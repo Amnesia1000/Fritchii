@@ -214,8 +214,29 @@ std::optional<FritchiiVersion> ParseFritchiiTag(std::string_view tag) {
     return std::nullopt;
 }
 
+std::vector<std::string> FritchiiAssetNames(const FritchiiVersion& version) {
+    std::vector<std::string> names;
+#if defined(_WIN32)
+    names.push_back(fmt::format("Fritchii-v{}-Windows-x64.zip", version.ToString()));
+    names.push_back(fmt::format("Fritchii-v{}-windows-x86_64.zip", version.ToString()));
+    names.push_back("lichii-windows-x86_64.zip");
+#elif defined(__APPLE__)
+    names.push_back(fmt::format("Fritchii-v{}-macOS-arm64.dmg", version.ToString()));
+    names.push_back(fmt::format("Fritchii-v{}-macos-arm64.zip", version.ToString()));
+    names.push_back("lichii-macos-arm64.zip");
+#else
+    names.push_back(fmt::format("Fritchii-v{}-Linux-x86_64.AppImage", version.ToString()));
+    names.push_back(fmt::format("Fritchii-v{}-linux-x86_64.AppImage", version.ToString()));
+    names.push_back("lichii-linux-x86_64.AppImage");
+    names.push_back(fmt::format("Fritchii-v{}-Linux-x86_64.tar.gz", version.ToString()));
+    names.push_back("lichii-linux-x86_64.tar.gz");
+#endif
+    return names;
+}
+
 std::string FritchiiAssetName(const FritchiiVersion& version) {
-    return fmt::format("Fritchii-v{}-Windows-x64.zip", version.ToString());
+    const auto names = FritchiiAssetNames(version);
+    return names.empty() ? "" : names.front();
 }
 
 Source DefaultSource() {
@@ -262,35 +283,34 @@ std::optional<Common::Net::Asset> SelectFritchiiAsset(const Common::Net::Release
     if (!version) {
         return std::nullopt;
     }
-    const auto filename = FritchiiAssetName(*version);
-    for (const auto& url : release.assets) {
-        std::string origin;
-        if (source.test) {
-            if (url.starts_with(source.origin + "/") && url.ends_with("/" + filename) &&
-                url.find("..") == std::string::npos &&
-                url.find_first_of("?#\\") == std::string::npos) {
-                origin = source.origin;
-            }
-        } else {
-            for (const auto repo : RepoNames) {
-                if (url == fmt::format("https://github.com/Frizti/{}/releases/download/{}/{}", repo,
-                                       release.tag, filename)) {
+    const auto candidate_names = FritchiiAssetNames(*version);
+    for (const auto& filename : candidate_names) {
+        for (const auto& url : release.assets) {
+            std::string origin;
+            if (source.test) {
+                if (url.starts_with(source.origin + "/") && url.ends_with("/" + filename) &&
+                    url.find("..") == std::string::npos &&
+                    url.find_first_of("?#\\") == std::string::npos) {
+                    origin = source.origin;
+                }
+            } else {
+                if (url.starts_with("https://github.com/") && url.ends_with("/" + filename)) {
                     origin = "https://github.com";
                 }
             }
+            if (origin.empty()) {
+                continue;
+            }
+            Common::Net::Asset asset{.name = "Fritchii",
+                                     .url = origin,
+                                     .path = url.substr(origin.size()),
+                                     .filename = filename};
+            if (const auto info = release.asset_info.find(url); info != release.asset_info.end()) {
+                asset.sha256 = info->second.sha256;
+                asset.size = info->second.size;
+            }
+            return asset;
         }
-        if (origin.empty()) {
-            continue;
-        }
-        Common::Net::Asset asset{.name = "Fritchii",
-                                 .url = origin,
-                                 .path = url.substr(origin.size()),
-                                 .filename = filename};
-        if (const auto info = release.asset_info.find(url); info != release.asset_info.end()) {
-            asset.sha256 = info->second.sha256;
-            asset.size = info->second.size;
-        }
-        return asset;
     }
     return std::nullopt;
 }
