@@ -45,7 +45,11 @@ namespace fs = std::filesystem;
 
 namespace {
 
+#ifdef _WIN32
 constexpr wchar_t ExeName[] = L"lichii.exe";
+#else
+constexpr wchar_t ExeName[] = L"lichii";
+#endif
 // Set for a restarted process to a note it shows once it is up, such as "v5 is installed".
 constexpr char RestartNoteVariable[] = "LICHII_UPDATE_NOTE";
 

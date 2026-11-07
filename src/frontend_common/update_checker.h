@@ -66,8 +66,9 @@ std::optional<FritchiiVersion> RunningVersion();
 // "fritchii-v4", "fritchii-v4.1", or the older "frizti-v3".
 std::optional<FritchiiVersion> ParseFritchiiTag(std::string_view tag);
 
-// "Fritchii-v4-Windows-x64.zip". Releases from before the rename named it differently and are
-// never installed.
+// Candidate asset filenames for the platform, e.g. "Fritchii-v4-Windows-x64.zip" or
+// "Fritchii-v4-Linux-x86_64.AppImage".
+std::vector<std::string> FritchiiAssetNames(const FritchiiVersion& version);
 std::string FritchiiAssetName(const FritchiiVersion& version);
 
 // Where Fritchii releases are listed and downloaded from.
