@@ -15,6 +15,7 @@
 #include <QGraphicsItem>
 #include <QLineEdit>
 #include <QMessageBox>
+#include <QSignalBlocker>
 #include <QSpinBox>
 
 #include "common/settings.h"
@@ -78,9 +79,13 @@ ConfigureSystem::ConfigureSystem(Core::System& system_,
         if (!checkbox_rtc->isChecked()) {
             return;
         }
-        auto offset = date_rtc_offset->value();
-        offset += date_rtc->dateTime().toSecsSinceEpoch() - previous_time;
-        previous_time = date_rtc->dateTime().toSecsSinceEpoch();
+        const auto posix_time = std::chrono::system_clock::now().time_since_epoch();
+        const auto current_time_s =
+            std::chrono::duration_cast<std::chrono::seconds>(posix_time).count();
+        const auto selected_time = date_rtc->dateTime().toSecsSinceEpoch();
+        const auto offset = static_cast<int>(selected_time - current_time_s);
+        previous_time = selected_time;
+        const QSignalBlocker blocker(date_rtc_offset);
         date_rtc_offset->setValue(offset);
     };
     const auto update_rtc_date = [this](int _) { UpdateRtcTime(); };
@@ -166,6 +171,7 @@ void ConfigureSystem::Setup(const ConfigurationShared::Builder& builder) {
 
         if (setting->Id() == Settings::values.custom_rtc_offset.Id()) {
             date_rtc_offset = widget->spinbox;
+            widget->setVisible(false);
         }
 
         switch (setting->GetCategory()) {
@@ -189,14 +195,18 @@ void ConfigureSystem::Setup(const ConfigurationShared::Builder& builder) {
 
 void ConfigureSystem::UpdateRtcTime() {
     const auto posix_time = std::chrono::system_clock::now().time_since_epoch();
-    previous_time = std::chrono::duration_cast<std::chrono::seconds>(posix_time).count();
+    const auto current_time_s =
+        std::chrono::duration_cast<std::chrono::seconds>(posix_time).count();
     date_rtc_offset->setEnabled(checkbox_rtc->isChecked());
 
+    s64 target_time = current_time_s;
     if (checkbox_rtc->isChecked()) {
-        previous_time += date_rtc_offset->value();
+        target_time += date_rtc_offset->value();
     }
+    previous_time = target_time;
 
-    const auto date = QDateTime::fromSecsSinceEpoch(previous_time);
+    const auto date = QDateTime::fromSecsSinceEpoch(target_time);
+    const QSignalBlocker blocker(date_rtc);
     date_rtc->setDateTime(date);
 }
 
