@@ -4040,10 +4040,42 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         }
         return false;
     };
+    // Whether the copies from overlaps the GPU wrote each write a part of the image and together
+    // all of it, for the layered and mipmapped 2D images overwritten_by_copies leaves out (from
+    // zortos293/Lichii#1079): Mario Kart World renders each layer of its shadow map and colour
+    // arrays as a target of its own, then samples the array, and the upload under those copies
+    // took 13-31 ms an array. Only at 1x, where the copies below are unscaled.
+    const auto overwritten_by_layer_copies = [&] {
+        constexpr ImageFlagBits unusual = ImageFlagBits::Sparse | ImageFlagBits::SparseLayers |
+                                          ImageFlagBits::SparseTiles |
+                                          ImageFlagBits::UnwrittenSparse | ImageFlagBits::Unbacked;
+        if (can_rescale || new_info.num_samples != 1 ||
+            True(new_image.flags & (unusual | ImageFlagBits::Converted |
+                                    ImageFlagBits::AsynchronousDecode))) {
+            return false;
+        }
+        std::vector<u8> written(
+            static_cast<size_t>(new_info.resources.levels * new_info.resources.layers));
+        for (const JoinCopy& copy : join_copies_to_do) {
+            const Image& overlap = slot_images[copy.id];
+            if (copy.is_alias || False(overlap.flags & ImageFlagBits::GpuModified) ||
+                overlap.info.num_samples != 1) {
+                continue;
+            }
+            const std::optional<SubresourceBase> base = new_image.TryFindBase(overlap.gpu_addr);
+            if (!base) {
+                continue;
+            }
+            MarkSubresourcesWrittenWhole(new_image, overlap,
+                                         MakeShrinkImageCopies(new_info, overlap.info, *base, 1, 0),
+                                         written);
+        }
+        return std::ranges::all_of(written, [](u8 whole) { return whole != 0; });
+    };
     const bool clear_skip = overwritten_by_clear();
     // EDEN_NX2_EXP8 bit 2: skip the upload the copies overwrite.
-    const bool copy_skip =
-        !clear_skip && (VideoCore::Nx2Debug::Experiment(8) & 2) != 0 && overwritten_by_copies();
+    const bool copy_skip = !clear_skip && (VideoCore::Nx2Debug::Experiment(8) & 2) != 0 &&
+                           (overwritten_by_copies() || overwritten_by_layer_copies());
     if (VideoCore::Nx2Debug::Experiment(7) != 0 && new_image.guest_size_bytes >= 1_MiB)
         [[unlikely]] {
         // Why a large new image was (or was not) uploaded from guest memory.
@@ -4064,7 +4096,8 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                         new_info.size.height, new_info.size.depth, new_info.resources.levels,
                         new_info.resources.layers, new_image.gpu_addr, join_copies_to_do.size(),
                         aliases, gpu_written, join_bad_overlap_ids.size(),
-                        clearing_render_targets, overwritten_by_copies(),
+                        clearing_render_targets,
+                        overwritten_by_copies() || overwritten_by_layer_copies(),
                         clear_skip  ? "skipped (clear)"
                         : copy_skip ? "skipped (copies)"
                                     : "done",
