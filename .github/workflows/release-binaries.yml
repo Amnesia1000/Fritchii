@@ -469,14 +469,27 @@ jobs:
           curl -fsSL -o "$tools/linuxdeploy-plugin-qt-$arch.AppImage" \
           https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-$arch.AppImage
           chmod +x "$tools"/*.AppImage
-          # The desktop file names its icon io.github.zortos293.lichii.
-          icon="$RUNNER_TEMP/io.github.zortos293.lichii.png"
-          cp dist/lichii.png "$icon"
+          # Use Fritchii desktop file and icon if available, otherwise fallback to Lichii
+          if [ -f dist/fritchii.desktop ]; then
+            desktop_file="dist/fritchii.desktop"
+            icon="$RUNNER_TEMP/fritchii.png"
+            cp dist/fritchii.png "$icon"
+          else
+            desktop_file="dist/io.github.zortos293.lichii.desktop"
+            icon="$RUNNER_TEMP/io.github.zortos293.lichii.png"
+            cp dist/lichii.png "$icon"
+          fi
           export APPIMAGE_EXTRACT_AND_RUN=1
           export QMAKE="$QT_ROOT_DIR/bin/qmake"
           # Include Wayland platform plugins and their graphics/shell integrations.
           export EXTRA_QT_MODULES=waylandclient
-          export EXTRA_PLATFORM_PLUGINS='libqwayland.so'
+          wayland_plugins=""
+          for p in libqwayland-egl.so libqwayland-generic.so libqwayland.so; do
+            if [ -f "$QT_ROOT_DIR/plugins/platforms/$p" ]; then
+              wayland_plugins="${wayland_plugins:+$wayland_plugins;}$p"
+            fi
+          done
+          export EXTRA_PLATFORM_PLUGINS="${wayland_plugins:-libqwayland-egl.so;libqwayland-generic.so}"
           # Embedded in the AppImage metadata; matches the release tag (build-N) plus the commit.
           export LINUXDEPLOY_OUTPUT_VERSION="build-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
           export LDAI_VERSION="build-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
@@ -508,10 +521,19 @@ jobs:
           mkdir -p AppDir/usr/bin
           cp build/release/bin/nx2_switches.txt AppDir/usr/bin/
 
+          # Deploy Wayland graphics and shell integration plugins for Wayland / OpenGL
+          for wayland_dir in "$QT_ROOT_DIR"/plugins/wayland*; do
+            if [ -d "$wayland_dir" ]; then
+              dest_dir="AppDir/usr/plugins/$(basename "$wayland_dir")"
+              mkdir -p "$dest_dir"
+              cp -a "$wayland_dir"/. "$dest_dir/"
+            fi
+          done
+
           "$tools/linuxdeploy-$arch.AppImage" --appdir AppDir \
             --executable build/release/bin/lichii \
             --executable build/release/bin/eden-cli \
-            --desktop-file dist/io.github.zortos293.lichii.desktop \
+            --desktop-file "$desktop_file" \
             --icon-file "$icon" \
             --custom-apprun "$RUNNER_TEMP/AppRun" \
             --plugin qt \
