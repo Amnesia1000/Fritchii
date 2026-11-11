@@ -838,6 +838,34 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     VmaVulkanFunctions functions{};
     functions.vkGetInstanceProcAddr = dld.vkGetInstanceProcAddr;
     functions.vkGetDeviceProcAddr = dld.vkGetDeviceProcAddr;
+    // EDEN_NX2_VMA_NO_PREFER_DEDICATED (boot, 1 = on; from Skitchii 9fb0cdd0a4, skolvolt/Lichii):
+    // images the driver only *prefers* in their own memory (NVIDIA: render and depth targets) go
+    // in VMA's blocks instead. OoT makes and frees ~2-3 short-lived depth targets a frame (shadow
+    // cascades sized anew), and each dedicated one is a kernel allocate, bind and free on the GPU
+    // thread. Required dedicated allocations stay dedicated.
+    static PFN_vkGetImageMemoryRequirements2 real_image_requirements2 = nullptr;
+    if (const char* value = std::getenv("EDEN_NX2_VMA_NO_PREFER_DEDICATED");
+        value != nullptr && value[0] == '1') {
+        real_image_requirements2 = reinterpret_cast<PFN_vkGetImageMemoryRequirements2>(
+            dld.vkGetDeviceProcAddr(*logical, "vkGetImageMemoryRequirements2"));
+        if (real_image_requirements2 != nullptr) {
+            LOG_INFO(Render_Vulkan, "VMA: preferred dedicated allocations go in blocks");
+            functions.vkGetImageMemoryRequirements2KHR =
+                [](VkDevice device, const VkImageMemoryRequirementsInfo2* info,
+                   VkMemoryRequirements2* requirements) {
+                    real_image_requirements2(device, info, requirements);
+                    for (auto* next = static_cast<VkBaseOutStructure*>(requirements->pNext);
+                         next != nullptr; next = next->pNext) {
+                        if (next->sType == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS) {
+                            auto* dedicated = reinterpret_cast<VkMemoryDedicatedRequirements*>(next);
+                            if (!dedicated->requiresDedicatedAllocation) {
+                                dedicated->prefersDedicatedAllocation = VK_FALSE;
+                            }
+                        }
+                    }
+                };
+        }
+    }
 
     VmaAllocatorCreateFlags flags = VMA_ALLOCATOR_CREATE_EXTERNALLY_SYNCHRONIZED_BIT;
     if (extensions.memory_budget) {
@@ -879,7 +907,14 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
             // after ten minutes, with 32 MiB ones ~0.5 GB: a block drains only once all of its
             // images are gone, and fewer per block drain sooner. VMA gives allocations over half a
             // block (8 MiB) their own memory, which goes back to the driver when they are freed.
-            .preferredLargeHeapBlockSize = 16u * 1024u * 1024u,
+            // EDEN_NX2_VMA_BLOCK_MIB (boot; from Skitchii 90fb5ec005, which uses 32): OoT docked
+            // makes 6-9 MiB shadow-map depth targets anew every frame, each its own allocation
+            // over half a 16 MiB block.
+            .preferredLargeHeapBlockSize = [] {
+                const char* value = std::getenv("EDEN_NX2_VMA_BLOCK_MIB");
+                const u64 mib = value != nullptr ? std::strtoull(value, nullptr, 10) : 16;
+                return (mib != 0 ? mib : 16) * 1024u * 1024u;
+            }(),
             .pAllocationCallbacks = nullptr,
             .pDeviceMemoryCallbacks = &churn_callbacks,
             .pHeapSizeLimit = heap_size_limit != 0 ? heap_size_limits.data() : nullptr,

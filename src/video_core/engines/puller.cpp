@@ -1269,6 +1269,17 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             return;
         }
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
+        // EDEN_NX2_ACQUIRE_TRIVIAL (boot, default on, 0 = off; from Skitchii 85b6e1f723,
+        // skolvolt/Lichii): an unsigned "at least 0" acquire is met whatever the word holds
+        // (Matches). OoT issues ~1,000 a second on the syncpoint shim (no guest memory behind
+        // it), and the ones the cheap checks couldn't read drained the back.
+        static const bool trivial = [] {
+            const char* value = std::getenv("EDEN_NX2_ACQUIRE_TRIVIAL");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (trivial && op == GpuSemaphoreOperation::AcquireGequal && acquire.value == 0) {
+            return;
+        }
         u32 word{};
         u64 read_done = 0;
         const bool readable = SemaphoreReadableNow(dma_pusher, acquire.address, word, &read_done);
