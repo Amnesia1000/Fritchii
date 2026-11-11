@@ -32,6 +32,18 @@ inline std::atomic<bool> g_detail{false};
     return g_active.load(std::memory_order_relaxed);
 }
 
+/// One byte that is non-zero while anything wants zone spans: bit 0 while a recording runs (set
+/// and cleared with g_active), bit 1 while EDEN_NX2_GPU_PROFILE times zones (Nx2Profile::
+/// Initialize). VideoCommon::Nx2Profile::Scope tests only this on entry, so a zone costs one
+/// relaxed load and a branch when nothing records (~1 M zones a second on the GPU back thread).
+inline std::atomic<u8> g_zone_gate{0};
+inline constexpr u8 ZoneGateTimeline = 1;
+inline constexpr u8 ZoneGateProfile = 2;
+
+[[nodiscard]] inline bool ZoneGateOpen() {
+    return g_zone_gate.load(std::memory_order_relaxed) != 0;
+}
+
 /// The guest layer (tools/nx2/critical_path.py round 2): the kernel's thread switches, waits and
 /// wakes with the guest thread ids, guest thread and kernel object names, and the GPU's writes to
 /// guest memory, recorded only with EDEN_NX2_TIMELINE_GUEST=1 (tens of thousands of markers a

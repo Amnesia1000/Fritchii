@@ -869,7 +869,18 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         }
     }
 
-    VmaAllocatorCreateFlags flags = VMA_ALLOCATOR_CREATE_EXTERNALLY_SYNCHRONIZED_BIT;
+    // EDEN_NX2_ASYNC_IMAGE_FREE (boot, default on; =0 off): the texture cache destroys the images
+    // it deleted on a thread of its own (with dedicated allocations each is a vkFreeMemory into
+    // the driver: ~22 ms/s on the GPU back thread at the Castle Town market). VMA then has to lock
+    // internally, which it does without EXTERNALLY_SYNCHRONIZED (an uncontended lock per
+    // allocation call, its default mode).
+    allocator_thread_safe = [] {
+        const char* value = std::getenv("EDEN_NX2_ASYNC_IMAGE_FREE");
+        return value == nullptr || value[0] != '0';
+    }();
+    VmaAllocatorCreateFlags flags =
+        allocator_thread_safe ? VmaAllocatorCreateFlags{0}
+                              : VmaAllocatorCreateFlags{VMA_ALLOCATOR_CREATE_EXTERNALLY_SYNCHRONIZED_BIT};
     if (extensions.memory_budget) {
         flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
     }

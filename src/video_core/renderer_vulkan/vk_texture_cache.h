@@ -6,11 +6,18 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
+#include <stop_token>
+#include <thread>
+#include <utility>
+#include <vector>
 
 #include "video_core/texture_cache/texture_cache_base.h"
 
@@ -95,6 +102,53 @@ struct ImagePoolKey {
     size_t view_format_count{};
 
     bool operator==(const ImagePoolKey&) const noexcept = default;
+};
+
+/// EDEN_NX2_ASYNC_IMAGE_FREE (boot, default on; see Device::IsAllocatorThreadSafe): images the
+/// texture cache deleted and the GPU is done with (TextureCache::TickFrame) are destroyed here, on
+/// a low-priority thread of its own, oldest first, instead of on the GPU back thread. With dedicated
+/// allocations each destruction is a vkFreeMemory into the driver's kernel path: ~22 ms/s of the
+/// back at the Castle Town market. The images arrive with their back-thread part already done
+/// (Image::PrepareForAsyncFree), so destroying them only touches their own Vulkan objects and VMA.
+class ImageFreeQueue {
+public:
+    /// Past this much device memory waiting here, images are destroyed on the caller's thread as
+    /// before: the thread falling behind never holds more than this much extra VRAM.
+    static constexpr u64 MaxPendingBytes = u64{256} << 20;
+
+    explicit ImageFreeQueue(bool enabled_);
+    ~ImageFreeQueue(); ///< Destroys what is left, then stops the thread
+
+    ImageFreeQueue(const ImageFreeQueue&) = delete;
+    ImageFreeQueue& operator=(const ImageFreeQueue&) = delete;
+
+    [[nodiscard]] bool Enabled() const noexcept {
+        return enabled;
+    }
+
+    /// Device memory of the images added and not destroyed yet: the driver still counts it.
+    [[nodiscard]] u64 PendingBytes() const noexcept {
+        return pending_bytes.load(std::memory_order_acquire);
+    }
+
+    /// Adds an image holding `bytes` of device memory to the batch (the GPU thread's; no lock).
+    void Add(std::unique_ptr<Image> image, u64 bytes);
+
+    /// Hands the batch to the thread: one lock and one wake-up for all of it.
+    void Submit();
+
+private:
+    using Entry = std::pair<std::unique_ptr<Image>, u64>; ///< The image, its device memory
+
+    void Run(std::stop_token stop_token);
+
+    bool enabled;
+    std::vector<Entry> batch; ///< Added since the last Submit (GPU thread only)
+    std::mutex mutex;
+    std::condition_variable_any cv;
+    std::vector<Entry> queue; ///< Submitted, not taken by the thread yet (under `mutex`)
+    std::atomic<u64> pending_bytes{};
+    std::jthread thread; ///< Last: started once the members above exist
 };
 
 class TextureCacheRuntime {
@@ -415,6 +469,25 @@ public:
     u64 image_pool_given{};
     u64 image_pool_evicted{};
     void TrimImagePool(u64 max_bytes);
+
+public:
+    /// EDEN_NX2_ASYNC_IMAGE_FREE: a deleted image the GPU is done with (TextureCache::TickFrame,
+    /// after ReleaseToPool) is moved out of `image` into the free queue's batch when it can go
+    /// there; `image` is then empty. Otherwise `image` is left as it was, for the caller to destroy.
+    void FreeImageLater(Image& image);
+
+    /// Hands the batch FreeImageLater collected to the free queue's thread.
+    void SubmitImageFrees();
+
+    /// Device memory of images handed to the free queue and not destroyed yet: the driver still
+    /// counts it.
+    [[nodiscard]] u64 PendingImageFreeBytes() const noexcept {
+        return image_free_queue.PendingBytes();
+    }
+
+private:
+    /// Last: destroyed first, destroying what it still holds.
+    ImageFreeQueue image_free_queue;
 };
 
 class Framebuffer {
@@ -598,6 +671,14 @@ public:
     /// EXP42: the deleted image's VkImages go to the runtime's pool instead of being destroyed,
     /// when eligible. Called once the GPU is done with them (TextureCache::TickFrame).
     void ReleaseToPool();
+
+    /// EDEN_NX2_ASYNC_IMAGE_FREE: runs the destructor's part that touches the runtime (resolve
+    /// shadows) now, on the GPU thread, and detaches the image from the runtime, so destroying it
+    /// later only touches its own Vulkan objects and VMA (ImageFreeQueue's thread). Returns the
+    /// device memory the image still holds. Nothing, with nothing done, for images whose
+    /// destruction stays on the GPU thread: sparse ones (their memory goes through the
+    /// MemoryAllocator) and ones holding no memory of their own (ReleaseToPool took it).
+    [[nodiscard]] std::optional<u64> PrepareForAsyncFree();
 
     /// Returns true when the image is already initialized and mark it as initialized
     [[nodiscard]] bool ExchangeInitialization() noexcept {

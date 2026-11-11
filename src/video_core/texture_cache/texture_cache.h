@@ -598,8 +598,16 @@ void TextureCache<P>::TickFrame() {
             if constexpr (requires(Image& image) { image.ReleaseToPool(); }) {
                 gpu_sentenced_images.front().image.ReleaseToPool();
             }
+            // EDEN_NX2_ASYNC_IMAGE_FREE: what is left of it is destroyed on the runtime's free
+            // thread (moved out here; pop_front then destroys an empty image), not here.
+            if constexpr (requires(Image& image) { runtime.FreeImageLater(image); }) {
+                runtime.FreeImageLater(gpu_sentenced_images.front().image);
+            }
             gpu_sentenced_bytes -= gpu_sentenced_images.front().bytes;
             gpu_sentenced_images.pop_front();
+        }
+        if constexpr (requires { runtime.SubmitImageFrees(); }) {
+            runtime.SubmitImageFrees();
         }
     }
     // If we can obtain the memory info, use it instead of the estimate.
@@ -612,6 +620,13 @@ void TextureCache<P>::TickFrame() {
             total_used_memory -= (std::min)(total_used_memory, bytes);
         }
         total_used_memory -= (std::min)(total_used_memory, gpu_sentenced_bytes);
+        // EDEN_NX2_ASYNC_IMAGE_FREE: deleted images handed to the free thread and not destroyed
+        // yet are still counted by the driver; left out, so the collector sees what it saw when
+        // they were destroyed above. Read after the usage: a free in between leaves the usage
+        // counted high, never low.
+        if constexpr (requires { runtime.PendingImageFreeBytes(); }) {
+            total_used_memory -= (std::min)(total_used_memory, runtime.PendingImageFreeBytes());
+        }
         // EXP42's pooled images are deleted images too: the pool caps and ages them itself.
         if constexpr (requires { runtime.PooledImageBytes(); }) {
             total_used_memory -= (std::min)(total_used_memory, runtime.PooledImageBytes());
