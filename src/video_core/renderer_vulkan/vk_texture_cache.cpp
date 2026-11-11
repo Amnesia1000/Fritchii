@@ -18,12 +18,14 @@
 #include <vector>
 #include <boost/container/small_vector.hpp>
 #include <bit>
+#include <iterator>
 #include <numeric>
 #include "common/alignment.h"
 #include "common/bit_util.h"
 #include "common/div_ceil.h"
 #include "common/literals.h"
 #include "common/settings.h"
+#include "common/thread.h"
 #include "shader_recompiler/byte_addressed_image.h"
 #include "shader_recompiler/exception.h"
 
@@ -1308,7 +1310,8 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
       staging_buffer_pool{staging_buffer_pool_}, blit_image_helper{blit_image_helper_},
       render_pass_cache{render_pass_cache_}, descriptor_pool{descriptor_pool_},
       compute_pass_descriptor_queue{compute_pass_descriptor_queue_},
-      resolution{Settings::values.resolution_info} {
+      resolution{Settings::values.resolution_info},
+      image_free_queue{device_.IsAllocatorThreadSafe()} {
     // Before anything below reads astc_recompression (passes, view formats).
     UseBc3ForSwitch2OnSmallCards(device);
     // Huge ASTC arrays always decode on the GPU (IsHugeAstcArray), whatever the decode setting.
@@ -2983,6 +2986,87 @@ void TextureCacheRuntime::TrimImagePool(u64 max_bytes) {
     }
 }
 
+ImageFreeQueue::ImageFreeQueue(bool enabled_) : enabled{enabled_} {
+    if (!enabled) {
+        return;
+    }
+    LOG_INFO(Render_Vulkan, "Deleted images are destroyed on their own thread "
+                            "(EDEN_NX2_ASYNC_IMAGE_FREE, 0 turns it off)");
+    thread = std::jthread([this](std::stop_token stop_token) { Run(stop_token); });
+}
+
+ImageFreeQueue::~ImageFreeQueue() {
+    Submit();
+    if (thread.joinable()) {
+        // Run destroys everything submitted before it sees the stop.
+        thread.request_stop();
+        thread.join();
+    }
+    // Without a thread (never started), the queue's images are destroyed here, with the members.
+}
+
+void ImageFreeQueue::Add(std::unique_ptr<Image> image, u64 bytes) {
+    pending_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    batch.emplace_back(std::move(image), bytes);
+}
+
+void ImageFreeQueue::Submit() {
+    if (batch.empty()) {
+        return;
+    }
+    {
+        std::scoped_lock lock{mutex};
+        if (queue.empty()) {
+            queue.swap(batch);
+        } else {
+            std::move(batch.begin(), batch.end(), std::back_inserter(queue));
+            batch.clear();
+        }
+    }
+    cv.notify_one();
+}
+
+void ImageFreeQueue::Run(std::stop_token stop_token) {
+    Common::SetCurrentThreadName("ImageFree");
+    // Off the GPU threads' cores and below them: falling behind only holds memory a little
+    // longer (MaxPendingBytes bounds it).
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+    Common::SetCurrentThreadToBackgroundWork();
+    std::vector<Entry> work;
+    while (true) {
+        {
+            std::unique_lock lock{mutex};
+            cv.wait(lock, stop_token, [this] { return !queue.empty(); });
+            if (queue.empty()) {
+                return; // stop requested, nothing left
+            }
+            work.swap(queue);
+        }
+        // Oldest first, in the order the GPU finished with them.
+        for (Entry& entry : work) {
+            entry.first.reset();
+            pending_bytes.fetch_sub(entry.second, std::memory_order_release);
+        }
+        work.clear();
+    }
+}
+
+void TextureCacheRuntime::FreeImageLater(Image& image) {
+    if (!image_free_queue.Enabled() ||
+        image_free_queue.PendingBytes() > ImageFreeQueue::MaxPendingBytes) {
+        return;
+    }
+    const std::optional<u64> bytes = image.PrepareForAsyncFree();
+    if (!bytes) {
+        return;
+    }
+    image_free_queue.Add(std::make_unique<Image>(std::move(image)), *bytes);
+}
+
+void TextureCacheRuntime::SubmitImageFrees() {
+    image_free_queue.Submit();
+}
+
 void TextureCacheRuntime::TickFrame() {
     ++image_pool_frame;
     {
@@ -3186,6 +3270,37 @@ void Image::ReleaseToPool() {
     };
     give(original_image, original_pool_key);
     give(scaled_image, scaled_pool_key);
+}
+
+std::optional<u64> Image::PrepareForAsyncFree() {
+    using VideoCommon::ImageFlagBits;
+    constexpr ImageFlagBits sparse = ImageFlagBits::Sparse | ImageFlagBits::SparseLayers |
+                                     ImageFlagBits::SparseTiles | ImageFlagBits::UnwrittenSparse |
+                                     ImageFlagBits::Unbacked;
+    if (True(flags & sparse) || sparse_layers.allocator != nullptr) {
+        return std::nullopt;
+    }
+    u64 bytes = 0;
+    for (const vk::Image* const image : {&original_image, &scaled_image}) {
+        if (*image) {
+            bytes += image->GetMemoryBlock().size;
+        }
+    }
+    if (bytes == 0) {
+        return std::nullopt;
+    }
+    // ~Image's runtime part, done here. With runtime null the destructor does nothing else
+    // besides destroying the members (Vulkan objects, VMA allocations, plain memory).
+    if (ENABLE_MSAA_RESOLVE_CONSUME && runtime != nullptr) {
+        if (original_image) {
+            runtime->EraseResolveShadow(*original_image);
+        }
+        if (scaled_image) {
+            runtime->EraseResolveShadow(*scaled_image);
+        }
+    }
+    runtime = nullptr;
+    return bytes;
 }
 
 Image::~Image() {
