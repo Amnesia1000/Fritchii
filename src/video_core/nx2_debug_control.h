@@ -448,7 +448,7 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// EXP65 (live; 0 = off; vk_texture_cache.h): EXP42 pool entries whose exact create info was never
 /// taken back age out after this many frames (proven shapes keep the 180). Per-NPC targets sized by
 /// screen bounds filled the pool to 512 MiB with dims that never repeat.
-/// EXP64 (live; 0 = off; fable_answer_npcdips 3, NPC-pass dips): a new render target that a clear
+/// EXP64 (live; N = min frames untouched, default 16, 0 = off; fable_answer_npcdips 3, NPC dips): a new render target that a clear
 /// overwrites whole retires the images at its exact address that the GPU wrote in an earlier
 /// frame (TextureCache::RetireSlotPredecessors) instead of leaving them as bad overlaps for EXP58's
 /// sweep 60 frames later. Ocarina draws each passing NPC into a D32 target sized by its screen
@@ -572,6 +572,11 @@ inline void LoadExperiments() {
         // the last submit. Castle Town live toggle: empty submits 4,600 -> 145 a second, 43.0 ->
         // 45.6 fps (3 of 4 pairs, the 4th a tie), GPU thread split drain 432 -> 396 ms/s.
         g_experiments[61].store(1, std::memory_order_relaxed);
+        // EXP64 = 16 (2026-11-11, NPC-pass dips): a cleared target retires its slot's old
+        // same-format images untouched for 16 frames. Night market live toggle 0/16: peak texture
+        // cache memory 5,972 -> 5,482 MiB, binds over 1 ms 30 -> 6 a 2 min (over 10 ms 1 -> 0),
+        // 53.4 -> 54.6 fps; 0 retired images wanted again within 16 frames (at 1: 29, at 8: 2).
+        g_experiments[64].store(16, std::memory_order_relaxed);
         // EXP49 = 1 (2026-11-10, owner's call for v5.7): the async read-back. Stalchild fight,
         // flipped every 30 s while the owner fought: 51.9 -> 56.9 fps, the back's read flushes
         // 35 -> 6 ms/s, guest lock waits halved. No beams in that session or two later ones
