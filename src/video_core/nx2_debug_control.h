@@ -587,6 +587,12 @@ inline void LoadExperiments() {
         // cache memory 5,972 -> 5,482 MiB, binds over 1 ms 30 -> 6 a 2 min (over 10 ms 1 -> 0),
         // 53.4 -> 54.6 fps; 0 retired images wanted again within 16 frames (at 1: 29, at 8: 2).
         g_experiments[64].store(16, std::memory_order_relaxed);
+        // EXP68 = 1 (2026-11-11, NPC-pass dips): a depth clear with a scissor of the real width
+        // goes to the exact image (one per NPC a frame, not two plus an upload and alias copies;
+        // fable52_answer_npcdips). Night market toggle: images made 483 -> 379, texture upload
+        // 18.8 -> 14.1 ms/s, about +1 fps; owner playtest: no visual glitches, 50-55 fps except
+        // when a dog enters from behind the camera. Bit 4 (no pool) stays off: binds over 1 ms x3.
+        g_experiments[68].store(1, std::memory_order_relaxed);
         // EXP49 = 1 (2026-11-10, owner's call for v5.7): the async read-back. Stalchild fight,
         // flipped every 30 s while the owner fought: 51.9 -> 56.9 fps, the back's read flushes
         // 35 -> 6 ms/s, guest lock waits halved. No beams in that session or two later ones

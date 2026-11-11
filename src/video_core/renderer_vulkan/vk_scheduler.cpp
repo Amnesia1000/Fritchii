@@ -21,6 +21,8 @@
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 
 #include "common/logging.h"
+#include "common/scope_exit.h"
+#include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "common/settings.h"
 #include "common/dkb_cpu_trace.h"
 #include "common/nx2_timeline.h"
@@ -328,14 +330,28 @@ void Scheduler::WaitWorker() {
     // Waits for the Vulkan worker (tools/nx2/critical_path.py's table): the queue, then the
     // chunk it is running.
     Common::Nx2Timeline::Span timeline_span{"wait for Vulkan worker"};
+    const auto wait_start = std::chrono::steady_clock::now();
+    size_t queued_chunks = 0;
     // Ensure the queue is drained.
     {
         std::unique_lock ql{queue_mutex};
+        queued_chunks = work_queue.size();
         event_cv.wait(ql, [this] { return work_queue.empty(); });
     }
 
     // Now wait for execution to finish.
     std::scoped_lock el{execution_mutex};
+    // The 40-90 ms full drains at the night market (2026-11-11) had the back blocked outside its
+    // zones while the worker sat in "record commands + submit": say when this wait is long.
+    const auto waited = std::chrono::steady_clock::now() - wait_start;
+    if (waited > std::chrono::milliseconds{4}) {
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 200) {
+            LOG_INFO(Render_Vulkan, "Slow worker wait: {} us for {} queued chunks",
+                     std::chrono::duration_cast<std::chrono::microseconds>(waited).count(),
+                     queued_chunks);
+        }
+    }
 }
 
 void Scheduler::MarkFrameEnd(u64 frame) {
@@ -923,13 +939,38 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         if (trace_query_pool) {
             trace_work = {};
         }
+        const auto end_start = std::chrono::steady_clock::now();
         cmdbuf.End();
+        const auto end_done = std::chrono::steady_clock::now();
 
         if (on_submit) {
             on_submit();
         }
 
         std::scoped_lock lock{submit_mutex};
+        const auto submit_start = std::chrono::steady_clock::now();
+        // Slow submits (residency work for new allocations?) with what was made since the last
+        // one; images are counted only with EDEN_NX2_IMAGE_ALLOC_TIMING=1.
+        SCOPE_EXIT {
+            static u64 images_at_last_submit = 0;
+            const u64 images = MemoryAllocator::ReadImageTiming().images;
+            const auto submit_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                       std::chrono::steady_clock::now() - submit_start)
+                                       .count();
+            const auto end_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(end_done - end_start)
+                    .count();
+            if (submit_us > 4000 || end_us > 4000) {
+                static std::atomic<u32> logged{};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 200) {
+                    LOG_INFO(Render_Vulkan,
+                             "Slow submit: vkQueueSubmit {} us, command buffer End {} us, tick {}; "
+                             "{} images made since the previous submit",
+                             submit_us, end_us, signal_value, images - images_at_last_submit);
+                }
+            }
+            images_at_last_submit = images;
+        };
         // Lines up with DkbFrameTrace's begin stamp and the driver's queue packets.
         if (Common::Nx2Timeline::Active()) {
             Common::Nx2Timeline::Instant("vkQueueSubmit", {"tick", signal_value});
