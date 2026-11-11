@@ -442,6 +442,9 @@ MainWindow::MainWindow(bool has_broken_vulkan)
 
     show();
 
+    // v5.9: the shader cache v5.8's import left in eden/lichii, before a game boots.
+    UserDataMigrator::CatchUpShaderCache(this);
+
 #ifdef ENABLE_UPDATE_CHECKER
     connect(&update_watcher, &QFutureWatcher<UpdateChecker::CheckResult>::finished, this,
             &MainWindow::OnEmulatorUpdateAvailable);

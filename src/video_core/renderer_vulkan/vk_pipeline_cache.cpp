@@ -1157,8 +1157,19 @@ void MergeCompatiblePipelineCaches(const std::filesystem::path& base_dir,
         std::filesystem::path cache;
         std::filesystem::path used;
         std::optional<u32> version; // nullopt: legacy name, read from the header
+        bool imported{};            // removed once merged (see below)
     };
     std::vector<Candidate> candidates;
+    // This fork's own cache of another profile (v5.9: an import or the startup catch-up copies
+    // Eden's/Lichii's beside a cache Fritchii already has, as vulkan-frizti-imported.*): same
+    // records, merged once and then removed.
+    for (const u32 version : std::array{CACHE_VERSION, VideoCommon::VulkanOwnPreviousVersions[0]}) {
+        candidates.push_back(
+            {VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan-frizti-imported", version),
+             VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_used-frizti-imported",
+                                                     version),
+             version, true});
+    }
     for (const u32 version : CompatibleVersions) {
         candidates.push_back({VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan", version),
                               VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_used",
@@ -1177,6 +1188,7 @@ void MergeCompatiblePipelineCaches(const std::filesystem::path& base_dir,
                          : VideoCommon::PipelineMergeLog{};
     bool log_changed = false;
     std::optional<VideoCommon::PipelineKeySet> own_keys;
+    std::vector<const Candidate*> merged_imports;
     using Status = VideoCommon::PipelineCacheMergeResult::Status;
     for (const Candidate& candidate : candidates) {
         const auto stamp = VideoCommon::StampPipelineCacheFile(candidate.cache);
@@ -1212,6 +1224,9 @@ void MergeCompatiblePipelineCaches(const std::filesystem::path& base_dir,
                          result.added_pipelines, result.added_records, path, *version,
                          result.known_pipelines);
                 cache_merged = true;
+                if (candidate.imported) {
+                    merged_imports.push_back(&candidate);
+                }
                 break;
             case Status::Missing:
                 continue;
@@ -1262,6 +1277,16 @@ void MergeCompatiblePipelineCaches(const std::filesystem::path& base_dir,
         }
         merge_log.insert_or_assign(used_name, *used_stamp);
         log_changed = true;
+    }
+    // Imported copies are in this cache now (their used lists too, merged just above).
+    for (const Candidate* candidate : merged_imports) {
+        for (const auto& file : {candidate->cache, candidate->used}) {
+            std::filesystem::remove(file, error);
+            merge_log.erase(Common::FS::PathToUTF8String(file.filename()));
+        }
+        log_changed = true;
+        LOG_INFO(Render_Vulkan, "Removed the merged imported cache {}",
+                 Common::FS::PathToUTF8String(candidate->cache));
     }
     if (log_changed && !VideoCommon::WritePipelineMergeLog(log_path, merge_log)) {
         LOG_WARNING(Render_Vulkan, "Failed to write {}", Common::FS::PathToUTF8String(log_path));
