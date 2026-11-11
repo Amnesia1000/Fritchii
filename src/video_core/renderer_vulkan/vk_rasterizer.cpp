@@ -1933,6 +1933,9 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     // Castle Town route start the back's clear zone went 0.7 -> 4.6 ms a frame while an NPC walked
     // past, at about the same number of clears.
     const auto clear_start = std::chrono::steady_clock::now();
+    const bool alloc_timing = Vulkan::MemoryAllocator::ImageTimingEnabled();
+    const auto alloc_before = alloc_timing ? Vulkan::MemoryAllocator::ReadImageTiming()
+                                           : Vulkan::MemoryAllocator::ImageTiming{};
     FlushWork();
     gpu_memory->FlushCaching();
     const auto clear_flushed = std::chrono::steady_clock::now();
@@ -1985,6 +1988,16 @@ void RasterizerVulkan::Clear(u32 layer_count) {
                      s.framebuffer_map_size, s.image_count,
                      ns_us(s.walk_ns), ns_us(s.create_ns), ns_us(s.refresh_ns),
                      ns_us(s.delete_ns), ns_us(s.framebuffer_ns));
+        }
+        if (alloc_timing) {
+            const auto after = Vulkan::MemoryAllocator::ReadImageTiming();
+            LOG_INFO(Render_Vulkan,
+                     "Slow clear allocator: {} images, vkCreateImage {} us, VMA allocate {} us, "
+                     "bind {} us",
+                     after.images - alloc_before.images,
+                     (after.create_ns - alloc_before.create_ns) / 1000,
+                     (after.alloc_ns - alloc_before.alloc_ns) / 1000,
+                     (after.bind_ns - alloc_before.bind_ns) / 1000);
         }
     };
 

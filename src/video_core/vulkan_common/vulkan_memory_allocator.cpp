@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <type_traits>
@@ -235,6 +237,73 @@ vk::Image MemoryAllocator::TryCreateImage(const VkImageCreateInfo &ci, bool dedi
     return image;
 }
 
+namespace {
+std::atomic<u64> g_timed_images{};
+std::atomic<u64> g_timed_create_ns{};
+std::atomic<u64> g_timed_alloc_ns{};
+std::atomic<u64> g_timed_bind_ns{};
+
+u64 TimingNow() noexcept {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+}
+
+// vmaCreateImage in its three steps (as VMA does them, without its dedicated-allocation hint
+// queries, which VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT callers set themselves), each timed.
+VkResult TimedVmaCreateImage(const Device &device, VmaAllocator allocator,
+                             const VkImageCreateInfo &ci, const VmaAllocationCreateInfo &alloc_ci,
+                             VkImage &handle, VmaAllocation &allocation,
+                             VmaAllocationInfo &alloc_info) {
+    const auto &dld = device.GetDispatchLoader();
+    const VkDevice logical = *device.GetLogical();
+    const u64 t0 = TimingNow();
+    VkResult result = dld.vkCreateImage(logical, &ci, nullptr, &handle);
+    const u64 t1 = TimingNow();
+    if (result != VK_SUCCESS) {
+        handle = VK_NULL_HANDLE;
+        return result;
+    }
+    result = vmaAllocateMemoryForImage(allocator, handle, &alloc_ci, &allocation, &alloc_info);
+    const u64 t2 = TimingNow();
+    if (result == VK_SUCCESS) {
+        result = vmaBindImageMemory(allocator, allocation, handle);
+        if (result != VK_SUCCESS) {
+            vmaFreeMemory(allocator, allocation);
+        }
+    }
+    const u64 t3 = TimingNow();
+    if (result != VK_SUCCESS) {
+        dld.vkDestroyImage(logical, handle, nullptr);
+        handle = VK_NULL_HANDLE;
+        allocation = VK_NULL_HANDLE;
+        return result;
+    }
+    g_timed_images.fetch_add(1, std::memory_order_relaxed);
+    g_timed_create_ns.fetch_add(t1 - t0, std::memory_order_relaxed);
+    g_timed_alloc_ns.fetch_add(t2 - t1, std::memory_order_relaxed);
+    g_timed_bind_ns.fetch_add(t3 - t2, std::memory_order_relaxed);
+    return VK_SUCCESS;
+}
+} // Anonymous namespace
+
+bool MemoryAllocator::ImageTimingEnabled() noexcept {
+    static const bool enabled = [] {
+        const char *value = std::getenv("EDEN_NX2_IMAGE_ALLOC_TIMING");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+MemoryAllocator::ImageTiming MemoryAllocator::ReadImageTiming() noexcept {
+    return ImageTiming{
+        .images = g_timed_images.load(std::memory_order_relaxed),
+        .create_ns = g_timed_create_ns.load(std::memory_order_relaxed),
+        .alloc_ns = g_timed_alloc_ns.load(std::memory_order_relaxed),
+        .bind_ns = g_timed_bind_ns.load(std::memory_order_relaxed),
+    };
+}
+
 VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedicated, bool may_fail,
                                         vk::Image &image) const {
     const VmaAllocationCreateInfo alloc_ci = {
@@ -259,7 +328,10 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
     const u64 texels = u64{ci.extent.width} * ci.extent.height * ci.extent.depth * ci.arrayLayers;
     const bool huge = texels > MaxBackedImageTexels;
     VkResult result = huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
-                           : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+                      : ImageTimingEnabled()
+                          ? TimedVmaCreateImage(device, allocator, ci, alloc_ci, handle,
+                                                allocation, alloc_info)
+                          : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
         // Over the device memory budget (Switch 2 titles fill 8 GB cards): let the driver page
         // it out rather than failing the draw and aborting.

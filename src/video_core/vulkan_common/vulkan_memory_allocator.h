@@ -142,6 +142,18 @@ namespace Vulkan {
             return failed_images.load(std::memory_order_relaxed);
         }
 
+        /// EDEN_NX2_IMAGE_ALLOC_TIMING=1 (boot, off by default): images are made in vmaCreateImage's
+        /// three steps, each timed (ns, all images so far), so "Slow clear" lines can say where a
+        /// new image's create time went (NPC-pass dips: 0.15-1.5 ms per per-object depth target).
+        struct ImageTiming {
+            u64 images{};
+            u64 create_ns{}; ///< vkCreateImage
+            u64 alloc_ns{};  ///< vmaAllocateMemoryForImage (requirements, block search, new blocks)
+            u64 bind_ns{};   ///< vmaBindImageMemory
+        };
+        static ImageTiming ReadImageTiming() noexcept;
+        static bool ImageTimingEnabled() noexcept;
+
         vk::Buffer CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage) const;
 
         vk::Buffer CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage,
