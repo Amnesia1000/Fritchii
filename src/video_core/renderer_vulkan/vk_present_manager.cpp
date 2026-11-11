@@ -438,6 +438,18 @@ void PresentManager::PresentThread(std::stop_token token) {
             // lock in WaitPresent is guaranteed to occur after here.
             void(std::exchange(lock, std::unique_lock{swapchain_mutex}));
             last_present_id = 0;
+            // EDEN_NX2_EXP71 (live, ms, test only): a display stall of this length every 10 s,
+            // as the 125-190 ms ones at the night market, to check EXP70 on demand.
+            if (const int stall_ms = VideoCore::Nx2Debug::Experiment(71); stall_ms > 0) [[unlikely]] {
+                static auto last_stall = std::chrono::steady_clock::now();
+                const auto now = std::chrono::steady_clock::now();
+                if (now - last_stall > std::chrono::seconds{10}) {
+                    last_stall = now;
+                    LOG_INFO(Render_Vulkan, "Present (EXP71): simulated display stall of {} ms",
+                             stall_ms);
+                    std::this_thread::sleep_for(std::chrono::milliseconds{stall_ms});
+                }
+            }
             CopyToSwapchain(frame);
             if (Common::Nx2Timeline::Active()) {
                 Common::Nx2Timeline::Instant("vkQueuePresentKHR", {"id", last_present_id});
