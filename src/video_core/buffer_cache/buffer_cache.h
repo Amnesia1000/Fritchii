@@ -41,6 +41,14 @@
 
 namespace VideoCommon {
 
+/// EDEN_NX2_BANK_PAGE_TABLE / EDEN_NX2_BANK_SLOTS defaults: on (table, c1) for Ocarina of Time only,
+/// whose bank layout they were measured on (2026-11-11, market: c1 compared ~580k pages/s and never
+/// changed; skip verify 0 missed / 0 disagreed over ~2.4M compares per 5 s; live toggle 46.8 -> 47.3
+/// fps, bind stage buffers 142.7 -> 135.7 ms/s). Other titles keep both off unless set.
+[[nodiscard]] inline bool NativeBankDefaultsForOcarina() {
+    return Settings::GetCurrentProgramID() == 0x0400486024DEC000ULL;
+}
+
 using Core::DEVICE_PAGESIZE;
 
 template <class P>
@@ -2435,7 +2443,8 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
     // page and a snapshot of every page has nothing the page loop would compare: skipped whole.
     // The game's banks (c3+) keep the loop and the hot rule.
     const u32 own_slots = static_cast<u32>(
-        VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_bank_slots, "EDEN_NX2_BANK_SLOTS"));
+        VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_bank_slots, "EDEN_NX2_BANK_SLOTS",
+                                         NativeBankDefaultsForOcarina() ? 0x2 : 0));
     // Not while CPU inner invalidation is skipped: our constant buffer words then set no flag.
     const bool own_slot = index < 32 && ((own_slots >> index) & 1) != 0 &&
                           !Settings::values.skip_cpu_inner_invalidation.GetValue();
@@ -2704,7 +2713,8 @@ void BufferCache<P>::FlushNativeBankUploads([[maybe_unused]] Buffer& buffer,
 template <class P>
 void BufferCache<P>::SelectNativeBankStore() {
     const bool table = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_bank_page_table,
-                                                        "EDEN_NX2_BANK_PAGE_TABLE") != 0;
+                                                        "EDEN_NX2_BANK_PAGE_TABLE",
+                                                        NativeBankDefaultsForOcarina() ? 1 : 0) != 0;
     if (table != native_bank_table_on) [[unlikely]] {
         // Both emptied: every page's next bind takes a new snapshot and marks the page changed.
         ClearNativeBankSnapshots();
