@@ -28,6 +28,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_runahead.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/query_cache/bank_base.h"
 #include "video_core/query_cache/frame_trace.h"
@@ -454,14 +455,20 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                 Tegra::Nx2NoteLanded(cpu_addr, static_cast<u32>(query_base->value),
                                      Tegra::Nx2Landing::QueryCompletion);
             }
+            // EDEN_NX2_RUNAHEAD: as for the immediate write below (with the default fences a
+            // fence report's operation runs while the back runs the release).
+            const bool superseded = report_type == QueryType::Payload &&
+                                    VideoCommon::Runahead::LandingSuperseded(cpu_addr);
             if (wide) {
                 const u64 ticks = state.gpu.GetTicks();
                 u8* const ticks_pointer = state.device_memory.template GetPointer<u8>(cpu_addr + 8);
                 if (ticks_pointer != nullptr) {
                     std::memcpy(ticks_pointer, &ticks, sizeof(ticks));
                 }
-                std::memcpy(pointer, &query_base->value, sizeof(query_base->value));
-            } else {
+                if (!superseded) {
+                    std::memcpy(pointer, &query_base->value, sizeof(query_base->value));
+                }
+            } else if (!superseded) {
                 const u32 word = static_cast<u32>(query_base->value);
                 std::memcpy(pointer, &word, sizeof(word));
             }
@@ -506,12 +513,17 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             FinishReads(cpu_addr, has_timestamp ? 16 : 4);
             // EXP13=2: marked before the word is written (nx2.h).
             Tegra::Nx2NoteLanded(cpu_addr, payload, Tegra::Nx2Landing::QueryImmediate);
+            // EDEN_NX2_RUNAHEAD: the split's front wrote this word already, for this release or a
+            // later one; writing it again would undo what the guest CPU did since.
+            const bool superseded = VideoCommon::Runahead::LandingSuperseded(cpu_addr);
             if (has_timestamp) {
                 u64 timestamp = impl->gpu.GetTicks();
                 u64 value = static_cast<u64>(payload);
                 std::memcpy(pointer_timestamp, &timestamp, sizeof(timestamp));
-                std::memcpy(pointer, &value, sizeof(value));
-            } else {
+                if (!superseded) {
+                    std::memcpy(pointer, &value, sizeof(value));
+                }
+            } else if (!superseded) {
                 std::memcpy(pointer, &payload, sizeof(payload));
             }
             Tegra::Nx2SemaphoreWaiters::Get().OnWrite(cpu_addr, payload);

@@ -36,6 +36,7 @@
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_runahead.h"
 
 namespace VideoCommon {
 
@@ -215,6 +216,9 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     (void)switches_read;
     ring = std::make_unique<u64[]>(RingWords);
     ++session;
+    // EDEN_NX2_RUNAHEAD: Ocarina of Time only.
+    Runahead::Reset();
+    Runahead::SetProgramId(system_.GetApplicationProcessProgramID());
     back_thread = std::jthread([this](std::stop_token stop_token) { BackLoop(stop_token); });
     active = true;
     const char* jit = std::getenv("EDEN_NX2_MME_JIT");
@@ -289,6 +293,8 @@ void GpuSplit::Stop() {
     back_idle_at.store(~u64{0}, std::memory_order_relaxed);
     back_waiting.store(false, std::memory_order_relaxed);
     front_waiting.store(false, std::memory_order_relaxed);
+    // Run-ahead's positions are ring positions too; queued chunks' bytes are in guest memory.
+    Runahead::Reset();
 }
 
 u64* GpuSplit::ReserveSlow(size_t words) {
@@ -1399,6 +1405,11 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 }
             }
             back_entry_position = read_position;
+            // EDEN_NX2_RUNAHEAD: chunks of CPU writes due before this entry (nx2_runahead.h).
+            if (read_position >= Runahead::g_apply_at.load(std::memory_order_relaxed))
+                [[unlikely]] {
+                Runahead::ApplyDue(read_position);
+            }
             const size_t size =
                 Execute(&ring[index], std::min<u64>(available - read_position, RingWords - index));
             read_position += size != 0 ? size : RingWords - index;

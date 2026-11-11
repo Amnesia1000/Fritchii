@@ -1596,6 +1596,26 @@ void BufferCache<P>::ClaimCpuWrites(std::span<const std::pair<DAddr, u64>> range
 }
 
 template <class P>
+void BufferCache<P>::Nx2ApplyCpuBytes(DAddr device_addr, u64 size, const u8* bytes) {
+    if (size == 0) {
+        return;
+    }
+    const DAddr page = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
+    if (device_addr + size <= page + Core::DEVICE_PAGESIZE) {
+        if (const auto it = native_indirect_page_snapshots.find(page);
+            it != native_indirect_page_snapshots.end()) {
+            std::memcpy(it->second.words.data() + (device_addr - page), bytes, size);
+        }
+    }
+    if (!IsRegionRegistered(device_addr, static_cast<size_t>(size))) {
+        WriteMemory(device_addr, size);
+        return;
+    }
+    InlineMemoryImplementation(device_addr, static_cast<size_t>(size),
+                               std::span<const u8>(bytes, static_cast<size_t>(size)));
+}
+
+template <class P>
 Common::RangeSet<DAddr> BufferCache<P>::PendingCpuWriteRanges() {
     Common::RangeSet<DAddr> ranges;
     if (pending_cpu_writes) {
@@ -2020,9 +2040,16 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     // now and then (white flashes in Ocarina of Time, Eglantine 031e07436c).
     // Decided before the bank check, which changes nothing it reads (marking pages CPU-modified
     // leaves their GPU bits alone).
+    // EDEN_NX2_RUNAHEAD: behind the run-ahead frontier guest memory may already hold the next
+    // frame's bytes; the host buffer, which the run-ahead chunks keep exact, is bound instead of
+    // a stream of guest memory. A misaligned bind still streams (counted as a risk).
+    if (needs_alignment_stream) {
+        (void)VideoCommon::Runahead::BackHolds(VideoCommon::Runahead::Hold::AlignedStream);
+    }
     const bool use_fast_buffer = needs_alignment_stream
         || (has_host_buffer && size <= channel_state->uniform_buffer_skip_cache_size
-            && !memory_tracker.IsRegionGpuModified(device_addr, size));
+            && !memory_tracker.IsRegionGpuModified(device_addr, size)
+            && !VideoCommon::Runahead::BackHolds(VideoCommon::Runahead::Hold::FastUniform));
     const bool native_bank_bind = has_host_buffer &&
                                   (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000 &&
                                   size != 0 && gpu_memory != nullptr &&
@@ -2033,7 +2060,13 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     // would take stay set for the next bind that reads the host buffer.
     const int bank_trims = native_bank_bind ? VideoCore::Nx2Debug::Experiment(26) : 0;
     const bool native_bank = native_bank_bind && !(use_fast_buffer && (bank_trims & 1) != 0);
-    if (const int tracked_mode = native_bank ? VideoCore::Nx2Debug::Experiment(9) : 0;
+    // EDEN_NX2_RUNAHEAD: behind the frontier the bank's guest pages may hold the next frame (the
+    // chunks put this draw's bytes in the host buffer and the snapshots): compared again at a
+    // bind past it (the write flags stay set until then).
+    if (native_bank &&
+        VideoCommon::Runahead::BackHolds(VideoCommon::Runahead::Hold::BankCompare)) {
+        // Held: nothing compared, nothing taken.
+    } else if (const int tracked_mode = native_bank ? VideoCore::Nx2Debug::Experiment(9) : 0;
         tracked_mode != 0) {
         CheckNativeBankPagesTracked(device_addr, size, tracked_mode, bank_trims, buffer);
     } else if (native_bank) {
@@ -2063,7 +2096,13 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         if (cost_mode != 0) {
             ++cost.binds;
         }
-        Buffer* const bank_upload_to = (bank_trims & 4) != 0 ? &buffer : nullptr;
+        // EDEN_NX2_RUNAHEAD: once the frontier moved this session, a changed page goes up from
+        // its snapshot now: a CPU-modified mark would read guest memory after a later boundary.
+        Buffer* const bank_upload_to =
+            (bank_trims & 4) != 0 ||
+                    VideoCommon::Runahead::g_frontier.load(std::memory_order_relaxed) != 0
+                ? &buffer
+                : nullptr;
         NativeBankUploads bank_uploads;
         for (DAddr page = first_page; page < end; page += Core::DEVICE_PAGESIZE) {
             const u8* const guest = device_memory.template GetPointer<u8>(page);
@@ -2374,7 +2413,11 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
     const bool any_cpu_dirty = memory_tracker.IsRegionCpuModified(first_page, end - first_page);
     auto& stats = native_bank_tracked_stats;
     ++stats.binds;
-    Buffer* const upload_to = (trims & 4) != 0 ? &buffer : nullptr;
+    // EDEN_NX2_RUNAHEAD: as in the untracked check (BindHostGraphicsUniformBuffer).
+    Buffer* const upload_to =
+        (trims & 4) != 0 || VideoCommon::Runahead::g_frontier.load(std::memory_order_relaxed) != 0
+            ? &buffer
+            : nullptr;
     NativeBankUploads uploads;
     for (DAddr page = first_page; page < end; page += Core::DEVICE_PAGESIZE) {
         const u8* const guest = device_memory.template GetPointer<u8>(page);

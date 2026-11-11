@@ -96,6 +96,13 @@ inline std::atomic<int> g_arb_spin{-1};
 /// every 16 pauses, instead of a SwitchToThread and a clock read per iteration. Live: read on
 /// every Idle.
 inline std::atomic<int> g_idle_pause{-1};
+/// EDEN_NX2_RUNAHEAD (live, Ocarina of Time only, default 0; video_core/nx2_runahead.h): 1 = the
+/// split's front answers acquires a release it sent meets without draining and writes the word
+/// early, with the guest's CPU writes snapshotted per boundary for the back; 2 = verify (old path,
+/// chunks compared with guest memory at their stamp); 3 = early answers without writing the word.
+inline std::atomic<int> g_runahead{-1};
+/// EDEN_NX2_RUNAHEAD_MS (live, default 16): how far the back may lag the oldest early answer.
+inline std::atomic<int> g_runahead_ms{-1};
 
 /// Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP63, live through the debug server:
 /// slots for batches of fixes built together and A/B-tested in one session
@@ -490,6 +497,12 @@ inline void LoadExperiments() {
     }
     if (name == "EDEN_NX2_IDLE_PAUSE") {
         return &g_idle_pause;
+    }
+    if (name == "EDEN_NX2_RUNAHEAD") {
+        return &g_runahead;
+    }
+    if (name == "EDEN_NX2_RUNAHEAD_MS") {
+        return &g_runahead_ms;
     }
     return nullptr;
 }
