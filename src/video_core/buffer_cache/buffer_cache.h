@@ -219,6 +219,7 @@ template <class P>
 void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu_data) {
     Nx2NoteListHostWrite(device_addr, size);
     Core::g_buffer_write_pages.Mark(device_addr, size);
+    Core::g_watch_write_pages.Mark(device_addr, size);
     // The written range lies within its pages: when they hold no GPU-written data, both lookups
     // below find nothing, so one lookup answers them.
     if (Nx2Perf::On(Nx2Perf::Opt::WriteIntersections) && keep_page_gpu_data) {
@@ -1631,6 +1632,7 @@ template <class P>
 void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_written,
                                            DAddr device_addr, const u8* data, u64 size) {
     Core::g_buffer_write_pages.Mark(device_addr, size);
+    Core::g_watch_write_pages.Mark(device_addr, size);
     if (!cpu_written.Intersects(device_addr, size)) {
         device_memory.WriteBlockUnsafe(device_addr, data, size);
         return;
@@ -4349,6 +4351,7 @@ template <class P>
 void BufferCache<P>::InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
                                                 std::span<const u8> inlined_buffer) {
     Core::g_buffer_write_pages.Mark(dest_address, copy_size);
+    Core::g_watch_write_pages.Mark(dest_address, copy_size);
     ClearDownload(dest_address, copy_size);
     gpu_modified_ranges.Subtract(dest_address, copy_size);
     MarkVertexBuffersStale(dest_address, copy_size);

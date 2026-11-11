@@ -361,6 +361,58 @@ private:
                            std::span<const DescriptorUpdateEntry> descriptors,
                            std::span<const u8> rescaled, int switch_value);
 
+    /// EDEN_NX2_TEX_BANK_GEN (Hookshot (NotRexed/Hookshot) 11d2c1a's per-stage texture bank
+    /// generations): this pipeline's last resolved textures and what they were resolved from.
+    /// Only for pipelines whose bindings are all sampled textures with handles read straight
+    /// from constant buffers (TexBankEligible).
+    struct TexBankMemo {
+        bool valid{};
+        s8 eligible{-1}; ///< -1: not decided yet
+        int switch_value{};
+        u64 page_epoch{}; ///< TextureCache::TexBankEpoch() the page pointers belong to
+        TextureCache::TextureMemoState state{};
+        bool via_header_index{};
+        bool null_pointer_handles{}; ///< EXP21
+        /// Record backoff: a memo that was never hit before the next record makes the pipeline
+        /// skip 2^backoff - 1 records (exact either way: only whether to keep a memo).
+        bool hit_since_record{};
+        bool recorded_once{};
+        u8 backoff{};
+        u8 countdown{};
+        struct Cbuf {
+            u32 stage;
+            u32 index;
+            GPUVAddr address;
+            u32 size;
+            bool enabled;
+        };
+        std::vector<Cbuf> cbufs; ///< the bindings the handle words are read from
+        struct Page {
+            TextureCache::TexBankPage* page;
+            u64 gen;
+        };
+        std::vector<Page> pages; ///< handle word, TIC and TSC entry pages, at record time
+        std::vector<u32> handles; ///< per texture: the TIC handle (views[i].index)
+        std::vector<VideoCommon::ImageViewId> views;
+        std::vector<VideoCommon::SamplerId> samplers;
+    };
+
+    /// Whether this pipeline can keep a texture bank memo (decided once).
+    [[nodiscard]] bool TexBankEligible();
+
+    /// Whether the memo holds this draw's textures: same state, same handle constant buffer
+    /// bindings, every page at its generation (counts why not).
+    [[nodiscard]] bool TexBankHit(const TextureCache::TextureMemoState& state,
+                                  bool via_header_index, bool null_pointer_handles,
+                                  int switch_value);
+
+    /// Remembers what this draw resolved the full way, with the pages it read from.
+    void RecordTexBank(const TextureCache::TextureMemoState& state,
+                       std::span<const VideoCommon::ImageViewInOut> views,
+                       std::span<const u32> sampler_handles,
+                       std::span<const VideoCommon::SamplerId> samplers, bool via_header_index,
+                       bool null_pointer_handles, int switch_value);
+
     template <typename Spec>
     bool ConfigureImpl(bool is_indexed);
 
@@ -425,6 +477,9 @@ private:
     u32 color_output_mask{};
     bool writes_storage{};
     TextureMemo texture_memo;
+    TexBankMemo tex_bank_memo;
+    /// EDEN_NX2_TEX_BANK_GEN: (stage, constant buffer index) of every handle word read.
+    std::vector<std::pair<u32, u32>> tex_bank_cbuf_slots;
 
     /// Graphics pipeline libraries (EDEN_NX2_GPL): one descriptor set per stage (set index =
     /// stage index), the shader libraries, and this pipeline's own vertex input and fragment

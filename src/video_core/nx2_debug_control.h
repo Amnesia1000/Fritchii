@@ -179,6 +179,19 @@ inline std::atomic<int> g_bank_slots{-1};
 /// skipped bank that the page loop finds a reason for are counted as "disagreed" (must stay 0).
 /// Logged every 5 s ("Native bank slot skip"). Costs what the skip saves. 1 = on.
 inline std::atomic<int> g_bank_skip_verify{-1};
+/// EDEN_NX2_TEX_BANK_GEN (live, default 0; Hookshot (NotRexed/Hookshot) 11d2c1a's per-stage
+/// texture bank generations, research idea 2): a graphics pipeline whose bindings are all sampled
+/// textures with handles read straight from constant buffers (no handle programs) keeps the view
+/// and sampler ids its last draw resolved, with the generations of the pages that draw read
+/// handle words and TIC/TSC entries from (TextureCache::TexBankPage: watched pages trap CPU
+/// writes; our constant buffer words, buffer cache writes and InvalidateRegion mark them too).
+/// A draw with the same handle constant buffer bindings, the same TextureMemoState (pools,
+/// limits, channel, mappings, no view removed), the same sampler binding mode and every page at
+/// its generation takes those ids: no handle reads, no table reads, no GetSamplerId; the views
+/// are still prepared (PrepareImageView). A miss costs the compares. Vulkan GraphicsPipeline::
+/// ConfigureImpl; not with EXP32. 1 = on, 2 = on and every 16th hit resolves the full way and
+/// compares ("Texture bank memo mismatch", must stay 0). Logged every 10 s ("Texture bank memo").
+inline std::atomic<int> g_tex_bank_gen{-1};
 
 /// Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP63, live through the debug server:
 /// slots for batches of fixes built together and A/B-tested in one session
@@ -614,6 +627,9 @@ inline void LoadExperiments() {
     }
     if (name == "EDEN_NX2_BANK_SKIP_VERIFY") {
         return &g_bank_skip_verify;
+    }
+    if (name == "EDEN_NX2_TEX_BANK_GEN") {
+        return &g_tex_bank_gen;
     }
     return nullptr;
 }

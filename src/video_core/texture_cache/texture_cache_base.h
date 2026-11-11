@@ -36,6 +36,7 @@
 #include "common/slot_vector.h"
 #include "video_core/texture_cache/pending_download.h"
 #include "common/thread_worker.h"
+#include "core/gpu_dirty_memory_manager.h"
 #include "video_core/compatible_formats.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/delayed_destruction_ring.h"
@@ -423,6 +424,62 @@ public:
 
     /// What preparing the view does once its contents are clean: the image's LRU touch.
     void TouchTextureMemoView(ImageViewId view) noexcept;
+
+    /// EDEN_NX2_TEX_BANK_GEN (Hookshot (NotRexed/Hookshot) 11d2c1a's per-stage texture bank
+    /// generations, research idea 2): a device page whose writes texture bank memos must see
+    /// (pages holding texture handle words and the TIC/TSC entries draws read). A watched page
+    /// counts as cached (UpdatePagesCachedCount), so guest CPU writes to it trap and mark
+    /// Core::g_watch_write_pages, as do the buffer cache's writes (our own constant buffer words
+    /// at FlushCaching among them) and WriteMemory. `gen` moves when a look finds the mark, and
+    /// again at the next look (a trapped CPU write marks before its bytes land; a page watched
+    /// just now was not trapped when the draw read it).
+    struct TexBankPage {
+        DAddr page{};
+        u64 gen = 1;
+        bool recheck = true;
+    };
+
+    /// The page's generation after taking its write mark.
+    static u64 TexBankPageGen(TexBankPage& page) noexcept {
+        const bool marked = Core::g_watch_write_pages.Take(page.page);
+        if (marked || page.recheck) {
+            ++page.gen;
+        }
+        page.recheck = marked;
+        return page.gen;
+    }
+
+    /// The watch of `page` (page aligned), made (and the page made to trap CPU writes) when there
+    /// is none (`created`). Pointers stay valid while TexBankEpoch() stands.
+    [[nodiscard]] TexBankPage* TexBankWatch(DAddr page, bool& created);
+
+    /// Moves whenever watches are dropped (TexBankReset): a memo of another epoch holds dead
+    /// pointers and must not look at them.
+    [[nodiscard]] u64 TexBankEpoch() const noexcept {
+        return tex_bank_epoch;
+    }
+
+    [[nodiscard]] bool TexBankWatching() const noexcept {
+        return !tex_bank_pages.empty();
+    }
+
+    /// Drops every watch (the pages trap as the caches' own counts say again).
+    void TexBankReset();
+
+    /// What VisitImageView does for a table entry it read before (PrepareImageView of each
+    /// non-null view), for views a memo resolved. False when that deleted images: the caller
+    /// resolves the full way (FillImageViews loops for the same reason).
+    [[nodiscard]] bool PrepareTexBankViews(std::span<const ImageViewId> views);
+
+    /// The device page `gpu_addr` lies in, or nullopt when unmapped.
+    [[nodiscard]] std::optional<DAddr> TexBankDevicePage(GPUVAddr gpu_addr) const;
+
+    /// The graphics tables' limits and native tiling, as VisitImageView and GetSamplerId use.
+    [[nodiscard]] u32 GraphicsTicIndex(u32 tic_handle) const noexcept {
+        return Tegra::Texture::TextureHeaderIndex(tic_handle,
+                                                  channel_state->graphics_image_table.current_limit,
+                                                  gpu_memory->UsesNativeTiling());
+    }
 
     [[nodiscard]] u64 FrameTick() const noexcept {
         return frame_tick;
@@ -854,6 +911,10 @@ private:
     u64 bindings_epoch = 1;
     /// See TextureMemoState::epoch (EXP32). 0 never matches.
     u64 texture_memo_epoch = 1;
+    /// EDEN_NX2_TEX_BANK_GEN: the watched pages (std::unordered_map: entries stay where they are)
+    /// and the epoch of their pointers.
+    std::unordered_map<DAddr, TexBankPage> tex_bank_pages;
+    u64 tex_bank_epoch = 1;
     u32 rt_active_mask = 0;
     std::array<ImageId, 8> rt_image_id{};
     ImageId rt_depth_image_id{};

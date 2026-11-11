@@ -201,6 +201,58 @@ struct TextureMemoControl {
         miss_images{}, recorded{}, refused{}, verified{}, mismatches{};
 };
 
+// EDEN_NX2_TEX_BANK_GEN (GraphicsPipeline::TexBankMemo): counts, logged every 10 s while the
+// switch is set, and the verify cadence (value 2: one hit in VERIFY_EVERY resolves the full way).
+// Used by the GPU back thread only.
+struct TexBankControl {
+    static constexpr u64 VERIFY_EVERY = 16;
+
+    static TexBankControl& Get() {
+        static TexBankControl control;
+        return control;
+    }
+
+    [[nodiscard]] bool ShouldVerify() {
+        return ++verify_counter % VERIFY_EVERY == 0;
+    }
+
+    void Frame() {
+        const int value = VideoCore::Nx2Debug::g_tex_bank_gen.load(std::memory_order_relaxed);
+        if (value <= 0 && lookups == 0 && ineligible == 0) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (window_start == std::chrono::steady_clock::time_point{}) {
+            window_start = now;
+            return;
+        }
+        const double seconds = std::chrono::duration<double>(now - window_start).count();
+        if (seconds < 10.0) {
+            return;
+        }
+        const double hit_share =
+            lookups != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(lookups) : 0.0;
+        LOG_INFO(Render_Vulkan,
+                 "Texture bank memo (TEX_BANK_GEN={}) last {:.1f} s: {} draws looked up, {} hits "
+                 "({:.1f}%), {} draws of other pipelines | misses: no memo {}, state {}, handle "
+                 "bindings {}, pages {} | recorded {}, refused {}, backed off {} | prepare "
+                 "fallbacks {} | verified {}, mismatches {}",
+                 value, seconds, lookups, hits, hit_share, ineligible, miss_no_memo, miss_state,
+                 miss_cbufs, miss_pages, recorded, refused, backed_off, prepare_fallbacks,
+                 verified, mismatches);
+        lookups = hits = ineligible = miss_no_memo = miss_state = miss_cbufs = miss_pages = 0;
+        recorded = refused = backed_off = prepare_fallbacks = verified = mismatches = 0;
+        window_start = now;
+    }
+
+    u64 verify_counter = 0;
+    u32 mismatches_logged = 0;
+    std::chrono::steady_clock::time_point window_start{};
+    u64 lookups{}, hits{}, ineligible{}, miss_no_memo{}, miss_state{}, miss_cbufs{},
+        miss_pages{}, recorded{}, refused{}, backed_off{}, prepare_fallbacks{}, verified{},
+        mismatches{};
+};
+
 /// A Vulkan handle's bits, for logs (a pointer or a 64-bit integer, depending on the platform).
 template <typename Handle>
 u64 HandleBits(Handle handle) {
@@ -474,6 +526,7 @@ void NoteDrawReuseProbeFrame() {
     }
     // The texture binding memo's frame too (EXP32: verify window, switch changes, its log).
     TextureMemoControl::Get().Frame();
+    TexBankControl::Get().Frame();
 }
 
 std::chrono::nanoseconds GraphicsPipeline::TakeHoldTime() noexcept {
@@ -943,6 +996,214 @@ bool GraphicsPipeline::VerifyTextureMemo(std::span<const VideoCommon::ImageViewI
     return false;
 }
 
+bool GraphicsPipeline::TexBankEligible() {
+    TexBankMemo& memo = tex_bank_memo;
+    if (memo.eligible < 0) [[unlikely]] {
+        // Sampled textures only (no texture or image buffers, no images): what ConfigureImpl
+        // resolves is then the textures' views and samplers, in stage order.
+        bool eligible = num_textures != 0 && num_image_elements == num_textures;
+        tex_bank_cbuf_slots.clear();
+        const auto add_slot = [&](u32 stage, u32 index) {
+            if (index >= Maxwell::MaxConstBuffers) {
+                eligible = false;
+                return;
+            }
+            const std::pair<u32, u32> slot{stage, index};
+            if (std::ranges::find(tex_bank_cbuf_slots, slot) == tex_bank_cbuf_slots.end()) {
+                tex_bank_cbuf_slots.push_back(slot);
+            }
+        };
+        for (size_t stage = 0; eligible && stage < NUM_STAGES; ++stage) {
+            for (const auto& desc : stage_infos[stage].texture_descriptors) {
+                // Handle programs compute the handle from storage buffers: always the full way.
+                if (desc.handle_program != ~0U) {
+                    eligible = false;
+                    break;
+                }
+                add_slot(static_cast<u32>(stage), desc.cbuf_index);
+                if (desc.has_secondary) {
+                    add_slot(static_cast<u32>(stage), desc.secondary_cbuf_index);
+                }
+            }
+        }
+        memo.eligible = eligible ? 1 : 0;
+    }
+    return memo.eligible == 1;
+}
+
+bool GraphicsPipeline::TexBankHit(const TextureCache::TextureMemoState& state,
+                                  bool via_header_index, bool null_pointer_handles,
+                                  int switch_value) {
+    auto& control = TexBankControl::Get();
+    ++control.lookups;
+    TexBankMemo& memo = tex_bank_memo;
+    // The epoch first: the page pointers of another epoch are gone.
+    if (!memo.valid || memo.switch_value != switch_value ||
+        memo.page_epoch != texture_cache.TexBankEpoch()) {
+        ++control.miss_no_memo;
+        return false;
+    }
+    if (memo.state != state || memo.via_header_index != via_header_index ||
+        memo.null_pointer_handles != null_pointer_handles) {
+        ++control.miss_state;
+        return false;
+    }
+    const auto& stages = maxwell3d->state.shader_stages;
+    for (const TexBankMemo::Cbuf& cbuf : memo.cbufs) {
+        const auto& bound = stages[cbuf.stage].const_buffers[cbuf.index];
+        if (bound.enabled != cbuf.enabled || bound.address != cbuf.address ||
+            bound.size != cbuf.size) {
+            ++control.miss_cbufs;
+            return false;
+        }
+    }
+    for (TexBankMemo::Page& page : memo.pages) {
+        if (TextureCache::TexBankPageGen(*page.page) != page.gen) {
+            ++control.miss_pages;
+            return false;
+        }
+    }
+    ++control.hits;
+    memo.hit_since_record = true;
+    return true;
+}
+
+void GraphicsPipeline::RecordTexBank(const TextureCache::TextureMemoState& state,
+                                     std::span<const VideoCommon::ImageViewInOut> views,
+                                     std::span<const u32> sampler_handles,
+                                     std::span<const VideoCommon::SamplerId> samplers,
+                                     bool via_header_index, bool null_pointer_handles,
+                                     int switch_value) {
+    auto& control = TexBankControl::Get();
+    TexBankMemo& memo = tex_bank_memo;
+    // Backoff: a memo never hit before the next record makes the next records rarer.
+    if (memo.countdown != 0) {
+        --memo.countdown;
+        memo.valid = false;
+        ++control.backed_off;
+        return;
+    }
+    if (memo.recorded_once && !memo.hit_since_record) {
+        memo.backoff = static_cast<u8>((std::min)(memo.backoff + 1, 4));
+    } else {
+        memo.backoff = 0;
+    }
+    memo.countdown = static_cast<u8>((1u << memo.backoff) - 1);
+    memo.recorded_once = true;
+    memo.hit_since_record = false;
+    memo.valid = false;
+    const auto refuse = [&control] { ++control.refused; };
+    if (sampler_handles.size() != views.size() || samplers.size() != views.size()) {
+        return refuse();
+    }
+    // An image made, joined, deleted or rescaled while resolving, or the pools moved: the same
+    // state need not give these ids again.
+    if (texture_cache.GraphicsTextureMemoState() != state) {
+        return refuse();
+    }
+    const auto& stages = maxwell3d->state.shader_stages;
+    memo.cbufs.clear();
+    for (const auto& [stage, index] : tex_bank_cbuf_slots) {
+        const auto& bound = stages[stage].const_buffers[index];
+        memo.cbufs.push_back(TexBankMemo::Cbuf{
+            .stage = stage,
+            .index = index,
+            .address = bound.address,
+            .size = bound.size,
+            .enabled = bound.enabled,
+        });
+    }
+    // The GPU pages this draw read: handle words (as read_handle), TIC entries (as
+    // VisitImageView: none past the limit) and TSC entries (as GetSamplerId).
+    boost::container::small_vector<GPUVAddr, 32> gpu_pages;
+    const auto add = [&gpu_pages](GPUVAddr address) {
+        const GPUVAddr page = address & ~GPUVAddr{Core::DEVICE_PAGEMASK};
+        if (std::ranges::find(gpu_pages, page) == gpu_pages.end()) {
+            gpu_pages.push_back(page);
+        }
+    };
+    size_t texture = 0;
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        const Shader::Info& info = stage_infos[stage];
+        const auto& cbufs = stages[stage].const_buffers;
+        for (const auto& desc : info.texture_descriptors) {
+            for (u32 index = 0; index < desc.count; ++index, ++texture) {
+                if (texture >= views.size()) {
+                    return refuse();
+                }
+                if (!(null_pointer_handles &&
+                      VideoCommon::HandleIsStoragePointer(info, desc, index))) {
+                    if (!cbufs[desc.cbuf_index].enabled) {
+                        return refuse();
+                    }
+                    add(cbufs[desc.cbuf_index].address + desc.cbuf_offset +
+                        (index << desc.size_shift));
+                    if (desc.has_secondary) {
+                        if (!cbufs[desc.secondary_cbuf_index].enabled) {
+                            return refuse();
+                        }
+                        add(cbufs[desc.secondary_cbuf_index].address +
+                            desc.secondary_cbuf_offset);
+                    }
+                }
+                const u32 tic_index = texture_cache.GraphicsTicIndex(views[texture].index);
+                if (tic_index <= state.tic_limit) {
+                    add(state.tic_pool + u64{tic_index} * sizeof(Tegra::Texture::TICEntry));
+                }
+                if (sampler_handles[texture] <= state.tsc_limit) {
+                    add(state.tsc_pool +
+                        u64{sampler_handles[texture]} * sizeof(Tegra::Texture::TSCEntry));
+                }
+            }
+        }
+    }
+    if (texture != views.size()) {
+        return refuse();
+    }
+    const u64 epoch = texture_cache.TexBankEpoch();
+    memo.pages.clear();
+    for (const GPUVAddr gpu_page : gpu_pages) {
+        const std::optional<DAddr> device_page = texture_cache.TexBankDevicePage(gpu_page);
+        if (!device_page) {
+            return refuse();
+        }
+        if (std::ranges::any_of(memo.pages, [&](const TexBankMemo::Page& page) {
+                return page.page->page == *device_page;
+            })) {
+            continue;
+        }
+        bool created = false;
+        TextureCache::TexBankPage* const page = texture_cache.TexBankWatch(*device_page, created);
+        if (texture_cache.TexBankEpoch() != epoch) {
+            // The watches were dropped while adding this one: the pointers taken are gone.
+            return refuse();
+        }
+        memo.pages.push_back(TexBankMemo::Page{
+            .page = page,
+            .gen = TextureCache::TexBankPageGen(*page),
+        });
+        if (created) {
+            // Not trapped yet when this draw read it: a CPU write in between marked nothing.
+            // The next look moves the generation, so the next draw resolves again, trapped.
+            page->recheck = true;
+        }
+    }
+    memo.handles.resize(views.size());
+    memo.views.resize(views.size());
+    for (size_t index = 0; index < views.size(); ++index) {
+        memo.handles[index] = views[index].index;
+        memo.views[index] = views[index].id;
+    }
+    memo.samplers.assign(samplers.begin(), samplers.end());
+    memo.state = state;
+    memo.page_epoch = epoch;
+    memo.switch_value = switch_value;
+    memo.via_header_index = via_header_index;
+    memo.null_pointer_handles = null_pointer_handles;
+    memo.valid = true;
+    ++control.recorded;
+}
+
 template <typename Spec>
 bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     zero_texture_handles = 0;
@@ -980,6 +1241,36 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
 
     const auto& regs{maxwell3d->regs};
     const bool via_header_index{regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
+    // EDEN_NX2_TEX_BANK_GEN (Hookshot (NotRexed/Hookshot) 11d2c1a, research idea 2): the
+    // textures of this pipeline's last draw, while the pages their handle words and TIC/TSC
+    // entries were read from kept their generations (TexBankHit). Not with EXP32.
+    // Not while CPU inner invalidation is skipped: constant buffer words then mark no page.
+    const int tex_bank_switch =
+        memo_switch == 0 && !Settings::values.skip_cpu_inner_invalidation.GetValue()
+            ? VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_tex_bank_gen,
+                                               "EDEN_NX2_TEX_BANK_GEN")
+            : 0;
+    if (tex_bank_switch <= 0 && texture_cache.TexBankWatching()) [[unlikely]] {
+        texture_cache.TexBankReset();
+    }
+    const bool tex_bank_null_pointers{VideoCore::Nx2Debug::Experiment(21) != 0};
+    const bool tex_bank_on = tex_bank_switch > 0 && TexBankEligible();
+    if (tex_bank_switch > 0 && !tex_bank_on) {
+        ++TexBankControl::Get().ineligible;
+    }
+    bool tex_bank_hit = false;
+    bool tex_bank_verify = false;
+    TextureCache::TextureMemoState tex_bank_state{};
+    boost::container::small_vector<u32, 96> tex_bank_sampler_handles;
+    if (tex_bank_on) {
+        Profile::Scope scope{Profile::Zone::ReadHandles};
+        tex_bank_state = texture_cache.GraphicsTextureMemoState();
+        if (TexBankHit(tex_bank_state, via_header_index, tex_bank_null_pointers,
+                       tex_bank_switch)) {
+            tex_bank_verify = tex_bank_switch == 2 && TexBankControl::Get().ShouldVerify();
+            tex_bank_hit = !tex_bank_verify;
+        }
+    }
     const auto config_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         const Shader::Info& info{stage_infos[stage]};
         {
@@ -995,6 +1286,10 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                     ++ssbo_index;
                 }
             }
+        }
+        if (tex_bank_hit) {
+            // EDEN_NX2_TEX_BANK_GEN: the textures come from the memo (no handle reads).
+            return true;
         }
         const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
         const auto read_handle{[&](const auto& desc, u32 index) {
@@ -1073,7 +1368,8 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             }
         }
         // EDEN_NX2_EXP21 (default 1; 0 = off): no texture for a handle that is a buffer address.
-        const bool null_pointer_handles{VideoCore::Nx2Debug::Experiment(21) != 0};
+        // Read once per draw (TEX_BANK_GEN keys its memo on the same value).
+        const bool null_pointer_handles{tex_bank_null_pointers};
         for (const auto& desc : info.texture_descriptors) {
             for (u32 index = 0; index < desc.count; ++index) {
                 const auto handle{null_pointer_handles &&
@@ -1112,6 +1408,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                     }
                 }
                 views.push_back({handle.first});
+                if (tex_bank_on) {
+                    tex_bank_sampler_handles.push_back(handle.second);
+                }
 
                 if (texture_memo_on) {
                     sampler_handles.push_back(handle.second);
@@ -1146,6 +1445,13 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
         if constexpr (Spec::enabled_stages[4]) {
             config_stage(4);
+        }
+        if (tex_bank_hit) {
+            const TexBankMemo& memo = tex_bank_memo;
+            for (const u32 handle : memo.handles) {
+                views.push_back({.index = handle, .blacklist = false, .id = {}});
+            }
+            samplers.assign(memo.samplers.begin(), memo.samplers.end());
         }
     }
     Profile::AddFine(Profile::FineCounter::TextureHandles, views.size());
@@ -1187,9 +1493,71 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
                                              Spec::has_images);
             }
+        } else if (tex_bank_hit) {
+            // EDEN_NX2_TEX_BANK_GEN: the memo's views, prepared as VisitImageView prepares a
+            // table entry it read before.
+            const TexBankMemo& memo = tex_bank_memo;
+            for (size_t index = 0; index < views.size(); ++index) {
+                views[index].id = memo.views[index];
+            }
+            if (!texture_cache.PrepareTexBankViews(memo.views)) {
+                // Preparing deleted images: resolve the views the full way (the handles and
+                // samplers stand; samplers are never deleted).
+                ++TexBankControl::Get().prepare_fallbacks;
+                texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
+                                             Spec::has_images);
+            }
         } else {
             texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
                                          Spec::has_images);
+        }
+        if (tex_bank_on && !tex_bank_hit) {
+            const std::span<const VideoCommon::ImageViewInOut> views_span{views.data(),
+                                                                          views.size()};
+            if (tex_bank_verify) {
+                // EDEN_NX2_TEX_BANK_GEN=2: a hit resolved the full way; the memo must agree.
+                auto& control = TexBankControl::Get();
+                ++control.verified;
+                const TexBankMemo& memo = tex_bank_memo;
+                size_t bad = views.size();
+                if (memo.views.size() == views.size() && memo.handles.size() == views.size() &&
+                    memo.samplers.size() == samplers.size() && samplers.size() == views.size()) {
+                    for (size_t index = 0; index < views.size(); ++index) {
+                        if (memo.handles[index] != views[index].index ||
+                            memo.views[index] != views[index].id ||
+                            memo.samplers[index] != samplers[index]) {
+                            bad = index;
+                            break;
+                        }
+                    }
+                } else {
+                    bad = 0;
+                }
+                if (bad != views.size()) {
+                    ++control.mismatches;
+                    if (control.mismatches_logged < 16) {
+                        ++control.mismatches_logged;
+                        const bool sized = bad < memo.views.size() && bad < memo.handles.size() &&
+                                           bad < memo.samplers.size();
+                        LOG_WARNING(
+                            Render_Vulkan,
+                            "Texture bank memo mismatch (TEX_BANK_GEN=2): pipeline {:016x} (vs "
+                            "{:016x} fs {:016x}) texture {} of {}: memo handle {:#x} view {} "
+                            "sampler {} | fresh handle {:#x} view {} sampler {}",
+                            key.Hash(), key.unique_hashes[1], key.unique_hashes[5], bad,
+                            views.size(), sized ? memo.handles[bad] : 0U,
+                            sized ? memo.views[bad].index : 0U,
+                            sized ? memo.samplers[bad].index : 0U, views[bad].index,
+                            views[bad].id.index, bad < samplers.size() ? samplers[bad].index : 0U);
+                    }
+                }
+            }
+            RecordTexBank(tex_bank_state, views_span,
+                          std::span<const u32>(tex_bank_sampler_handles.data(),
+                                               tex_bank_sampler_handles.size()),
+                          std::span<const VideoCommon::SamplerId>(samplers.data(),
+                                                                  samplers.size()),
+                          via_header_index, tex_bank_null_pointers, tex_bank_switch);
         }
     }
     ASSERT(samplers.size() == num_textures);

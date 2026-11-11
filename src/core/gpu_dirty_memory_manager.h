@@ -245,5 +245,10 @@ inline DevicePageFlags g_collected_write_pages;
 /// Pages whose guest memory the buffer cache saw change (WriteMemory, uploads in place,
 /// downloads).
 inline DevicePageFlags g_buffer_write_pages;
+/// EDEN_NX2_TEX_BANK_GEN: pages written by anyone the GPU side hears of: guest CPU writes that
+/// trapped (Memory::HandleRasterizerWrite, every one, collected or not), the buffer cache's
+/// writes (the same places as g_buffer_write_pages) and TextureCache::WriteMemory. Only the
+/// texture cache's watched-page harvest takes them (TextureCache::TexBankPageGen).
+inline DevicePageFlags g_watch_write_pages;
 
 } // namespace Core
