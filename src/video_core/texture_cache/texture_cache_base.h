@@ -707,15 +707,14 @@ private:
     /// EXP68 bit 1 (fable52_answer_npcdips 6): a depth clear whose scissor is the real width
     /// (the zeta width register rounded up to 16 in the same 64-byte column) goes to the exact
     /// image the following draws use. Verified by the next depth bind at the address.
-    struct ClearExactPending {
-        GPUVAddr gpu_addr{};
-        u32 width{};
-        u32 height{};
-    } clear_exact_pending{};
+    /// Per address: the exact size a clear went to this frame, until a depth bind there checks it.
+    std::unordered_map<GPUVAddr, std::pair<u32, u32>> clear_exact_pending;
     std::unordered_set<GPUVAddr> clear_exact_unsafe;
     u64 clear_exact_used{};
     u64 clear_exact_confirmed{};
     u64 clear_exact_missed{};
+    u64 clear_exact_unchecked{};
+    u64 no_pool_marked{}; ///< EXP68 bit 4: new images at size-varying addresses (skip the pool)
     u64 pad_depth_lookups{};   ///< New depth targets EXP67 looked at (render target lookups)
     u64 pad_not_varying{};     ///< ... at an address with no other-dims predecessor yet
     u64 pad_skipped_other{};   ///< ... refused: rescaling, not plain 2D, sampled address

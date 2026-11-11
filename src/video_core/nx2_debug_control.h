@@ -447,6 +447,8 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// the real width (zeta width rounded up to 16, same 64-byte column) looks up the scissor-wide image
 /// the draws then use, so OoT's per-NPC depth targets are one image a frame, not two plus an upload
 /// and alias copies. The next depth bind at the address checks the size; a miss turns it off there.
+/// Bit 4 = images at an address whose target keeps changing size skip the EXP42 pool (their dims
+/// never come back; the pool sat at 512 MiB during NPC passes).
 /// EXP67 (live; bucket in px, 0 = off): depth render targets at an address whose target changes
 /// dims get a host image rounded up to the bucket (ImageFlagBits::HostPadded), so the EXP42 pool
 /// reuses the VkImage for the next frames' nearby dims instead of a create + 0.2-1.3 ms depth bind

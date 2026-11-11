@@ -3309,7 +3309,7 @@ void Image::ReleaseToPool() {
     }
     constexpr ImageFlagBits unusual = ImageFlagBits::Sparse | ImageFlagBits::SparseLayers |
                                       ImageFlagBits::SparseTiles | ImageFlagBits::UnwrittenSparse |
-                                      ImageFlagBits::Unbacked;
+                                      ImageFlagBits::Unbacked | ImageFlagBits::NoPool;
     if (True(flags & unusual)) {
         return;
     }

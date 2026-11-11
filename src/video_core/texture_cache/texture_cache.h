@@ -815,13 +815,19 @@ void TextureCache<P>::TickFrame() {
         relocation_candidates = relocation_guarded = relocation_relocated = relocation_retired =
             relocation_crowded = 0;
     }
-    if ((clear_exact_used != 0 || clear_exact_missed != 0) && frame_tick % 600 == 0) {
+    clear_exact_unchecked += clear_exact_pending.size();
+    clear_exact_pending.clear();
+    if ((clear_exact_used != 0 || clear_exact_missed != 0 || no_pool_marked != 0) &&
+        frame_tick % 600 == 0) {
         LOG_INFO(HW_GPU,
                  "Clear to exact size (EXP68={}) last 600 frames: {} depth clears sent to the "
-                 "scissor's width, {} confirmed by the next bind, {} missed; {} addresses off",
+                 "scissor's width, {} confirmed by the next bind, {} missed, {} not bound again "
+                 "that frame; {} addresses off; {} images kept out of the pool",
                  VideoCore::Nx2Debug::Experiment(68), clear_exact_used, clear_exact_confirmed,
-                 clear_exact_missed, clear_exact_unsafe.size());
-        clear_exact_used = clear_exact_confirmed = clear_exact_missed = 0;
+                 clear_exact_missed, clear_exact_unchecked, clear_exact_unsafe.size(),
+                 no_pool_marked);
+        clear_exact_used = clear_exact_confirmed = clear_exact_missed = clear_exact_unchecked = 0;
+        no_pool_marked = 0;
     }
     if ((pad_depth_lookups != 0 || pad_sampled != 0) && frame_tick % 600 == 0) {
         LOG_INFO(HW_GPU,
@@ -4149,6 +4155,41 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         }
     }
     Image& new_image = slot_images[new_image_id];
+    if ((VideoCore::Nx2Debug::Experiment(68) & 4) != 0 && RelocationShaped(new_info)) {
+        // EXP68 bit 4 (fable52_answer_npcdips 2, item 3): same address and format, other dims
+        // among the overlaps: a size-varying slot. Its images skip the pool.
+        const auto other_dims = [&](ImageId id) {
+            const ImageBase& other = slot_images[id];
+            return other.gpu_addr == gpu_addr && other.info.format == new_info.format &&
+                   (other.info.size.width != new_info.size.width ||
+                    other.info.size.height != new_info.size.height);
+        };
+        bool varying = false;
+        for (const auto* ids : {&join_bad_overlap_ids}) {
+            for (const ImageId id : *ids) {
+                if (other_dims(id)) {
+                    varying = true;
+                    slot_images[id].flags |= ImageFlagBits::NoPool;
+                }
+            }
+        }
+        for (const ImageId id : join_left_aliased_ids) {
+            if (other_dims(id)) {
+                varying = true;
+                slot_images[id].flags |= ImageFlagBits::NoPool;
+            }
+        }
+        for (const ImageId id : join_right_aliased_ids) {
+            if (other_dims(id)) {
+                varying = true;
+                slot_images[id].flags |= ImageFlagBits::NoPool;
+            }
+        }
+        if (varying) {
+            new_image.flags |= ImageFlagBits::NoPool;
+            ++no_pool_marked;
+        }
+    }
     ++bindings_epoch;
 
     new_image.allocation_tick = frame_tick;
@@ -4663,12 +4704,11 @@ ImageViewId TextureCache<P>::FindDepthBuffer() {
         return ImageViewId{};
     }
     ImageInfo info(regs.zeta, regs.zeta_size, regs.anti_alias_samples_mode);
-    if (clear_exact_pending.gpu_addr != 0 && !clearing_render_targets) {
-        // EXP68 bit 1 check: the first depth bind after the clear, at the same address, uses the
-        // exact size the clear went to.
-        if (clear_exact_pending.gpu_addr == gpu_addr) {
-            if (info.size.width == clear_exact_pending.width &&
-                info.size.height == clear_exact_pending.height) {
+    if (!clearing_render_targets && !clear_exact_pending.empty()) {
+        // EXP68 bit 1 check: the first depth bind at an address after its clear uses the exact
+        // size the clear went to (several NPC targets are cleared before their draws).
+        if (const auto it = clear_exact_pending.find(gpu_addr); it != clear_exact_pending.end()) {
+            if (info.size.width == it->second.first && info.size.height == it->second.second) {
                 ++clear_exact_confirmed;
             } else {
                 ++clear_exact_missed;
@@ -4676,11 +4716,11 @@ ImageViewId TextureCache<P>::FindDepthBuffer() {
                 LOG_WARNING(HW_GPU,
                             "Clear to exact size (EXP68): the bind after the clear at {:#x} is "
                             "{}x{}, not {}x{}; this address keeps the register size",
-                            gpu_addr, info.size.width, info.size.height,
-                            clear_exact_pending.width, clear_exact_pending.height);
+                            gpu_addr, info.size.width, info.size.height, it->second.first,
+                            it->second.second);
             }
+            clear_exact_pending.erase(it);
         }
-        clear_exact_pending = {};
     }
     if (clearing_render_targets && (VideoCore::Nx2Debug::Experiment(68) & 1) != 0 &&
         regs.clear_surface.Z && regs.clear_control.use_scissor != 0 &&
@@ -4697,7 +4737,7 @@ ImageViewId TextureCache<P>::FindDepthBuffer() {
             Common::AlignUp(scissor_width * bytes, 64U) ==
                 Common::AlignUp(info.size.width * bytes, 64U)) {
             info.size.width = scissor_width;
-            clear_exact_pending = {gpu_addr, info.size.width, info.size.height};
+            clear_exact_pending[gpu_addr] = {info.size.width, info.size.height};
             ++clear_exact_used;
         }
     }

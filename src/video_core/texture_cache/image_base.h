@@ -65,6 +65,9 @@ enum class ImageFlagBits : u32 {
     /// left rectangle. Never sampled with normalized coordinates (a texture lookup that finds one
     /// stops the padding at its address).
     HostPadded = 1 << 24,
+    /// EXP68 bit 4: made at an address whose target keeps changing size: freed when the GPU is
+    /// done instead of going to the EXP42 pool (those dims never come back).
+    NoPool = 1 << 25,
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
 
