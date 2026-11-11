@@ -300,8 +300,14 @@ std::optional<s64> CoreTiming::Advance() {
             } else {
                 basic_lock.unlock();
 
-                const auto new_schedule_time{event_type->callback(
-                    evt_time, std::chrono::nanoseconds{GetGlobalTimeNs().count() - evt_time})};
+                // Time spent paused is not lateness: a callback that makes up for being late (the
+                // sysmix pump) would otherwise wait out the pause again after it.
+                const s64 now_ns{GetGlobalTimeNs().count()};
+                const s64 late_ns{now_ns - evt_time};
+                const std::chrono::nanoseconds late_since_pause{
+                    evt_time < pause_end_time ? (std::min)(late_ns, now_ns - pause_end_time)
+                                              : late_ns};
+                const auto new_schedule_time{event_type->callback(evt_time, late_since_pause)};
 
                 basic_lock.lock();
 
