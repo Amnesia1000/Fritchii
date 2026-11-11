@@ -1938,13 +1938,16 @@ void Device::RemoveUnsuitableExtensions() {
         cooperative_hmma_16x16x16 =
             usable && has_shape(16, 16) && IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT);
         // Intel Xe2 (ANV) only has 8x16x16: each HMMA is two products of 8 rows. Intel only, so
-        // NVIDIA and AMD keep exactly the paths above (zortos293/Lichii#779). Not Intel's Windows
-        // driver: the constructor turns its shaderFloat16 off after this check ("Intel has broken
-        // float16 math"), and the matrices need it; #779 was measured on Mesa ANV.
+        // NVIDIA and AMD keep exactly the paths above (zortos293/Lichii#779, measured on Mesa
+        // ANV). Intel's Windows driver too: its "broken float16 math" workaround only turns off
+        // float16 arithmetic in translated shaders (float16_math); the device keeps shaderFloat16
+        // for the matrices (see where float16_math is set). Arc B580, driver 101.9150: the
+        // software HMMA of OoT's 64x36 tile pass spilled 12 KB of scratch per lane at SIMD32 and
+        // took 13.5-15 ms a frame; on 8x16x16 matrices the same dispatch took 1.3 ms.
+        // EDEN_NX2_NO_COOP_MATRIX=1 goes back to the software path.
         constexpr u32 intel_vendor_id = 0x8086;
         cooperative_hmma_8x16x16 =
-            usable && properties.properties.vendorID == intel_vendor_id &&
-            driver_id != VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS && has_shape(8, 16) &&
+            usable && properties.properties.vendorID == intel_vendor_id && has_shape(8, 16) &&
             IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT);
         extensions.cooperative_matrix =
             cooperative_hmma_16x8x16 || cooperative_hmma_16x16x16 || cooperative_hmma_8x16x16;
