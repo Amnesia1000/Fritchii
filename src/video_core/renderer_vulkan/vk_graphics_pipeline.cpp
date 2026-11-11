@@ -42,6 +42,8 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/gpu_split.h"
+#include "video_core/nx2_front_handles.h"
 #include "common/settings.h"
 #include "shader_recompiler/exception.h"
 #include "video_core/nx2_profile.h"
@@ -1204,6 +1206,148 @@ void GraphicsPipeline::RecordTexBank(const TextureCache::TextureMemoState& state
     ++control.recorded;
 }
 
+const VideoCommon::FrontHandles::Record* GraphicsPipeline::TakeFrontHandles() {
+    namespace Handles = VideoCommon::FrontHandles;
+    auto& handles = Handles::Get();
+    const Handles::Record* const record =
+        handles.TakeRecord(VideoCommon::GpuSplit::Get().BackEntryPosition(), maxwell3d);
+    // EDEN_NX2_RUNAHEAD turned on since the front made it: its CPU write chunks may have landed
+    // before this entry (the front refuses while the switch is on or chunks are pending).
+    if (record != nullptr && VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_runahead,
+                                                              "EDEN_NX2_RUNAHEAD") != 0) {
+        handles.Add(Handles::BackCounter::Missing);
+        return nullptr;
+    }
+    if (record == nullptr) {
+        handles.Add(Handles::BackCounter::Missing);
+        return nullptr;
+    }
+    handles.Add(Handles::BackCounter::Matched);
+    if ((record->flags & Handles::NeedLayout) != 0) {
+        PublishFrontLayout(record->key);
+        return nullptr;
+    }
+    return record;
+}
+
+u32 GraphicsPipeline::FrontHandleWord(const VideoCommon::FrontHandles::Record& record,
+                                      GPUVAddr address, u32& cursor, FrontHandleStats& stats,
+                                      int mode) {
+    // The record lists the words in this pipeline's read order: the next is usually at `cursor`.
+    const u32 count = record.count;
+    u32 slot = count;
+    for (u32 i = cursor; i < count; ++i) {
+        if (record.address[i] == address) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot == count) {
+        for (u32 i = 0; i < cursor && i < count; ++i) {
+            if (record.address[i] == address) {
+                slot = i;
+                break;
+            }
+        }
+    }
+    if (slot == count) {
+        // Not a word the front read for this draw (another layout, or another bind).
+        ++stats.misses;
+        return gpu_memory->ReadHandleWord(address);
+    }
+    cursor = slot + 1;
+    if (((record.valid >> slot) & 1) == 0) {
+        ++stats.refused;
+        return gpu_memory->ReadHandleWord(address);
+    }
+    if (mode != 2) {
+        ++stats.used;
+        return record.value[slot];
+    }
+    // Verify: the word as read here is the one used.
+    const u32 word = gpu_memory->ReadHandleWord(address);
+    ++stats.verified;
+    if (word != record.value[slot]) {
+        ++stats.mismatches;
+        static u32 logged{};
+        if (logged < 32) {
+            ++logged;
+            LOG_WARNING(Render_Vulkan,
+                        "Front handles mismatch: word {:#x} is {:#x} in guest memory, {:#x} from "
+                        "the front (entry {}, read after back position {}, word {} of {})",
+                        address, word, record.value[slot],
+                        record.entry.load(std::memory_order_relaxed), record.done, slot, count);
+        }
+    }
+    return word;
+}
+
+void GraphicsPipeline::FinishFrontHandles(const VideoCommon::FrontHandles::Record& record,
+                                          const FrontHandleStats& stats) {
+    using Counter = VideoCommon::FrontHandles::BackCounter;
+    auto& handles = VideoCommon::FrontHandles::Get();
+    handles.Add(Counter::Used, stats.used);
+    handles.Add(Counter::Refused, stats.refused);
+    handles.Add(Counter::Misses, stats.misses);
+    handles.Add(Counter::Verified, stats.verified);
+    handles.Add(Counter::Mismatches, stats.mismatches);
+    if (stats.misses != 0) {
+        // The front's layout for this key is not this pipeline's (or its copy of a bind differs:
+        // then the same layout is there already and nothing is published).
+        PublishFrontLayout(record.key);
+    }
+}
+
+void GraphicsPipeline::PublishFrontLayout(const VideoCommon::FrontHandles::Key& key) {
+    namespace Handles = VideoCommon::FrontHandles;
+    if (!front_layout_built) {
+        front_layout_built = true;
+        front_layout.clear();
+        // As ConfigureImpl's config_stage reads them: per stage, texture buffers, image buffers,
+        // textures, images; per descriptor, each array element's word and then its secondary.
+        for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+            const Shader::Info& info = stage_infos[stage];
+            const auto add_words = [&](const auto& descriptors) {
+                for (const auto& desc : descriptors) {
+                    if (desc.handle_program != ~0U) {
+                        continue; // Computed from storage memory, not a constant buffer word
+                    }
+                    for (u32 index = 0; index < desc.count; ++index) {
+                        front_layout.push_back({
+                            .stage = static_cast<u8>(stage),
+                            .cbuf = static_cast<u8>(desc.cbuf_index),
+                            .reserved = 0,
+                            .offset = desc.cbuf_offset + (index << desc.size_shift),
+                        });
+                        if constexpr (requires { desc.has_secondary; }) {
+                            if (desc.has_secondary) {
+                                front_layout.push_back({
+                                    .stage = static_cast<u8>(stage),
+                                    .cbuf = static_cast<u8>(desc.secondary_cbuf_index),
+                                    .reserved = 0,
+                                    .offset = desc.secondary_cbuf_offset,
+                                });
+                            }
+                        }
+                    }
+                }
+            };
+            add_words(info.texture_buffer_descriptors);
+            add_words(info.image_buffer_descriptors);
+            add_words(info.texture_descriptors);
+            add_words(info.image_descriptors);
+        }
+        // Constant buffer indices past the front's copy of the binds can't be read there.
+        front_layout_too_many =
+            front_layout.size() > Handles::MaxWords ||
+            std::ranges::any_of(front_layout, [](const Handles::LayoutWord& word) {
+                return word.stage >= Maxwell::MaxShaderStage ||
+                       word.cbuf >= Maxwell::MaxConstBuffers;
+            });
+    }
+    Handles::Get().Publish(key, front_layout, front_layout_too_many);
+}
+
 template <typename Spec>
 bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     zero_texture_handles = 0;
@@ -1271,6 +1415,20 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             tex_bank_hit = !tex_bank_verify;
         }
     }
+    // EDEN_NX2_FRONT_HANDLES: the handle words the split's front read for the entry being run
+    // (nx2_front_handles.h); words it doesn't vouch for are read here as before.
+    // Taken in the "read handles" zone below.
+    const int front_handles = VideoCommon::FrontHandles::Mode();
+    const VideoCommon::FrontHandles::Record* handle_record = nullptr;
+    u32 handle_cursor = 0;
+    FrontHandleStats handle_stats{};
+    const auto handle_word{[&](GPUVAddr addr) -> u32 {
+        if (handle_record != nullptr) [[unlikely]] {
+            return FrontHandleWord(*handle_record, addr, handle_cursor, handle_stats,
+                                   front_handles);
+        }
+        return gpu_memory->ReadHandleWord(addr);
+    }};
     const auto config_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         const Shader::Info& info{stage_infos[stage]};
         {
@@ -1338,14 +1496,13 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                     const u32 second_offset{desc.secondary_cbuf_offset};
                     const GPUVAddr separate_addr{cbufs[desc.secondary_cbuf_index].address +
                                                  second_offset};
-                    const u32 lhs_raw{gpu_memory->ReadHandleWord(addr) << desc.shift_left};
-                    const u32 rhs_raw{gpu_memory->ReadHandleWord(separate_addr)
-                                      << desc.secondary_shift_left};
+                    const u32 lhs_raw{handle_word(addr) << desc.shift_left};
+                    const u32 rhs_raw{handle_word(separate_addr) << desc.secondary_shift_left};
                     const u32 raw{lhs_raw | rhs_raw};
                     return TexturePair(raw, via_header_index);
                 }
             }
-            return TexturePair(gpu_memory->ReadHandleWord(addr), via_header_index);
+            return TexturePair(handle_word(addr), via_header_index);
         }};
         const auto add_image{[&](const auto& desc, bool blacklist) LAMBDA_FORCEINLINE {
             for (u32 index = 0; index < desc.count; ++index) {
@@ -1431,6 +1588,10 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     }};
     {
         Profile::Scope scope{Profile::Zone::ReadHandles};
+        if (front_handles != 0 && !tex_bank_hit && VideoCommon::GpuSplit::OnBackThread())
+            [[unlikely]] {
+            handle_record = TakeFrontHandles();
+        }
         if constexpr (Spec::enabled_stages[0]) {
             config_stage(0);
         }
@@ -1452,6 +1613,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 views.push_back({.index = handle, .blacklist = false, .id = {}});
             }
             samplers.assign(memo.samplers.begin(), memo.samplers.end());
+        }
+        if (handle_record != nullptr) [[unlikely]] {
+            FinishFrontHandles(*handle_record, handle_stats);
         }
     }
     Profile::AddFine(Profile::FineCounter::TextureHandles, views.size());
