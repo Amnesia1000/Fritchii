@@ -1130,7 +1130,73 @@ private:
     };
     /// Ranged writes kept before the oldest counts for every read again (EDEN_NX2_RANGED_MAX).
     static size_t MaxRangedWrites();
-    std::deque<RangedWrite> ranged_writes;
+    /// ranged_writes' storage, in send order as the deque it replaces: a ring of slots whose word
+    /// vectors are cleared when a slot is reused, never freed (the deque destroyed one vector per
+    /// upload and built a new one: ~35 ms/s of the front in vector and deque allocations,
+    /// fable_answer_regression_2 4.3). Sized to MaxRangedWrites() (RangeLastWrite never holds
+    /// more), grown like a deque past it. A slot's vector over 64 KiB is freed on reuse.
+    class RangedRing {
+    public:
+        [[nodiscard]] bool empty() const {
+            return count == 0;
+        }
+        [[nodiscard]] size_t size() const {
+            return count;
+        }
+        /// Oldest first: 0 is the oldest, size() - 1 the newest.
+        [[nodiscard]] RangedWrite& operator[](size_t index) {
+            return slots[(head + index) & mask];
+        }
+        [[nodiscard]] const RangedWrite& operator[](size_t index) const {
+            return slots[(head + index) & mask];
+        }
+        [[nodiscard]] RangedWrite& front() {
+            return slots[head];
+        }
+        [[nodiscard]] RangedWrite& back() {
+            return (*this)[count - 1];
+        }
+        [[nodiscard]] const RangedWrite& back() const {
+            return (*this)[count - 1];
+        }
+        void pop_front() {
+            head = (head + 1) & mask;
+            --count;
+        }
+        /// As emplace_back(RangedWrite{position, begin, end, method, 0, {}}).
+        RangedWrite& push_back(u64 position, GPUVAddr begin, GPUVAddr end, u32 method) {
+            if (count == slots.size()) [[unlikely]] {
+                Grow();
+            }
+            RangedWrite& write = slots[(head + count) & mask];
+            ++count;
+            write.position = position;
+            write.begin = begin;
+            write.end = end;
+            write.method = method;
+            write.space = 0;
+            if (write.data.capacity() > MaxKeptWords) [[unlikely]] {
+                std::vector<u32>{}.swap(write.data);
+            } else {
+                write.data.clear();
+            }
+            return write;
+        }
+        /// Empties the ring; the slots keep their vectors.
+        void clear() {
+            head = 0;
+            count = 0;
+        }
+
+    private:
+        static constexpr size_t MaxKeptWords = 16384;
+        void Grow();
+        std::vector<RangedWrite> slots;
+        size_t mask{};
+        size_t head{};
+        size_t count{};
+    };
+    RangedRing ranged_writes;
     struct QueuedRelease {
         u64 position;
         u64 device;
