@@ -61,6 +61,12 @@ namespace VideoCommon::QmdPrediction {
     return mode == 3 || mode == 4;
 }
 
+/// EDEN_NX2_FEED_MEMORY_OVERLAY (default 1): the feed takes Source::OverlayFromMemory records.
+[[nodiscard]] inline bool FeedMemoryOverlays() {
+    return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_feed_memory_overlay,
+                                            "EDEN_NX2_FEED_MEMORY_OVERLAY", 1) != 0;
+}
+
 /// EXP13=2 records only: Report, a compute report semaphore (0x6c3) or a 3D payload report;
 /// Puller, a puller semaphore release.
 enum class Writer : u32 { Qmd, Dma, Report, Puller, Count };
@@ -96,6 +102,9 @@ enum class Source : u8 {
     Shadow,            ///< An upload shadow's block
     Memory,            ///< Guest memory, nothing queued writing it
     Waited,            ///< Guest memory after waiting for the work writing it
+    /// As OverlayFromMemory, built while the feed or EDEN_NX2_FEED_MEMORY_OVERLAY was off (not
+    /// checked) or with an unbounded writer queued over the QMD: never fed.
+    OverlayFromMemoryUnchecked,
     Count,
 };
 struct Record {
@@ -136,6 +145,9 @@ enum class Mirror : u32 {
     ShadowNotLinear, ///< An upload of 256 bytes or more not linear and back to back: no shadow
     ShadowPatched,   ///< A shadow took a later upload's words over it
     OverlayFromMemory, ///< A small upload patched a QMD guest memory held: overlay from both
+    /// Of them, built with an unbounded writer queued over the QMD (GpuSplit::
+    /// QueuedGuestWriters): never fed (EDEN_NX2_FEED_MEMORY_OVERLAY's belt)
+    OverlayFromMemoryUnbounded,
     Count,
 };
 void NoteMirror(Mirror event);

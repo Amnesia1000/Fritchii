@@ -3043,6 +3043,13 @@ void Maxwell3D::FrontNoteMemoryWrite(VideoCommon::GpuSplit& split, FrontState& f
     split.SetWriteStampTag(0);
     if (VideoCommon::QmdPrediction::MirrorMode()) {
         // EXP13=2-4: a QMD patched by a 3D inline upload (6h): the copy takes the bytes too.
+        // EDEN_NX2_QMD_3D_PATCH: this method's write mark is retired first (its bytes are noted
+        // above, under the tag the patch looks past), so the holders' stamp check does not take
+        // the upload itself for a later writer. The same call below then changes nothing.
+        if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_qmd_3d_patch,
+                                             "EDEN_NX2_QMD_3D_PATCH") != 0) {
+            split.RangedMethodWrite();
+        }
         const GPUVAddr destination = (GPUVAddr{fs.regs[base + 2]} << 32) | fs.regs[base + 3];
         Nx2PatchQmdCopy(split, memory_manager, destination + fs.upload_offset,
                         reinterpret_cast<const u8*>(words),
