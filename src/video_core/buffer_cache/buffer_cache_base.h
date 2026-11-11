@@ -12,6 +12,7 @@
 #include <bit>
 #include <bitset>
 #include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -1099,6 +1100,38 @@ private:
     std::atomic<u64> preflush_reads_flushed{};
     std::atomic<u64> preflush_reads_in_flight{};
     std::atomic<u64> preflush_reads_in_flight_depth{};
+    /// EDEN_NX2_EXP72: fence downloads with copies, numbered from 1 in commit order; landed counts
+    /// the ones PopAsyncBuffers wrote to guest memory (pending_download_ranges[i] is landed + i + 1).
+    std::atomic<u64> fence_downloads_landed{};
+    std::mutex fence_landed_mutex;
+    std::condition_variable fence_landed_cv;
+    std::atomic<u64> fence_waits{};
+    std::atomic<u64> fence_wait_ns{};
+    std::atomic<u64> fence_wait_timeouts{};
+
+public:
+    /// EDEN_NX2_EXP72 (fable52_answer_bosswave 3): a guest read whose GPU-written bytes are all in
+    /// a submitted fence download waits for that download to land instead of a new copy queued
+    /// behind everything since (11-17 fences at the night market). No cache lock held.
+    bool WaitFenceDownload(u64 sequence, std::chrono::milliseconds timeout) {
+        const auto start = std::chrono::steady_clock::now();
+        std::unique_lock lock{fence_landed_mutex};
+        const bool done = fence_landed_cv.wait_for(lock, timeout, [&] {
+            return fence_downloads_landed.load(std::memory_order_acquire) >= sequence;
+        });
+        lock.unlock();
+        fence_waits.fetch_add(1, std::memory_order_relaxed);
+        fence_wait_ns.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                     std::chrono::steady_clock::now() - start)
+                                                     .count()),
+                                std::memory_order_relaxed);
+        if (!done) {
+            fence_wait_timeouts.fetch_add(1, std::memory_order_relaxed);
+        }
+        return done;
+    }
+
+private:
     u64 preflush_resets{};
     bool download_cpu_read_ranges{};
     Common::RangeSet<DAddr> gpu_modified_ranges;

@@ -326,6 +326,13 @@ struct GPU::Impl {
         if (raster_area.preemtive) {
             return raster_area;
         }
+        // EDEN_NX2_EXP72: everything this read lacks is in a fence download already submitted:
+        // wait for it to land instead of a new copy behind all the work recorded since.
+        if (raster_area.fence_download != 0 &&
+            renderer->ReadRasterizer()->WaitFenceDownload(raster_area.fence_download)) {
+            raster_area.preemtive = true;
+            return raster_area;
+        }
         raster_area.preemtive = true;
         // A guest CPU read of GPU-written memory (reactive flushing): count them, they decide
         // whether buffer data must be copied back at every fence (EDEN_NX2_BUFFER_DOWNLOADS).

@@ -17,6 +17,9 @@ struct RasterizerDownloadArea {
     /// EDEN_NX2_EXP49 (async read-back): what guest memory lacks there is on its way for an
     /// earlier read. Nothing to flush, only to wait for (RasterizerInterface::FinishRead).
     bool in_flight{};
+    /// EDEN_NX2_EXP72: every GPU-written byte of the area is in this fence download (sequence
+    /// number, see BufferCache::WaitFenceDownload), already submitted; 0 = none.
+    u64 fence_download{};
 };
 
 /// EDEN_NX2_EXP49: downloads for guest CPU reads that are submitted but not yet written to guest

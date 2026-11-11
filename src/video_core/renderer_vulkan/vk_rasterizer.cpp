@@ -2667,6 +2667,10 @@ void CountGuestAccess(std::atomic<u64>& counter) {
 }
 } // Anonymous namespace
 
+bool RasterizerVulkan::WaitFenceDownload(u64 sequence) {
+    return buffer_cache.WaitFenceDownload(sequence, std::chrono::milliseconds{20});
+}
+
 VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64 size) {
     // A guest read of cached memory asked under both caches' mutexes, which the split's back holds
     // through each draw: 12% of the guest cores' busy time at Castle Town went to waiting for

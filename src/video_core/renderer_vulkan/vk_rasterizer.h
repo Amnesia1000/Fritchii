@@ -121,6 +121,7 @@ public:
     bool MustFlushRegion(DAddr addr, u64 size,
                          VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;
+    bool WaitFenceDownload(u64 sequence) override;
     /// GetFlushArea's answer under both caches' mutexes.
     VideoCore::RasterizerDownloadArea GetFlushAreaLocked(DAddr addr, u64 size);
     bool HasPendingQueries(DAddr addr, u64 size) override;

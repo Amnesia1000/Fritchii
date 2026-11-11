@@ -135,6 +135,12 @@ public:
     /// before it reads, and the GPU's side before it writes guest memory there.
     virtual void FinishRead([[maybe_unused]] DAddr addr, [[maybe_unused]] u64 size) {}
 
+    /// EDEN_NX2_EXP72: waits (bounded) until fence download `sequence` is in guest memory;
+    /// false = not done in time, flush as usual.
+    virtual bool WaitFenceDownload([[maybe_unused]] u64 sequence) {
+        return false;
+    }
+
     /// Switch 2, list draws (nx2_list_draw.h, zortos293/Lichii#1336): whether DrawIndirect draws
     /// from an array draw's two GPU-written list words (IndirectParams::list_words) without
     /// reading them back.

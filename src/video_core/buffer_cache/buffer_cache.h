@@ -169,6 +169,16 @@ void BufferCache<P>::TickFrame() {
                  "GPU-written byte already in a fence download on its way ({:.1f} fences from "
                  "the newest on average)",
                  flushed, in_flight, in_flight != 0 ? static_cast<double>(depth) / in_flight : 0.0);
+        const u64 waits = fence_waits.exchange(0, std::memory_order_relaxed);
+        if (waits != 0) {
+            const u64 ns = fence_wait_ns.exchange(0, std::memory_order_relaxed);
+            LOG_INFO(HW_GPU,
+                     "Fence download waits (EXP72={}) last 600 frames: {}, {:.2f} ms average, {} "
+                     "timed out (flushed as before)",
+                     VideoCore::Nx2Debug::Experiment(72), waits,
+                     static_cast<double>(ns) / 1e6 / static_cast<double>(waits),
+                     fence_wait_timeouts.exchange(0, std::memory_order_relaxed));
+        }
     }
     if (frame_tick % 600 == 0 && preflush_resets != 0) {
         LOG_INFO(HW_GPU, "Preflush reset (EXP69={}) last 600 frames: {} resets, {} KiB unmarked",
@@ -404,6 +414,10 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
             }
             preflush_reads_flushed.fetch_add(1, std::memory_order_relaxed);
             if (all_in_flight) {
+                if (VideoCore::Nx2Debug::Experiment(72) != 0) {
+                    area->fence_download =
+                        fence_downloads_landed.load(std::memory_order_acquire) + newest + 1;
+                }
                 preflush_reads_in_flight.fetch_add(1, std::memory_order_relaxed);
                 preflush_reads_in_flight_depth.fetch_add(
                     pending_download_ranges.size() - newest, std::memory_order_relaxed);
@@ -1780,6 +1794,12 @@ void BufferCache<P>::PopAsyncBuffers() {
     async_buffers.pop_front();
     pending_downloads.pop_front();
     pending_download_ranges.pop_front();
+    {
+        // EXP72: in guest memory now (the copies above wrote it).
+        std::scoped_lock lock{fence_landed_mutex};
+        fence_downloads_landed.fetch_add(1, std::memory_order_release);
+    }
+    fence_landed_cv.notify_all();
 }
 
 template <class P>

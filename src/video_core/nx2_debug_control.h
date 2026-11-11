@@ -443,6 +443,9 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// collector's device memory figure, as deleted images waiting for the GPU are. Logs "Image pool
 /// (EXP42) last 600 frames" and counts pooled creates in "Slow clear texture cache". 1 is the default
 /// (LoadExperiments); 0 = off.
+/// EXP72 (live; 0 = off; fable52_answer_bosswave 3; BufferCache::GetFlushArea, WaitFenceDownload):
+/// a preflushed guest read whose GPU-written bytes are all in a submitted fence download waits (up
+/// to 20 ms) for that download to land instead of a new copy behind everything recorded since.
 /// EXP70 (live; ms, 0 = off; fable52_answer_acquire 4; PresentManager::GetRenderFrame): after this
 /// long without a free render frame, the renderer drops the oldest queued frame that is not at
 /// the present thread's front and reuses it. With EDEN_NX2_PRESENT_EXTRA_FRAMES (boot) giving more
