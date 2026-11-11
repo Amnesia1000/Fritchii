@@ -133,6 +133,8 @@ add_library(video_core STATIC
     nx2_profile.h
     nx2_qmd_prediction.cpp
     nx2_qmd_prediction.h
+    nx2_runahead.cpp
+    nx2_runahead.h
     nx2_perf.h
     nx2_download_trace.h
     nx2_async_readback.h

@@ -862,6 +862,21 @@ public:
         position = release.position;
         return release.payload;
     }
+    /// EDEN_NX2_RUNAHEAD: the newest release recorded for the u32 at `device` (NoteRelease),
+    /// whether or not the back ran it; `position` gets its ring position.
+    [[nodiscard]] std::optional<u32> NewestReleaseTo(u64 device, u64& position) const {
+        const QueuedRelease& release = queued_releases[(device >> 2) % queued_releases.size()];
+        if (release.device != device || release.position == 0) {
+            return std::nullopt;
+        }
+        position = release.position;
+        return release.payload;
+    }
+    /// EDEN_NX2_RUNAHEAD: the ring position of the newest native compute work that may dispatch
+    /// (NoteDispatchWriter), 0 for none this session.
+    [[nodiscard]] u64 LastDispatchPosition() const {
+        return last_dispatch_position;
+    }
     /// EXP12: the ring position past the queued work that may write the u32 at `device` without
     /// the front knowing its words, so a semaphore read that waits for or overlays the noted
     /// writes (EDEN_NX2_SEM_FAST) can't account for it: compute and copies (their QMD and report
