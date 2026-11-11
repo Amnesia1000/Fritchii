@@ -110,6 +110,11 @@ inline std::atomic<int> g_runahead_ms{-1};
 /// CallConstBufferWords). Exact: the same bytes and the same accumulated invalidations; 0 = the
 /// page walk.
 inline std::atomic<int> g_cb_direct{-1};
+/// EDEN_NX2_RT_DEPTH_NOUPLOAD (live, bits, default 0; from Skitchii (skolvolt/Lichii)): new
+/// depth/stencil images skip the upload from guest memory when the exact rules (EXP56's clear,
+/// EXP8 bit 2's copies) did not already (TextureCache::JoinImages). 1 = render targets with
+/// nothing to join, 2 = images whose every join copy is GPU-written, 3 = both (Skitchii).
+inline std::atomic<int> g_rt_depth_noupload{-1};
 
 /// Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP63, live through the debug server:
 /// slots for batches of fixes built together and A/B-tested in one session
@@ -513,6 +518,9 @@ inline void LoadExperiments() {
     }
     if (name == "EDEN_NX2_CB_DIRECT") {
         return &g_cb_direct;
+    }
+    if (name == "EDEN_NX2_RT_DEPTH_NOUPLOAD") {
+        return &g_rt_depth_noupload;
     }
     return nullptr;
 }
