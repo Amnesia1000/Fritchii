@@ -151,15 +151,15 @@ PresentManager::PresentManager(const vk::Instance& instance_,
             VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
         .queueFamilyIndex = device.GetGraphicsFamily(),
     });
-    // EDEN_NX2_PRESENT_EXTRA_FRAMES (boot, default 0; fable52_answer_acquire 4): render frames
+    // EDEN_NX2_PRESENT_EXTRA_FRAMES (boot, default 2; fable52_answer_acquire 4): render frames
     // beyond the swapchain's images, so the renderer has a free one while the present thread
     // holds every queued frame (pacing, or a display stall of 125-190 ms at the night market).
     // MaxExtraFrames keeps using the swapchain count.
-    size_t frame_count = image_count;
+    size_t extra_frames = use_present_thread ? 2 : 0;
     if (const char* extra = std::getenv("EDEN_NX2_PRESENT_EXTRA_FRAMES")) {
-        frame_count = (std::min)(frame_count + static_cast<size_t>(std::max(0, std::atoi(extra))),
-                                 MAX_FRAMES_IN_FLIGHT);
+        extra_frames = static_cast<size_t>(std::max(0, std::atoi(extra)));
     }
+    const size_t frame_count = (std::min)(image_count + extra_frames, MAX_FRAMES_IN_FLIGHT);
     LOG_INFO(Render_Vulkan, "Present frames: {} ({} swapchain images)", frame_count,
              image_count.load());
     auto cmdbuffers = cmdpool.Allocate(frame_count);

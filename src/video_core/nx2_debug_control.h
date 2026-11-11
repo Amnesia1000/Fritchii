@@ -600,6 +600,11 @@ inline void LoadExperiments() {
         // 18.8 -> 14.1 ms/s, about +1 fps; owner playtest: no visual glitches, 50-55 fps except
         // when a dog enters from behind the camera. Bit 4 (no pool) stays off: binds over 1 ms x3.
         g_experiments[68].store(1, std::memory_order_relaxed);
+        // EXP70 = 2 (2026-11-11, display stalls): with no free render frame for 2 ms the renderer
+        // drops a queued frame instead of stalling emulation. Night market with a simulated 150 ms
+        // display stall every 10 s (EXP71): off, every stall froze emulation 65-82 ms; on, one
+        // 50 ms hitch in a minute (21 frames dropped). No drops in a minute of normal play.
+        g_experiments[70].store(2, std::memory_order_relaxed);
         // EXP49 = 1 (2026-11-10, owner's call for v5.7): the async read-back. Stalchild fight,
         // flipped every 30 s while the owner fought: 51.9 -> 56.9 fps, the back's read flushes
         // 35 -> 6 ms/s, guest lock waits halved. No beams in that session or two later ones
