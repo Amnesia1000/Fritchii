@@ -18,6 +18,7 @@
 #include <vector>
 #include <type_traits>
 #include <unordered_map>
+#include <utility>
 
 #include "common/common_types.h"
 #include "video_core/engines/engine_interface.h"
@@ -352,6 +353,28 @@ public:
             pending_flush = nullptr;
             pending_flush_argument = nullptr;
         }
+    }
+    /// Instance folding (zortos293/Lichii#1336, EDEN_NX2_FOLD_INSTANCES), front: one more
+    /// instance of the instance loop `context` draws. Nothing is sent: `flush(context, count)`
+    /// sends the instances counted so far as one entry before the next entry, engine selection,
+    /// Publish or Drain. Held as the pending flush above, so other held work (EXP22's batches,
+    /// EDEN_NX2_DRAW_PACKET's packet) keeps its order against it.
+    void FoldInstance(void (*flush)(void*, u32), void* context) {
+        if (fold_count != 0 && fold_context != context) {
+            RunPendingFlush(); // The other loop's count (FlushFoldThunk) goes first
+        }
+        SetPendingFlush(&FlushFoldThunk, this);
+        fold_flush = flush;
+        fold_context = context;
+        ++fold_count;
+    }
+    /// Sends the instances FoldInstance counted, if any (GpuSplit clears the hook before it).
+    void FlushFold() {
+        if (fold_count == 0) {
+            return;
+        }
+        const u32 count = std::exchange(fold_count, 0);
+        fold_flush(fold_context, count);
     }
 
     /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
@@ -1305,6 +1328,13 @@ private:
     /// Held-back front work (SetPendingFlush).
     PendingFlush pending_flush{};
     void* pending_flush_argument{};
+    /// Instance folding (FoldInstance): instances counted and not sent yet, and who sends them.
+    u32 fold_count{};
+    void (*fold_flush)(void*, u32){};
+    void* fold_context{};
+    static void FlushFoldThunk(void* split) {
+        static_cast<GpuSplit*>(split)->FlushFold();
+    }
     std::array<u64, static_cast<size_t>(Batched::Count)> batched{};
     std::chrono::steady_clock::time_point batched_since{};
     u32 publishes{};

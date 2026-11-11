@@ -39,6 +39,8 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_cmdpage_diag.h"
 #include "video_core/nx2_indirect_grid.h"
+#include "video_core/nx2_list_dispatch.h"
+#include "video_core/nx2_list_draw.h"
 #include "video_core/nx2_list_verify.h"
 #include "video_core/rasterizer_interface.h"
 
@@ -423,6 +425,12 @@ bool DmaPusher::Step() {
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Safe);
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+        } else if (gpu_written &&
+                   (TakeListDraw(dma_state.dma_get, static_cast<u32>(header.size)) ||
+                    TakeListDispatch(dma_state.dma_get, static_cast<u32>(header.size)))) {
+            // zortos293/Lichii#1336: nothing to parse, the words stay on the host GPU and the
+            // call is complete. Before the copy read (Nx2ReadListCopy, the "list GPU wait") and
+            // before EDEN_NX2_INDIRECT_GRID's placeholders, which then never see these lists.
         } else if (gpu_written && command_resume_offset == 0 && header.size == 3 &&
                    dma_state.method_count == 3 && dma_state.method >= MacroRegistersStart &&
                    subchannel_type[dma_state.subchannel] == Engines::EngineTypes::KeplerCompute &&
@@ -893,6 +901,63 @@ bool DmaPusher::IsGpuWrittenCommands(GPUVAddr address, size_t size) {
         }
     }
     return false;
+}
+
+bool DmaPusher::TakeListDraw(GPUVAddr address, u32 count) {
+    namespace ListDraw = Tegra::Nx2ListDraw;
+    if (ListDraw::Mode() == 0) {
+        return false;
+    }
+    ListDraw::MaybeLog();
+    auto& split = VideoCommon::GpuSplit::Get();
+    // The two words are all the parameters of a macro call begun in the entry before, on one
+    // mapped page.
+    if (count != 2 || dma_state.method_count != 2 || command_resume_offset != 0 ||
+        !split.Active() || !split.FrontMacros() || dma_state.method < MacroRegistersStart ||
+        (dma_state.method & 1) != 0 || (address & 0xfff) > 0x1000 - 2 * sizeof(u32) ||
+        subchannels[dma_state.subchannel] == nullptr ||
+        subchannel_type[dma_state.subchannel] != Engines::EngineTypes::Maxwell3D ||
+        !memory_manager.GpuToCpuAddress(address)) {
+        return false;
+    }
+    auto* const maxwell3d = static_cast<Engines::Maxwell3D*>(subchannels[dma_state.subchannel]);
+    if (!maxwell3d->FrontTakeListDraw(system, split, dma_state.method, address)) {
+        ListDraw::Count(ListDraw::g_stats.refused);
+        return false;
+    }
+    ListDraw::Count(ListDraw::g_stats.taken);
+    dma_state.method_count = 0;
+    dma_state.is_last_call = true;
+    return true;
+}
+
+bool DmaPusher::TakeListDispatch(GPUVAddr address, u32 count) {
+    namespace ListDispatch = Tegra::Nx2ListDispatch;
+    if (ListDispatch::Mode() == 0) {
+        return false;
+    }
+    ListDispatch::MaybeLog();
+    auto& split = VideoCommon::GpuSplit::Get();
+    // The three words are all the parameters of a compute macro call begun in the entry before,
+    // on one mapped page.
+    if (count != 3 || dma_state.method_count != 3 || command_resume_offset != 0 ||
+        !split.Active() || dma_state.method < MacroRegistersStart ||
+        (dma_state.method & 1) != 0 || (address & 0xfff) > 0x1000 - 3 * sizeof(u32) ||
+        subchannels[dma_state.subchannel] == nullptr ||
+        subchannel_type[dma_state.subchannel] != Engines::EngineTypes::KeplerCompute ||
+        !memory_manager.GpuToCpuAddress(address)) {
+        return false;
+    }
+    auto* const compute = static_cast<Engines::KeplerCompute*>(subchannels[dma_state.subchannel]);
+    if (!compute->FrontRunsMacros() ||
+        !compute->FrontTakeListDispatch(split, dma_state.method, address)) {
+        ListDispatch::Count(ListDispatch::g_stats.refused);
+        return false;
+    }
+    ListDispatch::Count(ListDispatch::g_stats.taken);
+    dma_state.method_count = 0;
+    dma_state.is_last_call = true;
+    return true;
 }
 
 bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {

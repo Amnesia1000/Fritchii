@@ -39,6 +39,7 @@
 #include "video_core/game_dlss_status.h"
 #include "video_core/memory_manager.h"
 #include "video_core/native_query_trace.h"
+#include "video_core/nx2_list_dispatch.h"
 #include "video_core/oot_network.h"
 #ifdef ARCHITECTURE_x86_64
 #include "video_core/macro_turing_jit.h"
@@ -1091,7 +1092,21 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
         return false;
     // A grid of GPU-written placeholders: dispatch indirectly from the words they stand for.
     bool grid_placeholder = false;
-    if (Tegra::Nx2IndirectGrid::AnyLive()) [[unlikely]] {
+    // List dispatches (nx2_list_dispatch.h, zortos293/Lichii#1336): the front stored the marker
+    // for a grid it did not read; the grid is at the address it sent, on the host GPU.
+    if (Nx2ListDispatch::IsMarker(qmd[12], qmd[13], qmd[14])) [[unlikely]] {
+        if (list_dispatch_address == 0) {
+            Nx2ListDispatch::Count(Nx2ListDispatch::g_stats.orphan);
+            LOG_ERROR(HW_GPU, "List dispatch: a QMD carries the grid marker and no list was taken");
+            return true;
+        }
+        launch_description.grid_dim_x.Assign(1);
+        launch_description.grid_dim_y.Assign(1);
+        launch_description.grid_dim_z.Assign(1);
+        indirect_compute = list_dispatch_address;
+        grid_placeholder = true; // Cleared after the dispatch (the SCOPE_EXIT below)
+        Nx2ListDispatch::Count(Nx2ListDispatch::g_stats.indirect);
+    } else if (Tegra::Nx2IndirectGrid::AnyLive()) [[unlikely]] {
         const u32 x = qmd[12];
         const u32 y = qmd[13] & 0xffff;
         const u32 z = qmd[14] & 0xffff;
@@ -2031,6 +2046,15 @@ struct KeplerCompute::FrontState {
     bool compute_uploaded{};
     u32 bind_pointer{};
     MacroEngine* macro{}; ///< Without a native context: the one macro engine
+    /// List dispatches (nx2_list_dispatch.h): by macro engine and start in its code of that
+    /// generation, whether the macro only stores a dispatch's grid.
+    struct GridMacro {
+        const MacroEngine* engine;
+        u64 generation;
+        u32 start;
+        bool stores_grid;
+    };
+    std::vector<GridMacro> grid_macros;
     /// EDEN_NX2_COMPUTE_SINK: plain registers (native_plain_methods) this front sent a write to.
     /// The back stored that value in both native_registers and regs, so `registers` holds what
     /// both hold and a later write of the same value can be dropped.
@@ -2845,6 +2869,56 @@ bool KeplerCompute::FrontPlainWrite(VideoCommon::GpuSplit& split, FrontState& fs
         split.SinkMethod(this, method, argument);
     }
     split.CountBatched(VideoCommon::GpuSplit::Batched::ComputeSunk);
+    return true;
+}
+
+bool KeplerCompute::FrontTakeListDispatch(VideoCommon::GpuSplit& split, u32 method,
+                                          GPUVAddr address) {
+    namespace ListDispatch = Tegra::Nx2ListDispatch;
+    auto& fs = Front(split);
+    // The three words must be the whole call.
+    if (fs.executing_macro || !fs.parameters.empty() || method < 0xe00 ||
+        method >= fs.registers.size() || rasterizer == nullptr ||
+        !rasterizer->Nx2ListDispatchSupported()) {
+        return false;
+    }
+    const auto positions = FrontMacroPositions(fs);
+    if (positions.empty()) {
+        return false;
+    }
+    const u32 start = positions[((method - 0xe00) / 2) % positions.size()];
+    auto& macro = FrontMacroEngine(fs);
+    auto known = std::ranges::find_if(fs.grid_macros, [&](const FrontState::GridMacro& entry) {
+        return entry.engine == &macro && entry.generation == macro.native_code_generation &&
+               entry.start == start;
+    });
+    if (known == fs.grid_macros.end()) {
+        if (fs.grid_macros.size() >= 64) {
+            fs.grid_macros.clear();
+        }
+        const bool stores_grid =
+            ListDispatch::IsStoreGridMacro(std::span<const u32>{macro.native_code}, start);
+        if (stores_grid) {
+            LOG_INFO(HW_GPU, "List dispatch: the compute macro at {:#x} stores a grid", start);
+        }
+        fs.grid_macros.push_back({&macro, macro.native_code_generation, start, stores_grid});
+        known = fs.grid_macros.end() - 1;
+    }
+    if (!known->stores_grid) {
+        return false;
+    }
+    // As the macro, with the marker for the words: the macro that uploads the QMD copies it
+    // into the grid words, where the dispatch finds it.
+    if (native_data_ram) {
+        macro.native_interpreter.active_dram = native_data_ram;
+    }
+    auto& data_ram = *macro.native_interpreter.active_dram;
+    data_ram[ListDispatch::DramGridX] = ListDispatch::MarkerX;
+    data_ram[ListDispatch::DramGridY] = ListDispatch::MarkerY;
+    data_ram[ListDispatch::DramGridZ] = ListDispatch::MarkerZ;
+    // Writes no guest memory itself.
+    split.Defer([this, address] { list_dispatch_address = address; },
+                VideoCommon::GpuSplit::Effect::None);
     return true;
 }
 

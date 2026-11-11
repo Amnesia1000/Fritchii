@@ -15,6 +15,8 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 #include "common/assert.h"
 #include "common/bit_util.h"
 #include "common/scope_exit.h"
@@ -32,6 +34,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cmdpage_diag.h"
+#include "video_core/nx2_list_draw.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/query_cache/frame_trace.h"
@@ -1204,6 +1207,15 @@ struct Maxwell3D::FrontState {
     /// A method the draw manager handles was sent since the back last ran DrawDeferred: only
     /// then can it have a deferred instanced draw to issue at the end of a macro.
     bool draw_pending{true};
+    /// The back holds state writes in its method sink, which its next executable method consumes
+    /// (issuing a deferred draw a changed one ends). Front() consumes it before copying the state.
+    /// Instance folding (zortos293/Lichii#1336) folds only while it is empty.
+    bool sink_pending{};
+    /// List draws (nx2_list_draw.h, zortos293/Lichii#1336): by start in the macro code of
+    /// list_draw_generation, whether the macro is the array draw FrontTakeListDraw sends as an
+    /// address.
+    std::unordered_map<u32, bool> list_draw_macros;
+    u64 list_draw_generation{~u64{0}};
     bool skip_same{}; ///< SkipSameValueWrites() && FrontSkipSame(), read once
     /// The inline upload being sent, when its words land linearly (EDEN_NX2_DMA_WAIT_WRITERS).
     bool upload_known{};
@@ -1742,6 +1754,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
             using Effect = VideoCommon::GpuSplit::Effect;
             split.DeltaWrite(this, method, argument,
                              direct && fs.draw_pending ? Effect::Gpu : Effect::None);
+            fs.sink_pending = false; // ApplyFrontDelta consumes the sink first
             if (from_macro && !direct) {
                 split.CountBatched(VideoCommon::GpuSplit::Batched::MacroSunk);
             }
@@ -1774,6 +1787,18 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
             FrontReportSameWrites(fs);
         }
         split.CountBatched(VideoCommon::GpuSplit::Batched::SameIndexFirst);
+        return;
+    }
+    // Instance folding (zortos293/Lichii#1336, EDEN_NX2_FOLD_INSTANCES): a later instance of an
+    // instance loop. The register keeps its value (instance id Subsequent, the same topology)
+    // and nothing waits in the back's sink, so all the write does there is count one more
+    // instance (DrawManager::DrawBegin): the count is sent once, before the front's next entry
+    // (GpuSplit::FoldInstance, held as the split's pending flush).
+    if (method == MAXWELL3D_REG_INDEX(draw.begin) && fs.instance_loop &&
+        ((value >> 26) & 3) == 1 && fs.skip_same && !fs.sink_pending && shadow_kept &&
+        fs.regs[method] == value && FoldInstancesEnabled()) {
+        fs.draw_pending = true;
+        split.FoldInstance(&FlushFoldedInstances, this);
         return;
     }
     // What a constant buffer upload word or a report writes, for the front's macro memory reads.
@@ -1844,6 +1869,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
     // EXP22 bit 2: instance loop methods, which nothing after the send below concerns.
     if ((fs.exp22 & 2) != 0 && execution_mask[method] &&
         FrontBatchWrite(split, fs, method, argument, value, is_last_call, from_macro)) {
+        fs.sink_pending = false; // Held executable writes: each consumes the sink when sent
         return;
     }
     if (from_macro && (execution_mask[method] || !VideoCommon::GpuSplit::MacroSink())) {
@@ -1854,6 +1880,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         } else {
             split.MacroWrite(this, method, argument, effect);
         }
+        fs.sink_pending = false; // Direct writes (and the packet) consume the sink first
     } else {
         // EDEN_NX2_MACRO_SINK: a macro's state write goes to the back's method sink as the
         // command list's own do; the back applies the sink in order (shadow RAM and same-value
@@ -1863,8 +1890,10 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         // the back reaches them, which is never later than the sink would.
         if (!execution_mask[method] && VideoCommon::GpuSplit::RingPairs()) {
             split.PairWrite(this, method, argument);
+            fs.sink_pending = false; // The back's Pairs entry consumes the sink first
         } else {
             split.Method(this, method, argument, is_last_call, nullptr, effect);
+            fs.sink_pending = !execution_mask[method];
         }
         if (from_macro) {
             split.CountBatched(VideoCommon::GpuSplit::Batched::MacroSunk);
@@ -2069,6 +2098,7 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         }
     }
     split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr, effect);
+    fs.sink_pending = false; // The back consumes the sink before a run
     if (write_end != 0) {
         // Uploaded words, unless the shadow RAM replays other values for them on the back.
         const bool upload = method >= cb_data && method < cb_data + 16 &&
@@ -2464,6 +2494,100 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
     if (FrontVerifyEnabled() && (++fs.calls & 4095) == 0) [[unlikely]] {
         FrontVerify(split, fs);
     }
+}
+
+// List draws (nx2_list_draw.h, zortos293/Lichii#1336): whether the macro at `start` does nothing
+// but begin a draw, write its first parameter to vertex_buffer.count and its second to
+// vertex_buffer.first, and end the draw.
+bool Maxwell3D::FrontIsListDrawMacro(FrontState& fs, const MacroEngine& engine, u32 start) {
+    if (fs.list_draw_generation != engine.native_code_generation) {
+        fs.list_draw_macros.clear();
+        fs.list_draw_generation = engine.native_code_generation;
+    }
+    const auto [it, inserted] = fs.list_draw_macros.try_emplace(start, false);
+    if (!inserted) {
+        return it->second;
+    }
+    static_assert(Nx2ListDraw::DrawBegin == MAXWELL3D_REG_INDEX(draw.begin) &&
+                  Nx2ListDraw::DrawEnd == MAXWELL3D_REG_INDEX(draw.end) &&
+                  Nx2ListDraw::VertexFirst == MAXWELL3D_REG_INDEX(vertex_buffer.first) &&
+                  Nx2ListDraw::VertexCount == MAXWELL3D_REG_INDEX(vertex_buffer.count));
+    if (!Nx2ListDraw::IsArrayDrawMacro(std::span<const u32>{engine.native_code}, start)) {
+        return false;
+    }
+    LOG_INFO(HW_GPU, "List draw: the macro at {:#x} is an array draw of (count, first)", start);
+    it->second = true;
+    return true;
+}
+
+bool Maxwell3D::FrontTakeListDraw(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
+                                  GPUVAddr address) {
+    auto& fs = Front(system, split);
+    // The registers must take the words themselves (no shadow RAM replay), and the two words
+    // must be the whole call.
+    if (fs.executing_macro != 0 || !fs.parameters.empty() ||
+        fs.control == Regs::ShadowRamControl::Replay || rasterizer == nullptr ||
+        !rasterizer->Nx2ListDrawSupported()) {
+        return false;
+    }
+    auto& engine = GetNativeMacroEngine();
+    const auto positions = GetNativeMacroPositions();
+    if (!engine.native_turing || positions.empty()) {
+        return false;
+    }
+    const u32 start = positions[((method - MacroRegistersStart) >> 1) % positions.size()];
+    if (!FrontIsListDrawMacro(fs, engine, start)) {
+        return false;
+    }
+    VideoCommon::Nx2Profile::CountMethod(method, false);
+    // As the writes of the macro, in its order. vertex_buffer.first and count keep the values of
+    // the last draw that was not one of these, here and on the back: only this draw reads the
+    // words.
+    FrontWrite(split, fs, MAXWELL3D_REG_INDEX(draw.begin), 0, true, true);
+    // Writes no guest memory itself (the draw.end after it notes the draw's writes).
+    split.Defer([this, address] { draw_manager.draw_state.list_draw_address = address; },
+                VideoCommon::GpuSplit::Effect::None);
+    FrontWrite(split, fs, MAXWELL3D_REG_INDEX(draw.end), 0, true, true);
+    if (fs.draw_pending) {
+        fs.draw_pending = false;
+        split.Defer([this, system_ptr = &system] { FinishFrontMacro(*system_ptr); },
+                    VideoCommon::GpuSplit::Effect::Gpu);
+    }
+    return true;
+}
+
+bool Maxwell3D::FoldInstancesEnabled() {
+    // EDEN_NX2_FOLD_INSTANCES=0 (zortos293/Lichii#1336; not our EDEN_NX2_FOLD_INSTANCE, which folds
+    // a loop's first instance into its deferred draw): every later instance is sent as its own
+    // draw.begin write again.
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_FOLD_INSTANCES");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+void Maxwell3D::FlushFoldedInstances(void* engine, u32 count) {
+    auto* const self = static_cast<Maxwell3D*>(engine);
+    if (Nx2ListDraw::Diagnostics()) {
+        // EDEN_NX2_LIST_DIAG: how many instances reach the back in how many calls.
+        static u64 instances{};
+        static u64 calls{};
+        instances += count;
+        ++calls;
+        static auto window = std::chrono::steady_clock::now();
+        if (const auto now = std::chrono::steady_clock::now();
+            now - window >= std::chrono::seconds{2}) {
+            window = now;
+            LOG_INFO(HW_GPU, "Instance fold per 2 s: {} instances sent in {} calls", instances,
+                     calls);
+            instances = calls = 0;
+        }
+    }
+    // As the draw.begin writes: the draw they defer may write anywhere a draw does.
+    VideoCommon::GpuSplit::Get().Defer(
+        [self, count] { self->draw_manager.AddLoopInstances(*self, count); },
+        VideoCommon::GpuSplit::Effect::Gpu);
 }
 
 bool Maxwell3D::IsPredicateMacro(FrontState& fs, u32 method) {
