@@ -820,7 +820,7 @@ void TextureCache<P>::TickFrame() {
                  "Slot retire (EXP64={}) last 600 frames: {} cleared targets over same-address "
                  "images, {} retired; kept: {} guarded (sampled or CPU-read later), {} busy "
                  "(bound, download queued), {} of an excluded kind, {} written this frame; {} made "
-                 "again after a retire",
+                 "again within 16 frames of a retire",
                  VideoCore::Nx2Debug::Experiment(64), slot_clears, slot_retired, slot_kept_guard,
                  slot_kept_busy, slot_kept_kind, slot_kept_same_frame, slot_remade);
         slot_clears = slot_retired = slot_kept_guard = slot_kept_busy = slot_kept_kind =
@@ -4015,7 +4015,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         const u64 frame = RenderFrame();
         for (const SlotRetired& retired : slot_recent) {
             if (retired.gpu_addr == gpu_addr && retired.shape == shape &&
-                frame - retired.render_frame <= 4) {
+                frame - retired.render_frame <= 16) {
                 ++slot_remade;
                 if (slot_remade_logged < 20) {
                     ++slot_remade_logged;
@@ -5328,6 +5328,7 @@ u32 TextureCache<P>::RetireSlotPredecessors(const ImageInfo& new_info, GPUVAddr 
         });
     };
     const u64 render_frame = RenderFrame();
+    const u64 min_age = static_cast<u64>((std::max)(1, VideoCore::Nx2Debug::Experiment(64)));
     bool seen = false;
     boost::container::small_vector<ImageId, 8> retire;
     for (const ImageId overlap_id : join_bad_overlap_ids) {
@@ -5363,6 +5364,13 @@ u32 TextureCache<P>::RetireSlotPredecessors(const ImageInfo& new_info, GPUVAddr 
         }
         if (old.last_write_frame == render_frame) {
             ++slot_kept_same_frame; // may still be read in this frame
+            continue;
+        }
+        // EXP64=N: only images nothing touched (bound, sampled, drawn) for N host frames. With
+        // 1, 29 retired targets were made again 1-4 frames later (drawn into without a clear:
+        // the game wanted their depth), 2026-11-11 night market.
+        if (frame_tick - lru_cache.Tick(old.lru_index) < min_age) {
+            ++slot_kept_same_frame;
             continue;
         }
         const auto shape = relocation_shapes.find(RelocationShapeKey(old.info));

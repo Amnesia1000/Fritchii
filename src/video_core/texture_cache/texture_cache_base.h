@@ -698,7 +698,7 @@ private:
     u64 slot_kept_same_frame{};
     u64 slot_clears{};
     /// EXP64 check: images made again (not by a clear) at a retired image's address and shape
-    /// within 4 render frames: a reader of the retired contents, which got guest memory instead.
+    /// within 16 render frames: a reader of the retired contents, which got guest memory instead.
     u64 slot_remade{};
     struct SlotRetired {
         GPUVAddr gpu_addr;
