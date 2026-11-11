@@ -120,6 +120,12 @@ inline std::atomic<int> g_rt_depth_noupload{-1};
 /// first instance alone; the loop's deferred draw covers it (Maxwell3D::FrontRunMacro,
 /// DrawManager::FoldFirstInstance). 1 = on.
 inline std::atomic<int> g_fold_instance{-1};
+/// EDEN_NX2_OOT_MACROS (live, default 0; from Skitchii (skolvolt/Lichii) macro_hle_oot.h): Ocarina
+/// of Time's hot 3D macros, found by code hash, run through native C++ handlers on the split
+/// front instead of the MME JIT (Maxwell3D::FrontRunMacro). 1 = handlers, 2 = verify (the JIT's
+/// writes count; the handler runs on copies for the first 4096 calls of each macro and then one
+/// call in 64, and differences are logged: "OoT macro verify"), 3 = verify every call.
+inline std::atomic<int> g_oot_macros{-1};
 
 /// Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP63, live through the debug server:
 /// slots for batches of fixes built together and A/B-tested in one session
@@ -529,6 +535,9 @@ inline void LoadExperiments() {
     }
     if (name == "EDEN_NX2_FOLD_INSTANCE") {
         return &g_fold_instance;
+    }
+    if (name == "EDEN_NX2_OOT_MACROS") {
+        return &g_oot_macros;
     }
     return nullptr;
 }
