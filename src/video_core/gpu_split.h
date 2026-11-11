@@ -237,26 +237,6 @@ public:
     void MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
                      u32 amount, u32 methods_pending, const GPUVAddr* segment,
                      Effect effect = Effect::Unknown);
-    /// EDEN_NX2_FRONT_HANDLES: a single-method entry as Method (`direct` false, no segment) or
-    /// MacroWrite (`direct` true) send it; `fill(position)` runs once the entry's room is
-    /// reserved, before it is committed and can be published, with the ring position it starts
-    /// at (BackEntryPosition() while the back runs it). Held-back work is sent and the engine
-    /// selected before, so `position` is also where everything sent before it ends. `fill` must
-    /// not send anything.
-    template <typename Fill>
-    void MethodWithFill(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument,
-                        bool is_last, bool direct, Effect effect, const Fill& fill) {
-        SelectEngine(engine);
-        u64* const entry = Reserve(1);
-        entry[0] = static_cast<u64>(Kind::Method) |
-                   (direct ? (IsLast | Direct) : (is_last ? IsLast : 0)) |
-                   (u64{method & 0xffff} << 8) | (u64{argument} << 32);
-        fill(write_position);
-        Commit(1, effect);
-        if (engine->memory_write_mask[method]) {
-            NoteMethodWrite(engine, method);
-        }
-    }
     /// A write made by a macro: CallMethod without the method sink, as the engines' macros do.
     void MacroWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument,
                     Effect effect = Effect::Unknown) {
@@ -651,18 +631,6 @@ public:
     [[nodiscard]] u64 LastUnrangedPosition() const {
         return last_unranged_position;
     }
-    /// The newest host-level wait (NoteSync), the newest memory-writing method without a range
-    /// (and deferred writes, NoteMemoryWrite(); ranged writes RangeLastWrite stopped remembering
-    /// raise it too) and the newest queued function (maps), for EDEN_NX2_FRONT_HANDLES.
-    [[nodiscard]] u64 LastSyncPosition() const {
-        return last_sync_position;
-    }
-    [[nodiscard]] u64 LastMemoryWritePosition() const {
-        return last_memory_write_position;
-    }
-    [[nodiscard]] u64 LastFunctionPosition() const {
-        return last_function_position;
-    }
     /// whether work sent after position `since` may write device bytes
     /// [begin, begin + size): compute or copies (any range), unranged writers, or a noted write
     /// that overlaps the range. Also true when more writes were noted since than are remembered.
@@ -769,25 +737,6 @@ public:
     /// `since` = ConsumedNow()) the queued writes the front knows the words of. False when an
     /// overlapping queued write's words are unknown (the caller waits instead).
     bool OverlayQueuedWrites(u64 since, u64 begin, u32* out, u32 words);
-    /// EDEN_NX2_FRONT_HANDLES: what OverlayQueuedWords found for a word.
-    enum class QueuedWord : u8 {
-        Clean,         ///< No write queued after `done` over it
-        Overlaid,      ///< The newest such write's word replaced the value
-        UnknownRanged, ///< The newest is a 3D ranged write without known words there
-        UnknownNoted,  ///< The newest is a noted write without known words there
-    };
-    /// EDEN_NX2_FRONT_HANDLES: for each u32 at GPU address `addresses[i]` of the 3D address space
-    /// `space` (MemoryManager::GetID() + 1, as RangeLastWrite takes it), device address
-    /// `devices[i]`, whose `values[i]` was read from guest memory after `done` = ConsumedNow(),
-    /// applies the newest write sent after `done` over it: a 3D ranged write (RangeLastWrite, by
-    /// GPU address; constant buffer uploads keep their words) or a noted write (NoteMemoryWrite,
-    /// NoteMemoryWriteData, by device address), whichever was sent later. `states[i]` says what was
-    /// found. False when more noted writes were sent since `done` than are remembered: nothing
-    /// can be told. The callers check the writers without words or ranges themselves
-    /// (LastMemoryWritePosition covers ranged writes past the remembered ones).
-    bool OverlayQueuedWords(u64 done, size_t space, std::span<const GPUVAddr> addresses,
-                            std::span<const u64> devices, std::span<u32> values,
-                            std::span<QueuedWord> states) const;
     /// Waits until the back executed the noted writes that overlap [begin, begin + size).
     /// Returns false when more writes are queued than are remembered (the caller drains).
     bool WaitForWritesTo(u64 begin, u64 size);

@@ -35,7 +35,6 @@
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_debug_control.h"
-#include "video_core/nx2_front_handles.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2_runahead.h"
@@ -300,8 +299,6 @@ void GpuSplit::Stop() {
     front_waiting.store(false, std::memory_order_relaxed);
     // Run-ahead's positions are ring positions too; queued chunks' bytes are in guest memory.
     Runahead::Reset();
-    // EDEN_NX2_FRONT_HANDLES' records are keyed by ring position as well.
-    FrontHandles::Get().Reset();
 }
 
 u64* GpuSplit::ReserveSlow(size_t words) {
@@ -378,21 +375,18 @@ void GpuSplit::ReportBatched() {
     const auto rate = [&](Batched counter) {
         return static_cast<double>(batched[static_cast<size_t>(counter)]) / elapsed.count();
     };
-    // EDEN_NX2_FRONT_HANDLES: its front and back counters, per second, on the same line.
-    const std::string front_handles = FrontHandles::Get().Report(elapsed.count());
-    if (!front_handles.empty() ||
-        std::ranges::any_of(batched, [](u64 count) { return count != 0; })) {
+    if (std::ranges::any_of(batched, [](u64 count) { return count != 0; })) {
         LOG_INFO(HW_GPU,
                  "GPU split batched writes per second: split_batch.macro_sunk {:.0f}, "
                  "split_batch.compute_sunk {:.0f}, split_batch.compute_same {:.0f}, "
                  "split_batch.pairs {:.0f} in split_batch.pair_blocks {:.0f}, "
                  "split_batch.delta {:.0f} in split_batch.delta_blocks {:.0f}, "
                  "split_batch.draw_batches {:.0f} for split_batch.draw_repeats {:.0f} more groups, "
-                 "split_batch.same_index_first {:.0f}{}",
+                 "split_batch.same_index_first {:.0f}",
                  rate(Batched::MacroSunk), rate(Batched::ComputeSunk), rate(Batched::ComputeSame),
                  rate(Batched::Pairs), rate(Batched::PairBlocks), rate(Batched::DeltaWrites),
                  rate(Batched::DeltaBlocks), rate(Batched::DrawBatches),
-                 rate(Batched::DrawRepeats), rate(Batched::SameIndexFirst), front_handles);
+                 rate(Batched::DrawRepeats), rate(Batched::SameIndexFirst));
     }
     batched.fill(0);
     batched_since = now;
@@ -525,100 +519,6 @@ bool GpuSplit::OverlayQueuedWrites(u64 since, u64 begin, u32* out, u32 words) {
         }
     }
     return true;
-}
-
-bool GpuSplit::OverlayQueuedWords(u64 done, size_t space, std::span<const GPUVAddr> addresses,
-                                  std::span<const u64> devices, std::span<u32> values,
-                                  std::span<QueuedWord> states) const {
-    const size_t count = addresses.size();
-    constexpr size_t MaxWords = 64;
-    if (count == 0) {
-        return true;
-    }
-    if (count > MaxWords || devices.size() != count || values.size() != count ||
-        states.size() != count) {
-        return false;
-    }
-    // The ring position of the newest write found over each word (0: none).
-    std::array<u64, MaxWords> newest{};
-    GPUVAddr gpu_low = ~GPUVAddr{0};
-    GPUVAddr gpu_high = 0;
-    u64 device_low = ~u64{0};
-    u64 device_high = 0;
-    for (size_t i = 0; i < count; ++i) {
-        states[i] = QueuedWord::Clean;
-        gpu_low = (std::min)(gpu_low, addresses[i]);
-        gpu_high = (std::max)(gpu_high, addresses[i] + sizeof(u32));
-        device_low = (std::min)(device_low, devices[i]);
-        device_high = (std::max)(device_high, devices[i] + sizeof(u32));
-    }
-    // 3D ranged writes (constant buffer uploads, reports), newest first: the first one over a
-    // word is its newest. Ranges RangeLastWrite stopped remembering raised
-    // last_memory_write_position, which the callers check.
-    for (size_t index = ranged_writes.size(); index-- > 0;) {
-        const RangedWrite& write = ranged_writes[index];
-        if (write.position <= done) {
-            break;
-        }
-        if (!(write.begin < gpu_high && gpu_low < write.end)) {
-            continue;
-        }
-        const bool known = write.space != 0 && write.space == space &&
-                           write.data.size() * sizeof(u32) ==
-                               static_cast<size_t>(write.end - write.begin);
-        for (size_t i = 0; i < count; ++i) {
-            const GPUVAddr address = addresses[i];
-            if (newest[i] != 0 || !(write.begin < address + sizeof(u32) && address < write.end)) {
-                continue;
-            }
-            newest[i] = write.position;
-            if (known && address >= write.begin && (address - write.begin) % sizeof(u32) == 0 &&
-                address + sizeof(u32) <= write.end) {
-                values[i] = write.data[(address - write.begin) / sizeof(u32)];
-                states[i] = QueuedWord::Overlaid;
-            } else {
-                states[i] = QueuedWord::UnknownRanged;
-            }
-        }
-    }
-    // Noted writes (puller and 3D releases, reports, inline uploads; an unknown range overlaps
-    // everything), newest first: one later than the word's newest ranged write replaces it.
-    std::array<bool, MaxWords> noted{};
-    const u64 remembered = (std::min<u64>)(pending_write_count, pending_writes.size());
-    u64 scanned = 0;
-    for (; scanned < remembered; ++scanned) {
-        const PendingWrite& write =
-            pending_writes[(pending_write_count - 1 - scanned) % pending_writes.size()];
-        if (write.position <= done) {
-            break;
-        }
-        const bool anywhere = write.end == ~u64{0};
-        if (!anywhere && !(write.begin < device_high && device_low < write.end)) {
-            continue;
-        }
-        for (size_t i = 0; i < count; ++i) {
-            const u64 device = devices[i];
-            if (noted[i] ||
-                !(anywhere || (write.begin < device + sizeof(u32) && device < write.end))) {
-                continue;
-            }
-            noted[i] = true;
-            if (write.position <= newest[i]) {
-                continue; // A later ranged write covers it
-            }
-            newest[i] = write.position;
-            const u64 offset = device - write.begin;
-            if (write.words != 0 && device >= write.begin && offset % sizeof(u32) == 0 &&
-                offset / sizeof(u32) < write.words) {
-                values[i] = write.data[offset / sizeof(u32)];
-                states[i] = QueuedWord::Overlaid;
-            } else {
-                states[i] = QueuedWord::UnknownNoted;
-            }
-        }
-    }
-    // Every remembered write is newer than `done`: older ones may be over the words too.
-    return scanned != pending_writes.size();
 }
 
 bool GpuSplit::WaitForSync() {

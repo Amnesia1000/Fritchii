@@ -3498,15 +3498,6 @@ private:
                                                   u32 amount) const;
     bool FrontDmaReadEarly(VideoCommon::GpuSplit& split, FrontState& state, u32 macro, u32 method,
                            GPUVAddr source, u32 ram, u32 words);
-    /// EDEN_NX2_FRONT_HANDLES: the front's copy of a constant buffer bind (ProcessCBBind).
-    void FrontNoteCbBind(FrontState& state, size_t stage, u32 value);
-    /// EDEN_NX2_FRONT_HANDLES: sends a draw.end or draw.begin that draws as one entry (Method, or
-    /// MacroWrite when `direct`), with the handle words of its draw (FrontFillHandles). `effect`:
-    /// a GpuSplit::Effect.
-    void FrontSendDraw(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
-                       bool is_last_call, bool direct, u8 effect);
-    /// EDEN_NX2_FRONT_HANDLES: the record of the draw entry at ring position `position`.
-    void FrontFillHandles(VideoCommon::GpuSplit& split, FrontState& state, u64 position);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
     void FinishFrontMacro(Core::System& system);
     // EXP22 bit 2: instance-loop groups held back and sent as DrawBatch entries.

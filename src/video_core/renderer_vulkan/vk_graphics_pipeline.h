@@ -22,7 +22,6 @@
 #include "shader_recompiler/shader_info.h"
 #include "video_core/evicted_pointer_slots.h"
 #include "video_core/engines/maxwell_3d.h"
-#include "video_core/nx2_front_handles.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/pipeline_build.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
@@ -414,28 +413,6 @@ private:
                        std::span<const VideoCommon::SamplerId> samplers, bool via_header_index,
                        bool null_pointer_handles, int switch_value);
 
-    /// EDEN_NX2_FRONT_HANDLES: what the back did with one draw's record.
-    struct FrontHandleStats {
-        u64 used{};
-        u64 refused{};
-        u64 misses{};
-        u64 verified{};
-        u64 mismatches{};
-    };
-    /// EDEN_NX2_FRONT_HANDLES: the record the split's front made for the entry being run, if it
-    /// carries words (a record asking for a layout gets this pipeline's and returns null).
-    [[nodiscard]] const VideoCommon::FrontHandles::Record* TakeFrontHandles();
-    /// The handle word at `address`: the record's when it lists the address with a valid word
-    /// (`cursor`: where the next is likely), else (and in verify mode) read here.
-    u32 FrontHandleWord(const VideoCommon::FrontHandles::Record& record, GPUVAddr address,
-                        u32& cursor, FrontHandleStats& stats, int mode);
-    /// Counts the draw's use; a record that missed one of this draw's reads gets this pipeline's
-    /// layout published under its key.
-    void FinishFrontHandles(const VideoCommon::FrontHandles::Record& record,
-                            const FrontHandleStats& stats);
-    /// Publishes this pipeline's handle words (built once) as the layout for `key`.
-    void PublishFrontLayout(const VideoCommon::FrontHandles::Key& key);
-
     template <typename Spec>
     bool ConfigureImpl(bool is_indexed);
 
@@ -503,11 +480,6 @@ private:
     TexBankMemo tex_bank_memo;
     /// EDEN_NX2_TEX_BANK_GEN: (stage, constant buffer index) of every handle word read.
     std::vector<std::pair<u32, u32>> tex_bank_cbuf_slots;
-    /// EDEN_NX2_FRONT_HANDLES: the handle words ConfigureImpl reads from constant buffers, in its
-    /// order (no handle programs), built on first use.
-    std::vector<VideoCommon::FrontHandles::LayoutWord> front_layout;
-    bool front_layout_built{};
-    bool front_layout_too_many{};
 
     /// Graphics pipeline libraries (EDEN_NX2_GPL): one descriptor set per stage (set index =
     /// stage index), the shader libraries, and this pipeline's own vertex input and fragment
