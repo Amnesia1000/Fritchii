@@ -15,6 +15,8 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 #include "common/assert.h"
 #include "common/bit_util.h"
 #include "common/scope_exit.h"
@@ -32,6 +34,8 @@
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cmdpage_diag.h"
+#include "video_core/nx2_list_dispatch.h"
+#include "video_core/nx2_list_draw.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/query_cache/frame_trace.h"
@@ -1204,6 +1208,32 @@ struct Maxwell3D::FrontState {
     /// A method the draw manager handles was sent since the back last ran DrawDeferred: only
     /// then can it have a deferred instanced draw to issue at the end of a macro.
     bool draw_pending{true};
+    /// The back holds state writes in its method sink, which its next executable method consumes
+    /// (issuing a deferred draw a changed one ends). Front() consumes it before copying the state.
+    /// Instance folding (zortos293/Lichii#1336) folds only while it is empty.
+    bool sink_pending{};
+    /// List draws (nx2_list_draw.h, zortos293/Lichii#1336): by start in the macro code of
+    /// list_draw_generation, whether the macro is the array draw FrontTakeListDraw sends as an
+    /// address.
+    std::unordered_map<u32, bool> list_draw_macros;
+    u64 list_draw_generation{~u64{0}};
+    /// List guard (nx2_list_dispatch.h): the registers the last list draw left with their old values
+    /// (bit 0: vertex_buffer.count, bit 1: vertex_buffer.first), on the front and the back
+    /// alike, until they are written again; the list its words are in; whether an index count
+    /// was written since the last draw.end (the draw then uses neither register).
+    u32 list_draw_stale{};
+    Nx2ListDispatch::ListReader list_draw_list;
+    bool list_draw_indexed{};
+    bool in_list_draw{};
+    /// By start in the macro code of data_ram_generation (an index per instruction), what the
+    /// macro's code can do (AnalyzeEffects): bit 0 use the data RAM, bit 1 read
+    /// vertex_buffer.first or count; 0xff not analyzed yet.
+    std::vector<u8> data_ram_macros;
+    u64 data_ram_generation{~u64{0}};
+    /// Set by FrontRunMacro for one call of FrontRunMacroFeatures, whose code can read one of
+    /// the two stale registers: check each of its register reads (our macro bodies; the plain
+    /// one stays v5.7's).
+    bool guard_list_reads{};
     bool skip_same{}; ///< SkipSameValueWrites() && FrontSkipSame(), read once
     /// The inline upload being sent, when its words land linearly (EDEN_NX2_DMA_WAIT_WRITERS).
     bool upload_known{};
@@ -1699,6 +1729,9 @@ void Maxwell3D::FrontReportSameWrites(FrontState& fs) {
 void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
                            u32 argument, bool is_last_call, bool from_macro) {
     namespace Profile = VideoCommon::Nx2Profile;
+    if (fs.list_draw_stale != 0) [[unlikely]] {
+        FrontNoteListDrawWrite(split, fs, method);
+    }
     // As ProcessShadowRam does on the back.
     u32 value = argument;
     bool shadow_kept = true;
@@ -1742,6 +1775,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
             using Effect = VideoCommon::GpuSplit::Effect;
             split.DeltaWrite(this, method, argument,
                              direct && fs.draw_pending ? Effect::Gpu : Effect::None);
+            fs.sink_pending = false; // ApplyFrontDelta consumes the sink first
             if (from_macro && !direct) {
                 split.CountBatched(VideoCommon::GpuSplit::Batched::MacroSunk);
             }
@@ -1774,6 +1808,18 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
             FrontReportSameWrites(fs);
         }
         split.CountBatched(VideoCommon::GpuSplit::Batched::SameIndexFirst);
+        return;
+    }
+    // Instance folding (zortos293/Lichii#1336, EDEN_NX2_FOLD_INSTANCES): a later instance of an
+    // instance loop. The register keeps its value (instance id Subsequent, the same topology)
+    // and nothing waits in the back's sink, so all the write does there is count one more
+    // instance (DrawManager::DrawBegin): the count is sent once, before the front's next entry
+    // (GpuSplit::FoldInstance, held as the split's pending flush).
+    if (method == MAXWELL3D_REG_INDEX(draw.begin) && fs.instance_loop &&
+        ((value >> 26) & 3) == 1 && fs.skip_same && !fs.sink_pending && shadow_kept &&
+        fs.regs[method] == value && FoldInstancesEnabled()) {
+        fs.draw_pending = true;
+        split.FoldInstance(&FlushFoldedInstances, this);
         return;
     }
     // What a constant buffer upload word or a report writes, for the front's macro memory reads.
@@ -1844,6 +1890,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
     // EXP22 bit 2: instance loop methods, which nothing after the send below concerns.
     if ((fs.exp22 & 2) != 0 && execution_mask[method] &&
         FrontBatchWrite(split, fs, method, argument, value, is_last_call, from_macro)) {
+        fs.sink_pending = false; // Held executable writes: each consumes the sink when sent
         return;
     }
     if (from_macro && (execution_mask[method] || !VideoCommon::GpuSplit::MacroSink())) {
@@ -1854,6 +1901,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         } else {
             split.MacroWrite(this, method, argument, effect);
         }
+        fs.sink_pending = false; // Direct writes (and the packet) consume the sink first
     } else {
         // EDEN_NX2_MACRO_SINK: a macro's state write goes to the back's method sink as the
         // command list's own do; the back applies the sink in order (shadow RAM and same-value
@@ -1863,8 +1911,10 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         // the back reaches them, which is never later than the sink would.
         if (!execution_mask[method] && VideoCommon::GpuSplit::RingPairs()) {
             split.PairWrite(this, method, argument);
+            fs.sink_pending = false; // The back's Pairs entry consumes the sink first
         } else {
             split.Method(this, method, argument, is_last_call, nullptr, effect);
+            fs.sink_pending = !execution_mask[method];
         }
         if (from_macro) {
             split.CountBatched(VideoCommon::GpuSplit::Batched::MacroSunk);
@@ -1970,6 +2020,11 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         }
         return;
     }
+    // List guard (zortos293/Lichii#1336): each word as FrontWrite notes it (the PR's front notes
+    // single writes only; a draw.end here would draw from the stale registers).
+    for (u32 i = 0; i < amount && fs.list_draw_stale != 0; ++i) {
+        FrontNoteListDrawWrite(split, fs, method);
+    }
     // The instance loop state the back ends in (Replay: it acts on the shadow copy). The back
     // runs draw.begin once per word, so each word can switch the loop; other methods leave it
     // as their last word does.
@@ -2069,6 +2124,7 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         }
     }
     split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr, effect);
+    fs.sink_pending = false; // The back consumes the sink before a run
     if (write_end != 0) {
         // Uploaded words, unless the shadow RAM replays other values for them on the back.
         const bool upload = method >= cb_data && method < cb_data + 16 &&
@@ -2101,6 +2157,18 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             VideoCore::Nx2Debug::g_switch_generation.load(std::memory_order_relaxed) ||
         (++fs.macro_calls & 1023) == 0) [[unlikely]] {
         FrontRefreshSwitches(fs);
+    }
+    // List guard (nx2_list_dispatch.h, zortos293/Lichii#1336), ahead of both bodies so the plain
+    // one stays v5.7's: a data RAM that holds a list dispatch's marker (the compute engine shares
+    // it), and the two registers a list draw left with their old values.
+    if (grid_marker.In(native_data_ram) || fs.list_draw_stale != 0) [[unlikely]] {
+        if (FrontListGuard(split, fs)) {
+            // The call may read a stale register: the features body checks each read.
+            fs.guard_list_reads = true;
+            FrontRunMacroFeatures(system, split, fs);
+            fs.guard_list_reads = false;
+            return;
+        }
     }
     if (fs.macro_features == 0) [[likely]] {
         FrontRunMacroPlain(system, split, fs);
@@ -2298,8 +2366,21 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
         VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
         engine.native_interpreter.active_dram = &native_data_ram;
         const auto parameter_count = fs.parameters.size();
-        const auto read = [&fs](u32 address) {
-            return address < Regs::NUM_REGS ? fs.regs[address] : 0U;
+        const auto read = [&](u32 address) {
+            if (address >= Regs::NUM_REGS) {
+                return 0U;
+            }
+            if (fs.guard_list_reads && fs.list_draw_stale != 0 &&
+                (address == Nx2ListDraw::VertexFirst || address == Nx2ListDraw::VertexCount))
+                [[unlikely]] {
+                // List guard (zortos293/Lichii#1336): a register the last list draw left
+                // unwritten (FrontRunMacro set guard_list_reads only with the guard on).
+                Nx2ListDispatch::Count(Nx2ListDispatch::g_guard.stale_reads);
+                if (Nx2ListDispatch::GuardMode() == 2) {
+                    FrontResolveListDraw(split, fs);
+                }
+            }
+            return fs.regs[address];
         };
         const auto emit = [&](u32 address, u32 value) {
             if (oot_verify) [[unlikely]] {
@@ -2359,7 +2440,9 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
             return true;
         };
         bool handled = false;
-        if (oot_mode == 1 && oot != OotMacros::Id::None) {
+        // Not while the list guard checks the call's register reads (the handlers read the
+        // registers directly): the JIT runs it.
+        if (oot_mode == 1 && oot != OotMacros::Id::None && !fs.guard_list_reads) {
             // The replacement instead of the JIT, through the same emit. It returns false
             // before any effect for a call it can't reproduce: that call runs through the JIT.
             static_assert(sizeof(native_data_ram) == OotMacros::DataRamWords * sizeof(u32));
@@ -2464,6 +2547,220 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
     if (FrontVerifyEnabled() && (++fs.calls & 4095) == 0) [[unlikely]] {
         FrontVerify(split, fs);
     }
+}
+
+// List draws (nx2_list_draw.h, zortos293/Lichii#1336): whether the macro at `start` does nothing
+// but begin a draw, write its first parameter to vertex_buffer.count and its second to
+// vertex_buffer.first, and end the draw.
+bool Maxwell3D::FrontIsListDrawMacro(FrontState& fs, const MacroEngine& engine, u32 start) {
+    if (fs.list_draw_generation != engine.native_code_generation) {
+        fs.list_draw_macros.clear();
+        fs.list_draw_generation = engine.native_code_generation;
+    }
+    const auto [it, inserted] = fs.list_draw_macros.try_emplace(start, false);
+    if (!inserted) {
+        return it->second;
+    }
+    static_assert(Nx2ListDraw::DrawBegin == MAXWELL3D_REG_INDEX(draw.begin) &&
+                  Nx2ListDraw::DrawEnd == MAXWELL3D_REG_INDEX(draw.end) &&
+                  Nx2ListDraw::VertexFirst == MAXWELL3D_REG_INDEX(vertex_buffer.first) &&
+                  Nx2ListDraw::VertexCount == MAXWELL3D_REG_INDEX(vertex_buffer.count));
+    if (!Nx2ListDraw::IsArrayDrawMacro(std::span<const u32>{engine.native_code}, start)) {
+        return false;
+    }
+    LOG_INFO(HW_GPU, "List draw: the macro at {:#x} is an array draw of (count, first)", start);
+    it->second = true;
+    return true;
+}
+
+u8 Maxwell3D::FrontListGuardEffects(FrontState& fs, const MacroEngine& engine, u32 start) {
+    if (fs.data_ram_generation != engine.native_code_generation) {
+        fs.data_ram_macros.assign(engine.native_code.size() / 3, u8{0xff});
+        fs.data_ram_generation = engine.native_code_generation;
+    }
+    if (start >= fs.data_ram_macros.size()) {
+        return u8{3}; // Nothing known: the guard assumes the worst
+    }
+    u8& known = fs.data_ram_macros[start];
+    if (known == 0xff) {
+        const auto effects = TuringMacroInterpreter::AnalyzeEffects(
+            std::span<const u32>{engine.native_code}, start);
+        const bool reads_list_draw =
+            !effects.registers_read_known ||
+            std::ranges::binary_search(effects.registers_read, Nx2ListDraw::VertexFirst) ||
+            std::ranges::binary_search(effects.registers_read, Nx2ListDraw::VertexCount);
+        known = static_cast<u8>((effects.data_ram ? 1 : 0) | (reads_list_draw ? 2 : 0));
+    }
+    return known;
+}
+
+bool Maxwell3D::FrontMacroUsesDataRam(FrontState& fs, const MacroEngine& engine, u32 start) {
+    return (FrontListGuardEffects(fs, engine, start) & 1) != 0;
+}
+
+bool Maxwell3D::FrontListGuard(VideoCommon::GpuSplit& split, FrontState& fs) {
+    const int guard = Nx2ListDispatch::GuardMode();
+    auto& engine = GetNativeMacroEngine();
+    const auto positions = GetNativeMacroPositions();
+    if (guard == 0 || positions.empty()) {
+        return false;
+    }
+    const u32 start =
+        positions[((fs.executing_macro - MacroRegistersStart) >> 1) % positions.size()];
+    // The data RAM holds the marker of a grid the front did not read (the compute engine shares
+    // it). A 3D macro that uses the data RAM gets the real words.
+    if (grid_marker.In(native_data_ram) && FrontMacroUsesDataRam(fs, engine, start)) {
+        Nx2ListDispatch::Count(Nx2ListDispatch::g_guard.dram_macros);
+        if (guard == 2) {
+            Nx2ListDispatch::ResolveGrid(grid_marker, native_data_ram);
+        }
+    }
+    // A macro whose code can read vertex_buffer.first or count while a list draw left them with
+    // their old values: its reads are checked one by one (FrontRunMacroFeatures).
+    const bool checked =
+        fs.list_draw_stale != 0 && (FrontListGuardEffects(fs, engine, start) & 2) != 0;
+    if (fs.list_draw_stale != 0 && Nx2ListDraw::Diagnostics()) [[unlikely]] {
+        // EDEN_NX2_LIST_DIAG: how much of the macro traffic runs while the registers are stale,
+        // and how much of it goes through the read-checking body.
+        Nx2ListDispatch::Count(Nx2ListDispatch::g_guard.stale_calls);
+        if (checked) {
+            Nx2ListDispatch::Count(Nx2ListDispatch::g_guard.checked_calls);
+        }
+    }
+    return checked;
+}
+
+void Maxwell3D::FrontNoteListDrawWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 method) {
+    switch (method) {
+    case MAXWELL3D_REG_INDEX(vertex_buffer.count):
+        fs.list_draw_stale &= ~1U;
+        break;
+    case MAXWELL3D_REG_INDEX(vertex_buffer.first):
+        fs.list_draw_stale &= ~2U;
+        break;
+    // The small index draws (index_buffer32_first and the like) draw at once, from their own
+    // words: the draw.end after them is still an array draw.
+    case MAXWELL3D_REG_INDEX(index_buffer.count):
+    case MAXWELL3D_REG_INDEX(draw_inline_index):
+    case MAXWELL3D_REG_INDEX(inline_index_2x16.even):
+    case MAXWELL3D_REG_INDEX(inline_index_4x8.index0):
+        fs.list_draw_indexed = true;
+        break;
+    case MAXWELL3D_REG_INDEX(draw.end):
+        if (fs.in_list_draw) {
+            break;
+        }
+        // An array draw takes its first vertex and its count from the two registers.
+        if (!fs.list_draw_indexed) {
+            if (const int guard = Nx2ListDispatch::GuardMode(); guard != 0) {
+                Nx2ListDispatch::Count(Nx2ListDispatch::g_guard.stale_draws);
+                if (guard == 2) {
+                    FrontResolveListDraw(split, fs);
+                }
+            }
+        }
+        fs.list_draw_indexed = false;
+        break;
+    default:
+        break;
+    }
+}
+
+void Maxwell3D::FrontResolveListDraw(VideoCommon::GpuSplit& split, FrontState& fs) {
+    const u32 stale = std::exchange(fs.list_draw_stale, 0);
+    std::array<u32, 2> words{};
+    if (!fs.list_draw_list.Read(words)) {
+        Nx2ListDispatch::Count(Nx2ListDispatch::g_guard.failed);
+        return;
+    }
+    // As the macro would have written them: the first vertex, then the count.
+    if ((stale & 2) != 0) {
+        FrontWrite(split, fs, MAXWELL3D_REG_INDEX(vertex_buffer.first), words[1], true, true);
+    }
+    if ((stale & 1) != 0) {
+        FrontWrite(split, fs, MAXWELL3D_REG_INDEX(vertex_buffer.count), words[0], true, true);
+    }
+    Nx2ListDispatch::Count(Nx2ListDispatch::g_guard.draw_resolves);
+}
+
+bool Maxwell3D::FrontTakeListDraw(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
+                                  GPUVAddr address, const Nx2ListDispatch::ListReader& reader) {
+    auto& fs = Front(system, split);
+    // The registers must take the words themselves (no shadow RAM replay), and the two words
+    // must be the whole call.
+    if (fs.executing_macro != 0 || !fs.parameters.empty() ||
+        fs.control == Regs::ShadowRamControl::Replay || rasterizer == nullptr ||
+        !rasterizer->Nx2ListDrawSupported()) {
+        return false;
+    }
+    auto& engine = GetNativeMacroEngine();
+    const auto positions = GetNativeMacroPositions();
+    if (!engine.native_turing || positions.empty()) {
+        return false;
+    }
+    const u32 start = positions[((method - MacroRegistersStart) >> 1) % positions.size()];
+    if (!FrontIsListDrawMacro(fs, engine, start)) {
+        return false;
+    }
+    VideoCommon::Nx2Profile::CountMethod(method, false);
+    // As the writes of the macro, in its order. vertex_buffer.first and count keep the values of
+    // the last draw that was not one of these, here and on the back: only this draw reads the
+    // words.
+    fs.in_list_draw = true;
+    FrontWrite(split, fs, MAXWELL3D_REG_INDEX(draw.begin), 0, true, true);
+    // Writes no guest memory itself (the draw.end after it notes the draw's writes).
+    split.Defer(
+        [this, address, keep_id = reader.keep_id] {
+            draw_manager.draw_state.list_draw_address = address;
+            draw_manager.draw_state.list_keep_id = keep_id;
+        },
+        VideoCommon::GpuSplit::Effect::None);
+    FrontWrite(split, fs, MAXWELL3D_REG_INDEX(draw.end), 0, true, true);
+    fs.in_list_draw = false;
+    // List guard (nx2_list_dispatch.h): the two registers keep their old values from here on.
+    fs.list_draw_stale = 3;
+    fs.list_draw_list = reader;
+    fs.list_draw_indexed = false;
+    if (fs.draw_pending) {
+        fs.draw_pending = false;
+        split.Defer([this, system_ptr = &system] { FinishFrontMacro(*system_ptr); },
+                    VideoCommon::GpuSplit::Effect::Gpu);
+    }
+    return true;
+}
+
+bool Maxwell3D::FoldInstancesEnabled() {
+    // EDEN_NX2_FOLD_INSTANCES=0 (zortos293/Lichii#1336; not our EDEN_NX2_FOLD_INSTANCE, which folds
+    // a loop's first instance into its deferred draw): every later instance is sent as its own
+    // draw.begin write again.
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_FOLD_INSTANCES");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+void Maxwell3D::FlushFoldedInstances(void* engine, u32 count) {
+    auto* const self = static_cast<Maxwell3D*>(engine);
+    if (Nx2ListDraw::Diagnostics()) {
+        // EDEN_NX2_LIST_DIAG: how many instances reach the back in how many calls.
+        static u64 instances{};
+        static u64 calls{};
+        instances += count;
+        ++calls;
+        static auto window = std::chrono::steady_clock::now();
+        if (const auto now = std::chrono::steady_clock::now();
+            now - window >= std::chrono::seconds{2}) {
+            window = now;
+            LOG_INFO(HW_GPU, "Instance fold per 2 s: {} instances sent in {} calls", instances,
+                     calls);
+            instances = calls = 0;
+        }
+    }
+    // As the draw.begin writes: the draw they defer may write anywhere a draw does.
+    VideoCommon::GpuSplit::Get().Defer(
+        [self, count] { self->draw_manager.AddLoopInstances(*self, count); },
+        VideoCommon::GpuSplit::Effect::Gpu);
 }
 
 bool Maxwell3D::IsPredicateMacro(FrontState& fs, u32 method) {

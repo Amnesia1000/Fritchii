@@ -135,6 +135,28 @@ public:
     /// before it reads, and the GPU's side before it writes guest memory there.
     virtual void FinishRead([[maybe_unused]] DAddr addr, [[maybe_unused]] u64 size) {}
 
+    /// Switch 2, list draws (nx2_list_draw.h, zortos293/Lichii#1336): whether DrawIndirect draws
+    /// from an array draw's two GPU-written list words (IndirectParams::list_words) without
+    /// reading them back.
+    [[nodiscard]] virtual bool Nx2ListDrawSupported() const {
+        return false;
+    }
+    /// Switch 2, list dispatches (nx2_list_dispatch.h): whether DispatchCompute dispatches from a
+    /// grid at KeplerCompute::GetIndirectComputeAddress that only the host GPU has.
+    [[nodiscard]] virtual bool Nx2ListDispatchSupported() const {
+        return false;
+    }
+    /// Switch 2, list draws and list dispatches, on the split's back at the list's place in the
+    /// stream: keeps a copy of the `count` (up to 3) words at `address` as `keep_id`.
+    virtual void Nx2KeepListWords([[maybe_unused]] u64 keep_id, [[maybe_unused]] GPUVAddr address,
+                                  [[maybe_unused]] u32 count) {}
+    /// On the split's back: the words kept as `keep_id`, waiting for the host GPU to copy them if
+    /// it must. False if none are kept (or a later copy took their place).
+    [[nodiscard]] virtual bool Nx2ReadKeptListWords([[maybe_unused]] u64 keep_id,
+                                                    [[maybe_unused]] std::span<u32> words) {
+        return false;
+    }
+
     /// Switch 2, from the GPU thread's front: where a GPU-written command list's words are.
     enum class GpuWrittenList {
         Unknown, ///< Neither: the caller drains, flushes the page and notes it synced

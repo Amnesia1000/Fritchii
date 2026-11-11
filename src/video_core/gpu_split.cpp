@@ -287,6 +287,9 @@ void GpuSplit::Stop() {
     delta_count = 0;
     pending_flush = nullptr;
     pending_flush_argument = nullptr;
+    fold_count = 0;
+    fold_flush = nullptr;
+    fold_context = nullptr;
     back_engine = nullptr;
     front_macros = false;
     published.store(0, std::memory_order_relaxed);

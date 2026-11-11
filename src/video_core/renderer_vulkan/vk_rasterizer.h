@@ -97,6 +97,10 @@ public:
 
     void Draw(bool is_indexed, u32 instance_count) override;
     void DrawIndirect() override;
+    [[nodiscard]] bool Nx2ListDrawSupported() const override;
+    [[nodiscard]] bool Nx2ListDispatchSupported() const override;
+    void Nx2KeepListWords(u64 keep_id, GPUVAddr address, u32 count) override;
+    [[nodiscard]] bool Nx2ReadKeptListWords(u64 keep_id, std::span<u32> words) override;
     void DrawTexture() override;
     void Clear(u32 layer_count) override;
     void DispatchCompute() override;
@@ -358,6 +362,8 @@ private:
     u32 render_trace_clears = 0;
     bool pending_native_work{};
     bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
+    /// List draws (nx2_list_draw.h): DrawIndirect for IndirectParams::list_words.
+    void DrawListWords();
     VideoCommon::OotNetwork::BypassState oot_network_bypass;
     u32 mesh_emulation_groups{};             ///< mesh workgroups of the emulated draw
     u32 mesh_emulation_vertices_per_group{}; ///< 0 unless the draw is an emulated mesh draw
