@@ -93,6 +93,27 @@ constexpr std::array MAX_RESOLUTION_RECORDS{
                        .original = 0x360041E8}, // tbz w8, #0, 0x80640c
 };
 
+// RsMan-Dev's texture pool patch (zortos293/Lichii#1313, refs #247 #449): with Max Resolution the
+// render targets outgrow the graphics allocator's initial pool and the Castle Town guard house
+// (the pot room) dereferences a null allocation and freezes. main+0xC2A36C (stp x8, x9,
+// [sp, #0x10]) stores the initial pool size (x8); it now calls a routine that doubles x8 first
+// (lsl x8, x8, #1 ; stp x8, x9, [sp, #0x10] ; ret). Upstream's routine sits at main+0x3C462C0,
+// inside the Hyrule Cheat Menu mod's code (main+0x3C46280..0x3C46398); ours goes after our own
+// cave on the same executable page (main+0x3C46F10, the page runs to main+0x3C47000), so the
+// call is re-encoded for it (bl +0x301CBA4).
+constexpr size_t TEXTURE_POOL_ROUTINE_OFFSET = 0x3C46F10;
+constexpr std::array<u8, 4> TEXTURE_POOL_CALL{0xE9, 0x72, 0xC0, 0x94};
+constexpr std::array<u8, 12> TEXTURE_POOL_ROUTINE{
+    0x08, 0xF9, 0x7F, 0xD3, 0xE8, 0x27, 0x01, 0xA9, 0xC0, 0x03, 0x5F, 0xD6,
+};
+constexpr std::array TEXTURE_POOL_RECORDS{
+    BuiltinPatchRecord{.module_offset = 0xC2A36C,
+                       .bytes = TEXTURE_POOL_CALL,
+                       .checked = true,
+                       .original = 0xA90127E8}, // stp x8, x9, [sp, #0x10]
+    BuiltinPatchRecord{.module_offset = TEXTURE_POOL_ROUTINE_OFFSET, .bytes = TEXTURE_POOL_ROUTINE},
+};
+
 // Dynamic FPS by Dark (Eglantine Dev), bundled with his permission: the game's frame step follows
 // the time measured with the system counter instead of assuming 30 fps, so it runs at full speed
 // at any frame rate. A call (bl 0x3c46200) to a routine in unused space after the code.
@@ -178,6 +199,9 @@ constexpr size_t HIGH_REFRESH_STATE_SIZE = 0xA0;
 // ripple accumulator. Every word must be free (zero) in the module.
 constexpr size_t OOT_CAVE_SIZE = 0x110;
 static_assert(HIGH_REFRESH_ROUTINE_OFFSET + OOT_CAVE_SIZE <= 0x3C47000);
+// The texture pool routine follows our cave on the same page.
+static_assert(HIGH_REFRESH_ROUTINE_OFFSET + OOT_CAVE_SIZE <= TEXTURE_POOL_ROUTINE_OFFSET);
+static_assert(TEXTURE_POOL_ROUTINE_OFFSET + TEXTURE_POOL_ROUTINE.size() <= 0x3C47000);
 constexpr std::array<u8, OOT_CAVE_SIZE> HIGH_REFRESH_CAVE = [] {
     std::array<u8, OOT_CAVE_SIZE> cave{};
     std::ranges::copy(HIGH_REFRESH_ROUTINE, cave.begin());
@@ -286,6 +310,15 @@ constexpr std::array BUILTIN_PATCHES{
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = MAX_RESOLUTION_RECORDS,
         .disable_env = "EDEN_NX2_NO_MAX_RES",
+    },
+    // With Max Resolution the guard house outgrows the initial pool and dereferences a null
+    // allocation (the pot room freeze in Castle Town).
+    BuiltinPatch{
+        .name = "Texture Pool x2 (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = TEXTURE_POOL_RECORDS,
     },
     // Before Dark's: it contains his routine and replaces it while applied. Off by default; only
     // listed in Add-Ons while the setting is on.
