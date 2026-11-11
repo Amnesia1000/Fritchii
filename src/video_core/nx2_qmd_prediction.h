@@ -228,9 +228,19 @@ std::optional<Bound> CheckAcquire(const AcquireCheck& check);
 /// violation (word < bound) once the records folded landed.
 void CheckBound(const Bound& bound, u32 word);
 
+/// What met an acquire Feed answered (EDEN_NX2_RUNAHEAD's predicted boundaries).
+struct FedRelease {
+    u32 payload;   ///< The release's payload
+    u64 position;  ///< Its ring position (the end of the entry that sends it)
+    /// A queued plain release whose value is known exactly: a simple QMD's (made where the back
+    /// runs the launch) or a copy semaphore's. Max releases, landed-pending ones and the
+    /// reduction bound are not.
+    bool exact;
+};
 /// Front, EXP13=3: whether the predictions meet the unmet acquire `check` describes (`resume`:
 /// a poll of a suspended one). The caller notes a host sync (GpuSplit::NoteSync) when met.
-[[nodiscard]] bool Feed(const AcquireCheck& check, bool resume);
+/// `fed` (optional): what met it.
+[[nodiscard]] bool Feed(const AcquireCheck& check, bool resume, FedRelease* fed = nullptr);
 
 /// The count of releases the back made (Verify), to tell which came after a point.
 [[nodiscard]] u64 BackSequence();
