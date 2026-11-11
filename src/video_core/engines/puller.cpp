@@ -35,6 +35,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_qmd_prediction.h"
+#include "video_core/nx2_runahead.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace Tegra::Engines {
@@ -74,6 +75,50 @@ void DrainBack() {
     VideoCommon::GpuSplit::Get().Drain(VideoCommon::DrainSite::Acquire);
 }
 
+// EDEN_NX2_RUNAHEAD (nx2_runahead.h): `acquire` of the u32 at `device` is answered met by the
+// release sent at ring `position` that writes `payload`. Mode 1 snapshots the guest's CPU writes
+// and writes the word now (the CPU goes on early), mode 2 takes a verify chunk. The word is not
+// written on a GPU-written page (a cache may hold a newer copy) or the native syncpoint shim.
+void RunaheadBoundary(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire, u64 device,
+                      u32 payload, u64 position) {
+    namespace Runahead = VideoCommon::Runahead;
+    const Runahead::Mode mode = Runahead::CurrentMode();
+    if (mode != Runahead::Mode::On && mode != Runahead::Mode::Verify) [[likely]] {
+        return;
+    }
+    auto& memory = dma_pusher.memory_manager;
+    u8* word = nullptr;
+    if (!memory.OverlapsNativeSyncpointShim(acquire.address, sizeof(u32)) &&
+        !Nx2IsGpuWritten(device)) {
+        word = memory.GetPointer(acquire.address);
+    }
+    if (Runahead::AtBoundary(dma_pusher.system, device, word, payload, position,
+                             VideoCommon::GpuSplit::Get().ConsumedNow())) {
+        Nx2SemaphoreWaiters::Get().OnWrite(device, payload);
+    }
+}
+
+// EDEN_NX2_RUNAHEAD: an acquire answered met from the word as the queued writes leave it
+// (EDEN_NX2_SEM_FAST=2 overlays them): when the newest release the front sent to the word is
+// still queued and meets it, that release is the boundary.
+void RunaheadOverlaidBoundary(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire) {
+    namespace Runahead = VideoCommon::Runahead;
+    const Runahead::Mode mode = Runahead::CurrentMode();
+    if (mode != Runahead::Mode::On && mode != Runahead::Mode::Verify) [[likely]] {
+        return;
+    }
+    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address);
+    if (!device) {
+        return;
+    }
+    auto& split = VideoCommon::GpuSplit::Get();
+    u64 position = 0;
+    if (const std::optional<u32> release = split.NewestReleaseTo(*device, position);
+        release && position > split.ConsumedNow() && acquire.Matches(*release)) {
+        RunaheadBoundary(dma_pusher, acquire, *device, *release, position);
+    }
+}
+
 // EDEN_NX2_ACQUIRE_PRECHECK=1: a GEQUAL acquire whose word already holds the value continues
 // without draining the split, if nothing queued for the back may write the word (a release that
 // lowers it, a fence action) and no GPU work ever wrote its page (then no cache holds a newer word
@@ -110,6 +155,12 @@ bool MetByQueuedRelease(DmaPusher& dma_pusher, const Puller::PendingAcquire& acq
     }
     split.NoteSync();
     VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquiresQueued, 1);
+    if (VideoCommon::Runahead::CurrentMode() != VideoCommon::Runahead::Mode::Off) [[unlikely]] {
+        u64 position = 0;
+        if (split.QueuedReleaseTo(*device, split.ConsumedNow(), position)) {
+            RunaheadBoundary(dma_pusher, acquire, *device, *payload, position);
+        }
+    }
     return true;
 }
 
@@ -789,6 +840,70 @@ bool MetByQmdPrediction(DmaPusher& dma_pusher, const Puller::PendingAcquire& acq
 static bool SemaphoreReadableNow(DmaPusher& dma_pusher, GPUVAddr address, u32& word,
                                  u64* read_done = nullptr);
 
+// EDEN_NX2_RUNAHEAD (nx2_runahead.h), for an acquire ReleaseFencesForReadable would drain for:
+// counts what it waits for, and answers it met without the drain when the newest release the
+// front sent to the word is still queued, meets it, and nothing sent after it may write the word
+// (GpuSplit::QueuedGuestWriters with that release left out, no compute or copy range over it,
+// and no native dispatch sent since that the back has not seen miss it). MetByQueuedRelease
+// refused it only because some work was sent after the release. Within EDEN_NX2_RUNAHEAD_MS.
+// Mode 1 then also writes the word (RunaheadBoundary), 3 only answers, 2 takes a verify chunk
+// and lets the drain run. The fences are released in order on the back, as EXP12 does.
+static bool RunaheadAnswer(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire,
+                           u64 device, VideoCommon::Runahead::Mode mode) {
+    namespace Runahead = VideoCommon::Runahead;
+    auto& split = VideoCommon::GpuSplit::Get();
+    const u64 done = split.ConsumedNow();
+    u64 position = 0;
+    const std::optional<u32> release = split.NewestReleaseTo(device, position);
+    if (!release) {
+        Runahead::CountUnmet(split.UntrackedWriterPosition(device) > done
+                                 ? Runahead::Unmet::UntrackedWriter
+                                 : Runahead::Unmet::Nothing);
+        return false;
+    }
+    if (!acquire.Matches(*release)) {
+        Runahead::CountUnmet(Runahead::Unmet::WrongPayload);
+        return false;
+    }
+    if (position <= done) {
+        Runahead::CountUnmet(Runahead::Unmet::ReleaseRan);
+        return false;
+    }
+    Runahead::CountUnmet(Runahead::Unmet::QueuedLaterWriter);
+    const std::array<u64, 1> skip{position};
+    const auto writers = split.QueuedGuestWriters(done, acquire.address, device, sizeof(u32), skip);
+    if (writers.noted > position || writers.unbounded > position ||
+        split.WritersMayWriteSince(position, device, sizeof(u32))) {
+        return false;
+    }
+    // QueuedGuestWriters leaves native compute launches out (their QMD releases are EXP13's).
+    if (split.LastDispatchPosition() > position) {
+        u64 checked = 0;
+        bool waited = false;
+        if (split.DispatchesMayWriteSince(position, device, sizeof(u32), false, checked, waited) !=
+            VideoCommon::GpuSplit::DispatchCheck::Miss) {
+            return false;
+        }
+    }
+    if (!Runahead::WithinBound(done)) {
+        return false;
+    }
+    if (mode == Runahead::Mode::Verify) {
+        RunaheadBoundary(dma_pusher, acquire, device, *release, position);
+        return false;
+    }
+    if (mode == Runahead::Mode::On) {
+        RunaheadBoundary(dma_pusher, acquire, device, *release, position);
+    }
+    split.Defer([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
+    split.NoteMemoryWrite();
+    // A host-level wait for the commands after it, as the drain was.
+    split.NoteSync();
+    split.Publish();
+    Runahead::NoteEarlyAnswer(split.SentPosition(), true);
+    return true;
+}
+
 // The fence release of an acquire whose word SemaphoreReadableNow read current but unmet: the
 // drain only matters for writes that read can't account for. Returns whether the acquire is met.
 // EDEN_NX2_EXP12 (live, 0 = off): the back first runs only the queued work that may write the
@@ -812,6 +927,13 @@ static bool ReleaseFencesForReadable(DmaPusher& dma_pusher, const void* owner,
     const int mode = VideoCore::Nx2Debug::Experiment(12);
     const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address);
     auto& split = VideoCommon::GpuSplit::Get();
+    if (const auto runahead = VideoCommon::Runahead::CurrentMode();
+        runahead != VideoCommon::Runahead::Mode::Off && device && split.Active()) [[unlikely]] {
+        if (RunaheadAnswer(dma_pusher, acquire, *device, runahead)) {
+            stats.Tick();
+            return true;
+        }
+    }
     if (mode <= 0 || mode > 3 || !device || !split.Active() ||
         VideoCore::Nx2Debug::DelayedFences()) {
         stats.delayed += mode != 0 ? 1 : 0;
@@ -1137,6 +1259,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         u64 read_done = 0;
         const bool readable = SemaphoreReadableNow(dma_pusher, acquire.address, word, &read_done);
         if (readable && acquire.Matches(word)) {
+            RunaheadOverlaidBoundary(dma_pusher, acquire);
             return;
         }
         u32 miss = 0;
