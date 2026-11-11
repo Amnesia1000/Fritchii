@@ -102,6 +102,9 @@ struct FrontQmdMirror {
         /// patch: replacing it raises `evicted`.
         bool inline_qmd;
         bool patched; ///< An upload wrote over it since
+        /// From memory: built in a feed mode with EDEN_NX2_FEED_MEMORY_OVERLAY on and no
+        /// unbounded writer queued over the QMD (QueuedGuestWriters), so the feed may take it.
+        bool feed_checked;
         NativeQmdScheduler::Descriptor words;
     };
     static constexpr size_t MaxOverlays = 256; ///< #717 has 64; OoT keeps more in flight
@@ -175,7 +178,7 @@ struct FrontQmdMirror {
     }
 
     void AddOverlay(const void* space, GPUVAddr address, u64 position, const u32* words,
-                    bool inline_qmd) {
+                    bool inline_qmd, bool feed_checked = false) {
         Overlay* slot = nullptr;
         for (Overlay& overlay : overlays) {
             if (overlay.position != 0 && overlay.address == address && overlay.space == space) {
@@ -200,6 +203,7 @@ struct FrontQmdMirror {
         slot->position = position;
         slot->inline_qmd = inline_qmd;
         slot->patched = false;
+        slot->feed_checked = feed_checked;
         std::memcpy(slot->words.data(), words, sizeof(slot->words));
     }
 
@@ -316,9 +320,10 @@ std::string ProbeFrontQmd(u64 qmd) {
     if (read == g_front_qmd.reads.end() || read->second.space == nullptr) {
         return text + "; no read noted";
     }
-    constexpr std::array<const char*, 7> sources{"not a QMD", "inline QMD", "patched inline QMD",
+    constexpr std::array<const char*, 8> sources{"not a QMD", "inline QMD", "patched inline QMD",
                                                  "overlay from memory", "upload shadow",
-                                                 "memory", "memory after a wait"};
+                                                 "memory", "memory after a wait",
+                                                 "overlay from memory (not checked for the feed)"};
     constexpr std::array<const char*, 12> causes{
         "none", "noted write", "writer range", "3D ranged write", "unbounded writer",
         "unranged writer", "queued function", "3D method write", "unknown noted write",
@@ -2640,9 +2645,11 @@ bool KeplerCompute::FrontReadQmd(VideoCommon::GpuSplit& split, u64 address,
     info.block_position = block_position;
     if (overlay_ok && (!shadow_ok || overlay->position >= block_position)) {
         descriptor = overlay->words;
-        info.source = !overlay->inline_qmd ? Prediction::Source::OverlayFromMemory
-                      : overlay->patched   ? Prediction::Source::PatchedOverlay
-                                           : Prediction::Source::InlineOverlay;
+        info.source = !overlay->inline_qmd
+                          ? (overlay->feed_checked ? Prediction::Source::OverlayFromMemory
+                                                   : Prediction::Source::OverlayFromMemoryUnchecked)
+                      : overlay->patched ? Prediction::Source::PatchedOverlay
+                                         : Prediction::Source::InlineOverlay;
         Prediction::NoteMirror(Prediction::Mirror::Overlay);
         return true;
     }
@@ -2801,7 +2808,20 @@ void KeplerCompute::FrontPatchOverlays(VideoCommon::GpuSplit& split, FrontState&
         const GPUVAddr to = (std::min)(last, block_address + size);
         std::memcpy(reinterpret_cast<u8*>(qmd.data()) + (from - block_address),
                     data + (from - first), to - from);
-        mirror.AddOverlay(&memory_manager, block_address, position, qmd.data(), false);
+        // EDEN_NX2_FEED_MEMORY_OVERLAY's belt (fable_answer_pair_2 2.1): the stamps above see
+        // every writer the front notes; one that may write anything (a compute or copy writer
+        // without a range, an unranged writer, a scan past what is remembered) keeps the
+        // overlay's records out of the feed. Asked only when the feed could take them.
+        bool feed_checked = false;
+        if (Prediction::FeedRequested() && Prediction::FeedMemoryOverlays()) {
+            feed_checked =
+                split.QueuedGuestWriters(done, block_address, *device, size).unbounded == 0;
+            if (!feed_checked) {
+                Prediction::NoteMirror(Prediction::Mirror::OverlayFromMemoryUnbounded);
+            }
+        }
+        mirror.AddOverlay(&memory_manager, block_address, position, qmd.data(), false,
+                          feed_checked);
         Prediction::NoteMirror(Prediction::Mirror::OverlayFromMemory);
     }
 }

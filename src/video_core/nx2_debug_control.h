@@ -212,6 +212,13 @@ inline std::atomic<int> g_storage_sync_scan{-1};
 /// 1 = on, 2 = every hit synchronizes anyway after checking that no word of the range holds a
 /// CPU-modified or unprotected page ("Nx2 storage sync memo verify" every 10 s, must stay 0).
 inline std::atomic<int> g_storage_sync_memo{-1};
+/// EDEN_NX2_FEED_MEMORY_OVERLAY (live, default 1; fable_answer_pair_2 section 2): the EXP13=3/4
+/// feed takes records whose QMD the copy read from an overlay built from guest memory with a
+/// small upload patched over it (QmdPrediction::Source::OverlayFromMemory; OoT's per-dispatch
+/// 12-byte release patch at QMD word 52). Only overlays built while the feed and this switch were
+/// on and no unbounded writer was queued over the QMD (GpuSplit::QueuedGuestWriters) count; the
+/// back verifies every release either way (QmdPrediction::Verify). 0 = refused as before.
+inline std::atomic<int> g_feed_memory_overlay{-1};
 
 /// Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP63, live through the debug server:
 /// slots for batches of fixes built together and A/B-tested in one session
@@ -656,6 +663,9 @@ inline void LoadExperiments() {
     }
     if (name == "EDEN_NX2_STORAGE_SYNC_MEMO") {
         return &g_storage_sync_memo;
+    }
+    if (name == "EDEN_NX2_FEED_MEMORY_OVERLAY") {
+        return &g_feed_memory_overlay;
     }
     return nullptr;
 }

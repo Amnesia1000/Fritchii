@@ -242,13 +242,17 @@ enum class Fed : u32 { QueuedPlain, LandedPending, Bound, Count };
 
 constexpr std::array<const char*, static_cast<size_t>(Source::Count)> source_names{
     "not a QMD", "inline QMD", "patched inline QMD", "overlay from memory", "upload shadow",
-    "memory", "memory after a wait"};
+    "memory", "memory after a wait", "overlay from memory (not checked for the feed)"};
 
 /// Provenance gating (6f (b) 3): what the feed takes predictions from until the audit is clean
-/// for the others.
+/// for the others. Overlays from memory with EDEN_NX2_FEED_MEMORY_OVERLAY (fable_answer_pair_2
+/// section 2): built only from a guarded read (no queued write noted over the QMD, not
+/// GPU-written, no inline QMD of it queued or evicted, no unbounded writer queued), and verified
+/// by the back like every other record.
 bool FeedSource(Source source) {
     return source == Source::Other || source == Source::InlineOverlay ||
-           source == Source::PatchedOverlay || source == Source::Shadow;
+           source == Source::PatchedOverlay || source == Source::Shadow ||
+           (source == Source::OverlayFromMemory && FeedMemoryOverlays());
 }
 
 /// For the audit at a turn-off: the word, the offending record (sequence; position, decisions
@@ -403,6 +407,10 @@ struct State {
     u64 deferred_events{};
     /// EXP13=3: acquires the narrow feed left for records of dependency-waiting QMDs.
     u64 not_fed_nonsimple{};
+    /// Of the fed acquires, those met through a record (the newest plain one, or any folded one
+    /// still to land) whose QMD was read from an overlay from memory
+    /// (EDEN_NX2_FEED_MEMORY_OVERLAY).
+    u64 fed_memory_overlay{};
     std::array<std::array<u64, 2>, static_cast<size_t>(Fed::Count)> fed{};
     u64 fed_checks_passed{};
     u64 fed_checks_violated{};
@@ -633,14 +641,17 @@ struct State {
                      "path stopped (/s) by: {:.0f} newest a reduction or landed, {:.0f} an "
                      "earlier one to land, {:.0f} ran with the word moved, {:.0f} value short, "
                      "{:.0f} a later writer (stamp), {:.0f} QMD source, {:.0f} not simple; feed "
-                     "{}{}",
+                     "{}{}; overlays from memory (EDEN_NX2_FEED_MEMORY_OVERLAY={}): {:.0f} "
+                     "acquires/s fed through them, {} of the refused not checked for the feed, "
+                     "{:.0f} built/s with an unbounded writer queued",
                      fed_rate(Fed::QueuedPlain, 0), fed_rate(Fed::QueuedPlain, 1),
                      fed_rate(Fed::LandedPending, 0), fed_rate(Fed::LandedPending, 1),
                      fed_rate(Fed::Bound, 0), fed_rate(Fed::Bound, 1), fed_checks_passed,
                      fed_checks_violated, fed_checks_unverified, fed_checks_full,
                      feed_check_count, not_fed_source[static_cast<size_t>(Source::Memory)],
                      not_fed_source[static_cast<size_t>(Source::Waited)],
-                     not_fed_source[static_cast<size_t>(Source::OverlayFromMemory)],
+                     not_fed_source[static_cast<size_t>(Source::OverlayFromMemory)] +
+                         not_fed_source[static_cast<size_t>(Source::OverlayFromMemoryUnchecked)],
                      audit_checked, audit_wrong, audit_unknown, session_audit_checked,
                      session_audit_wrong, mode == 3 ? "narrow" : "full",
                      rate(not_fed_nonsimple), narrow_share, deferred_events,
@@ -649,7 +660,10 @@ struct State {
                      rate(plain_gates[2]), rate(plain_gates[3]), rate(plain_gates[4]),
                      rate(plain_gates[5]), rate(plain_gates[6]),
                      off_names[static_cast<size_t>(feed_off)],
-                     feed_off_detail.empty() ? std::string{} : " (" + feed_off_detail + ")");
+                     feed_off_detail.empty() ? std::string{} : " (" + feed_off_detail + ")",
+                     FeedMemoryOverlays() ? 1 : 0, rate(fed_memory_overlay),
+                     not_fed_source[static_cast<size_t>(Source::OverlayFromMemoryUnchecked)],
+                     mirrored(Mirror::OverlayFromMemoryUnbounded));
         }
         if (MirrorMode()) {
             LOG_INFO(HW_GPU,
@@ -774,6 +788,7 @@ struct State {
         not_fed_source = {};
         audit_checked = audit_wrong = audit_unknown = 0;
         not_fed_nonsimple = 0;
+        fed_memory_overlay = 0;
         deferred_events = 0;
         unpredicted_evicted = 0;
         since = now;
@@ -2120,6 +2135,7 @@ bool Feed(const AcquireCheck& check, bool resume, FedRelease* fed) {
         } else {
             const Fed kind = queued ? Fed::QueuedPlain : Fed::LandedPending;
             ++state.fed[static_cast<size_t>(kind)][resumed];
+            state.fed_memory_overlay += newest.source == Source::OverlayFromMemory ? 1 : 0;
             if (fed != nullptr) {
                 *fed = {.payload = newest.payload,
                         .position = newest.position,
@@ -2164,6 +2180,12 @@ bool Feed(const AcquireCheck& check, bool resume, FedRelease* fed) {
                  folded.bound.folded, {}, state.session_evicted_unlanded, state.session_foreign};
     std::copy_n(folded.bound.sequences.begin(), folded.bound.folded, fed_check.sequences.begin());
     ++state.fed[static_cast<size_t>(Fed::Bound)][resumed];
+    for (size_t i = 0; i < count; ++i) {
+        if (!records[i]->landed && records[i]->source == Source::OverlayFromMemory) {
+            ++state.fed_memory_overlay;
+            break;
+        }
+    }
     if (fed != nullptr) {
         *fed = {.payload = folded.bound.value, .position = 0, .exact = false};
     }
