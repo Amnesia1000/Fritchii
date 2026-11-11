@@ -613,6 +613,11 @@ inline void LoadExperiments() {
         // playtest with EXP70 (market + Stalchild fight): constant 60 outside the boss wave
         // (40-45 there), no flashes or glitches.
         g_experiments[69].store(600, std::memory_order_relaxed);
+        // EXP72 = 1 (2026-11-11): a preflushed read whose bytes are all in a submitted fence download
+        // waits for it. Night market toggle: reader waits 683 -> 479, wait time 515 -> 299 ms. Owner
+        // Stalchild fight playtest: readers waited for the host GPU ~280-350 -> 40-70 ms/s, 0
+        // timeouts, no flicker or glitches (the boss wave still dips: front waits, not reads).
+        g_experiments[72].store(1, std::memory_order_relaxed);
         // EXP49 = 1 (2026-11-10, owner's call for v5.7): the async read-back. Stalchild fight,
         // flipped every 30 s while the owner fought: 51.9 -> 56.9 fps, the back's read flushes
         // 35 -> 6 ms/s, guest lock waits halved. No beams in that session or two later ones
