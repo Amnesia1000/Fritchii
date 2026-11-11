@@ -1090,6 +1090,10 @@ private:
     /// Ranges the guest CPU read after GPU writes. A read that must flush downloads the GPU
     /// writes in all of them, so the reads that usually follow it find nothing left to flush.
     Common::RangeSet<DAddr> cpu_read_ranges;
+    /// EXP69: the ranges GetFlushArea marked Preflushable since the last reset.
+    Common::RangeSet<DAddr> preflush_marked_ranges;
+    u64 preflush_reset_bytes{};
+    u64 preflush_resets{};
     bool download_cpu_read_ranges{};
     Common::RangeSet<DAddr> gpu_modified_ranges;
     std::deque<Common::RangeSet<DAddr>> committed_gpu_modified_ranges;

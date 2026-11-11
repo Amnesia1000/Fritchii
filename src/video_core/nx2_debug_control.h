@@ -443,6 +443,9 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// collector's device memory figure, as deleted images waiting for the GPU are. Logs "Image pool
 /// (EXP42) last 600 frames" and counts pooled creates in "Slow clear texture cache". 1 is the default
 /// (LoadExperiments); 0 = off.
+/// EXP69 (live; frames, 0 = off; fable52_answer_stalls 5.1; BufferCache::TickFrame): every N frames
+/// the Preflushable marks GetFlushArea set go; a range the CPU still reads is trapped on its next
+/// read and marked again. Marks never cleared before: ~100 MB of fence downloads a second.
 /// EXP68 (live; bits, 0 = off; fable52_answer_npcdips 6): bit 1 = a depth clear whose scissor is
 /// the real width (zeta width rounded up to 16, same 64-byte column) looks up the scissor-wide image
 /// the draws then use, so OoT's per-NPC depth targets are one image a frame, not two plus an upload

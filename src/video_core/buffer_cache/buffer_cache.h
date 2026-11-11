@@ -145,6 +145,26 @@ void BufferCache<P>::TickFrame() {
             LOG_INFO(HW_GPU, "Memory trace: buffer cache {} MiB", buffer_bytes >> 20);
         }
     }
+    // EDEN_NX2_EXP69 (live, frames, 0 = off; fable52_answer_stalls 5.1): Preflushable marks never
+    // cleared, so every later GPU write to a page the CPU once read was downloaded at its fence
+    // (night market: ~100 MB in ~8,200 copies a second). Every N frames the marks go; a range the
+    // CPU still reads is trapped on its next read (preflushed writes arm the traps too, see
+    // QueueFenceDownload) and marked again by that read's flush.
+    if (const int reset_frames = VideoCore::Nx2Debug::Experiment(69);
+        reset_frames > 0 && frame_tick % static_cast<u64>(reset_frames) == 0 &&
+        !preflush_marked_ranges.Empty()) {
+        preflush_marked_ranges.ForEach([&](DAddr begin, DAddr end) {
+            memory_tracker.UnmarkRegionAsPreflushable(begin, end - begin);
+            preflush_reset_bytes += end - begin;
+        });
+        preflush_marked_ranges.Clear();
+        ++preflush_resets;
+    }
+    if (frame_tick % 600 == 0 && preflush_resets != 0) {
+        LOG_INFO(HW_GPU, "Preflush reset (EXP69={}) last 600 frames: {} resets, {} KiB unmarked",
+                 VideoCore::Nx2Debug::Experiment(69), preflush_resets, preflush_reset_bytes >> 10);
+        preflush_resets = preflush_reset_bytes = 0;
+    }
     if (frame_tick % 600 == 0 && !uploaded_buffer_ranges.empty()) {
         for (const auto& [address, size] : uploaded_buffer_ranges) {
             device_memory.HintCold(address, size);
@@ -378,6 +398,8 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
         if (preflush) {
             memory_tracker.MarkRegionAsPreflushable(
                 device_addr_start_aligned, device_addr_end_aligned - device_addr_start_aligned);
+            preflush_marked_ranges.Add(device_addr_start_aligned,
+                                       device_addr_end_aligned - device_addr_start_aligned);
         } else {
             if constexpr (USE_MEMORY_MAPS) {
                 cpu_read_ranges.Add(area->start_address, area->end_address - area->start_address);
