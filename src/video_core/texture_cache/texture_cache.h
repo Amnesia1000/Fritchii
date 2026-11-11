@@ -4062,15 +4062,19 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                            pad_type == VideoCore::Surface::SurfaceType::Stencil ||
                            pad_type == VideoCore::Surface::SurfaceType::DepthStencil;
     const int pad_bucket = VideoCore::Nx2Debug::Experiment(67);
+    // Not is_rescaling: it is true whenever a depth target is bound, at 1x too (RescaleRenderTargets
+    // counts depth as rescaled), which refused every target in the first test.
+    const bool pad_native_scale = Settings::values.resolution_info.up_scale == 1 &&
+                                  Settings::values.resolution_info.down_shift == 0;
     if (pad_bucket > 0 && pad_depth) {
         ++pad_depth_lookups;
-        if (!render_target_lookup || is_rescaling || !RelocationShaped(new_info) ||
+        if (!render_target_lookup || !pad_native_scale || !RelocationShaped(new_info) ||
             new_info.num_samples != 1 || pad_unsafe_slots.contains(gpu_addr)) {
             ++pad_skipped_other;
         }
     }
     if (const int bucket = pad_bucket;
-        bucket > 0 && pad_depth && render_target_lookup && !is_rescaling &&
+        bucket > 0 && pad_depth && render_target_lookup && pad_native_scale &&
         RelocationShaped(new_info) && new_info.num_samples == 1 &&
         !pad_unsafe_slots.contains(gpu_addr)) {
         {
