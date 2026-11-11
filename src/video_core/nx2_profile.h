@@ -96,6 +96,11 @@ enum class Zone : u32 {
     UniformClassic,  ///< Of uniform buffers: the host buffer synchronized and bound
     StageStorage,    ///< Of bind stage buffers: the storage buffers
     StageTexBuffers, ///< Of bind stage buffers: the texture buffers
+    // Of stage storage buffers (BufferCache::BindHostGraphicsStorageBuffers): a sample capture
+    // put 91% of it in SynchronizeBuffer's tracker walk. The rest (touch, usage, host bind) stays
+    // in "stage storage buffers".
+    StorageSync,     ///< Of stage storage buffers: SynchronizeBuffer (tracker walk and uploads)
+    StorageMark,     ///< Of stage storage buffers: written bindings marked GPU-modified
     Count,
 };
 
@@ -115,7 +120,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "macro end", "draw setup", "draw queries", "tick work", "uniform buffers",
     "geometry buffers", "storage bindings",
     "uniform bank check", "uniform stream", "uniform classic", "stage storage buffers",
-    "stage texture buffers",
+    "stage texture buffers", "storage synchronize", "storage written marks",
 };
 static_assert(zone_names.back() != nullptr, "a zone without a name");
 
@@ -200,13 +205,21 @@ enum class FineCounter : u32 {
     UniformBytes,    ///< Bytes of the uniform buffers bound (all paths)
     StorageBinds,    ///< Graphics storage buffers bound
     TextureHandles,  ///< Graphics texture handles read
+    StorageKiB,      ///< KiB of the graphics storage bindings synchronized (one range each)
+    StorageWritten,  ///< Graphics storage bindings marked GPU-written
+    StorageMulti,    ///< Graphics storage bindings bound as several ranges (BindMultiRangeStorage)
+    StorageNoUpload, ///< Graphics storage synchronizes that uploaded nothing
+    StorageUploads,  ///< Graphics storage synchronizes that uploaded something
+    StorageMemoHits, ///< Graphics storage synchronizes skipped (EDEN_NX2_STORAGE_SYNC_MEMO)
     Count,
 };
 
 inline constexpr std::array<const char*, static_cast<size_t>(FineCounter::Count)>
     fine_counter_names{
         "uniform rebinds", "uniform streamed", "uniform cached",  "uniform other",
-        "uniform bytes",   "storage binds",    "texture handles",
+        "uniform bytes",   "storage binds",    "texture handles", "storage KiB",
+        "storage written binds", "storage multi-range binds", "storage syncs without upload",
+        "storage syncs uploading", "storage sync memo hits",
     };
 static_assert(fine_counter_names.back() != nullptr, "a fine counter without a name");
 
