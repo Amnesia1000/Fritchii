@@ -160,6 +160,16 @@ void BufferCache<P>::TickFrame() {
         preflush_marked_ranges.Clear();
         ++preflush_resets;
     }
+    if (frame_tick % 600 == 0 && preflush_reads_flushed.load(std::memory_order_relaxed) != 0) {
+        const u64 flushed = preflush_reads_flushed.exchange(0, std::memory_order_relaxed);
+        const u64 in_flight = preflush_reads_in_flight.exchange(0, std::memory_order_relaxed);
+        const u64 depth = preflush_reads_in_flight_depth.exchange(0, std::memory_order_relaxed);
+        LOG_INFO(HW_GPU,
+                 "Preflushed reads last 600 frames: {} flushed on demand, {} of them with every "
+                 "GPU-written byte already in a fence download on its way ({:.1f} fences from "
+                 "the newest on average)",
+                 flushed, in_flight, in_flight != 0 ? static_cast<double>(depth) / in_flight : 0.0);
+    }
     if (frame_tick % 600 == 0 && preflush_resets != 0) {
         LOG_INFO(HW_GPU, "Preflush reset (EXP69={}) last 600 frames: {} resets, {} KiB unmarked",
                  VideoCore::Nx2Debug::Experiment(69), preflush_resets, preflush_reset_bytes >> 10);
@@ -372,6 +382,33 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
         // watch reports a session, 3 without preflush). Such a read flushes on demand instead.
         area->preemtive = !IsRegionGpuModified(device_addr_start_aligned,
                                                device_addr_end_aligned - device_addr_start_aligned);
+        if (!area->preemtive) {
+            // Counter only: would waiting for a fence download already on its way have done?
+            const DAddr begin = device_addr_start_aligned;
+            const u64 length = device_addr_end_aligned - device_addr_start_aligned;
+            bool all_in_flight = !uncommitted_gpu_modified_ranges.Intersects(begin, length);
+            size_t newest = 0;
+            if (all_in_flight) {
+                gpu_modified_ranges.ForEachInRange(begin, length, [&](DAddr lower, DAddr upper) {
+                    bool found = false;
+                    size_t index = 0;
+                    for (const auto& ranges : pending_download_ranges) {
+                        if (ranges.Intersects(lower, upper - lower)) {
+                            found = true;
+                            newest = (std::max)(newest, index);
+                        }
+                        ++index;
+                    }
+                    all_in_flight = all_in_flight && found;
+                });
+            }
+            preflush_reads_flushed.fetch_add(1, std::memory_order_relaxed);
+            if (all_in_flight) {
+                preflush_reads_in_flight.fetch_add(1, std::memory_order_relaxed);
+                preflush_reads_in_flight_depth.fetch_add(
+                    pending_download_ranges.size() - newest, std::memory_order_relaxed);
+            }
+        }
         return area;
     }
     area->preemtive = !IsRegionGpuModified(device_addr_start_aligned,
