@@ -815,6 +815,14 @@ void TextureCache<P>::TickFrame() {
         relocation_candidates = relocation_guarded = relocation_relocated = relocation_retired =
             relocation_crowded = 0;
     }
+    if ((clear_exact_used != 0 || clear_exact_missed != 0) && frame_tick % 600 == 0) {
+        LOG_INFO(HW_GPU,
+                 "Clear to exact size (EXP68={}) last 600 frames: {} depth clears sent to the "
+                 "scissor's width, {} confirmed by the next bind, {} missed; {} addresses off",
+                 VideoCore::Nx2Debug::Experiment(68), clear_exact_used, clear_exact_confirmed,
+                 clear_exact_missed, clear_exact_unsafe.size());
+        clear_exact_used = clear_exact_confirmed = clear_exact_missed = 0;
+    }
     if ((pad_depth_lookups != 0 || pad_sampled != 0) && frame_tick % 600 == 0) {
         LOG_INFO(HW_GPU,
                  "Host pad (EXP67={}) last 600 frames: {} new depth targets, {} padded, {} at an "
@@ -4654,7 +4662,45 @@ ImageViewId TextureCache<P>::FindDepthBuffer() {
     if (gpu_addr == 0) {
         return ImageViewId{};
     }
-    const ImageInfo info(regs.zeta, regs.zeta_size, regs.anti_alias_samples_mode);
+    ImageInfo info(regs.zeta, regs.zeta_size, regs.anti_alias_samples_mode);
+    if (clear_exact_pending.gpu_addr != 0 && !clearing_render_targets) {
+        // EXP68 bit 1 check: the first depth bind after the clear, at the same address, uses the
+        // exact size the clear went to.
+        if (clear_exact_pending.gpu_addr == gpu_addr) {
+            if (info.size.width == clear_exact_pending.width &&
+                info.size.height == clear_exact_pending.height) {
+                ++clear_exact_confirmed;
+            } else {
+                ++clear_exact_missed;
+                clear_exact_unsafe.insert(gpu_addr);
+                LOG_WARNING(HW_GPU,
+                            "Clear to exact size (EXP68): the bind after the clear at {:#x} is "
+                            "{}x{}, not {}x{}; this address keeps the register size",
+                            gpu_addr, info.size.width, info.size.height,
+                            clear_exact_pending.width, clear_exact_pending.height);
+            }
+        }
+        clear_exact_pending = {};
+    }
+    if (clearing_render_targets && (VideoCore::Nx2Debug::Experiment(68) & 1) != 0 &&
+        regs.clear_surface.Z && regs.clear_control.use_scissor != 0 &&
+        info.type == ImageType::e2D && info.resources.levels == 1 && info.resources.layers == 1 &&
+        info.num_samples == 1 && !clear_exact_unsafe.contains(gpu_addr)) {
+        // The game clears the per-NPC depth target with the width register rounded up to 16 and
+        // a scissor of the real square, then draws into the real square: two images a frame
+        // with an upload and alias copies between them (fable52_answer_npcdips 1).
+        const auto& scissor = regs.scissor_test[0];
+        const u32 bytes = VideoCore::Surface::BytesPerBlock(info.format);
+        const u32 scissor_width = scissor.max_x;
+        if (scissor.min_x == 0 && scissor.min_y == 0 && scissor.max_y >= info.size.height &&
+            scissor_width != 0 && scissor_width < info.size.width && bytes != 0 &&
+            Common::AlignUp(scissor_width * bytes, 64U) ==
+                Common::AlignUp(info.size.width * bytes, 64U)) {
+            info.size.width = scissor_width;
+            clear_exact_pending = {gpu_addr, info.size.width, info.size.height};
+            ++clear_exact_used;
+        }
+    }
     return FindRenderTargetView(info, gpu_addr);
 }
 

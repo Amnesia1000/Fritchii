@@ -443,6 +443,10 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// collector's device memory figure, as deleted images waiting for the GPU are. Logs "Image pool
 /// (EXP42) last 600 frames" and counts pooled creates in "Slow clear texture cache". 1 is the default
 /// (LoadExperiments); 0 = off.
+/// EXP68 (live; bits, 0 = off; fable52_answer_npcdips 6): bit 1 = a depth clear whose scissor is
+/// the real width (zeta width rounded up to 16, same 64-byte column) looks up the scissor-wide image
+/// the draws then use, so OoT's per-NPC depth targets are one image a frame, not two plus an upload
+/// and alias copies. The next depth bind at the address checks the size; a miss turns it off there.
 /// EXP67 (live; bucket in px, 0 = off): depth render targets at an address whose target changes
 /// dims get a host image rounded up to the bucket (ImageFlagBits::HostPadded), so the EXP42 pool
 /// reuses the VkImage for the next frames' nearby dims instead of a create + 0.2-1.3 ms depth bind
