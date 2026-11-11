@@ -1605,9 +1605,8 @@ void BufferCache<P>::Nx2ApplyCpuBytes(DAddr device_addr, u64 size, const u8* byt
     }
     const DAddr page = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
     if (device_addr + size <= page + Core::DEVICE_PAGESIZE) {
-        if (const auto it = native_indirect_page_snapshots.find(page);
-            it != native_indirect_page_snapshots.end()) {
-            std::memcpy(it->second.words.data() + (device_addr - page), bytes, size);
+        if (NativeBankPage* const snapshot = FindNativeBankSnapshot(page)) {
+            std::memcpy(snapshot->words.data() + (device_addr - page), bytes, size);
         }
     }
     if (!IsRegionRegistered(device_addr, static_cast<size_t>(size))) {
@@ -2088,9 +2087,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         const u64 check_size = (std::min<u64>)(mapped_size, size);
         // Banks slide through larger buffers, a new address per draw: compare each page with
         // its last contents and mark only the pages that changed.
-        if (native_indirect_page_snapshots.size() >= 16384) {
-            native_indirect_page_snapshots.clear();
-        }
+        SelectNativeBankStore();
         const DAddr first_page = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
         const DAddr end = device_addr + check_size;
         // EDEN_NX2_EXP4 (experiment, 0 = off): & 1 compares only the bytes of each page the
@@ -2123,8 +2120,9 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             const u32 stop = trim ? static_cast<u32>((std::min<DAddr>)(page + Core::DEVICE_PAGESIZE,
                                                                       end) - page)
                                   : static_cast<u32>(Core::DEVICE_PAGESIZE);
-            auto [it, inserted] = native_indirect_page_snapshots.try_emplace(page);
-            NativeBankPage& snapshot = it->second;
+            const NativeBankSnapshotRef ref = NativeBankSnapshot(page);
+            const bool inserted = ref.inserted;
+            NativeBankPage& snapshot = *ref.page;
             if (once_per_draw && !inserted && snapshot.checked_draw == native_bank_draw &&
                 snapshot.checked_begin <= begin && stop <= snapshot.checked_end) {
                 ++cost.pages_skipped;
@@ -2415,9 +2413,7 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
            device_memory.template GetPointer<u8>(device_addr + mapped_size) != nullptr) {
         mapped_size += Core::DEVICE_PAGESIZE - ((device_addr + mapped_size) & Core::DEVICE_PAGEMASK);
     }
-    if (native_indirect_page_snapshots.size() >= 16384) {
-        native_indirect_page_snapshots.clear();
-    }
+    SelectNativeBankStore();
     const DAddr first_page = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
     const DAddr end = device_addr + (std::min<u64>)(mapped_size, size);
     const bool verify = mode == 2;
@@ -2456,21 +2452,24 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
         // Take the flags before reading the page: a write flagged later is compared next bind.
         const bool collected = Core::g_collected_write_pages.Take(page);
         const bool written = Core::g_buffer_write_pages.Take(page);
-        auto [it, inserted] = native_indirect_page_snapshots.try_emplace(page);
-        NativeBankPage& snapshot = it->second;
-        if (inserted) {
+        const NativeBankSnapshotRef ref = NativeBankSnapshot(page);
+        NativeBankPage& snapshot = *ref.page;
+        if (ref.inserted) {
             ++stats.pages_new;
             if (slot_stats != nullptr) [[unlikely]] {
                 ++slot_stats->pages_new;
             }
             std::memcpy(snapshot.words.data(), guest, Core::DEVICE_PAGESIZE);
             snapshot.checked_frame = frame_tick;
-            snapshot.recheck = collected || written;
+            SetNativeBankRecheck(ref, page, collected || written);
             NoteNativeBankPageChanged(page, snapshot.words.data(), upload_to, uploads);
             continue;
         }
         // A flagged write's bytes may land after this compare: compare again at the next bind.
-        const bool recheck = std::exchange(snapshot.recheck, collected || written);
+        const bool recheck = snapshot.recheck;
+        if (recheck != (collected || written)) {
+            SetNativeBankRecheck(ref, page, collected || written);
+        }
         NativeBankReason reason = BankNone;
         if (collected) {
             reason = BankCollected;
@@ -2620,6 +2619,87 @@ void BufferCache<P>::FlushNativeBankUploads([[maybe_unused]] Buffer& buffer,
         const bool can_reorder = runtime.CanReorderUpload(buffer, copy_span);
         runtime.CopyBuffer(buffer, upload_staging.buffer, copy_span, true, can_reorder);
     }
+}
+
+template <class P>
+void BufferCache<P>::SelectNativeBankStore() {
+    const bool table = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_bank_page_table,
+                                                        "EDEN_NX2_BANK_PAGE_TABLE") != 0;
+    if (table != native_bank_table_on) [[unlikely]] {
+        // Both emptied: every page's next bind takes a new snapshot and marks the page changed.
+        ClearNativeBankSnapshots();
+        native_bank_table_on = table;
+    }
+    const size_t pages =
+        table ? native_bank_table_pages : native_indirect_page_snapshots.size();
+    if (pages >= 16384) {
+        ClearNativeBankSnapshots();
+    }
+}
+
+template <class P>
+typename BufferCache<P>::NativeBankSnapshotRef BufferCache<P>::NativeBankSnapshot(DAddr page) {
+    static_assert(Tegra::MaxwellDeviceTraits::device_virtual_bits <= NativeBankAddressBits);
+    if (!native_bank_table_on || (page >> NativeBankAddressBits) != 0) [[unlikely]] {
+        auto [it, inserted] = native_indirect_page_snapshots.try_emplace(page);
+        return NativeBankSnapshotRef{&it->second, nullptr, inserted};
+    }
+    const u64 region_index = page >> NativeBankRegionBits;
+    NativeBankRegion* region = native_bank_last_region;
+    if (region_index != native_bank_last_region_index) [[unlikely]] {
+        if (!native_bank_regions) {
+            native_bank_regions = std::make_unique<NativeBankRegionTable>();
+        }
+        std::unique_ptr<NativeBankRegion>& entry = (*native_bank_regions)[region_index];
+        if (!entry) {
+            entry = std::make_unique<NativeBankRegion>();
+            native_bank_region_list.push_back(static_cast<u32>(region_index));
+        }
+        region = entry.get();
+        native_bank_last_region_index = region_index;
+        native_bank_last_region = region;
+    }
+    const u64 slot = (page >> Core::DEVICE_PAGEBITS) & (NativeBankRegionPages - 1);
+    std::unique_ptr<NativeBankPage>& snapshot = region->pages[slot];
+    if (snapshot) [[likely]] {
+        return NativeBankSnapshotRef{snapshot.get(), region, false};
+    }
+    // Default-initialized words: the caller copies the page in before any compare.
+    snapshot.reset(new NativeBankPage);
+    region->present[slot / 64] |= u64{1} << (slot % 64);
+    ++native_bank_table_pages;
+    return NativeBankSnapshotRef{snapshot.get(), region, true};
+}
+
+template <class P>
+typename BufferCache<P>::NativeBankPage* BufferCache<P>::FindNativeBankSnapshot(DAddr page) {
+    if (!native_bank_table_on || (page >> NativeBankAddressBits) != 0) {
+        const auto it = native_indirect_page_snapshots.find(page);
+        return it != native_indirect_page_snapshots.end() ? &it->second : nullptr;
+    }
+    if (!native_bank_regions) {
+        return nullptr;
+    }
+    const NativeBankRegion* const region =
+        (*native_bank_regions)[page >> NativeBankRegionBits].get();
+    if (region == nullptr) {
+        return nullptr;
+    }
+    return region->pages[(page >> Core::DEVICE_PAGEBITS) & (NativeBankRegionPages - 1)].get();
+}
+
+template <class P>
+void BufferCache<P>::ClearNativeBankSnapshots() {
+    native_indirect_page_snapshots.clear();
+    if (native_bank_regions) {
+        for (const u32 region_index : native_bank_region_list) {
+            (*native_bank_regions)[region_index].reset();
+        }
+    }
+    native_bank_region_list.clear();
+    native_bank_table_pages = 0;
+    native_bank_last_region_index = ~u64{0};
+    native_bank_last_region = nullptr;
 }
 
 template <class P>

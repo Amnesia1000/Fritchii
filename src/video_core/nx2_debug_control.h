@@ -152,6 +152,14 @@ inline std::atomic<int> g_draw_packet{-1};
 /// bank check" line ("Native bank slots"). Counting only (BufferCache::
 /// CheckNativeBankPagesTracked). 1 = on.
 inline std::atomic<int> g_bank_slot_stats{-1};
+/// EDEN_NX2_BANK_PAGE_TABLE (live, default 0; Hookshot (NotRexed/Hookshot) bf13340's page table,
+/// research idea 1 step 3): the native bank check's page snapshots live in a page-indexed table
+/// (2 MiB regions of 512 page slots, the last region kept) instead of a node map hashed per page
+/// (~1.9% self of the back in the 8 Nov sampler, 720k lookups/s at Castle Town). Exact: the
+/// same snapshots, the same compares; a change of the switch empties both stores, so the next
+/// bind of each page takes a new snapshot and marks it changed, as after the 16384-page reset.
+/// 1 = on.
+inline std::atomic<int> g_bank_page_table{-1};
 
 /// Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP63, live through the debug server:
 /// slots for batches of fixes built together and A/B-tested in one session
@@ -578,6 +586,9 @@ inline void LoadExperiments() {
     }
     if (name == "EDEN_NX2_BANK_SLOT_STATS") {
         return &g_bank_slot_stats;
+    }
+    if (name == "EDEN_NX2_BANK_PAGE_TABLE") {
+        return &g_bank_page_table;
     }
     return nullptr;
 }

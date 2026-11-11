@@ -561,6 +561,38 @@ public:
     /// uploads are flushed, so entries must not move (std::unordered_map's lookups were ~2% of the
     /// split's back at Castle Town, 600k a second).
     boost::unordered_node_map<DAddr, NativeBankPage> native_indirect_page_snapshots;
+    /// EDEN_NX2_BANK_PAGE_TABLE (live, default 0): the snapshots in a page-indexed table instead
+    /// of the node map (the shape of Hookshot (NotRexed/Hookshot) bf13340's write-back pages: 2 MiB
+    /// regions of 512 page slots under a flat top level, the last region looked up kept). Pages
+    /// are allocated one by one, so their words stay where they are, as in the node map.
+    static constexpr u64 NativeBankRegionBits = 21;
+    static constexpr u64 NativeBankRegionPages = u64{1}
+                                                 << (NativeBankRegionBits - Core::DEVICE_PAGEBITS);
+    static constexpr u64 NativeBankAddressBits = Core::DevicePageFlags::AddressBits;
+    struct NativeBankRegion {
+        std::array<std::unique_ptr<NativeBankPage>, NativeBankRegionPages> pages;
+        /// A bit per page slot holding a snapshot.
+        std::array<u64, NativeBankRegionPages / 64> present{};
+        /// A bit per page whose NativeBankPage::recheck is set (kept with it).
+        std::array<u64, NativeBankRegionPages / 64> recheck{};
+    };
+    using NativeBankRegionTable =
+        std::array<std::unique_ptr<NativeBankRegion>,
+                   u64{1} << (NativeBankAddressBits - NativeBankRegionBits)>;
+    std::unique_ptr<NativeBankRegionTable> native_bank_regions;
+    /// The regions allocated in native_bank_regions, to clear them.
+    std::vector<u32> native_bank_region_list;
+    size_t native_bank_table_pages = 0;
+    u64 native_bank_last_region_index = ~u64{0};
+    NativeBankRegion* native_bank_last_region = nullptr;
+    /// Which store holds the snapshots: the switch as last seen (a change empties both).
+    bool native_bank_table_on = false;
+    /// A page's snapshot, and the region holding it with the table (null with the node map).
+    struct NativeBankSnapshotRef {
+        NativeBankPage* page;
+        NativeBankRegion* region;
+        bool inserted;
+    };
     /// Counts graphics draws (UpdateGraphicsBuffers) for EDEN_NX2_EXP4 & 2.
     u64 native_bank_draw = 0;
     /// EDEN_NX2_EXP4 != 0: bank check cost, logged every 5 s.
@@ -682,6 +714,28 @@ private:
 
     /// EDEN_NX2_EXP26 & 4: copies the queued pages' snapshots into `buffer`.
     void FlushNativeBankUploads(Buffer& buffer, const NativeBankUploads& uploads);
+
+    /// EDEN_NX2_BANK_PAGE_TABLE: picks the snapshot store from the switch (emptying both when it
+    /// changed) and empties it once it holds 16384 pages, as before each bank check.
+    void SelectNativeBankStore();
+    /// The snapshot of `page` (page aligned), made (words left unset) when there is none.
+    [[nodiscard]] NativeBankSnapshotRef NativeBankSnapshot(DAddr page);
+    /// The snapshot of `page` (page aligned), or null.
+    [[nodiscard]] NativeBankPage* FindNativeBankSnapshot(DAddr page);
+    void ClearNativeBankSnapshots();
+    /// Sets the page's recheck flag (and its region bit with the table).
+    static void SetNativeBankRecheck(const NativeBankSnapshotRef& ref, DAddr page, bool value) {
+        ref.page->recheck = value;
+        if (ref.region != nullptr) {
+            const u64 slot = (page >> Core::DEVICE_PAGEBITS) & (NativeBankRegionPages - 1);
+            const u64 bit = u64{1} << (slot % 64);
+            if (value) {
+                ref.region->recheck[slot / 64] |= bit;
+            } else {
+                ref.region->recheck[slot / 64] &= ~bit;
+            }
+        }
+    }
 
     void BindHostGraphicsStorageBuffers(size_t stage);
 
