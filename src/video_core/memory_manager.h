@@ -87,7 +87,7 @@ public:
     [[nodiscard]] u8* GetPointer(GPUVAddr addr);
     [[nodiscard]] const u8* GetPointer(GPUVAddr addr) const;
 
-    /// EDEN_NX2_HANDLE_PTR_CACHE=1 (default off): the texture handle words and the texture and
+    /// EDEN_NX2_HANDLE_PTR_CACHE (default on, 0 = off): the texture handle words and the texture and
     /// sampler descriptor entries every draw reads go through this thread's host pointers of the
     /// 16 device pages (4 KiB) it read last, instead of a page table walk each. They are dropped
     /// when this manager maps, remaps or unmaps anything, or the device memory does. The value

@@ -462,8 +462,11 @@ const u8* MemoryManager::GetPointer(GPUVAddr gpu_addr) const {
 
 bool MemoryManager::HandlePointerCacheEnabled() {
     static const bool enabled = [] {
+        // On by default since 2026-11-11 (Hookshot's research: its equivalent was its biggest
+        // replay win of the week). Market fresh-launch A/B (off, on, on, off; PRECOMPILE on, no
+        // flash watch): off 44.8 / 44.7, on 45.9 / 46.1 fps, same picture. =0 turns it off.
         const char* value = std::getenv("EDEN_NX2_HANDLE_PTR_CACHE");
-        return value != nullptr && value[0] != '0';
+        return value == nullptr || value[0] != '0';
     }();
     return enabled;
 }
