@@ -4943,9 +4943,10 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
         return NULL_BINDING;
     }
 
-    // The size word after a plain pointer is part of the answer; pool and native pointers ignore
-    // it.
-    const bool reads_size_word = !(table_pointer && !is_written) && !native_pointer;
+    // The size word after a plain pointer is part of the answer; a read-only native compute
+    // pointer reads it too (a size word past 8 MiB grows the binding). Pool pointers ignore it.
+    const bool reads_size_word =
+        !(table_pointer && !is_written) && (!native_pointer || (compute && !is_written));
     const u64 next_qword = reads_size_word ? gpu_memory->Read<u64>(ssbo_addr + 8) : 0;
     // Every draw rebinds each storage buffer: the layout lookup (a mutex), the range walk and
     // two page walks cost Ocarina's GPU thread ~6%. Answers hold until the page table changes.
@@ -4983,6 +4984,11 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
         u32 size = [&]() {
             const u32 memory_layout_size = static_cast<u32>((std::min)(
                 u64{gpu_memory->GetMemoryLayoutSize(gpu_addr)}, u64{(std::numeric_limits<u32>::max)()}));
+            const u32 packed_size = static_cast<u32>(next_qword);
+            const bool next_qword_is_size = static_cast<u32>(next_qword >> 32) == 0 &&
+                                            packed_size != 0 && packed_size <= memory_layout_size;
+            const u64 reach = (std::min)(runtime.GetMaxStorageBufferRange(), u64{1_GiB});
+            const u32 limit = static_cast<u32>(reach - (std::min)(reach, u64{64_KiB}));
             // A pointer read from a table in memory is the base of an object pool, read anywhere in
             // it: bound to the end of its mapping, as far as a storage buffer may reach (at most
             // 1 GiB). Ocarina of Time's grass instances lie 12-18 MiB past theirs (an 8 MiB cap
@@ -4991,19 +4997,23 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
             // constant from them. Written pools keep a cap: a write marks the whole binding
             // GPU-modified.
             if (table_pointer && !is_written) {
-                const u64 reach = (std::min)(runtime.GetMaxStorageBufferRange(), u64{1_GiB});
-                const u32 limit = static_cast<u32>(reach - (std::min)(reach, u64{64_KiB}));
                 return (std::min)(memory_layout_size, limit);
             }
             // A native (Switch 2) compute program's pointer is bare: the word after it is another
             // parameter (a dimension, stride or texture handle), not an NVN buffer size. Taking it
             // as one bound Fortune's Weave's DLSS input features to 266 bytes and dropped the rest.
             if (native_pointer) {
-                return (std::min)(memory_layout_size, static_cast<u32>(8_MiB));
+                const u32 bare = (std::min)(memory_layout_size, static_cast<u32>(8_MiB));
+                // Mario Kart World's lighting passes read past 8 MiB from theirs, inside the size
+                // word after the pointer (Eglantine #609 reads it): capped at 8 MiB those reads
+                // came back zero and lit land and characters too dark. A read-only compute binding
+                // takes a larger size word. Binding to the end of the mapping instead spanned
+                // Ocarina of Time's ~1 GiB heap and backed it with a 1 GiB buffer.
+                if (compute && !is_written && next_qword_is_size && packed_size > bare) {
+                    return (std::min)(packed_size, limit);
+                }
+                return bare;
             }
-            const u32 packed_size = static_cast<u32>(next_qword);
-            const bool next_qword_is_size = static_cast<u32>(next_qword >> 32) == 0 &&
-                                            packed_size != 0 && packed_size <= memory_layout_size;
             if (next_qword_is_size) {
                 return packed_size;
             }
