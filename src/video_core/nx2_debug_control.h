@@ -443,6 +443,10 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// collector's device memory figure, as deleted images waiting for the GPU are. Logs "Image pool
 /// (EXP42) last 600 frames" and counts pooled creates in "Slow clear texture cache". 1 is the default
 /// (LoadExperiments); 0 = off.
+/// EXP70 (live; ms, 0 = off; fable52_answer_acquire 4; PresentManager::GetRenderFrame): after this
+/// long without a free render frame, the renderer drops the oldest queued frame that is not at
+/// the present thread's front and reuses it. With EDEN_NX2_PRESENT_EXTRA_FRAMES (boot) giving more
+/// render frames than swapchain images. Display stalls (acquire blocked 76-140 ms) stalled emulation.
 /// EXP69 (live; frames, 0 = off; fable52_answer_stalls 5.1; BufferCache::TickFrame): every N frames
 /// the Preflushable marks GetFlushArea set go; a range the CPU still reads is trapped on its next
 /// read and marked again. Marks never cleared before: ~100 MB of fence downloads a second.

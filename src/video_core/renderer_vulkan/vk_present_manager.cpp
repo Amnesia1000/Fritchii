@@ -5,6 +5,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <thread>
 
 #include "common/logging.h"
@@ -15,6 +18,7 @@
 #ifdef HAS_LSFG
 #include "video_core/renderer_vulkan/present/lsfg_common.h"
 #endif
+#include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/renderer_vulkan/vk_present_manager.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -147,9 +151,20 @@ PresentManager::PresentManager(const vk::Instance& instance_,
             VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
         .queueFamilyIndex = device.GetGraphicsFamily(),
     });
-    auto cmdbuffers = cmdpool.Allocate(image_count);
+    // EDEN_NX2_PRESENT_EXTRA_FRAMES (boot, default 0; fable52_answer_acquire 4): render frames
+    // beyond the swapchain's images, so the renderer has a free one while the present thread
+    // holds every queued frame (pacing, or a display stall of 125-190 ms at the night market).
+    // MaxExtraFrames keeps using the swapchain count.
+    size_t frame_count = image_count;
+    if (const char* extra = std::getenv("EDEN_NX2_PRESENT_EXTRA_FRAMES")) {
+        frame_count = (std::min)(frame_count + static_cast<size_t>(std::max(0, std::atoi(extra))),
+                                 MAX_FRAMES_IN_FLIGHT);
+    }
+    LOG_INFO(Render_Vulkan, "Present frames: {} ({} swapchain images)", frame_count,
+             image_count.load());
+    auto cmdbuffers = cmdpool.Allocate(frame_count);
 
-    frames.resize(image_count);
+    frames.resize(frame_count);
     for (u32 i = 0; i < frames.size(); i++) {
         Frame& frame = frames[i];
         frame.index = i;
@@ -198,11 +213,46 @@ Frame* PresentManager::GetRenderFrame() {
     Common::Nx2Timeline::Span timeline_span{"present: wait for free frame"};
     // Wait for free presentation frames
     std::unique_lock lock{free_mutex};
-    free_cv.wait(lock, [this] { return !free_queue.empty(); });
-
-    // Take the frame from the queue
-    Frame* frame = free_queue.front();
-    free_queue.pop_front();
+    Frame* frame = nullptr;
+    // EDEN_NX2_EXP70 (live, ms, 0 = off; fable52_answer_acquire 4): after this long without a
+    // free frame, the renderer takes back the oldest queued frame that is not at the front (the
+    // present thread may be pacing or presenting that one) and drops it: a display that stops
+    // taking frames (vkAcquireNextImageKHR blocked 76-140 ms) no longer stalls emulation.
+    if (const int steal_ms = VideoCore::Nx2Debug::Experiment(70); steal_ms > 0 && use_present_thread) {
+        while (!free_cv.wait_for(lock, std::chrono::milliseconds{steal_ms},
+                                 [this] { return !free_queue.empty(); })) {
+            lock.unlock();
+            Frame* stolen = nullptr;
+            {
+                std::scoped_lock ql{queue_mutex};
+                if (present_queue.size() >= 2) {
+                    stolen = present_queue[1];
+                    present_queue.erase(present_queue.begin() + 1);
+                }
+            }
+            if (stolen != nullptr) {
+                DiscardFrame(stolen);
+                static std::atomic<u32> logged{};
+                const u32 count = logged.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (count <= 20 || (count & (count - 1)) == 0) {
+                    LOG_INFO(Render_Vulkan,
+                             "Present (EXP70): no free frame for {} ms, dropped a queued frame "
+                             "({} so far)",
+                             steal_ms, count);
+                }
+                frame = stolen;
+                break;
+            }
+            lock.lock();
+        }
+    } else {
+        free_cv.wait(lock, [this] { return !free_queue.empty(); });
+    }
+    if (frame == nullptr) {
+        // Take the frame from the queue
+        frame = free_queue.front();
+        free_queue.pop_front();
+    }
 
     // Wait for the presentation to be finished so all frame resources are free
     frame->present_done.Wait();
