@@ -3459,6 +3459,12 @@ private:
     void FrontEmitCapture(VideoCommon::GpuSplit& split, FrontState& state);
     /// GpuSplit::PendingFlush: sends what FrontBatchWrite holds.
     static void FrontFlushPending(void* maxwell3d);
+    /// EDEN_NX2_DRAW_PACKET: a draw macro write FrontWrite holds in the packet instead of
+    /// sending it; GpuSplit::PendingFlush sending the packet; the back's apply of it.
+    void FrontCapturePacket(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
+                            u32 argument, u32 value, u8 effect);
+    static void FrontFlushPacket(void* maxwell3d);
+    static void ApplyDrawPacket(const u64* payload);
     /// EXP22 bit 8: the fast StateDelta loop against the single writes (the latter are kept).
     void CheckFrontDelta(const u64* writes, u32 count);
     std::unique_ptr<FrontState> front;

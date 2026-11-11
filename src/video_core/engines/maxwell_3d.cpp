@@ -9,9 +9,12 @@
 #include <atomic>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include "common/assert.h"
 #include "common/bit_util.h"
 #include "common/scope_exit.h"
@@ -35,6 +38,7 @@
 #include "video_core/query_dma.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/textures/texture.h"
+#include "video_core/macro_hle_oot.h"
 #ifdef ARCHITECTURE_x86_64
 #include "video_core/macro_turing_jit.h"
 #endif
@@ -1146,11 +1150,47 @@ struct Maxwell3D::FrontState {
     /// EXP53: per macro, 0 unknown, 1 a render-enable predicate, 2 something else.
     std::vector<u8> predicate_macros;
     u64 predicate_generation{~u64{0}};
-    /// EDEN_NX2_FOLD_INSTANCE: per macro slot, the code generation and start its kind was found
-    /// for, and the kind: 1 an instanced draw macro (FoldLoopMacro), 2 something else.
-    std::vector<u64> fold_generation;
-    std::vector<u32> fold_start;
-    std::vector<u8> fold_kind;
+    /// Per macro slot (FrontRunMacro): the code generation and start it was identified for
+    /// and its OoT replacement (macro_hle_oot.h, by code hash; None for other code). Used by
+    /// EDEN_NX2_OOT_MACROS and EDEN_NX2_FOLD_INSTANCE.
+    static constexpr size_t MacroSlots = 0x80;
+    std::array<u64, MacroSlots> oot_generation{};
+    std::array<u32, MacroSlots> oot_start{};
+    std::array<bool, MacroSlots> oot_known{};
+    std::array<OotMacros::Id, MacroSlots> oot_id{};
+    /// EDEN_NX2_OOT_MACROS statistics, logged every ~10 s while the switch is on ("OoT macros").
+    struct OotStats {
+        u64 native;      ///< Calls a handler ran (mode 1)
+        u64 declined;    ///< Handler calls that returned false: run through the JIT
+        u64 unmatched;   ///< Calls of macros without a handler (JIT)
+        u64 verified;    ///< Calls compared (modes 2 and 3)
+        u64 differences; ///< Of those, with a difference
+        u64 unverifiable; ///< Calls the recording context could not reproduce (data RAM DMA)
+        u64 folds;       ///< EDEN_NX2_FOLD_INSTANCE: first instances folded
+    };
+    OotStats oot_stats{};
+    u64 oot_ticks{};
+    std::chrono::steady_clock::time_point oot_report{};
+    /// Calls per replacement (modes 2 and 3 pick the calls to compare from it).
+    std::array<u64, 32> oot_calls{};
+    std::array<u32, 32> oot_mismatch_logs{};
+    /// Verify buffers: the JIT's emitted (method, value) pairs, the handler's, and the data RAM
+    /// before the call (the handler runs on this copy after the JIT).
+    std::vector<u32> oot_jit_writes;
+    std::vector<u32> oot_handler_writes;
+    std::array<u32, OotMacros::DataRamWords> oot_dram{};
+    /// EDEN_NX2_DRAW_PACKET: this macro call's draw writes go in the packet (set per call in
+    /// FrontRunMacro), the mode (2 = the back verifies), and the held writes (method | argument
+    /// << 32), the values the front's registers took, and the entries' combined effect.
+    bool packet_on{};
+    int packet_mode{};
+    static constexpr size_t MaxPacketWrites = 64;
+    std::vector<u64> packet;
+    std::vector<u32> packet_values;
+    VideoCommon::GpuSplit::Effect packet_effect{VideoCommon::GpuSplit::Effect::None};
+    u64 packets{};       ///< Packets sent (the "OoT macros" line)
+    u64 packet_writes{}; ///< Writes they carried
+    Core::System* system{};
     std::vector<u32> dma_words; ///< FrontDmaReadEarly's words
     u64 calls{};
     /// A method the draw manager handles was sent since the back last ran DrawDeferred: only
@@ -1215,47 +1255,232 @@ struct Maxwell3D::FrontState {
 
 namespace {
 
-// EDEN_NX2_FOLD_INSTANCE. Hash of a Turing MME macro's code: its instructions (three words each)
-// from `start` through the first one with the end bit and its delay slot, at most 1024
-// instructions; FNV-1a over the words, plus the instruction count. Stable across builds. From
-// Skitchii (skolvolt/Lichii) e8a0621152, macro_hle_oot.cpp HashMacro, so its hashes apply.
-u64 HashMacroCode(std::span<const u32> code, u32 start) {
-    constexpr u32 MaxInstructions = 1024;
-    u64 hash = 0xcbf29ce484222325ULL;
-    const auto mix = [&hash](u32 word) {
-        for (u32 byte = 0; byte < 4; ++byte) {
-            hash ^= (word >> (byte * 8)) & 0xff;
-            hash *= 0x100000001b3ULL;
-        }
-    };
-    u32 count = 0;
-    bool end_next = false;
-    for (u32 pc = start; count < MaxInstructions && size_t{pc} * 3 + 2 < code.size(); ++pc) {
-        mix(code[pc * 3]);
-        mix(code[pc * 3 + 1]);
-        mix(code[pc * 3 + 2]);
-        ++count;
-        if (end_next) {
-            break;
-        }
-        // Bit 0 of the instruction's high word: end after the next instruction (delay slot).
-        end_next = (code[pc * 3 + 2] & 1) != 0;
+// EDEN_NX2_OOT_MACROS=1: the context Ocarina of Time's native macro handlers (macro_hle_oot.h,
+// from Skitchii (skolvolt/Lichii) 1.3 e8a0621152, its maxwell_3d.cpp OotContext) run in on the
+// split front. Emit is FrontRunMacro's own emit, the one the JIT calls, so every front transform
+// of a macro write (EXP53's predicate, EDEN_NX2_FOLD_INSTANCE, EDEN_NX2_MACRO_TRACE, the MME DMA
+// reads) applies to a handler's writes exactly as to the JIT's.
+template <typename EmitFn>
+struct OotFrontContext {
+    std::vector<u32>& parameters;
+    u32* dram;
+    std::span<const u32> regs;
+    EmitFn& emit;
+    const char* error{};
+
+    [[nodiscard]] u32 Count() const {
+        return static_cast<u32>(parameters.size());
     }
-    mix(count);
-    return hash;
+    [[nodiscard]] u32 Param(u32 index) const {
+        return parameters[index];
+    }
+    [[nodiscard]] u32* Dram() {
+        return dram;
+    }
+    [[nodiscard]] u32 Read(u32 method) const {
+        return method < regs.size() ? regs[method] : 0U;
+    }
+    [[nodiscard]] bool OcclusionHle() const {
+        return false;
+    }
+    void FoldFirstInstance() {
+        // FrontRunMacro's emit folds at the loop's first draw.end (the same point: after the
+        // loop's first draw.begin, checked against the front's copy of it).
+    }
+    void Emit(u32 method, u32 value) {
+        if (!emit(method, value)) [[unlikely]] {
+            Fail("method past the macro range");
+        }
+    }
+    void EmitRepeated(const std::array<u32, 2>* writes, u32 count, u32 times) {
+        for (u32 time = 0; time < times; ++time) {
+            for (u32 i = 0; i < count; ++i) {
+                Emit(writes[i][0], writes[i][1]);
+            }
+        }
+    }
+    void Fail(const char* text) {
+        if (error == nullptr) {
+            error = text;
+        }
+    }
+};
+
+// EDEN_NX2_OOT_MACROS=2/3 (verify): a handler run after the JIT ran the same call, without
+// effects: its writes are recorded, it works on a copy of the data RAM from before the call, and
+// the FIFO is the one the JIT left (the MME DMA reads appended), grown to the size it had at each
+// point of the call as the handler's own MME_DMA_READ_FIFOED writes reach it.
+struct OotRecordContext {
+    std::span<const u32> parameters;
+    u32 count;
+    u32* dram;
+    std::span<const u32> regs;
+    std::vector<u32>& writes;
+    const char* error{};
+    bool unverifiable{};
+
+    [[nodiscard]] u32 Count() const {
+        return count;
+    }
+    [[nodiscard]] u32 Param(u32 index) const {
+        return index < parameters.size() ? parameters[index] : 0U;
+    }
+    [[nodiscard]] u32* Dram() {
+        return dram;
+    }
+    [[nodiscard]] u32 Read(u32 method) const {
+        return method < regs.size() ? regs[method] : 0U;
+    }
+    [[nodiscard]] bool OcclusionHle() const {
+        return false;
+    }
+    void FoldFirstInstance() {}
+    void Emit(u32 method, u32 value) {
+        writes.push_back(method);
+        writes.push_back(value);
+        if (method >= OotMacros::FirstMacroMethod) [[unlikely]] {
+            Fail("method past the macro range");
+        } else if (method == 0x158) {
+            // MME_DMA_READ_FIFOED: FrontDmaRead appended up to 0x1000 words (EXP53: `value`).
+            const u64 grown = u64{count} + std::min<u32>(value, 0x1000);
+            count = static_cast<u32>(std::min<u64>(grown, parameters.size()));
+        } else if (method == 0x157) {
+            // MME_DMA_READ into the data RAM: the copy doesn't get the words.
+            unverifiable = true;
+        }
+    }
+    void EmitRepeated(const std::array<u32, 2>* list, u32 list_count, u32 times) {
+        for (u32 time = 0; time < times; ++time) {
+            for (u32 i = 0; i < list_count; ++i) {
+                Emit(list[i][0], list[i][1]);
+            }
+        }
+    }
+    void Fail(const char* text) {
+        if (error == nullptr) {
+            error = text;
+        }
+    }
+};
+
+enum class OotVerdict { Same, Different, Declined, Unverifiable };
+
+// EDEN_NX2_DRAW_PACKET: the writes of OoT's draw macros (macro_hle_oot.h E04, E52, EA0) that go
+// in the packet: state and draw registers that write no memory and that FrontWrite notes nothing
+// for after sending. The constant buffer words of 0xea0 (0x8e4, 0x8e5) are not among them.
+static_assert(MAXWELL3D_REG_INDEX(draw.end) == 0x585 && MAXWELL3D_REG_INDEX(draw.begin) == 0x586);
+static_assert(MAXWELL3D_REG_INDEX(const_buffer.offset) == 0x8e3 &&
+              MAXWELL3D_REG_INDEX(const_buffer.buffer) == 0x8e4);
+[[nodiscard]] bool IsDrawPacketMethod(u32 method) {
+    switch (method) {
+    case 0x446: // base vertex
+    case 0x50d: // base vertex copy
+    case 0x50e: // base instance
+    case 0x585: // draw.end
+    case 0x586: // draw.begin
+    case 0x5f2: // index_buffer address high, low and format (0xe04)
+    case 0x5f3:
+    case 0x5f6:
+    case 0x5f7: // index_buffer.first
+    case 0x5f8: // index_buffer.count
+    case 0x8e3: // const_buffer.offset
+        return true;
+    default:
+        return false;
+    }
 }
 
-// Ocarina of Time's instanced indexed draw macros, by code hash (Skitchii macro_hle_oot.cpp/.h:
-// 0xe52 "instanced indexed draw", start 0x1f4, and 0xea0 "with the base in the constant buffer",
-// start 0x1e6). Their code is, for parameters p0 draw.begin, p1 count, p2 instances (p3 first,
-// p4 base vertex, p5 base instance): a few state writes, then p2 times draw.begin, index count,
-// draw.end, the instances after the first with draw.begin's instance id Subsequent (same begin
-// and count each time), then the resets. Skitchii's handlers reproduce the JIT write for write.
-bool IsFoldLoopMacroHash(u64 hash) {
-    return hash == 0xd7011b3ed6907773ULL || hash == 0x38b7414725298d00ULL;
+[[nodiscard]] bool IsDrawMacro(OotMacros::Id id) {
+    return id == OotMacros::Id::E04 || id == OotMacros::Id::E52 || id == OotMacros::Id::EA0;
 }
-// Skitchii's handlers run calls with more instances through the JIT (MaxInstances): not folded.
-constexpr u32 FoldMaxInstances = 0x10000;
+
+// Runs replacement `id` with an OotRecordContext for the call the JIT just ran and compares the
+// writes, the data RAM and the failure with the JIT's. Logs the first differences of each
+// replacement (up to `logs` 4 times).
+OotVerdict VerifyOotCall(OotMacros::Id id, u32 method, u32 start, std::span<const u32> parameters,
+                         size_t pre_count, std::span<const u32> regs, std::span<u32> dram_copy,
+                         std::span<const u32> dram_after, std::span<const u32> jit_writes,
+                         bool jit_ok, std::vector<u32>& handler_writes, u32& logs) {
+    handler_writes.clear();
+    OotRecordContext context{parameters, static_cast<u32>(std::min(pre_count, parameters.size())),
+                             dram_copy.data(), regs, handler_writes};
+    if (!OotMacros::Run(id, context)) {
+        return OotVerdict::Declined;
+    }
+    if (context.unverifiable) {
+        return OotVerdict::Unverifiable;
+    }
+    const bool handler_ok = context.error == nullptr;
+    const bool same_writes = std::ranges::equal(jit_writes, handler_writes);
+    const bool same_dram = std::ranges::equal(dram_after, dram_copy);
+    if (same_writes && same_dram && handler_ok == jit_ok) [[likely]] {
+        return OotVerdict::Same;
+    }
+    if (logs >= 4) {
+        return OotVerdict::Different;
+    }
+    ++logs;
+    std::string params;
+    for (size_t i = 0; i < std::min<size_t>(pre_count, 16); ++i) {
+        params += fmt::format(" {:x}", parameters[i]);
+    }
+    std::string text = fmt::format(
+        "OoT macro verify: {} (method {:#x} start {:#x}) differs from the JIT; parameters{}{}; "
+        "writes JIT {} handler {}",
+        OotMacros::Name(id), method, start, params, pre_count > 16 ? " ..." : "",
+        jit_writes.size() / 2, handler_writes.size() / 2);
+    if (!same_writes) {
+        size_t i = 0;
+        while (i + 1 < jit_writes.size() && i + 1 < handler_writes.size() &&
+               jit_writes[i] == handler_writes[i] && jit_writes[i + 1] == handler_writes[i + 1]) {
+            i += 2;
+        }
+        const auto pair = [](std::span<const u32> list, size_t at) {
+            return at + 1 < list.size() ? fmt::format("{:x}={:x}", list[at], list[at + 1])
+                                        : std::string{"(end)"};
+        };
+        text += fmt::format(", first difference at write {}: JIT {} handler {}", i / 2,
+                            pair(jit_writes, i), pair(handler_writes, i));
+    }
+    if (!same_dram) {
+        size_t differing = 0;
+        size_t first = dram_after.size();
+        for (size_t i = 0; i < dram_after.size(); ++i) {
+            if (dram_after[i] != dram_copy[i]) {
+                first = std::min(first, i);
+                ++differing;
+            }
+        }
+        text += fmt::format(", data RAM: {} words differ, first [{:#x}] JIT {:x} handler {:x}",
+                            differing, first, dram_after[first], dram_copy[first]);
+    }
+    if (handler_ok != jit_ok) {
+        text += fmt::format(", JIT {} handler {}", jit_ok ? "ok" : "failed",
+                            handler_ok ? "ok" : context.error);
+    }
+    LOG_WARNING(HW_GPU, "{}", text);
+    return OotVerdict::Different;
+}
+
+// Each macro slot's identification, logged once per method, start and code hash (at most 160
+// lines a session): "OoT macro slot". EDEN_NX2_OOT_MACROS_DUMP=1 also logs the code.
+void LogOotSlot(u32 method, u32 start, u64 hash, std::span<const u32> code,
+                const OotMacros::Macro* found) {
+    static std::mutex mutex;
+    static std::unordered_set<u64> logged;
+    static const bool dump = std::getenv("EDEN_NX2_OOT_MACROS_DUMP") != nullptr;
+    std::scoped_lock lock{mutex};
+    if (logged.size() >= 160 ||
+        !logged.insert(hash ^ (u64{method} << 48) ^ (u64{start} << 24)).second) {
+        return;
+    }
+    LOG_INFO(HW_GPU, "OoT macro slot: method {:#x} start {:#x} instructions {} hash {:016x}: {}",
+             method, start, OotMacros::MacroLength(code, start), hash,
+             found != nullptr ? found->name : "no handler");
+    if (dump) {
+        OotMacros::DumpCode(method, start, hash, code);
+    }
+}
 
 // EDEN_NX2_SPLIT_VERIFY=1: every 4096 front macro calls, wait for the back and compare the
 // front's registers with the back's (logs and resynchronizes differences).
@@ -1372,6 +1597,7 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
         front->skip_same = SkipSameValueWrites() && FrontSkipSame();
         front->delta_allowed = !record_write_history && !g_trace_first_method_writes;
         front->executing_macro = executing_macro;
+        front->system = &system;
         front->parameters = std::move(macro_params);
         macro_params.clear();
         executing_macro = 0;
@@ -1602,7 +1828,13 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         return;
     }
     if (from_macro && (execution_mask[method] || !VideoCommon::GpuSplit::MacroSink())) {
-        split.MacroWrite(this, method, argument, effect);
+        if (fs.packet_on && IsDrawPacketMethod(method)) [[unlikely]] {
+            // EDEN_NX2_DRAW_PACKET: the same Direct write, held in the draw packet (none of
+            // these methods writes memory or is noted below).
+            FrontCapturePacket(split, fs, method, argument, value, static_cast<u8>(effect));
+        } else {
+            split.MacroWrite(this, method, argument, effect);
+        }
     } else {
         // EDEN_NX2_MACRO_SINK: a macro's state write goes to the back's method sink as the
         // command list's own do; the back applies the sink in order (shadow RAM and same-value
@@ -1871,40 +2103,58 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     const bool predicate = VideoCore::Nx2Debug::Experiment(53) != 0 &&
                            fs.parameters.size() == 3 && fs.parameters[0] == 0 &&
                            IsPredicateMacro(fs, method);
+    // The slot's OoT replacement (macro_hle_oot.h, from Skitchii (skolvolt/Lichii) 1.3
+    // e8a0621152): the hash of the code at the slot's start, found again when the code or the
+    // start changed, as Skitchii's FrontRunMacro does. Each slot is logged once ("OoT macro
+    // slot") so the hashes of the running game's macros can be checked against the table.
+    OotMacros::Id oot = OotMacros::Id::None;
+    if (const size_t slot = ((method - MacroRegistersStart) >> 1) % positions.size();
+        slot < FrontState::MacroSlots) [[likely]] {
+        if (!fs.oot_known[slot] || fs.oot_generation[slot] != engine.native_code_generation ||
+            fs.oot_start[slot] != start) [[unlikely]] {
+            fs.oot_known[slot] = true;
+            fs.oot_generation[slot] = engine.native_code_generation;
+            fs.oot_start[slot] = start;
+            const std::span<const u32> code{engine.native_code};
+            const u64 hash = OotMacros::HashMacro(code, start);
+            const OotMacros::Macro* const found = OotMacros::Find(hash);
+            fs.oot_id[slot] = found != nullptr ? found->id : OotMacros::Id::None;
+            LogOotSlot(method, start, hash, code, found);
+        }
+        oot = fs.oot_id[slot];
+    }
+    // EDEN_NX2_OOT_MACROS (live, 0 = off, the default): 1 runs the replacement instead of the
+    // JIT, 2 and 3 verify it against the JIT (see nx2_debug_control.h g_oot_macros).
+    const int oot_mode =
+        VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_oot_macros, "EDEN_NX2_OOT_MACROS");
+    const size_t oot_index = static_cast<size_t>(oot);
+    bool oot_verify = false;
+    if (oot != OotMacros::Id::None && oot_mode >= 2) [[unlikely]] {
+        const u64 n = fs.oot_calls[oot_index]++;
+        oot_verify = oot_mode >= 3 || n < 4096 || (n & 63) == 0;
+    }
     // EDEN_NX2_FOLD_INSTANCE (live, 0 = off, the default; from Skitchii (skolvolt/Lichii)
     // e8a0621152, macro_hle_oot.h DrawLoop and maxwell_3d.cpp OotContext::FoldFirstInstance):
-    // for a call of an instanced draw macro (IsFoldLoopMacroHash) with 2 or more instances, the
-    // back's draw manager is told before the loop's first draw.end that this instance is the
-    // first of a loop, so it is not drawn alone: the loop's deferred draw (instance_count + 1
-    // from the base instance) covers it. Without it instance 0 is drawn twice.
-    bool fold_pending = false;
-    if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_fold_instance,
-                                         "EDEN_NX2_FOLD_INSTANCE") != 0 &&
-        fs.parameters.size() >= 6 && fs.parameters[2] > 1 &&
-        fs.parameters[2] <= FoldMaxInstances && !positions.empty()) [[unlikely]] {
-        const size_t index = ((method - MacroRegistersStart) >> 1) % positions.size();
-        if (fs.fold_kind.size() != positions.size()) {
-            fs.fold_kind.assign(positions.size(), 0);
-            fs.fold_generation.assign(positions.size(), 0);
-            fs.fold_start.assign(positions.size(), 0);
-        }
-        // Found again when the code or the slot's start changed, as Skitchii's FrontRunMacro.
-        if (fs.fold_kind[index] == 0 || fs.fold_generation[index] != engine.native_code_generation ||
-            fs.fold_start[index] != start) [[unlikely]] {
-            fs.fold_generation[index] = engine.native_code_generation;
-            fs.fold_start[index] = start;
-            const bool loop = IsFoldLoopMacroHash(
-                HashMacroCode(std::span<const u32>{engine.native_code}, start));
-            fs.fold_kind[index] = loop ? 1 : 2;
-            static u32 fold_logged{};
-            if (loop && fold_logged++ < 8) {
-                LOG_INFO(HW_GPU, "Native macro {:#x} (start {:#x}): instanced draw, first "
-                         "instance folded into the loop's draw (EDEN_NX2_FOLD_INSTANCE)",
-                         method, start);
-            }
-        }
-        fold_pending = fs.fold_kind[index] == 1;
-    }
+    // for a call of an instanced draw macro (0xe52 or 0xea0, identified as above, the handlers'
+    // own lookup) with 2 or more instances, the back's draw manager is told before the loop's
+    // first draw.end that this instance is the first of a loop, so it is not drawn alone: the
+    // loop's deferred draw (instance_count + 1 from the base instance) covers it. Without it
+    // instance 0 is drawn twice. The same with the handlers on (they call the emit below).
+    const bool fold_on = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_fold_instance,
+                                                          "EDEN_NX2_FOLD_INSTANCE") != 0;
+    bool fold_pending = fold_on &&
+                        (oot == OotMacros::Id::E52 || oot == OotMacros::Id::EA0) &&
+                        fs.parameters.size() >= 6 && fs.parameters[2] > 1 &&
+                        fs.parameters[2] <= OotMacros::MaxInstances;
+    // EDEN_NX2_DRAW_PACKET (live, 0 = off, the default): a draw macro's Direct draw and state
+    // writes go as one ring entry (FrontCapturePacket). Not with the paths that keep their own
+    // open blocks or held writes (EXP22, EXP2, EDEN_NX2_MACRO_SINK).
+    fs.packet_mode = IsDrawMacro(oot) ? VideoCore::Nx2Debug::SwitchValue(
+                                            VideoCore::Nx2Debug::g_draw_packet,
+                                            "EDEN_NX2_DRAW_PACKET")
+                                      : 0;
+    fs.packet_on = fs.packet_mode != 0 && fs.exp22 == 0 && fs.same_experiment == 0 &&
+                   !VideoCommon::GpuSplit::MacroSink();
     {
         VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
         engine.native_interpreter.active_dram = &native_data_ram;
@@ -1913,6 +2163,10 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             return address < Regs::NUM_REGS ? fs.regs[address] : 0U;
         };
         const auto emit = [&](u32 address, u32 value) {
+            if (oot_verify) [[unlikely]] {
+                fs.oot_jit_writes.push_back(address);
+                fs.oot_jit_writes.push_back(value);
+            }
             if (trace) [[unlikely]] {
                 trace_text += fmt::format(" {:x}={:x}", address, value);
             }
@@ -1936,6 +2190,14 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                 if (((fs.regs[MAXWELL3D_REG_INDEX(draw.begin)] >> 26) & 3) == 0) {
                     split.Defer([this] { draw_manager.FoldFirstInstance(); },
                                 VideoCommon::GpuSplit::Effect::None);
+                    ++fs.oot_stats.folds;
+                    static u32 fold_logged{};
+                    if (fold_logged++ < 4) {
+                        LOG_INFO(HW_GPU, "Native macro {:#x} (start {:#x}, {}): instanced draw, "
+                                 "first instance folded into the loop's draw "
+                                 "(EDEN_NX2_FOLD_INSTANCE)",
+                                 method, start, OotMacros::Name(oot));
+                    }
                 }
             }
             FrontWrite(split, fs, address, value, true, true);
@@ -1957,21 +2219,98 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             }
             return true;
         };
-#ifdef ARCHITECTURE_x86_64
-        if (!engine.native_jit) {
-            engine.native_jit = std::make_shared<TuringMacroJit>();
+        bool handled = false;
+        if (oot_mode == 1 && oot != OotMacros::Id::None) {
+            // The replacement instead of the JIT, through the same emit. It returns false
+            // before any effect for a call it can't reproduce: that call runs through the JIT.
+            static_assert(sizeof(native_data_ram) == OotMacros::DataRamWords * sizeof(u32));
+            OotFrontContext<decltype(emit)> context{fs.parameters, native_data_ram.data(),
+                                                    std::span<const u32>{fs.regs}, emit};
+            handled = OotMacros::Run(oot, context);
+            if (handled) {
+                ++fs.oot_stats.native;
+                if (context.error != nullptr) [[unlikely]] {
+                    engine.native_execution_failed = true;
+                    LOG_ERROR(HW_GPU, "Native MME (split front, OoT macro {:#x}) failed: {}",
+                              method, context.error);
+                }
+            } else {
+                ++fs.oot_stats.declined;
+            }
+        } else if (oot_mode != 0 && oot == OotMacros::Id::None) {
+            ++fs.oot_stats.unmatched;
         }
-        engine.native_jit->Prepare(engine.native_code, engine.native_code_generation);
-        const auto result = engine.native_jit->Execute(
-            start, fs.parameters, std::span<u32>{native_data_ram}, read, emit);
+        if (!handled) {
+            if (oot_verify) [[unlikely]] {
+                fs.oot_jit_writes.clear();
+                fs.oot_dram = native_data_ram;
+            }
+#ifdef ARCHITECTURE_x86_64
+            if (!engine.native_jit) {
+                engine.native_jit = std::make_shared<TuringMacroJit>();
+            }
+            engine.native_jit->Prepare(engine.native_code, engine.native_code_generation);
+            const auto result = engine.native_jit->Execute(
+                start, fs.parameters, std::span<u32>{native_data_ram}, read, emit);
 #else
-        const auto result =
-            engine.native_interpreter.Execute(engine.native_code, start, fs.parameters, read, emit);
+            const auto result = engine.native_interpreter.Execute(engine.native_code, start,
+                                                                  fs.parameters, read, emit);
 #endif
-        if (!result.success) {
-            engine.native_execution_failed = true;
-            LOG_ERROR(HW_GPU, "Native MME (split front) failed: start={:#x}, consumed={}/{}, error={}",
-                      start, result.consumed, parameter_count, result.error);
+            if (!result.success) {
+                engine.native_execution_failed = true;
+                LOG_ERROR(HW_GPU, "Native MME (split front) failed: start={:#x}, consumed={}/{}, error={}",
+                          start, result.consumed, parameter_count, result.error);
+            }
+            if (oot_verify) [[unlikely]] {
+                // The JIT's writes counted; now the replacement on copies, compared.
+                switch (VerifyOotCall(oot, method, start, fs.parameters, parameter_count,
+                                      fs.regs, fs.oot_dram, native_data_ram, fs.oot_jit_writes,
+                                      result.success, fs.oot_handler_writes,
+                                      fs.oot_mismatch_logs[oot_index])) {
+                case OotVerdict::Same:
+                    ++fs.oot_stats.verified;
+                    break;
+                case OotVerdict::Different:
+                    ++fs.oot_stats.verified;
+                    ++fs.oot_stats.differences;
+                    break;
+                case OotVerdict::Declined:
+                    ++fs.oot_stats.declined;
+                    break;
+                case OotVerdict::Unverifiable:
+                    ++fs.oot_stats.unverifiable;
+                    break;
+                }
+            }
+        }
+    }
+    if (fs.packet_on) [[unlikely]] {
+        // The call's last packet goes now (it is the pending flush when it holds writes).
+        fs.packet_on = false;
+        if (!fs.packet.empty()) {
+            split.RunPendingFlush();
+        }
+    }
+    if ((oot_mode != 0 || fold_on || fs.packet_mode != 0) && (++fs.oot_ticks & 0xffff) == 0)
+        [[unlikely]] {
+        const auto now = std::chrono::steady_clock::now();
+        if (fs.oot_report == std::chrono::steady_clock::time_point{}) {
+            fs.oot_report = now;
+        } else if (const double seconds = std::chrono::duration<double>(now - fs.oot_report).count();
+                   seconds >= 10.0) {
+            const auto& s = fs.oot_stats;
+            LOG_INFO(HW_GPU,
+                     "OoT macros (EDEN_NX2_OOT_MACROS={}, FOLD_INSTANCE={}), last {:.0f} s: {} "
+                     "native calls, {} declined to the JIT, {} calls of macros without a handler; "
+                     "verify: {} compared, {} differences, {} not verifiable; {} first instances "
+                     "folded; draw packets (EDEN_NX2_DRAW_PACKET) {} with {} writes",
+                     oot_mode, fold_on ? 1 : 0, seconds, s.native, s.declined, s.unmatched,
+                     s.verified, s.differences, s.unverifiable, s.folds, fs.packets,
+                     fs.packet_writes);
+            fs.oot_stats = {};
+            fs.packets = 0;
+            fs.packet_writes = 0;
+            fs.oot_report = now;
         }
     }
     if (trace) [[unlikely]] {
@@ -3073,6 +3412,116 @@ void Maxwell3D::FrontFlushPending(void* maxwell3d) {
     }
     self->FrontEmitBatch(split, fs);
     self->FrontEmitCapture(split, fs);
+}
+
+void Maxwell3D::FrontCapturePacket(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
+                                   u32 argument, u32 value, u8 effect) {
+    // EDEN_NX2_DRAW_PACKET (Fable's back-thread plan, Build C step 1). The packet is held as
+    // GpuSplit's pending flush, so anything else the front sends, publishes or drains for sends
+    // it first and the method order stays as with single entries.
+    if (fs.packet.size() >= FrontState::MaxPacketWrites) {
+        split.RunPendingFlush();
+    }
+    if (fs.packet.empty()) {
+        split.SetPendingFlush(&Maxwell3D::FrontFlushPacket, this);
+        fs.packet_effect = VideoCommon::GpuSplit::Effect::None;
+    }
+    fs.packet.push_back(u64{method} | (u64{argument} << 32));
+    fs.packet_values.push_back(value);
+    fs.packet_effect = VideoCommon::SplitWriteTracker::Combine(
+        fs.packet_effect, static_cast<VideoCommon::GpuSplit::Effect>(effect));
+}
+
+void Maxwell3D::FrontFlushPacket(void* maxwell3d) {
+    // GpuSplit cleared the hook before the call: the Reserve below does not come back here.
+    auto* const self = static_cast<Maxwell3D*>(maxwell3d);
+    FrontState& fs = *self->front;
+    if (fs.packet.empty()) {
+        return;
+    }
+    auto& split = VideoCommon::GpuSplit::Get();
+    // The writes as MacroWrite sends each one (Direct, is_last): the engine is part of the
+    // payload, so no engine entry is needed; the back's engine selection stays as it is.
+    const size_t count = fs.packet.size();
+    // EDEN_NX2_DRAW_PACKET=2: also each written register once, with the value the front's copy
+    // took for it (its last write in the packet), for the back to compare after applying.
+    std::array<u64, FrontState::MaxPacketWrites> checks;
+    size_t check_count = 0;
+    if (fs.packet_mode >= 2) [[unlikely]] {
+        for (size_t i = 0; i < count; ++i) {
+            const u32 method = static_cast<u32>(fs.packet[i] & 0xffff);
+            const bool later = std::any_of(fs.packet.begin() + i + 1, fs.packet.end(),
+                                           [method](u64 write) {
+                                               return static_cast<u32>(write & 0xffff) == method;
+                                           });
+            if (!later) {
+                checks[check_count++] = u64{method} | (u64{fs.packet_values[i]} << 32);
+            }
+        }
+    }
+    split.CallWithPayload(&Maxwell3D::ApplyDrawPacket, 3 + count + check_count, fs.packet_effect,
+                          [&](u64* payload) {
+                              payload[0] = reinterpret_cast<u64>(self);
+                              payload[1] = reinterpret_cast<u64>(fs.system);
+                              payload[2] = u64{count} | (u64{check_count} << 32);
+                              std::memcpy(payload + 3, fs.packet.data(), count * sizeof(u64));
+                              std::memcpy(payload + 3 + count, checks.data(),
+                                          check_count * sizeof(u64));
+                          });
+    ++fs.packets;
+    fs.packet_writes += count;
+    fs.packet.clear();
+    fs.packet_values.clear();
+}
+
+void Maxwell3D::ApplyDrawPacket(const u64* payload) {
+    // EDEN_NX2_DRAW_PACKET on the back: what GpuSplit::Execute does for each of the packet's
+    // Direct Method entries (ConsumeSink, then CallMethod), in one call. Nothing between the
+    // writes can fill the method sink, so it is consumed once.
+    auto* const self = reinterpret_cast<Maxwell3D*>(payload[0]);
+    auto& system = *reinterpret_cast<Core::System*>(payload[1]);
+    const u32 count = static_cast<u32>(payload[2]);
+    const u32 checks = static_cast<u32>(payload[2] >> 32);
+    const u64* const writes = payload + 3;
+    {
+        // GpuSplit::Execute: the fast path leaves the timing to CallMethod's own sample, the
+        // other path times the entry.
+        std::optional<VideoCommon::Nx2Profile::Scope> scope;
+        if (!self->fast_maxwell3d) {
+            scope.emplace(VideoCommon::Nx2Profile::Zone::Method);
+        }
+        self->ConsumeSink(system);
+        for (u32 i = 0; i < count; ++i) {
+            self->CallMethod(system, static_cast<u32>(writes[i] & 0xffff),
+                             static_cast<u32>(writes[i] >> 32), true);
+        }
+    }
+    if (checks == 0) [[likely]] {
+        return;
+    }
+    // EDEN_NX2_DRAW_PACKET=2: the registers must hold what the front's copy took.
+    static std::atomic<u64> checked{};
+    static std::atomic<u64> differing{};
+    static std::atomic<u32> logged{};
+    const u64* const check = writes + count;
+    for (u32 i = 0; i < checks; ++i) {
+        const u32 method = static_cast<u32>(check[i] & 0xffff);
+        const u32 expected = static_cast<u32>(check[i] >> 32);
+        if (self->regs.reg_array[method] != expected) [[unlikely]] {
+            differing.fetch_add(1, std::memory_order_relaxed);
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                LOG_WARNING(HW_GPU,
+                            "Draw packet verify: register {:#x} is {:#x} on the back, the front "
+                            "wrote {:#x} ({} writes in the packet)",
+                            method, self->regs.reg_array[method], expected, count);
+            }
+        }
+    }
+    if (const u64 n = checked.fetch_add(1, std::memory_order_relaxed) + 1;
+        n == 1 || n % 200000 == 0) {
+        LOG_INFO(HW_GPU, "Draw packet verify: {} packets checked, {} register differences", n,
+                 differing.load(std::memory_order_relaxed));
+    }
 }
 
 } // namespace Tegra::Engines

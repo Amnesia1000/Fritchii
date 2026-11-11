@@ -366,6 +366,17 @@ public:
         Commit(2 + payload, effect);
     }
     void DeferFunction(std::function<void()>&& func);
+    /// Runs `func(payload)` on the back after everything sent before it, with `words` payload
+    /// words that `fill(u64* payload)` writes here (a Call entry with a variable payload, for
+    /// EDEN_NX2_DRAW_PACKET's write lists). `fill` must not call into the split.
+    template <typename Fill>
+    void CallWithPayload(void (*func)(const u64*), size_t words, Effect effect, const Fill& fill) {
+        u64* const entry = Reserve(2 + words);
+        entry[0] = static_cast<u64>(Kind::Call) | (u64{words} << 8);
+        entry[1] = reinterpret_cast<u64>(func);
+        fill(entry + 2);
+        Commit(2 + words, effect);
+    }
     /// Runs `func` on the back and waits for it: for work on back-owned state, such as a buffer
     /// cache download that records into the Vulkan scheduler. A drained back still submits from
     /// its idle hook, so the front never touches that state itself.
