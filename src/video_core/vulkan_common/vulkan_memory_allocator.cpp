@@ -264,7 +264,17 @@ VkResult TimedVmaCreateImage(const Device &device, VmaAllocator allocator,
         handle = VK_NULL_HANDLE;
         return result;
     }
-    result = vmaAllocateMemoryForImage(allocator, handle, &alloc_ci, &allocation, &alloc_info);
+    // VMA_MEMORY_USAGE_AUTO* needs the create info (vmaCreateImage only; here it fails with
+    // VK_ERROR_FEATURE_NOT_PRESENT): the same preference without it.
+    VmaAllocationCreateInfo explicit_ci = alloc_ci;
+    if (explicit_ci.usage == VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE ||
+        explicit_ci.usage == VMA_MEMORY_USAGE_AUTO) {
+        explicit_ci.usage = VMA_MEMORY_USAGE_UNKNOWN;
+        explicit_ci.preferredFlags |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    } else if (explicit_ci.usage == VMA_MEMORY_USAGE_AUTO_PREFER_HOST) {
+        explicit_ci.usage = VMA_MEMORY_USAGE_UNKNOWN;
+    }
+    result = vmaAllocateMemoryForImage(allocator, handle, &explicit_ci, &allocation, &alloc_info);
     const u64 t2 = TimingNow();
     if (result == VK_SUCCESS) {
         result = vmaBindImageMemory(allocator, allocation, handle);
