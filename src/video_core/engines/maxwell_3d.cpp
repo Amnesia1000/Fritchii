@@ -1615,6 +1615,14 @@ GPUVAddr ConstBufferWriteAddress(std::span<const u32> regs) {
            regs[MAXWELL3D_REG_INDEX(const_buffer.offset)];
 }
 
+// Whether all `amount` constant buffer data words sent next land in memory: ProcessCBMultiData
+// (and CallConstBufferWords) drop the words past the buffer's size.
+bool FrontCbWordsLand(std::span<const u32> regs, u32 amount) {
+    const u64 offset = regs[MAXWELL3D_REG_INDEX(const_buffer.offset)];
+    const u64 size = regs[MAXWELL3D_REG_INDEX(const_buffer.size)];
+    return offset + u64{amount} * sizeof(u32) <= size;
+}
+
 // A report and what it may write: payload and timestamp.
 GPUVAddr ReportAddress(std::span<const u32> regs) {
     return (GPUVAddr{regs[MAXWELL3D_REG_INDEX(report_semaphore.address_high)]} << 32) |
@@ -1824,6 +1832,8 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
     }
     // What a constant buffer upload word or a report writes, for the front's macro memory reads.
     const auto [write_begin, write_end] = FrontWriteRange(fs, method, 1);
+    // ProcessCBMultiData drops words past the buffer's size: only words that land are known.
+    const bool cb_words_land = FrontCbWordsLand(fs.regs, 1);
     using Effect = VideoCommon::GpuSplit::Effect;
     // What the entry may write on the back (FrontDmaRead): any method may issue a deferred
     // instanced draw first.
@@ -1927,7 +1937,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
     }
     if (write_end != 0) {
         constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
-        const bool upload = method >= cb_data && method < cb_data + 16;
+        const bool upload = method >= cb_data && method < cb_data + 16 && cb_words_land;
         split.RangeLastWrite(write_begin, write_end, upload ? &value : nullptr,
                              memory_manager.GetID() + 1);
         if (method == MAXWELL3D_REG_INDEX(report_semaphore.query)) {
@@ -2046,6 +2056,7 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
     // What CallMultiMethod does to the registers on the back, then one entry for all the words.
     constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
     const auto [write_begin, write_end] = FrontWriteRange(fs, method, amount);
+    const bool cb_words_land = FrontCbWordsLand(fs.regs, amount); // As in FrontWrite
     const auto tracked = [&fs] {
         return fs.control == Regs::ShadowRamControl::Track ||
                fs.control == Regs::ShadowRamControl::TrackWithFilter;
@@ -2128,7 +2139,7 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
     if (write_end != 0) {
         // Uploaded words, unless the shadow RAM replays other values for them on the back.
         const bool upload = method >= cb_data && method < cb_data + 16 &&
-                            fs.control != Regs::ShadowRamControl::Replay;
+                            fs.control != Regs::ShadowRamControl::Replay && cb_words_land;
         split.RangeLastWrite(write_begin, write_end, upload ? base_start : nullptr,
                              memory_manager.GetID() + 1);
         if (method == MAXWELL3D_REG_INDEX(report_semaphore.query) && amount == 1) {
