@@ -395,6 +395,8 @@ public:
     Id tensor_subgroup_id{};
     std::vector<Id> interfaces;
     std::vector<std::pair<u32, spv::Op>> opcode_rewrites;
+    /// Storage float32 atomic adds use OpAtomicFAddEXT (Profile::support_float32_atomic_add).
+    bool native_f32_atomic_add{};
 
     // Task and mesh programs. Their stage buffer: the task's output region is the task payload
     // (the mesh stage's input region); the mesh output regions live in workgroup memory until

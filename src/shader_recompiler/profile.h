@@ -48,6 +48,9 @@ struct Profile {
     bool support_demote_to_helper_invocation{};
     bool support_int64_atomics{};
     bool support_shared_int64_atomics{};
+    /// Storage buffer float32 atomic add in hardware (VK_EXT_shader_atomic_float), not a
+    /// compare-exchange loop.
+    bool support_float32_atomic_add{};
     bool support_derivative_control{};
     bool support_geometry_shader_passthrough{};
     bool support_native_ndc{};

@@ -74,6 +74,7 @@ VK_DEFINE_HANDLE(VmaPool)
             primitive_topology_list_restart)                                                       \
     FEATURE(EXT, ProvokingVertex, PROVOKING_VERTEX, provoking_vertex)                              \
     FEATURE(EXT, Robustness2, ROBUSTNESS_2, robustness2)                                           \
+    FEATURE(EXT, ShaderAtomicFloat, SHADER_ATOMIC_FLOAT, shader_atomic_float)                      \
     FEATURE(EXT, ShaderFloat8, SHADER_FLOAT8, shader_float8)                                       \
     FEATURE(EXT, TransformFeedback, TRANSFORM_FEEDBACK, transform_feedback)                        \
     FEATURE(EXT, VertexInputDynamicState, VERTEX_INPUT_DYNAMIC_STATE, vertex_input_dynamic_state)  \
@@ -1051,6 +1052,12 @@ FN_MAX_LIMIT_LIST
     bool IsSharedInt64AtomicsSupported() const {
         return extensions.shader_atomic_int64 &&
                features.shader_atomic_int64.shaderSharedInt64Atomics;
+    }
+
+    /// Returns true if storage buffer float32 atomic add runs in hardware (VK_EXT_shader_atomic_float).
+    bool IsFloat32AtomicAddSupported() const {
+        return extensions.shader_atomic_float &&
+               features.shader_atomic_float.shaderBufferFloat32AtomicAdd;
     }
 
     bool IsExtConditionalRendering() const {
