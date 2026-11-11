@@ -265,6 +265,8 @@ private:
 
     void UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs);
 
+    /// Clears a 3D color target whose slices the framebuffer can't reach. Returns true when handled.
+    bool ClearVolumeSlices(const Framebuffer* framebuffer, u32 first_slice, u32 slice_count);
     void FrameDumpPass(const Framebuffer* framebuffer);
     bool OcarinaTemporalEnabled() const;
     /// At OoT's disk cache load (before any of its pipelines and images): DLSS and FSR take only images at
