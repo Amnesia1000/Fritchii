@@ -212,6 +212,16 @@ inline std::atomic<int> g_storage_sync_scan{-1};
 /// 1 = on, 2 = every hit synchronizes anyway after checking that no word of the range holds a
 /// CPU-modified or unprotected page ("Nx2 storage sync memo verify" every 10 s, must stay 0).
 inline std::atomic<int> g_storage_sync_memo{-1};
+/// EDEN_NX2_FRONT_HANDLES (live, default 0; fable_answer_pair 4.1 item 4): the split's front reads
+/// the texture handle words a draw's shaders take from their constant buffers, as the back will
+/// find them at that draw, and sends them with the draw.end (or loop-ending draw.begin) entry; the
+/// back's Vulkan GraphicsPipeline::ConfigureImpl takes them instead of reading guest memory
+/// (video_core/nx2_front_handles.h has the exactness rules). Words the front can't vouch for, and
+/// any word whose address differs from the back's own, are read by the back as before. 1 = on,
+/// 2 = verify: the back reads every shipped word itself, keeps its own and counts and logs the
+/// differences ("Front handles mismatch", must stay 0). Counters ride on the "GPU split batched
+/// writes per second" line (front_handles.*).
+inline std::atomic<int> g_front_handles{-1};
 
 /// Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP63, live through the debug server:
 /// slots for batches of fixes built together and A/B-tested in one session
@@ -656,6 +666,9 @@ inline void LoadExperiments() {
     }
     if (name == "EDEN_NX2_STORAGE_SYNC_MEMO") {
         return &g_storage_sync_memo;
+    }
+    if (name == "EDEN_NX2_FRONT_HANDLES") {
+        return &g_front_handles;
     }
     return nullptr;
 }
