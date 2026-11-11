@@ -204,6 +204,27 @@ public:
         return walked;
     }
 
+    /// EDEN_NX2_STORAGE_SYNC_SCAN: ForEachUploadRange over only each manager's part of the range
+    /// from its first to its last word with a CPU or Untracked page, found by reading the words
+    /// (WordManager::ScannedDirtyWindow; clean_words is not used). The words left out have
+    /// nothing the full walk would upload or re-protect. Missing managers are created, as the
+    /// full walk creates them (every page CPU-modified, so walked whole). Returns false when
+    /// nothing was walked.
+    template <typename Func>
+    bool ForEachScannedUploadRange(VAddr query_cpu_range, u64 query_size, Func&& func) {
+        bool walked = false;
+        IteratePages<true>(query_cpu_range, query_size, [&func, &walked](Manager* manager, u64 offset, size_t size) {
+            const auto [begin, end] = manager->ScannedDirtyWindow(offset, size);
+            if (begin >= end) {
+                return;
+            }
+            walked = true;
+            manager->ForEachModifiedRange(Type::CPU, true, manager->cpu_addr + begin,
+                                          static_cast<s64>(end - begin), func);
+        });
+        return walked;
+    }
+
     struct DirtyWalkCheck {
         u64 cpu_pages = 0;       ///< CPU pages the full walk uploads and the dirty-word walk would not
         u64 untracked_pages = 0; ///< Untracked pages it re-tracks and the dirty-word walk would not
@@ -232,6 +253,24 @@ public:
         });
         return check;
     }
+    /// EDEN_NX2_STORAGE_SYNC_SCAN=2: what ForEachScannedUploadRange would leave out of the range
+    /// that ForEachUploadRange finds or changes (counted over every word). Changes nothing; call
+    /// it before the full walk. A missing manager is created whole by both walks: no difference.
+    [[nodiscard]] DirtyWalkCheck CheckScannedWalk(VAddr query_cpu_range, u64 query_size) {
+        DirtyWalkCheck check;
+        if (query_size == 0) {
+            return check;
+        }
+        IteratePages<false>(query_cpu_range, query_size, [&check](Manager* manager, u64 offset, size_t size) {
+            const auto [begin, end] = manager->ScannedDirtyWindow(offset, size);
+            check.walks |= begin < end;
+            const auto [cpu_pages, untracked_pages] = manager->ScannedWalkMisses(offset, size);
+            check.cpu_pages += cpu_pages;
+            check.untracked_pages += untracked_pages;
+        });
+        return check;
+    }
+
     /// Verify mode: true when the clean words of the managers over a range match a recount.
     [[nodiscard]] bool CleanWordsHold(VAddr query_cpu_addr, u64 query_size) const noexcept {
         const size_t first = query_cpu_addr >> HIGHER_PAGE_BITS;

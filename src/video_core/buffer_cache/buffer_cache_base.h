@@ -836,6 +836,10 @@ private:
     /// have left out. Returns whether the dirty-word walk would have walked anything.
     bool VerifyComputeDirtyWalk(DAddr device_addr, u32 size);
 
+    /// EDEN_NX2_STORAGE_SYNC_SCAN=2: before the full walk, counts and logs (every 10 s) the CPU
+    /// and unprotected pages the scanned walk would have left out.
+    void VerifyStorageSyncScan(DAddr device_addr, u32 size);
+
     void UploadMemory(Buffer& buffer, u64 total_size_bytes, u64 largest_copy,
                       std::span<BufferCopy> copies);
 
@@ -1149,6 +1153,12 @@ private:
         u32 logged = 0;
         std::chrono::steady_clock::time_point last_report{};
     } dirty_walk_verify;
+    /// EDEN_NX2_STORAGE_SYNC_SCAN while a storage bind runs (BindHostGraphicsStorageBuffers, and
+    /// BindHostComputeStorageBuffers without EXP59), 0 otherwise: 1 = SynchronizeBuffer walks the
+    /// scanned windows only, 2 = it walks all after counting what the scan would leave out.
+    int storage_sync_scan = 0;
+    /// EDEN_NX2_STORAGE_SYNC_SCAN=2 totals (VerifyStorageSyncScan).
+    DirtyWalkVerify storage_scan_verify;
     u64 frame_tick = 0;
 
     /// EDEN_NX2_EXP18 (zortos293/Lichii#641): resolved bindings are kept while the GPU mappings

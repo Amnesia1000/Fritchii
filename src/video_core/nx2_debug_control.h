@@ -192,6 +192,16 @@ inline std::atomic<int> g_bank_skip_verify{-1};
 /// ConfigureImpl; not with EXP32. 1 = on, 2 = on and every 16th hit resolves the full way and
 /// compares ("Texture bank memo mismatch", must stay 0). Logged every 10 s ("Texture bank memo").
 inline std::atomic<int> g_tex_bank_gen{-1};
+/// EDEN_NX2_STORAGE_SYNC_SCAN (live, default 0): storage buffer synchronizes (graphics, and
+/// compute while EXP59 is off) walk the memory tracker only from the first to the last word of
+/// each 4 MiB manager that holds a CPU-modified or unprotected page, found by reading the words
+/// (MemoryTrackerBase::ForEachScannedUploadRange). The words left out hold neither, so the full
+/// walk would upload nothing there, re-protect nothing and store back what they hold: the same
+/// result without the stores. Not the CleanWords walk (that one trusts clean_words). The sample
+/// capture of 10 Nov had 72% of the graphics storage binds in that walk over clean words.
+/// 1 = on, 2 = the full walk as before, after counting the CPU and unprotected pages the scan
+/// would have left out ("Nx2 storage sync scan verify" every 10 s, must stay 0).
+inline std::atomic<int> g_storage_sync_scan{-1};
 
 /// Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP63, live through the debug server:
 /// slots for batches of fixes built together and A/B-tested in one session
@@ -630,6 +640,9 @@ inline void LoadExperiments() {
     }
     if (name == "EDEN_NX2_TEX_BANK_GEN") {
         return &g_tex_bank_gen;
+    }
+    if (name == "EDEN_NX2_STORAGE_SYNC_SCAN") {
+        return &g_storage_sync_scan;
     }
     return nullptr;
 }

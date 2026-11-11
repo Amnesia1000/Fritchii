@@ -551,6 +551,62 @@ struct WordManager {
         return {cpu_pages, untracked_pages};
     }
 
+    /// EDEN_NX2_STORAGE_SYNC_SCAN: the part of [offset, offset + size) from its first to its last
+    /// word holding a CPU or Untracked page, read from those words themselves (not clean_words,
+    /// which the CleanWords walk trusts). A CPU clear (ForEachModifiedRange) over a word with
+    /// neither uploads nothing, re-protects nothing and stores back what every word holds, so
+    /// the walk over this window does what the walk over the whole range does. Empty when no word
+    /// has either. Read only: two loads a word, against the clear's stores and NoteCleanWord.
+    [[nodiscard]] std::pair<u64, u64> ScannedDirtyWindow(u64 offset, u64 size) const noexcept {
+        const std::span<const u64> cpu_words = Span(Type::CPU);
+        const std::span<const u64> untracked_words = Span(Type::Untracked);
+        size_t first = num_words;
+        size_t last = 0;
+        IterateWords(offset, size, [&](size_t index, u64 mask) {
+            if (((cpu_words[index] | untracked_words[index]) & mask) != 0) {
+                first = (std::min)(first, index);
+                last = index;
+            }
+        });
+        if (first == num_words) {
+            return {offset + size, offset + size};
+        }
+        const u64 begin = (std::max<u64>)(offset, first * BYTES_PER_WORD);
+        const u64 end = (std::min<u64>)(offset + size, (last + 1) * BYTES_PER_WORD);
+        return {begin, end};
+    }
+
+    /// EDEN_NX2_STORAGE_SYNC_SCAN=2: the CPU and Untracked pages of [offset, offset + size)
+    /// outside ScannedDirtyWindow, counted word by word over the whole range. Both must stay 0.
+    [[nodiscard]] std::pair<u64, u64> ScannedWalkMisses(u64 offset, u64 size) const noexcept {
+        const std::span<const u64> cpu_words = Span(Type::CPU);
+        const std::span<const u64> untracked_words = Span(Type::Untracked);
+        const auto [begin, end] = ScannedDirtyWindow(offset, size);
+        u64 cpu_pages = 0;
+        u64 untracked_pages = 0;
+        const auto count = [&](u64 from, u64 to) {
+            if (from >= to) {
+                return;
+            }
+            IterateWords(from, to - from, [&](size_t index, u64 mask) {
+                // A word the window ends inside belongs to it: count only the pages outside.
+                u64 outside = mask;
+                if (begin < end) {
+                    const u64 word_begin = index * BYTES_PER_WORD;
+                    const u64 word_end = word_begin + BYTES_PER_WORD;
+                    if (word_begin < end && word_end > begin) {
+                        outside = 0;
+                    }
+                }
+                cpu_pages += std::popcount(cpu_words[index] & outside);
+                untracked_pages += std::popcount(untracked_words[index] & outside);
+            });
+        };
+        count(offset, begin);
+        count(end, offset + size);
+        return {cpu_pages, untracked_pages};
+    }
+
     /// Recounts the clean words: true when clean_words matches the CPU and Untracked words.
     [[nodiscard]] bool CleanWordsHold() const noexcept {
         const std::span<const u64> cpu_words = Span(Type::CPU);

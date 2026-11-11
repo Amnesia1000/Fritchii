@@ -2832,6 +2832,13 @@ void BufferCache<P>::BindHostGraphicsStorageBuffers(size_t stage) {
     // EDEN_NX2_GPU_PROFILE=2: what each binding costs (zones "storage synchronize" and "storage
     // written marks" under "stage storage buffers", and the storage fine counters).
     const bool fine = Nx2Profile::Fine();
+    // EDEN_NX2_STORAGE_SYNC_SCAN: the synchronizes below walk only the tracker words that hold
+    // something to upload or re-protect.
+    storage_sync_scan = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_storage_sync_scan,
+                                                         "EDEN_NX2_STORAGE_SYNC_SCAN");
+    SCOPE_EXIT {
+        storage_sync_scan = 0;
+    };
     ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 index) {
         const Binding& binding = channel_state->storage_buffers[stage][index];
         const bool is_written = ((channel_state->written_storage_buffers[stage] >> index) & 1) != 0;
@@ -2997,9 +3004,16 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
     // EDEN_NX2_EXP59 & 4: the dirty-word walk for these synchronizes only; & 8 verifies it.
     // Bits 1 and 2 belong to the read extents.
     compute_dirty_walk = VideoCore::Nx2Debug::Experiment(59) & (4 | 8);
+    // EDEN_NX2_STORAGE_SYNC_SCAN, while EXP59 does not pick the walk.
+    storage_sync_scan =
+        compute_dirty_walk != 0
+            ? 0
+            : VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_storage_sync_scan,
+                                               "EDEN_NX2_STORAGE_SYNC_SCAN");
     SCOPE_EXIT {
         count_compute_sync = false;
         compute_dirty_walk = 0;
+        storage_sync_scan = 0;
     };
     ForEachEnabledBit(channel_state->enabled_compute_storage_buffers, [&](u32 index) {
         const Binding& binding = channel_state->compute_storage_buffers[index];
@@ -4161,6 +4175,11 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
             Nx2Profile::Add(Nx2Profile::Counter::ComputeSyncDirtySkips, walks ? 0 : 1);
         }
     }
+    // EDEN_NX2_STORAGE_SYNC_SCAN (storage binds only, storage_sync_scan): 1 walks the scanned
+    // windows; 2 keeps the full walk and counts what 1 would have left out.
+    if (storage_sync_scan == 2) [[unlikely]] {
+        VerifyStorageSyncScan(device_addr, size);
+    }
     const auto for_each_upload_range = [&](auto&& func) {
         if (compute_fast) {
             const bool walked = memory_tracker.ForEachDirtyUploadRange(device_addr, size, func);
@@ -4168,6 +4187,8 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
                 Nx2Profile::Add(Nx2Profile::Counter::ComputeSyncDirtyWalks, 1);
                 Nx2Profile::Add(Nx2Profile::Counter::ComputeSyncDirtySkips, walked ? 0 : 1);
             }
+        } else if (storage_sync_scan == 1) {
+            memory_tracker.ForEachScannedUploadRange(device_addr, size, func);
         } else if (skip_clean && !compute_verify) {
             memory_tracker.ForEachDirtyUploadRange(device_addr, size, func);
         } else {
@@ -4292,6 +4313,53 @@ bool BufferCache<P>::VerifyComputeDirtyWalk(DAddr device_addr, u32 size) {
         verify.last_report = now;
     }
     return check.walks;
+}
+
+template <class P>
+void BufferCache<P>::VerifyStorageSyncScan(DAddr device_addr, u32 size) {
+    // The full walk runs after this and is what gets used. A CPU page outside the scanned
+    // windows is an upload the scanned walk would have missed; an unprotected one a page it
+    // would have left untracked. Both must stay 0.
+    const auto check = memory_tracker.CheckScannedWalk(device_addr, size);
+    auto& verify = storage_scan_verify;
+    ++verify.checked;
+    ++verify.total_checked;
+    if (check.cpu_pages != 0 || check.untracked_pages != 0) [[unlikely]] {
+        ++verify.mismatches;
+        ++verify.total_mismatches;
+        verify.cpu_pages += check.cpu_pages;
+        verify.untracked_pages += check.untracked_pages;
+        if (verify.logged < 16) {
+            ++verify.logged;
+            LOG_ERROR(HW_GPU,
+                      "Nx2 storage sync scan verify: the scanned walk would differ at {:#x}+{:#x}: "
+                      "{} CPU pages it would not upload, {} unprotected pages it would not "
+                      "re-track",
+                      device_addr, size, check.cpu_pages, check.untracked_pages);
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (verify.last_report == std::chrono::steady_clock::time_point{}) {
+        verify.last_report = now;
+    } else if (now - verify.last_report >= std::chrono::seconds{10}) {
+        if (verify.mismatches != 0) {
+            LOG_ERROR(HW_GPU,
+                      "Nx2 storage sync scan verify, last 10 s: {} of {} storage synchronizes "
+                      "differ ({} CPU pages, {} unprotected pages); since start {} of {}",
+                      verify.mismatches, verify.checked, verify.cpu_pages, verify.untracked_pages,
+                      verify.total_mismatches, verify.total_checked);
+        } else {
+            LOG_INFO(HW_GPU,
+                     "Nx2 storage sync scan verify, last 10 s: 0 of {} storage synchronizes "
+                     "differ; since start {} of {}",
+                     verify.checked, verify.total_mismatches, verify.total_checked);
+        }
+        verify.checked = 0;
+        verify.mismatches = 0;
+        verify.cpu_pages = 0;
+        verify.untracked_pages = 0;
+        verify.last_report = now;
+    }
 }
 
 template <class P>
