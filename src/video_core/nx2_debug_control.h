@@ -605,6 +605,11 @@ inline void LoadExperiments() {
         // display stall every 10 s (EXP71): off, every stall froze emulation 65-82 ms; on, one
         // 50 ms hitch in a minute (21 frames dropped). No drops in a minute of normal play.
         g_experiments[70].store(2, std::memory_order_relaxed);
+        // EXP69 = 600 (2026-11-11): Preflushable marks reset every 600 frames. Night market
+        // toggle: buffer downloads 81 -> 53 MB/s, back fence 45.9 -> 38.1 ms/s, +0.6 fps. Owner
+        // playtest with EXP70 (market + Stalchild fight): constant 60 outside the boss wave
+        // (40-45 there), no flashes or glitches.
+        g_experiments[69].store(600, std::memory_order_relaxed);
         // EXP49 = 1 (2026-11-10, owner's call for v5.7): the async read-back. Stalchild fight,
         // flipped every 30 s while the owner fought: 51.9 -> 56.9 fps, the back's read flushes
         // 35 -> 6 ms/s, guest lock waits halved. No beams in that session or two later ones
