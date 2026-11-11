@@ -1956,8 +1956,12 @@ void Device::RemoveUnsuitableExtensions() {
                                            features.cooperative_matrix,
                                            VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
     }
-    VideoCommon::Nx2Perf::g_native_tensor_ops.store(extensions.cooperative_matrix,
-                                                    std::memory_order_relaxed);
+    // Picks the movie upscaler (Automatic: the game's own network where tensor operations are
+    // native). Not on Intel's 8x16x16 path: OoT's movie network (its 32-lane compute programs,
+    // f9ea14a22394f5b1 and others) drew a pink line and speckled columns over the title movie on
+    // an Arc B580, the bilinear copy does not. The gameplay HMMA programs keep the matrices.
+    VideoCommon::Nx2Perf::g_native_tensor_ops.store(
+        extensions.cooperative_matrix && !cooperative_hmma_8x16x16, std::memory_order_relaxed);
 
     // VK_KHR_workgroup_memory_explicit_layout
     extensions.workgroup_memory_explicit_layout =
