@@ -3099,21 +3099,30 @@ bool RasterizerVulkan::OcarinaTemporalEnabled() const {
     return *oot_backend != VideoCommon::OcarinaUpscaleBackend::Native;
 }
 
-void RasterizerVulkan::ApplyOcarinaResolution() {
+void RasterizerVulkan::ApplyOcarinaResolution(u64 title_id) {
+    if (oot_resolution_checked || title_id != 0x0400486024DEC000ULL) {
+        return;
+    }
     oot_resolution_checked = true;
     auto& resolution = Settings::values.resolution_info;
     // DLSS and FSR take the scene at the game's own size and refuse rescaled images, so with a
     // resolution scale other than 1x the game's own upscale ran instead (2026-11-11: "DLSS only
     // works at 1x"). They pick their own render size (the DLSS quality), so the scale goes to 1x
-    // for this session; the texture cache reads this same info, and no image exists yet.
-    if (!resolution.active || !OcarinaTemporalEnabled()) {
+    // for this session; the texture cache reads this same info, and no image exists yet. Done at
+    // the disk cache load, before the prepared pipelines: built at 2x they all missed the driver
+    // cache (82k pipelines, 4.5 minutes at boot) and were thrown away at the switch to 1x.
+    if (!resolution.active) {
+        return;
+    }
+    const auto backend = ResolveOcarinaUpscaler(device);
+    if (backend == VideoCommon::OcarinaUpscaleBackend::Native) {
         return;
     }
     LOG_INFO(Render_Vulkan,
              "Ocarina temporal: resolution scale {}x set to 1x for this session ({} does the "
              "upscaling)",
              resolution.up_factor,
-             *oot_backend == VideoCommon::OcarinaUpscaleBackend::Dlss ? "DLSS" : "FSR 3.1");
+             backend == VideoCommon::OcarinaUpscaleBackend::Dlss ? "DLSS" : "FSR 3.1");
     Settings::TranslateResolutionInfo(Settings::ResolutionSetup::Res1X, resolution);
 }
 
@@ -3866,6 +3875,7 @@ std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
 
 void RasterizerVulkan::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                                          const VideoCore::DiskResourceLoadCallback& callback) {
+    ApplyOcarinaResolution(title_id);
     pipeline_cache.LoadDiskResources(title_id, stop_loading, callback);
 }
 
@@ -4910,8 +4920,8 @@ void RasterizerVulkan::InitializeChannel(Tegra::Control::ChannelState& channel) 
 void RasterizerVulkan::BindChannel(Tegra::Control::ChannelState& channel) {
     const s32 channel_id = channel.bind_id;
     BindToChannel(channel_id);
-    if (!oot_resolution_checked && program_id == 0x0400486024DEC000ULL) [[unlikely]] { // OoT
-        ApplyOcarinaResolution();
+    if (!oot_resolution_checked) [[unlikely]] {
+        ApplyOcarinaResolution(program_id); // no disk cache load (it does this first)
     }
     {
         std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
