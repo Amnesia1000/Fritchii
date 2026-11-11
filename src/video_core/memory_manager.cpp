@@ -332,12 +332,20 @@ std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr gpu_addr) const {
     const bool use_cache = cache_allowed && VideoCore::Nx2Debug::Experiment(63) != 0;
     constexpr u64 SubpageBits = 12;
     constexpr u64 SubpageMask = (u64{1} << SubpageBits) - 1;
-    const u64 owner_id = (u64{unique_identifier} << 1) | 1; // Never 0, the empty slot
+    // Off (the default): straight to the page table, without the cache's thread-local lookup,
+    // hash and serial load on every translation (Fable, 2026-11-11: up to ~10 ms/s of the back
+    // thread in read handles, update buffers and binds since 5.8).
     const u64 page = gpu_addr >> SubpageBits;
-    const u64 serial = map_serial.load(std::memory_order_acquire);
-    CachedPage& slot = cache[(page ^ (page >> 11)) % CacheSize];
-    if (use_cache && slot.owner == owner_id && slot.page == page && slot.serial == serial) [[likely]] {
-        return slot.device_page + (gpu_addr & SubpageMask);
+    CachedPage* slot = nullptr;
+    u64 owner_id = 0;
+    u64 serial = 0;
+    if (use_cache) [[unlikely]] {
+        owner_id = (u64{unique_identifier} << 1) | 1; // Never 0, the empty slot
+        serial = map_serial.load(std::memory_order_acquire);
+        slot = &cache[(page ^ (page >> 11)) % CacheSize];
+        if (slot->owner == owner_id && slot->page == page && slot->serial == serial) [[likely]] {
+            return slot->device_page + (gpu_addr & SubpageMask);
+        }
     }
     DAddr dev_addr;
     if (GetEntry(gpu_addr, true) != EntryType::Mapped) [[unlikely]] {
@@ -354,8 +362,8 @@ std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr gpu_addr) const {
                   dev_addr);
         return std::nullopt;
     }
-    if (use_cache) {
-        slot = CachedPage{owner_id, serial, page, dev_addr - (gpu_addr & SubpageMask)};
+    if (slot != nullptr) {
+        *slot = CachedPage{owner_id, serial, page, dev_addr - (gpu_addr & SubpageMask)};
     }
     return dev_addr;
 }
