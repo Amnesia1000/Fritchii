@@ -262,6 +262,9 @@ private:
 
     void FrameDumpPass(const Framebuffer* framebuffer);
     bool OcarinaTemporalEnabled() const;
+    /// At OoT's first channel bind (before any of its images): DLSS and FSR take only images at
+    /// the game's own size, so with either one upscaling the resolution scale goes to 1x.
+    void ApplyOcarinaResolution();
     void TrackOcarinaCamera();
     /// Offsets the viewport of Ocarina's scene draws (depth-tested, into the scene depth) by a
     /// sub-pixel amount that changes every frame while FSR replaces the game's upscale, so FSR
@@ -316,6 +319,7 @@ private:
     u32 draw_counter = 0;
     std::optional<u64> oot_camera_sample_frame;
     mutable std::optional<VideoCommon::OcarinaUpscaleBackend> oot_backend;
+    bool oot_resolution_checked{};
     struct OcarinaMotionTrace {
         const Tegra::MemoryManager* camera_channel{};
         const Tegra::MemoryManager* depth_channel{};

@@ -3099,6 +3099,24 @@ bool RasterizerVulkan::OcarinaTemporalEnabled() const {
     return *oot_backend != VideoCommon::OcarinaUpscaleBackend::Native;
 }
 
+void RasterizerVulkan::ApplyOcarinaResolution() {
+    oot_resolution_checked = true;
+    auto& resolution = Settings::values.resolution_info;
+    // DLSS and FSR take the scene at the game's own size and refuse rescaled images, so with a
+    // resolution scale other than 1x the game's own upscale ran instead (2026-11-11: "DLSS only
+    // works at 1x"). They pick their own render size (the DLSS quality), so the scale goes to 1x
+    // for this session; the texture cache reads this same info, and no image exists yet.
+    if (!resolution.active || !OcarinaTemporalEnabled()) {
+        return;
+    }
+    LOG_INFO(Render_Vulkan,
+             "Ocarina temporal: resolution scale {}x set to 1x for this session ({} does the "
+             "upscaling)",
+             resolution.up_factor,
+             *oot_backend == VideoCommon::OcarinaUpscaleBackend::Dlss ? "DLSS" : "FSR 3.1");
+    Settings::TranslateResolutionInfo(Settings::ResolutionSetup::Res1X, resolution);
+}
+
 /// Capture the two camera matrices from a draw targeting the scene color and depth. Terrain and
 /// materials draw with several vertex shaders, so any draw into a scene-sized target qualifies;
 /// the camera buffer's contents are checked below.
@@ -4892,6 +4910,9 @@ void RasterizerVulkan::InitializeChannel(Tegra::Control::ChannelState& channel) 
 void RasterizerVulkan::BindChannel(Tegra::Control::ChannelState& channel) {
     const s32 channel_id = channel.bind_id;
     BindToChannel(channel_id);
+    if (!oot_resolution_checked && program_id == 0x0400486024DEC000ULL) [[unlikely]] { // OoT
+        ApplyOcarinaResolution();
+    }
     {
         std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
         texture_cache.BindToChannel(channel_id);
