@@ -144,6 +144,14 @@ inline std::atomic<int> g_oot_macros{-1};
 /// the back checks each packet's registers against the values the front wrote ("Draw packet
 /// verify").
 inline std::atomic<int> g_draw_packet{-1};
+/// EDEN_NX2_BANK_SLOT_STATS (live, default 0; Hookshot (NotRexed/Hookshot) research idea 1, step
+/// 1): with the tracked native bank check (EXP9 != 0), counts per constant buffer index (c0, c1,
+/// c2, ... as the shader numbers them; NVN2: c0 driver storage table, c1 program constants, c2
+/// texture handles, c3+ the game's uniform buffers) the bank binds, the pages they cover and
+/// the pages compared and found changed for each reason, logged every 5 s next to the "Native
+/// bank check" line ("Native bank slots"). Counting only (BufferCache::
+/// CheckNativeBankPagesTracked). 1 = on.
+inline std::atomic<int> g_bank_slot_stats{-1};
 
 /// Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP63, live through the debug server:
 /// slots for batches of fixes built together and A/B-tested in one session
@@ -567,6 +575,9 @@ inline void LoadExperiments() {
     }
     if (name == "EDEN_NX2_DRAW_PACKET") {
         return &g_draw_packet;
+    }
+    if (name == "EDEN_NX2_BANK_SLOT_STATS") {
+        return &g_bank_slot_stats;
     }
     return nullptr;
 }

@@ -2076,7 +2076,8 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         // Held: nothing compared, nothing taken.
     } else if (const int tracked_mode = native_bank ? VideoCore::Nx2Debug::Experiment(9) : 0;
         tracked_mode != 0) {
-        CheckNativeBankPagesTracked(device_addr, size, tracked_mode, bank_trims, buffer);
+        CheckNativeBankPagesTracked(device_addr, size, tracked_mode, bank_trims, buffer, stage,
+                                    index);
     } else if (native_bank) {
         // The bank size is only an upper limit: stop at the end of the mapped memory.
         u64 mapped_size = 0;
@@ -2399,7 +2400,8 @@ bool BufferCache<P>::BindMultiRangeStorage(const Binding& binding, bool is_writt
 
 template <class P>
 void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, int mode,
-                                                 int trims, Buffer& buffer) {
+                                                 int trims, Buffer& buffer, size_t stage,
+                                                 u32 index) {
     // EDEN_NX2_EXP9 (experiment, 0 = off): compare only the pages whose guest memory may have
     // changed since their last compare. 1: pages guest CPU writes were collected for (applied
     // only at the next InvalidateGPUCache, while the tracker holds the page clean), pages the
@@ -2424,6 +2426,19 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
     const bool any_cpu_dirty = memory_tracker.IsRegionCpuModified(first_page, end - first_page);
     auto& stats = native_bank_tracked_stats;
     ++stats.binds;
+    // EDEN_NX2_BANK_SLOT_STATS (Hookshot research idea 1, step 1): the same counts per constant
+    // buffer index, to see which of NVN2's banks (c0 driver, c1 program, c2 handles, c3+ the
+    // game's) the 64 KiB binds are and which of them ever change outside our own writes.
+    NativeBankSlotStats* const slot_stats =
+        VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_bank_slot_stats,
+                                         "EDEN_NX2_BANK_SLOT_STATS") != 0 &&
+                index < native_bank_slot_stats.size()
+            ? &native_bank_slot_stats[index]
+            : nullptr;
+    if (slot_stats != nullptr) [[unlikely]] {
+        ++slot_stats->binds;
+        slot_stats->stages |= 1u << stage;
+    }
     // EDEN_NX2_RUNAHEAD: as in the untracked check (BindHostGraphicsUniformBuffer).
     Buffer* const upload_to =
         (trims & 4) != 0 || VideoCommon::Runahead::g_frontier.load(std::memory_order_relaxed) != 0
@@ -2435,6 +2450,9 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
         if (guest == nullptr) {
             continue;
         }
+        if (slot_stats != nullptr) [[unlikely]] {
+            ++slot_stats->pages;
+        }
         // Take the flags before reading the page: a write flagged later is compared next bind.
         const bool collected = Core::g_collected_write_pages.Take(page);
         const bool written = Core::g_buffer_write_pages.Take(page);
@@ -2442,6 +2460,9 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
         NativeBankPage& snapshot = it->second;
         if (inserted) {
             ++stats.pages_new;
+            if (slot_stats != nullptr) [[unlikely]] {
+                ++slot_stats->pages_new;
+            }
             std::memcpy(snapshot.words.data(), guest, Core::DEVICE_PAGESIZE);
             snapshot.checked_frame = frame_tick;
             snapshot.recheck = collected || written;
@@ -2475,6 +2496,9 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
             continue;
         }
         ++stats.compared[reason];
+        if (slot_stats != nullptr) [[unlikely]] {
+            ++slot_stats->compared[reason];
+        }
         // EDEN_NX2_EXP26 & 2: an inline SSE2 compare instead of the ucrt memcmp.
         if ((trims & 2) != 0
                 ? VideoCommon::Nx2BytesEqual(snapshot.words.data(), guest, Core::DEVICE_PAGESIZE)
@@ -2482,6 +2506,9 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
             continue;
         }
         ++stats.changed[reason];
+        if (slot_stats != nullptr) [[unlikely]] {
+            ++slot_stats->changed[reason];
+        }
         snapshot.changed_frame = frame_tick;
         std::memcpy(snapshot.words.data(), guest, Core::DEVICE_PAGESIZE);
         NoteNativeBankPageChanged(page, snapshot.words.data(), upload_to, uploads);
@@ -2513,6 +2540,30 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
              changed[BankFrame], compared[BankNone],
              changed[BankNone], verify ? changed[BankNone] : 0,
              verify ? changed[BankNone] + changed[BankFrame] : 0);
+    // EDEN_NX2_BANK_SLOT_STATS: the same window per constant buffer index. "hot" changes are the
+    // ones no flag saw; "written" ones are writes the buffer cache saw (our own constant buffer
+    // words, inline uploads, downloads); "collected" ones are guest CPU writes.
+    std::string slot_lines;
+    for (size_t slot = 0; slot < native_bank_slot_stats.size(); ++slot) {
+        const NativeBankSlotStats& s = native_bank_slot_stats[slot];
+        if (s.binds == 0) {
+            continue;
+        }
+        const auto& c = s.compared;
+        const auto& d = s.changed;
+        slot_lines += fmt::format(
+            " | c{} (stages {:#x}): {} binds, {} pages, {} new; compared / changed: collected {} "
+            "/ {}, written {} / {}, recheck {} / {}, CPU-modified {} / {}, hot {} / {}, frame {} "
+            "/ {}, verify only {} / {}",
+            slot, s.stages, s.binds, s.pages, s.pages_new, c[BankCollected], d[BankCollected],
+            c[BankWritten], d[BankWritten], c[BankRecheck], d[BankRecheck], c[BankCpuDirty],
+            d[BankCpuDirty], c[BankHot], d[BankHot], c[BankFrame], d[BankFrame], c[BankNone],
+            d[BankNone]);
+    }
+    if (!slot_lines.empty()) {
+        LOG_INFO(HW_GPU, "Native bank slots (EXP9={}, 5 s){}", mode, slot_lines);
+    }
+    native_bank_slot_stats = {};
     stats = {};
     stats.last_log = now;
 }

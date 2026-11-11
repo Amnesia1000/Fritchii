@@ -595,6 +595,18 @@ public:
         std::array<u64, BankReasons> changed{};
         std::chrono::steady_clock::time_point last_log{};
     } native_bank_tracked_stats;
+    /// EDEN_NX2_BANK_SLOT_STATS: the tracked check's counts per constant buffer index (c0..c17),
+    /// logged and cleared with native_bank_tracked_stats.
+    struct NativeBankSlotStats {
+        u64 binds = 0;
+        u64 pages = 0;     ///< pages the binds covered (mapped)
+        u64 pages_new = 0; ///< pages first seen (no snapshot yet)
+        u32 stages = 0;    ///< stages seen binding the index (bit per stage)
+        std::array<u64, BankReasons> compared{};
+        std::array<u64, BankReasons> changed{};
+    };
+    std::array<NativeBankSlotStats, Tegra::Engines::Maxwell3D::Regs::MaxConstBuffers>
+        native_bank_slot_stats{};
     /// EDEN_NX2_EXP26 & 4: changed bank pages of one bind, copied to the host buffer from their
     /// snapshots (FlushNativeBankUploads) instead of being marked CPU-modified. A 64 KiB bank
     /// spans at most 17 pages.
@@ -657,8 +669,10 @@ private:
     /// EDEN_NX2_EXP9: the native uniform bank check of a bind of [device_addr, device_addr + size).
     /// EDEN_NX2_EXP26 (bits, see Experiment in nx2_debug_control.h): `trims`; with & 4 changed
     /// pages that lie whole in `buffer` are uploaded from their snapshots.
+    /// `stage` and `index`: the binding's shader stage and constant buffer index
+    /// (EDEN_NX2_BANK_SLOT_STATS).
     void CheckNativeBankPagesTracked(DAddr device_addr, u32 size, int mode, int trims,
-                                     Buffer& buffer);
+                                     Buffer& buffer, size_t stage, u32 index);
 
     /// A native bank page whose snapshot was just (re)taken: marked CPU-modified, or with
     /// EXP26 & 4 (`upload_to` not null) queued in `uploads` when it lies whole in that buffer and
