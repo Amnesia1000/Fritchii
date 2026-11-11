@@ -3652,7 +3652,11 @@ bool RasterizerVulkan::AccelerateSurfaceCopy(const Tegra::Engines::Fermi2D::Surf
 }
 
 bool RasterizerVulkan::UsesNvidiaDlss() const {
-    return texture_cache_runtime.UsesNvidiaDlss();
+    // OoT runs NVIDIA DLSS through its own temporal path, not the texture cache's: count it too,
+    // or "Use the game's own DLSS" took over the game's upscale and NVIDIA DLSS never ran
+    // (2026-11-11, a player with both ticked: DLSS on, Streamline up, no DLSS all session).
+    return texture_cache_runtime.UsesNvidiaDlss() ||
+           (OcarinaTemporalEnabled() && oot_backend == VideoCommon::OcarinaUpscaleBackend::Dlss);
 }
 
 bool RasterizerVulkan::SupportsGameDlssNetwork() const {
