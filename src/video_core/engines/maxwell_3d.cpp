@@ -3111,6 +3111,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             static u64 misses{};
             static u64 differences{};
             static u64 report_reads{};
+            static u64 miss_report_flushes{};
             static std::array<u64, 4> miss_reasons{};
             // EXP10: compute and copies sent since count only where their writes may reach the
             // pages read: the ranges the fronts noted (GpuSplit::WritersMayWriteSince), the
@@ -3222,7 +3223,15 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                             },
                             VideoCommon::DrainSite::MacroDmaFlush);
                     }
-                    flush_queries(source, read_bytes);
+                    // EDEN_NX2_EXP73 (live, 0 = off; fable52_answer_bosswave_2 3b): only when
+                    // reports are listed over the bytes read (the hit path's own test, 12 bytes
+                    // back): otherwise FlushPending finds nothing and split.Run is an empty round
+                    // trip to the back, ~2,850 a second in the Stalchild fight.
+                    if (VideoCore::Nx2Debug::Experiment(73) == 0 ||
+                        rasterizer->HasCachedReports(*device - 12, u64{read_bytes} + 12)) {
+                        ++miss_report_flushes;
+                        flush_queries(source, read_bytes);
+                    }
                     if (fs.dma_snapshots.size() > 8192) {
                         fs.dma_snapshots.clear();
                     }
@@ -3239,9 +3248,11 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                     LOG_INFO(HW_GPU,
                              "DMA snapshot: {} reads skipped the drain, {} drained, {} differed, "
                              "{} reads of listed reports (drained path); misses: {} new page, {} "
-                             "compute/copy, {} unranged, {} noted write",
+                             "compute/copy, {} unranged, {} noted write; {} misses flushed reports "
+                             "(EXP73={})",
                              hits, misses, differences, report_reads, miss_reasons[0],
-                             miss_reasons[1], miss_reasons[2], miss_reasons[3]);
+                             miss_reasons[1], miss_reasons[2], miss_reasons[3], miss_report_flushes,
+                             VideoCore::Nx2Debug::Experiment(73));
                     if (ranged_writers) {
                         using Unbounded = VideoCommon::GpuSplit::DispatchUnbounded;
                         const auto& sent = split.UnboundedWriters();
