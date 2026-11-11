@@ -2999,6 +2999,11 @@ u64 TextureCacheRuntime::ImagePoolKeyHash(const ImagePoolKey& key) noexcept {
 }
 
 u64 TextureCacheRuntime::ImagePoolCap() {
+    // EXP66 (live, MiB, 0 = the built-in cap): the owner sees device memory jump ~0.8 GB while an
+    // NPC passes, ~500 MiB of it this pool at its cap (fable_answer_npcdips).
+    if (const int mib = VideoCore::Nx2Debug::Experiment(66); mib > 0) {
+        return u64{static_cast<u32>(mib)} << 20;
+    }
     return VideoCore::Nx2Debug::Experiment(42) >= 2 ? ImagePoolMaxBytesDedicated : ImagePoolMaxBytes;
 }
 
@@ -3105,6 +3110,8 @@ void TextureCacheRuntime::TickFrame() {
         const int pool_switch = VideoCore::Nx2Debug::Experiment(42);
         if (pool_switch == 0 || short_of_memory) {
             TrimImagePool(0);
+        } else {
+            TrimImagePool(ImagePoolCap()); // a lowered EXP66 applies at once
         }
         while (!image_pool.empty() &&
                image_pool_frame - image_pool.front().frame > ImagePoolMaxFrames) {

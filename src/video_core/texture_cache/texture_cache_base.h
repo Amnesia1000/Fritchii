@@ -692,6 +692,9 @@ private:
     u64 slot_kept_guard{};
     u64 slot_kept_busy{};
     u64 slot_kept_kind{};
+    std::array<u64, 32> slot_kept_flag{}; ///< Of slot_kept_kind, by ImageFlagBits bit
+    u64 slot_kept_not_gpu{};
+    u64 slot_kept_aliased{};
     u64 slot_kept_same_frame{};
     u64 slot_clears{};
     /// EXP64 check: images made again (not by a clear) at a retired image's address and shape

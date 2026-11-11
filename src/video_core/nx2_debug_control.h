@@ -443,6 +443,8 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// collector's device memory figure, as deleted images waiting for the GPU are. Logs "Image pool
 /// (EXP42) last 600 frames" and counts pooled creates in "Slow clear texture cache". 1 is the default
 /// (LoadExperiments); 0 = off.
+/// EXP66 (live; MiB, 0 = built in): the EXP42 pool's cap (512 MiB; 1,536 with EXP42=2), trimmed
+/// at once when lowered. NPC passes held it at its cap (~0.5 of the owner's +0.8 GB).
 /// EXP65 (live; 0 = off; vk_texture_cache.h): EXP42 pool entries whose exact create info was never
 /// taken back age out after this many frames (proven shapes keep the 180). Per-NPC targets sized by
 /// screen bounds filled the pool to 512 MiB with dims that never repeat.

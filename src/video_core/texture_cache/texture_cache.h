@@ -825,6 +825,16 @@ void TextureCache<P>::TickFrame() {
                  slot_kept_busy, slot_kept_kind, slot_kept_same_frame, slot_remade);
         slot_clears = slot_retired = slot_kept_guard = slot_kept_busy = slot_kept_kind =
             slot_kept_same_frame = slot_remade = 0;
+        std::string flags_text;
+        for (u32 bit = 0; bit < 32; ++bit) {
+            if (slot_kept_flag[bit] != 0) {
+                flags_text += fmt::format(" flag bit {}: {};", bit, slot_kept_flag[bit]);
+            }
+        }
+        LOG_INFO(HW_GPU, "Slot retire (EXP64) excluded kinds:{} not GPU-written or unregistered: {}; "
+                 "scaled or aliased: {}", flags_text, slot_kept_not_gpu, slot_kept_aliased);
+        slot_kept_flag.fill(0);
+        slot_kept_not_gpu = slot_kept_aliased = 0;
     }
     TickRenderClock();
     TickRelocationTombstones();
@@ -5326,10 +5336,25 @@ u32 TextureCache<P>::RetireSlotPredecessors(const ImageInfo& new_info, GPUVAddr 
             continue;
         }
         seen = true;
-        if (True(old.flags & excluded) || False(old.flags & ImageFlagBits::Registered) ||
-            False(old.flags & ImageFlagBits::GpuModified) || old.HasScaled() ||
-            !old.aliased_images.empty()) {
+        if (True(old.flags & excluded)) {
             ++slot_kept_kind;
+            const auto flag_bits = static_cast<u32>(old.flags & excluded);
+            for (u32 bit = 0; bit < 32; ++bit) {
+                if ((flag_bits >> bit) & 1) {
+                    ++slot_kept_flag[bit];
+                }
+            }
+            continue;
+        }
+        if (False(old.flags & ImageFlagBits::Registered) ||
+            False(old.flags & ImageFlagBits::GpuModified)) {
+            ++slot_kept_kind;
+            ++slot_kept_not_gpu;
+            continue;
+        }
+        if (old.HasScaled() || !old.aliased_images.empty()) {
+            ++slot_kept_kind;
+            ++slot_kept_aliased;
             continue;
         }
         if (old.last_write_frame == render_frame) {
