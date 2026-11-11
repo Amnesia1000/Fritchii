@@ -5,6 +5,7 @@
 
 #include <array>
 #include <atomic>
+#include <utility>
 #include <vector>
 
 #include "common/common_types.h"
@@ -47,6 +48,17 @@ class System;
 // EDEN_NX2_RUNAHEAD_MS (live, default 16): early answers only while the back is less than this
 // many ms behind the oldest early answer it has not reached; past it the acquire drains as before.
 // Needs the default (not delayed) fences, EXP33 = 0, and for mode 1 EXP35 = 2.
+//
+// Guest stores in flight (nx2_write_track.h): a store's dirty mark is collected before its bytes
+// land. A gather that copies bytes takes the in-flight writes' ranges again at the next gather
+// (their stores have landed by then), so no write is lost. Verify mode records them per chunk
+// and journals every tracked write, so a difference says whether the bytes were in flight at the
+// snapshot, rewritten after it (by which thread), or changed by no tracked CPU write.
+//
+// Predicted boundaries (EXP13 = 3 or 4, the QMD prediction's feed): an acquire the feed answers
+// with a queued plain release of a simple QMD (or a copy semaphore) is a boundary too, with the
+// predicted payload. Landings of such words are never skipped (the back writes the made value in
+// order, which repairs a wrong prediction; the feed turns itself off at the first mismatch).
 namespace VideoCommon::Runahead {
 
 inline constexpr u64 OcarinaOfTime = 0x0400486024DEC000ULL;
@@ -72,8 +84,11 @@ struct Chunk {
     u64 created_ns{}; ///< steady clock
     bool verify{};    ///< Mode 2: compare only
     bool own{};       ///< Gathered by the back itself (due at once)
+    u64 epoch{};      ///< Mode 2: the write journal's epoch of the snapshot
     std::vector<Range> ranges;
     std::vector<u8> bytes;
+    /// Mode 2: writes in flight at the snapshot (address, size; their bytes may be missing).
+    std::vector<std::pair<u64, u64>> in_flight;
 };
 
 /// The rasterizer's side (RasterizerVulkan sets them; null without a Vulkan rasterizer).
@@ -118,7 +133,9 @@ enum class Unmet : u32 {
     QueuedLaterWriter, ///< A queued release meets it, but work sent after it may write the word
     ReleaseRan,        ///< The newest release the front knows already ran: it was overwritten
     WrongPayload,      ///< The newest release the front knows writes a value that doesn't meet it
-    UntrackedWriter,   ///< No release known, but compute, copies or unranged writers are queued
+    UntrackedDispatch, ///< No release known; a native compute launch is queued (its QMD release
+                       ///< or reduction may write it)
+    UntrackedWriter,   ///< No release known; copies, unranged writers or maps are queued
     Nothing,           ///< Nothing queued can write it: the CPU or another channel will
     Count,
 };
@@ -133,9 +150,12 @@ void NoteEarlyAnswer(u64 sent, bool by_drain_path);
 /// that writes `payload` to the u32 at device `device` (`word`: its guest pointer, null when it
 /// must not be written: GPU-written page, syncpoint shim). Mode 1: takes a chunk and, within the
 /// bound and when no chunk range may be an image, writes the word and moves the frontier.
-/// Mode 2: takes a verify chunk. Returns whether the word was written.
+/// Mode 2: takes a verify chunk. Returns whether the word was written. `predicted`: the payload
+/// is the QMD prediction's (its landing is not skipped).
 bool AtBoundary(Core::System& system, u64 device, u8* word, u32 payload, u64 release_position,
-                u64 consumed);
+                u64 consumed, bool predicted = false);
+/// The EXP13 feed answered an acquire (counted).
+void NotePredictedAnswer();
 
 // Back thread (and GPU::InvalidateGPUCache's callers).
 
@@ -157,8 +177,8 @@ enum class Hold : u32 {
 /// true when the front already wrote that word for this release or a later one (it must not be
 /// written again, over what the CPU did since).
 [[nodiscard]] bool LandingSuperseded(u64 device);
-/// GPU::ForEachPendingCpuWrite: the ranges of chunks not applied yet (their bytes are the CPU's:
-/// a read download must not land over them).
+/// GPU::ForEachPendingCpuWrite: the ranges of chunks not applied yet and of writes taken again at
+/// the next gather (their bytes are the CPU's: a read download must not land over them).
 void ForEachUnappliedRange(void (*callback)(void* argument, u64 address, u64 size), void* argument);
 
 } // namespace VideoCommon::Runahead

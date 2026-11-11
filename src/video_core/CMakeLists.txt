@@ -135,6 +135,8 @@ add_library(video_core STATIC
     nx2_qmd_prediction.h
     nx2_runahead.cpp
     nx2_runahead.h
+    nx2_write_track.cpp
+    nx2_write_track.h
     nx2_perf.h
     nx2_download_trace.h
     nx2_async_readback.h

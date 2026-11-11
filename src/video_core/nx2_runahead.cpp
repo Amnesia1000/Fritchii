@@ -8,7 +8,10 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <utility>
+
+#include <fmt/format.h>
 
 #include "common/logging.h"
 #include "core/core.h"
@@ -17,6 +20,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_runahead.h"
+#include "video_core/nx2_write_track.h"
 
 namespace VideoCommon::Runahead {
 
@@ -44,6 +48,11 @@ std::mutex queue_mutex;
 std::deque<std::unique_ptr<Chunk>> exact_queue;  ///< Mode 1 chunks and the back's own gathers
 std::deque<std::unique_ptr<Chunk>> verify_queue; ///< Mode 2 chunks
 u64 verify_frontier = 0;                         ///< Front: mode 2's frontier (nothing written)
+/// Writes in flight at a gather (their marks may be gone, their bytes may be missing from the
+/// copy): the next gather takes their ranges again (queue_mutex).
+std::vector<std::pair<u64, u64>> retake;
+/// Whether `retake` holds anything (HandleInvalidate's fast exit reads it without the lock).
+std::atomic<bool> retake_pending{false};
 
 /// Front: early answers (and words written early) the back has not reached, for the bound.
 struct EarlyAnswer {
@@ -57,6 +66,7 @@ constexpr size_t MaxEarlyAnswers = 8192;
 struct ShadowSlot {
     std::atomic<u64> device{~u64{0}};
     std::atomic<u64> position{0};
+    std::atomic<bool> predicted{false}; ///< Written from the QMD prediction: landings not skipped
 };
 std::array<ShadowSlot, 4096> shadow;
 
@@ -82,8 +92,27 @@ struct Stats {
     std::atomic<u64> verify_bytes{};
     std::atomic<u64> verify_differ{};
     std::atomic<u64> verify_differ_bytes{};
+    /// Verify differences by what the write journal says (VerifyClass).
+    std::array<std::atomic<u64>, 4> verify_classes{};
+    std::atomic<u64> verify_in_flight{}; ///< Writes in flight at verify snapshots
+    std::atomic<u64> retaken{};          ///< Ranges taken again (in flight at a gather)
+    std::atomic<u64> retaken_bytes{};
+    std::atomic<u64> predicted_answers{};
+    std::atomic<u64> predicted_boundaries{};
+    std::atomic<u64> landings_predicted{}; ///< Landings of predicted words, not skipped
     std::atomic<u64> last_report_ns{};
 };
+
+/// What the journal says about a verify difference.
+enum class VerifyClass : u32 {
+    InFlight,  ///< A store was in flight at the snapshot (mode 1 takes it again at the next gather)
+    Rewritten, ///< A tracked CPU write after the snapshot
+    Unknown,   ///< None found, but a journal wrapped
+    Untracked, ///< No tracked CPU write: the GPU or a writer that marks nothing
+};
+constexpr std::array<const char*, 4> verify_class_names{
+    "in flight at the snapshot", "rewritten after the snapshot", "unknown (journal wrapped)",
+    "no tracked CPU write since"};
 Stats stats;
 std::atomic<u32> logged_differences{};
 
@@ -122,6 +151,7 @@ void MaybeReport() {
     const double queued_later = unmet(Unmet::QueuedLaterWriter);
     const double ran = unmet(Unmet::ReleaseRan);
     const double wrong = unmet(Unmet::WrongPayload);
+    const double untracked_dispatch = unmet(Unmet::UntrackedDispatch);
     const double untracked = unmet(Unmet::UntrackedWriter);
     const double nothing = unmet(Unmet::Nothing);
     const double boundaries = rate(stats.boundaries);
@@ -157,10 +187,31 @@ void MaybeReport() {
              "{:.0f}/s, uniform streams {:.0f}/s; misaligned uniform streams from guest memory "
              "behind the frontier {:.0f}/s; payload landings skipped {:.0f}/s; verify {:.0f} "
              "chunks/s, {:.0f} ranges/s, {:.1f} KiB/s, {} ranges differ ({} bytes)",
-             value, BoundMs(), window, queued_later, ran, wrong, untracked, nothing, boundaries,
+             value, BoundMs(), window, queued_later, ran, wrong, untracked_dispatch + untracked,
+             nothing, boundaries,
              early, written, refused_bound, refused_images, refused_no_word, chunks, ranges,
              chunk_kib, applied, own, own_kib, skipped, bank, fast, aligned, landings,
              verify_chunks, verify_ranges, verify_kib, differ, differ_bytes);
+    const auto differ_class = [](VerifyClass kind) {
+        return Take(stats.verify_classes[static_cast<size_t>(kind)]);
+    };
+    const u64 in_flight = differ_class(VerifyClass::InFlight);
+    const u64 rewritten = differ_class(VerifyClass::Rewritten);
+    const u64 unknown = differ_class(VerifyClass::Unknown);
+    const u64 untracked_differ = differ_class(VerifyClass::Untracked);
+    LOG_INFO(HW_GPU,
+             "Run-ahead writes: untracked writers queued: native compute {:.0f}/s, other {:.0f}/s; "
+             "stores in flight at gathers {:.0f}/s ({:.1f} KiB/s taken again), at verify "
+             "snapshots {:.0f}/s; differences: {} {}, {} {}, {} {}, {} {}; QMD prediction "
+             "answers {:.0f}/s, {:.0f}/s with a boundary, predicted landings not skipped {:.0f}/s; "
+             "{} writer threads, {} writes untracked (slots full)",
+             untracked_dispatch, untracked, rate(stats.retaken),
+             kib(stats.retaken_bytes), rate(stats.verify_in_flight), in_flight,
+             verify_class_names[0], rewritten, verify_class_names[1], unknown,
+             verify_class_names[2], untracked_differ, verify_class_names[3],
+             rate(stats.predicted_answers), rate(stats.predicted_boundaries),
+             rate(stats.landings_predicted), WriteTrack::SlotCount(),
+             WriteTrack::TakeUntrackedOpens());
 }
 
 /// Copies the guest bytes of `writes` into `chunk` (split at device pages).
@@ -200,6 +251,31 @@ void RecomputeApplyAt() {
     g_apply_at.store(at, std::memory_order_release);
 }
 
+/// claim_mutex and queue_mutex held: takes the collected writes out of the dirty managers into
+/// `gathered`, with the ranges an earlier gather found in flight (their stores landed since), and
+/// notes the stores in flight now for the next gather. Called before the bytes are copied: a store
+/// whose mark this gather took either landed before ForEachInFlight looked (its bytes are in the
+/// copy) or is seen there (nx2_write_track.h).
+void GatherExact(Core::System& system, std::vector<std::pair<u64, u64>>& gathered) {
+    std::function<void(PAddr, size_t)> collect = [&gathered](PAddr address, size_t size) {
+        gathered.emplace_back(address, size);
+    };
+    g_exact_used.store(true, std::memory_order_seq_cst);
+    system.GatherGPUDirtyMemory(collect);
+    gathered.insert(gathered.end(), retake.begin(), retake.end());
+    retake.clear();
+    WriteTrack::ForEachInFlight(
+        [](void* argument, u64 address, u64 size, u32, u32) {
+            static_cast<std::vector<std::pair<u64, u64>>*>(argument)->emplace_back(address, size);
+        },
+        &retake);
+    for (const auto& write : retake) {
+        stats.retaken.fetch_add(1, std::memory_order_relaxed);
+        stats.retaken_bytes.fetch_add(write.second, std::memory_order_relaxed);
+    }
+    retake_pending.store(!retake.empty(), std::memory_order_release);
+}
+
 /// Mode 2, on the back at the chunk's stamp: the chunk's bytes against guest memory now, which is
 /// what the old path uploads for the draws from here on.
 void Verify(const Hooks& hooks, const Chunk& chunk, u64 position) {
@@ -217,14 +293,32 @@ void Verify(const Hooks& hooks, const Chunk& chunk, u64 position) {
         }
         u32 differing = 0;
         u32 first = range.size;
+        u32 last = 0;
         for (u32 i = 0; i < range.size; ++i) {
             if (bytes[i] != guest[i]) {
                 first = (std::min)(first, i);
+                last = i;
                 ++differing;
             }
         }
         stats.verify_differ.fetch_add(1, std::memory_order_relaxed);
         stats.verify_differ_bytes.fetch_add(differing, std::memory_order_relaxed);
+        // Who changed the differing bytes (the write journal, nx2_write_track.h).
+        const u64 differ_begin = range.address + first;
+        const u64 differ_end = range.address + last + 1;
+        VerifyClass kind = VerifyClass::Untracked;
+        WriteTrack::Rewrite rewrite{};
+        if (std::ranges::any_of(chunk.in_flight, [&](const std::pair<u64, u64>& write) {
+                return write.first < differ_end && differ_begin < write.first + write.second;
+            })) {
+            kind = VerifyClass::InFlight;
+        } else {
+            rewrite = WriteTrack::FindRewrite(differ_begin, differ_end - differ_begin, chunk.epoch);
+            kind = rewrite.kind == WriteTrack::Rewrite::Kind::Found     ? VerifyClass::Rewritten
+                   : rewrite.kind == WriteTrack::Rewrite::Kind::Unknown ? VerifyClass::Unknown
+                                                                        : VerifyClass::Untracked;
+        }
+        stats.verify_classes[static_cast<size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
         if (logged_differences.fetch_add(1, std::memory_order_relaxed) >= 16) {
             continue;
         }
@@ -237,19 +331,27 @@ void Verify(const Hooks& hooks, const Chunk& chunk, u64 position) {
         const u32 word_bytes = (std::min)(4U, range.size - word_at);
         std::memcpy(&chunk_word, bytes + word_at, word_bytes);
         std::memcpy(&guest_word, guest + word_at, word_bytes);
+        const std::string writer =
+            kind == VerifyClass::Rewritten
+                ? fmt::format(" by writer thread {} (core {}), {} thread(s) in all", rewrite.slot,
+                              rewrite.core, rewrite.writers)
+                : std::string{};
         LOG_INFO(HW_GPU,
                  "Run-ahead verify: device {:#x}+{} differs at +{:#x} ({} bytes): chunk word "
-                 "{:#010x}, guest {:#010x}; chunk of release {} applied at back position {} "
+                 "{:#010x}, guest {:#010x}; {}{}; chunk of release {} applied at back position {} "
                  "(stamp {}, frontier {}, taken {:.2f} ms ago); bound programs vs {:#x} ps {:#x}",
                  range.address, range.size, first, differing, chunk_word, guest_word,
-                 chunk.release, position, chunk.stamp, chunk.frontier,
+                 verify_class_names[static_cast<size_t>(kind)], writer, chunk.release, position,
+                 chunk.stamp, chunk.frontier,
                  static_cast<double>(NowNs() - chunk.created_ns) / 1e6, programs[0], programs[1]);
     }
 }
 
 } // Anonymous namespace
 
-Mode CurrentMode() {
+namespace {
+
+Mode ModeNow() {
     const int value = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_runahead,
                                                        "EDEN_NX2_RUNAHEAD");
     if (value <= 0 || value > 3) [[likely]] {
@@ -270,6 +372,23 @@ Mode CurrentMode() {
     return static_cast<Mode>(value);
 }
 
+} // Anonymous namespace
+
+Mode CurrentMode() {
+    const Mode mode = ModeNow();
+    // The write tracking follows the mode (nx2_write_track.h): stores are tracked while a gather
+    // may copy bytes or a verify snapshot may be classified.
+    const bool armed = mode == Mode::On || mode == Mode::Verify;
+    if (WriteTrack::g_armed.load(std::memory_order_relaxed) != armed) [[unlikely]] {
+        WriteTrack::g_armed.store(armed, std::memory_order_relaxed);
+    }
+    const bool journal = mode == Mode::Verify;
+    if (WriteTrack::g_journal.load(std::memory_order_relaxed) != journal) [[unlikely]] {
+        WriteTrack::g_journal.store(journal, std::memory_order_relaxed);
+    }
+    return mode;
+}
+
 void SetProgramId(u64 program_id) {
     g_program_id.store(program_id, std::memory_order_relaxed);
 }
@@ -283,6 +402,8 @@ void Reset() {
     exact_queue.clear();
     verify_queue.clear();
     verify_frontier = 0;
+    retake.clear();
+    retake_pending.store(false, std::memory_order_release);
     early_answers.clear();
     g_apply_at.store(~u64{0}, std::memory_order_release);
     g_frontier.store(0, std::memory_order_release);
@@ -290,6 +411,7 @@ void Reset() {
     for (ShadowSlot& slot : shadow) {
         slot.device.store(~u64{0}, std::memory_order_relaxed);
         slot.position.store(0, std::memory_order_relaxed);
+        slot.predicted.store(false, std::memory_order_relaxed);
     }
 }
 
@@ -312,6 +434,10 @@ bool WithinBound(u64 consumed) {
     return NowNs() - early_answers.front().time_ns < bound_ns;
 }
 
+void NotePredictedAnswer() {
+    stats.predicted_answers.fetch_add(1, std::memory_order_relaxed);
+}
+
 void NoteEarlyAnswer(u64 sent, bool by_drain_path) {
     if (early_answers.empty() || early_answers.back().position < sent) {
         early_answers.push_back(EarlyAnswer{.position = sent, .time_ns = NowNs()});
@@ -322,7 +448,7 @@ void NoteEarlyAnswer(u64 sent, bool by_drain_path) {
 }
 
 bool AtBoundary(Core::System& system, u64 device, u8* word, u32 payload, u64 release_position,
-                u64 consumed) {
+                u64 consumed, bool predicted) {
     const Mode mode = CurrentMode();
     if (mode != Mode::On && mode != Mode::Verify) {
         return false;
@@ -339,9 +465,20 @@ bool AtBoundary(Core::System& system, u64 device, u8* word, u32 payload, u64 rel
         chunk->verify = true;
         chunk->release = release_position;
         chunk->created_ns = NowNs();
+        // The epoch first, then the pending writes, then the stores in flight, then the bytes: a
+        // store whose journal entry has an older epoch is seen in flight or landed before the
+        // copy (nx2_write_track.h).
+        chunk->epoch = WriteTrack::NewEpoch();
         std::vector<std::pair<u64, u64>> pending;
         system.GPU().ForEachPendingCpuWrite(
             [&pending](DAddr address, size_t size) { pending.emplace_back(address, size); });
+        WriteTrack::ForEachInFlight(
+            [](void* argument, u64 address, u64 size, u32, u32) {
+                static_cast<std::vector<std::pair<u64, u64>>*>(argument)->emplace_back(address,
+                                                                                       size);
+            },
+            &chunk->in_flight);
+        stats.verify_in_flight.fetch_add(chunk->in_flight.size(), std::memory_order_relaxed);
         CopyRanges(*hooks, pending, *chunk);
         if (chunk->ranges.empty()) {
             return false;
@@ -373,11 +510,7 @@ bool AtBoundary(Core::System& system, u64 device, u8* word, u32 payload, u64 rel
         chunk->release = release_position;
         chunk->created_ns = NowNs();
         std::vector<std::pair<u64, u64>> gathered;
-        std::function<void(PAddr, size_t)> collect = [&gathered](PAddr address, size_t size) {
-            gathered.emplace_back(address, size);
-        };
-        g_exact_used.store(true, std::memory_order_seq_cst);
-        system.GatherGPUDirtyMemory(collect);
+        GatherExact(system, gathered);
         CopyRanges(*hooks, gathered, *chunk);
         if (hooks->may_hold_images != nullptr) {
             images = std::ranges::any_of(chunk->ranges, [hooks](const Range& range) {
@@ -411,7 +544,11 @@ bool AtBoundary(Core::System& system, u64 device, u8* word, u32 payload, u64 rel
         slot.position.load(std::memory_order_relaxed) < release_position) {
         slot.device.store(~u64{0}, std::memory_order_relaxed);
         slot.position.store(release_position, std::memory_order_relaxed);
+        slot.predicted.store(predicted, std::memory_order_relaxed);
         slot.device.store(device, std::memory_order_release);
+    }
+    if (predicted) {
+        stats.predicted_boundaries.fetch_add(1, std::memory_order_relaxed);
     }
     g_words_written.store(true, std::memory_order_relaxed);
     g_frontier.store(frontier, std::memory_order_seq_cst);
@@ -469,7 +606,8 @@ bool HandleInvalidate(Core::System& system) {
     const u64 position = on_back ? split.BackEntryPosition() : split.ConsumedNow();
     const bool mode_on = CurrentMode() == Mode::On;
     if (!mode_on && g_apply_at.load(std::memory_order_acquire) == ~u64{0} &&
-        g_frontier.load(std::memory_order_acquire) <= position) [[likely]] {
+        g_frontier.load(std::memory_order_acquire) <= position &&
+        !retake_pending.load(std::memory_order_acquire)) [[likely]] {
         return false;
     }
     if (!on_back) {
@@ -493,7 +631,24 @@ bool HandleInvalidate(Core::System& system) {
         return true;
     }
     if (!mode_on) {
-        // Switched off and caught up: the old path from here on.
+        // Switched off and caught up: the old path from here on. The stores in flight at the last
+        // gather lost their marks: their bytes go to the caches now.
+        {
+            std::scoped_lock queue{queue_mutex};
+            if (!retake.empty()) {
+                auto chunk = std::make_unique<Chunk>();
+                chunk->own = true;
+                chunk->created_ns = NowNs();
+                CopyRanges(*hooks, retake, *chunk);
+                retake.clear();
+                retake_pending.store(false, std::memory_order_release);
+                if (!chunk->ranges.empty()) {
+                    exact_queue.push_back(std::move(chunk));
+                    RecomputeApplyAt();
+                }
+            }
+        }
+        ApplyDue(position);
         return false;
     }
     // Past the frontier: what guest memory holds now is what the draws from here on must see.
@@ -504,11 +659,7 @@ bool HandleInvalidate(Core::System& system) {
         chunk->own = true;
         chunk->created_ns = NowNs();
         std::vector<std::pair<u64, u64>> gathered;
-        std::function<void(PAddr, size_t)> collect = [&gathered](PAddr address, size_t size) {
-            gathered.emplace_back(address, size);
-        };
-        g_exact_used.store(true, std::memory_order_seq_cst);
-        system.GatherGPUDirtyMemory(collect);
+        GatherExact(system, gathered);
         CopyRanges(*hooks, gathered, *chunk);
         if (chunk->ranges.empty()) {
             return true;
@@ -543,7 +694,14 @@ bool LandingSuperseded(u64 device) {
         return false;
     }
     const u64 position = slot.position.load(std::memory_order_acquire);
+    const bool predicted = slot.predicted.load(std::memory_order_acquire);
     if (slot.device.load(std::memory_order_acquire) != device) {
+        return false;
+    }
+    if (predicted) {
+        // The front wrote the predicted payload: the made value lands in order (the same value,
+        // or the right one if the prediction was wrong).
+        stats.landings_predicted.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
     // The release being run starts before the position the front noted it at (the end of its
@@ -562,6 +720,9 @@ void ForEachUnappliedRange(void (*callback)(void* argument, u64 address, u64 siz
         for (const Range& range : chunk->ranges) {
             callback(argument, range.address, range.size);
         }
+    }
+    for (const auto& write : retake) {
+        callback(argument, write.first, write.second);
     }
 }
 
