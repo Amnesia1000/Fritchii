@@ -5348,13 +5348,15 @@ u32 TextureCache<P>::RetireSlotPredecessors(const ImageInfo& new_info, GPUVAddr 
             }
             continue;
         }
-        if (False(old.flags & ImageFlagBits::Registered) ||
-            False(old.flags & ImageFlagBits::GpuModified)) {
+        // Not GPU-written: its contents are guest memory's, nothing is lost. Alias links: the
+        // cold sweep deletes such images too, and DeleteImage drops the links (2026-11-11 night
+        // market: 1,700-3,000 of the pile a 600 frames had them, ~500 were never GPU-written).
+        if (False(old.flags & ImageFlagBits::Registered)) {
             ++slot_kept_kind;
             ++slot_kept_not_gpu;
             continue;
         }
-        if (old.HasScaled() || !old.aliased_images.empty()) {
+        if (old.HasScaled()) {
             ++slot_kept_kind;
             ++slot_kept_aliased;
             continue;
