@@ -126,6 +126,14 @@ inline std::atomic<int> g_fold_instance{-1};
 /// writes count; the handler runs on copies for the first 4096 calls of each macro and then one
 /// call in 64, and differences are logged: "OoT macro verify"), 3 = verify every call.
 inline std::atomic<int> g_oot_macros{-1};
+/// EDEN_NX2_DRAW_PACKET (live, default 0; Fable's back-thread plan, Build C step 1): the
+/// register writes of an OoT draw macro call (0xe04, 0xe52, 0xea0, identified by code hash) that
+/// the front would send as single Direct entries go as one ring entry the back applies in one
+/// call, in the same order through the same CallMethod (Maxwell3D::ApplyDrawPacket). Constant
+/// buffer words and anything else still go one by one, splitting the packet. 1 = on, 2 = on and
+/// the back checks each packet's registers against the values the front wrote ("Draw packet
+/// verify").
+inline std::atomic<int> g_draw_packet{-1};
 
 /// Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP63, live through the debug server:
 /// slots for batches of fixes built together and A/B-tested in one session
@@ -538,6 +546,9 @@ inline void LoadExperiments() {
     }
     if (name == "EDEN_NX2_OOT_MACROS") {
         return &g_oot_macros;
+    }
+    if (name == "EDEN_NX2_DRAW_PACKET") {
+        return &g_draw_packet;
     }
     return nullptr;
 }

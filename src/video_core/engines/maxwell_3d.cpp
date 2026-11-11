@@ -1179,6 +1179,18 @@ struct Maxwell3D::FrontState {
     std::vector<u32> oot_jit_writes;
     std::vector<u32> oot_handler_writes;
     std::array<u32, OotMacros::DataRamWords> oot_dram{};
+    /// EDEN_NX2_DRAW_PACKET: this macro call's draw writes go in the packet (set per call in
+    /// FrontRunMacro), the mode (2 = the back verifies), and the held writes (method | argument
+    /// << 32), the values the front's registers took, and the entries' combined effect.
+    bool packet_on{};
+    int packet_mode{};
+    static constexpr size_t MaxPacketWrites = 64;
+    std::vector<u64> packet;
+    std::vector<u32> packet_values;
+    VideoCommon::GpuSplit::Effect packet_effect{VideoCommon::GpuSplit::Effect::None};
+    u64 packets{};       ///< Packets sent (the "OoT macros" line)
+    u64 packet_writes{}; ///< Writes they carried
+    Core::System* system{};
     std::vector<u32> dma_words; ///< FrontDmaReadEarly's words
     u64 calls{};
     /// A method the draw manager handles was sent since the back last ran DrawDeferred: only
@@ -1352,6 +1364,35 @@ struct OotRecordContext {
 };
 
 enum class OotVerdict { Same, Different, Declined, Unverifiable };
+
+// EDEN_NX2_DRAW_PACKET: the writes of OoT's draw macros (macro_hle_oot.h E04, E52, EA0) that go
+// in the packet: state and draw registers that write no memory and that FrontWrite notes nothing
+// for after sending. The constant buffer words of 0xea0 (0x8e4, 0x8e5) are not among them.
+static_assert(MAXWELL3D_REG_INDEX(draw.end) == 0x585 && MAXWELL3D_REG_INDEX(draw.begin) == 0x586);
+static_assert(MAXWELL3D_REG_INDEX(const_buffer.offset) == 0x8e3 &&
+              MAXWELL3D_REG_INDEX(const_buffer.buffer) == 0x8e4);
+[[nodiscard]] bool IsDrawPacketMethod(u32 method) {
+    switch (method) {
+    case 0x446: // base vertex
+    case 0x50d: // base vertex copy
+    case 0x50e: // base instance
+    case 0x585: // draw.end
+    case 0x586: // draw.begin
+    case 0x5f2: // index_buffer address high, low and format (0xe04)
+    case 0x5f3:
+    case 0x5f6:
+    case 0x5f7: // index_buffer.first
+    case 0x5f8: // index_buffer.count
+    case 0x8e3: // const_buffer.offset
+        return true;
+    default:
+        return false;
+    }
+}
+
+[[nodiscard]] bool IsDrawMacro(OotMacros::Id id) {
+    return id == OotMacros::Id::E04 || id == OotMacros::Id::E52 || id == OotMacros::Id::EA0;
+}
 
 // Runs replacement `id` with an OotRecordContext for the call the JIT just ran and compares the
 // writes, the data RAM and the failure with the JIT's. Logs the first differences of each
@@ -1556,6 +1597,7 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
         front->skip_same = SkipSameValueWrites() && FrontSkipSame();
         front->delta_allowed = !record_write_history && !g_trace_first_method_writes;
         front->executing_macro = executing_macro;
+        front->system = &system;
         front->parameters = std::move(macro_params);
         macro_params.clear();
         executing_macro = 0;
@@ -1786,7 +1828,13 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         return;
     }
     if (from_macro && (execution_mask[method] || !VideoCommon::GpuSplit::MacroSink())) {
-        split.MacroWrite(this, method, argument, effect);
+        if (fs.packet_on && IsDrawPacketMethod(method)) [[unlikely]] {
+            // EDEN_NX2_DRAW_PACKET: the same Direct write, held in the draw packet (none of
+            // these methods writes memory or is noted below).
+            FrontCapturePacket(split, fs, method, argument, value, static_cast<u8>(effect));
+        } else {
+            split.MacroWrite(this, method, argument, effect);
+        }
     } else {
         // EDEN_NX2_MACRO_SINK: a macro's state write goes to the back's method sink as the
         // command list's own do; the back applies the sink in order (shadow RAM and same-value
@@ -2098,6 +2146,15 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                         (oot == OotMacros::Id::E52 || oot == OotMacros::Id::EA0) &&
                         fs.parameters.size() >= 6 && fs.parameters[2] > 1 &&
                         fs.parameters[2] <= OotMacros::MaxInstances;
+    // EDEN_NX2_DRAW_PACKET (live, 0 = off, the default): a draw macro's Direct draw and state
+    // writes go as one ring entry (FrontCapturePacket). Not with the paths that keep their own
+    // open blocks or held writes (EXP22, EXP2, EDEN_NX2_MACRO_SINK).
+    fs.packet_mode = IsDrawMacro(oot) ? VideoCore::Nx2Debug::SwitchValue(
+                                            VideoCore::Nx2Debug::g_draw_packet,
+                                            "EDEN_NX2_DRAW_PACKET")
+                                      : 0;
+    fs.packet_on = fs.packet_mode != 0 && fs.exp22 == 0 && fs.same_experiment == 0 &&
+                   !VideoCommon::GpuSplit::MacroSink();
     {
         VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
         engine.native_interpreter.active_dram = &native_data_ram;
@@ -2227,7 +2284,15 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             }
         }
     }
-    if ((oot_mode != 0 || fold_on) && (++fs.oot_ticks & 0xffff) == 0) [[unlikely]] {
+    if (fs.packet_on) [[unlikely]] {
+        // The call's last packet goes now (it is the pending flush when it holds writes).
+        fs.packet_on = false;
+        if (!fs.packet.empty()) {
+            split.RunPendingFlush();
+        }
+    }
+    if ((oot_mode != 0 || fold_on || fs.packet_mode != 0) && (++fs.oot_ticks & 0xffff) == 0)
+        [[unlikely]] {
         const auto now = std::chrono::steady_clock::now();
         if (fs.oot_report == std::chrono::steady_clock::time_point{}) {
             fs.oot_report = now;
@@ -2238,10 +2303,13 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                      "OoT macros (EDEN_NX2_OOT_MACROS={}, FOLD_INSTANCE={}), last {:.0f} s: {} "
                      "native calls, {} declined to the JIT, {} calls of macros without a handler; "
                      "verify: {} compared, {} differences, {} not verifiable; {} first instances "
-                     "folded",
+                     "folded; draw packets (EDEN_NX2_DRAW_PACKET) {} with {} writes",
                      oot_mode, fold_on ? 1 : 0, seconds, s.native, s.declined, s.unmatched,
-                     s.verified, s.differences, s.unverifiable, s.folds);
+                     s.verified, s.differences, s.unverifiable, s.folds, fs.packets,
+                     fs.packet_writes);
             fs.oot_stats = {};
+            fs.packets = 0;
+            fs.packet_writes = 0;
             fs.oot_report = now;
         }
     }
@@ -3344,6 +3412,116 @@ void Maxwell3D::FrontFlushPending(void* maxwell3d) {
     }
     self->FrontEmitBatch(split, fs);
     self->FrontEmitCapture(split, fs);
+}
+
+void Maxwell3D::FrontCapturePacket(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
+                                   u32 argument, u32 value, u8 effect) {
+    // EDEN_NX2_DRAW_PACKET (Fable's back-thread plan, Build C step 1). The packet is held as
+    // GpuSplit's pending flush, so anything else the front sends, publishes or drains for sends
+    // it first and the method order stays as with single entries.
+    if (fs.packet.size() >= FrontState::MaxPacketWrites) {
+        split.RunPendingFlush();
+    }
+    if (fs.packet.empty()) {
+        split.SetPendingFlush(&Maxwell3D::FrontFlushPacket, this);
+        fs.packet_effect = VideoCommon::GpuSplit::Effect::None;
+    }
+    fs.packet.push_back(u64{method} | (u64{argument} << 32));
+    fs.packet_values.push_back(value);
+    fs.packet_effect = VideoCommon::SplitWriteTracker::Combine(
+        fs.packet_effect, static_cast<VideoCommon::GpuSplit::Effect>(effect));
+}
+
+void Maxwell3D::FrontFlushPacket(void* maxwell3d) {
+    // GpuSplit cleared the hook before the call: the Reserve below does not come back here.
+    auto* const self = static_cast<Maxwell3D*>(maxwell3d);
+    FrontState& fs = *self->front;
+    if (fs.packet.empty()) {
+        return;
+    }
+    auto& split = VideoCommon::GpuSplit::Get();
+    // The writes as MacroWrite sends each one (Direct, is_last): the engine is part of the
+    // payload, so no engine entry is needed; the back's engine selection stays as it is.
+    const size_t count = fs.packet.size();
+    // EDEN_NX2_DRAW_PACKET=2: also each written register once, with the value the front's copy
+    // took for it (its last write in the packet), for the back to compare after applying.
+    std::array<u64, FrontState::MaxPacketWrites> checks;
+    size_t check_count = 0;
+    if (fs.packet_mode >= 2) [[unlikely]] {
+        for (size_t i = 0; i < count; ++i) {
+            const u32 method = static_cast<u32>(fs.packet[i] & 0xffff);
+            const bool later = std::any_of(fs.packet.begin() + i + 1, fs.packet.end(),
+                                           [method](u64 write) {
+                                               return static_cast<u32>(write & 0xffff) == method;
+                                           });
+            if (!later) {
+                checks[check_count++] = u64{method} | (u64{fs.packet_values[i]} << 32);
+            }
+        }
+    }
+    split.CallWithPayload(&Maxwell3D::ApplyDrawPacket, 3 + count + check_count, fs.packet_effect,
+                          [&](u64* payload) {
+                              payload[0] = reinterpret_cast<u64>(self);
+                              payload[1] = reinterpret_cast<u64>(fs.system);
+                              payload[2] = u64{count} | (u64{check_count} << 32);
+                              std::memcpy(payload + 3, fs.packet.data(), count * sizeof(u64));
+                              std::memcpy(payload + 3 + count, checks.data(),
+                                          check_count * sizeof(u64));
+                          });
+    ++fs.packets;
+    fs.packet_writes += count;
+    fs.packet.clear();
+    fs.packet_values.clear();
+}
+
+void Maxwell3D::ApplyDrawPacket(const u64* payload) {
+    // EDEN_NX2_DRAW_PACKET on the back: what GpuSplit::Execute does for each of the packet's
+    // Direct Method entries (ConsumeSink, then CallMethod), in one call. Nothing between the
+    // writes can fill the method sink, so it is consumed once.
+    auto* const self = reinterpret_cast<Maxwell3D*>(payload[0]);
+    auto& system = *reinterpret_cast<Core::System*>(payload[1]);
+    const u32 count = static_cast<u32>(payload[2]);
+    const u32 checks = static_cast<u32>(payload[2] >> 32);
+    const u64* const writes = payload + 3;
+    {
+        // GpuSplit::Execute: the fast path leaves the timing to CallMethod's own sample, the
+        // other path times the entry.
+        std::optional<VideoCommon::Nx2Profile::Scope> scope;
+        if (!self->fast_maxwell3d) {
+            scope.emplace(VideoCommon::Nx2Profile::Zone::Method);
+        }
+        self->ConsumeSink(system);
+        for (u32 i = 0; i < count; ++i) {
+            self->CallMethod(system, static_cast<u32>(writes[i] & 0xffff),
+                             static_cast<u32>(writes[i] >> 32), true);
+        }
+    }
+    if (checks == 0) [[likely]] {
+        return;
+    }
+    // EDEN_NX2_DRAW_PACKET=2: the registers must hold what the front's copy took.
+    static std::atomic<u64> checked{};
+    static std::atomic<u64> differing{};
+    static std::atomic<u32> logged{};
+    const u64* const check = writes + count;
+    for (u32 i = 0; i < checks; ++i) {
+        const u32 method = static_cast<u32>(check[i] & 0xffff);
+        const u32 expected = static_cast<u32>(check[i] >> 32);
+        if (self->regs.reg_array[method] != expected) [[unlikely]] {
+            differing.fetch_add(1, std::memory_order_relaxed);
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                LOG_WARNING(HW_GPU,
+                            "Draw packet verify: register {:#x} is {:#x} on the back, the front "
+                            "wrote {:#x} ({} writes in the packet)",
+                            method, self->regs.reg_array[method], expected, count);
+            }
+        }
+    }
+    if (const u64 n = checked.fetch_add(1, std::memory_order_relaxed) + 1;
+        n == 1 || n % 200000 == 0) {
+        LOG_INFO(HW_GPU, "Draw packet verify: {} packets checked, {} register differences", n,
+                 differing.load(std::memory_order_relaxed));
+    }
 }
 
 } // namespace Tegra::Engines
