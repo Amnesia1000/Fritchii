@@ -5307,11 +5307,13 @@ u32 TextureCache<P>::RetireSlotPredecessors(const ImageInfo& new_info, GPUVAddr 
     if (!RelocationShaped(new_info)) {
         return 0;
     }
+    // Not Alias (the per-NPC pile is all Alias: 2,000-3,200 kept a 600 frames for it): the cold
+    // sweep deletes those too; live alias links are refused below (aliased_images).
     constexpr ImageFlagBits excluded =
         ImageFlagBits::Sparse | ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
         ImageFlagBits::UnwrittenSparse | ImageFlagBits::Unbacked | ImageFlagBits::Converted |
         ImageFlagBits::AsynchronousDecode | ImageFlagBits::IsDecoding | ImageFlagBits::Remapped |
-        ImageFlagBits::Alias | ImageFlagBits::CostlyLoad | ImageFlagBits::Rescaled |
+        ImageFlagBits::CostlyLoad | ImageFlagBits::Rescaled |
         ImageFlagBits::TrimmedLevels;
     const auto queued = [](ImageId image_id, const auto& downloads) {
         return std::ranges::any_of(downloads, [image_id](const auto& download) {
