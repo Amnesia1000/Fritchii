@@ -4355,6 +4355,22 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     // preparation) one per host thread, at normal priority.
     const size_t full_threads =
         std::max<size_t>(threads, std::max(1U, std::thread::hardware_concurrency()));
+    // On Intel it does not build beside the game: there its compiles took the CPU from the game
+    // (owner, Arc B580 + 6 cores: lag spikes with the preparation running in play, none with
+    // EDEN_NX2_PRECOMPILE=0). Like the warm-up, it builds then only while emulation is paused or
+    // from Prepare Shaders Now (ShaderNotify::WarmMayBuild); the Preparing shaders screen runs it
+    // at full speed as before. EDEN_NX2_PRECOMPILE_WHILE_PLAYING=1 builds beside the game anyway.
+    static const bool while_playing = [] {
+        const char* value = std::getenv("EDEN_NX2_PRECOMPILE_WHILE_PLAYING");
+        return value != nullptr && value[0] == '1';
+    }();
+    const bool hold_beside_game = IntelDriverCache(device) && !while_playing;
+    const auto allowed_threads = [&](bool full) -> size_t {
+        if (full) {
+            return full_threads;
+        }
+        return hold_beside_game && !shader_notify.WarmMayBuild() ? 0 : threads;
+    };
     const auto complete = [&](size_t index) {
         const size_t finished = state.finished.fetch_add(1) + 1;
         {
@@ -4398,8 +4414,9 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         in.exceptions(std::ifstream::failbit);
         while (!stop.stop_requested() && !stop_loading.stop_requested() && !warm_cancel) {
             const bool full = shader_notify.PrecompileFullSpeed();
-            if (worker >= (full ? full_threads : threads)) {
-                // Parked until full speed; done once every record is taken.
+            if (worker >= allowed_threads(full)) {
+                // Parked until full speed (or, on Intel, a pause); done once every record is
+                // taken.
                 if (state.next.load() >= total) {
                     break;
                 }
