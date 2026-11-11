@@ -2434,7 +2434,9 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
     // The game's banks (c3+) keep the loop and the hot rule.
     const u32 own_slots = static_cast<u32>(
         VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_bank_slots, "EDEN_NX2_BANK_SLOTS"));
-    const bool own_slot = index < 32 && ((own_slots >> index) & 1) != 0;
+    // Not while CPU inner invalidation is skipped: our constant buffer words then set no flag.
+    const bool own_slot = index < 32 && ((own_slots >> index) & 1) != 0 &&
+                          !Settings::values.skip_cpu_inner_invalidation.GetValue();
     const bool slot_verify =
         own_slot && VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_bank_skip_verify,
                                                      "EDEN_NX2_BANK_SKIP_VERIFY") != 0;
