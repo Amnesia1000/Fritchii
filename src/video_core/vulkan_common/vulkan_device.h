@@ -573,6 +573,29 @@ FN_MAX_LIMIT_LIST
                control.minSubgroupSize <= GuestWarpSize && GuestWarpSize <= control.maxSubgroupSize;
     }
 
+    /// The subgroup size to require for compute shaders without warp-width operations, 0 for the
+    /// driver's choice. Intel (Xe2) compiles large compute shaders SIMD32 with register spills
+    /// (5.7 KB of scratch for Ocarina of Time's global memory shaders) after also compiling them
+    /// SIMD16: 16 lanes build ~2.6x faster without spills, but run slower (Hyrule Field on a
+    /// B580: ~35 instead of ~39.5 fps; f84d5909908cc5ea 0.14 instead of 0.07 ms a dispatch), so
+    /// it is off unless asked for. EDEN_NX2_INTEL_COMPUTE_SIMD16: 0 (default) off, 1 shaders with
+    /// global memory accesses, 2 every shader without warp operations.
+    u32 NarrowComputeSubgroupSize(bool uses_global_memory) const {
+        constexpr u32 narrow = 16;
+        static const int mode = [] {
+            const char* value = std::getenv("EDEN_NX2_INTEL_COMPUTE_SIMD16");
+            return value != nullptr && value[0] >= '0' && value[0] <= '2' ? value[0] - '0' : 0;
+        }();
+        const auto& control = properties.subgroup_size_control;
+        const bool applies = mode == 2 || (mode == 1 && uses_global_memory);
+        return applies && properties.properties.vendorID == 0x8086 &&
+                       extensions.subgroup_size_control &&
+                       IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT) &&
+                       control.minSubgroupSize <= narrow && narrow <= control.maxSubgroupSize
+                   ? narrow
+                   : 0;
+    }
+
     /// Returns true if a stage may run in subgroups narrower than the guest's warp (Intel runs
     /// fragment and vertex shaders SIMD8 or SIMD16, and those cannot be given a size).
     bool IsWarpSizePotentiallySmallerThanGuest() const {
