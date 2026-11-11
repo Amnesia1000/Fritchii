@@ -3421,6 +3421,13 @@ private:
     void FrontWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
                     bool is_last_call, bool from_macro);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
+    /// FrontRunMacro's two bodies: v5.7's (no macro switch on) and the one with EXP53,
+    /// EDEN_NX2_OOT_MACROS, EDEN_NX2_FOLD_INSTANCE and EDEN_NX2_DRAW_PACKET. FrontState's
+    /// macro_features picks one; FrontRefreshSwitches sets it from the live switches.
+    void FrontRunMacroPlain(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
+    void FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSplit& split,
+                               FrontState& state);
+    static void FrontRefreshSwitches(FrontState& state);
 public:
     /// Split front: whether the 3D macro `method`, called with `count` parameters that GPU work
     /// wrote, only copies the first into the draw's vertex count (dry runs on copies of its

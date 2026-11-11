@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdlib>
 #include <thread>
 
@@ -578,7 +579,7 @@ void GpuSplit::RangeLastWrite(GPUVAddr begin, GPUVAddr end, const u32* data, siz
         last_method_write_position = (std::max)(last_method_write_position, oldest.position);
         ranged_writes.pop_front();
     }
-    RangedWrite& write = ranged_writes.emplace_back(RangedWrite{write_position, begin, end, method, 0, {}});
+    RangedWrite& write = ranged_writes.push_back(write_position, begin, end, method);
     if (data != nullptr && space != 0 && (end - begin) % sizeof(u32) == 0) {
         write.space = space;
         write.data.assign(data, data + words);
@@ -593,8 +594,9 @@ bool GpuSplit::ForwardRead(size_t space, GPUVAddr begin, u32 words, u32* out) {
     if (target <= done) {
         return false; // Nothing to wait for: memory holds the words
     }
-    // The newest overlapping write; the deque is in send order.
-    for (auto it = ranged_writes.rbegin(); it != ranged_writes.rend(); ++it) {
+    // The newest overlapping write; the ring is in send order.
+    for (size_t index = ranged_writes.size(); index-- > 0;) {
+        const RangedWrite* const it = &ranged_writes[index];
         if (!(it->begin < end && begin < it->end)) {
             continue;
         }
@@ -616,10 +618,11 @@ u64 GpuSplit::MemoryWriterTarget(u64 done, GPUVAddr begin, GPUVAddr end, u32& ta
     }
     u64 target = std::max({last_writer_position, last_sync_position, last_memory_write_position});
     target_method = last_memory_write_method;
-    // Newest first (positions rise along the deque): the first overlap is the target, and the
+    // Newest first (positions rise along the ring): the first overlap is the target, and the
     // writes before `target` can't raise it.
-    for (auto it = ranged_writes.rbegin(); it != ranged_writes.rend() && it->position > target;
-         ++it) {
+    for (size_t index = ranged_writes.size();
+         index-- > 0 && ranged_writes[index].position > target;) {
+        const RangedWrite* const it = &ranged_writes[index];
         if (it->begin < end && begin < it->end) {
             target = it->position;
             target_method = it->method;
@@ -638,6 +641,19 @@ size_t GpuSplit::MaxRangedWrites() {
         return value != nullptr ? (std::max<size_t>)(std::strtoull(value, nullptr, 10), 1) : 256;
     }();
     return max;
+}
+
+void GpuSplit::RangedRing::Grow() {
+    // First use: MaxRangedWrites() slots (RangeLastWrite pops the oldest before it holds more),
+    // a power of two for the index mask. Past it, doubled, oldest moved to slot 0.
+    const size_t capacity = slots.empty() ? std::bit_ceil(MaxRangedWrites()) : slots.size() * 2;
+    std::vector<RangedWrite> grown(capacity);
+    for (size_t i = 0; i < count; ++i) {
+        grown[i] = std::move((*this)[i]);
+    }
+    slots = std::move(grown);
+    mask = capacity - 1;
+    head = 0;
 }
 
 GpuSplit::GuestWriters GpuSplit::QueuedGuestWriters(u64 done, GPUVAddr address, u64 device,
@@ -710,8 +726,9 @@ GpuSplit::GuestWriters GpuSplit::QueuedGuestWriters(u64 done, GPUVAddr address, 
         unbounded(write_position, Cause::WriterScanLimit);
     }
     // RangeLastWrite (3D constant buffer uploads and the like), by GPU address.
-    for (auto it = ranged_writes.rbegin(); it != ranged_writes.rend() && it->position > done;
-         ++it) {
+    for (size_t index = ranged_writes.size();
+         index-- > 0 && ranged_writes[index].position > done;) {
+        const RangedWrite* const it = &ranged_writes[index];
         if (it->begin < address + size && address < it->end) {
             noted(it->position, Cause::Ranged);
             break;

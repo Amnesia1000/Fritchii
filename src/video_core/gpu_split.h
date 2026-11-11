@@ -724,7 +724,7 @@ public:
     /// reports, timed releases), not when the back runs it (Tegra::Nx2AsyncReportsSettled).
     void NoteAsyncWrite(u64 begin, u64 size) {
         for (u64 slot = begin >> 4; slot <= (begin + size - 1) >> 4; ++slot) {
-            async_writes[slot] = write_position;
+            async_writes.Set(slot, write_position);
         }
     }
     /// Front: the ring position of the newest async write noted to these bytes, or 0.
@@ -734,8 +734,8 @@ public:
             return newest;
         }
         for (u64 slot = begin >> 4; slot <= (begin + size - 1) >> 4; ++slot) {
-            if (const auto it = async_writes.find(slot); it != async_writes.end()) {
-                newest = (std::max)(newest, it->second);
+            if (const u64* const position = async_writes.Find(slot)) {
+                newest = (std::max)(newest, *position);
             }
         }
         return newest;
@@ -951,7 +951,82 @@ private:
     static inline bool ring_pairs{};
     static constexpr u32 MaxPairs = 4096;
 
-    std::unordered_map<u64, u64> async_writes; ///< Front: 16-byte slot -> ring position
+    /// async_writes' table: 16-byte slot -> ring position, open addressing with linear probing.
+    /// As the std::unordered_map it replaces: entries are never erased (only clear(), at Reset),
+    /// a note to a known slot overwrites its position. It allocates only when it doubles (at
+    /// half full), not a node per new slot (FrontNoteMemoryWrite -> NoteAsyncWrite was 1.4-1.5%
+    /// of the front, ~15 ms/s, fable_answer_regression_2 4.4).
+    class AsyncWriteTable {
+    public:
+        [[nodiscard]] bool empty() const {
+            return count == 0;
+        }
+        void clear() {
+            if (count != 0) {
+                std::fill(entries.begin(), entries.end(), Entry{EmptyKey, 0});
+                count = 0;
+            }
+        }
+        void Set(u64 key, u64 position) {
+            if ((count + 1) * 2 > entries.size()) [[unlikely]] {
+                Grow();
+            }
+            for (size_t index = Hash(key) & mask;; index = (index + 1) & mask) {
+                Entry& entry = entries[index];
+                if (entry.key == key) {
+                    entry.position = position;
+                    return;
+                }
+                if (entry.key == EmptyKey) {
+                    entry = {key, position};
+                    ++count;
+                    return;
+                }
+            }
+        }
+        /// The position noted to `key`, or null.
+        [[nodiscard]] const u64* Find(u64 key) const {
+            if (count == 0) {
+                return nullptr;
+            }
+            for (size_t index = Hash(key) & mask;; index = (index + 1) & mask) {
+                const Entry& entry = entries[index];
+                if (entry.key == key) {
+                    return &entry.position;
+                }
+                if (entry.key == EmptyKey) {
+                    return nullptr;
+                }
+            }
+        }
+
+    private:
+        /// Slots are device addresses >> 4: never all ones.
+        static constexpr u64 EmptyKey = ~u64{0};
+        struct Entry {
+            u64 key;
+            u64 position;
+        };
+        [[nodiscard]] static size_t Hash(u64 key) {
+            const u64 mixed = key * 0x9e3779b97f4a7c15ULL;
+            return static_cast<size_t>(mixed ^ (mixed >> 29));
+        }
+        void Grow() {
+            std::vector<Entry> old = std::move(entries);
+            entries.assign(old.empty() ? size_t{1024} : old.size() * 2, Entry{EmptyKey, 0});
+            mask = entries.size() - 1;
+            count = 0;
+            for (const Entry& entry : old) {
+                if (entry.key != EmptyKey) {
+                    Set(entry.key, entry.position);
+                }
+            }
+        }
+        std::vector<Entry> entries;
+        size_t mask{};
+        size_t count{};
+    };
+    AsyncWriteTable async_writes; ///< Front: 16-byte slot -> ring position
 
     static constexpr size_t RingWords = size_t{1} << 20; // 8 MiB
     static constexpr size_t RingMask = RingWords - 1;
@@ -1130,7 +1205,73 @@ private:
     };
     /// Ranged writes kept before the oldest counts for every read again (EDEN_NX2_RANGED_MAX).
     static size_t MaxRangedWrites();
-    std::deque<RangedWrite> ranged_writes;
+    /// ranged_writes' storage, in send order as the deque it replaces: a ring of slots whose word
+    /// vectors are cleared when a slot is reused, never freed (the deque destroyed one vector per
+    /// upload and built a new one: ~35 ms/s of the front in vector and deque allocations,
+    /// fable_answer_regression_2 4.3). Sized to MaxRangedWrites() (RangeLastWrite never holds
+    /// more), grown like a deque past it. A slot's vector over 64 KiB is freed on reuse.
+    class RangedRing {
+    public:
+        [[nodiscard]] bool empty() const {
+            return count == 0;
+        }
+        [[nodiscard]] size_t size() const {
+            return count;
+        }
+        /// Oldest first: 0 is the oldest, size() - 1 the newest.
+        [[nodiscard]] RangedWrite& operator[](size_t index) {
+            return slots[(head + index) & mask];
+        }
+        [[nodiscard]] const RangedWrite& operator[](size_t index) const {
+            return slots[(head + index) & mask];
+        }
+        [[nodiscard]] RangedWrite& front() {
+            return slots[head];
+        }
+        [[nodiscard]] RangedWrite& back() {
+            return (*this)[count - 1];
+        }
+        [[nodiscard]] const RangedWrite& back() const {
+            return (*this)[count - 1];
+        }
+        void pop_front() {
+            head = (head + 1) & mask;
+            --count;
+        }
+        /// As emplace_back(RangedWrite{position, begin, end, method, 0, {}}).
+        RangedWrite& push_back(u64 position, GPUVAddr begin, GPUVAddr end, u32 method) {
+            if (count == slots.size()) [[unlikely]] {
+                Grow();
+            }
+            RangedWrite& write = slots[(head + count) & mask];
+            ++count;
+            write.position = position;
+            write.begin = begin;
+            write.end = end;
+            write.method = method;
+            write.space = 0;
+            if (write.data.capacity() > MaxKeptWords) [[unlikely]] {
+                std::vector<u32>{}.swap(write.data);
+            } else {
+                write.data.clear();
+            }
+            return write;
+        }
+        /// Empties the ring; the slots keep their vectors.
+        void clear() {
+            head = 0;
+            count = 0;
+        }
+
+    private:
+        static constexpr size_t MaxKeptWords = 16384;
+        void Grow();
+        std::vector<RangedWrite> slots;
+        size_t mask{};
+        size_t head{};
+        size_t count{};
+    };
+    RangedRing ranged_writes;
     struct QueuedRelease {
         u64 position;
         u64 device;
