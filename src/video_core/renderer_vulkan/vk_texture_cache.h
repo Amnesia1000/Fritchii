@@ -10,6 +10,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <unordered_set>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -451,7 +452,16 @@ public:
         vk::Image image;
         u64 bytes;
         u64 frame;
+        bool proven; ///< Its key was taken from the pool before (EXP65)
     };
+    /// EXP65 (live, 0 = off): pooled images whose exact create info was never taken back leave
+    /// after this many frames instead of ImagePoolMaxFrames. OoT sizes per-NPC depth targets by
+    /// screen bounds, so their dims rarely repeat; they filled the pool to its cap (~500 MiB held,
+    /// ~1,000 evicted a 600 frames) and device memory grew through an NPC pass, with driver paging
+    /// at bind (1-130 ms binds; fable_answer_npcdips_2).
+    [[nodiscard]] static u64 ImagePoolKeyHash(const ImagePoolKey& key) noexcept;
+    std::unordered_set<u64> image_pool_proven;
+    u64 image_pool_unproven_evicted{};
     static constexpr u64 ImagePoolMaxBytes = u64{512} << 20;
     /// EXP42=2 pools the big dedicated render targets too (a 2560x1440 one is ~30 MiB): 512 MiB
     /// held ~17 of them and evicted 1,150-1,400 images a 600 frames in Castle Town (2026-11-10).

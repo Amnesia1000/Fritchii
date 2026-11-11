@@ -2950,6 +2950,7 @@ vk::Image TextureCacheRuntime::TakePooledImage(const ImagePoolKey& key) {
             continue;
         }
         vk::Image image = std::move(it->image);
+        image_pool_proven.insert(ImagePoolKeyHash(key));
         image_pool_bytes -= it->bytes;
         image_pool.erase(std::next(it).base());
         ++image_pool_taken;
@@ -2968,10 +2969,33 @@ void TextureCacheRuntime::PoolImage(const ImagePoolKey& key, vk::Image image, u6
         .image = std::move(image),
         .bytes = bytes,
         .frame = image_pool_frame,
+        .proven = image_pool_proven.contains(ImagePoolKeyHash(key)),
     });
     image_pool_bytes += bytes;
     ++image_pool_given;
     TrimImagePool(ImagePoolCap());
+}
+
+u64 TextureCacheRuntime::ImagePoolKeyHash(const ImagePoolKey& key) noexcept {
+    u64 hash = 0xcbf29ce484222325ULL;
+    const auto mix = [&hash](u64 value) {
+        hash ^= value;
+        hash *= 0x100000001b3ULL;
+    };
+    mix(key.flags);
+    mix(key.type);
+    mix(key.format);
+    mix(key.width);
+    mix(key.height);
+    mix(key.depth);
+    mix(key.levels);
+    mix(key.layers);
+    mix(key.samples);
+    mix(key.tiling);
+    mix(key.usage);
+    mix(reinterpret_cast<uintptr_t>(key.view_formats));
+    mix(key.view_format_count);
+    return hash;
 }
 
 u64 TextureCacheRuntime::ImagePoolCap() {
@@ -3088,14 +3112,32 @@ void TextureCacheRuntime::TickFrame() {
             image_pool.pop_front();
             ++image_pool_evicted;
         }
+        if (const int unproven_frames = VideoCore::Nx2Debug::Experiment(65); unproven_frames > 0) {
+            // Oldest first; proven entries stay for ImagePoolMaxFrames as before.
+            for (auto it = image_pool.begin(); it != image_pool.end();) {
+                if (image_pool_frame - it->frame <= static_cast<u64>(unproven_frames)) {
+                    break;
+                }
+                if (it->proven) {
+                    ++it;
+                    continue;
+                }
+                image_pool_bytes -= it->bytes;
+                it = image_pool.erase(it);
+                ++image_pool_evicted;
+                ++image_pool_unproven_evicted;
+            }
+        }
         if (image_pool_frame % 600 == 0 &&
             (pool_switch != 0 || image_pool_taken + image_pool_given != 0)) {
             LOG_INFO(Render_Vulkan,
                      "Image pool (EXP42) last 600 frames: {} taken, {} missed, {} pooled, {} "
-                     "evicted; holds {} images, {} MiB",
+                     "evicted ({} never-taken shapes aged out, EXP65={}); holds {} images, {} MiB",
                      image_pool_taken, image_pool_missed, image_pool_given, image_pool_evicted,
+                     image_pool_unproven_evicted, VideoCore::Nx2Debug::Experiment(65),
                      image_pool.size(), image_pool_bytes >> 20);
             image_pool_taken = image_pool_missed = image_pool_given = image_pool_evicted = 0;
+            image_pool_unproven_evicted = 0;
         }
     }
     while (!pending_byte_addressed_shadows.empty() &&
