@@ -2832,10 +2832,13 @@ void BufferCache<P>::BindHostGraphicsStorageBuffers(size_t stage) {
     // EDEN_NX2_GPU_PROFILE=2: what each binding costs (zones "storage synchronize" and "storage
     // written marks" under "stage storage buffers", and the storage fine counters).
     const bool fine = Nx2Profile::Fine();
+    // Both on by default since 2026-11-11: verify modes (=2) found 0 differences in ~14M checked
+    // syncs each at the market, waterfall, Lost Woods and the Stalchild fight; bind stage buffers
+    // 136 -> 115 ms/s on the back with both. =0 turns each off.
     // EDEN_NX2_STORAGE_SYNC_SCAN: the synchronizes below walk only the tracker words that hold
     // something to upload or re-protect.
     storage_sync_scan = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_storage_sync_scan,
-                                                         "EDEN_NX2_STORAGE_SYNC_SCAN");
+                                                         "EDEN_NX2_STORAGE_SYNC_SCAN", 1);
     SCOPE_EXIT {
         storage_sync_scan = 0;
     };
@@ -2844,7 +2847,7 @@ void BufferCache<P>::BindHostGraphicsStorageBuffers(size_t stage) {
     // only behind a walk that leaves the range clean from the words themselves (the full walk
     // or the scanned one, not the CleanWords walk).
     const int memo_mode = VideoCore::Nx2Debug::SwitchValue(
-        VideoCore::Nx2Debug::g_storage_sync_memo, "EDEN_NX2_STORAGE_SYNC_MEMO");
+        VideoCore::Nx2Debug::g_storage_sync_memo, "EDEN_NX2_STORAGE_SYNC_MEMO", 1);
     const bool sync_memo = memo_mode != 0 && !HotPagesOn() &&
                            (storage_sync_scan == 1 || !Nx2Perf::On(Nx2Perf::Opt::CleanWords));
     ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 index) {
@@ -3020,7 +3023,7 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
         compute_dirty_walk != 0
             ? 0
             : VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_storage_sync_scan,
-                                               "EDEN_NX2_STORAGE_SYNC_SCAN");
+                                               "EDEN_NX2_STORAGE_SYNC_SCAN", 1);
     SCOPE_EXIT {
         count_compute_sync = false;
         compute_dirty_walk = 0;
