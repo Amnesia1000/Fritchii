@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <span>
 #include "common/container/unordered_map.h"
+#include "common/hash.h"
 #include <variant>
 #include <vector>
 
@@ -104,10 +105,11 @@ struct DefTable {
     }
 
     const IR::Value& Def(IR::Block* block, GotoVariable variable) {
-        return goto_vars[variable.index][block];
+        const auto it{goto_vars.find({block, variable.index})};
+        return it != goto_vars.end() ? it->second : empty;
     }
     void SetDef(IR::Block* block, GotoVariable variable, const IR::Value& value) {
-        goto_vars[variable.index].insert_or_assign(block, value);
+        goto_vars.insert_or_assign({block, variable.index}, value);
     }
 
     const IR::Value& Def(IR::Block* block, IndirectBranchVariable) {
@@ -182,8 +184,10 @@ struct DefTable {
 
     const bool in_blocks{SsaBlockValues()};
     std::array<ValueMap, IR::NUM_USER_PREDS> preds;
-    // TODO: Requires stable iterators
-    std::unordered_map<u32, ValueMap> goto_vars;
+    // Goto definitions are copied out as soon as they are read, so they need no stable
+    // references: one flat map for all of them.
+    Common::unordered_map<std::pair<IR::Block*, u32>, IR::Value, Common::PairHash> goto_vars;
+    const IR::Value empty{};
     ValueMap indirect_branch_var;
     ValueMap zero_flag;
     ValueMap sign_flag;
