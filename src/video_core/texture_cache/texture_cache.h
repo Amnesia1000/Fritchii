@@ -2069,6 +2069,37 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
     if (images.empty()) {
         return;
     }
+    // EDEN_NX2_FLUSH_AREA_LOG=1: image downloads that wait for the GPU (first ones, then a count
+    // every 10 s).
+    static const bool image_flush_log = std::getenv("EDEN_NX2_FLUSH_AREA_LOG") != nullptr;
+    if (image_flush_log) {
+        static int logged = 0;
+        static u64 count = 0, bytes = 0;
+        static auto last = std::chrono::steady_clock::now();
+        for (const ImageId id : images) {
+            const ImageBase& image = slot_images[id];
+            ++count;
+            bytes += image.unswizzled_size_bytes;
+            if (logged < 32) {
+                ++logged;
+                LOG_INFO(HW_GPU,
+                         "Image flush: read [{:#x} +{:#x}) downloads image cpu={:#x} gpu={:#x} "
+                         "format={} {}x{}x{} levels={} layers={}",
+                         cpu_addr, size, image.cpu_addr, image.gpu_addr,
+                         static_cast<u32>(image.info.format), image.info.size.width,
+                         image.info.size.height, image.info.size.depth,
+                         image.info.resources.levels, image.info.resources.layers);
+            }
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last > std::chrono::seconds(10)) {
+            LOG_INFO(HW_GPU, "Image flush: {} image downloads, {} KiB in 10 s", count,
+                     bytes / 1024);
+            count = 0;
+            bytes = 0;
+            last = now;
+        }
+    }
     std::ranges::sort(images, [this](ImageId lhs, ImageId rhs) {
         return slot_images[lhs].modification_tick < slot_images[rhs].modification_tick;
     });
@@ -2137,6 +2168,19 @@ std::optional<VideoCore::RasterizerDownloadArea> TextureCache<P>::GetFlushArea(D
             image_view.flags |= ImageViewFlagBits::PreemtiveDownload;
         }
         area->preemtive &= image.info.forced_flushed;
+        // EDEN_NX2_FLUSH_AREA_LOG=1: which CPU reads turn an image into a per-bind download.
+        static const bool flush_area_log = std::getenv("EDEN_NX2_FLUSH_AREA_LOG") != nullptr;
+        static int flush_area_logged = 0;
+        if (flush_area_log && !image.info.forced_flushed && flush_area_logged < 64) {
+            ++flush_area_logged;
+            LOG_INFO(HW_GPU,
+                     "Flush area: CPU read [{:#x} +{:#x}) marks image cpu={:#x}..{:#x} gpu={:#x} "
+                     "format={} {}x{}x{} levels={} layers={} pitch_linear={}",
+                     cpu_addr, size, image.cpu_addr, image.cpu_addr_end, image.gpu_addr,
+                     static_cast<u32>(image.info.format), image.info.size.width,
+                     image.info.size.height, image.info.size.depth, image.info.resources.levels,
+                     image.info.resources.layers, image.info.type == ImageType::Linear);
+        }
         image.info.forced_flushed = true;
         if ((image.relocation_guard_noted & GuardCpuRead) == 0 && RelocationShaped(image.info)) {
             NoteRelocationGuard(image, GuardCpuRead);
