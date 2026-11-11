@@ -22,6 +22,14 @@
 /// Without the server nothing is posted and the per-frame cost is one relaxed atomic load.
 namespace VideoCore::Nx2Debug {
 
+/// Bumped by every store a live switch or experiment can take (the debug server's `switch`,
+/// LoadExperiments, a switch's first read in SwitchValue). Hot paths keep what they derive from
+/// the switches and look again only when this moved (Maxwell3D::FrontRunMacro's feature byte).
+inline std::atomic<u32> g_switch_generation{0};
+inline void BumpSwitchGeneration() {
+    g_switch_generation.fetch_add(1, std::memory_order_release);
+}
+
 /// EXPERIMENT (not for nx2): EDEN_NX2_DMA_WAIT_WRITERS, read at startup and settable live by the
 /// debug server's `switch` method, so one session can A/B it.
 [[nodiscard]] inline int EnvSwitch(const char* name) {
@@ -36,7 +44,9 @@ namespace VideoCore::Nx2Debug {
     if (current < 0) [[unlikely]] {
         int unset = -1;
         const int initial = std::getenv(name) != nullptr ? EnvSwitch(name) : fallback;
-        value.compare_exchange_strong(unset, initial, std::memory_order_relaxed);
+        if (value.compare_exchange_strong(unset, initial, std::memory_order_relaxed)) {
+            BumpSwitchGeneration();
+        }
         current = value.load(std::memory_order_relaxed);
     }
     return current;
@@ -482,6 +492,7 @@ inline void LoadExperiments() {
             }
         }
         g_experiments_loaded.store(true, std::memory_order_release);
+        BumpSwitchGeneration();
         return true;
     }();
     static_cast<void>(loaded);

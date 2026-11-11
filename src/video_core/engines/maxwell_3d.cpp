@@ -1147,6 +1147,14 @@ struct Maxwell3D::FrontState {
     Regs::ShadowRamControl control{};
     u32 executing_macro{};
     std::vector<u32> parameters;
+    /// Which FrontRunMacro body runs (Fable's feature byte, fable_answer_regression_2 3.1): 0 =
+    /// v5.7's (FrontRunMacroPlain); bit 0 EXP53, 1 EDEN_NX2_OOT_MACROS, 2 EDEN_NX2_FOLD_INSTANCE,
+    /// 3 EDEN_NX2_DRAW_PACKET = FrontRunMacroFeatures. Refreshed when
+    /// Nx2Debug::g_switch_generation moved since switches_seen, and every 1024 calls.
+    u8 macro_features{};
+    bool macro_features_logged{};
+    u32 switches_seen{~u32{0}};
+    u32 macro_calls{};
     /// EXP53: per macro, 0 unknown, 1 a render-enable predicate, 2 something else.
     std::vector<u8> predicate_macros;
     u64 predicate_generation{~u64{0}};
@@ -1488,6 +1496,17 @@ bool FrontVerifyEnabled() {
     static const bool verify = std::getenv("EDEN_NX2_SPLIT_VERIFY") != nullptr;
     return verify;
 }
+
+// EDEN_NX2_MACRO_TRACE=<method>: the first 8 calls of that macro (with a parameter other than 0),
+// parameters and writes, counted across both FrontRunMacro bodies.
+u32 MacroTraced() {
+    static const u32 traced = [] {
+        const char* value = std::getenv("EDEN_NX2_MACRO_TRACE");
+        return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 16)) : 0U;
+    }();
+    return traced;
+}
+u32 g_macro_traced_calls{};
 
 // Methods whose execution on the back writes guest memory (inline uploads, reports).
 bool WritesGuestMemory(u32 method) {
@@ -2072,6 +2091,56 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
 
 void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
                               FrontState& fs) {
+    // Fable's feature byte (fable_answer_regression_2 3.1): with every macro switch off, v5.7's
+    // body and emit, without the per-call switch reads, slot lookup, predicate test, fold and
+    // packet setup and report tick the switches added (FrontRunMacro itself 4 -> 17 ns a call,
+    // the emit 1.4 -> 3.7 ns a write in the 5.7 vs HEAD sampler pair). The features body reads
+    // the switches per call as before, so turning one off is exact at once; turning one on
+    // bumps g_switch_generation, seen at the next call.
+    if (fs.switches_seen !=
+            VideoCore::Nx2Debug::g_switch_generation.load(std::memory_order_relaxed) ||
+        (++fs.macro_calls & 1023) == 0) [[unlikely]] {
+        FrontRefreshSwitches(fs);
+    }
+    if (fs.macro_features == 0) [[likely]] {
+        FrontRunMacroPlain(system, split, fs);
+        return;
+    }
+    FrontRunMacroFeatures(system, split, fs);
+}
+
+void Maxwell3D::FrontRefreshSwitches(FrontState& fs) {
+    namespace Debug = VideoCore::Nx2Debug;
+    // The generation first: a switch stored after this load bumps it again, so the next call
+    // refreshes once more (the SwitchValue first reads below do that once too).
+    const u32 generation = Debug::g_switch_generation.load(std::memory_order_acquire);
+    u8 features = 0;
+    if (Debug::Experiment(53) != 0) {
+        features |= 1;
+    }
+    if (Debug::SwitchValue(Debug::g_oot_macros, "EDEN_NX2_OOT_MACROS") != 0) {
+        features |= 2;
+    }
+    if (Debug::SwitchValue(Debug::g_fold_instance, "EDEN_NX2_FOLD_INSTANCE") != 0) {
+        features |= 4;
+    }
+    if (Debug::SwitchValue(Debug::g_draw_packet, "EDEN_NX2_DRAW_PACKET") != 0) {
+        features |= 8;
+    }
+    if (!fs.macro_features_logged || features != fs.macro_features) {
+        fs.macro_features_logged = true;
+        LOG_INFO(HW_GPU,
+                 "Front macro switches: features={:#x} (EXP53, OOT_MACROS, FOLD_INSTANCE, "
+                 "DRAW_PACKET bits), generation {}: {} body",
+                 features, generation, features == 0 ? "plain (v5.7)" : "features");
+    }
+    fs.macro_features = features;
+    fs.switches_seen = generation;
+}
+
+void Maxwell3D::FrontRunMacroPlain(Core::System& system, VideoCommon::GpuSplit& split,
+                                   FrontState& fs) {
+    // v5.7's (52317bf0e5) FrontRunMacro, verbatim but for the shared trace counter.
     const u32 method = fs.executing_macro;
     fs.executing_macro = 0;
     auto& engine = GetNativeMacroEngine();
@@ -2079,14 +2148,83 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     const u32 start = positions[((method - MacroRegistersStart) >> 1) % positions.size()];
     VideoCommon::Nx2Profile::CountMethod(method, false);
     // EDEN_NX2_MACRO_TRACE=<method>: the first calls of that macro, parameters and writes.
-    static const u32 traced = [] {
-        const char* value = std::getenv("EDEN_NX2_MACRO_TRACE");
-        return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 16)) : 0U;
-    }();
-    static u32 traced_calls{};
+    const u32 traced = MacroTraced();
     const bool trace = traced != 0 && method == traced &&
                        std::ranges::any_of(fs.parameters, [](u32 p) { return p != 0; }) &&
-                       traced_calls++ < 8;
+                       g_macro_traced_calls++ < 8;
+    std::string trace_text;
+    if (trace) [[unlikely]] {
+        trace_text = fmt::format("3D macro {:#x} start {:#x} params", traced, start);
+        for (const u32 p : fs.parameters) {
+            trace_text += fmt::format(" {:x}", p);
+        }
+        trace_text += " writes";
+    }
+    {
+        VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
+        engine.native_interpreter.active_dram = &native_data_ram;
+        const auto parameter_count = fs.parameters.size();
+        const auto read = [&fs](u32 address) {
+            return address < Regs::NUM_REGS ? fs.regs[address] : 0U;
+        };
+        const auto emit = [&](u32 address, u32 value) {
+            if (trace) [[unlikely]] {
+                trace_text += fmt::format(" {:x}={:x}", address, value);
+            }
+            if (address >= MacroRegistersStart) {
+                return false;
+            }
+            FrontWrite(split, fs, address, value, true, true);
+            // MME_DMA_READ (into data RAM) and MME_DMA_READ_FIFOED (into the load FIFO).
+            if (address == 0x157 || address == 0x158) {
+                FrontDmaRead(split, fs, method, address, value);
+            }
+            return true;
+        };
+#ifdef ARCHITECTURE_x86_64
+        if (!engine.native_jit) {
+            engine.native_jit = std::make_shared<TuringMacroJit>();
+        }
+        engine.native_jit->Prepare(engine.native_code, engine.native_code_generation);
+        const auto result = engine.native_jit->Execute(
+            start, fs.parameters, std::span<u32>{native_data_ram}, read, emit);
+#else
+        const auto result =
+            engine.native_interpreter.Execute(engine.native_code, start, fs.parameters, read, emit);
+#endif
+        if (!result.success) {
+            engine.native_execution_failed = true;
+            LOG_ERROR(HW_GPU, "Native MME (split front) failed: start={:#x}, consumed={}/{}, error={}",
+                      start, result.consumed, parameter_count, result.error);
+        }
+    }
+    if (trace) [[unlikely]] {
+        LOG_INFO(HW_GPU, "{}", trace_text);
+    }
+    fs.parameters.clear();
+    if (fs.draw_pending) {
+        fs.draw_pending = false;
+        split.Defer([this, system_ptr = &system] { FinishFrontMacro(*system_ptr); },
+                    VideoCommon::GpuSplit::Effect::Gpu);
+    }
+    if (FrontVerifyEnabled() && (++fs.calls & 4095) == 0) [[unlikely]] {
+        FrontVerify(split, fs);
+    }
+}
+
+void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSplit& split,
+                                      FrontState& fs) {
+    const u32 method = fs.executing_macro;
+    fs.executing_macro = 0;
+    auto& engine = GetNativeMacroEngine();
+    const auto positions = GetNativeMacroPositions();
+    const u32 start = positions[((method - MacroRegistersStart) >> 1) % positions.size()];
+    VideoCommon::Nx2Profile::CountMethod(method, false);
+    // EDEN_NX2_MACRO_TRACE=<method>: the first calls of that macro, parameters and writes.
+    const u32 traced = MacroTraced();
+    const bool trace = traced != 0 && method == traced &&
+                       std::ranges::any_of(fs.parameters, [](u32 p) { return p != 0; }) &&
+                       g_macro_traced_calls++ < 8;
     std::string trace_text;
     if (trace) [[unlikely]] {
         trace_text = fmt::format("3D macro {:#x} start {:#x} params", traced, start);
@@ -2106,7 +2244,8 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     // The slot's OoT replacement (macro_hle_oot.h, from Skitchii (skolvolt/Lichii) 1.3
     // e8a0621152): the hash of the code at the slot's start, found again when the code or the
     // start changed, as Skitchii's FrontRunMacro does. Each slot is logged once ("OoT macro
-    // slot") so the hashes of the running game's macros can be checked against the table.
+    // slot") so the hashes of the running game's macros can be checked against the table. Only
+    // in this body: with no macro switch on, nothing needs the slots (FrontRunMacroPlain).
     OotMacros::Id oot = OotMacros::Id::None;
     if (const size_t slot = ((method - MacroRegistersStart) >> 1) % positions.size();
         slot < FrontState::MacroSlots) [[likely]] {

@@ -472,6 +472,7 @@ json SetSwitch(ToolState&, const json& params) {
     const int previous = value->load(std::memory_order_relaxed);
     if (params.contains("value")) {
         value->store(params.at("value").get<int>(), std::memory_order_relaxed);
+        VideoCore::Nx2Debug::BumpSwitchGeneration();
     }
     return {{"name", name}, {"previous", previous}, {"value", value->load()}};
 }
