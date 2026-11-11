@@ -58,6 +58,15 @@ inline std::atomic<u32> g_hot_page_epoch{0};
     return allowed && VideoCore::Nx2Debug::Experiment(48) != 0;
 }
 
+/// HotPagesEnabled() as of the last BufferCache::TickFrame, which refreshes it with the epoch: the
+/// tracker walks test this one relaxed load instead of a guarded static and two atomics per walk
+/// (a live EXP48 toggle applies from the next frame).
+inline std::atomic<bool> g_hot_pages_on{false};
+
+[[nodiscard]] inline bool HotPagesOn() {
+    return g_hot_pages_on.load(std::memory_order_relaxed);
+}
+
 template <class DeviceTracker, size_t stack_words, size_t size_bytes>
 struct WordManager {
     using CollectedRanges = std::vector<std::pair<VAddr, size_t>>;
@@ -162,35 +171,28 @@ struct WordManager {
     }
 
     void ChangeRegionState(Type type, bool enable, u64 dirty_addr, u64 size) noexcept {
-        const bool hot_pages = HotPagesEnabled();
-        if (hot_pages) {
+        // EXP48 off (the default): the walk without a hot-page span or branch (the code before
+        // d20c32704c).
+        if (HotPagesOn()) [[unlikely]] {
+            ChangeRegionStateImpl<true>(type, enable, dirty_addr, size);
+        } else {
+            ChangeRegionStateImpl<false>(type, enable, dirty_addr, size);
+        }
+    }
+
+    template <bool hot_pages>
+    void ChangeRegionStateImpl(Type type, bool enable, u64 dirty_addr, u64 size) noexcept {
+        if constexpr (hot_pages) {
             RefreshHotEpoch();
         }
-        std::span<u64> hot_words = Span(Type::Hot);
-        std::span<u64> flip_words = Span(Type::Flip);
-        std::span<u64> no_hot_words = Span(Type::NoHot);
-        std::span<u64> hot_clean_words = Span(Type::HotClean);
         std::span<u64> state_words = Span(type);
         [[maybe_unused]] std::span<u64> untracked_words = Span(Type::Untracked);
         [[maybe_unused]] std::span<u64> cached_words = Span(Type::CachedCPU);
         CollectedRanges ranges;
         IterateWords(dirty_addr - cpu_addr, size, [&](size_t index, u64 mask) {
-            if (hot_pages && enable) {
-                if (type == Type::CPU) {
-                    // Whoever marks a hot page modified (a write made by the GPU in the middle of
-                    // the frame, a bank re-upload) wants it uploaded again, whatever was sent.
-                    hot_clean_words[index] &= ~mask;
-                    // Tracked pages the CPU just modified: the second time within the reset
-                    // period makes a page hot, unless the GPU ever wrote it.
-                    const u64 flipped = ~untracked_words[index] & mask;
-                    if (flipped != 0) {
-                        hot_words[index] |= flip_words[index] & flipped & ~no_hot_words[index];
-                        flip_words[index] |= flipped;
-                    }
-                } else if (type == Type::GPU) {
-                    no_hot_words[index] |= mask;
-                    hot_words[index] &= ~mask;
-                    hot_clean_words[index] &= ~mask;
+            if constexpr (hot_pages) {
+                if (enable) {
+                    HotPagesOnChange(type, index, mask, untracked_words[index]);
                 }
             }
             if (type == Type::CPU || type == Type::CachedCPU) {
@@ -218,6 +220,31 @@ struct WordManager {
         }
     }
 
+    /// EXP48: the hot-page bookkeeping of a page range marked modified (ChangeRegionState with
+    /// `enable`), before the state words change. `untracked` is the word's Untracked bits then.
+    void HotPagesOnChange(Type type, size_t index, u64 mask, u64 untracked) noexcept {
+        std::span<u64> hot_words = Span(Type::Hot);
+        std::span<u64> flip_words = Span(Type::Flip);
+        std::span<u64> no_hot_words = Span(Type::NoHot);
+        std::span<u64> hot_clean_words = Span(Type::HotClean);
+        if (type == Type::CPU) {
+            // Whoever marks a hot page modified (a write made by the GPU in the middle of
+            // the frame, a bank re-upload) wants it uploaded again, whatever was sent.
+            hot_clean_words[index] &= ~mask;
+            // Tracked pages the CPU just modified: the second time within the reset
+            // period makes a page hot, unless the GPU ever wrote it.
+            const u64 flipped = ~untracked & mask;
+            if (flipped != 0) {
+                hot_words[index] |= flip_words[index] & flipped & ~no_hot_words[index];
+                flip_words[index] |= flipped;
+            }
+        } else if (type == Type::GPU) {
+            no_hot_words[index] |= mask;
+            hot_words[index] &= ~mask;
+            hot_clean_words[index] &= ~mask;
+        }
+    }
+
     /// @brief Loop over each page in the given range.
     /// Turn off those bits and notify the tracker if needed. Call the given function on each turned off range.
     /// @param type            Type of the address
@@ -228,12 +255,23 @@ struct WordManager {
     template <typename Func>
     void ForEachModifiedRange(Type type, bool clear, VAddr query_cpu_range, s64 size, Func&& func) {
         //static_assert(type != Type::Untracked);
-        const bool hot_pages = HotPagesEnabled() && clear && type == Type::CPU;
-        if (hot_pages) {
+        // EXP48 off (the default), or not a CPU clear: the walk without a hot-page span, mask or
+        // branch (the code before d20c32704c).
+        if (clear && type == Type::CPU && HotPagesOn()) [[unlikely]] {
+            ForEachModifiedRangeImpl<true>(type, clear, query_cpu_range, size, func);
+        } else {
+            ForEachModifiedRangeImpl<false>(type, clear, query_cpu_range, size, func);
+        }
+    }
+
+    template <bool hot_pages, typename Func>
+    void ForEachModifiedRangeImpl(Type type, bool clear, VAddr query_cpu_range, s64 size,
+                                  Func& func) {
+        if constexpr (hot_pages) {
             RefreshHotEpoch();
         }
-        std::span<u64> hot_words = Span(Type::Hot);
-        std::span<u64> hot_clean_words = Span(Type::HotClean);
+        [[maybe_unused]] std::span<u64> hot_words = Span(Type::Hot);
+        [[maybe_unused]] std::span<u64> hot_clean_words = Span(Type::HotClean);
         std::span<u64> state_words = Span(type);
         std::span<u64> untracked_words = Span(Type::Untracked);
         std::span<u64> cached_words = Span(Type::CachedCPU);
@@ -249,25 +287,37 @@ struct WordManager {
         IterateWords(offset, size, [&](size_t index, u64 mask) {
             if (type == Type::GPU)
                 mask &= ~untracked_words[index];
-            // Hot pages uploaded since the frame began are not modified again until the next frame.
-            const u64 hot_clean = hot_pages ? hot_words[index] & hot_clean_words[index] & mask : 0;
-            const u64 word = state_words[index] & mask & ~hot_clean;
-            if (clear) {
+            u64 word;
+            if constexpr (hot_pages) {
+                // Only for CPU clears (ForEachModifiedRange's dispatch).
+                // Hot pages uploaded since the frame began are not modified again until the next
+                // frame.
+                const u64 hot_clean = hot_words[index] & hot_clean_words[index] & mask;
+                word = state_words[index] & mask & ~hot_clean;
                 // Hot pages stay modified and untracked: their next use uploads them again,
                 // with no write protection to set and no write fault to take.
-                const u64 hot = hot_pages ? hot_words[index] & mask : 0;
+                const u64 hot = hot_words[index] & mask;
                 hot_clean_words[index] |= hot & word;
                 const u64 clear_mask = mask & ~hot;
-                if (type == Type::CPU || type == Type::CachedCPU) {
-                    CollectChangedRanges(true, index, untracked_words[index], clear_mask, ranges);
-                }
+                CollectChangedRanges(true, index, untracked_words[index], clear_mask, ranges);
                 state_words[index] &= ~clear_mask;
-                if (type == Type::CPU || type == Type::CachedCPU)
-                    untracked_words[index] &= ~clear_mask;
-                if (type == Type::CPU)
-                    cached_words[index] &= ~(word & ~hot);
-                if (type == Type::CPU || type == Type::CachedCPU)
-                    NoteCleanWord(index);
+                untracked_words[index] &= ~clear_mask;
+                cached_words[index] &= ~(word & ~hot);
+                NoteCleanWord(index);
+            } else {
+                word = state_words[index] & mask;
+                if (clear) {
+                    if (type == Type::CPU || type == Type::CachedCPU) {
+                        CollectChangedRanges(true, index, untracked_words[index], mask, ranges);
+                    }
+                    state_words[index] &= ~mask;
+                    if (type == Type::CPU || type == Type::CachedCPU)
+                        untracked_words[index] &= ~mask;
+                    if (type == Type::CPU)
+                        cached_words[index] &= ~word;
+                    if (type == Type::CPU || type == Type::CachedCPU)
+                        NoteCleanWord(index);
+                }
             }
             const size_t base_offset = index * PAGES_PER_WORD;
             IteratePages(word, [&](size_t pages_offset, size_t pages_size) {
