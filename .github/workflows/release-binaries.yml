@@ -473,20 +473,13 @@ jobs:
           export ARCH="$arch"
 
           cat << 'EOF' > "$RUNNER_TEMP/AppRun"
-          #!/bin/bash
-          HERE="$(dirname "$(readlink -f "${0}")")"
-          export PATH="${HERE}/usr/bin:${PATH}"
-          export LD_LIBRARY_PATH="${HERE}/usr/lib:${LD_LIBRARY_PATH:-}"
-          export QT_PLUGIN_PATH="${HERE}/usr/plugins:${QT_PLUGIN_PATH:-}"
-          export QML2_IMPORT_PATH="${HERE}/usr/qml:${QML2_IMPORT_PATH:-}"
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          export QT_PLUGIN_PATH="${HERE}/usr/plugins${QT_PLUGIN_PATH:+:$QT_PLUGIN_PATH}"
           export QT_QPA_PLATFORM_PLUGIN_PATH="${HERE}/usr/plugins/platforms"
 
           if [ -z "${EDEN_NX2_PRECOMPILE:-}" ] && [ ! -e /proc/driver/nvidia/version ]; then
               export EDEN_NX2_PRECOMPILE=2
-          fi
-
-          if [ -n "${WAYLAND_DISPLAY:-}" ]; then
-              export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-wayland;xcb}"
           fi
 
           exec "${HERE}/usr/bin/lichii" "$@"
@@ -496,14 +489,12 @@ jobs:
           mkdir -p AppDir/usr/bin
           cp build/release/bin/nx2_switches.txt AppDir/usr/bin/
 
-          # Deploy Wayland graphics and shell integration plugins for Wayland / OpenGL
-          for wayland_dir in "$QT_ROOT_DIR"/plugins/wayland*; do
-            if [ -d "$wayland_dir" ]; then
-              dest_dir="AppDir/usr/plugins/$(basename "$wayland_dir")"
-              mkdir -p "$dest_dir"
-              cp -a "$wayland_dir"/. "$dest_dir/"
-            fi
-          done
+          # Deploy Wayland graphics integration plugins for Wayland / OpenGL
+          if [ -d "$QT_ROOT_DIR/plugins/wayland-graphics-integration-client" ]; then
+            dest_dir="AppDir/usr/plugins/wayland-graphics-integration-client"
+            mkdir -p "$dest_dir"
+            cp -a "$QT_ROOT_DIR/plugins/wayland-graphics-integration-client"/. "$dest_dir/"
+          fi
 
           "$tools/linuxdeploy-$arch.AppImage" --appdir AppDir \
             --executable build/release/bin/lichii \
