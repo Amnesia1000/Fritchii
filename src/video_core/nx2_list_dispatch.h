@@ -357,6 +357,10 @@ struct GuardStats {
     std::atomic<u64> stale_back_macros{}; ///< Macros sent to the back while they are stale
     std::atomic<u64> draw_resolves{};     ///< The two words read back
     std::atomic<u64> failed{};            ///< Words that could not be read back
+    /// Fritchii (our split's two macro bodies): 3D macro calls while the two registers are stale,
+    /// and of those the ones whose code can read them (run through the read-checking body).
+    std::atomic<u64> stale_calls{};
+    std::atomic<u64> checked_calls{};
 };
 inline GuardStats g_guard;
 
@@ -420,12 +424,14 @@ inline void MaybeLog() {
         LOG_INFO(HW_GPU,
                  "List guard per 2 s: grid: {} 3D macros with data RAM, compute macros {} "
                  "unaffected / {} copies / {} unsafe, {} read back | draws: {} register reads, {} "
-                 "array draws, {} back macros, {} read back | {} failed",
+                 "array draws, {} back macros, {} read back | {} failed | {} 3D macro calls while "
+                 "stale, {} read-checked",
                  take(g_guard.dram_macros), take(g_guard.compute_unaffected),
                  take(g_guard.compute_copies), take(g_guard.compute_unsafe),
                  take(g_guard.grid_resolves), take(g_guard.stale_reads),
                  take(g_guard.stale_draws), take(g_guard.stale_back_macros),
-                 take(g_guard.draw_resolves), take(g_guard.failed));
+                 take(g_guard.draw_resolves), take(g_guard.failed), take(g_guard.stale_calls),
+                 take(g_guard.checked_calls));
     }
 }
 

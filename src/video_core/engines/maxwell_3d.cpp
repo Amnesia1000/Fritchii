@@ -1225,9 +1225,10 @@ struct Maxwell3D::FrontState {
     Nx2ListDispatch::ListReader list_draw_list;
     bool list_draw_indexed{};
     bool in_list_draw{};
-    /// By start in the macro code of data_ram_generation, what the macro's code can do
-    /// (AnalyzeEffects): bit 0 use the data RAM, bit 1 read vertex_buffer.first or count.
-    std::unordered_map<u32, u8> data_ram_macros;
+    /// By start in the macro code of data_ram_generation (an index per instruction), what the
+    /// macro's code can do (AnalyzeEffects): bit 0 use the data RAM, bit 1 read
+    /// vertex_buffer.first or count; 0xff not analyzed yet.
+    std::vector<u8> data_ram_macros;
     u64 data_ram_generation{~u64{0}};
     /// Set by FrontRunMacro for one call of FrontRunMacroFeatures, whose code can read one of
     /// the two stale registers: check each of its register reads (our macro bodies; the plain
@@ -2574,20 +2575,23 @@ bool Maxwell3D::FrontIsListDrawMacro(FrontState& fs, const MacroEngine& engine, 
 
 u8 Maxwell3D::FrontListGuardEffects(FrontState& fs, const MacroEngine& engine, u32 start) {
     if (fs.data_ram_generation != engine.native_code_generation) {
-        fs.data_ram_macros.clear();
+        fs.data_ram_macros.assign(engine.native_code.size() / 3, u8{0xff});
         fs.data_ram_generation = engine.native_code_generation;
     }
-    const auto [it, inserted] = fs.data_ram_macros.try_emplace(start, u8{3});
-    if (inserted) {
+    if (start >= fs.data_ram_macros.size()) {
+        return u8{3}; // Nothing known: the guard assumes the worst
+    }
+    u8& known = fs.data_ram_macros[start];
+    if (known == 0xff) {
         const auto effects = TuringMacroInterpreter::AnalyzeEffects(
             std::span<const u32>{engine.native_code}, start);
         const bool reads_list_draw =
             !effects.registers_read_known ||
             std::ranges::binary_search(effects.registers_read, Nx2ListDraw::VertexFirst) ||
             std::ranges::binary_search(effects.registers_read, Nx2ListDraw::VertexCount);
-        it->second = static_cast<u8>((effects.data_ram ? 1 : 0) | (reads_list_draw ? 2 : 0));
+        known = static_cast<u8>((effects.data_ram ? 1 : 0) | (reads_list_draw ? 2 : 0));
     }
-    return it->second;
+    return known;
 }
 
 bool Maxwell3D::FrontMacroUsesDataRam(FrontState& fs, const MacroEngine& engine, u32 start) {
@@ -2613,7 +2617,17 @@ bool Maxwell3D::FrontListGuard(VideoCommon::GpuSplit& split, FrontState& fs) {
     }
     // A macro whose code can read vertex_buffer.first or count while a list draw left them with
     // their old values: its reads are checked one by one (FrontRunMacroFeatures).
-    return fs.list_draw_stale != 0 && (FrontListGuardEffects(fs, engine, start) & 2) != 0;
+    const bool checked =
+        fs.list_draw_stale != 0 && (FrontListGuardEffects(fs, engine, start) & 2) != 0;
+    if (fs.list_draw_stale != 0 && Nx2ListDraw::Diagnostics()) [[unlikely]] {
+        // EDEN_NX2_LIST_DIAG: how much of the macro traffic runs while the registers are stale,
+        // and how much of it goes through the read-checking body.
+        Nx2ListDispatch::Count(Nx2ListDispatch::g_guard.stale_calls);
+        if (checked) {
+            Nx2ListDispatch::Count(Nx2ListDispatch::g_guard.checked_calls);
+        }
+    }
+    return checked;
 }
 
 void Maxwell3D::FrontNoteListDrawWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 method) {
