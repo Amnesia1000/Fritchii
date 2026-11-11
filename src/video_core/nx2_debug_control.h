@@ -104,6 +104,23 @@ inline std::atomic<int> g_runahead{-1};
 /// EDEN_NX2_RUNAHEAD_MS (live, default 16): how far the back may lag the oldest early answer.
 inline std::atomic<int> g_runahead_ms{-1};
 
+/// EDEN_NX2_CB_DIRECT (live, default 1; from Skitchii (skolvolt/Lichii)): a run of constant
+/// buffer words within one device page outside Switch 2 sparse memory is written through one
+/// translation and a memcpy instead of WriteWordsCached's page walk (Maxwell3D::
+/// CallConstBufferWords). Exact: the same bytes and the same accumulated invalidations; 0 = the
+/// page walk.
+inline std::atomic<int> g_cb_direct{-1};
+/// EDEN_NX2_RT_DEPTH_NOUPLOAD (live, bits, default 0; from Skitchii (skolvolt/Lichii)): new
+/// depth/stencil images skip the upload from guest memory when the exact rules (EXP56's clear,
+/// EXP8 bit 2's copies) did not already (TextureCache::JoinImages). 1 = render targets with
+/// nothing to join, 2 = images whose every join copy is GPU-written, 3 = both (Skitchii).
+inline std::atomic<int> g_rt_depth_noupload{-1};
+/// EDEN_NX2_FOLD_INSTANCE (live, default 0; from Skitchii (skolvolt/Lichii)): an instance loop
+/// of Ocarina of Time's instanced draw macros (0xe52, 0xea0 by code hash) does not draw its
+/// first instance alone; the loop's deferred draw covers it (Maxwell3D::FrontRunMacro,
+/// DrawManager::FoldFirstInstance). 1 = on.
+inline std::atomic<int> g_fold_instance{-1};
+
 /// Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP63, live through the debug server:
 /// slots for batches of fixes built together and A/B-tested in one session
 /// (E:\OotRemakeEmulation\work\EXPERIMENTS.md lists which fix uses which slot). 0 = off.
@@ -503,6 +520,15 @@ inline void LoadExperiments() {
     }
     if (name == "EDEN_NX2_RUNAHEAD_MS") {
         return &g_runahead_ms;
+    }
+    if (name == "EDEN_NX2_CB_DIRECT") {
+        return &g_cb_direct;
+    }
+    if (name == "EDEN_NX2_RT_DEPTH_NOUPLOAD") {
+        return &g_rt_depth_noupload;
+    }
+    if (name == "EDEN_NX2_FOLD_INSTANCE") {
+        return &g_fold_instance;
     }
     return nullptr;
 }

@@ -4072,10 +4072,43 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         }
         return std::ranges::all_of(written, [](u8 whole) { return whole != 0; });
     };
+    // EDEN_NX2_RT_DEPTH_NOUPLOAD (live, bits, 0 = off, the default; from Skitchii (skolvolt/Lichii)
+    // 9fb0cdd0a4, texture_cache.h nup_skip_depth_upload): a new depth/stencil image starts without
+    // the upload from guest memory. Guest memory never receives the GPU's depth (no write-back),
+    // so the upload only copies stale bytes; Ocarina of Time makes ~2.5 such targets a frame
+    // (shadow cascades sized anew each frame, 259x259 ... 888x888 D32). Not exact: what the
+    // image holds where the game neither clears nor draws is undefined instead of stale guest
+    // bytes (Skitchii 8fcd85d90b names shadow popping with it), so it comes after the exact
+    // rules: a clear the target follows through IsFullClear (EXP56) and copies that write it
+    // whole (EXP8 bit 2) decide first.
+    // Bit 1 = a render target lookup's new target with nothing to join (no older image to copy).
+    // Bit 2 = a new image whose every join copy comes from a GPU-written image (sampled shadow
+    // maps made for a descriptor shaped unlike the target); texels the copies miss are undefined.
+    // 3 = Skitchii as shipped.
+    const auto depth_noupload = [&] {
+        const int mode = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_rt_depth_noupload,
+                                                          "EDEN_NX2_RT_DEPTH_NOUPLOAD");
+        if (mode == 0) {
+            return false;
+        }
+        const auto type = VideoCore::Surface::GetFormatType(new_info.format);
+        if (type != VideoCore::Surface::SurfaceType::Depth &&
+            type != VideoCore::Surface::SurfaceType::Stencil &&
+            type != VideoCore::Surface::SurfaceType::DepthStencil) {
+            return false;
+        }
+        if (join_copies_to_do.empty()) {
+            return (mode & 1) != 0 && render_target_lookup;
+        }
+        return (mode & 2) != 0 && std::ranges::all_of(join_copies_to_do, [this](const JoinCopy& copy) {
+                   return True(slot_images[copy.id].flags & ImageFlagBits::GpuModified);
+               });
+    };
     const bool clear_skip = overwritten_by_clear();
     // EDEN_NX2_EXP8 bit 2: skip the upload the copies overwrite.
     const bool copy_skip = !clear_skip && (VideoCore::Nx2Debug::Experiment(8) & 2) != 0 &&
                            (overwritten_by_copies() || overwritten_by_layer_copies());
+    const bool depth_skip = !clear_skip && !copy_skip && depth_noupload();
     if (VideoCore::Nx2Debug::Experiment(7) != 0 && new_image.guest_size_bytes >= 1_MiB)
         [[unlikely]] {
         // Why a large new image was (or was not) uploaded from guest memory.
@@ -4098,9 +4131,10 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                         aliases, gpu_written, join_bad_overlap_ids.size(),
                         clearing_render_targets,
                         overwritten_by_copies() || overwritten_by_layer_copies(),
-                        clear_skip  ? "skipped (clear)"
-                        : copy_skip ? "skipped (copies)"
-                                    : "done",
+                        clear_skip   ? "skipped (clear)"
+                        : copy_skip  ? "skipped (copies)"
+                        : depth_skip ? "skipped (depth)"
+                                     : "done",
                         clear_skip || clear_refusal[0] == '\0' ? "" : ", clear refused: ",
                         clear_skip ? "" : clear_refusal);
         }
@@ -4110,8 +4144,9 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         // Stays CpuModified: UpdateRenderTargets' PrepareImage drops the upload only when
         // IsFullClear agrees the clear covers the whole image, and uploads it otherwise.
         runtime.TransitionImageLayout(new_image);
-    } else if (copy_skip) {
-        // As RefreshContents leaves it, with the contents the copies write.
+    } else if (copy_skip || depth_skip) {
+        // As RefreshContents leaves it, with the contents the copies write (depth_skip: and
+        // undefined elsewhere; also when a partial clear creates it, PrepareImage would upload it).
         new_image.flags &= ~ImageFlagBits::CpuModified;
         TrackImage(new_image, new_image_id);
         runtime.TransitionImageLayout(new_image);
@@ -4427,11 +4462,13 @@ ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAdd
     }
     ImageId image_id{};
     bool delete_state = has_deleted_images;
+    render_target_lookup = true; // EDEN_NX2_RT_DEPTH_NOUPLOAD: JoinImages sees a render target
     do {
         has_deleted_images = false;
         image_id = FindOrInsertImage(info, gpu_addr);
         delete_state |= has_deleted_images;
     } while (has_deleted_images);
+    render_target_lookup = false;
     has_deleted_images = delete_state;
     if (!image_id) {
         return NULL_IMAGE_VIEW_ID;

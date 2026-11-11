@@ -89,6 +89,13 @@ enum class Zone : u32 {
     UniformBuffers,  ///< Of bind stage buffers: the uniform buffers
     GeometryBuffers, ///< Of update buffers: index and vertex buffer binds
     StorageBindings, ///< Of read handles: storage buffer addresses from constant buffers
+    // Of bind stage buffers (BufferCache::BindHostStageBuffers): where its ~140 ms/s at the
+    // Castle Town market go. "uniform buffers" keeps the per-slot rest (touch, offset, tracker).
+    UniformBank,     ///< Of uniform buffers: the native 64 KiB bank check (page compares)
+    UniformStream,   ///< Of uniform buffers: small buffers streamed (rebound or copied)
+    UniformClassic,  ///< Of uniform buffers: the host buffer synchronized and bound
+    StageStorage,    ///< Of bind stage buffers: the storage buffers
+    StageTexBuffers, ///< Of bind stage buffers: the texture buffers
     Count,
 };
 
@@ -107,6 +114,8 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "cb bind", "cb upload", "query report", "counter reset", "render enable", "sink",
     "macro end", "draw setup", "draw queries", "tick work", "uniform buffers",
     "geometry buffers", "storage bindings",
+    "uniform bank check", "uniform stream", "uniform classic", "stage storage buffers",
+    "stage texture buffers",
 };
 static_assert(zone_names.back() != nullptr, "a zone without a name");
 

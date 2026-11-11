@@ -705,7 +705,29 @@ void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods,
         ProcessDirtyRegisters(methods[i], ProcessShadowRam(methods[i], arguments[i]));
     }
     const VideoCommon::Nx2Profile::FineScope upload_scope{VideoCommon::Nx2Profile::Zone::CbUpload};
-    memory_manager.WriteWordsCached(address + offset, values.data(), count);
+    const GPUVAddr destination = address + offset;
+    // EDEN_NX2_CB_DIRECT (from Skitchii (skolvolt/Lichii) maxwell_3d.cpp CallConstBufferWords):
+    // what WriteWordsCached does for words within one device page (proven above) outside Switch 2
+    // sparse memory, with one translation (as MemoryManager::Write) instead of WriteBlockImpl's
+    // page walk: the words, then the invalidation accumulated word by word, as WriteWordsCached
+    // accumulates it. While an EXP49 read-back download is in flight, the walk, so its FinishRead
+    // check still runs first. Unmapped: the walk.
+    u8* const pointer =
+        VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_cb_direct, "EDEN_NX2_CB_DIRECT",
+                                         1) != 0 &&
+                VideoCore::g_read_downloads.load(std::memory_order_relaxed) == 0 &&
+                (destination + bytes <= Tegra::g_nx2_sparse_low.load(std::memory_order_relaxed) ||
+                 destination >= Tegra::g_nx2_sparse_high.load(std::memory_order_relaxed))
+            ? memory_manager.GetPointer(destination)
+            : nullptr;
+    if (pointer != nullptr) [[likely]] {
+        std::memcpy(pointer, values.data(), bytes);
+        for (u32 i = 0; i < count; ++i) {
+            memory_manager.AccumulateInvalidation(destination + u64{i} * sizeof(u32), sizeof(u32));
+        }
+    } else {
+        memory_manager.WriteWordsCached(destination, values.data(), count);
+    }
     regs.const_buffer.offset += static_cast<u32>(bytes);
 }
 
@@ -1124,6 +1146,11 @@ struct Maxwell3D::FrontState {
     /// EXP53: per macro, 0 unknown, 1 a render-enable predicate, 2 something else.
     std::vector<u8> predicate_macros;
     u64 predicate_generation{~u64{0}};
+    /// EDEN_NX2_FOLD_INSTANCE: per macro slot, the code generation and start its kind was found
+    /// for, and the kind: 1 an instanced draw macro (FoldLoopMacro), 2 something else.
+    std::vector<u64> fold_generation;
+    std::vector<u32> fold_start;
+    std::vector<u8> fold_kind;
     std::vector<u32> dma_words; ///< FrontDmaReadEarly's words
     u64 calls{};
     /// A method the draw manager handles was sent since the back last ran DrawDeferred: only
@@ -1187,6 +1214,48 @@ struct Maxwell3D::FrontState {
 };
 
 namespace {
+
+// EDEN_NX2_FOLD_INSTANCE. Hash of a Turing MME macro's code: its instructions (three words each)
+// from `start` through the first one with the end bit and its delay slot, at most 1024
+// instructions; FNV-1a over the words, plus the instruction count. Stable across builds. From
+// Skitchii (skolvolt/Lichii) e8a0621152, macro_hle_oot.cpp HashMacro, so its hashes apply.
+u64 HashMacroCode(std::span<const u32> code, u32 start) {
+    constexpr u32 MaxInstructions = 1024;
+    u64 hash = 0xcbf29ce484222325ULL;
+    const auto mix = [&hash](u32 word) {
+        for (u32 byte = 0; byte < 4; ++byte) {
+            hash ^= (word >> (byte * 8)) & 0xff;
+            hash *= 0x100000001b3ULL;
+        }
+    };
+    u32 count = 0;
+    bool end_next = false;
+    for (u32 pc = start; count < MaxInstructions && size_t{pc} * 3 + 2 < code.size(); ++pc) {
+        mix(code[pc * 3]);
+        mix(code[pc * 3 + 1]);
+        mix(code[pc * 3 + 2]);
+        ++count;
+        if (end_next) {
+            break;
+        }
+        // Bit 0 of the instruction's high word: end after the next instruction (delay slot).
+        end_next = (code[pc * 3 + 2] & 1) != 0;
+    }
+    mix(count);
+    return hash;
+}
+
+// Ocarina of Time's instanced indexed draw macros, by code hash (Skitchii macro_hle_oot.cpp/.h:
+// 0xe52 "instanced indexed draw", start 0x1f4, and 0xea0 "with the base in the constant buffer",
+// start 0x1e6). Their code is, for parameters p0 draw.begin, p1 count, p2 instances (p3 first,
+// p4 base vertex, p5 base instance): a few state writes, then p2 times draw.begin, index count,
+// draw.end, the instances after the first with draw.begin's instance id Subsequent (same begin
+// and count each time), then the resets. Skitchii's handlers reproduce the JIT write for write.
+bool IsFoldLoopMacroHash(u64 hash) {
+    return hash == 0xd7011b3ed6907773ULL || hash == 0x38b7414725298d00ULL;
+}
+// Skitchii's handlers run calls with more instances through the JIT (MaxInstances): not folded.
+constexpr u32 FoldMaxInstances = 0x10000;
 
 // EDEN_NX2_SPLIT_VERIFY=1: every 4096 front macro calls, wait for the back and compare the
 // front's registers with the back's (logs and resynchronizes differences).
@@ -1802,6 +1871,40 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     const bool predicate = VideoCore::Nx2Debug::Experiment(53) != 0 &&
                            fs.parameters.size() == 3 && fs.parameters[0] == 0 &&
                            IsPredicateMacro(fs, method);
+    // EDEN_NX2_FOLD_INSTANCE (live, 0 = off, the default; from Skitchii (skolvolt/Lichii)
+    // e8a0621152, macro_hle_oot.h DrawLoop and maxwell_3d.cpp OotContext::FoldFirstInstance):
+    // for a call of an instanced draw macro (IsFoldLoopMacroHash) with 2 or more instances, the
+    // back's draw manager is told before the loop's first draw.end that this instance is the
+    // first of a loop, so it is not drawn alone: the loop's deferred draw (instance_count + 1
+    // from the base instance) covers it. Without it instance 0 is drawn twice.
+    bool fold_pending = false;
+    if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_fold_instance,
+                                         "EDEN_NX2_FOLD_INSTANCE") != 0 &&
+        fs.parameters.size() >= 6 && fs.parameters[2] > 1 &&
+        fs.parameters[2] <= FoldMaxInstances && !positions.empty()) [[unlikely]] {
+        const size_t index = ((method - MacroRegistersStart) >> 1) % positions.size();
+        if (fs.fold_kind.size() != positions.size()) {
+            fs.fold_kind.assign(positions.size(), 0);
+            fs.fold_generation.assign(positions.size(), 0);
+            fs.fold_start.assign(positions.size(), 0);
+        }
+        // Found again when the code or the slot's start changed, as Skitchii's FrontRunMacro.
+        if (fs.fold_kind[index] == 0 || fs.fold_generation[index] != engine.native_code_generation ||
+            fs.fold_start[index] != start) [[unlikely]] {
+            fs.fold_generation[index] = engine.native_code_generation;
+            fs.fold_start[index] = start;
+            const bool loop = IsFoldLoopMacroHash(
+                HashMacroCode(std::span<const u32>{engine.native_code}, start));
+            fs.fold_kind[index] = loop ? 1 : 2;
+            static u32 fold_logged{};
+            if (loop && fold_logged++ < 8) {
+                LOG_INFO(HW_GPU, "Native macro {:#x} (start {:#x}): instanced draw, first "
+                         "instance folded into the loop's draw (EDEN_NX2_FOLD_INSTANCE)",
+                         method, start);
+            }
+        }
+        fold_pending = fs.fold_kind[index] == 1;
+    }
     {
         VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
         engine.native_interpreter.active_dram = &native_data_ram;
@@ -1824,6 +1927,16 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                 FrontWrite(split, fs, address,
                            static_cast<u32>(Regs::RenderEnable::Mode::IfNotEqual), true, true);
                 return true;
+            }
+            if (fold_pending && address == MAXWELL3D_REG_INDEX(draw.end)) [[unlikely]] {
+                // The loop's first draw.end, the macro's first. Only when the back's draw.begin
+                // (the front's copy, after the shadow RAM) holds instance id First: the draw
+                // manager then has no loop open and draws this one alone (DrawMode::General).
+                fold_pending = false;
+                if (((fs.regs[MAXWELL3D_REG_INDEX(draw.begin)] >> 26) & 3) == 0) {
+                    split.Defer([this] { draw_manager.FoldFirstInstance(); },
+                                VideoCommon::GpuSplit::Effect::None);
+                }
             }
             FrontWrite(split, fs, address, value, true, true);
             // MME_DMA_READ (into data RAM) and MME_DMA_READ_FIFOED (into the load FIFO).

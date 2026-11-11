@@ -1136,9 +1136,11 @@ void BufferCache<P>::BindHostStageBuffers(size_t stage) {
         Nx2Profile::FineCounter::StorageBinds,
         static_cast<u64>(std::popcount(channel_state->enabled_storage_buffers[stage])));
     if (channel_state->enabled_storage_buffers[stage] != 0) {
+        const Nx2Profile::FineScope storage_scope{Nx2Profile::Zone::StageStorage};
         BindHostGraphicsStorageBuffers(stage);
     }
     if (channel_state->enabled_texture_buffers[stage] != 0) {
+        const Nx2Profile::FineScope texture_scope{Nx2Profile::Zone::StageTexBuffers};
         BindHostGraphicsTextureBuffers(stage);
     }
 }
@@ -2060,6 +2062,11 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     // would take stay set for the next bind that reads the host buffer.
     const int bank_trims = native_bank_bind ? VideoCore::Nx2Debug::Experiment(26) : 0;
     const bool native_bank = native_bank_bind && !(use_fast_buffer && (bank_trims & 1) != 0);
+    // TEST (EDEN_NX2_GPU_PROFILE=2): the bank check below, only for the binds that run it.
+    std::optional<Nx2Profile::Scope> bank_scope;
+    if (native_bank && Nx2Profile::Fine()) [[unlikely]] {
+        bank_scope.emplace(Nx2Profile::Zone::UniformBank, true, true);
+    }
     // EDEN_NX2_RUNAHEAD: behind the frontier the bank's guest pages may hold the next frame (the
     // chunks put this draw's bytes in the host buffer and the snapshots): compared again at a
     // bind past it (the write flags stay set until then).
@@ -2202,8 +2209,10 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             }
         }
     }
+    bank_scope.reset();
     Nx2Profile::AddFine(Nx2Profile::FineCounter::UniformBytes, size);
     if (use_fast_buffer) {
+        const Nx2Profile::FineScope stream_scope{Nx2Profile::Zone::UniformStream};
         if constexpr (IS_OPENGL) {
             if (runtime.HasFastBufferSubData()) {
                 // Fast path for Nvidia
@@ -2256,6 +2265,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         return;
     }
     Nx2Profile::AddFine(Nx2Profile::FineCounter::UniformCached, 1);
+    const Nx2Profile::FineScope classic_scope{Nx2Profile::Zone::UniformClassic};
     // Classic cached path
     if (SynchronizeBuffer(buffer, device_addr, size)) {
         ++channel_state->uniform_cache_hits[0];
