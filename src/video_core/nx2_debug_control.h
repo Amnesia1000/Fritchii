@@ -160,6 +160,25 @@ inline std::atomic<int> g_bank_slot_stats{-1};
 /// bind of each page takes a new snapshot and marks it changed, as after the 16384-page reset.
 /// 1 = on.
 inline std::atomic<int> g_bank_page_table{-1};
+/// EDEN_NX2_BANK_SLOTS (live, default 0; Hookshot (NotRexed/Hookshot) research idea 1): a bit
+/// mask of constant buffer indices (bit n = cn) whose 64 KiB native bank binds rely on the write
+/// flags alone, for the banks NVN2's driver fills only through the command stream (c0 storage
+/// table, c2 texture handles) or never rewrites (c1 program constants). For those binds, with
+/// EXP9=3 (the default): (a) the "hot" rule (pages that changed lately are compared on every
+/// bind even with no flag set) is dropped, and (b) with EDEN_NX2_BANK_PAGE_TABLE=1 a bind whose
+/// whole range has no collected CPU write, no buffer cache write (our own constant buffer words
+/// among them, at FlushCaching), no recheck pending and no CPU-modified page, with every page
+/// already snapshotted, skips the page loop at once (BufferCache::CheckNativeBankPagesTracked).
+/// The game's own banks (c3+) keep the full check: never set their bits (the white flashes,
+/// d79572d28a). Pick the mask from EDEN_NX2_BANK_SLOT_STATS: indices whose "hot" changes stay 0.
+/// 0 = off. Suggested after that check: 0x7 (c0, c1, c2).
+inline std::atomic<int> g_bank_slots{-1};
+/// EDEN_NX2_BANK_SKIP_VERIFY (live, default 0): with EDEN_NX2_BANK_SLOTS, every bank the skip
+/// passes over and every hot page the slot rule leaves alone is still compared; changes are taken
+/// as before (the page is marked) and counted as "missed", which must stay 0, and pages of a
+/// skipped bank that the page loop finds a reason for are counted as "disagreed" (must stay 0).
+/// Logged every 5 s ("Native bank slot skip"). Costs what the skip saves. 1 = on.
+inline std::atomic<int> g_bank_skip_verify{-1};
 
 /// Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP63, live through the debug server:
 /// slots for batches of fixes built together and A/B-tested in one session
@@ -589,6 +608,12 @@ inline void LoadExperiments() {
     }
     if (name == "EDEN_NX2_BANK_PAGE_TABLE") {
         return &g_bank_page_table;
+    }
+    if (name == "EDEN_NX2_BANK_SLOTS") {
+        return &g_bank_slots;
+    }
+    if (name == "EDEN_NX2_BANK_SKIP_VERIFY") {
+        return &g_bank_skip_verify;
     }
     return nullptr;
 }

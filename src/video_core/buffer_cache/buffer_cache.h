@@ -2408,18 +2408,7 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
     // 2: every page as with 0, counting the changed pages the rules of 1 and 3 would have skipped.
     static_assert(Core::DevicePageFlags::AddressBits >=
                   Tegra::MaxwellDeviceTraits::device_virtual_bits);
-    u64 mapped_size = 0;
-    while (mapped_size < size &&
-           device_memory.template GetPointer<u8>(device_addr + mapped_size) != nullptr) {
-        mapped_size += Core::DEVICE_PAGESIZE - ((device_addr + mapped_size) & Core::DEVICE_PAGEMASK);
-    }
     SelectNativeBankStore();
-    const DAddr first_page = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
-    const DAddr end = device_addr + (std::min<u64>)(mapped_size, size);
-    const bool verify = mode == 2;
-    const bool frame_check = mode != 3;
-    // Most banks have no CPU-modified page: ask per page only when one has.
-    const bool any_cpu_dirty = memory_tracker.IsRegionCpuModified(first_page, end - first_page);
     auto& stats = native_bank_tracked_stats;
     ++stats.binds;
     // EDEN_NX2_BANK_SLOT_STATS (Hookshot research idea 1, step 1): the same counts per constant
@@ -2435,6 +2424,53 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
         ++slot_stats->binds;
         slot_stats->stages |= 1u << stage;
     }
+    // EDEN_NX2_BANK_SLOTS (Hookshot (NotRexed/Hookshot) research idea 1): banks NVN2's driver
+    // writes only through the command stream (c0, c2) or never (c1) change only through writes
+    // that set a flag: our own constant buffer words reach the buffer cache's WriteMemory at
+    // FlushCaching (g_buffer_write_pages), guest CPU writes on tracked pages are collected
+    // (g_collected_write_pages) and untracked ones leave the page CPU-modified. For those slots
+    // the hot rule goes, and a bank with no flag anywhere, no pending recheck, no CPU-modified
+    // page and a snapshot of every page has nothing the page loop would compare: skipped whole.
+    // The game's banks (c3+) keep the loop and the hot rule.
+    const u32 own_slots = static_cast<u32>(
+        VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_bank_slots, "EDEN_NX2_BANK_SLOTS"));
+    const bool own_slot = index < 32 && ((own_slots >> index) & 1) != 0;
+    const bool slot_verify =
+        own_slot && VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_bank_skip_verify,
+                                                     "EDEN_NX2_BANK_SKIP_VERIFY") != 0;
+    bool skip_verify = false;
+    if (own_slot && mode == 3 && native_bank_table_on) {
+        // The whole bound range, page aligned: a superset of what the loop below walks.
+        const DAddr bank_first = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
+        const DAddr bank_end = Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE);
+        const u64 bank_bytes = bank_end - bank_first;
+        if (!Core::g_collected_write_pages.Any(bank_first, bank_bytes) &&
+            !Core::g_buffer_write_pages.Any(bank_first, bank_bytes) &&
+            NativeBankPagesSettled(bank_first, bank_end) &&
+            !memory_tracker.IsRegionCpuModified(bank_first, bank_bytes)) {
+            ++stats.banks_skipped;
+            if (slot_stats != nullptr) [[unlikely]] {
+                ++slot_stats->banks_skipped;
+            }
+            if (!slot_verify) {
+                LogNativeBankTrackedStats(mode);
+                return;
+            }
+            // EDEN_NX2_BANK_SKIP_VERIFY: walk it anyway, comparing every page.
+            skip_verify = true;
+        }
+    }
+    u64 mapped_size = 0;
+    while (mapped_size < size &&
+           device_memory.template GetPointer<u8>(device_addr + mapped_size) != nullptr) {
+        mapped_size += Core::DEVICE_PAGESIZE - ((device_addr + mapped_size) & Core::DEVICE_PAGEMASK);
+    }
+    const DAddr first_page = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
+    const DAddr end = device_addr + (std::min<u64>)(mapped_size, size);
+    const bool verify = mode == 2;
+    const bool frame_check = mode != 3;
+    // Most banks have no CPU-modified page: ask per page only when one has.
+    const bool any_cpu_dirty = memory_tracker.IsRegionCpuModified(first_page, end - first_page);
     // EDEN_NX2_RUNAHEAD: as in the untracked check (BindHostGraphicsUniformBuffer).
     Buffer* const upload_to =
         (trims & 4) != 0 || VideoCommon::Runahead::g_frontier.load(std::memory_order_relaxed) != 0
@@ -2470,6 +2506,10 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
         if (recheck != (collected || written)) {
             SetNativeBankRecheck(ref, page, collected || written);
         }
+        // Changed lately: likely per-draw data, rewritten by paths none of the flags see
+        // (EXP9=2 found ~1 such change in 15 s without this rule). Not for EDEN_NX2_BANK_SLOTS.
+        const bool hot = snapshot.changed_frame != ~u64{0} &&
+                         frame_tick - snapshot.changed_frame < HotFrames;
         NativeBankReason reason = BankNone;
         if (collected) {
             reason = BankCollected;
@@ -2480,23 +2520,37 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
         } else if (any_cpu_dirty &&
                    memory_tracker.IsRegionCpuModified(page, Core::DEVICE_PAGESIZE)) {
             reason = BankCpuDirty;
-        } else if (snapshot.changed_frame != ~u64{0} &&
-                   frame_tick - snapshot.changed_frame < HotFrames) {
-            // Changed lately: likely per-draw data, rewritten by paths none of the flags see
-            // (EXP9=2 found ~1 such change in 15 s without this rule).
+        } else if (hot && !own_slot) {
             reason = BankHot;
         } else if (frame_check && snapshot.checked_frame != frame_tick) {
             reason = BankFrame;
         }
+        if (skip_verify && reason != BankNone) [[unlikely]] {
+            // The whole-bank skip passed over a page the loop has a reason for: must not happen.
+            ++stats.skip_disagreed;
+        }
+        const bool own_hot = reason == BankNone && own_slot && hot;
+        if (own_hot) {
+            ++stats.hot_left;
+            if (slot_stats != nullptr) [[unlikely]] {
+                ++slot_stats->hot_left;
+            }
+        }
+        // EDEN_NX2_BANK_SKIP_VERIFY: what the slot rule left alone is compared all the same.
+        const bool verify_skip = reason == BankNone && (skip_verify || (own_hot && slot_verify));
         if (reason != BankNone) {
             snapshot.checked_frame = frame_tick;
-        } else if (!verify) {
+        } else if (!verify && !verify_skip) {
             ++stats.pages_skipped;
             continue;
         }
-        ++stats.compared[reason];
-        if (slot_stats != nullptr) [[unlikely]] {
-            ++slot_stats->compared[reason];
+        if (verify_skip) {
+            ++stats.skip_verified;
+        } else {
+            ++stats.compared[reason];
+            if (slot_stats != nullptr) [[unlikely]] {
+                ++slot_stats->compared[reason];
+            }
         }
         // EDEN_NX2_EXP26 & 2: an inline SSE2 compare instead of the ucrt memcmp.
         if ((trims & 2) != 0
@@ -2504,9 +2558,14 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
                 : std::memcmp(snapshot.words.data(), guest, Core::DEVICE_PAGESIZE) == 0) {
             continue;
         }
-        ++stats.changed[reason];
-        if (slot_stats != nullptr) [[unlikely]] {
-            ++slot_stats->changed[reason];
+        if (verify_skip) {
+            // Missed by the slot rule: taken as any change is (marked), and counted.
+            ++stats.skip_missed;
+        } else {
+            ++stats.changed[reason];
+            if (slot_stats != nullptr) [[unlikely]] {
+                ++slot_stats->changed[reason];
+            }
         }
         snapshot.changed_frame = frame_tick;
         std::memcpy(snapshot.words.data(), guest, Core::DEVICE_PAGESIZE);
@@ -2515,6 +2574,13 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
     if (uploads.count != 0) {
         FlushNativeBankUploads(buffer, uploads);
     }
+    LogNativeBankTrackedStats(mode);
+}
+
+template <class P>
+void BufferCache<P>::LogNativeBankTrackedStats(int mode) {
+    auto& stats = native_bank_tracked_stats;
+    const bool verify = mode == 2;
     // The clock only every 1,024 binds (~100k binds a second at Castle Town).
     if ((stats.binds & 1023) != 0) {
         return;
@@ -2551,16 +2617,26 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
         const auto& c = s.compared;
         const auto& d = s.changed;
         slot_lines += fmt::format(
-            " | c{} (stages {:#x}): {} binds, {} pages, {} new; compared / changed: collected {} "
-            "/ {}, written {} / {}, recheck {} / {}, CPU-modified {} / {}, hot {} / {}, frame {} "
-            "/ {}, verify only {} / {}",
-            slot, s.stages, s.binds, s.pages, s.pages_new, c[BankCollected], d[BankCollected],
-            c[BankWritten], d[BankWritten], c[BankRecheck], d[BankRecheck], c[BankCpuDirty],
-            d[BankCpuDirty], c[BankHot], d[BankHot], c[BankFrame], d[BankFrame], c[BankNone],
-            d[BankNone]);
+            " | c{} (stages {:#x}): {} binds ({} skipped whole), {} pages, {} new; compared / "
+            "changed: collected {} / {}, written {} / {}, recheck {} / {}, CPU-modified {} / {}, "
+            "hot {} / {} ({} hot left by BANK_SLOTS), frame {} / {}, verify only {} / {}",
+            slot, s.stages, s.binds, s.banks_skipped, s.pages, s.pages_new, c[BankCollected],
+            d[BankCollected], c[BankWritten], d[BankWritten], c[BankRecheck], d[BankRecheck],
+            c[BankCpuDirty], d[BankCpuDirty], c[BankHot], d[BankHot], s.hot_left, c[BankFrame],
+            d[BankFrame], c[BankNone], d[BankNone]);
     }
     if (!slot_lines.empty()) {
         LOG_INFO(HW_GPU, "Native bank slots (EXP9={}, 5 s){}", mode, slot_lines);
+    }
+    // EDEN_NX2_BANK_SLOTS: what the slot rule skipped, and with EDEN_NX2_BANK_SKIP_VERIFY what
+    // comparing it anyway found ("missed" and "disagreed" must stay 0).
+    if (stats.banks_skipped != 0 || stats.hot_left != 0 || stats.skip_verified != 0) {
+        LOG_INFO(HW_GPU,
+                 "Native bank slot skip (BANK_SLOTS={:#x}, 5 s): {} binds skipped whole, {} hot "
+                 "pages not compared; verify: {} compared, {} missed, {} disagreed",
+                 VideoCore::Nx2Debug::g_bank_slots.load(std::memory_order_relaxed),
+                 stats.banks_skipped, stats.hot_left, stats.skip_verified, stats.skip_missed,
+                 stats.skip_disagreed);
     }
     native_bank_slot_stats = {};
     stats = {};
@@ -2686,6 +2762,40 @@ typename BufferCache<P>::NativeBankPage* BufferCache<P>::FindNativeBankSnapshot(
         return nullptr;
     }
     return region->pages[(page >> Core::DEVICE_PAGEBITS) & (NativeBankRegionPages - 1)].get();
+}
+
+template <class P>
+bool BufferCache<P>::NativeBankPagesSettled(DAddr first_page, DAddr end) {
+    if (!native_bank_table_on || !native_bank_regions || first_page >= end ||
+        ((end - 1) >> NativeBankAddressBits) != 0) {
+        return false;
+    }
+    for (DAddr page = first_page; page < end;) {
+        const u64 region_index = page >> NativeBankRegionBits;
+        const NativeBankRegion* const region =
+            region_index == native_bank_last_region_index
+                ? native_bank_last_region
+                : (*native_bank_regions)[region_index].get();
+        if (region == nullptr) {
+            return false;
+        }
+        const DAddr region_end =
+            (std::min<DAddr>)(end, (region_index + 1) << NativeBankRegionBits);
+        u64 slot = (page >> Core::DEVICE_PAGEBITS) & (NativeBankRegionPages - 1);
+        const u64 slot_end = slot + ((region_end - page) >> Core::DEVICE_PAGEBITS);
+        while (slot < slot_end) {
+            const u64 first_bit = slot % 64;
+            const u64 bits = (std::min<u64>)(64 - first_bit, slot_end - slot);
+            const u64 mask = (bits == 64 ? ~u64{0} : (u64{1} << bits) - 1) << first_bit;
+            if ((region->present[slot / 64] & mask) != mask ||
+                (region->recheck[slot / 64] & mask) != 0) {
+                return false;
+            }
+            slot += bits;
+        }
+        page = region_end;
+    }
+    return true;
 }
 
 template <class P>

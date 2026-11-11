@@ -625,6 +625,15 @@ public:
         u64 pages_skipped = 0;
         std::array<u64, BankReasons> compared{};
         std::array<u64, BankReasons> changed{};
+        /// EDEN_NX2_BANK_SLOTS: binds whose page loop was skipped whole, and pages of those
+        /// slots the hot rule would have compared.
+        u64 banks_skipped = 0;
+        u64 hot_left = 0;
+        /// EDEN_NX2_BANK_SKIP_VERIFY: pages compared anyway, those found changed, and pages of a
+        /// skipped bank the loop had a reason for.
+        u64 skip_verified = 0;
+        u64 skip_missed = 0;
+        u64 skip_disagreed = 0;
         std::chrono::steady_clock::time_point last_log{};
     } native_bank_tracked_stats;
     /// EDEN_NX2_BANK_SLOT_STATS: the tracked check's counts per constant buffer index (c0..c17),
@@ -634,6 +643,8 @@ public:
         u64 pages = 0;     ///< pages the binds covered (mapped)
         u64 pages_new = 0; ///< pages first seen (no snapshot yet)
         u32 stages = 0;    ///< stages seen binding the index (bit per stage)
+        u64 banks_skipped = 0; ///< EDEN_NX2_BANK_SLOTS: page loops skipped whole
+        u64 hot_left = 0;      ///< EDEN_NX2_BANK_SLOTS: hot pages not compared
         std::array<u64, BankReasons> compared{};
         std::array<u64, BankReasons> changed{};
     };
@@ -723,6 +734,11 @@ private:
     /// The snapshot of `page` (page aligned), or null.
     [[nodiscard]] NativeBankPage* FindNativeBankSnapshot(DAddr page);
     void ClearNativeBankSnapshots();
+    /// EDEN_NX2_BANK_SLOTS, with the table only: whether every page of [first_page, end) (page
+    /// aligned) has a snapshot and none waits for a recheck. False with the node map.
+    [[nodiscard]] bool NativeBankPagesSettled(DAddr first_page, DAddr end);
+    /// The tracked check's 5 s report (every 1024 binds it looks at the clock).
+    void LogNativeBankTrackedStats(int mode);
     /// Sets the page's recheck flag (and its region bit with the table).
     static void SetNativeBankRecheck(const NativeBankSnapshotRef& ref, DAddr page, bool value) {
         ref.page->recheck = value;

@@ -200,6 +200,27 @@ public:
         }
     }
 
+    /// Whether any page of [address, address + size) is marked, without clearing anything. A
+    /// relaxed look, as Take's first: a mark set after it is seen by the next look.
+    [[nodiscard]] bool Any(u64 address, u64 size) const noexcept {
+        constexpr u64 limit = u64{1} << AddressBits;
+        if (size == 0 || address >= limit) {
+            return false;
+        }
+        u64 page = address >> DEVICE_PAGEBITS;
+        const u64 last = ((std::min)(address + size, limit) - 1) >> DEVICE_PAGEBITS;
+        while (page <= last) {
+            const u64 first_bit = page % 64;
+            const u64 bits = (std::min<u64>)(64 - first_bit, last - page + 1);
+            const u64 mask = (bits == 64 ? ~u64{0} : (u64{1} << bits) - 1) << first_bit;
+            if ((words[page / 64].load(std::memory_order_relaxed) & mask) != 0) {
+                return true;
+            }
+            page += bits;
+        }
+        return false;
+    }
+
     /// Clears the bit of the page holding `address`, returning whether it was set.
     bool Take(u64 address) noexcept {
         if (address >= (u64{1} << AddressBits)) {
