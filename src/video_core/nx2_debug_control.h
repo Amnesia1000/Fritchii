@@ -621,6 +621,10 @@ inline void LoadExperiments() {
         // Stalchild fight playtest: readers waited for the host GPU ~280-350 -> 40-70 ms/s, 0
         // timeouts, no flicker or glitches (the boss wave still dips: front waits, not reads).
         g_experiments[72].store(1, std::memory_order_relaxed);
+        // EXP73 = 1 (2026-11-12): no report flush round trip after a drained macro read with no
+        // report listed over the bytes. Owner fight toggle with EXP30: macro dma flush 34.5 -> 20.4
+        // ms/s, front waits 442 -> 416 ms/s, no flashes; it only drops empty work.
+        g_experiments[73].store(1, std::memory_order_relaxed);
         // EXP49 = 1 (2026-11-10, owner's call for v5.7): the async read-back. Stalchild fight,
         // flipped every 30 s while the owner fought: 51.9 -> 56.9 fps, the back's read flushes
         // 35 -> 6 ms/s, guest lock waits halved. No beams in that session or two later ones
