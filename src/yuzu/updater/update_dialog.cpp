@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <filesystem>
 #include <utility>
 #include <QTimer>
@@ -315,7 +316,21 @@ void UpdateDialog::InstallInPlace() {
 
     const auto package = UpdateInstaller::FindPackageRoot(unpacked, ExeName);
     if (!package) {
-        fail(tr("The downloaded update does not contain lichii.exe."));
+        // 2026-11-11, v5.8.4: a player got this with a good zip: lichii.exe was in it but gone
+        // from disk right after unpacking, as an antivirus quarantining a new unsigned exe does.
+        const bool in_archive = std::ranges::any_of(extracted, [](const QString& file) {
+            return file.endsWith(QStringLiteral("/lichii.exe"), Qt::CaseInsensitive) ||
+                   file.endsWith(QStringLiteral("\\lichii.exe"), Qt::CaseInsensitive);
+        });
+        LOG_ERROR(Frontend, "Update package without {}: {} files unpacked, the exe {} in the list",
+                  PathText(ExeName), extracted.size(), in_archive ? "was" : "was not");
+        fail(in_archive
+                 ? tr("Your antivirus probably removed lichii.exe from the update right after it "
+                      "was unpacked.\n\nAllow it in your antivirus and try again, or download %1 "
+                      "from the release page and unzip it over your Fritchii folder. Your saves "
+                      "and settings are kept either way.")
+                       .arg(QString::fromStdString(m_asset.filename.empty() ? m_asset.name : m_asset.filename))
+                 : tr("The downloaded update does not contain lichii.exe."));
         return;
     }
 
