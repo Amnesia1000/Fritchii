@@ -144,6 +144,54 @@ inline std::atomic<int> g_oot_macros{-1};
 /// the back checks each packet's registers against the values the front wrote ("Draw packet
 /// verify").
 inline std::atomic<int> g_draw_packet{-1};
+/// EDEN_NX2_BANK_SLOT_STATS (live, default 0; Hookshot (NotRexed/Hookshot) research idea 1, step
+/// 1): with the tracked native bank check (EXP9 != 0), counts per constant buffer index (c0, c1,
+/// c2, ... as the shader numbers them; NVN2: c0 driver storage table, c1 program constants, c2
+/// texture handles, c3+ the game's uniform buffers) the bank binds, the pages they cover and
+/// the pages compared and found changed for each reason, logged every 5 s next to the "Native
+/// bank check" line ("Native bank slots"). Counting only (BufferCache::
+/// CheckNativeBankPagesTracked). 1 = on.
+inline std::atomic<int> g_bank_slot_stats{-1};
+/// EDEN_NX2_BANK_PAGE_TABLE (live, default 0; Hookshot (NotRexed/Hookshot) bf13340's page table,
+/// research idea 1 step 3): the native bank check's page snapshots live in a page-indexed table
+/// (2 MiB regions of 512 page slots, the last region kept) instead of a node map hashed per page
+/// (~1.9% self of the back in the 8 Nov sampler, 720k lookups/s at Castle Town). Exact: the
+/// same snapshots, the same compares; a change of the switch empties both stores, so the next
+/// bind of each page takes a new snapshot and marks it changed, as after the 16384-page reset.
+/// 1 = on.
+inline std::atomic<int> g_bank_page_table{-1};
+/// EDEN_NX2_BANK_SLOTS (live, default 0; Hookshot (NotRexed/Hookshot) research idea 1): a bit
+/// mask of constant buffer indices (bit n = cn) whose 64 KiB native bank binds rely on the write
+/// flags alone, for the banks NVN2's driver fills only through the command stream (c0 storage
+/// table, c2 texture handles) or never rewrites (c1 program constants). For those binds, with
+/// EXP9=3 (the default): (a) the "hot" rule (pages that changed lately are compared on every
+/// bind even with no flag set) is dropped, and (b) with EDEN_NX2_BANK_PAGE_TABLE=1 a bind whose
+/// whole range has no collected CPU write, no buffer cache write (our own constant buffer words
+/// among them, at FlushCaching), no recheck pending and no CPU-modified page, with every page
+/// already snapshotted, skips the page loop at once (BufferCache::CheckNativeBankPagesTracked).
+/// The game's own banks (c3+) keep the full check: never set their bits (the white flashes,
+/// d79572d28a). Pick the mask from EDEN_NX2_BANK_SLOT_STATS: indices whose "hot" changes stay 0.
+/// 0 = off. Suggested after that check: 0x7 (c0, c1, c2).
+inline std::atomic<int> g_bank_slots{-1};
+/// EDEN_NX2_BANK_SKIP_VERIFY (live, default 0): with EDEN_NX2_BANK_SLOTS, every bank the skip
+/// passes over and every hot page the slot rule leaves alone is still compared; changes are taken
+/// as before (the page is marked) and counted as "missed", which must stay 0, and pages of a
+/// skipped bank that the page loop finds a reason for are counted as "disagreed" (must stay 0).
+/// Logged every 5 s ("Native bank slot skip"). Costs what the skip saves. 1 = on.
+inline std::atomic<int> g_bank_skip_verify{-1};
+/// EDEN_NX2_TEX_BANK_GEN (live, default 0; Hookshot (NotRexed/Hookshot) 11d2c1a's per-stage
+/// texture bank generations, research idea 2): a graphics pipeline whose bindings are all sampled
+/// textures with handles read straight from constant buffers (no handle programs) keeps the view
+/// and sampler ids its last draw resolved, with the generations of the pages that draw read
+/// handle words and TIC/TSC entries from (TextureCache::TexBankPage: watched pages trap CPU
+/// writes; our constant buffer words, buffer cache writes and InvalidateRegion mark them too).
+/// A draw with the same handle constant buffer bindings, the same TextureMemoState (pools,
+/// limits, channel, mappings, no view removed), the same sampler binding mode and every page at
+/// its generation takes those ids: no handle reads, no table reads, no GetSamplerId; the views
+/// are still prepared (PrepareImageView). A miss costs the compares. Vulkan GraphicsPipeline::
+/// ConfigureImpl; not with EXP32. 1 = on, 2 = on and every 16th hit resolves the full way and
+/// compares ("Texture bank memo mismatch", must stay 0). Logged every 10 s ("Texture bank memo").
+inline std::atomic<int> g_tex_bank_gen{-1};
 
 /// Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP63, live through the debug server:
 /// slots for batches of fixes built together and A/B-tested in one session
@@ -567,6 +615,21 @@ inline void LoadExperiments() {
     }
     if (name == "EDEN_NX2_DRAW_PACKET") {
         return &g_draw_packet;
+    }
+    if (name == "EDEN_NX2_BANK_SLOT_STATS") {
+        return &g_bank_slot_stats;
+    }
+    if (name == "EDEN_NX2_BANK_PAGE_TABLE") {
+        return &g_bank_page_table;
+    }
+    if (name == "EDEN_NX2_BANK_SLOTS") {
+        return &g_bank_slots;
+    }
+    if (name == "EDEN_NX2_BANK_SKIP_VERIFY") {
+        return &g_bank_skip_verify;
+    }
+    if (name == "EDEN_NX2_TEX_BANK_GEN") {
+        return &g_tex_bank_gen;
     }
     return nullptr;
 }

@@ -1473,6 +1473,57 @@ void TextureCache<P>::TouchTextureMemoView(ImageViewId view) noexcept {
 }
 
 template <class P>
+typename TextureCache<P>::TexBankPage* TextureCache<P>::TexBankWatch(DAddr page,
+                                                                    bool& created) {
+    if (const auto it = tex_bank_pages.find(page); it != tex_bank_pages.end()) {
+        created = false;
+        return &it->second;
+    }
+    created = true;
+    // A bound on the trapped pages (handle words and pool entries of the draws seen lately).
+    if (tex_bank_pages.size() >= 4096) {
+        TexBankReset();
+    }
+    // Trapped from now on. Not before: the entry's first look moves its generation (recheck).
+    device_memory.UpdatePagesCachedCount(page, Core::DEVICE_PAGESIZE, 1);
+    TexBankPage& entry = tex_bank_pages[page];
+    entry.page = page;
+    return &entry;
+}
+
+template <class P>
+void TextureCache<P>::TexBankReset() {
+    if (tex_bank_pages.empty()) {
+        return;
+    }
+    for (const auto& [page, entry] : tex_bank_pages) {
+        device_memory.UpdatePagesCachedCount(page, Core::DEVICE_PAGESIZE, -1);
+    }
+    tex_bank_pages.clear();
+    ++tex_bank_epoch;
+}
+
+template <class P>
+bool TextureCache<P>::PrepareTexBankViews(std::span<const ImageViewId> views) {
+    has_deleted_images = false;
+    for (const ImageViewId view : views) {
+        if (view != NULL_IMAGE_VIEW_ID) {
+            PrepareImageView(view, false, false);
+        }
+    }
+    return !has_deleted_images;
+}
+
+template <class P>
+std::optional<DAddr> TextureCache<P>::TexBankDevicePage(GPUVAddr gpu_addr) const {
+    const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
+    if (!device_addr) {
+        return std::nullopt;
+    }
+    return Common::AlignDown(*device_addr, Core::DEVICE_PAGESIZE);
+}
+
+template <class P>
 const typename P::Sampler& TextureCache<P>::GetSampler(SamplerId id) const noexcept {
     return slot_samplers[id];
 }
@@ -1910,6 +1961,8 @@ FramebufferId TextureCache<P>::GetFramebufferId(const RenderTargets& key) {
 
 template <class P>
 void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
+    // EDEN_NX2_TEX_BANK_GEN: InvalidateRegion may reach only this cache.
+    Core::g_watch_write_pages.Mark(cpu_addr, size);
     ClearStale(cpu_addr, size);
     ForEachImageInRegion(cpu_addr, size, [this, cpu_addr, size](ImageId image_id, Image& image) {
         ++bindings_epoch;
@@ -2049,6 +2102,17 @@ std::optional<VideoCore::RasterizerDownloadArea> TextureCache<P>::GetFlushArea(D
 
 template <class P>
 void TextureCache<P>::UnmapMemory(DAddr cpu_addr, size_t size) {
+    // EDEN_NX2_TEX_BANK_GEN: a watched page leaving its mapping drops every watch (their trap
+    // counts go back while the pages are still mapped; memos of the old epoch miss).
+    if (!tex_bank_pages.empty()) {
+        const DAddr first = Common::AlignDown(cpu_addr, Core::DEVICE_PAGESIZE);
+        for (const auto& [page, entry] : tex_bank_pages) {
+            if (page >= first && page < cpu_addr + size) {
+                TexBankReset();
+                break;
+            }
+        }
+    }
     boost::container::small_vector<ImageId, 16> deleted_images;
     ForEachImageInRegion(cpu_addr, size, [&](ImageId id, Image&) { deleted_images.push_back(id); });
     for (const ImageId id : deleted_images) {

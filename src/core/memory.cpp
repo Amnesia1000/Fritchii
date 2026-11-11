@@ -1009,6 +1009,11 @@ struct Memory::Impl {
             }
         };
         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
+            // EDEN_NX2_TEX_BANK_GEN: every trapped write, before the bytes land (the texture
+            // cache's watched pages look again at their next draw for that reason).
+            if (address != 0 && size != 0) {
+                g_watch_write_pages.Mark(address, size);
+            }
             auto& current_area = rasterizer_write_areas[core];
             PAddr subaddress = address >> YUZU_PAGEBITS;
             // Performance note:
