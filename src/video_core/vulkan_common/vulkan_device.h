@@ -565,6 +565,13 @@ FN_MAX_LIMIT_LIST
         return properties.subgroup_size_control.requiredSubgroupSizeStages & stage;
     }
 
+    /// Returns true if a pipeline stage can be built with requiredSubgroupSize = GuestWarpSize.
+    bool CanRequireGuestWarpSize(VkShaderStageFlagBits stage) const {
+        const auto& control = properties.subgroup_size_control;
+        return extensions.subgroup_size_control && IsGuestWarpSizeSupported(stage) &&
+               control.minSubgroupSize <= GuestWarpSize && GuestWarpSize <= control.maxSubgroupSize;
+    }
+
     /// Returns true if the device supports the provided subgroup feature.
     bool IsSubgroupFeatureSupported(VkSubgroupFeatureFlagBits feature) const {
         return properties.subgroup_properties.supportedOperations & feature;
