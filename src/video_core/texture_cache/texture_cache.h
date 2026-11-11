@@ -815,13 +815,15 @@ void TextureCache<P>::TickFrame() {
         relocation_candidates = relocation_guarded = relocation_relocated = relocation_retired =
             relocation_crowded = 0;
     }
-    if ((pad_made != 0 || pad_sampled != 0) && frame_tick % 600 == 0) {
+    if ((pad_depth_lookups != 0 || pad_sampled != 0) && frame_tick % 600 == 0) {
         LOG_INFO(HW_GPU,
-                 "Host pad (EXP67={}) last 600 frames: {} padded depth targets made, {} found by "
-                 "a texture lookup; {} varying addresses, {} stopped",
-                 VideoCore::Nx2Debug::Experiment(67), pad_made, pad_sampled, pad_slots.size(),
+                 "Host pad (EXP67={}) last 600 frames: {} new depth targets, {} padded, {} at an "
+                 "address without a resize yet, {} refused (lookup kind, rescaling, shape, "
+                 "sampled address); {} found by a texture lookup; {} varying addresses, {} stopped",
+                 VideoCore::Nx2Debug::Experiment(67), pad_depth_lookups, pad_made,
+                 pad_not_varying, pad_skipped_other, pad_sampled, pad_slots.size(),
                  pad_unsafe_slots.size());
-        pad_made = pad_sampled = 0;
+        pad_made = pad_sampled = pad_depth_lookups = pad_not_varying = pad_skipped_other = 0;
     }
     if (slot_clears != 0 && frame_tick % 600 == 0) {
         LOG_INFO(HW_GPU,
@@ -4055,13 +4057,23 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     // changes dims (OoT's per-NPC depth targets, sized by screen bounds every frame) gets a host
     // image rounded up to the bucket, so the image pool hands the next frame's target the same
     // VkImage instead of a new create and a 0.2-1.3 ms depth bind (IMAGE_ALLOC_TIMING).
-    if (const int bucket = VideoCore::Nx2Debug::Experiment(67);
-        bucket > 0 && render_target_lookup && !is_rescaling && RelocationShaped(new_info) &&
-        new_info.num_samples == 1 && !pad_unsafe_slots.contains(gpu_addr)) {
-        const auto type = VideoCore::Surface::GetFormatType(new_info.format);
-        if (type == VideoCore::Surface::SurfaceType::Depth ||
-            type == VideoCore::Surface::SurfaceType::Stencil ||
-            type == VideoCore::Surface::SurfaceType::DepthStencil) {
+    const auto pad_type = VideoCore::Surface::GetFormatType(new_info.format);
+    const bool pad_depth = pad_type == VideoCore::Surface::SurfaceType::Depth ||
+                           pad_type == VideoCore::Surface::SurfaceType::Stencil ||
+                           pad_type == VideoCore::Surface::SurfaceType::DepthStencil;
+    const int pad_bucket = VideoCore::Nx2Debug::Experiment(67);
+    if (pad_bucket > 0 && pad_depth) {
+        ++pad_depth_lookups;
+        if (!render_target_lookup || is_rescaling || !RelocationShaped(new_info) ||
+            new_info.num_samples != 1 || pad_unsafe_slots.contains(gpu_addr)) {
+            ++pad_skipped_other;
+        }
+    }
+    if (const int bucket = pad_bucket;
+        bucket > 0 && pad_depth && render_target_lookup && !is_rescaling &&
+        RelocationShaped(new_info) && new_info.num_samples == 1 &&
+        !pad_unsafe_slots.contains(gpu_addr)) {
+        {
             bool varying = pad_slots.contains(gpu_addr);
             if (!varying) {
                 for (const ImageId overlap_id : join_bad_overlap_ids) {
@@ -4079,10 +4091,12 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                 const u32 b = static_cast<u32>(bucket);
                 const u32 width = (new_info.size.width + b - 1) / b * b;
                 const u32 height = (new_info.size.height + b - 1) / b * b;
-                if constexpr (requires { runtime.SetNextHostPad(width, height); }) {
+                if constexpr (requires(Runtime& r) { r.SetNextHostPad(0U, 0U); }) {
                     runtime.SetNextHostPad(width, height);
                     ++pad_made;
                 }
+            } else {
+                ++pad_not_varying;
             }
         }
     }

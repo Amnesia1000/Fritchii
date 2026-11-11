@@ -704,6 +704,9 @@ private:
     std::unordered_set<GPUVAddr> pad_slots;
     std::unordered_set<GPUVAddr> pad_unsafe_slots;
     u64 pad_made{};
+    u64 pad_depth_lookups{};   ///< New depth targets EXP67 looked at (render target lookups)
+    u64 pad_not_varying{};     ///< ... at an address with no other-dims predecessor yet
+    u64 pad_skipped_other{};   ///< ... refused: rescaling, not plain 2D, sampled address
     u64 pad_sampled{};
     u32 pad_logged{};
     /// EXP64 check: images made again (not by a clear) at a retired image's address and shape
