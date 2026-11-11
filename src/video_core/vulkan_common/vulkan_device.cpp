@@ -1572,8 +1572,14 @@ bool Device::GetSuitability(bool requires_swapchain) {
     // Same for NVIDIA Proprietary < 580.119.02, unknown when VIDS was first NOT broken
     // Disable VertexInputDynamicState on old Intel Windows drivers
     if (extensions.vertex_input_dynamic_state) {
-        const u32 version = (properties.properties.driverVersion << 3) >> 3;
-        if ((driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS && version < VK_MAKE_API_VERSION(27, 20, 100, 0))
+        // Intel's Windows driver reports its build as (major << 14) | minor ("101.9150" is
+        // 1663934), not as a Vulkan API version: compared with VK_MAKE_API_VERSION(27, 20, 100, 0)
+        // every Intel driver was "older" and lost the extension. That left the precompiled
+        // pipelines (all recorded with dynamic vertex input) unusable there and keyed every
+        // vertex layout into its own pipeline. The broken drivers are the 100.x branch (Gen9-era
+        // 27.20.100.x); Arc and Xe drivers are 101.x.
+        const u32 intel_build_major = properties.properties.driverVersion >> 14;
+        if ((driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS && intel_build_major < 101)
         || (driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY && properties.properties.driverVersion < NvidiaDriverVersion(580, 119, 2))) {
             LOG_WARNING(Render_Vulkan, "Disabling broken VK_EXT_vertex_input_dynamic_state");
             RemoveExtensionFeature(extensions.vertex_input_dynamic_state, features.vertex_input_dynamic_state, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
