@@ -3102,8 +3102,19 @@ public:
         void DrawDeferred(Maxwell3D& maxwell3d, bool loop_continues = false);
         /// Instances after the first wait to be drawn together (DrawDeferred).
         [[nodiscard]] bool HasDeferredDraw() const noexcept {
-            return draw_state.draw_mode == DrawMode::Instance && draw_state.instance_count != 0;
+            return (draw_state.draw_mode == DrawMode::Instance && draw_state.instance_count != 0) ||
+                   first_folded;
         }
+        /// EDEN_NX2_FOLD_INSTANCE (split front, instanced draw macros; from Skitchii
+        /// (skolvolt/Lichii)): the next draw.end ends the first instance of an instance loop. The
+        /// loop's deferred draw covers that instance too (DrawDeferred draws instance_count + 1),
+        /// so it isn't drawn on its own (it was drawn twice).
+        void FoldFirstInstance() noexcept {
+            fold_first_instance = true;
+        }
+        bool fold_first_instance{};
+        /// A folded first instance whose loop's deferred draw hasn't come yet.
+        bool first_folded{};
         /// Methods an instance loop writes between its draws; any other write ends the loop.
         [[nodiscard]] static bool IsInstanceLoopMethod(u32 method) noexcept;
         void DrawArray(Maxwell3D& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 vertex_first, u32 vertex_count, u32 base_instance, u32 num_instances);
