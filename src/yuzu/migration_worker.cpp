@@ -70,6 +70,9 @@ void MigrationWorker::process() {
                 fs::create_directories(shader);
             }
         });
+        // The cache came along or was cleared on purpose: Fritchii's startup catch-up
+        // (UserDataMigrator::CatchUpShaderCache) must not bring it back.
+        FrontendCommon::MarkShaderCacheCatchUpDone();
 
         QString message = tr("Data was imported successfully. Existing Lichii data, if any, "
                              "was kept in backup directories beside the new profile.");
