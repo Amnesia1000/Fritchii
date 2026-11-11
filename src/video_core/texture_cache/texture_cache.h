@@ -819,11 +819,12 @@ void TextureCache<P>::TickFrame() {
         LOG_INFO(HW_GPU,
                  "Slot retire (EXP64={}) last 600 frames: {} cleared targets over same-address "
                  "images, {} retired; kept: {} guarded (sampled or CPU-read later), {} busy "
-                 "(bound, download queued), {} of an excluded kind, {} written this frame",
+                 "(bound, download queued), {} of an excluded kind, {} written this frame; {} made "
+                 "again after a retire",
                  VideoCore::Nx2Debug::Experiment(64), slot_clears, slot_retired, slot_kept_guard,
-                 slot_kept_busy, slot_kept_kind, slot_kept_same_frame);
+                 slot_kept_busy, slot_kept_kind, slot_kept_same_frame, slot_remade);
         slot_clears = slot_retired = slot_kept_guard = slot_kept_busy = slot_kept_kind =
-            slot_kept_same_frame = 0;
+            slot_kept_same_frame = slot_remade = 0;
     }
     TickRenderClock();
     TickRelocationTombstones();
@@ -3999,6 +4000,25 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             }
         }
     }
+    if (!clearing_render_targets && slot_retired_any) {
+        const u64 shape = RelocationShapeKey(new_info);
+        const u64 frame = RenderFrame();
+        for (const SlotRetired& retired : slot_recent) {
+            if (retired.gpu_addr == gpu_addr && retired.shape == shape &&
+                frame - retired.render_frame <= 4) {
+                ++slot_remade;
+                if (slot_remade_logged < 20) {
+                    ++slot_remade_logged;
+                    LOG_WARNING(HW_GPU,
+                                "Slot retire (EXP64): format {} {}x{} at {:#x} made again {} "
+                                "frames after it was retired (its contents were wanted)",
+                                static_cast<u32>(new_info.format), new_info.size.width,
+                                new_info.size.height, gpu_addr, frame - retired.render_frame);
+                }
+                break;
+            }
+        }
+    }
     // EXP64 (fable_answer_npcdips 3): the cleared target's same-address predecessors go now.
     if (clearing_render_targets && !join_bad_overlap_ids.empty() && join_copies_to_do.empty() &&
         join_left_aliased_ids.empty() && join_right_aliased_ids.empty() &&
@@ -5342,6 +5362,9 @@ u32 TextureCache<P>::RetireSlotPredecessors(const ImageInfo& new_info, GPUVAddr 
             UntrackImage(old, old_id);
         }
         UnregisterImage(old_id);
+        slot_recent[slot_recent_next] = SlotRetired{old.gpu_addr, RelocationShapeKey(old.info),
+                                                    render_frame};
+        slot_recent_next = (slot_recent_next + 1) % slot_recent.size();
         DeleteImage(old_id);
         ++rt_stats.retired_images;
     }
@@ -5355,6 +5378,7 @@ u32 TextureCache<P>::RetireSlotPredecessors(const ImageInfo& new_info, GPUVAddr 
                                    join_bad_overlap_ids.end());
     }
     slot_retired += retire.size();
+    slot_retired_any = slot_retired_any || !retire.empty();
     return static_cast<u32>(retire.size());
 }
 

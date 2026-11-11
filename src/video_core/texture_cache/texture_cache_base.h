@@ -694,6 +694,18 @@ private:
     u64 slot_kept_kind{};
     u64 slot_kept_same_frame{};
     u64 slot_clears{};
+    /// EXP64 check: images made again (not by a clear) at a retired image's address and shape
+    /// within 4 render frames: a reader of the retired contents, which got guest memory instead.
+    u64 slot_remade{};
+    struct SlotRetired {
+        GPUVAddr gpu_addr;
+        u64 shape;
+        u64 render_frame;
+    };
+    std::array<SlotRetired, 16> slot_recent{};
+    size_t slot_recent_next{};
+    bool slot_retired_any{};
+    u32 slot_remade_logged{};
     bool relocation_seen{};
 
     /// The frame last_write_frame, CheckCrossFrameUse and RelocationCandidate's same-frame rule
