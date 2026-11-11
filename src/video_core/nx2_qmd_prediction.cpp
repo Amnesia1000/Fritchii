@@ -2062,7 +2062,7 @@ std::optional<Bound> CheckAcquire(const AcquireCheck& check) {
     return result;
 }
 
-bool Feed(const AcquireCheck& check, bool resume) {
+bool Feed(const AcquireCheck& check, bool resume, FedRelease* fed) {
     auto& state = Front();
     state.Tick();
     state.CheckLost();
@@ -2120,6 +2120,13 @@ bool Feed(const AcquireCheck& check, bool resume) {
         } else {
             const Fed kind = queued ? Fed::QueuedPlain : Fed::LandedPending;
             ++state.fed[static_cast<size_t>(kind)][resumed];
+            if (fed != nullptr) {
+                *fed = {.payload = newest.payload,
+                        .position = newest.position,
+                        .exact = queued && newest.kind == Kind::Plain &&
+                                 (newest.writer == Writer::Dma ||
+                                  (newest.writer == Writer::Qmd && newest.simple))};
+            }
             state.Audit({check.device, newest.sequence, newest.position, Clock::now(),
                          check.value, check.operation, newest.payload, kind, false});
             return true;
@@ -2157,6 +2164,9 @@ bool Feed(const AcquireCheck& check, bool resume) {
                  folded.bound.folded, {}, state.session_evicted_unlanded, state.session_foreign};
     std::copy_n(folded.bound.sequences.begin(), folded.bound.folded, fed_check.sequences.begin());
     ++state.fed[static_cast<size_t>(Fed::Bound)][resumed];
+    if (fed != nullptr) {
+        *fed = {.payload = folded.bound.value, .position = 0, .exact = false};
+    }
     const Prediction* newest_folded = nullptr;
     for (size_t i = 0; i < count; ++i) {
         if (records[i]->sequence == folded.newest) {

@@ -41,6 +41,7 @@
 #include "video_core/host1x/host1x.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_write_track.h"
 #include "video_core/rasterizer_download_area.h"
 
 namespace Core::Memory {
@@ -368,6 +369,7 @@ struct Memory::Impl {
                 HandleRasterizerWrite(GetInteger(current_vaddr), copy_amount);
             }
             std::memcpy(ptr, reinterpret_cast<u8 const*>(buffer) + offset, copy_amount);
+            VideoCommon::WriteTrack::CloseIfArmed();
         });
     }
 
@@ -382,6 +384,7 @@ struct Memory::Impl {
         [&](const Common::ProcessAddress current_vaddr, const std::size_t offset, const std::size_t copy_amount, u8* const ptr) {
             HandleRasterizerWrite(GetInteger(current_vaddr), copy_amount);
             std::memset(ptr, 0, copy_amount);
+            VideoCommon::WriteTrack::CloseIfArmed();
         });
     }
 
@@ -428,6 +431,7 @@ struct Memory::Impl {
             // dc cvac: Store to point of coherency
             // CPU flush -> GPU invalidate
             HandleRasterizerWrite(GetInteger(current_vaddr), block_size);
+            VideoCommon::WriteTrack::CloseIfArmed();
         };
         return PerformCacheOperation(dest_addr, size, on_rasterizer);
     }
@@ -437,6 +441,7 @@ struct Memory::Impl {
             // dc civac: Store to point of coherency, and invalidate from cache
             // CPU flush -> GPU invalidate
             HandleRasterizerWrite(GetInteger(current_vaddr), block_size);
+            VideoCommon::WriteTrack::CloseIfArmed();
         };
         return PerformCacheOperation(dest_addr, size, on_rasterizer);
     }
@@ -882,8 +887,10 @@ struct Memory::Impl {
         const u64 addr = GetInteger(vaddr);
         if (auto const ptr = GetPointerImpl(addr, [addr, data]() {
             LOG_ERROR(HW_Memory, "Unmapped Write{} @ {:#016x} = {:#016x}", sizeof(T) * 8, addr, u64(data));
-        }, [&]() { HandleRasterizerWrite(addr, sizeof(T)); }); ptr) [[likely]]
+        }, [&]() { HandleRasterizerWrite(addr, sizeof(T)); }); ptr) [[likely]] {
             std::memcpy(ptr, &data, sizeof(T));
+            VideoCommon::WriteTrack::CloseIfArmed();
+        }
     }
 
     template <typename T>
@@ -896,7 +903,10 @@ struct Memory::Impl {
             },
             [&]() { HandleRasterizerWrite(GetInteger(vaddr), sizeof(T)); });
         if (ptr) {
-            return Common::AtomicCompareAndSwap(reinterpret_cast<T*>(ptr), data, expected);
+            const bool stored =
+                Common::AtomicCompareAndSwap(reinterpret_cast<T*>(ptr), data, expected);
+            VideoCommon::WriteTrack::CloseIfArmed();
+            return stored;
         }
         return true;
     }
@@ -910,7 +920,10 @@ struct Memory::Impl {
             },
             [&]() { HandleRasterizerWrite(GetInteger(vaddr), sizeof(u128)); });
         if (ptr) {
-            return Common::AtomicCompareAndSwap(reinterpret_cast<u64*>(ptr), data, expected);
+            const bool stored =
+                Common::AtomicCompareAndSwap(reinterpret_cast<u64*>(ptr), data, expected);
+            VideoCommon::WriteTrack::CloseIfArmed();
+            return stored;
         }
         return true;
     }
@@ -1028,6 +1041,12 @@ struct Memory::Impl {
                 } else {
                     return;
                 }
+            }
+            // EDEN_NX2_RUNAHEAD: the mark is collected before the caller stores the bytes; a
+            // run-ahead gather that copies bytes must know the store may still be on its way
+            // (nx2_write_track.h). The caller closes it after the store.
+            if (VideoCommon::WriteTrack::g_armed.load(std::memory_order_relaxed)) [[unlikely]] {
+                VideoCommon::WriteTrack::Open(address, size, static_cast<u32>(core));
             }
             gpu_dirty_managers[core].Collect(address, size);
             // A download writing to guest memory here may have looked at the collected writes

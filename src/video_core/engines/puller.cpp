@@ -80,7 +80,7 @@ void DrainBack() {
 // and writes the word now (the CPU goes on early), mode 2 takes a verify chunk. The word is not
 // written on a GPU-written page (a cache may hold a newer copy) or the native syncpoint shim.
 void RunaheadBoundary(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire, u64 device,
-                      u32 payload, u64 position) {
+                      u32 payload, u64 position, bool predicted = false) {
     namespace Runahead = VideoCommon::Runahead;
     const Runahead::Mode mode = Runahead::CurrentMode();
     if (mode != Runahead::Mode::On && mode != Runahead::Mode::Verify) [[likely]] {
@@ -93,7 +93,7 @@ void RunaheadBoundary(DmaPusher& dma_pusher, const Puller::PendingAcquire& acqui
         word = memory.GetPointer(acquire.address);
     }
     if (Runahead::AtBoundary(dma_pusher.system, device, word, payload, position,
-                             VideoCommon::GpuSplit::Get().ConsumedNow())) {
+                             VideoCommon::GpuSplit::Get().ConsumedNow(), predicted)) {
         Nx2SemaphoreWaiters::Get().OnWrite(device, payload);
     }
 }
@@ -816,6 +816,7 @@ bool MetByQmdPrediction(DmaPusher& dma_pusher, const Puller::PendingAcquire& acq
     const u32 word = dma_pusher.memory_manager.Read<u32>(acquire.address);
     std::atomic_thread_fence(std::memory_order_acquire);
     const u64 done = split.ConsumedNow();
+    Prediction::FedRelease fed{};
     if (!Prediction::Feed(
             {
                 .device = *device,
@@ -827,10 +828,19 @@ bool MetByQmdPrediction(DmaPusher& dma_pusher, const Puller::PendingAcquire& acq
                 .gpu_dirty = Nx2IsGpuWritten(*device),
                 .pointer = dma_pusher.memory_manager.GetPointer(acquire.address),
             },
-            resume)) {
+            resume, &fed)) {
         return false;
     }
     split.NoteSync();
+    // EDEN_NX2_RUNAHEAD: a queued plain release with an exact payload is a boundary too (the
+    // untracked writers the drain path can't answer are mostly these QMD releases).
+    namespace Runahead = VideoCommon::Runahead;
+    if (Runahead::CurrentMode() != Runahead::Mode::Off) [[unlikely]] {
+        Runahead::NotePredictedAnswer();
+        if (fed.exact && fed.position > done && acquire.Matches(fed.payload)) {
+            RunaheadBoundary(dma_pusher, acquire, *device, fed.payload, fed.position, true);
+        }
+    }
     return true;
 }
 
@@ -856,9 +866,13 @@ static bool RunaheadAnswer(DmaPusher& dma_pusher, const Puller::PendingAcquire& 
     u64 position = 0;
     const std::optional<u32> release = split.NewestReleaseTo(device, position);
     if (!release) {
-        Runahead::CountUnmet(split.UntrackedWriterPosition(device) > done
-                                 ? Runahead::Unmet::UntrackedWriter
-                                 : Runahead::Unmet::Nothing);
+        // A native compute launch queued: its QMD completion release or reduction (the front
+        // knows those only with EXP13's QMD copy). Otherwise copies, unranged writers, maps.
+        Runahead::CountUnmet(split.UntrackedWriterPosition(device) <= done
+                                 ? Runahead::Unmet::Nothing
+                             : split.LastDispatchPosition() > done
+                                 ? Runahead::Unmet::UntrackedDispatch
+                                 : Runahead::Unmet::UntrackedWriter);
         return false;
     }
     if (!acquire.Matches(*release)) {
