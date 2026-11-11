@@ -280,6 +280,22 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
                                    info.uses_subgroup_shuffles || info.uses_subgroup_mask ||
                                    info.uses_quad_shuffles || info.uses_fswzadd ||
                                    info.uses_cooperative_matrix;
+        // Shaders without them may be given a narrower size where the driver's choice spills
+        // (Intel, Device::NarrowComputeSubgroupSize).
+        const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT narrow_subgroup_size_ci{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+            .pNext = nullptr,
+            .requiredSubgroupSize = uses_warp_ops
+                                        ? 0
+                                        : device.NarrowComputeSubgroupSize(info.uses_global_memory),
+        };
+        const void* const stage_next =
+            device.IsExtSubgroupSizeControlSupported() && uses_warp_ops &&
+                    device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT)
+                ? static_cast<const void*>(&subgroup_size_ci)
+            : narrow_subgroup_size_ci.requiredSubgroupSize != 0
+                ? static_cast<const void*>(&narrow_subgroup_size_ci)
+                : nullptr;
         VkPipelineCreateFlags flags{};
         if (device.IsKhrPipelineExecutablePropertiesEnabled() && Settings::values.renderer_debug.GetValue()) {
             flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
@@ -296,10 +312,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             .flags = flags,
             .stage{
                 .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                .pNext = device.IsExtSubgroupSizeControlSupported() && uses_warp_ops &&
-                                 device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT)
-                             ? &subgroup_size_ci
-                             : nullptr,
+                .pNext = stage_next,
                 .flags = info.uses_cooperative_matrix
                              ? VkPipelineShaderStageCreateFlags{
                                    VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT}

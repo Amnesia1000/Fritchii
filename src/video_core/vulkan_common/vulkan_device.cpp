@@ -1572,8 +1572,14 @@ bool Device::GetSuitability(bool requires_swapchain) {
     // Same for NVIDIA Proprietary < 580.119.02, unknown when VIDS was first NOT broken
     // Disable VertexInputDynamicState on old Intel Windows drivers
     if (extensions.vertex_input_dynamic_state) {
-        const u32 version = (properties.properties.driverVersion << 3) >> 3;
-        if ((driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS && version < VK_MAKE_API_VERSION(27, 20, 100, 0))
+        // Intel's Windows driver reports its build as (major << 14) | minor ("101.9150" is
+        // 1663934), not as a Vulkan API version: compared with VK_MAKE_API_VERSION(27, 20, 100, 0)
+        // every Intel driver was "older" and lost the extension. That left the precompiled
+        // pipelines (all recorded with dynamic vertex input) unusable there and keyed every
+        // vertex layout into its own pipeline. The broken drivers are the 100.x branch (Gen9-era
+        // 27.20.100.x); Arc and Xe drivers are 101.x.
+        const u32 intel_build_major = properties.properties.driverVersion >> 14;
+        if ((driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS && intel_build_major < 101)
         || (driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY && properties.properties.driverVersion < NvidiaDriverVersion(580, 119, 2))) {
             LOG_WARNING(Render_Vulkan, "Disabling broken VK_EXT_vertex_input_dynamic_state");
             RemoveExtensionFeature(extensions.vertex_input_dynamic_state, features.vertex_input_dynamic_state, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
@@ -1740,6 +1746,23 @@ void Device::RemoveUnsuitableExtensions() {
                                      features.shader_atomic_int64.shaderSharedInt64Atomics;
     RemoveExtensionFeatureIfUnsuitable(extensions.shader_atomic_int64, features.shader_atomic_int64,
                                        VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME);
+
+    // VK_EXT_shader_atomic_float: storage buffer float32 atomic add in hardware instead of a
+    // compare-exchange loop. Intel only for now (the GPU it was measured on): on an Arc B580 a
+    // contended loop of Ocarina of Time (1e1964184a291f00, 96 groups) took 2 ms of each frame.
+    // EDEN_NX2_NO_FLOAT_ATOMICS=1 keeps the loop.
+    {
+        constexpr u32 intel_vendor_id = 0x8086;
+        const char* const no_float_atomics = std::getenv("EDEN_NX2_NO_FLOAT_ATOMICS");
+        extensions.shader_atomic_float =
+            extensions.shader_atomic_float &&
+            properties.properties.vendorID == intel_vendor_id &&
+            features.shader_atomic_float.shaderBufferFloat32AtomicAdd &&
+            !(no_float_atomics != nullptr && no_float_atomics[0] == '1');
+        RemoveExtensionFeatureIfUnsuitable(extensions.shader_atomic_float,
+                                           features.shader_atomic_float,
+                                           VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
+    }
 
     // VK_EXT_shader_demote_to_helper_invocation
     extensions.shader_demote_to_helper_invocation =
@@ -1932,13 +1955,16 @@ void Device::RemoveUnsuitableExtensions() {
         cooperative_hmma_16x16x16 =
             usable && has_shape(16, 16) && IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT);
         // Intel Xe2 (ANV) only has 8x16x16: each HMMA is two products of 8 rows. Intel only, so
-        // NVIDIA and AMD keep exactly the paths above (zortos293/Lichii#779). Not Intel's Windows
-        // driver: the constructor turns its shaderFloat16 off after this check ("Intel has broken
-        // float16 math"), and the matrices need it; #779 was measured on Mesa ANV.
+        // NVIDIA and AMD keep exactly the paths above (zortos293/Lichii#779, measured on Mesa
+        // ANV). Intel's Windows driver too: its "broken float16 math" workaround only turns off
+        // float16 arithmetic in translated shaders (float16_math); the device keeps shaderFloat16
+        // for the matrices (see where float16_math is set). Arc B580, driver 101.9150: the
+        // software HMMA of OoT's 64x36 tile pass spilled 12 KB of scratch per lane at SIMD32 and
+        // took 13.5-15 ms a frame; on 8x16x16 matrices the same dispatch took 1.3 ms.
+        // EDEN_NX2_NO_COOP_MATRIX=1 goes back to the software path.
         constexpr u32 intel_vendor_id = 0x8086;
         cooperative_hmma_8x16x16 =
-            usable && properties.properties.vendorID == intel_vendor_id &&
-            driver_id != VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS && has_shape(8, 16) &&
+            usable && properties.properties.vendorID == intel_vendor_id && has_shape(8, 16) &&
             IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT);
         extensions.cooperative_matrix =
             cooperative_hmma_16x8x16 || cooperative_hmma_16x16x16 || cooperative_hmma_8x16x16;
@@ -1947,8 +1973,12 @@ void Device::RemoveUnsuitableExtensions() {
                                            features.cooperative_matrix,
                                            VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
     }
-    VideoCommon::Nx2Perf::g_native_tensor_ops.store(extensions.cooperative_matrix,
-                                                    std::memory_order_relaxed);
+    // Picks the movie upscaler (Automatic: the game's own network where tensor operations are
+    // native). Not on Intel's 8x16x16 path: OoT's movie network (its 32-lane compute programs,
+    // f9ea14a22394f5b1 and others) drew a pink line and speckled columns over the title movie on
+    // an Arc B580, the bilinear copy does not. The gameplay HMMA programs keep the matrices.
+    VideoCommon::Nx2Perf::g_native_tensor_ops.store(
+        extensions.cooperative_matrix && !cooperative_hmma_8x16x16, std::memory_order_relaxed);
 
     // VK_KHR_workgroup_memory_explicit_layout
     extensions.workgroup_memory_explicit_layout =

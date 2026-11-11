@@ -28,7 +28,8 @@ namespace VideoCommon::Nx2Precompile {
 
 /// EDEN_NX2_PRECOMPILE: 0 (the default) off; 1 prepares a title's precompiled pipelines in the
 /// background where the driver keeps a pipeline cache of its own (NVIDIA, AMD's proprietary
-/// driver); 2 also on other drivers. Read when first asked, after nx2_switches.txt is applied.
+/// driver, Intel's Windows driver); 2 also on other drivers. Read when first asked, after
+/// nx2_switches.txt is applied.
 [[nodiscard]] int Mode();
 
 /// EDEN_NX2_PRECOMPILED_FORCE=1 (#895's switch): prepare again although the stamp says it is done.

@@ -289,6 +289,22 @@ VkShaderStageFlagBits StageFlag(const Shader::Info& info, VkShaderStageFlagBits 
     return slot_stage;
 }
 
+// Votes, ballots, lane ids and shuffles span the guest's 32-thread warp. NVIDIA always runs 32
+// lanes, but Intel picks SIMD16 or SIMD32 per shader: a task shader's ballot then saw half the
+// warp and its meshlet compaction dropped or repeated meshlets (flickering and missing foliage on
+// Arc). Only stages with these ops are pinned, as in compute pipelines; quad ops need no more
+// than 4 lanes.
+bool UsesWarpWidthOps(const Shader::Info& info) {
+    return info.uses_subgroup_vote || info.uses_subgroup_invocation_id ||
+           info.uses_subgroup_shuffles || info.uses_subgroup_mask;
+}
+
+const void* GuestWarpSizeChain(const Device& device, const Shader::Info& info,
+                               VkShaderStageFlagBits stage,
+                               const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT& ci) {
+    return UsesWarpWidthOps(info) && device.CanRequireGuestWarpSize(stage) ? &ci : nullptr;
+}
+
 // The stage of a pipeline stage slot (vertex, tessellation control and evaluation, geometry,
 // fragment).
 VkShaderStageFlagBits SlotStage(size_t index) {
@@ -802,6 +818,9 @@ GraphicsPipeline::GraphicsPipeline(
     for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
         present_stages[stage] = infos[stage] != nullptr;
     }
+    // Mesh pipelines can hold the mesh program in slot 1; the pipeline cache drops pipelines
+    // with only one of the two tessellation stages.
+    has_tessellation = !IsMeshPipeline() && (present_stages[1] || present_stages[2]);
     configure_func = ConfigureFunc(present_stages, stage_infos);
     build.emplace(worker_thread, std::move(func));
 }
@@ -2675,7 +2694,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
     PipelineStates states;
     FillStates(states);
     const bool is_mesh{states.is_mesh};
-    [[maybe_unused]] const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
+    const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
         .pNext = nullptr,
         .requiredSubgroupSize = GuestWarpSize,
@@ -2690,19 +2709,21 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         }
         // Mesh emulation: stage 0 is the vertex shader reading the compute pass's output.
         const bool emulated_vertex{mesh_emulation && stage == 0};
-        [[maybe_unused]] auto& stage_ci =
-            shader_stages.emplace_back(VkPipelineShaderStageCreateInfo{
-                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                .pNext = nullptr,
-                .flags = 0,
-                .stage = emulated_vertex
-                             ? VK_SHADER_STAGE_VERTEX_BIT
-                             : StageFlag(stage_infos[stage],
-                                         MaxwellToVK::ShaderStage(Shader::StageFromIndex(stage))),
-                .module = emulated_vertex ? *mesh_vertex_module : *spv_modules[stage],
-                .pName = "main",
-                .pSpecializationInfo = nullptr,
-            });
+        const VkShaderStageFlagBits stage_flag{
+            emulated_vertex ? VK_SHADER_STAGE_VERTEX_BIT
+                            : StageFlag(stage_infos[stage],
+                                        MaxwellToVK::ShaderStage(Shader::StageFromIndex(stage)))};
+        shader_stages.emplace_back(VkPipelineShaderStageCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .pNext = emulated_vertex ? nullptr
+                                     : GuestWarpSizeChain(device, stage_infos[stage], stage_flag,
+                                                          subgroup_size_ci),
+            .flags = 0,
+            .stage = stage_flag,
+            .module = emulated_vertex ? *mesh_vertex_module : *spv_modules[stage],
+            .pName = "main",
+            .pSpecializationInfo = nullptr,
+        });
     }
     // Mesh emulation draws a plain triangle list without vertex attributes.
     const VkPipelineVertexInputStateCreateInfo emulation_vertex_input{
@@ -2894,6 +2915,11 @@ GplLibrary GraphicsPipeline::MakeShaderLibrary(GplPart part, const PipelineState
     // The library's own set layouts, identically defined to the linked pipeline's (same
     // signature in the key), so the library outlives the pipeline that built it.
     std::array<VkDescriptorSetLayout, NUM_STAGES> set_layouts{};
+    const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+        .pNext = nullptr,
+        .requiredSubgroupSize = GuestWarpSize,
+    };
     static_vector<VkPipelineShaderStageCreateInfo, 5> shader_stages;
     for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
         if (!InPart(part, stage)) {
@@ -2908,13 +2934,14 @@ GplLibrary GraphicsPipeline::MakeShaderLibrary(GplPart part, const PipelineState
         if (!spv_modules[stage]) {
             continue;
         }
-        // Same stage info as the monolithic pipeline (MakePipeline), which sets no subgroup size.
+        // Same stage info as the monolithic pipeline (MakePipeline).
+        const VkShaderStageFlagBits stage_flag{
+            StageFlag(stage_infos[stage], MaxwellToVK::ShaderStage(Shader::StageFromIndex(stage)))};
         shader_stages.push_back({
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .pNext = nullptr,
+            .pNext = GuestWarpSizeChain(device, stage_infos[stage], stage_flag, subgroup_size_ci),
             .flags = 0,
-            .stage = StageFlag(stage_infos[stage],
-                               MaxwellToVK::ShaderStage(Shader::StageFromIndex(stage))),
+            .stage = stage_flag,
             .module = *spv_modules[stage],
             .pName = "main",
             .pSpecializationInfo = nullptr,

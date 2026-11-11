@@ -666,11 +666,33 @@ bool AmdAppCache(const Device& device) {
     return enabled && device.GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY;
 }
 
+/// Intel's Windows driver keeps a disk cache of its own (%LOCALAPPDATA%Low\Intel\ShaderCache,
+/// one file per program: ~476 MB for Lichii after a session on an Arc B580), so the preparation
+/// can build into it. Our VkPipelineCache file is kept beside it for what play builds, as
+/// EDEN_NX2_AMD_APP_CACHE does on AMD: the boot rebuilds of earlier sessions' pipelines read it
+/// (3014 pipelines in 7 s), whatever the driver's cache evicted. EDEN_NX2_INTEL_DRIVER_CACHE=0
+/// treats Intel as before (no preparation, our file only).
+bool IntelDriverCache(const Device& device) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_INTEL_DRIVER_CACHE");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled && device.GetDriverID() == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS;
+}
+
+/// Our VkPipelineCache file is kept although the driver caches pipelines itself: the
+/// preparation's builds then go to the driver's cache only (PlayPipelineCache).
+bool AppCacheBesideDriver(const Device& device) {
+    return AmdAppCache(device) || IntelDriverCache(device);
+}
+
 bool DriverCachesPipelines(const Device& device) {
     switch (device.GetDriverID()) {
     case VK_DRIVER_ID_NVIDIA_PROPRIETARY:
     case VK_DRIVER_ID_AMD_PROPRIETARY:
         return true;
+    case VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS:
+        return IntelDriverCache(device);
     default:
         return false;
     }
@@ -691,7 +713,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
       texture_cache{texture_cache_}, shader_notify{shader_notify_},
       use_asynchronous_shaders{Settings::values.use_asynchronous_shaders.GetValue()},
       use_vulkan_pipeline_cache{Settings::values.use_vulkan_driver_pipeline_cache.GetValue() &&
-                                (!DriverCachesPipelines(device_) || AmdAppCache(device_))},
+                                (!DriverCachesPipelines(device_) || AppCacheBesideDriver(device_))},
       oot_visual_workaround{[] {
           const char* value = std::getenv("EDEN_NX2_OOT_VISUAL_WORKAROUND");
           return value != nullptr && std::string_view{value} == "1";
@@ -772,6 +794,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
             device.IsExtShaderDemoteToHelperInvocationSupported(),
         .support_int64_atomics = device.IsExtShaderAtomicInt64Supported(),
         .support_shared_int64_atomics = device.IsSharedInt64AtomicsSupported(),
+        .support_float32_atomic_add = device.IsFloat32AtomicAddSupported(),
         .support_derivative_control = true,
         .support_geometry_shader_passthrough = device.IsNvGeometryShaderPassthroughSupported(),
         .support_native_ndc = device.IsExtDepthClipControlSupported(),
@@ -788,6 +811,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
             device.IsStorageTexelBufferArrayNonUniformIndexingSupported(),
 
         .warp_size_potentially_larger_than_guest = device.IsWarpSizePotentiallyBiggerThanGuest(),
+        .warp_size_potentially_smaller_than_guest = device.IsWarpSizePotentiallySmallerThanGuest(),
 
         .lower_left_origin_mode = false,
         .need_declared_frag_colors = false,
@@ -2789,8 +2813,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         LogDriverCacheFolder(device, "at boot");
         LOG_INFO(Render_Vulkan, "Our VkPipelineCache file: {}",
                  !use_vulkan_pipeline_cache  ? "off (the driver's own cache only)"
-                 : AmdAppCache(device)        ? "on for pipelines built in play "
-                                                "(EDEN_NX2_AMD_APP_CACHE, up to 512 MiB)"
+                 : AppCacheBesideDriver(device) ? "on for pipelines built in play "
+                                                "(beside the driver's cache, up to 512 MiB)"
                                               : "on");
         LOG_INFO(Render_Vulkan, "VK_KHR_pipeline_binary: {}",
                  device.GetAvailableExtensions().contains("VK_KHR_pipeline_binary")
@@ -4332,6 +4356,22 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     // preparation) one per host thread, at normal priority.
     const size_t full_threads =
         std::max<size_t>(threads, std::max(1U, std::thread::hardware_concurrency()));
+    // On Intel it does not build beside the game: there its compiles took the CPU from the game
+    // (owner, Arc B580 + 6 cores: lag spikes with the preparation running in play, none with
+    // EDEN_NX2_PRECOMPILE=0). Like the warm-up, it builds then only while emulation is paused or
+    // from Prepare Shaders Now (ShaderNotify::WarmMayBuild); the Preparing shaders screen runs it
+    // at full speed as before. EDEN_NX2_PRECOMPILE_WHILE_PLAYING=1 builds beside the game anyway.
+    static const bool while_playing = [] {
+        const char* value = std::getenv("EDEN_NX2_PRECOMPILE_WHILE_PLAYING");
+        return value != nullptr && value[0] == '1';
+    }();
+    const bool hold_beside_game = IntelDriverCache(device) && !while_playing;
+    const auto allowed_threads = [&](bool full) -> size_t {
+        if (full) {
+            return full_threads;
+        }
+        return hold_beside_game && !shader_notify.WarmMayBuild() ? 0 : threads;
+    };
     const auto complete = [&](size_t index) {
         const size_t finished = state.finished.fetch_add(1) + 1;
         {
@@ -4375,8 +4415,9 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         in.exceptions(std::ifstream::failbit);
         while (!stop.stop_requested() && !stop_loading.stop_requested() && !warm_cancel) {
             const bool full = shader_notify.PrecompileFullSpeed();
-            if (worker >= (full ? full_threads : threads)) {
-                // Parked until full speed; done once every record is taken.
+            if (worker >= allowed_threads(full)) {
+                // Parked until full speed (or, on Intel, a pause); done once every record is
+                // taken.
                 if (state.next.load() >= total) {
                     break;
                 }
@@ -5428,10 +5469,10 @@ vk::PipelineCache& PipelineCache::PlayPipelineCache() {
     // gigabytes. With EDEN_NX2_AMD_APP_CACHE, past 512 MiB no new pipeline goes into it either
     // (a VkPipelineCache can't evict; the file is read into RAM at every boot).
     constexpr size_t AmdAppCacheCap = size_t{512} << 20;
-    if (t_precompile_build && AmdAppCache(device)) {
+    if (t_precompile_build && AppCacheBesideDriver(device)) {
         return no_pipeline_cache;
     }
-    if (AmdAppCache(device) &&
+    if (AppCacheBesideDriver(device) &&
         last_cache_size.load(std::memory_order_relaxed) >= AmdAppCacheCap) {
         return no_pipeline_cache;
     }
