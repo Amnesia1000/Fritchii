@@ -399,6 +399,10 @@ inline std::atomic<int> g_draw_packet{-1};
 /// too), then compare the lookup zone with profile_toggle (EXP52 0 vs 1).
 inline constexpr int ExperimentCount = 64;
 inline std::atomic<int> g_experiments[ExperimentCount]{};
+/// Set once LoadExperiments has run: Experiment() tests it inline instead of calling
+/// LoadExperiments (a function-local static guard) on every check (0.5% of the back thread in
+/// the 5.7 -> 5.8.4 sampler comparison, 2026-11-11).
+inline std::atomic<bool> g_experiments_loaded{false};
 
 inline void LoadExperiments() {
     static const bool loaded = [] {
@@ -477,6 +481,7 @@ inline void LoadExperiments() {
                 g_experiments[n].store(std::atoi(value), std::memory_order_relaxed);
             }
         }
+        g_experiments_loaded.store(true, std::memory_order_release);
         return true;
     }();
     static_cast<void>(loaded);
@@ -484,7 +489,9 @@ inline void LoadExperiments() {
 
 /// The value of experiment switch `n` (EDEN_NX2_EXP<n>), 0 unless set.
 [[nodiscard]] inline int Experiment(int n) {
-    LoadExperiments();
+    if (!g_experiments_loaded.load(std::memory_order_acquire)) [[unlikely]] {
+        LoadExperiments();
+    }
     return g_experiments[n].load(std::memory_order_relaxed);
 }
 
