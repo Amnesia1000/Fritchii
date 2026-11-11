@@ -947,6 +947,9 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
             on_submit();
         }
 
+        // fable52_answer_stalls: Swapchain::Present holds submit_mutex across vkQueuePresentKHR,
+        // so the wait for it is timed apart from the submit itself.
+        const auto lock_start = std::chrono::steady_clock::now();
         std::scoped_lock lock{submit_mutex};
         const auto submit_start = std::chrono::steady_clock::now();
         // Slow submits (residency work for new allocations?) with what was made since the last
@@ -960,13 +963,18 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
             const auto end_us =
                 std::chrono::duration_cast<std::chrono::microseconds>(end_done - end_start)
                     .count();
-            if (submit_us > 4000 || end_us > 4000) {
+            const auto lock_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                     submit_start - lock_start)
+                                     .count();
+            if (submit_us > 4000 || end_us > 4000 || lock_us > 4000) {
                 static std::atomic<u32> logged{};
                 if (logged.fetch_add(1, std::memory_order_relaxed) < 200) {
                     LOG_INFO(Render_Vulkan,
-                             "Slow submit: vkQueueSubmit {} us, command buffer End {} us, tick {}; "
-                             "{} images made since the previous submit",
-                             submit_us, end_us, signal_value, images - images_at_last_submit);
+                             "Slow submit: vkQueueSubmit {} us, waiting for the submit lock "
+                             "(present) {} us, command buffer End {} us, tick {}; {} images made "
+                             "since the previous submit",
+                             submit_us, lock_us, end_us, signal_value,
+                             images - images_at_last_submit);
                 }
             }
             images_at_last_submit = images;
