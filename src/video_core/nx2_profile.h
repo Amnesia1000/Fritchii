@@ -133,6 +133,14 @@ inline void Initialize() {
                 std::getenv("EDEN_NX2_SAMPLE_PROFILE") == nullptr;
     const char* value = std::getenv("EDEN_NX2_GPU_PROFILE");
     g_fine = g_enabled && value != nullptr && value[0] == '2';
+    // Scope's entry test (one load for the profiler and the timeline).
+    if (g_enabled) {
+        Common::Nx2Timeline::g_zone_gate.fetch_or(Common::Nx2Timeline::ZoneGateProfile,
+                                                  std::memory_order_release);
+    } else {
+        Common::Nx2Timeline::g_zone_gate.fetch_and(
+            static_cast<u8>(~Common::Nx2Timeline::ZoneGateProfile), std::memory_order_release);
+    }
 }
 
 inline bool Enabled() {
@@ -249,20 +257,56 @@ inline thread_local ThreadData t_data;
     }
 }
 
+#if defined(_MSC_VER)
+#define NX2_PROFILE_FORCEINLINE __forceinline
+#define NX2_PROFILE_NOINLINE __declspec(noinline)
+#else
+#define NX2_PROFILE_FORCEINLINE inline __attribute__((always_inline))
+#define NX2_PROFILE_NOINLINE __attribute__((noinline))
+#endif
+
+/// A zone. With the profiler off and no timeline recording (every normal run), entering one is
+/// one relaxed load of Common::Nx2Timeline::g_zone_gate and a not-taken branch, inlined at the
+/// call site; leaving it tests one byte of the object. The timing and the timeline span are in
+/// Begin and End, out of line.
 class Scope {
 public:
-    explicit Scope(Zone zone_) : Scope{zone_, Enabled(), true} {}
+    NX2_PROFILE_FORCEINLINE explicit Scope(Zone zone_) {
+        if (Common::Nx2Timeline::ZoneGateOpen()) [[unlikely]] {
+            Begin(zone_, Enabled(), true);
+        }
+    }
 
     /// A zone timed only if `on` (a profiled run's choice, such as Fine()); on the timeline only
     /// if `timeline_on` too.
-    Scope(Zone zone_, bool on, bool timeline_on)
-        : zone{zone_}, enabled{on},
-          timeline{timeline_on && Common::Nx2Timeline::Active() &&
-                   (Common::Nx2Timeline::Detail() || IsCoarse(zone_))} {
+    NX2_PROFILE_FORCEINLINE Scope(Zone zone_, bool on, bool timeline_on) {
+        if (on || (timeline_on && Common::Nx2Timeline::ZoneGateOpen())) [[unlikely]] {
+            Begin(zone_, on, timeline_on);
+        }
+    }
+
+    NX2_PROFILE_FORCEINLINE ~Scope() {
+        if (state != 0) [[unlikely]] {
+            End();
+        }
+    }
+
+    Scope(const Scope&) = delete;
+    Scope& operator=(const Scope&) = delete;
+
+private:
+    static constexpr u8 StateTimed = 1;
+    static constexpr u8 StateTimeline = 2;
+
+    NX2_PROFILE_NOINLINE void Begin(Zone zone_, bool on, bool timeline_on) {
+        zone = zone_;
+        const bool timeline = timeline_on && Common::Nx2Timeline::Active() &&
+                              (Common::Nx2Timeline::Detail() || IsCoarse(zone_));
+        state = static_cast<u8>((on ? StateTimed : 0) | (timeline ? StateTimeline : 0));
         if (timeline) {
             timeline_start = Common::Nx2Timeline::Now();
         }
-        if (!enabled) {
+        if (!on) {
             return;
         }
         auto& data = t_data;
@@ -272,12 +316,12 @@ public:
         start = Ticks();
     }
 
-    ~Scope() {
-        if (timeline) {
+    NX2_PROFILE_NOINLINE void End() {
+        if ((state & StateTimeline) != 0) {
             Common::Nx2Timeline::Record(zone_names[static_cast<size_t>(zone)], timeline_start,
                                         Common::Nx2Timeline::Now());
         }
-        if (!enabled) {
+        if ((state & StateTimed) == 0) {
             return;
         }
         const u64 elapsed = Ticks() - start;
@@ -289,16 +333,12 @@ public:
         --data.depth;
     }
 
-    Scope(const Scope&) = delete;
-    Scope& operator=(const Scope&) = delete;
-
-private:
+    // Only `state` is written on the off path; the rest is set by Begin before End reads it.
+    u8 state{}; ///< StateTimed | StateTimeline; 0: nothing to do on exit
     Zone zone;
-    bool enabled;
-    bool timeline;
-    u64 start{};
-    u64 parent_child_ns{};
-    u64 timeline_start{};
+    u64 start;
+    u64 parent_child_ns;
+    u64 timeline_start;
 };
 
 /// TEST: a fine zone (EDEN_NX2_GPU_PROFILE=2), on the timeline only then too.
