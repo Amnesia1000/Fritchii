@@ -443,6 +443,10 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// collector's device memory figure, as deleted images waiting for the GPU are. Logs "Image pool
 /// (EXP42) last 600 frames" and counts pooled creates in "Slow clear texture cache". 1 is the default
 /// (LoadExperiments); 0 = off.
+/// EXP67 (live; bucket in px, 0 = off): depth render targets at an address whose target changes
+/// dims get a host image rounded up to the bucket (ImageFlagBits::HostPadded), so the EXP42 pool
+/// reuses the VkImage for the next frames' nearby dims instead of a create + 0.2-1.3 ms depth bind
+/// (OoT per-NPC depth targets). A texture lookup that finds a padded image stops padding there.
 /// EXP66 (live; MiB, 0 = built in): the EXP42 pool's cap (512 MiB; 1,536 with EXP42=2), trimmed
 /// at once when lowered. NPC passes held it at its cap (~0.5 of the owner's +0.8 GB).
 /// EXP65 (live; 0 = off; vk_texture_cache.h): EXP42 pool entries whose exact create info was never

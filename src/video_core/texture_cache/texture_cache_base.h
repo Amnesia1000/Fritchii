@@ -18,6 +18,7 @@
 #include <type_traits>
 // TODO: find out which don't require stable iters
 #include <unordered_map>
+#include <unordered_set>
 #include "video_core/page_filter.h"
 #include "common/container/unordered_map.h"
 #include "common/container/unordered_set.h"
@@ -697,6 +698,14 @@ private:
     u64 slot_kept_aliased{};
     u64 slot_kept_same_frame{};
     u64 slot_clears{};
+    /// EXP67 (host-padded per-NPC depth targets): addresses whose depth target changed dims
+    /// (padded from then on), addresses where a texture lookup found a padded image (never
+    /// padded again), and counts since the last report.
+    std::unordered_set<GPUVAddr> pad_slots;
+    std::unordered_set<GPUVAddr> pad_unsafe_slots;
+    u64 pad_made{};
+    u64 pad_sampled{};
+    u32 pad_logged{};
     /// EXP64 check: images made again (not by a clear) at a retired image's address and shape
     /// within 16 render frames: a reader of the retired contents, which got guest memory instead.
     u64 slot_remade{};

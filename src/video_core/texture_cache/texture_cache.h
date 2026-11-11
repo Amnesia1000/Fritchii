@@ -815,6 +815,14 @@ void TextureCache<P>::TickFrame() {
         relocation_candidates = relocation_guarded = relocation_relocated = relocation_retired =
             relocation_crowded = 0;
     }
+    if ((pad_made != 0 || pad_sampled != 0) && frame_tick % 600 == 0) {
+        LOG_INFO(HW_GPU,
+                 "Host pad (EXP67={}) last 600 frames: {} padded depth targets made, {} found by "
+                 "a texture lookup; {} varying addresses, {} stopped",
+                 VideoCore::Nx2Debug::Experiment(67), pad_made, pad_sampled, pad_slots.size(),
+                 pad_unsafe_slots.size());
+        pad_made = pad_sampled = 0;
+    }
     if (slot_clears != 0 && frame_tick % 600 == 0) {
         LOG_INFO(HW_GPU,
                  "Slot retire (EXP64={}) last 600 frames: {} cleared targets over same-address "
@@ -3289,6 +3297,20 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config) {
         return NULL_IMAGE_VIEW_ID;
     }
     ImageBase& image = slot_images[image_id];
+    if (True(image.flags & ImageFlagBits::HostPadded)) [[unlikely]] {
+        // EXP67: sampled with normalized coordinates over the padded host image this time;
+        // its address is never padded again.
+        ++pad_sampled;
+        pad_unsafe_slots.insert(image.gpu_addr);
+        if (pad_logged < 20) {
+            ++pad_logged;
+            LOG_WARNING(HW_GPU,
+                        "Host pad (EXP67): format {} {}x{} at {:#x} is sampled as a texture; "
+                        "its address is no longer padded",
+                        static_cast<u32>(image.info.format), image.info.size.width,
+                        image.info.size.height, image.gpu_addr);
+        }
+    }
     const SubresourceBase base = image.TryFindBase(config.Address()).value();
     ASSERT(base.level == 0);
     const ImageViewInfo view_info(config, base.layer);
@@ -4026,6 +4048,41 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                                 new_info.size.height, gpu_addr, frame - retired.render_frame);
                 }
                 break;
+            }
+        }
+    }
+    // EXP67 (live, bucket in pixels, 0 = off): a depth render target at an address whose target
+    // changes dims (OoT's per-NPC depth targets, sized by screen bounds every frame) gets a host
+    // image rounded up to the bucket, so the image pool hands the next frame's target the same
+    // VkImage instead of a new create and a 0.2-1.3 ms depth bind (IMAGE_ALLOC_TIMING).
+    if (const int bucket = VideoCore::Nx2Debug::Experiment(67);
+        bucket > 0 && render_target_lookup && !is_rescaling && RelocationShaped(new_info) &&
+        new_info.num_samples == 1 && !pad_unsafe_slots.contains(gpu_addr)) {
+        const auto type = VideoCore::Surface::GetFormatType(new_info.format);
+        if (type == VideoCore::Surface::SurfaceType::Depth ||
+            type == VideoCore::Surface::SurfaceType::Stencil ||
+            type == VideoCore::Surface::SurfaceType::DepthStencil) {
+            bool varying = pad_slots.contains(gpu_addr);
+            if (!varying) {
+                for (const ImageId overlap_id : join_bad_overlap_ids) {
+                    const ImageBase& overlap = slot_images[overlap_id];
+                    if (overlap.gpu_addr == gpu_addr && overlap.info.format == new_info.format &&
+                        (overlap.info.size.width != new_info.size.width ||
+                         overlap.info.size.height != new_info.size.height)) {
+                        varying = true;
+                        pad_slots.insert(gpu_addr);
+                        break;
+                    }
+                }
+            }
+            if (varying) {
+                const u32 b = static_cast<u32>(bucket);
+                const u32 width = (new_info.size.width + b - 1) / b * b;
+                const u32 height = (new_info.size.height + b - 1) / b * b;
+                if constexpr (requires { runtime.SetNextHostPad(width, height); }) {
+                    runtime.SetNextHostPad(width, height);
+                    ++pad_made;
+                }
             }
         }
     }
@@ -5307,6 +5364,15 @@ u32 TextureCache<P>::RetireSlotPredecessors(const ImageInfo& new_info, GPUVAddr 
     if (!RelocationShaped(new_info)) {
         return 0;
     }
+    // Depth targets only (the per-NPC ones): in the owner's 2026-11-11 playtest the wider rule
+    // retired colour targets (480x270 format 21, 17 times) and the 2560x1440 scene depth that
+    // were wanted again in the same frame. Same-size predecessors are left to EXP43 and the sweep.
+    const auto type = VideoCore::Surface::GetFormatType(new_info.format);
+    if (type != VideoCore::Surface::SurfaceType::Depth &&
+        type != VideoCore::Surface::SurfaceType::Stencil &&
+        type != VideoCore::Surface::SurfaceType::DepthStencil) {
+        return 0;
+    }
     // Not Alias (the per-NPC pile is all Alias: 2,000-3,200 kept a 600 frames for it): the cold
     // sweep deletes those too; live alias links are refused below (aliased_images).
     constexpr ImageFlagBits excluded =
@@ -5335,7 +5401,9 @@ u32 TextureCache<P>::RetireSlotPredecessors(const ImageInfo& new_info, GPUVAddr 
         const Image& old = slot_images[overlap_id];
         // The same slot, reused for another layout of the same format.
         if (old.gpu_addr != gpu_addr || old.info.format != new_info.format ||
-            !RelocationShaped(old.info)) {
+            !RelocationShaped(old.info) ||
+            (old.info.size.width == new_info.size.width &&
+             old.info.size.height == new_info.size.height)) {
             continue;
         }
         seen = true;

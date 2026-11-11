@@ -154,6 +154,15 @@ private:
 
 class TextureCacheRuntime {
 public:
+    /// EXP67: the host extent of the next Image made (TextureCache::JoinImages sets it right
+    /// before the insert; the Image constructor takes and clears it).
+    void SetNextHostPad(u32 width, u32 height) noexcept {
+        next_host_pad_width = width;
+        next_host_pad_height = height;
+    }
+    u32 next_host_pad_width{};
+    u32 next_host_pad_height{};
+
     explicit TextureCacheRuntime(const Device& device_, Scheduler& scheduler_,
                                  MemoryAllocator& memory_allocator_,
                                  StagingBufferPool& staging_buffer_pool_,

@@ -3190,12 +3190,29 @@ void TextureCacheRuntime::TickFrame() {
     });
 }
 
+// EXP67: the host extent JoinImages asked for (TextureCacheRuntime::SetNextHostPad), if any.
+[[nodiscard]] ImageInfo PaddedHostInfo(TextureCacheRuntime& runtime, ImageInfo host,
+                                       VideoCommon::ImageFlagBits& flags) {
+    const u32 width = std::exchange(runtime.next_host_pad_width, 0U);
+    const u32 height = std::exchange(runtime.next_host_pad_height, 0U);
+    if (width >= host.size.width && height >= host.size.height &&
+        (width != host.size.width || height != host.size.height)) {
+        host.size.width = width;
+        host.size.height = height;
+        flags |= VideoCommon::ImageFlagBits::HostPadded;
+    }
+    return host;
+}
+
 Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu_addr_,
              VAddr cpu_addr_)
     : VideoCommon::ImageBase(info_, gpu_addr_, cpu_addr_), scheduler{&runtime_.scheduler},
       runtime{&runtime_},
       original_image(MakeImage(runtime_.device, runtime_.memory_allocator,
-                               TrimmedHostInfo(runtime_.device, info, host_level_offset),
+                               PaddedHostInfo(runtime_,
+                                              TrimmedHostInfo(runtime_.device, info,
+                                                              host_level_offset),
+                                              flags),
                                IsHugeAstcArray(runtime_.device, info) ||
                                        IsUnevenMipRgba8Astc(runtime_.device, info)
                                    ? std::span<const VkFormat>{HugeAstcViewFormats}
