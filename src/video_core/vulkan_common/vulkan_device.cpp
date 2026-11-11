@@ -838,14 +838,16 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     VmaVulkanFunctions functions{};
     functions.vkGetInstanceProcAddr = dld.vkGetInstanceProcAddr;
     functions.vkGetDeviceProcAddr = dld.vkGetDeviceProcAddr;
-    // EDEN_NX2_VMA_NO_PREFER_DEDICATED (boot, 1 = on; from Skitchii 9fb0cdd0a4, skolvolt/Lichii):
+    // EDEN_NX2_VMA_NO_PREFER_DEDICATED (boot, default on, 0 = off; from Skitchii 9fb0cdd0a4,
+    // skolvolt/Lichii; with 32 MiB blocks market A/B 2026-11-11: off 41.4/40.3, on 41.5/42.8 fps,
+    // same VRAM):
     // images the driver only *prefers* in their own memory (NVIDIA: render and depth targets) go
     // in VMA's blocks instead. OoT makes and frees ~2-3 short-lived depth targets a frame (shadow
     // cascades sized anew), and each dedicated one is a kernel allocate, bind and free on the GPU
     // thread. Required dedicated allocations stay dedicated.
     static PFN_vkGetImageMemoryRequirements2 real_image_requirements2 = nullptr;
     if (const char* value = std::getenv("EDEN_NX2_VMA_NO_PREFER_DEDICATED");
-        value != nullptr && value[0] == '1') {
+        value == nullptr || value[0] != '0') {
         real_image_requirements2 = reinterpret_cast<PFN_vkGetImageMemoryRequirements2>(
             dld.vkGetDeviceProcAddr(*logical, "vkGetImageMemoryRequirements2"));
         if (real_image_requirements2 != nullptr) {
@@ -907,12 +909,12 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
             // after ten minutes, with 32 MiB ones ~0.5 GB: a block drains only once all of its
             // images are gone, and fewer per block drain sooner. VMA gives allocations over half a
             // block (8 MiB) their own memory, which goes back to the driver when they are freed.
-            // EDEN_NX2_VMA_BLOCK_MIB (boot; from Skitchii 90fb5ec005, which uses 32): OoT docked
+            // EDEN_NX2_VMA_BLOCK_MIB (boot, default 32; from Skitchii 90fb5ec005): OoT docked
             // makes 6-9 MiB shadow-map depth targets anew every frame, each its own allocation
-            // over half a 16 MiB block.
+            // over half a 16 MiB block. 16 = the old size (fewer holes in long sessions, above).
             .preferredLargeHeapBlockSize = [] {
                 const char* value = std::getenv("EDEN_NX2_VMA_BLOCK_MIB");
-                const u64 mib = value != nullptr ? std::strtoull(value, nullptr, 10) : 16;
+                const u64 mib = value != nullptr ? std::strtoull(value, nullptr, 10) : 32;
                 return (mib != 0 ? mib : 16) * 1024u * 1024u;
             }(),
             .pAllocationCallbacks = nullptr,
