@@ -191,12 +191,16 @@ HeapUsage LastHeapUsage() {
 
 std::optional<u64> GetSystemCommitRoom() {
 #ifdef _WIN32
-    PERFORMANCE_INFORMATION performance{};
-    performance.cb = sizeof(performance);
-    if (GetPerformanceInfo(&performance, sizeof(performance))) {
-        const u64 limit = performance.CommitLimit;
-        const u64 committed = performance.CommitTotal;
-        return (committed < limit ? limit - committed : 0) * performance.PageSize;
+    // GlobalMemoryStatusEx, not GetPerformanceInfo: the latter also counts every process, thread
+    // and handle in the system and took ~3.7 ms a call (388 processes, 176k handles), on the GPU
+    // back thread every 30 frames (TextureCache::TickFrame, ~8.7 ms/s at the Castle Town market).
+    // GlobalMemoryStatusEx takes ~1.4 us and its ullAvailPageFile is the same number (commit limit
+    // minus commit total; equal to the byte in a side-by-side read), only ever lower inside a job
+    // object with a commit quota, where the quota is the tighter real bound anyway.
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    if (GlobalMemoryStatusEx(&status)) {
+        return status.ullAvailPageFile;
     }
 #endif
     return std::nullopt;
