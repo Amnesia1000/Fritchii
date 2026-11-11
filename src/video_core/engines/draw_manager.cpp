@@ -266,6 +266,7 @@ void Maxwell3D::DrawManager::AddLoopInstances(Maxwell3D& maxwell3d, u32 count) {
 void Maxwell3D::DrawManager::DrawEnd(Maxwell3D& maxwell3d, u32 instance_count, bool force_draw) {
     // List draws (nx2_list_draw.h): set between this draw.end and its draw.begin, for this draw only.
     const GPUVAddr list_draw_address = std::exchange(draw_state.list_draw_address, 0);
+    const u64 list_keep_id = std::exchange(draw_state.list_keep_id, 0);
     if (fold_first_instance) [[unlikely]] {
         // EDEN_NX2_FOLD_INSTANCE (from Skitchii (skolvolt/Lichii) draw_manager.cpp DrawEnd).
         fold_first_instance = false;
@@ -303,8 +304,10 @@ void Maxwell3D::DrawManager::DrawEnd(Maxwell3D& maxwell3d, u32 instance_count, b
             indirect_state.max_draw_counts = 1;
             indirect_state.stride = 0;
             indirect_state.list_words = true;
+            indirect_state.list_keep_id = list_keep_id;
             ProcessDrawIndirect(maxwell3d);
             indirect_state.list_words = false;
+            indirect_state.list_keep_id = 0;
             break;
         }
         if (draw_state.draw_indexed) {
