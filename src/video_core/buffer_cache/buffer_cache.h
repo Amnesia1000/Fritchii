@@ -2829,21 +2829,36 @@ void BufferCache<P>::ClearNativeBankSnapshots() {
 template <class P>
 void BufferCache<P>::BindHostGraphicsStorageBuffers(size_t stage) {
     u32 binding_index = 0;
+    // EDEN_NX2_GPU_PROFILE=2: what each binding costs (zones "storage synchronize" and "storage
+    // written marks" under "stage storage buffers", and the storage fine counters).
+    const bool fine = Nx2Profile::Fine();
     ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 index) {
         const Binding& binding = channel_state->storage_buffers[stage][index];
         const bool is_written = ((channel_state->written_storage_buffers[stage] >> index) & 1) != 0;
         if (BindMultiRangeStorage(binding, is_written, graphics_segments)) {
+            Nx2Profile::AddFine(Nx2Profile::FineCounter::StorageMulti, 1);
             return;
         }
         Buffer& buffer = slot_buffers[binding.buffer_id];
         TouchBuffer(buffer, binding.buffer_id);
         const u32 size = binding.size;
-        SynchronizeBuffer(buffer, binding.device_addr, size);
+        {
+            const Nx2Profile::FineScope sync_scope{Nx2Profile::Zone::StorageSync};
+            const bool no_upload = SynchronizeBuffer(buffer, binding.device_addr, size);
+            if (fine) [[unlikely]] {
+                Nx2Profile::AddFine(Nx2Profile::FineCounter::StorageKiB, size >> 10);
+                Nx2Profile::AddFine(no_upload ? Nx2Profile::FineCounter::StorageNoUpload
+                                              : Nx2Profile::FineCounter::StorageUploads,
+                                    1);
+            }
+        }
 
         const u32 offset = buffer.Offset(binding.device_addr);
         buffer.MarkUsage(offset, size);
 
         if (is_written) {
+            const Nx2Profile::FineScope mark_scope{Nx2Profile::Zone::StorageMark};
+            Nx2Profile::AddFine(Nx2Profile::FineCounter::StorageWritten, 1);
             const u32 mark = WrittenStorageMarkSize(size);
             MarkWrittenBuffer(binding.buffer_id, binding.device_addr, mark, false, mark < size);
         }
