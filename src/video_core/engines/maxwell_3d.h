@@ -26,6 +26,7 @@
 #include "video_core/engines/engine_upload.h"
 #include "video_core/gpu.h"
 #include "video_core/macro.h"
+#include "video_core/nx2_list_reader.h"
 #include "video_core/textures/texture.h"
 #include "video_core/engines/maxwell_3d.h"
 
@@ -3245,7 +3246,10 @@ public:
     /// parameters are the GPU-written words at `address`. Returns whether the call was sent to
     /// the back without reading them.
     bool FrontTakeListDraw(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
-                           GPUVAddr address);
+                           GPUVAddr address, const Nx2ListDispatch::ListReader& reader);
+    /// List guard (nx2_list_dispatch.h): the list of the grid the data RAM's marker stands for, set by the
+    /// compute engine that shares the data RAM (KeplerCompute::FrontTakeListDispatch).
+    Nx2ListDispatch::ListReader grid_list;
 
     bool ShouldExecute() const {
         return execute_on;
@@ -3458,6 +3462,19 @@ private:
     /// List draws (nx2_list_draw.h): whether the macro at `start` is the array draw
     /// FrontTakeListDraw sends as an address.
     bool FrontIsListDrawMacro(FrontState& state, const MacroEngine& engine, u32 start);
+    /// List guard (nx2_list_dispatch.h): a write of `method` while the two registers a list draw left
+    /// unwritten are stale (FrontState::list_draw_stale).
+    void FrontNoteListDrawWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method);
+    /// List guard (nx2_list_dispatch.h): reads the list draw's two words back and writes the registers.
+    void FrontResolveListDraw(VideoCommon::GpuSplit& split, FrontState& state);
+    /// List guard (nx2_list_dispatch.h): whether the macro at `start` uses the data RAM.
+    bool FrontMacroUsesDataRam(FrontState& state, const MacroEngine& engine, u32 start);
+    /// List guard: AnalyzeEffects of the macro at `start`, cached (bit 0 data RAM, bit 1 can read
+    /// vertex_buffer.first or count).
+    u8 FrontListGuardEffects(FrontState& state, const MacroEngine& engine, u32 start);
+    /// List guard, before FrontRunMacro picks a body: the data RAM's marker gets its real words
+    /// if the macro uses the data RAM; returns whether the call's register reads must be checked.
+    bool FrontListGuard(VideoCommon::GpuSplit& split, FrontState& state);
     /// GpuSplit::FoldInstance's flush, `engine` a Maxwell3D.
     static void FlushFoldedInstances(void* engine, u32 count);
     /// EDEN_NX2_FOLD_INSTANCES: whether the front counts an instance loop's later instances
