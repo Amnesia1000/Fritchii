@@ -12,6 +12,7 @@
 #include <limits>
 #include <optional>
 #include <tuple>
+#include <unordered_set>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -294,6 +295,26 @@ VkResult TimedVmaCreateImage(const Device &device, VmaAllocator allocator,
     g_timed_create_ns.fetch_add(t1 - t0, std::memory_order_relaxed);
     g_timed_alloc_ns.fetch_add(t2 - t1, std::memory_order_relaxed);
     g_timed_bind_ns.fetch_add(t3 - t2, std::memory_order_relaxed);
+    // Per image, the slow ones (over 500 us in all): is the memory a block VMA had already (a hole
+    // reused) or one it just took (fable_answer_npcdips_2 section 1)? 400 lines at most.
+    static std::mutex blocks_mutex;
+    static std::unordered_set<VkDeviceMemory> blocks_seen;
+    static u32 slow_logged = 0;
+    bool new_block = false;
+    {
+        std::scoped_lock lock{blocks_mutex};
+        new_block = blocks_seen.insert(alloc_info.deviceMemory).second;
+        if (t3 - t0 < 500'000 || slow_logged >= 400) {
+            return VK_SUCCESS;
+        }
+        ++slow_logged;
+    }
+    LOG_INFO(Render_Vulkan,
+             "Slow image create: {}x{} format {} usage {:#x}, {} KiB at offset {} KiB of {} "
+             "block; vkCreateImage {} us, allocate {} us, bind {} us",
+             ci.extent.width, ci.extent.height, static_cast<u32>(ci.format), ci.usage,
+             alloc_info.size >> 10, alloc_info.offset >> 10, new_block ? "a NEW" : "an old",
+             (t1 - t0) / 1000, (t2 - t1) / 1000, (t3 - t2) / 1000);
     return VK_SUCCESS;
 }
 } // Anonymous namespace
