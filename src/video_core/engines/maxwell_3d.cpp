@@ -705,7 +705,29 @@ void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods,
         ProcessDirtyRegisters(methods[i], ProcessShadowRam(methods[i], arguments[i]));
     }
     const VideoCommon::Nx2Profile::FineScope upload_scope{VideoCommon::Nx2Profile::Zone::CbUpload};
-    memory_manager.WriteWordsCached(address + offset, values.data(), count);
+    const GPUVAddr destination = address + offset;
+    // EDEN_NX2_CB_DIRECT (from Skitchii (skolvolt/Lichii) maxwell_3d.cpp CallConstBufferWords):
+    // what WriteWordsCached does for words within one device page (proven above) outside Switch 2
+    // sparse memory, with one translation (as MemoryManager::Write) instead of WriteBlockImpl's
+    // page walk: the words, then the invalidation accumulated word by word, as WriteWordsCached
+    // accumulates it. While an EXP49 read-back download is in flight, the walk, so its FinishRead
+    // check still runs first. Unmapped: the walk.
+    u8* const pointer =
+        VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_cb_direct, "EDEN_NX2_CB_DIRECT",
+                                         1) != 0 &&
+                VideoCore::g_read_downloads.load(std::memory_order_relaxed) == 0 &&
+                (destination + bytes <= Tegra::g_nx2_sparse_low.load(std::memory_order_relaxed) ||
+                 destination >= Tegra::g_nx2_sparse_high.load(std::memory_order_relaxed))
+            ? memory_manager.GetPointer(destination)
+            : nullptr;
+    if (pointer != nullptr) [[likely]] {
+        std::memcpy(pointer, values.data(), bytes);
+        for (u32 i = 0; i < count; ++i) {
+            memory_manager.AccumulateInvalidation(destination + u64{i} * sizeof(u32), sizeof(u32));
+        }
+    } else {
+        memory_manager.WriteWordsCached(destination, values.data(), count);
+    }
     regs.const_buffer.offset += static_cast<u32>(bytes);
 }
 

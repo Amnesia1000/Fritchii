@@ -104,6 +104,13 @@ inline std::atomic<int> g_runahead{-1};
 /// EDEN_NX2_RUNAHEAD_MS (live, default 16): how far the back may lag the oldest early answer.
 inline std::atomic<int> g_runahead_ms{-1};
 
+/// EDEN_NX2_CB_DIRECT (live, default 1; from Skitchii (skolvolt/Lichii)): a run of constant
+/// buffer words within one device page outside Switch 2 sparse memory is written through one
+/// translation and a memcpy instead of WriteWordsCached's page walk (Maxwell3D::
+/// CallConstBufferWords). Exact: the same bytes and the same accumulated invalidations; 0 = the
+/// page walk.
+inline std::atomic<int> g_cb_direct{-1};
+
 /// Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP63, live through the debug server:
 /// slots for batches of fixes built together and A/B-tested in one session
 /// (E:\OotRemakeEmulation\work\EXPERIMENTS.md lists which fix uses which slot). 0 = off.
@@ -503,6 +510,9 @@ inline void LoadExperiments() {
     }
     if (name == "EDEN_NX2_RUNAHEAD_MS") {
         return &g_runahead_ms;
+    }
+    if (name == "EDEN_NX2_CB_DIRECT") {
+        return &g_cb_direct;
     }
     return nullptr;
 }
