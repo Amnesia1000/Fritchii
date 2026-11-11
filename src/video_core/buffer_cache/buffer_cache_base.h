@@ -48,6 +48,7 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_runahead.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_async_readback.h"
 #include "video_core/nx2_download_trace.h"
@@ -424,6 +425,14 @@ public:
     /// applying one doesn't download the GPU's copy over another (WriteMemory keeps the GPU data
     /// on the pages it writes).
     void ClaimCpuWrites(std::span<const std::pair<DAddr, u64>> ranges);
+
+    /// EDEN_NX2_RUNAHEAD (nx2_runahead.h), back thread, mutex held: the guest CPU's bytes of
+    /// [device_addr, device_addr + size) as a run-ahead chunk captured them (`bytes`). Registered
+    /// memory gets them in its host buffer now, instead of a CPU-modified mark a later upload
+    /// would read guest memory for (by then it may hold the next frame); the uniform bank
+    /// snapshot of the page takes them too, so it keeps matching the host buffer. Memory no
+    /// buffer holds is marked as before (a buffer made there later reads guest memory: a risk).
+    void Nx2ApplyCpuBytes(DAddr device_addr, u64 size, const u8* bytes);
 
     /// Return true when there are uncommitted buffers to be downloaded
     [[nodiscard]] bool HasUncommittedFlushes() const noexcept;

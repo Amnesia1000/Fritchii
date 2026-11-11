@@ -525,9 +525,41 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
             return static_cast<RasterizerVulkan*>(argument)->FencesQuiet(strict, *epoch);
         },
         this);
+    runahead_hooks = VideoCommon::Runahead::Hooks{
+        .argument = this,
+        .guest_pointer = [](void* argument, u64 device) -> const u8* {
+            return static_cast<RasterizerVulkan*>(argument)
+                ->device_memory.GetPointer<u8>(static_cast<DAddr>(device));
+        },
+        .may_hold_images =
+            [](void* argument, u64 device, u64 size) {
+                return static_cast<RasterizerVulkan*>(argument)->texture_cache.page_filter.Any(
+                    static_cast<DAddr>(device), size);
+            },
+        .apply =
+            [](void* argument, const VideoCommon::Runahead::Chunk& chunk) {
+                static_cast<RasterizerVulkan*>(argument)->Nx2ApplyRunaheadChunk(chunk);
+            },
+        .bound_programs =
+            [](void* argument) {
+                const auto* const maxwell = static_cast<RasterizerVulkan*>(argument)->maxwell3d;
+                if (maxwell == nullptr) {
+                    return std::array<u64, 2>{};
+                }
+                const auto& regs = maxwell->regs;
+                return std::array<u64, 2>{
+                    (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) |
+                        regs.pipelines[1].reserved[1],
+                    (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) |
+                        regs.pipelines[5].reserved[1],
+                };
+            },
+    };
+    VideoCommon::Runahead::SetHooks(&runahead_hooks);
 }
 
 RasterizerVulkan::~RasterizerVulkan() {
+    VideoCommon::Runahead::SetHooks(nullptr);
     VideoCommon::GpuSplit::Get().SetIdleHook(nullptr, nullptr);
     VideoCommon::GpuSplit::Get().SetFenceQuietCheck(nullptr, nullptr);
     scheduler.WaitWorker();
@@ -2740,6 +2772,46 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
         buffer_cache.WriteMemory(addr, size);
     }
     pipeline_cache.InvalidateRegion(addr, size);
+}
+
+void RasterizerVulkan::Nx2ApplyRunaheadChunk(const VideoCommon::Runahead::Chunk& chunk) {
+    // As OnCacheInvalidations, with the buffer cache taking the chunk's bytes instead of a mark.
+    std::vector<std::pair<DAddr, u64>> ranges;
+    ranges.reserve(chunk.ranges.size());
+    for (const auto& range : chunk.ranges) {
+        ranges.emplace_back(static_cast<DAddr>(range.address), range.size);
+    }
+    const auto any = [&](const VideoCommon::PageFilter& filter) {
+        return std::ranges::any_of(ranges, [&filter](const std::pair<DAddr, u64>& range) {
+            return filter.Any(range.first, range.second);
+        });
+    };
+    {
+        std::scoped_lock lock{buffer_cache.mutex};
+        buffer_cache.ClaimCpuWrites(ranges);
+    }
+    // Images still upload from guest memory when next used (the front writes no word early for
+    // a chunk with image pages, so the CPU has not run ahead of those bytes).
+    if (any(texture_cache.page_filter)) {
+        std::scoped_lock lock{texture_cache.mutex};
+        for (const auto& [addr, size] : ranges) {
+            if (texture_cache.page_filter.Any(addr, size)) {
+                texture_cache.WriteMemory(addr, size);
+            }
+        }
+    }
+    {
+        std::scoped_lock lock{buffer_cache.mutex};
+        for (const auto& range : chunk.ranges) {
+            buffer_cache.Nx2ApplyCpuBytes(static_cast<DAddr>(range.address), range.size,
+                                          chunk.bytes.data() + range.offset);
+        }
+    }
+    if (any(pipeline_cache.page_filter)) {
+        for (const auto& [addr, size] : ranges) {
+            pipeline_cache.InvalidateRegion(addr, size);
+        }
+    }
 }
 
 bool RasterizerVulkan::TryCacheInvalidation(DAddr addr, u64 size) {

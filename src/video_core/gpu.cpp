@@ -43,6 +43,7 @@
 #include "video_core/nx2_async_readback.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_runahead.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
 
@@ -113,6 +114,11 @@ struct GPU::Impl {
 
     /// Synchronizes CPU writes with Host GPU memory.
     void InvalidateGPUCache() {
+        // EDEN_NX2_RUNAHEAD: behind the frontier the guest's newest bytes are not the draws'
+        // (the front's next boundary takes them); past it they are applied at once (exact).
+        if (VideoCommon::Runahead::HandleInvalidate(system)) {
+            return;
+        }
         std::vector<std::pair<DAddr, u64>> writes;
         std::function<void(PAddr, size_t)> callback_writes(
             [&writes](PAddr address, size_t size) { writes.emplace_back(address, size); });
@@ -156,6 +162,15 @@ struct GPU::Impl {
             for (const auto& [address, size] : *writes) {
                 callback(address, size);
             }
+        }
+        // EDEN_NX2_RUNAHEAD: writes taken into chunks the back has not applied yet.
+        if (VideoCommon::Runahead::g_exact_used.load(std::memory_order_acquire)) {
+            VideoCommon::Runahead::ForEachUnappliedRange(
+                [](void* argument, u64 address, u64 size) {
+                    (*static_cast<const std::function<void(DAddr, size_t)>*>(argument))(
+                        address, static_cast<size_t>(size));
+                },
+                const_cast<std::function<void(DAddr, size_t)>*>(&callback));
         }
     }
 

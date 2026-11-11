@@ -36,6 +36,7 @@
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
+#include "video_core/nx2_runahead.h"
 
 namespace Core {
 class System;
@@ -302,6 +303,11 @@ private:
     FenceManager fence_manager;
     FrameDump frame_dump;
     FlashWatch flash_watch;
+
+    /// EDEN_NX2_RUNAHEAD (nx2_runahead.h): the caches' side, registered while this rasterizer
+    /// lives. Back thread: a chunk's CPU bytes into the caches, exactly (Nx2ApplyCpuBytes).
+    void Nx2ApplyRunaheadChunk(const VideoCommon::Runahead::Chunk& chunk);
+    VideoCommon::Runahead::Hooks runahead_hooks{};
 
     boost::container::static_vector<u32, MAX_IMAGE_VIEWS> image_view_indices;
     std::array<VideoCommon::ImageViewId, MAX_IMAGE_VIEWS> image_view_ids;
