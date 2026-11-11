@@ -190,6 +190,16 @@ struct WordManager {
         [[maybe_unused]] std::span<u64> cached_words = Span(Type::CachedCPU);
         CollectedRanges ranges;
         IterateWords(dirty_addr - cpu_addr, size, [&](size_t index, u64 mask) {
+            if (enable && (type == Type::CPU || type == Type::CachedCPU)) {
+                // A page gains a CPU or an Untracked bit (EDEN_NX2_STORAGE_SYNC_MEMO): a CPU
+                // mark sets both, a cached write the Untracked one. Pages holding them already
+                // cannot be in a range a memo holds as clean.
+                const u64 held = type == Type::CPU ? state_words[index] & untracked_words[index]
+                                                   : untracked_words[index];
+                if ((held & mask) != mask) {
+                    ++dirty_gen;
+                }
+            }
             if constexpr (hot_pages) {
                 if (enable) {
                     HotPagesOnChange(type, index, mask, untracked_words[index]);
@@ -408,6 +418,10 @@ struct WordManager {
         CollectedRanges ranges;
         for (u64 word_index = 0; word_index < num_words; ++word_index) {
             const u64 cached_bits = cached_words[word_index];
+            // The cached pages turn CPU-modified (EDEN_NX2_STORAGE_SYNC_MEMO).
+            if (cached_bits != 0) {
+                ++dirty_gen;
+            }
             CollectChangedRanges(false, word_index, untracked_words[word_index], cached_bits, ranges);
             untracked_words[word_index] |= cached_bits;
             cpu_words[word_index] |= cached_bits;
@@ -629,6 +643,11 @@ struct WordManager {
     /// Bit per word, set while the word has no CPU and no Untracked page (DirtyWords). Every
     /// change to those words updates it: a per-word form of PR #161's upload_words count.
     u64 clean_words = 0;
+    /// EDEN_NX2_STORAGE_SYNC_MEMO: bumped whenever a page of this manager gains a CPU or an
+    /// Untracked bit (ChangeRegionStateImpl, FlushCachedWrites; the constructor's all-dirty
+    /// state comes before any memo). Only grows. Nothing else sets those bits, so a range left
+    /// clean at one value is still clean while it holds.
+    u64 dirty_gen = 0;
     DeviceTracker* tracker = nullptr;
     VAddr cpu_addr = 0;
     u32 hot_epoch = 0;

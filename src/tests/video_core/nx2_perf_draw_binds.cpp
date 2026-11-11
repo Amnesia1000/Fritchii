@@ -394,3 +394,71 @@ TEST_CASE("Nx2 storage sync scan: scanned uploads match full uploads", "[video_c
     }
     REQUIRE(full->ModifiedCpuRegion(BASE, span) == scanned->ModifiedCpuRegion(BASE, span));
 }
+
+TEST_CASE("Nx2 storage sync memo: an unchanged generation sum means a clean range", "[video_core]") {
+    FakeRasterizer rasterizer;
+    auto tracker = std::make_unique<Tracker>(rasterizer);
+    std::mt19937_64 rng{0x6e17ULL};
+    constexpr u64 span = 6 * MANAGER;
+    const auto random_range = [&]() -> std::pair<DAddr, u64> {
+        static constexpr u64 sizes[] = {4, 256, PAGE, 3 * PAGE, WORD, 3 * WORD + 100, MANAGER,
+                                        2 * MANAGER + 5 * PAGE};
+        const u64 size = sizes[rng() % std::size(sizes)];
+        const u64 offset = rng() % 2 == 0 ? (rng() % (span / PAGE)) * PAGE : rng() % span;
+        return {BASE + offset, (std::max<u64>)((std::min)(size, span - offset), 1)};
+    };
+    struct Memo {
+        DAddr addr;
+        u64 size;
+        u64 sum;
+    };
+    std::vector<Memo> memos;
+    u64 hits = 0;
+    for (int step = 0; step < 40000; ++step) {
+        const auto [addr, size] = random_range();
+        switch (rng() % 10) {
+        case 0:
+            tracker->MarkRegionAsCpuModified(addr, size);
+            break;
+        case 1:
+            tracker->UnmarkRegionAsCpuModified(addr, size);
+            break;
+        case 2:
+            tracker->CachedCpuWrite(addr, size);
+            break;
+        case 3:
+            tracker->FlushCachedWrites();
+            break;
+        case 4:
+            tracker->MarkRegionAsGpuModified(addr, size);
+            break;
+        case 5:
+            tracker->UnmarkRegionAsGpuModified(addr, size);
+            break;
+        default: {
+            // A synchronize as SynchronizeStorageMemo runs it: the sum before, the walk, the
+            // memo stored when the sum held across it.
+            u64 before = 0;
+            const bool tracked = tracker->DirtyGenerationSum(addr, size, before);
+            (void)Upload(*tracker, addr, size);
+            u64 after = 0;
+            if (tracked && tracker->DirtyGenerationSum(addr, size, after) && after == before) {
+                memos.push_back({addr, size, after});
+                if (memos.size() > 64) {
+                    memos.erase(memos.begin());
+                }
+            }
+            break;
+        }
+        }
+        for (const Memo& memo : memos) {
+            u64 sum = 0;
+            if (tracker->DirtyGenerationSum(memo.addr, memo.size, sum) && sum == memo.sum) {
+                ++hits;
+                REQUIRE_FALSE(tracker->CheckScannedWalk(memo.addr, memo.size).walks);
+                REQUIRE_FALSE(tracker->IsRegionCpuModified(memo.addr, memo.size));
+            }
+        }
+    }
+    REQUIRE(hits > 0);
+}

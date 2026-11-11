@@ -840,6 +840,12 @@ private:
     /// and unprotected pages the scanned walk would have left out.
     void VerifyStorageSyncScan(DAddr device_addr, u32 size);
 
+    /// EDEN_NX2_STORAGE_SYNC_MEMO: SynchronizeBuffer, skipped when the range's memo still holds;
+    /// stores the memo when the synchronize left the range clean. `verify` (=2): a hit checks
+    /// the range and synchronizes anyway. Returns what SynchronizeBuffer returns (true: nothing
+    /// uploaded).
+    bool SynchronizeStorageMemo(Buffer& buffer, DAddr device_addr, u32 size, bool verify);
+
     void UploadMemory(Buffer& buffer, u64 total_size_bytes, u64 largest_copy,
                       std::span<BufferCopy> copies);
 
@@ -1159,6 +1165,18 @@ private:
     int storage_sync_scan = 0;
     /// EDEN_NX2_STORAGE_SYNC_SCAN=2 totals (VerifyStorageSyncScan).
     DirtyWalkVerify storage_scan_verify;
+    /// EDEN_NX2_STORAGE_SYNC_MEMO: a range SynchronizeBuffer left clean, and the dirty generation
+    /// sum of its tracker managers then (MemoryTrackerBase::DirtyGenerationSum). size 0 = empty.
+    struct StorageSyncMemo {
+        DAddr device_addr{};
+        u32 size{};
+        u64 gen_sum{};
+    };
+    static constexpr u32 STORAGE_SYNC_MEMO_BITS = 9;
+    std::array<StorageSyncMemo, size_t{1} << STORAGE_SYNC_MEMO_BITS> storage_sync_memo{};
+    /// EDEN_NX2_STORAGE_SYNC_MEMO=2 totals: hits checked, hits whose range was not clean
+    /// (cpu_pages / untracked_pages unused).
+    DirtyWalkVerify storage_memo_verify;
     u64 frame_tick = 0;
 
     /// EDEN_NX2_EXP18 (zortos293/Lichii#641): resolved bindings are kept while the GPU mappings

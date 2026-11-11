@@ -225,6 +225,32 @@ public:
         return walked;
     }
 
+    /// EDEN_NX2_STORAGE_SYNC_MEMO: the sum of the dirty generations (WordManager::dirty_gen) of
+    /// the managers over a range. The generations only grow, so the sum is unchanged exactly
+    /// when none of them moved: no page of those managers gained a CPU or Untracked bit. False
+    /// when a manager is missing (nothing to prove; the walk would create it all dirty).
+    [[nodiscard]] bool DirtyGenerationSum(VAddr query_cpu_addr, u64 query_size,
+                                          u64& sum) const noexcept {
+        if (query_size == 0) {
+            return false;
+        }
+        const size_t first = query_cpu_addr >> HIGHER_PAGE_BITS;
+        const size_t last = (query_cpu_addr + query_size - 1) >> HIGHER_PAGE_BITS;
+        if (last >= NUM_HIGH_PAGES) {
+            return false;
+        }
+        u64 total = 0;
+        for (size_t page_index = first; page_index <= last; ++page_index) {
+            const Manager* const manager = top_tier[page_index];
+            if (manager == nullptr) {
+                return false;
+            }
+            total += manager->dirty_gen;
+        }
+        sum = total;
+        return true;
+    }
+
     struct DirtyWalkCheck {
         u64 cpu_pages = 0;       ///< CPU pages the full walk uploads and the dirty-word walk would not
         u64 untracked_pages = 0; ///< Untracked pages it re-tracks and the dirty-word walk would not

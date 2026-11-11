@@ -2839,6 +2839,14 @@ void BufferCache<P>::BindHostGraphicsStorageBuffers(size_t stage) {
     SCOPE_EXIT {
         storage_sync_scan = 0;
     };
+    // EDEN_NX2_STORAGE_SYNC_MEMO: ranges left clean are not walked again while no page of their
+    // tracker managers gained a CPU or Untracked bit. Not with hot pages (always dirty), and
+    // only behind a walk that leaves the range clean from the words themselves (the full walk
+    // or the scanned one, not the CleanWords walk).
+    const int memo_mode = VideoCore::Nx2Debug::SwitchValue(
+        VideoCore::Nx2Debug::g_storage_sync_memo, "EDEN_NX2_STORAGE_SYNC_MEMO");
+    const bool sync_memo = memo_mode != 0 && !HotPagesOn() &&
+                           (storage_sync_scan == 1 || !Nx2Perf::On(Nx2Perf::Opt::CleanWords));
     ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 index) {
         const Binding& binding = channel_state->storage_buffers[stage][index];
         const bool is_written = ((channel_state->written_storage_buffers[stage] >> index) & 1) != 0;
@@ -2851,7 +2859,10 @@ void BufferCache<P>::BindHostGraphicsStorageBuffers(size_t stage) {
         const u32 size = binding.size;
         {
             const Nx2Profile::FineScope sync_scope{Nx2Profile::Zone::StorageSync};
-            const bool no_upload = SynchronizeBuffer(buffer, binding.device_addr, size);
+            const bool no_upload =
+                sync_memo ? SynchronizeStorageMemo(buffer, binding.device_addr, size,
+                                                   memo_mode == 2)
+                          : SynchronizeBuffer(buffer, binding.device_addr, size);
             if (fine) [[unlikely]] {
                 Nx2Profile::AddFine(Nx2Profile::FineCounter::StorageKiB, size >> 10);
                 Nx2Profile::AddFine(no_upload ? Nx2Profile::FineCounter::StorageNoUpload
@@ -4360,6 +4371,74 @@ void BufferCache<P>::VerifyStorageSyncScan(DAddr device_addr, u32 size) {
         verify.untracked_pages = 0;
         verify.last_report = now;
     }
+}
+
+template <class P>
+bool BufferCache<P>::SynchronizeStorageMemo(Buffer& buffer, DAddr device_addr, u32 size,
+                                            bool verify) {
+    StorageSyncMemo& memo =
+        storage_sync_memo[((device_addr ^ (u64{size} << 40)) * 0x9E3779B97F4A7C15ULL) >>
+                          (64 - STORAGE_SYNC_MEMO_BITS)];
+    u64 gen_before = 0;
+    const bool tracked = memory_tracker.DirtyGenerationSum(device_addr, size, gen_before);
+    if (tracked && memo.size == size && memo.device_addr == device_addr &&
+        memo.gen_sum == gen_before) {
+        Nx2Profile::AddFine(Nx2Profile::FineCounter::StorageMemoHits, 1);
+        if (!verify) {
+            // Left clean at this sum, and no page of its managers gained a CPU or Untracked bit
+            // since: the walk would upload nothing and re-protect nothing.
+            return true;
+        }
+        // EDEN_NX2_STORAGE_SYNC_MEMO=2: the range must hold no CPU or Untracked page. Then
+        // synchronize as without the memo.
+        auto& check = storage_memo_verify;
+        ++check.checked;
+        ++check.total_checked;
+        if (memory_tracker.CheckScannedWalk(device_addr, size).walks) [[unlikely]] {
+            ++check.mismatches;
+            ++check.total_mismatches;
+            if (check.logged < 16) {
+                ++check.logged;
+                LOG_ERROR(HW_GPU,
+                          "Nx2 storage sync memo verify: a memo hit at {:#x}+{:#x} has CPU or "
+                          "unprotected pages",
+                          device_addr, size);
+            }
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (check.last_report == std::chrono::steady_clock::time_point{}) {
+            check.last_report = now;
+        } else if (now - check.last_report >= std::chrono::seconds{10}) {
+            if (check.mismatches != 0) {
+                LOG_ERROR(HW_GPU,
+                          "Nx2 storage sync memo verify, last 10 s: {} of {} memo hits wrong; "
+                          "since start {} of {}",
+                          check.mismatches, check.checked, check.total_mismatches,
+                          check.total_checked);
+            } else {
+                LOG_INFO(HW_GPU,
+                         "Nx2 storage sync memo verify, last 10 s: 0 of {} memo hits wrong; "
+                         "since start {} of {}",
+                         check.checked, check.total_mismatches, check.total_checked);
+            }
+            check.checked = 0;
+            check.mismatches = 0;
+            check.last_report = now;
+        }
+    }
+    const bool no_upload = SynchronizeBuffer(buffer, device_addr, size);
+    // The walk clears every CPU and Untracked bit of the range (hot pages are off) and sets
+    // none: with the sum unchanged across it, nothing marked the range during it either.
+    u64 gen_after = 0;
+    if (tracked && memory_tracker.DirtyGenerationSum(device_addr, size, gen_after) &&
+        gen_after == gen_before) {
+        memo = StorageSyncMemo{
+            .device_addr = device_addr,
+            .size = size,
+            .gen_sum = gen_after,
+        };
+    }
+    return no_upload;
 }
 
 template <class P>

@@ -210,6 +210,7 @@ enum class FineCounter : u32 {
     StorageMulti,    ///< Graphics storage bindings bound as several ranges (BindMultiRangeStorage)
     StorageNoUpload, ///< Graphics storage synchronizes that uploaded nothing
     StorageUploads,  ///< Graphics storage synchronizes that uploaded something
+    StorageMemoHits, ///< Graphics storage synchronizes skipped (EDEN_NX2_STORAGE_SYNC_MEMO)
     Count,
 };
 
@@ -218,7 +219,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(FineCounter::Count)
         "uniform rebinds", "uniform streamed", "uniform cached",  "uniform other",
         "uniform bytes",   "storage binds",    "texture handles", "storage KiB",
         "storage written binds", "storage multi-range binds", "storage syncs without upload",
-        "storage syncs uploading",
+        "storage syncs uploading", "storage sync memo hits",
     };
 static_assert(fine_counter_names.back() != nullptr, "a fine counter without a name");
 

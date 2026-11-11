@@ -202,6 +202,16 @@ inline std::atomic<int> g_tex_bank_gen{-1};
 /// 1 = on, 2 = the full walk as before, after counting the CPU and unprotected pages the scan
 /// would have left out ("Nx2 storage sync scan verify" every 10 s, must stay 0).
 inline std::atomic<int> g_storage_sync_scan{-1};
+/// EDEN_NX2_STORAGE_SYNC_MEMO (live, default 0): a graphics storage binding synchronized while
+/// the dirty generations of the 4 MiB tracker managers it covers stayed put (WordManager::
+/// dirty_gen: bumped whenever a page gains a CPU-modified or unprotected bit) is clean after it,
+/// and stays clean while that sum holds: the next bind of the same range skips SynchronizeBuffer,
+/// whose walk would find nothing (BufferCache::SynchronizeStorageMemo; 512 entries keyed by
+/// range). Not with EXP48's hot pages (they stay dirty) nor with the CleanWords walk unless
+/// EDEN_NX2_STORAGE_SYNC_SCAN=1 picks the walk. A miss costs a sum over the managers twice.
+/// 1 = on, 2 = every hit synchronizes anyway after checking that no word of the range holds a
+/// CPU-modified or unprotected page ("Nx2 storage sync memo verify" every 10 s, must stay 0).
+inline std::atomic<int> g_storage_sync_memo{-1};
 
 /// Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP63, live through the debug server:
 /// slots for batches of fixes built together and A/B-tested in one session
@@ -643,6 +653,9 @@ inline void LoadExperiments() {
     }
     if (name == "EDEN_NX2_STORAGE_SYNC_SCAN") {
         return &g_storage_sync_scan;
+    }
+    if (name == "EDEN_NX2_STORAGE_SYNC_MEMO") {
+        return &g_storage_sync_memo;
     }
     return nullptr;
 }
