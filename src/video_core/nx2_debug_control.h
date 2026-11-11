@@ -226,7 +226,7 @@ inline std::atomic<int> g_feed_memory_overlay{-1};
 /// write as a later writer, so no holder ever takes a 3D patch and the QMD read waits. 1 = on.
 inline std::atomic<int> g_qmd_3d_patch{-1};
 
-/// Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP63, live through the debug server:
+/// Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP79, live through the debug server:
 /// slots for batches of fixes built together and A/B-tested in one session
 /// (E:\OotRemakeEmulation\work\EXPERIMENTS.md lists which fix uses which slot). 0 = off.
 /// EXP8 (texture upload hitches), bits: 1 = keep idle upload staging buffers up to 32 MiB
@@ -443,6 +443,15 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// collector's device memory figure, as deleted images waiting for the GPU are. Logs "Image pool
 /// (EXP42) last 600 frames" and counts pooled creates in "Slow clear texture cache". 1 is the default
 /// (LoadExperiments); 0 = off.
+/// EXP64 (live; 0 = off; fable_answer_npcdips 3, NPC-pass dips): a new render target that a clear
+/// overwrites whole retires the images at its exact address that the GPU wrote in an earlier
+/// frame (TextureCache::RetireSlotPredecessors) instead of leaving them as bad overlaps for EXP58's
+/// sweep 60 frames later. Ocarina draws each passing NPC into a D32 target sized by its screen
+/// bounds at a fixed slot, so each frame made a new image and the old ones piled up (80-95 bad
+/// overlaps walked per clear, ~2,000 live images, the pool full at 512 MiB, VMA growing: device
+/// memory +0.8 GB while the chicken passes). Not for shapes the CPU read or that were sampled in a
+/// later frame (the relocation guard's GuardCpuRead / GuardSampled), images bound, queued for
+/// download, aliased, scaled or of the excluded kinds. Logs "Slot retire (EXP64) last 600 frames".
 /// EXP45 (live; 1 = off): the native compute write extent self-check (BufferCache::ExtentTrust,
 /// fable_answer_25): a program is marked in full until a dispatch at its dims showed its proof
 /// holds, and for good once one wrote past it (Ocarina of Time's glowing triangles, 2026-11-09).
@@ -488,7 +497,7 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// prove 2 shows 0 differ first (under EXP19=2 without EXP50, blend writes without
 /// Dirty::Blending already leave the clean lookup's attachments stale, and verify reports that
 /// too), then compare the lookup zone with profile_toggle (EXP52 0 vs 1).
-inline constexpr int ExperimentCount = 64;
+inline constexpr int ExperimentCount = 80;
 inline std::atomic<int> g_experiments[ExperimentCount]{};
 /// Set once LoadExperiments has run: Experiment() tests it inline instead of calling
 /// LoadExperiments (a function-local static guard) on every check (0.5% of the back thread in

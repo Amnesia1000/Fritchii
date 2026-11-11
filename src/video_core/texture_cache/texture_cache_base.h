@@ -687,6 +687,13 @@ private:
     u64 relocation_retired{};
     u64 relocation_crowded{}; ///< Cleared targets over two or more images of their shape
     u64 relocation_same_frame{}; ///< Candidates whose only predecessors were written this frame
+    /// EXP64, since the last report: retired, and those kept by reason.
+    u64 slot_retired{};
+    u64 slot_kept_guard{};
+    u64 slot_kept_busy{};
+    u64 slot_kept_kind{};
+    u64 slot_kept_same_frame{};
+    u64 slot_clears{};
     bool relocation_seen{};
 
     /// The frame last_write_frame, CheckCrossFrameUse and RelocationCandidate's same-frame rule
@@ -800,6 +807,9 @@ private:
     /// queued, bound as another target of this clear, registered in another channel). Else none.
     [[nodiscard]] ImageId RelocationCandidate(const ImageInfo& new_info, GPUVAddr gpu_addr,
                                               DAddr cpu_addr);
+    /// EXP64: retires JoinImages' bad overlaps at exactly gpu_addr that a new cleared render
+    /// target supersedes (see the EXP64 notes in nx2_debug_control.h); returns how many.
+    u32 RetireSlotPredecessors(const ImageInfo& new_info, GPUVAddr gpu_addr);
     /// EXP43=2: moves the image to gpu_addr / cpu_addr in place of a new one (fable_answer_12 2A
     /// steps 1-6); its VkImage, memory, views, framebuffers and scale state stay.
     void RelocateImage(ImageId image_id, GPUVAddr gpu_addr, DAddr cpu_addr);

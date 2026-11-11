@@ -815,6 +815,16 @@ void TextureCache<P>::TickFrame() {
         relocation_candidates = relocation_guarded = relocation_relocated = relocation_retired =
             relocation_crowded = 0;
     }
+    if (slot_clears != 0 && frame_tick % 600 == 0) {
+        LOG_INFO(HW_GPU,
+                 "Slot retire (EXP64={}) last 600 frames: {} cleared targets over same-address "
+                 "images, {} retired; kept: {} guarded (sampled or CPU-read later), {} busy "
+                 "(bound, download queued), {} of an excluded kind, {} written this frame",
+                 VideoCore::Nx2Debug::Experiment(64), slot_clears, slot_retired, slot_kept_guard,
+                 slot_kept_busy, slot_kept_kind, slot_kept_same_frame);
+        slot_clears = slot_retired = slot_kept_guard = slot_kept_busy = slot_kept_kind =
+            slot_kept_same_frame = 0;
+    }
     TickRenderClock();
     TickRelocationTombstones();
     // What the caches made and destroyed (fable_answer_16 4; counted always, logged on request).
@@ -3989,6 +3999,20 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             }
         }
     }
+    // EXP64 (fable_answer_npcdips 3): the cleared target's same-address predecessors go now.
+    if (clearing_render_targets && !join_bad_overlap_ids.empty() && join_copies_to_do.empty() &&
+        join_left_aliased_ids.empty() && join_right_aliased_ids.empty() &&
+        join_ignore_textures.empty() && VideoCore::Nx2Debug::Experiment(64) != 0) {
+        const auto& regs = maxwell3d->regs;
+        const auto& surface = regs.clear_surface;
+        const bool depth_cleared = regs.zeta_enable && regs.zeta.Address() == gpu_addr &&
+                                   (surface.Z || surface.S);
+        const bool colour_cleared = (surface.R || surface.G || surface.B || surface.A) &&
+                                    surface.RT < NUM_RT && regs.rt[surface.RT].Address() == gpu_addr;
+        if (depth_cleared || colour_cleared) {
+            RetireSlotPredecessors(new_info, gpu_addr);
+        }
+    }
     const auto create_start = std::chrono::steady_clock::now();
     const ImageId new_image_id = slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
     rt_stats.create_ns += NsSince(create_start);
@@ -5246,6 +5270,92 @@ void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
     if (!clearing_render_targets) {
         image.drawn_since_clear = true;
     }
+}
+
+template <class P>
+u32 TextureCache<P>::RetireSlotPredecessors(const ImageInfo& new_info, GPUVAddr gpu_addr) {
+    if (!RelocationShaped(new_info)) {
+        return 0;
+    }
+    constexpr ImageFlagBits excluded =
+        ImageFlagBits::Sparse | ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
+        ImageFlagBits::UnwrittenSparse | ImageFlagBits::Unbacked | ImageFlagBits::Converted |
+        ImageFlagBits::AsynchronousDecode | ImageFlagBits::IsDecoding | ImageFlagBits::Remapped |
+        ImageFlagBits::Alias | ImageFlagBits::CostlyLoad | ImageFlagBits::Rescaled |
+        ImageFlagBits::TrimmedLevels;
+    const auto queued = [](ImageId image_id, const auto& downloads) {
+        return std::ranges::any_of(downloads, [image_id](const auto& download) {
+            return download.is_swizzle && download.object_id == image_id;
+        });
+    };
+    const auto bound = [this](const ImageBase& image) {
+        return std::ranges::any_of(image.image_view_ids, [this](ImageViewId view) {
+            return render_targets.depth_buffer_id == view ||
+                   std::ranges::find(render_targets.color_buffer_ids, view) !=
+                       render_targets.color_buffer_ids.end();
+        });
+    };
+    const u64 render_frame = RenderFrame();
+    bool seen = false;
+    boost::container::small_vector<ImageId, 8> retire;
+    for (const ImageId overlap_id : join_bad_overlap_ids) {
+        const Image& old = slot_images[overlap_id];
+        // The same slot, reused for another layout of the same format.
+        if (old.gpu_addr != gpu_addr || old.info.format != new_info.format ||
+            !RelocationShaped(old.info)) {
+            continue;
+        }
+        seen = true;
+        if (True(old.flags & excluded) || False(old.flags & ImageFlagBits::Registered) ||
+            False(old.flags & ImageFlagBits::GpuModified) || old.HasScaled() ||
+            !old.aliased_images.empty()) {
+            ++slot_kept_kind;
+            continue;
+        }
+        if (old.last_write_frame == render_frame) {
+            ++slot_kept_same_frame; // may still be read in this frame
+            continue;
+        }
+        const auto shape = relocation_shapes.find(RelocationShapeKey(old.info));
+        const u8 guard = shape != relocation_shapes.end() ? shape->second.guard : 0;
+        constexpr u8 read_later = GuardSampled | GuardCpuRead;
+        if (old.info.forced_flushed || old.info.dma_downloaded ||
+            ((guard | old.relocation_guard_noted) & read_later) != 0) {
+            ++slot_kept_guard;
+            continue;
+        }
+        if (bound(old) || queued(overlap_id, uncommitted_downloads) ||
+            std::ranges::any_of(committed_downloads, [&](const auto& downloads) {
+                return queued(overlap_id, downloads);
+            })) {
+            ++slot_kept_busy;
+            continue;
+        }
+        retire.push_back(overlap_id);
+    }
+    slot_clears += seen ? 1 : 0;
+    for (const ImageId old_id : retire) {
+        // As EXP43=1 and the cold sweep delete one (no download: the contents have no reader).
+        Image& old = slot_images[old_id];
+        MarkStale(old); // before UntrackImage (see MarkStale)
+        if (True(old.flags & ImageFlagBits::Tracked)) {
+            UntrackImage(old, old_id);
+        }
+        UnregisterImage(old_id);
+        DeleteImage(old_id);
+        ++rt_stats.retired_images;
+    }
+    if (!retire.empty()) {
+        join_bad_overlap_ids.erase(std::remove_if(join_bad_overlap_ids.begin(),
+                                                  join_bad_overlap_ids.end(),
+                                                  [&retire](ImageId id) {
+                                                      return std::ranges::find(retire, id) !=
+                                                             retire.end();
+                                                  }),
+                                   join_bad_overlap_ids.end());
+    }
+    slot_retired += retire.size();
+    return static_cast<u32>(retire.size());
 }
 
 template <class P>

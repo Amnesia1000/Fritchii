@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <limits>
 #include <optional>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -297,6 +298,53 @@ VkResult TimedVmaCreateImage(const Device &device, VmaAllocator allocator,
 }
 } // Anonymous namespace
 
+// EDEN_NX2_DEPTH_POOL=1 (boot, off by default): depth/stencil attachments come from their own VMA
+// pool per memory type, so the memory a freed depth target leaves is reused by depth targets only.
+// The NPC-pass dips (night market): a new D32 target nearly every frame, and its vmaBindImageMemory
+// took 1.35 ms on average against 0.11 ms for colour targets (IMAGE_ALLOC_TIMING): the driver
+// readies the memory for depth on each bind, which memory that held depth before may skip. The
+// pools live as long as the VMA allocator (never destroyed: images may outlive this object).
+static VmaPool DepthAttachmentPool(VmaAllocator allocator, const VkImageCreateInfo &ci,
+                                   const VmaAllocationCreateInfo &alloc_ci) {
+    static const bool enabled = [] {
+        const char *value = std::getenv("EDEN_NX2_DEPTH_POOL");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    if (!enabled) {
+        return VK_NULL_HANDLE;
+    }
+    u32 type = 0;
+    if (vmaFindMemoryTypeIndexForImageInfo(allocator, &ci, &alloc_ci, &type) != VK_SUCCESS) {
+        return VK_NULL_HANDLE;
+    }
+    static std::mutex mutex;
+    static std::vector<std::tuple<VmaAllocator, u32, VmaPool>> pools;
+    std::scoped_lock lock{mutex};
+    for (const auto &[owner, pool_type, pool] : pools) {
+        if (owner == allocator && pool_type == type) {
+            return pool;
+        }
+    }
+    using namespace Common::Literals;
+    const VmaPoolCreateInfo pool_ci{
+        .memoryTypeIndex = type,
+        .flags = 0,
+        .blockSize = 64_MiB,
+        .minBlockCount = 0,
+        .maxBlockCount = 0,
+        .priority = 0.f,
+        .minAllocationAlignment = 0,
+        .pMemoryAllocateNext = nullptr,
+    };
+    VmaPool pool{};
+    if (vmaCreatePool(allocator, &pool_ci, &pool) != VK_SUCCESS) {
+        return VK_NULL_HANDLE;
+    }
+    LOG_INFO(Render_Vulkan, "Depth attachment pool (EDEN_NX2_DEPTH_POOL) for memory type {}", type);
+    pools.emplace_back(allocator, type, pool);
+    return pool;
+}
+
 bool MemoryAllocator::ImageTimingEnabled() noexcept {
     static const bool enabled = [] {
         const char *value = std::getenv("EDEN_NX2_IMAGE_ALLOC_TIMING");
@@ -337,11 +385,16 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
     VmaAllocationInfo alloc_info{};
     const u64 texels = u64{ci.extent.width} * ci.extent.height * ci.extent.depth * ci.arrayLayers;
     const bool huge = texels > MaxBackedImageTexels;
+    // EDEN_NX2_DEPTH_POOL: the first attempt only; the fallbacks below take any memory.
+    VmaAllocationCreateInfo first_ci = alloc_ci;
+    if (!dedicated && (ci.usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0) {
+        first_ci.pool = DepthAttachmentPool(allocator, ci, alloc_ci);
+    }
     VkResult result = huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
                       : ImageTimingEnabled()
-                          ? TimedVmaCreateImage(device, allocator, ci, alloc_ci, handle,
+                          ? TimedVmaCreateImage(device, allocator, ci, first_ci, handle,
                                                 allocation, alloc_info)
-                          : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+                          : vmaCreateImage(allocator, &ci, &first_ci, &handle, &allocation, &alloc_info);
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
         // Over the device memory budget (Switch 2 titles fill 8 GB cards): let the driver page
         // it out rather than failing the draw and aborting.
