@@ -1735,6 +1735,12 @@ void EmitContext::DefineInputs(const IR::Program& program) {
         if (stage == Stage::Fragment) {
             Decorate(subgroup_local_invocation_id, spv::Decoration::Flat);
         }
+        if (info.uses_subgroup_shuffles && profile.warp_size_potentially_smaller_than_guest) {
+            subgroup_size = DefineInput(*this, U32[1], false, spv::BuiltIn::SubgroupSize);
+            if (stage == Stage::Fragment) {
+                Decorate(subgroup_size, spv::Decoration::Flat);
+            }
+        }
     }
     if (info.uses_fswzadd) {
         const Id f32_one{Const(1.0f)};

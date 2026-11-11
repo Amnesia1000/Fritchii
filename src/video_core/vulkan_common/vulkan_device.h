@@ -572,6 +572,15 @@ FN_MAX_LIMIT_LIST
                control.minSubgroupSize <= GuestWarpSize && GuestWarpSize <= control.maxSubgroupSize;
     }
 
+    /// Returns true if a stage may run in subgroups narrower than the guest's warp (Intel runs
+    /// fragment and vertex shaders SIMD8 or SIMD16, and those cannot be given a size).
+    bool IsWarpSizePotentiallySmallerThanGuest() const {
+        const u32 min_size = extensions.subgroup_size_control
+                                 ? properties.subgroup_size_control.minSubgroupSize
+                                 : properties.subgroup_properties.subgroupSize;
+        return min_size != 0 && min_size < GuestWarpSize;
+    }
+
     /// Returns true if the device supports the provided subgroup feature.
     bool IsSubgroupFeatureSupported(VkSubgroupFeatureFlagBits feature) const {
         return properties.subgroup_properties.supportedOperations & feature;

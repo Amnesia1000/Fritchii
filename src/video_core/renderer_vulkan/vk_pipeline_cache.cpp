@@ -788,6 +788,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
             device.IsStorageTexelBufferArrayNonUniformIndexingSupported(),
 
         .warp_size_potentially_larger_than_guest = device.IsWarpSizePotentiallyBiggerThanGuest(),
+        .warp_size_potentially_smaller_than_guest = device.IsWarpSizePotentiallySmallerThanGuest(),
 
         .lower_left_origin_mode = false,
         .need_declared_frag_colors = false,

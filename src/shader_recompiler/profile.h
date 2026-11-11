@@ -67,6 +67,9 @@ struct Profile {
     bool support_storage_texel_buffer_array_nonuniform_indexing{};
 
     bool warp_size_potentially_larger_than_guest{};
+    /// Some stages may run in subgroups narrower than the guest's 32 lanes (Intel's SIMD8/16
+    /// fragment and vertex shaders): shuffles from lanes past the subgroup are kept in bounds.
+    bool warp_size_potentially_smaller_than_guest{};
 
     bool lower_left_origin_mode{};
     /// Fragment outputs have to be declared even if they are not written to avoid undefined values.

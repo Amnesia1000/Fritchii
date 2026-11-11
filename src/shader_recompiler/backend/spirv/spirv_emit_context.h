@@ -286,6 +286,9 @@ public:
     Id sample_id{};
     Id is_helper_invocation{};
     Id subgroup_local_invocation_id{};
+    /// SubgroupSize, when the host subgroup may be narrower than the guest warp and the program
+    /// shuffles (Profile::warp_size_potentially_smaller_than_guest).
+    Id subgroup_size{};
     Id subgroup_mask_eq{};
     Id subgroup_mask_lt{};
     Id subgroup_mask_le{};
