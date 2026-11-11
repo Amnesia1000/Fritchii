@@ -869,14 +869,18 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         }
     }
 
-    // EDEN_NX2_ASYNC_IMAGE_FREE (boot, default on; =0 off): the texture cache destroys the images
+    // EDEN_NX2_ASYNC_IMAGE_FREE (boot, default OFF since 2026-11-11; =1 on): the texture cache destroys the images
     // it deleted on a thread of its own (with dedicated allocations each is a vkFreeMemory into
     // the driver: ~22 ms/s on the GPU back thread at the Castle Town market). VMA then has to lock
     // internally, which it does without EXTERNALLY_SYNCHRONIZED (an uncontended lock per
     // allocation call, its default mode).
     allocator_thread_safe = [] {
+        // Off by default: with the free thread on, the back's unzoned stall time ("other") was
+        // 185 ms/s vs 129 with it off at the market (GPU_PROFILE=2, 46.4 vs 48.8 fps): its frees
+        // contend with the back's allocations for VMA's and the driver's locks. To revisit as
+        // "free only while the back sleeps" (Fable's fable_answer_next.md, Q1).
         const char* value = std::getenv("EDEN_NX2_ASYNC_IMAGE_FREE");
-        return value == nullptr || value[0] != '0';
+        return value != nullptr && value[0] == '1';
     }();
     VmaAllocatorCreateFlags flags =
         allocator_thread_safe ? VmaAllocatorCreateFlags{0}
