@@ -672,6 +672,13 @@ inline void LoadExperiments() {
         // the chicken much better, no glitches; owner asked for them as defaults.
         g_experiments[24].store(4, std::memory_order_relaxed);
         g_experiments[75].store(600, std::memory_order_relaxed);
+        // EXP77 = 1 and EXP78 = 1 (2026-11-12): kill frames re-made GPU-drawn targets the cold
+        // sweep had just taken and filled them from memory nobody wrote. Owner Stalchild fight with
+        // both on vs off: frames over 22 ms 2.54 -> 2.06 a second, over 28 ms 0.39 -> 0.30, up to
+        // 500 uploads (1.5 GB) skipped per 600 frames, device memory steady ~5.5 GB, no glitches
+        // seen; owner asked for them as defaults.
+        g_experiments[77].store(1, std::memory_order_relaxed);
+        g_experiments[78].store(1, std::memory_order_relaxed);
         // EXP49 = 1 (2026-11-10, owner's call for v5.7): the async read-back. Stalchild fight,
         // flipped every 30 s while the owner fought: 51.9 -> 56.9 fps, the back's read flushes
         // 35 -> 6 ms/s, guest lock waits halved. No beams in that session or two later ones
