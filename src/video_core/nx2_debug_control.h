@@ -127,6 +127,10 @@ inline std::atomic<int> g_gpu_wake{-1};
 inline std::atomic<int> g_runahead{-1};
 /// EDEN_NX2_RUNAHEAD_MS (live, default 16): how far the back may lag the oldest early answer.
 inline std::atomic<int> g_runahead_ms{-1};
+/// EDEN_NX2_BUFFER_CHURN_STATS=1 (live, diagnostic, off by default; Fable's ideal pipeline design
+/// 8.3): buffer cache creates and deletes per second by cause, and staging buffer creates by
+/// caller (video_core/buffer_churn_stats.h). "Buffer churn (5 s" every 5 s while on.
+inline std::atomic<int> g_buffer_churn_stats{-1};
 
 /// EDEN_NX2_CB_DIRECT (live, default 1; from Skitchii (skolvolt/Lichii)): a run of constant
 /// buffer words within one device page outside Switch 2 sparse memory is written through one
@@ -997,6 +1001,9 @@ inline void LoadExperiments() {
     }
     if (name == "EDEN_NX2_GPU_WAKE") {
         return &g_gpu_wake;
+    }
+    if (name == "EDEN_NX2_BUFFER_CHURN_STATS") {
+        return &g_buffer_churn_stats;
     }
     if (name == "EDEN_NX2_RUNAHEAD") {
         return &g_runahead;

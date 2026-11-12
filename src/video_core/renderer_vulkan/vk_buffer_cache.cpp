@@ -432,11 +432,13 @@ u32 BufferCacheRuntime::SetVertexRepackLayout(const Tegra::Engines::Maxwell3D::R
 }
 
 StagingBufferRef BufferCacheRuntime::UploadStagingBuffer(size_t size) {
-    return staging_pool.Request(size, MemoryUsage::Upload);
+    return staging_pool.Request(size, MemoryUsage::Upload, false,
+                                VideoCommon::BufferChurnStats::StagingCaller::BufferUpload);
 }
 
 StagingBufferRef BufferCacheRuntime::DownloadStagingBuffer(size_t size, bool deferred) {
-    return staging_pool.Request(size, MemoryUsage::Download, deferred);
+    return staging_pool.Request(size, MemoryUsage::Download, deferred,
+                                VideoCommon::BufferChurnStats::StagingCaller::BufferDownload);
 }
 
 VkFormat BufferCacheRuntime::TexelBufferFormat(VideoCore::Surface::PixelFormat format) const {

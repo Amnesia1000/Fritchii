@@ -1355,11 +1355,13 @@ void TextureCacheRuntime::Finish() {
 }
 
 StagingBufferRef TextureCacheRuntime::UploadStagingBuffer(size_t size, bool deferred) {
-    return staging_buffer_pool.Request(size, MemoryUsage::Upload, deferred);
+    return staging_buffer_pool.Request(size, MemoryUsage::Upload, deferred,
+                                       VideoCommon::BufferChurnStats::StagingCaller::TextureUpload);
 }
 
 StagingBufferRef TextureCacheRuntime::DownloadStagingBuffer(size_t size, bool deferred) {
-    return staging_buffer_pool.Request(size, MemoryUsage::Download, deferred);
+    return staging_buffer_pool.Request(size, MemoryUsage::Download, deferred,
+                                       VideoCommon::BufferChurnStats::StagingCaller::TextureDownload);
 }
 
 void TextureCacheRuntime::FreeDeferredStagingBuffer(StagingBufferRef& ref) {

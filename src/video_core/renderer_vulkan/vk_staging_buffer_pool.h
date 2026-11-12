@@ -11,6 +11,7 @@
 
 #include "common/common_types.h"
 
+#include "video_core/buffer_churn_stats.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -37,7 +38,11 @@ public:
                                Scheduler& scheduler);
     ~StagingBufferPool();
 
-    StagingBufferRef Request(size_t size, MemoryUsage usage, bool deferred = false);
+    /// `caller`: who asks, counted when a buffer has to be created (EDEN_NX2_BUFFER_CHURN_STATS).
+    StagingBufferRef Request(
+        size_t size, MemoryUsage usage, bool deferred = false,
+        VideoCommon::BufferChurnStats::StagingCaller caller =
+            VideoCommon::BufferChurnStats::StagingCaller::Other);
     void FreeDeferred(StagingBufferRef& ref);
 
     [[nodiscard]] VkBuffer StreamBuf() const noexcept {
@@ -92,16 +97,21 @@ private:
     static constexpr size_t NUM_LEVELS = sizeof(size_t) * CHAR_BIT;
     using StagingBuffersCache = std::array<StagingBuffers, NUM_LEVELS>;
 
-    StagingBufferRef GetStreamBuffer(size_t size);
+    StagingBufferRef GetStreamBuffer(size_t size,
+                                     VideoCommon::BufferChurnStats::StagingCaller caller);
 
     bool AreRegionsActive(size_t region_begin, size_t region_end) const;
 
-    StagingBufferRef GetStagingBuffer(size_t size, MemoryUsage usage, bool deferred = false);
+    StagingBufferRef GetStagingBuffer(size_t size, MemoryUsage usage, bool deferred,
+                                      VideoCommon::BufferChurnStats::StagingCaller caller,
+                                      bool stream_full = false);
 
     std::optional<StagingBufferRef> TryGetReservedBuffer(size_t size, MemoryUsage usage,
                                                          bool deferred);
 
-    StagingBufferRef CreateStagingBuffer(size_t size, MemoryUsage usage, bool deferred);
+    StagingBufferRef CreateStagingBuffer(size_t size, MemoryUsage usage, bool deferred,
+                                         VideoCommon::BufferChurnStats::StagingCaller caller,
+                                         bool stream_full);
 
     StagingBuffersCache& GetCache(MemoryUsage usage);
 

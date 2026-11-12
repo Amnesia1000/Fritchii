@@ -210,7 +210,8 @@ public:
     std::span<u8> BindMappedUniformBuffer([[maybe_unused]] size_t stage,
                                           [[maybe_unused]] u32 binding_index,
                                           u32 size) {
-        const StagingBufferRef ref = staging_pool.Request(size, MemoryUsage::Upload);
+        const StagingBufferRef ref = staging_pool.Request(
+            size, MemoryUsage::Upload, false, VideoCommon::BufferChurnStats::StagingCaller::UniformStream);
         last_stream_uniform = StreamUniformRef{
             .buffer = ref.buffer,
             .device_address = ref.device_address,

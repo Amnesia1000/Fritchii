@@ -15,6 +15,7 @@
 #include "common/bit_util.h"
 #include "common/common_types.h"
 #include "common/literals.h"
+#include "video_core/buffer_churn_stats.h"
 #include "video_core/churn_counters.h"
 #include "video_core/memstage_stats.h"
 #include "video_core/nx2_debug_control.h"
@@ -124,11 +125,12 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
 
 StagingBufferPool::~StagingBufferPool() = default;
 
-StagingBufferRef StagingBufferPool::Request(size_t size, MemoryUsage usage, bool deferred) {
+StagingBufferRef StagingBufferPool::Request(size_t size, MemoryUsage usage, bool deferred,
+                                            VideoCommon::BufferChurnStats::StagingCaller caller) {
     if (!deferred && usage == MemoryUsage::Upload && size <= region_size) {
-        return GetStreamBuffer(size);
+        return GetStreamBuffer(size, caller);
     }
-    return GetStagingBuffer(size, usage, deferred);
+    return GetStagingBuffer(size, usage, deferred, caller);
 }
 
 void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
@@ -151,13 +153,14 @@ void StagingBufferPool::TickFrame() {
     ReleaseCache(MemoryUsage::Download);
 }
 
-StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
+StagingBufferRef StagingBufferPool::GetStreamBuffer(
+    size_t size, VideoCommon::BufferChurnStats::StagingCaller caller) {
     if (AreRegionsActive(Region(free_iterator) + 1,
                          (std::min)(Region(iterator + size) + 1, NUM_SYNCS))) {
         // EDEN_NX2_MEMSTAGE_STATS: the stream ring is busy (the memory stage's join 3).
         VideoCommon::MemStageStats::StreamFull();
         // Avoid waiting for the previous usages to be free
-        return GetStagingBuffer(size, MemoryUsage::Upload);
+        return GetStagingBuffer(size, MemoryUsage::Upload, false, caller, true);
     }
     const u64 current_tick = scheduler.CurrentTick();
     std::fill(sync_ticks.begin() + Region(used_iterator), sync_ticks.begin() + Region(iterator),
@@ -175,7 +178,7 @@ StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
         if (AreRegionsActive(0, Region(size) + 1)) {
             VideoCommon::MemStageStats::StreamFull();
             // Avoid waiting for the previous usages to be free
-            return GetStagingBuffer(size, MemoryUsage::Upload);
+            return GetStagingBuffer(size, MemoryUsage::Upload, false, caller, true);
         }
     }
     const size_t offset = iterator;
@@ -197,12 +200,13 @@ bool StagingBufferPool::AreRegionsActive(size_t region_begin, size_t region_end)
                        [gpu_tick](u64 sync_tick) { return gpu_tick < sync_tick; });
 };
 
-StagingBufferRef StagingBufferPool::GetStagingBuffer(size_t size, MemoryUsage usage,
-                                                     bool deferred) {
+StagingBufferRef StagingBufferPool::GetStagingBuffer(
+    size_t size, MemoryUsage usage, bool deferred,
+    VideoCommon::BufferChurnStats::StagingCaller caller, bool stream_full) {
     if (const std::optional<StagingBufferRef> ref = TryGetReservedBuffer(size, usage, deferred)) {
         return *ref;
     }
-    return CreateStagingBuffer(size, usage, deferred);
+    return CreateStagingBuffer(size, usage, deferred, caller, stream_full);
 }
 
 std::optional<StagingBufferRef> StagingBufferPool::TryGetReservedBuffer(size_t size,
@@ -229,10 +233,14 @@ std::optional<StagingBufferRef> StagingBufferPool::TryGetReservedBuffer(size_t s
     return it->Ref();
 }
 
-StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage usage, bool deferred) {
+StagingBufferRef StagingBufferPool::CreateStagingBuffer(
+    size_t size, MemoryUsage usage, bool deferred,
+    VideoCommon::BufferChurnStats::StagingCaller caller, bool stream_full) {
     auto const log2_size = Common::Log2Ceil<u32>(u32(size));
     // EDEN_NX2_MEMSTAGE_STATS: no free staging buffer of this size (any user).
     VideoCommon::MemStageStats::StagingCreated(u64{1} << log2_size);
+    // EDEN_NX2_BUFFER_CHURN_STATS: the same, by caller.
+    VideoCommon::BufferChurnStats::StagingCreated(caller, u64{1} << log2_size, stream_full);
     VkBufferCreateInfo buffer_ci = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .pNext = nullptr,
