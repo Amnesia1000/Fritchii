@@ -613,6 +613,15 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// author's PC). Only on pages with no GPU-modified range and no GPU-modified bit (a tracked
 /// page's GPU bits count); never in Nx2Perf verify. A guest CPU access to such a page takes the
 /// slow path, as for any tracked page; a guest write there untracks it as before.
+/// EXP109 (live, 0 = off; port of zortos293/Lichii#1161 f5902c6c68, lucastaonline): a guest write
+/// that untracks buffer cache pages (RasterizerVulkan::OnCPUWrite) changes their host protection
+/// after dropping buffer_cache.mutex instead of under it (the back waited for those system calls
+/// before draws). The word state changes under the lock as before; the page count decrements are
+/// collected per thread (VideoCommon::DeferredPageCaching) and applied in order before OnCPUWrite
+/// returns, so the guest's write still finds the page unprotected. Ours defers only decrements
+/// (increments, e.g. an upload inside the write's slow path, apply at once): late decrements only
+/// keep a page protected a little longer; a late increment could let a page the texture cache
+/// tracks lose its protection in between. Never in Nx2Perf verify.
 /// EXP101 (live, 0 = off, 1 = runs, 2 = cached page pointer + prefetch; fable52_answer_presenter): nvhost_gpu::SubmitGPFIFOImpl's pushbuffer
 /// snapshot reads runs of entries whose GPU addresses follow each other with one ReadBlockUnsafe
 /// instead of one per entry (OoT's presenting thread submits ~6,500 entries a frame; the loop is

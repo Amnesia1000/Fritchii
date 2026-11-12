@@ -3616,8 +3616,29 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
         VideoCommon::Nx2FastDrawCount::NotePoolWrite(addr, size);
     }
     {
-        std::scoped_lock lock{buffer_cache.mutex};
-        if (buffer_cache.OnCPUWrite(addr, size)) {
+        // EXP109 (zortos293/Lichii#1161 f5902c6c68, lucastaonline): the pages the write untracks
+        // change their host protection after the lock is dropped: drawing waited for those
+        // system calls (~1 us each, thousands a second at OoT's water). The word state changes
+        // under the lock as before. A write trapping on a page still protected until then finds
+        // the page already untracked and changes nothing; tracking (+1) is never deferred.
+        static thread_local VideoCommon::DeferredPageCaching deferred;
+        const bool defer = VideoCommon::t_deferred_page_caching == nullptr &&
+                           VideoCore::Nx2Debug::Experiment(109) != 0;
+        bool gpu_modified;
+        {
+            std::scoped_lock lock{buffer_cache.mutex};
+            if (defer) {
+                VideoCommon::t_deferred_page_caching = &deferred;
+            }
+            gpu_modified = buffer_cache.OnCPUWrite(addr, size);
+            if (defer) {
+                VideoCommon::t_deferred_page_caching = nullptr;
+            }
+        }
+        if (defer) {
+            deferred.ApplyAll();
+        }
+        if (gpu_modified) {
             return true;
         }
     }
