@@ -2899,6 +2899,9 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     // changes the texels (layers, sparse pieces, the stale skip) leaves no hash behind.
     const u64 last_hash_lo = image.nx2_content_hash_lo;
     const u64 last_hash_hi = image.nx2_content_hash_hi;
+    if ((VideoCore::Nx2Debug::Experiment(76) & 4) != 0) {
+        ForgetContent(image_id, image, false);
+    }
     image.nx2_content_hash_lo = 0;
     image.nx2_content_hash_hi = 0;
 
@@ -2963,6 +2966,10 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
             nx2_upload_skip_bytes += image.guest_size_bytes;
             image.nx2_content_hash_lo = last_hash_lo;
             image.nx2_content_hash_hi = last_hash_hi;
+            if ((keep_mode & 4) != 0) {
+                nx2_content_index[ContentKey{ContentShape(image.info), last_hash_lo,
+                                             last_hash_hi}] = image_id;
+            }
             return;
         }
     }
@@ -3011,6 +3018,10 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         if (False(image.flags & ImageFlagBits::CpuModified)) {
             image.nx2_content_hash_lo = hash[0];
             image.nx2_content_hash_hi = hash[1] | 1; // never 0/0
+            if ((keep_mode & 4) != 0) {
+                nx2_content_index[ContentKey{ContentShape(image.info), image.nx2_content_hash_lo,
+                                             image.nx2_content_hash_hi}] = image_id;
+            }
         }
     }
     if (upload_trace) [[unlikely]] {
@@ -3398,6 +3409,9 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config) {
         image_id = InsertImage(info, image_gpu_addr, RelaxedOptions{});
         if (image_id) {
             NoteNewSampledImage(image_id, image_gpu_addr);
+            if ((VideoCore::Nx2Debug::Experiment(76) & 4) != 0) [[unlikely]] {
+                NoteContentLookup(image_id);
+            }
         }
     }
     if (!image_id) {
@@ -3869,14 +3883,105 @@ ImageId TextureCache<P>::InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
 }
 
 template <class P>
+u64 TextureCache<P>::ContentShape(const ImageInfo& info) noexcept {
+    u64 shape = static_cast<u64>(info.format);
+    const auto mix = [&shape](u64 value) { shape = (shape ^ value) * 0x100000001B3ULL; };
+    mix(static_cast<u64>(info.type));
+    mix(info.size.width);
+    mix(info.size.height);
+    mix(info.size.depth);
+    mix(static_cast<u64>(info.resources.levels));
+    mix(static_cast<u64>(info.resources.layers));
+    mix(info.num_samples);
+    mix(info.block.width);
+    mix(info.block.height);
+    mix(info.block.depth);
+    mix(info.layer_stride);
+    mix(info.pitch);
+    mix(info.tile_width_spacing);
+    return shape;
+}
+
+template <class P>
+void TextureCache<P>::ForgetContent(ImageId image_id, const ImageBase& image, bool deleted) {
+    if ((image.nx2_content_hash_lo | image.nx2_content_hash_hi) == 0) {
+        return;
+    }
+    const ContentKey key{ContentShape(image.info), image.nx2_content_hash_lo,
+                         image.nx2_content_hash_hi};
+    if (const auto it = nx2_content_index.find(key);
+        it != nx2_content_index.end() && it->second == image_id) {
+        nx2_content_index.erase(it);
+    }
+    if (!deleted || True(image.flags & ImageFlagBits::GpuModified)) {
+        return;
+    }
+    // Measure only: as if the host image were kept, within 512 MiB, oldest out.
+    constexpr u64 KeptBudget = u64{512} << 20;
+    if (nx2_content_kept.emplace(key, image.guest_size_bytes).second) {
+        nx2_content_kept_order.emplace_back(key, image.guest_size_bytes);
+        nx2_content_kept_bytes += image.guest_size_bytes;
+    }
+    while (nx2_content_kept_bytes > KeptBudget && !nx2_content_kept_order.empty()) {
+        const auto [old_key, bytes] = nx2_content_kept_order.front();
+        nx2_content_kept_order.pop_front();
+        if (nx2_content_kept.erase(old_key) != 0) {
+            nx2_content_kept_bytes -= bytes;
+        }
+    }
+}
+
+template <class P>
+void TextureCache<P>::NoteContentLookup(ImageId image_id) {
+    const ImageBase& image = slot_images[image_id];
+    constexpr u32 HashMinBytes = 64 * 1024;
+    if (image.guest_size_bytes < HashMinBytes ||
+        True(image.flags & (ImageFlagBits::GpuModified | ImageFlagBits::Sparse |
+                            ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
+                            ImageFlagBits::Unbacked))) {
+        return;
+    }
+    const u128 hash = GuestContentHash(image);
+    // As RefreshContents stores it (bit 0 of the high word set).
+    const ContentKey key{ContentShape(image.info), hash[0], hash[1] | 1};
+    size_t which = 3;
+    if (const auto it = nx2_content_index.find(key);
+        it != nx2_content_index.end() && it->second != image_id &&
+        slot_images.contains(it->second)) {
+        const ImageBase& twin = slot_images[it->second];
+        const bool same = twin.nx2_content_hash_lo == key.lo && twin.nx2_content_hash_hi == key.hi &&
+                          False(twin.flags & ImageFlagBits::GpuModified);
+        if (same) {
+            const bool idle = twin.lru_index == SIZE_MAX ||
+                              lru_cache.Tick(twin.lru_index) + 1 < frame_tick;
+            which = idle ? 0 : 1;
+        }
+    }
+    if (which == 3 && nx2_content_kept.contains(key)) {
+        which = 2;
+    }
+    ++nx2_content_cases[which];
+    nx2_content_case_bytes[which] += image.guest_size_bytes;
+}
+
+template <class P>
 u128 TextureCache<P>::GuestContentHash(const ImageBase& image) {
     const size_t size = image.guest_size_bytes;
+    const auto start = std::chrono::steady_clock::now();
+    u128 hash;
     if (const u8* const span = gpu_memory->GetSpan(image.gpu_addr, size); span != nullptr) {
-        return Common::CityHash128(reinterpret_cast<const char*>(span), size);
+        hash = Common::CityHash128(reinterpret_cast<const char*>(span), size);
+    } else {
+        nx2_hash_scratch.resize(size);
+        gpu_memory->ReadBlockUnsafe(image.gpu_addr, nx2_hash_scratch.data(), size);
+        hash = Common::CityHash128(reinterpret_cast<const char*>(nx2_hash_scratch.data()), size);
     }
-    nx2_hash_scratch.resize(size);
-    gpu_memory->ReadBlockUnsafe(image.gpu_addr, nx2_hash_scratch.data(), size);
-    return Common::CityHash128(reinterpret_cast<const char*>(nx2_hash_scratch.data()), size);
+    nx2_content_hash_ns += static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                             start)
+            .count());
+    nx2_content_hashed_bytes += size;
+    return hash;
 }
 
 template <class P>
@@ -3960,6 +4065,22 @@ void TextureCache<P>::NoteNewSampledImage(ImageId image_id, GPUVAddr gpu_addr) {
              "uploads: {} hash checks, {} skipped as unchanged ({} KiB)",
              VideoCore::Nx2Debug::Experiment(76), nx2_flagged_remapped, nx2_kept_after_remap,
              nx2_upload_hash_checks, nx2_upload_skips, nx2_upload_skip_bytes >> 10);
+    const double hash_ms = static_cast<double>(nx2_content_hash_ns) / 1e6;
+    LOG_INFO(HW_GPU,
+             "Content reuse (EXP76 & 4, measure only) last 10 s: new sampled images that a live "
+             "idle twin would serve {} ({} KiB), a live busy twin {} ({} KiB), a kept image {} "
+             "({} KiB), nothing {} ({} KiB); hashed {} MiB in {:.1f} ms ({:.1f} GB/s); index {} "
+             "live, {} kept ({} MiB)",
+             nx2_content_cases[0], nx2_content_case_bytes[0] >> 10, nx2_content_cases[1],
+             nx2_content_case_bytes[1] >> 10, nx2_content_cases[2],
+             nx2_content_case_bytes[2] >> 10, nx2_content_cases[3],
+             nx2_content_case_bytes[3] >> 10, nx2_content_hashed_bytes >> 20, hash_ms,
+             hash_ms > 0 ? static_cast<double>(nx2_content_hashed_bytes) / 1e6 / hash_ms : 0.0,
+             nx2_content_index.size(), nx2_content_kept.size(), nx2_content_kept_bytes >> 20);
+    nx2_content_cases = {};
+    nx2_content_case_bytes = {};
+    nx2_content_hash_ns = 0;
+    nx2_content_hashed_bytes = 0;
     nx2_flagged_remapped = 0;
     nx2_kept_after_remap = 0;
     nx2_upload_hash_checks = 0;
@@ -5393,6 +5514,9 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     ++images_deleted;
     Churn::Add(Churn::ImagesDeleted);
     ++bindings_epoch;
+    if ((VideoCore::Nx2Debug::Experiment(76) & 4) != 0) [[unlikely]] {
+        ForgetContent(image_id, image, true);
+    }
     if (ImageHashLogEnabled()) [[unlikely]] {
         const auto reason = static_cast<size_t>(delete_reason);
         ++nx2_deletes[reason];
@@ -5691,6 +5815,9 @@ void TextureCache<P>::UnindexFramebuffer(FramebufferId framebuffer_id, const Ren
 template <class P>
 void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
     image.flags |= ImageFlagBits::GpuModified;
+    // EXP76: GPU-written texels no longer match a hash of guest bytes.
+    image.nx2_content_hash_lo = 0;
+    image.nx2_content_hash_hi = 0;
     image.modification_tick = ++modification_tick;
     image.last_write_frame = RenderFrame();
     if (!clearing_render_targets) {
@@ -6134,6 +6261,8 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
     image.modification_tick = most_recent_tick;
     if (any_modified) {
         image.flags |= ImageFlagBits::GpuModified;
+        image.nx2_content_hash_lo = 0; // EXP76: aliases copied GPU-written texels in
+        image.nx2_content_hash_hi = 0;
     }
     std::ranges::sort(aliased_images, [this](const AliasedImage* lhs, const AliasedImage* rhs) {
         const ImageBase& lhs_image = slot_images[lhs->id];

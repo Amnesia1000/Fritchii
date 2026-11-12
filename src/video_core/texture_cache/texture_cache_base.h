@@ -634,6 +634,33 @@ private:
     u64 nx2_upload_skips = 0;
     u64 nx2_upload_skip_bytes = 0;
     u64 nx2_upload_hash_checks = 0;
+
+    /// EXP76 & 4 (fable52_answer_keeptex_2, step 1, measure only): images whose whole upload is
+    /// hashed (& 2) are indexed by (shape, content hash); a new sampled image hashes its guest bytes
+    /// and counts which reuse would serve it. Deleted hashed images are remembered as "kept"
+    /// within 512 MiB, oldest out. Nothing is reused yet.
+    struct ContentKey {
+        u64 shape;
+        u64 lo;
+        u64 hi;
+        bool operator==(const ContentKey&) const = default;
+    };
+    struct ContentKeyHash {
+        size_t operator()(const ContentKey& key) const noexcept {
+            return static_cast<size_t>(key.lo ^ (key.shape * 0x9E3779B97F4A7C15ULL) ^ key.hi);
+        }
+    };
+    [[nodiscard]] static u64 ContentShape(const ImageInfo& info) noexcept;
+    void NoteContentLookup(ImageId image_id);
+    void ForgetContent(ImageId image_id, const ImageBase& image, bool deleted);
+    std::unordered_map<ContentKey, ImageId, ContentKeyHash> nx2_content_index;
+    std::unordered_map<ContentKey, u32, ContentKeyHash> nx2_content_kept;
+    std::deque<std::pair<ContentKey, u32>> nx2_content_kept_order;
+    u64 nx2_content_kept_bytes = 0;
+    std::array<u64, 4> nx2_content_cases{}; ///< idle twin, busy twin, kept, none
+    std::array<u64, 4> nx2_content_case_bytes{};
+    u64 nx2_content_hashed_bytes = 0;
+    u64 nx2_content_hash_ns = 0;
     std::vector<u8> nx2_hash_scratch;
     /// CityHash128 of an image's guest bytes (in place when they are one continuous span).
     [[nodiscard]] u128 GuestContentHash(const ImageBase& image);

@@ -456,7 +456,11 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// after the upload, dropped if the image was CPU-written meanwhile); the next whole upload whose
 /// bytes hash the same is skipped. Any other refresh path clears the hash. The
 /// EDEN_NX2_IMAGE_HASH_LOG=1 summary logs "Remaps (EXP76=n)": images flagged, kept, hash checks,
-/// uploads skipped. Off by default.
+/// uploads skipped. 4 (with 2; measure only, fable52_answer_keeptex_2 step 1): hashed images are
+/// indexed by (shape, content hash); each new sampled image hashes its guest bytes and the
+/// "Content reuse" line counts which reuse would serve it (live idle twin, live busy twin,
+/// kept deleted image, nothing) and the hash cost in GB/s. GPU writes clear the hash
+/// (MarkModification, SynchronizeAliases). Off by default.
 /// EXP75 (live; us, 0 = off; fable52_answer_pipeline section 3; Core::Timing::CoreTiming's timer
 /// thread): precise guest timers. The thread spins the last this-many us before a precise event
 /// (the kernel's hardware timer: guest sleeps and timeouts, EventType::precise) instead of waking
