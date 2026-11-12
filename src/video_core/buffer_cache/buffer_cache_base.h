@@ -432,7 +432,8 @@ public:
     /// Takes CPU writes about to be applied one by one out of the GPU-written ranges first, so
     /// applying one doesn't download the GPU's copy over another (WriteMemory keeps the GPU data
     /// on the pages it writes).
-    void ClaimCpuWrites(std::span<const std::pair<DAddr, u64>> ranges);
+    template <typename Ranges>
+    void ClaimCpuWrites(const Ranges& ranges);
 
     /// EDEN_NX2_RUNAHEAD (nx2_runahead.h), back thread, mutex held: the guest CPU's bytes of
     /// [device_addr, device_addr + size) as a run-ahead chunk captured them (`bytes`). Registered

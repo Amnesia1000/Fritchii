@@ -507,6 +507,17 @@ const RasterizerVulkan::MeshArena& RasterizerVulkan::AcquireMeshArena() {
     return *it;
 }
 
+void RasterizerVulkan::ReleaseMeshEmulationBuffers() {
+    for (StagingBufferRef& ref : mesh_draw_buffers) {
+        staging_pool.FreeDeferred(ref);
+    }
+    mesh_draw_buffers.clear();
+    if (mesh_arena_used) {
+        mesh_arena_used = false;
+        mesh_arenas[mesh_arena_current].tick = scheduler.CurrentTick();
+    }
+}
+
 RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra::GPU& gpu_,
                                    Tegra::MaxwellDeviceMemoryManager& device_memory_,
                                    const Device& device_, MemoryAllocator& memory_allocator_,
@@ -984,6 +995,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                       render_trace_frame, vs, ps);
         }
     };
+    SCOPE_EXIT {
+        ReleaseMeshEmulationBuffers();
+    };
     namespace Profile = VideoCommon::Nx2Profile;
     if (InvalidateBeforeUse()) {
         gpu.InvalidateGPUCache();
@@ -1134,13 +1148,15 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         u64 bytes{};
         if (has_task) {
             const MeshArena& arena{AcquireMeshArena()};
+            mesh_arena_used = true;
             bytes = arena.size;
             pipeline->SetMeshEmulationOutput(*arena.buffer, 0, bytes, groups);
         } else {
             bytes = (std::max)(u64{groups} * block_bytes, u64{4});
             output = staging_pool.Request(
-                bytes, probe_draw ? MemoryUsage::Download : MemoryUsage::DeviceLocal, false,
+                bytes, probe_draw ? MemoryUsage::Download : MemoryUsage::DeviceLocal, true,
                 VideoCommon::BufferChurnStats::StagingCaller::Rasterizer);
+            mesh_draw_buffers.push_back(output);
             pipeline->SetMeshEmulationOutput(output.buffer, output.offset, bytes, groups);
         }
         mesh_emulation_indirect = {};
@@ -1162,7 +1178,8 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             const auto request = [&](u64 size, MemoryUsage usage = MemoryUsage::DeviceLocal) {
                 size = (std::max)(size, u64{16});
                 const StagingBufferRef ref{staging_pool.Request(
-                    size, usage, false, VideoCommon::BufferChurnStats::StagingCaller::Rasterizer)};
+                    size, usage, true, VideoCommon::BufferChurnStats::StagingCaller::Rasterizer)};
+                mesh_draw_buffers.push_back(ref);
                 return std::make_pair(GraphicsPipeline::MeshEmulationBuffer{ref.buffer, ref.offset,
                                                                             size},
                                       ref.mapped_span.subspan(
@@ -3546,6 +3563,9 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
     // FlushCaching's ranges are the GPU's own engines' writes (EXP108, zortos293/Lichii#1436).
     if ((cb_path & CbPath::SkipBit) == 0) {
         std::scoped_lock lock{buffer_cache.mutex};
+        // As OnCacheInvalidations: out of the GPU-written ranges first, so applying one range
+        // doesn't download the GPU's bytes over a later range on the same page (#1460).
+        buffer_cache.ClaimCpuWrites(sequences);
         for (const auto& [addr, size] : sequences) {
             buffer_cache.WriteMemory(addr, size, true, true);
         }
@@ -3578,6 +3598,13 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
             CbPath::Count(counters.lock_skips);
         } else {
             std::scoped_lock lock{buffer_cache.mutex};
+            // As above (#1460): claim every range applied below first. Skipped ranges
+            // (Reach::None) were never GPU-written, so the claim has nothing to take there.
+            boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> applied;
+            for (const auto& [range, skipped] : locked) {
+                applied.push_back(range);
+            }
+            buffer_cache.ClaimCpuWrites(applied);
             for (const auto& [range, skipped] : locked) {
                 if (skipped) {
                     // Verify: the skip had to change nothing; WriteMemory runs anyway.
