@@ -14,6 +14,7 @@
 
 #include "common/common_types.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_debug_control.h"
 
 namespace VideoCommon {
 
@@ -52,7 +53,9 @@ concept StreamUniformReusable = requires(R& runtime, u32 size) {
         const char* const value = std::getenv("EDEN_NX2_UBO_INPLACE");
         return value != nullptr && value[0] != '0';
     }();
-    return enabled;
+    // EXP93 (live, 0 = as the env says, 1 = on): the same, switchable in one session. Both modes
+    // compare against the slot's own bytes, so a change between two binds is safe.
+    return enabled || VideoCore::Nx2Debug::Experiment(93) != 0;
 }
 
 template <class Ref>

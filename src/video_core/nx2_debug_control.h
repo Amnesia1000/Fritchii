@@ -540,6 +540,9 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// written, ring overflow, pending cached writes, other range, no keep yet). "Uniform keeps
 /// count (EXP91" logs small binds, rebinds and those counts per second every 5 s while not 0.
 /// Gain of the later stages is about K x 55 ns; under 100,000 a second, stop there.
+/// EXP93 (live, 0 = as EDEN_NX2_UBO_INPLACE says, 1 = on; fable52_answer_writer 3): small
+/// uniform buffers are compared with their slot straight in guest memory instead of through a
+/// scratch copy (VideoCommon::UniformInPlaceCompareEnabled). Judge on "bind stage buffers".
 /// EXP92 (live, 0 = off; fable52_answer_uniformkeeps 3 and 4, idea zortos293/Lichii#1441 part d;
 /// BufferCache::BindSmallUniformKeeping): a small uniform slot bound again with the same range,
 /// in the same command buffer, with nothing written to that range since, binds the slot's stream
@@ -846,6 +849,10 @@ inline void LoadExperiments() {
         // heavy phase only (orbit, uncapped, 8 x 25 s): 56.5 -> 58.6 fps, 1% low 39.2 -> 40.4,
         // back 8.04 -> 7.81 us per draw. Timing only, no rendering change.
         g_experiments[79].store(1, std::memory_order_relaxed);
+        // EXP90 = 1 (2026-11-12, overnight; Fable after88 2): an image's LRU node is touched once a
+        // frame. Exact (the node ignored same-tick touches anyway). Heavy phase toggle: 92% of
+        // touches skipped, back 8.30 -> 8.02 us per draw, 56.0 -> 57.1 fps, 1% low 38.1 -> 39.6.
+        g_experiments[90].store(1, std::memory_order_relaxed);
         // EXP49 = 1 (2026-11-10, owner's call for v5.7): the async read-back. Stalchild fight,
         // flipped every 30 s while the owner fought: 51.9 -> 56.9 fps, the back's read flushes
         // 35 -> 6 ms/s, guest lock waits halved. No beams in that session or two later ones
