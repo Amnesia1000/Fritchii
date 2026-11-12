@@ -901,6 +901,14 @@ inline void LoadExperiments() {
         // playtest with EXP70 (market + Stalchild fight): constant 60 outside the boss wave
         // (40-45 there), no flashes or glitches.
         g_experiments[69].store(600, std::memory_order_relaxed);
+        // EXP69 = 4 and EXP81 = 4 (2026-11-12, fable52_answer_fences2 (a); EXP81 now fed by a
+        // lock-free read bitmap, so it works with EXP86): pages nobody read for 4 frames stop being
+        // downloaded at fences. Owner skeleton fight A/B: downloads 412-719 -> 162-203 MB per 600
+        // frames, unread landed pages 77-83% -> 27-30%, fence thread buffer mutex held 383 -> 83
+        // ms / 5 s, worst hitch 788 -> 409 ms, frames over 40 ms 4.5 -> 4.1 per 1000; owner: not
+        // less smooth.
+        g_experiments[69].store(4, std::memory_order_relaxed);
+        g_experiments[81].store(4, std::memory_order_relaxed);
         // EXP72 = 1 (2026-11-11): a preflushed read whose bytes are all in a submitted fence download
         // waits for it. Night market toggle: reader waits 683 -> 479, wait time 515 -> 299 ms. Owner
         // Stalchild fight playtest: readers waited for the host GPU ~280-350 -> 40-70 ms/s, 0
