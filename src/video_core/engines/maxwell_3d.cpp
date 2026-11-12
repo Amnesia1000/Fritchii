@@ -40,6 +40,7 @@
 #include "video_core/nx2_list_draw.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_report_census.h"
 #include "video_core/nx2_runahead.h"
 #include "video_core/query_cache/frame_trace.h"
 #include "video_core/query_dma.h"
@@ -3433,6 +3434,9 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     const u32 words = std::min<u32>(count, 0x1000);
     const size_t read_bytes = size_t{words} * sizeof(u32);
     static const bool full_drain = std::getenv("EDEN_NX2_MACRO_DMA_DRAIN") != nullptr;
+    // EDEN_NX2_DEPTH_CENSUS (fable52_answer_potroom 4b): the occlusion reads of macro 0xe2c.
+    namespace ReportCensus = VideoCommon::Nx2ReportCensus;
+    const bool census_read = macro == 0xe2c && ReportCensus::Enabled();
     const auto flush_if_dirty = [&] {
         if (memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
             split.Run(
@@ -3451,6 +3455,10 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         forwarded.resize(words);
         if (split.ForwardRead(memory_manager.GetID() + 1, source, words, forwarded.data())) {
             VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadsForwarded, 1);
+            if (census_read) [[unlikely]] {
+                ReportCensus::NoteE2cRead(forwarded.data(), words,
+                                          ReportCensus::E2cPath::Forwarded, false);
+            }
             for (u32 i = 0; i < words; ++i) {
                 if (method == 0x158) {
                     fs.parameters.push_back(forwarded[i]);
@@ -3509,6 +3517,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             const u64 first_page = *device >> 12;
             const u64 last_page = (*device + read_bytes - 1) >> 12;
             bool hit = true;
+            bool census_pending = false;
             for (u64 page = first_page; page <= last_page && hit; ++page) {
                 const auto it = fs.dma_snapshots.find(page);
                 if (it == fs.dma_snapshots.end()) {
@@ -3586,6 +3595,10 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                     }
                 } else {
                     ++misses;
+                    if (census_read) [[unlikely]] {
+                        census_pending =
+                            rasterizer->HasCachedReports(*device - 12, u64{read_bytes} + 12);
+                    }
                     // The GPU data of the whole pages (a flush of only the bytes read left stale
                     // neighbours), the pending reports of the bytes read.
                     const GPUVAddr flush_begin = source & ~GPUVAddr{0xfff};
@@ -3680,6 +3693,12 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                                  release(Release::Split));
                     }
                 }
+                if (census_read) [[unlikely]] {
+                    ReportCensus::NoteE2cRead(snap_words.data(), words,
+                                              hit ? ReportCensus::E2cPath::Snapshot
+                                                  : ReportCensus::E2cPath::SnapshotMiss,
+                                              census_pending);
+                }
                 for (u32 i = 0; i < words; ++i) {
                     fs.parameters.push_back(snap_words[i]);
                 }
@@ -3720,15 +3739,27 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         flush_if_dirty();
     }
     // Write out the reports held in the query cache, or the read returns stale occlusion counts.
+    bool census_pending = false;
     split.Run(
-        [this, source, read_bytes] {
+        [this, source, read_bytes, census_read, &census_pending] {
+            if (census_read) [[unlikely]] {
+                census_pending = VideoCommon::QueryDma::HasPendingQueries(
+                    memory_manager, *rasterizer, source, read_bytes);
+            }
             VideoCommon::QueryDma::FlushPending(memory_manager, *rasterizer, source, read_bytes);
         },
         VideoCommon::DrainSite::MacroDmaFlush,
         VideoCommon::Nx2FastDrawCount::Neutral());
+    thread_local std::vector<u32> census_words;
+    if (census_read) [[unlikely]] {
+        census_words.clear();
+    }
     u32 changed{};
     for (u32 i = 0; i < words; ++i) {
         const u32 word = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
+        if (census_read) [[unlikely]] {
+            census_words.push_back(word);
+        }
         if (method == 0x158) {
             fs.parameters.push_back(word);
         } else if (ram + i < native_data_ram.size()) {
@@ -3737,6 +3768,10 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         if (!diag_before.empty() && diag_before[i] != word) {
             ++changed;
         }
+    }
+    if (census_read) [[unlikely]] {
+        ReportCensus::NoteE2cRead(census_words.data(), census_words.size(),
+                                  ReportCensus::E2cPath::Drained, census_pending);
     }
     if (Tegra::Nx2CmdPageDiag::g_enabled) {
         bool gpu_written = false;

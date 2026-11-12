@@ -23,6 +23,7 @@
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_report_census.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
@@ -310,6 +311,10 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     }
     size_t streamer_id = static_cast<size_t>(counter_type);
     auto* streamer = impl->streamers[streamer_id];
+    if (VideoCommon::Nx2ReportCensus::Enabled()) [[unlikely]] {
+        VideoCommon::Nx2ReportCensus::NoteReport(static_cast<u32>(requested_type), has_timestamp,
+                                                 is_fence, streamer == nullptr);
+    }
     if (streamer == nullptr) [[unlikely]] {
         counter_type = QueryType::Payload;
         payload = 1U;
@@ -410,6 +415,10 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             const auto report_type = static_cast<QueryType>(type);
             auto* const stream = state.streamers[query_location.stream_id.Value()];
             if (True(query_base->flags & QueryFlagBits::IsInvalidated)) {
+                if (VideoCommon::Nx2ReportCensus::Enabled()) [[unlikely]] {
+                    VideoCommon::Nx2ReportCensus::Add(
+                        VideoCommon::Nx2ReportCensus::g_counters.invalidated);
+                }
                 if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Discard)) {
                     LOG_INFO(HW_GPU,
                              "DKB_QUERY discard n={} as={} gpu={:#x} device={:#x} type={} "
@@ -423,6 +432,10 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                 return;
             }
             if (False(query_base->flags & QueryFlagBits::IsFinalValueSynced)) [[unlikely]] {
+                if (VideoCommon::Nx2ReportCensus::Enabled()) [[unlikely]] {
+                    VideoCommon::Nx2ReportCensus::Add(
+                        VideoCommon::Nx2ReportCensus::g_counters.unsynchronized);
+                }
                 if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Discard)) {
                     LOG_INFO(HW_GPU,
                              "DKB_QUERY discard n={} as={} gpu={:#x} device={:#x} type={} "
@@ -439,6 +452,12 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             }
             query_base->value += stream->GetAmendValue();
             stream->SetAccumulationValue(query_base->value);
+            if (report_type == QueryType::ZPassPixelCount64 &&
+                VideoCommon::Nx2ReportCensus::Enabled()) [[unlikely]] {
+                auto& census = VideoCommon::Nx2ReportCensus::g_counters;
+                VideoCommon::Nx2ReportCensus::Add(query_base->value == 0 ? census.sample_zero
+                                                                         : census.sample_nonzero);
+            }
             const bool wide = True(query_base->flags & QueryFlagBits::HasTimestamp);
             cache->FinishReads(cpu_addr, wide ? 16 : 4);
             // Looked up here, not when the report was made (two pointers less to carry).
@@ -529,6 +548,9 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             Tegra::Nx2SemaphoreWaiters::Get().OnWrite(cpu_addr, payload);
             Common::Nx2GpuWrite::Notify(Common::Nx2GpuWrite::Path::QueryImmediate, cpu_addr, addr,
                                         pointer, payload);
+            if (VideoCommon::Nx2ReportCensus::Enabled()) [[unlikely]] {
+                VideoCommon::Nx2ReportCensus::Add(VideoCommon::Nx2ReportCensus::g_counters.immediate);
+            }
             if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Write)) {
                 LOG_INFO(HW_GPU,
                          "DKB_QUERY write n={} path=immediate as={} gpu={:#x} device={:#x} type={} "

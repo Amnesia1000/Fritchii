@@ -138,6 +138,43 @@ u32 SaturatingSub(u32 lhs, u32 rhs) {
     return desc.count > 1 || desc.is_descriptor_array;
 }
 
+// EDEN_NX2_DEPTH_CENSUS: TextureDescriptor::census_use of one (indexed) texture instruction.
+[[nodiscard]] u8 CensusUse(const IR::Inst& inst, bool is_rect_sample) {
+    u8 use = TextureDescriptor::CensusKnown;
+    const auto has = [&inst](size_t arg) {
+        return arg < inst.NumArgs() && !inst.Arg(arg).IsEmpty();
+    };
+    switch (inst.GetOpcode()) {
+    case IR::Opcode::ImageFetch:
+        use |= TextureDescriptor::CensusFetch;
+        use |= has(2) ? TextureDescriptor::CensusOffset : 0;
+        break;
+    case IR::Opcode::ImageQueryDimensions:
+        use |= TextureDescriptor::CensusQuery;
+        break;
+    case IR::Opcode::ImageSampleImplicitLod:
+    case IR::Opcode::ImageSampleExplicitLod:
+    case IR::Opcode::ImageGradient:
+        use |= has(3) ? TextureDescriptor::CensusOffset : 0;
+        break;
+    case IR::Opcode::ImageSampleDrefImplicitLod:
+    case IR::Opcode::ImageSampleDrefExplicitLod:
+        use |= has(4) ? TextureDescriptor::CensusOffset : 0;
+        break;
+    case IR::Opcode::ImageGather:
+    case IR::Opcode::ImageGatherDref:
+        use |= TextureDescriptor::CensusGather;
+        use |= has(2) || has(3) ? TextureDescriptor::CensusOffset : 0;
+        break;
+    default:
+        break;
+    }
+    if (is_rect_sample) {
+        use |= TextureDescriptor::CensusRect;
+    }
+    return use;
+}
+
 template <typename T>
 [[nodiscard]] u32 StaticDescriptorCount(T const& descriptors) noexcept {
     return std::accumulate(descriptors.cbegin(), descriptors.cend(), 0U, [](auto const& acc, auto const& e) {
@@ -1555,6 +1592,7 @@ public:
         texture_descriptors[index].is_multisample |= desc.is_multisample;
         texture_descriptors[index].is_integer |= desc.is_integer;
         texture_descriptors[index].is_descriptor_array |= desc.is_descriptor_array;
+        texture_descriptors[index].census_use |= desc.census_use;
         return index;
     }
 
@@ -1931,6 +1969,7 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
                     .handle_program = cbuf.handle_program,
                     .is_descriptor_array = host_info.support_handle_table_arrays && cbuf.count > 1,
                     .handle_is_pointer_word = texture_inst.pointer_word,
+                    .census_use = CensusUse(*inst, is_rect_sample),
                 });
                 if (texture_inst.pointer_word &&
                     std::ranges::none_of(program.info.storage_buffers_descriptors,
