@@ -115,6 +115,34 @@ struct DrawTemplate {
     }
 };
 
+/// Delta draws (Fable's port plan, fable_answer_backthread_threads.md 10, step D2; the delta draw
+/// path of zortos293/Lichii#1161): a pipeline's previous draw, in EXP87's DrawTemplate shape but
+/// in one slot per pipeline, with no table and no key. ConfigureImpl fills it while
+/// EDEN_NX2_FASTDRAW_COUNT or EXP106 is on, at the end of each Configure. From the template it uses
+/// `handles` (one raw handle word per view, in resolve order: both words of a two-word handle
+/// combined as the draw combined them, a computed handle's value, ~0 where EXP21 read none),
+/// `context`, `descriptors` and `ranges` (the image descriptor entries each stage pushed),
+/// `rescaling`, `scale_epoch` and `host_serial`; `textures`, `hash` and `last_use` stay empty.
+template <typename Descriptor, typename View, size_t NumStages, size_t RescalingWords>
+struct KeptDraw : DrawTemplate<Descriptor, NumStages, RescalingWords> {
+    /// A handle a handle program computed at the draw (zortos's ComputedHandle, one per element).
+    struct ComputedHandle {
+        u32 stage;
+        u32 program;  ///< Index into the stage's Shader::Info::handle_programs
+        u32 element;  ///< Descriptor array element
+        u32 value;    ///< What it gave
+        u64 alignment; ///< The storage alignment it was evaluated with
+    };
+
+    std::vector<View> views;         ///< As resolved, in resolve order
+    std::vector<SamplerId> samplers; ///< As resolved
+    std::vector<u32> view_generations; ///< TextureCache::ImageViewGeneration of each view
+    std::vector<ComputedHandle> computed;
+    /// The last Configure filled every member (false while one runs, and after a draw whose
+    /// handles came from a memo without being read: TEX_BANK_GEN).
+    bool valid{};
+};
+
 /// Every pipeline's draw templates in a fixed number of slots, WAYS per set; a new template
 /// replaces the set's least recently used one.
 template <typename Template>

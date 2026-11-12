@@ -550,6 +550,33 @@ public:
                                                            : 0;
     }
 
+    /// Delta draws (D2; zortos293/Lichii#1161's SampledViewsChange, sampled_views.h): whether
+    /// resolving `views` again would change one of their images, which a delta draw keeping them
+    /// does not prepare. That is PrepareImage's RefreshContents (the image is CpuModified) or
+    /// SynchronizeAliases (an alias was modified after it). Views of the null image and buffer
+    /// views are not counted, as there. Under the texture cache's mutex.
+    [[nodiscard]] bool SampledViewsChange(std::span<const ImageViewInOut> views) const noexcept {
+        for (const ImageViewInOut& view : views) {
+            if (!view.id || view.id == NULL_IMAGE_VIEW_ID) {
+                continue;
+            }
+            const ImageViewBase& image_view = slot_image_views[view.id];
+            if (image_view.IsBuffer() || image_view.image_id == NULL_IMAGE_ID) {
+                continue;
+            }
+            const ImageBase& image = slot_images[image_view.image_id];
+            if (True(image.flags & ImageFlagBits::CpuModified)) {
+                return true;
+            }
+            for (const AliasedImage& aliased : image.aliased_images) {
+                if (image.modification_tick < slot_images[aliased.id].modification_tick) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     /// Bumped whenever an image changes its scale (InvalidateScale): the rescaling words a draw
     /// pushed hold while it stays the same.
     [[nodiscard]] u64 ScaleEpoch() const noexcept {

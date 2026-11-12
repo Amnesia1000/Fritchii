@@ -873,11 +873,23 @@ void RasterizerVulkan::FastDrawCountDecide(const GraphicsPipeline* pipeline, boo
             }
         }
     }
-    // DeltaStillHolds: nothing broke between the take and the locked caches. (Its sampled image
-    // and computed handle checks need the delta path's captured state: not counted.)
+    // DeltaStillHolds: nothing broke between the take and the locked caches.
     if (serial != counter.take_serial) {
         return counter.CountStateChanged(mask,
                                          Count::g_last_break.load(std::memory_order_relaxed));
+    }
+    // Its last two checks, on the draw the previous pipeline kept (Fable's port plan step D2;
+    // counting keeps every draw, PrepareDraw). A kept image that a resolve would upload or copy
+    // a newer alias into, or a handle program that gives another handle now: resolved in full.
+    const KeptDraw* const kept = previous->KeptLastDraw();
+    if (kept == nullptr) {
+        return full(Count::Full::NoKeptDraw);
+    }
+    if (texture_cache.SampledViewsChange(kept->views)) {
+        return full(Count::Full::SampledImages);
+    }
+    if (!kept->computed.empty() && previous->ComputedHandlesChanged(*maxwell3d, *gpu_memory)) {
+        return full(Count::Full::ComputedHandles);
     }
     ++stats.delta;
     // The full resolve picked another pipeline: a delta draw would have kept the wrong one.
@@ -1221,7 +1233,13 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         }
     }
     setup_scope.reset();
-    if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->Configure(is_indexed)) {
+    // Delta draws (Fable's port plan step D2): the pipeline keeps this draw as its last while the
+    // count runs or EXP106 is on (live). Off, one relaxed load a draw and the same Configure.
+    const bool keep_last_draw =
+        fast_draw_counting ||
+        VideoCore::Nx2Debug::g_experiments[106].load(std::memory_order_relaxed) != 0;
+    if (Profile::Scope scope{Profile::Zone::Configure};
+        !pipeline->Configure(is_indexed, keep_last_draw)) {
         report_failure("configure failed");
         TraceRenderState(is_indexed, "configure-failed", nullptr);
         return;

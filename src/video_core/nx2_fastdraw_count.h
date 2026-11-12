@@ -23,7 +23,10 @@
 /// EDEN_NX2_FASTDRAW_COUNT=1 (read once, by the first Maxwell3D): counts the draws that could
 /// take zortos293/Lichii#1161's delta ("fast") draw path, which keeps the previous draw's
 /// pipeline, image views and samplers when only light state changed in between. Counting only:
-/// no draw is resolved, recorded or skipped differently. Off, each site costs one test of g_on.
+/// no draw is resolved or skipped differently. While on, each pipeline also keeps its last draw
+/// (GraphicsPipeline::KeptLastDraw, Fable's port plan step D2; EXP106 does that alone) for #1161's
+/// two checks that need it (sampled images to prepare, computed handles changed). Off, each site
+/// costs one test of g_on.
 ///
 /// The rules are #1161's (nx2_fast_draw.h, Maxwell3D::IsFastDrawParameter and its lists,
 /// RasterizerVulkan::TakeReusableDraw / DeltaStillHolds / NoteResolvedDraw), with its later
@@ -282,6 +285,12 @@ enum class Full : u8 {
     VertexInput,
     HandleBind,
     HandleData,
+    /// The previous pipeline kept no whole draw (its handles came from a TEX_BANK_GEN memo)
+    NoKeptDraw,
+    /// A kept view's image would be uploaded or get a newer alias copied in (SampledViewsChange)
+    SampledImages,
+    /// A kept computed handle evaluates to another value (ComputedHandlesChanged)
+    ComputedHandles,
     Count,
 };
 
@@ -399,9 +408,9 @@ struct Counter {
                  "different kind, {:.0f} state changed, {:.0f} after a submit, {:.0f} render pass "
                  "or pipeline changed, {:.0f} pipeline takes no delta draws, {:.0f} vertex "
                  "attribute types changed, {:.0f} handle buffer bound, {:.0f} handle data "
-                 "written, not counted: sampled image to prepare, computed handle changed | "
-                 "{:.0f} not drawn (no pipeline or skipped) | {:.0f} would-be delta resolved to "
-                 "another pipeline",
+                 "written, {:.0f} no kept draw, {:.0f} sampled image to prepare, {:.0f} computed "
+                 "handle changed | {:.0f} not drawn (no pipeline or skipped) | {:.0f} would-be "
+                 "delta resolved to another pipeline",
                  rate(stats.draws), rate(stats.delta),
                  decided == 0 ? 0.0
                               : 100.0 * static_cast<double>(stats.delta) /
@@ -409,6 +418,7 @@ struct Counter {
                  full(Full::NoCandidate), full(Full::Kind), full(Full::StateChanged),
                  full(Full::Submitted), full(Full::RenderPass), full(Full::DeltaPipeline),
                  full(Full::VertexInput), full(Full::HandleBind), full(Full::HandleData),
+                 full(Full::NoKeptDraw), full(Full::SampledImages), full(Full::ComputedHandles),
                  rate(stats.not_drawn), rate(stats.other_pipeline));
         static constexpr std::array<const char*, static_cast<size_t>(Ineligible::Count)>
             ineligible_names{"indirect",       "mesh",          "not built",
