@@ -40,8 +40,10 @@
 #include "video_core/nx2_list_draw.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_runahead.h"
 #include "video_core/query_cache/frame_trace.h"
 #include "video_core/query_dma.h"
+#include "video_core/rasterizer_download_area.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/textures/texture.h"
 #include "video_core/macro_hle_oot.h"
@@ -548,17 +550,23 @@ void Maxwell3D::UpdateFastDrawCountPools() {
     }
 }
 
-void Maxwell3D::NoteFastDrawCountData(GPUVAddr begin, GPUVAddr end) {
+void Maxwell3D::NoteFastDrawCountData(GPUVAddr begin, GPUVAddr end, bool unchanged) {
     namespace Count = VideoCommon::Nx2FastDrawCount;
     // #1161's NoteFastDrawConstantData: texture and sampler headers are read when image views are
-    // resolved, which delta draws skip.
+    // resolved, which delta draws skip. Header writes end reuse even when they change nothing
+    // (#1161 13d9320cfb, FastDrawHeaderWrite comes first).
     const FastDrawCountPools pools = FastDrawCountPoolRanges();
     if ((begin < pools.tic + pools.tic_size && pools.tic < end) ||
         (begin < pools.tsc + pools.tsc_size && pools.tsc < end)) {
         Count::BreakOn(Count::Reason::TextureHeaders, Count::Other);
         return;
     }
-    Count::NoteConstantData(begin, end);
+    // EXP107 (#1161 13d9320cfb): words memory held already change nothing a draw reads.
+    if (unchanged) {
+        Count::g_unchanged_writes.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        Count::NoteConstantData(begin, end);
+    }
     // The same device memory can be mapped at other GPU addresses: compare where it lands (#1161,
     // 792e12a47b; Fable plan D1, row 5).
     UpdateFastDrawCountPools();
@@ -575,6 +583,60 @@ void Maxwell3D::NoteFastDrawCountData(GPUVAddr begin, GPUVAddr end) {
         }
         page = page_end;
     }
+}
+
+Maxwell3D::ConstantWrite Maxwell3D::CompareConstantData(GPUVAddr begin, const void* data,
+                                                       u64 bytes) {
+    // EXP107 (zortos293/Lichii#1161 13d9320cfb): OoT rewrites ~258k constant buffer blocks a
+    // second with the words memory already holds. This runs on the thread that writes them, in
+    // order, after everything sent before (the split's back), so memory is what the write lands on.
+    if (VideoCore::Nx2Debug::Experiment(107) == 0 || bytes == 0) {
+        return ConstantWrite::Changed;
+    }
+    // Within one GPU page the words are contiguous in host memory. Switch 2 sparse memory goes
+    // the general path, as EDEN_NX2_CB_DIRECT's.
+    constexpr u64 PageSize = 0x1000; // the smallest GPU page
+    if ((begin & (PageSize - 1)) + bytes > PageSize ||
+        (begin + bytes > Tegra::g_nx2_sparse_low.load(std::memory_order_relaxed) &&
+         begin < Tegra::g_nx2_sparse_high.load(std::memory_order_relaxed))) {
+        return ConstantWrite::Changed;
+    }
+    const u8* const held = memory_manager.GetPointer(begin);
+    if (held == nullptr || std::memcmp(held, data, bytes) != 0) {
+        return ConstantWrite::Changed;
+    }
+    // Writing them again changes nothing either, unless the GPU caches may hold the words newer
+    // than memory or a download for a guest read may still land over them: the write must win
+    // then (#1161's conditions). MayHoldGpuWrites is true for every page outside Switch 2 titles.
+    const std::optional<DAddr> device = memory_manager.GpuToCpuAddress(begin);
+    if (!device || VideoCore::MayHoldGpuWrites(*device, bytes) ||
+        VideoCore::ReadDownloadsMayCover(*device, bytes)) {
+        return ConstantWrite::Unchanged;
+    }
+    // Run-ahead (EDEN_NX2_RUNAHEAD) lets guest memory hold the CPU's next frame while the back
+    // draws the current one from the host buffers: equal memory says nothing about those then.
+    if (VideoCommon::Runahead::g_exact_used.load(std::memory_order_relaxed) ||
+        VideoCommon::Runahead::g_words_written.load(std::memory_order_relaxed)) {
+        return ConstantWrite::Unchanged;
+    }
+    // Texture and sampler header writes still take the write (#1161 never skips them), also
+    // through another GPU address mapping the pools' device memory.
+    const FastDrawCountPools pools = FastDrawCountPoolRanges();
+    const GPUVAddr end = begin + bytes;
+    if ((begin < pools.tic + pools.tic_size && pools.tic < end) ||
+        (begin < pools.tsc + pools.tsc_size && pools.tsc < end)) {
+        return ConstantWrite::Unchanged;
+    }
+    unchanged_write_tic_spans.Update(memory_manager, pools.tic, pools.tic_size);
+    unchanged_write_tsc_spans.Update(memory_manager, pools.tsc, pools.tsc_size);
+    if (unchanged_write_tic_spans.Intersects(*device, *device + bytes) ||
+        unchanged_write_tsc_spans.Intersects(*device, *device + bytes)) {
+        return ConstantWrite::Unchanged;
+    }
+    if (VideoCommon::Nx2FastDrawCount::g_on) [[unlikely]] {
+        VideoCommon::Nx2FastDrawCount::g_skipped_writes.fetch_add(1, std::memory_order_relaxed);
+    }
+    return ConstantWrite::Skip;
 }
 
 void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call) {
@@ -895,8 +957,16 @@ void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods,
             VideoCommon::MemStageStats::Write::CbWords,
             memory_manager.GpuToCpuAddress(destination).value_or(0), bytes);
     }
+    // EXP107 (#1161 13d9320cfb): words memory holds already, where writing them again changes
+    // nothing, are not written (no invalidation either); unchanged ones are neutral for the count.
+    const ConstantWrite compared = CompareConstantData(destination, values.data(), bytes);
     if (VideoCommon::Nx2FastDrawCount::g_on) [[unlikely]] {
-        NoteFastDrawCountData(destination, destination + bytes);
+        NoteFastDrawCountData(destination, destination + bytes,
+                              compared != ConstantWrite::Changed);
+    }
+    if (compared == ConstantWrite::Skip) {
+        regs.const_buffer.offset += static_cast<u32>(bytes);
+        return;
     }
     // EXP88 & 2: through the bound buffer's device address, the device range logged for
     // FlushCaching, in place of CB_DIRECT's translation and the word-by-word accumulation.
@@ -1297,12 +1367,19 @@ void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
             memory_manager.GpuToCpuAddress(buffer_address + regs.const_buffer.offset).value_or(0),
             write_size);
     }
+    // EXP107 (#1161 13d9320cfb): as in CallConstBufferWords.
+    const ConstantWrite compared =
+        write_size != 0
+            ? CompareConstantData(buffer_address + regs.const_buffer.offset, start_base,
+                                  write_size)
+            : ConstantWrite::Changed;
     if (VideoCommon::Nx2FastDrawCount::g_on && write_size != 0) [[unlikely]] {
         const GPUVAddr address{buffer_address + regs.const_buffer.offset};
-        NoteFastDrawCountData(address, address + write_size);
+        NoteFastDrawCountData(address, address + write_size, compared != ConstantWrite::Changed);
     }
-    if (write_size != 0 && !WriteBoundConstantBuffer(regs.const_buffer.offset, start_base,
-                                                     static_cast<u32>(write_size))) {
+    if (write_size != 0 && compared != ConstantWrite::Skip &&
+        !WriteBoundConstantBuffer(regs.const_buffer.offset, start_base,
+                                  static_cast<u32>(write_size))) {
         const GPUVAddr address{buffer_address + regs.const_buffer.offset};
         memory_manager.WriteBlockCached(address, start_base, write_size);
     }

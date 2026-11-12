@@ -3343,8 +3343,21 @@ public:
     void NoteFastDrawCountWrite(u32 method, u32 argument);
     /// Counting on: inline data written to GPU addresses [begin, end) (constant buffer words, a
     /// report): texture or sampler headers end reuse, also through another GPU address mapping
-    /// their device memory (#1161's alias check); the rest is noted as light.
-    void NoteFastDrawCountData(GPUVAddr begin, GPUVAddr end);
+    /// their device memory (#1161's alias check); the rest is noted as light, unless `unchanged`
+    /// (memory held the words already: EXP107, #1161 13d9320cfb).
+    void NoteFastDrawCountData(GPUVAddr begin, GPUVAddr end, bool unchanged = false);
+
+    /// EXP107 (zortos293/Lichii#1161 13d9320cfb): how inline constant buffer data about to be
+    /// written to [begin, begin + bytes) compares with what memory holds there.
+    enum class ConstantWrite : u8 {
+        Changed,   ///< Other words, or not compared (switch off, crosses a page, sparse, unmapped)
+        Unchanged, ///< The same words, but the write must still land (see CompareConstantData)
+        Skip,      ///< The same words, and writing them again changes nothing anywhere
+    };
+    /// Unchanged where the GPU caches or a guest read download may hold other words there, the
+    /// texture header or sampler pools are written (directly or through an alias), or run-ahead
+    /// was used this session. Switch off: Changed, without reading memory.
+    ConstantWrite CompareConstantData(GPUVAddr begin, const void* data, u64 bytes);
     /// Counting on: translates the texture header and sampler pools to device memory again if
     /// they or the mappings changed, and publishes them for the writes applied to the caches
     /// (Nx2FastDrawCount::NotePoolWrite). On the thread that runs this engine.
@@ -3361,6 +3374,9 @@ private:
     FastDrawCountPools FastDrawCountPoolRanges() const;
     VideoCommon::Nx2FastDrawCount::DeviceSpans fast_draw_count_tic_spans;
     VideoCommon::Nx2FastDrawCount::DeviceSpans fast_draw_count_tsc_spans;
+    /// EXP107: the pools' device memory, for CompareConstantData's alias check.
+    VideoCommon::Nx2FastDrawCount::DeviceSpans unchanged_write_tic_spans;
+    VideoCommon::Nx2FastDrawCount::DeviceSpans unchanged_write_tsc_spans;
 
     void InitializeRegisterDefaults();
 

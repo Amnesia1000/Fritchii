@@ -593,6 +593,17 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// entries per stage, rescaling words, ScaleEpoch), through a second instantiation of
 /// ConfigureImpl. Records only, no draw changes; for the delta draw steps after D2.
 /// EDEN_NX2_FASTDRAW_COUNT=1 keeps them too. Off, PrepareDraw reads this switch once a draw.
+/// EXP107 (live, 0 = off; port of zortos293/Lichii#1161 13d9320cfb, lucastaonline): inline
+/// constant buffer data (Maxwell3D::CallConstBufferWords, ProcessCBMultiData) is compared with
+/// the words memory holds, on the back, in order (Maxwell3D::CompareConstantData; one GPU page,
+/// not sparse). Equal and safe: not written at all, so no invalidation, no buffer cache mark and
+/// no delta-draw break (OoT rewrites ~258k blocks a second with the same words, often over
+/// texture handles). Safe means #1161's conditions: no GPU-written data may be on the pages
+/// (VideoCore::MayHoldGpuWrites, always true outside Switch 2 titles) and no guest read download
+/// may land there; plus ours: not the texture header or sampler pools (also through an alias)
+/// and no run-ahead used this session. Equal but not safe: written as before. With
+/// EDEN_NX2_FASTDRAW_COUNT=1 equal writes are neutral for the count, and the 5 s line ends with
+/// how many changed nothing and how many were not written.
 /// EXP101 (live, 0 = off, 1 = runs, 2 = cached page pointer + prefetch; fable52_answer_presenter): nvhost_gpu::SubmitGPFIFOImpl's pushbuffer
 /// snapshot reads runs of entries whose GPU addresses follow each other with one ReadBlockUnsafe
 /// instead of one per entry (OoT's presenting thread submits ~6,500 entries a frame; the loop is

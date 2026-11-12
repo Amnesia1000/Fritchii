@@ -429,6 +429,11 @@ inline void NoteBind(size_t stage, u32 slot) {
     }
 }
 
+/// EXP107 (#1161 13d9320cfb), counted when on: inline constant buffer writes left out of the
+/// delta because memory held their words already, and those of them not written at all.
+inline std::atomic<u64> g_unchanged_writes{};
+inline std::atomic<u64> g_skipped_writes{};
+
 /// When on: inline constant buffer data written to GPU addresses [begin, end).
 inline void NoteConstantData(u64 begin, u64 end) {
     Delta& delta = g_delta;
@@ -583,6 +588,8 @@ struct Counter {
                 count.store(0, std::memory_order_relaxed);
             }
             g_call_sites.overflow.store(0, std::memory_order_relaxed);
+            g_unchanged_writes.store(0, std::memory_order_relaxed);
+            g_skipped_writes.store(0, std::memory_order_relaxed);
             return;
         }
         if (now - stats.window_start < std::chrono::seconds{5}) {
@@ -600,7 +607,8 @@ struct Counter {
                  "attribute types changed, {:.0f} handle buffer bound, {:.0f} handle data "
                  "written, {:.0f} no kept draw, {:.0f} sampled image to prepare, {:.0f} computed "
                  "handle changed | {:.0f} not drawn (no pipeline or skipped) | {:.0f} would-be "
-                 "delta resolved to another pipeline",
+                 "delta resolved to another pipeline | constant buffer writes that changed "
+                 "nothing {:.0f}, not written {:.0f} (EXP107)",
                  rate(stats.draws), rate(stats.delta),
                  decided == 0 ? 0.0
                               : 100.0 * static_cast<double>(stats.delta) /
@@ -609,7 +617,9 @@ struct Counter {
                  full(Full::Submitted), full(Full::RenderPass), full(Full::DeltaPipeline),
                  full(Full::VertexInput), full(Full::HandleBind), full(Full::HandleData),
                  full(Full::NoKeptDraw), full(Full::SampledImages), full(Full::ComputedHandles),
-                 rate(stats.not_drawn), rate(stats.other_pipeline));
+                 rate(stats.not_drawn), rate(stats.other_pipeline),
+                 rate(g_unchanged_writes.exchange(0, std::memory_order_relaxed)),
+                 rate(g_skipped_writes.exchange(0, std::memory_order_relaxed)));
         static constexpr std::array<const char*, static_cast<size_t>(Ineligible::Count)>
             ineligible_names{"indirect",       "mesh",          "not built",
                              "writes images",  "transform feedback", "inline index",
