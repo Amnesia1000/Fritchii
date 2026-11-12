@@ -20,5 +20,6 @@
         <file>icons/fullscreen-exit.svg</file>
         <file>icons/community.svg</file>
         <file>icons/heart.svg</file>
+        <file>icons/coffee.svg</file>
     </qresource>
 </RCC>

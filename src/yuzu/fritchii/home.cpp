@@ -290,7 +290,15 @@ QWidget* Home::MakePage() {
     });
     links->addWidget(saves);
     links->addWidget(link(QStringLiteral("community"), tr("Discord"), &OpenDiscord));
-    links->addWidget(link(QStringLiteral("heart"), tr("Donate"), &OpenDonate));
+    // Buy Me a Coffee (owner, 2026-11-12): the support link in its own yellow, so it is seen.
+    auto* coffee = new QPushButton(IconTinted(QStringLiteral("coffee"), QColor(0x1b, 0x1b, 0x1f), 18),
+                                   tr("Buy me a coffee"), page);
+    coffee->setObjectName(QStringLiteral("FritchiiCoffee"));
+    coffee->setIconSize(QSize(18, 18));
+    coffee->setCursor(Qt::PointingHandCursor);
+    coffee->setFocusPolicy(Qt::NoFocus);
+    connect(coffee, &QPushButton::clicked, this, [] { OpenDonate(); });
+    links->addWidget(coffee);
     layout->addLayout(links);
     layout->addSpacing(28);
 

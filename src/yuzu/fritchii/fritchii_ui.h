@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include <QColor>
+
 #include <functional>
 #include <string>
 #include <utility>
@@ -35,6 +37,8 @@ bool ApplyTheme();
 
 /// A bundled line icon (fritchii/icons/<name>.svg): grey, and violet when checked.
 [[nodiscard]] QIcon Icon(const QString& name, int px = 22);
+/// One colour for every state (a filled button whose own colour is not the palette's).
+[[nodiscard]] QIcon IconTinted(const QString& name, const QColor& color, int px = 22);
 /// The same icon in one fixed colour (e.g. the dark play glyph on the violet button).
 [[nodiscard]] QIcon Glyph(const QString& name, unsigned rgb, int px);
 

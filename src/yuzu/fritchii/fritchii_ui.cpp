@@ -165,6 +165,14 @@ bool HidesSetting(const std::string& label) {
     return Enabled() && label.starts_with("frame_gen");
 }
 
+QIcon IconTinted(const QString& name, const QColor& color, int px) {
+    QFile file(QStringLiteral(":/fritchii/icons/%1.svg").arg(name));
+    if (!file.open(QFile::ReadOnly)) {
+        return {};
+    }
+    return QIcon(RenderSvg(file.readAll(), color, px));
+}
+
 QIcon Icon(const QString& name, int px) {
     QFile file(QStringLiteral(":/fritchii/icons/%1.svg").arg(name));
     if (!file.open(QFile::ReadOnly)) {

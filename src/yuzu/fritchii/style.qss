@@ -216,6 +216,19 @@ QPushButton#FritchiiLink {
 }
 QPushButton#FritchiiLink:hover { background: #26222f; }
 QPushButton#FritchiiLink:pressed { background: #1f1b2e; }
+QPushButton#FritchiiCoffee {
+    background: #ffdd00;
+    color: #1b1b1f;
+    border: none;
+    border-radius: 8px;
+    min-height: 38px;
+    max-height: 38px;
+    padding: 0 18px;
+    font-size: 15px;
+    font-weight: 600;
+}
+QPushButton#FritchiiCoffee:hover { background: #ffe633; }
+QPushButton#FritchiiCoffee:pressed { background: #e6c700; }
 QPushButton#FritchiiPlay:hover { background: #b59dfb; }
 QPushButton#FritchiiPlay:pressed { background: #9a7cf5; }
 QToolButton#FritchiiTile {
