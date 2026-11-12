@@ -239,6 +239,21 @@ inline std::atomic<int> g_feed_memory_overlay{-1};
 /// (Nx2PatchQmdCopy). Without it the holder's write-stamp check counts the upload's own method
 /// write as a later writer, so no holder ever takes a 3D patch and the QMD read waits. 1 = on.
 inline std::atomic<int> g_qmd_3d_patch{-1};
+/// EDEN_NX2_LIGHT_TABLE_ARRAYS=1 (boot, default 0; port of zortos293/Lichii#1485, jpkto's #354):
+/// a texture handle the shader reads from a storage buffer table at an index each invocation
+/// reads for itself (OoT's clustered lights: each light's shadow map handle, read per pixel from
+/// the light table) becomes a descriptor array of the table's first 64 entries, indexed
+/// NonUniform, instead of binding the null image (zortos #778), whose depth-compare sample is 0:
+/// fully shadowed, the dark grid that follows Link over water. With it on also: depth-compare
+/// samples of uncomparable images (garbage table entries) bind the null image, view lookups skip
+/// repeated table elements, a pipeline's texture arrays fit the sampler limits too, and dual
+/// vertex programs join their handle programs. Read once, on first use (PipelineCache's
+/// constructor, after nx2_switches.txt is applied): it changes what shaders translate to, so it
+/// is not live. Off, translation and binding are exactly what they were before the port.
+[[nodiscard]] inline bool LightTableArrays() {
+    static const bool on = EnvSwitch("EDEN_NX2_LIGHT_TABLE_ARRAYS") > 0;
+    return on;
+}
 
 /// Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP79, live through the debug server:
 /// slots for batches of fixes built together and A/B-tested in one session
