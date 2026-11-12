@@ -747,6 +747,11 @@ inline void LoadExperiments() {
         // empties on device memory pressure (TickFrame).
         g_experiments[82].store(1800, std::memory_order_relaxed);
         g_experiments[66].store(1024, std::memory_order_relaxed);
+        // EXP86 = 1 (2026-11-12, overnight): guest reads of GPU-written pages answered from the
+        // lock-free page mirrors. Verify mode (2) at the daytime market: ~17,000 reads per 5 s
+        // checked, 0 mismatches. Toggle (orbit, uncapped, 180 s warm, 6 cycles): guest lock waits
+        // 65.0 -> 3.7 ms/s median, 65.0 -> 66.5 fps, 1% low 44.0 -> 44.9, 0 broken mirrors.
+        g_experiments[86].store(1, std::memory_order_relaxed);
         // EXP49 = 1 (2026-11-10, owner's call for v5.7): the async read-back. Stalchild fight,
         // flipped every 30 s while the owner fought: 51.9 -> 56.9 fps, the back's read flushes
         // 35 -> 6 ms/s, guest lock waits halved. No beams in that session or two later ones
