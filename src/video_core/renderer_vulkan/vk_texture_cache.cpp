@@ -2952,6 +2952,9 @@ vk::Image TextureCacheRuntime::TakePooledImage(const ImagePoolKey& key) {
     if (!key.valid || VideoCore::Nx2Debug::Experiment(42) == 0) {
         return vk::Image{};
     }
+    if (ghost_pools) [[unlikely]] {
+        ghost_pools->Take(ImagePoolKeyHash(key), image_pool_frame);
+    }
     // Newest first: its memory is the most likely to be resident still.
     for (auto it = image_pool.rbegin(); it != image_pool.rend(); ++it) {
         if (it->key != key) {
@@ -2971,6 +2974,9 @@ vk::Image TextureCacheRuntime::TakePooledImage(const ImagePoolKey& key) {
 void TextureCacheRuntime::PoolImage(const ImagePoolKey& key, vk::Image image, u64 bytes) {
     if (!key.valid || !image || bytes > ImagePoolMaxBytes) {
         return;
+    }
+    if (ghost_pools) [[unlikely]] {
+        ghost_pools->Give(ImagePoolKeyHash(key), bytes, image_pool_frame);
     }
     image_pool.push_back(PooledImage{
         .key = key,
@@ -3182,6 +3188,9 @@ void TextureCacheRuntime::TickFrame() {
         const int pool_switch = VideoCore::Nx2Debug::Experiment(42);
         if (pool_switch == 0 || short_of_memory) {
             TrimImagePool(0);
+            if (ghost_pools) [[unlikely]] {
+                ghost_pools->Clear();
+            }
         } else {
             TrimImagePool(ImagePoolCap()); // a lowered EXP66 applies at once
         }
@@ -3224,8 +3233,19 @@ void TextureCacheRuntime::TickFrame() {
                 ++image_pool_unproven_evicted;
             }
         }
+        if (ghost_pools) [[unlikely]] {
+            const int unproven_switch = VideoCore::Nx2Debug::Experiment(65);
+            ghost_pools->Age(image_pool_frame, ImagePoolMaxFrames, proven_frames,
+                             unproven_switch > 0 ? static_cast<u64>(unproven_switch) : 0);
+        }
         if (image_pool_frame % 600 == 0 &&
             (pool_switch != 0 || image_pool_taken + image_pool_given != 0)) {
+            if (ghost_pools) {
+                // EDEN_NX2_GHOST_POOLS: the same 600 frames under other rules and caps.
+                LOG_INFO(Render_Vulkan,
+                         "Ghost pools (EXP42) last 600 frames, taken/missed hit% held: {}",
+                         ghost_pools->Report());
+            }
             LOG_INFO(Render_Vulkan,
                      "Image pool (EXP42) last 600 frames: {} taken, {} missed, {} pooled, {} "
                      "evicted ({} never-taken shapes aged out, EXP65={}); holds {} images, {} MiB; "

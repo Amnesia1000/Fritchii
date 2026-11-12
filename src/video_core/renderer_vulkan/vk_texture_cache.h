@@ -31,6 +31,7 @@
 #endif
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
+#include "video_core/nx2_ghost_pools.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -498,6 +499,9 @@ public:
     u64 image_pool_dropped_async{}; ///< EXP99: evictions handed to the free thread
     u64 image_pool_dropped_here{};
     u64 image_pool_dropped_idle{}; ///< EXP99=1: destroyed in the back's idle hook
+    /// EDEN_NX2_GHOST_POOLS=1 (boot): the pool's calls replayed under other rules and caps.
+    std::unique_ptr<VideoCommon::Nx2GhostPools::Ghosts> ghost_pools =
+        VideoCommon::Nx2GhostPools::CreateIfEnabled();
 public:
     /// EXP99=1: destroys up to `max` evicted pool images; the back calls it before it sleeps.
     void DestroyIdlePooledImages(u32 max);
