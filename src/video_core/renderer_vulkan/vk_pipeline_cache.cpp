@@ -212,6 +212,31 @@ Shader::AttributeType AttributeType(const FixedPipelineState& state, size_t inde
     return Shader::AttributeType::Disabled;
 }
 
+// zortos293/Lichii#1466 (Eglantine#720): Switch 2 geometry shaders may write all 32 generic
+// outputs next to Position and Layer: 133 components where Vulkan devices allow 128
+// (maxGeometryOutputComponents). AMD's Windows driver closed the emulator compiling such a shader
+// (RX 6600, Mario Tennis Fever). Drop the outputs the fragment shader never reads; skipped where it
+// can't tell (legacy, indexed, XFB) and for passthrough shaders the host runs natively (no IR
+// writes the outputs there). Called on AMD drivers only, so every other vendor emits the same
+// SPIR-V as before.
+void PruneUnreadGeometryOutputs(Shader::IR::Program& geometry, const Shader::IR::Program& fragment,
+                                const GraphicsPipelineCacheKey& key, bool native_passthrough) {
+    const Shader::Info& fs{fragment.info};
+    Shader::VaryingState& stores{geometry.info.stores};
+    if (fragment.stage != Shader::Stage::Fragment || key.state.xfb_enabled ||
+        (geometry.is_geometry_passthrough && native_passthrough) || fs.loads_indexed_attributes ||
+        geometry.info.stores_indexed_attributes || fs.loads.Legacy() || stores.Legacy()) {
+        return;
+    }
+    for (size_t index = 0; index < Shader::IR::NUM_GENERICS; ++index) {
+        if (!fs.loads.Generic(index)) {
+            for (size_t element = 0; element < 4; ++element) {
+                stores.Set(Shader::IR::Attribute::Generic0X + index * 4 + element, false);
+            }
+        }
+    }
+}
+
 Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> programs,
                                     const GraphicsPipelineCacheKey& key,
                                     const Shader::IR::Program& program,
@@ -541,9 +566,41 @@ struct DeferredStages {
     std::array<std::vector<u32>, Maxwell::MaxShaderStage> emitted_spirv;
 };
 
-size_t GetTotalPipelineWorkers() {
+/// EDEN_NX2_PIPELINE_WORKERS=<n>: pipeline build threads, 0 (unset) = the default.
+size_t RequestedPipelineWorkers() {
+    static const size_t requested = [] {
+        const char* const value = std::getenv("EDEN_NX2_PIPELINE_WORKERS");
+        const long parsed = value != nullptr ? std::strtol(value, nullptr, 10) : 0;
+        return parsed > 0 ? static_cast<size_t>(parsed) : size_t{0};
+    }();
+    return requested;
+}
+
+/// CheezyEmu 132cc46c9e: AMD's legacy Polaris driver uses a lot of RAM per compile of a large
+/// Switch 2 shader, and one build per core ran an RX 580 out of RAM after the intro. On GCN4 and
+/// older under AMD's own driver (Device::IsAmdLegacyGcn) every pipeline build pool is held to 2
+/// threads, or to EDEN_NX2_PIPELINE_WORKERS when set. Every other GPU keeps its count.
+size_t CapLegacyAmdBuildThreads(const Device& device, size_t threads) {
+    if (!device.IsAmdLegacyGcn()) {
+        return threads;
+    }
+    const size_t requested = RequestedPipelineWorkers();
+    return (std::min)(threads, requested != 0 ? requested : size_t{2});
+}
+
+size_t GetTotalPipelineWorkers(const Device& device) {
     const size_t max_core_threads =
         std::max<size_t>(static_cast<size_t>(std::thread::hardware_concurrency()), 2ULL) - 1ULL;
+    // EDEN_NX2_PIPELINE_WORKERS=<n> sets the number of pipeline build threads (CheezyEmu
+    // 132cc46c9e, Spikol02/Nyamu). Opt-in: unset, every GPU but legacy AMD keeps the old count.
+    if (const size_t requested = RequestedPipelineWorkers(); requested != 0) {
+        return (std::min)(max_core_threads, requested);
+    }
+    if (device.IsAmdLegacyGcn()) {
+        LOG_WARNING(Render_Vulkan, "AMD GCN4 or older: limiting pipeline build threads to 2 "
+                                   "(EDEN_NX2_PIPELINE_WORKERS overrides)");
+        return CapLegacyAmdBuildThreads(device, max_core_threads);
+    }
 #ifdef __ANDROID__
     const int configured = AndroidSettings::values.pipeline_worker_count.GetValue();
     const int clamped = std::clamp(configured, 2, 8);
@@ -720,7 +777,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
           return value != nullptr && std::string_view{value} == "1";
       }()},
       num_pipeline_workers{device.HasBrokenParallelShaderCompiling() ? 1ULL
-                                                                   : GetTotalPipelineWorkers()},
+                                                                   : GetTotalPipelineWorkers(device)},
       emission_budget{num_pipeline_workers},
       workers(num_pipeline_workers,
               "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
@@ -887,6 +944,8 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         // indexed per invocation, which needs nonuniform indexing to be defined.
         .support_handle_table_arrays = VideoCore::Nx2Debug::LightTableArrays() &&
                                        device.IsSampledImageArrayNonUniformIndexingSupported(),
+        // zortos293/Lichii#1466: AMD only, so other vendors translate as before.
+        .trim_lowered_geometry_passthrough = device.IsAmdDriver(),
     };
     host_info.ApplyDescriptorLimitPolicy();
 
@@ -3301,7 +3360,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                  deferred_graphics.size());
     }
     if (background_count != 0 && !stop_loading.stop_requested()) {
-        const size_t threads = BackgroundPipelineThreads();
+        const size_t threads = CapLegacyAmdBuildThreads(device, BackgroundPipelineThreads());
         LOG_INFO(Render_Vulkan,
                  "Building {} of {} cached graphics pipelines in the background ({} threads), the "
                  "rest when first needed",
@@ -4251,7 +4310,8 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     // that starts twice from the same record without getting further skips past it.
     const auto progress_path =
         base_dir / fmt::format("precompiled_progress.fork-v{}.txt", CACHE_VERSION);
-    const size_t threads = VideoCommon::Nx2Precompile::Threads();
+    const size_t threads =
+        CapLegacyAmdBuildThreads(device, VideoCommon::Nx2Precompile::Threads());
     size_t start_index = 0;
     u32 restarts = 0;
     if (!force) {
@@ -4373,8 +4433,8 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     const auto begin = std::chrono::steady_clock::now();
     // Threads() workers beside the game; at full speed (the frontend holds the game for the
     // preparation) one per host thread, at normal priority.
-    const size_t full_threads =
-        std::max<size_t>(threads, std::max(1U, std::thread::hardware_concurrency()));
+    const size_t full_threads = CapLegacyAmdBuildThreads(
+        device, std::max<size_t>(threads, std::max(1U, std::thread::hardware_concurrency())));
     // On Intel it does not build beside the game: there its compiles took the CPU from the game
     // (owner, Arc B580 + 6 cores: lag spikes with the preparation running in play, none with
     // EDEN_NX2_PRECOMPILE=0). Like the warm-up, it builds then only while emulation is paused or
@@ -6718,6 +6778,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             }
         }
         ConvertLegacyToGeneric(program, runtime_info);
+        if (index == static_cast<size_t>(Maxwell::ShaderType::Geometry) && device.IsAmdDriver()) {
+            // zortos293/Lichii#1466, AMD only: other vendors keep every geometry output.
+            PruneUnreadGeometryOutputs(
+                program, programs[static_cast<size_t>(Maxwell::ShaderType::Pixel)], key,
+                device.IsNvGeometryShaderPassthroughSupported());
+        }
         // EDEN_NX2_MESH_EMULATION_DUMP=<dir>: write the emulation's vertex shader for spirv-val.
         // (Emitting the mesh program a second time here to dump its compute shader crashed the
         // build that followed, so only the vertex shader is written.)

@@ -1835,6 +1835,12 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
     } clearing_scope{clearing_render_targets};
     clearing_render_targets = is_clear;
     auto& flags = maxwell3d->dirty.flags;
+    if (render_targets_out_of_memory) [[unlikely]] {
+        // A target had no memory at the last update: look every target up again, even if
+        // something cleared the dirty flags since.
+        flags[Dirty::RenderTargets] = true;
+        flags[Dirty::RenderTargetControl] = true;
+    }
     if (!flags[Dirty::RenderTargets]) {
         // EDEN_NX2_EXP31 (RT_FAST, zortos293/Lichii#717): bit 1 = skip the loop below while it
         // would change nothing, bit 2 = run it anyway and check that it changed nothing.
@@ -1925,6 +1931,23 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
 
     if (render_targets != previous_render_targets) {
         ++render_targets_serial;
+    }
+
+    // CheezyEmu a08015f893: a target that got no memory (FindRenderTargetView gives the null
+    // view only when its image could not be allocated; unused slots are ImageViewId{}). Its
+    // draws and clears are skipped, and every target is looked up again at the next one, by
+    // when the collector may have freed some. Never set while allocations succeed.
+    render_targets_out_of_memory =
+        render_targets.depth_buffer_id == NULL_IMAGE_VIEW_ID ||
+        std::ranges::any_of(render_targets.color_buffer_ids,
+                            [](ImageViewId id) { return id == NULL_IMAGE_VIEW_ID; });
+    if (render_targets_out_of_memory) [[unlikely]] {
+        flags[Dirty::RenderTargets] = true;
+        flags[Dirty::RenderTargetControl] = true; // forces every target's lookup
+        static u32 logged{};
+        if (logged++ < 8) {
+            LOG_ERROR(HW_GPU, "A render target has no memory: draws into it are skipped");
+        }
     }
 
     flags[Dirty::DepthBiasGlobal] = true;

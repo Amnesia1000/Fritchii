@@ -357,6 +357,14 @@ public:
         return properties.driver.driverID;
     }
 
+    /// Whether the device runs on an AMD driver: AMD's own (Windows, AMDVLK) or RADV. Gates
+    /// AMD-only workarounds so other vendors (NVIDIA above all) keep their path unchanged.
+    bool IsAmdDriver() const {
+        const VkDriverIdKHR id = GetDriverID();
+        return id == VK_DRIVER_ID_AMD_PROPRIETARY || id == VK_DRIVER_ID_AMD_OPEN_SOURCE ||
+               id == VK_DRIVER_ID_MESA_RADV;
+    }
+
     bool IsSparseBindingSupported() const {
         return features.features.sparseBinding && graphics_family_sparse_binding;
     }
@@ -1135,6 +1143,13 @@ FN_MAX_LIMIT_LIST
         return has_broken_cube_compatibility;
     }
 
+    /// Returns true for AMD GCN4 and older (Polaris and earlier, found by device ID or by the
+    /// lack of float16) on AMD's own drivers (CheezyEmu 132cc46c9e). Their driver uses a lot of
+    /// RAM per compile of a large Switch 2 shader, so pipelines build on fewer threads there.
+    bool IsAmdLegacyGcn() const {
+        return is_amd_legacy_gcn;
+    }
+
     /// Returns true if parallel shader compiling has issues with the current driver.
     bool HasBrokenParallelShaderCompiling() const {
         return has_broken_parallel_compiling;
@@ -1457,6 +1472,7 @@ private:
     bool has_broken_cube_compatibility{};      ///< Has broken cube compatibility bit
     bool has_broken_descriptor_aliasing{};     ///< Miscompiles descriptors aliased on one binding
     bool has_broken_parallel_compiling{};      ///< Has broken parallel shader compiling.
+    bool is_amd_legacy_gcn{};                  ///< AMD GCN4 or older on an AMD driver.
     bool has_renderdoc{};                      ///< Has RenderDoc attached
     bool has_nsight_graphics{};                ///< Has Nsight Graphics attached
     bool has_radeon_gpu_profiler{};            ///< Has Radeon GPU Profiler attached.

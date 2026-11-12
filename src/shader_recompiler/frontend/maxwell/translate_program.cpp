@@ -407,6 +407,18 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
             }
 
             if (!normalized_host_info.support_geometry_shader_passthrough) {
+                if (normalized_host_info.trim_lowered_geometry_passthrough) {
+                    // zortos293/Lichii#1466 (Eglantine#720): the lowered shader copies only
+                    // Position and the generics; the mask's other bits (InstanceId, VertexId,
+                    // FrontFace...) would declare stage inputs a geometry shader can't have.
+                    // AMD's Windows driver closed the emulator compiling such a shader.
+                    for (size_t i = 0; i < program.info.passthrough.mask.size(); ++i) {
+                        if (i < static_cast<size_t>(IR::Attribute::PositionX) ||
+                            i > static_cast<size_t>(IR::Attribute::Generic31W)) {
+                            program.info.passthrough.mask[i] = false;
+                        }
+                    }
+                }
                 program.output_vertices = GetOutputTopologyVertices(program.output_topology);
                 LowerGeometryPassthrough(program, normalized_host_info);
             }

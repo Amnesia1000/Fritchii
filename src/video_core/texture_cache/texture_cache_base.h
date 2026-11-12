@@ -304,6 +304,16 @@ public:
     /// @param is_clear True when the render targets are being used for clears
     void UpdateRenderTargets(bool is_clear);
 
+    /// Whether a bound render target has no image because the device ran out of memory for it
+    /// (FindRenderTargetView gave the null view, which only happens when JoinImages could not
+    /// allocate the image). A draw or clear into it must be skipped: the null view is no depth
+    /// buffer and no target of the right size, and AMD's driver crashed on such a draw
+    /// (amdvlk64.dll, read of 0x0, after a 1536x1536 depth target failed on an RX 5700 XT).
+    /// The targets are looked up again at the next draw. CheezyEmu a08015f893.
+    [[nodiscard]] bool RenderTargetsOutOfMemory() const noexcept {
+        return render_targets_out_of_memory;
+    }
+
     /// Find a framebuffer with the currently bound render targets
     /// UpdateRenderTargets should be called before this
     Framebuffer* GetFramebuffer();
@@ -1099,6 +1109,7 @@ private:
     bool VerifyRenderTargetsPrepared();
 
     RenderTargets render_targets;
+    bool render_targets_out_of_memory = false;
     u64 render_targets_serial = 0;
     struct RenderTargetsPrepared {
         bool valid = false;

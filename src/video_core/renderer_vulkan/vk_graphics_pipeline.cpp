@@ -2146,6 +2146,10 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             scheduler.RequestOutsideRenderPassOperationContext();
         }
     }
+    if (texture_cache.RenderTargetsOutOfMemory()) [[unlikely]] {
+        // CheezyEmu a08015f893: a bound target got no memory; skip the draw.
+        return false;
+    }
     if (IsBuilt() && (!pipeline || build->Failed())) {
         return false;
     }

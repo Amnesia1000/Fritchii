@@ -673,6 +673,17 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     // off for newer AMD drivers below: checked after that, every AMD GPU looked like GCN4 and lost
     // VK_EXT_sampler_filter_minmax (an RDNA3 Radeon 780M logged it).
     const bool amd_gcn4_or_older = is_amd && !features.shader_float16_int8.shaderFloat16;
+    // CheezyEmu 132cc46c9e: Polaris by device ID, since newer AMD drivers report shaderFloat16 on
+    // Polaris and the float16 test above misses them. Polaris 10/11/20/21/30 (RX 470-590),
+    // Polaris 12 (RX 540/550) and the RX 580 2048SP. Only limits pipeline build threads.
+    {
+        const u32 device_id = properties.properties.deviceID;
+        const bool is_polaris = properties.properties.vendorID == 0x1002 &&
+                                ((device_id >= 0x67C0 && device_id <= 0x67FF) ||
+                                 (device_id >= 0x6980 && device_id <= 0x699F) ||
+                                 device_id == 0x6FDF);
+        is_amd_legacy_gcn = is_amd_driver && (is_polaris || amd_gcn4_or_older);
+    }
     const bool device_float16 = features.shader_float16_int8.shaderFloat16;
     if (is_amd_driver) {
         // AMD drivers need a higher amount of Sets per Pool in certain circumstances like in XC2.
@@ -1723,7 +1734,16 @@ void Device::RemoveUnsuitableExtensions() {
                                        VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
 
     // VK_EXT_robustness2
-    features.robustness2.robustBufferAccess2 = VK_FALSE;
+    // AMD keeps robustBufferAccess2 (zortos293/Lichii capy/amd-prep-robustness2 bbac5266ef, from
+    // CheezyEmu c08bd7432b): games read storage buffers out of bounds and AMD returned garbage
+    // without it (OoT's fog compute shader 75d4369f3b1f5868 filled distant froxels with huge
+    // values and turned the Hyrule Field sky white). It needs robustBufferAccess, which every
+    // device here enables (a required feature). Only where the driver offers it: the queried
+    // value is kept. AMD proprietary, AMDVLK and RADV only; every other driver turns it off as
+    // before.
+    if (!IsAmdDriver()) {
+        features.robustness2.robustBufferAccess2 = VK_FALSE;
+    }
     features.robustness2.robustImageAccess2 = VK_FALSE;
     extensions.robustness_2 = features.robustness2.nullDescriptor;
 

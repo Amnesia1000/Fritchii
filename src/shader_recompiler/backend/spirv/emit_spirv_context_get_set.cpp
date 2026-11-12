@@ -48,6 +48,11 @@ std::optional<OutAttr> OutputAttrPointer(EmitContext& ctx, IR::Attribute attr) {
         const u32 index{IR::GenericAttributeIndex(attr)};
         const u32 element{IR::GenericAttributeElement(attr)};
         const GenericElementInfo& info{ctx.output_generics.at(index).at(element)};
+        if (!Sirit::ValidId(info.id)) {
+            // Output pruned (PruneUnreadGeometryOutputs, AMD only), nothing downstream reads it.
+            // Never taken where no output is pruned: every stored generic is declared.
+            return std::nullopt;
+        }
         if (info.num_components == 1) {
             return info.id;
         } else {
