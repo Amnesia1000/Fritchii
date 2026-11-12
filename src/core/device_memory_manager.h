@@ -135,6 +135,9 @@ public:
     void ReadBlockUnsafe(DAddr address, void* dest_pointer, size_t size);
     void WriteBlock(DAddr address, const void* src_pointer, size_t size);
     void WriteBlockUnsafe(DAddr address, const void* src_pointer, size_t size);
+    /// EXP92: bytes stored in place through a span (Core::Memory::GuestMemoryScoped), after
+    /// they landed: noted for the uniform keeps (Common::UniformKeepPages).
+    void NoteHostStore(DAddr address, size_t size);
 
     Asid RegisterProcess(Memory::Memory* memory);
     void UnregisterProcess(Asid id);
@@ -198,6 +201,9 @@ private:
     size_t ReleaseLingeringPages(std::span<const std::pair<u64, u32>> pages, bool match_frame);
     /// Uncaches the noted pages of a device range, whatever their age (Map, Unmap).
     void ReleaseLingeringRange(DAddr address, size_t size);
+    /// EXP92 (Common::UniformKeepPages): gives back the page watches the uniform keeps hold on a
+    /// device range whose backing is about to change (Map, Unmap). One load while none is held.
+    void UnwatchUniformKeepPages(DAddr address, size_t size);
     /// Uncaches every noted page (UnregisterProcess).
     void ReleaseAllLingering();
     /// MarkRegionCaching(false) for sorted device pages, per run of consecutive guest pages of

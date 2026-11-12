@@ -52,6 +52,7 @@ add_library(
     nx2_sampler.cpp
     nx2_sampler.h
     nx2_gpu_write_listener.h
+    nx2_uniform_keep_pages.h
     dynamic_library.cpp
     dynamic_library.h
     elf.h

@@ -14,6 +14,7 @@
 #include <fmt/format.h>
 
 #include "common/logging.h"
+#include "common/nx2_uniform_keep_pages.h"
 #include "core/core.h"
 #include "core/device_memory_manager.h"
 #include "video_core/gpu.h"
@@ -553,6 +554,8 @@ bool AtBoundary(Core::System& system, u64 device, u8* word, u32 payload, u64 rel
     g_words_written.store(true, std::memory_order_relaxed);
     g_frontier.store(frontier, std::memory_order_seq_cst);
     std::memcpy(word, &payload, sizeof(payload));
+    // EXP92 (uniform keeps, tier 2): a raw store to guest memory, after it landed.
+    Common::UniformKeepPages::Note(device, sizeof(payload));
     NoteEarlyAnswer(GpuSplit::Get().SentPosition(), false);
     stats.words_written.fetch_add(1, std::memory_order_relaxed);
     return true;

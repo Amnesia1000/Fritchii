@@ -15,6 +15,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging.h"
+#include "common/nx2_uniform_keep_pages.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
@@ -419,15 +420,26 @@ void MemoryManager::Write(GPUVAddr addr, T data) {
             rasterizer->FinishRead(*address, sizeof(T));
         }
     }
+    // EXP92 (uniform keeps, tier 2): the word's device pages, after it landed. One relaxed load
+    // until a keep was ever made.
+    const auto note_keeps = [this, addr] {
+        if (Common::UniformKeepPages::AnyKept()) [[unlikely]] {
+            if (const auto address = GpuToCpuAddress(addr)) {
+                Common::UniformKeepPages::Note(*address, sizeof(T));
+            }
+        }
+    };
     if (auto page_pointer{GetPointer(addr)}; page_pointer) {
         // NOTE: Avoid adding any extra logic to this fast-path block
         std::memcpy(page_pointer, &data, sizeof(T));
+        note_keeps();
         return;
     }
     // A Switch 2 sparse block nobody wrote yet gets its memory now.
     Tegra::Nx2BackSparseWrite(addr, sizeof(T), &data);
     if (auto page_pointer{GetPointer(addr)}; page_pointer) {
         std::memcpy(page_pointer, &data, sizeof(T));
+        note_keeps();
         return;
     }
 
@@ -684,7 +696,7 @@ void MemoryManager::ReadWordsUnsafe(GPUVAddr gpu_src_addr, u32* dest, std::size_
     ReadBlockUnsafe(gpu_src_addr, dest, size);
 }
 
-void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, [[maybe_unused]] VideoCommon::CacheType which, bool unsafe) {
+void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, [[maybe_unused]] VideoCommon::CacheType which, bool unsafe, bool note_keeps) {
     // Give Switch 2 sparse pages the write lands on their memory first (otherwise it is dropped).
     Tegra::Nx2BackSparseWrite(gpu_dest_addr, size, src_buffer);
     auto just_advance = [&]([[maybe_unused]] std::size_t page_index, [[maybe_unused]] std::size_t offset, std::size_t copy_amount) {
@@ -708,6 +720,10 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
         if (u8* physical = memory.GetPointer<u8>(dev_addr_base)) [[likely]] {
             std::memcpy(physical, src_buffer, copy_amount);
         }
+        // EXP92 (uniform keeps, tier 2): after the copy; cached writes are tier 1.
+        if (note_keeps) {
+            Common::UniformKeepPages::Note(dev_addr_base, copy_amount);
+        }
         // After the copy: the buffer cache may upload the written bytes from guest memory.
         if (!unsafe) {
             rasterizer->InvalidateRegion(dev_addr_base, copy_amount, which);
@@ -726,6 +742,10 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
             std::memcpy(physical, src_buffer, copy_amount);
         } else {
             memory.WriteBlockUnsafe(dev_addr_base, src_buffer, copy_amount);
+        }
+        // EXP92 (uniform keeps, tier 2): after the copy; cached writes are tier 1.
+        if (note_keeps) {
+            Common::UniformKeepPages::Note(dev_addr_base, copy_amount);
         }
         if (!unsafe) {
             rasterizer->InvalidateRegion(dev_addr_base, copy_amount, which);
@@ -747,8 +767,24 @@ void MemoryManager::WriteBlockUnsafe(GPUVAddr gpu_dest_addr, const void* src_buf
     WriteBlockImpl(gpu_dest_addr, src_buffer, size, VideoCommon::CacheType::None, true);
 }
 
+void MemoryManager::NoteHostStore(GPUVAddr gpu_addr, std::size_t size) {
+    if (!Common::UniformKeepPages::AnyKept() || size == 0) [[likely]] {
+        return;
+    }
+    // Page by page: a GPU range may map to scattered device pages.
+    const GPUVAddr end = gpu_addr + size;
+    for (GPUVAddr page = gpu_addr; page < end;) {
+        const GPUVAddr next = (std::min)(end, Common::AlignDown(page, Core::DEVICE_PAGESIZE) +
+                                                  Core::DEVICE_PAGESIZE);
+        if (const auto address = GpuToCpuAddress(page)) {
+            Common::UniformKeepPages::Note(*address, next - page);
+        }
+        page = next;
+    }
+}
+
 void MemoryManager::WriteBlockCached(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size) {
-    WriteBlockImpl(gpu_dest_addr, src_buffer, size, VideoCommon::CacheType::None, true);
+    WriteBlockImpl(gpu_dest_addr, src_buffer, size, VideoCommon::CacheType::None, true, false);
     accumulator.Add(gpu_dest_addr, size);
 }
 
@@ -762,7 +798,7 @@ void MemoryManager::WriteWordsCached(GPUVAddr gpu_dest_addr, const u32* words, s
         }
         return;
     }
-    WriteBlockImpl(gpu_dest_addr, words, size, VideoCommon::CacheType::None, true);
+    WriteBlockImpl(gpu_dest_addr, words, size, VideoCommon::CacheType::None, true, false);
     // The accumulator merges word by word differently from one range: keep its ranges.
     for (std::size_t i = 0; i < count; ++i) {
         accumulator.Add(gpu_dest_addr + i * sizeof(u32), sizeof(u32));
