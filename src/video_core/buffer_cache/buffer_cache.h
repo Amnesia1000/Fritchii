@@ -301,7 +301,13 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu
     if (Nx2Perf::On(Nx2Perf::Opt::WriteIntersections) && keep_page_gpu_data) {
         const DAddr page_begin = Common::AlignDown(device_addr, DEVICE_PAGESIZE);
         const DAddr page_end = Common::AlignUp(device_addr + size, DEVICE_PAGESIZE);
-        if (!gpu_modified_ranges.Intersects(page_begin, page_end - page_begin)) {
+        // EDEN_NX2_EXP85 & 2 (live; fable52_answer_microcuts 2b): pages no GPU write ever marked
+        // hold no GPU-modified range (every gpu_modified_ranges.Add marks the bit first): the
+        // never-clearing bit answers before the range set's lookup.
+        const bool never_gpu_written = (VideoCore::Nx2Debug::Experiment(85) & 2) != 0 &&
+                                       Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
+                                       !Tegra::Nx2MayBeGpuWritten(page_begin, page_end - page_begin);
+        if (never_gpu_written || !gpu_modified_ranges.Intersects(page_begin, page_end - page_begin)) {
             if (!Nx2Perf::Verify()) {
                 memory_tracker.MarkRegionAsCpuModified(device_addr, size);
                 MarkVertexBuffersStale(device_addr, size);

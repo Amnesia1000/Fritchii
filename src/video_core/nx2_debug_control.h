@@ -471,6 +471,10 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// limit. EDEN_NX2_IDLE_STATS=1 logs each core's idle periods every 10 s (polled, blocked, wake
 /// latency). Blocking still uses EDEN_NX2_CORE_LOCK's address wait when that is on. In OoT the
 /// guest threads' handoffs sit on the frame's critical path. Off by default.
+/// EXP85 (live, bits, 0 = off; fable52_answer_microcuts 1 and 2b): 1 = a small inline upload to
+/// pages no GPU write ever marked skips the buffer cache's lock (InlineMemory would find nothing
+/// there; the list note and the query cache as before), 2 = BufferCache::WriteMemory answers
+/// "no GPU-written data on these pages" from the GPU-written bit before the range set. 3 = both.
 /// EXP84 (live, 0 = off; fable52_answer_microcuts 3.4; RasterizerVulkan::GetFlushArea): a guest
 /// read skips the caches' locks when no image is registered on its pages now (TextureCache::
 /// image_count_filter, counted at register and unregister, plus the pages sparse images ever

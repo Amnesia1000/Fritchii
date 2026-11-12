@@ -4037,6 +4037,22 @@ void RasterizerVulkan::AccelerateInlineToMemoryImpl(GPUVAddr address, size_t cop
         const char* value = std::getenv("EDEN_NX2_INLINE_DEFER");
         return value == nullptr || value[0] != '0';
     }();
+    // EDEN_NX2_EXP85 & 1 (live; fable52_answer_microcuts 1): no GPU write ever marked these pages,
+    // so InlineMemory would find no GPU-modified range to upload into (both gpu_modified_ranges.Add
+    // sites mark the GPU-written bit, on this thread): skip the buffer cache's lock. The list note
+    // takes its own mutex; the query cache only where its filter says it holds something.
+    if (defer && (VideoCore::Nx2Debug::Experiment(85) & 1) != 0) {
+        const DAddr page_begin = Common::AlignDown(*cpu_addr, Core::DEVICE_PAGESIZE);
+        const DAddr page_end = Common::AlignUp(*cpu_addr + copy_size, Core::DEVICE_PAGESIZE);
+        if (!MayBeGpuModified(page_begin, page_end - page_begin)) {
+            buffer_cache.Nx2NoteListHostWrite(*cpu_addr, copy_size);
+            if (query_cache.page_filter.Any(*cpu_addr, copy_size)) {
+                query_cache.InvalidateRegion(*cpu_addr, copy_size);
+            }
+            gpu_memory->AccumulateInvalidation(address, copy_size);
+            return;
+        }
+    }
     // One cache at a time: holding both while waiting for either (std::lock) waited longer, the
     // fencing thread and CPU write traps holding one of them most of the time.
     bool uploaded;
