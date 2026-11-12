@@ -655,6 +655,11 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// or, without MONITORX/WAITPKG as on the owner's PC, a SwitchToThread loop; ~795 ms/s over six
 /// cores). With SMT those polls share physical cores with the GPU threads. Timing only. An
 /// explicit EDEN_NX2_IDLE_SPIN_US still wins.
+/// EXP114 (live; 0 = off, N > 0 = N us; gpu_thread.cpp): while channels wait on semaphores, the
+/// GPU front polls them with a SwitchToThread between polls for 500 us after the last progress.
+/// With N it waits N us with PAUSE instead, polling less often and leaving its SMT sibling free.
+/// Measured elsewhere at the market: 2 us best (1, 5, 10, 20 less). Not under EDEN_NX2_GPU_WAKE,
+/// whose wait is in hardware already. Timing only.
 /// EXP101 (live, 0 = off, 1 = runs, 2 = cached page pointer + prefetch; fable52_answer_presenter): nvhost_gpu::SubmitGPFIFOImpl's pushbuffer
 /// snapshot reads runs of entries whose GPU addresses follow each other with one ReadBlockUnsafe
 /// instead of one per entry (OoT's presenting thread submits ~6,500 entries a frame; the loop is

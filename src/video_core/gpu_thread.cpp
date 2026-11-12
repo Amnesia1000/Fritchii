@@ -7,6 +7,9 @@
 #include <algorithm>
 #include <chrono>
 #include <thread>
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
 
 #include "common/assert.h"
 #include "common/dkb_cpu_trace.h"
@@ -42,6 +45,17 @@ void SignalCommand(SynchState& state, u64 fence, bool block) {
         std::scoped_lock lk{state.write_lock};
         state.cv.notify_all();
     }
+}
+
+// One spin-wait hint (EXP114's pending poll gap).
+void PollPause() {
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    _mm_pause();
+#elif defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    asm volatile("yield");
+#endif
 }
 
 } // Anonymous namespace
@@ -144,7 +158,21 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     const int poll = VideoCore::Nx2Debug::Experiment(6);
                     if (poll == 2 || std::chrono::steady_clock::now() - last_progress <
                                          std::chrono::microseconds{500}) {
-                        std::this_thread::yield();
+                        // EXP114 (live; 0 = yield, N > 0 = N us): between polls, wait with PAUSE
+                        // instead of a yield per poll. ResumePending ran hundreds of thousands of
+                        // times a second at the market; the PAUSE wait leaves the core's SMT
+                        // sibling (often the back thread or a guest core) free.
+                        if (const int gap_us = VideoCore::Nx2Debug::Experiment(114); gap_us > 0) {
+                            const auto until = std::chrono::steady_clock::now() +
+                                               std::chrono::microseconds{gap_us};
+                            do {
+                                for (int i = 0; i < 16; ++i) {
+                                    PollPause();
+                                }
+                            } while (std::chrono::steady_clock::now() < until);
+                        } else {
+                            std::this_thread::yield();
+                        }
                     } else if (poll == 1) {
                         std::this_thread::sleep_for(std::chrono::microseconds{50});
                     } else {
