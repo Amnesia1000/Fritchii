@@ -127,6 +127,11 @@ public:
     /// GetFlushAreaLocked that also compares the buffer cache's page mirrors' answer with what
     /// the locked path decides (EDEN_NX2_EXP86=2).
     VideoCore::RasterizerDownloadArea GetFlushAreaLockedVerifyMirror(DAddr addr, u64 size);
+    /// GetFlushAreaLocked that also compares the texture cache's count of GPU-modified images
+    /// with what its locked look finds (EDEN_NX2_EXP100=2). buffer_clean: the fast path's buffer
+    /// side answer, taken before the locks.
+    VideoCore::RasterizerDownloadArea GetFlushAreaLockedVerifyImage(DAddr addr, u64 size,
+                                                                    bool buffer_clean);
     bool HasPendingQueries(DAddr addr, u64 size) override;
     bool HasCachedReports(DAddr addr, u64 size) override;
     void InvalidateRegion(DAddr addr, u64 size,

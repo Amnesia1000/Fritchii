@@ -21,6 +21,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include "video_core/page_filter.h"
+#include "video_core/mirror_seq.h"
 #include "common/container/unordered_map.h"
 #include "common/container/unordered_set.h"
 #include <vector>
@@ -325,6 +326,10 @@ public:
 
     std::optional<VideoCore::RasterizerDownloadArea> GetFlushArea(DAddr cpu_addr, u64 size);
 
+    /// EXP100 verify (under the mutex): logs the GPU-modified images GetFlushArea finds for a read
+    /// gpu_image_filter said was clear (range, flags, nx2_gpu_counted).
+    void LogGpuModifiedImagesInRegion(DAddr cpu_addr, u64 size);
+
     /// Remove images in a region
     void UnmapMemory(DAddr cpu_addr, size_t size);
 
@@ -595,6 +600,14 @@ public:
     }
 
     Common::SpinRecursiveMutex mutex;
+    /// EXP100 (fable52_answer_imagereads 2): registered non-sparse images that were GPU-modified
+    /// at some time since they were registered (CountGpuModified at the three sites that set
+    /// GpuModified and at RegisterImage; removed at UnregisterImage; clears of the flag are
+    /// ignored on purpose). Changed only under the mutex, read without it.
+    VideoCommon::CountingPageFilter gpu_image_filter;
+    /// Odd from a hold's first change of gpu_image_filter until that hold releases the mutex
+    /// (the mutex's release hook, set in the constructor). After `mutex` in declaration order.
+    VideoCommon::MirrorSeq image_seq{mutex, "Texture cache GPU-modified image count (EXP100)"};
 
 private:
     /// Iterate over all page indices in a range
@@ -1022,6 +1035,10 @@ private:
 
     /// Mark an image as modified from the GPU
     void MarkModification(ImageBase& image) noexcept;
+
+    /// EXP100: counts a registered, non-sparse image that is or was GPU-modified in
+    /// gpu_image_filter until it is unregistered. Holder of the mutex only.
+    void CountGpuModified(ImageBase& image) noexcept;
 
     /// Synchronize image aliases, copying data if needed
     void SynchronizeAliases(ImageId image_id);

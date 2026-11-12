@@ -2772,6 +2772,23 @@ struct GuestAccessCounters {
     std::atomic<u64> verify_texture_answered{}; ///< of those, the texture cache answered
     std::atomic<u64> verify_cache_clean_mirror_not{};
     std::atomic<u64> verify_busy{};
+    /// EXP100 (fable52_answer_imagereads 5): reads with an image on their pages (EXP100 != 0)
+    /// the texture cache's count of GPU-modified images answered (fast), and why the others
+    /// stayed locked: a counted image on the 64 KiB page, a page a sparse image ever covered, the
+    /// counter odd or moved (or the count broken), the buffer side not clean, or excluded (EXP36,
+    /// EXP81, EXP43 = 4).
+    std::atomic<u64> image_fast{};
+    std::atomic<u64> image_counted{};
+    std::atomic<u64> image_sparse{};
+    std::atomic<u64> image_busy{};
+    std::atomic<u64> image_buffer{};
+    std::atomic<u64> image_excluded{};
+    /// EXP100=2: locked reads compared with the count, those it would have answered, and the
+    /// mismatches: the count said no GPU-modified image, the locked look found one (whole
+    /// session, must be 0).
+    std::atomic<u64> image_verify_checked{};
+    std::atomic<u64> image_verify_would_fast{};
+    std::atomic<u64> image_verify_mismatch{};
     std::atomic<s64> last_log{};
 };
 GuestAccessCounters g_guest_access;
@@ -2847,9 +2864,17 @@ void CountGuestAccess(std::atomic<u64>& counter) {
              Tegra::g_nx2_guest_writes_collected.exchange(0, std::memory_order_relaxed));
     LOG_INFO(Render_Vulkan,
              "Guest reads locked because (5 s, EXP84={}): an image registered there now {}, an "
-             "image only ever {}, GPU-written pages {}",
+             "image only ever {}, GPU-written pages {}; EXP100={}: answered by the image filter "
+             "{}, stayed locked by reason: counted image on the 64 KiB page {}, sparse {}, "
+             "counter busy {}, buffer side {}, excluded {}; verify {} checked, {} would be fast, "
+             "{} mismatches (whole session, must be 0)",
              VideoCore::Nx2Debug::Experiment(84), c.locked_image_now.exchange(0),
-             c.locked_image_ever.exchange(0), c.locked_gpu_written.exchange(0));
+             c.locked_image_ever.exchange(0), c.locked_gpu_written.exchange(0),
+             VideoCore::Nx2Debug::Experiment(100), c.image_fast.exchange(0),
+             c.image_counted.exchange(0), c.image_sparse.exchange(0), c.image_busy.exchange(0),
+             c.image_buffer.exchange(0), c.image_excluded.exchange(0),
+             c.image_verify_checked.exchange(0), c.image_verify_would_fast.exchange(0),
+             c.image_verify_mismatch.load());
     LOG_INFO(Render_Vulkan,
              "GPU-written page mirror (5 s, EXP86={}): {} fast, {} counter busy, {} modified, {} "
              "armed without a mark, {} broken; verify {} checked, {} mirror clean but cache not "
@@ -2919,6 +2944,60 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
         }
     }
     const bool verify_mirror = mirror_eligible && mirror_mode == 2;
+    // EDEN_NX2_EXP100 (live, 0 = off; fable52_answer_imagereads, Fable's F1): pages with an image
+    // on them, asked without the locks. The texture cache's locked look acts only on images that
+    // are GpuModified; gpu_image_filter counts, per 64 KiB page, every registered non-sparse image
+    // that was GPU-modified since it was registered, changed only under the texture cache's mutex
+    // with image_seq odd while a hold changes it. Nothing counted on the pages, no sparse image
+    // ever there, and the buffer side clean as today (no GPU write ever marked the pages, or
+    // EXP86's mirrors say clean): the locked path would answer this same preemptive area and
+    // change nothing. Obeys EXP36; EXP81's stamps and EXP43 = 4's tombstone check need the lock.
+    // 2 = verify on the locked path, no fast answers.
+    const int image_mode = VideoCore::Nx2Debug::Experiment(100);
+    const bool image_block = by_count ? image_now : image_ever; // what sends it to the lock today
+    bool image_eligible = false;
+    if (image_mode != 0 && image_block && size != 0) {
+        if (VideoCore::Nx2Debug::Experiment(36) != 0 ||
+            VideoCore::Nx2Debug::Experiment(81) != 0 ||
+            VideoCore::Nx2Debug::Experiment(43) == 4) { // tombstone check needs the lock
+            g_guest_access.image_excluded.fetch_add(1, std::memory_order_relaxed);
+        } else if (texture_cache.sparse_page_filter.Any(addr, size)) {
+            g_guest_access.image_sparse.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            image_eligible = true;
+        }
+    }
+    // The buffer side, as today: no GPU write ever marked the pages, or EXP86's mirrors say clean.
+    const auto image_buffer_clean = [&] {
+        if (!gpu_written) {
+            return true;
+        }
+        return mirror_mode == 1 && buffer_cache.MirrorCleanForRead(addr, size) ==
+                                       VideoCommon::MirrorAnswer::Clean;
+    };
+    if (image_eligible && image_mode == 1) {
+        const u64 seq = texture_cache.image_seq.Load();                  // 1: the counter
+        if ((seq & 1) != 0 || texture_cache.image_seq.Broken()) {
+            g_guest_access.image_busy.fetch_add(1, std::memory_order_relaxed);
+        } else if (texture_cache.gpu_image_filter.Any(addr, size)) {     // 2: the count
+            g_guest_access.image_counted.fetch_add(1, std::memory_order_relaxed);
+        } else if (!image_buffer_clean()) {                              // 3: the buffer side
+            g_guest_access.image_buffer.fetch_add(1, std::memory_order_relaxed);
+        } else if (texture_cache.image_seq.Load() != seq ||              // 4: the counter again
+                   texture_cache.image_seq.Broken()) {
+            g_guest_access.image_busy.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            g_guest_access.image_fast.fetch_add(1, std::memory_order_relaxed);
+            CountGuestAccess(g_guest_access.read_fast);
+            return VideoCore::RasterizerDownloadArea{
+                .start_address = page_begin,
+                .end_address = page_end,
+                .preemtive = true,
+            };
+        }
+    }
+    const bool verify_image = image_eligible && image_mode == 2;
+    const bool verify_image_buffer_clean = verify_image && image_buffer_clean();
     if (image_now) {
         g_guest_access.locked_image_now.fetch_add(1, std::memory_order_relaxed);
     } else if (image_ever) {
@@ -2957,8 +3036,10 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
             };
         }
         // Both held: the locked path takes them again recursively.
-        const auto area = verify_mirror ? GetFlushAreaLockedVerifyMirror(addr, size)
-                                        : GetFlushAreaLocked(addr, size);
+        const auto area =
+            verify_image    ? GetFlushAreaLockedVerifyImage(addr, size, verify_image_buffer_clean)
+            : verify_mirror ? GetFlushAreaLockedVerifyMirror(addr, size)
+                            : GetFlushAreaLocked(addr, size);
         buffer_cache.mutex.unlock();
         texture_cache.mutex.unlock();
         CountGuestAccess(g_guest_access.read_locked);
@@ -2967,8 +3048,10 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
         }
         return area;
     }
-    const auto area = verify_mirror ? GetFlushAreaLockedVerifyMirror(addr, size)
-                                    : GetFlushAreaLocked(addr, size);
+    const auto area =
+        verify_image    ? GetFlushAreaLockedVerifyImage(addr, size, verify_image_buffer_clean)
+        : verify_mirror ? GetFlushAreaLockedVerifyMirror(addr, size)
+                        : GetFlushAreaLocked(addr, size);
     CountGuestAccess(g_guest_access.read_locked);
     if (!area.preemtive) {
         g_guest_access.read_flush.fetch_add(1, std::memory_order_relaxed);
@@ -3001,6 +3084,61 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushAreaLockedVerifyMirr
     } else {
         // Nothing asks the buffer cache: preemptive, nothing changed.
         CountMirrorVerify(buffer_cache.MirrorCleanForRead(addr, size), true);
+    }
+    VideoCore::RasterizerDownloadArea new_area{
+        .start_address = Common::AlignDown(addr, Core::DEVICE_PAGESIZE),
+        .end_address = Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE),
+        .preemtive = true,
+    };
+    return new_area;
+}
+
+VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushAreaLockedVerifyImage(
+    DAddr addr, u64 size, bool buffer_clean) {
+    // GetFlushAreaLocked, step for step (EXP100 = 2). Under the texture cache's mutex no other
+    // thread is inside a hold, so the count is exact for this instant: "count says none, the
+    // locked look found one" is a true mismatch (a set site was missed). The read is still
+    // answered by the locked path.
+    auto& c = g_guest_access;
+    {
+        std::scoped_lock lock{texture_cache.mutex};
+        // Odd here only if this thread's own outer hold is changing the count; broken: the fast
+        // path never answers. Neither is compared.
+        const bool comparable = (texture_cache.image_seq.Load() & 1) == 0 &&
+                                !texture_cache.image_seq.Broken();
+        const bool filter_clean = !texture_cache.gpu_image_filter.Any(addr, size);
+        auto area = texture_cache.GetFlushArea(addr, size);
+        if (!comparable) {
+            c.image_busy.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            c.image_verify_checked.fetch_add(1, std::memory_order_relaxed);
+            if (filter_clean && area) {
+                const u64 mismatches = c.image_verify_mismatch.fetch_add(1) + 1;
+                if (mismatches <= 16) {
+                    LOG_ERROR(Render_Vulkan,
+                              "EXP100 verify mismatch {}: read [{:#x} +{:#x}) has no counted "
+                              "image, the locked look found a GPU-modified one",
+                              mismatches, addr, size);
+                    texture_cache.LogGpuModifiedImagesInRegion(addr, size);
+                }
+            } else if (!filter_clean) {
+                c.image_counted.fetch_add(1, std::memory_order_relaxed);
+            } else if (!buffer_clean) {
+                c.image_buffer.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                c.image_verify_would_fast.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (area) {
+            return *area;
+        }
+    }
+    if (buffer_cache.FlushesOnCpuRead()) {
+        std::scoped_lock lock{buffer_cache.mutex};
+        auto area = buffer_cache.GetFlushArea(addr, size);
+        if (area) {
+            return *area;
+        }
     }
     VideoCore::RasterizerDownloadArea new_area{
         .start_address = Common::AlignDown(addr, Core::DEVICE_PAGESIZE),

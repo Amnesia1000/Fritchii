@@ -72,6 +72,9 @@ using namespace Common::Literals;
 template <class P>
 TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManager& device_memory_)
     : runtime{runtime_}, device_memory{device_memory_} {
+    // EXP100 (fable52_answer_imagereads 2): the mutex's release closes the counter a hold opened
+    // for gpu_image_filter. Before any other thread sees the cache.
+    mutex.SetReleaseHook(&VideoCommon::MirrorSeq::ReleaseHook, &image_seq);
     // Configure null sampler
     TSCEntry sampler_descriptor{};
     sampler_descriptor.min_filter.Assign(Tegra::Texture::TextureFilter::Linear);
@@ -2292,6 +2295,23 @@ std::optional<VideoCore::RasterizerDownloadArea> TextureCache<P>::GetFlushArea(D
         }
     });
     return area;
+}
+
+template <class P>
+void TextureCache<P>::LogGpuModifiedImagesInRegion(DAddr cpu_addr, u64 size) {
+    // The images GetFlushArea's lambda acted on: same walk, same test, under the same hold.
+    ForEachImageInRegion(cpu_addr, size, [&](ImageId, ImageBase& image) {
+        if (False(image.flags & ImageFlagBits::GpuModified)) {
+            return;
+        }
+        LOG_ERROR(HW_GPU,
+                  "EXP100 verify: read [{:#x} +{:#x}) found GPU-modified image cpu={:#x}..{:#x} "
+                  "size={:#x} gpu={:#x} flags={:#x} nx2_gpu_counted={} counted={:#x} +{:#x}",
+                  cpu_addr, size, image.cpu_addr, image.cpu_addr_end, image.guest_size_bytes,
+                  image.gpu_addr, static_cast<u32>(image.flags & ~ImageFlagBits::Picked),
+                  image.nx2_gpu_counted,
+                  image.nx2_counted_addr, image.nx2_counted_size);
+    });
 }
 
 template <class P>
@@ -4952,6 +4972,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         }
         if (True(overlap.flags & ImageFlagBits::GpuModified)) {
             new_image.flags |= ImageFlagBits::GpuModified;
+            CountGpuModified(new_image); // EXP100 (a no-op until RegisterImage below counts it)
             const auto& resolution = Settings::values.resolution_info;
             const SubresourceBase base = new_image.TryFindBase(overlap.gpu_addr).value();
             const u32 up_scale = can_rescale ? resolution.up_scale : 1;
@@ -5478,6 +5499,9 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
         image_count_filter.Add(image.cpu_addr, image.guest_size_bytes);
         image.nx2_counted_addr = image.cpu_addr;
         image.nx2_counted_size = image.guest_size_bytes;
+        if (True(image.flags & ImageFlagBits::GpuModified)) {
+            CountGpuModified(image); // EXP100: registered while already GPU-modified
+        }
         ForEachCPUPage(image.cpu_addr, image.guest_size_bytes,
                        [this, map_id](u64 page) { page_table[page].push_back(map_id); });
         image.map_view_id = map_id;
@@ -5529,6 +5553,11 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
     if (False(image.flags & ImageFlagBits::Sparse)) {
         const auto map_id = image.map_view_id;
         image_count_filter.Remove(image.nx2_counted_addr, image.nx2_counted_size);
+        if (image.nx2_gpu_counted) { // EXP100
+            image_seq.BeforeChange();
+            gpu_image_filter.Remove(image.nx2_counted_addr, image.nx2_counted_size);
+            image.nx2_gpu_counted = false;
+        }
         image.nx2_counted_size = 0;
         ForEachCPUPage(image.cpu_addr, image.guest_size_bytes, [this, map_id](u64 page) {
             const auto page_it = page_table.find(page);
@@ -5949,9 +5978,24 @@ void TextureCache<P>::UnindexFramebuffer(FramebufferId framebuffer_id, const Ren
     framebuffer_keys.erase(framebuffer_id);
 }
 
+// EXP100 (fable52_answer_imagereads 2). Holder of the mutex only (BeforeChange breaks the count
+// for good otherwise, and logs). A registered, non-sparse image that is or was GPU-modified: its
+// pages stay counted until it is unregistered. Clears of the flag are ignored on purpose.
+template <class P>
+void TextureCache<P>::CountGpuModified(ImageBase& image) noexcept {
+    if (image.nx2_gpu_counted || False(image.flags & ImageFlagBits::Registered) ||
+        True(image.flags & ImageFlagBits::Sparse) || image.nx2_counted_size == 0) {
+        return;
+    }
+    image_seq.BeforeChange();
+    gpu_image_filter.Add(image.nx2_counted_addr, image.nx2_counted_size);
+    image.nx2_gpu_counted = true;
+}
+
 template <class P>
 void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
     image.flags |= ImageFlagBits::GpuModified;
+    CountGpuModified(image); // EXP100
     // EXP76: GPU-written texels no longer match a hash of guest bytes.
     image.nx2_content_hash_lo = 0;
     image.nx2_content_hash_hi = 0;
@@ -6398,6 +6442,7 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
     image.modification_tick = most_recent_tick;
     if (any_modified) {
         image.flags |= ImageFlagBits::GpuModified;
+        CountGpuModified(image); // EXP100
         image.nx2_content_hash_lo = 0; // EXP76: aliases copied GPU-written texels in
         image.nx2_content_hash_hi = 0;
     }
