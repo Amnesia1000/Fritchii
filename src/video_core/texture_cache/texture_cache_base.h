@@ -40,6 +40,7 @@
 #include "common/thread_worker.h"
 #include "core/gpu_dirty_memory_manager.h"
 #include "video_core/compatible_formats.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/delayed_destruction_ring.h"
 #include "video_core/engines/fermi_2d.h"
@@ -1071,10 +1072,16 @@ private:
     void UpdateStaleTracking(u64 run_begin, u64 run_pages, s32 delta);
     // Off here unless EDEN_NX2_TC_SKIP_STALE=1: no gain at an Ocarina of Time Hyrule Field save
     // (fresh launches, walking 1% low 40.2 off vs 36.5 on); #463 measured +20% in Castle Town.
-    bool tc_skip_stale{[] {
+    bool tc_skip_stale_boot{[] {
         const char* value = std::getenv("EDEN_NX2_TC_SKIP_STALE");
         return value != nullptr && value[0] == '1';
     }()};
+    /// EDEN_NX2_TC_SKIP_STALE=1 at boot, or EXP78 != 0 (live; fable52_answer_killuploads 3-4:
+    /// the fight's kill bursts re-upload GPU-drawn targets from memory nobody wrote). Pages are
+    /// marked from the moment it is on.
+    [[nodiscard]] bool TcSkipStale() const noexcept {
+        return tc_skip_stale_boot || VideoCore::Nx2Debug::Experiment(78) != 0;
+    }
     /// Device memory pages (Core::Memory::YUZU_PAGEBITS), not this cache's 1 MiB lookup pages.
     static constexpr u64 STALE_PAGE_BITS = 12;
     std::vector<u64> stale_bits; ///< One bit per device page

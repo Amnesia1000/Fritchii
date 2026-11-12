@@ -447,6 +447,12 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// collector's device memory figure, as deleted images waiting for the GPU are. Logs "Image pool
 /// (EXP42) last 600 frames" and counts pooled creates in "Slow clear texture cache". 1 is the default
 /// (LoadExperiments); 0 = off.
+/// EXP78 (live, 0 = off; fable52_answer_killuploads 3-4; TextureCache::TcSkipStale): what
+/// EDEN_NX2_TC_SKIP_STALE=1 does at boot, switchable: a deleted GPU-written image marks its whole
+/// pages stale (CPU writes clear them) and a new image whose range is all stale (and not
+/// buffer-written) skips its upload from guest memory nobody wrote. Fight kill bursts: 30-105
+/// such uploads inside draws, 3-10 ms. Marks start when it turns on. "stale uploads skipped" in
+/// the texture cache's 600-frame line.
 /// EXP77 (live, 0 = off; fable52_answer_keeptex_2 2b; TextureCache): a GPU-written chain target
 /// the cold sweep deletes leaves its shape at its address; a texture header that asks for that
 /// address again marks the shape (and address) GuardSampled, so the sweep keeps that shape from
