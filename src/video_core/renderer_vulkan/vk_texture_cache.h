@@ -10,6 +10,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <unordered_map>
 #include <unordered_set>
 #include <memory>
 #include <mutex>
@@ -468,7 +469,27 @@ public:
         u64 bytes;
         u64 frame;
         bool proven; ///< Its key was taken from the pool before (EXP65)
+        u64 hash;    ///< ImagePoolKeyHash(key), for EXP110's shape lookups
     };
+    /// EXP110 (live, 0 = off; fable52_answer_stall3 3): the pool's own record of each shape it
+    /// answered a lookup for, by key hash. Bumped on a take only, never aged, kept through
+    /// evictions and the emptying on memory pressure. Filled whenever EXP42 is on, so turning
+    /// EXP110 on mid-session finds it ready; only EXP110 reads it.
+    struct PoolShape {
+        u64 takes{};
+        u64 last_take{};
+    };
+    std::unordered_map<u64, PoolShape> image_pool_shapes;
+    /// At this many shapes the least recently taken go until ImagePoolShapesKeep remain.
+    static constexpr size_t ImagePoolShapesMax = 4096;
+    static constexpr size_t ImagePoolShapesKeep = 3072;
+    void NoteImagePoolTake(u64 hash);
+    /// EXP110's cap in bytes (1 = 512 MiB, N > 1 = N MiB), 0 when EXP110 is off.
+    [[nodiscard]] static u64 ImagePoolRuleCap();
+    /// EXP110: evicts until the pool plus the idle backlog fit `max_bytes`, by its rule.
+    void TrimImagePoolByRule(u64 max_bytes);
+    /// EXP110: bytes waiting in EXP99's idle backlog.
+    [[nodiscard]] u64 IdleDestroyBytes();
     /// EXP65 (live, 0 = off): pooled images whose exact create info was never taken back leave
     /// after this many frames instead of ImagePoolMaxFrames. OoT sizes per-NPC depth targets by
     /// screen bounds, so their dims rarely repeat; they filled the pool to its cap (~500 MiB held,
@@ -499,6 +520,9 @@ public:
     u64 image_pool_dropped_async{}; ///< EXP99: evictions handed to the free thread
     u64 image_pool_dropped_here{};
     u64 image_pool_dropped_idle{}; ///< EXP99=1: destroyed in the back's idle hook
+    u64 image_pool_dropped_frame_end{}; ///< EXP110: backlog past 64 MiB, destroyed at frame end
+    /// EXP99=1's backlog: destroys up to `max`, returns how many went.
+    u32 DestroyPooledBacklog(u32 max, const char* span_name);
     /// EDEN_NX2_GHOST_POOLS=1 (boot): the pool's calls replayed under other rules and caps.
     std::unique_ptr<VideoCommon::Nx2GhostPools::Ghosts> ghost_pools =
         VideoCommon::Nx2GhostPools::CreateIfEnabled();
