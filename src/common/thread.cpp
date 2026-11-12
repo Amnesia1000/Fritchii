@@ -1030,4 +1030,122 @@ bool Event::WaitFor(const std::chrono::nanoseconds time) {
 }
 #endif
 
+// WaitForFlag and Event::SleepFor: from zortos293/Lichii (#1373, #1376).
+#if defined(ARCHITECTURE_x86_64) && defined(__clang__)
+__attribute__((target("waitpkg,mwaitx")))
+#endif
+bool WaitForFlag(const std::atomic<bool>& flag, std::chrono::steady_clock::time_point deadline) {
+#ifdef ARCHITECTURE_x86_64
+    if (const auto& caps = Common::g_cpu_caps; caps.monitorx || caps.waitpkg) {
+        auto* const line = const_cast<std::atomic<bool>*>(std::addressof(flag));
+        const u64 ticks_per_second = Common::g_wall_clock.NsToTicks(std::chrono::seconds{1});
+        while (true) {
+            if (caps.monitorx) {
+                _mm_monitorx(line, 0, 0);
+            } else {
+                _umonitor(line);
+            }
+            if (flag.load(std::memory_order_acquire)) {
+                return true;
+            }
+            // Armed before the load, so a store after it ends the wait. Interrupts and stores to
+            // the rest of the line end it early too: wait again until the deadline.
+            const u32 cycles = MwaitxTimeoutCycles(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    deadline - std::chrono::steady_clock::now()),
+                ticks_per_second);
+            if (cycles == 0) {
+                return false;
+            }
+            if (caps.monitorx) {
+                _mm_mwaitx(1 << 1, 0u, cycles);
+            } else {
+                _umwait(0, Common::X64::FencedRDTSC() + cycles);
+            }
+        }
+    }
+#endif
+    while (!flag.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    return flag.load(std::memory_order_acquire);
+}
+
+#ifdef _WIN32
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
+Event::~Event() {
+    if (sleep_wake) {
+        CloseHandle(sleep_wake);
+    }
+}
+
+void Event::WakeSleeper() {
+    SetEvent(sleep_wake);
+}
+
+// Timer and wake event as in Eglantine #538 (a51de161ed, pretend7979): a high-resolution timer
+// can expire between timer-resolution ticks.
+bool Event::SleepFor(const std::chrono::nanoseconds time) {
+    struct Timer {
+        Timer() {
+            handle = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                            TIMER_ALL_ACCESS);
+            if (!handle) {
+                handle = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+            }
+        }
+        ~Timer() {
+            if (handle) {
+                CloseHandle(handle);
+            }
+        }
+        HANDLE handle;
+    };
+    static thread_local Timer timer;
+    using TimerTicks = std::chrono::duration<s64, std::ratio<1, 10'000'000>>;
+
+    std::unique_lock lk{mutex};
+    const auto deadline = std::chrono::steady_clock::time_point{EventWaitDeadline(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()), time)};
+    if (!sleep_wake) {
+        sleep_wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    }
+    while (!is_set.load()) {
+        const auto remaining = deadline - std::chrono::steady_clock::now();
+        if (remaining <= std::chrono::nanoseconds::zero()) {
+            return false;
+        }
+        LARGE_INTEGER due{};
+        due.QuadPart = -std::chrono::ceil<TimerTicks>(remaining).count();
+        if (!sleep_wake || !timer.handle ||
+            !SetWaitableTimerEx(timer.handle, &due, 0, nullptr, nullptr, nullptr, 0)) {
+            condvar.wait_until(lk, deadline, [this] { return is_set.load(); });
+            continue;
+        }
+        // Set() signals sleep_wake while a sleeper waits; the timeout only backs up the timer.
+        ++sleepers;
+        lk.unlock();
+        const HANDLE handles[]{static_cast<HANDLE>(sleep_wake), timer.handle};
+        const auto backstop = std::chrono::ceil<std::chrono::milliseconds>(remaining).count() + 1;
+        const DWORD result = WaitForMultipleObjects(
+            2, handles, FALSE, static_cast<DWORD>((std::min<s64>)(backstop, INFINITE - 1)));
+        lk.lock();
+        --sleepers;
+        if (result == WAIT_FAILED) {
+            condvar.wait_until(lk, deadline, [this] { return is_set.load(); });
+        }
+    }
+    is_set = false;
+    return true;
+}
+#else
+bool Event::SleepFor(const std::chrono::nanoseconds time) {
+    return WaitFor(time);
+}
+#endif
+
 } // namespace Common

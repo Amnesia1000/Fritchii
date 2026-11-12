@@ -42,6 +42,20 @@ namespace Tegra::Engines {
 
 namespace {
 
+/// EDEN_NX2_GPU_WAKE (zortos293/Lichii#1376): the acquire's word in host memory, which the GPU
+/// thread watches for the guest CPU's stores while it waits (Nx2SemaphoreWaiters::WordStored).
+/// Null while the switch is off, or where the word is not 4-byte aligned in host memory.
+u32* WatchedSemaphoreWord(MemoryManager& memory_manager, GPUVAddr address) {
+    if (!VideoCore::Nx2Debug::GpuWake()) {
+        return nullptr;
+    }
+    u32* const word = reinterpret_cast<u32*>(memory_manager.GetPointer(address));
+    if (reinterpret_cast<uintptr_t>(word) % alignof(u32) != 0) {
+        return nullptr;
+    }
+    return word;
+}
+
 constexpr u32 Gf100BindClassMask = 0xffff;
 constexpr u32 Gf100BindValidMask =  0x1f0000 | Gf100BindClassMask;
 
@@ -1348,7 +1362,9 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                 !acquire.Matches(dma_pusher.memory_manager.Read<u32>(acquire.address))) {
                 AcquireLearning::early_suspends.fetch_add(1, std::memory_order_relaxed);
                 if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address)) {
-                    Nx2SemaphoreWaiters::Get().Add(this, *device, acquire.value, acquire.operation);
+                    Nx2SemaphoreWaiters::Get().Add(
+                        this, *device, acquire.value, acquire.operation,
+                        WatchedSemaphoreWord(dma_pusher.memory_manager, acquire.address));
                 }
                 pending_acquire = acquire;
                 dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
@@ -1373,10 +1389,12 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             }
         }
         // Registered before the fences run, so a release among them that meets the value counts
-        // even if a later one overwrites it.
+        // even if a later one overwrites it. With EDEN_NX2_GPU_WAKE the word in memory is
+        // watched for the guest CPU's stores (Nx2SemaphoreWaiters::WordStored).
         auto& waiters = Nx2SemaphoreWaiters::Get();
         if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address)) {
-            waiters.Add(this, *device, acquire.value, acquire.operation);
+            waiters.Add(this, *device, acquire.value, acquire.operation,
+                        WatchedSemaphoreWord(dma_pusher.memory_manager, acquire.address));
         }
         bool met_now;
         if (readable) {

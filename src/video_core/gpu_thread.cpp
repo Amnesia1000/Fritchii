@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <chrono>
 #include <thread>
 
@@ -21,6 +22,7 @@
 #include "video_core/gpu.h"
 #include "video_core/gpu_thread.h"
 #include "video_core/gpu_split.h"
+#include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/renderer_base.h"
@@ -62,6 +64,16 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
         CommandDataContainer next;
         // When a pending channel last moved or a command arrived (see the polling below).
         auto last_progress = std::chrono::steady_clock::now();
+        // EDEN_NX2_GPU_WAKE: for PendingPoll after that the thread waits in hardware, then it
+        // blocks in the OS PendingSleepTime at a time. In hardware it looks at the words the
+        // channels wait on every WordCheckPeriod and polls the channels in full every
+        // PendingPollPeriod.
+        constexpr std::chrono::nanoseconds PendingPoll = std::chrono::microseconds{500};
+        constexpr std::chrono::nanoseconds PendingPollPeriod = std::chrono::microseconds{20};
+        constexpr std::chrono::nanoseconds WordCheckPeriod = std::chrono::microseconds{2};
+        constexpr std::chrono::nanoseconds PendingSleepTime = std::chrono::microseconds{500};
+        auto& wake = Tegra::Nx2PendingWake::Get();
+        auto& waiters = Tegra::Nx2SemaphoreWaiters::Get();
         namespace Profile = VideoCommon::Nx2Profile;
         // Before the split's back thread starts, which reads it too.
         Profile::Initialize();
@@ -71,15 +83,54 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             split.MaybeStart(system);
             if (scheduler.HasPendingChannels()) {
                 // Suspended channels wait on semaphores the CPU releases: poll them meanwhile.
+                // EDEN_NX2_GPU_WAKE (zortos293/Lichii#1376): a new command or a GPU release
+                // wakes the wait below at once (Nx2PendingWake), so arm it before looking.
+                const bool gpu_wake = VideoCore::Nx2Debug::GpuWake();
+                wake.SetEnabled(gpu_wake);
+                if (gpu_wake) {
+                    wake.Arm();
+                }
+                bool resumed = false;
                 {
                     Profile::Scope scope{Profile::Zone::ResumePending};
-                    scheduler.ResumePending(system.GPU());
+                    resumed = scheduler.ResumePending(system.GPU());
                 }
                 if (!state.queue.TryPop(next)) {
                     // EDEN_NX2_EXP27 & 1: what the resumed channels sent goes to the back before
                     // this thread yields or sleeps (Commit publishes every 256 words).
                     if (split.Active()) {
                         split.PublishBeforeWait();
+                    }
+                    if (gpu_wake) {
+                        if (resumed) {
+                            last_progress = std::chrono::steady_clock::now();
+                        }
+                        if (!scheduler.HasPendingChannels()) {
+                            continue;
+                        }
+                        // The CPU usually releases the semaphore soon after: for half a
+                        // millisecond after the last progress wait in hardware, watching the
+                        // semaphore words, then block in the OS for 500 us at a time. A full poll
+                        // every 20 us catches what sends no wake and changes no word, such as a
+                        // release a shader wrote to the caches.
+                        Profile::Scope scope{Profile::Zone::PendingSleep};
+                        const auto now = std::chrono::steady_clock::now();
+                        if (now - last_progress < PendingPoll) {
+                            const auto poll_end =
+                                std::min(now + PendingPollPeriod, last_progress + PendingPoll);
+                            auto until = now;
+                            do {
+                                until = std::min(std::chrono::steady_clock::now() +
+                                                     WordCheckPeriod,
+                                                 poll_end);
+                                if (wake.Poll(until) || waiters.WordStored()) {
+                                    break;
+                                }
+                            } while (until < poll_end);
+                        } else {
+                            wake.Sleep(PendingSleepTime);
+                        }
+                        continue;
                     }
                     // The CPU usually releases the semaphore soon after: poll for half a
                     // millisecond before sleeping, or every wait also waits out a host sleep
@@ -253,6 +304,9 @@ u64 ThreadManager::PushCommand(CommandData&& command_data, bool block, bool is_a
         }
     }
     state.queue.EmplaceWait(std::move(command_data), fence, block);
+    // EDEN_NX2_GPU_WAKE: ends the GPU thread's wait for suspended channels (returns at once
+    // while the switch is off).
+    Tegra::Nx2PendingWake::Get().Notify();
 
     if (block) {
         // With the split, SignalCommand runs on the back.

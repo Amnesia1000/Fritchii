@@ -106,6 +106,20 @@ inline std::atomic<int> g_arb_spin{-1};
 /// every 16 pauses, instead of a SwitchToThread and a clock read per iteration. Live: read on
 /// every Idle.
 inline std::atomic<int> g_idle_pause{-1};
+/// EDEN_NX2_GPU_WAKE=1 (live, off by default; port of zortos293/Lichii#1376 9f932fe3c5): the GPU
+/// thread (the split's front) waits for suspended channels in a wait that ends on a wake, instead
+/// of polling them (ResumePending, then yield or sleep per EXP6, ~120-150 ms a second of front
+/// time in Ocarina of Time). A new command (PushCommand) or a GPU write that latches a waiter
+/// (Nx2SemaphoreWaiters::OnWrite) wakes it at once (Tegra::Nx2PendingWake); a guest CPU store to
+/// the word a channel waits on ends the wait within ~2 us (Nx2SemaphoreWaiters::WordStored). For
+/// 500 us after the last progress it waits in hardware (MWAITX/UMWAIT, Common::WaitForFlag) with
+/// a full poll every 20 us, then blocks in the OS 500 us at a time (Common::Event::SleepFor).
+/// 0 = the polling loop as before (EXP6 applies), and the wake sources return at once. Read on
+/// every wait, so profile_toggle.py can A/B it in one session.
+inline std::atomic<int> g_gpu_wake{-1};
+[[nodiscard]] inline bool GpuWake() {
+    return SwitchValue(g_gpu_wake, "EDEN_NX2_GPU_WAKE", 0) > 0;
+}
 /// EDEN_NX2_RUNAHEAD (live, Ocarina of Time only, default 0; video_core/nx2_runahead.h): 1 = the
 /// split's front answers acquires a release it sent meets without draining and writes the word
 /// early, with the guest's CPU writes snapshotted per boundary for the back; 2 = verify (old path,
@@ -748,6 +762,9 @@ inline void LoadExperiments() {
     }
     if (name == "EDEN_NX2_IDLE_PAUSE") {
         return &g_idle_pause;
+    }
+    if (name == "EDEN_NX2_GPU_WAKE") {
+        return &g_gpu_wake;
     }
     if (name == "EDEN_NX2_RUNAHEAD") {
         return &g_runahead;
