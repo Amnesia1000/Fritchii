@@ -14,7 +14,12 @@ namespace {
 // there too: this size check fails the build until it is (update the size with it).
 // Bump Magic in vk_precompiled_kept.cpp when this layout changes.
 #if defined(_MSC_VER) && defined(_WIN64)
-static_assert(sizeof(Info) == 7008, // 6960 + 12 inline TextureDescriptors x 4 (is_descriptor_array)
+// 7016 = 6960 + 12 inline TextureDescriptors x 4 (is_descriptor_array) + 8 for
+// binds_unmapped_pointer_word (zortos293/Lichii#1523). Neither it nor TextureDescriptor's
+// handle_is_pointer_word is stored: both are only set with EDEN_NX2_LIGHT_TABLE_ARRAYS (off), and
+// #1523's cached-record drop that reads the first is not ported. Store both (and bump Magic)
+// before that switch goes on.
+static_assert(sizeof(Info) == 7016,
               "Shader::Info changed: list the new fields in VisitInfo, then update this size");
 // The descriptors are held in vectors, so a field they grow does not change sizeof(Info).
 static_assert(sizeof(ConstantBufferDescriptor) == 8 && sizeof(StorageBufferDescriptor) == 80 &&
