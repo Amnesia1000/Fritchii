@@ -324,7 +324,7 @@ VkResult TimedVmaCreateImage(const Device &device, VmaAllocator allocator,
 }
 } // Anonymous namespace
 
-// EDEN_NX2_DEPTH_POOL=1 (boot, off by default): depth/stencil attachments come from their own VMA
+// EDEN_NX2_DEPTH_POOL (boot, on by default, =0 off): depth/stencil attachments come from their own VMA
 // pool per memory type, so the memory a freed depth target leaves is reused by depth targets only.
 // The NPC-pass dips (night market): a new D32 target nearly every frame, and its vmaBindImageMemory
 // took 1.35 ms on average against 0.11 ms for colour targets (IMAGE_ALLOC_TIMING): the driver
@@ -332,9 +332,12 @@ VkResult TimedVmaCreateImage(const Device &device, VmaAllocator allocator,
 // pools live as long as the VMA allocator (never destroyed: images may outlive this object).
 static VmaPool DepthAttachmentPool(VmaAllocator allocator, const VkImageCreateInfo &ci,
                                    const VmaAllocationCreateInfo &alloc_ci) {
+    // On by default since 2026-11-12: depth targets no longer each get their own fresh memory (the
+    // driver prefers dedicated memory for them outside a pool). Night market, camera panning,
+    // 120 s: binds over 5 ms 6 -> 0 (worst 162 ms -> 1.8 ms), hitches over 50 ms 5 -> 1.
     static const bool enabled = [] {
         const char *value = std::getenv("EDEN_NX2_DEPTH_POOL");
-        return value != nullptr && value[0] != '\0' && value[0] != '0';
+        return value == nullptr || value[0] == '\0' || value[0] != '0';
     }();
     if (!enabled) {
         return VK_NULL_HANDLE;
