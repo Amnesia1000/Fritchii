@@ -39,6 +39,7 @@
 #include "core/hle/kernel/k_worker_task_manager.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/svc.h"
+#include "core/hle/kernel/svc/svc_nx2_oot_present.h"
 #include "core/hle/kernel/svc_results.h"
 #include "core/hle/kernel/svc_types.h"
 #include "core/hle/kernel/thread_startup_policy.h"
@@ -1406,6 +1407,9 @@ namespace Kernel {
 
         // Set our wait queue.
         m_wait_queue = queue;
+
+        // EXP24 = 4: a guest wait is the moment OoT's MainThread has written the present event.
+        Svc::Nx2OotPresentPollCheck(kernel, this);
     }
 
     void KThread::RecordWaitForTimeline(ThreadWaitReasonForDebugging reason,

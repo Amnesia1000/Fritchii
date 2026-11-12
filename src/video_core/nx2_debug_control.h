@@ -280,7 +280,11 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// poll (EXP24)" counts every 10 s. EXP24 = 2: locate only, sleeps unchanged: short sleeps
 /// (<= 2 ms) are counted by call chain and the top 8 logged every 10 s ("OoT present poll
 /// locate"). EXP24 = 3: no GPU wake, the poll's 1 ms sleep is EDEN_NX2_OOT_PRESENT_SLEEP_US
-/// instead (default 250 us, at most the time asked for). Default 3 (LoadExperiments).
+/// instead (default 250 us, at most the time asked for). Default 3 (LoadExperiments). EXP24 = 4
+/// (fable52_answer_pipeline section 2): as 3, but returns at once when the event's value word
+/// (event object field EDEN_NX2_OOT_PRESENT_FIELD, default 0) already reads 1, and the sleep ends
+/// as soon as it does (Nx2OotPresentPollCheck from KThread::BeginWait: the game's MainThread
+/// writes it, not the GPU). Logs "OoT present poll (EXP24=4" every 10 s.
 /// EXP25 (Ocarina of Time resource poll backoff, zortos293/Lichii#641; needs the built-in patch
 /// placed at launch by EDEN_NX2_OOT_POLL_BACKOFF=1, core/hle/kernel/svc/svc_nx2_oot_poll.cpp):
 /// the resource request thread sleeps before rescanning requests that are not ready.
