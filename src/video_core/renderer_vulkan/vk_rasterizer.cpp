@@ -36,6 +36,7 @@
 #include "common/logging.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#include "core/nx2_protect_stats.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/control/channel_state.h"
@@ -4151,6 +4152,10 @@ void RasterizerVulkan::TickFrame() {
     ComputePipeline::TickUpscalerTrace();
     draw_counter = 0;
     pending_native_work = false;
+    // EDEN_NX2_PROTECT_STATS' frame count, then EXP89's sweep of lingering protections (takes
+    // the device memory's counter_guard: no cache lock may be held here).
+    Core::Nx2ProtectStats::TickFrame();
+    device_memory.ReleaseLingering();
     pipeline_cache.TickFrame();
     guest_descriptor_queue.TickFrame();
     compute_pass_descriptor_queue.TickFrame();

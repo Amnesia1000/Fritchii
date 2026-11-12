@@ -511,6 +511,19 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// translation redone at FlushCaching. Both mismatch counts must stay 0. Same family as EXP85
 /// (its inline writes reach FlushCaching with & 1) and CB_DIRECT (& 2 replaces it). "Constant
 /// buffer path (EXP88" logs the counters every 5 s while not 0.
+/// EXP89 (live, 0 = off; N > 0 = frames; Fable's lingering protection, fable52_answer_after88
+/// section 1; core DeviceMemoryManager::UpdatePagesCachedCountNoLock): when a page's cached
+/// count falls to 0 it stays protected and is noted with the frame; when a cache counts it again
+/// within N frames nothing is called (no unprotect, no protect). RasterizerVulkan::TickFrame's
+/// sweep (DeviceMemoryManager::ReleaseLingering) really uncaches the pages noted more than N
+/// frames ago; Map, Unmap and UnregisterProcess uncache their pages at once. Exact: a lingering
+/// page is a protected page no cache tracks, whose collected writes reach the caches as today.
+/// Switching to 0 live releases every noted page at the next sweep. Start with 4. Measure first
+/// with EDEN_NX2_PROTECT_STATS=1 and EXP89=0: "Page protection frames since the last unprotect"
+/// gives the share of protects each N would cancel; "Lingering protection (EXP89" logs the
+/// cancelled calls, releases, pages held and, as the verify, pages left lingering after an
+/// Unmap (must stay 0). Watch "writes collected" in the Guest access line: if it rises much,
+/// lower N.
 /// EXP85 (live, bits, 0 = off; fable52_answer_microcuts 1 and 2b): 1 = a small inline upload to
 /// pages no GPU write ever marked skips the buffer cache's lock (InlineMemory would find nothing
 /// there; the list note and the query cache as before), 2 = BufferCache::WriteMemory answers

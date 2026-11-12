@@ -25,6 +25,7 @@
 #include "core/device_memory_manager.h"
 #include "core/memory.h"
 #include "core/nx2_protect_stats.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_perf.h"
 
 namespace Core {
@@ -255,6 +256,9 @@ void DeviceMemoryManager<Traits>::Map(DAddr address, VAddr virtual_address, size
     Core::Memory::Memory* process_memory = registered_processes[asid.id];
     size_t start_page_d = address >> Memory::YUZU_PAGEBITS;
     size_t num_pages = Common::AlignUp(size, Memory::YUZU_PAGESIZE) >> Memory::YUZU_PAGEBITS;
+    // EXP89: a page still lingering here is protected at its old guest address, which
+    // InsertCPUBacking below replaces: uncache it there first.
+    ReleaseLingeringRange(address, size);
     std::scoped_lock lk(mapping_guard);
 
     tracked_entries.CommitRegion(start_page_d, start_page_d + num_pages);
@@ -296,6 +300,29 @@ void DeviceMemoryManager<Traits>::Unmap(DAddr address, size_t size) {
     size_t start_page_d = address >> Memory::YUZU_PAGEBITS;
     size_t num_pages = Common::AlignUp(size, Memory::YUZU_PAGESIZE) >> Memory::YUZU_PAGEBITS;
     device_inter->InvalidateRegion(address, size);
+    // EXP89: the pages the caches just dropped may linger; the uncache needs their guest
+    // address, which the loop below erases.
+    ReleaseLingeringRange(address, size);
+    SCOPE_EXIT {
+        // EXP89 verify (fable52_answer_after88 1.6): no page of an unmapped range may be left
+        // lingering. Such a page can't be uncached any more (no guest address): drop the note.
+        if (VideoCore::Nx2Debug::Experiment(89) != 0 && Core::Nx2ProtectStats::Enabled()) {
+            u64 left = 0;
+            {
+                std::scoped_lock linger_lock{linger_mutex};
+                for (size_t i = 0; i < num_pages && !lingering.empty(); ++i) {
+                    if (lingering.erase(start_page_d + i) != 0) {
+                        lingering_count.fetch_sub(1, std::memory_order_relaxed);
+                        ++left;
+                    }
+                }
+            }
+            if (left != 0) {
+                Core::Nx2ProtectStats::AddLinger(
+                    &Core::Nx2ProtectStats::State::linger_left_after_unmap, left);
+            }
+        }
+    };
     std::scoped_lock lk(mapping_guard);
 
     tracked_entries.CommitRegion(start_page_d, start_page_d + num_pages); // should already be committed, but just in case
@@ -610,6 +637,8 @@ Asid DeviceMemoryManager<Traits>::RegisterProcess(Memory::Memory* memory_device_
 
 template <typename Traits>
 void DeviceMemoryManager<Traits>::UnregisterProcess(Asid asid) {
+    // EXP89: lingering pages are uncached while their process interface is still known.
+    ReleaseAllLingering();
     registered_processes[asid.id] = nullptr;
     id_pool.push_front(asid.id);
 }
@@ -620,18 +649,14 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedCountNoLock(DAddr addr, size_
     u64 cache_begin = 0;
     u64 uncache_bytes = 0;
     u64 cache_bytes = 0;
-    const auto MarkRegionCachingRaw = &DeviceMemoryManager<Traits>::DeviceMethods::MarkRegionCaching;
     // EDEN_NX2_PROTECT_STATS=1: every call counted and timed (Core::Nx2ProtectStats).
-    const bool protect_stats = Core::Nx2ProtectStats::Enabled();
-    const auto MarkRegionCaching = [&](auto* device_inter, u64 vaddr, u64 bytes, bool cached) {
-        if (protect_stats) [[unlikely]] {
-            Core::Nx2ProtectStats::Count(vaddr, bytes, cached, [&] {
-                MarkRegionCachingRaw(device_inter, vaddr, bytes, cached);
-            });
-            return;
-        }
-        MarkRegionCachingRaw(device_inter, vaddr, bytes, cached);
+    const auto MarkRegionCaching = [this](Memory::Memory* memory_inter, u64 vaddr, u64 bytes,
+                                          bool cached) {
+        MarkCaching(memory_inter, vaddr, bytes, cached);
     };
+    // EXP89 = N > 0: a page whose count falls to 0 stays protected for N frames (lingering
+    // protection, fable52_answer_after88 1.3); read live.
+    const int linger = VideoCore::Nx2Debug::Experiment(89);
 
     std::atomic_thread_fence(std::memory_order_acquire);
     const size_t page_end = Common::DivCeil(addr + size, Memory::YUZU_PAGESIZE);
@@ -681,34 +706,265 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedCountNoLock(DAddr addr, size_
 
         // Adds or subtracts 1, as count is a unsigned 8-bit value
         count.fetch_add(static_cast<CounterType>(delta), std::memory_order_release);
+        const auto now = count.load(std::memory_order::relaxed);
+
+        const auto flush_uncache_run = [&] {
+            if (uncache_bytes > 0) {
+                if (memory_device_inter != nullptr) {
+                    MarkRegionCaching(memory_device_inter, uncache_begin << Memory::YUZU_PAGEBITS,
+                                      uncache_bytes, false);
+                }
+                uncache_bytes = 0;
+            }
+        };
+        const auto flush_cache_run = [&] {
+            if (cache_bytes > 0) {
+                if (memory_device_inter != nullptr) {
+                    MarkRegionCaching(memory_device_inter, cache_begin << Memory::YUZU_PAGEBITS,
+                                      cache_bytes, true);
+                }
+                cache_bytes = 0;
+            }
+        };
 
         // Assume delta is either -1 or 1
-        if (count.load(std::memory_order::relaxed) == 0) {
-            if (uncache_bytes == 0) {
-                uncache_begin = vpage;
+        if (now == 0) {
+            if (linger > 0 && delta < 0 && NoteLingering(page, memory_device_inter)) {
+                // EXP89: stays protected (the sweep or Map/Unmap uncaches it later).
+                flush_uncache_run();
+            } else {
+                if (uncache_bytes == 0) {
+                    uncache_begin = vpage;
+                }
+                uncache_bytes += Memory::YUZU_PAGESIZE;
             }
-            uncache_bytes += Memory::YUZU_PAGESIZE;
-        } else if (uncache_bytes > 0) {
-            if (memory_device_inter != nullptr) {
-                MarkRegionCaching(memory_device_inter, uncache_begin << Memory::YUZU_PAGEBITS,
-                                  uncache_bytes, false);
-            }
-            uncache_bytes = 0;
+        } else {
+            flush_uncache_run();
         }
-        if (count.load(std::memory_order::relaxed) == 1 && delta > 0) {
-            if (cache_bytes == 0) {
-                cache_begin = vpage;
+        if (now == 1 && delta > 0) {
+            if (TakeLingering(page)) {
+                // EXP89: still protected from before, nothing to call.
+                flush_cache_run();
+            } else {
+                if (cache_bytes == 0) {
+                    cache_begin = vpage;
+                }
+                cache_bytes += Memory::YUZU_PAGESIZE;
             }
-            cache_bytes += Memory::YUZU_PAGESIZE;
-        } else if (cache_bytes > 0) {
-            if (memory_device_inter != nullptr) {
-                MarkRegionCaching(memory_device_inter, cache_begin << Memory::YUZU_PAGEBITS,
-                                  cache_bytes, true);
-            }
-            cache_bytes = 0;
+        } else {
+            flush_cache_run();
         }
     }
     release_pending();
+}
+
+template <typename Traits>
+void DeviceMemoryManager<Traits>::MarkCaching(Memory::Memory* memory_inter, u64 vaddr, u64 bytes,
+                                              bool cached) {
+    if (Core::Nx2ProtectStats::Enabled()) [[unlikely]] {
+        Core::Nx2ProtectStats::Count(vaddr, bytes, cached, [&] {
+            DeviceMethods::MarkRegionCaching(memory_inter, vaddr, bytes, cached);
+        });
+        return;
+    }
+    DeviceMethods::MarkRegionCaching(memory_inter, vaddr, bytes, cached);
+}
+
+template <typename Traits>
+bool DeviceMemoryManager<Traits>::NoteLingering(size_t page, Memory::Memory* memory_inter) {
+    // Without a process interface the page was never protected; without a sweep (no Vulkan
+    // TickFrame) nothing would ever uncache it.
+    const u32 frame = linger_frame.load(std::memory_order_relaxed);
+    if (memory_inter == nullptr || frame == 0) {
+        return false;
+    }
+    {
+        std::scoped_lock lock{linger_mutex};
+        const auto [it, inserted] = lingering.try_emplace(page, frame);
+        if (inserted) {
+            lingering_count.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            it->second = frame;
+        }
+    }
+    if (Core::Nx2ProtectStats::Enabled()) [[unlikely]] {
+        Core::Nx2ProtectStats::AddLinger(&Core::Nx2ProtectStats::State::linger_noted, 1);
+    }
+    return true;
+}
+
+template <typename Traits>
+bool DeviceMemoryManager<Traits>::TakeLingering(size_t page) {
+    // A page's note is made and dropped under counter_guard for that page, which the caller
+    // holds: a relaxed 0 here means this page is not noted.
+    if (lingering_count.load(std::memory_order_relaxed) == 0) {
+        return false;
+    }
+    {
+        std::scoped_lock lock{linger_mutex};
+        if (lingering.erase(page) == 0) {
+            return false;
+        }
+        lingering_count.fetch_sub(1, std::memory_order_relaxed);
+    }
+    if (Core::Nx2ProtectStats::Enabled()) [[unlikely]] {
+        Core::Nx2ProtectStats::AddLinger(&Core::Nx2ProtectStats::State::linger_cancelled, 1);
+    }
+    return true;
+}
+
+template <typename Traits>
+void DeviceMemoryManager<Traits>::UncacheDevicePages(std::span<const u64> pages) {
+    Memory::Memory* run_inter = nullptr;
+    u64 run_begin = 0;
+    u64 run_pages = 0;
+    const auto release_run = [&] {
+        if (run_pages > 0 && run_inter != nullptr) {
+            MarkCaching(run_inter, run_begin << Memory::YUZU_PAGEBITS,
+                        run_pages << Memory::YUZU_PAGEBITS, false);
+        }
+        run_pages = 0;
+    };
+    for (const u64 page : pages) {
+        const auto [asid, vaddr] = ExtractCPUBacking(page);
+        const u64 vpage = vaddr >> Memory::YUZU_PAGEBITS;
+        if (vpage == 0) {
+            release_run();
+            continue;
+        }
+        Memory::Memory* const inter =
+            asid.id < registered_processes.size() ? registered_processes[asid.id] : nullptr;
+        if (inter != run_inter || vpage != run_begin + run_pages) {
+            release_run();
+            run_inter = inter;
+            run_begin = vpage;
+        }
+        ++run_pages;
+    }
+    release_run();
+}
+
+template <typename Traits>
+size_t DeviceMemoryManager<Traits>::ReleaseLingeringPages(
+    std::span<const std::pair<u64, u32>> pages, bool match_frame) {
+    if (pages.empty()) {
+        return 0;
+    }
+    if (Core::Nx2ProtectStats::Enabled()) [[unlikely]] {
+        Core::Nx2ProtectStats::BeginBatch();
+    }
+    size_t released = 0;
+    std::vector<u64> uncache;
+    size_t begin = 0;
+    while (begin < pages.size()) {
+        size_t end = begin + 1;
+        while (end < pages.size() && pages[end].first == pages[end - 1].first + 1) {
+            ++end;
+        }
+        const u64 first_page = pages[begin].first;
+        const u64 run_pages = pages[end - 1].first - first_page + 1;
+        // counter_guard first, then linger_mutex; counter_guard is held through the uncache so
+        // no 0 -> 1 of these pages can protect in between and be undone by it.
+        Common::ScopedRangeLock lk(counter_guard, first_page << Memory::YUZU_PAGEBITS,
+                                   run_pages << Memory::YUZU_PAGEBITS);
+        uncache.clear();
+        {
+            std::scoped_lock lock{linger_mutex};
+            for (size_t i = begin; i < end; ++i) {
+                const u64 page = pages[i].first;
+                const auto it = lingering.find(page);
+                if (it == lingering.end() || (match_frame && it->second != pages[i].second)) {
+                    continue; // taken (or taken and noted again) since it was collected
+                }
+                lingering.erase(it);
+                lingering_count.fetch_sub(1, std::memory_order_relaxed);
+                if (cached_pages->at(page >> subentries_shift)
+                        .Count(page)
+                        .load(std::memory_order_relaxed) == 0) {
+                    uncache.push_back(page);
+                }
+            }
+        }
+        UncacheDevicePages(uncache);
+        released += uncache.size();
+        begin = end;
+    }
+    return released;
+}
+
+template <typename Traits>
+void DeviceMemoryManager<Traits>::ReleaseLingering() {
+    const u32 now = linger_frame.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool stats = Core::Nx2ProtectStats::Enabled();
+    if (lingering_count.load(std::memory_order_relaxed) == 0) {
+        if (stats) [[unlikely]] {
+            Core::Nx2ProtectStats::Get().linger_held.store(0, std::memory_order_relaxed);
+        }
+        return;
+    }
+    // EXP89 = 0 (switched off live): every noted page is released now.
+    const u32 frames = static_cast<u32>(std::max(VideoCore::Nx2Debug::Experiment(89), 0));
+    std::vector<std::pair<u64, u32>> due;
+    {
+        std::scoped_lock lock{linger_mutex};
+        for (const auto& [page, frame] : lingering) {
+            if (now - frame > frames) {
+                due.emplace_back(page, frame);
+            }
+        }
+    }
+    std::ranges::sort(due);
+    const size_t released = ReleaseLingeringPages(due, true);
+    if (stats) [[unlikely]] {
+        Core::Nx2ProtectStats::AddLinger(&Core::Nx2ProtectStats::State::linger_swept, released);
+        Core::Nx2ProtectStats::Get().linger_held.store(
+            lingering_count.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    }
+}
+
+template <typename Traits>
+void DeviceMemoryManager<Traits>::ReleaseLingeringRange(DAddr address, size_t size) {
+    const u64 first_page = address >> Memory::YUZU_PAGEBITS;
+    const u64 end_page = Common::DivCeil(address + size, Memory::YUZU_PAGESIZE);
+    std::vector<std::pair<u64, u32>> noted;
+    {
+        std::scoped_lock lock{linger_mutex};
+        if (lingering.empty()) {
+            return;
+        }
+        if (lingering.size() < end_page - first_page) {
+            for (const auto& [page, frame] : lingering) {
+                if (page >= first_page && page < end_page) {
+                    noted.emplace_back(page, frame);
+                }
+            }
+        } else {
+            for (u64 page = first_page; page < end_page; ++page) {
+                if (const auto it = lingering.find(page); it != lingering.end()) {
+                    noted.emplace_back(page, it->second);
+                }
+            }
+        }
+    }
+    std::ranges::sort(noted);
+    const size_t released = ReleaseLingeringPages(noted, false);
+    if (released != 0 && Core::Nx2ProtectStats::Enabled()) [[unlikely]] {
+        Core::Nx2ProtectStats::AddLinger(&Core::Nx2ProtectStats::State::linger_mapping, released);
+    }
+}
+
+template <typename Traits>
+void DeviceMemoryManager<Traits>::ReleaseAllLingering() {
+    std::vector<std::pair<u64, u32>> noted;
+    {
+        std::scoped_lock lock{linger_mutex};
+        noted.assign(lingering.begin(), lingering.end());
+    }
+    std::ranges::sort(noted);
+    const size_t released = ReleaseLingeringPages(noted, false);
+    if (released != 0 && Core::Nx2ProtectStats::Enabled()) [[unlikely]] {
+        Core::Nx2ProtectStats::AddLinger(&Core::Nx2ProtectStats::State::linger_mapping, released);
+    }
 }
 
 template <typename Traits>
