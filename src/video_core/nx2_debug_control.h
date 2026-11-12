@@ -447,6 +447,12 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// collector's device memory figure, as deleted images waiting for the GPU are. Logs "Image pool
 /// (EXP42) last 600 frames" and counts pooled creates in "Slow clear texture cache". 1 is the default
 /// (LoadExperiments); 0 = off.
+/// EXP81 (live, frames, 0 = off; fable52_answer_readback_card 3; BufferCache TickFrame and
+/// GetFlushArea): with EXP69's Preflushable reset, unmark only the pages the CPU has not read for
+/// this many frames (each CPU read through GetFlushArea stamps its pages). Unmarking every page
+/// made each page the game still reads need one async read (~40 a second at the market) to be
+/// marked again; a mark only decides whether a GPU write is copied at the fence or at the read,
+/// so it is exact. "Preflush reset" logs the KiB kept. Try 300 (with EXP69=600).
 /// EXP78 (live, 0 = off; fable52_answer_killuploads 3-4; TextureCache::TcSkipStale): what
 /// EDEN_NX2_TC_SKIP_STALE=1 does at boot, switchable: a deleted GPU-written image marks its whole
 /// pages stale (CPU writes clear them) and a new image whose range is all stale (and not
@@ -563,7 +569,7 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// prove 2 shows 0 differ first (under EXP19=2 without EXP50, blend writes without
 /// Dirty::Blending already leave the clean lookup's attachments stale, and verify reports that
 /// too), then compare the lookup zone with profile_toggle (EXP52 0 vs 1).
-inline constexpr int ExperimentCount = 80;
+inline constexpr int ExperimentCount = 96;
 inline std::atomic<int> g_experiments[ExperimentCount]{};
 /// Set once LoadExperiments has run: Experiment() tests it inline instead of calling
 /// LoadExperiments (a function-local static guard) on every check (0.5% of the back thread in

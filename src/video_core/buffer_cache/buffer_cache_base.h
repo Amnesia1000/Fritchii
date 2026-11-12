@@ -1094,6 +1094,10 @@ private:
     /// EXP69: the ranges GetFlushArea marked Preflushable since the last reset.
     Common::RangeSet<DAddr> preflush_marked_ranges;
     u64 preflush_reset_bytes{};
+    /// EXP81: frame_tick of each device page's last CPU read (GetFlushArea), and bytes the aged
+    /// reset kept marked because they were read within the last EXP81 frames.
+    std::unordered_map<u64, u64> preflush_read_frames;
+    u64 preflush_kept_bytes{};
     /// fable52_answer_bosswave 3 (counter before the change): preflushed reads that flush
     /// although every GPU-modified byte of theirs is in a fence download already on its way
     /// (none uncommitted), and how many fences behind the newest that download was.

@@ -153,11 +153,36 @@ void BufferCache<P>::TickFrame() {
     if (const int reset_frames = VideoCore::Nx2Debug::Experiment(69);
         reset_frames > 0 && frame_tick % static_cast<u64>(reset_frames) == 0 &&
         !preflush_marked_ranges.Empty()) {
-        preflush_marked_ranges.ForEach([&](DAddr begin, DAddr end) {
-            memory_tracker.UnmarkRegionAsPreflushable(begin, end - begin);
-            preflush_reset_bytes += end - begin;
-        });
-        preflush_marked_ranges.Clear();
+        // EDEN_NX2_EXP81 (live, frames, 0 = off; fable52_answer_readback_card 3): unmark only the
+        // pages the CPU has not read for this many frames. Unmarking every page made each page
+        // the game still reads need one async read (~40 a second at the market) to be marked
+        // again; a mark only decides whether a write is copied at the fence or at the read.
+        const u64 idle_frames = static_cast<u64>((std::max)(VideoCore::Nx2Debug::Experiment(81), 0));
+        if (idle_frames == 0) {
+            preflush_marked_ranges.ForEach([&](DAddr begin, DAddr end) {
+                memory_tracker.UnmarkRegionAsPreflushable(begin, end - begin);
+                preflush_reset_bytes += end - begin;
+            });
+            preflush_marked_ranges.Clear();
+        } else {
+            std::vector<DAddr> stale_pages;
+            preflush_marked_ranges.ForEach([&](DAddr begin, DAddr end) {
+                for (DAddr page = begin; page < end; page += Core::DEVICE_PAGESIZE) {
+                    const auto it = preflush_read_frames.find(page >> Core::DEVICE_PAGEBITS);
+                    if (it == preflush_read_frames.end() || frame_tick - it->second >= idle_frames) {
+                        stale_pages.push_back(page);
+                    } else {
+                        preflush_kept_bytes += Core::DEVICE_PAGESIZE;
+                    }
+                }
+            });
+            for (const DAddr page : stale_pages) {
+                memory_tracker.UnmarkRegionAsPreflushable(page, Core::DEVICE_PAGESIZE);
+                preflush_marked_ranges.Subtract(page, Core::DEVICE_PAGESIZE);
+                preflush_read_frames.erase(page >> Core::DEVICE_PAGEBITS);
+                preflush_reset_bytes += Core::DEVICE_PAGESIZE;
+            }
+        }
         ++preflush_resets;
     }
     if (frame_tick % 600 == 0 && preflush_reads_flushed.load(std::memory_order_relaxed) != 0) {
@@ -181,9 +206,12 @@ void BufferCache<P>::TickFrame() {
         }
     }
     if (frame_tick % 600 == 0 && preflush_resets != 0) {
-        LOG_INFO(HW_GPU, "Preflush reset (EXP69={}) last 600 frames: {} resets, {} KiB unmarked",
-                 VideoCore::Nx2Debug::Experiment(69), preflush_resets, preflush_reset_bytes >> 10);
-        preflush_resets = preflush_reset_bytes = 0;
+        LOG_INFO(HW_GPU,
+                 "Preflush reset (EXP69={}, EXP81={}) last 600 frames: {} resets, {} KiB unmarked, "
+                 "{} KiB kept as read recently",
+                 VideoCore::Nx2Debug::Experiment(69), VideoCore::Nx2Debug::Experiment(81),
+                 preflush_resets, preflush_reset_bytes >> 10, preflush_kept_bytes >> 10);
+        preflush_resets = preflush_reset_bytes = preflush_kept_bytes = 0;
     }
     if (frame_tick % 600 == 0 && !uploaded_buffer_ranges.empty()) {
         for (const auto& [address, size] : uploaded_buffer_ranges) {
@@ -363,6 +391,13 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
     DAddr device_addr_end_aligned = Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE);
     area->start_address = device_addr_start_aligned;
     area->end_address = device_addr_end_aligned;
+    // EXP81: the frame of each page's last CPU read, for the aged Preflushable reset (TickFrame).
+    if (VideoCore::Nx2Debug::Experiment(81) > 0) [[unlikely]] {
+        for (DAddr page = device_addr_start_aligned; page < device_addr_end_aligned;
+             page += Core::DEVICE_PAGESIZE) {
+            preflush_read_frames[page >> Core::DEVICE_PAGEBITS] = frame_tick;
+        }
+    }
     const bool preflushable = memory_tracker.IsRegionPreflushable(device_addr, size);
     // EDEN_NX2_EXP49: all of the area's GPU-modified bytes on their way for an earlier read. No
     // new copies: the read waits for those (in_flight), or finds them landed.
