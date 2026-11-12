@@ -2729,6 +2729,11 @@ bool RasterizerVulkan::HasPendingQueries(DAddr addr, u64 size) {
 }
 
 bool RasterizerVulkan::HasCachedReports(DAddr addr, u64 size) {
+    // EXP94 (live; Fable answer_front 1): a range no query was ever registered on has none, which
+    // the query cache's page filter tells without its mutex (the front asks for every macro DMA read).
+    if (VideoCore::Nx2Debug::Experiment(94) != 0 && !query_cache.page_filter.Any(addr, size)) {
+        return false;
+    }
     return query_cache.HasCachedReports(addr, size);
 }
 

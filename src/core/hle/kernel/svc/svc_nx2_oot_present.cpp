@@ -763,6 +763,10 @@ s64 ShortSleepUs() {
         const long long parsed = std::strtoll(text, nullptr, 10);
         return parsed > 0 ? static_cast<s64>(parsed) : DefaultShortSleepUs;
     }();
+    // EXP95 > 0 (live; Fable answer_front 2): the short sleep in us, switchable in one session.
+    if (const int live = VideoCore::Nx2Debug::Experiment(95); live > 0) {
+        return live;
+    }
     return us;
 }
 

@@ -540,6 +540,14 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// written, ring overflow, pending cached writes, other range, no keep yet). "Uniform keeps
 /// count (EXP91" logs small binds, rebinds and those counts per second every 5 s while not 0.
 /// Gain of the later stages is about K x 55 ns; under 100,000 a second, stop there.
+/// EXP94 (live, 0 = off; fable52_answer_front 1): RasterizerVulkan::HasCachedReports answers
+/// "none" from the query cache's page filter before taking its mutex (the front asks for every
+/// macro DMA read, ~5 ms/s of the front in the market heavy phase). Exact: the filter marks every
+/// page a query was ever registered on.
+/// EXP95 (live, 0 = EDEN_NX2_OOT_PRESENT_SLEEP_US or 250; N > 0 = N us; fable52_answer_front 2):
+/// the short sleep of OoT's present poll with EXP24 on. The event word is written by the game's
+/// main thread, so a sleep only ends at its timeout; shorter sleeps end the poll sooner after
+/// the write (try 100).
 /// EXP93 (live, 0 = as EDEN_NX2_UBO_INPLACE says, 1 = on; fable52_answer_writer 3): small
 /// uniform buffers are compared with their slot straight in guest memory instead of through a
 /// scratch copy (VideoCommon::UniformInPlaceCompareEnabled). Judge on "bind stage buffers".
