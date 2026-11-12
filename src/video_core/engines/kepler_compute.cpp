@@ -1177,6 +1177,7 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
         }
     };
     dlss_chain.output_pass = false;
+    current_native_key = 0; // set by BypassOotNetwork once the dispatch's shader is known
     // Fortune's Weave's evaluation is 13 dispatches. Bound incomplete evaluations, including
     // skipped dispatches, so a missing output pass cannot keep the chain active indefinitely.
     constexpr u32 max_dispatches = 64;
@@ -1371,6 +1372,20 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
         static std::unordered_set<std::string> logged;
         if (logged.insert(error.what()).second) {
             LOG_ERROR(HW_GPU, "Native compute shader rejected: {}", error.what());
+        }
+        // CheezyEmu 97a7e109e4: Ocarina of Time's anti-aliasing network can't run here: without
+        // it the scene is never written and the picture stays black (handheld PCs on RADV). Draw
+        // it without the network (No sharpening's copy) for the rest of the session. Only when
+        // the pass's pipeline can't be built (ComputePipelineCacheEntry::Get, DispatchCompute),
+        // not on a passing failure such as "Native compute resources unavailable".
+        if (Settings::GetCurrentProgramID() == VideoCommon::OotNetwork::ProgramId &&
+            VideoCommon::OotNetwork::IsNetworkPass(current_native_key) &&
+            std::string_view{error.what()}.starts_with("Native compute pipeline unavailable") &&
+            !VideoCommon::OotNetwork::forced_bypass.exchange(true)) {
+            LOG_WARNING(HW_GPU,
+                        "Ocarina of Time: its anti-aliasing network can't run on this GPU (pass "
+                        "{:#018x}); drawing without it (No sharpening) instead of a black picture",
+                        current_native_key);
         }
         dispatched = false;
         if (dlss_chain.active) {
@@ -1686,6 +1701,7 @@ std::optional<Texture::TICEntry> KeplerCompute::ConstBuffer0Image(u32 offset) co
 
 bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     using namespace VideoCommon::OotNetwork;
+    current_native_key = native_key; // asked about every native dispatch, before its pipeline
     if (!BypassEnabled(program_id)) {
         return false;
     }
