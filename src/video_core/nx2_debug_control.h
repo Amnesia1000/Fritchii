@@ -789,6 +789,11 @@ inline void LoadExperiments() {
         // uncapped): back 7.89 -> 7.43 us per draw, flush work 33.6 -> 16.9 ms/s, 59.8 -> 61.8
         // fps in the same session, 0.1% low 29.2 -> 32.8; picture normal.
         g_experiments[88].store(3, std::memory_order_relaxed);
+        // EXP85 = 3 (2026-11-12, overnight): inline uploads and WriteMemory skip the buffer lock on
+        // never-GPU-written pages. Alone (EXP86 on) it was inside the noise; with EXP88 = 3 at the
+        // daytime market (orbit, uncapped): back 8.09 -> 7.69 us per draw, method 175.4 -> 163.2
+        // ms/s, 58.7 -> 60.8 fps same session, 1% low 38.8 -> 40.4; picture normal.
+        g_experiments[85].store(3, std::memory_order_relaxed);
         // EXP49 = 1 (2026-11-10, owner's call for v5.7): the async read-back. Stalchild fight,
         // flipped every 30 s while the owner fought: 51.9 -> 56.9 fps, the back's read flushes
         // 35 -> 6 ms/s, guest lock waits halved. No beams in that session or two later ones
