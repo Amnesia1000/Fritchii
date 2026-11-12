@@ -578,27 +578,6 @@ void TextureCache<P>::TickFrame() {
                     retention_limit = (std::min)(budget - room_margin, host_critical);
                     expected_memory = critical_memory - (std::min)(margin, critical_memory / 2);
                     ApplyThresholdOverrides(false);
-                    // #1435's 150-frame keep stops at the cache's normal level, not near the
-                    // driver's budget: as ported it held every image used in the last 150 frames
-                    // up to ~14.7 GiB on a 16 GB card, past the owner's 7,680 MiB ceiling, and the
-                    // Castle Town pot room filled the owner's VRAM (2026-11-12). The usage it is
-                    // compared with also leaves out the EXP42 pool and the idle-destroy backlog,
-                    // so their room comes off too (fable52_answer_stall3 2).
-                    // EDEN_NX2_KEEP_RECENT=0: no 150-frame keep at all (the old ages).
-                    static const bool keep_recent = [] {
-                        const char* value = std::getenv("EDEN_NX2_KEEP_RECENT");
-                        return value == nullptr || value[0] != '0';
-                    }();
-                    if (!keep_recent) {
-                        retention_limit = 0;
-                    } else {
-                        retention_limit = (std::min)(retention_limit, expected_memory);
-                        u64 held_elsewhere = 512_MiB; // the EXP99 idle-destroy bound
-                        if constexpr (requires { runtime.ImagePoolCap(); }) {
-                            held_elsewhere += runtime.ImagePoolCap();
-                        }
-                        retention_limit -= (std::min)(retention_limit, held_elsewhere);
-                    }
                     // Log the first values and real changes (the budget moves by a few MiB all
                     // the time). Compared after the overrides: the value before them is above
                     // the 5/8-of-budget cap on large cards, so every check looked like a change
