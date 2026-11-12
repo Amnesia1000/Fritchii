@@ -302,6 +302,29 @@ constexpr std::array POLL_BACKOFF_RECORDS{
     BuiltinPatchRecord{.module_offset = 0x1708C, .bytes = POLL_BACKOFF_RETURN, .checked = true, .original = 0},
 };
 
+// Shadow size steps: OoT gives each nearby object its own square depth shadow map
+// ("local_shadow_depth"), sized by the object's size on screen. While the player moves, every
+// side changes every frame, so the host makes ~10-13 new depth images a frame in the Castle Town
+// pot room (2-5 ms a frame). The one read of the side before the texture request (main+0x2440A0,
+// `ldr w10, [x21, #0x4e8]` at main+0x244100) now goes through four words of free space that round
+// it up to a multiple of 64: 384..1,920 becomes 25 sizes the image pool can reuse. The projection
+// is unchanged, so a map gets at most 63 more texels a side. Research: work\potroom_patch_research.md.
+constexpr std::array<u8, 4> SHADOW_STEPS_BRANCH{0x30, 0x0B, 0xE8, 0x14}; // b 0x3c46dc0
+constexpr std::array<u8, 4> SHADOW_STEPS_LOAD{0xAA, 0xEA, 0x44, 0xB9};   // ldr w10, [x21, #0x4e8]
+constexpr std::array<u8, 4> SHADOW_STEPS_ADD{0x4A, 0xFD, 0x00, 0x11};    // add w10, w10, #0x3f
+constexpr std::array<u8, 4> SHADOW_STEPS_AND{0x4A, 0x65, 0x1A, 0x12};    // and w10, w10, #0xffffffc0
+constexpr std::array<u8, 4> SHADOW_STEPS_RETURN{0xCE, 0xF4, 0x17, 0x17}; // b 0x244104
+constexpr std::array SHADOW_STEPS_RECORDS{
+    BuiltinPatchRecord{.module_offset = 0x244100,
+                       .bytes = SHADOW_STEPS_BRANCH,
+                       .checked = true,
+                       .original = 0xB944EAAA}, // ldr w10, [x21, #0x4e8]
+    BuiltinPatchRecord{.module_offset = 0x3C46DC0, .bytes = SHADOW_STEPS_LOAD, .checked = true, .original = 0},
+    BuiltinPatchRecord{.module_offset = 0x3C46DC4, .bytes = SHADOW_STEPS_ADD, .checked = true, .original = 0},
+    BuiltinPatchRecord{.module_offset = 0x3C46DC8, .bytes = SHADOW_STEPS_AND, .checked = true, .original = 0},
+    BuiltinPatchRecord{.module_offset = 0x3C46DCC, .bytes = SHADOW_STEPS_RETURN, .checked = true, .original = 0},
+};
+
 constexpr std::array BUILTIN_PATCHES{
     BuiltinPatch{
         .name = "Max Resolution (built-in)",
@@ -366,6 +389,14 @@ constexpr std::array BUILTIN_PATCHES{
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = POLL_BACKOFF_RECORDS,
         .enable_env = "EDEN_NX2_OOT_POLL_BACKOFF",
+    },
+    BuiltinPatch{
+        .name = "Shadow Size Steps (built-in, FRITCHII_SHADOW_STEPS=1)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = SHADOW_STEPS_RECORDS,
+        .enable_env = "FRITCHII_SHADOW_STEPS",
     },
 };
 
