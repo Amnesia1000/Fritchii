@@ -355,12 +355,12 @@ static VmaPool DepthAttachmentPool(VmaAllocator allocator, const VkImageCreateIn
         }
     }
     using namespace Common::Literals;
-    // EDEN_NX2_DEPTH_POOL_MIN_BLOCKS (boot, default 4 = 256 MiB): blocks the pool never gives
+    // EDEN_NX2_DEPTH_POOL_MIN_BLOCKS (boot, default 0; try 4 = 256 MiB): blocks the pool never gives
     // back. VMA frees an empty block, so with 0 the pool still asked the driver for new memory at
     // each peak (night market panning: 39 images on a new block, 4 binds over 20 ms, worst 67 ms).
     static const u32 min_blocks = [] {
         const char *value = std::getenv("EDEN_NX2_DEPTH_POOL_MIN_BLOCKS");
-        return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 4U;
+        return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
     }();
     const VmaPoolCreateInfo pool_ci{
         .memoryTypeIndex = type,
