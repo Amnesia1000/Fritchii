@@ -546,6 +546,15 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// EXP97 (live; fable52_answer_guest 3a): spins of a contended KSpinLock (the scheduler lock)
 /// before it sleeps. 0 = 128 as before; N > 0 = N. EDEN_NX2_KLOCK_STATS=1 logs its locks every
 /// 5 s ("Kernel spin lock (5 s").
+/// EXP98 (live; fable52_answer_yield): guest yields (svcSleepThread 0 and -1) skip the scheduler
+/// lock when it would find nothing to do (k_scheduler.cpp YieldIsKnownNoOp). A change counter
+/// per core, raised under the lock for the cores of every thread whose scheduling changes; a
+/// yield that did nothing stamps its core and that core's counter and raises nothing; the early
+/// return reads the lock word, then the counter. 0 = the code as before (per-process count);
+/// 1 = early return; 2 = verify: always take the lock, check the stamp's prediction under it
+/// and count mismatches (must be 0, the first 16 are logged). While not 0, "Guest yields
+/// (EXP98" logs yields by form, early returns, lock-held checks and locked outcomes every 5 s.
+/// -2 (YieldToAnyThread) is only counted.
 /// EXP94 (live, 0 = off; fable52_answer_front 1): RasterizerVulkan::HasCachedReports answers
 /// "none" from the query cache's page filter before taking its mutex (the front asks for every
 /// macro DMA read, ~5 ms/s of the front in the market heavy phase). Exact: the filter marks every
