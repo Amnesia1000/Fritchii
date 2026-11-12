@@ -1734,7 +1734,16 @@ void Device::RemoveUnsuitableExtensions() {
                                        VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
 
     // VK_EXT_robustness2
-    features.robustness2.robustBufferAccess2 = VK_FALSE;
+    // AMD keeps robustBufferAccess2 (zortos293/Lichii capy/amd-prep-robustness2 bbac5266ef, from
+    // CheezyEmu c08bd7432b): games read storage buffers out of bounds and AMD returned garbage
+    // without it (OoT's fog compute shader 75d4369f3b1f5868 filled distant froxels with huge
+    // values and turned the Hyrule Field sky white). It needs robustBufferAccess, which every
+    // device here enables (a required feature). Only where the driver offers it: the queried
+    // value is kept. AMD proprietary, AMDVLK and RADV only; every other driver turns it off as
+    // before.
+    if (!IsAmdDriver()) {
+        features.robustness2.robustBufferAccess2 = VK_FALSE;
+    }
     features.robustness2.robustImageAccess2 = VK_FALSE;
     extensions.robustness_2 = features.robustness2.nullDescriptor;
 
