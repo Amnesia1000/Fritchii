@@ -635,6 +635,10 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// EXP42 off and a lowered cap still trim by the plain oldest-first loop. The "Image pool (EXP42)"
 /// line ends with the rule, the backlog in MiB and the frame-end destroys. Ghost run (orbit,
 /// 182-212 s): 66-68% of lookups taken at 512 MiB against 60-64% for today's rule at 1,024 MiB.
+/// EXP111 (live; 0 = Windows' default, 1 = above normal, 2 = high; vk_rasterizer.cpp TickFrame):
+/// the process priority class, applied when the value changes. The owner gets more fps with the
+/// window focused (Windows' foreground boost); this keeps the game's threads ahead of other
+/// normal-priority programs when it isn't. Watch for a stream encoder starving at 2.
 /// EXP101 (live, 0 = off, 1 = runs, 2 = cached page pointer + prefetch; fable52_answer_presenter): nvhost_gpu::SubmitGPFIFOImpl's pushbuffer
 /// snapshot reads runs of entries whose GPU addresses follow each other with one ReadBlockUnsafe
 /// instead of one per entry (OoT's presenting thread submits ~6,500 entries a frame; the loop is

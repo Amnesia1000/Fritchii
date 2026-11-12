@@ -7,6 +7,9 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#ifdef _WIN32
+#include <windows.h> // SetPriorityClass (EXP111)
+#endif
 #include <chrono>
 #include <thread>
 #include <cmath>
@@ -4601,6 +4604,25 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
 void NoteDrawReuseProbeFrame(); // vk_graphics_pipeline.cpp
 
 void RasterizerVulkan::TickFrame() {
+#ifdef _WIN32
+    // EXP111 (live; 0 = Windows' default, 1 = above normal, 2 = high): the process priority
+    // class. The owner sees more fps with the window focused: Windows boosts the foreground
+    // process (longer quantum, priority boost) and the game's threads lose it when another
+    // window has focus (2026-11-12). Applied when the value changes.
+    {
+        static int applied = 0;
+        const int wanted = VideoCore::Nx2Debug::Experiment(111);
+        if (wanted != applied) {
+            const DWORD priority_class = wanted >= 2   ? HIGH_PRIORITY_CLASS
+                                         : wanted == 1 ? ABOVE_NORMAL_PRIORITY_CLASS
+                                                       : NORMAL_PRIORITY_CLASS;
+            if (SetPriorityClass(GetCurrentProcess(), priority_class)) {
+                LOG_INFO(Render_Vulkan, "Process priority class (EXP111={}) set", wanted);
+            }
+            applied = wanted;
+        }
+    }
+#endif
     NoteDrawReuseProbeFrame();
     VideoCommon::MemStageStats::TickFrame();
     VideoCommon::BufferChurnStats::TickFrame();
