@@ -26,7 +26,8 @@ void Scheduler::BindChannel(GPU& gpu, s32 bind_id) {
                 std::scoped_lock lk{scheduling_guard};
                 gpu_ptr->BindChannel(bind_id);
             },
-            VideoCommon::GpuSplit::Effect::None);
+            // Delta draw count: a real switch breaks in RasterizerVulkan::BindChannel.
+            VideoCommon::GpuSplit::Effect::None, VideoCommon::Nx2FastDrawCount::Neutral());
         return;
     }
     std::scoped_lock lk{scheduling_guard};

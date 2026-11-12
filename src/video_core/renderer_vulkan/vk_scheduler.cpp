@@ -418,9 +418,8 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
     }
     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
     const VkExtent2D render_area = framebuffer->RenderArea();
-    if (VideoCommon::Nx2FastDrawCount::g_on) [[unlikely]] {
-        ++render_pass_serial;
-    }
+    // Delta draws: always counted (Fable plan D1, row 4), so the delta path can rely on it.
+    ++render_pass_serial;
     state.renderpass = renderpass;
     state.clear_variant = false;
     state.framebuffer = framebuffer_handle;

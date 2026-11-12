@@ -3342,10 +3342,26 @@ public:
     /// Counting on: a state write of `argument` to `method`, before the register takes it.
     void NoteFastDrawCountWrite(u32 method, u32 argument);
     /// Counting on: inline data written to GPU addresses [begin, end) (constant buffer words, a
-    /// report): texture or sampler headers end reuse, the rest is noted as light.
+    /// report): texture or sampler headers end reuse, also through another GPU address mapping
+    /// their device memory (#1161's alias check); the rest is noted as light.
     void NoteFastDrawCountData(GPUVAddr begin, GPUVAddr end);
+    /// Counting on: translates the texture header and sampler pools to device memory again if
+    /// they or the mappings changed, and publishes them for the writes applied to the caches
+    /// (Nx2FastDrawCount::NotePoolWrite). On the thread that runs this engine.
+    void UpdateFastDrawCountPools();
 
 private:
+    /// The texture header (TIC) and sampler (TSC) pools as NoteFastDrawCountData sizes them.
+    struct FastDrawCountPools {
+        GPUVAddr tic;
+        u64 tic_size;
+        GPUVAddr tsc;
+        u64 tsc_size;
+    };
+    FastDrawCountPools FastDrawCountPoolRanges() const;
+    VideoCommon::Nx2FastDrawCount::DeviceSpans fast_draw_count_tic_spans;
+    VideoCommon::Nx2FastDrawCount::DeviceSpans fast_draw_count_tsc_spans;
+
     void InitializeRegisterDefaults();
 
     void ProcessMacro(Core::System& system, u32 method, const u32* base_start, u32 amount, bool is_last_call);

@@ -153,7 +153,7 @@ public:
         return state.renderpass != VK_NULL_HANDLE;
     }
 
-    /// EDEN_NX2_FASTDRAW_COUNT: render passes begun (counted only while it counts).
+    /// Render passes begun (delta draws: a draw in another render pass is resolved in full).
     [[nodiscard]] u64 RenderPassSerial() const noexcept {
         return render_pass_serial;
     }
@@ -550,7 +550,7 @@ private:
 
     State state;
     u64 recording_epoch = 0;
-    u64 render_pass_serial = 0; ///< EDEN_NX2_FASTDRAW_COUNT: BeginRenderPassImpl calls
+    u64 render_pass_serial = 0; ///< BeginRenderPassImpl calls (delta draws)
 
     u32 num_renderpass_images = 0;
     std::array<VkImage, 9> renderpass_images{};

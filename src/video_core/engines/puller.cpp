@@ -77,10 +77,11 @@ u32 ReadSemaphoreWord(DmaPusher& dma_pusher, GPUVAddr address) {
 
 // With the GPU thread split (gpu_split.h) the rasterizer belongs to the back thread: work that
 // only feeds it runs there in order; reads of what it wrote first wait for it (DrainBack).
+// `flags`: GpuSplit::Defer's (Nx2FastDrawCount::Neutral() for calls that end no delta draw).
 template <typename Func>
-void OnBack(const Func& func) {
+void OnBack(const Func& func, u64 flags = 0) {
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
-        split.Defer(func);
+        split.Defer(func, VideoCommon::GpuSplit::Effect::Unknown, flags);
         split.NoteMemoryWrite();
     } else {
         func();
@@ -648,12 +649,14 @@ void ReleaseFences(DmaPusher& dma_pusher) {
                           dma_pusher.rasterizer->FenceWorkEpoch() == epoch;
         skips.Count(state, skip);
         if (skip) {
-            OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->InvalidateGPUCache(); });
+            OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->InvalidateGPUCache(); },
+                   VideoCommon::Nx2FastDrawCount::Neutral());
             return;
         }
     }
+    // Delta draw count: fence releases are neutral, the fence manager breaks per fence released.
     split.Run([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); },
-              VideoCommon::DrainSite::FenceRelease);
+              VideoCommon::DrainSite::FenceRelease, VideoCommon::Nx2FastDrawCount::Neutral());
 }
 
 // EDEN_NX2_EXP12: the fence releases of acquires whose word the front read current but unmet
@@ -925,7 +928,9 @@ static bool RunaheadAnswer(DmaPusher& dma_pusher, const Puller::PendingAcquire& 
     if (mode == Runahead::Mode::On) {
         RunaheadBoundary(dma_pusher, acquire, device, *release, position);
     }
-    split.Defer([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
+    split.Defer([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); },
+                VideoCommon::GpuSplit::Effect::Unknown,
+                VideoCommon::Nx2FastDrawCount::Neutral());
     split.NoteMemoryWrite();
     // A host-level wait for the commands after it, as the drain was.
     split.NoteSync();
@@ -979,7 +984,9 @@ static bool ReleaseFencesForReadable(DmaPusher& dma_pusher, const void* owner,
         return result;
     }
     const u64 target = split.UntrackedWriterPosition(*device);
-    split.Defer([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
+    split.Defer([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); },
+                VideoCommon::GpuSplit::Effect::Unknown,
+                VideoCommon::Nx2FastDrawCount::Neutral());
     split.NoteMemoryWrite();
     const auto begin = Clock::now();
     if (split.WaitUntil(target, VideoCommon::DrainSite::FenceWriters)) {
@@ -1302,7 +1309,8 @@ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
     case Puller::FenceOperation::Acquire:
         // UNIMPLEMENTED_MSG("Channel Scheduling pending.");
         // WaitFence(regs.fence_action.syncpoint_id, regs.fence_value);
-        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
+        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); },
+               VideoCommon::Nx2FastDrawCount::Neutral());
         VideoCommon::GpuSplit::Get().NoteSync();
         break;
     case Puller::FenceOperation::Increment:
@@ -1597,7 +1605,8 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
     // released in order on the back instead of after a drain (from zortos293/Lichii#179). Later
     // GPU-written list fetches and macro reads still wait for the work before it (NoteSync).
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
-        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
+        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); },
+               VideoCommon::Nx2FastDrawCount::Neutral());
         split.NoteSync();
         return;
     }
@@ -1605,7 +1614,8 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
     if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_sem_fast, "EDEN_NX2_SEM_FAST") != 0 &&
         VideoCommon::GpuSplit::Get().Active()) {
         // Only the warning below reads the result: release the fences in order instead.
-        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
+        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); },
+               VideoCommon::Nx2FastDrawCount::Neutral());
         return;
     }
     DrainBack();
@@ -1743,7 +1753,8 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
     }
     case BufferMethods::MemOpB: {
         // Implement this better.
-        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->InvalidateGPUCache(); });
+        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->InvalidateGPUCache(); },
+               VideoCommon::Nx2FastDrawCount::Neutral());
         break;
     }
     case BufferMethods::MemOpC:

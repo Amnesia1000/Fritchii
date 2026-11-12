@@ -139,6 +139,21 @@ void PrefetchRingLine(const u64* address) {
 #endif
 }
 
+/// EDEN_NX2_FASTDRAW_COUNT: a deferred call that ends delta draw reuse, by its thunk (Fable plan
+/// D1: the per call site histogram in the counter's log).
+void NoteFastDrawCallBreak(u64 thunk) {
+    Nx2FastDrawCount::Break(Nx2FastDrawCount::Reason::Call);
+#ifdef _WIN32
+    static const bool based = [] {
+        Nx2FastDrawCount::g_module_base.store(reinterpret_cast<u64>(GetModuleHandleW(nullptr)),
+                                              std::memory_order_relaxed);
+        return true;
+    }();
+    static_cast<void>(based);
+#endif
+    Nx2FastDrawCount::NoteCallSite(thunk);
+}
+
 } // Anonymous namespace
 
 void GpuSplit::CheckOwner(const char* where) {
@@ -1314,7 +1329,7 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
     case Kind::Call: {
         // EDEN_NX2_FASTDRAW_COUNT (#1161): deferred calls end reuse unless marked neutral.
         if (Nx2FastDrawCount::g_on && (head & Nx2FastDrawCount::NeutralCallBit) == 0) [[unlikely]] {
-            Nx2FastDrawCount::Break(Nx2FastDrawCount::Reason::Call);
+            NoteFastDrawCallBreak(entry[1]);
         }
         const size_t payload = static_cast<size_t>((head >> 8) & 0xffffff);
         reinterpret_cast<void (*)(const u64*)>(entry[1])(entry + 2);
