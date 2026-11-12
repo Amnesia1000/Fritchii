@@ -540,6 +540,12 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// written, ring overflow, pending cached writes, other range, no keep yet). "Uniform keeps
 /// count (EXP91" logs small binds, rebinds and those counts per second every 5 s while not 0.
 /// Gain of the later stages is about K x 55 ns; under 100,000 a second, stop there.
+/// EXP96 (live; fable52_answer_guest 4): the HLE reply hold (k_server_session.cpp HoldHleReply,
+/// written for Mario Tennis Fever, active in every title). 0 = EDEN_NX2_IPC_MIN_US or 50 us;
+/// 1 = off; N > 1 = N us. In OoT the service thread that presents waits in it ~14 ms/s.
+/// EXP97 (live; fable52_answer_guest 3a): spins of a contended KSpinLock (the scheduler lock)
+/// before it sleeps. 0 = 128 as before; N > 0 = N. EDEN_NX2_KLOCK_STATS=1 logs its locks every
+/// 5 s ("Kernel spin lock (5 s").
 /// EXP94 (live, 0 = off; fable52_answer_front 1): RasterizerVulkan::HasCachedReports answers
 /// "none" from the query cache's page filter before taking its mutex (the front asks for every
 /// macro DMA read, ~5 ms/s of the front in the market heavy phase). Exact: the filter marks every
@@ -713,7 +719,7 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// prove 2 shows 0 differ first (under EXP19=2 without EXP50, blend writes without
 /// Dirty::Blending already leave the clean lookup's attachments stale, and verify reports that
 /// too), then compare the lookup zone with profile_toggle (EXP52 0 vs 1).
-inline constexpr int ExperimentCount = 96;
+inline constexpr int ExperimentCount = 112;
 inline std::atomic<int> g_experiments[ExperimentCount]{};
 /// Set once LoadExperiments has run: Experiment() tests it inline instead of calling
 /// LoadExperiments (a function-local static guard) on every check (0.5% of the back thread in

@@ -32,6 +32,7 @@
 #include "core/hle/service/hle_ipc.h"
 #include "core/hle/service/ipc_helpers.h"
 #include "core/memory.h"
+#include "video_core/nx2_debug_control.h"
 
 namespace Kernel {
 
@@ -1250,7 +1251,14 @@ void HoldHleReply(KernelCore& kernel, KThread* client_thread) {
         const char* text = std::getenv("EDEN_NX2_IPC_MIN_US");
         return text ? std::strtoll(text, nullptr, 10) : 50LL;
     }()};
-    if (hold.count() <= 0) {
+    // EXP96 (live): 1 = off, N > 1 = N us, 0 = the env / 50 us.
+    auto live_hold = hold;
+    if (const int exp96 = VideoCore::Nx2Debug::Experiment(96); exp96 == 1) {
+        return;
+    } else if (exp96 > 1) {
+        live_hold = std::chrono::microseconds{exp96};
+    }
+    if (live_hold.count() <= 0) {
         return;
     }
     const s32 core = client_thread->GetActiveCore();
@@ -1258,7 +1266,7 @@ void HoldHleReply(KernelCore& kernel, KThread* client_thread) {
         return;
     }
     const auto& scheduler = kernel.Scheduler(core);
-    const auto deadline = std::chrono::steady_clock::now() + hold;
+    const auto deadline = std::chrono::steady_clock::now() + live_hold;
     while (std::chrono::steady_clock::now() < deadline) {
         // Stop as soon as the core has nothing else to run.
         const KThread* running = scheduler.GetSchedulerCurrentThread();

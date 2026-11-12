@@ -197,7 +197,7 @@ void NoteSleepAsked(s64 ns) {
     if (!enabled) {
         return;
     }
-    static constexpr std::array<s64, 11> limits{1'000,  5'000,   10'000,  19'000,    21'000,  50'000,
+    static constexpr std::array<s64, 11> limits{0,  5'000,   10'000,  19'000,    21'000,  50'000,
                                                 100'000, 250'000, 1'000'000, 16'000'000, INT64_MAX};
     static std::array<std::atomic<u64>, 11> counts{};
     static std::atomic<s64> next_report{};
@@ -222,7 +222,7 @@ void NoteSleepAsked(s64 ns) {
         c[i] = counts[i].exchange(0, std::memory_order_relaxed);
     }
     LOG_INFO(Kernel_SVC,
-             "Guest sleeps asked (5 s, per second): <=1us {:.0f}, <=5us {:.0f}, <=10us {:.0f}, "
+             "Guest sleeps asked (5 s, per second): yields (0 or less) {:.0f}, <=5us {:.0f}, <=10us {:.0f}, "
              "<=19us {:.0f}, 19-21us {:.0f}, <=50us {:.0f}, <=100us {:.0f}, <=250us {:.0f}, "
              "<=1ms {:.0f}, <=16ms {:.0f}, more {:.0f}",
              c[0] / 5.0, c[1] / 5.0, c[2] / 5.0, c[3] / 5.0, c[4] / 5.0, c[5] / 5.0, c[6] / 5.0,
@@ -237,8 +237,8 @@ void SleepThread(Core::System& system, s64 ns) {
     LOG_TRACE(Kernel_SVC, "called nanoseconds={}", ns);
 
     // When the input tick is positive, sleep.
+    NoteSleepAsked(ns); // EDEN_NX2_SLEEP_HIST: yields (ns <= 0) count in the first bucket
     if (ns > 0) {
-        NoteSleepAsked(ns);
         // The timeline marks Ocarina of Time's present poll sleeps: a timer wait for the GPU's
         // event, not guest work (tools/nx2/critical_path.py). Recorded on the host thread the
         // guest thread resumes on. The span carries the poll's event object (its words are
