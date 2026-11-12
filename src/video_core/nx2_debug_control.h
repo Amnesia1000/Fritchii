@@ -639,6 +639,16 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// the process priority class, applied when the value changes. The owner gets more fps with the
 /// window focused (Windows' foreground boost); this keeps the game's threads ahead of other
 /// normal-priority programs when it isn't. Watch for a stream encoder starving at 2.
+/// EXP112 (live, 0 = off; fable52_answer_fountain 4; BufferCache::DownloadMemoryForRead, with
+/// EXP49 on): a guest read that must flush GPU-written buffer memory also downloads the
+/// GPU-written run around its pages in the same round trip: the pages after it, then before it,
+/// that hold GPU-modified bytes in a row, up to 256 KiB with the read's own pages, inside the
+/// read's buffer, ending at a Preflushable page. Exact: only GPU-modified bytes not already on
+/// their way, the same read download, fence and landing. The run's read trap marks go at once,
+/// so once it lands EXP86's mirrors answer the neighbouring pages' reads without the lock (a GPU
+/// write there arms them again). At the great fairy fountain one game job read ~16 such pages a
+/// frame, each a round trip (~0.4 ms). Check FRITCHII_READ_RUNS=1's "Read runs" line first: the
+/// run histogram says whether the reads have neighbours to take.
 /// EXP101 (live, 0 = off, 1 = runs, 2 = cached page pointer + prefetch; fable52_answer_presenter): nvhost_gpu::SubmitGPFIFOImpl's pushbuffer
 /// snapshot reads runs of entries whose GPU addresses follow each other with one ReadBlockUnsafe
 /// instead of one per entry (OoT's presenting thread submits ~6,500 entries a frame; the loop is
@@ -856,7 +866,7 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// prove 2 shows 0 differ first (under EXP19=2 without EXP50, blend writes without
 /// Dirty::Blending already leave the clean lookup's attachments stale, and verify reports that
 /// too), then compare the lookup zone with profile_toggle (EXP52 0 vs 1).
-inline constexpr int ExperimentCount = 112;
+inline constexpr int ExperimentCount = 120;
 inline std::atomic<int> g_experiments[ExperimentCount]{};
 /// Set once LoadExperiments has run: Experiment() tests it inline instead of calling
 /// LoadExperiments (a function-local static guard) on every check (0.5% of the back thread in

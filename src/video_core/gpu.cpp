@@ -23,6 +23,7 @@
 #include "core/frontend/graphics_context.h"
 #include "core/hle/service/nvdrv/nvdata.h"
 #include "core/perf_stats.h"
+#include "video_core/buffer_cache/read_run_stats.h"
 #include "video_core/cdma_pusher.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/control/scheduler.h"
@@ -324,15 +325,27 @@ struct GPU::Impl {
     }
 
     VideoCore::RasterizerDownloadArea OnCPURead(DAddr addr, u64 size) {
+        namespace ReadRunStats = VideoCommon::ReadRunStats;
+        if (ReadRunStats::g_enabled) [[unlikely]] {
+            ReadRunStats::t_run_pages = 0;
+        }
         auto raster_area = renderer->ReadRasterizer()->GetFlushArea(addr, size);
         if (raster_area.preemtive) {
             return raster_area;
         }
+        // FRITCHII_READ_RUNS: this read goes to the back or waits for a download.
+        const u64 run_pages = ReadRunStats::t_run_pages;
+        const u64 run_start = ReadRunStats::g_enabled ? VideoCore::AsyncReadback::Now() : 0;
         // EDEN_NX2_EXP72: everything this read lacks is in a fence download already submitted:
         // wait for it to land instead of a new copy behind all the work recorded since.
         if (raster_area.fence_download != 0 &&
             renderer->ReadRasterizer()->WaitFenceDownload(raster_area.fence_download)) {
             raster_area.preemtive = true;
+            if (ReadRunStats::g_enabled) [[unlikely]] {
+                ReadRunStats::NoteRead(ReadRunStats::Kind::FenceDownload,
+                                       raster_area.start_address, run_pages,
+                                       VideoCore::AsyncReadback::Now() - run_start);
+            }
             return raster_area;
         }
         raster_area.preemtive = true;
@@ -384,6 +397,13 @@ struct GPU::Impl {
         }
         AsyncReadback::CountRead(kind, AsyncReadback::Now() - request);
         AsyncReadback::MaybeReport();
+        if (ReadRunStats::g_enabled) [[unlikely]] {
+            ReadRunStats::NoteRead(kind == AsyncReadback::Read::InFlight
+                                       ? ReadRunStats::Kind::InFlight
+                                       : ReadRunStats::Kind::Flushed,
+                                   raster_area.start_address, run_pages,
+                                   AsyncReadback::Now() - run_start);
+        }
         return raster_area;
     }
 
