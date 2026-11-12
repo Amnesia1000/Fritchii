@@ -231,6 +231,12 @@ void BufferCache<P>::TickFrame() {
     if (DownloadReadStats::g_enabled && frame_tick % 600 == 0) [[unlikely]] {
         DownloadReadStats::Log();
     }
+    if (ReadRunStats::g_enabled) [[unlikely]] {
+        ReadRunStats::g_frame.fetch_add(1, std::memory_order_relaxed);
+        if (frame_tick % 600 == 0) {
+            ReadRunStats::Log(VideoCore::Nx2Debug::Experiment(112));
+        }
+    }
     if (frame_tick % 600 == 0 && preflush_resets != 0) {
         LOG_INFO(HW_GPU,
                  "Preflush reset (EXP69={}, EXP81={}) last 600 frames: {} resets, {} KiB unmarked, "
@@ -511,6 +517,20 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
         preflush_read_pages.Set(device_addr_start_aligned,
                                 device_addr_end_aligned - device_addr_start_aligned);
     }
+    // FRITCHII_READ_RUNS: the GPU-written run around the read's pages, before anything lands.
+    if (ReadRunStats::g_enabled) [[unlikely]] {
+        ReadRunStats::t_run_pages = 0;
+        if (IsRegionGpuModified(device_addr_start_aligned,
+                                device_addr_end_aligned - device_addr_start_aligned)) {
+            const auto [run_begin, run_end] = GpuModifiedRunAround(
+                device_addr_start_aligned, device_addr_end_aligned,
+                ReadRunStats::RunCountPages * Core::DEVICE_PAGESIZE, false);
+            ReadRunStats::t_run_pages =
+                (Common::AlignUp(run_end, Core::DEVICE_PAGESIZE) -
+                 Common::AlignDown(run_begin, Core::DEVICE_PAGESIZE)) >>
+                Core::DEVICE_PAGEBITS;
+        }
+    }
     const bool preflushable = memory_tracker.IsRegionPreflushable(device_addr, size);
     // EDEN_NX2_EXP49: all of the area's GPU-modified bytes on their way for an earlier read. No
     // new copies: the read waits for those (in_flight), or finds them landed.
@@ -664,8 +684,84 @@ void BufferCache<P>::DownloadMemoryForRead(DAddr device_addr, u64 size) {
                     [&](DAddr start, DAddr end) { ranges.emplace_back(start, end - start); });
             });
         }
+        // EXP112 (live, 0 = off; fable52_answer_fountain 4): the GPU-written run around the
+        // read's pages too, up to 256 KiB, in this same download. RecordReadDownload takes only
+        // GPU-modified bytes there (and none already on their way), so it is what the reads of
+        // the neighbouring pages would download one round trip each. Once it lands they are clean
+        // (WriteReadDownloads); their read trap marks go now, so EXP86's mirrors answer those
+        // reads without the lock. Taking a mark early is always safe: the next GPU write there
+        // arms the pages again. Preflushable pages are left to their fence downloads.
+        if (VideoCore::Nx2Debug::Experiment(112) != 0) {
+            constexpr u64 RunFlushBytes = 256_KiB;
+            const DAddr begin = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
+            const DAddr end = Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE);
+            if (IsRegionGpuModified(begin, end - begin) &&
+                !memory_tracker.IsRegionPreflushable(begin, end - begin)) {
+                const auto [run_begin, run_end] =
+                    GpuModifiedRunAround(begin, end, RunFlushBytes, true);
+                if (run_begin < begin || run_end > end) {
+                    ranges.emplace_back(run_begin, run_end - run_begin);
+                    const DAddr pages_begin = Common::AlignDown(run_begin, Core::DEVICE_PAGESIZE);
+                    const DAddr pages_end = Common::AlignUp(run_end, Core::DEVICE_PAGESIZE);
+                    read_trapped_ranges.Subtract(pages_begin, pages_end - pages_begin);
+                    if (ReadRunStats::g_enabled) [[unlikely]] {
+                        ReadRunStats::g_run_flushes.fetch_add(1, std::memory_order_relaxed);
+                        const u64 before = pages_begin < begin ? begin - pages_begin : 0;
+                        const u64 after = pages_end > end ? pages_end - end : 0;
+                        ReadRunStats::g_run_bytes.fetch_add(before + after,
+                                                            std::memory_order_relaxed);
+                    }
+                }
+            }
+        }
         RecordReadDownload(ranges);
     }
+}
+
+template <class P>
+std::pair<DAddr, DAddr> BufferCache<P>::GpuModifiedRunAround(DAddr begin, DAddr end,
+                                                             u64 max_bytes,
+                                                             bool stop_at_preflushable) {
+    DAddr buffer_begin = 0;
+    DAddr buffer_end = 0;
+    ForEachBufferInRange(begin, end - begin, [&](BufferId, Buffer& buffer) {
+        if (buffer_end == 0 && buffer.CpuAddr() <= begin &&
+            begin < buffer.CpuAddr() + buffer.SizeBytes()) {
+            buffer_begin = buffer.CpuAddr();
+            buffer_end = buffer.CpuAddr() + buffer.SizeBytes();
+        }
+    });
+    if (buffer_end == 0) {
+        // The read's first page starts before any buffer: look from its first byte in a buffer.
+        ForEachBufferInRange(begin, end - begin, [&](BufferId, Buffer& buffer) {
+            if (buffer_end == 0) {
+                buffer_begin = buffer.CpuAddr();
+                buffer_end = buffer.CpuAddr() + buffer.SizeBytes();
+            }
+        });
+        if (buffer_end == 0) {
+            return {begin, begin};
+        }
+    }
+    // Whether the page at `page` holds GPU-modified bytes inside the buffer.
+    const auto written = [&](DAddr page) {
+        const DAddr lower = (std::max)(page, buffer_begin);
+        const DAddr upper = (std::min)(page + Core::DEVICE_PAGESIZE, buffer_end);
+        if (lower >= upper || !gpu_modified_ranges.Intersects(lower, upper - lower)) {
+            return false;
+        }
+        return !stop_at_preflushable || !memory_tracker.IsRegionPreflushable(lower, upper - lower);
+    };
+    DAddr run_begin = begin;
+    DAddr run_end = end;
+    while (run_end - run_begin < max_bytes && run_end < buffer_end && written(run_end)) {
+        run_end += Core::DEVICE_PAGESIZE;
+    }
+    while (run_end - run_begin < max_bytes && run_begin > buffer_begin &&
+           written(run_begin - Core::DEVICE_PAGESIZE)) {
+        run_begin -= Core::DEVICE_PAGESIZE;
+    }
+    return {(std::max)(run_begin, buffer_begin), (std::min)(run_end, buffer_end)};
 }
 
 template <class P>

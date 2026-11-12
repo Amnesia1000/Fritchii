@@ -42,6 +42,7 @@
 #include "video_core/buffer_cache/buffer_base.h"
 #include "video_core/buffer_cache/download_read_stats.h"
 #include "video_core/buffer_cache/gpu_written_mirror.h"
+#include "video_core/buffer_cache/read_run_stats.h"
 #include "video_core/buffer_cache/read_trap_tracker.h"
 #include "video_core/buffer_cache/virtual_range_cache.h"
 #include "video_core/control/channel_state_cache.h"
@@ -333,6 +334,14 @@ public:
     /// GPU-modified until then, and another read of them waits for these copies (GetFlushArea:
     /// in_flight).
     void DownloadMemoryForRead(DAddr device_addr, u64 size);
+
+    /// FRITCHII_READ_RUNS and EXP112 (`mutex` held): the pages around [begin, end) (page
+    /// aligned) that hold GPU-modified bytes in a row, inside the buffer holding `begin`, up to
+    /// max_bytes in all (the read's own pages count; the pages after them first, then those
+    /// before), clipped to that buffer. With stop_at_preflushable a Preflushable page ends the
+    /// run (fence downloads take those). Empty (first == second) when no buffer holds `begin`.
+    std::pair<DAddr, DAddr> GpuModifiedRunAround(DAddr begin, DAddr end, u64 max_bytes,
+                                                 bool stop_at_preflushable);
 
     /// Writes the DownloadMemoryForRead copies over [device_addr, device_addr + size), and those
     /// submitted before them, to guest memory, waiting for the host GPU if it must. Any thread:
