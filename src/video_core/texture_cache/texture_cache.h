@@ -18,6 +18,8 @@
 #include <optional>
 #include <bit>
 #include <type_traits>
+#include <unordered_map>
+#include "common/cityhash.h"
 #include "common/container/unordered_map.h"
 #include <boost/container/small_vector.hpp>
 
@@ -3352,7 +3354,13 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config) {
     }
     const u32 layer_offset = config.BaseLayer() * info.layer_stride;
     const GPUVAddr image_gpu_addr = config.Address() - layer_offset;
-    const ImageId image_id = FindOrInsertImage(info, image_gpu_addr);
+    ImageId image_id = FindImage(info, image_gpu_addr, RelaxedOptions{});
+    if (!image_id) {
+        image_id = InsertImage(info, image_gpu_addr, RelaxedOptions{});
+        if (image_id) {
+            NoteNewSampledImage(image_id, image_gpu_addr);
+        }
+    }
     if (!image_id) {
         return NULL_IMAGE_VIEW_ID;
     }
@@ -3789,6 +3797,68 @@ ImageId TextureCache<P>::InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
     }
     slot_image_allocs[it->second].images.push_back(image_id);
     return image_id;
+}
+
+template <class P>
+void TextureCache<P>::NoteNewSampledImage(ImageId image_id, GPUVAddr gpu_addr) {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_IMAGE_HASH_LOG");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (!enabled) [[likely]] {
+        return;
+    }
+    struct Seen {
+        u32 count = 0;
+        u32 width = 0;
+        u32 height = 0;
+        u32 format = 0;
+    };
+    static std::unordered_map<u64, Seen> seen;
+    static u64 made = 0;
+    static u64 made_again = 0;
+    static u64 bytes_again = 0;
+    static auto last_log = std::chrono::steady_clock::now();
+    const ImageBase& image = slot_images[image_id];
+    // Up to the first 256 KiB of the guest bytes, with the shape: enough to tell the same
+    // texture made again from a new one.
+    const size_t size =
+        (std::min)(static_cast<size_t>(image.guest_size_bytes), size_t{256} << 10);
+    std::vector<u8> bytes(size);
+    gpu_memory->ReadBlockUnsafe(gpu_addr, bytes.data(), size);
+    u64 hash = Common::CityHash64(reinterpret_cast<const char*>(bytes.data()), size);
+    hash ^= (u64{image.info.size.width} << 32 | image.info.size.height) * 0x9E3779B97F4A7C15ULL;
+    hash ^= static_cast<u64>(image.info.format) << 56;
+    Seen& entry = seen[hash];
+    ++made;
+    if (entry.count++ > 0) {
+        ++made_again;
+        bytes_again += image.guest_size_bytes;
+    }
+    entry.width = image.info.size.width;
+    entry.height = image.info.size.height;
+    entry.format = static_cast<u32>(image.info.format);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_log < std::chrono::seconds{10}) {
+        return;
+    }
+    last_log = now;
+    std::vector<std::pair<u64, Seen>> top(seen.begin(), seen.end());
+    const size_t keep = (std::min)(top.size(), size_t{8});
+    std::partial_sort(top.begin(), top.begin() + keep, top.end(),
+                      [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+    std::string text;
+    for (size_t i = 0; i < keep && top[i].second.count > 1; ++i) {
+        text += fmt::format(" {}x{} fmt {} x{};", top[i].second.width, top[i].second.height,
+                            top[i].second.format, top[i].second.count);
+    }
+    LOG_INFO(HW_GPU,
+             "New sampled images (EDEN_NX2_IMAGE_HASH_LOG) last 10 s: {} made, {} with bytes made "
+             "before ({} KiB); {} different so far; most made:{}",
+             made, made_again, bytes_again >> 10, seen.size(), text.empty() ? " none twice" : text);
+    made = 0;
+    made_again = 0;
+    bytes_again = 0;
 }
 
 template <class P>

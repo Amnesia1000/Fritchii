@@ -594,6 +594,11 @@ private:
     [[nodiscard]] ImageId InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
                                       RelaxedOptions options);
 
+    /// EDEN_NX2_IMAGE_HASH_LOG=1 (boot): a sampled image just made from a texture header; counts
+    /// it by the hash of its guest bytes and logs a summary every 10 s (are a kill's effect
+    /// textures made again each time? fable52_answer_backdraw (b) 4).
+    void NoteNewSampledImage(ImageId image_id, GPUVAddr gpu_addr);
+
     /// Create a new image and join perfectly matching existing images
     /// Remove joined images from the cache
     [[nodiscard]] ImageId JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DAddr cpu_addr);
