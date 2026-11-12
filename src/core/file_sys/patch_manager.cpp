@@ -391,12 +391,15 @@ constexpr std::array BUILTIN_PATCHES{
         .enable_env = "EDEN_NX2_OOT_POLL_BACKOFF",
     },
     BuiltinPatch{
-        .name = "Shadow Size Steps (built-in, FRITCHII_SHADOW_STEPS=1)",
+        .name = "Shadow Size Steps (built-in)",
         .title_id = 0x0400486024DEC000,
         .module = "main",
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = SHADOW_STEPS_RECORDS,
-        .enable_env = "FRITCHII_SHADOW_STEPS",
+        // On by default since the pot room run (2026-11-12): new depth images while strafing at
+        // the town wall 4,000-10,000 -> 30-90 per 600 frames, frames 20.5-26 -> 18.4-18.8 ms,
+        // shadows unchanged in the screenshot. FRITCHII_NO_SHADOW_STEPS=1 turns it off.
+        .disable_env = "FRITCHII_NO_SHADOW_STEPS",
     },
 };
 
