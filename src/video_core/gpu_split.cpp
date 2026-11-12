@@ -1407,7 +1407,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 ForgetFencesQuiet();
                 timeline_span.Set(0, {"phase", 1});
                 wait_phase = 1;
+                in_idle_wait = true;
                 idle_hook(idle_argument);
+                in_idle_wait = false;
                 available = published.load(std::memory_order_acquire);
                 if (available == read_position) {
                     CheckFencesQuiet(read_position);

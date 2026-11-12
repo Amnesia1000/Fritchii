@@ -503,7 +503,8 @@ public:
     void DestroyIdlePooledImages(u32 max);
 private:
     std::mutex idle_destroy_mutex;
-    std::deque<vk::Image> idle_destroys; ///< EXP99=1: evicted, destroyed when the back is idle
+    std::deque<std::pair<vk::Image, u64>> idle_destroys; ///< EXP99=1: evicted, destroyed when idle
+    u64 idle_destroy_bytes{};
 
 public:
     /// EDEN_NX2_ASYNC_IMAGE_FREE: a deleted image the GPU is done with (TextureCache::TickFrame,
