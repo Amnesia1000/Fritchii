@@ -23,6 +23,9 @@ namespace Core::Nx2ProtectStats {
 /// tracked, unprotect = it became untracked), how long they take, how many follow the previous
 /// call of the same kind on the next page within one batch (one call could have done both), and
 /// the pages that change most. Logged every 5 s ("Page protection (5 s"). Fable's next70 ask 3.
+/// Also (fable52_answer_after88 1.6, with EXP89 off or on): for every page a protect call covers,
+/// how many frames ago that guest page was last unprotected ("Page protection frames since the
+/// last unprotect"), and EXP89's lingering protection counters ("Lingering protection (EXP89").
 [[nodiscard]] inline bool Enabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("EDEN_NX2_PROTECT_STATS");
@@ -36,6 +39,28 @@ struct PageCount {
     u32 unprotects{};
 };
 
+/// Frames presented so far: raised once a frame by RasterizerVulkan::TickFrame (TickFrame below),
+/// the same place that runs EXP89's sweep. Counted with the stats off too.
+inline std::atomic<u64> g_frame{0};
+
+/// Buckets of "frames since this page was last unprotected" at a protect: 0 (same frame), 1, 2,
+/// 3-4, 5-16, 17-64, more, never (or longer ago than the last 5 s report's 64-frame trim). A
+/// lingering protection of N frames (EXP89=N) cancels the protects up to N frames after.
+inline constexpr size_t FramesAgoBuckets = 8;
+
+[[nodiscard]] inline size_t FramesAgoBucket(u64 frames) {
+    if (frames <= 2) {
+        return static_cast<size_t>(frames);
+    }
+    if (frames <= 4) {
+        return 3;
+    }
+    if (frames <= 16) {
+        return 4;
+    }
+    return frames <= 64 ? 5 : 6;
+}
+
 struct State {
     std::atomic<u64> calls[2]{};      ///< [0] unprotect, [1] protect
     std::atomic<u64> bytes[2]{};
@@ -44,12 +69,28 @@ struct State {
     std::atomic<u64> batches{};
     std::mutex pages_mutex;
     std::unordered_map<u64, PageCount> pages; ///< Guest page number -> changes this window
+    /// Guest page number -> frame of its last unprotect call; entries older than 64 frames are
+    /// trimmed at each report. Under pages_mutex.
+    std::unordered_map<u64, u64> last_unprotect;
+    std::atomic<u64> frames_ago[FramesAgoBuckets]{}; ///< Protected pages by FramesAgoBucket
+    // EXP89 (DeviceMemoryManager's lingering protection), pages:
+    std::atomic<u64> linger_noted{};      ///< 1 -> 0 left protected: unprotects not made
+    std::atomic<u64> linger_cancelled{};  ///< 0 -> 1 of a lingering page: protects not made
+    std::atomic<u64> linger_swept{};      ///< Uncached by the once-a-frame sweep
+    std::atomic<u64> linger_mapping{};    ///< Uncached at once by Map, Unmap or UnregisterProcess
+    std::atomic<u64> linger_held{};       ///< Lingering after the last sweep
+    std::atomic<u64> linger_left_after_unmap{}; ///< Verify: must stay 0
     std::atomic<s64> next_report_ns{};
 };
 
 inline State& Get() {
     static State state;
     return state;
+}
+
+/// EXP89 counters (pages); call only with Enabled().
+inline void AddLinger(std::atomic<u64> State::*counter, u64 pages) {
+    (Get().*counter).fetch_add(pages, std::memory_order_relaxed);
 }
 
 /// The previous call on this thread inside the current batch, for the mergeable count.
@@ -88,9 +129,22 @@ inline void Report(State& state, s64 now) {
     const u64 merge_u = take(state.mergeable[0]);
     const u64 merge_p = take(state.mergeable[1]);
     const u64 batches = take(state.batches);
+    u64 frames_ago[FramesAgoBuckets]{};
+    u64 frames_ago_total = 0;
+    for (size_t i = 0; i < FramesAgoBuckets; ++i) {
+        frames_ago[i] = take(state.frames_ago[i]);
+        frames_ago_total += frames_ago[i];
+    }
+    const u64 linger_noted = take(state.linger_noted);
+    const u64 linger_cancelled = take(state.linger_cancelled);
+    const u64 linger_swept = take(state.linger_swept);
+    const u64 linger_mapping = take(state.linger_mapping);
+    const u64 linger_left = take(state.linger_left_after_unmap);
+    const u64 linger_held = state.linger_held.load(std::memory_order_relaxed);
     std::vector<std::pair<u64, PageCount>> top;
     size_t distinct = 0;
     size_t cycled = 0;
+    size_t last_unprotect_kept = 0;
     {
         std::scoped_lock lock{state.pages_mutex};
         distinct = state.pages.size();
@@ -100,6 +154,10 @@ inline void Report(State& state, s64 now) {
             top.emplace_back(page, count);
         }
         state.pages.clear();
+        const u64 frame = g_frame.load(std::memory_order_relaxed);
+        std::erase_if(state.last_unprotect,
+                      [frame](const auto& entry) { return frame > entry.second + 64; });
+        last_unprotect_kept = state.last_unprotect.size();
     }
     const size_t keep = std::min<size_t>(16, top.size());
     std::partial_sort(top.begin(), top.begin() + keep, top.end(), [](const auto& a, const auto& b) {
@@ -119,6 +177,35 @@ inline void Report(State& state, s64 now) {
              distinct, cycled);
     LOG_INFO(HW_GPU, "Page protection top pages (address:protects/unprotects in 5 s):{}",
              pages_text);
+    // Share of the protected pages a lingering protection of N frames would have cancelled.
+    const auto share = [&](size_t last_bucket) {
+        u64 sum = 0;
+        for (size_t i = 0; i <= last_bucket; ++i) {
+            sum += frames_ago[i];
+        }
+        return frames_ago_total == 0 ? 0.0 : 100.0 * static_cast<double>(sum) / frames_ago_total;
+    };
+    LOG_INFO(HW_GPU,
+             "Page protection frames since the last unprotect (5 s, protected pages): 0:{} 1:{} "
+             "2:{} 3-4:{} 5-16:{} 17-64:{} more:{} never:{}; EXP89=N would cancel: N=1 {:.1f}%, "
+             "N=2 {:.1f}%, N=4 {:.1f}%, N=16 {:.1f}%, N=64 {:.1f}%; pages remembered {}",
+             frames_ago[0], frames_ago[1], frames_ago[2], frames_ago[3], frames_ago[4],
+             frames_ago[5], frames_ago[6], frames_ago[7], share(1), share(2), share(3), share(4),
+             share(5), last_unprotect_kept);
+    LOG_INFO(HW_GPU,
+             "Lingering protection (EXP89, 5 s, pages per second): unprotects cancelled {:.0f}, "
+             "protects cancelled {:.0f}, released by the sweep {:.0f}, by map/unmap {:.0f}; held "
+             "{}; left after unmap {} (must be 0)",
+             linger_noted / 5.0, linger_cancelled / 5.0, linger_swept / 5.0, linger_mapping / 5.0,
+             linger_held, linger_left);
+}
+
+/// Once a frame from RasterizerVulkan::TickFrame, before EXP89's sweep.
+inline void TickFrame() {
+    g_frame.fetch_add(1, std::memory_order_relaxed);
+    if (Enabled()) [[unlikely]] {
+        Report(Get(), NowNs());
+    }
 }
 
 /// Wraps one MarkRegionCaching call: `vaddr`/`bytes` are the guest range, `cached` true when
@@ -139,13 +226,21 @@ inline void Count(u64 vaddr, u64 bytes, bool cached, Func&& call) {
     t_last_end = vaddr + bytes;
     t_last_cached = cached;
     {
+        const u64 frame = g_frame.load(std::memory_order_relaxed);
         std::scoped_lock lock{state.pages_mutex};
         for (u64 page = vaddr >> 12; page < (vaddr + bytes + 4095) >> 12; ++page) {
             PageCount& count = state.pages[page];
             if (cached) {
                 ++count.protects;
+                const auto it = state.last_unprotect.find(page);
+                size_t bucket = FramesAgoBuckets - 1; // never (or trimmed)
+                if (it != state.last_unprotect.end()) {
+                    bucket = FramesAgoBucket(frame > it->second ? frame - it->second : 0);
+                }
+                state.frames_ago[bucket].fetch_add(1, std::memory_order_relaxed);
             } else {
                 ++count.unprotects;
+                state.last_unprotect[page] = frame;
             }
         }
     }
