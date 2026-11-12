@@ -19,8 +19,7 @@ merge can be told: "skip commits with the trailer Fritchii-Branding: yes".
 ## What branding changes
 
 - `dist/fritchii.ico`, `dist/fritchii.png`: the logo (art by Frizti, Triforce badge added).
-- `src/yuzu/yuzu.rc`, `src/yuzu_cmd/yuzu.rc`, `src/dedicated_room/yuzu_room.rc`, `src/yuzu/yuzu.qrc`,
-  `dist/qt_themes/default/default.qrc`: point the existing icon names at the Fritchii files.
+- `src/yuzu/yuzu.rc`, `src/yuzu/yuzu.qrc`, `dist/qt_themes/default/default.qrc`: point the existing icon names at the Fritchii files.
 - Version string and window title "Fritchii vN" (CMakeModules/GenerateSCMRev.cmake,
   src/qt_common/qt_common.cpp, src/yuzu/bootmanager.cpp), only when dist/frizti_version.txt exists.
 - This folder.

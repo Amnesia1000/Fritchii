@@ -45,31 +45,6 @@ if (NETBSD)
     set(ENV{PKG_CONFIG_PATH} "${PKG_CONFIG_PATH}:${CMAKE_SYSROOT}/usr/pkg/lib/ffmpeg7/pkgconfig")
 endif()
 
-cmake_dependent_option(YUZU_STATIC_ROOM "Build a static room executable only (CI only)" OFF "LINUX" OFF)
-if (YUZU_STATIC_ROOM)
-    set(YUZU_ROOM ON)
-    set(YUZU_ROOM_STANDALONE ON)
-
-    # disable e v e r y t h i n g
-    set(ENABLE_QT OFF)
-    set(YUZU_CMD OFF)
-    set(ENABLE_CUBEB OFF)
-    set(ENABLE_UPDATE_CHECKER OFF)
-    set(USE_DISCORD_PRESENCE OFF)
-    set(BUILD_TESTING OFF)
-    set(ENABLE_WEB_SERVICE OFF)
-    set(ENABLE_LIBUSB OFF)
-
-    # allow static libs for boost though
-    set(Boost_USE_STATIC_LIBS ON)
-    set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
-    set(OPENSSL_USE_STATIC_LIBS ON)
-    set(OpenSSL_FORCE_SYSTEM ON)
-
-    set(zstd_FORCE_BUNDLED ON)
-    set(fmt_FORCE_BUNDLED ON)
-endif()
-
 # qt stuff
 option(ENABLE_QT "Enable the Qt frontend" ON)
 option(ENABLE_QT_TRANSLATION "Enable translations for the Qt frontend" OFF)
@@ -281,11 +256,6 @@ option(YUZU_LEGACY "Apply patches that improve compatibility with older GPUs (e.
 
 option(NIGHTLY_BUILD "Use Nightly qualifiers in the update checker and build metadata" OFF)
 
-cmake_dependent_option(YUZU_ROOM "Enable dedicated room functionality" ON "NOT ANDROID" OFF)
-cmake_dependent_option(YUZU_ROOM_STANDALONE "Enable standalone room executable" ON "YUZU_ROOM" OFF)
-
-cmake_dependent_option(YUZU_CMD "Compile the eden-cli executable" ON "NOT ANDROID" OFF)
-
 cmake_dependent_option(YUZU_CRASH_DUMPS "Compile crash dump (Minidump) support" OFF "WIN32 OR LINUX" OFF)
 
 option(YUZU_DOWNLOAD_TIME_ZONE_DATA "Always download time zone binaries" ON)
@@ -312,10 +282,6 @@ endif()
 if (ARCHITECTURE_arm64 AND (ANDROID OR LINUX))
     set(HAS_NCE 1)
     add_compile_definitions(HAS_NCE=1)
-endif()
-
-if (YUZU_ROOM)
-    add_compile_definitions(YUZU_ROOM)
 endif()
 
 if (UNIX AND NOT (LINUX OR WIN32))
@@ -469,28 +435,26 @@ include(NxFormat)
 # nlohmann
 AddJsonPackage(nlohmann)
 
-if (NOT YUZU_STATIC_ROOM)
-    # zlib
-    AddJsonPackage(zlib)
+# zlib
+AddJsonPackage(zlib)
 
-    if (ZLIB_ADDED)
-        add_library(ZLIB::ZLIB ALIAS zlibstatic)
+if (ZLIB_ADDED)
+    add_library(ZLIB::ZLIB ALIAS zlibstatic)
+endif()
+
+# Opus
+AddJsonPackage(opus)
+
+if (Opus_ADDED)
+    if (MSVC AND CXX_CLANG)
+        target_compile_options(opus PRIVATE
+            $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-implicit-function-declaration>
+        )
     endif()
+endif()
 
-    # Opus
-    AddJsonPackage(opus)
-
-    if (Opus_ADDED)
-        if (MSVC AND CXX_CLANG)
-            target_compile_options(opus PRIVATE
-                $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-implicit-function-declaration>
-            )
-        endif()
-    endif()
-
-    if (NOT TARGET Opus::opus)
-        add_library(Opus::opus ALIAS opus)
-    endif()
+if (NOT TARGET Opus::opus)
+    add_library(Opus::opus ALIAS opus)
 endif()
 
 if(NOT TARGET Boost::headers)
@@ -560,42 +524,40 @@ if (ARCHITECTURE_x86 OR ARCHITECTURE_x86_64)
     find_package(xbyak)
 endif()
 
-if (NOT YUZU_STATIC_ROOM)
-    find_package(libusb)
-    find_package(VulkanMemoryAllocator)
-    find_package(VulkanUtilityLibraries)
-    find_package(SimpleIni)
-    find_package(sirit)
-    find_package(gamemode)
-    find_package(frozen)
+find_package(libusb)
+find_package(VulkanMemoryAllocator)
+find_package(VulkanUtilityLibraries)
+find_package(SimpleIni)
+find_package(sirit)
+find_package(gamemode)
+find_package(frozen)
 
-    if (ARCHITECTURE_riscv64)
-        find_package(biscuit)
-    endif()
+if (ARCHITECTURE_riscv64)
+    find_package(biscuit)
+endif()
 
-    if (ENABLE_WEB_SERVICE OR ENABLE_UPDATE_CHECKER)
-        find_package(cpp-jwt)
-    endif()
+if (ENABLE_WEB_SERVICE OR ENABLE_UPDATE_CHECKER)
+    find_package(cpp-jwt)
+endif()
 
-    if (ARCHITECTURE_arm64 OR DYNARMIC_TESTS)
-        find_package(oaknut)
-    endif()
+if (ARCHITECTURE_arm64 OR DYNARMIC_TESTS)
+    find_package(oaknut)
+endif()
 
-    if (NOT ANDROID)
-        find_package(SDL3)
-    endif()
+if (NOT ANDROID)
+    find_package(SDL3)
+endif()
 
-    if (USE_DISCORD_PRESENCE)
-        find_package(DiscordRPC)
-    endif()
+if (USE_DISCORD_PRESENCE)
+    find_package(DiscordRPC)
+endif()
 
-    if (ENABLE_CUBEB)
-        find_package(cubeb)
-    endif()
+if (ENABLE_CUBEB)
+    find_package(cubeb)
+endif()
 
-    if (YUZU_TESTS OR DYNARMIC_TESTS)
-        find_package(Catch2)
-    endif()
+if (YUZU_TESTS OR DYNARMIC_TESTS)
+    find_package(Catch2)
 endif()
 
 # Qt stuff
@@ -664,7 +626,7 @@ if (ENABLE_QT)
     AddJsonPackage(quazip)
 endif()
 
-if (NOT YUZU_STATIC_ROOM AND NOT (YUZU_USE_BUNDLED_FFMPEG OR YUZU_USE_EXTERNAL_FFMPEG))
+if (NOT (YUZU_USE_BUNDLED_FFMPEG OR YUZU_USE_EXTERNAL_FFMPEG))
     # Use system installed FFmpeg
     find_package(FFmpeg REQUIRED QUIET COMPONENTS ${FFmpeg_COMPONENTS})
 
@@ -729,11 +691,9 @@ if (ENABLE_DEBUG_TOOLS)
     add_subdirectory(tools/maxwell-ir)
 endif()
 
-# Set yuzu project or yuzu-cmd project as default StartUp Project in Visual Studio depending on whether QT is enabled or not
+# Set the Qt frontend as the default StartUp Project in Visual Studio
 if(ENABLE_QT)
     set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT yuzu)
-else()
-    set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT yuzu-cmd)
 endif()
 
 # Installation instructions

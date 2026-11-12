@@ -8,7 +8,7 @@
 include_directories(.)
 
 # Dynarmic
-if ((ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64 OR ARCHITECTURE_riscv64 OR ARCHITECTURE_loongarch64) AND NOT YUZU_STATIC_ROOM)
+if ((ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64 OR ARCHITECTURE_riscv64 OR ARCHITECTURE_loongarch64))
     add_subdirectory(dynarmic)
     add_library(dynarmic::dynarmic ALIAS dynarmic)
 endif()
@@ -239,7 +239,7 @@ else()
     if (YUZU_STATIC_BUILD AND NOT APPLE AND NOT MSVC)
         add_compile_options(-static)
 
-        # yuzu-cmd requires us to explicitly link libpthread, libgcc, and libstdc++ as static
+        # static builds need libpthread, libgcc, and libstdc++ linked explicitly as static
         add_link_options(-Wl,-Bstatic -static -lpthread)
         add_link_options(-static-libgcc -static-libstdc++)
     endif()
@@ -266,19 +266,6 @@ endif()
 add_subdirectory(common)
 add_subdirectory(network)
 
-if (YUZU_ROOM)
-    add_subdirectory(dedicated_room)
-endif()
-
-if (YUZU_ROOM_STANDALONE)
-    add_subdirectory(yuzu_room_standalone)
-    set_target_properties(yuzu-room PROPERTIES OUTPUT_NAME "eden-room")
-endif()
-
-if (YUZU_STATIC_ROOM)
-    return()
-endif()
-
 add_subdirectory(core)
 add_subdirectory(audio_core)
 add_subdirectory(video_core)
@@ -289,11 +276,6 @@ add_subdirectory(shader_recompiler)
 
 if (YUZU_TESTS)
     add_subdirectory(tests)
-endif()
-
-if (YUZU_CMD)
-    add_subdirectory(yuzu_cmd)
-    set_target_properties(yuzu-cmd PROPERTIES OUTPUT_NAME "eden-cli")
 endif()
 
 if (ENABLE_QT)
