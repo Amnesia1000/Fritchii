@@ -900,6 +900,11 @@ inline void LoadExperiments() {
         // frame. Exact (the node ignored same-tick touches anyway). Heavy phase toggle: 92% of
         // touches skipped, back 8.30 -> 8.02 us per draw, 56.0 -> 57.1 fps, 1% low 38.1 -> 39.6.
         g_experiments[90].store(1, std::memory_order_relaxed);
+        // EXP99 = 1 (2026-11-12; fable52_answer_chicken 1): evicted image pool entries (OoT's
+        // per-NPC depth targets, the chicken hitch) are destroyed in the back's idle wait instead
+        // of at the frame's end. Heavy phase toggle: other 143.4 -> 114.2 ms/s, back 7.92 -> 7.72
+        // us per draw, 0.1% low 15.6 -> 23.0; every eviction went while idle ("here" 0).
+        g_experiments[99].store(1, std::memory_order_relaxed);
         // EXP49 = 1 (2026-11-10, owner's call for v5.7): the async read-back. Stalchild fight,
         // flipped every 30 s while the owner fought: 51.9 -> 56.9 fps, the back's read flushes
         // 35 -> 6 ms/s, guest lock waits halved. No beams in that session or two later ones
