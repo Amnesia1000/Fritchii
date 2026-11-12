@@ -85,7 +85,7 @@ bool OotMovieNetworkChosen() {
     return chosen;
 }
 
-// EDEN_NX2_EXP13=2 (diagnostic, counting only; from zortos293/Lichii#717's
+// EDEN_NX2_EXP13=2 (diagnostic, counting only; from a ported change's
 // EDEN_NX2_QMD_PREDICT): the split's front runs its own copy of the QMD scheduler. All channels'
 // native compute methods pass through the front in the order the back runs them, so fed the same
 // signals and the same QMD words, the copy runs the same QMDs at the same places and makes the
@@ -108,7 +108,7 @@ struct FrontQmdMirror {
         bool feed_checked;
         NativeQmdScheduler::Descriptor words;
     };
-    static constexpr size_t MaxOverlays = 256; ///< #717 has 64; OoT keeps more in flight
+    static constexpr size_t MaxOverlays = 256; ///< the original has 64; OoT keeps more in flight
 
     /// A known linear compute inline upload's bytes (Ocarina uploads a 4 KB page of 16 QMDs with
     /// one and patches their release words with small ones): a QMD read inside its filled bytes
@@ -1011,7 +1011,7 @@ void KeplerCompute::CallMethod(Core::System& system, u32 method, u32 method_argu
 
     switch (method) {
     case KEPLER_COMPUTE_REG_INDEX(exec_upload): {
-        // EDEN_NX2_EXP29 & 4 (zortos293/Lichii#717 EDEN_NX2_DROP_NATIVE_UPLOADS): only the
+        // EDEN_NX2_EXP29 & 4 (the original's EDEN_NX2_DROP_NATIVE_UPLOADS): only the
         // launch case below reads the list, and native mode never gets there
         // (ProcessNativeMethod takes 0xaf): the list grew by one entry per exec all session.
         if (!native_mode || (VideoCore::Nx2Debug::Experiment(29) & 4) == 0) {
@@ -1102,7 +1102,7 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
         return false;
     // A grid of GPU-written placeholders: dispatch indirectly from the words they stand for.
     bool grid_placeholder = false;
-    // List dispatches (nx2_list_dispatch.h, zortos293/Lichii#1336): the front stored the marker
+    // List dispatches (nx2_list_dispatch.h): the front stored the marker
     // for a grid it did not read; the grid is at the address it sent, on the host GPU.
     if (Nx2ListDispatch::IsMarker(qmd[12], qmd[13], qmd[14])) [[unlikely]] {
         // The list this QMD's marker stands for: its own, whatever lists were taken since.
@@ -1188,7 +1188,7 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
         dlss_depth.reset();
         (void)fe_upscale_jitter.Take();
     }
-    // Ocarina of Time's movie network (port of Eglantine 92f119195f): a pass that reads one
+    // Ocarina of Time's movie network (ported): a pass that reads one
     // colour image and stores none retains its colour and opens a skip window; the pass that
     // stores an image upscaling it is replaced by a plain copy and closes it. The gameplay
     // network is left alone: its pair (+0xc0 -> +0xd0) carries the tonemap.
@@ -2596,7 +2596,7 @@ void KeplerCompute::FrontQmdSignal(VideoCommon::GpuSplit& split, GPUVAddr qmd_ad
         ++mirror.window_resyncs;
     }
     // Reads that wait for the back (QMDs written by queued work other than inline QMDs) or that
-    // drain would cost the front more than the copy saves: #717 turns it off then.
+    // drain would cost the front more than the copy saves: the original turns it off then.
     // EDEN_NX2_QMD_AUTO_OFF=0 keeps it on however many reads wait (they still count).
     static const bool auto_off = [] {
         const char* const value = std::getenv("EDEN_NX2_QMD_AUTO_OFF");

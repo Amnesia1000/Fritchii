@@ -6,8 +6,8 @@
 // (*.nx2recipe) are not GPL; using them in other builds needs Frizti's direct permission (Discord
 // DM): see LICENSES/Fritchii-Recipe.txt.
 
-// Fritchii's automatic side of zortos293/Lichii#895: finds a title's precompiled pipeline file
-// (precompiled.fork-v<N>.nx2prep, as #895 places it) or a precompile recipe for it, and assembles
+// Fritchii's automatic side of the ported precompile feature: finds a title's precompiled pipeline file
+// (precompiled.fork-v<N>.nx2prep, as the ported feature places it) or a precompile recipe for it, and assembles
 // the recipe with the running game's own files when the file is missing or older than the recipe.
 // PipelineCache::PreparePrecompiled then builds the file's pipelines in the background.
 //
@@ -37,7 +37,7 @@ namespace VideoCommon::Nx2Precompile {
 /// nx2_switches.txt is applied.
 [[nodiscard]] int Mode();
 
-/// EDEN_NX2_PRECOMPILED_FORCE=1 (#895's switch): prepare again although the stamp says it is done.
+/// EDEN_NX2_PRECOMPILED_FORCE=1 (the ported switch): prepare again although the stamp says it is done.
 [[nodiscard]] bool Forced();
 
 /// Threads that extract, assemble and prepare: EDEN_NX2_PRECOMPILE_THREADS (1 to 16), else a

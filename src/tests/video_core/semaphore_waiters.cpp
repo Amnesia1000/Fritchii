@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// From zortos293/Lichii#1376 (9f932fe3c5), adapted: this tree's waiters have no slot limit (Add
-// returns nothing), the wake is off until enabled (EDEN_NX2_GPU_WAKE), and #1376's GPU tick wake
+// A ported test, adapted: this tree's waiters have no slot limit (Add
+// returns nothing), the wake is off until enabled (EDEN_NX2_GPU_WAKE), and the original's GPU tick wake
 // is not ported.
 
 #include <array>

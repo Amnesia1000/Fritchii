@@ -143,7 +143,7 @@ inline void ResetUniformStreamReuse() noexcept {
 /// Binds the small uniform buffer at `device_addr` for (stage, cbuf `index`) through the stream
 /// buffer, binding an earlier allocation again when it holds the same bytes and was made in the
 /// current command buffer: the slot's previous copy or, with `range_reuse` (EDEN_NX2_EXP17,
-/// from zortos293/Lichii#641), a copy of the same guest range made by any stage or slot. Every
+/// from a ported change), a copy of the same guest range made by any stage or slot. Every
 /// reuse compares the guest bytes with the copy's. Returns false (nothing bound) when the buffer
 /// does not qualify, so the caller binds it the classic way.
 template <class Runtime, class DeviceMemory>

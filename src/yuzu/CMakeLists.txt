@@ -398,11 +398,11 @@ target_sources(yuzu
         ${LANGUAGES}
         ${THEMES})
 
-# TODO(crueter): Move Assets.car/icon/icns handling to its own Module.
+# TODO: Move Assets.car/icon/icns handling to its own Module.
 if (APPLE)
     target_sources(yuzu PRIVATE util/macos_sleep.cpp util/macos_sleep.h)
 
-    # Use the supplied Lichii artwork for all macOS generators.
+    # Use the supplied artwork for all macOS generators.
     set(_dist "${CMAKE_SOURCE_DIR}/dist")
     set(_icons "${_dist}/lichii.icns")
     if (CMAKE_GENERATOR MATCHES "Xcode")

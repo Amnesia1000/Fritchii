@@ -15,9 +15,9 @@ namespace {
 // Bump Magic in vk_precompiled_kept.cpp when this layout changes.
 #if defined(_MSC_VER) && defined(_WIN64)
 // 7016 = 6960 + 12 inline TextureDescriptors x 4 (is_descriptor_array) + 8 for
-// binds_unmapped_pointer_word (zortos293/Lichii#1523). Neither it nor TextureDescriptor's
+// binds_unmapped_pointer_word. Neither it nor TextureDescriptor's
 // handle_is_pointer_word is stored: both are only set with EDEN_NX2_LIGHT_TABLE_ARRAYS (off), and
-// #1523's cached-record drop that reads the first is not ported. Store both (and bump Magic)
+// The original's cached-record drop that reads the first is not ported. Store both (and bump Magic)
 // before that switch goes on.
 static_assert(sizeof(Info) == 7016,
               "Shader::Info changed: list the new fields in VisitInfo, then update this size");
@@ -235,7 +235,7 @@ void VisitTexture(Io& io, D& d) {
     io(d.count);
     io(d.size_shift);
     io(d.handle_program);
-    // Not d.is_descriptor_array (zortos293/Lichii#1485, EDEN_NX2_LIGHT_TABLE_ARRAYS): only the
+    // Not d.is_descriptor_array (EDEN_NX2_LIGHT_TABLE_ARRAYS): only the
     // texture pass and the array limits read it, while translating. Left out, the layout (and
     // Magic) stays what it was, and a kept info reads back with it false, which nothing after
     // translation looks at.

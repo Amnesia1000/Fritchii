@@ -70,7 +70,7 @@ public:
     bool DeferFlush();
     /// Submits deferred work (the split's back, from its idle hook).
     void FlushDeferred();
-    /// The split's back (EDEN_NX2_EXP27 & 8, zortos293/Lichii#717 DISPATCH_BATCH): the work so
+    /// The split's back (EDEN_NX2_EXP27 & 8, the original's DISPATCH_BATCH): the work so
     /// far goes with the next submission, when the back goes idle or when another thread waits
     /// for it (WaitSubmitted), with no time window. False on other threads (the caller submits).
     bool DeferFlushUntilWanted();
@@ -229,7 +229,7 @@ public:
     /// Whether a command was recorded since the last Flush or Finish (EXP61: a flush with nothing
     /// to submit is skipped).
     [[nodiscard]] bool RecordedSinceSubmit() const noexcept {
-        // Pending batched uploads (zortos293/Lichii#1245) are recorded work too: EXP61 must not
+        // Pending batched uploads are recorded work too: EXP61 must not
         // skip a flush that would send them.
         return uploads_pending || record_serial != submitted_serial;
     }

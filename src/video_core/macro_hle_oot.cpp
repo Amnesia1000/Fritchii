@@ -10,7 +10,7 @@
 #include "common/logging.h"
 #include "video_core/macro_hle_oot.h"
 
-// Ported from Skitchii (skolvolt/Lichii) 1.3, e8a0621152, src/video_core/macro_hle_oot.cpp: the
+// Ported (its src/video_core/macro_hle_oot.cpp): the
 // hash table and HashMacro unchanged, so its hashes apply.
 
 namespace Tegra::OotMacros {

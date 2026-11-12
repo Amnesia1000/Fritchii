@@ -621,7 +621,7 @@ RasterizerVulkan::~RasterizerVulkan() {
     scheduler.Finish();
 }
 
-// Experimental adaptation of PokeDinner commit 76df4591a747: execute the reset shader's
+// Experimental adaptation of a ported change: execute the reset shader's
 // indirect record writes on the host until general GPU-address translation is available.
 bool RasterizerVulkan::IsNx2IndirectReset(bool is_indexed, u32 instance_count) {
     static const bool enabled = [] {
@@ -715,7 +715,7 @@ bool RasterizerVulkan::TryNx2IndirectReset(bool is_indexed, u32 instance_count) 
 
 namespace {
 
-// EDEN_NX2_FASTDRAW_COUNT: #1161's handle masks of a pipeline (GraphicsPipeline's constructor
+// EDEN_NX2_FASTDRAW_COUNT: the original handle masks of a pipeline (GraphicsPipeline's constructor
 // there), built from its shader info on the first counted draw that needs them.
 const VideoCommon::Nx2FastDrawCount::PipelineInfo& FastDrawCountInfo(
     const GraphicsPipeline& pipeline) {
@@ -823,7 +823,7 @@ void RasterizerVulkan::FastDrawCountDecide(const GraphicsPipeline* pipeline, boo
     Count::Stats& stats = counter.stats;
     counter.open = false;
     // What the next draw compares with. The groups broken since the last snapshot are this
-    // draw's; a widened write list is noted with them (not a break in #1161). The mask is taken
+    // draw's; a widened write list is noted with them (not a break in the original). The mask is taken
     // before the serial: a break on another thread in between (BreakOn moves the serial, then
     // sets its group) keeps its group for the next draw.
     const u32 mask = Count::g_pending.exchange(0, std::memory_order_relaxed) |
@@ -863,7 +863,7 @@ void RasterizerVulkan::FastDrawCountDecide(const GraphicsPipeline* pipeline, boo
     if (info.writes_images || info.mesh) {
         return full(Count::Full::DeltaPipeline);
     }
-    // #1161 compares the attribute type classes in the previous pipeline's key with the
+    // The original compares the attribute type classes in the previous pipeline's key with the
     // registers'; our keys keep only the types the programs read (KeyedAttributeTypes), so the
     // full resolve's pipeline stands for that comparison here.
     if (counter.vertex_input_dirty &&
@@ -1013,7 +1013,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     if (frame_dump.Capturing()) {
         frame_dump.DrainIfFull();
     }
-    // EDEN_NX2_FASTDRAW_COUNT: counting only, at #1161's TakeReusableDraw.
+    // EDEN_NX2_FASTDRAW_COUNT: counting only, at the original TakeReusableDraw.
     const bool fast_draw_counting = VideoCommon::Nx2FastDrawCount::g_on;
     if (fast_draw_counting) [[unlikely]] {
         FastDrawCountBegin();
@@ -1235,7 +1235,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         mesh_emulation_vertices_per_group = pipeline->MeshEmulationVerticesPerGroup();
     }
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
-    // EDEN_NX2_FASTDRAW_COUNT: #1161 reads the serial the next draw compares with here, once the
+    // EDEN_NX2_FASTDRAW_COUNT: the original reads the serial the next draw compares with here, once the
     // caches are locked, and checks DeltaStillHolds.
     if (fast_draw_counting) [[unlikely]] {
         FastDrawCountDecide(pipeline, is_indexed, is_indirect);
@@ -1928,7 +1928,7 @@ void RasterizerVulkan::DrawIndirect() {
     buffer_cache.SetDrawIndirect(nullptr);
 }
 
-// List draws (nx2_list_draw.h, zortos293/Lichii#1336): an array draw whose vertex count and first
+// List draws (nx2_list_draw.h): an array draw whose vertex count and first
 // vertex are the two words at indirect_state.indirect_start_address (Nx2ListDraw). The host GPU
 // copies them into a draw command and draws from it; draws that need the words on the CPU read
 // them back, as the front did before (a flush of the words, synchronous).
@@ -2711,7 +2711,7 @@ void RasterizerVulkan::DispatchCompute() {
     };
     const auto indirect_address = kepler_compute->GetIndirectComputeAddress();
     // The full-size 1080p pass is replaced only by FSR (native AA); DLAA through it is untested.
-    // So is the 3/4-scale pass zortos saw on Linux RADV (ef542df87cacfe9e, added with the FSR
+    // So is the 3/4-scale pass seen on Linux RADV (added with the FSR
     // port): DLSS keeps the passes it replaced before it, after the owner saw a softer image.
     constexpr u64 ThreeQuarterShader = 0xef542df87cacfe9eULL;
     const bool fsr_only_pass = pipeline->ShaderHash() == ComputePipeline::OcarinaFullSizeShader ||
@@ -2941,11 +2941,11 @@ void RasterizerVulkan::FlushAll() {}
 
 void RasterizerVulkan::SubmitNx2ListCopies(u64 writer) {
     // Submitted at once: ReadGpuWrittenCommands waits on these copies, so they can't sit out
-    // the longer DeferFlush interval (#161).
+    // the longer DeferFlush interval.
     if (!buffer_cache.Nx2CopyListPages(scheduler.CurrentTick(), writer)) {
         return;
     }
-    // EDEN_NX2_EXP27 & 8 (zortos293/Lichii#717 DISPATCH_BATCH): the front reads few of the lists
+    // EDEN_NX2_EXP27 & 8 (the original's DISPATCH_BATCH): the front reads few of the lists
     // (Ocarina: ~150 dispatches a frame, a submission each), so the copies go when it waits for
     // one (BufferCacheRuntime::WaitSubmittedTick asks the back), when the back goes idle, or
     // with the next submission.
@@ -3563,17 +3563,17 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
     namespace CbPath = VideoCommon::Nx2CbPath;
     const int cb_path = CbPath::Mode();
     CbPath::MaybeLog(cb_path);
-    // FlushCaching's ranges are the GPU's own engines' writes (EXP108, zortos293/Lichii#1436).
+    // FlushCaching's ranges are the GPU's own engines' writes (EXP108).
     if ((cb_path & CbPath::SkipBit) == 0) {
         std::scoped_lock lock{buffer_cache.mutex};
         // As OnCacheInvalidations: out of the GPU-written ranges first, so applying one range
-        // doesn't download the GPU's bytes over a later range on the same page (#1460).
+        // doesn't download the GPU's bytes over a later range on the same page.
         buffer_cache.ClaimCpuWrites(sequences);
         for (const auto& [addr, size] : sequences) {
             buffer_cache.WriteMemory(addr, size, true, true);
         }
     } else {
-        // EXP88 & 1 (zortos293/Lichii#1441 part c): ranges WriteMemory would change nothing in
+        // EXP88 & 1: ranges WriteMemory would change nothing in
         // (BufferCache::WriteReachesBuffers) keep only its three marks, without the lock. The
         // drawing thread runs FlushCaching, so the vertex bindings asked are its own.
         using Reach = BufferCache::WriteReach;
@@ -3601,7 +3601,7 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
             CbPath::Count(counters.lock_skips);
         } else {
             std::scoped_lock lock{buffer_cache.mutex};
-            // As above (#1460): claim every range applied below first. Skipped ranges
+            // As above: claim every range applied below first. Skipped ranges
             // (Reach::None) were never GPU-written, so the claim has nothing to take there.
             boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> applied;
             for (const auto& [range, skipped] : locked) {
@@ -3646,7 +3646,7 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
         VideoCommon::Nx2FastDrawCount::NotePoolWrite(addr, size);
     }
     {
-        // EXP109 (zortos293/Lichii#1161 f5902c6c68, lucastaonline): the pages the write untracks
+        // EXP109: the pages the write untracks
         // change their host protection after the lock is dropped: drawing waited for those
         // system calls (~1 us each, thousands a second at OoT's water). The word state changes
         // under the lock as before. A write trapping on a page still protected until then finds
@@ -3916,7 +3916,7 @@ void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
     // way below (the A/B measure for EXP30).
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::QueryDmaWait};
     if (VideoCore::Nx2Debug::Experiment(30) != 0) {
-        // EXP30 (zortos293/Lichii#559): the fence carries the reports still waiting for one; on
+        // EXP30: the fence carries the reports still waiting for one; on
         // the split's back its submission may be deferred, and the fencing thread would wait
         // for this thread to submit it. Then wait for the reports themselves, not for an
         // operation queued behind everything: the work submitted after them (a few ms of GPU
@@ -3990,7 +3990,7 @@ void RasterizerVulkan::WaitForIdle() {
 }
 
 void RasterizerVulkan::FragmentBarrier() {
-    // The next draw breaks the render pass only if it reads what this one wrote (#161): Ocarina
+    // The next draw breaks the render pass only if it reads what this one wrote: Ocarina
     // ended ~5,900 render passes a second here.
     if (device.IsMoltenVK() || VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::FragmentBarrier)) {
         scheduler.DeferFragmentBarrier();
@@ -4251,7 +4251,7 @@ void RasterizerVulkan::UpdateOcarinaJitter() {
     // would show the offset as a shake. Only draws that depth-test against the scene depth at
     // the scene size, so a depth pre-pass and the colour passes move together; shadow maps,
     // half-size passes and full-screen passes (which keep the depth bound without using it, as
-    // #678 found, some with depth writes on: with the test off nothing writes depth) stay put.
+    // a ported change found, some with depth writes on: with the test off nothing writes depth) stay put.
     const auto& regs = maxwell3d->regs;
     // FSR, and DLSS with EDEN_NX2_DLSS_JITTER (it is made for jittered input too).
     const bool jittered_backend =
@@ -4996,7 +4996,7 @@ void RasterizerVulkan::FlushWork() {
     static constexpr bool android = false;
 #endif // __ANDROID__
     const bool native = gpu_memory->UsesNativeTiling();
-    // The 128-draw native budget is tuned for MoltenVK; desktop Vulkan takes the legacy 4096 (#161).
+    // The 128-draw native budget is tuned for MoltenVK; desktop Vulkan takes the legacy 4096.
     const u32 default_native_budget =
         (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::SubmitBudget) && !device.IsMoltenVK()) ? 4096U
                                                                 : SubmissionPolicy::DefaultNativeBudget;

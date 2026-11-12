@@ -47,7 +47,7 @@ enum class LoadCallbackStage {
 };
 using DiskResourceLoadCallback = std::function<void(LoadCallbackStage, std::size_t, std::size_t)>;
 
-/// EXP33 (zortos293/Lichii#337): set while the query cache signals the fence that writes a
+/// EXP33: set while the query cache signals the fence that writes a
 /// fence-flagged report, so the fence manager makes that fence and delays its operation even when
 /// it is empty (FenceManager::SignalFence).
 inline thread_local bool g_signaling_query_report_fence = false;
@@ -141,7 +141,7 @@ public:
         return false;
     }
 
-    /// Switch 2, list draws (nx2_list_draw.h, zortos293/Lichii#1336): whether DrawIndirect draws
+    /// Switch 2, list draws (nx2_list_draw.h): whether DrawIndirect draws
     /// from an array draw's two GPU-written list words (IndirectParams::list_words) without
     /// reading them back.
     [[nodiscard]] virtual bool Nx2ListDrawSupported() const {

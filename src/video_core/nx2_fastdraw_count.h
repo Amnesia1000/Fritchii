@@ -22,14 +22,14 @@
 #include "common/logging.h"
 
 /// EDEN_NX2_FASTDRAW_COUNT=1 (read once, by the first Maxwell3D): counts the draws that could
-/// take zortos293/Lichii#1161's delta ("fast") draw path, which keeps the previous draw's
+/// take the original delta ("fast") draw path, which keeps the previous draw's
 /// pipeline, image views and samplers when only light state changed in between. Counting only:
 /// no draw is resolved or skipped differently. While on, each pipeline also keeps its last draw
-/// (GraphicsPipeline::KeptLastDraw, Fable's port plan step D2; EXP106 does that alone) for #1161's
+/// (GraphicsPipeline::KeptLastDraw, Fable's port plan step D2; EXP106 does that alone) for the original
 /// two checks that need it (sampled images to prepare, computed handles changed). Off, each site
 /// costs one test of g_on.
 ///
-/// The rules are #1161's (nx2_fast_draw.h, Maxwell3D::IsFastDrawParameter and its lists,
+/// The rules are the ported change's (nx2_fast_draw.h, Maxwell3D::IsFastDrawParameter and its lists,
 /// RasterizerVulkan::TakeReusableDraw / DeltaStillHolds / NoteResolvedDraw), with its later
 /// commits 792e12a47b (vertex_id_base, vertex formats, report operands and neutral methods are
 /// light; the write list widens instead of ending reuse; handle words compared one by one),
@@ -38,7 +38,7 @@
 /// mask, cleared at each draw, so a draw that state ended shows every group that ended it, not
 /// only the last one (Fable plan, fable_answer_backthread_threads.md section 8).
 ///
-/// Step D1 of Fable's port plan (section 10.2) adds the five breaks our tree needs and #1161's
+/// Step D1 of Fable's port plan (section 10.2) adds the five breaks our tree needs and the original
 /// doesn't raise (writes applied over the pools, the pools written through an alias, EXP43
 /// relocations, channel switches, and the render pass serial counted always), marks as neutral
 /// the deferred calls whose effects now break where they act (channel bind, fence releases,
@@ -62,7 +62,7 @@ enum class Reason : u8 {
     HleMacro,
     // Fable's port plan step D1 (fable_answer_backthread_threads.md 10.2, the five breaks):
     PoolWrite, ///< A guest CPU (or cached GPU) write applied over the TIC or TSC pool
-    PoolAlias, ///< A stream write through another GPU address onto the pools (#1161)
+    PoolAlias, ///< A stream write through another GPU address onto the pools
     Relocate,  ///< EXP43 moved an image (TextureCache::RelocateImage)
     Channel,   ///< The rasterizer switched to another channel
     Count,
@@ -76,13 +76,13 @@ inline constexpr std::array<const char*, static_cast<size_t>(Reason::Count)> rea
 };
 
 /// The groups a draw's breaks are sorted into, a bit each. Register and method breaks go by
-/// method (Maxwell3D::FastDrawCountGroup); with #1161's lists most of the first three are light
+/// method (Maxwell3D::FastDrawCountGroup); with the original lists most of the first three are light
 /// and stay 0: the mask shows what is left.
 enum Group : u32 {
     VertexIdBase = 1U << 0,  ///< 0x446
     VertexLayout = 1U << 1,  ///< Vertex stream word 0 (enable, stride), attribute formats
     QueryMethods = 1U << 2,  ///< Counter reset, render enable, report operands, MME memory
-    ListOverflow = 1U << 3,  ///< The 16-range write list was widened (not a break in #1161)
+    ListOverflow = 1U << 3,  ///< The 16-range write list was widened (not a break in the original)
     RealState = 1U << 4,     ///< Any other 3D register or method
     OtherEngine = 1U << 5,
     Invalidation = 1U << 6,  ///< Texture cache writes and deletions, rescales, shader removals,
@@ -139,7 +139,7 @@ inline void Init() {
         g_on = value != nullptr && value[0] == '1';
         if (g_on) {
             LOG_INFO(HW_GPU, "Delta draw count on (EDEN_NX2_FASTDRAW_COUNT=1): counting only, "
-                             "zortos293/Lichii#1161 rules");
+                             "ported rules");
         }
         return true;
     }();
@@ -151,7 +151,7 @@ inline void Init() {
 }
 
 /// A Call entry's flag on the split's ring (bit 7, free for Call entries): a deferred call that
-/// can't change what a draw resolves to (#1161's GpuSplit::FastDrawNeutral). Set only when on.
+/// can't change what a draw resolves to (the original GpuSplit::FastDrawNeutral). Set only when on.
 inline constexpr u64 NeutralCallBit = u64{1} << 7;
 [[nodiscard]] inline u64 Neutral() {
     return g_on ? NeutralCallBit : 0;
@@ -218,7 +218,7 @@ inline void NoteCallSite(u64 thunk) {
     sites.overflow.fetch_add(1, std::memory_order_relaxed);
 }
 
-/// The device memory a GPU range maps to (#1161's DeviceSpans): a write through another GPU
+/// The device memory a GPU range maps to (the original DeviceSpans): a write through another GPU
 /// address that maps the same device memory changes the range too.
 class DeviceSpans {
 public:
@@ -357,7 +357,7 @@ struct Delta {
     std::array<u64, MaxWrites> write_begin{};
     std::array<u64, MaxWrites> write_end{};
     u32 num_writes{};
-    bool widened{}; ///< The list was full and a range widened (#1161: no uniform keeps then)
+    bool widened{}; ///< The list was full and a range widened (the original: no uniform keeps then)
 
     [[nodiscard]] bool Empty() const {
         return num_writes == 0 && (binds[0] | binds[1] | binds[2] | binds[3] | binds[4]) == 0;
@@ -386,7 +386,7 @@ struct Delta {
 
 inline Delta g_delta;
 
-/// #1161's AppendRange: extends a range the new one touches or overlaps, else appends it; a full
+/// The original AppendRange: extends a range the new one touches or overlaps, else appends it; a full
 /// list widens the range that grows least (true then).
 inline bool AppendRange(std::array<u64, Delta::MaxWrites>& begins,
                         std::array<u64, Delta::MaxWrites>& ends, u32& count, u64 begin, u64 end) {
@@ -429,7 +429,7 @@ inline void NoteBind(size_t stage, u32 slot) {
     }
 }
 
-/// EXP107 (#1161 13d9320cfb), counted when on: inline constant buffer writes left out of the
+/// EXP107, counted when on: inline constant buffer writes left out of the
 /// delta because memory held their words already, and those of them not written at all.
 inline std::atomic<u64> g_unchanged_writes{};
 inline std::atomic<u64> g_skipped_writes{};
@@ -440,7 +440,7 @@ inline void NoteConstantData(u64 begin, u64 end) {
     delta.widened |= AppendRange(delta.write_begin, delta.write_end, delta.num_writes, begin, end);
 }
 
-/// What a pipeline's handles are read from (#1161's GraphicsPipeline handle masks), built on its
+/// What a pipeline's handles are read from (the original GraphicsPipeline handle masks), built on its
 /// first counted draw.
 struct PipelineInfo {
     static constexpr size_t NumStages = 5;
@@ -461,7 +461,7 @@ struct PipelineInfo {
     }
 };
 
-/// Why a draw would be resolved in full (#1161's FullDraw).
+/// Why a draw would be resolved in full (the original FullDraw).
 enum class Full : u8 {
     NoCandidate,
     Kind,
@@ -481,7 +481,7 @@ enum class Full : u8 {
     Count,
 };
 
-/// Why a draw can't be the previous draw of a delta draw (#1161's Ineligible).
+/// Why a draw can't be the previous draw of a delta draw (the original Ineligible).
 enum class Ineligible : u8 {
     Indirect,
     Mesh,
@@ -497,7 +497,7 @@ enum class Ineligible : u8 {
     Count,
 };
 
-/// The previous eligible draw (#1161's ReusableDraw).
+/// The previous eligible draw (the original ReusableDraw).
 struct PreviousDraw {
     const void* pipeline{};
     const void* maxwell3d{};

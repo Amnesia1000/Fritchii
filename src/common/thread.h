@@ -47,8 +47,8 @@ public:
     bool WaitFor(const std::chrono::nanoseconds time);
 
     /// Like WaitFor, but always blocks in the OS. On Windows, WaitFor keeps the thread running
-    /// in a hardware wait; this sleeps on a high-resolution waitable timer instead (from
-    /// zortos293/Lichii; only Tegra::Nx2PendingWake uses it, under EDEN_NX2_GPU_WAKE).
+    /// in a hardware wait; this sleeps on a high-resolution waitable timer instead (ported;
+    /// only Tegra::Nx2PendingWake uses it, under EDEN_NX2_GPU_WAKE).
     bool SleepFor(const std::chrono::nanoseconds time);
 
     template<class Clock, class Duration>
@@ -175,7 +175,7 @@ constexpr std::chrono::nanoseconds NextPollWindow(std::chrono::nanoseconds poll,
 /// user-mode wait on an address (MWAITX on AMD, UMWAIT on Intel) the thread waits in it: a store to
 /// the flag's cache line ends the wait within a few hundred nanoseconds, and the core neither
 /// issues instructions nor enters the OS meanwhile. Other CPUs yield until then.
-/// (zortos293/Lichii#1373; only Tegra::Nx2PendingWake uses it, under EDEN_NX2_GPU_WAKE.)
+/// (only Tegra::Nx2PendingWake uses it, under EDEN_NX2_GPU_WAKE.)
 bool WaitForFlag(const std::atomic<bool>& flag, std::chrono::steady_clock::time_point deadline);
 
 } // namespace Common

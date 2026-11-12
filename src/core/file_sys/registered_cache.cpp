@@ -1468,7 +1468,7 @@ void ExternalContentProvider::ProcessNSP(const VirtualFile& file) {
         return;
     }
 
-    // Reject solid NCZ (.nsz without -B): Eden only supports block-compressed NCZ.
+    // Reject solid NCZ (.nsz without -B): Fritchii only supports block-compressed NCZ.
     if (!ContainerIsFullyBlockCompressed(nsp)) {
         LOG_DEBUG(Service_FS, "Skipping solid-compressed container: {}", file->GetName());
         return;

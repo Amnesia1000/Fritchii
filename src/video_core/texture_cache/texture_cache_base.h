@@ -445,7 +445,7 @@ public:
     /// Moves the image to the young end of the LRU (EDEN_NX2_EXP90: once a frame per image).
     void TouchImageLru(ImageBase& image) noexcept;
 
-    /// EDEN_NX2_EXP32 (texture binding memo, after zortos293/Lichii#717's BINDMEMO): what the
+    /// EDEN_NX2_EXP32 (texture binding memo, after the original BINDMEMO): what the
     /// graphics texture bindings of a draw are resolved against. With the same state, the same
     /// handles and the same guest TIC/TSC entries, VisitImageView and GetSamplerId give the same
     /// view and sampler ids: a view leaves a descriptor only through RemoveImageViewReferences
@@ -492,7 +492,7 @@ public:
     /// What preparing the view does once its contents are clean: the image's LRU touch.
     void TouchTextureMemoView(ImageViewId view) noexcept;
 
-    /// EDEN_NX2_TEX_BANK_GEN (Hookshot (NotRexed/Hookshot) 11d2c1a's per-stage texture bank
+    /// EDEN_NX2_TEX_BANK_GEN (the recomp's per-stage texture bank
     /// generations, research idea 2): a device page whose writes texture bank memos must see
     /// (pages holding texture handle words and the TIC/TSC entries draws read). A watched page
     /// counts as cached (UpdatePagesCachedCount), so guest CPU writes to it trap and mark
@@ -538,7 +538,7 @@ public:
     /// resolves the full way (FillImageViews loops for the same reason).
     [[nodiscard]] bool PrepareTexBankViews(std::span<const ImageViewId> views);
 
-    /// EXP87 (port of zortos293/Lichii#1447): what besides its handle words selects the textures
+    /// EXP87 (ported): what besides its handle words selects the textures
     /// a graphics draw samples now.
     [[nodiscard]] DrawTemplateContext GraphicsTextureContext(u64 owner) const noexcept;
 
@@ -560,7 +560,7 @@ public:
                                                            : 0;
     }
 
-    /// Delta draws (D2; zortos293/Lichii#1161's SampledViewsChange, sampled_views.h): whether
+    /// Delta draws (D2; the original SampledViewsChange, sampled_views.h): whether
     /// resolving `views` again would change one of their images, which a delta draw keeping them
     /// does not prepare. That is PrepareImage's RefreshContents (the image is CpuModified) or
     /// SynchronizeAliases (an alias was modified after it). Views of the null image and buffer
@@ -1204,7 +1204,7 @@ private:
     Tegra::MaxwellDeviceMemoryManager& device_memory;
     std::deque<TextureCacheGPUMap> gpu_page_table_storage;
 
-    /// EDEN_NX2_EXP31 (RT_FAST, zortos293/Lichii#717): whether UpdateRenderTargets' clean path
+    /// EDEN_NX2_EXP31 (RT_FAST): whether UpdateRenderTargets' clean path
     /// would change nothing: the same targets were prepared for a draw, no image was modified,
     /// created or deleted since, in the same frame, and none needs an upload, alias sync or
     /// sparse backing.
@@ -1232,7 +1232,7 @@ private:
     u64 rt_fast_mismatches = 0;
     /// Changes whenever a prepared render target could need preparing again: images or views
     /// created, deleted, rescaled or CPU modified, descriptor pools moved, and every frame
-    /// (zortos293/Lichii#717's bindings_epoch).
+    /// (the original bindings_epoch).
     u64 bindings_epoch = 1;
     /// See TextureMemoState::epoch (EXP32). 0 never matches.
     u64 texture_memo_epoch = 1;
@@ -1272,7 +1272,7 @@ private:
     [[nodiscard]] bool IsAllStale(DAddr addr, size_t size) const;
     void UpdateStaleTracking(u64 run_begin, u64 run_pages, s32 delta);
     // Off here unless EDEN_NX2_TC_SKIP_STALE=1: no gain at an Ocarina of Time Hyrule Field save
-    // (fresh launches, walking 1% low 40.2 off vs 36.5 on); #463 measured +20% in Castle Town.
+    // (fresh launches, walking 1% low 40.2 off vs 36.5 on); the original measured +20% in Castle Town.
     bool tc_skip_stale_boot{[] {
         const char* value = std::getenv("EDEN_NX2_TC_SKIP_STALE");
         return value != nullptr && value[0] == '1';

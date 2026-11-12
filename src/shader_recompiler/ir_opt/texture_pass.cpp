@@ -186,7 +186,7 @@ u32 DynamicSampledTextureCap(const Info& info, const HostTranslateInfo& host_inf
     auto const sampled_limit = (std::max)(1U, std::min(host_info.max_per_stage_descriptor_sampled_images,
                                                        host_info.max_descriptor_set_sampled_images));
     // A texture is a combined image sampler: it takes a sampler as well as a sampled image.
-    // EDEN_NX2_LIGHT_TABLE_ARRAYS off: no sampler limit, as before the port of #1485.
+    // EDEN_NX2_LIGHT_TABLE_ARRAYS off: no sampler limit, as before the port.
     auto const sampler_limit = host_info.support_handle_table_arrays
                                    ? (std::max)(1U, std::min(host_info.max_per_stage_descriptor_samplers,
                                                              host_info.max_descriptor_set_samplers))
@@ -421,7 +421,7 @@ u32 DynamicSampledTextureArrayCount(
     const std::unordered_map<u32, TextureType>& handle_program_types,
     const HostTranslateInfo& host_info) {
     if (!host_info.support_handle_table_arrays) {
-        // EDEN_NX2_LIGHT_TABLE_ARRAYS off: instructions, as before the port of #1485.
+        // EDEN_NX2_LIGHT_TABLE_ARRAYS off: instructions, as before the port.
         u32 count{};
         for (const TextureInst& inst : to_replace) {
             const auto flags{inst.inst->Flags<IR::TextureInstInfo>()};
@@ -712,7 +712,7 @@ thread_local int g_handle_depth{};
 // give the address of another read, qualifies, and one word per program.
 thread_local bool g_handle_index_allowed{};
 // EDEN_NX2_LIGHT_TABLE_ARRAYS (HostTranslateInfo::support_handle_table_arrays) for the pass on
-// this thread: off, handle programs are built exactly as before the port of #1485.
+// this thread: off, handle programs are built exactly as before the port.
 thread_local bool g_table_arrays{};
 thread_local IR::Value g_handle_index{};
 thread_local int g_handle_load_depth{};
@@ -1443,12 +1443,12 @@ TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst, const H
                                 legacy->secondary_index, legacy->secondary_offset, chain);
                 }
                 // The word the search found may be the pointer a load reads the handle through
-                // (a light table's address): that binds no texture (zortos293/Lichii#1523). Only
+                // (a light table's address): that binds no texture. Only
                 // with EDEN_NX2_LIGHT_TABLE_ARRAYS, whose fallback took the pointer word: off,
-                // the translation stays as before the port of #1485.
+                // the translation stays as before the port.
                 const bool pointer_word{host_info.support_handle_table_arrays &&
                                         !ReachesOutsideLoads(inst.Arg(0), legacy_inst, block)};
-                // EDEN_NX2_LIGHT_TABLE_ARRAYS (zortos293/Lichii#1485): the fallback's texture is likely
+                // EDEN_NX2_LIGHT_TABLE_ARRAYS: the fallback's texture is likely
                 // the wrong one, say so (a few times) with the switch on.
                 static std::atomic<int> warnings{};
                 if (host_info.support_handle_table_arrays &&
@@ -2011,7 +2011,7 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
     }
 }
 
-// LimitSampledTextureArrays as before the port of zortos293/Lichii#1485, for
+// LimitSampledTextureArrays as before the port, for
 // EDEN_NX2_LIGHT_TABLE_ARRAYS off: the same programs, so the same SPIR-V.
 static void LimitSampledTextureArraysLegacy(IR::Program& program, const HostTranslateInfo& host_info) {
     auto& info = program.info;

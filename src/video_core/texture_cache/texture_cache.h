@@ -497,7 +497,7 @@ void TextureCache<P>::TickFrame() {
         }
     }
     if constexpr (HAS_DEVICE_MEMORY_INFO) {
-        // Switch 2 titles (native tiling) stream far more texture data than Eden's thresholds
+        // Switch 2 titles (native tiling) stream far more texture data than the original thresholds
         // were tuned for: title 1's attract loop alone keeps ~5.3 GB resident, so the collector
         // sat in aggressive mode evicting decoded ASTC (and decoding it again). Total use is
         // measured from the driver, so collect only near the device budget instead.
@@ -512,7 +512,7 @@ void TextureCache<P>::TickFrame() {
         }
         // Follow the driver's budget (re-read now and then): it shrinks when other programs use
         // VRAM (another game: 7.0 -> 6.4 GB), and collecting only past it means the driver pages
-        // textures out. It is also the room to use: Eden's device memory figure is capped near
+        // textures out. It is also the room to use: the emulator's device memory figure is capped near
         // 7 GB, which on a 12 GB card (11.2 GB budget) kept title 1 evicting textures with 3 GB
         // unused. Both thresholds stay under it with a margin (1/8 of it, at most 1 GiB): past it
         // allocations fail and images end up unbacked (garbage textures), and Windows shrinks the
@@ -557,7 +557,7 @@ void TextureCache<P>::TickFrame() {
                     }
                     critical_memory =
                         budget - (std::min)(margin + pressure_margin + slack_margin, budget / 2);
-                    // zortos293/Lichii#1210: the device's budget is not all the room there is.
+                    // Ported fix: the device's budget is not all the room there is.
                     // Windows charges device memory to the system's commit limit, so the cache
                     // may also hold no more than the device memory in use plus the commit still
                     // free, less 2 GiB (HostCriticalMemory; an OoT out-of-memory crash on a PC
@@ -641,7 +641,7 @@ void TextureCache<P>::TickFrame() {
             total_used_memory -= (std::min)(total_used_memory, runtime.PooledImageBytes());
         }
     }
-    // EDEN_NX2_MEM_TRACE=1 (from zortos293/Lichii#951): every 2 s, what the cache holds next to
+    // EDEN_NX2_MEM_TRACE=1 (ported): every 2 s, what the cache holds next to
     // what the process and the driver report (memory climbs).
     static const bool mem_trace = std::getenv("EDEN_NX2_MEM_TRACE") != nullptr;
     if (const auto now = std::chrono::steady_clock::now();
@@ -777,7 +777,7 @@ void TextureCache<P>::TickFrame() {
             channel_storage[c].graphics_image_table.Invalidate();
             channel_storage[c].compute_image_table.Invalidate();
         }
-        // Texture memos of their null views would skip that read (EXP32, zortos293/Lichii#717).
+        // Texture memos of their null views would skip that read (EXP32).
         ++texture_memo_epoch;
     }
     sentenced_images.Tick();
@@ -1291,7 +1291,7 @@ void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compu
         if (blacklist) {
             has_blacklisted = false;
         }
-        // EDEN_NX2_LIGHT_TABLE_ARRAYS (zortos293/Lichii#1485) only: an element repeating the one
+        // EDEN_NX2_LIGHT_TABLE_ARRAYS only: an element repeating the one
         // before (a handle table holding one shadow map in many elements, say) is the same view:
         // visiting it again only prepares it again. Not once this pass has deleted image views
         // (scaling an image down below does): that view may have gone with them.
@@ -1463,7 +1463,7 @@ template <class P>
 bool TextureCache<P>::TakeTextureMemoEntry(u32 tic_handle, u32 tsc_handle, ImageViewId view,
                                            SamplerId sampler, TextureMemoEntry& entry) const {
     // The entry must be in the table as this draw read it, and still give the resolved id
-    // (as zortos293/Lichii#717's RecordBinding checks).
+    // (as the original RecordBinding checks).
     const auto read_entry = [](const auto& table, u32 index, auto id) {
         return !table.invalidated && index / 64 < table.read_descriptors.size() &&
                index < table.descriptors.size() &&
@@ -1857,7 +1857,7 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
         flags[Dirty::RenderTargetControl] = true;
     }
     if (!flags[Dirty::RenderTargets]) {
-        // EDEN_NX2_EXP31 (RT_FAST, zortos293/Lichii#717): bit 1 = skip the loop below while it
+        // EDEN_NX2_EXP31 (RT_FAST): bit 1 = skip the loop below while it
         // would change nothing, bit 2 = run it anyway and check that it changed nothing.
         const int rt_fast = VideoCore::Nx2Debug::Experiment(31);
         bool verify = false;
@@ -2426,7 +2426,7 @@ bool TextureCache<P>::BlitImage(const Tegra::Engines::Fermi2D::Surface& dst,
                                 const Tegra::Engines::Fermi2D::Config& copy) {
     // A deferred clear parked before this copy has to land before it: realizing it afterwards
     // starts its clear pass after the copy and wipes what the copy wrote. That is what made
-    // Ocarina of Time draw its terrain layer over the scene (#101): the game clears the
+    // Ocarina of Time draw its terrain layer over the scene: the game clears the
     // occlusion depth, blits the scene depth over it, and reads it back during the layer draw.
     // GetFramebufferId only flushes when it creates a framebuffer, so the bug starts on the
     // second frame. Texture cache copies bypass render passes and keep stream order here.
@@ -4863,8 +4863,8 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         return false;
     };
     // Whether the copies from overlaps the GPU wrote each write a part of the image and together
-    // all of it, for the layered and mipmapped 2D images overwritten_by_copies leaves out (from
-    // zortos293/Lichii#1079): Mario Kart World renders each layer of its shadow map and colour
+    // all of it, for the layered and mipmapped 2D images overwritten_by_copies leaves out (ported):
+    // Mario Kart World renders each layer of its shadow map and colour
     // arrays as a target of its own, then samples the array, and the upload under those copies
     // took 13-31 ms an array. Only at 1x, where the copies below are unscaled.
     const auto overwritten_by_layer_copies = [&] {
@@ -4894,19 +4894,19 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         }
         return std::ranges::all_of(written, [](u8 whole) { return whole != 0; });
     };
-    // EDEN_NX2_RT_DEPTH_NOUPLOAD (live, bits, 0 = off, the default; from Skitchii (skolvolt/Lichii)
-    // 9fb0cdd0a4, texture_cache.h nup_skip_depth_upload): a new depth/stencil image starts without
+    // EDEN_NX2_RT_DEPTH_NOUPLOAD (live, bits, 0 = off, the default; ported from its
+    // texture_cache.h nup_skip_depth_upload): a new depth/stencil image starts without
     // the upload from guest memory. Guest memory never receives the GPU's depth (no write-back),
     // so the upload only copies stale bytes; Ocarina of Time makes ~2.5 such targets a frame
     // (shadow cascades sized anew each frame, 259x259 ... 888x888 D32). Not exact: what the
     // image holds where the game neither clears nor draws is undefined instead of stale guest
-    // bytes (Skitchii 8fcd85d90b names shadow popping with it), so it comes after the exact
+    // bytes (the original names shadow popping with it), so it comes after the exact
     // rules: a clear the target follows through IsFullClear (EXP56) and copies that write it
     // whole (EXP8 bit 2) decide first.
     // Bit 1 = a render target lookup's new target with nothing to join (no older image to copy).
     // Bit 2 = a new image whose every join copy comes from a GPU-written image (sampled shadow
     // maps made for a descriptor shaped unlike the target); texels the copies miss are undefined.
-    // 3 = Skitchii as shipped.
+    // 3 = as the original shipped.
     const auto depth_noupload = [&] {
         const int mode = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_rt_depth_noupload,
                                                           "EDEN_NX2_RT_DEPTH_NOUPLOAD");

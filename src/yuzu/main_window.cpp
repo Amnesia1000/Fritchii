@@ -28,7 +28,7 @@
 #include "qt_common/discord/discord.h"
 #include "ui_main.h"
 
-// Other Yuzu stuff //
+// Other frontend stuff //
 #include "debugger/console.h"
 #include "debugger/controller.h"
 
@@ -368,7 +368,7 @@ QString GetTranslatedGameIconSize(size_t index) {
 } // namespace
 
 #ifndef _WIN32
-// TODO(crueter): carboxyl does this, is it needed in qml?
+// TODO: carboxyl does this, is it needed in qml?
 inline static bool isDarkMode() {
 #if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
     const auto scheme = QGuiApplication::styleHints()->colorScheme();
@@ -517,7 +517,7 @@ MainWindow::MainWindow(bool has_broken_vulkan)
 
     // Set a screensaver inhibition reason string. Currently passed to DBus by SDL and visible to
     // the user through their desktop environment.
-    //: TRANSLATORS: This string is shown to the user to explain why yuzu needs to prevent the
+    //: TRANSLATORS: This string is shown to the user to explain why Fritchii needs to prevent the
     //: computer from sleeping
     QByteArray wakelock_reason = tr("Running a game").toUtf8();
     SDL_SetHint(SDL_HINT_SCREENSAVER_INHIBIT_ACTIVITY_NAME, wakelock_reason.data());
@@ -2068,9 +2068,7 @@ bool MainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletPar
             ShowErrorWithExportLog(
                 tr("An error occurred initializing the video core."),
                 tr("This is usually caused by outdated GPU drivers. "
-                   "Please see the log for more details. See: "
-                   "<a href='https://git.eden-emu.dev/eden-emu/eden/src/branch/master/docs/user/HowToAccessLogs.md'>"
-                   "How to access log files</a>."));
+                   "Please see the log for more details."));
             break;
         default:
             if (result > Core::SystemResultStatus::ErrorLoader) {
@@ -2166,7 +2164,7 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     if (close_pending) {
         return;
     }
-    LOG_INFO(Frontend, "Lichii starting...");
+    LOG_INFO(Frontend, "Fritchii starting...");
 
     if (params.program_id == 0 ||
         params.program_id > static_cast<u64>(Service::AM::AppletProgramId::MaxProgramId)) {
@@ -2209,7 +2207,7 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
                    "Vulkan, 1x resolution, GPU Fast, asynchronous shaders, BC3, conservative VRAM, "
                    "reactive flushing off, FIFO Relaxed VSync, handheld mode, ScaleForce, and "
                    "FXAA.\n\n"
-                   "They apply to Mario Kart World until Lichii is closed. Your saved settings "
+                   "They apply to Mario Kart World until Fritchii is closed. Your saved settings "
                    "are not changed."),
                 QMessageBox::Yes | QMessageBox::No, QMessageBox::No) == QMessageBox::Yes;
         LOG_INFO(Config, "MKW recommended settings accepted: {}", use_recommended_mkw_settings);
@@ -2610,7 +2608,7 @@ void MainWindow::ShutdownGame() {
         return;
     }
 
-    // TODO(crueter): make this common as well (frontend_common?)
+    // TODO: make this common as well (frontend_common?)
     play_time_manager->Stop();
     OnShutdownBegin();
     OnEmulationStopTimeExpired();
@@ -2671,7 +2669,7 @@ void MainWindow::OnGameListLoadFile(QString game_path, u64 program_id) {
     BootGame(game_path, params);
 }
 
-// TODO(crueter): Common profile selector
+// TODO: Common profile selector
 void MainWindow::OnGameListOpenFolder(u64 program_id, GameListOpenTarget target,
                                       const std::string& game_path) {
     std::filesystem::path path;
@@ -2813,7 +2811,7 @@ static bool RomFSRawCopy(size_t total_size, size_t& read_size, QProgressDialog& 
     return true;
 }
 
-// TODO(crueter): All this can be transfered to qt_common
+// TODO: All this can be transfered to qt_common
 // Aldoe I need to decide re: message boxes for QML
 // translations_common? strings_common? qt_strings? who knows
 void MainWindow::OnGameListRemoveInstalledEntry(u64 program_id,
@@ -2836,7 +2834,7 @@ void MainWindow::OnGameListRemoveInstalledEntry(u64 program_id,
         return;
     }
 
-    // TODO(crueter): move this to QtCommon (populate async?)
+    // TODO: move this to QtCommon (populate async?)
     switch (type) {
     case QtCommon::Game::InstalledEntryType::Game:
         QtCommon::Game::RemoveBaseContent(program_id, type);
@@ -3057,7 +3055,7 @@ void MainWindow::OnGameListCreateShortcut(u64 program_id, const std::string& gam
 }
 
 void MainWindow::OnGameListOpenDirectory(const QString& directory) {
-    // TODO(crueter): QtCommon
+    // TODO: QtCommon
     std::filesystem::path fs_path;
     if (directory == QStringLiteral("SDMC")) {
         fs_path =
@@ -3619,7 +3617,7 @@ void MainWindow::OnOpenModsPage() {
 }
 
 void MainWindow::OnOpenUserHandbook() {
-    OpenURL(QUrl(QStringLiteral("https://git.eden-emu.dev/eden-emu/eden/src/branch/master/docs/user/README.md")));
+    OpenURL(QUrl(QStringLiteral("https://github.com/Frizti/Fritchii#readme")));
 }
 
 void MainWindow::ToggleFullscreen() {
@@ -4232,7 +4230,7 @@ void MainWindow::OnLoadAmiibo() {
     LoadAmiibo(filename);
 }
 
-// TODO(crueter): does this need to be ported to QML?
+// TODO: does this need to be ported to QML?
 bool MainWindow::question(QWidget* parent, const QString& title, const QString& text,
                           QMessageBox::StandardButtons buttons,
                           QMessageBox::StandardButton defaultButton) {
@@ -4336,7 +4334,7 @@ void MainWindow::OnInstallFirmwareFromZIP() {
     OnCheckFirmwareDecryption();
 }
 
-// TODO(crueter): QtCommon this: game list populate can be a signal?
+// TODO: QtCommon this: game list populate can be a signal?
 void MainWindow::OnInstallDecryptionKeys() {
     // Don't do this while emulation is running.
     if (QtCommon::emu_thread != nullptr && QtCommon::emu_thread->IsRunning())
@@ -5546,7 +5544,7 @@ void MainWindow::UpdateStatusButtons() {
     UpdateVolumeUI();
 }
 
-// TODO(crueter): Use this for game list stuff
+// TODO: Use this for game list stuff
 void MainWindow::UpdateUISettings() {
     if (!ui->action_Fullscreen->isChecked()) {
         UISettings::values.geometry = saveGeometry();
@@ -5656,7 +5654,7 @@ void MainWindow::OnCheckGraphicsBackend() {
         UISettings::values.gui_force_x11.SetValue(true);
         GraphicsBackend::SetForceX11(true);
         QMessageBox::information(this, tr("Restart Required"),
-                                 tr("Restart Lichii to apply the X11 backend."));
+                                 tr("Restart Fritchii to apply the X11 backend."));
     }
 }
 #endif
@@ -5781,8 +5779,8 @@ bool MainWindow::ConfirmClose() {
         UISettings::values.confirm_before_stopping.GetValue() == ConfirmStop::Ask_Based_On_Game)
         return true;
 
-    const auto text = tr("Are you sure you want to close Lichii?");
-    return question(this, tr("Lichii"), text);
+    const auto text = tr("Are you sure you want to close Fritchii?");
+    return question(this, tr("Fritchii"), text);
 }
 
 void MainWindow::closeEvent(QCloseEvent* event) {
@@ -5888,7 +5886,7 @@ bool MainWindow::ConfirmChangeGame() {
 
     // Use custom question to link controller navigation
     return question(
-        this, tr("Lichii"),
+        this, tr("Fritchii"),
         tr("Are you sure you want to stop the emulation? Any unsaved progress will be lost."),
         QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes);
 }
@@ -5897,10 +5895,10 @@ bool MainWindow::ConfirmForceLockedExit() {
     if (QtCommon::emu_thread == nullptr)
         return true;
 
-    const auto text = tr("The currently running application has requested Lichii to not exit.\n\n"
+    const auto text = tr("The currently running application has requested Fritchii to not exit.\n\n"
                          "Would you like to bypass this and exit anyway?");
 
-    return question(this, tr("Lichii"), text);
+    return question(this, tr("Fritchii"), text);
 }
 
 void MainWindow::RequestGameExit() {

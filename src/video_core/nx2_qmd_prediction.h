@@ -18,7 +18,7 @@
 /// GpuSplit::queued_releases and no acquire is treated as met: counting only.
 /// 1: predicted at every signal that reads a QMD, from guest memory (the first gate run).
 /// 2: the front runs its own copy of the QMD scheduler (KeplerCompute's QMD mirror, from
-///    zortos293/Lichii#717), so each release is predicted once, where the back makes it, from
+///    ported), so each release is predicted once, where the back makes it, from
 ///    the inline QMD words the front sent; max releases (bit 19) are lower bounds, reductions
 ///    (bit 26) and compute report reductions are recorded for the reduction lower bound
 ///    (fable_answer_6 6c), which is counted too.

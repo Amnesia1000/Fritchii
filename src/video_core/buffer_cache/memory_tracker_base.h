@@ -97,7 +97,7 @@ public:
         });
     }
 
-    /// EXP108 (zortos293/Lichii#1436): as MarkRegionAsCpuModified, for data the GPU's own engines
+    /// EXP108: as MarkRegionAsCpuModified, for data the GPU's own engines
     /// wrote to guest memory (inline constant buffer data): the pages stay tracked, as no guest CPU
     /// write needs to be let through, and the next upload has nothing to track again.
     void MarkRegionAsWrittenTracked(VAddr dirty_cpu_addr, u64 query_size) {
@@ -203,7 +203,7 @@ public:
     }
 
     /// ForEachUploadRange without the clean words (word_manager.h) at either end of each manager's
-    /// part of the range: they have nothing to find or change. A per-word form of PR #161's skip.
+    /// part of the range: they have nothing to find or change. A per-word form of a ported skip.
     /// Returns false when every word was clean (nothing walked at all).
     template <typename Func>
     bool ForEachDirtyUploadRange(VAddr query_cpu_range, u64 query_size, Func&& func) {
@@ -327,7 +327,7 @@ public:
         return true;
     }
 
-    /// EXP88 (zortos293/Lichii#1441 d18b636a69): whether a page of the range may ever have left
+    /// EXP88: whether a page of the range may ever have left
     /// the CPU-modified state: an upload walk asked for it, an unmark, a cached write, a GPU or
     /// Preflushable mark. Pages without any are CPU-modified and untracked as their managers
     /// are made, so a CPU mark there changes nothing. Bits never clear. Any thread, no lock.

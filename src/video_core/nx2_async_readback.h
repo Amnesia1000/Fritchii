@@ -11,13 +11,13 @@
 #include "common/logging.h"
 #include "common/nx2_hitch.h"
 
-// EDEN_NX2_EXP49, async read-back (port of zortos293/Lichii#1028's core, 0b83798bf6): a guest CPU
+// EDEN_NX2_EXP49, async read-back (a port of the original's core): a guest CPU
 // read of GPU-written buffer memory (GPU::OnCPURead) has the GPU thread record and submit the
 // downloads and go on. The reading thread waits for that submission and writes the bytes to guest
 // memory itself (BufferCache::FinishReadDownloads). Before, the GPU thread waited for the host
 // GPU (Scheduler::Finish) with the buffer cache's lock held, and the reader waited for it.
 //
-// Not ported: #1028's early downloads (pages read after each GPU write downloaded right behind the
+// Not ported: the original's early downloads (pages read after each GPU write downloaded right behind the
 // write), its EDEN_NX2_READ_CHECK verify mode and the macro DMA read changes.
 namespace VideoCore::AsyncReadback {
 

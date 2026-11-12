@@ -1613,7 +1613,7 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
 
         UNREACHABLE();
     };
-    // EDEN_NX2_FASTDRAW_COUNT (#1161): HLE programs write registers directly, without the 3D
+    // EDEN_NX2_FASTDRAW_COUNT: HLE programs write registers directly, without the 3D
     // engine's breaks, so a cached macro ends delta draw reuse before and after it runs.
     const auto count_break = [method] {
         if (VideoCommon::Nx2FastDrawCount::g_on) [[unlikely]] {

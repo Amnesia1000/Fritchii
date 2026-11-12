@@ -64,7 +64,7 @@ public:
                         std::optional<u32> subreport = std::nullopt) override {
         auto new_id = BuildQuery(has_timestamp, address, static_cast<u64>(value));
         // The value is kept here too: with EXP28 & 1 the sync can come after fences that freed
-        // the slot, which may hold another release by then (zortos293/Lichii#717).
+        // the slot, which may hold another release by then.
         pending_sync.push_back(PendingSync{
             .id = new_id,
             .address = address,
@@ -122,7 +122,7 @@ private:
         bool has_timestamp;
     };
 
-    /// Syncs that waited past a fence (EXP28 & 1, zortos293/Lichii#717 SyncWrites): the values
+    /// Syncs that waited past a fence (EXP28 & 1, the original's SyncWrites): the values
     /// as reported, newest first, one per address (one copy command must not write a range
     /// twice); a slot's flags count only while it still holds that release.
     void SyncDeferredWrites(std::vector<SyncValuesStruct>& sync_values) {
@@ -346,7 +346,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         return std::make_pair<u64, u32>(cur_addr >> Core::DEVICE_PAGEBITS,
                                         static_cast<u32>(cur_addr & Core::DEVICE_PAGEMASK));
     };
-    // EXP33 (zortos293/Lichii#337): a fence-flagged report stays registered until its fence runs
+    // EXP33: a fence-flagged report stays registered until its fence runs
     // (as Balanced already does), and its fence is made and waited for even when empty
     // (g_signaling_query_report_fence). Both halves: the fence alone, with the query freed at
     // once, left a stale operation behind (three channels waiting forever on a semaphore).
@@ -358,10 +358,10 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                                       !Settings::IsGPUFenceBehaviorAccurate()) &&
                            is_fence;
     // The report's operation, small enough for std::function to hold without allocating (a report
-    // per draw allocated one each, zortos293/Lichii#1161): at most 48 bytes and a nothrow move,
+    // per draw allocated one each, as a ported change found): at most 48 bytes and a nothrow move,
     // or MSVC's std::function allocates whatever the size. Built only once the report is issued.
     // It owes the report's completion, counted for Nx2AsyncReportsSettled (SEM_FAST) and
-    // FlushQueryResults' own-report wait (EXP30, zortos293/Lichii#559): completed on every way
+    // FlushQueryResults' own-report wait (EXP30): completed on every way
     // out of the operation, written or discarded, and when the operation is dropped without
     // running (fences discarded when emulation stops), or the slot stays unequal and a later wait
     // on it never ends. A copy or move takes the debt from its source: exactly one completes it.
@@ -875,7 +875,7 @@ bool QueryCacheBase<Traits>::SemiFlushQueryDirty(QueryCacheBase<Traits>::QueryLo
 
 template <typename Traits>
 void QueryCacheBase<Traits>::FinishReads(DAddr address, size_t size) {
-    // EDEN_NX2_EXP49 (zortos293/Lichii#1028): the query cache writes results to guest memory
+    // EDEN_NX2_EXP49: the query cache writes results to guest memory
     // through device memory pointers, not the memory manager: land a guest read's download still
     // on its way there first, or it writes the GPU's older copy over the result later.
     // SemiFlushQueryDirty asks with cache_mutex held, which no holder of the buffer cache's lock

@@ -80,7 +80,7 @@ constexpr inline SystemArchiveDescriptor GetSystemArchive(u64 title_id) {
 VirtualFile SynthesizeSystemArchive(const u64 title_id) {
     auto const desc = GetSystemArchive(title_id);
     if (desc.name == nullptr) {
-        // Not a system archive Eden knows (fmt throws on a null string, ending the process).
+        // Not a system archive the emulator knows (fmt throws on a null string, ending the process).
         // Switch 2 system data (ids 04...) is not installed with Switch 1 firmware, and titles
         // abort when it cannot be mounted (Nintendo Switch Sports Resort, 0400000000000849):
         // serve an empty archive. EDEN_NX2_EMPTY_SYSTEM_DATA=0 fails the request instead.

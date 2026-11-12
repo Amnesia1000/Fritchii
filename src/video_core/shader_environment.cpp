@@ -391,7 +391,7 @@ size_t GenericEnvironment::ReadSizeBytes() const noexcept {
 
 bool GenericEnvironment::CanBeSerialized() const noexcept {
     // A trap guard is checked against live constants on every dispatch (ComputeShader), so a
-    // cached pipeline is only used once its guard passes (zortos293/Lichii#192, SinCuri0).
+    // cached pipeline is only used once its guard passes (ported).
     return !has_unbound_instructions;
 }
 
@@ -1582,7 +1582,7 @@ bool FileEnvironment::AnswersHoldFor(Shader::Environment& live, const char** why
     }
     // Fritchii: the bound texture buffer is the constant buffer bindless handles are read from
     // (texture_pass), and compute programs take their workgroup and shared memory sizes from the
-    // environment; #896 leaves them to the key.
+    // environment; the original leaves them to the key.
     if (live.TextureBoundBuffer() != texture_bound) {
         return fail("bound texture buffer");
     }

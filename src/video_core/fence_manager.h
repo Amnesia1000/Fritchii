@@ -96,13 +96,13 @@ public:
         Nx2Profile::Scope profile_scope{Nx2Profile::Zone::Fence};
         // The accuracy can change while the game runs (settings dialog, Settings::UpdateGPUAccuracy
         // at each command list end): read once, every decision of this fence uses one value.
-        // EXP33 (zortos293/Lichii#337): a fence that writes a fence-flagged query report is never
+        // EXP33: a fence that writes a fence-flagged query report is never
         // skipped as empty, and its operation waits for the fence: a skipped fence runs its
         // operation at once, before the host GPU has run the work the report follows, and
         // Ocarina of Time then reads a wrong report (white flashes on leaves and walls at low GPU
         // accuracy). Only set by the query cache while EXP33 is on.
         const bool delay_fence = DelayFences() || VideoCore::g_signaling_query_report_fence;
-        // EDEN_NX2_EXP28 (zortos293/Lichii#717 FENCE_TRIM, FENCE_FOLD), one value per fence.
+        // EDEN_NX2_EXP28 (the original's FENCE_TRIM, FENCE_FOLD), one value per fence.
         const int fence_trims = VideoCore::Nx2Debug::Experiment(28);
         const bool trim = (fence_trims & 1) != 0;
         // EDEN_NX2_BACK_FENCE_STATS (fable52_answer_fences2 4): this fence's parts, timed.
@@ -582,7 +582,7 @@ private:
         }
     }
 
-    /// EDEN_NX2_EXP28 & 2 (zortos293/Lichii#717 FENCE_FOLD): a fence with nothing to wait for on
+    /// EDEN_NX2_EXP28 & 2 (the original's FENCE_FOLD): a fence with nothing to wait for on
     /// the host GPU (no downloads, no query results) carries only queued work: the query cache's
     /// slot cleanup, operations, and with delayed fences its callback (a syncpoint's host
     /// increment). The fencing thread runs that work as soon as every fence before it is
@@ -798,7 +798,7 @@ private:
 
     bool SkipEmptyFence(bool trim) {
         if constexpr (requires { query_cache.HasPendingFenceWork(); }) {
-            // EDEN_NX2_EXP28 & 1 (zortos293/Lichii#717 FENCE_TRIM): payload releases (QMD
+            // EDEN_NX2_EXP28 & 1 (the original's FENCE_TRIM): payload releases (QMD
             // releases, ~4,300 a second in Ocarina) wrote guest memory at once anyway; their host
             // buffer syncs (a render pass end and two barriers each) go with the next fence made
             // or wait for idle.

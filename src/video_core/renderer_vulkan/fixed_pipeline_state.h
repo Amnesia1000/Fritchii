@@ -267,8 +267,8 @@ struct FixedPipelineState {
     /// attachments. Clears the flag.
     void RefreshBlending(Tegra::Engines::Maxwell3D& maxwell3d);
 
-    /// attachments[index] as RefreshBlending builds it from `regs` (zortos293/Lichii#717,
-    /// the-cashman's BlendingFor).
+    /// attachments[index] as RefreshBlending builds it from `regs` (the
+    /// ported BlendingFor).
     [[nodiscard]] BlendingAttachment BlendingFor(const Maxwell& regs, size_t index) const;
 
     /// Whether the attachments equal what RefreshBlending would build from `regs` (and, with

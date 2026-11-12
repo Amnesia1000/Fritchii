@@ -1031,7 +1031,7 @@ bool Event::WaitFor(const std::chrono::nanoseconds time) {
 }
 #endif
 
-// WaitForFlag and Event::SleepFor: from zortos293/Lichii (#1373, #1376).
+// WaitForFlag and Event::SleepFor: ported changes.
 #if defined(ARCHITECTURE_x86_64) && defined(__clang__)
 __attribute__((target("waitpkg,mwaitx")))
 #endif
@@ -1103,7 +1103,7 @@ void Event::WakeSleeper() {
     SetEvent(sleep_wake);
 }
 
-// Timer and wake event as in Eglantine #538 (a51de161ed, pretend7979): a high-resolution timer
+// Timer and wake event as in a ported change: a high-resolution timer
 // can expire between timer-resolution ticks.
 bool Event::SleepFor(const std::chrono::nanoseconds time) {
     struct Timer {

@@ -472,7 +472,7 @@ struct System::Impl {
             cheat_engine->Initialize();
         }
 
-        // EDEN_NX2_PRECOMPILE: the game's files, for assembling a precompile recipe (#895) on the
+        // EDEN_NX2_PRECOMPILE: the game's files, for assembling a precompile recipe on the
         // pipeline cache's preparation thread. The RomFS as the process reads it, update included.
         if (VideoCommon::Nx2Precompile::Mode() != 0) {
             const u64 process_id = process->GetHandle()->GetProcessId();

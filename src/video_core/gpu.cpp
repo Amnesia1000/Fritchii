@@ -219,7 +219,7 @@ struct GPU::Impl {
 
     /// Tick pending requests within the GPU.
     void TickWork() {
-        // EDEN_NX2_EXP29 & 2 (zortos293/Lichii#717 EDEN_NX2_OPT_TICKWORK): TickWork runs for
+        // EDEN_NX2_EXP29 & 2 (the original's EDEN_NX2_OPT_TICKWORK): TickWork runs for
         // every draw, clear and dispatch; check without the mutex whether a request is queued
         // at all. A request queued after this check runs at the next TickWork, as one queued
         // just after the loop below empties the queue does; whoever queued it and then had this
@@ -359,7 +359,7 @@ struct GPU::Impl {
         namespace AsyncReadback = VideoCore::AsyncReadback;
         const u64 request = AsyncReadback::Now();
         const u64 area_size = raster_area.end_address - raster_area.start_address;
-        // EDEN_NX2_EXP49 (live; zortos293/Lichii#1028): the GPU thread submits the read's
+        // EDEN_NX2_EXP49 (live): the GPU thread submits the read's
         // downloads without waiting for the host GPU, and this thread waits for them. An area an
         // earlier read's downloads cover (in_flight) only waits; with the switch off it flushes
         // as before, which lands or downloads those bytes again.

@@ -9,12 +9,12 @@
 #include <array>
 #include "common/common_types.h"
 
-// This is to consolidate system-wide constants that are used by multiple components of yuzu.
+// This is to consolidate system-wide constants that are used by multiple components of the emulator.
 // This is especially to prevent the case of something in frontend duplicating a constexpr array or
 // directly including some service header for the sole purpose of data.
 namespace Core::Constants {
 
-// ACC Service - An Eden Profile Picture JPEG used as user icon in absentia of real one.
+// ACC Service - A default Profile Picture JPEG used as user icon in absentia of real one.
 extern const std::array<u8, 5099> ACCOUNT_BACKUP_JPEG;
 
 } // namespace Core::Constants

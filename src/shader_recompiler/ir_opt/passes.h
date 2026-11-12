@@ -67,7 +67,7 @@ struct JoinedDescriptors {
 /// JoinStorageInfo), or at their own bindings when it gives none
 JoinedDescriptors JoinTextureInfo(Info& base, Info& source,
                                   std::span<const u32> storage_bindings = {});
-/// JoinTextureInfo as before the port of zortos293/Lichii#1485 (descriptors only, the handle
+/// JoinTextureInfo as before the port (descriptors only, the handle
 /// programs of source not joined), for EDEN_NX2_LIGHT_TABLE_ARRAYS off
 void JoinTextureInfoLegacy(Info& base, Info& source);
 /// Adds the storage buffers of source to base, at most limit in all, returning the binding each

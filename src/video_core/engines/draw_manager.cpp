@@ -105,7 +105,7 @@ void Maxwell3D::DrawManager::DrawDeferred(Maxwell3D& maxwell3d, bool loop_contin
     if (draw_state.draw_mode != DrawMode::Instance || draw_state.instance_count == 0) {
         if (first_folded) [[unlikely]] {
             // The loop a folded first instance began never came: draw it on its own after all
-            // (Skitchii's fallback; the front folds only when the loop follows).
+            // (the ported fallback; the front folds only when the loop follows).
             first_folded = false;
             draw_state.draw_mode = DrawMode::General;
             DrawEnd(maxwell3d);
@@ -271,7 +271,7 @@ void Maxwell3D::DrawManager::DrawEnd(Maxwell3D& maxwell3d, u32 instance_count, b
     const GPUVAddr list_draw_address = std::exchange(draw_state.list_draw_address, 0);
     const u64 list_keep_id = std::exchange(draw_state.list_keep_id, 0);
     if (fold_first_instance) [[unlikely]] {
-        // EDEN_NX2_FOLD_INSTANCE (from Skitchii (skolvolt/Lichii) draw_manager.cpp DrawEnd).
+        // EDEN_NX2_FOLD_INSTANCE (ported, its draw_manager.cpp DrawEnd).
         fold_first_instance = false;
         if (draw_state.draw_mode == DrawMode::General && !force_draw &&
             draw_state.instance_count == 0) {

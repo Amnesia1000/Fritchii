@@ -127,7 +127,7 @@ public:
     bool HasUncommittedFlushes() const;
 
     /// Whether a new fence has queries to flush or host writes to sync for this cache.
-    /// `ignore_payload_sync` (EDEN_NX2_EXP28 & 1, zortos293/Lichii#717 FENCE_TRIM): payload
+    /// `ignore_payload_sync` (EDEN_NX2_EXP28 & 1, the original's FENCE_TRIM): payload
     /// releases' host buffer syncs don't count; they wait for a later fence or wait for idle.
     bool HasPendingFenceWork(bool ignore_payload_sync = false) const;
 

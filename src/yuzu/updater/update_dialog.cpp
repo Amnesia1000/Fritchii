@@ -168,7 +168,7 @@ UpdateDialog::UpdateDialog(const Common::Net::Release& release,
         return;
     }
 
-    // TODO(crueter): Find a way to set default
+    // TODO: Find a way to set default
     const auto assets = release.GetPlatformAssets();
 
     if (assets.empty()) {
@@ -373,7 +373,7 @@ bool UpdateDialog::DownloadTo(const QString& filename) {
         return false;
     }
 
-    // TODO(crueter): Move to net.cpp
+    // TODO: Move to net.cpp
     constexpr std::size_t timeout_seconds = 15;
 
     std::unique_ptr<httplib::Client> client = std::make_unique<httplib::Client>(m_asset.url);
@@ -381,7 +381,7 @@ bool UpdateDialog::DownloadTo(const QString& filename) {
     client->set_read_timeout(timeout_seconds);
     client->set_write_timeout(timeout_seconds);
     client->set_follow_location(true);
-    client->set_default_headers({{"User-Agent", "Lichii"}});
+    client->set_default_headers({{"User-Agent", "Fritchii"}});
 
 #ifdef YUZU_BUNDLED_OPENSSL
     client->load_ca_cert_store(kCert, sizeof(kCert));
@@ -550,7 +550,7 @@ bool FinishPendingSwap(QWidget* window) {
     }
     const UpdateInstaller::Lock lock{install_dir / UpdateInstaller::LockName};
     if (!lock.Held()) {
-        // Another Lichii window is installing or rolling back right now.
+        // Another Fritchii window is installing or rolling back right now.
         return false;
     }
     switch (UpdateInstaller::Recover(install_dir, ec)) {

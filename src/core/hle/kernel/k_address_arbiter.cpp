@@ -140,7 +140,7 @@ private:
     KAddressArbiter::ThreadTree* m_tree{};
 };
 
-/// EDEN_NX2_ARB_SPIN (live, VideoCore::Nx2Debug::g_arb_spin; off by default, #641 uses 8):
+/// EDEN_NX2_ARB_SPIN (live, VideoCore::Nx2Debug::g_arb_spin; off by default, the ported change uses 8):
 /// microseconds a thread about to wait on an address first watches the word. Capped at 1 ms.
 s64 ArbSpinMicroseconds() {
     const int value =
@@ -156,7 +156,7 @@ void SpinPause() {
 #endif
 }
 
-/// From zortos293/Lichii#641. Guest job systems hand work between threads through these waits
+/// A ported change. Guest job systems hand work between threads through these waits
 /// many times a frame, and the signal often comes a few microseconds later. Before the thread
 /// sleeps (scheduler lock, context switch, then the signaler's EndWait, interrupt and switch
 /// back), it watches the word briefly without any lock. If the word stops satisfying the wait,

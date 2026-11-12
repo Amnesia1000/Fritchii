@@ -27,7 +27,7 @@ struct MemoryInfo {
 /// only Windows fills them in).
 /// Commit the system can still hand out, in bytes: its commit limit (RAM plus the page files)
 /// minus what is committed. No value where the host reports no such limit (anything but Windows).
-/// From zortos293/Lichii#1210.
+/// Ported.
 [[nodiscard]] std::optional<u64> GetSystemCommitRoom();
 
 struct ProcessMemoryUsage {

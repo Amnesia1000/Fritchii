@@ -16,7 +16,7 @@
 
 // EXPERIMENT (not for nx2): GPU back-thread optimizations for Ocarina of Time.
 // split_overlap is quarantined. Frizti build: the options reviewed as exact rewrites are on by
-// default; those that change timing or reuse ideas reverted with zortos293/Lichii#161 (its
+// default; those that change timing or reuse ideas reverted with a ported change (its
 // slab of wrong geometry in Kokiri Forest) are off until EDEN_NX2_PERF_ON=<name>,... turns them
 // on: frames_ahead, clean_words, index_rebind, submit_budget, fence_flush, fragment_barrier,
 // front_sleep, async_pipelines, and bounds (this tree keeps its own range cache).

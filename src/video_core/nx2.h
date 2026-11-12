@@ -22,7 +22,7 @@
 namespace Tegra {
 
 // Set once a Switch 2 (Ampere, NVN2) driver is talking to the GPU. Its command streams use
-// Ampere classes and the Turing+ macro ISA, which Eden's Maxwell engines don't implement.
+// Ampere classes and the Turing+ macro ISA, which the emulator's Maxwell engines don't implement.
 inline std::atomic<bool> g_nx2_ampere{false};
 
 // Device pages the GPU has written through the buffer cache (shader stores, copies), ever. Title 1
@@ -111,8 +111,7 @@ inline std::array<std::atomic<u32>, Nx2AsyncReportSlots> g_nx2_async_reports_com
     return true;
 }
 
-// Bumped after every completed report; threads in Nx2WaitAsyncReportsSettled wait on it
-// (zortos293/Lichii#559).
+// Bumped after every completed report; threads in Nx2WaitAsyncReportsSettled wait on it.
 inline std::atomic<u32> g_nx2_async_reports_generation{};
 inline std::atomic<u32> g_nx2_async_reports_waiters{};
 
@@ -211,7 +210,7 @@ inline std::atomic<u64> g_nx2_guest_writes_collected{};
 /// mutexes stayed taken (EDEN_NX2_EXP60).
 inline std::atomic<u64> g_nx2_guest_reads_handed{};
 
-/// Whether any page of the range may have been written by the GPU (zortos293/Lichii#463).
+/// Whether any page of the range may have been written by the GPU.
 [[nodiscard]] inline bool Nx2MayBeGpuWritten(u64 device_address, u64 size) {
     if (size == 0) {
         return false;
@@ -466,7 +465,7 @@ inline bool Nx2SparseUnwritten(u64 gpu_address, u64 size) {
 }
 
 // GPU semaphore writes as they land in guest memory: EXP13=2 marks the release records they
-// belong to (#717's landed counter, per record: VideoCommon::QmdPrediction::NoteLanded, which
+// belong to (the original landed counter, per record: VideoCommon::QmdPrediction::NoteLanded, which
 // sets the hook once it records). The landing sites call it BEFORE they write the word, so a
 // front that reads the new word also finds the record marked.
 enum class Nx2Landing : u32 {
@@ -490,12 +489,12 @@ inline void Nx2NoteLanded(u64 device_address, u32 value, Nx2Landing kind) {
     }
 }
 
-/// EDEN_NX2_GPU_WAKE (port of zortos293/Lichii#1376): wakes the GPU thread while it waits for
+/// EDEN_NX2_GPU_WAKE (ported): wakes the GPU thread while it waits for
 /// suspended channels (gpu_thread.cpp) on what lets a channel go on: a new command
 /// (ThreadManager::PushCommand) and a GPU write that latches a waiter (Nx2SemaphoreWaiters::
 /// OnWrite). A guest CPU store to a semaphore goes straight to memory through fastmem and sends
 /// nothing: the waiting thread watches the words instead (Nx2SemaphoreWaiters::WordStored).
-/// #1376's wake on a GPU tick a command list copy waits for is not ported: this tree has no such
+/// The original's wake on a GPU tick a command list copy waits for is not ported: this tree has no such
 /// waits. While the switch is off (`enabled` false) Notify returns at once.
 class Nx2PendingWake {
 public:
@@ -553,7 +552,7 @@ private:
 };
 
 /// Channels suspended on a semaphore acquire. A console channel polls and sees every release;
-/// Eden writes releases in bursts when fences signal and resumes waiters only between command
+/// The emulator writes releases in bursts when fences signal and resumes waiters only between command
 /// lists, so an acquire-equal could miss its value. Writes latch the waiters they satisfy.
 class Nx2SemaphoreWaiters {
 public:

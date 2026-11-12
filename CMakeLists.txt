@@ -238,7 +238,7 @@ if(MSVC)
         $<$<COMPILE_LANGUAGE:C,CXX>:$<$<CONFIG:MinSizeRel>:/${libflag}>>)
 endif()
 
-# TODO(crueter): Cleanup, each dep that has a bundled option should allow to choose between bundled, external, system
+# TODO: Cleanup, each dep that has a bundled option should allow to choose between bundled, external, system
 option(ENABLE_CUBEB "Enables the cubeb audio backend" ON)
 
 set(EXT_DEFAULT OFF)
@@ -435,7 +435,7 @@ set(BOOST_INCLUDE_LIBRARIES algorithm icl pool container heap asio headers proce
 AddJsonPackage(boost)
 
 # really annoying thing where boost::headers doesn't work with cpm
-# TODO(crueter) investigate
+# TODO investigate
 set(BOOST_NO_HEADERS ${Boost_ADDED})
 
 if (Boost_ADDED)
@@ -565,7 +565,7 @@ message(STATUS "Platform Libraries: ${PLATFORM_LIBRARIES}")
 add_subdirectory(externals)
 
 # pass targets from externals
-# TODO(crueter): CPMUtil Propagate func?
+# TODO: CPMUtil Propagate func?
 find_package(enet)
 
 if (ARCHITECTURE_x86 OR ARCHITECTURE_x86_64)
@@ -680,7 +680,7 @@ if (NOT YUZU_STATIC_ROOM AND NOT (YUZU_USE_BUNDLED_FFMPEG OR YUZU_USE_EXTERNAL_F
     # Use system installed FFmpeg
     find_package(FFmpeg REQUIRED QUIET COMPONENTS ${FFmpeg_COMPONENTS})
 
-    # TODO(crueter): Version
+    # TODO: Version
     set_property(GLOBAL APPEND PROPERTY CPM_PACKAGE_NAMES FFmpeg)
     set_property(GLOBAL APPEND PROPERTY CPM_PACKAGE_SHAS "unknown (system)")
     set_property(GLOBAL APPEND PROPERTY CPM_PACKAGE_URLS "https://github.com/FFmpeg/FFmpeg")

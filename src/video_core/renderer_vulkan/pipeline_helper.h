@@ -452,7 +452,7 @@ public:
 /// has no depth comparison on this device (what the sample returns then differs between vendors)
 /// and it is an integer or block-compressed color texture, or its handle was read from memory (a
 /// handle program). A single-channel color texture with a cbuf handle may be one a game compares
-/// on purpose, and keeps its view. Only with EDEN_NX2_LIGHT_TABLE_ARRAYS (zortos293/Lichii#1485).
+/// on purpose, and keeps its view. Only with EDEN_NX2_LIGHT_TABLE_ARRAYS.
 [[nodiscard]] inline bool IsUncomparable(const ImageView& image_view, bool read_from_memory) {
     if (image_view.SupportsDepthComparison()) {
         return false;

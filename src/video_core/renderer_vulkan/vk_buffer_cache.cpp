@@ -597,7 +597,7 @@ void BufferCacheRuntime::WaitSubmittedTick(u64 tick, u64 writer) {
     }
     // The split's front waits for the GPU: the back runs meanwhile what the front sent, also the
     // entries since the front's last publish, which it does not see yet (fewer than 256 words;
-    // zortos293/Lichii#805 34656e8225).
+    // ported).
     if (auto& split = VideoCommon::GpuSplit::Get();
         split.Active() && !VideoCommon::GpuSplit::OnBackThread()) {
         split.Publish();
@@ -724,9 +724,9 @@ void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
     }
 
     scheduler.RequestOutsideRenderPassOperationContext();
-    // EDEN_NX2_EXP62 (live, 0 = off): zortos293/Lichii#1245's batched uploads. OoT records ~600
+    // EDEN_NX2_EXP62 (live, 0 = off): ported batched uploads. OoT records ~600
     // inline uploads a frame, each with two barriers; in-order ones share one command and one
-    // pair of barriers (#805's test: 55.9 -> 57.8 fps, GPU 8.2 -> 7.55 ms a frame).
+    // pair of barriers (the original test: 55.9 -> 57.8 fps, GPU 8.2 -> 7.55 ms a frame).
     if (barrier && VideoCore::Nx2Debug::Experiment(62) != 0 && src_buffer == staging_pool.StreamBuf() &&
         !vk_copies.empty()) {
         // Only in-order stream uploads share barriers. Dedicated staging buffers retain their
@@ -1029,7 +1029,7 @@ void BufferCacheRuntime::BindIndexBuffer(PrimitiveTopology topology, IndexFormat
         ReserveNullBuffer();
         vk_buffer = *null_buffer;
     }
-    // The same index buffer is still bound in this command buffer (PR #161): skip the rebind.
+    // The same index buffer is still bound in this command buffer: skip the rebind.
     if (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::IndexRebind) && !VideoCommon::Nx2Perf::Verify()) {
         const u64 epoch = scheduler.RecordingEpoch();
         if (bound_index_valid && vk_buffer == bound_index_buffer &&

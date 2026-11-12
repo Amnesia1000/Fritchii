@@ -676,7 +676,7 @@ TEST_CASE("MemoryTracker: FlushCachedWrites batching") {
     REQUIRE(rasterizer.Count() == WORD * 2 / PAGE - 3);
 }
 
-// zortos293/Lichii#1436 (EXP108).
+// A ported change (EXP108).
 TEST_CASE("MemoryTracker: engine writes leave their pages tracked", "[video_core]") {
     RasterizerInterface rasterizer;
     std::optional<MemoryTracker> memory_track(rasterizer);
@@ -743,7 +743,7 @@ TEST_CASE("DeviceMemoryManager: UpdatePagesCachedBatch basic") {
     SUCCEED("UpdatePagesCachedBatch executed without error");
 }
 
-// zortos293/Lichii#1161 f5902c6c68 (EXP109), ours deferring only untracking.
+// A ported change (EXP109), ours deferring only untracking.
 TEST_CASE("MemoryTracker: Deferred page caching applies in order", "[video_core]") {
     RasterizerInterface rasterizer;
     std::optional<MemoryTracker> memory_track(rasterizer);

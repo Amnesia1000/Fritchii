@@ -116,7 +116,7 @@ struct DrawTemplate {
 };
 
 /// Delta draws (Fable's port plan, fable_answer_backthread_threads.md 10, step D2; the delta draw
-/// path of zortos293/Lichii#1161): a pipeline's previous draw, in EXP87's DrawTemplate shape but
+/// path of the ported change): a pipeline's previous draw, in EXP87's DrawTemplate shape but
 /// in one slot per pipeline, with no table and no key. ConfigureImpl fills it while
 /// EDEN_NX2_FASTDRAW_COUNT or EXP106 is on, at the end of each Configure. From the template it uses
 /// `handles` (one raw handle word per view, in resolve order: both words of a two-word handle
@@ -125,7 +125,7 @@ struct DrawTemplate {
 /// `rescaling`, `scale_epoch` and `host_serial`; `textures`, `hash` and `last_use` stay empty.
 template <typename Descriptor, typename View, size_t NumStages, size_t RescalingWords>
 struct KeptDraw : DrawTemplate<Descriptor, NumStages, RescalingWords> {
-    /// A handle a handle program computed at the draw (zortos's ComputedHandle, one per element).
+    /// A handle a handle program computed at the draw (the original ComputedHandle, one per element).
     struct ComputedHandle {
         u32 stage;
         u32 program;  ///< Index into the stage's Shader::Info::handle_programs

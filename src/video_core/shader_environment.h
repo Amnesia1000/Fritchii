@@ -374,7 +374,7 @@ public:
     void Dump(u64 pipeline_hash, u64 shader_hash) override;
 
     /// Whether translating this recorded environment gives what translating `live`, the same
-    /// program as the game draws it now, would (zortos293/Lichii#896; the same code is assumed:
+    /// program as the game draws it now, would (ported; the same code is assumed:
     /// the pipeline keys match). Translation is decided by the answers to its questions, so each
     /// recorded question is asked of `live`: a constant buffer value must be the same, unless it
     /// was only used as a texture handle (then the texture it names now must have the same type

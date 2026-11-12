@@ -59,7 +59,7 @@ UserDataMigrator::UserDataMigrator(QMainWindow* main_window) {
     if (!FrontendCommon::NeedsLegacyProfileImport()) {
         return;
     }
-    // Fritchii imports on its own; zortos's choice dialog stays behind a switch for support.
+    // Fritchii imports on its own; the original choice dialog stays behind a switch for support.
     if (qEnvironmentVariableIntValue("EDEN_NX2_IMPORT_PROMPT") == 0) {
         AutoImport(main_window);
         return;
@@ -75,7 +75,7 @@ UserDataMigrator::UserDataMigrator(QMainWindow* main_window) {
                 QMessageBox::Retry | QMessageBox::Close, QMessageBox::Retry);
             if (answer != QMessageBox::Retry) {
                 throw std::runtime_error(
-                    "Import recovery was postponed. Relaunch Lichii to retry.");
+                    "Import recovery was postponed. Relaunch Fritchii to retry.");
             }
             Migration::Recover(state_dir);
         }
@@ -143,11 +143,11 @@ void UserDataMigrator::ShowMigrationPrompt(QMainWindow* main_window) {
                      [=](bool linked) { clear_shaders->setEnabled(!linked); });
     update_cache_default();
     migration_prompt.setText(
-        QObject::tr("Import an existing emulator profile into Lichii?\n"
+        QObject::tr("Import an existing emulator profile into Fritchii?\n"
                     "Copy keeps the original profile unchanged and is recommended.\n"
                     "Move retains a recovery backup and requires space for a full copy.\n"
                     "Link shares settings and saves with the source emulator.\n"
-                    "Existing Lichii data is kept in backup directories, not merged or deleted.\n\n"
+                    "Existing Fritchii data is kept in backup directories, not merged or deleted.\n\n"
                     "Close the source emulator, then choose its profile below.\n"
                     "Close this window to decide on the next launch."));
     migration_prompt.addButton(QObject::tr("Import"));
@@ -158,7 +158,7 @@ void UserDataMigrator::ShowMigrationPrompt(QMainWindow* main_window) {
     QAbstractButton* button = migration_prompt.clickedButton();
 
     if (button == nullptr) {
-        throw std::runtime_error("Import was postponed. Relaunch Lichii to choose a profile.");
+        throw std::runtime_error("Import was postponed. Relaunch Fritchii to choose a profile.");
     }
     if (button == fresh) {
         Common::FS::ProfileMigration::MarkFresh(FrontendCommon::ProfileImportStateDirectory());
@@ -173,13 +173,13 @@ void UserDataMigrator::ShowMigrationPrompt(QMainWindow* main_window) {
     MigrateUserData(main_window, clear_shaders->isEnabled() && clear_shaders->isChecked(),
                     strategy);
     if (!migrated) {
-        throw std::runtime_error("Import failed. Relaunch Lichii to retry or recover.");
+        throw std::runtime_error("Import failed. Relaunch Fritchii to retry or recover.");
     }
 }
 
 void UserDataMigrator::ShowMigrationCancelledMessage(QMainWindow* main_window) {
     QMessageBox::information(main_window, QObject::tr("Migration"),
-                             QObject::tr("Lichii will use its own profile. Your old emulator "
+                             QObject::tr("Fritchii will use its own profile. Your old emulator "
                                          "data has not been changed."),
                              QMessageBox::Ok);
 }

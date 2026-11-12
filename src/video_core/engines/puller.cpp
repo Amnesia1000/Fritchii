@@ -44,7 +44,7 @@ namespace Tegra::Engines {
 
 namespace {
 
-/// EDEN_NX2_GPU_WAKE (zortos293/Lichii#1376): the acquire's word in host memory, which the GPU
+/// EDEN_NX2_GPU_WAKE: the acquire's word in host memory, which the GPU
 /// thread watches for the guest CPU's stores while it waits (Nx2SemaphoreWaiters::WordStored).
 /// Null while the switch is off, or where the word is not 4-byte aligned in host memory.
 u32* WatchedSemaphoreWord(MemoryManager& memory_manager, GPUVAddr address) {
@@ -140,7 +140,7 @@ void RunaheadOverlaidBoundary(DmaPusher& dma_pusher, const Puller::PendingAcquir
 // without draining the split, if nothing queued for the back may write the word (a release that
 // lowers it, a fence action) and no GPU work ever wrote its page (then no cache holds a newer word
 // than guest memory). It counts as a host sync for later GPU-written command lists, as the drain
-// did. Equal and mask acquires always drain. Ported from zortos293/Lichii#166 (e56b37fc0a), with
+// did. Equal and mask acquires always drain. Ported, with
 // the queued-writer check added.
 // A release still queued for the split's back meets the acquire: the back runs it before the
 // acquire's channel goes on, so the acquire needs no drain (GpuSplit::QueuedReleasePayload).
@@ -1378,8 +1378,8 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             return;
         }
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
-        // EDEN_NX2_ACQUIRE_TRIVIAL (boot, default on, 0 = off; from Skitchii 85b6e1f723,
-        // skolvolt/Lichii): an unsigned "at least 0" acquire is met whatever the word holds
+        // EDEN_NX2_ACQUIRE_TRIVIAL (boot, default on, 0 = off;
+        // ported): an unsigned "at least 0" acquire is met whatever the word holds
         // (Matches). OoT issues ~1,000 a second on the syncpoint shim (no guest memory behind
         // it), and the ones the cheap checks couldn't read drained the back.
         static const bool trivial = [] {
@@ -1470,7 +1470,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         if (readable) {
             // The word is current (no queued or GPU write the front knows of can change it):
             // the value comes from the CPU or another channel later, and the polls in
-            // CanResumeAcquire pick it up without a drain (from zortos293/Lichii#231).
+            // CanResumeAcquire pick it up without a drain (ported).
             VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireNoDrain, 1);
         } else {
             DrainBack();
@@ -1564,7 +1564,7 @@ void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
 
 void Puller::ProcessSemaphoreAcquire(DmaPusher& dma_pusher) {
     DrainBack();
-    // EDEN_NX2_FASTDRAW_COUNT (#1161): the CPU may rewrite what the next draws read once it sees
+    // EDEN_NX2_FASTDRAW_COUNT: the CPU may rewrite what the next draws read once it sees
     // the release this waits for.
     VideoCommon::Nx2FastDrawCount::Break(VideoCommon::Nx2FastDrawCount::Reason::Fence);
     u32 word = dma_pusher.memory_manager.Read<u32>(regs.semaphore_address.SemaphoreAddress());
@@ -1592,7 +1592,7 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
             rasterizer->Query(address, VideoCommon::QueryType::Payload,
                               VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
         });
-        // An acquire it meets while queued needs no drain (from zortos293/Lichii#179).
+        // An acquire it meets while queued needs no drain (ported).
         if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
             if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address)) {
                 split.NoteRelease(*device, address, payload);
@@ -1602,7 +1602,7 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
         return;
     }
     // Acquires: the result only feeds the warning below, so with the split the pending fences are
-    // released in order on the back instead of after a drain (from zortos293/Lichii#179). Later
+    // released in order on the back instead of after a drain (ported). Later
     // GPU-written list fetches and macro reads still wait for the work before it (NoteSync).
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
         OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); },
@@ -1801,7 +1801,7 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
     }
 }
 
-// EDEN_NX2_FASTDRAW_COUNT (#1161): any other engine's method ends delta draw reuse. With the
+// EDEN_NX2_FASTDRAW_COUNT: any other engine's method ends delta draw reuse. With the
 // split, GpuSplit::Execute counts them where the back runs them; here only without it.
 static void NoteFastDrawCountEngine(EngineID engine) {
     if (VideoCommon::Nx2FastDrawCount::g_on && engine != EngineID::MAXWELL_B) [[unlikely]] {

@@ -12,7 +12,7 @@ namespace Service::Mii {
 class StoreData;
 
 // This is nn::mii::Ver3StoreData
-// Based on citra HLE::Applets::MiiData and PretendoNetwork.
+// Based on earlier HLE MiiData work and PretendoNetwork's.
 // https://github.com/citra-emu/citra/blob/master/src/core/hle/applets/mii_selector.h#L48
 // https://github.com/PretendoNetwork/mii-js/blob/master/mii.js#L299
 

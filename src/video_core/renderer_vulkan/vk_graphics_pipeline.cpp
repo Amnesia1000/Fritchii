@@ -536,7 +536,7 @@ ConfigureFuncPtr ConfigureFunc(const std::array<bool, NUM_STAGES>& stages,
 std::atomic<std::chrono::nanoseconds::rep> hold_time_ns{};
 std::atomic<std::chrono::nanoseconds::rep> hold_time_total_ns{};
 
-// EXP87 draw templates on the drawing thread (port of zortos293/Lichii#1447), logged every 10 s
+// EXP87 draw templates on the drawing thread (ported), logged every 10 s
 // while EXP87 != 0.
 struct DrawTemplateStats {
     u64 hits{};
@@ -613,7 +613,7 @@ std::chrono::nanoseconds GraphicsPipeline::HoldTimeTotal() noexcept {
     return std::chrono::nanoseconds{hold_time_total_ns.load(std::memory_order::relaxed)};
 }
 
-// TODO(crueter): This is the worst-formatted code I have EVER seen
+// TODO: This is the worst-formatted code I have EVER seen
 GraphicsPipeline::GraphicsPipeline(
     Scheduler& scheduler_, BufferCache& buffer_cache_, TextureCache& texture_cache_,
     vk::PipelineCache& pipeline_cache_, VideoCore::ShaderNotify* shader_notify,
@@ -667,7 +667,7 @@ GraphicsPipeline::GraphicsPipeline(
         return info.stores_global_memory || any_written(info.storage_buffers_descriptors) ||
                any_written(info.image_descriptors) || any_written(info.image_buffer_descriptors);
     });
-    // EXP87 (zortos293/Lichii#1447's texture_memo_eligible).
+    // EXP87 (the original texture_memo_eligible).
     template_eligible = std::ranges::all_of(stage_infos, [](const Shader::Info& info) {
         return info.texture_buffer_descriptors.empty() && info.image_buffer_descriptors.empty() &&
                info.image_descriptors.empty() &&
@@ -1468,7 +1468,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
 
     const auto& regs{maxwell3d->regs};
     const bool via_header_index{regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
-    // EDEN_NX2_TEX_BANK_GEN (Hookshot (NotRexed/Hookshot) 11d2c1a, research idea 2): the
+    // EDEN_NX2_TEX_BANK_GEN (recomp research idea 2): the
     // textures of this pipeline's last draw, while the pages their handle words and TIC/TSC
     // entries were read from kept their generations (TexBankHit). Not with EXP32.
     // Not while CPU inner invalidation is skipped: constant buffer words then mark no page.
@@ -1502,10 +1502,10 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         const char* const value = std::getenv("EDEN_NX2_FRAME_DUMP_SAMPLED");
         return value && *value != '\0' && *value != '0';
     }();
-    // EXP87 (live; port of zortos293/Lichii#1447): the textures may come from a template an
+    // EXP87 (live; ported): the textures may come from a template an
     // earlier draw kept, also in an earlier frame, keyed on the handle words read below. Not with
     // EXP32 or TEX_BANK_GEN on (their own memos of the textures), for mesh pipelines, or while
-    // EDEN_NX2_FRAME_DUMP_SAMPLED records (#1447 left its memo off for that too). 2 = verify.
+    // EDEN_NX2_FRAME_DUMP_SAMPLED records (the original left its memo off for that too). 2 = verify.
     const int template_switch = VideoCore::Nx2Debug::Experiment(87);
     const bool use_template = template_switch != 0 && template_eligible && memo_switch == 0 &&
                               tex_bank_switch <= 0 && !record_sampled && !IsMeshPipeline();
@@ -1641,7 +1641,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         u32 texture{};
         for (const auto& desc : info.texture_descriptors) {
             if (desc.count > 1 && desc.handle_program != ~0U) {
-                // EDEN_NX2_LIGHT_TABLE_ARRAYS (zortos293/Lichii#1485): a table of handles the
+                // EDEN_NX2_LIGHT_TABLE_ARRAYS: a table of handles the
                 // shader indexes (one shadow map per light, say), read in one go; elements
                 // repeating a sampler share its lookup. Only translated with the switch on.
                 // Handle programs keep a pipeline out of EXP87's templates and TEX_BANK_GEN
@@ -2506,7 +2506,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         });
     }
     if (buffer_cache.runtime.ListDrawArgsRequested()) {
-        // List draws (nx2_list_draw.h, zortos293/Lichii#1336): outside the render pass, before the
+        // List draws (nx2_list_draw.h): outside the render pass, before the
         // draw's counters start.
         const auto [list_buffer, list_offset] = buffer_cache.GetDrawIndirectBuffer();
         buffer_cache.runtime.RecordListDrawArgs(list_buffer->Handle(), list_offset,

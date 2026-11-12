@@ -60,7 +60,7 @@ struct DownloadLandingState {
 /// Each side fences between its store (the landing, the collected write) and its load (the
 /// collected writes, the landing): either the download finds the write, or the write finds the
 /// landing. Downloads land under the buffer cache's lock, so one landing is published at a time.
-/// (zortos293/Lichii#805 4942eb8a39.)
+/// (Ported.)
 class DownloadLanding {
 public:
     explicit DownloadLanding(DAddr begin, DAddr end) noexcept {
