@@ -86,6 +86,40 @@ inline State& Get() {
     return state;
 }
 
+/// EXP104's pool (renderer_vulkan/vk_buffer_recycler.h). Counted whenever the pool is used,
+/// logged on the churn line.
+enum class PoolGroup : u32 {
+    Cache,   ///< the buffer cache's buffers
+    Staging, ///< staging buffers (upload, download, device local)
+    Count,
+};
+
+struct PoolCounters {
+    std::atomic<u64> taken{};    ///< creates served from the pool (no driver call)
+    std::atomic<u64> missed{};   ///< creates the pool could not serve (a driver call)
+    std::atomic<u64> returned{}; ///< buffers given to the pool instead of destroyed
+    std::atomic<u64> refused{};  ///< too large to pool: destroyed as before
+    std::atomic<u64> evicted{};  ///< left (age, byte cap, EXP104 off), to be destroyed
+};
+
+struct Pool {
+    std::array<PoolCounters, static_cast<size_t>(PoolGroup::Count)> group;
+    std::atomic<u64> destroyed_idle{}; ///< evicted buffers destroyed in the back's idle wait
+    std::atomic<u64> destroyed_here{}; ///< ...at the frame's end (no idle wait, or too many)
+    std::atomic<u64> held_bytes{};     ///< gauges, kept by the pool
+    std::atomic<u64> held_entries{};
+    std::atomic<u64> doomed_bytes{};   ///< evicted, not destroyed yet
+};
+
+inline Pool& GetPool() {
+    static Pool pool;
+    return pool;
+}
+
+inline void PoolAdd(std::atomic<u64>& counter, u64 value = 1) {
+    counter.fetch_add(value, std::memory_order_relaxed);
+}
+
 inline void BufferCreated(Created cause, u64 bytes) {
     if (!Enabled()) {
         return;
@@ -174,11 +208,43 @@ inline void TickFrame() {
     const std::string deleted_text = Detail::Family(s.deleted, deleted_names, seconds, deleted);
     const std::string staging_text = Detail::Family(s.staging, caller_names, seconds, staging);
     const u64 stream_full = s.staging_stream_full.exchange(0, std::memory_order_relaxed);
+
+    // EXP104: per group taken / missed / returned / refused / evicted per second.
+    Pool& pool = GetPool();
+    std::string pool_text;
+    static constexpr const char* group_names[] = {"cache", "staging"};
+    for (size_t i = 0; i < pool.group.size(); ++i) {
+        PoolCounters& group = pool.group[i];
+        const auto rate = [seconds](std::atomic<u64>& counter) {
+            return counter.exchange(0, std::memory_order_relaxed) / seconds;
+        };
+        const double taken = rate(group.taken);
+        const double missed = rate(group.missed);
+        const double returned = rate(group.returned);
+        const double refused = rate(group.refused);
+        const double evicted = rate(group.evicted);
+        pool_text += fmt::format("{} taken {:.1f}/s, missed {:.1f}/s, returned {:.1f}/s, "
+                                 "refused {:.1f}/s, evicted {:.1f}/s; ",
+                                 group_names[i], taken, missed, returned, refused, evicted);
+    }
+    const double destroyed_idle =
+        pool.destroyed_idle.exchange(0, std::memory_order_relaxed) / seconds;
+    const double destroyed_here =
+        pool.destroyed_here.exchange(0, std::memory_order_relaxed) / seconds;
+    pool_text += fmt::format(
+        "destroyed while idle {:.1f}/s, here {:.1f}/s; held {} buffers, {:.1f} MiB ({:.1f} MiB "
+        "waiting to be destroyed)",
+        destroyed_idle, destroyed_here, pool.held_entries.load(std::memory_order_relaxed),
+        pool.held_bytes.load(std::memory_order_relaxed) / 1048576.0,
+        pool.doomed_bytes.load(std::memory_order_relaxed) / 1048576.0);
+
     LOG_INFO(HW_GPU,
              "Buffer churn (5 s, {:.1f} s): created {} [{}]; deleted {} [{}] (no unmap path); "
-             "staging created {} [{}], {:.1f}/s of them as the stream ring was busy",
+             "staging created {} [{}], {:.1f}/s of them as the stream ring was busy; "
+             "pool (EXP104={}): {}",
              seconds, Detail::Rate(created, seconds), created_text, Detail::Rate(deleted, seconds),
-             deleted_text, Detail::Rate(staging, seconds), staging_text, stream_full / seconds);
+             deleted_text, Detail::Rate(staging, seconds), staging_text, stream_full / seconds,
+             VideoCore::Nx2Debug::Experiment(104), pool_text);
 }
 
 } // namespace VideoCommon::BufferChurnStats

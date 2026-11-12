@@ -564,6 +564,20 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// EXP103 (live, pauses, 0 = off): common WaitForFlag's fallback (no MONITORX/WAITPKG, as on
 /// this owner's PC; EXP79's idle wait uses it) polls with N pauses between checks instead of
 /// SwitchToThread (try 64).
+/// EXP104 (live, 0 = off, 1 = on with entries kept 180 frames, N > 1 = kept N frames; Fable's
+/// ideal pipeline design 8.3, step 3b; renderer_vulkan/vk_buffer_recycler.h): a pool of VkBuffers
+/// by size class for the buffer cache's buffers and the staging buffers. Buffer cache buffers
+/// are made at their size class (powers of two from 64 KiB, up to 32 MiB; sparse-compatible ones
+/// never) and, when the delayed destruction ring lets a Buffer go, its VkBuffer is pooled instead
+/// of destroyed; staging buffers the staging pool releases are pooled by memory usage and size.
+/// Creates take a pooled one of their class first. Exact: an entry carries the scheduler tick
+/// current when it was returned and is handed out only once the GPU passed it (IsFree); the
+/// cache clears a new Buffer's range as before. 256 MiB held at most (oldest go first); entries
+/// past their age, over the cap or left when the switch goes off are destroyed by the back in its
+/// split idle hook (EXP99's way), at the frame's end without the split or past 256 MiB waiting.
+/// Costs up to 2x memory per buffer cache buffer (the class rounding). Gate (Fable): real creates
+/// ("missed") near 0 a second in steady play, device memory flat after 10 minutes. With
+/// EDEN_NX2_BUFFER_CHURN_STATS=1 the "Buffer churn (5 s" line ends with the pool's counters.
 /// EXP101 (live, 0 = off, 1 = runs, 2 = cached page pointer + prefetch; fable52_answer_presenter): nvhost_gpu::SubmitGPFIFOImpl's pushbuffer
 /// snapshot reads runs of entries whose GPU addresses follow each other with one ReadBlockUnsafe
 /// instead of one per entry (OoT's presenting thread submits ~6,500 entries a frame; the loop is

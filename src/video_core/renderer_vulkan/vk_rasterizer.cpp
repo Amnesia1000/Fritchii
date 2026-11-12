@@ -553,6 +553,12 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
             if (VideoCore::Nx2Debug::Experiment(99) == 1 && VideoCommon::GpuSplit::InIdleWait()) {
                 rasterizer->texture_cache_runtime.DestroyIdlePooledImages(2);
             }
+            // EXP104: evicted pool buffers go the same way, whatever EXP104 is now (switching it
+            // off evicts everything). The allocator stays on the back's thread.
+            if (VideoCommon::GpuSplit::InIdleWait() &&
+                rasterizer->staging_pool.Recycler().HasDoomed()) {
+                rasterizer->staging_pool.Recycler().DestroyIdle(2);
+            }
         },
         this);
     VideoCommon::GpuSplit::Get().SetFenceQuietCheck(
