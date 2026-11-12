@@ -6,7 +6,11 @@
 
 #include <thread>
 
+#include <algorithm>
 #include <ranges>
+#include <fmt/format.h>
+#include "common/nx2_hitch.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -17,6 +21,10 @@ namespace Vulkan {
 constexpr u64 FENCE_RESERVE_SIZE = 8;
 
 MasterSemaphore::MasterSemaphore(const Device& device_) : device(device_) {
+    // Once every member is set, whichever way the constructor ends.
+    SCOPE_EXIT {
+        Common::Nx2Hitch::SetStallTickReporter(&MasterSemaphore::StallTicks, this);
+    };
     if (!device.HasTimelineSemaphore()) {
         static constexpr VkFenceCreateInfo fence_ci{
             .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .pNext = nullptr, .flags = 0};
@@ -56,7 +64,26 @@ MasterSemaphore::MasterSemaphore(const Device& device_) : device(device_) {
     });
 }
 
-MasterSemaphore::~MasterSemaphore() = default;
+MasterSemaphore::~MasterSemaphore() {
+    Common::Nx2Hitch::ClearStallTickReporter(this);
+}
+
+std::string MasterSemaphore::StallTicks(const void* self_) {
+    const auto* const self = static_cast<const MasterSemaphore*>(self_);
+    // What the card has reported, read now (the known tick only moves when someone refreshes).
+    const u64 known = self->gpu_tick.load(std::memory_order_acquire);
+    const u64 reported = self->semaphore ? (std::max)(self->semaphore.GetCounter(), known) : known;
+    const u64 submitted = self->stall_submitted_tick.load(std::memory_order_acquire);
+    const u64 submitted_ns = self->stall_submitted_ns.load(std::memory_order_relaxed);
+    const u64 now = Common::Nx2Hitch::NowNs();
+    return fmt::format("newest handed out {}, newest submitted {} ({:.1f} ms ago), newest "
+                       "reported {} (known {}), {} submitted and not reported",
+                       self->CurrentTick() - 1, submitted,
+                       submitted_ns != 0 && now > submitted_ns
+                           ? static_cast<double>(now - submitted_ns) / 1e6
+                           : 0.0,
+                       reported, known, submitted > reported ? submitted - reported : 0);
+}
 
 void MasterSemaphore::Refresh() {
     if (!semaphore) {
@@ -120,12 +147,16 @@ void MasterSemaphore::Wait(u64 tick) {
 VkResult MasterSemaphore::SubmitQueue(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,
                                       VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                                       u64 host_tick) {
-    if (semaphore) {
-        return SubmitQueueTimeline(cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore,
-                                   host_tick);
-    } else {
-        return SubmitQueueFence(cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, host_tick);
+    const VkResult result =
+        semaphore ? SubmitQueueTimeline(cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore,
+                                        host_tick)
+                  : SubmitQueueFence(cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore,
+                                     host_tick);
+    if (result == VK_SUCCESS && Common::Nx2Hitch::StallOn()) [[unlikely]] {
+        stall_submitted_ns.store(Common::Nx2Hitch::NowNs(), std::memory_order_relaxed);
+        stall_submitted_tick.store(host_tick, std::memory_order_release);
     }
+    return result;
 }
 
 static constexpr VkPipelineStageFlags wait_stage_mask = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |

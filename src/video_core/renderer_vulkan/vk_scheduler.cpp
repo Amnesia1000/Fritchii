@@ -25,6 +25,7 @@
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "common/settings.h"
 #include "common/dkb_cpu_trace.h"
+#include "common/nx2_hitch.h"
 #include "common/nx2_timeline.h"
 #include "common/thread.h"
 #include "video_core/gpu_logging/gpu_logging.h"
@@ -953,7 +954,9 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         // fable52_answer_stalls: Swapchain::Present holds submit_mutex across vkQueuePresentKHR,
         // so the wait for it is timed apart from the submit itself.
         const auto lock_start = std::chrono::steady_clock::now();
+        const auto lock_stall = Common::Nx2Hitch::StallEnter("worker: wait for the submit lock");
         std::scoped_lock lock{submit_mutex};
+        Common::Nx2Hitch::StallLeave(lock_stall);
         const auto submit_start = std::chrono::steady_clock::now();
         // Slow submits (residency work for new allocations?) with what was made since the last
         // one; images are counted only with EDEN_NX2_IMAGE_ALLOC_TIMING=1.
@@ -986,6 +989,7 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         if (Common::Nx2Timeline::Active()) {
             Common::Nx2Timeline::Instant("vkQueueSubmit", {"tick", signal_value});
         }
+        const Common::Nx2Hitch::StallScope submit_stall{"worker: vkQueueSubmit"};
         switch (const VkResult result = master_semaphore->SubmitQueue(
                     cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value)) {
         case VK_SUCCESS:

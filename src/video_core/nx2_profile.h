@@ -23,6 +23,7 @@
 #include "common/logging.h"
 #include "common/cpu_features.h"
 #include "common/thread_cpu_clock.h"
+#include "common/nx2_hitch.h"
 #include "common/nx2_timeline.h"
 
 // EDEN_NX2_GPU_PROFILE: time where the GPU thread spends its time. Each zone counts its own
@@ -310,12 +311,18 @@ public:
 private:
     static constexpr u8 StateTimed = 1;
     static constexpr u8 StateTimeline = 2;
+    static constexpr u8 StateStall = 4;
 
     NX2_PROFILE_NOINLINE void Begin(Zone zone_, bool on, bool timeline_on) {
         zone = zone_;
         const bool timeline = timeline_on && Common::Nx2Timeline::Active() &&
                               (Common::Nx2Timeline::Detail() || IsCoarse(zone_));
         state = static_cast<u8>((on ? StateTimed : 0) | (timeline ? StateTimeline : 0));
+        // EDEN_NX2_STALL_SNAPSHOT: the coarse zones also mark the thread's span slot.
+        if (Common::Nx2Hitch::t_stall_slot != nullptr && IsCoarse(zone_)) [[unlikely]] {
+            stall_mark = Common::Nx2Hitch::StallEnter(zone_names[static_cast<size_t>(zone_)]);
+            state = static_cast<u8>(state | StateStall);
+        }
         if (timeline) {
             timeline_start = Common::Nx2Timeline::Now();
         }
@@ -334,6 +341,9 @@ private:
             Common::Nx2Timeline::Record(zone_names[static_cast<size_t>(zone)], timeline_start,
                                         Common::Nx2Timeline::Now());
         }
+        if ((state & StateStall) != 0) {
+            Common::Nx2Hitch::StallLeave(stall_mark);
+        }
         if ((state & StateTimed) == 0) {
             return;
         }
@@ -347,11 +357,12 @@ private:
     }
 
     // Only `state` is written on the off path; the rest is set by Begin before End reads it.
-    u8 state{}; ///< StateTimed | StateTimeline; 0: nothing to do on exit
+    u8 state{}; ///< StateTimed | StateTimeline | StateStall; 0: nothing to do on exit
     Zone zone;
     u64 start;
     u64 parent_child_ns;
     u64 timeline_start;
+    Common::Nx2Hitch::StallMark stall_mark; ///< Set by Begin with StateStall only
 };
 
 /// TEST: a fine zone (EDEN_NX2_GPU_PROFILE=2), on the timeline only then too.

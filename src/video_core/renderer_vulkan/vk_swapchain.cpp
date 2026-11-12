@@ -14,6 +14,7 @@
 #endif
 
 #include "common/logging.h"
+#include "common/nx2_hitch.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -169,9 +170,13 @@ void Swapchain::Create(
 }
 
 bool Swapchain::AcquireNextImage(bool may_flush) {
-    const VkResult result = device.GetLogical().AcquireNextImageKHR(
-        *swapchain, (std::numeric_limits<u64>::max)(), *present_semaphores[frame_index],
-        VK_NULL_HANDLE, &image_index);
+    VkResult result;
+    {
+        const Common::Nx2Hitch::StallScope stall{"present: vkAcquireNextImageKHR"};
+        result = device.GetLogical().AcquireNextImageKHR(
+            *swapchain, (std::numeric_limits<u64>::max)(), *present_semaphores[frame_index],
+            VK_NULL_HANDLE, &image_index);
+    }
     switch (result) {
     case VK_SUCCESS:
         break;
@@ -192,6 +197,9 @@ bool Swapchain::AcquireNextImage(bool may_flush) {
         // No image was acquired, so image_index is stale: the caller recreates and tries again.
         return true;
     }
+    // EDEN_NX2_STALL_SNAPSHOT: between acquire and present from here (Present ends it).
+    Common::Nx2Hitch::StallAcquired();
+    const Common::Nx2Hitch::StallScope image_stall{"present: wait for the image's last tick"};
 
     const auto wait_with_frame_pacing = [this, may_flush] {
     switch (Settings::values.frame_pacing_mode.GetValue()) {
@@ -251,9 +259,15 @@ u64 Swapchain::Present(VkSemaphore render_semaphore) {
         .pImageIndices = &image_index,
         .pResults = nullptr,
     };
+    const auto lock_stall = Common::Nx2Hitch::StallEnter("present: wait for the submit lock");
     std::scoped_lock lock{scheduler.submit_mutex};
+    Common::Nx2Hitch::StallLeave(lock_stall);
+    const auto present_stall = Common::Nx2Hitch::StallEnter("present: vkQueuePresentKHR");
+    const VkResult present_result = present_queue.Present(present_info);
+    Common::Nx2Hitch::StallLeave(present_stall);
+    Common::Nx2Hitch::StallPresented();
     bool queued = false;
-    switch (const VkResult result = present_queue.Present(present_info)) {
+    switch (const VkResult result = present_result) {
     case VK_SUCCESS:
         queued = true;
         break;
