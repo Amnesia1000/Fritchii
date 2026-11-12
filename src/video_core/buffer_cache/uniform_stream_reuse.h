@@ -58,6 +58,16 @@ concept StreamUniformReusable = requires(R& runtime, u32 size) {
     return enabled || VideoCore::Nx2Debug::Experiment(93) != 0;
 }
 
+/// EXP115 (live; 0 = off, 1 = after 8 misses, N > 1 = after N misses): a slot whose last binds
+/// all found no reusable copy (bytes that change every bind, such as per-draw matrices) copies
+/// straight into the stream buffer for its next UniformDirectBinds binds, without the compares
+/// and the extra copy into the reuse store, then tries reuse again.
+[[nodiscard]] inline u32 UniformMissStreak() noexcept {
+    const int value = VideoCore::Nx2Debug::Experiment(115);
+    return value <= 0 ? 0U : (value == 1 ? 8U : static_cast<u32>(value));
+}
+inline constexpr u16 UniformDirectBinds = 64;
+
 template <class Ref>
 class UniformStreamReuse {
 public:
@@ -85,6 +95,8 @@ public:
     struct Slot {
         u32 copy{};
         u32 serial{}; ///< the copy's serial then; 0: none
+        u16 misses{}; ///< binds in a row that found no reusable copy (EXP115)
+        u16 direct{}; ///< binds left that copy straight to the stream buffer (EXP115)
     };
 
     UniformStreamReuse() : bytes{new u8[NumCopies * MaxBytes]} {}
@@ -157,6 +169,16 @@ template <class Runtime, class DeviceMemory>
     }
     Reuse& reuse = UniformStreamReuseState<typename Runtime::StreamUniformRef>();
     typename Reuse::Slot& slot = reuse.slots[stage][index];
+    const u32 miss_streak = UniformMissStreak();
+    if (slot.direct != 0 && miss_streak != 0) {
+        // EXP115: a slot whose bytes change every bind: one copy, no compares. Its old copy is
+        // dropped (serial 0), so the next reuse attempt starts clean.
+        --slot.direct;
+        const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
+        device_memory.ReadBlockUnsafe(device_addr, span.data(), size);
+        slot.serial = 0;
+        return true;
+    }
     // The bytes are compared in guest memory with EDEN_NX2_UBO_INPLACE, else in a scratch copy.
     // The stream allocation is filled from the copy's bytes, never from guest memory, so a later
     // reuse finds exactly the bytes that were uploaded. Test memories have no GetSpan.
@@ -249,7 +271,14 @@ template <class Runtime, class DeviceMemory>
     copy.ref = runtime.LastStreamUniformRef();
     // After the allocation: the tick the stream region is tagged with is the one current now.
     copy.tick = runtime.CurrentTick();
-    slot = typename Reuse::Slot{static_cast<u32>(target), copy.serial};
+    // EXP115: a slot whose bytes differed from its copy again counts a miss (`slot` still holds
+    // the previous count here); enough in a row and it copies directly for a while.
+    const u16 misses = slot_same || miss_streak == 0 ? u16{0} : static_cast<u16>(slot.misses + 1);
+    slot = typename Reuse::Slot{static_cast<u32>(target), copy.serial, misses, 0};
+    if (miss_streak != 0 && misses >= miss_streak) {
+        slot.misses = 0;
+        slot.direct = UniformDirectBinds;
+    }
     return true;
 }
 

@@ -660,6 +660,11 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// With N it waits N us with PAUSE instead, polling less often and leaving its SMT sibling free.
 /// Measured elsewhere at the market: 2 us best (1, 5, 10, 20 less). Not under EDEN_NX2_GPU_WAKE,
 /// whose wait is in hardware already. Timing only.
+/// EXP115 (live; 0 = off, 1 = after 8 misses, N > 1 = after N; uniform_stream_reuse.h): a
+/// (stage, constant buffer) slot whose streamed bytes differed from its copy that many binds in a
+/// row copies guest memory straight into the stream buffer for its next 64 binds: no compares,
+/// no extra copy into the reuse store. Exact (a stream copy of guest memory, as with reuse off);
+/// it only gives up rebinds those 64 binds could have found.
 /// EXP101 (live, 0 = off, 1 = runs, 2 = cached page pointer + prefetch; fable52_answer_presenter): nvhost_gpu::SubmitGPFIFOImpl's pushbuffer
 /// snapshot reads runs of entries whose GPU addresses follow each other with one ReadBlockUnsafe
 /// instead of one per entry (OoT's presenting thread submits ~6,500 entries a frame; the loop is
