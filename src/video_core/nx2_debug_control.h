@@ -1030,6 +1030,11 @@ inline void LoadExperiments() {
         // of at the frame's end. Heavy phase toggle: other 143.4 -> 114.2 ms/s, back 7.92 -> 7.72
         // us per draw, 0.1% low 15.6 -> 23.0; every eviction went while idle ("here" 0).
         g_experiments[99].store(1, std::memory_order_relaxed);
+        // EXP112 = 1 (2026-11-13): a guest read of GPU-written memory takes the whole GPU-written
+        // run around it (up to 256 KiB) in the same read-back. Great fairy fountain, flipped every
+        // 20 s: 52.3 -> 71.0 fps, 1% / 0.1% low 40.0 / 34.2 -> 46.0 / 38.8; read-backs that went
+        // to the back 16.6 -> 3.1 a frame, the game's waiting 7.5 ms a frame -> under 2.
+        g_experiments[112].store(1, std::memory_order_relaxed);
         // EXP49 = 1 (2026-11-10, owner's call for v5.7): the async read-back. Stalchild fight,
         // flipped every 30 s while the owner fought: 51.9 -> 56.9 fps, the back's read flushes
         // 35 -> 6 ms/s, guest lock waits halved. No beams in that session or two later ones
