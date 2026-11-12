@@ -1349,6 +1349,70 @@ private:
     bool BindSmallUniformCountingKeeps(size_t stage, u32 index, u32 binding_index,
                                        DAddr device_addr, u32 size, bool range_reuse);
 
+    /// EXP92 (fable52_answer_uniformkeeps 3 and 4; idea zortos293/Lichii#1441 part d): uniform
+    /// keeps. Drawing thread only; the ring is UniformKeepCount's (tier 1), the page generations
+    /// and watches Common::UniformKeepPages (tier 2).
+    struct UniformKeeps {
+        static constexpr size_t NumStages = UniformKeepCount::NumStages;
+        static constexpr size_t NumSlots = UniformKeepCount::NumSlots;
+        /// Every 256th kept bind runs the normal path as a check with EXP92 = 1.
+        static constexpr u64 TripwireInterval = 256;
+        static constexpr u32 MaxStaleLogs = 32;
+        struct Keep {
+            DAddr addr{};
+            u32 size{};
+            u32 copy{};        ///< the stream reuse copy the slot bound
+            u32 copy_serial{}; ///< its serial then
+            std::array<u32, 2> page_gens{}; ///< first and last page's generation before the read
+            u32 global_gen{};
+            u64 seen_seq{};    ///< ring sequence the range is known clean up to
+            u64 translation{}; ///< device memory translation generation before the read
+            u64 made_frame{};
+            bool valid{};
+        };
+        std::array<std::array<Keep, NumSlots>, NumStages> slots{};
+        int mode{}; ///< EXP92 as the last bind saw it (a change drops every keep)
+        bool tripped{}; ///< a tripwire check found a stale keep: keeps off for the session
+        /// Why a keepable-looking bind was not kept (one per bind that was not kept).
+        enum Reason : u8 {
+            NoKeep,       ///< nothing kept for the slot yet (or the last bind made none)
+            OtherRange,   ///< the slot's last bind was another range
+            Ineligible,   ///< native bank bind or run-ahead frontier set
+            Tick,         ///< the slot's copy is gone or from an older command buffer
+            Translation,  ///< the device memory's translation changed
+            PageGen,      ///< a write was noted on one of the range's pages
+            RingOverflow, ///< more than RingSize cached writes since
+            RangeWritten, ///< a cached write overlapped the range
+            Pending,      ///< MemoryManager holds cached writes not flushed yet
+            NumReasons,
+        };
+        struct Totals {
+            u64 binds{};    ///< small binds through the stream branch while EXP92 is on
+            u64 kept{};     ///< bound from the keep (verified ones included)
+            u64 verified{}; ///< keepable binds that ran the normal path as a check
+            u64 stale{};    ///< of those, the normal path made a fresh copy
+            u64 denied{};   ///< not kept: a page of the range is denied (no keep made)
+            std::array<u64, NumReasons> not_kept{};
+        };
+        Totals totals{};
+        u64 kept_count{}; ///< kept binds this session (the tripwire's interval)
+        u64 stale_total{};
+        u32 stale_logged{};
+        u64 calls{};
+        /// A check's copy of the kept bytes (the normal path may overwrite the copy).
+        std::array<u8, 4096> verify_bytes{};
+        std::array<u8, 4096> fresh_bytes{};
+        u64 log_guest_stores{}; ///< UniformKeepPages guest_stores at the last log line
+        u64 log_pages_denied{};
+        std::chrono::steady_clock::time_point last_log{};
+    };
+    UniformKeeps uniform_keeps;
+
+    /// EXP92 != 0: the stream branch's small uniform bind with keeps (see UniformKeeps).
+    bool BindSmallUniformKeeping(size_t stage, u32 index, u32 binding_index, DAddr device_addr,
+                                 u32 size, bool range_reuse, bool eligible, int mode);
+    void LogUniformKeeps(int mode);
+
     /// EDEN_NX2_EXP18 (zortos293/Lichii#641): resolved bindings are kept while the GPU mappings
     /// and the set of buffers stay the same. Bumped whenever a buffer is created, joined or
     /// deleted (ChangeRegister) and when the inline index buffer is replaced.

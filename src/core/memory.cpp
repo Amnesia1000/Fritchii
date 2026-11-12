@@ -25,6 +25,7 @@
 #include "common/common_types.h"
 #include "common/heap_tracker.h"
 #include "common/logging.h"
+#include "common/nx2_uniform_keep_pages.h"
 #include "common/page_table.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -370,6 +371,11 @@ struct Memory::Impl {
             }
             std::memcpy(ptr, reinterpret_cast<u8 const*>(buffer) + offset, copy_amount);
             VideoCommon::WriteTrack::CloseIfArmed();
+            // EXP92: the after-store point (unsafe writes recorded nothing: noted here).
+            Common::UniformKeepPages::AfterGuestStore();
+            if (unsafe && Common::UniformKeepPages::AnyKept()) [[unlikely]] {
+                NoteUnrecordedStore(GetInteger(current_vaddr), copy_amount);
+            }
         });
     }
 
@@ -385,6 +391,7 @@ struct Memory::Impl {
             HandleRasterizerWrite(GetInteger(current_vaddr), copy_amount);
             std::memset(ptr, 0, copy_amount);
             VideoCommon::WriteTrack::CloseIfArmed();
+            Common::UniformKeepPages::AfterGuestStore(); // EXP92
         });
     }
 
@@ -432,6 +439,7 @@ struct Memory::Impl {
             // CPU flush -> GPU invalidate
             HandleRasterizerWrite(GetInteger(current_vaddr), block_size);
             VideoCommon::WriteTrack::CloseIfArmed();
+            Common::UniformKeepPages::AfterGuestStore(); // EXP92
         };
         return PerformCacheOperation(dest_addr, size, on_rasterizer);
     }
@@ -442,6 +450,7 @@ struct Memory::Impl {
             // CPU flush -> GPU invalidate
             HandleRasterizerWrite(GetInteger(current_vaddr), block_size);
             VideoCommon::WriteTrack::CloseIfArmed();
+            Common::UniformKeepPages::AfterGuestStore(); // EXP92
         };
         return PerformCacheOperation(dest_addr, size, on_rasterizer);
     }
@@ -890,6 +899,7 @@ struct Memory::Impl {
         }, [&]() { HandleRasterizerWrite(addr, sizeof(T)); }); ptr) [[likely]] {
             std::memcpy(ptr, &data, sizeof(T));
             VideoCommon::WriteTrack::CloseIfArmed();
+            Common::UniformKeepPages::AfterGuestStore(); // EXP92
         }
     }
 
@@ -906,6 +916,7 @@ struct Memory::Impl {
             const bool stored =
                 Common::AtomicCompareAndSwap(reinterpret_cast<T*>(ptr), data, expected);
             VideoCommon::WriteTrack::CloseIfArmed();
+            Common::UniformKeepPages::AfterGuestStore(); // EXP92
             return stored;
         }
         return true;
@@ -923,6 +934,7 @@ struct Memory::Impl {
             const bool stored =
                 Common::AtomicCompareAndSwap(reinterpret_cast<u64*>(ptr), data, expected);
             VideoCommon::WriteTrack::CloseIfArmed();
+            Common::UniformKeepPages::AfterGuestStore(); // EXP92
             return stored;
         }
         return true;
@@ -1014,6 +1026,10 @@ struct Memory::Impl {
             if (address != 0 && size != 0) {
                 g_watch_write_pages.Mark(address, size);
             }
+            // EXP92 (uniform keeps): the device range this thread stores next; the caller's
+            // after-store point notes it (Common::UniformKeepPages::AfterGuestStore). Recorded
+            // always: a keep may be made between here and the store.
+            Common::UniformKeepPages::RecordGuestStore(address, size);
             auto& current_area = rasterizer_write_areas[core];
             PAddr subaddress = address >> YUZU_PAGEBITS;
             // Performance note:
@@ -1060,6 +1076,24 @@ struct Memory::Impl {
             // last_address stays on the page after its GPU-written state is gone, so these
             // writes can land on pages the buffer cache holds as clean until the next gather.
             g_collected_write_pages.Mark(address, size);
+        });
+    }
+
+    /// EXP92: a store to a rasterizer-cached page that HandleRasterizerWrite did not see
+    /// (WriteBlockUnsafe), after the bytes landed: noted for the uniform keeps by device address.
+    /// Only once a keep was ever made. Its own scratch buffer: any thread may call it.
+    void NoteUnrecordedStore(VAddr v_address, size_t size) {
+        const auto* p = GetPointerImpl(
+            v_address, []() {}, []() {});
+        if (!gpu_device_memory) [[unlikely]] {
+            gpu_device_memory = &system.Host1x().MemoryManager();
+        }
+        if (p == nullptr || !gpu_device_memory->IsPhysicalPointer(p)) {
+            return;
+        }
+        thread_local Common::ScratchBuffer<u32> scratch;
+        gpu_device_memory->ApplyOpOnPointer(p, scratch, [&](DAddr address) {
+            Common::UniformKeepPages::Note(address, size);
         });
     }
 

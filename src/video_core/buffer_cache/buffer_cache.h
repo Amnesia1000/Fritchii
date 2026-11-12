@@ -21,6 +21,7 @@
 #include <vector>
 #include <fmt/ranges.h>
 
+#include "common/nx2_uniform_keep_pages.h"
 #include "common/range_sets.inc"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/buffer_cache/multi_range_refresh.h"
@@ -2456,7 +2457,17 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                 const u64 rebinds =
                     VideoCommon::UniformStreamReuseState<typename Runtime::StreamUniformRef>()
                         .rebinds;
-                if (VideoCore::Nx2Debug::Experiment(91) != 0) [[unlikely]] {
+                if (const int keep_mode = VideoCore::Nx2Debug::Experiment(92);
+                    keep_mode != 0 || uniform_keeps.mode != 0) [[unlikely]] {
+                    // EXP92: uniform keeps (a change to 0 drops them, then today's path). Not on
+                    // native bank binds or behind a run-ahead frontier.
+                    streamed = BindSmallUniformKeeping(
+                        stage, index, binding_index, device_addr, size,
+                        VideoCore::Nx2Debug::Experiment(17) != 0,
+                        !native_bank_bind &&
+                            VideoCommon::Runahead::g_frontier.load(std::memory_order_relaxed) == 0,
+                        keep_mode);
+                } else if (VideoCore::Nx2Debug::Experiment(91) != 0) [[unlikely]] {
                     // EXP91 (stage 0): the same call, counted (binds nothing differently).
                     streamed = BindSmallUniformCountingKeeps(
                         stage, index, binding_index, device_addr, size,
@@ -2516,10 +2527,15 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
 
 template <class P>
 void BufferCache<P>::NoteCachedWrites(std::span<const std::pair<DAddr, std::size_t>> sequences) {
-    if (VideoCore::Nx2Debug::Experiment(91) == 0) {
+    UniformKeepCount& count = uniform_keep_count;
+    if (VideoCore::Nx2Debug::Experiment(91) == 0 && VideoCore::Nx2Debug::Experiment(92) == 0) {
+        // Not noted: whatever a keep or count remembers is past the ring now (EXP92 turned on
+        // again before a bind saw it off still finds every older keep overflowed).
+        if (!sequences.empty()) {
+            count.write_seq += UniformKeepCount::RingSize + 1;
+        }
         return;
     }
-    UniformKeepCount& count = uniform_keep_count;
     for (const auto& [addr, size] : sequences) {
         ++count.write_seq;
         count.ring[count.write_seq % UniformKeepCount::RingSize] = {addr, addr + size};
@@ -2631,6 +2647,266 @@ bool BufferCache<P>::BindSmallUniformCountingKeeps(size_t stage, u32 index, u32 
         (void)range_reuse;
         return false;
     }
+}
+
+template <class P>
+bool BufferCache<P>::BindSmallUniformKeeping(size_t stage, u32 index, u32 binding_index,
+                                             DAddr device_addr, u32 size, bool range_reuse,
+                                             bool eligible, int mode) {
+    if constexpr (!IS_OPENGL && VideoCommon::StreamUniformReusable<Runtime>) {
+        using Ref = typename Runtime::StreamUniformRef;
+        using Reuse = VideoCommon::UniformStreamReuse<Ref>;
+        using Keeps = UniformKeeps;
+        using Keep = typename Keeps::Keep;
+        using Count = UniformKeepCount;
+        namespace KeepPages = Common::UniformKeepPages;
+        static_assert(Keeps::NumStages == Reuse::NumStages && Keeps::NumSlots == Reuse::NumSlots);
+        static_assert(KeepPages::PageBits == Core::DEVICE_PAGEBITS);
+        static_assert(Reuse::MaxBytes <= sizeof(Keeps::verify_bytes));
+        Reuse& reuse = VideoCommon::UniformStreamReuseState<Ref>();
+        Keeps& keeps = uniform_keeps;
+        const auto bind_normally = [&] {
+            return VideoCommon::BindSmallUniformReusing(runtime, device_memory, stage, index,
+                                                        binding_index, device_addr, size,
+                                                        range_reuse);
+        };
+        if (mode != keeps.mode) {
+            // Read live: any change drops every keep (1 -> 0 at any time included).
+            for (auto& stage_keeps : keeps.slots) {
+                stage_keeps.fill(Keep{});
+            }
+            if (keeps.mode == 0) {
+                keeps.totals = {};
+                keeps.last_log = std::chrono::steady_clock::now();
+                keeps.log_guest_stores =
+                    KeepPages::g_state.guest_stores.load(std::memory_order_relaxed);
+                keeps.log_pages_denied =
+                    KeepPages::g_state.pages_denied.load(std::memory_order_relaxed);
+            }
+            keeps.mode = mode;
+        }
+        if (mode == 0 || size == 0 || size > Reuse::MaxBytes || stage >= Keeps::NumStages ||
+            index >= Keeps::NumSlots) {
+            return bind_normally();
+        }
+        typename Keeps::Totals& totals = keeps.totals;
+        ++totals.binds;
+        if (keeps.tripped) {
+            // The tripwire fired: today's path for the rest of the session (still logged).
+            if ((++keeps.calls & 1023) == 0) {
+                LogUniformKeeps(mode);
+            }
+            return bind_normally();
+        }
+        Keep& keep = keeps.slots[stage][index];
+        const Count& ring = uniform_keep_count;
+        const DAddr end = device_addr + size;
+        const u64 first_page = device_addr >> Core::DEVICE_PAGEBITS;
+        const u64 last_page = (end - 1) >> Core::DEVICE_PAGEBITS;
+        const u64 tick = runtime.CurrentTick();
+
+        // 3.5: whether the slot's keep may be bound without reading guest memory.
+        u64 scanned = 0;
+        const auto overlaps = [&] {
+            for (u64 seq = keep.seen_seq + 1; seq <= ring.write_seq; ++seq) {
+                ++scanned;
+                const typename Count::Range& range = ring.ring[seq % Count::RingSize];
+                if (range.begin < end && device_addr < range.end) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        using Reason = typename Keeps::Reason;
+        Reason reason = Keeps::NumReasons; // keepable
+        if (!keep.valid) {
+            reason = Keeps::NoKeep;
+        } else if (keep.addr != device_addr || keep.size != size) {
+            reason = Keeps::OtherRange;
+        } else if (!eligible) {
+            reason = Keeps::Ineligible;
+        } else if (const typename Reuse::Copy& copy = reuse.copies[keep.copy];
+                   copy.serial != keep.copy_serial || copy.tick != tick ||
+                   reuse.slots[stage][index].copy != keep.copy ||
+                   reuse.slots[stage][index].serial != keep.copy_serial) {
+            reason = Keeps::Tick;
+        } else if (device_memory.TranslationGeneration() != keep.translation) {
+            reason = Keeps::Translation;
+        } else if (KeepPages::GlobalGen() != keep.global_gen ||
+                   KeepPages::PageGen(first_page) != keep.page_gens[0] ||
+                   KeepPages::PageGen(last_page) != keep.page_gens[1]) {
+            reason = Keeps::PageGen;
+        } else if (ring.write_seq - keep.seen_seq > Count::RingSize) {
+            reason = Keeps::RingOverflow;
+        } else if (overlaps()) {
+            reason = Keeps::RangeWritten;
+        } else if (gpu_memory != nullptr && gpu_memory->HasPendingCachedWrites()) {
+            reason = Keeps::Pending;
+        }
+        const bool keepable = reason == Keeps::NumReasons;
+        bool check = false;
+        if (keepable) {
+            ++totals.kept;
+            ++keeps.kept_count;
+            check = mode == 2 || keeps.kept_count % Keeps::TripwireInterval == 0;
+            if (!check) {
+                keep.seen_seq = ring.write_seq;
+                // What BindSmallUniformReusing does when its compare says "same" and the tick
+                // matches (the stream branch already set the two channel_state lines).
+                const typename Reuse::Copy& copy = reuse.copies[keep.copy];
+                runtime.RebindStreamUniform(copy.ref, size);
+                ++reuse.rebinds;
+                reuse.slots[stage][index] = typename Reuse::Slot{keep.copy, keep.copy_serial};
+                if ((++keeps.calls & 1023) == 0) {
+                    LogUniformKeeps(mode);
+                }
+                return true;
+            }
+            std::memcpy(keeps.verify_bytes.data(), reuse.Bytes(keep.copy), size);
+        } else {
+            ++totals.not_kept[reason];
+        }
+        const Keep previous = keep;
+
+        // 3.4: making a keep. 1. mark and watch the pages; 2. read their generations (then the
+        // watches again: a page unwatched meanwhile can't hold a keep); 3. the normal bind;
+        // 4. store the keep.
+        bool can_keep = eligible;
+        std::array<u32, 2> gens{};
+        u32 global_gen = 0;
+        u64 translation = 0;
+        if (can_keep) {
+            if (!KeepPages::Watch(device_addr, size, [this](DAddr page_address, s32 delta) {
+                    device_memory.UpdatePagesCachedCount(page_address, Core::DEVICE_PAGESIZE,
+                                                         delta);
+                })) {
+                can_keep = false;
+                ++totals.denied;
+            } else {
+                translation = device_memory.TranslationGeneration();
+                global_gen = KeepPages::GlobalGen();
+                gens = {KeepPages::PageGen(first_page), KeepPages::PageGen(last_page)};
+                can_keep = KeepPages::AllWatched(device_addr, size);
+            }
+        }
+        const u64 rebinds_before = reuse.rebinds;
+        const bool streamed = bind_normally();
+        if (check) {
+            // 4: the normal path must have bound the kept copy again ("same", same tick).
+            ++totals.verified;
+            const typename Reuse::Slot& after = reuse.slots[stage][index];
+            const bool same = streamed && reuse.rebinds != rebinds_before &&
+                              after.copy == previous.copy && after.serial == previous.copy_serial;
+            if (!same) {
+                ++totals.stale;
+                ++keeps.stale_total;
+                if (keeps.stale_logged < Keeps::MaxStaleLogs) {
+                    ++keeps.stale_logged;
+                    // Where the bytes differ, against guest memory now.
+                    device_memory.ReadBlockUnsafe(device_addr, keeps.fresh_bytes.data(), size);
+                    u32 first_diff = size;
+                    for (u32 i = 0; i < size; ++i) {
+                        if (keeps.fresh_bytes[i] != keeps.verify_bytes[i]) {
+                            first_diff = i;
+                            break;
+                        }
+                    }
+                    const auto& pages = KeepPages::g_state;
+                    LOG_ERROR(HW_GPU,
+                              "Uniform keeps (EXP92={}): STALE bind #{}: stage {} slot {} address "
+                              "{:#x} size {} kept {} frames ago; quiet checks: range and copy "
+                              "same, copy tick current, translation {:#x} unchanged, page gens "
+                              "{}/{} and global {} unchanged, ring clean ({} ranges scanned since "
+                              "seq {}), no pending cached writes; pages now: watched {}/{}, "
+                              "denied {}/{}; first changed byte {} of {}",
+                              mode, keeps.stale_total, stage, index, device_addr, size,
+                              frame_tick - previous.made_frame, previous.translation,
+                              previous.page_gens[0], previous.page_gens[1], previous.global_gen,
+                              scanned, previous.seen_seq, pages.watched.Test(first_page),
+                              pages.watched.Test(last_page), pages.denied.Test(first_page),
+                              pages.denied.Test(last_page), first_diff, size);
+                }
+                if (mode == 1 && !keeps.tripped) {
+                    keeps.tripped = true;
+                    LOG_ERROR(HW_GPU,
+                              "Uniform keeps (EXP92=1): the tripwire found a stale kept bind "
+                              "(stage {} slot {} address {:#x} size {}); keeps are off for this "
+                              "session",
+                              stage, index, device_addr, size);
+                }
+            }
+        }
+        if (streamed && can_keep) {
+            const typename Reuse::Slot& slot = reuse.slots[stage][index];
+            keep = Keep{
+                .addr = device_addr,
+                .size = size,
+                .copy = slot.copy,
+                .copy_serial = slot.serial,
+                .page_gens = gens,
+                .global_gen = global_gen,
+                .seen_seq = ring.write_seq,
+                .translation = translation,
+                .made_frame = frame_tick,
+                .valid = true,
+            };
+        } else {
+            keep.valid = false;
+        }
+        if ((++keeps.calls & 1023) == 0) {
+            LogUniformKeeps(mode);
+        }
+        return streamed;
+    } else {
+        (void)stage;
+        (void)index;
+        (void)binding_index;
+        (void)device_addr;
+        (void)size;
+        (void)range_reuse;
+        (void)eligible;
+        (void)mode;
+        return false;
+    }
+}
+
+template <class P>
+void BufferCache<P>::LogUniformKeeps(int mode) {
+    UniformKeeps& keeps = uniform_keeps;
+    const auto now = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(now - keeps.last_log).count();
+    if (seconds < 5.0) {
+        return;
+    }
+    namespace KeepPages = Common::UniformKeepPages;
+    const auto& pages = KeepPages::g_state;
+    const u64 guest_stores = pages.guest_stores.load(std::memory_order_relaxed);
+    const u64 pages_denied = pages.pages_denied.load(std::memory_order_relaxed);
+    const auto rate = [seconds](u64 n) {
+        return static_cast<u64>(static_cast<double>(n) / seconds + 0.5);
+    };
+    const typename UniformKeeps::Totals& totals = keeps.totals;
+    const auto& reasons = totals.not_kept;
+    LOG_INFO(HW_GPU,
+             "Uniform keeps (EXP92={}, per second over {:.1f} s): small binds {}, kept {}; not "
+             "kept: range written {}, page generation {}, tick {}, other range {}, ring overflow "
+             "{}, pending writes {}, translation {}, no keep yet {}, bank/run-ahead {}, denied "
+             "page {}; watched pages {}, guest stores on them {}, pages denied {} (total {}); "
+             "verified {} and stale {} in {:.1f} s, stale this session {}{}",
+             mode, seconds, rate(totals.binds), rate(totals.kept),
+             rate(reasons[UniformKeeps::RangeWritten]), rate(reasons[UniformKeeps::PageGen]),
+             rate(reasons[UniformKeeps::Tick]), rate(reasons[UniformKeeps::OtherRange]),
+             rate(reasons[UniformKeeps::RingOverflow]), rate(reasons[UniformKeeps::Pending]),
+             rate(reasons[UniformKeeps::Translation]), rate(reasons[UniformKeeps::NoKeep]),
+             rate(reasons[UniformKeeps::Ineligible]), rate(totals.denied),
+             pages.watched_count.load(std::memory_order_relaxed),
+             rate(guest_stores - keeps.log_guest_stores), pages_denied - keeps.log_pages_denied,
+             pages_denied, totals.verified, totals.stale, seconds, keeps.stale_total,
+             keeps.tripped ? " (TRIPPED: keeps off)" : "");
+    keeps.totals = {};
+    keeps.log_guest_stores = guest_stores;
+    keeps.log_pages_denied = pages_denied;
+    keeps.last_log = now;
 }
 
 template <class P>

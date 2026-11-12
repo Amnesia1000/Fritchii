@@ -135,6 +135,11 @@ public:
     void ReadBlockUnsafe(GPUVAddr gpu_src_addr, void* dest_buffer, std::size_t size) const;
     void WriteBlockUnsafe(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size);
 
+    /// EXP92 (Common::UniformKeepPages): bytes were stored in place at [gpu_addr, gpu_addr +
+    /// size) through a span (Core::Memory::GuestMemoryScoped): notes their device pages for the
+    /// uniform keeps. One load until a keep was ever made.
+    void NoteHostStore(GPUVAddr gpu_addr, std::size_t size);
+
     /// ReadBlockUnsafe for a thread that is not the GPU thread (EDEN_NX2_ASYNC_TRANSLATE: the
     /// translation workers' texture descriptor reads). Holds the page table lock shared, so Map,
     /// MapSparse and Unmap can't change the tables under the copy. Gives up (false, nothing read)
@@ -261,7 +266,10 @@ private:
     const MappingSnapshot& CurrentSnapshot() const;
 
     void ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe) const;
-    void WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe);
+    /// `note_keeps` false: a cached write (WriteBlockCached, WriteWordsCached), whose range the
+    /// uniform keeps get exactly at FlushCaching (EXP92 tier 1); every other write notes its
+    /// device pages after the copy (tier 2).
+    void WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe, bool note_keeps = true);
 
     [[nodiscard]] std::size_t PageEntryIndex(GPUVAddr gpu_addr, bool is_big_page) const {
         if (is_big_page) {

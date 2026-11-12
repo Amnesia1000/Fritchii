@@ -18,6 +18,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/div_ceil.h"
+#include "common/nx2_uniform_keep_pages.h"
 #include "common/paged_scalar.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -256,6 +257,9 @@ void DeviceMemoryManager<Traits>::Map(DAddr address, VAddr virtual_address, size
     Core::Memory::Memory* process_memory = registered_processes[asid.id];
     size_t start_page_d = address >> Memory::YUZU_PAGEBITS;
     size_t num_pages = Common::AlignUp(size, Memory::YUZU_PAGESIZE) >> Memory::YUZU_PAGEBITS;
+    // EXP92: watches the uniform keeps hold on these device pages are given back while the old
+    // guest address is known (before EXP89's release, which uncaches a page this lets linger).
+    UnwatchUniformKeepPages(address, size);
     // EXP89: a page still lingering here is protected at its old guest address, which
     // InsertCPUBacking below replaces: uncache it there first.
     ReleaseLingeringRange(address, size);
@@ -300,6 +304,8 @@ void DeviceMemoryManager<Traits>::Unmap(DAddr address, size_t size) {
     size_t start_page_d = address >> Memory::YUZU_PAGEBITS;
     size_t num_pages = Common::AlignUp(size, Memory::YUZU_PAGESIZE) >> Memory::YUZU_PAGEBITS;
     device_inter->InvalidateRegion(address, size);
+    // EXP92: as in Map, before the backing is erased (and before EXP89's release).
+    UnwatchUniformKeepPages(address, size);
     // EXP89: the pages the caches just dropped may linger; the uncache needs their guest
     // address, which the loop below erases.
     ReleaseLingeringRange(address, size);
@@ -451,6 +457,7 @@ void DeviceMemoryManager<Traits>::Write(DAddr address, T value) {
     Common::WritePagedScalar(address, value, [&](DAddr page_address) {
         return page_address < device_as_size ? GetPointer<u8>(page_address) : nullptr;
     });
+    Common::UniformKeepPages::Note(address, sizeof(T)); // EXP92, after the store
 }
 
 template <typename Traits>
@@ -553,6 +560,7 @@ void DeviceMemoryManager<Traits>::WriteBlock(DAddr address, const void* src_poin
         [&](const std::size_t copy_amount) {
             src_pointer = static_cast<const u8*>(src_pointer) + copy_amount;
         });
+    Common::UniformKeepPages::Note(address, size); // EXP92, after the stores
     device_inter->InvalidateRegion(address, size);
 }
 
@@ -619,6 +627,7 @@ void DeviceMemoryManager<Traits>::WriteBlockUnsafe(DAddr address, const void* sr
         [&](const std::size_t copy_amount) {
             src_pointer = static_cast<const u8*>(src_pointer) + copy_amount;
         });
+    Common::UniformKeepPages::Note(address, size); // EXP92, after the stores
 }
 
 template <typename Traits>
@@ -974,6 +983,19 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedCount(DAddr addr, size_t size
     }
     Common::ScopedRangeLock lk(counter_guard, addr, size);
     UpdatePagesCachedCountNoLock(addr, size, delta);
+}
+
+template <typename Traits>
+void DeviceMemoryManager<Traits>::NoteHostStore(DAddr address, size_t size) {
+    Common::UniformKeepPages::Note(address, size);
+}
+
+template <typename Traits>
+void DeviceMemoryManager<Traits>::UnwatchUniformKeepPages(DAddr address, size_t size) {
+    static_assert(Common::UniformKeepPages::PageBits == Memory::YUZU_PAGEBITS);
+    Common::UniformKeepPages::Unwatch(address, size, [this](DAddr page_address, s32 delta) {
+        UpdatePagesCachedCount(page_address, Memory::YUZU_PAGESIZE, delta);
+    });
 }
 
 template <typename Traits>

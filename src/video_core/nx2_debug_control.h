@@ -540,6 +540,24 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// written, ring overflow, pending cached writes, other range, no keep yet). "Uniform keeps
 /// count (EXP91" logs small binds, rebinds and those counts per second every 5 s while not 0.
 /// Gain of the later stages is about K x 55 ns; under 100,000 a second, stop there.
+/// EXP92 (live, 0 = off; fable52_answer_uniformkeeps 3 and 4, idea zortos293/Lichii#1441 part d;
+/// BufferCache::BindSmallUniformKeeping): a small uniform slot bound again with the same range,
+/// in the same command buffer, with nothing written to that range since, binds the slot's stream
+/// copy again without reading or comparing guest memory (a "keep"). Written-since is known two
+/// ways: tier 1, the back's cached writes by exact range (EXP91's ring, filled while EXP91 or
+/// EXP92 is on; nothing pending in MemoryManager); tier 2, a generation per device page
+/// (Common::UniformKeepPages) raised after the bytes land by every other writer (MemoryManager
+/// writes, device memory writes, the GPU write listener, in-place spans, run-ahead words, and
+/// guest CPU stores, which trap because a kept range's pages are watched: one
+/// UpdatePagesCachedCount +1 each, given back at RasterizerVulkan::UnmapMemory and at
+/// DeviceMemoryManager Map/Unmap; a page stored to more than 64 times a frame is denied). Plus
+/// the device translation generation. Not on native bank binds or behind a run-ahead frontier.
+/// 1 = keeps on, every 256th kept bind verified (the tripwire): one stale bind logs an error and
+/// turns keeps off for the session. 2 = verify: a keepable bind runs the normal path anyway, which
+/// must rebind the same copy ("same"); stale ones are counted, the first 32 logged, and bound
+/// from their fresh bytes. "Uniform keeps (EXP92" logs binds, kept, not kept by reason, watched
+/// pages, guest stores on them, denied pages, verified and stale every 5 s while not 0. Stale
+/// must stay 0. 1 -> 0 at any time drops every keep (watched pages stay watched until unmapped).
 /// EXP85 (live, bits, 0 = off; fable52_answer_microcuts 1 and 2b): 1 = a small inline upload to
 /// pages no GPU write ever marked skips the buffer cache's lock (InlineMemory would find nothing
 /// there; the list note and the query cache as before), 2 = BufferCache::WriteMemory answers

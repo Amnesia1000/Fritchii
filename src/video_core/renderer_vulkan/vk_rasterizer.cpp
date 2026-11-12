@@ -34,6 +34,7 @@
 #include "common/memory_detect.h"
 #include "shader_recompiler/exception.h"
 #include "common/logging.h"
+#include "common/nx2_uniform_keep_pages.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/nx2_protect_stats.h"
@@ -3051,7 +3052,8 @@ void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::Cache
 }
 
 void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) {
-    // EXP91 (stage 0): every cached write range, before any early return (counting only).
+    // EXP91 (stage 0, counting) and EXP92 (uniform keeps, tier 1): every cached write range, in
+    // the keeps' ring, before any early return.
     buffer_cache.NoteCachedWrites(sequences);
     if (Settings::values.skip_cpu_inner_invalidation.GetValue()) {
         return;
@@ -3313,6 +3315,13 @@ void RasterizerVulkan::InvalidateGPUCache() {
 }
 
 void RasterizerVulkan::UnmapMemory(DAddr addr, u64 size) {
+    // EXP92 (fable52_answer_uniformkeeps 3.3): the uniform keeps' page watches on this device
+    // memory are given back here, before the backing is cleared (no cache lock held). A later keep
+    // watches the page again. DeviceMemoryManager::Map and Unmap do the same for backing changes
+    // that come without a GPU unmap.
+    Common::UniformKeepPages::Unwatch(addr, size, [this](DAddr page_address, s32 delta) {
+        device_memory.UpdatePagesCachedCount(page_address, Core::DEVICE_PAGESIZE, delta);
+    });
     {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.UnmapMemory(addr, size);
@@ -4157,6 +4166,12 @@ void RasterizerVulkan::TickFrame() {
     // EDEN_NX2_PROTECT_STATS' frame count, then EXP89's sweep of lingering protections (takes
     // the device memory's counter_guard: no cache lock may be held here).
     Core::Nx2ProtectStats::TickFrame();
+    // EXP92 (fable52_answer_uniformkeeps 3.3): a watched page the guest stored to more than 64
+    // times this frame is denied (its watch given back, never kept again). Before EXP89's sweep,
+    // which then releases such a page if it lingers. Nothing while no page is watched.
+    Common::UniformKeepPages::TickFrame(64, [this](DAddr page_address, s32 delta) {
+        device_memory.UpdatePagesCachedCount(page_address, Core::DEVICE_PAGESIZE, delta);
+    });
     device_memory.ReleaseLingering();
     pipeline_cache.TickFrame();
     guest_descriptor_queue.TickFrame();
