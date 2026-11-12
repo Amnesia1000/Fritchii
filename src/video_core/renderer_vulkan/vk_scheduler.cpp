@@ -28,6 +28,7 @@
 #include "common/nx2_timeline.h"
 #include "common/thread.h"
 #include "video_core/gpu_logging/gpu_logging.h"
+#include "video_core/nx2_fastdraw_count.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/renderer_vulkan/upload_batch.h"
@@ -417,6 +418,9 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
     }
     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
     const VkExtent2D render_area = framebuffer->RenderArea();
+    if (VideoCommon::Nx2FastDrawCount::g_on) [[unlikely]] {
+        ++render_pass_serial;
+    }
     state.renderpass = renderpass;
     state.clear_variant = false;
     state.framebuffer = framebuffer_handle;

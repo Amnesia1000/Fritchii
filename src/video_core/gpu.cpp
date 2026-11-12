@@ -42,6 +42,7 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_async_readback.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_fastdraw_count.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2_runahead.h"
 #include "video_core/renderer_base.h"
@@ -231,6 +232,7 @@ struct GPU::Impl {
             auto request = std::move(sync_requests.front());
             sync_requests.pop_front();
             sync_request_mutex.unlock();
+            VideoCommon::Nx2FastDrawCount::Break(VideoCommon::Nx2FastDrawCount::Reason::TickWork);
             request();
             current_sync_fence.fetch_add(1, std::memory_order_release);
             sync_request_mutex.lock();

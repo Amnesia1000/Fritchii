@@ -67,6 +67,9 @@ public:
     /// A Maxwell3D whose CallMethod takes its fast path (Nx2Perf): GpuSplit's back calls it
     /// without the virtual call.
     bool fast_maxwell3d{};
+    /// Maxwell3D: its writes report their own delta draw count breaks (nx2_fastdraw_count.h);
+    /// any other engine's method ends reuse as a whole (#1161's reports_fast_draw_breaks).
+    bool counts_fast_draw_breaks{};
     std::vector<std::pair<u32, u32>> method_sink{};
     GPUVAddr current_dma_segment;
     bool current_dirty{};

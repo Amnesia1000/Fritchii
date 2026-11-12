@@ -153,6 +153,16 @@ public:
         return state.renderpass != VK_NULL_HANDLE;
     }
 
+    /// EDEN_NX2_FASTDRAW_COUNT: render passes begun (counted only while it counts).
+    [[nodiscard]] u64 RenderPassSerial() const noexcept {
+        return render_pass_serial;
+    }
+
+    /// The graphics pipeline UpdateGraphicsPipeline bound last in this command buffer.
+    [[nodiscard]] const GraphicsPipeline* BoundGraphicsPipeline() const noexcept {
+        return state.graphics_pipeline;
+    }
+
     /// Update the pipeline to the current execution context.
     bool UpdateGraphicsPipeline(GraphicsPipeline* pipeline);
 
@@ -540,6 +550,7 @@ private:
 
     State state;
     u64 recording_epoch = 0;
+    u64 render_pass_serial = 0; ///< EDEN_NX2_FASTDRAW_COUNT: BeginRenderPassImpl calls
 
     u32 num_renderpass_images = 0;
     std::array<VkImage, 9> renderpass_images{};

@@ -38,6 +38,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cmdpage_diag.h"
+#include "video_core/nx2_fastdraw_count.h"
 #include "video_core/nx2_indirect_grid.h"
 #include "video_core/nx2_list_dispatch.h"
 #include "video_core/nx2_list_draw.h"
@@ -301,7 +302,8 @@ bool DmaPusher::Step() {
                          address = GPUVAddr{dma_state.dma_get}, bytes = words * sizeof(u32)] {
                             engine_state->current_dirty = memory->IsMemoryDirty(address, bytes);
                         },
-                        VideoCommon::GpuSplit::Effect::None);
+                        VideoCommon::GpuSplit::Effect::None,
+                        VideoCommon::Nx2FastDrawCount::Neutral());
                 } else {
                     engine_state->current_dirty = memory_manager.IsMemoryDirty(dma_state.dma_get, words * sizeof(u32));
                 }
@@ -1069,10 +1071,13 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
                     diag.reads_synced.fetch_add(1, std::memory_order_relaxed);
                     if (split.Active() && Nx2CmdPageDiag::IsDrawPage(page)) {
                         // The back, at this list's place: did work sent before it write the page?
-                        split.Defer([page, begin = static_cast<u32>(*device - page),
-                                     end = static_cast<u32>(*device - page + part.size())] {
-                            Nx2CmdPageDiag::CheckMissedWrite(page, begin, end);
-                        });
+                        split.Defer(
+                            [page, begin = static_cast<u32>(*device - page),
+                             end = static_cast<u32>(*device - page + part.size())] {
+                                Nx2CmdPageDiag::CheckMissedWrite(page, begin, end);
+                            },
+                            VideoCommon::GpuSplit::Effect::Unknown,
+                            VideoCommon::Nx2FastDrawCount::Neutral());
                     }
                 } else {
                     diag.reads_unknown.fetch_add(1, std::memory_order_relaxed);

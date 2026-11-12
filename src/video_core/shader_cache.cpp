@@ -31,6 +31,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_fastdraw_count.h"
 #include "video_core/pipeline_cache_policy.h"
 #include "video_core/shader_cache.h"
 #include "video_core/shader_environment.h"
@@ -471,6 +472,7 @@ void ShaderCache::RemovePendingShaders() {
     marked_for_removal.clear();
 
     if (!removed_shaders.empty()) {
+        Nx2FastDrawCount::Break(Nx2FastDrawCount::Reason::Invalidation);
         if (removed_shaders.size() > 16) {
             std::ranges::sort(removed_shaders, std::less<ShaderInfo*>{});
             std::erase_if(storage, [&removed_shaders](const std::unique_ptr<ShaderInfo>& shader) {

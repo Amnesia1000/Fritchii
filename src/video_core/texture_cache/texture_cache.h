@@ -35,6 +35,7 @@
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_fastdraw_count.h"
 #include "video_core/texture_cache/host_memory_limit.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/texture_cache/conversion.h"
@@ -2119,6 +2120,7 @@ void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
     ClearStale(cpu_addr, size);
     ForEachImageInRegion(cpu_addr, size, [this, cpu_addr, size](ImageId image_id, Image& image) {
         ++bindings_epoch;
+        VideoCommon::Nx2FastDrawCount::Break(VideoCommon::Nx2FastDrawCount::Reason::Invalidation);
         if (True(image.flags & ImageFlagBits::UnwrittenSparse)) {
             // Written at last: a backed image replaces it where it is used next.
             image.flags |= ImageFlagBits::CpuModified | ImageFlagBits::Remapped;
@@ -2346,6 +2348,9 @@ void TextureCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t siz
     boost::container::small_vector<ImageId, 16> deleted_images;
     ForEachImageInRegionGPU(as_id, gpu_addr, size,
                             [&](ImageId id, Image&) { deleted_images.push_back(id); });
+    if (VideoCommon::Nx2FastDrawCount::g_on && !deleted_images.empty()) [[unlikely]] {
+        VideoCommon::Nx2FastDrawCount::Break(VideoCommon::Nx2FastDrawCount::Reason::Map);
+    }
     for (const ImageId id : deleted_images) {
         Image& image = slot_images[id];
         ++bindings_epoch;
@@ -3697,6 +3702,7 @@ bool TextureCache<P>::ImageCanRescale(ImageBase& image) {
 template <class P>
 void TextureCache<P>::InvalidateScale(Image& image) {
     ++bindings_epoch;
+    VideoCommon::Nx2FastDrawCount::Break(VideoCommon::Nx2FastDrawCount::Reason::Invalidation);
     ++scale_epoch; // ScaleEpoch: draw templates (EXP87) keep rescaling words
     if (image.scale_tick <= frame_tick) {
         image.scale_tick = frame_tick + 1;
@@ -5668,6 +5674,7 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     ++images_deleted;
     Churn::Add(Churn::ImagesDeleted);
     ++bindings_epoch;
+    VideoCommon::Nx2FastDrawCount::Break(VideoCommon::Nx2FastDrawCount::Reason::Invalidation);
     if ((VideoCore::Nx2Debug::Experiment(76) & 4) != 0) [[unlikely]] {
         ForgetContent(image_id, image, true);
     }
@@ -6520,6 +6527,7 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
             Tegra::Nx2SparseMarkWritten(image.gpu_addr, image.guest_size_bytes);
             image.flags |= ImageFlagBits::CpuModified | ImageFlagBits::Remapped;
             ++bindings_epoch;
+            VideoCommon::Nx2FastDrawCount::Break(VideoCommon::Nx2FastDrawCount::Reason::Invalidation);
         }
         MarkModification(image);
     }

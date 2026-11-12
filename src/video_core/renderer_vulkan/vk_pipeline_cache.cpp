@@ -57,6 +57,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_fastdraw_count.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_precompile.h"
 #include "video_core/pipeline_cache_files.h"
@@ -937,6 +938,10 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         Settings::values.vertex_input_dynamic_state.GetValue();
     dynamic_features.has_static_vertex_repack =
         StaticVertexRepackEnabled(device.GetMinVertexInputBindingStrideAlignment());
+    // EDEN_NX2_FASTDRAW_COUNT (#1161): neither the key's strides (extended dynamic state) nor its
+    // vertex input (dynamic vertex input) depend on the streams' stride and enable word then.
+    VideoCommon::Nx2FastDrawCount::g_vertex_streams_dynamic =
+        dynamic_features.has_extended_dynamic_state && dynamic_features.has_dynamic_vertex_input;
 
     dynamic_features.has_provoking_vertex = device.IsExtProvokingVertexSupported();
     dynamic_features.has_provoking_vertex_first_mode =

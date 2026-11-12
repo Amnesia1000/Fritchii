@@ -318,6 +318,14 @@ public:
         return build->IsBuilt();
     }
 
+    /// The programs' shader info, by stage (EDEN_NX2_FASTDRAW_COUNT reads the handle words).
+    [[nodiscard]] const std::array<Shader::Info, NUM_STAGES>& StageInfos() const noexcept {
+        return stage_infos;
+    }
+
+    /// EDEN_NX2_FASTDRAW_COUNT: what the counter derived from StageInfos, on its first draw.
+    mutable std::unique_ptr<VideoCommon::Nx2FastDrawCount::PipelineInfo> fast_draw_count_info;
+
     [[nodiscard]] bool Failed() const noexcept {
         return build->Failed();
     }

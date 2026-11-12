@@ -25,6 +25,7 @@
 #include "common/nx2_timeline.h"
 #include "common/settings.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_fastdraw_count.h"
 #include "common/thread.h"
 #include "video_core/delayed_destruction_ring.h"
 #include "video_core/fence_release_stats.h"
@@ -319,6 +320,7 @@ private:
                     return;
                 }
             }
+            VideoCommon::Nx2FastDrawCount::Break(VideoCommon::Nx2FastDrawCount::Reason::Fence);
             PopAsyncFlushes(pending_flushes.front());
             pending_flushes.pop_front();
             auto operations = std::move(pending_operations.front());
@@ -402,6 +404,9 @@ private:
                        (fences.front()->IsStubbed() || IsFenceSignaled(fences.front()))) {
                     take_front();
                 }
+            }
+            if (VideoCommon::Nx2FastDrawCount::g_on && !batch.empty()) [[unlikely]] {
+                VideoCommon::Nx2FastDrawCount::Break(VideoCommon::Nx2FastDrawCount::Reason::Fence);
             }
             release_span.Set(0, {"fences", batch.size()});
             // EDEN_NX2_FENCE_RELEASE_STATS (fable52_answer_chicken 5.1): split this release.
@@ -521,6 +526,9 @@ private:
                         FenceReleaseStats::NsSince(stats_mark);
                 }
                 released.operations.clear();
+            }
+            if (VideoCommon::Nx2FastDrawCount::g_on && !batch.empty()) [[unlikely]] {
+                VideoCommon::Nx2FastDrawCount::Break(VideoCommon::Nx2FastDrawCount::Reason::Fence);
             }
             {
                 std::scoped_lock lock{uncommitted_guard};

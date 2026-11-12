@@ -126,6 +126,7 @@ add_library(video_core STATIC
     nx2_cb_path.h
     nx2_cmdpage_diag.h
     nx2_debug_control.cpp
+    nx2_fastdraw_count.h
     nx2_precompile.cpp
     nx2_precompile.h
     nx2_recipe.cpp

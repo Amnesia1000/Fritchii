@@ -32,6 +32,7 @@
 #include "core/core.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/nx2_fastdraw_count.h"
 #include "video_core/gpu_split.h"
 #include "video_core/nx2_split_stats.h"
 #include "video_core/memory_manager.h"
@@ -1270,6 +1271,10 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
             }
             return (head & HasSegment) != 0 ? 2 : 1;
         }
+        // EDEN_NX2_FASTDRAW_COUNT (#1161): any other engine's method ends delta draw reuse.
+        if (Nx2FastDrawCount::g_on && !engine->counts_fast_draw_breaks) [[unlikely]] {
+            Nx2FastDrawCount::Break(Nx2FastDrawCount::Reason::OtherEngine);
+        }
         if ((head & Direct) != 0) {
             Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
             engine->ConsumeSink(*system);
@@ -1294,6 +1299,9 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
         const u32 amount = static_cast<u32>(head >> 32);
         const size_t data = (head & HasSegment) != 0 ? 3 : 2;
         auto* const engine = back_engine;
+        if (Nx2FastDrawCount::g_on && !engine->counts_fast_draw_breaks) [[unlikely]] {
+            Nx2FastDrawCount::Break(Nx2FastDrawCount::Reason::OtherEngine);
+        }
         Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
         engine->ConsumeSink(*system);
         if ((head & HasSegment) != 0) {
@@ -1304,6 +1312,10 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
         return data + (amount + 1) / 2;
     }
     case Kind::Call: {
+        // EDEN_NX2_FASTDRAW_COUNT (#1161): deferred calls end reuse unless marked neutral.
+        if (Nx2FastDrawCount::g_on && (head & Nx2FastDrawCount::NeutralCallBit) == 0) [[unlikely]] {
+            Nx2FastDrawCount::Break(Nx2FastDrawCount::Reason::Call);
+        }
         const size_t payload = static_cast<size_t>((head >> 8) & 0xffffff);
         reinterpret_cast<void (*)(const u64*)>(entry[1])(entry + 2);
         return 2 + payload;
@@ -1313,6 +1325,9 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
         // as for any other write, to keep the order.
         const u32 count = static_cast<u32>(head >> 32);
         auto* const engine = back_engine;
+        if (Nx2FastDrawCount::g_on && !engine->counts_fast_draw_breaks) [[unlikely]] {
+            Nx2FastDrawCount::Break(Nx2FastDrawCount::Reason::OtherEngine);
+        }
         Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
         engine->ConsumeSink(*system);
         engine->ApplyPairs(*system, entry + 1, count);
