@@ -48,6 +48,10 @@ struct HostTranslateInfo {
     /// array of the table's entries (not OpenGL: its pipelines bind at most 64 textures; Vulkan
     /// only with nonuniform sampled image array indexing)
     bool support_handle_table_arrays{};
+    /// True when a passthrough geometry shader lowered for a host without
+    /// VK_NV_geometry_shader_passthrough keeps only Position and the generics of its passthrough
+    /// mask (zortos293/Lichii#1466). Set on AMD drivers only.
+    bool trim_lowered_geometry_passthrough{};
 
     void ApplyDescriptorLimitPolicy() noexcept {
         if (min_ssbo_alignment == 0) {

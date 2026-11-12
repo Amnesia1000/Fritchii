@@ -357,6 +357,14 @@ public:
         return properties.driver.driverID;
     }
 
+    /// Whether the device runs on an AMD driver: AMD's own (Windows, AMDVLK) or RADV. Gates
+    /// AMD-only workarounds so other vendors (NVIDIA above all) keep their path unchanged.
+    bool IsAmdDriver() const {
+        const VkDriverIdKHR id = GetDriverID();
+        return id == VK_DRIVER_ID_AMD_PROPRIETARY || id == VK_DRIVER_ID_AMD_OPEN_SOURCE ||
+               id == VK_DRIVER_ID_MESA_RADV;
+    }
+
     bool IsSparseBindingSupported() const {
         return features.features.sparseBinding && graphics_family_sparse_binding;
     }
