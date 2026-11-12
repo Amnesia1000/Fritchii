@@ -908,7 +908,9 @@ inline void LoadExperiments() {
         // ms / 5 s, worst hitch 788 -> 409 ms, frames over 40 ms 4.5 -> 4.1 per 1000; owner: not
         // less smooth.
         g_experiments[69].store(4, std::memory_order_relaxed);
-        g_experiments[81].store(4, std::memory_order_relaxed);
+        // EXP81 16, not 4 (fable52_answer_fight3 5): with 4 the game's read-backs doubled (50 -> 116
+        // a second, guest waiting 64 -> 117 ms/s); a longer memory keeps pages it reads every few frames.
+        g_experiments[81].store(16, std::memory_order_relaxed);
         // EXP72 = 1 (2026-11-11): a preflushed read whose bytes are all in a submitted fence download
         // waits for it. Night market toggle: reader waits 683 -> 479, wait time 515 -> 299 ms. Owner
         // Stalchild fight playtest: readers waited for the host GPU ~280-350 -> 40-70 ms/s, 0
