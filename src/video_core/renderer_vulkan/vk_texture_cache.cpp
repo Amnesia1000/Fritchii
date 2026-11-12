@@ -2961,7 +2961,8 @@ vk::Image TextureCacheRuntime::TakePooledImage(const ImagePoolKey& key) {
             continue;
         }
         vk::Image image = std::move(it->image);
-        image_pool_proven.insert(ImagePoolKeyHash(key));
+        image_pool_proven.insert(it->hash);
+        NoteImagePoolTake(it->hash);
         image_pool_bytes -= it->bytes;
         image_pool.erase(std::next(it).base());
         ++image_pool_taken;
@@ -2975,19 +2976,97 @@ void TextureCacheRuntime::PoolImage(const ImagePoolKey& key, vk::Image image, u6
     if (!key.valid || !image || bytes > ImagePoolMaxBytes) {
         return;
     }
+    const u64 hash = ImagePoolKeyHash(key);
     if (ghost_pools) [[unlikely]] {
-        ghost_pools->Give(ImagePoolKeyHash(key), bytes, image_pool_frame);
+        ghost_pools->Give(hash, bytes, image_pool_frame);
+    }
+    const u64 rule_cap = ImagePoolRuleCap();
+    if (rule_cap != 0 && image_pool_bytes > rule_cap) {
+        // EXP110 just turned on or lowered: the bulk goes by the plain loop, not the rule's walk.
+        TrimImagePool(rule_cap);
     }
     image_pool.push_back(PooledImage{
         .key = key,
         .image = std::move(image),
         .bytes = bytes,
         .frame = image_pool_frame,
-        .proven = image_pool_proven.contains(ImagePoolKeyHash(key)),
+        .proven = image_pool_proven.contains(hash),
+        .hash = hash,
     });
     image_pool_bytes += bytes;
     ++image_pool_given;
-    TrimImagePool(ImagePoolCap());
+    if (rule_cap != 0) {
+        TrimImagePoolByRule(rule_cap);
+    } else {
+        TrimImagePool(ImagePoolCap());
+    }
+}
+
+void TextureCacheRuntime::NoteImagePoolTake(u64 hash) {
+    const auto [it, added] = image_pool_shapes.try_emplace(hash);
+    it->second.takes += 1;
+    it->second.last_take = image_pool_frame;
+    if (!added || image_pool_shapes.size() < ImagePoolShapesMax) {
+        return;
+    }
+    // Bound (~64 bytes a shape): at ImagePoolShapesMax keep the ImagePoolShapesKeep most recently
+    // taken, so one pass per ~1,000 new shapes. A dropped shape's pooled entries count as never
+    // taken again (first to go); it was among the least recently taken of all shapes.
+    std::vector<u64> last_takes;
+    last_takes.reserve(image_pool_shapes.size());
+    for (const auto& [shape_hash, shape] : image_pool_shapes) {
+        last_takes.push_back(shape.last_take);
+    }
+    const size_t drop = image_pool_shapes.size() - ImagePoolShapesKeep;
+    std::nth_element(last_takes.begin(), last_takes.begin() + drop, last_takes.end());
+    const u64 keep_from = last_takes[drop];
+    std::erase_if(image_pool_shapes,
+                  [keep_from](const auto& entry) { return entry.second.last_take < keep_from; });
+}
+
+u64 TextureCacheRuntime::ImagePoolRuleCap() {
+    const int rule = VideoCore::Nx2Debug::Experiment(110);
+    if (rule <= 0) {
+        return 0;
+    }
+    return rule == 1 ? u64{512} << 20 : u64{static_cast<u32>(rule)} << 20;
+}
+
+u64 TextureCacheRuntime::IdleDestroyBytes() {
+    std::scoped_lock lock{idle_destroy_mutex};
+    return idle_destroy_bytes;
+}
+
+void TextureCacheRuntime::TrimImagePoolByRule(u64 max_bytes) {
+    // EXP110 (fable52_answer_stall3 3, the ghost's "unproven first + takes"): the pool and EXP99's
+    // idle backlog share the cap, so the pool may hold the cap less what waits to be destroyed.
+    const u64 backlog = IdleDestroyBytes();
+    const u64 target = max_bytes - std::min(max_bytes, backlog);
+    while (!image_pool.empty() && image_pool_bytes > target) {
+        // Oldest first, the first entry whose shape was never taken goes; failing that the one
+        // with the fewest takes, then the least recent take, then the oldest (strict compares
+        // keep the earlier). Proof is looked up now, per shape, not stored at PoolImage time.
+        auto victim = image_pool.end();
+        const PoolShape* victim_shape = nullptr;
+        for (auto it = image_pool.begin(); it != image_pool.end(); ++it) {
+            const auto found = image_pool_shapes.find(it->hash);
+            if (found == image_pool_shapes.end()) {
+                victim = it;
+                break;
+            }
+            const PoolShape& shape = found->second;
+            if (victim == image_pool.end() || shape.takes < victim_shape->takes ||
+                (shape.takes == victim_shape->takes &&
+                 shape.last_take < victim_shape->last_take)) {
+                victim = it;
+                victim_shape = &shape;
+            }
+        }
+        image_pool_bytes -= victim->bytes;
+        DropPooledImage(std::move(victim->image), victim->bytes);
+        image_pool.erase(victim);
+        ++image_pool_evicted;
+    }
 }
 
 u64 TextureCacheRuntime::ImagePoolKeyHash(const ImagePoolKey& key) noexcept {
@@ -3013,6 +3092,10 @@ u64 TextureCacheRuntime::ImagePoolKeyHash(const ImagePoolKey& key) noexcept {
 }
 
 u64 TextureCacheRuntime::ImagePoolCap() {
+    // EXP110 sets its own cap (a lowered one applies at TickFrame by the plain oldest-first loop).
+    if (const u64 rule_cap = ImagePoolRuleCap(); rule_cap != 0) {
+        return rule_cap;
+    }
     // EXP66 (live, MiB, 0 = the built-in cap): the owner sees device memory jump ~0.8 GB while an
     // NPC passes, ~500 MiB of it this pool at its cap (fable_answer_npcdips).
     if (const int mib = VideoCore::Nx2Debug::Experiment(66); mib > 0) {
@@ -3033,7 +3116,9 @@ void TextureCacheRuntime::DropPooledImage(vk::Image image, u64 bytes) {
     if (exp99 == 1) {
         std::scoped_lock lock{idle_destroy_mutex};
         // Bounded by device memory, not count (Fable after: 64 filled in ~23 frames of a pass).
-        if (idle_destroy_bytes + bytes <= (u64{512} << 20)) {
+        // EXP110: 128 MiB, inside the cap it shares with the pool (fable52_answer_stall3 3).
+        const u64 bound = ImagePoolRuleCap() != 0 ? u64{128} << 20 : u64{512} << 20;
+        if (idle_destroy_bytes + bytes <= bound) {
             idle_destroy_bytes += bytes;
             idle_destroys.emplace_back(std::move(image), bytes);
             ++image_pool_dropped_async;
@@ -3051,21 +3136,26 @@ void TextureCacheRuntime::DropPooledImage(vk::Image image, u64 bytes) {
 }
 
 void TextureCacheRuntime::DestroyIdlePooledImages(u32 max) {
-    for (u32 i = 0; i < max; ++i) {
+    image_pool_dropped_idle += DestroyPooledBacklog(max, "back: idle pool destroy");
+}
+
+u32 TextureCacheRuntime::DestroyPooledBacklog(u32 max, const char* span_name) {
+    u32 destroyed = 0;
+    for (; destroyed < max; ++destroyed) {
         vk::Image image;
         {
             std::scoped_lock lock{idle_destroy_mutex};
             if (idle_destroys.empty()) {
-                return;
+                break;
             }
             image = std::move(idle_destroys.front().first);
             idle_destroy_bytes -= idle_destroys.front().second;
             idle_destroys.pop_front();
         }
-        Common::Nx2Timeline::Span span{"back: idle pool destroy"};
+        Common::Nx2Timeline::Span span{span_name};
         image = vk::Image{};
-        ++image_pool_dropped_idle;
     }
+    return destroyed;
 }
 
 void TextureCacheRuntime::TrimImagePool(u64 max_bytes) {
@@ -3202,12 +3292,16 @@ void TextureCacheRuntime::TickFrame() {
         const int proven_switch = VideoCore::Nx2Debug::Experiment(82);
         const u64 proven_frames = proven_switch > 0 ? static_cast<u64>(proven_switch)
                                                     : ImagePoolMaxFrames;
+        // EXP110: proof is the shape's, looked up now (an entry pooled before its shape's first
+        // take counts as proven once it is taken), and EXP65 is not applied (the ghost ran so).
+        const bool rule = ImagePoolRuleCap() != 0;
         for (auto it = image_pool.begin(); it != image_pool.end();) {
             const u64 age = image_pool_frame - it->frame;
             if (age <= ImagePoolMaxFrames) {
                 break; // oldest first: the rest are younger
             }
-            if (it->proven && age <= proven_frames) {
+            const bool proven = rule ? image_pool_shapes.contains(it->hash) : it->proven;
+            if (proven && age <= proven_frames) {
                 ++it;
                 continue;
             }
@@ -3216,7 +3310,8 @@ void TextureCacheRuntime::TickFrame() {
             it = image_pool.erase(it);
             ++image_pool_evicted;
         }
-        if (const int unproven_frames = VideoCore::Nx2Debug::Experiment(65); unproven_frames > 0) {
+        if (const int unproven_frames = VideoCore::Nx2Debug::Experiment(65);
+            unproven_frames > 0 && !rule) {
             // Oldest first; proven entries stay for ImagePoolMaxFrames as before.
             for (auto it = image_pool.begin(); it != image_pool.end();) {
                 if (image_pool_frame - it->frame <= static_cast<u64>(unproven_frames)) {
@@ -3238,6 +3333,11 @@ void TextureCacheRuntime::TickFrame() {
             ghost_pools->Age(image_pool_frame, ImagePoolMaxFrames, proven_frames,
                              unproven_switch > 0 ? static_cast<u64>(unproven_switch) : 0);
         }
+        // EXP110: past 64 MiB waiting, the idle backlog also loses two a frame end, so it stays
+        // well inside its 128 MiB and the cap it shares with the pool.
+        if (rule && IdleDestroyBytes() > (u64{64} << 20)) {
+            image_pool_dropped_frame_end += DestroyPooledBacklog(2, "back: pool backlog destroy");
+        }
         if (image_pool_frame % 600 == 0 &&
             (pool_switch != 0 || image_pool_taken + image_pool_given != 0)) {
             if (ghost_pools) {
@@ -3246,18 +3346,25 @@ void TextureCacheRuntime::TickFrame() {
                          "Ghost pools (EXP42) last 600 frames, taken/missed hit% held: {}",
                          ghost_pools->Report());
             }
+            const std::string rule_text =
+                rule ? fmt::format("unproven first + takes, {} MiB with the backlog, {} shapes",
+                                   ImagePoolRuleCap() >> 20, image_pool_shapes.size())
+                     : std::string{"oldest first"};
             LOG_INFO(Render_Vulkan,
                      "Image pool (EXP42) last 600 frames: {} taken, {} missed, {} pooled, {} "
                      "evicted ({} never-taken shapes aged out, EXP65={}); holds {} images, {} MiB; "
-                     "evictions deferred {} (EXP99={}; destroyed while idle {}), here {}",
+                     "evictions deferred {} (EXP99={}; destroyed while idle {}), here {}; "
+                     "rule {} (EXP110={}); backlog {} MiB, destroyed at frame end {}",
                      image_pool_taken, image_pool_missed, image_pool_given, image_pool_evicted,
                      image_pool_unproven_evicted, VideoCore::Nx2Debug::Experiment(65),
                      image_pool.size(), image_pool_bytes >> 20, image_pool_dropped_async,
                      VideoCore::Nx2Debug::Experiment(99), image_pool_dropped_idle,
-                     image_pool_dropped_here);
+                     image_pool_dropped_here, rule_text, VideoCore::Nx2Debug::Experiment(110),
+                     IdleDestroyBytes() >> 20, image_pool_dropped_frame_end);
             image_pool_taken = image_pool_missed = image_pool_given = image_pool_evicted = 0;
             image_pool_unproven_evicted = 0;
             image_pool_dropped_async = image_pool_dropped_here = image_pool_dropped_idle = 0;
+            image_pool_dropped_frame_end = 0;
         }
         // EXP99: hand what the trims above dropped to the free thread now, not next frame.
         image_free_queue.Submit();

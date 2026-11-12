@@ -622,6 +622,19 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// (increments, e.g. an upload inside the write's slow path, apply at once): late decrements only
 /// keep a page protected a little longer; a late increment could let a page the texture cache
 /// tracks lose its protection in between. Never in Nx2Perf verify.
+/// EXP110 (live, 0 = off, 1 = on at 512 MiB, N > 1 = on at N MiB; fable52_answer_stall3 3, the
+/// ghost pools' "unproven first + takes"): the EXP42 pool's eviction rule. Over the cap, oldest
+/// first, the first entry whose shape (exact create info) was never taken from the pool goes;
+/// failing that the one whose shape has the fewest takes, then the least recent take, then the
+/// oldest. Takes and the last take are kept per shape in a map that outlives entries, evictions
+/// and the emptying on memory pressure (bumped on a take only, never aged; at 4,096 shapes the
+/// 3,072 most recently taken stay). Ages as before (180 frames, EXP82 for proven shapes, proof
+/// looked up per shape when tested); EXP65 is not applied. The cap replaces EXP66's and is shared
+/// with EXP99's idle backlog: the pool holds the cap less the backlog, the backlog is bounded at
+/// 128 MiB instead of 512 and, past 64 MiB, loses two images a frame end too. Memory pressure,
+/// EXP42 off and a lowered cap still trim by the plain oldest-first loop. The "Image pool (EXP42)"
+/// line ends with the rule, the backlog in MiB and the frame-end destroys. Ghost run (orbit,
+/// 182-212 s): 66-68% of lookups taken at 512 MiB against 60-64% for today's rule at 1,024 MiB.
 /// EXP101 (live, 0 = off, 1 = runs, 2 = cached page pointer + prefetch; fable52_answer_presenter): nvhost_gpu::SubmitGPFIFOImpl's pushbuffer
 /// snapshot reads runs of entries whose GPU addresses follow each other with one ReadBlockUnsafe
 /// instead of one per entry (OoT's presenting thread submits ~6,500 entries a frame; the loop is
