@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "video_core/buffer_cache/buffer_cache_base.h"
+#include "video_core/nx2_async_readback.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
@@ -611,6 +612,8 @@ void BufferCacheRuntime::WaitForHostRead(u64 tick) {
     if (master.IsFree(tick)) {
         return;
     }
+    namespace AsyncReadback = VideoCore::AsyncReadback;
+    const u64 start = AsyncReadback::Now();
     // SubmitForHostRead flushed it, so it is handed to the worker: wait without flushing, which
     // only the recording thread may do. Should a tick not be submitted yet, ask the split's back
     // for it, as WaitSubmittedTickImpl does.
@@ -618,10 +621,15 @@ void BufferCacheRuntime::WaitForHostRead(u64 tick) {
         !VideoCommon::GpuSplit::OnBackThread()) {
         if (!scheduler.WaitSubmitted(tick)) {
             scheduler.Wait(tick);
+            AsyncReadback::Add(AsyncReadback::g_counters.to_submitted_ns,
+                               AsyncReadback::Now() - start);
             return;
         }
     }
+    const u64 submitted = AsyncReadback::Now();
+    AsyncReadback::Add(AsyncReadback::g_counters.to_submitted_ns, submitted - start);
     master.Wait(tick);
+    AsyncReadback::Add(AsyncReadback::g_counters.on_card_ns, AsyncReadback::Now() - submitted);
 }
 
 bool BufferCacheRuntime::IsFreeNow(u64 tick) {

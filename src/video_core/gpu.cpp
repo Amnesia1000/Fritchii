@@ -368,6 +368,8 @@ struct GPU::Impl {
             });
             gpu_thread.TickGPU(is_async);
             WaitForSyncOperation(fence);
+            AsyncReadback::Add(AsyncReadback::g_counters.to_flushed_ns,
+                               AsyncReadback::Now() - request);
         }
         AsyncReadback::Read kind = AsyncReadback::Read::Sync;
         if (async) {

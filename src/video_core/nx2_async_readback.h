@@ -56,6 +56,12 @@ struct Counters {
     std::atomic<u64> clear_landings{};
     std::atomic<u64> clear_waits{};
     std::atomic<u64> clear_wait_ns{};
+    /// Where an async read's time goes (fable52_answer_after7778 5): from the request until the
+    /// GPU thread ran its flush (queued behind the ring), then in WaitForHostRead until the worker
+    /// submitted the download, then on the host GPU until the fence signalled.
+    std::atomic<u64> to_flushed_ns{};
+    std::atomic<u64> to_submitted_ns{};
+    std::atomic<u64> on_card_ns{};
     std::atomic<u64> window_start{};
 };
 
@@ -130,6 +136,9 @@ inline void MaybeReport() {
     const u64 clear_landings = take(c.clear_landings);
     const u64 clear_waits = take(c.clear_waits);
     const u64 clear_wait_ns = take(c.clear_wait_ns);
+    const u64 to_flushed_ns = take(c.to_flushed_ns);
+    const u64 to_submitted_ns = take(c.to_submitted_ns);
+    const u64 on_card_ns = take(c.on_card_ns);
     constexpr auto sync = static_cast<size_t>(Read::Sync);
     constexpr auto async = static_cast<size_t>(Read::Async);
     constexpr auto in_flight = static_cast<size_t>(Read::InFlight);
@@ -146,6 +155,11 @@ inline void MaybeReport() {
              ms_per_second(reader_wait_ns), static_cast<double>(reader_max_wait_ns) / 1e6,
              per_second(gpu_side_waits), ms_per_second(gpu_side_wait_ns),
              per_second(clear_landings), per_second(clear_waits), ms_per_second(clear_wait_ns));
+    LOG_INFO(HW_GPU,
+             "Read-back wait split per second: request to the GPU thread's flush {:.1f} ms, then "
+             "until the worker submitted the download {:.1f} ms, then on the host GPU {:.1f} ms",
+             ms_per_second(to_flushed_ns), ms_per_second(to_submitted_ns),
+             ms_per_second(on_card_ns));
 }
 
 } // namespace VideoCore::AsyncReadback
