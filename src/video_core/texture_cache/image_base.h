@@ -144,6 +144,9 @@ struct ImageBase {
 
     u64 modification_tick = 0;
     size_t lru_index = SIZE_MAX;
+    /// The frame tick of the last LRU touch (TextureCache::TouchImageLru, EDEN_NX2_EXP90); reset
+    /// when the image gets a new LRU node.
+    u64 lru_touched_tick = ~u64{0};
 
     /// Render target relocation guard (EXP43): the frame the GPU last wrote the image (~0 =
     /// never, or contents discarded), and the guard reasons this image already reported.

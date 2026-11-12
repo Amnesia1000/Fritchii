@@ -511,6 +511,12 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// translation redone at FlushCaching. Both mismatch counts must stay 0. Same family as EXP85
 /// (its inline writes reach FlushCaching with & 1) and CB_DIRECT (& 2 replaces it). "Constant
 /// buffer path (EXP88" logs the counters every 5 s while not 0.
+/// EXP90 (live, 0 = off; Fable, fable52_answer_after88 2; TextureCache::TouchImageLru): an image's
+/// LRU node is touched once a frame, decided from a frame tick kept on the image
+/// (ImageBase::lru_touched_tick) instead of reading the node (a cache miss) on every
+/// PrepareImage, the way EXP18 & 4 does it for buffers. Exact: the node already ignores a second
+/// touch with the same tick, so the LRU order and the ticks eviction and the sweeps read stay the
+/// same. "Image LRU touch (EXP90" logs touches made and skipped every 5 s while not 0.
 /// EXP85 (live, bits, 0 = off; fable52_answer_microcuts 1 and 2b): 1 = a small inline upload to
 /// pages no GPU write ever marked skips the buffer cache's lock (InlineMemory would find nothing
 /// there; the list note and the query cache as before), 2 = BufferCache::WriteMemory answers
