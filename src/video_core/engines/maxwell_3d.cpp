@@ -57,7 +57,7 @@ namespace Tegra::Engines {
 /// First register id that is actually a Macro call.
 constexpr u32 MacroRegistersStart = 0xE00;
 
-// EDEN_NX2_3D_METHODS: log the first write to each 3D register (finds methods Eden doesn't model).
+// EDEN_NX2_3D_METHODS: log the first write to each 3D register (finds methods the emulator doesn't model).
 static const bool g_trace_first_method_writes = std::getenv("EDEN_NX2_3D_METHODS") != nullptr;
 
 Maxwell3D::Maxwell3D(MemoryManager& memory_manager_)

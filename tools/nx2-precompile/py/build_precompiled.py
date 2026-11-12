@@ -1,4 +1,4 @@
-"""Writes a game's precompiled pipeline file (NX2PREP1) for Lichii's PreparePrecompiled.
+"""Writes a game's precompiled pipeline file (NX2PREP1) for Fritchii's PreparePrecompiled.
 
 Records, all with canonical keys (statefields.canonical, as FixedPipelineState::CanonicalizeNative):
   * every pipeline recorded in the training caches, with its recorded environments;
@@ -41,7 +41,7 @@ ap.add_argument('--mesh-combos', help='(task, mesh, pixel) combinations, mesh_va
 ap.add_argument('--mesh-envs', help='NXPMESH1 file, nx2-precompile mesh-envs')
 ap.add_argument('--mesh-k', type=int, default=2)
 ap.add_argument('--cache-version', type=int, required=True,
-                help="the Lichii build's VulkanPipelineCacheVersion (the file name's v<N>)")
+                help="the Fritchii build's VulkanPipelineCacheVersion (the file name's v<N>)")
 args = ap.parse_args()
 
 inv = json.load(open(args.inventory))

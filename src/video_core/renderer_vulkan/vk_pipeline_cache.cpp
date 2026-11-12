@@ -651,7 +651,7 @@ bool GraphicsPipelineCacheKey::operator==(const GraphicsPipelineCacheKey& rhs) c
 }
 
 namespace {
-// NVIDIA's and AMD's drivers keep a disk cache of built pipelines of their own. Eden's copy on top
+// NVIDIA's and AMD's drivers keep a disk cache of built pipelines of their own. The emulator's copy on top
 // only kept every pipeline the title ever built in host memory (title 1: a 245 MB file, ~0.35 GB
 // of RAM for the session) and copied it whole at each save, which stalled frames; pipelines built
 // no slower without it.
@@ -725,7 +725,7 @@ bool AmdAppCache(const Device& device) {
 }
 
 /// Intel's Windows driver keeps a disk cache of its own (%LOCALAPPDATA%Low\Intel\ShaderCache,
-/// one file per program: ~476 MB for Lichii after a session on an Arc B580), so the preparation
+/// one file per program: ~476 MB for an earlier build after a session on an Arc B580), so the preparation
 /// can build into it. Our VkPipelineCache file is kept beside it for what play builds, as
 /// EDEN_NX2_AMD_APP_CACHE does on AMD: the boot rebuilds of earlier sessions' pipelines read it
 /// (3014 pipelines in 7 s), whatever the driver's cache evicted. EDEN_NX2_INTEL_DRIVER_CACHE=0

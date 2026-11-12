@@ -497,7 +497,7 @@ void TextureCache<P>::TickFrame() {
         }
     }
     if constexpr (HAS_DEVICE_MEMORY_INFO) {
-        // Switch 2 titles (native tiling) stream far more texture data than Eden's thresholds
+        // Switch 2 titles (native tiling) stream far more texture data than the original thresholds
         // were tuned for: title 1's attract loop alone keeps ~5.3 GB resident, so the collector
         // sat in aggressive mode evicting decoded ASTC (and decoding it again). Total use is
         // measured from the driver, so collect only near the device budget instead.
@@ -512,7 +512,7 @@ void TextureCache<P>::TickFrame() {
         }
         // Follow the driver's budget (re-read now and then): it shrinks when other programs use
         // VRAM (another game: 7.0 -> 6.4 GB), and collecting only past it means the driver pages
-        // textures out. It is also the room to use: Eden's device memory figure is capped near
+        // textures out. It is also the room to use: the emulator's device memory figure is capped near
         // 7 GB, which on a 12 GB card (11.2 GB budget) kept title 1 evicting textures with 3 GB
         // unused. Both thresholds stay under it with a margin (1/8 of it, at most 1 GiB): past it
         // allocations fail and images end up unbacked (garbage textures), and Windows shrinks the

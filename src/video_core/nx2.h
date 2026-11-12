@@ -22,7 +22,7 @@
 namespace Tegra {
 
 // Set once a Switch 2 (Ampere, NVN2) driver is talking to the GPU. Its command streams use
-// Ampere classes and the Turing+ macro ISA, which Eden's Maxwell engines don't implement.
+// Ampere classes and the Turing+ macro ISA, which the emulator's Maxwell engines don't implement.
 inline std::atomic<bool> g_nx2_ampere{false};
 
 // Device pages the GPU has written through the buffer cache (shader stores, copies), ever. Title 1
@@ -552,7 +552,7 @@ private:
 };
 
 /// Channels suspended on a semaphore acquire. A console channel polls and sees every release;
-/// Eden writes releases in bursts when fences signal and resumes waiters only between command
+/// The emulator writes releases in bursts when fences signal and resumes waiters only between command
 /// lists, so an acquire-equal could miss its value. Writes latch the waiters they satisfy.
 class Nx2SemaphoreWaiters {
 public:

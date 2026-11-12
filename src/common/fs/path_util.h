@@ -279,7 +279,7 @@ void SetAppDirectory(const std::string& app_directory);
 void SetEdenPath(EdenPath eden_path, const std::filesystem::path& new_path);
 
 /**
- * Creates all necessary Eden paths in the filesystem.
+ * Creates all necessary Fritchii paths in the filesystem.
  */
 void CreateEdenPaths();
 
@@ -321,14 +321,14 @@ void SetEdenPath(EdenPath eden_path, const Path& new_path) {
 [[nodiscard]] std::filesystem::path GetHomeDirectory();
 
 /**
- * Gets the relevant paths for yuzu to store its data based on the given XDG environment variable.
+ * Gets the relevant paths for Fritchii to store its data based on the given XDG environment variable.
  * See https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html
  * Defaults to $HOME/.local/share for main application data,
  * $HOME/.cache for cached data, and $HOME/.config for configuration files.
  *
  * @param env_name XDG environment variable name
  *
- * @returns The path where yuzu should store its data.
+ * @returns The path where Fritchii should store its data.
  */
 [[nodiscard]] std::filesystem::path GetDataDirectory(const std::string& env_name);
 

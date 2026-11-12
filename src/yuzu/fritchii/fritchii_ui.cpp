@@ -265,7 +265,7 @@ void RestructureMenus(Ui::MainWindow& ui, QMainWindow& window, const MenuHooks& 
     tools->addMenu(advanced);
     ui.menubar->removeAction(ui.menu_Multiplayer->menuAction());
 
-    // Help: the log first; Eden's mods page leaves the menu.
+    // Help: the log first; the original mods page leaves the menu.
     auto* export_log = new QAction(tr("&Export Log..."), &window);
     QObject::connect(export_log, &QAction::triggered, &window, hooks.export_log);
     ui.menu_Help->removeAction(ui.action_Open_Mods_Page);

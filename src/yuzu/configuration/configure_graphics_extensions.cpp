@@ -80,7 +80,7 @@ void ConfigureGraphicsExtensions::Setup(const ConfigurationShared::Builder& buil
     std::map<u32, QWidget*> hacks_hold{}; // A map will sort the data for us
 
     if (FritchiiUi::Enabled()) {
-        // Where Lichii has its "Pin GPU threads" toggle: players kept asking for it.
+        // Where other builds have their "Pin GPU threads" toggle: players kept asking for it.
         auto* pinning = new QLabel(tr("<b>GPU thread pinning is built in.</b><br>On automatically, nothing "
                                       "to turn on. Fritchii had it first."),
                                    this);

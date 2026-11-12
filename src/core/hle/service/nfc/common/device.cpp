@@ -626,7 +626,7 @@ Result NfcDevice::Restore() {
         }
     }
 
-    // Restore mii data in case is corrupted by previous instances of yuzu
+    // Restore mii data in case is corrupted by previous instances of the emulator
     if (tag_data.settings.settings.amiibo_initialized && !tag_data.owner_mii.IsValid()) {
         LOG_ERROR(Service_NFP, "Regenerating mii data");
         Mii::StoreData new_mii{};

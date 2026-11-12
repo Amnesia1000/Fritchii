@@ -259,7 +259,7 @@ std::optional<std::string> HttpGetUrl(const std::string& full_url, DetectionBudg
     QNetworkRequest request(url);
     request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
                          QNetworkRequest::ManualRedirectPolicy);
-    request.setRawHeader("User-Agent", "Eden icon lookup");
+    request.setRawHeader("User-Agent", "Fritchii icon lookup");
     request.setRawHeader("Accept-Encoding", "identity");
 
     std::string body;
@@ -732,7 +732,7 @@ void ConfigurePerGame::OnDetectNupIcon() {
                     return out;
                 }
 
-                // 2. Check Eden official boxart repository
+                // 2. Check the official boxart repository
                 if (!slug.empty()) {
                     std::vector<std::string> candidate_slugs{slug};
                     if (!slug.starts_with("the-legend-of-")) {

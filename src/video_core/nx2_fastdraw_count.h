@@ -139,7 +139,7 @@ inline void Init() {
         g_on = value != nullptr && value[0] == '1';
         if (g_on) {
             LOG_INFO(HW_GPU, "Delta draw count on (EDEN_NX2_FASTDRAW_COUNT=1): counting only, "
-                             "zortos293/Lichii#1161 rules");
+                             "ported rules");
         }
         return true;
     }();

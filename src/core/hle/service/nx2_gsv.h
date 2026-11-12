@@ -177,7 +177,7 @@ private:
 //   NVN's NvOsEventPool asks for slots and multi-waits on them.
 // - TIPC 201(slot, counter, u64 value, mode): signal the slot's event once the counter reaches
 //   value. The counter is a SyncCounterId, the bitwise NOT of the host1x syncpoint id; mode 0
-//   compares 32-bit wrapping, mode 1 64-bit. Eden's guest syncpoints back it.
+//   compares 32-bit wrapping, mode 1 64-bit. The emulator's guest syncpoints back it.
 // - TIPC 202(slot): cancel the slot's request.
 class INx2SyncptSession final : public ServiceFramework<INx2SyncptSession> {
 public:
@@ -1871,7 +1871,7 @@ private:
             // With EDEN_NX2_FRAMES_AHEAD=1, only run a frame ahead while the GPU keeps up. With
             // the previous frame still on the GPU here, the GPU is the limit and running ahead
             // gains nothing; and Splatoon Raiders, which reuses its command memory as if the GPU
-            // were at most a frame behind, rewrote command lists Eden had not read yet (misread
+            // were at most a frame behind, rewrote command lists the emulator had not read yet (misread
             // commands, then crashes, with a slow GPU). Wait for this frame too then. Not when a
             // suspended channel brought us here: this frame can't finish before the present
             // returns.
@@ -1920,7 +1920,7 @@ private:
             m_frame_trace.last_present = entered;
         }
         // Where each frame's time goes on the present thread, averaged per 600 presents: the
-        // game is blocked here while Eden's GPU thread catches up (fence) and composites.
+        // game is blocked here while the emulator's GPU thread catches up (fence) and composites.
         {
             using us = std::chrono::microseconds;
             // long long like the stats: microseconds::rep is long on Linux (std::max needs one type).
@@ -1963,7 +1963,7 @@ private:
     // The console's compositor frees a buffer only once its frame's GPU fence has passed, which
     // is what keeps a game from running ahead of the GPU. This reply always reports every buffer
     // free, so pace the game here instead: wait (bounded, in case the GPU waits on the CPU) until
-    // Eden's GPU thread has processed the frame. Otherwise the game laps the GPU thread and
+    // The emulator's GPU thread has processed the frame. Otherwise the game laps the GPU thread and
     // rewrites command memory it hasn't read yet.
     u32 m_wait_timeouts{};
     struct PresentStats {
@@ -3760,7 +3760,7 @@ private:
         bytes.resize(layout.size);
         if (prepared.block_linear) {
             // Read on the GPU: RGBA (the blit's format 0xd5) in the native block-linear layout,
-            // 16-GOB blocks, as our Eden tree writes these images.
+            // 16-GOB blocks, as this tree writes these images.
             decoder->Render(*frame.picture, Tegra::Host1x::Nx2PictureFormat::Rgba8, prepared.width,
                             prepared.height, layout.pitch, 0, bytes);
             DumpFrame(image_id, bytes, layout, prepared.width, prepared.height);
@@ -4361,7 +4361,7 @@ private:
         rb.PushCopyObjects(ctx, m_syncpt_events[1]->GetReadableEvent());
     }
 
-    // Mirrors Eden's guest syncpoint values into the shared RO page. Returns true if any changed.
+    // Mirrors the emulator's guest syncpoint values into the shared RO page. Returns true if any changed.
     bool UpdateSyncptValues() {
         auto& manager = system.Host1x().GetSyncpointManager();
         bool changed = false;
@@ -4627,7 +4627,7 @@ private:
 
     // 428/426 for a decoder output image (Fire Emblem: Fortune's Weave's movie player blits each
     // one, block-linear RGBA, format 0xd5, block height 16 GOBs, into a texture of its own). The
-    // reply follows our Eden tree, where the movies play: words 3-4 the GPU address, 5-6 the last
+    // reply follows this tree, where the movies play: words 3-4 the GPU address, 5-6 the last
     // byte's address, then the descriptor {1, 0, dimensions, .., 0x01000001, 1, offset, size}
     // (offset 0 once mapped). 426 maps the image at its own address for the GPU: decoder pool
     // memory is process memory (114) that no GPU mapping covers, and the blit read zeros.
@@ -4835,7 +4835,7 @@ private:
     void OpenNvsrvSession(HLERequestContext& ctx) {
         // The SDK reads the handle at word 3 and the result at word 4.
         // nvsrv speaks the nvdrv INvDrvServices protocol (Open/Ioctl/Close/...,
-        // 13 = SetGraphicsFirmwareMemoryMarginEnabled), so serve it with Eden's nvdrv on the shared
+        // 13 = SetGraphicsFirmwareMemoryMarginEnabled), so serve it with the emulator's nvdrv on the shared
         // module. The nx2: name keeps unknown commands auto-stubbed and logged.
         LOG_WARNING(Service, "(STUBBED) nx2:gsv TIPC 1402, returning an nvdrv-backed nx2:nvsrv session");
         auto module = system.ServiceManager().GetService<Nvidia::NVDRV>("nvdrv", true)->GetModule();

@@ -415,7 +415,7 @@ private slots:
     void OnExportLog();
     /// A critical error box; Fritchii builds add an "Export Log..." button next to OK.
     void ShowErrorWithExportLog(const QString& title, const QString& text);
-    /// The Fritchii look (fritchii/main_window_fritchii.cpp); nothing in Lichii builds.
+    /// The Fritchii look (fritchii/main_window_fritchii.cpp); nothing in other builds.
     void SetUpFritchiiUi();
     void OnVerifyInstalledContents();
     void OnInstallFirmware();
@@ -608,7 +608,7 @@ private:
     std::unique_ptr<QtConfig> config;
     bool launched_with_game = false; ///< Started with a game path (skips the first-launch question)
 
-    // Whether emulation is currently running in yuzu.
+    // Whether emulation is currently running.
     bool emulation_running = false;
     bool boot_in_progress = false;
     bool close_pending = false;

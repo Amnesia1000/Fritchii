@@ -49,7 +49,7 @@ else()
 endif()
 
 if (FRIZTI_VERSION AND NOT LICHII_BUILD_TAG MATCHES "^build-[0-9]+$")
-    # Logs keep the commit: "Lichii Frizti vN | <branch>-<commit>".
+    # Logs keep the commit: "Fritchii vN | <branch>-<commit>".
     string(SUBSTRING ${GIT_COMMIT} 0 10 GIT_DESC)
 else()
     set(GIT_DESC ${BUILD_VERSION})
