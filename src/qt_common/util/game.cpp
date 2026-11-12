@@ -368,7 +368,7 @@ void ResetMetadata(bool show_message) {
 
 // Uhhh //
 
-// TODO(crueter): Make QtCommon::Shortcut
+// TODO: Make QtCommon::Shortcut
 // Messages in pre-defined message boxes for less code spaghetti
 inline constexpr bool CreateShortcutMessagesGUI(ShortcutMessages imsg, const QString& game_title) {
     int result = 0;
@@ -534,7 +534,7 @@ void CreateHomeMenuShortcut(ShortcutTarget target) {
     auto qlaunch_applet_nca = bis_system->GetEntry(QLaunchId, FileSys::ContentRecordType::Program);
     const auto game_path = qlaunch_applet_nca->GetFullPath();
 
-    // TODO(crueter): Make this use the Eden icon
+    // TODO: Make this use the Fritchii icon
     CreateShortcut(game_path, QLaunchId, "Switch Home Menu", target, "-qlaunch", false);
 }
 

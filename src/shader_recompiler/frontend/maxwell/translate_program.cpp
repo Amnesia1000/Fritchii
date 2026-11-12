@@ -408,7 +408,7 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
 
             if (!normalized_host_info.support_geometry_shader_passthrough) {
                 if (normalized_host_info.trim_lowered_geometry_passthrough) {
-                    // zortos293/Lichii#1466 (Eglantine#720): the lowered shader copies only
+                    // Ported fix: the lowered shader copies only
                     // Position and the generics; the mask's other bits (InstanceId, VertexId,
                     // FrontFace...) would declare stage inputs a geometry shader can't have.
                     // AMD's Windows driver closed the emulator compiling such a shader.
@@ -554,7 +554,7 @@ IR::Program MergeDualVertexPrograms(IR::Program& vertex_a, IR::Program& vertex_b
     result.info.stores.mask |= vertex_b.info.stores.mask;
 
     if (host_info.support_handle_table_arrays) {
-        // EDEN_NX2_LIGHT_TABLE_ARRAYS (zortos293/Lichii#1485): Vertex B's descriptors and storage
+        // EDEN_NX2_LIGHT_TABLE_ARRAYS: Vertex B's descriptors and storage
         // buffers join Vertex A's, which keep their indices; its handle programs and the
         // instructions of its blocks read them where they are here. The two halves are one
         // stage: their storage buffers share its limit.
@@ -565,7 +565,7 @@ IR::Program MergeDualVertexPrograms(IR::Program& vertex_a, IR::Program& vertex_b
         Optimization::RemapTextureDescriptors(vertex_b, descriptors);
         Optimization::RemapStorageBindings(vertex_b, storage_bindings);
     } else {
-        // As before the port of #1485.
+        // As before the port.
         Optimization::JoinTextureInfoLegacy(result.info, vertex_b.info);
         // The two halves are one stage: their storage buffers share its limit.
         Optimization::JoinStorageInfo(result.info, vertex_b.info,

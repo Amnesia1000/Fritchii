@@ -356,8 +356,8 @@ void EmitMeshPrologue(EmitContext& ctx) {
         if (!as_compute) {
             // A task that culls all its threads never writes the mesh workgroup count, and the
             // payload starts undefined: launching that many mesh workgroups hangs the GPU (OoT
-            // device loss on native mesh devices). Every invocation stores the zero (upstream
-            // 8e87cf5a66, SethRamey, Eglantine #684; zortos293/Lichii#1492).
+            // device loss on native mesh devices). Every invocation stores the zero (a ported
+            // fix).
             ctx.OpStore(PayloadWord(ctx, ctx.Const(1U)), ctx.u32_zero_value);
             Barrier(ctx);
             return;

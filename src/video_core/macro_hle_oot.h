@@ -14,7 +14,7 @@ namespace Tegra::OotMacros {
 // GPU thread's front by Maxwell3D::FrontRunMacro). A replacement is found by the hash of the
 // macro's code (HashMacro), so it only runs for the exact code it was written against.
 //
-// Ported from Skitchii (skolvolt/Lichii) 1.3, e8a0621152 (src/video_core/macro_hle_oot.h/.cpp,
+// Ported (src/video_core/macro_hle_oot.h/.cpp,
 // written by its author, who allowed us to use its code). In Fritchii the handlers are off by
 // default: EDEN_NX2_OOT_MACROS (live) 0 = every macro through the MME JIT, 1 = the handlers run
 // instead of the JIT, 2 = verify (the JIT runs and its writes count; the handler runs on copies
@@ -24,7 +24,7 @@ namespace Tegra::OotMacros {
 // A handler makes exactly the writes the JIT makes for the code, in the same order, with the same
 // values, and leaves the data RAM as the JIT would. It returns false, before any effect, for the
 // calls it can't reproduce exactly (a short FIFO, an out-of-range data RAM index, a write past
-// the macro methods, a loop the JIT would stop): those run through the JIT instead. (Skitchii's
+// the macro methods, a loop the JIT would stop): those run through the JIT instead. (The original's
 // exception, 0xe2c under its EDEN_NX2_OCCLUSION_HLE, is never taken here: OcclusionHle() is
 // false in Fritchii's contexts.)
 //
@@ -37,7 +37,7 @@ namespace Tegra::OotMacros {
 //                             `times` times the `count` (method, value) writes, in order
 //   void Fail(const char* e)  a failure the JIT would report after its effects so far
 //   u32 Read(u32 m) const     the front's copy of 3D register m
-//   bool OcclusionHle() const Skitchii's EDEN_NX2_OCCLUSION_HLE (0xe2c); false here
+//   bool OcclusionHle() const the original's EDEN_NX2_OCCLUSION_HLE (0xe2c); false here
 //   void FoldFirstInstance()  the next draw.end is an instance loop's first instance (no write;
 //                             in Fritchii FrontRunMacro's emit folds at that draw.end itself)
 
@@ -321,7 +321,7 @@ bool E2C(C& c) {
     }
     const u32 p0 = c.Param(0);
     if (c.OcclusionHle() && c.Count() == 3 && p0 <= 1 && (c.Param(1) & ~0x1ffffffU) == 0) {
-        // EDEN_NX2_OCCLUSION_HLE (from lichii-OoTPerf): the same comparison as render_enable on
+        // EDEN_NX2_OCCLUSION_HLE (from a ported OoT perf build): the same comparison as render_enable on
         // the report address (counters at +0 and +16), decided by the query fast path, host
         // conditional rendering or the back, instead of reading the counters on the front.
         // p0 = 0 renders when they differ (IfNotEqual), p0 = 1 when they are equal (IfEqual).

@@ -368,7 +368,7 @@ QString GetTranslatedGameIconSize(size_t index) {
 } // namespace
 
 #ifndef _WIN32
-// TODO(crueter): carboxyl does this, is it needed in qml?
+// TODO: carboxyl does this, is it needed in qml?
 inline static bool isDarkMode() {
 #if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
     const auto scheme = QGuiApplication::styleHints()->colorScheme();
@@ -2610,7 +2610,7 @@ void MainWindow::ShutdownGame() {
         return;
     }
 
-    // TODO(crueter): make this common as well (frontend_common?)
+    // TODO: make this common as well (frontend_common?)
     play_time_manager->Stop();
     OnShutdownBegin();
     OnEmulationStopTimeExpired();
@@ -2671,7 +2671,7 @@ void MainWindow::OnGameListLoadFile(QString game_path, u64 program_id) {
     BootGame(game_path, params);
 }
 
-// TODO(crueter): Common profile selector
+// TODO: Common profile selector
 void MainWindow::OnGameListOpenFolder(u64 program_id, GameListOpenTarget target,
                                       const std::string& game_path) {
     std::filesystem::path path;
@@ -2813,7 +2813,7 @@ static bool RomFSRawCopy(size_t total_size, size_t& read_size, QProgressDialog& 
     return true;
 }
 
-// TODO(crueter): All this can be transfered to qt_common
+// TODO: All this can be transfered to qt_common
 // Aldoe I need to decide re: message boxes for QML
 // translations_common? strings_common? qt_strings? who knows
 void MainWindow::OnGameListRemoveInstalledEntry(u64 program_id,
@@ -2836,7 +2836,7 @@ void MainWindow::OnGameListRemoveInstalledEntry(u64 program_id,
         return;
     }
 
-    // TODO(crueter): move this to QtCommon (populate async?)
+    // TODO: move this to QtCommon (populate async?)
     switch (type) {
     case QtCommon::Game::InstalledEntryType::Game:
         QtCommon::Game::RemoveBaseContent(program_id, type);
@@ -3057,7 +3057,7 @@ void MainWindow::OnGameListCreateShortcut(u64 program_id, const std::string& gam
 }
 
 void MainWindow::OnGameListOpenDirectory(const QString& directory) {
-    // TODO(crueter): QtCommon
+    // TODO: QtCommon
     std::filesystem::path fs_path;
     if (directory == QStringLiteral("SDMC")) {
         fs_path =
@@ -4232,7 +4232,7 @@ void MainWindow::OnLoadAmiibo() {
     LoadAmiibo(filename);
 }
 
-// TODO(crueter): does this need to be ported to QML?
+// TODO: does this need to be ported to QML?
 bool MainWindow::question(QWidget* parent, const QString& title, const QString& text,
                           QMessageBox::StandardButtons buttons,
                           QMessageBox::StandardButton defaultButton) {
@@ -4336,7 +4336,7 @@ void MainWindow::OnInstallFirmwareFromZIP() {
     OnCheckFirmwareDecryption();
 }
 
-// TODO(crueter): QtCommon this: game list populate can be a signal?
+// TODO: QtCommon this: game list populate can be a signal?
 void MainWindow::OnInstallDecryptionKeys() {
     // Don't do this while emulation is running.
     if (QtCommon::emu_thread != nullptr && QtCommon::emu_thread->IsRunning())
@@ -5546,7 +5546,7 @@ void MainWindow::UpdateStatusButtons() {
     UpdateVolumeUI();
 }
 
-// TODO(crueter): Use this for game list stuff
+// TODO: Use this for game list stuff
 void MainWindow::UpdateUISettings() {
     if (!ui->action_Fullscreen->isChecked()) {
         UISettings::values.geometry = saveGeometry();

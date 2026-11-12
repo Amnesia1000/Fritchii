@@ -46,7 +46,7 @@ enum class Type {
 /// Frames since start, moved by BufferCache::TickFrame. Hot page state is dropped every 128.
 inline std::atomic<u32> g_hot_page_epoch{0};
 
-/// Eglantine f27522bfb9 (kraibse): back thread 14.5 -> 13.8 ms a frame in OoT, protect calls
+/// Ported fix: back thread 14.5 -> 13.8 ms a frame in OoT, protect calls
 /// -71%. Fritchii: behind EDEN_NX2_EXP48 (live, default off) until a fight A/B and a flicker
 /// check: a hot page the CPU writes again after its upload in the same frame reaches the GPU
 /// one frame later. EDEN_NX2_HOT_PAGES=0 also turns it off.
@@ -67,7 +67,7 @@ inline std::atomic<bool> g_hot_pages_on{false};
     return g_hot_pages_on.load(std::memory_order_relaxed);
 }
 
-/// EXP109 (zortos293/Lichii#1161 f5902c6c68, lucastaonline): page tracking changes a thread
+/// EXP109: page tracking changes a thread
 /// applies itself once it drops the buffer cache's lock (RasterizerVulkan::OnCPUWrite): changing a
 /// page's host protection is a system call, and every other thread drawing or reading waited for
 /// it. Ours collects only untracking (ApplyCollectedRanges).
@@ -211,7 +211,7 @@ struct WordManager {
         }
     }
 
-    /// EXP108 (zortos293/Lichii#1436, from #1161 4c44094e30): ChangeRegionState(Type::CPU, true,
+    /// EXP108 (ported): ChangeRegionState(Type::CPU, true,
     /// ...) leaving the pages tracked (Untracked unchanged): pages tracked now stay tracked, so
     /// clearing the bits at the upload tracks nothing again. Ours also moves dirty_gen where a
     /// page gains its CPU bit (EDEN_NX2_STORAGE_SYNC_MEMO) and, with EXP48, drops the pages'
@@ -541,7 +541,7 @@ struct WordManager {
         if (ranges.empty())
             return;
         std::sort(ranges.begin(), ranges.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
-        // EXP109 (#1161 f5902c6c68): untracking, collected for after the lock. Only decrements:
+        // EXP109: untracking, collected for after the lock. Only decrements:
         // a page left protected a little longer only traps once more, while an increment applied
         // after another thread's decrement could let a page other users track drop its
         // protection in between.
@@ -748,7 +748,7 @@ struct WordManager {
 
     std::array<u64, size_t(Type::Max) * num_words> heap = {};
     /// Bit per word, set while the word has no CPU and no Untracked page (DirtyWords). Every
-    /// change to those words updates it: a per-word form of PR #161's upload_words count.
+    /// change to those words updates it: a per-word form of a ported upload_words count.
     u64 clean_words = 0;
     /// EDEN_NX2_STORAGE_SYNC_MEMO: bumped whenever a page of this manager gains a CPU or an
     /// Untracked bit (ChangeRegionStateImpl, FlushCachedWrites; the constructor's all-dirty

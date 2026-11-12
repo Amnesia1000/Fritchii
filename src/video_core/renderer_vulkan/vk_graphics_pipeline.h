@@ -112,7 +112,7 @@ struct MeshEmulationSetup {
 };
 
 /// The sampled textures and image descriptors of a draw, kept across frames (ConfigureImpl,
-/// EXP87, port of zortos293/Lichii#1447).
+/// EXP87, ported).
 using DrawTemplate =
     VideoCommon::DrawTemplate<DescriptorUpdateEntry,
                               Tegra::Engines::Maxwell3D::Regs::MaxShaderStage,
@@ -292,7 +292,7 @@ public:
         return kept_draw && kept_draw->valid ? kept_draw.get() : nullptr;
     }
 
-    /// Delta draws (D2; zortos293/Lichii#1161's ComputedHandlesChanged): whether a handle the
+    /// Delta draws (D2; the original ComputedHandlesChanged): whether a handle the
     /// kept draw computed with a handle program (from constant and storage buffers) evaluates to
     /// another value now with `maxwell3d_`'s constant buffers: a delta draw would keep views and
     /// samplers resolved from the old one. Needs a KeptLastDraw.
@@ -368,7 +368,7 @@ public:
     }
 
 private:
-    /// EDEN_NX2_EXP32 (texture binding memo; zortos293/Lichii#717's BINDMEMO reduced to "the same
+    /// EDEN_NX2_EXP32 (texture binding memo; the original BINDMEMO reduced to "the same
     /// textures as this pipeline's previous draw"): that draw's texture bindings as resolved and
     /// pushed, for pipelines whose image bindings are all sampled textures (no texture or image
     /// buffers, no storage images). A draw reading the same handles with the same texture cache
@@ -410,7 +410,7 @@ private:
                            std::span<const DescriptorUpdateEntry> descriptors,
                            std::span<const u8> rescaled, int switch_value);
 
-    /// EDEN_NX2_TEX_BANK_GEN (Hookshot (NotRexed/Hookshot) 11d2c1a's per-stage texture bank
+    /// EDEN_NX2_TEX_BANK_GEN (the recomp's per-stage texture bank
     /// generations): this pipeline's last resolved textures and what they were resolved from.
     /// Only for pipelines whose bindings are all sampled textures with handles read straight
     /// from constant buffers (TexBankEligible).

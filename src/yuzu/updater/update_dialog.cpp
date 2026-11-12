@@ -168,7 +168,7 @@ UpdateDialog::UpdateDialog(const Common::Net::Release& release,
         return;
     }
 
-    // TODO(crueter): Find a way to set default
+    // TODO: Find a way to set default
     const auto assets = release.GetPlatformAssets();
 
     if (assets.empty()) {
@@ -373,7 +373,7 @@ bool UpdateDialog::DownloadTo(const QString& filename) {
         return false;
     }
 
-    // TODO(crueter): Move to net.cpp
+    // TODO: Move to net.cpp
     constexpr std::size_t timeout_seconds = 15;
 
     std::unique_ptr<httplib::Client> client = std::make_unique<httplib::Client>(m_asset.url);

@@ -192,7 +192,7 @@ QString UnzipFirmwareToTmp(const QString& location) {
 
     QFile zip(location);
 
-    // TODO(crueter): use QtCompress
+    // TODO: use QtCompress
     QStringList result = JlCompress::extractDir(&zip, qCacheDir);
     if (result.isEmpty()) {
         return QString();

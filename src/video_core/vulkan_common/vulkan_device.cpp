@@ -806,7 +806,7 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     }
 #ifdef EGLANTINE_STREAMLINE
     // NVIDIA's DLSS needs buffer device addresses: keep the feature enabled for
-    // it, but leave Eglantine's own buffers as they are without descriptor buffers.
+    // it, but leave the emulator's own buffers as they are without descriptor buffers.
     const bool dlss_wants_device_address =
         streamline_extensions && features.buffer_device_address.bufferDeviceAddress;
     if (!extensions.descriptor_buffer && dlss_wants_device_address) {
@@ -849,8 +849,8 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     VmaVulkanFunctions functions{};
     functions.vkGetInstanceProcAddr = dld.vkGetInstanceProcAddr;
     functions.vkGetDeviceProcAddr = dld.vkGetDeviceProcAddr;
-    // EDEN_NX2_VMA_NO_PREFER_DEDICATED (boot, default on, 0 = off; from Skitchii 9fb0cdd0a4,
-    // skolvolt/Lichii; with 32 MiB blocks market A/B 2026-11-11: off 41.4/40.3, on 41.5/42.8 fps,
+    // EDEN_NX2_VMA_NO_PREFER_DEDICATED (boot, default on, 0 = off; ported;
+    // with 32 MiB blocks market A/B 2026-11-11: off 41.4/40.3, on 41.5/42.8 fps,
     // same VRAM):
     // images the driver only *prefers* in their own memory (NVIDIA: render and depth targets) go
     // in VMA's blocks instead. OoT makes and frees ~2-3 short-lived depth targets a frame (shadow
@@ -935,7 +935,7 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
             // after ten minutes, with 32 MiB ones ~0.5 GB: a block drains only once all of its
             // images are gone, and fewer per block drain sooner. VMA gives allocations over half a
             // block (8 MiB) their own memory, which goes back to the driver when they are freed.
-            // EDEN_NX2_VMA_BLOCK_MIB (boot, default 32; from Skitchii 90fb5ec005): OoT docked
+            // EDEN_NX2_VMA_BLOCK_MIB (boot, default 32; ported): OoT docked
             // makes 6-9 MiB shadow-map depth targets anew every frame, each its own allocation
             // over half a 16 MiB block. 16 = the old size (fewer holes in long sessions, above).
             .preferredLargeHeapBlockSize = [] {
@@ -1734,8 +1734,8 @@ void Device::RemoveUnsuitableExtensions() {
                                        VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
 
     // VK_EXT_robustness2
-    // AMD keeps robustBufferAccess2 (zortos293/Lichii capy/amd-prep-robustness2 bbac5266ef, from
-    // CheezyEmu c08bd7432b): games read storage buffers out of bounds and AMD returned garbage
+    // AMD keeps robustBufferAccess2 (a ported AMD fix):
+    // games read storage buffers out of bounds and AMD returned garbage
     // without it (OoT's fog compute shader 75d4369f3b1f5868 filled distant froxels with huge
     // values and turned the Hyrule Field sky white). It needs robustBufferAccess, which every
     // device here enables (a required feature). Only where the driver offers it: the queried
@@ -1847,7 +1847,7 @@ void Device::RemoveUnsuitableExtensions() {
         extensions.mesh_shader = false;
     }
     // The Mesh Shaders setting. Automatic leaves the extension disabled on AMD drivers: native
-    // task/mesh draws hang AMD GPUs (#316, #670, #672, #871). RADV resets the GPU on RX 6000, 7000
+    // task/mesh draws hang AMD GPUs. RADV resets the GPU on RX 6000, 7000
     // and 9000 cards (Mesa 26.0 to 27.0-devel; 26.2.6 still hangs, though it recovers more often),
     // and AMD's own driver times out on the Radeon 780M. The compute fallback avoids the hangs, but
     // it can be slower in scenes full of foliage and skips the mesh programs it can't run
@@ -1933,7 +1933,7 @@ void Device::RemoveUnsuitableExtensions() {
             LOG_INFO(Render_Vulkan, "Cooperative matrices off: AMD GPU without matrix units");
         }
         // EDEN_NX2_NO_COOP_MATRIX=1 keeps HMMA on the software path, for A/B runs and for drivers
-        // the checks above miss (#634: amdvlk64.dll crash on an RX 6900 XT).
+        // the checks above miss (a reported amdvlk64.dll crash on an RX 6900 XT).
         const char* const no_coop_matrix = std::getenv("EDEN_NX2_NO_COOP_MATRIX");
         const bool forced_off = no_coop_matrix != nullptr && *no_coop_matrix != '\0' &&
                                 std::string_view{no_coop_matrix} != "0";
@@ -1975,7 +1975,7 @@ void Device::RemoveUnsuitableExtensions() {
         cooperative_hmma_16x16x16 =
             usable && has_shape(16, 16) && IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT);
         // Intel Xe2 (ANV) only has 8x16x16: each HMMA is two products of 8 rows. Intel only, so
-        // NVIDIA and AMD keep exactly the paths above (zortos293/Lichii#779, measured on Mesa
+        // NVIDIA and AMD keep exactly the paths above (ported, measured on Mesa
         // ANV). Intel's Windows driver too: its "broken float16 math" workaround only turns off
         // float16 arithmetic in translated shaders (float16_math); the device keeps shaderFloat16
         // for the matrices (see where float16_math is set). Arc B580, driver 101.9150: the
@@ -2117,7 +2117,7 @@ void Device::ReleaseCustomBorderColorSamplers(size_t count) const {
 }
 
 u64 Device::GetDeviceMemoryUsage() const {
-    // EDEN_NX2_EXP29 & 1 (zortos293/Lichii#717 EDEN_NX2_MEMSTAT_MS): the buffer and texture
+    // EDEN_NX2_EXP29 & 1 (the original's EDEN_NX2_MEMSTAT_MS): the buffer and texture
     // caches ask every frame; with the budget extension each answer is a driver and OS query.
     // An answer younger than 50 ms is reused (so the caches' GC sees usage up to 50 ms old).
     if ((VideoCore::Nx2Debug::Experiment(29) & 1) == 0) {

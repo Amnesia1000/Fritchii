@@ -336,7 +336,7 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu
                                        !Tegra::Nx2MayBeGpuWritten(page_begin, page_end - page_begin);
         if (never_gpu_written || !gpu_modified_ranges.Intersects(page_begin, page_end - page_begin)) {
             if (!Nx2Perf::Verify()) {
-                // EXP108 (zortos293/Lichii#1436, from #1161 4c44094e30): untracking the pages
+                // EXP108 (ported): untracking the pages
                 // and tracking them again at the upload changed their host protection twice (two
                 // VirtualProtect calls each, ~4% of the GPU thread at OoT's water) for writes no
                 // guest CPU access saw. Ours also wants no GPU-modified bit on the pages: a
@@ -1119,7 +1119,7 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
     MarkVertexBuffersStale(*cpu_dest_address, amount);
     // Guest memory gets the copy below (the scoped write at the end), which holds every byte the
     // source has in guest memory: command list pages in the destination read those from it, and
-    // their copies are stale (zortos293/Lichii#805 34656e8225). The bytes copied from GPU-written
+    // their copies are stale. The bytes copied from GPU-written
     // source ranges are noted as GPU writes after this.
     Nx2NoteListHostWrite(*cpu_dest_address, amount);
 
@@ -1185,8 +1185,8 @@ bool BufferCache<P>::DMAClear(GPUVAddr dst_address, u64 amount, u32 value) {
     if (!cpu_dst_address) {
         return false;
     }
-    // `amount` counts words: the check looked at a quarter of the range (zortos293/Lichii#805
-    // 34656e8225).
+    // `amount` counts words: the check looked at a quarter of the range (fixed in a
+    // ported change).
     const size_t size = amount * sizeof(u32);
     const bool dest_dirty = IsRegionRegistered(*cpu_dst_address, size);
     if (!dest_dirty) {
@@ -1604,7 +1604,7 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
     // binding is up to 8 MiB past it, and marking all of it defers the CPU's later writes to those
     // pages until the next fence and has fences copy the over-marked range back.
     u64 mark = binding.size;
-    // EDEN_NX2_EXP1=1: mark the whole binding as before (#415's A/B).
+    // EDEN_NX2_EXP1=1: mark the whole binding as before (the original A/B).
     if (native_pointer && is_written && binding.size != 0 &&
         VideoCore::Nx2Debug::Experiment(1) == 0) {
         switch (Settings::values.native_compute_write_mark.GetValue()) {
@@ -2328,7 +2328,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     // (Splatoon Raiders: the dialogue box corners in c1). Writes to that memory can go unnoticed by
     // the memory tracker, leaving stale host contents, so check such a bank on every bind: games
     // rewrite per-draw data between draws, and checking once per frame left it stale for a frame
-    // now and then (white flashes in Ocarina of Time, Eglantine 031e07436c).
+    // now and then (white flashes in Ocarina of Time).
     // Decided before the bank check, which changes nothing it reads (marking pages CPU-modified
     // leaves their GPU bits alone).
     // EDEN_NX2_RUNAHEAD: behind the run-ahead frontier guest memory may already hold the next
@@ -2346,7 +2346,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                                   size != 0 && gpu_memory != nullptr &&
                                   gpu_memory->UsesNativeTiling() &&
                                   !memory_tracker.IsRegionGpuModified(device_addr, size);
-    // EDEN_NX2_EXP26 & 1 (zortos293/Lichii#717 EDEN_NX2_BUFCACHE_BANK): a bind that streams the
+    // EDEN_NX2_EXP26 & 1 (the original's EDEN_NX2_BUFCACHE_BANK): a bind that streams the
     // buffer skips the check. The stream copies guest memory itself; the write flags the check
     // would take stay set for the next bind that reads the host buffer.
     const int bank_trims = native_bank_bind ? VideoCore::Nx2Debug::Experiment(26) : 0;
@@ -3111,7 +3111,7 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
     SelectNativeBankStore();
     auto& stats = native_bank_tracked_stats;
     ++stats.binds;
-    // EDEN_NX2_BANK_SLOT_STATS (Hookshot research idea 1, step 1): the same counts per constant
+    // EDEN_NX2_BANK_SLOT_STATS (recomp research idea 1, step 1): the same counts per constant
     // buffer index, to see which of NVN2's banks (c0 driver, c1 program, c2 handles, c3+ the
     // game's) the 64 KiB binds are and which of them ever change outside our own writes.
     NativeBankSlotStats* const slot_stats =
@@ -3124,7 +3124,7 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
         ++slot_stats->binds;
         slot_stats->stages |= 1u << stage;
     }
-    // EDEN_NX2_BANK_SLOTS (Hookshot (NotRexed/Hookshot) research idea 1): banks NVN2's driver
+    // EDEN_NX2_BANK_SLOTS (recomp research idea 1): banks NVN2's driver
     // writes only through the command stream (c0, c2) or never (c1) change only through writes
     // that set a flag: our own constant buffer words reach the buffer cache's WriteMemory at
     // FlushCaching (g_buffer_write_pages), guest CPU writes on tracked pages are collected
@@ -3351,7 +3351,7 @@ void BufferCache<P>::NoteNativeBankPageChanged(DAddr page, [[maybe_unused]] cons
                                                [[maybe_unused]] Buffer* upload_to,
                                                [[maybe_unused]] NativeBankUploads& uploads) {
     if constexpr (USE_MEMORY_MAPS_FOR_UPLOADS) {
-        // EDEN_NX2_EXP26 & 4 (zortos293/Lichii#717 UploadNativeBank): copy the page from its
+        // EDEN_NX2_EXP26 & 4 (the original's UploadNativeBank): copy the page from its
         // snapshot now and leave its tracking alone (marking it CPU-modified costs two
         // VirtualProtect calls). Only for a page that lies whole in the bound buffer and holds no
         // GPU-written data, so the guest bytes are what its host copy should hold.
@@ -4452,7 +4452,7 @@ auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool 
             }
             // Pages the CPU writes the lists of (GPU-written once, long before) stay synced, and
             // with EXP40 & 1 a list on none of the words GPU work wrote since the page was flushed
-            // is in guest memory too: it waits for no copy (zortos293/Lichii#805 34656e8225).
+            // is in guest memory too: it waits for no copy.
             if (entry.synced_writes == entry.writes ||
                 (words && entry.flushed && !Nx2HasListWords(entry, offset, offset + out.size()))) {
                 return Nx2ListRead::Synced;
@@ -5663,7 +5663,7 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
             if (native_pointer) {
                 const u32 bare = (std::min)(memory_layout_size, static_cast<u32>(8_MiB));
                 // Mario Kart World's lighting passes read past 8 MiB from theirs, inside the size
-                // word after the pointer (Eglantine #609 reads it): capped at 8 MiB those reads
+                // word after the pointer (a ported change reads it): capped at 8 MiB those reads
                 // came back zero and lit land and characters too dark. A read-only compute binding
                 // takes a larger size word. Binding to the end of the mapping instead spanned
                 // Ocarina of Time's ~1 GiB heap and backed it with a 1 GiB buffer.

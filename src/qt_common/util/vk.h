@@ -70,6 +70,6 @@ public:
     const bool fsr4_capable; ///< VideoCommon::IsFsr4CapableGpu
 };
 
-// TODO(crueter): Port some configure_graphics.cpp stuff
+// TODO: Port some configure_graphics.cpp stuff
 void PopulateRecords(std::vector<Record>& records, QWindow* window);
 } // namespace VkDeviceInfo

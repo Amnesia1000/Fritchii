@@ -59,7 +59,7 @@ UserDataMigrator::UserDataMigrator(QMainWindow* main_window) {
     if (!FrontendCommon::NeedsLegacyProfileImport()) {
         return;
     }
-    // Fritchii imports on its own; zortos's choice dialog stays behind a switch for support.
+    // Fritchii imports on its own; the original choice dialog stays behind a switch for support.
     if (qEnvironmentVariableIntValue("EDEN_NX2_IMPORT_PROMPT") == 0) {
         AutoImport(main_window);
         return;

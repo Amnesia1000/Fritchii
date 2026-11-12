@@ -126,8 +126,7 @@ struct ComputePipelineCacheEntry {
     /// Constant buffer slots bound as storage buffer pointers (see MappedStoragePointerKeys)
     std::vector<u64> mapped_pointers;
     u32 rebuilds{};
-    /// A rebuild still compiling: dispatches keep this entry's pipeline until it is ready
-    /// (zortos293/Lichii#969).
+    /// A rebuild still compiling: dispatches keep this entry's pipeline until it is ready.
     std::unique_ptr<ComputePipelineCacheEntry> pending;
     /// GPU thread: frame_count at the last dispatch through this entry (EXP51 eviction)
     u64 last_use_frame{};
@@ -306,7 +305,7 @@ private:
     mutable std::unordered_set<GPUVAddr> listed_persistent_targets;
 
     /// With `keep_pointers`, the slots an evicted pipeline of this key bound stay storage buffer
-    /// pointers whatever they hold now (from zortos293/Lichii#1143).
+    /// pointers whatever they hold now (ported).
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline(
         const VideoCommon::EvictedPointerSlots::Slots* keep_pointers = nullptr);
 
@@ -350,7 +349,7 @@ private:
         std::unique_ptr<EmissionBudget::Reservation> reservation = nullptr,
         bool libraries_only = false, TranslationRecord* record = nullptr);
 
-    /// EDEN_NX2_PRECOMPILED_FAST (zortos293/Lichii#896): the current key's pipeline from the
+    /// EDEN_NX2_PRECOMPILED_FAST: the current key's pipeline from the
     /// shader infos and SPIR-V the precompiled preparation kept, when the key is precompiled and
     /// the game's state answers the recorded environments' questions as they were answered
     /// (FileEnvironment::AnswersHoldFor): created on the GPU thread without translating, built on
@@ -494,7 +493,7 @@ private:
     /// Waits until the warm-up may build (ShaderNotify::WarmMayBuild). False when it is to stop.
     bool WaitForWarmTurn(std::stop_token stop);
 
-    /// EDEN_NX2_PRECOMPILE (zortos293/Lichii#895): finds or assembles the title's precompiled
+    /// EDEN_NX2_PRECOMPILE: finds or assembles the title's precompiled
     /// file (VideoCommon::Nx2Precompile) and prepares it on precompile_thread, at idle priority
     /// while the game runs. Prepare Shaders Now (ShaderNotify::RequestPrecompile) prepares it
     /// again. Started at the end of LoadDiskResources.
@@ -506,7 +505,7 @@ private:
     /// before they are first drawn. Draws never use these pipelines: they build their own from
     /// the guest's shaders and find the driver's compiled code. Runs once per precompiled file,
     /// driver and release (or again when `force`). Fritchii runs it on precompile_thread,
-    /// so `callback` (the loading screen in #895) is empty and progress goes to ShaderNotify.
+    /// so `callback` (the loading screen in the ported feature) is empty and progress goes to ShaderNotify.
     void PreparePrecompiled(const std::filesystem::path& base_dir, std::stop_token stop_loading,
                             const VideoCore::DiskResourceLoadCallback& callback,
                             const std::filesystem::path& file = {}, bool force = false);
@@ -515,7 +514,7 @@ private:
     void RecordedKeyForThisDevice(GraphicsPipelineCacheKey& key) const noexcept;
 
     /// Native pipelines: the key without state that cannot change the pipeline (see
-    /// FixedPipelineState::CanonicalizeNative), with #895's attribute mask from the header. Not
+    /// FixedPipelineState::CanonicalizeNative), with the ported attribute mask from the header. Not
     /// called: EDEN_NX2_CANONICAL_KEYS=1 canonicalizes draws, the loader and the precompiled
     /// preparation with CanonicalizeKeyState (vk_pipeline_cache.cpp), which leaves the attribute
     /// types to VideoCommon::KeyedAttributeTypes, the masking our keys had before.
@@ -523,7 +522,7 @@ private:
                                std::span<const Shader::Environment* const> envs) const noexcept;
 
     /// Native vertex programs found to load attributes their header does not list: their keys
-    /// keep every attribute type (#895).
+    /// keep every attribute type.
     bool IsUnmaskedVertexProgram(u64 hash) const {
         if (!any_unmasked_vertex_program.load(std::memory_order_acquire)) {
             return false;
@@ -587,8 +586,8 @@ private:
     std::deque<std::pair<u64, std::unique_ptr<GraphicsPipeline>>> retired_translations; ///< (tick, pipeline)
     void RetireTranslatedPipeline(std::unique_ptr<GraphicsPipeline> pipeline);
     std::unordered_set<u64> used_and_evicted; ///< Key hashes of pipelines used this session, evicted since
-    /// The pointer slots of evicted graphics pipelines, for their next translation (from
-    /// zortos293/Lichii#1143). Forgotten once a pipeline of the key is made again.
+    /// The pointer slots of evicted graphics pipelines, for their next translation (ported).
+    /// Forgotten once a pipeline of the key is made again.
     VideoCommon::EvictedPointerSlots evicted_pointer_slots;
 
     ::Common::unordered_map<ComputePipelineCacheKey, ComputePipelineCacheEntry> compute_cache;

@@ -12,7 +12,7 @@
 
 #include "common/common_types.h"
 
-/// EXP92 (fable52_answer_uniformkeeps 3, tier 2; idea: zortos293/Lichii#1441 part d): what the
+/// EXP92 (fable52_answer_uniformkeeps 3, tier 2): what the
 /// buffer cache's uniform keeps need to know about writes to guest memory that are not the back's
 /// cached writes (those are tier 1, by exact range, in BufferCache's ring).
 ///

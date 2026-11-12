@@ -85,7 +85,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             split.MaybeStart(system);
             if (scheduler.HasPendingChannels()) {
                 // Suspended channels wait on semaphores the CPU releases: poll them meanwhile.
-                // EDEN_NX2_GPU_WAKE (zortos293/Lichii#1376): a new command or a GPU release
+                // EDEN_NX2_GPU_WAKE: a new command or a GPU release
                 // wakes the wait below at once (Nx2PendingWake), so arm it before looking.
                 const bool gpu_wake = VideoCore::Nx2Debug::GpuWake();
                 wake.SetEnabled(gpu_wake);
@@ -137,7 +137,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     // The CPU usually releases the semaphore soon after: poll for half a
                     // millisecond before sleeping, or every wait also waits out a host sleep
                     // (title 1 waits ~25 times a second).
-                    // EDEN_NX2_EXP6 (zortos293/Lichii#446): 1 = 50 us sleeps (Ocarina waits here
+                    // EDEN_NX2_EXP6: 1 = 50 us sleeps (Ocarina waits here
                     // ~330 times a second and its present waits for the work behind them; on
                     // Windows a sleep still lasts one timer tick, ~0.5 ms), 2 = always yield.
                     Profile::Scope scope{Profile::Zone::PendingSleep};
@@ -190,7 +190,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                         Common::Nx2Timeline::Instant("front: list end", {"seq", next.fence});
                     }
                 } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
-                    // TickWork ends delta draw reuse itself when it runs a request (#1161).
+                    // TickWork ends delta draw reuse itself when it runs a request.
                     split.Defer([gpu = &system.GPU()] { gpu->TickWork(); },
                                 VideoCommon::GpuSplit::Effect::Unknown,
                                 VideoCommon::Nx2FastDrawCount::Neutral());

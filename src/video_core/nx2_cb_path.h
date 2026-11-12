@@ -10,7 +10,7 @@
 #include "common/logging.h"
 #include "video_core/nx2_debug_control.h"
 
-/// EXP88 (port of zortos293/Lichii#1441 parts a to c, fable52_answer_next70 section 3): the
+/// EXP88 (ported, fable52_answer_next70 section 3): the
 /// constant buffer path's switch bits and counters. See EXP88 in nx2_debug_control.h.
 namespace VideoCommon::Nx2CbPath {
 

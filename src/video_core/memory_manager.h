@@ -157,7 +157,7 @@ public:
     void WriteBlockCached(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size);
     /// WriteBlockCached of `count` consecutive words within one device page, in a single write.
     void WriteWordsCached(GPUVAddr gpu_dest_addr, const u32* words, std::size_t count);
-    /// EXP88 & 2 (zortos293/Lichii#1441 parts a and b): constant buffer data written at
+    /// EXP88 & 2: constant buffer data written at
     /// `device_addr`, which the caller translated from `gpu_addr` (one mapped device range, not
     /// Switch 2 sparse memory): what WriteBlockCached does, without its page walk, and with the
     /// device range logged for FlushCaching instead of the GPU range accumulated (32-byte
@@ -189,7 +189,7 @@ public:
         GPUVAddr gpu_addr, std::size_t size) const;
 
     /// The device ranges [gpu_addr, gpu_addr + size) maps to (contiguous pages merged), up to the
-    /// end of the address space (zortos293/Lichii#1161).
+    /// end of the address space.
     boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> GetSubmappedDeviceRange(
         GPUVAddr gpu_addr, std::size_t size) const;
 

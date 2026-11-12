@@ -281,7 +281,7 @@ public:
     /// the front instead of CallMethod for native compute engines: runs their macros and macro
     /// uploads against a copy of the registers and sends the register writes to the back.
     bool FrontRunsMacros() const { return native_mode; }
-    /// List dispatches (nx2_list_dispatch.h, zortos293/Lichii#1336): the call of macro `method`
+    /// List dispatches (nx2_list_dispatch.h): the call of macro `method`
     /// whose three parameters are the GPU-written words at `address`. If the macro only stores a
     /// dispatch's grid, the front stores a marker instead and the dispatch that carries it takes
     /// its grid from `address` on the host GPU. False when the words have to be read.

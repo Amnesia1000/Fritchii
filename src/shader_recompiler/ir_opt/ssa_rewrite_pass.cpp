@@ -60,11 +60,11 @@ using Variant = std::variant<IR::Reg, IR::Pred, ZeroFlagTag, SignFlagTag, CarryF
 // TODO: majority of these require stable iterators, test with XC beforehand
 using ValueMap = std::unordered_map<IR::Block*, IR::Value>;
 
-// EDEN_NX2_SSA_BLOCK_VALUES=1 (zortos293/Lichii#896's "cheaper reads in the SSA rewrite", off by
+// EDEN_NX2_SSA_BLOCK_VALUES=1 (the original "cheaper reads in the SSA rewrite", off by
 // default; read on the first translation, after nx2_switches.txt): predicates, flags and the
 // indirect branch target are stored in the blocks like registers (IR::Block::SsaOtherValue)
 // instead of per-variable hash maps (a lookup, and an insertion on a miss, for every read of
-// one), and every read reuses one work stack instead of allocating its own. #896 measured the
+// one), and every read reuses one work stack instead of allocating its own. The ported change measured the
 // SSA rewrite at 1.66 -> 1.31 ms per program with byte-identical SPIR-V for all 47,420
 // environments that translate.
 bool SsaBlockValues() {

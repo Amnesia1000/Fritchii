@@ -366,7 +366,7 @@ TEST_CASE("High refresh rate built-in calls its own routine only while its setti
         for (size_t offset = Dark + 0x78; offset < Routine; offset += 4) {
             REQUIRE(word_at(patched, offset) == 0);
         }
-        // v5.8: the ripple accumulator and its hook with Dark's mode too (zortos293/Lichii#1180).
+        // v5.8: the ripple accumulator and its hook with Dark's mode too.
         REQUIRE(word_at(patched, Code + OcarinaWaterHook) == 0x14EFFE26); // b 0x3c46e90
         REQUIRE(word_at(patched, Routine + 0x90) == 0xB00092C9);          // adrp x9, 0x4e9f000
         REQUIRE(word_at(patched, Routine + 0x10C) == 0x171001BC);         // b 0x475fc
@@ -407,7 +407,7 @@ TEST_CASE("High refresh rate built-in calls its own routine only while its setti
         REQUIRE(word_at(patched, Routine + 0x84) == 0x40400000); // 3.0f
         REQUIRE(word_at(patched, Routine + 0x88) == 0x3F800000); // 1.0f
         REQUIRE(word_at(patched, Routine + 0x8C) == 0);
-        // The water ripple accumulator (zortos293/Lichii#1152) right after it, and its hook.
+        // The water ripple accumulator right after it, and its hook.
         REQUIRE(word_at(patched, Code + OcarinaWaterHook) == 0x14EFFE26); // b 0x3c46e90
         REQUIRE(word_at(patched, Routine + 0x90) == 0xB00092C9);  // adrp x9, 0x4e9f000
         REQUIRE(word_at(patched, Routine + 0x94) == 0x91388129);  // add x9, x9, #0xe20
@@ -663,7 +663,7 @@ TEST_CASE("Built-in Texture Pool x2 doubles the allocator's initial pool size",
           "[patch_manager]") {
     constexpr std::string_view TexturePool = "Texture Pool x2 (built-in)";
     constexpr size_t CallOffset = sizeof(Loader::NSOHeader) + 0xC2A36C;
-    constexpr size_t RoutineOffset = sizeof(Loader::NSOHeader) + 0x3C46F10; // ours (upstream: 0x3C462C0)
+    constexpr size_t RoutineOffset = sizeof(Loader::NSOHeader) + 0x3C46F10; // ours (the original: 0x3C462C0)
     constexpr u32 StpInstruction = 0xA90127E8;
     constexpr u32 CallInstruction = 0x94C072E9; // bl to our cave
     PatchManagerTestContext context;

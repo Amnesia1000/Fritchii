@@ -2374,7 +2374,7 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
     const VkImage src_image = src.ImageHandle();
     const VkImageSubresourceLayers dst_layers = MakeSubresourceLayers(&dst);
     const VkImageSubresourceLayers src_layers = MakeSubresourceLayers(&src);
-    // zortos293/Lichii#1466 (Eglantine#720): a blit inside one image (a mip chain, say) keeps it
+    // Ported fix: a blit inside one image (a mip chain, say) keeps it
     // in GENERAL: moving the whole image to TRANSFER_DST_OPTIMAL would leave the source levels in
     // another layout than the blit reads. AMD drivers only: other vendors keep the old layouts.
     const VkImageLayout dst_layout = src_image == dst_image && device.IsAmdDriver()
@@ -4116,7 +4116,7 @@ bool Image::InitSparseLayers() {
         s.tile_width *= block_width;
         s.tile_height *= block_height;
     }
-    // zortos293/Lichii#1466 (Eglantine#720, Orchid 64a5e4df8): a block that is not one sparse
+    // Ported fix: a block that is not one sparse
     // page of the image can't be bound by (AMD reported 65549 x 339860304 for Mario Kart World's
     // RGBA8 terrain arrays on an RX 9070 XT). The image then takes the sparse tiles or
     // UnwrittenSparse path. Checked on AMD drivers only: other vendors keep their path.
@@ -4980,7 +4980,7 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
         create(TextureType::ColorArray2D, std::nullopt);
         render_target = Handle(Shader::TextureType::ColorArray2D);
         // Native shaders can sample six layers of a 2D array as a cube (point-light shadows).
-        // Adapted from Duck912/eden-fefw a1b23ac3.
+        // Adapted from a ported change.
         if (info.type == VideoCommon::ImageViewType::e2DArray && info.range.extent.layers >= 6 &&
             image.info.num_samples == 1 && IsCubeCompatible(*device, image.info)) {
             create(TextureType::ColorCube, 6);

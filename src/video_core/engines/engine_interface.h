@@ -68,7 +68,7 @@ public:
     /// without the virtual call.
     bool fast_maxwell3d{};
     /// Maxwell3D: its writes report their own delta draw count breaks (nx2_fastdraw_count.h);
-    /// any other engine's method ends reuse as a whole (#1161's reports_fast_draw_breaks).
+    /// any other engine's method ends reuse as a whole (the original reports_fast_draw_breaks).
     bool counts_fast_draw_breaks{};
     std::vector<std::pair<u32, u32>> method_sink{};
     GPUVAddr current_dma_segment;

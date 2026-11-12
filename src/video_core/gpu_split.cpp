@@ -954,7 +954,7 @@ void GpuSplit::Backoff(u32 spins, u64 target) {
         std::this_thread::yield();
         return;
     }
-    // A long wait sleeps until the back stores a new position (port of #161's front_wake): the
+    // A long wait sleeps until the back stores a new position (a port of the original front_wake): the
     // back checks front_waiting after each store, the front checks the position after setting it.
     front_waiting.store(true, std::memory_order_seq_cst);
     const u32 seen = front_wake.load(std::memory_order_seq_cst);
@@ -1286,7 +1286,7 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
             }
             return (head & HasSegment) != 0 ? 2 : 1;
         }
-        // EDEN_NX2_FASTDRAW_COUNT (#1161): any other engine's method ends delta draw reuse.
+        // EDEN_NX2_FASTDRAW_COUNT: any other engine's method ends delta draw reuse.
         if (Nx2FastDrawCount::g_on && !engine->counts_fast_draw_breaks) [[unlikely]] {
             Nx2FastDrawCount::Break(Nx2FastDrawCount::Reason::OtherEngine);
         }
@@ -1327,7 +1327,7 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
         return data + (amount + 1) / 2;
     }
     case Kind::Call: {
-        // EDEN_NX2_FASTDRAW_COUNT (#1161): deferred calls end reuse unless marked neutral.
+        // EDEN_NX2_FASTDRAW_COUNT: deferred calls end reuse unless marked neutral.
         if (Nx2FastDrawCount::g_on && (head & Nx2FastDrawCount::NeutralCallBit) == 0) [[unlikely]] {
             NoteFastDrawCallBreak(entry[1]);
         }
@@ -1463,7 +1463,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             }
         }
         u64 last_store = read_position;
-        // EDEN_NX2_EXP27 & 4 (zortos293/Lichii#717 EDEN_NX2_RING_PREFETCH): prefetch the ring
+        // EDEN_NX2_EXP27 & 4 (the original's EDEN_NX2_RING_PREFETCH): prefetch the ring
         // lines ahead of the entry, up to a line short of what the front published (a line it
         // may still be writing would only bounce between the two cores).
         const bool ring_prefetch = (VideoCore::Nx2Debug::Experiment(27) & 4) != 0;

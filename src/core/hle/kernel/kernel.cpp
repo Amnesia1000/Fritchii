@@ -56,7 +56,7 @@ namespace Kernel {
 
 namespace {
 
-// EDEN_NX2_FAST_TLS=1 (boot switch, off by default; from zortos293/Lichii#641, where it is on):
+// EDEN_NX2_FAST_TLS=1 (boot switch, off by default; ported from a build where it is on):
 // plain (constinit, trivially destructible) copies of the hot fields of ThreadLocalData.
 // ThreadLocalData holds an optional KThread, so its thread_local has a non-trivial destructor
 // and every access may go through the TLS init guard or wrapper; SVCs, scheduler locks and memory

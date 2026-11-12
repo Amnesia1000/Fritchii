@@ -290,7 +290,7 @@ public:
         Commit(2, Effect::None);
     }
 
-    // EDEN_NX2_EXP22, from zortos293/Lichii#641 (EDEN_NX2_FRONT_STATE, EDEN_NX2_DRAW_BATCH).
+    // EDEN_NX2_EXP22, from a ported change (EDEN_NX2_FRONT_STATE, EDEN_NX2_DRAW_BATCH).
     /// Bit 1: a 3D state register write (not executable, writes no memory), which would go as a
     /// Direct MacroWrite or a PairWrite, appended to the open StateDelta block instead. The back
     /// applies the block in one loop, write by write as CallMethod and ApplyPairs would
@@ -358,7 +358,7 @@ public:
             pending_flush_argument = nullptr;
         }
     }
-    /// Instance folding (zortos293/Lichii#1336, EDEN_NX2_FOLD_INSTANCES), front: one more
+    /// Instance folding (EDEN_NX2_FOLD_INSTANCES), front: one more
     /// instance of the instance loop `context` draws. Nothing is sent: `flush(context, count)`
     /// sends the instances counted so far as one entry before the next entry, engine selection,
     /// Publish or Drain. Held as the pending flush above, so other held work (EXP22's batches,
@@ -427,7 +427,7 @@ public:
 
     /// Makes what was sent visible to the back.
     void Publish();
-    /// EDEN_NX2_EXP27 & 1 (zortos293/Lichii#717 EDEN_NX2_PUBLISH_WAITS): before the front yields
+    /// EDEN_NX2_EXP27 & 1 (the original's EDEN_NX2_PUBLISH_WAITS): before the front yields
     /// or sleeps polling suspended channels, it publishes what they sent (held-back work too),
     /// so the back doesn't idle on work the front already decoded.
     void PublishBeforeWait();
@@ -781,8 +781,8 @@ public:
     /// of it was still queued.
     bool WaitForSync();
     /// Waits until the back executed the compute and copy work sent before the last NoteSync:
-    /// the writers a command list fetched now is ordered after (zortos293/Lichii#805
-    /// 6229487c8c). Returns whether any of it was still queued. `site`: whose wait it is, for
+    /// the writers a command list fetched now is ordered after.
+    /// Returns whether any of it was still queued. `site`: whose wait it is, for
     /// EDEN_NX2_GPU_PROFILE.
     bool WaitForSyncedWriters(DrainSite site = DrainSite::ListWriters);
     /// Whether the back executed the work sent before `position` (as far as it stored `consumed`,
@@ -1088,7 +1088,7 @@ private:
     void Commit(size_t words, Effect effect) {
         write_position += words;
         writes.Entry(effect, write_position);
-        // EXP39 & 1 (zortos293/Lichii#805 62db242b34): the back waits for work at the last
+        // EXP39 & 1: the back waits for work at the last
         // position published (it stored it in back_idle_at before it spun), so it waits for
         // exactly the words the front holds: it gets them after PublishAfterWait, not after
         // publish_every. Not while a Pairs or StateDelta block is open (publishing ends it).
@@ -1394,7 +1394,7 @@ private:
     alignas(128) std::atomic<u64> back_idle_at{~u64{0}};
     alignas(128) std::atomic<bool> back_waiting{};
     std::atomic<u32> wake{};
-    /// The front sleeps in Backoff (#161: instead of yielding).
+    /// The front sleeps in Backoff (ported: instead of yielding).
     alignas(128) std::atomic<bool> front_waiting{};
     std::atomic<u32> front_wake{};
     std::jthread back_thread;

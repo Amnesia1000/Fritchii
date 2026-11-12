@@ -401,7 +401,7 @@ void Maxwell3D::ApplyPairs(Core::System& system, const u64* pairs, u32 count) {
     }
 }
 
-// EDEN_NX2_FASTDRAW_COUNT: zortos293/Lichii#1161's lists (maxwell_3d.cpp at 792e12a47b), counting
+// EDEN_NX2_FASTDRAW_COUNT: the ported change's lists (its maxwell_3d.cpp), counting
 // only.
 bool Maxwell3D::IsFastDrawParameter(u32 method) {
     switch (method) {
@@ -553,23 +553,23 @@ void Maxwell3D::UpdateFastDrawCountPools() {
 
 void Maxwell3D::NoteFastDrawCountData(GPUVAddr begin, GPUVAddr end, bool unchanged) {
     namespace Count = VideoCommon::Nx2FastDrawCount;
-    // #1161's NoteFastDrawConstantData: texture and sampler headers are read when image views are
+    // The original NoteFastDrawConstantData: texture and sampler headers are read when image views are
     // resolved, which delta draws skip. Header writes end reuse even when they change nothing
-    // (#1161 13d9320cfb, FastDrawHeaderWrite comes first).
+    // (FastDrawHeaderWrite comes first).
     const FastDrawCountPools pools = FastDrawCountPoolRanges();
     if ((begin < pools.tic + pools.tic_size && pools.tic < end) ||
         (begin < pools.tsc + pools.tsc_size && pools.tsc < end)) {
         Count::BreakOn(Count::Reason::TextureHeaders, Count::Other);
         return;
     }
-    // EXP107 (#1161 13d9320cfb): words memory held already change nothing a draw reads.
+    // EXP107: words memory held already change nothing a draw reads.
     if (unchanged) {
         Count::g_unchanged_writes.fetch_add(1, std::memory_order_relaxed);
     } else {
         Count::NoteConstantData(begin, end);
     }
-    // The same device memory can be mapped at other GPU addresses: compare where it lands (#1161,
-    // 792e12a47b; Fable plan D1, row 5).
+    // The same device memory can be mapped at other GPU addresses: compare where it lands (as the
+    // ported change does; Fable plan D1, row 5).
     UpdateFastDrawCountPools();
     constexpr u64 PageSize = 0x1000; // the smallest GPU page
     for (GPUVAddr page = begin; page < end;) {
@@ -588,7 +588,7 @@ void Maxwell3D::NoteFastDrawCountData(GPUVAddr begin, GPUVAddr end, bool unchang
 
 Maxwell3D::ConstantWrite Maxwell3D::CompareConstantData(GPUVAddr begin, const void* data,
                                                        u64 bytes) {
-    // EXP107 (zortos293/Lichii#1161 13d9320cfb): OoT rewrites ~258k constant buffer blocks a
+    // EXP107: OoT rewrites ~258k constant buffer blocks a
     // second with the words memory already holds. This runs on the thread that writes them, in
     // order, after everything sent before (the split's back), so memory is what the write lands on.
     if (VideoCore::Nx2Debug::Experiment(107) == 0 || bytes == 0) {
@@ -608,7 +608,7 @@ Maxwell3D::ConstantWrite Maxwell3D::CompareConstantData(GPUVAddr begin, const vo
     }
     // Writing them again changes nothing either, unless the GPU caches may hold the words newer
     // than memory or a download for a guest read may still land over them: the write must win
-    // then (#1161's conditions). MayHoldGpuWrites is true for every page outside Switch 2 titles.
+    // then (the original conditions). MayHoldGpuWrites is true for every page outside Switch 2 titles.
     const std::optional<DAddr> device = memory_manager.GpuToCpuAddress(begin);
     if (!device || VideoCore::MayHoldGpuWrites(*device, bytes) ||
         VideoCore::ReadDownloadsMayCover(*device, bytes)) {
@@ -620,7 +620,7 @@ Maxwell3D::ConstantWrite Maxwell3D::CompareConstantData(GPUVAddr begin, const vo
         VideoCommon::Runahead::g_words_written.load(std::memory_order_relaxed)) {
         return ConstantWrite::Unchanged;
     }
-    // Texture and sampler header writes still take the write (#1161 never skips them), also
+    // Texture and sampler header writes still take the write (the original never skips them), also
     // through another GPU address mapping the pools' device memory.
     const FastDrawCountPools pools = FastDrawCountPoolRanges();
     const GPUVAddr end = begin + bytes;
@@ -958,7 +958,7 @@ void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods,
             VideoCommon::MemStageStats::Write::CbWords,
             memory_manager.GpuToCpuAddress(destination).value_or(0), bytes);
     }
-    // EXP107 (#1161 13d9320cfb): words memory holds already, where writing them again changes
+    // EXP107: words memory holds already, where writing them again changes
     // nothing, are not written (no invalidation either); unchanged ones are neutral for the count.
     const ConstantWrite compared = CompareConstantData(destination, values.data(), bytes);
     if (VideoCommon::Nx2FastDrawCount::g_on) [[unlikely]] {
@@ -975,7 +975,7 @@ void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods,
         regs.const_buffer.offset += static_cast<u32>(bytes);
         return;
     }
-    // EDEN_NX2_CB_DIRECT (from Skitchii (skolvolt/Lichii) maxwell_3d.cpp CallConstBufferWords):
+    // EDEN_NX2_CB_DIRECT (ported, its maxwell_3d.cpp CallConstBufferWords):
     // what WriteWordsCached does for words within one device page (proven above) outside Switch 2
     // sparse memory, with one translation (as MemoryManager::Write) instead of WriteBlockImpl's
     // page walk: the words, then the invalidation accumulated word by word, as WriteWordsCached
@@ -1172,7 +1172,7 @@ void Maxwell3D::ProcessQueryGet() {
     const u32 payload = regs.report_semaphore.payload;
     const u32 subreport = regs.report_semaphore.query.sub_report;
     if (VideoCommon::Nx2FastDrawCount::g_on) [[unlikely]] {
-        // #1161: the release lands in guest memory (a short one the payload, a long one the
+        // Ported fix: the release lands in guest memory (a short one the payload, a long one the
         // 16-byte report), noted as constant data.
         const u64 bytes = regs.report_semaphore.query.short_query != 0 ? 4 : 16;
         NoteFastDrawCountData(sequence_address, sequence_address + bytes);
@@ -1368,7 +1368,7 @@ void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
             memory_manager.GpuToCpuAddress(buffer_address + regs.const_buffer.offset).value_or(0),
             write_size);
     }
-    // EXP107 (#1161 13d9320cfb): as in CallConstBufferWords.
+    // EXP107: as in CallConstBufferWords.
     const ConstantWrite compared =
         write_size != 0
             ? CompareConstantData(buffer_address + regs.const_buffer.offset, start_base,
@@ -1569,9 +1569,9 @@ struct Maxwell3D::FrontState {
     bool draw_pending{true};
     /// The back holds state writes in its method sink, which its next executable method consumes
     /// (issuing a deferred draw a changed one ends). Front() consumes it before copying the state.
-    /// Instance folding (zortos293/Lichii#1336) folds only while it is empty.
+    /// Instance folding folds only while it is empty.
     bool sink_pending{};
-    /// List draws (nx2_list_draw.h, zortos293/Lichii#1336): by start in the macro code of
+    /// List draws (nx2_list_draw.h): by start in the macro code of
     /// list_draw_generation, whether the macro is the array draw FrontTakeListDraw sends as an
     /// address.
     std::unordered_map<u32, bool> list_draw_macros;
@@ -1601,7 +1601,7 @@ struct Maxwell3D::FrontState {
     /// EDEN_NX2_EXP2, read in Front(): same-value index_buffer.first writes are not sent.
     int same_experiment{};
     int early_same{}; ///< EXP14, read once per front call like same_experiment
-    /// EDEN_NX2_EXP22 (zortos293/Lichii#641's front state, draw batches and same-value draw
+    /// EDEN_NX2_EXP22 (the original front state, draw batches and same-value draw
     /// registers), read once per front call like early_same.
     int exp22{};
     /// StateDelta blocks would skip the back's write history and first-write trace
@@ -1637,7 +1637,7 @@ struct Maxwell3D::FrontState {
     u32 upload_offset{};
     /// EXP13=2-4: the upload's write-stamp tag (Nx2PatchQmdCopy looks past its own stamps).
     u64 upload_tag{};
-    /// Macro DMA read snapshots (EDEN_NX2_DMA_SNAPSHOT, from EvilOOT's dma-snapshot fix): device
+    /// Macro DMA read snapshots (EDEN_NX2_DMA_SNAPSHOT, from a ported dma-snapshot fix): device
     /// pages a drained read flushed whole, and the split position right after. Cleared past 8192
     /// pages.
     struct DmaSnapshot {
@@ -1653,7 +1653,7 @@ struct Maxwell3D::FrontState {
 namespace {
 
 // EDEN_NX2_OOT_MACROS=1: the context Ocarina of Time's native macro handlers (macro_hle_oot.h,
-// from Skitchii (skolvolt/Lichii) 1.3 e8a0621152, its maxwell_3d.cpp OotContext) run in on the
+// ported, its maxwell_3d.cpp OotContext) run in on the
 // split front. Emit is FrontRunMacro's own emit, the one the JIT calls, so every front transform
 // of a macro write (EXP53's predicate, EDEN_NX2_FOLD_INSTANCE, EDEN_NX2_MACRO_TRACE, the MME DMA
 // reads) applies to a handler's writes exactly as to the JIT's.
@@ -2114,7 +2114,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
     if (Profile::Enabled()) [[unlikely]] {
         Profile::Add(Profile::Counter::MethodWrites, 1);
     }
-    // EXP22 bit 1 (zortos293/Lichii#641 EDEN_NX2_FRONT_STATE): a write to a state register that
+    // EXP22 bit 1 (the original's EDEN_NX2_FRONT_STATE): a write to a state register that
     // writes no memory, which the rest of this function would only compare, store and send as a
     // Direct MacroWrite (a macro's, EDEN_NX2_MACRO_SINK off) or a PairWrite (EDEN_NX2_RING_PAIRS:
     // the command list's, and the macros' with MACRO_SINK), goes in the open StateDelta block at
@@ -2145,7 +2145,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         fs.control_writes[fs.control_count++ % fs.control_writes.size()] = {
             argument, static_cast<u32>(fs.control), from_macro ? 2U : 1U};
     }
-    // From zortos293/Lichii#178 (tibzejoker): instance loop writes the back would ignore.
+    // Ported: instance loop writes the back would ignore.
     if (execution_mask[method] && FrontSkipsLoopWrite(fs, method, value, shadow_kept)) {
         if (Profile::Enabled()) [[unlikely]] {
             Profile::Add(Profile::Counter::SameValueWrites, 1);
@@ -2156,7 +2156,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         }
         return;
     }
-    // EXP2, and EXP22 bit 4 (#641 EDEN_NX2_SKIP_SAME_DRAWREG: its same-value vertex_buffer
+    // EXP2, and EXP22 bit 4 (the original's EDEN_NX2_SKIP_SAME_DRAWREG: its same-value vertex_buffer
     // first and count are the loop writes skipped above).
     if ((fs.same_experiment != 0 || (fs.exp22 & 4) != 0) && execution_mask[method] &&
         FrontSkipsIndexFirst(fs, method, value, shadow_kept)) {
@@ -2169,7 +2169,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         split.CountBatched(VideoCommon::GpuSplit::Batched::SameIndexFirst);
         return;
     }
-    // Instance folding (zortos293/Lichii#1336, EDEN_NX2_FOLD_INSTANCES): a later instance of an
+    // Instance folding (EDEN_NX2_FOLD_INSTANCES): a later instance of an
     // instance loop. The register keeps its value (instance id Subsequent, the same topology)
     // and nothing waits in the back's sink, so all the write does there is count one more
     // instance (DrawManager::DrawBegin): the count is sent once, before the front's next entry
@@ -2379,7 +2379,7 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         }
         return;
     }
-    // List guard (zortos293/Lichii#1336): each word as FrontWrite notes it (the PR's front notes
+    // List guard: each word as FrontWrite notes it (the PR's front notes
     // single writes only; a draw.end here would draw from the stale registers).
     for (u32 i = 0; i < amount && fs.list_draw_stale != 0; ++i) {
         FrontNoteListDrawWrite(split, fs, method);
@@ -2517,7 +2517,7 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
         (++fs.macro_calls & 1023) == 0) [[unlikely]] {
         FrontRefreshSwitches(fs);
     }
-    // List guard (nx2_list_dispatch.h, zortos293/Lichii#1336), ahead of both bodies so the plain
+    // List guard (nx2_list_dispatch.h), ahead of both bodies so the plain
     // one stays v5.7's: a data RAM that holds a list dispatch's marker (the compute engine shares
     // it), and the two registers a list draw left with their old values.
     if (grid_marker.In(native_data_ram) || fs.list_draw_stale != 0) [[unlikely]] {
@@ -2660,7 +2660,7 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
         }
         trace_text += " writes";
     }
-    // EDEN_NX2_EXP53 (live, 0 = off; port of Eglantine d3612f82b1 by kraibse): NVN's conditional
+    // EDEN_NX2_EXP53 (live, 0 = off; ported): NVN's conditional
     // render macro reads the six Compare words at an address and sets render_enable.mode from
     // them, which drained the split on every call (our largest front wait, "macro dma read").
     // For such a macro the front skips the read, feeds six zero words and writes the address
@@ -2668,9 +2668,9 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
     const bool predicate = VideoCore::Nx2Debug::Experiment(53) != 0 &&
                            fs.parameters.size() == 3 && fs.parameters[0] == 0 &&
                            IsPredicateMacro(fs, method);
-    // The slot's OoT replacement (macro_hle_oot.h, from Skitchii (skolvolt/Lichii) 1.3
-    // e8a0621152): the hash of the code at the slot's start, found again when the code or the
-    // start changed, as Skitchii's FrontRunMacro does. Each slot is logged once ("OoT macro
+    // The slot's OoT replacement (macro_hle_oot.h, ported):
+    // the hash of the code at the slot's start, found again when the code or the
+    // start changed, as the original FrontRunMacro does. Each slot is logged once ("OoT macro
     // slot") so the hashes of the running game's macros can be checked against the table. Only
     // in this body: with no macro switch on, nothing needs the slots (FrontRunMacroPlain).
     OotMacros::Id oot = OotMacros::Id::None;
@@ -2700,8 +2700,8 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
         const u64 n = fs.oot_calls[oot_index]++;
         oot_verify = oot_mode >= 3 || n < 4096 || (n & 63) == 0;
     }
-    // EDEN_NX2_FOLD_INSTANCE (live, 0 = off, the default; from Skitchii (skolvolt/Lichii)
-    // e8a0621152, macro_hle_oot.h DrawLoop and maxwell_3d.cpp OotContext::FoldFirstInstance):
+    // EDEN_NX2_FOLD_INSTANCE (live, 0 = off, the default; ported from its
+    // macro_hle_oot.h DrawLoop and maxwell_3d.cpp OotContext::FoldFirstInstance):
     // for a call of an instanced draw macro (0xe52 or 0xea0, identified as above, the handlers'
     // own lookup) with 2 or more instances, the back's draw manager is told before the loop's
     // first draw.end that this instance is the first of a loop, so it is not drawn alone: the
@@ -2733,7 +2733,7 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
             if (fs.guard_list_reads && fs.list_draw_stale != 0 &&
                 (address == Nx2ListDraw::VertexFirst || address == Nx2ListDraw::VertexCount))
                 [[unlikely]] {
-                // List guard (zortos293/Lichii#1336): a register the last list draw left
+                // List guard: a register the last list draw left
                 // unwritten (FrontRunMacro set guard_list_reads only with the guard on).
                 Nx2ListDispatch::Count(Nx2ListDispatch::g_guard.stale_reads);
                 if (Nx2ListDispatch::GuardMode() == 2) {
@@ -2910,7 +2910,7 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
     }
 }
 
-// List draws (nx2_list_draw.h, zortos293/Lichii#1336): whether the macro at `start` does nothing
+// List draws (nx2_list_draw.h): whether the macro at `start` does nothing
 // but begin a draw, write its first parameter to vertex_buffer.count and its second to
 // vertex_buffer.first, and end the draw.
 bool Maxwell3D::FrontIsListDrawMacro(FrontState& fs, const MacroEngine& engine, u32 start) {
@@ -3091,7 +3091,7 @@ bool Maxwell3D::FrontTakeListDraw(Core::System& system, VideoCommon::GpuSplit& s
 }
 
 bool Maxwell3D::FoldInstancesEnabled() {
-    // EDEN_NX2_FOLD_INSTANCES=0 (zortos293/Lichii#1336; not our EDEN_NX2_FOLD_INSTANCE, which folds
+    // EDEN_NX2_FOLD_INSTANCES=0 (the ported switch; not our EDEN_NX2_FOLD_INSTANCE, which folds
     // a loop's first instance into its deferred draw): every later instance is sent as its own
     // draw.begin write again.
     static const bool enabled = [] {
@@ -3275,7 +3275,7 @@ bool Maxwell3D::FrontMacroCountsDraw(Core::System& system, VideoCommon::GpuSplit
 #endif
 }
 
-// Not inlined on GCC (zortos293/Lichii#491): GCC 13 -O3 unswitched a per-word loop on this
+// Not inlined on GCC: GCC 13 -O3 unswitched a per-word loop on this
 // switch there and dropped the macro upload cases from it (an empty macro RAM on the front).
 #if defined(__GNUC__) && !defined(__clang__)
 [[gnu::noinline]]
@@ -3469,7 +3469,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             return;
         }
     }
-    // EDEN_NX2_DMA_SNAPSHOT (EvilOOT's dma-snapshot fix): Ocarina reads an occlusion report for
+    // EDEN_NX2_DMA_SNAPSHOT (a ported dma-snapshot fix): Ocarina reads an occlusion report for
     // each object (macro 0xe2c, MME_DMA_READ_FIFOED), ~35,000 times a second, and its pages are
     // GPU-written, so each read drained the back: the front and the back took turns. A drained
     // read now flushes its whole device pages and remembers the split position; later reads of
@@ -3479,7 +3479,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     const int snapshot_mode =
         VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_dma_snapshot, "EDEN_NX2_DMA_SNAPSHOT",
                                          9);
-    // Waits until pending reports in the range have landed (#215), as the drained path below.
+    // Waits until pending reports in the range have landed, as the drained path below.
     const auto flush_queries = [&](GPUVAddr begin, size_t bytes) {
         split.Run(
             [this, begin, bytes] {

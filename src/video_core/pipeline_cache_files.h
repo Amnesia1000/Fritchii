@@ -19,16 +19,16 @@
 namespace VideoCommon {
 
 inline constexpr u32 OpenGLPipelineCacheVersion = 48;
-/// 54 since 2026-11-08 (was 52): zortos293/Lichii writes the same records under 53 and 54, and our
+/// 54 since 2026-11-08 (was 52): the builds we port from write the same records under 53 and 54, and our
 /// graphics keys already keep only the attribute types a program reads (KeyedAttributeTypes, their
-/// #408), which is all their version 55 changes. So shared caches and #895 recipes of 54 are taken as
+/// own change), which is all their version 55 changes. So shared caches and precompile recipes of 54 are taken as
 /// they are, and moving to 55 later is this number plus VulkanOwnPreviousVersions.
 inline constexpr u32 VulkanPipelineCacheVersion = 54;
 /// This fork's earlier versions of the same record format, newest first: their files are copied
 /// once to the current version's names (header version rewritten; records unchanged).
 inline constexpr std::array<u32, 1> VulkanOwnPreviousVersions{52};
 
-// Official Eglantine (cache version 18 at c0cb3325) and this fork (a different version) both
+// An earlier build (cache version 18) and this fork (a different version) both
 // used <shader dir>/<title>/vulkan.bin and vulkan_pipelines.bin. Each build deletes a file
 // with another version at boot, so alternating builds made every run start with no pipelines
 // (MKW log: "Deleting old pipeline cache", "Total Pipeline Count: 0", then hundreds of
@@ -81,7 +81,7 @@ inline void CopyOwnUnversionedFile(const std::filesystem::path& old_file,
 }
 
 /// Copies a cache whose records this build reads, written with another cache version, to
-/// `destination` with this build's version in its header (from zortos293/Lichii#194). The
+/// `destination` with this build's version in its header (ported). The
 /// source is never changed; an existing destination is kept.
 inline bool CopyCompatiblePipelineCache(const std::filesystem::path& source,
                                         const std::filesystem::path& destination,

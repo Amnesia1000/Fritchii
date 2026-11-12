@@ -108,7 +108,7 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
         } catch (const std::bad_alloc&) {
             Common::Nx2Hitch::ZeroTrimEnd();
             // A pass needs 32 MiB and more of scratch. When Windows runs out of commit, the
-            // exception leaving this thread ended the emulator (#1346); the pass is only a saving.
+            // exception leaving this thread ended the emulator; the pass is only a saving.
             interval = std::chrono::seconds{60};
             const Common::ProcessMemoryUsage usage = Common::GetProcessMemoryUsage();
             LOG_WARNING(HW_Memory,

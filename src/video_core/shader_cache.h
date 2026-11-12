@@ -45,7 +45,7 @@ struct ShaderInfo {
     /// attribute as in FixedPipelineState::attribute_types. None for task and mesh programs, all
     /// set for any other program.
     u64 vertex_attribute_mask{~u64{0}};
-    /// Native vertex programs: the generic attributes their header says they read (#895).
+    /// Native vertex programs: the generic attributes their header says they read.
     u32 generic_read_mask{~0U};
 };
 

@@ -51,7 +51,7 @@ struct ResolutionScalingInfo {
 
 #ifndef CANNOT_EXPLICITLY_INSTANTIATE
 // Instantiate the classes elsewhere (settings.cpp) to reduce compiler/linker work
-// TODO(crueter): Move new enums here
+// TODO: Move new enums here
 #define SETTING(TYPE, RANGED) extern template class Setting<TYPE, RANGED>
 #define SWITCHABLE(TYPE, RANGED) extern template class SwitchableSetting<TYPE, RANGED>
 
@@ -407,7 +407,7 @@ struct Values {
                                            Specialization::Default,
                                            true,
                                            true};
-    // The DLSS mode (zortos293/Lichii#1249): Automatic picks it from the game's render and output
+    // The DLSS mode: Automatic picks it from the game's render and output
     // sizes as before; an explicit mode applies when the render size fits NVIDIA's range for it.
     // Native (DLAA) keeps the game's render size. Applies live too.
     SwitchableSetting<NvidiaDlssQuality> nvidia_dlss_quality{linkage,

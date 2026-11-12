@@ -5,7 +5,7 @@ package, wait for the owner to launch the game, press a hotkey and send the log 
 dumps. Every new question costs a relaunch, and most cost a rebuild, because every
 `EDEN_NX2_*` switch is read once at startup.
 
-This document designs an opt-in debug server inside Lichii and an MCP adapter that agents run on
+This document designs an opt-in debug server inside Fritchii and an MCP adapter that agents run on
 the PC, so an agent can ask a running game questions directly. Phase 1 is implemented on the
 `feat/debug-mcp` branch; the later phases are proposals with the hook points they need.
 
@@ -24,7 +24,7 @@ Line numbers refer to `feat/debug-mcp` at the time of writing.
 ## Architecture
 
 ```
-agent ──stdio MCP──> tools/nx2/debug_mcp.py ──TCP 127.0.0.1, JSON lines──> Lichii
+agent ──stdio MCP──> tools/nx2/debug_mcp.py ──TCP 127.0.0.1, JSON lines──> Fritchii
   (on the PC)          (Python, stdlib only)                               ├─ "DebugServer" thread
                                                                            │    tools: status, screenshot, log_*, ...
                                                                            └─ rasterizer thread
@@ -57,7 +57,7 @@ server copies its threading model, not its protocol.
 - MCP's own transports are stdio, which needs the agent to launch the process (it cannot launch
   the emulator, which the owner starts), and Streamable HTTP, which needs sessions and
   server-sent events. Neither fits inside the emulator cheaply.
-- A JSON-lines socket is about 200 lines of C++ with libraries Lichii already links (Boost.Asio,
+- A JSON-lines socket is about 200 lines of C++ with libraries Fritchii already links (Boost.Asio,
   nlohmann::json, both already used by `core`). Anything can drive it: the adapter, a test,
   or `python -c`.
 - The adapter owns everything that is MCP: tool descriptions, input schemas, image content, error
@@ -419,7 +419,7 @@ Live switch classification, from the switches in `src/`:
 ### Save states
 
 The core cannot save state. There is no serialisation of the kernel, services, the dynarmic and
-NCE CPU state, or the GPU caches, and Eden and yuzu never had it. The `saveState` in
+NCE CPU state, or the GPU caches, and the emulator never had it. The `saveState` in
 `src/yuzu/main_window.cpp` is Qt window geometry. Adding save states is a project of its own,
 not a tool. The practical substitute is a reproduction script: phase 2 input sequences, recorded
 once with `input_record` and replayed with `input_replay` after the same save is loaded

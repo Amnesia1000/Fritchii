@@ -318,7 +318,7 @@ std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr gpu_addr) const {
     // The same few pages are looked up over and over (every draw rebinds its buffers and
     // textures): a small per-thread cache of page translations, dropped whenever any entry
     // changes (map_serial moves after each map or unmap). EDEN_NX2_NO_TRANSLATION_CACHE=1
-    // turns it off (Eglantine b1e650849e by kraibse: back thread 13.64 -> 13.25 ms a frame).
+    // turns it off (ported: back thread 13.64 -> 13.25 ms a frame).
     struct CachedPage {
         u64 owner;
         u64 serial;
@@ -475,7 +475,7 @@ const u8* MemoryManager::GetPointer(GPUVAddr gpu_addr) const {
 
 bool MemoryManager::HandlePointerCacheEnabled() {
     static const bool enabled = [] {
-        // On by default since 2026-11-11 (Hookshot's research: its equivalent was its biggest
+        // On by default since 2026-11-11 (recomp research: its equivalent was its biggest
         // replay win of the week). Market fresh-launch A/B (off, on, on, off; PRECOMPILE on, no
         // flash watch): off 44.8 / 44.7, on 45.9 / 46.1 fps, same picture. =0 turns it off.
         const char* value = std::getenv("EDEN_NX2_HANDLE_PTR_CACHE");

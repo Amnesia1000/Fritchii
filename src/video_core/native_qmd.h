@@ -150,7 +150,7 @@ public:
     using StateTable = std::unordered_map<Address, State>;
     /// The table this scheduler runs on: the shared one, or the GPU thread split's front copy
     /// (EXP13=2: KeplerCompute's QMD release prediction mirrors the back's scheduling with it;
-    /// from zortos293/Lichii#717).
+    /// ported).
     StateTable* table = &states;
     /// The shared table (read only while no other thread signals).
     static const StateTable& SharedStates() { return states; }

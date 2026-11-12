@@ -15,7 +15,7 @@
 #include <QPainter>
 #include <QValueAxis>
 
-// TODO(crueter): Reset samples when user changes turbo, slow, etc.
+// TODO: Reset samples when user changes turbo, slow, etc.
 PerformanceOverlay::PerformanceOverlay(MainWindow* parent)
     : QWidget(parent), m_mainWindow{parent}, ui(new Ui::PerformanceOverlay) {
     ui->setupUi(this);

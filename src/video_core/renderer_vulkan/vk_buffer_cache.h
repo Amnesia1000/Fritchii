@@ -305,7 +305,7 @@ public:
         return max_dynamic_storage_buffers;
     }
 
-    // List draws (nx2_list_draw.h, zortos293/Lichii#1336): the arguments of an array draw whose
+    // List draws (nx2_list_draw.h): the arguments of an array draw whose
     // vertex count and first vertex are two GPU-written words (Nx2ListDraw). The rasterizer asks
     // for them before it prepares the draw, the pipeline records their copy before it requests
     // the render pass, and the draw takes them.

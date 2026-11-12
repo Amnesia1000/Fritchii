@@ -44,7 +44,7 @@ constexpr u64 FoldExtraCoreMask(u64 mask) {
     return (mask & low) | ((mask >> Core::Hardware::NUM_CPU_CORES) & low);
 }
 
-// EDEN_NX2_OOT_WIDE_AFFINITY=1 (boot switch, off by default; from zortos293/Lichii#641).
+// EDEN_NX2_OOT_WIDE_AFFINITY=1 (boot switch, off by default; ported).
 // Ocarina of Time's two main threads (priorities 55 and 47) may only run on two of cores 3-5,
 // where the per-core job workers (priority 44) keep preempting them while cores 0-2 sit idle
 // about 30% of the time. With the switch on, any affinity mask of more than one core that

@@ -50,7 +50,7 @@ struct HostTranslateInfo {
     bool support_handle_table_arrays{};
     /// True when a passthrough geometry shader lowered for a host without
     /// VK_NV_geometry_shader_passthrough keeps only Position and the generics of its passthrough
-    /// mask (zortos293/Lichii#1466). Set on AMD drivers only.
+    /// mask. Set on AMD drivers only.
     bool trim_lowered_geometry_passthrough{};
 
     void ApplyDescriptorLimitPolicy() noexcept {

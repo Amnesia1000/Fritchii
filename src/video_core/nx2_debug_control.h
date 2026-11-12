@@ -66,7 +66,7 @@ inline std::atomic<int> g_list_verify{-1};
 /// buffer firsts and counts) (maxwell_3d.cpp).
 inline std::atomic<int> g_loop_skip{-1};
 
-/// EDEN_NX2_DMA_SNAPSHOT (from EvilOOT's dma-snapshot fix): macro DMA reads of pages a drained
+/// EDEN_NX2_DMA_SNAPSHOT (from a ported dma-snapshot fix): macro DMA reads of pages a drained
 /// read flushed whole skip the drain while nothing sent since may write them (Maxwell3D::
 /// FrontDmaRead). 9 = on (default: Lake Hylia 46.5 -> 52.3 fps; verify 0 differences in 235k
 /// reads), 10 = on and verify every skipped read against the drained path, 0 = off.
@@ -97,16 +97,16 @@ inline std::atomic<int> g_dma_snapshot{-1};
 /// measure how long each frame was shown.
 inline std::atomic<int> g_host_pace{-1};
 
-/// EDEN_NX2_ARB_SPIN (zortos293/Lichii#641; off by default here, #641 uses 8): microseconds a
+/// EDEN_NX2_ARB_SPIN (ported; off by default here, the original uses 8): microseconds a
 /// guest thread about to sleep in WaitForAddress first watches the word (KAddressArbiter), 0 =
 /// off. Live: read on every wait, so profile_toggle.py can A/B it in one session.
 inline std::atomic<int> g_arb_spin{-1};
-/// EDEN_NX2_IDLE_PAUSE=1 (zortos293/Lichii#641; off by default here, on in #641): the guest
+/// EDEN_NX2_IDLE_PAUSE=1 (ported; off by default here, on in the original): the guest
 /// core's idle poll (PhysicalCore::Idle, EDEN_NX2_IDLE_SPIN_US) runs PAUSE and reads the clock
 /// every 16 pauses, instead of a SwitchToThread and a clock read per iteration. Live: read on
 /// every Idle.
 inline std::atomic<int> g_idle_pause{-1};
-/// EDEN_NX2_GPU_WAKE=1 (live, off by default; port of zortos293/Lichii#1376 9f932fe3c5): the GPU
+/// EDEN_NX2_GPU_WAKE=1 (live, off by default; ported): the GPU
 /// thread (the split's front) waits for suspended channels in a wait that ends on a wake, instead
 /// of polling them (ResumePending, then yield or sleep per EXP6, ~120-150 ms a second of front
 /// time in Ocarina of Time). A new command (PushCommand) or a GPU write that latches a waiter
@@ -141,23 +141,23 @@ inline std::atomic<int> g_runahead_ms{-1};
 /// caller (video_core/buffer_churn_stats.h). "Buffer churn (5 s" every 5 s while on.
 inline std::atomic<int> g_buffer_churn_stats{-1};
 
-/// EDEN_NX2_CB_DIRECT (live, default 1; from Skitchii (skolvolt/Lichii)): a run of constant
+/// EDEN_NX2_CB_DIRECT (live, default 1; ported): a run of constant
 /// buffer words within one device page outside Switch 2 sparse memory is written through one
 /// translation and a memcpy instead of WriteWordsCached's page walk (Maxwell3D::
 /// CallConstBufferWords). Exact: the same bytes and the same accumulated invalidations; 0 = the
 /// page walk.
 inline std::atomic<int> g_cb_direct{-1};
-/// EDEN_NX2_RT_DEPTH_NOUPLOAD (live, bits, default 0; from Skitchii (skolvolt/Lichii)): new
+/// EDEN_NX2_RT_DEPTH_NOUPLOAD (live, bits, default 0; ported): new
 /// depth/stencil images skip the upload from guest memory when the exact rules (EXP56's clear,
 /// EXP8 bit 2's copies) did not already (TextureCache::JoinImages). 1 = render targets with
-/// nothing to join, 2 = images whose every join copy is GPU-written, 3 = both (Skitchii).
+/// nothing to join, 2 = images whose every join copy is GPU-written, 3 = both.
 inline std::atomic<int> g_rt_depth_noupload{-1};
-/// EDEN_NX2_FOLD_INSTANCE (live, default 0; from Skitchii (skolvolt/Lichii)): an instance loop
+/// EDEN_NX2_FOLD_INSTANCE (live, default 0; ported): an instance loop
 /// of Ocarina of Time's instanced draw macros (0xe52, 0xea0 by code hash) does not draw its
 /// first instance alone; the loop's deferred draw covers it (Maxwell3D::FrontRunMacro,
 /// DrawManager::FoldFirstInstance). 1 = on.
 inline std::atomic<int> g_fold_instance{-1};
-/// EDEN_NX2_OOT_MACROS (live, default 1 since 2026-11-12; from Skitchii (skolvolt/Lichii) macro_hle_oot.h): Ocarina
+/// EDEN_NX2_OOT_MACROS (live, default 1 since 2026-11-12; ported, its macro_hle_oot.h): Ocarina
 /// of Time's hot 3D macros, found by code hash, run through native C++ handlers on the split
 /// front instead of the MME JIT (Maxwell3D::FrontRunMacro). 1 = handlers, 2 = verify (the JIT's
 /// writes count; the handler runs on copies for the first 4096 calls of each macro and then one
@@ -171,7 +171,7 @@ inline std::atomic<int> g_oot_macros{-1};
 /// the back checks each packet's registers against the values the front wrote ("Draw packet
 /// verify").
 inline std::atomic<int> g_draw_packet{-1};
-/// EDEN_NX2_BANK_SLOT_STATS (live, default 0; Hookshot (NotRexed/Hookshot) research idea 1, step
+/// EDEN_NX2_BANK_SLOT_STATS (live, default 0; recomp research idea 1, step
 /// 1): with the tracked native bank check (EXP9 != 0), counts per constant buffer index (c0, c1,
 /// c2, ... as the shader numbers them; NVN2: c0 driver storage table, c1 program constants, c2
 /// texture handles, c3+ the game's uniform buffers) the bank binds, the pages they cover and
@@ -179,7 +179,7 @@ inline std::atomic<int> g_draw_packet{-1};
 /// bank check" line ("Native bank slots"). Counting only (BufferCache::
 /// CheckNativeBankPagesTracked). 1 = on.
 inline std::atomic<int> g_bank_slot_stats{-1};
-/// EDEN_NX2_BANK_PAGE_TABLE (live, default 0; Hookshot (NotRexed/Hookshot) bf13340's page table,
+/// EDEN_NX2_BANK_PAGE_TABLE (live, default 0; the recomp's page table,
 /// research idea 1 step 3): the native bank check's page snapshots live in a page-indexed table
 /// (2 MiB regions of 512 page slots, the last region kept) instead of a node map hashed per page
 /// (~1.9% self of the back in the 8 Nov sampler, 720k lookups/s at Castle Town). Exact: the
@@ -187,7 +187,7 @@ inline std::atomic<int> g_bank_slot_stats{-1};
 /// bind of each page takes a new snapshot and marks it changed, as after the 16384-page reset.
 /// 1 = on.
 inline std::atomic<int> g_bank_page_table{-1};
-/// EDEN_NX2_BANK_SLOTS (live, default 0; Hookshot (NotRexed/Hookshot) research idea 1): a bit
+/// EDEN_NX2_BANK_SLOTS (live, default 0; recomp research idea 1): a bit
 /// mask of constant buffer indices (bit n = cn) whose 64 KiB native bank binds rely on the write
 /// flags alone, for the banks NVN2's driver fills only through the command stream (c0 storage
 /// table, c2 texture handles) or never rewrites (c1 program constants). For those binds, with
@@ -206,7 +206,7 @@ inline std::atomic<int> g_bank_slots{-1};
 /// skipped bank that the page loop finds a reason for are counted as "disagreed" (must stay 0).
 /// Logged every 5 s ("Native bank slot skip"). Costs what the skip saves. 1 = on.
 inline std::atomic<int> g_bank_skip_verify{-1};
-/// EDEN_NX2_TEX_BANK_GEN (live, default 0; Hookshot (NotRexed/Hookshot) 11d2c1a's per-stage
+/// EDEN_NX2_TEX_BANK_GEN (live, default 0; the recomp's per-stage
 /// texture bank generations, research idea 2): a graphics pipeline whose bindings are all sampled
 /// textures with handles read straight from constant buffers (no handle programs) keeps the view
 /// and sampler ids its last draw resolved, with the generations of the pages that draw read
@@ -252,11 +252,11 @@ inline std::atomic<int> g_feed_memory_overlay{-1};
 /// (Nx2PatchQmdCopy). Without it the holder's write-stamp check counts the upload's own method
 /// write as a later writer, so no holder ever takes a 3D patch and the QMD read waits. 1 = on.
 inline std::atomic<int> g_qmd_3d_patch{-1};
-/// EDEN_NX2_LIGHT_TABLE_ARRAYS=1 (boot, default 0; port of zortos293/Lichii#1485, jpkto's #354):
+/// EDEN_NX2_LIGHT_TABLE_ARRAYS=1 (boot, default 0; ported):
 /// a texture handle the shader reads from a storage buffer table at an index each invocation
 /// reads for itself (OoT's clustered lights: each light's shadow map handle, read per pixel from
 /// the light table) becomes a descriptor array of the table's first 64 entries, indexed
-/// NonUniform, instead of binding the null image (zortos #778), whose depth-compare sample is 0:
+/// NonUniform, instead of binding the null image, whose depth-compare sample is 0:
 /// fully shadowed, the dark grid that follows Link over water. With it on also: depth-compare
 /// samples of uncomparable images (garbage table entries) bind the null image, view lookups skip
 /// repeated table elements, a pipeline's texture arrays fit the sampler limits too, and dual
@@ -287,36 +287,36 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// drain only if still unmet; 2 = suspend then too, without the full drain; 3 = measure only.
 /// EXP17 = 1: a small streamed uniform buffer binds again any stage or slot's copy of the same
 /// guest range made in the current command buffer, when the bytes still match
-/// (BindSmallUniformReusing; zortos293/Lichii#641 EDEN_NX2_UBO_RANGE_REUSE).
-/// EXP18 (buffer binding memos, #641), bits: 1 = a constant buffer bind of the slot's current
+/// (BindSmallUniformReusing; the original's EDEN_NX2_UBO_RANGE_REUSE).
+/// EXP18 (buffer binding memos), bits: 1 = a constant buffer bind of the slot's current
 /// GPU range keeps its translation and resolved buffer (UBO_REBIND), 2 = storage bindings reuse
 /// their last FindBuffer result (STORAGE_MEMO), 4 = buffers touch the LRU once per frame
 /// (default 4: exact, see LoadExperiments). All while the mappings and the set of buffers are
 /// unchanged (BufferCache::binding_epoch).
 /// EXP19 (graphics pipeline lookup without Refresh, PipelineCache::CurrentGraphicsPipelineClean):
-/// 1 = as EDEN_NX2_PIPELINE_CLEAN=1, 2 = also #641's patches (blend registers left to the
+/// 1 = as EDEN_NX2_PIPELINE_CLEAN=1, 2 = also the original's patches (blend registers left to the
 /// dual-source bit and Dirty::Blending, attribute types redone alone under Dirty::VertexInput).
-/// EXP50 (live; with EXP19 / EDEN_NX2_PIPELINE_CLEAN on; after the-cashman's fix in
-/// zortos293/Lichii#717): 1 = the blend registers leave the clean lookup's word compare and
+/// EXP50 (live; with EXP19 / EDEN_NX2_PIPELINE_CLEAN on; after a ported fix):
+/// 1 = the blend registers leave the clean lookup's word compare and
 /// Dirty::Blending is not looked at; when they moved since the key was made, the attachments
 /// RefreshBlending would build from them (FixedPipelineState::BlendingMatches) and the
 /// dual-source bit are compared with the key's: equal keeps the pipeline without a Refresh,
-/// different patches only the blend part of the key. Reads the registers, so #679's writes
+/// different patches only the blend part of the key. Reads the registers, so the ported change's writes
 /// without the flag are still caught. Logs "saved by the blend value check" and why the other
 /// lookups refreshed in "EDEN_NX2_PIPELINE_CLEAN per second". Off by default, not measured yet.
-/// EXP22 (split ring traffic, zortos293/Lichii#641; gpu_split.h DeltaWrite and DrawBatch), bits:
+/// EXP22 (split ring traffic; gpu_split.h DeltaWrite and DrawBatch), bits:
 /// 1 = 3D state writes that went as Direct macro writes or (EDEN_NX2_RING_PAIRS) as pairs go in
 /// StateDelta blocks, applied in one loop (FRONT_STATE, without its per-register merge),
 /// 2 = repeated instance-loop groups go as one DrawBatch entry that counts the repeats
 /// (DRAW_BATCH), 4 = same-value index_buffer.first writes stay on the front
 /// (SKIP_SAME_DRAWREG, as EXP2), 8 = the back checks each delta and batch against the single
-/// writes and keeps theirs (logs "EXP22 check"). 7 = all three. #641's FRONT_CB_ENCODE is not
+/// writes and keeps theirs (logs "EXP22 check"). 7 = all three. The original's FRONT_CB_ENCODE is not
 /// ported (it holds constant buffer writes off the ring).
-/// EXP23 = 1: trim unused pipeline libraries every 600 frames past 4096 (#579 stage B;
+/// EXP23 = 1: trim unused pipeline libraries every 600 frames past 4096 (ported, stage B;
 /// PipelineCache::TickFrame, GraphicsPipelineLibraryCache::TrimUnused). Off by default, not
 /// measured yet.
 /// EXP24 = 1: Ocarina of Time's present poll (`while (nvnEventGetValue(e) != 1) SleepThread(1 ms)`,
-/// from Hookshot) sleeps until the GPU's next write of a 1 instead, at most 1 ms
+/// from a recomp's research) sleeps until the GPU's next write of a 1 instead, at most 1 ms
 /// (core/hle/kernel/svc/svc_nx2_oot_present.cpp; the site per build id is in its PresentSites
 /// table, or EDEN_NX2_OOT_PRESENT_SITE=<ret>[:<blr>] in hex main offsets). Logs "OoT present
 /// poll (EXP24)" counts every 10 s. EXP24 = 2: locate only, sleeps unchanged: short sleeps
@@ -327,12 +327,12 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// (event object field EDEN_NX2_OOT_PRESENT_FIELD, default 0) already reads 1, and the sleep ends
 /// as soon as it does (Nx2OotPresentPollCheck from KThread::BeginWait: the game's MainThread
 /// writes it, not the GPU). Logs "OoT present poll (EXP24=4" every 10 s.
-/// EXP25 (Ocarina of Time resource poll backoff, zortos293/Lichii#641; needs the built-in patch
+/// EXP25 (Ocarina of Time resource poll backoff, ported; needs the built-in patch
 /// placed at launch by EDEN_NX2_OOT_POLL_BACKOFF=1, core/hle/kernel/svc/svc_nx2_oot_poll.cpp):
 /// the resource request thread sleeps before rescanning requests that are not ready.
-/// 0 = no sleep (as without the patch, plus one SVC per rescan), 1 = 500 us (#641's default),
+/// 0 = no sleep (as without the patch, plus one SVC per rescan), 1 = 500 us (the original default),
 /// above 1 = that many us, at most 16000. Off by default, not measured yet.
-/// EXP26 (native uniform bank check trims, zortos293/Lichii#717; BufferCache::
+/// EXP26 (native uniform bank check trims, ported; BufferCache::
 /// BindHostGraphicsUniformBuffer and CheckNativeBankPagesTracked), bits: 1 = a bind that streams
 /// the buffer (at most 4 KiB, not GPU-modified) skips the check, the stream copies guest memory
 /// itself (BUFCACHE_BANK), 2 = pages compared with an inline SSE2 loop instead of memcmp
@@ -353,7 +353,7 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// EXP35=2 (live): every guest write of cached memory is collected for the back, not only writes to
 /// never-GPU-written pages. EXP60 (live): 1 = a guest read whose cache mutexes stay taken after a
 /// short spin is answered with a flush request served by the back (GetFlushArea).
-/// EXP49 (live; async read-back, the core of zortos293/Lichii#1028 0b83798bf6): 1 = a guest read
+/// EXP49 (live; async read-back): 1 = a guest read
 /// of GPU-written buffer memory (GPU::OnCPURead) has the GPU thread record and submit the
 /// downloads without waiting for the host GPU (RasterizerVulkan::FlushRegionForRead). The reading
 /// thread waits for them and writes them to guest memory (BufferCache::FinishReadDownloads); a
@@ -362,25 +362,25 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// landing); writes from the GPU's side (MemoryManager, query results, DMA clears and copies) land
 /// them first. 0 = the synchronous flush (Scheduler::Finish on the GPU thread under the buffer
 /// cache's lock). Both log "Read-back (EXP49) per second" every 10 s (reads, GPU thread time in
-/// read flushes, reader waits). Not ported: #1028's early downloads and EDEN_NX2_READ_CHECK.
-/// EXP27 (keep the split's back fed, fewer submits; zortos293/Lichii#717), bits: 1 = the front
+/// read flushes, reader waits). Not ported: the original's early downloads and EDEN_NX2_READ_CHECK.
+/// EXP27 (keep the split's back fed, fewer submits), bits: 1 = the front
 /// publishes before it yields or sleeps polling suspended channels (PUBLISH_WAITS,
 /// GpuSplit::PublishBeforeWait), 2 = retired (was PUBLISH_IDLE, each entry published at once
 /// while the back found the ring empty; EXP39 & 1 replaces it), 4 = the back prefetches the ring 128 words
 /// ahead (RING_PREFETCH), 8 = command list copies after a dispatch are submitted when the front
 /// waits for them, when the back goes idle or with the next submission, instead of at once
 /// (DISPATCH_BATCH, RasterizerVulkan::SubmitNx2ListCopies). Off by default; 1, 2 and 4 change
-/// only when work becomes visible, 8 changes submission timing (the #161 family: flash watch).
-/// EXP28 (fewer fences, zortos293/Lichii#717; FenceManager::SignalFence), bits: 1 = a fence whose
+/// only when work becomes visible, 8 changes submission timing (the boulder-flash family: flash watch).
+/// EXP28 (fewer fences; FenceManager::SignalFence), bits: 1 = a fence whose
 /// only work is syncing payload releases into host buffers is skipped like an empty one (the
 /// guest word was written at once; the copy goes with the next fence made or wait for idle,
 /// values kept per release since the query slot may be reused: GuestStreamer::
 /// SyncDeferredWrites) (FENCE_TRIM), 2 = a made fence with nothing to wait for on the host GPU
 /// joins the newest queued fence, or with none queued and the fencing thread idle runs its work
 /// on the split's back at once (FENCE_FOLD, FoldStubbedFence). Off by default; timing family
-/// (#161, boulder flashes): flash watch after each. "Fence decisions/s" (GPU profile) counts
+/// (boulder flashes): flash watch after each. "Fence decisions/s" (GPU profile) counts
 /// both.
-/// EXP29 (zortos293/Lichii#717's micro bundle), bits: 1 = Device::GetDeviceMemoryUsage reuses an
+/// EXP29 (a ported micro bundle), bits: 1 = Device::GetDeviceMemoryUsage reuses an
 /// answer younger than 50 ms (MEMSTAT_MS; the buffer and texture caches ask twice per frame on
 /// the back; zone "memory query" times the driver query), 2 = GPU::TickWork checks an atomic
 /// before taking the sync request mutex (OPT_TICKWORK), 4 = native compute engines no longer
@@ -388,8 +388,8 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// Default 6: 2 and 4 are exact (2 only allows interleavings the mutex already allowed, 4 drops
 /// a list nothing in native mode reads); 1 is off, since the caches' GC then sees usage up to
 /// 50 ms old. EDEN_NX2_EXP29=0 is the behaviour before.
-/// EXP30 = 1 (zortos293/Lichii#559, no env var of its own): a macro DMA read of report memory
-/// with pending query results (#215's white flash fix, RasterizerVulkan::FlushQueryResults) waits
+/// EXP30 = 1 (no env var of its own): a macro DMA read of report memory
+/// with pending query results (the ported white flash fix, RasterizerVulkan::FlushQueryResults) waits
 /// only until the counter reports in its range are written (Tegra::Nx2WaitAsyncReportsSettled,
 /// slots from 12 bytes before the read), not for an operation queued behind every fence, which
 /// also waited for all GPU work sent after those reports (8-15% of the back while walking in
@@ -397,7 +397,7 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// (OpenGL keeps its FlushRegion). 0 = the operation wait as before. Off by default, not measured
 /// yet: compare the back's "query DMA wait" profile zone (ms and waits per second) and the white
 /// flash watch.
-/// EXP31 (render target memo, RT_FAST from zortos293/Lichii#717; TextureCache::
+/// EXP31 (render target memo, RT_FAST, ported; TextureCache::
 /// UpdateRenderTargets), bits: 1 = a draw whose render targets are clean (no Dirty::RenderTargets)
 /// skips preparing them again while the same views were prepared for a draw in the same frame,
 /// no image was marked modified, created, deleted, rescaled or CPU written since (modification
@@ -407,7 +407,7 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// (EXP31) mismatch" and drops the memo on a difference). Logs skips, verified and mismatches
 /// every 600 frames while on. Off by default; measure the back's "render targets" zone (3 = verify
 /// first, then 1).
-/// EXP32 (texture binding memo, the core of zortos293/Lichii#717's BINDMEMO for "the same textures
+/// EXP32 (texture binding memo, the core of a ported BINDMEMO for "the same textures
 /// as the pipeline's previous draw"; Vulkan GraphicsPipeline::TextureMemo, graphics pipelines whose
 /// image bindings are all sampled textures), bits: 1 = a draw that reads the same TIC and TSC
 /// handles as its pipeline's previous draw, with the same pools, channel, GPU mappings and texture
@@ -422,14 +422,14 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// by cause, records and verify mismatches every 10 s while set. Off by default; 7 = memo, verify
 /// and auto-off. Measure the back's "read handles", "fill image views" and "push descriptors"
 /// zones (the sampler lookups move from the first to the second with the memo on).
-/// EXP33 = 1 (zortos293/Lichii#337 by Inc0rporate; QueryCacheBase::CounterReport and
+/// EXP33 = 1 (ported; QueryCacheBase::CounterReport and
 /// FenceManager::SignalFence): at fence behaviour Default without GPU accuracy High (or
 /// EDEN_NX2_ACCURATE_PARTS bit 1), a fence-flagged query report is no longer treated as
 /// synchronized: the query stays registered until its fence runs, and that fence is made even
 /// when empty and runs the report's operation once the host GPU passed the work before it
 /// (VideoCore::g_signaling_query_report_fence), as with delayed fences. Other fences are skipped
-/// as before. Read once per report, live. #337's fix for Ocarina's white flashes on leaves and
-/// walls at low accuracy; ours already has #215's FlushQueryResults wait (EXP30 trims it), so
+/// as before. Read once per report, live. The ported fix for Ocarina's white flashes on leaves and
+/// walls at low accuracy; ours already has the ported FlushQueryResults wait (EXP30 trims it), so
 /// off by default, not measured yet: white flash watch, and the front's semaphore waits (the
 /// reports land later than with the fence skipped).
 /// EXP34 (EDEN_NX2_ACQUIRE_PRECHECK=2's reset hole, fable_answer_6 6i (b); puller.cpp
@@ -446,7 +446,7 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// answers into the path level 2 takes for a word below the value, never the other way, so it is
 /// a strict tightening; its cost is the drains it puts back (compare 0, 1 and 2 with
 /// profile_toggle and the AcquiresFast count).
-/// EXP39 (live; keep the split's back fed, zortos293/Lichii#805 62db242b34), bits: 1 = the back
+/// EXP39 (live; keep the split's back fed), bits: 1 = the back
 /// stores its position when it runs out of work (GpuSplit::back_idle_at) and, while that is the
 /// position last published, the front publishes at its next Commit once it holds 8 words, not
 /// after 256 (outside open Pairs and StateDelta blocks; replaces EXP27 & 2), 2 = when an acquire
@@ -455,7 +455,7 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// (CanUseSubmittedCommands); the lists behind it are copied as before. Default 3: both only
 /// change when the back sees work or which words nobody parses again are copied. Measure with
 /// profile_toggle (EXP39 0 vs 3): back "split wait", front "resume pending".
-/// EXP40 (live; command lists on GPU-written pages, zortos293/Lichii#805 34656e8225), bits:
+/// EXP40 (live; command lists on GPU-written pages), bits:
 /// 1 = each command list page keeps the 4-byte words GPU work wrote that guest memory lacks
 /// (BufferCache::Nx2ListPage::gpu_words: set by every GPU write noted to the page, the whole range
 /// a dispatch or copy may write, cleared for words the host writes whole and for all of them when
@@ -471,7 +471,7 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// memory (their copies went stale), DMAClear checks its whole range (it passed words as bytes),
 /// and a front waiting for a list copy publishes first.
 /// EXP41 (live; command entries on pages no GPU work wrote yet, DmaPusher::Step): 1 = the writer
-/// waits before the port of zortos293/Lichii#805 6229487c8c + d4e8d85d4d: EDEN_NX2_LIST_WAIT_SKIP=1
+/// waits before the port: EDEN_NX2_LIST_WAIT_SKIP=1
 /// (built in) skips every entry's wait, =0 waits for every queued dispatch and copy. 0 (default)
 /// = the new shape: an entry waits only for the compute and copy work sent before the last host
 /// sync (WaitForSyncedWriters), and with LIST_WAIT_SKIP=1 an entry that begins between methods
@@ -489,7 +489,7 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// collector's device memory figure, as deleted images waiting for the GPU are. Logs "Image pool
 /// (EXP42) last 600 frames" and counts pooled creates in "Slow clear texture cache". 1 is the default
 /// (LoadExperiments); 0 = off.
-/// EXP79 (live, 0 = off; port of zortos293/Lichii#1373 cedfc26f47; Kernel::PhysicalCore::Idle):
+/// EXP79 (live, 0 = off; ported; Kernel::PhysicalCore::Idle):
 /// a guest core going idle polls its interrupt flag in a hardware wait (MONITORX/MWAITX on AMD,
 /// UMONITOR/UMWAIT on Intel, Common::WaitForFlag; yields elsewhere) instead of a spin of yields
 /// (or EDEN_NX2_IDLE_PAUSE's pauses), so Interrupt's store ends the poll at once and the core
@@ -499,7 +499,7 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// limit. EDEN_NX2_IDLE_STATS=1 logs each core's idle periods every 10 s (polled, blocked, wake
 /// latency). Blocking still uses EDEN_NX2_CORE_LOCK's address wait when that is on. In OoT the
 /// guest threads' handoffs sit on the frame's critical path. Off by default.
-/// EXP87 (live, read per draw, 0 = off; port of zortos293/Lichii#1447; GraphicsPipeline::
+/// EXP87 (live, read per draw, 0 = off; ported; GraphicsPipeline::
 /// ConfigureImpl): draw templates. A pipeline whose bindings are all sampled textures with handles
 /// read from constant buffers keeps each draw's views, samplers, texture descriptors and rescaling
 /// words in a shared table (8,192 slots, 4-way, keyed on the pipeline, the address space, the
@@ -521,7 +521,7 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// the read to the locks. 1 = the fast path; 2 = verify: locked reads compare the mirrors' answer
 /// with what the locked path decides ("mirror clean but cache not" must stay 0), no fast answers.
 /// "GPU-written page mirror" logs the answers every 5 s, also while off.
-/// EXP88 (live, bits, 0 = off; port of zortos293/Lichii#1441 5e186d4f13 + d18b636a69 parts a to
+/// EXP88 (live, bits, 0 = off; ported, parts a to
 /// c, fable52_answer_next70 3; nx2_cb_path.h): 1 = part c: RasterizerVulkan::InnerInvalidation
 /// (FlushCaching's ranges) and, on the back, OnCacheInvalidations (collected guest writes) skip
 /// BufferCache::WriteMemory and its lock where it would change nothing: no page ever left the
@@ -593,18 +593,18 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// entries per stage, rescaling words, ScaleEpoch), through a second instantiation of
 /// ConfigureImpl. Records only, no draw changes; for the delta draw steps after D2.
 /// EDEN_NX2_FASTDRAW_COUNT=1 keeps them too. Off, PrepareDraw reads this switch once a draw.
-/// EXP107 (live, 0 = off; port of zortos293/Lichii#1161 13d9320cfb, lucastaonline): inline
+/// EXP107 (live, 0 = off; ported): inline
 /// constant buffer data (Maxwell3D::CallConstBufferWords, ProcessCBMultiData) is compared with
 /// the words memory holds, on the back, in order (Maxwell3D::CompareConstantData; one GPU page,
 /// not sparse). Equal and safe: not written at all, so no invalidation, no buffer cache mark and
 /// no delta-draw break (OoT rewrites ~258k blocks a second with the same words, often over
-/// texture handles). Safe means #1161's conditions: no GPU-written data may be on the pages
+/// texture handles). Safe means the original conditions: no GPU-written data may be on the pages
 /// (VideoCore::MayHoldGpuWrites, always true outside Switch 2 titles) and no guest read download
 /// may land there; plus ours: not the texture header or sampler pools (also through an alias)
 /// and no run-ahead used this session. Equal but not safe: written as before. With
 /// EDEN_NX2_FASTDRAW_COUNT=1 equal writes are neutral for the count, and the 5 s line ends with
 /// how many changed nothing and how many were not written.
-/// EXP108 (live, 0 = off; port of zortos293/Lichii#1436 = #1161 4c44094e30, lucastaonline):
+/// EXP108 (live, 0 = off; ported):
 /// the GPU's own cached writes (MemoryManager::FlushCaching: inline constant buffer data, its
 /// accumulated ranges) mark their pages CPU-modified but leave them tracked
 /// (MemoryTracker::MarkRegionAsWrittenTracked) instead of untracking them as a guest CPU write
@@ -613,7 +613,7 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// author's PC). Only on pages with no GPU-modified range and no GPU-modified bit (a tracked
 /// page's GPU bits count); never in Nx2Perf verify. A guest CPU access to such a page takes the
 /// slow path, as for any tracked page; a guest write there untracks it as before.
-/// EXP109 (live, 0 = off; port of zortos293/Lichii#1161 f5902c6c68, lucastaonline): a guest write
+/// EXP109 (live, 0 = off; ported): a guest write
 /// that untracks buffer cache pages (RasterizerVulkan::OnCPUWrite) changes their host protection
 /// after dropping buffer_cache.mutex instead of under it (the back waited for those system calls
 /// before draws). The word state changes under the lock as before; the page count decrements are
@@ -692,7 +692,7 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// EXP93 (live, 0 = as EDEN_NX2_UBO_INPLACE says, 1 = on; fable52_answer_writer 3): small
 /// uniform buffers are compared with their slot straight in guest memory instead of through a
 /// scratch copy (VideoCommon::UniformInPlaceCompareEnabled). Judge on "bind stage buffers".
-/// EXP92 (live, 0 = off; fable52_answer_uniformkeeps 3 and 4, idea zortos293/Lichii#1441 part d;
+/// EXP92 (live, 0 = off; fable52_answer_uniformkeeps 3 and 4, idea from a ported change, part d;
 /// BufferCache::BindSmallUniformKeeping): a small uniform slot bound again with the same range,
 /// in the same command buffer, with nothing written to that range since, binds the slot's stream
 /// copy again without reading or comparing guest memory (a "keep"). Written-since is known two
@@ -883,7 +883,7 @@ inline void LoadExperiments() {
         // EXP14: unchanged macro register writes dropped before FrontWrite's other checks.
         // Castle Town, profile toggle: front macro 250 -> 236 ms/s, push 77 -> 70 ms/s.
         g_experiments[14].store(1, std::memory_order_relaxed);
-        // EXP18 = 4 (exact, zortos293/Lichii#717 wave 1): a buffer touches its LRU node once
+        // EXP18 = 4 (exact): a buffer touches its LRU node once
         // per frame; a second touch in the same frame was already a no-op in LruCache::Touch
         // (its tick is not older), so only the node's cache miss goes. Bits 1 and 2 stay off.
         g_experiments[18].store(4, std::memory_order_relaxed);
@@ -891,7 +891,7 @@ inline void LoadExperiments() {
         // (VideoCommon::HandleIsStoragePointer). Ocarina of Time's Zora's River waterfall
         // flickered every other frame in bursts without it.
         g_experiments[21].store(1, std::memory_order_relaxed);
-        // EXP29 = 6: the exact parts of #717's micro bundle (TickWork's lock-free check, native
+        // EXP29 = 6: the exact parts of the ported micro bundle (TickWork's lock-free check, native
         // compute inline uploads not recorded); 1 (memory usage reuse) changes what the caches'
         // GC sees and stays off.
         g_experiments[29].store(6, std::memory_order_relaxed);
@@ -994,7 +994,7 @@ inline void LoadExperiments() {
         // checked, 0 mismatches. Toggle (orbit, uncapped, 180 s warm, 6 cycles): guest lock waits
         // 65.0 -> 3.7 ms/s median, 65.0 -> 66.5 fps, 1% low 44.0 -> 44.9, 0 broken mirrors.
         g_experiments[86].store(1, std::memory_order_relaxed);
-        // EXP88 = 3 (2026-11-12, overnight): zortos293/Lichii#1441 parts a-c (Fable's plan). Verify
+        // EXP88 = 3 (2026-11-12, overnight): ported parts a-c (Fable's plan). Verify
         // runs: part c skipped 100% of ~800,000 flush ranges a second with 0 that would change,
         // parts a+b 0 differ over ~8 million direct writes. Daytime market toggle (orbit,
         // uncapped): back 7.89 -> 7.43 us per draw, flush work 33.6 -> 16.9 ms/s, 59.8 -> 61.8
@@ -1005,7 +1005,7 @@ inline void LoadExperiments() {
         // daytime market (orbit, uncapped): back 8.09 -> 7.69 us per draw, method 175.4 -> 163.2
         // ms/s, 58.7 -> 60.8 fps same session, 1% low 38.8 -> 40.4; picture normal.
         g_experiments[85].store(3, std::memory_order_relaxed);
-        // EXP79 = 1 (2026-11-12, overnight; zortos293/Lichii#1373): guest cores wait for work in
+        // EXP79 = 1 (2026-11-12, overnight): guest cores wait for work in
         // hardware. Judged earlier in runs that mixed the market's two phases (no gain); inside the
         // heavy phase only (orbit, uncapped, 8 x 25 s): 56.5 -> 58.6 fps, 1% low 39.2 -> 40.4,
         // back 8.04 -> 7.81 us per draw. Timing only, no rendering change.
@@ -1025,7 +1025,7 @@ inline void LoadExperiments() {
         // played with it on from boot.
         g_experiments[49].store(1, std::memory_order_relaxed);
         // EXP39 = 3: publish to a back that waits after 8 words, no snapshot refresh of entries
-        // that ran (zortos293/Lichii#805 62db242b34; see the EXP39 notes above). Timing only.
+        // that ran (see the EXP39 notes above). Timing only.
         g_experiments[39].store(3, std::memory_order_relaxed);
         for (int n = 0; n < ExperimentCount; ++n) {
             const std::string name = "EDEN_NX2_EXP" + std::to_string(n);

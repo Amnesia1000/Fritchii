@@ -21,11 +21,11 @@ class MainWindow;
 }
 
 // The Fritchii look ("Graphite"): dark, one violet accent, Inter, a home screen for Ocarina of
-// Time and plain menus. Everything here is switched on only for Fritchii builds, so a Lichii build
-// keeps the upstream UI and merges from Lichii stay clean. Shared files only call in here.
+// Time and plain menus. Everything here is switched on only for Fritchii builds, so any other build
+// keeps the original UI and merges stay clean. Shared files only call in here.
 namespace FritchiiUi {
 
-/// Fritchii builds (g_build_name "Fritchii"). FRITCHII_CLASSIC_UI=1 shows the upstream UI.
+/// Fritchii builds (g_build_name "Fritchii"). FRITCHII_CLASSIC_UI=1 shows the original UI.
 [[nodiscard]] bool Enabled();
 
 /// Fusion style, the Graphite palette, Inter and the stylesheet. Does nothing (and returns false)

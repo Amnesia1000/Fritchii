@@ -41,7 +41,7 @@
 namespace Kernel::Svc {
 namespace {
 
-// Ocarina of Time. Found by Hookshot (NotRexed's OoT recomp, host/hos_thread.c present_poll):
+// Ocarina of Time. Found by an OoT recomp's research (its host/hos_thread.c present_poll):
 // the main thread waits for its frame's GPU work with
 //     while (nvnEventGetValue(e) != 1) nn::os::SleepThread(1 ms);
 // ~3.5 sleeps a frame, so each frame ends 0.5-1 ms after the GPU wrote the event. In the loop a
@@ -70,9 +70,9 @@ struct PresentSite {
 };
 
 constexpr std::array PresentSites{
-    // E0F3CCFA... (2.0.0, v131072). Hookshot's 0x80590520 (sleep return), 0x8059051C and
-    // 0x8059052C are absolute addresses in its Eden layout (nx2/image.py): rtld at 0x80000000,
-    // main right after rtld's 0x20000 (as in Eden: rtld@0x80fe4000, main@0x81004000), so main
+    // E0F3CCFA... (2.0.0, v131072). The recomp's 0x80590520 (sleep return), 0x8059051C and
+    // 0x8059052C are absolute addresses in its emulator layout (nx2/image.py): rtld at 0x80000000,
+    // main right after rtld's 0x20000 (as in this emulator: rtld@0x80fe4000, main@0x81004000), so main
     // offsets 0x570520, 0x57051C, 0x57052C. main+0x590520 held a function epilogue. Not yet
     // seen verified; EXP24=2 shows the real site.
     PresentSite{

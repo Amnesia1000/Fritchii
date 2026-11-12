@@ -266,7 +266,7 @@ public:
 
     /// `keep_page_gpu_data`: download GPU-written bytes sharing the written pages first (false
     /// when the memory is going away). `engine_write`: the GPU's own engines wrote it (inline
-    /// constant buffer data, MemoryManager::FlushCaching), not the guest CPU (EXP108, #1436).
+    /// constant buffer data, MemoryManager::FlushCaching), not the guest CPU (EXP108).
     void WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu_data = true,
                      bool engine_write = false);
 
@@ -275,7 +275,7 @@ public:
     /// among them), noted first, before any early return. Drawing thread. Changes nothing bound.
     void NoteCachedWrites(std::span<const std::pair<DAddr, std::size_t>> sequences);
 
-    /// EXP88 & 1 (zortos293/Lichii#1441 part c, fable52_answer_next70 3.1): why WriteMemory of
+    /// EXP88 & 1 (ported, part c; fable52_answer_next70 3.1): why WriteMemory of
     /// [device_addr, device_addr + size) may change something, or None when it would only make
     /// its first three marks (NoteWriteUnlocked): no page ever left the CPU-modified state (so
     /// none is tracked, cached-written or GPU-modified), no GPU write ever marked one (Switch 2
@@ -497,7 +497,7 @@ public:
     /// write once the GPU is done with it. Unknown otherwise: the caller drains and flushes.
     /// Pages draws write are only Synced or Unknown, and NeedsSync until `past_sync`: the
     /// split's back ran the work before the last host-level wait (GpuSplit::WaitForSync).
-    /// EXP40 & 1 (zortos293/Lichii#805 34656e8225): Synced too when no GPU work wrote the bytes
+    /// EXP40 & 1: Synced too when no GPU work wrote the bytes
     /// [device_addr, device_addr + out.size()) since the page was flushed, or the host wrote them
     /// since; Copied reads the words GPU work wrote from the copy and, once the page was flushed,
     /// the others from guest memory.
@@ -670,7 +670,7 @@ public:
     /// split's back at Castle Town, 600k a second).
     boost::unordered_node_map<DAddr, NativeBankPage> native_indirect_page_snapshots;
     /// EDEN_NX2_BANK_PAGE_TABLE (live, default 0): the snapshots in a page-indexed table instead
-    /// of the node map (the shape of Hookshot (NotRexed/Hookshot) bf13340's write-back pages: 2 MiB
+    /// of the node map (the shape of the recomp's write-back pages: 2 MiB
     /// regions of 512 page slots under a flat top level, the last region looked up kept). Pages
     /// are allocated one by one, so their words stay where they are, as in the node map.
     static constexpr u64 NativeBankRegionBits = 21;
@@ -1053,7 +1053,7 @@ private:
     Common::RangeSet<DAddr> uncommitted_gpu_modified_ranges;
 
     /// Whether GPU-written buffer ranges are copied back to guest memory at the next fence;
-    /// otherwise only when something flushes them (as upstream yuzu below High GPU accuracy).
+    /// otherwise only when something flushes them (as the original code below High GPU accuracy).
     /// Not for Switch 2 titles: title 1 had 250-330 MB/s copied back (a fence per compute
     /// dispatch, the fencing thread holding the buffer cache while it wrote them), while its CPU
     /// read GPU-written memory at most 64 times in 200 s (counted with reactive flushing) and
@@ -1383,7 +1383,7 @@ private:
     bool BindSmallUniformCountingKeeps(size_t stage, u32 index, u32 binding_index,
                                        DAddr device_addr, u32 size, bool range_reuse);
 
-    /// EXP92 (fable52_answer_uniformkeeps 3 and 4; idea zortos293/Lichii#1441 part d): uniform
+    /// EXP92 (fable52_answer_uniformkeeps 3 and 4; idea from a ported change, part d): uniform
     /// keeps. Drawing thread only; the ring is UniformKeepCount's (tier 1), the page generations
     /// and watches Common::UniformKeepPages (tier 2).
     struct UniformKeeps {
@@ -1447,7 +1447,7 @@ private:
                                  u32 size, bool range_reuse, bool eligible, int mode);
     void LogUniformKeeps(int mode);
 
-    /// EDEN_NX2_EXP18 (zortos293/Lichii#641): resolved bindings are kept while the GPU mappings
+    /// EDEN_NX2_EXP18: resolved bindings are kept while the GPU mappings
     /// and the set of buffers stay the same. Bumped whenever a buffer is created, joined or
     /// deleted (ChangeRegister) and when the inline index buffer is replaced.
     u64 binding_epoch = 1;

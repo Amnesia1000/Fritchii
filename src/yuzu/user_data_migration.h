@@ -24,7 +24,7 @@ struct ProfileImportChoice {
     [[nodiscard]] static std::optional<ProfileImportChoice> Parse(const std::string& text);
 };
 
-// TODO(crueter): Quick implementation
+// TODO: Quick implementation
 class UserDataMigrator {
 public:
     UserDataMigrator(QMainWindow* main_window);

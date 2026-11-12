@@ -107,7 +107,7 @@ public:
     }
 
     /// Adds entries recorded from an earlier payload (a pipeline's remembered texture bindings,
-    /// EDEN_NX2_EXP32; from zortos293/Lichii#717).
+    /// EDEN_NX2_EXP32; ported).
     void AddEntries(const DescriptorUpdateEntry* entries, size_t count) {
         payload_cursor = std::copy_n(entries, count, payload_cursor);
     }

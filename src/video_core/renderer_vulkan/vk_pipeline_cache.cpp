@@ -212,7 +212,7 @@ Shader::AttributeType AttributeType(const FixedPipelineState& state, size_t inde
     return Shader::AttributeType::Disabled;
 }
 
-// zortos293/Lichii#1466 (Eglantine#720): Switch 2 geometry shaders may write all 32 generic
+// Ported fix: Switch 2 geometry shaders may write all 32 generic
 // outputs next to Position and Layer: 133 components where Vulkan devices allow 128
 // (maxGeometryOutputComponents). AMD's Windows driver closed the emulator compiling such a shader
 // (RX 6600, Mario Tennis Fever). Drop the outputs the fragment shader never reads; skipped where it
@@ -940,11 +940,11 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .support_conditional_barrier = device.SupportsConditionalBarriers(),
         .single_lane_geometry_subgroups = !profile.SupportsSubgroupStage(Shader::Stage::Geometry),
         .support_byte_addressed_r16 = true,
-        // EDEN_NX2_LIGHT_TABLE_ARRAYS (zortos293/Lichii#1485, off by default). The arrays are
+        // EDEN_NX2_LIGHT_TABLE_ARRAYS (off by default). The arrays are
         // indexed per invocation, which needs nonuniform indexing to be defined.
         .support_handle_table_arrays = VideoCore::Nx2Debug::LightTableArrays() &&
                                        device.IsSampledImageArrayNonUniformIndexingSupported(),
-        // zortos293/Lichii#1466: AMD only, so other vendors translate as before.
+        // Ported fix: AMD only, so other vendors translate as before.
         .trim_lowered_geometry_passthrough = device.IsAmdDriver(),
     };
     host_info.ApplyDescriptorLimitPolicy();
@@ -1011,7 +1011,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         Settings::values.vertex_input_dynamic_state.GetValue();
     dynamic_features.has_static_vertex_repack =
         StaticVertexRepackEnabled(device.GetMinVertexInputBindingStrideAlignment());
-    // EDEN_NX2_FASTDRAW_COUNT (#1161): neither the key's strides (extended dynamic state) nor its
+    // EDEN_NX2_FASTDRAW_COUNT: neither the key's strides (extended dynamic state) nor its
     // vertex input (dynamic vertex input) depend on the streams' stride and enable word then.
     VideoCommon::Nx2FastDrawCount::g_vertex_streams_dynamic =
         dynamic_features.has_extended_dynamic_state && dynamic_features.has_dynamic_vertex_input;
@@ -1063,7 +1063,7 @@ constexpr u32 UsedPipelinesMagic = 0x31505545; // "EUP1"
 // SPIR-V -> MSL -> Metal, far more than the 2-3 ms the shorter window assumes, so each one
 // built at boot is a stutter avoided.
 // Ocarina still built pipelines for 1-2 s of every 10 s early in play with two sessions kept:
-// keep sixteen (#161).
+// keep sixteen.
 constexpr u8 UsedPipelinesMaxAge = 2;
 constexpr u8 UsedPipelinesMaxAgePerf = 16;
 constexpr u8 UsedPipelinesMaxAgeMoltenVK = 8;
@@ -1113,7 +1113,7 @@ void MaskKeyedAttributeTypes(GraphicsPipelineCacheKey& key, std::span<const File
 }
 
 /// EDEN_NX2_CANONICAL_KEYS=1 (off by default; read on first use, after nx2_switches.txt): native
-/// graphics keys without the state that cannot change the pipeline (zortos293/Lichii#895's
+/// graphics keys without the state that cannot change the pipeline (the ported precompile feature's
 /// FixedPipelineState::CanonicalizeNative), at the draw, at disk cache load and in the
 /// precompiled preparation, so a precompiled pipeline is created with the draw's create info.
 bool CanonicalKeys() {
@@ -1132,7 +1132,7 @@ bool CanonicalKeys() {
     return enabled;
 }
 
-/// EDEN_NX2_PRECOMPILED_FAST (zortos293/Lichii#896; off by default, read on first use): 0 off; 1
+/// EDEN_NX2_PRECOMPILED_FAST (off by default, read on first use): 0 off; 1
 /// the precompiled preparation (EDEN_NX2_PRECOMPILE) keeps each pipeline's shader infos and
 /// SPIR-V, and a draw of a precompiled pipeline whose recorded answers hold is created from them
 /// instead of translated; 2 the same, and each such pipeline is translated from the game's state
@@ -1161,7 +1161,7 @@ int PrecompiledFastMode() {
 
 /// The canonical form of a native key's state (EDEN_NX2_CANONICAL_KEYS=1). The attribute types
 /// are left as they are: draws and the loader already keep only those the programs read
-/// (VideoCommon::KeyedAttributeTypes, the rule #895's mask follows). Idempotent.
+/// (VideoCommon::KeyedAttributeTypes, the rule the ported mask follows). Idempotent.
 void CanonicalizeKeyState(FixedPipelineState& state, const DynamicFeatures& features) noexcept {
     // With a dynamic stipple enable the key never says whether lines are stippled (Refresh3
     // leaves line_stipple_enable 0), while the factor and pattern stay static in the pipeline:
@@ -1244,16 +1244,16 @@ std::optional<std::string> ReadPipelineRecordKey(std::ifstream& file, std::strea
     return bytes;
 }
 
-/// Pipeline caches of zortos293/Lichii builds whose records this build reads, newest first.
-/// From #194 on (cache version 53) they write the same records as this build under another
-/// version number; version 54 (#408) only masks the vertex attribute types in its keys, as
+/// Pipeline caches of related builds whose records this build reads, newest first.
+/// From cache version 53 on they write the same records as this build under another
+/// version number; version 54 only masks the vertex attribute types in its keys, as
 /// loading does here. Community packs often keep the legacy names, so those are taken when
 /// their header says 53 or 54.
 void MergeCompatiblePipelineCaches(const std::filesystem::path& base_dir,
                                    const std::filesystem::path& own_cache,
                                    const std::filesystem::path& own_used) {
     constexpr std::array<char, 8> PipelineCacheMagic{'y', 'u', 'z', 'u', 'c', 'a', 'c', 'h'};
-    // 55: zortos293/Lichii#408/#804 (same records, keys masked as ours already are).
+    // 55: same records, keys masked as ours already are.
     constexpr std::array<u32, 3> CompatibleVersions{55, 54, 53};
     struct Candidate {
         std::filesystem::path cache;
@@ -2105,7 +2105,7 @@ void PipelineCache::SaveUsedPipelines() {
 
 namespace {
 // EDEN_NX2_PIPELINE_CLEAN=1 or EDEN_NX2_EXP19=1 (live; default off): see
-// CurrentGraphicsPipelineClean. EXP19=2: with the patches of zortos293/Lichii#641
+// CurrentGraphicsPipelineClean. EXP19=2: with the ported patches
 // (EDEN_NX2_PIPE_SKIP, EDEN_NX2_PIPE_PATCH).
 int PipelineCleanMode() {
     static const bool env = [] {
@@ -2410,16 +2410,16 @@ void PipelineCache::TakeCleanSnapshot() {
 // engine hint. When all of these equal their values at the last Refresh and the flags are
 // clear, Refresh would rewrite the same key and Next(graphics_key) would return
 // current_pipeline (whose key it is): the lookup returns it as that fast path does.
-// With `patch` (zortos293/Lichii#641): the dual-source blend bit is compared instead of the blend
+// With `patch`: the dual-source blend bit is compared instead of the blend
 // registers, and a raised VertexInput (dynamic vertex input) or Blending flag redoes only that
 // part of the key, which Next then looks up.
-// With EXP50 (blend by value, after the-cashman's fix in zortos293/Lichii#717): the blend
+// With EXP50 (blend by value, after a ported fix): the blend
 // registers (clean.blend_ranges) leave the word compare and Dirty::Blending is not looked at.
 // While those words equal the ones the key's attachments and dual-source bit were made from (or
 // last proved equal to), the key stands. When they moved, the attachments RefreshBlending would
 // build (canonical as RefreshGraphicsKey makes them) and the dual-source bit are compared with
 // the key's: equal is a hit, different patches only that part of the key, which Next looks up.
-// The compare reads the registers, so blend writes that never raise the flag (#679) are seen.
+// The compare reads the registers, so blend writes that never raise the flag are seen.
 // With EXP52 (fable52_answer_1 section 1): when the programs changed but every other input above
 // stands, the state part of the key is still what Refresh would build, except the one field the
 // programs feed: with dynamic vertex input, the attribute types are masked by what the bound
@@ -2811,7 +2811,7 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
             entry = CreateComputePipeline(key, shader);
         }
     } else if (entry.pending) {
-        // A rebuild (below) compiles on a worker; switch once it is built (zortos293/Lichii#969:
+        // A rebuild (below) compiles on a worker; switch once it is built (ported:
         // the next dispatch used to wait for it, up to 2.8 s in Ocarina of Time).
         if (entry.pending->pipeline->IsBuilt()) {
             auto rebuilt{std::move(entry.pending)};
@@ -2976,7 +2976,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                      error ? fmt::format(" (failed: {})", error.message()) : std::string{});
         }
     }
-    // Pipelines of zortos293/Lichii caches this cache lacks are appended each time such a cache
+    // Pipelines of related builds' caches this cache lacks are appended each time such a cache
     // changes, and their used lists merged, so they are built like this build's own.
     MergeCompatiblePipelineCaches(base_dir, pipeline_cache_filename, used_pipelines_filename);
     used_pipelines = LoadUsedPipelines(used_pipelines_filename, MaxUsedPipelineAge(device));
@@ -4173,7 +4173,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                                        std::stop_token stop_loading,
                                        const VideoCore::DiskResourceLoadCallback& callback,
                                        const std::filesystem::path& file, bool force) {
-    // Ported from #895 for Fritchii: it runs beside the game (precompile_thread) instead of
+    // Ported for Fritchii: it runs beside the game (precompile_thread) instead of
     // before the first frame, on threads of its own at idle priority instead of the boot's
     // pipeline workers, and reads each record from the file when it is built instead of
     // holding all of them (Ocarina of Time: 132,606 records, ~140 MB of keys).
@@ -4786,9 +4786,9 @@ std::string PipelineCache::KeptStamp(const std::string& prepared_stamp) const {
     // found by). Not the exe nor the EDEN_NX2_ switches (2026-11-09, owner: every dev build and
     // every test switch prepared again): whether this build and its switches translate the
     // kept pipelines the same is checked at boot on a sample of them (CheckKeptSample).
-    // NX2KEPT4: the SPIR-V emitter changed under kept modules (zortos293/Lichii#902 clip
-    // distances; #820 noperspective varyings, then its revert), which the sample only sees if it hits one.
-    // NX2KEPT5 (v5.6): F32->S32 conversions saturate in range (zortos293/Lichii#1051), and the
+    // NX2KEPT4: the SPIR-V emitter changed under kept modules (ported clip
+    // distances; ported noperspective varyings, then their revert), which the sample only sees if it hits one.
+    // NX2KEPT5 (v5.6): F32->S32 conversions saturate in range, and the
     // fragment output masks are kept with the infos (Fritchii #29, AMD horizon rainbow).
     return fmt::format("{}kept NX2KEPT5 cache {} settings {:#x} gpl {} oot {} {:016x} canonical "
                        "{}\n",
@@ -4865,7 +4865,7 @@ void PipelineCache::NotePrecompiledMiss(const char* reason) {
 
 namespace {
 /// The pixel format traits a translation used: integer formats always (sampled textures), the
-/// others only with descriptors that use them (#896).
+/// others only with descriptors that use them.
 u32 UsedFormatTraits(std::span<const Shader::Info* const> infos) {
     u32 traits = FileEnvironment::FormatTraitInteger;
     for (const Shader::Info* const info : infos) {
@@ -5757,7 +5757,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
         pipeline = TakeBackgroundPipeline(graphics_key);
         // A key evicted earlier (EvictUnusedPipelines) is translated binding the storage buffer
         // pointers it bound, whatever their slots hold now: one null or unmapped around an area
-        // load would otherwise read zeros for the rest of the session (from zortos293/Lichii#1143).
+        // load would otherwise read zeros for the rest of the session (ported).
         // Kept until a pipeline of the key is made: a queued translation may be queued again.
         const auto* const keep_pointers = pipeline ? nullptr : KeptPointers();
         if (keep_pointers) {
@@ -5908,7 +5908,7 @@ void ReportWorstFrame() {
 } // Anonymous namespace
 
 namespace {
-/// EDEN_NX2_TRANSLATE_PROFILE=1 (zortos293/Lichii#896's profiler, off by default): every 10 s the
+/// EDEN_NX2_TRANSLATE_PROFILE=1 (the ported profiler, off by default): every 10 s the
 /// time each translation step took on all threads, the largest first.
 void ReportTranslateProfile() {
     if (!Shader::TranslateProfile::Enabled()) {
@@ -6059,7 +6059,7 @@ void PipelineCache::EvictUnusedPipelines() {
     // 25 minutes of play, then rebuilt 1,850 (14 s of stalls, 3.8 s in one 10 s window). The
     // threshold scales with the RAM (EvictAbovePipelines: 32 GB ~4,560, ~2 GB of driver memory).
     // EDEN_NX2_PIPELINE_EVICT_ABOVE sets it.
-    // Past it only the excess goes, least recently used first (from zortos293/Lichii#408), so
+    // Past it only the excess goes, least recently used first (ported), so
     // crossing it doesn't drop every stale pipeline at once.
     const size_t evict_above = EvictAbovePipelines();
     if (graphics_cache.size() <= evict_above) {
@@ -6067,7 +6067,7 @@ void PipelineCache::EvictUnusedPipelines() {
     }
     const u64 cutoff = frame_count - EvictAfterFrames;
     // A pipeline built from the disk cache at boot that no draw has used yet stays, up to a budget
-    // (from zortos293/Lichii#550): evicting it throws the prebuild away, and the game translates it
+    // (ported): evicting it throws the prebuild away, and the game translates it
     // again on the GPU thread when it reaches that content. Past the budget (~0.9 GB of driver
     // memory) they go like the rest, so a large cache can't hold their memory all session.
     constexpr size_t MaxUnusedPrebuiltPipelines = 2000;
@@ -6535,7 +6535,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         // The output buffer's binding follows every program's. The task and mesh programs
         // share the compute stage, so their descriptors and the emulation's own buffers count
         // against one set of per-stage limits.
-        // EDEN_NX2_LIGHT_TABLE_ARRAYS (zortos293/Lichii#1485): task and mesh share the compute
+        // EDEN_NX2_LIGHT_TABLE_ARRAYS: task and mesh share the compute
         // stage, including the fallback's storage buffers: their arrays shrink before counting
         // resources and assigning auxiliary bindings, a descriptor array takes one binding (as
         // in DefineTextures and the layout builder) and samplers count too. Off, as before
@@ -6683,7 +6683,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     }
     // The mesh fallback binds its output buffer (and, for task draws, payload, offsets and
     // indirect arguments) into the descriptor set every stage shares: with the stages' own storage
-    // buffers they must fit the set's limit (zortos293/Lichii#642; only fallback pipelines).
+    // buffers they must fit the set's limit (only fallback pipelines).
     if (const u32 set_limit = host_info.max_descriptor_set_storage_buffers;
         mesh_emulation && set_limit != 0) {
         size_t storage_buffers{};
@@ -6779,7 +6779,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         ConvertLegacyToGeneric(program, runtime_info);
         if (index == static_cast<size_t>(Maxwell::ShaderType::Geometry) && device.IsAmdDriver()) {
-            // zortos293/Lichii#1466, AMD only: other vendors keep every geometry output.
+            // Ported fix, AMD only: other vendors keep every geometry output.
             PruneUnreadGeometryOutputs(
                 program, programs[static_cast<size_t>(Maxwell::ShaderType::Pixel)], key,
                 device.IsNvGeometryShaderPassthroughSupported());
@@ -6916,7 +6916,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         .libraries_only = libraries_only,
     };
     // The slots each program bound as storage buffer pointers, kept if the pipeline is evicted
-    // (evicted_pointer_slots) for its next translation (from zortos293/Lichii#1143).
+    // (evicted_pointer_slots) for its next translation (ported).
     static_assert(VideoCommon::EvictedPointerSlots::NumPrograms == Maxwell::MaxShaderProgram);
     VideoCommon::EvictedPointerSlots::Slots mapped_pointers;
     for (size_t index = 0, program_env = 0;

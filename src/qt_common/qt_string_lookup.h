@@ -19,7 +19,7 @@ namespace QtCommon::StringLookup {
 
 Q_NAMESPACE
 
-// TODO(crueter): QML interface
+// TODO: QML interface
 enum StringKey {
     DataManagerSavesTooltip,
     DataManagerShadersTooltip,

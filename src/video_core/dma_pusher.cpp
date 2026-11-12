@@ -52,7 +52,7 @@ constexpr u32 ComputeInline = 0x6D;
 
 namespace {
 /// The split's position after the last copy engine method that may write memory (the front's;
-/// zortos293/Lichii#805 d4e8d85d4d).
+/// ported).
 u64 g_last_copy_writer{};
 
 /// Whether copy engine work sent so far may still be queued on the split's back. A new session
@@ -229,7 +229,7 @@ bool DmaPusher::Step() {
     // as this frame's commands (methods on unbound subchannels, garbage QMDs, then a channel
     // waiting forever on a release it never got). The acquire is released now, so the commands
     // are written and the memory not yet reused: copy them here. EDEN_NX2_RESNAPSHOT=0: off.
-    // EXP39 & 2 (zortos293/Lichii#805 62db242b34): the current list's entries before this one
+    // EXP39 & 2: the current list's entries before this one
     // ran already and are never parsed again, and an entry the acquire suspended inside reads
     // its remaining words from memory anyway (CanUseSubmittedCommands): neither is copied.
     if (ResnapshotEnabled() && suspensions.load(std::memory_order_relaxed) != suspensions_before) {
@@ -351,7 +351,7 @@ bool DmaPusher::Step() {
         // Pages no GPU work has written yet may still get the entry from compute or copy work
         // queued before it: the GPU-written page bits learn of a write only when the back records
         // it, so the front waits for that work (the "list writers" site). The new shape
-        // (zortos293/Lichii#805 6229487c8c, d4e8d85d4d):
+        // (ported):
         // - The GPU fetches an entry after that work only past a host-level wait (NoteSync):
         //   later work is not ordered before the fetch, so the entry waits only for the compute
         //   and copy work sent before the last sync (nor for draws, which write memory too;
@@ -444,7 +444,7 @@ bool DmaPusher::Step() {
         } else if (gpu_written &&
                    (TakeListDraw(dma_state.dma_get, static_cast<u32>(header.size)) ||
                     TakeListDispatch(dma_state.dma_get, static_cast<u32>(header.size)))) {
-            // zortos293/Lichii#1336: nothing to parse, the words stay on the host GPU and the
+            // Ported fix: nothing to parse, the words stay on the host GPU and the
             // call is complete. Before the copy read (Nx2ReadListCopy, the "list GPU wait") and
             // before EDEN_NX2_INDIRECT_GRID's placeholders, which then never see these lists.
         } else if (gpu_written && command_resume_offset == 0 && header.size == 3 &&
@@ -1022,7 +1022,7 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
     // second in a Mario Kart World race, during which the back had nothing to do). Pages
     // FlushGpuWrittenCommands flushed whole and no GPU work wrote since are read from guest
     // memory; with EXP40 & 1 so are lists on words no GPU work wrote since the page was flushed,
-    // or the host wrote since (BufferCache::Nx2ReadListCopy; zortos293/Lichii#805 34656e8225).
+    // or the host wrote since (BufferCache::Nx2ReadListCopy).
     if (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed) || count == 0 ||
         rasterizer == nullptr) {
         return false;
@@ -1117,8 +1117,7 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
 
 void DmaPusher::VerifyGpuWrittenCommands(GPUVAddr address, u32 count) {
     // The list again as the front read lists before EXP40: after every dispatch and copy sent so
-    // far, from the pages' whole copies, or drained and flushed (zortos293/Lichii#805
-    // 3a665f9f27).
+    // far, from the pages' whole copies, or drained and flushed.
     using GpuWrittenList = VideoCore::RasterizerInterface::GpuWrittenList;
     const size_t bytes = size_t{count} * sizeof(u32);
     std::vector<u32> parsed(count);

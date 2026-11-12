@@ -419,7 +419,7 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
     } else {
         // The play history the guesses come from: this fork's cache (vulkan-frizti), else the
         // shared name of this version, else the newest cache of a version with the same record
-        // layout (zortos293/Lichii builds).
+        // layout (related builds).
         std::vector<fs::path> candidates{
             VideoCommon::VersionedPipelineCachePath(TitleDir(title_id), "vulkan-frizti",
                                                     VideoCommon::VulkanPipelineCacheVersion),

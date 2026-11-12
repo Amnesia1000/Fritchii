@@ -34,8 +34,8 @@ namespace Kernel {
 
 namespace {
 
-/// EDEN_NX2_IDLE_PAUSE=1 (live, VideoCore::Nx2Debug::g_idle_pause, off by default; from
-/// zortos293/Lichii#641, where it is on): Idle's poll runs PAUSE instead of SwitchToThread, so
+/// EDEN_NX2_IDLE_PAUSE=1 (live, VideoCore::Nx2Debug::g_idle_pause, off by default; ported
+/// from a build where it is on): Idle's poll runs PAUSE instead of SwitchToThread, so
 /// there is no syscall per iteration (10-16% of each guest core in Castle Town), and reads the
 /// clock only every 16 pauses instead of every iteration. The poll stays bounded by time: 16
 /// pauses are ~2,200 cycles on Intel Skylake and later (~140 each) and far fewer on AMD (~10-60
@@ -58,13 +58,13 @@ void IdlePause() {
 #endif
 }
 
-/// EDEN_NX2_CORE_LOCK=1 (boot switch, off by default; from zortos293/Lichii#641, where it is on):
+/// EDEN_NX2_CORE_LOCK=1 (boot switch, off by default; ported from a build where it is on):
 /// the core context lock is a KSpinLock (spins briefly, then an address wait) instead of a
 /// std::mutex, and Idle sleeps on an address wait on the interrupt flag instead of a condition
 /// variable; Interrupt sets the flag and signals the JIT under the lock and wakes the sleeper
 /// after releasing it. This sits on the scheduler's thread-state path (OnThreadStateChanged ->
 /// scheduler lock Unlock -> RescheduleCores -> Interrupt), 10-16% of each guest core in Castle
-/// Town. #641 also moved the waits to its own WaitOnAddress wrapper because libstdc++'s
+/// Town. The ported change also moved the waits to its own WaitOnAddress wrapper because libstdc++'s
 /// std::atomic::wait goes through winpthreads on MinGW; here std::atomic::wait is used, which on
 /// MSVC's STL (the clang-cl builds) already is WaitOnAddress. Read once per core at kernel setup,
 /// so a core never mixes the two locks.
@@ -413,7 +413,7 @@ void PhysicalCore::Idle(KernelCore& kernel) {
         return;
     }
 
-    // EXP79 (zortos293/Lichii#1373, cedfc26f47): that poll is a hardware wait on the interrupt
+    // EXP79: that poll is a hardware wait on the interrupt
     // flag (Common::WaitForFlag) rather than a spin of yields or pauses, and only as long as
     // recent idle periods suggest it pays (Common::NextPollWindow): a core that keeps idling past
     // the limit polls less, and blocks sooner. EDEN_NX2_IDLE_PAUSE does not apply here.

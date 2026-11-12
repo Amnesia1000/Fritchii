@@ -3117,8 +3117,8 @@ public:
             return (draw_state.draw_mode == DrawMode::Instance && draw_state.instance_count != 0) ||
                    first_folded;
         }
-        /// EDEN_NX2_FOLD_INSTANCE (split front, instanced draw macros; from Skitchii
-        /// (skolvolt/Lichii)): the next draw.end ends the first instance of an instance loop. The
+        /// EDEN_NX2_FOLD_INSTANCE (split front, instanced draw macros; ported):
+        /// the next draw.end ends the first instance of an instance loop. The
         /// loop's deferred draw covers that instance too (DrawDeferred draws instance_count + 1),
         /// so it isn't drawn on its own (it was drawn twice).
         void FoldFirstInstance() noexcept {
@@ -3247,7 +3247,7 @@ public:
                          u32 argument, bool is_last_call);
     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                               const u32* base_start, u32 amount, u32 methods_pending);
-    /// List draws (nx2_list_draw.h, zortos293/Lichii#1336): the call of macro `method` whose two
+    /// List draws (nx2_list_draw.h): the call of macro `method` whose two
     /// parameters are the GPU-written words at `address`. Returns whether the call was sent to
     /// the back without reading them.
     bool FrontTakeListDraw(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
@@ -3314,7 +3314,7 @@ public:
     /// Handles a write to the CB_DATA[i] register.
     void ProcessCBData(u32 value);
     void ProcessCBMultiData(const u32* start_base, u32 amount);
-    /// EXP88 & 2 (zortos293/Lichii#1441 part a): writes constant buffer data at `offset`
+    /// EXP88 & 2: writes constant buffer data at `offset`
     /// (`bytes` within the buffer) through the buffer CB_ADDRESS and CB_SIZE select, translated
     /// once per selection and memory map (MemoryManager::WriteConstantBufferData). False, having
     /// done nothing, where the general path has to: the switch is off, the buffer isn't one
@@ -3323,7 +3323,7 @@ public:
 
     void ProcessInlineIndexMultiData(u32 method, const u32* start_base, u32 amount);
 
-    /// EDEN_NX2_FASTDRAW_COUNT (nx2_fastdraw_count.h), zortos293/Lichii#1161's lists: registers
+    /// EDEN_NX2_FASTDRAW_COUNT (nx2_fastdraw_count.h), the original lists: registers
     /// that only parameterize the next draw, the next constant buffer bind or the buffers a delta
     /// draw binds again, or that ProcessMethodCall handles, so writing them doesn't end reuse.
     static bool IsFastDrawParameter(u32 method);
@@ -3343,11 +3343,11 @@ public:
     void NoteFastDrawCountWrite(u32 method, u32 argument);
     /// Counting on: inline data written to GPU addresses [begin, end) (constant buffer words, a
     /// report): texture or sampler headers end reuse, also through another GPU address mapping
-    /// their device memory (#1161's alias check); the rest is noted as light, unless `unchanged`
-    /// (memory held the words already: EXP107, #1161 13d9320cfb).
+    /// their device memory (the original alias check); the rest is noted as light, unless `unchanged`
+    /// (memory held the words already: EXP107).
     void NoteFastDrawCountData(GPUVAddr begin, GPUVAddr end, bool unchanged = false);
 
-    /// EXP107 (zortos293/Lichii#1161 13d9320cfb): how inline constant buffer data about to be
+    /// EXP107: how inline constant buffer data about to be
     /// written to [begin, begin + bytes) compares with what memory holds there.
     enum class ConstantWrite : u8 {
         Changed,   ///< Other words, or not compared (switch off, crosses a page, sparse, unmapped)
@@ -3490,7 +3490,7 @@ private:
 
     MemoryManager& memory_manager;
 
-    /// EXP88 & 2: the constant buffer WriteBoundConstantBuffer last translated (zortos' TIC and
+    /// EXP88 & 2: the constant buffer WriteBoundConstantBuffer last translated (the original's TIC and
     /// TSC parts left out: they serve its fast draw, which we don't have).
     struct BoundConstantBuffer {
         GPUVAddr address{};
@@ -3565,7 +3565,7 @@ public:
     bool FrontMacroCountsDraw(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                               u32 count);
 private:
-    /// EXP53 (Eglantine d3612f82b1, kraibse): whether the macro at `method` is NVN's
+    /// EXP53: whether the macro at `method` is NVN's
     /// conditional render, which DMA-reads six Compare words and only sets render_enable.mode
     /// from them as IfNotEqual does (dry runs on copies, cached per macro and code generation).
     bool IsPredicateMacro(FrontState& fs, u32 method);

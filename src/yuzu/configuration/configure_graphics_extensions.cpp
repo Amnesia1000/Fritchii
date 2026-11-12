@@ -44,7 +44,7 @@ void ConfigureGraphicsExtensions::Setup(const ConfigurationShared::Builder& buil
          Settings::values.linkage.by_category[Settings::Category::RendererExtensions]) {
         ConfigurationShared::Widget* widget = [&]() {
             if (setting->Id() == Settings::values.sample_shading.Id()) {
-                // TODO(crueter): should support this natively perhaps?
+                // TODO: should support this natively perhaps?
                 return builder.BuildWidget(
                     setting, apply_funcs, ConfigurationShared::RequestType::Slider, true, 1.0f,
                     nullptr, tr("%", "Sample Shading percentage (e.g. 50%)"));

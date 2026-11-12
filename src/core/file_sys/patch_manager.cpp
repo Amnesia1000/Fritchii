@@ -93,11 +93,11 @@ constexpr std::array MAX_RESOLUTION_RECORDS{
                        .original = 0x360041E8}, // tbz w8, #0, 0x80640c
 };
 
-// RsMan-Dev's texture pool patch (zortos293/Lichii#1313, refs #247 #449): with Max Resolution the
+// Texture pool patch (a ported community patch): with Max Resolution the
 // render targets outgrow the graphics allocator's initial pool and the Castle Town guard house
 // (the pot room) dereferences a null allocation and freezes. main+0xC2A36C (stp x8, x9,
 // [sp, #0x10]) stores the initial pool size (x8); it now calls a routine that doubles x8 first
-// (lsl x8, x8, #1 ; stp x8, x9, [sp, #0x10] ; ret). Upstream's routine sits at main+0x3C462C0,
+// (lsl x8, x8, #1 ; stp x8, x9, [sp, #0x10] ; ret). The original routine sits at main+0x3C462C0,
 // inside the Hyrule Cheat Menu mod's code (main+0x3C46280..0x3C46398); ours goes after our own
 // cave on the same executable page (main+0x3C46F10, the page runs to main+0x3C47000), so the
 // call is re-encoded for it (bl +0x301CBA4).
@@ -114,7 +114,7 @@ constexpr std::array TEXTURE_POOL_RECORDS{
     BuiltinPatchRecord{.module_offset = TEXTURE_POOL_ROUTINE_OFFSET, .bytes = TEXTURE_POOL_ROUTINE},
 };
 
-// Dynamic FPS by Dark (Eglantine Dev), bundled with his permission: the game's frame step follows
+// Dynamic FPS by Dark, bundled with his permission: the game's frame step follows
 // the time measured with the system counter instead of assuming 30 fps, so it runs at full speed
 // at any frame rate. A call (bl 0x3c46200) to a routine in unused space after the code.
 constexpr std::array<u8, 4> DYNAMIC_FPS_CALL{0x4F, 0x7D, 0xD5, 0x94};
@@ -132,10 +132,10 @@ constexpr std::array<u8, 120> DYNAMIC_FPS_ROUTINE{
 };
 
 // High refresh rate (experimental, Settings oot_high_refresh): Dark's routine with the tail of
-// zortos293/Lichii#655 ("FPS Unlock", by atk3001): the smoothed real-time step is always
+// The "FPS Unlock" patch (a ported community patch): the smoothed real-time step is always
 // returned, also below 1.0, so the game keeps real speed above 60 fps (0.5 a frame at 120).
 // Through the fmul at +0x58 it is Dark's routine byte for byte (the 50 ms delta cap included;
-// #655 raised it to 100 ms). The tail clamps the step to [0.02, 3.0] (3.0 = that cap; #655: 6.0) and multiplies it
+// the ported patch raised it to 100 ms). The tail clamps the step to [0.02, 3.0] (3.0 = that cap; the ported patch: 6.0) and multiplies it
 // by a speed scale word that the present pacing sets from the speed limit (Turbo, Slow; 1.0 at
 // 100%), since pacing alone no longer changes the game's speed. The first call (no earlier
 // tick) still returns the game's own step from +0x70 (the head's cbz target).
@@ -165,14 +165,14 @@ constexpr size_t HIGH_REFRESH_ROUTINE_OFFSET = 0x3C46E00;
 constexpr std::array<u8, 4> HIGH_REFRESH_CALL{0x4F, 0x80, 0xD5, 0x94}; // bl 0x3c46e00
 constexpr size_t HIGH_REFRESH_SCALE = 0x88; // the speed scale word, in the routine
 
-// Water ripples above 60 fps (Port of zortos293/Lichii#1152, by atk3001): the water renderer
+// Water ripples above 60 fps (a ported community patch): the water renderer
 // (main+0x472E0) runs its ripple simulation trunc(step) * substeps times a frame (fcvtzs w9, s0 at
 // main+0x475F8), so below a step of 1 the rings Link makes in water freeze. That fcvtzs branches
 // to an accumulator that keeps the fractional step per water object (x21) in 8 slots in BSS
 // after Dark's timer state (main+0x4E9FE00, 16 bytes): a u32 round-robin index at +0x10, then
 // (u64 owner, f32 rest) slots with a 16-byte stride at +0x20, replaced round-robin when full.
-// It returns w9 = trunc(step + rest) and keeps the rest. Upstream puts it at main+0x3C46280; it
-// sits at +0x90 of our routine here (main+0x3C46E90): the same page, so its adrp is upstream's
+// It returns w9 = trunc(step + rest) and keeps the rest. The original patch puts it at main+0x3C46280; it
+// sits at +0x90 of our routine here (main+0x3C46E90): the same page, so its adrp is the original's
 // word; only the two branches between the hook and it are re-encoded.
 constexpr size_t WATER_HOOK_OFFSET = 0x475F8;
 constexpr u32 WATER_FCVTZS = 0x1E380009;                        // fcvtzs w9, s0
@@ -188,7 +188,7 @@ constexpr std::array<u8, 128> WATER_ACCUMULATOR{
     0x29, 0x41, 0x00, 0x91, 0x29, 0x11, 0x0A, 0x8B, 0x35, 0x01, 0x00, 0xF9, 0x3F, 0x09,
     0x00, 0xB9, 0x21, 0x09, 0x40, 0xBD, 0x00, 0x28, 0x21, 0x1E, 0x01, 0xC0, 0x25, 0x1E,
     0x00, 0x38, 0x21, 0x1E, 0x20, 0x09, 0x00, 0xBD, 0x29, 0x00, 0x38, 0x1E, 0xBC, 0x01,
-    0x10, 0x17, // +0x7C b 0x475fc (from 0x3c46f0c; upstream, from 0x3c46280: 0x171004c0)
+    0x10, 0x17, // +0x7C b 0x475fc (from 0x3c46f0c; the original, from 0x3c46280: 0x171004c0)
 };
 // Dark's timer state and the ripple slots (ldr/str through adrp 0x4e9f000 + 0xe00 / + 0xe20).
 constexpr size_t HIGH_REFRESH_STATE_OFFSET = 0x4E9FE00;
@@ -224,7 +224,7 @@ static_assert(OotHighRefreshCode::CallOffset == 0x6E6CC4 &&
 
 // The call (to our routine or to Dark's), Dark's routine (so the mode can switch live), the water
 // hook (over its fcvtzs), then our cave one word at a time, each checked to be zero in the module.
-// Since v5.8 (zortos293/Lichii#1180's finding, 2026-11-10) Dark's mode gets the same hook and
+// Since v5.8 (a ported finding, 2026-11-10) Dark's mode gets the same hook and
 // cave too, through the separate ripple built-in: with his Dynamic FPS alone the ripples ran
 // trunc(step) passes, so at a 60 fps cap (step 0.998-1.003) some frames ran none and below 60
 // they ran slow (1.33 -> 1). With both, the call word is the only difference between the modes.
@@ -272,7 +272,7 @@ bool HighRefreshSettingOn() {
     return Settings::values.oot_high_refresh.GetValue();
 }
 
-// Occlusion Off (cLohan's community patch, from zortos293/Lichii#641): the game creates no
+// Occlusion Off (a ported community patch): the game creates no
 // z-prepass occlusion queries and no samples-passed queries (ldrb w8, [x0] -> mov w8, wzr), so it
 // issues no occlusion reports and no conditional renders; every candidate object is drawn.
 constexpr std::array<u8, 4> MOV_W8_WZR{0xE8, 0x03, 0x1F, 0x2A};
@@ -286,7 +286,7 @@ constexpr std::array OCCLUSION_OFF_RECORDS{
     BuiltinPatchRecord{.module_offset = 0x11B82F4, .bytes = MOV_W8_WZR, .checked = true, .original = LDRB_W8_X0},
 };
 
-// Resource poll backoff (zortos293/Lichii#641): the resource request thread (main+0xF7A0)
+// Resource poll backoff: the resource request thread (main+0xF7A0)
 // rescans its pending requests at once when one is not ready (`tbz w8, #0, loop` at main+0x14ABC,
 // w8 = "all done"). That branch now goes through the zero padding at main+0x17088: `svc #0xf3`
 // (a short sleep while EXP25 is on, core/hle/kernel/svc/svc_nx2_oot_poll.cpp) and `b loop`.
@@ -363,7 +363,7 @@ constexpr std::array BUILTIN_PATCHES{
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = DYNAMIC_FPS_RECORDS,
     },
-    // After Dark's (v5.8, zortos293/Lichii#1180's finding): his mode ran trunc(step) ripple
+    // After Dark's (v5.8, a ported finding): his mode ran trunc(step) ripple
     // passes, so at a 60 fps cap some frames ran none and below 60 the ripples ran slow.
     BuiltinPatch{
         .name = WATER_RIPPLE_NAME,
