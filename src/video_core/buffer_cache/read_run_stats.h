@@ -75,6 +75,26 @@ inline std::atomic<u64> g_frame{};
 /// EXP112's run flushes and the bytes they took beyond the read's own pages.
 inline std::atomic<u64> g_run_flushes{};
 inline std::atomic<u64> g_run_bytes{};
+/// EXP112: read flushes it looked at (BufferCache::DownloadMemoryForRead), and of them those
+/// whose own pages were Preflushable by then (GetFlushArea marks them first with preflushing on).
+inline std::atomic<u64> g_run_asked{};
+inline std::atomic<u64> g_run_own_marked{};
+
+/// Why EXP112 took no run for a read flush.
+enum class NoRun : u8 {
+    NotGpuModified,        ///< the read's pages held no GPU-modified byte by the flush
+    NoBuffer,              ///< no buffer holds the read's pages
+    NeighbourPreflushable, ///< the run would go on, but the next page is Preflushable
+    NoNeighbour,           ///< no GPU-written page next to the read's inside its buffer
+    Count,
+};
+inline std::atomic<u64> g_no_run[static_cast<size_t>(NoRun::Count)]{};
+
+inline void CountNoRun(NoRun why) {
+    if (g_enabled) [[unlikely]] {
+        g_no_run[static_cast<size_t>(why)].fetch_add(1, std::memory_order_relaxed);
+    }
+}
 
 /// GPU::OnCPURead, once per read past the preemptive answer.
 inline void NoteRead(Kind kind, u64 address, u64 run_pages, u64 wait_ns) {
@@ -133,7 +153,9 @@ inline void Log(int run_flush_mode) {
              "GPU-written run around the page: not in the buffer cache {}, 1 page {}, 2-16 {}, "
              "17-64 {}, more {} | waited {:.2f} ms a frame, {:.3f} ms a read, longest {:.2f} ms | "
              "{:.1f} distinct pages a frame, {} reads of a page already read that frame | span "
-             "[{:#x}, {:#x}] | run flushes {} ({} KiB beyond the reads' pages)",
+             "[{:#x}, {:#x}] | run flushes {} ({} KiB beyond the reads' pages) of {} read "
+             "flushes looked at ({} with their own pages Preflushable); no run: not GPU-modified "
+             "{}, no buffer {}, next page Preflushable {}, no GPU-written neighbour {}",
              run_flush_mode, reads, static_cast<double>(reads) / Frames, c.reads[0], c.reads[1],
              c.reads[2], c.next_page, c.near_pages, c.same_page, c.runs[0], c.runs[1], c.runs[2],
              c.runs[3], c.runs[4], static_cast<double>(c.wait_ns) / 1e6 / Frames,
@@ -142,7 +164,13 @@ inline void Log(int run_flush_mode) {
              static_cast<double>(c.distinct_pages) / Frames, c.repeat_reads,
              reads != 0 ? c.lowest : 0, c.highest,
              g_run_flushes.exchange(0, std::memory_order_relaxed),
-             g_run_bytes.exchange(0, std::memory_order_relaxed) >> 10);
+             g_run_bytes.exchange(0, std::memory_order_relaxed) >> 10,
+             g_run_asked.exchange(0, std::memory_order_relaxed),
+             g_run_own_marked.exchange(0, std::memory_order_relaxed),
+             g_no_run[0].exchange(0, std::memory_order_relaxed),
+             g_no_run[1].exchange(0, std::memory_order_relaxed),
+             g_no_run[2].exchange(0, std::memory_order_relaxed),
+             g_no_run[3].exchange(0, std::memory_order_relaxed));
     c = Counts{};
 }
 

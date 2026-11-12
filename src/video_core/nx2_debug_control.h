@@ -643,7 +643,8 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// EXP49 on): a guest read that must flush GPU-written buffer memory also downloads the
 /// GPU-written run around its pages in the same round trip: the pages after it, then before it,
 /// that hold GPU-modified bytes in a row, up to 256 KiB with the read's own pages, inside the
-/// read's buffer, ending at a Preflushable page. Exact: only GPU-modified bytes not already on
+/// read's buffer, ending at a neighbouring Preflushable page (the read's own pages may be marked:
+/// with preflushing on, the read marks them first). Exact: only GPU-modified bytes not already on
 /// their way, the same read download, fence and landing. The run's read trap marks go at once,
 /// so once it lands EXP86's mirrors answer the neighbouring pages' reads without the lock (a GPU
 /// write there arms them again). At the great fairy fountain one game job read ~16 such pages a
