@@ -158,6 +158,10 @@ public:
     }
 
     /// Whether the calling thread is the back.
+    /// Back: true while its idle hook runs because it ran out of work (EXP99=1 destroys only then).
+    [[nodiscard]] static bool InIdleWait() {
+        return in_idle_wait;
+    }
     [[nodiscard]] static bool OnBackThread() {
         return on_back_thread;
     }
@@ -1353,6 +1357,8 @@ private:
 
     static GpuSplit instance;
     static inline thread_local bool on_back_thread{};
+    /// The back is in its wait for work (the idle hook's idle call, not a RequestIdleHook mid-batch).
+    static inline thread_local bool in_idle_wait{};
     void (*idle_hook)(void*){};
     void* idle_argument{};
     FenceQuietCheck fence_quiet_check{};

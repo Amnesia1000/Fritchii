@@ -543,7 +543,8 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
             auto* const rasterizer = static_cast<RasterizerVulkan*>(argument);
             rasterizer->scheduler.FlushDeferred();
             // EXP99 = 1: evicted pool images (OoT's per-NPC depth targets) go while idle.
-            if (VideoCore::Nx2Debug::Experiment(99) == 1) {
+            // Only when it ran out of work: a RequestIdleHook mid-batch has a waiter (Fable).
+            if (VideoCore::Nx2Debug::Experiment(99) == 1 && VideoCommon::GpuSplit::InIdleWait()) {
                 rasterizer->texture_cache_runtime.DestroyIdlePooledImages(2);
             }
         },

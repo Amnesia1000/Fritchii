@@ -3019,8 +3019,10 @@ void TextureCacheRuntime::DropPooledImage(vk::Image image, u64 bytes) {
     const int exp99 = VideoCore::Nx2Debug::Experiment(99);
     if (exp99 == 1) {
         std::scoped_lock lock{idle_destroy_mutex};
-        if (idle_destroys.size() < 64) {
-            idle_destroys.push_back(std::move(image));
+        // Bounded by device memory, not count (Fable after: 64 filled in ~23 frames of a pass).
+        if (idle_destroy_bytes + bytes <= (u64{512} << 20)) {
+            idle_destroy_bytes += bytes;
+            idle_destroys.emplace_back(std::move(image), bytes);
             ++image_pool_dropped_async;
             return;
         }
@@ -3043,7 +3045,8 @@ void TextureCacheRuntime::DestroyIdlePooledImages(u32 max) {
             if (idle_destroys.empty()) {
                 return;
             }
-            image = std::move(idle_destroys.front());
+            image = std::move(idle_destroys.front().first);
+            idle_destroy_bytes -= idle_destroys.front().second;
             idle_destroys.pop_front();
         }
         Common::Nx2Timeline::Span span{"back: idle pool destroy"};
