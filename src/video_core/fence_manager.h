@@ -409,17 +409,34 @@ private:
                 texture_pops += (released.flushes & TextureFlushes) != 0 ? 1 : 0;
                 buffer_pops += (released.flushes & BufferFlushes) != 0 ? 1 : 0;
             }
-            if (texture_pops != 0) {
-                std::scoped_lock lock{texture_cache.mutex};
-                for (size_t i = 0; i < texture_pops; ++i) {
-                    texture_cache.PopAsyncFlushes();
+            // EDEN_NX2_EXP74 (live, us, 0 = off; fable52_answer_perdraw 1): a batch of 20-60
+            // fences held the cache lock 1-13 ms, and the back waited for it in its draws and
+            // fences (boss wave: "cache lock waits: GPU back" 24 -> 72 ms/s). After this long
+            // under the lock the thread lets it go between two pops, so the back can take it;
+            // the same pops in the same order, each whole under the lock.
+            const int hand_back_us = VideoCore::Nx2Debug::Experiment(74);
+            const auto pop_all = [hand_back_us](auto& mutex, size_t pops, auto&& pop) {
+                std::unique_lock lock{mutex};
+                auto held_since = std::chrono::steady_clock::now();
+                for (size_t i = 0; i < pops; ++i) {
+                    pop();
+                    if (hand_back_us > 0 && i + 1 < pops) {
+                        const auto now = std::chrono::steady_clock::now();
+                        if (now - held_since >= std::chrono::microseconds{hand_back_us}) {
+                            lock.unlock();
+                            std::this_thread::yield();
+                            lock.lock();
+                            held_since = std::chrono::steady_clock::now();
+                        }
+                    }
                 }
+            };
+            if (texture_pops != 0) {
+                pop_all(texture_cache.mutex, texture_pops,
+                        [this] { texture_cache.PopAsyncFlushes(); });
             }
             if (buffer_pops != 0) {
-                std::scoped_lock lock{buffer_cache.mutex};
-                for (size_t i = 0; i < buffer_pops; ++i) {
-                    buffer_cache.PopAsyncFlushes();
-                }
+                pop_all(buffer_cache.mutex, buffer_pops, [this] { buffer_cache.PopAsyncFlushes(); });
             }
             // Queries and operations keep their per-fence order.
             for (Released& released : batch) {

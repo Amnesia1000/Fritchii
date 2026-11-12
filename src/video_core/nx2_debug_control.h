@@ -443,6 +443,9 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// collector's device memory figure, as deleted images waiting for the GPU are. Logs "Image pool
 /// (EXP42) last 600 frames" and counts pooled creates in "Slow clear texture cache". 1 is the default
 /// (LoadExperiments); 0 = off.
+/// EXP74 (live; us, 0 = off; fable52_answer_perdraw 1; FenceManager::ReleaseThreadFunc): the fencing
+/// thread lets the texture/buffer cache lock go between two pops after holding it this long, so a
+/// batch of 20-60 fences no longer keeps the back waiting 1-13 ms.
 /// EXP73 (live; 0 = off; fable52_answer_bosswave_2 3b; Maxwell3D macro DMA snapshot miss path): the
 /// report flush after a drained read runs only when reports are listed over the bytes read; else it
 /// was an empty round trip to the back (~2,850 a second in the Stalchild fight).
