@@ -4592,7 +4592,11 @@ void MainWindow::OnGameListPrepareShaderWarm(u64 program_id, const std::string& 
         return;
     }
 
-    const auto path = std::filesystem::path{std::u8string{game_path.begin(), game_path.end()}};
+    auto path = std::filesystem::path{std::u8string{game_path.begin(), game_path.end()}};
+    // Loose dumps are listed by their exefs folder (FormatGameName); the loader opens its main.
+    if (std::error_code ec; std::filesystem::is_directory(path, ec)) {
+        path /= "main";
+    }
     QString name;
     if (const auto loader = Loader::GetLoader(
             *QtCommon::system, QtCommon::vfs->OpenFile(game_path, FileSys::OpenMode::Read))) {
