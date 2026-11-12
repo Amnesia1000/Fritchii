@@ -471,6 +471,11 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// limit. EDEN_NX2_IDLE_STATS=1 logs each core's idle periods every 10 s (polled, blocked, wake
 /// latency). Blocking still uses EDEN_NX2_CORE_LOCK's address wait when that is on. In OoT the
 /// guest threads' handoffs sit on the frame's critical path. Off by default.
+/// EXP82 (live, frames, 0 = off; fable52_answer_after7778 1; TextureCacheRuntime::TickFrame):
+/// proven EXP42 pool entries (a shape taken from the pool before) stay this many frames instead
+/// of 180, so per-NPC depth targets whose size comes back later find their image. Unproven
+/// entries and the byte cap (EXP66) are unchanged. Try 1800. Judge on the pool's taken/missed
+/// line and the clear zone.
 /// EXP81 (live, frames, 0 = off; fable52_answer_readback_card 3; BufferCache TickFrame and
 /// GetFlushArea): with EXP69's Preflushable reset, unmark only the pages the CPU has not read for
 /// this many frames (each CPU read through GetFlushArea stamps its pages). Unmarking every page

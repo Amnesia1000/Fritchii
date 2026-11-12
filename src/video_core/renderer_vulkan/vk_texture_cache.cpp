@@ -3113,10 +3113,25 @@ void TextureCacheRuntime::TickFrame() {
         } else {
             TrimImagePool(ImagePoolCap()); // a lowered EXP66 applies at once
         }
-        while (!image_pool.empty() &&
-               image_pool_frame - image_pool.front().frame > ImagePoolMaxFrames) {
-            image_pool_bytes -= image_pool.front().bytes;
-            image_pool.pop_front();
+        // EDEN_NX2_EXP82 (live, frames, 0 = off; fable52_answer_after7778 1): proven entries (a
+        // shape taken from the pool before) stay this many frames instead of ImagePoolMaxFrames.
+        // OoT's per-NPC depth targets are sized by screen bounds, so a size comes back later
+        // than 180 frames; the daytime market made one ~8 times a second at 0.2-2.3 ms each.
+        // Unproven entries still leave at ImagePoolMaxFrames; the byte cap still applies.
+        const int proven_switch = VideoCore::Nx2Debug::Experiment(82);
+        const u64 proven_frames = proven_switch > 0 ? static_cast<u64>(proven_switch)
+                                                    : ImagePoolMaxFrames;
+        for (auto it = image_pool.begin(); it != image_pool.end();) {
+            const u64 age = image_pool_frame - it->frame;
+            if (age <= ImagePoolMaxFrames) {
+                break; // oldest first: the rest are younger
+            }
+            if (it->proven && age <= proven_frames) {
+                ++it;
+                continue;
+            }
+            image_pool_bytes -= it->bytes;
+            it = image_pool.erase(it);
             ++image_pool_evicted;
         }
         if (const int unproven_frames = VideoCore::Nx2Debug::Experiment(65); unproven_frames > 0) {
