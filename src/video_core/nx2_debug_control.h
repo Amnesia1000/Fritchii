@@ -665,6 +665,10 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// row copies guest memory straight into the stream buffer for its next 64 binds: no compares,
 /// no extra copy into the reuse store. Exact (a stream copy of guest memory, as with reuse off);
 /// it only gives up rebinds those 64 binds could have found.
+/// EXP116 (live, read each frame; 0 = 4096 bytes as before, N = N bytes from 256 to 16384;
+/// Vulkan only): the size up to which uniform buffers are streamed and reused instead of going
+/// through the cached buffers. OoT's skinned models bind 7-13 KiB bone palettes about 8 times a
+/// frame with the same bytes. Try 16384. The reuse store is sized for 16 KiB copies either way.
 /// EXP101 (live, 0 = off, 1 = runs, 2 = cached page pointer + prefetch; fable52_answer_presenter): nvhost_gpu::SubmitGPFIFOImpl's pushbuffer
 /// snapshot reads runs of entries whose GPU addresses follow each other with one ReadBlockUnsafe
 /// instead of one per entry (OoT's presenting thread submits ~6,500 entries a frame; the loop is

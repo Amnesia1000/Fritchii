@@ -68,10 +68,22 @@ concept StreamUniformReusable = requires(R& runtime, u32 size) {
 }
 inline constexpr u16 UniformDirectBinds = 64;
 
+/// EXP116 (live; 0 = 4096 bytes, as before; N = N bytes, 256 to 16384): uniform buffers up to
+/// this size are streamed (and reused) instead of going through the cached buffers (BufferCache
+/// TickFrame's skip size, Vulkan only). OoT's skinned models bind 7-13 KiB bone palettes about
+/// 8 times a frame each, with the same bytes within the frame.
+[[nodiscard]] inline u32 UniformStreamMaxBytes() noexcept {
+    const int value = VideoCore::Nx2Debug::Experiment(116);
+    if (value <= 0) {
+        return 4096U;
+    }
+    return static_cast<u32>(value < 256 ? 256 : (value > 16384 ? 16384 : value));
+}
+
 template <class Ref>
 class UniformStreamReuse {
 public:
-    static constexpr u32 MaxBytes = 4096; // BufferCache's DEFAULT_SKIP_CACHE_SIZE
+    static constexpr u32 MaxBytes = 16384; // the most EXP116 allows (UniformStreamMaxBytes)
     static constexpr size_t NumStages = 5;
     static constexpr size_t NumSlots = 18; // Maxwell constant buffers per stage
     /// One private copy per slot, then the copies keyed by guest range (range reuse): NumSets
@@ -163,7 +175,9 @@ template <class Runtime, class DeviceMemory>
                                            size_t stage, u32 index, u32 binding_index,
                                            u64 device_addr, u32 size, bool range_reuse = false) {
     using Reuse = UniformStreamReuse<typename Runtime::StreamUniformRef>;
-    if (size == 0 || size > Reuse::MaxBytes || stage >= Reuse::NumStages ||
+    // UniformStreamMaxBytes: misaligned binds of any size stream too; above 4096 bytes they keep
+    // being copied without reuse unless EXP116 raises the limit.
+    if (size == 0 || size > UniformStreamMaxBytes() || stage >= Reuse::NumStages ||
         index >= Reuse::NumSlots) {
         return false;
     }

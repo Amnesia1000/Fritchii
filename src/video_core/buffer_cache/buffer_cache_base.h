@@ -1443,8 +1443,8 @@ private:
         u32 stale_logged{};
         u64 calls{};
         /// A check's copy of the kept bytes (the normal path may overwrite the copy).
-        std::array<u8, 4096> verify_bytes{};
-        std::array<u8, 4096> fresh_bytes{};
+        std::array<u8, 16384> verify_bytes{}; ///< UniformStreamReuse::MaxBytes (EXP116's most)
+        std::array<u8, 16384> fresh_bytes{};
         u64 log_guest_stores{}; ///< UniformKeepPages guest_stores at the last log line
         u64 log_pages_denied{};
         std::chrono::steady_clock::time_point last_log{};
