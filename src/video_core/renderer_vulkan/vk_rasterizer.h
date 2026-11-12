@@ -36,6 +36,7 @@
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
+#include "video_core/nx2_fastdraw_count.h"
 #include "video_core/nx2_runahead.h"
 
 namespace Core {
@@ -385,6 +386,16 @@ private:
     u32 render_trace_clears = 0;
     bool pending_native_work{};
     bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
+    /// EDEN_NX2_FASTDRAW_COUNT (nx2_fastdraw_count.h): which draws could be delta draws by
+    /// zortos293/Lichii#1161's rules. Counting only; PrepareDraw calls these when it is on.
+    VideoCommon::Nx2FastDrawCount::Counter fast_draw_count;
+    /// Before the pipeline lookup (#1161's TakeReusableDraw takes the previous draw here).
+    void FastDrawCountBegin();
+    /// Once the caches are locked: would this draw be a delta draw, and the serial for the next.
+    void FastDrawCountDecide(const GraphicsPipeline* pipeline, bool is_indexed, bool is_indirect);
+    /// After the draw was recorded: whether the next draw may follow it (NoteResolvedDraw).
+    void FastDrawCountResolved(const GraphicsPipeline* pipeline, bool is_indexed,
+                               bool is_indirect);
     /// List draws (nx2_list_draw.h): DrawIndirect for IndirectParams::list_words.
     void DrawListWords();
     VideoCommon::OotNetwork::BypassState oot_network_bypass;

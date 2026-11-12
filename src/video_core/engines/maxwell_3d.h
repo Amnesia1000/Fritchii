@@ -26,6 +26,7 @@
 #include "video_core/engines/engine_upload.h"
 #include "video_core/gpu.h"
 #include "video_core/macro.h"
+#include "video_core/nx2_fastdraw_count.h"
 #include "video_core/nx2_list_dispatch.h"
 #include "video_core/nx2_list_reader.h"
 #include "video_core/textures/texture.h"
@@ -3322,6 +3323,28 @@ public:
 
     void ProcessInlineIndexMultiData(u32 method, const u32* start_base, u32 amount);
 
+    /// EDEN_NX2_FASTDRAW_COUNT (nx2_fastdraw_count.h), zortos293/Lichii#1161's lists: registers
+    /// that only parameterize the next draw, the next constant buffer bind or the buffers a delta
+    /// draw binds again, or that ProcessMethodCall handles, so writing them doesn't end reuse.
+    static bool IsFastDrawParameter(u32 method);
+    /// Methods recorded as light changes (constant buffer data and binds).
+    static bool IsFastDrawDeltaMethod(u32 method);
+    /// A vertex stream's address, size or limit; its stride and enable word when dynamic.
+    static bool IsFastDrawVertexBuffer(u32 method);
+    /// Executable methods whose work leaves what a draw resolves to alone.
+    static bool IsFastDrawNeutralMethod(u32 method);
+    /// Registers only a report or a macro memory read takes as operands.
+    static bool IsFastDrawReportOperand(u32 method);
+    /// A vertex attribute format, when vertex input is dynamic state.
+    static bool IsFastDrawVertexFormat(u32 method);
+    /// The break group (Nx2FastDrawCount::Group) of a register or method that ends reuse.
+    static u32 FastDrawCountGroup(u32 method);
+    /// Counting on: a state write of `argument` to `method`, before the register takes it.
+    void NoteFastDrawCountWrite(u32 method, u32 argument);
+    /// Counting on: inline data written to GPU addresses [begin, end) (constant buffer words, a
+    /// report): texture or sampler headers end reuse, the rest is noted as light.
+    void NoteFastDrawCountData(GPUVAddr begin, GPUVAddr end);
+
 private:
     void InitializeRegisterDefaults();
 
@@ -3350,6 +3373,9 @@ private:
         if (draw_manager.HasDeferredDraw() && !DrawManager::IsInstanceLoopMethod(method))
             [[unlikely]] {
             draw_manager.DrawDeferred(*this, true);
+        }
+        if (VideoCommon::Nx2FastDrawCount::g_on) [[unlikely]] {
+            NoteFastDrawCountWrite(method, argument);
         }
         regs.reg_array[method] = argument;
         for (const auto& table : dirty.tables) {

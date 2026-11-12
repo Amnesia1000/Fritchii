@@ -382,12 +382,14 @@ public:
     }
 
     /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
+    /// `flags`: Nx2FastDrawCount::Neutral() for a call that can't change what a draw resolves to
+    /// (bit 7 of a Call entry, set only while EDEN_NX2_FASTDRAW_COUNT counts; Execute ignores it).
     template <typename Func>
-    void Defer(const Func& func, Effect effect = Effect::Unknown) {
+    void Defer(const Func& func, Effect effect = Effect::Unknown, u64 flags = 0) {
         static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
         constexpr size_t payload = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
         u64* const entry = Reserve(2 + payload);
-        entry[0] = static_cast<u64>(Kind::Call) | (u64{payload} << 8);
+        entry[0] = static_cast<u64>(Kind::Call) | flags | (u64{payload} << 8);
         entry[1] = reinterpret_cast<u64>(&CallThunk<Func>);
         std::memcpy(entry + 2, &func, sizeof(Func));
         Commit(2 + payload, effect);

@@ -33,6 +33,7 @@
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_fastdraw_count.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_qmd_prediction.h"
@@ -1555,6 +1556,9 @@ void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
 
 void Puller::ProcessSemaphoreAcquire(DmaPusher& dma_pusher) {
     DrainBack();
+    // EDEN_NX2_FASTDRAW_COUNT (#1161): the CPU may rewrite what the next draws read once it sees
+    // the release this waits for.
+    VideoCommon::Nx2FastDrawCount::Break(VideoCommon::Nx2FastDrawCount::Reason::Fence);
     u32 word = dma_pusher.memory_manager.Read<u32>(regs.semaphore_address.SemaphoreAddress());
     const auto value = regs.semaphore_acquire;
     while (word != value) {
@@ -1605,6 +1609,7 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
         return;
     }
     DrainBack();
+    VideoCommon::Nx2FastDrawCount::Break(VideoCommon::Nx2FastDrawCount::Reason::Fence);
     ReleaseFences(dma_pusher);
     const u32 word = dma_pusher.memory_manager.Read<u32>(address);
     const bool ready = operation == 0   ? word == payload
@@ -1785,6 +1790,16 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
     }
 }
 
+// EDEN_NX2_FASTDRAW_COUNT (#1161): any other engine's method ends delta draw reuse. With the
+// split, GpuSplit::Execute counts them where the back runs them; here only without it.
+static void NoteFastDrawCountEngine(EngineID engine) {
+    if (VideoCommon::Nx2FastDrawCount::g_on && engine != EngineID::MAXWELL_B) [[unlikely]] {
+        if (!VideoCommon::GpuSplit::Get().Active() || VideoCommon::GpuSplit::OnBackThread()) {
+            VideoCommon::Nx2FastDrawCount::Break(VideoCommon::Nx2FastDrawCount::Reason::OtherEngine);
+        }
+    }
+}
+
 /// Calls a GPU engine method.
 static bool Nx2MethodTrace() {
     static const bool trace = std::getenv("EDEN_NX2_METHOD_TRACE") != nullptr;
@@ -1793,6 +1808,7 @@ static bool Nx2MethodTrace() {
 
 void Puller::CallEngineMethod(DmaPusher& dma_pusher, const MethodCall& method_call) {
     const EngineID engine = bound_engines[method_call.subchannel];
+    NoteFastDrawCountEngine(engine);
     if (Nx2MethodTrace()) {
         LOG_INFO(HW_GPU, "nx2 method sub={} engine={:04X} method={:#x} arg={:#x}",
                  method_call.subchannel, static_cast<u32>(engine), method_call.method,
@@ -1826,6 +1842,7 @@ void Puller::CallEngineMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
 /// Calls a GPU engine multivalue method.
 void Puller::CallEngineMultiMethod(DmaPusher& dma_pusher, u32 method, u32 subchannel, const u32* base_start, u32 amount, u32 methods_pending) {
     const EngineID engine = bound_engines[subchannel];
+    NoteFastDrawCountEngine(engine);
     if (Nx2MethodTrace()) {
         LOG_INFO(HW_GPU, "nx2 multimethod sub={} engine={:04X} method={:#x} amount={} first={:#x}",
                  subchannel, static_cast<u32>(engine), method, amount, base_start[0]);

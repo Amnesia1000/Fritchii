@@ -23,6 +23,7 @@
 #include "video_core/gpu_thread.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memstage_stats.h"
+#include "video_core/nx2_fastdraw_count.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/host1x/host1x.h"
@@ -177,7 +178,8 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                             [seq = next.fence] {
                                 Common::Nx2Timeline::Instant("back: list", {"seq", seq});
                             },
-                            VideoCommon::GpuSplit::Effect::None);
+                            VideoCommon::GpuSplit::Effect::None,
+                            VideoCommon::Nx2FastDrawCount::Neutral());
                     }
                     {
                         Profile::Scope scope{Profile::Zone::Push};
@@ -188,7 +190,10 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                         Common::Nx2Timeline::Instant("front: list end", {"seq", next.fence});
                     }
                 } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
-                    split.Defer([gpu = &system.GPU()] { gpu->TickWork(); });
+                    // TickWork ends delta draw reuse itself when it runs a request (#1161).
+                    split.Defer([gpu = &system.GPU()] { gpu->TickWork(); },
+                                VideoCommon::GpuSplit::Effect::Unknown,
+                                VideoCommon::Nx2FastDrawCount::Neutral());
                 } else if (auto* run = std::get_if<RunCommand>(&next.data)) {
                     if (run->before_later_reads) {
                         // GPU memory maps unmap caches (UnmapMemory downloads): the back's state.
@@ -213,7 +218,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     [state_ptr = &state, fence = next.fence, block = next.block] {
                         SignalCommand(*state_ptr, fence, block);
                     },
-                    VideoCommon::GpuSplit::Effect::None);
+                    VideoCommon::GpuSplit::Effect::None, VideoCommon::Nx2FastDrawCount::Neutral());
                 split.Publish();
                 continue;
             }

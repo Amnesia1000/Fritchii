@@ -90,6 +90,8 @@ Maxwell3D::Maxwell3D(MemoryManager& memory_manager_)
     const char* skip_same = std::getenv("EDEN_NX2_SKIP_SAME");
     skip_same_value_writes = skip_same == nullptr || skip_same[0] != '0';
     perf_verify = VideoCommon::Nx2Perf::Verify();
+    VideoCommon::Nx2FastDrawCount::Init();
+    counts_fast_draw_breaks = true;
 }
 
 Maxwell3D::~Maxwell3D() {
@@ -396,7 +398,158 @@ void Maxwell3D::ApplyPairs(Core::System& system, const u64* pairs, u32 count) {
     }
 }
 
+// EDEN_NX2_FASTDRAW_COUNT: zortos293/Lichii#1161's lists (maxwell_3d.cpp at 792e12a47b), counting
+// only.
+bool Maxwell3D::IsFastDrawParameter(u32 method) {
+    switch (method) {
+    case MAXWELL3D_REG_INDEX(const_buffer.size):
+    case MAXWELL3D_REG_INDEX(const_buffer.address_high):
+    case MAXWELL3D_REG_INDEX(const_buffer.address_low):
+    case MAXWELL3D_REG_INDEX(const_buffer.offset):
+    case MAXWELL3D_REG_INDEX(global_base_vertex_index):
+    case MAXWELL3D_REG_INDEX(global_base_instance_index):
+    // Written with the first vertex before each draw; nothing a draw resolves reads it.
+    case MAXWELL3D_REG_INDEX(vertex_id_base):
+    case MAXWELL3D_REG_INDEX(index_buffer.start_addr_high):
+    case MAXWELL3D_REG_INDEX(index_buffer.start_addr_low):
+    case MAXWELL3D_REG_INDEX(index_buffer.limit_addr_high):
+    case MAXWELL3D_REG_INDEX(index_buffer.limit_addr_low):
+    case MAXWELL3D_REG_INDEX(index_buffer.format):
+        return true;
+    default:
+        return DrawManager::IsInstanceLoopMethod(method) || IsFastDrawDeltaMethod(method) ||
+               IsFastDrawVertexBuffer(method) || IsFastDrawNeutralMethod(method) ||
+               IsFastDrawReportOperand(method) || IsFastDrawVertexFormat(method);
+    }
+}
+
+bool Maxwell3D::IsFastDrawVertexFormat(u32 method) {
+    constexpr u32 formats = MAXWELL3D_REG_INDEX(vertex_attrib_format);
+    return VideoCommon::Nx2FastDrawCount::g_vertex_streams_dynamic && method >= formats &&
+           method < formats + Regs::NumVertexAttributes;
+}
+
+bool Maxwell3D::IsFastDrawNeutralMethod(u32 method) {
+    switch (method) {
+    case MAXWELL3D_REG_INDEX(clear_report_value):
+    case MAXWELL3D_REG_INDEX(render_enable.mode):
+    case MAXWELL3D_REG_INDEX(report_semaphore.query):
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool Maxwell3D::IsFastDrawReportOperand(u32 method) {
+    // SET_MME_MEM_ADDRESS_A/B and the data RAM address.
+    constexpr u32 MmeMemAddressA = 0x154;
+    constexpr u32 MmeDataRamAddress = 0x156;
+    if (method >= MmeMemAddressA && method <= MmeDataRamAddress) {
+        return true;
+    }
+    switch (method) {
+    case MAXWELL3D_REG_INDEX(report_semaphore.address_high):
+    case MAXWELL3D_REG_INDEX(report_semaphore.address_low):
+    case MAXWELL3D_REG_INDEX(report_semaphore.payload):
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool Maxwell3D::IsFastDrawVertexBuffer(u32 method) {
+    constexpr u32 streams = MAXWELL3D_REG_INDEX(vertex_streams);
+    constexpr u32 stream_words = sizeof(Regs::VertexStream) / sizeof(u32);
+    if (method >= streams && method < streams + Regs::NumVertexArrays * stream_words) {
+        const u32 word = (method - streams) % stream_words;
+        return word == 1 || word == 2 ||
+               (word == 0 && VideoCommon::Nx2FastDrawCount::g_vertex_streams_dynamic);
+    }
+    constexpr u32 sizes = 0x600 / sizeof(u32); // SET_VERTEX_STREAM_SIZE_A/B (NativeVertexStreamSize)
+    constexpr u32 limits = MAXWELL3D_REG_INDEX(vertex_stream_limits);
+    constexpr u32 limit_words = sizeof(Regs::VertexStreamLimit) / sizeof(u32);
+    return (method >= sizes && method < sizes + Regs::NumVertexArrays * 2) ||
+           (method >= limits && method < limits + Regs::NumVertexArrays * limit_words);
+}
+
+bool Maxwell3D::IsFastDrawDeltaMethod(u32 method) {
+    constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+    if (method >= cb_data && method < cb_data + Regs::NumCBData) {
+        return true;
+    }
+    switch (method) {
+    case MAXWELL3D_REG_INDEX(bind_groups[0].raw_config):
+    case MAXWELL3D_REG_INDEX(bind_groups[1].raw_config):
+    case MAXWELL3D_REG_INDEX(bind_groups[2].raw_config):
+    case MAXWELL3D_REG_INDEX(bind_groups[3].raw_config):
+    case MAXWELL3D_REG_INDEX(bind_groups[4].raw_config):
+        return true;
+    default:
+        return false;
+    }
+}
+
+u32 Maxwell3D::FastDrawCountGroup(u32 method) {
+    namespace Count = VideoCommon::Nx2FastDrawCount;
+    if (method == MAXWELL3D_REG_INDEX(vertex_id_base)) {
+        return Count::VertexIdBase;
+    }
+    constexpr u32 streams = MAXWELL3D_REG_INDEX(vertex_streams);
+    constexpr u32 stream_words = sizeof(Regs::VertexStream) / sizeof(u32);
+    constexpr u32 formats = MAXWELL3D_REG_INDEX(vertex_attrib_format);
+    if ((method >= streams && method < streams + Regs::NumVertexArrays * stream_words &&
+         (method - streams) % stream_words == 0) ||
+        (method >= formats && method < formats + Regs::NumVertexAttributes)) {
+        return Count::VertexLayout;
+    }
+    if (method == MAXWELL3D_REG_INDEX(clear_report_value) ||
+        method == MAXWELL3D_REG_INDEX(render_enable.mode) ||
+        method == MAXWELL3D_REG_INDEX(report_semaphore.query) ||
+        method == MAXWELL3D_REG_INDEX(report_semaphore.address_high) ||
+        method == MAXWELL3D_REG_INDEX(report_semaphore.address_low) ||
+        method == MAXWELL3D_REG_INDEX(report_semaphore.payload) ||
+        (method >= 0x154 && method <= 0x156)) {
+        return Count::QueryMethods;
+    }
+    return Count::RealState;
+}
+
+void Maxwell3D::NoteFastDrawCountWrite(u32 method, u32 argument) {
+    if (regs.reg_array[method] != argument && !IsFastDrawParameter(method)) {
+        VideoCommon::Nx2FastDrawCount::BreakOn(VideoCommon::Nx2FastDrawCount::Reason::Register,
+                                               FastDrawCountGroup(method), method);
+    }
+}
+
+void Maxwell3D::NoteFastDrawCountData(GPUVAddr begin, GPUVAddr end) {
+    namespace Count = VideoCommon::Nx2FastDrawCount;
+    // #1161's NoteFastDrawConstantData by GPU address: texture and sampler headers are read when
+    // image views are resolved, which delta draws skip. (Its second check, through other GPU
+    // addresses mapping the same device memory, is not ported.)
+    constexpr u64 HeaderSize = 0x20;
+    const GPUVAddr tic = regs.tex_header.Address();
+    const u64 tic_size = (u64{regs.tex_header.limit} + 1) * HeaderSize;
+    const GPUVAddr tsc = regs.tex_sampler.Address();
+    const u64 tsc_size = (u64{regs.sampler_binding == Regs::SamplerBinding::ViaHeaderBinding
+                                  ? regs.tex_header.limit
+                                  : regs.tex_sampler.limit} +
+                          1) *
+                         HeaderSize;
+    if ((begin < tic + tic_size && tic < end) || (begin < tsc + tsc_size && tsc < end)) {
+        Count::BreakOn(Count::Reason::TextureHeaders, Count::Other);
+        return;
+    }
+    Count::NoteConstantData(begin, end);
+}
+
 void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call) {
+    if (VideoCommon::Nx2FastDrawCount::g_on) [[unlikely]] {
+        if (!DrawManager::IsInstanceLoopMethod(method) && !IsFastDrawDeltaMethod(method) &&
+            !IsFastDrawNeutralMethod(method)) {
+            VideoCommon::Nx2FastDrawCount::BreakOn(VideoCommon::Nx2FastDrawCount::Reason::Method,
+                                                   FastDrawCountGroup(method), method);
+        }
+    }
     if (GetNativeMacroEngine().native_turing && method == MAXWELL3D_REG_INDEX(clear_surface)) {
         LOG_DEBUG(HW_GPU, "Native GPU surface clear: value={:#x}", argument);
     }
@@ -707,6 +860,9 @@ void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods,
             VideoCommon::MemStageStats::Write::CbWords,
             memory_manager.GpuToCpuAddress(destination).value_or(0), bytes);
     }
+    if (VideoCommon::Nx2FastDrawCount::g_on) [[unlikely]] {
+        NoteFastDrawCountData(destination, destination + bytes);
+    }
     // EXP88 & 2: through the bound buffer's device address, the device range logged for
     // FlushCaching, in place of CB_DIRECT's translation and the word-by-word accumulation.
     if (WriteBoundConstantBuffer(offset, values.data(), static_cast<u32>(bytes))) {
@@ -835,6 +991,7 @@ void Maxwell3D::CallMultiMethod(Core::System& system, u32 method, const u32* bas
         break;
     case MAXWELL3D_REG_INDEX(inline_data): {
         ASSERT(methods_pending == amount);
+        VideoCommon::Nx2FastDrawCount::Break(VideoCommon::Nx2FastDrawCount::Reason::InlineData);
         upload_state.ProcessData(base_start, amount);
         return;
     }
@@ -908,6 +1065,12 @@ void Maxwell3D::ProcessQueryGet() {
         static_cast<VideoCommon::QueryType>(regs.report_semaphore.query.report.Value());
     const u32 payload = regs.report_semaphore.payload;
     const u32 subreport = regs.report_semaphore.query.sub_report;
+    if (VideoCommon::Nx2FastDrawCount::g_on) [[unlikely]] {
+        // #1161: the release lands in guest memory (a short one the payload, a long one the
+        // 16-byte report), noted as constant data.
+        const u64 bytes = regs.report_semaphore.query.short_query != 0 ? 4 : 16;
+        NoteFastDrawCountData(sequence_address, sequence_address + bytes);
+    }
     switch (regs.report_semaphore.query.operation) {
     case Regs::ReportSemaphore::Operation::Release:
         if (regs.report_semaphore.query.short_query != 0) {
@@ -1059,6 +1222,13 @@ void Maxwell3D::ProcessCBBind(size_t stage_index) {
         return; // slot field is 5 bits; the state array holds 18
     }
     auto& buffer = state.shader_stages[stage_index].const_buffers[bind_data.shader_slot];
+    if (VideoCommon::Nx2FastDrawCount::g_on) [[unlikely]] {
+        if (buffer.enabled != (bind_data.valid.Value() != 0) ||
+            buffer.address != regs.const_buffer.Address() ||
+            buffer.size != regs.const_buffer.size) {
+            VideoCommon::Nx2FastDrawCount::NoteBind(stage_index, bind_data.shader_slot);
+        }
+    }
     buffer.enabled = bind_data.valid.Value() != 0;
     buffer.address = regs.const_buffer.Address();
     buffer.size = regs.const_buffer.size;
@@ -1091,6 +1261,10 @@ void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
             VideoCommon::MemStageStats::Write::CbWords,
             memory_manager.GpuToCpuAddress(buffer_address + regs.const_buffer.offset).value_or(0),
             write_size);
+    }
+    if (VideoCommon::Nx2FastDrawCount::g_on && write_size != 0) [[unlikely]] {
+        const GPUVAddr address{buffer_address + regs.const_buffer.offset};
+        NoteFastDrawCountData(address, address + write_size);
     }
     if (write_size != 0 && !WriteBoundConstantBuffer(regs.const_buffer.offset, start_base,
                                                      static_cast<u32>(write_size))) {
@@ -2345,7 +2519,7 @@ void Maxwell3D::FrontRunMacroPlain(Core::System& system, VideoCommon::GpuSplit& 
     if (fs.draw_pending) {
         fs.draw_pending = false;
         split.Defer([this, system_ptr = &system] { FinishFrontMacro(*system_ptr); },
-                    VideoCommon::GpuSplit::Effect::Gpu);
+                    VideoCommon::GpuSplit::Effect::Gpu, VideoCommon::Nx2FastDrawCount::Neutral());
     }
     if (FrontVerifyEnabled() && (++fs.calls & 4095) == 0) [[unlikely]] {
         FrontVerify(split, fs);
@@ -2482,7 +2656,8 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
                 fold_pending = false;
                 if (((fs.regs[MAXWELL3D_REG_INDEX(draw.begin)] >> 26) & 3) == 0) {
                     split.Defer([this] { draw_manager.FoldFirstInstance(); },
-                                VideoCommon::GpuSplit::Effect::None);
+                                VideoCommon::GpuSplit::Effect::None,
+                                VideoCommon::Nx2FastDrawCount::Neutral());
                     ++fs.oot_stats.folds;
                     static u32 fold_logged{};
                     if (fold_logged++ < 4) {
@@ -2615,7 +2790,7 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
     if (fs.draw_pending) {
         fs.draw_pending = false;
         split.Defer([this, system_ptr = &system] { FinishFrontMacro(*system_ptr); },
-                    VideoCommon::GpuSplit::Effect::Gpu);
+                    VideoCommon::GpuSplit::Effect::Gpu, VideoCommon::Nx2FastDrawCount::Neutral());
     }
     if (FrontVerifyEnabled() && (++fs.calls & 4095) == 0) [[unlikely]] {
         FrontVerify(split, fs);
@@ -2787,7 +2962,7 @@ bool Maxwell3D::FrontTakeListDraw(Core::System& system, VideoCommon::GpuSplit& s
             draw_manager.draw_state.list_draw_address = address;
             draw_manager.draw_state.list_keep_id = keep_id;
         },
-        VideoCommon::GpuSplit::Effect::None);
+        VideoCommon::GpuSplit::Effect::None, VideoCommon::Nx2FastDrawCount::Neutral());
     FrontWrite(split, fs, MAXWELL3D_REG_INDEX(draw.end), 0, true, true);
     fs.in_list_draw = false;
     // List guard (nx2_list_dispatch.h): the two registers keep their old values from here on.
@@ -2797,7 +2972,7 @@ bool Maxwell3D::FrontTakeListDraw(Core::System& system, VideoCommon::GpuSplit& s
     if (fs.draw_pending) {
         fs.draw_pending = false;
         split.Defer([this, system_ptr = &system] { FinishFrontMacro(*system_ptr); },
-                    VideoCommon::GpuSplit::Effect::Gpu);
+                    VideoCommon::GpuSplit::Effect::Gpu, VideoCommon::Nx2FastDrawCount::Neutral());
     }
     return true;
 }
@@ -2833,7 +3008,7 @@ void Maxwell3D::FlushFoldedInstances(void* engine, u32 count) {
     // As the draw.begin writes: the draw they defer may write anywhere a draw does.
     VideoCommon::GpuSplit::Get().Defer(
         [self, count] { self->draw_manager.AddLoopInstances(*self, count); },
-        VideoCommon::GpuSplit::Effect::Gpu);
+        VideoCommon::GpuSplit::Effect::Gpu, VideoCommon::Nx2FastDrawCount::Neutral());
 }
 
 bool Maxwell3D::IsPredicateMacro(FrontState& fs, u32 method) {
@@ -3663,6 +3838,9 @@ void ApplyDeltaWrites(Maxwell3D& maxwell3d, const u64* writes, u32 count) {
         }
         if (reg_array[method] == value) {
             continue;
+        }
+        if (VideoCommon::Nx2FastDrawCount::g_on) [[unlikely]] {
+            maxwell3d.NoteFastDrawCountWrite(method, value);
         }
         reg_array[method] = value;
         raised[table0[method]] = true;

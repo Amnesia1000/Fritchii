@@ -83,6 +83,7 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_cb_path.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_fastdraw_count.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_list_dispatch.h"
 #include "video_core/nx2_list_draw.h"
@@ -627,6 +628,7 @@ bool RasterizerVulkan::TryNx2IndirectReset(bool is_indexed, u32 instance_count) 
     if (!IsNx2IndirectReset(is_indexed, instance_count)) {
         return false;
     }
+    VideoCommon::Nx2FastDrawCount::Break(VideoCommon::Nx2FastDrawCount::Reason::IndirectReset);
     const auto& draw = maxwell3d->draw_manager.draw_state;
     FlushWork();
     gpu_memory->FlushCaching();
@@ -690,6 +692,251 @@ bool RasterizerVulkan::TryNx2IndirectReset(bool is_indexed, u32 instance_count) 
     return true;
 }
 
+namespace {
+
+// EDEN_NX2_FASTDRAW_COUNT: #1161's handle masks of a pipeline (GraphicsPipeline's constructor
+// there), built from its shader info on the first counted draw that needs them.
+const VideoCommon::Nx2FastDrawCount::PipelineInfo& FastDrawCountInfo(
+    const GraphicsPipeline& pipeline) {
+    using Info = VideoCommon::Nx2FastDrawCount::PipelineInfo;
+    if (pipeline.fast_draw_count_info) {
+        return *pipeline.fast_draw_count_info;
+    }
+    auto info = std::make_unique<Info>();
+    const auto& stage_infos = pipeline.StageInfos();
+    const auto any_written = [](const auto& descriptors) {
+        return std::ranges::any_of(descriptors,
+                                   [](const auto& descriptor) { return descriptor.is_written; });
+    };
+    info->writes_images = std::ranges::any_of(stage_infos, [&](const Shader::Info& stage_info) {
+        return any_written(stage_info.image_descriptors) ||
+               any_written(stage_info.image_buffer_descriptors);
+    });
+    info->mesh = pipeline.IsMeshPipeline();
+    for (size_t stage = 0; stage < (std::min)(stage_infos.size(), Info::NumStages); ++stage) {
+        const Shader::Info& stage_info = stage_infos[stage];
+        u32& handles = info->handle_cbufs[stage];
+        auto& ranges = info->ranges[stage];
+        std::array<std::vector<std::pair<u32, u32>>, Info::NumSlots> words;
+        const auto add_range = [&](u32 slot, u32 begin, u32 end) {
+            if (slot >= Info::NumSlots) {
+                return;
+            }
+            handles |= 1U << slot;
+            auto& range = ranges[slot];
+            range = range.first == range.second
+                        ? std::pair{begin, end}
+                        : std::pair{(std::min)(range.first, begin), (std::max)(range.second, end)};
+            words[slot].emplace_back(begin, end);
+        };
+        // The words a handle is read from. Handles computed at draw time take no part
+        // (e05a72847e: they are evaluated again for each delta draw, not counted here).
+        const auto add = [&](const auto& descriptor) {
+            if (descriptor.handle_program != ~0U) {
+                return;
+            }
+            const u32 last = ((std::max)(descriptor.count, 1U) - 1) << descriptor.size_shift;
+            add_range(descriptor.cbuf_index, descriptor.cbuf_offset,
+                      descriptor.cbuf_offset + last + 4);
+            if constexpr (requires { descriptor.has_secondary; }) {
+                if (descriptor.has_secondary) {
+                    add_range(descriptor.secondary_cbuf_index, descriptor.secondary_cbuf_offset,
+                              descriptor.secondary_cbuf_offset + 4);
+                }
+            }
+        };
+        for (const auto& descriptor : stage_info.texture_buffer_descriptors) {
+            add(descriptor);
+        }
+        for (const auto& descriptor : stage_info.image_buffer_descriptors) {
+            add(descriptor);
+        }
+        for (const auto& descriptor : stage_info.texture_descriptors) {
+            add(descriptor);
+        }
+        for (const auto& descriptor : stage_info.image_descriptors) {
+            add(descriptor);
+        }
+        for (u32 slot = 0; slot < words.size(); ++slot) {
+            auto& list = words[slot];
+            std::ranges::sort(list);
+            const size_t first = info->words.size();
+            for (const auto& range : list) {
+                if (info->words.size() != first && range.first <= info->words.back().second) {
+                    info->words.back().second =
+                        (std::max)(info->words.back().second, range.second);
+                } else {
+                    info->words.push_back(range);
+                }
+            }
+            info->word_index[stage][slot] = {static_cast<u16>(first),
+                                             static_cast<u16>(info->words.size() - first)};
+        }
+    }
+    pipeline.fast_draw_count_info = std::move(info);
+    return *pipeline.fast_draw_count_info;
+}
+
+} // Anonymous namespace
+
+void RasterizerVulkan::FastDrawCountBegin() {
+    namespace Count = VideoCommon::Nx2FastDrawCount;
+    Count::Counter& counter = fast_draw_count;
+    // The draw before returned before its decision (no pipeline, a skipped mesh draw).
+    counter.stats.not_drawn += counter.open ? 1 : 0;
+    ++counter.stats.draws;
+    counter.taken = std::exchange(counter.previous, Count::PreviousDraw{});
+    counter.taken_delta = std::exchange(Count::g_delta, Count::Delta{});
+    counter.take_serial = Count::g_serial.load(std::memory_order_relaxed);
+    counter.take_last_break = Count::g_last_break.load(std::memory_order_relaxed);
+    counter.vertex_input_dirty = maxwell3d->dirty.flags[Dirty::VertexInput];
+    counter.open = true;
+}
+
+void RasterizerVulkan::FastDrawCountDecide(const GraphicsPipeline* pipeline, bool is_indexed,
+                                           bool is_indirect) {
+    namespace Count = VideoCommon::Nx2FastDrawCount;
+    Count::Counter& counter = fast_draw_count;
+    Count::Stats& stats = counter.stats;
+    counter.open = false;
+    // What the next draw compares with. The groups broken since the last snapshot are this
+    // draw's; a widened write list is noted with them (not a break in #1161). The mask is taken
+    // before the serial: a break on another thread in between (BreakOn moves the serial, then
+    // sets its group) keeps its group for the next draw.
+    const u32 mask = Count::g_pending.exchange(0, std::memory_order_relaxed) |
+                     (counter.taken_delta.widened ? u32{Count::ListOverflow} : 0U);
+    const u64 serial = Count::g_serial.load(std::memory_order_relaxed);
+    const u64 map_serial = gpu_memory->MapSerial();
+    counter.draw_serial = serial;
+    counter.draw_map_serial = map_serial;
+    const Count::PreviousDraw& draw = counter.taken;
+    const auto full = [&stats](Count::Full reason) { ++stats.full[static_cast<size_t>(reason)]; };
+    // TakeReusableDraw's checks, in its order.
+    if (!draw.valid) {
+        return full(Count::Full::NoCandidate);
+    }
+    const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    if (is_indirect || draw.is_indexed != is_indexed || draw.maxwell3d != maxwell3d ||
+        draw.topology != static_cast<u32>(draw_state.topology) ||
+        !draw_state.inline_index_draw_indexes.empty() || frame_dump.Capturing()) {
+        return full(Count::Full::Kind);
+    }
+    if (draw.serial != counter.take_serial) {
+        return counter.CountStateChanged(mask, counter.take_last_break);
+    }
+    if (draw.map_serial != map_serial) {
+        return counter.CountStateChanged(mask | Count::Map,
+                                         static_cast<u32>(Count::Reason::Map));
+    }
+    if (draw.tick != scheduler.CurrentTick()) {
+        return full(Count::Full::Submitted);
+    }
+    const auto* const previous = static_cast<const GraphicsPipeline*>(draw.pipeline);
+    if (draw.render_pass != scheduler.RenderPassSerial() || !scheduler.IsRenderPassActive() ||
+        scheduler.BoundGraphicsPipeline() != previous) {
+        return full(Count::Full::RenderPass);
+    }
+    const Count::PipelineInfo& info = FastDrawCountInfo(*previous);
+    if (info.writes_images || info.mesh) {
+        return full(Count::Full::DeltaPipeline);
+    }
+    // #1161 compares the attribute type classes in the previous pipeline's key with the
+    // registers'; our keys keep only the types the programs read (KeyedAttributeTypes), so the
+    // full resolve's pipeline stands for that comparison here.
+    if (counter.vertex_input_dirty &&
+        (!previous->HasDynamicVertexInput() || pipeline != previous)) {
+        return full(Count::Full::VertexInput);
+    }
+    const Count::Delta& delta = counter.taken_delta;
+    for (size_t stage = 0; stage < Count::PipelineInfo::NumStages && !delta.Empty(); ++stage) {
+        if ((delta.binds[stage] & info.handle_cbufs[stage]) != 0) {
+            return full(Count::Full::HandleBind);
+        }
+        if (delta.num_writes == 0) {
+            continue;
+        }
+        const auto& cbufs = maxwell3d->state.shader_stages[stage].const_buffers;
+        for (u32 slots = info.handle_cbufs[stage]; slots != 0; slots &= slots - 1) {
+            const u32 slot = static_cast<u32>(std::countr_zero(slots));
+            const GPUVAddr address = cbufs[slot].address;
+            const auto [begin, end] = info.ranges[stage][slot];
+            if (delta.Reaches(address + begin, end - begin) &&
+                delta.ReachesWords(address, info.Words(stage, slot))) {
+                return full(Count::Full::HandleData);
+            }
+        }
+    }
+    // DeltaStillHolds: nothing broke between the take and the locked caches. (Its sampled image
+    // and computed handle checks need the delta path's captured state: not counted.)
+    if (serial != counter.take_serial) {
+        return counter.CountStateChanged(mask,
+                                         Count::g_last_break.load(std::memory_order_relaxed));
+    }
+    ++stats.delta;
+    // The full resolve picked another pipeline: a delta draw would have kept the wrong one.
+    stats.other_pipeline += pipeline != previous ? 1 : 0;
+}
+
+void RasterizerVulkan::FastDrawCountResolved(const GraphicsPipeline* pipeline, bool is_indexed,
+                                             bool is_indirect) {
+    namespace Count = VideoCommon::Nx2FastDrawCount;
+    Count::Counter& counter = fast_draw_count;
+    const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    const auto topology = draw_state.topology;
+    const auto ineligible = [&]() -> std::optional<Count::Ineligible> {
+        if (is_indirect) {
+            return Count::Ineligible::Indirect;
+        }
+        if (mesh_draw) {
+            return Count::Ineligible::Mesh;
+        }
+        if (!pipeline->IsBuilt()) {
+            return Count::Ineligible::NotBuilt;
+        }
+        if (FastDrawCountInfo(*pipeline).writes_images) {
+            return Count::Ineligible::WritesImages;
+        }
+        if (maxwell3d->regs.transform_feedback_enabled != 0) {
+            return Count::Ineligible::TransformFeedback;
+        }
+        if (!draw_state.inline_index_draw_indexes.empty()) {
+            return Count::Ineligible::InlineIndex;
+        }
+        if (topology == Maxwell::PrimitiveTopology::Quads ||
+            topology == Maxwell::PrimitiveTopology::QuadStrip) {
+            return Count::Ineligible::Quads;
+        }
+        if (buffer_cache_runtime.AnyVertexRepacked()) {
+            return Count::Ineligible::Repacked;
+        }
+        if (!scheduler.IsRenderPassActive()) {
+            return Count::Ineligible::NoRenderPass;
+        }
+        if (scheduler.BoundGraphicsPipeline() != pipeline) {
+            return Count::Ineligible::PipelineNotBound;
+        }
+        if (!VideoCommon::GpuSplit::OnBackThread()) {
+            return Count::Ineligible::OffBackThread;
+        }
+        return std::nullopt;
+    }();
+    if (ineligible) {
+        ++counter.stats.ineligible[static_cast<size_t>(*ineligible)];
+        return;
+    }
+    counter.previous = Count::PreviousDraw{
+        .pipeline = pipeline,
+        .maxwell3d = maxwell3d,
+        .serial = counter.draw_serial,
+        .map_serial = counter.draw_map_serial,
+        .tick = scheduler.CurrentTick(),
+        .render_pass = scheduler.RenderPassSerial(),
+        .topology = static_cast<u32>(topology),
+        .is_indexed = is_indexed,
+        .valid = true,
+    };
+}
+
 template <typename Func>
 void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_indirect) {
 
@@ -727,6 +974,11 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     }
     if (frame_dump.Capturing()) {
         frame_dump.DrainIfFull();
+    }
+    // EDEN_NX2_FASTDRAW_COUNT: counting only, at #1161's TakeReusableDraw.
+    const bool fast_draw_counting = VideoCommon::Nx2FastDrawCount::g_on;
+    if (fast_draw_counting) [[unlikely]] {
+        FastDrawCountBegin();
     }
 
     const auto report_failure = [&](std::string_view reason) {
@@ -940,6 +1192,11 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         mesh_emulation_vertices_per_group = pipeline->MeshEmulationVerticesPerGroup();
     }
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+    // EDEN_NX2_FASTDRAW_COUNT: #1161 reads the serial the next draw compares with here, once the
+    // caches are locked, and checks DeltaStillHolds.
+    if (fast_draw_counting) [[unlikely]] {
+        FastDrawCountDecide(pipeline, is_indexed, is_indirect);
+    }
     // update engine as channel may be different.
     pipeline->SetEngine(maxwell3d, gpu_memory);
     const u32 repack_dirty = buffer_cache_runtime.SetVertexRepackLayout(
@@ -1052,6 +1309,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             });
     }
     submitted = true;
+    if (fast_draw_counting) [[unlikely]] {
+        FastDrawCountResolved(pipeline, is_indexed, is_indirect);
+    }
     constexpr u64 final_vertex = 0x16aff33d999f993fULL;
     constexpr u64 final_fragment = 0x52402d8e8ab55263ULL;
     const auto hashes = pipeline->ShaderHashes();
@@ -4231,6 +4491,10 @@ void NoteDrawReuseProbeFrame(); // vk_graphics_pipeline.cpp
 void RasterizerVulkan::TickFrame() {
     NoteDrawReuseProbeFrame();
     VideoCommon::MemStageStats::TickFrame();
+    if (VideoCommon::Nx2FastDrawCount::g_on) [[unlikely]] {
+        fast_draw_count.MaybeLog();
+        VideoCommon::Nx2FastDrawCount::Break(VideoCommon::Nx2FastDrawCount::Reason::Frame);
+    }
     if (MemoryOwnersEnabled()) {
         static std::chrono::steady_clock::time_point last_owners_log{};
         if (const auto now = std::chrono::steady_clock::now();
