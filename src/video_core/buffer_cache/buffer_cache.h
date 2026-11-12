@@ -216,6 +216,9 @@ void BufferCache<P>::TickFrame() {
                      fence_wait_timeouts.exchange(0, std::memory_order_relaxed));
         }
     }
+    if (DownloadReadStats::g_enabled && frame_tick % 600 == 0) [[unlikely]] {
+        DownloadReadStats::Log();
+    }
     if (frame_tick % 600 == 0 && preflush_resets != 0) {
         LOG_INFO(HW_GPU,
                  "Preflush reset (EXP69={}, EXP81={}) last 600 frames: {} resets, {} KiB unmarked, "
@@ -474,6 +477,11 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
     DAddr device_addr_end_aligned = Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE);
     area->start_address = device_addr_start_aligned;
     area->end_address = device_addr_end_aligned;
+    // F2 counter (EDEN_NX2_DOWNLOAD_READ_STATS): the guest reads these pages, whatever this
+    // answers (and whether it disarms their read traps below).
+    if (DownloadReadStats::g_enabled) [[unlikely]] {
+        DownloadReadStats::Read(device_addr_start_aligned, device_addr_end_aligned);
+    }
     // EXP81: the frame of each page's last CPU read, for the aged Preflushable reset (TickFrame).
     if (VideoCore::Nx2Debug::Experiment(81) > 0) [[unlikely]] {
         for (DAddr page = device_addr_start_aligned; page < device_addr_end_aligned;
@@ -1680,6 +1688,9 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
     AccumulateFlushes();
 
     if (committed_gpu_modified_ranges.empty()) {
+        if (DownloadReadStats::g_enabled) [[unlikely]] {
+            DownloadReadStats::Committed(0, 0);
+        }
         async_buffers.emplace_back(std::optional<Async_Buffer>{});
         return;
     }
@@ -1738,6 +1749,9 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
         });
     }
     committed_gpu_modified_ranges.clear();
+    if (DownloadReadStats::g_enabled) [[unlikely]] {
+        DownloadReadStats::Committed(downloads.size(), total_size_bytes);
+    }
     if (downloads.empty()) {
         async_buffers.emplace_back(std::optional<Async_Buffer>{});
         return;
@@ -1874,6 +1888,8 @@ void BufferCache<P>::PopAsyncBuffers() {
     auto& async_buffer = async_buffers.front();
     u8* base = async_buffer->mapped_span.data();
     const size_t base_offset = async_buffer->offset;
+    // F2 counter (EDEN_NX2_DOWNLOAD_READ_STATS): the ranges this fence writes to guest memory.
+    std::vector<std::pair<u64, u64>> stats_landed;
     // Landed per copy (copies within a page of each other together), each inside a
     // VideoCore::DownloadLanding that it looks at the collected CPU writes in: with preflush a
     // fence's copies span unrelated pages, and one landing over their hull would hold guest
@@ -1909,9 +1925,15 @@ void BufferCache<P>::PopAsyncBuffers() {
                 WriteDownloadedMemory(cpu_written, start, &read_mapped_memory[start - device_addr],
                                       end - start);
                 gpu_modified_ranges.Subtract(start, end - start);
+                if (DownloadReadStats::g_enabled) [[unlikely]] {
+                    stats_landed.emplace_back(start, end);
+                }
             });
         }
         first = last;
+    }
+    if (DownloadReadStats::g_enabled) [[unlikely]] {
+        DownloadReadStats::Landed(stats_landed);
     }
     async_buffers_death_ring.emplace_back(*async_buffer);
     async_buffers.pop_front();

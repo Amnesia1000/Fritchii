@@ -44,6 +44,7 @@
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/delayed_destruction_ring.h"
 #include "video_core/engines/fermi_2d.h"
+#include "video_core/fence_release_stats.h"
 #include "video_core/game_dlss_status.h"
 #include "video_core/nx2.h"
 #include "video_core/surface.h"
@@ -366,6 +367,32 @@ public:
 
     /// Pop asynchronous downloads
     void PopAsyncFlushes();
+
+    /// EDEN_NX2_FENCE_RELEASE_STATS (`mutex` held): what the next PopAsyncFlushes lands.
+    void Nx2DescribeNextPop(FenceReleaseStats::PopLanding& landing) {
+        if (committed_downloads.empty()) {
+            return;
+        }
+        for (const PendingDownload& download : committed_downloads.front()) {
+            FenceReleaseStats::LandedItem item{};
+            if (download.is_swizzle) {
+                const ImageBase& image = download.GetImage(slot_images);
+                item.image = true;
+                item.address = image.gpu_addr;
+                item.bytes = image.unswizzled_size_bytes;
+                item.width = image.info.size.width;
+                item.height = image.info.size.height;
+                item.format = image.info.format;
+                item.forced_flushed = image.info.forced_flushed;
+            } else {
+                const BufferDownload& buffer = slot_buffer_downloads[download.object_id];
+                item.address = buffer.address;
+                item.end = buffer.address + buffer.size;
+                item.bytes = buffer.size;
+            }
+            landing.Add(item);
+        }
+    }
 
     [[nodiscard]] ImageId DmaImageId(const Tegra::DMA::ImageOperand& operand, bool is_upload);
 

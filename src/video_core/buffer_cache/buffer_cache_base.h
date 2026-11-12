@@ -40,6 +40,7 @@
 #include "core/gpu_dirty_memory_manager.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/buffer_cache/buffer_base.h"
+#include "video_core/buffer_cache/download_read_stats.h"
 #include "video_core/buffer_cache/gpu_written_mirror.h"
 #include "video_core/buffer_cache/read_trap_tracker.h"
 #include "video_core/buffer_cache/virtual_range_cache.h"
@@ -48,6 +49,7 @@
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/kepler_compute.h"
+#include "video_core/fence_release_stats.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_runahead.h"
@@ -453,6 +455,22 @@ public:
     void PopAsyncFlushes();
     void PopAsyncBuffers();
 
+    /// EDEN_NX2_FENCE_RELEASE_STATS (`mutex` held): what the next PopAsyncFlushes copies to guest
+    /// memory (EXP49's read downloads it also lands are not included).
+    void Nx2DescribeNextPop(FenceReleaseStats::PopLanding& landing) {
+        if (async_buffers.empty() || !async_buffers.front().has_value() ||
+            pending_downloads.empty()) {
+            return;
+        }
+        for (const BufferCopy& copy : pending_downloads.front()) {
+            FenceReleaseStats::LandedItem item{};
+            item.address = static_cast<u64>(copy.src_offset);
+            item.end = item.address + copy.size;
+            item.bytes = copy.size;
+            landing.Add(item);
+        }
+    }
+
     bool DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount);
 
     bool DMAClear(GPUVAddr src_address, u64 amount, u32 value);
@@ -604,6 +622,10 @@ public:
         }
         if (armed && !marked) {
             return MirrorAnswer::ArmedUnmarked;
+        }
+        // F2 counter: a read answered here skips GetFlushArea (verify mode's calls are reads too).
+        if (DownloadReadStats::g_enabled) [[unlikely]] {
+            DownloadReadStats::Read(begin, begin + length);
         }
         return MirrorAnswer::Clean;
     }

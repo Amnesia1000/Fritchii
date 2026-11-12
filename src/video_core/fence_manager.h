@@ -27,6 +27,7 @@
 #include "video_core/nx2_debug_control.h"
 #include "common/thread.h"
 #include "video_core/delayed_destruction_ring.h"
+#include "video_core/fence_release_stats.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/gpu_wait_site.h"
@@ -403,6 +404,10 @@ private:
                 }
             }
             release_span.Set(0, {"fences", batch.size()});
+            // EDEN_NX2_FENCE_RELEASE_STATS (fable52_answer_chicken 5.1): split this release.
+            const bool stats = FenceReleaseStats::g_enabled;
+            const FenceReleaseStats::Clock::time_point release_start =
+                stats ? FenceReleaseStats::Clock::now() : FenceReleaseStats::Clock::time_point{};
             size_t texture_pops = 0;
             size_t buffer_pops = 0;
             for (const Released& released : batch) {
@@ -431,20 +436,89 @@ private:
                     }
                 }
             };
+            // pop_all with the stats: each pop described and timed, the mutex's waits and holds.
+            const auto pop_all_stats = [hand_back_us](auto& mutex, size_t pops, bool texture,
+                                                      auto&& describe, auto&& pop) {
+                namespace Stats = FenceReleaseStats;
+                Stats::Totals& totals = Stats::Get();
+                u64& wait_ns = texture ? totals.texture_wait_ns : totals.buffer_wait_ns;
+                u64& held_ns = texture ? totals.texture_held_ns : totals.buffer_held_ns;
+                auto wait_start = Stats::Clock::now();
+                std::unique_lock lock{mutex};
+                auto held_since = Stats::Clock::now();
+                wait_ns += Stats::NsBetween(wait_start, held_since);
+                auto hand_back_since = std::chrono::steady_clock::now();
+                for (size_t i = 0; i < pops; ++i) {
+                    Stats::PopLanding landing;
+                    describe(landing);
+                    const auto pop_start = Stats::Clock::now();
+                    pop();
+                    Stats::Pop(texture, Stats::NsSince(pop_start), landing);
+                    if (hand_back_us > 0 && i + 1 < pops) {
+                        const auto now = std::chrono::steady_clock::now();
+                        if (now - hand_back_since >= std::chrono::microseconds{hand_back_us}) {
+                            held_ns += Stats::NsSince(held_since);
+                            lock.unlock();
+                            std::this_thread::yield();
+                            wait_start = Stats::Clock::now();
+                            lock.lock();
+                            held_since = Stats::Clock::now();
+                            wait_ns += Stats::NsBetween(wait_start, held_since);
+                            hand_back_since = std::chrono::steady_clock::now();
+                        }
+                    }
+                }
+                held_ns += Stats::NsSince(held_since);
+            };
             if (texture_pops != 0) {
-                pop_all(texture_cache.mutex, texture_pops,
+                if (stats) [[unlikely]] {
+                    pop_all_stats(
+                        texture_cache.mutex, texture_pops, true,
+                        [this](FenceReleaseStats::PopLanding& landing) {
+                            texture_cache.Nx2DescribeNextPop(landing);
+                        },
                         [this] { texture_cache.PopAsyncFlushes(); });
+                } else {
+                    pop_all(texture_cache.mutex, texture_pops,
+                            [this] { texture_cache.PopAsyncFlushes(); });
+                }
             }
             if (buffer_pops != 0) {
-                pop_all(buffer_cache.mutex, buffer_pops, [this] { buffer_cache.PopAsyncFlushes(); });
+                if (stats) [[unlikely]] {
+                    pop_all_stats(
+                        buffer_cache.mutex, buffer_pops, false,
+                        [this](FenceReleaseStats::PopLanding& landing) {
+                            buffer_cache.Nx2DescribeNextPop(landing);
+                        },
+                        [this] { buffer_cache.PopAsyncFlushes(); });
+                } else {
+                    pop_all(buffer_cache.mutex, buffer_pops,
+                            [this] { buffer_cache.PopAsyncFlushes(); });
+                }
             }
             // Queries and operations keep their per-fence order.
             for (Released& released : batch) {
+                FenceReleaseStats::Clock::time_point stats_mark{};
+                if (stats) [[unlikely]] {
+                    stats_mark = FenceReleaseStats::Clock::now();
+                }
                 for (u32 i = 0; i < released.query_pops; ++i) {
                     query_cache.PopAsyncFlushes();
                 }
+                if (stats) [[unlikely]] {
+                    FenceReleaseStats::Totals& totals = FenceReleaseStats::Get();
+                    const auto now = FenceReleaseStats::Clock::now();
+                    totals.query_pops += released.query_pops;
+                    totals.query_ns += FenceReleaseStats::NsBetween(stats_mark, now);
+                    totals.operations += released.operations.size();
+                    stats_mark = now;
+                }
                 for (auto& operation : released.operations) {
                     operation();
+                }
+                if (stats) [[unlikely]] {
+                    FenceReleaseStats::Get().operations_ns +=
+                        FenceReleaseStats::NsSince(stats_mark);
                 }
                 released.operations.clear();
             }
@@ -462,6 +536,9 @@ private:
             }
             // Only once their operations ran: FencesQuiet must not see a fence as gone before.
             fences_in_flight.fetch_sub(static_cast<u32>(batch.size()), std::memory_order_release);
+            if (stats) [[unlikely]] {
+                FenceReleaseStats::Release(batch.size(), FenceReleaseStats::NsSince(release_start));
+            }
             batch.clear();
             {
                 std::scoped_lock lock(guard);
