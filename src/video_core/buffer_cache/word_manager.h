@@ -67,6 +67,47 @@ inline std::atomic<bool> g_hot_pages_on{false};
     return g_hot_pages_on.load(std::memory_order_relaxed);
 }
 
+/// EXP109 (zortos293/Lichii#1161 f5902c6c68, lucastaonline): page tracking changes a thread
+/// applies itself once it drops the buffer cache's lock (RasterizerVulkan::OnCPUWrite): changing a
+/// page's host protection is a system call, and every other thread drawing or reading waited for
+/// it. Ours collects only untracking (ApplyCollectedRanges).
+class DeferredPageCaching {
+public:
+    using Ranges = std::vector<std::pair<VAddr, size_t>>;
+    using Apply = void (*)(void* tracker, std::span<const std::pair<VAddr, size_t>>, s32 delta);
+
+    void Add(void* tracker, Apply apply, const Ranges& ranges, s32 delta) {
+        batches.push_back(Batch{tracker, apply, delta, collected.size(), ranges.size()});
+        collected.insert(collected.end(), ranges.begin(), ranges.end());
+    }
+
+    /// In the order they were made.
+    void ApplyAll() {
+        for (const Batch& batch : batches) {
+            batch.apply(batch.tracker,
+                        std::span<const std::pair<VAddr, size_t>>(collected).subspan(batch.begin,
+                                                                                    batch.count),
+                        batch.delta);
+        }
+        batches.clear();
+        collected.clear();
+    }
+
+private:
+    struct Batch {
+        void* tracker;
+        Apply apply;
+        s32 delta;
+        size_t begin;
+        size_t count;
+    };
+    std::vector<Batch> batches;
+    Ranges collected;
+};
+
+/// Set while the calling thread collects its page untracking instead of applying it.
+inline thread_local DeferredPageCaching* t_deferred_page_caching{};
+
 template <class DeviceTracker, size_t stack_words, size_t size_bytes>
 struct WordManager {
     using CollectedRanges = std::vector<std::pair<VAddr, size_t>>;
@@ -168,6 +209,32 @@ struct WordManager {
             std::fill_n(heap.data() + size_t(Type::Hot) * num_words, num_words, u64{0});
             std::fill_n(heap.data() + size_t(Type::Flip) * num_words, num_words, u64{0});
         }
+    }
+
+    /// EXP108 (zortos293/Lichii#1436, from #1161 4c44094e30): ChangeRegionState(Type::CPU, true,
+    /// ...) leaving the pages tracked (Untracked unchanged): pages tracked now stay tracked, so
+    /// clearing the bits at the upload tracks nothing again. Ours also moves dirty_gen where a
+    /// page gains its CPU bit (EDEN_NX2_STORAGE_SYNC_MEMO) and, with EXP48, drops the pages'
+    /// hot-clean bits, so an upload this frame doesn't pass them over.
+    void MarkWrittenTracked(u64 dirty_addr, u64 size) noexcept {
+        const bool hot_pages = HotPagesOn();
+        if (hot_pages) [[unlikely]] {
+            RefreshHotEpoch();
+        }
+        std::span<u64> cpu_words = Span(Type::CPU);
+        std::span<u64> cached_words = Span(Type::CachedCPU);
+        std::span<u64> hot_clean_words = Span(Type::HotClean);
+        IterateWords(dirty_addr - cpu_addr, size, [&](size_t index, u64 mask) {
+            if ((cpu_words[index] & mask) != mask) {
+                ++dirty_gen;
+            }
+            cpu_words[index] |= mask;
+            cached_words[index] &= ~mask;
+            if (hot_pages) [[unlikely]] {
+                hot_clean_words[index] &= ~mask;
+            }
+            NoteCleanWord(index);
+        });
     }
 
     void ChangeRegionState(Type type, bool enable, u64 dirty_addr, u64 size) noexcept {
@@ -474,6 +541,23 @@ struct WordManager {
         if (ranges.empty())
             return;
         std::sort(ranges.begin(), ranges.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        // EXP109 (#1161 f5902c6c68): untracking, collected for after the lock. Only decrements:
+        // a page left protected a little longer only traps once more, while an increment applied
+        // after another thread's decrement could let a page other users track drop its
+        // protection in between.
+        if (delta < 0 && t_deferred_page_caching != nullptr && !Nx2Perf::Verify()) [[unlikely]] {
+            CoalesceInPlace(ranges);
+            t_deferred_page_caching->Add(
+                tracker,
+                [](void* deferred_tracker, std::span<const std::pair<VAddr, size_t>> runs,
+                   s32 run_delta) {
+                    static_cast<DeviceTracker*>(deferred_tracker)
+                        ->UpdatePagesCachedBatch(runs, run_delta);
+                },
+                ranges, delta);
+            ranges.clear();
+            return;
+        }
         if (Nx2Perf::On(Nx2Perf::Opt::SortedPageBatches) && !Nx2Perf::Verify()) {
             CoalesceInPlace(ranges);
             tracker->UpdatePagesCachedBatch(

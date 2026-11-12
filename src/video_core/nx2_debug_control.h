@@ -593,6 +593,35 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// entries per stage, rescaling words, ScaleEpoch), through a second instantiation of
 /// ConfigureImpl. Records only, no draw changes; for the delta draw steps after D2.
 /// EDEN_NX2_FASTDRAW_COUNT=1 keeps them too. Off, PrepareDraw reads this switch once a draw.
+/// EXP107 (live, 0 = off; port of zortos293/Lichii#1161 13d9320cfb, lucastaonline): inline
+/// constant buffer data (Maxwell3D::CallConstBufferWords, ProcessCBMultiData) is compared with
+/// the words memory holds, on the back, in order (Maxwell3D::CompareConstantData; one GPU page,
+/// not sparse). Equal and safe: not written at all, so no invalidation, no buffer cache mark and
+/// no delta-draw break (OoT rewrites ~258k blocks a second with the same words, often over
+/// texture handles). Safe means #1161's conditions: no GPU-written data may be on the pages
+/// (VideoCore::MayHoldGpuWrites, always true outside Switch 2 titles) and no guest read download
+/// may land there; plus ours: not the texture header or sampler pools (also through an alias)
+/// and no run-ahead used this session. Equal but not safe: written as before. With
+/// EDEN_NX2_FASTDRAW_COUNT=1 equal writes are neutral for the count, and the 5 s line ends with
+/// how many changed nothing and how many were not written.
+/// EXP108 (live, 0 = off; port of zortos293/Lichii#1436 = #1161 4c44094e30, lucastaonline):
+/// the GPU's own cached writes (MemoryManager::FlushCaching: inline constant buffer data, its
+/// accumulated ranges) mark their pages CPU-modified but leave them tracked
+/// (MemoryTracker::MarkRegionAsWrittenTracked) instead of untracking them as a guest CPU write
+/// does; the upload clears the bits and has nothing to track again. Saves a VirtualProtect pair
+/// per page per write cycle (~4% of the GPU thread at OoT's Kokiri water, +1.4 fps on the
+/// author's PC). Only on pages with no GPU-modified range and no GPU-modified bit (a tracked
+/// page's GPU bits count); never in Nx2Perf verify. A guest CPU access to such a page takes the
+/// slow path, as for any tracked page; a guest write there untracks it as before.
+/// EXP109 (live, 0 = off; port of zortos293/Lichii#1161 f5902c6c68, lucastaonline): a guest write
+/// that untracks buffer cache pages (RasterizerVulkan::OnCPUWrite) changes their host protection
+/// after dropping buffer_cache.mutex instead of under it (the back waited for those system calls
+/// before draws). The word state changes under the lock as before; the page count decrements are
+/// collected per thread (VideoCommon::DeferredPageCaching) and applied in order before OnCPUWrite
+/// returns, so the guest's write still finds the page unprotected. Ours defers only decrements
+/// (increments, e.g. an upload inside the write's slow path, apply at once): late decrements only
+/// keep a page protected a little longer; a late increment could let a page the texture cache
+/// tracks lose its protection in between. Never in Nx2Perf verify.
 /// EXP101 (live, 0 = off, 1 = runs, 2 = cached page pointer + prefetch; fable52_answer_presenter): nvhost_gpu::SubmitGPFIFOImpl's pushbuffer
 /// snapshot reads runs of entries whose GPU addresses follow each other with one ReadBlockUnsafe
 /// instead of one per entry (OoT's presenting thread submits ~6,500 entries a frame; the loop is
