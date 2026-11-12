@@ -18,10 +18,37 @@
 
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#include "common/thread.h"
 #include "core/core_timing.h"
 #include "core/hardware_properties.h"
+#include "video_core/nx2_debug_control.h"
+
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#include <intrin.h>
+#endif
 
 namespace Core::Timing {
+
+namespace {
+
+/// EDEN_NX2_EXP75 (live, us, 0 = off; fable52_answer_pipeline section 3): the timer thread spins
+/// the last this-many us before a precise event (the kernel's hardware timer: guest sleeps and
+/// timeouts) instead of waking on the OS timer's 0.5 ms tick.
+s64 TimerSpinNs() {
+    return s64{VideoCore::Nx2Debug::Experiment(75)} * 1000;
+}
+
+void SpinPause() {
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    _mm_pause();
+#elif defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    asm volatile("yield");
+#endif
+}
+
+} // Anonymous namespace
 
 constexpr s64 MAX_SLICE_LENGTH = 10000;
 
@@ -71,6 +98,7 @@ CoreTiming::~CoreTiming() {
 }
 
 void CoreTiming::Wake() {
+    wake_count.fetch_add(1, std::memory_order_release);
     event.Set();
 #ifdef _WIN32
     Common::Windows::SignalWakeEvent(wake_handle);
@@ -111,7 +139,34 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
                     paused_set = false;
                     if (auto const next_time = Advance(); next_time) {
                         // There are more events left in the queue, wait until the next event.
-                        auto const wait_time = *next_time - GetGlobalTimeNs().count();
+                        auto wait_time = *next_time - GetGlobalTimeNs().count();
+                        // EXP75: a precise event due within the spin window: spin to the next
+                        // event (never later than that precise one), else wake on the OS timer
+                        // that far ahead of it. A Wake (an earlier event scheduled) ends the spin.
+                        if (const s64 spin_ns = TimerSpinNs();
+                            spin_ns > 0 && wait_time > 0 &&
+                            next_precise_ns != (std::numeric_limits<s64>::max)()) {
+                            const s64 precise_in = next_precise_ns - GetGlobalTimeNs().count();
+                            if (precise_in <= spin_ns) {
+                                static bool placed = false;
+                                if (!placed) {
+                                    // Off the GPU threads' cores, once they are pinned.
+                                    if (const u64 mask = Common::BackgroundWorkCpuMask();
+                                        mask != 0) {
+                                        Common::SetCurrentThreadCpuMask(mask);
+                                        placed = true;
+                                    }
+                                }
+                                const u32 seen = wake_count.load(std::memory_order_acquire);
+                                while (GetGlobalTimeNs().count() < *next_time &&
+                                       wake_count.load(std::memory_order_acquire) == seen &&
+                                       !paused && !stop_token.stop_requested()) {
+                                    SpinPause();
+                                }
+                                continue;
+                            }
+                            wait_time = (std::min)(wait_time, precise_in - spin_ns);
+                        }
                         if (wait_time > 0) {
 #ifdef _WIN32
                             // A high resolution timer keeps the guest's events (vsync among them)
@@ -333,6 +388,18 @@ std::optional<s64> CoreTiming::Advance() {
         }
 
         global_timer = GetGlobalTimeNs().count();
+    }
+
+    // The earliest precise event (the heap orders by time only; a few dozen events at most).
+    next_precise_ns = (std::numeric_limits<s64>::max)();
+    if (TimerSpinNs() > 0) {
+        for (const Event& queued : event_queue) {
+            if (queued.time < next_precise_ns) {
+                if (const auto type = queued.type.lock(); type && type->precise) {
+                    next_precise_ns = queued.time;
+                }
+            }
+        }
     }
 
     if (!event_queue.empty()) {

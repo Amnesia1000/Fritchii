@@ -39,6 +39,10 @@ struct EventType {
     /// A monotonic sequence number, incremented when this event is
     /// changed externally.
     size_t sequence_number;
+    /// EDEN_NX2_TIMER_SPIN_US: the timer thread spins up to this event instead of waking on the
+    /// OS timer (whose 0.5 ms tick made guest sleeps of 100 us last ~420 us). The kernel's
+    /// hardware timer only (guest sleeps and timeouts); set right after CreateEvent.
+    bool precise = false;
 };
 
 enum class UnscheduleEventType {
@@ -152,6 +156,10 @@ public:
 #endif
     /// Wakes the timer thread: `event`, and on Windows the high resolution wait's wake handle.
     void Wake();
+    /// Bumped by Wake: ends the timer thread's spin before a precise event (a new earlier event).
+    std::atomic<u32> wake_count{};
+    /// The earliest precise event's time after Advance (max: none). Timer thread only.
+    s64 next_precise_ns = (std::numeric_limits<s64>::max)();
     u64 event_fifo_id = 0;
     s64 pause_end_time{};
     /// Cycle timing

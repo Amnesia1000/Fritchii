@@ -18,6 +18,8 @@ void KHardwareTimer::Initialize() {
                                                  this->DoTask();
                                                  return std::nullopt;
                                              });
+    // Guest sleeps and timeouts: on time to the microsecond with EXP75, not on the OS tick.
+    m_event_type->precise = true;
 }
 
 void KHardwareTimer::Finalize() {

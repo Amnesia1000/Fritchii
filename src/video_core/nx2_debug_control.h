@@ -447,6 +447,12 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// collector's device memory figure, as deleted images waiting for the GPU are. Logs "Image pool
 /// (EXP42) last 600 frames" and counts pooled creates in "Slow clear texture cache". 1 is the default
 /// (LoadExperiments); 0 = off.
+/// EXP75 (live; us, 0 = off; fable52_answer_pipeline section 3; Core::Timing::CoreTiming's timer
+/// thread): precise guest timers. The thread spins the last this-many us before a precise event
+/// (the kernel's hardware timer: guest sleeps and timeouts, EventType::precise) instead of waking
+/// on the OS timer, whose 0.5 ms tick made the game's 100 us sleeps last ~420 us and its 1 ms
+/// present poll 1.45 ms. Other events stay on the timer. Costs a share of one logical CPU (kept
+/// off the GPU threads' cores). Try 600.
 /// EXP74 (live; us, 0 = off; fable52_answer_perdraw 1; FenceManager::ReleaseThreadFunc): the fencing
 /// thread lets the texture/buffer cache lock go between two pops after holding it this long, so a
 /// batch of 20-60 fences no longer keeps the back waiting 1-13 ms.
