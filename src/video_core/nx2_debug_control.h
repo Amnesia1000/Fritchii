@@ -130,7 +130,7 @@ inline std::atomic<int> g_rt_depth_noupload{-1};
 /// first instance alone; the loop's deferred draw covers it (Maxwell3D::FrontRunMacro,
 /// DrawManager::FoldFirstInstance). 1 = on.
 inline std::atomic<int> g_fold_instance{-1};
-/// EDEN_NX2_OOT_MACROS (live, default 0; from Skitchii (skolvolt/Lichii) macro_hle_oot.h): Ocarina
+/// EDEN_NX2_OOT_MACROS (live, default 1 since 2026-11-12; from Skitchii (skolvolt/Lichii) macro_hle_oot.h): Ocarina
 /// of Time's hot 3D macros, found by code hash, run through native C++ handlers on the split
 /// front instead of the MME JIT (Maxwell3D::FrontRunMacro). 1 = handlers, 2 = verify (the JIT's
 /// writes count; the handler runs on copies for the first 4096 calls of each macro and then one
@@ -280,7 +280,7 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// poll (EXP24)" counts every 10 s. EXP24 = 2: locate only, sleeps unchanged: short sleeps
 /// (<= 2 ms) are counted by call chain and the top 8 logged every 10 s ("OoT present poll
 /// locate"). EXP24 = 3: no GPU wake, the poll's 1 ms sleep is EDEN_NX2_OOT_PRESENT_SLEEP_US
-/// instead (default 250 us, at most the time asked for). Default 3 (LoadExperiments). EXP24 = 4
+/// instead (default 250 us, at most the time asked for). EXP24 = 4 (the default, LoadExperiments)
 /// (fable52_answer_pipeline section 2): as 3, but returns at once when the event's value word
 /// (event object field EDEN_NX2_OOT_PRESENT_FIELD, default 0) already reads 1, and the sleep ends
 /// as soon as it does (Nx2OotPresentPollCheck from KThread::BeginWait: the game's MainThread
@@ -452,7 +452,7 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// (the kernel's hardware timer: guest sleeps and timeouts, EventType::precise) instead of waking
 /// on the OS timer, whose 0.5 ms tick made the game's 100 us sleeps last ~420 us and its 1 ms
 /// present poll 1.45 ms. Other events stay on the timer. Costs a share of one logical CPU (kept
-/// off the GPU threads' cores). Try 600.
+/// off the GPU threads' cores). Default 600 (LoadExperiments).
 /// EXP74 (live; us, 0 = off; fable52_answer_perdraw 1; FenceManager::ReleaseThreadFunc): the fencing
 /// thread lets the texture/buffer cache lock go between two pops after holding it this long, so a
 /// batch of 20-60 fences no longer keeps the back waiting 1-13 ms.
@@ -638,10 +638,15 @@ inline void LoadExperiments() {
         // report listed over the bytes. Owner fight toggle with EXP30: macro dma flush 34.5 -> 20.4
         // ms/s, front waits 442 -> 416 ms/s, no flashes; it only drops empty work.
         g_experiments[73].store(1, std::memory_order_relaxed);
-        // EXP24 = 3 (2026-11-12): OoT's present poll sleeps 250 us instead of 1 ms. The guest
-        // timeline puts that poll on the night market's critical path (1.9 ms a frame, 5.2 at
-        // p90); live toggle there 57.8 -> 58.4 fps, 3 of 4 windows up. Only the verified site.
-        g_experiments[24].store(3, std::memory_order_relaxed);
+        // EXP24 = 4 (2026-11-12): OoT's present poll sleeps at most 250 us and ends when the
+        // event's value word reads 1. The guest timeline put that poll on the night market's
+        // critical path (1.9 ms a frame, 5.2 at p90); 3 alone gave 57.8 -> 58.4 fps. Only the
+        // verified site. With EXP75 = 600 (precise guest timers, +0.9 fps at the night market):
+        // together they made the GPU side the frame's critical path, so its cuts now show
+        // (OOT_MACROS +2.1 with them on). Owner playtest of all three: dogs no longer hitch,
+        // the chicken much better, no glitches; owner asked for them as defaults.
+        g_experiments[24].store(4, std::memory_order_relaxed);
+        g_experiments[75].store(600, std::memory_order_relaxed);
         // EXP49 = 1 (2026-11-10, owner's call for v5.7): the async read-back. Stalchild fight,
         // flipped every 30 s while the owner fought: 51.9 -> 56.9 fps, the back's read flushes
         // 35 -> 6 ms/s, guest lock waits halved. No beams in that session or two later ones

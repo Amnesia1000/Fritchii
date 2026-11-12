@@ -2170,7 +2170,7 @@ void Maxwell3D::FrontRefreshSwitches(FrontState& fs) {
     if (Debug::Experiment(53) != 0) {
         features |= 1;
     }
-    if (Debug::SwitchValue(Debug::g_oot_macros, "EDEN_NX2_OOT_MACROS") != 0) {
+    if (Debug::SwitchValue(Debug::g_oot_macros, "EDEN_NX2_OOT_MACROS", 1) != 0) {
         features |= 2;
     }
     if (Debug::SwitchValue(Debug::g_fold_instance, "EDEN_NX2_FOLD_INSTANCE") != 0) {
@@ -2314,10 +2314,11 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
         }
         oot = fs.oot_id[slot];
     }
-    // EDEN_NX2_OOT_MACROS (live, 0 = off, the default): 1 runs the replacement instead of the
-    // JIT, 2 and 3 verify it against the JIT (see nx2_debug_control.h g_oot_macros).
-    const int oot_mode =
-        VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_oot_macros, "EDEN_NX2_OOT_MACROS");
+    // EDEN_NX2_OOT_MACROS (live, 0 = off; 1, the default since 2026-11-12): 1 runs the
+    // replacement instead of the JIT, 2 and 3 verify it against the JIT (see nx2_debug_control.h
+    // g_oot_macros).
+    const int oot_mode = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_oot_macros,
+                                                          "EDEN_NX2_OOT_MACROS", 1);
     const size_t oot_index = static_cast<size_t>(oot);
     bool oot_verify = false;
     if (oot != OotMacros::Id::None && oot_mode >= 2) [[unlikely]] {
