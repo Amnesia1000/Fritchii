@@ -84,6 +84,7 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
         }
         // Busy: over 32 MiB mapped, unmapped or protected in the last half second. At most 10
         // waits (5 s), then the pass runs anyway.
+        bool mapping_nonstop = idle_timing;
         for (int wait = 0; idle_timing && wait < 10; ++wait) {
             const u64 before = mapped_bytes();
             {
@@ -94,6 +95,7 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
                 return;
             }
             if (mapped_bytes() - before < (u64{32} << 20)) {
+                mapping_nonstop = false;
                 break;
             }
         }
@@ -121,7 +123,12 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
             interval = (std::min)(interval * 2, std::chrono::seconds{max_interval});
             continue;
         }
-        interval = 5s;
+        // The game mapped through every wait (a fight spawning and killing every frame): don't
+        // come back in 5 s, or the next pass lands in it again (fable52_answer_backdraw (b) 1).
+        interval = mapping_nonstop
+                       ? (std::min)((std::max)(interval * 2, std::chrono::seconds{60}),
+                                    std::chrono::seconds{max_interval})
+                       : 5s;
         const auto phases = Common::HostMemory::LastZeroTrimPhases();
         LOG_INFO(HW_Memory,
                  "Trimmed {} MiB of all-zero guest pages out of {} MiB resident in {} ms; the kernel "

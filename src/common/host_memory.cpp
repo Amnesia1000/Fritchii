@@ -4,6 +4,9 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <chrono>
+
 #ifdef _WIN32
 
 #include <iterator>
@@ -82,6 +85,23 @@ static int memfd_create(const char* name, unsigned int flags) {
 #endif
 
 namespace Common {
+
+namespace {
+// Guest map/unmap/protect calls under way (Windows): the zero-page pass gives way to them between
+// its unlock runs (fable52_answer_backdraw (b) fix 1: host unmap/protect stalled up to 12.2 ms
+// during a pass in the Stalchild fight, 424.55 s and 440.35 s).
+std::atomic<int> g_guest_mapping_in_flight{};
+struct GuestMappingInFlight {
+    GuestMappingInFlight() noexcept {
+        g_guest_mapping_in_flight.fetch_add(1, std::memory_order_relaxed);
+    }
+    ~GuestMappingInFlight() {
+        g_guest_mapping_in_flight.fetch_sub(1, std::memory_order_relaxed);
+    }
+    GuestMappingInFlight(const GuestMappingInFlight&) = delete;
+    GuestMappingInFlight& operator=(const GuestMappingInFlight&) = delete;
+};
+} // Anonymous namespace
 
 [[maybe_unused]] constexpr size_t PageAlignment = 0x1000;
 [[maybe_unused]] constexpr int BackingAttempts = 5; // fastmem backing allocation tries (Windows)
@@ -325,6 +345,7 @@ public:
     }
 
     void Map(size_t virtual_offset, size_t host_offset, size_t length, MemoryPermission perms) {
+        const GuestMappingInFlight in_flight;
         const Common::Nx2Hitch::Scope timed{Common::Nx2Hitch::Cause::HostMap, length}; // before the lock
         std::unique_lock lock{placeholder_mutex};
         if (!IsNiechePlaceholder(virtual_offset, length)) {
@@ -337,6 +358,7 @@ public:
     }
 
     void Unmap(size_t virtual_offset, size_t length) {
+        const GuestMappingInFlight in_flight;
         const Common::Nx2Hitch::Scope timed{Common::Nx2Hitch::Cause::HostUnmap, length}; // before the lock
         std::scoped_lock lock{placeholder_mutex};
 
@@ -358,6 +380,7 @@ public:
         }
         const size_t virtual_end = virtual_offset + length;
 
+        const GuestMappingInFlight in_flight;
         const Common::Nx2Hitch::Scope timed{Common::Nx2Hitch::Cause::HostProtect, length}; // before the lock
         std::scoped_lock lock{placeholder_mutex};
         auto [it, end] = placeholders.equal_range({virtual_offset, virtual_end});
@@ -1378,6 +1401,16 @@ std::pair<size_t, size_t> HostMemory::TrimZeroPages() const {
         size_t j = i + 1;
         while (j < trim.size() && trim[j] == trim[j - 1] + PageAlignment) {
             ++j;
+        }
+        // Give way to a guest map/unmap/protect under way (they share the address space lock with
+        // VirtualUnlock): at most 20 ms per run, so a game that maps nonstop can't hold the pass.
+        if (g_guest_mapping_in_flight.load(std::memory_order_relaxed) > 0) {
+            const auto give_way_start = std::chrono::steady_clock::now();
+            while (g_guest_mapping_in_flight.load(std::memory_order_relaxed) > 0 &&
+                   std::chrono::steady_clock::now() - give_way_start <
+                       std::chrono::milliseconds{20}) {
+                SwitchToThread();
+            }
         }
         const auto run_start = std::chrono::steady_clock::now();
         unlock(trim[i], trim[j - 1] + PageAlignment);
