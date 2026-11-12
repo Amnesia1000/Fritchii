@@ -627,6 +627,16 @@ private:
     std::array<u64, static_cast<size_t>(DeleteReason::Count)> nx2_deletes{};
     std::array<u64, static_cast<size_t>(DeleteReason::Count) * 2> nx2_remade_after{};
     u64 nx2_remade_unknown = 0;
+    /// EXP76: images flagged Remapped (UnmapGPUMemory), kept after a remap (& 1), whole uploads
+    /// skipped because the guest bytes hashed the same as at the last upload (& 2), and checked.
+    u64 nx2_flagged_remapped = 0;
+    u64 nx2_kept_after_remap = 0;
+    u64 nx2_upload_skips = 0;
+    u64 nx2_upload_skip_bytes = 0;
+    u64 nx2_upload_hash_checks = 0;
+    std::vector<u8> nx2_hash_scratch;
+    /// CityHash128 of an image's guest bytes (in place when they are one continuous span).
+    [[nodiscard]] u128 GuestContentHash(const ImageBase& image);
 
     /// Create a new image and join perfectly matching existing images
     /// Remove joined images from the cache

@@ -2239,6 +2239,7 @@ void TextureCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t siz
             continue;
         }
         image.flags |= ImageFlagBits::Remapped;
+        ++nx2_flagged_remapped;
     }
 }
 
@@ -2894,6 +2895,12 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
 
     image.flags &= ~ImageFlagBits::CpuModified;
+    // EXP76 & 2: the hash of the last whole upload, cleared here so any other way this refresh
+    // changes the texels (layers, sparse pieces, the stale skip) leaves no hash behind.
+    const u64 last_hash_lo = image.nx2_content_hash_lo;
+    const u64 last_hash_hi = image.nx2_content_hash_hi;
+    image.nx2_content_hash_lo = 0;
+    image.nx2_content_hash_hi = 0;
 
     // Images uploaded by layer stay tracked while some of their layers are dirty.
     if (False(image.flags & ImageFlagBits::Tracked)) {
@@ -2940,6 +2947,26 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         runtime.TransitionImageLayout(image);
         return;
     }
+    // EXP76 & 2: a whole upload whose guest bytes hash as they did at this image's last whole
+    // upload already has its texels (the image was tracked again above, before the bytes are
+    // read, so a CPU write after this marks it again). Never for GPU-written images.
+    const int keep_mode = VideoCore::Nx2Debug::Experiment(76);
+    constexpr u32 HashMinBytes = 64 * 1024;
+    const bool hashable = (keep_mode & 2) != 0 && image.guest_size_bytes >= HashMinBytes &&
+                          False(image.flags & ImageFlagBits::GpuModified);
+    if (hashable && (last_hash_lo | last_hash_hi) != 0) {
+        ++nx2_upload_hash_checks;
+        const u128 hash = GuestContentHash(image);
+        if (hash[0] == last_hash_lo && (hash[1] | 1) == last_hash_hi &&
+            False(image.flags & ImageFlagBits::CpuModified)) {
+            ++nx2_upload_skips;
+            nx2_upload_skip_bytes += image.guest_size_bytes;
+            image.nx2_content_hash_lo = last_hash_lo;
+            image.nx2_content_hash_hi = last_hash_hi;
+            return;
+        }
+    }
+
     if (True(image.flags & ImageFlagBits::AsynchronousDecode)) {
         QueueAsyncDecode(image, image_id);
         return;
@@ -2976,6 +3003,15 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         }
         UploadImageContents(image, staging);
         runtime.InsertUploadMemoryBarrier();
+    }
+    // EXP76 & 2: the bytes just uploaded, hashed after the upload read them. A CPU write since
+    // the image was tracked marked it CpuModified again: then no hash (the next refresh uploads).
+    if (hashable && False(image.flags & ImageFlagBits::CpuModified)) {
+        const u128 hash = GuestContentHash(image);
+        if (False(image.flags & ImageFlagBits::CpuModified)) {
+            image.nx2_content_hash_lo = hash[0];
+            image.nx2_content_hash_hi = hash[1] | 1; // never 0/0
+        }
     }
     if (upload_trace) [[unlikely]] {
         using Ms = std::chrono::duration<double, std::milli>;
@@ -3414,9 +3450,39 @@ ImageId TextureCache<P>::FindImage(const ImageInfo& info, GPUVAddr gpu_addr,
     const bool flexible_formats = True(options & RelaxedOptions::Format);
     ImageId image_id{};
     boost::container::small_vector<ImageId, 8> image_ids;
+    const int keep_mode = VideoCore::Nx2Debug::Experiment(76);
     const auto lambda = [&](ImageId existing_image_id, ImageBase& existing_image) {
         if (True(existing_image.flags & ImageFlagBits::Remapped)) {
-            return false;
+            // EXP76 & 1 (fable52_answer_keeptex 2a): the game remapped the range and the same
+            // texture is asked for at the same GPU and device address: keep the image instead of
+            // making it again. It stays CpuModified, so its contents are uploaded from guest
+            // memory as for a new image (or skipped by EXP76 & 2 when the bytes are unchanged).
+            const ImageInfo& old = existing_image.info;
+            constexpr ImageFlagBits not_kept =
+                ImageFlagBits::GpuModified | ImageFlagBits::Alias | ImageFlagBits::BadOverlap |
+                ImageFlagBits::Sparse | ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
+                ImageFlagBits::UnwrittenSparse | ImageFlagBits::Unbacked;
+            if ((keep_mode & 1) == 0 || existing_image.gpu_addr != gpu_addr ||
+                existing_image.cpu_addr != *cpu_addr || True(existing_image.flags & not_kept) ||
+                !existing_image.aliased_images.empty() || old.type != info.type ||
+                old.format != info.format || old.size.width != info.size.width ||
+                old.size.height != info.size.height || old.size.depth != info.size.depth ||
+                old.resources.levels != info.resources.levels ||
+                old.resources.layers != info.resources.layers ||
+                old.num_samples != info.num_samples || old.block.width != info.block.width ||
+                old.block.height != info.block.height || old.block.depth != info.block.depth ||
+                old.layer_stride != info.layer_stride || old.pitch != info.pitch ||
+                old.tile_width_spacing != info.tile_width_spacing) {
+                return false;
+            }
+            existing_image.flags &= ~ImageFlagBits::Remapped;
+            existing_image.flags |= ImageFlagBits::CpuModified;
+            ++bindings_epoch;
+            ++nx2_kept_after_remap;
+            image_id = existing_image_id;
+            image_ids.clear();
+            image_ids.push_back(existing_image_id);
+            return true;
         }
         if (info.type == ImageType::Linear || existing_image.info.type == ImageType::Linear)
             [[unlikely]] {
@@ -3803,6 +3869,17 @@ ImageId TextureCache<P>::InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
 }
 
 template <class P>
+u128 TextureCache<P>::GuestContentHash(const ImageBase& image) {
+    const size_t size = image.guest_size_bytes;
+    if (const u8* const span = gpu_memory->GetSpan(image.gpu_addr, size); span != nullptr) {
+        return Common::CityHash128(reinterpret_cast<const char*>(span), size);
+    }
+    nx2_hash_scratch.resize(size);
+    gpu_memory->ReadBlockUnsafe(image.gpu_addr, nx2_hash_scratch.data(), size);
+    return Common::CityHash128(reinterpret_cast<const char*>(nx2_hash_scratch.data()), size);
+}
+
+template <class P>
 void TextureCache<P>::NoteNewSampledImage(ImageId image_id, GPUVAddr gpu_addr) {
     if (!ImageHashLogEnabled()) [[likely]] {
         return;
@@ -3878,6 +3955,16 @@ void TextureCache<P>::NoteNewSampledImage(ImageId image_id, GPUVAddr gpu_addr) {
              "Images deleted last 10 s by:{} | new sampled images whose previous image at that "
              "address was deleted by (not GPU-written/GPU-written):{} no earlier image there {}",
              deletes, remade, nx2_remade_unknown);
+    LOG_INFO(HW_GPU,
+             "Remaps (EXP76={}) last 10 s: {} images flagged remapped, {} kept in place; whole "
+             "uploads: {} hash checks, {} skipped as unchanged ({} KiB)",
+             VideoCore::Nx2Debug::Experiment(76), nx2_flagged_remapped, nx2_kept_after_remap,
+             nx2_upload_hash_checks, nx2_upload_skips, nx2_upload_skip_bytes >> 10);
+    nx2_flagged_remapped = 0;
+    nx2_kept_after_remap = 0;
+    nx2_upload_hash_checks = 0;
+    nx2_upload_skips = 0;
+    nx2_upload_skip_bytes = 0;
     nx2_deletes = {};
     nx2_remade_after = {};
     nx2_remade_unknown = 0;

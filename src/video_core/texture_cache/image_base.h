@@ -113,6 +113,10 @@ struct ImageBase {
     ImageInfo info;
 
     u32 guest_size_bytes = 0;
+    /// EXP76 & 2: CityHash128 of the guest bytes as they were when the image was last uploaded
+    /// whole (0/0: none). An upload whose guest bytes still hash the same is skipped.
+    u64 nx2_content_hash_lo = 0;
+    u64 nx2_content_hash_hi = 0;
     u32 unswizzled_size_bytes = 0;
     u32 converted_size_bytes = 0;
     u32 scale_rating = 0;

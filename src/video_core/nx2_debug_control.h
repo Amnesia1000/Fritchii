@@ -447,6 +447,16 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// collector's device memory figure, as deleted images waiting for the GPU are. Logs "Image pool
 /// (EXP42) last 600 frames" and counts pooled creates in "Slow clear texture cache". 1 is the default
 /// (LoadExperiments); 0 = off.
+/// EXP76 (live, bits; fable52_answer_keeptex 2a; TextureCache): kill frames remade textures the
+/// game already had (fight: 767 of 833 new sampled images in 10 s had bytes made before; a BC5
+/// 2448x3056 one 129 times). 1 = FindImage keeps an image the game's remap flagged when the same
+/// texture is asked for at the same GPU and device address with the same shape (never
+/// GPU-written, no alias or sparse state): no delete, create or new views; it is uploaded as a new
+/// one would be. 2 = whole uploads of 64 KiB or more store a CityHash128 of the guest bytes (read
+/// after the upload, dropped if the image was CPU-written meanwhile); the next whole upload whose
+/// bytes hash the same is skipped. Any other refresh path clears the hash. The
+/// EDEN_NX2_IMAGE_HASH_LOG=1 summary logs "Remaps (EXP76=n)": images flagged, kept, hash checks,
+/// uploads skipped. Off by default.
 /// EXP75 (live; us, 0 = off; fable52_answer_pipeline section 3; Core::Timing::CoreTiming's timer
 /// thread): precise guest timers. The thread spins the last this-many us before a precise event
 /// (the kernel's hardware timer: guest sleeps and timeouts, EventType::precise) instead of waking
