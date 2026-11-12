@@ -604,6 +604,15 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// and no run-ahead used this session. Equal but not safe: written as before. With
 /// EDEN_NX2_FASTDRAW_COUNT=1 equal writes are neutral for the count, and the 5 s line ends with
 /// how many changed nothing and how many were not written.
+/// EXP108 (live, 0 = off; port of zortos293/Lichii#1436 = #1161 4c44094e30, lucastaonline):
+/// the GPU's own cached writes (MemoryManager::FlushCaching: inline constant buffer data, its
+/// accumulated ranges) mark their pages CPU-modified but leave them tracked
+/// (MemoryTracker::MarkRegionAsWrittenTracked) instead of untracking them as a guest CPU write
+/// does; the upload clears the bits and has nothing to track again. Saves a VirtualProtect pair
+/// per page per write cycle (~4% of the GPU thread at OoT's Kokiri water, +1.4 fps on the
+/// author's PC). Only on pages with no GPU-modified range and no GPU-modified bit (a tracked
+/// page's GPU bits count); never in Nx2Perf verify. A guest CPU access to such a page takes the
+/// slow path, as for any tracked page; a guest write there untracks it as before.
 /// EXP101 (live, 0 = off, 1 = runs, 2 = cached page pointer + prefetch; fable52_answer_presenter): nvhost_gpu::SubmitGPFIFOImpl's pushbuffer
 /// snapshot reads runs of entries whose GPU addresses follow each other with one ReadBlockUnsafe
 /// instead of one per entry (OoT's presenting thread submits ~6,500 entries a frame; the loop is

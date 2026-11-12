@@ -170,6 +170,32 @@ struct WordManager {
         }
     }
 
+    /// EXP108 (zortos293/Lichii#1436, from #1161 4c44094e30): ChangeRegionState(Type::CPU, true,
+    /// ...) leaving the pages tracked (Untracked unchanged): pages tracked now stay tracked, so
+    /// clearing the bits at the upload tracks nothing again. Ours also moves dirty_gen where a
+    /// page gains its CPU bit (EDEN_NX2_STORAGE_SYNC_MEMO) and, with EXP48, drops the pages'
+    /// hot-clean bits, so an upload this frame doesn't pass them over.
+    void MarkWrittenTracked(u64 dirty_addr, u64 size) noexcept {
+        const bool hot_pages = HotPagesOn();
+        if (hot_pages) [[unlikely]] {
+            RefreshHotEpoch();
+        }
+        std::span<u64> cpu_words = Span(Type::CPU);
+        std::span<u64> cached_words = Span(Type::CachedCPU);
+        std::span<u64> hot_clean_words = Span(Type::HotClean);
+        IterateWords(dirty_addr - cpu_addr, size, [&](size_t index, u64 mask) {
+            if ((cpu_words[index] & mask) != mask) {
+                ++dirty_gen;
+            }
+            cpu_words[index] |= mask;
+            cached_words[index] &= ~mask;
+            if (hot_pages) [[unlikely]] {
+                hot_clean_words[index] &= ~mask;
+            }
+            NoteCleanWord(index);
+        });
+    }
+
     void ChangeRegionState(Type type, bool enable, u64 dirty_addr, u64 size) noexcept {
         // EXP48 off (the default): the walk without a hot-page span or branch (the code before
         // d20c32704c).

@@ -3543,10 +3543,11 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
     namespace CbPath = VideoCommon::Nx2CbPath;
     const int cb_path = CbPath::Mode();
     CbPath::MaybeLog(cb_path);
+    // FlushCaching's ranges are the GPU's own engines' writes (EXP108, zortos293/Lichii#1436).
     if ((cb_path & CbPath::SkipBit) == 0) {
         std::scoped_lock lock{buffer_cache.mutex};
         for (const auto& [addr, size] : sequences) {
-            buffer_cache.WriteMemory(addr, size);
+            buffer_cache.WriteMemory(addr, size, true, true);
         }
     } else {
         // EXP88 & 1 (zortos293/Lichii#1441 part c): ranges WriteMemory would change nothing in
@@ -3594,7 +3595,7 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
                 } else {
                     CbPath::Count(counters.locked);
                 }
-                buffer_cache.WriteMemory(range.first, range.second);
+                buffer_cache.WriteMemory(range.first, range.second, true, true);
             }
         }
     }

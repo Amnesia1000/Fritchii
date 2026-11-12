@@ -318,7 +318,8 @@ void BufferCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size
 }
 
 template <class P>
-void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu_data) {
+void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu_data,
+                                 bool engine_write) {
     Nx2NoteListHostWrite(device_addr, size);
     Core::g_buffer_write_pages.Mark(device_addr, size);
     Core::g_watch_write_pages.Mark(device_addr, size);
@@ -335,7 +336,17 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu
                                        !Tegra::Nx2MayBeGpuWritten(page_begin, page_end - page_begin);
         if (never_gpu_written || !gpu_modified_ranges.Intersects(page_begin, page_end - page_begin)) {
             if (!Nx2Perf::Verify()) {
-                memory_tracker.MarkRegionAsCpuModified(device_addr, size);
+                // EXP108 (zortos293/Lichii#1436, from #1161 4c44094e30): untracking the pages
+                // and tracking them again at the upload changed their host protection twice (two
+                // VirtualProtect calls each, ~4% of the GPU thread at OoT's water) for writes no
+                // guest CPU access saw. Ours also wants no GPU-modified bit on the pages: a
+                // tracked page's GPU bits count (an untracked one's are masked).
+                if (engine_write && VideoCore::Nx2Debug::Experiment(108) != 0 &&
+                    !memory_tracker.IsRegionGpuModified(page_begin, page_end - page_begin)) {
+                    memory_tracker.MarkRegionAsWrittenTracked(device_addr, size);
+                } else {
+                    memory_tracker.MarkRegionAsCpuModified(device_addr, size);
+                }
                 MarkVertexBuffersStale(device_addr, size);
                 return;
             }
