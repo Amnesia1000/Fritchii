@@ -36,6 +36,7 @@
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
+#include "video_core/memstage_stats.h"
 #include "video_core/shader_handle_program.h"
 #include "video_core/shader_notify.h"
 #include "video_core/texture_cache/texture_cache.h"
@@ -1468,6 +1469,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
         const auto read_handle{[&](const auto& desc, u32 index) {
             if (desc.handle_program != ~0U) {
+                // EDEN_NX2_MEMSTAGE_STATS: a handle program (its storage reads are not sized).
+                VideoCommon::MemStageStats::Read(VideoCommon::MemStageStats::Kind::HandleProgram,
+                                                 0);
                 // Read by the shader from a storage buffer: computed for this draw.
                 const auto evaluate{[&](u64 storage_alignment) {
                     return VideoCommon::EvaluateTextureHandle(
@@ -1516,9 +1520,15 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                     const u32 rhs_raw{gpu_memory->ReadHandleWord(separate_addr)
                                       << desc.secondary_shift_left};
                     const u32 raw{lhs_raw | rhs_raw};
+                    // EDEN_NX2_MEMSTAGE_STATS: two handle words.
+                    VideoCommon::MemStageStats::Read(VideoCommon::MemStageStats::Kind::HandleWord,
+                                                     2 * sizeof(u32), 2);
                     return TexturePair(raw, via_header_index);
                 }
             }
+            // EDEN_NX2_MEMSTAGE_STATS: one handle word.
+            VideoCommon::MemStageStats::Read(VideoCommon::MemStageStats::Kind::HandleWord,
+                                             sizeof(u32));
             return TexturePair(gpu_memory->ReadHandleWord(addr), via_header_index);
         }};
         const auto add_image{[&](const auto& desc, bool blacklist) LAMBDA_FORCEINLINE {

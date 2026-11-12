@@ -20,6 +20,7 @@
 #include "common/common_types.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/memstage_stats.h"
 #include "video_core/query_cache/frame_trace.h"
 #include "video_core/query_cache/query_cache.h"
 #include "video_core/rasterizer_interface.h"
@@ -1501,6 +1502,7 @@ void QueryCacheRuntime::HostConditionalRenderingCompareValueImpl(VideoCommon::Lo
         const auto post_op = VideoCommon::ObtainBufferOperation::DoNothing;
         const auto [buffer, offset] =
             impl->buffer_cache.ObtainCPUBuffer(object.address, 8, sync_info, post_op);
+        VideoCommon::MemStageStats::Read(VideoCommon::MemStageStats::Kind::QueryBuffer, 8);
         impl->hcr_buffer = buffer->Handle();
         impl->hcr_offset = offset;
     }
@@ -1536,6 +1538,8 @@ void QueryCacheRuntime::HostConditionalRenderingCompareBCImpl(DAddr address, boo
         const auto post_op = VideoCommon::ObtainBufferOperation::DoNothing;
         const auto [buffer, offset] =
             impl->buffer_cache.ObtainCPUBuffer(address, resolve_size, sync_info, post_op);
+        VideoCommon::MemStageStats::Read(VideoCommon::MemStageStats::Kind::QueryBuffer,
+                                         resolve_size);
         to_resolve = buffer->Handle();
         to_resolve_offset = static_cast<u32>(offset);
     }
@@ -1765,6 +1769,8 @@ void QueryCacheRuntime::SyncValues(std::span<SyncValuesType> values, VkBuffer ba
             const auto post_op = VideoCommon::ObtainBufferOperation::DoNothing;
             const auto [buffer, offset] = impl->buffer_cache.ObtainCPUBuffer(
                 pair.first, static_cast<u32>(pair.second - pair.first), sync_info, post_op);
+            VideoCommon::MemStageStats::Read(VideoCommon::MemStageStats::Kind::QueryBuffer,
+                                             pair.second - pair.first);
             impl->buffers_to_upload_to.emplace_back(buffer->Handle(), offset);
         }
     });

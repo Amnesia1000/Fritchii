@@ -38,6 +38,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/game_dlss_status.h"
 #include "video_core/memory_manager.h"
+#include "video_core/memstage_stats.h"
 #include "video_core/native_query_trace.h"
 #include "video_core/nx2_grid_taint.h"
 #include "video_core/nx2_list_dispatch.h"
@@ -842,6 +843,9 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                 running_descriptor = nullptr;
                 if (!memory_manager.IsFullyMappedRange(address, sizeof(descriptor))) return false;
                 memory_manager.ReadBlockUnsafe(address, descriptor.data(), sizeof(descriptor));
+                // EDEN_NX2_MEMSTAGE_STATS: the QMD (the memory stage would pass it by value).
+                VideoCommon::MemStageStats::Read(VideoCommon::MemStageStats::Kind::Qmd,
+                                                 sizeof(descriptor));
                 running_descriptor = &descriptor;
                 if (static u32 logged{}; (descriptor[53] & (1U << 23)) && logged < 8) {
                     ++logged;
@@ -2026,6 +2030,9 @@ void KeplerCompute::ProcessLaunch() {
     const GPUVAddr launch_desc_loc = regs.launch_desc_loc.Address();
     memory_manager.ReadBlockUnsafe(launch_desc_loc, &launch_description,
                                    LaunchParams::NUM_LAUNCH_PARAMETERS * sizeof(u32));
+    // EDEN_NX2_MEMSTAGE_STATS: the QMD.
+    VideoCommon::MemStageStats::Read(VideoCommon::MemStageStats::Kind::Qmd,
+                                     LaunchParams::NUM_LAUNCH_PARAMETERS * sizeof(u32));
     rasterizer->DispatchCompute();
 }
 

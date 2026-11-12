@@ -32,6 +32,7 @@
 #include "video_core/nx2_qmd_prediction.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/memory_manager.h"
+#include "video_core/memstage_stats.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cb_path.h"
 #include "video_core/nx2_cmdpage_diag.h"
@@ -699,6 +700,13 @@ void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods,
     }
     const VideoCommon::Nx2Profile::FineScope upload_scope{VideoCommon::Nx2Profile::Zone::CbUpload};
     const GPUVAddr destination = address + offset;
+    // EDEN_NX2_MEMSTAGE_STATS: constant buffer words (the slow paths above count each word in
+    // ProcessCBMultiData).
+    if (VideoCommon::MemStageStats::Enabled()) [[unlikely]] {
+        VideoCommon::MemStageStats::StreamWrite(
+            VideoCommon::MemStageStats::Write::CbWords,
+            memory_manager.GpuToCpuAddress(destination).value_or(0), bytes);
+    }
     // EXP88 & 2: through the bound buffer's device address, the device range logged for
     // FlushCaching, in place of CB_DIRECT's translation and the word-by-word accumulation.
     if (WriteBoundConstantBuffer(offset, values.data(), static_cast<u32>(bytes))) {
@@ -929,8 +937,14 @@ void Maxwell3D::ProcessQueryCondition() {
         VideoCommon::Nx2Profile::Zone::RenderEnable};
     if (rasterizer->AccelerateConditionalRendering()) {
         execute_on = true;
+        // EDEN_NX2_MEMSTAGE_STATS: decided by the host (the draws run predicated).
+        VideoCommon::MemStageStats::Condition(true, true);
         return;
     }
+    // EDEN_NX2_MEMSTAGE_STATS: decided here (the end of this function sets execute_on).
+    SCOPE_EXIT {
+        VideoCommon::MemStageStats::Condition(false, execute_on);
+    };
     const GPUVAddr condition_address{regs.render_enable.Address()};
     if (VideoCore::Nx2Debug::Experiment(53) != 0 &&
         regs.render_enable.mode >= Regs::RenderEnable::Mode::Conditional) {
@@ -1071,6 +1085,13 @@ void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
                             ? regs.const_buffer.size - regs.const_buffer.offset
                             : 0;
     const size_t write_size = std::min(copy_size, room / sizeof(u32) * sizeof(u32));
+    // EDEN_NX2_MEMSTAGE_STATS: constant buffer words, and whether they land on texture pages.
+    if (VideoCommon::MemStageStats::Enabled() && write_size != 0) [[unlikely]] {
+        VideoCommon::MemStageStats::StreamWrite(
+            VideoCommon::MemStageStats::Write::CbWords,
+            memory_manager.GpuToCpuAddress(buffer_address + regs.const_buffer.offset).value_or(0),
+            write_size);
+    }
     if (write_size != 0 && !WriteBoundConstantBuffer(regs.const_buffer.offset, start_base,
                                                      static_cast<u32>(write_size))) {
         const GPUVAddr address{buffer_address + regs.const_buffer.offset};
