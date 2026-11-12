@@ -669,6 +669,11 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// Vulkan only): the size up to which uniform buffers are streamed and reused instead of going
 /// through the cached buffers. OoT's skinned models bind 7-13 KiB bone palettes about 8 times a
 /// frame with the same bytes. Try 16384. The reuse store is sized for 16 KiB copies either way.
+/// EXP117 (live, 0 = off; TextureCache::RescaleRenderTargets; only matters above 1X): a pass
+/// with a square depth target and no colour target (a shadow map) is drawn unscaled. Scaling a
+/// shadow map does not sharpen the picture and costs the square of the scale in memory (OoT's
+/// 12288x12288 sun map: 648 MiB at 1.5x); the per-object maps stay square under Shadow Size
+/// Steps and EXP68, so they are left unscaled too. Switching it on scales such images down once.
 /// EXP101 (live, 0 = off, 1 = runs, 2 = cached page pointer + prefetch; fable52_answer_presenter): nvhost_gpu::SubmitGPFIFOImpl's pushbuffer
 /// snapshot reads runs of entries whose GPU addresses follow each other with one ReadBlockUnsafe
 /// instead of one per entry (OoT's presenting thread submits ~6,500 entries a frame; the loop is
