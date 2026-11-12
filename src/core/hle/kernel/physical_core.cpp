@@ -379,6 +379,17 @@ void PhysicalCore::Idle(KernelCore& kernel) {
 #else
         const KProcess* process = kernel.ApplicationProcess();
         spin_us = process != nullptr && process->IsSwitch2() ? 100 : 0;
+        // EXP113 (live; 1 = no poll, N > 1 = poll at most N us): OoT's guest cores idle many
+        // times a frame, and with SMT each one polling shares a physical core with our GPU
+        // threads. Measured elsewhere on the fountain lap at 1X: 100 us 52.2 fps, 25 us 57.7,
+        // 0 us 60.1 (5 and 10 us level with 0). Only when EDEN_NX2_IDLE_SPIN_US is not set.
+        if (spin_us > 0) {
+            constexpr u64 OcarinaOfTime = 0x0400486024DEC000ULL;
+            if (const int exp113 = VideoCore::Nx2Debug::Experiment(113);
+                exp113 > 0 && process->GetProgramId() == OcarinaOfTime) {
+                spin_us = exp113 == 1 ? 0 : exp113;
+            }
+        }
 #endif
     }
     if (VideoCore::Nx2Debug::Experiment(79) == 0) {

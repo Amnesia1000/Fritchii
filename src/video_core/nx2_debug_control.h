@@ -650,6 +650,11 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// write there arms them again). At the great fairy fountain one game job read ~16 such pages a
 /// frame, each a round trip (~0.4 ms). Check FRITCHII_READ_RUNS=1's "Read runs" line first: the
 /// run histogram says whether the reads have neighbours to take.
+/// EXP113 (live; 0 = off, 1 = no poll, N > 1 = poll at most N us; PhysicalCore::Idle): OoT's
+/// guest cores block at once when idle instead of polling for up to 100 us (EXP79's hardware wait
+/// or, without MONITORX/WAITPKG as on the owner's PC, a SwitchToThread loop; ~795 ms/s over six
+/// cores). With SMT those polls share physical cores with the GPU threads. Timing only. An
+/// explicit EDEN_NX2_IDLE_SPIN_US still wins.
 /// EXP101 (live, 0 = off, 1 = runs, 2 = cached page pointer + prefetch; fable52_answer_presenter): nvhost_gpu::SubmitGPFIFOImpl's pushbuffer
 /// snapshot reads runs of entries whose GPU addresses follow each other with one ReadBlockUnsafe
 /// instead of one per entry (OoT's presenting thread submits ~6,500 entries a frame; the loop is
