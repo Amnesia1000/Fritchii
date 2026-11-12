@@ -57,6 +57,11 @@ BufferCache<P>::BufferCache(Tegra::MaxwellDeviceMemoryManager& device_memory_, R
     // A new runtime has a new scheduler (its ticks restart) and a new stream buffer: whatever the
     // stream uniform reuse remembers refers to the old ones. Before the early return below.
     VideoCommon::ResetUniformStreamReuse<Runtime>();
+    // EXP86 (fable52_answer_gpuwritten 2.1): the page mirrors follow their range sets, and the
+    // mutex's release closes the counter a hold opened. Before any other thread sees the cache.
+    gpu_modified_ranges.Attach(&gpu_written_mirror.gpu_modified_pages, &gpu_written_mirror.seq);
+    read_trapped_ranges.AttachMirror(&gpu_written_mirror.trap_pages, &gpu_written_mirror.seq);
+    mutex.SetReleaseHook(&MirrorSeq::ReleaseHook, &gpu_written_mirror.seq);
     // Ensure the first slot is used for the null buffer
     void(slot_buffers.insert(runtime, NullBufferParams{}));
     gpu_modified_ranges.Clear();
@@ -160,6 +165,9 @@ void BufferCache<P>::TickFrame() {
         const u64 idle_frames = static_cast<u64>((std::max)(VideoCore::Nx2Debug::Experiment(81), 0));
         if (idle_frames == 0) {
             preflush_marked_ranges.ForEach([&](DAddr begin, DAddr end) {
+                // EXP86: the mirror bit goes before the tracker's (a mark missing early only
+                // sends a read to the locked path).
+                gpu_written_mirror.preflush_pages.Clear(begin, end - begin, gpu_written_mirror.seq);
                 memory_tracker.UnmarkRegionAsPreflushable(begin, end - begin);
                 preflush_reset_bytes += end - begin;
             });
@@ -177,6 +185,8 @@ void BufferCache<P>::TickFrame() {
                 }
             });
             for (const DAddr page : stale_pages) {
+                gpu_written_mirror.preflush_pages.Clear(page, Core::DEVICE_PAGESIZE,
+                                                        gpu_written_mirror.seq);
                 memory_tracker.UnmarkRegionAsPreflushable(page, Core::DEVICE_PAGESIZE);
                 preflush_marked_ranges.Subtract(page, Core::DEVICE_PAGESIZE);
                 preflush_read_frames.erase(page >> Core::DEVICE_PAGEBITS);
@@ -490,6 +500,11 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
         if (preflush) {
             memory_tracker.MarkRegionAsPreflushable(
                 device_addr_start_aligned, device_addr_end_aligned - device_addr_start_aligned);
+            // EXP86: the mirror bit after the tracker's (one missing late only sends a read to
+            // the locked path).
+            gpu_written_mirror.preflush_pages.Set(
+                device_addr_start_aligned, device_addr_end_aligned - device_addr_start_aligned,
+                gpu_written_mirror.seq);
             preflush_marked_ranges.Add(device_addr_start_aligned,
                                        device_addr_end_aligned - device_addr_start_aligned);
         } else {

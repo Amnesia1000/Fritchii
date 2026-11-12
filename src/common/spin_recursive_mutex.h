@@ -56,10 +56,27 @@ public:
         if (--depth != 0) {
             return;
         }
+        // Still held here: the hook runs as the holder's last act (the buffer cache's page
+        // mirrors close their sequence counter, EXP86). Null on every other mutex.
+        if (on_release != nullptr) [[unlikely]] {
+            on_release(on_release_context);
+        }
         owner.store(std::thread::id{}, std::memory_order_relaxed);
         if (state.exchange(0, std::memory_order_release) == 2) {
             state.notify_one();
         }
+    }
+
+    /// Called by the holder at each final unlock (depth back to 0), before the mutex is given up.
+    /// Set once, before the mutex is shared between threads; the hook must not lock this mutex.
+    void SetReleaseHook(void (*hook)(void*), void* context) {
+        on_release = hook;
+        on_release_context = context;
+    }
+
+    /// Whether the calling thread holds the mutex.
+    [[nodiscard]] bool IsHeldByCurrentThread() const {
+        return owner.load(std::memory_order_relaxed) == std::this_thread::get_id();
     }
 
 private:
@@ -102,6 +119,8 @@ private:
     std::atomic<std::uint32_t> state{0}; ///< 0 free, 1 held, 2 held with sleepers
     std::atomic<std::thread::id> owner{};
     std::uint32_t depth{}; ///< Recursion depth, touched only by the owner
+    void (*on_release)(void*){};
+    void* on_release_context{};
 };
 
 } // namespace Common

@@ -124,6 +124,9 @@ public:
     bool WaitFenceDownload(u64 sequence) override;
     /// GetFlushArea's answer under both caches' mutexes.
     VideoCore::RasterizerDownloadArea GetFlushAreaLocked(DAddr addr, u64 size);
+    /// GetFlushAreaLocked that also compares the buffer cache's page mirrors' answer with what
+    /// the locked path decides (EDEN_NX2_EXP86=2).
+    VideoCore::RasterizerDownloadArea GetFlushAreaLockedVerifyMirror(DAddr addr, u64 size);
     bool HasPendingQueries(DAddr addr, u64 size) override;
     bool HasCachedReports(DAddr addr, u64 size) override;
     void InvalidateRegion(DAddr addr, u64 size,

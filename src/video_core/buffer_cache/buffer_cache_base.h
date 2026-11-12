@@ -40,6 +40,7 @@
 #include "core/gpu_dirty_memory_manager.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/buffer_cache/buffer_base.h"
+#include "video_core/buffer_cache/gpu_written_mirror.h"
 #include "video_core/buffer_cache/read_trap_tracker.h"
 #include "video_core/buffer_cache/virtual_range_cache.h"
 #include "video_core/control/channel_state_cache.h"
@@ -540,6 +541,54 @@ public:
     }
 
     Common::SpinRecursiveMutex mutex;
+    /// EXP86 (fable52_answer_gpuwritten): per-page mirrors of gpu_modified_ranges, the tracker's
+    /// Preflushable bits and read_trapped_ranges, all changed under `mutex`, with a sequence
+    /// counter that is odd from a hold's first change to its release (the mutex's release hook).
+    GpuWrittenMirror gpu_written_mirror{mutex};
+
+    /// EXP86: what the locked GetFlushArea would do for a guest read of [addr, addr + size), from
+    /// the mirrors and without the lock. Clean: it would answer the preemptive page-aligned area
+    /// and change nothing (EXP81's stamps aside). Anything else: take the locked path.
+    [[nodiscard]] MirrorAnswer MirrorCleanForRead(DAddr addr, u64 size) const {
+        if (!PageBitmap::InRange(Common::AlignDown(addr, Core::DEVICE_PAGESIZE),
+                                 Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE) -
+                                     Common::AlignDown(addr, Core::DEVICE_PAGESIZE))) {
+            return MirrorAnswer::Broken;
+        }
+        const u64 seq = gpu_written_mirror.seq.Load();
+        if ((seq & 1) != 0) {
+            return MirrorAnswer::Busy;
+        }
+        const DAddr begin = Common::AlignDown(addr, Core::DEVICE_PAGESIZE);
+        const u64 length = Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE) - begin;
+        const bool modified = gpu_written_mirror.gpu_modified_pages.Any(begin, length);
+        // "Any page", as IsRegionPreflushable asks.
+        const bool marked = gpu_written_mirror.preflush_pages.Any(begin, length);
+        const bool armed = gpu_written_mirror.trap_pages.Any(begin, length);
+        if (gpu_written_mirror.seq.Load() != seq) {
+            return MirrorAnswer::Busy;
+        }
+        if (gpu_written_mirror.seq.Broken()) {
+            return MirrorAnswer::Broken;
+        }
+        if (modified) {
+            return MirrorAnswer::Modified;
+        }
+        if (armed && !marked) {
+            return MirrorAnswer::ArmedUnmarked;
+        }
+        return MirrorAnswer::Clean;
+    }
+
+    /// EXP86 verify (`mutex` held, before GetFlushArea): whether GetFlushArea leaves the read
+    /// traps alone for this read: a Preflushable mark on its pages, or nothing armed there.
+    [[nodiscard]] bool ReadLeavesTrapsAlone(DAddr addr, u64 size) {
+        const DAddr begin = Common::AlignDown(addr, Core::DEVICE_PAGESIZE);
+        const DAddr end = Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE);
+        return memory_tracker.IsRegionPreflushable(addr, size) ||
+               !read_trapped_ranges.Intersects(begin, end - begin);
+    }
+
     Runtime& runtime;
     bool any_buffer_uploaded = false;
     /// The guest words of each page of native programs' indirectly read banks when last checked:
@@ -1138,7 +1187,8 @@ public:
 private:
     u64 preflush_resets{};
     bool download_cpu_read_ranges{};
-    Common::RangeSet<DAddr> gpu_modified_ranges;
+    /// Keeps gpu_written_mirror.gpu_modified_pages (EXP86) at every Add, Subtract and Clear.
+    MirroredRangeSet<DAddr> gpu_modified_ranges;
     std::deque<Common::RangeSet<DAddr>> committed_gpu_modified_ranges;
 
     // Async Buffers

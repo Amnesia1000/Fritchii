@@ -471,6 +471,15 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// limit. EDEN_NX2_IDLE_STATS=1 logs each core's idle periods every 10 s (polled, blocked, wake
 /// latency). Blocking still uses EDEN_NX2_CORE_LOCK's address wait when that is on. In OoT the
 /// guest threads' handoffs sit on the frame's critical path. Off by default.
+/// EXP86 (live, 0 = off; fable52_answer_gpuwritten; RasterizerVulkan::GetFlushArea): a guest
+/// read of pages the GPU ever wrote (no image there, EXP36 and EXP81 off) skips the caches' locks
+/// when the buffer cache's page mirrors (gpu_written_mirror.h) say the locked path would answer
+/// "preemptive" and change nothing: no GPU-modified byte on the pages now, and a Preflushable
+/// mark or no armed read trap there. The mirrors change only under the buffer cache's mutex; a
+/// sequence counter is odd from a hold's first change to its release, and a busy counter sends
+/// the read to the locks. 1 = the fast path; 2 = verify: locked reads compare the mirrors' answer
+/// with what the locked path decides ("mirror clean but cache not" must stay 0), no fast answers.
+/// "GPU-written page mirror" logs the answers every 5 s, also while off.
 /// EXP85 (live, bits, 0 = off; fable52_answer_microcuts 1 and 2b): 1 = a small inline upload to
 /// pages no GPU write ever marked skips the buffer cache's lock (InlineMemory would find nothing
 /// there; the list note and the query cache as before), 2 = BufferCache::WriteMemory answers
