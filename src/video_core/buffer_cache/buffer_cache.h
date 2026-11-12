@@ -152,6 +152,16 @@ void BufferCache<P>::TickFrame() {
             LOG_INFO(HW_GPU, "Memory trace: buffer cache {} MiB", buffer_bytes >> 20);
         }
     }
+    // EXP81 (fable52_answer_fences2 2): every frame, the marked pages read since the last frame
+    // (both read paths set preflush_read_pages, with or without the lock) get this frame's stamp.
+    if (VideoCore::Nx2Debug::Experiment(81) > 0 && VideoCore::Nx2Debug::Experiment(69) > 0 &&
+        !preflush_marked_ranges.Empty()) {
+        preflush_marked_ranges.ForEach([&](DAddr begin, DAddr end) {
+            preflush_read_pages.Take(begin, end - begin, [&](u64 page) {
+                preflush_read_frames[page >> Core::DEVICE_PAGEBITS] = frame_tick;
+            });
+        });
+    }
     // EDEN_NX2_EXP69 (live, frames, 0 = off; fable52_answer_stalls 5.1): Preflushable marks never
     // cleared, so every later GPU write to a page the CPU once read was downloaded at its fence
     // (night market: ~100 MB in ~8,200 copies a second). Every N frames the marks go; a range the
@@ -483,12 +493,11 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
     if (DownloadReadStats::g_enabled) [[unlikely]] {
         DownloadReadStats::Read(device_addr_start_aligned, device_addr_end_aligned);
     }
-    // EXP81: the frame of each page's last CPU read, for the aged Preflushable reset (TickFrame).
+    // EXP81 (fable52_answer_fences2 2): this read's pages, stamped by TickFrame's fold. The
+    // lock-free clean answer (MirrorCleanForRead) sets them too, so EXP86 sees every read.
     if (VideoCore::Nx2Debug::Experiment(81) > 0) [[unlikely]] {
-        for (DAddr page = device_addr_start_aligned; page < device_addr_end_aligned;
-             page += Core::DEVICE_PAGESIZE) {
-            preflush_read_frames[page >> Core::DEVICE_PAGEBITS] = frame_tick;
-        }
+        preflush_read_pages.Set(device_addr_start_aligned,
+                                device_addr_end_aligned - device_addr_start_aligned);
     }
     const bool preflushable = memory_tracker.IsRegionPreflushable(device_addr, size);
     // EDEN_NX2_EXP49: all of the area's GPU-modified bytes on their way for an earlier read. No
@@ -1761,7 +1770,14 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
     }
     Nx2Profile::Add(Nx2Profile::Counter::DownloadBytes, total_size_bytes);
     Nx2Profile::Add(Nx2Profile::Counter::DownloadCopies, downloads.size());
+    // EDEN_NX2_BACK_FENCE_STATS (fable52_answer_fences2 4): the staging buffer's part of the fence.
+    const bool time_staging = VideoCore::Nx2Debug::BackFenceStats();
+    const auto staging_start = time_staging ? FenceReleaseStats::Clock::now()
+                                            : FenceReleaseStats::Clock::time_point{};
     auto download_staging = runtime.DownloadStagingBuffer(total_size_bytes, true);
+    if (time_staging) [[unlikely]] {
+        FenceReleaseStats::BackFence::t_staging_ns += FenceReleaseStats::NsSince(staging_start);
+    }
     boost::container::small_vector<BufferCopy, 4> normalized_copies;
     Common::RangeSet<DAddr> download_ranges;
     runtime.PreCopyBarrier();
@@ -1916,7 +1932,15 @@ void BufferCache<P>::PopAsyncBuffers() {
         // This runs on the fencing thread while the CPU keeps writing: CPU writes collected since
         // the copy was taken are newer than it, and the GPU thread hasn't dropped them from
         // `ranges` yet.
+        // EDEN_NX2_FENCE_RELEASE_STATS (fable52_answer_fences2 3): the two parts that can wait.
+        const bool time_parts = FenceReleaseStats::g_enabled;
+        auto part_start = time_parts ? FenceReleaseStats::Clock::now()
+                                     : FenceReleaseStats::Clock::time_point{};
         const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
+        if (time_parts) [[unlikely]] {
+            FenceReleaseStats::t_pop_parts.pending_ns += FenceReleaseStats::NsSince(part_start);
+            ++FenceReleaseStats::t_pop_parts.pending_calls;
+        }
         for (size_t index = first; index < last; ++index) {
             const auto& copy = downloads[index];
             const DAddr device_addr = static_cast<DAddr>(copy.src_offset);
@@ -1925,8 +1949,16 @@ void BufferCache<P>::PopAsyncBuffers() {
             // Only what no write replaced since the copy was taken: the rest is older than guest
             // memory (CPU writes) or than the GPU's copy (GPU writes, still to be downloaded).
             ranges.ForEachInRange(device_addr, copy.size, [&](DAddr start, DAddr end) {
+                if (time_parts) [[unlikely]] {
+                    part_start = FenceReleaseStats::Clock::now();
+                }
                 WriteDownloadedMemory(cpu_written, start, &read_mapped_memory[start - device_addr],
                                       end - start);
+                if (time_parts) [[unlikely]] {
+                    FenceReleaseStats::t_pop_parts.write_ns +=
+                        FenceReleaseStats::NsSince(part_start);
+                    ++FenceReleaseStats::t_pop_parts.writes;
+                }
                 gpu_modified_ranges.Subtract(start, end - start);
                 if (DownloadReadStats::g_enabled) [[unlikely]] {
                     stats_landed.emplace_back(start, end);

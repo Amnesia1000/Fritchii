@@ -105,17 +105,26 @@ public:
         // EDEN_NX2_EXP28 (zortos293/Lichii#717 FENCE_TRIM, FENCE_FOLD), one value per fence.
         const int fence_trims = VideoCore::Nx2Debug::Experiment(28);
         const bool trim = (fence_trims & 1) != 0;
+        // EDEN_NX2_BACK_FENCE_STATS (fable52_answer_fences2 4): this fence's parts, timed.
+        namespace BackFence = FenceReleaseStats::BackFence;
+        BackFence::Timer stats_timer{VideoCore::Nx2Debug::BackFenceStats()};
         if constexpr (!can_async_check) {
             TryReleasePendingFences<false>();
         }
+        stats_timer.BeginCommit();
         auto [should_flush, committed_flushes] = CommitCacheFlushes();
+        stats_timer.EndCommit();
         if (Nx2Profile::Enabled()) [[unlikely]] {
             NoteFenceDecision(delay_fence, committed_flushes, trim);
         }
         if (!delay_fence && committed_flushes == 0 && SkipEmptyFence(trim)) {
             Nx2Profile::Scope skipped_scope{Nx2Profile::Zone::FenceSkipped};
+            stats_timer.Skip();
             func();
+            stats_timer.Mark(BackFence::Operation);
             rasterizer.InvalidateGPUCache();
+            stats_timer.Mark(BackFence::Invalidate);
+            stats_timer.Done(BackFence::Kind::Skipped, true, false);
             return;
         }
         skipped_fences = 0;
@@ -127,19 +136,28 @@ public:
             if ((fence_trims & 2) != 0 && !should_flush && committed_flushes == 0) {
                 // As the made fence below: its callback runs now, before its queued work.
                 if (!delay_fence) {
+                    stats_timer.Skip();
                     func();
+                    stats_timer.Mark(BackFence::Operation);
                 }
                 FoldStubbedFence(delay_fence, func);
                 if (delay_fence) {
+                    stats_timer.Skip();
                     SubmitDeferredWork();
+                    stats_timer.Mark(BackFence::SubmitDeferred);
                 }
+                stats_timer.Skip();
                 rasterizer.InvalidateGPUCache();
+                stats_timer.Mark(BackFence::Invalidate);
+                stats_timer.Done(BackFence::Kind::Folded, true, false);
                 return;
             }
         }
         TFence new_fence = CreateFence(!should_flush);
         if constexpr (can_async_check) {
+            stats_timer.Skip();
             guard.lock();
+            stats_timer.Mark(BackFence::Guard);
         }
         {
             std::scoped_lock lock{uncommitted_guard};
@@ -154,13 +172,17 @@ public:
         }
         QueueFence(new_fence);
         if (!delay_fence) {
+            stats_timer.Skip();
             func();
+            stats_timer.Mark(BackFence::Operation);
         }
         fences.push(std::move(new_fence));
         fences_in_flight.fetch_add(1, std::memory_order_relaxed);
         work_epoch.fetch_add(1, std::memory_order_release);
         if (should_flush) {
+            stats_timer.Skip();
             rasterizer.FlushCommands();
+            stats_timer.Mark(BackFence::FlushCommands);
         }
         if constexpr (can_async_check) {
             guard.unlock();
@@ -171,9 +193,14 @@ public:
             // guest or WaitPendingFences may block on that callback: a submission left for
             // later (Scheduler::DeferFlush) would wait for the back to go idle, which it then
             // never does (GPU accuracy switched to High while the game ran, 24 s and more).
+            stats_timer.Skip();
             SubmitDeferredWork();
+            stats_timer.Mark(BackFence::SubmitDeferred);
         }
+        stats_timer.Skip();
         rasterizer.InvalidateGPUCache();
+        stats_timer.Mark(BackFence::Invalidate);
+        stats_timer.Done(BackFence::Kind::Made, committed_flushes == 0, should_flush);
     }
 
     void SignalSyncPoint(u32 value) {

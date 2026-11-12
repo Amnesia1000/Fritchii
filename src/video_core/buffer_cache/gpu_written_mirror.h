@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <memory>
 
 #include "common/alignment.h"
@@ -107,6 +108,71 @@ public:
 
     [[nodiscard]] static bool InRange(u64 address, u64 size) {
         return size != 0 && address + size > address && ((address + size - 1) >> PageBits) < NumPages;
+    }
+
+private:
+    std::unique_ptr<std::atomic<u64>[]> words;
+};
+
+/// EXP81 (fable52_answer_fences2 2): one bit per 4 KiB device page the guest read since the
+/// last fold, PageBitmap's shape. Set without any lock by both read paths (the locked
+/// GetFlushArea and EXP86's lock-free clean answer), taken under the buffer cache's mutex by
+/// TickFrame. No sequence counter: a bit seen one fold late only stamps its page a frame later,
+/// and an unmark that comes too early costs one on-demand flush.
+class ReadPageBitmap {
+public:
+    static constexpr u64 PageBits = PageBitmap::PageBits;
+    static constexpr u64 NumPages = PageBitmap::NumPages;
+    static constexpr u64 NumWords = PageBitmap::NumWords;
+
+    ReadPageBitmap() : words{std::make_unique<std::atomic<u64>[]>(NumWords)} {}
+
+    /// Sets the bits of the pages [address, address + size) touches (out of range: nothing).
+    void Set(u64 address, u64 size) {
+        if (size == 0 || address + size < address) {
+            return;
+        }
+        const u64 first = address >> PageBits;
+        const u64 last = (address + size - 1) >> PageBits;
+        if (last >= NumPages) {
+            return;
+        }
+        for (u64 page = first; page <= last;) {
+            const u64 bit = page % 64;
+            const u64 count = (std::min<u64>)(64 - bit, last - page + 1);
+            const u64 mask = (count == 64 ? ~u64{0} : (u64{1} << count) - 1) << bit;
+            auto& word = words[page / 64];
+            if ((word.load(std::memory_order_relaxed) & mask) != mask) {
+                word.fetch_or(mask, std::memory_order_relaxed);
+            }
+            page += count;
+        }
+    }
+
+    /// Clears the set bits of the pages [address, address + size) touches and calls
+    /// func(page address) for each of them.
+    template <typename Func>
+    void Take(u64 address, u64 size, Func&& func) {
+        if (size == 0 || address + size < address) {
+            return;
+        }
+        const u64 first = address >> PageBits;
+        const u64 last = (std::min<u64>)((address + size - 1) >> PageBits, NumPages - 1);
+        for (u64 page = first; page <= last;) {
+            const u64 bit = page % 64;
+            const u64 count = (std::min<u64>)(64 - bit, last - page + 1);
+            const u64 mask = (count == 64 ? ~u64{0} : (u64{1} << count) - 1) << bit;
+            auto& word = words[page / 64];
+            if ((word.load(std::memory_order_relaxed) & mask) != 0) {
+                u64 taken = word.fetch_and(~mask, std::memory_order_relaxed) & mask;
+                while (taken != 0) {
+                    const u64 index = static_cast<u64>(std::countr_zero(taken));
+                    func(((page / 64) * 64 + index) << PageBits);
+                    taken &= taken - 1;
+                }
+            }
+            page += count;
+        }
     }
 
 private:

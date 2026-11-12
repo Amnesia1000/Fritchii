@@ -55,6 +55,7 @@
 #include "video_core/nx2_runahead.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_async_readback.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_download_trace.h"
 #include "video_core/rasterizer_download_area.h"
 #include "video_core/surface.h"
@@ -594,7 +595,7 @@ public:
 
     /// EXP86: what the locked GetFlushArea would do for a guest read of [addr, addr + size), from
     /// the mirrors and without the lock. Clean: it would answer the preemptive page-aligned area
-    /// and change nothing (EXP81's stamps aside). Anything else: take the locked path.
+    /// and change nothing (EXP81's read bits aside). Anything else: take the locked path.
     [[nodiscard]] MirrorAnswer MirrorCleanForRead(DAddr addr, u64 size) const {
         if (!PageBitmap::InRange(Common::AlignDown(addr, Core::DEVICE_PAGESIZE),
                                  Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE) -
@@ -626,6 +627,10 @@ public:
         // F2 counter: a read answered here skips GetFlushArea (verify mode's calls are reads too).
         if (DownloadReadStats::g_enabled) [[unlikely]] {
             DownloadReadStats::Read(begin, begin + length);
+        }
+        // EXP81 (fable52_answer_fences2 2): this read's pages, for TickFrame's read stamps.
+        if (VideoCore::Nx2Debug::Experiment(81) > 0) [[unlikely]] {
+            preflush_read_pages.Set(begin, length);
         }
         return MirrorAnswer::Clean;
     }
@@ -1193,9 +1198,13 @@ private:
     /// EXP69: the ranges GetFlushArea marked Preflushable since the last reset.
     Common::RangeSet<DAddr> preflush_marked_ranges;
     u64 preflush_reset_bytes{};
-    /// EXP81: frame_tick of each device page's last CPU read (GetFlushArea), and bytes the aged
-    /// reset kept marked because they were read within the last EXP81 frames.
+    /// EXP81: frame_tick of each marked device page's last CPU read (folded from
+    /// preflush_read_pages by TickFrame), and bytes the aged reset kept marked because they were
+    /// read within the last EXP81 frames.
     std::unordered_map<u64, u64> preflush_read_frames;
+    /// EXP81 (fable52_answer_fences2 2): pages guest reads asked about since the last fold, set
+    /// by GetFlushArea and MirrorCleanForRead's clean answer (no lock there, hence mutable).
+    mutable ReadPageBitmap preflush_read_pages;
     u64 preflush_kept_bytes{};
     /// fable52_answer_bosswave 3 (counter before the change): preflushed reads that flush
     /// although every GPU-modified byte of theirs is in a fence download already on its way
