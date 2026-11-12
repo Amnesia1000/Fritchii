@@ -279,7 +279,12 @@ void BufferCache<P>::TickFrame() {
     AdvanceUniformCacheHistory(channel_state->uniform_cache_shots);
 
     const bool skip_preferred = hits * 256 < shots * 251;
-    channel_state->uniform_buffer_skip_cache_size = skip_preferred ? DEFAULT_SKIP_CACHE_SIZE : 0;
+    // EXP116: a larger stream size on Vulkan (OpenGL's fast uniform buffers hold 4 KiB).
+    u32 stream_max = DEFAULT_SKIP_CACHE_SIZE;
+    if constexpr (!IS_OPENGL) {
+        stream_max = VideoCommon::UniformStreamMaxBytes();
+    }
+    channel_state->uniform_buffer_skip_cache_size = skip_preferred ? stream_max : 0;
 
     // If we can obtain the memory info, use it instead of the estimate.
     if (runtime.CanReportMemoryUsage()) {
@@ -2889,8 +2894,8 @@ bool BufferCache<P>::BindSmallUniformKeeping(size_t stage, u32 index, u32 bindin
             }
             keeps.mode = mode;
         }
-        if (mode == 0 || size == 0 || size > Reuse::MaxBytes || stage >= Keeps::NumStages ||
-            index >= Keeps::NumSlots) {
+        if (mode == 0 || size == 0 || size > VideoCommon::UniformStreamMaxBytes() ||
+            stage >= Keeps::NumStages || index >= Keeps::NumSlots) {
             return bind_normally();
         }
         typename Keeps::Totals& totals = keeps.totals;

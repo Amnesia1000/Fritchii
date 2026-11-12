@@ -650,6 +650,30 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// write there arms them again). At the great fairy fountain one game job read ~16 such pages a
 /// frame, each a round trip (~0.4 ms). Check FRITCHII_READ_RUNS=1's "Read runs" line first: the
 /// run histogram says whether the reads have neighbours to take.
+/// EXP113 (live; 0 = off, 1 = no poll, N > 1 = poll at most N us; PhysicalCore::Idle): OoT's
+/// guest cores block at once when idle instead of polling for up to 100 us (EXP79's hardware wait
+/// or, without MONITORX/WAITPKG as on the owner's PC, a SwitchToThread loop; ~795 ms/s over six
+/// cores). With SMT those polls share physical cores with the GPU threads. Timing only. An
+/// explicit EDEN_NX2_IDLE_SPIN_US still wins.
+/// EXP114 (live; 0 = off, N > 0 = N us; gpu_thread.cpp): while channels wait on semaphores, the
+/// GPU front polls them with a SwitchToThread between polls for 500 us after the last progress.
+/// With N it waits N us with PAUSE instead, polling less often and leaving its SMT sibling free.
+/// Measured elsewhere at the market: 2 us best (1, 5, 10, 20 less). Not under EDEN_NX2_GPU_WAKE,
+/// whose wait is in hardware already. Timing only.
+/// EXP115 (live; 0 = off, 1 = after 8 misses, N > 1 = after N; uniform_stream_reuse.h): a
+/// (stage, constant buffer) slot whose streamed bytes differed from its copy that many binds in a
+/// row copies guest memory straight into the stream buffer for its next 64 binds: no compares,
+/// no extra copy into the reuse store. Exact (a stream copy of guest memory, as with reuse off);
+/// it only gives up rebinds those 64 binds could have found.
+/// EXP116 (live, read each frame; 0 = 4096 bytes as before, N = N bytes from 256 to 16384;
+/// Vulkan only): the size up to which uniform buffers are streamed and reused instead of going
+/// through the cached buffers. OoT's skinned models bind 7-13 KiB bone palettes about 8 times a
+/// frame with the same bytes. Try 16384. The reuse store is sized for 16 KiB copies either way.
+/// EXP117 (live, 0 = off; TextureCache::RescaleRenderTargets; only matters above 1X): a pass
+/// with a square depth target and no colour target (a shadow map) is drawn unscaled. Scaling a
+/// shadow map does not sharpen the picture and costs the square of the scale in memory (OoT's
+/// 12288x12288 sun map: 648 MiB at 1.5x); the per-object maps stay square under Shadow Size
+/// Steps and EXP68, so they are left unscaled too. Switching it on scales such images down once.
 /// EXP101 (live, 0 = off, 1 = runs, 2 = cached page pointer + prefetch; fable52_answer_presenter): nvhost_gpu::SubmitGPFIFOImpl's pushbuffer
 /// snapshot reads runs of entries whose GPU addresses follow each other with one ReadBlockUnsafe
 /// instead of one per entry (OoT's presenting thread submits ~6,500 entries a frame; the loop is
