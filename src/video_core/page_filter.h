@@ -69,4 +69,63 @@ private:
     std::atomic<bool> overflow{};
 };
 
+/// EXP84 (fable52_answer_microcuts 3.4): how many registered objects cover each 64 KiB page now,
+/// so "nothing here now" is answered without the cache's lock. PageFilter's bits never clear, and
+/// the game's render targets move every frame, so its bits pile up over memory that holds no image
+/// any more. Add at register, Remove at unregister with the same range. Conservative: a page any
+/// object touches counts it; out of range answers "maybe".
+class CountingPageFilter {
+public:
+    CountingPageFilter() : counts{std::make_unique<std::atomic<u32>[]>(NumPages)} {}
+
+    void Add(u64 address, u64 size) {
+        Update(address, size, true);
+    }
+    void Remove(u64 address, u64 size) {
+        Update(address, size, false);
+    }
+
+    [[nodiscard]] bool Any(u64 address, u64 size) const {
+        if (size == 0) {
+            return false;
+        }
+        const u64 first = address >> PageBits;
+        const u64 last = (address + size - 1) >> PageBits;
+        if (last >= NumPages || overflow.load(std::memory_order_relaxed)) {
+            return true;
+        }
+        for (u64 page = first; page <= last; ++page) {
+            if (counts[page].load(std::memory_order_acquire) != 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+private:
+    void Update(u64 address, u64 size, bool add) {
+        if (size == 0) {
+            return;
+        }
+        const u64 first = address >> PageBits;
+        const u64 last = (address + size - 1) >> PageBits;
+        if (last >= NumPages) {
+            overflow.store(true, std::memory_order_relaxed);
+            return;
+        }
+        for (u64 page = first; page <= last; ++page) {
+            if (add) {
+                counts[page].fetch_add(1, std::memory_order_release);
+            } else {
+                counts[page].fetch_sub(1, std::memory_order_release);
+            }
+        }
+    }
+
+    static constexpr u64 PageBits = 16;
+    static constexpr u64 NumPages = u64{1} << (36 - PageBits); // 1 Mi counters, 4 MiB
+    std::unique_ptr<std::atomic<u32>[]> counts;
+    std::atomic<bool> overflow{};
+};
+
 } // namespace VideoCommon

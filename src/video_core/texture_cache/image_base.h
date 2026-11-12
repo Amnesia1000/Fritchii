@@ -117,6 +117,10 @@ struct ImageBase {
     /// whole (0/0: none). An upload whose guest bytes still hash the same is skipped.
     u64 nx2_content_hash_lo = 0;
     u64 nx2_content_hash_hi = 0;
+    /// EXP84: the range RegisterImage counted in image_count_filter (UnregisterImage removes
+    /// exactly this one, whatever cpu_addr or the size say by then).
+    u64 nx2_counted_addr = 0;
+    u64 nx2_counted_size = 0;
     u32 unswizzled_size_bytes = 0;
     u32 converted_size_bytes = 0;
     u32 scale_rating = 0;

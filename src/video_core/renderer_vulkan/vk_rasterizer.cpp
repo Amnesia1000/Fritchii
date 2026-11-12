@@ -2737,6 +2737,11 @@ struct GuestAccessCounters {
     std::atomic<u64> read_locked{};
     std::atomic<u64> read_flush{};
     std::atomic<u64> write_locked{};
+    /// Why a read took the locked path (fable52_answer_microcuts 3.4): an image registered there
+    /// now, one only ever (EXP84's count is 0), and pages the GPU ever wrote.
+    std::atomic<u64> locked_image_now{};
+    std::atomic<u64> locked_image_ever{};
+    std::atomic<u64> locked_gpu_written{};
     std::atomic<s64> last_log{};
 };
 GuestAccessCounters g_guest_access;
@@ -2763,6 +2768,11 @@ void CountGuestAccess(std::atomic<u64>& counter) {
              Tegra::g_nx2_guest_reads_handed.exchange(0, std::memory_order_relaxed),
              c.write_locked.exchange(0),
              Tegra::g_nx2_guest_writes_collected.exchange(0, std::memory_order_relaxed));
+    LOG_INFO(Render_Vulkan,
+             "Guest reads locked because (5 s, EXP84={}): an image registered there now {}, an "
+             "image only ever {}, GPU-written pages {}",
+             VideoCore::Nx2Debug::Experiment(84), c.locked_image_now.exchange(0),
+             c.locked_image_ever.exchange(0), c.locked_gpu_written.exchange(0));
 }
 } // Anonymous namespace
 
@@ -2778,15 +2788,33 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
     // and the locked path would answer this same preemptive page-aligned area.
     const DAddr page_begin = Common::AlignDown(addr, Core::DEVICE_PAGESIZE);
     const DAddr page_end = Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE);
+    // EDEN_NX2_EXP84 (live, 0 = off; fable52_answer_microcuts 3.4): "no image here" from the count
+    // of images registered now (and the pages sparse images ever covered) instead of page_filter,
+    // whose bits never clear: the game's targets move every frame and leave them behind. An image
+    // the GPU wrote and the read must see is registered when the read comes (the fence ordering
+    // that makes page_filter's answer valid makes the count's valid too).
+    const bool by_count = VideoCore::Nx2Debug::Experiment(84) != 0;
+    const bool image_now = texture_cache.image_count_filter.Any(addr, size) ||
+                           texture_cache.sparse_page_filter.Any(addr, size);
+    const bool image_ever = texture_cache.page_filter.Any(addr, size);
+    const bool gpu_written = MayBeGpuModified(page_begin, page_end - page_begin);
     // EDEN_NX2_EXP36=1 turns this off (live), for the washed-out scene hunt.
-    if (VideoCore::Nx2Debug::Experiment(36) == 0 && !texture_cache.page_filter.Any(addr, size) &&
-        !MayBeGpuModified(page_begin, page_end - page_begin)) {
+    if (VideoCore::Nx2Debug::Experiment(36) == 0 && !(by_count ? image_now : image_ever) &&
+        !gpu_written) {
         CountGuestAccess(g_guest_access.read_fast);
         return VideoCore::RasterizerDownloadArea{
             .start_address = page_begin,
             .end_address = page_end,
             .preemtive = true,
         };
+    }
+    if (image_now) {
+        g_guest_access.locked_image_now.fetch_add(1, std::memory_order_relaxed);
+    } else if (image_ever) {
+        g_guest_access.locked_image_ever.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (gpu_written) {
+        g_guest_access.locked_gpu_written.fetch_add(1, std::memory_order_relaxed);
     }
     // EDEN_NX2_EXP60=1: the back holds both mutexes through bursts of draws and re-takes them right
     // after each release, so a guest read waiting for them slept for milliseconds (Fable answer

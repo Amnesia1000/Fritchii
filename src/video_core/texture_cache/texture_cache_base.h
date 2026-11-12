@@ -244,6 +244,10 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
 public:
     /// Device pages this cache ever registered objects on (InnerInvalidation skips the rest).
     VideoCommon::PageFilter page_filter;
+    /// EXP84: images registered now (non-sparse: count up at RegisterImage, down at
+    /// UnregisterImage), and the pages sparse images ever covered (never cleared).
+    VideoCommon::CountingPageFilter image_count_filter;
+    VideoCommon::PageFilter sparse_page_filter;
 
     explicit TextureCache(Runtime&, Tegra::MaxwellDeviceMemoryManager&);
 

@@ -471,6 +471,13 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// limit. EDEN_NX2_IDLE_STATS=1 logs each core's idle periods every 10 s (polled, blocked, wake
 /// latency). Blocking still uses EDEN_NX2_CORE_LOCK's address wait when that is on. In OoT the
 /// guest threads' handoffs sit on the frame's critical path. Off by default.
+/// EXP84 (live, 0 = off; fable52_answer_microcuts 3.4; RasterizerVulkan::GetFlushArea): a guest
+/// read skips the caches' locks when no image is registered on its pages now (TextureCache::
+/// image_count_filter, counted at register and unregister, plus the pages sparse images ever
+/// covered) instead of never (page_filter, whose bits never clear while the game's targets move
+/// every frame) and no GPU write ever marked them. Daytime market: guest cores waited 22-54 ms/s
+/// for those locks, ~3,500 locked reads a second, 65 of them needing a flush. "Guest reads
+/// locked because" logs the reasons every 5 s, also while off.
 /// EXP83 (live, 0 = off; fable52_answer_microcuts 3.2; RasterizerVulkan::UpdateVertexInput): a
 /// vertex input state identical to the last one recorded in this command buffer is not sent
 /// again (any vertex buffer address or stride write resent all 32 bindings). The memo drops on
