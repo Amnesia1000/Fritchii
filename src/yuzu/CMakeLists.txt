@@ -315,7 +315,7 @@ target_sources(yuzu
         ${ICONS}
         ${THEMES})
 
-# TODO: Move Assets.car/icon/icns handling to its own Module.
+# TODO: Move icon/icns handling to its own Module.
 if (APPLE)
     target_sources(yuzu PRIVATE util/macos_sleep.cpp util/macos_sleep.h)
 
