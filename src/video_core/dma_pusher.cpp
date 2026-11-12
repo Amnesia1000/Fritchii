@@ -381,6 +381,15 @@ bool DmaPusher::Step() {
                 // Writers sent after the last sync may still be queued.
                 checked = !gpu_written && !split.Ran(split.LastWriterPosition());
             }
+            // EDEN_NX2_EXP105 (live; 0 = every entry as before, N > 1 = 1 in N): this check only
+            // reads (IsGpuWrittenCommands) and logs; it never fired in any OoT run of 2026-11-12,
+            // and at ~84,000 entries a second it cost ~8 ms/s of the back (fable answer_backthread 9).
+            if (checked) {
+                if (const int every = VideoCore::Nx2Debug::Experiment(105); every > 1) {
+                    static thread_local u32 list_check_count{};
+                    checked = (++list_check_count % static_cast<u32>(every)) == 0;
+                }
+            }
             if (checked) {
                 split.Defer([this, address = GPUVAddr{dma_state.dma_get},
                              size = size_t{header.size} * sizeof(u32), skip] {
@@ -397,7 +406,8 @@ bool DmaPusher::Step() {
                                              : "waited for the writers before the last sync");
                         }
                     }
-                });
+                    // Only reads and logs: neutral for the delta draw count (fable backthread 9).
+                }, VideoCommon::GpuSplit::Effect::Unknown, VideoCommon::Nx2FastDrawCount::Neutral());
             }
         }
         // Resume and GPU-written entries need live words, even after a flush cleared dirty state.
