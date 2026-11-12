@@ -27,17 +27,5 @@ Tools for Fritchii and other subprojects. When adding new scripts please use `#!
 - `lanczos-gen.pl`: Generates constants for the Lanczos filter.
 - `clang-format.sh`: Runs `clang-format` on the entire codebase.
     * Requires: clang
-- `find-unused-strings.sh`: Find any unused strings in the Android app (XML -> Kotlin).
 - `cpp-lint.sh`: Homemade dumb C++ linter.
 - `fuzzsettings.cpp`: Fuzz settings files.
-
-## Android
-
-It's recommended to run these scripts after almost any Android change, as they are relatively fast and important both for APK bloat and CI.
-
-- `unused-strings.sh`: Finds unused strings in `strings.xml` files.
-- `stale-translations.sh`: Finds translated strings that aren't present in the source `strings.xml` file.
-
-## Translations
-
-- [Translation Scripts](./translations)

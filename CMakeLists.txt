@@ -47,7 +47,6 @@ endif()
 
 # qt stuff
 option(ENABLE_QT "Enable the Qt frontend" ON)
-option(ENABLE_QT_TRANSLATION "Enable translations for the Qt frontend" OFF)
 option(ENABLE_UPDATE_CHECKER "Enable update checker (for Qt and Android)" OFF)
 set(LICHII_BUILD_TAG "" CACHE STRING "Published build-N release tag; empty for local builds")
 set(LICHII_BUILD_PLATFORM "" CACHE STRING "Release asset platform and variant, such as linux-x86_64-pgo")
@@ -609,10 +608,6 @@ if (ENABLE_QT)
 
     if (YUZU_USE_QT_WEB_ENGINE)
         list(APPEND YUZU_QT_COMPONENTS WebEngineCore WebEngineWidgets)
-    endif()
-
-    if (ENABLE_QT_TRANSLATION)
-        list(APPEND YUZU_QT_COMPONENTS LinguistTools)
     endif()
 
     find_package(Qt6 REQUIRED COMPONENTS ${YUZU_QT_COMPONENTS} OPTIONAL_COMPONENTS ${YUZU_QT_OPTIONAL})
