@@ -11,6 +11,7 @@
 #include <thread>
 
 #include "common/logging.h"
+#include "common/nx2_hitch.h"
 #include "common/nx2_timeline.h"
 #include "common/settings.h"
 #include "common/thread.h"
@@ -864,7 +865,11 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
 
     // Submit the image copy/blit to the swapchain
     {
+        const auto lock_stall =
+            Common::Nx2Hitch::StallEnter("present: wait for the submit lock (copy)");
         std::scoped_lock submit_lock{scheduler.submit_mutex};
+        Common::Nx2Hitch::StallLeave(lock_stall);
+        const Common::Nx2Hitch::StallScope submit_stall{"present: submit the copy"};
         switch (const VkResult result =
                     device.GetGraphicsQueue().Submit(submit_info, *frame->present_done)) {
         case VK_SUCCESS:

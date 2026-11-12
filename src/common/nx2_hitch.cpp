@@ -12,9 +12,11 @@
 
 #include <fmt/format.h>
 
+#include "common/cpu_features.h"
 #include "common/host_memory.h"
 #include "common/logging.h"
 #include "common/nx2_hitch.h"
+#include "common/nx2_timeline.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -199,12 +201,177 @@ size_t TakeWarmKeys(u32 core, std::vector<u64>& out, size_t max) {
     return out.size();
 }
 
+namespace {
+
+constexpr std::array<const char*, static_cast<size_t>(StallThread::Count)> StallThreadNames{
+    "back", "front", "worker", "fencing", "present"};
+
+std::mutex g_stall_reporter_mutex;
+std::string (*g_stall_reporter)(const void*){};
+const void* g_stall_reporter_owner{};
+
+u64 StallNow() {
+    return static_cast<u64>(Common::g_wall_clock.GetTimeNS().count());
+}
+
+// Only the slot's own thread writes it; a span within 0.5 ms of the recorded one does not replace
+// it, so a wait keeps its inner name ("macro dma read") over the zone around it ("split drain").
+void NoteLongest(StallSlot* slot, const char* zone, u64 ns) {
+    if (ns > slot->longest_ns.load(std::memory_order_relaxed) + 500'000) {
+        slot->longest_zone.store(zone, std::memory_order_relaxed);
+        slot->longest_ns.store(ns, std::memory_order_release);
+    }
+}
+
+// EDEN_NX2_STALL_SNAPSHOT=1, read at every thread name (not cached: threads are named before
+// main() applies nx2_switches.txt).
+bool StallSwitch() {
+    const char* const value = std::getenv("EDEN_NX2_STALL_SNAPSHOT");
+    return value != nullptr && value[0] == '1';
+}
+
+} // Anonymous namespace
+
+StallMark StallEnterSlow(StallSlot* slot, const char* zone) {
+    const u64 now = StallNow();
+    StallMark mark{slot, slot->zone.load(std::memory_order_relaxed),
+                   slot->since.load(std::memory_order_relaxed), now};
+    if (mark.prev_zone == nullptr && mark.prev_since != 0) {
+        NoteLongest(slot, "(no span)", now - mark.prev_since);
+    }
+    slot->zone.store(zone, std::memory_order_relaxed);
+    slot->since.store(now, std::memory_order_relaxed);
+    return mark;
+}
+
+void StallLeaveSlow(const StallMark& mark) {
+    StallSlot* const slot = mark.slot;
+    const u64 now = StallNow();
+    NoteLongest(slot, slot->zone.load(std::memory_order_relaxed), now - mark.since);
+    // Back in the span around this one, with its own start; outside every span from now.
+    slot->zone.store(mark.prev_zone, std::memory_order_relaxed);
+    slot->since.store(mark.prev_zone != nullptr ? mark.prev_since : now,
+                      std::memory_order_relaxed);
+}
+
+void StallAcquired() {
+    if (StallOn()) {
+        g_stall_acquired_since.store(StallNow(), std::memory_order_relaxed);
+    }
+}
+
+void StallPresented() {
+    if (!StallOn()) {
+        return;
+    }
+    const u64 since = g_stall_acquired_since.exchange(0, std::memory_order_relaxed);
+    if (since == 0) {
+        return;
+    }
+    const u64 ns = StallNow() - since;
+    u64 longest = g_stall_acquire_longest.load(std::memory_order_relaxed);
+    while (ns > longest && !g_stall_acquire_longest.compare_exchange_weak(
+                               longest, ns, std::memory_order_relaxed)) {
+    }
+}
+
+void SetStallTickReporter(std::string (*reporter)(const void*), const void* owner) {
+    std::scoped_lock lock{g_stall_reporter_mutex};
+    g_stall_reporter = reporter;
+    g_stall_reporter_owner = owner;
+}
+
+void ClearStallTickReporter(const void* owner) {
+    std::scoped_lock lock{g_stall_reporter_mutex};
+    if (g_stall_reporter_owner == owner) {
+        g_stall_reporter = nullptr;
+        g_stall_reporter_owner = nullptr;
+    }
+}
+
+namespace {
+
+std::string StallSnapshotLine(long long gap_us) {
+    const u64 now = StallNow();
+    std::string current;
+    std::string longest;
+    for (size_t i = 0; i < g_stall_slots.size(); ++i) {
+        StallSlot& slot = g_stall_slots[i];
+        const char* const sep = i == 0 ? "" : ", ";
+        const u64 since = slot.since.load(std::memory_order_relaxed);
+        const char* const zone = slot.zone.load(std::memory_order_relaxed);
+        if (since == 0) {
+            current += fmt::format("{}{} not seen", sep, StallThreadNames[i]);
+        } else {
+            current += fmt::format("{}{} {} {:.1f} ms", sep, StallThreadNames[i],
+                                   zone != nullptr ? zone : "(no span)",
+                                   now > since ? static_cast<double>(now - since) / 1e6 : 0.0);
+        }
+        // Reset for the next gap (OnPresent resets every present too).
+        const u64 longest_ns = slot.longest_ns.exchange(0, std::memory_order_acquire);
+        const char* const longest_zone = slot.longest_zone.load(std::memory_order_relaxed);
+        longest += fmt::format("{}{} {} {:.1f} ms", sep, StallThreadNames[i],
+                               longest_ns != 0 && longest_zone != nullptr ? longest_zone : "-",
+                               static_cast<double>(longest_ns) / 1e6);
+    }
+    const u64 acquired = g_stall_acquired_since.load(std::memory_order_relaxed);
+    const u64 acquire_longest = g_stall_acquire_longest.exchange(0, std::memory_order_relaxed);
+    const std::string acquire =
+        acquired != 0 ? fmt::format("between acquire and present for {:.1f} ms",
+                                    now > acquired ? static_cast<double>(now - acquired) / 1e6
+                                                   : 0.0)
+                      : std::string{"not between acquire and present"};
+    std::string ticks;
+    {
+        std::scoped_lock lock{g_stall_reporter_mutex};
+        ticks = g_stall_reporter != nullptr ? g_stall_reporter(g_stall_reporter_owner)
+                                            : std::string{"no renderer"};
+    }
+    return fmt::format("Stall snapshot: {:.1f} ms between presents; now: {}; longest in the gap: "
+                       "{}; present thread {} (longest acquire to present in the gap {:.1f} ms); "
+                       "ticks: {}",
+                       static_cast<double>(gap_us) / 1e3, current, longest, acquire,
+                       static_cast<double>(acquire_longest) / 1e6, ticks);
+}
+
+void StallResetGap() {
+    for (StallSlot& slot : g_stall_slots) {
+        slot.longest_ns.store(0, std::memory_order_relaxed);
+    }
+    g_stall_acquire_longest.store(0, std::memory_order_relaxed);
+}
+
+} // Anonymous namespace
+
 void RegisterThread(const char* name) {
     const std::string_view view{name};
     t_role = view.starts_with("CPUCore") ? Role::GuestCore
              : view == "GPUBack"         ? Role::GpuBack
              : view == "GPU"             ? Role::GpuFront
                                          : Role::Other;
+    {
+        const StallThread stall = view == "GPUBack"            ? StallThread::GpuBack
+                                  : view == "GPU"              ? StallThread::GpuFront
+                                  : view == "VulkanWorker"     ? StallThread::VulkanWorker
+                                  : view == "GPUFencingThread" ? StallThread::Fencing
+                                  : view == "VulkanPresent"    ? StallThread::Present
+                                                               : StallThread::Count;
+        if (stall != StallThread::Count && StallSwitch()) {
+            StallSlot& slot = g_stall_slots[static_cast<size_t>(stall)];
+            slot.zone.store(nullptr, std::memory_order_relaxed);
+            slot.since.store(StallNow(), std::memory_order_relaxed);
+            t_stall_slot = &slot;
+            if (!g_stall_on.exchange(true, std::memory_order_relaxed)) {
+                // The profiler's zones call out of line for the slots too (coarse zones only).
+                Nx2Timeline::g_zone_gate.fetch_or(Nx2Timeline::ZoneGateStall,
+                                                  std::memory_order_release);
+                LOG_INFO(Render, "Stall snapshot on (EDEN_NX2_STALL_SNAPSHOT=1): a line after "
+                                 "each Hitch line of 100 ms or more");
+            }
+        } else {
+            t_stall_slot = nullptr;
+        }
+    }
 #ifdef _WIN32
     std::scoped_lock lock{g_thread_mutex};
     const size_t index = g_thread_count.load(std::memory_order_relaxed);
@@ -271,7 +438,13 @@ void OnPresent(long long gap_us) {
                      static_cast<double>(now.user_100ns - last.user_100ns) / 1e4,
                      static_cast<double>(now.kernel_100ns - last.kernel_100ns) / 1e4,
                      BusiestThreads(last, now));
+            if (gap_us >= 100'000 && StallOn()) {
+                LOG_INFO(Render, "{}", StallSnapshotLine(gap_us));
+            }
         }
+    }
+    if (StallOn()) {
+        StallResetGap();
     }
     last = now;
 }

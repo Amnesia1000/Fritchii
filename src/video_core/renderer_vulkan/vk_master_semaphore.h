@@ -12,6 +12,7 @@
 #include <mutex>
 #include <thread>
 #include <queue>
+#include <string>
 
 #include "common/common_types.h"
 #include "common/polyfill_thread.h"
@@ -59,6 +60,9 @@ public:
                          VkSemaphore signal_semaphore, VkSemaphore wait_semaphore, u64 host_tick);
 
 private:
+    /// EDEN_NX2_STALL_SNAPSHOT: the ticks for the "Stall snapshot:" line (common/nx2_hitch.h).
+    static std::string StallTicks(const void* self);
+
     VkResult SubmitQueueTimeline(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,
                                  VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                                  u64 host_tick);
@@ -84,6 +88,9 @@ private:
     std::deque<vk::Fence> free_queue; ///< Holds available fences for submission.
     std::jthread debug_thread;        ///< Debug thread to workaround validation layer bugs.
     std::jthread wait_thread;         ///< Helper thread that waits for submitted fences.
+    /// EDEN_NX2_STALL_SNAPSHOT only: the newest tick vkQueueSubmit took, and when (steady ns).
+    std::atomic<u64> stall_submitted_tick{0};
+    std::atomic<u64> stall_submitted_ns{0};
 };
 
 } // namespace Vulkan

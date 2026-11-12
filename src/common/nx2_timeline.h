@@ -10,6 +10,7 @@
 #include <string_view>
 
 #include "common/common_types.h"
+#include "common/nx2_hitch.h"
 
 // A timeline of what the emulator's threads do and wait for, for a few seconds: each thread
 // records spans (begin, duration, name) into its own buffer while a recording runs, and the
@@ -39,6 +40,8 @@ inline std::atomic<bool> g_detail{false};
 inline std::atomic<u8> g_zone_gate{0};
 inline constexpr u8 ZoneGateTimeline = 1;
 inline constexpr u8 ZoneGateProfile = 2;
+/// Bit 2 while EDEN_NX2_STALL_SNAPSHOT keeps per-thread span slots (Nx2Hitch::RegisterThread).
+inline constexpr u8 ZoneGateStall = 4;
 
 [[nodiscard]] inline bool ZoneGateOpen() {
     return g_zone_gate.load(std::memory_order_relaxed) != 0;
@@ -117,7 +120,8 @@ void ForgetObject(const void* object);
 
 class Span {
 public:
-    explicit Span(const char* name_) : name{name_}, on{Active()} {
+    explicit Span(const char* name_)
+        : name{name_}, on{Active()}, stall{Nx2Hitch::StallEnter(name_)} {
         if (on) {
             begin = Now();
         }
@@ -126,6 +130,7 @@ public:
         if (on) {
             Record(name, begin, Now());
         }
+        Nx2Hitch::StallLeave(stall);
     }
     Span(const Span&) = delete;
     Span& operator=(const Span&) = delete;
@@ -134,13 +139,14 @@ private:
     const char* name;
     bool on;
     u64 begin{};
+    Nx2Hitch::StallMark stall; ///< EDEN_NX2_STALL_SNAPSHOT's slot (common/nx2_hitch.h)
 };
 
 /// A Span with args. Values known only at its end (which phase a wait reached) are set with Set.
 class ArgSpan {
 public:
     explicit ArgSpan(const char* name_, Arg a = {}, Arg b = {}, Arg c = {})
-        : name{name_}, on{Active()}, args{a, b, c} {
+        : name{name_}, on{Active()}, args{a, b, c}, stall{Nx2Hitch::StallEnter(name_)} {
         if (on) {
             begin = Now();
         }
@@ -149,6 +155,7 @@ public:
         if (on) {
             Record(name, begin, Now(), args[0], args[1], args[2]);
         }
+        Nx2Hitch::StallLeave(stall);
     }
     ArgSpan(const ArgSpan&) = delete;
     ArgSpan& operator=(const ArgSpan&) = delete;
@@ -169,6 +176,7 @@ private:
     bool on;
     u64 begin{};
     std::array<Arg, MaxArgs> args;
+    Nx2Hitch::StallMark stall;
 };
 
 } // namespace Common::Nx2Timeline
