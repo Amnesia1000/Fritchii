@@ -540,6 +540,10 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// written, ring overflow, pending cached writes, other range, no keep yet). "Uniform keeps
 /// count (EXP91" logs small binds, rebinds and those counts per second every 5 s while not 0.
 /// Gain of the later stages is about K x 55 ns; under 100,000 a second, stop there.
+/// EXP99 (live, 0 = off; fable52_answer_chicken 1): evicted EXP42 pool images (OoT's per-NPC
+/// depth targets, ~3 a frame while a chicken passes or an enemy dies) are destroyed on the image
+/// free thread instead of on the GPU back thread at the frame's end. The pool line every 600
+/// frames counts where they went; the timeline shows "back: image pool tick".
 /// EXP96 (live; fable52_answer_guest 4): the HLE reply hold (k_server_session.cpp HoldHleReply,
 /// written for Mario Tennis Fever, active in every title). 0 = EDEN_NX2_IPC_MIN_US or 50 us;
 /// 1 = off; N > 1 = N us. In OoT the service thread that presents waits in it ~14 ms/s.

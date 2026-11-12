@@ -134,12 +134,15 @@ public:
 
     /// Adds an image holding `bytes` of device memory to the batch (the GPU thread's; no lock).
     void Add(std::unique_ptr<Image> image, u64 bytes);
+    /// Same for a bare VkImage (EXP99: evicted pool images; the GPU is done with them).
+    void AddBare(vk::Image image, u64 bytes);
 
     /// Hands the batch to the thread: one lock and one wake-up for all of it.
     void Submit();
 
 private:
     using Entry = std::pair<std::unique_ptr<Image>, u64>; ///< The image, its device memory
+    using BareEntry = std::pair<vk::Image, u64>;
 
     void Run(std::stop_token stop_token);
 
@@ -148,6 +151,8 @@ private:
     std::mutex mutex;
     std::condition_variable_any cv;
     std::vector<Entry> queue; ///< Submitted, not taken by the thread yet (under `mutex`)
+    std::vector<BareEntry> bare_batch; ///< AddBare since the last Submit (GPU thread only)
+    std::vector<BareEntry> bare_queue; ///< Submitted bare images (under `mutex`)
     std::atomic<u64> pending_bytes{};
     std::jthread thread; ///< Last: started once the members above exist
 };
@@ -488,6 +493,10 @@ public:
     u64 image_pool_given{};
     u64 image_pool_evicted{};
     void TrimImagePool(u64 max_bytes);
+    /// Destroys an evicted pool image here, or with EXP99 on its free thread.
+    void DropPooledImage(vk::Image image, u64 bytes);
+    u64 image_pool_dropped_async{}; ///< EXP99: evictions handed to the free thread
+    u64 image_pool_dropped_here{};
 
 public:
     /// EDEN_NX2_ASYNC_IMAGE_FREE: a deleted image the GPU is done with (TextureCache::TickFrame,

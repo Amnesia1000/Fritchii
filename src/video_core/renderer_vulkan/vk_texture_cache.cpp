@@ -23,6 +23,7 @@
 #include "common/alignment.h"
 #include "common/bit_util.h"
 #include "common/div_ceil.h"
+#include "common/nx2_timeline.h"
 #include "common/literals.h"
 #include "common/settings.h"
 #include "common/thread.h"
@@ -3007,9 +3008,25 @@ u64 TextureCacheRuntime::ImagePoolCap() {
     return VideoCore::Nx2Debug::Experiment(42) >= 2 ? ImagePoolMaxBytesDedicated : ImagePoolMaxBytes;
 }
 
+void TextureCacheRuntime::DropPooledImage(vk::Image image, u64 bytes) {
+    // EDEN_NX2_EXP99 (live, 0 = off; fable52_answer_chicken 1): an evicted pool image is
+    // destroyed on the image free thread instead of here, on the GPU back thread at the frame's
+    // end (OoT's per-NPC depth targets: ~3 a frame while a chicken passes, 1-4.7 ms stalls).
+    // The GPU finished with pooled images before they were pooled (IsFree), so no ordering.
+    if (VideoCore::Nx2Debug::Experiment(99) != 0 && image_free_queue.Enabled() &&
+        image_free_queue.PendingBytes() <= ImageFreeQueue::MaxPendingBytes) {
+        image_free_queue.AddBare(std::move(image), bytes);
+        ++image_pool_dropped_async;
+        return;
+    }
+    ++image_pool_dropped_here;
+    image = vk::Image{};
+}
+
 void TextureCacheRuntime::TrimImagePool(u64 max_bytes) {
     while (!image_pool.empty() && image_pool_bytes > max_bytes) {
         image_pool_bytes -= image_pool.front().bytes;
+        DropPooledImage(std::move(image_pool.front().image), image_pool.front().bytes);
         image_pool.pop_front();
         ++image_pool_evicted;
     }
@@ -3039,12 +3056,19 @@ void ImageFreeQueue::Add(std::unique_ptr<Image> image, u64 bytes) {
     batch.emplace_back(std::move(image), bytes);
 }
 
+void ImageFreeQueue::AddBare(vk::Image image, u64 bytes) {
+    pending_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    bare_batch.emplace_back(std::move(image), bytes);
+}
+
 void ImageFreeQueue::Submit() {
-    if (batch.empty()) {
+    if (batch.empty() && bare_batch.empty()) {
         return;
     }
     {
         std::scoped_lock lock{mutex};
+        std::move(bare_batch.begin(), bare_batch.end(), std::back_inserter(bare_queue));
+        bare_batch.clear();
         if (queue.empty()) {
             queue.swap(batch);
         } else {
@@ -3062,15 +3086,22 @@ void ImageFreeQueue::Run(std::stop_token stop_token) {
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
     Common::SetCurrentThreadToBackgroundWork();
     std::vector<Entry> work;
+    std::vector<BareEntry> bare_work;
     while (true) {
         {
             std::unique_lock lock{mutex};
-            cv.wait(lock, stop_token, [this] { return !queue.empty(); });
-            if (queue.empty()) {
+            cv.wait(lock, stop_token, [this] { return !queue.empty() || !bare_queue.empty(); });
+            if (queue.empty() && bare_queue.empty()) {
                 return; // stop requested, nothing left
             }
             work.swap(queue);
+            bare_work.swap(bare_queue);
         }
+        for (BareEntry& entry : bare_work) {
+            entry.first = vk::Image{};
+            pending_bytes.fetch_sub(entry.second, std::memory_order_release);
+        }
+        bare_work.clear();
         // Oldest first, in the order the GPU finished with them.
         for (Entry& entry : work) {
             entry.first.reset();
@@ -3099,6 +3130,8 @@ void TextureCacheRuntime::SubmitImageFrees() {
 void TextureCacheRuntime::TickFrame() {
     ++image_pool_frame;
     {
+        // On the timeline (fable52_answer_chicken): the pool's evictions at the frame's end.
+        Common::Nx2Timeline::Span pool_span{"back: image pool tick"};
         // EXP42's pool: images older than ImagePoolMaxFrames go, and all of them when the
         // switch is off or device memory ran short (an image did not fit or could not be made).
         const u32 pressure = memory_allocator.MemoryPressureEvents();
@@ -3131,6 +3164,7 @@ void TextureCacheRuntime::TickFrame() {
                 continue;
             }
             image_pool_bytes -= it->bytes;
+            DropPooledImage(std::move(it->image), it->bytes);
             it = image_pool.erase(it);
             ++image_pool_evicted;
         }
@@ -3145,6 +3179,7 @@ void TextureCacheRuntime::TickFrame() {
                     continue;
                 }
                 image_pool_bytes -= it->bytes;
+                DropPooledImage(std::move(it->image), it->bytes);
                 it = image_pool.erase(it);
                 ++image_pool_evicted;
                 ++image_pool_unproven_evicted;
@@ -3154,13 +3189,18 @@ void TextureCacheRuntime::TickFrame() {
             (pool_switch != 0 || image_pool_taken + image_pool_given != 0)) {
             LOG_INFO(Render_Vulkan,
                      "Image pool (EXP42) last 600 frames: {} taken, {} missed, {} pooled, {} "
-                     "evicted ({} never-taken shapes aged out, EXP65={}); holds {} images, {} MiB",
+                     "evicted ({} never-taken shapes aged out, EXP65={}); holds {} images, {} MiB; "
+                     "evictions destroyed on the free thread {} (EXP99={}), here {}",
                      image_pool_taken, image_pool_missed, image_pool_given, image_pool_evicted,
                      image_pool_unproven_evicted, VideoCore::Nx2Debug::Experiment(65),
-                     image_pool.size(), image_pool_bytes >> 20);
+                     image_pool.size(), image_pool_bytes >> 20, image_pool_dropped_async,
+                     VideoCore::Nx2Debug::Experiment(99), image_pool_dropped_here);
             image_pool_taken = image_pool_missed = image_pool_given = image_pool_evicted = 0;
             image_pool_unproven_evicted = 0;
+            image_pool_dropped_async = image_pool_dropped_here = 0;
         }
+        // EXP99: hand what the trims above dropped to the free thread now, not next frame.
+        image_free_queue.Submit();
     }
     while (!pending_byte_addressed_shadows.empty() &&
            scheduler.IsFree(pending_byte_addressed_shadows.front().tick)) {
