@@ -1770,7 +1770,14 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
     }
     Nx2Profile::Add(Nx2Profile::Counter::DownloadBytes, total_size_bytes);
     Nx2Profile::Add(Nx2Profile::Counter::DownloadCopies, downloads.size());
+    // EDEN_NX2_BACK_FENCE_STATS (fable52_answer_fences2 4): the staging buffer's part of the fence.
+    const bool time_staging = VideoCore::Nx2Debug::BackFenceStats();
+    const auto staging_start = time_staging ? FenceReleaseStats::Clock::now()
+                                            : FenceReleaseStats::Clock::time_point{};
     auto download_staging = runtime.DownloadStagingBuffer(total_size_bytes, true);
+    if (time_staging) [[unlikely]] {
+        FenceReleaseStats::BackFence::t_staging_ns += FenceReleaseStats::NsSince(staging_start);
+    }
     boost::container::small_vector<BufferCopy, 4> normalized_copies;
     Common::RangeSet<DAddr> download_ranges;
     runtime.PreCopyBarrier();
@@ -1925,7 +1932,15 @@ void BufferCache<P>::PopAsyncBuffers() {
         // This runs on the fencing thread while the CPU keeps writing: CPU writes collected since
         // the copy was taken are newer than it, and the GPU thread hasn't dropped them from
         // `ranges` yet.
+        // EDEN_NX2_FENCE_RELEASE_STATS (fable52_answer_fences2 3): the two parts that can wait.
+        const bool time_parts = FenceReleaseStats::g_enabled;
+        auto part_start = time_parts ? FenceReleaseStats::Clock::now()
+                                     : FenceReleaseStats::Clock::time_point{};
         const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
+        if (time_parts) [[unlikely]] {
+            FenceReleaseStats::t_pop_parts.pending_ns += FenceReleaseStats::NsSince(part_start);
+            ++FenceReleaseStats::t_pop_parts.pending_calls;
+        }
         for (size_t index = first; index < last; ++index) {
             const auto& copy = downloads[index];
             const DAddr device_addr = static_cast<DAddr>(copy.src_offset);
@@ -1934,8 +1949,16 @@ void BufferCache<P>::PopAsyncBuffers() {
             // Only what no write replaced since the copy was taken: the rest is older than guest
             // memory (CPU writes) or than the GPU's copy (GPU writes, still to be downloaded).
             ranges.ForEachInRange(device_addr, copy.size, [&](DAddr start, DAddr end) {
+                if (time_parts) [[unlikely]] {
+                    part_start = FenceReleaseStats::Clock::now();
+                }
                 WriteDownloadedMemory(cpu_written, start, &read_mapped_memory[start - device_addr],
                                       end - start);
+                if (time_parts) [[unlikely]] {
+                    FenceReleaseStats::t_pop_parts.write_ns +=
+                        FenceReleaseStats::NsSince(part_start);
+                    ++FenceReleaseStats::t_pop_parts.writes;
+                }
                 gpu_modified_ranges.Subtract(start, end - start);
                 if (DownloadReadStats::g_enabled) [[unlikely]] {
                     stats_landed.emplace_back(start, end);

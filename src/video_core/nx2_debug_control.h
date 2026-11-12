@@ -120,6 +120,15 @@ inline std::atomic<int> g_gpu_wake{-1};
 [[nodiscard]] inline bool GpuWake() {
     return SwitchValue(g_gpu_wake, "EDEN_NX2_GPU_WAKE", 0) > 0;
 }
+/// EDEN_NX2_BACK_FENCE_STATS=1 (live, diagnostic, off by default; fable52_answer_fences2 4): the
+/// back's SignalFence timed in five parts (CommitCacheFlushes with DownloadStagingBuffer, guard,
+/// the fence's operation, FlushCommands, InvalidateGPUCache), summed per 5 s ("Back fence split
+/// (5 s"), and every fence over 1 ms with its parts ("Back fence over 1 ms", 30 lines per 5 s at
+/// most). Also counts the fences that committed no download (FenceReleaseStats::BackFence).
+inline std::atomic<int> g_back_fence_stats{-1};
+[[nodiscard]] inline bool BackFenceStats() {
+    return SwitchValue(g_back_fence_stats, "EDEN_NX2_BACK_FENCE_STATS", 0) > 0;
+}
 /// EDEN_NX2_RUNAHEAD (live, Ocarina of Time only, default 0; video_core/nx2_runahead.h): 1 = the
 /// split's front answers acquires a release it sent meets without draining and writes the word
 /// early, with the guest's CPU writes snapshotted per boundary for the back; 2 = verify (old path,
@@ -999,6 +1008,9 @@ inline void LoadExperiments() {
     }
     if (name == "EDEN_NX2_GPU_WAKE") {
         return &g_gpu_wake;
+    }
+    if (name == "EDEN_NX2_BACK_FENCE_STATS") {
+        return &g_back_fence_stats;
     }
     if (name == "EDEN_NX2_RUNAHEAD") {
         return &g_runahead;
