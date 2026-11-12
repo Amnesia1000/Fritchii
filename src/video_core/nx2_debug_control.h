@@ -280,7 +280,7 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// poll (EXP24)" counts every 10 s. EXP24 = 2: locate only, sleeps unchanged: short sleeps
 /// (<= 2 ms) are counted by call chain and the top 8 logged every 10 s ("OoT present poll
 /// locate"). EXP24 = 3: no GPU wake, the poll's 1 ms sleep is EDEN_NX2_OOT_PRESENT_SLEEP_US
-/// instead (default 250 us, at most the time asked for). Off by default, not measured yet.
+/// instead (default 250 us, at most the time asked for). Default 3 (LoadExperiments).
 /// EXP25 (Ocarina of Time resource poll backoff, zortos293/Lichii#641; needs the built-in patch
 /// placed at launch by EDEN_NX2_OOT_POLL_BACKOFF=1, core/hle/kernel/svc/svc_nx2_oot_poll.cpp):
 /// the resource request thread sleeps before rescanning requests that are not ready.
@@ -628,6 +628,10 @@ inline void LoadExperiments() {
         // report listed over the bytes. Owner fight toggle with EXP30: macro dma flush 34.5 -> 20.4
         // ms/s, front waits 442 -> 416 ms/s, no flashes; it only drops empty work.
         g_experiments[73].store(1, std::memory_order_relaxed);
+        // EXP24 = 3 (2026-11-12): OoT's present poll sleeps 250 us instead of 1 ms. The guest
+        // timeline puts that poll on the night market's critical path (1.9 ms a frame, 5.2 at
+        // p90); live toggle there 57.8 -> 58.4 fps, 3 of 4 windows up. Only the verified site.
+        g_experiments[24].store(3, std::memory_order_relaxed);
         // EXP49 = 1 (2026-11-10, owner's call for v5.7): the async read-back. Stalchild fight,
         // flipped every 30 s while the owner fought: 51.9 -> 56.9 fps, the back's read flushes
         // 35 -> 6 ms/s, guest lock waits halved. No beams in that session or two later ones
