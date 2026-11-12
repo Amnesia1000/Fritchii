@@ -15,11 +15,12 @@
 #include "common/common_types.h"
 
 // Ghost pools (fable52_answer_stall2 section 3b, diagnostic): EDEN_NX2_GHOST_POOLS=1 (boot) runs
-// nine make-believe copies of EXP42's image pool next to the real one: three eviction rules at
-// 256, 512 and 1,024 MiB each. They hold keys and byte sizes only, no images and no memory, and
-// see exactly the real pool's calls: every image the real pool is given (PoolImage) and every
-// lookup it answers (TakePooledImage), plus its frame tick (the same aging: 180 frames, EXP82 for
-// proven shapes, EXP65 for never-taken ones, emptied when the real pool is emptied for memory).
+// fifteen make-believe copies of EXP42's image pool next to the real one: five eviction rules at
+// 256, 512 and 1,024 MiB each (the last two, fable52_answer_stall3 3, appended to the line). They
+// hold keys and byte sizes only, no images and no memory, and see exactly the real pool's calls:
+// every image the real pool is given (PoolImage) and every lookup it answers (TakePooledImage),
+// plus its frame tick (the same aging: 180 frames, EXP82 for proven shapes, EXP65 for never-taken
+// ones, emptied when the real pool is emptied for memory).
 // The images a pool is given do not depend on which pool answered a lookup (the texture cache
 // frees an image the same way either way), so each ghost's hit rate is what that rule and cap
 // would have had. Every 600 frames, next to the "Image pool (EXP42)" line, one line with each
@@ -31,11 +32,17 @@ enum class Policy : u8 {
     Oldest,        ///< Today's: over the cap the oldest entry goes, proven or not
     UnprovenFirst, ///< Never-taken shapes first (oldest first), then least recently taken
     Frequency,     ///< UnprovenFirst, proven ones by fewest takes (then least recently taken)
+    /// Frequency with every shape's takes halved each 600 frames (fable52_answer_stall3 3)
+    FrequencyHalved,
+    /// Frequency where a missed lookup counts as a take for its key (fable52_answer_stall3 3):
+    /// a new shape arriving while the pool is full of proven entries can earn its place
+    FrequencyDemand,
     Count,
 };
 
 inline constexpr std::array<const char*, static_cast<size_t>(Policy::Count)> PolicyNames{
-    "oldest first", "unproven first", "unproven first + takes"};
+    "oldest first", "unproven first", "unproven first + takes",
+    "unproven first + takes halved every 600 frames", "unproven first + takes and misses"};
 inline constexpr std::array<u64, 3> CapsMiB{256, 512, 1024};
 
 class Ghost {
@@ -65,10 +72,22 @@ public:
             return;
         }
         ++missed;
+        if (policy == Policy::FrequencyDemand) {
+            // The miss is demand: the shape counts as proven, with one more take.
+            Shape& shape = shapes[key];
+            ++shape.takes;
+            shape.last_take = frame;
+        }
     }
 
     /// The real pool's age rules (TextureCacheRuntime::TickFrame), with this ghost's own proof.
     void Age(u64 frame, u64 max_frames, u64 proven_frames, u64 unproven_frames) {
+        if (policy == Policy::FrequencyHalved && frame % 600 == 0) {
+            // Halved, not dropped: a shape whose takes reach 0 stays proven.
+            for (auto& [key, shape] : shapes) {
+                shape.takes >>= 1;
+            }
+        }
         for (auto it = entries.begin(); it != entries.end();) {
             const u64 age = frame - it->frame;
             if (age <= max_frames) {
@@ -160,7 +179,7 @@ private:
 
     /// Whether proven shape `a` goes before `b`.
     [[nodiscard]] bool Lower(const Shape& a, const Shape& b) const {
-        if (policy == Policy::Frequency && a.takes != b.takes) {
+        if (policy != Policy::UnprovenFirst && a.takes != b.takes) {
             return a.takes < b.takes;
         }
         return a.last_take < b.last_take;
@@ -170,7 +189,8 @@ private:
     u64 cap;
     std::deque<Entry> entries; ///< Oldest first
     u64 held{};
-    /// Shapes this ghost answered a lookup for (proven), by key hash.
+    /// Shapes this ghost answered a lookup for (proven), by key hash; FrequencyDemand also adds
+    /// the ones it missed. Unbounded (a diagnostic).
     std::unordered_map<u64, Shape> shapes;
     u64 taken{};
     u64 missed{};
