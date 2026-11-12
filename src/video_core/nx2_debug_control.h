@@ -447,6 +447,11 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// collector's device memory figure, as deleted images waiting for the GPU are. Logs "Image pool
 /// (EXP42) last 600 frames" and counts pooled creates in "Slow clear texture cache". 1 is the default
 /// (LoadExperiments); 0 = off.
+/// EXP77 (live, 0 = off; fable52_answer_keeptex_2 2b; TextureCache): a GPU-written chain target
+/// the cold sweep deletes leaves its shape at its address; a texture header that asks for that
+/// address again marks the shape (and address) GuardSampled, so the sweep keeps that shape from
+/// then on instead of deleting it and remaking it from stale guest bytes. Fight: 197 GPU-written
+/// images a window remade after a sweep. Only keeps longer. Counted in the "Cold sweep" line.
 /// EXP76 (live, bits; fable52_answer_keeptex 2a; TextureCache): kill frames remade textures the
 /// game already had (fight: 767 of 833 new sampled images in 10 s had bytes made before; a BC5
 /// 2448x3056 one 129 times). 1 = FindImage keeps an image the game's remap flagged when the same

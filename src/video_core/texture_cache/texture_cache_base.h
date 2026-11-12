@@ -634,6 +634,10 @@ private:
     u64 nx2_upload_skips = 0;
     u64 nx2_upload_skip_bytes = 0;
     u64 nx2_upload_hash_checks = 0;
+    /// EXP77: shapes of GPU-written images the cold sweep deleted, by address (at most 65,536),
+    /// and the shapes guarded because a texture header asked for that address again.
+    ::Common::unordered_map<GPUVAddr, u64> nx2_swept_shapes;
+    u64 nx2_sweep_guards = 0;
 
     /// EXP76 & 4 (fable52_answer_keeptex_2, step 1, measure only): images whose whole upload is
     /// hashed (& 2) are indexed by (shape, content hash); a new sampled image hashes its guest bytes

@@ -1083,10 +1083,10 @@ void TextureCache<P>::SweepColdImages() {
                  "Cold sweep (EDEN_NX2_TC_COLD_FRAMES={}{}) last 600 frames: {} chain images "
                  "deleted ({} of them guarded but superseded, EXP58), {} kept as GPU-written and "
                  "guarded, {} kept as read later; {} watched; {} images, device memory {} MiB "
-                 "(expected {} MiB)",
+                 "(expected {} MiB); EXP77 shapes guarded after a sweep: {} so far",
                  cold_frames, sweep_guarded ? ", guarded too" : "", cold_deleted, cold_superseded,
                  cold_kept_guarded, cold_kept_read, cold_watch.size(), slot_images.size(),
-                 total_used_memory >> 20, expected_memory >> 20);
+                 total_used_memory >> 20, expected_memory >> 20, nx2_sweep_guards);
         cold_deleted = cold_kept_guarded = cold_kept_read = cold_superseded = 0;
         // The image families made in those frames, most made first (fable52_answer_13 sec. 6).
         std::vector<std::pair<std::pair<u32, u32>, const MadeShapes*>> families;
@@ -3407,6 +3407,21 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config) {
     ImageId image_id = FindImage(info, image_gpu_addr, RelaxedOptions{});
     if (!image_id) {
         image_id = InsertImage(info, image_gpu_addr, RelaxedOptions{});
+        // EXP77 (live; fable52_answer_keeptex_2 2b): the game samples memory where the cold
+        // sweep just took a GPU-written target: that shape's contents are read in later frames,
+        // so the sweep keeps it from now on (GuardSampled), as if the target had been sampled.
+        if (image_id && !nx2_swept_shapes.empty()) [[unlikely]] {
+            if (const auto swept = nx2_swept_shapes.find(image_gpu_addr);
+                swept != nx2_swept_shapes.end()) {
+                RelocationShape& shape = relocation_shapes[swept->second];
+                if ((shape.guard & GuardSampled) == 0) {
+                    shape.guard |= GuardSampled;
+                    ++nx2_sweep_guards;
+                }
+                relocation_guarded_addresses[image_gpu_addr] |= GuardSampled;
+                nx2_swept_shapes.erase(swept);
+            }
+        }
         if (image_id) {
             NoteNewSampledImage(image_id, image_gpu_addr);
             if ((VideoCore::Nx2Debug::Experiment(76) & 4) != 0) [[unlikely]] {
@@ -5516,6 +5531,12 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     ++bindings_epoch;
     if ((VideoCore::Nx2Debug::Experiment(76) & 4) != 0) [[unlikely]] {
         ForgetContent(image_id, image, true);
+    }
+    // EXP77: a GPU-written chain target the cold sweep takes leaves its shape at its address.
+    if (delete_reason == DeleteReason::ColdSweep &&
+        True(image.flags & ImageFlagBits::GpuModified) && RelocationShaped(image.info) &&
+        VideoCore::Nx2Debug::Experiment(77) != 0 && nx2_swept_shapes.size() < 65536) {
+        nx2_swept_shapes[image.gpu_addr] = RelocationShapeKey(image.info);
     }
     if (ImageHashLogEnabled()) [[unlikely]] {
         const auto reason = static_cast<size_t>(delete_reason);
