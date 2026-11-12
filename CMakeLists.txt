@@ -277,8 +277,6 @@ option(YUZU_TESTS "Compile tests" "${BUILD_TESTING}")
 # Only acts on joysticks and nothing else.
 cmake_dependent_option(YUZU_INSTALL_UDEV_RULES "Install udev rules for gyro access" OFF "LINUX" OFF)
 
-option(YUZU_DOWNLOAD_ANDROID_VVL "Download validation layer binary for android" ON)
-
 option(YUZU_LEGACY "Apply patches that improve compatibility with older GPUs (e.g. Snapdragon 865) at the cost of performance" OFF)
 
 option(NIGHTLY_BUILD "Use Nightly qualifiers in the update checker and build metadata" OFF)
@@ -303,16 +301,6 @@ if (EXT_DEFAULT OR SOLARIS OR OPENBSD)
 endif()
 
 option(YUZU_USE_BUNDLED_OPENSSL "Download bundled OpenSSL build" ${DEFAULT_YUZU_USE_BUNDLED_OPENSSL})
-
-if (ANDROID AND YUZU_DOWNLOAD_ANDROID_VVL)
-    AddJsonPackage(vulkan-validation-layers)
-
-    set(abi ${CMAKE_ANDROID_ARCH_ABI})
-
-    set(vvl_lib_path "${CMAKE_CURRENT_SOURCE_DIR}/src/android/app/src/main/jniLibs/${abi}/")
-    file(COPY "${vulkan-validation-layers_SOURCE_DIR}/${abi}/libVkLayer_khronos_validation.so"
-        DESTINATION "${vvl_lib_path}")
-endif()
 
 if(EXISTS ${PROJECT_SOURCE_DIR}/hooks/pre-commit AND NOT EXISTS ${PROJECT_SOURCE_DIR}/.git/hooks/pre-commit)
     if (IS_DIRECTORY ${PROJECT_SOURCE_DIR}/.git)
