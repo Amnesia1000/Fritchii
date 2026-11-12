@@ -40,6 +40,7 @@
 #include "core/gpu_dirty_memory_manager.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/buffer_cache/buffer_base.h"
+#include "video_core/buffer_cache/download_read_stats.h"
 #include "video_core/buffer_cache/gpu_written_mirror.h"
 #include "video_core/buffer_cache/read_trap_tracker.h"
 #include "video_core/buffer_cache/virtual_range_cache.h"
@@ -604,6 +605,10 @@ public:
         }
         if (armed && !marked) {
             return MirrorAnswer::ArmedUnmarked;
+        }
+        // F2 counter: a read answered here skips GetFlushArea (verify mode's calls are reads too).
+        if (DownloadReadStats::g_enabled) [[unlikely]] {
+            DownloadReadStats::Read(begin, begin + length);
         }
         return MirrorAnswer::Clean;
     }
