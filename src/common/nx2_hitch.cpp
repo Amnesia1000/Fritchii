@@ -25,7 +25,16 @@ namespace Common::Nx2Hitch {
 
 namespace {
 
-constexpr long long ThresholdUs = 50'000;
+// EDEN_NX2_HITCH_MS=<ms> (boot, default 50): the present gap that logs a Hitch line. Under 50
+// (e.g. 25 for the single long frames of NPC dips) the cap rises from 60 to 600 lines a minute.
+long long ThresholdUs() {
+    static const long long threshold = [] {
+        const char* const value = std::getenv("EDEN_NX2_HITCH_MS");
+        const long long ms = value != nullptr ? std::strtoll(value, nullptr, 10) : 0;
+        return ms > 0 ? ms * 1000 : 50'000LL;
+    }();
+    return threshold;
+}
 constexpr size_t Causes = static_cast<size_t>(Cause::Count);
 constexpr size_t MaxThreads = 48;
 
@@ -224,7 +233,7 @@ void OnPresent(long long gap_us) {
         return;
     }
     const Snapshot now = Take();
-    if (gap_us >= ThresholdUs) {
+    if (gap_us >= ThresholdUs()) {
         // At most 60 lines a minute (a loading screen can stall many presents in a row; 20 hid a
         // 740 ms first load behind the title screen's gaps, 2026-11-10).
         const u64 now_ns = NowNs();
@@ -232,7 +241,7 @@ void OnPresent(long long gap_us) {
             window_start_ns = now_ns;
             lines_in_window = 0;
         }
-        if (lines_in_window++ < 60) {
+        if (lines_in_window++ < (ThresholdUs() < 50'000 ? 600 : 60)) {
             std::string causes;
             for (size_t i = 0; i < Causes; ++i) {
                 const u64 ns = now.ns[i] - last.ns[i];

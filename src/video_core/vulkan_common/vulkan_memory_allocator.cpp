@@ -30,6 +30,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/nx2_hitch.h"
 #include "common/common_types.h"
 #include "common/literals.h"
 #include "common/logging.h"
@@ -226,13 +227,17 @@ MemoryAllocator::~MemoryAllocator() = default;
 vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicated) const
 {
     vk::Image image;
+    const u64 start = Common::Nx2Hitch::NowNs();
     vk::Check(AllocateImage(ci, dedicated, false, image));
+    Common::Nx2Hitch::Add(Common::Nx2Hitch::Cause::ImageCreate, Common::Nx2Hitch::NowNs() - start);
     return image;
 }
 
 vk::Image MemoryAllocator::TryCreateImage(const VkImageCreateInfo &ci, bool dedicated) const {
     vk::Image image;
+    const u64 start = Common::Nx2Hitch::NowNs();
     const VkResult result = AllocateImage(ci, dedicated, true, image);
+    Common::Nx2Hitch::Add(Common::Nx2Hitch::Cause::ImageCreate, Common::Nx2Hitch::NowNs() - start);
     if (result != VK_ERROR_OUT_OF_DEVICE_MEMORY && result != VK_ERROR_OUT_OF_HOST_MEMORY) {
         vk::Check(result);
     }
