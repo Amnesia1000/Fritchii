@@ -49,6 +49,7 @@
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/kepler_compute.h"
+#include "video_core/fence_release_stats.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_runahead.h"
@@ -453,6 +454,22 @@ public:
     /// Pop asynchronous downloads
     void PopAsyncFlushes();
     void PopAsyncBuffers();
+
+    /// EDEN_NX2_FENCE_RELEASE_STATS (`mutex` held): what the next PopAsyncFlushes copies to guest
+    /// memory (EXP49's read downloads it also lands are not included).
+    void Nx2DescribeNextPop(FenceReleaseStats::PopLanding& landing) {
+        if (async_buffers.empty() || !async_buffers.front().has_value() ||
+            pending_downloads.empty()) {
+            return;
+        }
+        for (const BufferCopy& copy : pending_downloads.front()) {
+            FenceReleaseStats::LandedItem item{};
+            item.address = static_cast<u64>(copy.src_offset);
+            item.end = item.address + copy.size;
+            item.bytes = copy.size;
+            landing.Add(item);
+        }
+    }
 
     bool DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount);
 
