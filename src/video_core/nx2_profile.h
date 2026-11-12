@@ -102,6 +102,11 @@ enum class Zone : u32 {
     // in "stage storage buffers".
     StorageSync,     ///< Of stage storage buffers: SynchronizeBuffer (tracker walk and uploads)
     StorageMark,     ///< Of stage storage buffers: written bindings marked GPU-modified
+    // Texture cache images (fable52_answer_potroom 4): made and destroyed on the back.
+    ImageCreate,        ///< A VkImage made for a texture cache image (not taken from the pool)
+    PoolDestroyHere,    ///< An evicted pool image destroyed on the spot (TickFrame, eviction)
+    PoolDestroyIdle,    ///< EXP99=1: evicted pool images destroyed in the back's idle hook
+    PoolDestroyBacklog, ///< EXP110: the idle backlog destroyed at the frame's end
     Count,
 };
 
@@ -122,6 +127,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "geometry buffers", "storage bindings",
     "uniform bank check", "uniform stream", "uniform classic", "stage storage buffers",
     "stage texture buffers", "storage synchronize", "storage written marks",
+    "image create", "pool destroy here", "pool destroy idle", "pool destroy backlog",
 };
 static_assert(zone_names.back() != nullptr, "a zone without a name");
 
@@ -265,6 +271,8 @@ inline thread_local ThreadData t_data;
     case Zone::ListGpuWait:
     case Zone::QueryDmaWait:
     case Zone::ReadFlush:
+    case Zone::ImageCreate:
+    case Zone::PoolDestroyHere:
         return true;
     default:
         return false;

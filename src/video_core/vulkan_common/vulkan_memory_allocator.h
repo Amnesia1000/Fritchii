@@ -150,6 +150,12 @@ namespace Vulkan {
             u64 create_ns{}; ///< vkCreateImage
             u64 alloc_ns{};  ///< vmaAllocateMemoryForImage (requirements, block search, new blocks)
             u64 bind_ns{};   ///< vmaBindImageMemory
+            /// Of the images: those whose create added a VMA memory object (a new block or
+            /// dedicated memory; VMA's count across the create, so another thread's allocation
+            /// in between can count too), their whole create time, and the dedicated ones.
+            u64 new_block_images{};
+            u64 new_block_ns{};
+            u64 dedicated_images{};
         };
         static ImageTiming ReadImageTiming() noexcept;
         static bool ImageTimingEnabled() noexcept;

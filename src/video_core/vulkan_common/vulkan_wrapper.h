@@ -754,6 +754,17 @@ public:
     /// True when the image's memory is device local (not placed in host memory over budget).
     [[nodiscard]] bool IsDeviceLocal() const noexcept;
 
+    /// EDEN_NX2_IMAGE_ALLOC_TIMING: what destroying the image took, in vmaDestroyImage's two
+    /// steps, and whether VMA gave device memory back (its count of memory objects fell: an
+    /// emptied block, or the image's own dedicated memory).
+    struct DestroyTiming {
+        u64 destroy_ns{}; ///< vkDestroyImage
+        u64 free_ns{};    ///< vmaFreeMemory
+        bool block_freed{};
+    };
+    /// Destroys the image now (as Release does) with each step timed; the image is empty after.
+    DestroyTiming DestroyTimed() noexcept;
+
 private:
     void Release() const noexcept;
 
@@ -764,6 +775,10 @@ private:
     VmaAllocation allocation = nullptr;
     const DeviceDispatch* dld = nullptr;
 };
+
+/// The device memory objects VMA holds (blocks and dedicated allocations, all heaps), for
+/// EDEN_NX2_IMAGE_ALLOC_TIMING's "new block" and "block freed" counts.
+[[nodiscard]] u64 VmaMemoryObjectCount(VmaAllocator allocator) noexcept;
 
 struct MemoryLocation {
     VkDeviceMemory memory{};

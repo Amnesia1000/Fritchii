@@ -249,6 +249,9 @@ std::atomic<u64> g_timed_images{};
 std::atomic<u64> g_timed_create_ns{};
 std::atomic<u64> g_timed_alloc_ns{};
 std::atomic<u64> g_timed_bind_ns{};
+std::atomic<u64> g_timed_new_block{};    ///< Images whose create added a VMA memory object
+std::atomic<u64> g_timed_new_block_ns{}; ///< ... their create, allocate and bind time
+std::atomic<u64> g_timed_dedicated{};    ///< ... of them, dedicated allocations
 
 u64 TimingNow() noexcept {
     return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -264,6 +267,8 @@ VkResult TimedVmaCreateImage(const Device &device, VmaAllocator allocator,
                              VmaAllocationInfo &alloc_info) {
     const auto &dld = device.GetDispatchLoader();
     const VkDevice logical = *device.GetLogical();
+    // Outside the timed steps: did this image take a memory object VMA did not hold before?
+    const u64 blocks_before = vk::VmaMemoryObjectCount(allocator);
     const u64 t0 = TimingNow();
     VkResult result = dld.vkCreateImage(logical, &ci, nullptr, &handle);
     const u64 t1 = TimingNow();
@@ -300,6 +305,15 @@ VkResult TimedVmaCreateImage(const Device &device, VmaAllocator allocator,
     g_timed_create_ns.fetch_add(t1 - t0, std::memory_order_relaxed);
     g_timed_alloc_ns.fetch_add(t2 - t1, std::memory_order_relaxed);
     g_timed_bind_ns.fetch_add(t3 - t2, std::memory_order_relaxed);
+    if (vk::VmaMemoryObjectCount(allocator) > blocks_before) {
+        g_timed_new_block.fetch_add(1, std::memory_order_relaxed);
+        g_timed_new_block_ns.fetch_add(t3 - t0, std::memory_order_relaxed);
+        VmaAllocationInfo2 info2{};
+        vmaGetAllocationInfo2(allocator, allocation, &info2);
+        if (info2.dedicatedMemory) {
+            g_timed_dedicated.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     // Per image, the slow ones (over 500 us in all): is the memory a block VMA had already (a hole
     // reused) or one it just took (fable_answer_npcdips_2 section 1)? 400 lines at most.
     static std::mutex blocks_mutex;
@@ -395,6 +409,9 @@ MemoryAllocator::ImageTiming MemoryAllocator::ReadImageTiming() noexcept {
         .create_ns = g_timed_create_ns.load(std::memory_order_relaxed),
         .alloc_ns = g_timed_alloc_ns.load(std::memory_order_relaxed),
         .bind_ns = g_timed_bind_ns.load(std::memory_order_relaxed),
+        .new_block_images = g_timed_new_block.load(std::memory_order_relaxed),
+        .new_block_ns = g_timed_new_block_ns.load(std::memory_order_relaxed),
+        .dedicated_images = g_timed_dedicated.load(std::memory_order_relaxed),
     };
 }
 

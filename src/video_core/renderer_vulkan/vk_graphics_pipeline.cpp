@@ -1999,6 +1999,41 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             }
         }
     }
+    if (texture_cache.DepthCensusOn()) [[unlikely]] {
+        // EDEN_NX2_DEPTH_CENSUS: which of the D32 targets made this frame this draw samples,
+        // with the sampler and how the shader reads it (views laid out as in record_sampled).
+        size_t view_index{};
+        size_t sampler_index{};
+        for (size_t stage = 0; stage < Spec::enabled_stages.size(); ++stage) {
+            if (!Spec::enabled_stages[stage]) {
+                continue;
+            }
+            const Shader::Info& info{stage_infos[stage]};
+            if constexpr (Spec::has_texture_buffers) {
+                view_index += Shader::NumDescriptors(info.texture_buffer_descriptors);
+            }
+            if constexpr (Spec::has_image_buffers) {
+                view_index += Shader::NumDescriptors(info.image_buffer_descriptors);
+            }
+            for (const auto& desc : info.texture_descriptors) {
+                for (u32 i = 0; i < desc.count; ++i, ++view_index, ++sampler_index) {
+                    if (view_index >= views.size()) {
+                        break;
+                    }
+                    const bool has_sampler = sampler_index < samplers.size() &&
+                                             samplers[sampler_index] != VideoCommon::SamplerId{};
+                    texture_cache.CensusNoteSampled(
+                        views[view_index].id,
+                        has_sampler ? &texture_cache.GetSampler(samplers[sampler_index]).Descriptor()
+                                    : nullptr,
+                        desc.census_use, desc.is_depth);
+                }
+            }
+            if constexpr (Spec::has_images) {
+                view_index += Shader::NumDescriptors(info.image_descriptors);
+            }
+        }
+    }
 
     if constexpr (Spec::has_texture_buffers || Spec::has_image_buffers) {
         VideoCommon::ImageViewInOut* texture_buffer_it{views.data()};

@@ -290,6 +290,16 @@ public:
     /// Return a constant reference to the given sampler id
     [[nodiscard]] const Sampler& GetSampler(SamplerId id) const noexcept;
 
+    /// EDEN_NX2_DEPTH_CENSUS=1 (boot, off; fable52_answer_potroom 4): per 600 frames, what the
+    /// D32 render targets the cache makes are used for. One load when off.
+    [[nodiscard]] bool DepthCensusOn() const noexcept {
+        return depth_census_on;
+    }
+    /// The depth census: a draw samples `view_id` with `sampler` (null if unknown); `shader_use`
+    /// is the descriptor's census_use (Shader::TextureDescriptor), `shader_dref` its is_depth.
+    void CensusNoteSampled(ImageViewId view_id, const TSCEntry* sampler, u8 shader_use,
+                           bool shader_dref);
+
     /// Return a reference to the given sampler id
     [[nodiscard]] Sampler& GetSampler(SamplerId id) noexcept;
 
@@ -913,6 +923,75 @@ private:
     u64 pad_skipped_other{};   ///< ... refused: rescaling, not plain 2D, sampled address
     u64 pad_sampled{};
     u32 pad_logged{};
+
+    /// EDEN_NX2_DEPTH_CENSUS (see DepthCensusOn). A D32 render target the cache made, followed
+    /// until it is deleted or CensusMaxAge frames old, then counted.
+    const bool depth_census_on = [] {
+        const char* value = std::getenv("EDEN_NX2_DEPTH_CENSUS");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    static constexpr u64 CensusMaxAge = 120;
+    struct CensusTarget {
+        GPUVAddr gpu_addr{};
+        u64 frame{};             ///< frame_tick when made
+        bool cleared{};          ///< a clear of depth (or stencil) with it bound
+        bool drawn{};            ///< a draw with it bound as the depth target
+        bool drawn_writes{};     ///< ... one with depth test and depth writes on
+        bool sampled_same{};     ///< first sampled by a draw in the frame it was made
+        bool sampled_later{};    ///< first sampled in a later frame
+        bool cpu_read{};         ///< downloaded for a guest read
+        bool dma_read{};         ///< copied to a buffer (DownloadImageIntoBuffer)
+        bool via_texture{};      ///< joined into an image a texture lookup made
+        u8 shader_use{};         ///< census_use bits of every sampling descriptor, or'ed
+    };
+    std::unordered_map<ImageId, CensusTarget> census_live;
+    std::unordered_map<GPUVAddr, ImageId> census_by_addr; ///< The newest live target per address
+    struct CensusMade {
+        GPUVAddr gpu_addr;
+        u32 width;
+        u32 height;
+    };
+    std::vector<CensusMade> census_this_frame; ///< In the order made: the n-th of the frame
+    std::vector<CensusMade> census_last_frame;
+    /// Since the last report. Made: counted when made; the rest when the target is done.
+    struct CensusCounts {
+        u64 made{};
+        u64 at_floor{};          ///< 384x384
+        u64 no_predecessor{};    ///< no n-th target last frame
+        u64 same_address{};      ///< at the address of last frame's n-th
+        u64 moved{};
+        std::array<u64, 4> side_change{}; ///< vs last frame's n-th: 0, 1-8, 9-64, more
+        u64 done{};
+        u64 cleared_and_drawn{};
+        u64 cleared_only{};
+        u64 drawn_only{};
+        u64 neither{};
+        u64 drawn_writes{};
+        u64 sampled_same{};
+        u64 sampled_later{};
+        u64 never_sampled{};
+        u64 via_texture{};
+        u64 cpu_read{};
+        u64 dma_read{};
+        u64 deleted{};           ///< done by deletion (the rest aged out at CensusMaxAge)
+        // Of the sampled, at the first sampling draw:
+        std::array<u64, 4> address_mode{}; ///< u and v: repeat/mirror, clamp, border, mixed
+        u64 compare_on{};        ///< the sampler's depth compare
+        u64 shader_dref{};       ///< the shader samples with a depth reference
+        u64 no_sampler{};
+        // Of the sampled, any sampling descriptor (or'ed):
+        u64 use_unknown{};       ///< shader info from the precompiled cache (no census bits)
+        u64 use_fetch{};
+        u64 use_query{};
+        u64 use_offset{};
+        u64 use_gather{};
+        u64 use_rect{};
+    } census{};
+    void CensusNoteMade(ImageId image_id, const ImageInfo& info, GPUVAddr gpu_addr);
+    void CensusNoteRenderTargets(bool is_clear);
+    void CensusNoteRead(const ImageBase& image, bool dma);
+    void CensusFinish(ImageId image_id, bool deleted);
+    void CensusTickFrame();
     /// EXP64 check: images made again (not by a clear) at a retired image's address and shape
     /// within 16 render frames: a reader of the retired contents, which got guest memory instead.
     u64 slot_remade{};

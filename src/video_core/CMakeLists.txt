@@ -133,6 +133,7 @@ add_library(video_core STATIC
     nx2_precompile.h
     nx2_recipe.cpp
     nx2_recipe.h
+    nx2_report_census.h
     nx2_debug_control.h
     nx2_frame_fence.h
     nx2_list_verify.h

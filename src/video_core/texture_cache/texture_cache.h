@@ -45,6 +45,8 @@
 #include "video_core/nx2.h"
 #include "video_core/churn_counters.h"
 #include "video_core/nx2_profile.h"
+#include "shader_recompiler/shader_info.h"
+#include "video_core/nx2_report_census.h"
 #include "video_core/render_trace.h"
 #include "video_core/textures/decoders.h"
 
@@ -853,6 +855,9 @@ void TextureCache<P>::TickFrame() {
                  no_pool_marked);
         clear_exact_used = clear_exact_confirmed = clear_exact_missed = clear_exact_unchecked = 0;
         no_pool_marked = 0;
+    }
+    if (depth_census_on) [[unlikely]] {
+        CensusTickFrame();
     }
     if ((pad_depth_lookups != 0 || pad_sampled != 0) && frame_tick % 600 == 0) {
         LOG_INFO(HW_GPU,
@@ -1834,6 +1839,16 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
         }
     } clearing_scope{clearing_render_targets};
     clearing_render_targets = is_clear;
+    // EDEN_NX2_DEPTH_CENSUS: the depth target bound once this update is done, on every path out.
+    struct CensusScope {
+        TextureCache& cache;
+        bool is_clear;
+        ~CensusScope() {
+            if (cache.depth_census_on) [[unlikely]] {
+                cache.CensusNoteRenderTargets(is_clear);
+            }
+        }
+    } census_scope{*this, is_clear};
     auto& flags = maxwell3d->dirty.flags;
     if (render_targets_out_of_memory) [[unlikely]] {
         // A target had no memory at the last update: look every target up again, even if
@@ -2280,6 +2295,9 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
         }
         auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
         auto copies = FullDownloadCopies(image.info);
+        if (depth_census_on) [[unlikely]] {
+            CensusNoteRead(image, false);
+        }
         image.DownloadMemory(map, copies);
         pending_bytes += image.unswizzled_size_bytes;
         pending.push_back(Pending{image_id, map, std::move(copies)});
@@ -2825,6 +2843,9 @@ void TextureCache<P>::CommitAsyncFlushes() {
                 if (download_info.is_swizzle) {
                     Image& image = download_info.GetImage(slot_images);
                     const auto copies = FullDownloadCopies(image.info);
+                    if (depth_census_on) [[unlikely]] {
+                        CensusNoteRead(image, false);
+                    }
                     image.DownloadMemory(download_map, copies);
                     download_map.offset += Common::AlignUp(image.unswizzled_size_bytes, 64);
                 }
@@ -2898,6 +2919,9 @@ void TextureCache<P>::PopAsyncFlushes() {
             }
             Image& image = download_info.GetImage(slot_images);
             const auto copies = FullDownloadCopies(image.info);
+            if (depth_census_on) [[unlikely]] {
+                CensusNoteRead(image, false);
+            }
             image.DownloadMemory(download_map, copies);
             download_map.offset += image.unswizzled_size_bytes;
         }
@@ -3024,6 +3048,9 @@ void TextureCache<P>::DownloadImageIntoBuffer(typename TextureCache<P>::Image* i
                                               size_t buffer_offset,
                                               std::span<const VideoCommon::BufferImageCopy> copies,
                                               GPUVAddr address, size_t size) {
+    if (depth_census_on) [[unlikely]] {
+        CensusNoteRead(*image, true);
+    }
     if constexpr (IMPLEMENTS_ASYNC_DOWNLOADS) {
         const BufferDownload new_buffer_download{address, size};
         auto slot = slot_buffer_downloads.insert(new_buffer_download);
@@ -4660,6 +4687,19 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     const auto create_start = std::chrono::steady_clock::now();
     const ImageId new_image_id = slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
     rt_stats.create_ns += NsSince(create_start);
+    if (depth_census_on && !render_target_lookup) [[unlikely]] {
+        // EDEN_NX2_DEPTH_CENSUS: a texture lookup's image takes census targets in.
+        const auto mark = [this](ImageId id) {
+            if (const auto it = census_live.find(id); it != census_live.end()) {
+                it->second.via_texture = true;
+            }
+        };
+        for (const auto& copy : join_copies_to_do) {
+            mark(copy.id);
+        }
+        std::ranges::for_each(join_left_aliased_ids, mark);
+        std::ranges::for_each(join_right_aliased_ids, mark);
+    }
     NoteMadeShape(new_info);
     if constexpr (requires(const Image& image) { image.FromPool(); }) {
         rt_stats.pooled_images += slot_images[new_image_id].FromPool() ? 1 : 0;
@@ -5032,6 +5072,10 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     }
     rt_stats.delete_ns += NsSince(joined_delete_start);
 
+    if (depth_census_on && render_target_lookup &&
+        new_info.format == VideoCore::Surface::PixelFormat::D32_FLOAT) [[unlikely]] {
+        CensusNoteMade(new_image_id, new_info, gpu_addr);
+    }
     RegisterImage(new_image_id);
     return new_image_id;
 }
@@ -5199,6 +5243,186 @@ SamplerId TextureCache<P>::FindSampler(const TSCEntry& config, bool compute) {
         pair->second = slot_samplers.insert(runtime, config);
     }
     return pair->second;
+}
+
+template <class P>
+void TextureCache<P>::CensusNoteMade(ImageId image_id, const ImageInfo& info, GPUVAddr gpu_addr) {
+    const size_t n = census_this_frame.size();
+    ++census.made;
+    if (info.size.width == 384 && info.size.height == 384) {
+        ++census.at_floor;
+    }
+    if (n < census_last_frame.size()) {
+        const CensusMade& prev = census_last_frame[n];
+        ++(prev.gpu_addr == gpu_addr ? census.same_address : census.moved);
+        const u32 dw = prev.width > info.size.width ? prev.width - info.size.width
+                                                    : info.size.width - prev.width;
+        const u32 dh = prev.height > info.size.height ? prev.height - info.size.height
+                                                      : info.size.height - prev.height;
+        const u32 side = (std::max)(dw, dh);
+        ++census.side_change[side == 0 ? 0 : side <= 8 ? 1 : side <= 64 ? 2 : 3];
+    } else {
+        ++census.no_predecessor;
+    }
+    census_this_frame.push_back({gpu_addr, info.size.width, info.size.height});
+    census_live[image_id] = CensusTarget{.gpu_addr = gpu_addr, .frame = frame_tick};
+    census_by_addr[gpu_addr] = image_id;
+}
+
+template <class P>
+void TextureCache<P>::CensusNoteRenderTargets(bool is_clear) {
+    const ImageViewId view_id = render_targets.depth_buffer_id;
+    if (view_id == NULL_IMAGE_VIEW_ID || view_id == ImageViewId{}) {
+        return;
+    }
+    const auto it = census_live.find(slot_image_views[view_id].image_id);
+    if (it == census_live.end()) {
+        return;
+    }
+    const auto& regs = maxwell3d->regs;
+    CensusTarget& target = it->second;
+    if (is_clear) {
+        target.cleared |= regs.clear_surface.Z != 0 || regs.clear_surface.S != 0;
+    } else {
+        target.drawn = true;
+        target.drawn_writes |= regs.depth_test_enable != 0 && regs.depth_write_enabled != 0;
+    }
+}
+
+template <class P>
+void TextureCache<P>::CensusNoteSampled(ImageViewId view_id, const TSCEntry* sampler,
+                                        u8 shader_use, bool shader_dref) {
+    if (view_id == NULL_IMAGE_VIEW_ID || view_id == ImageViewId{}) {
+        return;
+    }
+    const auto it = census_live.find(slot_image_views[view_id].image_id);
+    if (it == census_live.end()) {
+        return;
+    }
+    CensusTarget& target = it->second;
+    target.shader_use |= shader_use;
+    if (target.sampled_same || target.sampled_later) {
+        return;
+    }
+    (target.frame == frame_tick ? target.sampled_same : target.sampled_later) = true;
+    census.shader_dref += shader_dref ? 1 : 0;
+    if (sampler == nullptr) {
+        ++census.no_sampler;
+        return;
+    }
+    using Tegra::Texture::WrapMode;
+    const auto kind = [](WrapMode mode) {
+        switch (mode) {
+        case WrapMode::Wrap:
+        case WrapMode::Mirror:
+            return 0;
+        case WrapMode::Border:
+        case WrapMode::MirrorOnceBorder:
+            return 2;
+        default:
+            return 1; // clamp to edge, clamp, the mirror-once clamps
+        }
+    };
+    const int u = kind(sampler->wrap_u);
+    const int v = kind(sampler->wrap_v);
+    ++census.address_mode[u == v ? u : 3];
+    census.compare_on += sampler->depth_compare_enabled != 0 ? 1 : 0;
+}
+
+template <class P>
+void TextureCache<P>::CensusNoteRead(const ImageBase& image, bool dma) {
+    const auto by_addr = census_by_addr.find(image.gpu_addr);
+    if (by_addr == census_by_addr.end() || &slot_images[by_addr->second] != &image) {
+        return;
+    }
+    const auto it = census_live.find(by_addr->second);
+    if (it != census_live.end()) {
+        (dma ? it->second.dma_read : it->second.cpu_read) = true;
+    }
+}
+
+template <class P>
+void TextureCache<P>::CensusFinish(ImageId image_id, bool deleted) {
+    const auto it = census_live.find(image_id);
+    if (it == census_live.end()) {
+        return;
+    }
+    const CensusTarget& t = it->second;
+    ++census.done;
+    census.deleted += deleted ? 1 : 0;
+    if (t.cleared && t.drawn) {
+        ++census.cleared_and_drawn;
+    } else if (t.cleared) {
+        ++census.cleared_only;
+    } else if (t.drawn) {
+        ++census.drawn_only;
+    } else {
+        ++census.neither;
+    }
+    census.drawn_writes += t.drawn_writes ? 1 : 0;
+    census.via_texture += t.via_texture ? 1 : 0;
+    census.cpu_read += t.cpu_read ? 1 : 0;
+    census.dma_read += t.dma_read ? 1 : 0;
+    if (t.sampled_same || t.sampled_later) {
+        ++(t.sampled_same ? census.sampled_same : census.sampled_later);
+        using Desc = Shader::TextureDescriptor;
+        if ((t.shader_use & Desc::CensusKnown) == 0) {
+            ++census.use_unknown;
+        } else {
+            census.use_fetch += (t.shader_use & Desc::CensusFetch) != 0 ? 1 : 0;
+            census.use_query += (t.shader_use & Desc::CensusQuery) != 0 ? 1 : 0;
+            census.use_offset += (t.shader_use & Desc::CensusOffset) != 0 ? 1 : 0;
+            census.use_gather += (t.shader_use & Desc::CensusGather) != 0 ? 1 : 0;
+            census.use_rect += (t.shader_use & Desc::CensusRect) != 0 ? 1 : 0;
+        }
+    } else {
+        ++census.never_sampled;
+    }
+    if (const auto by_addr = census_by_addr.find(t.gpu_addr);
+        by_addr != census_by_addr.end() && by_addr->second == image_id) {
+        census_by_addr.erase(by_addr);
+    }
+    census_live.erase(it);
+}
+
+template <class P>
+void TextureCache<P>::CensusTickFrame() {
+    census_last_frame.swap(census_this_frame);
+    census_this_frame.clear();
+    std::vector<ImageId> aged;
+    for (const auto& [image_id, target] : census_live) {
+        if (frame_tick - target.frame > CensusMaxAge) {
+            aged.push_back(image_id);
+        }
+    }
+    for (const ImageId image_id : aged) {
+        CensusFinish(image_id, false);
+    }
+    if (frame_tick % 600 != 0) {
+        return;
+    }
+    const CensusCounts& c = census;
+    LOG_INFO(HW_GPU,
+             "Depth census (EDEN_NX2_DEPTH_CENSUS) last 600 frames: {} D32 targets made, {} at "
+             "384x384; vs last frame's n-th: {} same address, {} moved, {} none; side change "
+             "0/1-8/9-64/more {}/{}/{}/{}. Done {} ({} deleted, the rest {} frames old): "
+             "cleared+drawn {}, cleared only {}, drawn only {}, neither {} ({} drawn with depth "
+             "writes); sampled same frame {}, later {}, never {}; joined into a texture lookup's "
+             "image {}; CPU-read {}, copied to a buffer {}. Sampled, first sampler: address "
+             "repeat/clamp/border/mixed {}/{}/{}/{}, compare on {}, shader depth-reference {}, "
+             "no sampler {}; shader reads: fetch {}, size query {}, offsets {}, gather {}, rect "
+             "{}, unknown (precompiled info) {}; {} live",
+             c.made, c.at_floor, c.same_address, c.moved, c.no_predecessor, c.side_change[0],
+             c.side_change[1], c.side_change[2], c.side_change[3], c.done, c.deleted,
+             CensusMaxAge, c.cleared_and_drawn, c.cleared_only, c.drawn_only, c.neither,
+             c.drawn_writes, c.sampled_same, c.sampled_later, c.never_sampled, c.via_texture,
+             c.cpu_read, c.dma_read, c.address_mode[0], c.address_mode[1], c.address_mode[2],
+             c.address_mode[3], c.compare_on, c.shader_dref, c.no_sampler, c.use_fetch,
+             c.use_query, c.use_offset, c.use_gather, c.use_rect, c.use_unknown,
+             census_live.size());
+    census = {};
+    // The same switch: the occlusion reports and the 0xe2c reads of them (potroom 4b).
+    VideoCommon::Nx2ReportCensus::LogAndReset();
 }
 
 template <class P>
@@ -5703,6 +5927,9 @@ void TextureCache<P>::UntrackImage(ImageBase& image, ImageId image_id) {
 
 template <class P>
 void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
+    if (depth_census_on) [[unlikely]] {
+        CensusFinish(image_id, true);
+    }
     ImageBase& image = slot_images[image_id];
     ++images_deleted;
     Churn::Add(Churn::ImagesDeleted);

@@ -245,6 +245,16 @@ struct TextureDescriptor {
     /// Whether the constant buffer word above reaches the handle only as the address of a load:
     /// a pointer, never a texture handle, which binds no texture (see HandleIsStoragePointer)
     bool handle_is_pointer_word{};
+    /// EDEN_NX2_DEPTH_CENSUS (fable52_answer_potroom 4): how the shader reads the texture, the
+    /// Census* bits of every instruction on it. Not stored with the info (info_serialize.cpp):
+    /// 0 for an info from the precompiled cache, CensusKnown unset. In the struct's padding.
+    u8 census_use{};
+    static constexpr u8 CensusKnown = 1;  ///< Set by the texture pass
+    static constexpr u8 CensusFetch = 2;  ///< texelFetch
+    static constexpr u8 CensusQuery = 4;  ///< textureSize (ImageQueryDimensions)
+    static constexpr u8 CensusOffset = 8; ///< a sample, fetch or gather with texel offsets
+    static constexpr u8 CensusGather = 16;
+    static constexpr u8 CensusRect = 32;  ///< a rectangle texture sampled (normalized by size)
 
     auto operator<=>(const TextureDescriptor&) const = default;
 };
