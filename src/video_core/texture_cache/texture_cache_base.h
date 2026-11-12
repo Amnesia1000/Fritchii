@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -598,6 +599,34 @@ private:
     /// it by the hash of its guest bytes and logs a summary every 10 s (are a kill's effect
     /// textures made again each time? fable52_answer_backdraw (b) 4).
     void NoteNewSampledImage(ImageId image_id, GPUVAddr gpu_addr);
+
+    /// EDEN_NX2_IMAGE_HASH_LOG: why images are deleted, so a texture made again can say what
+    /// killed its previous copy at that address.
+    static bool ImageHashLogEnabled() {
+        static const bool enabled = [] {
+            const char* const value = std::getenv("EDEN_NX2_IMAGE_HASH_LOG");
+            return value != nullptr && value[0] == '1';
+        }();
+        return enabled;
+    }
+    enum class DeleteReason : u8 { Other, GarbageCollect, ColdSweep, Unmap, Join, SlotRetire, Count };
+    DeleteReason delete_reason = DeleteReason::Other;
+    struct DeleteReasonScope {
+        DeleteReasonScope(TextureCache& cache_, DeleteReason reason)
+            : cache{cache_}, previous{cache_.delete_reason} {
+            cache.delete_reason = reason;
+        }
+        ~DeleteReasonScope() {
+            cache.delete_reason = previous;
+        }
+        TextureCache& cache;
+        DeleteReason previous;
+    };
+    /// Deleted images by address: the reason, bit 7 set when the GPU had written the image.
+    std::unordered_map<GPUVAddr, u8> nx2_deleted_reasons;
+    std::array<u64, static_cast<size_t>(DeleteReason::Count)> nx2_deletes{};
+    std::array<u64, static_cast<size_t>(DeleteReason::Count) * 2> nx2_remade_after{};
+    u64 nx2_remade_unknown = 0;
 
     /// Create a new image and join perfectly matching existing images
     /// Remove joined images from the cache

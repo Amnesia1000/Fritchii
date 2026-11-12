@@ -150,6 +150,7 @@ TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManag
 
 template <class P>
 void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
+    const DeleteReasonScope delete_reason_scope{*this, DeleteReason::GarbageCollect};
     bool high_priority_mode = false;
     bool aggressive_mode = false;
     bool evict_old_costly = false;
@@ -938,6 +939,7 @@ bool TextureCache<P>::ColdSuperseded(ImageId image_id, const ImageBase& image) {
 
 template <class P>
 void TextureCache<P>::SweepColdImages() {
+    const DeleteReasonScope delete_reason_scope{*this, DeleteReason::ColdSweep};
     const u64 cold_frames = TcColdFrames();
     if (cold_frames == 0) {
         return;
@@ -2193,6 +2195,7 @@ std::optional<VideoCore::RasterizerDownloadArea> TextureCache<P>::GetFlushArea(D
 
 template <class P>
 void TextureCache<P>::UnmapMemory(DAddr cpu_addr, size_t size) {
+    const DeleteReasonScope delete_reason_scope{*this, DeleteReason::Unmap};
     // EDEN_NX2_TEX_BANK_GEN: a watched page leaving its mapping drops every watch (their trap
     // counts go back while the pages are still mapped; memos of the old epoch miss).
     if (!tex_bank_pages.empty()) {
@@ -3801,12 +3804,17 @@ ImageId TextureCache<P>::InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
 
 template <class P>
 void TextureCache<P>::NoteNewSampledImage(ImageId image_id, GPUVAddr gpu_addr) {
-    static const bool enabled = [] {
-        const char* const value = std::getenv("EDEN_NX2_IMAGE_HASH_LOG");
-        return value != nullptr && value[0] == '1';
-    }();
-    if (!enabled) [[likely]] {
+    if (!ImageHashLogEnabled()) [[likely]] {
         return;
+    }
+    // What deleted the previous image at this address (bit 7: the GPU had written it).
+    if (const auto it = nx2_deleted_reasons.find(gpu_addr); it != nx2_deleted_reasons.end()) {
+        const size_t reason = it->second & 0x7f;
+        const size_t gpu_written = (it->second & 0x80) != 0 ? 1 : 0;
+        ++nx2_remade_after[reason * 2 + gpu_written];
+        nx2_deleted_reasons.erase(it);
+    } else {
+        ++nx2_remade_unknown;
     }
     struct Seen {
         u32 count = 0;
@@ -3856,6 +3864,23 @@ void TextureCache<P>::NoteNewSampledImage(ImageId image_id, GPUVAddr gpu_addr) {
              "New sampled images (EDEN_NX2_IMAGE_HASH_LOG) last 10 s: {} made, {} with bytes made "
              "before ({} KiB); {} different so far; most made:{}",
              made, made_again, bytes_again >> 10, seen.size(), text.empty() ? " none twice" : text);
+    // Reason order: other, garbage collect, cold sweep, unmap, join, slot retire.
+    static constexpr std::array<const char*, static_cast<size_t>(DeleteReason::Count)> names{
+        "other", "garbage collect", "cold sweep", "unmap", "join", "slot retire"};
+    std::string deletes;
+    std::string remade;
+    for (size_t r = 0; r < names.size(); ++r) {
+        deletes += fmt::format(" {} {};", names[r], nx2_deletes[r]);
+        remade += fmt::format(" {} {}/{};", names[r], nx2_remade_after[r * 2],
+                              nx2_remade_after[r * 2 + 1]);
+    }
+    LOG_INFO(HW_GPU,
+             "Images deleted last 10 s by:{} | new sampled images whose previous image at that "
+             "address was deleted by (not GPU-written/GPU-written):{} no earlier image there {}",
+             deletes, remade, nx2_remade_unknown);
+    nx2_deletes = {};
+    nx2_remade_after = {};
+    nx2_remade_unknown = 0;
     made = 0;
     made_again = 0;
     bytes_again = 0;
@@ -3863,6 +3888,7 @@ void TextureCache<P>::NoteNewSampledImage(ImageId image_id, GPUVAddr gpu_addr) {
 
 template <class P>
 ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DAddr cpu_addr) {
+    const DeleteReasonScope delete_reason_scope{*this, DeleteReason::Join};
     ImageInfo new_info = info;
     const size_t size_bytes = CalculateGuestSizeInBytes(new_info);
     const bool broken_views = runtime.HasBrokenTextureViewFormats();
@@ -5280,6 +5306,14 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     ++images_deleted;
     Churn::Add(Churn::ImagesDeleted);
     ++bindings_epoch;
+    if (ImageHashLogEnabled()) [[unlikely]] {
+        const auto reason = static_cast<size_t>(delete_reason);
+        ++nx2_deletes[reason];
+        if (nx2_deleted_reasons.size() < 200'000) {
+            nx2_deleted_reasons[image.gpu_addr] = static_cast<u8>(
+                reason | (True(image.flags & ImageFlagBits::GpuModified) ? 0x80 : 0));
+        }
+    }
     MarkStale(image);
     // Drop every decode still queued for it, whatever IsDecoding says: an image re-decoded while
     // a decode was in flight has two, and the first to finish clears the flag. A decode left
@@ -5579,6 +5613,7 @@ void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
 
 template <class P>
 u32 TextureCache<P>::RetireSlotPredecessors(const ImageInfo& new_info, GPUVAddr gpu_addr) {
+    const DeleteReasonScope delete_reason_scope{*this, DeleteReason::SlotRetire};
     if (!RelocationShaped(new_info)) {
         return 0;
     }
