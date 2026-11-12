@@ -471,6 +471,19 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// limit. EDEN_NX2_IDLE_STATS=1 logs each core's idle periods every 10 s (polled, blocked, wake
 /// latency). Blocking still uses EDEN_NX2_CORE_LOCK's address wait when that is on. In OoT the
 /// guest threads' handoffs sit on the frame's critical path. Off by default.
+/// EXP87 (live, read per draw, 0 = off; port of zortos293/Lichii#1447; GraphicsPipeline::
+/// ConfigureImpl): draw templates. A pipeline whose bindings are all sampled textures with handles
+/// read from constant buffers keeps each draw's views, samplers, texture descriptors and rescaling
+/// words in a shared table (8,192 slots, 4-way, keyed on the pipeline, the address space, the
+/// texture and sampler pools and the handle words). A later draw with the same key, also in a
+/// later frame, takes them instead of resolving its views and samplers and pushing descriptors,
+/// while the template's TIC and TSC bytes are still in memory, no mapping changed
+/// (HostPointerSerial), no image changed its scale (ScaleEpoch) and none of its views was deleted
+/// or moved (ImageViewGeneration). Not with EXP32 or EDEN_NX2_TEX_BANK_GEN on, for mesh pipelines,
+/// or with the OoT FSR LOD bias on a sampler. 1 = on; 2 = verify: draws a template holds for are
+/// resolved in full and compared with it, nothing taken from templates ("Draw template verify in
+/// 10 s: ... mismatched" must stay 0). With EXP87 != 0, "Draw templates in 10 s" logs hits,
+/// misses, kept templates and rejections every 10 s.
 /// EXP86 (live, 0 = off; fable52_answer_gpuwritten; RasterizerVulkan::GetFlushArea): a guest
 /// read of pages the GPU ever wrote (no image there, EXP36 and EXP81 off) skips the caches' locks
 /// when the buffer cache's page mirrors (gpu_written_mirror.h) say the locked path would answer

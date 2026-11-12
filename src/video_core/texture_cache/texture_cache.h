@@ -1564,6 +1564,89 @@ bool TextureCache<P>::PrepareTexBankViews(std::span<const ImageViewId> views) {
 }
 
 template <class P>
+DrawTemplateContext TextureCache<P>::GraphicsTextureContext(u64 owner) const noexcept {
+    const auto& image_table = channel_state->graphics_image_table;
+    const auto& sampler_table = channel_state->graphics_sampler_table;
+    return {
+        .owner = owner,
+        .memory = reinterpret_cast<uintptr_t>(gpu_memory),
+        .image_table = reinterpret_cast<uintptr_t>(&image_table),
+        .tic_address = image_table.current_gpu_addr,
+        .tsc_address = sampler_table.current_gpu_addr,
+        .tic_limit = image_table.current_limit,
+        .tsc_limit = sampler_table.current_limit,
+        .via_header_index =
+            maxwell3d->regs.sampler_binding ==
+                    Tegra::Engines::Maxwell3D::Regs::SamplerBinding::ViaHeaderBinding
+                ? 1U
+                : 0U,
+        .native_tiling = gpu_memory->UsesNativeTiling() ? 1U : 0U,
+    };
+}
+
+template <class P>
+bool TextureCache<P>::KeepTemplateTextures(std::span<const u32> handles,
+                                           std::span<const ImageViewInOut> views,
+                                           std::span<const SamplerId> samplers,
+                                           std::vector<DrawTemplateTexture>& textures) {
+    textures.clear();
+    const auto& image_table = channel_state->graphics_image_table;
+    const auto& sampler_table = channel_state->graphics_sampler_table;
+    if (image_table.invalidated || sampler_table.invalidated || handles.size() != views.size() ||
+        handles.size() != samplers.size()) {
+        return false;
+    }
+    const bool via_header_index = maxwell3d->regs.sampler_binding ==
+                                  Tegra::Engines::Maxwell3D::Regs::SamplerBinding::ViaHeaderBinding;
+    const bool native_tiling = gpu_memory->UsesNativeTiling();
+    const auto host_of = [&](GPUVAddr address, size_t size) -> const u8* {
+        if ((address & Core::Memory::YUZU_PAGEMASK) + size > Core::Memory::YUZU_PAGESIZE) {
+            return nullptr;
+        }
+        return gpu_memory->GetPointer(address);
+    };
+    for (size_t i = 0; i < handles.size(); ++i) {
+        const auto [view_index, sampler_index] =
+            Tegra::Texture::TexturePair(handles[i], via_header_index);
+        const u32 tic_index = Tegra::Texture::TextureHeaderIndex(
+            view_index, image_table.current_limit, native_tiling);
+        // A null view can stand for an image that failed to allocate, which the next read of the
+        // descriptor after TickFrame's collection makes again: a template would keep it null.
+        if (!views[i].id || views[i].id == NULL_IMAGE_VIEW_ID || !samplers[i] ||
+            tic_index > image_table.current_limit ||
+            sampler_index > sampler_table.current_limit) {
+            return false;
+        }
+        const DrawTemplateTexture& texture = textures.emplace_back(DrawTemplateTexture{
+            .tic_host = host_of(image_table.current_gpu_addr + tic_index * sizeof(TICEntry),
+                                sizeof(TICEntry)),
+            .tsc_host = host_of(sampler_table.current_gpu_addr + sampler_index * sizeof(TSCEntry),
+                                sizeof(TSCEntry)),
+            .tic = image_table.descriptors[tic_index],
+            .tsc = sampler_table.descriptors[sampler_index],
+            .view = views[i].id,
+            .view_generation = ImageViewGeneration(views[i].id),
+            .sampler = samplers[i],
+        });
+        if (texture.tic_host == nullptr || texture.tsc_host == nullptr ||
+            std::memcmp(texture.tic_host, &texture.tic, sizeof(texture.tic)) != 0 ||
+            std::memcmp(texture.tsc_host, &texture.tsc, sizeof(texture.tsc)) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+template <class P>
+bool TextureCache<P>::PrepareTemplateViews(std::span<const ImageViewInOut> views) {
+    has_deleted_images = false;
+    for (const ImageViewInOut& view : views) {
+        PrepareImageView(view.id, false, false);
+    }
+    return !has_deleted_images;
+}
+
+template <class P>
 std::optional<DAddr> TextureCache<P>::TexBankDevicePage(GPUVAddr gpu_addr) const {
     const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
     if (!device_addr) {
@@ -3576,6 +3659,7 @@ bool TextureCache<P>::ImageCanRescale(ImageBase& image) {
 template <class P>
 void TextureCache<P>::InvalidateScale(Image& image) {
     ++bindings_epoch;
+    ++scale_epoch; // ScaleEpoch: draw templates (EXP87) keep rescaling words
     if (image.scale_tick <= frame_tick) {
         image.scale_tick = frame_tick + 1;
     }
@@ -3597,6 +3681,7 @@ void TextureCache<P>::InvalidateScale(Image& image) {
     for (const ImageViewId image_view_id : image_view_ids) {
         sentenced_image_view.Push(std::move(slot_image_views[image_view_id]));
         slot_image_views.erase(image_view_id);
+        BumpImageViewGeneration(image_view_id);
         Churn::Add(Churn::ImageViewsDestroyed);
     }
     image.image_view_ids.clear();
@@ -5619,6 +5704,7 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
             sentenced_image_view.Push(std::move(slot_image_views[image_view_id]));
         }
         slot_image_views.erase(image_view_id);
+        BumpImageViewGeneration(image_view_id);
         Churn::Add(Churn::ImageViewsDestroyed);
     }
     const bool retained = RetainPendingImageDownloads(image_id, slot_images[image_id],
@@ -5707,6 +5793,11 @@ void TextureCache<P>::RelocateImage(ImageId image_id, GPUVAddr gpu_addr, DAddr c
         }
     }
     RemoveImageViewReferences(image.image_view_ids);
+    // The views stay, but their descriptors now resolve to other views (the image is no longer
+    // at the old address): draw templates (EXP87) keeping them must not hold.
+    for (const ImageViewId image_view_id : image.image_view_ids) {
+        BumpImageViewGeneration(image_view_id);
+    }
     // 4. The new address. Contents count as the guest's (the clear overwrites them whole, and
     // PrepareImage's invalidate path drops the upload, as for a new image).
     image.gpu_addr = gpu_addr;
