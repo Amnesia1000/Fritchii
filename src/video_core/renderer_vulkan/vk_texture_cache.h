@@ -522,7 +522,21 @@ public:
     u64 image_pool_dropped_idle{}; ///< EXP99=1: destroyed in the back's idle hook
     u64 image_pool_dropped_frame_end{}; ///< EXP110: backlog past 64 MiB, destroyed at frame end
     /// EXP99=1's backlog: destroys up to `max`, returns how many went.
-    u32 DestroyPooledBacklog(u32 max, const char* span_name);
+    u32 DestroyPooledBacklog(u32 max, const char* span_name, bool frame_end);
+    /// EDEN_NX2_IMAGE_ALLOC_TIMING: pool image destroys timed in vmaDestroyImage's steps, per
+    /// place, summed since the last "Image pool destroys" line (fable52_answer_potroom 4).
+    struct PoolDestroyTiming {
+        u64 images{};
+        u64 destroy_ns{}; ///< vkDestroyImage
+        u64 free_ns{};    ///< vmaFreeMemory
+        u64 blocks_freed{};
+    };
+    PoolDestroyTiming pool_destroy_here_timing{};
+    PoolDestroyTiming pool_destroy_idle_timing{};
+    PoolDestroyTiming pool_destroy_frame_end_timing{};
+    Vulkan::MemoryAllocator::ImageTiming pool_create_timing_seen{};
+    /// Destroys `image` now, timed into `timing` with EDEN_NX2_IMAGE_ALLOC_TIMING.
+    static void DestroyPoolImage(vk::Image& image, PoolDestroyTiming& timing);
     /// EDEN_NX2_GHOST_POOLS=1 (boot): the pool's calls replayed under other rules and caps.
     std::unique_ptr<VideoCommon::Nx2GhostPools::Ghosts> ghost_pools =
         VideoCommon::Nx2GhostPools::CreateIfEnabled();

@@ -5,6 +5,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -541,6 +543,50 @@ Image::MemoryBlock Image::GetMemoryBlock() const noexcept {
     }
     return {reinterpret_cast<u64>(info.allocationInfo.deviceMemory), info.blockSize,
             info.allocationInfo.size};
+}
+
+u64 VmaMemoryObjectCount(VmaAllocator allocator) noexcept {
+    if (allocator == nullptr) {
+        return 0;
+    }
+    const VkPhysicalDeviceMemoryProperties* properties{};
+    vmaGetMemoryProperties(allocator, &properties);
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets{};
+    vmaGetHeapBudgets(allocator, budgets.data());
+    u64 count = 0;
+    for (u32 heap = 0; heap < properties->memoryHeapCount; ++heap) {
+        count += budgets[heap].statistics.blockCount;
+    }
+    return count;
+}
+
+Image::DestroyTiming Image::DestroyTimed() noexcept {
+    DestroyTiming timing{};
+    if (!handle) {
+        return timing;
+    }
+    const auto now = [] {
+        return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count());
+    };
+    // Counted outside the timed steps (vmaGetHeapBudgets can ask the driver every 30 operations).
+    const u64 blocks_before = allocation != nullptr ? VmaMemoryObjectCount(allocator) : 0;
+    const u64 t0 = now();
+    dld->vkDestroyImage(owner, handle, nullptr);
+    const u64 t1 = now();
+    if (allocation != nullptr) {
+        vmaFreeMemory(allocator, allocation);
+    }
+    const u64 t2 = now();
+    if (allocation != nullptr) {
+        timing.block_freed = VmaMemoryObjectCount(allocator) < blocks_before;
+    }
+    timing.destroy_ns = t1 - t0;
+    timing.free_ns = t2 - t1;
+    handle = VkImage{};
+    allocation = nullptr;
+    return timing;
 }
 
 bool Image::IsDeviceLocal() const noexcept {

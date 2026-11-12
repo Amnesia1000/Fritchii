@@ -34,6 +34,7 @@
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/render_trace.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 
@@ -570,6 +571,8 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
             }
         }
     }
+    // EDEN_NX2_GPU_PROFILE: the create (vkCreateImage, VMA allocate and bind) as its own zone.
+    VideoCommon::Nx2Profile::Scope create_scope{VideoCommon::Nx2Profile::Zone::ImageCreate};
     if (unbacked) {
         if (vk::Image image = allocator.CreateUnbackedImage(image_ci, aliased)) {
             return image;
@@ -3132,14 +3135,28 @@ void TextureCacheRuntime::DropPooledImage(vk::Image image, u64 bytes) {
         return;
     }
     ++image_pool_dropped_here;
-    image = vk::Image{};
+    VideoCommon::Nx2Profile::Scope destroy_scope{VideoCommon::Nx2Profile::Zone::PoolDestroyHere};
+    DestroyPoolImage(image, pool_destroy_here_timing);
+}
+
+void TextureCacheRuntime::DestroyPoolImage(vk::Image& image, PoolDestroyTiming& timing) {
+    if (!Vulkan::MemoryAllocator::ImageTimingEnabled()) [[likely]] {
+        image = vk::Image{};
+        return;
+    }
+    const vk::Image::DestroyTiming split = image.DestroyTimed();
+    ++timing.images;
+    timing.destroy_ns += split.destroy_ns;
+    timing.free_ns += split.free_ns;
+    timing.blocks_freed += split.block_freed ? 1 : 0;
 }
 
 void TextureCacheRuntime::DestroyIdlePooledImages(u32 max) {
-    image_pool_dropped_idle += DestroyPooledBacklog(max, "back: idle pool destroy");
+    VideoCommon::Nx2Profile::Scope destroy_scope{VideoCommon::Nx2Profile::Zone::PoolDestroyIdle};
+    image_pool_dropped_idle += DestroyPooledBacklog(max, "back: idle pool destroy", false);
 }
 
-u32 TextureCacheRuntime::DestroyPooledBacklog(u32 max, const char* span_name) {
+u32 TextureCacheRuntime::DestroyPooledBacklog(u32 max, const char* span_name, bool frame_end) {
     u32 destroyed = 0;
     for (; destroyed < max; ++destroyed) {
         vk::Image image;
@@ -3153,7 +3170,8 @@ u32 TextureCacheRuntime::DestroyPooledBacklog(u32 max, const char* span_name) {
             idle_destroys.pop_front();
         }
         Common::Nx2Timeline::Span span{span_name};
-        image = vk::Image{};
+        DestroyPoolImage(image, frame_end ? pool_destroy_frame_end_timing
+                                          : pool_destroy_idle_timing);
     }
     return destroyed;
 }
@@ -3336,7 +3354,37 @@ void TextureCacheRuntime::TickFrame() {
         // EXP110: past 64 MiB waiting, the idle backlog also loses two a frame end, so it stays
         // well inside its 128 MiB and the cap it shares with the pool.
         if (rule && IdleDestroyBytes() > (u64{64} << 20)) {
-            image_pool_dropped_frame_end += DestroyPooledBacklog(2, "back: pool backlog destroy");
+            VideoCommon::Nx2Profile::Scope destroy_scope{
+                VideoCommon::Nx2Profile::Zone::PoolDestroyBacklog};
+            image_pool_dropped_frame_end +=
+                DestroyPooledBacklog(2, "back: pool backlog destroy", true);
+        }
+        if (image_pool_frame % 600 == 0 && Vulkan::MemoryAllocator::ImageTimingEnabled()) {
+            // EDEN_NX2_IMAGE_ALLOC_TIMING (fable52_answer_potroom 4): what the pool's destroys
+            // cost in vmaDestroyImage's two steps, and whether creates took new VMA memory.
+            const auto part = [](const PoolDestroyTiming& t) {
+                return fmt::format("{} ({} us destroy, {} us VMA free, {} blocks freed)", t.images,
+                                   t.destroy_ns / 1000, t.free_ns / 1000, t.blocks_freed);
+            };
+            const auto now = Vulkan::MemoryAllocator::ReadImageTiming();
+            const auto& seen = pool_create_timing_seen;
+            const u64 created = now.images - seen.images;
+            const u64 new_block = now.new_block_images - seen.new_block_images;
+            const u64 all_ns = (now.create_ns - seen.create_ns) + (now.alloc_ns - seen.alloc_ns) +
+                               (now.bind_ns - seen.bind_ns);
+            const u64 new_block_ns = now.new_block_ns - seen.new_block_ns;
+            LOG_INFO(Render_Vulkan,
+                     "Image pool destroys (IMAGE_ALLOC_TIMING) last 600 frames: here {}; idle {}; "
+                     "backlog at frame end {}; creates {} ({} us), {} on a new VMA memory object "
+                     "({} us, {} dedicated), {} in an old block ({} us)",
+                     part(pool_destroy_here_timing), part(pool_destroy_idle_timing),
+                     part(pool_destroy_frame_end_timing), created, all_ns / 1000, new_block,
+                     new_block_ns / 1000, now.dedicated_images - seen.dedicated_images,
+                     created - new_block, (all_ns - std::min(all_ns, new_block_ns)) / 1000);
+            pool_destroy_here_timing = {};
+            pool_destroy_idle_timing = {};
+            pool_destroy_frame_end_timing = {};
+            pool_create_timing_seen = now;
         }
         if (image_pool_frame % 600 == 0 &&
             (pool_switch != 0 || image_pool_taken + image_pool_given != 0)) {
