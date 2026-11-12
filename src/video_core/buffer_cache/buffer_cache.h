@@ -690,16 +690,38 @@ void BufferCache<P>::DownloadMemoryForRead(DAddr device_addr, u64 size) {
         // the neighbouring pages would download one round trip each. Once it lands they are clean
         // (WriteReadDownloads); their read trap marks go now, so EXP86's mirrors answer those
         // reads without the lock. Taking a mark early is always safe: the next GPU write there
-        // arms the pages again. Preflushable pages are left to their fence downloads.
+        // arms the pages again. Neighbouring Preflushable pages end the run (their fence
+        // downloads take them). The read's own pages may be Preflushable: with preflushing on,
+        // GetFlushArea marks them for this very read before it comes here (the first version
+        // skipped those and never ran at the fountain).
         if (VideoCore::Nx2Debug::Experiment(112) != 0) {
+            using Why = ReadRunStats::NoRun;
             constexpr u64 RunFlushBytes = 256_KiB;
             const DAddr begin = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
             const DAddr end = Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE);
-            if (IsRegionGpuModified(begin, end - begin) &&
-                !memory_tracker.IsRegionPreflushable(begin, end - begin)) {
+            if (ReadRunStats::g_enabled) [[unlikely]] {
+                ReadRunStats::g_run_asked.fetch_add(1, std::memory_order_relaxed);
+                if (memory_tracker.IsRegionPreflushable(begin, end - begin)) {
+                    ReadRunStats::g_run_own_marked.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            if (!IsRegionGpuModified(begin, end - begin)) {
+                ReadRunStats::CountNoRun(Why::NotGpuModified);
+            } else {
                 const auto [run_begin, run_end] =
                     GpuModifiedRunAround(begin, end, RunFlushBytes, true);
-                if (run_begin < begin || run_end > end) {
+                if (run_begin == run_end) {
+                    ReadRunStats::CountNoRun(Why::NoBuffer);
+                } else if (run_begin >= begin && run_end <= end) {
+                    if (ReadRunStats::g_enabled) [[unlikely]] {
+                        // Would the run have gone on without the Preflushable stop?
+                        const auto [any_begin, any_end] =
+                            GpuModifiedRunAround(begin, end, RunFlushBytes, false);
+                        ReadRunStats::CountNoRun(any_begin < begin || any_end > end
+                                                     ? Why::NeighbourPreflushable
+                                                     : Why::NoNeighbour);
+                    }
+                } else {
                     ranges.emplace_back(run_begin, run_end - run_begin);
                     const DAddr pages_begin = Common::AlignDown(run_begin, Core::DEVICE_PAGESIZE);
                     const DAddr pages_end = Common::AlignUp(run_end, Core::DEVICE_PAGESIZE);
