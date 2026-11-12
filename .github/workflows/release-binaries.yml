@@ -520,6 +520,10 @@ jobs:
 
           mkdir -p AppDir/usr/bin
           cp build/release/bin/nx2_switches.txt AppDir/usr/bin/
+          if [ -d dist/recipes ]; then
+            mkdir -p AppDir/usr/bin/recipes
+            cp -a dist/recipes/. AppDir/usr/bin/recipes/
+          fi
 
           # Deploy Wayland graphics and shell integration plugins for Wayland / OpenGL
           for wayland_dir in "$QT_ROOT_DIR"/plugins/wayland*; do
