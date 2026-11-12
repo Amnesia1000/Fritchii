@@ -24,6 +24,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
+#include "video_core/memstage_stats.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/shader_handle_program.h"
@@ -434,6 +435,8 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     const bool via_header_index{qmd.linked_tsc != 0};
     const auto read_handle{[&](const auto& desc, u32 index) {
         if (desc.handle_program != ~0U) {
+            // EDEN_NX2_MEMSTAGE_STATS: a handle program (its storage reads are not sized).
+            VideoCommon::MemStageStats::Read(VideoCommon::MemStageStats::Kind::CHandleProgram, 0);
             // Read by the shader from a storage buffer: computed for this dispatch.
             // EDEN_NX2_HANDLE_ALIGN=0 reads the words at the unaligned address (A/B).
             static const bool align_storage{[] {
@@ -465,9 +468,15 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                                              secondary_offset};
                 const u32 lhs_raw{gpu_memory.ReadHandleWord(addr) << desc.shift_left};
                 const u32 rhs_raw{gpu_memory.ReadHandleWord(separate_addr) << desc.secondary_shift_left};
+                // EDEN_NX2_MEMSTAGE_STATS: two handle words.
+                VideoCommon::MemStageStats::Read(VideoCommon::MemStageStats::Kind::CHandleWord,
+                                                 2 * sizeof(u32), 2);
                 return TexturePair(lhs_raw | rhs_raw, via_header_index);
             }
         }
+        // EDEN_NX2_MEMSTAGE_STATS: one handle word.
+        VideoCommon::MemStageStats::Read(VideoCommon::MemStageStats::Kind::CHandleWord,
+                                         sizeof(u32));
         return TexturePair(gpu_memory.ReadHandleWord(addr), via_header_index);
     }};
     const auto add_image{[&](const auto& desc, bool blacklist) {

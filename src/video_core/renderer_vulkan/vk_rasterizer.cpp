@@ -79,6 +79,7 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/memory_manager.h"
+#include "video_core/memstage_stats.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cb_path.h"
 #include "video_core/nx2_debug_control.h"
@@ -534,6 +535,9 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
       frame_dump(device, memory_allocator, scheduler),
       flash_watch(device, memory_allocator, scheduler) {
     scheduler.SetQueryCache(query_cache);
+    // EDEN_NX2_MEMSTAGE_STATS: stream writes are tested against the texture cache's pages.
+    VideoCommon::MemStageStats::SetImagePageFilters(&texture_cache.page_filter,
+                                                    &texture_cache.image_count_filter);
     buffer_cache.SetPendingCpuWrites(
         [this](const std::function<void(DAddr, size_t)>& callback) {
             gpu.ForEachPendingCpuWrite(callback);
@@ -772,6 +776,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             }
         }
         return;
+    }
+    // EDEN_NX2_MEMSTAGE_STATS: the first draw of each shader set (the memory stage's join 1).
+    if (VideoCommon::MemStageStats::Enabled()) [[unlikely]] {
+        VideoCommon::MemStageStats::ProgramSet(pipeline->ShaderHashes());
     }
     // TEST: up to Configure (EDEN_NX2_GPU_PROFILE=2).
     std::optional<Profile::FineScope> setup_scope;
@@ -2370,6 +2378,11 @@ void RasterizerVulkan::DispatchCompute() {
         return;
     }
     VideoCommon::Nx2Profile::CountComputeProgram(pipeline->ShaderHash());
+    // EDEN_NX2_MEMSTAGE_STATS: the dispatch, per channel, and each program's first one.
+    if (VideoCommon::MemStageStats::Enabled()) [[unlikely]] {
+        VideoCommon::MemStageStats::Dispatch();
+        VideoCommon::MemStageStats::ComputeProgram(pipeline->ShaderHash());
+    }
     std::scoped_lock lock{texture_cache.mutex, buffer_cache.mutex};
     std::optional<ByteAddressedShadow> byte_addressed_shadow;
     buffer_cache.Nx2CollectListCopies(true);
@@ -4217,6 +4230,7 @@ void NoteDrawReuseProbeFrame(); // vk_graphics_pipeline.cpp
 
 void RasterizerVulkan::TickFrame() {
     NoteDrawReuseProbeFrame();
+    VideoCommon::MemStageStats::TickFrame();
     if (MemoryOwnersEnabled()) {
         static std::chrono::steady_clock::time_point last_owners_log{};
         if (const auto now = std::chrono::steady_clock::now();
@@ -4438,6 +4452,9 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
 void RasterizerVulkan::AccelerateInlineToMemoryImpl(GPUVAddr address, size_t copy_size,
                                                     std::span<const u8> memory) {
     auto cpu_addr = gpu_memory->GpuToCpuAddress(address);
+    // EDEN_NX2_MEMSTAGE_STATS: an inline upload, and whether it lands on texture pages (join 2).
+    VideoCommon::MemStageStats::StreamWrite(VideoCommon::MemStageStats::Write::Inline,
+                                            cpu_addr.value_or(0), copy_size);
     if (gpu_memory->UsesNativeTiling()) {
         u32 first_word{};
         if (memory.size() >= sizeof(first_word)) std::memcpy(&first_word, memory.data(), sizeof(first_word));
@@ -5672,6 +5689,7 @@ void RasterizerVulkan::InitializeChannel(Tegra::Control::ChannelState& channel) 
 
 void RasterizerVulkan::BindChannel(Tegra::Control::ChannelState& channel) {
     const s32 channel_id = channel.bind_id;
+    VideoCommon::MemStageStats::ChannelBound(channel_id);
     BindToChannel(channel_id);
     if (!oot_resolution_checked) [[unlikely]] {
         ApplyOcarinaResolution(program_id); // no disk cache load (it does this first)

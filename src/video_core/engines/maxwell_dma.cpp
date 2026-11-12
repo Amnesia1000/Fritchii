@@ -17,6 +17,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
+#include "video_core/memstage_stats.h"
 #include "video_core/nx2_qmd_prediction.h"
 #include "video_core/renderer_base.h"
 #include "video_core/textures/decoders.h"
@@ -193,6 +194,32 @@ void MaxwellDMA::Launch() {
     // TODO(Subv): Perform more research and implement all features of this engine.
     const LaunchDMA& launch = regs.launch_dma;
     ASSERT(launch.interrupt_type == LaunchDMA::InterruptType::NONE);
+
+    // EDEN_NX2_MEMSTAGE_STATS: what this launch writes. Copies and fills between linear memory are
+    // stream writes (tested against texture pages, join 2); copies with a block linear side are
+    // image copies (the texture cache writes them; counted only, bytes approximate).
+    if (VideoCommon::MemStageStats::Enabled()) [[unlikely]] {
+        namespace Stats = VideoCommon::MemStageStats;
+        const u64 device = memory_manager.GpuToCpuAddress(regs.offset_out).value_or(0);
+        if (!launch.multi_line_enable) {
+            const bool fill = launch.remap_enable != 0 &&
+                              regs.remap_const.dst_x == RemapConst::Swizzle::CONST_A;
+            const u64 bytes =
+                fill ? u64{regs.line_length_in} * (regs.remap_const.component_size_minus_one + 1)
+                     : u64{regs.line_length_in};
+            Stats::StreamWrite(Stats::Write::DmaLinear, device, bytes);
+        } else if (launch.src_memory_layout == LaunchDMA::MemoryLayout::PITCH &&
+                   launch.dst_memory_layout == LaunchDMA::MemoryLayout::PITCH) {
+            const u64 lines = regs.line_count;
+            const u64 span =
+                lines == 0 ? 0 : u64{regs.pitch_out} * (lines - 1) + regs.line_length_in;
+            Stats::StreamWrite(Stats::Write::DmaLinear, device, u64{regs.line_length_in} * lines,
+                               span);
+        } else {
+            Stats::StreamWrite(Stats::Write::DmaImage, 0,
+                               u64{regs.line_length_in} * regs.line_count);
+        }
+    }
 
     if (launch.multi_line_enable) {
         const bool is_src_pitch = launch.src_memory_layout == LaunchDMA::MemoryLayout::PITCH;

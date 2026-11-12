@@ -16,6 +16,7 @@
 #include "common/common_types.h"
 #include "common/literals.h"
 #include "video_core/churn_counters.h"
+#include "video_core/memstage_stats.h"
 #include "video_core/nx2_debug_control.h"
 #include "common/logging.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -153,6 +154,8 @@ void StagingBufferPool::TickFrame() {
 StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
     if (AreRegionsActive(Region(free_iterator) + 1,
                          (std::min)(Region(iterator + size) + 1, NUM_SYNCS))) {
+        // EDEN_NX2_MEMSTAGE_STATS: the stream ring is busy (the memory stage's join 3).
+        VideoCommon::MemStageStats::StreamFull();
         // Avoid waiting for the previous usages to be free
         return GetStagingBuffer(size, MemoryUsage::Upload);
     }
@@ -170,6 +173,7 @@ StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
         free_iterator = size;
 
         if (AreRegionsActive(0, Region(size) + 1)) {
+            VideoCommon::MemStageStats::StreamFull();
             // Avoid waiting for the previous usages to be free
             return GetStagingBuffer(size, MemoryUsage::Upload);
         }
@@ -227,6 +231,8 @@ std::optional<StagingBufferRef> StagingBufferPool::TryGetReservedBuffer(size_t s
 
 StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage usage, bool deferred) {
     auto const log2_size = Common::Log2Ceil<u32>(u32(size));
+    // EDEN_NX2_MEMSTAGE_STATS: no free staging buffer of this size (any user).
+    VideoCommon::MemStageStats::StagingCreated(u64{1} << log2_size);
     VkBufferCreateInfo buffer_ci = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .pNext = nullptr,

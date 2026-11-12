@@ -32,6 +32,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/memstage_stats.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cmdpage_diag.h"
 #include "video_core/nx2_list_verify.h"
@@ -1450,6 +1451,7 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
     if (indirect_offset != ~0U) {
         // The pointer is an entry of a table the constant buffer points to.
         holder = gpu_memory->Read<u64>(ssbo_addr);
+        MemStageStats::Read(MemStageStats::Kind::StorageAddress, sizeof(u64));
         if (holder == 0) {
             channel_state->storage_buffers[stage][ssbo_index] = NULL_BINDING;
             return false;
@@ -1557,6 +1559,7 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
     const bool table_pointer = indirect_offset != ~0U;
     if (table_pointer) {
         holder = gpu_memory->Read<u64>(ssbo_addr);
+        MemStageStats::Read(MemStageStats::Kind::CStorageAddress, sizeof(u64));
         ssbo_addr = holder + indirect_offset;
     }
     const bool native_pointer = kepler_compute->IsNativeMode();
@@ -1987,6 +1990,7 @@ void BufferCache<P>::BindHostIndexBuffer() {
     const u32 offset = buffer.Offset(channel_state->index_buffer.device_addr);
     const u32 size = channel_state->index_buffer.size;
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    MemStageStats::Read(MemStageStats::Kind::Index, size);
     if constexpr (requires { runtime.BindHostUint8IndexBuffer(std::span<const u8>{}); }) {
         if (draw_state.index_buffer.format == Maxwell::IndexFormat::UnsignedByte &&
             draw_state.topology != Maxwell::PrimitiveTopology::Quads &&
@@ -2130,6 +2134,7 @@ void BufferCache<P>::BindHostVertexBuffers() {
             const Binding& binding = VertexBufferSlot(index);
             Buffer& buffer = slot_buffers[binding.buffer_id];
             TouchBuffer(buffer, binding.buffer_id);
+            MemStageStats::Read(MemStageStats::Kind::Vertex, binding.size);
             SynchronizeBuffer(buffer, binding.device_addr, binding.size);
             if (!flags[Dirty::VertexBuffer0 + index]) {
                 flush_bindings();
@@ -2160,6 +2165,8 @@ void BufferCache<P>::BindHostVertexBuffers() {
             const Binding& binding = channel_state->vertex_buffers[index];
             Buffer& buffer = slot_buffers[binding.buffer_id];
             TouchBuffer(buffer, binding.buffer_id);
+            MemStageStats::Read(MemStageStats::Kind::Vertex, binding.size,
+                                binding.size != 0 ? 1 : 0);
             SynchronizeBuffer(buffer, binding.device_addr, binding.size);
             if (!flags[Dirty::VertexBuffer0 + index]) {
                 continue;
@@ -2198,6 +2205,7 @@ void BufferCache<P>::BindHostDrawIndirectBuffers() {
     const auto bind_buffer = [this](const Binding& binding) {
         Buffer& buffer = slot_buffers[binding.buffer_id];
         TouchBuffer(buffer, binding.buffer_id);
+        MemStageStats::Read(MemStageStats::Kind::Indirect, binding.size);
         SynchronizeBuffer(buffer, binding.device_addr, binding.size);
         // The draw reads the arguments (GetDrawIndirectBuffer, GetDrawIndirectCount).
         if (binding.buffer_id != NULL_BUFFER_ID) {
@@ -2296,6 +2304,16 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     // would take stay set for the next bind that reads the host buffer.
     const int bank_trims = native_bank_bind ? VideoCore::Nx2Debug::Experiment(26) : 0;
     const bool native_bank = native_bank_bind && !(use_fast_buffer && (bank_trims & 1) != 0);
+    // EDEN_NX2_MEMSTAGE_STATS: what this bind reads (the stream copies guest memory; the cached
+    // path synchronizes the host buffer; the bank check compares the bank's pages).
+    if (MemStageStats::Enabled()) [[unlikely]] {
+        MemStageStats::Read(use_fast_buffer ? MemStageStats::Kind::UniformStream
+                                            : MemStageStats::Kind::UniformCached,
+                            size);
+        if (native_bank) {
+            MemStageStats::Read(MemStageStats::Kind::BankCheck, size);
+        }
+    }
     // TEST (EDEN_NX2_GPU_PROFILE=2): the bank check below, only for the binds that run it.
     std::optional<Nx2Profile::Scope> bank_scope;
     if (native_bank && Nx2Profile::Fine()) [[unlikely]] {
@@ -3478,6 +3496,7 @@ void BufferCache<P>::BindHostGraphicsStorageBuffers(size_t stage) {
     ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 index) {
         const Binding& binding = channel_state->storage_buffers[stage][index];
         const bool is_written = ((channel_state->written_storage_buffers[stage] >> index) & 1) != 0;
+        MemStageStats::Read(MemStageStats::Kind::Storage, binding.size);
         if (BindMultiRangeStorage(binding, is_written, graphics_segments)) {
             Nx2Profile::AddFine(Nx2Profile::FineCounter::StorageMulti, 1);
             return;
@@ -3524,6 +3543,7 @@ void BufferCache<P>::BindHostGraphicsTextureBuffers(size_t stage) {
         const TextureBufferBinding& binding = channel_state->texture_buffers[stage][index];
         Buffer& buffer = slot_buffers[binding.buffer_id];
         const u32 size = binding.size;
+        MemStageStats::Read(MemStageStats::Kind::TextureBuffer, size);
         SynchronizeBuffer(buffer, binding.device_addr, size);
 
         const bool is_written = ((channel_state->written_texture_buffers[stage] >> index) & 1) != 0;
@@ -3613,6 +3633,11 @@ void BufferCache<P>::BindHostComputeUniformBuffers() {
             needs_alignment_stream ||
             (has_host_buffer && size <= channel_state->uniform_buffer_skip_cache_size &&
              !memory_tracker.IsRegionGpuModified(binding.device_addr, size));
+        if (MemStageStats::Enabled()) [[unlikely]] {
+            MemStageStats::Read(use_fast_buffer ? MemStageStats::Kind::CUniformStream
+                                                : MemStageStats::Kind::CUniformCached,
+                                size);
+        }
         if constexpr (!IS_OPENGL) {
             if (use_fast_buffer) {
                 const std::span<u8> span =
@@ -3660,6 +3685,7 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
             Nx2Profile::Add(Nx2Profile::Counter::ComputeStorageBindings, 1);
             Nx2Profile::Add(Nx2Profile::Counter::ComputeStorageBytes, binding.size);
         }
+        MemStageStats::Read(MemStageStats::Kind::CStorage, binding.size);
         const bool is_written =
             ((channel_state->written_compute_storage_buffers >> index) & 1) != 0;
         // A native program's binding is min(layout, 8 MiB) because its pointer has no size, and
@@ -3867,6 +3893,7 @@ void BufferCache<P>::BindHostComputeTextureBuffers() {
         const TextureBufferBinding& binding = channel_state->compute_texture_buffers[index];
         Buffer& buffer = slot_buffers[binding.buffer_id];
         const u32 size = binding.size;
+        MemStageStats::Read(MemStageStats::Kind::CTextureBuffer, size);
         SynchronizeBuffer(buffer, binding.device_addr, size);
 
         const bool is_written =
@@ -3941,6 +3968,7 @@ void BufferCache<P>::UpdateIndexBuffer() {
         }
         if (slot_buffers[inline_buffer_id].SizeBytes() < buffer_size) [[unlikely]] {
             ++binding_epoch;
+            MemStageStats::BufferDeleted(slot_buffers[inline_buffer_id].SizeBytes());
             slot_buffers.erase(inline_buffer_id);
             inline_buffer_id = CreateBuffer(0, buffer_size, false);
         }
@@ -4717,6 +4745,7 @@ BufferId BufferCache<P>::CreateBuffer(DAddr device_addr, u32 wanted_size,
     VideoCommon::Churn::Add(VideoCommon::Churn::BuffersCreated);
     auto& new_buffer = slot_buffers[new_buffer_id];
     const size_t size_bytes = new_buffer.SizeBytes();
+    MemStageStats::BufferCreated(size_bytes);
     runtime.ClearBuffer(new_buffer, 0, size_bytes, 0);
     new_buffer.MarkUsage(0, size_bytes);
     bool copied = false;
@@ -5072,6 +5101,7 @@ bool BufferCache<P>::SynchronizeStorageMemo(Buffer& buffer, DAddr device_addr, u
 template <class P>
 void BufferCache<P>::UploadMemory(Buffer& buffer, u64 total_size_bytes, u64 largest_copy,
                                   std::span<BufferCopy> copies) {
+    MemStageStats::Uploaded(copies.size(), total_size_bytes);
     if constexpr (USE_MEMORY_MAPS_FOR_UPLOADS) {
         MappedUploadMemory(buffer, total_size_bytes, copies);
     } else {
@@ -5362,6 +5392,9 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
 template <class P>
 void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
     VideoCommon::Churn::Add(VideoCommon::Churn::BuffersDeleted);
+    if (MemStageStats::Enabled()) [[unlikely]] {
+        MemStageStats::BufferDeleted(slot_buffers[buffer_id].SizeBytes());
+    }
     if constexpr (requires { runtime.OnBufferDeleted(slot_buffers[buffer_id]); }) {
         runtime.OnBufferDeleted(slot_buffers[buffer_id]);
     }
@@ -5484,6 +5517,10 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
                                              bool native_pointer, bool table_pointer,
                                              bool compute) const {
     const GPUVAddr gpu_addr = gpu_memory->Read<u64>(ssbo_addr);
+    // EDEN_NX2_MEMSTAGE_STATS: the pointer word.
+    const MemStageStats::Kind address_kind =
+        compute ? MemStageStats::Kind::CStorageAddress : MemStageStats::Kind::StorageAddress;
+    MemStageStats::Read(address_kind, sizeof(u64));
 
     if (gpu_addr == 0) {
         return NULL_BINDING;
@@ -5494,6 +5531,8 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
     const bool reads_size_word =
         !(table_pointer && !is_written) && (!native_pointer || (compute && !is_written));
     const u64 next_qword = reads_size_word ? gpu_memory->Read<u64>(ssbo_addr + 8) : 0;
+    // EDEN_NX2_MEMSTAGE_STATS: the size word, in the pointer's range.
+    MemStageStats::Read(address_kind, reads_size_word ? sizeof(u64) : 0, 0);
     // Every draw rebinds each storage buffer: the layout lookup (a mutex), the range walk and
     // two page walks cost Ocarina's GPU thread ~6%. Answers hold until the page table changes.
     struct CachedBinding {

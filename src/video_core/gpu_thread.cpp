@@ -22,6 +22,7 @@
 #include "video_core/gpu.h"
 #include "video_core/gpu_thread.h"
 #include "video_core/gpu_split.h"
+#include "video_core/memstage_stats.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/host1x/host1x.h"
@@ -163,6 +164,9 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 // in order, and so does the signal that the command ran.
                 auto* const rasterizer_ptr = renderer.ReadRasterizer();
                 if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
+                    // EDEN_NX2_MEMSTAGE_STATS: command lists per channel.
+                    VideoCommon::MemStageStats::ListSubmitted(
+                        submit_list->channel, submit_list->entries.command_lists.size());
                     const bool timeline = Common::Nx2Timeline::Active();
                     if (timeline) {
                         // The list's sequence number (PushCommand's "submit list") on each
@@ -214,6 +218,8 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 continue;
             }
             if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
+                VideoCommon::MemStageStats::ListSubmitted(
+                    submit_list->channel, submit_list->entries.command_lists.size());
                 const bool timeline = Common::Nx2Timeline::Active();
                 if (timeline) {
                     Common::Nx2Timeline::Instant("front: list begin", {"seq", next.fence},
