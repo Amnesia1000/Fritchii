@@ -18,6 +18,7 @@
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
+#include "common/bit_util.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vertex_repack.h"
 
@@ -120,7 +121,7 @@ Buffer::Buffer(BufferCacheRuntime& runtime, VideoCommon::NullBufferParams null_p
         return;
     }
     device = &runtime.device;
-    buffer = runtime.CreateNullBuffer();
+    buffer = RecycledBuffer{runtime.CreateNullBuffer()};
     is_null = true;
     if (device->IsBufferDeviceAddressSupported()) {
         device_address = device->GetLogical().GetBufferDeviceAddress(*buffer);
@@ -131,9 +132,7 @@ Buffer::Buffer(BufferCacheRuntime& runtime, DAddr cpu_addr_, u64 size_bytes_,
                bool sparse_compatible_)
     : VideoCommon::BufferBase(cpu_addr_, size_bytes_), device{&runtime.device},
       scheduler{&runtime.scheduler},
-      buffer{CreateBuffer(*device, runtime.memory_allocator, SizeBytes(),
-                          runtime.SparseAlignmentFor(sparse_compatible_))},
-      tracker{SizeBytes()} {
+      buffer{runtime.CreateCacheBuffer(SizeBytes(), sparse_compatible_)}, tracker{SizeBytes()} {
     sparse_compatible = sparse_compatible_;
     if (runtime.device.HasDebuggingToolAttached()) {
         buffer.SetObjectNameEXT(fmt::format("Buffer {:#x}", CpuAddr()).c_str());
@@ -431,12 +430,51 @@ u32 BufferCacheRuntime::SetVertexRepackLayout(const Tegra::Engines::Maxwell3D::R
     return old_mask ^ vertex_repack_mask;
 }
 
+RecycledBuffer BufferCacheRuntime::CreateCacheBuffer(u64 size, bool sparse_compatible) {
+    const VkDeviceSize sparse_alignment = SparseAlignmentFor(sparse_compatible);
+    if (sparse_alignment > 1) {
+        // Bound by their memory location (multi-range sparse binds): never pooled.
+        return RecycledBuffer{CreateBuffer(device, memory_allocator, size, sparse_alignment)};
+    }
+    BufferRecycler& recycler = staging_pool.Recycler();
+    u64 bytes = size;
+    // EDEN_NX2_EXP104 (Fable's design 8.3, step 3b): the size class, powers of two from 64 KiB.
+    // A pooled buffer is one the GPU finished with (BufferRecycler::Take); CreateBuffer clears
+    // the Buffer's range before any use, as for a new one.
+    if (BufferRecycler::Enabled()) {
+        const u32 log2 = (std::max)(BufferRecycler::MinCacheLog2,
+                                    static_cast<u32>(Common::Log2Ceil<u64>(size)));
+        if (log2 <= BufferRecycler::MaxLog2) {
+            u64 pooled_bytes = 0;
+            if (vk::Buffer pooled =
+                    recycler.Take(BufferRecycler::Family::Cache, log2, &pooled_bytes)) {
+                return RecycledBuffer{std::move(pooled), &recycler, pooled_bytes};
+            }
+            bytes = u64{1} << log2;
+        }
+    }
+    vk::Buffer created;
+    try {
+        created = CreateBuffer(device, memory_allocator, bytes, 0);
+    } catch (const vk::Exception&) {
+        // Out of device memory: give back what the pool holds, retry at the exact size.
+        if (recycler.DropAll() == 0 && bytes == size) {
+            throw;
+        }
+        bytes = size;
+        created = CreateBuffer(device, memory_allocator, bytes, 0);
+    }
+    return RecycledBuffer{std::move(created), &recycler, bytes};
+}
+
 StagingBufferRef BufferCacheRuntime::UploadStagingBuffer(size_t size) {
-    return staging_pool.Request(size, MemoryUsage::Upload);
+    return staging_pool.Request(size, MemoryUsage::Upload, false,
+                                VideoCommon::BufferChurnStats::StagingCaller::BufferUpload);
 }
 
 StagingBufferRef BufferCacheRuntime::DownloadStagingBuffer(size_t size, bool deferred) {
-    return staging_pool.Request(size, MemoryUsage::Download, deferred);
+    return staging_pool.Request(size, MemoryUsage::Download, deferred,
+                                VideoCommon::BufferChurnStats::StagingCaller::BufferDownload);
 }
 
 VkFormat BufferCacheRuntime::TexelBufferFormat(VideoCore::Surface::PixelFormat format) const {

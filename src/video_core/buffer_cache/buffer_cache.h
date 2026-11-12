@@ -28,6 +28,7 @@
 #include "video_core/buffer_cache/nx2_bytes_equal.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/buffer_cache/uniform_stream_reuse.h"
+#include "video_core/buffer_churn_stats.h"
 #include "video_core/churn_counters.h"
 #include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
@@ -4001,6 +4002,9 @@ void BufferCache<P>::UpdateIndexBuffer() {
         if (slot_buffers[inline_buffer_id].SizeBytes() < buffer_size) [[unlikely]] {
             ++binding_epoch;
             MemStageStats::BufferDeleted(slot_buffers[inline_buffer_id].SizeBytes());
+            VideoCommon::BufferChurnStats::BufferDeleted(
+                VideoCommon::BufferChurnStats::Deleted::Inline,
+                slot_buffers[inline_buffer_id].SizeBytes());
             slot_buffers.erase(inline_buffer_id);
             inline_buffer_id = CreateBuffer(0, buffer_size, false);
         }
@@ -4778,6 +4782,15 @@ BufferId BufferCache<P>::CreateBuffer(DAddr device_addr, u32 wanted_size,
     auto& new_buffer = slot_buffers[new_buffer_id];
     const size_t size_bytes = new_buffer.SizeBytes();
     MemStageStats::BufferCreated(size_bytes);
+    // EDEN_NX2_BUFFER_CHURN_STATS: why (Fable's design 8.3).
+    if (VideoCommon::BufferChurnStats::Enabled()) [[unlikely]] {
+        using VideoCommon::BufferChurnStats::Created;
+        const Created cause = device_addr == 0         ? Created::Inline
+                              : overlap.ids.empty()     ? Created::NewRange
+                              : overlap.ids.size() == 1 ? Created::Grow
+                                                        : Created::Join;
+        VideoCommon::BufferChurnStats::BufferCreated(cause, size_bytes);
+    }
     runtime.ClearBuffer(new_buffer, 0, size_bytes, 0);
     new_buffer.MarkUsage(0, size_bytes);
     bool copied = false;
@@ -5427,6 +5440,11 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
     if (MemStageStats::Enabled()) [[unlikely]] {
         MemStageStats::BufferDeleted(slot_buffers[buffer_id].SizeBytes());
     }
+    // EDEN_NX2_BUFFER_CHURN_STATS: joins pass do_not_mark, the collector does not.
+    VideoCommon::BufferChurnStats::BufferDeleted(
+        do_not_mark ? VideoCommon::BufferChurnStats::Deleted::Join
+                    : VideoCommon::BufferChurnStats::Deleted::Collector,
+        slot_buffers[buffer_id].SizeBytes());
     if constexpr (requires { runtime.OnBufferDeleted(slot_buffers[buffer_id]); }) {
         runtime.OnBufferDeleted(slot_buffers[buffer_id]);
     }

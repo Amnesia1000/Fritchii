@@ -15,6 +15,7 @@
 #include "video_core/buffer_cache/memory_tracker_base.h"
 #include "video_core/buffer_cache/usage_tracker.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/renderer_vulkan/vk_buffer_recycler.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_multi_range_buffer.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
@@ -88,7 +89,9 @@ private:
 
     const Device* device{};
     Scheduler* scheduler{};
-    vk::Buffer buffer;
+    /// EXP104: may be larger than SizeBytes() (its size class), and goes back to the pool when
+    /// this Buffer is destroyed. Declared before the views, so they are destroyed first.
+    RecycledBuffer buffer;
     std::vector<BufferView> views;
     VideoCommon::UsageTracker tracker;
     VkDeviceAddress device_address{};
@@ -210,7 +213,8 @@ public:
     std::span<u8> BindMappedUniformBuffer([[maybe_unused]] size_t stage,
                                           [[maybe_unused]] u32 binding_index,
                                           u32 size) {
-        const StagingBufferRef ref = staging_pool.Request(size, MemoryUsage::Upload);
+        const StagingBufferRef ref = staging_pool.Request(
+            size, MemoryUsage::Upload, false, VideoCommon::BufferChurnStats::StagingCaller::UniformStream);
         last_stream_uniform = StreamUniformRef{
             .buffer = ref.buffer,
             .device_address = ref.device_address,
@@ -354,6 +358,10 @@ private:
 
     void ReserveNullBuffer();
     vk::Buffer CreateNullBuffer();
+
+    /// A buffer cache buffer of at least `size` bytes: with EXP104, rounded up to its size class
+    /// and taken from the staging pool's BufferRecycler when one is free there.
+    RecycledBuffer CreateCacheBuffer(u64 size, bool sparse_compatible);
 
     const Device& device;
     MemoryAllocator& memory_allocator;

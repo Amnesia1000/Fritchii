@@ -79,6 +79,7 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/memory_manager.h"
+#include "video_core/buffer_churn_stats.h"
 #include "video_core/memstage_stats.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cb_path.h"
@@ -551,6 +552,12 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
             // Only when it ran out of work: a RequestIdleHook mid-batch has a waiter (Fable).
             if (VideoCore::Nx2Debug::Experiment(99) == 1 && VideoCommon::GpuSplit::InIdleWait()) {
                 rasterizer->texture_cache_runtime.DestroyIdlePooledImages(2);
+            }
+            // EXP104: evicted pool buffers go the same way, whatever EXP104 is now (switching it
+            // off evicts everything). The allocator stays on the back's thread.
+            if (VideoCommon::GpuSplit::InIdleWait() &&
+                rasterizer->staging_pool.Recycler().HasDoomed()) {
+                rasterizer->staging_pool.Recycler().DestroyIdle(2);
             }
         },
         this);
@@ -1117,8 +1124,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             pipeline->SetMeshEmulationOutput(*arena.buffer, 0, bytes, groups);
         } else {
             bytes = (std::max)(u64{groups} * block_bytes, u64{4});
-            output = staging_pool.Request(bytes, probe_draw ? MemoryUsage::Download
-                                                            : MemoryUsage::DeviceLocal);
+            output = staging_pool.Request(
+                bytes, probe_draw ? MemoryUsage::Download : MemoryUsage::DeviceLocal, false,
+                VideoCommon::BufferChurnStats::StagingCaller::Rasterizer);
             pipeline->SetMeshEmulationOutput(output.buffer, output.offset, bytes, groups);
         }
         mesh_emulation_indirect = {};
@@ -1139,7 +1147,8 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                                   render_trace_frame % 60 == 0};
             const auto request = [&](u64 size, MemoryUsage usage = MemoryUsage::DeviceLocal) {
                 size = (std::max)(size, u64{16});
-                const StagingBufferRef ref{staging_pool.Request(size, usage)};
+                const StagingBufferRef ref{staging_pool.Request(
+                    size, usage, false, VideoCommon::BufferChurnStats::StagingCaller::Rasterizer)};
                 return std::make_pair(GraphicsPipeline::MeshEmulationBuffer{ref.buffer, ref.offset,
                                                                             size},
                                       ref.mapped_span.subspan(
@@ -2255,7 +2264,8 @@ bool RasterizerVulkan::ClearVolumeSlices(const Framebuffer* framebuffer, u32 fir
     // R16G16B16A16): size the zeros for the widest color texel, 16 bytes.
     constexpr size_t WidestTexelBytes = 16;
     const size_t slice_bytes = size_t{width} * height * WidestTexelBytes;
-    const auto zeros = staging_pool.Request(slice_bytes, MemoryUsage::Upload);
+    const auto zeros = staging_pool.Request(slice_bytes, MemoryUsage::Upload, false,
+                                            VideoCommon::BufferChurnStats::StagingCaller::Rasterizer);
     std::memset(zeros.mapped_span.data(), 0, slice_bytes);
     const u32 count = std::min(slice_count, depth - first_slice);
     const VkImage image = view.ImageHandle();
@@ -4498,6 +4508,7 @@ void NoteDrawReuseProbeFrame(); // vk_graphics_pipeline.cpp
 void RasterizerVulkan::TickFrame() {
     NoteDrawReuseProbeFrame();
     VideoCommon::MemStageStats::TickFrame();
+    VideoCommon::BufferChurnStats::TickFrame();
     if (VideoCommon::Nx2FastDrawCount::g_on) [[unlikely]] {
         fast_draw_count.MaybeLog();
         VideoCommon::Nx2FastDrawCount::Break(VideoCommon::Nx2FastDrawCount::Reason::Frame);

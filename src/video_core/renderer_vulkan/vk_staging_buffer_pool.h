@@ -11,6 +11,8 @@
 
 #include "common/common_types.h"
 
+#include "video_core/buffer_churn_stats.h"
+#include "video_core/renderer_vulkan/vk_buffer_recycler.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -37,7 +39,11 @@ public:
                                Scheduler& scheduler);
     ~StagingBufferPool();
 
-    StagingBufferRef Request(size_t size, MemoryUsage usage, bool deferred = false);
+    /// `caller`: who asks, counted when a buffer has to be created (EDEN_NX2_BUFFER_CHURN_STATS).
+    StagingBufferRef Request(
+        size_t size, MemoryUsage usage, bool deferred = false,
+        VideoCommon::BufferChurnStats::StagingCaller caller =
+            VideoCommon::BufferChurnStats::StagingCaller::Other);
     void FreeDeferred(StagingBufferRef& ref);
 
     [[nodiscard]] VkBuffer StreamBuf() const noexcept {
@@ -52,6 +58,11 @@ public:
     /// The stream buffer's size (the "Memory owners" line).
     [[nodiscard]] u64 StreamBufferBytes() const noexcept {
         return stream_buffer_size;
+    }
+
+    /// EXP104's pool, shared with the buffer cache (one byte cap for both).
+    [[nodiscard]] BufferRecycler& Recycler() noexcept {
+        return recycler;
     }
 
 private:
@@ -92,22 +103,30 @@ private:
     static constexpr size_t NUM_LEVELS = sizeof(size_t) * CHAR_BIT;
     using StagingBuffersCache = std::array<StagingBuffers, NUM_LEVELS>;
 
-    StagingBufferRef GetStreamBuffer(size_t size);
+    StagingBufferRef GetStreamBuffer(size_t size,
+                                     VideoCommon::BufferChurnStats::StagingCaller caller);
 
     bool AreRegionsActive(size_t region_begin, size_t region_end) const;
 
-    StagingBufferRef GetStagingBuffer(size_t size, MemoryUsage usage, bool deferred = false);
+    StagingBufferRef GetStagingBuffer(size_t size, MemoryUsage usage, bool deferred,
+                                      VideoCommon::BufferChurnStats::StagingCaller caller,
+                                      bool stream_full = false);
 
     std::optional<StagingBufferRef> TryGetReservedBuffer(size_t size, MemoryUsage usage,
                                                          bool deferred);
 
-    StagingBufferRef CreateStagingBuffer(size_t size, MemoryUsage usage, bool deferred);
+    StagingBufferRef CreateStagingBuffer(size_t size, MemoryUsage usage, bool deferred,
+                                         VideoCommon::BufferChurnStats::StagingCaller caller,
+                                         bool stream_full);
 
     StagingBuffersCache& GetCache(MemoryUsage usage);
 
     void ReleaseCache(MemoryUsage usage);
 
     void ReleaseLevel(StagingBuffersCache& cache, size_t log2);
+
+    /// EXP104: offers an idle staging buffer being released to the pool (left empty if taken).
+    void Retire(StagingBuffer& entry);
     size_t Region(size_t iter) const noexcept {
         return iter / region_size;
     }
@@ -115,6 +134,7 @@ private:
     const Device& device;
     MemoryAllocator& memory_allocator;
     Scheduler& scheduler;
+    BufferRecycler recycler;
 
     vk::Buffer stream_buffer;
     VkDeviceAddress stream_buffer_address{};

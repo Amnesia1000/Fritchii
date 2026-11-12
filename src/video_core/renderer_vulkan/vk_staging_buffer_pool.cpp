@@ -15,7 +15,10 @@
 #include "common/bit_util.h"
 #include "common/common_types.h"
 #include "common/literals.h"
+#include "common/nx2_timeline.h"
+#include "video_core/buffer_churn_stats.h"
 #include "video_core/churn_counters.h"
+#include "video_core/gpu_split.h"
 #include "video_core/memstage_stats.h"
 #include "video_core/nx2_debug_control.h"
 #include "common/logging.h"
@@ -92,8 +95,8 @@ size_t GetStreamBufferSize(const Device& device) {
 StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& memory_allocator_,
                                      Scheduler& scheduler_)
     : device{device_}, memory_allocator{memory_allocator_}, scheduler{scheduler_},
-      stream_buffer_size{GetStreamBufferSize(device)}, region_size{stream_buffer_size /
-                                                                   StagingBufferPool::NUM_SYNCS} {
+      recycler{scheduler_}, stream_buffer_size{GetStreamBufferSize(device)},
+      region_size{stream_buffer_size / StagingBufferPool::NUM_SYNCS} {
     VkBufferCreateInfo stream_ci = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .pNext = nullptr,
@@ -124,11 +127,12 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
 
 StagingBufferPool::~StagingBufferPool() = default;
 
-StagingBufferRef StagingBufferPool::Request(size_t size, MemoryUsage usage, bool deferred) {
+StagingBufferRef StagingBufferPool::Request(size_t size, MemoryUsage usage, bool deferred,
+                                            VideoCommon::BufferChurnStats::StagingCaller caller) {
     if (!deferred && usage == MemoryUsage::Upload && size <= region_size) {
-        return GetStreamBuffer(size);
+        return GetStreamBuffer(size, caller);
     }
-    return GetStagingBuffer(size, usage, deferred);
+    return GetStagingBuffer(size, usage, deferred, caller);
 }
 
 void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
@@ -149,15 +153,17 @@ void StagingBufferPool::TickFrame() {
     ReleaseCache(MemoryUsage::DeviceLocal);
     ReleaseCache(MemoryUsage::Upload);
     ReleaseCache(MemoryUsage::Download);
+    recycler.TickFrame();
 }
 
-StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
+StagingBufferRef StagingBufferPool::GetStreamBuffer(
+    size_t size, VideoCommon::BufferChurnStats::StagingCaller caller) {
     if (AreRegionsActive(Region(free_iterator) + 1,
                          (std::min)(Region(iterator + size) + 1, NUM_SYNCS))) {
         // EDEN_NX2_MEMSTAGE_STATS: the stream ring is busy (the memory stage's join 3).
         VideoCommon::MemStageStats::StreamFull();
         // Avoid waiting for the previous usages to be free
-        return GetStagingBuffer(size, MemoryUsage::Upload);
+        return GetStagingBuffer(size, MemoryUsage::Upload, false, caller, true);
     }
     const u64 current_tick = scheduler.CurrentTick();
     std::fill(sync_ticks.begin() + Region(used_iterator), sync_ticks.begin() + Region(iterator),
@@ -175,7 +181,7 @@ StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
         if (AreRegionsActive(0, Region(size) + 1)) {
             VideoCommon::MemStageStats::StreamFull();
             // Avoid waiting for the previous usages to be free
-            return GetStagingBuffer(size, MemoryUsage::Upload);
+            return GetStagingBuffer(size, MemoryUsage::Upload, false, caller, true);
         }
     }
     const size_t offset = iterator;
@@ -197,12 +203,13 @@ bool StagingBufferPool::AreRegionsActive(size_t region_begin, size_t region_end)
                        [gpu_tick](u64 sync_tick) { return gpu_tick < sync_tick; });
 };
 
-StagingBufferRef StagingBufferPool::GetStagingBuffer(size_t size, MemoryUsage usage,
-                                                     bool deferred) {
+StagingBufferRef StagingBufferPool::GetStagingBuffer(
+    size_t size, MemoryUsage usage, bool deferred,
+    VideoCommon::BufferChurnStats::StagingCaller caller, bool stream_full) {
     if (const std::optional<StagingBufferRef> ref = TryGetReservedBuffer(size, usage, deferred)) {
         return *ref;
     }
-    return CreateStagingBuffer(size, usage, deferred);
+    return CreateStagingBuffer(size, usage, deferred, caller, stream_full);
 }
 
 std::optional<StagingBufferRef> StagingBufferPool::TryGetReservedBuffer(size_t size,
@@ -229,10 +236,14 @@ std::optional<StagingBufferRef> StagingBufferPool::TryGetReservedBuffer(size_t s
     return it->Ref();
 }
 
-StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage usage, bool deferred) {
+StagingBufferRef StagingBufferPool::CreateStagingBuffer(
+    size_t size, MemoryUsage usage, bool deferred,
+    VideoCommon::BufferChurnStats::StagingCaller caller, bool stream_full) {
     auto const log2_size = Common::Log2Ceil<u32>(u32(size));
     // EDEN_NX2_MEMSTAGE_STATS: no free staging buffer of this size (any user).
     VideoCommon::MemStageStats::StagingCreated(u64{1} << log2_size);
+    // EDEN_NX2_BUFFER_CHURN_STATS: the same, by caller.
+    VideoCommon::BufferChurnStats::StagingCreated(caller, u64{1} << log2_size, stream_full);
     VkBufferCreateInfo buffer_ci = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .pNext = nullptr,
@@ -253,28 +264,39 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
         buffer_ci.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     }
     vk::Buffer buffer;
-    try {
-        buffer = memory_allocator.CreateBuffer(buffer_ci, usage);
-    } catch (const vk::Exception& e) {
-        // Out of memory: free every idle staging buffer and try once more.
-        size_t freed = 0;
-        for (StagingBuffersCache* cache : {&device_local_cache, &upload_cache, &download_cache}) {
-            for (StagingBuffers& level : *cache) {
-                const size_t before = level.entries.size();
-                std::erase_if(level.entries, [this](const StagingBuffer& entry) {
-                    return !entry.deferred && scheduler.IsFree(entry.tick);
-                });
-                freed += before - level.entries.size();
-                level.iterate_index = 0;
-                level.delete_index = 0;
-            }
-        }
-        LOG_WARNING(Render_Vulkan, "Staging buffer of {} MiB could not be made ({}); freed {} idle "
-                    "staging buffers and retrying", buffer_ci.size >> 20, e.what(), freed);
-        buffer = memory_allocator.CreateBuffer(buffer_ci, usage);
+    // EDEN_NX2_EXP104: a pooled staging buffer of this memory usage and size the GPU finished
+    // with (BufferRecycler), instead of a new one. Same create info, so the same buffer.
+    if (BufferRecycler::Enabled()) {
+        buffer = recycler.Take(BufferRecycler::StagingFamily(usage), log2_size);
     }
-    VideoCommon::Churn::Add(VideoCommon::Churn::StagingBuffers);
-    VideoCommon::Churn::Add(VideoCommon::Churn::StagingBytes, buffer_ci.size);
+    if (!buffer) {
+        try {
+            buffer = memory_allocator.CreateBuffer(buffer_ci, usage);
+        } catch (const vk::Exception& e) {
+            // Out of memory: free every idle staging buffer (and EXP104's pooled ones) and try
+            // once more.
+            size_t freed = recycler.DropAll();
+            for (StagingBuffersCache* cache :
+                 {&device_local_cache, &upload_cache, &download_cache}) {
+                for (StagingBuffers& level : *cache) {
+                    const size_t before = level.entries.size();
+                    std::erase_if(level.entries, [this](const StagingBuffer& entry) {
+                        return !entry.deferred && scheduler.IsFree(entry.tick);
+                    });
+                    freed += before - level.entries.size();
+                    level.iterate_index = 0;
+                    level.delete_index = 0;
+                }
+            }
+            LOG_WARNING(Render_Vulkan,
+                        "Staging buffer of {} MiB could not be made ({}); freed {} idle "
+                        "staging buffers and retrying",
+                        buffer_ci.size >> 20, e.what(), freed);
+            buffer = memory_allocator.CreateBuffer(buffer_ci, usage);
+        }
+        VideoCommon::Churn::Add(VideoCommon::Churn::StagingBuffers);
+        VideoCommon::Churn::Add(VideoCommon::Churn::StagingBytes, buffer_ci.size);
+    }
     if (device.HasDebuggingToolAttached()) {
         ++buffer_index;
         buffer.SetObjectNameEXT(fmt::format("Staging Buffer {}", buffer_index).c_str());
@@ -341,8 +363,12 @@ void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
     if (&cache == &upload_cache && log2 <= KeepMaxLog2 &&
         (VideoCore::Nx2Debug::Experiment(8) & 1) != 0) {
         size_t idle = 0;
-        std::erase_if(entries, [this, &idle](const StagingBuffer& entry) {
-            return scheduler.IsFree(entry.tick) && ++idle > KeepPerLevel;
+        std::erase_if(entries, [this, &idle](StagingBuffer& entry) {
+            if (!scheduler.IsFree(entry.tick) || ++idle <= KeepPerLevel) {
+                return false;
+            }
+            Retire(entry);
+            return true;
         });
         staging.delete_index = 0;
         if (staging.iterate_index > entries.size()) {
@@ -351,8 +377,12 @@ void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
         return;
     }
 
-    const auto is_deletable = [this](const StagingBuffer& entry) {
-        return scheduler.IsFree(entry.tick);
+    const auto is_deletable = [this](StagingBuffer& entry) {
+        if (!scheduler.IsFree(entry.tick)) {
+            return false;
+        }
+        Retire(entry);
+        return true;
     };
     const size_t begin_offset = staging.delete_index;
     const size_t end_offset = (std::min)(begin_offset + deletions_per_tick, old_size);
@@ -368,6 +398,214 @@ void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
     if (staging.iterate_index > new_size) {
         staging.iterate_index = 0;
     }
+}
+
+void StagingBufferPool::Retire(StagingBuffer& entry) {
+    // EDEN_NX2_EXP104: the pool takes it (leaving entry.buffer empty) or the erase destroys it
+    // as before. The caller checked IsFree; the pool stamps the current tick anyway.
+    recycler.Give(BufferRecycler::StagingFamily(entry.usage), entry.buffer,
+                  u64{1} << entry.log2_level);
+}
+
+namespace {
+using PoolGroup = VideoCommon::BufferChurnStats::PoolGroup;
+
+VideoCommon::BufferChurnStats::PoolCounters& GroupCounters(BufferRecycler::Family family) {
+    const PoolGroup group =
+        family == BufferRecycler::Family::Cache ? PoolGroup::Cache : PoolGroup::Staging;
+    return VideoCommon::BufferChurnStats::GetPool().group[static_cast<size_t>(group)];
+}
+} // Anonymous namespace
+
+BufferRecycler::BufferRecycler(Scheduler& scheduler_) : scheduler{scheduler_} {}
+
+BufferRecycler::~BufferRecycler() {
+    // Shutdown: the device is idle; the vk::Buffers destroy themselves.
+    held_bytes = held_entries = doomed_bytes = 0;
+    PublishGauges();
+}
+
+bool BufferRecycler::Enabled() noexcept {
+    return VideoCore::Nx2Debug::Experiment(104) > 0;
+}
+
+BufferRecycler::Family BufferRecycler::StagingFamily(MemoryUsage usage) noexcept {
+    switch (usage) {
+    case MemoryUsage::Upload:
+        return Family::StagingUpload;
+    case MemoryUsage::Download:
+        return Family::StagingDownload;
+    default:
+        return Family::StagingDeviceLocal;
+    }
+}
+
+vk::Buffer BufferRecycler::Take(Family family, u32 log2, u64* bytes) {
+    VideoCommon::BufferChurnStats::PoolCounters& counters = GroupCounters(family);
+    if (log2 >= NumClasses) {
+        VideoCommon::BufferChurnStats::PoolAdd(counters.missed);
+        return vk::Buffer{};
+    }
+    vk::Buffer buffer;
+    {
+        std::scoped_lock lock{mutex};
+        std::deque<Entry>& list = lists[ListIndex(family, log2)];
+        // Oldest first: entries are returned in tick order, so if the oldest is still in use
+        // by the GPU, so are the others.
+        if (!list.empty() && scheduler.IsFree(list.front().tick)) {
+            Entry& entry = list.front();
+            buffer = std::move(entry.buffer);
+            if (bytes != nullptr) {
+                *bytes = entry.bytes;
+            }
+            held_bytes -= entry.bytes;
+            --held_entries;
+            list.pop_front();
+            PublishGauges();
+        }
+    }
+    VideoCommon::BufferChurnStats::PoolAdd(buffer ? counters.taken : counters.missed);
+    return buffer;
+}
+
+bool BufferRecycler::Give(Family family, vk::Buffer& buffer, u64 bytes) {
+    if (!buffer || bytes == 0 || !Enabled()) {
+        return false;
+    }
+    VideoCommon::BufferChurnStats::PoolCounters& counters = GroupCounters(family);
+    // Floor: the entry serves every create of its class (a buffer made while EXP104 was off
+    // has its exact size).
+    const u32 log2 = static_cast<u32>(Common::Log2Floor<u64>(bytes));
+    if (bytes > (u64{1} << MaxLog2)) {
+        VideoCommon::BufferChurnStats::PoolAdd(counters.refused);
+        return false;
+    }
+    std::scoped_lock lock{mutex};
+    lists[ListIndex(family, log2)].push_back(Entry{
+        .buffer = std::move(buffer),
+        .bytes = bytes,
+        .tick = scheduler.CurrentTick(),
+        .frame = frame,
+        .family = family,
+    });
+    held_bytes += bytes;
+    ++held_entries;
+    VideoCommon::BufferChurnStats::PoolAdd(counters.returned);
+    // Over the cap: the entry returned longest ago goes, whatever its class.
+    while (held_bytes > MaxHeldBytes) {
+        std::deque<Entry>* oldest = nullptr;
+        for (std::deque<Entry>& list : lists) {
+            if (!list.empty() &&
+                (oldest == nullptr || list.front().frame < oldest->front().frame)) {
+                oldest = &list;
+            }
+        }
+        if (oldest == nullptr) {
+            break;
+        }
+        Doom(std::move(oldest->front()));
+        oldest->pop_front();
+    }
+    PublishGauges();
+    return true;
+}
+
+void BufferRecycler::Doom(Entry&& entry) {
+    held_bytes -= entry.bytes;
+    --held_entries;
+    doomed_bytes += entry.bytes;
+    VideoCommon::BufferChurnStats::PoolAdd(GroupCounters(entry.family).evicted);
+    doomed.push_back(std::move(entry));
+    doomed_count.store(doomed.size(), std::memory_order_relaxed);
+}
+
+void BufferRecycler::TickFrame() {
+    {
+        std::scoped_lock lock{mutex};
+        ++frame;
+        if (held_entries != 0) {
+            // EXP104 off live: everything goes (still only once the GPU finished with it).
+            const int exp104 = VideoCore::Nx2Debug::Experiment(104);
+            const u64 age = exp104 > 1 ? static_cast<u64>(exp104) : DefaultAgeFrames;
+            for (std::deque<Entry>& list : lists) {
+                while (!list.empty() && (exp104 <= 0 || frame - list.front().frame > age)) {
+                    Doom(std::move(list.front()));
+                    list.pop_front();
+                }
+            }
+            PublishGauges();
+        }
+    }
+    if (HasDoomed()) {
+        // The split's idle hook destroys them on the back when it runs out of work (EXP99's
+        // way). Without the split nothing would: destroy here. A back that never idles still
+        // keeps at most MaxDoomedBytes waiting.
+        DestroyDoomed(VideoCommon::GpuSplit::OnBackThread() ? MaxDoomedBytes : 0);
+    }
+}
+
+size_t BufferRecycler::DestroyDoomed(u64 keep_bytes) {
+    std::deque<Entry> destroy;
+    {
+        std::scoped_lock lock{mutex};
+        while (!doomed.empty() && doomed_bytes > keep_bytes &&
+               scheduler.IsFree(doomed.front().tick)) {
+            doomed_bytes -= doomed.front().bytes;
+            destroy.push_back(std::move(doomed.front()));
+            doomed.pop_front();
+        }
+        doomed_count.store(doomed.size(), std::memory_order_relaxed);
+        PublishGauges();
+    }
+    const size_t count = destroy.size();
+    if (count != 0) {
+        Common::Nx2Timeline::Span span{"back: buffer pool destroy"};
+        destroy.clear();
+        VideoCommon::BufferChurnStats::PoolAdd(
+            VideoCommon::BufferChurnStats::GetPool().destroyed_here, count);
+    }
+    return count;
+}
+
+void BufferRecycler::DestroyIdle(u32 max) {
+    for (u32 i = 0; i < max; ++i) {
+        vk::Buffer buffer;
+        {
+            std::scoped_lock lock{mutex};
+            if (doomed.empty() || !scheduler.IsFree(doomed.front().tick)) {
+                return;
+            }
+            doomed_bytes -= doomed.front().bytes;
+            buffer = std::move(doomed.front().buffer);
+            doomed.pop_front();
+            doomed_count.store(doomed.size(), std::memory_order_relaxed);
+            PublishGauges();
+        }
+        Common::Nx2Timeline::Span span{"back: idle buffer pool destroy"};
+        buffer.reset();
+        VideoCommon::BufferChurnStats::PoolAdd(
+            VideoCommon::BufferChurnStats::GetPool().destroyed_idle);
+    }
+}
+
+size_t BufferRecycler::DropAll() {
+    {
+        std::scoped_lock lock{mutex};
+        for (std::deque<Entry>& list : lists) {
+            while (!list.empty()) {
+                Doom(std::move(list.front()));
+                list.pop_front();
+            }
+        }
+    }
+    return DestroyDoomed(0);
+}
+
+void BufferRecycler::PublishGauges() noexcept {
+    VideoCommon::BufferChurnStats::Pool& pool = VideoCommon::BufferChurnStats::GetPool();
+    pool.held_bytes.store(held_bytes, std::memory_order_relaxed);
+    pool.held_entries.store(held_entries, std::memory_order_relaxed);
+    pool.doomed_bytes.store(doomed_bytes, std::memory_order_relaxed);
 }
 
 } // namespace Vulkan
