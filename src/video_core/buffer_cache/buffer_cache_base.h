@@ -265,6 +265,11 @@ public:
     /// when the memory is going away).
     void WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu_data = true);
 
+    /// EXP91 (fable52_answer_uniformkeeps stage 0, counting only): RasterizerVulkan::
+    /// InnerInvalidation's ranges (FlushCaching's cached writes, EXP88's constant buffer data
+    /// among them), noted first, before any early return. Drawing thread. Changes nothing bound.
+    void NoteCachedWrites(std::span<const std::pair<DAddr, std::size_t>> sequences);
+
     /// EXP88 & 1 (zortos293/Lichii#1441 part c, fable52_answer_next70 3.1): why WriteMemory of
     /// [device_addr, device_addr + size) may change something, or None when it would only make
     /// its first three marks (NoteWriteUnlocked): no page ever left the CPU-modified state (so
@@ -1298,6 +1303,51 @@ private:
     /// (cpu_pages / untracked_pages unused).
     DirtyWalkVerify storage_memo_verify;
     u64 frame_tick = 0;
+
+    /// EXP91 (fable52_answer_uniformkeeps stage 0): counts how many of today's slot rebinds
+    /// (BindSmallUniformReusing: same bytes, same tick) a keep could have made without reading
+    /// guest memory. Drawing thread only; nothing here changes what is bound.
+    struct UniformKeepCount {
+        static constexpr size_t RingSize = 128;
+        static constexpr size_t NumStages = 5;
+        static constexpr size_t NumSlots = 18;
+        struct Range {
+            DAddr begin{};
+            DAddr end{};
+        };
+        /// The last RingSize cached write ranges; range number `seq` sits at seq % RingSize.
+        std::array<Range, RingSize> ring{};
+        u64 write_seq{};
+        struct Slot {
+            DAddr addr{};
+            u32 size{};
+            bool valid{};
+            u64 seen_seq{}; ///< write_seq at the slot's last bind
+        };
+        std::array<std::array<Slot, NumSlots>, NumStages> slots{};
+        /// Since the last log line. A slot rebind lands in exactly one of kept .. pending.
+        struct Totals {
+            u64 binds{};        ///< BindSmallUniformReusing calls
+            u64 rebinds{};      ///< every rebind (slot and EXP17 range reuse)
+            u64 slot_rebinds{}; ///< today's rebind of the slot's own copy
+            u64 kept{};         ///< K: no noted range touched it since the slot's last bind
+            u64 no_keep{};      ///< the slot was not streamed since counting (re)started
+            u64 other_range{};  ///< the slot's last bind was another range
+            u64 overflow{};     ///< more than RingSize ranges noted since the slot's last bind
+            u64 overlap{};      ///< a range noted since then overlaps
+            u64 pending{};      ///< MemoryManager holds unflushed cached writes at the bind
+        };
+        Totals totals{};
+        u64 calls{};
+        u64 last_frame{};
+        u64 log_write_seq{}; ///< write_seq at the last log line
+        std::chrono::steady_clock::time_point last_log{};
+    };
+    UniformKeepCount uniform_keep_count;
+
+    /// EXP91 != 0: BindSmallUniformReusing as the stream branch calls it, plus the counting.
+    bool BindSmallUniformCountingKeeps(size_t stage, u32 index, u32 binding_index,
+                                       DAddr device_addr, u32 size, bool range_reuse);
 
     /// EDEN_NX2_EXP18 (zortos293/Lichii#641): resolved bindings are kept while the GPU mappings
     /// and the set of buffers stay the same. Bumped whenever a buffer is created, joined or

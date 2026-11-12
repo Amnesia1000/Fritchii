@@ -530,6 +530,16 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// cancelled calls, releases, pages held and, as the verify, pages left lingering after an
 /// Unmap (must stay 0). Watch "writes collected" in the Guest access line: if it rises much,
 /// lower N.
+/// EXP91 (live, 0 = off; fable52_answer_uniformkeeps stage 0; counting only, nothing bound
+/// changes): RasterizerVulkan::InnerInvalidation notes every cached write range it gets
+/// (FlushCaching's, EXP88's constant buffer data among them) in a ring of 128 with a sequence
+/// number, before any early return (BufferCache::NoteCachedWrites). Each of today's slot rebinds
+/// in BindSmallUniformReusing (same bytes, same tick) is then judged as a keep would be: K when
+/// the slot's last bind was the same range and no range noted since overlaps it, with nothing
+/// pending in MemoryManager (accumulator, EXP88's ranges); else not kept, by reason (range
+/// written, ring overflow, pending cached writes, other range, no keep yet). "Uniform keeps
+/// count (EXP91" logs small binds, rebinds and those counts per second every 5 s while not 0.
+/// Gain of the later stages is about K x 55 ns; under 100,000 a second, stop there.
 /// EXP85 (live, bits, 0 = off; fable52_answer_microcuts 1 and 2b): 1 = a small inline upload to
 /// pages no GPU write ever marked skips the buffer cache's lock (InlineMemory would find nothing
 /// there; the list note and the query cache as before), 2 = BufferCache::WriteMemory answers

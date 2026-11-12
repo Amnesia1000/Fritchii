@@ -3051,6 +3051,8 @@ void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::Cache
 }
 
 void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) {
+    // EXP91 (stage 0): every cached write range, before any early return (counting only).
+    buffer_cache.NoteCachedWrites(sequences);
     if (Settings::values.skip_cpu_inner_invalidation.GetValue()) {
         return;
     }
