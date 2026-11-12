@@ -783,6 +783,12 @@ inline void LoadExperiments() {
         // checked, 0 mismatches. Toggle (orbit, uncapped, 180 s warm, 6 cycles): guest lock waits
         // 65.0 -> 3.7 ms/s median, 65.0 -> 66.5 fps, 1% low 44.0 -> 44.9, 0 broken mirrors.
         g_experiments[86].store(1, std::memory_order_relaxed);
+        // EXP88 = 3 (2026-11-12, overnight): zortos293/Lichii#1441 parts a-c (Fable's plan). Verify
+        // runs: part c skipped 100% of ~800,000 flush ranges a second with 0 that would change,
+        // parts a+b 0 differ over ~8 million direct writes. Daytime market toggle (orbit,
+        // uncapped): back 7.89 -> 7.43 us per draw, flush work 33.6 -> 16.9 ms/s, 59.8 -> 61.8
+        // fps in the same session, 0.1% low 29.2 -> 32.8; picture normal.
+        g_experiments[88].store(3, std::memory_order_relaxed);
         // EXP49 = 1 (2026-11-10, owner's call for v5.7): the async read-back. Stalchild fight,
         // flipped every 30 s while the owner fought: 51.9 -> 56.9 fps, the back's read flushes
         // 35 -> 6 ms/s, guest lock waits halved. No beams in that session or two later ones
