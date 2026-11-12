@@ -714,6 +714,13 @@ inline void LoadExperiments() {
         // seen; owner asked for them as defaults.
         g_experiments[77].store(1, std::memory_order_relaxed);
         g_experiments[78].store(1, std::memory_order_relaxed);
+        // EXP82 = 1800 and EXP66 = 1024 (2026-11-12, overnight): proven image pool entries stay
+        // 1,800 frames and the pool may hold 1 GiB. Daytime market toggle (orbit, uncapped, zones
+        // on): clear 59.6 -> 43.0 ms/s, back busy 7.88 -> 7.45 us per draw, 0.1% low 30.8 ->
+        // 35.4; pool 1,000-1,500 taken per 600 frames, held up to ~716 MiB. The pool still
+        // empties on device memory pressure (TickFrame).
+        g_experiments[82].store(1800, std::memory_order_relaxed);
+        g_experiments[66].store(1024, std::memory_order_relaxed);
         // EXP49 = 1 (2026-11-10, owner's call for v5.7): the async read-back. Stalchild fight,
         // flipped every 30 s while the owner fought: 51.9 -> 56.9 fps, the back's read flushes
         // 35 -> 6 ms/s, guest lock waits halved. No beams in that session or two later ones
