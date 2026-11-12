@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -1134,6 +1135,81 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     return false;
 }
 
+namespace {
+// EDEN_NX2_ACQUIRE_LOG=1 (read once; Fable heavypath 3): every acquire resumed from a suspension,
+// grouped by semaphore address: resumes and total wait per second, waits of 1 ms and more, the
+// operation and value waited for, whether its fence release was readable. Logged every 5 s, the
+// 8 addresses with the most wait first ("Acquires resumed (5 s").
+struct AcquireLogEntry {
+    u64 count{};
+    u64 wait_ns{};
+    u64 long_count{};
+    u64 long_ns{};
+    u64 readable{};
+    u32 operation{};
+    u32 value{};
+    u64 device{};
+};
+struct AcquireLog {
+    std::mutex mutex;
+    std::unordered_map<GPUVAddr, AcquireLogEntry> entries;
+    std::chrono::steady_clock::time_point since{};
+};
+bool AcquireLogEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_ACQUIRE_LOG");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+void NoteAcquireResumed(GPUVAddr address, u32 operation, u32 value, u64 device, u64 ns,
+                        bool readable) {
+    static AcquireLog log;
+    std::scoped_lock lock{log.mutex};
+    AcquireLogEntry& entry = log.entries[address];
+    ++entry.count;
+    entry.wait_ns += ns;
+    if (ns >= 1'000'000) {
+        ++entry.long_count;
+        entry.long_ns += ns;
+    }
+    entry.readable += readable ? 1 : 0;
+    entry.operation = operation;
+    entry.value = value;
+    entry.device = device;
+    const auto now = std::chrono::steady_clock::now();
+    if (log.since == std::chrono::steady_clock::time_point{}) {
+        log.since = now;
+        return;
+    }
+    const double seconds = std::chrono::duration<double>(now - log.since).count();
+    if (seconds < 5.0) {
+        return;
+    }
+    std::vector<std::pair<GPUVAddr, AcquireLogEntry>> sorted(log.entries.begin(), log.entries.end());
+    std::ranges::sort(sorted, [](const auto& a, const auto& b) { return a.second.wait_ns > b.second.wait_ns; });
+    u64 count = 0;
+    u64 wait_ns = 0;
+    for (const auto& [addr, e] : sorted) {
+        count += e.count;
+        wait_ns += e.wait_ns;
+    }
+    std::string text;
+    for (size_t i = 0; i < sorted.size() && i < 8; ++i) {
+        const AcquireLogEntry& e = sorted[i].second;
+        text += fmt::format(" [{:#x} dev {:#x} op {} value {:#x}: {:.0f}/s, {:.1f} ms/s, {:.0f} us each, "
+                            ">=1ms {:.0f}/s {:.1f} ms/s, readable {:.0f}/s]",
+                            sorted[i].first, e.device, e.operation, e.value, e.count / seconds,
+                            e.wait_ns / 1e6 / seconds, e.count ? e.wait_ns / 1e3 / e.count : 0.0,
+                            e.long_count / seconds, e.long_ns / 1e6 / seconds, e.readable / seconds);
+    }
+    LOG_INFO(HW_GPU, "Acquires resumed (5 s, per second): {:.0f} resumes, {:.1f} ms/s waited, {} addresses; top:{}",
+             count / seconds, wait_ns / 1e6 / seconds, sorted.size(), text);
+    log.entries.clear();
+    log.since = now;
+}
+} // namespace
+
 bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
     if (!CanResumeAcquire(dma_pusher)) {
         return false;
@@ -1147,6 +1223,16 @@ bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
             ++stats.resumed;
             stats.resume_ns += FenceWriterStats::Nanoseconds(
                 pending_acquire->since, FenceWriterStats::Clock::now());
+        }
+        if (AcquireLogEnabled()) [[unlikely]] {
+            const auto device = dma_pusher.memory_manager.GpuToCpuAddress(pending_acquire->address);
+            NoteAcquireResumed(pending_acquire->address, pending_acquire->operation,
+                               pending_acquire->value, device.value_or(0),
+                               static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                    std::chrono::steady_clock::now() -
+                                                    pending_acquire->since)
+                                                    .count()),
+                               pending_acquire->readable_release);
         }
         pending_acquire.reset();
         dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
