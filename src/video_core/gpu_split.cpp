@@ -26,12 +26,14 @@
 #include "common/logging.h"
 #include "common/nx2_hitch.h"
 #include "common/nx2_timeline.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu_split.h"
+#include "video_core/nx2_split_stats.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_debug_control.h"
@@ -341,6 +343,9 @@ void GpuSplit::Publish() {
     delta_header = nullptr;
     if (published_local == write_position) {
         return;
+    }
+    if (Nx2SplitStats::Enabled()) [[unlikely]] {
+        Nx2SplitStats::NotePublish(write_position - published_local);
     }
     published_local = write_position;
     publish_every = std::min<size_t>(publish_every * 2, PublishEvery);
@@ -1374,6 +1379,22 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             // EXP39 & 1: the front publishes what it holds at its next commit (a few words) from
             // now on. Published positions only grow, so the front never matches a stale one.
             back_idle_at.store(read_position, std::memory_order_relaxed);
+            // EDEN_NX2_SPLIT_STATS: this wait's length, deepest phase and the words it woke to.
+            const bool split_stats = Nx2SplitStats::Enabled();
+            const auto wait_start = split_stats ? std::chrono::steady_clock::now()
+                                                : std::chrono::steady_clock::time_point{};
+            u32 wait_phase = 0;
+            SCOPE_EXIT {
+                if (split_stats) [[unlikely]] {
+                    const u64 ns = static_cast<u64>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - wait_start)
+                            .count());
+                    Nx2SplitStats::NoteWait(ns, wait_phase,
+                                            published.load(std::memory_order_relaxed) -
+                                                read_position);
+                }
+            };
             // The front usually sends more within microseconds: spin briefly before sleeping.
             for (u32 spins = 0; spins < 8192 && available == read_position &&
                                 !hook_requested.load(std::memory_order_relaxed);
@@ -1385,6 +1406,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 hook_requested.store(false, std::memory_order_seq_cst);
                 ForgetFencesQuiet();
                 timeline_span.Set(0, {"phase", 1});
+                wait_phase = 1;
                 idle_hook(idle_argument);
                 available = published.load(std::memory_order_acquire);
                 if (available == read_position) {
@@ -1401,6 +1423,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 if (available == read_position && !stop_token.stop_requested() &&
                     !hook_requested.load(std::memory_order_seq_cst)) {
                     timeline_span.Set(0, {"phase", 2});
+                    wait_phase = 2;
                     wake.wait(seen, std::memory_order_seq_cst);
                 }
                 back_waiting.store(false, std::memory_order_relaxed);
