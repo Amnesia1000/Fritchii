@@ -90,7 +90,7 @@ Use these before guessing. All are off unless the variable is set; pass them as 
 | Split GPU thread races | `EDEN_NX2_SPLIT_CHECK=1` | Reports scheduler use from the wrong thread. |
 | Upscaler and DLSS contracts | `EDEN_NX2_DLSS_CONTRACT_TRACE=1` | Inputs and outputs of replaced upscaler networks. |
 | Service calls | `EDEN_NX2_IPC_TRACE=1` | IPC command trace. |
-| Host crash (log just stops) | Windows minidump in `%LOCALAPPDATA%\CrashDumps\lichii.exe.<pid>.dmp` | Read the exception and stack with the `minidump` Python package, then symbolize with `llvm-symbolizer --obj=lichii.exe --inlines --relative-address <offset>` next to the build's `lichii.pdb`. |
+| Host crash (log just stops) | Always on (Windows): a `Common <Critical> Host crash:` line, then `eden_crash.dmp` next to the log. Without that line, the WER minidump in `%LOCALAPPDATA%\CrashDumps\lichii.exe.<pid>.dmp` if LocalDumps is set up | The line has the exception code, faulting thread (id and name) and the stack as module+offset; `abort()` covers `std::terminate` and fatal asserts. Symbolize with `llvm-symbolizer --obj=lichii.exe --inlines --relative-address <offset>` next to the build's `lichii.pdb`, and read the dump with the `minidump` Python package. Fail-fast exits (heap corruption, stack cookie) and kills skip it, and the log then also misses up to 4 KiB of lines below Error that were still buffered. |
 
 ## How work is split
 
