@@ -265,6 +265,16 @@ private:
 
     void UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs);
 
+    /// EXP83 (fable52_answer_microcuts 3.2): the vertex input state last recorded in this command
+    /// buffer, so an identical one is not sent again. Valid while vertex_input_memo_generation
+    /// equals the state tracker's and no pipeline without dynamic vertex input was bound since.
+    boost::container::static_vector<VkVertexInputBindingDescription2EXT, 32> vertex_input_memo_bindings;
+    boost::container::static_vector<VkVertexInputAttributeDescription2EXT, 32> vertex_input_memo_attributes;
+    u64 vertex_input_memo_generation{~u64{0}};
+    bool vertex_input_memo_valid{};
+    u64 vertex_input_sent{};
+    u64 vertex_input_repeats{};
+
     /// Clears a 3D color target whose slices the framebuffer can't reach. Returns true when handled.
     bool ClearVolumeSlices(const Framebuffer* framebuffer, u32 first_slice, u32 slice_count);
     void FrameDumpPass(const Framebuffer* framebuffer);

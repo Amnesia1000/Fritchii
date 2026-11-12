@@ -89,9 +89,15 @@ public:
         current_topology = INVALID_TOPOLOGY;
         current_host_topology = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
         stencil_reset = true;
+        ++vertex_input_generation;
     }
 
+    /// EXP83: raised whenever the command buffer's vertex input state may no longer be what the
+    /// last SetVertexInputEXT set (new command buffer, input or whole state invalidated).
+    u64 vertex_input_generation{};
+
     void InvalidateInputState() {
+        ++vertex_input_generation;
         (*flags)[Dirty::VertexInput] = true;
         (*flags)[Dirty::PrimitiveRestartEnable] = true;
         for (std::size_t index = VideoCommon::Dirty::VertexBuffer0;

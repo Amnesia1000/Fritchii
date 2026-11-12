@@ -471,6 +471,12 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// limit. EDEN_NX2_IDLE_STATS=1 logs each core's idle periods every 10 s (polled, blocked, wake
 /// latency). Blocking still uses EDEN_NX2_CORE_LOCK's address wait when that is on. In OoT the
 /// guest threads' handoffs sit on the frame's critical path. Off by default.
+/// EXP83 (live, 0 = off; fable52_answer_microcuts 3.2; RasterizerVulkan::UpdateVertexInput): a
+/// vertex input state identical to the last one recorded in this command buffer is not sent
+/// again (any vertex buffer address or stride write resent all 32 bindings). The memo drops on
+/// StateTracker invalidation (new command buffer, input or whole state; helper passes call
+/// InvalidateState) and when a pipeline without dynamic vertex input is drawn. "Vertex input
+/// (EXP83" logs sends and repeats every 10 s, also while off.
 /// EXP82 (live, frames, 0 = off; fable52_answer_after7778 1; TextureCacheRuntime::TickFrame):
 /// proven EXP42 pool entries (a shape taken from the pool before) stay this many frames instead
 /// of 180, so per-NPC depth targets whose size comes back later find their image. Unproven

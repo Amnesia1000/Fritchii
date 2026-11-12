@@ -4323,6 +4323,9 @@ void RasterizerVulkan::UpdateDynamicStates(const GraphicsPipeline* pipeline) {
             pipeline != nullptr ? pipeline : pipeline_cache.CurrentGraphicsPipeline();
         if (gp && gp->HasDynamicVertexInput()) {
             UpdateVertexInput(regs);
+        } else if (gp) {
+            // EXP83: binding a pipeline without dynamic vertex input leaves that state undefined.
+            vertex_input_memo_valid = false;
         }
     }
 }
@@ -5133,6 +5136,52 @@ void RasterizerVulkan::UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs) 
     }
     for (size_t index = 0; index < Maxwell::NumVertexArrays; ++index) {
         dirty[Dirty::VertexBinding0 + index] = false;
+    }
+
+    // EDEN_NX2_EXP83 (live, 0 = off; fable52_answer_microcuts 3.2): a vertex buffer address or
+    // stride write raises VertexBuffers and so sent the whole state again, usually unchanged.
+    // A dynamic state stays set in a command buffer until set again or a pipeline without it is
+    // bound (both drop the memo), so a call with the last call's arguments changes nothing.
+    // Compared field by field: the structs have padding after sType.
+    const int memo_mode = VideoCore::Nx2Debug::Experiment(83);
+    ++vertex_input_sent;
+    if (vertex_input_memo_valid &&
+        vertex_input_memo_generation == state_tracker.vertex_input_generation &&
+        bindings.size() == vertex_input_memo_bindings.size() &&
+        attributes.size() == vertex_input_memo_attributes.size()) {
+        bool same = true;
+        for (size_t i = 0; same && i < bindings.size(); ++i) {
+            const auto& a = bindings[i];
+            const auto& b = vertex_input_memo_bindings[i];
+            same = a.binding == b.binding && a.stride == b.stride && a.inputRate == b.inputRate &&
+                   a.divisor == b.divisor;
+        }
+        for (size_t i = 0; same && i < attributes.size(); ++i) {
+            const auto& a = attributes[i];
+            const auto& b = vertex_input_memo_attributes[i];
+            same = a.location == b.location && a.binding == b.binding && a.format == b.format &&
+                   a.offset == b.offset;
+        }
+        if (same) {
+            ++vertex_input_repeats;
+            if (memo_mode != 0) {
+                return;
+            }
+        }
+    }
+    vertex_input_memo_bindings = bindings;
+    vertex_input_memo_attributes = attributes;
+    vertex_input_memo_generation = state_tracker.vertex_input_generation;
+    vertex_input_memo_valid = true;
+    static auto last_log = std::chrono::steady_clock::now();
+    if (const auto now = std::chrono::steady_clock::now();
+        now - last_log >= std::chrono::seconds{10}) {
+        LOG_INFO(Render_Vulkan,
+                 "Vertex input (EXP83={}) last 10 s: {} sends, {} the same as the last one ({})",
+                 memo_mode, vertex_input_sent, vertex_input_repeats,
+                 memo_mode != 0 ? "skipped" : "sent anyway");
+        vertex_input_sent = vertex_input_repeats = 0;
+        last_log = now;
     }
 
     scheduler.Record([bindings, attributes](vk::CommandBuffer cmdbuf) {
