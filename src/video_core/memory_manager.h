@@ -232,6 +232,12 @@ public:
         accumulator.Add(gpu_addr, size);
     }
 
+    /// EXP91: whether cached writes wait for the next FlushCaching (accumulated GPU ranges or
+    /// EXP88's constant buffer device ranges). Drawing thread.
+    [[nodiscard]] bool HasPendingCachedWrites() const noexcept {
+        return !accumulator.Empty() || !constant_buffer_writes.empty();
+    }
+
     const u8* GetSpan(const GPUVAddr src_addr, const std::size_t size) const;
     u8* GetSpan(const GPUVAddr src_addr, const std::size_t size);
 

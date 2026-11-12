@@ -2456,9 +2456,16 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                 const u64 rebinds =
                     VideoCommon::UniformStreamReuseState<typename Runtime::StreamUniformRef>()
                         .rebinds;
-                streamed = VideoCommon::BindSmallUniformReusing(
-                    runtime, device_memory, stage, index, binding_index, device_addr, size,
-                    VideoCore::Nx2Debug::Experiment(17) != 0);
+                if (VideoCore::Nx2Debug::Experiment(91) != 0) [[unlikely]] {
+                    // EXP91 (stage 0): the same call, counted (binds nothing differently).
+                    streamed = BindSmallUniformCountingKeeps(
+                        stage, index, binding_index, device_addr, size,
+                        VideoCore::Nx2Debug::Experiment(17) != 0);
+                } else {
+                    streamed = VideoCommon::BindSmallUniformReusing(
+                        runtime, device_memory, stage, index, binding_index, device_addr, size,
+                        VideoCore::Nx2Debug::Experiment(17) != 0);
+                }
                 const u64 rebound =
                     VideoCommon::UniformStreamReuseState<typename Runtime::StreamUniformRef>()
                         .rebinds -
@@ -2505,6 +2512,125 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         runtime.BindUniformBuffer(buffer, offset, size);
     }
     channel_state->fast_bound_uniform_buffers[stage] &= ~(1u << binding_index);
+}
+
+template <class P>
+void BufferCache<P>::NoteCachedWrites(std::span<const std::pair<DAddr, std::size_t>> sequences) {
+    if (VideoCore::Nx2Debug::Experiment(91) == 0) {
+        return;
+    }
+    UniformKeepCount& count = uniform_keep_count;
+    for (const auto& [addr, size] : sequences) {
+        ++count.write_seq;
+        count.ring[count.write_seq % UniformKeepCount::RingSize] = {addr, addr + size};
+    }
+}
+
+template <class P>
+bool BufferCache<P>::BindSmallUniformCountingKeeps(size_t stage, u32 index, u32 binding_index,
+                                                   DAddr device_addr, u32 size,
+                                                   bool range_reuse) {
+    if constexpr (!IS_OPENGL && VideoCommon::StreamUniformReusable<Runtime>) {
+        using Ref = typename Runtime::StreamUniformRef;
+        using Reuse = VideoCommon::UniformStreamReuse<Ref>;
+        using Count = UniformKeepCount;
+        static_assert(Count::NumStages == Reuse::NumStages && Count::NumSlots == Reuse::NumSlots);
+        Reuse& reuse = VideoCommon::UniformStreamReuseState<Ref>();
+        Count& count = uniform_keep_count;
+        // A whole frame without a counted bind: EXP91 was off (nothing noted then) or nothing
+        // drew. Start over, so no bind is judged across ranges the ring did not see.
+        if (count.last_log == std::chrono::steady_clock::time_point{} ||
+            count.last_frame + 1 < frame_tick) {
+            for (auto& stage_slots : count.slots) {
+                stage_slots.fill(typename Count::Slot{});
+            }
+            count.totals = {};
+            count.log_write_seq = count.write_seq;
+            count.last_log = std::chrono::steady_clock::now();
+        }
+        count.last_frame = frame_tick;
+        const bool in_slot = stage < Count::NumStages && index < Count::NumSlots;
+        typename Reuse::Slot before{};
+        if (in_slot) {
+            before = reuse.slots[stage][index];
+        }
+        const u64 rebinds = reuse.rebinds;
+        const bool streamed = VideoCommon::BindSmallUniformReusing(
+            runtime, device_memory, stage, index, binding_index, device_addr, size, range_reuse);
+        const u64 rebound = reuse.rebinds - rebinds;
+        typename Count::Totals& totals = count.totals;
+        ++totals.binds;
+        totals.rebinds += rebound;
+        if (in_slot) {
+            typename Count::Slot& keep = count.slots[stage][index];
+            const typename Reuse::Slot& after = reuse.slots[stage][index];
+            // The slot still names the same copy and serial only after today's slot rebind (the
+            // compare said "same" and the copy's tick is the current one); a range-reuse rebind
+            // or a fresh copy changes it.
+            if (rebound != 0 && after.copy == before.copy && after.serial == before.serial) {
+                ++totals.slot_rebinds;
+                const u64 since = count.write_seq - keep.seen_seq;
+                const auto overlaps = [&] {
+                    const DAddr end = device_addr + size;
+                    for (u64 seq = keep.seen_seq + 1; seq <= count.write_seq; ++seq) {
+                        const typename Count::Range& range = count.ring[seq % Count::RingSize];
+                        if (range.begin < end && device_addr < range.end) {
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+                if (!keep.valid) {
+                    ++totals.no_keep;
+                } else if (keep.addr != device_addr || keep.size != size) {
+                    ++totals.other_range;
+                } else if (since > Count::RingSize) {
+                    ++totals.overflow;
+                } else if (overlaps()) {
+                    ++totals.overlap;
+                } else if (gpu_memory != nullptr && gpu_memory->HasPendingCachedWrites()) {
+                    ++totals.pending;
+                } else {
+                    ++totals.kept;
+                }
+            }
+            if (streamed) {
+                keep = typename Count::Slot{device_addr, size, true, count.write_seq};
+            } else {
+                keep.valid = false;
+            }
+        }
+        if ((++count.calls & 1023) == 0) {
+            const auto now = std::chrono::steady_clock::now();
+            const double seconds = std::chrono::duration<double>(now - count.last_log).count();
+            if (seconds >= 5.0) {
+                const auto rate = [seconds](u64 n) {
+                    return static_cast<u64>(static_cast<double>(n) / seconds + 0.5);
+                };
+                LOG_INFO(HW_GPU,
+                         "Uniform keeps count (EXP91, per second over {:.1f} s): small binds {}, "
+                         "rebinds today {} (slot {}), K (keepable) {}; not kept: range written "
+                         "{}, ring overflow {}, pending cached writes {}, other range {}, no "
+                         "keep yet {}; ranges noted {}",
+                         seconds, rate(totals.binds), rate(totals.rebinds),
+                         rate(totals.slot_rebinds), rate(totals.kept), rate(totals.overlap),
+                         rate(totals.overflow), rate(totals.pending), rate(totals.other_range),
+                         rate(totals.no_keep), rate(count.write_seq - count.log_write_seq));
+                count.totals = {};
+                count.log_write_seq = count.write_seq;
+                count.last_log = now;
+            }
+        }
+        return streamed;
+    } else {
+        (void)stage;
+        (void)index;
+        (void)binding_index;
+        (void)device_addr;
+        (void)size;
+        (void)range_reuse;
+        return false;
+    }
 }
 
 template <class P>
