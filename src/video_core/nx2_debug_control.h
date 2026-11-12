@@ -540,6 +540,11 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// written, ring overflow, pending cached writes, other range, no keep yet). "Uniform keeps
 /// count (EXP91" logs small binds, rebinds and those counts per second every 5 s while not 0.
 /// Gain of the later stages is about K x 55 ns; under 100,000 a second, stop there.
+/// EXP101 (live, 0 = off; fable52_answer_presenter): nvhost_gpu::SubmitGPFIFOImpl's pushbuffer
+/// snapshot reads runs of entries whose GPU addresses follow each other with one ReadBlockUnsafe
+/// instead of one per entry (OoT's presenting thread submits ~6,500 entries a frame; the loop is
+/// on the frame's critical path). Exact: same words at the same offsets. "Pushbuffer snapshot
+/// (EXP101" logs submits, entries, reads and loop time every 5 s while on.
 /// EXP99 (live, 0 = off; fable52_answer_chicken 1): evicted EXP42 pool images (OoT's per-NPC
 /// depth targets, ~3 a frame while a chicken passes or an enemy dies) are destroyed on the image
 /// free thread instead of on the GPU back thread at the frame's end. The pool line every 600

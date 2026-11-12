@@ -30,6 +30,7 @@
 #include "video_core/gpu.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_debug_control.h"
 
 namespace Service::Nvidia::Devices {
 namespace {
@@ -411,6 +412,36 @@ static boost::container::small_vector<Tegra::CommandHeader, 512> BuildIncrementW
     return result;
 }
 
+namespace {
+// EXP101 counters, every 5 s while it is on: submits, entries, reads made, loop time.
+void NotePbSnapshot(int mode, size_t entries, u64 reads, std::chrono::steady_clock::duration took) {
+    static std::atomic<u64> submits{}, entry_count{}, read_count{}, ns{};
+    static std::atomic<s64> next_report{};
+    submits.fetch_add(1, std::memory_order_relaxed);
+    entry_count.fetch_add(entries, std::memory_order_relaxed);
+    read_count.fetch_add(reads, std::memory_order_relaxed);
+    ns.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(took).count()),
+                 std::memory_order_relaxed);
+    const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    s64 next = next_report.load(std::memory_order_relaxed);
+    if (next == 0) {
+        next_report.compare_exchange_strong(next, now + 5'000'000'000);
+        return;
+    }
+    if (now < next || !next_report.compare_exchange_strong(next, now + 5'000'000'000)) {
+        return;
+    }
+    const u64 s = submits.exchange(0), e = entry_count.exchange(0), r = read_count.exchange(0),
+              t = ns.exchange(0);
+    LOG_INFO(Service_NVDRV,
+             "Pushbuffer snapshot (EXP101={}, 5 s, per second): {:.0f} submits, {:.0f} entries, "
+             "{:.0f} reads ({:.1f} entries each), loop {:.2f} ms/s",
+             mode, s / 5.0, e / 5.0, r / 5.0, r != 0 ? static_cast<double>(e) / r : 0.0, t / 5e6);
+}
+} // namespace
+
 NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandList&& entries) {
     LOG_TRACE(Service_NVDRV, "called, gpfifo={:X}, num_entries={:X}, flags={:X}", params.address,
               params.num_entries, params.flags.raw);
@@ -461,7 +492,58 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
             entries.submitted_words.resize(words);
             entries.submitted_offsets.reserve(entries.command_lists.size());
             size_t offset = 0;
-            for (u32 i = 0; i < entries.command_lists.size(); ++i) {
+            // EDEN_NX2_EXP101 (live; fable52_answer_presenter): entries whose GPU addresses follow
+            // each other are read with one ReadBlockUnsafe per run instead of one per entry (OoT:
+            // ~6,500 entries a frame, a few words each, on the thread that presents). The words
+            // land where the per-entry reads put them; any entry a queued map touches takes the
+            // per-entry path as before.
+            const int run_mode = VideoCore::Nx2Debug::Experiment(101);
+            const auto loop_begin = run_mode != 0 ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point{};
+            u64 runs_read = 0;
+            if (run_mode != 0) {
+                const auto& lists = entries.command_lists;
+                for (u32 i = 0; i < lists.size();) {
+                    u32 end = i + 1;
+                    u64 run_bytes = static_cast<u64>(lists[i].size) * sizeof(u32);
+                    while (end < lists.size() &&
+                           static_cast<u64>(lists[end].addr) ==
+                               static_cast<u64>(lists[i].addr) + run_bytes) {
+                        run_bytes += static_cast<u64>(lists[end].size) * sizeof(u32);
+                        ++end;
+                    }
+                    if (end - i > 1 && !system.GPU().IsMapPending(lists[i].addr, run_bytes)) {
+                        for (u32 j = i; j < end; ++j) {
+                            entries.submitted_offsets.push_back(static_cast<u32>(offset));
+                            offset += lists[j].size;
+                        }
+                        channel_state->memory_manager->ReadBlockUnsafe(
+                            lists[i].addr,
+                            entries.submitted_words.data() + entries.submitted_offsets[i],
+                            run_bytes);
+                        ++runs_read;
+                        i = end;
+                        continue;
+                    }
+                    // One entry (or a run a queued map touches): as before.
+                    const auto& entry = lists[i];
+                    entries.submitted_offsets.push_back(static_cast<u32>(offset));
+                    const u64 bytes = static_cast<u64>(entry.size) * sizeof(u32);
+                    if (system.GPU().IsMapPending(entry.addr, bytes)) {
+                        entries.deferred_entries.push_back(i);
+                    } else {
+                        channel_state->memory_manager->ReadBlockUnsafe(
+                            entry.addr, entries.submitted_words.data() + offset,
+                            entry.size * sizeof(u32));
+                        ++runs_read;
+                    }
+                    offset += entry.size;
+                    ++i;
+                }
+                NotePbSnapshot(run_mode, lists.size(), runs_read,
+                               std::chrono::steady_clock::now() - loop_begin);
+            }
+            for (u32 i = 0; run_mode == 0 && i < entries.command_lists.size(); ++i) {
                 const auto& entry = entries.command_lists[i];
                 entries.submitted_offsets.push_back(static_cast<u32>(offset));
                 // GMMU maps run on the GPU thread (GPU::MapInOrder): an entry on addresses a
