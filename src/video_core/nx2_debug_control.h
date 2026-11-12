@@ -587,6 +587,12 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// Costs up to 2x memory per buffer cache buffer (the class rounding). Gate (Fable): real creates
 /// ("missed") near 0 a second in steady play, device memory flat after 10 minutes. With
 /// EDEN_NX2_BUFFER_CHURN_STATS=1 the "Buffer churn (5 s" line ends with the pool's counters.
+/// EXP106 (live, 0 = off; Fable's delta draw port plan, fable_answer_backthread_threads.md 10,
+/// step D2): every graphics pipeline keeps its last draw (GraphicsPipeline::KeptLastDraw: raw
+/// handle words, computed handle values, views, samplers, view generations, image descriptor
+/// entries per stage, rescaling words, ScaleEpoch), through a second instantiation of
+/// ConfigureImpl. Records only, no draw changes; for the delta draw steps after D2.
+/// EDEN_NX2_FASTDRAW_COUNT=1 keeps them too. Off, PrepareDraw reads this switch once a draw.
 /// EXP101 (live, 0 = off, 1 = runs, 2 = cached page pointer + prefetch; fable52_answer_presenter): nvhost_gpu::SubmitGPFIFOImpl's pushbuffer
 /// snapshot reads runs of entries whose GPU addresses follow each other with one ReadBlockUnsafe
 /// instead of one per entry (OoT's presenting thread submits ~6,500 entries a frame; the loop is

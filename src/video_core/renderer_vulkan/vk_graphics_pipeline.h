@@ -119,6 +119,12 @@ using DrawTemplate =
                               Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS>;
 using DrawTemplates = VideoCommon::DrawTemplateTable<DrawTemplate>;
 
+/// A pipeline's previous draw (delta draws, Fable's port plan step D2; ConfigureImpl).
+using KeptDraw =
+    VideoCommon::KeptDraw<DescriptorUpdateEntry, VideoCommon::ImageViewInOut,
+                          Tegra::Engines::Maxwell3D::Regs::MaxShaderStage,
+                          Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS>;
+
 class GraphicsPipeline {
     static constexpr size_t NUM_STAGES = Tegra::Engines::Maxwell3D::Regs::MaxShaderStage;
 
@@ -270,9 +276,28 @@ public:
 
     void AddTransition(GraphicsPipeline* transition);
 
-    bool Configure(bool is_indexed) {
+    /// `keep_last` (EDEN_NX2_FASTDRAW_COUNT or EXP106 on): the draw is also kept as the
+    /// pipeline's last draw (KeptLastDraw), by a second instantiation of ConfigureImpl; with it
+    /// off the draw runs the same code as before.
+    bool Configure(bool is_indexed, bool keep_last = false) {
+        if (keep_last) [[unlikely]] {
+            return configure_keep_func(this, is_indexed);
+        }
         return configure_func(this, is_indexed);
     }
+
+    /// Delta draws (D2): the previous draw as its Configure kept it with `keep_last`, or null
+    /// when it wasn't kept whole. Only meaningful for the pipeline's last configured draw.
+    [[nodiscard]] const KeptDraw* KeptLastDraw() const noexcept {
+        return kept_draw && kept_draw->valid ? kept_draw.get() : nullptr;
+    }
+
+    /// Delta draws (D2; zortos293/Lichii#1161's ComputedHandlesChanged): whether a handle the
+    /// kept draw computed with a handle program (from constant and storage buffers) evaluates to
+    /// another value now with `maxwell3d_`'s constant buffers: a delta draw would keep views and
+    /// samplers resolved from the old one. Needs a KeptLastDraw.
+    [[nodiscard]] bool ComputedHandlesChanged(const Tegra::Engines::Maxwell3D& maxwell3d_,
+                                              Tegra::MemoryManager& gpu_memory_) const;
 
     [[nodiscard]] GraphicsPipeline* Next(const GraphicsPipelineCacheKey& current_key) noexcept {
         if (key == current_key) {
@@ -330,9 +355,11 @@ public:
         return build->Failed();
     }
 
-    template <typename Spec>
+    template <typename Spec, bool KeepLast = false>
     static auto MakeConfigureSpecFunc() {
-        return [](GraphicsPipeline* pl, bool is_indexed) { return pl->ConfigureImpl<Spec>(is_indexed); };
+        return [](GraphicsPipeline* pl, bool is_indexed) {
+            return pl->ConfigureImpl<Spec, KeepLast>(is_indexed);
+        };
     }
 
     void SetEngine(Tegra::Engines::Maxwell3D* maxwell3d_, Tegra::MemoryManager* gpu_memory_) {
@@ -445,7 +472,16 @@ private:
                           const std::array<std::pair<u32, u32>, NUM_STAGES>& ranges,
                           const RescalingPushConstant& rescaling);
 
-    template <typename Spec>
+    /// Delta draws (D2): fills kept_draw from the draw ConfigureImpl<Spec, true> just resolved
+    /// and pushed (`ranges`: each stage's image descriptor entries in the guest descriptor
+    /// queue). `handles_read`: the draw read its handles (not a TEX_BANK_GEN hit).
+    void KeepLastDraw(std::span<const VideoCommon::ImageViewInOut> views,
+                      std::span<const VideoCommon::SamplerId> samplers,
+                      const std::array<std::pair<u32, u32>, NUM_STAGES>& ranges,
+                      const RescalingPushConstant& rescaling, bool handles_read);
+
+    /// KeepLast: also keep the draw as the pipeline's last (Configure's keep_last).
+    template <typename Spec, bool KeepLast = false>
     bool ConfigureImpl(bool is_indexed);
 
     bool ConfigureDraw(const RescalingPushConstant& rescaling,
@@ -494,6 +530,10 @@ private:
     bool template_eligible{};
 
     bool (*configure_func)(GraphicsPipeline*, bool){};
+    /// ConfigureImpl<Spec, true> for the same Spec (Configure with keep_last).
+    bool (*configure_keep_func)(GraphicsPipeline*, bool){};
+    /// Delta draws (D2): the last draw configured with keep_last; made on the first.
+    std::unique_ptr<KeptDraw> kept_draw;
 
     std::vector<GraphicsPipelineCacheKey> transition_keys;
     std::vector<GraphicsPipeline*> transitions;
