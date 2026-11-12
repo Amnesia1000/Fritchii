@@ -429,7 +429,7 @@ once with `input_record` and replayed with `input_replay` after the same save is
 
 1. Build the branch as usual:
    `bash C:/lx/build-fix.sh feat/debug-mcp debug-mcp "Any - debug server" "EDEN_NX2_DEBUG_SERVER=127.0.0.1:6545"`.
-   Optionally add `EDEN_NX2_DEBUG_DIR=C:/Users/Zortos/.capy/work/lichii-debug/debug-mcp/dumps`
+   Optionally add `EDEN_NX2_DEBUG_DIR=C:/Users/<you>/debug-mcp/dumps`
    so dumps land next to the build.
 2. The owner launches the game from the shortcut. The log shows
    `Debug server listening on 127.0.0.1:6545, dump dir ...`.
@@ -438,7 +438,7 @@ once with `input_record` and replayed with `input_replay` after the same save is
    request, prints its JSON result, and saves any PNG to `--out`:
 
    ```
-   PY=/c/Users/Zortos/AppData/Local/Programs/Python/Python314/python.exe
+   PY=/c/Users/<you>/AppData/Local/Programs/Python/Python314/python.exe
    $PY -I C:/lx/src/tools/nx2/debug_mcp.py --server 127.0.0.1:6545 --call '{"method":"status"}'
    $PY -I C:/lx/src/tools/nx2/debug_mcp.py --server 127.0.0.1:6545 \
        --call '{"method":"screenshot","params":{"height":1080}}' --out C:/lx/shot.png

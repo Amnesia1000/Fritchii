@@ -105,7 +105,7 @@ Fritchii v5.7.
 Windows x64. Tested with The Legend of Zelda: Ocarina of Time (0400486024DEC000) on a Ryzen 7 7800X3D + RTX 4080: stable 60 fps in a lot of places, rarely under 45 even in the heaviest ones (Water Temple included), no shader stutter after the preparation.
 
 #### New
-- **Shaders are prepared once, before you play.** The first time you start OoT, a "Preparing shaders" screen builds the game's shaders at full speed (about 15 minutes on an 8-core CPU, once). After that, places you visit for the first time play like you've been there before: walking into a new area used to freeze for ~0.7 s per new shader, now it's 40-70 ms, and loads are shorter. A new driver or GPU prepares them again. Built on zortos's precompile work.
+- **Shaders are prepared once, before you play.** The first time you start OoT, a "Preparing shaders" screen builds the game's shaders at full speed (about 15 minutes on an 8-core CPU, once). After that, places you visit for the first time play like you've been there before: walking into a new area used to freeze for ~0.7 s per new shader, now it's 40-70 ms, and loads are shorter. A new driver or GPU prepares them again. Built on a ported precompile system.
 - **New look.** Graphite theme, a home screen, an in-app "What's new", and Help > Export Log for bug reports.
 - **In-game controls.** Move the mouse to the top of the game for Pause, Restart, Stop, Fullscreen and the menus.
 - **New performance graph** (View > Performance Overlay): big fps, frame time, the lowest recent fps and a line against 60 (or 30). Loading screens leave a gap instead of a dip.
