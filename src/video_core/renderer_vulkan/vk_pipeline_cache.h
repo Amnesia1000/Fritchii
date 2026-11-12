@@ -551,6 +551,8 @@ private:
     DescriptorPool& descriptor_pool;
     GuestDescriptorQueue& guest_descriptor_queue;
     DescriptorBufferRing& descriptor_buffer_ring;
+    /// EXP87 draw templates of every graphics pipeline: 2,048 sets of 4 (allocated on first use).
+    DrawTemplates draw_templates{2048};
     RenderPassCache& render_pass_cache;
     BufferCache& buffer_cache;
     TextureCache& texture_cache;

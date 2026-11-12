@@ -5244,9 +5244,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreatePrecompiledGraphicsPipeli
     };
     auto pipeline = std::make_unique<GraphicsPipeline>(
         scheduler, buffer_cache, texture_cache, PlayPipelineCache(), &shader_notify, device,
-        descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring, &workers, nullptr,
-        render_pass_cache, graphics_key, std::array<vk::ShaderModule, Maxwell::MaxShaderStage>{},
-        info_ptrs, std::move(emit_stages), library_params);
+        descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring, draw_templates, &workers,
+        nullptr, render_pass_cache, graphics_key,
+        std::array<vk::ShaderModule, Maxwell::MaxShaderStage>{}, info_ptrs, std::move(emit_stages),
+        library_params);
     // As a translation's (the live environments answered the same questions): kept if evicted.
     VideoCommon::EvictedPointerSlots::Slots mapped_pointers;
     for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
@@ -6795,7 +6796,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         scheduler, buffer_cache, texture_cache,
         libraries_only ? WarmPipelineCache() : PlayPipelineCache(),
         libraries_only || t_precompile_build ? nullptr : &shader_notify, device, descriptor_pool,
-        guest_descriptor_queue, descriptor_buffer_ring, thread_worker, statistics,
+        guest_descriptor_queue, descriptor_buffer_ring, draw_templates, thread_worker, statistics,
         render_pass_cache, key, std::move(modules), infos, std::move(emit_stages),
         library_params, std::move(mesh_emulation));
     pipeline->SetMappedPointers(std::move(mapped_pointers));

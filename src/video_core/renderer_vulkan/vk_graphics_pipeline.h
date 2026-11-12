@@ -31,6 +31,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_library.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
+#include "video_core/texture_cache/draw_template.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace VideoCore {
@@ -110,6 +111,14 @@ struct MeshEmulationSetup {
     std::array<u32, 4> position_lines{~0U, ~0U, ~0U, ~0U}; ///< line of PositionX..W
 };
 
+/// The sampled textures and image descriptors of a draw, kept across frames (ConfigureImpl,
+/// EXP87, port of zortos293/Lichii#1447).
+using DrawTemplate =
+    VideoCommon::DrawTemplate<DescriptorUpdateEntry,
+                              Tegra::Engines::Maxwell3D::Regs::MaxShaderStage,
+                              Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS>;
+using DrawTemplates = VideoCommon::DrawTemplateTable<DrawTemplate>;
+
 class GraphicsPipeline {
     static constexpr size_t NUM_STAGES = Tegra::Engines::Maxwell3D::Regs::MaxShaderStage;
 
@@ -131,8 +140,8 @@ public:
         vk::PipelineCache& pipeline_cache, VideoCore::ShaderNotify* shader_notify,
         const Device& device, DescriptorPool& descriptor_pool,
         GuestDescriptorQueue& guest_descriptor_queue,
-        DescriptorBufferRing& descriptor_buffer_ring, Common::ThreadWorker* worker_thread,
-        PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
+        DescriptorBufferRing& descriptor_buffer_ring, DrawTemplates& draw_templates,
+        Common::ThreadWorker* worker_thread, PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
         const GraphicsPipelineCacheKey& key, std::array<vk::ShaderModule, NUM_STAGES> stages,
         const std::array<const Shader::Info*, NUM_STAGES>& infos,
         EmitStagesFunc emit_stages = {}, LibraryParams library_params = {},
@@ -418,6 +427,16 @@ private:
                        std::span<const VideoCommon::SamplerId> samplers, bool via_header_index,
                        bool null_pointer_handles, int switch_value);
 
+    /// EXP87: keeps the draw's textures and image descriptors, which the guest descriptor queue
+    /// holds at `ranges`, for later draws with the same key. With `verified`, the template the key
+    /// found is compared with them first (EXP87 = 2).
+    void KeepDrawTemplate(DrawTemplate* verified, const VideoCommon::DrawTemplateContext& context,
+                          std::span<const u32> handles, u64 hash,
+                          std::span<const VideoCommon::ImageViewInOut> views,
+                          std::span<const VideoCommon::SamplerId> samplers,
+                          const std::array<std::pair<u32, u32>, NUM_STAGES>& ranges,
+                          const RescalingPushConstant& rescaling);
+
     template <typename Spec>
     bool ConfigureImpl(bool is_indexed);
 
@@ -459,6 +478,12 @@ private:
     Scheduler& scheduler;
     GuestDescriptorQueue& guest_descriptor_queue;
     DescriptorBufferRing& descriptor_buffer_ring;
+    DrawTemplates& draw_templates;
+    const u64 template_owner;
+    u32 template_misses{}; ///< Draws in a row no template was found for (EXP87)
+    /// Every texture is sampled with a handle read from a constant buffer, nothing else is bound
+    /// as an image: ConfigureImpl can take the textures from a draw template (EXP87).
+    bool template_eligible{};
 
     bool (*configure_func)(GraphicsPipeline*, bool){};
 

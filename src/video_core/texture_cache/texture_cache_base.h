@@ -48,6 +48,7 @@
 #include "video_core/nx2.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/descriptor_table.h"
+#include "video_core/texture_cache/draw_template.h"
 #include "video_core/texture_cache/image_base.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view_base.h"
@@ -477,6 +478,34 @@ public:
     /// non-null view), for views a memo resolved. False when that deleted images: the caller
     /// resolves the full way (FillImageViews loops for the same reason).
     [[nodiscard]] bool PrepareTexBankViews(std::span<const ImageViewId> views);
+
+    /// EXP87 (port of zortos293/Lichii#1447): what besides its handle words selects the textures
+    /// a graphics draw samples now.
+    [[nodiscard]] DrawTemplateContext GraphicsTextureContext(u64 owner) const noexcept;
+
+    /// The texture and sampler descriptors the draw's textures were resolved from (`handles`:
+    /// the raw handle words), for a draw template; false when one can't be kept.
+    [[nodiscard]] bool KeepTemplateTextures(std::span<const u32> handles,
+                                            std::span<const ImageViewInOut> views,
+                                            std::span<const SamplerId> samplers,
+                                            std::vector<DrawTemplateTexture>& textures);
+
+    /// Prepares the images of the views a draw template gave, as resolving them would; false
+    /// when that deleted images and the views have to be resolved again.
+    [[nodiscard]] bool PrepareTemplateViews(std::span<const ImageViewInOut> views);
+
+    /// Bumped each time the slot's view is deleted, or its image moves (RelocateImage): a kept
+    /// id names the same view, and resolves from the same descriptor, while its generation holds.
+    [[nodiscard]] u32 ImageViewGeneration(ImageViewId id) const noexcept {
+        return id.Value() < image_view_generations.size() ? image_view_generations[id.Value()]
+                                                           : 0;
+    }
+
+    /// Bumped whenever an image changes its scale (InvalidateScale): the rescaling words a draw
+    /// pushed hold while it stays the same.
+    [[nodiscard]] u64 ScaleEpoch() const noexcept {
+        return scale_epoch;
+    }
 
     /// The device page `gpu_addr` lies in, or nullopt when unmapped.
     [[nodiscard]] std::optional<DAddr> TexBankDevicePage(GPUVAddr gpu_addr) const;
@@ -1097,6 +1126,15 @@ private:
     /// The CPU address an image at gpu_addr is keyed by: its backing, or a fixed stand-in.
     [[nodiscard]] std::optional<DAddr> ImageCpuAddress(GPUVAddr gpu_addr, size_t size) const;
 
+    void BumpImageViewGeneration(ImageViewId id) {
+        if (id.Value() >= image_view_generations.size()) {
+            image_view_generations.resize(id.Value() + 1);
+        }
+        ++image_view_generations[id.Value()];
+    }
+
+    std::vector<u32> image_view_generations; ///< ImageViewGeneration
+    u64 scale_epoch{};                       ///< ScaleEpoch
     bool has_deleted_images = false;
     /// True while a clear binds its render targets (UpdateRenderTargets(true)), so JoinImages can
     /// skip the upload of a new target the clear overwrites whole.
