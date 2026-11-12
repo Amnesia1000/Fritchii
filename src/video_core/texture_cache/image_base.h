@@ -121,6 +121,9 @@ struct ImageBase {
     /// exactly this one, whatever cpu_addr or the size say by then).
     u64 nx2_counted_addr = 0;
     u64 nx2_counted_size = 0;
+    /// EXP100: this image's nx2_counted range is in TextureCache::gpu_image_filter (it was
+    /// GPU-modified while registered); UnregisterImage removes it.
+    bool nx2_gpu_counted = false;
     u32 unswizzled_size_bytes = 0;
     u32 converted_size_bytes = 0;
     u32 scale_rating = 0;

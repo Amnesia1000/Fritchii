@@ -544,6 +544,20 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// depth targets, ~3 a frame while a chicken passes or an enemy dies) are destroyed on the image
 /// free thread instead of on the GPU back thread at the frame's end. The pool line every 600
 /// frames counts where they went; the timeline shows "back: image pool tick".
+/// EXP100 (live, 0 = off; fable52_answer_imagereads, Fable's F1; RasterizerVulkan::GetFlushArea):
+/// a guest read of pages that hold an image skips the caches' locks when no image there was
+/// GPU-modified. TextureCache::gpu_image_filter counts per 64 KiB page every registered,
+/// non-sparse image that was GPU-modified since it was registered (CountGpuModified at
+/// MarkModification, SynchronizeAliases, JoinImages and RegisterImage; removed at
+/// UnregisterImage; clears of the flag are ignored, so it is conservative), under the texture
+/// cache's mutex, with a sequence counter (image_seq, odd while a hold changes the count, closed
+/// by the mutex's release hook). Nothing counted on the pages, no sparse image ever there, the
+/// counter even and unmoved, and the buffer side clean as today (no GPU write ever marked the
+/// pages, or EXP86 = 1's mirrors say clean): the locked path would answer the same preemptive
+/// area and change nothing. Not with EXP36 or EXP81 on or EXP43 = 4. 1 = the fast path; 2 =
+/// verify: locked reads compare the count with the texture cache's locked look, no fast answers
+/// (mismatches must stay 0, the first 16 are logged with the image's range, flags and
+/// nx2_gpu_counted). "Guest reads locked because" logs the answers and why reads stayed locked.
 /// EXP96 (live; fable52_answer_guest 4): the HLE reply hold (k_server_session.cpp HoldHleReply,
 /// written for Mario Tennis Fever, active in every title). 0 = EDEN_NX2_IPC_MIN_US or 50 us;
 /// 1 = off; N > 1 = N us. In OoT the service thread that presents waits in it ~14 ms/s.
