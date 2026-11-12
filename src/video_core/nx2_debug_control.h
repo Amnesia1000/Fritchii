@@ -598,6 +598,9 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// instead of one per entry (OoT's presenting thread submits ~6,500 entries a frame; the loop is
 /// on the frame's critical path). Exact: same words at the same offsets. "Pushbuffer snapshot
 /// (EXP101" logs submits, entries, reads and loop time every 5 s while on.
+/// EXP105 (live, 0 = every entry; N > 1 = 1 in N): DmaPusher::Step's check that a command list
+/// the front read early was not GPU-written by queued work (EDEN_NX2_LIST_WAIT_SKIP log). It only
+/// reads and logs, never fired in OoT on 2026-11-12, and cost ~8 ms/s of the back (try 64).
 /// EXP99 (live, 0 = off; fable52_answer_chicken 1): evicted EXP42 pool images (OoT's per-NPC
 /// depth targets, ~3 a frame while a chicken passes or an enemy dies) are destroyed on the image
 /// free thread (2; needs EDEN_NX2_ASYNC_IMAGE_FREE=1) or, with 1, by the back itself in its idle hook
