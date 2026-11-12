@@ -78,6 +78,7 @@
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_cb_path.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_list_dispatch.h"
@@ -3068,10 +3069,62 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
             texture_cache.WriteMemory(addr, size);
         }
     }
-    {
+    namespace CbPath = VideoCommon::Nx2CbPath;
+    const int cb_path = CbPath::Mode();
+    CbPath::MaybeLog(cb_path);
+    if ((cb_path & CbPath::SkipBit) == 0) {
         std::scoped_lock lock{buffer_cache.mutex};
         for (const auto& [addr, size] : sequences) {
             buffer_cache.WriteMemory(addr, size);
+        }
+    } else {
+        // EXP88 & 1 (zortos293/Lichii#1441 part c): ranges WriteMemory would change nothing in
+        // (BufferCache::WriteReachesBuffers) keep only its three marks, without the lock. The
+        // drawing thread runs FlushCaching, so the vertex bindings asked are its own.
+        using Reach = BufferCache::WriteReach;
+        auto& counters = CbPath::g_counters;
+        const bool verify = (cb_path & CbPath::VerifyBit) != 0;
+        boost::container::small_vector<std::pair<std::pair<DAddr, std::size_t>, bool>, 32> locked;
+        for (const auto& range : sequences) {
+            const Reach reach = buffer_cache.WriteReachesBuffers(range.first, range.second);
+            if (reach == Reach::None) {
+                CbPath::Count(counters.skipped);
+                if (verify) {
+                    locked.emplace_back(range, true);
+                } else {
+                    buffer_cache.NoteWriteUnlocked(range.first, range.second);
+                }
+                continue;
+            }
+            CbPath::Count(reach == Reach::EverSynchronized  ? counters.kept_synced
+                          : reach == Reach::MayBeGpuWritten ? counters.kept_gpu
+                                                            : counters.kept_vertex);
+            locked.emplace_back(range, false);
+        }
+        CbPath::Count(counters.ranges, sequences.size());
+        if (locked.empty()) {
+            CbPath::Count(counters.lock_skips);
+        } else {
+            std::scoped_lock lock{buffer_cache.mutex};
+            for (const auto& [range, skipped] : locked) {
+                if (skipped) {
+                    // Verify: the skip had to change nothing; WriteMemory runs anyway.
+                    CbPath::Count(counters.verify_skip_checked);
+                    if (!buffer_cache.WriteChangesNothing(range.first, range.second)) {
+                        CbPath::Count(counters.verify_skip_mismatch);
+                        static std::atomic<u32> logged{};
+                        if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                            LOG_ERROR(Render_Vulkan,
+                                      "EXP88 verify: a skipped range {:#x}+{:#x} would change "
+                                      "the buffer cache",
+                                      range.first, range.second);
+                        }
+                    }
+                } else {
+                    CbPath::Count(counters.locked);
+                }
+                buffer_cache.WriteMemory(range.first, range.second);
+            }
         }
     }
     if (any(query_cache.page_filter)) {
@@ -3102,6 +3155,73 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
 }
 
 void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) {
+    namespace CbPath = VideoCommon::Nx2CbPath;
+    const int cb_path = CbPath::Mode();
+    // EXP88 & 1 (fable52_answer_next70 3.1 step 5): the guest's collected writes take each
+    // cache's lock only where that cache may act. On the back only: it owns the vertex bindings
+    // WriteReachesBuffers reads (the collected writes are applied there).
+    if ((cb_path & CbPath::SkipBit) != 0 && VideoCommon::GpuSplit::OnBackThread()) {
+        auto& counters = CbPath::g_counters;
+        const bool verify = (cb_path & CbPath::VerifyBit) != 0;
+        const auto note_mismatch = [&counters](DAddr addr, u64 size, const char* what) {
+            CbPath::Count(counters.verify_skip_mismatch);
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                LOG_ERROR(Render_Vulkan, "EXP88 verify: guest write {:#x}+{:#x}: {}", addr, size,
+                          what);
+            }
+        };
+        // ClaimCpuWrites acts only on pages a GPU-modified mark ever reached.
+        if (buffer_cache.ClaimMayFindGpuWrites(ranges)) {
+            std::scoped_lock lock{buffer_cache.mutex};
+            buffer_cache.ClaimCpuWrites(ranges);
+        } else {
+            CbPath::Count(counters.guest_claim_skips);
+            if (verify) {
+                std::scoped_lock lock{buffer_cache.mutex};
+                for (const auto& [addr, size] : ranges) {
+                    CbPath::Count(counters.verify_skip_checked);
+                    if (buffer_cache.IsRegionGpuModified(addr, size)) {
+                        note_mismatch(addr, size, "the skipped claim had GPU-written data");
+                    }
+                }
+                buffer_cache.ClaimCpuWrites(ranges);
+            }
+        }
+        for (const auto& [addr, size] : ranges) {
+            if (addr == 0 || size == 0) {
+                continue;
+            }
+            CbPath::Count(counters.guest_ranges);
+            // No image or shader ever registered on these pages: their caches do nothing here
+            // (as InnerInvalidation asks them).
+            if (texture_cache.page_filter.Any(addr, size)) {
+                std::scoped_lock lock{texture_cache.mutex};
+                texture_cache.WriteMemory(addr, size);
+            }
+            const bool skip = buffer_cache.WriteReachesBuffers(addr, size) ==
+                              BufferCache::WriteReach::None;
+            if (skip) {
+                CbPath::Count(counters.guest_skipped);
+            }
+            if (skip && !verify) {
+                buffer_cache.NoteWriteUnlocked(addr, size);
+            } else {
+                std::scoped_lock lock{buffer_cache.mutex};
+                if (skip) {
+                    CbPath::Count(counters.verify_skip_checked);
+                    if (!buffer_cache.WriteChangesNothing(addr, size)) {
+                        note_mismatch(addr, size, "the skipped write would change the buffer cache");
+                    }
+                }
+                buffer_cache.WriteMemory(addr, size);
+            }
+            if (pipeline_cache.page_filter.Any(addr, size)) {
+                pipeline_cache.InvalidateRegion(addr, size);
+            }
+        }
+        return;
+    }
     // Out of the GPU-written ranges first: applying one write downloads the GPU's bytes elsewhere
     // on its pages (WriteMemory), which would write over the next collected write.
     {

@@ -123,6 +123,7 @@ add_library(video_core STATIC
     native_qmd.h
     native_query_trace.h
     nx2.h
+    nx2_cb_path.h
     nx2_cmdpage_diag.h
     nx2_debug_control.cpp
     nx2_precompile.cpp

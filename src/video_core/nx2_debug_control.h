@@ -493,6 +493,24 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// the read to the locks. 1 = the fast path; 2 = verify: locked reads compare the mirrors' answer
 /// with what the locked path decides ("mirror clean but cache not" must stay 0), no fast answers.
 /// "GPU-written page mirror" logs the answers every 5 s, also while off.
+/// EXP88 (live, bits, 0 = off; port of zortos293/Lichii#1441 5e186d4f13 + d18b636a69 parts a to
+/// c, fable52_answer_next70 3; nx2_cb_path.h): 1 = part c: RasterizerVulkan::InnerInvalidation
+/// (FlushCaching's ranges) and, on the back, OnCacheInvalidations (collected guest writes) skip
+/// BufferCache::WriteMemory and its lock where it would change nothing: no page ever left the
+/// CPU-modified state (MemoryTrackerBase::IsRegionEverSynchronized), no GPU write ever marked one
+/// and no enabled vertex binding overlaps (BufferCache::WriteReachesBuffers); its three page marks
+/// stay (NoteWriteUnlocked: the bank check reads g_buffer_write_pages). The collected writes also
+/// skip the texture lock and the pipeline cache where their page filters are clear, and the
+/// ClaimCpuWrites lock where no GPU-modified mark ever reached. 2 = parts a and b: constant buffer
+/// data (CallConstBufferWords in place of CB_DIRECT, ProcessCBMultiData in place of
+/// WriteBlockCached) goes to the bound buffer's device address, translated once per CB_ADDRESS,
+/// CB_SIZE and memory map (Maxwell3D::WriteBoundConstantBuffer), its device ranges logged for
+/// FlushCaching (MemoryManager::WriteConstantBufferData); buffers that aren't one mapped device
+/// range and Switch 2 sparse memory take the old path. 4 = verify: skipped ranges take the locked
+/// WriteMemory anyway after checking it changes nothing; direct writes are read back and their
+/// translation redone at FlushCaching. Both mismatch counts must stay 0. Same family as EXP85
+/// (its inline writes reach FlushCaching with & 1) and CB_DIRECT (& 2 replaces it). "Constant
+/// buffer path (EXP88" logs the counters every 5 s while not 0.
 /// EXP85 (live, bits, 0 = off; fable52_answer_microcuts 1 and 2b): 1 = a small inline upload to
 /// pages no GPU write ever marked skips the buffer cache's lock (InlineMemory would find nothing
 /// there; the list note and the query cache as before), 2 = BufferCache::WriteMemory answers

@@ -22,6 +22,7 @@
 #include "video_core/async_translate.h"
 #include "video_core/guest_memory.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_cb_path.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/host1x/host1x.h"
@@ -768,6 +769,51 @@ void MemoryManager::WriteWordsCached(GPUVAddr gpu_dest_addr, const u32* words, s
     }
 }
 
+void MemoryManager::WriteConstantBufferData(DAddr device_addr, GPUVAddr gpu_addr,
+                                            const void* data, std::size_t size, bool verify) {
+    if (size == 0) {
+        return;
+    }
+    // As WriteBlockImpl's unsafe write: a download for a guest read not yet in guest memory
+    // would land over this write later.
+    if (VideoCore::g_read_downloads.load(std::memory_order_relaxed) != 0) [[unlikely]] {
+        if (rasterizer != nullptr && VideoCore::ReadDownloadsMayCover(device_addr, size)) {
+            rasterizer->FinishRead(device_addr, size);
+        }
+    }
+    const auto* src = static_cast<const u8*>(data);
+    for (DAddr address = device_addr; address < device_addr + size;) {
+        const std::size_t amount = (std::min<std::size_t>)(
+            device_addr + size - address,
+            Core::DEVICE_PAGESIZE - (address & Core::DEVICE_PAGEMASK));
+        if (u8* const physical = memory.GetPointer<u8>(address)) [[likely]] {
+            std::memcpy(physical, src, amount);
+        } else {
+            memory.WriteBlockUnsafe(address, src, amount);
+        }
+        address += amount;
+        src += amount;
+    }
+    // Rounded as InvalidationAccumulator::Add rounds (within the page: pages are 4 KiB aligned
+    // in both address spaces).
+    constexpr DAddr Atom = 32;
+    const DAddr begin = device_addr & ~(Atom - 1);
+    const DAddr end = (device_addr + size + Atom - 1) & ~(Atom - 1);
+    if (verify) {
+        constant_buffer_verify.push_back({gpu_addr, device_addr, size, MapSerial()});
+    }
+    if (!constant_buffer_writes.empty()) {
+        auto& [last, last_size] = constant_buffer_writes.back();
+        if (begin <= last + last_size && last <= end) {
+            const DAddr merged_end = (std::max<DAddr>)(last + last_size, end);
+            last = (std::min)(last, begin);
+            last_size = static_cast<std::size_t>(merged_end - last);
+            return;
+        }
+    }
+    constant_buffer_writes.emplace_back(begin, static_cast<std::size_t>(end - begin));
+}
+
 void MemoryManager::FlushRegion(GPUVAddr gpu_addr, size_t size,
                                 VideoCommon::CacheType which) const {
     auto do_nothing = [&]([[maybe_unused]] std::size_t page_index,
@@ -1189,9 +1235,45 @@ void MemoryManager::GetSubmappedRangeImpl(GPUVAddr gpu_addr, std::size_t size, b
 
 void MemoryManager::FlushCaching() {
     // Flush from the invalidate accumulator
-    if (accumulator.InvalidateAll([this](GPUVAddr addr, size_t size) {
+    bool invalidate = accumulator.InvalidateAll([this](GPUVAddr addr, size_t size) {
         GetSubmappedRangeImpl<false>(addr, size, page_stash2);
-    })) {
+    });
+    // EXP88 & 2: constant buffer data's device ranges, translated when written, in the same call
+    // (one pass, as when they were accumulated). Also once the switch is off again.
+    if (!constant_buffer_writes.empty()) [[unlikely]] {
+        if (!constant_buffer_verify.empty()) {
+            // EXP88 & 4: the GPU range translated again lands where the write went (unless the
+            // mapping changed since, when the write-time address is the right one).
+            auto& counters = VideoCommon::Nx2CbPath::g_counters;
+            const u64 serial = MapSerial();
+            for (const ConstantBufferVerify& write : constant_buffer_verify) {
+                if (write.map_serial != serial) {
+                    continue;
+                }
+                VideoCommon::Nx2CbPath::Count(counters.verify_direct_checked);
+                const std::optional<DAddr> first = GpuToCpuAddress(write.gpu_addr);
+                const std::optional<DAddr> last = GpuToCpuAddress(write.gpu_addr + write.size - 1);
+                if (!first || *first != write.device_addr || !last ||
+                    *last != write.device_addr + write.size - 1) {
+                    VideoCommon::Nx2CbPath::Count(counters.verify_direct_mismatch);
+                    static std::atomic<u32> logged{};
+                    if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                        LOG_ERROR(HW_GPU,
+                                  "EXP88 verify: constant buffer data at GPU {:#x}+{:#x} went to "
+                                  "device {:#x}, translates to {:#x} now",
+                                  write.gpu_addr, write.size, write.device_addr,
+                                  first.value_or(0));
+                    }
+                }
+            }
+            constant_buffer_verify.clear();
+        }
+        page_stash2.insert(page_stash2.end(), constant_buffer_writes.begin(),
+                           constant_buffer_writes.end());
+        constant_buffer_writes.clear();
+        invalidate = true;
+    }
+    if (invalidate) {
         rasterizer->InnerInvalidation(page_stash2);
         page_stash2.clear();
     }

@@ -366,6 +366,72 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu
 }
 
 template <class P>
+typename BufferCache<P>::WriteReach BufferCache<P>::WriteReachesBuffers(DAddr device_addr,
+                                                                        u64 size) const {
+    // Exact (fable52_answer_next70 3.1): on pages that never left the CPU-modified state and no
+    // GPU write marked, WriteMemory finds no GPU-modified range and its CPU mark sets bits that
+    // are set: no page changes state, dirty_gen doesn't move (only a gained bit moves it) and
+    // EXP48's hot bookkeeping acts only on tracked pages. What is left is the three marks.
+    if (memory_tracker.IsRegionEverSynchronized(device_addr, size)) {
+        return WriteReach::EverSynchronized;
+    }
+    // Every gpu_modified_ranges.Add marks the GPU-written bit (Switch 2 titles only).
+    const DAddr page_begin = Common::AlignDown(device_addr, DEVICE_PAGESIZE);
+    const DAddr page_end = Common::AlignUp(device_addr + size, DEVICE_PAGESIZE);
+    if (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed) ||
+        Tegra::Nx2MayBeGpuWritten(page_begin, page_end - page_begin)) {
+        return WriteReach::MayBeGpuWritten;
+    }
+    if constexpr (requires { runtime.IsVertexRepacked(u32{}); }) {
+        for (u32 mask = enabled_vertex_buffers_mask; mask != 0; mask &= mask - 1) {
+            const Binding& binding = v_buffer[std::countr_zero(mask)];
+            if (device_addr < binding.device_addr + binding.size &&
+                binding.device_addr < device_addr + size) {
+                return WriteReach::VertexBinding;
+            }
+        }
+    }
+    return WriteReach::None;
+}
+
+template <class P>
+void BufferCache<P>::NoteWriteUnlocked(DAddr device_addr, u64 size) {
+    // WriteMemory's first three lines: the bank compare (d79572d28a) reads these page flags.
+    Nx2NoteListHostWrite(device_addr, size);
+    Core::g_buffer_write_pages.Mark(device_addr, size);
+    Core::g_watch_write_pages.Mark(device_addr, size);
+}
+
+template <class P>
+bool BufferCache<P>::WriteChangesNothing(DAddr device_addr, u64 size) {
+    const DAddr page_begin = Common::AlignDown(device_addr, DEVICE_PAGESIZE);
+    const DAddr page_end = Common::AlignUp(device_addr + size, DEVICE_PAGESIZE);
+    if (gpu_modified_ranges.Intersects(page_begin, page_end - page_begin) ||
+        !memory_tracker.IsRegionUntouched(device_addr, size)) {
+        return false;
+    }
+    if constexpr (requires { runtime.IsVertexRepacked(u32{}); }) {
+        for (u32 mask = enabled_vertex_buffers_mask; mask != 0; mask &= mask - 1) {
+            const Binding& binding = v_buffer[std::countr_zero(mask)];
+            if (device_addr < binding.device_addr + binding.size &&
+                binding.device_addr < device_addr + size) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+template <class P>
+bool BufferCache<P>::ClaimMayFindGpuWrites(
+    std::span<const std::pair<DAddr, u64>> ranges) const {
+    // ClaimCpuWrites acts only where IsRegionGpuModified, which needs a GPU-modified mark.
+    return std::ranges::any_of(ranges, [this](const std::pair<DAddr, u64>& range) {
+        return memory_tracker.IsRegionEverGpuModified(range.first, range.second);
+    });
+}
+
+template <class P>
 void BufferCache<P>::CachedWriteMemory(DAddr device_addr, u64 size) {
     const bool is_dirty = IsRegionRegistered(device_addr, size);
     if (!is_dirty) {
