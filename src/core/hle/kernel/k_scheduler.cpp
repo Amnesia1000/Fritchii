@@ -1144,6 +1144,11 @@ void KScheduler::YieldWithoutCoreMigrationExp98(KernelCore& kernel, int mode) {
 
     if (mode == 1 && YieldIsKnownNoOp(kernel, cur_thread, 1, stats)) {
         Add(stats.early);
+        // EXP102 (live, pauses; fable52_answer_yield 7): keep the old cadence of a yield
+        // that took the lock, so the worker does not reach its idle wait sooner.
+        for (int pause = VideoCore::Nx2Debug::Experiment(102); pause > 0; --pause) {
+            CpuPause();
+        }
         return;
     }
 
@@ -1210,6 +1215,11 @@ void KScheduler::YieldWithCoreMigrationExp98(KernelCore& kernel, int mode) {
 
     if (mode == 1 && YieldIsKnownNoOp(kernel, cur_thread, 2, stats)) {
         Add(stats.early);
+        // EXP102 (live, pauses; fable52_answer_yield 7): keep the old cadence of a yield
+        // that took the lock, so the worker does not reach its idle wait sooner.
+        for (int pause = VideoCore::Nx2Debug::Experiment(102); pause > 0; --pause) {
+            CpuPause();
+        }
         return;
     }
 

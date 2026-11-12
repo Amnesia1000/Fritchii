@@ -454,6 +454,7 @@ void RememberCurrentThreadNice(pid_t tid, s32 nice_value) {
 #include <x86intrin.h>
 #endif
 #include "common/x64/rdtsc.h"
+#include "video_core/nx2_debug_control.h"
 #endif
 
 #ifdef _WIN32
@@ -1065,6 +1066,22 @@ bool WaitForFlag(const std::atomic<bool>& flag, std::chrono::steady_clock::time_
         }
     }
 #endif
+    // EXP103 (live, pauses; fable52_answer_yield 7): without MONITORX/WAITPKG (this owner's PC:
+    // g_cpu_caps.monitorx false, ~795 ms/s of SwitchToThread over six cores) poll with N pauses
+    // between checks instead of yielding to the scheduler: a better neighbour on a shared core.
+    if (const int pauses = VideoCore::Nx2Debug::Experiment(103); pauses > 0) {
+        while (!flag.load(std::memory_order_acquire)) {
+            for (int i = 0; i < pauses; ++i) {
+#ifdef ARCHITECTURE_x86_64
+                _mm_pause();
+#endif
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                break;
+            }
+        }
+        return flag.load(std::memory_order_acquire);
+    }
     while (!flag.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
         std::this_thread::yield();
     }

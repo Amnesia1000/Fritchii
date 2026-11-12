@@ -540,7 +540,12 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// written, ring overflow, pending cached writes, other range, no keep yet). "Uniform keeps
 /// count (EXP91" logs small binds, rebinds and those counts per second every 5 s while not 0.
 /// Gain of the later stages is about K x 55 ns; under 100,000 a second, stop there.
-/// EXP101 (live, 0 = off; fable52_answer_presenter): nvhost_gpu::SubmitGPFIFOImpl's pushbuffer
+/// EXP102 (live, pauses, 0 = none; fable52_answer_yield 7): with EXP98=1, an early-returned
+/// yield pauses this many times, keeping the old cadence (try 6, 16, 64).
+/// EXP103 (live, pauses, 0 = off): common WaitForFlag's fallback (no MONITORX/WAITPKG, as on
+/// this owner's PC; EXP79's idle wait uses it) polls with N pauses between checks instead of
+/// SwitchToThread (try 64).
+/// EXP101 (live, 0 = off, 1 = runs, 2 = cached page pointer + prefetch; fable52_answer_presenter): nvhost_gpu::SubmitGPFIFOImpl's pushbuffer
 /// snapshot reads runs of entries whose GPU addresses follow each other with one ReadBlockUnsafe
 /// instead of one per entry (OoT's presenting thread submits ~6,500 entries a frame; the loop is
 /// on the frame's critical path). Exact: same words at the same offsets. "Pushbuffer snapshot

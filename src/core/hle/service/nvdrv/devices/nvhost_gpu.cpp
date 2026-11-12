@@ -5,6 +5,8 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstring>
+#include <immintrin.h>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -501,7 +503,49 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
             const auto loop_begin = run_mode != 0 ? std::chrono::steady_clock::now()
                                                   : std::chrono::steady_clock::time_point{};
             u64 runs_read = 0;
-            if (run_mode != 0) {
+            if (run_mode == 2) {
+                // EXP101=2 (fable52_answer_presenter 2.1): an entry inside one 4 KiB GPU page is
+                // copied from MemoryManager's per-thread page pointer cache (it drops stale
+                // entries on any map serial or translation change), and the first and last
+                // lines of the entry 8 ahead are prefetched. Same bytes as ReadBlockUnsafe.
+                const auto& lists = entries.command_lists;
+                auto& gmmu = *channel_state->memory_manager;
+                const auto host_of = [&](u32 index) -> const u8* {
+                    const u64 addr = static_cast<u64>(lists[index].addr);
+                    const u64 bytes = static_cast<u64>(lists[index].size) * sizeof(u32);
+                    if (bytes == 0 || bytes > 0x1000 || (addr & 0xFFF) + bytes > 0x1000) {
+                        return nullptr;
+                    }
+                    return gmmu.GetPointerForDescriptor(addr);
+                };
+                for (u32 i = 0; i < lists.size(); ++i) {
+                    if (i + 8 < lists.size()) {
+                        if (const u8* ahead = host_of(i + 8)) {
+                            const u64 ahead_bytes =
+                                static_cast<u64>(lists[i + 8].size) * sizeof(u32);
+                            _mm_prefetch(reinterpret_cast<const char*>(ahead), _MM_HINT_T0);
+                            _mm_prefetch(reinterpret_cast<const char*>(ahead + ahead_bytes - 1),
+                                         _MM_HINT_T0);
+                        }
+                    }
+                    const auto& entry = lists[i];
+                    entries.submitted_offsets.push_back(static_cast<u32>(offset));
+                    const u64 bytes = static_cast<u64>(entry.size) * sizeof(u32);
+                    if (system.GPU().IsMapPending(entry.addr, bytes)) {
+                        entries.deferred_entries.push_back(i);
+                    } else if (const u8* host = host_of(i)) {
+                        std::memcpy(entries.submitted_words.data() + offset, host, bytes);
+                        ++runs_read;
+                    } else {
+                        gmmu.ReadBlockUnsafe(entry.addr, entries.submitted_words.data() + offset,
+                                             bytes);
+                        ++runs_read;
+                    }
+                    offset += entry.size;
+                }
+                NotePbSnapshot(run_mode, lists.size(), runs_read,
+                               std::chrono::steady_clock::now() - loop_begin);
+            } else if (run_mode != 0) {
                 const auto& lists = entries.command_lists;
                 for (u32 i = 0; i < lists.size();) {
                     u32 end = i + 1;
