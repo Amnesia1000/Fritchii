@@ -539,8 +539,15 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
             gpu.ForEachPendingCpuWrite(callback);
         });
     VideoCommon::GpuSplit::Get().SetIdleHook(
-        [](void* argument) { static_cast<Scheduler*>(argument)->FlushDeferred(); },
-        &scheduler);
+        [](void* argument) {
+            auto* const rasterizer = static_cast<RasterizerVulkan*>(argument);
+            rasterizer->scheduler.FlushDeferred();
+            // EXP99 = 1: evicted pool images (OoT's per-NPC depth targets) go while idle.
+            if (VideoCore::Nx2Debug::Experiment(99) == 1) {
+                rasterizer->texture_cache_runtime.DestroyIdlePooledImages(2);
+            }
+        },
+        this);
     VideoCommon::GpuSplit::Get().SetFenceQuietCheck(
         [](void* argument, bool strict, u64* epoch) {
             return static_cast<RasterizerVulkan*>(argument)->FencesQuiet(strict, *epoch);

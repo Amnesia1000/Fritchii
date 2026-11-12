@@ -3013,7 +3013,19 @@ void TextureCacheRuntime::DropPooledImage(vk::Image image, u64 bytes) {
     // destroyed on the image free thread instead of here, on the GPU back thread at the frame's
     // end (OoT's per-NPC depth targets: ~3 a frame while a chicken passes, 1-4.7 ms stalls).
     // The GPU finished with pooled images before they were pooled (IsFree), so no ordering.
-    if (VideoCore::Nx2Debug::Experiment(99) != 0 && image_free_queue.Enabled() &&
+    // EXP99 = 1: the back destroys it when it next has nothing to do (RasterizerVulkan's split
+    // idle hook), on its own thread, so VMA stays externally synchronized; the free thread
+    // (2, needs EDEN_NX2_ASYNC_IMAGE_FREE=1) fought the back for VMA's and the driver's locks.
+    const int exp99 = VideoCore::Nx2Debug::Experiment(99);
+    if (exp99 == 1) {
+        std::scoped_lock lock{idle_destroy_mutex};
+        if (idle_destroys.size() < 64) {
+            idle_destroys.push_back(std::move(image));
+            ++image_pool_dropped_async;
+            return;
+        }
+    }
+    if (exp99 == 2 && image_free_queue.Enabled() &&
         image_free_queue.PendingBytes() <= ImageFreeQueue::MaxPendingBytes) {
         image_free_queue.AddBare(std::move(image), bytes);
         ++image_pool_dropped_async;
@@ -3021,6 +3033,23 @@ void TextureCacheRuntime::DropPooledImage(vk::Image image, u64 bytes) {
     }
     ++image_pool_dropped_here;
     image = vk::Image{};
+}
+
+void TextureCacheRuntime::DestroyIdlePooledImages(u32 max) {
+    for (u32 i = 0; i < max; ++i) {
+        vk::Image image;
+        {
+            std::scoped_lock lock{idle_destroy_mutex};
+            if (idle_destroys.empty()) {
+                return;
+            }
+            image = std::move(idle_destroys.front());
+            idle_destroys.pop_front();
+        }
+        Common::Nx2Timeline::Span span{"back: idle pool destroy"};
+        image = vk::Image{};
+        ++image_pool_dropped_idle;
+    }
 }
 
 void TextureCacheRuntime::TrimImagePool(u64 max_bytes) {
@@ -3190,14 +3219,15 @@ void TextureCacheRuntime::TickFrame() {
             LOG_INFO(Render_Vulkan,
                      "Image pool (EXP42) last 600 frames: {} taken, {} missed, {} pooled, {} "
                      "evicted ({} never-taken shapes aged out, EXP65={}); holds {} images, {} MiB; "
-                     "evictions destroyed on the free thread {} (EXP99={}), here {}",
+                     "evictions deferred {} (EXP99={}; destroyed while idle {}), here {}",
                      image_pool_taken, image_pool_missed, image_pool_given, image_pool_evicted,
                      image_pool_unproven_evicted, VideoCore::Nx2Debug::Experiment(65),
                      image_pool.size(), image_pool_bytes >> 20, image_pool_dropped_async,
-                     VideoCore::Nx2Debug::Experiment(99), image_pool_dropped_here);
+                     VideoCore::Nx2Debug::Experiment(99), image_pool_dropped_idle,
+                     image_pool_dropped_here);
             image_pool_taken = image_pool_missed = image_pool_given = image_pool_evicted = 0;
             image_pool_unproven_evicted = 0;
-            image_pool_dropped_async = image_pool_dropped_here = 0;
+            image_pool_dropped_async = image_pool_dropped_here = image_pool_dropped_idle = 0;
         }
         // EXP99: hand what the trims above dropped to the free thread now, not next frame.
         image_free_queue.Submit();

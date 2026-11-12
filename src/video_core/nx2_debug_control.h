@@ -547,7 +547,8 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// (EXP101" logs submits, entries, reads and loop time every 5 s while on.
 /// EXP99 (live, 0 = off; fable52_answer_chicken 1): evicted EXP42 pool images (OoT's per-NPC
 /// depth targets, ~3 a frame while a chicken passes or an enemy dies) are destroyed on the image
-/// free thread instead of on the GPU back thread at the frame's end. The pool line every 600
+/// free thread (2; needs EDEN_NX2_ASYNC_IMAGE_FREE=1) or, with 1, by the back itself in its idle hook
+/// (up to 2 each time it runs out of work), instead of at the frame's end. The pool line every 600
 /// frames counts where they went; the timeline shows "back: image pool tick".
 /// EXP96 (live; fable52_answer_guest 4): the HLE reply hold (k_server_session.cpp HoldHleReply,
 /// written for Mario Tennis Fever, active in every title). 0 = EDEN_NX2_IPC_MIN_US or 50 us;

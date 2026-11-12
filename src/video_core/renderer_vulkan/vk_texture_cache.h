@@ -497,6 +497,13 @@ public:
     void DropPooledImage(vk::Image image, u64 bytes);
     u64 image_pool_dropped_async{}; ///< EXP99: evictions handed to the free thread
     u64 image_pool_dropped_here{};
+    u64 image_pool_dropped_idle{}; ///< EXP99=1: destroyed in the back's idle hook
+public:
+    /// EXP99=1: destroys up to `max` evicted pool images; the back calls it before it sleeps.
+    void DestroyIdlePooledImages(u32 max);
+private:
+    std::mutex idle_destroy_mutex;
+    std::deque<vk::Image> idle_destroys; ///< EXP99=1: evicted, destroyed when the back is idle
 
 public:
     /// EDEN_NX2_ASYNC_IMAGE_FREE: a deleted image the GPU is done with (TextureCache::TickFrame,
