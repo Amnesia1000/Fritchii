@@ -500,7 +500,7 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// 10 s: ... mismatched" must stay 0). With EXP87 != 0, "Draw templates in 10 s" logs hits,
 /// misses, kept templates and rejections every 10 s.
 /// EXP86 (live, 0 = off; fable52_answer_gpuwritten; RasterizerVulkan::GetFlushArea): a guest
-/// read of pages the GPU ever wrote (no image there, EXP36 and EXP81 off) skips the caches' locks
+/// read of pages the GPU ever wrote (no image there, EXP36 off) skips the caches' locks
 /// when the buffer cache's page mirrors (gpu_written_mirror.h) say the locked path would answer
 /// "preemptive" and change nothing: no GPU-modified byte on the pages now, and a Preflushable
 /// mark or no armed read trap there. The mirrors change only under the buffer cache's mutex; a
@@ -652,10 +652,12 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// line and the clear zone.
 /// EXP81 (live, frames, 0 = off; fable52_answer_readback_card 3; BufferCache TickFrame and
 /// GetFlushArea): with EXP69's Preflushable reset, unmark only the pages the CPU has not read for
-/// this many frames (each CPU read through GetFlushArea stamps its pages). Unmarking every page
-/// made each page the game still reads need one async read (~40 a second at the market) to be
-/// marked again; a mark only decides whether a GPU write is copied at the fence or at the read,
-/// so it is exact. "Preflush reset" logs the KiB kept. Try 300 (with EXP69=600).
+/// this many frames. Every CPU read, locked (GetFlushArea) or EXP86's lock-free clean answer,
+/// sets its pages in a page bitmap that TickFrame folds into per-page stamps every frame
+/// (fable52_answer_fences2 2), so it works with EXP86 on. Unmarking every page made each page
+/// the game still reads need one async read (~40 a second at the market) to be marked again; a
+/// mark only decides whether a GPU write is copied at the fence or at the read, so it is exact.
+/// "Preflush reset" logs the KiB kept. Try EXP69=4 with EXP81=4, then 2 and 8.
 /// EXP78 (live, 0 = off; fable52_answer_killuploads 3-4; TextureCache::TcSkipStale): what
 /// EDEN_NX2_TC_SKIP_STALE=1 does at boot, switchable: a deleted GPU-written image marks its whole
 /// pages stale (CPU writes clear them) and a new image whose range is all stale (and not

@@ -152,6 +152,16 @@ void BufferCache<P>::TickFrame() {
             LOG_INFO(HW_GPU, "Memory trace: buffer cache {} MiB", buffer_bytes >> 20);
         }
     }
+    // EXP81 (fable52_answer_fences2 2): every frame, the marked pages read since the last frame
+    // (both read paths set preflush_read_pages, with or without the lock) get this frame's stamp.
+    if (VideoCore::Nx2Debug::Experiment(81) > 0 && VideoCore::Nx2Debug::Experiment(69) > 0 &&
+        !preflush_marked_ranges.Empty()) {
+        preflush_marked_ranges.ForEach([&](DAddr begin, DAddr end) {
+            preflush_read_pages.Take(begin, end - begin, [&](u64 page) {
+                preflush_read_frames[page >> Core::DEVICE_PAGEBITS] = frame_tick;
+            });
+        });
+    }
     // EDEN_NX2_EXP69 (live, frames, 0 = off; fable52_answer_stalls 5.1): Preflushable marks never
     // cleared, so every later GPU write to a page the CPU once read was downloaded at its fence
     // (night market: ~100 MB in ~8,200 copies a second). Every N frames the marks go; a range the
@@ -483,12 +493,11 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
     if (DownloadReadStats::g_enabled) [[unlikely]] {
         DownloadReadStats::Read(device_addr_start_aligned, device_addr_end_aligned);
     }
-    // EXP81: the frame of each page's last CPU read, for the aged Preflushable reset (TickFrame).
+    // EXP81 (fable52_answer_fences2 2): this read's pages, stamped by TickFrame's fold. The
+    // lock-free clean answer (MirrorCleanForRead) sets them too, so EXP86 sees every read.
     if (VideoCore::Nx2Debug::Experiment(81) > 0) [[unlikely]] {
-        for (DAddr page = device_addr_start_aligned; page < device_addr_end_aligned;
-             page += Core::DEVICE_PAGESIZE) {
-            preflush_read_frames[page >> Core::DEVICE_PAGEBITS] = frame_tick;
-        }
+        preflush_read_pages.Set(device_addr_start_aligned,
+                                device_addr_end_aligned - device_addr_start_aligned);
     }
     const bool preflushable = memory_tracker.IsRegionPreflushable(device_addr, size);
     // EDEN_NX2_EXP49: all of the area's GPU-modified bytes on their way for an earlier read. No

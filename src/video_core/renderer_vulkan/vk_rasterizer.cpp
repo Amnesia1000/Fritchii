@@ -3205,13 +3205,13 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
     // without the locks. The buffer cache mirrors per page whether gpu_modified_ranges holds a
     // byte there now, the tracker's Preflushable mark and an armed read trap, under its mutex,
     // with a counter that is odd while a hold changes them. Clean, and marked or not armed: the
-    // locked path would answer this same preemptive area and change nothing. EXP81's per-read
-    // stamps need the lock, so not with EXP81. 2 = verify on the locked path, no fast answers.
+    // locked path would answer this same preemptive area and change nothing. With EXP81 the clean
+    // answer sets the read's pages in preflush_read_pages, as the locked path does
+    // (fable52_answer_fences2 2). 2 = verify on the locked path, no fast answers.
     const int mirror_mode = VideoCore::Nx2Debug::Experiment(86);
     const bool mirror_eligible = mirror_mode != 0 && gpu_written && size != 0 &&
                                  !(by_count ? image_now : image_ever) &&
-                                 VideoCore::Nx2Debug::Experiment(36) == 0 &&
-                                 VideoCore::Nx2Debug::Experiment(81) == 0;
+                                 VideoCore::Nx2Debug::Experiment(36) == 0;
     if (mirror_eligible && mirror_mode == 1) {
         const VideoCommon::MirrorAnswer answer = buffer_cache.MirrorCleanForRead(addr, size);
         CountMirrorAnswer(answer);
