@@ -521,25 +521,60 @@ void Maxwell3D::NoteFastDrawCountWrite(u32 method, u32 argument) {
     }
 }
 
+Maxwell3D::FastDrawCountPools Maxwell3D::FastDrawCountPoolRanges() const {
+    constexpr u64 HeaderSize = 0x20;
+    // As TextureCache::SynchronizeDescriptors sizes the sampler table.
+    return {
+        .tic = regs.tex_header.Address(),
+        .tic_size = (u64{regs.tex_header.limit} + 1) * HeaderSize,
+        .tsc = regs.tex_sampler.Address(),
+        .tsc_size = (u64{regs.sampler_binding == Regs::SamplerBinding::ViaHeaderBinding
+                             ? regs.tex_header.limit
+                             : regs.tex_sampler.limit} +
+                     1) *
+                    HeaderSize,
+    };
+}
+
+void Maxwell3D::UpdateFastDrawCountPools() {
+    namespace Count = VideoCommon::Nx2FastDrawCount;
+    const FastDrawCountPools pools = FastDrawCountPoolRanges();
+    const bool tic_changed =
+        fast_draw_count_tic_spans.Update(memory_manager, pools.tic, pools.tic_size);
+    const bool tsc_changed =
+        fast_draw_count_tsc_spans.Update(memory_manager, pools.tsc, pools.tsc_size);
+    if (tic_changed || tsc_changed || Count::g_pools_owner != this) {
+        Count::PublishPools(this, fast_draw_count_tic_spans, fast_draw_count_tsc_spans);
+    }
+}
+
 void Maxwell3D::NoteFastDrawCountData(GPUVAddr begin, GPUVAddr end) {
     namespace Count = VideoCommon::Nx2FastDrawCount;
-    // #1161's NoteFastDrawConstantData by GPU address: texture and sampler headers are read when
-    // image views are resolved, which delta draws skip. (Its second check, through other GPU
-    // addresses mapping the same device memory, is not ported.)
-    constexpr u64 HeaderSize = 0x20;
-    const GPUVAddr tic = regs.tex_header.Address();
-    const u64 tic_size = (u64{regs.tex_header.limit} + 1) * HeaderSize;
-    const GPUVAddr tsc = regs.tex_sampler.Address();
-    const u64 tsc_size = (u64{regs.sampler_binding == Regs::SamplerBinding::ViaHeaderBinding
-                                  ? regs.tex_header.limit
-                                  : regs.tex_sampler.limit} +
-                          1) *
-                         HeaderSize;
-    if ((begin < tic + tic_size && tic < end) || (begin < tsc + tsc_size && tsc < end)) {
+    // #1161's NoteFastDrawConstantData: texture and sampler headers are read when image views are
+    // resolved, which delta draws skip.
+    const FastDrawCountPools pools = FastDrawCountPoolRanges();
+    if ((begin < pools.tic + pools.tic_size && pools.tic < end) ||
+        (begin < pools.tsc + pools.tsc_size && pools.tsc < end)) {
         Count::BreakOn(Count::Reason::TextureHeaders, Count::Other);
         return;
     }
     Count::NoteConstantData(begin, end);
+    // The same device memory can be mapped at other GPU addresses: compare where it lands (#1161,
+    // 792e12a47b; Fable plan D1, row 5).
+    UpdateFastDrawCountPools();
+    constexpr u64 PageSize = 0x1000; // the smallest GPU page
+    for (GPUVAddr page = begin; page < end;) {
+        const GPUVAddr page_end = (std::min)(end, (page & ~(PageSize - 1)) + PageSize);
+        if (const std::optional<DAddr> device = memory_manager.GpuToCpuAddress(page)) {
+            const DAddr device_end = *device + (page_end - page);
+            if (fast_draw_count_tic_spans.Intersects(*device, device_end) ||
+                fast_draw_count_tsc_spans.Intersects(*device, device_end)) {
+                Count::BreakOn(Count::Reason::PoolAlias, Count::Other);
+                return;
+            }
+        }
+        page = page_end;
+    }
 }
 
 void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call) {
@@ -3327,7 +3362,8 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                 [memory = &memory_manager, source, read_bytes] {
                     memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
                 },
-                VideoCommon::DrainSite::MacroDmaFlush);
+                VideoCommon::DrainSite::MacroDmaFlush,
+                VideoCommon::Nx2FastDrawCount::Neutral());
         }
     };
     // Words a constant buffer upload still queued for the back writes come from the upload
@@ -3364,7 +3400,8 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             [this, begin, bytes] {
                 VideoCommon::QueryDma::FlushPending(memory_manager, *rasterizer, begin, bytes);
             },
-            VideoCommon::DrainSite::MacroDmaFlush);
+            VideoCommon::DrainSite::MacroDmaFlush,
+            VideoCommon::Nx2FastDrawCount::Neutral());
     };
     if (snapshot_mode >= 9 && !full_drain && !Tegra::Nx2CmdPageDiag::g_enabled &&
         method == 0x158 && words != 0) {
@@ -3485,7 +3522,8 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                                 memory->FlushRegion(flush_begin, flush_bytes,
                                                     VideoCommon::CacheType::BufferCache);
                             },
-                            VideoCommon::DrainSite::MacroDmaFlush);
+                            VideoCommon::DrainSite::MacroDmaFlush,
+                            VideoCommon::Nx2FastDrawCount::Neutral());
                     }
                     // EDEN_NX2_EXP73 (live, 0 = off; fable52_answer_bosswave_2 3b): only when
                     // reports are listed over the bytes read (the hit path's own test, 12 bytes
@@ -3593,7 +3631,8 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                                                  source, read_bytes);
                 }
             },
-            VideoCommon::DrainSite::MacroDmaFlush);
+            VideoCommon::DrainSite::MacroDmaFlush,
+            VideoCommon::Nx2FastDrawCount::Neutral());
     }
     flush_if_dirty();
     std::vector<u32> diag_before;
@@ -3608,7 +3647,8 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         [this, source, read_bytes] {
             VideoCommon::QueryDma::FlushPending(memory_manager, *rasterizer, source, read_bytes);
         },
-        VideoCommon::DrainSite::MacroDmaFlush);
+        VideoCommon::DrainSite::MacroDmaFlush,
+        VideoCommon::Nx2FastDrawCount::Neutral());
     u32 changed{};
     for (u32 i = 0; i < words; ++i) {
         const u32 word = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
@@ -3686,7 +3726,8 @@ bool Maxwell3D::FrontDmaReadEarly(VideoCommon::GpuSplit& split, FrontState& fs, 
                 [memory = &memory_manager, source, bytes] {
                     memory->FlushRegion(source, bytes, VideoCommon::CacheType::BufferCache);
                 },
-                VideoCommon::DrainSite::MacroDmaFlush);
+                VideoCommon::DrainSite::MacroDmaFlush,
+                VideoCommon::Nx2FastDrawCount::Neutral());
         }
         static u32 logged{};
         for (u32 i = 0; i < words; ++i) {

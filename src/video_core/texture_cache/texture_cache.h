@@ -5916,6 +5916,8 @@ void TextureCache<P>::RelocateImage(ImageId image_id, GPUVAddr gpu_addr, DAddr c
         channel_info.compute_image_table.Invalidate();
     }
     has_deleted_images = true;
+    // EDEN_NX2_FASTDRAW_COUNT (Fable plan D1, row 2): view generations and tables changed.
+    VideoCommon::Nx2FastDrawCount::Break(VideoCommon::Nx2FastDrawCount::Reason::Relocate);
 }
 
 template <class P>

@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <functional>
+#include <initializer_list>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -36,6 +37,13 @@
 /// calls are neutral). Every break moves a serial, as there; it also ORs the break's group into a
 /// mask, cleared at each draw, so a draw that state ended shows every group that ended it, not
 /// only the last one (Fable plan, fable_answer_backthread_threads.md section 8).
+///
+/// Step D1 of Fable's port plan (section 10.2) adds the five breaks our tree needs and #1161's
+/// doesn't raise (writes applied over the pools, the pools written through an alias, EXP43
+/// relocations, channel switches, and the render pass serial counted always), marks as neutral
+/// the deferred calls whose effects now break where they act (channel bind, fence releases,
+/// collected writes applied, macro read flushes, FlushRegion, list end), and logs every break
+/// raised by reason and the deferred calls that still break by thunk.
 namespace VideoCommon::Nx2FastDrawCount {
 
 enum class Reason : u8 {
@@ -52,13 +60,19 @@ enum class Reason : u8 {
     TextureHeaders,
     Map,
     HleMacro,
+    // Fable's port plan step D1 (fable_answer_backthread_threads.md 10.2, the five breaks):
+    PoolWrite, ///< A guest CPU (or cached GPU) write applied over the TIC or TSC pool
+    PoolAlias, ///< A stream write through another GPU address onto the pools (#1161)
+    Relocate,  ///< EXP43 moved an image (TextureCache::RelocateImage)
+    Channel,   ///< The rasterizer switched to another channel
     Count,
 };
 
 inline constexpr std::array<const char*, static_cast<size_t>(Reason::Count)> reason_names{
     "register",       "method",        "inline data",   "other engine",        "deferred call",
     "tick work",      "invalidation",  "fence release", "indirect reset",      "frame",
-    "texture header data", "memory map", "HLE macro",
+    "texture header data", "memory map", "HLE macro",   "pool write",          "pool alias write",
+    "image relocated", "channel switch",
 };
 
 /// The groups a draw's breaks are sorted into, a bit each. Register and method breaks go by
@@ -71,13 +85,15 @@ enum Group : u32 {
     ListOverflow = 1U << 3,  ///< The 16-range write list was widened (not a break in #1161)
     RealState = 1U << 4,     ///< Any other 3D register or method
     OtherEngine = 1U << 5,
-    Invalidation = 1U << 6,  ///< Texture cache writes and deletions, rescales, shader removals
+    Invalidation = 1U << 6,  ///< Texture cache writes and deletions, rescales, shader removals,
+                             ///< writes applied over the pools, image relocations
     Fence = 1U << 7,
     TickWork = 1U << 8,
     Call = 1U << 9,          ///< Deferred calls on the split's back not marked neutral
     Frame = 1U << 10,
     Map = 1U << 11,          ///< GPU memory map changes, unmapped images
-    Other = 1U << 12,        ///< Inline data, texture header data, indirect reset, HLE macros
+    Other = 1U << 12,        ///< Inline data, texture header data (also through an alias),
+                             ///< indirect reset, HLE macros, channel switches
 };
 inline constexpr u32 NumGroups = 13;
 inline constexpr u32 BreakGroups = ((1U << NumGroups) - 1) & ~u32{ListOverflow};
@@ -96,6 +112,8 @@ inline constexpr std::array<const char*, NumGroups> group_names{
     case Reason::TickWork:
         return TickWork;
     case Reason::Invalidation:
+    case Reason::PoolWrite:
+    case Reason::Relocate:
         return Invalidation;
     case Reason::Fence:
         return Fence;
@@ -149,9 +167,12 @@ inline std::atomic<u64> g_serial{1};
 inline std::atomic<u32> g_pending{};
 /// The last break's reason and, for Register and Method, its 3D method (bits 8 and up).
 inline std::atomic<u32> g_last_break{};
+/// Every break raised, by reason (whether or not a draw followed it), for the 5 s log.
+inline std::array<std::atomic<u64>, static_cast<size_t>(Reason::Count)> g_raised{};
 
 /// A break, when on (callers test g_on). Breaks come from several threads.
 inline void BreakOn(Reason reason, u32 group, u32 method = 0) {
+    g_raised[static_cast<size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
     g_serial.fetch_add(1, std::memory_order_relaxed);
     g_last_break.store(static_cast<u32>(reason) | (method << 8), std::memory_order_relaxed);
     if ((g_pending.load(std::memory_order_relaxed) & group) != group) {
@@ -162,6 +183,167 @@ inline void BreakOn(Reason reason, u32 group, u32 method = 0) {
 inline void Break(Reason reason) {
     if (g_on) [[unlikely]] {
         BreakOn(reason, GroupOf(reason));
+    }
+}
+
+/// The deferred calls that still break (Call entries without the neutral bit), by thunk address,
+/// for the 5 s log's top 8 (Fable section 9.1: which call ends the chains). Recorded by
+/// GpuSplit::Execute when on.
+struct CallSites {
+    static constexpr size_t Size = 64;
+    std::array<std::atomic<u64>, Size> thunks{};
+    std::array<std::atomic<u64>, Size> counts{};
+    std::atomic<u64> overflow{}; ///< Calls of thunks the table had no room for
+};
+inline CallSites g_call_sites;
+/// The base of the module the thunks are in (lichii.exe; set by GpuSplit on Windows, else 0):
+/// the log prints thunks as offsets from it, which a symbol lookup on the PDB resolves.
+inline std::atomic<u64> g_module_base{};
+
+inline void NoteCallSite(u64 thunk) {
+    CallSites& sites = g_call_sites;
+    size_t index = static_cast<size_t>(((thunk >> 4) * 0x9E3779B97F4A7C15ULL) >> 58);
+    for (size_t probe = 0; probe < CallSites::Size; ++probe) {
+        u64 key = sites.thunks[index].load(std::memory_order_relaxed);
+        if (key == 0 &&
+            sites.thunks[index].compare_exchange_strong(key, thunk, std::memory_order_relaxed)) {
+            key = thunk;
+        }
+        if (key == thunk) {
+            sites.counts[index].fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        index = (index + 1) % CallSites::Size;
+    }
+    sites.overflow.fetch_add(1, std::memory_order_relaxed);
+}
+
+/// The device memory a GPU range maps to (#1161's DeviceSpans): a write through another GPU
+/// address that maps the same device memory changes the range too.
+class DeviceSpans {
+public:
+    /// Translates [address, address + size) again unless it was translated last and the memory
+    /// manager's mappings haven't changed since. Returns whether the spans may have changed.
+    template <typename MemoryManager>
+    bool Update(const MemoryManager& memory_, GPUVAddr address_, u64 size_) {
+        const u64 serial = memory_.MapSerial();
+        if (memory == &memory_ && address == address_ && size == size_ && map_serial == serial) {
+            return false;
+        }
+        memory = &memory_;
+        address = address_;
+        size = size_;
+        map_serial = serial;
+        spans.clear();
+        for (const auto& [device, bytes] : memory_.GetSubmappedDeviceRange(address_, size_)) {
+            spans.emplace_back(device, device + bytes);
+        }
+        std::sort(spans.begin(), spans.end());
+        size_t merged = 0;
+        for (const auto& span : spans) {
+            if (merged != 0 && span.first <= spans[merged - 1].second) {
+                spans[merged - 1].second = (std::max)(spans[merged - 1].second, span.second);
+            } else {
+                spans[merged++] = span;
+            }
+        }
+        spans.resize(merged);
+        return true;
+    }
+
+    /// Whether [begin, end) of device memory overlaps the range's.
+    [[nodiscard]] bool Intersects(DAddr begin, DAddr end) const {
+        const auto span = std::upper_bound(
+            spans.begin(), spans.end(), begin,
+            [](DAddr value, const std::pair<DAddr, DAddr>& item) { return value < item.second; });
+        return span != spans.end() && span->first < end;
+    }
+
+    /// Sorted, disjoint [begin, end) pairs.
+    [[nodiscard]] const std::vector<std::pair<DAddr, DAddr>>& Spans() const noexcept {
+        return spans;
+    }
+
+private:
+    const void* memory{};
+    GPUVAddr address{};
+    u64 size{};
+    u64 map_serial{};
+    std::vector<std::pair<DAddr, DAddr>> spans;
+};
+
+/// The device memory of the bound 3D engine's texture header (TIC) and sampler (TSC) pools,
+/// published by the thread that runs it (Maxwell3D::UpdateFastDrawCountPools) for the threads
+/// that apply guest writes (a sequence lock: one writer, any readers). Pools are not images, so
+/// TextureCache::WriteMemory's break does not cover a write there (Fable 10.2, row 1).
+struct PoolSpans {
+    static constexpr size_t Max = 8;
+    std::atomic<u32> generation{};
+    std::atomic<u32> count{};
+    std::array<std::atomic<u64>, Max> begin{};
+    std::array<std::atomic<u64>, Max> end{};
+};
+inline PoolSpans g_pools;
+/// The engine whose pools were published last (the publishing thread only).
+inline const void* g_pools_owner{};
+
+inline void PublishPools(const void* owner, const DeviceSpans& tic, const DeviceSpans& tsc) {
+    g_pools_owner = owner;
+    PoolSpans& pools = g_pools;
+    const u32 generation = pools.generation.load(std::memory_order_relaxed);
+    pools.generation.store(generation + 1, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    // Too many pieces: each pool's hull (more breaks, never fewer).
+    const bool fits = tic.Spans().size() + tsc.Spans().size() <= PoolSpans::Max;
+    u32 count = 0;
+    const auto add = [&pools, &count](DAddr begin, DAddr end) {
+        pools.begin[count].store(begin, std::memory_order_relaxed);
+        pools.end[count].store(end, std::memory_order_relaxed);
+        ++count;
+    };
+    for (const DeviceSpans* pool : {&tic, &tsc}) {
+        const auto& spans = pool->Spans();
+        if (spans.empty()) {
+            continue;
+        }
+        if (fits) {
+            for (const auto& [begin, end] : spans) {
+                add(begin, end);
+            }
+        } else {
+            add(spans.front().first, spans.back().second);
+        }
+    }
+    pools.count.store(count, std::memory_order_relaxed);
+    pools.generation.store(generation + 2, std::memory_order_release);
+}
+
+[[nodiscard]] inline bool PoolsIntersect(DAddr begin, DAddr end) {
+    const PoolSpans& pools = g_pools;
+    for (;;) {
+        const u32 generation = pools.generation.load(std::memory_order_acquire);
+        if ((generation & 1) != 0) {
+            continue; // Being published (a few stores)
+        }
+        const u32 count = (std::min)(pools.count.load(std::memory_order_relaxed),
+                                     static_cast<u32>(PoolSpans::Max));
+        bool hit = false;
+        for (u32 i = 0; i < count; ++i) {
+            hit |= pools.begin[i].load(std::memory_order_relaxed) < end &&
+                   begin < pools.end[i].load(std::memory_order_relaxed);
+        }
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (pools.generation.load(std::memory_order_relaxed) == generation) {
+            return hit;
+        }
+    }
+}
+
+/// When on: a write of [addr, addr + size) of device memory applied to the caches (guest CPU
+/// writes, collected or not, and the GPU's cached writes). Over a pool: a break.
+inline void NotePoolWrite(DAddr addr, u64 size) {
+    if (size != 0 && PoolsIntersect(addr, addr + size)) {
+        BreakOn(Reason::PoolWrite, Invalidation);
     }
 }
 
@@ -393,6 +575,14 @@ struct Counter {
         const auto now = std::chrono::steady_clock::now();
         if (stats.window_start == std::chrono::steady_clock::time_point{}) {
             stats.window_start = now;
+            // The global counts start with the window too.
+            for (auto& count : g_raised) {
+                count.store(0, std::memory_order_relaxed);
+            }
+            for (auto& count : g_call_sites.counts) {
+                count.store(0, std::memory_order_relaxed);
+            }
+            g_call_sites.overflow.store(0, std::memory_order_relaxed);
             return;
         }
         if (now - stats.window_start < std::chrono::seconds{5}) {
@@ -460,11 +650,50 @@ struct Counter {
         for (size_t i = 0; i < shown; ++i) {
             top += fmt::format(" {:#x}:{:.0f}", methods[i].second, rate(methods[i].first));
         }
+        // Every break raised (D1: the pool write, alias, relocate and channel rates), and the
+        // deferred calls that still break by thunk, top 8.
+        std::string raised;
+        for (size_t reason = 0; reason < g_raised.size(); ++reason) {
+            if (const u64 count = g_raised[reason].exchange(0, std::memory_order_relaxed);
+                count != 0) {
+                raised += fmt::format(" {} {:.0f},", reason_names[reason], rate(count));
+            }
+        }
+        if (!raised.empty()) {
+            raised.pop_back();
+        }
+        std::vector<std::pair<u64, u64>> calls;
+        for (size_t i = 0; i < CallSites::Size; ++i) {
+            const u64 thunk = g_call_sites.thunks[i].load(std::memory_order_relaxed);
+            if (const u64 count = g_call_sites.counts[i].exchange(0, std::memory_order_relaxed);
+                thunk != 0 && count != 0) {
+                calls.emplace_back(count, thunk);
+            }
+        }
+        const size_t shown_calls = (std::min)(calls.size(), size_t{8});
+        std::partial_sort(calls.begin(), calls.begin() + shown_calls, calls.end(),
+                          std::greater{});
+        const u64 module_base = g_module_base.load(std::memory_order_relaxed);
+        std::string call_list;
+        for (size_t i = 0; i < shown_calls; ++i) {
+            const u64 thunk = calls[i].second;
+            call_list += module_base != 0 && thunk >= module_base
+                             ? fmt::format(" +{:#x}:{:.0f}", thunk - module_base,
+                                           rate(calls[i].first))
+                             : fmt::format(" {:#x}:{:.0f}", thunk, rate(calls[i].first));
+        }
+        if (const u64 overflow = g_call_sites.overflow.exchange(0, std::memory_order_relaxed);
+            overflow != 0) {
+            call_list += fmt::format(" other:{:.0f}", rate(overflow));
+        }
         LOG_INFO(Render_Vulkan,
                  "Delta draw count (5 s) state changed per second, by last break:{} | top "
-                 "methods by last break:{}",
+                 "methods by last break:{} | breaks raised per second:{} | deferred calls "
+                 "that broke per second, top thunks (offset from the module base):{}",
                  breaks.empty() ? std::string{" none"} : breaks,
-                 top.empty() ? std::string{" none"} : top);
+                 top.empty() ? std::string{" none"} : top,
+                 raised.empty() ? std::string{" none"} : raised,
+                 call_list.empty() ? std::string{" none"} : call_list);
         std::string any;
         std::string alone;
         for (u32 group = 0; group < NumGroups; ++group) {

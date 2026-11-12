@@ -792,6 +792,8 @@ void RasterizerVulkan::FastDrawCountBegin() {
     // The draw before returned before its decision (no pipeline, a skipped mesh draw).
     counter.stats.not_drawn += counter.open ? 1 : 0;
     ++counter.stats.draws;
+    // The pools the writes applied from here on are tested against (Fable plan D1, row 1).
+    maxwell3d->UpdateFastDrawCountPools();
     counter.taken = std::exchange(counter.previous, Count::PreviousDraw{});
     counter.taken_delta = std::exchange(Count::g_delta, Count::Delta{});
     counter.take_serial = Count::g_serial.load(std::memory_order_relaxed);
@@ -3514,6 +3516,11 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
     // EXP91 (stage 0, counting) and EXP92 (uniform keeps, tier 1): every cached write range, in
     // the keeps' ring, before any early return.
     buffer_cache.NoteCachedWrites(sequences);
+    if (VideoCommon::Nx2FastDrawCount::g_on) [[unlikely]] {
+        for (const auto& [addr, size] : sequences) {
+            VideoCommon::Nx2FastDrawCount::NotePoolWrite(addr, size);
+        }
+    }
     if (Settings::values.skip_cpu_inner_invalidation.GetValue()) {
         return;
     }
@@ -3604,6 +3611,9 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
 bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
     DEBUG_ASSERT(addr != 0 || size != 0);
     CountGuestAccess(g_guest_access.write_locked);
+    if (VideoCommon::Nx2FastDrawCount::g_on) [[unlikely]] {
+        VideoCommon::Nx2FastDrawCount::NotePoolWrite(addr, size);
+    }
     {
         std::scoped_lock lock{buffer_cache.mutex};
         if (buffer_cache.OnCPUWrite(addr, size)) {
@@ -3625,6 +3635,13 @@ void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64
     // cache's lock only where that cache may act. On the back only: it owns the vertex bindings
     // WriteReachesBuffers reads (the collected writes are applied there).
     if ((cb_path & CbPath::SkipBit) != 0 && VideoCommon::GpuSplit::OnBackThread()) {
+        // Delta draw count (Fable plan D1, row 1): pools are not images, test them here. The
+        // other path tests each range in OnCacheInvalidation.
+        if (VideoCommon::Nx2FastDrawCount::g_on) [[unlikely]] {
+            for (const auto& [addr, size] : ranges) {
+                VideoCommon::Nx2FastDrawCount::NotePoolWrite(addr, size);
+            }
+        }
         auto& counters = CbPath::g_counters;
         const bool verify = (cb_path & CbPath::VerifyBit) != 0;
         const auto note_mismatch = [&counters](DAddr addr, u64 size, const char* what) {
@@ -3701,6 +3718,9 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
     if (addr == 0 || size == 0) {
         return;
     }
+    if (VideoCommon::Nx2FastDrawCount::g_on) [[unlikely]] {
+        VideoCommon::Nx2FastDrawCount::NotePoolWrite(addr, size);
+    }
 
     {
         std::scoped_lock lock{texture_cache.mutex};
@@ -3719,6 +3739,11 @@ void RasterizerVulkan::Nx2ApplyRunaheadChunk(const VideoCommon::Runahead::Chunk&
     ranges.reserve(chunk.ranges.size());
     for (const auto& range : chunk.ranges) {
         ranges.emplace_back(static_cast<DAddr>(range.address), range.size);
+    }
+    if (VideoCommon::Nx2FastDrawCount::g_on) [[unlikely]] {
+        for (const auto& [addr, size] : ranges) {
+            VideoCommon::Nx2FastDrawCount::NotePoolWrite(addr, size);
+        }
     }
     const auto any = [&](const VideoCommon::PageFilter& filter) {
         return std::ranges::any_of(ranges, [&filter](const std::pair<DAddr, u64>& range) {
@@ -3762,6 +3787,9 @@ bool RasterizerVulkan::TryCacheInvalidation(DAddr addr, u64 size) {
         const DAddr page_begin = Common::AlignDown(addr, Core::DEVICE_PAGESIZE);
         const DAddr page_end = Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE);
         if (buffer_cache.IsRegionGpuModified(page_begin, page_end - page_begin)) return false;
+        if (VideoCommon::Nx2FastDrawCount::g_on) [[unlikely]] {
+            VideoCommon::Nx2FastDrawCount::NotePoolWrite(addr, size);
+        }
         texture_cache.WriteMemory(addr, size);
         buffer_cache.WriteMemory(addr, size);
     }
@@ -5990,7 +6018,14 @@ void RasterizerVulkan::InitializeChannel(Tegra::Control::ChannelState& channel) 
 void RasterizerVulkan::BindChannel(Tegra::Control::ChannelState& channel) {
     const s32 channel_id = channel.bind_id;
     VideoCommon::MemStageStats::ChannelBound(channel_id);
+    const size_t previous_channel = current_channel_id;
     BindToChannel(channel_id);
+    // Delta draw count (Fable plan D1, row 3): only a real switch ends reuse (the state tracker
+    // is reset below); binding the bound channel again doesn't.
+    if (VideoCommon::Nx2FastDrawCount::g_on && current_channel_id != previous_channel)
+        [[unlikely]] {
+        VideoCommon::Nx2FastDrawCount::Break(VideoCommon::Nx2FastDrawCount::Reason::Channel);
+    }
     if (!oot_resolution_checked) [[unlikely]] {
         ApplyOcarinaResolution(program_id); // no disk cache load (it does this first)
     }

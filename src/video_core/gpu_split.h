@@ -409,13 +409,14 @@ public:
     /// Runs `func` on the back and waits for it: for work on back-owned state, such as a buffer
     /// cache download that records into the Vulkan scheduler. A drained back still submits from
     /// its idle hook, so the front never touches that state itself.
+    /// `flags` as Defer's.
     template <typename Func>
-    void Run(const Func& func, DrainSite site = DrainSite::Other) {
+    void Run(const Func& func, DrainSite site = DrainSite::Other, u64 flags = 0) {
         if (on_back_thread || !active) {
             func();
             return;
         }
-        Defer(func);
+        Defer(func, Effect::Unknown, flags);
         Drain(site);
     }
 

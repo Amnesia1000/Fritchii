@@ -204,13 +204,21 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                         split.NoteMemoryWrite();
                     }
                 } else if (const auto* flush = std::get_if<FlushRegionCommand>(&next.data)) {
-                    split.Defer([rasterizer_ptr, addr = flush->addr, size = flush->size] {
-                        rasterizer_ptr->FlushRegion(addr, size);
-                    });
+                    // Delta draw count: FlushRegion and the collected write below are neutral
+                    // (a download changes no draw; a write breaks where it lands).
+                    split.Defer(
+                        [rasterizer_ptr, addr = flush->addr, size = flush->size] {
+                            rasterizer_ptr->FlushRegion(addr, size);
+                        },
+                        VideoCommon::GpuSplit::Effect::Unknown,
+                        VideoCommon::Nx2FastDrawCount::Neutral());
                 } else if (const auto* invalidate = std::get_if<InvalidateRegionCommand>(&next.data)) {
-                    split.Defer([rasterizer_ptr, addr = invalidate->addr, size = invalidate->size] {
-                        rasterizer_ptr->OnCacheInvalidation(addr, size);
-                    });
+                    split.Defer(
+                        [rasterizer_ptr, addr = invalidate->addr, size = invalidate->size] {
+                            rasterizer_ptr->OnCacheInvalidation(addr, size);
+                        },
+                        VideoCommon::GpuSplit::Effect::Unknown,
+                        VideoCommon::Nx2FastDrawCount::Neutral());
                 } else {
                     ASSERT(false);
                 }

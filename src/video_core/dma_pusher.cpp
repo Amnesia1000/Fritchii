@@ -183,7 +183,10 @@ void DmaPusher::DispatchCalls() {
     }();
     if (invalidate_at_list) {
         if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
-            split.Defer([gpu = &system.GPU()] { gpu->InvalidateGPUCache(); });
+            // Delta draw count: neutral, the writes break where they land (pools included).
+            split.Defer([gpu = &system.GPU()] { gpu->InvalidateGPUCache(); },
+                        VideoCommon::GpuSplit::Effect::Unknown,
+                        VideoCommon::Nx2FastDrawCount::Neutral());
         } else {
             system.GPU().InvalidateGPUCache();
         }
@@ -202,7 +205,8 @@ void DmaPusher::DispatchCalls() {
                 gpu->FlushCommands();
                 gpu->OnCommandListEnd();
             },
-            VideoCommon::GpuSplit::Effect::None);
+            // Delta draw count: neutral, a submit moves the tick and released fences break.
+            VideoCommon::GpuSplit::Effect::None, VideoCommon::Nx2FastDrawCount::Neutral());
         split.Publish();
         return;
     }
