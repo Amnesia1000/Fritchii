@@ -24,6 +24,7 @@
 #include "core/device_memory.h"
 #include "core/device_memory_manager.h"
 #include "core/memory.h"
+#include "core/nx2_protect_stats.h"
 #include "video_core/nx2_perf.h"
 
 namespace Core {
@@ -619,7 +620,18 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedCountNoLock(DAddr addr, size_
     u64 cache_begin = 0;
     u64 uncache_bytes = 0;
     u64 cache_bytes = 0;
-    const auto MarkRegionCaching = &DeviceMemoryManager<Traits>::DeviceMethods::MarkRegionCaching;
+    const auto MarkRegionCachingRaw = &DeviceMemoryManager<Traits>::DeviceMethods::MarkRegionCaching;
+    // EDEN_NX2_PROTECT_STATS=1: every call counted and timed (Core::Nx2ProtectStats).
+    const bool protect_stats = Core::Nx2ProtectStats::Enabled();
+    const auto MarkRegionCaching = [&](auto* device_inter, u64 vaddr, u64 bytes, bool cached) {
+        if (protect_stats) [[unlikely]] {
+            Core::Nx2ProtectStats::Count(vaddr, bytes, cached, [&] {
+                MarkRegionCachingRaw(device_inter, vaddr, bytes, cached);
+            });
+            return;
+        }
+        MarkRegionCachingRaw(device_inter, vaddr, bytes, cached);
+    };
 
     std::atomic_thread_fence(std::memory_order_acquire);
     const size_t page_end = Common::DivCeil(addr + size, Memory::YUZU_PAGESIZE);
@@ -701,6 +713,9 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedCountNoLock(DAddr addr, size_
 
 template <typename Traits>
 void DeviceMemoryManager<Traits>::UpdatePagesCachedCount(DAddr addr, size_t size, s32 delta) {
+    if (Core::Nx2ProtectStats::Enabled()) [[unlikely]] {
+        Core::Nx2ProtectStats::BeginBatch();
+    }
     Common::ScopedRangeLock lk(counter_guard, addr, size);
     UpdatePagesCachedCountNoLock(addr, size, delta);
 }
@@ -709,6 +724,9 @@ template <typename Traits>
 void DeviceMemoryManager<Traits>::UpdatePagesCachedBatch(std::span<const std::pair<DAddr, size_t>> ranges, s32 delta) {
     if (ranges.empty()) {
         return;
+    }
+    if (Core::Nx2ProtectStats::Enabled()) [[unlikely]] {
+        Core::Nx2ProtectStats::BeginBatch();
     }
     // Runs already sorted with gaps between them (the buffer tracker's) are what the sort and
     // merge below would produce: use them as they are instead of two heap copies.
