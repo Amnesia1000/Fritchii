@@ -3545,6 +3545,9 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
     CbPath::MaybeLog(cb_path);
     if ((cb_path & CbPath::SkipBit) == 0) {
         std::scoped_lock lock{buffer_cache.mutex};
+        // As OnCacheInvalidations: out of the GPU-written ranges first, so applying one range
+        // doesn't download the GPU's bytes over a later range on the same page (#1460).
+        buffer_cache.ClaimCpuWrites(sequences);
         for (const auto& [addr, size] : sequences) {
             buffer_cache.WriteMemory(addr, size);
         }
@@ -3577,6 +3580,13 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
             CbPath::Count(counters.lock_skips);
         } else {
             std::scoped_lock lock{buffer_cache.mutex};
+            // As above (#1460): claim every range applied below first. Skipped ranges
+            // (Reach::None) were never GPU-written, so the claim has nothing to take there.
+            boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> applied;
+            for (const auto& [range, skipped] : locked) {
+                applied.push_back(range);
+            }
+            buffer_cache.ClaimCpuWrites(applied);
             for (const auto& [range, skipped] : locked) {
                 if (skipped) {
                     // Verify: the skip had to change nothing; WriteMemory runs anyway.
