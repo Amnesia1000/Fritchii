@@ -25,6 +25,11 @@ public:
         return m_owner_thread == GetCurrentThreadPointer(m_kernel);
     }
 
+    // EXP98 (KScheduler's yield early return): the spin lock word reads free.
+    bool IsFree() const {
+        return m_spin_lock.IsFree();
+    }
+
     void Lock() {
         if (this->IsLockedByCurrentThread()) {
             // If we already own the lock, the lock count should be > 0.

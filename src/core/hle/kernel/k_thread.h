@@ -385,6 +385,24 @@ public:
         m_schedule_count = count;
     }
 
+    // EXP98 (k_scheduler.cpp): the last yield that found nothing to do, stamped under the
+    // scheduler lock with its core and that core's change counter. Kind 1 = same core (no
+    // rotation), 2 = also no migration. Only the thread itself reads or writes these.
+    s32 GetYieldCore() const {
+        return m_yield_core;
+    }
+    u8 GetYieldKind() const {
+        return m_yield_kind;
+    }
+    u64 GetYieldGen() const {
+        return m_yield_gen;
+    }
+    void SetYieldCache(s32 core, u64 gen, u8 kind) {
+        m_yield_core = static_cast<s8>(core);
+        m_yield_gen = gen;
+        m_yield_kind = kind;
+    }
+
     void WaitCancel(KernelCore& kernel);
 
     bool IsWaitCancelled() const {
@@ -922,6 +940,9 @@ private:
     KLightLock m_activity_pause_lock;
     SyncObjectBuffer m_sync_object_buffer{};
     s64 m_schedule_count{};
+    u64 m_yield_gen{};
+    s8 m_yield_core{-1};
+    u8 m_yield_kind{};
     s64 m_last_scheduled_tick{};
     std::vector<KThread*> m_pending_started_threads;
     std::atomic<bool> m_entered_kernel{false};
