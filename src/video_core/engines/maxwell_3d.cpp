@@ -33,6 +33,7 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_cb_path.h"
 #include "video_core/nx2_cmdpage_diag.h"
 #include "video_core/nx2_list_dispatch.h"
 #include "video_core/nx2_list_draw.h"
@@ -698,6 +699,12 @@ void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods,
     }
     const VideoCommon::Nx2Profile::FineScope upload_scope{VideoCommon::Nx2Profile::Zone::CbUpload};
     const GPUVAddr destination = address + offset;
+    // EXP88 & 2: through the bound buffer's device address, the device range logged for
+    // FlushCaching, in place of CB_DIRECT's translation and the word-by-word accumulation.
+    if (WriteBoundConstantBuffer(offset, values.data(), static_cast<u32>(bytes))) {
+        regs.const_buffer.offset += static_cast<u32>(bytes);
+        return;
+    }
     // EDEN_NX2_CB_DIRECT (from Skitchii (skolvolt/Lichii) maxwell_3d.cpp CallConstBufferWords):
     // what WriteWordsCached does for words within one device page (proven above) outside Switch 2
     // sparse memory, with one translation (as MemoryManager::Write) instead of WriteBlockImpl's
@@ -1064,7 +1071,8 @@ void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
                             ? regs.const_buffer.size - regs.const_buffer.offset
                             : 0;
     const size_t write_size = std::min(copy_size, room / sizeof(u32) * sizeof(u32));
-    if (write_size != 0) {
+    if (write_size != 0 && !WriteBoundConstantBuffer(regs.const_buffer.offset, start_base,
+                                                     static_cast<u32>(write_size))) {
         const GPUVAddr address{buffer_address + regs.const_buffer.offset};
         memory_manager.WriteBlockCached(address, start_base, write_size);
     }
@@ -1084,6 +1092,65 @@ void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
 
 void Maxwell3D::ProcessCBData(u32 value) {
     ProcessCBMultiData(&value, 1);
+}
+
+bool Maxwell3D::WriteBoundConstantBuffer(u32 offset, const void* data, u32 bytes) {
+    namespace CbPath = VideoCommon::Nx2CbPath;
+    const int mode = CbPath::Mode();
+    if ((mode & CbPath::DirectBit) == 0) {
+        return false;
+    }
+    auto& counters = CbPath::g_counters;
+    const GPUVAddr address = regs.const_buffer.Address();
+    const u32 size = regs.const_buffer.size;
+    const u64 map_serial = memory_manager.MapSerial();
+    BoundConstantBuffer& bound = bound_constant_buffer;
+    // One translation per selection (fable52_answer_next70 3.2): the same bytes reach the same
+    // device memory and the same ranges the same invalidation, translated when written instead
+    // of when flushed; map_serial covers a remap between writes.
+    if (bound.address != address || bound.size != size || bound.map_serial != map_serial) {
+        bound = {address, size, map_serial, 0};
+        if (address != 0 && size != 0 && memory_manager.IsContinuousRange(address, size)) {
+            bound.device = memory_manager.GpuToCpuAddress(address).value_or(0);
+        }
+    }
+    if (bound.device == 0) {
+        CbPath::Count(counters.fallback_device0);
+        return false;
+    }
+    const GPUVAddr begin = address + offset;
+    // Words on Switch 2 sparse memory go the general path (Nx2BackSparseWrite).
+    if (begin + bytes > Tegra::g_nx2_sparse_low.load(std::memory_order_relaxed) &&
+        begin < Tegra::g_nx2_sparse_high.load(std::memory_order_relaxed)) {
+        CbPath::Count(counters.fallback_sparse);
+        return false;
+    }
+    const bool verify = (mode & CbPath::VerifyBit) != 0;
+    memory_manager.WriteConstantBufferData(bound.device + offset, begin, data, bytes, verify);
+    CbPath::Count(counters.direct_writes);
+    if (verify) {
+        // The bytes read back through the general path's translation.
+        std::array<u8, 256> read;
+        bool differs = false;
+        for (u32 done = 0; done < bytes;) {
+            const u32 amount = (std::min<u32>)(bytes - done, static_cast<u32>(read.size()));
+            memory_manager.ReadBlockUnsafe(begin + done, read.data(), amount);
+            differs |= std::memcmp(read.data(), static_cast<const u8*>(data) + done, amount) != 0;
+            done += amount;
+        }
+        CbPath::Count(counters.verify_direct_checked);
+        if (differs) {
+            CbPath::Count(counters.verify_direct_mismatch);
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                LOG_ERROR(HW_GPU,
+                          "EXP88 verify: constant buffer data at {:#x}+{:#x} (device {:#x}) "
+                          "reads back different",
+                          begin, bytes, bound.device + offset);
+            }
+        }
+    }
+    return true;
 }
 
 void Maxwell3D::ProcessInlineIndexMultiData(u32 method, const u32* start_base, u32 amount) {

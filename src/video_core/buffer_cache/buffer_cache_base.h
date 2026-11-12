@@ -265,6 +265,29 @@ public:
     /// when the memory is going away).
     void WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu_data = true);
 
+    /// EXP88 & 1 (zortos293/Lichii#1441 part c, fable52_answer_next70 3.1): why WriteMemory of
+    /// [device_addr, device_addr + size) may change something, or None when it would only make
+    /// its first three marks (NoteWriteUnlocked): no page ever left the CPU-modified state (so
+    /// none is tracked, cached-written or GPU-modified), no GPU write ever marked one (Switch 2
+    /// titles; so no gpu_modified_ranges there) and no enabled vertex binding overlaps the range
+    /// (MarkVertexBuffersStale would act). Drawing thread only (v_buffer is its state), without
+    /// the lock.
+    enum class WriteReach : u8 { None, EverSynchronized, MayBeGpuWritten, VertexBinding };
+    [[nodiscard]] WriteReach WriteReachesBuffers(DAddr device_addr, u64 size) const;
+
+    /// EXP88: what WriteMemory does first, on a range WriteReachesBuffers answers None for: the
+    /// command list note and the two page-flag marks the native bank check and the write watch
+    /// read (g_buffer_write_pages, g_watch_write_pages). Atomics or their own mutex; no lock.
+    void NoteWriteUnlocked(DAddr device_addr, u64 size);
+
+    /// EXP88 & 4, under the lock: WriteMemory of the range would change nothing but its first
+    /// three marks (no GPU-modified range on its pages, every page untouched, no vertex binding).
+    [[nodiscard]] bool WriteChangesNothing(DAddr device_addr, u64 size);
+
+    /// EXP88: whether ClaimCpuWrites may find anything in `ranges` (a page ever marked
+    /// GPU-modified). Without the lock.
+    [[nodiscard]] bool ClaimMayFindGpuWrites(std::span<const std::pair<DAddr, u64>> ranges) const;
+
     void CachedWriteMemory(DAddr device_addr, u64 size);
 
     /// Cancels pending downloads over the range (fences' and, with EDEN_NX2_EXP49, reads'), so

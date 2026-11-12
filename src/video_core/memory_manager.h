@@ -152,6 +152,13 @@ public:
     void WriteBlockCached(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size);
     /// WriteBlockCached of `count` consecutive words within one device page, in a single write.
     void WriteWordsCached(GPUVAddr gpu_dest_addr, const u32* words, std::size_t count);
+    /// EXP88 & 2 (zortos293/Lichii#1441 parts a and b): constant buffer data written at
+    /// `device_addr`, which the caller translated from `gpu_addr` (one mapped device range, not
+    /// Switch 2 sparse memory): what WriteBlockCached does, without its page walk, and with the
+    /// device range logged for FlushCaching instead of the GPU range accumulated (32-byte
+    /// rounded as the accumulator rounds, merged with the last range when they touch).
+    void WriteConstantBufferData(DAddr device_addr, GPUVAddr gpu_addr, const void* data,
+                                 std::size_t size, bool verify);
 
     /**
      * Checks if a gpu region can be simply read with a pointer.
@@ -332,6 +339,16 @@ private:
 
     const size_t unique_identifier;
     VideoCommon::InvalidationAccumulator accumulator;
+    /// EXP88 & 2: device ranges WriteConstantBufferData wrote since the last FlushCaching.
+    boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> constant_buffer_writes;
+    /// EXP88 & 4: those writes one by one, translated again at FlushCaching.
+    struct ConstantBufferVerify {
+        GPUVAddr gpu_addr;
+        DAddr device_addr;
+        std::size_t size;
+        u64 map_serial;
+    };
+    std::vector<ConstantBufferVerify> constant_buffer_verify;
 
     static std::atomic<size_t> unique_identifier_generator;
 

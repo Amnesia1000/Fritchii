@@ -3313,6 +3313,12 @@ public:
     /// Handles a write to the CB_DATA[i] register.
     void ProcessCBData(u32 value);
     void ProcessCBMultiData(const u32* start_base, u32 amount);
+    /// EXP88 & 2 (zortos293/Lichii#1441 part a): writes constant buffer data at `offset`
+    /// (`bytes` within the buffer) through the buffer CB_ADDRESS and CB_SIZE select, translated
+    /// once per selection and memory map (MemoryManager::WriteConstantBufferData). False, having
+    /// done nothing, where the general path has to: the switch is off, the buffer isn't one
+    /// mapped device range, or the write lands on Switch 2 sparse memory.
+    bool WriteBoundConstantBuffer(u32 offset, const void* data, u32 bytes);
 
     void ProcessInlineIndexMultiData(u32 method, const u32* start_base, u32 amount);
 
@@ -3425,6 +3431,15 @@ private:
     bool IsMethodExecutable(u32 method);
 
     MemoryManager& memory_manager;
+
+    /// EXP88 & 2: the constant buffer WriteBoundConstantBuffer last translated (zortos' TIC and
+    /// TSC parts left out: they serve its fast draw, which we don't have).
+    struct BoundConstantBuffer {
+        GPUVAddr address{};
+        u32 size{};
+        u64 map_serial{};
+        DAddr device{}; ///< 0: the general path writes its data
+    } bound_constant_buffer;
 
     VideoCore::RasterizerInterface* rasterizer = nullptr;
 

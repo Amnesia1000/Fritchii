@@ -387,6 +387,29 @@ struct WordManager {
         return whole;
     }
 
+    /// EXP88 verify: every page of the range CPU-modified and untracked, none cached-written,
+    /// GPU-modified, Preflushable or hot and clean, so a CPU mark there changes no word.
+    [[nodiscard]] bool IsRegionUntouched(u64 offset, u64 size) const noexcept {
+        const std::span<const u64> cpu_words = Span(Type::CPU);
+        const std::span<const u64> untracked_words = Span(Type::Untracked);
+        const std::span<const u64> cached_words = Span(Type::CachedCPU);
+        const std::span<const u64> gpu_words = Span(Type::GPU);
+        const std::span<const u64> preflush_words = Span(Type::Preflushable);
+        const std::span<const u64> hot_clean_words = Span(Type::HotClean);
+        bool untouched = true;
+        IterateWords(offset, size, [&](size_t index, u64 mask) {
+            if ((cpu_words[index] & mask) != mask || (untracked_words[index] & mask) != mask ||
+                ((cached_words[index] | gpu_words[index] | preflush_words[index] |
+                  hot_clean_words[index]) &
+                 mask) != 0) {
+                untouched = false;
+                return true;
+            }
+            return false;
+        });
+        return untouched;
+    }
+
     /// @brief Returns a begin end pair with the inclusive modified region
     /// @param offset Offset in bytes from the start of the buffer
     /// @param size   Size in bytes of the region to query for modifications
