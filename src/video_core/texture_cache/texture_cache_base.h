@@ -171,6 +171,10 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     bool debug_stats{true}; ///< Collect what only the debug statistics lines use
     /// EDEN_NX2_MEM_TRACE: when the last memory trace lines were logged.
     std::chrono::steady_clock::time_point mem_trace_time{};
+    /// EDEN_NX2_EXP90: image LRU touches made and skipped since the last report, and its time.
+    u64 nx2_lru_touches{};
+    u64 nx2_lru_touches_skipped{};
+    std::chrono::steady_clock::time_point nx2_lru_touch_report{};
 
     static constexpr s64 DEFAULT_EXPECTED_MEMORY = 1_GiB + 125_MiB;
     static constexpr s64 DEFAULT_CRITICAL_MEMORY = 1_GiB + 625_MiB;
@@ -385,6 +389,9 @@ public:
 
     /// Prepare an image to be used
     void PrepareImage(ImageId image_id, bool is_modification, bool invalidate);
+
+    /// Moves the image to the young end of the LRU (EDEN_NX2_EXP90: once a frame per image).
+    void TouchImageLru(ImageBase& image) noexcept;
 
     /// EDEN_NX2_EXP32 (texture binding memo, after zortos293/Lichii#717's BINDMEMO): what the
     /// graphics texture bindings of a draw are resolved against. With the same state, the same

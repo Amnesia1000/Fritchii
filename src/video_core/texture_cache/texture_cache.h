@@ -794,6 +794,24 @@ void TextureCache<P>::TickFrame() {
 
     runtime.TickFrame();
     ++frame_tick;
+    if (const int lru_switch = VideoCore::Nx2Debug::Experiment(90); lru_switch != 0) {
+        const auto now = std::chrono::steady_clock::now();
+        if (nx2_lru_touch_report == std::chrono::steady_clock::time_point{}) {
+            nx2_lru_touch_report = now;
+        } else if (now - nx2_lru_touch_report >= std::chrono::seconds{5}) {
+            const u64 all = nx2_lru_touches + nx2_lru_touches_skipped;
+            LOG_INFO(HW_GPU,
+                     "Image LRU touch (EXP90={}) in 5 s: {} touched, {} skipped ({:.1f}% of {})",
+                     lru_switch, nx2_lru_touches, nx2_lru_touches_skipped,
+                     all != 0 ? 100.0 * static_cast<double>(nx2_lru_touches_skipped) /
+                                    static_cast<double>(all)
+                              : 0.0,
+                     all);
+            nx2_lru_touch_report = now;
+            nx2_lru_touches = 0;
+            nx2_lru_touches_skipped = 0;
+        }
+    }
     // Prepared render targets skip the LRU touch of their images: keep them to one frame.
     ++bindings_epoch;
     if (VideoCore::Nx2Debug::Experiment(31) != 0 && frame_tick % 600 == 0) {
@@ -1518,7 +1536,7 @@ void TextureCache<P>::TouchTextureMemoView(ImageViewId view) noexcept {
     }
     ImageBase& image = slot_images[image_view.image_id];
     CheckCrossFrameUse(image, false, false); // as PrepareImage(id, false, false) would
-    lru_cache.Touch(image.lru_index, frame_tick);
+    TouchImageLru(image);
 }
 
 template <class P>
@@ -5106,8 +5124,8 @@ std::pair<u32, u32> TextureCache<P>::PrepareDmaImage(ImageId dst_id, GPUVAddr ba
     const auto& image = slot_images[dst_id];
     const auto base = image.TryFindBase(base_addr);
     PrepareImage(dst_id, mark_as_modified, false);
-    const auto& new_image = slot_images[dst_id];
-    lru_cache.Touch(new_image.lru_index, frame_tick);
+    auto& new_image = slot_images[dst_id];
+    TouchImageLru(new_image);
     return std::make_pair(base->level, base->layer);
 }
 
@@ -5448,6 +5466,7 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
     image.flags |= ImageFlagBits::Registered;
     total_used_memory += ImageMemoryBytes(slot_images[image_id]);
     image.lru_index = lru_cache.Insert(image_id, frame_tick);
+    image.lru_touched_tick = ~u64{0};
 
     ForEachGPUPage(image.gpu_addr, image.guest_size_bytes, [this, image_id](u64 page) {
         (*channel_state->gpu_page_table)[page].push_back(image_id);
@@ -6458,6 +6477,23 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
             ++bindings_epoch;
         }
         MarkModification(image);
+    }
+    TouchImageLru(image);
+}
+
+template <class P>
+void TextureCache<P>::TouchImageLru(ImageBase& image) noexcept {
+    // EDEN_NX2_EXP90 (Fable, fable52_answer_after88 2): decide from the image's own field, which
+    // PrepareImage has just read, instead of the LRU node (a cache miss) on every use. The node
+    // already ignores a second touch with the same tick (LeastRecentlyUsedCache::Touch), so the
+    // LRU order and ticks stay exactly what they were.
+    if (VideoCore::Nx2Debug::Experiment(90) != 0) {
+        if (image.lru_touched_tick == frame_tick) {
+            ++nx2_lru_touches_skipped;
+            return;
+        }
+        image.lru_touched_tick = frame_tick;
+        ++nx2_lru_touches;
     }
     lru_cache.Touch(image.lru_index, frame_tick);
 }
