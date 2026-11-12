@@ -447,6 +447,16 @@ inline std::atomic<int> g_qmd_3d_patch{-1};
 /// collector's device memory figure, as deleted images waiting for the GPU are. Logs "Image pool
 /// (EXP42) last 600 frames" and counts pooled creates in "Slow clear texture cache". 1 is the default
 /// (LoadExperiments); 0 = off.
+/// EXP79 (live, 0 = off; port of zortos293/Lichii#1373 cedfc26f47; Kernel::PhysicalCore::Idle):
+/// a guest core going idle polls its interrupt flag in a hardware wait (MONITORX/MWAITX on AMD,
+/// UMONITOR/UMWAIT on Intel, Common::WaitForFlag; yields elsewhere) instead of a spin of yields
+/// (or EDEN_NX2_IDLE_PAUSE's pauses), so Interrupt's store ends the poll at once and the core
+/// issues nothing meanwhile. The poll length adapts per core (Common::NextPollWindow, the
+/// cpuidle-haltpoll rule): a period a longer poll would have caught doubles it, one past
+/// EDEN_NX2_IDLE_SPIN_US (the limit, 100 us for Switch 2) halves it, down to an eighth of the
+/// limit. EDEN_NX2_IDLE_STATS=1 logs each core's idle periods every 10 s (polled, blocked, wake
+/// latency). Blocking still uses EDEN_NX2_CORE_LOCK's address wait when that is on. In OoT the
+/// guest threads' handoffs sit on the frame's critical path. Off by default.
 /// EXP81 (live, frames, 0 = off; fable52_answer_readback_card 3; BufferCache TickFrame and
 /// GetFlushArea): with EXP69's Preflushable reset, unmark only the pages the CPU has not read for
 /// this many frames (each CPU read through GetFlushArea stamps its pages). Unmarking every page
