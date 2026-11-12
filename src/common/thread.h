@@ -21,10 +21,19 @@ namespace Common {
 
 class Event {
 public:
+#ifdef _WIN32
+    ~Event();
+#endif
+
     void Set() {
         std::scoped_lock lk{mutex};
         if (!is_set) {
             is_set = true;
+#ifdef _WIN32
+            if (sleepers != 0) {
+                WakeSleeper();
+            }
+#endif
             condvar.notify_one();
         }
     }
@@ -36,6 +45,11 @@ public:
     }
 
     bool WaitFor(const std::chrono::nanoseconds time);
+
+    /// Like WaitFor, but always blocks in the OS. On Windows, WaitFor keeps the thread running
+    /// in a hardware wait; this sleeps on a high-resolution waitable timer instead (from
+    /// zortos293/Lichii; only Tegra::Nx2PendingWake uses it, under EDEN_NX2_GPU_WAKE).
+    bool SleepFor(const std::chrono::nanoseconds time);
 
     template<class Clock, class Duration>
     bool WaitUntil(const std::chrono::time_point<Clock, Duration> time) {
@@ -58,9 +72,17 @@ public:
     }
 
 private:
+#ifdef _WIN32
+    void WakeSleeper();
+#endif
+
     alignas(64) std::atomic<bool> is_set{false};
     std::condition_variable condvar;
     std::mutex mutex;
+#ifdef _WIN32
+    void* sleep_wake{}; ///< SleepFor's wake event, made on its first use
+    u32 sleepers{};     ///< Threads in SleepFor; Set signals sleep_wake only then
+#endif
 };
 
 class Barrier {
@@ -153,6 +175,7 @@ constexpr std::chrono::nanoseconds NextPollWindow(std::chrono::nanoseconds poll,
 /// user-mode wait on an address (MWAITX on AMD, UMWAIT on Intel) the thread waits in it: a store to
 /// the flag's cache line ends the wait within a few hundred nanoseconds, and the core neither
 /// issues instructions nor enters the OS meanwhile. Other CPUs yield until then.
+/// (zortos293/Lichii#1373; only Tegra::Nx2PendingWake uses it, under EDEN_NX2_GPU_WAKE.)
 bool WaitForFlag(const std::atomic<bool>& flag, std::chrono::steady_clock::time_point deadline);
 
 } // namespace Common
