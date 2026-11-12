@@ -841,6 +841,11 @@ inline void LoadExperiments() {
         // daytime market (orbit, uncapped): back 8.09 -> 7.69 us per draw, method 175.4 -> 163.2
         // ms/s, 58.7 -> 60.8 fps same session, 1% low 38.8 -> 40.4; picture normal.
         g_experiments[85].store(3, std::memory_order_relaxed);
+        // EXP79 = 1 (2026-11-12, overnight; zortos293/Lichii#1373): guest cores wait for work in
+        // hardware. Judged earlier in runs that mixed the market's two phases (no gain); inside the
+        // heavy phase only (orbit, uncapped, 8 x 25 s): 56.5 -> 58.6 fps, 1% low 39.2 -> 40.4,
+        // back 8.04 -> 7.81 us per draw. Timing only, no rendering change.
+        g_experiments[79].store(1, std::memory_order_relaxed);
         // EXP49 = 1 (2026-11-10, owner's call for v5.7): the async read-back. Stalchild fight,
         // flipped every 30 s while the owner fought: 51.9 -> 56.9 fps, the back's read flushes
         // 35 -> 6 ms/s, guest lock waits halved. No beams in that session or two later ones
