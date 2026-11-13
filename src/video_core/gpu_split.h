@@ -39,6 +39,10 @@ class EngineInterface;
 
 namespace VideoCommon {
 
+/// Writer ranges compared by GpuSplit::WritersMayWriteSince scans (logged with the front DMA
+/// snapshot line): what the larger scan limit costs the front.
+inline std::atomic<u64> g_writer_ranges_compared{0};
+
 /// Why the split's front waited for its back (EDEN_NX2_GPU_PROFILE counts each).
 enum class DrainSite : u32 {
     Other,
@@ -568,10 +572,13 @@ public:
                                             u64* checked = nullptr,
                                             ListedWrites* listed = nullptr,
                                             WriterCheck* why = nullptr) const {
-        const auto answer = [why](WriterCheck reason) {
+        u64 compared = 0;
+        const auto answer = [why, &compared](WriterCheck reason) {
             if (why != nullptr) {
                 *why = reason;
             }
+            // Ranges compared by these scans: the front time a larger MaxWriterScan costs.
+            g_writer_ranges_compared.fetch_add(compared, std::memory_order_relaxed);
             return reason != WriterCheck::Miss;
         };
         if (last_unbounded_writer_position > since) {
@@ -591,6 +598,7 @@ public:
                 return answer(WriterCheck::ScanLimit);
             }
             const WriterRange& range = writer_ranges[(index - 1) % writer_ranges.size()];
+            ++compared;
             if (range.position <= since) {
                 reached = true;
                 break;
@@ -1244,8 +1252,12 @@ private:
         u64 end;
         WriterKind kind; ///< For EXP13=2's wait histogram
     };
-    std::array<WriterRange, 1024> writer_ranges{};
-    static constexpr u64 MaxWriterScan = 512;
+    // 8,192 / 4,096 (was 1,024 / 512): at the Castle Town pot room ~11,500 ranges are noted a
+    // second (compute inline uploads), so a page read every few frames was always past the
+    // old limit and every front DMA read of it drained. Both numbers only bound work: past
+    // them the answer is "may write" without looking, so a larger limit is exact.
+    std::array<WriterRange, 8192> writer_ranges{};
+    static constexpr u64 MaxWriterScan = 4096;
     u64 writer_range_count{};
     u64 last_unbounded_writer_position{};
     std::array<u64, static_cast<size_t>(WriterKind::Count)> unbounded_writers{};

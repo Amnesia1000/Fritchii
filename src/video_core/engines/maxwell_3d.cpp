@@ -3753,7 +3753,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                                  "nothing, unbounded: {} pending map, {} sparse, {} unmapped "
                                  "reduction, {} split; page scan misses: {} overlap (no list), "
                                  "{} past the scan, {} left the ring; {} byte list merges; {} "
-                                 "ranges noted",
+                                 "ranges noted, {} ranges compared by the scans",
                                  writer_unbounded + writer_overlaps + byte_overlaps +
                                      dispatch_drains,
                                  writer_unbounded, writer_overlaps, byte_overlaps,
@@ -3772,7 +3772,9 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                                  writer_checks[static_cast<size_t>(WriterCheck::Overlap)],
                                  writer_checks[static_cast<size_t>(WriterCheck::ScanLimit)],
                                  writer_checks[static_cast<size_t>(WriterCheck::Forgotten)],
-                                 byte_merges, split.NotedWriterRanges());
+                                 byte_merges, split.NotedWriterRanges(),
+                                 VideoCommon::g_writer_ranges_compared.load(
+                                     std::memory_order_relaxed));
                     }
                 }
                 if (census_read) [[unlikely]] {
