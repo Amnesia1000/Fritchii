@@ -919,6 +919,9 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
     EndPendingOperations();
     InvalidateState();
 
+    // FRITCHII_MEMSTAGE_TICKS: everything this tick holds is recorded; the memory stage
+    // publishes which packet numbers it covers (vk_mem_stage.cpp, "Packet ticks").
+    SeamHook::TickEnd(master_semaphore->CurrentTick());
     const u64 signal_value = master_semaphore->NextTick();
     // The recording thread's hand-off of this tick to the worker (and the GPU).
     if (Common::Nx2Timeline::Active()) {

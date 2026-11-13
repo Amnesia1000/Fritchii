@@ -305,7 +305,14 @@ void BufferCache<P>::TickFrame() {
         RunGarbageCollector(total_used_memory >= critical_memory);
     }
     ++frame_tick;
-    delayed_destruction_ring.Tick();
+    // Deleted buffers wait their frames, and with FRITCHII_MEMSTAGE_TICKS also the packet they
+    // were deleted in: frames are the stage's, and the GPU thread may not have played that far.
+    if constexpr (IS_OPENGL) {
+        delayed_destruction_ring.Tick([](u64) { return true; });
+    } else {
+        runtime.NoteHeldBuffers(delayed_destruction_ring.Tick(
+            [this](u64 stamp) { return runtime.DeletedBufferFree(stamp); }));
+    }
 
     // EDEN_NX2_EXP49: read downloads no thread waited for (the other ranges the guest read
     // before) land once the host GPU ran them.
@@ -2917,7 +2924,7 @@ bool BufferCache<P>::BindSmallUniformKeeping(size_t stage, u32 index, u32 bindin
         const DAddr end = device_addr + size;
         const u64 first_page = device_addr >> Core::DEVICE_PAGEBITS;
         const u64 last_page = (end - 1) >> Core::DEVICE_PAGEBITS;
-        const u64 tick = runtime.CurrentTick();
+        const u64 tick = runtime.StreamEpoch();
 
         // 3.5: whether the slot's keep may be bound without reading guest memory.
         u64 scanned = 0;
@@ -5670,7 +5677,13 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
 #ifdef YUZU_LEGACY
     if (!do_not_mark || !immediately_free)
 #endif
-        delayed_destruction_ring.Push(std::move(slot_buffers[buffer_id]));
+        delayed_destruction_ring.Push(std::move(slot_buffers[buffer_id]), [this] {
+            if constexpr (IS_OPENGL) {
+                return u64{0};
+            } else {
+                return runtime.CurrentTick();
+            }
+        }());
 
     slot_buffers.erase(buffer_id);
 }

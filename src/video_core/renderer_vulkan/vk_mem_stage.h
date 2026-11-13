@@ -325,6 +325,11 @@ public:
         return player;
     }
 
+    /// FRITCHII_MEMSTAGE_TICKS >= 1: the packet numbers and published ticks; null at 0.
+    [[nodiscard]] SeamTicks* Ticks() const noexcept {
+        return ticks.get();
+    }
+
     /// Runs `fill` in a fill bracket, then plays: for the calls that return a buffer the caller
     /// records with.
     template <typename Func>
@@ -452,6 +457,7 @@ public:
 private:
     friend class SeamClock;
     friend void SeamHook::OnUse(SeamHook::Use use, const std::source_location& location);
+    friend void SeamHook::OnTickEnd(u64 tick);
     friend void VideoCommon::MemReadLog::NoteBytes(VideoCommon::MemReadLog::Kind,
                                                    Tegra::MaxwellDeviceMemoryManager&, u64, u64);
     friend void VideoCommon::MemReadLog::NoteStaged(VideoCommon::MemReadLog::Kind,
@@ -596,6 +602,8 @@ private:
     u32 last_entry{~0U};
 
     u64 packet_number{};
+    std::unique_ptr<SeamTicks> ticks;
+    u64 op_number{};
     DrawPacket draw{};
     DispatchPacket dispatch{};
     OpPacket op{};

@@ -156,14 +156,28 @@ public:
         return vertex_repack_mask;
     }
 
+    /// The clock's stamp (SeamClock: a scheduler tick, or a packet number with
+    /// FRITCHII_MEMSTAGE_TICKS). IsFree, Wait, WaitSubmittedTick, WaitForHostRead and IsFreeNow
+    /// take these, as does what SubmitForHostRead returns.
     u64 CurrentTick();
 
     bool IsFree(u64 tick);
 
     void Wait(u64 tick);
 
+    /// Changes exactly when the scheduler's tick does (one thread): the stream uniform reuse's
+    /// "the stream copy is still there" test (vk_mem_stage.cpp, "Packet ticks").
+    [[nodiscard]] u64 StreamEpoch() const noexcept {
+        return clock.Epoch();
+    }
+
+    /// Whether a buffer deleted at `stamp` may be destroyed once its frames have passed.
+    [[nodiscard]] bool DeletedBufferFree(u64 stamp);
+    void NoteHeldBuffers(u64 newly_held);
+
     /// Waits for a submitted tick without flushing: safe on threads other than the GPU thread.
     void WaitSubmittedTick(u64 tick, u64 writer = 0);
+    /// `tick`: a scheduler tick (WaitSubmittedTick translated the stamp).
     void WaitSubmittedTickImpl(u64 tick);
 
     void Finish();
