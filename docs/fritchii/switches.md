@@ -257,6 +257,19 @@ vertex programs join their handle programs. Read once, on first use (PipelineCac
 constructor, after nx2_switches.txt is applied): it changes what shaders translate to, so it
 is not live. Off, translation and binding are exactly what they were before the port.
 
+### FRITCHII_MEMSTAGE_SPLIT_ALLOC
+
+FRITCHII_MEMSTAGE_SPLIT_ALLOC (boot, default on, =0 off; Fable's ideal pipeline design 2.4,
+build step 3): the buffer cache runtime gets a VMA allocator of its own (Device::
+GetBufferAllocator) and a staging pool of its own on it, so the future memory stage can own
+them on its thread. On it: the buffer cache's buffers (EXP104's pool included), quad and
+uint8 index buffers, vertex repack and multi-range buffers, list and null buffers, the uniform
+stream and buffer uploads and downloads. Images, the texture cache, query cache, descriptors,
+mesh emulation, upscalers and diagnostics stay on the main allocator and staging pool. Nothing
+is reserved twice: the two staging pools split the one stream buffer (64 MiB each instead of
+128 MiB for one; regions 4 MiB instead of 8), EXP104's byte caps count both pools' recyclers
+together, and the new allocator takes no memory until used. Read once when the device is made.
+
 ## Numbered experiments (EDEN_NX2_EXPn)
 
 Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP79, live through the debug server:

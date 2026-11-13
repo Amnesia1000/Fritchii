@@ -36,8 +36,8 @@ class Scheduler;
 /// allocator is externally synchronized), and so does every destroy here. The lists have a
 /// mutex anyway, in case a guest-thread read-back path ever takes a staging buffer.
 ///
-/// Not done (Fable 2.4, step 3): a second VMA allocator for the memory stage's buffers. This
-/// pool would then sit on that allocator, used by the stage alone.
+/// FRITCHII_MEMSTAGE_SPLIT_ALLOC: each staging pool has its own recycler on its own allocator;
+/// the byte caps count all recyclers together.
 class BufferRecycler {
 public:
     enum class Family : u32 {

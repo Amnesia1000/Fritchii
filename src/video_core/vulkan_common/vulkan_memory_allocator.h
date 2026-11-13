@@ -94,10 +94,11 @@ namespace Vulkan {
          * Construct memory allocator
          *
          * @param device_  Device to allocate from
+         * @param buffers  Use the device's buffer allocator (Device::GetBufferAllocator)
          *
          * @throw vk::Exception on failure
          */
-        explicit MemoryAllocator(const Device &device_);
+        explicit MemoryAllocator(const Device &device_, bool buffers = false);
 
         ~MemoryAllocator();
 

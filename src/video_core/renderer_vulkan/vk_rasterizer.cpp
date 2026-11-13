@@ -335,8 +335,16 @@ bool MemoryOwnersEnabled() {
 /// read here. All in MiB. The residual is the private working set less what the line attributes
 /// to the host side; its terms are estimates and may overlap (driver heaps among the heaps, VMA's
 /// host heap not all resident), so a negative residual means overlap, not an error.
+/// `buffer_staging`: the buffer cache's own staging pool (FRITCHII_MEMSTAGE_SPLIT_ALLOC), counted
+/// with the other in the staging numbers; null when there is one pool.
 void LogMemoryOwners(const Device& device, PipelineCache& pipeline_cache,
-                     StagingBufferPool& staging_pool) {
+                     StagingBufferPool& staging_pool, StagingBufferPool* buffer_staging) {
+    const auto cached = [&](MemoryUsage usage) {
+        return staging_pool.CachedBytes(usage) +
+               (buffer_staging != nullptr ? buffer_staging->CachedBytes(usage) : 0);
+    };
+    const u64 stream_bytes = staging_pool.StreamBufferBytes() +
+                             (buffer_staging != nullptr ? buffer_staging->StreamBufferBytes() : 0);
     constexpr u64 PipelineBytes = u64{460} << 10; // ~0.45 MB of driver memory each
     const Common::ProcessMemoryUsage process = Common::GetProcessMemoryUsage();
     const auto commit = Common::HostMemory::GetCommitStats();
@@ -374,10 +382,9 @@ void LogMemoryOwners(const Device& device, PipelineCache& pipeline_cache,
              pipelines.awaiting_destruction, mib(pipeline_estimate),
              mib(pipelines.cache_data_bytes), mib(heaps.host_usage), mib(heaps.host_budget),
              mib(heaps.host_blocks), mib(heaps.local_usage), mib(heaps.local_budget),
-             mib(staging_pool.CachedBytes(MemoryUsage::Upload)),
-             mib(staging_pool.CachedBytes(MemoryUsage::Download)),
-             mib(staging_pool.CachedBytes(MemoryUsage::DeviceLocal)),
-             mib(staging_pool.StreamBufferBytes()), mib(win32_heaps.crt_committed),
+             mib(cached(MemoryUsage::Upload)), mib(cached(MemoryUsage::Download)),
+             mib(cached(MemoryUsage::DeviceLocal)), mib(stream_bytes),
+             mib(win32_heaps.crt_committed),
              mib(win32_heaps.crt_allocated), win32_heaps.heaps > 0 ? win32_heaps.heaps - 1 : 0,
              mib(win32_heaps.other_committed), mib(win32_heaps.other_allocated),
              win32_heaps.micros, residual / (s64{1} << 20));
@@ -529,7 +536,18 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
                                    StateTracker& state_tracker_, Scheduler& scheduler_)
     : gpu{gpu_}, device_memory{device_memory_}, device{device_},
       memory_allocator{memory_allocator_}, state_tracker{state_tracker_}, scheduler{scheduler_},
-      staging_pool(device, memory_allocator, scheduler), descriptor_pool(device, scheduler),
+      staging_pool(device, memory_allocator, scheduler, device.HasSplitAllocators() ? 2 : 1),
+      split_buffer_allocator{device.HasSplitAllocators()
+                                 ? std::make_unique<MemoryAllocator>(device, true)
+                                 : nullptr},
+      split_buffer_staging{split_buffer_allocator ? std::make_unique<StagingBufferPool>(
+                                                        device, *split_buffer_allocator,
+                                                        scheduler, 2)
+                                                  : nullptr},
+      buffer_memory_allocator{split_buffer_allocator ? *split_buffer_allocator
+                                                     : memory_allocator},
+      buffer_staging_pool{split_buffer_staging ? *split_buffer_staging : staging_pool},
+      descriptor_pool(device, scheduler),
       guest_descriptor_queue(device, UpdateDescriptorQueue::GUEST_FRAME_PAYLOAD_SIZE,
                              device.IsExtDescriptorBufferSupported()),
       compute_pass_descriptor_queue(device, UpdateDescriptorQueue::COMPUTE_FRAME_PAYLOAD_SIZE),
@@ -539,7 +557,7 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
           device,     scheduler,         memory_allocator, staging_pool,
           blit_image, render_pass_cache, descriptor_pool,  compute_pass_descriptor_queue},
       texture_cache(texture_cache_runtime, device_memory),
-      buffer_cache_runtime(device, memory_allocator, scheduler, staging_pool,
+      buffer_cache_runtime(device, buffer_memory_allocator, scheduler, buffer_staging_pool,
                            guest_descriptor_queue, compute_pass_descriptor_queue, descriptor_pool),
       buffer_cache(device_memory, buffer_cache_runtime),
       query_cache_runtime(this, device_memory, buffer_cache, device, memory_allocator, scheduler,
@@ -571,13 +589,34 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
                 rasterizer->texture_cache_runtime.DestroyIdlePooledImages(2);
             }
             // EXP104: evicted pool buffers go the same way, whatever EXP104 is now (switching it
-            // off evicts everything). The allocator stays on the back's thread.
-            if (VideoCommon::GpuSplit::InIdleWait() &&
-                rasterizer->staging_pool.Recycler().HasDoomed()) {
-                rasterizer->staging_pool.Recycler().DestroyIdle(2);
+            // off evicts everything). The allocator stays on the back's thread. With
+            // FRITCHII_MEMSTAGE_SPLIT_ALLOC the buffer cache's recycler first, then the back's:
+            // still at most 2 a call.
+            if (VideoCommon::GpuSplit::InIdleWait()) {
+                BufferRecycler& buffers = rasterizer->buffer_staging_pool.Recycler();
+                BufferRecycler& others = rasterizer->staging_pool.Recycler();
+                if (buffers.HasDoomed()) {
+                    buffers.DestroyIdle(2);
+                } else if (others.HasDoomed()) {
+                    others.DestroyIdle(2);
+                }
             }
         },
         this);
+    if (split_buffer_allocator) {
+        LOG_INFO(Render_Vulkan,
+                 "Memory stage split allocators on (FRITCHII_MEMSTAGE_SPLIT_ALLOC=0 turns it off): "
+                 "buffer allocator owns the buffer cache's buffers (EXP104 pool, quad and uint8 "
+                 "index, vertex repack, multi-range, list and null buffers) and its staging pool "
+                 "(stream {} MiB, uniform stream and buffer uploads/downloads); main allocator owns "
+                 "images, the texture cache, query cache, descriptors, mesh emulation, upscalers "
+                 "and their staging pool (stream {} MiB)",
+                 buffer_staging_pool.StreamBufferBytes() >> 20,
+                 staging_pool.StreamBufferBytes() >> 20);
+    } else {
+        LOG_INFO(Render_Vulkan, "Memory stage split allocators off: one allocator and one staging "
+                                "pool for everything");
+    }
     VideoCommon::GpuSplit::Get().SetFenceQuietCheck(
         [](void* argument, bool strict, u64* epoch) {
             return static_cast<RasterizerVulkan*>(argument)->FencesQuiet(strict, *epoch);
@@ -4856,7 +4895,7 @@ void RasterizerVulkan::TickFrame() {
         if (const auto now = std::chrono::steady_clock::now();
             now - last_owners_log >= std::chrono::seconds{10}) {
             last_owners_log = now;
-            LogMemoryOwners(device, pipeline_cache, staging_pool);
+            LogMemoryOwners(device, pipeline_cache, staging_pool, split_buffer_staging.get());
         }
     }
     if (VideoCore::Nx2Debug::HasRequests()) {
@@ -4964,6 +5003,9 @@ void RasterizerVulkan::TickFrame() {
     descriptor_buffer_ring.TickFrame();
     fence_manager.TickFrame();
     staging_pool.TickFrame();
+    if (split_buffer_staging) {
+        split_buffer_staging->TickFrame();
+    }
     {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.TickFrame();

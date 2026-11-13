@@ -199,8 +199,8 @@ void MemoryCommit::Release() {
     size = 0;
 }
 
-MemoryAllocator::MemoryAllocator(const Device &device_)
-        : device{device_}, allocator{device.GetAllocator()},
+MemoryAllocator::MemoryAllocator(const Device &device_, bool buffers)
+        : device{device_}, allocator{buffers ? device.GetBufferAllocator() : device.GetAllocator()},
             properties{device_.GetPhysical().GetMemoryProperties().memoryProperties},
             buffer_image_granularity{
                     device_.GetPhysical().GetProperties().limits.bufferImageGranularity} {
@@ -581,7 +581,7 @@ VmaAllocation MemoryAllocator::AllocateSparseMemory(const VkMemoryRequirements &
         vmaFindMemoryTypeIndex(allocator, requirements.memoryTypeBits, &alloc_ci, &memory_type) ==
             VK_SUCCESS) {
         if (const VmaPool pool =
-                device.GetSeparatePool(Device::SeparatePool::SparsePages, memory_type)) {
+                device.GetSeparatePool(allocator, Device::SeparatePool::SparsePages, memory_type)) {
             VmaAllocationCreateInfo pool_ci = alloc_ci;
             pool_ci.pool = pool;
             if (vmaAllocateMemory(allocator, &requirements, &pool_ci, &allocation, &info) ==
@@ -628,7 +628,8 @@ bool MemoryAllocator::CreateBufferInSeparatePool(const VkBufferCreateInfo& ci, M
             return false;
         }
     }
-    const VmaPool pool = device.GetSeparatePool(Device::SeparatePool::DeviceBuffers, memory_type);
+    const VmaPool pool =
+        device.GetSeparatePool(allocator, Device::SeparatePool::DeviceBuffers, memory_type);
     if (pool == VK_NULL_HANDLE) {
         return false;
     }
@@ -915,20 +916,29 @@ void LogMemoryTrace(const Device& device) {
                        budget.statistics.blockBytes >> 20);
     }
     LOG_INFO(Render_Vulkan, "Memory trace: heaps {}", heaps);
-    VmaTotalStatistics stats{};
-    vmaCalculateStatistics(allocator, &stats);
-    std::string types;
-    for (u32 type = 0; type < properties->memoryTypeCount; ++type) {
-        const VmaStatistics& s = stats.memoryType[type].statistics;
-        if (s.blockCount == 0) {
-            continue;
+    // The heaps' VMA numbers above are the main allocator's; with FRITCHII_MEMSTAGE_SPLIT_ALLOC
+    // the buffer allocator's memory types get a line of their own.
+    const auto log_types = [&](VmaAllocator owner, const char* label) {
+        VmaTotalStatistics stats{};
+        vmaCalculateStatistics(owner, &stats);
+        std::string types;
+        for (u32 type = 0; type < properties->memoryTypeCount; ++type) {
+            const VmaStatistics& s = stats.memoryType[type].statistics;
+            if (s.blockCount == 0) {
+                continue;
+            }
+            fmt::format_to(std::back_inserter(types),
+                           "{}{} (heap {}, flags {:#x}): {} allocs {}/{} MiB",
+                           types.empty() ? "" : "; ", type, properties->memoryTypes[type].heapIndex,
+                           static_cast<u32>(properties->memoryTypes[type].propertyFlags),
+                           s.allocationCount, s.allocationBytes >> 20, s.blockBytes >> 20);
         }
-        fmt::format_to(std::back_inserter(types), "{}{} (heap {}, flags {:#x}): {} allocs {}/{} MiB",
-                       types.empty() ? "" : "; ", type, properties->memoryTypes[type].heapIndex,
-                       static_cast<u32>(properties->memoryTypes[type].propertyFlags),
-                       s.allocationCount, s.allocationBytes >> 20, s.blockBytes >> 20);
+        LOG_INFO(Render_Vulkan, "Memory trace: {} {}", label, types);
+    };
+    log_types(allocator, "types");
+    if (device.HasSplitAllocators()) {
+        log_types(device.GetBufferAllocator(), "buffer allocator types");
     }
-    LOG_INFO(Render_Vulkan, "Memory trace: types {}", types);
 }
 
 HeapTotals GetHeapTotals(const Device& device) {
@@ -948,6 +958,23 @@ HeapTotals GetHeapTotals(const Device& device) {
             totals.host_usage += budget.usage;
             totals.host_budget += budget.budget;
             totals.host_blocks += budget.statistics.blockBytes;
+        }
+    }
+    if (device.HasSplitAllocators()) {
+        // FRITCHII_MEMSTAGE_SPLIT_ALLOC: the buffer allocator's blocks too. Its usage only
+        // without VK_EXT_memory_budget: with it, usage is the driver's for the whole process.
+        vmaGetHeapBudgets(device.GetBufferAllocator(), budgets.data());
+        const bool add_usage = !device.CanReportMemoryUsage();
+        for (u32 heap = 0; heap < properties->memoryHeapCount; ++heap) {
+            const VmaBudget& budget = budgets[heap];
+            const u64 usage = add_usage ? budget.usage : 0;
+            if ((properties->memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) {
+                totals.local_usage += usage;
+                totals.local_blocks += budget.statistics.blockBytes;
+            } else {
+                totals.host_usage += usage;
+                totals.host_blocks += budget.statistics.blockBytes;
+            }
         }
     }
     return totals;
@@ -975,6 +1002,14 @@ void LogMemoryStatistics(const Device& device) {
         LOG_INFO(Render_Vulkan, "VMA heap {}: usage {} MiB of budget {} MiB, VMA blocks {} MiB",
                  heap, budgets[heap].usage >> 20, budgets[heap].budget >> 20,
                  budgets[heap].statistics.blockBytes >> 20);
+    }
+    if (device.HasSplitAllocators()) {
+        vmaGetHeapBudgets(device.GetBufferAllocator(), budgets.data());
+        for (u32 heap = 0; heap < properties->memoryHeapCount; ++heap) {
+            LOG_INFO(Render_Vulkan, "VMA heap {}: buffer allocator blocks {} MiB ({} MiB used)",
+                     heap, budgets[heap].statistics.blockBytes >> 20,
+                     budgets[heap].statistics.allocationBytes >> 20);
+        }
     }
 }
 

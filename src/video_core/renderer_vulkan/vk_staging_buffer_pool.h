@@ -34,8 +34,9 @@ class StagingBufferPool {
 public:
     static constexpr size_t NUM_SYNCS = 16;
 
+    /// `stream_divisor`: the stream buffer is its usual size divided by this.
     explicit StagingBufferPool(const Device& device, MemoryAllocator& memory_allocator,
-                               Scheduler& scheduler);
+                               Scheduler& scheduler, u32 stream_divisor = 1);
     ~StagingBufferPool();
 
     /// `caller`: who asks, counted when a buffer has to be created (EDEN_NX2_BUFFER_CHURN_STATS).
@@ -59,7 +60,7 @@ public:
         return stream_buffer_size;
     }
 
-    /// EXP104's pool, shared with the buffer cache (one byte cap for both).
+    /// EXP104's pool, shared with the buffer cache that uses this staging pool.
     [[nodiscard]] BufferRecycler& Recycler() noexcept {
         return recycler;
     }

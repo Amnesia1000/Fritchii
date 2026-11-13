@@ -91,10 +91,14 @@ size_t GetStreamBufferSize(const Device& device) {
 }
 } // Anonymous namespace
 
+// stream_divisor: FRITCHII_MEMSTAGE_SPLIT_ALLOC makes two pools (the buffer cache's and the
+// back's), which split one stream buffer's size between them instead of each taking all of it.
 StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& memory_allocator_,
-                                     Scheduler& scheduler_)
+                                     Scheduler& scheduler_, u32 stream_divisor)
     : device{device_}, memory_allocator{memory_allocator_}, scheduler{scheduler_},
-      recycler{scheduler_}, stream_buffer_size{GetStreamBufferSize(device)},
+      recycler{scheduler_},
+      stream_buffer_size{Common::AlignDown(
+          GetStreamBufferSize(device) / (std::max)(stream_divisor, 1U), MAX_ALIGNMENT)},
       region_size{stream_buffer_size / StagingBufferPool::NUM_SYNCS} {
     VkBufferCreateInfo stream_ci = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -414,12 +418,28 @@ VideoCommon::BufferChurnStats::PoolCounters& GroupCounters(BufferRecycler::Famil
         family == BufferRecycler::Family::Cache ? PoolGroup::Cache : PoolGroup::Staging;
     return VideoCommon::BufferChurnStats::GetPool().group[static_cast<size_t>(group)];
 }
+
+// Every recycler's held and doomed bytes together. FRITCHII_MEMSTAGE_SPLIT_ALLOC gives each staging
+// pool a recycler of its own (a pooled buffer must go back to the allocator that made it), and
+// the caps (MaxHeldBytes, MaxDoomedBytes) stay one cap for all of them, as with a single pool:
+// a recycler over the total evicts its own oldest entries. The gauges show the totals.
+std::atomic<u64> g_total_held_bytes{};
+std::atomic<u64> g_total_held_entries{};
+std::atomic<u64> g_total_doomed_bytes{};
+
+void AddTotals(s64 held_bytes, s64 held_entries, s64 doomed_bytes) noexcept {
+    g_total_held_bytes.fetch_add(static_cast<u64>(held_bytes), std::memory_order_relaxed);
+    g_total_held_entries.fetch_add(static_cast<u64>(held_entries), std::memory_order_relaxed);
+    g_total_doomed_bytes.fetch_add(static_cast<u64>(doomed_bytes), std::memory_order_relaxed);
+}
 } // Anonymous namespace
 
 BufferRecycler::BufferRecycler(Scheduler& scheduler_) : scheduler{scheduler_} {}
 
 BufferRecycler::~BufferRecycler() {
     // Shutdown: the device is idle; the vk::Buffers destroy themselves.
+    AddTotals(-static_cast<s64>(held_bytes), -static_cast<s64>(held_entries),
+              -static_cast<s64>(doomed_bytes));
     held_bytes = held_entries = doomed_bytes = 0;
     PublishGauges();
 }
@@ -459,6 +479,7 @@ vk::Buffer BufferRecycler::Take(Family family, u32 log2, u64* bytes) {
             }
             held_bytes -= entry.bytes;
             --held_entries;
+            AddTotals(-static_cast<s64>(entry.bytes), -1, 0);
             list.pop_front();
             PublishGauges();
         }
@@ -489,9 +510,11 @@ bool BufferRecycler::Give(Family family, vk::Buffer& buffer, u64 bytes) {
     });
     held_bytes += bytes;
     ++held_entries;
+    AddTotals(static_cast<s64>(bytes), 1, 0);
     VideoCommon::BufferChurnStats::PoolAdd(counters.returned);
-    // Over the cap: the entry returned longest ago goes, whatever its class.
-    while (held_bytes > MaxHeldBytes) {
+    // Over the cap (all recyclers): this one's entry returned longest ago goes, whatever its
+    // class.
+    while (g_total_held_bytes.load(std::memory_order_relaxed) > MaxHeldBytes) {
         std::deque<Entry>* oldest = nullptr;
         for (std::deque<Entry>& list : lists) {
             if (!list.empty() &&
@@ -513,6 +536,7 @@ void BufferRecycler::Doom(Entry&& entry) {
     held_bytes -= entry.bytes;
     --held_entries;
     doomed_bytes += entry.bytes;
+    AddTotals(-static_cast<s64>(entry.bytes), -1, static_cast<s64>(entry.bytes));
     VideoCommon::BufferChurnStats::PoolAdd(GroupCounters(entry.family).evicted);
     doomed.push_back(std::move(entry));
     doomed_count.store(doomed.size(), std::memory_order_relaxed);
@@ -547,9 +571,12 @@ size_t BufferRecycler::DestroyDoomed(u64 keep_bytes) {
     std::deque<Entry> destroy;
     {
         std::scoped_lock lock{mutex};
-        while (!doomed.empty() && doomed_bytes > keep_bytes &&
+        // keep_bytes counts every recycler's doomed bytes (one cap for all).
+        while (!doomed.empty() &&
+               g_total_doomed_bytes.load(std::memory_order_relaxed) > keep_bytes &&
                scheduler.IsFree(doomed.front().tick)) {
             doomed_bytes -= doomed.front().bytes;
+            AddTotals(0, 0, -static_cast<s64>(doomed.front().bytes));
             destroy.push_back(std::move(doomed.front()));
             doomed.pop_front();
         }
@@ -575,6 +602,7 @@ void BufferRecycler::DestroyIdle(u32 max) {
                 return;
             }
             doomed_bytes -= doomed.front().bytes;
+            AddTotals(0, 0, -static_cast<s64>(doomed.front().bytes));
             buffer = std::move(doomed.front().buffer);
             doomed.pop_front();
             doomed_count.store(doomed.size(), std::memory_order_relaxed);
@@ -602,9 +630,12 @@ size_t BufferRecycler::DropAll() {
 
 void BufferRecycler::PublishGauges() noexcept {
     VideoCommon::BufferChurnStats::Pool& pool = VideoCommon::BufferChurnStats::GetPool();
-    pool.held_bytes.store(held_bytes, std::memory_order_relaxed);
-    pool.held_entries.store(held_entries, std::memory_order_relaxed);
-    pool.doomed_bytes.store(doomed_bytes, std::memory_order_relaxed);
+    pool.held_bytes.store(g_total_held_bytes.load(std::memory_order_relaxed),
+                          std::memory_order_relaxed);
+    pool.held_entries.store(g_total_held_entries.load(std::memory_order_relaxed),
+                            std::memory_order_relaxed);
+    pool.doomed_bytes.store(g_total_doomed_bytes.load(std::memory_order_relaxed),
+                            std::memory_order_relaxed);
 }
 
 } // namespace Vulkan

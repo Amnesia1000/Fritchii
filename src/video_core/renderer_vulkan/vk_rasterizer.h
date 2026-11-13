@@ -317,6 +317,12 @@ private:
     Scheduler& scheduler;
 
     StagingBufferPool staging_pool;
+    /// FRITCHII_MEMSTAGE_SPLIT_ALLOC: the buffer cache's allocator and staging pool (null when
+    /// off); the references below name them, or memory_allocator and staging_pool.
+    std::unique_ptr<MemoryAllocator> split_buffer_allocator;
+    std::unique_ptr<StagingBufferPool> split_buffer_staging;
+    MemoryAllocator& buffer_memory_allocator;
+    StagingBufferPool& buffer_staging_pool;
     DescriptorPool descriptor_pool;
     GuestDescriptorQueue guest_descriptor_queue;
     ComputePassDescriptorQueue compute_pass_descriptor_queue;
