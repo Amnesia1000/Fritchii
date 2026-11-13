@@ -1118,6 +1118,35 @@ write there arms them again). At the great fairy fountain one game job read ~16 
 frame, each a round trip (~0.4 ms). Check FRITCHII_READ_RUNS=1's "Read runs" line first: the
 run histogram says whether the reads have neighbours to take.
 
+### FRITCHII_READ_RUNS
+
+FRITCHII_READ_RUNS=1 (boot, diagnostic, default off; read_run_stats.h): the guest reads of
+GPU-written memory that go to the back or wait for a download (GPU::OnCPURead past its
+preemptive answer). Every 600 frames two lines:
+
+- "Read runs": each read's kind (flushed, waited for a read download on its way, waited for a
+  fence download on its way), whether it is on the page after the previous one, the
+  GPU-written run around its page, the wait, distinct pages a frame, and EXP112's run flushes.
+- "Read overlap" (fable52_answer_kills 2b): whether the read's own bytes [address, address +
+  size) overlap the GPU-written bytes inside its pages that it waits for, or only share the
+  page(s) with them. Checked in BufferCache::GetFlushArea under the buffer cache's mutex it
+  already holds, against: for a fence download wait (EXP72), pending_download_ranges up to the
+  newest download the read needs; for a read download wait (EXP49 in_flight),
+  read_download_ranges; for a flush, gpu_modified_ranges at the read (what the flush
+  downloads). Per kind as overlap/page only/unknown (unknown: the buffer cache did not answer,
+  e.g. image memory, or EXP60 handed the read off). For page only, the gap to the nearest
+  GPU-written byte (<64 B, <256 B, <1 KiB, <4 KiB; "more" must stay 0). The read size
+  (<=16 B, <=64, <=256, <=4096, more). The wait split by overlap/page only/unknown, in ms a
+  frame and ms a read. "gpu_modified_ranges answers otherwise" counts waits where the download
+  ranges and gpu_modified_ranges disagree (should be near 0).
+
+The GPU-written ranges are what the cache marks: for a dispatch or draw that is the bound
+writable buffer range (cut only by the native store bound, or by EDEN_NX2_WRITTEN_SSBO_MARK_KIB,
+which must be unset for this), not only the bytes the shader stored. So "page only" is as exact
+as the cache's own tracking (no written binding covers the read's bytes), while "overlap" means
+a written binding covers them, not that the shader changed them. Reads after the first one in an area are answered from it (memory.cpp's per-core area)
+and are not seen. Off: one test of a constant at each site.
+
 ### EXP113
 
 EXP113 (live; 0 = off, 1 = no poll, N > 1 = poll at most N us; PhysicalCore::Idle): OoT's

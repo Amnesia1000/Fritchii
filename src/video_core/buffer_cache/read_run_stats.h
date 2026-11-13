@@ -20,6 +20,8 @@
 // from gpu_modified_ranges inside the read's buffer), whether its bytes were already on their
 // way, how long the reader waited, and how many distinct pages a frame reads. It also counts
 // EXP112's run flushes. Off: one test of g_enabled at each site.
+// A second line, "Read overlap", says per read whether its own bytes [address, address + size)
+// overlap the GPU-written bytes it waits for, or only share their page(s) (see ByteCheck).
 namespace VideoCommon::ReadRunStats {
 
 inline const bool g_enabled = [] {
@@ -41,6 +43,59 @@ enum class Kind : u8 {
     FenceDownload, ///< its bytes were in a fence download on its way (EXP72): only waited
 };
 
+/// The read's own bytes against GPU-written byte ranges inside the read's pages.
+enum class Overlap : u8 {
+    Unknown,  ///< not answered from the buffer cache's ranges (an image, or no range there)
+    Bytes,    ///< at least one of the read's bytes is GPU-written
+    PageOnly, ///< none is: the read only shares the page(s) with GPU-written bytes
+};
+
+/// One answer: what the read overlaps and, for PageOnly, the bytes between the read and the
+/// nearest GPU-written byte in its pages (0 = adjacent).
+struct ByteAnswer {
+    Overlap overlap{Overlap::Unknown};
+    u64 gap{};
+};
+
+/// Fed the GPU-written ranges inside the read's pages (clipped to them), one by one.
+struct ByteCheck {
+    u64 begin{}; ///< the read's first byte
+    u64 end{};   ///< one past its last byte
+    bool any{};
+    bool overlap{};
+    u64 gap{std::numeric_limits<u64>::max()};
+
+    void Add(u64 lower, u64 upper) {
+        if (lower >= upper) {
+            return;
+        }
+        any = true;
+        if (lower < end && begin < upper) {
+            overlap = true;
+        } else {
+            gap = (std::min)(gap, upper <= begin ? begin - upper : lower - end);
+        }
+    }
+
+    ByteAnswer Answer() const {
+        if (!any) {
+            return {};
+        }
+        return overlap ? ByteAnswer{Overlap::Bytes, 0} : ByteAnswer{Overlap::PageOnly, gap};
+    }
+};
+
+/// Set by BufferCache::GetFlushArea on the reading thread (its mutex held), cleared by
+/// GPU::OnCPURead before asking. `modified`: against gpu_modified_ranges at the read (what a
+/// flush downloads). `on_way`: against the download already on its way that the read waits for:
+/// pending_download_ranges up to the newest one the read needs (EXP72's fence download), or
+/// read_download_ranges (EXP49's read download, GetFlushArea's in_flight answer).
+struct ReadBytes {
+    ByteAnswer modified;
+    ByteAnswer on_way;
+};
+inline thread_local ReadBytes t_read_bytes{};
+
 /// What the line reports, reset after each line.
 struct Counts {
     u64 reads[3]{};
@@ -54,6 +109,12 @@ struct Counts {
     u64 highest{};
     u64 distinct_pages{}; ///< summed over the window's frames
     u64 repeat_reads{};   ///< reads of a page already read that frame
+    // The "Read overlap" line.
+    u64 overlap[3][3]{};  ///< [Kind][Overlap]
+    u64 overlap_wait_ns[3]{}; ///< [Overlap], all kinds
+    u64 gaps[5]{};        ///< PageOnly: < 64 B, < 256 B, < 1 KiB, < 4 KiB, more
+    u64 sizes[5]{};       ///< <= 16 B, <= 64, <= 256, <= 4096, more
+    u64 modified_differs{}; ///< waited for a download, and gpu_modified_ranges answers otherwise
 };
 
 struct State {
@@ -96,14 +157,31 @@ inline void CountNoRun(NoRun why) {
     }
 }
 
-/// GPU::OnCPURead, once per read past the preemptive answer.
-inline void NoteRead(Kind kind, u64 address, u64 run_pages, u64 wait_ns) {
+/// GPU::OnCPURead, once per read past the preemptive answer. `address` is the read's area start
+/// (page aligned), `size` the read's own size; `bytes` is t_read_bytes as GetFlushArea left it.
+inline void NoteRead(Kind kind, u64 address, u64 run_pages, u64 wait_ns, u64 size,
+                     const ReadBytes& bytes) {
     State& s = Get();
     const u64 page = address >> 12;
     const u64 frame = g_frame.load(std::memory_order_relaxed);
+    // A flush downloads gpu_modified_ranges' bytes; a wait waits for the download on its way.
+    const ByteAnswer& answer = kind == Kind::Flushed ? bytes.modified : bytes.on_way;
     std::scoped_lock lock{s.mutex};
     Counts& c = s.counts;
     ++c.reads[static_cast<size_t>(kind)];
+    ++c.overlap[static_cast<size_t>(kind)][static_cast<size_t>(answer.overlap)];
+    c.overlap_wait_ns[static_cast<size_t>(answer.overlap)] += wait_ns;
+    if (answer.overlap == Overlap::PageOnly) {
+        ++c.gaps[answer.gap < 64     ? 0
+                 : answer.gap < 256  ? 1
+                 : answer.gap < 1024 ? 2
+                 : answer.gap < 4096 ? 3
+                                     : 4];
+    }
+    ++c.sizes[size <= 16 ? 0 : size <= 64 ? 1 : size <= 256 ? 2 : size <= 4096 ? 3 : 4];
+    if (kind != Kind::Flushed && bytes.modified.overlap != answer.overlap) {
+        ++c.modified_differs;
+    }
     if (s.previous_page != std::numeric_limits<u64>::max()) {
         const u64 distance =
             page >= s.previous_page ? page - s.previous_page : s.previous_page - page;
@@ -171,6 +249,32 @@ inline void Log(int run_flush_mode) {
              g_no_run[1].exchange(0, std::memory_order_relaxed),
              g_no_run[2].exchange(0, std::memory_order_relaxed),
              g_no_run[3].exchange(0, std::memory_order_relaxed));
+    constexpr size_t B = static_cast<size_t>(Overlap::Bytes);
+    constexpr size_t P = static_cast<size_t>(Overlap::PageOnly);
+    constexpr size_t U = static_cast<size_t>(Overlap::Unknown);
+    const auto ms_frame = [&](size_t o) {
+        return static_cast<double>(c.overlap_wait_ns[o]) / 1e6 / Frames;
+    };
+    const auto ms_read = [&](size_t o) {
+        const u64 n = c.overlap[0][o] + c.overlap[1][o] + c.overlap[2][o];
+        return n != 0 ? static_cast<double>(c.overlap_wait_ns[o]) / 1e6 / static_cast<double>(n)
+                      : 0.0;
+    };
+    LOG_INFO(HW_GPU,
+             "Read overlap (FRITCHII_READ_RUNS) last 600 frames, the read's own bytes against "
+             "the GPU-written bytes in its pages it waits for (fence download: its pending "
+             "download ranges; read download: read_download_ranges; flushed: gpu_modified_ranges) "
+             "as overlap/page only/unknown: fence download {}/{}/{}, read download {}/{}/{}, "
+             "flushed {}/{}/{} | page only, gap to the nearest GPU-written byte: <64 B {}, "
+             "<256 B {}, <1 KiB {}, <4 KiB {}, more {} | read size <=16 B {}, <=64 {}, <=256 "
+             "{}, <=4096 {}, more {} | waited: overlap {:.2f} ms a frame ({:.3f} ms a read), "
+             "page only {:.2f} ({:.3f}), unknown {:.2f} ({:.3f}) | gpu_modified_ranges answers "
+             "otherwise for {} of the waits",
+             c.overlap[2][B], c.overlap[2][P], c.overlap[2][U], c.overlap[1][B], c.overlap[1][P],
+             c.overlap[1][U], c.overlap[0][B], c.overlap[0][P], c.overlap[0][U], c.gaps[0],
+             c.gaps[1], c.gaps[2], c.gaps[3], c.gaps[4], c.sizes[0], c.sizes[1], c.sizes[2],
+             c.sizes[3], c.sizes[4], ms_frame(B), ms_read(B), ms_frame(P), ms_read(P),
+             ms_frame(U), ms_read(U), c.modified_differs);
     c = Counts{};
 }
 
