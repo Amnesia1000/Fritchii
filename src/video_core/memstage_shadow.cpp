@@ -940,6 +940,30 @@ void Collect(State& s, const Copy& c, GPUVAddr address, u64 size) {
 /// collected for the buffer half (the back's accumulator is not used).
 void StageWriteWords(State& s, Copy& c, GPUVAddr address, const u32* data, u64 size) {
     const Common::WriteRing::SiteScope write_site{"3D constant buffer data (memory stage)", false};
+    // Step 7, the window open: the stage's own ring keeps these writes with their entry (the
+    // read compare leaves them out, the image check looks for them); the emulator's write ring
+    // would only wrap on them over a lead of a frame.
+    MemoryStageLink& link = MemoryStageLink::Get();
+    const bool ahead = MemoryStageLink::Ahead() != 0;
+    struct Quiet {
+        bool was;
+        explicit Quiet(bool on) : was{Common::WriteRing::t_quiet} {
+            Common::WriteRing::t_quiet = was || on;
+        }
+        ~Quiet() {
+            Common::WriteRing::t_quiet = was;
+        }
+    } quiet{ahead};
+    if (ahead) {
+        constexpr u64 Page = 0x1000;
+        for (GPUVAddr piece = address; piece < address + size;) {
+            const GPUVAddr piece_end = (std::min)(address + size, (piece + Page) & ~(Page - 1));
+            if (const std::optional<DAddr> device = c.memory->GpuToCpuAddress(piece)) {
+                link.NoteStageWrite(*device, piece_end - piece, s.processing_position);
+            }
+            piece = piece_end;
+        }
+    }
     if (address + size > Tegra::g_nx2_sparse_low.load(std::memory_order_relaxed) &&
         address < Tegra::g_nx2_sparse_high.load(std::memory_order_relaxed)) {
         for (u64 i = 0; i < size / sizeof(u32); ++i) {

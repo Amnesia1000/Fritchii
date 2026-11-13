@@ -34,6 +34,7 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/memory_stage_link.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_fastdraw_count.h"
 #include "video_core/texture_cache/host_memory_limit.h"
@@ -5966,6 +5967,9 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
             slot_map_views.insert(image.gpu_addr, image.cpu_addr, image.guest_size_bytes, image_id);
         page_filter.Mark(image.cpu_addr, image.guest_size_bytes);
         image_count_filter.Add(image.cpu_addr, image.guest_size_bytes);
+        // Memory stage step 7 (risk 9.1): a constant buffer write the stage made ahead of the
+        // back under this image (counted, must be 0).
+        VideoCommon::MemoryStageLink::NoteImageRegistered(image.cpu_addr, image.guest_size_bytes);
         image.nx2_counted_addr = image.cpu_addr;
         image.nx2_counted_size = image.guest_size_bytes;
         if (True(image.flags & ImageFlagBits::GpuModified)) {

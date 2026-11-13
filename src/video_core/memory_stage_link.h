@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <exception>
+#include <memory>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -51,6 +52,7 @@ public:
         BackHandles,
         SyncAhead,
         ServedAheadJoin,
+        FutureWriteUnderImage,
         Count,
     };
 
@@ -248,6 +250,58 @@ public:
     [[nodiscard]] u64 StageEntry() const noexcept {
         return stage_entry;
     }
+
+    // --- Step 7: GPUMem's own writes to game memory (spec 6.4's "short ring of the stage's own
+    // stream writes with positions"): constant buffer words, by device range and entry ---
+
+    /// GPUMem, the window open: it wrote [begin, begin + size) of device memory for the entry at
+    /// `position`. Positions only grow (the stream's order).
+    void NoteStageWrite(u64 begin, u64 size, u64 position) noexcept;
+    /// How many writes were noted (the number the next one gets).
+    [[nodiscard]] u64 StageWriteCount() const noexcept {
+        return stage_write_count.load(std::memory_order_acquire);
+    }
+    /// Any thread: calls func(begin, end, position) for each write numbered `since` or later,
+    /// newest first, until it returns true. False when some of them were overwritten already.
+    template <typename F>
+    bool ForEachStageWriteSince(u64 since, F&& func) const {
+        if (!stage_writes) {
+            return true;
+        }
+        const u64 count = stage_write_count.load(std::memory_order_acquire);
+        if (count < since) {
+            return true;
+        }
+        bool complete = count - since <= StageWriteSlots;
+        const u64 oldest = complete ? since : count - StageWriteSlots;
+        for (u64 n = count; n > oldest; --n) {
+            const StageWrite& slot = stage_writes[(n - 1) % StageWriteSlots];
+            if (slot.seq.load(std::memory_order_acquire) != n) {
+                complete = false;
+                continue;
+            }
+            const u64 begin = slot.begin.load(std::memory_order_relaxed);
+            const u64 end = slot.end.load(std::memory_order_relaxed);
+            const u64 position = slot.position.load(std::memory_order_relaxed);
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (slot.seq.load(std::memory_order_relaxed) != n) {
+                complete = false;
+                continue;
+            }
+            if (func(begin, end, position)) {
+                break;
+            }
+        }
+        return complete;
+    }
+    /// The back registers an image over [address, address + size) (the texture cache): risk 9.1,
+    /// a constant buffer write GPUMem made for a later entry under it (must be 0).
+    static void NoteImageRegistered(u64 address, u64 size) {
+        if (g_ring_active.load(std::memory_order_relaxed) &&
+            g_ahead.load(std::memory_order_relaxed) != 0) [[unlikely]] {
+            instance.NoteImageRegisteredSlow(address, size);
+        }
+    }
     void NoteLevelDraw(u32 kind) noexcept;
     /// The verify of compare b with two threads (FRITCHII_MEMSTAGE_RING_VERIFY).
     void NoteHash(bool same) noexcept;
@@ -401,6 +455,17 @@ private:
     std::array<Join, JoinSlots> joins{};
     u64 join_count{};
     void NoteBufferJoinSlow(u64 address, u64 size) noexcept;
+    /// GPUMem's own writes (NoteStageWrite): one writer, any reader (a sequence word per slot).
+    struct StageWrite {
+        std::atomic<u64> seq{};
+        std::atomic<u64> begin{};
+        std::atomic<u64> end{};
+        std::atomic<u64> position{};
+    };
+    static constexpr u64 StageWriteSlots = u64{1} << 17;
+    std::unique_ptr<StageWrite[]> stage_writes;
+    std::atomic<u64> stage_write_count{0};
+    void NoteImageRegisteredSlow(u64 address, u64 size);
     /// GPUMem's thread id (the back serves it while it waits for a lock GPUMem holds).
     std::atomic<std::thread::id> stage_thread{};
     /// Bumped while the back waits for a lock GPUMem holds (StageSyncCatchUp gives up then).

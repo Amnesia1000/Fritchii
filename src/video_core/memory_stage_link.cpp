@@ -273,6 +273,7 @@ constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::Check::Co
     "a served draw whose texture handles the back read from game memory",
     "a sync of GPUMem's fill sent to the back before it played the packets ahead of it",
     "a served download over GPU-written data in a buffer a packet ahead of the back joined",
+    "an image registered over a constant buffer write GPUMem made for a later entry",
 };
 constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::LevelReason::Count)>
     LEVEL_REASON_NAMES{"full copy", "writing draw", "ranges over GPU-written data"};
@@ -326,6 +327,9 @@ void MemoryStageLink::Start(Core::System& system_) {
     g_ring_active.store(false, std::memory_order_relaxed);
     stage_busy.store(false, std::memory_order_relaxed);
     back_in_hook.store(false, std::memory_order_relaxed);
+    if (!stage_writes) {
+        stage_writes = std::make_unique<StageWrite[]>(StageWriteSlots);
+    }
     thread = std::jthread([this](std::stop_token stop) { StageMain(stop); });
     LOG_INFO(HW_GPU, "Memory stage thread (GPUMem) started, sleeping until "
                      "FRITCHII_MEMSTAGE_THREAD=1 or 2 gives it work");
@@ -958,10 +962,15 @@ bool MemoryStageLink::StageWaitFor(std::stop_token& stop, StageWait reason, u64 
             return Ring::Published().load(std::memory_order_acquire) != target ||
                    !ring_wanted.load(std::memory_order_acquire);
         case StageWait::Window:
-            // Packets in ring B the back has not taken (the back's count is stored seq_cst).
-            return ring_backend.ring_packets(ring_backend.context) < target;
+            // Packets in ring B the back has not taken (the back's count is stored seq_cst). A
+            // back parked at the published position takes no more: what is left is a packet no
+            // draw asked for (counted when it is dropped), so the stage goes on.
+            return ring_backend.ring_packets(ring_backend.context) < target ||
+                   Ring::Consumed().load(std::memory_order_acquire) >= staged_local;
         case StageWait::Room:
-            return ring_backend.ring_room(ring_backend.context);
+            // As the window; without room then, the next draw is level (StageFillDraw).
+            return ring_backend.ring_room(ring_backend.context) ||
+                   Ring::Consumed().load(std::memory_order_acquire) >= staged_local;
         default:
             return Ring::Consumed().load(std::memory_order_acquire) >= target;
         }
@@ -1055,6 +1064,43 @@ void MemoryStageLink::StageLevel(u64 position, LevelReason reason) {
     }
     if (!stage_busy.load(std::memory_order_relaxed)) {
         BecomeBusy(*ring_stop);
+    }
+}
+
+void MemoryStageLink::NoteStageWrite(u64 begin, u64 size, u64 position) noexcept {
+    if (!stage_writes || size == 0) {
+        return;
+    }
+    const u64 number = stage_write_count.load(std::memory_order_relaxed);
+    StageWrite& slot = stage_writes[number % StageWriteSlots];
+    slot.seq.store(0, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    slot.begin.store(begin, std::memory_order_relaxed);
+    slot.end.store(begin + size, std::memory_order_relaxed);
+    slot.position.store(position, std::memory_order_relaxed);
+    slot.seq.store(number + 1, std::memory_order_release);
+    stage_write_count.store(number + 1, std::memory_order_release);
+}
+
+void MemoryStageLink::NoteImageRegisteredSlow(u64 address, u64 size) {
+    // Risk 9.1 of the spec: the stage wrote constant buffer words for an entry the back has not
+    // reached, on pages an image is registered over now; that image's upload reads the later
+    // bytes. Only the back registers images at its position.
+    if (!GpuSplit::OnBackThread() || size == 0) {
+        return;
+    }
+    const u64 back = GpuSplit::Get().BackEntryPosition();
+    const u64 end = address + size;
+    bool hit = false;
+    ForEachStageWriteSince(0, [&](u64 write_begin, u64 write_end, u64 position) {
+        if (position <= back) {
+            return true; // older writes are at or before the back's entry
+        }
+        hit = write_begin < end && address < write_end;
+        return hit;
+    });
+    if (hit) [[unlikely]] {
+        Note(Check::FutureWriteUnderImage, "the texture cache's image registration");
     }
 }
 

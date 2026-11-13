@@ -161,8 +161,17 @@ public:
     struct TrackerRecord {
         std::array<TrackerSlot, 3> slots;
         bool filled;
+        /// Step 7 (the window open): the bytes each tracker reads, copied at the fill, as many
+        /// per slot (0: not copied, the tracker reads game memory); MemStage::TrackerBytes.
+        std::array<u32, 3> copied;
         static constexpr std::array<u32, 3> Slots{3, 4, 6};
         static constexpr u32 CameraBytes = 0x230;
+        /// The actor tracker's draw (its vertex program) and what it reads of slots 4 and 6.
+        static constexpr u64 ActorShader = 0x28c6e527634f814aULL;
+        static constexpr u32 OriginOffset = 0x40;
+        static constexpr u32 OriginBytes = 3 * sizeof(float);
+        static constexpr u32 BonesSlotSize = 13568; ///< the binding the actor's draw has
+        static constexpr u32 BonesBytes = 280 * 12 * sizeof(float); ///< what the tracker reads
     };
     struct DrawPacket {
         u64 number;
@@ -437,6 +446,13 @@ public:
     }
     /// The record of slots 3, 4 and 6 from the cache as it is now (FillDraw; the verify).
     static void FillTrackerRecord(Cache& cache, TrackerRecord& record);
+    /// The back: the bytes a ring packet's fill copied for tracker slot `slot` (0 to 2) of the
+    /// draw it holds, or null (read game memory then).
+    [[nodiscard]] const u8* TrackerBytes(const TrackerRecord& record, size_t slot) const noexcept;
+    /// The device memory the trackers' bytes are copied from (the rasterizer's).
+    void AttachDeviceMemory(Tegra::MaxwellDeviceMemoryManager& memory) noexcept {
+        device_memory = &memory;
+    }
 
     /// On GPUMem inside a hand-off: runs `body` on the back with this thread's seam state (a
     /// sync, an entry that must run now). Anywhere else: runs it here.
@@ -618,6 +634,10 @@ private:
         u64 ring_seq{};      ///< Common::WriteRing's sequence when the fill began
         u64 gathers{};       ///< This thread's gathers applied when the fill ended
         u64 flush_regions{}; ///< This thread's FlushRegion calls when the fill ended
+        /// Step 7, a ring packet's log: GPUMem's own writes noted when the fill ended (the
+        /// compare leaves out the ones after), and the packet's entry.
+        u64 stage_writes{};
+        u64 position{};
         void Clear() noexcept {
             records.clear();
             bytes.clear();
@@ -627,6 +647,8 @@ private:
             ring_seq = 0;
             gathers = 0;
             flush_regions = 0;
+            stage_writes = 0;
+            position = 0;
         }
     };
 
@@ -706,6 +728,8 @@ private:
         std::array<u64, static_cast<size_t>(DiffClass::Count)> diff_classes{};
         u64 diff_own{};
         u64 diff_over{};
+        u64 diff_stage_own{};
+        u64 ring_reads{};
         u64 ring_wrapped{};
         u64 gathers_held{};
         std::array<u64, 3> flush_regions_held{};
@@ -852,6 +876,8 @@ private:
         std::array<std::atomic<u64>, static_cast<size_t>(DiffClass::Count)> diff_classes{};
         std::atomic<u64> diff_own{};
         std::atomic<u64> diff_over{};
+        std::atomic<u64> diff_stage_own{}; ///< Step 7: changed only by GPUMem's later writes
+        std::atomic<u64> ring_reads{};     ///< Step 7: ring packets whose reads were compared
         std::atomic<u64> ring_wrapped{};
         std::atomic<u64> gathers_held{};
         std::array<std::atomic<u64>, 3> flush_regions_held{};
@@ -883,6 +909,8 @@ private:
         std::array<u64, 2> hashes;
         u32 value_count;  ///< Handle values after the entries
         u32 value_flags;  ///< 1: filled, 2: EXP21's null pointer handles
+        u32 tracker_bytes; ///< Step 7: the trackers' bytes after the values
+        u32 reserved;
     };
     static constexpr u64 RingBytes = u64{4} << 20;
     std::unique_ptr<u8[]> ring_b;
@@ -910,6 +938,23 @@ private:
     u64 stage_fill_from{};
     std::array<u64, 2> fill_hashes{};
     bool fill_held_form{};
+    /// Step 7: the trackers' bytes, GPUMem's for the fill, the back's for the packet it holds.
+    std::vector<u8> fill_tracker_data;
+    std::vector<u8> played_tracker_data;
+    Tegra::MaxwellDeviceMemoryManager* device_memory{};
+    void CopyTrackerBytes(TrackerRecord& record, u64 vertex_program);
+    /// Step 7's verify (spec 6.4, the design's 2.5 read compare): a ring packet's read log, filled
+    /// by GPUMem (stage_log while it fills), handed over in packet order, compared by the back at
+    /// the take. Logs are pooled.
+    std::mutex ring_logs_mutex;
+    std::deque<std::pair<u64, std::unique_ptr<ReadLog>>> ring_logs;
+    std::vector<std::unique_ptr<ReadLog>> ring_log_pool;
+    std::unique_ptr<ReadLog> stage_log;
+    bool StartRingReadLog(u64 number);
+    void StopRingReadLog();
+    std::unique_ptr<ReadLog> TakeRingLog(u64 number);
+    void RecycleRingLog(std::unique_ptr<ReadLog> log);
+    void CompareRingReads(ReadLog& log, u64 number, u64 hash_a, u64 hash_b);
     void PushRingDraw();
     const RingHeader* PeekRing();
     void TakeRingHeader(const RingHeader& header);

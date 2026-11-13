@@ -585,6 +585,7 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
     // The memory seam's read log asks this cache's tracker.
     mem_stage.Attach(buffer_cache);
     mem_stage.AttachGpu(gpu);
+    mem_stage.AttachDeviceMemory(device_memory);
     if (split_buffer_staging) {
         // The memory stage's thread checks who requests from the cache's own pool.
         split_buffer_staging->MarkCacheSide();
@@ -5016,9 +5017,14 @@ void RasterizerVulkan::TrackOcarinaCamera(const MemStage::TrackerRecord* record)
     }
 
     // The camera block of vertex uniform slot 3, when bound that large and not GPU-modified.
-    const auto sample = [&](DAddr address) {
+    // `copied`: the bytes the packet's fill copied (step 7, the window open), else game memory.
+    const auto sample = [&](DAddr address, const u8* copied) {
         std::array<f32, 0x230 / sizeof(f32)> camera;
-        device_memory.ReadBlockUnsafe(address, camera.data(), sizeof(camera));
+        if (copied != nullptr) {
+            std::memcpy(camera.data(), copied, sizeof(camera));
+        } else {
+            device_memory.ReadBlockUnsafe(address, camera.data(), sizeof(camera));
+        }
         constexpr size_t extent_offset = 0x120 / sizeof(f32);
         constexpr size_t projection_wz = 0xa8 / sizeof(f32);
         if (camera[extent_offset] != static_cast<f32>(color.size.width) ||
@@ -5039,7 +5045,7 @@ void RasterizerVulkan::TrackOcarinaCamera(const MemStage::TrackerRecord* record)
         // the end of the fill.
         const MemStage::TrackerSlot& slot = record->slots[0];
         if (slot.bound && slot.size >= MemStage::TrackerRecord::CameraBytes && !slot.gpu_modified) {
-            sample(slot.address);
+            sample(slot.address, mem_stage.TrackerBytes(*record, 0));
         }
         return;
     }
@@ -5052,7 +5058,7 @@ void RasterizerVulkan::TrackOcarinaCamera(const MemStage::TrackerRecord* record)
                                              MemStage::TrackerRecord::CameraBytes)) {
             return;
         }
-        sample(binding.device_addr);
+        sample(binding.device_addr, nullptr);
     });
 }
 
@@ -5107,7 +5113,7 @@ void RasterizerVulkan::UpdateOcarinaJitter() {
 /// Capture the skinning pose of the recognized Link draw for frame-to-frame motion.
 void RasterizerVulkan::TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool is_indirect,
                                          const MemStage::TrackerRecord* record) {
-    if (shader_hash != 0x28c6e527634f814aULL || !is_indexed || is_indirect ||
+    if (shader_hash != MemStage::TrackerRecord::ActorShader || !is_indexed || is_indirect ||
         !OcarinaTemporalEnabled() || oot_actor.frame == render_trace_frame) {
         return;
     }
@@ -5137,14 +5143,27 @@ void RasterizerVulkan::TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool 
         .base_vertex = static_cast<s32>(draw.base_index),
     };
     bool origin_found{}, bones_found{};
-    // Vertex uniform slots 4 (the origin) and 6 (the bones), when not GPU-modified.
-    const auto sample = [&](u32 index, DAddr address, u32 size) {
-        if (index == 4 && size >= 0x40 + 3 * sizeof(f32)) {
-            device_memory.ReadBlockUnsafe(address + 0x40, pose.origin.data(), 3 * sizeof(f32));
+    // Vertex uniform slots 4 (the origin) and 6 (the bones), when not GPU-modified. `copied`: the
+    // bytes the packet's fill copied (step 7, the window open), else game memory.
+    using Tracker = MemStage::TrackerRecord;
+    static_assert(Tracker::OriginBytes == 3 * sizeof(f32));
+    static_assert(Tracker::BonesBytes == sizeof(pose.bones));
+    const auto sample = [&](u32 index, DAddr address, u32 size, const u8* copied) {
+        if (index == 4 && size >= Tracker::OriginOffset + Tracker::OriginBytes) {
+            if (copied != nullptr) {
+                std::memcpy(pose.origin.data(), copied, Tracker::OriginBytes);
+            } else {
+                device_memory.ReadBlockUnsafe(address + Tracker::OriginOffset, pose.origin.data(),
+                                              Tracker::OriginBytes);
+            }
             origin_found = true;
         }
-        if (index == 6 && size == 13568) {
-            device_memory.ReadBlockUnsafe(address, pose.bones.data(), sizeof(pose.bones));
+        if (index == 6 && size == Tracker::BonesSlotSize) {
+            if (copied != nullptr) {
+                std::memcpy(pose.bones.data(), copied, sizeof(pose.bones));
+            } else {
+                device_memory.ReadBlockUnsafe(address, pose.bones.data(), sizeof(pose.bones));
+            }
             bones_found = true;
         }
     };
@@ -5153,7 +5172,7 @@ void RasterizerVulkan::TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool 
         for (size_t i = 1; i < record->slots.size(); ++i) {
             const MemStage::TrackerSlot& slot = record->slots[i];
             if (slot.bound && !slot.gpu_modified) {
-                sample(MemStage::TrackerRecord::Slots[i], slot.address, slot.size);
+                sample(Tracker::Slots[i], slot.address, slot.size, mem_stage.TrackerBytes(*record, i));
             }
         }
     } else {
@@ -5164,7 +5183,7 @@ void RasterizerVulkan::TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool 
                 buffer_cache.IsRegionGpuModified(binding.device_addr, size)) {
                 return;
             }
-            sample(index, binding.device_addr, size);
+            sample(index, binding.device_addr, size, nullptr);
         });
     }
     if (origin_found && bones_found) {

@@ -53,6 +53,9 @@ inline thread_local std::array<u64, 2> t_thread{};
 inline thread_local const char* t_site = nullptr;
 inline thread_local const char* t_context = nullptr;
 inline thread_local bool t_landing = false;
+/// Writes this thread makes now are not noted (the memory stage's own constant buffer words with
+/// FRITCHII_MEMSTAGE_AHEAD: its own ring names them, with their entry, and they would wrap this one).
+inline thread_local bool t_quiet = false;
 
 /// Common::SetCurrentThreadName: the name the ring keeps (16 characters).
 inline void NameThread(const char* name) noexcept {
@@ -81,7 +84,7 @@ inline void Record(u64 address, u64 size, const char* via) noexcept {
 
 /// After the bytes of [address, address + size) landed in game memory (device address).
 inline void Note(u64 address, u64 size, const char* via) noexcept {
-    if (g_on.load(std::memory_order_relaxed)) [[unlikely]] {
+    if (g_on.load(std::memory_order_relaxed) && !t_quiet) [[unlikely]] {
         Record(address, size, via);
     }
 }
