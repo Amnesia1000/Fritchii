@@ -496,8 +496,13 @@ fills on a thread of their own by hand-off; 2 lets that thread read the ring its
   - level mode (AHEAD = 0): GPUMem works only while the back is parked (it ran everything passed
     on and is not in its idle hook), so the two threads still take turns at every draw. Expect fps
     lower than 0; the point is correctness and what a run costs. Step 7 opens the window.
-  - Needs what 1 needs, plus EDEN_NX2_EXP53 off (it runs as 1 otherwise, logged once); forces
-    FRITCHII_MEMSTAGE_FULL_BINDS on. FRITCHII_MEMSTAGE_AHEAD other than 0 is logged and ignored.
+  - Needs what 1 needs, plus EXP123 = 3 (values by value: a served draw's texture handles are
+    read by GPUMem at its fill and come in the packet) and EDEN_NX2_EXP53 off (it runs as 1
+    otherwise, logged once); forces FRITCHII_MEMSTAGE_FULL_BINDS on. An exception on GPUMem ends
+    the ring cleanly where the back is parked and THREAD = 2 runs as 1 for the rest of the
+    session (logged, counted).
+  - Ending the ring (2 to 1 or 0, at a frame end) hands the cache's flags and GPUMem's last
+    constant buffer ranges back to the back, and plays whatever is left in ring B. FRITCHII_MEMSTAGE_AHEAD other than 0 is logged and ignored.
     The constant buffer write modes other than the default (EXP107) make every constant buffer
     entry level. EXP118 (delta draws) is untested with it.
   - What the back would do in the buffer cache inside a served entry (a read flush from a
@@ -512,8 +517,11 @@ fills on a thread of their own by hand-off; 2 lets that thread read the ring its
     copies by cause, render_enable.mode, ...) keep coming every 10 s, from GPUMem's state.
   - Must be 0, beside 1's: the back in the buffer cache while not lent (its entry points, by
     function), InnerInvalidation with ranges on the back while not lent, a packet asked for at a
-    draw the stage sent none for, a packet left unplayed at a run's start, ring B full, and the
-    draw counts of both threads differing at a run's end.
+    draw the stage sent none for, a packet left unplayed at a run's start, ring B full, the draw
+    counts of both threads differing at a run's end, a packet played whole for a draw the back
+    did not prepare, a packet whose entry is past the back's draw (dropped unplayed, the back
+    fills the draw), a served draw whose texture handles the back read from game memory, and an
+    exception on GPUMem.
   - FRITCHII_MEMSTAGE_RING_VERIFY=1 (boot): compare b with two threads: GPUMem puts a hash of
     compare b's words (the narrow set) in each packet and the back hashes its own at the take;
     differences are counted on the ring line, the first 16 logged. Off for fps runs. The flags
