@@ -491,12 +491,48 @@ public:
         writer_range_sealed = writer_range_count;
         return writer_range_count;
     }
+    /// EXP10 +8: the writes found since a macro DMA read snapshot that overlap the range it
+    /// checks (a 4 KiB page), as offsets into that range, so a read of other bytes of it can
+    /// still skip the drain (Maxwell3D::FrontDmaRead). Holds Capacity; one more is a miss.
+    struct ListedWrites {
+        static constexpr u32 Capacity = 8;
+        std::array<std::pair<u32, u32>, Capacity> ranges{};
+        u32 count{};
+        /// Lists [begin, end) of the range at `base` (clipped to `size` bytes) unless a listed
+        /// one covers it. False when full.
+        bool Add(u64 base, u64 size, u64 begin, u64 end) {
+            const u32 first = static_cast<u32>((std::max)(begin, base) - base);
+            const u32 last = static_cast<u32>((std::min)(end, base + size) - base);
+            for (u32 i = 0; i < count; ++i) {
+                if (ranges[i].first <= first && last <= ranges[i].second) {
+                    return true;
+                }
+            }
+            if (count == Capacity) {
+                return false;
+            }
+            ranges[count++] = {first, last};
+            return true;
+        }
+        /// Whether a listed write overlaps device bytes [begin, end) (the range at `base`).
+        [[nodiscard]] bool Overlaps(u64 base, u64 begin, u64 end) const {
+            for (u32 i = 0; i < count; ++i) {
+                if (base + ranges[i].first < end && begin < base + ranges[i].second) {
+                    return true;
+                }
+            }
+            return false;
+        }
+    };
     /// Whether compute or copy work sent after position `since` may write device bytes
     /// [begin, begin + size): an unbounded writer, or a noted range that overlaps them.
     /// `checked` (optional): the noted ranges below it were found to miss these bytes before;
-    /// set to WriterRangeCount() when nothing does.
+    /// set to WriterRangeCount() when nothing does. `listed` (optional, EXP10 +8): overlapping
+    /// ranges are added to it instead of answering true while it has room; it and `checked`
+    /// change only when the answer is false (the ranges below `checked` then miss or are listed).
     [[nodiscard]] bool WritersMayWriteSince(u64 since, u64 begin, u64 size,
-                                            u64* checked = nullptr) const {
+                                            u64* checked = nullptr,
+                                            ListedWrites* listed = nullptr) const {
         if (last_unbounded_writer_position > since) {
             return true;
         }
@@ -506,6 +542,7 @@ public:
         const u64 oldest =
             writer_range_count - (std::min<u64>)(writer_range_count, writer_ranges.size());
         const u64 known = checked != nullptr ? *checked : 0;
+        ListedWrites found = listed != nullptr ? *listed : ListedWrites{};
         u64 index = writer_range_count;
         bool reached = false;
         for (u64 scanned = 0; index > (std::max)(known, oldest); --index, ++scanned) {
@@ -517,12 +554,16 @@ public:
                 reached = true;
                 break;
             }
-            if (range.begin < end && begin < range.end) {
+            if (range.begin < end && begin < range.end &&
+                (listed == nullptr || !found.Add(begin, size, range.begin, range.end))) {
                 return true;
             }
         }
         if (!reached && oldest > known) {
             return true;
+        }
+        if (listed != nullptr) {
+            *listed = found;
         }
         if (checked != nullptr) {
             *checked = WriterRangeCount();
@@ -566,9 +607,11 @@ public:
     /// Whether the native compute dispatches sent after position `since` may write device bytes
     /// [begin, begin + size). `checked`: the recorded writes below it were found to miss these
     /// bytes before (DispatchWriteCount() at the snapshot); updated on a miss. With `wait`, waits
-    /// for the back to run the newest of those dispatches first (`waited` then set).
+    /// for the back to run the newest of those dispatches first (`waited` then set). `listed`
+    /// (optional, EXP10 +8): as WritersMayWriteSince's, bounded overlapping writes are listed
+    /// instead of answering Overlap; changed only on a Miss.
     DispatchCheck DispatchesMayWriteSince(u64 since, u64 begin, u64 size, bool wait, u64& checked,
-                                          bool& waited);
+                                          bool& waited, ListedWrites* listed = nullptr);
     /// The writes the back recorded so far.
     [[nodiscard]] u64 DispatchWriteCount() const {
         return dispatch_write_count.load(std::memory_order_acquire);
