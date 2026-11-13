@@ -2412,7 +2412,10 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             }
         }
     }
-    if (buffer_cache.any_buffer_uploaded) {
+    if (held != nullptr && (held->flags & MemStage::PostCopyBarrier) != 0) {
+        // FRITCHII_MEMSTAGE_THREAD = 2: the stage's fill uploaded (the mark came in the packet).
+        mem_stage.PlayPostCopyBarrier();
+    } else if (buffer_cache.any_buffer_uploaded) {
         buffer_cache.runtime.PostCopyBarrier();
         buffer_cache.any_buffer_uploaded = false;
     }

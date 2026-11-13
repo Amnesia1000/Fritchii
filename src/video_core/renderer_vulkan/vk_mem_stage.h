@@ -229,6 +229,7 @@ public:
         LateFill = 1,   ///< Texel buffers: filled where the calls are (as with SEAM = 1)
         Held = 2,       ///< Filled before the texture work, its sections played later
         RestPlayed = 4, ///< Configure did not play every section: PlayRest did
+        PostCopyBarrier = 8, ///< THREAD = 2: the fill uploaded; the back records the barrier
     };
 
     /// THREAD = 2: a facts table entry (spec 4.4), copied by value from the pipeline.
@@ -468,6 +469,8 @@ public:
     const DrawPacket* TakeRingDraw(u64 seq, u64 hash, bool verify);
     /// The back: plays whole the packets of entries before `position`; returns how many.
     u64 DropRingPackets(u64 position);
+    /// The back: the barrier after a ring packet's uploads (Configure's any_buffer_uploaded).
+    void PlayPostCopyBarrier();
     /// The back publishes a pipeline's facts under the stage's program key; GPUMem looks them up.
     void PublishFacts(u64 key, const void* source, const DrawFacts& facts, bool dynamic_input);
     [[nodiscard]] bool LookupFacts(u64 key, StagedFacts& out) const;

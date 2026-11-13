@@ -1181,6 +1181,12 @@ const MemStage::DrawPacket* MemStage::FillDrawHere(Cache& cache_, const DrawFact
             StopReadLog(held_log, true);
         }
         if (ring_fill) {
+            // The cache's "uploaded" mark is the back's question in Configure: it goes in the
+            // packet (the back records the barrier where it does today).
+            if (cache_.any_buffer_uploaded) {
+                draw.flags |= PostCopyBarrier;
+                cache_.any_buffer_uploaded = false;
+            }
             // The trackers' record goes in the packet: taken before the push.
             if (tracker_record.load(std::memory_order_relaxed)) [[unlikely]] {
                 FillTrackerRecord(cache_, draw.trackers);
@@ -1571,6 +1577,18 @@ const MemStage::DrawPacket* MemStage::TakeRingDraw(u64 seq, u64 hash, bool verif
         Link::Get().NotePacketTaken();
         return &played_draw;
     }
+}
+
+void MemStage::PlayPostCopyBarrier() {
+    // As BufferCacheRuntime::PostCopyBarrier's entry, executed at once by the play side.
+    const Entry entry{
+        .kind = Cmd::PostCopyBarrier,
+        .flags = OutsideRenderPass,
+        .count = 0,
+        .bytes = static_cast<u32>(sizeof(Entry)),
+    };
+    PlayDepth depth;
+    player.Exec(entry);
 }
 
 u64 MemStage::DropRingPackets(u64 position) {
