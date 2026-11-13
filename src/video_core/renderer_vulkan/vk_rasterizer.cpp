@@ -558,8 +558,12 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
           device,     scheduler,         memory_allocator, staging_pool,
           blit_image, render_pass_cache, descriptor_pool,  compute_pass_descriptor_queue},
       texture_cache(texture_cache_runtime, device_memory),
+      mem_player(device, memory_allocator, scheduler, guest_descriptor_queue,
+                 compute_pass_descriptor_queue),
+      mem_stage(mem_player), mem_clock(scheduler, &mem_stage),
       buffer_cache_runtime(device, buffer_memory_allocator, scheduler, buffer_staging_pool,
-                           guest_descriptor_queue, compute_pass_descriptor_queue, descriptor_pool),
+                           guest_descriptor_queue, compute_pass_descriptor_queue, descriptor_pool,
+                           mem_stage, mem_clock),
       buffer_cache(device_memory, buffer_cache_runtime),
       query_cache_runtime(this, device_memory, buffer_cache, device, memory_allocator, scheduler,
                           staging_pool, compute_pass_descriptor_queue, descriptor_pool, texture_cache),
@@ -2192,11 +2196,11 @@ void RasterizerVulkan::Nx2KeepListWords(u64 keep_id, GPUVAddr address, u32 count
     if (buffer == nullptr) {
         return;
     }
-    buffer_cache_runtime.KeepListWords(keep_id, buffer->Handle(), offset, count);
+    mem_player.KeepListWords(keep_id, buffer->Handle(), offset, count);
 }
 
 bool RasterizerVulkan::Nx2ReadKeptListWords(u64 keep_id, std::span<u32> words) {
-    return buffer_cache_runtime.ReadKeptListWords(keep_id, words);
+    return mem_player.ReadKeptListWords(keep_id, words);
 }
 
 void RasterizerVulkan::DrawListWords() {
@@ -2226,7 +2230,7 @@ void RasterizerVulkan::DrawListWords() {
         if (words[1] != 0) {
             ListDraw::Count(ListDraw::g_stats.read_first);
         }
-        buffer_cache_runtime.KeepListWordsRead(params.list_keep_id, words);
+        mem_player.KeepListWordsRead(params.list_keep_id, words);
         draw_state.vertex_buffer.count = words[0];
         draw_state.vertex_buffer.first = words[1];
         draw_state.draw_element_count = words[0];
@@ -2240,11 +2244,11 @@ void RasterizerVulkan::DrawListWords() {
         ++trace_indirect;
     }
     buffer_cache.SetDrawIndirect(&params);
-    buffer_cache_runtime.RequestListDrawArgs(params.list_keep_id);
+    mem_player.RequestListDrawArgs(params.list_keep_id);
     bool recorded = false;
     bool mesh = false;
     PrepareDraw(false, [this, &mesh, &recorded] {
-        const auto args = buffer_cache_runtime.TakeListDrawArgs();
+        const auto args = mem_player.TakeListDrawArgs();
         if (args.buffer == VK_NULL_HANDLE) {
             return;
         }
@@ -2262,7 +2266,7 @@ void RasterizerVulkan::DrawListWords() {
         });
     }, true);
     // A draw that was not prepared as far as its copy leaves the request behind.
-    (void)buffer_cache_runtime.TakeListDrawArgs();
+    (void)mem_player.TakeListDrawArgs();
     buffer_cache.SetDrawIndirect(nullptr);
     ListDraw::Count(!recorded ? ListDraw::g_stats.not_recorded
                     : mesh    ? ListDraw::g_stats.indirect_mesh
@@ -3181,7 +3185,7 @@ void RasterizerVulkan::FlushAll() {}
 void RasterizerVulkan::SubmitNx2ListCopies(u64 writer) {
     // Submitted at once: ReadGpuWrittenCommands waits on these copies, so they can't sit out
     // the longer DeferFlush interval.
-    if (!buffer_cache.Nx2CopyListPages(scheduler.CurrentTick(), writer)) {
+    if (!buffer_cache.Nx2CopyListPages(mem_clock.Now(), writer)) {
         return;
     }
     // EDEN_NX2_EXP27 & 8 (the original's DISPATCH_BATCH): the front reads few of the lists
@@ -5318,7 +5322,7 @@ bool AccelerateDMA::BufferCopy(GPUVAddr src_address, GPUVAddr dest_address, u64 
     std::scoped_lock lock{buffer_cache.mutex};
     buffer_cache.Nx2CollectListCopies(true);
     const bool copied = buffer_cache.DMACopy(src_address, dest_address, amount);
-    if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
+    if (buffer_cache.Nx2CopyListPages(buffer_cache.runtime.Clock().Now())) {
         scheduler.Flush();
     }
     buffer_cache.Nx2CollectListCopies(false);

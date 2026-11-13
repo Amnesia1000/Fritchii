@@ -133,7 +133,7 @@ private:
 
     const Device& device;
     MemoryAllocator& memory_allocator;
-    Scheduler& scheduler;
+    SeamClock clock;
     BufferRecycler recycler;
 
     vk::Buffer stream_buffer;

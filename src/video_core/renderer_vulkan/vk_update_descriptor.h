@@ -9,6 +9,7 @@
 #include <memory>
 #include <variant>
 #include <vector>
+#include "video_core/renderer_vulkan/vk_mem_stage_hook.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace Vulkan {
@@ -52,6 +53,42 @@ public:
         return use_descriptor_buffer;
     }
 
+    /// The entry AddBuffer adds, in the form `descriptor_buffer` asks for.
+    [[nodiscard]] static DescriptorUpdateEntry MakeBufferEntry(bool descriptor_buffer,
+                                                               VkBuffer buffer,
+                                                               VkDeviceAddress base_address,
+                                                               VkDeviceSize offset,
+                                                               VkDeviceSize size) {
+        if (!descriptor_buffer) {
+            return VkDescriptorBufferInfo{
+                .buffer = buffer,
+                .offset = offset,
+                .range = size,
+            };
+        }
+        return DescriptorAddress{
+            .address = base_address == 0 ? 0 : base_address + offset,
+            .range = base_address == 0 ? VK_WHOLE_SIZE : size,
+            .format = VK_FORMAT_UNDEFINED,
+        };
+    }
+
+    /// The entry AddTexelBuffer adds, in the form `descriptor_buffer` asks for.
+    [[nodiscard]] static DescriptorUpdateEntry MakeTexelEntry(bool descriptor_buffer,
+                                                              VkBufferView texel_buffer,
+                                                              VkDeviceAddress base_address,
+                                                              VkDeviceSize offset,
+                                                              VkDeviceSize size, VkFormat format) {
+        if (!descriptor_buffer) {
+            return texel_buffer;
+        }
+        return DescriptorAddress{
+            .address = base_address == 0 ? 0 : base_address + offset,
+            .range = base_address == 0 ? VK_WHOLE_SIZE : size,
+            .format = format,
+        };
+    }
+
     void TickFrame();
     void Acquire(Scheduler& scheduler, size_t required_entries = 0,
                  bool use_descriptor_buffer_ = false);
@@ -65,6 +102,7 @@ public:
     }
 
     void AddSampledImage(VkImageView image_view, VkSampler sampler) {
+        SeamHook::Watch(SeamHook::Use::DescriptorAdd);
         *(payload_cursor++) = VkDescriptorImageInfo{
             .sampler = sampler,
             .imageView = image_view,
@@ -73,6 +111,7 @@ public:
     }
 
     void AddImage(VkImageView image_view) {
+        SeamHook::Watch(SeamHook::Use::DescriptorAdd);
         *(payload_cursor++) = VkDescriptorImageInfo{
             .sampler = VK_NULL_HANDLE,
             .imageView = image_view,
@@ -81,6 +120,7 @@ public:
     }
 
     void AddBuffer(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size) {
+        SeamHook::Watch(SeamHook::Use::DescriptorAdd);
         *(payload_cursor++) = VkDescriptorBufferInfo{
             .buffer = buffer,
             .offset = offset,
@@ -90,38 +130,28 @@ public:
 
     void AddBuffer(VkBuffer buffer, VkDeviceAddress base_address, VkDeviceSize offset,
                    VkDeviceSize size) {
-        if (!use_descriptor_buffer) {
-            AddBuffer(buffer, offset, size);
-            return;
-        }
-        *(payload_cursor++) = DescriptorAddress{
-            .address = base_address == 0 ? 0 : base_address + offset,
-            .range = base_address == 0 ? VK_WHOLE_SIZE : size,
-            .format = VK_FORMAT_UNDEFINED,
-        };
+        SeamHook::Watch(SeamHook::Use::DescriptorAdd);
+        *(payload_cursor++) =
+            MakeBufferEntry(use_descriptor_buffer, buffer, base_address, offset, size);
     }
 
     void AddTexelBuffer(VkBufferView texel_buffer) {
+        SeamHook::Watch(SeamHook::Use::DescriptorAdd);
         *(payload_cursor++) = texel_buffer;
     }
 
     /// Adds entries recorded from an earlier payload (a pipeline's remembered texture bindings,
     /// EDEN_NX2_EXP32; ported).
     void AddEntries(const DescriptorUpdateEntry* entries, size_t count) {
+        SeamHook::Watch(SeamHook::Use::DescriptorAdd);
         payload_cursor = std::copy_n(entries, count, payload_cursor);
     }
 
     void AddTexelBuffer(VkBufferView texel_buffer, VkDeviceAddress base_address,
                         VkDeviceSize offset, VkDeviceSize size, VkFormat format) {
-        if (!use_descriptor_buffer) {
-            AddTexelBuffer(texel_buffer);
-            return;
-        }
-        *(payload_cursor++) = DescriptorAddress{
-            .address = base_address == 0 ? 0 : base_address + offset,
-            .range = base_address == 0 ? VK_WHOLE_SIZE : size,
-            .format = format,
-        };
+        SeamHook::Watch(SeamHook::Use::DescriptorAdd);
+        *(payload_cursor++) = MakeTexelEntry(use_descriptor_buffer, texel_buffer, base_address,
+                                             offset, size, format);
     }
 
 private:

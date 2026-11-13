@@ -207,6 +207,7 @@ Scheduler::~Scheduler() {
 
 u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                      std::source_location location) {
+    SeamHook::Watch(SeamHook::Use::Flush, location);
     if (state.renderpass) {
         CountRenderPassEnd(location.file_name(), location.line());
     }
@@ -301,6 +302,7 @@ bool Scheduler::WaitSubmitted(u64 tick) {
 
 void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                        std::source_location location) {
+    SeamHook::Watch(SeamHook::Use::Finish, location);
     if (state.renderpass) {
         CountRenderPassEnd(location.file_name(), location.line());
     }
@@ -362,6 +364,7 @@ void Scheduler::MarkFrameEnd(u64 frame) {
 }
 
 void Scheduler::DispatchWork() {
+    SeamHook::Watch(SeamHook::Use::DispatchWork);
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::DispatchWork");
     }
@@ -386,6 +389,7 @@ void Scheduler::DispatchWork() {
 }
 
 void Scheduler::RecordUpload(VkBuffer src, VkBuffer dst, std::span<const VkBufferCopy> copies) {
+    SeamHook::Watch(SeamHook::Use::RecordUpload);
     if (VideoCommon::GpuSplit::check_owner) {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::RecordUpload");
     }
@@ -542,6 +546,7 @@ void Scheduler::FlushDeferredClear() {
 }
 
 void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_location location) {
+    SeamHook::Watch(SeamHook::Use::RenderPass, location);
     if (deferred_clear.framebuffer == framebuffer) {
         RealizeDeferredClear();
         return;
@@ -567,6 +572,7 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_lo
 }
 
 void Scheduler::RequestOutsideRenderPassOperationContext(std::source_location location) {
+    SeamHook::Watch(SeamHook::Use::OutsideRenderPass, location);
     if (state.renderpass) {
         CountRenderPassEnd(location.file_name(), location.line());
     }
@@ -1029,6 +1035,7 @@ void Scheduler::AllocateNewContext() {
 }
 
 void Scheduler::InvalidateState() {
+    SeamHook::Watch(SeamHook::Use::InvalidateState);
     ++recording_epoch;
     state.graphics_pipeline = nullptr;
     state.rescaling_defined = false;
