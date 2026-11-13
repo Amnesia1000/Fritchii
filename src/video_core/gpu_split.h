@@ -584,13 +584,30 @@ public:
         if (last_unbounded_writer_position > since) {
             return answer(WriterCheck::Unbounded);
         }
+        const u64 known = checked != nullptr ? *checked : 0;
+        ListedWrites found = listed != nullptr ? *listed : ListedWrites{};
+        // EXP122: a watched page answers from its own list (gpu_split.cpp).
+        if (watched_pages != 0) {
+            const WatchAnswer watch = WatchedWritesSince(
+                since, begin, size, known, listed != nullptr ? &found : nullptr);
+            if (watch == WatchAnswer::Write) {
+                return answer(WriterCheck::Overlap);
+            }
+            if (watch == WatchAnswer::NoWrite) {
+                if (listed != nullptr) {
+                    *listed = found;
+                }
+                if (checked != nullptr) {
+                    *checked = WriterRangeCount();
+                }
+                return answer(WriterCheck::Miss);
+            }
+        }
         // At most MaxWriterScan ranges are compared (a drained read takes a new snapshot), and
         // more than are remembered count as overlapping.
         const u64 end = begin + size;
         const u64 oldest =
             writer_range_count - (std::min<u64>)(writer_range_count, writer_ranges.size());
-        const u64 known = checked != nullptr ? *checked : 0;
-        ListedWrites found = listed != nullptr ? *listed : ListedWrites{};
         u64 index = writer_range_count;
         bool reached = false;
         for (u64 scanned = 0; index > (std::max)(known, oldest); --index, ++scanned) {
@@ -621,6 +638,26 @@ public:
         }
         return answer(WriterCheck::Miss);
     }
+    /// EXP122 page watch (gpu_split.cpp): 0 off, 1 on, 2 on with a full-scan verify. Front only.
+    void SetPageWatch(int mode) {
+        if (mode != page_watch_mode) {
+            page_watch_mode = mode;
+            if (mode == 0) {
+                ClearPageWatch();
+            }
+        }
+    }
+    /// EXP122: the front just took a snapshot of device page `page` (Maxwell3D::FrontDmaRead).
+    void WatchPage(u64 page);
+    struct PageWatchStats {
+        u64 answered;       ///< WritersMayWriteSince answers from a watched page
+        u64 answered_write; ///< of them "may write"
+        u64 watched;        ///< Pages watched now
+        u64 overflows;      ///< Byte lists that overflowed (unioned)
+        u64 verified;       ///< EXP122=2: "no write" answers checked by a full scan
+        u64 mismatches;     ///< of them the full scan found an overlap (must stay 0)
+    };
+    [[nodiscard]] PageWatchStats GetPageWatchStats() const;
     /// The ranges noted so far, without sealing the last one (EXP10's log line).
     [[nodiscard]] u64 NotedWriterRanges() const {
         return writer_range_count;
@@ -1312,6 +1349,16 @@ private:
     GPUVAddr writer_range_address{};
     u64 writer_range_size{};
     u64 writer_range_function{~u64{0}};
+    /// EXP122 page watch (gpu_split.cpp), front only.
+    struct PageWatch;
+    std::unique_ptr<PageWatch> page_watch;
+    u32 watched_pages{};
+    int page_watch_mode{};
+    enum class WatchAnswer : u8 { Unwatched, NoWrite, Write };
+    WatchAnswer WatchedWritesSince(u64 since, u64 begin, u64 size, u64 known,
+                                   ListedWrites* found) const;
+    void NoteWatchedWrite(u64 begin, u64 end, u64 position);
+    void ClearPageWatch();
     /// Front, EXP10 dispatches (NoteDispatchWriter): the newest sent, the newest sent while the
     /// back did not record (EXP10 off), whether the back was last told to record, and how many.
     u64 last_dispatch_position{};

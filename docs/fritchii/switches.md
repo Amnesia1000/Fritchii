@@ -913,6 +913,27 @@ and the reads EXP120 let skip the drain (an unranged note it spared since the pa
 with their own "differed" count, which EDEN_NX2_DMA_SNAPSHOT=10 checks and must stay 0. With 0
 the counts show who notes the unranged writers. Toggle live 0/1 (or 0/2) with profile_toggle.py.
 
+### EXP122
+
+EXP122 (live, 0 = off; GpuSplit's page watch, fable_answer_long_drains 8.2 (a'),
+fable52_answer_kills 3.4; needs EXP10 on): the device pages the macro DMA read snapshots
+(EDEN_NX2_DMA_SNAPSHOT) are served from are watched. Each compute or copy range the fronts note
+(NoteWriterRange, NoteReleaseWriter) is tested against those pages when it is noted, and the
+bytes it covers in a watched page are kept with its position (8 a page, the rest folded into one
+union). A read of a watched page then answers "may a writer since the snapshot write these
+bytes" from that list, with no scan of the writer range ring and no scan limit: before, every
+"past the scan" drain of the session was the scan giving up (4,096 ranges at ~11,500 a second),
+never an overlap. Pages that are not watched (256 at most, least recently used replaced), or
+whose watch started after the snapshot asked about (another channel's snapshot), take the ring
+scan as before; the ring's other readers are unchanged. Unbounded writers still count for every
+page. 1 = on. 2 = on, and every "no write" answer is checked by the old scan without its limit;
+an overlap it finds that the watch did not report is a verify mismatch (the first 16 logged as
+"Writer page watch (EXP122=2)"), which must stay 0. EXP10's "DMA snapshot EXP10" line logs reads
+answered by the page watch (and how many said "may write"), watched pages, byte-list overflows,
+verified answers and verify mismatches. Off by default, not measured yet: run 2 first (0
+mismatches in a kill fight and at the pot room), then toggle 0/1 with profile_toggle.py and
+compare the "past the scan" count and the macro dma read drains.
+
 ### EXP101
 
 EXP101 (live, 0 = off, 1 = runs, 2 = cached page pointer + prefetch; fable52_answer_presenter): nvhost_gpu::SubmitGPFIFOImpl's pushbuffer
