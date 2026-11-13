@@ -464,7 +464,30 @@ void Maxwell3D::DrawManager::ProcessDrawIndirect(Engine& maxwell3d) {
     }
 }
 // The two engines the draw manager's code runs on (see IsBack above).
-#define FRITCHII_DRAW_MANAGER_INSTANTIATE(E)                                                             template void Maxwell3D::DrawManager::ProcessMethodCall<E>(E&, u32, u32);                           template void Maxwell3D::DrawManager::Clear<E>(E&, u32);                                            template void Maxwell3D::DrawManager::DrawDeferred<E>(E&, bool);                                    template void Maxwell3D::DrawManager::DrawArray<E>(E&, Maxwell3D::Regs::PrimitiveTopology, u32,                                                        u32, u32, u32);                                 template void Maxwell3D::DrawManager::DrawArrayInstanced<E>(                                            E&, Maxwell3D::Regs::PrimitiveTopology, u32, u32, bool);                                        template void Maxwell3D::DrawManager::DrawIndex<E>(E&, Maxwell3D::Regs::PrimitiveTopology, u32,                                                        u32, u32, u32, u32);                            template void Maxwell3D::DrawManager::DrawArrayIndirect<E>(E&,                                                                                                 Maxwell3D::Regs::PrimitiveTopology);     template void Maxwell3D::DrawManager::DrawIndexedIndirect<E>(                                           E&, Maxwell3D::Regs::PrimitiveTopology, u32, u32);                                              template void Maxwell3D::DrawManager::SetInlineIndexBuffer<E>(E&, u32);                             template void Maxwell3D::DrawManager::SetInlineIndexBuffer<E>(E&, u32, const u32*, u32);            template void Maxwell3D::DrawManager::DrawBegin<E>(E&);                                             template void Maxwell3D::DrawManager::AddLoopInstances<E>(E&, u32);                                 template void Maxwell3D::DrawManager::DrawEnd<E>(E&, u32, bool);                                    template void Maxwell3D::DrawManager::DrawIndexSmall<E>(E&, u32);                                   template void Maxwell3D::DrawManager::DrawTexture<E>(E&);                                           template void Maxwell3D::DrawManager::UpdateTopology<E>(E&);                                        template void Maxwell3D::DrawManager::ProcessDraw<E>(E&, bool, u32);                                template void Maxwell3D::DrawManager::ProcessDrawIndirect<E>(E&);
+#define FRITCHII_DRAW_MANAGER_INSTANTIATE(E)                                                       \
+    template void Maxwell3D::DrawManager::ProcessMethodCall<E>(E&, u32, u32);                      \
+    template void Maxwell3D::DrawManager::Clear<E>(E&, u32);                                       \
+    template void Maxwell3D::DrawManager::DrawDeferred<E>(E&, bool);                               \
+    template void Maxwell3D::DrawManager::DrawArray<E>(                                            \
+        E&, Maxwell3D::Regs::PrimitiveTopology, u32, u32, u32, u32);                               \
+    template void Maxwell3D::DrawManager::DrawArrayInstanced<E>(                                   \
+        E&, Maxwell3D::Regs::PrimitiveTopology, u32, u32, bool);                                   \
+    template void Maxwell3D::DrawManager::DrawIndex<E>(                                            \
+        E&, Maxwell3D::Regs::PrimitiveTopology, u32, u32, u32, u32, u32);                          \
+    template void Maxwell3D::DrawManager::DrawArrayIndirect<E>(                                    \
+        E&, Maxwell3D::Regs::PrimitiveTopology);                                                   \
+    template void Maxwell3D::DrawManager::DrawIndexedIndirect<E>(                                  \
+        E&, Maxwell3D::Regs::PrimitiveTopology, u32, u32);                                         \
+    template void Maxwell3D::DrawManager::SetInlineIndexBuffer<E>(E&, u32);                        \
+    template void Maxwell3D::DrawManager::SetInlineIndexBuffer<E>(E&, u32, const u32*, u32);       \
+    template void Maxwell3D::DrawManager::DrawBegin<E>(E&);                                        \
+    template void Maxwell3D::DrawManager::AddLoopInstances<E>(E&, u32);                            \
+    template void Maxwell3D::DrawManager::DrawEnd<E>(E&, u32, bool);                               \
+    template void Maxwell3D::DrawManager::DrawIndexSmall<E>(E&, u32);                              \
+    template void Maxwell3D::DrawManager::DrawTexture<E>(E&);                                      \
+    template void Maxwell3D::DrawManager::UpdateTopology<E>(E&);                                   \
+    template void Maxwell3D::DrawManager::ProcessDraw<E>(E&, bool, u32);                           \
+    template void Maxwell3D::DrawManager::ProcessDrawIndirect<E>(E&);
 
 FRITCHII_DRAW_MANAGER_INSTANTIATE(Maxwell3D)
 FRITCHII_DRAW_MANAGER_INSTANTIATE(VideoCommon::MemStageShadowEngine)
