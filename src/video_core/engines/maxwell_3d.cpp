@@ -3884,7 +3884,8 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                                  "ranges noted, {} ranges compared by the scans; page watch "
                                  "(EXP122={}): {} answered by the page watch ({} may write), {} "
                                  "watched pages, {} byte-list overflows, {} verified, {} verify "
-                                 "mismatches",
+                                 "mismatches; left to the ring: {} page not watched, {} watched "
+                                 "after the snapshot, {} over two pages; {} pages replaced",
                                  writer_unbounded + writer_overlaps + byte_overlaps +
                                      dispatch_drains,
                                  writer_unbounded, writer_overlaps, byte_overlaps,
@@ -3907,7 +3908,9 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                                  VideoCommon::g_writer_ranges_compared.load(
                                      std::memory_order_relaxed),
                                  exp122, watch.answered, watch.answered_write, watch.watched,
-                                 watch.overflows, watch.verified, watch.mismatches);
+                                 watch.overflows, watch.verified, watch.mismatches,
+                                 watch.unwatched_absent, watch.unwatched_newer,
+                                 watch.unwatched_spans, watch.replaced);
                     }
                 }
                 if (census_read) [[unlikely]] {
