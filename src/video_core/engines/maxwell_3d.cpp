@@ -93,20 +93,35 @@ struct Maxwell3D::StageCall {
             engine->draw_manager.AddLoopInstances(*engine, count);
         }
     };
+    /// StageTag::DrawLoop, ListDraw (header bits 40-47): [engine, address, keep id]. The next
+    /// draw.end draws the list whose two words are at `address` (FrontTakeListDraw).
+    struct ListDraw {
+        Maxwell3D* engine;
+        GPUVAddr address;
+        u64 keep_id;
+        void operator()() const {
+            engine->draw_manager.draw_state.list_draw_address = address;
+            engine->draw_manager.draw_state.list_keep_id = keep_id;
+        }
+    };
     static constexpr u64 FinishMacroFlags =
         VideoCommon::StageTagBits(VideoCommon::StageTag::FinishMacro);
     static constexpr u64 FoldFirstInstanceFlags =
         VideoCommon::StageDrawLoopBits(VideoCommon::StageDrawLoop::FoldFirstInstance);
     static constexpr u64 AddLoopInstancesFlags =
         VideoCommon::StageDrawLoopBits(VideoCommon::StageDrawLoop::AddLoopInstances);
+    static constexpr u64 ListDrawFlags =
+        VideoCommon::StageDrawLoopBits(VideoCommon::StageDrawLoop::ListDraw);
     // The words the stage reads (memstage_shadow.cpp), and ring entries as large as the lambdas
-    // these replaced ([this, &system], [this], [self, count]).
+    // these replaced ([this, &system], [this], [self, count], [this, address, keep_id]).
     static void CheckLayout() {
         static_assert(offsetof(FinishMacro, engine) == 0 && offsetof(FinishMacro, system) == 8 &&
                       sizeof(FinishMacro) == 16);
         static_assert(offsetof(FoldFirstInstance, engine) == 0 && sizeof(FoldFirstInstance) == 8);
         static_assert(offsetof(AddLoopInstances, engine) == 0 &&
                       offsetof(AddLoopInstances, count) == 8 && sizeof(AddLoopInstances) == 16);
+        static_assert(offsetof(ListDraw, engine) == 0 && offsetof(ListDraw, address) == 8 &&
+                      offsetof(ListDraw, keep_id) == 16 && sizeof(ListDraw) == 24);
     }
 };
 
@@ -3166,13 +3181,11 @@ bool Maxwell3D::FrontTakeListDraw(Core::System& system, VideoCommon::GpuSplit& s
     // words.
     fs.in_list_draw = true;
     FrontWrite(split, fs, MAXWELL3D_REG_INDEX(draw.begin), 0, true, true);
-    // Writes no guest memory itself (the draw.end after it notes the draw's writes).
-    split.Defer(
-        [this, address, keep_id = reader.keep_id] {
-            draw_manager.draw_state.list_draw_address = address;
-            draw_manager.draw_state.list_keep_id = keep_id;
-        },
-        VideoCommon::GpuSplit::Effect::None, VideoCommon::Nx2FastDrawCount::Neutral());
+    // Writes no guest memory itself (the draw.end after it notes the draw's writes). The memory
+    // stage stores the two fields in its copy of the draw state (StageCall::ListDraw).
+    split.Defer(StageCall::ListDraw{this, address, reader.keep_id},
+                VideoCommon::GpuSplit::Effect::None,
+                VideoCommon::Nx2FastDrawCount::Neutral() | StageCall::ListDrawFlags);
     FrontWrite(split, fs, MAXWELL3D_REG_INDEX(draw.end), 0, true, true);
     fs.in_list_draw = false;
     // List guard (nx2_list_dispatch.h): the two registers keep their old values from here on.

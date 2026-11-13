@@ -354,8 +354,15 @@ void Maxwell3D::DrawManager::DrawEnd(Engine& maxwell3d, u32 instance_count, bool
         draw_state.index_buffer.count = u32(draw_state.inline_index_draw_indexes.size() / 4);
         draw_state.index_buffer.format = Maxwell3D::Regs::IndexFormat::UnsignedInt;
         maxwell3d.dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+        if constexpr (!IsBack<Engine>) {
+            maxwell3d.NoteRaised(VideoCommon::Dirty::IndexBuffer);
+        }
         ProcessDraw(maxwell3d, true, instance_count);
         draw_state.inline_index_draw_indexes.clear();
+        if constexpr (!IsBack<Engine>) {
+            // The fill reads the inline index bytes (memstage_shadow.cpp, SHADOW=3).
+            maxwell3d.NoteChanged();
+        }
         break;
     }
 }
@@ -370,6 +377,9 @@ void Maxwell3D::DrawManager::DrawIndexSmall(Engine& maxwell3d, u32 argument) {
     draw_state.index_buffer.count = index_small_params.count;
     draw_state.topology = index_small_params.topology;
     maxwell3d.dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+    if constexpr (!IsBack<Engine>) {
+        maxwell3d.NoteRaised(VideoCommon::Dirty::IndexBuffer);
+    }
     ProcessDraw(maxwell3d, true, 1);
 }
 

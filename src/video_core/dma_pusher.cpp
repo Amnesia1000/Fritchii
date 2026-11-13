@@ -504,10 +504,21 @@ bool DmaPusher::Step() {
             const auto engine = subchannel_type[dma_state.subchannel];
             const bool kepler_payload = engine == Engines::EngineTypes::KeplerCompute && dma_state.method == ComputeInline && dma_state.non_incrementing;
             const bool macro_payload = engine == Engines::EngineTypes::Maxwell3D && dma_state.method >= MacroRegistersStart;
-            if (kepler_payload || macro_payload) {
+            auto& split = VideoCommon::GpuSplit::Get();
+            // A 3D macro the split's front runs (the routing of CallMethod/CallMultiMethod below:
+            // front macros and the native Turing macro engine) never reaches ProcessMacro, the
+            // only reader of the 3D engine's current_dirty: its closure is not sent. It asked
+            // the buffer cache (MustFlushRegion) on the back for nothing, and the memory stage
+            // has to lend the cache for it (fable_memstage_6b_plan 2.8).
+            const bool front_macro =
+                macro_payload && split.Active() && split.FrontMacros() &&
+                static_cast<Engines::Maxwell3D*>(subchannels[dma_state.subchannel])
+                    ->GetNativeMacroEngine()
+                    .native_turing;
+            if (kepler_payload || (macro_payload && !front_macro)) {
                 const size_t words = std::min<size_t>(dma_state.method_count, header.size);
                 auto* const engine_state = subchannels[dma_state.subchannel];
-                if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+                if (split.Active()) {
                     // The caches behind IsMemoryDirty belong to the split's back thread.
                     split.Defer(
                         [engine_state, memory = &memory_manager,
@@ -619,7 +630,11 @@ bool DmaPusher::Step() {
                         }
                     }
                     // Only reads and logs: neutral for the delta draw count (fable backthread 9).
-                }, VideoCommon::GpuSplit::Effect::Unknown, VideoCommon::Nx2FastDrawCount::Neutral());
+                    // The memory stage passes it: the page table and the GPU-written page bits,
+                    // no register, no cache object, no game memory (fable_memstage_6b_plan 2.1).
+                }, VideoCommon::GpuSplit::Effect::Unknown,
+                   VideoCommon::Nx2FastDrawCount::Neutral() |
+                       VideoCommon::StageTagBits(VideoCommon::StageTag::Pass));
             }
         }
         // Resume and GPU-written entries need live words, even after a flush cleared dirty state.
