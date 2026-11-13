@@ -883,15 +883,17 @@ unranged writer, which ends every snapshot ("unranged" misses in the "DMA snapsh
 method but the blit launch, pixels_from_memory.src_y0 + 1) and a single data word that is not
 its method's last (the upload is written with the last one) are not noted; the data of a linear
 upload notes the bytes it may write (from the upload registers as sent: line_length_in,
-line_count, address, pitch, and the exec's copy size), when they are under 1 MiB and map to one
-device range. Blits (with 1), block linear uploads and anything else stay unranged. With 2,
-also a blit launch notes its whole destination surface (the registers as sent: address,
-layout, pitch or block linear size from width, height, depth and block sizes, the format's
-bytes per pixel; as SoftwareBlitEngine sizes it, whose covered rows stay inside it; the texture
-cache's copy writes an image, not guest memory), when it is up to 64 MiB and maps to one device
-range. "DMA snapshot unranged notes (EXP120=n; single/run)" logs, every 5 s with the "DMA
-snapshot" line, each kind
-of method by call (single method / non-incrementing run): noted unranged, ranged, not noted;
+line_count, address, pitch, and the exec's copy size). Blits (with 1), block linear uploads
+and anything else stay unranged. With 2, also a blit launch notes its whole destination surface
+(the registers as sent: address, layout, pitch or block linear size from width, height, depth
+and block sizes, the format's bytes per pixel; as SoftwareBlitEngine sizes it, whose covered
+rows stay inside it; the texture cache's copy writes an image, not guest memory). A range is
+noted as the device ranges its mapped pages make (unmapped pages are written by nothing), when
+it is up to 1 GiB and makes at most 16 of them; otherwise it stays unranged. "DMA snapshot
+unranged notes (EXP120=n; single/run)" logs, every 5 s with the "DMA snapshot" line, each kind
+of method by call (single method / non-incrementing run): noted unranged, ranged, not noted
+(with 2, why blits stayed unranged: a destination register not sent yet, format, empty, over
+1 GiB, unmapped, over 16 device ranges);
 and the reads EXP120 let skip the drain (an unranged note it spared since the page's snapshot)
 with their own "differed" count, which EDEN_NX2_DMA_SNAPSHOT=10 checks and must stay 0. With 0
 the counts show who notes the unranged writers. Toggle live 0/1 (or 0/2) with profile_toggle.py.
