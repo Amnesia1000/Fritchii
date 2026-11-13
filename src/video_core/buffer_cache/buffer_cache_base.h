@@ -1044,7 +1044,7 @@ private:
 #else
     static constexpr size_t TICKS_TO_DESTROY = 8;
 #endif
-    DelayedDestructionRing<Buffer, TICKS_TO_DESTROY> delayed_destruction_ring;
+    StampedDestructionRing<Buffer, TICKS_TO_DESTROY> delayed_destruction_ring;
 
     const Tegra::Engines::Maxwell3D::DrawManager::IndirectParams* current_draw_indirect{};
 
