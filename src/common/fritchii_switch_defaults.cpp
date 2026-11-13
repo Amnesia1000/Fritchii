@@ -179,6 +179,11 @@ void LoadExperiments() {
         // fired in OoT) runs on 1 entry in 64. At every entry it cost ~8 ms/s of the back and was
         // 236,000 of the memory stage's 273,000 level entries a second at the market (5b shadow).
         g_experiments[105].store(64, std::memory_order_relaxed);
+        // EXP121 = 1 (2026-11-13, owner OK): the texture collector records the download of a
+        // GPU-written image it evicts and deletes the image once the GPU is past the copy, instead
+        // of waiting for the GPU each time (2-3 ms stalls in fight frames). Verified with EXP121=2:
+        // 481 landings compared, 0 mismatches. Fight 62.5 -> 64.2 and 62.9 -> 64.7 fps.
+        g_experiments[121].store(1, std::memory_order_relaxed);
         // EXP114 = 2 (2026-11-13): the GPU thread's pending polls wait 2 us with PAUSE instead of
         // yielding. Daytime market, flipped every 20 s: 59.2 -> 59.9 fps, windows 54.8-63.7 ->
         // 59.1-60.4, 1% low 40.0 -> 42.1, back 7.35 -> 7.16 us a draw; the owner felt it steadier.
