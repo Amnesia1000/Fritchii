@@ -66,6 +66,12 @@ public:
     BufferRecycler(const BufferRecycler&) = delete;
     BufferRecycler& operator=(const BufferRecycler&) = delete;
 
+    /// The buffer cache's clock (packet stamps with FRITCHII_MEMSTAGE_TICKS), before any use.
+    void UseClock(const SeamClock& clock_) {
+        std::scoped_lock lock{mutex};
+        clock = clock_;
+    }
+
     /// Whether EXP104 is on (live).
     [[nodiscard]] static bool Enabled() noexcept;
 

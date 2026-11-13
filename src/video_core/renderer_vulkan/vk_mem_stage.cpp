@@ -182,6 +182,35 @@ const char* UseName(SeamHook::Use use) {
     return "?";
 }
 
+/// A fill at one of these sites is a packet of its own (the others belong to a draw or dispatch).
+bool IsOpSite(MemStage::Site site) {
+    switch (site) {
+    case MemStage::Site::Invalidation:
+    case MemStage::Site::Download:
+    case MemStage::Site::DownloadForRead:
+    case MemStage::Site::Frame:
+    case MemStage::Site::Dma:
+    case MemStage::Site::InlineUpload:
+    case MemStage::Site::Unmap:
+    case MemStage::Site::ImageCopy:
+    case MemStage::Site::Query:
+    case MemStage::Site::Fence:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/// FRITCHII_MEMSTAGE_TICKS (boot): 0 the scheduler's ticks, 1 packet ticks, 2 packet ticks
+/// checked against the scheduler's answer.
+u32 TicksMode() {
+    const char* const value = std::getenv("FRITCHII_MEMSTAGE_TICKS");
+    if (value == nullptr || value[0] < '0' || value[0] > '9') {
+        return 0;
+    }
+    return (std::min)(static_cast<u32>(std::atoi(value)), 2U);
+}
+
 bool IsRecord(SeamHook::Use use) {
     switch (use) {
     case SeamHook::Use::Record:
@@ -219,6 +248,13 @@ void SeamHook::OnUse(Use use, const std::source_location& location) {
             stage->Note(use, location, false);
         }
         stage->PlayPending(true);
+    }
+}
+
+void SeamHook::OnTickEnd(u64 tick) {
+    MemStage* const stage = g_stage.load(std::memory_order_acquire);
+    if (stage != nullptr && stage->ticks) {
+        stage->ticks->Close(tick);
     }
 }
 
@@ -263,6 +299,9 @@ MemStage::Fill::Fill(MemStage& stage_, Site site_, u32 index_)
             stage.play_cursor = 0;
             stage.last_entry = ~0U;
         }
+        if (stage.ticks && IsOpSite(site)) {
+            stage.op_number = stage.ticks->BeginPacket();
+        }
     }
     begin = stage.OwnedHere() ? stage.arena.Size() : 0;
     t_site = site;
@@ -302,12 +341,22 @@ MemStage::SyncScope::~SyncScope() {
 
 MemStage::MemStage(MemPlayer& player_) : player{player_}, arena{256 * 1024} {
     player.stage = this;
+    if (const u32 mode = TicksMode(); mode != 0) {
+        ticks = std::make_unique<SeamTicks>(player.scheduler.GetMasterSemaphore(), mode == 2);
+        LOG_INFO(Render_Vulkan, "Memory seam: packet ticks (FRITCHII_MEMSTAGE_TICKS={}){}", mode,
+                 mode == 2 ? ", checked against the scheduler's ticks" : "");
+    }
     g_stage.store(this, std::memory_order_release);
+    if (ticks) {
+        SeamHook::g_tick_watch.store(true, std::memory_order_release);
+    }
 }
 
 MemStage::~MemStage() {
     MemStage* expected = this;
-    g_stage.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel);
+    if (g_stage.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel) && ticks) {
+        SeamHook::g_tick_watch.store(false, std::memory_order_release);
+    }
     if (pending) {
         SeamHook::g_watch.fetch_sub(1, std::memory_order_relaxed);
     }
@@ -324,6 +373,9 @@ bool MemStage::Deferring() const noexcept {
 void MemStage::SetPending() {
     if (!pending) {
         pending = true;
+        if (ticks) {
+            ticks->SetUnplayed(ticks->Current());
+        }
         SeamHook::g_watch.fetch_add(1, std::memory_order_relaxed);
     }
 }
@@ -340,6 +392,9 @@ void MemStage::PlayPending([[maybe_unused]] bool late) {
         player.Exec(entry);
     }
     pending = false;
+    if (ticks) {
+        ticks->ClearUnplayed();
+    }
     last_entry = ~0U;
     SeamHook::g_watch.fetch_sub(1, std::memory_order_relaxed);
 }
@@ -376,7 +431,7 @@ void MemStage::CloseSection(Site site, u32 index, u32 begin) {
         break;
     default:
         if (t_fill_depth == 1) {
-            op.number = ++packet_number;
+            op.number = ticks ? op_number : ++packet_number;
             op.entries = span;
         }
         break;
@@ -393,7 +448,7 @@ void MemStage::EnterSync(Sync kind) {
 void MemStage::BeginDraw(u32 repack_mask, u32 repack_dirty) {
     Bump(counters.draws);
     draw = DrawPacket{};
-    draw.number = ++packet_number;
+    draw.number = ticks ? ticks->BeginPacket() : ++packet_number;
     draw.fill_tick = player.scheduler.CurrentTick();
     draw.repack_mask = repack_mask;
     draw.repack_dirty = repack_dirty;
@@ -402,7 +457,7 @@ void MemStage::BeginDraw(u32 repack_mask, u32 repack_dirty) {
 void MemStage::BeginDispatch() {
     Bump(counters.dispatches);
     dispatch = DispatchPacket{};
-    dispatch.number = ++packet_number;
+    dispatch.number = ticks ? ticks->BeginPacket() : ++packet_number;
     dispatch.fill_tick = player.scheduler.CurrentTick();
 }
 
@@ -599,6 +654,9 @@ void MemStage::TickFrame() {
     if (on || stats_env) {
         LogStats();
     }
+    if (ticks) {
+        ticks->LogStats();
+    }
 }
 
 void MemStage::LogStats() {
@@ -716,18 +774,27 @@ void MemStage::Snapshot(Counts& out) const {
 }
 
 // ---------------------------------------------------------------------------------------------
-// SeamClock. Now, IsFree and KnownGpu read the scheduler's master semaphore, exactly what
-// Scheduler::CurrentTick and IsFree read. The syncs play the pending entries first.
+// SeamClock. With FRITCHII_MEMSTAGE_TICKS = 0 (or no stage), Now, IsFree and KnownGpu read the
+// scheduler's master semaphore, exactly what Scheduler::CurrentTick and IsFree read; with 1 or 2
+// they ask SeamTicks (below). The syncs play the pending entries first.
 
 SeamClock::SeamClock(Scheduler& scheduler_, MemStage* stage_)
-    : scheduler{&scheduler_}, master{&scheduler_.GetMasterSemaphore()}, stage{stage_} {}
+    : scheduler{&scheduler_}, master{&scheduler_.GetMasterSemaphore()}, stage{stage_},
+      ticks{stage_ != nullptr ? stage_->Ticks() : nullptr} {}
 
 void SeamClock::Finish(std::source_location location) {
     MemStage::SyncScope sync{stage, MemStage::Sync::Finish};
     scheduler->Finish({}, {}, location);
 }
 
-void SeamClock::Wait(u64 tick) {
+void SeamClock::Wait(u64 stamp) {
+    MemStage::SyncScope sync{stage, MemStage::Sync::Wait};
+    // Translated after the scope played the pending entries: a number still unpublished then is
+    // recorded in the current tick, which Scheduler::Wait flushes (and so publishes).
+    scheduler->Wait(ticks != nullptr ? ticks->WaitTickOf(stamp) : stamp);
+}
+
+void SeamClock::WaitTick(u64 tick) {
     MemStage::SyncScope sync{stage, MemStage::Sync::Wait};
     scheduler->Wait(tick);
 }
@@ -736,7 +803,364 @@ u64 SeamClock::SubmitForHostRead(std::source_location location) {
     MemStage::SyncScope sync{stage, MemStage::Sync::SubmitForHostRead};
     scheduler->RequestOutsideRenderPassOperationContext(location);
     scheduler->Record(HostReadBarrier);
-    return scheduler->Flush({}, {}, location);
+    if (ticks == nullptr) {
+        return scheduler->Flush({}, {}, location);
+    }
+    // Nothing is pending after the scope: the number current now is the one this flush closes,
+    // and the stamp of the tick it submits.
+    const u64 stamp = ticks->Now();
+    const u64 tick = scheduler->Flush({}, {}, location);
+    ticks->CheckHostRead(stamp, tick);
+    return stamp;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Packet ticks: FRITCHII_MEMSTAGE_TICKS >= 1 (boot), fable_memstage_step2_spec.md 7.2, build
+// step 4.
+//
+// A stamp is a packet number, not a scheduler tick. The stage counts its packets up (a draw, a
+// dispatch and an operation packet each take the next number: BeginPacket), and every stamp the
+// buffer cache side takes (SeamClock::Now: buffer usage, staging and stream regions, recycled
+// buffers, write ticks, probes, list page copies, deleted buffers) is the number current then.
+// The thread that records publishes, at the end of every scheduler tick, "every number up to N
+// was recorded in tick K" (Close, called by Scheduler::SubmitExecution right before the tick
+// advances). A stamp is free when the tick its number was published with is complete.
+//
+// The published table is a short ring of (N, K), in order, for the ticks not yet seen complete;
+// `free_number` is the highest N whose K is known complete. IsFree is a load or two in the
+// common cases (at or below free_number: free; above the last published N: not free) and
+// otherwise advances free_number to the master semaphore's known GPU tick under the lock. So it
+// never asks the GPU more than Scheduler::IsFree did (it does not refresh).
+//
+// What N a close publishes. Entries the stage filled and the player has not played are not
+// recorded yet: their number (`unplayed_from`, set when the first entry starts waiting) and every
+// later one stay open, and are published with a later tick, the one their play lands in. That is
+// what makes sub-step 2b's tick guard (StagingBufferPool::Retick) unnecessary with packet ticks:
+// a staging buffer stamped at an early fill is not free before the tick its copy is recorded in.
+// Otherwise the close takes the current number and moves the stage on to the next, so a stamp
+// taken after the tick ended is never published with it. On one thread each number then lives
+// in exactly one tick, and every answer is today's: IsFree(N) == IsFree(the tick N was handed
+// out in).
+//
+// Step 6 (the stage on its own thread, ahead of the GPU thread) keeps the stamps, the ring and
+// the reads as they are. Only Close changes: the GPU thread publishes the last packet it has
+// played and never moves `open` (the stage alone does). Waits on a stamp not yet published
+// (TickOf falls back to the current tick, right only when the two are level) become a join:
+// the stage asks the GPU thread to play up to that packet and flush.
+//
+// Users that compare stamps for equality (the stream uniform reuse and its keeps: "same tick, so
+// the stream copy is still there") take Epoch(): the number of closes. A copy made at epoch E
+// carries a number not yet published; its stream region is only recycled once that number is
+// published and complete, which is a later close, so "still epoch E" keeps meaning "not
+// recycled" in step 6. On one thread there is one close per tick and the epoch is the tick.
+//
+// FRITCHII_MEMSTAGE_TICKS = 2 checks every answer against the scheduler's: each stamp handed out
+// notes the tick current then (a ring keyed by number, 2^18 numbers back), and IsFree, the
+// stream regions' known-GPU test, the waits, the host read flushes and the epoch compare with
+// what that tick says. The "Memory seam ticks" line every 10 s:
+//   early:     the packet answer frees (or waits for) less than the tick answer. Unsafe; must be 0.
+//   late:      the packet answer holds longer. Must be 0 on one thread.
+//   carried:   numbers a tick ended with unplayed (an early fill across a flush): skipped, the
+//              packet answer is the right one there and the tick answer is the one 2b guards.
+//   split:     a number handed out in two ticks without a carry (a tick ended without a close).
+//              Must be 0.
+//   unchecked: stamps older than the ring.
+//   epoch off: Epoch() differed from the scheduler's tick. Must be 0.
+// Deleted buffers held past their frames (buffer_cache.h's ring waits for their stamp as well)
+// are counted with 1 and 2; on one thread they must be 0.
+
+namespace {
+constexpr u64 StampSlots = u64{1} << 18;
+constexpr std::array<const char*, 4> CHECK_NAMES{"is free", "stream known", "wait", "host read"};
+
+thread_local u64 t_known_tick = 0;
+std::atomic<u32> g_ticks_logged{0};
+
+u64 SteadyNs() {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+}
+} // Anonymous namespace
+
+SeamTicks::SeamTicks(MasterSemaphore& master_, bool verify_) : master{&master_}, verify{verify_} {
+    epoch.store(master->CurrentTick(), std::memory_order_release);
+    if (verify) {
+        slots = std::make_unique<StampSlot[]>(StampSlots);
+    }
+}
+
+SeamTicks::~SeamTicks() = default;
+
+u64 SeamTicks::Advance(u64 known) {
+    std::scoped_lock lock{mutex};
+    return AdvanceLocked(known);
+}
+
+u64 SeamTicks::AdvanceLocked(u64 known) {
+    u64 free = free_number.load(std::memory_order_relaxed);
+    while (!ring.empty() && ring.front().tick <= known) {
+        free = ring.front().last;
+        ring.pop_front();
+    }
+    // free_number before advanced_gpu: a reader that sees the new known GPU tick there sees the
+    // numbers it frees.
+    free_number.store(free, std::memory_order_release);
+    if (known > advanced_gpu.load(std::memory_order_relaxed)) {
+        advanced_gpu.store(known, std::memory_order_release);
+    }
+    return free;
+}
+
+void SeamTicks::Close(u64 tick) {
+    std::scoped_lock lock{mutex};
+    const u64 unplayed = unplayed_from.load(std::memory_order_acquire);
+    u64 last;
+    if (unplayed != 0) {
+        last = unplayed - 1;
+        Bump(counters.carried);
+        if (verify) {
+            const u64 to = open.load(std::memory_order_acquire);
+            carried_ranges.push_back(Range{.from = unplayed, .to = to});
+            if (carried_ranges.size() > 1024) {
+                carried_ranges.pop_front();
+            }
+            carried_to.store(to, std::memory_order_release);
+        }
+    } else {
+        last = open.fetch_add(1, std::memory_order_acq_rel);
+    }
+    if (last > published.load(std::memory_order_relaxed)) {
+        ring.push_back(Published{.last = last, .tick = tick});
+        published.store(last, std::memory_order_release);
+    }
+    epoch.fetch_add(1, std::memory_order_acq_rel);
+    Bump(counters.closes);
+    AdvanceLocked(master->KnownGpuTick());
+    if (const u64 depth = ring.size(); depth > counters.max_depth.load(std::memory_order_relaxed)) {
+        counters.max_depth.store(depth, std::memory_order_relaxed);
+    }
+}
+
+u64 SeamTicks::TickOf(u64 stamp) {
+    std::scoped_lock lock{mutex};
+    if (stamp <= free_number.load(std::memory_order_relaxed)) {
+        // Complete: any complete tick does for a wait or a submitted test.
+        return advanced_gpu.load(std::memory_order_relaxed);
+    }
+    const auto it = std::lower_bound(
+        ring.begin(), ring.end(), stamp,
+        [](const Published& entry, u64 value) { return entry.last < value; });
+    // Not published: still open, so its uses are in the tick being recorded.
+    return it != ring.end() ? it->tick : master->CurrentTick();
+}
+
+u64 SeamTicks::WaitTickOf(u64 stamp) {
+    const u64 tick = TickOf(stamp);
+    if (verify) [[unlikely]] {
+        u64 old_tick{};
+        if (stamp > free_number.load(std::memory_order_acquire) && OldTick(stamp, old_tick)) {
+            Bump(counters.checks[static_cast<size_t>(Check::Wait)]);
+            if (tick != old_tick) {
+                Disagree(Check::Wait, tick < old_tick, stamp, old_tick, tick);
+            }
+        }
+    }
+    return tick;
+}
+
+void SeamTicks::CheckHostRead(u64 stamp, u64 tick) {
+    if (!verify) {
+        return;
+    }
+    const u64 published_tick = TickOf(stamp);
+    if (stamp <= free_number.load(std::memory_order_acquire)) {
+        return;
+    }
+    Bump(counters.checks[static_cast<size_t>(Check::HostRead)]);
+    if (published_tick != tick) {
+        Disagree(Check::HostRead, published_tick < tick, stamp, tick, published_tick);
+    }
+}
+
+void SeamTicks::NoteHeld(u64 newly_held) noexcept {
+    if (newly_held != 0) {
+        Bump(counters.held, newly_held);
+    }
+}
+
+void SeamTicks::NoteStamp(u64 number) noexcept {
+    StampSlot& slot = slots[number & (StampSlots - 1)];
+    const u64 tick = master->CurrentTick();
+    if (slot.number.load(std::memory_order_acquire) != number) {
+        slot.first.store(tick, std::memory_order_relaxed);
+        slot.last.store(tick, std::memory_order_relaxed);
+        slot.number.store(number, std::memory_order_release);
+    } else if (slot.last.load(std::memory_order_relaxed) != tick) {
+        slot.last.store(tick, std::memory_order_relaxed);
+    }
+}
+
+bool SeamTicks::OldTick(u64 stamp, u64& tick) {
+    if (stamp == 0 || stamp == Never) {
+        // Never stamped (free) and the deferred staging buffers' "never free".
+        tick = stamp;
+        return true;
+    }
+    const StampSlot& slot = slots[stamp & (StampSlots - 1)];
+    if (slot.number.load(std::memory_order_acquire) != stamp) {
+        Bump(counters.unchecked);
+        return false;
+    }
+    const u64 first = slot.first.load(std::memory_order_relaxed);
+    const u64 last = slot.last.load(std::memory_order_relaxed);
+    bool carried = false;
+    if (stamp <= carried_to.load(std::memory_order_acquire)) {
+        std::scoped_lock lock{mutex};
+        carried = std::ranges::any_of(carried_ranges, [stamp](const Range& range) {
+            return stamp >= range.from && stamp <= range.to;
+        });
+    }
+    if (carried) {
+        Bump(counters.carried_skipped);
+        return false;
+    }
+    if (first != last) {
+        Bump(counters.split);
+        if (g_ticks_logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+            LOG_WARNING(Render_Vulkan,
+                        "Memory seam ticks: packet {} was handed out in ticks {} and {} without "
+                        "a carry (a tick ended without a close)",
+                        stamp, first, last);
+        }
+        return false;
+    }
+    tick = first;
+    return true;
+}
+
+bool SeamTicks::IsFreeChecked(u64 stamp) {
+    const u64 known_before = master->KnownGpuTick();
+    const bool free = IsFreeFast(stamp);
+    const u64 known_after = master->KnownGpuTick();
+    u64 old_tick{};
+    if (!OldTick(stamp, old_tick)) {
+        return free;
+    }
+    Bump(counters.checks[static_cast<size_t>(Check::IsFree)]);
+    // The packet answer came from a known GPU tick between the two reads.
+    if (free && old_tick > known_after) {
+        Disagree(Check::IsFree, true, stamp, old_tick, known_after);
+    } else if (!free && old_tick <= known_before) {
+        Disagree(Check::IsFree, false, stamp, old_tick, known_before);
+    }
+    return free;
+}
+
+u64 SeamTicks::KnownFreeChecked(u64 known) {
+    std::scoped_lock lock{mutex};
+    const u64 free = AdvanceLocked(known);
+    // The tick that answer stands for (another thread may have advanced past `known`).
+    t_known_tick = advanced_gpu.load(std::memory_order_relaxed);
+    return free;
+}
+
+void SeamTicks::CheckKnown(u64 stamp, bool free) {
+    u64 old_tick{};
+    if (!OldTick(stamp, old_tick)) {
+        return;
+    }
+    Bump(counters.checks[static_cast<size_t>(Check::Known)]);
+    const bool old_free = old_tick <= t_known_tick;
+    if (free != old_free) {
+        Disagree(Check::Known, free, stamp, old_tick, t_known_tick);
+    }
+}
+
+void SeamTicks::CheckEpoch(u64 value) {
+    const u64 tick = master->CurrentTick();
+    if (value != tick) {
+        Bump(counters.epoch_off);
+        if (g_ticks_logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+            LOG_WARNING(Render_Vulkan, "Memory seam ticks: epoch {} while the tick is {}", value,
+                        tick);
+        }
+    }
+}
+
+void SeamTicks::Disagree(Check kind, bool early, u64 stamp, u64 old_tick, u64 detail) {
+    const size_t index = static_cast<size_t>(kind);
+    Bump(early ? counters.early[index] : counters.late[index]);
+    if (g_ticks_logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+        LOG_WARNING(Render_Vulkan,
+                    "Memory seam ticks: {} answer {} for packet {}: tick {} by the scheduler's "
+                    "ticks, {} by the packet ticks (open {}, free up to {}, published up to {})",
+                    CHECK_NAMES[index], early ? "early" : "late", stamp, old_tick, detail,
+                    open.load(std::memory_order_relaxed),
+                    free_number.load(std::memory_order_relaxed),
+                    published.load(std::memory_order_relaxed));
+    }
+}
+
+void SeamTicks::Take(Snap& out) const noexcept {
+    out.numbers = open.load(std::memory_order_relaxed);
+    out.closes = counters.closes.load(std::memory_order_relaxed);
+    out.carried = counters.carried.load(std::memory_order_relaxed);
+    out.held = counters.held.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < out.checks.size(); ++i) {
+        out.checks[i] = counters.checks[i].load(std::memory_order_relaxed);
+        out.early[i] = counters.early[i].load(std::memory_order_relaxed);
+        out.late[i] = counters.late[i].load(std::memory_order_relaxed);
+    }
+    out.carried_skipped = counters.carried_skipped.load(std::memory_order_relaxed);
+    out.unchecked = counters.unchecked.load(std::memory_order_relaxed);
+    out.split = counters.split.load(std::memory_order_relaxed);
+    out.epoch_off = counters.epoch_off.load(std::memory_order_relaxed);
+}
+
+void SeamTicks::LogStats() {
+    const u64 now = SteadyNs();
+    if (last_log_ns == 0) {
+        last_log_ns = now;
+        Take(reported);
+        return;
+    }
+    if (now - last_log_ns < 10'000'000'000ULL) {
+        return;
+    }
+    const double seconds = static_cast<double>(now - last_log_ns) / 1e9;
+    last_log_ns = now;
+    Snap current;
+    Take(current);
+    const auto rate = [seconds](u64 value) { return static_cast<double>(value) / seconds; };
+    const u64 depth = counters.max_depth.exchange(0, std::memory_order_relaxed);
+    LOG_INFO(Render_Vulkan,
+             "Memory seam ticks (FRITCHII_MEMSTAGE_TICKS={}) {:.0f} s: packets {:.0f}/s, tick "
+             "closes {:.0f}/s, published ticks waiting at most {}, carried closes {}, deleted "
+             "buffers held past their frames {}",
+             verify ? 2 : 1, seconds, rate(current.numbers - reported.numbers),
+             rate(current.closes - reported.closes), depth, current.carried - reported.carried,
+             current.held - reported.held);
+    if (verify) {
+        std::string checks;
+        u64 early = 0;
+        u64 late = 0;
+        for (size_t i = 0; i < CHECK_NAMES.size(); ++i) {
+            const u64 e = current.early[i] - reported.early[i];
+            const u64 l = current.late[i] - reported.late[i];
+            early += e;
+            late += l;
+            checks += fmt::format("{}{} {} (early {}, late {})", checks.empty() ? "" : ", ",
+                                  CHECK_NAMES[i], current.checks[i] - reported.checks[i], e, l);
+        }
+        LOG_INFO(Render_Vulkan,
+                 "  memory seam ticks check: early {}, late {}; {}; carried skipped {}, split {}, "
+                 "unchecked {}, epoch off {}",
+                 early, late, checks, current.carried_skipped - reported.carried_skipped,
+                 current.split - reported.split, current.unchecked - reported.unchecked,
+                 current.epoch_off - reported.epoch_off);
+    }
+    reported = current;
 }
 
 // ---------------------------------------------------------------------------------------------

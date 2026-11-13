@@ -35,4 +35,15 @@ inline void Watch(Use use,
     }
 }
 
+inline std::atomic<bool> g_tick_watch{false};
+
+void OnTickEnd(u64 tick);
+
+/// The recording thread, right before the scheduler's current tick ends (packet ticks).
+inline void TickEnd(u64 tick) {
+    if (g_tick_watch.load(std::memory_order_relaxed)) [[unlikely]] {
+        OnTickEnd(tick);
+    }
+}
+
 } // namespace Vulkan::SeamHook

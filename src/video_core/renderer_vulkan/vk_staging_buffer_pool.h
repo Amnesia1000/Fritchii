@@ -65,6 +65,13 @@ public:
         return recycler;
     }
 
+    /// The buffer cache's clock for this pool and its recycler, before any request: with
+    /// FRITCHII_MEMSTAGE_TICKS their stamps are packet numbers.
+    void UseClock(const SeamClock& clock_) {
+        clock = clock_;
+        recycler.UseClock(clock_);
+    }
+
 private:
     struct StreamBufferCommit {
         size_t upper_bound;

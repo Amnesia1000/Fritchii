@@ -2912,7 +2912,7 @@ bool BufferCache<P>::BindSmallUniformKeeping(size_t stage, u32 index, u32 bindin
         const DAddr end = device_addr + size;
         const u64 first_page = device_addr >> Core::DEVICE_PAGEBITS;
         const u64 last_page = (end - 1) >> Core::DEVICE_PAGEBITS;
-        const u64 tick = runtime.CurrentTick();
+        const u64 tick = runtime.StreamEpoch();
 
         // 3.5: whether the slot's keep may be bound without reading guest memory.
         u64 scanned = 0;

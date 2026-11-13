@@ -168,6 +168,8 @@ StagingBufferRef StagingBufferPool::GetStreamBuffer(
         // Avoid waiting for the previous usages to be free
         return GetStagingBuffer(size, MemoryUsage::Upload, false, caller, true);
     }
+    // Lazy: the regions used since the last request take this one's stamp. With packet ticks
+    // that is a packet at or after theirs, so never free before their copies (vk_mem_stage.cpp).
     const u64 current_tick = clock.Now();
     std::fill(sync_ticks.begin() + Region(used_iterator), sync_ticks.begin() + Region(iterator),
               current_tick);
@@ -203,7 +205,9 @@ StagingBufferRef StagingBufferPool::GetStreamBuffer(
 bool StagingBufferPool::AreRegionsActive(size_t region_begin, size_t region_end) const {
     const u64 gpu_tick = clock.KnownGpu();
     return std::any_of(sync_ticks.begin() + region_begin, sync_ticks.begin() + region_end,
-                       [gpu_tick](u64 sync_tick) { return gpu_tick < sync_tick; });
+                       [this, gpu_tick](u64 sync_tick) {
+                           return !clock.IsKnownFree(sync_tick, gpu_tick);
+                       });
 };
 
 StagingBufferRef StagingBufferPool::GetStagingBuffer(

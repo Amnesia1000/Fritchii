@@ -360,6 +360,13 @@ BufferCacheRuntime::BufferCacheRuntime(const Device& device_, MemoryAllocator& m
       quad_index_pass(device, scheduler, descriptor_pool, staging_pool,
                       compute_pass_descriptor_queue),
       multi_range_buffers(device_) {
+    if (clock.Ticks() != nullptr) {
+        // Packet ticks: the stamps of this cache's staging pool and recycler are packet numbers
+        // too. Without FRITCHII_MEMSTAGE_SPLIT_ALLOC that pool is also the texture cache's: on
+        // one thread its stamps are just as right (the GPU thread records right after it takes
+        // them), but step 6 needs the split, so the GPU thread's own pool keeps scheduler ticks.
+        staging_pool.UseClock(clock);
+    }
     const VkDriverIdKHR driver_id = device.GetDriverID();
     const bool enable_vertex_repack = VertexRepackEnabled();
     LOG_INFO(Render_Vulkan, "69-byte vertex layout repacking {} ({})",
@@ -566,11 +573,14 @@ private:
 };
 } // Anonymous namespace
 
-void BufferCacheRuntime::WaitSubmittedTick(u64 tick, u64 writer) {
-    auto& master = scheduler.GetMasterSemaphore();
-    if (master.IsFree(tick)) {
+// `stamp` is the clock's (a packet number with FRITCHII_MEMSTAGE_TICKS): it is turned into the
+// scheduler tick it was recorded in once, here; the rest waits on that tick as before.
+void BufferCacheRuntime::WaitSubmittedTick(u64 stamp, u64 writer) {
+    if (clock.IsFree(stamp)) {
         return;
     }
+    auto& master = scheduler.GetMasterSemaphore();
+    const u64 tick = clock.TickOf(stamp);
     // The split's front waits for the GPU: the back runs meanwhile what the front sent, also the
     // entries since the front's last publish, which it does not see yet (fewer than 256 words;
     // ported).
@@ -603,7 +613,7 @@ void BufferCacheRuntime::WaitSubmittedTickImpl(u64 tick) {
         !VideoCommon::GpuSplit::OnBackThread()) {
         VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::ListSubmitWait};
         if (!scheduler.WaitSubmitted(tick)) {
-            clock.Wait(tick);
+            clock.WaitTick(tick);
             return;
         }
     }
@@ -619,11 +629,12 @@ u64 BufferCacheRuntime::SubmitForHostRead() {
     return clock.SubmitForHostRead();
 }
 
-void BufferCacheRuntime::WaitForHostRead(u64 tick) {
-    auto& master = scheduler.GetMasterSemaphore();
-    if (master.IsFree(tick)) {
+void BufferCacheRuntime::WaitForHostRead(u64 stamp) {
+    if (clock.IsFree(stamp)) {
         return;
     }
+    auto& master = scheduler.GetMasterSemaphore();
+    const u64 tick = clock.TickOf(stamp);
     namespace AsyncReadback = VideoCore::AsyncReadback;
     const u64 start = AsyncReadback::Now();
     // SubmitForHostRead flushed it, so it is handed to the worker: wait without flushing, which
@@ -632,7 +643,7 @@ void BufferCacheRuntime::WaitForHostRead(u64 tick) {
     if (!scheduler.IsSubmitted(tick) && VideoCommon::GpuSplit::Get().Active() &&
         !VideoCommon::GpuSplit::OnBackThread()) {
         if (!scheduler.WaitSubmitted(tick)) {
-            clock.Wait(tick);
+            clock.WaitTick(tick);
             AsyncReadback::Add(AsyncReadback::g_counters.to_submitted_ns,
                                AsyncReadback::Now() - start);
             return;
@@ -644,17 +655,34 @@ void BufferCacheRuntime::WaitForHostRead(u64 tick) {
     AsyncReadback::Add(AsyncReadback::g_counters.on_card_ns, AsyncReadback::Now() - submitted);
 }
 
-bool BufferCacheRuntime::IsFreeNow(u64 tick) {
-    if (clock.IsFree(tick)) {
+bool BufferCacheRuntime::IsFreeNow(u64 stamp) {
+    if (clock.IsFree(stamp)) {
         return true;
     }
-    if (!scheduler.IsSubmitted(tick)) {
+    if (!scheduler.IsSubmitted(clock.TickOf(stamp))) {
         return false;
     }
     scheduler.GetMasterSemaphore().Refresh();
-    return clock.IsFree(tick);
+    return clock.IsFree(stamp);
 }
 
+bool BufferCacheRuntime::DeletedBufferFree(u64 stamp) {
+    // FRITCHII_MEMSTAGE_TICKS: a deleted buffer also waits for the packet it was deleted in
+    // (every packet that used it is at or before that one). With 0 the frames alone, as before.
+    return clock.Ticks() == nullptr || clock.IsFree(stamp);
+}
+
+void BufferCacheRuntime::NoteHeldBuffers(u64 newly_held) {
+    if (SeamTicks* const ticks = clock.Ticks()) {
+        ticks->NoteHeld(newly_held);
+    }
+}
+
+// "Used" is the range tracker: Buffer::MarkUsage tracks the range and stamps the buffer, and
+// TickFrame resets the tracker only once that stamp is free. With FRITCHII_MEMSTAGE_TICKS the
+// stamp is a packet number, free once the GPU thread played that packet and its tick completed,
+// so a range a packet the GPU thread has not played yet uses still counts as used, and the
+// upload is not moved ahead of that use (spec 7.2, the third user that needs more than a swap).
 bool BufferCacheRuntime::CanReorderUpload(const Buffer& buffer,
                                           std::span<const VideoCommon::BufferCopy> copies) {
     if (Settings::values.disable_buffer_reorder) {
