@@ -67,6 +67,8 @@ enum class ImageFlagBits : u32 {
     /// EXP68 bit 4: made at an address whose target keeps changing size: freed when the GPU is
     /// done instead of going to the EXP42 pool (those dims never come back).
     NoPool = 1 << 25,
+    /// EXP121: the collector recorded its download; deleted once the GPU has written it out.
+    CollectPending = 1 << 26,
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
 
