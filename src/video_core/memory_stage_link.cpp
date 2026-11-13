@@ -1564,6 +1564,7 @@ void MemoryStageLink::RingLoop(std::stop_token& stop, u64 start) {
             // nothing of the stage.
             u64 until = position + result.size;
             u64 run_entries = 1;
+            u64 run_launches = result.launches;
             close_batch();
             Lend(position, until);
             const u64 run_start = LinkNowNs();
@@ -1618,6 +1619,7 @@ void MemoryStageLink::RingLoop(std::stop_token& stop, u64 start) {
                     LinkBump(counters.entries[(std::min)(static_cast<size_t>(more.cls), size_t{3})]);
                     until += more.size;
                     ++run_entries;
+                    run_launches += more.launches;
                     if (!publish_once) {
                         Ring::LentUntil().store(until, std::memory_order_relaxed);
                         PublishStaged(until);
@@ -1634,7 +1636,11 @@ void MemoryStageLink::RingLoop(std::stop_token& stop, u64 start) {
                     break;
                 }
             }
-            LinkBump(counters.run_ns, LinkNowNs() - run_start);
+            {
+                const u64 run_time = LinkNowNs() - run_start;
+                LinkBump(counters.run_ns, run_time);
+                NoteRunShape(result.channel, run_entries, run_launches, run_time);
+            }
             // The return (back parked at `until`): flags, takes, full copies.
             if (!BecomeBusy(stop)) {
                 break;
@@ -1688,6 +1694,80 @@ void MemoryStageLink::RingLoop(std::stop_token& stop, u64 start) {
 
 // ---------------------------------------------------------------------------------------------
 // Stats
+
+namespace {
+/// The run shape's buckets: 0, 1, 2-7, 8-63, 64-511, 512 and more.
+size_t RunBucket(u64 count) noexcept {
+    return count == 0 ? 0 : count == 1 ? 1 : count < 8 ? 2 : count < 64 ? 3 : count < 512 ? 4 : 5;
+}
+} // Anonymous namespace
+
+void MemoryStageLink::NoteRunShape(s32 channel, u64 entries, u64 launches, u64 ns) noexcept {
+    // GPUMem, once a run: a few relaxed adds, with the GPU profile only.
+    if (!Nx2Profile::Enabled()) {
+        return;
+    }
+    RunShape& shape = run_shape;
+    const size_t slot = channel >= 0 && static_cast<size_t>(channel) < RunChannels - 1
+                            ? static_cast<size_t>(channel)
+                            : RunChannels - 1;
+    LinkBump(shape.runs[slot]);
+    LinkBump(shape.entries[slot], entries);
+    LinkBump(shape.launches[slot], launches);
+    LinkBump(shape.ns[slot], ns);
+    const size_t by_entries = RunBucket(entries);
+    LinkBump(shape.by_entries[by_entries]);
+    LinkBump(shape.by_entries_ns[by_entries], ns);
+    const size_t by_launches = RunBucket(launches);
+    LinkBump(shape.by_launches[by_launches]);
+    LinkBump(shape.by_launches_ns[by_launches], ns);
+}
+
+void MemoryStageLink::LogRunShape(double seconds) {
+    RunShape& shape = run_shape;
+    const auto take = [](std::atomic<u64>& value) {
+        return value.exchange(0, std::memory_order_relaxed);
+    };
+    const auto rate = [seconds](u64 value) { return static_cast<double>(value) / seconds; };
+    const auto ms = [seconds](u64 ns) { return static_cast<double>(ns) / 1e6 / seconds; };
+    const auto each = [](u64 total, u64 count) {
+        return count != 0 ? static_cast<double>(total) / static_cast<double>(count) : 0.0;
+    };
+    std::string channels;
+    for (size_t i = 0; i < RunChannels; ++i) {
+        const u64 runs = take(shape.runs[i]);
+        const u64 entries = take(shape.entries[i]);
+        const u64 launches = take(shape.launches[i]);
+        const u64 ns = take(shape.ns[i]);
+        if (runs == 0) {
+            continue;
+        }
+        channels += fmt::format("{}channel {}: {:.0f}/s, {:.1f} entries and {:.1f} compute "
+                                "launches each, {:.1f} ms/s",
+                                channels.empty() ? "" : "; ",
+                                i == RunChannels - 1 ? std::string{"other"} : fmt::format("{}", i),
+                                rate(runs), each(entries, runs), each(launches, runs), ms(ns));
+    }
+    static constexpr std::array<const char*, RunBuckets> bucket_names{"0",     "1",       "2-7",
+                                                                      "8-63",  "64-511",  "512+"};
+    const auto buckets = [&](auto& counts, auto& times, size_t first) {
+        std::string text;
+        for (size_t i = first; i < RunBuckets; ++i) {
+            const u64 runs = take(counts[i]);
+            const u64 ns = take(times[i]);
+            text += fmt::format("{}{} {:.0f}/s {:.1f} ms/s", text.empty() ? "" : ", ",
+                                bucket_names[i], rate(runs), ms(ns));
+        }
+        return text;
+    };
+    const std::string by_entries = buckets(shape.by_entries, shape.by_entries_ns, 1);
+    const std::string by_launches = buckets(shape.by_launches, shape.by_launches_ns, 0);
+    LOG_INFO(HW_GPU,
+             "Memory stage runs by channel {:.0f} s: {} | by entries a run: {} | by compute "
+             "launches a run: {}",
+             seconds, channels.empty() ? std::string{"none"} : channels, by_entries,
+             by_launches);
+}
 
 void MemoryStageLink::Take(Snapshot& out) const noexcept {
     const auto load = [](const std::atomic<u64>& value) {
@@ -1858,6 +1938,9 @@ void MemoryStageLink::LogStats() {
                  rate(current.flag_handovers - reported.flag_handovers), served_text, level_text,
                  hashes, current.hash_mismatches - reported.hash_mismatches,
                  RingVerify() ? "on" : "off");
+        if (Nx2Profile::Enabled()) {
+            LogRunShape(seconds);
+        }
         // Step 7's window (spec 8.3: the stage's lead; 6.4's counters).
         static constexpr std::array<const char*, WindowBuckets> bucket_names{
             "1", "2-3", "4-7", "8-15", "16-31", "32-63", "64-255", "256+"};

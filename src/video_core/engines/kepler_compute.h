@@ -262,6 +262,11 @@ public:
     /// Write multiple values to the register identified by method.
     void CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) override;
 
+    /// EXP124: a macro's inline upload words (GpuSplit::MacroWords), each called as its
+    /// MacroWrite was; where the flush writes them in place, one flush for them all
+    /// (Upload::State, AccelerateInlineWords).
+    void CallMacroWords(Core::System& system, u32 method, const u32* words, u32 amount) override;
+
     std::optional<GPUVAddr> GetIndirectComputeAddress() const {
         return indirect_compute;
     }
@@ -336,6 +341,9 @@ private:
                             u32 count, u64 position) const;
     /// EXP13=2: the data_upload words batched since (FrontState::upload_batch) to the copy.
     void FrontFlushUploads(VideoCommon::GpuSplit& split, FrontState& state) const;
+    /// EXP124: the data_upload words a macro emitted since (FrontState::macro_upload_words) as
+    /// one entry, then the notes their MacroWrites made (the upload's range, EXP13's batch).
+    void FrontSendUploadWords(VideoCommon::GpuSplit& split, FrontState& state);
     std::unique_ptr<FrontState> front;
     bool front_macros{}; ///< The front owns the macro code and bindings (the back skips them)
 

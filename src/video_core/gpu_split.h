@@ -246,6 +246,13 @@ public:
     void MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
                      u32 amount, u32 methods_pending, const GPUVAddr* segment,
                      Effect effect = Effect::Unknown);
+    /// EXP124: a macro's writes of one method in a row, which went as one Direct MacroWrite
+    /// each, as Multi entries marked Direct: the back calls the engine's CallMacroWords (each
+    /// word called as its MacroWrite was, unless the engine knows taking them at once is the
+    /// same), the memory stage follows each entry as it follows the words (an executable method
+    /// of another engine: one hard entry).
+    void MacroWords(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
+                    u32 amount, Effect effect = Effect::Unknown);
     /// A write made by a macro: CallMethod without the method sink, as the engines' macros do.
     void MacroWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument,
                     Effect effect = Effect::Unknown) {

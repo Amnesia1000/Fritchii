@@ -407,7 +407,8 @@ public:
     }
 
     /// Records the "after" copies of the write extent checks of the dispatch just recorded.
-    void RecordComputeExtentProbes();
+    /// Returns how many it recorded.
+    u32 RecordComputeExtentProbes();
 
     /// write_extent: how far the program's stores reach past the pointer (native programs).
     void BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
@@ -522,6 +523,13 @@ public:
     /// so a synced page stays synced and the words they cover whole are guest memory's again, but
     /// the page's copy no longer holds the page.
     void Nx2NoteListHostWrite(DAddr device_addr, u64 size);
+
+    /// fable_memstage_compute_brief 3: GPU-written marks (MarkWrittenBuffer) and the bytes they
+    /// cover, under the cache's lock, with GPU profile 2 only. Counting only: DispatchCompute,
+    /// which holds the lock from before its fill to its end, takes the difference over a
+    /// dispatch (its storage binds).
+    u64 nx2_written_marks{};
+    u64 nx2_written_mark_bytes{};
 
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(DAddr addr, size_t size);

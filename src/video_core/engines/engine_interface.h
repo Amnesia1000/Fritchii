@@ -36,6 +36,16 @@ public:
     /// Write multiple values to the register identified by method.
     virtual void CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) = 0;
 
+    /// EXP124 (GpuSplit::MacroWords): a macro's writes of one method in a row, each of which
+    /// went as its own MacroWrite before: each is called as that one was (a last call). An
+    /// engine overrides it where taking them at once ends the same (KeplerCompute's inline
+    /// upload words).
+    virtual void CallMacroWords(Core::System& system, u32 method, const u32* words, u32 amount) {
+        for (u32 i = 0; i < amount; ++i) {
+            CallMethod(system, method, words[i], true);
+        }
+    }
+
     void ConsumeSink(Core::System& system) {
         if (!method_sink.empty()) {
             ConsumeSinkImpl(system);

@@ -44,8 +44,14 @@ void State::ProcessData(const u32 data, const bool is_last_call) {
     if (native_partial && is_linear && regs.line_count == 1) {
         const u32 count = write_offset - flushed_offset;
         if (count) {
-            rasterizer->AccelerateInlineToMemory(regs.dest.Address() + flushed_offset, count,
-                std::span<const u8>{inner_buffer.data() + flushed_offset, count});
+            const GPUVAddr address = regs.dest.Address() + flushed_offset;
+            const std::span<const u8> bytes{inner_buffer.data() + flushed_offset, count};
+            if (words_as_calls) {
+                // EXP124: a macro's words, each a last call before (KeplerCompute::CallMacroWords).
+                rasterizer->AccelerateInlineWords(address, count, bytes);
+            } else {
+                rasterizer->AccelerateInlineToMemory(address, count, bytes);
+            }
             flushed_offset = write_offset;
         }
         return;

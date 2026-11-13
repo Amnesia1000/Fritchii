@@ -153,6 +153,8 @@ struct StageResult {
     u8 cls; ///< pass, work, level, neutral
     bool hard;
     u32 packets;
+    u32 launches; ///< Compute launches in the entry (0xaf, 0xb0, 0x107), for the run shape
+    s32 channel;  ///< The channel the stage had bound at the entry, for the run shape
 };
 /// The back: ring mode starts (its hooks off) or ended.
 void SetRingBack(bool on);

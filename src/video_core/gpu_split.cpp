@@ -22,6 +22,7 @@
 
 #include <fmt/format.h>
 
+#include "common/assert.h"
 #include "common/dkb_cpu_trace.h"
 #include "common/logging.h"
 #include "common/nx2_hitch.h"
@@ -1016,6 +1017,40 @@ void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, 
     }
 }
 
+void GpuSplit::MacroWords(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
+                          u32 amount, Effect effect) {
+    // Not for the 3D engine: the memory stage applies a Multi entry to its 3D copy as a
+    // multi-method and ignores the Direct bit (memstage_shadow.cpp, Kind::Multi), while the
+    // back calls every word as a Direct write. A 3D engine's words go one MacroWrite each.
+    if (dynamic_cast<const Tegra::Engines::Maxwell3D*>(engine) != nullptr) [[unlikely]] {
+        ASSERT_MSG(false, "GpuSplit::MacroWords is not for the 3D engine");
+        for (u32 i = 0; i < amount; ++i) {
+            MacroWrite(engine, method, words[i], effect);
+        }
+        return;
+    }
+    SelectEngine(engine);
+    // As MultiMethod, with no segment (a MacroWrite has none), marked Direct.
+    u32 pending = amount;
+    while (pending > 0) {
+        const u32 piece = std::min(pending, MaxMultiWords);
+        constexpr size_t head = 2;
+        const size_t size = head + (piece + 1) / 2;
+        u64* const entry = Reserve(size);
+        entry[0] = static_cast<u64>(Kind::Multi) | Direct | (u64{method & 0xffff} << 8) |
+                   (u64{piece} << 32);
+        entry[1] = pending;
+        entry[size - 1] = 0;
+        std::memcpy(entry + head, words, size_t{piece} * sizeof(u32));
+        Commit(size, effect);
+        words += piece;
+        pending -= piece;
+    }
+    if (amount != 0 && engine->memory_write_mask[method]) {
+        NoteMethodWrite(engine, method);
+    }
+}
+
 void GpuSplit::DeferFunction(std::function<void()>&& func) {
     auto* const heap = new std::function<void()>(std::move(func));
     Defer([heap] {
@@ -1649,8 +1684,14 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
         if ((head & HasSegment) != 0) {
             engine->current_dma_segment = entry[2];
         }
-        engine->CallMultiMethod(*system, method, reinterpret_cast<const u32*>(entry + data),
-                                amount, static_cast<u32>(entry[1]));
+        if ((head & Direct) != 0) {
+            // EXP124: a macro's words (MacroWords), each called as its MacroWrite was.
+            engine->CallMacroWords(*system, method, reinterpret_cast<const u32*>(entry + data),
+                                   amount);
+        } else {
+            engine->CallMultiMethod(*system, method, reinterpret_cast<const u32*>(entry + data),
+                                    amount, static_cast<u32>(entry[1]));
+        }
         return data + (amount + 1) / 2;
     }
     case Kind::Call: {

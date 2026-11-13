@@ -802,6 +802,7 @@ struct State {
     LevelType entry_type{LevelType::Method3D}; ///< How a hard 3D method in it is named
     u32 entry_draws{};        ///< Shadow draws it issued
     u32 entry_served{};       ///< ... with execute_on
+    u32 entry_launches{};     ///< Compute launches in it (0xaf, 0xb0, 0x107; StageResult)
     u64 stale_cause{};        ///< The entry that last made the copies stale (full copy counter)
     // Runs (plan 3.2).
     bool in_run{};
@@ -1482,6 +1483,7 @@ size_t Process(State& s, u64 position, bool executed) {
     s.entry_type = LevelType::Method3D;
     s.entry_draws = 0;
     s.entry_served = 0;
+    s.entry_launches = 0;
     if (s.channel_stale && !executed) {
         // After an entry that cannot be followed, the channel as the back has it (an untagged
         // closure may bind one).
@@ -1497,6 +1499,16 @@ size_t Process(State& s, u64 position, bool executed) {
                  (u64{static_cast<u32>(s.engine_type)} << 16) | (method & 0xffff));
         } else {
             cls = Class::Neutral;
+        }
+    };
+    // fable_memstage_compute_brief 3: the compute launches among another engine's methods (as
+    // the compute front notes dispatch writers), for the runs by size (counting only).
+    // With the GPU profile only (the line is logged then).
+    const auto count_launch = [&](u32 method, u32 argument) {
+        if (Nx2Profile::Enabled() && s.engine_type == EngineType::KeplerCompute &&
+            ((method == 0xaf && (argument & 2) != 0) ||
+             (method == 0xb0 && (argument & 15) > 1) || method == 0x107)) {
+            ++s.entry_launches;
         }
     };
     switch (static_cast<Kind>(head & 0xf)) {
@@ -1529,6 +1541,7 @@ size_t Process(State& s, u64 position, bool executed) {
             other_engine(method, (head & Access::Direct) != 0 ||
                                      ((head & Access::Sink) == 0 &&
                                       s.engine->execution_mask[method]));
+            count_launch(method, argument);
             break;
         }
         Copy& c0 = *s.engine_copy;
@@ -1572,7 +1585,14 @@ size_t Process(State& s, u64 position, bool executed) {
             break;
         }
         if (s.engine_copy == nullptr) {
-            other_engine(method, s.engine->execution_mask[method]);
+            // Direct: a macro's words (GpuSplit::MacroWords, EXP124), called as a Direct Method.
+            other_engine(method, (head & Access::Direct) != 0 || s.engine->execution_mask[method]);
+            if (Nx2Profile::Enabled() && (method == 0xaf || method == 0xb0 || method == 0x107)) {
+                const u32* const words = reinterpret_cast<const u32*>(entry + data);
+                for (u32 i = 0; i < amount; ++i) {
+                    count_launch(method, words[i]);
+                }
+            }
             break;
         }
         Copy& c0 = *s.engine_copy;
@@ -2115,6 +2135,8 @@ StageResult StageProcess(u64 position, bool in_run) {
         .cls = static_cast<u8>(s.last_class),
         .hard = s.entry_hard,
         .packets = s.ring_packets,
+        .launches = s.entry_launches,
+        .channel = s.channel,
     };
 }
 

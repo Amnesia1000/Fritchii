@@ -1560,6 +1560,83 @@ dispatches with values a second (values each, how many filled in Configure, how 
 skipped and their values), QMDs a second (and reads that ran no dispatch), null pointer slots,
 and the verify counters below. Values below 3 change nothing here.
 
+### Compute counters (fable_memstage_compute_brief 3)
+
+Counting only, no switch; for one market run with FRITCHII_MEMSTAGE_THREAD=2, AHEAD unlimited
+and EDEN_NX2_GPU_PROFILE=2. Nothing is counted without the GPU profile.
+- "Memory stage runs by channel n s" (THREAD 2 with EDEN_NX2_GPU_PROFILE, every 10 s after the
+  "Memory stage ring" line):
+  GPUMem's level runs by the channel the stage had bound at the run's first entry (0 to 6, then
+  "other"): runs a second, entries and compute launches each (0xaf with bit 1, 0xb0 above 1,
+  0x107, as the compute front notes dispatch writers), and GPUMem's run time in ms/s (from the
+  lend to the return). Then runs a second and ms/s by entries a run (1, 2-7, 8-63, 64-511, 512+)
+  and by compute launches a run (0, 1, 2-7, ...): the ms/s in compute lists against small runs.
+- Fine zones (GPU profile 2): "inline upload" (AccelerateInlineToMemoryImpl, inside "method"),
+  "dispatch fill" (MemStage::FillDispatchHere, on whichever thread fills) and "qmd signal" (the
+  QMD scheduler's signal with its QMD reads and releases; the dispatches it runs stay
+  "compute"). Zones are exclusive, so "method" and "compute" lose what they cover.
+- Fine counters (GPU profile 2, each thread's "fine counters per second" line). The front
+  thread: compute upload data words by path, "upload words (macro emit)", "(method)"
+  (FrontCallMethod) and "(multi-method)" (FrontCallMultiMethod). The back: inline uploads by
+  size ("inline uploads 4 B", "5-64 B", "65-256 B", "over 256 B") and by branch ("to never
+  GPU-written pages", EXP85's branch; "uploaded in place"; "not uploaded"; "unmapped");
+  dispatches by what their fill marks ("marking a buffer GPU-written" with "dispatch marked
+  bytes", "writing images only", "marking nothing": the buffer cache's GPU-written marks made
+  while DispatchCompute holds its lock), "indirect dispatches", "dispatches with texel buffers"
+  (late fill), "dispatches skipped" (DispatchCompute ended before the record: unconfigured, grid
+  over the device's limit, an exception), "dispatches replaced" (the upscaler), "dispatches
+  copying list pages", "dispatches with extent probes"; and served calls made inside a dispatch
+  by cause ("served in a dispatch: FlushRegion", ... in the "Memory stage ring" line's order).
+
+### EXP124
+
+EXP124 (upload words as one entry; live, 0 = off by default; fable_memstage_compute_brief 4).
+Today the compute macro's emit sends every inline upload data word (KeplerCompute 0x6d) as its
+own Direct MacroWrite: about 457,000 ring entries a second at the Castle Town market, each
+followed by GPUMem as a hard entry, and on the back each a last call that Upload::State flushes
+alone (AccelerateInlineToMemory with 4 bytes). With 1, the words a front macro call emits
+collect and go as one Multi entry marked Direct (GpuSplit::MacroWords; pieces of 8,192 words;
+never for the 3D engine, whose Multi entries the memory stage applies without the Direct bit),
+sent before any other write the macro emits and at its end (or when the macro call ends in an
+exception, so none waits for the next call); after the entry, in this order, the
+upload's writer note (FrontNoteWriter: its whole range, as each word noted it) and with EXP13=2
+the copy's batch at the entry's position (FrontPatchOverlays). FrontApply still runs at each
+word (a later register read of the macro sees it). FrontCallMethod's and FrontCallMultiMethod's
+words are unchanged. The memory stage follows the entry as one hard entry (an executable method
+of another engine), as it followed each word. On the back the entry calls
+KeplerCompute::CallMacroWords: every word goes through CallMethod as before (registers end the
+same), but only each entry's last word is a last call (a batch over 8,192 words is several
+entries, each ending with one), and where the flush writes in place (native
+partial transfers, linear, one line) it goes to AccelerateInlineWords, which writes the words as
+their own calls would have: word by word while a grid placeholder is live (the scan sees x, y
+and z in one write, x alone in a word's) or when the destination is off a 4-byte boundary (the
+list note clears only words a write covers whole); otherwise split at 4 KiB pages of the GPU
+address, a piece in one call where InlineSkipsCaches (EXP85 & 1, deferral on, no GPU-written
+mark on its page) holds and it is mapped and not on sparse memory, word by word otherwise. Words
+an earlier non-last call left unflushed are flushed with the first word's call, as before;
+block linear, multi-line and non-native uploads keep a last call per word.
+Why one call per piece is the same as its words' calls: the write lands the same bytes (guest
+memory between two words is touched by nothing that reads the destination on a never
+GPU-written page); the list note bumps a page's write count once instead of once a word, and
+every user of that count compares it for equality only; the query filter is per page and the
+invalidation drops queries by overlap; the invalidation accumulator is fed word by word (it
+keeps a range per call where one does not extend the last, so a single range could differ).
+Values: 1 = on; 2 = on, and before each one-call piece every word is asked as its own call
+would ask (its translation and the page test); a piece whose words disagree goes word by word.
+GPU profile 2 fine counters: front "upload word batches (EXP124)" (one per batch sent; a ring
+entry per 8,192 words of it) and "upload batch words"; back
+"upload pieces in one call", "upload pieces word by word (page may be GPU-written)", "(unmapped
+or sparse)", "upload flushes word by word (grid placeholder live)", "(not word-aligned)",
+"upload pieces checked (EXP124=2)" and "upload pieces whose words disagree (must be 0)" (the
+first 16 also logged as "Upload words (EXP124=2)"). Toggle live 0/1 with profile_toggle.py (a
+macro call reads it once). Fields that should move at the market: the ring's level entries
+(about 500,000 to 50,000 a second), entries each run, the shadow's KeplerCompute 0x6d rows
+(about 9,000 a second, as multi entries), GPUMem's stage entries, the back's "method" and new
+"inline upload" counts, the front's "macro" zone. Must stay 0 with THREAD 0 and THREAD 2 (AHEAD
+unlimited), at the market and the fight: the memstage gate, "DMA snapshot ... 0 differed", the
+QMD release prediction's payload differences and unpredicted counts, the compute front verify,
+FRITCHII_MEMSTAGE_VERIFY=2's QMD mismatches, the flash-watch route.
+
 ### EXP101
 
 EXP101 (live, 0 = off, 1 = runs, 2 = cached page pointer + prefetch; fable52_answer_presenter): nvhost_gpu::SubmitGPFIFOImpl's pushbuffer
