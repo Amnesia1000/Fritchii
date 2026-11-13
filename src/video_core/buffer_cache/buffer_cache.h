@@ -234,6 +234,7 @@ void BufferCache<P>::TickFrame() {
     }
     if (ReadRunStats::g_enabled) [[unlikely]] {
         ReadRunStats::g_frame.fetch_add(1, std::memory_order_relaxed);
+        ReadRunStats::FrameTick();
         if (frame_tick % 600 == 0) {
             ReadRunStats::Log(VideoCore::Nx2Debug::Experiment(112));
         }
@@ -537,8 +538,17 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
     if (ReadRunStats::g_enabled) [[unlikely]] {
         ReadRunStats::t_run_pages = 0;
         ReadRunStats::t_read_bytes = {};
+        ReadRunStats::t_writer_answer = {};
         if (IsRegionGpuModified(device_addr_start_aligned,
                                 device_addr_end_aligned - device_addr_start_aligned)) {
+            // The newest write mark over the read's bytes, and the bytes as guest memory holds
+            // them before this read's download lands (fence downloads land under this lock).
+            ReadRunStats::FindWriter(device_addr, size, device_addr_start_aligned,
+                                     device_addr_end_aligned);
+            ReadRunStats::WriterAnswer& writer = ReadRunStats::t_writer_answer;
+            writer.compared =
+                static_cast<u32>((std::min<u64>)(size, ReadRunStats::CompareBytes));
+            device_memory.ReadBlockUnsafe(device_addr, writer.before.data(), writer.compared);
             ReadRunStats::ByteCheck check{.begin = device_addr, .end = device_addr + size};
             gpu_modified_ranges.ForEachInRange(
                 device_addr_start_aligned, device_addr_end_aligned - device_addr_start_aligned,
@@ -551,6 +561,8 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
                 (Common::AlignUp(run_end, Core::DEVICE_PAGESIZE) -
                  Common::AlignDown(run_begin, Core::DEVICE_PAGESIZE)) >>
                 Core::DEVICE_PAGEBITS;
+            writer.run_begin = run_begin;
+            writer.run_end = run_end;
         }
     }
     const bool preflushable = memory_tracker.IsRegionPreflushable(device_addr, size);
@@ -1325,6 +1337,10 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
     const bool has_new_downloads = tmp_intervals.size() != 0;
     for (const auto& pair : tmp_intervals) {
         gpu_modified_ranges.Add(pair.first, pair.second);
+        // FRITCHII_READ_RUNS: a GPU copy of GPU-written bytes is a write mark too (writer Other).
+        if (ReadRunStats::g_enabled) [[unlikely]] {
+            ReadRunStats::NoteWrite(pair.first, pair.second);
+        }
         if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
             Nx2NoteListWrite(buffer_b, pair.first, pair.second);
         }
@@ -1561,6 +1577,9 @@ void BufferCache<P>::BindHostStageBuffers(size_t stage) {
 template <class P>
 void BufferCache<P>::BindHostComputeBuffers() {
     VideoCommon::MemoryStageLink::CheckBackCache("BindHostComputeBuffers");
+    if (ReadRunStats::g_enabled) [[unlikely]] {
+        ReadRunStats::g_dispatches.fetch_add(1, std::memory_order_relaxed);
+    }
     BindHostComputeUniformBuffers();
     if (channel_state->enabled_compute_storage_buffers != 0) {
         BindHostComputeStorageBuffers();
@@ -3735,6 +3754,9 @@ void BufferCache<P>::BindHostGraphicsStorageBuffers(size_t stage) {
                                                          "EDEN_NX2_STORAGE_SYNC_SCAN", 1);
     SCOPE_EXIT {
         storage_sync_scan = 0;
+        if (ReadRunStats::g_enabled) [[unlikely]] {
+            ReadRunStats::t_writer = {};
+        }
     };
     // EDEN_NX2_STORAGE_SYNC_MEMO: ranges left clean are not walked again while no page of their
     // tracker managers gained a CPU or Untracked bit. Not with hot pages (always dirty), and
@@ -3747,6 +3769,10 @@ void BufferCache<P>::BindHostGraphicsStorageBuffers(size_t stage) {
     ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 index) {
         const Binding& binding = channel_state->storage_buffers[stage][index];
         const bool is_written = ((channel_state->written_storage_buffers[stage] >> index) & 1) != 0;
+        if (ReadRunStats::g_enabled) [[unlikely]] {
+            ReadRunStats::t_writer = {.binding = static_cast<u32>(stage) * 64 + index,
+                                      .kind = ReadRunStats::WriterKind::DrawStorage};
+        }
         MemStageStats::Read(MemStageStats::Kind::Storage, binding.size);
         if (BindMultiRangeStorage(binding, is_written, graphics_segments)) {
             Nx2Profile::AddFine(Nx2Profile::FineCounter::StorageMulti, 1);
@@ -3799,7 +3825,14 @@ void BufferCache<P>::BindHostGraphicsTextureBuffers(size_t stage) {
 
         const bool is_written = ((channel_state->written_texture_buffers[stage] >> index) & 1) != 0;
         if (is_written) {
+            if (ReadRunStats::g_enabled) [[unlikely]] {
+                ReadRunStats::t_writer = {.binding = static_cast<u32>(stage) * 64 + index,
+                                          .kind = ReadRunStats::WriterKind::DrawTexture};
+            }
             MarkWrittenBuffer(binding.buffer_id, binding.device_addr, size);
+            if (ReadRunStats::g_enabled) [[unlikely]] {
+                ReadRunStats::t_writer = {};
+            }
         }
 
         const u32 offset = buffer.Offset(binding.device_addr);
@@ -3931,9 +3964,17 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
         count_compute_sync = false;
         compute_dirty_walk = 0;
         storage_sync_scan = 0;
+        if (ReadRunStats::g_enabled) [[unlikely]] {
+            ReadRunStats::t_writer = {};
+        }
     };
     ForEachEnabledBit(channel_state->enabled_compute_storage_buffers, [&](u32 index) {
         const Binding& binding = channel_state->compute_storage_buffers[index];
+        if (ReadRunStats::g_enabled) [[unlikely]] {
+            ReadRunStats::t_writer = {.program = compute_shader_hash,
+                                      .binding = index,
+                                      .kind = ReadRunStats::WriterKind::ComputeStorage};
+        }
         if (profile) {
             Nx2Profile::Add(Nx2Profile::Counter::ComputeStorageBindings, 1);
             Nx2Profile::Add(Nx2Profile::Counter::ComputeStorageBytes, binding.size);
@@ -4152,7 +4193,15 @@ void BufferCache<P>::BindHostComputeTextureBuffers() {
         const bool is_written =
             ((channel_state->written_compute_texture_buffers >> index) & 1) != 0;
         if (is_written) {
+            if (ReadRunStats::g_enabled) [[unlikely]] {
+                ReadRunStats::t_writer = {.program = compute_shader_hash,
+                                          .binding = index,
+                                          .kind = ReadRunStats::WriterKind::ComputeTexture};
+            }
             MarkWrittenBuffer(binding.buffer_id, binding.device_addr, size);
+            if (ReadRunStats::g_enabled) [[unlikely]] {
+                ReadRunStats::t_writer = {};
+            }
         }
 
         const u32 offset = buffer.Offset(binding.device_addr);
@@ -4476,6 +4525,10 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
                                        bool capped) {
     if (VideoCommon::GpuSplit::RecordingDispatch()) [[unlikely]] {
         VideoCommon::GpuSplit::Get().RecordDispatchWrite(device_addr, size);
+    }
+    // FRITCHII_READ_RUNS: the write mark, with the writer its bind set (the "Read writer" lines).
+    if (ReadRunStats::g_enabled) [[unlikely]] {
+        ReadRunStats::NoteWrite(device_addr, size);
     }
     if constexpr (!IS_OPENGL) {
         if (needs_sync) {
