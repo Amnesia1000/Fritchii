@@ -13,6 +13,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/fritchii_write_ring.h"
 #include "common/logging.h"
 #include "common/nx2_uniform_keep_pages.h"
 #include "core/core.h"
@@ -442,6 +443,11 @@ void MemoryManager::Write(GPUVAddr addr, T data) {
                 Common::UniformKeepPages::Note(*address, sizeof(T));
             }
         }
+        if (Common::WriteRing::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
+            if (const auto address = GpuToCpuAddress(addr)) {
+                Common::WriteRing::Record(*address, sizeof(T), "GPU Write");
+            }
+        }
     };
     // A write: its pointer getter is hidden from the back read audit.
     const auto write_pointer = [this, addr] {
@@ -763,6 +769,7 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
         }
         if (u8* physical = write_pointer(dev_addr_base)) [[likely]] {
             std::memcpy(physical, src_buffer, copy_amount);
+            Common::WriteRing::Note(dev_addr_base, copy_amount, "GPU WriteBlock");
         }
         // EXP92 (uniform keeps, tier 2): after the copy; cached writes are tier 1.
         if (note_keeps) {
@@ -784,6 +791,7 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
                                                              : nullptr;
         if (physical != nullptr) [[likely]] {
             std::memcpy(physical, src_buffer, copy_amount);
+            Common::WriteRing::Note(dev_addr_base, copy_amount, "GPU WriteBlock");
         } else {
             memory.WriteBlockUnsafe(dev_addr_base, src_buffer, copy_amount);
         }
@@ -812,7 +820,9 @@ void MemoryManager::WriteBlockUnsafe(GPUVAddr gpu_dest_addr, const void* src_buf
 }
 
 void MemoryManager::NoteHostStore(GPUVAddr gpu_addr, std::size_t size) {
-    if (!Common::UniformKeepPages::AnyKept() || size == 0) [[likely]] {
+    if ((!Common::UniformKeepPages::AnyKept() &&
+         !Common::WriteRing::g_on.load(std::memory_order_relaxed)) ||
+        size == 0) [[likely]] {
         return;
     }
     // Page by page: a GPU range may map to scattered device pages.
@@ -822,6 +832,7 @@ void MemoryManager::NoteHostStore(GPUVAddr gpu_addr, std::size_t size) {
                                                   Core::DEVICE_PAGESIZE);
         if (const auto address = GpuToCpuAddress(page)) {
             Common::UniformKeepPages::Note(*address, next - page);
+            Common::WriteRing::Note(*address, next - page, "GPU span store");
         }
         page = next;
     }
@@ -871,6 +882,7 @@ void MemoryManager::WriteConstantBufferData(DAddr device_addr, GPUVAddr gpu_addr
             BackReadAudit::Unaudited([&] { return memory.GetPointer<u8>(address); });
         if (physical != nullptr) [[likely]] {
             std::memcpy(physical, src, amount);
+            Common::WriteRing::Note(address, amount, "GPU constant buffer write");
         } else {
             memory.WriteBlockUnsafe(address, src, amount);
         }

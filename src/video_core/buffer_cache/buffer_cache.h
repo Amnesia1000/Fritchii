@@ -658,6 +658,7 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
 
 template <class P>
 void BufferCache<P>::DownloadMemory(DAddr device_addr, u64 size) {
+    const Common::WriteRing::SiteScope write_site{"buffer download (DownloadMemory)", true};
     if constexpr (USE_MEMORY_MAPS) {
         if (download_cpu_read_ranges) {
             download_cpu_read_ranges = false;
@@ -683,6 +684,7 @@ void BufferCache<P>::DownloadMemory(DAddr device_addr, u64 size) {
 
 template <class P>
 void BufferCache<P>::DownloadMemoryForRead(DAddr device_addr, u64 size) {
+    const Common::WriteRing::SiteScope write_site{"buffer download (DownloadMemoryForRead)", true};
     if constexpr (IS_OPENGL || !USE_MEMORY_MAPS) {
         DownloadMemory(device_addr, size);
     } else {
@@ -949,6 +951,7 @@ bool BufferCache<P>::WriteFinishedReadDownloads(DAddr device_addr, u64 size) {
 
 template <class P>
 void BufferCache<P>::WriteReadDownloads(u64 tick) {
+    const Common::WriteRing::SiteScope write_site{"buffer read download (WriteReadDownloads)", true};
     if constexpr (!IS_OPENGL) {
         while (!read_downloads.empty() && read_downloads.front().tick <= tick) {
             ReadDownload& download = read_downloads.front();
@@ -1235,6 +1238,7 @@ void BufferCache<P>::ClearFenceDownloads(DAddr device_addr, u64 size) {
 
 template <class P>
 bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount) {
+    const Common::WriteRing::SiteScope write_site{"DMA copy (buffer cache)", false};
     const std::optional<DAddr> cpu_src_address = gpu_memory->GpuToCpuAddress(src_address);
     const std::optional<DAddr> cpu_dest_address = gpu_memory->GpuToCpuAddress(dest_address);
     if (!cpu_src_address || !cpu_dest_address) {
@@ -2016,6 +2020,7 @@ Common::RangeSet<DAddr> BufferCache<P>::PendingCpuWriteRanges() {
 template <class P>
 void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_written,
                                            DAddr device_addr, const u8* data, u64 size) {
+    const Common::WriteRing::SiteScope write_site{"buffer download", true};
     Core::g_buffer_write_pages.Mark(device_addr, size);
     Core::g_watch_write_pages.Mark(device_addr, size);
     if (!cpu_written.Intersects(device_addr, size)) {
@@ -2034,6 +2039,7 @@ void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_wr
 
 template <class P>
 void BufferCache<P>::PopAsyncBuffers() {
+    const Common::WriteRing::SiteScope write_site{"buffer download landing (PopAsyncBuffers)", true};
     // EDEN_NX2_EXP49: the host GPU is past this fence. The read downloads taken before its copies
     // are complete and go to guest memory first; those taken after took their bytes out of its
     // copies (ClearFenceDownloads).
@@ -4685,6 +4691,7 @@ void BufferCache<P>::Nx2NoteListSynced(DAddr page) {
 
 template <class P>
 void BufferCache<P>::Nx2FlushListPages(std::span<const DAddr> pages) {
+    const Common::WriteRing::SiteScope write_site{"list page flush (Nx2FlushListPages)", true};
     constexpr u64 page_size = u64{1} << Tegra::Nx2WrittenPageBits;
     std::vector<std::pair<DAddr, u64>> ranges;
     for (const DAddr page : pages) {
@@ -5418,6 +5425,7 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer) {
 
 template <class P>
 void BufferCache<P>::DownloadBuffersMemory(std::span<const BufferId> buffer_ids) {
+    const Common::WriteRing::SiteScope write_site{"buffer download (DownloadBuffersMemory)", true};
     struct Download {
         BufferId buffer_id;
         BufferCopy copy;

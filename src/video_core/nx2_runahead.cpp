@@ -13,6 +13,7 @@
 
 #include <fmt/format.h>
 
+#include "common/fritchii_write_ring.h"
 #include "common/logging.h"
 #include "common/nx2_uniform_keep_pages.h"
 #include "core/core.h"
@@ -556,6 +557,7 @@ bool AtBoundary(Core::System& system, u64 device, u8* word, u32 payload, u64 rel
     std::memcpy(word, &payload, sizeof(payload));
     // EXP92 (uniform keeps, tier 2): a raw store to guest memory, after it landed.
     Common::UniformKeepPages::Note(device, sizeof(payload));
+    Common::WriteRing::Note(device, sizeof(payload), "run-ahead release word (front)");
     NoteEarlyAnswer(GpuSplit::Get().SentPosition(), false);
     stats.words_written.fetch_add(1, std::memory_order_relaxed);
     return true;

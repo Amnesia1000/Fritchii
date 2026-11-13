@@ -9,9 +9,11 @@
 #include <cstdint>
 #include <initializer_list>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <source_location>
 #include <span>
+#include <string>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -27,6 +29,7 @@
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace Tegra {
+class GPU;
 class MemoryManager;
 }
 
@@ -348,6 +351,24 @@ public:
 
     /// The cache whose ranges the read log asks about.
     void Attach(Cache& cache) noexcept;
+    /// The read log's pending-mark question (GPU::ForEachPendingCpuWrite).
+    void AttachGpu(Tegra::GPU& gpu) noexcept;
+
+    /// The read log (Common::WriteRing::g_on): a gather of game writes applied
+    /// (OnCacheInvalidations) or a FlushRegion (`which`: its CacheType bits), on this thread.
+    enum class Gather : u8 { Apply, FlushRegion };
+    void NoteGather(Gather kind, u32 which);
+
+    /// The read log's classes of a difference (5.3).
+    enum class DiffClass : u8 {
+        Landing,       ///< an emulator write the ring names, a download landing
+        EmulatorWrite, ///< an emulator write the ring names, anything else
+        GameMarked,    ///< no emulator write; a game-side mark is pending (or the tracker holds it)
+        MarkTaken,     ///< no emulator write, no pending mark: a store in flight at the gather
+        BackGather,    ///< bound range: a gather ran on this thread between the fill and the play
+        Unclassified,
+        Count,
+    };
 
     /// SEAM = 2: the draw's whole fill, before the texture work. Null when the draw is not held
     /// (another SEAM, texel buffers: LateFill, or the arena busy on another thread); Configure
@@ -483,13 +504,30 @@ private:
         std::vector<u8> bytes;
         u64 skipped{}; ///< Not logged: past the byte budget
         u64 budget{};  ///< Bytes to read again at the compare
+        /// Device ranges the packet uses: bound ranges, uniforms, values (over-read test).
+        std::vector<std::pair<u64, u64>> used;
+        u64 ring_seq{};      ///< Common::WriteRing's sequence when the fill began
+        u64 gathers{};       ///< This thread's gathers applied when the fill ended
+        u64 flush_regions{}; ///< This thread's FlushRegion calls when the fill ended
         void Clear() noexcept {
             records.clear();
             bytes.clear();
             skipped = 0;
             budget = 0;
+            used.clear();
+            ring_seq = 0;
+            gathers = 0;
+            flush_regions = 0;
         }
     };
+
+    /// Emulator writes the ring named at a difference, by site.
+    struct DiffSite {
+        std::atomic<const char*> name{};
+        std::atomic<bool> landing{};
+        std::atomic<u64> count{};
+    };
+    static constexpr size_t DIFF_SITES = 32;
 
     inline static thread_local ReadLog* t_log = nullptr;
 
@@ -554,6 +592,16 @@ private:
         u64 fill_ns{};
         u64 play_ns{};
         std::array<u64, static_cast<size_t>(VideoCommon::MemReadLog::Kind::Count)> read_diffs{};
+        std::array<u64, static_cast<size_t>(VideoCommon::MemReadLog::Kind::Count)>
+            read_kind_records{};
+        std::array<u64, static_cast<size_t>(DiffClass::Count)> diff_classes{};
+        u64 diff_own{};
+        u64 diff_over{};
+        u64 ring_wrapped{};
+        u64 gathers_held{};
+        std::array<u64, 3> flush_regions_held{};
+        std::array<u64, DIFF_SITES> diff_sites{};
+        u64 diff_sites_other{};
     };
 
     void PushParts(Cmd kind, u8 flags, u32 count, std::initializer_list<Part> parts);
@@ -584,6 +632,10 @@ private:
     void StopReadLog(ReadLog& log, bool held_packet);
     void NoteHeldFlush(SeamHook::Use use, const std::source_location& location);
     void CompareReads(ReadLog& log, const char* what, u64 number, u64 hash_a, u64 hash_b);
+    void ClassifyDiff(const ReadLog& log, const ReadRecord& record, u64 first, u64 last,
+                      const char* what, u64 number, u64 hash_a, u64 hash_b);
+    void CountDiffSite(const char* name, bool landing);
+    std::string GatherFrames() const;
 
     MemPlayer& player;
     Arena arena;
@@ -612,7 +664,15 @@ private:
     bool held_log_pending{};
     u64 op_fills{};
     std::vector<u8> compare_scratch;
-    std::atomic<u32> diffs_logged{};
+    Tegra::GPU* gpu{};
+    /// This stage turned Common::WriteRing on (FRITCHII_MEMSTAGE_READ_LOG).
+    bool ring_owner{};
+    std::array<std::atomic<u32>, static_cast<size_t>(DiffClass::Count)> class_logged{};
+    /// The first gather on this thread after the held fill ended: where it came from.
+    std::array<void*, 16> gather_frames{};
+    u32 gather_frame_count{};
+    std::mutex diff_sites_mutex;
+    std::array<DiffSite, DIFF_SITES> diff_site_table{};
     bool claim_deferring{};
     bool pending{};
     u32 play_cursor{};
@@ -661,6 +721,15 @@ private:
         std::atomic<u64> play_ns{};
         std::array<std::atomic<u64>, static_cast<size_t>(VideoCommon::MemReadLog::Kind::Count)>
             read_diffs{};
+        std::array<std::atomic<u64>, static_cast<size_t>(VideoCommon::MemReadLog::Kind::Count)>
+            read_kind_records{};
+        std::array<std::atomic<u64>, static_cast<size_t>(DiffClass::Count)> diff_classes{};
+        std::atomic<u64> diff_own{};
+        std::atomic<u64> diff_over{};
+        std::atomic<u64> ring_wrapped{};
+        std::atomic<u64> gathers_held{};
+        std::array<std::atomic<u64>, 3> flush_regions_held{};
+        std::atomic<u64> diff_sites_other{};
     };
     Counters counters;
     Counts reported;

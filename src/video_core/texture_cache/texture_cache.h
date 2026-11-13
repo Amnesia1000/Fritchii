@@ -156,6 +156,7 @@ TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManag
 
 template <class P>
 void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
+    const Common::WriteRing::SiteScope write_site{"texture download (garbage collector)", true};
     const DeleteReasonScope delete_reason_scope{*this, DeleteReason::GarbageCollect};
     bool high_priority_mode = false;
     bool aggressive_mode = false;
@@ -389,6 +390,7 @@ void TextureCache<P>::DropCollectDownloadsIn(DAddr cpu_addr, size_t size) {
 
 template <class P>
 void TextureCache<P>::LandCollectDownloads() {
+    const Common::WriteRing::SiteScope write_site{"EXP121 landing (LandCollectDownloads)", true};
     if constexpr (requires { runtime.CurrentTick(); }) {
         const DeleteReasonScope delete_reason_scope{*this, DeleteReason::GarbageCollect};
         for (size_t i = 0; i < collect_downloads.size();) {
@@ -2402,6 +2404,7 @@ bool TextureCache<P>::IsDownloadable(const ImageBase& image) const noexcept {
 
 template <class P>
 void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
+    const Common::WriteRing::SiteScope write_site{"texture download (DownloadMemory)", true};
     if (!relocation_tombstones.empty()) {
         CheckTombstoneCpuRead(cpu_addr, size); // EXP43=4
     }
@@ -3056,6 +3059,7 @@ void TextureCache<P>::CommitAsyncFlushes() {
 
 template <class P>
 void TextureCache<P>::PopAsyncFlushes() {
+    const Common::WriteRing::SiteScope write_site{"texture download landing (PopAsyncFlushes)", true};
     if (committed_downloads.empty()) {
         return;
     }

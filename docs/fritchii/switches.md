@@ -287,10 +287,32 @@ with their staged bytes, cached ranges bound without an upload, storage and tabl
 size words, compute pointers, the inline page write), and at the old read position (a draw's or
 dispatch's first play; an operation's end) reads it all again: bytes and values are compared,
 bound ranges are asked whether the CPU wrote them since. Differences are counted by kind; the
-first 16 are logged as "Memory seam (5.3)" with the kind, address, size and the programs. Must
-read 0. Reads past 1 MiB a packet are not logged (counted as "not logged"). The counts are in the
-"memory seam read log" line of EXP123's stats every 10 s. N = 8 is the spec's value; N = 1 checks
-every packet (slower). Not FRITCHII_MEMSTAGE_VERIFY, which is 2c's by-value checks (bit flags).
+first 16 of each class (below) are logged as "Memory seam (5.3) <class>" with the kind, address,
+size, the changed bytes, the device range, the place, the writer, the pending mark answer, the
+gathers since the fill and the programs. Reads past 1 MiB a packet are not compared (counted as
+"not logged"; the ranges still count for the over-read test). The counts are in the "memory seam
+read log" line of EXP123's stats every 10 s, with the reads compared by kind. N = 8 is the spec's
+value; N = 1 checks every packet (slower). Not FRITCHII_MEMSTAGE_VERIFY, which is 2c's by-value
+checks (bit flags).
+
+Game threads write the pages the cache reads all the time, so the gate is "0 unexplained", not 0
+(fable_memstage_readlog1.md; step 6 spec 10). With READ_LOG on, from boot, every write emulator
+code makes to game memory (device and GPU memory managers, span stores, the GPU write listener,
+run-ahead release words, Core::Memory's unsafe writes) goes to a ring of 4,096 entries with its
+site, thread and sequence (vk_mem_stage.cpp, "Who wrote", lists every hook). Each difference gets:
+- a class: "emulator write, download landing" or "emulator write" (the ring names a write newer
+  than the fill over the changed bytes; counted by site), "game write, marked" (a game-side mark
+  is pending, GPU::ForEachPendingCpuWrite; for a bound range, the tracker holds it), "game write,
+  mark already taken" (no mark left: the store landed after its mark was gathered), "gather on the
+  back inside Configure" (a bound range, and the drawing thread applied a gather since the fill;
+  the first gather's stack is logged), or "unclassified" (unmapped, or the ring wrapped);
+- a place: "over-read" (an upload's changed bytes outside every range the packet uses) or "own
+  data".
+The "memory seam read log classes" line has the counts by class and site, over-read and own
+data, ring wraps, and on the holding thread the gathers applied and FlushRegion calls by cache.
+The "read log gate" line: unexplained = emulator writes that are not download landings +
+unclassified; must be 0. "mark already taken" and "own data changed" are reported beside it and
+are not failures. Off, every hook costs one relaxed load and a branch.
 
 ### FRITCHII_MEMSTAGE_VERIFY
 
