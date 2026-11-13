@@ -244,7 +244,15 @@ public:
     /// Does nothing in level mode (the stage is level before each entry there) or off GPUMem.
     /// False when GPUMem is stopping (the caller stops its work).
     bool StageLevel(u64 position, LevelReason reason);
-    /// GPUMem came level at a constant buffer write onto GPU-written data (counted).
+    /// The staging pool's stream was busy on GPUMem with the window open: it took a new buffer
+    /// (the pool never waits for a region, so a stamp not played yet is never waited on).
+    static void NoteStagingFallback() noexcept {
+        if (t_on_stage && g_ahead.load(std::memory_order_relaxed) != 0) [[unlikely]] {
+            auto& counter = instance.counters.staging_fallbacks;
+            counter.store(counter.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+        }
+    }
+    /// The entry turned hard at a constant buffer write onto GPU-written data (counted).
     void NoteWriteLevel() noexcept {
         counters.write_levels.store(counters.write_levels.load(std::memory_order_relaxed) + 1,
                                     std::memory_order_relaxed);
@@ -538,10 +546,10 @@ private:
     std::atomic<std::thread::id> stage_thread{};
     /// Bumped while the back waits for a lock GPUMem holds (StageSyncCatchUp gives up then).
     std::atomic<u64> back_contended{0};
-    static void BackContendedHook(std::thread::id holder, bool first);
+    static bool BackContendedHook(std::thread::id holder, bool first);
     /// The back's thread id (GPUMem serves the back's call while it waits for a lock it holds).
     std::atomic<std::thread::id> back_thread{};
-    static void StageContendedHook(std::thread::id holder, bool first);
+    static bool StageContendedHook(std::thread::id holder, bool first);
     /// Back: the run it is in.
     u64 back_run_from{};
     u64 back_draw_seq{};
@@ -594,7 +602,8 @@ private:
         std::atomic<u64> stage_lock_serves{}; ///< GPUMem served a call while waiting for it
         std::atomic<u64> join_catchups{};
         std::atomic<u64> joins_unknown{};     ///< a served download past the join ring's reach
-        std::atomic<u64> write_levels{};      ///< words onto GPU-written data: level at the write
+        std::atomic<u64> write_levels{};      ///< words onto GPU-written data: the entry hard
+        std::atomic<u64> staging_fallbacks{}; ///< GPUMem took a new staging buffer, stream busy
         std::atomic<u64> hook_flushes{};      ///< the back's skipped idle hook, its flush run
         std::atomic<u64> stage_idles{};
     };
@@ -640,6 +649,7 @@ private:
         u64 join_catchups{};
         u64 joins_unknown{};
         u64 write_levels{};
+        u64 staging_fallbacks{};
         u64 hook_flushes{};
         u64 stage_idles{};
     };

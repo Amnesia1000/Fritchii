@@ -144,8 +144,10 @@
 //     played the packets ahead of it", must be 0 (syncs in served fills: 0/s at the market), and
 //     the window is refused for the rest of the session from the next frame end. A join in the
 //     stage's fill over GPU-written data catches up the same way (StageJoinCatchUpSlow);
-//   - constant buffer words onto GPU-written data: the stage comes level before the write and
-//     applies the claim at once (StageWriteWords), so no served download can come in between;
+//   - constant buffer words onto GPU-written data: the entry turns hard before the stage writes
+//     them (StageWriteWords), so the back writes them in a level run, in stream order: no served
+//     download comes in between, and no claim of theirs is recorded before the entry's own
+//     earlier packets;
 //   - the buffer cache's lock: a back that waits for it while the stage holds it serves the
 //     stage's requests from the wait (SpinRecursiveMutex's contended hook; not a request it is
 //     serving already), so a sync in the stage's fill never waits on a back that waits on the
@@ -378,6 +380,9 @@ void MemoryStageLink::Start(Core::System& system_) {
     if (!stage_writes) {
         stage_writes = std::make_unique<StageWrite[]>(StageWriteSlots);
     }
+    // A refusal of the window is for one game session (re-review N3).
+    ahead_refused.store(false, std::memory_order_relaxed);
+    ahead_blocked_logged = nullptr;
     thread = std::jthread([this](std::stop_token stop) { StageMain(stop); });
     LOG_INFO(HW_GPU, "Memory stage thread (GPUMem) started, sleeping until "
                      "FRITCHII_MEMSTAGE_THREAD=1 or 2 gives it work");
@@ -711,13 +716,14 @@ void MemoryStageLink::ServeOnStage(Served cause, Function function, void* argume
     Call(HandOff::Served, function, argument);
 }
 
-void MemoryStageLink::BackContendedHook(std::thread::id holder, bool first) {
+bool MemoryStageLink::BackContendedHook(std::thread::id holder, bool first) {
     // The back waits for a lock (the buffer cache's): if GPUMem holds it, it may be waiting for
-    // the back in a sync of its fill (Serve), so the back serves it here. StageSyncCatchUp sees
-    // the count and stops waiting for the back to play on.
+    // the back in a sync of its fill (Serve), so the back serves it here and does not sleep.
+    // StageSyncCatchUp sees the count and stops waiting for the back to play on. Another holder:
+    // false, the wait sleeps as usual.
     MemoryStageLink& link = instance;
     if (holder != link.stage_thread.load(std::memory_order_relaxed)) {
-        return;
+        return false;
     }
     if (first) {
         // Counted by call site (the caller's frames, first 16 logged): each site is read once
@@ -740,23 +746,26 @@ void MemoryStageLink::BackContendedHook(std::thread::id holder, bool first) {
     if (!t_back_serving && link.BackRequestPending()) {
         link.BackServeRequests();
     }
+    return true;
 }
 
-void MemoryStageLink::StageContendedHook(std::thread::id holder, bool first) {
+bool MemoryStageLink::StageContendedHook(std::thread::id holder, bool first) {
     // GPUMem waits for the buffer cache's lock while the back holds it. The back may hold it
     // across a call it posted for GPUMem (EXP118's delta draws hold it through Configure, and a
     // read flush there is a served call): GPUMem serves the call from here, at the lock sites
-    // that are clean points (CleanPoint: no fill open, between entries' cache work).
+    // that are clean points (CleanPoint: no fill open, between entries' cache work), and does
+    // not sleep while the back holds the lock there. Anything else: false, it sleeps as usual.
     MemoryStageLink& link = instance;
     static_cast<void>(first);
     if (!t_stage_clean || link.ring_window == 0 ||
         holder != link.back_thread.load(std::memory_order_relaxed)) {
-        return;
+        return false;
     }
     if (link.calls.load(std::memory_order_seq_cst) != link.calls_seen) {
         LinkBump(link.counters.stage_lock_serves);
         link.StageServeCalls();
     }
+    return true;
 }
 
 bool MemoryStageLink::BackRingTop(u64 position) {
@@ -807,6 +816,13 @@ bool MemoryStageLink::BackRingTopImpl(u64 position) {
             // no stale header meets the next start; then the stage's last ranges.
             t_back_served = false;
             t_back_run = false;
+            // GPUMem's unplayed mark must not outlive the ring (a fill that threw leaves its
+            // entries pending and its number open): first of all its entries are played and the
+            // arena is the back's again, the mark cleared (re-review N5), so the plays below run
+            // with no stale owner or mark.
+            if (ring_backend.reset_stage != nullptr) {
+                ring_backend.reset_stage(ring_backend.context, true);
+            }
             if (ring_backend.drop_packets != nullptr) {
                 const u64 left = ring_backend.drop_packets(ring_backend.context, ~u64{0});
                 for (u64 i = 0; i < left; ++i) {
@@ -818,11 +834,6 @@ bool MemoryStageLink::BackRingTopImpl(u64 position) {
                                           lend_ranges.size());
             }
             lend_ranges.clear();
-            // GPUMem's unplayed mark must not outlive the ring (a fill that threw leaves its
-            // entries pending and its number open): its entries are played, the mark cleared.
-            if (ring_backend.reset_stage != nullptr) {
-                ring_backend.reset_stage(ring_backend.context, true);
-            }
             // Both draw counts start at 0 with the next ring (StageStart, the start above).
             back_draw_seq = 0;
             back_run_from = ~u64{0};
@@ -1366,9 +1377,6 @@ void MemoryStageLink::RingLoop(std::stop_token& stop, u64 start) {
     staged_local = start;
     ring_stop = &stop;
     ring_window = 0;
-    // Step 7: GPUMem serves the back's call while it waits for the buffer cache's lock the back
-    // holds, at its clean lock sites (StageContendedHook; inert in level mode).
-    Common::SpinRecursiveMutex::t_contended_hook = &MemoryStageLink::StageContendedHook;
     MemStageShadow::StageStart(ring_backend.back_channel != nullptr
                                    ? ring_backend.back_channel(ring_backend.context)
                                    : 0);
@@ -1410,6 +1418,11 @@ void MemoryStageLink::RingLoop(std::stop_token& stop, u64 start) {
             // The window (step 7), read here: it changes only at a frame end, where the stage is
             // parked in a level run.
             ring_window = Ahead();
+            // Step 7: GPUMem serves the back's call while it waits for the buffer cache's lock
+            // the back holds, at its clean lock sites (StageContendedHook). Only with the window
+            // open: in level mode a lock wait stays the plain spin-then-sleep.
+            Common::SpinRecursiveMutex::t_contended_hook =
+                ring_window != 0 ? &MemoryStageLink::StageContendedHook : nullptr;
             if (ring_window == 0) {
                 // Level mode (AHEAD = 0): the stage runs only while the back is parked.
                 if (Ring::Consumed().load(std::memory_order_acquire) < staged_local &&
@@ -1604,6 +1617,7 @@ void MemoryStageLink::Take(Snapshot& out) const noexcept {
     out.join_catchups = load(counters.join_catchups);
     out.joins_unknown = load(counters.joins_unknown);
     out.write_levels = load(counters.write_levels);
+    out.staging_fallbacks = load(counters.staging_fallbacks);
     out.hook_flushes = load(counters.hook_flushes);
     out.stage_idles = load(counters.stage_idles);
 }
@@ -1732,7 +1746,8 @@ void MemoryStageLink::LogStats() {
                 "each push {:.1f} on average, {} at most; per second by packets ahead ({}); the "
                 "back waited for the stage {:.0f}/s, {:.1f} ms/s; GPUMem waited for the window "
                 "{:.1f} ms/s, for room in ring B {:.1f} ms/s, level inside the window {:.1f} ms/s "
-                "({}/s; at a constant buffer write onto GPU-written data {:.0f}/s); served calls "
+                "({}/s; entries made hard by constant buffer words onto GPU-written data "
+                "{:.0f}/s); new staging buffers for GPUMem, the stream busy {:.0f}/s; served calls "
                 "while packets were ahead {:.0f}/s; sync catch-ups {:.0f}/s ({:.2f} ms/s); join "
                 "catch-ups {:.0f}/s; lends handed over at the run's start {:.0f}/s; the back "
                 "waited for the cache's lock held by GPUMem {:.0f}/s; GPUMem served the back's "
@@ -1749,7 +1764,8 @@ void MemoryStageLink::LogStats() {
                 ms(current.stage_wait_ns[3] - reported.stage_wait_ns[3]),
                 ms(current.stage_wait_ns[4] - reported.stage_wait_ns[4]),
                 ms(current.stage_wait_ns[5] - reported.stage_wait_ns[5]), levels_text,
-                rate(delta(&Snapshot::write_levels)), rate(delta(&Snapshot::served_ahead)),
+                rate(delta(&Snapshot::write_levels)), rate(delta(&Snapshot::staging_fallbacks)),
+                rate(delta(&Snapshot::served_ahead)),
                 rate(delta(&Snapshot::catchups)), ms(delta(&Snapshot::catchup_ns)),
                 rate(delta(&Snapshot::join_catchups)), rate(delta(&Snapshot::deferred_lends)),
                 rate(delta(&Snapshot::back_lock_waits)), rate(delta(&Snapshot::stage_lock_serves)),

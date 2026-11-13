@@ -88,9 +88,11 @@ public:
     /// A thread that may have to work for the holder while it waits for the lock (the memory
     /// stage's back serves GPUMem's syncs, and GPUMem can hold the buffer cache's lock while it
     /// waits for one: FRITCHII_MEMSTAGE_AHEAD). Set per thread; while set, a contended lock calls
-    /// it between tries with the holder's id (`first`: the first try of this wait) and never
-    /// sleeps. Null everywhere else.
-    using ContendedHook = void (*)(std::thread::id holder, bool first);
+    /// it between tries with the holder's id (`first`: the first try of this wait). While it
+    /// answers true (the holder is the thread it may have to work for) the wait does not sleep;
+    /// on false it spins and sleeps as usual, and looks again after each wake (the holder may have
+    /// changed). Null everywhere else.
+    using ContendedHook = bool (*)(std::thread::id holder, bool first);
     static inline thread_local ContendedHook t_contended_hook = nullptr;
 
 private:
@@ -114,6 +116,7 @@ private:
 
     void LockContendedUntimed() {
         if (t_contended_hook != nullptr) [[unlikely]] {
+            bool first = true;
             for (int spin = 0;; ++spin) {
                 if (state.load(std::memory_order_relaxed) == 0) {
                     std::uint32_t expected = 0;
@@ -122,12 +125,29 @@ private:
                         return;
                     }
                 }
-                t_contended_hook(owner.load(std::memory_order_relaxed), spin == 0);
+                const bool relevant =
+                    t_contended_hook(owner.load(std::memory_order_relaxed), first);
+                first = false;
+                if (relevant) {
+                    // The holder may need this thread: never sleep while it holds the lock.
+                    if (spin < SpinCount) {
+                        Pause();
+                    } else {
+                        std::this_thread::yield();
+                    }
+                    continue;
+                }
                 if (spin < SpinCount) {
                     Pause();
-                } else {
-                    std::this_thread::yield();
+                    continue;
                 }
+                // As below: held with sleepers, taken this way it stays marked. After a wake,
+                // spin and ask the hook again.
+                if (state.exchange(2, std::memory_order_acquire) == 0) {
+                    return;
+                }
+                state.wait(2, std::memory_order_relaxed);
+                spin = 0;
             }
         }
         for (int spin = 0; spin < SpinCount; ++spin) {
