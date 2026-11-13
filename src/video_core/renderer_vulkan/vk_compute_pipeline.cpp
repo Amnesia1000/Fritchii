@@ -460,15 +460,14 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     const u64 storage_alignment{device.GetStorageBufferAlignment()};
     // SEAM >= 3 (EXP123, vk_mem_stage.cpp): the raw handles come in the dispatch packet, with the
     // EXP21 value they were made with; made here when no early fill made them.
-    MemStage& seam{buffer_cache.runtime.Seam()};
     const std::vector<u32>* handle_values{};
     bool packet_null_pointers{};
-    if (seam.ValuesByValue()) {
-        handle_values = seam.HandleValues(true, packet_null_pointers);
+    if (mem_stage.ValuesByValue()) {
+        handle_values = mem_stage.HandleValues(true, packet_null_pointers);
         if (handle_values == nullptr) {
-            FillHandleValues(seam, kepler_compute, gpu_memory,
+            FillHandleValues(mem_stage, kepler_compute, gpu_memory,
                              VideoCore::Nx2Debug::Experiment(21) != 0, true);
-            handle_values = seam.HandleValues(true, packet_null_pointers);
+            handle_values = mem_stage.HandleValues(true, packet_null_pointers);
         }
     }
     const bool verify_handles{handle_values != nullptr &&
@@ -496,9 +495,9 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
             // FRITCHII_MEMSTAGE_VERIFY & 1 (5.4): the back's own read.
             const u32 own{VideoCommon::RawTextureHandle<true>(info, desc, index, gpu_memory,
                                                               cbuf_view, storage_alignment)};
-            seam.NoteValueCheck(MemStage::Value::Handle, own == value,
-                                VideoCommon::HandleWordAddress(desc, index, cbuf_view),
-                                shader_hash, value, own);
+            mem_stage.NoteValueCheck(MemStage::Value::Handle, own == value,
+                                     VideoCommon::HandleWordAddress(desc, index, cbuf_view),
+                                     shader_hash, value, own);
         }
         return TexturePair(value, via_header_index);
     }};
@@ -557,10 +556,10 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                     if (!next_value(value)) [[unlikely]] {
                         value = own[element];
                     } else if (verify_handles) [[unlikely]] {
-                        seam.NoteValueCheck(MemStage::Value::Handle, own[element] == value,
-                                            VideoCommon::HandleWordAddress(desc, element,
-                                                                           cbuf_view),
-                                            shader_hash, value, own[element]);
+                        mem_stage.NoteValueCheck(
+                            MemStage::Value::Handle, own[element] == value,
+                            VideoCommon::HandleWordAddress(desc, element, cbuf_view), shader_hash,
+                            value, own[element]);
                     }
                     table_element(element, value);
                 }
@@ -595,7 +594,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         add_image(desc, desc.is_written);
     }
     if (handle_values != nullptr) {
-        seam.LookedAtHandleValues(true, handle_cursor);
+        mem_stage.LookedAtHandleValues(true, handle_cursor);
     }
     texture_cache.FillImageViews(std::span(views.data(), views.size()), true);
     views_scope.reset();

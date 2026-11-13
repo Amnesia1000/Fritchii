@@ -1550,16 +1550,15 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     // SEAM >= 3 (EXP123, vk_mem_stage.cpp): the raw handles come in the draw packet, with the
     // EXP21 value they were made with. When no early fill made them they are made here, before
     // the bank decision: the fill always runs, a TEX_BANK_GEN hit then does not look at them.
-    MemStage& seam{buffer_cache.runtime.Seam()};
     const std::vector<u32>* handle_values{};
     bool packet_null_pointers{};
     if constexpr (!Delta) {
-        if (seam.ValuesByValue()) {
-            handle_values = seam.HandleValues(false, packet_null_pointers);
+        if (mem_stage.ValuesByValue()) {
+            handle_values = mem_stage.HandleValues(false, packet_null_pointers);
             if (handle_values == nullptr) {
                 Profile::Scope scope{Profile::Zone::ReadHandles};
-                FillHandleValues(seam, VideoCore::Nx2Debug::Experiment(21) != 0, true);
-                handle_values = seam.HandleValues(false, packet_null_pointers);
+                FillHandleValues(mem_stage, VideoCore::Nx2Debug::Experiment(21) != 0, true);
+                handle_values = mem_stage.HandleValues(false, packet_null_pointers);
             }
         }
     }
@@ -1656,9 +1655,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 // FRITCHII_MEMSTAGE_VERIFY & 1 (5.4): the back's own read.
                 const u32 own{VideoCommon::RawTextureHandle<false>(
                     info, desc, index, *gpu_memory, cbuf_view, storage_alignment)};
-                seam.NoteValueCheck(MemStage::Value::Handle, own == value,
-                                    VideoCommon::HandleWordAddress(desc, index, cbuf_view),
-                                    key.unique_hashes[stage + 1], value, own);
+                mem_stage.NoteValueCheck(MemStage::Value::Handle, own == value,
+                                         VideoCommon::HandleWordAddress(desc, index, cbuf_view),
+                                         key.unique_hashes[stage + 1], value, own);
             }
             return value;
         }};
@@ -1787,7 +1786,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                         if (!next_value(value)) [[unlikely]] {
                             value = own[element];
                         } else if (verify_handles) [[unlikely]] {
-                            seam.NoteValueCheck(
+                            mem_stage.NoteValueCheck(
                                 MemStage::Value::Handle, own[element] == value,
                                 VideoCommon::HandleWordAddress(desc, element, cbuf_view),
                                 key.unique_hashes[stage + 1], value, own[element]);
@@ -1900,7 +1899,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
         if (handle_values != nullptr) {
             // None taken: a bank hit skipped the loop. Else all must have been.
-            seam.LookedAtHandleValues(false, handle_cursor);
+            mem_stage.LookedAtHandleValues(false, handle_cursor);
         }
         if (tex_bank_hit) {
             const TexBankMemo& memo = tex_bank_memo;

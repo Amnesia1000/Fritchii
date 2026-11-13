@@ -1499,9 +1499,11 @@ void MemStage::TickFrame() {
         // At 2 and 3 always: a held fill keeps its read ranges for the texture write check.
         VideoCommon::MemReadLog::g_on.store(value >= 2, std::memory_order_relaxed);
         LOG_INFO(Render_Vulkan, "Memory seam (EXP123): {}{}",
-                 value >= 2  ? "2, one fill per draw and dispatch before the texture work"
-                 : on        ? "1, recorder and player"
-                             : "0, entries run as pushed",
+                 value >= 2 ? fmt::format("{}, one fill per draw and dispatch before the texture "
+                                          "work{}",
+                                          value, value >= 3 ? ", values by value" : "")
+                 : on       ? std::string{"1, recorder and player"}
+                            : std::string{"0, entries run as pushed"},
                  value >= 2 && read_log_every > 0
                      ? fmt::format(" (FRITCHII_MEMSTAGE_READ_LOG: every {}th packet's reads "
                                    "compared)",
