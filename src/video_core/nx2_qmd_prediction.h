@@ -67,6 +67,14 @@ namespace VideoCommon::QmdPrediction {
                                             "EDEN_NX2_FEED_MEMORY_OVERLAY", 1) != 0;
 }
 
+/// EXP127 (live, fable_fence_writers_brief piece 2): the feed's QMD sources. 0: as before. 1
+/// (audit): the records get the sources below, the feed takes nothing new, and a line counts
+/// per source the back's check of the records and the acquires the feed would have met through
+/// the new ones. 2: the feed takes them too (with EDEN_NX2_FEED_MEMORY_OVERLAY on).
+[[nodiscard]] inline int FeedSourcesMode() {
+    return VideoCore::Nx2Debug::Experiment(127);
+}
+
 /// EXP13=2 records only: Report, a compute report semaphore (0x6c3) or a 3D payload report;
 /// Puller, a puller semaphore release.
 enum class Writer : u32 { Qmd, Dma, Report, Puller, Count };
@@ -105,6 +113,9 @@ enum class Source : u8 {
     /// As OverlayFromMemory, built while the feed or EDEN_NX2_FEED_MEMORY_OVERLAY was off (not
     /// checked) or with an unbounded writer queued over the QMD: never fed.
     OverlayFromMemoryUnchecked,
+    /// EXP127 not 0 and EXP126 = 1: as OverlayFromMemory, built while the ranged overflow (whose
+    /// writes are stamped) was the only unbounded writer queued; fed with EXP127 = 2
+    OverlayFromMemoryOverflow,
     Count,
 };
 struct Record {
@@ -148,6 +159,10 @@ enum class Mirror : u32 {
     /// Of them, built with an unbounded writer queued over the QMD (GpuSplit::
     /// QueuedGuestWriters): never fed (EDEN_NX2_FEED_MEMORY_OVERLAY's belt)
     OverlayFromMemoryUnbounded,
+    /// EXP127 not 0: of the overlays from memory, built with the stamped ranged overflow as the
+    /// only unbounded writer queued
+    /// (Source::OverlayFromMemoryOverflow; not counted in OverlayFromMemoryUnbounded)
+    OverlayFromMemoryOverflow,
     Count,
 };
 void NoteMirror(Mirror event);

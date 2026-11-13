@@ -760,7 +760,8 @@ void GpuSplit::RangedRing::Grow() {
 }
 
 GpuSplit::GuestWriters GpuSplit::QueuedGuestWriters(u64 done, GPUVAddr address, u64 device,
-                                                     u64 size, std::span<const u64> skip) const {
+                                                     u64 size, std::span<const u64> skip,
+                                                     bool overflow_stamped) const {
     GuestWriters found{};
     using Cause = GuestWriterCause;
     const auto unbounded = [&](u64 position, Cause cause, const char* what = nullptr) {
@@ -780,7 +781,11 @@ GpuSplit::GuestWriters GpuSplit::QueuedGuestWriters(u64 done, GPUVAddr address, 
     unbounded(last_unranged_position, Cause::Unranged);
     unbounded(last_function_position, Cause::Function);
     unbounded(last_method_write_position, Cause::MethodWrite);
-    unbounded(ranged_overflow_position, Cause::RangedOverflow);
+    // EXP127 (the header): the dropped writes are at or before the overflow position, and those
+    // not stamped by device address before ranged_device_since.
+    unbounded(overflow_stamped ? (std::min)(ranged_overflow_position, FloorlessOverflowTerm())
+                               : ranged_overflow_position,
+              Cause::RangedOverflow);
     const u64 end = device + size;
     // NoteMemoryWrite and NoteMemoryWriteData (puller releases, 3D reports and uploads), newest
     // first; an unknown range may write anything.
