@@ -70,6 +70,7 @@
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
+#include "video_core/renderer_vulkan/vk_mem_stage_shadow.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/nx2_indirect_grid.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -86,6 +87,7 @@
 #include "video_core/fritchii_delta_path.h"
 #include "video_core/fritchii_draw_kinds.h"
 #include "video_core/fritchii_report_runs.h"
+#include "video_core/memstage_shadow.h"
 #include "video_core/memstage_stats.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cb_path.h"
@@ -584,6 +586,8 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
     // EDEN_NX2_MEMSTAGE_STATS: stream writes are tested against the texture cache's pages.
     VideoCommon::MemStageStats::SetImagePageFilters(&texture_cache.page_filter,
                                                     &texture_cache.image_count_filter);
+    // FRITCHII_MEMSTAGE_SHADOW: the watched pages of join 2 (image pages).
+    VideoCommon::MemStageShadow::SetWatchFilter(&texture_cache.page_filter);
     buffer_cache.SetPendingCpuWrites(
         [this](const std::function<void(DAddr, size_t)>& callback) {
             gpu.ForEachPendingCpuWrite(callback);
@@ -1283,6 +1287,16 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     if (VideoCommon::MemStageStats::Enabled()) [[unlikely]] {
         VideoCommon::MemStageStats::ProgramSet(pipeline->ShaderHashes());
     }
+    // FRITCHII_MEMSTAGE_SHADOW: the facts table's compare (c) and the draw kinds of spec 3.4.
+    if (VideoCommon::MemStageShadow::g_on) [[unlikely]] {
+        const MemStage::DrawFacts facts = pipeline->MemFacts();
+        const bool diagnostic = frame_dump.Capturing() || VideoCommon::RenderTrace::Enabled() ||
+                                OcarinaTemporalEnabled();
+        VideoCommon::MemStageShadow::BackPipeline(
+            pipeline->ShaderHashes(), ShadowFactsDigest(facts, pipeline->HasDynamicVertexInput()),
+            (facts.has_texel_buffers ? VideoCommon::MemStageShadow::PipelineTexel : 0U) |
+                (diagnostic ? VideoCommon::MemStageShadow::PipelineDiagnostic : 0U));
+    }
     // TEST: up to Configure (EDEN_NX2_GPU_PROFILE=2).
     std::optional<Profile::FineScope> setup_scope;
     setup_scope.emplace(Profile::Zone::DrawSetup);
@@ -1488,6 +1502,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     // Configure plays its sections and RestAtEnd what is left, however Configure ends (true,
     // false or an exception).
     mem_stage.FillDraw(buffer_cache, pipeline->MemFacts(), is_indexed);
+    // FRITCHII_MEMSTAGE_SHADOW: read flushes from here to the record are counted.
+    if (VideoCommon::MemStageShadow::g_on) [[unlikely]] {
+        VideoCommon::MemStageShadow::BackDrawWindow(true);
+    }
     bool configured{};
     {
         Profile::Scope scope{Profile::Zone::Configure};
@@ -1577,6 +1595,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         Profile::Scope scope{Profile::Zone::DrawRecord};
         scheduler.TraceGraphicsPipeline(pipeline->ShaderHashes());
         trace_draw_hashes = {pipeline->ShaderHashes()[1], pipeline->ShaderHashes()[5]};
+        if (VideoCommon::MemStageShadow::g_on) [[unlikely]] {
+            VideoCommon::MemStageShadow::BackDrawWindow(false);
+        }
         draw_func();
     }
     if (probe) {
@@ -3275,6 +3296,13 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType 
     if (Common::WriteRing::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
         mem_stage.NoteGather(MemStage::Gather::FlushRegion, static_cast<u32>(which));
     }
+    // FRITCHII_MEMSTAGE_SHADOW: read flushes inside a draw (between its fill and its record).
+    if (VideoCommon::MemStageShadow::g_on) [[unlikely]] {
+        using VideoCommon::CacheType;
+        VideoCommon::MemStageShadow::BackFlushRegion(True(which & CacheType::TextureCache),
+                                                     True(which & CacheType::BufferCache),
+                                                     True(which & CacheType::QueryCache));
+    }
     if (True(which & (VideoCommon::CacheType::TextureCache | VideoCommon::CacheType::BufferCache))) {
         // CPU writes into GPU-written memory are only collected when they happen. Apply them
         // first, or the download writes the stale GPU copy over them: the Yoshi demo writes a
@@ -3299,6 +3327,9 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType 
 void RasterizerVulkan::FlushRegionForRead(DAddr addr, u64 size) {
     if (addr == 0 || size == 0) {
         return;
+    }
+    if (VideoCommon::MemStageShadow::g_on) [[unlikely]] {
+        VideoCommon::MemStageShadow::BackFlushRegion(true, true, true);
     }
     // EDEN_NX2_EXP49: as FlushRegion, but the buffer cache doesn't wait for the host GPU here
     // (Scheduler::Finish, with its lock held): the reading thread does, in FinishRead.
@@ -3979,6 +4010,9 @@ void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64
     if (Common::WriteRing::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
         mem_stage.NoteGather(MemStage::Gather::Apply, 0);
     }
+    if (VideoCommon::MemStageShadow::g_on) [[unlikely]] {
+        VideoCommon::MemStageShadow::BackCacheInvalidation(true, ranges.size());
+    }
     namespace CbPath = VideoCommon::Nx2CbPath;
     const int cb_path = CbPath::Mode();
     // EXP88 & 1 (fable52_answer_next70 3.1 step 5): the guest's collected writes take each
@@ -4071,6 +4105,9 @@ void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64
 void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
     if (addr == 0 || size == 0) {
         return;
+    }
+    if (VideoCommon::MemStageShadow::g_on) [[unlikely]] {
+        VideoCommon::MemStageShadow::BackCacheInvalidation(false, 1);
     }
     if (VideoCommon::Nx2FastDrawCount::g_on) [[unlikely]] {
         VideoCommon::Nx2FastDrawCount::NotePoolWrite(addr, size);

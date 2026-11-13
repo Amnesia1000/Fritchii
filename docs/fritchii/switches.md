@@ -352,6 +352,45 @@ fable_memstage_step2_spec.md 7.2): what the buffer cache side's stamps are.
   (older than the 2^18-number ring) and epoch off. Early, late, split, epoch off and held
   must all read 0. Disagreements log the first 16 lines with the packet and both ticks.
 
+### FRITCHII_MEMSTAGE_SHADOW
+
+FRITCHII_MEMSTAGE_SHADOW (boot, default 0; the memory stage's piece 5b,
+fable_memstage_step6_spec.md 6.2): the future memory stage's inputs, run on the back thread and
+compared, never used. Off, each hook is one test of a flag (one per ring entry, per draw, per
+FlushCaching, per channel bind).
+- 1: before the back executes each ring entry, the stage's code classifies it (pass, work or
+  level: spec section 3, the Call entries by their stage tag in header bits 32-39) and applies
+  pass and work entries to its own copy of each Maxwell3D's registers, shadow RAM, constant
+  buffer bindings, root tables and draw manager. The draw manager is the same code on both
+  (DrawManager is a template on the engine, instantiated for Maxwell3D and for the stage's copy),
+  so the stage finds its draws with the back's own lines. Constant buffer words are computed
+  (range and offset), not written. After a level entry the copy is taken from the back again,
+  with the back's waiting method sink applied. At every draw the back issues: (a) the stage drew
+  at the same entry; (b) the stage's state at its draw equals the back's (the registers the
+  buffer cache reads through CacheInputs, the draw's registers, the constant buffer bindings, the
+  root tables, the draw state, execute_on, the channel, the engine; every dirty flag the stage
+  raised is raised on the back); (c) at the pipeline lookup, the facts table (keyed by the program
+  registers) against the pipeline's facts digest; (d) at FlushCaching, the device ranges of the
+  stage's constant buffer words against the back's invalidation ranges.
+- 2: as 1, and (b) compares the whole register file and the shadow RAM (slower).
+Every 10 s, "Memory stage shadow": entries/s pass, work, level; level runs/s and resyncs/s;
+draws/s compared (served, render-enable off, flushed from the method sink) and in level entries;
+the draw kinds of spec 3.4 (indirect, list, GPU count, texel buffers, diagnostics, host
+conditional); facts misses/s; watched-page hits (constant buffer words onto image pages or the
+texture/sampler tables: counted, and the entry is treated as level). "Memory stage shadow
+compare" gives a (missing, extra, position), b (dirty flags apart), c (conflicts; program keys
+that changed code; pipelines without a compared draw), d (missing, extra; flushes, strict ones)
+for the window and the session: **all must read 0**. "Memory stage shadow inside draws": what
+runs on the back between a draw's fill and its record, FlushRegion by the cache halves that ran
+(texture, buffer, query; the buffer half must stay 0 in play) and collected game writes applied.
+"Memory stage shadow level entries by kind and channel": the top 12, named by the 3D method, the
+engine, the closure (`call +0x...`: its address in the executable, for the symbol file), or the
+constant buffer case; this table is the go/no-go for piece 6b. The first 16 differences of each
+compare are logged as "Memory stage shadow (a/b/c/d)", (b) naming the registers. The stage
+implements the default constant buffer write; with EXP107 on, constant buffer words are level.
+Not covered yet: render_enable.mode is always level (the back asks the query cache), and the
+watched pages leave out shader code and query addresses.
+
 ### FRITCHII_JIT_DISPATCH_BITS
 
 FRITCHII_JIT_DISPATCH_BITS (boot, default 20; fable52_answer_guest 2.1): the A64 JIT's fast

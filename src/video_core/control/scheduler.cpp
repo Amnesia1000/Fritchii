@@ -4,7 +4,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <cstddef>
 #include <memory>
+#include <mutex>
+#include <type_traits>
 #include <vector>
 
 #include "common/assert.h"
@@ -13,20 +16,40 @@
 #include "video_core/control/scheduler.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
+#include "video_core/memstage_shadow.h"
 
 namespace Tegra::Control {
+namespace {
+
+// The channel switch the split's back runs. A struct with a fixed layout, not a lambda: the
+// memory stage reads the bind id from payload word 0 (StageTag::Channel, memstage_shadow.h).
+struct BindChannelCall {
+    s64 bind_id;
+    GPU* gpu;
+    std::mutex* guard;
+
+    void operator()() const {
+        std::scoped_lock lk{*guard};
+        gpu->BindChannel(static_cast<s32>(bind_id));
+        if (VideoCommon::MemStageShadow::g_on) [[unlikely]] {
+            VideoCommon::MemStageShadow::BackChannel(static_cast<s32>(bind_id));
+        }
+    }
+};
+static_assert(offsetof(BindChannelCall, bind_id) == 0);
+static_assert(std::is_trivially_copyable_v<BindChannelCall>);
+
+} // Anonymous namespace
 
 void Scheduler::BindChannel(GPU& gpu, s32 bind_id) {
     // With the GPU thread split the rasterizer's channel switches with the methods around it, on
     // the back thread (deferred outside the lock: the back takes it to bind).
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
-        split.Defer(
-            [this, gpu_ptr = &gpu, bind_id] {
-                std::scoped_lock lk{scheduling_guard};
-                gpu_ptr->BindChannel(bind_id);
-            },
-            // Delta draw count: a real switch breaks in RasterizerVulkan::BindChannel.
-            VideoCommon::GpuSplit::Effect::None, VideoCommon::Nx2FastDrawCount::Neutral());
+        split.Defer(BindChannelCall{bind_id, &gpu, &scheduling_guard},
+                    // Delta draw count: a real switch breaks in RasterizerVulkan::BindChannel.
+                    VideoCommon::GpuSplit::Effect::None,
+                    VideoCommon::Nx2FastDrawCount::Neutral() |
+                        VideoCommon::StageTagBits(VideoCommon::StageTag::Channel));
         return;
     }
     std::scoped_lock lk{scheduling_guard};
