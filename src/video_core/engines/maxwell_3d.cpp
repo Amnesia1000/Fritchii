@@ -3566,6 +3566,11 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             static u64 range_skips{};
             static u64 range_differences{};
             bool range_skip = false;
+            // EXP120: hits that EXP120 = 0 would have drained (an unranged writer note it spared
+            // since a page's snapshot), with their own verify count.
+            static u64 unranged_skips{};
+            static u64 unranged_differences{};
+            bool unranged_skip = false;
             const u64 first_page = *device >> 12;
             const u64 last_page = (*device + read_bytes - 1) >> 12;
             bool hit = true;
@@ -3628,6 +3633,8 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                 if (reason != 4) {
                     hit = false;
                     ++miss_reasons[reason];
+                } else if (split.LastUnrangedPositionWithoutExp120() > since) {
+                    unranged_skip = true;
                 }
             }
             if (hit && range_skip) {
@@ -3635,6 +3642,9 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             }
             if (hit && byte_skip) {
                 ++byte_skips;
+            }
+            if (hit && unranged_skip) {
+                ++unranged_skips;
             }
             // A report's value is up to 8 bytes, listed by its first 4: look 12 bytes back. A
             // listed report may not be in guest memory yet: take the drained path.
@@ -3653,14 +3663,16 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                         if (exact != snap_words) {
                             range_differences += range_skip ? 1 : 0;
                             byte_differences += byte_skip ? 1 : 0;
+                            unranged_differences += unranged_skip ? 1 : 0;
                             if (differences++ < 32) {
                                 LOG_WARNING(HW_GPU,
                                             "DMA snapshot check: macro {:#x} read of {} words at "
                                             "{:#x} differs from the drained read ({:#x} vs "
-                                            "{:#x}){}{}",
+                                            "{:#x}){}{}{}",
                                             macro, words, source, snap_words[0], exact[0],
                                             range_skip ? " (skipped by EXP10 ranges)" : "",
-                                            byte_skip ? " (skipped by EXP10 byte ranges)" : "");
+                                            byte_skip ? " (skipped by EXP10 byte ranges)" : "",
+                                            unranged_skip ? " (skipped by EXP120)" : "");
                             }
                             snap_words = std::move(exact);
                         }
@@ -3717,6 +3729,30 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                              hits, misses, differences, report_reads, miss_reasons[0],
                              miss_reasons[1], miss_reasons[2], miss_reasons[3], miss_report_flushes,
                              VideoCore::Nx2Debug::Experiment(73));
+                    {
+                        // fable_answer_long_drains 8.4: who notes the unranged writers, the
+                        // KeplerMemory and Fermi2D methods (single method / non-incrementing run).
+                        using Kind = VideoCommon::GpuSplit::EngineWriteKind;
+                        using Note = VideoCommon::GpuSplit::EngineWriteNote;
+                        const auto& notes = split.GetEngineWriteNotes();
+                        const auto kind = [&notes](Kind k) {
+                            const auto at = [&](size_t call, Note n) {
+                                return notes[call][static_cast<size_t>(k)][static_cast<size_t>(n)];
+                            };
+                            return fmt::format(
+                                "{}/{} unranged, {}/{} ranged, {}/{} not noted",
+                                at(0, Note::Unranged), at(1, Note::Unranged), at(0, Note::Ranged),
+                                at(1, Note::Ranged), at(0, Note::Nothing), at(1, Note::Nothing));
+                        };
+                        LOG_INFO(HW_GPU,
+                                 "DMA snapshot unranged notes (EXP120={}; single/run): "
+                                 "KeplerMemory data {}; KeplerMemory registers {}; Fermi2D blits "
+                                 "{}; Fermi2D registers {}; {} reads skipped by EXP120 ({} "
+                                 "differed)",
+                                 VideoCore::Nx2Debug::Experiment(120), kind(Kind::I2mData),
+                                 kind(Kind::I2mRegister), kind(Kind::BlitLaunch),
+                                 kind(Kind::BlitRegister), unranged_skips, unranged_differences);
+                    }
                     if (ranged_writers) {
                         using Unbounded = VideoCommon::GpuSplit::DispatchUnbounded;
                         const auto& sent = split.UnboundedWriters();

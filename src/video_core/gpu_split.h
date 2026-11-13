@@ -720,10 +720,47 @@ public:
     /// Waits until the back executed every NoteWriter and NoteMemoryWriter work sent so far.
     bool WaitForMemoryWriters();
     /// memory-writing work whose range the front does not note was just sent (KeplerMemory
-    /// and Fermi2D methods, syncpoint operations). Ends every macro DMA read snapshot.
+    /// and Fermi2D methods; DmaPusher is the only caller). Ends every macro DMA read snapshot.
     void NoteUnrangedWriter() {
         last_memory_writer_position = write_position;
         last_unranged_position = write_position;
+        unranged_without_exp120 = write_position;
+    }
+    /// EXP120: a KeplerMemory or Fermi2D method that EXP120 = 0 notes as an unranged writer was
+    /// just sent, and EXP120 noted its bytes instead (NoteMemoryWrite) or found it writes no
+    /// memory. FrontDmaRead tells the reads this spares a drain apart (their own verify count).
+    void NoteUnrangedWriterSpared() {
+        unranged_without_exp120 = write_position;
+    }
+    /// Where LastUnrangedPosition would be with EXP120 = 0.
+    [[nodiscard]] u64 LastUnrangedPositionWithoutExp120() const {
+        return unranged_without_exp120;
+    }
+    /// What the KeplerMemory and Fermi2D methods sent were noted as (DmaPusher, EXP120), for the
+    /// "DMA snapshot" log. Front only.
+    enum class EngineWriteKind : u32 {
+        I2mData,      ///< KeplerMemory data: the back writes the upload
+        I2mRegister,  ///< KeplerMemory, any other method (exec included): registers only
+        BlitLaunch,   ///< Fermi2D's blit launch (pixels_from_memory.src_y0 + 1)
+        BlitRegister, ///< Fermi2D, any other method: registers only
+        Count,
+    };
+    enum class EngineWriteNote : u32 {
+        Unranged, ///< NoteUnrangedWriter
+        Ranged,   ///< EXP120: NoteMemoryWrite of the bytes it may write
+        Nothing,  ///< EXP120: writes no memory, not noted
+        Count,
+    };
+    /// [call: 0 CallMethod, 1 CallMultiMethod][kind][note]
+    using EngineWriteNotes =
+        std::array<std::array<std::array<u64, static_cast<size_t>(EngineWriteNote::Count)>,
+                              static_cast<size_t>(EngineWriteKind::Count)>,
+                   2>;
+    void CountEngineWrite(bool multi, EngineWriteKind kind, EngineWriteNote note) {
+        ++engine_write_notes[multi ? 1 : 0][static_cast<size_t>(kind)][static_cast<size_t>(note)];
+    }
+    [[nodiscard]] const EngineWriteNotes& GetEngineWriteNotes() const {
+        return engine_write_notes;
     }
     /// the ring position of everything sent so far.
     [[nodiscard]] u64 SentPosition() const {
@@ -1234,6 +1271,8 @@ private:
     u64 last_writer_position{};
     u64 last_memory_writer_position{};
     u64 last_unranged_position{};
+    u64 unranged_without_exp120{};
+    EngineWriteNotes engine_write_notes{};
     static constexpr u32 PendingWriteWords = 8;
     struct PendingWrite {
         u64 begin;
