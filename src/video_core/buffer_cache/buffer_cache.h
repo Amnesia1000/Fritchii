@@ -1472,7 +1472,7 @@ void BufferCache<P>::BindHostGeometryBuffers(bool is_indexed) {
     if (is_indexed) {
         BindHostIndexBuffer();
     } else if constexpr (!HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT) {
-        const auto& draw_state = maxwell3d->draw_manager.draw_state;
+        const auto& draw_state = Inputs().DrawState();
         if (draw_state.topology == Maxwell::PrimitiveTopology::Quads ||
             draw_state.topology == Maxwell::PrimitiveTopology::QuadStrip) {
             runtime.BindQuadIndexBuffer(draw_state.topology, draw_state.vertex_buffer.first,
@@ -1481,7 +1481,7 @@ void BufferCache<P>::BindHostGeometryBuffers(bool is_indexed) {
     }
     BindHostVertexBuffers();
     BindHostTransformFeedbackBuffers();
-    if (current_draw_indirect) {
+    if (Inputs().DrawIndirect()) {
         BindHostDrawIndirectBuffers();
     }
 }
@@ -1590,12 +1590,11 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
         }
     }
 
-    const auto& cbufs = maxwell3d->state.shader_stages[stage];
-    GPUVAddr ssbo_addr = cbufs.const_buffers[cbuf_index].address + cbuf_offset;
+    GPUVAddr ssbo_addr = Inputs().StageConstBuffer(stage, cbuf_index).address + cbuf_offset;
     GPUVAddr holder{};
     if (indirect_offset != ~0U) {
         // The pointer is an entry of a table the constant buffer points to.
-        holder = gpu_memory->Read<u64>(ssbo_addr);
+        holder = Inputs().ReadGameU64(ssbo_addr);
         MemStageStats::Read(MemStageStats::Kind::StorageAddress, sizeof(u64));
         if (holder == 0) {
             channel_state->storage_buffers[stage][ssbo_index] = NULL_BINDING;
@@ -1611,7 +1610,7 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
     }();
     channel_state->storage_buffers[stage][ssbo_index] =
         StorageBufferBinding(ssbo_addr, cbuf_index, is_written,
-                             (bare_pointers && maxwell3d->GetNativeMacroEngine().native_turing) ||
+                             (bare_pointers && Inputs().NativeTuring()) ||
                                  indirect_offset != ~0U,
                              indirect_offset != ~0U);
     if (indirect_offset != ~0U) {
@@ -1691,7 +1690,7 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
         }
     }
 
-    const auto& launch_desc = kepler_compute->launch_description;
+    const auto& launch_desc = Inputs().LaunchDescription();
     if (((launch_desc.const_buffer_enable_mask >> cbuf_index) & 1) == 0) {
         LOG_WARNING(HW_GPU, "Skipped binding SSBO: cbuf index {} is not enabled", cbuf_index);
         return;
@@ -1703,11 +1702,11 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
     GPUVAddr holder{};
     const bool table_pointer = indirect_offset != ~0U;
     if (table_pointer) {
-        holder = gpu_memory->Read<u64>(ssbo_addr);
+        holder = Inputs().ReadGameU64(ssbo_addr);
         MemStageStats::Read(MemStageStats::Kind::CStorageAddress, sizeof(u64));
         ssbo_addr = holder + indirect_offset;
     }
-    const bool native_pointer = kepler_compute->IsNativeMode();
+    const bool native_pointer = Inputs().ComputeNativeMode();
     channel_state->native_compute_storage_buffers =
         (channel_state->native_compute_storage_buffers & ~(u64{1} << ssbo_index)) |
         (u64{native_pointer ? 1U : 0U} << ssbo_index);
@@ -1735,13 +1734,13 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
             const std::array<u32, 3> block{qmd.block_dim_x.Value(), qmd.block_dim_y.Value(),
                                            qmd.block_dim_z.Value()};
             std::optional<std::array<u32, 3>> grid;
-            if (!kepler_compute->GetIndirectComputeAddress()) {
+            if (!Inputs().IndirectComputeAddress()) {
                 grid = std::array<u32, 3>{qmd.grid_dim_x.Value(), qmd.grid_dim_y.Value(),
                                           qmd.grid_dim_z.Value()};
             }
             if (const auto extent = Shader::ResolveStorageWriteExtent(write_extent, block, grid)) {
                 // The extent counts from the pointer, the binding from the pointer aligned down.
-                const GPUVAddr pointer = gpu_memory->Read<u64>(ssbo_addr);
+                const GPUVAddr pointer = Inputs().ReadGameU64(ssbo_addr);
                 const u64 pad = pointer >= binding.gpu_addr ? pointer - binding.gpu_addr : 0;
                 const u64 proven = std::min<u64>(binding.size, pad + *extent);
                 mark = proven;
@@ -2158,7 +2157,7 @@ void BufferCache<P>::BindHostIndexBuffer() {
     TouchBuffer(buffer, channel_state->index_buffer.buffer_id);
     const u32 offset = buffer.Offset(channel_state->index_buffer.device_addr);
     const u32 size = channel_state->index_buffer.size;
-    const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    const auto& draw_state = Inputs().DrawState();
     MemStageStats::Read(MemStageStats::Kind::Index, size);
     if constexpr (requires { runtime.BindHostUint8IndexBuffer(std::span<const u8>{}); }) {
         if (draw_state.index_buffer.format == Maxwell::IndexFormat::UnsignedByte &&
@@ -2262,7 +2261,7 @@ template <class P>
 void BufferCache<P>::RefreshRepackedVertexBuffers() {
     if constexpr (requires { runtime.IsVertexRepacked(u32{}); }) {
         u32 mask = std::exchange(stale_vertex_buffers_mask, 0) & enabled_vertex_buffers_mask;
-        auto& flags = maxwell3d->dirty.flags;
+        auto& flags = Inputs().Dirty();
         while (mask != 0) {
             const u32 index = std::countr_zero(mask);
             mask &= mask - 1;
@@ -2284,7 +2283,7 @@ void BufferCache<P>::BindHostVertexBuffers() {
 #endif
 
     if (use_optimized_vertex_buffers) {
-        auto& flags = maxwell3d->dirty.flags;
+        auto& flags = Inputs().Dirty();
         u32 enabled_mask = enabled_vertex_buffers_mask;
         HostBindings<Buffer> bindings{};
         u32 last_index = (std::numeric_limits<u32>::max)();
@@ -2310,7 +2309,7 @@ void BufferCache<P>::BindHostVertexBuffers() {
                 continue;
             }
             flags[Dirty::VertexBuffer0 + index] = false;
-            const u32 stride = maxwell3d->regs.vertex_streams[index].stride;
+            const u32 stride = Inputs().VertexStreamStride(index);
             const u32 offset = buffer.Offset(binding.device_addr);
             buffer.MarkUsage(offset, binding.size);
             if (!bindings.buffers.empty() && index != last_index + 1) {
@@ -2329,7 +2328,7 @@ void BufferCache<P>::BindHostVertexBuffers() {
     } else {
         HostBindings<typename P::Buffer> host_bindings;
         bool any_valid{false};
-        auto& flags = maxwell3d->dirty.flags;
+        auto& flags = Inputs().Dirty();
         for (u32 index = 0; index < NUM_VERTEX_BUFFERS; ++index) {
             const Binding& binding = channel_state->vertex_buffers[index];
             Buffer& buffer = slot_buffers[binding.buffer_id];
@@ -2355,7 +2354,7 @@ void BufferCache<P>::BindHostVertexBuffers() {
                 const Binding& binding = channel_state->vertex_buffers[index];
                 Buffer& buffer = slot_buffers[binding.buffer_id];
 
-                const u32 stride = maxwell3d->regs.vertex_streams[index].stride;
+                const u32 stride = Inputs().VertexStreamStride(index);
                 const u32 offset = buffer.Offset(binding.device_addr);
                 buffer.MarkUsage(offset, binding.size);
 
@@ -2381,7 +2380,7 @@ void BufferCache<P>::BindHostDrawIndirectBuffers() {
             buffer.MarkUsage(buffer.Offset(binding.device_addr), binding.size);
         }
     };
-    if (current_draw_indirect->include_count) {
+    if (Inputs().DrawIndirect()->include_count) {
         bind_buffer(channel_state->count_buffer_binding);
     }
     bind_buffer(channel_state->indirect_buffer_binding);
@@ -2408,8 +2407,8 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     ++channel_state->uniform_cache_shots[0];
     // Bank 24 (root table 0, NVN2's push constants) is read from bank 17, which such games do not
     // bind: stream the table's current words as that buffer.
-    if (index == 17 && maxwell3d->root_tables.loaded && channel_state->uniform_buffers[stage][index].size == 0) {
-        const auto& words = maxwell3d->root_tables.tables[0];
+    if (index == 17 && Inputs().RootTables().loaded && channel_state->uniform_buffers[stage][index].size == 0) {
+        const auto& words = Inputs().RootTables().tables[0];
         const u32 size = (*channel_state->uniform_buffer_sizes)[stage][index];
         const u32 copied = (std::min)(size, static_cast<u32>(sizeof(words)));
         if constexpr (IS_OPENGL) {
@@ -3737,13 +3736,13 @@ void BufferCache<P>::BindHostGraphicsTextureBuffers(size_t stage) {
 
 template <class P>
 void BufferCache<P>::BindHostTransformFeedbackBuffers() {
-    if (maxwell3d->regs.transform_feedback_enabled == 0) {
+    if (!Inputs().TransformFeedbackEnabled()) {
         return;
     }
     HostBindings<typename P::Buffer> host_bindings;
     for (u32 index = 0; index < NUM_TRANSFORM_FEEDBACK_BUFFERS; ++index) {
         const Binding& binding = channel_state->transform_feedback_buffers[index];
-        const auto& control = maxwell3d->regs.transform_feedback.controls[index];
+        const auto& control = Inputs().TransformFeedbackControl(index);
         const bool has_layout = control.varying_count != 0 || control.stride != 0;
 
         Buffer* host_buffer = &slot_buffers[NULL_BUFFER_ID];
@@ -4100,7 +4099,7 @@ void BufferCache<P>::DoUpdateGraphicsBuffers(bool is_indexed) {
             UpdateStorageBuffers(stage);
             UpdateTextureBuffers(stage);
         }
-        if (current_draw_indirect) {
+        if (Inputs().DrawIndirect()) {
             UpdateDrawIndirect();
         }
         RefreshMultiRangeSegments(graphics_segments);
@@ -4122,9 +4121,9 @@ template <class P>
 void BufferCache<P>::UpdateIndexBuffer() {
     // We have to check for the dirty flags and index count
     // The index count is currently changed without updating the dirty flags
-    const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    const auto& draw_state = Inputs().DrawState();
     const auto& index_buffer_ref = draw_state.index_buffer;
-    auto& flags = maxwell3d->dirty.flags;
+    auto& flags = Inputs().Dirty();
     if (!flags[Dirty::IndexBuffer]) {
         return;
     }
@@ -4171,8 +4170,8 @@ void BufferCache<P>::UpdateIndexBuffer() {
 
 template <class P>
 void BufferCache<P>::UpdateVertexBuffers() {
-    auto& flags = maxwell3d->dirty.flags;
-    if (!maxwell3d->dirty.flags[Dirty::VertexBuffers]) {
+    auto& flags = Inputs().Dirty();
+    if (!flags[Dirty::VertexBuffers]) {
         return;
     }
     flags[Dirty::VertexBuffers] = false;
@@ -4184,14 +4183,15 @@ void BufferCache<P>::UpdateVertexBuffers() {
 
 template <class P>
 void BufferCache<P>::UpdateVertexBuffer(u32 index) {
-    if (!maxwell3d->dirty.flags[Dirty::VertexBuffer0 + index]) {
+    const CacheInputs inputs = Inputs();
+    if (!inputs.Dirty()[Dirty::VertexBuffer0 + index]) {
         return;
     }
-    const auto& array = maxwell3d->regs.vertex_streams[index];
-    const auto& limit = maxwell3d->regs.vertex_stream_limits[index];
+    const auto& array = inputs.VertexStream(index);
+    const auto& limit = inputs.VertexStreamLimit(index);
     const GPUVAddr gpu_addr_begin = array.Address();
-    const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
-    const u64 native_size = native ? maxwell3d->regs.NativeVertexStreamSize(index) : 0;
+    const bool native = inputs.NativeTuring();
+    const u64 native_size = native ? inputs.NativeVertexStreamSize(index) : 0;
     if (native && array.enable != 0 && native_size > (std::numeric_limits<u32>::max)()) {
         throw std::runtime_error("Native vertex stream exceeds supported 32-bit buffer size");
     }
@@ -4231,11 +4231,11 @@ void BufferCache<P>::UpdateDrawIndirect() {
             .buffer_id = FindBuffer(*device_addr, static_cast<u32>(size), false),
         };
     };
-    if (current_draw_indirect->include_count) {
-        update(current_draw_indirect->count_start_address, sizeof(u32),
-               channel_state->count_buffer_binding);
+    const auto* const indirect = Inputs().DrawIndirect();
+    if (indirect->include_count) {
+        update(indirect->count_start_address, sizeof(u32), channel_state->count_buffer_binding);
     }
-    update(current_draw_indirect->indirect_start_address, current_draw_indirect->buffer_size,
+    update(indirect->indirect_start_address, indirect->buffer_size,
            channel_state->indirect_buffer_binding);
 }
 
@@ -4323,7 +4323,7 @@ void BufferCache<P>::UpdateTextureBuffers(size_t stage) {
 
 template <class P>
 void BufferCache<P>::UpdateTransformFeedbackBuffers() {
-    if (maxwell3d->regs.transform_feedback_enabled == 0) {
+    if (!Inputs().TransformFeedbackEnabled()) {
         return;
     }
     for (u32 index = 0; index < NUM_TRANSFORM_FEEDBACK_BUFFERS; ++index) {
@@ -4333,7 +4333,7 @@ void BufferCache<P>::UpdateTransformFeedbackBuffers() {
 
 template <class P>
 void BufferCache<P>::UpdateTransformFeedbackBuffer(u32 index) {
-    const auto& binding = maxwell3d->regs.transform_feedback.buffers[index];
+    const auto& binding = Inputs().TransformFeedbackBuffer(index);
     const GPUVAddr gpu_addr = binding.Address() + binding.start_offset;
     const u32 size = binding.size;
     const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
@@ -4354,7 +4354,7 @@ void BufferCache<P>::UpdateComputeUniformBuffers() {
     ForEachEnabledBit(channel_state->enabled_compute_uniform_buffer_mask, [&](u32 index) {
         Binding& binding = channel_state->compute_uniform_buffers[index];
         binding = NULL_BINDING;
-        const auto& launch_desc = kepler_compute->launch_description;
+        const auto& launch_desc = Inputs().LaunchDescription();
         if (((launch_desc.const_buffer_enable_mask >> index) & 1) != 0) {
             const auto& cbuf = launch_desc.const_buffer_config[index];
             const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(cbuf.Address());
@@ -5605,7 +5605,7 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
     // draws. A channel left out would address whatever buffer reuses the slot next at the old
     // offset (Ocarina of Time draws from several channels: a frame of garbage constants).
     const auto scrub = [&](BufferCacheChannelInfo& channel) {
-        auto& flags = channel.maxwell3d.dirty.flags;
+        auto& flags = CacheInputs::Of(channel).Dirty();
         if (channel.index_buffer.buffer_id == buffer_id) {
             channel.index_buffer.buffer_id = BufferId{};
             flags[Dirty::IndexBuffer] = true;
@@ -5676,7 +5676,7 @@ void BufferCache<P>::TraceTablePointer(bool compute, size_t stage, size_t ssbo_i
         return;
     }
     const GPUVAddr entry_addr = holder + indirect_offset;
-    const GPUVAddr entry = gpu_memory->Read<u64>(entry_addr);
+    const GPUVAddr entry = Inputs().ReadGameU64(entry_addr);
     const u64 key = (u64{compute} << 63) | (u64{stage & 7} << 60) | (u64{ssbo_index & 63} << 54) |
                     (u64{cbuf_index & 31} << 49) | (u64{cbuf_offset & 0x7ffff} << 30) |
                     (indirect_offset & 0x3fffffff);
@@ -5711,7 +5711,7 @@ template <class P>
 Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index, bool is_written,
                                              bool native_pointer, bool table_pointer,
                                              bool compute) const {
-    const GPUVAddr gpu_addr = gpu_memory->Read<u64>(ssbo_addr);
+    const GPUVAddr gpu_addr = Inputs().ReadGameU64(ssbo_addr);
     // EDEN_NX2_MEMSTAGE_STATS: the pointer word.
     const MemStageStats::Kind address_kind =
         compute ? MemStageStats::Kind::CStorageAddress : MemStageStats::Kind::StorageAddress;
@@ -5725,7 +5725,7 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
     // pointer reads it too (a size word past 8 MiB grows the binding). Pool pointers ignore it.
     const bool reads_size_word =
         !(table_pointer && !is_written) && (!native_pointer || (compute && !is_written));
-    const u64 next_qword = reads_size_word ? gpu_memory->Read<u64>(ssbo_addr + 8) : 0;
+    const u64 next_qword = reads_size_word ? Inputs().ReadGameU64(ssbo_addr + 8) : 0;
     // EDEN_NX2_MEMSTAGE_STATS: the size word, in the pointer's range.
     MemStageStats::Read(address_kind, reads_size_word ? sizeof(u64) : 0, 0);
     // Every draw rebinds each storage buffer: the layout lookup (a mutex), the range walk and
