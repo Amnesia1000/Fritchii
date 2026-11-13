@@ -179,6 +179,13 @@ void LoadExperiments() {
         // yielding. Daytime market, flipped every 20 s: 59.2 -> 59.9 fps, windows 54.8-63.7 ->
         // 59.1-60.4, 1% low 40.0 -> 42.1, back 7.35 -> 7.16 us a draw; the owner felt it steadier.
         g_experiments[114].store(2, std::memory_order_relaxed);
+        // EXP13 = 4 + EXP12 = 2 (2026-11-13): the front predicts QMD releases and, for acquires
+        // nothing queued can meet, suspends without a full drain. Skeleton fight, flipped every
+        // 20 s: 64.8 -> 66.3 fps, 0.1% low 36.4 -> 42.1, the front's split drain 497 -> 297 ms/s;
+        // EXP12=3 verify: met there = met after the drain; no prediction error. Owner's kill
+        // playtest with both on: never under 48 fps, picture clean.
+        g_experiments[13].store(4, std::memory_order_relaxed);
+        g_experiments[12].store(2, std::memory_order_relaxed);
         // EXP49 = 1 (2026-11-10, owner's call for v5.7): the async read-back. Stalchild fight,
         // flipped every 30 s while the owner fought: 51.9 -> 56.9 fps, the back's read flushes
         // 35 -> 6 ms/s, guest lock waits halved. No beams in that session or two later ones
