@@ -161,6 +161,13 @@ void StageStart(s32 channel);
 StageResult StageProcess(u64 position, bool in_run);
 [[nodiscard]] bool StageExtendsRun(u64 position);
 void StageLend();
+/// Step 7, the window open: StageLend's flags are kept, and the back sets them at the run's first
+/// entry (BackTakeLend, on the back; the publish of the run orders the two).
+void StageLendDeferred();
+void BackTakeLend();
+/// Step 7: whether processing the entry at `position` may take a full copy from the back (a copy
+/// that is new or stale): GPUMem must be level there first.
+[[nodiscard]] bool StageMayCopy(u64 position);
 /// Returns the full copies it made.
 u64 StageReturn(const void* drew_engine, const void* state_engine, s32 back_channel);
 void StageTick();

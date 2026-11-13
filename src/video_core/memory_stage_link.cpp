@@ -103,6 +103,53 @@
 // nothing ever runs beside a fill; the stage's collected ranges at a lend are applied by the back
 // at the run's first entry, not by the stage before it.
 //
+// ---------------------------------------------------------------------------------------------
+// Step 7: the window, FRITCHII_MEMSTAGE_AHEAD (live, read at a frame end, a level run, by
+// MemStage::TickThread; 0 is level mode above, 65,536 and more unlimited).
+//
+// With AHEAD = N the stage no longer waits for the back to park before each entry. It waits only
+//   - while N packets are in ring B that the back has not taken ("the window"), and while ring B
+//     has no room for another ("room"); both after publishing `staged` up to the entry, so the
+//     back can take every one of them (spec 1.4);
+//   - at a level run, as before: it lends, then waits for the back to get through the run, so
+//     every run still runs on the back with the cache as the back's position has it, and the
+//     stage is level after every run (at least once a frame: the frame end is one);
+//   - level inside the window (StageLevel: publish up to the entry, wait until the back has run
+//     everything before it), where running ahead would change an answer the back gets:
+//       full copy:     the entry takes a full copy of the back's engine (a new or stale copy);
+//       writing draw:  a draw whose fill marks buffers GPU-written (written storage buffers,
+//                      transform feedback): the back's served calls (a read flush's download, a
+//                      gather's claims, MustFlushRegion) read those marks, so no packet ahead of
+//                      the back may carry new ones;
+//       claims:        the collected constant buffer ranges of the next fill cover GPU-written
+//                      buffer data (applying them claims it: the same marks).
+// So a served call the back makes while packets are ahead is answered by the cache with every
+// GPU-written mark it has at the back's position; what the packets ahead changed (uploads, new
+// bindings, the stream) does not enter those answers. Counted ("served calls while packets were
+// ahead"), not a failure.
+//
+// What the threads still share, and how it is ordered with the window open:
+//   - the lend's flag hand-over (plan 4.2) is kept by the stage at the lend and set by the back
+//     at the run's first entry, where both are at the same position (StageLendDeferred,
+//     BackTakeLend); the ranges a lend hands over already worked that way;
+//   - a sync in the stage's own fill (Serve) is recorded where the back is: first the back runs
+//     up to the published position (StageSyncCatchUp), so every packet the stage sent before is
+//     recorded before the sync's entries and a wait's number is played. If the back cannot (it
+//     waits in a served call, or for the buffer cache's lock, which the stage holds in its fill),
+//     the sync goes at once and is counted: "a sync of GPUMem's fill sent to the back before it
+//     played the packets ahead of it", must be 0 (syncs in served fills: 0/s at the market);
+//   - the buffer cache's lock: a back that waits for it while the stage holds it serves the
+//     stage's requests from the wait (SpinRecursiveMutex's contended hook), so a sync in the
+//     stage's fill never waits on a back that waits on the lock;
+//   - the back's calls are answered between entries too (StageServeCalls at the loop top);
+//   - packet ticks: each side writes its own unplayed mark (vk_mem_stage.cpp, "Packet ticks with
+//     the stage ahead"), so every buffer, staging and stream region a packet in flight uses
+//     outlives its play.
+// "Memory stage window" logs every 10 s: packets in ring B at each push (average, maximum, and a
+// histogram), the back's waits for the stage, the stage's waits for the window, for room and to
+// come level (by reason), served calls while packets were ahead, sync catch-ups, and lends handed
+// over at the run's start.
+//
 // "Memory stage ring" logs every 10 s (section 8.3): entries/s by class, runs/s with entries and
 // microseconds per run (GPUMem from the lend to the return, the back from the lend seen to its
 // next packet), packets/s and bytes, the back's waits for the stage, the stage's waits by reason,
@@ -111,6 +158,7 @@
 // copies by cause, ...) come from the stage's own copy of the shadow's state every 10 s too.
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cstdlib>
 #include <string>
@@ -121,6 +169,7 @@
 #include "common/dkb_cpu_trace.h"
 #include "common/logging.h"
 #include "common/nx2_timeline.h"
+#include "common/spin_recursive_mutex.h"
 #include "common/thread.h"
 #include "core/core.h"
 #include "video_core/gpu_split.h"
@@ -218,7 +267,10 @@ constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::Check::Co
     "an exception out of GPUMem's ring loop (the ring ended)",
     "a packet whose entry is past the back's draw (dropped unplayed, the back filled)",
     "a served draw whose texture handles the back read from game memory",
+    "a sync of GPUMem's fill sent to the back before it played the packets ahead of it",
 };
+constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::LevelReason::Count)>
+    LEVEL_REASON_NAMES{"full copy", "writing draw", "ranges over GPU-written data"};
 constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::HandOff::Count)>
     LINK_HANDOFF_NAMES{"draw fills", "dispatch fills", "idle destroys", "served for the back"};
 constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::Served::Count)>
@@ -355,6 +407,7 @@ void MemoryStageLink::Call(HandOff kind, Function function, void* argument) {
     call_function = function;
     call_argument = argument;
     call_recording = GpuSplit::RecordingDispatch();
+    call_served = kind == HandOff::Served;
     call_error = nullptr;
     const u32 seq = ++call_sent;
     const bool was_lent = t_back_lent;
@@ -425,6 +478,11 @@ void MemoryStageLink::Serve(Function function, void* argument) {
         function(argument);
         return;
     }
+    if (ring_window != 0 && t_on_stage && !t_serving_back) [[unlikely]] {
+        // Step 7: GPUMem's own fill, the window open. The back records this sync where it is;
+        // the packets GPUMem sent before must be played first (StageSyncCatchUp).
+        StageSyncCatchUp();
+    }
     request_function = function;
     request_argument = argument;
     request_error = nullptr;
@@ -473,6 +531,7 @@ void MemoryStageLink::StageMain(std::stop_token stop) {
     const Common::DkbCpuTrace::Registration cpu_trace{Common::DkbCpuTrace::Role::GpuMem};
     Common::SetCurrentThreadName("GPUMem");
     t_on_stage = true;
+    stage_thread.store(std::this_thread::get_id(), std::memory_order_relaxed);
     // As the back (spec 5.8); not pinned in 6a and 6b.
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
     Common::SetCurrentThreadToPerformanceCores();
@@ -521,8 +580,10 @@ void MemoryStageLink::RunCall(u32 seq) {
     const u64 start = LinkNowNs();
     const bool was_in_call = t_in_call;
     const bool was_user = t_stage_user;
+    const bool was_serving = t_serving_back;
     t_in_call = true;
     t_stage_user = true;
+    t_serving_back = call_served;
     // EXP10: the back records the writes of the dispatches it runs; this fill is one of them.
     GpuSplit::AdoptRecordingDispatch(call_recording);
     try {
@@ -531,6 +592,7 @@ void MemoryStageLink::RunCall(u32 seq) {
         call_error = std::current_exception();
     }
     GpuSplit::AdoptRecordingDispatch(false);
+    t_serving_back = was_serving;
     t_stage_user = was_user;
     t_in_call = was_in_call;
     LinkBump(counters.stage_ns, LinkNowNs() - start);
@@ -580,10 +642,42 @@ void MemoryStageLink::ServeOnStage(Served cause, Function function, void* argume
         return;
     }
     LinkBump(counters.served_calls[static_cast<size_t>(cause)]);
+    if (ring_backend.ring_packets != nullptr &&
+        ring_backend.ring_packets(ring_backend.context) != 0) {
+        // Step 7: answered by the cache as of GPUMem's position, later than the back's (the
+        // switch's documentation has why that answer is the back's: StageLevel's rules).
+        LinkBump(counters.served_ahead);
+    }
     Call(HandOff::Served, function, argument);
 }
 
+void MemoryStageLink::BackContendedHook(std::thread::id holder) {
+    // The back waits for a lock (the buffer cache's): if GPUMem holds it, it may be waiting for
+    // the back in a sync of its fill (Serve), so the back serves it here. StageSyncCatchUp sees
+    // the flag and stops waiting for the back to play on.
+    MemoryStageLink& link = instance;
+    if (holder != link.stage_thread.load(std::memory_order_relaxed)) {
+        return;
+    }
+    link.back_contended.fetch_add(1, std::memory_order_seq_cst);
+    if (link.stage_sleeping.load(std::memory_order_seq_cst)) {
+        link.WakeStage();
+    }
+    if (link.BackRequestPending()) {
+        link.BackServeRequests();
+    }
+}
+
 bool MemoryStageLink::BackRingTop(u64 position) {
+    const bool on = BackRingTopImpl(position);
+    // Step 7: with the window open GPUMem fills while the back runs, and a sync in its fill waits
+    // for the back with the buffer cache's lock held: a back that waits for that lock serves it.
+    Common::SpinRecursiveMutex::t_contended_hook =
+        on && Ahead() != 0 ? &MemoryStageLink::BackContendedHook : nullptr;
+    return on;
+}
+
+bool MemoryStageLink::BackRingTopImpl(u64 position) {
     const bool wanted = ring_wanted.load(std::memory_order_acquire);
     const bool active = g_ring_active.load(std::memory_order_acquire);
     if (wanted && !active && !ring_running.load(std::memory_order_acquire)) {
@@ -666,6 +760,11 @@ void MemoryStageLink::BackEntry(u64 position, const BackLimits& limits) {
         back_run_seen_ns = LinkNowNs();
         back_drew_in_run.store(nullptr, std::memory_order_relaxed);
         back_state_in_run.store(nullptr, std::memory_order_relaxed);
+        if (std::exchange(lend_flags_deferred, false)) {
+            // Step 7 (plan 4.2): the cache's flags 15-48 the stage had at the lend, set here, where
+            // the back reaches the same entry (with the window open it was not parked then).
+            MemStageShadow::BackTakeLend();
+        }
         if (ring_backend.drop_packets != nullptr) {
             // Packets of entries before the run that no draw took (must be 0): played whole, so
             // what the cache believes it uploaded is recorded.
@@ -766,9 +865,27 @@ void MemoryStageLink::NotePublished() noexcept {
     }
 }
 
-void MemoryStageLink::NotePacketSent(u64 bytes) noexcept {
+void MemoryStageLink::NotePacketSent(u64 bytes, u64 ahead) noexcept {
     LinkBump(counters.packets);
     LinkBump(counters.packet_bytes, bytes);
+    // The window's fill (step 7, 8.3's "the stage's lead"): packets in ring B after this push.
+    LinkBump(counters.ahead_sum, ahead);
+    const size_t bucket = ahead <= 1    ? 0
+                          : ahead < 64  ? static_cast<size_t>(std::bit_width(ahead)) - 1
+                          : ahead < 256 ? 6
+                                        : 7;
+    LinkBump(counters.window[(std::min)(bucket, WindowBuckets - 1)]);
+    if (ahead > counters.ring_ahead_max.load(std::memory_order_relaxed)) {
+        counters.ring_ahead_max.store(ahead, std::memory_order_relaxed);
+    }
+}
+
+void MemoryStageLink::NoteRingFreed() noexcept {
+    // The back took or dropped a packet (its count is MemStage's, stored seq_cst before this).
+    // Only the window's waits need it (level mode waits for `consumed`).
+    if (Ahead() != 0 && stage_sleeping.load(std::memory_order_seq_cst)) {
+        WakeStage();
+    }
 }
 
 void MemoryStageLink::NotePacketTaken() noexcept {
@@ -825,16 +942,24 @@ bool MemoryStageLink::StageServeCalls() {
 bool MemoryStageLink::StageWaitFor(std::stop_token& stop, StageWait reason, u64 target) {
     const u64 start = LinkNowNs();
     static constexpr std::array<const char*, static_cast<size_t>(StageWait::Count)> names{
-        "the front", "the back (level mode)", "the back (level run)"};
+        "the front",          "the back (level mode)", "the back (level run)",
+        "the window (AHEAD)", "room in ring B",        "the back (level inside the window)"};
     const Nx2Profile::Scope zone{Nx2Profile::Zone::StageWait};
     Common::Nx2Timeline::ArgSpan span{"stage wait", {"reason", static_cast<u32>(reason)}};
     const StageWaitScope site{names[static_cast<size_t>(reason)]};
     const auto reached = [&] {
-        if (reason == StageWait::Input) {
+        switch (reason) {
+        case StageWait::Input:
             return Ring::Published().load(std::memory_order_acquire) != target ||
                    !ring_wanted.load(std::memory_order_acquire);
+        case StageWait::Window:
+            // Packets in ring B the back has not taken (the back's count is stored seq_cst).
+            return ring_backend.ring_packets(ring_backend.context) < target;
+        case StageWait::Room:
+            return ring_backend.ring_room(ring_backend.context);
+        default:
+            return Ring::Consumed().load(std::memory_order_acquire) >= target;
         }
-        return Ring::Consumed().load(std::memory_order_acquire) >= target;
     };
     bool ok = true;
     for (u32 spin = 0;;) {
@@ -901,14 +1026,99 @@ void MemoryStageLink::StageIdle(std::stop_token& stop) {
     stage_busy.store(false, std::memory_order_seq_cst);
 }
 
+void MemoryStageLink::SetAhead(u32 packets) {
+    const u32 next = (std::min)(packets, AheadUnlimited);
+    if (g_ahead.exchange(next, std::memory_order_relaxed) != next) {
+        LOG_INFO(HW_GPU, "Memory stage window (FRITCHII_MEMSTAGE_AHEAD={}): {}", next,
+                 next == 0               ? "level mode, GPUMem fills only while the back is parked"
+                 : next >= AheadUnlimited ? "unlimited, GPUMem fills ahead of the back up to its "
+                                            "next level run"
+                                          : "GPUMem fills up to that many packets ahead of the "
+                                            "back's take");
+    }
+}
+
+void MemoryStageLink::StageLevel(u64 position, LevelReason reason) {
+    if (!t_on_stage || ring_window == 0 || ring_stop == nullptr) {
+        return; // level mode: the stage is level before each entry already
+    }
+    LinkBump(counters.levels[static_cast<size_t>(reason)]);
+    if (Ring::Consumed().load(std::memory_order_acquire) < position) {
+        // Publish before you wait (spec 4.3): the back runs up to this entry, not into it.
+        PublishStaged(position);
+        StageWaitFor(*ring_stop, StageWait::Level, position);
+    }
+    if (!stage_busy.load(std::memory_order_relaxed)) {
+        BecomeBusy(*ring_stop);
+    }
+}
+
+void MemoryStageLink::StageSyncCatchUp() {
+    // GPUMem's fill reaches a sync with the window open. The back records the sync (and the
+    // entries a sync plays) where it is now; the packets GPUMem sent before belong earlier in the
+    // stream, and a wait may be on one of their numbers. So the back first runs up to the
+    // published position (every packet of an entry before it played) by itself. It cannot when it
+    // waits in a served call (GPUMem runs those only between entries) or for the buffer cache's
+    // lock, which GPUMem holds in its fill: then the sync goes now, counted (must be 0).
+    if (Ring::Consumed().load(std::memory_order_acquire) >= staged_local) {
+        return;
+    }
+    const u64 start = LinkNowNs();
+    LinkBump(counters.catchups);
+    const u64 contended = back_contended.load(std::memory_order_seq_cst);
+    const auto stuck = [&] {
+        return calls.load(std::memory_order_seq_cst) != calls_seen ||
+               back_contended.load(std::memory_order_seq_cst) != contended;
+    };
+    const auto done = [&] {
+        return Ring::Consumed().load(std::memory_order_acquire) >= staged_local ||
+               (ring_stop != nullptr && ring_stop->stop_requested()) ||
+               !GpuSplit::Get().BackRunning();
+    };
+    {
+        const StageWaitScope site{"the back's catch-up before a sync"};
+        for (u32 spin = 0;;) {
+            if (done()) {
+                break;
+            }
+            if (stuck()) {
+                Note(Check::SyncAhead, "a sync in GPUMem's fill");
+                break;
+            }
+            if (spin < LinkSpinPauses) {
+                ++spin;
+                LinkPause();
+                continue;
+            }
+            stage_sleeping.store(true, std::memory_order_seq_cst);
+            const u32 word = stage_word.load(std::memory_order_seq_cst);
+            if (!done() && !stuck()) {
+                stage_word.wait(word, std::memory_order_seq_cst);
+                LinkBump(counters.stage_sleeps);
+            }
+            stage_sleeping.store(false, std::memory_order_relaxed);
+        }
+    }
+    LinkBump(counters.catchup_ns, LinkNowNs() - start);
+}
+
 void MemoryStageLink::Lend(u64 from, u64 until) {
     // The ranges the stage's constant buffer words collected and no fill applied: the back
     // applies their buffer half before the run's first entry (it reads the cache there).
     std::vector<std::pair<u64, std::size_t>>& ranges = MemStageShadow::StageRanges();
     lend_ranges.swap(ranges);
     ranges.clear();
-    // Plan 4.2: the cache's flags (15-48) go with the cache.
-    MemStageShadow::StageLend();
+    // Plan 4.2: the cache's flags (15-48) go with the cache. In level mode the back is parked
+    // here; with the window open it may still be running entries before the run, so the stage
+    // keeps what it lends and the back takes it at the run's first entry (BackEntry), where both
+    // are at the same position.
+    if (ring_window != 0) {
+        MemStageShadow::StageLendDeferred();
+        lend_flags_deferred = true;
+        LinkBump(counters.deferred_lends);
+    } else {
+        MemStageShadow::StageLend();
+    }
     LinkBump(counters.flag_handovers);
     LinkBump(counters.runs);
     Ring::LentFrom().store(from, std::memory_order_relaxed);
@@ -938,6 +1148,8 @@ u64 MemoryStageLink::RingFailed(std::stop_token& stop, const char* what) {
 void MemoryStageLink::RingLoop(std::stop_token& stop, u64 start) {
     ring_running.store(true, std::memory_order_seq_cst);
     staged_local = start;
+    ring_stop = &stop;
+    ring_window = 0;
     MemStageShadow::StageStart(ring_backend.back_channel != nullptr
                                    ? ring_backend.back_channel(ring_backend.context)
                                    : 0);
@@ -976,10 +1188,39 @@ void MemoryStageLink::RingLoop(std::stop_token& stop, u64 start) {
                 }
                 continue;
             }
-            // Level mode (AHEAD = 0): the stage runs only while the back is parked.
-            if (Ring::Consumed().load(std::memory_order_acquire) < staged_local &&
-                !StageWaitFor(stop, StageWait::Back, staged_local)) {
-                break;
+            // The window (step 7), read here: it changes only at a frame end, where the stage is
+            // parked in a level run.
+            ring_window = Ahead();
+            if (ring_window == 0) {
+                // Level mode (AHEAD = 0): the stage runs only while the back is parked.
+                if (Ring::Consumed().load(std::memory_order_acquire) < staged_local &&
+                    !StageWaitFor(stop, StageWait::Back, staged_local)) {
+                    break;
+                }
+            } else {
+                // The back's served calls are answered between entries too: with the window
+                // open the stage may not wait for a long time.
+                StageServeCalls();
+                // A full copy of the back's engine (a new or stale copy) is only exact where the
+                // back is at this entry.
+                if (MemStageShadow::StageMayCopy(position)) [[unlikely]] {
+                    StageLevel(position, LevelReason::Copy);
+                }
+                // At most `ring_window` packets in ring B the back has not taken, and room for
+                // the next one (spec 1.4). The back can take them all: everything before
+                // `position` is published first.
+                if (ring_backend.ring_packets(ring_backend.context) >= ring_window) {
+                    PublishStaged(position);
+                    if (!StageWaitFor(stop, StageWait::Window, ring_window)) {
+                        break;
+                    }
+                }
+                if (!ring_backend.ring_room(ring_backend.context)) {
+                    PublishStaged(position);
+                    if (!StageWaitFor(stop, StageWait::Room, 0)) {
+                        break;
+                    }
+                }
             }
             if (!stage_busy.load(std::memory_order_relaxed) && !BecomeBusy(stop)) {
                 break;
@@ -1055,6 +1296,8 @@ void MemoryStageLink::RingLoop(std::stop_token& stop, u64 start) {
     }
     t_in_call = false;
     t_stage_user = false;
+    ring_window = 0;
+    ring_stop = nullptr;
     stage_busy.store(false, std::memory_order_seq_cst);
     if (!stop.stop_requested()) {
         // The cache goes back to the back for good, with its flags 15-48 (plan 4.2, as at a
@@ -1123,6 +1366,17 @@ void MemoryStageLink::Take(Snapshot& out) const noexcept {
     }
     out.hashes = load(counters.hashes);
     out.hash_mismatches = load(counters.hash_mismatches);
+    for (size_t i = 0; i < out.window.size(); ++i) {
+        out.window[i] = load(counters.window[i]);
+    }
+    out.ahead_sum = load(counters.ahead_sum);
+    for (size_t i = 0; i < out.levels.size(); ++i) {
+        out.levels[i] = load(counters.levels[i]);
+    }
+    out.served_ahead = load(counters.served_ahead);
+    out.catchups = load(counters.catchups);
+    out.catchup_ns = load(counters.catchup_ns);
+    out.deferred_lends = load(counters.deferred_lends);
 }
 
 void MemoryStageLink::LogStats() {
@@ -1225,6 +1479,42 @@ void MemoryStageLink::LogStats() {
                  rate(current.flag_handovers - reported.flag_handovers), served_text, level_text,
                  hashes, current.hash_mismatches - reported.hash_mismatches,
                  RingVerify() ? "on" : "off");
+        // Step 7's window (spec 8.3: the stage's lead; 6.4's counters).
+        static constexpr std::array<const char*, WindowBuckets> bucket_names{
+            "1", "2-3", "4-7", "8-15", "16-31", "32-63", "64-255", "256+"};
+        std::string window_text;
+        for (size_t i = 0; i < WindowBuckets; ++i) {
+            window_text += fmt::format("{}{} {:.0f}", i == 0 ? "" : ", ", bucket_names[i],
+                                       rate(current.window[i] - reported.window[i]));
+        }
+        std::string levels_text;
+        for (size_t i = 0; i < current.levels.size(); ++i) {
+            levels_text += fmt::format("{}{} {:.0f}", i == 0 ? "" : ", ", LEVEL_REASON_NAMES[i],
+                                       rate(current.levels[i] - reported.levels[i]));
+        }
+        const u64 ahead_max = counters.ring_ahead_max.exchange(0, std::memory_order_relaxed);
+        const u32 window = Ahead();
+        LOG_INFO(HW_GPU,
+                 "Memory stage window (FRITCHII_MEMSTAGE_AHEAD={}) {:.0f} s: packets in ring B at "
+                 "each push {:.1f} on average, {} at most; per second by packets ahead ({}); the "
+                 "back waited for the stage {:.0f}/s, {:.1f} ms/s; GPUMem waited for the window "
+                 "{:.1f} ms/s, for room in ring B {:.1f} ms/s, level inside the window {:.1f} ms/s "
+                 "({}/s); served calls while packets were ahead {:.0f}/s; sync catch-ups {:.0f}/s "
+                 "({:.2f} ms/s); lends handed over at the run's start {:.0f}/s",
+                 window >= AheadUnlimited ? std::string{"unlimited"} : fmt::format("{}", window),
+                 seconds,
+                 packets != 0 ? static_cast<double>(current.ahead_sum - reported.ahead_sum) /
+                                    static_cast<double>(packets)
+                              : 0.0,
+                 ahead_max, window_text, rate(current.back_wait - reported.back_wait),
+                 ms(current.back_wait_ns - reported.back_wait_ns),
+                 ms(current.stage_wait_ns[3] - reported.stage_wait_ns[3]),
+                 ms(current.stage_wait_ns[4] - reported.stage_wait_ns[4]),
+                 ms(current.stage_wait_ns[5] - reported.stage_wait_ns[5]), levels_text,
+                 rate(current.served_ahead - reported.served_ahead),
+                 rate(current.catchups - reported.catchups),
+                 ms(current.catchup_ns - reported.catchup_ns),
+                 rate(current.deferred_lends - reported.deferred_lends));
     }
     reported = current;
 }

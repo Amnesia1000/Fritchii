@@ -766,6 +766,8 @@ struct State {
     u32 ring_packets{};       ///< Packets the entry sent
     Class last_class{Class::Pass};
     std::vector<std::pair<u64, std::size_t>> ring_ranges; ///< Collected, not applied yet
+    /// Step 7: the flags a deferred lend hands over, per engine (BackTakeLend).
+    std::vector<std::pair<Maxwell3D*, Flags>> lend_flags;
     Counters counters;
     Counters totals;
     std::chrono::steady_clock::time_point window_start{};
@@ -2044,6 +2046,65 @@ void StageLend() {
         }
     }
     ++s.counters.lends;
+}
+
+void StageLendDeferred() {
+    // GPUMem: what StageLend would set, kept for the back. Nothing changes the copies' flags
+    // until the run returns (the run's entries GPUMem follows meanwhile are other engines' and
+    // closures), and the back reads this only after the run is published.
+    State& s = S();
+    s.lend_flags.clear();
+    for (Copy& copy : s.copies) {
+        if (!copy.stale) {
+            s.lend_flags.emplace_back(copy.back, copy.e->dirty.flags & CacheFlagMask());
+        }
+    }
+    ++s.counters.lends;
+}
+
+void BackTakeLend() {
+    // The back, at the run's first entry: S() is GPUMem's state, which is parked on this run.
+    for (const auto& [engine, flags] : S().lend_flags) {
+        TakeCacheFlags(engine->dirty.flags, flags);
+    }
+}
+
+bool StageMayCopy(u64 position) {
+    // As Process and Use: the copy an entry applies to, when it is missing or stale, is taken
+    // from the back (Resync).
+    State& s = S();
+    const u64* const entry = &Access::Ring()[position & Access::RingMask];
+    const u64 head = entry[0];
+    const auto needs = [&s](Maxwell3D* engine) {
+        if (engine == nullptr) {
+            return false;
+        }
+        for (const Copy& copy : s.copies) {
+            if (copy.back == engine) {
+                return copy.stale;
+            }
+        }
+        return true; // a new copy starts stale
+    };
+    switch (static_cast<Kind>(head & 0xf)) {
+    case Kind::Method:
+    case Kind::Multi:
+    case Kind::Pairs:
+    case Kind::StateDelta:
+    case Kind::DrawBatch:
+        return s.engine_copy != nullptr && s.engine_copy->stale;
+    case Kind::Call:
+        switch (StageTagOf(head)) {
+        case StageTag::Writes:
+        case StageTag::FinishMacro:
+        case StageTag::DrawLoop:
+            return needs(As3D(entry[2]));
+        default:
+            return false;
+        }
+    default:
+        return false;
+    }
 }
 
 u64 StageReturn(const void* drew_engine, const void* state_engine, s32 back_channel) {

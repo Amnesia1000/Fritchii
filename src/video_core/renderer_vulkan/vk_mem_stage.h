@@ -474,6 +474,11 @@ public:
     [[nodiscard]] bool RingRoom() const noexcept;
     /// GPUMem: its draw's fill is over, packet or not (BeginDraw opened its packet number).
     void EndStageFill();
+    /// Packets in ring B the back has not taken or dropped yet (step 7's window).
+    [[nodiscard]] u64 RingPackets() const noexcept {
+        return ring_packets_sent.load(std::memory_order_seq_cst) -
+               ring_packets_done.load(std::memory_order_seq_cst);
+    }
     /// The back: the packet of its draw `seq` (packets of earlier draws are played whole first),
     /// held as a filled draw is; null when there is none. `hash`: the back's compare b hash.
     const DrawPacket* TakeRingDraw(u64 seq, u64 back_position, u64 hash, bool verify);
@@ -859,7 +864,6 @@ private:
     bool thread_clamp_logged{};
     bool ring_clamp_logged{};
     bool ring_seam_logged{};
-    bool ahead_logged{};
 
     std::atomic<int> seam_level{0};
     bool dispatch_open{};
@@ -886,6 +890,8 @@ private:
     std::atomic<u64> ring_b_sent{};  ///< Bytes GPUMem committed
     u64 ring_b_read{};               ///< The back
     std::atomic<u64> ring_b_freed{}; ///< Bytes the back is done with
+    std::atomic<u64> ring_packets_sent{}; ///< GPUMem: packets pushed
+    std::atomic<u64> ring_packets_done{}; ///< The back: packets taken or dropped
     /// The fill in progress goes to ring B (FillRingDraw).
     bool ring_fill{};
     bool ring_pushed{};

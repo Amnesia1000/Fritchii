@@ -1540,7 +1540,10 @@ void MemStage::PushRingDraw() {
     ring_b_sent.store(ring_b_write, std::memory_order_release);
     // GPUMem's mark goes only after the packet is in ring B (a close reads the mark first).
     stage_fill_from = 0;
-    Link::Get().NotePacketSent(bytes);
+    const u64 sent = ring_packets_sent.load(std::memory_order_relaxed) + 1;
+    ring_packets_sent.store(sent, std::memory_order_seq_cst);
+    Link::Get().NotePacketSent(bytes,
+                               sent - ring_packets_done.load(std::memory_order_seq_cst));
     // As TakeHeld: the arena is done with; the next fill starts on an empty one.
     arena.Reset();
     play_cursor = 0;
@@ -1628,7 +1631,10 @@ void MemStage::TakeRingHeader(const RingHeader& header) {
     held_hashes = header.hashes;
     const u64 number = header.number;
     ring_b_read += header.bytes;
-    ring_b_freed.store(ring_b_read, std::memory_order_release);
+    ring_b_freed.store(ring_b_read, std::memory_order_seq_cst);
+    // Step 7: the window and the room GPUMem may wait for (it is woken if it sleeps).
+    ring_packets_done.fetch_add(1, std::memory_order_seq_cst);
+    Link::Get().NoteRingFreed();
     held = HeldKind::Draw;
     held_ring = true;
     held_reads.clear();
@@ -1701,7 +1707,9 @@ void MemStage::PlayPostCopyBarrier() {
 
 void MemStage::DiscardRingHeader(const RingHeader& header) {
     ring_b_read += header.bytes;
-    ring_b_freed.store(ring_b_read, std::memory_order_release);
+    ring_b_freed.store(ring_b_read, std::memory_order_seq_cst);
+    ring_packets_done.fetch_add(1, std::memory_order_seq_cst);
+    Link::Get().NoteRingFreed();
     if (ticks) {
         UpdateUnplayed();
     }
@@ -2520,7 +2528,7 @@ void MemStage::TickFrame() {
 // THREAD = 2 (piece 6b) needs the same, and EXP53 off (with it every conditional block is a level
 // entry the registers do not decide); without it, it runs as 1, logged once. It forces full vertex
 // binds (plan 4.2: the flags the state tracker raises on the back are dropped at each lend).
-// FRITCHII_MEMSTAGE_AHEAD (boot) is step 7's window: 6b runs 0 (level mode) and says so.
+// FRITCHII_MEMSTAGE_AHEAD (live, here too) is step 7's window (memory_stage_link.cpp); 0 is 6b.
 void MemStage::TickThread(int seam) {
     namespace Debug = VideoCore::Nx2Debug;
     const int wanted = Debug::SwitchValue(Debug::g_memstage_thread, "FRITCHII_MEMSTAGE_THREAD");
@@ -2553,17 +2561,13 @@ void MemStage::TickThread(int seam) {
         }
         mode = 1;
     }
-    if (mode == 2 && !ahead_logged) {
-        ahead_logged = true;
-        if (const char* const ahead = std::getenv("FRITCHII_MEMSTAGE_AHEAD");
-            ahead != nullptr && std::atoi(ahead) != 0) {
-            LOG_WARNING(Render_Vulkan, "FRITCHII_MEMSTAGE_AHEAD={}: the window is step 7; the "
-                                       "ring-fed stage runs level mode (AHEAD=0)",
-                        ahead);
-        }
-    }
     Link& link = Link::Get();
     link.SetMode(mode);
+    // Step 7's window (live, here at a frame end, a level run: GPUMem is parked on it and reads
+    // the new value at its next entry). Packets GPUMem may fill ahead of the back's take; 0 is
+    // 6b's level mode, 65,536 and above unlimited (the harness sends 2147483647).
+    const int ahead = Debug::SwitchValue(Debug::g_memstage_ahead, "FRITCHII_MEMSTAGE_AHEAD");
+    link.SetAhead(link.Mode() == 2 && ahead > 0 ? static_cast<u32>(ahead) : 0U);
     const bool full =
         Debug::SwitchValue(Debug::g_memstage_full_binds, "FRITCHII_MEMSTAGE_FULL_BINDS") > 0 ||
         link.Mode() == 2;

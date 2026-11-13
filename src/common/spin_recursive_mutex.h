@@ -85,6 +85,13 @@ public:
         owner.store(thread, std::memory_order_relaxed);
     }
 
+    /// A thread that may have to work for the holder while it waits for the lock (the memory
+    /// stage's back serves GPUMem's syncs, and GPUMem can hold the buffer cache's lock while it
+    /// waits for one: FRITCHII_MEMSTAGE_AHEAD). Set per thread; while set, a contended lock calls
+    /// it between tries with the holder's id and never sleeps. Null everywhere else.
+    using ContendedHook = void (*)(std::thread::id holder);
+    static inline thread_local ContendedHook t_contended_hook = nullptr;
+
 private:
     // About 10 microseconds of spinning before sleeping.
     static constexpr int SpinCount = 1024;
@@ -105,6 +112,23 @@ private:
     }
 
     void LockContendedUntimed() {
+        if (t_contended_hook != nullptr) [[unlikely]] {
+            for (int spin = 0;; ++spin) {
+                if (state.load(std::memory_order_relaxed) == 0) {
+                    std::uint32_t expected = 0;
+                    if (state.compare_exchange_weak(expected, 1, std::memory_order_acquire,
+                                                    std::memory_order_relaxed)) {
+                        return;
+                    }
+                }
+                t_contended_hook(owner.load(std::memory_order_relaxed));
+                if (spin < SpinCount) {
+                    Pause();
+                } else {
+                    std::this_thread::yield();
+                }
+            }
+        }
         for (int spin = 0; spin < SpinCount; ++spin) {
             Pause();
             if (state.load(std::memory_order_relaxed) == 0) {

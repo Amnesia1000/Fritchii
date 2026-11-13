@@ -1222,6 +1222,12 @@ void RasterizerVulkan::SetRingBackend() {
     backend.back_channel = [](void* context) {
         return static_cast<s32>(static_cast<RasterizerVulkan*>(context)->current_channel_id);
     };
+    backend.ring_packets = [](void* context) {
+        return static_cast<RasterizerVulkan*>(context)->mem_stage.RingPackets();
+    };
+    backend.ring_room = [](void* context) {
+        return static_cast<RasterizerVulkan*>(context)->mem_stage.RingRoom();
+    };
     Link::Get().SetRingBackend(backend);
 }
 
@@ -1246,6 +1252,19 @@ bool RasterizerVulkan::StageFillDraw(VideoCommon::MemStageShadowEngine& copy, bo
     if (!mem_stage.RingRoom()) {
         link.NoteLevelDraw(5);
         return false;
+    }
+    if (Link::Ahead() != 0) [[unlikely]] {
+        // Step 7, the window open: the back answers its served calls (a read flush's download, a
+        // gather's claims, MustFlushRegion) from the cache as GPUMem has it. That is the back's
+        // answer while no packet ahead of the back changes what those calls read: the buffers'
+        // GPU-written marks. Two fills would: a draw that writes buffers (its marks), and the
+        // collected constant buffer ranges claiming GPU-written data (their claims). Those fill
+        // level: GPUMem first waits for the back to reach this entry (StageLevel).
+        if (StageDrawWritesBuffers(copy)) {
+            link.StageLevel(position, Link::LevelReason::WritingDraw);
+        } else if (StageRangesOverGpuWritten(ranges)) {
+            link.StageLevel(position, Link::LevelReason::Claim);
+        }
     }
     std::scoped_lock lock{buffer_cache.mutex};
     // The fill reads the stage's copy (plan 5.4), as at FRITCHII_MEMSTAGE_SHADOW=3.
@@ -1310,6 +1329,48 @@ bool RasterizerVulkan::StageFillDraw(VideoCommon::MemStageShadowEngine& copy, bo
         link.NoteLevelDraw(7);
     }
     return filled;
+}
+
+bool RasterizerVulkan::StageDrawWritesBuffers(const VideoCommon::MemStageShadowEngine& copy) const {
+    // The fill marks GPU-written ranges for written storage buffers (BindGraphicsStorageBuffer's
+    // is_written) and for transform feedback.
+    if (copy.regs.transform_feedback_enabled != 0) {
+        return true;
+    }
+    for (u32 stage = 0; stage < 5; ++stage) {
+        if ((stage_facts.stages & (1U << stage)) == 0) {
+            continue;
+        }
+        for (u32 i = 0; i < stage_facts.ssbo_counts[stage]; ++i) {
+            if (stage_facts.ssbos[stage][i].is_written) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool RasterizerVulkan::StageRangesOverGpuWritten(
+    std::span<const std::pair<DAddr, std::size_t>> ranges) {
+    // The page bits first (they never clear, so a clear one proves nothing GPU-written is there),
+    // then the cache's own answer under its lock.
+    bool maybe = false;
+    for (const auto& [addr, size] : ranges) {
+        if (MayBeGpuModified(addr, size)) {
+            maybe = true;
+            break;
+        }
+    }
+    if (!maybe) {
+        return false;
+    }
+    std::scoped_lock lock{buffer_cache.mutex};
+    for (const auto& [addr, size] : ranges) {
+        if (buffer_cache.IsRegionGpuModified(addr, size)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void RasterizerVulkan::StageApplyRanges(std::span<const std::pair<DAddr, std::size_t>> ranges,
