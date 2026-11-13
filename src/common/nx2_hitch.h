@@ -17,6 +17,9 @@
 // the previous present, and a gap over 50 ms logs one line with its exact time, what each cause
 // took inside it, page faults, memory the kernel zero-filled, and the CPU time of the busiest
 // threads. EDEN_NX2_HITCH_LOG=0 turns the line off (the counters stay, a few relaxed adds).
+// With the line on, it also says how much CPU the rest of the machine used, and a once-a-second
+// "Pulse:" line samples the clock, a speed probe and free memory (FRITCHII_PULSE=0 turns that
+// off; nx2_hitch.cpp, machine pulse).
 namespace Common::Nx2Hitch {
 
 enum class Cause : u8 {

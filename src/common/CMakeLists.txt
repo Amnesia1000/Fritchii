@@ -185,7 +185,8 @@ if(WIN32)
         windows/crash_handler.h
         windows/timer_resolution.cpp
         windows/timer_resolution.h)
-    target_link_libraries(common PRIVATE ntdll)
+    # pdh: the machine pulse's clock and thermal counters (nx2_hitch.cpp)
+    target_link_libraries(common PRIVATE ntdll pdh)
 endif()
 
 if(NOT WIN32)
