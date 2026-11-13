@@ -2198,6 +2198,18 @@ bool RasterizerVulkan::Nx2ListDispatchSupported() const {
     return Tegra::Nx2ListDispatch::Mode() != 0;
 }
 
+// The memory seam, SEAM >= 3 (vk_mem_stage.cpp): KeplerCompute's QMD read comes through the open
+// dispatch packet. False below 3: the engine reads it itself, as before.
+bool RasterizerVulkan::MemStageQmd(Tegra::MemoryManager& memory, GPUVAddr address,
+                                   std::span<u32, 64> out) {
+    if (!mem_stage.ValuesByValue()) {
+        return false;
+    }
+    const std::array<u32, 64>& qmd = mem_stage.Qmd(memory, address);
+    std::copy(qmd.begin(), qmd.end(), out.begin());
+    return true;
+}
+
 // List draws and list dispatches: a copy of the list words at their place in the stream, for the
 // front to read back if it needs their values after all.
 void RasterizerVulkan::Nx2KeepListWords(u64 keep_id, GPUVAddr address, u32 count) {

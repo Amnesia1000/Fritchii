@@ -171,6 +171,11 @@ public:
     [[nodiscard]] virtual bool Nx2ListDispatchSupported() const {
         return false;
     }
+    [[nodiscard]] virtual bool MemStageQmd([[maybe_unused]] Tegra::MemoryManager& memory,
+                                           [[maybe_unused]] GPUVAddr address,
+                                           [[maybe_unused]] std::span<u32, 64> out) {
+        return false;
+    }
     /// Switch 2, list draws and list dispatches, on the split's back at the list's place in the
     /// stream: keeps a copy of the `count` (up to 3) words at `address` as `keep_id`.
     virtual void Nx2KeepListWords([[maybe_unused]] u64 keep_id, [[maybe_unused]] GPUVAddr address,

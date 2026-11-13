@@ -328,6 +328,8 @@ public:
     [[nodiscard]] bool ComputedHandlesChanged(const Tegra::Engines::Maxwell3D& maxwell3d_,
                                               Tegra::MemoryManager& gpu_memory_) const;
 
+    void FillHandleValues(MemStage& seam, bool null_pointer_handles, bool in_configure);
+
     [[nodiscard]] GraphicsPipeline* Next(const GraphicsPipelineCacheKey& current_key) noexcept {
         if (key == current_key) {
             return this;

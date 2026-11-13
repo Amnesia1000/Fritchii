@@ -324,6 +324,7 @@ add_library(video_core STATIC
     shader_environment.h
     evicted_pointer_slots.h
     shader_handle_program.h
+    texture_handle_values.h
     shader_notify.cpp
     shader_notify.h
     shader_warm/shader_archives.cpp

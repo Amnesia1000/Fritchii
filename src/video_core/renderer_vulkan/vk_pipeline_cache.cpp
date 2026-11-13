@@ -2800,7 +2800,11 @@ bool PipelineCache::StaleNullPointerSlot(const ComputePipelineCacheEntry& entry)
         if (!gpu_memory->IsFullyMappedRange(slot, sizeof(u64))) {
             continue;
         }
-        const GPUVAddr address{gpu_memory->Read<u64>(slot)};
+        // The memory seam (EXP123 >= 3): the slot's value is kept in the dispatch packet, which
+        // opens here or at the QMD read (vk_mem_stage.cpp).
+        MemStage& seam{buffer_cache.runtime.Seam()};
+        const GPUVAddr address{seam.ValuesByValue() ? seam.ReadPointerSlot(*gpu_memory, slot)
+                                                    : gpu_memory->Read<u64>(slot)};
         if (address != 0 && gpu_memory->IsWithinGPUAddressRange(address) &&
             gpu_memory->IsFullyMappedRange(address, 1)) {
             LOG_INFO(Render_Vulkan,

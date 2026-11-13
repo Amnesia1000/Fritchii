@@ -26,6 +26,10 @@
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
+namespace Tegra {
+class MemoryManager;
+}
+
 namespace Vulkan {
 
 class Buffer;
@@ -151,7 +155,7 @@ public:
         BufferRef indirect;
         BufferRef indirect_count;
         Span reads;
-        Span handle_words;
+        Span handle_values;
     };
     struct DispatchPacket {
         u64 number;
@@ -162,8 +166,10 @@ public:
         BufferRef indirect;
         Span after;
         Span reads;
-        Span handle_words;
+        Span handle_values;
         std::array<u32, 64> qmd;
+        std::array<u64, 8> null_slot_values;
+        u32 null_slot_count;
     };
     struct OpPacket {
         u64 number;
@@ -380,6 +386,48 @@ public:
         }
     }
 
+    enum class Value : u8 {
+        Handle,
+        Qmd,
+        NullSlot,
+        Shape,
+        Count,
+    };
+    enum ValueFlag : u32 {
+        HandleValuesFilled = 1U << 16,
+        HandleNullPointers = 1U << 17,
+        HandleValuesLooked = 1U << 18,
+        HandleValuesRetired = 1U << 19,
+        QmdByValue = 1U << 20,
+    };
+    enum VerifyBit : u32 {
+        VerifyHandles = 1,
+        VerifyQmd = 2,
+        VerifyNullSlots = 4,
+    };
+
+    [[nodiscard]] bool ValuesByValue() const noexcept {
+        return seam_level.load(std::memory_order_relaxed) >= 3;
+    }
+    [[nodiscard]] static u32 VerifyBits() noexcept;
+
+    template <typename FillFn>
+    void FillHandleValues(bool dispatch_side, bool null_pointer_handles, bool in_configure,
+                          FillFn&& fill) {
+        std::vector<u32>& values = dispatch_side ? dispatch_values : draw_values;
+        values.clear();
+        fill(values);
+        CloseHandleValues(dispatch_side, null_pointer_handles, in_configure);
+    }
+    [[nodiscard]] const std::vector<u32>* HandleValues(bool dispatch_side,
+                                                       bool& null_pointer_handles) const noexcept;
+    void LookedAtHandleValues(bool dispatch_side, size_t taken);
+    void NoteValueCheck(Value kind, bool same, u64 address, u64 shader, u64 packet_value,
+                        u64 own_value);
+
+    const std::array<u32, 64>& Qmd(Tegra::MemoryManager& gpu_memory, GPUVAddr address);
+    u64 ReadPointerSlot(Tegra::MemoryManager& gpu_memory, GPUVAddr address);
+
     /// Once a frame on the GPU thread: reads SEAM (EDEN_NX2_EXP123) and logs the stats line.
     void TickFrame();
 
@@ -501,6 +549,11 @@ private:
     void Note(SeamHook::Use use, const std::source_location& location, bool around);
     void LogStats();
     void Snapshot(Counts& out) const;
+    void CloseHandleValues(bool dispatch_side, bool null_pointer_handles, bool in_configure);
+    void RetireDrawValues();
+    void RetireDispatchValues();
+    void OpenDispatchByValue();
+    void LogValueStats(double seconds, bool first);
 
     bool ClaimHeld();
     void TakeHeld(HeldKind kind);
@@ -581,6 +634,41 @@ private:
     Counters counters;
     Counts reported;
     u64 last_log_ns{};
+
+    std::atomic<int> seam_level{0};
+    bool dispatch_open{};
+    std::vector<u32> draw_values;
+    std::vector<u32> dispatch_values;
+
+    struct ValueCounts {
+        std::array<u64, 2> fills{};
+        std::array<u64, 2> values{};
+        std::array<u64, 2> in_configure{};
+        std::array<u64, 2> skipped{};
+        std::array<u64, 2> skipped_values{};
+        u64 qmds{};
+        u64 qmds_unused{};
+        u64 null_slots{};
+        u64 null_slots_unkept{};
+        std::array<u64, static_cast<size_t>(Value::Count)> checks{};
+        std::array<u64, static_cast<size_t>(Value::Count)> mismatches{};
+    };
+    struct ValueCounters {
+        std::array<std::atomic<u64>, 2> fills{};
+        std::array<std::atomic<u64>, 2> values{};
+        std::array<std::atomic<u64>, 2> in_configure{};
+        std::array<std::atomic<u64>, 2> skipped{};
+        std::array<std::atomic<u64>, 2> skipped_values{};
+        std::atomic<u64> qmds{};
+        std::atomic<u64> qmds_unused{};
+        std::atomic<u64> null_slots{};
+        std::atomic<u64> null_slots_unkept{};
+        std::array<std::atomic<u64>, static_cast<size_t>(Value::Count)> checks{};
+        std::array<std::atomic<u64>, static_cast<size_t>(Value::Count)> mismatches{};
+    };
+    ValueCounters value_counters;
+    ValueCounts reported_values;
+    void SnapshotValues(ValueCounts& out) const;
 };
 
 /// Turns the memory stage's entries into scheduler and descriptor queue calls: the only copy of

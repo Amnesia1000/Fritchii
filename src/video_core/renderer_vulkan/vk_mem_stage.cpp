@@ -60,6 +60,38 @@
 // Only the thread that owns the arena defers (the first to open a fill while none is pending);
 // a fill on another thread at the same moment runs its entries at once. Pending entries are only
 // ever played by the thread that pushed them.
+//
+// SEAM = 3 (sub-step 2c, spec 6.3 and 9.1-9.3): everything SEAM = 2 does (the early fill and its
+// checks: the code compares SEAM >= 2), and what the back reads from game memory that the stream
+// writes comes in the packet by value.
+//   Handle values: the raw handle of every image element a draw or dispatch binds, in the order the
+//     back's handle loops read them (per stage: texture buffers, image buffers, textures with
+//     tables expanded, images), made by VideoCommon::FillStageHandleValues
+//     (texture_handle_values.h). The back's loops take the next value instead of reading. The same
+//     RawTextureHandle makes the value on both sides, so a handle program's constant buffer words,
+//     storage buffer address and storage words are read by the fill only. The fill always runs;
+//     the back's memo paths (TEX_BANK_GEN hits) decide later whether to look: those draws are
+//     counted ("skipped by the back"), they now pay for reads the back did not make.
+//     Where the fill runs: not in 2b's early fill (yet): the pipeline's Configure fills at the top
+//     of its handle work, before the bank decision ("in Configure"), on the same thread as the
+//     back's reads.
+//   The QMD: KeplerCompute's read of the 256 bytes (kepler_compute.cpp, the native QMD
+//     scheduler's read) goes through Qmd(), which opens the dispatch packet, reads into it and
+//     returns it. BeginDispatch adopts the open packet. The error path's 512-byte read stays a
+//     direct read.
+//   Null pointer slots: the compute pipeline lookup (PipelineCache::StaleNullPointerSlot) reads a
+//     pointer from a QMD constant buffer before the dispatch's fill can run; it reads through
+//     ReadPointerSlot(), which keeps the value in the open dispatch packet (null_slot_values).
+// The handle values live in their own arrays beside the entry arena (draw_values,
+// dispatch_values), not in it: the arena is played as an entry stream. packet.handle_values spans
+// them.
+//
+// FRITCHII_MEMSTAGE_VERIFY (boot, bit flags; spec 5.4; not 2b's FRITCHII_MEMSTAGE_READ_LOG): with
+// SEAM = 3 the back also makes its own read and compares it with the packet's value: 1 handle
+// values, 2 the QMD, 4 null pointer slots.
+// Mismatches are counted by kind and the first 16 are logged with address, kind and shader. They
+// must read 0: same thread, same instant. Shape mismatches (the back took a different number of
+// handle values than the fill made) are counted always.
 
 #include <algorithm>
 #include <array>
@@ -512,6 +544,7 @@ void MemStage::BeginDraw(u32 repack_mask, u32 repack_dirty) {
     // A held packet ends at its Configure's PlayRestAfter; this is only a safety net.
     PlayRest();
     Bump(counters.draws);
+    RetireDrawValues();
     draw = DrawPacket{};
     draw.number = ++packet_number;
     draw.fill_tick = player.scheduler.CurrentTick();
@@ -522,9 +555,225 @@ void MemStage::BeginDraw(u32 repack_mask, u32 repack_dirty) {
 void MemStage::BeginDispatch() {
     PlayRest();
     Bump(counters.dispatches);
+    if (dispatch_open) {
+        // SEAM = 3: the packet opened at the QMD read (or the null pointer slot read).
+        dispatch_open = false;
+    } else {
+        RetireDispatchValues();
+        dispatch = DispatchPacket{};
+        dispatch.number = ++packet_number;
+    }
+    dispatch.fill_tick = player.scheduler.CurrentTick();
+}
+
+// ---------------------------------------------------------------------------------------------
+// By value (SEAM = 3)
+
+u32 MemStage::VerifyBits() noexcept {
+    static const u32 bits = [] {
+        const char* const value = std::getenv("FRITCHII_MEMSTAGE_VERIFY");
+        return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 0)) : 0U;
+    }();
+    return bits;
+}
+
+void MemStage::CloseHandleValues(bool dispatch_side, bool null_pointer_handles,
+                                 bool in_configure) {
+    const size_t side = dispatch_side ? 1 : 0;
+    const u32 count = static_cast<u32>((dispatch_side ? dispatch_values : draw_values).size());
+    u32& flags = dispatch_side ? dispatch.flags : draw.flags;
+    flags &= ~(HandleNullPointers | HandleValuesLooked | HandleValuesRetired);
+    flags |= HandleValuesFilled | (null_pointer_handles ? HandleNullPointers : 0U);
+    (dispatch_side ? dispatch.handle_values : draw.handle_values) = Span{0, count};
+    Bump(value_counters.fills[side]);
+    Bump(value_counters.values[side], count);
+    if (in_configure) {
+        Bump(value_counters.in_configure[side]);
+    }
+}
+
+const std::vector<u32>* MemStage::HandleValues(bool dispatch_side,
+                                               bool& null_pointer_handles) const noexcept {
+    const u32 flags = dispatch_side ? dispatch.flags : draw.flags;
+    if ((flags & HandleValuesFilled) == 0) {
+        return nullptr;
+    }
+    null_pointer_handles = (flags & HandleNullPointers) != 0;
+    return dispatch_side ? &dispatch_values : &draw_values;
+}
+
+void MemStage::LookedAtHandleValues(bool dispatch_side, size_t taken) {
+    u32& flags = dispatch_side ? dispatch.flags : draw.flags;
+    const size_t count = (dispatch_side ? dispatch_values : draw_values).size();
+    if (taken == 0 && count != 0) {
+        // The back skipped its handle loop (a TEX_BANK_GEN hit): retired as skipped.
+        return;
+    }
+    flags |= HandleValuesLooked;
+    if (taken != count) {
+        NoteValueCheck(Value::Shape, false, 0, 0, count, taken);
+    }
+}
+
+void MemStage::RetireDrawValues() {
+    if ((draw.flags & (HandleValuesFilled | HandleValuesLooked | HandleValuesRetired)) ==
+        HandleValuesFilled) {
+        Bump(value_counters.skipped[0]);
+        Bump(value_counters.skipped_values[0], draw_values.size());
+    }
+    draw.flags |= HandleValuesRetired;
+}
+
+void MemStage::RetireDispatchValues() {
+    if ((dispatch.flags & (HandleValuesFilled | HandleValuesLooked | HandleValuesRetired)) ==
+        HandleValuesFilled) {
+        Bump(value_counters.skipped[1]);
+        Bump(value_counters.skipped_values[1], dispatch_values.size());
+    }
+    dispatch.flags |= HandleValuesRetired;
+}
+
+void MemStage::OpenDispatchByValue() {
+    if (dispatch_open) {
+        return;
+    }
+    RetireDispatchValues();
     dispatch = DispatchPacket{};
     dispatch.number = ++packet_number;
-    dispatch.fill_tick = player.scheduler.CurrentTick();
+    dispatch_open = true;
+}
+
+const std::array<u32, 64>& MemStage::Qmd(Tegra::MemoryManager& gpu_memory, GPUVAddr address) {
+    if (dispatch_open) {
+        // A QMD read always begins a new dispatch (the pipeline lookup's pointer slots come after
+        // it). An open packet is one that ran no dispatch: a QMD the scheduler read for a load or
+        // that waits on its dependencies, or only a pointer slot read by a lookup that found no
+        // pipeline (review of 2c: it was carried into the next dispatch).
+        if ((dispatch.flags & QmdByValue) != 0) {
+            Bump(value_counters.qmds_unused);
+        }
+        dispatch_open = false;
+    }
+    OpenDispatchByValue();
+    gpu_memory.ReadBlockUnsafe(address, dispatch.qmd.data(), sizeof(dispatch.qmd));
+    dispatch.flags |= QmdByValue;
+    Bump(value_counters.qmds);
+    if ((VerifyBits() & VerifyQmd) != 0) [[unlikely]] {
+        std::array<u32, 64> own;
+        gpu_memory.ReadBlockUnsafe(address, own.data(), sizeof(own));
+        for (size_t word = 0; word < own.size(); ++word) {
+            const bool same = own[word] == dispatch.qmd[word];
+            if (!same || word + 1 == own.size()) {
+                // One check per QMD; the first word that differs is the one logged. The shader
+                // is the program address (QMD words 48-49).
+                NoteValueCheck(Value::Qmd, same, address + word * sizeof(u32),
+                               (u64{own[49]} << 32) | own[48], dispatch.qmd[word], own[word]);
+                break;
+            }
+        }
+    }
+    return dispatch.qmd;
+}
+
+u64 MemStage::ReadPointerSlot(Tegra::MemoryManager& gpu_memory, GPUVAddr address) {
+    OpenDispatchByValue();
+    const u64 value = gpu_memory.Read<u64>(address);
+    if (dispatch.null_slot_count < dispatch.null_slot_values.size()) {
+        dispatch.null_slot_values[dispatch.null_slot_count++] = value;
+    } else {
+        Bump(value_counters.null_slots_unkept);
+    }
+    Bump(value_counters.null_slots);
+    if ((VerifyBits() & VerifyNullSlots) != 0) [[unlikely]] {
+        const u64 own = gpu_memory.Read<u64>(address);
+        NoteValueCheck(Value::NullSlot, own == value, address,
+                       (u64{dispatch.qmd[49]} << 32) | dispatch.qmd[48], value, own);
+    }
+    return value;
+}
+
+void MemStage::NoteValueCheck(Value kind, bool same, u64 address, u64 shader, u64 packet_value,
+                              u64 own_value) {
+    const size_t index = static_cast<size_t>(kind);
+    if (kind != Value::Shape) {
+        Bump(value_counters.checks[index]);
+    }
+    if (same) {
+        return;
+    }
+    Bump(value_counters.mismatches[index]);
+    static constexpr std::array<const char*, static_cast<size_t>(Value::Count)> names{
+        "handle value", "QMD word", "null pointer slot", "handle count"};
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+        LOG_WARNING(Render_Vulkan,
+                    "Memory seam by value (5.4): {} differs at {:#x}, shader {:016x}: packet "
+                    "{:#x}, the back's own read {:#x}",
+                    names[index], address, shader, packet_value, own_value);
+    }
+}
+
+void MemStage::SnapshotValues(ValueCounts& out) const {
+    const auto load = [](const std::atomic<u64>& value) {
+        return value.load(std::memory_order_relaxed);
+    };
+    for (size_t side = 0; side < 2; ++side) {
+        out.fills[side] = load(value_counters.fills[side]);
+        out.values[side] = load(value_counters.values[side]);
+        out.in_configure[side] = load(value_counters.in_configure[side]);
+        out.skipped[side] = load(value_counters.skipped[side]);
+        out.skipped_values[side] = load(value_counters.skipped_values[side]);
+    }
+    out.qmds = load(value_counters.qmds);
+    out.qmds_unused = load(value_counters.qmds_unused);
+    out.null_slots = load(value_counters.null_slots);
+    out.null_slots_unkept = load(value_counters.null_slots_unkept);
+    for (size_t kind = 0; kind < out.checks.size(); ++kind) {
+        out.checks[kind] = load(value_counters.checks[kind]);
+        out.mismatches[kind] = load(value_counters.mismatches[kind]);
+    }
+}
+
+void MemStage::LogValueStats(double seconds, bool first) {
+    if (first) {
+        SnapshotValues(reported_values);
+        return;
+    }
+    ValueCounts current;
+    SnapshotValues(current);
+    const ValueCounts& last = reported_values;
+    const auto rate = [seconds](u64 value) { return static_cast<double>(value) / seconds; };
+    const auto each = [](u64 values, u64 fills) {
+        return fills != 0 ? static_cast<double>(values) / static_cast<double>(fills) : 0.0;
+    };
+    if (ValuesByValue() || current.fills[0] != last.fills[0] || current.qmds != last.qmds) {
+        std::array<std::string, 2> sides;
+        for (size_t side = 0; side < 2; ++side) {
+            const u64 fills = current.fills[side] - last.fills[side];
+            const u64 skipped = current.skipped[side] - last.skipped[side];
+            sides[side] = fmt::format(
+                "{:.0f}/s ({:.1f} values each, {:.0f}/s filled in Configure), skipped by the back "
+                "{:.0f}/s ({:.0f} values/s)",
+                rate(fills), each(current.values[side] - last.values[side], fills),
+                rate(current.in_configure[side] - last.in_configure[side]), rate(skipped),
+                rate(current.skipped_values[side] - last.skipped_values[side]));
+        }
+        const auto delta = [&](size_t kind, bool checks) {
+            return checks ? current.checks[kind] - last.checks[kind]
+                          : current.mismatches[kind] - last.mismatches[kind];
+        };
+        LOG_INFO(Render_Vulkan,
+                 "  memory seam by value: draws {}; dispatches {}; QMDs {:.0f}/s ({:.0f}/s ran no "
+                 "dispatch); null pointer slots {:.0f}/s ({} not kept); verify {:#x}: checks "
+                 "handle {} QMD {} slot {}, mismatches (5.4) handle {} QMD {} slot {}, count {}",
+                 sides[0], sides[1], rate(current.qmds - last.qmds),
+                 rate(current.qmds_unused - last.qmds_unused),
+                 rate(current.null_slots - last.null_slots),
+                 current.null_slots_unkept - last.null_slots_unkept, VerifyBits(),
+                 delta(0, true), delta(1, true), delta(2, true), delta(0, false),
+                 delta(1, false), delta(2, false), delta(3, false));
+    }
+    reported_values = current;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1082,6 +1331,20 @@ void MemStage::TickFrame() {
     const bool on = value != 0;
     // A held packet never outlives its draw or dispatch; a safety net, as in BeginDraw.
     PlayRest();
+    if (value != seam_level.load(std::memory_order_relaxed)) {
+        if ((value >= 3) != ValuesByValue()) {
+            LOG_INFO(Render_Vulkan, "Memory seam (EXP123={}): {}", value,
+                     value >= 3 ? "handle values, the QMD and null pointer slots by value"
+                                : "the back reads handles, the QMD and null pointer slots itself");
+        }
+        seam_level.store(value, std::memory_order_relaxed);
+    }
+    RetireDrawValues();
+    if (dispatch_open) {
+        dispatch_open = false;
+        Bump(value_counters.qmds_unused);
+        RetireDispatchValues();
+    }
     if (OwnedHere() && pending) {
         // Nothing should be pending between frames: a site that misses its play.
         Note(SeamHook::Use::Flush, std::source_location::current(), false);
@@ -1119,6 +1382,7 @@ void MemStage::LogStats() {
     if (last_log_ns == 0) {
         last_log_ns = now;
         Snapshot(reported);
+        LogValueStats(0.0, true);
         return;
     }
     if (now - last_log_ns < 10'000'000'000ULL) {
@@ -1239,6 +1503,7 @@ void MemStage::LogStats() {
         }
     }
     reported = current;
+    LogValueStats(seconds, false);
 }
 
 void MemStage::Snapshot(Counts& out) const {
