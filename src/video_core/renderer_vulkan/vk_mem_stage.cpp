@@ -86,10 +86,12 @@
 //           trapped game store ("game write, marked").
 //        C  the place: an upload's changed bytes outside every bound range, uniform and value the
 //           packet read are "over-read" (the cache uploaded the page, the draw does not use them);
-//           everything else is "own data".
+//           everything else is "inside a range the packet binds" (for a dispatch, whole storage
+//           buffers).
 //        Unclassified: unmapped, no GPU, or the ring wrapped since the fill.
 //        The gate line: unexplained = emulator writes that are not landings + unclassified;
-//        "mark already taken" and "own data changed" are reported apart, not failures.
+//        "mark already taken", "untracked read changed" and "changed inside a range the packet
+//        binds" are reported apart, not failures.
 //        Off (no READ_LOG) every hook is one relaxed load and a branch.
 //   The held descriptors' form is compared with the queue's after Acquire. Must be 0.
 // The zones "memory fill" (fills at SEAM = 2, with what the cache does inside them) and "memory
@@ -1561,7 +1563,8 @@ void MemStage::ClassifyDiff(const ReadLog& log, const ReadRecord& record, u64 fi
     };
 
     // C: an upload covers whole tracked words; the packet uses only its bound ranges, uniforms
-    // and values. Every other read is the packet's own data by what it is.
+    // and values. Every other read is inside a range the packet binds by what it is (for a
+    // dispatch that is whole storage buffers: whether the shader reads the bytes is not known).
     bool own = true;
     if (record.kind == Kind::Upload && device) {
         own = std::any_of(log.used.begin(), log.used.end(), [&](const std::pair<u64, u64>& used) {
@@ -1660,7 +1663,8 @@ void MemStage::ClassifyDiff(const ReadLog& log, const ReadRecord& record, u64 fi
                 READ_KIND_NAMES[static_cast<size_t>(record.kind)], record.address, record.size,
                 first, last,
                 device ? fmt::format("{:#x}+{:#x}", *device, length) : std::string{"unmapped"},
-                own ? "the packet's own data" : "over-read (outside every range the packet uses)",
+                own ? "inside a range the packet binds"
+                    : "over-read (outside every range the packet binds)",
                 who, mark, back, hash_a, hash_b);
 }
 
@@ -2201,9 +2205,9 @@ void MemStage::LogStats() {
             LOG_INFO(Render_Vulkan,
                      "  memory seam read log classes: emulator write {}{}{}{}, game write marked "
                      "{}, game write mark already taken {}, untracked read changed {}, gather on "
-                     "the back inside Configure {}, unclassified {}; over-read {}, own data "
-                     "changed {}; ring wrapped {}; on the holding thread: gathers applied {}, "
-                     "FlushRegion texture {} query {} buffer {}",
+                     "the back inside Configure {}, unclassified {}; over-read {}, changed inside "
+                     "a range the packet binds {}; ring wrapped {}; on the holding thread: "
+                     "gathers applied {}, FlushRegion texture {} query {} buffer {}",
                      landings + emulator, sites.empty() ? "" : " (", sites,
                      sites.empty() ? "" : ")", by_class(DiffClass::GameMarked), taken, untracked,
                      by_class(DiffClass::BackGather), unclassified, delta(&Counts::diff_over), own,
@@ -2214,7 +2218,7 @@ void MemStage::LogStats() {
             LOG_INFO(Render_Vulkan,
                      "  read log gate: unexplained {} (emulator writes that are not download "
                      "landings {}, unclassified {}); mark already taken {} (tracked reads); "
-                     "untracked read changed {}; own data changed {}",
+                     "untracked read changed {}; changed inside a range the packet binds {}",
                      emulator + unclassified, emulator, unclassified, taken, untracked, own);
         }
     }

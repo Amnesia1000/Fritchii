@@ -308,13 +308,14 @@ site, thread and sequence (vk_mem_stage.cpp, "Who wrote", lists every hook). Eac
   stream uniform or a value: no tracker, no mark expected, the next fill reads it again), "gather
   on the back inside Configure" (a bound range, and the drawing thread applied a gather since the
   fill; the first gather's stack is logged), or "unclassified" (unmapped, or the ring wrapped);
-- a place: "over-read" (an upload's changed bytes outside every range the packet uses) or "own
-  data".
-The "memory seam read log classes" line has the counts by class and site, over-read and own
-data, ring wraps, and on the holding thread the gathers applied and FlushRegion calls by cache.
-The "read log gate" line: unexplained = emulator writes that are not download landings +
-unclassified; must be 0. "mark already taken", "untracked read changed" and "own data changed"
-are reported beside it and are not failures. Off, every hook costs one relaxed load and a branch.
+- a place: "over-read" (an upload's changed bytes outside every range the packet binds) or
+  "inside a range the packet binds" (for a dispatch, whole storage buffers).
+The "memory seam read log classes" line has the counts by class and site, over-read and changed
+inside a bound range, ring wraps, and on the holding thread the gathers applied and FlushRegion
+calls by cache. The "read log gate" line: unexplained = emulator writes that are not download
+landings + unclassified; must be 0. "mark already taken", "untracked read changed" and "changed
+inside a range the packet binds" are reported beside it and are not failures. Off, every hook
+costs one relaxed load and a branch.
 
 ### FRITCHII_MEMSTAGE_VERIFY
 
