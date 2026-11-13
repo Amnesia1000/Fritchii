@@ -984,9 +984,11 @@ static bool ReleaseFencesForReadable(DmaPusher& dma_pusher, const void* owner,
         return result;
     }
     const u64 target = split.UntrackedWriterPosition(*device);
+    // Memory stage tag Cache: the fence manager only; no 3D state.
     split.Defer([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); },
                 VideoCommon::GpuSplit::Effect::Unknown,
-                VideoCommon::Nx2FastDrawCount::Neutral());
+                VideoCommon::Nx2FastDrawCount::Neutral() |
+                    VideoCommon::StageTagBits(VideoCommon::StageTag::Cache));
     split.NoteMemoryWrite();
     const auto begin = Clock::now();
     if (split.WaitUntil(target, VideoCommon::DrainSite::FenceWriters)) {
