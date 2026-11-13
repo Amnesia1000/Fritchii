@@ -925,6 +925,27 @@ private:
     static constexpr size_t FactsSlots = 4096;
     std::unique_ptr<FactsSlot[]> facts_table;
     mutable std::mutex facts_mutex;
+    /// Step 7: with the window open both threads use the table at every draw, so each keeps a
+    /// cache of its own and takes the lock only on a miss. Bumped (under the lock) at every write.
+    std::atomic<u64> facts_generation{0};
+    /// The back's: what it published, one slot per key hash (no lock while it holds).
+    struct PublishedMemo {
+        u64 key{};
+        const void* source{};
+    };
+    static constexpr size_t MemoSlots = 1024;
+    std::unique_ptr<PublishedMemo[]> published_memo;
+    /// GPUMem's: the entries it looked up, valid while the generation it saw holds.
+    struct StageFactsSlot {
+        u64 key{};
+        StagedFacts facts{};
+    };
+    static constexpr size_t StageFactsSlots = 512;
+    mutable std::unique_ptr<StageFactsSlot[]> stage_facts_cache;
+    mutable u64 stage_facts_generation{~u64{0}};
+    static size_t FactsHash(u64 key) noexcept {
+        return static_cast<size_t>((key * 0x9e3779b97f4a7c15ULL) >> 52);
+    }
     std::vector<u32> draw_values;
     std::vector<u32> dispatch_values;
 

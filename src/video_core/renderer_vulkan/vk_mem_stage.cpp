@@ -570,7 +570,9 @@ MemStage::SyncScope::~SyncScope() {
 MemStage::MemStage(MemPlayer& player_)
     : player{player_}, arena{256 * 1024}, held_arena{256 * 1024},
       ring_b{std::make_unique_for_overwrite<u8[]>(RingBytes)},
-      facts_table{std::make_unique<FactsSlot[]>(FactsSlots)} {
+      facts_table{std::make_unique<FactsSlot[]>(FactsSlots)},
+      published_memo{std::make_unique<PublishedMemo[]>(MemoSlots)},
+      stage_facts_cache{std::make_unique<StageFactsSlot[]>(StageFactsSlots)} {
     player.stage = this;
     if (const char* const value = std::getenv("FRITCHII_MEMSTAGE_READ_LOG")) {
         read_log_every = (std::max)(0, std::atoi(value));
@@ -1729,14 +1731,21 @@ u64 MemStage::DropRingPackets(u64 position) {
 void MemStage::PublishFacts(u64 key, const void* source, const DrawFacts& facts,
                             bool dynamic_input) {
     key = key != 0 ? key : 1;
+    // The back's memo (step 7): every write of the table goes through here and updates it, so a
+    // hit means the table holds this source under this key already. No lock then.
+    PublishedMemo& memo = published_memo[FactsHash(key) & (MemoSlots - 1)];
+    if (memo.key == key && memo.source == source) {
+        return;
+    }
     constexpr size_t Mask = FactsSlots - 1;
-    const size_t home = static_cast<size_t>((key * 0x9e3779b97f4a7c15ULL) >> 52) & Mask;
+    const size_t home = FactsHash(key) & Mask;
     std::scoped_lock lock{facts_mutex};
     FactsSlot* target = &facts_table[home];
     for (size_t probe = 0, index = home; probe < 16; ++probe, index = (index + 1) & Mask) {
         FactsSlot& slot = facts_table[index];
         if (slot.key == key) {
             if (slot.source == source) {
+                memo = PublishedMemo{key, source};
                 return; // published already
             }
             target = &slot;
@@ -1780,20 +1789,49 @@ void MemStage::PublishFacts(u64 key, const void* source, const DrawFacts& facts,
         }
         staged.infos = std::move(infos);
     }
+    if (target->key != 0 && target->key != key) {
+        // An entry pushed out of a full probe run: its memo must not say "published" any more.
+        PublishedMemo& evicted = published_memo[FactsHash(target->key) & (MemoSlots - 1)];
+        if (evicted.key == target->key) {
+            evicted = PublishedMemo{};
+        }
+    }
     target->key = key;
     target->source = source;
     target->facts = std::move(staged);
+    memo = PublishedMemo{key, source};
+    facts_generation.fetch_add(1, std::memory_order_release);
 }
 
 bool MemStage::LookupFacts(u64 key, StagedFacts& out) const {
     key = key != 0 ? key : 1;
+    // GPUMem's cache (step 7): valid while no write happened since it was filled. A write right
+    // after this test is one the lookup could have missed under the lock too (the back publishes
+    // at its own, earlier, position).
+    const u64 generation = facts_generation.load(std::memory_order_acquire);
+    if (generation != stage_facts_generation) {
+        for (size_t i = 0; i < StageFactsSlots; ++i) {
+            stage_facts_cache[i].key = 0;
+        }
+        stage_facts_generation = generation;
+    }
+    StageFactsSlot& cached = stage_facts_cache[FactsHash(key) & (StageFactsSlots - 1)];
+    if (cached.key == key) {
+        out = cached.facts;
+        return true;
+    }
     constexpr size_t Mask = FactsSlots - 1;
-    const size_t home = static_cast<size_t>((key * 0x9e3779b97f4a7c15ULL) >> 52) & Mask;
+    const size_t home = FactsHash(key) & Mask;
     std::scoped_lock lock{facts_mutex};
     for (size_t probe = 0, index = home; probe < 16; ++probe, index = (index + 1) & Mask) {
         const FactsSlot& slot = facts_table[index];
         if (slot.key == key) {
             out = slot.facts;
+            if (facts_generation.load(std::memory_order_relaxed) == generation) {
+                // Kept only when the table is still the generation the cache stands for.
+                cached.key = key;
+                cached.facts = slot.facts;
+            }
             return true;
         }
         if (slot.key == 0) {
