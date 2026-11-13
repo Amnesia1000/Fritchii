@@ -472,6 +472,8 @@ public:
     }
     /// GPUMem: room for another packet.
     [[nodiscard]] bool RingRoom() const noexcept;
+    /// GPUMem: its draw's fill is over, packet or not (BeginDraw opened its packet number).
+    void EndStageFill();
     /// The back: the packet of its draw `seq` (packets of earlier draws are played whole first),
     /// held as a filled draw is; null when there is none. `hash`: the back's compare b hash.
     const DrawPacket* TakeRingDraw(u64 seq, u64 back_position, u64 hash, bool verify);
@@ -897,6 +899,11 @@ private:
     /// The held draw came from ring B: its packet is played_draw.
     bool held_ring{};
     DrawPacket played_draw{};
+    /// GPUMem's side of a ring fill (THREAD = 2; the back's held_* fields are the back's): the
+    /// open packet number (its unplayed mark), the program hashes and the descriptor form.
+    u64 stage_fill_from{};
+    std::array<u64, 2> fill_hashes{};
+    bool fill_held_form{};
     void PushRingDraw();
     const RingHeader* PeekRing();
     void TakeRingHeader(const RingHeader& header);

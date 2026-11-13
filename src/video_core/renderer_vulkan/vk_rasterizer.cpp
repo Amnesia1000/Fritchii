@@ -1259,6 +1259,10 @@ bool RasterizerVulkan::StageFillDraw(VideoCommon::MemStageShadowEngine& copy, bo
     const u32 repack_dirty = buffer_cache_runtime.SetVertexRepackLayout(
         inputs.RepackLayoutRegs(), stage_facts.dynamic_vertex_input);
     mem_stage.BeginDraw(buffer_cache_runtime.RepackMask(), repack_dirty);
+    // The packet number BeginDraw opened is GPUMem's unplayed mark until the push, or until here.
+    SCOPE_EXIT {
+        mem_stage.EndStageFill();
+    };
     if (repack_dirty) {
         inputs.MarkVertexBuffersDirty(repack_dirty);
     }

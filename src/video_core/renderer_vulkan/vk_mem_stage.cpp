@@ -582,6 +582,10 @@ MemStage::MemStage(MemPlayer& player_)
     }
     if (const u32 mode = TicksMode(); mode != 0) {
         ticks = std::make_unique<SeamTicks>(player.scheduler.GetMasterSemaphore(), mode == 2);
+        // Ring B's packets are unplayed too: a close asks for the oldest itself (THREAD = 2).
+        ticks->SetRingOldest(
+            [](void* context) { return static_cast<MemStage*>(context)->RingOldestNumber(); },
+            this);
         LOG_INFO(Render_Vulkan, "Memory seam: packet ticks (FRITCHII_MEMSTAGE_TICKS={}){}", mode,
                  mode == 2 ? ", checked against the scheduler's ticks" : "");
     }
@@ -752,7 +756,16 @@ void MemStage::BeginDraw(u32 repack_mask, u32 repack_dirty) {
     Bump(counters.draws);
     RetireDrawValues();
     draw = DrawPacket{};
-    draw.number = ticks ? ticks->BeginPacket() : ++packet_number;
+    if (ticks && Link::OnStageThread() && Link::RingActive()) {
+        // THREAD = 2: GPUMem's mark is the draw's number from the moment it exists (the back
+        // may close a tick meanwhile); EndStageFill clears it however the fill ends.
+        draw.number = ticks->BeginStagePacket();
+        if (stage_fill_from == 0) {
+            stage_fill_from = draw.number;
+        }
+    } else {
+        draw.number = ticks ? ticks->BeginPacket() : ++packet_number;
+    }
     draw.repack_mask = repack_mask;
     draw.repack_dirty = repack_dirty;
 }
@@ -1020,6 +1033,34 @@ bool MemStage::ClaimHeld() {
 // played inside Configure does not end the held one. Without a held packet this is SetPending's
 // and PlayPending's set and clear.
 void MemStage::UpdateUnplayed() {
+    if (Link::RingActive()) {
+        // THREAD = 2 ("Packet ticks with the stage ahead"): each side writes only its own mark,
+        // from its own fields; the close takes the lower one and ring B's oldest packet itself.
+        // GPUMem: the draw it fills (from BeginDraw to the push) and its pending entries. The
+        // back: the packet it holds, its own fill in a run, its pending entries. (The arena and
+        // its pending flag belong to whichever thread owns it: GPUMem's while it fills; the back
+        // reads them as GPUMem's only while it serves GPUMem's sync with GPUMem's identity, and
+        // then writes GPUMem's mark.)
+        const bool owned = OwnedHere();
+        if (Link::OnStageThread() || t_identity != 0) {
+            u64 from = stage_fill_from;
+            if (owned && pending && (from == 0 || pending_from < from)) {
+                from = pending_from;
+            }
+            ticks->SetStageUnplayed(from);
+            return;
+        }
+        u64 from = held != HeldKind::None || (owned && filling_held) ? held_from : 0;
+        if (owned && pending && (from == 0 || pending_from < from)) {
+            from = pending_from;
+        }
+        if (from != 0) {
+            ticks->SetUnplayed(from);
+        } else {
+            ticks->ClearUnplayed();
+        }
+        return;
+    }
     u64 from = held != HeldKind::None || filling_held ? held_from : 0;
     // THREAD = 2: the packets in ring B are not played yet either.
     if (const u64 oldest = RingOldestNumber(); oldest != 0 && (from == 0 || oldest < from)) {
@@ -1070,8 +1111,9 @@ void MemStage::EndHeldFill() {
     fill_form = -1;
     t_reads = nullptr;
     // A ring push ended the fill too. ring_pushed is FillRingDraw's answer: read here, not taken
-    // (taking it here made every served draw look unfilled to the stage, hence level).
-    if (held != HeldKind::None || ring_pushed) {
+    // (taking it here made every served draw look unfilled to the stage, hence level). A ring fill
+    // asks only that: `held` is the back's (it may hold another packet right now).
+    if (ring_fill ? ring_pushed : held != HeldKind::None) {
         return;
     }
     // The fill threw before TakeHeld: nothing is held. Its entries stay pending and the next
@@ -1106,19 +1148,29 @@ const MemStage::DrawPacket* MemStage::FillDrawHere(Cache& cache_, const DrawFact
     const u64 start = timed ? NowNs() : 0;
     Bump(counters.held_draws);
     draw.flags |= Held;
-    held_hashes = facts.hashes;
-    held_form = player.guest_descriptor_queue.FormFor(facts.uses_descriptor_buffer);
-    fill_form = held_form ? 1 : 0;
+    const bool form = player.guest_descriptor_queue.FormFor(facts.uses_descriptor_buffer);
+    if (ring_fill) {
+        // THREAD = 2: the fill side's own fields (the back holds and plays another packet at the
+        // same time with the window open); they go to the back in the ring header.
+        fill_hashes = facts.hashes;
+        fill_held_form = form;
+    } else {
+        held_hashes = facts.hashes;
+        held_form = form;
+        held_flush_seen = false;
+        held_reads.clear();
+    }
+    fill_form = form ? 1 : 0;
     filling_held = true;
     filling_kind = HeldKind::Draw;
-    held_flush_seen = false;
     t_holding = true;
-    held_reads.clear();
     // THREAD = 2: no texture write check and no read log for ring packets (Ring B above).
     t_reads = ring_fill ? nullptr : &held_reads;
     const HeldFillEnd fill_end{*this};
     if (ticks) {
-        held_from = draw.number;
+        if (!ring_fill) {
+            held_from = draw.number;
+        }
         UpdateUnplayed();
     }
     const bool logging =
@@ -1418,6 +1470,17 @@ bool MemStage::FillRingDraw(Cache& cache_, const DrawFacts& facts, bool is_index
     return packet != nullptr && std::exchange(ring_pushed, false);
 }
 
+void MemStage::EndStageFill() {
+    // GPUMem's mark, however its draw's fill ended (a push clears it first; this covers a fill
+    // that made no packet, or threw).
+    if (stage_fill_from != 0) {
+        stage_fill_from = 0;
+        if (ticks) {
+            UpdateUnplayed();
+        }
+    }
+}
+
 bool MemStage::RingRoom() const noexcept {
     // Several packets can be in flight in level mode: the draws of one entry, and a deferred
     // draw the stage's copy flushed at a sink-bound write, whose packet waits for the back's
@@ -1452,7 +1515,7 @@ void MemStage::PushRingDraw() {
     RingHeader header{};
     header.bytes = static_cast<u32>(bytes);
     header.kind = 1;
-    header.flags = held_form ? 1 : 0;
+    header.flags = fill_held_form ? 1 : 0;
     header.part = 0;
     header.position = ring_fill_position;
     header.number = draw.number;
@@ -1460,7 +1523,7 @@ void MemStage::PushRingDraw() {
     header.hash = ring_fill_hash;
     header.held_cursor = play_cursor;
     header.entry_bytes = entries;
-    header.hashes = held_hashes;
+    header.hashes = fill_hashes;
     header.value_count = value_count;
     header.value_flags = (ring_values != nullptr ? 1U : 0U) | (ring_null_pointers ? 2U : 0U);
     u8* const out = ring_b.get() + index;
@@ -1475,6 +1538,8 @@ void MemStage::PushRingDraw() {
     }
     ring_b_write += bytes;
     ring_b_sent.store(ring_b_write, std::memory_order_release);
+    // GPUMem's mark goes only after the packet is in ring B (a close reads the mark first).
+    stage_fill_from = 0;
     Link::Get().NotePacketSent(bytes);
     // As TakeHeld: the arena is done with; the next fill starts on an empty one.
     arena.Reset();
@@ -1879,11 +1944,14 @@ void MemStage::NoteHeldFlush(SeamHook::Use use, const std::source_location& loca
     Bump(counters.held_flushed);
     static std::atomic<u32> logged{};
     if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
-        const bool is_draw = (filling_held ? filling_kind : held) == HeldKind::Draw;
+        // THREAD = 2: a ring packet the back holds is played_draw (GPUMem's fields are its own).
+        const bool ring = held_ring && held == HeldKind::Draw;
+        const bool is_draw = ring || (filling_held ? filling_kind : held) == HeldKind::Draw;
         LOG_WARNING(Render_Vulkan,
                     "Memory seam (5.5): a {}{} between the fill and the PlayRest of {} {}: {}:{} {}",
                     UseName(use), t_play_depth != 0 ? " (in a sync)" : "",
-                    is_draw ? "draw" : "dispatch", is_draw ? draw.number : dispatch.number,
+                    is_draw ? "draw" : "dispatch",
+                    ring ? played_draw.number : is_draw ? draw.number : dispatch.number,
                     location.file_name(), location.line(), location.function_name());
     }
 }
@@ -2864,6 +2932,18 @@ u64 SeamClock::SubmitForHostRead(std::source_location location) {
 // (TickOf falls back to the current tick, right only when the two are level) become a join:
 // the stage asks the GPU thread to play up to that packet and flush.
 //
+// Packet ticks with the stage ahead (FRITCHII_MEMSTAGE_THREAD = 2, step 7's window). GPUMem fills
+// while the back records, so one `unplayed_from` written by both would lose the lower mark (the
+// back clearing it from a stale look at ring B while GPUMem pushes). While the ring runs each side
+// writes only its own mark: the back's (`unplayed_from`: the packet it holds, its own fill in a
+// level run, its pending entries) and GPUMem's (`stage_unplayed`: the draw it fills, from the
+// number BeginDraw opens under the close's lock (BeginStagePacket) to the push, and its pending
+// entries). Close, on the recording thread, takes the lowest of the two and of ring B's oldest
+// packet, which it reads itself after GPUMem's mark: a push puts the packet in ring B before the
+// mark clears. So every number a packet in flight carries (in GPUMem's fill, in ring B, held by
+// the back) stays open until its entries are recorded: its buffers, staging and stream regions
+// outlive it. At AHEAD = 0 the two threads take turns and the three marks give the old answer.
+//
 // Users that compare stamps for equality (the stream uniform reuse and its keeps: "same tick, so
 // the stream copy is still there") take Epoch(): the number of closes. A copy made at epoch E
 // carries a number not yet published; its stream region is only recycled once that number is
@@ -2928,9 +3008,30 @@ u64 SeamTicks::AdvanceLocked(u64 known) {
     return free;
 }
 
+u64 SeamTicks::BeginStagePacket() {
+    std::scoped_lock lock{mutex};
+    const u64 number = open.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (stage_unplayed.load(std::memory_order_relaxed) == 0) {
+        stage_unplayed.store(number, std::memory_order_release);
+    }
+    return number;
+}
+
 void SeamTicks::Close(u64 tick) {
     std::scoped_lock lock{mutex};
-    const u64 unplayed = unplayed_from.load(std::memory_order_acquire);
+    // The back's mark, then GPUMem's, then ring B's oldest packet ("Packet ticks with the stage
+    // ahead"): GPUMem's mark before the ring, because a packet it pushes is in ring B before its
+    // mark clears. Off THREAD = 2 the last two are 0.
+    u64 unplayed = unplayed_from.load(std::memory_order_acquire);
+    const auto lower = [&unplayed](u64 number) {
+        if (number != 0 && (unplayed == 0 || number < unplayed)) {
+            unplayed = number;
+        }
+    };
+    lower(stage_unplayed.load(std::memory_order_acquire));
+    if (ring_oldest != nullptr) {
+        lower(ring_oldest(ring_context));
+    }
     u64 last;
     if (unplayed != 0) {
         last = unplayed - 1;
