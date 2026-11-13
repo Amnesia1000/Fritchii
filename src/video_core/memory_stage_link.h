@@ -77,18 +77,42 @@ public:
         }
     }
     static void Note(Check check, const char* where) noexcept;
-
-    static void NoteAllocator(const void* allocator) noexcept {
-        const void* const watched = g_buffer_allocator.load(std::memory_order_relaxed);
-        if (allocator == watched && watched != nullptr) [[unlikely]] {
-            OnBufferAllocator();
-        }
+    /// FRITCHII_MEMSTAGE_THREAD >= 1: the thread rules are checked (and the buffer allocator's
+    /// heap budgets are published by its user instead of read from VMA by anyone).
+    [[nodiscard]] static bool Checking() noexcept {
+        return g_checking.load(std::memory_order_relaxed);
     }
+
+    /// Around a call on a VMA allocator (vulkan_memory_allocator.cpp, vulkan_wrapper.cpp). On the
+    /// buffer allocator: checks the caller is the cache's user, and counts the operation once it
+    /// is done, so a heap budget read during it keeps the old count and is taken again
+    /// (Device::PublishBufferHeapBudgets).
+    class AllocatorOp {
+    public:
+        explicit AllocatorOp(const void* allocator) noexcept
+            : watched{allocator != nullptr &&
+                      allocator == g_buffer_allocator.load(std::memory_order_relaxed)} {
+            if (watched) [[unlikely]] {
+                CheckCacheUser(Check::AllocatorUser);
+            }
+        }
+        ~AllocatorOp() {
+            if (watched) [[unlikely]] {
+                g_buffer_allocator_ops.fetch_add(1, std::memory_order_release);
+            }
+        }
+        AllocatorOp(const AllocatorOp&) = delete;
+        AllocatorOp& operator=(const AllocatorOp&) = delete;
+
+    private:
+        bool watched;
+    };
     static void WatchBufferAllocator(const void* allocator) noexcept {
         g_buffer_allocator.store(allocator, std::memory_order_relaxed);
     }
+    /// Operations finished on the buffer allocator (AllocatorOp).
     [[nodiscard]] static u64 BufferAllocatorOps() noexcept {
-        return g_buffer_allocator_ops.load(std::memory_order_relaxed);
+        return g_buffer_allocator_ops.load(std::memory_order_acquire);
     }
 
     [[nodiscard]] static bool FullVertexBinds() noexcept {
@@ -103,7 +127,6 @@ public:
 private:
     static bool IsCacheUserSlow() noexcept;
     static void CheckCacheUserSlow(Check check) noexcept;
-    static void OnBufferAllocator() noexcept;
 
     void StageMain(std::stop_token stop);
     void RunCall(u32 seq);

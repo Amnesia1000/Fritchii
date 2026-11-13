@@ -428,16 +428,18 @@ std::filesystem::path StaticPipelineCacheFilename() {
 // (title 1).
 u64 AllocatedUsage(VkDeviceSize driver_usage, const VmaBudget& vma_budget) {
     const VmaStatistics& statistics = vma_budget.statistics;
-    const u64 unused = statistics.blockBytes - statistics.allocationBytes;
+    // Guarded: two allocators' sums (or numbers taken at different times) must not wrap.
+    const u64 unused =
+        statistics.blockBytes - (std::min)(statistics.blockBytes, statistics.allocationBytes);
     return driver_usage - (std::min)(driver_usage, unused);
 }
 
 // vmaGetHeapBudgets of the main allocator, with the buffer allocator's blocks and allocations
 // (FRITCHII_MEMSTAGE_SPLIT_ALLOC) added to the statistics: the unused space in either allocator's
 // blocks is slack. usage and budget stay the main allocator's (the driver's, for the process).
-// The buffer allocator's numbers are the ones its user published (Device::BufferHeapBudgets): an
-// externally synchronized allocator refreshes its budget arrays inside vmaGetHeapBudgets, so no
-// other thread may call it (memory stage spec 5.3).
+// At FRITCHII_MEMSTAGE_THREAD=1 the buffer allocator's numbers are the ones its user published
+// (Device::BufferHeapBudgets): an externally synchronized allocator refreshes its budget arrays
+// inside vmaGetHeapBudgets, so no other thread may call it (memory stage spec 5.3). At 0, VMA's.
 void GetHeapBudgets(const Device& device, std::array<VmaBudget, VK_MAX_MEMORY_HEAPS>& budgets) {
     if (VideoCommon::MemoryStageLink::OnStageThread()) [[unlikely]] {
         // The main allocator is the back's.
@@ -2196,16 +2198,17 @@ u64 Device::GetDeviceMemoryUsage() const {
     return usage;
 }
 
-// The buffer allocator's heap budgets (memory stage spec 5.3). Only the allocator's user calls VMA
+// The buffer allocator's heap budgets (memory stage spec 5.3). At FRITCHII_MEMSTAGE_THREAD=0 every
+// caller asks VMA directly, as before the stage's thread. At 1 only the allocator's user calls VMA
 // for them (the back, or GPUMem inside a hand-off: MemoryStageLink::IsCacheUser), when the
-// allocator changed since they were taken (its operation count moved); everyone else reads the
-// published values.
-void Device::PublishBufferHeapBudgets() const {
-    if (buffer_allocator == nullptr) {
-        return;
-    }
+// allocator changed since they were taken (its finished-operation count moved); everyone else
+// reads the published values. The publish and the reads hold buffer_budgets_mutex: two
+// publishers (a broken thread rule) can't interleave, and a reader never sees half of one.
+void Device::PublishBufferHeapBudgetsLocked() const {
+    // Counted when each operation ended (MemoryStageLink::AllocatorOp): an operation still running
+    // during vmaGetHeapBudgets is counted later, and the next call takes the budgets again.
     const u64 ops = VideoCommon::MemoryStageLink::BufferAllocatorOps();
-    if (buffer_budget_ops.load(std::memory_order_relaxed) == ops) {
+    if (buffer_budget_ops == ops) {
         return;
     }
     if (!VideoCommon::MemoryStageLink::IsCacheUser()) {
@@ -2217,31 +2220,48 @@ void Device::PublishBufferHeapBudgets() const {
     vmaGetHeapBudgets(buffer_allocator, budgets.data());
     for (size_t heap = 0; heap < budgets.size(); ++heap) {
         const VmaBudget& budget = budgets[heap];
-        auto& out = buffer_budgets[heap];
-        out[0].store(budget.statistics.blockCount, std::memory_order_relaxed);
-        out[1].store(budget.statistics.allocationCount, std::memory_order_relaxed);
-        out[2].store(budget.statistics.blockBytes, std::memory_order_relaxed);
-        out[3].store(budget.statistics.allocationBytes, std::memory_order_relaxed);
-        out[4].store(budget.usage, std::memory_order_relaxed);
-        out[5].store(budget.budget, std::memory_order_relaxed);
+        buffer_budgets[heap] = {budget.statistics.blockCount,
+                                budget.statistics.allocationCount,
+                                budget.statistics.blockBytes,
+                                budget.statistics.allocationBytes,
+                                budget.usage,
+                                budget.budget};
     }
-    buffer_budget_ops.store(ops, std::memory_order_release);
+    buffer_budget_ops = ops;
+}
+
+void Device::PublishBufferHeapBudgets() const {
+    if (buffer_allocator == nullptr || !VideoCommon::MemoryStageLink::Checking()) {
+        return;
+    }
+    std::scoped_lock lock{buffer_budgets_mutex};
+    PublishBufferHeapBudgetsLocked();
 }
 
 void Device::BufferHeapBudgets(VmaBudget* budgets) const {
+    if (buffer_allocator == nullptr) {
+        std::fill_n(budgets, VK_MAX_MEMORY_HEAPS, VmaBudget{});
+        return;
+    }
+    if (!VideoCommon::MemoryStageLink::Checking()) {
+        // FRITCHII_MEMSTAGE_THREAD=0: VMA's numbers of this moment, as before the stage's thread
+        // (the texture cache collector's thresholds read them).
+        vmaGetHeapBudgets(buffer_allocator, budgets);
+        return;
+    }
+    std::scoped_lock lock{buffer_budgets_mutex};
     if (VideoCommon::MemoryStageLink::IsCacheUser()) {
-        PublishBufferHeapBudgets();
+        PublishBufferHeapBudgetsLocked();
     }
     for (size_t heap = 0; heap < VK_MAX_MEMORY_HEAPS; ++heap) {
         const auto& in = buffer_budgets[heap];
         VmaBudget& budget = budgets[heap];
-        budget.statistics.blockCount = static_cast<u32>(in[0].load(std::memory_order_relaxed));
-        budget.statistics.allocationCount =
-            static_cast<u32>(in[1].load(std::memory_order_relaxed));
-        budget.statistics.blockBytes = in[2].load(std::memory_order_relaxed);
-        budget.statistics.allocationBytes = in[3].load(std::memory_order_relaxed);
-        budget.usage = in[4].load(std::memory_order_relaxed);
-        budget.budget = in[5].load(std::memory_order_relaxed);
+        budget.statistics.blockCount = static_cast<u32>(in[0]);
+        budget.statistics.allocationCount = static_cast<u32>(in[1]);
+        budget.statistics.blockBytes = in[2];
+        budget.statistics.allocationBytes = in[3];
+        budget.usage = in[4];
+        budget.budget = in[5];
     }
 }
 

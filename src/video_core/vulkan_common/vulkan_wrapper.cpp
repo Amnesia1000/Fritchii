@@ -616,7 +616,7 @@ void Buffer::SetObjectNameEXT(const char* name) const {
 
 void Buffer::Release() const noexcept {
     if (handle) {
-        VideoCommon::MemoryStageLink::NoteAllocator(allocator);
+        const VideoCommon::MemoryStageLink::AllocatorOp allocator_op{allocator};
         vmaDestroyBuffer(allocator, handle, allocation);
     }
 }

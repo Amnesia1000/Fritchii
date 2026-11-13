@@ -388,11 +388,6 @@ void MemoryStageLink::CheckCacheUserSlow(Check check) noexcept {
     }
 }
 
-void MemoryStageLink::OnBufferAllocator() noexcept {
-    g_buffer_allocator_ops.fetch_add(1, std::memory_order_relaxed);
-    CheckCacheUser(Check::AllocatorUser);
-}
-
 void MemoryStageLink::Note(Check check, const char* where) noexcept {
     const size_t index = static_cast<size_t>(check);
     instance.counters.checks[index].fetch_add(1, std::memory_order_relaxed);

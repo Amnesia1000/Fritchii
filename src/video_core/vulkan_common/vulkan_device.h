@@ -1192,7 +1192,8 @@ FN_MAX_LIMIT_LIST
         return memory_usage_value.load(std::memory_order_relaxed);
     }
 
-    /// The buffer allocator's heap budgets as its user published them (vulkan_device.cpp).
+    /// The buffer allocator's heap budgets: VMA's at FRITCHII_MEMSTAGE_THREAD=0, as its user
+    /// published them at 1 (vulkan_device.cpp).
     void BufferHeapBudgets(VmaBudget* budgets) const;
     void PublishBufferHeapBudgets() const;
 
@@ -1397,10 +1398,13 @@ private:
     VkInstance instance;         ///< Vulkan instance.
     VmaAllocator allocator{};    ///< VMA allocator.
     VmaAllocator buffer_allocator{}; ///< See GetBufferAllocator; null when not split.
-    /// BufferHeapBudgets: per heap block count, allocation count, block bytes, allocation bytes,
-    /// usage, budget; and the allocator's operation count they were taken at.
-    mutable std::array<std::array<std::atomic<u64>, 6>, VK_MAX_MEMORY_HEAPS> buffer_budgets{};
-    mutable std::atomic<u64> buffer_budget_ops{~u64{0}};
+    /// BufferHeapBudgets at FRITCHII_MEMSTAGE_THREAD=1: per heap block count, allocation count,
+    /// block bytes, allocation bytes, usage, budget; and the allocator's finished-operation count
+    /// they were taken at. Published and read under buffer_budgets_mutex.
+    void PublishBufferHeapBudgetsLocked() const;
+    mutable std::mutex buffer_budgets_mutex;
+    mutable std::array<std::array<u64, 6>, VK_MAX_MEMORY_HEAPS> buffer_budgets{};
+    mutable u64 buffer_budget_ops{~u64{0}};
     bool allocator_thread_safe{}; ///< See IsAllocatorThreadSafe.
     mutable std::mutex separate_pools_mutex;
     /// [allocator: main, buffers][SeparatePool][memory type]

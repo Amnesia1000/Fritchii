@@ -178,7 +178,7 @@ void MemoryCommit::Unmap()
 
 void MemoryCommit::Release() {
     if (allocation && allocator) {
-        VideoCommon::MemoryStageLink::NoteAllocator(allocator);
+        const VideoCommon::MemoryStageLink::AllocatorOp allocator_op{allocator};
         // Log GPU memory deallocation
         if (GPU::Logging::IsActive() &&
             Settings::values.gpu_log_memory_tracking.GetValue() &&
@@ -418,7 +418,7 @@ MemoryAllocator::ImageTiming MemoryAllocator::ReadImageTiming() noexcept {
 
 VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedicated, bool may_fail,
                                         vk::Image &image) const {
-    VideoCommon::MemoryStageLink::NoteAllocator(allocator);
+    const VideoCommon::MemoryStageLink::AllocatorOp allocator_op{allocator};
     const VmaAllocationCreateInfo alloc_ci = {
             // Best fit: images freed by the thousand leave holes in the blocks, which new ones
             // should fill before VMA takes another block.
@@ -565,7 +565,7 @@ vk::Image MemoryAllocator::CreateUnbackedImage(const VkImageCreateInfo &ci, bool
 VmaAllocation MemoryAllocator::AllocateSparseMemory(const VkMemoryRequirements &requirements,
                                                    VkDeviceMemory &memory,
                                                    VkDeviceSize &offset) const {
-    VideoCommon::MemoryStageLink::NoteAllocator(allocator);
+    const VideoCommon::MemoryStageLink::AllocatorOp allocator_op{allocator};
     const VmaAllocationCreateInfo alloc_ci{
         .flags = 0,
         .usage = VMA_MEMORY_USAGE_UNKNOWN,
@@ -606,7 +606,7 @@ VmaAllocation MemoryAllocator::AllocateSparseMemory(const VkMemoryRequirements &
 
 void MemoryAllocator::FreeSparseMemory(VmaAllocation allocation) const {
     if (allocation != VK_NULL_HANDLE) {
-        VideoCommon::MemoryStageLink::NoteAllocator(allocator);
+        const VideoCommon::MemoryStageLink::AllocatorOp allocator_op{allocator};
         vmaFreeMemory(allocator, allocation);
     }
 }
@@ -646,7 +646,7 @@ bool MemoryAllocator::CreateBufferInSeparatePool(const VkBufferCreateInfo& ci, M
 }
 
 vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage) const {
-    VideoCommon::MemoryStageLink::NoteAllocator(allocator);
+    const VideoCommon::MemoryStageLink::AllocatorOp allocator_op{allocator};
     // MESA will do memcpy() if not marked as host cached, so just force mark it for most buffers
     auto const anv_flags = (usage == MemoryUsage::Stream
         && device.GetDriverID() == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA)
@@ -715,7 +715,7 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
     if (min_alignment <= 1) {
         return CreateBuffer(ci, usage);
     }
-    VideoCommon::MemoryStageLink::NoteAllocator(allocator);
+    const VideoCommon::MemoryStageLink::AllocatorOp allocator_op{allocator};
     VkMemoryPropertyFlags anv_flags = 0;
     if (usage == MemoryUsage::Stream &&
         device.GetDriverID() == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA) {
@@ -763,7 +763,7 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
 
 MemoryCommit MemoryAllocator::Commit(const VkMemoryRequirements &reqs, MemoryUsage usage)
 {
-    VideoCommon::MemoryStageLink::NoteAllocator(allocator);
+    const VideoCommon::MemoryStageLink::AllocatorOp allocator_op{allocator};
     const auto vma_usage = MemoryUsageVma(usage);
     VmaAllocationCreateInfo ci{};
     ci.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | MemoryUsageVmaFlags(usage);
@@ -796,7 +796,7 @@ MemoryCommit MemoryAllocator::Commit(const VkMemoryRequirements &reqs, MemoryUsa
 }
 
 MemoryCommit MemoryAllocator::Commit(const vk::Buffer &buffer, MemoryUsage usage) {
-    VideoCommon::MemoryStageLink::NoteAllocator(allocator);
+    const VideoCommon::MemoryStageLink::AllocatorOp allocator_op{allocator};
     // Allocate memory appropriate for this buffer automatically
     const auto vma_usage = MemoryUsageVma(usage);
 
@@ -973,7 +973,7 @@ HeapTotals GetHeapTotals(const Device& device) {
     if (device.HasSplitAllocators()) {
         // FRITCHII_MEMSTAGE_SPLIT_ALLOC: the buffer allocator's blocks too. Its usage only
         // without VK_EXT_memory_budget: with it, usage is the driver's for the whole process.
-        // As its user published them (memory stage spec 5.3).
+        // At FRITCHII_MEMSTAGE_THREAD=1 as its user published them (memory stage spec 5.3).
         device.BufferHeapBudgets(budgets.data());
         const bool add_usage = !device.CanReportMemoryUsage();
         for (u32 heap = 0; heap < properties->memoryHeapCount; ++heap) {
