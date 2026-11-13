@@ -85,6 +85,9 @@ public:
         std::chrono::steady_clock::time_point last_drain{};
         /// Suspended after the fence release of a word read current (EXP12's resume counts).
         bool readable_release{};
+        /// How CanResumeAcquire found it met (FenceResumeRoute in puller.cpp), for EXP12's
+        /// resume histogram.
+        u8 resume_route{};
 
         [[nodiscard]] bool Matches(u32 current) const;
     };

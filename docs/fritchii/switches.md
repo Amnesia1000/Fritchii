@@ -750,7 +750,34 @@ ranges (N differed)" in the "DMA snapshot EXP10" line must stay 0.
 
 EXP12 (EDEN_NX2_SEM_FAST acquires read current but unmet, puller.cpp ReleaseFencesForReadable):
 1 = their fence release waits only for the queued writers the read can't account for, full
-drain only if still unmet; 2 = suspend then too, without the full drain; 3 = measure only.
+drain only if still unmet; 2 = suspend then too, without the full drain; 3 = measure only;
+4 = as 2 without the wait for those writers (the "fence writers" site): the fence release is
+queued, the word read once more, and an unmet acquire suspends at once. Exact for the reason 2
+is: the waiter is registered before the fence release is queued, the back latches it at any
+release that meets the value, and a suspended channel resumes only on that latch or a met read
+of the word (CanResumeAcquire). Live. The risk is speed only: an acquire the latch does not
+resume within 16 polls or 1 ms gets a poll drain (the "acquire" site), which costs more than
+the wait did.
+
+Lines, every 5 s:
+- "Fence writer waits (EXP12=N)": as before. At 4, "writer waits" is 0 and "met there" counts
+  acquires met at the read without the wait.
+- "Fence writer resumes (EXP12=N)", every mode: writer waits skipped (4) and how many of them
+  had the back short of the target (from the back's stored position, so an upper bound); the
+  fence path acquires resumed from a suspension, per route (latch: the back latched the
+  waiter; word read: a read of the word met it; front answer: a queued release, the QMD
+  prediction or the GEQUAL bound; poll drain: met after a poll drained the back), as a
+  histogram per second of the time from acquire to resume (under 100 us / 500 us / 1 ms /
+  5 ms / longer) with the mean; poll drains of these acquires and their time, split by
+  pending under 2 ms or longer, and those of the other acquires; then per channel: fence path
+  acquires, met there, suspended, resumed by route, and the mean time to resume.
+- At 4 the QMD prediction's "met by" for an acquire suspended there is counted at its resume
+  instead of at once (there would be no "unmet"), without the reduction bound check (the word
+  at the resume may be a later write's): the bound is checked only for acquires met at once.
+
+Must stay 0 at 4: the 2 s "waits on semaphore" warning. Judge 2 against 4 with a live toggle:
+"fence writers" in the front waits by site to 0, the "acquire" site under 20 ms/s, "from
+acquire to resume" not higher.
 
 ### EXP17
 

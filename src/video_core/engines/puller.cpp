@@ -659,23 +659,61 @@ void ReleaseFences(DmaPusher& dma_pusher) {
               VideoCommon::DrainSite::FenceRelease, VideoCommon::Nx2FastDrawCount::Neutral());
 }
 
+// How a suspended acquire was found met (Puller::PendingAcquire::resume_route, set by
+// CanResumeAcquire), for the resume histogram of FenceWriterStats.
+enum class FenceResumeRoute : u8 {
+    Latch,  ///< The back ran a release that met it and latched its waiter
+    Word,   ///< The word read met (or acquire learning's read), no drain
+    Answer, ///< A queued release, the QMD prediction or the GEQUAL bound met it, no drain
+    Drain,  ///< Met after a poll drained the back (the 16th unmet poll, or 1 ms since a drain)
+    Count,
+};
+
 // EDEN_NX2_EXP12: the fence releases of acquires whose word the front read current but unmet
 // (ReleaseFencesForReadable), logged every 5 s. Front thread only.
 struct FenceWriterStats {
     using Clock = std::chrono::steady_clock;
+    static constexpr size_t Routes = static_cast<size_t>(FenceResumeRoute::Count);
+    /// Acquire to resume: under 100 us, 500 us, 1 ms, 5 ms, then longer.
+    static constexpr std::array<u64, 4> BucketLimitsNs{100'000, 500'000, 1'000'000, 5'000'000};
+    static constexpr size_t Buckets = BucketLimitsNs.size() + 1;
+
+    /// Fence path acquires of one channel, and what became of them.
+    struct Channel {
+        s32 id{-1};
+        u64 acquires{};  ///< Readable acquires on the fence path
+        u64 met{};       ///< Met there (no suspension)
+        u64 suspended{};
+        u64 resumed{};
+        u64 resume_ns{};
+        std::array<u64, Routes> routes{};
+    };
 
     u64 acquires{};   ///< Readable acquires unmet before their fence release
     u64 delayed{};    ///< With EXP12 on, not applied: fences are delayed (GPU accuracy High)
     u64 waits{};      ///< Waits for the back to run the writers the read can't account for
     u64 wait_ns{};
-    u64 met{};        ///< Met once the back ran those writers
+    u64 met{};        ///< Met once the back ran those writers (EXP12=4: read without a wait)
     u64 full{};       ///< Full drains (EXP12 0 or 3, 1 when still unmet)
     u64 full_ns{};    ///< Their time (from the target on, when there was one)
     u64 full_met{};   ///< Met after the full drain
-    u64 suspended{};  ///< EXP12=2: unmet, suspended without the full drain
+    u64 suspended{};  ///< EXP12=2 or 4: unmet, suspended without the full drain
     u64 saved_ns{};   ///< EXP12=3: the full drains' time past the target, of acquires met there
     u64 resumed{};    ///< Readable acquires suspended after their fence release, resumed since
     u64 resume_ns{};  ///< Their time from the acquire to the resume
+    u64 skipped{};        ///< EXP12=4: writer waits not made
+    u64 skipped_behind{}; ///< Of them, the back's stored position was short of the target
+    /// The resumed ones by route and time from the acquire (Buckets), and their time by route.
+    std::array<std::array<u64, Buckets>, Routes> resume_hist{};
+    std::array<u64, Routes> route_ns{};
+    /// Poll drains (CanResumeAcquire) of fence path acquires: [0] pending under 2 ms, [1] longer.
+    std::array<u64, 2> poll_drains{};
+    std::array<u64, 2> poll_drain_ns{};
+    u64 other_poll_drains{}; ///< Poll drains of the other suspended acquires
+    u64 other_poll_drain_ns{};
+    std::array<Channel, 8> channels{};
+    size_t channel_count{};
+    Channel other_channels{}; ///< Channels past the first 8 seen in the window
     Clock::time_point since{};
 
     static FenceWriterStats& Get() {
@@ -686,6 +724,55 @@ struct FenceWriterStats {
     static u64 Nanoseconds(Clock::time_point begin, Clock::time_point end) {
         return static_cast<u64>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count());
+    }
+
+    Channel& ChannelRow(s32 id) {
+        for (size_t i = 0; i < channel_count; ++i) {
+            if (channels[i].id == id) {
+                return channels[i];
+            }
+        }
+        if (channel_count < channels.size()) {
+            channels[channel_count].id = id;
+            return channels[channel_count++];
+        }
+        return other_channels;
+    }
+
+    /// ProcessSemaphoreTriggerMethod: a readable acquire's outcome on the fence path.
+    void NoteOutcome(s32 channel, bool suspended_there) {
+        Channel& row = ChannelRow(channel);
+        ++row.acquires;
+        row.met += suspended_there ? 0 : 1;
+        row.suspended += suspended_there ? 1 : 0;
+    }
+
+    /// ResumeAcquire: a fence path acquire resumed `ns` after it, by `route`.
+    void NoteResume(s32 channel, u8 route, u64 ns) {
+        const size_t r = (std::min)(static_cast<size_t>(route), Routes - 1);
+        size_t bucket = 0;
+        while (bucket < BucketLimitsNs.size() && ns >= BucketLimitsNs[bucket]) {
+            ++bucket;
+        }
+        ++resumed;
+        resume_ns += ns;
+        ++resume_hist[r][bucket];
+        route_ns[r] += ns;
+        Channel& row = ChannelRow(channel);
+        ++row.resumed;
+        row.resume_ns += ns;
+        ++row.routes[r];
+    }
+
+    /// CanResumeAcquire drained the back for a suspended acquire.
+    void NotePollDrain(bool fence_path, bool young, u64 ns) {
+        if (!fence_path) {
+            ++other_poll_drains;
+            other_poll_drain_ns += ns;
+            return;
+        }
+        ++poll_drains[young ? 0 : 1];
+        poll_drain_ns[young ? 0 : 1] += ns;
     }
 
     void Tick() {
@@ -711,6 +798,50 @@ struct FenceWriterStats {
                  ms(wait_ns), rate(met), rate(full), ms(full_ns), rate(full_met), rate(suspended),
                  ms(saved_ns), rate(resumed),
                  resumed != 0 ? static_cast<double>(resume_ns) / 1e3 / resumed : 0.0);
+        // Per route: per second under 100 us / 500 us / 1 ms / 5 ms / longer, then the mean.
+        constexpr std::array<const char*, Routes> route_names{"latch", "word read",
+                                                              "front answer", "poll drain"};
+        std::string routes;
+        for (size_t r = 0; r < Routes; ++r) {
+            u64 count = 0;
+            for (const u64 n : resume_hist[r]) {
+                count += n;
+            }
+            routes += fmt::format("{}{} {:.0f}/{:.0f}/{:.0f}/{:.0f}/{:.0f} ({:.0f} us)",
+                                  r != 0 ? ", " : "", route_names[r], rate(resume_hist[r][0]),
+                                  rate(resume_hist[r][1]), rate(resume_hist[r][2]),
+                                  rate(resume_hist[r][3]), rate(resume_hist[r][4]),
+                                  count != 0 ? static_cast<double>(route_ns[r]) / 1e3 / count
+                                             : 0.0);
+        }
+        std::string rows;
+        const auto add_row = [&](const Channel& row, bool other) {
+            if (row.acquires == 0 && row.resumed == 0) {
+                return;
+            }
+            rows += fmt::format(
+                " [{}: {:.0f} acquires/s, met there {:.0f}, suspended {:.0f}, resumed {:.0f} "
+                "(latch {:.0f}, word {:.0f}, answer {:.0f}, drain {:.0f}), {:.0f} us to resume]",
+                other ? std::string{"other channels"} : fmt::format("channel {}", row.id),
+                rate(row.acquires), rate(row.met), rate(row.suspended), rate(row.resumed),
+                rate(row.routes[0]), rate(row.routes[1]), rate(row.routes[2]),
+                rate(row.routes[3]),
+                row.resumed != 0 ? static_cast<double>(row.resume_ns) / 1e3 / row.resumed
+                                 : 0.0);
+        };
+        for (size_t i = 0; i < channel_count; ++i) {
+            add_row(channels[i], false);
+        }
+        add_row(other_channels, true);
+        LOG_INFO(HW_GPU,
+                 "Fence writer resumes (EXP12={}): writer waits skipped {:.0f}/s (back short of "
+                 "the target {:.0f}/s); acquire to resume per route, /s under 100 us/500 us/1 "
+                 "ms/5 ms/longer: {}; poll drains of these acquires pending under 2 ms {:.0f}/s "
+                 "{:.2f} ms/s, 2 ms or more {:.0f}/s {:.2f} ms/s, of other acquires {:.0f}/s "
+                 "{:.2f} ms/s; by channel:{}",
+                 VideoCore::Nx2Debug::Experiment(12), rate(skipped), rate(skipped_behind), routes,
+                 rate(poll_drains[0]), ms(poll_drain_ns[0]), rate(poll_drains[1]),
+                 ms(poll_drain_ns[1]), rate(other_poll_drains), ms(other_poll_drain_ns), rows);
         *this = {};
         since = now;
     }
@@ -797,6 +928,42 @@ void QmdPredictionMetBy(DmaPusher& dma_pusher, const QmdPredictionCheck& check,
         Prediction::NoteMetBy(MetBy::BeforeCheck);
     }
 }
+
+// EXP12=4: the QMD prediction's "met by" of an acquire the fence path suspended without waiting
+// for the writers is noted at its resume (Puller::ResumeAcquire) instead of at once, where
+// nearly all would count as unmet (the writers had not run). Without the reduction bound check:
+// the word at the resume may already be a later write's. Counting only. Front thread only.
+class DeferredMetBy {
+public:
+    static DeferredMetBy& Get() {
+        static DeferredMetBy table;
+        return table;
+    }
+
+    void Add(const void* owner, const QmdPredictionCheck& check) {
+        std::erase_if(entries, [owner](const auto& entry) { return entry.first == owner; });
+        if (entries.size() >= 64) {
+            entries.erase(entries.begin()); // A channel that went away while suspended
+        }
+        QmdPredictionCheck kept = check;
+        kept.bound.reset();
+        entries.emplace_back(owner, kept);
+    }
+
+    std::optional<QmdPredictionCheck> Take(const void* owner) {
+        for (auto it = entries.begin(); it != entries.end(); ++it) {
+            if (it->first == owner) {
+                const QmdPredictionCheck check = it->second;
+                entries.erase(it);
+                return check;
+            }
+        }
+        return std::nullopt;
+    }
+
+private:
+    std::vector<std::pair<const void*, QmdPredictionCheck>> entries;
+};
 
 // EXP13=2: a plain release the puller sent, recorded so the reduction bound sees it queued or
 // run but not landed (it sets the word).
@@ -947,10 +1114,17 @@ static bool RunaheadAnswer(DmaPusher& dma_pusher, const Puller::PendingAcquire& 
 // queued functions), the fence release queued behind everything as before. 1 = met there: go
 // on, the fences released on the back in order; still unmet: the full drain as before.
 // 2 = unmet there too suspends without the full drain (the channel polls as usual). 3 = the full
-// drain always, timed past that point (measures what 1 saves). Not with delayed fences, whose
+// drain always, timed past that point (measures what 1 saves). 4 = as 2 without the wait for
+// those writers: the fence release is queued, the word read once more, and unmet suspends at
+// once. Exact for the reason 2 is: the waiter was registered before the fence release was
+// queued, the back latches it at any release that meets the value (OnWrite), and a suspended
+// channel resumes only on that latch or on a met read of the word (CanResumeAcquire), the same
+// polls 2's unmet acquires go through after their wait. The wait only made the front look
+// later. `skipped_wait` (optional): set when 4 skipped it. Not with delayed fences, whose
 // releases land when the host GPU passed them, not when the back runs them.
 static bool ReleaseFencesForReadable(DmaPusher& dma_pusher, const void* owner,
-                                     const Puller::PendingAcquire& acquire) {
+                                     const Puller::PendingAcquire& acquire,
+                                     bool* skipped_wait = nullptr) {
     using Clock = FenceWriterStats::Clock;
     auto& stats = FenceWriterStats::Get();
     const auto met = [&] {
@@ -969,7 +1143,7 @@ static bool ReleaseFencesForReadable(DmaPusher& dma_pusher, const void* owner,
             return true;
         }
     }
-    if (mode <= 0 || mode > 3 || !device || !split.Active() ||
+    if (mode <= 0 || mode > 4 || !device || !split.Active() ||
         VideoCore::Nx2Debug::DelayedFences()) {
         stats.delayed += mode != 0 ? 1 : 0;
         const auto begin = Clock::now();
@@ -991,11 +1165,18 @@ static bool ReleaseFencesForReadable(DmaPusher& dma_pusher, const void* owner,
                     VideoCommon::StageTagBits(VideoCommon::StageTag::Cache));
     split.NoteMemoryWrite();
     const auto begin = Clock::now();
-    if (split.WaitUntil(target, VideoCommon::DrainSite::FenceWriters)) {
+    if (mode == 4) {
+        // No wait: the back runs the writers and the fence release on its own (Publish below).
+        ++stats.skipped;
+        stats.skipped_behind += split.Ran(target) ? 0 : 1;
+        if (skipped_wait) {
+            *skipped_wait = true;
+        }
+    } else if (split.WaitUntil(target, VideoCommon::DrainSite::FenceWriters)) {
         ++stats.waits;
     }
     const auto reached = Clock::now();
-    stats.wait_ns += FenceWriterStats::Nanoseconds(begin, reached);
+    stats.wait_ns += mode == 4 ? 0 : FenceWriterStats::Nanoseconds(begin, reached);
     const bool met_there = met();
     stats.met += met_there ? 1 : 0;
     if (mode == 3 || (mode == 1 && !met_there)) {
@@ -1041,10 +1222,15 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     // each waiting acquire about 12 times before it is met, and every poll drained the back
     // (about 380 ms/s of the front's time). The drained path below runs now and then for an
     // unmet word, and reports an acquire not met for 2 s.
+    // `met_by` notes the route for EXP12's resume histogram (FenceWriterStats::NoteResume).
+    const auto met_by = [this](FenceResumeRoute route) {
+        pending_acquire->resume_route = static_cast<u8>(route);
+        return true;
+    };
     if (Nx2SemaphoreWaiters::Get().Latched(this)) {
         // The back ran a release that met the value and latched this waiter: resume at once.
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquirePollsFast, 1);
-        return true;
+        return met_by(FenceResumeRoute::Latch);
     }
     // EXP13=3: asked once per poll, before the unmet-poll throttle most polls end at.
     bool predicted = false;
@@ -1053,7 +1239,7 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     if (u32 word{}; SemaphoreReadableNow(dma_pusher, pending_acquire->address, word, &read_done)) {
         if (pending_acquire->Matches(word)) {
             VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquirePollsFast, 1);
-            return true;
+            return met_by(FenceResumeRoute::Word);
         }
         readable = ReadableRead{.word = word, .done = read_done};
         // An unmet word is answered without a drain for at most 16 polls or 1 ms since the back
@@ -1062,7 +1248,7 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
         // (Mario Kart World hung after 63 s once the 2 s report had been made).
         predicted = true;
         if (MetByQmdPrediction(dma_pusher, *pending_acquire, true)) {
-            return true;
+            return met_by(FenceResumeRoute::Answer);
         }
         const auto now = std::chrono::steady_clock::now();
         if (++pending_acquire->unmet_polls % 16 != 0 &&
@@ -1072,33 +1258,41 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
         }
     }
     if (MetByQueuedRelease(dma_pusher, *pending_acquire)) {
-        return true;
+        return met_by(FenceResumeRoute::Answer);
     }
     if (!predicted && MetByQmdPrediction(dma_pusher, *pending_acquire, true)) {
-        return true;
+        return met_by(FenceResumeRoute::Answer);
     }
     if (static_cast<GpuSemaphoreOperation>(pending_acquire->operation) ==
             GpuSemaphoreOperation::AcquireGequal &&
         GequalMetWithoutDrain(dma_pusher, pending_acquire->address, pending_acquire->value,
                               readable)) {
-        return true;
+        return met_by(FenceResumeRoute::Answer);
     }
     // EDEN_NX2_ACQUIRE_LEARN: resume when a release met the waiter (GPU releases notify
     // Nx2SemaphoreWaiters) or the word in memory does (CPU releases); drain only once the channel
     // has waited 2 ms. Every command list pushed retried this with a drain (~5 ms a frame).
     if (AcquireLearning::Enabled() &&
         std::chrono::steady_clock::now() - pending_acquire->since < std::chrono::milliseconds{2}) {
-        if (Nx2SemaphoreWaiters::Get().Latched(this) ||
-            pending_acquire->Matches(dma_pusher.memory_manager.Read<u32>(pending_acquire->address))) {
+        if (Nx2SemaphoreWaiters::Get().Latched(this)) {
             VideoCommon::GpuSplit::Get().NoteSync();
-            return true;
+            return met_by(FenceResumeRoute::Latch);
+        }
+        if (pending_acquire->Matches(dma_pusher.memory_manager.Read<u32>(pending_acquire->address))) {
+            VideoCommon::GpuSplit::Get().NoteSync();
+            return met_by(FenceResumeRoute::Word);
         }
         return false;
     }
     // The release may still be queued for the split GPU thread's back half (and the caches
     // ReadSemaphoreWord asks are its state).
+    const auto drain_begin = std::chrono::steady_clock::now();
     DrainBack();
     pending_acquire->last_drain = std::chrono::steady_clock::now();
+    FenceWriterStats::Get().NotePollDrain(
+        pending_acquire->readable_release,
+        drain_begin - pending_acquire->since < std::chrono::milliseconds{2},
+        FenceWriterStats::Nanoseconds(drain_begin, pending_acquire->last_drain));
     const u32 current = ReadSemaphoreWord(dma_pusher, pending_acquire->address);
     if (Nx2SemaphoreWaiters::Get().Latched(this)) {
         if (static std::atomic<u32> rescued{};
@@ -1107,10 +1301,10 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
                      dma_pusher.channel_state.bind_id, pending_acquire->address,
                      pending_acquire->value, current);
         }
-        return true;
+        return met_by(FenceResumeRoute::Drain);
     }
     if (pending_acquire->Matches(current)) {
-        return true;
+        return met_by(FenceResumeRoute::Drain);
     }
     // With delayed fence operations (Balanced or Accurate fences, accurate GPU), a release
     // queued after the acquire released the fences waits in the caches for the next fence. With
@@ -1125,7 +1319,7 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
         ReleaseFences(dma_pusher);
         if (Nx2SemaphoreWaiters::Get().Latched(this) ||
             pending_acquire->Matches(ReadSemaphoreWord(dma_pusher, pending_acquire->address))) {
-            return true;
+            return met_by(FenceResumeRoute::Drain);
         }
     }
     if (!pending_acquire->reported &&
@@ -1229,10 +1423,14 @@ bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
     // thrown away for about half of all entries (CommandList::snapshot_suspensions).
     if (pending_acquire) {
         if (pending_acquire->readable_release) {
-            auto& stats = FenceWriterStats::Get();
-            ++stats.resumed;
-            stats.resume_ns += FenceWriterStats::Nanoseconds(
-                pending_acquire->since, FenceWriterStats::Clock::now());
+            FenceWriterStats::Get().NoteResume(
+                dma_pusher.channel_state.bind_id, pending_acquire->resume_route,
+                FenceWriterStats::Nanoseconds(pending_acquire->since,
+                                              FenceWriterStats::Clock::now()));
+            // EXP12=4: the QMD prediction's "met by", deferred to here (DeferredMetBy).
+            if (const auto check = DeferredMetBy::Get().Take(this)) {
+                QmdPredictionMetBy(dma_pusher, *check, *pending_acquire, true);
+            }
         }
         if (AcquireLogEnabled()) [[unlikely]] {
             const auto device = dma_pusher.memory_manager.GpuToCpuAddress(pending_acquire->address);
@@ -1499,18 +1697,37 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                         WatchedSemaphoreWord(dma_pusher.memory_manager, acquire.address));
         }
         bool met_now;
+        // EXP12=4: the QMD check of an acquire suspended without the writer wait, for its resume.
+        std::optional<QmdPredictionCheck> deferred_check;
         if (readable) {
             const auto qmd_check = CheckQmdPrediction(dma_pusher, acquire);
-            met_now = ReleaseFencesForReadable(dma_pusher, this, acquire);
+            bool skipped_wait = false;
+            met_now = ReleaseFencesForReadable(dma_pusher, this, acquire, &skipped_wait);
             if (qmd_check) {
-                QmdPredictionMetBy(dma_pusher, *qmd_check, acquire,
-                                   met_now || waiters.Latched(this));
+                const bool met = met_now || waiters.Latched(this);
+                if (skipped_wait && !met) {
+                    deferred_check = qmd_check;
+                } else {
+                    QmdPredictionMetBy(dma_pusher, *qmd_check, acquire, met);
+                }
             }
         } else {
             ReleaseFences(dma_pusher);
             met_now = acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address));
         }
-        if (!waiters.Latched(this) && !met_now) {
+        const bool suspend = !waiters.Latched(this) && !met_now;
+        if (readable) {
+            FenceWriterStats::Get().NoteOutcome(dma_pusher.channel_state.bind_id, suspend);
+        }
+        if (deferred_check) {
+            if (suspend) {
+                DeferredMetBy::Get().Add(this, *deferred_check);
+            } else {
+                // Latched in between: met after all.
+                QmdPredictionMetBy(dma_pusher, *deferred_check, acquire, true);
+            }
+        }
+        if (suspend) {
             pending_acquire = acquire;
             pending_acquire->last_drain = std::chrono::steady_clock::now();
             pending_acquire->readable_release = readable;
