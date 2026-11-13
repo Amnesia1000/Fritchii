@@ -85,6 +85,11 @@ public:
         std::chrono::steady_clock::time_point last_drain{};
         /// Suspended after the fence release of a word read current (EXP12's resume counts).
         bool readable_release{};
+        /// How CanResumeAcquire first found it met (FenceResumeRoute in puller.cpp), for EXP12's
+        /// resume histogram; RouteUnset until then. A resume asks CanResumeAcquire twice
+        /// (Scheduler::ResumePending, then ResumeAcquire): the first answer is kept.
+        static constexpr u8 RouteUnset = 0xFF;
+        u8 resume_route{RouteUnset};
 
         [[nodiscard]] bool Matches(u32 current) const;
     };
