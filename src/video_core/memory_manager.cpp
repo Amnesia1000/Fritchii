@@ -844,6 +844,13 @@ void MemoryManager::WriteBlockCached(GPUVAddr gpu_dest_addr, const void* src_buf
     accumulator.Add(gpu_dest_addr, size);
 }
 
+void MemoryManager::WriteBlockStage(GPUVAddr gpu_dest_addr, const void* src_buffer,
+                                    std::size_t size) {
+    // FRITCHII_MEMSTAGE_THREAD=2: constant buffer words the memory stage writes on GPUMem, while
+    // the back is parked (memstage_shadow.cpp). The stage collects and applies their ranges.
+    WriteBlockImpl(gpu_dest_addr, src_buffer, size, VideoCommon::CacheType::None, true, false);
+}
+
 void MemoryManager::WriteWordsCached(GPUVAddr gpu_dest_addr, const u32* words, std::size_t count) {
     const std::size_t size = count * sizeof(u32);
     // Words on Switch 2 sparse memory go one at a time, as Nx2BackSparseWrite saw them.

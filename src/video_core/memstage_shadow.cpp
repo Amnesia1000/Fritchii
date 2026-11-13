@@ -97,6 +97,26 @@
 // reasons for the others; the OoT trackers' record against today's query. Then the gate line of
 // plan 6.1: runs above 15,000 a second (at the market), full copies above 2,000 a second, or a
 // render_enable.mode the registers do not decide, each fails it.
+//
+// Piece 6b (FRITCHII_MEMSTAGE_THREAD=2, memory_stage_link.cpp): the same code runs on GPUMem, on
+// each ring entry before the back (StageProcess), and its copy is the one the fills read. The
+// state below is then GPUMem's: the back's hooks (Before, BackDraw's compares, BackFill, ...) are
+// off (SetRingBack), and the compares give way to the ring's own checks. What changes on the stage:
+// - constant buffer words of a served entry are written to game memory here (WriteBlockStage, the
+//   bytes the back's cached write writes) and their device ranges collected (StageRanges): the
+//   next fill applies their buffer half, a lend hands them to the back. In a run, or after the
+//   entry turned hard, they only advance the offset (the back writes them);
+// - bind_groups binds and the Channel closure act on the buffer cache through the ring backend
+//   (the back skips them in served mode);
+// - a draw the copy's draw manager issues with execute_on, outside a run and before the entry
+//   turned hard, is filled at once (the ring backend's fill_draw, from the copy) and its packet
+//   goes to ring B with the draw's sequence number (every draw counts, on both threads, from the
+//   ring's start). A draw the stage cannot serve makes its entry hard: indirect and list draws,
+//   GPU-counted draws, draws while the back asks for level draws (diagnostics), facts misses and
+//   texel buffers (fill_draw says so);
+// - StageLend hands the cache's flags 15-48 to the back's engines, StageReturn takes them back,
+//   with execute_on (5c's take), the scalar draw state when the back drew in the run, and full
+//   copies of the copies an unfollowed entry left stale. The back is parked at both moments.
 
 #include <algorithm>
 #include <bit>
@@ -113,6 +133,7 @@
 #include <windows.h>
 #endif
 
+#include "common/fritchii_write_ring.h"
 #include "common/logging.h"
 #include "video_core/buffer_cache/cache_inputs.h"
 #include "video_core/dirty_flags.h"
@@ -126,7 +147,9 @@
 #include "video_core/memory_stage_link.h"
 #include "video_core/memstage_shadow.h"
 #include "video_core/memstage_shadow_engine.h"
+#include "video_core/nx2.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_indirect_grid.h"
 #include "video_core/page_filter.h"
 
 namespace VideoCommon {
@@ -150,6 +173,9 @@ struct MemStageShadowAccess {
     }
     static bool FrontMacros(const Maxwell3D& maxwell3d) {
         return maxwell3d.front_macros;
+    }
+    static Tegra::Engines::EngineInterface* BackEngine() {
+        return GpuSplit::Get().back_engine;
     }
 };
 
@@ -190,6 +216,8 @@ enum class LevelType : u8 {
     Condition,    ///< render_enable.mode the registers do not decide; id: override << 8 | mode
     EngineMethod, ///< another engine's executable method; id: EngineType << 16 | method
     CacheCall,    ///< a closure tagged StageTag::Cache; id: its address in the executable
+    // 6b
+    LevelDraw,    ///< a draw the stage cannot serve (THREAD = 2); id: the kind
 };
 enum class EngineType : u32 { KeplerCompute, KeplerMemory, MaxwellDMA, Fermi2D, Other };
 
@@ -312,6 +340,9 @@ std::string LevelName(u64 key) {
         break;
     case LevelType::CacheCall:
         what = fmt::format("cache call +{:#x}", id);
+        break;
+    case LevelType::LevelDraw:
+        what = fmt::format("level draw (kind {})", id);
         break;
     }
     return fmt::format("{} ch{}", what, channel);
@@ -728,6 +759,13 @@ struct State {
     bool fill_from_copy{};
     u64 invalidations_seen{}; ///< g_flag_invalidations at the back's previous draw
     bool full_binds{};        ///< SHADOW=3: FRITCHII_MEMSTAGE_FULL_BINDS at the last check
+    // 6b (THREAD = 2): this state is GPUMem's.
+    bool ring{};              ///< StageProcess runs it on GPUMem
+    bool ring_in_run{};       ///< The entry is followed inside a level run
+    u64 ring_seq{};           ///< Draws the copies issued since the ring started
+    u32 ring_packets{};       ///< Packets the entry sent
+    Class last_class{Class::Pass};
+    std::vector<std::pair<u64, std::size_t>> ring_ranges; ///< Collected, not applied yet
     Counters counters;
     Counters totals;
     std::chrono::steady_clock::time_point window_start{};
@@ -895,9 +933,36 @@ void Collect(State& s, const Copy& c, GPUVAddr address, u64 size) {
     }
 }
 
+/// 6b: the bytes Maxwell3D::ProcessCBMultiData's write puts in game memory, written by the stage
+/// (words on Switch 2 sparse memory one at a time, as WriteWordsCached), and their device ranges
+/// collected for the buffer half (the back's accumulator is not used).
+void StageWriteWords(State& s, Copy& c, GPUVAddr address, const u32* data, u64 size) {
+    const Common::WriteRing::SiteScope write_site{"3D constant buffer data (memory stage)", false};
+    if (address + size > Tegra::g_nx2_sparse_low.load(std::memory_order_relaxed) &&
+        address < Tegra::g_nx2_sparse_high.load(std::memory_order_relaxed)) {
+        for (u64 i = 0; i < size / sizeof(u32); ++i) {
+            c.memory->WriteBlockStage(address + i * sizeof(u32), data + i, sizeof(u32));
+        }
+    } else {
+        c.memory->WriteBlockStage(address, data, size);
+    }
+    constexpr u64 Atom = 32;
+    constexpr u64 Page = 0x1000;
+    GPUVAddr begin = address & ~(Atom - 1);
+    const GPUVAddr end = (address + size + Atom - 1) & ~(Atom - 1);
+    while (begin < end) {
+        const GPUVAddr piece_end = (std::min)(end, (begin + Page) & ~(Page - 1));
+        if (const std::optional<DAddr> device = c.memory->GpuToCpuAddress(begin)) {
+            s.ring_ranges.emplace_back(*device, static_cast<std::size_t>(piece_end - begin));
+        }
+        begin = piece_end;
+    }
+}
+
 /// Maxwell3D::ProcessCBMultiData: computes the write and its range, writes nothing. With EXP107
 /// (a mode the stage does not implement: hard) only the offset advances, as in a run (plan 3.2).
-void ConstBufferWords(State& s, Copy& c, u32 amount) {
+/// 6b: a served entry's words are written here (StageWriteWords).
+void ConstBufferWords(State& s, Copy& c, u32 amount, const u32* data) {
     Regs& regs = c.e->regs;
     const GPUVAddr address = regs.const_buffer.Address();
     const u64 copy_size = u64{amount} * sizeof(u32);
@@ -914,7 +979,11 @@ void ConstBufferWords(State& s, Copy& c, u32 amount) {
             ++s.counters.watched_hits;
             Hard(s, LevelType::CbWatched, 0);
         }
-        Collect(s, c, begin, write_size);
+        if (!s.ring) {
+            Collect(s, c, begin, write_size);
+        } else if (!s.ring_in_run && !s.entry_hard) {
+            StageWriteWords(s, c, begin, data, write_size);
+        }
     }
     regs.const_buffer.offset += static_cast<u32>(copy_size);
 }
@@ -931,6 +1000,15 @@ void ConstBufferBind(Copy& c, size_t stage) {
     buffer.enabled = bind.valid.Value() != 0;
     buffer.address = e.regs.const_buffer.Address();
     buffer.size = e.regs.const_buffer.size;
+    // 6b: the buffer cache's half of Maxwell3D::ProcessCBBind (the back skips it when served).
+    State& s = S();
+    if (s.ring && !s.ring_in_run && !s.entry_hard) {
+        const auto& backend = MemoryStageLink::Get().Backend();
+        if (backend.bind_uniform != nullptr) {
+            backend.bind_uniform(backend.context, stage, bind.shader_slot, buffer.address,
+                                 buffer.size, buffer.enabled);
+        }
+    }
 }
 
 /// How an executable 3D method classifies before its handler (plan section 2; the handler can
@@ -1008,7 +1086,7 @@ void Condition(State& s, Copy& c) {
 void MethodCall(State& s, Copy& c, u32 method, u32 value, u32 nonshadow) {
     Engine& e = *c.e;
     if (method - CbData < 16) {
-        return ConstBufferWords(s, c, 1);
+        return ConstBufferWords(s, c, 1, &value);
     }
     ++c.generation;
     switch (method) {
@@ -1104,7 +1182,7 @@ void CallMultiMethod(State& s, Copy& c, u32 method, const u32* words, u32 amount
         Hard(s, s.entry_type, method);
     }
     if (method - CbData < 16) {
-        return ConstBufferWords(s, c, amount);
+        return ConstBufferWords(s, c, amount, words);
     }
     switch (method) {
     case MAXWELL3D_REG_INDEX(inline_data):
@@ -1207,7 +1285,7 @@ Maxwell3D* As3D(u64 pointer) {
 
 /// SHADOW=3: whether the copy holds the cache's flags outside runs (needs full vertex binds).
 bool OwnsFlags(const State& s) {
-    return g_mode >= 3 && s.full_binds;
+    return g_mode >= 3 && s.full_binds && !s.ring;
 }
 
 /// Sets `to`'s cache flags (15 to 48) to `from`'s.
@@ -1415,6 +1493,13 @@ size_t Process(State& s, u64 position, bool executed) {
         case StageTag::Channel:
             cls = Class::Work;
             s.channel = static_cast<s32>(static_cast<s64>(words[0]));
+            // 6b: the buffer cache's channel bind (the back skips it when served).
+            if (s.ring && !s.ring_in_run && !s.entry_hard) {
+                const auto& backend = MemoryStageLink::Get().Backend();
+                if (backend.bind_channel != nullptr) {
+                    backend.bind_channel(backend.context, s.channel);
+                }
+            }
             break;
         case StageTag::Writes: {
             Maxwell3D* const engine = As3D(words[0]);
@@ -1524,6 +1609,7 @@ size_t Process(State& s, u64 position, bool executed) {
     if (s.entry_hard) {
         cls = Class::Level;
     }
+    s.last_class = cls;
     Runs(s, cls);
     switch (cls) {
     case Class::Pass:
@@ -1850,7 +1936,185 @@ std::pair<DAddr, DAddr> FirstUncovered(const std::vector<std::pair<DAddr, DAddr>
     return {0, 0};
 }
 
+/// 6b: what the stage cannot serve, as a LevelDraw id and the link's level draw kind.
+enum class RingLevel : u32 { Indirect = 0, GpuCount = 1, Forced = 3, Late = 6 };
+
+/// The copy's state in compare b's words (the narrow set, channel 0), hashed: the verify of
+/// compare b with two threads. The back hashes the same words of its engine at the take.
+template <typename E>
+u64 StateHash(const E& e, const Maxwell3D* engine) {
+    u64 hash = 0xcbf29ce484222325ULL;
+    Visit(e, false, 0, engine, [&](const SegmentInfo& info, const u32* words) {
+        hash = HashBytes(words, size_t{info.words} * sizeof(u32), hash);
+    });
+    return hash;
+}
+
 } // Anonymous namespace
+
+void SetRingBack(bool on) {
+    // On the back thread: its hooks are off while GPUMem keeps the state (THREAD = 2), and on
+    // again with a fresh state when the ring ends (SHADOW >= 1), or the shadow is off again.
+    if (on) {
+        t_on_back = false;
+        g_on.store(true, std::memory_order_relaxed);
+        return;
+    }
+    g_on.store(g_mode != 0, std::memory_order_relaxed);
+    if (g_mode != 0) {
+        Start();
+    } else {
+        t_on_back = false;
+    }
+}
+
+void StageStart(s32 channel) {
+    State& s = S();
+    s = State{};
+    s.window_start = std::chrono::steady_clock::now();
+    s.ring = true;
+    s.channel = channel;
+    s.back_channel = channel;
+    s.full_binds = true;
+    CacheInputs::g_mark_hook = &OnCacheMark;
+    // The engine the back runs now: entries before the next engine entry are its.
+    if (Tegra::Engines::EngineInterface* const engine = Access::BackEngine()) {
+        s.engine = engine;
+        if (auto* const maxwell3d = dynamic_cast<Maxwell3D*>(engine)) {
+            s.engine_copy = FindCopy(s, maxwell3d);
+        } else {
+            s.engine_type = TypeOf(engine);
+        }
+    }
+}
+
+StageResult StageProcess(u64 position, bool in_run) {
+    State& s = S();
+    s.ring_in_run = in_run;
+    s.ring_packets = 0;
+    s.current = position;
+    const size_t size = Process(s, position, false);
+    s.cursor = position + size;
+    return StageResult{
+        .size = size,
+        .cls = static_cast<u8>(s.last_class),
+        .hard = s.entry_hard,
+        .packets = s.ring_packets,
+    };
+}
+
+bool StageExtendsRun(u64 position) {
+    State& s = S();
+    const u64* const entry = &Access::Ring()[position & Access::RingMask];
+    const u64 head = entry[0];
+    switch (static_cast<Kind>(head & 0xf)) {
+    case Kind::Wrap:
+        return true;
+    case Kind::Engine:
+        return dynamic_cast<Maxwell3D*>(
+                   reinterpret_cast<Tegra::Engines::EngineInterface*>(entry[1])) == nullptr;
+    case Kind::Call:
+        switch (StageTagOf(head)) {
+        case StageTag::Level:
+        case StageTag::Cache:
+        case StageTag::Pass:
+            return true;
+        case StageTag::Channel:
+        case StageTag::Writes:
+        case StageTag::FinishMacro:
+        case StageTag::DrawLoop:
+            return false;
+        default:
+            return true; // an unknown tag: hard, cannot be followed
+        }
+    case Kind::Method:
+    case Kind::Multi:
+    case Kind::Pairs:
+        return s.engine != nullptr && s.engine_copy == nullptr;
+    default:
+        return false;
+    }
+}
+
+void StageLend() {
+    State& s = S();
+    for (Copy& copy : s.copies) {
+        if (!copy.stale) {
+            TakeCacheFlags(copy.back->dirty.flags, copy.e->dirty.flags);
+        }
+    }
+    ++s.counters.lends;
+}
+
+u64 StageReturn(const void* drew_engine, const void* state_engine, s32 back_channel) {
+    State& s = S();
+    for (Copy& copy : s.copies) {
+        if (!copy.stale) {
+            TakeCacheFlags(copy.e->dirty.flags, copy.back->dirty.flags);
+            ++copy.generation;
+        }
+    }
+    ++s.counters.returns;
+    if (Copy* const copy = std::exchange(s.take_execute, nullptr); copy != nullptr && !copy->stale) {
+        copy->e->execute_on = copy->back->ShouldExecute();
+        ++copy->generation;
+        ++s.counters.execute_takes;
+    }
+    // Plan 3.3: after a run in which the back issued a draw, or wrote a GPU count into its draw
+    // state, the draw manager's scalar state.
+    Copy* draw_copy = nullptr;
+    if (drew_engine != nullptr) {
+        draw_copy = FindCopy(s, static_cast<Maxwell3D*>(const_cast<void*>(drew_engine)));
+    } else if (state_engine != nullptr) {
+        draw_copy = s.engine_copy;
+    }
+    if (draw_copy != nullptr && !draw_copy->stale) {
+        CopyScalarDrawState(draw_copy->e->draw_manager.draw_state,
+                            draw_copy->back->draw_manager.draw_state);
+        ++draw_copy->generation;
+        ++s.counters.draw_state_takes;
+    }
+    s.take_draw_state = nullptr;
+    s.back_channel = back_channel;
+    if (s.channel_stale) {
+        s.channel = back_channel;
+        s.channel_stale = false;
+    }
+    // The full copies an unfollowed entry asks for, now that the back is parked at the run's
+    // end (spec 1.5).
+    u64 copies = 0;
+    for (Copy& copy : s.copies) {
+        if (copy.stale) {
+            Resync(s, copy);
+            ++copies;
+        }
+    }
+    return copies;
+}
+
+void StageTick() {
+    State& s = S();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - s.window_start >= std::chrono::seconds{10}) {
+        Report(s, now);
+    }
+}
+
+std::vector<std::pair<u64, std::size_t>>& StageRanges() {
+    return S().ring_ranges;
+}
+
+u64 BackStateHash(const Maxwell3D& maxwell3d) {
+    return StateHash(maxwell3d, &maxwell3d);
+}
+
+u64 BackProgramKey(const Maxwell3D& maxwell3d) {
+    return ProgramKey(maxwell3d);
+}
+
+u64 StageProgramKey(const MemStageShadowEngine& copy) {
+    return ProgramKey(copy);
+}
 
 void ReadSwitch() {
     const char* const value = std::getenv("FRITCHII_MEMSTAGE_SHADOW");
@@ -1941,6 +2205,11 @@ void Before(u64 position) {
 }
 
 void BackDraw(Maxwell3D& maxwell3d, bool indexed, u32 instances, bool indirect) {
+    if (MemoryStageLink::RingActive() && GpuSplit::OnBackThread()) [[unlikely]] {
+        // 6b: every draw counts (the packets' sequence numbers).
+        MemoryStageLink::Get().NoteBackDraw(&maxwell3d);
+        return;
+    }
     if (!t_on_back) {
         return;
     }
@@ -2251,6 +2520,10 @@ MemStageShadowEngine* BackFill(Maxwell3D& maxwell3d, bool indirect) {
 }
 
 void BackDrawStateWritten() {
+    if (MemoryStageLink::RingActive() && GpuSplit::OnBackThread()) [[unlikely]] {
+        MemoryStageLink::Get().NoteBackDrawState(reinterpret_cast<const void*>(1));
+        return;
+    }
     if (!t_on_back) {
         return;
     }
@@ -2325,6 +2598,51 @@ void SetWatchFilter(const PageFilter* filter) {
 void MemStageShadowEngine::StageDraw(bool indexed, u32 instance_count, bool indirect) {
     namespace Shadow = MemStageShadow;
     Shadow::State& s = Shadow::S();
+    if (s.ring) {
+        // 6b (memstage_shadow.cpp's header): serve the draw, or make its entry hard.
+        MemoryStageLink& link = MemoryStageLink::Get();
+        const u64 seq = ++s.ring_seq;
+        ++s.entry_draws;
+        if (!execute_on) {
+            return; // the back skips it too (DrawManager's render-enable test), and asks for nothing
+        }
+        if (s.ring_in_run) {
+            return; // the back fills it in the run
+        }
+        if (s.entry_hard) {
+            link.NoteLevelDraw(static_cast<u32>(Shadow::RingLevel::Late));
+            return;
+        }
+        const auto level = [&](Shadow::RingLevel kind) {
+            link.NoteLevelDraw(static_cast<u32>(kind));
+            Shadow::Hard(s, Shadow::LevelType::LevelDraw, static_cast<u64>(kind));
+        };
+        if (indirect) {
+            return level(Shadow::RingLevel::Indirect);
+        }
+        if (!indexed && Tegra::Nx2IndirectGrid::AnyLive() &&
+            Tegra::Nx2IndirectGrid::LooksLikeDrawPlaceholder(
+                draw_manager.draw_state.vertex_buffer.count)) {
+            return level(Shadow::RingLevel::GpuCount);
+        }
+        if (Shadow::g_ring_level_draws.load(std::memory_order_relaxed)) {
+            return level(Shadow::RingLevel::Forced);
+        }
+        const auto& backend = link.Backend();
+        const u64 hash = MemoryStageLink::RingVerify() ? Shadow::StateHash(*this, back) : 0;
+        if (backend.fill_draw == nullptr ||
+            !backend.fill_draw(backend.context, *this, indexed, s.processing_position, seq, hash,
+                               s.ring_ranges)) {
+            // fill_draw counted the kind (facts miss, texel buffers, no room).
+            Shadow::Hard(s, Shadow::LevelType::LevelDraw, 4);
+            return;
+        }
+        ++s.entry_served;
+        ++s.counters.served_draws;
+        ++s.ring_packets;
+        static_cast<void>(instance_count);
+        return;
+    }
     Shadow::Record record = Shadow::TakeSpare(s);
     record.position = s.processing_position;
     record.sunk = s.processing_sunk;
