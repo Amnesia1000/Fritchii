@@ -123,6 +123,8 @@ add_library(video_core STATIC
     invalidation_accumulator.h
     memory_manager.cpp
     memory_manager.h
+    memory_stage_link.cpp
+    memory_stage_link.h
     page_filter.h
     pipeline_cache_files.cpp
     pipeline_cache_files.h

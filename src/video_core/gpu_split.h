@@ -728,6 +728,10 @@ public:
     void EndDispatchRecord() {
         recording_dispatch = false;
     }
+    /// GPUMem, around a fill it runs for the back (memory_stage_link.cpp).
+    static void AdoptRecordingDispatch(bool recording) {
+        recording_dispatch = recording;
+    }
     /// Back, while recording: a dispatch starts; the rasterizer recorded all it writes; it ended
     /// (`ran`: it reached the rasterizer, `replaced`: other work ran instead).
     void StartDispatch() {
