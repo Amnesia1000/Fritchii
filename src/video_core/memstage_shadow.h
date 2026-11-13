@@ -175,8 +175,16 @@ void StageTick();
 /// Sets the stage's draw count to `back_seq`; returns what it was.
 u64 StageDrawSeq(u64 back_seq);
 [[nodiscard]] u64 BackStateHash(const Tegra::Engines::Maxwell3D& maxwell3d);
-[[nodiscard]] u64 BackProgramKey(const Tegra::Engines::Maxwell3D& maxwell3d);
-[[nodiscard]] u64 StageProgramKey(const MemStageShadowEngine& copy);
+/// The registers that select the programs (the six pipeline slots, then the program region), as
+/// 8-byte words, and their hash: the facts table's key. The table compares the words on a key
+/// match, so a hash collision is a miss, never another program's facts.
+inline constexpr std::size_t ProgramWordCount = 49;
+struct ProgramId {
+    u64 key{};
+    std::array<u64, ProgramWordCount> words{};
+};
+void BackProgramId(const Tegra::Engines::Maxwell3D& maxwell3d, ProgramId& out);
+void StageProgramId(const MemStageShadowEngine& copy, ProgramId& out);
 
 } // namespace MemStageShadow
 

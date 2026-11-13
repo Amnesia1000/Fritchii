@@ -1963,14 +1963,18 @@ u64 MemStage::DropRingPackets(u64 position) {
     return dropped;
 }
 
-void MemStage::PublishFacts(u64 key, const void* source, const DrawFacts& facts,
+void MemStage::PublishFacts(const ProgramId& id, const void* source, const DrawFacts& facts,
                             bool dynamic_input) {
-    key = key != 0 ? key : 1;
+    const u64 key = id.key != 0 ? id.key : 1;
     // The back's memo (step 7): every write of the table goes through here and updates it, so a
-    // hit means the table holds this source under this key already. No lock then.
+    // hit means the table holds this source under these registers already. No lock then. The
+    // registers are compared too: one key for two programs is a miss, never the other's entry.
     PublishedMemo& memo = published_memo[FactsHash(key) & (MemoSlots - 1)];
     if (memo.key == key && memo.source == source) {
-        return;
+        if (memo.words == id.words) {
+            return;
+        }
+        Link::Note(Link::Check::FactsKeyCollision, "the back's facts memo");
     }
     constexpr size_t Mask = FactsSlots - 1;
     const size_t home = FactsHash(key) & Mask;
@@ -1979,8 +1983,13 @@ void MemStage::PublishFacts(u64 key, const void* source, const DrawFacts& facts,
     for (size_t probe = 0, index = home; probe < 16; ++probe, index = (index + 1) & Mask) {
         FactsSlot& slot = facts_table[index];
         if (slot.key == key) {
+            if (slot.words != id.words) {
+                // Another program's registers under the same key: a separate entry.
+                Link::Note(Link::Check::FactsKeyCollision, "the facts table (publish)");
+                continue;
+            }
             if (slot.source == source) {
-                memo = PublishedMemo{key, source};
+                memo = PublishedMemo{key, source, id.words};
                 return; // published already
             }
             target = &slot;
@@ -2024,8 +2033,9 @@ void MemStage::PublishFacts(u64 key, const void* source, const DrawFacts& facts,
         }
         staged.infos = std::move(infos);
     }
-    if (target->key != 0 && target->key != key) {
-        // An entry pushed out of a full probe run: its memo must not say "published" any more.
+    if (target->key != 0 && (target->key != key || target->words != id.words)) {
+        // An entry pushed out of a full probe run: its memo must not say "published" any more
+        // (cleared on the key alone: a memo cleared needlessly costs one locked look).
         PublishedMemo& evicted = published_memo[FactsHash(target->key) & (MemoSlots - 1)];
         if (evicted.key == target->key) {
             evicted = PublishedMemo{};
@@ -2033,13 +2043,14 @@ void MemStage::PublishFacts(u64 key, const void* source, const DrawFacts& facts,
     }
     target->key = key;
     target->source = source;
+    target->words = id.words;
     target->facts = std::move(staged);
-    memo = PublishedMemo{key, source};
+    memo = PublishedMemo{key, source, id.words};
     facts_generation.fetch_add(1, std::memory_order_release);
 }
 
-bool MemStage::LookupFacts(u64 key, StagedFacts& out) const {
-    key = key != 0 ? key : 1;
+bool MemStage::LookupFacts(const ProgramId& id, StagedFacts& out) const {
+    const u64 key = id.key != 0 ? id.key : 1;
     // GPUMem's cache (step 7): valid while no write happened since it was filled. A write right
     // after this test is one the lookup could have missed under the lock too (the back publishes
     // at its own, earlier, position).
@@ -2050,10 +2061,15 @@ bool MemStage::LookupFacts(u64 key, StagedFacts& out) const {
         }
         stage_facts_generation = generation;
     }
+    // Entries match on the key and the registers it hashes: one key for two programs is a miss
+    // (counted, must be 0 in practice), never the other program's facts.
     StageFactsSlot& cached = stage_facts_cache[FactsHash(key) & (StageFactsSlots - 1)];
     if (cached.key == key) {
-        out = cached.facts;
-        return true;
+        if (cached.words == id.words) {
+            out = cached.facts;
+            return true;
+        }
+        Link::Note(Link::Check::FactsKeyCollision, "GPUMem's facts cache");
     }
     constexpr size_t Mask = FactsSlots - 1;
     const size_t home = FactsHash(key) & Mask;
@@ -2061,10 +2077,15 @@ bool MemStage::LookupFacts(u64 key, StagedFacts& out) const {
     for (size_t probe = 0, index = home; probe < 16; ++probe, index = (index + 1) & Mask) {
         const FactsSlot& slot = facts_table[index];
         if (slot.key == key) {
+            if (slot.words != id.words) {
+                Link::Note(Link::Check::FactsKeyCollision, "the facts table (lookup)");
+                continue;
+            }
             out = slot.facts;
             if (facts_generation.load(std::memory_order_relaxed) == generation) {
                 // Kept only when the table is still the generation the cache stands for.
                 cached.key = key;
+                cached.words = id.words;
                 cached.facts = slot.facts;
             }
             return true;
@@ -2213,6 +2234,7 @@ void MemStage::PlayRest() {
         return;
     }
     PlayHeldTo(held_arena.Size(), true);
+    const Profile::FineScope tail_scope{Profile::Zone::RestTail};
     held = HeldKind::None;
     held_ring = false;
     t_holding = false;

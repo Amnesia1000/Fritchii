@@ -58,6 +58,7 @@ public:
         ServedAheadJoin,
         FutureWriteUnderImage,
         ServedOverStageWrite,
+        FactsKeyCollision,
         Count,
     };
 

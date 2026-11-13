@@ -300,6 +300,7 @@ constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::Check::Co
     "a served download over GPU-written data in a buffer a packet ahead of the back joined",
     "an image registered over a constant buffer write GPUMem made for a later entry",
     "a served download over a constant buffer write GPUMem made for a later entry",
+    "facts key collisions (one program key for two programs' registers: told apart, a miss)",
 };
 constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::LevelReason::Count)>
     LEVEL_REASON_NAMES{"full copy", "writing draw", "ranges over GPU-written data"};

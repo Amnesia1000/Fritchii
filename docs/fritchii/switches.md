@@ -583,8 +583,10 @@ session after a catch-up could not finish (below; logged).
   clears it with one thread, and with each send). With EDEN_NX2_GPU_PROFILE=2 GPUMem's
   profile splits its entry loop into "stage entries" and, inside it, "stage cb words"; the back's
   "draw" splits off "ring take" (the packet's take from ring B) with "ring take copy" inside it
-  (its bytes copied out), "draw locks" (inside "draw setup") and "draw after configure" (the
-  trackers, traces and dumps between Configure and dynamic state).
+  (its bytes copied out), "draw locks" and "ring facts" (inside "draw setup": the caches' locks,
+  and the facts published under the stage's program key), "draw after configure" (the
+  trackers, traces and dumps between Configure and dynamic state) and "rest tail" (PlayRest after
+  its play: the held flags, the ticks mark, the watch count).
 - The second fps fixes (window open only): GPUMem's wait for the front spins about 200 us before
   it sleeps (level mode keeps about 2,000 pauses; the link line's "slept n/s" adds how many of
   those sleeps waited for the front); the back prefetches the first 1 KiB of the next packet in
@@ -623,7 +625,10 @@ session after a catch-up could not finish (below; logged).
   registered over a constant buffer write GPUMem made for a later entry" (spec 9.1); "a served
   download over a constant buffer write GPUMem made for a later entry" (on GPU-written bytes). The
   last two need GPUMem's own-write ring, which runs only with the verify on (READ_LOG or
-  RING_VERIFY), so the fps gate measures play without it.
+  RING_VERIFY), so the fps gate measures play without it. Also "facts key collisions" (any ring
+  mode): the facts table's key is a hash of the program registers (the six pipeline slots and the
+  program region), and every entry keeps those registers and compares them on a key match, so
+  two programs under one key are told apart (a miss, the draw is level), never mixed up.
 - EXP104 (the buffer pool, spec 7.5): with the window open GPUMem creates and destroys buffers while
   the back records, so the gate's area load should run with EXP104 on and off (or watch its hitch
   lines). GPUMem has no role in thread_pinning.h: the gate runs it unpinned, and the pinning choice

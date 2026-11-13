@@ -119,6 +119,7 @@
 //   copies of the copies an unfollowed entry left stale. The back is parked at both moments.
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <chrono>
 #include <cstring>
@@ -606,10 +607,65 @@ std::string WordName(const SegmentInfo& info, u32 index) {
 
 /// The stage's program key for the facts table: what selects the programs, as the stage sees it
 /// (the program region and every pipeline slot's registers, native addresses included).
+/// Step 7: an xxh64-style hash of 8-byte words (four lanes, xxh64's round, merge and
+/// avalanche). The byte loop was 392 dependent multiplies, about 0.4 us for every served draw on
+/// the back (its facts publish) and again for every fill on GPUMem; both sides use this one
+/// function, so their keys stay equal. The round's rotate brings high bits down, so differences
+/// in the top bits of words do not cancel (a plain xor-multiply lane lost them).
+// ProgramWordCount (memstage_shadow.h): the six pipeline slots (48 words), then the region.
+template <typename E>
+void ProgramWords(const E& e, std::array<u64, ProgramWordCount>& words) {
+    static_assert(sizeof(e.regs.pipelines) == 48 * sizeof(u64));
+    static_assert(sizeof(e.regs.program_region) == sizeof(u64));
+    std::memcpy(words.data(), &e.regs.pipelines, sizeof(e.regs.pipelines));
+    std::memcpy(words.data() + 48, &e.regs.program_region, sizeof(u64));
+}
+
+constexpr u64 XxhPrime1 = 0x9E3779B185EBCA87ULL;
+constexpr u64 XxhPrime2 = 0xC2B2AE3D27D4EB4FULL;
+constexpr u64 XxhPrime3 = 0x165667B19E3779F9ULL;
+constexpr u64 XxhPrime4 = 0x85EBCA77C2B2AE63ULL;
+
+constexpr u64 XxhRound(u64 acc, u64 input) {
+    acc += input * XxhPrime2;
+    acc = std::rotl(acc, 31);
+    return acc * XxhPrime1;
+}
+
+constexpr u64 XxhMerge(u64 acc, u64 value) {
+    acc ^= XxhRound(0, value);
+    return acc * XxhPrime1 + XxhPrime4;
+}
+
+u64 HashProgramWords(const std::array<u64, ProgramWordCount>& words) {
+    std::array<u64, 4> lanes{XxhPrime1 + XxhPrime2, XxhPrime2, 0, 0 - XxhPrime1};
+    for (size_t i = 0; i < 48; i += 4) {
+        for (size_t lane = 0; lane < 4; ++lane) {
+            lanes[lane] = XxhRound(lanes[lane], words[i + lane]);
+        }
+    }
+    u64 hash = std::rotl(lanes[0], 1) + std::rotl(lanes[1], 7) + std::rotl(lanes[2], 12) +
+               std::rotl(lanes[3], 18);
+    for (const u64 lane : lanes) {
+        hash = XxhMerge(hash, lane);
+    }
+    hash += ProgramWordCount * sizeof(u64);
+    // The last word (the program region), as xxh64's 8-byte tail; then its avalanche.
+    hash ^= XxhRound(0, words[48]);
+    hash = std::rotl(hash, 27) * XxhPrime1 + XxhPrime4;
+    hash ^= hash >> 33;
+    hash *= XxhPrime2;
+    hash ^= hash >> 29;
+    hash *= XxhPrime3;
+    hash ^= hash >> 32;
+    return hash;
+}
+
 template <typename E>
 u64 ProgramKey(const E& e) {
-    u64 hash = HashBytes(&e.regs.program_region, sizeof(e.regs.program_region));
-    return HashBytes(&e.regs.pipelines, sizeof(e.regs.pipelines), hash);
+    std::array<u64, ProgramWordCount> words;
+    ProgramWords(e, words);
+    return HashProgramWords(words);
 }
 
 /// One draw the shadow issued, waiting for the back's.
@@ -2230,12 +2286,14 @@ u64 BackStateHash(const Maxwell3D& maxwell3d) {
     return StateHash(maxwell3d, &maxwell3d);
 }
 
-u64 BackProgramKey(const Maxwell3D& maxwell3d) {
-    return ProgramKey(maxwell3d);
+void BackProgramId(const Maxwell3D& maxwell3d, ProgramId& out) {
+    ProgramWords(maxwell3d, out.words);
+    out.key = HashProgramWords(out.words);
 }
 
-u64 StageProgramKey(const MemStageShadowEngine& copy) {
-    return ProgramKey(copy);
+void StageProgramId(const MemStageShadowEngine& copy, ProgramId& out) {
+    ProgramWords(copy, out.words);
+    out.key = HashProgramWords(out.words);
 }
 
 void ReadSwitch() {

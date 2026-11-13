@@ -22,6 +22,7 @@
 #include "common/common_types.h"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/buffer_cache/mem_read_log.h"
+#include "video_core/memstage_shadow.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_mem_stage_hook.h"
@@ -523,8 +524,11 @@ public:
     /// The back: the barrier after a ring packet's uploads (Configure's any_buffer_uploaded).
     void PlayPostCopyBarrier();
     /// The back publishes a pipeline's facts under the stage's program key; GPUMem looks them up.
-    void PublishFacts(u64 key, const void* source, const DrawFacts& facts, bool dynamic_input);
-    [[nodiscard]] bool LookupFacts(u64 key, StagedFacts& out) const;
+    /// Entries match on the key and the registers it hashes (a key collision is a miss).
+    using ProgramId = VideoCommon::MemStageShadow::ProgramId;
+    void PublishFacts(const ProgramId& id, const void* source, const DrawFacts& facts,
+                      bool dynamic_input);
+    [[nodiscard]] bool LookupFacts(const ProgramId& id, StagedFacts& out) const;
     [[nodiscard]] const DispatchPacket* HeldDispatch() const noexcept {
         return held == HeldKind::Dispatch ? &dispatch : nullptr;
     }
@@ -1022,9 +1026,11 @@ private:
     [[nodiscard]] u64 RingOldestNumber();
 
     // The facts table (spec 4.4): open addressing under a lock (written rarely, by the back).
+    using ProgramWords = std::array<u64, VideoCommon::MemStageShadow::ProgramWordCount>;
     struct FactsSlot {
         u64 key{};
         const void* source{};
+        ProgramWords words{};
         StagedFacts facts{};
     };
     static constexpr size_t FactsSlots = 4096;
@@ -1037,12 +1043,14 @@ private:
     struct PublishedMemo {
         u64 key{};
         const void* source{};
+        ProgramWords words{};
     };
     static constexpr size_t MemoSlots = 1024;
     std::unique_ptr<PublishedMemo[]> published_memo;
     /// GPUMem's: the entries it looked up, valid while the generation it saw holds.
     struct StageFactsSlot {
         u64 key{};
+        ProgramWords words{};
         StagedFacts facts{};
     };
     static constexpr size_t StageFactsSlots = 512;
