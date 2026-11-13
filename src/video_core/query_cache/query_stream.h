@@ -35,6 +35,18 @@ public:
         /* Do Nothing */
     }
 
+    /// EXP119 (fritchii_report_runs.h): ResetCounter without queuing its amend reset, which the
+    /// caller queues in a report run instead (ResetAmend). False: not split, nothing done.
+    virtual bool ResetCounterWithoutOperation() {
+        return false;
+    }
+
+    /// The operation ResetCounter queues (EXP119 runs it from a report run).
+    void ResetAmend() {
+        amend_value = 0;
+        accumulation_value = 0;
+    }
+
     virtual void CloseCounter() {
         /* Do Nothing */
     }

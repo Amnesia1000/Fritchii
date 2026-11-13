@@ -90,6 +90,26 @@ public:
     /// Send an operation to be done after a certain amount of flushes.
     virtual void SyncOperation(std::function<void()>&& func) = 0;
 
+    /// EXP119 (fritchii_report_runs.h): as SyncOperation, and returns a stamp that names this
+    /// operation as the last one queued. 0: not supported (the operation was still queued).
+    virtual u64 SyncOperationStamped(std::function<void()>&& func) {
+        SyncOperation(std::move(func));
+        return 0;
+    }
+
+    /// EXP119: runs append(context) under the operation list's lock, only while the operation
+    /// `stamp` names is still the last one queued and not taken by a fence. False: nothing ran.
+    virtual bool AppendToLastOperation([[maybe_unused]] u64 stamp,
+                                       [[maybe_unused]] void (*append)(void*),
+                                       [[maybe_unused]] void* context) {
+        return false;
+    }
+
+    /// EXP119=2: as SyncOperation, but the stamp of the last queued operation stays valid.
+    virtual void SyncOperationKeepStamp(std::function<void()>&& func) {
+        SyncOperation(std::move(func));
+    }
+
     /// Signal a GPU based syncpoint as a fence
     virtual void SignalSyncPoint(u32 value) = 0;
 
