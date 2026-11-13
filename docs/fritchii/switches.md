@@ -355,6 +355,15 @@ fable_memstage_step2_spec.md 7.2): what the buffer cache side's stamps are.
   carried skipped, split (a number handed out in two ticks without a carry), unchecked
   (older than the 2^18-number ring) and epoch off. Early, late, split, epoch off and held
   must all read 0. Disagreements log the first 16 lines with the packet and both ticks.
+- With FRITCHII_MEMSTAGE_AHEAD (the window open, the ring running) each thread stamps with its
+  own packet instead of the newest number anyone opened: GPUMem with the draw it fills or the
+  operation it runs (under its mark), the back with the packet it holds or fills and after it
+  the last one while not published. The check then also counts "stamps on a number already
+  published" (must be 0: such a use would be freed early), "splits that raced the tick advance"
+  (a split by one tick of a number above what the closing tick's close saw: a stamp taken on the
+  other thread between a close and the tick's advance; reported) and GPUMem's "epoch reads
+  racing a close" (reported). Carried ranges are kept until older than the stamp ring. Late is
+  a warning with two threads (it is the conservative side).
 
 ### FRITCHII_MEMSTAGE_SHADOW
 
