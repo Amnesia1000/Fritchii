@@ -50,7 +50,44 @@
 //        ranges, storage and table addresses, compute pointers, the inline page write). At the
 //        old read position (the packet's first play; an operation's end) the bytes and values are
 //        read again and compared, and each bound range is asked whether the CPU wrote it since.
-//        Differences are counted by kind, the first 16 logged. Must be 0.
+//        Differences are counted by kind. Game threads write those pages all the time, so the
+//        gate is "0 unexplained" (fable_memstage_readlog1.md, step 6 spec 10): every difference
+//        gets a class and a place, the first 16 of each class are logged with all of it.
+//   Who wrote (the read log's classes). From boot with READ_LOG, every write emulator code makes
+//        to game memory, on any thread, goes to Common::WriteRing (fritchii_write_ring.h), one
+//        ring of 4,096 {device address, size, site, context, write function, thread name,
+//        sequence}, after its bytes landed. The write functions that note: DeviceMemoryManager
+//        Write, WriteBlock, WriteBlockUnsafe and its in-place span stores (NoteHostStore);
+//        Tegra::MemoryManager Write, WriteBlock(Unsafe/Cached) and WriteWordsCached (through
+//        WriteBlockImpl), WriteConstantBufferData, its span stores (CopyBlock, the engines'
+//        scoped writes); the GPU write listener (query completions, immediate and semi-flush
+//        reports, the 3D stamps, compute and QMD releases); the run-ahead front's release words;
+//        Core::Memory's unsafe writes (services storing past the write trap). The sites that name
+//        them (SiteScope; innermost names the site, outermost the context; "landing" = GPU bytes
+//        written back): buffer downloads (WriteDownloadedMemory in DownloadMemory,
+//        DownloadMemoryForRead, DownloadBuffersMemory, PopAsyncBuffers, WriteReadDownloads,
+//        Nx2FlushListPages), texture downloads (SwizzleImage in DownloadMemory, PopAsyncFlushes,
+//        the garbage collector), EXP121's LandCollectDownloads: landings; the buffer cache's DMA
+//        copy, the DMA engine, inline uploads (engine upload, AccelerateInlineToMemory), the 3D
+//        constant buffer data, the software blit, the VIC's output: not landings.
+//        At a difference (ClassifyDiff):
+//        A  an entry newer than the fill over the changed bytes names the writer: "emulator
+//           write, download landing" or "emulator write" (by site on the stats line).
+//        B  none: GPU::ForEachPendingCpuWrite over the changed bytes. A pending game-side mark is
+//           "game write, marked" (applied at the next gather); none is "game write, mark already
+//           taken" (the store landed after its mark was gathered: core\memory.cpp marks before
+//           the store).
+//        D  a bound range (the tracker says CPU-written): if this thread applied a gather since
+//           the fill (OnCacheInvalidations; FlushRegion gathers first), "gather on the back inside
+//           Configure", with the first gather's stack; else the tracker was marked directly by a
+//           trapped game store ("game write, marked").
+//        C  the place: an upload's changed bytes outside every bound range, uniform and value the
+//           packet read are "over-read" (the cache uploaded the page, the draw does not use them);
+//           everything else is "own data".
+//        Unclassified: unmapped, no GPU, or the ring wrapped since the fill.
+//        The gate line: unexplained = emulator writes that are not landings + unclassified;
+//        "mark already taken" and "own data changed" are reported apart, not failures.
+//        Off (no READ_LOG) every hook is one relaxed load and a branch.
 //   The held descriptors' form is compared with the queue's after Acquire. Must be 0.
 // The zones "memory fill" (fills at SEAM = 2, with what the cache does inside them) and "memory
 // play" (the plays at SEAM = 2) go to EDEN_NX2_GPU_PROFILE: "memory fill" ms/s is what leaves the
@@ -105,6 +142,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -114,9 +152,18 @@
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h> // RtlCaptureStackBackTrace (the read log's gather callers)
+#endif
+
 #include "common/assert.h"
+#include "common/fritchii_write_ring.h"
 #include "common/logging.h"
 #include "video_core/buffer_cache/buffer_cache_base.h"
+#include "video_core/gpu.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_debug_control.h"
@@ -143,6 +190,11 @@ thread_local bool t_holding = false;
 
 /// Per packet, the bytes the read log copies or reads again at the compare.
 constexpr u64 READ_LOG_BUDGET = 1ULL << 20;
+
+/// The read log's test D: gathers of game writes applied and FlushRegion calls on this thread
+/// (counted only while the read log runs).
+thread_local u64 t_gathers = 0;
+thread_local u64 t_flush_regions = 0;
 
 namespace Profile = VideoCommon::Nx2Profile;
 
@@ -251,6 +303,12 @@ constexpr std::array<const char*, static_cast<size_t>(VideoCommon::MemReadLog::K
         "storage size",     "table address",  "compute pointer",     "inline page write",
         "handle program word", "handle program storage base", "handle program storage word",
 };
+constexpr std::array<const char*, static_cast<size_t>(MemStage::DiffClass::Count)>
+    DIFF_CLASS_NAMES{
+        "emulator write, download landing", "emulator write",
+        "game write, marked",               "game write, mark already taken",
+        "gather on the back inside Configure", "unclassified",
+    };
 constexpr std::array<const char*, static_cast<size_t>(MemStage::Sync::Count)> SYNC_NAMES{
     "finish", "wait", "submit for host read", "multi-range", "kept words",
 };
@@ -481,6 +539,11 @@ MemStage::MemStage(MemPlayer& player_)
     if (const char* const value = std::getenv("FRITCHII_MEMSTAGE_READ_LOG")) {
         read_log_every = (std::max)(0, std::atoi(value));
     }
+    if (read_log_every > 0) {
+        // The read log's classes: every emulator write to game memory goes to the ring from now.
+        Common::WriteRing::g_on.store(true, std::memory_order_relaxed);
+        ring_owner = true;
+    }
     if (const u32 mode = TicksMode(); mode != 0) {
         ticks = std::make_unique<SeamTicks>(player.scheduler.GetMasterSemaphore(), mode == 2);
         LOG_INFO(Render_Vulkan, "Memory seam: packet ticks (FRITCHII_MEMSTAGE_TICKS={}){}", mode,
@@ -505,10 +568,17 @@ MemStage::~MemStage() {
     }
     VideoCommon::MemReadLog::g_on.store(false, std::memory_order_relaxed);
     VideoCommon::MemReadLog::g_held.store(false, std::memory_order_relaxed);
+    if (ring_owner) {
+        Common::WriteRing::g_on.store(false, std::memory_order_relaxed);
+    }
 }
 
 void MemStage::Attach(Cache& cache_) noexcept {
     cache = &cache_;
+}
+
+void MemStage::AttachGpu(Tegra::GPU& gpu_) noexcept {
+    gpu = &gpu_;
 }
 
 bool MemStage::OwnedHere() const noexcept {
@@ -1214,12 +1284,18 @@ bool MemStage::StartReadLog(ReadLog& log, u64 number) {
         return false;
     }
     log.Clear();
+    log.ring_seq = Common::WriteRing::Sequence();
     t_log = &log;
     return true;
 }
 
 void MemStage::StopReadLog(ReadLog& log, bool held_packet) {
     t_log = nullptr;
+    log.gathers = t_gathers;
+    log.flush_regions = t_flush_regions;
+    if (held_packet) {
+        gather_frame_count = 0;
+    }
     for (ReadRecord& record : log.records) {
         if (record.how != ReadRecord::How::Range) {
             continue;
@@ -1239,7 +1315,11 @@ void MemStage::StopReadLog(ReadLog& log, bool held_packet) {
 void MemStage::CompareReads(ReadLog& log, const char* what, u64 number, u64 hash_a, u64 hash_b) {
     using How = ReadRecord::How;
     for (const ReadRecord& record : log.records) {
+        Bump(counters.read_kind_records[static_cast<size_t>(record.kind)]);
         bool differs = false;
+        // The first and last byte that differ, from the record's address.
+        u64 first = 0;
+        u64 last = record.size != 0 ? record.size - 1 : 0;
         switch (record.how) {
         case How::Bytes:
         case How::Staged: {
@@ -1250,6 +1330,14 @@ void MemStage::CompareReads(ReadLog& log, const char* what, u64 number, u64 hash
                                            ? log.bytes.data() + record.value
                                            : static_cast<const u8*>(record.data);
             differs = std::memcmp(compare_scratch.data(), expected, record.size) != 0;
+            if (differs) {
+                while (compare_scratch[first] == expected[first]) {
+                    ++first;
+                }
+                while (compare_scratch[last] == expected[last]) {
+                    --last;
+                }
+            }
             break;
         }
         case How::Value: {
@@ -1257,6 +1345,12 @@ void MemStage::CompareReads(ReadLog& log, const char* what, u64 number, u64 hash
             const u64 now = record.size == 4 ? u64{memory->Read<u32>(record.address)}
                                              : memory->Read<u64>(record.address);
             differs = now != record.value;
+            if (differs) {
+                // Little endian: the lowest changed bit's byte is the first.
+                const u64 changed = now ^ record.value;
+                first = static_cast<u64>(std::countr_zero(changed)) / 8;
+                last = static_cast<u64>(63 - std::countl_zero(changed)) / 8;
+            }
             break;
         }
         case How::Range:
@@ -1268,18 +1362,203 @@ void MemStage::CompareReads(ReadLog& log, const char* what, u64 number, u64 hash
             continue;
         }
         Bump(counters.read_diffs[static_cast<size_t>(record.kind)]);
-        if (diffs_logged.fetch_add(1, std::memory_order_relaxed) < 16) {
-            LOG_WARNING(Render_Vulkan,
-                        "Memory seam (5.3): {} {} read {} at {:#x}+{:#x}: game memory changed "
-                        "between the fill and the old read position (programs {:016x} {:016x})",
-                        what, number, READ_KIND_NAMES[static_cast<size_t>(record.kind)],
-                        record.address, record.size, hash_a, hash_b);
-        }
+        ClassifyDiff(log, record, first, last, what, number, hash_a, hash_b);
     }
     Bump(counters.read_packets);
     Bump(counters.read_records, log.records.size());
     Bump(counters.read_skipped, log.skipped);
     log.Clear();
+}
+
+// Every difference gets a class (A, B, D) and a place (C); see "Who wrote" at the top.
+void MemStage::ClassifyDiff(const ReadLog& log, const ReadRecord& record, u64 first, u64 last,
+                            const char* what, u64 number, u64 hash_a, u64 hash_b) {
+    using How = ReadRecord::How;
+    using Kind = VideoCommon::MemReadLog::Kind;
+    // The changed bytes as a device range (a value is read by GPU address).
+    std::optional<u64> device;
+    if (record.how == How::Value) {
+        if (const auto* const memory = static_cast<const Tegra::MemoryManager*>(record.memory)) {
+            device = memory->GpuToCpuAddress(record.address + first);
+        }
+    } else {
+        device = record.address + first;
+    }
+    const u64 length = last - first + 1;
+    const u64 begin = device.value_or(0);
+    const u64 end = begin + length;
+    const auto overlaps = [begin, end](u64 address, u64 size) {
+        return address < end && begin < address + size;
+    };
+
+    // C: an upload covers whole tracked words; the packet uses only its bound ranges, uniforms
+    // and values. Every other read is the packet's own data by what it is.
+    bool own = true;
+    if (record.kind == Kind::Upload && device) {
+        own = std::any_of(log.used.begin(), log.used.end(), [&](const std::pair<u64, u64>& used) {
+            return overlaps(used.first, used.second);
+        });
+    }
+
+    // A: an emulator write noted after the fill began.
+    Common::WriteRing::Entry writer{};
+    bool found = false;
+    bool complete = true;
+    if (device) {
+        complete = Common::WriteRing::ForEachSince(
+            log.ring_seq, [&](const Common::WriteRing::Entry& entry) {
+                if (overlaps(entry.address, entry.size)) {
+                    writer = entry;
+                    found = true;
+                    return true;
+                }
+                return false;
+            });
+        if (!complete) {
+            Bump(counters.ring_wrapped);
+        }
+    }
+
+    // B: a game-side mark over the changed bytes not applied yet.
+    bool asked = false;
+    bool pending = false;
+    if (device && gpu != nullptr) {
+        asked = true;
+        gpu->ForEachPendingCpuWrite([&](DAddr address, size_t size) {
+            pending = pending || overlaps(address, size);
+        });
+    }
+
+    // D: gathers on this thread since the fill ended (a held packet; an operation compares at
+    // once, they never move there).
+    const u64 gathers = t_gathers - log.gathers;
+    const u64 flush_regions = t_flush_regions - log.flush_regions;
+
+    DiffClass kind;
+    if (record.how == How::Range && gathers != 0) {
+        kind = DiffClass::BackGather;
+    } else if (found) {
+        kind = writer.landing ? DiffClass::Landing : DiffClass::EmulatorWrite;
+    } else if (!device || !complete || !asked) {
+        kind = DiffClass::Unclassified;
+    } else if (record.how == How::Range) {
+        // The tracker holds the mark: a game core's trapped store marked it directly.
+        kind = DiffClass::GameMarked;
+    } else {
+        kind = pending ? DiffClass::GameMarked : DiffClass::MarkTaken;
+    }
+    const size_t index = static_cast<size_t>(kind);
+    Bump(counters.diff_classes[index]);
+    Bump(own ? counters.diff_own : counters.diff_over);
+    if (found && (kind == DiffClass::Landing || kind == DiffClass::EmulatorWrite)) {
+        CountDiffSite(writer.site != nullptr ? writer.site : writer.via, writer.landing);
+    }
+    if (class_logged[index].fetch_add(1, std::memory_order_relaxed) >= 16) {
+        return;
+    }
+    std::string who;
+    if (found) {
+        who = fmt::format("; written by {}{}{} via {} on {}, {} ring entries after the fill began",
+                          writer.site != nullptr ? writer.site : "an unscoped site",
+                          writer.context != nullptr && writer.context != writer.site
+                              ? fmt::format(" (in {})", writer.context)
+                              : std::string{},
+                          writer.landing ? ", a landing" : "", writer.via,
+                          writer.thread[0] != '\0' ? writer.thread.data() : "an unnamed thread",
+                          writer.seq - log.ring_seq);
+    } else if (device) {
+        who = complete ? "; no emulator write in the ring" : "; the ring wrapped since the fill";
+    }
+    const std::string mark = asked ? (pending ? "; a game-side mark is pending over them"
+                                              : "; no game-side mark pending over them")
+                                   : "; marks not asked (no GPU or unmapped)";
+    std::string back;
+    if (record.how == How::Range || gathers != 0 || flush_regions != 0) {
+        back = fmt::format("; this thread since the fill: {} gathers applied, {} FlushRegion{}",
+                           gathers, flush_regions,
+                           kind == DiffClass::BackGather && gather_frame_count != 0
+                               ? fmt::format("; first gather from:{}", GatherFrames())
+                               : std::string{});
+    }
+    LOG_WARNING(Render_Vulkan,
+                "Memory seam (5.3) {}: {} {} read {} at {:#x}+{:#x}, bytes +{:#x}..+{:#x} changed "
+                "(device {}), {}{}{}{} (programs {:016x} {:016x})",
+                DIFF_CLASS_NAMES[index], what, number,
+                READ_KIND_NAMES[static_cast<size_t>(record.kind)], record.address, record.size,
+                first, last,
+                device ? fmt::format("{:#x}+{:#x}", *device, length) : std::string{"unmapped"},
+                own ? "the packet's own data" : "over-read (outside every range the packet uses)",
+                who, mark, back, hash_a, hash_b);
+}
+
+void MemStage::CountDiffSite(const char* name, bool landing) {
+    std::scoped_lock lock{diff_sites_mutex};
+    for (DiffSite& site : diff_site_table) {
+        const char* const known = site.name.load(std::memory_order_relaxed);
+        if (known == nullptr) {
+            site.landing.store(landing, std::memory_order_relaxed);
+            site.count.store(1, std::memory_order_relaxed);
+            site.name.store(name, std::memory_order_release);
+            return;
+        }
+        if (site.landing.load(std::memory_order_relaxed) == landing &&
+            std::strcmp(known, name) == 0) {
+            Bump(site.count);
+            return;
+        }
+    }
+    Bump(counters.diff_sites_other);
+}
+
+void MemStage::NoteGather(Gather kind, u32 which) {
+    if (kind == Gather::Apply) {
+        ++t_gathers;
+    } else {
+        ++t_flush_regions;
+    }
+    if (!t_holding) {
+        return;
+    }
+    if (kind == Gather::FlushRegion) {
+        for (u32 bit = 0; bit < 3; ++bit) {
+            if ((which & (1U << bit)) != 0) {
+                Bump(counters.flush_regions_held[bit]);
+            }
+        }
+        return;
+    }
+    Bump(counters.gathers_held);
+    if (held_log_pending && gather_frame_count == 0) {
+#ifdef _WIN32
+        gather_frame_count = RtlCaptureStackBackTrace(
+            1, static_cast<ULONG>(gather_frames.size()), gather_frames.data(), nullptr);
+#else
+        gather_frames[0] = __builtin_return_address(0);
+        gather_frame_count = 1;
+#endif
+    }
+}
+
+std::string MemStage::GatherFrames() const {
+    std::string text;
+    for (u32 i = 0; i < gather_frame_count; ++i) {
+#ifdef _WIN32
+        HMODULE module{};
+        char name[MAX_PATH] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               static_cast<LPCSTR>(gather_frames[i]), &module)) {
+            GetModuleFileNameA(module, name, sizeof(name));
+        }
+        const char* const base_name = std::strrchr(name, '\\');
+        text += fmt::format(" {}+{:#x}", base_name != nullptr ? base_name + 1 : name,
+                            reinterpret_cast<uintptr_t>(gather_frames[i]) -
+                                reinterpret_cast<uintptr_t>(module));
+#else
+        text += fmt::format(" {}", gather_frames[i]);
+#endif
+    }
+    return text;
 }
 
 void MemStage::CountPush(Cmd kind) noexcept {
@@ -1645,11 +1924,62 @@ void MemStage::LogStats() {
                                    : 0.0,
                  static_cast<double>(delta(&Counts::play_ns)) / 1e6 / seconds);
         if (read_log_every > 0) {
+            std::string compared;
+            for (size_t i = 0; i < READ_KIND_NAMES.size(); ++i) {
+                if (const u64 n = current.read_kind_records[i] - reported.read_kind_records[i];
+                    n != 0) {
+                    compared += fmt::format("{}{} {}", compared.empty() ? "" : ", ",
+                                            READ_KIND_NAMES[i], n);
+                }
+            }
             LOG_INFO(Render_Vulkan,
                      "  memory seam read log (FRITCHII_MEMSTAGE_READ_LOG={}): {} packets, {} reads "
-                     "compared, {} not logged (budget); differences (5.3) {}{}{}",
+                     "compared{}{}{}, {} not logged (budget); differences (5.3) {}{}{}",
                      read_log_every, delta(&Counts::read_packets), delta(&Counts::read_records),
+                     compared.empty() ? "" : " (", compared, compared.empty() ? "" : ")",
                      delta(&Counts::read_skipped), diff_total, diffs.empty() ? "" : ": ", diffs);
+            const auto by_class = [&](DiffClass kind) {
+                const size_t i = static_cast<size_t>(kind);
+                return current.diff_classes[i] - reported.diff_classes[i];
+            };
+            std::string sites;
+            for (size_t i = 0; i < DIFF_SITES; ++i) {
+                const char* const name = diff_site_table[i].name.load(std::memory_order_acquire);
+                if (name == nullptr) {
+                    break;
+                }
+                if (const u64 n = current.diff_sites[i] - reported.diff_sites[i]; n != 0) {
+                    sites += fmt::format(
+                        "{}{} {}{}", sites.empty() ? "" : ", ", name, n,
+                        diff_site_table[i].landing.load(std::memory_order_relaxed) ? " (landing)"
+                                                                                   : "");
+                }
+            }
+            if (const u64 n = delta(&Counts::diff_sites_other); n != 0) {
+                sites += fmt::format("{}other sites {}", sites.empty() ? "" : ", ", n);
+            }
+            const u64 landings = by_class(DiffClass::Landing);
+            const u64 emulator = by_class(DiffClass::EmulatorWrite);
+            const u64 unclassified = by_class(DiffClass::Unclassified);
+            const u64 own = delta(&Counts::diff_own);
+            const u64 taken = by_class(DiffClass::MarkTaken);
+            LOG_INFO(Render_Vulkan,
+                     "  memory seam read log classes: emulator write {}{}{}{}, game write marked "
+                     "{}, game write mark already taken {}, gather on the back inside Configure "
+                     "{}, unclassified {}; over-read {}, own data changed {}; ring wrapped {}; on "
+                     "the holding thread: gathers applied {}, FlushRegion texture {} query {} "
+                     "buffer {}",
+                     landings + emulator, sites.empty() ? "" : " (", sites,
+                     sites.empty() ? "" : ")", by_class(DiffClass::GameMarked), taken,
+                     by_class(DiffClass::BackGather), unclassified, delta(&Counts::diff_over), own,
+                     delta(&Counts::ring_wrapped), delta(&Counts::gathers_held),
+                     current.flush_regions_held[0] - reported.flush_regions_held[0],
+                     current.flush_regions_held[1] - reported.flush_regions_held[1],
+                     current.flush_regions_held[2] - reported.flush_regions_held[2]);
+            LOG_INFO(Render_Vulkan,
+                     "  read log gate: unexplained {} (emulator writes that are not download "
+                     "landings {}, unclassified {}); mark already taken {}; own data changed {}",
+                     emulator + unclassified, emulator, unclassified, taken, own);
         }
     }
     reported = current;
@@ -1695,7 +2025,22 @@ void MemStage::Snapshot(Counts& out) const {
     out.play_ns = counters.play_ns.load(std::memory_order_relaxed);
     for (size_t i = 0; i < out.read_diffs.size(); ++i) {
         out.read_diffs[i] = counters.read_diffs[i].load(std::memory_order_relaxed);
+        out.read_kind_records[i] = counters.read_kind_records[i].load(std::memory_order_relaxed);
     }
+    for (size_t i = 0; i < out.diff_classes.size(); ++i) {
+        out.diff_classes[i] = counters.diff_classes[i].load(std::memory_order_relaxed);
+    }
+    out.diff_own = counters.diff_own.load(std::memory_order_relaxed);
+    out.diff_over = counters.diff_over.load(std::memory_order_relaxed);
+    out.ring_wrapped = counters.ring_wrapped.load(std::memory_order_relaxed);
+    out.gathers_held = counters.gathers_held.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < out.flush_regions_held.size(); ++i) {
+        out.flush_regions_held[i] = counters.flush_regions_held[i].load(std::memory_order_relaxed);
+    }
+    for (size_t i = 0; i < out.diff_sites.size(); ++i) {
+        out.diff_sites[i] = diff_site_table[i].count.load(std::memory_order_relaxed);
+    }
+    out.diff_sites_other = counters.diff_sites_other.load(std::memory_order_relaxed);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2592,6 +2937,8 @@ void NoteBytes(Kind kind, Tegra::MaxwellDeviceMemoryManager& memory, u64 address
     if (log == nullptr || size == 0) {
         return;
     }
+    // Also past the budget: the over-read test needs every range the packet uses.
+    log->used.emplace_back(address, size);
     if (log->budget + size > Vulkan::READ_LOG_BUDGET) {
         ++log->skipped;
         return;
@@ -2645,6 +2992,9 @@ void NoteValue(Kind kind, Tegra::MemoryManager* memory, u64 address, u64 value, 
     if (log == nullptr || memory == nullptr) {
         return;
     }
+    if (const auto device_address = memory->GpuToCpuAddress(address)) {
+        log->used.emplace_back(*device_address, size);
+    }
     log->records.push_back({
         .kind = kind,
         .how = MemStage::ReadRecord::How::Value,
@@ -2662,6 +3012,7 @@ void NoteRange(Kind kind, u64 address, u64 size) {
     if (log == nullptr || size == 0) {
         return;
     }
+    log->used.emplace_back(address, size);
     log->records.push_back({
         .kind = kind,
         .how = MemStage::ReadRecord::How::Range,

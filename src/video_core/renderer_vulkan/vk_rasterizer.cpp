@@ -579,6 +579,7 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
     scheduler.SetQueryCache(query_cache);
     // The memory seam's read log asks this cache's tracker.
     mem_stage.Attach(buffer_cache);
+    mem_stage.AttachGpu(gpu);
     VideoCommon::FritchiiDrawKinds::Init();
     // EDEN_NX2_MEMSTAGE_STATS: stream writes are tested against the texture cache's pages.
     VideoCommon::MemStageStats::SetImagePageFilters(&texture_cache.page_filter,
@@ -3271,6 +3272,9 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType 
     if (addr == 0 || size == 0) {
         return;
     }
+    if (Common::WriteRing::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
+        mem_stage.NoteGather(MemStage::Gather::FlushRegion, static_cast<u32>(which));
+    }
     if (True(which & (VideoCommon::CacheType::TextureCache | VideoCommon::CacheType::BufferCache))) {
         // CPU writes into GPU-written memory are only collected when they happen. Apply them
         // first, or the download writes the stale GPU copy over them: the Yoshi demo writes a
@@ -3971,6 +3975,10 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
 }
 
 void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) {
+    // The memory seam's read log (5.3, test D): gathers applied on this thread.
+    if (Common::WriteRing::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
+        mem_stage.NoteGather(MemStage::Gather::Apply, 0);
+    }
     namespace CbPath = VideoCommon::Nx2CbPath;
     const int cb_path = CbPath::Mode();
     // EXP88 & 1 (fable52_answer_next70 3.1 step 5): the guest's collected writes take each
