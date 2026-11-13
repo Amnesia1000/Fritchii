@@ -449,6 +449,15 @@ public:
     /// The back: the bytes a ring packet's fill copied for tracker slot `slot` (0 to 2) of the
     /// draw it holds, or null (read game memory then).
     [[nodiscard]] const u8* TrackerBytes(const TrackerRecord& record, size_t slot) const noexcept;
+    /// Step 7's verify: the cache marked [address, address + size) CPU-written for a game write
+    /// (a served gather or invalidation, a game core's trapped store). Any thread; only while ring
+    /// packets' reads are compared. A difference over one is "game write, marked": the tracker
+    /// holds it and the next bind uploads.
+    void NoteCpuMark(u64 address, u64 size) noexcept {
+        if (ring_read_log.load(std::memory_order_relaxed)) [[unlikely]] {
+            NoteCpuMarkSlow(address, size);
+        }
+    }
     /// The device memory the trackers' bytes are copied from (the rasterizer's).
     void AttachDeviceMemory(Tegra::MaxwellDeviceMemoryManager& memory) noexcept {
         device_memory = &memory;
@@ -638,8 +647,10 @@ private:
         u64 gathers{};       ///< This thread's gathers applied when the fill ended
         u64 flush_regions{}; ///< This thread's FlushRegion calls when the fill ended
         /// Step 7, a ring packet's log: GPUMem's own writes noted when the fill ended (the
-        /// compare leaves out the ones after), and the packet's entry.
+        /// compare leaves out the ones after), the CPU-written marks noted then (CpuMarks), and
+        /// the packet's entry.
         u64 stage_writes{};
+        u64 cpu_marks{};
         u64 position{};
         void Clear() noexcept {
             records.clear();
@@ -651,6 +662,7 @@ private:
             gathers = 0;
             flush_regions = 0;
             stage_writes = 0;
+            cpu_marks = 0;
             position = 0;
         }
     };
@@ -776,7 +788,8 @@ private:
     void NoteHeldFlush(SeamHook::Use use, const std::source_location& location);
     void CompareReads(ReadLog& log, const char* what, u64 number, u64 hash_a, u64 hash_b);
     void ClassifyDiff(const ReadLog& log, const ReadRecord& record, u64 first, u64 last,
-                      const char* what, u64 number, u64 hash_a, u64 hash_b);
+                      const char* what, u64 number, u64 hash_a, u64 hash_b,
+                      bool tracker_holds = false);
     void CountDiffSite(const char* name, bool landing);
     std::string GatherFrames() const;
 
@@ -956,6 +969,23 @@ private:
     std::deque<std::pair<u64, std::unique_ptr<ReadLog>>> ring_logs;
     std::vector<std::unique_ptr<ReadLog>> ring_log_pool;
     std::unique_ptr<ReadLog> stage_log;
+    /// Ring packets' reads are compared (the window open, FRITCHII_MEMSTAGE_READ_LOG).
+    std::atomic<bool> ring_read_log{false};
+    /// The CPU-written marks (NoteCpuMark): several writers, a sequence word per slot.
+    struct CpuMark {
+        std::atomic<u64> seq{};
+        std::atomic<u64> begin{};
+        std::atomic<u64> end{};
+    };
+    static constexpr u64 CpuMarkSlots = 8192;
+    std::unique_ptr<CpuMark[]> cpu_marks;
+    std::atomic<u64> cpu_mark_count{0};
+    u64 reported_quiet{};
+    u64 reported_marks{};
+    void NoteCpuMarkSlow(u64 address, u64 size) noexcept;
+    /// Whether a mark noted since `since` covers [begin, end); `complete` false when the ring
+    /// wrapped since.
+    bool CpuMarkedSince(u64 since, u64 begin, u64 end, bool& complete) const;
     bool StartRingReadLog(u64 number);
     void StopRingReadLog();
     std::unique_ptr<ReadLog> TakeRingLog(u64 number);

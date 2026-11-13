@@ -83,8 +83,14 @@ inline void Record(u64 address, u64 size, const char* via) noexcept {
 }
 
 /// After the bytes of [address, address + size) landed in game memory (device address).
+/// Writes kept out while t_quiet (counted: the read log's line says how many).
+inline std::atomic<u64> g_quiet{0};
 inline void Note(u64 address, u64 size, const char* via) noexcept {
-    if (g_on.load(std::memory_order_relaxed) && !t_quiet) [[unlikely]] {
+    if (g_on.load(std::memory_order_relaxed)) [[unlikely]] {
+        if (t_quiet) {
+            g_quiet.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         Record(address, size, via);
     }
 }

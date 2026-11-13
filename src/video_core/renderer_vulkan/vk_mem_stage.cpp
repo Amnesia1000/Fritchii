@@ -585,6 +585,8 @@ MemStage::MemStage(MemPlayer& player_)
         // The read log's classes: every emulator write to game memory goes to the ring from now.
         Common::WriteRing::g_on.store(true, std::memory_order_relaxed);
         ring_owner = true;
+        // Step 7's verify: the cache's CPU-written marks (NoteCpuMark).
+        cpu_marks = std::make_unique<CpuMark[]>(CpuMarkSlots);
     }
     if (const u32 mode = TicksMode(); mode != 0) {
         ticks = std::make_unique<SeamTicks>(player.scheduler.GetMasterSemaphore(), mode == 2);
@@ -2229,8 +2231,57 @@ void MemStage::CompareReads(ReadLog& log, const char* what, u64 number, u64 hash
 // classed as every read log difference ("Who wrote" above), so the gate is the read log's:
 // unexplained 0 (emulator writes that are not download landings, unclassified), ring wrapped 0
 // (GPUMem's own ring counts there too). A bound range has no tracker on the back (the cache is
-// GPUMem's): it differs when an emulator write noted since the fill or a pending game-side mark
-// covers it, and is classed the same way.
+// GPUMem's): it differs when an emulator write noted since the fill, a mark the cache took since
+// or a pending game-side mark covers it, and is classed the same way. The marks the cache takes
+// (a served gather or invalidation, a game core's trapped store) go to a small ring of their own
+// while the compare runs (NoteCpuMark): a difference over one, with no emulator write, is "game
+// write, marked" (the tracker holds it, the next bind uploads), not "mark already taken". Every
+// ring that wrapped since a fill counts as "ring wrapped". Only GPUMem's own constant buffer
+// writes are kept out of the emulator's write ring (counted): every other compare ends before
+// GPUMem writes again (held packets in runs, where GPUMem is parked; operations, compared at once).
+
+void MemStage::NoteCpuMarkSlow(u64 address, u64 size) noexcept {
+    if (!cpu_marks || size == 0) {
+        return;
+    }
+    const u64 number = cpu_mark_count.fetch_add(1, std::memory_order_relaxed);
+    CpuMark& slot = cpu_marks[number % CpuMarkSlots];
+    slot.seq.store(0, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    slot.begin.store(address, std::memory_order_relaxed);
+    slot.end.store(address + size, std::memory_order_relaxed);
+    slot.seq.store(number + 1, std::memory_order_release);
+}
+
+bool MemStage::CpuMarkedSince(u64 since, u64 begin, u64 end, bool& complete) const {
+    if (!cpu_marks) {
+        return false;
+    }
+    const u64 count = cpu_mark_count.load(std::memory_order_acquire);
+    if (count <= since) {
+        return false;
+    }
+    if (count - since > CpuMarkSlots) {
+        complete = false;
+    }
+    const u64 oldest = count - since > CpuMarkSlots ? count - CpuMarkSlots : since;
+    for (u64 n = count; n > oldest; --n) {
+        const CpuMark& slot = cpu_marks[(n - 1) % CpuMarkSlots];
+        if (slot.seq.load(std::memory_order_acquire) != n) {
+            continue; // being written (a later mark), or reused
+        }
+        const u64 mark_begin = slot.begin.load(std::memory_order_relaxed);
+        const u64 mark_end = slot.end.load(std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (slot.seq.load(std::memory_order_relaxed) != n) {
+            continue;
+        }
+        if (mark_begin < end && begin < mark_end) {
+            return true;
+        }
+    }
+    return false;
+}
 
 bool MemStage::StartRingReadLog(u64 number) {
     if (Link::Ahead() == 0 || read_log_every <= 0 ||
@@ -2261,6 +2312,7 @@ void MemStage::StopRingReadLog() {
     }
     ReadLog& log = *stage_log;
     log.stage_writes = Link::Get().StageWriteCount();
+    log.cpu_marks = cpu_mark_count.load(std::memory_order_acquire);
     for (ReadRecord& record : log.records) {
         if (record.how == ReadRecord::How::Range) {
             // The tracker's answer at the fill's end (GPUMem holds the cache).
@@ -2372,11 +2424,31 @@ void MemStage::CompareRingReads(ReadLog& log, u64 number, u64 hash_a, u64 hash_b
             first = static_cast<u64>(std::countr_zero(changed)) / 8;
             last = static_cast<u64>(63 - std::countl_zero(changed)) / 8;
             if (const auto device = memory->GpuToCpuAddress(record.address)) {
+                // Left out only when every changed byte is one GPUMem wrote later (R5c). A
+                // value is 4 or 8 aligned bytes: one page, so the device bytes follow on.
                 later_writes(*device, *device + record.size);
-                if (left_out(*device + first) && left_out(*device + last)) {
-                    own_later = true;
+                bool all_own = true;
+                bool any_own = false;
+                u64 kept_first = ~u64{0};
+                u64 kept_last = 0;
+                for (u64 i = first; i <= last; ++i) {
+                    if (((changed >> (i * 8)) & 0xff) == 0) {
+                        continue;
+                    }
+                    if (left_out(*device + i)) {
+                        any_own = true;
+                        continue;
+                    }
+                    all_own = false;
+                    kept_first = (std::min)(kept_first, i);
+                    kept_last = i;
+                }
+                own_later = any_own;
+                if (all_own) {
                     break;
                 }
+                first = kept_first;
+                last = kept_last;
             }
             differs = true;
             break;
@@ -2385,14 +2457,26 @@ void MemStage::CompareRingReads(ReadLog& log, u64 number, u64 hash_a, u64 hash_b
             if (record.value != 0) {
                 break; // CPU-written at the fill already: uploaded or read as such
             }
-            // No tracker on the back: an emulator write noted since the fill, or a game-side
-            // mark pending now, over the range.
+            // No tracker on the back: an emulator write noted since the fill, a mark the cache
+            // took since (CpuMarks), or a game-side mark pending now, over the range.
             const u64 begin = record.address;
             const u64 end = begin + record.size;
-            Common::WriteRing::ForEachSince(log.ring_seq, [&](const Common::WriteRing::Entry& e) {
-                differs = e.address < end && begin < e.address + e.size;
-                return differs;
-            });
+            const bool complete = Common::WriteRing::ForEachSince(
+                log.ring_seq, [&](const Common::WriteRing::Entry& e) {
+                    differs = e.address < end && begin < e.address + e.size;
+                    return differs;
+                });
+            if (!complete) {
+                // R5a: writers since the fill unknown, as ClassifyDiff counts it.
+                Bump(counters.ring_wrapped);
+            }
+            if (!differs) {
+                bool marks_complete = true;
+                differs = CpuMarkedSince(log.cpu_marks, begin, end, marks_complete);
+                if (!marks_complete) {
+                    Bump(counters.ring_wrapped);
+                }
+            }
             if (!differs && gpu != nullptr) {
                 gpu->ForEachPendingCpuWrite([&](DAddr address, size_t size) {
                     differs = differs || (address < end && begin < address + size);
@@ -2408,7 +2492,26 @@ void MemStage::CompareRingReads(ReadLog& log, u64 number, u64 hash_a, u64 hash_b
             continue;
         }
         Bump(counters.read_diffs[static_cast<size_t>(record.kind)]);
-        ClassifyDiff(log, record, first, last, "ring draw", number, hash_a, hash_b);
+        // Fable's review, 2: a game store the cache took since the fill (a served gather, a
+        // trapped store) leaves no pending mark; the tracker holds it, the next bind uploads.
+        bool tracker_holds = false;
+        std::optional<u64> device;
+        if (record.how == How::Value) {
+            if (const auto* const memory = static_cast<const Tegra::MemoryManager*>(record.memory)) {
+                device = memory->GpuToCpuAddress(record.address + first);
+            }
+        } else {
+            device = record.address + first;
+        }
+        if (device) {
+            bool marks_complete = true;
+            tracker_holds =
+                CpuMarkedSince(log.cpu_marks, *device, *device + (last - first + 1), marks_complete);
+            if (!marks_complete) {
+                Bump(counters.ring_wrapped);
+            }
+        }
+        ClassifyDiff(log, record, first, last, "ring draw", number, hash_a, hash_b, tracker_holds);
     }
     Bump(counters.read_packets);
     Bump(counters.ring_reads);
@@ -2419,7 +2522,8 @@ void MemStage::CompareRingReads(ReadLog& log, u64 number, u64 hash_a, u64 hash_b
 
 // Every difference gets a class (A, B, D) and a place (C); see "Who wrote" at the top.
 void MemStage::ClassifyDiff(const ReadLog& log, const ReadRecord& record, u64 first, u64 last,
-                            const char* what, u64 number, u64 hash_a, u64 hash_b) {
+                            const char* what, u64 number, u64 hash_a, u64 hash_b,
+                            bool tracker_holds) {
     using How = ReadRecord::How;
     using Kind = VideoCommon::MemReadLog::Kind;
     // The changed bytes as a device range (a value is read by GPU address).
@@ -2487,6 +2591,9 @@ void MemStage::ClassifyDiff(const ReadLog& log, const ReadRecord& record, u64 fi
         kind = DiffClass::BackGather;
     } else if (found) {
         kind = writer.landing ? DiffClass::Landing : DiffClass::EmulatorWrite;
+    } else if (tracker_holds && device && complete) {
+        // Step 7: the cache took a game-side mark over these bytes since the fill (CpuMarks).
+        kind = DiffClass::GameMarked;
     } else if (!device || !complete || !asked) {
         kind = DiffClass::Unclassified;
     } else if (record.how == How::Range) {
@@ -2933,6 +3040,7 @@ void MemStage::TickThread(int seam) {
     link.SetAhead(link.Mode() == 2 && ahead > 0 ? static_cast<u32>(ahead) : 0U, blocked);
     // The window's verify (its own-write ring and the image check) only with a verify on.
     Link::SetVerify(read_log_every > 0 || Link::RingVerify());
+    ring_read_log.store(read_log_every > 0 && Link::Ahead() != 0, std::memory_order_relaxed);
     const bool full =
         Debug::SwitchValue(Debug::g_memstage_full_binds, "FRITCHII_MEMSTAGE_FULL_BINDS") > 0 ||
         link.Mode() == 2;
@@ -3083,15 +3191,23 @@ void MemStage::LogStats() {
                                             READ_KIND_NAMES[i], n);
                 }
             }
+            // Step 7: GPUMem's writes kept out of the emulator's write ring (in its own ring), and
+            // the cache's CPU-written marks noted for the compare.
+            const u64 quiet = Common::WriteRing::g_quiet.load(std::memory_order_relaxed);
+            const u64 marks = cpu_mark_count.load(std::memory_order_relaxed);
             LOG_INFO(Render_Vulkan,
                      "  memory seam read log (FRITCHII_MEMSTAGE_READ_LOG={}): {} packets, {} reads "
                      "compared{}{}{}, {} not logged (budget); differences (5.3) {}{}{}; ring "
                      "packets compared at the take (step 7) {}, left out as GPUMem's own later "
-                     "writes {}",
+                     "writes {}; GPUMem's writes kept out of the write ring {}; CPU-written marks "
+                     "noted {}",
                      read_log_every, delta(&Counts::read_packets), delta(&Counts::read_records),
                      compared.empty() ? "" : " (", compared, compared.empty() ? "" : ")",
                      delta(&Counts::read_skipped), diff_total, diffs.empty() ? "" : ": ", diffs,
-                     delta(&Counts::ring_reads), delta(&Counts::diff_stage_own));
+                     delta(&Counts::ring_reads), delta(&Counts::diff_stage_own),
+                     quiet - reported_quiet, marks - reported_marks);
+            reported_quiet = quiet;
+            reported_marks = marks;
             const auto by_class = [&](DiffClass kind) {
                 const size_t i = static_cast<size_t>(kind);
                 return current.diff_classes[i] - reported.diff_classes[i];

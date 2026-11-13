@@ -4451,6 +4451,8 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
                 VideoCommon::t_deferred_page_caching = nullptr;
             }
         }
+        // Step 7's verify: a game core's trapped store marked the tracker directly.
+        mem_stage.NoteCpuMark(addr, size);
         if (defer) {
             deferred.ApplyAll();
         }
@@ -4476,7 +4478,11 @@ void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64
     }
     if (VideoCommon::MemoryStageLink::BackServed()) [[unlikely]] {
         // FRITCHII_MEMSTAGE_THREAD = 2, a gather inside a served entry (a read flush's): the
-        // buffer half on GPUMem (claims first, as below), the other caches' here.
+        // buffer half on GPUMem (claims first, as below), the other caches' here. Step 7's
+        // verify notes the marks the cache takes (a game write the tracker holds from now).
+        for (const auto& [addr, size] : ranges) {
+            mem_stage.NoteCpuMark(addr, size);
+        }
         OnStage(static_cast<u8>(VideoCommon::MemoryStageLink::Served::Gather), [&] {
             std::scoped_lock lock{buffer_cache.mutex};
             MemStage::FillPlay seam{mem_stage, MemStage::Site::Invalidation};
@@ -4605,6 +4611,9 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
     {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.WriteMemory(addr, size);
+    }
+    if (VideoCommon::MemoryStageLink::BackServed()) [[unlikely]] {
+        mem_stage.NoteCpuMark(addr, size); // step 7's verify, as in OnCacheInvalidations
     }
     OnStage(static_cast<u8>(VideoCommon::MemoryStageLink::Served::Invalidation), [&] {
         std::scoped_lock lock{buffer_cache.mutex};
