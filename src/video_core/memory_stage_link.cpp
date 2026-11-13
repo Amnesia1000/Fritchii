@@ -141,18 +141,31 @@
 //     recorded before the sync's entries and a wait's number is played. If the back cannot (it
 //     waits in a served call, or for the buffer cache's lock, which the stage holds in its fill),
 //     the sync goes at once and is counted: "a sync of GPUMem's fill sent to the back before it
-//     played the packets ahead of it", must be 0 (syncs in served fills: 0/s at the market);
+//     played the packets ahead of it", must be 0 (syncs in served fills: 0/s at the market), and
+//     the window is refused for the rest of the session from the next frame end. A join in the
+//     stage's fill over GPU-written data catches up the same way (StageJoinCatchUpSlow);
+//   - constant buffer words onto GPU-written data: the stage comes level before the write and
+//     applies the claim at once (StageWriteWords), so no served download can come in between;
 //   - the buffer cache's lock: a back that waits for it while the stage holds it serves the
-//     stage's requests from the wait (SpinRecursiveMutex's contended hook), so a sync in the
-//     stage's fill never waits on a back that waits on the lock;
+//     stage's requests from the wait (SpinRecursiveMutex's contended hook; not a request it is
+//     serving already), so a sync in the stage's fill never waits on a back that waits on the
+//     lock; each such wait is counted with its caller's frames. The other way round, a stage
+//     that waits for the lock the back holds (EXP118's delta draws hold it through Configure,
+//     where a read flush is a served call) serves the back's call from the wait, at its clean
+//     lock sites only (CleanPoint, StageContendedHook);
 //   - the back's calls are answered between entries too (StageServeCalls at the loop top);
+//   - the ring's start and end clear the stage's unplayed mark (and the end plays the stage's
+//     pending entries first), so a fill that threw cannot hold the ticks open;
+//   - EDEN_NX2_RUNAHEAD on: the window runs 0 (the back applies its chunks before each entry);
 //   - packet ticks: each side writes its own unplayed mark (vk_mem_stage.cpp, "Packet ticks with
 //     the stage ahead"), so every buffer, staging and stream region a packet in flight uses
 //     outlives its play.
-// "Memory stage window" logs every 10 s: packets in ring B at each push (average, maximum, and a
-// histogram), the back's waits for the stage, the stage's waits for the window, for room and to
-// come level (by reason), served calls while packets were ahead, sync catch-ups, and lends handed
-// over at the run's start.
+// "Memory stage window" logs every 10 s while the window is open: packets in ring B at each push
+// (average, maximum, and a histogram), the back's waits for the stage, the stage's waits for the
+// window, for room and to come level (by reason, and at constant buffer writes), served calls
+// while packets were ahead, sync and join catch-ups, lends handed over at the run's start, the
+// lock waits both ways, served downloads past the join ring's reach, idle hook runs with the
+// stage busy, and the stage's idle work.
 //
 // "Memory stage ring" logs every 10 s (section 8.3): entries/s by class, runs/s with entries and
 // microseconds per run (GPUMem from the lend to the return, the back from the lend seen to its

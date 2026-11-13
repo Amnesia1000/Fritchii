@@ -540,7 +540,9 @@ window"; work\fable_memstage_step6_spec.md 1.4 and 6.4): with FRITCHII_MEMSTAGE_
 draw packets GPUMem may fill ahead of the back's take. 0 is 6b's level mode, unchanged. Any value
 of 65,536 or more is unlimited (the test harness sends 2147483647); the frame end is a level run,
 so the lead never passes one frame. Ignored (0) while THREAD is not 2; "Memory stage window
-(FRITCHII_MEMSTAGE_AHEAD=n)" is logged when it changes.
+(FRITCHII_MEMSTAGE_AHEAD=n)" is logged when it changes. It runs 0 while EDEN_NX2_RUNAHEAD is on
+(the back applies due CPU-write chunks before each entry; logged once), and for the rest of the
+session after a catch-up could not finish (below; logged).
 
 - GPUMem waits only while that many packets are in ring B that the back has not taken, while
   ring B has no room for another (both after publishing up to the entry), and at level runs (it
@@ -548,36 +550,58 @@ so the lead never passes one frame. Ignored (0) while THREAD is not 2; "Memory s
 - It comes level inside the window (waits for the back to reach the entry) where running ahead
   would change an answer the back gets from the cache in a served call: an entry that takes a full
   copy of the back's engine (a new or stale copy), a draw whose fill marks buffers GPU-written
-  (written storage buffers, transform feedback), and collected constant buffer ranges over
-  GPU-written buffer data. Counted by reason.
+  (written storage buffers, transform feedback), and constant buffer words onto GPU-written buffer
+  data (tested at the write, before the bytes land, with the claim applied at once; also at the
+  next fill). Counted by reason.
 - So what the back reads in a served draw is its position's: texture handles (EXP123=3), uniforms
   and storage addresses come in the packet; with the OoT trackers on, the bytes they read (the
   camera block, the actor's origin and bones) are copied at the fill and come in the packet too.
 - Other changes it makes: packet ticks keep one unplayed mark per thread (the close takes the
-  lowest, and ring B's oldest packet); the lend's flag hand-over happens at the run's first entry;
-  a sync in GPUMem's fill first lets the back play up to the published position; a back waiting
-  for a lock GPUMem holds serves GPUMem's requests from that wait; GPUMem answers the back's served
-  calls between entries too; the facts table has a cache on each side (a lock only on a miss).
-- "Memory stage window" every 10 s: packets in ring B at each push (average, maximum, and per
-  second by 1, 2-3, 4-7, 8-15, 16-31, 32-63, 64-255, 256+ ahead), the back's waits for the stage
-  (times and ms/s: should drop toward 0), GPUMem's waits for the window, for room in ring B and to
-  come level (ms/s, and comings level a second by reason: full copy, writing draw, ranges over
-  GPU-written data), served calls made while packets were ahead, sync catch-ups (count, ms/s), and
-  lends handed over at the run's start.
+  lowest, and ring B's oldest packet; the ring's start and end clear GPUMem's); the lend's flag
+  hand-over happens at the run's first entry; a sync in GPUMem's fill, and a join in it over
+  GPU-written data, first let the back play up to the published position (a catch-up); a back
+  waiting for the buffer cache's lock GPUMem holds serves GPUMem's requests from that wait (each
+  wait counted, the first 16 logged with the caller's frames: read each site once and declare it
+  safe for a sync there, or make it a served call); a GPUMem waiting for the lock the back holds
+  (EXP118's delta draws) serves the back's call from its clean lock sites; GPUMem answers the
+  back's served calls between entries too; the facts table has a cache on each side; a waiter's
+  idle hook request runs even while GPUMem is busy.
+- "Memory stage window" every 10 s, only while the window is open: packets in ring B at each push
+  (average, maximum, and per second by 1, 2-3, 4-7, 8-15, 16-31, 32-63, 64-255, 256+ ahead), the
+  back's waits for the stage (times and ms/s: should drop toward 0; spec 8.4's target is under
+  20 ms/s, and 6b's run rate makes about 58 ms/s the floor until runs drop), GPUMem's waits for the
+  window, for room in ring B and to come level (ms/s, comings level a second by reason: full copy,
+  writing draw, ranges over GPU-written data; and those at a constant buffer write), served calls
+  made while packets were ahead, sync and join catch-ups, lends handed over at the run's start, the
+  back's waits for the lock GPUMem held and GPUMem's served calls while waiting for the back's,
+  served downloads past the join ring's reach (4,096 joins; not a failure), idle hook runs with
+  GPUMem busy, and GPUMem's idle work (EXP104's doomed buffers; it runs only when the back is
+  parked as GPUMem runs out of input).
 - Must be 0 (on the "Memory stage link" line, the first 16 logged): "a sync of GPUMem's fill sent
-  to the back before it played the packets ahead of it" (the back waited in a served call or for
-  the lock); "a served download over GPU-written data in a buffer a packet ahead of the back
-  joined"; "an image registered over a constant buffer write GPUMem made for a later entry" (spec
-  9.1: GPUMem keeps a ring of its own writes with their entry, and image registration looks there).
+  to the back before it played the packets ahead of it" (a catch-up that could not finish: the back
+  waited in a served call or for the lock; the window is then refused for the session); "a served
+  download over GPU-written data in a buffer a packet ahead of the back joined"; "an image
+  registered over a constant buffer write GPUMem made for a later entry" (spec 9.1); "a served
+  download over a constant buffer write GPUMem made for a later entry" (on GPU-written bytes). The
+  last two need GPUMem's own-write ring, which runs only with the verify on (READ_LOG or
+  RING_VERIFY), so the fps gate measures play without it.
+- EXP104 (the buffer pool, spec 7.5): with the window open GPUMem creates and destroys buffers while
+  the back records, so the gate's area load should run with EXP104 on and off (or watch its hitch
+  lines). GPUMem has no role in thread_pinning.h: the gate runs it unpinned, and the pinning choice
+  of spec 5.8 stays open.
 - Verify (spec 6.4) with FRITCHII_MEMSTAGE_READ_LOG=N: every Nth ring packet's fill logs its reads
   of game memory on GPUMem, and the back reads them again at the take and compares, leaving out
   the bytes GPUMem itself wrote after the fill (its constant buffer words for later entries, from
   its own ring; while the window is open they are kept out of the emulator's write ring, which they
   would wrap). The rest is classed as every read log difference; the read log gate line is the
-  gate (unexplained 0, ring wrapped 0: GPUMem's own ring counts too). Bound ranges have no tracker
-  on the back: they differ when an emulator write noted since the fill or a pending game-side mark
-  covers them. The read log line adds "ring packets compared at the take" and "left out as GPUMem's
-  own later writes". Keep FRITCHII_MEMSTAGE_RING_VERIFY (compare b's hash) on with it.
+  gate (unexplained 0, ring wrapped 0: GPUMem's own ring and the mark ring count too). Bound ranges
+  have no tracker on the back: they differ when an emulator write noted since the fill, a mark the
+  cache took since (a served gather or invalidation, a game core's trapped store: a small ring
+  while the compare runs) or a pending game-side mark covers them; a difference over a mark the
+  cache took is "game write, marked". A value is left out only when every changed byte is
+  GPUMem's. The read log line adds "ring packets compared at the take", "left out as GPUMem's own
+  later writes", "GPUMem's writes kept out of the write ring" and "CPU-written marks noted". Keep
+  FRITCHII_MEMSTAGE_RING_VERIFY (compare b's hash) on with it.
 - Order of the verify runs: 1, 8, 64, unlimited (work\run_step7_verify.sh), then the fps gate
   against THREAD 0 (work\run_step7_gate.sh).
 
