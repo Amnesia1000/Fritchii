@@ -33,7 +33,8 @@
 //        scheduler flushed between the fill and a play, the play counts it, gives every cached
 //        staging buffer stamped with the fill's tick the current one (StagingBufferPool::Retick)
 //        and restamps the buffers the fill marked used. Expected near 0; the first 16 flushes
-//        inside a held packet are logged with their caller.
+//        inside a held packet are logged with their caller. Off with packet ticks
+//        (FRITCHII_MEMSTAGE_TICKS): the stamps are packet numbers then.
 //   5.3, the read log (FRITCHII_MEMSTAGE_READ_LOG=N, boot): every Nth draw, dispatch and operation
 //        packet logs what its fill read from game memory (the buffer cache's MemReadLog lines:
 //        uniforms copied to the stream, buffer uploads with their staged bytes, bound cached
@@ -1029,7 +1030,9 @@ const MemStage::DispatchPacket* MemStage::FillDispatch(Cache& cache_,
 void MemStage::CheckHeld() {
     u64& fill_tick = held == HeldKind::Draw ? draw.fill_tick : dispatch.fill_tick;
     const u64 now = player.scheduler.CurrentTick();
-    if (now != fill_tick) [[unlikely]] {
+    // With packet ticks (FRITCHII_MEMSTAGE_TICKS) the stamps are packet numbers, not ticks: no
+    // guard (the packet's numbers stay open until its play, "Packet ticks" below).
+    if (!ticks && now != fill_tick) [[unlikely]] {
         // 5.5: the scheduler flushed between the fill and this play. What the fill stamped with
         // its tick is used by this later submission: stamp it with the current one.
         Bump(counters.tick_moved);

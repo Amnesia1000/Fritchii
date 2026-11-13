@@ -1111,7 +1111,8 @@ extent probes, list page copies and draw indirect buffers stay where they are (f
 the call, as with 1). The tick guard (5.5): when the scheduler submitted between a packet's fill
 and a play, the play gives the buffer cache's staging buffers stamped with the fill's tick and
 the buffers the fill marked used the current tick (counted "tick moved", the first 16 logged with
-the caller of the submit; expected near 0). The stats line gets a "memory seam 2b" line: held and
+the caller of the submit; expected near 0; off with FRITCHII_MEMSTAGE_TICKS, whose stamps are
+packet numbers). The stats line gets a "memory seam 2b" line: held and
 late fill draws and dispatches a second, packets not held (arena busy on another thread), tick
 moved, rest plays (and descriptors dropped), descriptor form mismatches (must be 0), and fill
 and play time with EDEN_NX2_GPU_PROFILE. The GPU profile gets two zones, "memory fill" (every fill
