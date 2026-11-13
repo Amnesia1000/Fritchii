@@ -327,6 +327,7 @@ struct GPU::Impl {
         namespace ReadRunStats = VideoCommon::ReadRunStats;
         if (ReadRunStats::g_enabled) [[unlikely]] {
             ReadRunStats::t_run_pages = 0;
+            ReadRunStats::t_read_bytes = {};
         }
         auto raster_area = renderer->ReadRasterizer()->GetFlushArea(addr, size);
         if (raster_area.preemtive) {
@@ -334,6 +335,8 @@ struct GPU::Impl {
         }
         // FRITCHII_READ_RUNS: this read goes to the back or waits for a download.
         const u64 run_pages = ReadRunStats::t_run_pages;
+        const ReadRunStats::ReadBytes read_bytes =
+            ReadRunStats::g_enabled ? ReadRunStats::t_read_bytes : ReadRunStats::ReadBytes{};
         const u64 run_start = ReadRunStats::g_enabled ? VideoCore::AsyncReadback::Now() : 0;
         // EDEN_NX2_EXP72: everything this read lacks is in a fence download already submitted:
         // wait for it to land instead of a new copy behind all the work recorded since.
@@ -343,7 +346,8 @@ struct GPU::Impl {
             if (ReadRunStats::g_enabled) [[unlikely]] {
                 ReadRunStats::NoteRead(ReadRunStats::Kind::FenceDownload,
                                        raster_area.start_address, run_pages,
-                                       VideoCore::AsyncReadback::Now() - run_start);
+                                       VideoCore::AsyncReadback::Now() - run_start, size,
+                                       read_bytes);
             }
             return raster_area;
         }
@@ -401,7 +405,7 @@ struct GPU::Impl {
                                        ? ReadRunStats::Kind::InFlight
                                        : ReadRunStats::Kind::Flushed,
                                    raster_area.start_address, run_pages,
-                                   AsyncReadback::Now() - run_start);
+                                   AsyncReadback::Now() - run_start, size, read_bytes);
         }
         return raster_area;
     }

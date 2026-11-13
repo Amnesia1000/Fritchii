@@ -532,11 +532,18 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
         preflush_read_pages.Set(device_addr_start_aligned,
                                 device_addr_end_aligned - device_addr_start_aligned);
     }
-    // FRITCHII_READ_RUNS: the GPU-written run around the read's pages, before anything lands.
+    // FRITCHII_READ_RUNS: the GPU-written run around the read's pages, before anything lands,
+    // and whether the read's own bytes are GPU-written or only share their pages.
     if (ReadRunStats::g_enabled) [[unlikely]] {
         ReadRunStats::t_run_pages = 0;
+        ReadRunStats::t_read_bytes = {};
         if (IsRegionGpuModified(device_addr_start_aligned,
                                 device_addr_end_aligned - device_addr_start_aligned)) {
+            ReadRunStats::ByteCheck check{.begin = device_addr, .end = device_addr + size};
+            gpu_modified_ranges.ForEachInRange(
+                device_addr_start_aligned, device_addr_end_aligned - device_addr_start_aligned,
+                [&](DAddr lower, DAddr upper) { check.Add(lower, upper); });
+            ReadRunStats::t_read_bytes.modified = check.Answer();
             const auto [run_begin, run_end] = GpuModifiedRunAround(
                 device_addr_start_aligned, device_addr_end_aligned,
                 ReadRunStats::RunCountPages * Core::DEVICE_PAGESIZE, false);
@@ -563,6 +570,15 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
                                         device_addr_end_aligned - device_addr_start_aligned)) {
             area->preemtive = false;
             area->in_flight = true;
+            if (ReadRunStats::g_enabled) [[unlikely]] {
+                // FRITCHII_READ_RUNS: the read download's bytes in the read's pages.
+                ReadRunStats::ByteCheck check{.begin = device_addr, .end = device_addr + size};
+                read_download_ranges.ForEachInRange(
+                    device_addr_start_aligned,
+                    device_addr_end_aligned - device_addr_start_aligned,
+                    [&](DAddr lower, DAddr upper) { check.Add(lower, upper); });
+                ReadRunStats::t_read_bytes.on_way = check.Answer();
+            }
             return area;
         }
         // The host GPU had run them: in guest memory now. Anything still GPU-modified is newer
@@ -604,6 +620,19 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
                 preflush_reads_in_flight.fetch_add(1, std::memory_order_relaxed);
                 preflush_reads_in_flight_depth.fetch_add(
                     pending_download_ranges.size() - newest, std::memory_order_relaxed);
+                if (ReadRunStats::g_enabled) [[unlikely]] {
+                    // FRITCHII_READ_RUNS: the fence downloads the read waits for (up to and
+                    // including `newest`), their bytes in the read's pages.
+                    ReadRunStats::ByteCheck check{.begin = device_addr,
+                                                  .end = device_addr + size};
+                    for (size_t index = 0;
+                         index <= newest && index < pending_download_ranges.size(); ++index) {
+                        pending_download_ranges[index].ForEachInRange(
+                            begin, length,
+                            [&](DAddr lower, DAddr upper) { check.Add(lower, upper); });
+                    }
+                    ReadRunStats::t_read_bytes.on_way = check.Answer();
+                }
             }
         }
         return area;
