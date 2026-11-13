@@ -20,6 +20,7 @@
 #include "core/hle/kernel/k_process.h"
 #include "memory_manager.h"
 #include "video_core/async_translate.h"
+#include "video_core/back_read_audit.h"
 #include "video_core/guest_memory.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cb_path.h"
@@ -39,6 +40,11 @@ bool MemoryManager::IsShuttingDown() const {
 }
 
 using Tegra::Memory::GuestMemoryFlags;
+// FRITCHII_BACK_READ_AUDIT: the read functions below count their caller on the back thread
+// (FRITCHII_BACK_READ_AUDITED / _NOTE) and hide the device reads they make inside; the writes
+// hide their pointer getters (Unaudited). One branch on a static bool each while off.
+namespace BackReadAudit = VideoCommon::BackReadAudit;
+using AuditKind = VideoCommon::BackReadAudit::Kind;
 
 std::atomic<size_t> MemoryManager::unique_identifier_generator{};
 
@@ -66,6 +72,7 @@ MemoryManager::MemoryManager(Core::System& system_, MaxwellDeviceMemoryManager& 
     big_entries.resize(big_page_table_size / 32, 0);
     big_page_continuous.resize(big_page_table_size / continuous_bits, 0);
     entries.resize(page_table_size / 32, 0);
+    BackReadAudit::Init();
 }
 
 MemoryManager::MemoryManager(Core::System& system_, u64 address_space_bits_, GPUVAddr split_address_, u64 big_page_bits_, u64 page_bits_)
@@ -200,7 +207,8 @@ GPUVAddr MemoryManager::BigPageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr
             const auto index = PageEntryIndex(current_gpu_addr, true);
             const u32 sub_value = static_cast<u32>(current_dev_addr >> cpu_page_bits);
             big_page_table_dev.Set(index, sub_value);
-            const bool is_continuous = ([&] {
+            // Pointer compares, not reads: hidden from the back read audit.
+            const bool is_continuous = BackReadAudit::Unaudited([&] {
                 uintptr_t base_ptr{
                     reinterpret_cast<uintptr_t>(memory.GetPointer<u8>(current_dev_addr))};
                 if (base_ptr == 0) {
@@ -215,7 +223,7 @@ GPUVAddr MemoryManager::BigPageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr
                     }
                 }
                 return true;
-            })();
+            });
             SetBigPageContinuous(index, is_continuous);
         }
         remaining_size -= big_page_size;
@@ -292,12 +300,15 @@ bool MemoryManager::TryLockPageTableShared() const {
 
 bool MemoryManager::ReadBlockGuarded(GPUVAddr gpu_src_addr, void* dest_buffer,
                                      std::size_t size) const {
-    if (!TryLockPageTableShared()) {
-        return false;
-    }
-    ReadBlockUnsafe(gpu_src_addr, dest_buffer, size);
-    page_table_lock.unlock_shared();
-    return true;
+    const auto body = [&]() -> bool {
+        if (!TryLockPageTableShared()) {
+            return false;
+        }
+        ReadBlockUnsafe(gpu_src_addr, dest_buffer, size);
+        page_table_lock.unlock_shared();
+        return true;
+    };
+    FRITCHII_BACK_READ_AUDITED(size, AuditKind::MmReadBlockGuarded, body);
 }
 
 std::optional<bool> MemoryManager::IsFullyMappedRangeGuarded(GPUVAddr gpu_addr,
@@ -384,28 +395,32 @@ std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr addr, std::size_t s
 
 template <typename T>
 T MemoryManager::Read(GPUVAddr addr) const {
-    if constexpr (sizeof(T) == sizeof(u32)) {
-        const auto shim = native_syncpoint_shim.load(std::memory_order_acquire);
-        if (shim && addr >= shim && addr - shim < NumShimSyncpoints * sizeof(u32) &&
-            Common::IsAligned(addr - shim, sizeof(u32))) {
-            return static_cast<T>(system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(
-                static_cast<u32>((addr - shim) / sizeof(u32))));
+    const auto body = [&]() -> T {
+        if constexpr (sizeof(T) == sizeof(u32)) {
+            const auto shim = native_syncpoint_shim.load(std::memory_order_acquire);
+            if (shim && addr >= shim && addr - shim < NumShimSyncpoints * sizeof(u32) &&
+                Common::IsAligned(addr - shim, sizeof(u32))) {
+                return static_cast<T>(
+                    system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(
+                        static_cast<u32>((addr - shim) / sizeof(u32))));
+            }
         }
-    }
 
-    if (auto page_pointer{GetPointer(addr)}; page_pointer) {
-        // NOTE: Avoid adding any extra logic to this fast-path block
-        T value;
-        std::memcpy(&value, page_pointer, sizeof(T));
-        return value;
-    }
+        if (auto page_pointer{GetPointer(addr)}; page_pointer) {
+            // NOTE: Avoid adding any extra logic to this fast-path block
+            T value;
+            std::memcpy(&value, page_pointer, sizeof(T));
+            return value;
+        }
 
-    static std::atomic<u32> reported{};
-    if (reported.fetch_add(1) < 16) {
-        LOG_ERROR(HW_GPU, "Read{} of unmapped GPU address {:#x}", sizeof(T) * 8, addr);
-    }
+        static std::atomic<u32> reported{};
+        if (reported.fetch_add(1) < 16) {
+            LOG_ERROR(HW_GPU, "Read{} of unmapped GPU address {:#x}", sizeof(T) * 8, addr);
+        }
 
-    return {};
+        return {};
+    };
+    FRITCHII_BACK_READ_AUDITED(sizeof(T), AuditKind::MmRead, body);
 }
 
 template <typename T>
@@ -428,7 +443,11 @@ void MemoryManager::Write(GPUVAddr addr, T data) {
             }
         }
     };
-    if (auto page_pointer{GetPointer(addr)}; page_pointer) {
+    // A write: its pointer getter is hidden from the back read audit.
+    const auto write_pointer = [this, addr] {
+        return BackReadAudit::Unaudited([this, addr] { return GetPointer(addr); });
+    };
+    if (auto page_pointer{write_pointer()}; page_pointer) {
         // NOTE: Avoid adding any extra logic to this fast-path block
         std::memcpy(page_pointer, &data, sizeof(T));
         note_keeps();
@@ -436,7 +455,7 @@ void MemoryManager::Write(GPUVAddr addr, T data) {
     }
     // A Switch 2 sparse block nobody wrote yet gets its memory now.
     Tegra::Nx2BackSparseWrite(addr, sizeof(T), &data);
-    if (auto page_pointer{GetPointer(addr)}; page_pointer) {
+    if (auto page_pointer{write_pointer()}; page_pointer) {
         std::memcpy(page_pointer, &data, sizeof(T));
         note_keeps();
         return;
@@ -455,21 +474,27 @@ template void MemoryManager::Write<u32>(GPUVAddr addr, u32 data);
 template void MemoryManager::Write<u64>(GPUVAddr addr, u64 data);
 
 u8* MemoryManager::GetPointer(GPUVAddr gpu_addr) {
-    const auto address{GpuToCpuAddress(gpu_addr)};
-    if (!address) {
-        return {};
-    }
+    const auto body = [&]() -> u8* {
+        const auto address{GpuToCpuAddress(gpu_addr)};
+        if (!address) {
+            return {};
+        }
 
-    return memory.GetPointer<u8>(*address);
+        return memory.GetPointer<u8>(*address);
+    };
+    FRITCHII_BACK_READ_AUDITED(0, AuditKind::MmGetPointerMut, body);
 }
 
 const u8* MemoryManager::GetPointer(GPUVAddr gpu_addr) const {
-    const auto address{GpuToCpuAddress(gpu_addr)};
-    if (!address) {
-        return {};
-    }
+    const auto body = [&]() -> const u8* {
+        const auto address{GpuToCpuAddress(gpu_addr)};
+        if (!address) {
+            return {};
+        }
 
-    return memory.GetPointer<u8>(*address);
+        return memory.GetPointer<u8>(*address);
+    };
+    FRITCHII_BACK_READ_AUDITED(0, AuditKind::MmGetPointer, body);
 }
 
 bool MemoryManager::HandlePointerCacheEnabled() {
@@ -526,25 +551,32 @@ const u8* MemoryManager::CachedPagePointer(GPUVAddr addr) const {
 }
 
 u32 MemoryManager::ReadHandleWord(GPUVAddr addr) const {
-    constexpr u64 host_page_mask = (u64{1} << cpu_page_bits) - 1;
-    if (!HandlePointerCacheEnabled() || (addr & host_page_mask) > host_page_mask + 1 - sizeof(u32) ||
-        OverlapsNativeSyncpointShim(addr, sizeof(u32))) {
-        return Read<u32>(addr);
-    }
-    const u8* const host = CachedPagePointer(addr);
-    if (host == nullptr) [[unlikely]] {
-        return Read<u32>(addr); // Unmapped: Read logs it and returns 0
-    }
-    u32 value;
-    std::memcpy(&value, host, sizeof(u32));
-    return value;
+    const auto body = [&]() -> u32 {
+        constexpr u64 host_page_mask = (u64{1} << cpu_page_bits) - 1;
+        if (!HandlePointerCacheEnabled() ||
+            (addr & host_page_mask) > host_page_mask + 1 - sizeof(u32) ||
+            OverlapsNativeSyncpointShim(addr, sizeof(u32))) {
+            return Read<u32>(addr);
+        }
+        const u8* const host = CachedPagePointer(addr);
+        if (host == nullptr) [[unlikely]] {
+            return Read<u32>(addr); // Unmapped: Read logs it and returns 0
+        }
+        u32 value;
+        std::memcpy(&value, host, sizeof(u32));
+        return value;
+    };
+    FRITCHII_BACK_READ_AUDITED(sizeof(u32), AuditKind::MmReadHandleWord, body);
 }
 
 const u8* MemoryManager::GetPointerForDescriptor(GPUVAddr addr) const {
-    if (!HandlePointerCacheEnabled()) {
-        return GetPointer(addr);
-    }
-    return CachedPagePointer(addr);
+    const auto body = [&]() -> const u8* {
+        if (!HandlePointerCacheEnabled()) {
+            return GetPointer(addr);
+        }
+        return CachedPagePointer(addr);
+    };
+    FRITCHII_BACK_READ_AUDITED(0, AuditKind::MmDescriptorPointer, body);
 }
 
 #if defined(_MSC_VER) && !defined(__clang__) // no need for gcc / clang but msvc's compiler is more conservative with inlining.
@@ -666,33 +698,42 @@ void MemoryManager::ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std:
 }
 
 void MemoryManager::ReadBlock(GPUVAddr gpu_src_addr, void* dest_buffer, std::size_t size, VideoCommon::CacheType which) const {
-    ReadBlockImpl(gpu_src_addr, dest_buffer, size, which, false);
+    const auto body = [&] { ReadBlockImpl(gpu_src_addr, dest_buffer, size, which, false); };
+    FRITCHII_BACK_READ_AUDITED(size, AuditKind::MmReadBlock, body);
 }
 
 void MemoryManager::ReadBlockUnsafe(GPUVAddr gpu_src_addr, void* dest_buffer, const std::size_t size) const {
-    // Small reads within one 4 KiB page (texture and sampler descriptors, several per draw): one
-    // translation and a copy, as Read<T> does, instead of the page walk (~3% of the GPU thread
-    // in title 1). Anything else, unmapped or sparse pages included, takes the full path.
-    constexpr std::size_t SmallPage = 0x1000;
-    if (size <= SmallPage && (gpu_src_addr & (SmallPage - 1)) + size <= SmallPage) {
-        if (const u8* const pointer = GetPointer(gpu_src_addr)) {
-            std::memcpy(dest_buffer, pointer, size);
-            return;
+    const auto body = [&] {
+        // Small reads within one 4 KiB page (texture and sampler descriptors, several per draw):
+        // one translation and a copy, as Read<T> does, instead of the page walk (~3% of the GPU
+        // thread in title 1). Anything else, unmapped or sparse pages included, takes the full
+        // path.
+        constexpr std::size_t SmallPage = 0x1000;
+        if (size <= SmallPage && (gpu_src_addr & (SmallPage - 1)) + size <= SmallPage) {
+            if (const u8* const pointer = GetPointer(gpu_src_addr)) {
+                std::memcpy(dest_buffer, pointer, size);
+                return;
+            }
         }
-    }
-    ReadBlockImpl(gpu_src_addr, dest_buffer, size, VideoCommon::CacheType::None, true);
+        ReadBlockImpl(gpu_src_addr, dest_buffer, size, VideoCommon::CacheType::None, true);
+    };
+    FRITCHII_BACK_READ_AUDITED(size, AuditKind::MmReadBlockUnsafe, body);
 }
 
 void MemoryManager::ReadWordsUnsafe(GPUVAddr gpu_src_addr, u32* dest, std::size_t count) const {
     const std::size_t size = count * sizeof(u32);
-    const auto shim = native_syncpoint_shim.load(std::memory_order_acquire);
-    if (shim && gpu_src_addr < shim + NumShimSyncpoints * sizeof(u32) && gpu_src_addr + size > shim) {
-        for (std::size_t i = 0; i < count; ++i) {
-            dest[i] = Read<u32>(gpu_src_addr + i * sizeof(u32));
+    const auto body = [&] {
+        const auto shim = native_syncpoint_shim.load(std::memory_order_acquire);
+        if (shim && gpu_src_addr < shim + NumShimSyncpoints * sizeof(u32) &&
+            gpu_src_addr + size > shim) {
+            for (std::size_t i = 0; i < count; ++i) {
+                dest[i] = Read<u32>(gpu_src_addr + i * sizeof(u32));
+            }
+            return;
         }
-        return;
-    }
-    ReadBlockUnsafe(gpu_src_addr, dest, size);
+        ReadBlockUnsafe(gpu_src_addr, dest, size);
+    };
+    FRITCHII_BACK_READ_AUDITED(size, AuditKind::MmReadWords, body);
 }
 
 void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, [[maybe_unused]] VideoCommon::CacheType which, bool unsafe, bool note_keeps) {
@@ -710,13 +751,17 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
             }
         }
     };
+    // The pointer getter of a write is hidden from the back read audit.
+    const auto write_pointer = [this](DAddr dev_addr) {
+        return BackReadAudit::Unaudited([&] { return memory.GetPointer<u8>(dev_addr); });
+    };
     auto mapped_normal = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
         const DAddr dev_addr_base = (DAddr(page_table[page_index]) << cpu_page_bits) + offset;
         finish_reads(dev_addr_base, copy_amount);
         if (!unsafe) {
             rasterizer->PrepareRegionWrite(dev_addr_base, copy_amount, which);
         }
-        if (u8* physical = memory.GetPointer<u8>(dev_addr_base)) [[likely]] {
+        if (u8* physical = write_pointer(dev_addr_base)) [[likely]] {
             std::memcpy(physical, src_buffer, copy_amount);
         }
         // EXP92 (uniform keeps, tier 2): after the copy; cached writes are tier 1.
@@ -735,7 +780,7 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
         if (!unsafe) {
             rasterizer->PrepareRegionWrite(dev_addr_base, copy_amount, which);
         }
-        u8* const physical = IsBigPageContinuous(page_index) ? memory.GetPointer<u8>(dev_addr_base)
+        u8* const physical = IsBigPageContinuous(page_index) ? write_pointer(dev_addr_base)
                                                              : nullptr;
         if (physical != nullptr) [[likely]] {
             std::memcpy(physical, src_buffer, copy_amount);
@@ -821,7 +866,10 @@ void MemoryManager::WriteConstantBufferData(DAddr device_addr, GPUVAddr gpu_addr
         const std::size_t amount = (std::min<std::size_t>)(
             device_addr + size - address,
             Core::DEVICE_PAGESIZE - (address & Core::DEVICE_PAGEMASK));
-        if (u8* const physical = memory.GetPointer<u8>(address)) [[likely]] {
+        // A write: hidden from the back read audit.
+        u8* const physical =
+            BackReadAudit::Unaudited([&] { return memory.GetPointer<u8>(address); });
+        if (physical != nullptr) [[likely]] {
             std::memcpy(physical, src, amount);
         } else {
             memory.WriteBlockUnsafe(address, src, amount);
@@ -1108,10 +1156,13 @@ void MemoryManager::InvalidateRegion(GPUVAddr gpu_addr, size_t size,
 
 void MemoryManager::CopyBlock(GPUVAddr gpu_dest_addr, GPUVAddr gpu_src_addr, std::size_t size,
                               VideoCommon::CacheType which) {
-    Tegra::Memory::GpuGuestMemoryScoped<u8, GuestMemoryFlags::SafeReadWrite> data(
-        *this, gpu_src_addr, size);
-    data.SetAddressAndSize(gpu_dest_addr, size);
-    FlushRegion(gpu_dest_addr, size, which);
+    const auto body = [&] {
+        Tegra::Memory::GpuGuestMemoryScoped<u8, GuestMemoryFlags::SafeReadWrite> data(
+            *this, gpu_src_addr, size);
+        data.SetAddressAndSize(gpu_dest_addr, size);
+        FlushRegion(gpu_dest_addr, size, which);
+    };
+    FRITCHII_BACK_READ_AUDITED(size, AuditKind::MmCopyBlock, body);
 }
 
 bool MemoryManager::IsGranularRange(GPUVAddr gpu_addr, std::size_t size) const {
@@ -1325,25 +1376,31 @@ void MemoryManager::FlushCaching() {
 }
 
 const u8* MemoryManager::GetSpan(const GPUVAddr src_addr, const std::size_t size) const {
-    if (!IsContinuousRange(src_addr, size)) {
+    const auto body = [&]() -> const u8* {
+        if (!IsContinuousRange(src_addr, size)) {
+            return nullptr;
+        }
+        auto dev_addr = GpuToCpuAddress(src_addr);
+        if (dev_addr) {
+            return memory.GetSpan(*dev_addr, size);
+        }
         return nullptr;
-    }
-    auto dev_addr = GpuToCpuAddress(src_addr);
-    if (dev_addr) {
-        return memory.GetSpan(*dev_addr, size);
-    }
-    return nullptr;
+    };
+    FRITCHII_BACK_READ_AUDITED(size, AuditKind::MmGetSpan, body);
 }
 
 u8* MemoryManager::GetSpan(const GPUVAddr src_addr, const std::size_t size) {
-    if (!IsContinuousRange(src_addr, size)) {
+    const auto body = [&]() -> u8* {
+        if (!IsContinuousRange(src_addr, size)) {
+            return nullptr;
+        }
+        auto dev_addr = GpuToCpuAddress(src_addr);
+        if (dev_addr) {
+            return memory.GetSpan(*dev_addr, size);
+        }
         return nullptr;
-    }
-    auto dev_addr = GpuToCpuAddress(src_addr);
-    if (dev_addr) {
-        return memory.GetSpan(*dev_addr, size);
-    }
-    return nullptr;
+    };
+    FRITCHII_BACK_READ_AUDITED(size, AuditKind::MmGetSpanMut, body);
 }
 
 } // namespace Tegra

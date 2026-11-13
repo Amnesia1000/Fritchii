@@ -14,6 +14,8 @@ endif()
 
 add_library(video_core STATIC
     async_translate.h
+    back_read_audit.cpp
+    back_read_audit.h
     buffer_cache/buffer_base.h
     buffer_cache/buffer_cache_base.h
     buffer_cache/buffer_cache.cpp
