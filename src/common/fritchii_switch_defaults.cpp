@@ -175,6 +175,10 @@ void LoadExperiments() {
         // 20 s: 52.3 -> 71.0 fps, 1% / 0.1% low 40.0 / 34.2 -> 46.0 / 38.8; read-backs that went
         // to the back 16.6 -> 3.1 a frame, the game's waiting 7.5 ms a frame -> under 2.
         g_experiments[112].store(1, std::memory_order_relaxed);
+        // EXP105 = 64 (2026-11-13): the command list GPU-written check (read-only, logs only, never
+        // fired in OoT) runs on 1 entry in 64. At every entry it cost ~8 ms/s of the back and was
+        // 236,000 of the memory stage's 273,000 level entries a second at the market (5b shadow).
+        g_experiments[105].store(64, std::memory_order_relaxed);
         // EXP114 = 2 (2026-11-13): the GPU thread's pending polls wait 2 us with PAUSE instead of
         // yielding. Daytime market, flipped every 20 s: 59.2 -> 59.9 fps, windows 54.8-63.7 ->
         // 59.1-60.4, 1% low 40.0 -> 42.1, back 7.35 -> 7.16 us a draw; the owner felt it steadier.
