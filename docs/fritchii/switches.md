@@ -552,9 +552,15 @@ session after a catch-up could not finish (below; logged).
 - It comes level inside the window (waits for the back to reach the entry) where running ahead
   would change an answer the back gets from the cache in a served call: an entry that takes a full
   copy of the back's engine (a new or stale copy), a draw whose fill marks buffers GPU-written
-  (written storage buffers, transform feedback), and constant buffer words onto GPU-written buffer
-  data (tested at the write, before the bytes land, with the claim applied at once; also at the
-  next fill). Counted by reason.
+  (written storage buffers, transform feedback), and collected constant buffer ranges over
+  GPU-written buffer data at the next fill. Counted by reason. Constant buffer words onto
+  GPU-written buffer data are tested at the write, before the bytes land: the entry turns hard
+  (the back writes them in a level run, in stream order), counted as "entries made hard by
+  constant buffer words onto GPU-written data".
+- GPUMem never waits on a staging or stream region stamped with a packet not played yet: the
+  staging pool never waits for a region (a busy stream takes a new buffer, counted as "new
+  staging buffers for GPUMem, the stream busy"). The one wait a draw's fill can reach is the
+  multi-range storage bind's (a sync, with its catch-up).
 - So what the back reads in a served draw is its position's: texture handles (EXP123=3), uniforms
   and storage addresses come in the packet; with the OoT trackers on, the bytes they read (the
   camera block, the actor's origin and bones) are copied at the fill and come in the packet too.
@@ -573,7 +579,8 @@ session after a catch-up could not finish (below; logged).
   back's waits for the stage (times and ms/s: should drop toward 0; spec 8.4's target is under
   20 ms/s, and 6b's run rate makes about 58 ms/s the floor until runs drop), GPUMem's waits for the
   window, for room in ring B and to come level (ms/s, comings level a second by reason: full copy,
-  writing draw, ranges over GPU-written data; and those at a constant buffer write), served calls
+  writing draw, ranges over GPU-written data), entries made hard at a constant buffer write, new
+  staging buffers for GPUMem with the stream busy, served calls
   made while packets were ahead, sync and join catch-ups, lends handed over at the run's start, the
   back's waits for the lock GPUMem held and GPUMem's served calls while waiting for the back's,
   served downloads past the join ring's reach (4,096 joins; not a failure), idle hook runs with
@@ -602,7 +609,9 @@ session after a catch-up could not finish (below; logged).
   while the compare runs) or a pending game-side mark covers them; a difference over a mark the
   cache took is "game write, marked". A value is left out only when every changed byte is
   GPUMem's. The read log line adds "ring packets compared at the take", "left out as GPUMem's own
-  later writes", "GPUMem's writes kept out of the write ring" and "CPU-written marks noted". Keep
+  later writes", ring packets "with a CPU-written mark since the fill", "GPUMem's writes kept out
+  of the write ring" and "CPU-written marks noted" (marks taken anywhere: served and inline gathers
+  and invalidations, InnerInvalidation, game cores' trapped stores). Keep
   FRITCHII_MEMSTAGE_RING_VERIFY (compare b's hash) on with it.
 - Order of the verify runs: 1, 8, 64, unlimited (work\run_step7_verify.sh), then the fps gate
   against THREAD 0 (work\run_step7_gate.sh).
