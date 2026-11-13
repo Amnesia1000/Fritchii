@@ -1590,7 +1590,8 @@ and EDEN_NX2_GPU_PROFILE=2. Nothing is counted without the GPU profile.
 
 ### EXP124
 
-EXP124 (upload words as one entry; live, 0 = off by default; fable_memstage_compute_brief 4).
+EXP124 (upload words as one entry; live, 0 = off, DEFAULT 1 since 2026-11-13: market 56.2 -> 58.4
+fps, 1% low 38.8 -> 40.0; fable_memstage_compute_brief 4).
 Today the compute macro's emit sends every inline upload data word (KeplerCompute 0x6d) as its
 own Direct MacroWrite: about 457,000 ring entries a second at the Castle Town market, each
 followed by GPUMem as a hard entry, and on the back each a last call that Upload::State flushes

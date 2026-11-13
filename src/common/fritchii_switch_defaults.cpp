@@ -192,6 +192,10 @@ void LoadExperiments() {
         // without the ring scan; verified at the pot room (4.39 M answers, 0 mismatches) and the
         // "past the scan" drains stop while it is on.
         g_experiments[122].store(1, std::memory_order_relaxed);
+        // EXP124 = 1 (2026-11-13): a compute macro's inline upload words go as one entry per batch
+        // and one upload call per safe 4 KiB piece. Market 0/1 (4 x 30 s): 56.2 -> 58.4 fps, 1% low
+        // 38.8 -> 40.0, the back's method zone -11 ms/s; EXP124=2 check: no piece disagreed.
+        g_experiments[124].store(1, std::memory_order_relaxed);
         // EXP114 = 2 (2026-11-13): the GPU thread's pending polls wait 2 us with PAUSE instead of
         // yielding. Daytime market, flipped every 20 s: 59.2 -> 59.9 fps, windows 54.8-63.7 ->
         // 59.1-60.4, 1% low 40.0 -> 42.1, back 7.35 -> 7.16 us a draw; the owner felt it steadier.
