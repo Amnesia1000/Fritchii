@@ -325,10 +325,11 @@ std::string ProbeFrontQmd(u64 qmd) {
                                                  "overlay from memory", "upload shadow",
                                                  "memory", "memory after a wait",
                                                  "overlay from memory (not checked for the feed)"};
-    constexpr std::array<const char*, 12> causes{
+    constexpr std::array<const char*, 13> causes{
         "none", "noted write", "writer range", "3D ranged write", "unbounded writer",
         "unranged writer", "queued function", "3D method write", "unknown noted write",
-        "noted-write scan limit", "writer-range scan limit", "evicted inline QMD"};
+        "noted-write scan limit", "writer-range scan limit", "evicted inline QMD",
+        "ranged overflow"};
     const auto source = static_cast<size_t>(read->second.source);
     text += fmt::format("; read at {} from {}", read->second.position,
                         source < sources.size() ? sources[source] : "?");
@@ -2646,6 +2647,7 @@ bool KeplerCompute::FrontReadQmd(VideoCommon::GpuSplit& split, u64 address,
     auto& mirror = g_front_qmd;
     ++mirror.window_reads;
     const u64 done = split.ConsumedNow();
+    split.NoteQmdRead(done);
     // The newest write that may have reached the QMD (write stamps, 6f (c) a).
     u64 target = split.WriteStamp(*device, size, address);
     const FrontQmdMirror::Overlay* const overlay = mirror.FindOverlay(&memory_manager, address);
@@ -2724,6 +2726,17 @@ bool KeplerCompute::FrontReadQmd(VideoCommon::GpuSplit& split, u64 address,
                                                   : "already run");
             }
         }
+        // The QMD wait floor counters (fable_qmd_wait_brief piece 1): which stamp term set the
+        // target and, for a block or page stamp, whether the exact scan finds the writer too.
+        const auto why = split.WriteStampWhy(*device, size, address);
+        const bool evicted = target > why.stamp;
+        const bool stamped =
+            why.term == VideoCommon::StampTerm::Block || why.term == VideoCommon::StampTerm::Page;
+        split.NoteQmdReadWait(
+            why, done, target, evicted,
+            !evicted && stamped
+                ? split.ExactWriterCheck(done, address, *device, size, why.term_position)
+                : u8{3});
         ++mirror.window_waits;
         split.WaitUntil(target, VideoCommon::DrainSite::QmdRead);
         Prediction::NoteMirror(Prediction::Mirror::Waited);
@@ -2812,22 +2825,44 @@ void KeplerCompute::FrontPatchOverlays(VideoCommon::GpuSplit& split, FrontState&
     }
     for (u64 block = 0; block < block_patched.size(); ++block) {
         const GPUVAddr block_address = first_block + block * size;
-        if (block_patched[block] || last <= block_address) {
+        if (last <= block_address) {
+            continue;
+        }
+        // The QMD wait floor counters (fable_qmd_wait_brief piece 1): each outcome.
+        using Outcome = VideoCommon::QmdPatchOutcome;
+        if (block_patched[block]) {
+            split.NoteQmdPatch(Outcome::Holder);
             continue;
         }
         const auto device = memory_manager.GpuToCpuAddress(block_address);
         if (!device || !memory_manager.IsFullyMappedRange(block_address, size) ||
             Nx2MayBeGpuWritten(*device, size)) {
+            split.NoteQmdPatch(Outcome::Unmapped);
             continue;
         }
         const FrontQmdMirror::Overlay* const existing =
             mirror.FindOverlay(&memory_manager, block_address);
         if ((existing != nullptr && existing->position > done) ||
             (existing == nullptr && mirror.evicted > done)) {
+            split.NoteQmdPatch(existing != nullptr ? Outcome::InlineQueued : Outcome::Evicted);
             continue; // Its inline QMD may still be queued
         }
         if (split.WriteStamp(*device, size, block_address, fs.upload_tag) > done) {
+            // Which term refused it; for a block or page stamp, whether the exact scan (this
+            // upload's own range left out) finds the writer too.
+            const auto why = split.WriteStampWhy(*device, size, block_address, fs.upload_tag);
+            const bool stamped = why.term == VideoCommon::StampTerm::Block ||
+                                 why.term == VideoCommon::StampTerm::Page;
+            const std::array<u64, 1> own{position};
+            split.NoteQmdPatchRefused(
+                why, done,
+                stamped ? split.ExactWriterCheck(done, block_address, *device, size,
+                                                 why.term_position, own)
+                        : u8{3});
             continue; // Another write may still land there
+        }
+        if (split.RangedOverflowPosition() > done) {
+            split.NoteQmdPatch(Outcome::MadeFloorUp);
         }
         NativeQmdScheduler::Descriptor qmd{};
         memory_manager.ReadBlockUnsafe(block_address, qmd.data(), size);
@@ -2850,6 +2885,7 @@ void KeplerCompute::FrontPatchOverlays(VideoCommon::GpuSplit& split, FrontState&
         mirror.AddOverlay(&memory_manager, block_address, position, qmd.data(), false,
                           feed_checked);
         Prediction::NoteMirror(Prediction::Mirror::OverlayFromMemory);
+        split.NoteQmdPatch(Outcome::Made);
     }
 }
 

@@ -1560,6 +1560,32 @@ dispatches with values a second (values each, how many filled in Configure, how 
 skipped and their values), QMDs a second (and reads that ran no dispatch), null pointer slots,
 and the verify counters below. Values below 3 change nothing here.
 
+### QMD wait floor line
+
+"QMD wait floor" (HW_GPU, every 5 s with EDEN_NX2_GPU_PROFILE on; fable_qmd_wait_brief piece 1,
+counting only): why the front's QMD scheduler copy (EXP13 = 2 to 4) waits at "qmd read". The
+front keeps at most 256 ranged 3D writes (constant buffer words, reports; EDEN_NX2_RANGED_MAX);
+at the next one the oldest is dropped and its position, `ranged_overflow_position`, counts for
+every address in the ring scans. It used to raise the "3D method write" floor; it is a term of
+its own now (the EXP13=2 wait cause line says "ranged overflow" for it), with the same effect.
+The line gives:
+- ranged ring overflows a second; QMD reads a second, how many with the overflow still queued,
+  and the ring words from it to the write position then (average, most);
+- small QMD patches a second by outcome: a holder (overlay or shadow) took it, an overlay from
+  memory made (and of them, made with the overflow queued: 0 unless EXP126 = 1), refused as
+  unmapped or GPU-written, an overlay queued, an evicted inline QMD, or by the stamps, by the
+  term that refused it (block stamp, page stamp, stamps on since/over 1 MiB, unknown write,
+  unbounded writer, unranged writer, queued function, 3D method write, ranged overflow), and how
+  many of those nothing but the overflow refused;
+- QMD read waits a second by the term that set the target (the same terms, and evicted inline
+  QMD) with the ring words each waited, and how many nothing but the overflow made wait;
+- for refusals and waits set by a block or page stamp: whether the exact scan over the same bytes
+  (GpuSplit::QueuedGuestWriters) finds the writer at the stamp, only an older or unbounded one, or
+  nothing (a hash collision, or a page stamp of a write elsewhere in the page), as counts for
+  the window: patches a/b/c, reads a/b/c;
+- macro DMA read waits a second (WaitForMemoryWriters with a range) and those whose target is the
+  ranged overflow, with the ring words each.
+
 ### EXP101
 
 EXP101 (live, 0 = off, 1 = runs, 2 = cached page pointer + prefetch; fable52_answer_presenter): nvhost_gpu::SubmitGPFIFOImpl's pushbuffer
