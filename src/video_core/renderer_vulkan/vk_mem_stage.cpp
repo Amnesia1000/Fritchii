@@ -1672,7 +1672,8 @@ bool MemStage::RingRoom() const noexcept {
     // next ConsumeSink while the stage goes on with the entries after it. A packet is a few KiB;
     // the margin holds hundreds. Short of it the draw is level (StageFillDraw).
     constexpr u64 Margin = u64{1} << 20;
-    return RingBytes - (ring_b_write - ring_b_freed.load(std::memory_order_acquire)) >= Margin;
+    // seq_cst: GPUMem's room wait tests it after announcing its sleep (NoteRingFreed's handshake).
+    return RingBytes - (ring_b_write - ring_b_freed.load(std::memory_order_seq_cst)) >= Margin;
 }
 
 void MemStage::PushRingDraw() {

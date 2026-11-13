@@ -1012,8 +1012,14 @@ void MemoryStageLink::NoteHookFlush() noexcept {
 
 void MemoryStageLink::NoteRingFreed() noexcept {
     // The back took or dropped a packet (its count is MemStage's, stored seq_cst before this).
-    // Only the window's waits need it (level mode waits for `consumed`).
-    if (Ahead() != 0 && stage_sleeping.load(std::memory_order_seq_cst)) {
+    // Only the window's waits need it (level mode waits for `consumed`), and of them only a
+    // GPUMem asleep on the window or on room in ring B: its other sleeps (the back's position,
+    // a run, the front) a take does not end, and each wake was a system call in the back's draw.
+    // GPUMem stores stage_ring_wait before stage_sleeping, both seq_cst, and tests the window
+    // and the room after: either this sees both, or GPUMem sees this take before it sleeps.
+    if (Ahead() != 0 && stage_sleeping.load(std::memory_order_seq_cst) &&
+        stage_ring_wait.load(std::memory_order_seq_cst)) {
+        LinkBump(counters.ring_wakes);
         WakeStage();
     }
 }
@@ -1100,6 +1106,7 @@ bool MemoryStageLink::StageWaitFor(std::stop_token& stop, StageWait reason, u64 
     // sleeping stage costs the front a wake in its next publish and a wake-up inside the drain
     // that follows. Level mode keeps the short spin.
     const bool long_spin = reason == StageWait::Input && ring_window != 0;
+    const bool ring_wait = reason == StageWait::Window || reason == StageWait::Room;
     u64 spin_from = start;
     bool ok = true;
     for (u32 spin = 0;;) {
@@ -1123,6 +1130,8 @@ bool MemoryStageLink::StageWaitFor(std::stop_token& stop, StageWait reason, u64 
             LinkPause();
             continue;
         }
+        // The back's take wakes only these two waits (NoteRingFreed).
+        stage_ring_wait.store(ring_wait, std::memory_order_seq_cst);
         stage_sleeping.store(true, std::memory_order_seq_cst);
         const u32 word = stage_word.load(std::memory_order_seq_cst);
         if (!reached() && calls.load(std::memory_order_seq_cst) == calls_seen &&
@@ -1134,6 +1143,9 @@ bool MemoryStageLink::StageWaitFor(std::stop_token& stop, StageWait reason, u64 
             }
         }
         stage_sleeping.store(false, std::memory_order_relaxed);
+        if (ring_wait) {
+            stage_ring_wait.store(false, std::memory_order_relaxed);
+        }
     }
     LinkBump(counters.stage_wait_ns[static_cast<size_t>(reason)], LinkNowNs() - start);
     return ok;
@@ -1739,6 +1751,7 @@ void MemoryStageLink::Take(Snapshot& out) const noexcept {
     out.write_levels = load(counters.write_levels);
     out.staging_fallbacks = load(counters.staging_fallbacks);
     out.hook_flushes = load(counters.hook_flushes);
+    out.ring_wakes = load(counters.ring_wakes);
     out.stage_idles = load(counters.stage_idles);
     out.run_input_waits = load(counters.run_input_waits);
 }
@@ -1867,9 +1880,9 @@ void MemoryStageLink::LogStats() {
                 "Memory stage window (FRITCHII_MEMSTAGE_AHEAD={}) {:.0f} s: packets in ring B at "
                 "each push {:.1f} on average, {} at most; per second by packets ahead ({}); the "
                 "back waited for the stage {:.0f}/s, {:.1f} ms/s; GPUMem waited for the window "
-                "{:.1f} ms/s, for room in ring B {:.1f} ms/s, level inside the window {:.1f} ms/s "
-                "({}/s; entries made hard by constant buffer words onto GPU-written data "
-                "{:.0f}/s); new staging buffers for GPUMem, the stream busy {:.0f}/s; served calls "
+                "{:.1f} ms/s, for room in ring B {:.1f} ms/s (woken by the back's takes "
+                "{:.0f}/s), level inside the window {:.1f} ms/s ({}/s; entries made hard by "
+                "constant buffer words onto GPU-written data {:.0f}/s); new staging buffers for GPUMem, the stream busy {:.0f}/s; served calls "
                 "while packets were ahead {:.0f}/s; sync catch-ups {:.0f}/s ({:.2f} ms/s); join "
                 "catch-ups {:.0f}/s; lends handed over at the run's start {:.0f}/s; the back "
                 "waited for the cache's lock held by GPUMem {:.0f}/s; GPUMem served the back's "
@@ -1885,6 +1898,7 @@ void MemoryStageLink::LogStats() {
                 ms(delta(&Snapshot::back_wait_ns)),
                 ms(current.stage_wait_ns[3] - reported.stage_wait_ns[3]),
                 ms(current.stage_wait_ns[4] - reported.stage_wait_ns[4]),
+                rate(delta(&Snapshot::ring_wakes)),
                 ms(current.stage_wait_ns[5] - reported.stage_wait_ns[5]), levels_text,
                 rate(delta(&Snapshot::write_levels)), rate(delta(&Snapshot::staging_fallbacks)),
                 rate(delta(&Snapshot::served_ahead)),

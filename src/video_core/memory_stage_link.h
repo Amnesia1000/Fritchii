@@ -504,6 +504,9 @@ private:
     alignas(64) std::atomic<u32> answered{0};
     alignas(64) std::atomic<u32> stage_word{0};
     std::atomic<bool> stage_sleeping{false};
+    /// Step 7: GPUMem's sleep waits for the window or for room in ring B, the only waits a take
+    /// ends (set before stage_sleeping, both seq_cst: a back that sees GPUMem asleep sees it).
+    std::atomic<bool> stage_ring_wait{false};
     alignas(64) std::atomic<u32> back_word{0};
     std::atomic<bool> back_sleeping{false};
 
@@ -626,6 +629,7 @@ private:
         std::atomic<u64> hash_mismatches{};
         std::atomic<u64> back_lock_waits{};   ///< the back waited for the lock GPUMem held
         std::atomic<u64> hook_flushes{};      ///< the back's skipped idle hook, its flush run
+        std::atomic<u64> ring_wakes{};        ///< takes that woke GPUMem (window or room wait)
         // Either thread's, rare (the must-be-0 checks).
         alignas(64) std::array<std::atomic<u64>, static_cast<size_t>(Check::Count)> checks{};
     };
@@ -674,6 +678,7 @@ private:
         u64 write_levels{};
         u64 staging_fallbacks{};
         u64 hook_flushes{};
+        u64 ring_wakes{};
         u64 stage_idles{};
         u64 run_input_waits{};
     };
