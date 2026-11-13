@@ -1133,6 +1133,7 @@ public:
 
 private:
     friend struct GpuSplitTestAccess;
+    friend struct MemStageShadowAccess; // memstage_shadow.cpp reads the ring's layout
 
     enum class Kind : u64 {
         Wrap,   ///< The rest of the ring is unused: continue at its start

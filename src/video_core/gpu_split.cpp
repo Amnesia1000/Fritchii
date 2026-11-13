@@ -234,6 +234,8 @@ void GpuSplit::MaybeStart(Core::System& system_) {
         return true;
     }();
     (void)switches_read;
+    // FRITCHII_MEMSTAGE_SHADOW (memstage_shadow.cpp): before the back thread exists.
+    MemStageShadow::ReadSwitch();
     ring = std::make_unique<u64[]>(RingWords);
     ++session;
     // EDEN_NX2_RUNAHEAD: Ocarina of Time only.
@@ -1690,6 +1692,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     g_back_thread_id.store(GetCurrentThreadId(), std::memory_order_relaxed);
 #endif
     u64 read_position = 0;
+    if (MemStageShadow::g_on) [[unlikely]] {
+        MemStageShadow::Start();
+    }
     while (!stop_token.stop_requested()) {
         Nx2Profile::Report("GPU back thread");
         u64 available = published.load(std::memory_order_acquire);
@@ -1778,6 +1783,11 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             if (read_position >= Runahead::g_apply_at.load(std::memory_order_relaxed))
                 [[unlikely]] {
                 Runahead::ApplyDue(read_position);
+            }
+            // FRITCHII_MEMSTAGE_SHADOW: the memory stage's inputs for this entry, compared at
+            // the back's draws (memstage_shadow.cpp). Off: this one test per entry.
+            if (MemStageShadow::g_on) [[unlikely]] {
+                MemStageShadow::Before(read_position);
             }
             const size_t size =
                 Execute(&ring[index], std::min<u64>(available - read_position, RingWords - index));

@@ -6,17 +6,28 @@
 #include <cstring>
 #include <set>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 
 #include "common/settings.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/memstage_shadow.h"
+#include "video_core/memstage_shadow_engine.h"
 #include "video_core/memstage_stats.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/render_trace.h"
 
 namespace Tegra::Engines {
 namespace {
+
+// The draw manager's code runs on the back's Maxwell3D and on the memory stage's copy of its
+// registers (VideoCommon::MemStageShadowEngine, FRITCHII_MEMSTAGE_SHADOW): one code, two
+// instantiations (the end of this file), so which draws the stage finds, and what state each one
+// sees, is decided by the same lines (fable_memstage_step6_spec.md 4.2). They differ only where a
+// draw is issued (the rasterizer, or the stage's StageDraw) and in the back's counters.
+template <typename Engine>
+constexpr bool IsBack = std::is_same_v<Engine, Maxwell3D>;
 
 void TraceSuppressedDraw(const Maxwell3D& maxwell3d, bool indirect) {
     if (!VideoCommon::RenderTrace::Enabled()) {
@@ -39,7 +50,8 @@ void TraceSuppressedDraw(const Maxwell3D& maxwell3d, bool indirect) {
 
 } // namespace
 
-void Maxwell3D::DrawManager::ProcessMethodCall(Maxwell3D& maxwell3d, u32 method, u32 argument) {
+template <typename Engine>
+void Maxwell3D::DrawManager::ProcessMethodCall(Engine& maxwell3d, u32 method, u32 argument) {
     switch (method) {
     case MAXWELL3D_REG_INDEX(clear_surface):
         return Clear(maxwell3d, 1);
@@ -92,15 +104,19 @@ void Maxwell3D::DrawManager::ProcessMethodCall(Maxwell3D& maxwell3d, u32 method,
     }
 }
 
-void Maxwell3D::DrawManager::Clear(Maxwell3D& maxwell3d, u32 layer_count) {
+template <typename Engine>
+void Maxwell3D::DrawManager::Clear(Engine& maxwell3d, u32 layer_count) {
     // EDEN_NX2_MEMSTAGE_STATS: clears render-enable skips.
-    VideoCommon::MemStageStats::Clear(!maxwell3d.ShouldExecute());
+    if constexpr (IsBack<Engine>) {
+        VideoCommon::MemStageStats::Clear(!maxwell3d.ShouldExecute());
+    }
     if (maxwell3d.ShouldExecute()) {
         maxwell3d.rasterizer->Clear(layer_count);
     }
 }
 
-void Maxwell3D::DrawManager::DrawDeferred(Maxwell3D& maxwell3d, bool loop_continues) {
+template <typename Engine>
+void Maxwell3D::DrawManager::DrawDeferred(Engine& maxwell3d, bool loop_continues) {
     if (draw_state.draw_mode != DrawMode::Instance || draw_state.instance_count == 0) {
         if (first_folded) [[unlikely]] {
             // The loop a folded first instance began never came: draw it on its own after all
@@ -153,7 +169,8 @@ bool Maxwell3D::DrawManager::IsInstanceLoopMethod(u32 method) noexcept {
     }
 }
 
-void Maxwell3D::DrawManager::DrawArray(Maxwell3D& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 vertex_first, u32 vertex_count, u32 base_instance, u32 num_instances) {
+template <typename Engine>
+void Maxwell3D::DrawManager::DrawArray(Engine& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 vertex_first, u32 vertex_count, u32 base_instance, u32 num_instances) {
     draw_state.topology = topology;
     draw_state.vertex_buffer.first = vertex_first;
     draw_state.vertex_buffer.count = vertex_count;
@@ -161,7 +178,8 @@ void Maxwell3D::DrawManager::DrawArray(Maxwell3D& maxwell3d, Maxwell3D::Regs::Pr
     ProcessDraw(maxwell3d, false, num_instances);
 }
 
-void Maxwell3D::DrawManager::DrawArrayInstanced(Maxwell3D& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 vertex_first, u32 vertex_count, bool subsequent) {
+template <typename Engine>
+void Maxwell3D::DrawManager::DrawArrayInstanced(Engine& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 vertex_first, u32 vertex_count, bool subsequent) {
     draw_state.topology = topology;
     draw_state.vertex_buffer.first = vertex_first;
     draw_state.vertex_buffer.count = vertex_count;
@@ -175,7 +193,8 @@ void Maxwell3D::DrawManager::DrawArrayInstanced(Maxwell3D& maxwell3d, Maxwell3D:
     ProcessDraw(maxwell3d, false, 1);
 }
 
-void Maxwell3D::DrawManager::DrawIndex(Maxwell3D& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 index_first, u32 index_count, u32 base_index, u32 base_instance, u32 num_instances) {
+template <typename Engine>
+void Maxwell3D::DrawManager::DrawIndex(Engine& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 index_first, u32 index_count, u32 base_index, u32 base_instance, u32 num_instances) {
     draw_state.topology = topology;
     draw_state.index_buffer = maxwell3d.regs.index_buffer;
     draw_state.index_buffer.first = index_first;
@@ -185,12 +204,14 @@ void Maxwell3D::DrawManager::DrawIndex(Maxwell3D& maxwell3d, Maxwell3D::Regs::Pr
     ProcessDraw(maxwell3d, true, num_instances);
 }
 
-void Maxwell3D::DrawManager::DrawArrayIndirect(Maxwell3D& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology) {
+template <typename Engine>
+void Maxwell3D::DrawManager::DrawArrayIndirect(Engine& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology) {
     draw_state.topology = topology;
     ProcessDrawIndirect(maxwell3d);
 }
 
-void Maxwell3D::DrawManager::DrawIndexedIndirect(Maxwell3D& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 index_first, u32 index_count) {
+template <typename Engine>
+void Maxwell3D::DrawManager::DrawIndexedIndirect(Engine& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 index_first, u32 index_count) {
     draw_state.topology = topology;
     draw_state.index_buffer = maxwell3d.regs.index_buffer;
     draw_state.index_buffer.first = index_first;
@@ -198,7 +219,8 @@ void Maxwell3D::DrawManager::DrawIndexedIndirect(Maxwell3D& maxwell3d, Maxwell3D
     ProcessDrawIndirect(maxwell3d);
 }
 
-void Maxwell3D::DrawManager::SetInlineIndexBuffer(Maxwell3D& maxwell3d, u32 index) {
+template <typename Engine>
+void Maxwell3D::DrawManager::SetInlineIndexBuffer(Engine& maxwell3d, u32 index) {
     draw_state.inline_index_draw_indexes.push_back(u8(index & 0x000000ff));
     draw_state.inline_index_draw_indexes.push_back(u8((index & 0x0000ff00) >> 8));
     draw_state.inline_index_draw_indexes.push_back(u8((index & 0x00ff0000) >> 16));
@@ -206,7 +228,8 @@ void Maxwell3D::DrawManager::SetInlineIndexBuffer(Maxwell3D& maxwell3d, u32 inde
     draw_state.draw_mode = DrawMode::InlineIndex;
 }
 
-void Maxwell3D::DrawManager::SetInlineIndexBuffer(Maxwell3D& maxwell3d, u32 method,
+template <typename Engine>
+void Maxwell3D::DrawManager::SetInlineIndexBuffer(Engine& maxwell3d, u32 method,
                                                   const u32* base_start, u32 amount) {
     auto& index_buffer = draw_state.inline_index_draw_indexes;
     switch (method) {
@@ -244,7 +267,8 @@ void Maxwell3D::DrawManager::SetInlineIndexBuffer(Maxwell3D& maxwell3d, u32 meth
     draw_state.draw_mode = DrawMode::InlineIndex;
 }
 
-void Maxwell3D::DrawManager::DrawBegin(Maxwell3D& maxwell3d) {
+template <typename Engine>
+void Maxwell3D::DrawManager::DrawBegin(Engine& maxwell3d) {
     auto reset_instance_count = maxwell3d.regs.draw.instance_id == Maxwell3D::Regs::Draw::InstanceId::First;
     auto increment_instance_count = maxwell3d.regs.draw.instance_id == Maxwell3D::Regs::Draw::InstanceId::Subsequent;
     if (reset_instance_count) {
@@ -258,14 +282,16 @@ void Maxwell3D::DrawManager::DrawBegin(Maxwell3D& maxwell3d) {
     draw_state.topology = maxwell3d.regs.draw.topology;
 }
 
-void Maxwell3D::DrawManager::AddLoopInstances(Maxwell3D& maxwell3d, u32 count) {
+template <typename Engine>
+void Maxwell3D::DrawManager::AddLoopInstances(Engine& maxwell3d, u32 count) {
     // DrawBegin, `count` times, for draw.instance_id == Subsequent.
     draw_state.instance_count += count;
     draw_state.draw_mode = DrawMode::Instance;
     draw_state.topology = maxwell3d.regs.draw.topology;
 }
 
-void Maxwell3D::DrawManager::DrawEnd(Maxwell3D& maxwell3d, u32 instance_count, bool force_draw) {
+template <typename Engine>
+void Maxwell3D::DrawManager::DrawEnd(Engine& maxwell3d, u32 instance_count, bool force_draw) {
     // List draws (nx2_list_draw.h): set between this draw.end and its draw.begin, for this draw only.
     const GPUVAddr list_draw_address = std::exchange(draw_state.list_draw_address, 0);
     const u64 list_keep_id = std::exchange(draw_state.list_keep_id, 0);
@@ -334,7 +360,8 @@ void Maxwell3D::DrawManager::DrawEnd(Maxwell3D& maxwell3d, u32 instance_count, b
     }
 }
 
-void Maxwell3D::DrawManager::DrawIndexSmall(Maxwell3D& maxwell3d, u32 argument) {
+template <typename Engine>
+void Maxwell3D::DrawManager::DrawIndexSmall(Engine& maxwell3d, u32 argument) {
     Maxwell3D::Regs::IndexBufferSmall index_small_params{argument};
     draw_state.base_instance = maxwell3d.regs.global_base_instance_index;
     draw_state.base_index = maxwell3d.regs.global_base_vertex_index;
@@ -346,7 +373,8 @@ void Maxwell3D::DrawManager::DrawIndexSmall(Maxwell3D& maxwell3d, u32 argument) 
     ProcessDraw(maxwell3d, true, 1);
 }
 
-void Maxwell3D::DrawManager::DrawTexture(Maxwell3D& maxwell3d) {
+template <typename Engine>
+void Maxwell3D::DrawManager::DrawTexture(Engine& maxwell3d) {
     draw_texture_state.dst_x0 = f32(maxwell3d.regs.draw_texture.dst_x0) / 4096.f;
     draw_texture_state.dst_y0 = f32(maxwell3d.regs.draw_texture.dst_y0) / 4096.f;
     const auto dst_width = f32(maxwell3d.regs.draw_texture.dst_width) / 4096.f;
@@ -366,7 +394,8 @@ void Maxwell3D::DrawManager::DrawTexture(Maxwell3D& maxwell3d) {
     maxwell3d.rasterizer->DrawTexture();
 }
 
-void Maxwell3D::DrawManager::UpdateTopology(Maxwell3D& maxwell3d) {
+template <typename Engine>
+void Maxwell3D::DrawManager::UpdateTopology(Engine& maxwell3d) {
     switch (maxwell3d.regs.primitive_topology_control) {
     case Maxwell3D::Regs::PrimitiveTopologyControl::UseInBeginMethods:
         break;
@@ -391,29 +420,54 @@ void Maxwell3D::DrawManager::UpdateTopology(Maxwell3D& maxwell3d) {
     }
 }
 
-void Maxwell3D::DrawManager::ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed, u32 instance_count) {
+template <typename Engine>
+void Maxwell3D::DrawManager::ProcessDraw(Engine& maxwell3d, bool draw_indexed, u32 instance_count) {
     draw_state.draw_element_count =
         draw_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count;
     LOG_TRACE(HW_GPU, "called, topology={}, count={}", draw_state.topology, draw_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count);
     UpdateTopology(maxwell3d);
-    // EDEN_NX2_MEMSTAGE_STATS: draws per channel, and those render-enable skips (section 4).
-    VideoCommon::MemStageStats::Draw(!maxwell3d.ShouldExecute());
-    if (maxwell3d.ShouldExecute()) {
-        maxwell3d.rasterizer->Draw(draw_indexed, instance_count);
+    if constexpr (!IsBack<Engine>) {
+        // The stage's draw, at the point the back's is compared (before the render-enable test).
+        maxwell3d.StageDraw(draw_indexed, instance_count, false);
     } else {
-        TraceSuppressedDraw(maxwell3d, false);
+        // FRITCHII_MEMSTAGE_SHADOW: the stage's copy issued the same draw (compares a and b).
+        if (VideoCommon::MemStageShadow::g_on) [[unlikely]] {
+            VideoCommon::MemStageShadow::BackDraw(maxwell3d, draw_indexed, instance_count, false);
+        }
+        // EDEN_NX2_MEMSTAGE_STATS: draws per channel, and those render-enable skips (section 4).
+        VideoCommon::MemStageStats::Draw(!maxwell3d.ShouldExecute());
+        if (maxwell3d.ShouldExecute()) {
+            maxwell3d.rasterizer->Draw(draw_indexed, instance_count);
+        } else {
+            TraceSuppressedDraw(maxwell3d, false);
+        }
     }
 }
 
-void Maxwell3D::DrawManager::ProcessDrawIndirect(Maxwell3D& maxwell3d) {
+template <typename Engine>
+void Maxwell3D::DrawManager::ProcessDrawIndirect(Engine& maxwell3d) {
     draw_state.draw_element_count = 0;
     LOG_TRACE(HW_GPU, "called, topology={}, is_indexed={}, includes_count={}, buffer_size={}, max_draw_count={}", draw_state.topology, indirect_state.is_indexed, indirect_state.include_count, indirect_state.buffer_size, indirect_state.max_draw_counts);
     UpdateTopology(maxwell3d);
-    VideoCommon::MemStageStats::Draw(!maxwell3d.ShouldExecute());
-    if (maxwell3d.ShouldExecute()) {
-        maxwell3d.rasterizer->DrawIndirect();
+    if constexpr (!IsBack<Engine>) {
+        maxwell3d.StageDraw(true, 1, true);
     } else {
-        TraceSuppressedDraw(maxwell3d, true);
+        if (VideoCommon::MemStageShadow::g_on) [[unlikely]] {
+            VideoCommon::MemStageShadow::BackDraw(maxwell3d, indirect_state.is_indexed, 1, true);
+        }
+        VideoCommon::MemStageStats::Draw(!maxwell3d.ShouldExecute());
+        if (maxwell3d.ShouldExecute()) {
+            maxwell3d.rasterizer->DrawIndirect();
+        } else {
+            TraceSuppressedDraw(maxwell3d, true);
+        }
     }
 }
+// The two engines the draw manager's code runs on (see IsBack above).
+#define FRITCHII_DRAW_MANAGER_INSTANTIATE(E)                                                             template void Maxwell3D::DrawManager::ProcessMethodCall<E>(E&, u32, u32);                           template void Maxwell3D::DrawManager::Clear<E>(E&, u32);                                            template void Maxwell3D::DrawManager::DrawDeferred<E>(E&, bool);                                    template void Maxwell3D::DrawManager::DrawArray<E>(E&, Maxwell3D::Regs::PrimitiveTopology, u32,                                                        u32, u32, u32);                                 template void Maxwell3D::DrawManager::DrawArrayInstanced<E>(                                            E&, Maxwell3D::Regs::PrimitiveTopology, u32, u32, bool);                                        template void Maxwell3D::DrawManager::DrawIndex<E>(E&, Maxwell3D::Regs::PrimitiveTopology, u32,                                                        u32, u32, u32, u32);                            template void Maxwell3D::DrawManager::DrawArrayIndirect<E>(E&,                                                                                                 Maxwell3D::Regs::PrimitiveTopology);     template void Maxwell3D::DrawManager::DrawIndexedIndirect<E>(                                           E&, Maxwell3D::Regs::PrimitiveTopology, u32, u32);                                              template void Maxwell3D::DrawManager::SetInlineIndexBuffer<E>(E&, u32);                             template void Maxwell3D::DrawManager::SetInlineIndexBuffer<E>(E&, u32, const u32*, u32);            template void Maxwell3D::DrawManager::DrawBegin<E>(E&);                                             template void Maxwell3D::DrawManager::AddLoopInstances<E>(E&, u32);                                 template void Maxwell3D::DrawManager::DrawEnd<E>(E&, u32, bool);                                    template void Maxwell3D::DrawManager::DrawIndexSmall<E>(E&, u32);                                   template void Maxwell3D::DrawManager::DrawTexture<E>(E&);                                           template void Maxwell3D::DrawManager::UpdateTopology<E>(E&);                                        template void Maxwell3D::DrawManager::ProcessDraw<E>(E&, bool, u32);                                template void Maxwell3D::DrawManager::ProcessDrawIndirect<E>(E&);
+
+FRITCHII_DRAW_MANAGER_INSTANTIATE(Maxwell3D)
+FRITCHII_DRAW_MANAGER_INSTANTIATE(VideoCommon::MemStageShadowEngine)
+#undef FRITCHII_DRAW_MANAGER_INSTANTIATE
+
 } // namespace Tegra::Engines

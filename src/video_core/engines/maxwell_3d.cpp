@@ -1283,7 +1283,12 @@ void Maxwell3D::ProcessQueryGet() {
 void Maxwell3D::ProcessQueryCondition() {
     const VideoCommon::Nx2Profile::FineScope profile_scope{
         VideoCommon::Nx2Profile::Zone::RenderEnable};
-    if (rasterizer->AccelerateConditionalRendering()) {
+    const bool host_condition = rasterizer->AccelerateConditionalRendering();
+    // FRITCHII_MEMSTAGE_SHADOW: draws under host conditional rendering are level (spec 3.4).
+    if (VideoCommon::MemStageShadow::g_on) [[unlikely]] {
+        VideoCommon::MemStageShadow::BackCondition(host_condition);
+    }
+    if (host_condition) {
         execute_on = true;
         // EDEN_NX2_MEMSTAGE_STATS: decided by the host (the draws run predicated).
         VideoCommon::MemStageStats::Condition(true, true);
