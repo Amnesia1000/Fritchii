@@ -964,6 +964,42 @@ void MemStage::SnapshotValues(ValueCounts& out) const {
         out.checks[kind] = load(value_counters.checks[kind]);
         out.mismatches[kind] = load(value_counters.mismatches[kind]);
     }
+    out.left_out = load(value_counters.left_out);
+}
+
+bool MemStage::ValueLeftOut(Tegra::MemoryManager& gpu_memory,
+                            std::span<const std::pair<u64, u64>> ranges) {
+    // The back holds a ring packet and GPUMem keeps its writes (the window open, its verify on).
+    if (!held_ring || held != HeldKind::Draw || !Link::StageWritesKept()) {
+        return false;
+    }
+    const Link& link = Link::Get();
+    bool hit = false;
+    for (const auto& [gpu_address, size] : ranges) {
+        // Per GPU page: the device range it maps to.
+        constexpr u64 Page = 0x1000;
+        for (u64 piece = gpu_address; piece < gpu_address + size && !hit;) {
+            const u64 piece_end = (std::min)(gpu_address + size, (piece + Page) & ~(Page - 1));
+            if (const auto device = gpu_memory.GpuToCpuAddress(piece)) {
+                const u64 begin = *device;
+                const u64 end = begin + (piece_end - piece);
+                link.ForEachStageWriteSince(played_stage_writes,
+                                            [&](u64 write_begin, u64 write_end, u64) {
+                                                hit = write_begin < end && begin < write_end;
+                                                return hit;
+                                            });
+            }
+            piece = piece_end;
+        }
+        if (hit) {
+            break;
+        }
+    }
+    if (hit) {
+        Bump(value_counters.checks[static_cast<size_t>(Value::Handle)]);
+        Bump(value_counters.left_out);
+    }
+    return hit;
 }
 
 void MemStage::LogValueStats(double seconds, bool first) {
@@ -997,13 +1033,15 @@ void MemStage::LogValueStats(double seconds, bool first) {
         LOG_INFO(Render_Vulkan,
                  "  memory seam by value: draws {}; dispatches {}; QMDs {:.0f}/s ({:.0f}/s ran no "
                  "dispatch); null pointer slots {:.0f}/s ({} not kept); verify {:#x}: checks "
-                 "handle {} QMD {} slot {}, mismatches (5.4) handle {} QMD {} slot {}, count {}",
+                 "handle {} QMD {} slot {}, mismatches (5.4) handle {} QMD {} slot {}, count {}; "
+                 "handle values left out as GPUMem's own later writes {}",
                  sides[0], sides[1], rate(current.qmds - last.qmds),
                  rate(current.qmds_unused - last.qmds_unused),
                  rate(current.null_slots - last.null_slots),
                  current.null_slots_unkept - last.null_slots_unkept, VerifyBits(),
                  delta(0, true), delta(1, true), delta(2, true), delta(0, false),
-                 delta(1, false), delta(2, false), delta(3, false));
+                 delta(1, false), delta(2, false), delta(3, false),
+                 current.left_out - last.left_out);
     }
     reported_values = current;
 }
@@ -1620,6 +1658,7 @@ void MemStage::PushRingDraw() {
     header.value_count = value_count;
     header.value_flags = (ring_values != nullptr ? 1U : 0U) | (ring_null_pointers ? 2U : 0U);
     header.tracker_bytes = tracker_bytes;
+    header.stage_writes = Link::Get().StageWriteCount();
     if (stage_log) {
         // Step 7's verify: the fill's read log, in packet order, before the packet is visible.
         header.flags |= 2;
@@ -1737,6 +1776,7 @@ void MemStage::TakeRingHeader(const RingHeader& header) {
     held_cursor = header.held_cursor;
     held_form = (header.flags & 1) != 0;
     held_hashes = header.hashes;
+    played_stage_writes = header.stage_writes;
     const bool logged = (header.flags & 2) != 0;
     const u64 number = header.number;
     ring_b_read += header.bytes;

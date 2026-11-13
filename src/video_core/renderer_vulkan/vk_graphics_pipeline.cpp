@@ -1642,6 +1642,31 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         const VideoCommon::GraphicsHandleCbufs<std::remove_cvref_t<decltype(cbufs)>> cbuf_view{
             cbufs};
         const u64 storage_alignment{device.GetStorageBufferAlignment()};
+        // Memory stage step 7 (the 5.4 check with the window open): the game memory a handle's
+        // own read takes, for MemStage::ValueLeftOut: its word or two, or for a handle program
+        // every enabled constant buffer of the stage (its storage words are not known here).
+        const auto handle_ranges{[&](const auto& desc, u32 index) {
+            boost::container::small_vector<std::pair<u64, u64>, 18> ranges;
+            if (desc.handle_program != ~0U) {
+                for (const auto& cbuf : cbufs) {
+                    if (cbuf.enabled && cbuf.size != 0) {
+                        ranges.emplace_back(cbuf.address, cbuf.size);
+                    }
+                }
+                return ranges;
+            }
+            ranges.emplace_back(cbuf_view.Base(desc.cbuf_index) + desc.cbuf_offset +
+                                    (index << desc.size_shift),
+                                sizeof(u32));
+            if constexpr (requires { desc.has_secondary; }) {
+                if (desc.has_secondary) {
+                    ranges.emplace_back(cbuf_view.Base(desc.secondary_cbuf_index) +
+                                            desc.secondary_cbuf_offset,
+                                        sizeof(u32));
+                }
+            }
+            return ranges;
+        }};
         // SEAM >= 3: the next value of the draw packet, false past its end (a count mismatch,
         // counted when the loop ends).
         const auto next_value{[&](u32& value) {
@@ -1666,9 +1691,15 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 // FRITCHII_MEMSTAGE_VERIFY & 1 (5.4): the back's own read.
                 const u32 own{VideoCommon::RawTextureHandle<false>(
                     info, desc, index, *gpu_memory, cbuf_view, storage_alignment)};
-                mem_stage.NoteValueCheck(MemStage::Value::Handle, own == value,
-                                         VideoCommon::HandleWordAddress(desc, index, cbuf_view),
-                                         key.unique_hashes[stage + 1], value, own);
+                // With the window open GPUMem may have written the words since the fill (left
+                // out and counted apart); any other difference is a mismatch.
+                if (own == value ||
+                    !mem_stage.ValueLeftOut(*gpu_memory, handle_ranges(desc, index))) {
+                    mem_stage.NoteValueCheck(
+                        MemStage::Value::Handle, own == value,
+                        VideoCommon::HandleWordAddress(desc, index, cbuf_view),
+                        key.unique_hashes[stage + 1], value, own);
+                }
             }
             return value;
         }};
@@ -1797,10 +1828,14 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                         if (!next_value(value)) [[unlikely]] {
                             value = own[element];
                         } else if (verify_handles) [[unlikely]] {
-                            mem_stage.NoteValueCheck(
-                                MemStage::Value::Handle, own[element] == value,
-                                VideoCommon::HandleWordAddress(desc, element, cbuf_view),
-                                key.unique_hashes[stage + 1], value, own[element]);
+                            if (own[element] == value ||
+                                !mem_stage.ValueLeftOut(*gpu_memory,
+                                                        handle_ranges(desc, element))) {
+                                mem_stage.NoteValueCheck(
+                                    MemStage::Value::Handle, own[element] == value,
+                                    VideoCommon::HandleWordAddress(desc, element, cbuf_view),
+                                    key.unique_hashes[stage + 1], value, own[element]);
+                            }
                         }
                         table_element(element, value);
                     }

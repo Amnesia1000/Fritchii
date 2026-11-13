@@ -613,6 +613,12 @@ session after a catch-up could not finish (below; logged).
   of the write ring" and "CPU-written marks noted" (marks taken anywhere: served and inline gathers
   and invalidations, InnerInvalidation, game cores' trapped stores). Keep
   FRITCHII_MEMSTAGE_RING_VERIFY (compare b's hash) on with it.
+- FRITCHII_MEMSTAGE_VERIFY & 1 (5.4, handle values) with the window open: the back's own read is
+  at play, after GPUMem wrote constant buffer words for later entries, so a handle value whose
+  words GPUMem wrote since the packet's fill (from its own-write ring; for a handle program, any
+  enabled constant buffer of the stage) is left out and counted apart on the by-value line
+  ("handle values left out as GPUMem's own later writes"); any other difference is a mismatch.
+  The QMD and null pointer slot checks read twice at once inside level runs and are unchanged.
 - Order of the verify runs: 1, 8, 64, unlimited (work\run_step7_verify.sh), then the fps gate
   against THREAD 0 (work\run_step7_gate.sh).
 
