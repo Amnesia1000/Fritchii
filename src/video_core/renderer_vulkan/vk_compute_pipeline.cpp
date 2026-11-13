@@ -404,8 +404,12 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     shadow.reset();
     guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
 
+    // SEAM = 2 (EXP123): the memory stage filled the dispatch's buffer side before this call
+    // (MemStage::FillDispatch); its calls below are skipped and its section played in place.
+    MemStage& mem_stage = buffer_cache.runtime.Seam();
+    const MemStage::DispatchPacket* const held = mem_stage.HeldDispatch();
     namespace Profile = VideoCommon::Nx2Profile;
-    {
+    if (held == nullptr) {
         const Profile::Scope pointers_scope{Profile::Zone::ComputePointers};
         buffer_cache.SetComputeUniformBufferState(info.constant_buffer_mask, &uniform_buffer_sizes);
         buffer_cache.UnbindComputeStorageBuffers();
@@ -641,7 +645,10 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         shadow = texture_runtime.CreateByteAddressedShadow(target_view);
     }
 
-    buffer_cache.UnbindComputeTextureBuffers();
+    if (held == nullptr) {
+        // A held dispatch has no texel buffers (else it fills here, LateFill).
+        buffer_cache.UnbindComputeTextureBuffers();
+    }
     size_t index{};
     const auto add_buffer{[&](const auto& desc) {
         constexpr bool is_image = std::is_same_v<decltype(desc), const ImageBufferDescriptor&>;
@@ -666,10 +673,14 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     std::ranges::for_each(info.texture_buffer_descriptors, add_buffer);
     std::ranges::for_each(info.image_buffer_descriptors, add_buffer);
 
-    {
+    if (held != nullptr) {
+        // SEAM = 2: the `before` section, filled before Configure, played here.
+        const Profile::Scope sync_scope{Profile::Zone::ComputeSync};
+        mem_stage.PlayHeld(held->before);
+    } else {
         // The dispatch's `before` section: its uploads, binds and descriptors are played here,
         // before the image descriptors.
-        MemStage::FillPlay seam{buffer_cache.runtime.Seam(), MemStage::Site::DispatchBefore};
+        MemStage::FillPlay seam{mem_stage, MemStage::Site::DispatchBefore};
         {
             const Profile::Scope resolve_scope{Profile::Zone::ComputeResolve};
             buffer_cache.UpdateComputeBuffers();

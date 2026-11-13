@@ -74,6 +74,19 @@ public:
         return shader_hash;
     }
 
+    /// What the memory stage's FillDispatch needs (SEAM = 2, vk_mem_stage.cpp).
+    [[nodiscard]] MemStage::DispatchFacts MemFacts() const noexcept {
+        return {
+            .uniform_mask = info.constant_buffer_mask,
+            .uniform_sizes = &uniform_buffer_sizes,
+            .info = &info,
+            .shader_hash = shader_hash,
+            .has_texel_buffers =
+                !info.texture_buffer_descriptors.empty() || !info.image_buffer_descriptors.empty(),
+            .uses_descriptor_buffer = uses_descriptor_buffer,
+        };
+    }
+
     /// Storage images written by the last configured dispatch
     [[nodiscard]] std::span<const VideoCommon::ImageViewId> WrittenImages() const noexcept {
         return written_images;

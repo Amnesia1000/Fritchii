@@ -576,6 +576,8 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
       frame_dump(device, memory_allocator, scheduler),
       flash_watch(device, memory_allocator, scheduler) {
     scheduler.SetQueryCache(query_cache);
+    // The memory seam's read log asks this cache's tracker; its tick guard restamps this pool.
+    mem_stage.Attach(buffer_cache, buffer_staging_pool);
     VideoCommon::FritchiiDrawKinds::Init();
     // EDEN_NX2_MEMSTAGE_STATS: stream writes are tested against the texture cache's pages.
     VideoCommon::MemStageStats::SetImagePageFilters(&texture_cache.page_filter,
@@ -1485,9 +1487,13 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     const bool keep_last_draw =
         fast_draw_counting ||
         VideoCore::Nx2Debug::g_experiments[106].load(std::memory_order_relaxed) != 0;
+    // SEAM = 2 (EXP123): the draw's buffer side is filled here, before the texture work;
+    // Configure plays its sections and PlayRestAfter what is left, whatever Configure returns.
+    mem_stage.FillDraw(buffer_cache, pipeline->MemFacts(), is_indexed);
     if (Profile::Scope scope{Profile::Zone::Configure};
-        !(delta_pipeline != nullptr ? pipeline->ConfigureDelta(is_indexed)
-                                    : pipeline->Configure(is_indexed, keep_last_draw))) {
+        !mem_stage.PlayRestAfter(delta_pipeline != nullptr
+                                     ? pipeline->ConfigureDelta(is_indexed)
+                                     : pipeline->Configure(is_indexed, keep_last_draw))) {
         report_failure("configure failed");
         TraceRenderState(is_indexed, "configure-failed", nullptr);
         return;
@@ -2977,9 +2983,13 @@ void RasterizerVulkan::DispatchCompute() {
     const bool marking_effects = oot_effects_frame == render_trace_frame && OcarinaTemporalEnabled() &&
                                  !indirect_address && !frame_dump.Capturing();
     ComputePipeline::BindCommand deferred_bind;
-    if (!pipeline->Configure(*kepler_compute, *gpu_memory, scheduler, buffer_cache,
-                             texture_cache, texture_cache_runtime, byte_addressed_shadow,
-                             can_replace || marking_effects ? &deferred_bind : nullptr)) {
+    // SEAM = 2 (EXP123): the dispatch's buffer side is filled here, before Configure's texture
+    // work; Configure plays it and PlayRestAfter what is left.
+    mem_stage.FillDispatch(buffer_cache, pipeline->MemFacts());
+    if (!mem_stage.PlayRestAfter(pipeline->Configure(
+            *kepler_compute, *gpu_memory, scheduler, buffer_cache, texture_cache,
+            texture_cache_runtime, byte_addressed_shadow,
+            can_replace || marking_effects ? &deferred_bind : nullptr))) {
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute resources unavailable");
         return;
     }
