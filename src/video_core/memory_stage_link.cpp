@@ -585,6 +585,7 @@ bool MemoryStageLink::BackRingTop(u64 position) {
         Ring::LentFrom().store(0, std::memory_order_relaxed);
         Ring::LentUntil().store(0, std::memory_order_relaxed);
         back_draw_seq = 0;
+        back_run_from = ~u64{0};
         back_drew_in_run.store(nullptr, std::memory_order_relaxed);
         back_state_in_run.store(nullptr, std::memory_order_relaxed);
         lend_ranges.clear();
@@ -627,10 +628,16 @@ void MemoryStageLink::BackEntry(u64 position, const BackLimits& limits) {
     }
     const bool lent = position >= limits.lent_from && position < limits.lent_until;
     if (lent && !t_back_run) {
-        // A run starts: the cache is the back's until its last entry.
+        // A run starts: the cache is the back's until its last entry. A run the stage extended
+        // after the back had ended it (same lent_from) goes on: what the back drew in its first
+        // part stays noted for the return.
+        const bool continued = limits.lent_from == back_run_from;
         t_back_run = true;
         t_back_served = false;
         back_run_from = limits.lent_from;
+        if (continued) {
+            return;
+        }
         back_run_seen_ns = LinkNowNs();
         back_drew_in_run.store(nullptr, std::memory_order_relaxed);
         back_state_in_run.store(nullptr, std::memory_order_relaxed);
@@ -659,7 +666,9 @@ bool MemoryStageLink::BackAfter(u64 position, const BackLimits& limits) {
     if (!t_back_run || position < limits.lent_until) {
         return false;
     }
-    return true;
+    // The stage may have extended the run since the batch's limits were read (it stores
+    // lent_until before `staged`): the run ends only at its current end.
+    return position >= Ring::LentUntil().load(std::memory_order_acquire);
 }
 
 void MemoryStageLink::BackEndRun() {
