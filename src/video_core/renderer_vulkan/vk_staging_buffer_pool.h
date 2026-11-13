@@ -46,6 +46,10 @@ public:
             VideoCommon::BufferChurnStats::StagingCaller::Other);
     void FreeDeferred(StagingBufferRef& ref);
 
+    /// The memory seam's tick guard (SEAM = 2): cached staging buffers stamped `from` get the
+    /// current tick (the copy that reads them was recorded after a flush).
+    void Retick(u64 from);
+
     [[nodiscard]] VkBuffer StreamBuf() const noexcept {
         return *stream_buffer;
     }

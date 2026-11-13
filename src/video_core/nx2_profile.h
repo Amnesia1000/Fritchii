@@ -107,6 +107,8 @@ enum class Zone : u32 {
     PoolDestroyHere,    ///< An evicted pool image destroyed on the spot (TickFrame, eviction)
     PoolDestroyIdle,    ///< EXP99=1: evicted pool images destroyed in the back's idle hook
     PoolDestroyBacklog, ///< EXP110: the idle backlog destroyed at the frame's end
+    MemoryFill,
+    MemoryPlay,
     Count,
 };
 
@@ -128,6 +130,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "uniform bank check", "uniform stream", "uniform classic", "stage storage buffers",
     "stage texture buffers", "storage synchronize", "storage written marks",
     "image create", "pool destroy here", "pool destroy idle", "pool destroy backlog",
+    "memory fill", "memory play",
 };
 static_assert(zone_names.back() != nullptr, "a zone without a name");
 
