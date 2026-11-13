@@ -126,6 +126,8 @@ add_library(video_core STATIC
     memstage_shadow.cpp
     memstage_shadow.h
     memstage_shadow_engine.h
+    memory_stage_link.cpp
+    memory_stage_link.h
     page_filter.h
     pipeline_cache_files.cpp
     pipeline_cache_files.h

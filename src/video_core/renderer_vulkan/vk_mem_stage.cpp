@@ -162,10 +162,13 @@
 #include "common/assert.h"
 #include "common/fritchii_write_ring.h"
 #include "common/logging.h"
+#include "common/scope_exit.h"
+#include "common/spin_recursive_mutex.h"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/gpu.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
+#include "video_core/memory_stage_link.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
@@ -185,6 +188,8 @@ thread_local u32 t_fill_depth = 0;
 thread_local u32 t_play_depth = 0;
 thread_local MemStage::Site t_site = MemStage::Site::Count;
 thread_local char t_thread_marker = 0;
+/// FRITCHII_MEMSTAGE_THREAD = 1: while the back serves GPUMem's request, GPUMem's identity.
+thread_local uintptr_t t_identity = 0;
 /// This thread holds a filled draw or dispatch packet (SEAM = 2) until its plays.
 thread_local bool t_holding = false;
 
@@ -207,8 +212,10 @@ u64 NowNs() noexcept {
 std::atomic<MemStage*> g_stage{nullptr};
 
 uintptr_t ThisThread() noexcept {
-    return reinterpret_cast<uintptr_t>(&t_thread_marker);
+    return t_identity != 0 ? t_identity : reinterpret_cast<uintptr_t>(&t_thread_marker);
 }
+
+using Link = VideoCommon::MemoryStageLink;
 
 struct PlayDepth {
     PlayDepth() noexcept {
@@ -404,6 +411,10 @@ bool IsRecord(SeamHook::Use use) {
 // The hook
 
 void SeamHook::OnUse(Use use, const std::source_location& location) {
+    if (Link::OnStageThread()) [[unlikely]] {
+        // The scheduler and the descriptor queues are the back's (spec 5.5): must be 0.
+        Link::Note(Link::Check::StageScheduler, location.function_name());
+    }
     if (t_holding && (use == Use::Flush || use == Use::Finish)) [[unlikely]] {
         // SEAM = 2: a submit between a held packet's fill and its PlayRest, syncs included.
         if (MemStage* const stage = g_stage.load(std::memory_order_acquire)) {
@@ -602,6 +613,12 @@ void MemStage::SetPending() {
 
 void MemStage::PlayPending([[maybe_unused]] bool late) {
     if (!pending) {
+        return;
+    }
+    if (Link::InCall()) [[unlikely]] {
+        // GPUMem (FRITCHII_MEMSTAGE_THREAD = 1): a play inside a fill (a sync's, a Ref's) records,
+        // so the back runs it, as GPUMem.
+        OnBack([this, late] { PlayPending(late); });
         return;
     }
     std::optional<Profile::Scope> zone;
@@ -1030,8 +1047,8 @@ void MemStage::EndHeldFill() {
     }
 }
 
-const MemStage::DrawPacket* MemStage::FillDraw(Cache& cache_, const DrawFacts& facts,
-                                               bool is_indexed) {
+const MemStage::DrawPacket* MemStage::FillDrawHere(Cache& cache_, const DrawFacts& facts,
+                                                   bool is_indexed) {
     if (seam_value.load(std::memory_order_relaxed) < 2) {
         return nullptr;
     }
@@ -1118,8 +1135,8 @@ const MemStage::DrawPacket* MemStage::FillDraw(Cache& cache_, const DrawFacts& f
     return &draw;
 }
 
-const MemStage::DispatchPacket* MemStage::FillDispatch(Cache& cache_,
-                                                       const DispatchFacts& facts) {
+const MemStage::DispatchPacket* MemStage::FillDispatchHere(Cache& cache_,
+                                                           const DispatchFacts& facts) {
     if (seam_value.load(std::memory_order_relaxed) < 2) {
         return nullptr;
     }
@@ -1183,6 +1200,148 @@ const MemStage::DispatchPacket* MemStage::FillDispatch(Cache& cache_,
         Bump(counters.fill_ns, NowNs() - start);
     }
     return &dispatch;
+}
+
+// ---------------------------------------------------------------------------------------------
+// FRITCHII_MEMSTAGE_THREAD = 1 (fable_memstage_step6_spec.md 6.1; the thread and its link:
+// memory_stage_link.cpp). The draw's and the dispatch's fills run on GPUMem while the back waits.
+//
+// Before the hand-off the back does what ClaimHeld does first on one thread (plays a held packet
+// left over and entries left pending, lets go of the arena), so GPUMem starts with nothing to
+// play. The buffer cache's lock, which the back holds at both sites, goes with the fill: GPUMem
+// holds it while it runs (the cache's page mirrors change bits only under their holder,
+// MirrorSeq), and the back holds it again for every request it serves and when the fill returns.
+// The seam's thread-local state (fill and play depth, the site, the held flag, the read log) is
+// GPUMem's during the fill; a request the back serves (OnBack) runs with that state and with
+// GPUMem's identity as the arena's owner, so a sync inside a held fill plays exactly what it
+// plays on one thread. After the hand-off the back holds the packet: its plays and the texture
+// write check run on the back as before. When the fill changed the buffer allocator, GPUMem
+// publishes its heap budgets (spec 5.3).
+
+bool MemStage::HandsOff() const noexcept {
+    return Link::Get().Mode() != 0 && seam_value.load(std::memory_order_relaxed) >= 2 &&
+           t_fill_depth == 0 && t_play_depth == 0 && !Link::OnStageThread();
+}
+
+template <typename Body>
+void MemStage::HandOff(Cache& cache_, u8 kind, Body& body) {
+    PlayRest();
+    if (OwnedHere()) {
+        if (pending) {
+            Note(SeamHook::Use::Flush, std::source_location::current(), false);
+            PlayPending(true);
+        }
+        owner.store(0, std::memory_order_release);
+    }
+    lent_mutex = cache_.mutex.IsHeldByCurrentThread() ? &cache_.mutex : nullptr;
+    lent_back = std::this_thread::get_id();
+    handing_back = ThisThread();
+    SeamHook::g_watch.fetch_add(1, std::memory_order_relaxed);
+    SCOPE_EXIT {
+        SeamHook::g_watch.fetch_sub(1, std::memory_order_relaxed);
+        lent_mutex = nullptr;
+        t_holding = held != HeldKind::None;
+    };
+    auto run = [&] {
+        lent_stage = std::this_thread::get_id();
+        if (lent_mutex != nullptr) {
+            lent_mutex->HandOver(lent_stage);
+        }
+        SCOPE_EXIT {
+            // A fill that threw leaves its entries pending: the back plays them.
+            if (OwnedHere()) {
+                owner.store(pending ? handing_back : 0, std::memory_order_release);
+            }
+            t_holding = false;
+            player.device.PublishBufferHeapBudgets();
+            if (lent_mutex != nullptr) {
+                lent_mutex->HandOver(lent_back);
+            }
+        };
+        body();
+    };
+    Link::Get().Call(static_cast<Link::HandOff>(kind), run);
+}
+
+const MemStage::DrawPacket* MemStage::FillDraw(Cache& cache_, const DrawFacts& facts,
+                                               bool is_indexed) {
+    if (facts.has_texel_buffers || !HandsOff()) {
+        return FillDrawHere(cache_, facts, is_indexed);
+    }
+    const DrawPacket* packet = nullptr;
+    auto body = [&] { packet = FillDrawHere(cache_, facts, is_indexed); };
+    HandOff(cache_, static_cast<u8>(Link::HandOff::Draw), body);
+    return packet;
+}
+
+const MemStage::DispatchPacket* MemStage::FillDispatch(Cache& cache_,
+                                                       const DispatchFacts& facts) {
+    if (facts.has_texel_buffers || !HandsOff()) {
+        return FillDispatchHere(cache_, facts);
+    }
+    const DispatchPacket* packet = nullptr;
+    auto body = [&] { packet = FillDispatchHere(cache_, facts); };
+    HandOff(cache_, static_cast<u8>(Link::HandOff::Dispatch), body);
+    return packet;
+}
+
+void MemStage::OnBackImpl(void (*function)(void*), void* argument) {
+    if (!Link::InCall()) {
+        function(argument);
+        return;
+    }
+    struct State {
+        uintptr_t identity;
+        u32 fill_depth;
+        u32 play_depth;
+        Site site;
+        bool holding;
+        ReadLog* log;
+        std::vector<ReadRange>* reads;
+    };
+    const auto capture = [] {
+        return State{t_identity, t_fill_depth, t_play_depth, t_site, t_holding, t_log, t_reads};
+    };
+    const auto install = [](const State& state) {
+        t_identity = state.identity;
+        t_fill_depth = state.fill_depth;
+        t_play_depth = state.play_depth;
+        t_site = state.site;
+        t_holding = state.holding;
+        t_log = state.log;
+        t_reads = state.reads;
+    };
+    State gpumem = capture();
+    gpumem.identity = ThisThread();
+    MemStage* const stage = g_stage.load(std::memory_order_acquire);
+    const std::thread::id gpumem_thread = std::this_thread::get_id();
+    auto served = [&] {
+        const State back = capture();
+        install(gpumem);
+        Common::SpinRecursiveMutex* const lent = stage != nullptr ? stage->lent_mutex : nullptr;
+        if (lent != nullptr) {
+            lent->HandOver(std::this_thread::get_id());
+        }
+        SCOPE_EXIT {
+            if (lent != nullptr) {
+                lent->HandOver(gpumem_thread);
+            }
+            gpumem = capture();
+            install(back);
+        };
+        function(argument);
+    };
+    Link::Get().Serve(served);
+    gpumem.identity = 0;
+    install(gpumem);
+}
+
+void MemStage::CacheIdleImpl(void (*function)(void*), void* argument) {
+    auto run = [&] {
+        function(argument);
+        player.device.PublishBufferHeapBudgets();
+    };
+    Link::Get().Call(Link::HandOff::Idle, run);
 }
 
 void MemStage::CheckHeld() {
@@ -1576,6 +1735,7 @@ void MemStage::PushParts(Cmd kind, u8 flags, u32 count, std::initializer_list<Pa
         bytes += Align8(part.bytes);
     }
     CountPush(kind);
+    Link::CheckCacheUser(Link::Check::PushUser);
     const bool defer = Deferring();
     Arena& target = defer ? arena : Scratch();
     if (!defer) {
@@ -1603,8 +1763,20 @@ void MemStage::PushParts(Cmd kind, u8 flags, u32 count, std::initializer_list<Pa
         SetPending();
         return;
     }
-    PlayDepth depth;
+    if (pending && OwnedHere()) [[unlikely]] {
+        Link::Note(Link::Check::PushWhilePending, CMD_NAMES[static_cast<size_t>(kind)]);
+    }
     const ScratchDepth scratch_depth;
+    if (Link::InCall()) [[unlikely]] {
+        // GPUMem has nowhere to put it (spec 5.5): the back records it, counted.
+        Link::Note(Link::Check::PushNowhere, CMD_NAMES[static_cast<size_t>(kind)]);
+        OnBack([this, out] {
+            PlayDepth depth;
+            player.Exec(*reinterpret_cast<const Entry*>(out));
+        });
+        return;
+    }
+    PlayDepth depth;
     player.Exec(*reinterpret_cast<const Entry*>(out));
 }
 
@@ -1688,8 +1860,20 @@ void MemStage::PushDescriptor(const DescriptorUpdateEntry& descriptor, bool texe
     if (texel) {
         Bump(counters.texel);
     }
+    Link::CheckCacheUser(Link::Check::PushUser);
     if (!Deferring()) {
         CountPush(Cmd::Descriptors);
+        if (pending && OwnedHere()) [[unlikely]] {
+            Link::Note(Link::Check::PushWhilePending, "descriptor");
+        }
+        if (Link::InCall()) [[unlikely]] {
+            Link::Note(Link::Check::PushNowhere, "descriptor");
+            OnBack([this, &descriptor] {
+                PlayDepth depth;
+                player.AddDescriptors(&descriptor, 1);
+            });
+            return;
+        }
         PlayDepth depth;
         player.AddDescriptors(&descriptor, 1);
         return;
@@ -1789,6 +1973,7 @@ void MemStage::TickFrame() {
                                    read_log_every)
                      : std::string{});
     }
+    TickThread(value);
     static const bool stats_env = std::getenv("FRITCHII_MEMSTAGE_SEAM_STATS") != nullptr;
     if (on || stats_env) {
         LogStats();
@@ -1796,6 +1981,40 @@ void MemStage::TickFrame() {
     if (ticks) {
         ticks->LogStats();
     }
+}
+
+// FRITCHII_MEMSTAGE_THREAD (live, read here at a frame end, where both threads are level) and
+// FRITCHII_MEMSTAGE_FULL_BINDS (live). THREAD = 1 needs the early fill (SEAM >= 2, which needs
+// packet ticks) and the buffer cache's own allocator (FRITCHII_MEMSTAGE_SPLIT_ALLOC); without them
+// it runs as 0, logged once. The link refuses too when GPUMem does not run (no GPU thread split).
+void MemStage::TickThread(int seam) {
+    namespace Debug = VideoCore::Nx2Debug;
+    const int wanted = Debug::SwitchValue(Debug::g_memstage_thread, "FRITCHII_MEMSTAGE_THREAD");
+    u32 mode = wanted > 0 ? 1U : 0U;
+    if (mode != 0 && (seam < 2 || !player.device.HasSplitAllocators())) {
+        if (!thread_clamp_logged) {
+            thread_clamp_logged = true;
+            LOG_WARNING(Render_Vulkan, "FRITCHII_MEMSTAGE_THREAD={} needs {}; running 0", wanted,
+                        seam < 2 ? "EXP123 >= 2 (with FRITCHII_MEMSTAGE_TICKS >= 1)"
+                                 : "the buffer cache's own allocator (FRITCHII_MEMSTAGE_SPLIT_ALLOC)");
+        }
+        mode = 0;
+    }
+    Link& link = Link::Get();
+    link.SetMode(mode);
+    const bool full =
+        Debug::SwitchValue(Debug::g_memstage_full_binds, "FRITCHII_MEMSTAGE_FULL_BINDS") > 0;
+    if (full != Link::FullVertexBinds()) {
+        Link::SetFullVertexBinds(full);
+        LOG_INFO(Render_Vulkan, "Memory seam full vertex bindings (FRITCHII_MEMSTAGE_FULL_BINDS={}): {}",
+                 full ? 1 : 0,
+                 full ? "every enabled vertex binding is bound on every draw; the player drops the "
+                        "ones still bound"
+                      : "vertex bindings are bound when dirty");
+    }
+    // The back is the cache's user at a frame end: the buffer allocator's numbers, fresh.
+    player.device.PublishBufferHeapBudgets();
+    link.LogStats();
 }
 
 void MemStage::LogStats() {
@@ -1982,6 +2201,17 @@ void MemStage::LogStats() {
                      emulator + unclassified, emulator, unclassified, taken, own);
         }
     }
+    const std::array<u64, 2> vertex_runs{
+        player.vertex_runs_recorded.load(std::memory_order_relaxed),
+        player.vertex_runs_dropped.load(std::memory_order_relaxed)};
+    if (Link::FullVertexBinds()) {
+        LOG_INFO(Render_Vulkan,
+                 "  memory seam full vertex bindings (FRITCHII_MEMSTAGE_FULL_BINDS=1): vertex bind "
+                 "runs recorded {:.0f}/s, dropped as still bound {:.0f}/s",
+                 rate(vertex_runs[0] - reported_vertex_runs[0]),
+                 rate(vertex_runs[1] - reported_vertex_runs[1]));
+    }
+    reported_vertex_runs = vertex_runs;
     reported = current;
     LogValueStats(seconds, false);
 }
@@ -2052,36 +2282,48 @@ SeamClock::SeamClock(Scheduler& scheduler_, MemStage* stage_)
     : scheduler{&scheduler_}, master{&scheduler_.GetMasterSemaphore()}, stage{stage_},
       ticks{stage_ != nullptr ? stage_->Ticks() : nullptr} {}
 
+// On GPUMem (FRITCHII_MEMSTAGE_THREAD = 1) each sync is served by the back (MemStage::OnBack).
 void SeamClock::Finish(std::source_location location) {
-    MemStage::SyncScope sync{stage, MemStage::Sync::Finish};
-    scheduler->Finish({}, {}, location);
+    MemStage::OnBack([&] {
+        MemStage::SyncScope sync{stage, MemStage::Sync::Finish};
+        scheduler->Finish({}, {}, location);
+    });
 }
 
 void SeamClock::Wait(u64 stamp) {
-    MemStage::SyncScope sync{stage, MemStage::Sync::Wait};
-    // Translated after the scope played the pending entries: a number still unpublished then is
-    // recorded in the current tick, which Scheduler::Wait flushes (and so publishes).
-    scheduler->Wait(ticks != nullptr ? ticks->WaitTickOf(stamp) : stamp);
+    MemStage::OnBack([&] {
+        MemStage::SyncScope sync{stage, MemStage::Sync::Wait};
+        // Translated after the scope played the pending entries: a number still unpublished then
+        // is recorded in the current tick, which Scheduler::Wait flushes (and so publishes).
+        scheduler->Wait(ticks != nullptr ? ticks->WaitTickOf(stamp) : stamp);
+    });
 }
 
 void SeamClock::WaitTick(u64 tick) {
-    MemStage::SyncScope sync{stage, MemStage::Sync::Wait};
-    scheduler->Wait(tick);
+    MemStage::OnBack([&] {
+        MemStage::SyncScope sync{stage, MemStage::Sync::Wait};
+        scheduler->Wait(tick);
+    });
 }
 
 u64 SeamClock::SubmitForHostRead(std::source_location location) {
-    MemStage::SyncScope sync{stage, MemStage::Sync::SubmitForHostRead};
-    scheduler->RequestOutsideRenderPassOperationContext(location);
-    scheduler->Record(HostReadBarrier);
-    if (ticks == nullptr) {
-        return scheduler->Flush({}, {}, location);
-    }
-    // Nothing is pending after the scope: the number current now is the one this flush closes,
-    // and the stamp of the tick it submits.
-    const u64 stamp = ticks->Now();
-    const u64 tick = scheduler->Flush({}, {}, location);
-    ticks->CheckHostRead(stamp, tick);
-    return stamp;
+    u64 result{};
+    MemStage::OnBack([&] {
+        MemStage::SyncScope sync{stage, MemStage::Sync::SubmitForHostRead};
+        scheduler->RequestOutsideRenderPassOperationContext(location);
+        scheduler->Record(HostReadBarrier);
+        if (ticks == nullptr) {
+            result = scheduler->Flush({}, {}, location);
+            return;
+        }
+        // Nothing is pending after the scope: the number current now is the one this flush
+        // closes, and the stamp of the tick it submits.
+        const u64 stamp = ticks->Now();
+        const u64 tick = scheduler->Flush({}, {}, location);
+        ticks->CheckHostRead(stamp, tick);
+        result = stamp;
+    });
+    return result;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2461,11 +2703,21 @@ void MemPlayer::ForgetBindings() noexcept {
     }
 }
 
+// Spec 5.4: the player is the back's. Nothing reaches it on GPUMem: entries GPUMem must have run
+// now go to the back (OnBack), and the runtime's Player() and Seam() check too. Must be 0.
+void MemPlayer::CheckBack(const char* where) noexcept {
+    if (Link::OnStageThread()) [[unlikely]] {
+        Link::Note(Link::Check::PlayerOnStage, where);
+    }
+}
+
 void MemPlayer::AddDescriptors(const DescriptorUpdateEntry* entries, size_t count) {
+    CheckBack("AddDescriptors");
     guest_descriptor_queue.AddEntries(entries, count);
 }
 
 void MemPlayer::Exec(const MemStage::Entry& entry) {
+    CheckBack("Exec");
     using Cmd = MemStage::Cmd;
     constexpr u32 HEAD = static_cast<u32>(sizeof(MemStage::Entry));
     if ((entry.flags & MemStage::OutsideRenderPass) != 0) {
@@ -2662,6 +2914,7 @@ void MemPlayer::Exec(const MemStage::Entry& entry) {
                             bound.stride == strides[i];
             }
             if (unchanged) {
+                Bump(vertex_runs_dropped);
                 break;
             }
             for (u32 i = 0; i < binding_count; ++i) {
@@ -2669,6 +2922,7 @@ void MemPlayer::Exec(const MemStage::Entry& entry) {
                                                    epoch};
             }
         }
+        Bump(vertex_runs_recorded);
         using Handles = boost::container::static_vector<VkBuffer, NUM_BOUND_VERTEX_BUFFERS>;
         using Sizes = boost::container::static_vector<VkDeviceSize, NUM_BOUND_VERTEX_BUFFERS>;
         Handles buffer_handles(handles, handles + binding_count);
@@ -2755,6 +3009,7 @@ void MemPlayer::Exec(const MemStage::Entry& entry) {
 // buffers are created with the main allocator.
 
 void MemPlayer::RecordListDrawArgs(VkBuffer source, VkDeviceSize offset, bool mesh) {
+    CheckBack("RecordListDrawArgs");
     if (source == VK_NULL_HANDLE) {
         return;
     }
@@ -2860,6 +3115,7 @@ void MemPlayer::EnsureListKeepBuffer() {
 }
 
 void MemPlayer::KeepListWords(u64 keep_id, VkBuffer source, VkDeviceSize offset, u32 count) {
+    CheckBack("KeepListWords");
     if (keep_id == 0 || source == VK_NULL_HANDLE || count == 0 || count > 3) {
         return;
     }
@@ -2895,6 +3151,7 @@ void MemPlayer::KeepListWords(u64 keep_id, VkBuffer source, VkDeviceSize offset,
 }
 
 void MemPlayer::KeepListWordsRead(u64 keep_id, std::span<const u32> words) {
+    CheckBack("KeepListWordsRead");
     if (keep_id == 0 || words.empty() || words.size() > 3) {
         return;
     }
@@ -2904,6 +3161,7 @@ void MemPlayer::KeepListWordsRead(u64 keep_id, std::span<const u32> words) {
 }
 
 bool MemPlayer::ReadKeptListWords(u64 keep_id, std::span<u32> words) {
+    CheckBack("ReadKeptListWords");
     const ListKeep& keep = list_keeps[keep_id % LIST_KEEP_SLOTS];
     if (keep_id == 0 || keep.keep_id != keep_id || words.size() > keep.count) {
         return false;

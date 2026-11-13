@@ -14,6 +14,7 @@
 #include <source_location>
 #include <span>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -27,6 +28,10 @@
 #include "video_core/renderer_vulkan/vk_seam_clock.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
+
+namespace Common {
+class SpinRecursiveMutex;
+}
 
 namespace Tegra {
 class GPU;
@@ -373,9 +378,27 @@ public:
     /// SEAM = 2: the draw's whole fill, before the texture work. Null when the draw is not held
     /// (another SEAM, texel buffers: LateFill, or the arena busy on another thread); Configure
     /// then fills where the calls are. A held packet is always played whole: RestAtEnd.
+    /// FRITCHII_MEMSTAGE_THREAD = 1: run on GPUMem by hand-off.
     const DrawPacket* FillDraw(Cache& cache, const DrawFacts& facts, bool is_indexed);
     /// SEAM = 2: the dispatch's `before` section, before Configure. Null as for FillDraw.
     const DispatchPacket* FillDispatch(Cache& cache, const DispatchFacts& facts);
+
+    /// On GPUMem inside a hand-off: runs `body` on the back with this thread's seam state (a
+    /// sync, an entry that must run now). Anywhere else: runs it here.
+    template <typename F>
+    static void OnBack(F&& body) {
+        using Body = std::remove_reference_t<F>;
+        OnBackImpl([](void* argument) { (*static_cast<Body*>(argument))(); }, &body);
+    }
+    static void OnBackImpl(void (*function)(void*), void* argument);
+
+    /// The buffer cache's idle work, on its user's thread (hand-off at FRITCHII_MEMSTAGE_THREAD=1).
+    template <typename F>
+    void CacheIdle(F&& body) {
+        using Body = std::remove_reference_t<F>;
+        CacheIdleImpl([](void* argument) { (*static_cast<Body*>(argument))(); }, &body);
+    }
+    void CacheIdleImpl(void (*function)(void*), void* argument);
 
     [[nodiscard]] const DrawPacket* HeldDraw() const noexcept {
         return held == HeldKind::Draw ? &draw : nullptr;
@@ -621,6 +644,13 @@ private:
     void OpenDispatchByValue();
     void LogValueStats(double seconds, bool first);
 
+    const DrawPacket* FillDrawHere(Cache& cache, const DrawFacts& facts, bool is_indexed);
+    const DispatchPacket* FillDispatchHere(Cache& cache, const DispatchFacts& facts);
+    template <typename Body>
+    void HandOff(Cache& cache, u8 kind, Body& body);
+    [[nodiscard]] bool HandsOff() const noexcept;
+    void TickThread(int seam);
+
     bool ClaimHeld();
     void UpdateUnplayed();
     void TakeHeld(HeldKind kind);
@@ -645,6 +675,12 @@ private:
     /// FRITCHII_MEMSTAGE_READ_LOG: every Nth packet's reads are compared, 0 off
     int read_log_every{};
     Cache* cache{};
+    /// FRITCHII_MEMSTAGE_THREAD = 1: the cache's lock while a hand-off lends it to GPUMem.
+    Common::SpinRecursiveMutex* lent_mutex{};
+    std::thread::id lent_back{};
+    std::thread::id lent_stage{};
+    /// The back's identity while a hand-off runs (an owner it takes back with pending entries).
+    uintptr_t handing_back{};
     /// SEAM 2/3 asked for without packet ticks: run as SEAM 1 (logged once).
     bool clamp_logged{};
 
@@ -734,6 +770,8 @@ private:
     Counters counters;
     Counts reported;
     u64 last_log_ns{};
+    std::array<u64, 2> reported_vertex_runs{};
+    bool thread_clamp_logged{};
 
     std::atomic<int> seam_level{0};
     bool dispatch_open{};
@@ -800,13 +838,18 @@ public:
     /// The remembered index and vertex buffers are forgotten (SEAM changed).
     void ForgetBindings() noexcept;
 
+    /// The player is the back's: counts a use on GPUMem (vk_mem_stage.cpp).
+    static void CheckBack(const char* where) noexcept;
+
     /// `keep_id`: the id the copy of the words is kept as (KeepListWords), 0 for none.
     void RequestListDrawArgs(u64 keep_id = 0) noexcept {
+        CheckBack("RequestListDrawArgs");
         list_draw_requested = true;
         list_draw_args = {};
         list_draw_keep_id = keep_id;
     }
     [[nodiscard]] bool ListDrawArgsRequested() const noexcept {
+        CheckBack("ListDrawArgsRequested");
         return list_draw_requested;
     }
     /// Records the copy of the words at `offset` of `source`, outside the render pass, into a
@@ -814,6 +857,7 @@ public:
     void RecordListDrawArgs(VkBuffer source, VkDeviceSize offset, bool mesh);
     /// The arguments recorded since the request (no buffer if none were), ending the request.
     [[nodiscard]] ListDrawArgs TakeListDrawArgs() noexcept {
+        CheckBack("TakeListDrawArgs");
         list_draw_requested = false;
         list_draw_keep_id = 0;
         return std::exchange(list_draw_args, {});
@@ -858,6 +902,9 @@ private:
     };
     static constexpr size_t NUM_BOUND_VERTEX_BUFFERS = 32;
     std::array<BoundVertexBuffer, NUM_BOUND_VERTEX_BUFFERS> bound_vertex_buffers{};
+    /// BindVertices entries recorded, and dropped as still bound (FRITCHII_MEMSTAGE_FULL_BINDS).
+    std::atomic<u64> vertex_runs_recorded{};
+    std::atomic<u64> vertex_runs_dropped{};
 
     static constexpr u32 LIST_DRAW_SLOTS = 1024;
     static constexpr u32 LIST_DRAW_SLOT_BYTES = 32;

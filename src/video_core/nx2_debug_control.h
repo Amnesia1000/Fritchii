@@ -128,6 +128,10 @@ inline std::atomic<int> g_storage_sync_memo{-1};
 inline std::atomic<int> g_feed_memory_overlay{-1};
 /// EDEN_NX2_QMD_3D_PATCH: docs/fritchii/switches.md.
 inline std::atomic<int> g_qmd_3d_patch{-1};
+/// FRITCHII_MEMSTAGE_THREAD: docs/fritchii/switches.md.
+inline std::atomic<int> g_memstage_thread{-1};
+/// FRITCHII_MEMSTAGE_FULL_BINDS: docs/fritchii/switches.md.
+inline std::atomic<int> g_memstage_full_binds{-1};
 /// EDEN_NX2_LIGHT_TABLE_ARRAYS: docs/fritchii/switches.md.
 [[nodiscard]] inline bool LightTableArrays() {
     static const bool on = EnvSwitch("EDEN_NX2_LIGHT_TABLE_ARRAYS") > 0;

@@ -20,6 +20,7 @@
 #include "core/device_memory_manager.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
+#include "video_core/memory_stage_link.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_runahead.h"
 #include "video_core/nx2_write_track.h"
@@ -681,7 +682,10 @@ bool HandleInvalidate(Core::System& system) {
 
 bool BackHolds(Hold what) {
     const u64 frontier = g_frontier.load(std::memory_order_acquire);
-    if (frontier == 0 || !GpuSplit::OnBackThread() ||
+    // The buffer cache asks it inside the draw's fill: on GPUMem by hand-off, while the back
+    // waits at the same entry (memory_stage_link.cpp).
+    const bool for_back = GpuSplit::OnBackThread() || MemoryStageLink::InCall();
+    if (frontier == 0 || !for_back ||
         GpuSplit::Get().BackEntryPosition() >= frontier) [[likely]] {
         return false;
     }

@@ -391,6 +391,49 @@ implements the default constant buffer write; with EXP107 on, constant buffer wo
 Not covered yet: render_enable.mode is always level (the back asks the query cache), and the
 watched pages leave out shader code and query addresses.
 
+### FRITCHII_MEMSTAGE_THREAD
+
+FRITCHII_MEMSTAGE_THREAD (live, read at a frame end, default 0; the memory stage's step 6, piece
+6a, fable_memstage_step6_spec.md 6.1 and section 5): the buffer cache's two big fills on a thread
+of their own, by hand-off.
+- The thread, "GPUMem", exists while the GPU thread split runs (started and stopped with the
+  back) and sleeps at 0. It is not started with FRITCHII_MEMSTAGE_SPLIT_ALLOC=0 (logged).
+- 0: the fills run on the back (EXP123 = 2's early fill, as before).
+- 1: the draw's fill (MemStage::FillDraw) and the dispatch's (FillDispatch), and the buffer
+  recycler's idle destroys, run on GPUMem: the back posts the fill, GPUMem runs it, the back
+  waits (about 2,000 pauses of spinning, then a sleep). Same order and timing as 0, another
+  thread. The buffer cache's lock goes with the fill. Every other cache call stays on the back,
+  where it was. A sync inside a fill (finish, wait, submit for host read, the multi-range bind)
+  is posted back to the back, which serves it inside its wait. Needs EXP123 >= 2 (so
+  FRITCHII_MEMSTAGE_TICKS >= 1) and the buffer cache's own allocator; without them, or without
+  the split, it runs as 0, logged once.
+- Expect fps lower than 0: two thread wake-ups a draw. The point is the thread rules, not speed.
+- "Memory stage link (FRITCHII_MEMSTAGE_THREAD=1)" every 10 s: hand-offs a second (draw fills,
+  dispatch fills, idle destroys), the back's wait in ms/s and per hand-off, GPUMem's run time,
+  sleeps on both sides, served syncs a second, and the counters that must be 0: a buffer
+  allocator call, a buffer staging request or a seam push by a thread that is not the cache's
+  user; a VMA heap budget read off its allocator's user; a scheduler or descriptor queue use on
+  GPUMem; an entry GPUMem would run at once (served on the back instead); an entry run at once
+  while entries are pending; the memory player reached on GPUMem; the front's waits reached on
+  GPUMem. The first 16 of each log "Memory stage link (must be 0)" with the place. The seam's
+  own 5.1/5.2 counters (EXP123's line) must stay 0 too.
+- EDEN_NX2_GPU_PROFILE: GPUMem reports as "GPU memory thread" with its "memory fill" zone (the
+  fill ms/s of EXP123 = 2, now off the back) and "memory sync wait"; the back shows "memory
+  hand-off" for its waits. FRITCHII_BACK_READ_AUDIT adds a "Stage read audit" table for GPUMem.
+  The hitch line, the stall snapshot and the CPU trace list GPUMem as a thread of its own.
+- Not pinned to a core (spec 5.8, until step 7 measures it).
+
+### FRITCHII_MEMSTAGE_FULL_BINDS
+
+FRITCHII_MEMSTAGE_FULL_BINDS (live, read at a frame end, default 0; spec 4.2): every draw binds
+every enabled vertex binding, not only the dirty ones. The ones that were not dirty go in runs of
+their own, without a usage mark, and the memory player drops a run still bound in the current
+command buffer, so the recorded commands stay the same; repacked bindings are left out (binding
+one again runs its conversion). It is what the stage will need instead of the scheduler's
+command buffer flags (step 6b). With EXP123 >= 1 the seam's stats line adds "memory seam full
+vertex bindings": vertex bind runs recorded and dropped as still bound a second. Independent of
+FRITCHII_MEMSTAGE_THREAD.
+
 ### FRITCHII_JIT_DISPATCH_BITS
 
 FRITCHII_JIT_DISPATCH_BITS (boot, default 20; fable52_answer_guest 2.1): the A64 JIT's fast

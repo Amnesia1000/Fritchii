@@ -111,7 +111,7 @@ inline void ZeroTrimEnd() {
 inline thread_local bool t_warming{};
 
 /// Which emulator thread this is, from its name (RegisterThread), for the lock wait counters.
-enum class Role : u8 { Other, GuestCore, GpuFront, GpuBack, Count };
+enum class Role : u8 { Other, GuestCore, GpuFront, GpuBack, GpuMem, Count };
 inline thread_local Role t_role{};
 
 /// Time spent waiting for a contended SpinRecursiveMutex (the buffer and texture cache locks),
@@ -155,7 +155,7 @@ void OnPresent(long long gap_us);
 // vkAcquireNextImageKHR and vkQueuePresentKHR. Spans are the timeline's (Nx2Timeline::Span,
 // ArgSpan), the profiler's coarse zones and a few marks of its own (StallScope). Off, a span pays
 // one thread_local load (t_stall_slot stays null on every thread).
-enum class StallThread : u8 { GpuBack, GpuFront, VulkanWorker, Fencing, Present, Count };
+enum class StallThread : u8 { GpuBack, GpuFront, VulkanWorker, Fencing, Present, GpuMem, Count };
 
 struct StallSlot {
     std::atomic<const char*> zone{}; ///< The innermost span now, nullptr outside every span

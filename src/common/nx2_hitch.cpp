@@ -216,7 +216,7 @@ size_t TakeWarmKeys(u32 core, std::vector<u64>& out, size_t max) {
 namespace {
 
 constexpr std::array<const char*, static_cast<size_t>(StallThread::Count)> StallThreadNames{
-    "back", "front", "worker", "fencing", "present"};
+    "back", "front", "worker", "fencing", "present", "memory"};
 
 std::mutex g_stall_reporter_mutex;
 std::string (*g_stall_reporter)(const void*){};
@@ -687,6 +687,7 @@ void RegisterThread(const char* name) {
     t_role = view.starts_with("CPUCore") ? Role::GuestCore
              : view == "GPUBack"         ? Role::GpuBack
              : view == "GPU"             ? Role::GpuFront
+             : view == "GPUMem"          ? Role::GpuMem
                                          : Role::Other;
     {
         const StallThread stall = view == "GPUBack"            ? StallThread::GpuBack
@@ -694,6 +695,7 @@ void RegisterThread(const char* name) {
                                   : view == "VulkanWorker"     ? StallThread::VulkanWorker
                                   : view == "GPUFencingThread" ? StallThread::Fencing
                                   : view == "VulkanPresent"    ? StallThread::Present
+                                  : view == "GPUMem"           ? StallThread::GpuMem
                                                                : StallThread::Count;
         if (stall != StallThread::Count && StallSwitch()) {
             StallSlot& slot = g_stall_slots[static_cast<size_t>(stall)];

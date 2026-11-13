@@ -119,7 +119,9 @@ public:
                                 SeamClock& clock);
     ~BufferCacheRuntime();
 
+    /// The back's way to the seam and its player (memory stage spec 5.4: never from GPUMem).
     [[nodiscard]] MemStage& Seam() noexcept {
+        MemPlayer::CheckBack("runtime.Seam()");
         return mem_stage;
     }
 
@@ -128,6 +130,7 @@ public:
     }
 
     [[nodiscard]] MemPlayer& Player() noexcept {
+        MemPlayer::CheckBack("runtime.Player()");
         return mem_stage.Player();
     }
 

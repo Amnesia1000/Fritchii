@@ -35,6 +35,7 @@
 #include "video_core/nx2_fastdraw_count.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memstage_shadow.h"
+#include "video_core/memory_stage_link.h"
 #include "video_core/nx2_split_stats.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
@@ -241,6 +242,7 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     // EDEN_NX2_RUNAHEAD: Ocarina of Time only.
     Runahead::Reset();
     Runahead::SetProgramId(system_.GetApplicationProcessProgramID());
+    MemoryStageLink::Get().Start(system_);
     back_thread = std::jthread([this](std::stop_token stop_token) { BackLoop(stop_token); });
     active = true;
     const char* jit = std::getenv("EDEN_NX2_MME_JIT");
@@ -257,6 +259,7 @@ void GpuSplit::Stop() {
     wake.fetch_add(1, std::memory_order_seq_cst);
     wake.notify_one();
     back_thread.join();
+    MemoryStageLink::Get().Stop();
     active = false;
     // The split is static and outlives the emulation session. The next session's back thread
     // starts reading at 0: with the old positions kept it skipped through the new, empty ring a

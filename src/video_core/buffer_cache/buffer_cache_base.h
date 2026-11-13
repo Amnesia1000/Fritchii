@@ -1038,6 +1038,7 @@ private:
 
     /// Re-dirties repacked vertex buffers whose source data was written since they were bound.
     void RefreshRepackedVertexBuffers();
+    [[nodiscard]] bool IsRepackedVertexBuffer(u32 index);
 
     void InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
                                     std::span<const u8> inlined_buffer);
