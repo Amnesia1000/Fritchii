@@ -1734,7 +1734,10 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
         VideoCommon::GpuSplit::Get().NoteMemoryWriter();
         break;
     case BufferMethods::WaitForIdle:
-        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->WaitForIdle(); });
+        // Memory stage tag Cache: a barrier, the query cache's NotifyWFI (which can reach the
+        // buffer cache) and the fence manager; no 3D state.
+        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->WaitForIdle(); },
+               VideoCommon::StageTagBits(VideoCommon::StageTag::Cache));
         VideoCommon::GpuSplit::Get().NoteSync();
         break;
     case BufferMethods::SemaphoreOperation: {
