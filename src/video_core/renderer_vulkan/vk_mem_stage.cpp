@@ -1413,8 +1413,10 @@ bool MemStage::FillRingDraw(Cache& cache_, const DrawFacts& facts, bool is_index
 }
 
 bool MemStage::RingRoom() const noexcept {
-    // A draw's packet is a few KiB; the back plays every packet before the stage fills again
-    // (level mode), so this margin is never short in play.
+    // Several packets can be in flight in level mode: the draws of one entry, and a deferred
+    // draw the stage's copy flushed at a sink-bound write, whose packet waits for the back's
+    // next ConsumeSink while the stage goes on with the entries after it. A packet is a few KiB;
+    // the margin holds hundreds. Short of it the draw is level (StageFillDraw).
     constexpr u64 Margin = u64{1} << 20;
     return RingBytes - (ring_b_write - ring_b_freed.load(std::memory_order_acquire)) >= Margin;
 }
@@ -1546,18 +1548,30 @@ void MemStage::TakeRingHeader(const RingHeader& header) {
     }
 }
 
-const MemStage::DrawPacket* MemStage::TakeRingDraw(u64 seq, u64 hash, bool verify) {
+const MemStage::DrawPacket* MemStage::TakeRingDraw(u64 seq, u64 back_position, u64 hash,
+                                                   bool verify) {
     for (;;) {
         const RingHeader* const header = PeekRing();
         if (header == nullptr || header->seq > seq) {
             return nullptr;
         }
         if (header->seq < seq) {
-            // A draw the back never prepared (its Draw returned before PrepareDraw): the packet
-            // is played whole, so the uploads the cache counts on are recorded.
+            // A draw the back never prepared (its Draw returned before PrepareDraw), must be 0.
+            // The packet is played whole, so the uploads the cache counts on are recorded. Ring B
+            // is played in order, and every draw the back fills itself takes this path first (in
+            // a run too), so no newer upload of the same bytes has been recorded before it.
+            Link::Note(Link::Check::PacketOrphan, "a draw the back did not prepare");
             TakeRingHeader(*header);
             PlayRest();
             continue;
+        }
+        if (header->position > back_position) {
+            // The number matches but the packet belongs to a later entry than the back's: the
+            // two sides paired the draws differently (must be 0). Another draw's packet is never
+            // played: it is dropped unplayed, and the back fills this draw itself.
+            Link::Note(Link::Check::PacketMismatch, "the packet's entry is past the back's");
+            DiscardRingHeader(*header);
+            return nullptr;
         }
         const u64 stage_hash = header->hash;
         const u64 position = header->position;
@@ -1589,6 +1603,14 @@ void MemStage::PlayPostCopyBarrier() {
     };
     PlayDepth depth;
     player.Exec(entry);
+}
+
+void MemStage::DiscardRingHeader(const RingHeader& header) {
+    ring_b_read += header.bytes;
+    ring_b_freed.store(ring_b_read, std::memory_order_release);
+    if (ticks) {
+        UpdateUnplayed();
+    }
 }
 
 u64 MemStage::DropRingPackets(u64 position) {

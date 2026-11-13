@@ -47,6 +47,7 @@ public:
         DrawCount,
         PacketOrphan,
         StageException,
+        PacketMismatch,
         Count,
     };
 

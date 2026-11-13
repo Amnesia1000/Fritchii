@@ -1394,7 +1394,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     if (ring_on && (served || Link::BackInRun())) [[unlikely]] {
         const bool verify = Link::RingVerify();
         ring_packet = mem_stage.TakeRingDraw(
-            Link::Get().BackDrawSeq(),
+            Link::Get().BackDrawSeq(), VideoCommon::GpuSplit::Get().BackEntryPosition(),
             verify ? VideoCommon::MemStageShadow::BackStateHash(*maxwell3d) : 0, verify);
         ring_rest.emplace(mem_stage);
         if (ring_packet == nullptr && served) {

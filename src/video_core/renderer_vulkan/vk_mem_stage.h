@@ -466,7 +466,7 @@ public:
     [[nodiscard]] bool RingRoom() const noexcept;
     /// The back: the packet of its draw `seq` (packets of earlier draws are played whole first),
     /// held as a filled draw is; null when there is none. `hash`: the back's compare b hash.
-    const DrawPacket* TakeRingDraw(u64 seq, u64 hash, bool verify);
+    const DrawPacket* TakeRingDraw(u64 seq, u64 back_position, u64 hash, bool verify);
     /// The back: plays whole the packets of entries before `position`; returns how many.
     u64 DropRingPackets(u64 position);
     /// The back: the barrier after a ring packet's uploads (Configure's any_buffer_uploaded).
@@ -887,6 +887,7 @@ private:
     void PushRingDraw();
     const RingHeader* PeekRing();
     void TakeRingHeader(const RingHeader& header);
+    void DiscardRingHeader(const RingHeader& header);
     [[nodiscard]] u64 RingOldestNumber();
 
     // The facts table (spec 4.4): open addressing, a sequence word per slot.
