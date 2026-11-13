@@ -1516,7 +1516,12 @@ void MemoryStageLink::RingLoop(std::stop_token& stop, u64 start) {
             t_in_call = true;
             t_stage_user = true;
             stage_entry = position;
-            const MemStageShadow::StageResult result = MemStageShadow::StageProcess(position, false);
+            // fps fix 4 (profiling): the entries in a fine zone of their own (with their constant
+            // buffer words in another, inside it), so GPUMem's "other" splits.
+            const MemStageShadow::StageResult result = [&] {
+                const Nx2Profile::FineScope zone{Nx2Profile::Zone::StageEntries};
+                return MemStageShadow::StageProcess(position, false);
+            }();
             LinkBump(counters.entries[(std::min)(static_cast<size_t>(result.cls), size_t{3})]);
             if (!result.hard) {
                 t_in_call = false;
