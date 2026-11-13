@@ -1309,14 +1309,17 @@ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
     case Puller::FenceOperation::Acquire:
         // UNIMPLEMENTED_MSG("Channel Scheduling pending.");
         // WaitFence(regs.fence_action.syncpoint_id, regs.fence_value);
+        // Memory stage tag Cache (both closures here): the fence manager (its releases commit
+        // the buffer cache's async flushes); no 3D state.
         OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); },
-               VideoCommon::Nx2FastDrawCount::Neutral());
+               VideoCommon::Nx2FastDrawCount::Neutral() |
+                   VideoCommon::StageTagBits(VideoCommon::StageTag::Cache));
         VideoCommon::GpuSplit::Get().NoteSync();
         break;
     case Puller::FenceOperation::Increment:
         OnBack([rasterizer = dma_pusher.rasterizer, id = static_cast<u32>(regs.fence_action.syncpoint_id.Value())] {
             rasterizer->SignalSyncPoint(id);
-        });
+        }, VideoCommon::StageTagBits(VideoCommon::StageTag::Cache));
         break;
     default:
         UNIMPLEMENTED_MSG("Unimplemented operation {}", regs.fence_action.op.Value());
