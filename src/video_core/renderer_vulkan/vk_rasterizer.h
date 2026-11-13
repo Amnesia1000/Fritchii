@@ -148,6 +148,9 @@ public:
     void ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) override;
     void SignalFence(std::function<void()>&& func) override;
     void SyncOperation(std::function<void()>&& func) override;
+    u64 SyncOperationStamped(std::function<void()>&& func) override;
+    bool AppendToLastOperation(u64 stamp, void (*append)(void*), void* context) override;
+    void SyncOperationKeepStamp(std::function<void()>&& func) override;
     void SignalSyncPoint(u32 value) override;
     void SignalReference() override;
     void ReleaseFences(bool force = true) override;

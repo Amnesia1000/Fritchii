@@ -84,6 +84,7 @@
 #include "video_core/buffer_churn_stats.h"
 #include "video_core/fritchii_delta_path.h"
 #include "video_core/fritchii_draw_kinds.h"
+#include "video_core/fritchii_report_runs.h"
 #include "video_core/memstage_stats.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cb_path.h"
@@ -4086,6 +4087,18 @@ void RasterizerVulkan::SyncOperation(std::function<void()>&& func) {
     fence_manager.SyncOperation(std::move(func));
 }
 
+u64 RasterizerVulkan::SyncOperationStamped(std::function<void()>&& func) {
+    return fence_manager.SyncOperationStamped(std::move(func));
+}
+
+bool RasterizerVulkan::AppendToLastOperation(u64 stamp, void (*append)(void*), void* context) {
+    return fence_manager.AppendToLastOperation(stamp, append, context);
+}
+
+void RasterizerVulkan::SyncOperationKeepStamp(std::function<void()>&& func) {
+    fence_manager.SyncOperationKeepStamp(std::move(func));
+}
+
 void RasterizerVulkan::SignalSyncPoint(u32 value) {
     fence_manager.SignalSyncPoint(value);
 }
@@ -4827,6 +4840,10 @@ void RasterizerVulkan::TickFrame() {
     }
     VideoCommon::MemStageStats::TickFrame();
     VideoCommon::BufferChurnStats::TickFrame();
+    if (VideoCore::Nx2Debug::Experiment(VideoCommon::FritchiiReportRuns::Switch) != 0)
+        [[unlikely]] {
+        VideoCommon::FritchiiReportRuns::g_frames.fetch_add(1, std::memory_order_relaxed);
+    }
     if (VideoCommon::Nx2FastDrawCount::g_on) [[unlikely]] {
         if (VideoCommon::Nx2FastDrawCount::g_count) {
             fast_draw_count.MaybeLog();

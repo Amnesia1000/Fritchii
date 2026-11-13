@@ -202,15 +202,25 @@ public:
     }
 
     void ResetCounter() override {
+        ResetCounterImpl(true);
+    }
+
+    bool ResetCounterWithoutOperation() override {
+        ResetCounterImpl(false);
+        return true;
+    }
+
+    /// `queue_amend_reset` false (EXP119): the caller queues ResetAmend in a report run, at the
+    /// place this operation would have taken.
+    void ResetCounterImpl(bool queue_amend_reset) {
         if (has_started) {
             PauseCounter();
         }
         AbandonCurrentQuery();
-        std::function<void()> func([this] {
-            amend_value = 0;
-            accumulation_value = 0;
-        });
-        rasterizer->SyncOperation(std::move(func));
+        if (queue_amend_reset) {
+            std::function<void()> func([this] { ResetAmend(); });
+            rasterizer->SyncOperation(std::move(func));
+        }
         accumulation_since_last_sync = false;
         first_accumulation_checkpoint = (std::min)(first_accumulation_checkpoint, num_slots_used);
         last_accumulation_checkpoint = (std::max)(last_accumulation_checkpoint, num_slots_used);

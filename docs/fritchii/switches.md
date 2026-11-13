@@ -843,6 +843,32 @@ FRITCHII_DRAW_KINDS also counts, per class, the draws whose pipeline samples not
 EDEN_NX2_FASTDRAW_COUNT=1, the would-be delta draws. Measure with breaks on at boot on both
 sides (EXP118=2 at boot, then toggle 0/1); the breaks' own cost needs a fresh-launch A/B.
 
+### EXP119
+
+EXP119 (report runs: the report side of the occlusion tests; live, off by default;
+src/video_core/fritchii_report_runs.h, fable52_answer_potroom3 sections 2 and 4, step 2). A
+sample count report (type 21) that is not a fence, and the amend reset of a sample counter
+reset, no longer queue a std::function each in the fence manager's list: they become entries
+of a run, one operation that writes them in one loop when the fence's results are in. An entry
+joins a run only while the run's operation is still the last one queued and no fence took the
+list since (the fence manager's operation stamp, checked under its list lock), so each entry
+runs exactly where its own operation would have: same fence, same neighbours, same order
+against the counter's other operations (presync amend, replicated query, slot-limit resets).
+The report is still listed in the query cache's map from the moment it is made until its fence
+ran (the split's front, guest reads and render enable rely on it), with one hash fewer; it is
+unlisted and freed as before. Render enable: the Conditional mode skips its map lookup (the
+runtime only uses the address), IfEqual / IfNotEqual do both lookups under one lock. Today's
+path for fences, other report types and traced reports (EDEN_NX2_QUERY_TRACE,
+EDEN_NX2_SEM_WATCH). Values: 1 = on; 2 = verify: today's operations still write (queued keeping
+the run's stamp, so the runs take the shape they have with 1), the runs only compute outcome,
+address and value, and each report's own operation compares (the run must have run before it,
+with the same result); render enable does both forms and compares the lookups. Mismatches must
+be 0 (a guest write to a report between its run and its operation would count one; the first
+16 are logged). "Report runs (EXP119=n) per frame over 600 frames" logs reports, those in runs,
+runs started and ran, counter resets (in runs), today's path by reason, render enable calls
+(without lookup, with one lock) and with 2 the compares and mismatches. Toggle live 0/1 with
+profile_toggle.py; zones "query report", "counter reset", "render enable" (GPU profile 2).
+
 ### EXP101
 
 EXP101 (live, 0 = off, 1 = runs, 2 = cached page pointer + prefetch; fable52_answer_presenter): nvhost_gpu::SubmitGPFIFOImpl's pushbuffer

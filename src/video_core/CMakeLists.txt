@@ -67,6 +67,7 @@ add_library(video_core STATIC
     framebuffer_config.h
     fritchii_delta_path.h
     fritchii_draw_kinds.h
+    fritchii_report_runs.h
     render_trace.h
     fsr.cpp
     fsr.h

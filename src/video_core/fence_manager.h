@@ -87,6 +87,43 @@ public:
         {
             std::scoped_lock lock{uncommitted_guard};
             uncommitted_operations.emplace_back(std::move(func));
+            ++operation_stamp;
+        }
+        work_epoch.fetch_add(1, std::memory_order_release);
+    }
+
+    /// EXP119 (fritchii_report_runs.h): SyncOperation, returning the stamp that names `func` as
+    /// the last operation queued. Every other queued operation and every hand-over of the list
+    /// to a fence (TakeUncommittedOperations, FoldStubbedFence) moves the stamp on.
+    u64 SyncOperationStamped(std::function<void()>&& func) {
+        u64 stamp;
+        {
+            std::scoped_lock lock{uncommitted_guard};
+            uncommitted_operations.emplace_back(std::move(func));
+            stamp = ++operation_stamp;
+        }
+        work_epoch.fetch_add(1, std::memory_order_release);
+        return stamp;
+    }
+
+    /// EXP119: append(context) under the list's lock while `stamp` is still current: the
+    /// operation it names is then the last one in the uncommitted list and has not run, so what
+    /// it appends runs where an operation queued now would. No epoch bump: the list was not
+    /// empty and stays so (FencesQuiet's answer can't change).
+    bool AppendToLastOperation(u64 stamp, void (*append)(void*), void* context) {
+        std::scoped_lock lock{uncommitted_guard};
+        if (stamp == 0 || stamp != operation_stamp) {
+            return false;
+        }
+        append(context);
+        return true;
+    }
+
+    /// EXP119=2: SyncOperation that leaves the stamp as it is (the verify's own operations).
+    void SyncOperationKeepStamp(std::function<void()>&& func) {
+        {
+            std::scoped_lock lock{uncommitted_guard};
+            uncommitted_operations.emplace_back(std::move(func));
         }
         work_epoch.fetch_add(1, std::memory_order_release);
     }
@@ -600,6 +637,7 @@ private:
                     operations.emplace_back(std::move(operation));
                 }
                 uncommitted_operations.clear();
+                ++operation_stamp; // EXP119: handed to a fence
                 if (delay_fence) {
                     operations.emplace_back(std::move(func));
                 }
@@ -664,6 +702,7 @@ private:
     /// its place, keeping its capacity (else a new one reserved for 64): a list that started
     /// empty grew again at every fence, a report per draw adding one operation each.
     OperationList TakeUncommittedOperations() {
+        ++operation_stamp; // EXP119: handed to a fence
         OperationList taken = std::move(uncommitted_operations);
         if (!spare_operations.empty()) {
             uncommitted_operations = std::move(spare_operations.back());
@@ -838,6 +877,8 @@ private:
     std::mutex guard;
     std::mutex ring_guard;
     std::mutex uncommitted_guard; ///< Guards uncommitted_operations
+    /// EXP119: names the last operation queued (SyncOperationStamped). Guarded by uncommitted_guard.
+    u64 operation_stamp{};
     std::condition_variable cv;
 
     std::jthread fence_thread;
