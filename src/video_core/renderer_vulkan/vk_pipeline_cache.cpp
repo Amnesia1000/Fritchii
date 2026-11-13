@@ -2649,6 +2649,36 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineClean(bool patch) {
     return result;
 }
 
+PipelineCache::DeltaLookup PipelineCache::DeltaKeeps(const GraphicsPipeline& pipeline,
+                                                     bool apply) {
+    if (current_pipeline != &pipeline) {
+        return DeltaLookup::NotCurrent;
+    }
+    const auto& flags = maxwell3d->dirty.flags;
+    if (flags[VideoCommon::Dirty::Shaders] || flags[Dirty::ViewportSwizzles]) {
+        return DeltaLookup::Inputs;
+    }
+    if (!flags[Dirty::VertexInput]) {
+        return DeltaLookup::Keeps;
+    }
+    if (!dynamic_features.has_dynamic_vertex_input || !pipeline.HasDynamicVertexInput()) {
+        return DeltaLookup::VertexInput;
+    }
+    // As RefreshGraphicsKey under the raised flag (Refresh's DynamicAttributeTypes, then the
+    // programs' mask). The pipeline is the current one, so its programs are the bound ones.
+    const u64 types = FixedPipelineState::DynamicAttributeTypes(maxwell3d->regs);
+    const u64 keyed =
+        VideoCommon::KeyedAttributeTypes(types, pipeline.ShaderHashes(), vertex_attribute_masks);
+    if (keyed != pipeline.Key().state.attribute_types) {
+        return DeltaLookup::VertexInput;
+    }
+    if (apply) {
+        vertex_attribute_types = types;
+        graphics_key.state.attribute_types = keyed;
+    }
+    return DeltaLookup::Keeps;
+}
+
 void PipelineCache::RefreshGraphicsKey() {
     if (!dynamic_features.has_dynamic_vertex_input) {
         graphics_key.state.Refresh(*maxwell3d, dynamic_features);

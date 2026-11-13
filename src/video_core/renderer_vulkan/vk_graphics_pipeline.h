@@ -158,6 +158,9 @@ public:
     static std::chrono::nanoseconds HoldTimeTotal() noexcept;
 
     bool HasDynamicVertexInput() const noexcept { return key.state.dynamic_vertex_input; }
+    [[nodiscard]] const GraphicsPipelineCacheKey& Key() const noexcept {
+        return key;
+    }
     const std::array<u64, 6>& ShaderHashes() const noexcept {
         return key.unique_hashes;
     }
@@ -291,6 +294,14 @@ public:
         return configure_func(this, is_indexed);
     }
 
+    /// EXP118 (fritchii_delta_path.h), for a pipeline that samples nothing (SamplesNothing), on a
+    /// draw that follows this pipeline's last with only light state changed: Configure without
+    /// the descriptor pools' sync and the texture steps (nothing to bind). Everything else runs
+    /// as in Configure.
+    bool ConfigureDelta(bool is_indexed) {
+        return configure_delta_func(this, is_indexed);
+    }
+
     /// Delta draws (D2): the previous draw as its Configure kept it with `keep_last`, or null
     /// when it wasn't kept whole. Only meaningful for the pipeline's last configured draw.
     [[nodiscard]] const KeptDraw* KeptLastDraw() const noexcept {
@@ -360,10 +371,10 @@ public:
         return build->Failed();
     }
 
-    template <typename Spec, bool KeepLast = false>
+    template <typename Spec, bool KeepLast = false, bool Delta = false>
     static auto MakeConfigureSpecFunc() {
         return [](GraphicsPipeline* pl, bool is_indexed) {
-            return pl->ConfigureImpl<Spec, KeepLast>(is_indexed);
+            return pl->ConfigureImpl<Spec, KeepLast, Delta>(is_indexed);
         };
     }
 
@@ -486,7 +497,8 @@ private:
                       const RescalingPushConstant& rescaling, bool handles_read);
 
     /// KeepLast: also keep the draw as the pipeline's last (Configure's keep_last).
-    template <typename Spec, bool KeepLast = false>
+    /// Delta: ConfigureDelta (EXP118; pipelines that sample nothing, never with KeepLast).
+    template <typename Spec, bool KeepLast = false, bool Delta = false>
     bool ConfigureImpl(bool is_indexed);
 
     bool ConfigureDraw(const RescalingPushConstant& rescaling,
@@ -537,6 +549,8 @@ private:
     bool (*configure_func)(GraphicsPipeline*, bool){};
     /// ConfigureImpl<Spec, true> for the same Spec (Configure with keep_last).
     bool (*configure_keep_func)(GraphicsPipeline*, bool){};
+    /// ConfigureImpl<Spec, false, true> (ConfigureDelta); null unless the pipeline samples nothing.
+    bool (*configure_delta_func)(GraphicsPipeline*, bool){};
     /// Delta draws (D2): the last draw configured with keep_last; made on the first.
     std::unique_ptr<KeptDraw> kept_draw;
 

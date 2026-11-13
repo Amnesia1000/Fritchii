@@ -819,6 +819,30 @@ shadow map does not sharpen the picture and costs the square of the scale in mem
 12288x12288 sun map: 648 MiB at 1.5x); the per-object maps stay square under Shadow Size
 Steps and EXP68, so they are left unscaled too. Switching it on scales such images down once.
 
+### EXP118
+
+EXP118 (delta path for draws that sample nothing; live, but only if it is on at boot: that
+raises the breaks EDEN_NX2_FASTDRAW_COUNT counts with, which then stay on for the session; off
+by default; src/video_core/fritchii_delta_path.h, fable52_answer_potroom3 sections 2 and 4).
+A draw whose previous draw used the same pipeline, with only light state changed in between (no
+break: the count's rules), whose pipeline has no texture, image, texture buffer or image buffer
+descriptor, keeps the pipeline instead of looking it up and configures it without the
+descriptor pools' sync, handle reads, sampler lookups and image views (nothing to bind).
+Uniform, storage, vertex and index binds, the descriptor push, render targets (EXP31 still
+decides whether they are prepared again), dynamic state, the host query, the draw record and
+the reports run as for every draw. With the vertex input moved, the pipeline must take it
+dynamically and the attribute types its programs read must be its key's; the cache's types are
+then left as a lookup would leave them. Never with EXP32, EXP87 or EDEN_NX2_TEX_BANK_GEN on.
+Values: 1 = on; 2 = verify only (decide, draw the full way, the full lookup must give the pipeline
+the delta draw would have kept); 3 = on, and every delta draw also looks the pipeline up (another
+pipeline: drawn the full way) and synchronizes the descriptor pools after its configure (nothing
+may change). "Delta path (EXP118=n) per frame over 600 frames" logs draws decided, delta draws
+(or would-be ones), those with the vertex input moved, the full draws by reason, and with 2 or 3
+the lookups compared and the differences (must be 0; the first 16 are logged with the shaders).
+FRITCHII_DRAW_KINDS also counts, per class, the draws whose pipeline samples nothing and, with
+EDEN_NX2_FASTDRAW_COUNT=1, the would-be delta draws. Measure with breaks on at boot on both
+sides (EXP118=2 at boot, then toggle 0/1); the breaks' own cost needs a fresh-launch A/B.
+
 ### EXP101
 
 EXP101 (live, 0 = off, 1 = runs, 2 = cached page pointer + prefetch; fable52_answer_presenter): nvhost_gpu::SubmitGPFIFOImpl's pushbuffer

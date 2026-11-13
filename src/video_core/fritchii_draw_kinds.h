@@ -313,7 +313,7 @@ inline void LogAndReset(ThreadState& t, u64 frames) {
     }
     const bool timed = us_per_tick > 0.0 && (all.draw_ticks != 0 || all.gap_ticks != 0);
     // Would-be delta draws exist only while the delta draw count runs.
-    const bool counted = VideoCommon::Nx2FastDrawCount::g_on;
+    const bool counted = VideoCommon::Nx2FastDrawCount::g_count;
     const auto describe = [&](const Bucket& b) {
         const double draws = static_cast<double>(b.draws);
         std::string text = fmt::format("{:.1f} draws {:.1f} writes", draws / frame_count,
