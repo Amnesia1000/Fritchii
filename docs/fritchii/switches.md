@@ -278,9 +278,9 @@ when the device is made.
 FRITCHII_MEMSTAGE_SEAM_STATS=1 (boot, diagnostic): the memory seam's stats line (EXP123) every
 10 s also with EXP123 = 0, which shows what the seam carries at today's timing.
 
-### FRITCHII_MEMSTAGE_VERIFY
+### FRITCHII_MEMSTAGE_READ_LOG
 
-FRITCHII_MEMSTAGE_VERIFY=N (boot, diagnostic, default 0 = off; the memory stage's sub-step 2b,
+FRITCHII_MEMSTAGE_READ_LOG=N (boot, diagnostic, default 0 = off; the memory stage's sub-step 2b,
 fable_memstage_step2_spec.md 5.3): with EXP123 = 2, every Nth draw, dispatch and operation
 packet logs what its fill read from game memory (uniforms copied to the stream, buffer uploads
 with their staged bytes, cached ranges bound without an upload, storage and table addresses and
@@ -1079,8 +1079,8 @@ late fill draws and dispatches a second, packets not held (arena busy on another
 moved, rest plays (and descriptors dropped), descriptor form mismatches (must be 0), and fill
 and play time with EDEN_NX2_GPU_PROFILE. The GPU profile gets two zones, "memory fill" (every fill
 at 2, the buffer cache's own work included: what leaves the back in step 6) and "memory play".
-FRITCHII_MEMSTAGE_VERIFY adds the read log (5.3). Compare 1 and 2 with profile_toggle.py ("back us
-a draw", heavy-phase market, 4 cycles).
+FRITCHII_MEMSTAGE_READ_LOG adds the read log (5.3). Compare 1 and 2 with profile_toggle.py
+("back us a draw", heavy-phase market, 4 cycles).
 
 ### EXP101
 

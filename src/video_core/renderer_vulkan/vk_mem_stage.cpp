@@ -34,7 +34,7 @@
 //        staging buffer stamped with the fill's tick the current one (StagingBufferPool::Retick)
 //        and restamps the buffers the fill marked used. Expected near 0; the first 16 flushes
 //        inside a held packet are logged with their caller.
-//   5.3, the read log (FRITCHII_MEMSTAGE_VERIFY=N, boot): every Nth draw, dispatch and operation
+//   5.3, the read log (FRITCHII_MEMSTAGE_READ_LOG=N, boot): every Nth draw, dispatch and operation
 //        packet logs what its fill read from game memory (the buffer cache's MemReadLog lines:
 //        uniforms copied to the stream, buffer uploads with their staged bytes, bound cached
 //        ranges, storage and table addresses, compute pointers, the inline page write). At the
@@ -328,7 +328,7 @@ MemStage::Fill::Fill(MemStage& stage_, Site site_, u32 index_)
             // SEAM = 2: the outermost bracket times the fill; an operation packet (not a held
             // draw or dispatch) may log its reads.
             zone.emplace(Profile::Zone::MemoryFill);
-            if (stage.verify > 0 && !stage.filling_held && stage.OwnedHere()) {
+            if (stage.read_log_every > 0 && !stage.filling_held && stage.OwnedHere()) {
                 reads = stage.StartReadLog(stage.op_log, ++stage.op_fills);
             }
         }
@@ -378,8 +378,8 @@ MemStage::SyncScope::~SyncScope() {
 MemStage::MemStage(MemPlayer& player_)
     : player{player_}, arena{256 * 1024}, held_arena{256 * 1024} {
     player.stage = this;
-    if (const char* const value = std::getenv("FRITCHII_MEMSTAGE_VERIFY")) {
-        verify = (std::max)(0, std::atoi(value));
+    if (const char* const value = std::getenv("FRITCHII_MEMSTAGE_READ_LOG")) {
+        read_log_every = (std::max)(0, std::atoi(value));
     }
     g_stage.store(this, std::memory_order_release);
 }
@@ -602,7 +602,7 @@ const MemStage::DrawPacket* MemStage::FillDraw(Cache& cache_, const DrawFacts& f
     marked.clear();
     t_marked = &marked;
     filling_held = true;
-    const bool logging = verify > 0 && StartReadLog(held_log, draw.number);
+    const bool logging = read_log_every > 0 && StartReadLog(held_log, draw.number);
     {
         // Today's calls in today's relative order (ConfigureImpl): the uniform state, per stage
         // the storage binds, the texture buffer unbinds, then the geometry and each stage's
@@ -684,7 +684,7 @@ const MemStage::DispatchPacket* MemStage::FillDispatch(Cache& cache_,
     marked.clear();
     t_marked = &marked;
     filling_held = true;
-    const bool logging = verify > 0 && StartReadLog(held_log, dispatch.number);
+    const bool logging = read_log_every > 0 && StartReadLog(held_log, dispatch.number);
     {
         // ComputePipeline::Configure's calls in its order: the uniform state, the storage binds
         // and the shader hash, the texture buffer unbinds, then the `before` section.
@@ -832,7 +832,7 @@ void MemStage::NoteHeldFlush(SeamHook::Use use, const std::source_location& loca
 // The read log (5.3)
 
 bool MemStage::StartReadLog(ReadLog& log, u64 number) {
-    if (verify <= 0 || number % static_cast<u64>(verify) != 0 || t_log != nullptr) {
+    if (read_log_every <= 0 || number % static_cast<u64>(read_log_every) != 0 || t_log != nullptr) {
         return false;
     }
     log.Clear();
@@ -1094,15 +1094,16 @@ void MemStage::TickFrame() {
         seam_value.store(value, std::memory_order_relaxed);
         seam_on.store(on, std::memory_order_relaxed);
         player.ForgetBindings();
-        VideoCommon::MemReadLog::g_on.store(value >= 2 && verify > 0, std::memory_order_relaxed);
+        VideoCommon::MemReadLog::g_on.store(value >= 2 && read_log_every > 0,
+                                            std::memory_order_relaxed);
         LOG_INFO(Render_Vulkan, "Memory seam (EXP123): {}{}",
                  value >= 2  ? "2, one fill per draw and dispatch before the texture work"
                  : on        ? "1, recorder and player"
                              : "0, entries run as pushed",
-                 value >= 2 && verify > 0
-                     ? fmt::format(" (FRITCHII_MEMSTAGE_VERIFY: every {}th packet's reads "
+                 value >= 2 && read_log_every > 0
+                     ? fmt::format(" (FRITCHII_MEMSTAGE_READ_LOG: every {}th packet's reads "
                                    "compared)",
-                                   verify)
+                                   read_log_every)
                      : std::string{});
     }
     static const bool stats_env = std::getenv("FRITCHII_MEMSTAGE_SEAM_STATS") != nullptr;
@@ -1229,11 +1230,11 @@ void MemStage::LogStats() {
                                          static_cast<double>(held_packets)
                                    : 0.0,
                  static_cast<double>(delta(&Counts::play_ns)) / 1e6 / seconds);
-        if (verify > 0) {
+        if (read_log_every > 0) {
             LOG_INFO(Render_Vulkan,
-                     "  memory seam read log (FRITCHII_MEMSTAGE_VERIFY={}): {} packets, {} reads "
+                     "  memory seam read log (FRITCHII_MEMSTAGE_READ_LOG={}): {} packets, {} reads "
                      "compared, {} not logged (budget); differences (5.3) {}{}{}",
-                     verify, delta(&Counts::read_packets), delta(&Counts::read_records),
+                     read_log_every, delta(&Counts::read_packets), delta(&Counts::read_records),
                      delta(&Counts::read_skipped), diff_total, diffs.empty() ? "" : ": ", diffs);
         }
     }
@@ -1795,7 +1796,8 @@ bool MemPlayer::ReadKeptListWords(u64 keep_id, std::span<u32> words) {
 } // namespace Vulkan
 
 // The buffer cache's read log lines (buffer_cache.h). g_on is set while SEAM = 2 runs with
-// FRITCHII_MEMSTAGE_VERIFY; only a fill that logs (every Nth packet, on its own thread) has a log.
+// FRITCHII_MEMSTAGE_READ_LOG; only a fill that logs (every Nth packet, on its own thread) has a
+// log.
 namespace VideoCommon::MemReadLog {
 
 using Vulkan::MemStage;

@@ -516,7 +516,8 @@ private:
     std::atomic<uintptr_t> owner{0};
     std::atomic<bool> seam_on{false};
     std::atomic<int> seam_value{0};
-    int verify{}; ///< FRITCHII_MEMSTAGE_VERIFY: every Nth packet's reads are compared, 0 off
+    /// FRITCHII_MEMSTAGE_READ_LOG: every Nth packet's reads are compared, 0 off
+    int read_log_every{};
     Cache* cache{};
     StagingBufferPool* staging_pool{};
 
