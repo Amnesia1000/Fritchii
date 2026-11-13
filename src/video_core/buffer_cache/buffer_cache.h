@@ -33,6 +33,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/memory_stage_link.h"
 #include "video_core/memstage_stats.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cmdpage_diag.h"
@@ -2270,6 +2271,15 @@ void BufferCache<P>::MarkVertexBuffersStale(DAddr device_addr, u64 size) {
 }
 
 template <class P>
+bool BufferCache<P>::IsRepackedVertexBuffer(u32 index) {
+    if constexpr (requires { runtime.IsVertexRepacked(u32{}); }) {
+        return runtime.IsVertexRepacked(index);
+    } else {
+        return false;
+    }
+}
+
+template <class P>
 void BufferCache<P>::RefreshRepackedVertexBuffers() {
     if constexpr (requires { runtime.IsVertexRepacked(u32{}); }) {
         u32 mask = std::exchange(stale_vertex_buffers_mask, 0) & enabled_vertex_buffers_mask;
@@ -2299,6 +2309,12 @@ void BufferCache<P>::BindHostVertexBuffers() {
         u32 enabled_mask = enabled_vertex_buffers_mask;
         HostBindings<Buffer> bindings{};
         u32 last_index = (std::numeric_limits<u32>::max)();
+        // FRITCHII_MEMSTAGE_FULL_BINDS (memory stage spec 4.2): the bindings that are not dirty
+        // are bound too, in runs of their own and without a usage mark, and the player drops
+        // the ones still bound, so the recorded commands stay the same. Repacked ones are left
+        // out: binding one again runs its conversion again.
+        const bool full_binds = VideoCommon::MemoryStageLink::FullVertexBinds();
+        bool run_dirty = true;
         const auto flush_bindings = [&]() {
             if (bindings.buffers.empty()) {
                 return;
@@ -2316,19 +2332,23 @@ void BufferCache<P>::BindHostVertexBuffers() {
             TouchBuffer(buffer, binding.buffer_id);
             MemStageStats::Read(MemStageStats::Kind::Vertex, binding.size);
             SynchronizeBuffer(buffer, binding.device_addr, binding.size);
-            if (!flags[Dirty::VertexBuffer0 + index]) {
+            const bool dirty = flags[Dirty::VertexBuffer0 + index];
+            if (!dirty && (!full_binds || IsRepackedVertexBuffer(index))) {
                 flush_bindings();
                 continue;
             }
             flags[Dirty::VertexBuffer0 + index] = false;
             const u32 stride = Inputs().VertexStreamStride(index);
             const u32 offset = buffer.Offset(binding.device_addr);
-            buffer.MarkUsage(offset, binding.size);
-            if (!bindings.buffers.empty() && index != last_index + 1) {
+            if (dirty) {
+                buffer.MarkUsage(offset, binding.size);
+            }
+            if (!bindings.buffers.empty() && (index != last_index + 1 || dirty != run_dirty)) {
                 flush_bindings();
             }
             if (bindings.buffers.empty()) {
                 bindings.min_index = index;
+                run_dirty = dirty;
             }
             bindings.buffers.push_back(&buffer);
             bindings.offsets.push_back(offset);
