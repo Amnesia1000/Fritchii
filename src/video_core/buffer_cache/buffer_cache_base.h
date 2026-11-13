@@ -589,7 +589,30 @@ public:
 
     /// Everything the cache reads from the engines (cache_inputs.h), for the bound channel.
     [[nodiscard]] CacheInputs Inputs() const noexcept {
+        if (inputs_override != nullptr) [[unlikely]] {
+            return *inputs_override;
+        }
         return CacheInputs{maxwell3d, kepler_compute, gpu_memory, current_draw_indirect};
+    }
+
+    /// FRITCHII_MEMSTAGE_SHADOW=3: the inputs a draw's fill reads instead (null: the engines).
+    void SetInputsOverride(const CacheInputs* inputs) noexcept {
+        inputs_override = inputs;
+    }
+
+    /// Graphics uniform buffer `index` of `stage` as ForEachBoundBuffer visits it: its device
+    /// address and bound size, or {0, 0} when it visits none.
+    [[nodiscard]] std::pair<DAddr, u32> BoundGraphicsUniform(u32 stage, u32 index) const noexcept {
+        if (((channel_state->enabled_uniform_buffer_masks[stage] >> index) & 1) == 0) {
+            return {0, 0};
+        }
+        const Binding& binding = channel_state->uniform_buffers[stage][index];
+        const auto* const sizes = channel_state->uniform_buffer_sizes;
+        const u32 size = sizes ? (std::min)(binding.size, (*sizes)[stage][index]) : binding.size;
+        if (binding.device_addr == 0 || size == 0) {
+            return {0, 0};
+        }
+        return {binding.device_addr, size};
     }
 
     [[nodiscard]] std::pair<Buffer*, u32> GetDrawIndirectCount();
@@ -1054,6 +1077,7 @@ private:
     StampedDestructionRing<Buffer, TICKS_TO_DESTROY> delayed_destruction_ring;
 
     const Tegra::Engines::Maxwell3D::DrawManager::IndirectParams* current_draw_indirect{};
+    const CacheInputs* inputs_override{};
 
     u32 last_index_count = 0;
 
