@@ -1126,7 +1126,8 @@ void GpuSplit::NoteDispatchWriter() {
 }
 
 GpuSplit::DispatchCheck GpuSplit::DispatchesMayWriteSince(u64 since, u64 begin, u64 size, bool wait,
-                                                          u64& checked, bool& waited) {
+                                                          u64& checked, bool& waited,
+                                                          ListedWrites* listed) {
     if (last_dispatch_position <= since) {
         return DispatchCheck::Miss;
     }
@@ -1149,6 +1150,7 @@ GpuSplit::DispatchCheck GpuSplit::DispatchesMayWriteSince(u64 since, u64 begin, 
     const u64 end = begin + size;
     const u64 count = dispatch_write_count.load(std::memory_order_acquire);
     const u64 oldest = count - (std::min)(count, DispatchWriteSlots);
+    ListedWrites found = listed != nullptr ? *listed : ListedWrites{};
     u64 index = count;
     bool reached = false;
     for (u64 scanned = 0; index > (std::max)(checked, oldest); --index, ++scanned) {
@@ -1163,8 +1165,13 @@ GpuSplit::DispatchCheck GpuSplit::DispatchesMayWriteSince(u64 since, u64 begin, 
         const u64 write_begin = write.begin.load(std::memory_order_relaxed);
         const u64 write_end = write.end.load(std::memory_order_relaxed);
         if (write_begin < end && begin < write_end) {
-            return write_end == ~u64{0} && write_begin == 0 ? DispatchCheck::Unbounded
-                                                            : DispatchCheck::Overlap;
+            if (write_end == ~u64{0} && write_begin == 0) {
+                return DispatchCheck::Unbounded;
+            }
+            // A slot reused meanwhile lists a stray range; the reuse check below then misses.
+            if (listed == nullptr || !found.Add(begin, size, write_begin, write_end)) {
+                return DispatchCheck::Overlap;
+            }
         }
     }
     // Writes between `checked` and the oldest remembered were forgotten; the back may have
@@ -1172,6 +1179,9 @@ GpuSplit::DispatchCheck GpuSplit::DispatchesMayWriteSince(u64 since, u64 begin, 
     if ((!reached && oldest > checked) ||
         dispatch_write_count.load(std::memory_order_acquire) >= index + DispatchWriteSlots) {
         return DispatchCheck::ScanLimit;
+    }
+    if (listed != nullptr) {
+        *listed = found;
     }
     checked = count;
     return DispatchCheck::Miss;

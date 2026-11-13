@@ -1683,6 +1683,9 @@ struct Maxwell3D::FrontState {
         /// to miss the page (GpuSplit::WritersMayWriteSince, DispatchesMayWriteSince).
         u64 writer_ranges;
         u64 dispatch_writes;
+        /// EXP10 +8: the noted ranges and dispatch writes since that do overlap the page; a
+        /// read of bytes none of them overlaps still skips the drain.
+        VideoCommon::GpuSplit::ListedWrites listed{};
     };
     std::unordered_map<u64, DmaSnapshot> dma_snapshots;
 };
@@ -3543,6 +3546,15 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             // nobody can tell still count for every read.
             const int exp10 = VideoCore::Nx2Debug::Experiment(10);
             const bool ranged_writers = exp10 != 0;
+            // EXP10 +8 (fable_answer_long_drains R1): a page snapshot is current for every byte
+            // no writer since touches. The page scans list the overlapping writes (8 a page) and
+            // the read misses only when its own bytes overlap one of them.
+            const bool byte_ranges = (exp10 & 8) != 0;
+            static u64 byte_skips{};
+            static u64 byte_overlaps{};
+            static u64 byte_differences{};
+            bool byte_skip = false;
+            const u64 read_end = *device + read_bytes;
             using DispatchCheck = VideoCommon::GpuSplit::DispatchCheck;
             static u64 writer_unbounded{};
             static u64 writer_overlaps{};
@@ -3566,6 +3578,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                 auto& snapshot = it->second;
                 const u64 since = snapshot.position;
                 const bool writer_since = split.LastWriterPosition() > since;
+                auto* const listed = byte_ranges ? &snapshot.listed : nullptr;
                 u32 reason = 4;
                 if (!ranged_writers) {
                     reason = writer_since                             ? 1
@@ -3573,7 +3586,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                              : split.NotedWriteSince(since, *device, read_bytes) ? 3
                                                                                  : 4;
                 } else if (split.WritersMayWriteSince(since, page << 12, 0x1000,
-                                                      &snapshot.writer_ranges)) {
+                                                      &snapshot.writer_ranges, listed)) {
                     // Whole pages: the ranges found to miss one need no second look.
                     reason = 1;
                     ++(split.LastUnboundedWriterPosition() > since ? writer_unbounded
@@ -3587,11 +3600,19 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                     bool waited = false;
                     const DispatchCheck check = split.DispatchesMayWriteSince(
                         since, page << 12, 0x1000, (exp10 & 3) != 2, snapshot.dispatch_writes,
-                        waited);
+                        waited, listed);
                     dispatch_waits += waited ? 1 : 0;
                     if (check != DispatchCheck::Miss) {
                         reason = 1;
                         ++dispatch_checks[static_cast<size_t>(check)];
+                    } else if (listed != nullptr && listed->count != 0) {
+                        // The listed writes are all since this page's snapshot.
+                        if (listed->Overlaps(page << 12, *device, read_end)) {
+                            reason = 1;
+                            ++byte_overlaps;
+                        } else {
+                            byte_skip = true;
+                        }
                     } else {
                         range_skip |= writer_since;
                     }
@@ -3603,6 +3624,9 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             }
             if (hit && range_skip) {
                 ++range_skips;
+            }
+            if (hit && byte_skip) {
+                ++byte_skips;
             }
             // A report's value is up to 8 bytes, listed by its first 4: look 12 bytes back. A
             // listed report may not be in guest memory yet: take the drained path.
@@ -3620,12 +3644,15 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                         memory_manager.ReadBlockUnsafe(source, exact.data(), read_bytes);
                         if (exact != snap_words) {
                             range_differences += range_skip ? 1 : 0;
+                            byte_differences += byte_skip ? 1 : 0;
                             if (differences++ < 32) {
                                 LOG_WARNING(HW_GPU,
                                             "DMA snapshot check: macro {:#x} read of {} words at "
-                                            "{:#x} differs from the drained read ({:#x} vs {:#x}){}",
+                                            "{:#x} differs from the drained read ({:#x} vs "
+                                            "{:#x}){}{}",
                                             macro, words, source, snap_words[0], exact[0],
-                                            range_skip ? " (skipped by EXP10 ranges)" : "");
+                                            range_skip ? " (skipped by EXP10 ranges)" : "",
+                                            byte_skip ? " (skipped by EXP10 byte ranges)" : "");
                             }
                             snap_words = std::move(exact);
                         }
@@ -3666,7 +3693,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                     }
                     for (u64 page = first_page; page <= last_page; ++page) {
                         fs.dma_snapshots[page] = {split.SentPosition(), split.WriterRangeCount(),
-                                                  split.DispatchWriteCount()};
+                                                  split.DispatchWriteCount(), {}};
                     }
                     memory_manager.ReadBlockUnsafe(source, snap_words.data(), read_bytes);
                 }
@@ -3707,20 +3734,24 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                         };
                         LOG_INFO(HW_GPU,
                                  "DMA snapshot EXP10: compute/copy: {} drained ({} unbounded "
-                                 "writer, {} overlapping range; dispatches: {} queued, {} "
-                                 "overlapping, {} unbounded, {} past the scan), {} skipped by "
-                                 "ranges ({} differed), {} waited for dispatches only; dispatch "
-                                 "launches sent: {}, dispatches run: {} bounded, {} unbounded ({} "
+                                 "writer, {} overlapping range, {} on listed bytes; dispatches: "
+                                 "{} queued, {} overlapping, {} unbounded, {} past the scan), {} "
+                                 "skipped by ranges ({} differed), {} by byte ranges ({} "
+                                 "differed), {} waited for dispatches only; dispatch launches "
+                                 "sent: {}, dispatches run: {} bounded, {} unbounded ({} "
                                  "unconfirmed, {} replaced, {} image); unbounded writers sent: "
                                  "{} upload, {} release, {} compute, {} copy, {} other; compute "
                                  "releases: {} ranged, {} unmapped (write nothing), {} write "
                                  "nothing, unbounded: {} pending map, {} sparse, {} unmapped "
                                  "reduction, {} split",
-                                 writer_unbounded + writer_overlaps + dispatch_drains,
-                                 writer_unbounded, writer_overlaps, checks(DispatchCheck::Queued),
+                                 writer_unbounded + writer_overlaps + byte_overlaps +
+                                     dispatch_drains,
+                                 writer_unbounded, writer_overlaps, byte_overlaps,
+                                 checks(DispatchCheck::Queued),
                                  checks(DispatchCheck::Overlap), checks(DispatchCheck::Unbounded),
                                  checks(DispatchCheck::ScanLimit), range_skips, range_differences,
-                                 dispatch_waits, dispatches.sent, dispatches.bounded,
+                                 byte_skips, byte_differences, dispatch_waits, dispatches.sent,
+                                 dispatches.bounded,
                                  dispatches_unbounded, unbounded(Unbounded::Unconfirmed),
                                  unbounded(Unbounded::Replaced), unbounded(Unbounded::Image),
                                  sent[0], sent[1], sent[2], sent[3], sent[4],
