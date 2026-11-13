@@ -415,7 +415,8 @@ of their own, by hand-off.
   user; a VMA heap budget read off its allocator's user; a scheduler or descriptor queue use on
   GPUMem; an entry GPUMem would run at once (served on the back instead); an entry run at once
   while entries are pending; the memory player reached on GPUMem; the front's waits reached on
-  GPUMem. The first 16 of each log "Memory stage link (must be 0)" with the place. The seam's
+  GPUMem; a fill handed off while the back did not hold the buffer cache's lock. The first 16 of
+  each log "Memory stage link (must be 0)" with the place. The seam's
   own 5.1/5.2 counters (EXP123's line) must stay 0 too.
 - EDEN_NX2_GPU_PROFILE: GPUMem reports as "GPU memory thread" with its "memory fill" zone (the
   fill ms/s of EXP123 = 2, now off the back) and "memory sync wait"; the back shows "memory

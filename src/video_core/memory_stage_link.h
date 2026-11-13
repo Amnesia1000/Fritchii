@@ -34,6 +34,7 @@ public:
         PushWhilePending,
         PlayerOnStage,
         FrontWaitOnStage,
+        HandOffUnlocked,
         Count,
     };
 

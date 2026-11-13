@@ -1234,6 +1234,12 @@ void MemStage::HandOff(Cache& cache_, u8 kind, Body& body) {
         owner.store(0, std::memory_order_release);
     }
     lent_mutex = cache_.mutex.IsHeldByCurrentThread() ? &cache_.mutex : nullptr;
+    if (lent_mutex == nullptr) [[unlikely]] {
+        // The fills run under the back's buffer cache lock, which goes with them (spec 5.1).
+        // Without it GPUMem would fill unlocked: counted and logged (must be 0), and run anyway.
+        Link::Note(Link::Check::HandOffUnlocked,
+                   kind == static_cast<u8>(Link::HandOff::Draw) ? "draw fill" : "dispatch fill");
+    }
     lent_back = std::this_thread::get_id();
     handing_back = ThisThread();
     SeamHook::g_watch.fetch_add(1, std::memory_order_relaxed);

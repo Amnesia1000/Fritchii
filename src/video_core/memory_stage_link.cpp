@@ -114,6 +114,7 @@ constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::Check::Co
     "entry executed at once while entries are pending",
     "memory player reached on GPUMem",
     "front-side wait reached on GPUMem",
+    "fill handed off without the back holding the buffer cache's lock",
 };
 constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::HandOff::Count)>
     LINK_HANDOFF_NAMES{"draw fills", "dispatch fills", "idle destroys"};
