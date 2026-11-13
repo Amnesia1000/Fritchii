@@ -1388,7 +1388,8 @@ profile_toggle.py; zones "query report", "counter reset", "render enable" (GPU p
 
 ### EXP120
 
-EXP120 (live, 0 = off; DmaPusher's NoteEngineWriter, fable_answer_long_drains 8.4): the
+EXP120 (live, 0 = off, DEFAULT 2 since 2026-11-13: market 1.89 M reads skipped, 0 differed, 1%
+low 37.7 -> 39.2; DmaPusher's NoteEngineWriter, fable_answer_long_drains 8.4): the
 KeplerMemory and Fermi2D methods the GPU thread split sends are noted for the macro DMA read
 snapshots (EDEN_NX2_DMA_SNAPSHOT) by what the back really writes, instead of every one as an
 unranged writer, which ends every snapshot ("unranged" misses in the "DMA snapshot" line). With
@@ -1413,7 +1414,8 @@ the counts show who notes the unranged writers. Toggle live 0/1 (or 0/2) with pr
 
 ### EXP122
 
-EXP122 (live, 0 = off; GpuSplit's page watch, fable_answer_long_drains 8.2 (a'),
+EXP122 (live, 0 = off, DEFAULT 1 since 2026-11-13: 0 mismatches in 4.39 M verified answers;
+GpuSplit's page watch, fable_answer_long_drains 8.2 (a'),
 fable52_answer_kills 3.4; needs EXP10 on): the device pages the macro DMA read snapshots
 (EDEN_NX2_DMA_SNAPSHOT) are served from are watched. Each compute or copy range the fronts note
 (NoteWriterRange, NoteReleaseWriter) is tested against those pages when it is noted, and the
