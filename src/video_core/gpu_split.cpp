@@ -106,8 +106,9 @@ void NoteSiteWait(DrainSite site, u64 behind, u64 ns) {
     LOG_INFO(HW_GPU,
              "Front waits for the back by site (ring words behind at the start): {}; cache lock "
              "waits: guest cores {:.1f} ms/s ({:.0f}/s), GPU back {:.1f} ms/s ({:.0f}/s), GPU "
-             "front {:.1f} ms/s, other threads {:.1f} ms/s",
-             sites, lock_ms[1], lock_rate[1], lock_ms[3], lock_rate[3], lock_ms[2], lock_ms[0]);
+             "front {:.1f} ms/s, GPU memory {:.1f} ms/s ({:.0f}/s), other threads {:.1f} ms/s",
+             sites, lock_ms[1], lock_rate[1], lock_ms[3], lock_rate[3], lock_ms[2], lock_ms[4],
+             lock_rate[4], lock_ms[0]);
     stats.count = {};
     stats.ns = {};
     stats.behind = {};
