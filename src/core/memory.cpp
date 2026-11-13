@@ -22,6 +22,7 @@
 #include "common/assert.h"
 #include "common/atomic_ops.h"
 #include "common/common_types.h"
+#include "common/fritchii_write_ring.h"
 #include "common/heap_tracker.h"
 #include "common/logging.h"
 #include "common/nx2_uniform_keep_pages.h"
@@ -375,7 +376,8 @@ struct Memory::Impl {
             VideoCommon::WriteTrack::CloseIfArmed();
             // EXP92: the after-store point (unsafe writes recorded nothing: noted here).
             Common::UniformKeepPages::AfterGuestStore();
-            if (unsafe && Common::UniformKeepPages::AnyKept()) [[unlikely]] {
+            if (unsafe && (Common::UniformKeepPages::AnyKept() ||
+                           Common::WriteRing::g_on.load(std::memory_order_relaxed))) [[unlikely]] {
                 NoteUnrecordedStore(GetInteger(current_vaddr), copy_amount);
             }
         });
@@ -1122,6 +1124,8 @@ struct Memory::Impl {
         thread_local Common::ScratchBuffer<u32> scratch;
         gpu_device_memory->ApplyOpOnPointer(p, scratch, [&](DAddr address) {
             Common::UniformKeepPages::Note(address, size);
+            // The memory seam's read log: an emulator write, not a game store.
+            Common::WriteRing::Note(address, size, "Core::Memory unsafe write");
         });
     }
 

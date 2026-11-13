@@ -7,6 +7,7 @@
 
 #include "common/algorithm.h"
 #include "common/assert.h"
+#include "common/fritchii_write_ring.h"
 #include "video_core/engines/engine_upload.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
@@ -68,6 +69,7 @@ void State::ProcessData(const u32* data, size_t num_data) {
 }
 
 void State::ProcessData(std::span<const u8> read_buffer) {
+    const Common::WriteRing::SiteScope write_site{"inline upload (engine upload)", false};
     const GPUVAddr address{regs.dest.Address()};
     if (is_linear) {
         for (size_t line = 0; line < regs.line_count; ++line) {

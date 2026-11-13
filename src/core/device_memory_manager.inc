@@ -17,6 +17,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/div_ceil.h"
+#include "common/fritchii_write_ring.h"
 #include "common/nx2_uniform_keep_pages.h"
 #include "common/paged_scalar.h"
 #include "common/scope_exit.h"
@@ -471,6 +472,7 @@ void DeviceMemoryManager<Traits>::Write(DAddr address, T value) {
         });
     });
     Common::UniformKeepPages::Note(address, sizeof(T)); // EXP92, after the store
+    Common::WriteRing::Note(address, sizeof(T), "device Write");
 }
 
 template <typename Traits>
@@ -578,6 +580,7 @@ void DeviceMemoryManager<Traits>::WriteBlock(DAddr address, const void* src_poin
             src_pointer = static_cast<const u8*>(src_pointer) + copy_amount;
         });
     Common::UniformKeepPages::Note(address, size); // EXP92, after the stores
+    Common::WriteRing::Note(address, size, "device WriteBlock");
     device_inter->InvalidateRegion(address, size);
 }
 
@@ -646,6 +649,7 @@ void DeviceMemoryManager<Traits>::WriteBlockUnsafe(DAddr address, const void* sr
             src_pointer = static_cast<const u8*>(src_pointer) + copy_amount;
         });
     Common::UniformKeepPages::Note(address, size); // EXP92, after the stores
+    Common::WriteRing::Note(address, size, "device WriteBlockUnsafe");
 }
 
 template <typename Traits>
@@ -1006,6 +1010,7 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedCount(DAddr addr, size_t size
 template <typename Traits>
 void DeviceMemoryManager<Traits>::NoteHostStore(DAddr address, size_t size) {
     Common::UniformKeepPages::Note(address, size);
+    Common::WriteRing::Note(address, size, "device span store");
 }
 
 template <typename Traits>

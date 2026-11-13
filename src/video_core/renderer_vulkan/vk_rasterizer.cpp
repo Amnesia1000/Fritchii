@@ -32,6 +32,7 @@
 
 #include "common/assert.h"
 #include "common/dkb_frame_trace.h"
+#include "common/fritchii_write_ring.h"
 #include "common/host_memory.h"
 #include "common/memory_detect.h"
 #include "shader_recompiler/exception.h"
@@ -5176,6 +5177,7 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
 
 void RasterizerVulkan::AccelerateInlineToMemoryImpl(GPUVAddr address, size_t copy_size,
                                                     std::span<const u8> memory) {
+    const Common::WriteRing::SiteScope write_site{"inline upload (AccelerateInlineToMemory)", false};
     auto cpu_addr = gpu_memory->GpuToCpuAddress(address);
     // EDEN_NX2_MEMSTAGE_STATS: an inline upload, and whether it lands on texture pages (join 2).
     VideoCommon::MemStageStats::StreamWrite(VideoCommon::MemStageStats::Write::Inline,

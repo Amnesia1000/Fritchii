@@ -18,6 +18,7 @@
 #include <vector>
 #include "common/assert.h"
 #include "common/bit_util.h"
+#include "common/fritchii_write_ring.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core.h"
@@ -1392,6 +1393,7 @@ void Maxwell3D::ProcessCBBind(size_t stage_index) {
 }
 
 void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
+    const Common::WriteRing::SiteScope write_site{"3D constant buffer data", false};
     const VideoCommon::Nx2Profile::FineScope profile_scope{VideoCommon::Nx2Profile::Zone::CbUpload};
     // Write the input value to the current const buffer at the current position.
     const GPUVAddr buffer_address = regs.const_buffer.Address();

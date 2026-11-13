@@ -7,6 +7,7 @@
 #include "common/algorithm.h"
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/fritchii_write_ring.h"
 #include "common/logging.h"
 #include <ranges>
 #include "common/settings.h"
@@ -162,6 +163,7 @@ void MaxwellDMA::FrontNoteLaunch(VideoCommon::GpuSplit& split, u32 launch) {
 }
 
 void MaxwellDMA::Launch() {
+    const Common::WriteRing::SiteScope write_site{"DMA engine (MaxwellDMA::Launch)", false};
     LOG_TRACE(Render_OpenGL, "DMA copy {:#x} -> {:#x}", static_cast<GPUVAddr>(regs.offset_in), GPUVAddr(regs.offset_out));
     // EDEN_NX2_TRACE_DST=<hex>: also log copies writing within 32 MiB above that GPU address.
     static const u64 trace_destination = [] {

@@ -6,6 +6,7 @@
 #include <atomic>
 
 #include "common/common_types.h"
+#include "common/fritchii_write_ring.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 
 namespace Tegra {

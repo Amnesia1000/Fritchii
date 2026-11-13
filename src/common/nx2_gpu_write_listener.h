@@ -7,6 +7,7 @@
 #include <cstdint>
 
 #include "common/common_types.h"
+#include "common/fritchii_write_ring.h"
 #include "common/nx2_timeline.h"
 #include "common/nx2_uniform_keep_pages.h"
 
@@ -93,6 +94,7 @@ inline void Notify(Path path, u64 device_address, u64 gpu_address, const void* h
     // most, are in guest memory now. One relaxed load until a keep was ever made.
     if (device_address != 0) {
         Common::UniformKeepPages::Note(device_address, 16);
+        Common::WriteRing::Note(device_address, 16, TimelineName(path));
     }
     if (Nx2Timeline::Guest()) [[unlikely]] {
         // What ends a guest poll of this word (tools/nx2/critical_path.py matches the host

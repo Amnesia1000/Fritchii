@@ -1531,6 +1531,7 @@ boost::container::small_vector<SwizzleParameters, 16> FullUploadSwizzles(const I
 void SwizzleImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
                   std::span<const BufferImageCopy> copies, std::span<const u8> memory,
                   Common::ScratchBuffer<u8>& tmp_buffer) {
+    const Common::WriteRing::SiteScope write_site{"texture download (SwizzleImage)", true};
     // The memory seam (SEAM 2/3): a guest write between a held fill and its draw is checked.
     if (MemReadLog::g_held.load(std::memory_order_relaxed)) [[unlikely]] {
         MemReadLog::NoteGuestWrite(gpu_memory, gpu_addr, CalculateGuestSizeInBytes(info));

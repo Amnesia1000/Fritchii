@@ -53,6 +53,7 @@ add_library(
     nx2_gpu_write_listener.h
     nx2_uniform_keep_pages.h
     fritchii_switch_defaults.cpp
+    fritchii_write_ring.h
     dynamic_library.cpp
     dynamic_library.h
     elf.h

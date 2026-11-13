@@ -25,6 +25,7 @@ extern "C" {
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/bit_field.h"
+#include "common/fritchii_write_ring.h"
 #include "common/logging.h"
 #include "common/polyfill_thread.h"
 #include "common/settings.h"
@@ -109,6 +110,7 @@ void Vic::ProcessMethod(u32 method, u32 arg) noexcept {
 }
 
 void Vic::Execute() noexcept {
+    const Common::WriteRing::SiteScope write_site{"host1x VIC output", false};
     ConfigStruct config{};
     host1x.gmmu_manager.ReadBlock(regs.config_struct_offset.Address(), &config, sizeof(ConfigStruct));
 

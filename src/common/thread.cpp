@@ -18,6 +18,7 @@
 #include "common/adpf.h"
 #include "common/error.h"
 #include "common/event_wait.h"
+#include "common/fritchii_write_ring.h"
 #include "common/logging.h"
 #include "common/nx2_sample_profile.h"
 #include "common/assert.h"
@@ -671,6 +672,7 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
 void SetCurrentThreadName(const char* name) {
     Nx2SampleProfile::OnThreadNamed(name);
     Nx2Hitch::RegisterThread(name);
+    WriteRing::NameThread(name);
 #ifdef _MSC_VER
     // Sets the debugger-visible name of the current thread.
     if (auto pf = (decltype(&SetThreadDescription))(void*)GetProcAddress(GetModuleHandle(TEXT("KernelBase.dll")), "SetThreadDescription"); pf)
