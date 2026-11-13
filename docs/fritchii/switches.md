@@ -265,10 +265,12 @@ GetBufferAllocator) and a staging pool of its own on it, so the future memory st
 them on its thread. On it: the buffer cache's buffers (EXP104's pool included), quad and
 uint8 index buffers, vertex repack and multi-range buffers, list and null buffers, the uniform
 stream and buffer uploads and downloads. Images, the texture cache, query cache, descriptors,
-mesh emulation, upscalers and diagnostics stay on the main allocator and staging pool. Nothing
-is reserved twice: the two staging pools split the one stream buffer (64 MiB each instead of
-128 MiB for one; regions 4 MiB instead of 8), EXP104's byte caps count both pools' recyclers
-together, and the new allocator takes no memory until used. Read once when the device is made.
+mesh emulation, upscalers and diagnostics stay on the main allocator and staging pool. The
+back's pool keeps its full stream buffer (128 MiB, texture uploads up to 8 MiB stay in the
+ring); the buffer cache's pool takes half that (64 MiB), so a discrete card reserves 64 MiB
+more. On integrated GPUs the two split the one stream buffer instead. EXP104's byte caps count
+both pools' recyclers together, and the new allocator takes no memory until used. Read once
+when the device is made.
 
 ## Numbered experiments (EDEN_NX2_EXPn)
 
