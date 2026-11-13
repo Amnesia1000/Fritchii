@@ -105,13 +105,43 @@ bool WritesMemory(Engines::EngineInterface* engine, Engines::EngineTypes type, u
     return true;
 }
 
+// The device range GPU range [begin, begin + size) maps to as one piece, or none (unmapped or
+// scattered pages). The last answer is kept until the page tables change (MapSerial): a blit's
+// destination surface is the same one frame after frame and can be MiBs (a page lookup each).
+// Front only.
+[[nodiscard]] std::optional<DAddr> ContiguousDevice(const MemoryManager& memory_manager,
+                                                    GPUVAddr begin, u64 size) {
+    struct Memo {
+        const MemoryManager* memory_manager;
+        GPUVAddr begin;
+        u64 size;
+        u64 serial;
+        std::optional<DAddr> device;
+    };
+    static Memo memo{};
+    const u64 serial = memory_manager.MapSerial();
+    if (memo.memory_manager == &memory_manager && memo.begin == begin && memo.size == size &&
+        memo.serial == serial) {
+        return memo.device;
+    }
+    std::optional<DAddr> device = memory_manager.GpuToCpuAddress(begin);
+    if (device && !MapsContiguously(memory_manager, begin, size, *device)) {
+        device.reset();
+    }
+    // Taken before the walk: a change during it leaves the next call looking again.
+    memo = {&memory_manager, begin, size, serial, device};
+    return device;
+}
+
 // The KeplerMemory or Fermi2D method just sent on the split (`words`: its `count` words, `multi`:
 // a non-incrementing run, CallMultiMethod). EXP120 = 0 notes every one as an unranged writer,
 // which ends every macro DMA read snapshot (fable_answer_long_drains 8.4). EXP120 = 1: the back
 // writes memory only on KeplerMemory's data method and Fermi2D's blit launch (their CallMethod),
 // so the methods that only store a register are not noted, nor a single data word that is not
 // its method's last (Upload::State::ProcessData writes with the last one); a linear upload's data
-// notes the bytes it may write (NoteMemoryWrite). Blits and block linear uploads stay unranged.
+// notes the bytes it may write (NoteMemoryWrite). EXP120 = 2 also notes a blit's whole
+// destination surface (Fermi2D::FrontBlitRange). Block linear uploads stay unranged, and so does
+// anything whose bytes are not one device range.
 void NoteEngineWriter(VideoCommon::GpuSplit& split, const MemoryManager& memory_manager,
                       Engines::EngineInterface* engine, Engines::EngineTypes type, u32 method,
                       const u32* words, u32 count, bool is_last, bool multi) {
@@ -136,15 +166,21 @@ void NoteEngineWriter(VideoCommon::GpuSplit& split, const MemoryManager& memory_
         } else {
             kind = Kind::I2mRegister;
         }
-    } else if (method == FERMI2D_REG_INDEX(pixels_from_memory.src_y0) + 1) {
-        kind = Kind::BlitLaunch;
-        writes = true;
+    } else {
+        auto* const blitter = static_cast<Engines::Fermi2D*>(engine);
+        blitter->FrontNoteMethod(method, words[count - 1]);
+        if (method == FERMI2D_REG_INDEX(pixels_from_memory.src_y0) + 1) {
+            kind = Kind::BlitLaunch;
+            writes = true;
+            ranged = blitter->FrontBlitRange(begin, size);
+        }
     }
     const auto unranged = [&] {
         split.NoteUnrangedWriter();
         split.CountEngineWrite(multi, kind, Note::Unranged);
     };
-    if (VideoCore::Nx2Debug::Experiment(120) == 0) {
+    const int mode = VideoCore::Nx2Debug::Experiment(120);
+    if (mode == 0) {
         return unranged();
     }
     if (!writes) {
@@ -152,17 +188,18 @@ void NoteEngineWriter(VideoCommon::GpuSplit& split, const MemoryManager& memory_
         split.CountEngineWrite(multi, kind, Note::Nothing);
         return;
     }
-    // A large upload, or one over unmapped or scattered pages, stays unranged.
-    std::optional<DAddr> device;
-    if (ranged) {
-        device = memory_manager.GpuToCpuAddress(begin);
+    // A large upload or surface, or one over unmapped or scattered pages, stays unranged.
+    const bool blit = kind == Kind::BlitLaunch;
+    const u64 limit = blit ? u64{64} << 20 : u64{1} << 20;
+    if (!ranged || (blit && mode < 2) || size > limit) {
+        return unranged();
     }
-    if (!device || size > (u64{1} << 20) ||
-        !MapsContiguously(memory_manager, begin, size, *device)) {
+    const std::optional<DAddr> device = ContiguousDevice(memory_manager, begin, size);
+    if (!device) {
         return unranged();
     }
     split.NoteMemoryWriter();
-    split.NoteMemoryWrite(*device, size, "KeplerMemory upload");
+    split.NoteMemoryWrite(*device, size, blit ? "Fermi2D blit" : "KeplerMemory upload");
     split.NoteUnrangedWriterSpared();
     split.CountEngineWrite(multi, kind, Note::Ranged);
 }

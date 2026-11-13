@@ -884,12 +884,17 @@ method but the blit launch, pixels_from_memory.src_y0 + 1) and a single data wor
 its method's last (the upload is written with the last one) are not noted; the data of a linear
 upload notes the bytes it may write (from the upload registers as sent: line_length_in,
 line_count, address, pitch, and the exec's copy size), when they are under 1 MiB and map to one
-device range. Blits, block linear uploads and anything else stay unranged. "DMA snapshot
-unranged notes (EXP120=n; single/run)" logs, every 5 s with the "DMA snapshot" line, each kind
+device range. Blits (with 1), block linear uploads and anything else stay unranged. With 2,
+also a blit launch notes its whole destination surface (the registers as sent: address,
+layout, pitch or block linear size from width, height, depth and block sizes, the format's
+bytes per pixel; as SoftwareBlitEngine sizes it, whose covered rows stay inside it; the texture
+cache's copy writes an image, not guest memory), when it is up to 64 MiB and maps to one device
+range. "DMA snapshot unranged notes (EXP120=n; single/run)" logs, every 5 s with the "DMA
+snapshot" line, each kind
 of method by call (single method / non-incrementing run): noted unranged, ranged, not noted;
 and the reads EXP120 let skip the drain (an unranged note it spared since the page's snapshot)
 with their own "differed" count, which EDEN_NX2_DMA_SNAPSHOT=10 checks and must stay 0. With 0
-the counts show who notes the unranged writers. Toggle live 0/1 with profile_toggle.py.
+the counts show who notes the unranged writers. Toggle live 0/1 (or 0/2) with profile_toggle.py.
 
 ### EXP101
 
