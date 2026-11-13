@@ -425,6 +425,8 @@ public:
                        ///< is expected, the next fill reads it again
         BackGather,    ///< bound range: a gather ran on this thread between the fill and the play
         Unclassified,
+        AsyncOverRead, ///< a query completion GPUFencingThread wrote, on bytes the packet does not
+                       ///< bind: it lands when the GPU finishes, not at a stream position (step 7)
         Count,
     };
 

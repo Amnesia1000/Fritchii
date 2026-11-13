@@ -191,6 +191,7 @@ private:
         std::atomic<u64> unchecked{};
         std::atomic<u64> split{};
         std::atomic<u64> epoch_off{};
+        std::atomic<u64> epoch_racing{}; ///< GPUMem's reads one apart from a close (step 7)
     };
     Counters counters;
     struct Snap {
@@ -205,6 +206,7 @@ private:
         u64 unchecked{};
         u64 split{};
         u64 epoch_off{};
+        u64 epoch_racing{};
     };
     void Take(Snap& out) const noexcept;
     Snap reported{};
