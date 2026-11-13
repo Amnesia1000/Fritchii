@@ -698,6 +698,14 @@ private:
     /// Runs the Garbage Collector.
     void RunGarbageCollector(bool out_of_memory);
 
+    /// EXP121: the collector's download without a wait (false: take the waiting path).
+    bool QueueCollectDownload(ImageId image_id);
+    /// EXP121: deletes the images whose download the GPU has finished, drops those used again.
+    void LandCollectDownloads();
+    /// EXP121: forgets queued downloads (the images stay) overlapping guest bytes written now.
+    void DropCollectDownloadsIn(DAddr cpu_addr, size_t size);
+    void DropCollectDownload(size_t index);
+
     /// Find or create an image view in the guest descriptor table
     ImageViewId VisitImageView(u32 index, bool compute);
 
@@ -1374,6 +1382,27 @@ private:
     };
     std::deque<GpuSentencedImage> gpu_sentenced_images;
     u64 gpu_sentenced_bytes{};
+
+    /// EXP121: collector downloads recorded without a wait, oldest first.
+    struct CollectDownload {
+        ImageId image_id;
+        AsyncBuffer map;
+        boost::container::small_vector<BufferImageCopy, 16> copies;
+        u64 tick;              ///< GPU tick of the copy
+        u64 frame;             ///< frame_tick when recorded
+        u64 lru_tick;          ///< the image's LRU tick then; another one means it was used
+        u64 image_modification; ///< the image's modification_tick then
+        u64 cache_modification; ///< the cache's modification_tick then
+        u64 staging_bytes;
+        u64 memory_bytes;      ///< device memory counted as freed while queued
+    };
+    std::deque<CollectDownload> collect_downloads;
+    u64 collect_download_staging{};
+    u64 collect_download_memory{};
+    struct CollectDownloadStats {
+        u64 waits, made, landed, dropped_used, dropped_written, dropped_deleted, fallback_cap,
+            fallback_oom, mismatches, land_frames;
+    } collect_stats{};
 
     /// Bytes of images per device memory block, for the collector (refreshed every 60 frames).
     std::unordered_map<u64, u64> block_image_bytes;

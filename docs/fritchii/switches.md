@@ -946,6 +946,26 @@ verified answers and verify mismatches. Off by default, not measured yet: run 2 
 mismatches in a kill fight and at the pot room), then toggle 0/1 with profile_toggle.py and
 compare the "past the scan" count and the macro dma read drains.
 
+### EXP121
+
+EXP121 (live, 0 = off; fable52_answer_kills 3, fix 1): the texture cache's collector, once device
+memory is at its expected threshold, downloads each GPU-written image it evicts and waits for
+the GPU every time (2 to 3 ms, then ten more short waits, in fight frames). With 1 it records
+the download into a staging buffer without waiting and deletes the image at a later frame end,
+once the GPU is past the copy: guest memory written, untracked, unregistered, deleted, as the
+waiting path does. Until then the image stays registered (a guest read takes the usual read
+path) and counts as freed for the collector. The queued download is dropped and the image kept
+if it is used again (its LRU tick moved), written again (by the GPU, the CPU, or a guest read
+download), deleted by another path, or if newer GPU data reaches its guest memory (another
+image's or a DMA buffer download, or an overlapping image written since). Still waiting: an
+allocation that failed (the memory is needed now), sparse images, and past 64 queued downloads
+or 256 MiB of staging (EXP57 still limits those). With 2, each landing is also compared with a
+fresh waited download (mismatches must be 0; the first are logged with the image). "Texture
+cache last 600 frames: collector downloads" logs, with EXP121 on or EDEN_NX2_TC_LOG, the waits
+left, queued, landed (and frames from record to landing), dropped by reason, fallbacks and
+mismatches. Toggle live 0/1 (or 0/2) with profile_toggle.py in a scene at the memory threshold
+(8 GB cards, long fights).
+
 ### EXP101
 
 EXP101 (live, 0 = off, 1 = runs, 2 = cached page pointer + prefetch; fable52_answer_presenter): nvhost_gpu::SubmitGPFIFOImpl's pushbuffer

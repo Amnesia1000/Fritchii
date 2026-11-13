@@ -179,8 +179,11 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         if (num_iterations == 0) {
             return true;
         }
-        --num_iterations;
         auto& image = slot_images[image_id];
+        if (True(image.flags & ImageFlagBits::CollectPending)) {
+            return false; // EXP121: already counted as freed
+        }
+        --num_iterations;
         if (True(image.flags & ImageFlagBits::IsDecoding)) {
             return false;
         }
@@ -189,35 +192,50 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             (!high_priority_mode && must_download)) {
             return false;
         }
+        // EXP121 (live, 0 = off): record the download and delete the image at a later frame end,
+        // when the GPU has written it out (LandCollectDownloads), instead of waiting here. An
+        // allocation that failed needs the memory now, so it still waits.
+        bool queued = false;
+        if (must_download && VideoCore::Nx2Debug::Experiment(121) != 0) {
+            if (out_of_memory) {
+                ++collect_stats.fallback_oom;
+            } else {
+                queued = QueueCollectDownload(image_id);
+            }
+        }
         // EDEN_NX2_EXP57 (live, 0 = off): at most one download with a full wait for the GPU per
         // frame unless an allocation failed. A player's first high-priority pass downloaded
         // image after image and froze for 3 s (fable52_answer_3 s7); the rest wait for later
         // frames.
-        if (must_download && !out_of_memory && VideoCore::Nx2Debug::Experiment(57) != 0 &&
-            gc_waited_frame == frame_tick) {
+        if (!queued && must_download && !out_of_memory &&
+            VideoCore::Nx2Debug::Experiment(57) != 0 && gc_waited_frame == frame_tick) {
             ++gc_downloads_deferred;
             return false;
         }
-        if (must_download) {
-            gc_waited_frame = frame_tick;
-            auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
-            const auto copies = FullDownloadCopies(image.info);
-            image.DownloadMemory(map, copies);
-            runtime.Finish();
-            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);
-            ++gc_download_deletes;
-            // Guest memory holds the GPU's data now (DeleteImage must not mark it stale).
-            image.flags &= ~ImageFlagBits::GpuModified;
-            ClearStaleImage(image);
-        } else {
-            MarkStale(image); // before UntrackImage (see MarkStale)
+        if (!queued) {
+            if (must_download) {
+                gc_waited_frame = frame_tick;
+                auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
+                const auto copies = FullDownloadCopies(image.info);
+                image.DownloadMemory(map, copies);
+                runtime.Finish();
+                ++collect_stats.waits;
+                DropCollectDownloadsIn(image.cpu_addr, image.guest_size_bytes);
+                SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);
+                ++gc_download_deletes;
+                // Guest memory holds the GPU's data now (DeleteImage must not mark it stale).
+                image.flags &= ~ImageFlagBits::GpuModified;
+                ClearStaleImage(image);
+            } else {
+                MarkStale(image); // before UntrackImage (see MarkStale)
+            }
+            if (True(image.flags & ImageFlagBits::Tracked)) {
+                UntrackImage(image, image_id);
+            }
+            ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
+            UnregisterImage(image_id);
+            DeleteImage(image_id, image.scale_tick > frame_tick + 5);
         }
-        if (True(image.flags & ImageFlagBits::Tracked)) {
-            UntrackImage(image, image_id);
-        }
-        ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
-        UnregisterImage(image_id);
-        DeleteImage(image_id, image.scale_tick > frame_tick + 5);
         if (out_of_memory) {
             return false;
         }
@@ -295,6 +313,148 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     if (out_of_memory || total_used_memory >= critical_memory) {
         Configure(true);
         Collect();
+    }
+}
+
+template <class P>
+bool TextureCache<P>::QueueCollectDownload(ImageId image_id) {
+    if constexpr (requires { runtime.CurrentTick(); }) {
+        // Caps on what is held at once; past them the collector waits as before.
+        constexpr size_t MaxQueued = 64;
+        constexpr u64 MaxStaging = 256_MiB;
+        Image& image = slot_images[image_id];
+        if (True(image.flags & ImageFlagBits::Sparse)) {
+            return false;
+        }
+        const u64 staging_bytes = image.unswizzled_size_bytes;
+        if (collect_downloads.size() >= MaxQueued ||
+            collect_download_staging + staging_bytes > MaxStaging) {
+            ++collect_stats.fallback_cap;
+            return false;
+        }
+        // Deferred: the pool must not hand the buffer to anyone else until it is freed here.
+        auto map = runtime.DownloadStagingBuffer(staging_bytes, true);
+        const auto copies = FullDownloadCopies(image.info);
+        image.DownloadMemory(map, copies);
+        const u64 memory_bytes = (image.HasScaled() ? GetScaledImageSizeBytes(image) : 0) +
+                                 ImageMemoryBytes(image);
+        collect_downloads.push_back(CollectDownload{
+            .image_id = image_id,
+            .map = map,
+            .copies = copies,
+            .tick = runtime.CurrentTick(),
+            .frame = frame_tick,
+            .lru_tick = lru_cache.Tick(image.lru_index),
+            .image_modification = image.modification_tick,
+            .cache_modification = modification_tick,
+            .staging_bytes = staging_bytes,
+            .memory_bytes = memory_bytes,
+        });
+        image.flags |= ImageFlagBits::CollectPending;
+        collect_download_staging += staging_bytes;
+        collect_download_memory += memory_bytes;
+        total_used_memory -= (std::min)(total_used_memory, memory_bytes);
+        ++collect_stats.made;
+        return true;
+    } else {
+        (void)image_id;
+        return false;
+    }
+}
+
+template <class P>
+void TextureCache<P>::DropCollectDownload(size_t index) {
+    CollectDownload& entry = collect_downloads[index];
+    slot_images[entry.image_id].flags &= ~ImageFlagBits::CollectPending;
+    // The image stays: its memory counts again (TickFrame leaves out the rest still queued).
+    total_used_memory += entry.memory_bytes;
+    collect_download_staging -= entry.staging_bytes;
+    collect_download_memory -= entry.memory_bytes;
+    runtime.FreeDeferredStagingBuffer(entry.map);
+    collect_downloads.erase(collect_downloads.begin() + static_cast<std::ptrdiff_t>(index));
+}
+
+template <class P>
+void TextureCache<P>::DropCollectDownloadsIn(DAddr cpu_addr, size_t size) {
+    // Newer bytes went to guest memory: the queued, older ones must not land over them.
+    for (size_t i = collect_downloads.size(); i-- > 0;) {
+        const ImageBase& image = slot_images[collect_downloads[i].image_id];
+        if (image.cpu_addr < cpu_addr + size && cpu_addr < image.cpu_addr + image.guest_size_bytes) {
+            DropCollectDownload(i);
+            ++collect_stats.dropped_written;
+        }
+    }
+}
+
+template <class P>
+void TextureCache<P>::LandCollectDownloads() {
+    if constexpr (requires { runtime.CurrentTick(); }) {
+        const DeleteReasonScope delete_reason_scope{*this, DeleteReason::GarbageCollect};
+        for (size_t i = 0; i < collect_downloads.size();) {
+            CollectDownload& entry = collect_downloads[i];
+            Image& image = slot_images[entry.image_id];
+            // Used again (bound, drawn to, copied; registered again): keep it, as if never picked.
+            if (False(image.flags & ImageFlagBits::Registered) ||
+                lru_cache.Tick(image.lru_index) != entry.lru_tick) {
+                DropCollectDownload(i);
+                ++collect_stats.dropped_used;
+                continue;
+            }
+            // Written again by the GPU or the CPU, or downloaded by a guest read.
+            bool written = !IsDownloadable(image) ||
+                           image.modification_tick != entry.image_modification;
+            if (!written && runtime.IsFree(entry.tick)) {
+                // An overlapping image the GPU wrote since holds newer bytes for this memory.
+                const ImageId self = entry.image_id;
+                const u64 since = entry.cache_modification;
+                ForEachImageInRegion(image.cpu_addr, image.guest_size_bytes,
+                                     [&](ImageId other_id, ImageBase& other) {
+                                         written |= other_id != self &&
+                                                    other.modification_tick > since;
+                                     });
+            }
+            if (written) {
+                DropCollectDownload(i);
+                ++collect_stats.dropped_written;
+                continue;
+            }
+            if (!runtime.IsFree(entry.tick)) {
+                ++i;
+                continue;
+            }
+            // EXP121=2: compare with a download that waits (nothing touched the image since).
+            if (VideoCore::Nx2Debug::Experiment(121) == 2) {
+                auto fresh = runtime.DownloadStagingBuffer(entry.staging_bytes);
+                image.DownloadMemory(fresh, entry.copies);
+                runtime.Finish();
+                if (std::memcmp(fresh.mapped_span.data(), entry.map.mapped_span.data(),
+                                entry.staging_bytes) != 0) {
+                    if (++collect_stats.mismatches <= 8) {
+                        LOG_WARNING(HW_GPU,
+                                    "Collector download differs from a waited one: {:#x} {}x{} "
+                                    "format {}, {} frames after it was recorded",
+                                    image.gpu_addr, image.info.size.width,
+                                    image.info.size.height, static_cast<u32>(image.info.format),
+                                    frame_tick - entry.frame);
+                    }
+                }
+            }
+            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, entry.copies,
+                         entry.map.mapped_span, swizzle_data_buffer);
+            ++collect_stats.landed;
+            collect_stats.land_frames += frame_tick - entry.frame;
+            const ImageId image_id = entry.image_id;
+            DropCollectDownload(i);
+            // As the waiting path, a few frames later.
+            image.flags &= ~ImageFlagBits::GpuModified;
+            ClearStaleImage(image);
+            if (True(image.flags & ImageFlagBits::Tracked)) {
+                UntrackImage(image, image_id);
+            }
+            ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
+            UnregisterImage(image_id);
+            DeleteImage(image_id, image.scale_tick > frame_tick + 5);
+        }
     }
 }
 
@@ -495,6 +655,10 @@ void TextureCache<P>::TickFrame() {
             scratch->release();
         }
     }
+    // EXP121: before the usage is read below, so landed images leave the queued bytes.
+    if (!collect_downloads.empty()) {
+        LandCollectDownloads();
+    }
     if constexpr (HAS_DEVICE_MEMORY_INFO) {
         // Switch 2 titles (native tiling) stream far more texture data than the original thresholds
         // were tuned for: title 1's attract loop alone keeps ~5.3 GB resident, so the collector
@@ -628,6 +792,8 @@ void TextureCache<P>::TickFrame() {
             total_used_memory -= (std::min)(total_used_memory, bytes);
         }
         total_used_memory -= (std::min)(total_used_memory, gpu_sentenced_bytes);
+        // EXP121: images whose download is queued are as good as deleted.
+        total_used_memory -= (std::min)(total_used_memory, collect_download_memory);
         // EDEN_NX2_ASYNC_IMAGE_FREE: deleted images handed to the free thread and not destroyed
         // yet are still counted by the driver; left out, so the collector sees what it saw when
         // they were destroyed above. Read after the usage: a free in between leaves the usage
@@ -756,6 +922,23 @@ void TextureCache<P>::TickFrame() {
         gc_deletes = gc_costly_deletes = gc_download_deletes = gc_downloads_deferred =
             async_decodes_queued = 0;
         images_created = images_deleted = 0;
+    }
+    // EXP121's counts, and the collector downloads that still wait for the GPU.
+    if (frame_tick % 600 == 0 && (log_tc || VideoCore::Nx2Debug::Experiment(121) != 0)) {
+        auto& s = collect_stats;
+        if (s.waits != 0 || s.made != 0 || !collect_downloads.empty()) {
+            LOG_INFO(HW_GPU,
+                     "Texture cache last 600 frames: collector downloads {} waited, {} queued, "
+                     "{} landed ({:.1f} frames after), dropped {} used again / {} written again "
+                     "/ {} deleted, fell back {} cap / {} out of memory, {} mismatches, {} queued "
+                     "now ({} MiB staging)",
+                     s.waits, s.made, s.landed,
+                     s.landed != 0 ? static_cast<double>(s.land_frames) / s.landed : 0.0,
+                     s.dropped_used, s.dropped_written, s.dropped_deleted, s.fallback_cap,
+                     s.fallback_oom, s.mismatches, collect_downloads.size(),
+                     collect_download_staging >> 20);
+        }
+        s = {};
     }
     SweepColdImages();
     // An image that could not be made at all: the driver is out of memory whatever the counts
@@ -2290,6 +2473,7 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
         runtime.Finish();
         for (Pending& entry : pending) {
             Image& image = slot_images[entry.image_id];
+            DropCollectDownloadsIn(image.cpu_addr, image.guest_size_bytes);
             SwizzleImage(*gpu_memory, image.gpu_addr, image.info, entry.copies,
                          entry.map.mapped_span, swizzle_data_buffer);
             ClearStaleImage(image);
@@ -2891,12 +3075,18 @@ void TextureCache<P>::PopAsyncFlushes() {
                 download_buffer.offset -= Common::AlignUp(image.unswizzled_size_bytes, 64);
                 std::span<u8> download_span =
                     download_buffer.mapped_span.subspan(download_buffer.offset);
+                DropCollectDownloadsIn(image.cpu_addr, image.guest_size_bytes);
                 SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, download_span, swizzle_data_buffer);
                 ClearStaleImage(image);
             } else {
                 const BufferDownload& buffer_info = slot_buffer_downloads[download_info.object_id];
                 std::span<u8> download_span =
                     download_buffer.mapped_span.subspan(download_buffer.offset);
+                if (!collect_downloads.empty()) {
+                    if (const auto cpu_addr = gpu_memory->GpuToCpuAddress(buffer_info.address)) {
+                        DropCollectDownloadsIn(*cpu_addr, buffer_info.size);
+                    }
+                }
                 gpu_memory->WriteBlockUnsafe(buffer_info.address, download_span.data(),
                                              buffer_info.size);
                 ClearStaleGpu(buffer_info.address, buffer_info.size);
@@ -2944,6 +3134,7 @@ void TextureCache<P>::PopAsyncFlushes() {
             }
             const ImageBase& image = download_info.GetImage(slot_images);
             const auto copies = FullDownloadCopies(image.info);
+            DropCollectDownloadsIn(image.cpu_addr, image.guest_size_bytes);
             SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, download_span, swizzle_data_buffer);
             ClearStaleImage(image);
             download_map.offset += image.unswizzled_size_bytes;
@@ -5940,6 +6131,16 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
         CensusFinish(image_id, true);
     }
     ImageBase& image = slot_images[image_id];
+    if (True(image.flags & ImageFlagBits::CollectPending)) [[unlikely]] {
+        // EXP121: deleted by another path before its queued download landed.
+        for (size_t i = 0; i < collect_downloads.size(); ++i) {
+            if (collect_downloads[i].image_id == image_id) {
+                DropCollectDownload(i);
+                ++collect_stats.dropped_deleted;
+                break;
+            }
+        }
+    }
     ++images_deleted;
     Churn::Add(Churn::ImagesDeleted);
     ++bindings_epoch;
