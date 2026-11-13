@@ -328,6 +328,7 @@ struct GPU::Impl {
         if (ReadRunStats::g_enabled) [[unlikely]] {
             ReadRunStats::t_run_pages = 0;
             ReadRunStats::t_read_bytes = {};
+            ReadRunStats::t_writer_answer = {};
         }
         auto raster_area = renderer->ReadRasterizer()->GetFlushArea(addr, size);
         if (raster_area.preemtive) {
@@ -344,10 +345,11 @@ struct GPU::Impl {
             renderer->ReadRasterizer()->WaitFenceDownload(raster_area.fence_download)) {
             raster_area.preemtive = true;
             if (ReadRunStats::g_enabled) [[unlikely]] {
+                const u64 wait_ns = VideoCore::AsyncReadback::Now() - run_start;
                 ReadRunStats::NoteRead(ReadRunStats::Kind::FenceDownload,
-                                       raster_area.start_address, run_pages,
-                                       VideoCore::AsyncReadback::Now() - run_start, size,
+                                       raster_area.start_address, run_pages, wait_ns, size,
                                        read_bytes);
+                NoteReadWriter(ReadRunStats::Kind::FenceDownload, wait_ns);
             }
             return raster_area;
         }
@@ -401,13 +403,29 @@ struct GPU::Impl {
         AsyncReadback::CountRead(kind, AsyncReadback::Now() - request);
         AsyncReadback::MaybeReport();
         if (ReadRunStats::g_enabled) [[unlikely]] {
-            ReadRunStats::NoteRead(kind == AsyncReadback::Read::InFlight
-                                       ? ReadRunStats::Kind::InFlight
-                                       : ReadRunStats::Kind::Flushed,
-                                   raster_area.start_address, run_pages,
-                                   AsyncReadback::Now() - run_start, size, read_bytes);
+            const ReadRunStats::Kind read_kind = kind == AsyncReadback::Read::InFlight
+                                                     ? ReadRunStats::Kind::InFlight
+                                                     : ReadRunStats::Kind::Flushed;
+            const u64 wait_ns = AsyncReadback::Now() - run_start;
+            ReadRunStats::NoteRead(read_kind, raster_area.start_address, run_pages, wait_ns, size,
+                                   read_bytes);
+            NoteReadWriter(read_kind, wait_ns);
         }
         return raster_area;
+    }
+
+    /// FRITCHII_READ_RUNS: the read's writer, as GetFlushArea found it, and whether the read's
+    /// bytes in guest memory differ now that its download landed from before it landed.
+    void NoteReadWriter(VideoCommon::ReadRunStats::Kind kind, u64 wait_ns) {
+        namespace ReadRunStats = VideoCommon::ReadRunStats;
+        const ReadRunStats::WriterAnswer& answer = ReadRunStats::t_writer_answer;
+        std::array<u8, ReadRunStats::CompareBytes> after{};
+        if (answer.compared != 0) {
+            system.Host1x().MemoryManager().ReadBlockUnsafe(answer.address, after.data(),
+                                                            answer.compared);
+        }
+        ReadRunStats::NoteWriter(kind, wait_ns, answer,
+                                 answer.compared != 0 ? after.data() : nullptr);
     }
 
     /// Notify rasterizer that any caches of the specified region should be invalidated

@@ -1212,7 +1212,7 @@ run histogram says whether the reads have neighbours to take.
 
 FRITCHII_READ_RUNS=1 (boot, diagnostic, default off; read_run_stats.h): the guest reads of
 GPU-written memory that go to the back or wait for a download (GPU::OnCPURead past its
-preemptive answer). Every 600 frames two lines:
+preemptive answer). Every 600 frames these lines:
 
 - "Read runs": each read's kind (flushed, waited for a read download on its way, waited for a
   fence download on its way), whether it is on the page after the previous one, the
@@ -1229,6 +1229,40 @@ preemptive answer). Every 600 frames two lines:
   (<=16 B, <=64, <=256, <=4096, more). The wait split by overlap/page only/unknown, in ms a
   frame and ms a read. "gpu_modified_ranges answers otherwise" counts waits where the download
   ranges and gpu_modified_ranges disagree (should be near 0).
+- "Read writers", up to 8 "Read writer k/n" lines and "Read runs for B1"
+  (fable52_answer_readback 3): which write made the bytes each read waits for. Every GPU write
+  mark (BufferCache::MarkWrittenBuffer, on the thread that binds: the back, or the memory stage)
+  goes into a ring of 16,384 marks with its range, host time, the dispatch count at the time
+  and its writer: a dispatch's storage or texture buffer (the compute program's hash, the same
+  hash as the write extent checks use, and the binding index), a draw's (stage and binding), or
+  other (copies, queries, transform feedback; no bind named it). The binds set the writer in a
+  thread-local around their marks. At a read whose pages hold GPU-written bytes, GetFlushArea
+  (reading thread, cache mutex held, before anything lands) takes the newest mark over the
+  read's bytes and copies up to 64 of the read's bytes from guest memory; OnCPURead, once the
+  read is answered, compares them with guest memory again.
+  - "Read writers": reads with a mark over their bytes, with one only on their page, with none
+    in the ring, and not GPU-written in the buffer cache; the write's age at the read (from the
+    mark to the read's ask) as <1 ms / 1-1.5 / >=1.5 per kind; reads whose bytes differed at
+    landing out of those compared; marks a frame (the ring covers about 16,384 / that frames).
+  - "Read writer k/n", the 8 writers with the most wait: reads by kind; the age (<0.5, <1, <2,
+    <4 ms, more); the wait in ms a frame and a read; the read's offset in the marked range (the
+    bound range, or a multi-range segment) as lowest to highest, distinct offsets, and the most
+    common step from the writer's previous read; how many reads' bytes differed at landing; the
+    dispatches bound between the write and the read.
+  - "Read runs for B1": the GPU-written runs around the reads (GetFlushArea's run, up to 65
+    pages) kept 16 frames after their last read and merged where they touch: how many and how
+    big a frame, and the bytes marked GPU-written inside them a frame (all writers, and by
+    dispatches). That is about what fence downloads would add if B1 marked those runs
+    Preflushable (an upper bound: a range marked twice before a fence downloads once).
+
+  Reading it for fable52_answer_readback 2: flushed reads whose writes are 1.5 ms or more old at
+  the read are the ones B1 turns into landed reads (the bytes were written long before the read;
+  only the missing mark sent them to the back); flushed reads under 1 ms only become fence
+  waits with B1, and the fence download kind only gains from B2 (reaching the dispatch run
+  sooner). A writer whose bytes never differ at landing is the one to read the code of. A steady
+  step in the offsets means the read walks an array: mark ahead by a page instead of the run.
+  Costs with it on: a lock and a ring slot per write mark ("marks a frame"), a scan of up
+  to 16,384 marks and a 64-byte copy per read; off: one test of a constant at each site.
 
 The GPU-written ranges are what the cache marks: for a dispatch or draw that is the bound
 writable buffer range (cut only by the native store bound, or by EDEN_NX2_WRITTEN_SSBO_MARK_KIB,
