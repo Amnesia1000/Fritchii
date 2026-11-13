@@ -527,6 +527,8 @@ private:
     u32 back_repack_mask{};
     /// GPUMem's copy of the facts of the draw it fills (the cache keeps a pointer to the sizes).
     MemStage::StagedFacts stage_facts{};
+    /// GPUMem: the raw handles of the draw it fills (SEAM 3).
+    std::vector<u32> stage_handle_values;
 };
 
 } // namespace Vulkan

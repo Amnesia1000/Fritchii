@@ -48,6 +48,7 @@ public:
         PacketOrphan,
         StageException,
         PacketMismatch,
+        BackHandles,
         Count,
     };
 

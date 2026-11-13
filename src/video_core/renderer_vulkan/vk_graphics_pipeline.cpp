@@ -38,6 +38,7 @@
 #include "video_core/memstage_stats.h"
 #include "video_core/shader_handle_program.h"
 #include "video_core/shader_notify.h"
+#include "video_core/memory_stage_link.h"
 #include "video_core/texture_handle_values.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -1556,10 +1557,20 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         if (mem_stage.ValuesByValue()) {
             handle_values = mem_stage.HandleValues(false, packet_null_pointers);
             if (handle_values == nullptr) {
+                if (mem_stage.HeldFromRing()) [[unlikely]] {
+                    // FRITCHII_MEMSTAGE_THREAD = 2: the stage's packet came without them.
+                    VideoCommon::MemoryStageLink::Note(
+                        VideoCommon::MemoryStageLink::Check::BackHandles,
+                        "a served draw's handles read in Configure");
+                }
                 Profile::Scope scope{Profile::Zone::ReadHandles};
                 FillHandleValues(mem_stage, VideoCore::Nx2Debug::Experiment(21) != 0, true);
                 handle_values = mem_stage.HandleValues(false, packet_null_pointers);
             }
+        } else if (mem_stage.HeldFromRing()) [[unlikely]] {
+            // SEAM below 3 with a ring packet (the ring is ending): handles from game memory.
+            VideoCommon::MemoryStageLink::Note(VideoCommon::MemoryStageLink::Check::BackHandles,
+                                               "a served draw's handles read below SEAM 3");
         }
     }
     const bool verify_handles{handle_values != nullptr &&

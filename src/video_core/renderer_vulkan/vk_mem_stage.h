@@ -250,6 +250,8 @@ public:
         bool uses_descriptor_buffer;
         bool dynamic_vertex_input;
         std::array<u64, 2> hashes;
+        /// The programs' infos, for the handle values the stage reads at its fill.
+        std::shared_ptr<const std::array<Shader::Info, 5>> infos;
     };
 
     /// What FillDraw needs from the graphics pipeline (spec 4.2's StageFacts).
@@ -460,8 +462,14 @@ public:
     // FRITCHII_MEMSTAGE_THREAD = 2 (vk_mem_stage.cpp, "Ring B").
     /// GPUMem: FillDraw for a draw the stage serves (after BeginDraw); the packet goes to ring B.
     /// `pre` runs inside the fill bracket first (the buffer half of the stage's ranges).
+    /// `values`: the draw's raw handles the stage read at its position (SEAM 3), or null.
     bool FillRingDraw(Cache& cache, const DrawFacts& facts, bool is_indexed, u64 position, u64 seq,
-                      u64 hash, void (*pre)(void*), void* pre_argument);
+                      u64 hash, void (*pre)(void*), void* pre_argument,
+                      const std::vector<u32>* values, bool null_pointer_handles);
+    /// The back holds a draw packet from ring B.
+    [[nodiscard]] bool HeldFromRing() const noexcept {
+        return held == HeldKind::Draw && held_ring;
+    }
     /// GPUMem: room for another packet.
     [[nodiscard]] bool RingRoom() const noexcept;
     /// The back: the packet of its draw `seq` (packets of earlier draws are played whole first),
@@ -848,6 +856,7 @@ private:
     std::array<u64, 2> reported_vertex_runs{};
     bool thread_clamp_logged{};
     bool ring_clamp_logged{};
+    bool ring_seam_logged{};
     bool ahead_logged{};
 
     std::atomic<int> seam_level{0};
@@ -866,6 +875,8 @@ private:
         u32 held_cursor;
         u32 entry_bytes;
         std::array<u64, 2> hashes;
+        u32 value_count;  ///< Handle values after the entries
+        u32 value_flags;  ///< 1: filled, 2: EXP21's null pointer handles
     };
     static constexpr u64 RingBytes = u64{4} << 20;
     std::unique_ptr<u8[]> ring_b;
@@ -881,6 +892,8 @@ private:
     u64 ring_fill_hash{};
     void (*ring_pre)(void*){};
     void* ring_pre_argument{};
+    const std::vector<u32>* ring_values{};
+    bool ring_null_pointers{};
     /// The held draw came from ring B: its packet is played_draw.
     bool held_ring{};
     DrawPacket played_draw{};
@@ -890,15 +903,15 @@ private:
     void DiscardRingHeader(const RingHeader& header);
     [[nodiscard]] u64 RingOldestNumber();
 
-    // The facts table (spec 4.4): open addressing, a sequence word per slot.
+    // The facts table (spec 4.4): open addressing under a lock (written rarely, by the back).
     struct FactsSlot {
-        std::atomic<u64> sequence{};
         u64 key{};
         const void* source{};
         StagedFacts facts{};
     };
     static constexpr size_t FactsSlots = 4096;
     std::unique_ptr<FactsSlot[]> facts_table;
+    mutable std::mutex facts_mutex;
     std::vector<u32> draw_values;
     std::vector<u32> dispatch_values;
 

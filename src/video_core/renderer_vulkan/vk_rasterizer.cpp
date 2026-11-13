@@ -88,6 +88,7 @@
 #include "video_core/fritchii_draw_kinds.h"
 #include "video_core/fritchii_report_runs.h"
 #include "video_core/memory_stage_link.h"
+#include "video_core/texture_handle_values.h"
 #include "video_core/memstage_shadow.h"
 #include "video_core/memstage_shadow_engine.h"
 #include "video_core/memstage_stats.h"
@@ -1271,6 +1272,23 @@ bool RasterizerVulkan::StageFillDraw(VideoCommon::MemStageShadowEngine& copy, bo
         .hashes = stage_facts.hashes,
         .staged = &stage_facts,
     };
+    // The draw's raw handles, read here at the stage's position (SEAM 3, 2c's functions, on the
+    // copy's constant buffer bindings): the back takes them from the packet.
+    const std::vector<u32>* values = nullptr;
+    const bool null_pointer_handles = VideoCore::Nx2Debug::Experiment(21) != 0;
+    if (mem_stage.ValuesByValue() && stage_facts.infos != nullptr) {
+        stage_handle_values.clear();
+        const auto& stages = copy.state.shader_stages;
+        using Cbufs = std::remove_cvref_t<decltype(stages[0].const_buffers)>;
+        VideoCommon::FillGraphicsHandleValues(
+            std::span<const Shader::Info>{*stage_facts.infos}, copy.back->GetMemoryManager(),
+            [&stages](size_t stage) {
+                return VideoCommon::GraphicsHandleCbufs<Cbufs>{stages[stage].const_buffers};
+            },
+            device.GetStorageBufferAlignment(), null_pointer_handles,
+            [this](u32 raw) { stage_handle_values.push_back(raw); });
+        values = &stage_handle_values;
+    }
     struct Pre {
         RasterizerVulkan* self;
         std::vector<std::pair<u64, std::size_t>>* ranges;
@@ -1283,7 +1301,7 @@ bool RasterizerVulkan::StageFillDraw(VideoCommon::MemStageShadowEngine& copy, bo
             p->self->StageApplyRanges(*p->ranges, false);
             p->ranges->clear();
         },
-        &pre);
+        &pre, values, null_pointer_handles);
     if (!filled) {
         link.NoteLevelDraw(7);
     }

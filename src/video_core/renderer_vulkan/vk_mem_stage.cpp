@@ -1392,7 +1392,10 @@ const MemStage::DispatchPacket* MemStage::FillDispatch(Cache& cache_,
 // FRITCHII_MEMSTAGE_THREAD = 2: ring B and the facts table ("Ring B" in the header comment)
 
 bool MemStage::FillRingDraw(Cache& cache_, const DrawFacts& facts, bool is_indexed, u64 position,
-                            u64 seq, u64 hash, void (*pre)(void*), void* pre_argument) {
+                            u64 seq, u64 hash, void (*pre)(void*), void* pre_argument,
+                            const std::vector<u32>* values, bool null_pointer_handles) {
+    ring_values = values;
+    ring_null_pointers = null_pointer_handles;
     ring_fill = true;
     ring_pushed = false;
     ring_fill_position = position;
@@ -1406,6 +1409,7 @@ bool MemStage::FillRingDraw(Cache& cache_, const DrawFacts& facts, bool is_index
         ring_fill = false;
         ring_pre = nullptr;
         ring_pre_argument = nullptr;
+        ring_values = nullptr;
         lent_mutex = nullptr;
     };
     const DrawPacket* const packet = FillDrawHere(cache_, facts, is_indexed);
@@ -1423,7 +1427,9 @@ bool MemStage::RingRoom() const noexcept {
 
 void MemStage::PushRingDraw() {
     const u32 entries = arena.Size();
-    const u64 bytes = Align8(static_cast<u32>(sizeof(RingHeader) + sizeof(DrawPacket) + entries));
+    const u32 value_count = ring_values != nullptr ? static_cast<u32>(ring_values->size()) : 0U;
+    const u64 bytes = Align8(static_cast<u32>(sizeof(RingHeader) + sizeof(DrawPacket) + entries +
+                                              value_count * sizeof(u32)));
     u64 index = ring_b_write % RingBytes;
     if (index + bytes > RingBytes) {
         // Packets never wrap: a pad to the end (no header when fewer bytes than one are left).
@@ -1453,11 +1459,17 @@ void MemStage::PushRingDraw() {
     header.held_cursor = play_cursor;
     header.entry_bytes = entries;
     header.hashes = held_hashes;
+    header.value_count = value_count;
+    header.value_flags = (ring_values != nullptr ? 1U : 0U) | (ring_null_pointers ? 2U : 0U);
     u8* const out = ring_b.get() + index;
     std::memcpy(out, &header, sizeof(header));
     std::memcpy(out + sizeof(header), &draw, sizeof(DrawPacket));
     if (entries != 0) {
         std::memcpy(out + sizeof(header) + sizeof(DrawPacket), arena.At(0), entries);
+    }
+    if (value_count != 0) {
+        std::memcpy(out + sizeof(header) + sizeof(DrawPacket) + entries, ring_values->data(),
+                    value_count * sizeof(u32));
     }
     ring_b_write += bytes;
     ring_b_sent.store(ring_b_write, std::memory_order_release);
@@ -1529,6 +1541,21 @@ void MemStage::TakeRingHeader(const RingHeader& header) {
                     header.entry_bytes);
     }
     std::memcpy(&played_draw, data + sizeof(RingHeader), sizeof(DrawPacket));
+    // SEAM 3: the raw handles the stage read at its fill, at its position in the stream; the
+    // back's handle loops take them (HandleValues) instead of reading game memory, which the
+    // stage may already have written past this draw.
+    played_draw.flags &=
+        ~(HandleValuesFilled | HandleNullPointers | HandleValuesLooked | HandleValuesRetired);
+    if ((header.value_flags & 1) != 0) {
+        const auto* const values = reinterpret_cast<const u32*>(
+            data + sizeof(RingHeader) + sizeof(DrawPacket) + header.entry_bytes);
+        draw_values.assign(values, values + header.value_count);
+        played_draw.flags |=
+            HandleValuesFilled | ((header.value_flags & 2) != 0 ? HandleNullPointers : 0U);
+        played_draw.handle_values = Span{0, header.value_count};
+        Bump(value_counters.fills[0]);
+        Bump(value_counters.values[0], header.value_count);
+    }
     held_cursor = header.held_cursor;
     held_form = (header.flags & 1) != 0;
     held_hashes = header.hashes;
@@ -1629,6 +1656,7 @@ void MemStage::PublishFacts(u64 key, const void* source, const DrawFacts& facts,
     key = key != 0 ? key : 1;
     constexpr size_t Mask = FactsSlots - 1;
     const size_t home = static_cast<size_t>((key * 0x9e3779b97f4a7c15ULL) >> 52) & Mask;
+    std::scoped_lock lock{facts_mutex};
     FactsSlot* target = &facts_table[home];
     for (size_t probe = 0, index = home; probe < 16; ++probe, index = (index + 1) & Mask) {
         FactsSlot& slot = facts_table[index];
@@ -1670,41 +1698,31 @@ void MemStage::PublishFacts(u64 key, const void* source, const DrawFacts& facts,
     staged.uses_descriptor_buffer = facts.uses_descriptor_buffer;
     staged.dynamic_vertex_input = dynamic_input;
     staged.hashes = facts.hashes;
-    const u64 sequence = target->sequence.load(std::memory_order_relaxed);
-    target->sequence.store(sequence + 1, std::memory_order_relaxed);
-    std::atomic_thread_fence(std::memory_order_release);
+    if (facts.stage_infos != nullptr) {
+        auto infos = std::make_shared<std::array<Shader::Info, 5>>();
+        for (size_t stage = 0; stage < infos->size(); ++stage) {
+            (*infos)[stage] = facts.stage_infos[stage];
+        }
+        staged.infos = std::move(infos);
+    }
     target->key = key;
     target->source = source;
-    target->facts = staged;
-    target->sequence.store(sequence + 2, std::memory_order_release);
+    target->facts = std::move(staged);
 }
 
 bool MemStage::LookupFacts(u64 key, StagedFacts& out) const {
     key = key != 0 ? key : 1;
     constexpr size_t Mask = FactsSlots - 1;
     const size_t home = static_cast<size_t>((key * 0x9e3779b97f4a7c15ULL) >> 52) & Mask;
+    std::scoped_lock lock{facts_mutex};
     for (size_t probe = 0, index = home; probe < 16; ++probe, index = (index + 1) & Mask) {
         const FactsSlot& slot = facts_table[index];
-        for (u32 tries = 0; tries < 64; ++tries) {
-            const u64 before = slot.sequence.load(std::memory_order_acquire);
-            if ((before & 1) != 0) {
-                continue;
-            }
-            const u64 slot_key = slot.key;
-            if (slot_key == key) {
-                out = slot.facts;
-            }
-            std::atomic_thread_fence(std::memory_order_acquire);
-            if (slot.sequence.load(std::memory_order_relaxed) != before) {
-                continue;
-            }
-            if (slot_key == key) {
-                return true;
-            }
-            if (slot_key == 0) {
-                return false;
-            }
-            break;
+        if (slot.key == key) {
+            out = slot.facts;
+            return true;
+        }
+        if (slot.key == 0) {
+            return false;
         }
     }
     return false;
@@ -2446,6 +2464,16 @@ void MemStage::TickThread(int seam) {
                             : "the buffer cache's own allocator (FRITCHII_MEMSTAGE_SPLIT_ALLOC)");
         }
         mode = 0;
+    }
+    if (mode == 2 && seam < 3) {
+        // Finding 1 of the 6b review: a served draw's handles must come in its packet (values by
+        // value); the back would read them after the stage wrote later constant buffer words.
+        if (!ring_seam_logged) {
+            ring_seam_logged = true;
+            LOG_WARNING(Render_Vulkan, "FRITCHII_MEMSTAGE_THREAD=2 needs EXP123=3 (values by "
+                                       "value); running 1");
+        }
+        mode = 1;
     }
     if (mode == 2 && Debug::Experiment(53) != 0) {
         if (!ring_clamp_logged) {

@@ -217,6 +217,7 @@ constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::Check::Co
     "a packet played whole for a draw the back did not prepare",
     "an exception out of GPUMem's ring loop (the ring ended)",
     "a packet whose entry is past the back's draw (dropped unplayed, the back filled)",
+    "a served draw whose texture handles the back read from game memory",
 };
 constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::HandOff::Count)>
     LINK_HANDOFF_NAMES{"draw fills", "dispatch fills", "idle destroys", "served for the back"};
