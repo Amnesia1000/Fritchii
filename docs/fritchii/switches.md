@@ -1042,6 +1042,36 @@ above, entries a second by kind (which kinds OoT uses at all: convert, multi-ran
 buffers), fills by site with entries each, syncs by kind, and entries run outside any fill by
 kind. Compare 0 and 1 with profile_toggle.py ("back us a draw", heavy-phase market, 4 cycles).
 
+EXP123 = 3 (sub-step 2c, spec 6.3 and 9.1-9.3; the recorder and player as with 1): what the back
+reads from game memory that the stream writes comes in the packet by value. Handle values: the
+raw handle of every image element a draw or dispatch binds, in the order the handle loops read
+them (per stage: texture buffers, image buffers, textures with handle tables expanded, images;
+one value per element, EXP21's buffer address words keep their place unread), made by one
+function for both sides (texture_handle_values.h: RawTextureHandle, FillStageHandleValues), so
+handle programs' constant buffer words, storage buffer addresses and storage words are read by
+the fill. The fill always runs: draws whose handle loop the back skips (TEX_BANK_GEN hits) now
+pay for those reads and are counted. Until the early fill (sub-step 2b, EXP123 = 2) is in, the
+pipeline's Configure fills at the top of its handle work ("filled in Configure"). The QMD: the
+native QMD scheduler's 256-byte read goes through the dispatch packet (MemStage::Qmd), which
+opens there; the error path's 512-byte read stays direct. Null pointer slots: the compute
+pipeline lookup's pointer read (StaleNullPointerSlot) goes through the open dispatch packet too
+(MemStage::ReadPointerSlot). With 3 the stats line adds "memory seam by value": draws and
+dispatches with values a second (values each, how many filled in Configure, how many the back
+skipped and their values), QMDs a second (and reads that ran no dispatch), null pointer slots,
+and the verify counters below. Values below 3 change nothing here.
+
+### FRITCHII_MEMSTAGE_VERIFY
+
+FRITCHII_MEMSTAGE_VERIFY (boot, bit flags, default 0; spec 5.4): with EXP123 = 3 the back also
+makes its own read and compares it with the packet's value. 1 = handle values, 2 = the QMD,
+4 = null pointer slots (7 = all). Checks and mismatches are counted by kind in the "memory seam
+by value" line; the first 16 mismatches are logged as "Memory seam by value (5.4)" with the
+address (a handle word's address, or for a handle program bit 63 set, the program in bits 32-62
+and the element in bits 0-31), the kind and the shader (the stage's hash; the program address
+for the QMD and null slots). Must read 0: same thread, same instant. "count" (the back took a
+different number of handle values than the fill made) is counted always and must be 0 too. The
+own reads double the handle reads EDEN_NX2_MEMSTAGE_STATS counts. Later sub-steps may add bits.
+
 ### EXP101
 
 EXP101 (live, 0 = off, 1 = runs, 2 = cached page pointer + prefetch; fable52_answer_presenter): nvhost_gpu::SubmitGPFIFOImpl's pushbuffer
