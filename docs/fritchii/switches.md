@@ -280,7 +280,7 @@ them once it ran them (the read waits for that much); 2 = the same, but a dispat
 queued drains as before. +4 (5, 6): compute report semaphores noted as before, 16 bytes or
 anything when unmapped (GpuSplit::NoteReleaseWriter). +8 (9, 10, 13, 14; live): the read tests
 the bytes it reads, not the whole page: the page scans list the writes since the snapshot that
-overlap the page (8 a page, a ninth is a miss as before; GpuSplit::ListedWrites) and the read
+overlap the page (8 a page, then the two closest merge; GpuSplit::ListedWrites) and the read
 drains only when its own bytes overlap one. Verify with EDEN_NX2_DMA_SNAPSHOT=10: "by byte
 ranges (N differed)" in the "DMA snapshot EXP10" line must stay 0.
 

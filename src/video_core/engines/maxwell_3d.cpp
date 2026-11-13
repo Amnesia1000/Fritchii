@@ -3553,6 +3553,9 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             static u64 byte_skips{};
             static u64 byte_overlaps{};
             static u64 byte_differences{};
+            static u64 byte_merges{};
+            using WriterCheck = VideoCommon::GpuSplit::WriterCheck;
+            static std::array<u64, static_cast<size_t>(WriterCheck::Count)> writer_checks{};
             bool byte_skip = false;
             const u64 read_end = *device + read_bytes;
             using DispatchCheck = VideoCommon::GpuSplit::DispatchCheck;
@@ -3579,6 +3582,8 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                 const u64 since = snapshot.position;
                 const bool writer_since = split.LastWriterPosition() > since;
                 auto* const listed = byte_ranges ? &snapshot.listed : nullptr;
+                const u32 merges_before = snapshot.listed.merges;
+                WriterCheck writer_check = WriterCheck::Miss;
                 u32 reason = 4;
                 if (!ranged_writers) {
                     reason = writer_since                             ? 1
@@ -3586,11 +3591,13 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                              : split.NotedWriteSince(since, *device, read_bytes) ? 3
                                                                                  : 4;
                 } else if (split.WritersMayWriteSince(since, page << 12, 0x1000,
-                                                      &snapshot.writer_ranges, listed)) {
+                                                      &snapshot.writer_ranges, listed,
+                                                      &writer_check)) {
                     // Whole pages: the ranges found to miss one need no second look.
                     reason = 1;
                     ++(split.LastUnboundedWriterPosition() > since ? writer_unbounded
                                                                    : writer_overlaps);
+                    ++writer_checks[static_cast<size_t>(writer_check)];
                 } else if (split.LastUnrangedPosition() > since) {
                     reason = 2;
                 } else if (split.NotedWriteSince(since, *device, read_bytes)) {
@@ -3617,6 +3624,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                         range_skip |= writer_since;
                     }
                 }
+                byte_merges += snapshot.listed.merges - merges_before;
                 if (reason != 4) {
                     hit = false;
                     ++miss_reasons[reason];
@@ -3743,7 +3751,9 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                                  "{} upload, {} release, {} compute, {} copy, {} other; compute "
                                  "releases: {} ranged, {} unmapped (write nothing), {} write "
                                  "nothing, unbounded: {} pending map, {} sparse, {} unmapped "
-                                 "reduction, {} split",
+                                 "reduction, {} split; page scan misses: {} overlap (no list), "
+                                 "{} past the scan, {} left the ring; {} byte list merges; {} "
+                                 "ranges noted",
                                  writer_unbounded + writer_overlaps + byte_overlaps +
                                      dispatch_drains,
                                  writer_unbounded, writer_overlaps, byte_overlaps,
@@ -3758,7 +3768,11 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                                  release(Release::Ranged), release(Release::Unmapped),
                                  release(Release::NoWrite), release(Release::PendingMap),
                                  release(Release::Sparse), release(Release::LateUnmapped),
-                                 release(Release::Split));
+                                 release(Release::Split),
+                                 writer_checks[static_cast<size_t>(WriterCheck::Overlap)],
+                                 writer_checks[static_cast<size_t>(WriterCheck::ScanLimit)],
+                                 writer_checks[static_cast<size_t>(WriterCheck::Forgotten)],
+                                 byte_merges, split.NotedWriterRanges());
                     }
                 }
                 if (census_read) [[unlikely]] {

@@ -12,6 +12,7 @@
 #include <deque>
 #include <optional>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <span>
 #include <thread>
@@ -493,26 +494,49 @@ public:
     }
     /// EXP10 +8: the writes found since a macro DMA read snapshot that overlap the range it
     /// checks (a 4 KiB page), as offsets into that range, so a read of other bytes of it can
-    /// still skip the drain (Maxwell3D::FrontDmaRead). Holds Capacity; one more is a miss.
+    /// still skip the drain (Maxwell3D::FrontDmaRead). Past Capacity the two closest listed
+    /// ranges become their union: never smaller than what was written, only coarser.
     struct ListedWrites {
         static constexpr u32 Capacity = 8;
         std::array<std::pair<u32, u32>, Capacity> ranges{};
         u32 count{};
+        /// Unions made to stay within Capacity (for the log line).
+        u32 merges{};
         /// Lists [begin, end) of the range at `base` (clipped to `size` bytes) unless a listed
-        /// one covers it. False when full.
-        bool Add(u64 base, u64 size, u64 begin, u64 end) {
+        /// one covers it.
+        void Add(u64 base, u64 size, u64 begin, u64 end) {
             const u32 first = static_cast<u32>((std::max)(begin, base) - base);
             const u32 last = static_cast<u32>((std::min)(end, base + size) - base);
             for (u32 i = 0; i < count; ++i) {
                 if (ranges[i].first <= first && last <= ranges[i].second) {
-                    return true;
+                    return;
                 }
             }
-            if (count == Capacity) {
-                return false;
+            if (count < Capacity) {
+                ranges[count++] = {first, last};
+                return;
             }
-            ranges[count++] = {first, last};
-            return true;
+            // Sorted by start, the neighbours with the smallest gap (or the most overlap) merge.
+            std::array<std::pair<u32, u32>, Capacity + 1> all{};
+            std::copy(ranges.begin(), ranges.end(), all.begin());
+            all[Capacity] = {first, last};
+            std::sort(all.begin(), all.end());
+            size_t best = 0;
+            s64 best_gap = (std::numeric_limits<s64>::max)();
+            for (size_t i = 0; i + 1 < all.size(); ++i) {
+                const s64 gap = static_cast<s64>(all[i + 1].first) - all[i].second;
+                if (gap < best_gap) {
+                    best_gap = gap;
+                    best = i;
+                }
+            }
+            all[best].second = (std::max)(all[best].second, all[best + 1].second);
+            for (size_t i = 0, out = 0; i < all.size(); ++i) {
+                if (i != best + 1) {
+                    ranges[out++] = all[i];
+                }
+            }
+            ++merges;
         }
         /// Whether a listed write overlaps device bytes [begin, end) (the range at `base`).
         [[nodiscard]] bool Overlaps(u64 base, u64 begin, u64 end) const {
@@ -524,17 +548,34 @@ public:
             return false;
         }
     };
+    /// Why WritersMayWriteSince answered true (EXP10's log line).
+    enum class WriterCheck : u32 {
+        Miss,      ///< Answered false
+        Unbounded, ///< An unbounded writer since
+        Overlap,   ///< A noted range overlaps (without `listed`)
+        ScanLimit, ///< More than MaxWriterScan ranges noted since `checked`
+        Forgotten, ///< Ranges since `checked` left the ring before they were compared
+        Count,
+    };
     /// Whether compute or copy work sent after position `since` may write device bytes
     /// [begin, begin + size): an unbounded writer, or a noted range that overlaps them.
     /// `checked` (optional): the noted ranges below it were found to miss these bytes before;
     /// set to WriterRangeCount() when nothing does. `listed` (optional, EXP10 +8): overlapping
-    /// ranges are added to it instead of answering true while it has room; it and `checked`
-    /// change only when the answer is false (the ranges below `checked` then miss or are listed).
+    /// ranges are added to it instead of answering true; it and `checked` change only when the
+    /// answer is false (the ranges below `checked` then miss or are listed). `why` (optional):
+    /// set to the reason.
     [[nodiscard]] bool WritersMayWriteSince(u64 since, u64 begin, u64 size,
                                             u64* checked = nullptr,
-                                            ListedWrites* listed = nullptr) const {
+                                            ListedWrites* listed = nullptr,
+                                            WriterCheck* why = nullptr) const {
+        const auto answer = [why](WriterCheck reason) {
+            if (why != nullptr) {
+                *why = reason;
+            }
+            return reason != WriterCheck::Miss;
+        };
         if (last_unbounded_writer_position > since) {
-            return true;
+            return answer(WriterCheck::Unbounded);
         }
         // At most MaxWriterScan ranges are compared (a drained read takes a new snapshot), and
         // more than are remembered count as overlapping.
@@ -547,20 +588,22 @@ public:
         bool reached = false;
         for (u64 scanned = 0; index > (std::max)(known, oldest); --index, ++scanned) {
             if (scanned == MaxWriterScan) {
-                return true;
+                return answer(WriterCheck::ScanLimit);
             }
             const WriterRange& range = writer_ranges[(index - 1) % writer_ranges.size()];
             if (range.position <= since) {
                 reached = true;
                 break;
             }
-            if (range.begin < end && begin < range.end &&
-                (listed == nullptr || !found.Add(begin, size, range.begin, range.end))) {
-                return true;
+            if (range.begin < end && begin < range.end) {
+                if (listed == nullptr) {
+                    return answer(WriterCheck::Overlap);
+                }
+                found.Add(begin, size, range.begin, range.end);
             }
         }
         if (!reached && oldest > known) {
-            return true;
+            return answer(WriterCheck::Forgotten);
         }
         if (listed != nullptr) {
             *listed = found;
@@ -568,7 +611,11 @@ public:
         if (checked != nullptr) {
             *checked = WriterRangeCount();
         }
-        return false;
+        return answer(WriterCheck::Miss);
+    }
+    /// The ranges noted so far, without sealing the last one (EXP10's log line).
+    [[nodiscard]] u64 NotedWriterRanges() const {
+        return writer_range_count;
     }
     [[nodiscard]] u64 LastUnboundedWriterPosition() const {
         return last_unbounded_writer_position;
