@@ -2,11 +2,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -17,9 +19,12 @@
 #include "common/logging.h"
 #include "common/nx2_hitch.h"
 #include "common/nx2_timeline.h"
+#include "common/thread.h"
 
 #ifdef _WIN32
 #include <windows.h>
+#include <pdh.h>
+#include <pdhmsg.h>
 #include <psapi.h>
 #endif
 
@@ -60,6 +65,7 @@ struct Snapshot {
     u64 zero_filled{};
     u64 user_100ns{};   ///< the process's CPU time in user mode, all threads
     u64 kernel_100ns{}; ///< and in kernel mode (page faults, VM calls)
+    u64 system_busy_100ns{}; ///< every logical CPU's busy time, all processes (GetSystemTimes)
     size_t threads{};
     std::array<u64, MaxThreads> thread_user{};
     std::array<u64, MaxThreads> thread_kernel{};
@@ -89,6 +95,12 @@ Snapshot Take() {
     if (GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) {
         snapshot.user_100ns = FileTimeValue(user);
         snapshot.kernel_100ns = FileTimeValue(kernel);
+    }
+    FILETIME idle{};
+    if (GetSystemTimes(&idle, &kernel, &user)) {
+        // The kernel time includes the idle time.
+        snapshot.system_busy_100ns =
+            FileTimeValue(kernel) - FileTimeValue(idle) + FileTimeValue(user);
     }
     snapshot.threads = g_thread_count.load(std::memory_order_acquire);
     for (size_t i = 0; i < snapshot.threads; ++i) {
@@ -343,6 +355,333 @@ void StallResetGap() {
 
 } // Anonymous namespace
 
+// Machine pulse (fable52_answer_dips section 4c): tells "the machine got slower" (another program,
+// a power or heat clock drop, a contended cache or memory bus) apart from the emulator's own work.
+// With the hitch log on, every Hitch line says how much CPU the rest of the machine used in the gap
+// and over the last second, and a normal-priority "FritchiiPulse" thread samples once a second: the
+// clock against nominal (PDH % Processor Performance), a fixed integer loop over 64 KiB timed (the
+// speed probe: how fast a core is for us right now, whatever the cause), free memory, and the
+// thermal zones when the board exposes them. It logs one "Pulse:" line a second; the Hitch line
+// shows its last clock and probe. FRITCHII_PULSE=0 (boot) turns the thread and its line off.
+// Cost: one GetSystemTimes a present; one PDH read and about 2 ms of one core a second.
+namespace {
+
+std::atomic<u64> g_presents{};
+std::atomic<int> g_pulse_clock{-1}; ///< % Processor Performance over the last second; -1 unknown
+std::atomic<u64> g_pulse_probe_ns{}; ///< the last speed probe; 0 none yet
+std::atomic<u32> g_probe_sink{};     ///< keeps the probe's result alive
+
+#ifdef _WIN32
+
+bool PulseEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("FRITCHII_PULSE");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+/// 9400 -> "9,400"
+std::string Grouped(u64 value) {
+    std::string digits = std::to_string(value);
+    for (size_t i = digits.size(); i > 3; i -= 3) {
+        digits.insert(i - 3, 1, ',');
+    }
+    return digits;
+}
+
+/// ", clock 112%, probe 1.96 ms" from the pulse thread's last sample, empty before it has one.
+std::string PulseLastText() {
+    std::string text;
+    const int clock = g_pulse_clock.load(std::memory_order_relaxed);
+    if (clock >= 0) {
+        text += fmt::format(", clock {}%", clock);
+    }
+    const u64 probe_ns = g_pulse_probe_ns.load(std::memory_order_relaxed);
+    if (probe_ns != 0) {
+        text += fmt::format(", probe {:.2f} ms", static_cast<double>(probe_ns) / 1e6);
+    }
+    return text;
+}
+
+#endif // _WIN32
+
+/// The rest of the machine's CPU time (all processes but this one) over about the last second,
+/// from the presents' samples. Only the game's present thread touches it.
+class RestWindow {
+public:
+    void Push(u64 ns, s64 rest_100ns) {
+        samples[next] = {ns, rest_100ns};
+        next = (next + 1) % samples.size();
+        count = (std::min)(count + 1, samples.size());
+    }
+
+    /// Logical CPUs the rest of the machine kept busy from the newest sample a second or more
+    /// old (or the oldest kept) until `ns`; negative without a sample.
+    [[nodiscard]] double Cpus(u64 ns, s64 rest_100ns) const {
+        const Sample* base = nullptr;
+        for (size_t back = 1; back <= count; ++back) {
+            base = &samples[(next + samples.size() - back) % samples.size()];
+            if (ns - base->ns >= 1'000'000'000ULL) {
+                break;
+            }
+        }
+        if (base == nullptr || ns <= base->ns) {
+            return -1.0;
+        }
+        const double span_100ns = static_cast<double>(ns - base->ns) / 100.0;
+        return static_cast<double>((std::max)(rest_100ns - base->rest_100ns, s64{0})) /
+               span_100ns;
+    }
+
+private:
+    struct Sample {
+        u64 ns{};
+        s64 rest_100ns{};
+    };
+    std::array<Sample, 512> samples{};
+    size_t next{};
+    size_t count{};
+};
+
+#ifdef _WIN32
+
+constexpr size_t ProbeWords = 64 * 1024 / sizeof(u32);
+// About 2 ms on a 5 GHz desktop core: each step's load index hangs on the step before, so the
+// loop runs at the core's clock and its L1/L2 latency, never vectorized.
+constexpr u32 ProbeSteps = 800'000;
+
+/// The same work every call: the array is reset first, so every run walks the same indices.
+u32 ProbeLoop(u32* words) {
+    for (size_t i = 0; i < ProbeWords; ++i) {
+        words[i] = static_cast<u32>(i) * 2654435761U;
+    }
+    u32 x = 0x9E3779B9U;
+    u32 index = 0;
+    for (u32 step = 0; step < ProbeSteps; ++step) {
+        index = (index + x) & static_cast<u32>(ProbeWords - 1);
+        x = x * 0x01000193U + words[index];
+        words[index] = x ^ (x >> 13);
+    }
+    return x;
+}
+
+struct MachineTimes {
+    u64 ns{};
+    u64 system_busy_100ns{};
+    u64 process_busy_100ns{};
+};
+
+MachineTimes ReadMachineTimes() {
+    MachineTimes times{.ns = NowNs()};
+    FILETIME idle{}, kernel{}, user{}, created{}, exited{};
+    if (GetSystemTimes(&idle, &kernel, &user)) {
+        times.system_busy_100ns =
+            FileTimeValue(kernel) - FileTimeValue(idle) + FileTimeValue(user);
+    }
+    if (GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) {
+        times.process_busy_100ns = FileTimeValue(kernel) + FileTimeValue(user);
+    }
+    return times;
+}
+
+/// The PDH counters; one that fails to open is left out.
+class PdhCounters {
+public:
+    struct Values {
+        double clock = -1.0;   ///< % of nominal, above 100 with boost
+        double kelvin = -1.0;  ///< the hottest thermal zone
+        double passive = -1.0; ///< the lowest % Passive Limit of the zones (100 = no limit)
+    };
+
+    PdhCounters() {
+        if (PdhOpenQueryW(nullptr, 0, &query) != ERROR_SUCCESS) {
+            query = nullptr;
+            return;
+        }
+        clock = Add(L"\\Processor Information(_Total)\\% Processor Performance");
+        temperature = Add(L"\\Thermal Zone Information(*)\\Temperature");
+        passive = Add(L"\\Thermal Zone Information(*)\\% Passive Limit");
+        // The first sample; the clock is a rate, so the first value comes a second later.
+        PdhCollectQueryData(query);
+    }
+
+    ~PdhCounters() {
+        if (query != nullptr) {
+            PdhCloseQuery(query);
+        }
+    }
+
+    PdhCounters(const PdhCounters&) = delete;
+    PdhCounters& operator=(const PdhCounters&) = delete;
+
+    [[nodiscard]] std::string Found() const {
+        if (query == nullptr) {
+            return "no PDH query";
+        }
+        return fmt::format("clock {}, thermal zones {}", clock != nullptr ? "yes" : "no",
+                           temperature != nullptr || passive != nullptr ? "yes" : "no");
+    }
+
+    [[nodiscard]] Values Read() {
+        Values values;
+        if (query == nullptr || PdhCollectQueryData(query) != ERROR_SUCCESS) {
+            return values;
+        }
+        if (clock != nullptr) {
+            PDH_FMT_COUNTERVALUE value{};
+            if (PdhGetFormattedCounterValue(clock, Format, nullptr, &value) == ERROR_SUCCESS &&
+                Valid(value.CStatus)) {
+                values.clock = value.doubleValue;
+            }
+        }
+        values.kelvin = Extreme(temperature, true);
+        values.passive = Extreme(passive, false);
+        return values;
+    }
+
+private:
+    static constexpr DWORD Format = PDH_FMT_DOUBLE | PDH_FMT_NOCAP100;
+
+    static bool Valid(DWORD status) {
+        return status == PDH_CSTATUS_VALID_DATA || status == PDH_CSTATUS_NEW_DATA;
+    }
+
+    PDH_HCOUNTER Add(const wchar_t* path) {
+        PDH_HCOUNTER counter{};
+        return PdhAddEnglishCounterW(query, path, 0, &counter) == ERROR_SUCCESS ? counter : nullptr;
+    }
+
+    /// The highest (or lowest) value over a wildcard counter's instances; negative without one.
+    double Extreme(PDH_HCOUNTER counter, bool highest) {
+        if (counter == nullptr) {
+            return -1.0;
+        }
+        DWORD bytes = 0;
+        DWORD items = 0;
+        if (static_cast<DWORD>(PdhGetFormattedCounterArrayW(counter, Format, &bytes, &items,
+                                                            nullptr)) != PDH_MORE_DATA ||
+            bytes == 0) {
+            return -1.0;
+        }
+        buffer.resize((bytes + sizeof(u64) - 1) / sizeof(u64));
+        auto* const entries = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_W*>(buffer.data());
+        if (PdhGetFormattedCounterArrayW(counter, Format, &bytes, &items, entries) !=
+            ERROR_SUCCESS) {
+            return -1.0;
+        }
+        double result = -1.0;
+        for (DWORD i = 0; i < items; ++i) {
+            if (!Valid(entries[i].FmtValue.CStatus)) {
+                continue;
+            }
+            const double value = entries[i].FmtValue.doubleValue;
+            if (result < 0.0 || (highest ? value > result : value < result)) {
+                result = value;
+            }
+        }
+        return result;
+    }
+
+    PDH_HQUERY query{};
+    PDH_HCOUNTER clock{};
+    PDH_HCOUNTER temperature{};
+    PDH_HCOUNTER passive{};
+    std::vector<u64> buffer;
+};
+
+/// The once-a-second sampler; stops and joins when the process's statics are destroyed.
+class PulseThread {
+public:
+    PulseThread() : thread{[this] { Run(); }} {}
+
+    ~PulseThread() {
+        {
+            std::scoped_lock lock{mutex};
+            stop = true;
+        }
+        cv.notify_all();
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+
+    PulseThread(const PulseThread&) = delete;
+    PulseThread& operator=(const PulseThread&) = delete;
+
+private:
+    void Run() {
+        Common::SetCurrentThreadName("FritchiiPulse");
+        PdhCounters pdh;
+        std::vector<u32> words(ProbeWords);
+        LOG_INFO(Render,
+                 "Machine pulse on: a Pulse line a second, clock and probe in the Hitch lines "
+                 "(FRITCHII_PULSE=0 turns it off); counters: {}",
+                 pdh.Found());
+        MachineTimes last = ReadMachineTimes();
+        u64 last_presents = g_presents.load(std::memory_order_relaxed);
+        std::unique_lock lock{mutex};
+        while (!cv.wait_for(lock, std::chrono::seconds{1}, [this] { return stop; })) {
+            lock.unlock();
+            Sample(pdh, words.data(), last, last_presents);
+            lock.lock();
+        }
+    }
+
+    static void Sample(PdhCounters& pdh, u32* words, MachineTimes& last, u64& last_presents) {
+        const u64 probe_begin = NowNs();
+        const u32 probe_result = ProbeLoop(words);
+        const u64 probe_ns = NowNs() - probe_begin;
+        g_probe_sink.store(probe_result, std::memory_order_relaxed);
+        g_pulse_probe_ns.store((std::max)(probe_ns, u64{1}), std::memory_order_relaxed);
+
+        const PdhCounters::Values values = pdh.Read();
+        if (values.clock >= 0.0) {
+            g_pulse_clock.store(static_cast<int>(values.clock + 0.5), std::memory_order_relaxed);
+        }
+        MEMORYSTATUSEX memory{};
+        memory.dwLength = sizeof(memory);
+        const bool memory_ok = GlobalMemoryStatusEx(&memory) != FALSE;
+
+        const MachineTimes now = ReadMachineTimes();
+        const u64 presents = g_presents.load(std::memory_order_relaxed);
+        if (now.ns > last.ns) {
+            const double span_100ns = static_cast<double>(now.ns - last.ns) / 100.0;
+            const s64 process = static_cast<s64>(now.process_busy_100ns - last.process_busy_100ns);
+            const s64 system = static_cast<s64>(now.system_busy_100ns - last.system_busy_100ns);
+            std::string extra;
+            if (values.clock >= 0.0) {
+                extra += fmt::format(", clock {:.0f}%", values.clock);
+            }
+            extra += fmt::format(", probe {:.2f} ms", static_cast<double>(probe_ns) / 1e6);
+            if (memory_ok) {
+                extra += fmt::format(", {} MiB free", Grouped(memory.ullAvailPhys >> 20));
+            }
+            if (values.kelvin > 0.0) {
+                extra += fmt::format(", heat {:.0f} C", values.kelvin - 273.15);
+            }
+            if (values.passive >= 0.0) {
+                extra += fmt::format(", passive limit {:.0f}%", values.passive);
+            }
+            LOG_INFO(Render, "Pulse: {} frames, process {:.1f} CPUs, rest of the machine {:.1f} CPUs{}",
+                     presents - last_presents, static_cast<double>(process) / span_100ns,
+                     static_cast<double>((std::max)(system - process, s64{0})) / span_100ns,
+                     extra);
+        }
+        last = now;
+        last_presents = presents;
+    }
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool stop{};
+    std::thread thread; ///< last: the members above exist before it runs
+};
+
+#endif // _WIN32
+
+} // Anonymous namespace
+
 void RegisterThread(const char* name) {
     const std::string_view view{name};
     t_role = view.starts_with("CPUCore") ? Role::GuestCore
@@ -396,10 +735,20 @@ void OnPresent(long long gap_us) {
     static Snapshot last = Take();
     static u64 window_start_ns = NowNs();
     static int lines_in_window = 0;
+    static RestWindow rest_window;
     if (!Enabled()) {
         return;
     }
+    g_presents.fetch_add(1, std::memory_order_relaxed);
+#ifdef _WIN32
+    if (PulseEnabled()) {
+        static PulseThread pulse; // started at the first present
+    }
+#endif
     const Snapshot now = Take();
+    const u64 present_ns = NowNs();
+    const s64 rest_now = static_cast<s64>(now.system_busy_100ns) -
+                         static_cast<s64>(now.user_100ns + now.kernel_100ns);
     if (gap_us >= ThresholdUs()) {
         // At most 60 lines a minute (a loading screen can stall many presents in a row; 20 hid a
         // 740 ms first load behind the title screen's gaps, 2026-11-10).
@@ -429,15 +778,29 @@ void OnPresent(long long gap_us) {
                                       causes.empty() ? "" : ", ",
                                       static_cast<double>(now_ns - trim_since) / 1e6);
             }
+            std::string machine;
+#ifdef _WIN32
+            if (now.system_busy_100ns != 0 && last.system_busy_100ns != 0) {
+                const s64 rest_gap = rest_now - (static_cast<s64>(last.system_busy_100ns) -
+                                                 static_cast<s64>(last.user_100ns +
+                                                                  last.kernel_100ns));
+                const double cpus = rest_window.Cpus(present_ns, rest_now);
+                machine = fmt::format(
+                    "; rest of the machine {:.0f} ms{}{}",
+                    static_cast<double>((std::max)(rest_gap, s64{0})) / 1e4,
+                    cpus >= 0.0 ? fmt::format(" ({:.1f} CPUs over the last second)", cpus) : "",
+                    PulseLastText());
+            }
+#endif
             LOG_INFO(Render, // with the frame lines it lines up against
                      "Hitch: {:.1f} ms between presents; in it: {}; page faults {}, kernel "
                      "zero-filled {} MiB, CPU {:.0f} ms user + {:.0f} ms kernel; busiest threads "
-                     "(user+kernel ms): {}",
+                     "(user+kernel ms): {}{}",
                      static_cast<double>(gap_us) / 1e3, causes.empty() ? "nothing counted" : causes,
                      now.page_faults - last.page_faults, (now.zero_filled - last.zero_filled) >> 20,
                      static_cast<double>(now.user_100ns - last.user_100ns) / 1e4,
                      static_cast<double>(now.kernel_100ns - last.kernel_100ns) / 1e4,
-                     BusiestThreads(last, now));
+                     BusiestThreads(last, now), machine);
             if (gap_us >= 100'000 && StallOn()) {
                 LOG_INFO(Render, "{}", StallSnapshotLine(gap_us));
             }
@@ -446,6 +809,7 @@ void OnPresent(long long gap_us) {
     if (StallOn()) {
         StallResetGap();
     }
+    rest_window.Push(present_ns, rest_now);
     last = now;
 }
 
