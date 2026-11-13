@@ -50,6 +50,7 @@ public:
         PacketMismatch,
         BackHandles,
         SyncAhead,
+        ServedAheadJoin,
         Count,
     };
 
@@ -232,6 +233,21 @@ public:
     /// entry before it (so every packet before it is played), serving the back's calls meanwhile.
     /// Does nothing in level mode (the stage is level before each entry there) or off GPUMem.
     void StageLevel(u64 position, LevelReason reason);
+    /// The buffer cache joined a buffer at [address, address + size) into a new one
+    /// (BufferCache::JoinOverlap): with the window open GPUMem keeps where (the entry it fills).
+    static void NoteBufferJoin(u64 address, u64 size) {
+        if (t_on_stage && g_ahead.load(std::memory_order_relaxed) != 0) [[unlikely]] {
+            instance.NoteBufferJoinSlow(address, size);
+        }
+    }
+    /// GPUMem, in a call it serves for the back at entry `back_position`: whether a buffer over
+    /// [address, address + size) was joined by a fill of a later entry (its copy is in a packet
+    /// the back has not played).
+    [[nodiscard]] bool JoinedAhead(u64 address, u64 size, u64 back_position) const noexcept;
+    /// GPUMem processes the entry at `position` (the joins' and the stage writes' position).
+    [[nodiscard]] u64 StageEntry() const noexcept {
+        return stage_entry;
+    }
     void NoteLevelDraw(u32 kind) noexcept;
     /// The verify of compare b with two threads (FRITCHII_MEMSTAGE_RING_VERIFY).
     void NoteHash(bool same) noexcept;
@@ -373,6 +389,18 @@ private:
     /// GPUMem's loop: its stop token while the ring runs, and the window it read last.
     std::stop_token* ring_stop{};
     u32 ring_window{};
+    /// The entry GPUMem processes (GPUMem only).
+    u64 stage_entry{};
+    /// Buffers joined by GPUMem's fills, with the entry (GPUMem only; served calls run there too).
+    struct Join {
+        u64 begin;
+        u64 end;
+        u64 position;
+    };
+    static constexpr size_t JoinSlots = 256;
+    std::array<Join, JoinSlots> joins{};
+    u64 join_count{};
+    void NoteBufferJoinSlow(u64 address, u64 size) noexcept;
     /// GPUMem's thread id (the back serves it while it waits for a lock GPUMem holds).
     std::atomic<std::thread::id> stage_thread{};
     /// Bumped while the back waits for a lock GPUMem holds (StageSyncCatchUp gives up then).

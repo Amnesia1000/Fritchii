@@ -317,6 +317,8 @@ private:
     /// Step 7 (GPUMem): fills the window must not run ahead of (StageFillDraw).
     bool StageDrawWritesBuffers(const VideoCommon::MemStageShadowEngine& copy) const;
     bool StageRangesOverGpuWritten(std::span<const std::pair<DAddr, std::size_t>> ranges);
+    /// Step 7 (GPUMem, in a served call): a download over a buffer joined ahead of the back.
+    void CheckServedJoins(DAddr addr, u64 size);
     void InnerInvalidationServed(std::span<const std::pair<DAddr, std::size_t>> sequences);
     template <typename F>
     void OnStage(u8 cause, F&& body);

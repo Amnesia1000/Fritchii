@@ -1331,6 +1331,20 @@ bool RasterizerVulkan::StageFillDraw(VideoCommon::MemStageShadowEngine& copy, bo
     return filled;
 }
 
+void RasterizerVulkan::CheckServedJoins(DAddr addr, u64 size) {
+    // Step 7, in a call GPUMem serves for the back (the cache's lock held): a download of
+    // GPU-written data from a buffer a packet ahead of the back joined reads that buffer before
+    // the join's copy (must be 0; the window's StageLevel rules keep the marks the back's).
+    using Link = VideoCommon::MemoryStageLink;
+    if (!Link::OnStageThread() || Link::Ahead() == 0 || addr == 0 || size == 0) {
+        return;
+    }
+    if (Link::Get().JoinedAhead(addr, size, VideoCommon::GpuSplit::Get().BackEntryPosition()) &&
+        buffer_cache.IsRegionGpuModified(addr, size)) [[unlikely]] {
+        Link::Note(Link::Check::ServedAheadJoin, "a served call's download");
+    }
+}
+
 bool RasterizerVulkan::StageDrawWritesBuffers(const VideoCommon::MemStageShadowEngine& copy) const {
     // The fill marks GPU-written ranges for written storage buffers (BindGraphicsStorageBuffer's
     // is_written) and for transform feedback.
@@ -1397,8 +1411,16 @@ void RasterizerVulkan::StageApplyRanges(std::span<const std::pair<DAddr, std::si
 
 void RasterizerVulkan::InnerInvalidationServed(
     std::span<const std::pair<DAddr, std::size_t>> sequences) {
-    OnStage(static_cast<u8>(VideoCommon::MemoryStageLink::Served::InnerInvalidation),
-            [&] { StageApplyRanges(sequences, true); });
+    OnStage(static_cast<u8>(VideoCommon::MemoryStageLink::Served::InnerInvalidation), [&] {
+        if (VideoCommon::MemoryStageLink::OnStageThread() &&
+            VideoCommon::MemoryStageLink::Ahead() != 0) {
+            std::scoped_lock lock{buffer_cache.mutex};
+            for (const auto& [addr, size] : sequences) {
+                CheckServedJoins(addr, size);
+            }
+        }
+        StageApplyRanges(sequences, true);
+    });
     if (Settings::values.skip_cpu_inner_invalidation.GetValue()) {
         return;
     }
@@ -3701,6 +3723,7 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType 
         // draw's Configure).
         OnStage(static_cast<u8>(VideoCommon::MemoryStageLink::Served::FlushRegion), [&] {
             std::scoped_lock lock{buffer_cache.mutex};
+            CheckServedJoins(addr, size);
             MemStage::FillPlay seam{mem_stage, MemStage::Site::Download};
             buffer_cache.DownloadMemory(addr, size);
         });
@@ -3726,6 +3749,7 @@ void RasterizerVulkan::FlushRegionForRead(DAddr addr, u64 size) {
     }
     OnStage(static_cast<u8>(VideoCommon::MemoryStageLink::Served::FlushRegionForRead), [&] {
         std::scoped_lock lock{buffer_cache.mutex};
+        CheckServedJoins(addr, size);
         MemStage::FillPlay seam{mem_stage, MemStage::Site::DownloadForRead};
         buffer_cache.DownloadMemoryForRead(addr, size);
     });
@@ -4416,6 +4440,9 @@ void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64
         // buffer half on GPUMem (claims first, as below), the other caches' here.
         OnStage(static_cast<u8>(VideoCommon::MemoryStageLink::Served::Gather), [&] {
             std::scoped_lock lock{buffer_cache.mutex};
+            for (const auto& [addr, size] : ranges) {
+                CheckServedJoins(addr, size);
+            }
             MemStage::FillPlay seam{mem_stage, MemStage::Site::Invalidation};
             buffer_cache.ClaimCpuWrites(ranges);
             for (const auto& [addr, size] : ranges) {
@@ -4545,6 +4572,7 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
     }
     OnStage(static_cast<u8>(VideoCommon::MemoryStageLink::Served::Invalidation), [&] {
         std::scoped_lock lock{buffer_cache.mutex};
+        CheckServedJoins(addr, size);
         MemStage::FillPlay seam{mem_stage, MemStage::Site::Invalidation};
         buffer_cache.WriteMemory(addr, size);
     });

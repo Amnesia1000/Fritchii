@@ -4944,6 +4944,8 @@ bool BufferCache<P>::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
     });
     new_buffer.MarkUsage(copies[0].dst_offset, copies[0].size);
     VideoCommon::Churn::Add(VideoCommon::Churn::BuffersJoined);
+    // Memory stage step 7: a join in a fill ahead of the back (the served calls' check).
+    VideoCommon::MemoryStageLink::NoteBufferJoin(overlap.CpuAddr(), overlap.SizeBytes());
     // EDEN_NX2_JOIN_SKIP_CPU=1 (fable_answer_17 4): a drifted per-frame range the guest rewrote
     // whole since its last upload needs no copy, the first bind uploads all of it anyway
     // (JoinCopyIsDead). Read on first use: nx2_switches.txt is applied after static init.

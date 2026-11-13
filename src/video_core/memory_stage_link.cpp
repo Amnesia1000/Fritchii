@@ -126,7 +126,11 @@
 // So a served call the back makes while packets are ahead is answered by the cache with every
 // GPU-written mark it has at the back's position; what the packets ahead changed (uploads, new
 // bindings, the stream) does not enter those answers. Counted ("served calls while packets were
-// ahead"), not a failure.
+// ahead"), not a failure. One change of theirs would: a buffer a fill ahead joined into a new one
+// (its old bytes reach the new buffer in that fill's packet), under GPU-written data a served
+// download reads. GPUMem keeps the joins of its fills with their entries (NoteBufferJoin) and the
+// served calls check them: "a served download over GPU-written data in a buffer a packet ahead of
+// the back joined", must be 0.
 //
 // What the threads still share, and how it is ordered with the window open:
 //   - the lend's flag hand-over (plan 4.2) is kept by the stage at the lend and set by the back
@@ -268,6 +272,7 @@ constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::Check::Co
     "a packet whose entry is past the back's draw (dropped unplayed, the back filled)",
     "a served draw whose texture handles the back read from game memory",
     "a sync of GPUMem's fill sent to the back before it played the packets ahead of it",
+    "a served download over GPU-written data in a buffer a packet ahead of the back joined",
 };
 constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::LevelReason::Count)>
     LEVEL_REASON_NAMES{"full copy", "writing draw", "ranges over GPU-written data"};
@@ -1053,6 +1058,30 @@ void MemoryStageLink::StageLevel(u64 position, LevelReason reason) {
     }
 }
 
+void MemoryStageLink::NoteBufferJoinSlow(u64 address, u64 size) noexcept {
+    joins[join_count % JoinSlots] = Join{address, address + size, stage_entry};
+    ++join_count;
+}
+
+bool MemoryStageLink::JoinedAhead(u64 address, u64 size, u64 back_position) const noexcept {
+    // A join copies the old buffer's bytes into the new one in its packet: a download the back
+    // records before that packet reads the new buffer before the copy. The served calls' answers
+    // stay the back's only while no such join is ahead of it over GPU-written data (step 7).
+    const u64 end = address + size;
+    const u64 kept = (std::min)(join_count, u64{JoinSlots});
+    for (u64 i = 0; i < kept; ++i) {
+        const Join& join = joins[(join_count - 1 - i) % JoinSlots];
+        if (join.position <= back_position) {
+            return false; // the fills are in stream order: the rest are played
+        }
+        if (join.begin < end && address < join.end) {
+            return true;
+        }
+    }
+    // Every kept join is ahead of the back: older ones are unknown, so say "maybe".
+    return kept == JoinSlots;
+}
+
 void MemoryStageLink::StageSyncCatchUp() {
     // GPUMem's fill reaches a sync with the window open. The back records the sync (and the
     // entries a sync plays) where it is now; the packets GPUMem sent before belong earlier in the
@@ -1228,6 +1257,7 @@ void MemoryStageLink::RingLoop(std::stop_token& stop, u64 start) {
             const u64 busy_start = LinkNowNs();
             t_in_call = true;
             t_stage_user = true;
+            stage_entry = position;
             const MemStageShadow::StageResult result = MemStageShadow::StageProcess(position, false);
             LinkBump(counters.entries[(std::min)(static_cast<size_t>(result.cls), size_t{3})]);
             if (!result.hard) {
