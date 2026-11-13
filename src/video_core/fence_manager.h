@@ -773,6 +773,13 @@ private:
         }
         {
             std::scoped_lock lock{buffer_cache.mutex};
+            [[maybe_unused]] auto seam = [&] {
+                if constexpr (requires { buffer_cache.runtime.FenceCommitBracket(); }) {
+                    return buffer_cache.runtime.FenceCommitBracket();
+                } else {
+                    return 0;
+                }
+            }();
             if (buffer_cache.HasUncommittedFlushes()) {
                 buffer_cache.CommitAsyncFlushes();
                 flushes.should_flush = true;

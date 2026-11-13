@@ -30,6 +30,8 @@
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
 #include "video_core/renderer_vulkan/vk_flash_watch.h"
 #include "video_core/renderer_vulkan/vk_frame_dump.h"
+#include "video_core/renderer_vulkan/vk_mem_stage.h"
+#include "video_core/renderer_vulkan/vk_seam_clock.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
@@ -332,6 +334,11 @@ private:
 
     TextureCacheRuntime texture_cache_runtime;
     TextureCache texture_cache;
+    /// The memory stage's seam (vk_mem_stage.cpp): constructed before the buffer cache runtime,
+    /// which pushes its entries and asks its clock.
+    MemPlayer mem_player;
+    MemStage mem_stage;
+    SeamClock mem_clock;
     BufferCacheRuntime buffer_cache_runtime;
     BufferCache buffer_cache;
     QueryCacheRuntime query_cache_runtime;

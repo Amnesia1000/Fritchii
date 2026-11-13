@@ -2136,6 +2136,8 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     mark();
     {
         Profile::Scope scope{Profile::Zone::UpdateBuffers};
+        // The geometry section: filled here, played as the bracket ends.
+        MemStage::FillPlay seam{buffer_cache.runtime.Seam(), MemStage::Site::Geometry};
         buffer_cache.UpdateGraphicsBuffers(is_indexed);
         const Profile::FineScope geometry_scope{Profile::Zone::GeometryBuffers};
         buffer_cache.BindHostGeometryBuffers(is_indexed);
@@ -2170,6 +2172,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     const auto prepare_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         {
             Profile::Scope scope{Profile::Zone::BindStageBuffers};
+            // The stage's buffer entries and descriptors, played before its image descriptors.
+            MemStage::FillPlay seam{buffer_cache.runtime.Seam(), MemStage::Site::Stage,
+                                    static_cast<u32>(stage)};
             buffer_cache.BindHostStageBuffers(stage);
         }
         {
@@ -2523,12 +2528,13 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT);
         });
     }
-    if (buffer_cache.runtime.ListDrawArgsRequested()) {
+    if (buffer_cache.runtime.Player().ListDrawArgsRequested()) {
         // List draws (nx2_list_draw.h): outside the render pass, before the
         // draw's counters start.
-        const auto [list_buffer, list_offset] = buffer_cache.GetDrawIndirectBuffer();
-        buffer_cache.runtime.RecordListDrawArgs(list_buffer->Handle(), list_offset,
-                                                IsMeshPipeline());
+        const auto [list_buffer, list_offset] = buffer_cache.runtime.Seam().Ref(
+            MemStage::Site::ListArgs, [&] { return buffer_cache.GetDrawIndirectBuffer(); });
+        buffer_cache.runtime.Player().RecordListDrawArgs(list_buffer->Handle(), list_offset,
+                                                         IsMeshPipeline());
     }
     scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
     if (writes_storage) {

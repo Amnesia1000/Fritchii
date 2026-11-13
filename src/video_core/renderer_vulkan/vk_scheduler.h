@@ -29,6 +29,7 @@
 #include "video_core/gpu_wait_site.h"
 #include "video_core/renderer_vulkan/fragment_barrier_state.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
+#include "video_core/renderer_vulkan/vk_mem_stage_hook.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace VideoCommon {
@@ -201,6 +202,22 @@ public:
     template <typename T>
         requires std::is_invocable_v<T, vk::CommandBuffer, vk::CommandBuffer>
     void RecordWithUploadBuffer(T&& command) {
+        SeamHook::Watch(SeamHook::Use::Record);
+        RecordCommand(std::forward<T>(command));
+    }
+
+    template <typename T>
+        requires std::is_invocable_v<T, vk::CommandBuffer>
+    void Record(T&& c) {
+        SeamHook::Watch(SeamHook::Use::Record);
+        RecordCommand([command = std::move(c)](vk::CommandBuffer cmdbuf, vk::CommandBuffer) {
+            command(cmdbuf);
+        });
+    }
+
+    template <typename T>
+        requires std::is_invocable_v<T, vk::CommandBuffer, vk::CommandBuffer>
+    void RecordCommand(T&& command) {
         if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
             VideoCommon::GpuSplit::CheckOwner("Scheduler::Record");
         }
@@ -214,15 +231,6 @@ public:
         }
         DispatchWork();
         (void)chunk->Record(command);
-    }
-
-    template <typename T>
-        requires std::is_invocable_v<T, vk::CommandBuffer>
-    void Record(T&& c) {
-        this->RecordWithUploadBuffer(
-            [command = std::move(c)](vk::CommandBuffer cmdbuf, vk::CommandBuffer) {
-                command(cmdbuf);
-            });
     }
 
     /// Whether a command was recorded since the last Flush or Finish (EXP61: a flush with nothing

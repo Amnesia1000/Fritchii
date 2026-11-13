@@ -42,7 +42,9 @@ void UpdateDescriptorQueue::TickFrame() {
 /// Reserve one batch, growing drained host storage when possible, otherwise reusing it safely.
 void UpdateDescriptorQueue::Acquire(Scheduler& scheduler, size_t required_entries,
                                     bool use_descriptor_buffer_) {
-    use_descriptor_buffer = supports_descriptor_buffer && use_descriptor_buffer_;
+    // The memory stage's pending entries belong to the batch before this one.
+    SeamHook::Watch(SeamHook::Use::DescriptorAcquire);
+    use_descriptor_buffer =supports_descriptor_buffer && use_descriptor_buffer_;
     static constexpr size_t DEFAULT_REQUIRED_ENTRIES = 0x400;
     const size_t reserve = required_entries > 0 ? required_entries : DEFAULT_REQUIRED_ENTRIES;
     if (reserve > maximum_frame_payload_size) {

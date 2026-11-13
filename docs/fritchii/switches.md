@@ -263,14 +263,20 @@ FRITCHII_MEMSTAGE_SPLIT_ALLOC (boot, default on, =0 off; Fable's ideal pipeline 
 build step 3): the buffer cache runtime gets a VMA allocator of its own (Device::
 GetBufferAllocator) and a staging pool of its own on it, so the future memory stage can own
 them on its thread. On it: the buffer cache's buffers (EXP104's pool included), quad and
-uint8 index buffers, vertex repack and multi-range buffers, list and null buffers, the uniform
-stream and buffer uploads and downloads. Images, the texture cache, query cache, descriptors,
+uint8 index buffers, vertex repack and multi-range buffers, the null buffer, the uniform
+stream and buffer uploads and downloads. The two list draw buffers (list draw arguments, kept
+list words) belong to the memory stage's player (EXP123) and are on the main allocator. Images, the texture cache, query cache, descriptors,
 mesh emulation, upscalers and diagnostics stay on the main allocator and staging pool. The
 back's pool keeps its full stream buffer (128 MiB, texture uploads up to 8 MiB stay in the
 ring); the buffer cache's pool takes half that (64 MiB), so a discrete card reserves 64 MiB
 more. On integrated GPUs the two split the one stream buffer instead. EXP104's byte caps count
 both pools' recyclers together, and the new allocator takes no memory until used. Read once
 when the device is made.
+
+### FRITCHII_MEMSTAGE_SEAM_STATS
+
+FRITCHII_MEMSTAGE_SEAM_STATS=1 (boot, diagnostic): the memory seam's stats line (EXP123) every
+10 s also with EXP123 = 0, which shows what the seam carries at today's timing.
 
 ### FRITCHII_JIT_DISPATCH_BITS
 
@@ -1001,6 +1007,40 @@ cache last 600 frames: collector downloads" logs, with EXP121 on or EDEN_NX2_TC_
 left, queued, landed (and frames from record to landing), dropped by reason, fallbacks and
 mismatches. Toggle live 0/1 (or 0/2) with profile_toggle.py in a scene at the memory threshold
 (8 GB cards, long fights).
+
+### EXP123
+
+EXP123 (SEAM, live, 0 = off; the memory stage's step 2a, fable_memstage_step2_spec.md 6.1):
+every Vulkan command the buffer cache runtime records (uploads, copies and their barriers,
+clears, the quad index tables, the null buffer's fill, index, vertex and transform feedback
+binds, the uint8, quad and vertex repack compute passes, and its uniform, storage and texel
+buffer descriptors) is pushed as an entry; MemPlayer::Exec (vk_mem_stage.cpp) is the only code
+that turns an entry into scheduler and descriptor queue calls. With 0 each entry runs the
+moment it is pushed: today's calls at today's moments, in today's order. With 1 the entries of
+a fill bracket wait in the arena and are played where the call site plays them: after the
+geometry binds (UpdateGraphicsBuffers, BindHostGeometryBuffers), after each stage's
+BindHostStageBuffers, after BindHostComputeBuffers, after each call that returns a buffer
+(ObtainBuffer for a GPU count, an indirect dispatch, kept list words, a DMA image copy;
+GetDrawIndirectBuffer and Count; the query cache's ObtainCPUBuffer) and at the end of each
+single operation (downloads, write and invalidation ranges, runahead chunks, unmaps, DMA
+copies and clears, inline uploads, list page copies and flushes, the frame tick, the fence
+commit). The picture must stay identical. Read once a frame; a change makes the player forget
+the remembered index and vertex buffers (a few rebinds). The rebind checks against the
+recording epoch and the list draw facility (list draw arguments, kept list words) are the
+player's; finishes, waits, submits for host reads, the multi-range bind and the kept words wait
+go through SeamClock, which plays what is pending first.
+
+Verify, always counted: "around the packet" (5.1, something recorded or added a descriptor
+inside a fill without going through the player or a sync: a runtime path that was not
+converted) and "late plays" (5.2, entries still pending when something else recorded: a call
+site misses its play). Both must stay 0; the first 16 are logged as "Memory seam: ..." with the
+use and its source location. "Scheduler uses not through the clock" counts flushes, finishes
+and state resets inside a fill that did not go through SeamClock. With EXP123 = 1 (or
+FRITCHII_MEMSTAGE_SEAM_STATS=1) "Memory seam (EXP123=n)" logs every 10 s: draws, dispatches and
+fence commits a second with entries each, deferred entries and plays a second, the counters
+above, entries a second by kind (which kinds OoT uses at all: convert, multi-range, texel
+buffers), fills by site with entries each, syncs by kind, and entries run outside any fill by
+kind. Compare 0 and 1 with profile_toggle.py ("back us a draw", heavy-phase market, 4 cycles).
 
 ### EXP101
 

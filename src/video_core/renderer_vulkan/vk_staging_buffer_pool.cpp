@@ -95,7 +95,7 @@ size_t GetStreamBufferSize(const Device& device) {
 // back's), which split one stream buffer's size between them instead of each taking all of it.
 StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& memory_allocator_,
                                      Scheduler& scheduler_, u32 stream_divisor)
-    : device{device_}, memory_allocator{memory_allocator_}, scheduler{scheduler_},
+    : device{device_}, memory_allocator{memory_allocator_}, clock{scheduler_},
       recycler{scheduler_},
       stream_buffer_size{Common::AlignDown(
           GetStreamBufferSize(device) / (std::max)(stream_divisor, 1U), MAX_ALIGNMENT)},
@@ -146,7 +146,7 @@ void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
     auto it = std::find_if(entries.begin(), entries.end(), is_this_one);
     ASSERT(it != entries.end());
     ASSERT(it->deferred);
-    it->tick = scheduler.CurrentTick();
+    it->tick = clock.Now();
     it->deferred = false;
 }
 
@@ -168,7 +168,7 @@ StagingBufferRef StagingBufferPool::GetStreamBuffer(
         // Avoid waiting for the previous usages to be free
         return GetStagingBuffer(size, MemoryUsage::Upload, false, caller, true);
     }
-    const u64 current_tick = scheduler.CurrentTick();
+    const u64 current_tick = clock.Now();
     std::fill(sync_ticks.begin() + Region(used_iterator), sync_ticks.begin() + Region(iterator),
               current_tick);
     used_iterator = iterator;
@@ -201,7 +201,7 @@ StagingBufferRef StagingBufferPool::GetStreamBuffer(
 }
 
 bool StagingBufferPool::AreRegionsActive(size_t region_begin, size_t region_end) const {
-    const u64 gpu_tick = scheduler.GetMasterSemaphore().KnownGpuTick();
+    const u64 gpu_tick = clock.KnownGpu();
     return std::any_of(sync_ticks.begin() + region_begin, sync_ticks.begin() + region_end,
                        [gpu_tick](u64 sync_tick) { return gpu_tick < sync_tick; });
 };
@@ -221,7 +221,7 @@ std::optional<StagingBufferRef> StagingBufferPool::TryGetReservedBuffer(size_t s
     StagingBuffers& cache_level = GetCache(usage)[Common::Log2Ceil(size)];
 
     const auto is_free = [this](const StagingBuffer& entry) {
-        return !entry.deferred && scheduler.IsFree(entry.tick);
+        return !entry.deferred && clock.IsFree(entry.tick);
     };
     auto& entries = cache_level.entries;
     const auto hint_it = entries.begin() + cache_level.iterate_index;
@@ -233,7 +233,7 @@ std::optional<StagingBufferRef> StagingBufferPool::TryGetReservedBuffer(size_t s
         }
     }
     cache_level.iterate_index = std::distance(entries.begin(), it) + 1;
-    it->tick = deferred ? (std::numeric_limits<u64>::max)() : scheduler.CurrentTick();
+    it->tick = deferred ? (std::numeric_limits<u64>::max)() : clock.Now();
     ASSERT(!it->deferred);
     it->deferred = deferred;
     return it->Ref();
@@ -284,7 +284,7 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(
                 for (StagingBuffers& level : *cache) {
                     const size_t before = level.entries.size();
                     std::erase_if(level.entries, [this](const StagingBuffer& entry) {
-                        return !entry.deferred && scheduler.IsFree(entry.tick);
+                        return !entry.deferred && clock.IsFree(entry.tick);
                     });
                     freed += before - level.entries.size();
                     level.iterate_index = 0;
@@ -316,7 +316,7 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(
         .usage = usage,
         .log2_level = log2_size,
         .index = unique_ids++,
-        .tick = deferred ? (std::numeric_limits<u64>::max)() : scheduler.CurrentTick(),
+        .tick = deferred ? (std::numeric_limits<u64>::max)() : clock.Now(),
         .deferred = deferred,
     });
     return entry.Ref();
@@ -367,7 +367,7 @@ void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
         (VideoCore::Nx2Debug::Experiment(8) & 1) != 0) {
         size_t idle = 0;
         std::erase_if(entries, [this, &idle](StagingBuffer& entry) {
-            if (!scheduler.IsFree(entry.tick) || ++idle <= KeepPerLevel) {
+            if (!clock.IsFree(entry.tick) || ++idle <= KeepPerLevel) {
                 return false;
             }
             Retire(entry);
@@ -381,7 +381,7 @@ void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
     }
 
     const auto is_deletable = [this](StagingBuffer& entry) {
-        if (!scheduler.IsFree(entry.tick)) {
+        if (!clock.IsFree(entry.tick)) {
             return false;
         }
         Retire(entry);
@@ -434,7 +434,7 @@ void AddTotals(s64 held_bytes, s64 held_entries, s64 doomed_bytes) noexcept {
 }
 } // Anonymous namespace
 
-BufferRecycler::BufferRecycler(Scheduler& scheduler_) : scheduler{scheduler_} {}
+BufferRecycler::BufferRecycler(Scheduler& scheduler_) : clock{scheduler_} {}
 
 BufferRecycler::~BufferRecycler() {
     // Shutdown: the device is idle; the vk::Buffers destroy themselves.
@@ -471,7 +471,7 @@ vk::Buffer BufferRecycler::Take(Family family, u32 log2, u64* bytes) {
         std::deque<Entry>& list = lists[ListIndex(family, log2)];
         // Oldest first: entries are returned in tick order, so if the oldest is still in use
         // by the GPU, so are the others.
-        if (!list.empty() && scheduler.IsFree(list.front().tick)) {
+        if (!list.empty() && clock.IsFree(list.front().tick)) {
             Entry& entry = list.front();
             buffer = std::move(entry.buffer);
             if (bytes != nullptr) {
@@ -504,7 +504,7 @@ bool BufferRecycler::Give(Family family, vk::Buffer& buffer, u64 bytes) {
     lists[ListIndex(family, log2)].push_back(Entry{
         .buffer = std::move(buffer),
         .bytes = bytes,
-        .tick = scheduler.CurrentTick(),
+        .tick = clock.Now(),
         .frame = frame,
         .family = family,
     });
@@ -574,7 +574,7 @@ size_t BufferRecycler::DestroyDoomed(u64 keep_bytes) {
         // keep_bytes counts every recycler's doomed bytes (one cap for all).
         while (!doomed.empty() &&
                g_total_doomed_bytes.load(std::memory_order_relaxed) > keep_bytes &&
-               scheduler.IsFree(doomed.front().tick)) {
+               clock.IsFree(doomed.front().tick)) {
             doomed_bytes -= doomed.front().bytes;
             AddTotals(0, 0, -static_cast<s64>(doomed.front().bytes));
             destroy.push_back(std::move(doomed.front()));
@@ -598,7 +598,7 @@ void BufferRecycler::DestroyIdle(u32 max) {
         vk::Buffer buffer;
         {
             std::scoped_lock lock{mutex};
-            if (doomed.empty() || !scheduler.IsFree(doomed.front().tick)) {
+            if (doomed.empty() || !clock.IsFree(doomed.front().tick)) {
                 return;
             }
             doomed_bytes -= doomed.front().bytes;

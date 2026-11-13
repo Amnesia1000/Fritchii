@@ -16,7 +16,9 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/renderer_vulkan/vk_buffer_recycler.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
+#include "video_core/renderer_vulkan/vk_mem_stage.h"
 #include "video_core/renderer_vulkan/vk_multi_range_buffer.h"
+#include "video_core/renderer_vulkan/vk_seam_clock.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/surface.h"
@@ -87,7 +89,7 @@ private:
     };
 
     const Device* device{};
-    Scheduler* scheduler{};
+    const SeamClock* clock{};
     /// EXP104: may be larger than SizeBytes() (its size class), and goes back to the pool when
     /// this Buffer is destroyed. Declared before the views, so they are destroyed first.
     RecycledBuffer buffer;
@@ -113,7 +115,26 @@ public:
                                 Scheduler& scheduler_, StagingBufferPool& staging_pool_,
                                 GuestDescriptorQueue& guest_descriptor_queue,
                                 ComputePassDescriptorQueue& compute_pass_descriptor_queue,
-                                DescriptorPool& descriptor_pool);
+                                DescriptorPool& descriptor_pool, MemStage& mem_stage,
+                                SeamClock& clock);
+    ~BufferCacheRuntime();
+
+    [[nodiscard]] MemStage& Seam() noexcept {
+        return mem_stage;
+    }
+
+    [[nodiscard]] SeamClock& Clock() noexcept {
+        return clock;
+    }
+
+    [[nodiscard]] MemPlayer& Player() noexcept {
+        return mem_stage.Player();
+    }
+
+    /// The fence commit's fill bracket (FenceManager): its downloads are played as it ends.
+    [[nodiscard]] MemStage::FillPlay FenceCommitBracket() {
+        return MemStage::FillPlay{mem_stage, MemStage::Site::Fence};
+    }
 
     void TickFrame(Common::SlotVector<Buffer>& slot_buffers) noexcept;
 
@@ -126,6 +147,10 @@ public:
 
     bool AnyVertexRepacked() const {
         return vertex_repack_mask != 0;
+    }
+
+    [[nodiscard]] u32 RepackMask() const noexcept {
+        return vertex_repack_mask;
     }
 
     u64 CurrentTick();
@@ -233,7 +258,9 @@ public:
     /// live: made on the scheduler tick that is current now, so the staging pool has not recycled
     /// it and the GPU has not even started on it.
     void RebindStreamUniform(const StreamUniformRef& ref, u32 size) {
-        guest_descriptor_queue.AddBuffer(ref.buffer, ref.device_address, ref.offset, size);
+        mem_stage.PushDescriptor(UpdateDescriptorQueue::MakeBufferEntry(
+            guest_descriptor_queue.UsesDescriptorBuffer(), ref.buffer, ref.device_address,
+            ref.offset, size));
     }
 
     [[nodiscard]] VkDeviceSize SparseAlignmentFor(bool sparse_compatible) const noexcept {
@@ -273,7 +300,7 @@ public:
     }
 
     void OnBufferDeleted(const Buffer& buffer) {
-        multi_range_buffers.DropOwner(scheduler, buffer.Handle());
+        multi_range_buffers.DropOwner(clock, buffer.Handle());
     }
 
     void BindUniformBuffer(const Buffer& buffer, u32 offset, u32 size) {
@@ -291,9 +318,10 @@ public:
         if (format == VideoCore::Surface::PixelFormat::Invalid) {
             format = VideoCore::Surface::PixelFormat::R8_UNORM;
         }
-        guest_descriptor_queue.AddTexelBuffer(buffer.View(offset, size, format),
-                                              buffer.DeviceAddress(), offset, size,
-                                              TexelBufferFormat(format));
+        const VkBufferView view = buffer.View(offset, size, format);
+        mem_stage.PushDescriptor(UpdateDescriptorQueue::MakeTexelEntry(
+            guest_descriptor_queue.UsesDescriptorBuffer(), view, buffer.DeviceAddress(), offset,
+            size, TexelBufferFormat(format)), true);
     }
 
     bool ShouldLimitDynamicStorageBuffers() const {
@@ -304,52 +332,16 @@ public:
         return max_dynamic_storage_buffers;
     }
 
-    // List draws (nx2_list_draw.h): the arguments of an array draw whose
-    // vertex count and first vertex are two GPU-written words (Nx2ListDraw). The rasterizer asks
-    // for them before it prepares the draw, the pipeline records their copy before it requests
-    // the render pass, and the draw takes them.
-    struct ListDrawArgs {
-        VkBuffer buffer{};
-        VkDeviceSize offset{};
-        bool mesh{}; ///< A task/mesh draw command (group counts)
-    };
-    /// `keep_id`: the id the copy of the words is kept as (KeepListWords), 0 for none.
-    void RequestListDrawArgs(u64 keep_id = 0) noexcept {
-        list_draw_requested = true;
-        list_draw_args = {};
-        list_draw_keep_id = keep_id;
-    }
-    [[nodiscard]] bool ListDrawArgsRequested() const noexcept {
-        return list_draw_requested;
-    }
-    /// Records the copy of the words at `offset` of `source`, outside the render pass, into a
-    /// vertex draw command or (`mesh`) a task/mesh one.
-    void RecordListDrawArgs(VkBuffer source, VkDeviceSize offset, bool mesh);
-    /// The arguments recorded since the request (no buffer if none were), ending the request.
-    [[nodiscard]] ListDrawArgs TakeListDrawArgs() noexcept {
-        list_draw_requested = false;
-        list_draw_keep_id = 0;
-        return std::exchange(list_draw_args, {});
-    }
-
-    // List draws and list dispatches: copies of list words kept for the front, which reads them
-    // back when it needs their values after all (RasterizerInterface::Nx2ReadKeptListWords).
-    /// Records, outside the render pass, a copy of `count` (up to 3) words at `offset` of
-    /// `source` as `keep_id`.
-    void KeepListWords(u64 keep_id, VkBuffer source, VkDeviceSize offset, u32 count);
-    /// Keeps words the host read itself as `keep_id`.
-    void KeepListWordsRead(u64 keep_id, std::span<const u32> words);
-    /// The words kept as `keep_id`, waiting for the host GPU to copy them if it must. False if
-    /// none are (a later copy took the slot).
-    [[nodiscard]] bool ReadKeptListWords(u64 keep_id, std::span<u32> words);
-
 private:
     void BindBuffer(const Buffer& buffer, u32 offset, u32 size) {
         const VkBuffer handle = buffer.Handle();
+        const bool descriptor_buffer = guest_descriptor_queue.UsesDescriptorBuffer();
         if (handle == VK_NULL_HANDLE) {
-            guest_descriptor_queue.AddBuffer(handle, 0, 0, VK_WHOLE_SIZE);
+            mem_stage.PushDescriptor(UpdateDescriptorQueue::MakeBufferEntry(
+                descriptor_buffer, handle, 0, 0, VK_WHOLE_SIZE));
         } else {
-            guest_descriptor_queue.AddBuffer(handle, buffer.DeviceAddress(), offset, size);
+            mem_stage.PushDescriptor(UpdateDescriptorQueue::MakeBufferEntry(
+                descriptor_buffer, handle, buffer.DeviceAddress(), offset, size));
         }
     }
 
@@ -367,36 +359,13 @@ private:
     Scheduler& scheduler;
     StagingBufferPool& staging_pool;
     GuestDescriptorQueue& guest_descriptor_queue;
+    MemStage& mem_stage;
+    SeamClock& clock;
 
     std::shared_ptr<QuadArrayIndexBuffer> quad_array_index_buffer;
     std::shared_ptr<QuadStripIndexBuffer> quad_strip_index_buffer;
 
     vk::Buffer null_buffer;
-
-    /// Slots of two draw commands each, a vertex one (count, 1 instance, first, instance 0) and a
-    /// task/mesh one (count, 1, 1): the host GPU copies the list words over the count and the
-    /// first vertex, the other words are written once.
-    static constexpr u32 LIST_DRAW_SLOTS = 1024;
-    static constexpr u32 LIST_DRAW_SLOT_BYTES = 32;
-    vk::Buffer list_draw_buffer;
-    u32 list_draw_cursor{};
-    bool list_draw_requested{};
-    ListDrawArgs list_draw_args{};
-    u64 list_draw_keep_id{};
-
-    /// Kept list words, by keep id: a host-readable slot of 16 bytes each.
-    static constexpr u32 LIST_KEEP_SLOTS = 1024;
-    static constexpr u32 LIST_KEEP_SLOT_BYTES = 16;
-    struct ListKeep {
-        u64 keep_id{};
-        u64 tick{};   ///< The submission that copies them, if on_gpu
-        bool on_gpu{};
-        u32 count{};
-        std::array<u32, 3> words{}; ///< If not on_gpu
-    };
-    void EnsureListKeepBuffer();
-    vk::Buffer list_keep_buffer;
-    std::array<ListKeep, LIST_KEEP_SLOTS> list_keeps{};
 
     std::unique_ptr<Uint8Pass> uint8_pass;
     std::unique_ptr<VertexRepackPass> vertex_repack_pass;
@@ -412,24 +381,6 @@ private:
 
     bool limit_dynamic_storage_buffers = false;
     u32 max_dynamic_storage_buffers = (std::numeric_limits<u32>::max)();
-
-    /// The index buffer BindIndexBuffer recorded last, at scheduler recording epoch bound_index_epoch.
-    VkBuffer bound_index_buffer = VK_NULL_HANDLE;
-    VkDeviceSize bound_index_offset = 0;
-    VkIndexType bound_index_type = VK_INDEX_TYPE_UINT32;
-    u64 bound_index_epoch = 0;
-    bool bound_index_valid = false;
-
-    /// The vertex buffer each binding last recorded, and the scheduler recording epoch it was
-    /// recorded at (~0: unknown).
-    struct BoundVertexBuffer {
-        VkBuffer buffer = VK_NULL_HANDLE;
-        VkDeviceSize offset = 0;
-        VkDeviceSize size = 0;
-        VkDeviceSize stride = 0;
-        u64 epoch = ~u64{0};
-    };
-    std::array<BoundVertexBuffer, VideoCommon::NUM_VERTEX_BUFFERS> bound_vertex_buffers{};
 };
 
 struct BufferCacheParams {

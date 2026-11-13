@@ -11,6 +11,7 @@
 #include <utility>
 
 #include "common/common_types.h"
+#include "video_core/renderer_vulkan/vk_seam_clock.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -115,7 +116,7 @@ private:
     size_t DestroyDoomed(u64 keep_bytes);
     void PublishGauges() noexcept;
 
-    Scheduler& scheduler;
+    SeamClock clock;
     std::mutex mutex;
     std::array<std::deque<Entry>, NumLists> lists;
     std::deque<Entry> doomed;

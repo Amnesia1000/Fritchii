@@ -252,6 +252,9 @@ add_library(video_core STATIC
     renderer_vulkan/vk_multi_range_buffer.h
     renderer_vulkan/vk_master_semaphore.cpp
     renderer_vulkan/vk_master_semaphore.h
+    renderer_vulkan/vk_mem_stage.cpp
+    renderer_vulkan/vk_mem_stage.h
+    renderer_vulkan/vk_mem_stage_hook.h
     renderer_vulkan/vk_pipeline_cache.cpp
     renderer_vulkan/vk_pipeline_cache.h
     renderer_vulkan/vk_pipeline_translate_queue.cpp
@@ -274,6 +277,7 @@ add_library(video_core STATIC
     renderer_vulkan/vk_resource_pool.h
     renderer_vulkan/vk_scheduler.cpp
     renderer_vulkan/vk_scheduler.h
+    renderer_vulkan/vk_seam_clock.h
     renderer_vulkan/fragment_barrier_state.h
     renderer_vulkan/vk_shader_util.cpp
     renderer_vulkan/vk_shader_util.h
