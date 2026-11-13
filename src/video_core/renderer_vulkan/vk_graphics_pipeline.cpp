@@ -666,6 +666,10 @@ GraphicsPipeline::GraphicsPipeline(
         return info.stores_global_memory || any_written(info.storage_buffers_descriptors) ||
                any_written(info.image_descriptors) || any_written(info.image_buffer_descriptors);
     });
+    samples_nothing = std::ranges::all_of(stage_infos, [](const Shader::Info& info) {
+        return info.texture_descriptors.empty() && info.texture_buffer_descriptors.empty() &&
+               info.image_descriptors.empty() && info.image_buffer_descriptors.empty();
+    });
     // EXP87 (the original texture_memo_eligible).
     template_eligible = std::ranges::all_of(stage_infos, [](const Shader::Info& info) {
         return info.texture_buffer_descriptors.empty() && info.image_buffer_descriptors.empty() &&

@@ -14,6 +14,7 @@
 #include "common/common_types.h"
 #include "common/logging.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/nx2_fastdraw_count.h"
 #include "video_core/nx2_profile.h"
 
 // FRITCHII_DRAW_KINDS=1 (diagnostic, read once when the rasterizer is made; fable52_answer_potroom2
@@ -27,6 +28,10 @@
 // setup; the report after a draw goes to the next one). Clears are counted apart, with their writes.
 // With EDEN_NX2_GPU_PROFILE on, the line also has each kind's busy time a draw: inside the draw and
 // between the previous draw or clear and this one, the profiler's wait zones taken out.
+// Each kind also counts its draws whose pipeline samples nothing (no texture, image, texture
+// buffer or image buffer descriptor: the delta path's first cut, fable52_answer_potroom3
+// section 2) and, while EDEN_NX2_FASTDRAW_COUNT counts, its would-be delta draws (of them, those
+// sampling nothing).
 // Off: one test of g_on at each site.
 namespace VideoCommon::FritchiiDrawKinds {
 
@@ -65,6 +70,9 @@ struct Bucket {
     u64 draw_ticks{}; ///< Busy inside the draw (profiled runs)
     u64 gap_ticks{};  ///< Busy since the previous draw or clear ended (profiled runs)
     u64 square{};     ///< Of the draws: a square depth target (shadow draws only)
+    u64 no_samples{}; ///< Of the draws: the pipeline samples nothing
+    u64 would_delta{};            ///< Of the draws: would-be delta draws (the count's decision)
+    u64 would_delta_no_samples{}; ///< Of those: the pipeline samples nothing
 };
 
 struct ThreadState {
@@ -76,6 +84,8 @@ struct ThreadState {
     bool pending{};
     bool pending_clear{};
     bool pending_square{};
+    bool pending_no_samples{};
+    bool pending_would_delta{};
     u8 pending_mask{};
     u64 pending_writes{};
     u64 pending_draw_ticks{};
@@ -141,6 +151,26 @@ inline void Commit() {
     bucket.draw_ticks += t.pending_draw_ticks;
     bucket.gap_ticks += t.pending_gap_ticks;
     bucket.square += t.pending_square ? 1 : 0;
+    bucket.no_samples += t.pending_no_samples ? 1 : 0;
+    bucket.would_delta += t.pending_would_delta ? 1 : 0;
+    bucket.would_delta_no_samples += t.pending_would_delta && t.pending_no_samples ? 1 : 0;
+}
+
+/// The draw's pipeline (RasterizerVulkan::PrepareDraw, once it has one): whether it samples
+/// nothing.
+inline void NotePipeline(bool samples_nothing) {
+    auto& t = t_state;
+    if (t.pending && !t.pending_clear) {
+        t.pending_no_samples = samples_nothing;
+    }
+}
+
+/// The delta draw count (EDEN_NX2_FASTDRAW_COUNT) found the draw a would-be delta draw.
+inline void NoteWouldBeDelta() {
+    auto& t = t_state;
+    if (t.pending && !t.pending_clear) {
+        t.pending_would_delta = true;
+    }
 }
 
 /// What a draw made with these registers is (all but ReportAfter, known later).
@@ -195,6 +225,8 @@ inline void Begin(const Tegra::Engines::Maxwell3D::Regs& regs, bool is_clear) {
     t.pending = true;
     t.pending_clear = is_clear;
     t.pending_square = false;
+    t.pending_no_samples = false;
+    t.pending_would_delta = false;
     t.pending_mask = is_clear ? 0 : Classify(regs, t.pending_square);
     t.pending_writes = t.writes_since;
     t.writes_since = 0;
@@ -265,6 +297,9 @@ inline void LogAndReset(ThreadState& t, u64 frames) {
             into.draw_ticks += b.draw_ticks;
             into.gap_ticks += b.gap_ticks;
             into.square += b.square;
+            into.no_samples += b.no_samples;
+            into.would_delta += b.would_delta;
+            into.would_delta_no_samples += b.would_delta_no_samples;
         };
         add(all);
         if (mask == 0) {
@@ -277,6 +312,8 @@ inline void LogAndReset(ThreadState& t, u64 frames) {
         }
     }
     const bool timed = us_per_tick > 0.0 && (all.draw_ticks != 0 || all.gap_ticks != 0);
+    // Would-be delta draws exist only while the delta draw count runs.
+    const bool counted = VideoCommon::Nx2FastDrawCount::g_on;
     const auto describe = [&](const Bucket& b) {
         const double draws = static_cast<double>(b.draws);
         std::string text = fmt::format("{:.1f} draws {:.1f} writes", draws / frame_count,
@@ -285,6 +322,16 @@ inline void LogAndReset(ThreadState& t, u64 frames) {
             text += fmt::format(" {:.2f}+{:.2f} us",
                                 static_cast<double>(b.draw_ticks) * us_per_tick / draws,
                                 static_cast<double>(b.gap_ticks) * us_per_tick / draws);
+        }
+        if (b.draws != 0) {
+            text += fmt::format(" ({:.1f} sample nothing",
+                                static_cast<double>(b.no_samples) / frame_count);
+            if (counted) {
+                text += fmt::format(", {:.1f} would-be delta, {:.1f} of them sample nothing",
+                                    static_cast<double>(b.would_delta) / frame_count,
+                                    static_cast<double>(b.would_delta_no_samples) / frame_count);
+            }
+            text += ')';
         }
         return text;
     };

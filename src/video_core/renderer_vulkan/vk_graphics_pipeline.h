@@ -182,6 +182,12 @@ public:
         return fragment_has_color0_output;
     }
 
+    /// No texture, image, texture buffer or image buffer descriptor in any stage: a draw binds no
+    /// image (FRITCHII_DRAW_KINDS counts these; the delta path's first cut, EXP118).
+    [[nodiscard]] bool SamplesNothing() const noexcept {
+        return samples_nothing;
+    }
+
     /// Texture handles of the last configured draw whose handle program gave 0.
     u32 ZeroTextureHandles() const noexcept {
         return zero_texture_handles;
@@ -554,6 +560,7 @@ private:
     u32 zero_texture_handles{};
     u32 color_output_mask{};
     bool writes_storage{};
+    bool samples_nothing{}; ///< SamplesNothing
     TextureMemo texture_memo;
     TexBankMemo tex_bank_memo;
     /// EDEN_NX2_TEX_BANK_GEN: (stage, constant buffer index) of every handle word read.

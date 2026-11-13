@@ -909,6 +909,9 @@ void RasterizerVulkan::FastDrawCountDecide(const GraphicsPipeline* pipeline, boo
         return full(Count::Full::ComputedHandles);
     }
     ++stats.delta;
+    if (VideoCommon::FritchiiDrawKinds::g_on) [[unlikely]] {
+        VideoCommon::FritchiiDrawKinds::NoteWouldBeDelta();
+    }
     // The full resolve picked another pipeline: a delta draw would have kept the wrong one.
     stats.other_pipeline += pipeline != previous ? 1 : 0;
 }
@@ -1067,6 +1070,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             }
         }
         return;
+    }
+    // FRITCHII_DRAW_KINDS: whether the draw's pipeline samples nothing.
+    if (VideoCommon::FritchiiDrawKinds::g_on) [[unlikely]] {
+        VideoCommon::FritchiiDrawKinds::NotePipeline(pipeline->SamplesNothing());
     }
     // EDEN_NX2_MEMSTAGE_STATS: the first draw of each shader set (the memory stage's join 1).
     if (VideoCommon::MemStageStats::Enabled()) [[unlikely]] {
