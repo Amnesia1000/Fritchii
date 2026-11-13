@@ -278,6 +278,31 @@ when the device is made.
 FRITCHII_MEMSTAGE_SEAM_STATS=1 (boot, diagnostic): the memory seam's stats line (EXP123) every
 10 s also with EXP123 = 0, which shows what the seam carries at today's timing.
 
+### FRITCHII_MEMSTAGE_TICKS
+
+FRITCHII_MEMSTAGE_TICKS (boot, default 0; the memory stage's build step 4,
+fable_memstage_step2_spec.md 7.2): what the buffer cache side's stamps are.
+- 0: scheduler ticks, as before (SeamClock forwards to the scheduler).
+- 1: packet ticks. The memory stage numbers its packets (each draw, dispatch and operation
+  packet takes the next number) and every stamp the buffer cache side takes is the number
+  current then: buffer usage (and so CanReorderUpload's "used since"), staging buffers and
+  the stream ring's lazy region stamps, EXP104's recycler, write ticks, extent probes, list
+  page copies, host read flushes. The GPU thread publishes at the end of every scheduler
+  tick "every number up to N was recorded in tick K"; a stamp is free when its tick is
+  complete. Numbers whose entries still wait for their play stay open past a tick's end, so
+  an early fill (EXP123 = 2) needs no tick guard. Deleted buffers wait their 8 frames and also
+  their packet. The stream uniform reuse compares a close count instead of the tick. On one
+  thread every answer is the scheduler's. With FRITCHII_MEMSTAGE_SPLIT_ALLOC=0 the texture
+  cache's staging (the shared pool) gets packet stamps too, right on one thread.
+- 2: as 1, and every answer is checked against the scheduler ticks' answer. The line
+  "Memory seam ticks (FRITCHII_MEMSTAGE_TICKS=n)" every 10 s gives packets/s, tick closes/s,
+  the published ticks waiting, carried closes and deleted buffers held past their frames (with
+  1 too); with 2, "memory seam ticks check" gives early (the packet answer frees or waits
+  less: unsafe) and late (holds longer) per check (is free, stream known, wait, host read),
+  carried skipped, split (a number handed out in two ticks without a carry), unchecked
+  (older than the 2^18-number ring) and epoch off. Early, late, split, epoch off and held
+  must all read 0. Disagreements log the first 16 lines with the packet and both ticks.
+
 ### FRITCHII_JIT_DISPATCH_BITS
 
 FRITCHII_JIT_DISPATCH_BITS (boot, default 20; fable52_answer_guest 2.1): the A64 JIT's fast
