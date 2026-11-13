@@ -31,6 +31,7 @@
 #include "video_core/engines/puller.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
+#include "video_core/memstage_shadow.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_fastdraw_count.h"
 #include "video_core/memory_manager.h"
@@ -1350,9 +1351,11 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         const auto properties = g_nx2_ampere && (regs.semaphore_trigger & (1U << 24)) != 0
                                     ? VideoCommon::QueryPropertiesFlags::IsAFence
                                     : VideoCommon::QueryPropertiesFlags::HasTimeout;
+        // Memory stage tag Cache: the query cache's report (a fence commits the buffer cache's
+        // async flushes); no 3D register, draw state, binding or channel is written.
         OnBack([rasterizer = dma_pusher.rasterizer, sequence_address, properties, payload] {
             rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload, properties, payload, 0);
-        });
+        }, VideoCommon::StageTagBits(VideoCommon::StageTag::Cache));
         if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
             if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(sequence_address)) {
                 split.NoteRelease(*device, sequence_address, payload);
