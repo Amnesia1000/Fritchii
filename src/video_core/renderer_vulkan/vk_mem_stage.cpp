@@ -1763,7 +1763,8 @@ void MemStage::PushParts(Cmd kind, u8 flags, u32 count, std::initializer_list<Pa
         SetPending();
         return;
     }
-    if (pending && OwnedHere()) [[unlikely]] {
+    // FRITCHII_MEMSTAGE_THREAD >= 1 only: at 0 this is the seam's own case, logged nowhere new.
+    if (Link::Checking() && pending && OwnedHere()) [[unlikely]] {
         Link::Note(Link::Check::PushWhilePending, CMD_NAMES[static_cast<size_t>(kind)]);
     }
     const ScratchDepth scratch_depth;
@@ -1863,7 +1864,7 @@ void MemStage::PushDescriptor(const DescriptorUpdateEntry& descriptor, bool texe
     Link::CheckCacheUser(Link::Check::PushUser);
     if (!Deferring()) {
         CountPush(Cmd::Descriptors);
-        if (pending && OwnedHere()) [[unlikely]] {
+        if (Link::Checking() && pending && OwnedHere()) [[unlikely]] {
             Link::Note(Link::Check::PushWhilePending, "descriptor");
         }
         if (Link::InCall()) [[unlikely]] {
