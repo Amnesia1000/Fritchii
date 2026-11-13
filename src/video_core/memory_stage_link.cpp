@@ -214,6 +214,7 @@ constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::Check::Co
     "a packet left unplayed at a run's start",
     "ring B full",
     "draws issued by the back and the stage differ at a run's end (compare a)",
+    "a packet played whole for a draw the back did not prepare",
 };
 constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::HandOff::Count)>
     LINK_HANDOFF_NAMES{"draw fills", "dispatch fills", "idle destroys", "served for the back"};
@@ -602,9 +603,26 @@ bool MemoryStageLink::BackRingTop(u64 position) {
     }
     if (!active) {
         if (t_back_served || t_back_run) {
-            // The stage ended the ring (at a parked point): back to `published`.
+            // The stage ended the ring (at a parked point): back to `published`, the cache the
+            // back's again. Ring B is drained first: a packet left is a draw the back never
+            // prepared (must be 0), played whole in order so the cache's uploads are recorded and
+            // no stale header meets the next start; then the stage's last ranges.
             t_back_served = false;
             t_back_run = false;
+            if (ring_backend.drop_packets != nullptr) {
+                const u64 left = ring_backend.drop_packets(ring_backend.context, ~u64{0});
+                for (u64 i = 0; i < left; ++i) {
+                    Note(Check::PacketOrphan, "left in ring B when the ring ended");
+                }
+            }
+            if (!lend_ranges.empty() && ring_backend.apply_ranges != nullptr) {
+                ring_backend.apply_ranges(ring_backend.context, lend_ranges.data(),
+                                          lend_ranges.size());
+            }
+            lend_ranges.clear();
+            // Both draw counts start at 0 with the next ring (StageStart, the start above).
+            back_draw_seq = 0;
+            back_run_from = ~u64{0};
             MemStageShadow::SetRingBack(false);
             LOG_INFO(HW_GPU, "Memory stage ring ended at position {:#x}", position);
         }
@@ -1008,6 +1026,14 @@ void MemoryStageLink::RingLoop(std::stop_token& stop, u64 start) {
     t_in_call = false;
     t_stage_user = false;
     stage_busy.store(false, std::memory_order_seq_cst);
+    // The ranges the stage's words collected that no fill applied and no lend handed over: the
+    // back applies their buffer half when it sees the ring end (BackRingTop), before anything
+    // else, as at a lend. (StageStart wipes the stage's list at the next start.)
+    {
+        std::vector<std::pair<u64, std::size_t>>& ranges = MemStageShadow::StageRanges();
+        lend_ranges.insert(lend_ranges.end(), ranges.begin(), ranges.end());
+        ranges.clear();
+    }
     // The back's limit goes back to `published`; it is parked at `position` (or stopping).
     g_ring_active.store(false, std::memory_order_seq_cst);
     ring_running.store(false, std::memory_order_seq_cst);
