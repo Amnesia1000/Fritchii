@@ -31,6 +31,7 @@
 #include "video_core/engines/puller.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
+#include "video_core/memstage_shadow.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_fastdraw_count.h"
 #include "video_core/memory_manager.h"
@@ -983,9 +984,11 @@ static bool ReleaseFencesForReadable(DmaPusher& dma_pusher, const void* owner,
         return result;
     }
     const u64 target = split.UntrackedWriterPosition(*device);
+    // Memory stage tag Cache: the fence manager only; no 3D state.
     split.Defer([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); },
                 VideoCommon::GpuSplit::Effect::Unknown,
-                VideoCommon::Nx2FastDrawCount::Neutral());
+                VideoCommon::Nx2FastDrawCount::Neutral() |
+                    VideoCommon::StageTagBits(VideoCommon::StageTag::Cache));
     split.NoteMemoryWrite();
     const auto begin = Clock::now();
     if (split.WaitUntil(target, VideoCommon::DrainSite::FenceWriters)) {
@@ -1308,14 +1311,17 @@ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
     case Puller::FenceOperation::Acquire:
         // UNIMPLEMENTED_MSG("Channel Scheduling pending.");
         // WaitFence(regs.fence_action.syncpoint_id, regs.fence_value);
+        // Memory stage tag Cache (both closures here): the fence manager (its releases commit
+        // the buffer cache's async flushes); no 3D state.
         OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); },
-               VideoCommon::Nx2FastDrawCount::Neutral());
+               VideoCommon::Nx2FastDrawCount::Neutral() |
+                   VideoCommon::StageTagBits(VideoCommon::StageTag::Cache));
         VideoCommon::GpuSplit::Get().NoteSync();
         break;
     case Puller::FenceOperation::Increment:
         OnBack([rasterizer = dma_pusher.rasterizer, id = static_cast<u32>(regs.fence_action.syncpoint_id.Value())] {
             rasterizer->SignalSyncPoint(id);
-        });
+        }, VideoCommon::StageTagBits(VideoCommon::StageTag::Cache));
         break;
     default:
         UNIMPLEMENTED_MSG("Unimplemented operation {}", regs.fence_action.op.Value());
@@ -1350,9 +1356,11 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         const auto properties = g_nx2_ampere && (regs.semaphore_trigger & (1U << 24)) != 0
                                     ? VideoCommon::QueryPropertiesFlags::IsAFence
                                     : VideoCommon::QueryPropertiesFlags::HasTimeout;
+        // Memory stage tag Cache: the query cache's report (a fence commits the buffer cache's
+        // async flushes); no 3D register, draw state, binding or channel is written.
         OnBack([rasterizer = dma_pusher.rasterizer, sequence_address, properties, payload] {
             rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload, properties, payload, 0);
-        });
+        }, VideoCommon::StageTagBits(VideoCommon::StageTag::Cache));
         if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
             if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(sequence_address)) {
                 split.NoteRelease(*device, sequence_address, payload);
@@ -1722,14 +1730,19 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
     case BufferMethods::WrcacheFlush:
         break;
     case BufferMethods::RefCnt:
-        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->SignalReference(); });
+        // Memory stage tag Cache: the fence manager only; no 3D state.
+        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->SignalReference(); },
+               VideoCommon::StageTagBits(VideoCommon::StageTag::Cache));
         break;
     case BufferMethods::SyncpointOperation:
         ProcessFenceActionMethod(dma_pusher);
         VideoCommon::GpuSplit::Get().NoteMemoryWriter();
         break;
     case BufferMethods::WaitForIdle:
-        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->WaitForIdle(); });
+        // Memory stage tag Cache: a barrier, the query cache's NotifyWFI (which can reach the
+        // buffer cache) and the fence manager; no 3D state.
+        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->WaitForIdle(); },
+               VideoCommon::StageTagBits(VideoCommon::StageTag::Cache));
         VideoCommon::GpuSplit::Get().NoteSync();
         break;
     case BufferMethods::SemaphoreOperation: {

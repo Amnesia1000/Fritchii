@@ -448,9 +448,9 @@ frame dump or a trace only.
 
 ### FRITCHII_MEMSTAGE_THREAD
 
-FRITCHII_MEMSTAGE_THREAD (live, read at a frame end, default 0; the memory stage's step 6, piece
-6a, fable_memstage_step6_spec.md 6.1 and section 5): the buffer cache's two big fills on a thread
-of their own, by hand-off.
+FRITCHII_MEMSTAGE_THREAD (live, read at a frame end, default 0; the memory stage's step 6, pieces
+6a and 6b, fable_memstage_step6_spec.md 6.1, 6.3 and section 5): 1 runs the buffer cache's two big
+fills on a thread of their own by hand-off; 2 lets that thread read the ring itself (below).
 - The thread, "GPUMem", exists while the GPU thread split runs (started and stopped with the
   back) and sleeps at 0. It is not started with FRITCHII_MEMSTAGE_SPLIT_ALLOC=0 (logged).
 - 0: the fills run on the back (EXP123 = 2's early fill, as before).
@@ -478,6 +478,59 @@ of their own, by hand-off.
   hand-off" for its waits. FRITCHII_BACK_READ_AUDIT adds a "Stage read audit" table for GPUMem.
   The hitch line, the stall snapshot and the CPU trace list GPUMem as a thread of its own.
 - Not pinned to a core (spec 5.8, until step 7 measures it).
+- 2: the ring-fed stage, level mode (piece 6b, fable_memstage_step6_spec.md 6.3 and
+  fable_memstage_6b_plan.md 6.2; the code: memory_stage_link.cpp, memstage_shadow.cpp, ring B in
+  vk_mem_stage.cpp). GPUMem reads the ring itself, before the back, with its own cursor
+  ("staged"); the back runs only what GPUMem passed on. GPUMem runs piece 5c's code on every
+  entry (classify, apply, follow) on its own copy of the 3D registers, and that copy is what the
+  fills read:
+  - a draw it serves is filled on GPUMem right where its draw manager issues it (the pipeline's
+    facts come from a table the back fills; constant buffer words are written to game memory by
+    GPUMem, their buffer half applied before the fill), and the packet goes to ring B (4 MiB);
+    the back takes the packet at its draw and plays it, without entering the buffer cache;
+  - everything GPUMem does not implement is a level run: the cache, its flags and the words'
+    ranges are lent to the back, which runs those entries exactly as today, then GPUMem takes the
+    flags back (and a full copy only after a closure it cannot follow). Indirect and list draws,
+    GPU-counted draws, texel buffers, a facts miss, a frame dump or trace, host conditional
+    rendering and constant buffer words onto a watched page make their entry level;
+  - level mode (AHEAD = 0): GPUMem works only while the back is parked (it ran everything passed
+    on and is not in its idle hook), so the two threads still take turns at every draw. Expect fps
+    lower than 0; the point is correctness and what a run costs. Step 7 opens the window.
+  - Needs what 1 needs, plus EXP123 = 3 (values by value: a served draw's texture handles are
+    read by GPUMem at its fill and come in the packet) and EDEN_NX2_EXP53 off (it runs as 1
+    otherwise, logged once); forces FRITCHII_MEMSTAGE_FULL_BINDS on. An exception on GPUMem ends
+    the ring cleanly where the back is parked and THREAD = 2 runs as 1 for the rest of the
+    session (logged, counted).
+  - Ending the ring (2 to 1 or 0, at a frame end) hands the cache's flags and GPUMem's last
+    constant buffer ranges back to the back, and plays whatever is left in ring B. FRITCHII_MEMSTAGE_AHEAD other than 0 is logged and ignored.
+    The constant buffer write modes other than the default (EXP107) make every constant buffer
+    entry level. EXP118 (delta draws) is untested with it.
+  - What the back would do in the buffer cache inside a served entry (a read flush from a
+    texture upload in Configure, its gather, a MustFlushRegion question) runs on GPUMem as a
+    served call while the back waits, counted by cause.
+  - "Memory stage ring" every 10 s (with the link line): entries a second by class (pass, work,
+    level, neutral), runs a second with entries per run and microseconds per run (GPUMem, from the
+    lend to the return; the back, from the lend seen to its next packet), packets a second and
+    their size, the back's waits for the stage (times and ms/s), GPUMem busy and its waits by
+    reason (the front, the back, runs), full copies and flag hand-overs a second, served calls by
+    cause, level draws by kind, and the verify. Piece 5c's lines (runs by first hard kind, full
+    copies by cause, render_enable.mode, ...) keep coming every 10 s, from GPUMem's state.
+  - Must be 0, beside 1's: the back in the buffer cache while not lent (its entry points, by
+    function), InnerInvalidation with ranges on the back while not lent, a packet asked for at a
+    draw the stage sent none for, a packet left unplayed at a run's start, ring B full, the draw
+    counts of both threads differing at a run's end, a packet played whole for a draw the back
+    did not prepare, a packet whose entry is past the back's draw (dropped unplayed, the back
+    fills the draw), a served draw whose texture handles the back read from game memory, and an
+    exception on GPUMem.
+  - FRITCHII_MEMSTAGE_RING_VERIFY=1 (boot): compare b with two threads: GPUMem puts a hash of
+    compare b's words (the narrow set) in each packet and the back hashes its own at the take;
+    differences are counted on the ring line, the first 16 logged. Off for fps runs. The flags
+    15-48 are not in it (in served mode the back's are not the cache's: GPUMem's copy holds them,
+    and they are handed over at each lend and return).
+  - Profile: GPUMem's "stage wait" and "level run" zones; on the back the "split wait" span's
+    phase 3 is its wait for the stage.
+  - The read log (FRITCHII_MEMSTAGE_READ_LOG) and the texture-write check do not cover ring
+    packets yet.
 
 ### FRITCHII_MEMSTAGE_FULL_BINDS
 
@@ -488,7 +541,7 @@ command buffer, so the recorded commands stay the same; repacked bindings are le
 one again runs its conversion). It is what the stage will need instead of the scheduler's
 command buffer flags (step 6b). With EXP123 >= 1 the seam's stats line adds "memory seam full
 vertex bindings": vertex bind runs recorded and dropped as still bound a second. Independent of
-FRITCHII_MEMSTAGE_THREAD.
+FRITCHII_MEMSTAGE_THREAD 0 and 1; THREAD = 2 turns it on by itself.
 
 ### FRITCHII_JIT_DISPATCH_BITS
 

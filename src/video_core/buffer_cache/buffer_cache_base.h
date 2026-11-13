@@ -41,6 +41,7 @@
 #include "video_core/buffer_cache/buffer_base.h"
 #include "video_core/buffer_cache/cache_inputs.h"
 #include "video_core/buffer_cache/download_read_stats.h"
+#include "video_core/memory_stage_link.h"
 #include "video_core/buffer_cache/gpu_written_mirror.h"
 #include "video_core/buffer_cache/read_run_stats.h"
 #include "video_core/buffer_cache/read_trap_tracker.h"
@@ -530,6 +531,7 @@ public:
     /// created or synchronized. Stage 5 is compute.
     template <typename Func>
     void ForEachBoundBuffer(bool compute, Func&& func) {
+        MemoryStageLink::CheckBackCache("ForEachBoundBuffer");
         const auto visit = [&](u32 stage, bool storage, u32 index, bool written,
                                const Binding& binding, u32 size) {
             if (binding.device_addr == 0 || size == 0) {
@@ -598,6 +600,16 @@ public:
     /// FRITCHII_MEMSTAGE_SHADOW=3: the inputs a draw's fill reads instead (null: the engines).
     void SetInputsOverride(const CacheInputs* inputs) noexcept {
         inputs_override = inputs;
+    }
+
+    /// FRITCHII_MEMSTAGE_THREAD=2: the memory stage's copy as the bound channel's inputs.
+    [[nodiscard]] CacheInputs StageInputs(const CacheInputs::Regs& regs_,
+                                          const Tegra::Engines::Maxwell3D::State& state_,
+                                          const Tegra::Engines::Maxwell3D::RootTables& tables_,
+                                          const CacheInputs::DrawManagerState& draw_state_,
+                                          CacheInputs::DirtyFlags& flags_) const noexcept {
+        return CacheInputs::OfStage(maxwell3d, regs_, state_, tables_, draw_state_, flags_,
+                                    kepler_compute, gpu_memory, nullptr);
     }
 
     /// Graphics uniform buffer `index` of `stage` as ForEachBoundBuffer visits it: its device

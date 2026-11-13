@@ -38,6 +38,7 @@
 #include "video_core/game_dlss_status.h"
 #include "video_core/memory_manager.h"
 #include "video_core/memstage_stats.h"
+#include "video_core/memstage_shadow.h"
 #include "video_core/native_query_trace.h"
 #include "video_core/nx2_grid_taint.h"
 #include "video_core/nx2_list_dispatch.h"
@@ -2985,12 +2986,15 @@ bool KeplerCompute::FrontTakeListDispatch(VideoCommon::GpuSplit& split, u32 meth
     grid_marker->Remember(reader);
     // At the list's place in the stream: where its grid is, and a copy of its words for the
     // front to read back (DmaPusher::ReadListWords). Writes no guest memory itself.
+    // Memory stage tag Cache: the compute engine's own list table and the buffer cache's
+    // kept words; no 3D state.
     split.Defer(
         [this, address, keep_id = reader.keep_id] {
             list_dispatches[keep_id % list_dispatches.size()] = {keep_id, address};
             rasterizer->Nx2KeepListWords(keep_id, address, 3);
         },
-        VideoCommon::GpuSplit::Effect::None);
+        VideoCommon::GpuSplit::Effect::None,
+        VideoCommon::StageTagBits(VideoCommon::StageTag::Cache));
     return true;
 }
 

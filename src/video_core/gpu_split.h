@@ -1138,6 +1138,7 @@ public:
 private:
     friend struct GpuSplitTestAccess;
     friend struct MemStageShadowAccess; // memstage_shadow.cpp reads the ring's layout
+    friend struct MemoryStageRingAccess; // memory_stage_link.cpp: the stage's cursors
 
     enum class Kind : u64 {
         Wrap,   ///< The rest of the ring is unused: continue at its start
@@ -1303,6 +1304,7 @@ private:
     }
 
     void BackLoop(std::stop_token stop_token);
+    void BackWaitForStage(std::stop_token& stop_token, u64 read_position);
     /// Runs the entry at `entry` (of the `words` published before the ring's end), returns its size.
     size_t Execute(const u64* entry, size_t words);
 
@@ -1581,6 +1583,10 @@ private:
     // always touched together by both threads, so they share a block.
     alignas(128) std::atomic<u64> published{};
     alignas(128) std::atomic<u64> consumed{};
+    /// FRITCHII_MEMSTAGE_THREAD=2: the stage's read position (the back's limit) and its level run.
+    alignas(128) std::atomic<u64> staged{};
+    std::atomic<u64> lent_from{};
+    std::atomic<u64> lent_until{};
     /// A position the front waits for (WaitFor): the back stores `consumed` once past it.
     alignas(128) std::atomic<u64> wait_target{~u64{0}};
     /// The back's position when it last ran out of work, stored before it waits for more: while

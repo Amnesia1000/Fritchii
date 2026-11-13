@@ -4,8 +4,10 @@
 
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <span>
 #include <utility>
+#include <vector>
 
 #include "common/common_types.h"
 
@@ -140,6 +142,34 @@ void BackCacheInvalidation(bool batch, u64 ranges);
 /// The texture cache's "pages that ever held an image" filter: constant buffer words onto those
 /// pages make their entry level (join 2, spec 3.2). Set by the rasterizer at creation.
 void SetWatchFilter(const PageFilter* filter);
+
+// Piece 6b, FRITCHII_MEMSTAGE_THREAD=2 (memstage_shadow.cpp, memory_stage_link.cpp).
+
+/// Set by the back at a frame end: every draw is level (a diagnostic, host conditional rendering).
+inline std::atomic<bool> g_ring_level_draws{};
+
+struct StageResult {
+    size_t size;
+    u8 cls; ///< pass, work, level, neutral
+    bool hard;
+    u32 packets;
+};
+/// The back: ring mode starts (its hooks off) or ended.
+void SetRingBack(bool on);
+/// GPUMem: the stage's state starts over (every copy taken from the back at its first use).
+void StageStart(s32 channel);
+StageResult StageProcess(u64 position, bool in_run);
+[[nodiscard]] bool StageExtendsRun(u64 position);
+void StageLend();
+/// Returns the full copies it made.
+u64 StageReturn(const void* drew_engine, const void* state_engine, s32 back_channel);
+void StageTick();
+[[nodiscard]] std::vector<std::pair<u64, std::size_t>>& StageRanges();
+/// Sets the stage's draw count to `back_seq`; returns what it was.
+u64 StageDrawSeq(u64 back_seq);
+[[nodiscard]] u64 BackStateHash(const Tegra::Engines::Maxwell3D& maxwell3d);
+[[nodiscard]] u64 BackProgramKey(const Tegra::Engines::Maxwell3D& maxwell3d);
+[[nodiscard]] u64 StageProgramKey(const MemStageShadowEngine& copy);
 
 } // namespace MemStageShadow
 

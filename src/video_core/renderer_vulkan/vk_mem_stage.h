@@ -229,6 +229,29 @@ public:
         LateFill = 1,   ///< Texel buffers: filled where the calls are (as with SEAM = 1)
         Held = 2,       ///< Filled before the texture work, its sections played later
         RestPlayed = 4, ///< Configure did not play every section: PlayRest did
+        PostCopyBarrier = 8, ///< THREAD = 2: the fill uploaded; the back records the barrier
+    };
+
+    /// THREAD = 2: a facts table entry (spec 4.4), copied by value from the pipeline.
+    struct FactsSsbo {
+        u32 cbuf_index;
+        u32 cbuf_offset;
+        u32 indirect_offset;
+        bool is_written;
+    };
+    static constexpr u32 MaxFactsSsbos = 16;
+    struct StagedFacts {
+        std::array<u32, 5> uniform_masks;
+        VideoCommon::UniformBufferSizes uniform_sizes;
+        std::array<std::array<FactsSsbo, MaxFactsSsbos>, 5> ssbos;
+        std::array<u8, 5> ssbo_counts;
+        u32 stages;
+        bool has_texel_buffers;
+        bool uses_descriptor_buffer;
+        bool dynamic_vertex_input;
+        std::array<u64, 2> hashes;
+        /// The programs' infos, for the handle values the stage reads at its fill.
+        std::shared_ptr<const std::array<Shader::Info, 5>> infos;
     };
 
     /// What FillDraw needs from the graphics pipeline (spec 4.2's StageFacts).
@@ -240,6 +263,7 @@ public:
         bool has_texel_buffers;
         bool uses_descriptor_buffer;
         std::array<u64, 2> hashes; ///< Vertex and fragment program, for the logs
+        const StagedFacts* staged{}; ///< THREAD = 2: the storage binds from here
     };
 
     /// What FillDispatch needs from the compute pipeline (spec 4.3's ComputeFacts).
@@ -432,8 +456,32 @@ public:
     void CacheIdleImpl(void (*function)(void*), void* argument);
 
     [[nodiscard]] const DrawPacket* HeldDraw() const noexcept {
-        return held == HeldKind::Draw ? &draw : nullptr;
+        return held == HeldKind::Draw ? (held_ring ? &played_draw : &draw) : nullptr;
     }
+
+    // FRITCHII_MEMSTAGE_THREAD = 2 (vk_mem_stage.cpp, "Ring B").
+    /// GPUMem: FillDraw for a draw the stage serves (after BeginDraw); the packet goes to ring B.
+    /// `pre` runs inside the fill bracket first (the buffer half of the stage's ranges).
+    /// `values`: the draw's raw handles the stage read at its position (SEAM 3), or null.
+    bool FillRingDraw(Cache& cache, const DrawFacts& facts, bool is_indexed, u64 position, u64 seq,
+                      u64 hash, void (*pre)(void*), void* pre_argument,
+                      const std::vector<u32>* values, bool null_pointer_handles);
+    /// The back holds a draw packet from ring B.
+    [[nodiscard]] bool HeldFromRing() const noexcept {
+        return held == HeldKind::Draw && held_ring;
+    }
+    /// GPUMem: room for another packet.
+    [[nodiscard]] bool RingRoom() const noexcept;
+    /// The back: the packet of its draw `seq` (packets of earlier draws are played whole first),
+    /// held as a filled draw is; null when there is none. `hash`: the back's compare b hash.
+    const DrawPacket* TakeRingDraw(u64 seq, u64 back_position, u64 hash, bool verify);
+    /// The back: plays whole the packets of entries before `position`; returns how many.
+    u64 DropRingPackets(u64 position);
+    /// The back: the barrier after a ring packet's uploads (Configure's any_buffer_uploaded).
+    void PlayPostCopyBarrier();
+    /// The back publishes a pipeline's facts under the stage's program key; GPUMem looks them up.
+    void PublishFacts(u64 key, const void* source, const DrawFacts& facts, bool dynamic_input);
+    [[nodiscard]] bool LookupFacts(u64 key, StagedFacts& out) const;
     [[nodiscard]] const DispatchPacket* HeldDispatch() const noexcept {
         return held == HeldKind::Dispatch ? &dispatch : nullptr;
     }
@@ -807,9 +855,63 @@ private:
     u64 last_log_ns{};
     std::array<u64, 2> reported_vertex_runs{};
     bool thread_clamp_logged{};
+    bool ring_clamp_logged{};
+    bool ring_seam_logged{};
+    bool ahead_logged{};
 
     std::atomic<int> seam_level{0};
     bool dispatch_open{};
+
+    // Ring B (THREAD = 2): the stage's draw packets, one writer (GPUMem), one reader (the back).
+    struct RingHeader {
+        u32 bytes;
+        u8 kind;
+        u8 flags;
+        u16 part;
+        u64 position; ///< Ring A position of the entry the packet belongs to
+        u64 number;
+        u64 seq;      ///< The draw's sequence number since the ring started
+        u64 hash;     ///< The stage's compare b hash (FRITCHII_MEMSTAGE_RING_VERIFY), else 0
+        u32 held_cursor;
+        u32 entry_bytes;
+        std::array<u64, 2> hashes;
+        u32 value_count;  ///< Handle values after the entries
+        u32 value_flags;  ///< 1: filled, 2: EXP21's null pointer handles
+    };
+    static constexpr u64 RingBytes = u64{4} << 20;
+    std::unique_ptr<u8[]> ring_b;
+    u64 ring_b_write{};              ///< GPUMem
+    std::atomic<u64> ring_b_sent{};  ///< Bytes GPUMem committed
+    u64 ring_b_read{};               ///< The back
+    std::atomic<u64> ring_b_freed{}; ///< Bytes the back is done with
+    /// The fill in progress goes to ring B (FillRingDraw).
+    bool ring_fill{};
+    bool ring_pushed{};
+    u64 ring_fill_position{};
+    u64 ring_fill_seq{};
+    u64 ring_fill_hash{};
+    void (*ring_pre)(void*){};
+    void* ring_pre_argument{};
+    const std::vector<u32>* ring_values{};
+    bool ring_null_pointers{};
+    /// The held draw came from ring B: its packet is played_draw.
+    bool held_ring{};
+    DrawPacket played_draw{};
+    void PushRingDraw();
+    const RingHeader* PeekRing();
+    void TakeRingHeader(const RingHeader& header);
+    void DiscardRingHeader(const RingHeader& header);
+    [[nodiscard]] u64 RingOldestNumber();
+
+    // The facts table (spec 4.4): open addressing under a lock (written rarely, by the back).
+    struct FactsSlot {
+        u64 key{};
+        const void* source{};
+        StagedFacts facts{};
+    };
+    static constexpr size_t FactsSlots = 4096;
+    std::unique_ptr<FactsSlot[]> facts_table;
+    mutable std::mutex facts_mutex;
     std::vector<u32> draw_values;
     std::vector<u32> dispatch_values;
 

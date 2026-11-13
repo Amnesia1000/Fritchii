@@ -322,6 +322,9 @@ void GpuSplit::Stop() {
     front_macros = false;
     published.store(0, std::memory_order_relaxed);
     consumed.store(0, std::memory_order_relaxed);
+    staged.store(0, std::memory_order_relaxed);
+    lent_from.store(0, std::memory_order_relaxed);
+    lent_until.store(0, std::memory_order_relaxed);
     back_idle_at.store(~u64{0}, std::memory_order_relaxed);
     back_waiting.store(false, std::memory_order_relaxed);
     front_waiting.store(false, std::memory_order_relaxed);
@@ -381,6 +384,8 @@ void GpuSplit::Publish() {
         wake.fetch_add(1, std::memory_order_seq_cst);
         wake.notify_one();
     }
+    // FRITCHII_MEMSTAGE_THREAD=2: the stage is the next reader (spec 1.2).
+    MemoryStageLink::Get().NotePublished();
     if ((++publishes & 1023) == 0) [[unlikely]] {
         ReportBatched();
     }
@@ -1683,6 +1688,43 @@ void GpuSplit::CheckFencesQuiet(u64 position) {
     }
 }
 
+void GpuSplit::BackWaitForStage(std::stop_token& stop_token, u64 read_position) {
+    // FRITCHII_MEMSTAGE_THREAD=2: the "split wait" span's phase 3, waiting for the stage. The
+    // back serves the stage's sync requests meanwhile (memory_stage_link.cpp).
+    MemoryStageLink& link = MemoryStageLink::Get();
+    Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait, Nx2Profile::Enabled(), false};
+    Common::Nx2Timeline::ArgSpan timeline_span{
+        Nx2Profile::zone_names[static_cast<size_t>(Nx2Profile::Zone::SplitWait)], {"phase", 3}};
+    const u64 begin_ns = Common::Nx2Hitch::NowNs();
+    const auto waiting = [&] {
+        return MemoryStageLink::RingActive() &&
+               staged.load(std::memory_order_acquire) == read_position &&
+               published.load(std::memory_order_acquire) != read_position &&
+               !stop_token.stop_requested();
+    };
+    for (u32 spins = 0;;) {
+        if (link.BackServeRequests()) {
+            spins = 0;
+            continue;
+        }
+        if (!waiting()) {
+            break;
+        }
+        if (spins < 8192) {
+            ++spins;
+            Pause();
+            continue;
+        }
+        back_waiting.store(true, std::memory_order_seq_cst);
+        const u32 seen = wake.load(std::memory_order_seq_cst);
+        if (waiting() && !link.BackRequestPending()) {
+            wake.wait(seen, std::memory_order_seq_cst);
+        }
+        back_waiting.store(false, std::memory_order_relaxed);
+    }
+    link.NoteBackWait(Common::Nx2Hitch::NowNs() - begin_ns);
+}
+
 void GpuSplit::BackLoop(std::stop_token stop_token) {
     const Common::DkbCpuTrace::Registration cpu_trace{Common::DkbCpuTrace::Role::GpuBack};
     Common::SetCurrentThreadName("GPUBack");
@@ -1699,12 +1741,36 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     if (MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
         MemStageShadow::Start();
     }
+    // FRITCHII_MEMSTAGE_THREAD=2 (memory_stage_link.cpp): the stage reads the ring before the
+    // back; the back's limit is the stage's `staged`, and each entry is lent or served.
+    MemoryStageLink& link = MemoryStageLink::Get();
     while (!stop_token.stop_requested()) {
         Nx2Profile::Report("GPU back thread");
-        u64 available = published.load(std::memory_order_acquire);
+        // The ring starts and ends here, where everything before read_position is consumed.
+        const bool ring_on = link.BackRingTop(read_position);
+        MemoryStageLink::BackLimits limits =
+            link.BackLoad(published.load(std::memory_order_acquire));
+        const auto limit = [&] {
+            limits = link.BackLoad(published.load(std::memory_order_acquire));
+            return limits.available;
+        };
+        u64 available = limits.available;
         if (available == read_position) {
+            if (ring_on) {
+                // A sync of the stage's fill (Serve): the back is parked at the stage's position.
+                if (link.BackServeRequests()) {
+                    continue;
+                }
+                if (published.load(std::memory_order_acquire) != read_position) {
+                    // Phase 3 of the split wait: the front published, the stage has not passed
+                    // it on yet. No idle hook, no fence quiet check.
+                    BackWaitForStage(stop_token, read_position);
+                    continue;
+                }
+            }
             // On the timeline (not through the zone) with the phase the wait reached: 0 = spin,
-            // 1 = the idle hook ran, 2 = slept on `wake` (tools/nx2/critical_path.py).
+            // 1 = the idle hook ran, 2 = slept on `wake`, 3 = waited for the memory stage
+            // (tools/nx2/critical_path.py).
             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait, Nx2Profile::Enabled(), false};
             Common::Nx2Timeline::ArgSpan timeline_span{
                 Nx2Profile::zone_names[static_cast<size_t>(Nx2Profile::Zone::SplitWait)],
@@ -1730,12 +1796,17 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             };
             // The front usually sends more within microseconds: spin briefly before sleeping.
             for (u32 spins = 0; spins < 8192 && available == read_position &&
-                                !hook_requested.load(std::memory_order_relaxed);
+                                !hook_requested.load(std::memory_order_relaxed) &&
+                                !(ring_on && link.BackRequestPending());
                  ++spins) {
                 Pause();
-                available = published.load(std::memory_order_acquire);
+                available = limit();
             }
-            if (available == read_position && idle_hook != nullptr) {
+            if (ring_on && link.BackRequestPending()) {
+                continue;
+            }
+            // THREAD=2: not while the stage works (BackEnterHook's handshake).
+            if (available == read_position && idle_hook != nullptr && link.BackEnterHook()) {
                 hook_requested.store(false, std::memory_order_seq_cst);
                 ForgetFencesQuiet();
                 timeline_span.Set(0, {"phase", 1});
@@ -1743,20 +1814,24 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 in_idle_wait = true;
                 idle_hook(idle_argument);
                 in_idle_wait = false;
-                available = published.load(std::memory_order_acquire);
+                link.BackLeaveHook();
+                available = limit();
                 if (available == read_position) {
                     CheckFencesQuiet(read_position);
                 }
             }
             if (available == read_position) {
                 // Publish bumps `wake` when it sees back_waiting: read it before the last look
-                // at `published`, so a publish in between ends the wait at once.
+                // at `published`, so a publish in between ends the wait at once. (The stage bumps
+                // it too, for `staged` and for its requests.)
                 back_waiting.store(true, std::memory_order_seq_cst);
                 const u32 seen = wake.load(std::memory_order_seq_cst);
-                available = published.load(std::memory_order_seq_cst);
+                available = limit();
                 // A request made after the hook ran (RequestIdleHook) runs it before sleeping.
                 if (available == read_position && !stop_token.stop_requested() &&
-                    !hook_requested.load(std::memory_order_seq_cst)) {
+                    !hook_requested.load(std::memory_order_seq_cst) &&
+                    MemoryStageLink::RingActive() == ring_on &&
+                    !(ring_on && link.BackRequestPending()) && !link.BackRingStartWanted()) {
                     timeline_span.Set(0, {"phase", 2});
                     wait_phase = 2;
                     wake.wait(seen, std::memory_order_seq_cst);
@@ -1788,14 +1863,32 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 [[unlikely]] {
                 Runahead::ApplyDue(read_position);
             }
-            // FRITCHII_MEMSTAGE_SHADOW: the memory stage's inputs for this entry, compared at
-            // the back's draws (memstage_shadow.cpp). Off: this one test per entry.
-            if (MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
+            // The entries Execute may take with this one (constant buffer words) stop at a level
+            // run's edge, so each entry runs lent or served as a whole.
+            u64 end = available;
+            if (ring_on) [[unlikely]] {
+                link.BackEntry(read_position, limits);
+                if (read_position < limits.lent_from) {
+                    end = (std::min)(end, limits.lent_from);
+                } else if (read_position < limits.lent_until) {
+                    end = (std::min)(end, limits.lent_until);
+                }
+            } else if (MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
+                // FRITCHII_MEMSTAGE_SHADOW: the memory stage's inputs for this entry, compared at
+                // the back's draws (memstage_shadow.cpp). Off: this one test per entry.
                 MemStageShadow::Before(read_position);
             }
             const size_t size =
-                Execute(&ring[index], std::min<u64>(available - read_position, RingWords - index));
+                Execute(&ring[index], std::min<u64>(end - read_position, RingWords - index));
             read_position += size != 0 ? size : RingWords - index;
+            if (ring_on && link.BackAfter(read_position, limits)) [[unlikely]] {
+                // The run's last entry ran (spec 1.5, plan 5.2): no register write still waits in
+                // the sink, then the run's collected ranges; then `consumed` below.
+                if (back_engine != nullptr) {
+                    back_engine->ConsumeSink(*system);
+                }
+                link.BackEndRun();
+            }
             if (hook_requested.load(std::memory_order_relaxed) &&
                 idle_hook != nullptr) [[unlikely]] {
                 hook_requested.store(false, std::memory_order_seq_cst);
@@ -1810,11 +1903,20 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 consumed.store(read_position, std::memory_order_seq_cst);
                 last_store = read_position;
                 NotifyFront();
+                if (ring_on) {
+                    link.NoteConsumed(read_position);
+                }
+            }
+            if (!ring_on && link.BackRingStartWanted()) [[unlikely]] {
+                break; // THREAD=2 starts at the loop top
             }
         }
         CheckFencesQuiet(read_position);
         consumed.store(read_position, std::memory_order_seq_cst);
         NotifyFront();
+        if (ring_on) {
+            link.NoteConsumed(read_position);
+        }
     }
     back_running.store(false, std::memory_order_seq_cst);
     front_wake.fetch_add(1, std::memory_order_seq_cst);

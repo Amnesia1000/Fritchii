@@ -309,6 +309,14 @@ private:
                            const MemStage::TrackerRecord* record);
     /// FRITCHII_MEMSTAGE_SHADOW: the trackers' record against today's query.
     void VerifyTrackerRecord(const MemStage::TrackerRecord* record);
+    // FRITCHII_MEMSTAGE_THREAD = 2 (vk_rasterizer.cpp).
+    void SetRingBackend();
+    bool StageFillDraw(VideoCommon::MemStageShadowEngine& copy, bool is_indexed, u64 position,
+                       u64 seq, u64 hash, std::vector<std::pair<u64, std::size_t>>& ranges);
+    void StageApplyRanges(std::span<const std::pair<DAddr, std::size_t>> ranges, bool bracket);
+    void InnerInvalidationServed(std::span<const std::pair<DAddr, std::size_t>> sequences);
+    template <typename F>
+    void OnStage(u8 cause, F&& body);
     bool TryOcarinaUpscale(const ComputePipeline& pipeline, bool replace);
     void ReadOcarinaActor(struct OcarinaActorMesh& mesh);
     /// Records the uniform and storage buffers of the current draw or dispatch for the frame dump.
@@ -514,6 +522,13 @@ private:
     u32 trace_captures{};
     u32 trace_capture_dropped{};
     u32 trace_failure_details{};
+    /// The vertex repack mask of the draw being prepared (the stage's, from its packet, at
+    /// FRITCHII_MEMSTAGE_THREAD = 2).
+    u32 back_repack_mask{};
+    /// GPUMem's copy of the facts of the draw it fills (the cache keeps a pointer to the sizes).
+    MemStage::StagedFacts stage_facts{};
+    /// GPUMem: the raw handles of the draw it fills (SEAM 3).
+    std::vector<u32> stage_handle_values;
 };
 
 } // namespace Vulkan

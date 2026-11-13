@@ -111,6 +111,8 @@ enum class Zone : u32 {
     MemoryPlay,
     MemoryHandOff,
     MemorySyncWait,
+    StageWait,
+    LevelRun,
     Count,
 };
 
@@ -133,6 +135,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "stage texture buffers", "storage synchronize", "storage written marks",
     "image create", "pool destroy here", "pool destroy idle", "pool destroy backlog",
     "memory fill", "memory play", "memory hand-off", "memory sync wait",
+    "stage wait", "level run",
 };
 static_assert(zone_names.back() != nullptr, "a zone without a name");
 
