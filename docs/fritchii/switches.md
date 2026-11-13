@@ -1640,7 +1640,8 @@ FRITCHII_MEMSTAGE_VERIFY=2's QMD mismatches, the flash-watch route.
 
 ### EXP126
 
-EXP126 (live, 0 = off, the default; fable_qmd_wait_brief piece 2): the ranged ring's overflow
+EXP126 (live, 0 = off, DEFAULT 1 since 2026-11-14: trial 0 differed, market 57.7 -> 58.7 fps;
+fable_qmd_wait_brief piece 2): the ranged ring's overflow
 (below) out of GpuSplit::WriteStamp. With 0 a dropped ranged write counts as a write to every
 address for the write stamps, so with the back more than about 5,000 ring words behind (the
 Castle Town market) every QMD read the front's copy cannot serve waits for the whole backlog

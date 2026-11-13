@@ -196,6 +196,11 @@ void LoadExperiments() {
         // and one upload call per safe 4 KiB piece. Market 0/1 (4 x 30 s): 56.2 -> 58.4 fps, 1% low
         // 38.8 -> 40.0, the back's method zone -11 ms/s; EXP124=2 check: no piece disagreed.
         g_experiments[124].store(1, std::memory_order_relaxed);
+        // EXP126 = 1 (2026-11-14, owner OK): the ranged write ring's overflow no longer makes QMD
+        // reads wait for the whole backlog (ranged writes are stamped, by GPU and device address).
+        // Market trial (=2): ~560 reads compared a window, 0 differed; 0/1: 57.7 -> 58.7 fps, 0.1%
+        // low 30.1 -> 33.9. The front's wait moves to "fence writers" (next target).
+        g_experiments[126].store(1, std::memory_order_relaxed);
         // EXP114 = 2 (2026-11-13): the GPU thread's pending polls wait 2 us with PAUSE instead of
         // yielding. Daytime market, flipped every 20 s: 59.2 -> 59.9 fps, windows 54.8-63.7 ->
         // 59.1-60.4, 1% low 40.0 -> 42.1, back 7.35 -> 7.16 us a draw; the owner felt it steadier.
