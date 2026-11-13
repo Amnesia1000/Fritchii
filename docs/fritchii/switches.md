@@ -763,17 +763,25 @@ Lines, every 5 s:
 - "Fence writer waits (EXP12=N)": as before. At 4, "writer waits" is 0 and "met there" counts
   acquires met at the read without the wait.
 - "Fence writer resumes (EXP12=N)", every mode: writer waits skipped (4) and how many of them
-  had the back short of the target (from the back's stored position, so an upper bound); the
-  fence path acquires resumed from a suspension, per route (latch: the back latched the
+  had the back short of the target (overstates: the back stores its position only every few
+  thousand words of a batch and at its end); the
+  fence path acquires resumed from a suspension, per route (the first answer of the two
+  CanResumeAcquire calls a resume makes; latch: the back latched the
   waiter; word read: a read of the word met it; front answer: a queued release, the QMD
   prediction or the GEQUAL bound; poll drain: met after a poll drained the back), as a
   histogram per second of the time from acquire to resume (under 100 us / 500 us / 1 ms /
   5 ms / longer) with the mean; poll drains of these acquires and their time, split by
-  pending under 2 ms or longer, and those of the other acquires; then per channel: fence path
-  acquires, met there, suspended, resumed by route, and the mean time to resume.
+  pending under 2 ms or longer, and those of the other acquires; at 4, the reduction bounds of
+  resumed acquires checked and not; then per channel: fence path acquires, met there,
+  suspended, resumed by route, and the mean time to resume.
 - At 4 the QMD prediction's "met by" for an acquire suspended there is counted at its resume
-  instead of at once (there would be no "unmet"), without the reduction bound check (the word
-  at the resume may be a later write's): the bound is checked only for acquires met at once.
+  instead of at once (there would be no "unmet"). Its reduction bound is checked there only
+  when a word read met it within 1 ms of the acquire, as 2's read after its wait; by a latch or
+  later the word may already be a later write's. Compare "safety: N checked" in the QMD
+  prediction's reduction bound line between 2 and 4.
+- With EDEN_NX2_GPU_WAKE=0 (the default) a latch does not wake the GPU thread: once nothing
+  moved for 500 us it sleeps 1 ms at a time (EXP6=0), so a latched resume can wait out one
+  sleep. 4 leans on latches for the acquires 2 met after its wait.
 
 Must stay 0 at 4: the 2 s "waits on semaphore" warning. Judge 2 against 4 with a live toggle:
 "fence writers" in the front waits by site to 0, the "acquire" site under 20 ms/s, "from

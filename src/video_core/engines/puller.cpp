@@ -702,7 +702,13 @@ struct FenceWriterStats {
     u64 resumed{};    ///< Readable acquires suspended after their fence release, resumed since
     u64 resume_ns{};  ///< Their time from the acquire to the resume
     u64 skipped{};        ///< EXP12=4: writer waits not made
-    u64 skipped_behind{}; ///< Of them, the back's stored position was short of the target
+    /// Of them, the back's stored position was short of the target. Overstates: the back stores
+    /// its position only every few thousand words of a batch and at its end.
+    u64 skipped_behind{};
+    /// EXP12=4, deferred "met by" with a reduction bound: checked at the resume (a word read
+    /// within 1 ms), or left unchecked.
+    u64 resume_bound_checks{};
+    u64 resume_bound_dropped{};
     /// The resumed ones by route and time from the acquire (Buckets), and their time by route.
     std::array<std::array<u64, Buckets>, Routes> resume_hist{};
     std::array<u64, Routes> route_ns{};
@@ -838,10 +844,12 @@ struct FenceWriterStats {
                  "the target {:.0f}/s); acquire to resume per route, /s under 100 us/500 us/1 "
                  "ms/5 ms/longer: {}; poll drains of these acquires pending under 2 ms {:.0f}/s "
                  "{:.2f} ms/s, 2 ms or more {:.0f}/s {:.2f} ms/s, of other acquires {:.0f}/s "
-                 "{:.2f} ms/s; by channel:{}",
+                 "{:.2f} ms/s; reduction bounds of the resumed (EXP12=4) {:.0f}/s checked, "
+                 "{:.0f}/s not (latch, front answer, drain or after 1 ms); by channel:{}",
                  VideoCore::Nx2Debug::Experiment(12), rate(skipped), rate(skipped_behind), routes,
                  rate(poll_drains[0]), ms(poll_drain_ns[0]), rate(poll_drains[1]),
-                 ms(poll_drain_ns[1]), rate(other_poll_drains), ms(other_poll_drain_ns), rows);
+                 ms(poll_drain_ns[1]), rate(other_poll_drains), ms(other_poll_drain_ns),
+                 rate(resume_bound_checks), rate(resume_bound_dropped), rows);
         *this = {};
         since = now;
     }
@@ -931,8 +939,9 @@ void QmdPredictionMetBy(DmaPusher& dma_pusher, const QmdPredictionCheck& check,
 
 // EXP12=4: the QMD prediction's "met by" of an acquire the fence path suspended without waiting
 // for the writers is noted at its resume (Puller::ResumeAcquire) instead of at once, where
-// nearly all would count as unmet (the writers had not run). Without the reduction bound check:
-// the word at the resume may already be a later write's. Counting only. Front thread only.
+// nearly all would count as unmet (the writers had not run). The reduction bound is checked
+// there only when a read of the word met it within 1 ms of the acquire (ResumeAcquire); later,
+// or by a latch, the word may already be a later write's. Front thread only.
 class DeferredMetBy {
 public:
     static DeferredMetBy& Get() {
@@ -945,9 +954,7 @@ public:
         if (entries.size() >= 64) {
             entries.erase(entries.begin()); // A channel that went away while suspended
         }
-        QmdPredictionCheck kept = check;
-        kept.bound.reset();
-        entries.emplace_back(owner, kept);
+        entries.emplace_back(owner, check);
     }
 
     std::optional<QmdPredictionCheck> Take(const void* owner) {
@@ -1222,9 +1229,13 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     // each waiting acquire about 12 times before it is met, and every poll drained the back
     // (about 380 ms/s of the front's time). The drained path below runs now and then for an
     // unmet word, and reports an acquire not met for 2 s.
-    // `met_by` notes the route for EXP12's resume histogram (FenceWriterStats::NoteResume).
+    // `met_by` notes the route for EXP12's resume histogram (FenceWriterStats::NoteResume). Only
+    // the first: ResumePending asks first, then ResumeAcquire asks again, often answered by the
+    // latch or the word the first answer's drain left behind.
     const auto met_by = [this](FenceResumeRoute route) {
-        pending_acquire->resume_route = static_cast<u8>(route);
+        if (pending_acquire->resume_route == PendingAcquire::RouteUnset) {
+            pending_acquire->resume_route = static_cast<u8>(route);
+        }
         return true;
     };
     if (Nx2SemaphoreWaiters::Get().Latched(this)) {
@@ -1416,6 +1427,10 @@ void NoteAcquireResumed(GPUVAddr address, u32 operation, u32 value, u64 device, 
 
 bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
     if (!CanResumeAcquire(dma_pusher)) {
+        if (pending_acquire) {
+            // ResumePending's answer did not hold: not resumed by it after all.
+            pending_acquire->resume_route = PendingAcquire::RouteUnset;
+        }
         return false;
     }
     // Only a resume from a suspension counts: DmaPusher::Step calls this before every entry, and
@@ -1423,12 +1438,24 @@ bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
     // thrown away for about half of all entries (CommandList::snapshot_suspensions).
     if (pending_acquire) {
         if (pending_acquire->readable_release) {
-            FenceWriterStats::Get().NoteResume(
-                dma_pusher.channel_state.bind_id, pending_acquire->resume_route,
-                FenceWriterStats::Nanoseconds(pending_acquire->since,
-                                              FenceWriterStats::Clock::now()));
+            auto& stats = FenceWriterStats::Get();
+            const u64 ns = FenceWriterStats::Nanoseconds(pending_acquire->since,
+                                                         FenceWriterStats::Clock::now());
+            stats.NoteResume(dma_pusher.channel_state.bind_id, pending_acquire->resume_route, ns);
             // EXP12=4: the QMD prediction's "met by", deferred to here (DeferredMetBy).
-            if (const auto check = DeferredMetBy::Get().Take(this)) {
+            if (auto check = DeferredMetBy::Get().Take(this)) {
+                if (check->bound) {
+                    // The reduction bound only where the word read met it within 1 ms: as 2's
+                    // read after its wait. Later the word may already be a later write's.
+                    if (pending_acquire->resume_route ==
+                            static_cast<u8>(FenceResumeRoute::Word) &&
+                        ns < 1'000'000) {
+                        ++stats.resume_bound_checks;
+                    } else {
+                        ++stats.resume_bound_dropped;
+                        check->bound.reset();
+                    }
+                }
                 QmdPredictionMetBy(dma_pusher, *check, *pending_acquire, true);
             }
         }
