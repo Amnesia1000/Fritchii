@@ -430,6 +430,14 @@ void MemoryStageLink::Serve(Function function, void* argument) {
         const Nx2Profile::Scope zone{Nx2Profile::Zone::MemorySyncWait};
         const StageWaitScope site{"a sync the back serves"};
         for (u32 spin = 0; answered.load(std::memory_order_seq_cst) != seq;) {
+            if (g_ring_active.load(std::memory_order_relaxed) &&
+                !GpuSplit::Get().BackRunning()) [[unlikely]] {
+                // THREAD = 2 at shutdown: the back left its loop; nobody else answers.
+                request_sent = seq - 1;
+                t_stage_user = was_user;
+                function(argument);
+                return;
+            }
             if (spin < LinkSpinPauses) {
                 ++spin;
                 LinkPause();
@@ -437,7 +445,9 @@ void MemoryStageLink::Serve(Function function, void* argument) {
             }
             stage_sleeping.store(true, std::memory_order_seq_cst);
             const u32 word = stage_word.load(std::memory_order_seq_cst);
-            if (answered.load(std::memory_order_seq_cst) != seq) {
+            if (answered.load(std::memory_order_seq_cst) != seq &&
+                (!g_ring_active.load(std::memory_order_relaxed) ||
+                 GpuSplit::Get().BackRunning())) {
                 stage_word.wait(word, std::memory_order_seq_cst);
                 LinkBump(counters.stage_sleeps);
             }

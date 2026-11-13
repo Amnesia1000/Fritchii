@@ -339,6 +339,7 @@ void BufferCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size
 template <class P>
 void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu_data,
                                  bool engine_write) {
+    VideoCommon::MemoryStageLink::CheckBackCache("WriteMemory");
     Nx2NoteListHostWrite(device_addr, size);
     Core::g_buffer_write_pages.Mark(device_addr, size);
     Core::g_watch_write_pages.Mark(device_addr, size);
@@ -659,6 +660,7 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
 
 template <class P>
 void BufferCache<P>::DownloadMemory(DAddr device_addr, u64 size) {
+    VideoCommon::MemoryStageLink::CheckBackCache("DownloadMemory");
     const Common::WriteRing::SiteScope write_site{"buffer download (DownloadMemory)", true};
     if constexpr (USE_MEMORY_MAPS) {
         if (download_cpu_read_ranges) {
@@ -685,6 +687,7 @@ void BufferCache<P>::DownloadMemory(DAddr device_addr, u64 size) {
 
 template <class P>
 void BufferCache<P>::DownloadMemoryForRead(DAddr device_addr, u64 size) {
+    VideoCommon::MemoryStageLink::CheckBackCache("DownloadMemoryForRead");
     const Common::WriteRing::SiteScope write_site{"buffer download (DownloadMemoryForRead)", true};
     if constexpr (IS_OPENGL || !USE_MEMORY_MAPS) {
         DownloadMemory(device_addr, size);
@@ -1347,6 +1350,7 @@ template <class P>
 std::pair<typename P::Buffer*, u32> BufferCache<P>::ObtainBuffer(GPUVAddr gpu_addr, u32 size,
                                                                  ObtainBufferSynchronize sync_info,
                                                                  ObtainBufferOperation post_op) {
+    VideoCommon::MemoryStageLink::CheckBackCache("ObtainBuffer");
     const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
     if (!device_addr) {
         return {&slot_buffers[NULL_BUFFER_ID], 0};
@@ -1408,6 +1412,7 @@ void BufferCache<P>::MarkUsed(DAddr device_addr, u64 size) {
 template <class P>
 void BufferCache<P>::BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr,
                                                u32 size) {
+    VideoCommon::MemoryStageLink::CheckBackCache("BindGraphicsUniformBuffer");
     UniformBindMemo& memo = uniform_bind_memo[stage][index];
     Binding& current = channel_state->uniform_buffers[stage][index];
     // EDEN_NX2_EXP18 & 1: the same GPU range bound again while the mappings and the set of
@@ -1455,6 +1460,7 @@ void BufferCache<P>::BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr
 
 template <class P>
 void BufferCache<P>::DisableGraphicsUniformBuffer(size_t stage, u32 index) {
+    VideoCommon::MemoryStageLink::CheckBackCache("DisableGraphicsUniformBuffer");
     uniform_bind_memo[stage][index].epoch = 0;
     auto& current = channel_state->uniform_buffers[stage][index];
     if (current.device_addr == 0 && current.size == 0 && current.buffer_id == NULL_BUFFER_ID)
@@ -1466,6 +1472,7 @@ void BufferCache<P>::DisableGraphicsUniformBuffer(size_t stage, u32 index) {
 
 template <class P>
 void BufferCache<P>::UpdateGraphicsBuffers(bool is_indexed) {
+    VideoCommon::MemoryStageLink::CheckBackCache("UpdateGraphicsBuffers");
     ++native_bank_draw;
     do {
         channel_state->has_deleted_buffers = false;
@@ -1475,6 +1482,7 @@ void BufferCache<P>::UpdateGraphicsBuffers(bool is_indexed) {
 
 template <class P>
 void BufferCache<P>::UpdateComputeBuffers() {
+    VideoCommon::MemoryStageLink::CheckBackCache("UpdateComputeBuffers");
     do {
         channel_state->has_deleted_buffers = false;
         DoUpdateComputeBuffers();
@@ -1483,6 +1491,7 @@ void BufferCache<P>::UpdateComputeBuffers() {
 
 template <class P>
 void BufferCache<P>::BindHostGeometryBuffers(bool is_indexed) {
+    VideoCommon::MemoryStageLink::CheckBackCache("BindHostGeometryBuffers");
     if (is_indexed) {
         BindHostIndexBuffer();
     } else if constexpr (!HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT) {
@@ -1502,6 +1511,7 @@ void BufferCache<P>::BindHostGeometryBuffers(bool is_indexed) {
 
 template <class P>
 void BufferCache<P>::BindHostStageBuffers(size_t stage) {
+    VideoCommon::MemoryStageLink::CheckBackCache("BindHostStageBuffers");
     {
         const Nx2Profile::FineScope uniform_scope{Nx2Profile::Zone::UniformBuffers};
         BindHostGraphicsUniformBuffers(stage);
@@ -1521,6 +1531,7 @@ void BufferCache<P>::BindHostStageBuffers(size_t stage) {
 
 template <class P>
 void BufferCache<P>::BindHostComputeBuffers() {
+    VideoCommon::MemoryStageLink::CheckBackCache("BindHostComputeBuffers");
     BindHostComputeUniformBuffers();
     if (channel_state->enabled_compute_storage_buffers != 0) {
         BindHostComputeStorageBuffers();
@@ -1537,6 +1548,7 @@ void BufferCache<P>::BindHostComputeBuffers() {
 template <class P>
 void BufferCache<P>::SetUniformBuffersState(const std::array<u32, NUM_STAGES>& mask,
                                             const UniformBufferSizes* sizes) {
+    VideoCommon::MemoryStageLink::CheckBackCache("SetUniformBuffersState");
     if (channel_state->enabled_uniform_buffer_masks == mask &&
         channel_state->uniform_buffer_sizes == sizes) [[likely]] {
         return;
@@ -1980,6 +1992,7 @@ void BufferCache<P>::PopAsyncFlushes() {
 template <class P>
 template <typename Ranges>
 void BufferCache<P>::ClaimCpuWrites(const Ranges& ranges) {
+    VideoCommon::MemoryStageLink::CheckBackCache("ClaimCpuWrites");
     for (const auto& [device_addr, size] : ranges) {
         if (IsRegionGpuModified(device_addr, size)) {
             // The CPU's bytes are in guest memory: read downloads leave the range.
@@ -2139,6 +2152,7 @@ void BufferCache<P>::PopAsyncBuffers() {
 
 template <class P>
 bool BufferCache<P>::IsRegionGpuModified(DAddr addr, size_t size) {
+    VideoCommon::MemoryStageLink::CheckBackCache("IsRegionGpuModified");
     // One lookup instead of visiting every range inside (~4% of the GPU thread for title 1's
     // inline uploads once GPU-written ranges are no longer cleared by downloads).
     return gpu_modified_ranges.Intersects(addr, size);
@@ -2774,6 +2788,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
 
 template <class P>
 void BufferCache<P>::NoteCachedWrites(std::span<const std::pair<DAddr, std::size_t>> sequences) {
+    VideoCommon::MemoryStageLink::CheckBackCache("NoteCachedWrites");
     UniformKeepCount& count = uniform_keep_count;
     if (VideoCore::Nx2Debug::Experiment(91) == 0 && VideoCore::Nx2Debug::Experiment(92) == 0) {
         // Not noted: whatever a keep or count remembers is past the ring now (EXP92 turned on
@@ -5938,12 +5953,14 @@ bool BufferCache<P>::HasFastUniformBufferBound(size_t stage, u32 binding_index) 
 
 template <class P>
 std::pair<typename BufferCache<P>::Buffer*, u32> BufferCache<P>::GetDrawIndirectCount() {
+    VideoCommon::MemoryStageLink::CheckBackCache("GetDrawIndirectCount");
     auto& buffer = slot_buffers[channel_state->count_buffer_binding.buffer_id];
     return std::make_pair(&buffer, buffer.Offset(channel_state->count_buffer_binding.device_addr));
 }
 
 template <class P>
 std::pair<typename BufferCache<P>::Buffer*, u32> BufferCache<P>::GetDrawIndirectBuffer() {
+    VideoCommon::MemoryStageLink::CheckBackCache("GetDrawIndirectBuffer");
     auto& buffer = slot_buffers[channel_state->indirect_buffer_binding.buffer_id];
     return std::make_pair(&buffer,
                           buffer.Offset(channel_state->indirect_buffer_binding.device_addr));

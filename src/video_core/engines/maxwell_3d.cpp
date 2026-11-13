@@ -33,6 +33,7 @@
 #include "video_core/nx2_qmd_prediction.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/memory_manager.h"
+#include "video_core/memory_stage_link.h"
 #include "video_core/memstage_shadow.h"
 #include "video_core/memstage_stats.h"
 #include "video_core/nx2.h"
@@ -1026,6 +1027,11 @@ void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods,
         }
         ProcessDirtyRegisters(methods[i], ProcessShadowRam(methods[i], arguments[i]));
     }
+    if (VideoCommon::MemoryStageLink::BackServed()) [[unlikely]] {
+        // FRITCHII_MEMSTAGE_THREAD=2: the memory stage wrote the words (ProcessCBMultiData).
+        regs.const_buffer.offset += static_cast<u32>(bytes);
+        return;
+    }
     const VideoCommon::Nx2Profile::FineScope upload_scope{VideoCommon::Nx2Profile::Zone::CbUpload};
     const GPUVAddr destination = address + offset;
     // EDEN_NX2_MEMSTAGE_STATS: constant buffer words (the slow paths above count each word in
@@ -1445,6 +1451,9 @@ void Maxwell3D::ProcessCBBind(size_t stage_index) {
     buffer.enabled = bind_data.valid.Value() != 0;
     buffer.address = regs.const_buffer.Address();
     buffer.size = regs.const_buffer.size;
+    if (VideoCommon::MemoryStageLink::BackServed()) [[unlikely]] {
+        return; // FRITCHII_MEMSTAGE_THREAD=2: the memory stage bound it on the buffer cache
+    }
 
     const bool is_enabled = bind_data.valid.Value() != 0;
     if (!is_enabled) {
@@ -1469,6 +1478,12 @@ void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
                             ? regs.const_buffer.size - regs.const_buffer.offset
                             : 0;
     const size_t write_size = std::min(copy_size, room / sizeof(u32) * sizeof(u32));
+    if (VideoCommon::MemoryStageLink::BackServed()) [[unlikely]] {
+        // FRITCHII_MEMSTAGE_THREAD=2: the memory stage wrote the words and collected their range
+        // (the back's half: the offset).
+        regs.const_buffer.offset += static_cast<u32>(copy_size);
+        return;
+    }
     // EDEN_NX2_MEMSTAGE_STATS: constant buffer words, and whether they land on texture pages.
     if (VideoCommon::MemStageStats::Enabled() && write_size != 0) [[unlikely]] {
         VideoCommon::MemStageStats::StreamWrite(

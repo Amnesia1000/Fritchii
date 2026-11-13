@@ -87,6 +87,7 @@
 #include "video_core/fritchii_delta_path.h"
 #include "video_core/fritchii_draw_kinds.h"
 #include "video_core/fritchii_report_runs.h"
+#include "video_core/memory_stage_link.h"
 #include "video_core/memstage_shadow.h"
 #include "video_core/memstage_shadow_engine.h"
 #include "video_core/memstage_stats.h"
@@ -622,6 +623,7 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
             }
         },
         this);
+    SetRingBackend();
     if (split_buffer_allocator) {
         LOG_INFO(Render_Vulkan,
                  "Memory stage split allocators on (FRITCHII_MEMSTAGE_SPLIT_ALLOC=0 turns it off): "
@@ -1005,7 +1007,7 @@ void RasterizerVulkan::FastDrawCountResolved(const GraphicsPipeline* pipeline, b
             topology == Maxwell::PrimitiveTopology::QuadStrip) {
             return Count::Ineligible::Quads;
         }
-        if (buffer_cache_runtime.AnyVertexRepacked()) {
+        if (back_repack_mask != 0) {
             return Count::Ineligible::Repacked;
         }
         if (!scheduler.IsRenderPassActive()) {
@@ -1132,6 +1134,215 @@ void RasterizerVulkan::DeltaPathSnapshot() {
     counter.draw_map_serial = gpu_memory->MapSerial();
 }
 
+// ---------------------------------------------------------------------------------------------
+// FRITCHII_MEMSTAGE_THREAD = 2: the memory stage's ring backend (memory_stage_link.cpp)
+//
+// What GPUMem asks of this side: the fill of a draw it serves (StageFillDraw: the facts table,
+// the stage's copy as the buffer cache's inputs, the repack layout, the buffer half of the ranges
+// its constant buffer words collected, then MemStage's fill into ring B), the cache's channel and
+// uniform binds, its idle work. What the back asks of it: the buffer half of the stage's ranges at
+// a run's start, FlushCaching at a run's end, the packets left at a run's start. And the back's
+// served calls (OnStage): what the back would do in the buffer cache while it runs a served entry
+// (a read flush and its gather, a MustFlushRegion question, collected ranges) runs on GPUMem, the
+// cache's holder, while the back waits; inline everywhere else.
+
+template <typename F>
+void RasterizerVulkan::OnStage(u8 cause, F&& body) {
+    using Link = VideoCommon::MemoryStageLink;
+    if (!Link::BackServed()) {
+        body();
+        return;
+    }
+    // The buffer cache's lock, if the back holds it (EXP118's delta draws), goes with the call.
+    Common::SpinRecursiveMutex* const held =
+        buffer_cache.mutex.IsHeldByCurrentThread() ? &buffer_cache.mutex : nullptr;
+    const std::thread::id back = std::this_thread::get_id();
+    auto run = [&] {
+        if (held != nullptr) {
+            held->HandOver(std::this_thread::get_id());
+        }
+        SCOPE_EXIT {
+            if (held != nullptr) {
+                held->HandOver(back);
+            }
+        };
+        body();
+    };
+    Link::Get().ServeOnStage(static_cast<Link::Served>(cause), run);
+}
+
+void RasterizerVulkan::SetRingBackend() {
+    using Link = VideoCommon::MemoryStageLink;
+    Link::RingBackend backend{};
+    backend.context = this;
+    backend.fill_draw = [](void* context, VideoCommon::MemStageShadowEngine& copy, bool indexed,
+                           u64 position, u64 seq, u64 hash,
+                           std::vector<std::pair<u64, std::size_t>>& ranges) {
+        return static_cast<RasterizerVulkan*>(context)->StageFillDraw(copy, indexed, position, seq,
+                                                                      hash, ranges);
+    };
+    backend.bind_channel = [](void* context, s32 bind_id) {
+        auto* const self = static_cast<RasterizerVulkan*>(context);
+        std::scoped_lock lock{self->buffer_cache.mutex};
+        self->buffer_cache.BindToChannel(bind_id);
+    };
+    backend.bind_uniform = [](void* context, size_t stage, u32 slot, u64 gpu_address, u32 size,
+                              bool enabled) {
+        // As Maxwell3D::ProcessCBBind's calls (unlocked there too: the cache's user alone).
+        auto& cache = static_cast<RasterizerVulkan*>(context)->buffer_cache;
+        if (enabled) {
+            cache.BindGraphicsUniformBuffer(stage, slot, gpu_address, size);
+        } else {
+            cache.DisableGraphicsUniformBuffer(stage, slot);
+        }
+    };
+    backend.apply_ranges = [](void* context, const std::pair<u64, std::size_t>* ranges,
+                              size_t count) {
+        static_cast<RasterizerVulkan*>(context)->StageApplyRanges({ranges, count}, true);
+    };
+    backend.idle = [](void* context) {
+        // The first half of the idle hook's EXP104 work (spec 5.2): the buffer allocator's.
+        auto* const self = static_cast<RasterizerVulkan*>(context);
+        BufferRecycler& buffers = self->buffer_staging_pool.Recycler();
+        if (buffers.HasDoomed()) {
+            buffers.DestroyIdle(2);
+            self->device.PublishBufferHeapBudgets();
+        }
+    };
+    backend.end_run = [](void* context) {
+        auto* const self = static_cast<RasterizerVulkan*>(context);
+        if (self->gpu_memory != nullptr) {
+            self->gpu_memory->FlushCaching();
+        }
+    };
+    backend.drop_packets = [](void* context, u64 position) {
+        return static_cast<RasterizerVulkan*>(context)->mem_stage.DropRingPackets(position);
+    };
+    backend.back_channel = [](void* context) {
+        return static_cast<s32>(static_cast<RasterizerVulkan*>(context)->current_channel_id);
+    };
+    Link::Get().SetRingBackend(backend);
+}
+
+bool RasterizerVulkan::StageFillDraw(VideoCommon::MemStageShadowEngine& copy, bool is_indexed,
+                                     u64 position, u64 seq, u64 hash,
+                                     std::vector<std::pair<u64, std::size_t>>& ranges) {
+    using Link = VideoCommon::MemoryStageLink;
+    Link& link = Link::Get();
+    // Join 1 (spec 4.4): a miss leaves the draw to the back, which publishes the facts.
+    if (!mem_stage.LookupFacts(VideoCommon::MemStageShadow::StageProgramKey(copy), stage_facts)) {
+        link.NoteLevelDraw(4);
+        return false;
+    }
+    if (stage_facts.has_texel_buffers) {
+        link.NoteLevelDraw(2); // LateFill: the texture buffer binds need the texture cache
+        return false;
+    }
+    if (!mem_stage.Packets()) {
+        link.NoteLevelDraw(7);
+        return false;
+    }
+    if (!mem_stage.RingRoom()) {
+        link.NoteLevelDraw(5);
+        return false;
+    }
+    std::scoped_lock lock{buffer_cache.mutex};
+    // The fill reads the stage's copy (plan 5.4), as at FRITCHII_MEMSTAGE_SHADOW=3.
+    const VideoCommon::CacheInputs inputs =
+        buffer_cache.StageInputs(copy.regs, copy.state, copy.root_tables,
+                                 copy.draw_manager.draw_state, copy.dirty.flags);
+    buffer_cache.SetInputsOverride(&inputs);
+    SCOPE_EXIT {
+        buffer_cache.SetInputsOverride(nullptr);
+    };
+    const u32 repack_dirty = buffer_cache_runtime.SetVertexRepackLayout(
+        inputs.RepackLayoutRegs(), stage_facts.dynamic_vertex_input);
+    mem_stage.BeginDraw(buffer_cache_runtime.RepackMask(), repack_dirty);
+    if (repack_dirty) {
+        inputs.MarkVertexBuffersDirty(repack_dirty);
+    }
+    const MemStage::DrawFacts facts{
+        .uniform_masks = &stage_facts.uniform_masks,
+        .uniform_sizes = &stage_facts.uniform_sizes,
+        .stage_infos = nullptr,
+        .stages = stage_facts.stages,
+        .has_texel_buffers = false,
+        .uses_descriptor_buffer = stage_facts.uses_descriptor_buffer,
+        .hashes = stage_facts.hashes,
+        .staged = &stage_facts,
+    };
+    struct Pre {
+        RasterizerVulkan* self;
+        std::vector<std::pair<u64, std::size_t>>* ranges;
+    } pre{this, &ranges};
+    const bool filled = mem_stage.FillRingDraw(
+        buffer_cache, facts, is_indexed, position, seq, hash,
+        [](void* argument) {
+            // The buffer half of the ranges the stage's words collected, before the fill reads.
+            auto* const p = static_cast<Pre*>(argument);
+            p->self->StageApplyRanges(*p->ranges, false);
+            p->ranges->clear();
+        },
+        &pre);
+    if (!filled) {
+        link.NoteLevelDraw(7);
+    }
+    return filled;
+}
+
+void RasterizerVulkan::StageApplyRanges(std::span<const std::pair<DAddr, std::size_t>> ranges,
+                                        bool bracket) {
+    // InnerInvalidation's buffer half (the stage's constant buffer words land on uniform pages
+    // only: words on a watched page are a level entry, join 2).
+    if (ranges.empty()) {
+        return;
+    }
+    std::scoped_lock lock{buffer_cache.mutex};
+    buffer_cache.NoteCachedWrites(ranges);
+    if (Settings::values.skip_cpu_inner_invalidation.GetValue()) {
+        return;
+    }
+    std::optional<MemStage::FillPlay> seam;
+    if (bracket) {
+        seam.emplace(mem_stage, MemStage::Site::Invalidation);
+    }
+    buffer_cache.ClaimCpuWrites(ranges);
+    for (const auto& [addr, size] : ranges) {
+        buffer_cache.WriteMemory(addr, size, true, true);
+    }
+}
+
+void RasterizerVulkan::InnerInvalidationServed(
+    std::span<const std::pair<DAddr, std::size_t>> sequences) {
+    OnStage(static_cast<u8>(VideoCommon::MemoryStageLink::Served::InnerInvalidation),
+            [&] { StageApplyRanges(sequences, true); });
+    if (Settings::values.skip_cpu_inner_invalidation.GetValue()) {
+        return;
+    }
+    const auto any = [&](const VideoCommon::PageFilter& filter) {
+        for (const auto& [addr, size] : sequences) {
+            if (filter.Any(addr, size)) {
+                return true;
+            }
+        }
+        return false;
+    };
+    if (any(texture_cache.page_filter)) {
+        std::scoped_lock lock{texture_cache.mutex};
+        for (const auto& [addr, size] : sequences) {
+            texture_cache.WriteMemory(addr, size);
+        }
+    }
+    if (any(query_cache.page_filter)) {
+        for (const auto& [addr, size] : sequences) {
+            query_cache.InvalidateRegion(addr, size);
+        }
+    }
+    if (any(pipeline_cache.page_filter)) {
+        pipeline_cache.InvalidateRegions(sequences);
+    }
+}
+
 template <typename Func>
 void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_indirect) {
 
@@ -1162,6 +1373,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         ReleaseMeshEmulationBuffers();
     };
     namespace Profile = VideoCommon::Nx2Profile;
+    using Link = VideoCommon::MemoryStageLink;
     if (InvalidateBeforeUse()) {
         gpu.InvalidateGPUCache();
     }
@@ -1169,6 +1381,25 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         Profile::Scope scope{Profile::Zone::FlushWork};
         FlushWork();
         gpu_memory->FlushCaching();
+    }
+    // FRITCHII_MEMSTAGE_THREAD = 2: a draw the stage filled takes its packet from ring B here, and
+    // every return plays it (PlayRest, spec 4.2): the cache believes its uploads are recorded. In
+    // a level run only the draws the stage filled before it found the entry hard have one; the
+    // others the back fills itself, lent. A served draw without one is counted (must be 0) and
+    // filled here (level mode: the stage is parked, so this is safe, only not where it belongs).
+    const bool ring_on = Link::RingActive();
+    const bool served = Link::BackServed();
+    const MemStage::DrawPacket* ring_packet = nullptr;
+    std::optional<MemStage::RestAtEnd> ring_rest;
+    if (ring_on && (served || Link::BackInRun())) [[unlikely]] {
+        const bool verify = Link::RingVerify();
+        ring_packet = mem_stage.TakeRingDraw(
+            Link::Get().BackDrawSeq(),
+            verify ? VideoCommon::MemStageShadow::BackStateHash(*maxwell3d) : 0, verify);
+        ring_rest.emplace(mem_stage);
+        if (ring_packet == nullptr && served) {
+            Link::Note(Link::Check::PacketMissing, "PrepareDraw (the back fills it)");
+        }
     }
     if (frame_dump.Capturing()) {
         frame_dump.DrainIfFull();
@@ -1468,7 +1699,11 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         mesh_emulation_vertices_per_group = pipeline->MeshEmulationVerticesPerGroup();
     }
     if (!buffer_lock.owns_lock()) {
-        std::lock(buffer_lock, texture_lock);
+        if (ring_packet != nullptr && served) {
+            texture_lock.lock(); // spec 5.6: the buffer cache's lock is the stage's
+        } else {
+            std::lock(buffer_lock, texture_lock);
+        }
     }
     // EDEN_NX2_FASTDRAW_COUNT: the original reads the serial the next draw compares with here, once the
     // caches are locked, and checks DeltaStillHolds.
@@ -1491,6 +1726,11 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     }
     // update engine as channel may be different.
     pipeline->SetEngine(maxwell3d, gpu_memory);
+    // THREAD = 2: the facts table (join 1) learns this pipeline's facts under the stage's key.
+    if (ring_on) [[unlikely]] {
+        mem_stage.PublishFacts(VideoCommon::MemStageShadow::BackProgramKey(*maxwell3d), pipeline,
+                               pipeline->MemFacts(), pipeline->HasDynamicVertexInput());
+    }
     // FRITCHII_MEMSTAGE_SHADOW (piece 5c): the cache's flags over the fill (compare b); with 3,
     // the fill below and the repack layout read the stage's copy of the engine (CacheInputs on
     // the copy, plan 5.4) when the shadow can vouch for it, until the draw is recorded.
@@ -1503,7 +1743,8 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             }
         }
     } inputs_override;
-    if (VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
+    if (VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed) &&
+        ring_packet == nullptr) [[unlikely]] {
         if (VideoCommon::MemStageShadowEngine* const copy =
                 VideoCommon::MemStageShadow::BackFill(*maxwell3d, is_indirect)) {
             stage_inputs.emplace(VideoCommon::CacheInputs::OfStage(
@@ -1514,13 +1755,23 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             inputs_override.cache = &buffer_cache;
         }
     }
-    const u32 repack_dirty = buffer_cache_runtime.SetVertexRepackLayout(
-        buffer_cache.Inputs().RepackLayoutRegs(), pipeline->HasDynamicVertexInput());
-    mem_stage.BeginDraw(buffer_cache_runtime.RepackMask(), repack_dirty);
-    if (repack_dirty) {
-        // The cache's flags through its inputs; the vertex input state is the back's own.
-        buffer_cache.Inputs().MarkVertexBuffersDirty(repack_dirty);
-        maxwell3d->dirty.flags[Dirty::VertexInput] = true;
+    if (ring_packet != nullptr) {
+        // THREAD = 2: the stage set the repack layout and the cache's flags in its fill; the
+        // vertex input state is the back's own.
+        back_repack_mask = ring_packet->repack_mask;
+        if (ring_packet->repack_dirty != 0) {
+            maxwell3d->dirty.flags[Dirty::VertexInput] = true;
+        }
+    } else {
+        const u32 repack_dirty = buffer_cache_runtime.SetVertexRepackLayout(
+            buffer_cache.Inputs().RepackLayoutRegs(), pipeline->HasDynamicVertexInput());
+        back_repack_mask = buffer_cache_runtime.RepackMask();
+        mem_stage.BeginDraw(buffer_cache_runtime.RepackMask(), repack_dirty);
+        if (repack_dirty) {
+            // The cache's flags through its inputs; the vertex input state is the back's own.
+            buffer_cache.Inputs().MarkVertexBuffersDirty(repack_dirty);
+            maxwell3d->dirty.flags[Dirty::VertexInput] = true;
+        }
     }
     setup_scope.reset();
     // Delta draws (Fable's port plan step D2): the pipeline keeps this draw as its last while the
@@ -1532,7 +1783,8 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     // Configure plays its sections and RestAtEnd what is left, however Configure ends (true,
     // false or an exception).
     const MemStage::DrawPacket* const packet =
-        mem_stage.FillDraw(buffer_cache, pipeline->MemFacts(), is_indexed);
+        ring_packet != nullptr ? ring_packet
+                               : mem_stage.FillDraw(buffer_cache, pipeline->MemFacts(), is_indexed);
     // The OoT trackers' record (plan 5.1): taken from the packet; without one (SEAM < 2, a late
     // fill, the trackers turned on since the frame began), today's query.
     std::optional<MemStage::TrackerRecord> tracker_record;
@@ -1571,7 +1823,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         }
     }
 
-    if (VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed) &&
+    if (VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed) && !ring_on &&
         OcarinaTemporalEnabled()) [[unlikely]] {
         VerifyTrackerRecord(tracker_record ? &*tracker_record : nullptr);
     }
@@ -3362,9 +3614,13 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType 
         texture_cache.DownloadMemory(addr, size);
     }
     if ((True(which & VideoCommon::CacheType::BufferCache))) {
-        std::scoped_lock lock{buffer_cache.mutex};
-        MemStage::FillPlay seam{mem_stage, MemStage::Site::Download};
-        buffer_cache.DownloadMemory(addr, size);
+        // THREAD = 2: on GPUMem when the back runs a served entry (a read flush inside a served
+        // draw's Configure).
+        OnStage(static_cast<u8>(VideoCommon::MemoryStageLink::Served::FlushRegion), [&] {
+            std::scoped_lock lock{buffer_cache.mutex};
+            MemStage::FillPlay seam{mem_stage, MemStage::Site::Download};
+            buffer_cache.DownloadMemory(addr, size);
+        });
     }
     if ((True(which & VideoCommon::CacheType::QueryCache))) {
         query_cache.FlushRegion(addr, size);
@@ -3385,11 +3641,11 @@ void RasterizerVulkan::FlushRegionForRead(DAddr addr, u64 size) {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.DownloadMemory(addr, size);
     }
-    {
+    OnStage(static_cast<u8>(VideoCommon::MemoryStageLink::Served::FlushRegionForRead), [&] {
         std::scoped_lock lock{buffer_cache.mutex};
         MemStage::FillPlay seam{mem_stage, MemStage::Site::DownloadForRead};
         buffer_cache.DownloadMemoryForRead(addr, size);
-    }
+    });
     query_cache.FlushRegion(addr, size);
 }
 
@@ -3399,8 +3655,12 @@ void RasterizerVulkan::FinishRead(DAddr addr, u64 size) {
 
 bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
     if ((True(which & VideoCommon::CacheType::BufferCache)) && MayBeGpuModified(addr, size)) {
-        std::scoped_lock lock{buffer_cache.mutex};
-        if (buffer_cache.IsRegionGpuModified(addr, size)) {
+        bool modified = false;
+        OnStage(static_cast<u8>(VideoCommon::MemoryStageLink::Served::MustFlush), [&] {
+            std::scoped_lock lock{buffer_cache.mutex};
+            modified = buffer_cache.IsRegionGpuModified(addr, size);
+        });
+        if (modified) {
             return true;
         }
     }
@@ -3903,6 +4163,14 @@ void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::Cache
 }
 
 void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) {
+    if (VideoCommon::MemoryStageLink::BackServed() && !sequences.empty()) [[unlikely]] {
+        // FRITCHII_MEMSTAGE_THREAD = 2 (plan 5.2): collected ranges on the back outside a run.
+        // Must be 0; served on GPUMem all the same.
+        VideoCommon::MemoryStageLink::Note(VideoCommon::MemoryStageLink::Check::BackInvalidation,
+                                           "InnerInvalidation");
+        InnerInvalidationServed(sequences);
+        return;
+    }
     // EXP91 (stage 0, counting) and EXP92 (uniform keeps, tier 1): every cached write range, in
     // the keeps' ring, before any early return.
     buffer_cache.NoteCachedWrites(sequences);
@@ -4060,6 +4328,34 @@ void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64
     if (VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
         VideoCommon::MemStageShadow::BackCacheInvalidation(true, ranges.size());
     }
+    if (VideoCommon::MemoryStageLink::BackServed()) [[unlikely]] {
+        // FRITCHII_MEMSTAGE_THREAD = 2, a gather inside a served entry (a read flush's): the
+        // buffer half on GPUMem (claims first, as below), the other caches' here.
+        OnStage(static_cast<u8>(VideoCommon::MemoryStageLink::Served::Gather), [&] {
+            std::scoped_lock lock{buffer_cache.mutex};
+            MemStage::FillPlay seam{mem_stage, MemStage::Site::Invalidation};
+            buffer_cache.ClaimCpuWrites(ranges);
+            for (const auto& [addr, size] : ranges) {
+                if (addr != 0 && size != 0) {
+                    buffer_cache.WriteMemory(addr, size);
+                }
+            }
+        });
+        for (const auto& [addr, size] : ranges) {
+            if (addr == 0 || size == 0) {
+                continue;
+            }
+            if (VideoCommon::Nx2FastDrawCount::g_on) [[unlikely]] {
+                VideoCommon::Nx2FastDrawCount::NotePoolWrite(addr, size);
+            }
+            {
+                std::scoped_lock lock{texture_cache.mutex};
+                texture_cache.WriteMemory(addr, size);
+            }
+            pipeline_cache.InvalidateRegion(addr, size);
+        }
+        return;
+    }
     namespace CbPath = VideoCommon::Nx2CbPath;
     const int cb_path = CbPath::Mode();
     // EXP88 & 1 (fable52_answer_next70 3.1 step 5): the guest's collected writes take each
@@ -4164,11 +4460,11 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.WriteMemory(addr, size);
     }
-    {
+    OnStage(static_cast<u8>(VideoCommon::MemoryStageLink::Served::Invalidation), [&] {
         std::scoped_lock lock{buffer_cache.mutex};
         MemStage::FillPlay seam{mem_stage, MemStage::Site::Invalidation};
         buffer_cache.WriteMemory(addr, size);
-    }
+    });
     pipeline_cache.InvalidateRegion(addr, size);
 }
 
@@ -4482,7 +4778,7 @@ void RasterizerVulkan::TraceRenderState(bool is_indexed, const char* outcome,
                       "frequency={} repacked={}",
                       binding, stream.Address(), regs.vertex_stream_limits[binding].Address(),
                       stream.stride.Value(), stream.frequency,
-                      buffer_cache_runtime.IsVertexRepacked(static_cast<u32>(binding)));
+                      ((back_repack_mask >> binding) & 1) != 0);
         }
     }
     if (is_indexed) {
@@ -5104,6 +5400,11 @@ void RasterizerVulkan::TickFrame() {
     // The OoT trackers read the draw packet's record (fable_memstage_6b_plan.md 5.1): the fill
     // adds it while they are on (and draws have packets), published here once a frame.
     mem_stage.SetTrackerRecord(mem_stage.Packets() && OcarinaTemporalEnabled());
+    // FRITCHII_MEMSTAGE_THREAD = 2: draws the stage must not fill (a diagnostic reads the bound
+    // buffers on the back; EDEN_NX2_INVALIDATE_BEFORE_DISPATCH gathers before every draw).
+    VideoCommon::MemStageShadow::g_ring_level_draws.store(
+        frame_dump.Capturing() || VideoCommon::RenderTrace::Enabled() || InvalidateBeforeUse(),
+        std::memory_order_relaxed);
     if (VideoCommon::FritchiiDrawKinds::g_on) [[unlikely]] {
         VideoCommon::FritchiiDrawKinds::g_frames.fetch_add(1, std::memory_order_relaxed);
     }
@@ -6508,7 +6809,7 @@ void RasterizerVulkan::UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs) 
             .binding = binding,
             .format = MaxwellToVK::VertexFormat(device, attribute.type, attribute.size),
             .offset = attribute.offset +
-                      (buffer_cache_runtime.IsVertexRepacked(binding) && attribute.offset >= 65 ? 3 : 0),
+                      (((back_repack_mask >> binding) & 1) != 0 && attribute.offset >= 65 ? 3 : 0),
         });
     }
 
@@ -6519,7 +6820,7 @@ void RasterizerVulkan::UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs) 
             .sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT,
             .pNext = nullptr,
             .binding = binding,
-            .stride = buffer_cache_runtime.IsVertexRepacked(binding) ? 72U : input_binding.stride.Value(),
+            .stride = ((back_repack_mask >> binding) & 1) != 0 ? 72U : input_binding.stride.Value(),
             .inputRate = is_instanced ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX,
             .divisor = is_instanced ? input_binding.frequency : 1,
         });
@@ -6609,7 +6910,11 @@ void RasterizerVulkan::BindChannel(Tegra::Control::ChannelState& channel) {
     if (!oot_resolution_checked) [[unlikely]] {
         ApplyOcarinaResolution(program_id); // no disk cache load (it does this first)
     }
-    {
+    if (VideoCommon::MemoryStageLink::BackServed()) {
+        // FRITCHII_MEMSTAGE_THREAD = 2: the stage binds the buffer cache's channel itself.
+        std::scoped_lock lock{texture_cache.mutex};
+        texture_cache.BindToChannel(channel_id);
+    } else {
         std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
         texture_cache.BindToChannel(channel_id);
         buffer_cache.BindToChannel(channel_id);

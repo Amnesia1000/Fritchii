@@ -139,6 +139,22 @@
 // dispatch_values), not in it: the arena is played as an entry stream. packet.handle_values spans
 // them.
 //
+// Ring B and the facts table (FRITCHII_MEMSTAGE_THREAD = 2, piece 6b; memory_stage_link.cpp has the
+// loop). The stage fills the draws it serves on GPUMem (FillRingDraw: the same FillDrawHere, from
+// the facts table instead of the pipeline) and the packet goes to ring B instead of the held arena:
+// a 4 MiB byte ring, one writer, one reader, packets never wrapped (a pad header at the end), each
+// a RingHeader (position, number, the draw's sequence number, the verify hash, the entries a sync
+// played already), the DrawPacket and the arena's bytes. That is the split of MemStage (spec 5.5):
+// the fill side (arena, the packet being built, ring B's writer) is GPUMem's; the play side (ring
+// B's reader, the held arena, played_draw, the player) the back's. The back takes the packet of
+// its draw by sequence number (TakeRingDraw: every draw on both threads counts, so the numbers
+// match; packets of earlier draws the back never prepared are played whole first) into the held
+// arena, and from there plays it exactly as a held packet (PlayHeld, PlayRest). The read log and
+// the texture write check stay off for ring packets (they compare one fill with its own play on
+// one thread). The facts table: the back publishes each pipeline's facts (by value) under the
+// stage's program key at every draw it prepares; GPUMem copies an entry out under its sequence
+// word. A miss makes the draw level (the back prepares it, and publishes).
+//
 // FRITCHII_MEMSTAGE_VERIFY (boot, bit flags; spec 5.4; not 2b's FRITCHII_MEMSTAGE_READ_LOG): with
 // SEAM = 3 the back also makes its own read and compares it with the packet's value: 1 handle
 // values, 2 the QMD, 4 null pointer slots.
@@ -552,7 +568,9 @@ MemStage::SyncScope::~SyncScope() {
 // MemStage
 
 MemStage::MemStage(MemPlayer& player_)
-    : player{player_}, arena{256 * 1024}, held_arena{256 * 1024} {
+    : player{player_}, arena{256 * 1024}, held_arena{256 * 1024},
+      ring_b{std::make_unique_for_overwrite<u8[]>(RingBytes)},
+      facts_table{std::make_unique<FactsSlot[]>(FactsSlots)} {
     player.stage = this;
     if (const char* const value = std::getenv("FRITCHII_MEMSTAGE_READ_LOG")) {
         read_log_every = (std::max)(0, std::atoi(value));
@@ -726,8 +744,11 @@ void MemStage::EnterSync(Sync kind) {
 }
 
 void MemStage::BeginDraw(u32 repack_mask, u32 repack_dirty) {
-    // A held packet ends at its Configure's RestAtEnd; this is only a safety net.
-    PlayRest();
+    // A held packet ends at its Configure's RestAtEnd; this is only a safety net. (On GPUMem,
+    // THREAD = 2, the held packet is the back's.)
+    if (!Link::OnStageThread()) {
+        PlayRest();
+    }
     Bump(counters.draws);
     RetireDrawValues();
     draw = DrawPacket{};
@@ -967,7 +988,9 @@ bool MemStage::ClaimHeld() {
         // Inside another fill or a play: not a draw site. Fill where the calls are.
         return false;
     }
-    PlayRest();
+    if (!Link::OnStageThread()) {
+        PlayRest();
+    }
     const uintptr_t me = ThisThread();
     uintptr_t expected = 0;
     if (owner.load(std::memory_order_relaxed) != me &&
@@ -995,6 +1018,10 @@ bool MemStage::ClaimHeld() {
 // and PlayPending's set and clear.
 void MemStage::UpdateUnplayed() {
     u64 from = held != HeldKind::None || filling_held ? held_from : 0;
+    // THREAD = 2: the packets in ring B are not played yet either.
+    if (const u64 oldest = RingOldestNumber(); oldest != 0 && (from == 0 || oldest < from)) {
+        from = oldest;
+    }
     if (pending && (from == 0 || pending_from < from)) {
         from = pending_from;
     }
@@ -1039,7 +1066,7 @@ void MemStage::EndHeldFill() {
     filling_held = false;
     fill_form = -1;
     t_reads = nullptr;
-    if (held != HeldKind::None) {
+    if (held != HeldKind::None || std::exchange(ring_pushed, false)) {
         return;
     }
     // The fill threw before TakeHeld: nothing is held. Its entries stay pending and the next
@@ -1082,24 +1109,40 @@ const MemStage::DrawPacket* MemStage::FillDrawHere(Cache& cache_, const DrawFact
     held_flush_seen = false;
     t_holding = true;
     held_reads.clear();
-    t_reads = &held_reads;
+    // THREAD = 2: no texture write check and no read log for ring packets (Ring B above).
+    t_reads = ring_fill ? nullptr : &held_reads;
     const HeldFillEnd fill_end{*this};
     if (ticks) {
         held_from = draw.number;
         UpdateUnplayed();
     }
-    const bool logging = read_log_every > 0 && StartReadLog(held_log, draw.number);
+    const bool logging =
+        read_log_every > 0 && !ring_fill && StartReadLog(held_log, draw.number);
     {
         // Today's calls in today's relative order (ConfigureImpl): the uniform state, per stage
         // the storage binds, the texture buffer unbinds, then the geometry and each stage's
         // buffers, each in its own section.
         Fill whole{*this, Site::Draw};
+        if (ring_fill && ring_pre != nullptr) {
+            // THREAD = 2: the buffer half of the stage's collected ranges, where FlushCaching is
+            // today (the top of PrepareDraw); what it pushes is played with the packet.
+            ring_pre(ring_pre_argument);
+        }
         cache_.SetUniformBuffersState(*facts.uniform_masks, facts.uniform_sizes);
         for (u32 stage = 0; stage < 5; ++stage) {
             if ((facts.stages & (1U << stage)) == 0) {
                 continue;
             }
             cache_.UnbindGraphicsStorageBuffers(stage);
+            if (facts.staged != nullptr) {
+                const StagedFacts& staged = *facts.staged;
+                for (u32 i = 0; i < staged.ssbo_counts[stage]; ++i) {
+                    const FactsSsbo& desc = staged.ssbos[stage][i];
+                    cache_.BindGraphicsStorageBuffer(stage, i, desc.cbuf_index, desc.cbuf_offset,
+                                                     desc.is_written, desc.indirect_offset);
+                }
+                continue;
+            }
             size_t ssbo_index = 0;
             for (const auto& desc : facts.stage_infos[stage].storage_buffers_descriptors) {
                 ASSERT(desc.count == 1);
@@ -1134,11 +1177,19 @@ const MemStage::DrawPacket* MemStage::FillDrawHere(Cache& cache_, const DrawFact
         if (logging) {
             StopReadLog(held_log, true);
         }
-        TakeHeld(HeldKind::Draw);
+        if (ring_fill) {
+            // The trackers' record goes in the packet: taken before the push.
+            if (tracker_record.load(std::memory_order_relaxed)) [[unlikely]] {
+                FillTrackerRecord(cache_, draw.trackers);
+            }
+            PushRingDraw();
+        } else {
+            TakeHeld(HeldKind::Draw);
+        }
     }
     // The OoT trackers' record (fable_memstage_6b_plan.md 5.1): the bindings and GPU-modified
     // marks they ask the cache for after the fill, taken here, where the fill ends.
-    if (tracker_record.load(std::memory_order_relaxed)) [[unlikely]] {
+    if (!ring_fill && tracker_record.load(std::memory_order_relaxed)) [[unlikely]] {
         FillTrackerRecord(cache_, draw.trackers);
     }
     if (timed) {
@@ -1248,7 +1299,7 @@ const MemStage::DispatchPacket* MemStage::FillDispatchHere(Cache& cache_,
 // publishes its heap budgets (spec 5.3).
 
 bool MemStage::HandsOff() const noexcept {
-    return Link::Get().Mode() != 0 && seam_value.load(std::memory_order_relaxed) >= 2 &&
+    return Link::Get().Mode() == 1 && seam_value.load(std::memory_order_relaxed) >= 2 &&
            t_fill_depth == 0 && t_play_depth == 0 && !Link::OnStageThread();
 }
 
@@ -1328,6 +1379,294 @@ const MemStage::DispatchPacket* MemStage::FillDispatch(Cache& cache_,
     return packet;
 }
 
+// ---------------------------------------------------------------------------------------------
+// FRITCHII_MEMSTAGE_THREAD = 2: ring B and the facts table ("Ring B" in the header comment)
+
+bool MemStage::FillRingDraw(Cache& cache_, const DrawFacts& facts, bool is_indexed, u64 position,
+                            u64 seq, u64 hash, void (*pre)(void*), void* pre_argument) {
+    ring_fill = true;
+    ring_pushed = false;
+    ring_fill_position = position;
+    ring_fill_seq = seq;
+    ring_fill_hash = hash;
+    ring_pre = pre;
+    ring_pre_argument = pre_argument;
+    // The cache's lock, held by GPUMem, goes to the back with each sync it serves (OnBackImpl).
+    lent_mutex = cache_.mutex.IsHeldByCurrentThread() ? &cache_.mutex : nullptr;
+    SCOPE_EXIT {
+        ring_fill = false;
+        ring_pre = nullptr;
+        ring_pre_argument = nullptr;
+        lent_mutex = nullptr;
+    };
+    const DrawPacket* const packet = FillDrawHere(cache_, facts, is_indexed);
+    return packet != nullptr && std::exchange(ring_pushed, false);
+}
+
+bool MemStage::RingRoom() const noexcept {
+    // A draw's packet is a few KiB; the back plays every packet before the stage fills again
+    // (level mode), so this margin is never short in play.
+    constexpr u64 Margin = u64{1} << 20;
+    return RingBytes - (ring_b_write - ring_b_freed.load(std::memory_order_acquire)) >= Margin;
+}
+
+void MemStage::PushRingDraw() {
+    const u32 entries = arena.Size();
+    const u64 bytes = Align8(static_cast<u32>(sizeof(RingHeader) + sizeof(DrawPacket) + entries));
+    u64 index = ring_b_write % RingBytes;
+    if (index + bytes > RingBytes) {
+        // Packets never wrap: a pad to the end (no header when fewer bytes than one are left).
+        if (RingBytes - index >= sizeof(RingHeader)) {
+            RingHeader pad{};
+            pad.bytes = static_cast<u32>(RingBytes - index);
+            pad.kind = 0;
+            std::memcpy(ring_b.get() + index, &pad, sizeof(pad));
+        }
+        ring_b_write += RingBytes - index;
+        index = 0;
+    }
+    if (ring_b_write + bytes - ring_b_freed.load(std::memory_order_acquire) > RingBytes)
+        [[unlikely]] {
+        // RingRoom's margin makes this impossible below 1 MiB a packet.
+        Link::Note(Link::Check::RingFull, "a draw packet past ring B's room");
+    }
+    RingHeader header{};
+    header.bytes = static_cast<u32>(bytes);
+    header.kind = 1;
+    header.flags = held_form ? 1 : 0;
+    header.part = 0;
+    header.position = ring_fill_position;
+    header.number = draw.number;
+    header.seq = ring_fill_seq;
+    header.hash = ring_fill_hash;
+    header.held_cursor = play_cursor;
+    header.entry_bytes = entries;
+    header.hashes = held_hashes;
+    u8* const out = ring_b.get() + index;
+    std::memcpy(out, &header, sizeof(header));
+    std::memcpy(out + sizeof(header), &draw, sizeof(DrawPacket));
+    if (entries != 0) {
+        std::memcpy(out + sizeof(header) + sizeof(DrawPacket), arena.At(0), entries);
+    }
+    ring_b_write += bytes;
+    ring_b_sent.store(ring_b_write, std::memory_order_release);
+    Link::Get().NotePacketSent(bytes);
+    // As TakeHeld: the arena is done with; the next fill starts on an empty one.
+    arena.Reset();
+    play_cursor = 0;
+    last_entry = ~0U;
+    if (pending) {
+        pending = false;
+        SeamHook::g_watch.fetch_sub(1, std::memory_order_relaxed);
+    }
+    ring_pushed = true;
+    t_holding = false;
+    if (ticks) {
+        UpdateUnplayed();
+    }
+}
+
+const MemStage::RingHeader* MemStage::PeekRing() {
+    for (;;) {
+        const u64 sent = ring_b_sent.load(std::memory_order_acquire);
+        if (ring_b_read == sent) {
+            return nullptr;
+        }
+        const u64 index = ring_b_read % RingBytes;
+        if (RingBytes - index < sizeof(RingHeader)) {
+            ring_b_read += RingBytes - index;
+            ring_b_freed.store(ring_b_read, std::memory_order_release);
+            continue;
+        }
+        const auto* const header = reinterpret_cast<const RingHeader*>(ring_b.get() + index);
+        if (header->kind == 0) {
+            ring_b_read += header->bytes;
+            ring_b_freed.store(ring_b_read, std::memory_order_release);
+            continue;
+        }
+        return header;
+    }
+}
+
+u64 MemStage::RingOldestNumber() {
+    u64 read = ring_b_read;
+    const u64 sent = ring_b_sent.load(std::memory_order_acquire);
+    while (read != sent) {
+        const u64 index = read % RingBytes;
+        if (RingBytes - index < sizeof(RingHeader)) {
+            read += RingBytes - index;
+            continue;
+        }
+        const auto* const header = reinterpret_cast<const RingHeader*>(ring_b.get() + index);
+        if (header->kind == 0) {
+            read += header->bytes;
+            continue;
+        }
+        return header->number;
+    }
+    return 0;
+}
+
+void MemStage::TakeRingHeader(const RingHeader& header) {
+    // The back holds the packet as a held one: PlayHeld and PlayRest play it as today.
+    PlayRest();
+    const u8* const data = reinterpret_cast<const u8*>(&header);
+    held_arena.Reset();
+    if (header.entry_bytes != 0) {
+        const u32 at = held_arena.Reserve(header.entry_bytes);
+        std::memcpy(held_arena.At(at), data + sizeof(RingHeader) + sizeof(DrawPacket),
+                    header.entry_bytes);
+    }
+    std::memcpy(&played_draw, data + sizeof(RingHeader), sizeof(DrawPacket));
+    held_cursor = header.held_cursor;
+    held_form = (header.flags & 1) != 0;
+    held_hashes = header.hashes;
+    const u64 number = header.number;
+    ring_b_read += header.bytes;
+    ring_b_freed.store(ring_b_read, std::memory_order_release);
+    held = HeldKind::Draw;
+    held_ring = true;
+    held_reads.clear();
+    held_log_pending = false;
+    t_holding = true;
+    VideoCommon::MemReadLog::g_held.store(true, std::memory_order_relaxed);
+    SeamHook::g_watch.fetch_add(1, std::memory_order_relaxed);
+    if (ticks) {
+        held_from = number;
+        UpdateUnplayed();
+    }
+}
+
+const MemStage::DrawPacket* MemStage::TakeRingDraw(u64 seq, u64 hash, bool verify) {
+    for (;;) {
+        const RingHeader* const header = PeekRing();
+        if (header == nullptr || header->seq > seq) {
+            return nullptr;
+        }
+        if (header->seq < seq) {
+            // A draw the back never prepared (its Draw returned before PrepareDraw): the packet
+            // is played whole, so the uploads the cache counts on are recorded.
+            TakeRingHeader(*header);
+            PlayRest();
+            continue;
+        }
+        const u64 stage_hash = header->hash;
+        const u64 position = header->position;
+        TakeRingHeader(*header);
+        if (verify && stage_hash != 0) {
+            Link::Get().NoteHash(stage_hash == hash);
+            if (stage_hash != hash) {
+                static std::atomic<u32> logged{};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                    LOG_WARNING(Render_Vulkan,
+                                "Memory stage ring verify (compare b, two threads): draw {} of "
+                                "entry {:#x}: the stage's state hash {:#x}, the back's {:#x}",
+                                seq, position, stage_hash, hash);
+                }
+            }
+        }
+        Link::Get().NotePacketTaken();
+        return &played_draw;
+    }
+}
+
+u64 MemStage::DropRingPackets(u64 position) {
+    u64 dropped = 0;
+    for (const RingHeader* header = PeekRing(); header != nullptr && header->position < position;
+         header = PeekRing()) {
+        TakeRingHeader(*header);
+        PlayRest();
+        ++dropped;
+    }
+    return dropped;
+}
+
+void MemStage::PublishFacts(u64 key, const void* source, const DrawFacts& facts,
+                            bool dynamic_input) {
+    key = key != 0 ? key : 1;
+    constexpr size_t Mask = FactsSlots - 1;
+    const size_t home = static_cast<size_t>((key * 0x9e3779b97f4a7c15ULL) >> 52) & Mask;
+    FactsSlot* target = &facts_table[home];
+    for (size_t probe = 0, index = home; probe < 16; ++probe, index = (index + 1) & Mask) {
+        FactsSlot& slot = facts_table[index];
+        if (slot.key == key) {
+            if (slot.source == source) {
+                return; // published already
+            }
+            target = &slot;
+            break;
+        }
+        if (slot.key == 0) {
+            target = &slot;
+            break;
+        }
+    }
+    StagedFacts staged{};
+    staged.uniform_masks = *facts.uniform_masks;
+    staged.uniform_sizes = *facts.uniform_sizes;
+    for (u32 stage = 0; stage < 5; ++stage) {
+        if ((facts.stages & (1U << stage)) == 0 || facts.stage_infos == nullptr) {
+            continue;
+        }
+        u8 count = 0;
+        for (const auto& desc : facts.stage_infos[stage].storage_buffers_descriptors) {
+            if (desc.count != 1 || count >= MaxFactsSsbos) {
+                return; // not by value: the stage misses and the draw stays level
+            }
+            staged.ssbos[stage][count++] = FactsSsbo{
+                .cbuf_index = desc.cbuf_index,
+                .cbuf_offset = desc.cbuf_offset,
+                .indirect_offset = desc.indirect_offset,
+                .is_written = desc.is_written,
+            };
+        }
+        staged.ssbo_counts[stage] = count;
+    }
+    staged.stages = facts.stages;
+    staged.has_texel_buffers = facts.has_texel_buffers;
+    staged.uses_descriptor_buffer = facts.uses_descriptor_buffer;
+    staged.dynamic_vertex_input = dynamic_input;
+    staged.hashes = facts.hashes;
+    const u64 sequence = target->sequence.load(std::memory_order_relaxed);
+    target->sequence.store(sequence + 1, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    target->key = key;
+    target->source = source;
+    target->facts = staged;
+    target->sequence.store(sequence + 2, std::memory_order_release);
+}
+
+bool MemStage::LookupFacts(u64 key, StagedFacts& out) const {
+    key = key != 0 ? key : 1;
+    constexpr size_t Mask = FactsSlots - 1;
+    const size_t home = static_cast<size_t>((key * 0x9e3779b97f4a7c15ULL) >> 52) & Mask;
+    for (size_t probe = 0, index = home; probe < 16; ++probe, index = (index + 1) & Mask) {
+        const FactsSlot& slot = facts_table[index];
+        for (u32 tries = 0; tries < 64; ++tries) {
+            const u64 before = slot.sequence.load(std::memory_order_acquire);
+            if ((before & 1) != 0) {
+                continue;
+            }
+            const u64 slot_key = slot.key;
+            if (slot_key == key) {
+                out = slot.facts;
+            }
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (slot.sequence.load(std::memory_order_relaxed) != before) {
+                continue;
+            }
+            if (slot_key == key) {
+                return true;
+            }
+            if (slot_key == 0) {
+                return false;
+            }
+            break;
+        }
+    }
+    return false;
+}
+
 void MemStage::OnBackImpl(void (*function)(void*), void* argument) {
     if (!Link::InCall()) {
         function(argument);
@@ -1380,6 +1719,11 @@ void MemStage::OnBackImpl(void (*function)(void*), void* argument) {
 }
 
 void MemStage::CacheIdleImpl(void (*function)(void*), void* argument) {
+    if (Link::RingActive()) {
+        // THREAD = 2: GPUMem runs the cache's idle work itself, while the back is parked
+        // (the ring backend's idle).
+        return;
+    }
     auto run = [&] {
         function(argument);
         player.device.PublishBufferHeapBudgets();
@@ -1393,7 +1737,8 @@ void MemStage::CheckHeld() {
         held_log_pending = false;
         const bool is_draw = held == HeldKind::Draw;
         CompareReads(held_log, is_draw ? "draw" : "dispatch",
-                     is_draw ? draw.number : dispatch.number, held_hashes[0], held_hashes[1]);
+                     is_draw ? (held_ring ? played_draw.number : draw.number) : dispatch.number,
+                     held_hashes[0], held_hashes[1]);
     }
 }
 
@@ -1416,7 +1761,8 @@ void MemStage::PlayHeldTo(u32 end, bool rest) {
     if (rest) {
         // Configure returned before playing every section (false, or a path without the play).
         Bump(counters.rest_plays);
-        (held == HeldKind::Draw ? draw.flags : dispatch.flags) |= RestPlayed;
+        (held == HeldKind::Draw ? (held_ring ? played_draw.flags : draw.flags) : dispatch.flags) |=
+            RestPlayed;
     }
     PlayDepth depth;
     while (held_cursor < stop) {
@@ -1448,6 +1794,7 @@ void MemStage::PlayRest() {
     }
     PlayHeldTo(held_arena.Size(), true);
     held = HeldKind::None;
+    held_ring = false;
     t_holding = false;
     VideoCommon::MemReadLog::g_held.store(false, std::memory_order_relaxed);
     held_reads.clear();
@@ -2039,23 +2386,46 @@ void MemStage::TickFrame() {
 // FRITCHII_MEMSTAGE_FULL_BINDS (live). THREAD = 1 needs the early fill (SEAM >= 2, which needs
 // packet ticks) and the buffer cache's own allocator (FRITCHII_MEMSTAGE_SPLIT_ALLOC); without them
 // it runs as 0, logged once. The link refuses too when GPUMem does not run (no GPU thread split).
+// THREAD = 2 (piece 6b) needs the same, and EXP53 off (with it every conditional block is a level
+// entry the registers do not decide); without it, it runs as 1, logged once. It forces full vertex
+// binds (plan 4.2: the flags the state tracker raises on the back are dropped at each lend).
+// FRITCHII_MEMSTAGE_AHEAD (boot) is step 7's window: 6b runs 0 (level mode) and says so.
 void MemStage::TickThread(int seam) {
     namespace Debug = VideoCore::Nx2Debug;
     const int wanted = Debug::SwitchValue(Debug::g_memstage_thread, "FRITCHII_MEMSTAGE_THREAD");
-    u32 mode = wanted > 0 ? 1U : 0U;
-    if (mode != 0 && (seam < 2 || !player.device.HasSplitAllocators())) {
+    u32 mode = wanted >= 2 ? 2U : wanted > 0 ? 1U : 0U;
+    if (mode != 0 && (seam < 2 || !ticks || !player.device.HasSplitAllocators())) {
         if (!thread_clamp_logged) {
             thread_clamp_logged = true;
             LOG_WARNING(Render_Vulkan, "FRITCHII_MEMSTAGE_THREAD={} needs {}; running 0", wanted,
-                        seam < 2 ? "EXP123 >= 2 (with FRITCHII_MEMSTAGE_TICKS >= 1)"
-                                 : "the buffer cache's own allocator (FRITCHII_MEMSTAGE_SPLIT_ALLOC)");
+                        seam < 2 || !ticks
+                            ? "EXP123 >= 2 (with FRITCHII_MEMSTAGE_TICKS >= 1)"
+                            : "the buffer cache's own allocator (FRITCHII_MEMSTAGE_SPLIT_ALLOC)");
         }
         mode = 0;
+    }
+    if (mode == 2 && Debug::Experiment(53) != 0) {
+        if (!ring_clamp_logged) {
+            ring_clamp_logged = true;
+            LOG_WARNING(Render_Vulkan, "FRITCHII_MEMSTAGE_THREAD=2 needs EDEN_NX2_EXP53 off "
+                                       "(conditional rendering decided on the front); running 1");
+        }
+        mode = 1;
+    }
+    if (mode == 2 && !ahead_logged) {
+        ahead_logged = true;
+        if (const char* const ahead = std::getenv("FRITCHII_MEMSTAGE_AHEAD");
+            ahead != nullptr && std::atoi(ahead) != 0) {
+            LOG_WARNING(Render_Vulkan, "FRITCHII_MEMSTAGE_AHEAD={}: the window is step 7; the "
+                                       "ring-fed stage runs level mode (AHEAD=0)",
+                        ahead);
+        }
     }
     Link& link = Link::Get();
     link.SetMode(mode);
     const bool full =
-        Debug::SwitchValue(Debug::g_memstage_full_binds, "FRITCHII_MEMSTAGE_FULL_BINDS") > 0;
+        Debug::SwitchValue(Debug::g_memstage_full_binds, "FRITCHII_MEMSTAGE_FULL_BINDS") > 0 ||
+        link.Mode() == 2;
     if (full != Link::FullVertexBinds()) {
         Link::SetFullVertexBinds(full);
         LOG_INFO(Render_Vulkan, "Memory seam full vertex bindings (FRITCHII_MEMSTAGE_FULL_BINDS={}): {}",
