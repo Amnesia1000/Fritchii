@@ -148,6 +148,22 @@ public:
         VkBuffer buffer;
         u32 offset;
     };
+    /// The OoT temporal trackers' uniform slots in a draw packet (fable_memstage_6b_plan.md 5.1):
+    /// vertex stage slots 3, 4 and 6 as ForEachBoundBuffer visits them, and whether the bytes
+    /// the trackers read are GPU-modified (slot 3: the first 0x230; slots 4 and 6: the binding).
+    /// Filled by FillDraw while the trackers are on, so they need not ask the cache.
+    struct TrackerSlot {
+        DAddr address;
+        u32 size;
+        bool bound;
+        bool gpu_modified;
+    };
+    struct TrackerRecord {
+        std::array<TrackerSlot, 3> slots;
+        bool filled;
+        static constexpr std::array<u32, 3> Slots{3, 4, 6};
+        static constexpr u32 CameraBytes = 0x230;
+    };
     struct DrawPacket {
         u64 number;
         u32 flags;
@@ -161,6 +177,7 @@ public:
         BufferRef indirect_count;
         Span reads;
         Span handle_values;
+        TrackerRecord trackers;
     };
     struct DispatchPacket {
         u64 number;
@@ -385,6 +402,17 @@ public:
     const DrawPacket* FillDraw(Cache& cache, const DrawFacts& facts, bool is_indexed);
     /// SEAM = 2: the dispatch's `before` section, before Configure. Null as for FillDraw.
     const DispatchPacket* FillDispatch(Cache& cache, const DispatchFacts& facts);
+    /// The OoT trackers are on (RasterizerVulkan::TickFrame, at each frame end): FillDraw adds
+    /// their record to the draw packet.
+    void SetTrackerRecord(bool on) noexcept {
+        tracker_record.store(on, std::memory_order_relaxed);
+    }
+    /// SEAM >= 2: draws get packets.
+    [[nodiscard]] bool Packets() const noexcept {
+        return seam_value.load(std::memory_order_relaxed) >= 2;
+    }
+    /// The record of slots 3, 4 and 6 from the cache as it is now (FillDraw; the verify).
+    static void FillTrackerRecord(Cache& cache, TrackerRecord& record);
 
     /// On GPUMem inside a hand-off: runs `body` on the back with this thread's seam state (a
     /// sync, an entry that must run now). Anywhere else: runs it here.
@@ -675,6 +703,7 @@ private:
     std::atomic<uintptr_t> owner{0};
     std::atomic<bool> seam_on{false};
     std::atomic<int> seam_value{0};
+    std::atomic<bool> tracker_record{false};
     /// FRITCHII_MEMSTAGE_READ_LOG: every Nth packet's reads are compared, 0 off
     int read_log_every{};
     Cache* cache{};

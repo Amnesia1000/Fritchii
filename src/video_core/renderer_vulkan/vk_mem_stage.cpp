@@ -1136,10 +1136,32 @@ const MemStage::DrawPacket* MemStage::FillDrawHere(Cache& cache_, const DrawFact
         }
         TakeHeld(HeldKind::Draw);
     }
+    // The OoT trackers' record (fable_memstage_6b_plan.md 5.1): the bindings and GPU-modified
+    // marks they ask the cache for after the fill, taken here, where the fill ends.
+    if (tracker_record.load(std::memory_order_relaxed)) [[unlikely]] {
+        FillTrackerRecord(cache_, draw.trackers);
+    }
     if (timed) {
         Bump(counters.fill_ns, NowNs() - start);
     }
     return &draw;
+}
+
+void MemStage::FillTrackerRecord(Cache& cache_, TrackerRecord& record) {
+    for (size_t i = 0; i < record.slots.size(); ++i) {
+        const u32 index = TrackerRecord::Slots[i];
+        const auto [address, size] = cache_.BoundGraphicsUniform(0, index);
+        TrackerSlot& slot = record.slots[i];
+        slot.address = address;
+        slot.size = size;
+        slot.bound = size != 0;
+        // The bytes each tracker reads: the camera block of slot 3 (only when it is bound that
+        // large), the whole binding of slots 4 and 6.
+        const u64 bytes = index == 3 ? u64{TrackerRecord::CameraBytes} : u64{size};
+        slot.gpu_modified = slot.bound && (index != 3 || size >= TrackerRecord::CameraBytes) &&
+                            cache_.IsRegionGpuModified(address, bytes);
+    }
+    record.filled = true;
 }
 
 const MemStage::DispatchPacket* MemStage::FillDispatchHere(Cache& cache_,
