@@ -46,6 +46,7 @@ public:
         RingFull,
         DrawCount,
         PacketOrphan,
+        StageException,
         Count,
     };
 
@@ -265,6 +266,7 @@ private:
     bool BecomeBusy(std::stop_token& stop);
     void StageIdle(std::stop_token& stop);
     void Lend(u64 from, u64 until);
+    u64 RingFailed(std::stop_token& stop, const char* what);
 
     static MemoryStageLink instance;
 
@@ -319,6 +321,7 @@ private:
     /// Set by the back at the loop top: where the stage starts reading.
     std::atomic<u64> ring_start{~u64{0}};
     std::atomic<bool> ring_running{false};
+    std::atomic<bool> ring_failed{false};
     u64 staged_local{};
     /// The stage's ranges handed to the back at a lend (read by the back at the run's start).
     std::vector<std::pair<u64, std::size_t>> lend_ranges;

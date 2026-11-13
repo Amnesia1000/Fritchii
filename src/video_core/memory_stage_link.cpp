@@ -215,6 +215,7 @@ constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::Check::Co
     "ring B full",
     "draws issued by the back and the stage differ at a run's end (compare a)",
     "a packet played whole for a draw the back did not prepare",
+    "an exception out of GPUMem's ring loop (the ring ended)",
 };
 constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::HandOff::Count)>
     LINK_HANDOFF_NAMES{"draw fills", "dispatch fills", "idle destroys", "served for the back"};
@@ -262,6 +263,7 @@ void MemoryStageLink::Start(Core::System& system_) {
     ring_wanted.store(false, std::memory_order_relaxed);
     ring_start.store(~u64{0}, std::memory_order_relaxed);
     ring_running.store(false, std::memory_order_relaxed);
+    ring_failed.store(false, std::memory_order_relaxed);
     g_ring_active.store(false, std::memory_order_relaxed);
     stage_busy.store(false, std::memory_order_relaxed);
     back_in_hook.store(false, std::memory_order_relaxed);
@@ -287,6 +289,9 @@ void MemoryStageLink::Stop() {
 
 u32 MemoryStageLink::SetMode(u32 wanted) {
     u32 next = (std::min)(wanted, 2U);
+    if (next == 2 && ring_failed.load(std::memory_order_relaxed)) {
+        next = 1; // GPUMem failed in ring mode this session (RingFailed)
+    }
     if (next != 0 && !thread.joinable()) {
         if (!refused_logged) {
             refused_logged = true;
@@ -911,6 +916,23 @@ void MemoryStageLink::Lend(u64 from, u64 until) {
     PublishStaged(until);
 }
 
+u64 MemoryStageLink::RingFailed(std::stop_token& stop, const char* what) {
+    // An exception out of the stage's work (a fill, the cache): the ring ends cleanly where the
+    // back is parked, the entries past `staged` run on the back as at THREAD 1 or 0, and THREAD 2
+    // is refused for the rest of the session (SetMode). Counted, must be 0.
+    t_in_call = false;
+    t_stage_user = false;
+    stage_busy.store(false, std::memory_order_seq_cst);
+    ring_failed.store(true, std::memory_order_seq_cst);
+    ring_wanted.store(false, std::memory_order_seq_cst);
+    Note(Check::StageException, what);
+    LOG_CRITICAL(HW_GPU, "Memory stage ring: GPUMem failed ({}); the ring ends at {:#x} and "
+                         "FRITCHII_MEMSTAGE_THREAD=2 runs as 1 from here",
+                 what, staged_local);
+    StageWaitFor(stop, StageWait::Back, staged_local);
+    return staged_local;
+}
+
 void MemoryStageLink::RingLoop(std::stop_token& stop, u64 start) {
     ring_running.store(true, std::memory_order_seq_cst);
     staged_local = start;
@@ -921,111 +943,122 @@ void MemoryStageLink::RingLoop(std::stop_token& stop, u64 start) {
     u64 since_publish = 0;
     u64 last_tick_ns = LinkNowNs();
     t_stage_user = true;
-    for (;;) {
-        if (stop.stop_requested()) {
-            break;
-        }
-        if (!ring_wanted.load(std::memory_order_acquire)) {
-            // The ring ends where the back is parked at the stage's position.
-            PublishStaged(position);
-            if (!StageWaitFor(stop, StageWait::Back, position)) {
+    try {
+        for (;;) {
+            if (stop.stop_requested()) {
                 break;
             }
-            break;
-        }
-        const u64 available = Ring::Published().load(std::memory_order_acquire);
-        if (available == position) {
-            PublishStaged(position);
-            // EXP39: the front publishes a few words to a reader that waits for them; the stage
-            // is the reader the front feeds now.
-            Ring::IdleAt().store(position, std::memory_order_relaxed);
-            StageIdle(stop);
-            const u64 now = LinkNowNs();
-            if (now - last_tick_ns >= 1'000'000'000ULL) {
-                last_tick_ns = now;
-                MemStageShadow::StageTick();
-                Nx2Profile::Report("GPU memory thread");
-            }
-            if (!StageWaitFor(stop, StageWait::Input, position)) {
-                break;
-            }
-            continue;
-        }
-        // Level mode (AHEAD = 0): the stage runs only while the back is parked.
-        if (Ring::Consumed().load(std::memory_order_acquire) < staged_local &&
-            !StageWaitFor(stop, StageWait::Back, staged_local)) {
-            break;
-        }
-        if (!stage_busy.load(std::memory_order_relaxed) && !BecomeBusy(stop)) {
-            break;
-        }
-        const u64 busy_start = LinkNowNs();
-        t_in_call = true;
-        t_stage_user = true;
-        const MemStageShadow::StageResult result = MemStageShadow::StageProcess(position, false);
-        LinkBump(counters.entries[(std::min)(static_cast<size_t>(result.cls), size_t{3})]);
-        if (!result.hard) {
-            t_in_call = false;
-            position += result.size;
-            LinkBump(counters.stage_busy_ns, LinkNowNs() - busy_start);
-            if (result.packets != 0 || ++since_publish >= PublishEvery) {
-                since_publish = 0;
+            if (!ring_wanted.load(std::memory_order_acquire)) {
+                // The ring ends where the back is parked at the stage's position.
                 PublishStaged(position);
-            }
-            continue;
-        }
-        // A hard entry: a level run [position, until), extended over what follows that needs
-        // nothing of the stage.
-        u64 until = position + result.size;
-        u64 run_entries = 1;
-        Lend(position, until);
-        const u64 run_start = LinkNowNs();
-        LinkBump(counters.stage_busy_ns, run_start - busy_start);
-        {
-            const Nx2Profile::Scope zone{Nx2Profile::Zone::LevelRun};
-            Common::Nx2Timeline::ArgSpan span{"level run", {"entries", 1}};
-            for (;;) {
-                if (until == Ring::Published().load(std::memory_order_acquire) ||
-                    !MemStageShadow::StageExtendsRun(until)) {
+                if (!StageWaitFor(stop, StageWait::Back, position)) {
                     break;
                 }
-                const MemStageShadow::StageResult more = MemStageShadow::StageProcess(until, true);
-                LinkBump(counters.entries[(std::min)(static_cast<size_t>(more.cls), size_t{3})]);
-                until += more.size;
-                ++run_entries;
-                Ring::LentUntil().store(until, std::memory_order_relaxed);
-                PublishStaged(until);
-            }
-            span.Set(0, {"entries", run_entries});
-            LinkBump(counters.run_entries, run_entries);
-            if (!StageWaitFor(stop, StageWait::Run, until)) {
                 break;
             }
+            const u64 available = Ring::Published().load(std::memory_order_acquire);
+            if (available == position) {
+                PublishStaged(position);
+                // EXP39: the front publishes a few words to a reader that waits for them; the stage
+                // is the reader the front feeds now.
+                Ring::IdleAt().store(position, std::memory_order_relaxed);
+                StageIdle(stop);
+                const u64 now = LinkNowNs();
+                if (now - last_tick_ns >= 1'000'000'000ULL) {
+                    last_tick_ns = now;
+                    MemStageShadow::StageTick();
+                    Nx2Profile::Report("GPU memory thread");
+                }
+                if (!StageWaitFor(stop, StageWait::Input, position)) {
+                    break;
+                }
+                continue;
+            }
+            // Level mode (AHEAD = 0): the stage runs only while the back is parked.
+            if (Ring::Consumed().load(std::memory_order_acquire) < staged_local &&
+                !StageWaitFor(stop, StageWait::Back, staged_local)) {
+                break;
+            }
+            if (!stage_busy.load(std::memory_order_relaxed) && !BecomeBusy(stop)) {
+                break;
+            }
+            const u64 busy_start = LinkNowNs();
+            t_in_call = true;
+            t_stage_user = true;
+            const MemStageShadow::StageResult result = MemStageShadow::StageProcess(position, false);
+            LinkBump(counters.entries[(std::min)(static_cast<size_t>(result.cls), size_t{3})]);
+            if (!result.hard) {
+                t_in_call = false;
+                position += result.size;
+                LinkBump(counters.stage_busy_ns, LinkNowNs() - busy_start);
+                if (result.packets != 0 || ++since_publish >= PublishEvery) {
+                    since_publish = 0;
+                    PublishStaged(position);
+                }
+                continue;
+            }
+            // A hard entry: a level run [position, until), extended over what follows that needs
+            // nothing of the stage.
+            u64 until = position + result.size;
+            u64 run_entries = 1;
+            Lend(position, until);
+            const u64 run_start = LinkNowNs();
+            LinkBump(counters.stage_busy_ns, run_start - busy_start);
+            {
+                const Nx2Profile::Scope zone{Nx2Profile::Zone::LevelRun};
+                Common::Nx2Timeline::ArgSpan span{"level run", {"entries", 1}};
+                for (;;) {
+                    if (until == Ring::Published().load(std::memory_order_acquire) ||
+                        !MemStageShadow::StageExtendsRun(until)) {
+                        break;
+                    }
+                    const MemStageShadow::StageResult more = MemStageShadow::StageProcess(until, true);
+                    LinkBump(counters.entries[(std::min)(static_cast<size_t>(more.cls), size_t{3})]);
+                    until += more.size;
+                    ++run_entries;
+                    Ring::LentUntil().store(until, std::memory_order_relaxed);
+                    PublishStaged(until);
+                }
+                span.Set(0, {"entries", run_entries});
+                LinkBump(counters.run_entries, run_entries);
+                if (!StageWaitFor(stop, StageWait::Run, until)) {
+                    break;
+                }
+            }
+            LinkBump(counters.run_ns, LinkNowNs() - run_start);
+            // The return (back parked at `until`): flags, takes, full copies.
+            if (!BecomeBusy(stop)) {
+                break;
+            }
+            const u64 copies = MemStageShadow::StageReturn(
+                back_drew_in_run.exchange(nullptr, std::memory_order_relaxed),
+                back_state_in_run.exchange(nullptr, std::memory_order_relaxed),
+                ring_backend.back_channel != nullptr ? ring_backend.back_channel(ring_backend.context)
+                                                     : 0);
+            LinkBump(counters.copies, copies);
+            // Compare a with two threads: both sides counted every draw since the ring started. A
+            // difference would mispair every later packet; the back's count is taken (it is parked).
+            if (const u64 stage_seq = MemStageShadow::StageDrawSeq(back_draw_seq);
+                stage_seq != back_draw_seq) [[unlikely]] {
+                Note(Check::DrawCount, "the stage's count set to the back's");
+            }
+            t_stage_user = true;
+            position = until;
+            since_publish = 0;
         }
-        LinkBump(counters.run_ns, LinkNowNs() - run_start);
-        // The return (back parked at `until`): flags, takes, full copies.
-        if (!BecomeBusy(stop)) {
-            break;
-        }
-        const u64 copies = MemStageShadow::StageReturn(
-            back_drew_in_run.exchange(nullptr, std::memory_order_relaxed),
-            back_state_in_run.exchange(nullptr, std::memory_order_relaxed),
-            ring_backend.back_channel != nullptr ? ring_backend.back_channel(ring_backend.context)
-                                                 : 0);
-        LinkBump(counters.copies, copies);
-        // Compare a with two threads: both sides counted every draw since the ring started. A
-        // difference would mispair every later packet; the back's count is taken (it is parked).
-        if (const u64 stage_seq = MemStageShadow::StageDrawSeq(back_draw_seq);
-            stage_seq != back_draw_seq) [[unlikely]] {
-            Note(Check::DrawCount, "the stage's count set to the back's");
-        }
-        t_stage_user = true;
-        position = until;
-        since_publish = 0;
+    } catch (const std::exception& error) {
+        position = RingFailed(stop, error.what());
+    } catch (...) {
+        position = RingFailed(stop, "an exception of no standard type");
     }
     t_in_call = false;
     t_stage_user = false;
     stage_busy.store(false, std::memory_order_seq_cst);
+    if (!stop.stop_requested()) {
+        // The cache goes back to the back for good, with its flags 15-48 (plan 4.2, as at a
+        // lend; the back is parked).
+        MemStageShadow::StageLend();
+    }
     // The ranges the stage's words collected that no fill applied and no lend handed over: the
     // back applies their buffer half when it sees the ring end (BackRingTop), before anything
     // else, as at a lend. (StageStart wipes the stage's list at the next start.)
