@@ -1922,6 +1922,19 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         if (ring_packet->repack_dirty != 0) {
             maxwell3d->dirty.flags[Dirty::VertexInput] = true;
         }
+        // Step 7 (fps fix 2, take 2), a served draw with the window open: the stage's fill ran
+        // the cache's vertex buffer update for this draw, on its copy's flags. With one thread
+        // that update clears the engine's VertexBuffers before UpdateVertexInput looks at it, so
+        // a stream address, limit or stride write alone never sends the vertex input state (the
+        // buffers are bound again with their strides). The back's flag, raised by those writes
+        // and cleared by nothing, sent it at about 20,000 draws a second with nothing changed.
+        // Cleared here as that update would have; Dirty::VertexInput still sends every change of
+        // the formats, the divisors and the repack layout. A lend sets the back's cache flags
+        // from GPUMem's copy again.
+        if (VideoCommon::MemoryStageLink::BackServed() &&
+            VideoCommon::MemoryStageLink::Ahead() != 0) {
+            maxwell3d->dirty.flags[VideoCommon::Dirty::VertexBuffers] = false;
+        }
     } else {
         const u32 repack_dirty = buffer_cache_runtime.SetVertexRepackLayout(
             buffer_cache.Inputs().RepackLayoutRegs(), pipeline->HasDynamicVertexInput());
