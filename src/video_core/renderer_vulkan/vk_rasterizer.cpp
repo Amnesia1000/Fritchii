@@ -82,6 +82,7 @@
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/memory_manager.h"
 #include "video_core/buffer_churn_stats.h"
+#include "video_core/fritchii_draw_kinds.h"
 #include "video_core/memstage_stats.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cb_path.h"
@@ -550,6 +551,7 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
       frame_dump(device, memory_allocator, scheduler),
       flash_watch(device, memory_allocator, scheduler) {
     scheduler.SetQueryCache(query_cache);
+    VideoCommon::FritchiiDrawKinds::Init();
     // EDEN_NX2_MEMSTAGE_STATS: stream writes are tested against the texture cache's pages.
     VideoCommon::MemStageStats::SetImagePageFilters(&texture_cache.page_filter,
                                                     &texture_cache.image_count_filter);
@@ -1522,6 +1524,7 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
 
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
+    const VideoCommon::FritchiiDrawKinds::Scope draw_kinds_scope{maxwell3d->regs};
     // A vertex count GPU work wrote (nx2_indirect_grid.h): drawn with that count, read on the GPU.
     // Draws that need the count here (the indirect reset, quads, a first vertex) read the words,
     // which waits for the GPU on this thread.
@@ -1833,6 +1836,7 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
 
 void RasterizerVulkan::DrawIndirect() {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
+    const VideoCommon::FritchiiDrawKinds::Scope draw_kinds_scope{maxwell3d->regs};
     const auto& params = maxwell3d->draw_manager.indirect_state;
     if (params.list_words) {
         DrawListWords();
@@ -2348,6 +2352,7 @@ bool RasterizerVulkan::ClearVolumeSlices(const Framebuffer* framebuffer, u32 fir
 
 void RasterizerVulkan::Clear(u32 layer_count) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Clear};
+    const VideoCommon::FritchiiDrawKinds::Scope draw_kinds_scope{maxwell3d->regs, true};
     if (Tegra::Engines::g_nx2_trace_draws_after_upscale > 0) {
         const auto& regs = maxwell3d->regs;
         LOG_INFO(HW_GPU, "after upscale: clear rt0 {:#x} {}x{} fmt {:#x} surface {:#x} colour {} {} {} {}",
@@ -4623,6 +4628,9 @@ void RasterizerVulkan::TickFrame() {
     }
 #endif
     NoteDrawReuseProbeFrame();
+    if (VideoCommon::FritchiiDrawKinds::g_on) [[unlikely]] {
+        VideoCommon::FritchiiDrawKinds::g_frames.fetch_add(1, std::memory_order_relaxed);
+    }
     VideoCommon::MemStageStats::TickFrame();
     VideoCommon::BufferChurnStats::TickFrame();
     if (VideoCommon::Nx2FastDrawCount::g_on) [[unlikely]] {
