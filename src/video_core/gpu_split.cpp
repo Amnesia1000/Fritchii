@@ -1168,10 +1168,11 @@ GpuSplit::DispatchCheck GpuSplit::DispatchesMayWriteSince(u64 since, u64 begin, 
             if (write_end == ~u64{0} && write_begin == 0) {
                 return DispatchCheck::Unbounded;
             }
-            // A slot reused meanwhile lists a stray range; the reuse check below then misses.
-            if (listed == nullptr || !found.Add(begin, size, write_begin, write_end)) {
+            if (listed == nullptr) {
                 return DispatchCheck::Overlap;
             }
+            // A slot reused meanwhile lists a stray range; the reuse check below then misses.
+            found.Add(begin, size, write_begin, write_end);
         }
     }
     // Writes between `checked` and the oldest remembered were forgotten; the back may have
