@@ -1157,14 +1157,18 @@ GpuSplit::ReleaseNote GpuSplit::TryNoteWriterRange(const Tegra::MemoryManager& m
 // one union with the newest position: never smaller than what was written, so never a missed
 // write, only a coarser byte list.
 //
-// The table is set associative (64 sets of 4 pages, least recently used way replaced): two tag
-// probes for a range of one or two pages. A range over more than 16 pages walks the 256 tags
-// instead, after a test against the lowest and highest watched page. EXP122=2 runs the old scan
+// The table is set associative (256 sets of 8 pages, least recently used way replaced): two tag
+// probes for a range of one or two pages. A range over more than 16 pages walks the occupied
+// slots instead, after a test against the lowest and highest watched page. 2,048 slots: OoT
+// snapshots ~400 distinct pages, and with 256 slots the LRU rule evicted exactly the rarely read
+// pages (hot pages refresh their last use with every answer), the ones whose ring scans run past
+// the limit: the watch answered 96% of the checks but none of the "past the scan" drains
+// (fable52_answer_exp122). EXP122=2 runs the old scan
 // without a limit after every "no write" and counts each overlap it finds that the watch did not
 // list (the "verify mismatches" of EXP10's log line, which must stay 0).
 struct GpuSplit::PageWatch {
-    static constexpr u32 Sets = 64;
-    static constexpr u32 Ways = 4;
+    static constexpr u32 Sets = 256;
+    static constexpr u32 Ways = 8;
     static constexpr u32 Slots = Sets * Ways;
     static constexpr u32 Capacity = 8;
     static constexpr u64 Empty = ~u64{0};
@@ -1184,6 +1188,9 @@ struct GpuSplit::PageWatch {
     };
     std::array<u64, Slots> pages;
     std::array<Entry, Slots> entries{};
+    /// The slots holding a page, in the order they were first filled (a wide write walks these).
+    std::array<u16, Slots> occupied{};
+    u32 occupied_count = 0;
     u64 min_page = Empty;
     u64 max_page = 0;
     u64 clock = 0;
@@ -1193,6 +1200,10 @@ struct GpuSplit::PageWatch {
     u64 overflows = 0;
     u64 verified = 0;
     u64 mismatches = 0;
+    u64 unwatched_absent = 0; ///< Checks of a page not in the table: the ring answers
+    u64 unwatched_newer = 0;  ///< Checks of a page watched since after their snapshot
+    u64 unwatched_spans = 0;  ///< Checks over two pages
+    u64 replaced = 0;         ///< Watched pages pushed out by a new one
 
     PageWatch() {
         pages.fill(Empty);
@@ -1242,6 +1253,7 @@ void GpuSplit::ClearPageWatch() {
         page_watch->pages.fill(PageWatch::Empty);
         page_watch->min_page = PageWatch::Empty;
         page_watch->max_page = 0;
+        page_watch->occupied_count = 0;
     }
     watched_pages = 0;
 }
@@ -1270,6 +1282,9 @@ void GpuSplit::WatchPage(u64 page) {
         }
         if (watch.pages[pick] == PageWatch::Empty) {
             ++watched_pages;
+            watch.occupied[watch.occupied_count++] = static_cast<u16>(pick);
+        } else {
+            ++watch.replaced;
         }
         watch.pages[pick] = page;
         watch.min_page = (std::min)(watch.min_page, page);
@@ -1303,9 +1318,10 @@ void GpuSplit::NoteWatchedWrite(u64 begin, u64 end, u64 position) {
         }
         return;
     }
-    for (u32 slot = 0; slot < PageWatch::Slots; ++slot) {
+    for (u32 i = 0; i < watch.occupied_count; ++i) {
+        const u32 slot = watch.occupied[i];
         const u64 page = watch.pages[slot];
-        if (page != PageWatch::Empty && first_page <= page && page <= last_page) {
+        if (first_page <= page && page <= last_page) {
             watch.Record(watch.entries[slot], page, begin, end, position);
         }
     }
@@ -1316,18 +1332,22 @@ GpuSplit::WatchAnswer GpuSplit::WatchedWritesSince(u64 since, u64 begin, u64 siz
     if (size == 0 || page_watch_mode == 0) {
         return WatchAnswer::Unwatched;
     }
+    // Callers test watched_pages first: the table exists.
+    PageWatch& watch = *page_watch;
     const u64 page = begin >> 12;
     if (((begin + size - 1) >> 12) != page) {
+        ++watch.unwatched_spans;
         return WatchAnswer::Unwatched;
     }
-    PageWatch& watch = *page_watch;
     const s32 slot = watch.Find(page);
     if (slot < 0) {
+        ++watch.unwatched_absent;
         return WatchAnswer::Unwatched;
     }
     PageWatch::Entry& entry = watch.entries[static_cast<u32>(slot)];
     if (entry.start_count > known && entry.start_position > since) {
         // Started after this check's snapshot (another snapshot of the page): the ring answers.
+        ++watch.unwatched_newer;
         return WatchAnswer::Unwatched;
     }
     entry.last_use = ++watch.clock;
@@ -1396,11 +1416,13 @@ GpuSplit::WatchAnswer GpuSplit::WatchedWritesSince(u64 since, u64 begin, u64 siz
 
 GpuSplit::PageWatchStats GpuSplit::GetPageWatchStats() const {
     if (!page_watch) {
-        return {0, 0, watched_pages, 0, 0, 0};
+        return {0, 0, watched_pages, 0, 0, 0, 0, 0, 0, 0};
     }
     const PageWatch& watch = *page_watch;
-    return {watch.answered, watch.answered_write, watched_pages,
-            watch.overflows, watch.verified,       watch.mismatches};
+    return {watch.answered,         watch.answered_write,  watched_pages,
+            watch.overflows,        watch.verified,        watch.mismatches,
+            watch.unwatched_absent, watch.unwatched_newer, watch.unwatched_spans,
+            watch.replaced};
 }
 
 void GpuSplit::NoteDispatchWriter() {

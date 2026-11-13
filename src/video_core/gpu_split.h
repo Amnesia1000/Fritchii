@@ -659,6 +659,10 @@ public:
         u64 overflows;      ///< Byte lists that overflowed (unioned)
         u64 verified;       ///< EXP122=2: "no write" answers checked by a full scan
         u64 mismatches;     ///< of them the full scan found an overlap (must stay 0)
+        u64 unwatched_absent; ///< Checks the watch left to the ring: page not in the table
+        u64 unwatched_newer;  ///< page watched since after the check's snapshot
+        u64 unwatched_spans;  ///< check over two pages
+        u64 replaced;         ///< Watched pages pushed out by a new one
     };
     [[nodiscard]] PageWatchStats GetPageWatchStats() const;
     /// The ranges noted so far, without sealing the last one (EXP10's log line).

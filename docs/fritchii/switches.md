@@ -1271,14 +1271,18 @@ bytes it covers in a watched page are kept with its position (8 a page, the rest
 union). A read of a watched page then answers "may a writer since the snapshot write these
 bytes" from that list, with no scan of the writer range ring and no scan limit: before, every
 "past the scan" drain of the session was the scan giving up (4,096 ranges at ~11,500 a second),
-never an overlap. Pages that are not watched (256 at most, least recently used replaced), or
+never an overlap. Pages that are not watched (2,048 at most, 256 sets of 8, least recently used
+replaced; the first table held 256 and kept evicting the rarely read pages, exactly the ones
+that need it, fable52_answer_exp122), or
 whose watch started after the snapshot asked about (another channel's snapshot), take the ring
 scan as before; the ring's other readers are unchanged. Unbounded writers still count for every
 page. 1 = on. 2 = on, and every "no write" answer is checked by the old scan without its limit;
 an overlap it finds that the watch did not report is a verify mismatch (the first 16 logged as
 "Writer page watch (EXP122=2)"), which must stay 0. EXP10's "DMA snapshot EXP10" line logs reads
 answered by the page watch (and how many said "may write"), watched pages, byte-list overflows,
-verified answers and verify mismatches. Off by default, not measured yet: run 2 first (0
+verified answers and verify mismatches, then the checks left to the ring (page not watched,
+watched only after the check's snapshot, over two pages) and the pages replaced; with the
+watch working, "page not watched", "pages replaced" and "past the scan" stay near flat. Off by default, not measured yet: run 2 first (0
 mismatches in a kill fight and at the pot room), then toggle 0/1 with profile_toggle.py and
 compare the "past the scan" count and the macro dma read drains.
 
