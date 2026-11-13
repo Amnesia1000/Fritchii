@@ -73,10 +73,13 @@
 //        At a difference (ClassifyDiff):
 //        A  an entry newer than the fill over the changed bytes names the writer: "emulator
 //           write, download landing" or "emulator write" (by site on the stats line).
-//        B  none: GPU::ForEachPendingCpuWrite over the changed bytes. A pending game-side mark is
+//        B  none, on a tracked read (an upload, the inline page write):
+//           GPU::ForEachPendingCpuWrite over the changed bytes. A pending game-side mark is
 //           "game write, marked" (applied at the next gather); none is "game write, mark already
 //           taken" (the store landed after its mark was gathered: core\memory.cpp marks before
-//           the store).
+//           the store; nothing repairs it). An untracked read (a stream uniform, a value) has no
+//           mark to expect and is read again by the next fill: "untracked read changed"
+//           (fable_memstage_readlog2.md 4).
 //        D  a bound range (the tracker says CPU-written): if this thread applied a gather since
 //           the fill (OnCacheInvalidations; FlushRegion gathers first), "gather on the back inside
 //           Configure", with the first gather's stack; else the tracker was marked directly by a
@@ -314,7 +317,8 @@ constexpr std::array<const char*, static_cast<size_t>(MemStage::DiffClass::Count
     DIFF_CLASS_NAMES{
         "emulator write, download landing", "emulator write",
         "game write, marked",               "game write, mark already taken",
-        "gather on the back inside Configure", "unclassified",
+        "untracked read changed",           "gather on the back inside Configure",
+        "unclassified",
     };
 constexpr std::array<const char*, static_cast<size_t>(MemStage::Sync::Count)> SYNC_NAMES{
     "finish", "wait", "submit for host read", "multi-range", "kept words",
@@ -1609,6 +1613,10 @@ void MemStage::ClassifyDiff(const ReadLog& log, const ReadRecord& record, u64 fi
     } else if (record.how == How::Range) {
         // The tracker holds the mark: a game core's trapped store marked it directly.
         kind = DiffClass::GameMarked;
+    } else if (record.kind != Kind::Upload && record.kind != Kind::InlinePageWrite) {
+        // No tracker behind the read (a stream uniform, a value): no mark is expected and the
+        // next fill reads it again, so "mark already taken" stays the unrepaired tracked case.
+        kind = DiffClass::Untracked;
     } else {
         kind = pending ? DiffClass::GameMarked : DiffClass::MarkTaken;
     }
@@ -2189,14 +2197,15 @@ void MemStage::LogStats() {
             const u64 unclassified = by_class(DiffClass::Unclassified);
             const u64 own = delta(&Counts::diff_own);
             const u64 taken = by_class(DiffClass::MarkTaken);
+            const u64 untracked = by_class(DiffClass::Untracked);
             LOG_INFO(Render_Vulkan,
                      "  memory seam read log classes: emulator write {}{}{}{}, game write marked "
-                     "{}, game write mark already taken {}, gather on the back inside Configure "
-                     "{}, unclassified {}; over-read {}, own data changed {}; ring wrapped {}; on "
-                     "the holding thread: gathers applied {}, FlushRegion texture {} query {} "
-                     "buffer {}",
+                     "{}, game write mark already taken {}, untracked read changed {}, gather on "
+                     "the back inside Configure {}, unclassified {}; over-read {}, own data "
+                     "changed {}; ring wrapped {}; on the holding thread: gathers applied {}, "
+                     "FlushRegion texture {} query {} buffer {}",
                      landings + emulator, sites.empty() ? "" : " (", sites,
-                     sites.empty() ? "" : ")", by_class(DiffClass::GameMarked), taken,
+                     sites.empty() ? "" : ")", by_class(DiffClass::GameMarked), taken, untracked,
                      by_class(DiffClass::BackGather), unclassified, delta(&Counts::diff_over), own,
                      delta(&Counts::ring_wrapped), delta(&Counts::gathers_held),
                      current.flush_regions_held[0] - reported.flush_regions_held[0],
@@ -2204,8 +2213,9 @@ void MemStage::LogStats() {
                      current.flush_regions_held[2] - reported.flush_regions_held[2]);
             LOG_INFO(Render_Vulkan,
                      "  read log gate: unexplained {} (emulator writes that are not download "
-                     "landings {}, unclassified {}); mark already taken {}; own data changed {}",
-                     emulator + unclassified, emulator, unclassified, taken, own);
+                     "landings {}, unclassified {}); mark already taken {} (tracked reads); "
+                     "untracked read changed {}; own data changed {}",
+                     emulator + unclassified, emulator, unclassified, taken, untracked, own);
         }
     }
     const std::array<u64, 2> vertex_runs{

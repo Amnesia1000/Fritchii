@@ -369,7 +369,10 @@ public:
         Landing,       ///< an emulator write the ring names, a download landing
         EmulatorWrite, ///< an emulator write the ring names, anything else
         GameMarked,    ///< no emulator write; a game-side mark is pending (or the tracker holds it)
-        MarkTaken,     ///< no emulator write, no pending mark: a store in flight at the gather
+        MarkTaken,     ///< tracked read, no emulator write, no pending mark: a store in flight at
+                       ///< the gather (nothing repairs it)
+        Untracked,     ///< untracked read (a stream uniform, a value), no emulator write: no mark
+                       ///< is expected, the next fill reads it again
         BackGather,    ///< bound range: a gather ran on this thread between the fill and the play
         Unclassified,
         Count,

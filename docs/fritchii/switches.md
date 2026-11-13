@@ -303,16 +303,18 @@ site, thread and sequence (vk_mem_stage.cpp, "Who wrote", lists every hook). Eac
 - a class: "emulator write, download landing" or "emulator write" (the ring names a write newer
   than the fill over the changed bytes; counted by site), "game write, marked" (a game-side mark
   is pending, GPU::ForEachPendingCpuWrite; for a bound range, the tracker holds it), "game write,
-  mark already taken" (no mark left: the store landed after its mark was gathered), "gather on the
-  back inside Configure" (a bound range, and the drawing thread applied a gather since the fill;
-  the first gather's stack is logged), or "unclassified" (unmapped, or the ring wrapped);
+  mark already taken" (a tracked read, an upload or the inline page write, with no mark left: the
+  store landed after its mark was gathered, and nothing repairs it), "untracked read changed" (a
+  stream uniform or a value: no tracker, no mark expected, the next fill reads it again), "gather
+  on the back inside Configure" (a bound range, and the drawing thread applied a gather since the
+  fill; the first gather's stack is logged), or "unclassified" (unmapped, or the ring wrapped);
 - a place: "over-read" (an upload's changed bytes outside every range the packet uses) or "own
   data".
 The "memory seam read log classes" line has the counts by class and site, over-read and own
 data, ring wraps, and on the holding thread the gathers applied and FlushRegion calls by cache.
 The "read log gate" line: unexplained = emulator writes that are not download landings +
-unclassified; must be 0. "mark already taken" and "own data changed" are reported beside it and
-are not failures. Off, every hook costs one relaxed load and a branch.
+unclassified; must be 0. "mark already taken", "untracked read changed" and "own data changed"
+are reported beside it and are not failures. Off, every hook costs one relaxed load and a branch.
 
 ### FRITCHII_MEMSTAGE_VERIFY
 
