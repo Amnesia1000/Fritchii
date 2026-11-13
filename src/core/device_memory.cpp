@@ -170,7 +170,14 @@ void DeviceMemory::ProbeMemory(std::stop_token stop) {
             return;
         }
         // Published for the GPU thread's line (Vulkan::LogMemoryOwners), which reads the last ones.
-        {
+        // Only for a memory hunt: EDEN_NX2_MEM_SAMPLE=1. The walk holds kernel locks for 35-48 ms
+        // every 10 s, which the owner's playtest (2026-11-14) showed inside a 217 ms hitch; nothing
+        // but that log line uses it, which shows 0 resident without it.
+        static const bool sample_resident = [] {
+            const char* value = std::getenv("EDEN_NX2_MEM_SAMPLE");
+            return value != nullptr && value[0] == '1';
+        }();
+        if (sample_resident) {
             const Common::Nx2Hitch::Scope timed{Common::Nx2Hitch::Cause::MemorySample};
             static_cast<void>(buffer.SampleResident());
         }

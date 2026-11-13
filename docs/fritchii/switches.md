@@ -7,6 +7,14 @@ rebuilds nothing.
 
 ## Named switches
 
+### EDEN_NX2_MEM_SAMPLE
+
+TEST, off by default (2026-11-14): EDEN_NX2_MEM_SAMPLE=1 (read at startup) lets the MemoryProbe
+thread sample which guest pages are resident every 10 s (HostMemory::SampleResident) for the
+"Memory owners" line. The walk holds kernel locks for 35-48 ms and showed up inside a 217 ms hitch
+in the owner's playtest, so it only runs for a memory hunt; without it the line's resident and
+guest-unique figures read 0. EDEN_NX2_MEM_HEAPS=1 (the heap walk, ~250 ms) is separate.
+
 ### EDEN_NX2_DMA_WAIT_WRITERS
 
 EXPERIMENT (not for nx2): EDEN_NX2_DMA_WAIT_WRITERS, read at startup and settable live by the
