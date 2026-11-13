@@ -1230,6 +1230,7 @@ void RasterizerVulkan::SetRingBackend() {
     backend.ring_room = [](void* context) {
         return static_cast<RasterizerVulkan*>(context)->mem_stage.RingRoom();
     };
+    Link::Get().SetCacheLock(&buffer_cache.mutex);
     backend.reset_stage = [](void* context, bool end) {
         static_cast<RasterizerVulkan*>(context)->mem_stage.ResetStageSide(end);
     };

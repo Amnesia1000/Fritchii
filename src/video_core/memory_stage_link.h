@@ -17,6 +17,10 @@ namespace Core {
 class System;
 }
 
+namespace Common {
+class SpinRecursiveMutex;
+}
+
 namespace VideoCommon {
 
 struct MemStageShadowEngine;
@@ -194,6 +198,11 @@ public:
 
     void SetRingBackend(const RingBackend& backend) noexcept {
         ring_backend = backend;
+    }
+    /// The buffer cache's lock: a thread that holds it and starts to wait for the other thread
+    /// (a request, a call, a catch-up) wakes that thread if it sleeps on the lock (step 7).
+    void SetCacheLock(Common::SpinRecursiveMutex* lock) noexcept {
+        cache_lock = lock;
     }
     [[nodiscard]] const RingBackend& Backend() const noexcept {
         return ring_backend;
@@ -497,6 +506,8 @@ private:
 
     // THREAD = 2.
     RingBackend ring_backend{};
+    Common::SpinRecursiveMutex* cache_lock{};
+    void WakeLockWaiters() noexcept;
     alignas(64) std::atomic<bool> ring_wanted{false};
     /// Stage: inside a batch (between a park of the back and the next publish), or its idle work.
     alignas(64) std::atomic<bool> stage_busy{false};

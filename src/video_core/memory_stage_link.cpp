@@ -476,6 +476,7 @@ void MemoryStageLink::Call(HandOff kind, Function function, void* argument) {
     t_back_lent = true;
     calls.store(seq, std::memory_order_seq_cst);
     WakeStage();
+    WakeLockWaiters(); // GPUMem may sleep on the lock this thread holds (EXP118's delta draws)
     {
         const Nx2Profile::Scope zone{Nx2Profile::Zone::MemoryHandOff};
         const BackWaitScope site{"memory stage hand-off (a fill on GPUMem)"};
@@ -555,6 +556,7 @@ void MemoryStageLink::Serve(Function function, void* argument) {
     t_stage_user = false;
     requests.store(seq, std::memory_order_seq_cst);
     WakeBack();
+    WakeLockWaiters(); // the back may sleep on the lock GPUMem holds in its fill
     {
         const Nx2Profile::Scope zone{Nx2Profile::Zone::MemorySyncWait};
         const StageWaitScope site{"a sync the back serves"};
@@ -816,18 +818,18 @@ bool MemoryStageLink::BackRingTopImpl(u64 position) {
             // no stale header meets the next start; then the stage's last ranges.
             t_back_served = false;
             t_back_run = false;
-            // GPUMem's unplayed mark must not outlive the ring (a fill that threw leaves its
-            // entries pending and its number open): first of all its entries are played and the
-            // arena is the back's again, the mark cleared (re-review N5), so the plays below run
-            // with no stale owner or mark.
-            if (ring_backend.reset_stage != nullptr) {
-                ring_backend.reset_stage(ring_backend.context, true);
-            }
             if (ring_backend.drop_packets != nullptr) {
                 const u64 left = ring_backend.drop_packets(ring_backend.context, ~u64{0});
                 for (u64 i = 0; i < left; ++i) {
                     Note(Check::PacketOrphan, "left in ring B when the ring ended");
                 }
+            }
+            // GPUMem's unplayed mark must not outlive the ring (a fill that threw leaves its
+            // entries pending and its number open): its entries are played, after the packets
+            // of earlier entries above (they are later in the stream), and the mark cleared;
+            // then the ranges.
+            if (ring_backend.reset_stage != nullptr) {
+                ring_backend.reset_stage(ring_backend.context, true);
             }
             if (!lend_ranges.empty() && ring_backend.apply_ranges != nullptr) {
                 ring_backend.apply_ranges(ring_backend.context, lend_ranges.data(),
@@ -990,6 +992,15 @@ void MemoryStageLink::NotePacketSent(u64 bytes, u64 ahead) noexcept {
     LinkBump(counters.window[(std::min)(bucket, WindowBuckets - 1)]);
     if (ahead > counters.ring_ahead_max.load(std::memory_order_relaxed)) {
         counters.ring_ahead_max.store(ahead, std::memory_order_relaxed);
+    }
+}
+
+void MemoryStageLink::WakeLockWaiters() noexcept {
+    // This thread holds the buffer cache's lock and is about to wait for the other thread: if
+    // that one sleeps on the lock (a hooked wait that read another holder), it wakes, sees this
+    // thread as the holder, and works for it (re-review N6).
+    if (cache_lock != nullptr && cache_lock->IsHeldByCurrentThread()) [[unlikely]] {
+        cache_lock->WakeWaiters();
     }
 }
 
@@ -1282,6 +1293,9 @@ bool MemoryStageLink::StageCatchUp(const char* what) {
     if (Ring::Consumed().load(std::memory_order_acquire) >= staged_local) {
         return true;
     }
+    // A back asleep on the lock GPUMem holds wakes, sees GPUMem as the holder and counts
+    // (back_contended): the wait below then stops at once instead of waiting forever.
+    WakeLockWaiters();
     const u64 start = LinkNowNs();
     bool caught_up = true;
     const u64 contended = back_contended.load(std::memory_order_seq_cst);
