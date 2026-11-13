@@ -1469,17 +1469,12 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     // update engine as channel may be different.
     pipeline->SetEngine(maxwell3d, gpu_memory);
     const u32 repack_dirty = buffer_cache_runtime.SetVertexRepackLayout(
-        maxwell3d->regs, pipeline->HasDynamicVertexInput());
+        buffer_cache.Inputs().RepackLayoutRegs(), pipeline->HasDynamicVertexInput());
     mem_stage.BeginDraw(buffer_cache_runtime.RepackMask(), repack_dirty);
     if (repack_dirty) {
-        auto& flags = maxwell3d->dirty.flags;
-        flags[VideoCommon::Dirty::VertexBuffers] = true;
-        flags[Dirty::VertexInput] = true;
-        for (u32 binding = 0; binding < 32; ++binding) {
-            if (repack_dirty & (1U << binding)) {
-                flags[VideoCommon::Dirty::VertexBuffer0 + binding] = true;
-            }
-        }
+        // The cache's flags through its inputs; the vertex input state is the back's own.
+        buffer_cache.Inputs().MarkVertexBuffersDirty(repack_dirty);
+        maxwell3d->dirty.flags[Dirty::VertexInput] = true;
     }
     setup_scope.reset();
     // Delta draws (Fable's port plan step D2): the pipeline keeps this draw as its last while the
