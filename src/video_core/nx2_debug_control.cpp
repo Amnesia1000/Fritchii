@@ -231,4 +231,104 @@ bool WaitRejectApplied(u64 generation, std::chrono::milliseconds timeout) {
     }) && state.applied_generation >= generation;
 }
 
+std::atomic<int>* FindSwitch(std::string_view name) {
+    if (constexpr std::string_view prefix = "EDEN_NX2_EXP";
+        name.size() > prefix.size() && name.substr(0, prefix.size()) == prefix) {
+        int n = 0;
+        for (const char c : name.substr(prefix.size())) {
+            if (c < '0' || c > '9') {
+                return nullptr;
+            }
+            n = n * 10 + (c - '0');
+        }
+        if (n >= ExperimentCount) {
+            return nullptr;
+        }
+        LoadExperiments();
+        return &g_experiments[n];
+    }
+    if (name == "EDEN_NX2_LIST_VERIFY") {
+        return &g_list_verify;
+    }
+    if (name == "EDEN_NX2_DMA_WAIT_WRITERS") {
+        return &g_dma_wait_writers;
+    }
+    if (name == "EDEN_NX2_SEM_FAST") {
+        return &g_sem_fast;
+    }
+    if (name == "EDEN_NX2_DMA_SNAPSHOT") {
+        return &g_dma_snapshot;
+    }
+    if (name == "EDEN_NX2_LOOP_SKIP") {
+        return &g_loop_skip;
+    }
+    if (name == "EDEN_NX2_HOST_PACE") {
+        return &g_host_pace;
+    }
+    if (name == "EDEN_NX2_ARB_SPIN") {
+        return &g_arb_spin;
+    }
+    if (name == "EDEN_NX2_IDLE_PAUSE") {
+        return &g_idle_pause;
+    }
+    if (name == "EDEN_NX2_GPU_WAKE") {
+        return &g_gpu_wake;
+    }
+    if (name == "EDEN_NX2_BACK_FENCE_STATS") {
+        return &g_back_fence_stats;
+    }
+    if (name == "EDEN_NX2_BUFFER_CHURN_STATS") {
+        return &g_buffer_churn_stats;
+    }
+    if (name == "EDEN_NX2_RUNAHEAD") {
+        return &g_runahead;
+    }
+    if (name == "EDEN_NX2_RUNAHEAD_MS") {
+        return &g_runahead_ms;
+    }
+    if (name == "EDEN_NX2_CB_DIRECT") {
+        return &g_cb_direct;
+    }
+    if (name == "EDEN_NX2_RT_DEPTH_NOUPLOAD") {
+        return &g_rt_depth_noupload;
+    }
+    if (name == "EDEN_NX2_FOLD_INSTANCE") {
+        return &g_fold_instance;
+    }
+    if (name == "EDEN_NX2_OOT_MACROS") {
+        return &g_oot_macros;
+    }
+    if (name == "EDEN_NX2_DRAW_PACKET") {
+        return &g_draw_packet;
+    }
+    if (name == "EDEN_NX2_BANK_SLOT_STATS") {
+        return &g_bank_slot_stats;
+    }
+    if (name == "EDEN_NX2_BANK_PAGE_TABLE") {
+        return &g_bank_page_table;
+    }
+    if (name == "EDEN_NX2_BANK_SLOTS") {
+        return &g_bank_slots;
+    }
+    if (name == "EDEN_NX2_BANK_SKIP_VERIFY") {
+        return &g_bank_skip_verify;
+    }
+    if (name == "EDEN_NX2_TEX_BANK_GEN") {
+        return &g_tex_bank_gen;
+    }
+    if (name == "EDEN_NX2_STORAGE_SYNC_SCAN") {
+        return &g_storage_sync_scan;
+    }
+    if (name == "EDEN_NX2_STORAGE_SYNC_MEMO") {
+        return &g_storage_sync_memo;
+    }
+    if (name == "EDEN_NX2_FEED_MEMORY_OVERLAY") {
+        return &g_feed_memory_overlay;
+    }
+    if (name == "EDEN_NX2_QMD_3D_PATCH") {
+        return &g_qmd_3d_patch;
+    }
+    return nullptr;
+}
+
 } // namespace VideoCore::Nx2Debug
