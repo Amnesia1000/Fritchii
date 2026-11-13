@@ -582,6 +582,13 @@ public:
     [[nodiscard]] const std::vector<u32>* HandleValues(bool dispatch_side,
                                                        bool& null_pointer_handles) const noexcept;
     void LookedAtHandleValues(bool dispatch_side, size_t taken);
+    /// Step 7, a 5.4 check of the ring packet the back holds that differs: whether GPUMem wrote
+    /// any of these GPU ranges since the packet's fill (its constant buffer words for later
+    /// entries; the back's own read is at play, after them). Then the value is left out and
+    /// counted apart ("left out as GPUMem's own later writes"), not as a mismatch. Only while
+    /// GPUMem keeps its own writes (the window open, its verify on).
+    [[nodiscard]] bool ValueLeftOut(Tegra::MemoryManager& gpu_memory,
+                                    std::span<const std::pair<u64, u64>> ranges);
     void NoteValueCheck(Value kind, bool same, u64 address, u64 shader, u64 packet_value,
                         u64 own_value);
 
@@ -932,6 +939,7 @@ private:
         u32 value_flags;  ///< 1: filled, 2: EXP21's null pointer handles
         u32 tracker_bytes; ///< Step 7: the trackers' bytes after the values
         u32 reserved;
+        u64 stage_writes;  ///< Step 7: GPUMem's own writes noted when the fill ended
     };
     static constexpr u64 RingBytes = u64{4} << 20;
     std::unique_ptr<u8[]> ring_b;
@@ -962,6 +970,8 @@ private:
     /// Step 7: the trackers' bytes, GPUMem's for the fill, the back's for the packet it holds.
     std::vector<u8> fill_tracker_data;
     std::vector<u8> played_tracker_data;
+    /// The held ring packet's ring header stage_writes (ValueLeftOut).
+    u64 played_stage_writes{};
     Tegra::MaxwellDeviceMemoryManager* device_memory{};
     void CopyTrackerBytes(TrackerRecord& record, u64 vertex_program);
     /// Step 7's verify (spec 6.4, the design's 2.5 read compare): a ring packet's read log, filled
@@ -1044,6 +1054,7 @@ private:
         u64 null_slots_unkept{};
         std::array<u64, static_cast<size_t>(Value::Count)> checks{};
         std::array<u64, static_cast<size_t>(Value::Count)> mismatches{};
+        u64 left_out{};
     };
     struct ValueCounters {
         std::array<std::atomic<u64>, 2> fills{};
@@ -1057,6 +1068,7 @@ private:
         std::atomic<u64> null_slots_unkept{};
         std::array<std::atomic<u64>, static_cast<size_t>(Value::Count)> checks{};
         std::array<std::atomic<u64>, static_cast<size_t>(Value::Count)> mismatches{};
+        std::atomic<u64> left_out{}; ///< Step 7: handle values GPUMem wrote since the fill
     };
     ValueCounters value_counters;
     ValueCounts reported_values;
