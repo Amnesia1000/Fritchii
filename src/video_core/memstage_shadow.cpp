@@ -220,6 +220,8 @@ enum class LevelType : u8 {
     CacheCall,    ///< a closure tagged StageTag::Cache; id: its address in the executable
     // 6b
     LevelDraw,    ///< a draw the stage cannot serve (THREAD = 2); id: the kind
+    // 7
+    CbGpuWritten, ///< constant buffer words onto GPU-written buffer data, the window open
 };
 enum class EngineType : u32 { KeplerCompute, KeplerMemory, MaxwellDMA, Fermi2D, Other };
 
@@ -345,6 +347,9 @@ std::string LevelName(u64 key) {
         break;
     case LevelType::LevelDraw:
         what = fmt::format("level draw (kind {})", id);
+        break;
+    case LevelType::CbGpuWritten:
+        what = "constant buffer words onto GPU-written data (the window open)";
         break;
     }
     return fmt::format("{} ch{}", what, channel);
@@ -962,17 +967,18 @@ void StageWriteWords(State& s, Copy& c, GPUVAddr address, const u32* data, u64 s
     }
     // Step 7, the window open (Fable's review, A): words onto GPU-written buffer data. A served
     // download the back makes before this entry would copy the GPU's older bytes over them, and
-    // the claim would then upload those. So GPUMem comes level here, before the write, and applies
-    // the claim at once: the mark changes at the back's position, with no download in between.
+    // the claim would then upload those. Coming level and claiming at once is not enough: the
+    // packets of this entry's earlier draws are still in ring B (a writing draw into these pages,
+    // a join's copy) and the claim's download would be recorded before them. So the entry turns
+    // hard here, before the write: the back runs it in a level run and writes the words with its
+    // own code, in stream order (re-review N1). The words written before in this entry are the
+    // same bytes; the back writes them again.
     const auto& backend = link.Backend();
-    bool claim_now = false;
     if (ahead && !pieces.empty() && backend.ranges_gpu_written != nullptr &&
         backend.ranges_gpu_written(backend.context, pieces.data(), pieces.size())) [[unlikely]] {
         link.NoteWriteLevel();
-        if (!link.StageLevel(s.processing_position, MemoryStageLink::LevelReason::Claim)) {
-            return; // GPUMem is stopping
-        }
-        claim_now = backend.apply_ranges != nullptr;
+        Hard(s, LevelType::CbGpuWritten, 0);
+        return;
     }
     // The stage's own ring keeps these writes with their entry while the window's verify runs
     // (the read compare leaves them out, the image check looks for them); the emulator's write
@@ -1004,10 +1010,6 @@ void StageWriteWords(State& s, Copy& c, GPUVAddr address, const u32* data, u64 s
         }
     } else {
         c.memory->WriteBlockStage(address, data, size);
-    }
-    if (claim_now) {
-        backend.apply_ranges(backend.context, pieces.data(), pieces.size());
-        return;
     }
     s.ring_ranges.insert(s.ring_ranges.end(), pieces.begin(), pieces.end());
 }
