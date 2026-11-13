@@ -119,6 +119,7 @@
 //   copies of the copies an unfollowed entry left stale. The back is parked at both moments.
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <chrono>
 #include <cstring>
@@ -606,10 +607,35 @@ std::string WordName(const SegmentInfo& info, u32 index) {
 
 /// The stage's program key for the facts table: what selects the programs, as the stage sees it
 /// (the program region and every pipeline slot's registers, native addresses included).
+/// Step 7: 8-byte words in four independent FNV-1a lanes. The byte loop was 392 dependent
+/// multiplies, about 0.4 us for every served draw on the back (its facts publish) and again for
+/// every fill on GPUMem; both sides use this one function, so their keys stay equal. As with
+/// the bytes, each step is a bijection of the lane, so inputs one word apart never collide.
 template <typename E>
 u64 ProgramKey(const E& e) {
-    u64 hash = HashBytes(&e.regs.program_region, sizeof(e.regs.program_region));
-    return HashBytes(&e.regs.pipelines, sizeof(e.regs.pipelines), hash);
+    static_assert(sizeof(e.regs.program_region) == 8);
+    static_assert(sizeof(e.regs.pipelines) % 32 == 0);
+    constexpr u64 Prime = 0x100000001b3ULL;
+    std::array<u64, 4> lanes{0xcbf29ce484222325ULL, 0x84222325cbf29ce4ULL, 0x9e3779b97f4a7c15ULL,
+                             0xc2b2ae3d27d4eb4fULL};
+    u64 word;
+    std::memcpy(&word, &e.regs.program_region, sizeof(word));
+    lanes[0] = (lanes[0] ^ word) * Prime;
+    const auto* const bytes = reinterpret_cast<const u8*>(&e.regs.pipelines);
+    for (size_t offset = 0; offset < sizeof(e.regs.pipelines); offset += 32) {
+        for (size_t lane = 0; lane < 4; ++lane) {
+            std::memcpy(&word, bytes + offset + lane * 8, sizeof(word));
+            lanes[lane] = (lanes[lane] ^ word) * Prime;
+        }
+    }
+    u64 hash = lanes[0];
+    for (size_t lane = 1; lane < 4; ++lane) {
+        hash = (hash ^ lanes[lane]) * Prime;
+    }
+    hash ^= hash >> 33;
+    hash *= 0xff51afd7ed558ccdULL;
+    hash ^= hash >> 33;
+    return hash;
 }
 
 /// One draw the shadow issued, waiting for the back's.
