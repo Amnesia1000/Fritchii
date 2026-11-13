@@ -278,6 +278,20 @@ when the device is made.
 FRITCHII_MEMSTAGE_SEAM_STATS=1 (boot, diagnostic): the memory seam's stats line (EXP123) every
 10 s also with EXP123 = 0, which shows what the seam carries at today's timing.
 
+### FRITCHII_MEMSTAGE_VERIFY
+
+FRITCHII_MEMSTAGE_VERIFY=N (boot, diagnostic, default 0 = off; the memory stage's sub-step 2b,
+fable_memstage_step2_spec.md 5.3): with EXP123 = 2, every Nth draw, dispatch and operation
+packet logs what its fill read from game memory (uniforms copied to the stream, buffer uploads
+with their staged bytes, cached ranges bound without an upload, storage and table addresses and
+size words, compute pointers, the inline page write), and at the old read position (a draw's or
+dispatch's first play; an operation's end) reads it all again: bytes and values are compared,
+bound ranges are asked whether the CPU wrote them since. Differences are counted by kind; the
+first 16 are logged as "Memory seam (5.3)" with the kind, address, size and the programs. Must
+read 0. Reads past 1 MiB a packet are not logged (counted as "not logged"). The counts are in the
+"memory seam read log" line of EXP123's stats every 10 s. N = 8 is the spec's value; N = 1 checks
+every packet (slower).
+
 ### FRITCHII_JIT_DISPATCH_BITS
 
 FRITCHII_JIT_DISPATCH_BITS (boot, default 20; fable52_answer_guest 2.1): the A64 JIT's fast
@@ -1041,6 +1055,32 @@ fence commits a second with entries each, deferred entries and plays a second, t
 above, entries a second by kind (which kinds OoT uses at all: convert, multi-range, texel
 buffers), fills by site with entries each, syncs by kind, and entries run outside any fill by
 kind. Compare 0 and 1 with profile_toggle.py ("back us a draw", heavy-phase market, 4 cycles).
+
+EXP123 = 2 (sub-step 2b, spec 4 and 6.2): as 1, and each draw and dispatch is filled once,
+before the texture work. The draw's fill (MemStage::FillDraw, at the rasterizer's draw site after
+the vertex repack layout) runs SetUniformBuffersState, every prepared stage's storage binds, the
+texture buffer unbinds, UpdateGraphicsBuffers, BindHostGeometryBuffers and every stage's
+BindHostStageBuffers; the dispatch's (MemStage::FillDispatch, before ComputePipeline::Configure)
+the uniform state, the storage binds and shader hash, the texture buffer unbinds,
+UpdateComputeBuffers and BindHostComputeBuffers. Configure no longer calls the buffer cache: it
+plays the packet's sections where the calls were (the geometry after the texture buffer binds,
+each stage after Acquire and before its image descriptors, the dispatch's section before its
+image descriptors). When Configure returns, true or false, whatever is left is played (the cache
+believes those uploads are on their way); descriptors left then are dropped with the draw.
+Descriptor entries take the pipeline's form (descriptor buffer or not), as the fill runs before
+Acquire. Pipelines with texture or image buffers keep their fill in Configure as with 1
+("late fill": the binds need the texture cache's views). The indirect dispatch's ObtainBuffer, the
+extent probes, list page copies and draw indirect buffers stay where they are (fill and play at
+the call, as with 1). The tick guard (5.5): when the scheduler submitted between a packet's fill
+and a play, the play gives the buffer cache's staging buffers stamped with the fill's tick and
+the buffers the fill marked used the current tick (counted "tick moved", the first 16 logged with
+the caller of the submit; expected near 0). The stats line gets a "memory seam 2b" line: held and
+late fill draws and dispatches a second, packets not held (arena busy on another thread), tick
+moved, rest plays (and descriptors dropped), descriptor form mismatches (must be 0), and fill
+and play time with EDEN_NX2_GPU_PROFILE. The GPU profile gets two zones, "memory fill" (every fill
+at 2, the buffer cache's own work included: what leaves the back in step 6) and "memory play".
+FRITCHII_MEMSTAGE_VERIFY adds the read log (5.3). Compare 1 and 2 with profile_toggle.py ("back us
+a draw", heavy-phase market, 4 cycles).
 
 ### EXP101
 
