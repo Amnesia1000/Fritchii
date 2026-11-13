@@ -584,6 +584,7 @@ private:
         std::atomic<u64> served_ns{};
         std::atomic<u64> back_sleeps{};
         std::atomic<u64> stage_sleeps{};
+        std::atomic<u64> stage_input_sleeps{}; ///< of stage_sleeps, waiting for the front
         std::array<std::atomic<u64>, static_cast<size_t>(Check::Count)> checks{};
         // THREAD = 2.
         std::array<std::atomic<u64>, static_cast<size_t>(Served::Count)> served_calls{};
@@ -634,6 +635,7 @@ private:
         u64 served_ns{};
         u64 back_sleeps{};
         u64 stage_sleeps{};
+        u64 stage_input_sleeps{};
         std::array<u64, static_cast<size_t>(Check::Count)> checks{};
         std::array<u64, static_cast<size_t>(Served::Count)> served_calls{};
         std::array<u64, 4> entries{};
