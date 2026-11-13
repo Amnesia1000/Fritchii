@@ -1124,6 +1124,30 @@ public:
     [[nodiscard]] u64 RangedOverflowPosition() const {
         return ranged_overflow_position;
     }
+    /// EXP126 (live; fable_qmd_wait_brief piece 2): 0 WriteStamp counts the ranged overflow for
+    /// every address (as before), 1 it does not, 2 as 0 while the QMD copy compares what 1
+    /// would have served (NoteQmdTrial).
+    [[nodiscard]] static int OverflowFloorMode();
+    [[nodiscard]] static bool OverflowFloorOff() {
+        return OverflowFloorMode() == 1;
+    }
+    /// EXP126 = 2: a QMD read today waits for compared with what 1 would have served
+    /// (`overlay`: the trial overlay a patch would have made, else guest memory read before the
+    /// wait) once the wait is over; `differed`: the 256 bytes were not the same (must stay 0).
+    void NoteQmdTrial(bool overlay, bool differed) {
+        ++floor_stats.trial_compared[overlay ? 1 : 0];
+        if (differed) {
+            ++floor_stats.trial_differed;
+        }
+    }
+    /// EXP126 = 2: a patch nothing but the overflow refused built a trial overlay (not served).
+    void NoteQmdTrialBuilt() {
+        ++floor_stats.trial_built;
+    }
+    /// EXP126 = 2: a read 1 would have served not compared (an upload shadow of it is queued).
+    void NoteQmdTrialSkipped() {
+        ++floor_stats.trial_skipped;
+    }
     void NoteQmdPatch(QmdPatchOutcome outcome) {
         ++floor_stats.patches[static_cast<size_t>(outcome)];
     }
@@ -1476,7 +1500,8 @@ private:
     /// The newest ranged write RangeLastWrite dropped from its full ring (fable_qmd_wait_brief
     /// 4.1). The ring scans (QueuedGuestWriters; MemoryWriterTarget through
     /// last_memory_write_position) no longer see its range, so for them it may write anything.
-    /// Its bytes were stamped when it was noted; WriteStamp counts it as a floor of its own.
+    /// Its bytes were stamped when it was noted, so WriteStamp needs it only as a floor of its
+    /// own, which EXP126 = 1 leaves out.
     u64 ranged_overflow_position{};
     u64 session{};
     /// EnableWriteStamps' tables: a slot keeps its newest stamp, the tag that made it, and the
@@ -1620,7 +1645,7 @@ private:
     u32 publishes{};
     void ReportBatched();
     /// The QMD wait floor counters (fable_qmd_wait_brief piece 1), front only, logged every 5 s
-    /// as "QMD wait floor" with EDEN_NX2_GPU_PROFILE on (ReportQmdFloor).
+    /// as "QMD wait floor" with EDEN_NX2_GPU_PROFILE or EXP126 on (ReportQmdFloor).
     struct FloorStats {
         u64 overflows;       ///< RangeLastWrite dropped the oldest of a full ring
         u64 qmd_reads;       ///< NoteQmdRead
@@ -1639,6 +1664,12 @@ private:
         u64 dma_waits;          ///< WaitForMemoryWriters(site, begin, end) that waited
         u64 dma_overflow_waits; ///< ... whose target is the ranged overflow
         u64 dma_overflow_words; ///< ... and the ring words they waited for
+        /// EXP126 = 2: reads compared (from memory, from a trial overlay), those that differed,
+        /// trial overlays built, reads not compared.
+        std::array<u64, 2> trial_compared;
+        u64 trial_differed;
+        u64 trial_built;
+        u64 trial_skipped;
     };
     FloorStats floor_stats{};
     std::chrono::steady_clock::time_point floor_since{};

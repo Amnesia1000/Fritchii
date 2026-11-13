@@ -844,15 +844,22 @@ u64 GpuSplit::WriteStamp(u64 device, u64 size, GPUVAddr address, u64 skip_tag) c
     if (!write_stamps) {
         return write_position;
     }
+    // EXP126 = 1 (fable_qmd_wait_brief piece 2): without the ranged overflow. RangeLastWrite
+    // stamps a ranged write's bytes before it touches the ring, so a dropped one is still found
+    // over its own bytes below; only its count for every other address goes.
+    const u64 overflow = OverflowFloorOff() ? 0 : ranged_overflow_position;
     u64 stamp = (std::max)({write_stamp_floor, unknown_write_position,
                             last_unbounded_writer_position, last_unranged_position,
-                            last_function_position, last_method_write_position,
-                            ranged_overflow_position});
+                            last_function_position, last_method_write_position, overflow});
     if (size != 0) {
         stamp = (std::max)(stamp, StampOf(device, device + size, false, skip_tag));
         stamp = (std::max)(stamp, StampOf(address, address + size, true, skip_tag));
     }
     return (std::min)(stamp, write_position);
+}
+
+int GpuSplit::OverflowFloorMode() {
+    return VideoCore::Nx2Debug::Experiment(126);
 }
 
 GpuSplit::StampWhy GpuSplit::WriteStampWhy(u64 device, u64 size, GPUVAddr address,
@@ -891,8 +898,13 @@ GpuSplit::StampWhy GpuSplit::WriteStampWhy(u64 device, u64 size, GPUVAddr addres
         {ranged_overflow_position, StampTerm::RangedOverflow},
     }};
     StampWhy why{0, 0, 0, StampTerm::None};
+    const bool floor_off = OverflowFloorOff();
     for (const auto& [position, term] : terms) {
-        if (term != StampTerm::RangedOverflow) {
+        if (term == StampTerm::RangedOverflow) {
+            if (floor_off) {
+                continue; // As WriteStamp
+            }
+        } else {
             why.floorless = (std::max)(why.floorless, position);
         }
         if (position > why.term_position) {
@@ -963,7 +975,8 @@ void GpuSplit::ReportQmdFloor() {
     const FloorStats s = floor_stats;
     floor_stats = {};
     floor_since = now;
-    if (!Nx2Profile::Enabled()) {
+    const int mode = OverflowFloorMode();
+    if (!Nx2Profile::Enabled() && mode == 0) {
         return;
     }
     const auto rate = [&](u64 count) { return static_cast<double>(count) / elapsed.count(); };
@@ -990,7 +1003,7 @@ void GpuSplit::ReportQmdFloor() {
         return rate(s.patches[static_cast<size_t>(outcome)]);
     };
     LOG_INFO(HW_GPU,
-             "QMD wait floor: ranged ring overflows {:.0f}/s (ring of {}); QMD reads "
+             "QMD wait floor (EXP126={}): ranged ring overflows {:.0f}/s (ring of {}); QMD reads "
              "{:.0f}/s, {:.0f}/s with the overflow queued, {:.0f} ring words from it to the write "
              "position on average, {} most; small patches/s: {:.0f} a holder took, {:.0f} overlay "
              "from memory made ({:.0f} with the overflow queued), refused {:.0f} unmapped or "
@@ -999,8 +1012,9 @@ void GpuSplit::ReportQmdFloor() {
              "{:.0f} of them by the overflow alone; block/page stamps against the exact scan "
              "(writer found, older or unbounded only, nothing): patches {}/{}/{}, reads "
              "{}/{}/{}; macro DMA read waits {:.0f}/s, {:.0f}/s on the overflow ({:.0f} words "
-             "each)",
-             rate(s.overflows), MaxRangedWrites(),
+             "each); trial (EXP126=2): {} reads compared from memory, {} from a trial overlay, "
+             "{} differed, {} trial overlays built, {} not compared",
+             mode, rate(s.overflows), MaxRangedWrites(),
              rate(s.qmd_reads), rate(s.reads_floor_up),
              s.reads_floor_up != 0 ? static_cast<double>(s.floor_words) /
                                          static_cast<double>(s.reads_floor_up)
@@ -1015,7 +1029,15 @@ void GpuSplit::ReportQmdFloor() {
              rate(s.dma_overflow_waits),
              s.dma_overflow_waits != 0 ? static_cast<double>(s.dma_overflow_words) /
                                              static_cast<double>(s.dma_overflow_waits)
-                                       : 0.0);
+                                       : 0.0,
+             s.trial_compared[0], s.trial_compared[1], s.trial_differed, s.trial_built,
+             s.trial_skipped);
+    if (s.trial_differed != 0) {
+        LOG_ERROR(HW_GPU,
+                  "QMD wait floor (EXP126=2): {} QMD reads differed from what EXP126=1 would "
+                  "have served in the last {:.0f} s",
+                  s.trial_differed, elapsed.count());
+    }
 }
 
 bool GpuSplit::HasQueuedMemoryWriters(GPUVAddr begin, GPUVAddr end) {

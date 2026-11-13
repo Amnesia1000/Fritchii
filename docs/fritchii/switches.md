@@ -1560,9 +1560,35 @@ dispatches with values a second (values each, how many filled in Configure, how 
 skipped and their values), QMDs a second (and reads that ran no dispatch), null pointer slots,
 and the verify counters below. Values below 3 change nothing here.
 
+### EXP126
+
+EXP126 (live, 0 = off, the default; fable_qmd_wait_brief piece 2): the ranged ring's overflow
+(below) out of GpuSplit::WriteStamp. With 0 a dropped ranged write counts as a write to every
+address for the write stamps, so with the back more than about 5,000 ring words behind (the
+Castle Town market) every QMD read the front's copy cannot serve waits for the whole backlog
+("qmd read", about 95 waits and 125 to 150 ms a second), and small patches cannot become
+overlays. With 1 it does not: RangeLastWrite stamps each ranged write's bytes before it touches
+the ring, so a dropped write is still found over its own bytes, and stamps only err newer (a
+collision makes one newer, never older). Unranged 3D writes still count for every address;
+QueuedGuestWriters and the macro DMA reads (MemoryWriterTarget) scan the ring and keep the
+overflow as before. An overlay from memory made while the overflow is queued is kept out of the
+EXP13 feed (its unbounded-writer check sees the overflow). The same hole as before stays: memory
+mapped at two GPU addresses is stamped by the address it was written through only.
+With 2 everything behaves as 0, and the QMD copy checks what 1 would have served: at a patch
+nothing but the overflow refused it builds the overlay 1 would make into a small trial table
+(never served); at a read that waits and would not at 1 it takes that trial overlay, or reads
+guest memory before the wait, and compares it with what it reads after the wait. "differed" on
+the line below must be 0 (the first 16 are logged as errors with the word); comparisons are
+skipped where an upload shadow of the QMD is queued. To judge 1: profile_toggle.py on EXP126,
+0 against 1, market heavy phase uncapped with EDEN_NX2_GPU_PROFILE, and watch "qmd read" in the
+front waits by site, the EXP13 lines' "after a wait" and "ranged overflow" waits, overlays from
+memory, the fence writers wait and fps; with 1 the EXP13 checks (payload differs, unpredicted,
+resyncs, auto-off, bound violated) and "DMA snapshot ... differed" must stay 0.
+
 ### QMD wait floor line
 
-"QMD wait floor" (HW_GPU, every 5 s with EDEN_NX2_GPU_PROFILE on; fable_qmd_wait_brief piece 1,
+"QMD wait floor (EXP126=n)" (HW_GPU, every 5 s with EDEN_NX2_GPU_PROFILE or EXP126 on;
+fable_qmd_wait_brief piece 1,
 counting only): why the front's QMD scheduler copy (EXP13 = 2 to 4) waits at "qmd read". The
 front keeps at most 256 ranged 3D writes (constant buffer words, reports; EDEN_NX2_RANGED_MAX);
 at the next one the oldest is dropped and its position, `ranged_overflow_position`, counts for
@@ -1584,7 +1610,9 @@ The line gives:
   nothing (a hash collision, or a page stamp of a write elsewhere in the page), as counts for
   the window: patches a/b/c, reads a/b/c;
 - macro DMA read waits a second (WaitForMemoryWriters with a range) and those whose target is the
-  ranged overflow, with the ring words each.
+  ranged overflow, with the ring words each;
+- EXP126 = 2: reads compared from memory and from a trial overlay, how many differed, trial
+  overlays built and reads not compared (counts for the window).
 
 ### EXP101
 

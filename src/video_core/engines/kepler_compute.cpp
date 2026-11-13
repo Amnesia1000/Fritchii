@@ -131,6 +131,33 @@ struct FrontQmdMirror {
     static constexpr size_t MaxShadows = 64;
     static constexpr u64 ShadowBytes = 4096;
 
+    /// EXP126 = 2 (fable_qmd_wait_brief 4.3): the overlay from memory EXP126 = 1 would have made
+    /// at a patch nothing but the ranged overflow refused, kept aside (never served); a read that
+    /// waits today compares it with what it reads after the wait. One slot per 256-byte block,
+    /// direct mapped: a lost one only means fewer comparisons.
+    struct Trial {
+        const void* space;
+        GPUVAddr address;
+        u64 position; ///< The patch's; 0 = empty
+        NativeQmdScheduler::Descriptor words;
+    };
+    static constexpr size_t MaxTrials = 64;
+    std::array<Trial, MaxTrials> trials{};
+    Trial& TrialSlot(GPUVAddr address) {
+        return trials[static_cast<size_t>(address / BlockBytes) % MaxTrials];
+    }
+    const Trial* FindTrial(const void* space, GPUVAddr address) const {
+        const Trial& trial = trials[static_cast<size_t>(address / BlockBytes) % MaxTrials];
+        return trial.position != 0 && trial.space == space && trial.address == address ? &trial
+                                                                                       : nullptr;
+    }
+    void DropTrial(const void* space, GPUVAddr address) {
+        Trial& trial = TrialSlot(address);
+        if (trial.space == space && trial.address == address) {
+            trial.position = 0;
+        }
+    }
+
     FrontQmdMirror() {
         scheduler.table = &table;
     }
@@ -288,6 +315,9 @@ struct FrontQmdMirror {
         for (Shadow& shadow : shadows) {
             shadow.id = 0;
             shadow.position = 0;
+        }
+        for (Trial& trial : trials) {
+            trial.position = 0;
         }
         evicted = 0;
         reads.clear();
@@ -2690,6 +2720,10 @@ bool KeplerCompute::FrontReadQmd(VideoCommon::GpuSplit& split, u64 address,
         return true;
     }
     info.source = target > done ? Prediction::Source::Waited : Prediction::Source::Memory;
+    // EXP126 = 2: what 1 would have served (1 guest memory before the wait, 2 a trial overlay),
+    // compared with what is read after it.
+    u8 trial_case = 0;
+    NativeQmdScheduler::Descriptor trial_words;
     if (target > done) {
         // Diagnostics only (reads rarely wait now): what set the target.
         const auto writers = split.QueuedGuestWriters(done, address, *device, size);
@@ -2737,6 +2771,32 @@ bool KeplerCompute::FrontReadQmd(VideoCommon::GpuSplit& split, u64 address,
             !evicted && stamped
                 ? split.ExactWriterCheck(done, address, *device, size, why.term_position)
                 : u8{3});
+        if (VideoCommon::GpuSplit::OverflowFloorMode() == 2 &&
+            (overlay == nullptr || overlay->position <= done)) {
+            // As this function would decide with the target 1 gives (fable_qmd_wait_brief 4.3):
+            // the trial overlay a patch would have made, if nothing stamped after it; else, with
+            // no overlay of it queued, guest memory now if nothing queued may write the QMD.
+            // Not with an upload shadow of it queued (which may win at 1): not compared.
+            const FrontQmdMirror::Trial* const trial = mirror.FindTrial(&memory_manager, address);
+            const bool shadow_queued = shadow != nullptr && block_position > done;
+            u64 floorless = why.floorless;
+            if (overlay == nullptr && trial == nullptr && mirror.evicted > done) {
+                floorless = (std::max)(floorless, mirror.evicted);
+            }
+            const bool trial_serves =
+                trial != nullptr && trial->position > done && why.floorless <= trial->position;
+            const bool memory_serves = !trial_serves && floorless <= done &&
+                                       (trial == nullptr || trial->position <= done);
+            if ((trial_serves || memory_serves) && shadow_queued) {
+                split.NoteQmdTrialSkipped();
+            } else if (trial_serves) {
+                trial_words = trial->words;
+                trial_case = 2;
+            } else if (memory_serves) {
+                memory_manager.ReadBlockUnsafe(address, trial_words.data(), size);
+                trial_case = 1;
+            }
+        }
         ++mirror.window_waits;
         split.WaitUntil(target, VideoCommon::DrainSite::QmdRead);
         Prediction::NoteMirror(Prediction::Mirror::Waited);
@@ -2745,6 +2805,23 @@ bool KeplerCompute::FrontReadQmd(VideoCommon::GpuSplit& split, u64 address,
         Prediction::NoteMirror(Prediction::Mirror::Memory);
     }
     memory_manager.ReadBlockUnsafe(address, descriptor.data(), size);
+    if (trial_case != 0) {
+        const bool differed = trial_words != descriptor;
+        split.NoteQmdTrial(trial_case == 2, differed);
+        static u32 logged{};
+        if (differed && logged < 16) {
+            ++logged;
+            size_t word = 0;
+            while (word < descriptor.size() && trial_words[word] == descriptor[word]) {
+                ++word;
+            }
+            LOG_ERROR(HW_GPU,
+                      "QMD wait floor (EXP126=2): QMD {:#x} read after the wait differs from what "
+                      "EXP126=1 would have served ({}): word {} {:#x}, would have been {:#x}",
+                      address, trial_case == 2 ? "trial overlay" : "memory before the wait", word,
+                      descriptor[word], trial_words[word]);
+        }
+    }
     // An all-zero QMD: the words may still be in the buffer cache.
     if (std::ranges::all_of(descriptor, [](u32 word) { return word == 0; })) {
         unknown = true;
@@ -2830,6 +2907,11 @@ void KeplerCompute::FrontPatchOverlays(VideoCommon::GpuSplit& split, FrontState&
         }
         // The QMD wait floor counters (fable_qmd_wait_brief piece 1): each outcome.
         using Outcome = VideoCommon::QmdPatchOutcome;
+        const bool trial_mode = VideoCommon::GpuSplit::OverflowFloorMode() == 2;
+        if (trial_mode) {
+            // A later patch of the block: its trial overlay is rebuilt below or not compared.
+            mirror.DropTrial(&memory_manager, block_address);
+        }
         if (block_patched[block]) {
             split.NoteQmdPatch(Outcome::Holder);
             continue;
@@ -2859,6 +2941,19 @@ void KeplerCompute::FrontPatchOverlays(VideoCommon::GpuSplit& split, FrontState&
                 stamped ? split.ExactWriterCheck(done, block_address, *device, size,
                                                  why.term_position, own)
                         : u8{3});
+            if (trial_mode && why.floorless <= done) {
+                // EXP126 = 2: the overlay 1 would make here, kept aside (never served).
+                auto& trial = mirror.TrialSlot(block_address);
+                memory_manager.ReadBlockUnsafe(block_address, trial.words.data(), size);
+                const GPUVAddr from = (std::max)(first, block_address);
+                const GPUVAddr to = (std::min)(last, block_address + size);
+                std::memcpy(reinterpret_cast<u8*>(trial.words.data()) + (from - block_address),
+                            data + (from - first), to - from);
+                trial.space = &memory_manager;
+                trial.address = block_address;
+                trial.position = position;
+                split.NoteQmdTrialBuilt();
+            }
             continue; // Another write may still land there
         }
         if (split.RangedOverflowPosition() > done) {
