@@ -4,6 +4,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <thread>
 
@@ -89,9 +90,9 @@ public:
     /// stage's back serves GPUMem's syncs, and GPUMem can hold the buffer cache's lock while it
     /// waits for one: FRITCHII_MEMSTAGE_AHEAD). Set per thread; while set, a contended lock calls
     /// it between tries with the holder's id (`first`: the first try of this wait). While it
-    /// answers true (the holder is the thread it may have to work for) the wait does not sleep;
-    /// on false it spins and sleeps as usual, and looks again after each wake (the holder may have
-    /// changed). Null everywhere else.
+    /// answers true (the holder is the thread it may have to work for) the wait only spins and
+    /// yields; on false it spins, then backs off in short timed sleeps, asking again each time
+    /// (never a futex sleep: the holder may change without a wake). Null everywhere else.
     using ContendedHook = bool (*)(std::thread::id holder, bool first);
     static inline thread_local ContendedHook t_contended_hook = nullptr;
 
@@ -141,13 +142,11 @@ private:
                     Pause();
                     continue;
                 }
-                // As below: held with sleepers, taken this way it stays marked. After a wake,
-                // spin and ask the hook again.
-                if (state.exchange(2, std::memory_order_acquire) == 0) {
-                    return;
-                }
-                state.wait(2, std::memory_order_relaxed);
-                spin = 0;
+                // Never a futex sleep here: the holder can change to the thread the hook works
+                // for without a wake (an unlock with no sleepers marked notifies nobody, and the
+                // owner is stored after the state), so the wait backs off in short timed sleeps
+                // and asks the hook again each time.
+                std::this_thread::sleep_for(std::chrono::microseconds{50});
             }
         }
         for (int spin = 0; spin < SpinCount; ++spin) {
