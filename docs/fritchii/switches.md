@@ -609,7 +609,10 @@ session after a catch-up could not finish (below; logged).
   while the compare runs) or a pending game-side mark covers them; a difference over a mark the
   cache took is "game write, marked". A value is left out only when every changed byte is
   GPUMem's. The read log line adds "ring packets compared at the take", "left out as GPUMem's own
-  later writes", ring packets "with a CPU-written mark since the fill", "GPUMem's writes kept out
+  later writes", ring packets "with a CPU-written mark since the fill", "async GPU completions
+  over-read" (a query result GPUFencingThread wrote when the GPU finished, on uploaded bytes the
+  packet does not bind: reported, not a failure; inside a range the packet binds it fails as an
+  emulator write), "GPUMem's writes kept out
   of the write ring" and "CPU-written marks noted" (marks taken anywhere: served and inline gathers
   and invalidations, InnerInvalidation, game cores' trapped stores). Keep
   FRITCHII_MEMSTAGE_RING_VERIFY (compare b's hash) on with it.

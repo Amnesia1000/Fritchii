@@ -342,7 +342,7 @@ constexpr std::array<const char*, static_cast<size_t>(MemStage::DiffClass::Count
         "emulator write, download landing", "emulator write",
         "game write, marked",               "game write, mark already taken",
         "untracked read changed",           "gather on the back inside Configure",
-        "unclassified",
+        "unclassified",                     "async GPU completion, over-read",
     };
 constexpr std::array<const char*, static_cast<size_t>(MemStage::Sync::Count)> SYNC_NAMES{
     "finish", "wait", "submit for host read", "multi-range", "kept words",
@@ -2634,6 +2634,13 @@ void MemStage::ClassifyDiff(const ReadLog& log, const ReadRecord& record, u64 fi
     DiffClass kind;
     if (record.how == How::Range && gathers != 0) {
         kind = DiffClass::BackGather;
+    } else if (found && !writer.landing && !own && writer.via != nullptr &&
+               std::strcmp(writer.via, "GPU write: query-completion") == 0 &&
+               std::strncmp(writer.thread.data(), "GPUFencingThread", 16) == 0) {
+        // A query result the fencing thread wrote when the GPU finished (not at a stream
+        // position, so a fill can meet it at any distance from its play), on bytes the packet
+        // does not bind: reported apart. Inside a range the packet binds it stays a failure.
+        kind = DiffClass::AsyncOverRead;
     } else if (found) {
         kind = writer.landing ? DiffClass::Landing : DiffClass::EmulatorWrite;
     } else if (tracker_holds && device && complete) {
@@ -3290,14 +3297,16 @@ void MemStage::LogStats() {
                      "{}, game write mark already taken {}, untracked read changed {}, gather on "
                      "the back inside Configure {}, unclassified {}; over-read {}, changed inside "
                      "a range the packet binds {}; ring wrapped {}; on the holding thread: "
-                     "gathers applied {}, FlushRegion texture {} query {} buffer {}",
+                     "gathers applied {}, FlushRegion texture {} query {} buffer {}; async GPU "
+                     "completions over-read {}",
                      landings + emulator, sites.empty() ? "" : " (", sites,
                      sites.empty() ? "" : ")", by_class(DiffClass::GameMarked), taken, untracked,
                      by_class(DiffClass::BackGather), unclassified, delta(&Counts::diff_over), own,
                      wrapped, delta(&Counts::gathers_held),
                      current.flush_regions_held[0] - reported.flush_regions_held[0],
                      current.flush_regions_held[1] - reported.flush_regions_held[1],
-                     current.flush_regions_held[2] - reported.flush_regions_held[2]);
+                     current.flush_regions_held[2] - reported.flush_regions_held[2],
+                     by_class(DiffClass::AsyncOverRead));
             // Fails on any unexplained difference, and on a wrapped ring (the run is not valid:
             // the writers since some fills are unknown).
             const bool gate_pass = emulator + unclassified == 0 && wrapped == 0;
@@ -3305,10 +3314,10 @@ void MemStage::LogStats() {
                      "  read log gate {}: unexplained {} (emulator writes that are not download "
                      "landings {}, unclassified {}); ring wrapped {}{}; mark already taken {} "
                      "(tracked reads); untracked read changed {}; changed inside a range the "
-                     "packet binds {}",
+                     "packet binds {}; async GPU completions over-read {} (reported)",
                      gate_pass ? "passed" : "FAILED", emulator + unclassified, emulator,
                      unclassified, wrapped, wrapped != 0 ? " (run not valid)" : "", taken,
-                     untracked, own);
+                     untracked, own, by_class(DiffClass::AsyncOverRead));
         }
     }
     const std::array<u64, 2> vertex_runs{
