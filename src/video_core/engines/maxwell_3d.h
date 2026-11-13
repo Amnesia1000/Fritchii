@@ -41,6 +41,7 @@ class MemoryManager;
 
 namespace VideoCommon {
 class GpuSplit;
+struct MemStageShadowAccess;
 }
 
 namespace VideoCore {
@@ -3107,10 +3108,15 @@ public:
             bool list_words{};
             u64 list_keep_id{};
         };
-        void ProcessMethodCall(Maxwell3D& maxwell3d, u32 method, u32 argument);
-        void Clear(Maxwell3D& maxwell3d, u32 layer_count);
+        // `Engine` is Maxwell3D, or the memory stage's copy of the registers (MemStageShadowEngine,
+        // memstage_shadow_engine.h): the same code runs on both (draw_manager.cpp instantiates both).
+        template <typename Engine>
+        void ProcessMethodCall(Engine& maxwell3d, u32 method, u32 argument);
+        template <typename Engine>
+        void Clear(Engine& maxwell3d, u32 layer_count);
         /// Draws the waiting instances. loop_continues is set when the loop goes on afterwards.
-        void DrawDeferred(Maxwell3D& maxwell3d, bool loop_continues = false);
+        template <typename Engine>
+        void DrawDeferred(Engine& maxwell3d, bool loop_continues = false);
         /// Instances after the first wait to be drawn together (DrawDeferred).
         [[nodiscard]] bool HasDeferredDraw() const noexcept {
             return (draw_state.draw_mode == DrawMode::Instance && draw_state.instance_count != 0) ||
@@ -3128,23 +3134,38 @@ public:
         bool first_folded{};
         /// Methods an instance loop writes between its draws; any other write ends the loop.
         [[nodiscard]] static bool IsInstanceLoopMethod(u32 method) noexcept;
-        void DrawArray(Maxwell3D& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 vertex_first, u32 vertex_count, u32 base_instance, u32 num_instances);
-        void DrawArrayInstanced(Maxwell3D& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 vertex_first, u32 vertex_count, bool subsequent);
-        void DrawIndex(Maxwell3D& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 index_first, u32 index_count, u32 base_index, u32 base_instance, u32 num_instances);
-        void DrawArrayIndirect(Maxwell3D& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology);
-        void DrawIndexedIndirect(Maxwell3D& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 index_first, u32 index_count);
-        void SetInlineIndexBuffer(Maxwell3D& maxwell3d, u32 index);
-        void SetInlineIndexBuffer(Maxwell3D& maxwell3d, u32 method, const u32* base_start, u32 amount);
-        void DrawBegin(Maxwell3D& maxwell3d);
+        template <typename Engine>
+        void DrawArray(Engine& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 vertex_first, u32 vertex_count, u32 base_instance, u32 num_instances);
+        template <typename Engine>
+        void DrawArrayInstanced(Engine& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 vertex_first, u32 vertex_count, bool subsequent);
+        template <typename Engine>
+        void DrawIndex(Engine& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 index_first, u32 index_count, u32 base_index, u32 base_instance, u32 num_instances);
+        template <typename Engine>
+        void DrawArrayIndirect(Engine& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology);
+        template <typename Engine>
+        void DrawIndexedIndirect(Engine& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 index_first, u32 index_count);
+        template <typename Engine>
+        void SetInlineIndexBuffer(Engine& maxwell3d, u32 index);
+        template <typename Engine>
+        void SetInlineIndexBuffer(Engine& maxwell3d, u32 method, const u32* base_start, u32 amount);
+        template <typename Engine>
+        void DrawBegin(Engine& maxwell3d);
         /// Instance folding (EDEN_NX2_FOLD_INSTANCES): as `count` draw.begin writes of the
         /// register's value, which is a later instance of an instance loop.
-        void AddLoopInstances(Maxwell3D& maxwell3d, u32 count);
-        void DrawEnd(Maxwell3D& maxwell3d, u32 instance_count = 1, bool force_draw = false);
-        void DrawIndexSmall(Maxwell3D& maxwell3d, u32 argument);
-        void DrawTexture(Maxwell3D& maxwell3d);
-        void UpdateTopology(Maxwell3D& maxwell3d);
-        void ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed, u32 instance_count);
-        void ProcessDrawIndirect(Maxwell3D& maxwell3d);
+        template <typename Engine>
+        void AddLoopInstances(Engine& maxwell3d, u32 count);
+        template <typename Engine>
+        void DrawEnd(Engine& maxwell3d, u32 instance_count = 1, bool force_draw = false);
+        template <typename Engine>
+        void DrawIndexSmall(Engine& maxwell3d, u32 argument);
+        template <typename Engine>
+        void DrawTexture(Engine& maxwell3d);
+        template <typename Engine>
+        void UpdateTopology(Engine& maxwell3d);
+        template <typename Engine>
+        void ProcessDraw(Engine& maxwell3d, bool draw_indexed, u32 instance_count);
+        template <typename Engine>
+        void ProcessDrawIndirect(Engine& maxwell3d);
         State draw_state{};
         DrawTextureState draw_texture_state{};
         IndirectParams indirect_state{};
@@ -3607,6 +3628,9 @@ private:
                            GPUVAddr source, u32 ram, u32 words);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
     void FinishFrontMacro(Core::System& system);
+    /// The closures the memory stage reads (StageTag, memstage_shadow.h), with fixed payloads.
+    struct StageCall;
+    friend struct VideoCommon::MemStageShadowAccess;
     // EXP22 bit 2: instance-loop groups held back and sent as DrawBatch entries.
     bool FrontBatchWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
                          u32 argument, u32 value, bool is_last_call, bool from_macro);

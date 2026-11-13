@@ -13,6 +13,7 @@
 
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "video_core/memory_stage_link.h"
 #include "video_core/vulkan_common/vk_enum_string_helper.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -615,6 +616,7 @@ void Buffer::SetObjectNameEXT(const char* name) const {
 
 void Buffer::Release() const noexcept {
     if (handle) {
+        const VideoCommon::MemoryStageLink::AllocatorOp allocator_op{allocator};
         vmaDestroyBuffer(allocator, handle, allocation);
     }
 }

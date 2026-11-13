@@ -303,16 +303,20 @@ site, thread and sequence (vk_mem_stage.cpp, "Who wrote", lists every hook). Eac
 - a class: "emulator write, download landing" or "emulator write" (the ring names a write newer
   than the fill over the changed bytes; counted by site), "game write, marked" (a game-side mark
   is pending, GPU::ForEachPendingCpuWrite; for a bound range, the tracker holds it), "game write,
-  mark already taken" (no mark left: the store landed after its mark was gathered), "gather on the
-  back inside Configure" (a bound range, and the drawing thread applied a gather since the fill;
-  the first gather's stack is logged), or "unclassified" (unmapped, or the ring wrapped);
-- a place: "over-read" (an upload's changed bytes outside every range the packet uses) or "own
-  data".
-The "memory seam read log classes" line has the counts by class and site, over-read and own
-data, ring wraps, and on the holding thread the gathers applied and FlushRegion calls by cache.
-The "read log gate" line: unexplained = emulator writes that are not download landings +
-unclassified; must be 0. "mark already taken" and "own data changed" are reported beside it and
-are not failures. Off, every hook costs one relaxed load and a branch.
+  mark already taken" (a tracked read, an upload or the inline page write, with no mark left: the
+  store landed after its mark was gathered, and nothing repairs it), "untracked read changed" (a
+  stream uniform or a value: no tracker, no mark expected, the next fill reads it again), "gather
+  on the back inside Configure" (a bound range, and the drawing thread applied a gather since the
+  fill; the first gather's stack is logged), or "unclassified" (unmapped, or the ring wrapped);
+- a place: "over-read" (an upload's changed bytes outside every range the packet binds) or
+  "inside a range the packet binds" (for a dispatch, whole storage buffers).
+The "memory seam read log classes" line has the counts by class and site, over-read and changed
+inside a bound range, ring wraps, and on the holding thread the gathers applied and FlushRegion
+calls by cache. The "read log gate" line says passed or FAILED: it fails on unexplained (emulator
+writes that are not download landings + unclassified) and on ring wrapped (the run is not valid;
+make the ring larger). "mark already taken", "untracked read changed" and "changed inside a range
+the packet binds" are reported beside it and are not failures (fable_memstage_readlog2.md). Off,
+every hook costs one relaxed load and a branch.
 
 ### FRITCHII_MEMSTAGE_VERIFY
 
@@ -351,6 +355,89 @@ fable_memstage_step2_spec.md 7.2): what the buffer cache side's stamps are.
   carried skipped, split (a number handed out in two ticks without a carry), unchecked
   (older than the 2^18-number ring) and epoch off. Early, late, split, epoch off and held
   must all read 0. Disagreements log the first 16 lines with the packet and both ticks.
+
+### FRITCHII_MEMSTAGE_SHADOW
+
+FRITCHII_MEMSTAGE_SHADOW (boot, default 0; the memory stage's piece 5b,
+fable_memstage_step6_spec.md 6.2): the future memory stage's inputs, run on the back thread and
+compared, never used. Off, each hook is one test of a flag (one per ring entry, per draw, per
+FlushCaching, per channel bind).
+- 1: before the back executes each ring entry, the stage's code classifies it (pass, work or
+  level: spec section 3, the Call entries by their stage tag in header bits 32-39) and applies
+  pass and work entries to its own copy of each Maxwell3D's registers, shadow RAM, constant
+  buffer bindings, root tables and draw manager. The draw manager is the same code on both
+  (DrawManager is a template on the engine, instantiated for Maxwell3D and for the stage's copy),
+  so the stage finds its draws with the back's own lines. Constant buffer words are computed
+  (range and offset), not written. After a level entry the copy is taken from the back again,
+  with the back's waiting method sink applied. At every draw the back issues: (a) the stage drew
+  at the same entry; (b) the stage's state at its draw equals the back's (the registers the
+  buffer cache reads through CacheInputs, the draw's registers, the constant buffer bindings, the
+  root tables, the draw state, execute_on, the channel, the engine; every dirty flag the stage
+  raised is raised on the back); (c) at the pipeline lookup, the facts table (keyed by the program
+  registers) against the pipeline's facts digest; (d) at FlushCaching, the device ranges of the
+  stage's constant buffer words against the back's invalidation ranges.
+- 2: as 1, and (b) compares the whole register file and the shadow RAM (slower).
+Every 10 s, "Memory stage shadow": entries/s pass, work, level; level runs/s and resyncs/s;
+draws/s compared (served, render-enable off, flushed from the method sink) and in level entries;
+the draw kinds of spec 3.4 (indirect, list, GPU count, texel buffers, diagnostics, host
+conditional); facts misses/s; watched-page hits (constant buffer words onto image pages or the
+texture/sampler tables: counted, and the entry is treated as level). "Memory stage shadow
+compare" gives a (missing, extra, position), b (dirty flags apart), c (conflicts; program keys
+that changed code; pipelines without a compared draw), d (missing, extra; flushes, strict ones)
+for the window and the session: **all must read 0**. "Memory stage shadow inside draws": what
+runs on the back between a draw's fill and its record, FlushRegion by the cache halves that ran
+(texture, buffer, query; the buffer half must stay 0 in play) and collected game writes applied.
+"Memory stage shadow level entries by kind and channel": the top 12, named by the 3D method, the
+engine, the closure (`call +0x...`: its address in the executable, for the symbol file), or the
+constant buffer case; this table is the go/no-go for piece 6b. The first 16 differences of each
+compare are logged as "Memory stage shadow (a/b/c/d)", (b) naming the registers. The stage
+implements the default constant buffer write; with EXP107 on, constant buffer words are level.
+Not covered yet: render_enable.mode is always level (the back asks the query cache), and the
+watched pages leave out shader code and query addresses.
+
+### FRITCHII_MEMSTAGE_THREAD
+
+FRITCHII_MEMSTAGE_THREAD (live, read at a frame end, default 0; the memory stage's step 6, piece
+6a, fable_memstage_step6_spec.md 6.1 and section 5): the buffer cache's two big fills on a thread
+of their own, by hand-off.
+- The thread, "GPUMem", exists while the GPU thread split runs (started and stopped with the
+  back) and sleeps at 0. It is not started with FRITCHII_MEMSTAGE_SPLIT_ALLOC=0 (logged).
+- 0: the fills run on the back (EXP123 = 2's early fill, as before).
+- 1: the draw's fill (MemStage::FillDraw) and the dispatch's (FillDispatch), and the buffer
+  recycler's idle destroys, run on GPUMem: the back posts the fill, GPUMem runs it, the back
+  waits (about 2,000 pauses of spinning, then a sleep). Same order and timing as 0, another
+  thread. The buffer cache's lock goes with the fill. Every other cache call stays on the back,
+  where it was. A sync inside a fill (finish, wait, submit for host read, the multi-range bind)
+  is posted back to the back, which serves it inside its wait. Needs EXP123 >= 2 (so
+  FRITCHII_MEMSTAGE_TICKS >= 1) and the buffer cache's own allocator; without them, or without
+  the split, it runs as 0, logged once.
+- Expect fps lower than 0: two thread wake-ups a draw. The point is the thread rules, not speed.
+- "Memory stage link (FRITCHII_MEMSTAGE_THREAD=1)" every 10 s: hand-offs a second (draw fills,
+  dispatch fills, idle destroys), the back's wait in ms/s and per hand-off, GPUMem's run time,
+  sleeps on both sides, served syncs a second, and the counters that must be 0: a buffer
+  allocator call, a buffer staging request or a seam push by a thread that is not the cache's
+  user; a VMA heap budget read off its allocator's user; a scheduler or descriptor queue use on
+  GPUMem; an entry GPUMem would run at once (served on the back instead); an entry run at once
+  while entries are pending; the memory player reached on GPUMem; the front's waits reached on
+  GPUMem; a fill handed off while the back did not hold the buffer cache's lock. The first 16 of
+  each log "Memory stage link (must be 0)" with the place. The seam's
+  own 5.1/5.2 counters (EXP123's line) must stay 0 too.
+- EDEN_NX2_GPU_PROFILE: GPUMem reports as "GPU memory thread" with its "memory fill" zone (the
+  fill ms/s of EXP123 = 2, now off the back) and "memory sync wait"; the back shows "memory
+  hand-off" for its waits. FRITCHII_BACK_READ_AUDIT adds a "Stage read audit" table for GPUMem.
+  The hitch line, the stall snapshot and the CPU trace list GPUMem as a thread of its own.
+- Not pinned to a core (spec 5.8, until step 7 measures it).
+
+### FRITCHII_MEMSTAGE_FULL_BINDS
+
+FRITCHII_MEMSTAGE_FULL_BINDS (live, read at a frame end, default 0; spec 4.2): every draw binds
+every enabled vertex binding, not only the dirty ones. The ones that were not dirty go in runs of
+their own, without a usage mark, and the memory player drops a run still bound in the current
+command buffer, so the recorded commands stay the same; repacked bindings are left out (binding
+one again runs its conversion). It is what the stage will need instead of the scheduler's
+command buffer flags (step 6b). With EXP123 >= 1 the seam's stats line adds "memory seam full
+vertex bindings": vertex bind runs recorded and dropped as still bound a second. Independent of
+FRITCHII_MEMSTAGE_THREAD.
 
 ### FRITCHII_JIT_DISPATCH_BITS
 

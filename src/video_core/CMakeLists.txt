@@ -123,6 +123,11 @@ add_library(video_core STATIC
     invalidation_accumulator.h
     memory_manager.cpp
     memory_manager.h
+    memstage_shadow.cpp
+    memstage_shadow.h
+    memstage_shadow_engine.h
+    memory_stage_link.cpp
+    memory_stage_link.h
     page_filter.h
     pipeline_cache_files.cpp
     pipeline_cache_files.h
@@ -257,6 +262,7 @@ add_library(video_core STATIC
     renderer_vulkan/vk_mem_stage.cpp
     renderer_vulkan/vk_mem_stage.h
     renderer_vulkan/vk_mem_stage_hook.h
+    renderer_vulkan/vk_mem_stage_shadow.h
     renderer_vulkan/vk_pipeline_cache.cpp
     renderer_vulkan/vk_pipeline_cache.h
     renderer_vulkan/vk_pipeline_translate_queue.cpp

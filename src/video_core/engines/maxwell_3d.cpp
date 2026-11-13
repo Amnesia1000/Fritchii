@@ -33,6 +33,7 @@
 #include "video_core/nx2_qmd_prediction.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/memory_manager.h"
+#include "video_core/memstage_shadow.h"
 #include "video_core/memstage_stats.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cb_path.h"
@@ -65,6 +66,49 @@ constexpr u32 MacroRegistersStart = 0xE00;
 
 // EDEN_NX2_3D_METHODS: log the first write to each 3D register (finds methods the emulator doesn't model).
 static const bool g_trace_first_method_writes = std::getenv("EDEN_NX2_3D_METHODS") != nullptr;
+
+// The front's closures that trigger or shape draws, as structs with the payload layout the
+// memory stage reads (StageTag, memstage_shadow.h): the engine in word 0, then the tag's words.
+struct Maxwell3D::StageCall {
+    /// StageTag::FinishMacro: [engine, system].
+    struct FinishMacro {
+        Maxwell3D* engine;
+        Core::System* system;
+        void operator()() const {
+            engine->FinishFrontMacro(*system);
+        }
+    };
+    /// StageTag::DrawLoop, FoldFirstInstance (header bits 40-47): [engine].
+    struct FoldFirstInstance {
+        Maxwell3D* engine;
+        void operator()() const {
+            engine->draw_manager.FoldFirstInstance();
+        }
+    };
+    /// StageTag::DrawLoop, AddLoopInstances (header bits 40-47): [engine, count].
+    struct AddLoopInstances {
+        Maxwell3D* engine;
+        u32 count;
+        void operator()() const {
+            engine->draw_manager.AddLoopInstances(*engine, count);
+        }
+    };
+    static constexpr u64 FinishMacroFlags =
+        VideoCommon::StageTagBits(VideoCommon::StageTag::FinishMacro);
+    static constexpr u64 FoldFirstInstanceFlags =
+        VideoCommon::StageDrawLoopBits(VideoCommon::StageDrawLoop::FoldFirstInstance);
+    static constexpr u64 AddLoopInstancesFlags =
+        VideoCommon::StageDrawLoopBits(VideoCommon::StageDrawLoop::AddLoopInstances);
+    // The words the stage reads (memstage_shadow.cpp), and ring entries as large as the lambdas
+    // these replaced ([this, &system], [this], [self, count]).
+    static void CheckLayout() {
+        static_assert(offsetof(FinishMacro, engine) == 0 && offsetof(FinishMacro, system) == 8 &&
+                      sizeof(FinishMacro) == 16);
+        static_assert(offsetof(FoldFirstInstance, engine) == 0 && sizeof(FoldFirstInstance) == 8);
+        static_assert(offsetof(AddLoopInstances, engine) == 0 &&
+                      offsetof(AddLoopInstances, count) == 8 && sizeof(AddLoopInstances) == 16);
+    }
+};
 
 Maxwell3D::Maxwell3D(MemoryManager& memory_manager_)
     : draw_manager()
@@ -1247,7 +1291,12 @@ void Maxwell3D::ProcessQueryGet() {
 void Maxwell3D::ProcessQueryCondition() {
     const VideoCommon::Nx2Profile::FineScope profile_scope{
         VideoCommon::Nx2Profile::Zone::RenderEnable};
-    if (rasterizer->AccelerateConditionalRendering()) {
+    const bool host_condition = rasterizer->AccelerateConditionalRendering();
+    // FRITCHII_MEMSTAGE_SHADOW: draws under host conditional rendering are level (spec 3.4).
+    if (VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
+        VideoCommon::MemStageShadow::BackCondition(host_condition);
+    }
+    if (host_condition) {
         execute_on = true;
         // EDEN_NX2_MEMSTAGE_STATS: decided by the host (the draws run predicated).
         VideoCommon::MemStageStats::Condition(true, true);
@@ -2678,8 +2727,8 @@ void Maxwell3D::FrontRunMacroPlain(Core::System& system, VideoCommon::GpuSplit& 
     fs.parameters.clear();
     if (fs.draw_pending) {
         fs.draw_pending = false;
-        split.Defer([this, system_ptr = &system] { FinishFrontMacro(*system_ptr); },
-                    VideoCommon::GpuSplit::Effect::Gpu, VideoCommon::Nx2FastDrawCount::Neutral());
+        split.Defer(StageCall::FinishMacro{this, &system}, VideoCommon::GpuSplit::Effect::Gpu,
+                    VideoCommon::Nx2FastDrawCount::Neutral() | StageCall::FinishMacroFlags);
     }
     if (FrontVerifyEnabled() && (++fs.calls & 4095) == 0) [[unlikely]] {
         FrontVerify(split, fs);
@@ -2815,9 +2864,10 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
                 // manager then has no loop open and draws this one alone (DrawMode::General).
                 fold_pending = false;
                 if (((fs.regs[MAXWELL3D_REG_INDEX(draw.begin)] >> 26) & 3) == 0) {
-                    split.Defer([this] { draw_manager.FoldFirstInstance(); },
+                    split.Defer(StageCall::FoldFirstInstance{this},
                                 VideoCommon::GpuSplit::Effect::None,
-                                VideoCommon::Nx2FastDrawCount::Neutral());
+                                VideoCommon::Nx2FastDrawCount::Neutral() |
+                                    StageCall::FoldFirstInstanceFlags);
                     ++fs.oot_stats.folds;
                     static u32 fold_logged{};
                     if (fold_logged++ < 4) {
@@ -2949,8 +2999,8 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
     fs.parameters.clear();
     if (fs.draw_pending) {
         fs.draw_pending = false;
-        split.Defer([this, system_ptr = &system] { FinishFrontMacro(*system_ptr); },
-                    VideoCommon::GpuSplit::Effect::Gpu, VideoCommon::Nx2FastDrawCount::Neutral());
+        split.Defer(StageCall::FinishMacro{this, &system}, VideoCommon::GpuSplit::Effect::Gpu,
+                    VideoCommon::Nx2FastDrawCount::Neutral() | StageCall::FinishMacroFlags);
     }
     if (FrontVerifyEnabled() && (++fs.calls & 4095) == 0) [[unlikely]] {
         FrontVerify(split, fs);
@@ -3131,8 +3181,8 @@ bool Maxwell3D::FrontTakeListDraw(Core::System& system, VideoCommon::GpuSplit& s
     fs.list_draw_indexed = false;
     if (fs.draw_pending) {
         fs.draw_pending = false;
-        split.Defer([this, system_ptr = &system] { FinishFrontMacro(*system_ptr); },
-                    VideoCommon::GpuSplit::Effect::Gpu, VideoCommon::Nx2FastDrawCount::Neutral());
+        split.Defer(StageCall::FinishMacro{this, &system}, VideoCommon::GpuSplit::Effect::Gpu,
+                    VideoCommon::Nx2FastDrawCount::Neutral() | StageCall::FinishMacroFlags);
     }
     return true;
 }
@@ -3167,8 +3217,8 @@ void Maxwell3D::FlushFoldedInstances(void* engine, u32 count) {
     }
     // As the draw.begin writes: the draw they defer may write anywhere a draw does.
     VideoCommon::GpuSplit::Get().Defer(
-        [self, count] { self->draw_manager.AddLoopInstances(*self, count); },
-        VideoCommon::GpuSplit::Effect::Gpu, VideoCommon::Nx2FastDrawCount::Neutral());
+        StageCall::AddLoopInstances{self, count}, VideoCommon::GpuSplit::Effect::Gpu,
+        VideoCommon::Nx2FastDrawCount::Neutral() | StageCall::AddLoopInstancesFlags);
 }
 
 bool Maxwell3D::IsPredicateMacro(FrontState& fs, u32 method) {
@@ -4467,7 +4517,9 @@ void Maxwell3D::FrontFlushPacket(void* maxwell3d) {
                               std::memcpy(payload + 3, fs.packet.data(), count * sizeof(u64));
                               std::memcpy(payload + 3 + count, checks.data(),
                                           check_count * sizeof(u64));
-                          });
+                          },
+                          // The memory stage reads these words (StageTag::Writes).
+                          VideoCommon::StageTagBits(VideoCommon::StageTag::Writes));
     ++fs.packets;
     fs.packet_writes += count;
     fs.packet.clear();

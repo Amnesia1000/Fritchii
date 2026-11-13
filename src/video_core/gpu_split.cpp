@@ -34,6 +34,8 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/nx2_fastdraw_count.h"
 #include "video_core/gpu_split.h"
+#include "video_core/memstage_shadow.h"
+#include "video_core/memory_stage_link.h"
 #include "video_core/nx2_split_stats.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
@@ -104,8 +106,9 @@ void NoteSiteWait(DrainSite site, u64 behind, u64 ns) {
     LOG_INFO(HW_GPU,
              "Front waits for the back by site (ring words behind at the start): {}; cache lock "
              "waits: guest cores {:.1f} ms/s ({:.0f}/s), GPU back {:.1f} ms/s ({:.0f}/s), GPU "
-             "front {:.1f} ms/s, other threads {:.1f} ms/s",
-             sites, lock_ms[1], lock_rate[1], lock_ms[3], lock_rate[3], lock_ms[2], lock_ms[0]);
+             "front {:.1f} ms/s, GPU memory {:.1f} ms/s ({:.0f}/s), other threads {:.1f} ms/s",
+             sites, lock_ms[1], lock_rate[1], lock_ms[3], lock_rate[3], lock_ms[2], lock_ms[4],
+             lock_rate[4], lock_ms[0]);
     stats.count = {};
     stats.ns = {};
     stats.behind = {};
@@ -233,11 +236,14 @@ void GpuSplit::MaybeStart(Core::System& system_) {
         return true;
     }();
     (void)switches_read;
+    // FRITCHII_MEMSTAGE_SHADOW (memstage_shadow.cpp): before the back thread exists.
+    MemStageShadow::ReadSwitch();
     ring = std::make_unique<u64[]>(RingWords);
     ++session;
     // EDEN_NX2_RUNAHEAD: Ocarina of Time only.
     Runahead::Reset();
     Runahead::SetProgramId(system_.GetApplicationProcessProgramID());
+    MemoryStageLink::Get().Start(system_);
     back_thread = std::jthread([this](std::stop_token stop_token) { BackLoop(stop_token); });
     active = true;
     const char* jit = std::getenv("EDEN_NX2_MME_JIT");
@@ -254,6 +260,7 @@ void GpuSplit::Stop() {
     wake.fetch_add(1, std::memory_order_seq_cst);
     wake.notify_one();
     back_thread.join();
+    MemoryStageLink::Get().Stop();
     active = false;
     // The split is static and outlives the emulation session. The next session's back thread
     // starts reading at 0: with the old positions kept it skipped through the new, empty ring a
@@ -1400,7 +1407,8 @@ void GpuSplit::NoteDispatchWriter() {
     if (records != dispatch_records) {
         dispatch_records = records;
         last_unrecorded_dispatch_position = write_position;
-        Defer([this, records] { back_dispatch_records = records; }, Effect::None);
+        Defer([this, records] { back_dispatch_records = records; }, Effect::None,
+              StageTagBits(StageTag::Pass));
     } else if (!records) {
         last_unrecorded_dispatch_position = write_position;
     }
@@ -1688,6 +1696,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     g_back_thread_id.store(GetCurrentThreadId(), std::memory_order_relaxed);
 #endif
     u64 read_position = 0;
+    if (MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
+        MemStageShadow::Start();
+    }
     while (!stop_token.stop_requested()) {
         Nx2Profile::Report("GPU back thread");
         u64 available = published.load(std::memory_order_acquire);
@@ -1776,6 +1787,11 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             if (read_position >= Runahead::g_apply_at.load(std::memory_order_relaxed))
                 [[unlikely]] {
                 Runahead::ApplyDue(read_position);
+            }
+            // FRITCHII_MEMSTAGE_SHADOW: the memory stage's inputs for this entry, compared at
+            // the back's draws (memstage_shadow.cpp). Off: this one test per entry.
+            if (MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
+                MemStageShadow::Before(read_position);
             }
             const size_t size =
                 Execute(&ring[index], std::min<u64>(available - read_position, RingWords - index));

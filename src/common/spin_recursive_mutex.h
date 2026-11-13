@@ -79,6 +79,12 @@ public:
         return owner.load(std::memory_order_relaxed) == std::this_thread::get_id();
     }
 
+    /// The holding thread's: the mutex stays held, by `thread` from now on (a thread that works
+    /// for the holder while the holder waits). The caller orders the two threads.
+    void HandOver(std::thread::id thread) {
+        owner.store(thread, std::memory_order_relaxed);
+    }
+
 private:
     // About 10 microseconds of spinning before sleeping.
     static constexpr int SpinCount = 1024;

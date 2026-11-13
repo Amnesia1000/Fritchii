@@ -124,7 +124,7 @@ inline void NoteZPassReport() {
     u64 total{};
     for (const Zone zone : {Zone::Idle, Zone::PendingSleep, Zone::ResumePending, Zone::SplitDrain,
                             Zone::SplitWait, Zone::WriterWait, Zone::ListSubmitWait,
-                            Zone::ListGpuWait, Zone::QueryDmaWait}) {
+                            Zone::ListGpuWait, Zone::QueryDmaWait, Zone::MemoryHandOff}) {
         total += data.exclusive_ns[static_cast<size_t>(zone)];
     }
     return total;

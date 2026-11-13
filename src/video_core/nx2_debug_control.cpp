@@ -328,6 +328,12 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "EDEN_NX2_QMD_3D_PATCH") {
         return &g_qmd_3d_patch;
     }
+    if (name == "FRITCHII_MEMSTAGE_THREAD") {
+        return &g_memstage_thread;
+    }
+    if (name == "FRITCHII_MEMSTAGE_FULL_BINDS") {
+        return &g_memstage_full_binds;
+    }
     return nullptr;
 }
 

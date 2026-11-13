@@ -27,6 +27,11 @@
 //
 // Every 10 s the back logs the top 40 sites by reads as offsets from the executable's base
 // (logged once), with reads/s and bytes/s over the window, and starts a new window.
+//
+// The memory stage thread (GPUMem, FRITCHII_MEMSTAGE_THREAD=1) counts in a second table, logged
+// the same way as "Stage read audit" when it read anything: the draw and dispatch fills it runs
+// for the back read game memory there now, so the back's list loses them and this is the stage's
+// read list (memory stage step 6 spec 5.7).
 // work/back_read_audit.py symbolizes those lines with llvm-symbolizer.
 
 #include "video_core/back_read_audit.h"
@@ -49,6 +54,7 @@
 
 #include "common/logging.h"
 #include "video_core/gpu_split.h"
+#include "video_core/memory_stage_link.h"
 
 namespace VideoCommon::BackReadAudit {
 
@@ -72,8 +78,11 @@ struct Slot {
     std::atomic<u8> kind{};
 };
 
-std::array<Slot, TableSize> table{};
-std::atomic<u64> dropped{};
+/// [0] the back's reads, [1] the memory stage thread's (GPUMem, FRITCHII_MEMSTAGE_THREAD=1): the
+/// fills it runs for the back read there now (memory stage spec 5.7: its read list).
+std::array<std::array<Slot, TableSize>, 2> tables{};
+std::array<std::atomic<u64>, 2> dropped{};
+constexpr std::array<const char*, 2> TableNames{"Back read audit", "Stage read audit"};
 /// steady_clock nanoseconds of the next report; 0 until the first count.
 std::atomic<s64> next_report{};
 std::atomic<s64> window_start{};
@@ -112,7 +121,7 @@ s64 NowNs() {
         .count();
 }
 
-void Report(s64 now) {
+void ReportTable(std::size_t which, double seconds) {
     struct Site {
         uintptr_t address;
         u64 reads;
@@ -123,7 +132,7 @@ void Report(s64 now) {
     sites.reserve(TableSize);
     u64 total_reads = 0;
     u64 total_bytes = 0;
-    for (Slot& slot : table) {
+    for (Slot& slot : tables[which]) {
         const uintptr_t address = slot.address.load(std::memory_order_relaxed);
         if (address == 0) {
             continue;
@@ -137,26 +146,36 @@ void Report(s64 now) {
         total_bytes += bytes;
         sites.push_back({address, reads, bytes, slot.kind.load(std::memory_order_relaxed)});
     }
-    const u64 lost = dropped.exchange(0, std::memory_order_relaxed);
-    const s64 start = window_start.exchange(now, std::memory_order_relaxed);
-    const double seconds = (std::max)(1e-3, static_cast<double>(now - start) * 1e-9);
+    const u64 lost = dropped[which].exchange(0, std::memory_order_relaxed);
+    if (which != 0 && total_reads == 0 && lost == 0) {
+        // GPUMem ran nothing this window (FRITCHII_MEMSTAGE_THREAD=0).
+        return;
+    }
     std::sort(sites.begin(), sites.end(),
               [](const Site& a, const Site& b) { return a.reads > b.reads; });
 
     static const uintptr_t base = ImageBase();
+    const char* const name = TableNames[which];
     LOG_INFO(HW_GPU,
-             "Back read audit: {:.1f} s, {} sites, {:.0f} reads/s, {:.0f} bytes/s, {} reads "
-             "dropped (table full)",
-             seconds, sites.size(), static_cast<double>(total_reads) / seconds,
+             "{}: {:.1f} s, {} sites, {:.0f} reads/s, {:.0f} bytes/s, {} reads dropped (table "
+             "full)",
+             name, seconds, sites.size(), static_cast<double>(total_reads) / seconds,
              static_cast<double>(total_bytes) / seconds, lost);
     const std::size_t shown = (std::min)(sites.size(), TopSites);
     for (std::size_t i = 0; i < shown; ++i) {
         const Site& site = sites[i];
-        LOG_INFO(HW_GPU, "Back read audit: #{:02} +{:#x} {} {:.1f} reads/s {:.0f} bytes/s", i + 1,
+        LOG_INFO(HW_GPU, "{}: #{:02} +{:#x} {} {:.1f} reads/s {:.0f} bytes/s", name, i + 1,
                  site.address - base, KindName(site.kind),
                  static_cast<double>(site.reads) / seconds,
                  static_cast<double>(site.bytes) / seconds);
     }
+}
+
+void Report(s64 now) {
+    const s64 start = window_start.exchange(now, std::memory_order_relaxed);
+    const double seconds = (std::max)(1e-3, static_cast<double>(now - start) * 1e-9);
+    ReportTable(0, seconds);
+    ReportTable(1, seconds);
 }
 
 void MaybeReport() {
@@ -185,11 +204,20 @@ void MaybeReport() {
     Report(now);
 }
 
-void Count(const void* caller, std::size_t bytes, Kind kind) {
+/// The table this thread counts in: 0 the back, 1 GPUMem, -1 none.
+int TableOfThread() noexcept {
+    if (GpuSplit::OnBackThread()) {
+        return 0;
+    }
+    return MemoryStageLink::OnStageThread() ? 1 : -1;
+}
+
+void Count(std::size_t which, const void* caller, std::size_t bytes, Kind kind) {
     const auto address = reinterpret_cast<uintptr_t>(caller);
     std::size_t index =
         static_cast<std::size_t>((static_cast<u64>(address) * 0x9E3779B97F4A7C15ULL) >> 55) &
         (TableSize - 1);
+    auto& table = tables[which];
     for (std::size_t probe = 0; probe < TableSize; ++probe) {
         Slot& slot = table[index];
         uintptr_t current = slot.address.load(std::memory_order_relaxed);
@@ -206,7 +234,7 @@ void Count(const void* caller, std::size_t bytes, Kind kind) {
         }
         index = (index + 1) & (TableSize - 1);
     }
-    dropped.fetch_add(1, std::memory_order_relaxed);
+    dropped[which].fetch_add(1, std::memory_order_relaxed);
     MaybeReport();
 }
 
@@ -227,15 +255,19 @@ void Init() {
 }
 
 void Note(const void* caller, std::size_t bytes, Kind kind) noexcept {
-    if (!GpuSplit::OnBackThread() || t_depth != 0) {
+    if (t_depth != 0) {
         return;
     }
-    Count(caller, bytes, kind);
+    if (const int which = TableOfThread(); which >= 0) {
+        Count(static_cast<std::size_t>(which), caller, bytes, kind);
+    }
 }
 
 OuterScope::OuterScope(const void* caller, std::size_t bytes, Kind kind) noexcept {
-    if (t_depth++ == 0 && GpuSplit::OnBackThread()) {
-        Count(caller, bytes, kind);
+    if (t_depth++ == 0) {
+        if (const int which = TableOfThread(); which >= 0) {
+            Count(static_cast<std::size_t>(which), caller, bytes, kind);
+        }
     }
 }
 

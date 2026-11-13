@@ -389,6 +389,7 @@ public:
     /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
     /// `flags`: Nx2FastDrawCount::Neutral() for a call that can't change what a draw resolves to
     /// (bit 7 of a Call entry, set only while EDEN_NX2_FASTDRAW_COUNT counts; Execute ignores it).
+    /// Bits 32-39: the memory stage's tag (StageTagBits, memstage_shadow.h); Execute ignores them.
     template <typename Func>
     void Defer(const Func& func, Effect effect = Effect::Unknown, u64 flags = 0) {
         static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
@@ -403,10 +404,12 @@ public:
     /// Runs `func(payload)` on the back after everything sent before it, with `words` payload
     /// words that `fill(u64* payload)` writes here (a Call entry with a variable payload, for
     /// EDEN_NX2_DRAW_PACKET's write lists). `fill` must not call into the split.
+    /// `flags` as Defer's.
     template <typename Fill>
-    void CallWithPayload(void (*func)(const u64*), size_t words, Effect effect, const Fill& fill) {
+    void CallWithPayload(void (*func)(const u64*), size_t words, Effect effect, const Fill& fill,
+                         u64 flags = 0) {
         u64* const entry = Reserve(2 + words);
-        entry[0] = static_cast<u64>(Kind::Call) | (u64{words} << 8);
+        entry[0] = static_cast<u64>(Kind::Call) | flags | (u64{words} << 8);
         entry[1] = reinterpret_cast<u64>(func);
         fill(entry + 2);
         Commit(2 + words, effect);
@@ -727,6 +730,10 @@ public:
     }
     void EndDispatchRecord() {
         recording_dispatch = false;
+    }
+    /// GPUMem, around a fill it runs for the back (memory_stage_link.cpp).
+    static void AdoptRecordingDispatch(bool recording) {
+        recording_dispatch = recording;
     }
     /// Back, while recording: a dispatch starts; the rasterizer recorded all it writes; it ended
     /// (`ran`: it reached the rasterizer, `replaced`: other work ran instead).
@@ -1130,6 +1137,7 @@ public:
 
 private:
     friend struct GpuSplitTestAccess;
+    friend struct MemStageShadowAccess; // memstage_shadow.cpp reads the ring's layout
 
     enum class Kind : u64 {
         Wrap,   ///< The rest of the ring is unused: continue at its start

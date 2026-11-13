@@ -27,6 +27,7 @@
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "video_core/churn_counters.h"
+#include "video_core/memory_stage_link.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
@@ -427,21 +428,30 @@ std::filesystem::path StaticPipelineCacheFilename() {
 // (title 1).
 u64 AllocatedUsage(VkDeviceSize driver_usage, const VmaBudget& vma_budget) {
     const VmaStatistics& statistics = vma_budget.statistics;
-    const u64 unused = statistics.blockBytes - statistics.allocationBytes;
+    // Guarded: two allocators' sums (or numbers taken at different times) must not wrap.
+    const u64 unused =
+        statistics.blockBytes - (std::min)(statistics.blockBytes, statistics.allocationBytes);
     return driver_usage - (std::min)(driver_usage, unused);
 }
 
 // vmaGetHeapBudgets of the main allocator, with the buffer allocator's blocks and allocations
 // (FRITCHII_MEMSTAGE_SPLIT_ALLOC) added to the statistics: the unused space in either allocator's
 // blocks is slack. usage and budget stay the main allocator's (the driver's, for the process).
-void GetHeapBudgets(VmaAllocator allocator, VmaAllocator buffer_allocator,
-                    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS>& budgets) {
-    vmaGetHeapBudgets(allocator, budgets.data());
-    if (buffer_allocator == nullptr) {
+// At FRITCHII_MEMSTAGE_THREAD=1 the buffer allocator's numbers are the ones its user published
+// (Device::BufferHeapBudgets): an externally synchronized allocator refreshes its budget arrays
+// inside vmaGetHeapBudgets, so no other thread may call it (memory stage spec 5.3). At 0, VMA's.
+void GetHeapBudgets(const Device& device, std::array<VmaBudget, VK_MAX_MEMORY_HEAPS>& budgets) {
+    if (VideoCommon::MemoryStageLink::OnStageThread()) [[unlikely]] {
+        // The main allocator is the back's.
+        VideoCommon::MemoryStageLink::Note(VideoCommon::MemoryStageLink::Check::BudgetUser,
+                                           "main allocator");
+    }
+    vmaGetHeapBudgets(device.GetAllocator(), budgets.data());
+    if (!device.HasSplitAllocators()) {
         return;
     }
     std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> buffers{};
-    vmaGetHeapBudgets(buffer_allocator, buffers.data());
+    device.BufferHeapBudgets(buffers.data());
     for (size_t heap = 0; heap < budgets.size(); ++heap) {
         budgets[heap].statistics.blockCount += buffers[heap].statistics.blockCount;
         budgets[heap].statistics.allocationCount += buffers[heap].statistics.allocationCount;
@@ -987,6 +997,8 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
             LOG_WARNING(Render_Vulkan, "Buffer VMA allocator could not be made; one allocator");
             buffer_allocator = nullptr;
         }
+        // The memory stage counts the calls on it and who makes them (memory_stage_link.cpp).
+        VideoCommon::MemoryStageLink::WatchBufferAllocator(buffer_allocator);
     }
 
     owns_static_pipeline_cache = surface != VkSurfaceKHR{};
@@ -1016,6 +1028,7 @@ Device::~Device() {
         }
     }
     if (buffer_allocator != nullptr) {
+        VideoCommon::MemoryStageLink::WatchBufferAllocator(nullptr);
         vmaDestroyAllocator(buffer_allocator);
     }
     vmaDestroyAllocator(allocator);
@@ -2166,7 +2179,10 @@ u64 Device::GetDeviceMemoryUsage() const {
     // caches ask every frame; with the budget extension each answer is a driver and OS query.
     // An answer younger than 50 ms is reused (so the caches' GC sees usage up to 50 ms old).
     if ((VideoCore::Nx2Debug::Experiment(29) & 1) == 0) {
-        return QueryDeviceMemoryUsage();
+        // Kept for LastDeviceMemoryUsage (the memory stage's thread does not ask, spec 5.3).
+        const u64 usage = QueryDeviceMemoryUsage();
+        memory_usage_value.store(usage, std::memory_order_relaxed);
+        return usage;
     }
     constexpr s64 reuse_ns = 50'000'000;
     const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -2182,6 +2198,73 @@ u64 Device::GetDeviceMemoryUsage() const {
     return usage;
 }
 
+// The buffer allocator's heap budgets (memory stage spec 5.3). At FRITCHII_MEMSTAGE_THREAD=0 every
+// caller asks VMA directly, as before the stage's thread. At 1 only the allocator's user calls VMA
+// for them (the back, or GPUMem inside a hand-off: MemoryStageLink::IsCacheUser), when the
+// allocator changed since they were taken (its finished-operation count moved); everyone else
+// reads the published values. The publish and the reads hold buffer_budgets_mutex: two
+// publishers (a broken thread rule) can't interleave, and a reader never sees half of one.
+void Device::PublishBufferHeapBudgetsLocked() const {
+    // Counted when each operation ended (MemoryStageLink::AllocatorOp): an operation still running
+    // during vmaGetHeapBudgets is counted later, and the next call takes the budgets again.
+    const u64 ops = VideoCommon::MemoryStageLink::BufferAllocatorOps();
+    if (buffer_budget_ops == ops) {
+        return;
+    }
+    if (!VideoCommon::MemoryStageLink::IsCacheUser()) {
+        VideoCommon::MemoryStageLink::Note(VideoCommon::MemoryStageLink::Check::BudgetUser,
+                                           "buffer allocator");
+        return;
+    }
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets{};
+    vmaGetHeapBudgets(buffer_allocator, budgets.data());
+    for (size_t heap = 0; heap < budgets.size(); ++heap) {
+        const VmaBudget& budget = budgets[heap];
+        buffer_budgets[heap] = {budget.statistics.blockCount,
+                                budget.statistics.allocationCount,
+                                budget.statistics.blockBytes,
+                                budget.statistics.allocationBytes,
+                                budget.usage,
+                                budget.budget};
+    }
+    buffer_budget_ops = ops;
+}
+
+void Device::PublishBufferHeapBudgets() const {
+    if (buffer_allocator == nullptr || !VideoCommon::MemoryStageLink::Checking()) {
+        return;
+    }
+    std::scoped_lock lock{buffer_budgets_mutex};
+    PublishBufferHeapBudgetsLocked();
+}
+
+void Device::BufferHeapBudgets(VmaBudget* budgets) const {
+    if (buffer_allocator == nullptr) {
+        std::fill_n(budgets, VK_MAX_MEMORY_HEAPS, VmaBudget{});
+        return;
+    }
+    if (!VideoCommon::MemoryStageLink::Checking()) {
+        // FRITCHII_MEMSTAGE_THREAD=0: VMA's numbers of this moment, as before the stage's thread
+        // (the texture cache collector's thresholds read them).
+        vmaGetHeapBudgets(buffer_allocator, budgets);
+        return;
+    }
+    std::scoped_lock lock{buffer_budgets_mutex};
+    if (VideoCommon::MemoryStageLink::IsCacheUser()) {
+        PublishBufferHeapBudgetsLocked();
+    }
+    for (size_t heap = 0; heap < VK_MAX_MEMORY_HEAPS; ++heap) {
+        const auto& in = buffer_budgets[heap];
+        VmaBudget& budget = budgets[heap];
+        budget.statistics.blockCount = static_cast<u32>(in[0]);
+        budget.statistics.allocationCount = static_cast<u32>(in[1]);
+        budget.statistics.blockBytes = in[2];
+        budget.statistics.allocationBytes = in[3];
+        budget.usage = in[4];
+        budget.budget = in[5];
+    }
+}
+
 u64 Device::QueryDeviceMemoryUsage() const {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::MemoryQuery};
     VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
@@ -2189,7 +2272,7 @@ u64 Device::QueryDeviceMemoryUsage() const {
     physical.GetMemoryProperties(&budget);
     std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> heap_budgets{};
     if (allocator != nullptr) {
-        GetHeapBudgets(allocator, buffer_allocator, heap_budgets);
+        GetHeapBudgets(*this, heap_budgets);
     }
     u64 result{};
     for (const size_t heap : valid_heap_memory) {
@@ -2203,7 +2286,7 @@ u64 Device::GetDeviceMemorySlack() const {
         return 0;
     }
     std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> heap_budgets{};
-    GetHeapBudgets(allocator, buffer_allocator, heap_budgets);
+    GetHeapBudgets(*this, heap_budgets);
     const VmaStatistics& statistics = heap_budgets[main_heap].statistics;
     return statistics.blockBytes - (std::min)(statistics.blockBytes, statistics.allocationBytes);
 }
@@ -2217,7 +2300,7 @@ u64 Device::GetDeviceMemoryBudget() const {
     physical.GetMemoryProperties(&budget);
     std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> heap_budgets{};
     if (allocator != nullptr) {
-        GetHeapBudgets(allocator, buffer_allocator, heap_budgets);
+        GetHeapBudgets(*this, heap_budgets);
     }
     // Only the main heap's budget: summing every heap's counted VRAM twice on AMD (an 8 GB card
     // reported 8.5 GB) and kept the collector's thresholds above the heap the images fill. What

@@ -24,6 +24,7 @@
 #include "video_core/gpu.h"
 #include "video_core/gpu_thread.h"
 #include "video_core/gpu_split.h"
+#include "video_core/memstage_shadow.h"
 #include "video_core/memstage_stats.h"
 #include "video_core/nx2_fastdraw_count.h"
 #include "video_core/nx2.h"
@@ -206,7 +207,8 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                                 Common::Nx2Timeline::Instant("back: list", {"seq", seq});
                             },
                             VideoCommon::GpuSplit::Effect::None,
-                            VideoCommon::Nx2FastDrawCount::Neutral());
+                            VideoCommon::Nx2FastDrawCount::Neutral() |
+                                VideoCommon::StageTagBits(VideoCommon::StageTag::Pass));
                     }
                     {
                         Profile::Scope scope{Profile::Zone::Push};
@@ -253,7 +255,9 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     [state_ptr = &state, fence = next.fence, block = next.block] {
                         SignalCommand(*state_ptr, fence, block);
                     },
-                    VideoCommon::GpuSplit::Effect::None, VideoCommon::Nx2FastDrawCount::Neutral());
+                    VideoCommon::GpuSplit::Effect::None,
+                    VideoCommon::Nx2FastDrawCount::Neutral() |
+                        VideoCommon::StageTagBits(VideoCommon::StageTag::Pass));
                 split.Publish();
                 continue;
             }
