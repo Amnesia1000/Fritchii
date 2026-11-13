@@ -88,6 +88,7 @@
 #include "video_core/fritchii_draw_kinds.h"
 #include "video_core/fritchii_report_runs.h"
 #include "video_core/memstage_shadow.h"
+#include "video_core/memstage_shadow_engine.h"
 #include "video_core/memstage_stats.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cb_path.h"
@@ -1295,8 +1296,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     // FRITCHII_MEMSTAGE_SHADOW: the facts table's compare (c) and the draw kinds of spec 3.4.
     if (VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
         const MemStage::DrawFacts facts = pipeline->MemFacts();
-        const bool diagnostic = frame_dump.Capturing() || VideoCommon::RenderTrace::Enabled() ||
-                                OcarinaTemporalEnabled();
+        // A diagnostic that reads the bound buffers on the back: a frame dump or a trace. The
+        // OoT trackers are not one any more: they read the draw packet's record (5c, plan 5.1).
+        const bool diagnostic = frame_dump.Capturing() || VideoCommon::RenderTrace::Enabled();
         VideoCommon::MemStageShadow::BackPipeline(
             pipeline->ShaderHashes(), ShadowFactsDigest(facts, pipeline->HasDynamicVertexInput()),
             (facts.has_texel_buffers ? VideoCommon::MemStageShadow::PipelineTexel : 0U) |
@@ -1489,6 +1491,29 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     }
     // update engine as channel may be different.
     pipeline->SetEngine(maxwell3d, gpu_memory);
+    // FRITCHII_MEMSTAGE_SHADOW (piece 5c): the cache's flags over the fill (compare b); with 3,
+    // the fill below and the repack layout read the stage's copy of the engine (CacheInputs on
+    // the copy, plan 5.4) when the shadow can vouch for it, until the draw is recorded.
+    std::optional<VideoCommon::CacheInputs> stage_inputs;
+    struct InputsOverride {
+        BufferCache* cache{};
+        ~InputsOverride() {
+            if (cache != nullptr) {
+                cache->SetInputsOverride(nullptr);
+            }
+        }
+    } inputs_override;
+    if (VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
+        if (VideoCommon::MemStageShadowEngine* const copy =
+                VideoCommon::MemStageShadow::BackFill(*maxwell3d, is_indirect)) {
+            stage_inputs.emplace(VideoCommon::CacheInputs::OfStage(
+                maxwell3d, copy->regs, copy->state, copy->root_tables,
+                copy->draw_manager.draw_state, copy->dirty.flags, kepler_compute, gpu_memory,
+                nullptr));
+            buffer_cache.SetInputsOverride(&*stage_inputs);
+            inputs_override.cache = &buffer_cache;
+        }
+    }
     const u32 repack_dirty = buffer_cache_runtime.SetVertexRepackLayout(
         buffer_cache.Inputs().RepackLayoutRegs(), pipeline->HasDynamicVertexInput());
     mem_stage.BeginDraw(buffer_cache_runtime.RepackMask(), repack_dirty);
@@ -1506,7 +1531,14 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     // SEAM = 2 (EXP123): the draw's buffer side is filled here, before the texture work;
     // Configure plays its sections and RestAtEnd what is left, however Configure ends (true,
     // false or an exception).
-    mem_stage.FillDraw(buffer_cache, pipeline->MemFacts(), is_indexed);
+    const MemStage::DrawPacket* const packet =
+        mem_stage.FillDraw(buffer_cache, pipeline->MemFacts(), is_indexed);
+    // The OoT trackers' record (plan 5.1): taken from the packet; without one (SEAM < 2, a late
+    // fill, the trackers turned on since the frame began), today's query.
+    std::optional<MemStage::TrackerRecord> tracker_record;
+    if (packet != nullptr && packet->trackers.filled) [[unlikely]] {
+        tracker_record = packet->trackers;
+    }
     // FRITCHII_MEMSTAGE_SHADOW: read flushes from here to the record are counted.
     if (VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
         VideoCommon::MemStageShadow::BackDrawWindow(true);
@@ -1539,8 +1571,13 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         }
     }
 
-    TrackOcarinaCamera();
-    TrackOcarinaActor(pipeline->ShaderHashes()[1], is_indexed, is_indirect);
+    if (VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed) &&
+        OcarinaTemporalEnabled()) [[unlikely]] {
+        VerifyTrackerRecord(tracker_record ? &*tracker_record : nullptr);
+    }
+    TrackOcarinaCamera(tracker_record ? &*tracker_record : nullptr);
+    TrackOcarinaActor(pipeline->ShaderHashes()[1], is_indexed, is_indirect,
+                      tracker_record ? &*tracker_record : nullptr);
     TracePendingCpuWrites(false, pipeline->ShaderHashes());
     TraceRenderState(is_indexed, "configured", texture_cache.GetFramebuffer());
     if (frame_dump.Capturing() || flash_watch.WatchesPasses()) {
@@ -1833,6 +1870,11 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                 draw_state.vertex_buffer.count = words[0];
                 if (first_placeholder) {
                     draw_state.vertex_buffer.first = words[1];
+                }
+                // FRITCHII_MEMSTAGE_SHADOW: the stage's copy takes the draw state (plan 3.3).
+                if (VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed))
+                    [[unlikely]] {
+                    VideoCommon::MemStageShadow::BackDrawStateWritten();
                 }
                 grid.draws_refused.fetch_add(1, std::memory_order_relaxed);
             } else {
@@ -4545,7 +4587,7 @@ void RasterizerVulkan::ApplyOcarinaResolution(u64 title_id) {
 /// Capture the two camera matrices from a draw targeting the scene color and depth. Terrain and
 /// materials draw with several vertex shaders, so any draw into a scene-sized target qualifies;
 /// the camera buffer's contents are checked below.
-void RasterizerVulkan::TrackOcarinaCamera() {
+void RasterizerVulkan::TrackOcarinaCamera(const MemStage::TrackerRecord* record) {
     if (!OcarinaTemporalEnabled()) {
         return;
     }
@@ -4566,15 +4608,10 @@ void RasterizerVulkan::TrackOcarinaCamera() {
         return;
     }
 
-    buffer_cache.ForEachBoundBuffer(false, [&](u32 stage, bool storage, u32 index, bool,
-                                                const auto& binding, u32 bound_size,
-                                                const auto*, u32) {
+    // The camera block of vertex uniform slot 3, when bound that large and not GPU-modified.
+    const auto sample = [&](DAddr address) {
         std::array<f32, 0x230 / sizeof(f32)> camera;
-        if (stage != 0 || storage || index != 3 || bound_size < sizeof(camera) ||
-            buffer_cache.IsRegionGpuModified(binding.device_addr, sizeof(camera))) {
-            return;
-        }
-        device_memory.ReadBlockUnsafe(binding.device_addr, camera.data(), sizeof(camera));
+        device_memory.ReadBlockUnsafe(address, camera.data(), sizeof(camera));
         constexpr size_t extent_offset = 0x120 / sizeof(f32);
         constexpr size_t projection_wz = 0xa8 / sizeof(f32);
         if (camera[extent_offset] != static_cast<f32>(color.size.width) ||
@@ -4588,6 +4625,27 @@ void RasterizerVulkan::TrackOcarinaCamera() {
         oot_motion.extent = {color.size.width, color.size.height};
         std::copy_n(values.begin() + 0x30 / sizeof(f32), 16, oot_motion.current.begin());
         std::copy_n(values.begin() + 0x180 / sizeof(f32), 16, oot_motion.previous.begin());
+    };
+    static_assert(MemStage::TrackerRecord::CameraBytes == 0x230);
+    if (record != nullptr) {
+        // The draw packet's record (fable_memstage_6b_plan.md 5.1): the same answers, taken at
+        // the end of the fill.
+        const MemStage::TrackerSlot& slot = record->slots[0];
+        if (slot.bound && slot.size >= MemStage::TrackerRecord::CameraBytes && !slot.gpu_modified) {
+            sample(slot.address);
+        }
+        return;
+    }
+    buffer_cache.ForEachBoundBuffer(false, [&](u32 stage, bool storage, u32 index, bool,
+                                                const auto& binding, u32 bound_size,
+                                                const auto*, u32) {
+        if (stage != 0 || storage || index != 3 ||
+            bound_size < MemStage::TrackerRecord::CameraBytes ||
+            buffer_cache.IsRegionGpuModified(binding.device_addr,
+                                             MemStage::TrackerRecord::CameraBytes)) {
+            return;
+        }
+        sample(binding.device_addr);
     });
 }
 
@@ -4640,7 +4698,8 @@ void RasterizerVulkan::UpdateOcarinaJitter() {
 }
 
 /// Capture the skinning pose of the recognized Link draw for frame-to-frame motion.
-void RasterizerVulkan::TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool is_indirect) {
+void RasterizerVulkan::TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool is_indirect,
+                                         const MemStage::TrackerRecord* record) {
     if (shader_hash != 0x28c6e527634f814aULL || !is_indexed || is_indirect ||
         !OcarinaTemporalEnabled() || oot_actor.frame == render_trace_frame) {
         return;
@@ -4671,25 +4730,83 @@ void RasterizerVulkan::TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool 
         .base_vertex = static_cast<s32>(draw.base_index),
     };
     bool origin_found{}, bones_found{};
-    buffer_cache.ForEachBoundBuffer(false, [&](u32 stage, bool storage, u32 index, bool,
-                                                const auto& binding, u32 size, const auto*, u32) {
-        if (stage != 0 || storage || (index != 4 && index != 6) ||
-            buffer_cache.IsRegionGpuModified(binding.device_addr, size)) {
-            return;
-        }
+    // Vertex uniform slots 4 (the origin) and 6 (the bones), when not GPU-modified.
+    const auto sample = [&](u32 index, DAddr address, u32 size) {
         if (index == 4 && size >= 0x40 + 3 * sizeof(f32)) {
-            device_memory.ReadBlockUnsafe(binding.device_addr + 0x40, pose.origin.data(), 3 * sizeof(f32));
+            device_memory.ReadBlockUnsafe(address + 0x40, pose.origin.data(), 3 * sizeof(f32));
             origin_found = true;
         }
         if (index == 6 && size == 13568) {
-            device_memory.ReadBlockUnsafe(binding.device_addr, pose.bones.data(), sizeof(pose.bones));
+            device_memory.ReadBlockUnsafe(address, pose.bones.data(), sizeof(pose.bones));
             bones_found = true;
         }
-    });
+    };
+    if (record != nullptr) {
+        // The draw packet's record (fable_memstage_6b_plan.md 5.1).
+        for (size_t i = 1; i < record->slots.size(); ++i) {
+            const MemStage::TrackerSlot& slot = record->slots[i];
+            if (slot.bound && !slot.gpu_modified) {
+                sample(MemStage::TrackerRecord::Slots[i], slot.address, slot.size);
+            }
+        }
+    } else {
+        buffer_cache.ForEachBoundBuffer(false, [&](u32 stage, bool storage, u32 index, bool,
+                                                    const auto& binding, u32 size, const auto*,
+                                                    u32) {
+            if (stage != 0 || storage || (index != 4 && index != 6) ||
+                buffer_cache.IsRegionGpuModified(binding.device_addr, size)) {
+                return;
+            }
+            sample(index, binding.device_addr, size);
+        });
+    }
     if (origin_found && bones_found) {
         oot_previous_actor = oot_actor;
         oot_actor = pose;
     }
+}
+
+/// FRITCHII_MEMSTAGE_SHADOW: the draw packet's record of uniform slots 3, 4 and 6 against what
+/// the two trackers would ask the cache now (ForEachBoundBuffer, IsRegionGpuModified), slot by
+/// slot: bound, address and size, and the GPU-modified answer over the bytes each tracker reads.
+void RasterizerVulkan::VerifyTrackerRecord(const MemStage::TrackerRecord* record) {
+    if (record == nullptr) {
+        VideoCommon::MemStageShadow::BackTrackerRecord(false, 0);
+        return;
+    }
+    MemStage::TrackerRecord today{};
+    buffer_cache.ForEachBoundBuffer(false, [&](u32 stage, bool storage, u32 index, bool,
+                                                const auto& binding, u32 size, const auto*, u32) {
+        if (stage != 0 || storage) {
+            return;
+        }
+        for (size_t i = 0; i < today.slots.size(); ++i) {
+            if (MemStage::TrackerRecord::Slots[i] != index) {
+                continue;
+            }
+            MemStage::TrackerSlot& slot = today.slots[i];
+            slot.address = binding.device_addr;
+            slot.size = size;
+            slot.bound = true;
+            if (index == 3) {
+                slot.gpu_modified = size >= MemStage::TrackerRecord::CameraBytes &&
+                                    buffer_cache.IsRegionGpuModified(
+                                        binding.device_addr, MemStage::TrackerRecord::CameraBytes);
+            } else {
+                slot.gpu_modified = buffer_cache.IsRegionGpuModified(binding.device_addr, size);
+            }
+        }
+    });
+    u32 mismatches = 0;
+    for (size_t i = 0; i < today.slots.size(); ++i) {
+        const MemStage::TrackerSlot& a = record->slots[i];
+        const MemStage::TrackerSlot& b = today.slots[i];
+        const bool same = a.bound == b.bound &&
+                          (!a.bound || (a.address == b.address && a.size == b.size &&
+                                        a.gpu_modified == b.gpu_modified));
+        mismatches |= same ? 0U : (1U << i);
+    }
+    VideoCommon::MemStageShadow::BackTrackerRecord(true, mismatches);
 }
 
 /// Read the shared mesh only when both poses refer to the same vertex and index buffers.
@@ -4984,6 +5101,9 @@ void RasterizerVulkan::TickFrame() {
     }
 #endif
     NoteDrawReuseProbeFrame();
+    // The OoT trackers read the draw packet's record (fable_memstage_6b_plan.md 5.1): the fill
+    // adds it while they are on (and draws have packets), published here once a frame.
+    mem_stage.SetTrackerRecord(mem_stage.Packets() && OcarinaTemporalEnabled());
     if (VideoCommon::FritchiiDrawKinds::g_on) [[unlikely]] {
         VideoCommon::FritchiiDrawKinds::g_frames.fetch_add(1, std::memory_order_relaxed);
     }

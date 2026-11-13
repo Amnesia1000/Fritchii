@@ -26,18 +26,49 @@ namespace VideoCommon {
 /// (GpuToCpuAddress, MaxContinuousRange, MapSerial, ...), which the stage owns with the page
 /// table, and the content reads of game memory through device_memory (uploads), which the read log
 /// of sub-step 2b covers.
+///
+/// It holds pointers to the five things it reads (registers, constant buffer bindings, root
+/// tables, draw state, dirty flags; piece 5c, fable_memstage_6b_plan.md 5.4): bound to an engine,
+/// or to the memory stage's copy of one (OfStage, FRITCHII_MEMSTAGE_SHADOW=3).
 class CacheInputs {
 public:
     using Maxwell3D = Tegra::Engines::Maxwell3D;
     using KeplerCompute = Tegra::Engines::KeplerCompute;
     using Regs = Maxwell3D::Regs;
     using DirtyFlags = Maxwell3D::DirtyState::Flags;
+    using DrawManagerState = Maxwell3D::DrawManager::State;
 
     CacheInputs(Maxwell3D* maxwell3d_, KeplerCompute* kepler_compute_,
                 Tegra::MemoryManager* gpu_memory_,
                 const Maxwell3D::DrawManager::IndirectParams* draw_indirect_) noexcept
-        : maxwell3d{maxwell3d_}, kepler_compute{kepler_compute_}, gpu_memory{gpu_memory_},
-          draw_indirect{draw_indirect_} {}
+        : maxwell3d{maxwell3d_}, regs{maxwell3d_ ? &maxwell3d_->regs : nullptr},
+          state{maxwell3d_ ? &maxwell3d_->state : nullptr},
+          root_tables{maxwell3d_ ? &maxwell3d_->root_tables : nullptr},
+          draw_state{maxwell3d_ ? &maxwell3d_->draw_manager.draw_state : nullptr},
+          flags{maxwell3d_ ? &maxwell3d_->dirty.flags : nullptr}, kepler_compute{kepler_compute_},
+          gpu_memory{gpu_memory_}, draw_indirect{draw_indirect_} {}
+
+    /// The inputs from the memory stage's copy of `maxwell3d_` (memstage_shadow.cpp). The engine
+    /// itself still answers NativeTuring (fixed when its channel is made).
+    [[nodiscard]] static CacheInputs OfStage(
+        Maxwell3D* maxwell3d_, const Regs& regs_, const Maxwell3D::State& state_,
+        const Maxwell3D::RootTables& root_tables_, const DrawManagerState& draw_state_,
+        DirtyFlags& flags_, KeplerCompute* kepler_compute_, Tegra::MemoryManager* gpu_memory_,
+        const Maxwell3D::DrawManager::IndirectParams* draw_indirect_) noexcept {
+        CacheInputs inputs{maxwell3d_, kepler_compute_, gpu_memory_, draw_indirect_};
+        inputs.regs = &regs_;
+        inputs.state = &state_;
+        inputs.root_tables = &root_tables_;
+        inputs.draw_state = &draw_state_;
+        inputs.flags = &flags_;
+        inputs.stage_copy = true;
+        return inputs;
+    }
+
+    /// Set while FRITCHII_MEMSTAGE_SHADOW is on: the marks the cache makes on an engine's flags
+    /// (Mark*, on an engine's inputs) also reach the stage's copy of that engine.
+    static inline void (*g_mark_hook)(const Maxwell3D* engine, bool index_buffer,
+                                      u32 vertex_mask) = nullptr;
 
     /// The inputs of another channel than the bound one (the scrub of a deleted buffer's
     /// bindings marks every channel's dirty flags). It has no indirect draw.
@@ -50,7 +81,7 @@ public:
 
     /// Topology, vertex and index buffer of the draw, and its inline index bytes.
     [[nodiscard]] const Maxwell3D::DrawManager::State& DrawState() const noexcept {
-        return maxwell3d->draw_manager.draw_state;
+        return *draw_state;
     }
 
     /// The indirect draw's parameters the rasterizer handed in (SetDrawIndirect), or null.
@@ -61,45 +92,45 @@ public:
     // --- 3D registers ---
 
     [[nodiscard]] const Regs::VertexStream& VertexStream(u32 index) const noexcept {
-        return maxwell3d->regs.vertex_streams[index];
+        return regs->vertex_streams[index];
     }
 
     [[nodiscard]] const Regs::VertexStreamLimit& VertexStreamLimit(u32 index) const noexcept {
-        return maxwell3d->regs.vertex_stream_limits[index];
+        return regs->vertex_stream_limits[index];
     }
 
     [[nodiscard]] u32 VertexStreamStride(u32 index) const noexcept {
-        return maxwell3d->regs.vertex_streams[index].stride;
+        return regs->vertex_streams[index].stride;
     }
 
     [[nodiscard]] u64 NativeVertexStreamSize(u32 index) const {
-        return maxwell3d->regs.NativeVertexStreamSize(index);
+        return regs->NativeVertexStreamSize(index);
     }
 
     [[nodiscard]] bool TransformFeedbackEnabled() const noexcept {
-        return maxwell3d->regs.transform_feedback_enabled != 0;
+        return regs->transform_feedback_enabled != 0;
     }
 
     [[nodiscard]] const Regs::TransformFeedback::Control& TransformFeedbackControl(
         u32 index) const noexcept {
-        return maxwell3d->regs.transform_feedback.controls[index];
+        return regs->transform_feedback.controls[index];
     }
 
     [[nodiscard]] const Regs::TransformFeedback::Buffer& TransformFeedbackBuffer(
         u32 index) const noexcept {
-        return maxwell3d->regs.transform_feedback.buffers[index];
+        return regs->transform_feedback.buffers[index];
     }
 
     /// Constant buffer `index` of graphics stage `stage` as the engine has it bound.
     [[nodiscard]] const Tegra::Engines::ConstBufferInfo& StageConstBuffer(
         size_t stage, u32 index) const noexcept {
-        return maxwell3d->state.shader_stages[stage].const_buffers[index];
+        return state->shader_stages[stage].const_buffers[index];
     }
 
     /// The registers the Vulkan vertex repack layout is chosen from (vertex_attrib_format and
     /// vertex_streams strides). Read by the rasterizer for BufferCacheRuntime::SetVertexRepackLayout.
     [[nodiscard]] const Regs& RepackLayoutRegs() const noexcept {
-        return maxwell3d->regs;
+        return *regs;
     }
 
     // --- The macro engine ---
@@ -111,7 +142,7 @@ public:
 
     /// Root tables (NVN2's push constants in table 0, read as uniform bank 17).
     [[nodiscard]] const Maxwell3D::RootTables& RootTables() const noexcept {
-        return maxwell3d->root_tables;
+        return *root_tables;
     }
 
     // --- Dirty flags, read and set ---
@@ -119,18 +150,29 @@ public:
     /// The 3D engine's dirty flags. The cache reads and clears IndexBuffer, VertexBuffers and
     /// VertexBuffer0..31, and sets them again when a buffer it bound goes away or is repacked.
     [[nodiscard]] DirtyFlags& Dirty() const noexcept {
-        return maxwell3d->dirty.flags;
+        return *flags;
     }
 
     /// Marks the vertex buffers in `mask` (bit n = VertexBuffer0 + n) and the vertex buffer set
     /// dirty, so the next update rebinds them.
     void MarkVertexBuffersDirty(u32 mask) const noexcept {
-        DirtyFlags& flags = maxwell3d->dirty.flags;
-        flags[VideoCommon::Dirty::VertexBuffers] = true;
+        DirtyFlags& dirty = *flags;
+        dirty[VideoCommon::Dirty::VertexBuffers] = true;
         for (u32 binding = 0; binding < 32; ++binding) {
             if (mask & (1U << binding)) {
-                flags[VideoCommon::Dirty::VertexBuffer0 + binding] = true;
+                dirty[VideoCommon::Dirty::VertexBuffer0 + binding] = true;
             }
+        }
+        if (g_mark_hook != nullptr && !stage_copy) [[unlikely]] {
+            g_mark_hook(maxwell3d, false, mask);
+        }
+    }
+
+    /// Marks the index buffer dirty, so the next update binds it again.
+    void MarkIndexBufferDirty() const noexcept {
+        (*flags)[VideoCommon::Dirty::IndexBuffer] = true;
+        if (g_mark_hook != nullptr && !stage_copy) [[unlikely]] {
+            g_mark_hook(maxwell3d, true, 0);
         }
     }
 
@@ -157,9 +199,15 @@ public:
 
 private:
     Maxwell3D* maxwell3d;
+    const Regs* regs;
+    const Maxwell3D::State* state;
+    const Maxwell3D::RootTables* root_tables;
+    const DrawManagerState* draw_state;
+    DirtyFlags* flags;
     KeplerCompute* kepler_compute;
     Tegra::MemoryManager* gpu_memory;
     const Maxwell3D::DrawManager::IndirectParams* draw_indirect;
+    bool stage_copy{};
 };
 
 } // namespace VideoCommon

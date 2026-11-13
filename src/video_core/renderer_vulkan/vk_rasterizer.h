@@ -298,13 +298,17 @@ private:
     /// At OoT's disk cache load (before any of its pipelines and images): DLSS and FSR take only images at
     /// the game's own size, so with either one upscaling the resolution scale goes to 1x.
     void ApplyOcarinaResolution(u64 title_id);
-    void TrackOcarinaCamera();
+    /// `record`: the draw packet's record of the uniform slots (null: ask the buffer cache).
+    void TrackOcarinaCamera(const MemStage::TrackerRecord* record);
     /// Offsets the viewport of Ocarina's scene draws (depth-tested, into the scene depth) by a
     /// sub-pixel amount that changes every frame while FSR replaces the game's upscale, so FSR
     /// gets new sample positions each frame (the game renders without jitter). The offset goes to
     /// FSR with the frame.
     void UpdateOcarinaJitter();
-    void TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool is_indirect);
+    void TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool is_indirect,
+                           const MemStage::TrackerRecord* record);
+    /// FRITCHII_MEMSTAGE_SHADOW: the trackers' record against today's query.
+    void VerifyTrackerRecord(const MemStage::TrackerRecord* record);
     bool TryOcarinaUpscale(const ComputePipeline& pipeline, bool replace);
     void ReadOcarinaActor(struct OcarinaActorMesh& mesh);
     /// Records the uniform and storage buffers of the current draw or dispatch for the frame dump.

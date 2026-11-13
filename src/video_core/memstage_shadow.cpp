@@ -44,12 +44,62 @@
 // query) and the collected game writes applied (OnCacheInvalidations / OnCacheInvalidation). The
 // buffer half there must stay 0 in play, or such draws become level entries in step 6.
 //
-// What it does not cover (yet): compute and the other engines (level by design); 3D methods that
-// are level in the first version (spec 3.2); render_enable.mode (level: the back asks the query
-// cache and flushes, AccelerateConditionalRendering); the query and shader code pages of the
-// watched-page filter (only image pages and the texture/sampler tables are tested).
+// What it does not cover (yet): the query and shader code pages of the watched-page filter (only
+// image pages and the texture/sampler tables are tested).
+//
+// Piece 5c (fable_memstage_6b_plan.md sections 2 to 4 and 6.1): the classification of 6b and
+// "follow".
+// - Four classes. Pass and work as before; **hard** is a level entry that needs the cache on the
+//   back (or does something the stage cannot know); **neutral** is another engine's plain register
+//   write, which touches nothing the stage reads. Only hard entries start a run. A run starts at
+//   a hard entry and ends after the last hard entry reached through pass and neutral entries only:
+//   a work entry, or any entry that issues a draw, ends it.
+// - Plan section 2: clear_report_value, fragment_barrier and tiled_cache_barrier are pass (the
+//   store); report_semaphore.query is pass unless it is a fence report (Release with a short
+//   query: hard); render_enable.mode is work with no packet when its result is fixed by the
+//   registers (an override, or mode False / True: the stage sets execute_on), else hard (and
+//   execute_on is taken from the back after it). Other engines: plain writes neutral, their
+//   execution_mask methods hard. Closures: StageTag::Cache is hard with no copy after; ListDraw is
+//   a draw loop tag (work).
+// - Follow (plan 3.2): the copy is no longer thrown away at every level entry. Hard entries are
+//   applied to it too (the store; falcon[4]'s scratch word; constant buffer words as before), so
+//   it stays current. Only an entry that cannot be followed marks the copies stale (an untagged
+//   closure, an unknown tag, a 3D macro run on the back, methods before any engine entry); the
+//   next use takes the full copy from the back as in 5b (Resync), counted by cause. After a hard
+//   render_enable.mode the stage takes execute_on from the back, and after a draw the back issued
+//   inside a hard entry (or a GPU-counted draw whose count the rasterizer wrote into the draw
+//   state) the draw manager's scalar draw state; both at the next entry, where the back has run
+//   exactly what the stage has applied.
+// - The cache's flags (plan 4.2): compare b looks at flags 15 to 48 only (VertexBuffers,
+//   VertexBuffer0..31, IndexBuffer; the others belong to the texture cache and the state tracker).
+//   The copy keeps its flags as the cache's own state: its stores raise them, a full copy takes
+//   the back's, and what the back's fill clears (the flags before the fill and not after it) is
+//   cleared on the copy too, except a flag the stage raised again after its draw. The cache's own
+//   marks (a deleted buffer's scrub, a repack change) reach the copy through CacheInputs' mark
+//   hook. At the back's draw the flags must be equal both ways when the state tracker has not
+//   raised them since the back's previous draw (g_flag_invalidations), and the copy's a subset of
+//   the back's otherwise. Mismatches are counted per flag.
+// - SHADOW=3 (plan 6.1 step B): the real fill reads the copy. At a draw the back issues outside a
+//   hard entry, whose shadow draw matched and whose copy has not changed since (a generation
+//   count), the rasterizer points the buffer cache's inputs at the copy (CacheInputs holding
+//   pointers, plan 5.4). Otherwise (indirect, a hard entry, a stale or moved-on copy) it reads
+//   the engine. The cache's flags are then the copy's outside runs: at a run's start the back's
+//   flags 15-48 are set to the copy's (the lend), and inside a run the copy takes the back's at
+//   every entry (the return). Needs full vertex binds (the state tracker's raises on the back are
+//   dropped at the lend): while FRITCHII_MEMSTAGE_FULL_BINDS is off it runs as 2 (counted). The
+//   flag part of compare b is skipped at 3 (the copy's fills clear the copy's flags, not the
+//   back's).
+//
+// Counters for 5c (the "Memory stage 5c" lines): runs a second by first hard kind and channel
+// (top 12) and entries per run; served draws between two runs (histogram); full copies a second
+// and bytes by cause; render_enable.mode by override and mode, and the hard ones; fence reports;
+// other engines' hard methods; b mismatches by flag; SHADOW=3's fills from the copy and the
+// reasons for the others; the OoT trackers' record against today's query. Then the gate line of
+// plan 6.1: runs above 15,000 a second (at the market), full copies above 2,000 a second, or a
+// render_enable.mode the registers do not decide, each fails it.
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cstring>
 #include <deque>
@@ -64,6 +114,8 @@
 #endif
 
 #include "common/logging.h"
+#include "video_core/buffer_cache/cache_inputs.h"
+#include "video_core/dirty_flags.h"
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/kepler_memory.h"
@@ -71,6 +123,7 @@
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
+#include "video_core/memory_stage_link.h"
 #include "video_core/memstage_shadow.h"
 #include "video_core/memstage_shadow_engine.h"
 #include "video_core/nx2_debug_control.h"
@@ -117,7 +170,8 @@ thread_local bool t_on_back{};
 const PageFilter* g_watch_filter{};
 int g_mode{};
 
-enum class Class : u8 { Pass, Work, Level };
+/// Level is "hard" in 5c's words (plan section 2): the entry needs the cache on the back.
+enum class Class : u8 { Pass, Work, Level, Neutral };
 
 /// What a level entry is, for the by-kind counter.
 enum class LevelType : u8 {
@@ -125,14 +179,36 @@ enum class LevelType : u8 {
     Macro3D,    ///< id: the macro method
     Packet3D,   ///< a tagged draw packet holding a level method; id: the method
     Batch3D,    ///< a draw batch holding a level method; id: the method
-    Engine,     ///< methods on another engine; id: EngineType
+    Engine,     ///< (5b) methods on another engine; id: EngineType
     NoEngine,   ///< methods before any engine entry
     Call,       ///< an untagged closure; id: its address in the executable
     CbWatched,  ///< constant buffer words onto a watched page
     CbMode,     ///< constant buffer words with EXP107 (the stage implements the default mode)
     UnknownTag, ///< a tag the shadow does not know
+    // 5c
+    FenceReport,  ///< report_semaphore.query, a fence (Release, short query)
+    Condition,    ///< render_enable.mode the registers do not decide; id: override << 8 | mode
+    EngineMethod, ///< another engine's executable method; id: EngineType << 16 | method
+    CacheCall,    ///< a closure tagged StageTag::Cache; id: its address in the executable
 };
 enum class EngineType : u32 { KeplerCompute, KeplerMemory, MaxwellDMA, Fermi2D, Other };
+
+/// The cache's flags (plan 4.2): VertexBuffers, VertexBuffer0..31, IndexBuffer.
+constexpr u32 CacheFlagFirst = VideoCommon::Dirty::VertexBuffers;
+constexpr u32 CacheFlagLast = VideoCommon::Dirty::IndexBuffer;
+constexpr u32 CacheFlagCount = CacheFlagLast - CacheFlagFirst + 1;
+static_assert(CacheFlagCount == 34);
+
+const Maxwell3D::DirtyState::Flags& CacheFlagMask() {
+    static const Maxwell3D::DirtyState::Flags mask = [] {
+        Maxwell3D::DirtyState::Flags bits;
+        for (u32 flag = CacheFlagFirst; flag <= CacheFlagLast; ++flag) {
+            bits[flag] = true;
+        }
+        return bits;
+    }();
+    return mask;
+}
 
 u64 LevelKey(LevelType type, s32 channel, u64 id) {
     return (u64{static_cast<u8>(type)} << 56) | (u64{static_cast<u8>(channel)} << 48) |
@@ -224,6 +300,18 @@ std::string LevelName(u64 key) {
         break;
     case LevelType::UnknownTag:
         what = fmt::format("call with stage tag {}", id);
+        break;
+    case LevelType::FenceReport:
+        what = "3D 0x6c3 report_semaphore.query, fence";
+        break;
+    case LevelType::Condition:
+        what = fmt::format("3D 0x556 render_enable.mode {} (override {})", id & 0xff, id >> 8);
+        break;
+    case LevelType::EngineMethod:
+        what = fmt::format("{} method {:#x}", EngineName(id >> 16), id & 0xffff);
+        break;
+    case LevelType::CacheCall:
+        what = fmt::format("cache call +{:#x}", id);
         break;
     }
     return fmt::format("{} ch{}", what, channel);
@@ -494,7 +582,10 @@ struct Record {
     Maxwell3D* engine{};
     s32 channel{};
     u64 program_key{};
-    Flags dirty{};
+    Flags dirty{};        ///< The copy's flags at the draw
+    Flags raised_before{}; ///< Raised on the copy since its previous draw
+    u64 generation{};     ///< The copy's generation at the draw (SHADOW=3)
+    bool hard{};          ///< Issued inside a hard entry
     std::vector<u32> words;
     std::vector<Range> ranges; ///< Written since the shadow's previous draw
 };
@@ -508,6 +599,34 @@ struct Copy {
     bool skip_same{};
     bool front_macros{};
     bool stale{true};
+    /// Flags raised on the copy since its last draw (StageDraw hands them to the pending records).
+    Flags raised{};
+    /// Bumped at every change to what the fill reads (SHADOW=3: a draw whose copy moved on since
+    /// the shadow's draw reads the engine instead).
+    u64 generation{};
+};
+
+/// Histogram buckets of served draws between two runs: 0, 1, 2-3, 4-7, 8-15, 16+.
+constexpr size_t GapBuckets = 6;
+size_t GapBucket(u64 draws) {
+    if (draws == 0) {
+        return 0;
+    }
+    const size_t bit = static_cast<size_t>(std::bit_width(draws)); // 1 -> 1, 2-3 -> 2, ...
+    return (std::min)(bit, GapBuckets - 1);
+}
+
+/// SHADOW=3: why a draw's fill read the engine and not the copy.
+enum class FillFrom : u8 {
+    Copy,
+    NoRecord,   ///< the back's draw matched no shadow draw
+    Hard,       ///< issued inside a hard entry (the back fills in a run)
+    Indirect,   ///< an indirect draw (level in 6b)
+    Stale,      ///< the copy is stale (after an entry that cannot be followed)
+    MovedOn,    ///< the copy changed after the shadow's draw (later writes of the same entry)
+    Other,      ///< another engine or channel than the shadow's draw
+    NoFullBinds, ///< FRITCHII_MEMSTAGE_FULL_BINDS off
+    Count,
 };
 
 /// Counters for one 10 s window.
@@ -534,6 +653,26 @@ struct Counters {
     u64 draw_flushes{}, draw_flush_texture{}, draw_flush_buffer{}, draw_flush_query{};
     u64 draw_gathers{}, draw_gather_ranges{}, draw_single_invalidations{};
     std::unordered_map<u64, u64> level_kinds;
+    // 5c.
+    u64 neutral{};
+    u64 run_entries{};     ///< Entries of the runs that ended in this window
+    u64 runs_ended{};
+    std::array<u64, GapBuckets> gaps{}; ///< Served draws between two runs
+    u64 served_draws{};    ///< Shadow draws outside hard entries with execute_on
+    std::unordered_map<u64, u64> run_kinds;   ///< Runs by their first hard entry's kind
+    std::unordered_map<u64, u64> copy_causes; ///< Full copies by the entry that made them stale
+    std::unordered_map<u32, u64> conditions;  ///< render_enable.mode: override << 8 | mode
+    u64 condition_hard{};
+    u64 fence_reports{}, reports{};
+    u64 macros_on_back{};
+    u64 execute_takes{}, draw_state_takes{}, draw_state_written{};
+    std::array<u64, CacheFlagCount> flag_missing{}; ///< Raised on the copy, not on the back
+    std::array<u64, CacheFlagCount> flag_extra{};   ///< On the back, not the copy (no invalidation)
+    u64 flag_compares{}, flag_compares_strict{}, flag_settles{};
+    std::array<u64, static_cast<size_t>(FillFrom::Count)> fill_from{};
+    u64 lends{}, returns{};
+    // The OoT trackers' record (plan 5.1) against today's query.
+    u64 tracker_compared{}, tracker_mismatches{}, tracker_without{};
 };
 
 struct State {
@@ -561,11 +700,39 @@ struct State {
     std::vector<Range> due; ///< Ranges of draws the back issued, not flushed yet
     std::unordered_map<u64, u64> program_sets; ///< Program key -> shader set key
     std::unordered_map<u64, u64> facts;        ///< Shader set key -> facts digest
+    // 5c: the entry being processed.
+    bool entry_hard{};        ///< A hard entry (plan section 2)
+    u64 entry_key{};          ///< ... its first hard kind
+    bool entry_unfollowed{};  ///< It cannot be followed: the copies go stale
+    LevelType entry_type{LevelType::Method3D}; ///< How a hard 3D method in it is named
+    u32 entry_draws{};        ///< Shadow draws it issued
+    u32 entry_served{};       ///< ... with execute_on
+    u64 stale_cause{};        ///< The entry that last made the copies stale (full copy counter)
+    // Runs (plan 3.2).
+    bool in_run{};
+    u64 run_entries{};        ///< Up to its last hard entry
+    u64 run_trailing{};       ///< Pass and neutral entries after its last hard entry
+    u64 served_since_run{};
+    // Taken from the back at the next entry (plan 3.3).
+    Copy* take_execute{};
+    Copy* take_draw_state{};
+    // The back's draw being prepared: its record's flags, for the fill's clears (plan 4.2).
+    Copy* match_copy{};       ///< The copy of the back's current draw's record, or null
+    u64 match_generation{};
+    bool match_hard{};
+    bool match_indirect{};
+    s32 match_channel{};
+    bool fill_pending{};      ///< Between BackFill and the settle
+    Flags fill_pre{};         ///< The back's cache flags at BackFill (and marks made since)
+    Maxwell3D* fill_engine{};
+    bool fill_from_copy{};
+    u64 invalidations_seen{}; ///< g_flag_invalidations at the back's previous draw
+    bool full_binds{};        ///< SHADOW=3: FRITCHII_MEMSTAGE_FULL_BINDS at the last check
     Counters counters;
     Counters totals;
     std::chrono::steady_clock::time_point window_start{};
     u64 entries_since_check{};
-    u32 b_logged{}, a_logged{}, c_logged{}, d_logged{};
+    u32 b_logged{}, a_logged{}, c_logged{}, d_logged{}, t_logged{};
 #ifdef _WIN32
     u64 module_base{};
 #endif
@@ -574,6 +741,40 @@ struct State {
 State& S() {
     static State state;
     return state;
+}
+
+/// The entry being processed is hard (a level entry); the first kind names it.
+void Hard(State& s, LevelType type, u64 id) {
+    if (!s.entry_hard) {
+        s.entry_hard = true;
+        s.entry_key = LevelKey(type, s.channel, id);
+    }
+}
+
+/// The entry cannot be followed: hard, and the copies go stale after it (plan 3.2).
+void Unfollow(State& s, LevelType type, u64 id) {
+    Hard(s, type, id);
+    if (!s.entry_unfollowed) {
+        s.entry_unfollowed = true;
+        s.stale_cause = LevelKey(type, s.channel, id);
+    }
+}
+
+/// The draw manager's scalar draw state, the inline index bytes left out (plan 3.3).
+void CopyScalarDrawState(Maxwell3D::DrawManager::State& to,
+                         const Maxwell3D::DrawManager::State& from) {
+    to.topology = from.topology;
+    to.draw_mode = from.draw_mode;
+    to.draw_indexed = from.draw_indexed;
+    to.draw_element_count = from.draw_element_count;
+    to.base_index = from.base_index;
+    to.vertex_buffer = from.vertex_buffer;
+    to.index_buffer = from.index_buffer;
+    to.base_instance = from.base_instance;
+    to.instance_count = from.instance_count;
+    to.drawn_instances = from.drawn_instances;
+    to.list_draw_address = from.list_draw_address;
+    to.list_keep_id = from.list_keep_id;
 }
 
 Copy* FindCopy(State& s, Maxwell3D* back) {
@@ -633,9 +834,11 @@ void DirtyStore(Copy& c, u32 method, u32 value) {
         !Maxwell3D::DrawManager::IsInstanceLoopMethod(method)) [[unlikely]] {
         e.draw_manager.DrawDeferred(e, true);
     }
+    ++c.generation;
     e.regs.reg_array[method] = value;
     for (const auto& table : *c.tables) {
         e.dirty.flags[table[method]] = true;
+        c.raised[table[method]] = true;
     }
 }
 
@@ -692,7 +895,8 @@ void Collect(State& s, const Copy& c, GPUVAddr address, u64 size) {
     }
 }
 
-/// Maxwell3D::ProcessCBMultiData: computes the write and its range, writes nothing.
+/// Maxwell3D::ProcessCBMultiData: computes the write and its range, writes nothing. With EXP107
+/// (a mode the stage does not implement: hard) only the offset advances, as in a run (plan 3.2).
 void ConstBufferWords(State& s, Copy& c, u32 amount) {
     Regs& regs = c.e->regs;
     const GPUVAddr address = regs.const_buffer.Address();
@@ -701,14 +905,14 @@ void ConstBufferWords(State& s, Copy& c, u32 amount) {
                          ? regs.const_buffer.size - regs.const_buffer.offset
                          : 0;
     const u64 write_size = (std::min)(copy_size, room / sizeof(u32) * sizeof(u32));
-    if (write_size != 0) {
+    ++c.generation;
+    if (write_size != 0 && !CbMode()) {
         const GPUVAddr begin = address + regs.const_buffer.offset;
         if (Watched(c, begin, write_size)) [[unlikely]] {
-            // Join 2: the stage would leave this entry to the back. Counted; the copy is
-            // taken from the back again at the next entry, as after any level entry.
+            // Join 2: the stage leaves this entry to the back (hard). It follows it: the
+            // offset below; the back writes the words.
             ++s.counters.watched_hits;
-            ++s.counters.level_kinds[LevelKey(LevelType::CbWatched, s.channel, 0)];
-            c.stale = true;
+            Hard(s, LevelType::CbWatched, 0);
         }
         Collect(s, c, begin, write_size);
     }
@@ -718,6 +922,7 @@ void ConstBufferWords(State& s, Copy& c, u32 amount) {
 /// Maxwell3D::ProcessCBBind: the binding the cache gets (Bind/DisableGraphicsUniformBuffer).
 void ConstBufferBind(Copy& c, size_t stage) {
     Engine& e = *c.e;
+    ++c.generation;
     const auto& bind = e.regs.bind_groups[stage];
     if (bind.shader_slot >= Regs::MaxConstBuffers) {
         return;
@@ -728,42 +933,112 @@ void ConstBufferBind(Copy& c, size_t stage) {
     buffer.size = e.regs.const_buffer.size;
 }
 
-/// The executable 3D methods the first version leaves to the back (spec 3.2 and 8.1).
-bool IsLevelMethod(const Copy& c, u32 method) {
-    if (method >= MacroRegistersStart) {
-        return true;
-    }
+/// How an executable 3D method classifies before its handler (plan section 2; the handler can
+/// still make it hard: a fence report, a render_enable.mode the registers do not decide, constant
+/// buffer words onto a watched page).
+enum class MethodKind : u8 { Work, Pass, Hard };
+
+MethodKind MethodKindOf(const Copy& c, u32 method) {
     switch (method) {
+    // Hard: they need the back's caches (the gather, the wait, the upload engine's writes),
+    // or (falcon[4]) were level in the first version. Followed: the store, and falcon[4]'s
+    // scratch word.
     case MAXWELL3D_REG_INDEX(wait_for_idle):
     case MAXWELL3D_REG_INDEX(falcon[4]):
-    case MAXWELL3D_REG_INDEX(report_semaphore.query):
-    case MAXWELL3D_REG_INDEX(clear_report_value):
     case MAXWELL3D_REG_INDEX(sync_info):
     case MAXWELL3D_REG_INDEX(launch_dma):
     case MAXWELL3D_REG_INDEX(inline_data):
-    case MAXWELL3D_REG_INDEX(fragment_barrier):
     case MAXWELL3D_REG_INDEX(invalidate_texture_data_cache):
+        return MethodKind::Hard;
+    // Pass (plan 2.2, 2.4, 2.5): the query streamer's reset, the scheduler's barrier, an empty
+    // handler, and a report that is not a fence (the handler decides that). The store only.
+    case MAXWELL3D_REG_INDEX(clear_report_value):
+    case MAXWELL3D_REG_INDEX(fragment_barrier):
     case MAXWELL3D_REG_INDEX(tiled_cache_barrier):
-    // The back asks the query cache (host conditional rendering) and flushes the invalidation
-    // ranges first (RasterizerVulkan::AccelerateConditionalRendering): level in the first version.
-    case MAXWELL3D_REG_INDEX(render_enable.mode):
-        return true;
+    case MAXWELL3D_REG_INDEX(report_semaphore.query):
+        return MethodKind::Pass;
     case MAXWELL3D_REG_INDEX(load_mme.instruction_ptr):
     case MAXWELL3D_REG_INDEX(load_mme.instruction):
     case MAXWELL3D_REG_INDEX(load_mme.start_address):
-        return !c.front_macros;
+        return c.front_macros ? MethodKind::Work : MethodKind::Hard;
     default:
-        return method - CbData < 16 && CbMode();
+        return method - CbData < 16 && CbMode() ? MethodKind::Hard : MethodKind::Work;
     }
 }
 
-/// Maxwell3D::ProcessMethodCall for the methods that are not level.
+/// render_enable.mode after its store (plan 2.3): execute_on from the registers when they decide
+/// it (an override, or mode False / True: the back's AccelerateConditionalRendering then only ends
+/// host conditional rendering and returns false). Otherwise hard, and execute_on is taken from the
+/// back at the next entry.
+void Condition(State& s, Copy& c) {
+    using RenderEnable = Regs::RenderEnable;
+    Engine& e = *c.e;
+    ++c.generation;
+    const auto override_value = e.regs.render_enable_override;
+    const auto mode = e.regs.render_enable.mode;
+    const u32 key = (static_cast<u32>(override_value) << 8) | (static_cast<u32>(mode) & 0xff);
+    ++s.counters.conditions[key];
+    switch (override_value) {
+    case RenderEnable::Override::AlwaysRender:
+        e.execute_on = true;
+        return;
+    case RenderEnable::Override::NeverRender:
+        e.execute_on = false;
+        return;
+    default:
+        break;
+    }
+    if (override_value == RenderEnable::Override::UseRenderEnable) {
+        if (mode == RenderEnable::Mode::True) {
+            e.execute_on = true;
+            return;
+        }
+        if (mode == RenderEnable::Mode::False) {
+            e.execute_on = false;
+            return;
+        }
+    }
+    ++s.counters.condition_hard;
+    Hard(s, LevelType::Condition, key);
+    s.take_execute = &c;
+}
+
+/// Maxwell3D::ProcessMethodCall's effects on the copy, for every executable method that is not a
+/// macro: the stage's handler (spec 3.2), or for a hard method what follow applies (plan 3.2).
 void MethodCall(State& s, Copy& c, u32 method, u32 value, u32 nonshadow) {
     Engine& e = *c.e;
     if (method - CbData < 16) {
         return ConstBufferWords(s, c, 1);
     }
+    ++c.generation;
     switch (method) {
+    case MAXWELL3D_REG_INDEX(falcon[4]):
+        // Maxwell3D::ProcessFirmwareCall4.
+        e.regs.shadow_scratch[0] = 1;
+        return;
+    case MAXWELL3D_REG_INDEX(report_semaphore.query): {
+        // Maxwell3D::ProcessQueryGet: a fence report signals a fence, whose manager commits the
+        // cache's async flushes (plan 2.4): hard. Any other report is the store only.
+        ++s.counters.reports;
+        const auto& query = e.regs.report_semaphore.query;
+        if (query.operation.Value() == Regs::ReportSemaphore::Operation::Release &&
+            query.short_query != 0) {
+            ++s.counters.fence_reports;
+            Hard(s, LevelType::FenceReport, method);
+        }
+        return;
+    }
+    case MAXWELL3D_REG_INDEX(render_enable.mode):
+        return Condition(s, c);
+    case MAXWELL3D_REG_INDEX(wait_for_idle):
+    case MAXWELL3D_REG_INDEX(sync_info):
+    case MAXWELL3D_REG_INDEX(launch_dma):
+    case MAXWELL3D_REG_INDEX(inline_data):
+    case MAXWELL3D_REG_INDEX(invalidate_texture_data_cache):
+    case MAXWELL3D_REG_INDEX(clear_report_value):
+    case MAXWELL3D_REG_INDEX(fragment_barrier):
+    case MAXWELL3D_REG_INDEX(tiled_cache_barrier):
+        return; // the store only
     case Maxwell3D::RootTables::SelectMethod:
         e.root_tables.selected = value & 7;
         e.root_tables.offset = (value >> 8) & 0xff;
@@ -800,27 +1075,41 @@ void MethodCall(State& s, Copy& c, u32 method, u32 value, u32 nonshadow) {
     }
 }
 
-/// Maxwell3D::CallMethod for a method that is not level (CallMethodSlow's order).
+/// Maxwell3D::CallMethod (CallMethodSlow's order), for every method: hard ones are followed. A
+/// macro method (one the back would run) cannot be followed.
 void CallMethod(State& s, Copy& c, u32 method, u32 argument) {
+    if (method >= MacroRegistersStart) [[unlikely]] {
+        ++s.counters.macros_on_back;
+        return Unfollow(s, LevelType::Macro3D, method);
+    }
     if (!c.back->execution_mask[method]) {
         return StateWrite(c, method, argument);
+    }
+    if (MethodKindOf(c, method) == MethodKind::Hard) {
+        Hard(s, s.entry_type, method);
     }
     const u32 value = ShadowRam(*c.e, method, argument);
     DirtyStore(c, method, value);
     MethodCall(s, c, method, value, argument);
 }
 
-/// Maxwell3D::CallMultiMethod for a method that is not level.
+/// Maxwell3D::CallMultiMethod, for every method that is not a macro (hard ones are followed).
 void CallMultiMethod(State& s, Copy& c, u32 method, const u32* words, u32 amount) {
     Engine& e = *c.e;
     if (e.draw_manager.HasDeferredDraw() &&
         !Maxwell3D::DrawManager::IsInstanceLoopMethod(method)) [[unlikely]] {
         e.draw_manager.DrawDeferred(e, true);
     }
+    if (c.back->execution_mask[method] && MethodKindOf(c, method) == MethodKind::Hard) {
+        Hard(s, s.entry_type, method);
+    }
     if (method - CbData < 16) {
         return ConstBufferWords(s, c, amount);
     }
     switch (method) {
+    case MAXWELL3D_REG_INDEX(inline_data):
+        // The upload engine takes the words; no register is stored (Maxwell3D::CallMultiMethod).
+        return;
     case MAXWELL3D_REG_INDEX(draw_inline_index):
     case MAXWELL3D_REG_INDEX(inline_index_2x16.even):
     case MAXWELL3D_REG_INDEX(inline_index_4x8.index0):
@@ -853,10 +1142,21 @@ void Resync(State& s, Copy& c) {
     e.root_tables = back.root_tables;
     e.draw_manager = back.draw_manager;
     e.execute_on = back.ShouldExecute();
-    e.dirty.flags.reset();
+    // 5c (plan 4.2): the cache's flags are taken with the rest, not reset. A flag raised for a
+    // vertex stream written before the entry that made the copy stale stays raised.
+    e.dirty.flags = back.dirty.flags;
+    c.raised.reset();
+    ++c.generation;
     c.stale = false;
     ++s.counters.resyncs;
     s.counters.resync_bytes += 2 * sizeof(Regs) + sizeof(e.state) + sizeof(e.root_tables);
+    ++s.counters.copy_causes[s.stale_cause];
+    if (s.take_execute == &c) {
+        s.take_execute = nullptr;
+    }
+    if (s.take_draw_state == &c) {
+        s.take_draw_state = nullptr;
+    }
     if (back.method_sink.empty()) {
         return;
     }
@@ -868,10 +1168,6 @@ void Resync(State& s, Copy& c) {
         StateWrite(c, method, value);
     }
     s.processing_sunk = sunk;
-}
-
-void CountLevel(State& s, LevelType type, u64 id) {
-    ++s.counters.level_kinds[LevelKey(type, s.channel, id)];
 }
 
 u64 Rva(u64 address) {
@@ -909,8 +1205,78 @@ Maxwell3D* As3D(u64 pointer) {
     return reinterpret_cast<Maxwell3D*>(pointer);
 }
 
-/// Classifies the entry at `position`, applies it to the copies unless it is level, and returns
-/// its size in words (for a wrap: the rest of the ring).
+/// SHADOW=3: whether the copy holds the cache's flags outside runs (needs full vertex binds).
+bool OwnsFlags(const State& s) {
+    return g_mode >= 3 && s.full_binds;
+}
+
+/// Sets `to`'s cache flags (15 to 48) to `from`'s.
+void TakeCacheFlags(Flags& to, const Flags& from) {
+    const Flags& mask = CacheFlagMask();
+    to = (to & ~mask) | (from & mask);
+}
+
+/// SHADOW=3, a run starts (plan 3.3): the back holds the cache for it, with the copy's flags.
+void Lend(State& s) {
+    for (Copy& copy : s.copies) {
+        if (!copy.stale) {
+            TakeCacheFlags(copy.back->dirty.flags, copy.e->dirty.flags);
+        }
+    }
+    ++s.counters.lends;
+}
+
+/// SHADOW=3, inside a run: the copy takes the back's flags (the back is at the same entry).
+void Return(State& s) {
+    for (Copy& copy : s.copies) {
+        if (!copy.stale) {
+            TakeCacheFlags(copy.e->dirty.flags, copy.back->dirty.flags);
+            ++copy.generation;
+        }
+    }
+    ++s.counters.returns;
+}
+
+/// Run bookkeeping for one entry (plan 3.2): a run starts at a hard entry and ends after the last
+/// hard entry reached through pass and neutral entries; a work entry, or one that issued a draw,
+/// ends it.
+void Runs(State& s, Class cls) {
+    Counters& c = s.counters;
+    if (cls == Class::Level) {
+        if (!s.in_run) {
+            s.in_run = true;
+            ++c.level_runs;
+            ++c.run_kinds[s.entry_key];
+            ++c.gaps[GapBucket(s.served_since_run)];
+            s.served_since_run = 0;
+            s.run_entries = 1;
+            s.run_trailing = 0;
+            if (OwnsFlags(s)) {
+                Lend(s);
+            }
+        } else {
+            s.run_entries += s.run_trailing + 1;
+            s.run_trailing = 0;
+        }
+        return;
+    }
+    if (cls == Class::Work || s.entry_draws != 0) {
+        if (s.in_run) {
+            s.in_run = false;
+            ++c.runs_ended;
+            c.run_entries += s.run_entries;
+        }
+        s.served_since_run += s.entry_served;
+        return;
+    }
+    if (s.in_run) {
+        ++s.run_trailing;
+    }
+}
+
+/// Classifies the entry at `position`, applies it to the copies (hard entries too: follow, plan
+/// 3.2, unless it cannot be followed), and returns its size in words (for a wrap: the rest of the
+/// ring).
 size_t Process(State& s, u64 position, bool executed) {
     const u64* const ring = Access::Ring();
     const size_t index = position & Access::RingMask;
@@ -918,16 +1284,27 @@ size_t Process(State& s, u64 position, bool executed) {
     const u64 head = entry[0];
     s.processing_position = position;
     s.processing_sunk = false;
+    s.entry_hard = false;
+    s.entry_unfollowed = false;
+    s.entry_type = LevelType::Method3D;
+    s.entry_draws = 0;
+    s.entry_served = 0;
     if (s.channel_stale && !executed) {
-        // After a level run, the channel as the back has it (an untagged closure may bind one).
+        // After an entry that cannot be followed, the channel as the back has it (an untagged
+        // closure may bind one).
         s.channel = s.back_channel;
         s.channel_stale = false;
     }
     Class cls = Class::Pass;
     size_t size = 1;
-    auto level = [&](LevelType type, u64 id) {
-        cls = Class::Level;
-        CountLevel(s, type, id);
+    // Another engine's method: neutral unless executable (plan 2.6).
+    const auto other_engine = [&](u32 method, bool executable) {
+        if (executable) {
+            Hard(s, LevelType::EngineMethod,
+                 (u64{static_cast<u32>(s.engine_type)} << 16) | (method & 0xffff));
+        } else {
+            cls = Class::Neutral;
+        }
     };
     switch (static_cast<Kind>(head & 0xf)) {
     case Kind::Wrap:
@@ -942,7 +1319,7 @@ size_t Process(State& s, u64 position, bool executed) {
             s.engine_copy = FindCopy(s, maxwell3d);
         } else {
             s.engine_type = TypeOf(engine);
-            level(LevelType::Engine, static_cast<u64>(s.engine_type));
+            cls = Class::Neutral;
         }
         break;
     }
@@ -951,28 +1328,35 @@ size_t Process(State& s, u64 position, bool executed) {
         const u32 method = static_cast<u32>((head >> 8) & 0xffff);
         const u32 argument = static_cast<u32>(head >> 32);
         if (s.engine == nullptr) {
-            level(LevelType::NoEngine, 0);
+            Unfollow(s, LevelType::NoEngine, 0);
             break;
         }
         if (s.engine_copy == nullptr) {
-            level(LevelType::Engine, static_cast<u64>(s.engine_type));
+            // A Sink write is a plain store (GpuSplit::SinkMethod); Direct is called.
+            other_engine(method, (head & Access::Direct) != 0 ||
+                                     ((head & Access::Sink) == 0 &&
+                                      s.engine->execution_mask[method]));
             break;
         }
         Copy& c0 = *s.engine_copy;
         const bool executable = c0.back->execution_mask[method];
         if ((head & Access::Sink) != 0) {
-            level(LevelType::Method3D, method);
+            // Not sent for the 3D engine (native compute only): the back stores it later.
+            Unfollow(s, LevelType::Method3D, method);
             break;
         }
         if ((head & Access::Direct) != 0 || executable) {
-            if (executable && IsLevelMethod(c0, method)) {
-                level(method >= MacroRegistersStart ? LevelType::Macro3D : LevelType::Method3D,
-                      method);
+            if (method >= MacroRegistersStart) {
+                ++s.counters.macros_on_back;
+                Unfollow(s, LevelType::Macro3D, method);
                 break;
             }
-            cls = executable ? Class::Work : Class::Pass;
+            cls = executable && MethodKindOf(c0, method) == MethodKind::Work ? Class::Work
+                                                                             : Class::Pass;
             if (Copy* const c = Use(s, c0.back, executed)) {
                 CallMethod(s, *c, method, argument);
+            } else if (executable && MethodKindOf(c0, method) == MethodKind::Hard) {
+                Hard(s, LevelType::Method3D, method);
             }
             break;
         }
@@ -991,26 +1375,26 @@ size_t Process(State& s, u64 position, bool executed) {
         const size_t data = (head & Access::HasSegment) != 0 ? 3 : 2;
         size = data + (amount + 1) / 2;
         if (s.engine == nullptr) {
-            level(LevelType::NoEngine, 0);
+            Unfollow(s, LevelType::NoEngine, 0);
             break;
         }
         if (s.engine_copy == nullptr) {
-            level(LevelType::Engine, static_cast<u64>(s.engine_type));
+            other_engine(method, s.engine->execution_mask[method]);
             break;
         }
         Copy& c0 = *s.engine_copy;
         if (method >= MacroRegistersStart) {
-            level(LevelType::Macro3D, method);
+            ++s.counters.macros_on_back;
+            Unfollow(s, LevelType::Macro3D, method);
             break;
         }
         const bool executable = c0.back->execution_mask[method];
-        if (executable && IsLevelMethod(c0, method)) {
-            level(LevelType::Method3D, method);
-            break;
-        }
-        cls = executable ? Class::Work : Class::Pass;
+        cls = executable && MethodKindOf(c0, method) == MethodKind::Work ? Class::Work
+                                                                         : Class::Pass;
         if (Copy* const c = Use(s, c0.back, executed)) {
             CallMultiMethod(s, *c, method, reinterpret_cast<const u32*>(entry + data), amount);
+        } else if (executable && MethodKindOf(c0, method) == MethodKind::Hard) {
+            Hard(s, LevelType::Method3D, method);
         }
         break;
     }
@@ -1020,9 +1404,13 @@ size_t Process(State& s, u64 position, bool executed) {
         const u64* const words = entry + 2;
         switch (StageTagOf(head)) {
         case StageTag::Level:
-            level(LevelType::Call, Rva(entry[1]));
+            Unfollow(s, LevelType::Call, Rva(entry[1]));
             break;
         case StageTag::Pass:
+            break;
+        case StageTag::Cache:
+            // Uses the cache on the back, writes no 3D state: hard, no copy after (plan 3.3).
+            Hard(s, LevelType::CacheCall, Rva(entry[1]));
             break;
         case StageTag::Channel:
             cls = Class::Work;
@@ -1032,27 +1420,15 @@ size_t Process(State& s, u64 position, bool executed) {
             Maxwell3D* const engine = As3D(words[0]);
             const u32 count = static_cast<u32>(words[2]);
             const u64* const writes = words + 3;
-            Copy* const c0 = engine != nullptr ? FindCopy(s, engine) : nullptr;
-            if (c0 == nullptr) {
-                level(LevelType::Packet3D, 0);
-                break;
-            }
-            for (u32 i = 0; i < count; ++i) {
-                const u32 method = static_cast<u32>(writes[i] & 0xffff);
-                if (c0->back->execution_mask[method] && IsLevelMethod(*c0, method)) {
-                    level(LevelType::Packet3D, method);
-                    break;
-                }
-            }
-            if (cls == Class::Level) {
-                break;
-            }
             cls = Class::Work;
+            s.entry_type = LevelType::Packet3D;
             if (Copy* const c = Use(s, engine, executed)) {
                 for (u32 i = 0; i < count; ++i) {
                     CallMethod(s, *c, static_cast<u32>(writes[i] & 0xffff),
                                static_cast<u32>(writes[i] >> 32));
                 }
+            } else if (engine == nullptr) {
+                Unfollow(s, LevelType::Packet3D, 0);
             }
             break;
         }
@@ -1060,6 +1436,7 @@ size_t Process(State& s, u64 position, bool executed) {
             cls = Class::Work;
             if (Copy* const c = Use(s, As3D(words[0]), executed)) {
                 // ConsumeSink (the shadow applied its writes already), then DrawDeferred.
+                ++c->generation;
                 c->e->draw_manager.DrawDeferred(*c->e);
             }
             break;
@@ -1067,18 +1444,30 @@ size_t Process(State& s, u64 position, bool executed) {
         case StageTag::DrawLoop: {
             cls = Class::Work;
             if (Copy* const c = Use(s, As3D(words[0]), executed)) {
+                ++c->generation;
                 // The kind is in header bits 40-47; AddLoopInstances' count is the low half of
-                // payload word 1 (the struct's u32 at offset 8, little-endian).
-                if (StageDrawLoopOf(head) == StageDrawLoop::FoldFirstInstance) {
+                // payload word 1 (the struct's u32 at offset 8, little-endian); ListDraw's address
+                // and keep id are words 1 and 2.
+                switch (StageDrawLoopOf(head)) {
+                case StageDrawLoop::FoldFirstInstance:
                     c->e->draw_manager.FoldFirstInstance();
-                } else {
+                    break;
+                case StageDrawLoop::AddLoopInstances:
                     c->e->draw_manager.AddLoopInstances(*c->e, static_cast<u32>(words[1]));
+                    break;
+                case StageDrawLoop::ListDraw:
+                    c->e->draw_manager.draw_state.list_draw_address = words[1];
+                    c->e->draw_manager.draw_state.list_keep_id = words[2];
+                    break;
+                default:
+                    Unfollow(s, LevelType::UnknownTag, static_cast<u64>(StageTag::DrawLoop));
+                    break;
                 }
             }
             break;
         }
         default:
-            level(LevelType::UnknownTag, static_cast<u64>(StageTagOf(head)));
+            Unfollow(s, LevelType::UnknownTag, static_cast<u64>(StageTagOf(head)));
             break;
         }
         break;
@@ -1088,11 +1477,11 @@ size_t Process(State& s, u64 position, bool executed) {
         const u32 count = static_cast<u32>(head >> 32);
         size = 1 + size_t{count};
         if (s.engine == nullptr) {
-            level(LevelType::NoEngine, 0);
+            Unfollow(s, LevelType::NoEngine, 0);
             break;
         }
         if (s.engine_copy == nullptr) {
-            level(LevelType::Engine, static_cast<u64>(s.engine_type));
+            cls = Class::Neutral; // plain stores (GpuSplit::PairWrite)
             break;
         }
         if (Copy* const c = Use(s, s.engine_copy->back, executed)) {
@@ -1108,22 +1497,16 @@ size_t Process(State& s, u64 position, bool executed) {
         const u32 repeats = static_cast<u32>(head >> 32);
         size = 1 + size_t{count};
         if (s.engine_copy == nullptr) {
-            level(s.engine == nullptr ? LevelType::NoEngine : LevelType::Engine,
-                  s.engine == nullptr ? 0 : static_cast<u64>(s.engine_type));
+            if (s.engine == nullptr) {
+                Unfollow(s, LevelType::NoEngine, 0);
+            } else {
+                Unfollow(s, LevelType::Engine, static_cast<u64>(s.engine_type));
+            }
             break;
         }
         Copy& c0 = *s.engine_copy;
-        for (u32 i = 0; i < count; ++i) {
-            const u32 method = static_cast<u32>(entry[1 + i] & 0xffff);
-            if (c0.back->execution_mask[method] && IsLevelMethod(c0, method)) {
-                level(LevelType::Batch3D, method);
-                break;
-            }
-        }
-        if (cls == Class::Level) {
-            break;
-        }
         cls = Class::Work;
+        s.entry_type = LevelType::Batch3D;
         if (Copy* const c = Use(s, c0.back, executed)) {
             // Maxwell3D::RunDrawBatch: the group once, then the repeats as instances.
             for (u32 i = 0; i < count; ++i) {
@@ -1131,36 +1514,41 @@ size_t Process(State& s, u64 position, bool executed) {
                            static_cast<u32>(entry[1 + i] >> 32));
             }
             if (repeats > 1) {
+                ++c->generation;
                 c->e->draw_manager.draw_state.instance_count += repeats - 1;
             }
         }
         break;
     }
     }
+    if (s.entry_hard) {
+        cls = Class::Level;
+    }
+    Runs(s, cls);
     switch (cls) {
     case Class::Pass:
         ++s.counters.pass;
-        s.in_level_run = false;
         break;
     case Class::Work:
         ++s.counters.work;
-        s.in_level_run = false;
+        break;
+    case Class::Neutral:
+        ++s.counters.neutral;
         break;
     case Class::Level:
         ++s.counters.level;
-        if (!s.in_level_run) {
-            s.in_level_run = true;
-            ++s.counters.level_runs;
-        }
+        ++s.counters.level_kinds[s.entry_key];
         s.level_since_flush = true;
-        s.channel_stale = true;
-        for (Copy& copy : s.copies) {
-            copy.stale = true;
-        }
         if (!executed) {
             s.current_level = true;
         }
         break;
+    }
+    if (s.entry_unfollowed) {
+        s.channel_stale = true;
+        for (Copy& copy : s.copies) {
+            copy.stale = true;
+        }
     }
     return size;
 }
@@ -1194,6 +1582,170 @@ void DropUnmatched(State& s, Record&& record, const char* why) {
     }
     s.due.insert(s.due.end(), record.ranges.begin(), record.ranges.end());
     Recycle(s, std::move(record));
+}
+
+/// After the back's fill of a draw that matched a shadow draw (plan 4.2): what the fill cleared
+/// on the back's cache flags is cleared on the copy and on the pending shadow draws of the same
+/// copy, except a flag the stage raised again after the matched draw. Not at SHADOW=3 while the
+/// copy holds the flags (its own fills clear them; the back's are a superset).
+void Settle(State& s) {
+    if (!s.fill_pending) {
+        return;
+    }
+    s.fill_pending = false;
+    Copy* const copy = s.match_copy;
+    if (s.fill_from_copy || OwnsFlags(s) || copy == nullptr || copy->stale ||
+        copy->back != s.fill_engine) {
+        return;
+    }
+    const Flags cleared = s.fill_pre & ~(s.fill_engine->dirty.flags & CacheFlagMask());
+    ++s.counters.flag_settles;
+    if (cleared.none()) {
+        return;
+    }
+    Flags since{};
+    for (Record& record : s.records) {
+        if (record.engine != copy->back) {
+            continue;
+        }
+        since |= record.raised_before;
+        record.dirty &= ~(cleared & ~since);
+    }
+    since |= copy->raised;
+    copy->e->dirty.flags &= ~(cleared & ~since);
+}
+
+/// CacheInputs' mark hook (the scrub of a deleted buffer's bindings, a repack change): the marks
+/// the cache makes on an engine's flags reach the copy too, as they will reach the stage's copy
+/// in 6b. During a back fill they count as flags held before it (Settle).
+void OnCacheMark(const Maxwell3D* engine, bool index_buffer, u32 vertex_mask) {
+    if (!g_on.load(std::memory_order_relaxed) ||
+        !(t_on_back || VideoCommon::MemoryStageLink::OnStageThread())) {
+        return;
+    }
+    State& s = S();
+    Flags bits{};
+    if (index_buffer) {
+        bits[VideoCommon::Dirty::IndexBuffer] = true;
+    } else {
+        bits[VideoCommon::Dirty::VertexBuffers] = true;
+        for (u32 binding = 0; binding < 32; ++binding) {
+            if ((vertex_mask >> binding) & 1) {
+                bits[VideoCommon::Dirty::VertexBuffer0 + binding] = true;
+            }
+        }
+    }
+    for (Copy& copy : s.copies) {
+        if (copy.back == engine) {
+            copy.e->dirty.flags |= bits;
+            break;
+        }
+    }
+    if (s.fill_pending && s.fill_engine == engine) {
+        s.fill_pre |= bits;
+    }
+}
+
+/// "a: n/s; b: m/s" for the top `count` of a map by value, names from `name`.
+template <typename Map, typename Name>
+std::string Top(const Map& map, size_t count, double seconds, Name&& name) {
+    std::vector<std::pair<typename Map::key_type, u64>> list(map.begin(), map.end());
+    std::sort(list.begin(), list.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+    std::string text;
+    for (size_t i = 0; i < list.size() && i < count; ++i) {
+        text += fmt::format("{}{} {:.1f}/s", i == 0 ? "" : "; ", name(list[i].first),
+                            static_cast<double>(list[i].second) / seconds);
+    }
+    return text.empty() ? std::string{"none"} : text;
+}
+
+/// The 5c lines (plan 6.1 step A item 7) and the gate.
+void Report5c(State& s, double seconds) {
+    Counters& c = s.counters;
+    Counters& t = s.totals;
+    const auto rate = [seconds](u64 value) { return static_cast<double>(value) / seconds; };
+    t.condition_hard += c.condition_hard;
+    t.macros_on_back += c.macros_on_back;
+    t.tracker_mismatches += c.tracker_mismatches;
+    t.flag_compares += c.flag_compares;
+    const u64 copy_bytes_each =
+        2 * sizeof(Regs) + sizeof(Maxwell3D::State) + sizeof(Maxwell3D::RootTables);
+    LOG_INFO(HW_GPU,
+             "Memory stage 5c runs: {:.0f}/s ({:.1f} entries each), neutral entries/s {:.0f}; "
+             "served draws between two runs (0, 1, 2-3, 4-7, 8-15, 16+): {} {} {} {} {} {}; full "
+             "copies/s {:.0f} ({:.1f} MB/s); takes/s execute_on {:.1f}, draw state {:.1f} (GPU "
+             "count written {:.1f}); 3D macros on the back/s {:.1f}; fence reports/s {:.1f} of "
+             "{:.0f} reports",
+             rate(c.level_runs),
+             c.runs_ended != 0 ? static_cast<double>(c.run_entries) / c.runs_ended : 0.0,
+             rate(c.neutral), c.gaps[0], c.gaps[1], c.gaps[2], c.gaps[3], c.gaps[4], c.gaps[5],
+             rate(c.resyncs), rate(c.resyncs * copy_bytes_each) / 1e6, rate(c.execute_takes),
+             rate(c.draw_state_takes), rate(c.draw_state_written), rate(c.macros_on_back),
+             rate(c.fence_reports), rate(c.reports));
+    LOG_INFO(HW_GPU, "Memory stage 5c runs by first hard kind (top 12): {}",
+             Top(c.run_kinds, 12, seconds, [](u64 key) { return LevelName(key); }));
+    LOG_INFO(HW_GPU, "Memory stage 5c full copies by cause (top 8): {}",
+             Top(c.copy_causes, 8, seconds, [](u64 key) {
+                 return key == 0 ? std::string{"start"} : LevelName(key);
+             }));
+    LOG_INFO(HW_GPU,
+             "Memory stage 5c render_enable.mode by override and mode: {}; not decided by the "
+             "registers {} this window, {} this session (must be 0)",
+             Top(c.conditions, 8, seconds,
+                 [](u32 key) {
+                     static constexpr const char* overrides[]{"use", "always", "never"};
+                     static constexpr const char* modes[]{"False", "True", "Conditional",
+                                                          "IfEqual", "IfNotEqual"};
+                     const u32 o = key >> 8;
+                     const u32 m = key & 0xff;
+                     return fmt::format("{}/{}", o < 3 ? overrides[o] : "?",
+                                        m < 5 ? modes[m] : "?");
+                 }),
+             c.condition_hard, t.condition_hard);
+    std::string flags;
+    for (u32 i = 0; i < CacheFlagCount; ++i) {
+        if (c.flag_missing[i] != 0 || c.flag_extra[i] != 0) {
+            flags += fmt::format("{}flag {}: copy only {}, back only {}", flags.empty() ? "" : "; ",
+                                 CacheFlagFirst + i, c.flag_missing[i], c.flag_extra[i]);
+        }
+    }
+    std::string fills;
+    if (g_mode >= 3) {
+        static constexpr const char* names[]{"copy",   "no record", "hard entry", "indirect",
+                                             "stale",  "moved on",  "other",      "full binds off"};
+        for (size_t i = 0; i < c.fill_from.size(); ++i) {
+            fills += fmt::format("{}{} {:.0f}", i == 0 ? "" : ", ", names[i], rate(c.fill_from[i]));
+        }
+        fills = fmt::format("; SHADOW=3 fills/s from: {}; lends/s {:.0f}, returns/s {:.0f}", fills,
+                            rate(c.lends), rate(c.returns));
+    }
+    LOG_INFO(HW_GPU,
+             "Memory stage 5c flags 15-48 (compare b): {} draws compared ({} strict), {} settles; "
+             "mismatches by flag: {}{}; OoT tracker record vs today's query: {} compared, {} "
+             "mismatches (session {}, must be 0), {} draws without a record",
+             c.flag_compares, c.flag_compares_strict, c.flag_settles,
+             flags.empty() ? "none" : flags, fills, c.tracker_compared, c.tracker_mismatches,
+             t.tracker_mismatches, c.tracker_without);
+    // The stop thresholds of plan 6.1 (they are the market's: read this line in its window).
+    constexpr double RunLimit = 15000.0;
+    constexpr double CopyLimit = 2000.0;
+    std::string why;
+    if (rate(c.level_runs) > RunLimit) {
+        why += fmt::format("; runs/s {:.0f} > {:.0f}", rate(c.level_runs), RunLimit);
+    }
+    if (rate(c.resyncs) > CopyLimit) {
+        why += fmt::format("; full copies/s {:.0f} > {:.0f}", rate(c.resyncs), CopyLimit);
+    }
+    if (t.condition_hard != 0) {
+        why += fmt::format("; render_enable.mode other than False/True in play ({} this session)",
+                           t.condition_hard);
+    }
+    LOG_INFO(HW_GPU,
+             "Memory stage 5c gate: {} (runs/s {:.0f}, limit {:.0f}; full copies/s {:.0f}, limit "
+             "{:.0f}; undecided render_enable.mode this session {}, limit 0){}",
+             why.empty() ? "pass" : "fail", rate(c.level_runs), RunLimit, rate(c.resyncs),
+             CopyLimit, t.condition_hard, why);
 }
 
 void Report(State& s, std::chrono::steady_clock::time_point now) {
@@ -1257,6 +1809,7 @@ void Report(State& s, std::chrono::steady_clock::time_point now) {
     }
     LOG_INFO(HW_GPU, "Memory stage shadow level entries by kind and channel (top 12 of {}): {}",
              kinds.size(), top.empty() ? "none" : top);
+    Report5c(s, seconds);
     std::unordered_map<u64, u64> keep;
     keep.swap(c.level_kinds);
     keep.clear();
@@ -1303,7 +1856,14 @@ void ReadSwitch() {
     const char* const value = std::getenv("FRITCHII_MEMSTAGE_SHADOW");
     g_mode = value != nullptr ? std::atoi(value) : 0;
     g_on.store(g_mode != 0, std::memory_order_relaxed);
-    if (g_mode != 0) {
+    if (g_mode >= 3) {
+        LOG_INFO(HW_GPU,
+                 "Memory stage shadow (FRITCHII_MEMSTAGE_SHADOW={}): the stage's inputs run on the "
+                 "back and are compared at every draw, and the buffer cache's fills read the "
+                 "stage's copy outside runs (needs FRITCHII_MEMSTAGE_FULL_BINDS=1; runs as 2 "
+                 "while it is off)",
+                 g_mode);
+    } else if (g_mode != 0) {
         LOG_INFO(HW_GPU,
                  "Memory stage shadow (FRITCHII_MEMSTAGE_SHADOW={}): the stage's inputs run on the "
                  "back and are compared at every draw; nothing they compute is used",
@@ -1311,15 +1871,24 @@ void ReadSwitch() {
     }
 }
 
+int Mode() {
+    return g_mode;
+}
+
 void Start() {
     State& s = S();
     s = State{};
     s.window_start = std::chrono::steady_clock::now();
     t_on_back = true;
+    CacheInputs::g_mark_hook = &OnCacheMark;
 }
 
 void Before(u64 position) {
     State& s = S();
+    // The back finished the entry before: its draw's fill, if any, is done.
+    Settle(s);
+    s.match_copy = nullptr;
+    s.full_binds = VideoCommon::MemoryStageLink::FullVertexBinds();
     if (position < s.cursor) [[unlikely]] {
         // The ring started over (not expected while the back runs): start from the back's state.
         s.cursor = position;
@@ -1331,6 +1900,22 @@ void Before(u64 position) {
     while (s.cursor < position) {
         const size_t size = Process(s, s.cursor, true);
         s.cursor += size != 0 ? size : Access::RingWords - (s.cursor & Access::RingMask);
+    }
+    // The copy and the back are at the same entry here: what plan 3.3 takes from the back after a
+    // hard entry is taken now.
+    if (Copy* const copy = std::exchange(s.take_execute, nullptr); copy != nullptr && !copy->stale) {
+        copy->e->execute_on = copy->back->ShouldExecute();
+        ++copy->generation;
+        ++s.counters.execute_takes;
+    }
+    if (Copy* const copy = std::exchange(s.take_draw_state, nullptr);
+        copy != nullptr && !copy->stale) {
+        CopyScalarDrawState(copy->e->draw_manager.draw_state, copy->back->draw_manager.draw_state);
+        ++copy->generation;
+        ++s.counters.draw_state_takes;
+    }
+    if (s.in_run && OwnsFlags(s)) {
+        Return(s);
     }
     s.current = position;
     s.current_level = false;
@@ -1362,6 +1947,17 @@ void BackDraw(Maxwell3D& maxwell3d, bool indexed, u32 instances, bool indirect) 
     State& s = S();
     Counters& c = s.counters;
     ++c.back_draws;
+    // An earlier draw of this entry: its fill is done (or it had none).
+    Settle(s);
+    s.match_copy = nullptr;
+    // Plan 3.3: after a draw the back issues in a hard entry (a level draw in 6b), and after an
+    // indirect one, the copy takes the draw manager's scalar state at the next entry.
+    if (s.current_level || indirect) {
+        s.take_draw_state = FindCopy(s, &maxwell3d);
+    }
+    const u64 invalidations = g_flag_invalidations.load(std::memory_order_relaxed);
+    const bool flags_strict = invalidations == s.invalidations_seen;
+    s.invalidations_seen = invalidations;
     const auto& in = maxwell3d.draw_manager.indirect_state;
     if (indirect) {
         if (in.list_words) {
@@ -1427,15 +2023,43 @@ void BackDraw(Maxwell3D& maxwell3d, bool indexed, u32 instances, bool indirect) 
                   }
               }
           });
-    const Flags missing_flags = record.dirty & ~maxwell3d.dirty.flags;
-    if (missing_flags.any()) {
-        ++c.b_dirty;
-        for (size_t flag = 0; flag < missing_flags.size(); ++flag) {
-            if (missing_flags[flag] && differences++ < 16) {
-                diff += fmt::format("; dirty flag {} raised by the shadow, not on the back", flag);
+    // The cache's flags (plan 4.2): equal both ways, or the copy's a subset of the back's when
+    // the state tracker raised them since the back's previous draw. Not at SHADOW=3 while the
+    // copy holds them.
+    if (!OwnsFlags(s)) {
+        const Flags& mask = CacheFlagMask();
+        const Flags shadow_flags = record.dirty & mask;
+        const Flags back_flags = maxwell3d.dirty.flags & mask;
+        const Flags missing_flags = shadow_flags & ~back_flags;
+        const Flags extra_flags = flags_strict ? back_flags & ~shadow_flags : Flags{};
+        ++c.flag_compares;
+        c.flag_compares_strict += flags_strict ? 1 : 0;
+        if (missing_flags.any() || extra_flags.any()) {
+            ++c.b_dirty;
+            for (u32 flag = CacheFlagFirst; flag <= CacheFlagLast; ++flag) {
+                if (missing_flags[flag]) {
+                    ++c.flag_missing[flag - CacheFlagFirst];
+                    if (differences++ < 16) {
+                        diff += fmt::format("; dirty flag {} raised on the shadow, not on the back",
+                                            flag);
+                    }
+                }
+                if (extra_flags[flag]) {
+                    ++c.flag_extra[flag - CacheFlagFirst];
+                    if (differences++ < 16) {
+                        diff += fmt::format("; dirty flag {} raised on the back, not on the shadow",
+                                            flag);
+                    }
+                }
             }
         }
     }
+    // For the fill (Settle, BackFill).
+    s.match_copy = FindCopy(s, record.engine != nullptr ? record.engine : &maxwell3d);
+    s.match_generation = record.generation;
+    s.match_hard = record.hard;
+    s.match_indirect = record.indirect;
+    s.match_channel = record.channel;
     if (differences != 0) {
         ++c.b_mismatch;
         if (s.b_logged < 16) {
@@ -1580,7 +2204,84 @@ void BackDrawWindow(bool open) {
     if (!t_on_back) {
         return;
     }
-    S().in_draw_window = open;
+    State& s = S();
+    s.in_draw_window = open;
+    if (!open) {
+        // The fill and Configure are done.
+        Settle(s);
+    }
+}
+
+MemStageShadowEngine* BackFill(Maxwell3D& maxwell3d, bool indirect) {
+    if (!t_on_back) {
+        return nullptr;
+    }
+    State& s = S();
+    Settle(s);
+    s.fill_pending = true;
+    s.fill_engine = &maxwell3d;
+    s.fill_pre = maxwell3d.dirty.flags & CacheFlagMask();
+    s.fill_from_copy = false;
+    if (g_mode < 3) {
+        return nullptr;
+    }
+    Copy* const copy = s.match_copy;
+    FillFrom from = FillFrom::Copy;
+    if (!s.full_binds) {
+        from = FillFrom::NoFullBinds;
+    } else if (copy == nullptr) {
+        from = FillFrom::NoRecord;
+    } else if (indirect || s.match_indirect) {
+        from = FillFrom::Indirect;
+    } else if (s.match_hard || s.current_level) {
+        from = FillFrom::Hard;
+    } else if (copy->back != &maxwell3d || s.match_channel != s.back_channel) {
+        from = FillFrom::Other;
+    } else if (copy->stale) {
+        from = FillFrom::Stale;
+    } else if (copy->generation != s.match_generation) {
+        from = FillFrom::MovedOn;
+    }
+    ++s.counters.fill_from[static_cast<size_t>(from)];
+    if (from != FillFrom::Copy) {
+        return nullptr;
+    }
+    s.fill_from_copy = true;
+    return copy->e.get();
+}
+
+void BackDrawStateWritten() {
+    if (!t_on_back) {
+        return;
+    }
+    State& s = S();
+    ++s.counters.draw_state_written;
+    if (s.engine_copy != nullptr) {
+        s.take_draw_state = s.engine_copy;
+    }
+}
+
+void BackTrackerRecord(bool had_record, u32 mismatches) {
+    if (!t_on_back) {
+        return;
+    }
+    State& s = S();
+    Counters& c = s.counters;
+    if (!had_record) {
+        ++c.tracker_without;
+        return;
+    }
+    ++c.tracker_compared;
+    if (mismatches != 0) {
+        ++c.tracker_mismatches;
+        if (s.t_logged < 16) {
+            ++s.t_logged;
+            LOG_WARNING(HW_GPU,
+                        "Memory stage shadow (OoT trackers): the draw packet's record of uniform "
+                        "slots 3, 4, 6 differs from today's query at entry {:#x} (slot mask {:#x})",
+                        s.current, mismatches);
+        }
+    }
 }
 
 void BackFlushRegion(bool texture, bool buffer, bool query) {
@@ -1632,8 +2333,19 @@ void MemStageShadowEngine::StageDraw(bool indexed, u32 instance_count, bool indi
     record.engine = back;
     record.channel = s.channel;
     record.program_key = Shadow::ProgramKey(*this);
+    // 5c: the flags are the cache's own state now (plan 4.2), not reset at a draw.
     record.dirty = dirty.flags;
-    dirty.flags.reset();
+    record.hard = s.entry_hard;
+    if (Shadow::Copy* const copy = Shadow::FindCopy(s, back)) {
+        record.raised_before = copy->raised;
+        copy->raised.reset();
+        record.generation = copy->generation;
+    }
+    ++s.entry_draws;
+    if (execute_on && !indirect) {
+        ++s.entry_served;
+        ++s.counters.served_draws;
+    }
     Shadow::Visit(*this, Shadow::g_mode >= 2, s.channel, back,
                   [&](const Shadow::SegmentInfo& info, const u32* words) {
                       record.words.insert(record.words.end(), words, words + info.words);
@@ -1643,6 +2355,21 @@ void MemStageShadowEngine::StageDraw(bool indexed, u32 instance_count, bool indi
     static_cast<void>(indexed);
     static_cast<void>(instance_count);
     s.records.push_back(std::move(record));
+}
+
+void MemStageShadowEngine::NoteRaised(u32 flag) {
+    namespace Shadow = MemStageShadow;
+    if (Shadow::Copy* const copy = Shadow::FindCopy(Shadow::S(), back)) {
+        copy->raised[flag] = true;
+        ++copy->generation;
+    }
+}
+
+void MemStageShadowEngine::NoteChanged() {
+    namespace Shadow = MemStageShadow;
+    if (Shadow::Copy* const copy = Shadow::FindCopy(Shadow::S(), back)) {
+        ++copy->generation;
+    }
 }
 
 } // namespace VideoCommon

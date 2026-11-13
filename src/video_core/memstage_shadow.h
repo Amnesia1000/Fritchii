@@ -19,6 +19,7 @@ class Maxwell3D;
 namespace VideoCommon {
 
 class PageFilter;
+struct MemStageShadowEngine;
 
 /// Memory stage (fable_memstage_step6_spec.md 3.3): what a ring Call entry does, as the stage
 /// reads it, in bits 32-39 of the entry's header (GpuSplit::Defer's and CallWithPayload's
@@ -40,6 +41,8 @@ enum class StageTag : u8 {
     DrawLoop = 4,
     /// Touches no register, no buffer cache state and no game memory the stage reads.
     Pass = 5,
+    /// Uses the buffer cache or another back-side object; writes no 3D state (memstage_shadow.cpp).
+    Cache = 6,
 };
 
 /// StageTag::DrawLoop's kind, in header bits 40-47 (the payloads stay as small as the lambdas
@@ -47,6 +50,7 @@ enum class StageTag : u8 {
 enum class StageDrawLoop : u8 {
     FoldFirstInstance = 0, ///< DrawManager::FoldFirstInstance; payload [engine]
     AddLoopInstances = 1,  ///< DrawManager::AddLoopInstances(count); payload [engine, count]
+    ListDraw = 2,          ///< the list draw's address and keep id; payload [engine, address, id]
 };
 
 /// The bits a tag takes in a Call entry's header.
@@ -78,8 +82,18 @@ namespace MemStageShadow {
 /// ReadSwitch may write it.
 inline std::atomic<bool> g_on{};
 
+/// Raised by the state tracker's flag invalidations while on (compare b of piece 5c).
+inline std::atomic<u64> g_flag_invalidations{};
+inline void NoteFlagInvalidation() noexcept {
+    if (g_on.load(std::memory_order_relaxed)) [[unlikely]] {
+        g_flag_invalidations.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 /// Reads the switch (GpuSplit::MaybeStart, before the back thread exists).
 void ReadSwitch();
+/// FRITCHII_MEMSTAGE_SHADOW's value (0 when off).
+[[nodiscard]] int Mode();
 /// The back thread starts reading the ring at position 0 (GpuSplit::BackLoop).
 void Start();
 /// The back is about to execute the entry at ring position `position` (GpuSplit::BackLoop).
@@ -109,6 +123,13 @@ void BackPipeline(const std::array<u64, 6>& hashes, u64 facts_digest, u32 kinds)
 /// flushes and collected-write applies in between are counted (the buffer half there would make
 /// the draw level in step 6).
 void BackDrawWindow(bool open);
+/// PrepareDraw, before the vertex repack and the fill (piece 5c). SHADOW=3: the stage's copy the
+/// fill reads instead of the engine, or null.
+MemStageShadowEngine* BackFill(Tegra::Engines::Maxwell3D& maxwell3d, bool indirect);
+/// The rasterizer wrote a GPU count into the back's draw state.
+void BackDrawStateWritten();
+/// The OoT trackers' record in the draw packet against today's query (mismatching slots, a mask).
+void BackTrackerRecord(bool had_record, u32 mismatches);
 /// RasterizerVulkan::FlushRegion (and FlushRegionForRead: all three) on the back: which caches'
 /// halves run.
 void BackFlushRegion(bool texture, bool buffer, bool query);

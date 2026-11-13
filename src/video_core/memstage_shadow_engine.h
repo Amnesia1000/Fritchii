@@ -21,7 +21,7 @@ struct MemStageShadowEngine {
     };
 
     struct Dirty {
-        /// Flags raised since the stage's last draw (its compare is "the back has them too").
+        /// The copy's dirty flags. Flags 15-48 are the buffer cache's own state (piece 5c).
         Maxwell3D::DirtyState::Flags flags;
     };
 
@@ -32,6 +32,10 @@ struct MemStageShadowEngine {
     /// The draw manager issued a draw (ProcessDraw, ProcessDrawIndirect), before the
     /// render-enable test. Defined in memstage_shadow.cpp.
     void StageDraw(bool indexed, u32 instance_count, bool indirect);
+    /// The draw manager raised `flag` itself (not through a register store).
+    void NoteRaised(u32 flag);
+    /// The draw manager changed draw state the fill reads after a draw.
+    void NoteChanged();
 
     Maxwell3D::Regs regs{};
     /// shadow_state of Maxwell3D: the shadow RAM and its control register.

@@ -5651,10 +5651,10 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
     // draws. A channel left out would address whatever buffer reuses the slot next at the old
     // offset (Ocarina of Time draws from several channels: a frame of garbage constants).
     const auto scrub = [&](BufferCacheChannelInfo& channel) {
-        auto& flags = CacheInputs::Of(channel).Dirty();
+        const CacheInputs inputs = CacheInputs::Of(channel);
         if (channel.index_buffer.buffer_id == buffer_id) {
             channel.index_buffer.buffer_id = BufferId{};
-            flags[Dirty::IndexBuffer] = true;
+            inputs.MarkIndexBufferDirty();
         }
         for (u32 index = 0; index < channel.vertex_buffers.size(); index++) {
             auto& binding = channel.vertex_buffers[index];
@@ -5665,8 +5665,7 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
             if (&channel == channel_state) {
                 UpdateVertexBufferSlot(index, binding);
             }
-            flags[Dirty::VertexBuffers] = true;
-            flags[Dirty::VertexBuffer0 + index] = true;
+            inputs.MarkVertexBuffersDirty(1U << index);
         }
         std::ranges::for_each(channel.uniform_buffers, replace);
         std::ranges::for_each(channel.storage_buffers, replace);
