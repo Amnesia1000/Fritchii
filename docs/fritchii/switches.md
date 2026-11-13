@@ -564,6 +564,14 @@ session after a catch-up could not finish (below; logged).
 - So what the back reads in a served draw is its position's: texture handles (EXP123=3), uniforms
   and storage addresses come in the packet; with the OoT trackers on, the bytes they read (the
   camera block, the actor's origin and bones) are copied at the fill and come in the packet too.
+- GPUMem's loop with the window open (the step 7 fps fixes): the window and the room are tested
+  before a draw's fill, not before every entry; GPUMem's busy time is timed per publish batch; a
+  run publishes its end once, after GPUMem followed it, and stays lent when it reaches the end of
+  what the front published (it waits for more input and ends at the first entry that needs
+  GPUMem; "runs kept lent at the end of the input" on the window line); a served draw sends the
+  vertex input state only when it may have changed (the back's VertexBuffers flag, not the
+  cache's in served mode, is cleared with each send). With EDEN_NX2_GPU_PROFILE=2 GPUMem's
+  profile splits its entry loop into "stage entries" and, inside it, "stage cb words".
 - Other changes it makes: packet ticks keep one unplayed mark per thread (the close takes the
   lowest, and ring B's oldest packet; the ring's start and end clear GPUMem's); the lend's flag
   hand-over happens at the run's first entry; a sync in GPUMem's fill, and a join in it over
