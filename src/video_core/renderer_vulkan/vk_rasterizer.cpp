@@ -6969,6 +6969,16 @@ void RasterizerVulkan::UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs) 
         return;
     }
     dirty[Dirty::VertexInput] = false;
+    // Step 7 (fps fix 2), a served draw with the window open: the back's VertexBuffers flag is
+    // not the cache's (GPUMem's copy holds it and its fills clear it there, plan 4.2), so on the
+    // back nothing cleared it and it stayed raised: every draw sent the vertex input state again
+    // (88,500 sends a second, 45,000 the same as the last). Here it only means "a stream register
+    // changed, or a new command buffer, since the last send", so it is cleared with the send. A
+    // lend sets the back's cache flags from GPUMem's copy again.
+    if (vertex_buffers_dirty && VideoCommon::MemoryStageLink::BackServed() &&
+        VideoCommon::MemoryStageLink::Ahead() != 0) {
+        dirty[VideoCommon::Dirty::VertexBuffers] = false;
+    }
 
     boost::container::static_vector<VkVertexInputBindingDescription2EXT, 32> bindings;
     boost::container::static_vector<VkVertexInputAttributeDescription2EXT, 32> attributes;
