@@ -1296,13 +1296,24 @@ bool RasterizerVulkan::StageFillDraw(VideoCommon::MemStageShadowEngine& copy, bo
     SCOPE_EXIT {
         buffer_cache.SetInputsOverride(nullptr);
     };
-    const u32 repack_dirty = buffer_cache_runtime.SetVertexRepackLayout(
-        inputs.RepackLayoutRegs(), stage_facts.dynamic_vertex_input);
-    mem_stage.BeginDraw(buffer_cache_runtime.RepackMask(), repack_dirty);
-    // The packet number BeginDraw opened is GPUMem's unplayed mark until the push, or until here.
+    // The packet number BeginDraw opens is GPUMem's unplayed mark until the push, or until here.
     SCOPE_EXIT {
         mem_stage.EndStageFill();
     };
+    // Stamps per thread (the window open): the draw's number exists before anything here can
+    // stamp, so every stamp of the fill carries it under GPUMem's mark. Level mode keeps the
+    // order it had.
+    const bool number_first = Link::Ahead() != 0;
+    if (number_first) {
+        mem_stage.BeginDraw(0, 0);
+    }
+    const u32 repack_dirty = buffer_cache_runtime.SetVertexRepackLayout(
+        inputs.RepackLayoutRegs(), stage_facts.dynamic_vertex_input);
+    if (number_first) {
+        mem_stage.SetDrawRepack(buffer_cache_runtime.RepackMask(), repack_dirty);
+    } else {
+        mem_stage.BeginDraw(buffer_cache_runtime.RepackMask(), repack_dirty);
+    }
     if (repack_dirty) {
         inputs.MarkVertexBuffersDirty(repack_dirty);
     }

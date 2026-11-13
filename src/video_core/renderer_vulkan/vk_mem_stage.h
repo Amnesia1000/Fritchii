@@ -342,6 +342,7 @@ public:
         Site previous_site;
         u32 begin{};
         bool reads{}; ///< This bracket started an operation packet's read log
+        bool stage_op{}; ///< Step 7: GPUMem's operation, opened with its mark (stamps per thread)
         std::optional<VideoCommon::Nx2Profile::Scope> zone;
     };
 
@@ -402,6 +403,11 @@ public:
     void Play();
 
     void BeginDraw(u32 repack_mask, u32 repack_dirty);
+    /// The repack layout of the draw BeginDraw opened (GPUMem opens it first, step 7).
+    void SetDrawRepack(u32 repack_mask, u32 repack_dirty) noexcept {
+        draw.repack_mask = repack_mask;
+        draw.repack_dirty = repack_dirty;
+    }
     void BeginDispatch();
 
     /// The cache whose ranges the read log asks about.
@@ -967,6 +973,8 @@ private:
     /// GPUMem's side of a ring fill (THREAD = 2; the back's held_* fields are the back's): the
     /// open packet number (its unplayed mark), the program hashes and the descriptor form.
     u64 stage_fill_from{};
+    /// Step 7, stamps per thread: GPUMem's open operation's number (its mark while it runs).
+    u64 stage_op_from{};
     std::array<u64, 2> fill_hashes{};
     bool fill_held_form{};
     /// Step 7: the trackers' bytes, GPUMem's for the fill, the back's for the packet it holds.
