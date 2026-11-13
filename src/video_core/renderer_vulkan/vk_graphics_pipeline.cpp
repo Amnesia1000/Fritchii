@@ -533,6 +533,29 @@ ConfigureFuncPtr ConfigureFunc(const std::array<bool, NUM_STAGES>& stages,
                     SimpleStorageSpec, SimpleImageSpec, DefaultSpec>(stages, infos);
 }
 
+/// The stages ConfigureFunc's Spec prepares, one bit each: the memory stage's fill runs the
+/// same per-stage calls (MemStage::FillDraw).
+template <typename Spec, typename... Specs>
+u32 FindSpecStages(const std::array<bool, NUM_STAGES>& stages,
+                   const std::array<Shader::Info, NUM_STAGES>& infos) {
+    if constexpr (sizeof...(Specs) > 0) {
+        if (!Passes<Spec>(stages, infos)) {
+            return FindSpecStages<Specs...>(stages, infos);
+        }
+    }
+    u32 mask = 0;
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        mask |= Spec::enabled_stages[stage] ? 1U << stage : 0U;
+    }
+    return mask;
+}
+
+u32 SpecStages(const std::array<bool, NUM_STAGES>& stages,
+               const std::array<Shader::Info, NUM_STAGES>& infos) {
+    return FindSpecStages<SimpleVertexSpec, SimpleVertexFragmentSpec, SimpleStorageSpec,
+                          SimpleImageSpec, DefaultSpec>(stages, infos);
+}
+
 std::atomic<std::chrono::nanoseconds::rep> hold_time_ns{};
 std::atomic<std::chrono::nanoseconds::rep> hold_time_total_ns{};
 
@@ -896,6 +919,10 @@ GraphicsPipeline::GraphicsPipeline(
     has_tessellation = !IsMeshPipeline() && (present_stages[1] || present_stages[2]);
     configure_func = ConfigureFunc(present_stages, stage_infos);
     configure_keep_func = ConfigureFunc<true>(present_stages, stage_infos);
+    spec_stages = SpecStages(present_stages, stage_infos);
+    has_texel_buffers = std::ranges::any_of(stage_infos, [](const Shader::Info& info) {
+        return !info.texture_buffer_descriptors.empty() || !info.image_buffer_descriptors.empty();
+    });
     if (samples_nothing && !IsMeshPipeline()) {
         configure_delta_func = ConfigureFunc<false, true>(present_stages, stage_infos);
     }
@@ -1446,6 +1473,10 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         kept_draw->computed.clear();
     }
     zero_texture_handles = 0;
+    // SEAM = 2 (EXP123): the memory stage filled this draw's buffer side before the texture work
+    // (MemStage::FillDraw); its calls below are skipped and its sections played in their place.
+    MemStage& mem_stage = buffer_cache.runtime.Seam();
+    const MemStage::DrawPacket* const held = mem_stage.HeldDraw();
     boost::container::small_vector<VideoCommon::ImageViewInOut, 160> views;
     boost::container::small_vector<VideoCommon::SamplerId, 96> samplers;
     views.reserve(num_image_elements);
@@ -1476,7 +1507,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     }
     mark();
 
-    buffer_cache.SetUniformBuffersState(enabled_uniform_buffer_masks, &uniform_buffer_sizes);
+    if (held == nullptr) {
+        buffer_cache.SetUniformBuffersState(enabled_uniform_buffer_masks, &uniform_buffer_sizes);
+    }
 
     const auto& regs{maxwell3d->regs};
     const bool via_header_index{regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
@@ -1527,7 +1560,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     boost::container::small_vector<u32, 96> template_handles;
     const auto config_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         const Shader::Info& info{stage_infos[stage]};
-        {
+        if (held == nullptr) {
             const Profile::FineScope storage_scope{Profile::Zone::StorageBindings};
             buffer_cache.UnbindGraphicsStorageBuffers(stage);
             if constexpr (Spec::has_storage_buffers) {
@@ -2056,6 +2089,11 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     if constexpr (Spec::has_texture_buffers || Spec::has_image_buffers) {
         VideoCommon::ImageViewInOut* texture_buffer_it{views.data()};
         const auto bind_stage_info{[&](size_t stage) LAMBDA_FORCEINLINE {
+            if (held != nullptr) {
+                // A held draw has no texel buffers (else it fills here, LateFill): the fill
+                // unbound them.
+                return;
+            }
             size_t index{};
             const auto add_buffer{[&](const auto& desc) {
                 constexpr bool is_image = std::is_same_v<decltype(desc), const ImageBufferDescriptor&>;
@@ -2112,7 +2150,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         if constexpr (Spec::enabled_stages[4]) {
             bind_stage_info(4);
         }
-    } else {
+    } else if (held == nullptr) {
         if constexpr (Spec::enabled_stages[0]) {
             buffer_cache.UnbindGraphicsTextureBuffers(0);
         }
@@ -2136,11 +2174,16 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     mark();
     {
         Profile::Scope scope{Profile::Zone::UpdateBuffers};
-        // The geometry section: filled here, played as the bracket ends.
-        MemStage::FillPlay seam{buffer_cache.runtime.Seam(), MemStage::Site::Geometry};
-        buffer_cache.UpdateGraphicsBuffers(is_indexed);
-        const Profile::FineScope geometry_scope{Profile::Zone::GeometryBuffers};
-        buffer_cache.BindHostGeometryBuffers(is_indexed);
+        if (held != nullptr) {
+            // SEAM = 2: the geometry section filled before the texture work, played here.
+            mem_stage.PlayHeld(held->geometry);
+        } else {
+            // The geometry section: filled here, played as the bracket ends.
+            MemStage::FillPlay seam{mem_stage, MemStage::Site::Geometry};
+            buffer_cache.UpdateGraphicsBuffers(is_indexed);
+            const Profile::FineScope geometry_scope{Profile::Zone::GeometryBuffers};
+            buffer_cache.BindHostGeometryBuffers(is_indexed);
+        }
     }
     mark();
     {
@@ -2172,10 +2215,15 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     const auto prepare_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         {
             Profile::Scope scope{Profile::Zone::BindStageBuffers};
-            // The stage's buffer entries and descriptors, played before its image descriptors.
-            MemStage::FillPlay seam{buffer_cache.runtime.Seam(), MemStage::Site::Stage,
-                                    static_cast<u32>(stage)};
-            buffer_cache.BindHostStageBuffers(stage);
+            if (held != nullptr) {
+                // SEAM = 2: the stage's section, filled before the texture work.
+                mem_stage.PlayHeld(held->stage[stage]);
+            } else {
+                // The stage's buffer entries and descriptors, played before its image
+                // descriptors.
+                MemStage::FillPlay seam{mem_stage, MemStage::Site::Stage, static_cast<u32>(stage)};
+                buffer_cache.BindHostStageBuffers(stage);
+            }
         }
         {
             Profile::Scope scope{Profile::Zone::PushDescriptors};

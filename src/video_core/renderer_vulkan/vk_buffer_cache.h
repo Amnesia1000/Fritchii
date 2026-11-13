@@ -72,6 +72,9 @@ public:
         return last_usage_tick;
     }
 
+    /// The memory seam's tick guard: a use stamped `from` is recorded in the current tick.
+    void Restamp(u64 from) noexcept;
+
     [[nodiscard]] std::span<const u8> Mapped() const noexcept {
         return buffer.IsHostCoherent() ? buffer.Mapped() : std::span<const u8>{};
     }
@@ -259,8 +262,7 @@ public:
     /// it and the GPU has not even started on it.
     void RebindStreamUniform(const StreamUniformRef& ref, u32 size) {
         mem_stage.PushDescriptor(UpdateDescriptorQueue::MakeBufferEntry(
-            guest_descriptor_queue.UsesDescriptorBuffer(), ref.buffer, ref.device_address,
-            ref.offset, size));
+            DescriptorForm(), ref.buffer, ref.device_address, ref.offset, size));
     }
 
     [[nodiscard]] VkDeviceSize SparseAlignmentFor(bool sparse_compatible) const noexcept {
@@ -320,8 +322,8 @@ public:
         }
         const VkBufferView view = buffer.View(offset, size, format);
         mem_stage.PushDescriptor(UpdateDescriptorQueue::MakeTexelEntry(
-            guest_descriptor_queue.UsesDescriptorBuffer(), view, buffer.DeviceAddress(), offset,
-            size, TexelBufferFormat(format)), true);
+            DescriptorForm(), view, buffer.DeviceAddress(), offset, size,
+            TexelBufferFormat(format)), true);
     }
 
     bool ShouldLimitDynamicStorageBuffers() const {
@@ -335,7 +337,7 @@ public:
 private:
     void BindBuffer(const Buffer& buffer, u32 offset, u32 size) {
         const VkBuffer handle = buffer.Handle();
-        const bool descriptor_buffer = guest_descriptor_queue.UsesDescriptorBuffer();
+        const bool descriptor_buffer = DescriptorForm();
         if (handle == VK_NULL_HANDLE) {
             mem_stage.PushDescriptor(UpdateDescriptorQueue::MakeBufferEntry(
                 descriptor_buffer, handle, 0, 0, VK_WHOLE_SIZE));
@@ -343,6 +345,12 @@ private:
             mem_stage.PushDescriptor(UpdateDescriptorQueue::MakeBufferEntry(
                 descriptor_buffer, handle, buffer.DeviceAddress(), offset, size));
         }
+    }
+
+    /// The form of the descriptor entries pushed now: a held fill's pipeline's (SEAM = 2 fills
+    /// before Acquire), else the queue's.
+    [[nodiscard]] bool DescriptorForm() const noexcept {
+        return mem_stage.DescriptorForm(guest_descriptor_queue.UsesDescriptorBuffer());
     }
 
     VkFormat TexelBufferFormat(VideoCore::Surface::PixelFormat format) const;

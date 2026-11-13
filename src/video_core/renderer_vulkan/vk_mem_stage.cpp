@@ -13,6 +13,38 @@
 //   1: inside a fill bracket (MemStage::Fill, FillPlay, Ref) the entries wait in the arena and
 //      are played where the call site plays them: right after the call, as today. Outside a
 //      bracket (a site that has none, another thread) they still run at once.
+//   2: as 1, and each draw and dispatch is filled once, before the texture work (sub-step 2b):
+//      FillDraw at the rasterizer's draw site (SetUniformBuffersState, the storage binds, the
+//      texture buffer unbinds, UpdateGraphicsBuffers, BindHostGeometryBuffers, every stage's
+//      BindHostStageBuffers), FillDispatch before ComputePipeline::Configure (the uniform state,
+//      the storage binds, the shader hash, the texture buffer unbinds, UpdateComputeBuffers,
+//      BindHostComputeBuffers). The packet is held apart from the arena (held_arena), so the
+//      texture side's records do not play it; Configure plays its sections at today's places
+//      (PlayHeld: the geometry after the texture buffer binds, each stage after Acquire, the
+//      dispatch's `before` before the image descriptors) and PlayRestAfter plays whatever is
+//      left when Configure returns, true or false: the cache believes its uploads are on their
+//      way. Descriptors left over then are dropped (the draw is dropped too). Pipelines with
+//      texel buffers keep the fill where the calls are (LateFill: the texture buffer binds need
+//      the texture cache's views). The descriptor entries take the pipeline's form (the fill runs
+//      before Acquire; DescriptorForm).
+//
+// SEAM = 2's checks:
+//   5.5, the tick guard: the staging taken at the fill is stamped with the fill's tick. If the
+//        scheduler flushed between the fill and a play, the play counts it, gives every cached
+//        staging buffer stamped with the fill's tick the current one (StagingBufferPool::Retick)
+//        and restamps the buffers the fill marked used. Expected near 0; the first 16 flushes
+//        inside a held packet are logged with their caller.
+//   5.3, the read log (FRITCHII_MEMSTAGE_VERIFY=N, boot): every Nth draw, dispatch and operation
+//        packet logs what its fill read from game memory (the buffer cache's MemReadLog lines:
+//        uniforms copied to the stream, buffer uploads with their staged bytes, bound cached
+//        ranges, storage and table addresses, compute pointers, the inline page write). At the
+//        old read position (the packet's first play; an operation's end) the bytes and values are
+//        read again and compared, and each bound range is asked whether the CPU wrote it since.
+//        Differences are counted by kind, the first 16 logged. Must be 0.
+//   The held descriptors' form is compared with the queue's after Acquire. Must be 0.
+// The zones "memory fill" (fills at SEAM = 2, with what the cache does inside them) and "memory
+// play" (the plays at SEAM = 2) go to EDEN_NX2_GPU_PROFILE: "memory fill" ms/s is what leaves the
+// back in step 6.
 //
 // The order rule: pending entries are played before anything else is recorded. The scheduler's
 // record functions, its flush, finish, dispatch and state reset, and the descriptor queues' adds
@@ -43,11 +75,16 @@
 #include "common/assert.h"
 #include "common/logging.h"
 #include "video_core/buffer_cache/buffer_cache_base.h"
+#include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/memory_manager.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_perf.h"
+#include "video_core/nx2_profile.h"
+#include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_mem_stage.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -59,6 +96,19 @@ thread_local u32 t_fill_depth = 0;
 thread_local u32 t_play_depth = 0;
 thread_local MemStage::Site t_site = MemStage::Site::Count;
 thread_local char t_thread_marker = 0;
+/// This thread holds a filled draw or dispatch packet (SEAM = 2) until its plays.
+thread_local bool t_holding = false;
+
+/// Per packet, the bytes the read log copies or reads again at the compare.
+constexpr u64 READ_LOG_BUDGET = 1ULL << 20;
+
+namespace Profile = VideoCommon::Nx2Profile;
+
+u64 NowNs() noexcept {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+}
 
 std::atomic<MemStage*> g_stage{nullptr};
 
@@ -151,6 +201,13 @@ constexpr std::array<const char*, static_cast<size_t>(MemStage::Site::Count)> SI
     "draw count",    "draw indirect", "list words",   "list args",         "list pages",
     "invalidation",  "download",   "download for read", "frame",           "dma",
     "inline upload", "unmap",      "image copy",      "query",             "fence",
+    "draw fill",     "dispatch fill",
+};
+constexpr std::array<const char*, static_cast<size_t>(VideoCommon::MemReadLog::Kind::Count)>
+    READ_KIND_NAMES{
+        "uniform",          "upload",         "bound range",         "storage address",
+        "storage size",     "table address",  "compute pointer",     "inline page write",
+        "handle program word", "handle program storage base", "handle program storage word",
 };
 constexpr std::array<const char*, static_cast<size_t>(MemStage::Sync::Count)> SYNC_NAMES{
     "finish", "wait", "submit for host read", "multi-range", "kept words",
@@ -208,6 +265,10 @@ void SeamHook::OnUse(Use use, const std::source_location& location) {
     if (stage == nullptr) {
         return;
     }
+    if (t_holding && (use == Use::Flush || use == Use::Finish)) [[unlikely]] {
+        // SEAM = 2: a submit between a held packet's fill and its plays (the tick guard's case).
+        stage->NoteHeldFlush(use, location);
+    }
     const bool in_fill = t_fill_depth != 0;
     if (in_fill) {
         // A use inside a fill that is not the player's: a record is 5.1; a flush, finish or
@@ -263,6 +324,14 @@ MemStage::Fill::Fill(MemStage& stage_, Site site_, u32 index_)
             stage.play_cursor = 0;
             stage.last_entry = ~0U;
         }
+        if (stage.seam_value.load(std::memory_order_relaxed) >= 2) {
+            // SEAM = 2: the outermost bracket times the fill; an operation packet (not a held
+            // draw or dispatch) may log its reads.
+            zone.emplace(Profile::Zone::MemoryFill);
+            if (stage.verify > 0 && !stage.filling_held && stage.OwnedHere()) {
+                reads = stage.StartReadLog(stage.op_log, ++stage.op_fills);
+            }
+        }
     }
     begin = stage.OwnedHere() ? stage.arena.Size() : 0;
     t_site = site;
@@ -274,6 +343,12 @@ MemStage::Fill::~Fill() {
     SeamHook::g_watch.fetch_sub(1, std::memory_order_relaxed);
     if (stage.OwnedHere()) {
         stage.CloseSection(site, index, begin);
+    }
+    if (reads) {
+        // An operation packet is played where it is filled: its old read position is here.
+        stage.StopReadLog(stage.op_log, false);
+        stage.CompareReads(stage.op_log, SITE_NAMES[static_cast<size_t>(site)], stage.op_fills, 0,
+                           0);
     }
     t_site = previous_site;
     if (--t_fill_depth == 0 && stage.OwnedHere() && !stage.pending) {
@@ -300,8 +375,12 @@ MemStage::SyncScope::~SyncScope() {
 // ---------------------------------------------------------------------------------------------
 // MemStage
 
-MemStage::MemStage(MemPlayer& player_) : player{player_}, arena{256 * 1024} {
+MemStage::MemStage(MemPlayer& player_)
+    : player{player_}, arena{256 * 1024}, held_arena{256 * 1024} {
     player.stage = this;
+    if (const char* const value = std::getenv("FRITCHII_MEMSTAGE_VERIFY")) {
+        verify = (std::max)(0, std::atoi(value));
+    }
     g_stage.store(this, std::memory_order_release);
 }
 
@@ -311,6 +390,15 @@ MemStage::~MemStage() {
     if (pending) {
         SeamHook::g_watch.fetch_sub(1, std::memory_order_relaxed);
     }
+    if (held != HeldKind::None) {
+        SeamHook::g_watch.fetch_sub(1, std::memory_order_relaxed);
+    }
+    VideoCommon::MemReadLog::g_on.store(false, std::memory_order_relaxed);
+}
+
+void MemStage::Attach(Cache& cache_, StagingBufferPool& staging_pool_) noexcept {
+    cache = &cache_;
+    staging_pool = &staging_pool_;
 }
 
 bool MemStage::OwnedHere() const noexcept {
@@ -332,12 +420,38 @@ void MemStage::PlayPending([[maybe_unused]] bool late) {
     if (!pending) {
         return;
     }
+    std::optional<Profile::Scope> zone;
+    if (seam_value.load(std::memory_order_relaxed) >= 2) {
+        zone.emplace(Profile::Zone::MemoryPlay);
+    }
     PlayDepth depth;
     Bump(counters.plays);
-    while (play_cursor < arena.Size()) {
-        const Entry& entry = *reinterpret_cast<const Entry*>(arena.At(play_cursor));
-        play_cursor += entry.bytes;
-        player.Exec(entry);
+    if (filling_held) [[unlikely]] {
+        // A sync inside a held fill (SEAM = 2): the scheduler work it needs runs now, but the
+        // descriptor entries wait for the packet's plays (no Acquire yet). Played entries are
+        // marked, and the cursor stays at the first descriptor entry left.
+        u32 first_left = ~0U;
+        for (u32 at = play_cursor; at < arena.Size();) {
+            Entry& entry = *reinterpret_cast<Entry*>(arena.At(at));
+            const u32 here = at;
+            at += entry.bytes;
+            if ((entry.flags & Played) != 0) {
+                continue;
+            }
+            if (entry.kind == Cmd::Descriptors) {
+                first_left = (std::min)(first_left, here);
+                continue;
+            }
+            entry.flags |= Played;
+            player.Exec(entry);
+        }
+        play_cursor = first_left != ~0U ? first_left : arena.Size();
+    } else {
+        while (play_cursor < arena.Size()) {
+            const Entry& entry = *reinterpret_cast<const Entry*>(arena.At(play_cursor));
+            play_cursor += entry.bytes;
+            player.Exec(entry);
+        }
     }
     pending = false;
     last_entry = ~0U;
@@ -374,6 +488,10 @@ void MemStage::CloseSection(Site site, u32 index, u32 begin) {
     case Site::DispatchAfter:
         dispatch.after = span;
         break;
+    case Site::Draw:
+    case Site::Dispatch:
+        // A held packet's whole fill: its sections are the brackets inside.
+        break;
     default:
         if (t_fill_depth == 1) {
             op.number = ++packet_number;
@@ -391,6 +509,8 @@ void MemStage::EnterSync(Sync kind) {
 }
 
 void MemStage::BeginDraw(u32 repack_mask, u32 repack_dirty) {
+    // A held packet ends at its Configure's PlayRestAfter; this is only a safety net.
+    PlayRest();
     Bump(counters.draws);
     draw = DrawPacket{};
     draw.number = ++packet_number;
@@ -400,10 +520,388 @@ void MemStage::BeginDraw(u32 repack_mask, u32 repack_dirty) {
 }
 
 void MemStage::BeginDispatch() {
+    PlayRest();
     Bump(counters.dispatches);
     dispatch = DispatchPacket{};
     dispatch.number = ++packet_number;
     dispatch.fill_tick = player.scheduler.CurrentTick();
+}
+
+// ---------------------------------------------------------------------------------------------
+// SEAM = 2: the held draw and dispatch packets
+
+bool MemStage::ClaimHeld() {
+    if (t_fill_depth != 0 || t_play_depth != 0) {
+        // Inside another fill or a play: not a draw site. Fill where the calls are.
+        return false;
+    }
+    PlayRest();
+    const uintptr_t me = ThisThread();
+    uintptr_t expected = 0;
+    if (owner.load(std::memory_order_relaxed) != me &&
+        !owner.compare_exchange_strong(expected, me, std::memory_order_acquire)) {
+        // Another thread's fill holds the arena this instant.
+        return false;
+    }
+    if (pending) {
+        // Left pending by a site that misses its play (5.2): played before the packet begins.
+        Note(SeamHook::Use::Flush, std::source_location::current(), false);
+        PlayPending(true);
+    }
+    arena.Reset();
+    play_cursor = 0;
+    last_entry = ~0U;
+    claim_deferring = true;
+    return true;
+}
+
+void MemStage::TakeHeld(HeldKind kind) {
+    // The arena holding the packet becomes the held one; the next fill starts on an empty arena.
+    // Entries a sync played during the fill are behind play_cursor.
+    held_arena.Swap(arena);
+    held_cursor = play_cursor;
+    arena.Reset();
+    play_cursor = 0;
+    last_entry = ~0U;
+    if (pending) {
+        pending = false;
+        SeamHook::g_watch.fetch_sub(1, std::memory_order_relaxed);
+    }
+    held_marked.swap(marked);
+    marked.clear();
+    held = kind;
+    t_holding = true;
+    // Watched while held: a flush before the plays is logged with its caller.
+    SeamHook::g_watch.fetch_add(1, std::memory_order_relaxed);
+}
+
+const MemStage::DrawPacket* MemStage::FillDraw(Cache& cache_, const DrawFacts& facts,
+                                               bool is_indexed) {
+    if (seam_value.load(std::memory_order_relaxed) < 2) {
+        return nullptr;
+    }
+    if (facts.has_texel_buffers) {
+        // The texture buffer binds take their address, size and format from the texture
+        // cache's views (FillImageViews): this draw fills where the calls are.
+        draw.flags |= LateFill;
+        Bump(counters.late_draws);
+        return nullptr;
+    }
+    if (!ClaimHeld()) {
+        Bump(counters.unheld);
+        return nullptr;
+    }
+    const bool timed = Profile::Enabled();
+    const u64 start = timed ? NowNs() : 0;
+    Bump(counters.held_draws);
+    draw.fill_tick = player.scheduler.CurrentTick();
+    draw.flags |= Held;
+    held_hashes = facts.hashes;
+    held_form = player.guest_descriptor_queue.FormFor(facts.uses_descriptor_buffer);
+    fill_form = held_form ? 1 : 0;
+    marked.clear();
+    t_marked = &marked;
+    filling_held = true;
+    const bool logging = verify > 0 && StartReadLog(held_log, draw.number);
+    {
+        // Today's calls in today's relative order (ConfigureImpl): the uniform state, per stage
+        // the storage binds, the texture buffer unbinds, then the geometry and each stage's
+        // buffers, each in its own section.
+        Fill whole{*this, Site::Draw};
+        cache_.SetUniformBuffersState(*facts.uniform_masks, facts.uniform_sizes);
+        for (u32 stage = 0; stage < 5; ++stage) {
+            if ((facts.stages & (1U << stage)) == 0) {
+                continue;
+            }
+            cache_.UnbindGraphicsStorageBuffers(stage);
+            size_t ssbo_index = 0;
+            for (const auto& desc : facts.stage_infos[stage].storage_buffers_descriptors) {
+                ASSERT(desc.count == 1);
+                cache_.BindGraphicsStorageBuffer(stage, ssbo_index, desc.cbuf_index,
+                                                 desc.cbuf_offset, desc.is_written,
+                                                 desc.indirect_offset);
+                ++ssbo_index;
+            }
+        }
+        for (u32 stage = 0; stage < 5; ++stage) {
+            if ((facts.stages & (1U << stage)) != 0) {
+                cache_.UnbindGraphicsTextureBuffers(stage);
+            }
+        }
+        last_entry = ~0U;
+        {
+            Fill geometry{*this, Site::Geometry};
+            cache_.UpdateGraphicsBuffers(is_indexed);
+            cache_.BindHostGeometryBuffers(is_indexed);
+        }
+        for (u32 stage = 0; stage < 5; ++stage) {
+            if ((facts.stages & (1U << stage)) == 0) {
+                continue;
+            }
+            // A stage's descriptors never join the previous stage's entry: each is played at
+            // its own stage, before that stage's image descriptors.
+            last_entry = ~0U;
+            Fill section{*this, Site::Stage, stage};
+            cache_.BindHostStageBuffers(stage);
+        }
+        last_entry = ~0U;
+        if (logging) {
+            StopReadLog(held_log, true);
+        }
+        TakeHeld(HeldKind::Draw);
+    }
+    filling_held = false;
+    t_marked = nullptr;
+    fill_form = -1;
+    if (timed) {
+        Bump(counters.fill_ns, NowNs() - start);
+    }
+    return &draw;
+}
+
+const MemStage::DispatchPacket* MemStage::FillDispatch(Cache& cache_,
+                                                       const DispatchFacts& facts) {
+    if (seam_value.load(std::memory_order_relaxed) < 2) {
+        return nullptr;
+    }
+    if (facts.has_texel_buffers) {
+        dispatch.flags |= LateFill;
+        Bump(counters.late_dispatches);
+        return nullptr;
+    }
+    if (!ClaimHeld()) {
+        Bump(counters.unheld);
+        return nullptr;
+    }
+    const bool timed = Profile::Enabled();
+    const u64 start = timed ? NowNs() : 0;
+    Bump(counters.held_dispatches);
+    dispatch.fill_tick = player.scheduler.CurrentTick();
+    dispatch.flags |= Held;
+    held_hashes = {facts.shader_hash, 0};
+    held_form = player.guest_descriptor_queue.FormFor(facts.uses_descriptor_buffer);
+    fill_form = held_form ? 1 : 0;
+    marked.clear();
+    t_marked = &marked;
+    filling_held = true;
+    const bool logging = verify > 0 && StartReadLog(held_log, dispatch.number);
+    {
+        // ComputePipeline::Configure's calls in its order: the uniform state, the storage binds
+        // and the shader hash, the texture buffer unbinds, then the `before` section.
+        Fill whole{*this, Site::Dispatch};
+        cache_.SetComputeUniformBufferState(facts.uniform_mask, facts.uniform_sizes);
+        cache_.UnbindComputeStorageBuffers();
+        cache_.SetComputeShaderHash(facts.shader_hash);
+        size_t ssbo_index = 0;
+        for (const auto& desc : facts.info->storage_buffers_descriptors) {
+            ASSERT(desc.count == 1);
+            cache_.BindComputeStorageBuffer(ssbo_index, desc.cbuf_index, desc.cbuf_offset,
+                                            desc.is_written, desc.indirect_offset,
+                                            desc.write_extent);
+            ++ssbo_index;
+        }
+        cache_.UnbindComputeTextureBuffers();
+        last_entry = ~0U;
+        {
+            Fill before{*this, Site::DispatchBefore};
+            cache_.UpdateComputeBuffers();
+            cache_.BindHostComputeBuffers();
+        }
+        last_entry = ~0U;
+        if (logging) {
+            StopReadLog(held_log, true);
+        }
+        TakeHeld(HeldKind::Dispatch);
+    }
+    filling_held = false;
+    t_marked = nullptr;
+    fill_form = -1;
+    if (timed) {
+        Bump(counters.fill_ns, NowNs() - start);
+    }
+    return &dispatch;
+}
+
+void MemStage::CheckHeld() {
+    u64& fill_tick = held == HeldKind::Draw ? draw.fill_tick : dispatch.fill_tick;
+    const u64 now = player.scheduler.CurrentTick();
+    if (now != fill_tick) [[unlikely]] {
+        // 5.5: the scheduler flushed between the fill and this play. What the fill stamped with
+        // its tick is used by this later submission: stamp it with the current one.
+        Bump(counters.tick_moved);
+        if (ticks_logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+            LOG_WARNING(Render_Vulkan,
+                        "Memory seam (5.5): the tick moved from {} to {} between the fill and the "
+                        "play of {} {} (programs {:016x} {:016x}); restamped",
+                        fill_tick, now, held == HeldKind::Draw ? "draw" : "dispatch",
+                        held == HeldKind::Draw ? draw.number : dispatch.number, held_hashes[0],
+                        held_hashes[1]);
+        }
+        if (staging_pool != nullptr) {
+            staging_pool->Retick(fill_tick);
+        }
+        for (Buffer* const buffer : held_marked) {
+            buffer->Restamp(fill_tick);
+        }
+        fill_tick = now;
+    }
+    if (held_log_pending) {
+        // 5.3: the packet's first play is the old read position.
+        held_log_pending = false;
+        const bool is_draw = held == HeldKind::Draw;
+        CompareReads(held_log, is_draw ? "draw" : "dispatch",
+                     is_draw ? draw.number : dispatch.number, held_hashes[0], held_hashes[1]);
+    }
+}
+
+void MemStage::PlayHeld(Span span) {
+    if (held == HeldKind::None) {
+        return;
+    }
+    PlayHeldTo(span.end, false);
+}
+
+void MemStage::PlayHeldTo(u32 end, bool rest) {
+    const bool timed = Profile::Enabled();
+    const u64 start = timed ? NowNs() : 0;
+    const Profile::Scope zone{Profile::Zone::MemoryPlay};
+    CheckHeld();
+    const u32 stop = (std::min)(end, held_arena.Size());
+    if (held_cursor >= stop) {
+        return;
+    }
+    if (rest) {
+        // Configure returned before playing every section (false, or a path without the play).
+        Bump(counters.rest_plays);
+        (held == HeldKind::Draw ? draw.flags : dispatch.flags) |= RestPlayed;
+    }
+    PlayDepth depth;
+    while (held_cursor < stop) {
+        const Entry& entry = *reinterpret_cast<const Entry*>(held_arena.At(held_cursor));
+        held_cursor += entry.bytes;
+        if ((entry.flags & Played) != 0) {
+            continue;
+        }
+        if (entry.kind == Cmd::Descriptors) {
+            if (rest) {
+                // No Acquire for them: the draw or dispatch is dropped.
+                Bump(counters.rest_descriptors, entry.count);
+                continue;
+            }
+            if (player.guest_descriptor_queue.UsesDescriptorBuffer() != held_form) [[unlikely]] {
+                Bump(counters.form_mismatch);
+            }
+        }
+        player.Exec(entry);
+    }
+    if (timed) {
+        Bump(counters.play_ns, NowNs() - start);
+    }
+}
+
+void MemStage::PlayRest() {
+    if (held == HeldKind::None) {
+        return;
+    }
+    PlayHeldTo(held_arena.Size(), true);
+    held = HeldKind::None;
+    t_holding = false;
+    SeamHook::g_watch.fetch_sub(1, std::memory_order_relaxed);
+    held_arena.Reset();
+    held_cursor = 0;
+    held_marked.clear();
+    held_log.Clear();
+    held_log_pending = false;
+}
+
+void MemStage::NoteHeldFlush(SeamHook::Use use, const std::source_location& location) {
+    if (t_play_depth != 0) {
+        return;
+    }
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+        LOG_WARNING(Render_Vulkan,
+                    "Memory seam (5.5): a {} between the fill and the plays of {} {}: {}:{} {}",
+                    UseName(use), held == HeldKind::Draw ? "draw" : "dispatch",
+                    held == HeldKind::Draw ? draw.number : dispatch.number, location.file_name(),
+                    location.line(), location.function_name());
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The read log (5.3)
+
+bool MemStage::StartReadLog(ReadLog& log, u64 number) {
+    if (verify <= 0 || number % static_cast<u64>(verify) != 0 || t_log != nullptr) {
+        return false;
+    }
+    log.Clear();
+    t_log = &log;
+    return true;
+}
+
+void MemStage::StopReadLog(ReadLog& log, bool held_packet) {
+    t_log = nullptr;
+    for (ReadRecord& record : log.records) {
+        if (record.how != ReadRecord::How::Range) {
+            continue;
+        }
+        // The tracker's answer when the fill ends; at the compare a range the CPU wrote since
+        // (clean now, modified then) is a difference. An operation is compared at once.
+        record.value = !held_packet || cache == nullptr ||
+                               cache->IsRegionCpuModified(record.address, record.size)
+                           ? 1
+                           : 0;
+    }
+    if (held_packet) {
+        held_log_pending = true;
+    }
+}
+
+void MemStage::CompareReads(ReadLog& log, const char* what, u64 number, u64 hash_a, u64 hash_b) {
+    using How = ReadRecord::How;
+    for (const ReadRecord& record : log.records) {
+        bool differs = false;
+        switch (record.how) {
+        case How::Bytes:
+        case How::Staged: {
+            compare_scratch.resize(record.size);
+            static_cast<Tegra::MaxwellDeviceMemoryManager*>(record.memory)
+                ->ReadBlockUnsafe(record.address, compare_scratch.data(), record.size);
+            const u8* const expected = record.how == How::Bytes
+                                           ? log.bytes.data() + record.value
+                                           : static_cast<const u8*>(record.data);
+            differs = std::memcmp(compare_scratch.data(), expected, record.size) != 0;
+            break;
+        }
+        case How::Value: {
+            const auto* const memory = static_cast<const Tegra::MemoryManager*>(record.memory);
+            const u64 now = record.size == 4 ? u64{memory->Read<u32>(record.address)}
+                                             : memory->Read<u64>(record.address);
+            differs = now != record.value;
+            break;
+        }
+        case How::Range:
+            differs = record.value == 0 && cache != nullptr &&
+                      cache->IsRegionCpuModified(record.address, record.size);
+            break;
+        }
+        if (!differs) {
+            continue;
+        }
+        Bump(counters.read_diffs[static_cast<size_t>(record.kind)]);
+        if (diffs_logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+            LOG_WARNING(Render_Vulkan,
+                        "Memory seam (5.3): {} {} read {} at {:#x}+{:#x}: game memory changed "
+                        "between the fill and the old read position (programs {:016x} {:016x})",
+                        what, number, READ_KIND_NAMES[static_cast<size_t>(record.kind)],
+                        record.address, record.size, hash_a, hash_b);
+        }
+    }
+    Bump(counters.read_packets);
+    Bump(counters.read_records, log.records.size());
+    Bump(counters.read_skipped, log.skipped);
+    log.Clear();
 }
 
 void MemStage::CountPush(Cmd kind) noexcept {
@@ -580,7 +1078,10 @@ void MemStage::Note(SeamHook::Use use, const std::source_location& location, boo
 }
 
 void MemStage::TickFrame() {
-    const bool on = VideoCore::Nx2Debug::Experiment(123) != 0;
+    const int value = VideoCore::Nx2Debug::Experiment(123);
+    const bool on = value != 0;
+    // A held packet never outlives its draw or dispatch; a safety net, as in BeginDraw.
+    PlayRest();
     if (OwnedHere() && pending) {
         // Nothing should be pending between frames: a site that misses its play.
         Note(SeamHook::Use::Flush, std::source_location::current(), false);
@@ -589,11 +1090,20 @@ void MemStage::TickFrame() {
     if (OwnedHere() && t_fill_depth == 0) {
         owner.store(0, std::memory_order_release);
     }
-    if (on != seam_on.load(std::memory_order_relaxed)) {
+    if (value != seam_value.load(std::memory_order_relaxed)) {
+        seam_value.store(value, std::memory_order_relaxed);
         seam_on.store(on, std::memory_order_relaxed);
         player.ForgetBindings();
-        LOG_INFO(Render_Vulkan, "Memory seam (EXP123): {}",
-                 on ? "1, recorder and player" : "0, entries run as pushed");
+        VideoCommon::MemReadLog::g_on.store(value >= 2 && verify > 0, std::memory_order_relaxed);
+        LOG_INFO(Render_Vulkan, "Memory seam (EXP123): {}{}",
+                 value >= 2  ? "2, one fill per draw and dispatch before the texture work"
+                 : on        ? "1, recorder and player"
+                             : "0, entries run as pushed",
+                 value >= 2 && verify > 0
+                     ? fmt::format(" (FRITCHII_MEMSTAGE_VERIFY: every {}th packet's reads "
+                                   "compared)",
+                                   verify)
+                     : std::string{});
     }
     static const bool stats_env = std::getenv("FRITCHII_MEMSTAGE_SEAM_STATS") != nullptr;
     if (on || stats_env) {
@@ -643,8 +1153,10 @@ void MemStage::LogStats() {
         case Site::DrawCount:
         case Site::DrawIndirect:
         case Site::ListArgs:
+        case Site::Draw:
             draw_entries += entries;
             break;
+        case Site::Dispatch:
         case Site::DispatchBefore:
         case Site::DispatchIndirect:
         case Site::DispatchAfter:
@@ -675,7 +1187,7 @@ void MemStage::LogStats() {
              "dispatches {:.0f}/s ({:.2f} each), fence commits {:.0f}/s ({:.2f} each); "
              "deferred {:.0f}/s, plays {:.0f}/s; around the packet (5.1) {}, late plays (5.2) {}, "
              "scheduler uses not through the clock {}",
-             seam_on.load(std::memory_order_relaxed) ? 1 : 0, seconds, rate(draws),
+             seam_value.load(std::memory_order_relaxed), seconds, rate(draws),
              draws != 0 ? static_cast<double>(draw_entries) / static_cast<double>(draws) : 0.0,
              rate(dispatches),
              dispatches != 0 ? static_cast<double>(dispatch_entries) / static_cast<double>(dispatches)
@@ -690,6 +1202,41 @@ void MemStage::LogStats() {
     LOG_INFO(Render_Vulkan, "  memory seam fills/s by site: {}", sites.empty() ? "none" : sites);
     LOG_INFO(Render_Vulkan, "  memory seam syncs/s: {}; entries/s run outside any fill: {}",
              syncs.empty() ? "none" : syncs, outside.empty() ? "none" : outside);
+    if (seam_value.load(std::memory_order_relaxed) >= 2) {
+        std::string diffs;
+        u64 diff_total = 0;
+        for (size_t i = 0; i < READ_KIND_NAMES.size(); ++i) {
+            if (const u64 n = current.read_diffs[i] - reported.read_diffs[i]; n != 0) {
+                diffs += fmt::format("{}{} {}", diffs.empty() ? "" : ", ", READ_KIND_NAMES[i], n);
+                diff_total += n;
+            }
+        }
+        const u64 held_draws = delta(&Counts::held_draws);
+        const u64 held_dispatches = delta(&Counts::held_dispatches);
+        const u64 held_packets = held_draws + held_dispatches;
+        LOG_INFO(Render_Vulkan,
+                 "  memory seam 2b: held draws {:.0f}/s, late fill draws {:.0f}/s (texel "
+                 "buffers), held dispatches {:.0f}/s, late fill dispatches {:.0f}/s, not held "
+                 "(arena busy) {}; tick moved (5.5) {}; rest plays {} ({} descriptors dropped); "
+                 "descriptor form mismatches {}; fill {:.3f} ms/s ({:.2f} us a packet), play "
+                 "{:.3f} ms/s (inclusive, with EDEN_NX2_GPU_PROFILE)",
+                 rate(held_draws), rate(delta(&Counts::late_draws)), rate(held_dispatches),
+                 rate(delta(&Counts::late_dispatches)), delta(&Counts::unheld),
+                 delta(&Counts::tick_moved), delta(&Counts::rest_plays),
+                 delta(&Counts::rest_descriptors), delta(&Counts::form_mismatch),
+                 static_cast<double>(delta(&Counts::fill_ns)) / 1e6 / seconds,
+                 held_packets != 0 ? static_cast<double>(delta(&Counts::fill_ns)) / 1e3 /
+                                         static_cast<double>(held_packets)
+                                   : 0.0,
+                 static_cast<double>(delta(&Counts::play_ns)) / 1e6 / seconds);
+        if (verify > 0) {
+            LOG_INFO(Render_Vulkan,
+                     "  memory seam read log (FRITCHII_MEMSTAGE_VERIFY={}): {} packets, {} reads "
+                     "compared, {} not logged (budget); differences (5.3) {}{}{}",
+                     verify, delta(&Counts::read_packets), delta(&Counts::read_records),
+                     delta(&Counts::read_skipped), diff_total, diffs.empty() ? "" : ": ", diffs);
+        }
+    }
     reported = current;
 }
 
@@ -713,6 +1260,23 @@ void MemStage::Snapshot(Counts& out) const {
     out.late = counters.late.load(std::memory_order_relaxed);
     out.unclocked = counters.unclocked.load(std::memory_order_relaxed);
     out.texel = counters.texel.load(std::memory_order_relaxed);
+    out.held_draws = counters.held_draws.load(std::memory_order_relaxed);
+    out.late_draws = counters.late_draws.load(std::memory_order_relaxed);
+    out.held_dispatches = counters.held_dispatches.load(std::memory_order_relaxed);
+    out.late_dispatches = counters.late_dispatches.load(std::memory_order_relaxed);
+    out.unheld = counters.unheld.load(std::memory_order_relaxed);
+    out.tick_moved = counters.tick_moved.load(std::memory_order_relaxed);
+    out.rest_plays = counters.rest_plays.load(std::memory_order_relaxed);
+    out.rest_descriptors = counters.rest_descriptors.load(std::memory_order_relaxed);
+    out.form_mismatch = counters.form_mismatch.load(std::memory_order_relaxed);
+    out.read_packets = counters.read_packets.load(std::memory_order_relaxed);
+    out.read_records = counters.read_records.load(std::memory_order_relaxed);
+    out.read_skipped = counters.read_skipped.load(std::memory_order_relaxed);
+    out.fill_ns = counters.fill_ns.load(std::memory_order_relaxed);
+    out.play_ns = counters.play_ns.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < out.read_diffs.size(); ++i) {
+        out.read_diffs[i] = counters.read_diffs[i].load(std::memory_order_relaxed);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1229,3 +1793,89 @@ bool MemPlayer::ReadKeptListWords(u64 keep_id, std::span<u32> words) {
 }
 
 } // namespace Vulkan
+
+// The buffer cache's read log lines (buffer_cache.h). g_on is set while SEAM = 2 runs with
+// FRITCHII_MEMSTAGE_VERIFY; only a fill that logs (every Nth packet, on its own thread) has a log.
+namespace VideoCommon::MemReadLog {
+
+using Vulkan::MemStage;
+
+void NoteBytes(Kind kind, Tegra::MaxwellDeviceMemoryManager& memory, u64 address, u64 size) {
+    MemStage::ReadLog* const log = MemStage::t_log;
+    if (log == nullptr || size == 0) {
+        return;
+    }
+    if (log->budget + size > Vulkan::READ_LOG_BUDGET) {
+        ++log->skipped;
+        return;
+    }
+    log->budget += size;
+    const size_t at = log->bytes.size();
+    log->bytes.resize(at + static_cast<size_t>(size));
+    memory.ReadBlockUnsafe(address, log->bytes.data() + at, static_cast<size_t>(size));
+    log->records.push_back({
+        .kind = kind,
+        .how = MemStage::ReadRecord::How::Bytes,
+        .size = static_cast<u32>(size),
+        .address = address,
+        .value = at,
+        .data = nullptr,
+        .memory = &memory,
+    });
+}
+
+void NoteStaged(Kind kind, Tegra::MaxwellDeviceMemoryManager& memory, u64 address,
+                const u8* staged, u64 size) {
+    MemStage::ReadLog* const log = MemStage::t_log;
+    if (log == nullptr || size == 0) {
+        return;
+    }
+    if (log->budget + size > Vulkan::READ_LOG_BUDGET) {
+        ++log->skipped;
+        return;
+    }
+    log->budget += size;
+    log->records.push_back({
+        .kind = kind,
+        .how = MemStage::ReadRecord::How::Staged,
+        .size = static_cast<u32>(size),
+        .address = address,
+        .value = 0,
+        .data = staged,
+        .memory = &memory,
+    });
+}
+
+void NoteValue(Kind kind, Tegra::MemoryManager* memory, u64 address, u64 value, u32 size) {
+    MemStage::ReadLog* const log = MemStage::t_log;
+    if (log == nullptr || memory == nullptr) {
+        return;
+    }
+    log->records.push_back({
+        .kind = kind,
+        .how = MemStage::ReadRecord::How::Value,
+        .size = size,
+        .address = address,
+        .value = value,
+        .data = nullptr,
+        .memory = memory,
+    });
+}
+
+void NoteRange(Kind kind, u64 address, u64 size) {
+    MemStage::ReadLog* const log = MemStage::t_log;
+    if (log == nullptr || size == 0) {
+        return;
+    }
+    log->records.push_back({
+        .kind = kind,
+        .how = MemStage::ReadRecord::How::Range,
+        .size = static_cast<u32>(size),
+        .address = address,
+        .value = 0,
+        .data = nullptr,
+        .memory = nullptr,
+    });
+}
+
+} // namespace VideoCommon::MemReadLog

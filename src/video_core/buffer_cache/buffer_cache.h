@@ -23,6 +23,7 @@
 #include "common/nx2_uniform_keep_pages.h"
 #include "common/range_sets.inc"
 #include "video_core/buffer_cache/buffer_cache_base.h"
+#include "video_core/buffer_cache/mem_read_log.h"
 #include "video_core/buffer_cache/multi_range_refresh.h"
 #include "video_core/buffer_cache/nx2_bytes_equal.h"
 #include "video_core/nx2_debug_control.h"
@@ -393,6 +394,7 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu
         if (inline_writes && IsRegionRegistered(device_addr, size)) {
             tmp_buffer.resize_destructive(size);
             device_memory.ReadBlockUnsafe(device_addr, tmp_buffer.data(), size);
+            MemReadLog::Bytes(MemReadLog::Kind::InlinePageWrite, device_memory, device_addr, size);
             InlineMemoryImplementation(device_addr, size, tmp_buffer);
             return;
         }
@@ -1597,6 +1599,7 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
         // The pointer is an entry of a table the constant buffer points to.
         holder = gpu_memory->Read<u64>(ssbo_addr);
         MemStageStats::Read(MemStageStats::Kind::StorageAddress, sizeof(u64));
+        MemReadLog::Value(MemReadLog::Kind::TableAddress, gpu_memory, ssbo_addr, holder);
         if (holder == 0) {
             channel_state->storage_buffers[stage][ssbo_index] = NULL_BINDING;
             return false;
@@ -1705,6 +1708,7 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
     if (table_pointer) {
         holder = gpu_memory->Read<u64>(ssbo_addr);
         MemStageStats::Read(MemStageStats::Kind::CStorageAddress, sizeof(u64));
+        MemReadLog::Value(MemReadLog::Kind::TableAddress, gpu_memory, ssbo_addr, holder);
         ssbo_addr = holder + indirect_offset;
     }
     const bool native_pointer = kepler_compute->IsNativeMode();
@@ -1742,6 +1746,7 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
             if (const auto extent = Shader::ResolveStorageWriteExtent(write_extent, block, grid)) {
                 // The extent counts from the pointer, the binding from the pointer aligned down.
                 const GPUVAddr pointer = gpu_memory->Read<u64>(ssbo_addr);
+                MemReadLog::Value(MemReadLog::Kind::ComputePointer, gpu_memory, ssbo_addr, pointer);
                 const u64 pad = pointer >= binding.gpu_addr ? pointer - binding.gpu_addr : 0;
                 const u64 proven = std::min<u64>(binding.size, pad + *extent);
                 mark = proven;
@@ -2633,6 +2638,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     bank_scope.reset();
     Nx2Profile::AddFine(Nx2Profile::FineCounter::UniformBytes, size);
     if (use_fast_buffer) {
+        MemReadLog::Bytes(MemReadLog::Kind::Uniform, device_memory, device_addr, size);
         const Nx2Profile::FineScope stream_scope{Nx2Profile::Zone::UniformStream};
         if constexpr (IS_OPENGL) {
             if (runtime.HasFastBufferSubData()) {
@@ -3809,6 +3815,8 @@ void BufferCache<P>::BindHostComputeUniformBuffers() {
         }
         if constexpr (!IS_OPENGL) {
             if (use_fast_buffer) {
+                MemReadLog::Bytes(MemReadLog::Kind::Uniform, device_memory, binding.device_addr,
+                                  size);
                 const std::span<u8> span =
                     runtime.BindMappedUniformBuffer(0, binding_index, size);
                 device_memory.ReadBlockUnsafe(binding.device_addr, span.data(), size);
@@ -5008,6 +5016,7 @@ void BufferCache<P>::TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept {
 
 template <class P>
 bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size) {
+    MemReadLog::Range(MemReadLog::Kind::Bound, device_addr, size);
     // An upload over a clean word of the tracker (word_manager.h) finds and changes nothing:
     // walk only the dirty ones. Verify walks every word and checks the clean words.
     const bool skip_clean = Nx2Perf::On(Nx2Perf::Opt::CleanWords) && !Nx2Perf::Verify();
@@ -5333,6 +5342,8 @@ void BufferCache<P>::MappedUploadMemory([[maybe_unused]] Buffer& buffer,
             u8* const src_pointer = staging_pointer.data() + copy.src_offset;
             const DAddr device_addr = buffer.CpuAddr() + copy.dst_offset;
             device_memory.ReadBlockUnsafe(device_addr, src_pointer, copy.size);
+            MemReadLog::Staged(MemReadLog::Kind::Upload, device_memory, device_addr, src_pointer,
+                               copy.size);
             // Large uploads are mostly geometry the host GPU now has its own copy of: TickFrame
             // marks their guest memory cold (see TextureCache::RefreshContents).
             if (copy.size >= 256_KiB) {
@@ -5712,6 +5723,7 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
                                              bool native_pointer, bool table_pointer,
                                              bool compute) const {
     const GPUVAddr gpu_addr = gpu_memory->Read<u64>(ssbo_addr);
+    MemReadLog::Value(MemReadLog::Kind::StorageAddress, gpu_memory, ssbo_addr, gpu_addr);
     // EDEN_NX2_MEMSTAGE_STATS: the pointer word.
     const MemStageStats::Kind address_kind =
         compute ? MemStageStats::Kind::CStorageAddress : MemStageStats::Kind::StorageAddress;
@@ -5726,6 +5738,9 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
     const bool reads_size_word =
         !(table_pointer && !is_written) && (!native_pointer || (compute && !is_written));
     const u64 next_qword = reads_size_word ? gpu_memory->Read<u64>(ssbo_addr + 8) : 0;
+    if (reads_size_word) {
+        MemReadLog::Value(MemReadLog::Kind::StorageSize, gpu_memory, ssbo_addr + 8, next_qword);
+    }
     // EDEN_NX2_MEMSTAGE_STATS: the size word, in the pointer's range.
     MemStageStats::Read(address_kind, reads_size_word ? sizeof(u64) : 0, 0);
     // Every draw rebinds each storage buffer: the layout lookup (a mutex), the range walk and
