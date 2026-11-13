@@ -292,6 +292,11 @@ void GpuSplit::Stop() {
     previous_memory_write_position = 0;
     last_method_write_position = 0;
     previous_method_write_position = 0;
+    ranged_overflow_position = 0;
+    ranged_device_stamps = false;
+    ranged_device_since = 0;
+    stamp_memory = nullptr;
+    stamp_page = ~GPUVAddr{0};
     if (write_stamps) {
         // The next session's positions start at 0 again.
         std::fill_n(block_stamps.get(), BlockStamps, StampSlot{});
@@ -389,6 +394,7 @@ void GpuSplit::Publish() {
     MemoryStageLink::Get().NotePublished();
     if ((++publishes & 1023) == 0) [[unlikely]] {
         ReportBatched();
+        ReportQmdFloor();
     }
 }
 
@@ -566,7 +572,8 @@ bool GpuSplit::WaitForSyncedWriters(DrainSite site) {
     return WaitFor(std::min({last_writer_position, last_sync_position, write_position}), site);
 }
 
-void GpuSplit::RangeLastWrite(GPUVAddr begin, GPUVAddr end, const u32* data, size_t space) {
+void GpuSplit::RangeLastWrite(GPUVAddr begin, GPUVAddr end, const u32* data, size_t space,
+                              const Tegra::MemoryManager* memory) {
     static const bool enabled = [] {
         const char* const value = std::getenv("EDEN_NX2_RANGED_WAITS");
         return value == nullptr || value[0] != '0';
@@ -583,6 +590,14 @@ void GpuSplit::RangeLastWrite(GPUVAddr begin, GPUVAddr end, const u32* data, siz
     }
     if (write_stamps) [[unlikely]] {
         StampWrite(begin, end, true);
+        if (RangedDeviceStamps()) {
+            if (memory != nullptr) {
+                StampRangedDevice(*memory, begin, end);
+            } else {
+                write_stamp_floor = write_position; // No translation: it may write anything
+                ++floor_stats.device_floors;
+            }
+        }
     }
     static const bool forward = [] {
         const char* const value = std::getenv("EDEN_NX2_FORWARD_READS");
@@ -610,13 +625,15 @@ void GpuSplit::RangeLastWrite(GPUVAddr begin, GPUVAddr end, const u32* data, siz
         }
     }
     if (ranged_writes.size() >= MaxRangedWrites()) {
-        // Too many in flight: the oldest counts for every read again.
+        // Too many in flight: the oldest counts for every read again (the ring scans no longer
+        // see its range; its bytes stay stamped).
         const RangedWrite& oldest = ranged_writes.front();
         if (oldest.position > last_memory_write_position) {
             last_memory_write_position = oldest.position;
             last_memory_write_method = oldest.method;
         }
-        last_method_write_position = (std::max)(last_method_write_position, oldest.position);
+        ranged_overflow_position = (std::max)(ranged_overflow_position, oldest.position);
+        ++floor_stats.overflows;
         ranged_writes.pop_front();
     }
     RangedWrite& write = ranged_writes.push_back(write_position, begin, end, method);
@@ -624,6 +641,52 @@ void GpuSplit::RangeLastWrite(GPUVAddr begin, GPUVAddr end, const u32* data, siz
         write.space = space;
         write.data.assign(data, data + words);
     }
+}
+
+bool GpuSplit::RangedDeviceStamps() {
+    const bool on = OverflowFloorMode() != 0;
+    if (on != ranged_device_stamps) {
+        ranged_device_stamps = on;
+        // Turned on: the ranged writes sent so far were stamped by GPU address only.
+        ranged_device_since = on ? write_position : 0;
+    }
+    return on;
+}
+
+void GpuSplit::StampRangedDevice(const Tegra::MemoryManager& memory, GPUVAddr begin,
+                                 GPUVAddr end) {
+    // As TryNoteWriterRange: while a queued function may still remap the range the back may
+    // translate it differently, and sparse pages are written through their own backing. Then
+    // the write counts for every address until the back ran it.
+    if (last_function_position > consumed_cache) {
+        consumed_cache = consumed.load(std::memory_order_acquire);
+    }
+    const bool sparse = begin < Tegra::g_nx2_sparse_high.load(std::memory_order_relaxed) &&
+                        Tegra::g_nx2_sparse_low.load(std::memory_order_relaxed) < end;
+    if (last_function_position > consumed_cache || sparse) {
+        write_stamp_floor = write_position;
+        ++floor_stats.device_floors;
+        return;
+    }
+    constexpr GPUVAddr page_size = 0x1000;
+    for (GPUVAddr page = begin & ~(page_size - 1); page < end; page += page_size) {
+        if (&memory != stamp_memory || page != stamp_page ||
+            stamp_function != last_function_position) {
+            const std::optional<DAddr> device = memory.GpuToCpuAddress(page);
+            stamp_memory = &memory;
+            stamp_page = page;
+            stamp_function = last_function_position;
+            stamp_mapped = device.has_value();
+            stamp_device = device.value_or(0);
+        }
+        if (!stamp_mapped) {
+            continue; // Unmapped: the back writes nothing there
+        }
+        const GPUVAddr from = (std::max)(begin, page);
+        const GPUVAddr to = (std::min)(end, page + page_size);
+        StampWrite(stamp_device + (from - page), stamp_device + (to - page), false);
+    }
+    ++floor_stats.device_stamped;
 }
 
 bool GpuSplit::ForwardRead(size_t space, GPUVAddr begin, u32 words, u32* out) {
@@ -717,6 +780,7 @@ GpuSplit::GuestWriters GpuSplit::QueuedGuestWriters(u64 done, GPUVAddr address, 
     unbounded(last_unranged_position, Cause::Unranged);
     unbounded(last_function_position, Cause::Function);
     unbounded(last_method_write_position, Cause::MethodWrite);
+    unbounded(ranged_overflow_position, Cause::RangedOverflow);
     const u64 end = device + size;
     // NoteMemoryWrite and NoteMemoryWriteData (puller releases, 3D reports and uploads), newest
     // first; an unknown range may write anything.
@@ -840,14 +904,206 @@ u64 GpuSplit::WriteStamp(u64 device, u64 size, GPUVAddr address, u64 skip_tag) c
     if (!write_stamps) {
         return write_position;
     }
+    // EXP126 = 1 (fable_qmd_wait_brief piece 2): without the ranged overflow. RangeLastWrite
+    // stamps a ranged write's bytes before it touches the ring, so a dropped one is still found
+    // over its own bytes below; only its count for every other address goes. Its device bytes
+    // too (RangeLastWrite stamps them with EXP126 on), so a read through another GPU address
+    // of the same memory finds it; the writes sent before EXP126 turned on count until they ran.
+    const u64 overflow =
+        OverflowFloorOff() ? FloorlessOverflowTerm() : ranged_overflow_position;
     u64 stamp = (std::max)({write_stamp_floor, unknown_write_position,
                             last_unbounded_writer_position, last_unranged_position,
-                            last_function_position, last_method_write_position});
+                            last_function_position, last_method_write_position, overflow});
     if (size != 0) {
         stamp = (std::max)(stamp, StampOf(device, device + size, false, skip_tag));
         stamp = (std::max)(stamp, StampOf(address, address + size, true, skip_tag));
     }
     return (std::min)(stamp, write_position);
+}
+
+int GpuSplit::OverflowFloorMode() {
+    return VideoCore::Nx2Debug::Experiment(126);
+}
+
+GpuSplit::StampWhy GpuSplit::WriteStampWhy(u64 device, u64 size, GPUVAddr address,
+                                           u64 skip_tag) const {
+    if (!write_stamps) {
+        return {write_position, write_position, write_position, StampTerm::Floor};
+    }
+    // WriteStamp's terms one by one, the tables split into blocks and pages.
+    u64 block = 0;
+    u64 page = 0;
+    if (size != 0) {
+        const auto read = [skip_tag](const StampSlot& slot) {
+            return skip_tag != 0 && slot.last_tag == skip_tag ? slot.before : slot.last;
+        };
+        for (const bool gpu : {false, true}) {
+            const u64 begin = gpu ? address : device;
+            const u64 end = begin + size;
+            const u64 salt = gpu ? GpuStampSalt : 0;
+            for (u64 key = begin >> 8; key <= (end - 1) >> 8; ++key) {
+                block = (std::max)(block, read(block_stamps[StampIndex(key ^ salt, BlockStamps)]));
+            }
+            for (u64 key = begin >> 12; key <= (end - 1) >> 12; ++key) {
+                page = (std::max)(page, read(page_stamps[StampIndex(key ^ salt, PageStamps)]));
+            }
+        }
+    }
+    const std::array<std::pair<u64, StampTerm>, 9> terms{{
+        {block, StampTerm::Block},
+        {page, StampTerm::Page},
+        {write_stamp_floor, StampTerm::Floor},
+        {unknown_write_position, StampTerm::Unknown},
+        {last_unbounded_writer_position, StampTerm::Unbounded},
+        {last_unranged_position, StampTerm::Unranged},
+        {last_function_position, StampTerm::Function},
+        {last_method_write_position, StampTerm::MethodWrite},
+        // As WriteStamp: with EXP126 = 1 the writes not stamped by device address stand for it.
+        {OverflowFloorOff() ? FloorlessOverflowTerm() : ranged_overflow_position,
+         StampTerm::RangedOverflow},
+    }};
+    // `floorless` (what 1 answers): with device stamps on (EXP126 not 0) the writes sent before
+    // they started; with 0 (counters only) nothing for the overflow.
+    StampWhy why{0, ranged_device_stamps ? ranged_device_since : 0, 0, StampTerm::None};
+    for (const auto& [position, term] : terms) {
+        if (term != StampTerm::RangedOverflow) {
+            why.floorless = (std::max)(why.floorless, position);
+        }
+        if (position > why.term_position) {
+            why.term_position = position;
+            why.term = term;
+        }
+    }
+    why.stamp = (std::min)(why.term_position, write_position);
+    why.floorless = (std::min)(why.floorless, write_position);
+    return why;
+}
+
+u8 GpuSplit::ExactWriterCheck(u64 done, GPUVAddr address, u64 device, u64 size,
+                              u64 term_position, std::span<const u64> skip) const {
+    const GuestWriters writers = QueuedGuestWriters(done, address, device, size, skip);
+    if (writers.noted > done && writers.noted >= (std::min)(term_position, write_position)) {
+        return 0;
+    }
+    return (std::max)(writers.noted, writers.unbounded) > done ? 1 : 2;
+}
+
+void GpuSplit::NoteQmdPatchRefused(const StampWhy& why, u64 done, u8 exact) {
+    ++floor_stats.patches[static_cast<size_t>(QmdPatchOutcome::Stamp)];
+    ++floor_stats.patch_refused[static_cast<size_t>(why.term)];
+    if (why.floorless <= done) {
+        ++floor_stats.patch_overflow_alone;
+    }
+    if (exact < 3) {
+        ++floor_stats.exact[0][exact];
+    }
+}
+
+void GpuSplit::NoteQmdRead(u64 done) {
+    ++floor_stats.qmd_reads;
+    if (ranged_overflow_position > done) {
+        const u64 words = write_position - ranged_overflow_position;
+        ++floor_stats.reads_floor_up;
+        floor_stats.floor_words += words;
+        floor_stats.floor_words_max = (std::max)(floor_stats.floor_words_max, words);
+    }
+}
+
+void GpuSplit::NoteQmdReadWait(const StampWhy& why, u64 done, u64 target, bool evicted,
+                               u8 exact) {
+    const size_t term = evicted ? static_cast<size_t>(StampTerm::Count)
+                                : static_cast<size_t>(why.term);
+    ++floor_stats.read_waits[term];
+    floor_stats.read_wait_words[term] += target - done;
+    if (!evicted && why.floorless <= done) {
+        ++floor_stats.read_overflow_alone;
+    }
+    if (exact < 3) {
+        ++floor_stats.exact[1][exact];
+    }
+}
+
+void GpuSplit::ReportQmdFloor() {
+    const auto now = std::chrono::steady_clock::now();
+    if (floor_since == std::chrono::steady_clock::time_point{}) {
+        floor_since = now;
+        floor_stats = {};
+        return;
+    }
+    const std::chrono::duration<double> elapsed = now - floor_since;
+    if (elapsed.count() < 5.0) {
+        return;
+    }
+    const FloorStats s = floor_stats;
+    floor_stats = {};
+    floor_since = now;
+    const int mode = OverflowFloorMode();
+    if (!Nx2Profile::Enabled() && mode == 0) {
+        return;
+    }
+    const auto rate = [&](u64 count) { return static_cast<double>(count) / elapsed.count(); };
+    // StampTerm's order, then the evicted inline QMD (read waits only).
+    constexpr std::array<const char*, static_cast<size_t>(StampTerm::Count) + 1> term_names{
+        "none",       "block stamp",     "page stamp",      "stamps on since/over 1 MiB",
+        "unknown write", "unbounded writer", "unranged writer", "queued function",
+        "3D method write", "ranged overflow", "evicted inline QMD"};
+    std::string refused;
+    std::string waits;
+    for (size_t i = 0; i < term_names.size(); ++i) {
+        if (i < s.patch_refused.size() && s.patch_refused[i] != 0) {
+            refused += fmt::format("{}{} {:.0f}", refused.empty() ? "" : ", ", term_names[i],
+                                   rate(s.patch_refused[i]));
+        }
+        if (s.read_waits[i] != 0) {
+            waits += fmt::format("{}{} {:.0f} ({:.0f} words each)", waits.empty() ? "" : ", ",
+                                 term_names[i], rate(s.read_waits[i]),
+                                 static_cast<double>(s.read_wait_words[i]) /
+                                     static_cast<double>(s.read_waits[i]));
+        }
+    }
+    const auto patch = [&](QmdPatchOutcome outcome) {
+        return rate(s.patches[static_cast<size_t>(outcome)]);
+    };
+    LOG_INFO(HW_GPU,
+             "QMD wait floor (EXP126={}): ranged ring overflows {:.0f}/s (ring of {}); QMD reads "
+             "{:.0f}/s, {:.0f}/s with the overflow queued, {:.0f} ring words from it to the write "
+             "position on average, {} most; small patches/s: {:.0f} a holder took, {:.0f} overlay "
+             "from memory made ({:.0f} with the overflow queued), refused {:.0f} unmapped or "
+             "GPU-written, {:.0f} overlay queued, {:.0f} evicted inline QMD, {:.0f} by the "
+             "stamp ({}), {:.0f} of them by the overflow alone; QMD read waits/s by term: {}; "
+             "{:.0f} of them by the overflow alone; block/page stamps against the exact scan "
+             "(writer found, older or unbounded only, nothing): patches {}/{}/{}, reads "
+             "{}/{}/{}; macro DMA read waits {:.0f}/s, {:.0f}/s on the overflow ({:.0f} words "
+             "each); ranged writes stamped by device address {:.0f}/s, {:.0f}/s counted for every "
+             "address instead; trial (EXP126=2): reads where 1 serves otherwise compared, 1 "
+             "serving guest memory {}, an overlay {}, an upload shadow block {}; {} differed; {} "
+             "trial overlays and blocks built; {} reads not compared (1's copy not followed), {} "
+             "trial entries lost",
+             mode, rate(s.overflows), MaxRangedWrites(),
+             rate(s.qmd_reads), rate(s.reads_floor_up),
+             s.reads_floor_up != 0 ? static_cast<double>(s.floor_words) /
+                                         static_cast<double>(s.reads_floor_up)
+                                   : 0.0,
+             s.floor_words_max, patch(QmdPatchOutcome::Holder), patch(QmdPatchOutcome::Made),
+             patch(QmdPatchOutcome::MadeFloorUp), patch(QmdPatchOutcome::Unmapped),
+             patch(QmdPatchOutcome::InlineQueued), patch(QmdPatchOutcome::Evicted),
+             patch(QmdPatchOutcome::Stamp), refused.empty() ? "none" : refused,
+             rate(s.patch_overflow_alone), waits.empty() ? "none" : waits,
+             rate(s.read_overflow_alone), s.exact[0][0], s.exact[0][1], s.exact[0][2],
+             s.exact[1][0], s.exact[1][1], s.exact[1][2], rate(s.dma_waits),
+             rate(s.dma_overflow_waits),
+             s.dma_overflow_waits != 0 ? static_cast<double>(s.dma_overflow_words) /
+                                             static_cast<double>(s.dma_overflow_waits)
+                                       : 0.0,
+             rate(s.device_stamped), rate(s.device_floors), s.trial_compared[0],
+             s.trial_compared[1], s.trial_compared[2], s.trial_differed, s.trial_built,
+             s.trial_skipped, s.trial_lost);
+    if (s.trial_differed != 0) {
+        LOG_ERROR(HW_GPU,
+                  "QMD wait floor (EXP126=2): {} QMD reads differed from what EXP126=1 would "
+                  "have served in the last {:.0f} s",
+                  s.trial_differed, elapsed.count());
+    }
 }
 
 bool GpuSplit::HasQueuedMemoryWriters(GPUVAddr begin, GPUVAddr end) {
@@ -906,6 +1162,15 @@ bool GpuSplit::WaitForMemoryWriters(DrainSite site, GPUVAddr begin, GPUVAddr end
     const u64 target = MemoryWriterTarget(done, begin, end, target_method);
     const u64 unranged =
         std::max({last_writer_position, last_sync_position, last_memory_write_position});
+    if (target > done) {
+        // The QMD wait floor counters: waits whose target is the ranged ring's overflow
+        // (last_memory_write_position took the dropped write's position).
+        ++floor_stats.dma_waits;
+        if (target == ranged_overflow_position) {
+            ++floor_stats.dma_overflow_waits;
+            floor_stats.dma_overflow_words += target - done;
+        }
+    }
     if (Nx2Profile::Enabled()) {
         // What the read waits for: the newest writer it depends on.
         using Cause = Nx2Profile::DmaWaitCause;

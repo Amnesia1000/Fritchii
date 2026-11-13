@@ -2414,7 +2414,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
         const bool upload = method >= cb_data && method < cb_data + 16;
         split.RangeLastWrite(write_begin, write_end, upload ? &value : nullptr,
-                             memory_manager.GetID() + 1);
+                             memory_manager.GetID() + 1, &memory_manager);
         if (method == MAXWELL3D_REG_INDEX(report_semaphore.query)) {
             FrontNoteRelease(split, fs, value);
         }
@@ -2615,7 +2615,7 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         const bool upload = method >= cb_data && method < cb_data + 16 &&
                             fs.control != Regs::ShadowRamControl::Replay;
         split.RangeLastWrite(write_begin, write_end, upload ? base_start : nullptr,
-                             memory_manager.GetID() + 1);
+                             memory_manager.GetID() + 1, &memory_manager);
         if (method == MAXWELL3D_REG_INDEX(report_semaphore.query) && amount == 1) {
             FrontNoteRelease(split, fs, base_start[0]);
         }

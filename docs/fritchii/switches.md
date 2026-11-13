@@ -1637,6 +1637,87 @@ unlimited), at the market and the fight: the memstage gate, "DMA snapshot ... 0 
 QMD release prediction's payload differences and unpredicted counts, the compute front verify,
 FRITCHII_MEMSTAGE_VERIFY=2's QMD mismatches, the flash-watch route.
 
+### EXP126
+
+EXP126 (live, 0 = off, the default; fable_qmd_wait_brief piece 2): the ranged ring's overflow
+(below) out of GpuSplit::WriteStamp. With 0 a dropped ranged write counts as a write to every
+address for the write stamps, so with the back more than about 5,000 ring words behind (the
+Castle Town market) every QMD read the front's copy cannot serve waits for the whole backlog
+("qmd read", about 95 waits and 125 to 150 ms a second), and small patches cannot become
+overlays. With 1 it does not: RangeLastWrite stamps each ranged write's bytes before it touches
+the ring, so a dropped write is still found over its own bytes, and stamps only err newer (a
+collision makes one newer, never older). Unranged 3D writes still count for every address;
+QueuedGuestWriters and the macro DMA reads (MemoryWriterTarget) scan the ring and keep the
+overflow as before. An overlay from memory made while the overflow is queued is kept out of the
+EXP13 feed (its unbounded-writer check sees the overflow). Aliases: with EXP126 not 0 every
+ranged write is stamped by device address as well as by GPU address (the page translated once
+and cached, as NoteWrite does), so a QMD or semaphore read of the same memory through another
+GPU address finds it in WriteStamp (the QMD sites, PatchHolders and the semaphore feed check all
+ask it with the device address). With 0 they are stamped by GPU address only, as before (the
+overflow floor covered the dropped ones; the newest 256 had that hole already). While a queued
+function may remap the range, or for sparse pages, the write counts for every address instead
+(the stamp floor) until the back ran it. When EXP126 turns on, the ranged writes sent before were
+not stamped by device address: with 1 they count for every address until the back ran them.
+The ring scans (QueuedGuestWriters, ExactWriterCheck) still compare GPU addresses only; they
+keep the overflow, so their answers are as before.
+With 2 WriteStamp keeps the overflow as with 0, but the device stamps are on as with 1, so its
+answers are the same as 0's or newer (never served earlier than 0; a block collision can add a
+wait). The table below is cleared whenever EXP126 changes, so a switch into 2 starts from 1's copy
+and this one being the same. The QMD copy follows what 1's copy would hold where it
+differs, in a trial table (never served): the overlay 1 makes from memory at a patch nothing but
+the overflow refused, and an overlay or upload shadow block that takes a patch at 1 only (a
+holder still_holds refused for the overflow alone), each patched further as 1's PatchHolders
+would. At every read it works out what 1 would serve (an overlay, a shadow block, guest memory
+at once, or a wait, with 1's target and those holders) and, where that is something else than
+this copy serves or the same without the wait, compares the 256 bytes with what this copy
+reads (after its wait, if it waits). "differed" on the line below must be 0 (the first 16 are
+logged as errors with the word and the source). A change 1 would make that the table does not
+follow (a holder 1 drops as newer than a patch, an overlay this copy makes where 1 keeps its
+own) marks the block: its reads are counted as not compared until the back passes it (every read
+of a marked block, also those 1 would have waited for, so the count overstates); entries
+dropped at the table's limit (4,096 blocks, only after those the back passed) count as lost.
+Not followed at all: the overlay table's capacity at 1 (its evictions and evicted floor). To
+judge 1: profile_toggle.py on EXP126,
+0 against 1, market heavy phase uncapped with EDEN_NX2_GPU_PROFILE, and watch "qmd read" in the
+front waits by site, the EXP13 lines' "after a wait" and "ranged overflow" waits, overlays from
+memory, the fence writers wait and fps; with 1 the EXP13 checks (payload differs, unpredicted,
+resyncs, auto-off, bound violated) and "DMA snapshot ... differed" must stay 0.
+
+### QMD wait floor line
+
+"QMD wait floor (EXP126=n)" (HW_GPU, every 5 s with EDEN_NX2_GPU_PROFILE or EXP126 on;
+fable_qmd_wait_brief piece 1,
+counting only): why the front's QMD scheduler copy (EXP13 = 2 to 4) waits at "qmd read". The
+front keeps at most 256 ranged 3D writes (constant buffer words, reports; EDEN_NX2_RANGED_MAX);
+at the next one the oldest is dropped and its position, `ranged_overflow_position`, counts for
+every address in the ring scans. It used to raise the "3D method write" floor; it is a term of
+its own now (the EXP13=2 wait cause line says "ranged overflow" for it), with the same effect.
+The line gives:
+- ranged ring overflows a second; QMD reads a second, how many with the overflow still queued,
+  and the ring words from it to the write position then (average, most);
+- small QMD patches a second by outcome: a holder (overlay or shadow) took it, an overlay from
+  memory made (and of them, made with the overflow queued: 0 unless EXP126 = 1), refused as
+  unmapped or GPU-written, an overlay queued, an evicted inline QMD, or by the stamps, by the
+  term that refused it (block stamp, page stamp, stamps on since/over 1 MiB, unknown write,
+  unbounded writer, unranged writer, queued function, 3D method write, ranged overflow), and how
+  many of those nothing but the overflow refused;
+- QMD read waits a second by the term that set the target (the same terms, and evicted inline
+  QMD) with the ring words each waited, and how many nothing but the overflow made wait;
+- the stamp terms, the "overflow alone" counts and the exact scan below are worked out only with
+  the line on (EDEN_NX2_GPU_PROFILE or EXP126 not 0; WriteStampWhy and the scan cost the front
+  otherwise); without it refusals count under "by the stamp" with no terms;
+- for refusals and waits set by a block or page stamp: whether the exact scan over the same bytes
+  (GpuSplit::QueuedGuestWriters) finds the writer at the stamp, only an older or unbounded one, or
+  nothing (a hash collision, or a page stamp of a write elsewhere in the page), as counts for
+  the window: patches a/b/c, reads a/b/c;
+- macro DMA read waits a second (WaitForMemoryWriters with a range) and those whose target is the
+  ranged overflow, with the ring words each;
+- EXP126 not 0: ranged writes stamped by device address a second, and those counted for every
+  address instead (a queued function, sparse pages, no memory manager given);
+- EXP126 = 2: reads compared, by what 1 serves (guest memory, an overlay, an upload shadow
+  block), how many differed, trial overlays and blocks built, reads not compared and trial
+  entries lost (counts for the window).
+
 ### EXP101
 
 EXP101 (live, 0 = off, 1 = runs, 2 = cached page pointer + prefetch; fable52_answer_presenter): nvhost_gpu::SubmitGPFIFOImpl's pushbuffer

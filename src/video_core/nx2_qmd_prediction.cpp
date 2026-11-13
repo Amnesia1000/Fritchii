@@ -744,8 +744,8 @@ struct State {
                      "write, {:.0f} unbounded compute/copy writer, {:.0f} unranged writer, {:.0f} "
                      "queued function, {:.0f} 3D method write, {:.0f} unknown noted write ({}), "
                      "{:.0f} noted-write scan limit, {:.0f} writer-range scan limit, {:.0f} "
-                     "evicted inline QMD, {:.0f} none; writer ranges waited on by (kind, word "
-                     "in the QMD, bytes): {}",
+                     "evicted inline QMD, {:.0f} ranged overflow, {:.0f} none; writer ranges "
+                     "waited on by (kind, word in the QMD, bytes): {}",
                      waited(GuestWriterCause::Pending), waited(GuestWriterCause::WriterRange),
                      waited(GuestWriterCause::Ranged), waited(GuestWriterCause::UnboundedWriter),
                      waited(GuestWriterCause::Unranged), waited(GuestWriterCause::Function),
@@ -753,7 +753,8 @@ struct State {
                      waited(GuestWriterCause::UnknownPending), whats,
                      waited(GuestWriterCause::PendingScanLimit),
                      waited(GuestWriterCause::WriterScanLimit),
-                     waited(GuestWriterCause::OverlayEvicted), waited(GuestWriterCause::None),
+                     waited(GuestWriterCause::OverlayEvicted),
+                     waited(GuestWriterCause::RangedOverflow), waited(GuestWriterCause::None),
                      ranges);
         }
         signals = {};

@@ -90,6 +90,39 @@ enum class GuestWriterCause : u8 {
     PendingScanLimit, ///< More noted writes queued than are remembered
     WriterScanLimit,  ///< More writer ranges queued than are compared
     OverlayEvicted,   ///< KeplerCompute's QMD copy: an evicted inline QMD may be the writer
+    /// The newest ranged write RangeLastWrite dropped from its full ring (MaxRangedWrites): the
+    /// ring scans no longer see its range, so it may write anything for them
+    RangedOverflow,
+    Count,
+};
+
+/// The QMD wait floor counters (fable_qmd_wait_brief piece 1): which term of
+/// GpuSplit::WriteStamp set its answer, newest first; on a tie the earlier one here.
+enum class StampTerm : u8 {
+    None,           ///< Nothing: the answer is 0
+    Block,          ///< A 256-byte block stamp over the bytes
+    Page,           ///< A 4 KB page stamp over them
+    Floor,          ///< Stamps on since, or a write over 1 MiB (write_stamp_floor)
+    Unknown,        ///< A noted write of unknown range (unknown_write_position)
+    Unbounded,      ///< Compute or copy work without a range
+    Unranged,       ///< KeplerMemory, Fermi2D, syncpoint operations
+    Function,       ///< A queued function (GPU memory maps)
+    MethodWrite,    ///< A 3D memory-writing method without a range
+    RangedOverflow, ///< The ranged ring's overflow (ranged_overflow_position)
+    Count,
+};
+
+/// The same counters: what happened to a small inline upload patching a QMD no shadow or overlay
+/// holds (KeplerCompute::FrontPatchOverlays), per 256-byte block it writes.
+enum class QmdPatchOutcome : u8 {
+    Holder,       ///< An overlay or shadow took it (PatchHolders)
+    Made,         ///< An overlay from memory with the patch over it
+    /// Of Made: built while the ranged overflow was queued (only when WriteStamp leaves it out)
+    MadeFloorUp,
+    Unmapped,     ///< Refused: not mapped, or GPU-written
+    InlineQueued, ///< Refused: an overlay of it (an inline QMD's mostly) is still queued
+    Evicted,      ///< Refused: an evicted inline QMD may be
+    Stamp,        ///< Refused by the write stamps (by term: NoteQmdPatchRefused)
     Count,
 };
 
@@ -1013,7 +1046,10 @@ public:
     /// keeps every write counting.
     /// `data` (optional): the words it writes there, in address space `space`, which a macro
     /// memory read of them takes without waiting (ForwardRead).
-    void RangeLastWrite(GPUVAddr begin, GPUVAddr end, const u32* data = nullptr, size_t space = 0);
+    /// `memory` (optional): the memory manager [begin, end) is in; with EXP126 not 0 the range is
+    /// stamped by device address too (StampRangedDevice).
+    void RangeLastWrite(GPUVAddr begin, GPUVAddr end, const u32* data = nullptr, size_t space = 0,
+                        const Tegra::MemoryManager* memory = nullptr);
     /// For a macro memory read of `words` words at `begin` in address space `space`: when the
     /// newest work that may write them is one constant buffer upload still queued for the back,
     /// copies its words to `out` and returns true; the read then needs no wait.
@@ -1042,8 +1078,8 @@ public:
     /// reports). `noted`: the newest write noted over the bytes (inline uploads, reports,
     /// semaphore releases, copies and compute releases with known ranges; those at a position in
     /// `skip` don't count); `unbounded`: the newest that may write anything (compute and copy
-    /// writers without a range, unranged writers, 3D memory writes without a range, maps, more
-    /// writes than are remembered). 0 for none.
+    /// writers without a range, unranged writers, 3D memory writes without a range, the ranged
+    /// ring's overflow, maps, more writes than are remembered). 0 for none.
     struct GuestWriters {
         u64 noted;
         u64 unbounded;
@@ -1075,6 +1111,67 @@ public:
         return ++write_stamp_tags;
     }
     [[nodiscard]] u64 WriteStamp(u64 device, u64 size, GPUVAddr address, u64 skip_tag = 0) const;
+    /// The QMD wait floor counters (fable_qmd_wait_brief piece 1), front only. WriteStampWhy is
+    /// WriteStamp's diagnostic twin, for the two QMD sites: `stamp` is what WriteStamp answers,
+    /// `floorless` what it answers without the ranged overflow (EXP126 = 1), `term` which term
+    /// set `stamp` and `term_position` that term's position.
+    struct StampWhy {
+        u64 stamp;
+        u64 floorless;
+        u64 term_position;
+        StampTerm term;
+    };
+    [[nodiscard]] StampWhy WriteStampWhy(u64 device, u64 size, GPUVAddr address,
+                                         u64 skip_tag = 0) const;
+    /// For a wait or refusal set by a block or page stamp at `term_position`: what the exact scan
+    /// (QueuedGuestWriters over the same bytes, writer ranges at a position in `skip` left out)
+    /// finds. 0: a noted writer at or after the stamp (a real writer), 1: only an older one or
+    /// an unbounded writer, 2: nothing queued (a hash collision, or a page stamp of a write
+    /// elsewhere in the page).
+    [[nodiscard]] u8 ExactWriterCheck(u64 done, GPUVAddr address, u64 device, u64 size,
+                                      u64 term_position, std::span<const u64> skip = {}) const;
+    /// The newest ranged write dropped from the full ring (0 for none).
+    [[nodiscard]] u64 RangedOverflowPosition() const {
+        return ranged_overflow_position;
+    }
+    /// EXP126 (live; fable_qmd_wait_brief piece 2): 0 WriteStamp counts the ranged overflow for
+    /// every address (as before), 1 it does not, 2 as 0 while the QMD copy compares what 1
+    /// would have served (NoteQmdTrial).
+    [[nodiscard]] static int OverflowFloorMode();
+    [[nodiscard]] static bool OverflowFloorOff() {
+        return OverflowFloorMode() == 1;
+    }
+    /// EXP126 = 2: a QMD read where 1 would have served something else, or without the wait,
+    /// compared with what this copy read (`kind`: what 1 served, 0 guest memory, 1 an overlay,
+    /// 2 an upload shadow block); `differed`: the 256 bytes were not the same (must stay 0).
+    void NoteQmdTrial(u8 kind, bool differed) {
+        ++floor_stats.trial_compared[kind];
+        if (differed) {
+            ++floor_stats.trial_differed;
+        }
+    }
+    /// EXP126 = 2: 1's copy would hold a different overlay or shadow block (a trial one).
+    void NoteQmdTrialBuilt() {
+        ++floor_stats.trial_built;
+    }
+    /// EXP126 = 2: a read of a block 1 changed in a way not followed: not compared.
+    void NoteQmdTrialSkipped() {
+        ++floor_stats.trial_skipped;
+    }
+    /// EXP126 = 2: trial entries the back had not passed dropped at the table's limit.
+    void NoteQmdTrialLost(u64 count) {
+        floor_stats.trial_lost += count;
+    }
+    void NoteQmdPatch(QmdPatchOutcome outcome) {
+        ++floor_stats.patches[static_cast<size_t>(outcome)];
+    }
+    /// A small patch refused by the stamps; `exact`: ExactWriterCheck's answer (3: not asked).
+    void NoteQmdPatchRefused(const StampWhy& why, u64 done, u8 exact);
+    /// Every QMD read the front's copy makes from guest memory or its tables.
+    void NoteQmdRead(u64 done);
+    /// A QMD read that waits for `target`; `evicted`: an evicted inline QMD raised it past the
+    /// stamps; `exact` as NoteQmdPatchRefused.
+    void NoteQmdReadWait(const StampWhy& why, u64 done, u64 target, bool evicted, u8 exact);
     /// For a semaphore acquire of `device`: the payload a release still queued for the back writes
     /// there, if nothing sent after it may write the word. The back runs the acquire's channel
     /// after that release, so an acquire it meets needs no drain. EDEN_NX2_ACQUIRE_QUEUED=0 off.
@@ -1414,6 +1511,12 @@ private:
     /// counts (QueuedGuestWriters).
     u64 last_method_write_position{};
     u64 previous_method_write_position{};
+    /// The newest ranged write RangeLastWrite dropped from its full ring (fable_qmd_wait_brief
+    /// 4.1). The ring scans (QueuedGuestWriters; MemoryWriterTarget through
+    /// last_memory_write_position) no longer see its range, so for them it may write anything.
+    /// Its bytes were stamped when it was noted, so WriteStamp needs it only as a floor of its
+    /// own, which EXP126 = 1 leaves out.
+    u64 ranged_overflow_position{};
     u64 session{};
     /// EnableWriteStamps' tables: a slot keeps its newest stamp, the tag that made it, and the
     /// newest stamp of any other tag before it.
@@ -1528,6 +1631,27 @@ private:
     GPUVAddr note_page{~GPUVAddr{0}};
     u64 note_device{};
     u64 note_function{};
+    /// EXP126 not 0 (review fix 2 of fable_qmd_wait_brief): ranged writes are stamped by device
+    /// address too, so a read of the same memory through another GPU address finds them (the
+    /// GPU stamp alone did not; the overflow floor hid that once the ring was full). Since
+    /// `ranged_device_since` (the switch turned on): the writes sent before were stamped by GPU
+    /// address only, and count for every address with the overflow left out until they ran.
+    bool ranged_device_stamps{};
+    u64 ranged_device_since{};
+    /// StampRangedDevice's last translation, as NoteWrite's.
+    const Tegra::MemoryManager* stamp_memory{};
+    GPUVAddr stamp_page{~GPUVAddr{0}};
+    u64 stamp_device{};
+    u64 stamp_function{};
+    bool stamp_mapped{};
+    /// Whether ranged writes are stamped by device address now (EXP126 not 0), noting a turn on.
+    bool RangedDeviceStamps();
+    void StampRangedDevice(const Tegra::MemoryManager& memory, GPUVAddr begin, GPUVAddr end);
+    /// What stands for the ranged overflow when WriteStamp leaves it out: the writes not
+    /// stamped by device address, or the overflow itself while device stamps are off.
+    [[nodiscard]] u64 FloorlessOverflowTerm() const {
+        return ranged_device_stamps ? ranged_device_since : ranged_overflow_position;
+    }
     u64 published_local{};
     u64 consumed_cache{};
     /// Words between publishes: small right after a drain, while the back has nothing to do.
@@ -1555,6 +1679,41 @@ private:
     std::chrono::steady_clock::time_point batched_since{};
     u32 publishes{};
     void ReportBatched();
+    /// The QMD wait floor counters (fable_qmd_wait_brief piece 1), front only, logged every 5 s
+    /// as "QMD wait floor" with EDEN_NX2_GPU_PROFILE or EXP126 on (ReportQmdFloor).
+    struct FloorStats {
+        u64 overflows;       ///< RangeLastWrite dropped the oldest of a full ring
+        u64 qmd_reads;       ///< NoteQmdRead
+        u64 reads_floor_up;  ///< ... with the overflow queued
+        u64 floor_words;     ///< ... their ring words from the overflow to the write position
+        u64 floor_words_max;
+        std::array<u64, static_cast<size_t>(QmdPatchOutcome::Count)> patches;
+        std::array<u64, static_cast<size_t>(StampTerm::Count)> patch_refused;
+        u64 patch_overflow_alone; ///< Refused with nothing but the overflow queued over it
+        /// Read waits by the term that set the target (the last: an evicted inline QMD).
+        std::array<u64, static_cast<size_t>(StampTerm::Count) + 1> read_waits;
+        std::array<u64, static_cast<size_t>(StampTerm::Count) + 1> read_wait_words;
+        u64 read_overflow_alone; ///< Waits with nothing but the overflow queued over the QMD
+        /// ExactWriterCheck's answers for block and page stamps: patches, reads.
+        std::array<std::array<u64, 3>, 2> exact;
+        u64 dma_waits;          ///< WaitForMemoryWriters(site, begin, end) that waited
+        u64 dma_overflow_waits; ///< ... whose target is the ranged overflow
+        u64 dma_overflow_words; ///< ... and the ring words they waited for
+        /// EXP126 not 0: ranged writes stamped by device address, and those that could not be
+        /// (a queued function may remap, sparse) and count for every address instead.
+        u64 device_stamped;
+        u64 device_floors;
+        /// EXP126 = 2: reads compared (1 serving memory, an overlay, a shadow block), those that
+        /// differed, trial overlays and blocks built, reads not compared, entries lost.
+        std::array<u64, 3> trial_compared;
+        u64 trial_differed;
+        u64 trial_built;
+        u64 trial_skipped;
+        u64 trial_lost;
+    };
+    FloorStats floor_stats{};
+    std::chrono::steady_clock::time_point floor_since{};
+    void ReportQmdFloor();
 
     // Back side.
     Tegra::Engines::EngineInterface* back_engine{};
