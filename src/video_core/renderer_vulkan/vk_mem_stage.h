@@ -745,6 +745,7 @@ private:
         u64 diff_over{};
         u64 diff_stage_own{};
         u64 ring_reads{};
+        u64 ring_reads_marked{};
         u64 ring_wrapped{};
         u64 gathers_held{};
         std::array<u64, 3> flush_regions_held{};
@@ -897,6 +898,7 @@ private:
         std::atomic<u64> diff_over{};
         std::atomic<u64> diff_stage_own{}; ///< Step 7: changed only by GPUMem's later writes
         std::atomic<u64> ring_reads{};     ///< Step 7: ring packets whose reads were compared
+        std::atomic<u64> ring_reads_marked{}; ///< ... with a CPU-written mark since the fill
         std::atomic<u64> ring_wrapped{};
         std::atomic<u64> gathers_held{};
         std::array<std::atomic<u64>, 3> flush_regions_held{};

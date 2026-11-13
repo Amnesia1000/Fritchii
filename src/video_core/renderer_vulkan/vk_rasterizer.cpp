@@ -4299,6 +4299,7 @@ void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::Cache
         std::scoped_lock lock{buffer_cache.mutex};
         MemStage::FillPlay seam{mem_stage, MemStage::Site::Invalidation};
         buffer_cache.WriteMemory(addr, size);
+        mem_stage.NoteCpuMark(addr, size); // step 7's verify (re-review N4)
     }
     if ((True(which & VideoCommon::CacheType::QueryCache))) {
         query_cache.InvalidateRegion(addr, size);
@@ -4320,6 +4321,10 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
     // EXP91 (stage 0, counting) and EXP92 (uniform keeps, tier 1): every cached write range, in
     // the keeps' ring, before any early return.
     buffer_cache.NoteCachedWrites(sequences);
+    // Step 7's verify: marks the cache takes inline, on any thread (re-review N4).
+    for (const auto& [addr, size] : sequences) {
+        mem_stage.NoteCpuMark(addr, size);
+    }
     if (VideoCommon::Nx2FastDrawCount::g_on) [[unlikely]] {
         for (const auto& [addr, size] : sequences) {
             VideoCommon::Nx2FastDrawCount::NotePoolWrite(addr, size);
@@ -4508,6 +4513,10 @@ void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64
         }
         return;
     }
+    // Step 7's verify: the marks a gather applied here, on any thread (re-review N4).
+    for (const auto& [addr, size] : ranges) {
+        mem_stage.NoteCpuMark(addr, size);
+    }
     namespace CbPath = VideoCommon::Nx2CbPath;
     const int cb_path = CbPath::Mode();
     // EXP88 & 1 (fable52_answer_next70 3.1 step 5): the guest's collected writes take each
@@ -4612,9 +4621,7 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.WriteMemory(addr, size);
     }
-    if (VideoCommon::MemoryStageLink::BackServed()) [[unlikely]] {
-        mem_stage.NoteCpuMark(addr, size); // step 7's verify, as in OnCacheInvalidations
-    }
+    mem_stage.NoteCpuMark(addr, size); // step 7's verify, as in OnCacheInvalidations
     OnStage(static_cast<u8>(VideoCommon::MemoryStageLink::Served::Invalidation), [&] {
         std::scoped_lock lock{buffer_cache.mutex};
         MemStage::FillPlay seam{mem_stage, MemStage::Site::Invalidation};

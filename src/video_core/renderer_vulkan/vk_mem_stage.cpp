@@ -2516,6 +2516,10 @@ void MemStage::CompareRingReads(ReadLog& log, u64 number, u64 hash_a, u64 hash_b
     }
     Bump(counters.read_packets);
     Bump(counters.ring_reads);
+    if (cpu_mark_count.load(std::memory_order_acquire) != log.cpu_marks) {
+        // The cache took a game-side mark (anywhere) between this packet's fill and its take.
+        Bump(counters.ring_reads_marked);
+    }
     Bump(counters.read_records, log.records.size());
     Bump(counters.read_skipped, log.skipped);
     log.Clear();
@@ -3203,14 +3207,15 @@ void MemStage::LogStats() {
             LOG_INFO(Render_Vulkan,
                      "  memory seam read log (FRITCHII_MEMSTAGE_READ_LOG={}): {} packets, {} reads "
                      "compared{}{}{}, {} not logged (budget); differences (5.3) {}{}{}; ring "
-                     "packets compared at the take (step 7) {}, left out as GPUMem's own later "
-                     "writes {}; GPUMem's writes kept out of the write ring {}; CPU-written marks "
-                     "noted {}",
+                     "packets compared at the take (step 7) {} ({} with a CPU-written mark since "
+                     "the fill), left out as GPUMem's own later writes {}; GPUMem's writes kept "
+                     "out of the write ring {}; CPU-written marks noted {}",
                      read_log_every, delta(&Counts::read_packets), delta(&Counts::read_records),
                      compared.empty() ? "" : " (", compared, compared.empty() ? "" : ")",
                      delta(&Counts::read_skipped), diff_total, diffs.empty() ? "" : ": ", diffs,
-                     delta(&Counts::ring_reads), delta(&Counts::diff_stage_own),
-                     quiet - reported_quiet, marks - reported_marks);
+                     delta(&Counts::ring_reads), delta(&Counts::ring_reads_marked),
+                     delta(&Counts::diff_stage_own), quiet - reported_quiet,
+                     marks - reported_marks);
             reported_quiet = quiet;
             reported_marks = marks;
             const auto by_class = [&](DiffClass kind) {
@@ -3329,6 +3334,7 @@ void MemStage::Snapshot(Counts& out) const {
     out.diff_over = counters.diff_over.load(std::memory_order_relaxed);
     out.diff_stage_own = counters.diff_stage_own.load(std::memory_order_relaxed);
     out.ring_reads = counters.ring_reads.load(std::memory_order_relaxed);
+    out.ring_reads_marked = counters.ring_reads_marked.load(std::memory_order_relaxed);
     out.ring_wrapped = counters.ring_wrapped.load(std::memory_order_relaxed);
     out.gathers_held = counters.gathers_held.load(std::memory_order_relaxed);
     for (size_t i = 0; i < out.flush_regions_held.size(); ++i) {
