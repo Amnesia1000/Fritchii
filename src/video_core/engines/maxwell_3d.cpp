@@ -3555,6 +3555,10 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             // no writer since touches. The page scans list the overlapping writes (8 a page) and
             // the read misses only when its own bytes overlap one of them.
             const bool byte_ranges = (exp10 & 8) != 0;
+            // EXP122 (fable_answer_long_drains 8.2 a'): the pages with a snapshot keep the noted
+            // ranges since it, so WritersMayWriteSince answers them without the ring scan.
+            const int exp122 = VideoCore::Nx2Debug::Experiment(122);
+            split.SetPageWatch(exp122);
             static u64 byte_skips{};
             static u64 byte_overlaps{};
             static u64 byte_differences{};
@@ -3719,6 +3723,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                     for (u64 page = first_page; page <= last_page; ++page) {
                         fs.dma_snapshots[page] = {split.SentPosition(), split.WriterRangeCount(),
                                                   split.DispatchWriteCount(), {}};
+                        split.WatchPage(page);
                     }
                     memory_manager.ReadBlockUnsafe(source, snap_words.data(), read_bytes);
                 }
@@ -3779,6 +3784,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                         }
                         using Release = VideoCommon::GpuSplit::ReleaseNote;
                         const auto& releases = split.ReleaseNotes();
+                        const auto watch = split.GetPageWatchStats();
                         const auto release = [&releases](Release note) {
                             return releases[static_cast<size_t>(note)];
                         };
@@ -3795,7 +3801,10 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                                  "nothing, unbounded: {} pending map, {} sparse, {} unmapped "
                                  "reduction, {} split; page scan misses: {} overlap (no list), "
                                  "{} past the scan, {} left the ring; {} byte list merges; {} "
-                                 "ranges noted, {} ranges compared by the scans",
+                                 "ranges noted, {} ranges compared by the scans; page watch "
+                                 "(EXP122={}): {} answered by the page watch ({} may write), {} "
+                                 "watched pages, {} byte-list overflows, {} verified, {} verify "
+                                 "mismatches",
                                  writer_unbounded + writer_overlaps + byte_overlaps +
                                      dispatch_drains,
                                  writer_unbounded, writer_overlaps, byte_overlaps,
@@ -3816,7 +3825,9 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                                  writer_checks[static_cast<size_t>(WriterCheck::Forgotten)],
                                  byte_merges, split.NotedWriterRanges(),
                                  VideoCommon::g_writer_ranges_compared.load(
-                                     std::memory_order_relaxed));
+                                     std::memory_order_relaxed),
+                                 exp122, watch.answered, watch.answered_write, watch.watched,
+                                 watch.overflows, watch.verified, watch.mismatches);
                     }
                 }
                 if (census_read) [[unlikely]] {

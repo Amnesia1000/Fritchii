@@ -271,6 +271,7 @@ void GpuSplit::Stop() {
     last_unbounded_writer_position = 0;
     writer_range_memory = nullptr;
     writer_range_sealed = 0;
+    ClearPageWatch();
     last_dispatch_position = 0;
     last_unrecorded_dispatch_position = 0;
     dispatch_records = false;
@@ -1077,6 +1078,9 @@ GpuSplit::ReleaseNote GpuSplit::TryNoteWriterRange(const Tegra::MemoryManager& m
         WriterRange& last = writer_ranges[(writer_range_count - 1) % writer_ranges.size()];
         last.position = write_position;
         last.kind = kind;
+        if (watched_pages != 0) {
+            NoteWatchedWrite(last.begin, last.end, last.position);
+        }
         if (write_stamps) [[unlikely]] {
             StampWrite(last.begin, last.end, false);
         }
@@ -1102,6 +1106,9 @@ GpuSplit::ReleaseNote GpuSplit::TryNoteWriterRange(const Tegra::MemoryManager& m
     }
     writer_ranges[writer_range_count++ % writer_ranges.size()] = {write_position, *device,
                                                                   *device + size, kind};
+    if (watched_pages != 0) {
+        NoteWatchedWrite(*device, *device + size, write_position);
+    }
     if (write_stamps) [[unlikely]] {
         StampWrite(*device, *device + size, false);
     }
@@ -1110,6 +1117,278 @@ GpuSplit::ReleaseNote GpuSplit::TryNoteWriterRange(const Tegra::MemoryManager& m
     writer_range_size = size;
     writer_range_function = last_function_position;
     return ReleaseNote::Ranged;
+}
+
+// EXP122 page watch (fable_answer_long_drains 8.2 (a'), fable52_answer_kills 3.4).
+//
+// WritersMayWriteSince scans the noted writer ranges newest first and gives up after
+// MaxWriterScan. At ~11,500 ranges a second (compute inline uploads) a page whose snapshot is a
+// few frames old was always past the limit: every such "may write" was a give-up, never an
+// overlap, and each cost the front a drain. The page watch keeps, for the few device pages the
+// front's macro DMA reads hold a snapshot of, the noted ranges that touched each since its
+// snapshot, so the answer for such a page is a few compares and has no limit.
+//
+// Threads: the ranges are noted (TryNoteWriterRange, from KeplerCompute and MaxwellDMA front
+// methods) and asked about (Maxwell3D::FrontDmaRead) on the front thread, as is the ring itself
+// (writer_ranges and writer_range_count are plain front-side fields). The table is front-only
+// state too, so a range is in a watched page's list before any later check runs, in program
+// order: the same guarantee the ring gives, with no atomics needed.
+//
+// Exactness: an entry started at writer range count C (sealed: the last range below C can no
+// longer move its position) holds every range noted from C on that touches the page, with its
+// newest position (an inline upload's repeat of the same range only moves the position, and is
+// recorded again). A check whose ranges below `known` were already found to miss (or listed)
+// may use the entry when C <= known; one whose `since` is at or past the entry's start position
+// also may, as every range below C was noted at or before it. Otherwise (another channel's
+// snapshot of the same page started the entry later, an evicted entry, a range over several
+// pages) the ring scan answers as before. Past 8 entries a page's further ranges are folded into
+// one union with the newest position: never smaller than what was written, so never a missed
+// write, only a coarser byte list.
+//
+// The table is set associative (64 sets of 4 pages, least recently used way replaced): two tag
+// probes for a range of one or two pages. A range over more than 16 pages walks the 256 tags
+// instead, after a test against the lowest and highest watched page. EXP122=2 runs the old scan
+// without a limit after every "no write" and counts each overlap it finds that the watch did not
+// list (the "verify mismatches" of EXP10's log line, which must stay 0).
+struct GpuSplit::PageWatch {
+    static constexpr u32 Sets = 64;
+    static constexpr u32 Ways = 4;
+    static constexpr u32 Slots = Sets * Ways;
+    static constexpr u32 Capacity = 8;
+    static constexpr u64 Empty = ~u64{0};
+    struct Write {
+        u64 position;
+        u16 begin; ///< Byte offsets in the page
+        u16 end;
+    };
+    struct Entry {
+        u64 start_count;
+        u64 start_position;
+        u64 last_use;
+        u32 count;
+        bool folded; ///< `fold` holds the ranges past Capacity
+        Write fold;
+        std::array<Write, Capacity> writes;
+    };
+    std::array<u64, Slots> pages;
+    std::array<Entry, Slots> entries{};
+    u64 min_page = Empty;
+    u64 max_page = 0;
+    u64 clock = 0;
+    // Stats: mutable through the pointer from const WritersMayWriteSince.
+    u64 answered = 0;
+    u64 answered_write = 0;
+    u64 overflows = 0;
+    u64 verified = 0;
+    u64 mismatches = 0;
+
+    PageWatch() {
+        pages.fill(Empty);
+    }
+    static u32 Set(u64 page) {
+        return static_cast<u32>((page ^ (page >> 6) ^ (page >> 12)) & (Sets - 1));
+    }
+    [[nodiscard]] s32 Find(u64 page) const {
+        const u32 base = Set(page) * Ways;
+        for (u32 way = 0; way < Ways; ++way) {
+            if (pages[base + way] == page) {
+                return static_cast<s32>(base + way);
+            }
+        }
+        return -1;
+    }
+    void Record(Entry& entry, u64 page, u64 begin, u64 end, u64 position) {
+        const u64 base = page << 12;
+        const u16 first = static_cast<u16>((std::max)(begin, base) - base);
+        const u16 last = static_cast<u16>((std::min)(end, base + 0x1000) - base);
+        for (u32 i = 0; i < entry.count; ++i) {
+            Write& write = entry.writes[i];
+            if (write.begin == first && write.end == last) {
+                write.position = (std::max)(write.position, position);
+                return;
+            }
+        }
+        if (entry.count < Capacity) {
+            entry.writes[entry.count++] = {position, first, last};
+            return;
+        }
+        if (!entry.folded) {
+            entry.folded = true;
+            entry.fold = {position, first, last};
+            ++overflows;
+            return;
+        }
+        entry.fold.position = (std::max)(entry.fold.position, position);
+        entry.fold.begin = (std::min)(entry.fold.begin, first);
+        entry.fold.end = (std::max)(entry.fold.end, last);
+    }
+};
+
+void GpuSplit::ClearPageWatch() {
+    // Front only (or with the back stopped).
+    if (page_watch) {
+        page_watch->pages.fill(PageWatch::Empty);
+        page_watch->min_page = PageWatch::Empty;
+        page_watch->max_page = 0;
+    }
+    watched_pages = 0;
+}
+
+void GpuSplit::WatchPage(u64 page) {
+    if (page_watch_mode == 0) {
+        return;
+    }
+    if (!page_watch) {
+        page_watch = std::make_unique<PageWatch>();
+    }
+    PageWatch& watch = *page_watch;
+    s32 slot = watch.Find(page);
+    if (slot < 0) {
+        const u32 base = PageWatch::Set(page) * PageWatch::Ways;
+        u32 pick = base;
+        for (u32 way = 0; way < PageWatch::Ways; ++way) {
+            const u32 index = base + way;
+            if (watch.pages[index] == PageWatch::Empty) {
+                pick = index;
+                break;
+            }
+            if (watch.entries[index].last_use < watch.entries[pick].last_use) {
+                pick = index;
+            }
+        }
+        if (watch.pages[pick] == PageWatch::Empty) {
+            ++watched_pages;
+        }
+        watch.pages[pick] = page;
+        watch.min_page = (std::min)(watch.min_page, page);
+        watch.max_page = (std::max)(watch.max_page, page);
+        slot = static_cast<s32>(pick);
+    }
+    PageWatch::Entry& entry = watch.entries[static_cast<u32>(slot)];
+    // Sealed: the newest range can't move its position past the start any more.
+    entry.start_count = WriterRangeCount();
+    entry.start_position = write_position;
+    entry.last_use = ++watch.clock;
+    entry.count = 0;
+    entry.folded = false;
+}
+
+void GpuSplit::NoteWatchedWrite(u64 begin, u64 end, u64 position) {
+    if (end <= begin) {
+        return;
+    }
+    PageWatch& watch = *page_watch;
+    const u64 first_page = begin >> 12;
+    const u64 last_page = (end - 1) >> 12;
+    if (last_page < watch.min_page || first_page > watch.max_page) {
+        return;
+    }
+    if (last_page - first_page < 16) {
+        for (u64 page = first_page; page <= last_page; ++page) {
+            if (const s32 slot = watch.Find(page); slot >= 0) {
+                watch.Record(watch.entries[static_cast<u32>(slot)], page, begin, end, position);
+            }
+        }
+        return;
+    }
+    for (u32 slot = 0; slot < PageWatch::Slots; ++slot) {
+        const u64 page = watch.pages[slot];
+        if (page != PageWatch::Empty && first_page <= page && page <= last_page) {
+            watch.Record(watch.entries[slot], page, begin, end, position);
+        }
+    }
+}
+
+GpuSplit::WatchAnswer GpuSplit::WatchedWritesSince(u64 since, u64 begin, u64 size, u64 known,
+                                                   ListedWrites* found) const {
+    if (size == 0 || page_watch_mode == 0) {
+        return WatchAnswer::Unwatched;
+    }
+    const u64 page = begin >> 12;
+    if (((begin + size - 1) >> 12) != page) {
+        return WatchAnswer::Unwatched;
+    }
+    PageWatch& watch = *page_watch;
+    const s32 slot = watch.Find(page);
+    if (slot < 0) {
+        return WatchAnswer::Unwatched;
+    }
+    PageWatch::Entry& entry = watch.entries[static_cast<u32>(slot)];
+    if (entry.start_count > known && entry.start_position > since) {
+        // Started after this check's snapshot (another snapshot of the page): the ring answers.
+        return WatchAnswer::Unwatched;
+    }
+    entry.last_use = ++watch.clock;
+    const u64 base = page << 12;
+    const u64 end = begin + size;
+    bool write = false;
+    const auto test = [&](const PageWatch::Write& noted) {
+        if (noted.position > since && base + noted.begin < end && begin < base + noted.end) {
+            if (found == nullptr) {
+                write = true;
+            } else {
+                found->Add(begin, size, base + noted.begin, base + noted.end);
+            }
+        }
+    };
+    for (u32 i = 0; i < entry.count && !write; ++i) {
+        test(entry.writes[i]);
+    }
+    if (entry.folded && !write) {
+        test(entry.fold);
+    }
+    ++watch.answered;
+    if (write) {
+        ++watch.answered_write;
+        return WatchAnswer::Write;
+    }
+    if (page_watch_mode == 2) [[unlikely]] {
+        // The old scan without its limit: every range since `since` that overlaps must be in
+        // the answer (listed, or "may write" without a list).
+        ++watch.verified;
+        const u64 oldest =
+            writer_range_count - (std::min<u64>)(writer_range_count, writer_ranges.size());
+        for (u64 index = writer_range_count; index > oldest; --index) {
+            const WriterRange& range = writer_ranges[(index - 1) % writer_ranges.size()];
+            if (range.position <= since) {
+                break;
+            }
+            if (!(range.begin < end && begin < range.end)) {
+                continue;
+            }
+            const u64 clip_begin = (std::max)(range.begin, begin);
+            const u64 clip_end = (std::min)(range.end, end);
+            bool covered = false;
+            if (found != nullptr) {
+                for (u32 i = 0; i < found->count && !covered; ++i) {
+                    covered = begin + found->ranges[i].first <= clip_begin &&
+                              clip_end <= begin + found->ranges[i].second;
+                }
+            }
+            if (!covered) {
+                if (watch.mismatches++ < 16) {
+                    LOG_WARNING(HW_GPU,
+                                "Writer page watch (EXP122=2): page {:#x} answered no write since "
+                                "{}, but range {:#x}-{:#x} noted at {} overlaps (entry from range "
+                                "{}, position {}; {} listed, folded {})",
+                                page, since, range.begin, range.end, range.position,
+                                entry.start_count, entry.start_position, entry.count,
+                                entry.folded);
+                }
+                break;
+            }
+        }
+    }
+    return WatchAnswer::NoWrite;
+}
+
+GpuSplit::PageWatchStats GpuSplit::GetPageWatchStats() const {
+    if (!page_watch) {
+        return {0, 0, watched_pages, 0, 0, 0};
+    }
+    const PageWatch& watch = *page_watch;
+    return {watch.answered, watch.answered_write, watched_pages,
+            watch.overflows, watch.verified,       watch.mismatches};
 }
 
 void GpuSplit::NoteDispatchWriter() {
