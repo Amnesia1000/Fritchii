@@ -727,14 +727,16 @@ struct State {
                      "source, /s matched/payload differs/unpredicted (by the copy's last read): "
                      "{}; overlays from memory built/s with only the stamped ranged overflow "
                      "queued {:.0f}; QMD reads/s from memory (nothing queued over them) with no "
-                     "unbounded writer queued {:.0f}, with one {:.0f}; acquires/s the feed would "
+                     "unbounded writer queued {:.0f}, with one {:.0f}, GPU-written by then "
+                     "{:.0f}; acquires/s the feed would "
                      "meet through the new sources "
                      "(queued plain/run unlanded/bound): {}; those checked at their landing: {} "
                      "right, {} wrongly met, {} unknown (session {} checked, {} wrongly met); "
                      "acquires/s fed through them: {}",
                      sources_mode, VideoCore::Nx2Debug::Experiment(126), checks,
                      mirrored(Mirror::OverlayFromMemoryOverflow),
-                     mirrored(Mirror::MemoryChecked), mirrored(Mirror::MemoryUnbounded), would,
+                     mirrored(Mirror::MemoryChecked), mirrored(Mirror::MemoryUnbounded),
+                     mirrored(Mirror::MemoryGpuWritten), would,
                      would_checked - would_wrong, would_wrong, would_unknown,
                      session_would_checked, session_would_wrong, through);
         }

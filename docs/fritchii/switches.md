@@ -1751,9 +1751,13 @@ is refused again at 0.
   an overlay from memory passes: mapped, not GPU-written, no inline QMD of it queued or evicted
   (a queued overlay of it would serve the read or set its target past the back), no upload
   shadow block of it queued (it would serve the read), no write stamp over it newer than the
-  back. With EXP127 not 0 (EXP13 3 or 4, EDEN_NX2_FEED_MEMORY_OVERLAY on) the read also asks the
-  overlays' belt (QueuedGuestWriters: no unbounded writer queued; the overflow as above with
-  EXP126 = 1), and with it clean its records get the source "memory, checked"
+  back. With EXP127 not 0 (EXP13 3 or 4, EDEN_NX2_FEED_MEMORY_OVERLAY on) and EXP126 not 0 (at 0
+  ranged writes are stamped and scanned by GPU address only, so a write through another GPU
+  address of the same memory would be missed) the read asks the GPU-written check again (the
+  first one ran before the back's position was loaded: a GPU writer the back ran in between
+  would be at or below it, past the stamps) and the overlays' belt (QueuedGuestWriters: no
+  unbounded writer queued; the overflow as above with EXP126 = 1); with both clean its records
+  get the source "memory, checked"
   (QmdPrediction::Source::MemoryChecked). Exact on the same ground as the overlays from memory:
   the copy reads the QMD at the same signal the back reads it at, so the back reads the same
   bytes unless something outside the stream (the guest CPU, a read-back landing) writes the QMD
@@ -1785,8 +1789,9 @@ predicted queued release" to near 0.
   queued (with EXP127 not 0 these no longer count in the feed line's "built/s with an unbounded
   writer queued");
 - QMD reads a second from memory with nothing queued over them (the EXP13 line's "from memory")
-  whose belt was clean ("memory, checked") and those with an unbounded writer queued (EXP13 3
-  or 4 with EDEN_NX2_FEED_MEMORY_OVERLAY on; 0 otherwise);
+  whose belt was clean ("memory, checked"), those with an unbounded writer queued, and those
+  whose page was GPU-written by the time the back's position was loaded (EXP13 3 or 4 with
+  EDEN_NX2_FEED_MEMORY_OVERLAY on and EXP126 not 0; 0 otherwise);
 - EXP127 = 1: acquires a second (resume polls included) the feed would have met through the new
   sources, by source, as queued plain/run but unlanded/reduction bound (the plain and narrow
   gates as at 2; the bound's check table is not asked), and those decisions checked once their

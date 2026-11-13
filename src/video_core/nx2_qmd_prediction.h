@@ -167,9 +167,11 @@ enum class Mirror : u32 {
     /// (Source::OverlayFromMemoryOverflow; not counted in OverlayFromMemoryUnbounded)
     OverlayFromMemoryOverflow,
     /// EXP127 not 0, of the Memory reads in a feed mode with EDEN_NX2_FEED_MEMORY_OVERLAY on:
-    /// no unbounded writer queued over the QMD (Source::MemoryChecked), or one queued
+    /// no unbounded writer queued over the QMD (Source::MemoryChecked), or one queued, or the
+    /// page GPU-written once the back's position was loaded (asked with EXP126 not 0 only)
     MemoryChecked,
     MemoryUnbounded,
+    MemoryGpuWritten,
     Count,
 };
 void NoteMirror(Mirror event);

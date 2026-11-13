@@ -3093,11 +3093,19 @@ bool KeplerCompute::FrontReadQmd(VideoCommon::GpuSplit& split, u64 address,
         // overlay would serve or set the target, no stamp over it newer than `done`); with the
         // overlays' belt too (no unbounded writer queued; the stamped overflow as at the patch)
         // its records get a source the feed takes with EXP127 = 2. Asked only when it could.
+        // Only with EXP126 not 0: at 0 ranged writes are stamped and scanned by GPU address
+        // only, so a write through another GPU address of the same memory would be missed.
+        // The GPU-written check above ran before `done` was loaded: a GPU writer of these bytes
+        // the back ran in between is at or below `done`, past the stamps and the belt, so it is
+        // asked again now (the read below follows it).
         if (Prediction::FeedSourcesMode() != 0 && Prediction::FeedRequested() &&
-            Prediction::FeedMemoryOverlays()) {
-            if (split.QueuedGuestWriters(done, address, *device, size, {},
-                                         split.OverflowFloorOff())
-                    .unbounded == 0) {
+            Prediction::FeedMemoryOverlays() &&
+            VideoCommon::GpuSplit::OverflowFloorMode() != 0) {
+            if (Nx2MayBeGpuWritten(*device, size)) {
+                Prediction::NoteMirror(Prediction::Mirror::MemoryGpuWritten);
+            } else if (split.QueuedGuestWriters(done, address, *device, size, {},
+                                                split.OverflowFloorOff())
+                           .unbounded == 0) {
                 info.source = Prediction::Source::MemoryChecked;
                 Prediction::NoteMirror(Prediction::Mirror::MemoryChecked);
             } else {
