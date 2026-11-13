@@ -1796,8 +1796,9 @@ predicted queued release" to near 0.
   sources, by source, as queued plain/run but unlanded/reduction bound (the plain and narrow
   gates as at 2; the bound's check table is not asked), and those decisions checked once their
   record landed as the feed's own audit checks its decisions: right, wrongly met (must be 0; the
-  first 8 are logged as errors "QMD feed sources (EXP127=1) audit"), unknown, and session
-  totals;
+  first 8 are logged as errors "QMD feed sources (EXP127=1) audit"), unknown (left the table, or
+  not landed in 2 s), dropped unchecked (the 4,096-decision ring, checked every 256 decisions
+  and at each report, overwrote one not judged yet; should be 0), and session totals;
 - EXP127 = 2: acquires a second fed through the new sources, by source.
 
 ### EXP101

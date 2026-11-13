@@ -516,11 +516,15 @@ struct State {
     std::array<std::array<u64, static_cast<size_t>(Fed::Count)>,
                static_cast<size_t>(Source::Count)>
         would_fed{};
-    std::array<Decision, 1024> would_audit{};
+    /// 4096 (about 8 s of decisions at the market's rate), checked every 256 decisions as well
+    /// as at each report, so none leaves the ring unjudged (they turn unknown after 2 s);
+    /// `would_dropped` counts those that do anyway.
+    std::array<Decision, 4096> would_audit{};
     u64 would_audit_count{};
     u64 would_checked{};
     u64 would_wrong{};
     u64 would_unknown{};
+    u64 would_dropped{};
     u64 session_would_checked{};
     u64 session_would_wrong{};
     u32 would_logged{};
@@ -731,13 +735,13 @@ struct State {
                      "{:.0f}; acquires/s the feed would "
                      "meet through the new sources "
                      "(queued plain/run unlanded/bound): {}; those checked at their landing: {} "
-                     "right, {} wrongly met, {} unknown (session {} checked, {} wrongly met); "
-                     "acquires/s fed through them: {}",
+                     "right, {} wrongly met, {} unknown, {} dropped unchecked (session {} "
+                     "checked, {} wrongly met); acquires/s fed through them: {}",
                      sources_mode, VideoCore::Nx2Debug::Experiment(126), checks,
                      mirrored(Mirror::OverlayFromMemoryOverflow),
                      mirrored(Mirror::MemoryChecked), mirrored(Mirror::MemoryUnbounded),
                      mirrored(Mirror::MemoryGpuWritten), would,
-                     would_checked - would_wrong, would_wrong, would_unknown,
+                     would_checked - would_wrong, would_wrong, would_unknown, would_dropped,
                      session_would_checked, session_would_wrong, through);
         }
         if (MirrorMode()) {
@@ -865,7 +869,7 @@ struct State {
         audit_checked = audit_wrong = audit_unknown = 0;
         back_by_source = {};
         would_fed = {};
-        would_checked = would_wrong = would_unknown = 0;
+        would_checked = would_wrong = would_unknown = would_dropped = 0;
         fed_through = {};
         not_fed_nonsimple = 0;
         fed_memory_overlay = 0;
@@ -1308,7 +1312,12 @@ struct State {
     /// (NewFeedSource). Counted and checked like a decision, nothing else.
     void WouldFeed(Source source, const Decision& decision) {
         ++would_fed[static_cast<size_t>(source)][static_cast<size_t>(decision.kind)];
-        would_audit[would_audit_count++ % would_audit.size()] = decision;
+        if (would_audit_count % 256 == 0) {
+            CheckWouldAudit(decision.when);
+        }
+        Decision& slot = would_audit[would_audit_count++ % would_audit.size()];
+        would_dropped += would_audit_count > would_audit.size() && !slot.checked ? 1 : 0;
+        slot = decision;
     }
 
     /// EXP127 = 1, each report: CheckAudit for WouldFeed's decisions.
