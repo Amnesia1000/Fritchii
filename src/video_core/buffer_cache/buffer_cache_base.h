@@ -525,8 +525,9 @@ public:
     void Nx2NoteListHostWrite(DAddr device_addr, u64 size);
 
     /// fable_memstage_compute_brief 3: GPU-written marks (MarkWrittenBuffer) and the bytes they
-    /// cover, under the cache's lock. Counting only: DispatchCompute, which holds the lock from
-    /// before its fill to its end, takes the difference over a dispatch (its storage binds).
+    /// cover, under the cache's lock, with GPU profile 2 only. Counting only: DispatchCompute,
+    /// which holds the lock from before its fill to its end, takes the difference over a
+    /// dispatch (its storage binds).
     u64 nx2_written_marks{};
     u64 nx2_written_mark_bytes{};
 

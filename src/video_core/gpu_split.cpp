@@ -22,6 +22,7 @@
 
 #include <fmt/format.h>
 
+#include "common/assert.h"
 #include "common/dkb_cpu_trace.h"
 #include "common/logging.h"
 #include "common/nx2_hitch.h"
@@ -1018,6 +1019,16 @@ void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, 
 
 void GpuSplit::MacroWords(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
                           u32 amount, Effect effect) {
+    // Not for the 3D engine: the memory stage applies a Multi entry to its 3D copy as a
+    // multi-method and ignores the Direct bit (memstage_shadow.cpp, Kind::Multi), while the
+    // back calls every word as a Direct write. A 3D engine's words go one MacroWrite each.
+    if (dynamic_cast<const Tegra::Engines::Maxwell3D*>(engine) != nullptr) [[unlikely]] {
+        ASSERT_MSG(false, "GpuSplit::MacroWords is not for the 3D engine");
+        for (u32 i = 0; i < amount; ++i) {
+            MacroWrite(engine, method, words[i], effect);
+        }
+        return;
+    }
     SelectEngine(engine);
     // As MultiMethod, with no segment (a MacroWrite has none), marked Direct.
     u32 pending = amount;

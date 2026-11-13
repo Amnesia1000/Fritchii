@@ -4529,8 +4529,10 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
     if (VideoCommon::GpuSplit::RecordingDispatch()) [[unlikely]] {
         VideoCommon::GpuSplit::Get().RecordDispatchWrite(device_addr, size);
     }
-    ++nx2_written_marks;
-    nx2_written_mark_bytes += size;
+    if (VideoCommon::Nx2Profile::Fine()) [[unlikely]] {
+        ++nx2_written_marks;
+        nx2_written_mark_bytes += size;
+    }
     // FRITCHII_READ_RUNS: the write mark, with the writer its bind set (the "Read writer" lines).
     if (ReadRunStats::g_enabled) [[unlikely]] {
         ReadRunStats::NoteWrite(device_addr, size);

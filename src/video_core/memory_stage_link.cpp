@@ -1703,7 +1703,10 @@ size_t RunBucket(u64 count) noexcept {
 } // Anonymous namespace
 
 void MemoryStageLink::NoteRunShape(s32 channel, u64 entries, u64 launches, u64 ns) noexcept {
-    // GPUMem, once a run: a few relaxed adds.
+    // GPUMem, once a run: a few relaxed adds, with the GPU profile only.
+    if (!Nx2Profile::Enabled()) {
+        return;
+    }
     RunShape& shape = run_shape;
     const size_t slot = channel >= 0 && static_cast<size_t>(channel) < RunChannels - 1
                             ? static_cast<size_t>(channel)
@@ -1935,7 +1938,9 @@ void MemoryStageLink::LogStats() {
                  rate(current.flag_handovers - reported.flag_handovers), served_text, level_text,
                  hashes, current.hash_mismatches - reported.hash_mismatches,
                  RingVerify() ? "on" : "off");
-        LogRunShape(seconds);
+        if (Nx2Profile::Enabled()) {
+            LogRunShape(seconds);
+        }
         // Step 7's window (spec 8.3: the stage's lead; 6.4's counters).
         static constexpr std::array<const char*, WindowBuckets> bucket_names{
             "1", "2-3", "4-7", "8-15", "16-31", "32-63", "64-255", "256+"};

@@ -1084,9 +1084,10 @@ void KeplerCompute::CallMultiMethod(Core::System& system, u32 method, const u32*
 void KeplerCompute::CallMacroWords(Core::System& system, u32 method, const u32* words,
                                    u32 amount) {
     // EXP124 (fable_memstage_compute_brief 4.2). Each word was a last call: with the flush in
-    // place, each flushed itself alone. Here only the last word flushes, and AccelerateInlineWords
-    // writes the words as those calls would have. Every word still goes through CallMethod, so
-    // the registers and the upload's state end as the word calls left them.
+    // place, each flushed itself alone. Here only this entry's last word is a last call (each
+    // MacroWords piece of up to 8,192 words is an entry of its own and ends with one), and
+    // AccelerateInlineWords writes the words as those calls would have. Every word still goes
+    // through CallMethod, so the registers and the upload's state end as the word calls left them.
     if (method != KEPLER_COMPUTE_REG_INDEX(data_upload) || amount == 0 ||
         !upload_state.FlushesInPlace()) {
         EngineInterface::CallMacroWords(system, method, words, amount);
@@ -3219,6 +3220,17 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
     // EXP124 (fable_memstage_compute_brief 4.2): the macro's upload data words go as one entry,
     // sent before any other write it emits and at its end. Read once a call.
     const bool upload_words_entry = VideoCore::Nx2Debug::Experiment(124) != 0;
+    // Sent below at the macro's end; if the macro ends in an exception, sent here so no word is
+    // left for the next macro call (dropped only if sending them fails too).
+    SCOPE_EXIT {
+        if (!fs.macro_upload_words.empty()) [[unlikely]] {
+            try {
+                FrontSendUploadWords(split, fs);
+            } catch (...) {
+                fs.macro_upload_words.clear();
+            }
+        }
+    };
     const auto emit = [&](u32 address, u32 value) {
         if (trace) [[unlikely]] {
             trace_text += fmt::format(" {:x}={:x}", address, value);

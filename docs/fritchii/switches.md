@@ -1563,8 +1563,9 @@ and the verify counters below. Values below 3 change nothing here.
 ### Compute counters (fable_memstage_compute_brief 3)
 
 Counting only, no switch; for one market run with FRITCHII_MEMSTAGE_THREAD=2, AHEAD unlimited
-and EDEN_NX2_GPU_PROFILE=2.
-- "Memory stage runs by channel n s" (THREAD 2, every 10 s after the "Memory stage ring" line):
+and EDEN_NX2_GPU_PROFILE=2. Nothing is counted without the GPU profile.
+- "Memory stage runs by channel n s" (THREAD 2 with EDEN_NX2_GPU_PROFILE, every 10 s after the
+  "Memory stage ring" line):
   GPUMem's level runs by the channel the stage had bound at the run's first entry (0 to 6, then
   "other"): runs a second, entries and compute launches each (0xaf with bit 1, 0xb0 above 1,
   0x107, as the compute front notes dispatch writers), and GPUMem's run time in ms/s (from the
@@ -1594,15 +1595,18 @@ Today the compute macro's emit sends every inline upload data word (KeplerComput
 own Direct MacroWrite: about 457,000 ring entries a second at the Castle Town market, each
 followed by GPUMem as a hard entry, and on the back each a last call that Upload::State flushes
 alone (AccelerateInlineToMemory with 4 bytes). With 1, the words a front macro call emits
-collect and go as one Multi entry marked Direct (GpuSplit::MacroWords; pieces of 8,192 words),
-sent before any other write the macro emits and at its end; after the entry, in this order, the
+collect and go as one Multi entry marked Direct (GpuSplit::MacroWords; pieces of 8,192 words;
+never for the 3D engine, whose Multi entries the memory stage applies without the Direct bit),
+sent before any other write the macro emits and at its end (or when the macro call ends in an
+exception, so none waits for the next call); after the entry, in this order, the
 upload's writer note (FrontNoteWriter: its whole range, as each word noted it) and with EXP13=2
 the copy's batch at the entry's position (FrontPatchOverlays). FrontApply still runs at each
 word (a later register read of the macro sees it). FrontCallMethod's and FrontCallMultiMethod's
 words are unchanged. The memory stage follows the entry as one hard entry (an executable method
 of another engine), as it followed each word. On the back the entry calls
 KeplerCompute::CallMacroWords: every word goes through CallMethod as before (registers end the
-same), but only the last one is a last call, and where the flush writes in place (native
+same), but only each entry's last word is a last call (a batch over 8,192 words is several
+entries, each ending with one), and where the flush writes in place (native
 partial transfers, linear, one line) it goes to AccelerateInlineWords, which writes the words as
 their own calls would have: word by word while a grid placeholder is live (the scan sees x, y
 and z in one write, x alone in a word's) or when the destination is off a 4-byte boundary (the
@@ -1619,7 +1623,8 @@ invalidation drops queries by overlap; the invalidation accumulator is fed word 
 keeps a range per call where one does not extend the last, so a single range could differ).
 Values: 1 = on; 2 = on, and before each one-call piece every word is asked as its own call
 would ask (its translation and the page test); a piece whose words disagree goes word by word.
-GPU profile 2 fine counters: front "upload entries (EXP124)" and "upload entry words"; back
+GPU profile 2 fine counters: front "upload word batches (EXP124)" (one per batch sent; a ring
+entry per 8,192 words of it) and "upload batch words"; back
 "upload pieces in one call", "upload pieces word by word (page may be GPU-written)", "(unmapped
 or sparse)", "upload flushes word by word (grid placeholder live)", "(not word-aligned)",
 "upload pieces checked (EXP124=2)" and "upload pieces whose words disagree (must be 0)" (the

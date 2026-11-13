@@ -1503,8 +1503,9 @@ size_t Process(State& s, u64 position, bool executed) {
     };
     // fable_memstage_compute_brief 3: the compute launches among another engine's methods (as
     // the compute front notes dispatch writers), for the runs by size (counting only).
+    // With the GPU profile only (the line is logged then).
     const auto count_launch = [&](u32 method, u32 argument) {
-        if (s.engine_type == EngineType::KeplerCompute &&
+        if (Nx2Profile::Enabled() && s.engine_type == EngineType::KeplerCompute &&
             ((method == 0xaf && (argument & 2) != 0) ||
              (method == 0xb0 && (argument & 15) > 1) || method == 0x107)) {
             ++s.entry_launches;
@@ -1586,7 +1587,7 @@ size_t Process(State& s, u64 position, bool executed) {
         if (s.engine_copy == nullptr) {
             // Direct: a macro's words (GpuSplit::MacroWords, EXP124), called as a Direct Method.
             other_engine(method, (head & Access::Direct) != 0 || s.engine->execution_mask[method]);
-            if (method == 0xaf || method == 0xb0 || method == 0x107) {
+            if (Nx2Profile::Enabled() && (method == 0xaf || method == 0xb0 || method == 0x107)) {
                 const u32* const words = reinterpret_cast<const u32*>(entry + data);
                 for (u32 i = 0; i < amount; ++i) {
                     count_launch(method, words[i]);

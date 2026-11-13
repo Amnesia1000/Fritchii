@@ -272,7 +272,8 @@ enum class FineCounter : u32 {
     ServedInDispatchMustFlush,
     ServedInDispatchFallback,
     // EXP124 (fable_memstage_compute_brief 4.4): a macro's upload words as one entry.
-    UploadEntries,        ///< Front: uploads sent as one entry (GpuSplit::MacroWords)
+    UploadEntries,        ///< Front: word batches sent (FrontSendUploadWords; GpuSplit::MacroWords
+                          ///< makes one ring entry per 8,192 words of a batch)
     UploadEntryWords,     ///< Front: ... their data words
     InlinePiecesOne,      ///< Back: pieces (a 4 KiB page each) written in one call
     InlinePiecesWritten,  ///< Back: pieces word by word, the page may be GPU-written (or EXP85 off)
@@ -302,7 +303,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(FineCounter::Count)
         "served in a dispatch: FlushRegionForRead", "served in a dispatch: gather",
         "served in a dispatch: single invalidation", "served in a dispatch: InnerInvalidation",
         "served in a dispatch: MustFlushRegion", "served in a dispatch: fallback fill",
-        "upload entries (EXP124)", "upload entry words", "upload pieces in one call",
+        "upload word batches (EXP124)", "upload batch words", "upload pieces in one call",
         "upload pieces word by word (page may be GPU-written)",
         "upload pieces word by word (unmapped or sparse)",
         "upload flushes word by word (grid placeholder live)",
