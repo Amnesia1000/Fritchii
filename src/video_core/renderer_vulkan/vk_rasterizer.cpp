@@ -1251,7 +1251,9 @@ bool RasterizerVulkan::StageFillDraw(VideoCommon::MemStageShadowEngine& copy, bo
         return false; // GPUMem is stopping: the draw is left to the back
     }
     // Join 1 (spec 4.4): a miss leaves the draw to the back, which publishes the facts.
-    if (!mem_stage.LookupFacts(VideoCommon::MemStageShadow::StageProgramKey(copy), stage_facts)) {
+    VideoCommon::MemStageShadow::ProgramId program_id;
+    VideoCommon::MemStageShadow::StageProgramId(copy, program_id);
+    if (!mem_stage.LookupFacts(program_id, stage_facts)) {
         link.NoteLevelDraw(4);
         return false;
     }
@@ -1891,8 +1893,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     // THREAD = 2: the facts table (join 1) learns this pipeline's facts under the stage's key.
     if (ring_on) [[unlikely]] {
         const Profile::FineScope facts_scope{Profile::Zone::RingFacts};
-        mem_stage.PublishFacts(VideoCommon::MemStageShadow::BackProgramKey(*maxwell3d), pipeline,
-                               pipeline->MemFacts(), pipeline->HasDynamicVertexInput());
+        VideoCommon::MemStageShadow::ProgramId program_id;
+        VideoCommon::MemStageShadow::BackProgramId(*maxwell3d, program_id);
+        mem_stage.PublishFacts(program_id, pipeline, pipeline->MemFacts(),
+                               pipeline->HasDynamicVertexInput());
     }
     // FRITCHII_MEMSTAGE_SHADOW (piece 5c): the cache's flags over the fill (compare b); with 3,
     // the fill below and the repack layout read the stage's copy of the engine (CacheInputs on

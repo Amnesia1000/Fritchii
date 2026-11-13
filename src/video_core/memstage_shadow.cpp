@@ -612,8 +612,7 @@ std::string WordName(const SegmentInfo& info, u32 index) {
 /// the back (its facts publish) and again for every fill on GPUMem; both sides use this one
 /// function, so their keys stay equal. The round's rotate brings high bits down, so differences
 /// in the top bits of words do not cancel (a plain xor-multiply lane lost them).
-constexpr size_t ProgramWordCount = 49; ///< the six pipeline slots (48 words), the region
-
+// ProgramWordCount (memstage_shadow.h): the six pipeline slots (48 words), then the region.
 template <typename E>
 void ProgramWords(const E& e, std::array<u64, ProgramWordCount>& words) {
     static_assert(sizeof(e.regs.pipelines) == 48 * sizeof(u64));
@@ -2287,12 +2286,14 @@ u64 BackStateHash(const Maxwell3D& maxwell3d) {
     return StateHash(maxwell3d, &maxwell3d);
 }
 
-u64 BackProgramKey(const Maxwell3D& maxwell3d) {
-    return ProgramKey(maxwell3d);
+void BackProgramId(const Maxwell3D& maxwell3d, ProgramId& out) {
+    ProgramWords(maxwell3d, out.words);
+    out.key = HashProgramWords(out.words);
 }
 
-u64 StageProgramKey(const MemStageShadowEngine& copy) {
-    return ProgramKey(copy);
+void StageProgramId(const MemStageShadowEngine& copy, ProgramId& out) {
+    ProgramWords(copy, out.words);
+    out.key = HashProgramWords(out.words);
 }
 
 void ReadSwitch() {

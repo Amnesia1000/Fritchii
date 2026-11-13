@@ -625,7 +625,10 @@ session after a catch-up could not finish (below; logged).
   registered over a constant buffer write GPUMem made for a later entry" (spec 9.1); "a served
   download over a constant buffer write GPUMem made for a later entry" (on GPU-written bytes). The
   last two need GPUMem's own-write ring, which runs only with the verify on (READ_LOG or
-  RING_VERIFY), so the fps gate measures play without it.
+  RING_VERIFY), so the fps gate measures play without it. Also "facts key collisions" (any ring
+  mode): the facts table's key is a hash of the program registers (the six pipeline slots and the
+  program region), and every entry keeps those registers and compares them on a key match, so
+  two programs under one key are told apart (a miss, the draw is level), never mixed up.
 - EXP104 (the buffer pool, spec 7.5): with the window open GPUMem creates and destroys buffers while
   the back records, so the gate's area load should run with EXP104 on and off (or watch its hitch
   lines). GPUMem has no role in thread_pinning.h: the gate runs it unpinned, and the pinning choice
