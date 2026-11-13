@@ -1067,10 +1067,12 @@ size_t Process(State& s, u64 position, bool executed) {
         case StageTag::DrawLoop: {
             cls = Class::Work;
             if (Copy* const c = Use(s, As3D(words[0]), executed)) {
-                if (static_cast<StageDrawLoop>(words[1]) == StageDrawLoop::FoldFirstInstance) {
+                // The kind is in header bits 40-47; AddLoopInstances' count is the low half of
+                // payload word 1 (the struct's u32 at offset 8, little-endian).
+                if (StageDrawLoopOf(head) == StageDrawLoop::FoldFirstInstance) {
                     c->e->draw_manager.FoldFirstInstance();
                 } else {
-                    c->e->draw_manager.AddLoopInstances(*c->e, static_cast<u32>(words[2]));
+                    c->e->draw_manager.AddLoopInstances(*c->e, static_cast<u32>(words[1]));
                 }
             }
             break;

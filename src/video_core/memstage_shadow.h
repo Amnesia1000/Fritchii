@@ -34,16 +34,18 @@ enum class StageTag : u8 {
     Writes = 2,
     /// Maxwell3D::FinishFrontMacro: [engine, system]. ConsumeSink, then DrawDeferred.
     FinishMacro = 3,
-    /// A draw manager change: [engine, StageDrawLoop, value].
+    /// A draw manager change, StageDrawLoop in header bits 40-47 (StageDrawLoopBits). Payload:
+    /// FoldFirstInstance [engine]; AddLoopInstances [engine, count in the low 32 bits].
     DrawLoop = 4,
     /// Touches no register, no buffer cache state and no game memory the stage reads.
     Pass = 5,
 };
 
-/// StageTag::DrawLoop's payload word 1.
-enum class StageDrawLoop : u64 {
-    FoldFirstInstance = 0, ///< DrawManager::FoldFirstInstance; no value
-    AddLoopInstances = 1,  ///< DrawManager::AddLoopInstances(value)
+/// StageTag::DrawLoop's kind, in header bits 40-47 (the payloads stay as small as the lambdas
+/// they replaced: one word and two).
+enum class StageDrawLoop : u8 {
+    FoldFirstInstance = 0, ///< DrawManager::FoldFirstInstance; payload [engine]
+    AddLoopInstances = 1,  ///< DrawManager::AddLoopInstances(count); payload [engine, count]
 };
 
 /// The bits a tag takes in a Call entry's header.
@@ -53,6 +55,15 @@ enum class StageDrawLoop : u64 {
 
 [[nodiscard]] constexpr StageTag StageTagOf(u64 header) noexcept {
     return static_cast<StageTag>((header >> 32) & 0xff);
+}
+
+/// StageTag::DrawLoop with its kind, for a Call entry's header.
+[[nodiscard]] constexpr u64 StageDrawLoopBits(StageDrawLoop which) noexcept {
+    return StageTagBits(StageTag::DrawLoop) | (u64{static_cast<u8>(which)} << 40);
+}
+
+[[nodiscard]] constexpr StageDrawLoop StageDrawLoopOf(u64 header) noexcept {
+    return static_cast<StageDrawLoop>((header >> 40) & 0xff);
 }
 
 /// Memory stage piece 5b (spec 6.2), FRITCHII_MEMSTAGE_SHADOW=1: the stage's classify, register

@@ -78,28 +78,35 @@ struct Maxwell3D::StageCall {
             engine->FinishFrontMacro(*system);
         }
     };
-    /// StageTag::DrawLoop: [engine, which, value].
-    struct DrawLoop {
+    /// StageTag::DrawLoop, FoldFirstInstance (header bits 40-47): [engine].
+    struct FoldFirstInstance {
         Maxwell3D* engine;
-        VideoCommon::StageDrawLoop which;
-        u64 value;
         void operator()() const {
-            if (which == VideoCommon::StageDrawLoop::FoldFirstInstance) {
-                engine->draw_manager.FoldFirstInstance();
-            } else {
-                engine->draw_manager.AddLoopInstances(*engine, static_cast<u32>(value));
-            }
+            engine->draw_manager.FoldFirstInstance();
+        }
+    };
+    /// StageTag::DrawLoop, AddLoopInstances (header bits 40-47): [engine, count].
+    struct AddLoopInstances {
+        Maxwell3D* engine;
+        u32 count;
+        void operator()() const {
+            engine->draw_manager.AddLoopInstances(*engine, count);
         }
     };
     static constexpr u64 FinishMacroFlags =
         VideoCommon::StageTagBits(VideoCommon::StageTag::FinishMacro);
-    static constexpr u64 DrawLoopFlags =
-        VideoCommon::StageTagBits(VideoCommon::StageTag::DrawLoop);
-    // The words the stage reads (memstage_shadow.cpp).
+    static constexpr u64 FoldFirstInstanceFlags =
+        VideoCommon::StageDrawLoopBits(VideoCommon::StageDrawLoop::FoldFirstInstance);
+    static constexpr u64 AddLoopInstancesFlags =
+        VideoCommon::StageDrawLoopBits(VideoCommon::StageDrawLoop::AddLoopInstances);
+    // The words the stage reads (memstage_shadow.cpp), and ring entries as large as the lambdas
+    // these replaced ([this, &system], [this], [self, count]).
     static void CheckLayout() {
-        static_assert(offsetof(FinishMacro, engine) == 0 && offsetof(FinishMacro, system) == 8);
-        static_assert(offsetof(DrawLoop, engine) == 0 && offsetof(DrawLoop, which) == 8 &&
-                      offsetof(DrawLoop, value) == 16);
+        static_assert(offsetof(FinishMacro, engine) == 0 && offsetof(FinishMacro, system) == 8 &&
+                      sizeof(FinishMacro) == 16);
+        static_assert(offsetof(FoldFirstInstance, engine) == 0 && sizeof(FoldFirstInstance) == 8);
+        static_assert(offsetof(AddLoopInstances, engine) == 0 &&
+                      offsetof(AddLoopInstances, count) == 8 && sizeof(AddLoopInstances) == 16);
     }
 };
 
@@ -2857,12 +2864,10 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
                 // manager then has no loop open and draws this one alone (DrawMode::General).
                 fold_pending = false;
                 if (((fs.regs[MAXWELL3D_REG_INDEX(draw.begin)] >> 26) & 3) == 0) {
-                    split.Defer(StageCall::DrawLoop{this,
-                                                     VideoCommon::StageDrawLoop::FoldFirstInstance,
-                                                     0},
+                    split.Defer(StageCall::FoldFirstInstance{this},
                                 VideoCommon::GpuSplit::Effect::None,
                                 VideoCommon::Nx2FastDrawCount::Neutral() |
-                                    StageCall::DrawLoopFlags);
+                                    StageCall::FoldFirstInstanceFlags);
                     ++fs.oot_stats.folds;
                     static u32 fold_logged{};
                     if (fold_logged++ < 4) {
@@ -3212,9 +3217,8 @@ void Maxwell3D::FlushFoldedInstances(void* engine, u32 count) {
     }
     // As the draw.begin writes: the draw they defer may write anywhere a draw does.
     VideoCommon::GpuSplit::Get().Defer(
-        StageCall::DrawLoop{self, VideoCommon::StageDrawLoop::AddLoopInstances, count},
-        VideoCommon::GpuSplit::Effect::Gpu,
-        VideoCommon::Nx2FastDrawCount::Neutral() | StageCall::DrawLoopFlags);
+        StageCall::AddLoopInstances{self, count}, VideoCommon::GpuSplit::Effect::Gpu,
+        VideoCommon::Nx2FastDrawCount::Neutral() | StageCall::AddLoopInstancesFlags);
 }
 
 bool Maxwell3D::IsPredicateMacro(FrontState& fs, u32 method) {
