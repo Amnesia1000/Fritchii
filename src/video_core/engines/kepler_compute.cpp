@@ -150,6 +150,18 @@ struct FrontQmdMirror {
     };
     static constexpr size_t MaxTrials = 4096;
     std::unordered_map<GPUVAddr, Trial> trials;
+    /// The EXP126 value the table was kept for: any change (into or out of 2) clears it, so a
+    /// later 2 starts from 1's copy and this one being the same.
+    int trial_floor_mode{};
+    /// Reads EXP126 for a site; returns it.
+    int FloorMode() {
+        const int mode = VideoCommon::GpuSplit::OverflowFloorMode();
+        if (mode != trial_floor_mode) {
+            trial_floor_mode = mode;
+            trials.clear();
+        }
+        return mode;
+    }
     Trial* FindTrial(const void* space, GPUVAddr address) {
         const auto it = trials.find(address);
         return it != trials.end() && it->second.space == space ? &it->second : nullptr;
@@ -499,7 +511,7 @@ std::array<bool, 2> PatchHolders(VideoCommon::GpuSplit& split, const MemoryManag
         }
         return split.WriteStamp(*device, bytes, address, tag) <= held_position;
     };
-    const bool trial_mode = VideoCommon::GpuSplit::OverflowFloorMode() == 2;
+    const bool trial_mode = mirror.FloorMode() == 2;
     // As still_holds, with the stamps EXP126 = 1 answers.
     const auto still_holds_at_1 = [&](GPUVAddr address, u64 bytes, u64 held_position) {
         const auto device = memory.GpuToCpuAddress(address);
@@ -2877,7 +2889,7 @@ bool KeplerCompute::FrontReadQmd(VideoCommon::GpuSplit& split, u64 address,
     // 1 gives and its overlay and shadow block (FrontQmdMirror::Trial where they differ from this
     // copy's). Compared with what this read gives, once it has it, where 1 serves something else
     // or the same without the wait.
-    const int floor_mode = VideoCommon::GpuSplit::OverflowFloorMode();
+    const int floor_mode = mirror.FloorMode();
     enum class Served : u8 { Wait, Memory, Overlay, TrialOverlay, Shadow, TrialShadow, Unknown };
     Served served_at_1 = Served::Wait;
     NativeQmdScheduler::Descriptor words_at_1;
@@ -3125,7 +3137,7 @@ void KeplerCompute::FrontPatchOverlays(VideoCommon::GpuSplit& split, FrontState&
         }
         // The QMD wait floor counters (fable_qmd_wait_brief piece 1): each outcome.
         using Outcome = VideoCommon::QmdPatchOutcome;
-        const int floor_mode = VideoCommon::GpuSplit::OverflowFloorMode();
+        const int floor_mode = mirror.FloorMode();
         const bool trial_mode = floor_mode == 2;
         const GPUVAddr from = (std::max)(first, block_address);
         const GPUVAddr to = (std::min)(last, block_address + size);

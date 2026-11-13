@@ -1581,10 +1581,12 @@ overflow floor covered the dropped ones; the newest 256 had that hole already). 
 function may remap the range, or for sparse pages, the write counts for every address instead
 (the stamp floor) until the back ran it. When EXP126 turns on, the ranged writes sent before were
 not stamped by device address: with 1 they count for every address until the back ran them.
-(With 2 the device stamps are taken too, for the trial; they can only make a stamp newer.)
 The ring scans (QueuedGuestWriters, ExactWriterCheck) still compare GPU addresses only; they
 keep the overflow, so their answers are as before.
-With 2 everything behaves as 0, and the QMD copy follows what 1's copy would hold where it
+With 2 WriteStamp keeps the overflow as with 0, but the device stamps are on as with 1, so its
+answers are the same as 0's or newer (never served earlier than 0; a block collision can add a
+wait). The table below is cleared whenever EXP126 changes, so a switch into 2 starts from 1's copy
+and this one being the same. The QMD copy follows what 1's copy would hold where it
 differs, in a trial table (never served): the overlay 1 makes from memory at a patch nothing but
 the overflow refused, and an overlay or upload shadow block that takes a patch at 1 only (a
 holder still_holds refused for the overflow alone), each patched further as 1's PatchHolders
@@ -1594,7 +1596,8 @@ this copy serves or the same without the wait, compares the 256 bytes with what 
 reads (after its wait, if it waits). "differed" on the line below must be 0 (the first 16 are
 logged as errors with the word and the source). A change 1 would make that the table does not
 follow (a holder 1 drops as newer than a patch, an overlay this copy makes where 1 keeps its
-own) marks the block: its reads are counted as not compared until the back passes it; entries
+own) marks the block: its reads are counted as not compared until the back passes it (every read
+of a marked block, also those 1 would have waited for, so the count overstates); entries
 dropped at the table's limit (4,096 blocks, only after those the back passed) count as lost.
 Not followed at all: the overlay table's capacity at 1 (its evictions and evicted floor). To
 judge 1: profile_toggle.py on EXP126,
