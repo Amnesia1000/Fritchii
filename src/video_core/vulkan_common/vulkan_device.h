@@ -274,6 +274,16 @@ public:
         return allocator;
     }
 
+    /// FRITCHII_MEMSTAGE_SPLIT_ALLOC (boot, default on): the buffer cache's own VMA allocator, or
+    /// the main one when the split is off.
+    VmaAllocator GetBufferAllocator() const {
+        return buffer_allocator != nullptr ? buffer_allocator : allocator;
+    }
+
+    [[nodiscard]] bool HasSplitAllocators() const noexcept {
+        return buffer_allocator != nullptr;
+    }
+
     /// EDEN_NX2_ASYNC_IMAGE_FREE (boot, default on; =0 off): the allocator was made without
     /// VMA_ALLOCATOR_CREATE_EXTERNALLY_SYNCHRONIZED_BIT, so VMA locks internally and images may be
     /// destroyed off the GPU thread (TextureCacheRuntime's image free queue).
@@ -289,8 +299,9 @@ public:
     };
     static constexpr VkDeviceSize SeparatePoolBlockSize = 16ULL << 20;
 
-    /// The pool of that kind for a memory type, created on first use (null if that failed).
-    VmaPool GetSeparatePool(SeparatePool kind, u32 memory_type) const;
+    /// The pool of that kind for a memory type in `owner` (GetAllocator or GetBufferAllocator),
+    /// created on first use (null if that failed).
+    VmaPool GetSeparatePool(VmaAllocator owner, SeparatePool kind, u32 memory_type) const;
 
     /// Returns the logical device.
     const vk::Device& GetLogical() const {
@@ -1376,9 +1387,11 @@ private:
 private:
     VkInstance instance;         ///< Vulkan instance.
     VmaAllocator allocator{};    ///< VMA allocator.
+    VmaAllocator buffer_allocator{}; ///< See GetBufferAllocator; null when not split.
     bool allocator_thread_safe{}; ///< See IsAllocatorThreadSafe.
     mutable std::mutex separate_pools_mutex;
-    mutable std::array<std::array<VmaPool, VK_MAX_MEMORY_TYPES>, 2> separate_pools{};
+    /// [allocator: main, buffers][SeparatePool][memory type]
+    mutable std::array<std::array<std::array<VmaPool, VK_MAX_MEMORY_TYPES>, 2>, 2> separate_pools{};
     vk::DeviceDispatch dld;      ///< Device function pointers.
     vk::PhysicalDevice physical; ///< Physical device.
     vk::Device logical;          ///< Logical device.

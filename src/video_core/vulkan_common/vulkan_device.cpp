@@ -431,6 +431,25 @@ u64 AllocatedUsage(VkDeviceSize driver_usage, const VmaBudget& vma_budget) {
     return driver_usage - (std::min)(driver_usage, unused);
 }
 
+// vmaGetHeapBudgets of the main allocator, with the buffer allocator's blocks and allocations
+// (FRITCHII_MEMSTAGE_SPLIT_ALLOC) added to the statistics: the unused space in either allocator's
+// blocks is slack. usage and budget stay the main allocator's (the driver's, for the process).
+void GetHeapBudgets(VmaAllocator allocator, VmaAllocator buffer_allocator,
+                    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS>& budgets) {
+    vmaGetHeapBudgets(allocator, budgets.data());
+    if (buffer_allocator == nullptr) {
+        return;
+    }
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> buffers{};
+    vmaGetHeapBudgets(buffer_allocator, buffers.data());
+    for (size_t heap = 0; heap < budgets.size(); ++heap) {
+        budgets[heap].statistics.blockCount += buffers[heap].statistics.blockCount;
+        budgets[heap].statistics.allocationCount += buffers[heap].statistics.allocationCount;
+        budgets[heap].statistics.blockBytes += buffers[heap].statistics.blockBytes;
+        budgets[heap].statistics.allocationBytes += buffers[heap].statistics.allocationBytes;
+    }
+}
+
 /// AMD GPUs before RDNA3 have no matrix units. AMD's driver still lists 16x16x16 float16
 /// cooperative matrix shapes on RDNA2 and then crashes building the HMMA compute pipelines
 /// (RX 6700 XT, driver 2.0.353, amdvlk64.dll+0x2f1c963 during the boot pipeline build).
@@ -953,6 +972,23 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
 
     vk::Check(vmaCreateAllocator(&allocator_info, &allocator));
 
+    // FRITCHII_MEMSTAGE_SPLIT_ALLOC (boot, default on; =0 off): a second allocator, same settings,
+    // for the buffer cache runtime and its staging pool (the memory stage's design, 2.4 and build
+    // step 3). VMA allocators here are externally synchronized, so once the buffer cache runs on a
+    // thread of its own it cannot share the back's. Images stay on the main one. Creating it takes
+    // no memory: VMA allocates blocks on first use, and both see the same driver budget (with
+    // VK_EXT_memory_budget the usage they compare against it is the whole process's).
+    const bool split_allocators = [] {
+        const char* value = std::getenv("FRITCHII_MEMSTAGE_SPLIT_ALLOC");
+        return value == nullptr || value[0] == '\0' || value[0] != '0';
+    }();
+    if (split_allocators) {
+        if (vmaCreateAllocator(&allocator_info, &buffer_allocator) != VK_SUCCESS) {
+            LOG_WARNING(Render_Vulkan, "Buffer VMA allocator could not be made; one allocator");
+            buffer_allocator = nullptr;
+        }
+    }
+
     owns_static_pipeline_cache = surface != VkSurfaceKHR{};
     LoadStaticPipelineCache();
 
@@ -968,19 +1004,29 @@ Device::~Device() {
 #endif
     SaveStaticPipelineCache();
     ShutdownGPULogging();
-    for (auto& pools : separate_pools) {
-        for (VmaPool pool : pools) {
-            if (pool != VK_NULL_HANDLE) {
-                vmaDestroyPool(allocator, pool);
+    // Everything allocated from either allocator (the renderer's caches) is gone by now.
+    const std::array<VmaAllocator, 2> owners{allocator, buffer_allocator};
+    for (size_t owner = 0; owner < owners.size(); ++owner) {
+        for (auto& pools : separate_pools[owner]) {
+            for (VmaPool pool : pools) {
+                if (pool != VK_NULL_HANDLE) {
+                    vmaDestroyPool(owners[owner], pool);
+                }
             }
         }
+    }
+    if (buffer_allocator != nullptr) {
+        vmaDestroyAllocator(buffer_allocator);
     }
     vmaDestroyAllocator(allocator);
 }
 
-VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type) const {
+VmaPool Device::GetSeparatePool(VmaAllocator owner, SeparatePool kind, u32 memory_type) const {
     std::scoped_lock lk{separate_pools_mutex};
-    VmaPool& pool = separate_pools[static_cast<u32>(kind)][memory_type];
+    // Each allocator has its own pools: a pool belongs to the allocator that made it.
+    const size_t owner_index = buffer_allocator != nullptr && owner == buffer_allocator ? 1 : 0;
+    owner = owner_index == 1 ? buffer_allocator : allocator;
+    VmaPool& pool = separate_pools[owner_index][static_cast<u32>(kind)][memory_type];
     if (pool == VK_NULL_HANDLE) {
         const VmaPoolCreateInfo ci{
             .memoryTypeIndex = memory_type,
@@ -992,7 +1038,7 @@ VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type) const {
             .minAllocationAlignment = 0,
             .pMemoryAllocateNext = nullptr,
         };
-        if (vmaCreatePool(allocator, &ci, &pool) != VK_SUCCESS) {
+        if (vmaCreatePool(owner, &ci, &pool) != VK_SUCCESS) {
             pool = VK_NULL_HANDLE;
         }
     }
@@ -2143,7 +2189,7 @@ u64 Device::QueryDeviceMemoryUsage() const {
     physical.GetMemoryProperties(&budget);
     std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> heap_budgets{};
     if (allocator != nullptr) {
-        vmaGetHeapBudgets(allocator, heap_budgets.data());
+        GetHeapBudgets(allocator, buffer_allocator, heap_budgets);
     }
     u64 result{};
     for (const size_t heap : valid_heap_memory) {
@@ -2157,7 +2203,7 @@ u64 Device::GetDeviceMemorySlack() const {
         return 0;
     }
     std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> heap_budgets{};
-    vmaGetHeapBudgets(allocator, heap_budgets.data());
+    GetHeapBudgets(allocator, buffer_allocator, heap_budgets);
     const VmaStatistics& statistics = heap_budgets[main_heap].statistics;
     return statistics.blockBytes - (std::min)(statistics.blockBytes, statistics.allocationBytes);
 }
@@ -2171,7 +2217,7 @@ u64 Device::GetDeviceMemoryBudget() const {
     physical.GetMemoryProperties(&budget);
     std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> heap_budgets{};
     if (allocator != nullptr) {
-        vmaGetHeapBudgets(allocator, heap_budgets.data());
+        GetHeapBudgets(allocator, buffer_allocator, heap_budgets);
     }
     // Only the main heap's budget: summing every heap's counted VRAM twice on AMD (an 8 GB card
     // reported 8.5 GB) and kept the collector's thresholds above the heap the images fill. What
