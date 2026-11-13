@@ -1074,8 +1074,10 @@ void GpuSplit::ReportQmdFloor() {
              "(writer found, older or unbounded only, nothing): patches {}/{}/{}, reads "
              "{}/{}/{}; macro DMA read waits {:.0f}/s, {:.0f}/s on the overflow ({:.0f} words "
              "each); ranged writes stamped by device address {:.0f}/s, {:.0f}/s counted for every "
-             "address instead; trial (EXP126=2): {} reads compared from memory, {} from a trial "
-             "overlay, {} differed, {} trial overlays built, {} not compared",
+             "address instead; trial (EXP126=2): reads where 1 serves otherwise compared, 1 "
+             "serving guest memory {}, an overlay {}, an upload shadow block {}; {} differed; {} "
+             "trial overlays and blocks built; {} reads not compared (1's copy not followed), {} "
+             "trial entries lost",
              mode, rate(s.overflows), MaxRangedWrites(),
              rate(s.qmd_reads), rate(s.reads_floor_up),
              s.reads_floor_up != 0 ? static_cast<double>(s.floor_words) /
@@ -1093,8 +1095,8 @@ void GpuSplit::ReportQmdFloor() {
                                              static_cast<double>(s.dma_overflow_waits)
                                        : 0.0,
              rate(s.device_stamped), rate(s.device_floors), s.trial_compared[0],
-             s.trial_compared[1], s.trial_differed, s.trial_built,
-             s.trial_skipped);
+             s.trial_compared[1], s.trial_compared[2], s.trial_differed, s.trial_built,
+             s.trial_skipped, s.trial_lost);
     if (s.trial_differed != 0) {
         LOG_ERROR(HW_GPU,
                   "QMD wait floor (EXP126=2): {} QMD reads differed from what EXP126=1 would "

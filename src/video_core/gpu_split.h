@@ -1134,22 +1134,26 @@ public:
     [[nodiscard]] static bool OverflowFloorOff() {
         return OverflowFloorMode() == 1;
     }
-    /// EXP126 = 2: a QMD read today waits for compared with what 1 would have served
-    /// (`overlay`: the trial overlay a patch would have made, else guest memory read before the
-    /// wait) once the wait is over; `differed`: the 256 bytes were not the same (must stay 0).
-    void NoteQmdTrial(bool overlay, bool differed) {
-        ++floor_stats.trial_compared[overlay ? 1 : 0];
+    /// EXP126 = 2: a QMD read where 1 would have served something else, or without the wait,
+    /// compared with what this copy read (`kind`: what 1 served, 0 guest memory, 1 an overlay,
+    /// 2 an upload shadow block); `differed`: the 256 bytes were not the same (must stay 0).
+    void NoteQmdTrial(u8 kind, bool differed) {
+        ++floor_stats.trial_compared[kind];
         if (differed) {
             ++floor_stats.trial_differed;
         }
     }
-    /// EXP126 = 2: a patch nothing but the overflow refused built a trial overlay (not served).
+    /// EXP126 = 2: 1's copy would hold a different overlay or shadow block (a trial one).
     void NoteQmdTrialBuilt() {
         ++floor_stats.trial_built;
     }
-    /// EXP126 = 2: a read 1 would have served not compared (an upload shadow of it is queued).
+    /// EXP126 = 2: a read of a block 1 changed in a way not followed: not compared.
     void NoteQmdTrialSkipped() {
         ++floor_stats.trial_skipped;
+    }
+    /// EXP126 = 2: trial entries the back had not passed dropped at the table's limit.
+    void NoteQmdTrialLost(u64 count) {
+        floor_stats.trial_lost += count;
     }
     void NoteQmdPatch(QmdPatchOutcome outcome) {
         ++floor_stats.patches[static_cast<size_t>(outcome)];
@@ -1692,12 +1696,13 @@ private:
         /// (a queued function may remap, sparse) and count for every address instead.
         u64 device_stamped;
         u64 device_floors;
-        /// EXP126 = 2: reads compared (from memory, from a trial overlay), those that differed,
-        /// trial overlays built, reads not compared.
-        std::array<u64, 2> trial_compared;
+        /// EXP126 = 2: reads compared (1 serving memory, an overlay, a shadow block), those that
+        /// differed, trial overlays and blocks built, reads not compared, entries lost.
+        std::array<u64, 3> trial_compared;
         u64 trial_differed;
         u64 trial_built;
         u64 trial_skipped;
+        u64 trial_lost;
     };
     FloorStats floor_stats{};
     std::chrono::steady_clock::time_point floor_since{};

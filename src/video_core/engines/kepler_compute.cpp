@@ -131,31 +131,49 @@ struct FrontQmdMirror {
     static constexpr size_t MaxShadows = 64;
     static constexpr u64 ShadowBytes = 4096;
 
-    /// EXP126 = 2 (fable_qmd_wait_brief 4.3): the overlay from memory EXP126 = 1 would have made
-    /// at a patch nothing but the ranged overflow refused, kept aside (never served); a read that
-    /// waits today compares it with what it reads after the wait. One slot per 256-byte block,
-    /// direct mapped: a lost one only means fewer comparisons.
+    /// EXP126 = 2 (fable_qmd_wait_brief 4.3): where EXP126 = 1's copy would hold something else
+    /// for a 256-byte block than this one, what it would hold (never served; reads compare it):
+    /// an overlay (from memory at a patch nothing but the overflow refused, or a holder's words
+    /// with a patch only 1 would have taken), and the block of an upload shadow (a patch only 1
+    /// would have taken). Each stands for this copy's own while it is at least as new. A change
+    /// 1 would make that is not followed (stream order crossed, an overlay 1 would not have
+    /// made) marks the block unknown until the back passes it: its reads are not compared.
     struct Trial {
         const void* space;
-        GPUVAddr address;
-        u64 position; ///< The patch's; 0 = empty
-        NativeQmdScheduler::Descriptor words;
+        u64 overlay_position; ///< 0: none (1 holds what this copy holds)
+        u64 shadow_position;  ///< 0: none
+        u64 shadow_id;        ///< The upload shadow whose block it is
+        u64 unknown_until;
+        bool overlay_inline;  ///< The overlay is an inline QMD's (patched)
+        NativeQmdScheduler::Descriptor overlay_words;
+        NativeQmdScheduler::Descriptor shadow_words;
     };
-    static constexpr size_t MaxTrials = 64;
-    std::array<Trial, MaxTrials> trials{};
-    Trial& TrialSlot(GPUVAddr address) {
-        return trials[static_cast<size_t>(address / BlockBytes) % MaxTrials];
+    static constexpr size_t MaxTrials = 4096;
+    std::unordered_map<GPUVAddr, Trial> trials;
+    Trial* FindTrial(const void* space, GPUVAddr address) {
+        const auto it = trials.find(address);
+        return it != trials.end() && it->second.space == space ? &it->second : nullptr;
     }
-    const Trial* FindTrial(const void* space, GPUVAddr address) const {
-        const Trial& trial = trials[static_cast<size_t>(address / BlockBytes) % MaxTrials];
-        return trial.position != 0 && trial.space == space && trial.address == address ? &trial
-                                                                                       : nullptr;
-    }
-    void DropTrial(const void* space, GPUVAddr address) {
-        Trial& trial = TrialSlot(address);
-        if (trial.space == space && trial.address == address) {
-            trial.position = 0;
+    /// The block's entry, made if needed; `lost`: queued entries dropped to make room.
+    Trial& TrialFor(const void* space, GPUVAddr address, u64 done, u64& lost) {
+        if (trials.size() >= MaxTrials && trials.find(address) == trials.end()) {
+            // Entries the back has run past change nothing any more.
+            std::erase_if(trials, [done](const auto& entry) {
+                const Trial& trial = entry.second;
+                return trial.overlay_position <= done && trial.shadow_position <= done &&
+                       trial.unknown_until <= done;
+            });
+            if (trials.size() >= MaxTrials) {
+                lost += trials.size();
+                trials.clear();
+            }
         }
+        Trial& trial = trials[address];
+        if (trial.space != space) {
+            trial = Trial{};
+            trial.space = space;
+        }
+        return trial;
     }
 
     FrontQmdMirror() {
@@ -316,9 +334,7 @@ struct FrontQmdMirror {
             shadow.id = 0;
             shadow.position = 0;
         }
-        for (Trial& trial : trials) {
-            trial.position = 0;
-        }
+        trials.clear();
         evicted = 0;
         reads.clear();
     }
@@ -387,15 +403,91 @@ std::string ProbeFrontQmd(u64 qmd) {
     return text;
 }
 
+// EXP126 = 2 (fable_qmd_wait_brief 4.3): PatchHolders for the trial blocks and overlays that
+// stand for 1's copy's own (FrontQmdMirror::Trial), as 1's PatchHolders would treat them. Those
+// made by this very write are left alone. `patched_at_1` gets the blocks 1 would have taken.
+void PatchTrials(VideoCommon::GpuSplit& split, const MemoryManager& memory, GPUVAddr first,
+                 GPUVAddr last, const u8* data, u64 position, u64 tag, u64 done,
+                 std::array<bool, 2>& patched_at_1) {
+    auto& mirror = g_front_qmd;
+    constexpr u64 block_bytes = FrontQmdMirror::BlockBytes;
+    const GPUVAddr first_block = first & ~GPUVAddr{block_bytes - 1};
+    const auto holds_at_1 = [&](GPUVAddr address, u64 held_position) {
+        const auto device = memory.GpuToCpuAddress(address);
+        if (!device || held_position <= done) {
+            return false;
+        }
+        return split.WriteStampWhy(*device, block_bytes, address, tag).floorless <=
+               held_position;
+    };
+    for (GPUVAddr block_address = first_block; block_address < last;
+         block_address += block_bytes) {
+        FrontQmdMirror::Trial* const trial = mirror.FindTrial(&memory, block_address);
+        if (trial == nullptr) {
+            continue;
+        }
+        const GPUVAddr from = (std::max)(first, block_address);
+        const GPUVAddr to = (std::min)(last, block_address + block_bytes);
+        const auto patch = [&](NativeQmdScheduler::Descriptor& words) {
+            std::memcpy(reinterpret_cast<u8*>(words.data()) + (from - block_address),
+                        data + (from - first), to - from);
+        };
+        const u64 index = (block_address - first_block) / block_bytes;
+        // The upload shadow's block, while its shadow lives (a new upload over it replaces the
+        // shadow in both copies) and is not newer than the trial block.
+        size_t block = 0;
+        const FrontQmdMirror::Shadow* const shadow =
+            mirror.FindShadow(&memory, block_address, block);
+        const bool shadow_live = trial->shadow_position != 0 && shadow != nullptr &&
+                                 shadow->id == trial->shadow_id &&
+                                 trial->shadow_position >= shadow->block_position[block];
+        if (shadow_live && trial->shadow_position != position && trial->shadow_position > done) {
+            if (trial->shadow_position > position) {
+                // 1 drops it (stream order crossed): not followed.
+                trial->unknown_until = (std::max)(trial->unknown_until, trial->shadow_position);
+                trial->shadow_position = 0;
+            } else if (holds_at_1(block_address, trial->shadow_position)) {
+                patch(trial->shadow_words);
+                trial->shadow_position = position;
+                if (index < patched_at_1.size()) {
+                    patched_at_1[index] = true;
+                }
+            }
+        }
+        // The overlay, while it is at least as new as this copy's.
+        const FrontQmdMirror::Overlay* const overlay = mirror.FindOverlay(&memory, block_address);
+        const bool overlay_live =
+            trial->overlay_position != 0 &&
+            trial->overlay_position >= (overlay != nullptr ? overlay->position : 0);
+        if (overlay_live && trial->overlay_position != position &&
+            trial->overlay_position > done) {
+            if (trial->overlay_position > position) {
+                // 1 drops it (and an inline QMD's raises its evicted floor): not followed.
+                trial->unknown_until = (std::max)(trial->unknown_until, trial->overlay_position);
+                trial->overlay_position = 0;
+            } else if (holds_at_1(block_address, trial->overlay_position)) {
+                patch(trial->overlay_words);
+                trial->overlay_position = position;
+                if (index < patched_at_1.size()) {
+                    patched_at_1[index] = true;
+                }
+            }
+        }
+    }
+}
+
 // The game patches the release words of QMDs already written (native_qmd.h: "The SDK patches
 // release payloads while a scheduled QMD is waiting"): an overlay or shadow block that still
 // holds its bytes (nothing but this write since it took them) takes the new ones and counts as
 // written at `position`, so a read takes it instead of waiting. One that holds newer bytes than
 // this write (stream order crossed) is dropped: the read then waits rather than serving a mix.
 // Returns which of the (at most two) 256-byte blocks from first's were taken.
+// EXP126 = 2: the same for EXP126 = 1's copy (FrontQmdMirror::Trial): `patched_at_1` gets the
+// blocks it would have taken.
 std::array<bool, 2> PatchHolders(VideoCommon::GpuSplit& split, const MemoryManager& memory,
                                  GPUVAddr first, GPUVAddr last, const u8* data, u64 position,
-                                 u64 tag, const FrontQmdMirror::Shadow* own, u64 done) {
+                                 u64 tag, const FrontQmdMirror::Shadow* own, u64 done,
+                                 std::array<bool, 2>& patched_at_1) {
     namespace Prediction = VideoCommon::QmdPrediction;
     auto& mirror = g_front_qmd;
     constexpr u64 block_bytes = FrontQmdMirror::BlockBytes;
@@ -407,16 +499,53 @@ std::array<bool, 2> PatchHolders(VideoCommon::GpuSplit& split, const MemoryManag
         }
         return split.WriteStamp(*device, bytes, address, tag) <= held_position;
     };
+    const bool trial_mode = VideoCommon::GpuSplit::OverflowFloorMode() == 2;
+    // As still_holds, with the stamps EXP126 = 1 answers.
+    const auto still_holds_at_1 = [&](GPUVAddr address, u64 bytes, u64 held_position) {
+        const auto device = memory.GpuToCpuAddress(address);
+        if (!device || held_position <= done) {
+            return false;
+        }
+        return split.WriteStampWhy(*device, bytes, address, tag).floorless <= held_position;
+    };
+    const auto trial_for = [&](GPUVAddr address) -> FrontQmdMirror::Trial& {
+        u64 lost = 0;
+        FrontQmdMirror::Trial& trial = mirror.TrialFor(&memory, address, done, lost);
+        if (lost != 0) {
+            split.NoteQmdTrialLost(lost);
+        }
+        return trial;
+    };
     std::array<bool, 2> block_patched{};
+    patched_at_1 = {};
     const GPUVAddr first_block = first & ~GPUVAddr{block_bytes - 1};
-    const auto note_patched = [&](GPUVAddr address, u64 bytes) {
-        for (u64 block = 0; block < block_patched.size(); ++block) {
+    const auto note_patched_in = [&](std::array<bool, 2>& patched, GPUVAddr address, u64 bytes) {
+        for (u64 block = 0; block < patched.size(); ++block) {
             const GPUVAddr block_address = first_block + block * block_bytes;
             if (address <= block_address && block_address + block_bytes <= address + bytes) {
-                block_patched[block] = true;
+                patched[block] = true;
             }
         }
     };
+    const auto note_patched = [&](GPUVAddr address, u64 bytes) {
+        note_patched_in(block_patched, address, bytes);
+    };
+    // EXP126 = 2: whether 1's copy holds a trial block or overlay instead of this one's.
+    const auto shadow_superseded = [&](const FrontQmdMirror::Shadow& shadow, GPUVAddr address,
+                                       u64 block_position) {
+        const FrontQmdMirror::Trial* const trial = mirror.FindTrial(&memory, address);
+        return trial != nullptr && trial->shadow_position != 0 &&
+               trial->shadow_id == shadow.id && trial->shadow_position >= block_position;
+    };
+    const auto overlay_superseded = [&](GPUVAddr address, u64 overlay_position) {
+        const FrontQmdMirror::Trial* const trial = mirror.FindTrial(&memory, address);
+        return trial != nullptr && trial->overlay_position != 0 &&
+               trial->overlay_position >= overlay_position;
+    };
+    if (trial_mode) {
+        // First, while this copy's holders are as they were: which trial ones stand for 1's.
+        PatchTrials(split, memory, first, last, data, position, tag, done, patched_at_1);
+    }
     for (FrontQmdMirror::Shadow& shadow : mirror.shadows) {
         if (&shadow == own || shadow.id == 0 || shadow.position == 0 ||
             shadow.space != &memory || last <= shadow.address ||
@@ -431,19 +560,41 @@ std::array<bool, 2> PatchHolders(VideoCommon::GpuSplit& split, const MemoryManag
             if (block_address + block_bytes > shadow.address + shadow.filled) {
                 continue;
             }
+            // EXP126 = 2: 1's copy holds a trial block here instead (handled below).
+            const bool superseded =
+                trial_mode &&
+                shadow_superseded(shadow, block_address, shadow.block_position[block]);
             if (shadow.block_position[block] > position) {
                 shadow.block_position[block] = 0; // Newer than this write: unknown mix
                 continue;
             }
-            if (!still_holds(block_address, block_bytes, shadow.block_position[block])) {
-                continue;
-            }
             const GPUVAddr from = (std::max)(first, block_address);
             const GPUVAddr to = (std::min)(last, block_address + block_bytes);
+            if (!still_holds(block_address, block_bytes, shadow.block_position[block])) {
+                if (trial_mode && !superseded &&
+                    still_holds_at_1(block_address, block_bytes, shadow.block_position[block])) {
+                    // Only the ranged overflow keeps it: 1 takes the patch.
+                    FrontQmdMirror::Trial& trial = trial_for(block_address);
+                    std::memcpy(trial.shadow_words.data(),
+                                shadow.bytes.data() + (block_address - shadow.address),
+                                block_bytes);
+                    std::memcpy(reinterpret_cast<u8*>(trial.shadow_words.data()) +
+                                    (from - block_address),
+                                data + (from - first), to - from);
+                    trial.shadow_position = position;
+                    trial.shadow_id = shadow.id;
+                    note_patched_in(patched_at_1, block_address, block_bytes);
+                    split.NoteQmdTrialBuilt();
+                }
+                continue;
+            }
             std::memcpy(shadow.bytes.data() + (from - shadow.address), data + (from - first),
                         to - from);
             FrontQmdMirror::StampBlock(shadow, static_cast<size_t>(block), position);
             note_patched(block_address, block_bytes);
+            if (trial_mode && !superseded) {
+                note_patched_in(patched_at_1, block_address, block_bytes);
+            }
             Prediction::NoteMirror(Prediction::Mirror::ShadowPatched);
         }
         shadow.last_use = ++mirror.use_clock;
@@ -454,6 +605,9 @@ std::array<bool, 2> PatchHolders(VideoCommon::GpuSplit& split, const MemoryManag
             overlay.address + size <= first || overlay.position <= done) {
             continue;
         }
+        // EXP126 = 2: 1's copy holds a trial overlay here instead (handled below).
+        const bool superseded =
+            trial_mode && overlay_superseded(overlay.address, overlay.position);
         if (overlay.position > position) {
             // Newer than this write: unknown mix. A queued inline QMD dropped keeps its floor.
             if (overlay.inline_qmd) {
@@ -462,16 +616,32 @@ std::array<bool, 2> PatchHolders(VideoCommon::GpuSplit& split, const MemoryManag
             overlay.position = 0;
             continue;
         }
-        if (!still_holds(overlay.address, size, overlay.position)) {
-            continue; // Something else wrote it since: the read waits
-        }
         const GPUVAddr from = (std::max)(first, overlay.address);
         const GPUVAddr to = (std::min)(last, overlay.address + size);
+        if (!still_holds(overlay.address, size, overlay.position)) {
+            if (trial_mode && !superseded &&
+                still_holds_at_1(overlay.address, size, overlay.position)) {
+                // Only the ranged overflow keeps it: 1 takes the patch.
+                FrontQmdMirror::Trial& trial = trial_for(overlay.address);
+                trial.overlay_words = overlay.words;
+                trial.overlay_inline = overlay.inline_qmd;
+                std::memcpy(reinterpret_cast<u8*>(trial.overlay_words.data()) +
+                                (from - overlay.address),
+                            data + (from - first), to - from);
+                trial.overlay_position = position;
+                note_patched_in(patched_at_1, overlay.address, size);
+                split.NoteQmdTrialBuilt();
+            }
+            continue; // Something else wrote it since: the read waits
+        }
         std::memcpy(reinterpret_cast<u8*>(overlay.words.data()) + (from - overlay.address),
                     data + (from - first), to - from);
         overlay.position = position;
         overlay.patched = true;
         note_patched(overlay.address, size);
+        if (trial_mode && !superseded) {
+            note_patched_in(patched_at_1, overlay.address, size);
+        }
         Prediction::NoteMirror(Prediction::Mirror::Patched);
     }
     return block_patched;
@@ -516,8 +686,9 @@ void Nx2PatchQmdCopy(VideoCommon::GpuSplit& split, const MemoryManager& memory, 
     if (size == 0 || !VideoCommon::QmdPrediction::MirrorMode() || !g_front_qmd.synced) {
         return;
     }
+    std::array<bool, 2> patched_at_1{};
     (void)PatchHolders(split, memory, address, address + size, data, position, tag, nullptr,
-                       split.ConsumedNow());
+                       split.ConsumedNow(), patched_at_1);
 }
 
 KeplerCompute::KeplerCompute(MemoryManager& memory_manager_)
@@ -2702,8 +2873,94 @@ bool KeplerCompute::FrontReadQmd(VideoCommon::GpuSplit& split, u64 address,
     info.read_done = done;
     info.overlay_position = overlay != nullptr ? overlay->position : 0;
     info.block_position = block_position;
+    // EXP126 = 2 (fable_qmd_wait_brief 4.3): what 1's copy serves here, as below with the target
+    // 1 gives and its overlay and shadow block (FrontQmdMirror::Trial where they differ from this
+    // copy's). Compared with what this read gives, once it has it, where 1 serves something else
+    // or the same without the wait.
+    const int floor_mode = VideoCommon::GpuSplit::OverflowFloorMode();
+    enum class Served : u8 { Wait, Memory, Overlay, TrialOverlay, Shadow, TrialShadow, Unknown };
+    Served served_at_1 = Served::Wait;
+    NativeQmdScheduler::Descriptor words_at_1;
+    if (floor_mode == 2) {
+        const FrontQmdMirror::Trial* const trial = mirror.FindTrial(&memory_manager, address);
+        if (trial != nullptr && trial->unknown_until > done) {
+            served_at_1 = Served::Unknown; // 1 changed it in a way not followed
+        } else {
+            const u64 floorless = split.WriteStampWhy(*device, size, address).floorless;
+            const u64 real_overlay = overlay != nullptr ? overlay->position : 0;
+            const bool trial_overlay = trial != nullptr && trial->overlay_position != 0 &&
+                                       trial->overlay_position >= real_overlay;
+            const bool has_overlay = trial_overlay || overlay != nullptr;
+            const u64 overlay_at_1 = trial_overlay ? trial->overlay_position : real_overlay;
+            const bool inline_at_1 =
+                trial_overlay ? trial->overlay_inline : overlay != nullptr && overlay->inline_qmd;
+            const bool trial_shadow = trial != nullptr && trial->shadow_position != 0 &&
+                                      shadow != nullptr && shadow->id == trial->shadow_id &&
+                                      trial->shadow_position >= block_position;
+            const u64 shadow_at_1 = trial_shadow ? trial->shadow_position : block_position;
+            u64 target_at_1 = floorless;
+            if (!has_overlay && mirror.evicted > done) {
+                target_at_1 = (std::max)(target_at_1, mirror.evicted);
+            }
+            const u64 inline_at_1_position =
+                has_overlay && inline_at_1 && overlay_at_1 > done ? overlay_at_1 : 0;
+            const bool overlay_ok_at_1 =
+                has_overlay && overlay_at_1 > done && target_at_1 <= overlay_at_1;
+            const bool shadow_ok_at_1 =
+                shadow != nullptr && shadow_at_1 > done &&
+                (std::max)(target_at_1, inline_at_1_position) <= shadow_at_1;
+            if (overlay_ok_at_1 && (!shadow_ok_at_1 || overlay_at_1 >= shadow_at_1)) {
+                served_at_1 = trial_overlay ? Served::TrialOverlay : Served::Overlay;
+                words_at_1 = trial_overlay ? trial->overlay_words : overlay->words;
+            } else if (shadow_ok_at_1) {
+                served_at_1 = trial_shadow ? Served::TrialShadow : Served::Shadow;
+                if (trial_shadow) {
+                    words_at_1 = trial->shadow_words;
+                } else {
+                    std::memcpy(words_at_1.data(),
+                                shadow->bytes.data() + (address - shadow->address), size);
+                }
+            } else if (target_at_1 <= done) {
+                served_at_1 = Served::Memory;
+                memory_manager.ReadBlockUnsafe(address, words_at_1.data(), size);
+            }
+        }
+    }
+    const auto compare_at_1 = [&](Served served, bool waited) {
+        if (served_at_1 == Served::Wait || (served_at_1 == served && !waited)) {
+            return; // 1 waits too, or serves the same at once
+        }
+        if (served_at_1 == Served::Unknown) {
+            split.NoteQmdTrialSkipped();
+            return;
+        }
+        const u8 kind = served_at_1 == Served::Memory                                       ? 0
+                        : served_at_1 == Served::Overlay || served_at_1 == Served::TrialOverlay ? 1
+                                                                                            : 2;
+        const bool differed = words_at_1 != descriptor;
+        split.NoteQmdTrial(kind, differed);
+        static u32 logged{};
+        if (differed && logged < 16) {
+            ++logged;
+            size_t word = 0;
+            while (word < descriptor.size() && words_at_1[word] == descriptor[word]) {
+                ++word;
+            }
+            constexpr std::array<const char*, 7> names{
+                "wait", "guest memory at once", "overlay", "trial overlay",
+                "upload shadow", "trial shadow block", "?"};
+            LOG_ERROR(HW_GPU,
+                      "QMD wait floor (EXP126=2): QMD {:#x} as this copy reads it ({}) differs "
+                      "from what EXP126=1 would have served ({}): word {} {:#x}, would have "
+                      "been {:#x}",
+                      address, waited ? "after the wait" : "at once",
+                      names[static_cast<size_t>(served_at_1)], word, descriptor[word],
+                      words_at_1[word]);
+        }
+    };
     if (overlay_ok && (!shadow_ok || overlay->position >= block_position)) {
         descriptor = overlay->words;
+        compare_at_1(Served::Overlay, false);
         info.source = !overlay->inline_qmd
                           ? (overlay->feed_checked ? Prediction::Source::OverlayFromMemory
                                                    : Prediction::Source::OverlayFromMemoryUnchecked)
@@ -2714,16 +2971,14 @@ bool KeplerCompute::FrontReadQmd(VideoCommon::GpuSplit& split, u64 address,
     }
     if (shadow_ok) {
         std::memcpy(descriptor.data(), shadow->bytes.data() + (address - shadow->address), size);
+        compare_at_1(Served::Shadow, false);
         shadow->last_use = ++mirror.use_clock;
         info.source = Prediction::Source::Shadow;
         Prediction::NoteMirror(Prediction::Mirror::Shadow);
         return true;
     }
     info.source = target > done ? Prediction::Source::Waited : Prediction::Source::Memory;
-    // EXP126 = 2: what 1 would have served (1 guest memory before the wait, 2 a trial overlay),
-    // compared with what is read after it.
-    u8 trial_case = 0;
-    NativeQmdScheduler::Descriptor trial_words;
+    const bool waited = target > done;
     if (target > done) {
         // Diagnostics only (reads rarely wait now): what set the target.
         const auto writers = split.QueuedGuestWriters(done, address, *device, size);
@@ -2763,10 +3018,8 @@ bool KeplerCompute::FrontReadQmd(VideoCommon::GpuSplit& split, u64 address,
         // The QMD wait floor counters (fable_qmd_wait_brief piece 1): which stamp term set the
         // target and, for a block or page stamp, whether the exact scan finds the writer too.
         // Only with the line on (EDEN_NX2_GPU_PROFILE or EXP126).
-        const int floor_mode = VideoCommon::GpuSplit::OverflowFloorMode();
-        VideoCommon::GpuSplit::StampWhy why{};
         if (floor_mode != 0 || VideoCommon::Nx2Profile::Enabled()) {
-            why = split.WriteStampWhy(*device, size, address);
+            const auto why = split.WriteStampWhy(*device, size, address);
             const bool evicted = target > why.stamp;
             const bool stamped = why.term == VideoCommon::StampTerm::Block ||
                                  why.term == VideoCommon::StampTerm::Page;
@@ -2776,31 +3029,6 @@ bool KeplerCompute::FrontReadQmd(VideoCommon::GpuSplit& split, u64 address,
                     ? split.ExactWriterCheck(done, address, *device, size, why.term_position)
                     : u8{3});
         }
-        if (floor_mode == 2 && (overlay == nullptr || overlay->position <= done)) {
-            // As this function would decide with the target 1 gives (fable_qmd_wait_brief 4.3):
-            // the trial overlay a patch would have made, if nothing stamped after it; else, with
-            // no overlay of it queued, guest memory now if nothing queued may write the QMD.
-            // Not with an upload shadow of it queued (which may win at 1): not compared.
-            const FrontQmdMirror::Trial* const trial = mirror.FindTrial(&memory_manager, address);
-            const bool shadow_queued = shadow != nullptr && block_position > done;
-            u64 floorless = why.floorless;
-            if (overlay == nullptr && trial == nullptr && mirror.evicted > done) {
-                floorless = (std::max)(floorless, mirror.evicted);
-            }
-            const bool trial_serves =
-                trial != nullptr && trial->position > done && why.floorless <= trial->position;
-            const bool memory_serves = !trial_serves && floorless <= done &&
-                                       (trial == nullptr || trial->position <= done);
-            if ((trial_serves || memory_serves) && shadow_queued) {
-                split.NoteQmdTrialSkipped();
-            } else if (trial_serves) {
-                trial_words = trial->words;
-                trial_case = 2;
-            } else if (memory_serves) {
-                memory_manager.ReadBlockUnsafe(address, trial_words.data(), size);
-                trial_case = 1;
-            }
-        }
         ++mirror.window_waits;
         split.WaitUntil(target, VideoCommon::DrainSite::QmdRead);
         Prediction::NoteMirror(Prediction::Mirror::Waited);
@@ -2809,23 +3037,7 @@ bool KeplerCompute::FrontReadQmd(VideoCommon::GpuSplit& split, u64 address,
         Prediction::NoteMirror(Prediction::Mirror::Memory);
     }
     memory_manager.ReadBlockUnsafe(address, descriptor.data(), size);
-    if (trial_case != 0) {
-        const bool differed = trial_words != descriptor;
-        split.NoteQmdTrial(trial_case == 2, differed);
-        static u32 logged{};
-        if (differed && logged < 16) {
-            ++logged;
-            size_t word = 0;
-            while (word < descriptor.size() && trial_words[word] == descriptor[word]) {
-                ++word;
-            }
-            LOG_ERROR(HW_GPU,
-                      "QMD wait floor (EXP126=2): QMD {:#x} read after the wait differs from what "
-                      "EXP126=1 would have served ({}): word {} {:#x}, would have been {:#x}",
-                      address, trial_case == 2 ? "trial overlay" : "memory before the wait", word,
-                      descriptor[word], trial_words[word]);
-        }
-    }
+    compare_at_1(Served::Memory, waited);
     // An all-zero QMD: the words may still be in the buffer cache.
     if (std::ranges::all_of(descriptor, [](u32 word) { return word == 0; })) {
         unknown = true;
@@ -2895,8 +3107,10 @@ void KeplerCompute::FrontPatchOverlays(VideoCommon::GpuSplit& split, FrontState&
         }
         own->last_use = ++mirror.use_clock;
     }
+    std::array<bool, 2> patched_at_1{};
     const std::array<bool, 2> block_patched = PatchHolders(
-        split, memory_manager, first, last, data, position, fs.upload_tag, own, done);
+        split, memory_manager, first, last, data, position, fs.upload_tag, own, done,
+        patched_at_1);
     const GPUVAddr first_block = first & ~GPUVAddr{size - 1};
     // A small patch of a QMD nothing above holds: when guest memory holds the QMD now (nothing
     // else queued writes it, not GPU-written, no inline QMD of it queued or evicted), an overlay
@@ -2913,28 +3127,81 @@ void KeplerCompute::FrontPatchOverlays(VideoCommon::GpuSplit& split, FrontState&
         using Outcome = VideoCommon::QmdPatchOutcome;
         const int floor_mode = VideoCommon::GpuSplit::OverflowFloorMode();
         const bool trial_mode = floor_mode == 2;
-        if (trial_mode) {
-            // A later patch of the block: its trial overlay is rebuilt below or not compared.
-            mirror.DropTrial(&memory_manager, block_address);
+        const GPUVAddr from = (std::max)(first, block_address);
+        const GPUVAddr to = (std::min)(last, block_address + size);
+        const auto device = memory_manager.GpuToCpuAddress(block_address);
+        const bool unmapped = !device || !memory_manager.IsFullyMappedRange(block_address, size) ||
+                              Nx2MayBeGpuWritten(*device, size);
+        const FrontQmdMirror::Overlay* const existing =
+            mirror.FindOverlay(&memory_manager, block_address);
+        // EXP126 = 2 (fable_qmd_wait_brief 4.3): whether 1's copy, holding its trial overlay
+        // where it has one (FrontQmdMirror::Trial), makes an overlay from memory here, decided
+        // before this copy's path below; then what 1 holds where this copy does otherwise.
+        bool made_at_1 = false;
+        if (trial_mode && !patched_at_1[block] && !unmapped) {
+            const FrontQmdMirror::Trial* const trial =
+                mirror.FindTrial(&memory_manager, block_address);
+            const u64 existing_position = existing != nullptr ? existing->position : 0;
+            const u64 existing_at_1 =
+                trial != nullptr && trial->overlay_position != 0 &&
+                        trial->overlay_position >= existing_position
+                    ? trial->overlay_position
+                    : existing_position;
+            const bool refused_at_1 = existing_at_1 > done ||
+                                      (existing_at_1 == 0 && mirror.evicted > done);
+            made_at_1 = !refused_at_1 &&
+                        split.WriteStampWhy(*device, size, block_address, fs.upload_tag)
+                                .floorless <= done;
         }
+        const auto settle_trial = [&](bool made_here) {
+            // (A block 1 took in a holder: its trial holder is at `position`, as new as what
+            // this copy makes, and stands for 1's.)
+            if (!trial_mode || made_here == made_at_1 || patched_at_1[block]) {
+                if (made_here && made_at_1) {
+                    // Both copies hold the same overlay now.
+                    if (auto* const trial = mirror.FindTrial(&memory_manager, block_address)) {
+                        trial->overlay_position = 0;
+                    }
+                }
+                return;
+            }
+            u64 lost = 0;
+            FrontQmdMirror::Trial& trial =
+                mirror.TrialFor(&memory_manager, block_address, done, lost);
+            if (lost != 0) {
+                split.NoteQmdTrialLost(lost);
+            }
+            if (made_at_1) {
+                // The overlay 1 makes here, kept aside (never served).
+                memory_manager.ReadBlockUnsafe(block_address, trial.overlay_words.data(), size);
+                std::memcpy(reinterpret_cast<u8*>(trial.overlay_words.data()) +
+                                (from - block_address),
+                            data + (from - first), to - from);
+                trial.overlay_position = position;
+                trial.overlay_inline = false;
+                split.NoteQmdTrialBuilt();
+            } else {
+                // 1 keeps what it held where this copy made an overlay: not followed.
+                trial.unknown_until = (std::max)(trial.unknown_until, position);
+            }
+        };
         if (block_patched[block]) {
             split.NoteQmdPatch(Outcome::Holder);
+            settle_trial(false);
             continue;
         }
-        const auto device = memory_manager.GpuToCpuAddress(block_address);
-        if (!device || !memory_manager.IsFullyMappedRange(block_address, size) ||
-            Nx2MayBeGpuWritten(*device, size)) {
+        if (unmapped) {
             split.NoteQmdPatch(Outcome::Unmapped);
             continue;
         }
-        const FrontQmdMirror::Overlay* const existing =
-            mirror.FindOverlay(&memory_manager, block_address);
         if ((existing != nullptr && existing->position > done) ||
             (existing == nullptr && mirror.evicted > done)) {
             split.NoteQmdPatch(existing != nullptr ? Outcome::InlineQueued : Outcome::Evicted);
+            settle_trial(false);
             continue; // Its inline QMD may still be queued
         }
         if (split.WriteStamp(*device, size, block_address, fs.upload_tag) > done) {
+            settle_trial(false);
             // Which term refused it; for a block or page stamp, whether the exact scan (this
             // upload's own range left out) finds the writer too. Only with the line on
             // (EDEN_NX2_GPU_PROFILE or EXP126).
@@ -2951,28 +3218,14 @@ void KeplerCompute::FrontPatchOverlays(VideoCommon::GpuSplit& split, FrontState&
                 stamped ? split.ExactWriterCheck(done, block_address, *device, size,
                                                  why.term_position, own)
                         : u8{3});
-            if (trial_mode && why.floorless <= done) {
-                // EXP126 = 2: the overlay 1 would make here, kept aside (never served).
-                auto& trial = mirror.TrialSlot(block_address);
-                memory_manager.ReadBlockUnsafe(block_address, trial.words.data(), size);
-                const GPUVAddr from = (std::max)(first, block_address);
-                const GPUVAddr to = (std::min)(last, block_address + size);
-                std::memcpy(reinterpret_cast<u8*>(trial.words.data()) + (from - block_address),
-                            data + (from - first), to - from);
-                trial.space = &memory_manager;
-                trial.address = block_address;
-                trial.position = position;
-                split.NoteQmdTrialBuilt();
-            }
             continue; // Another write may still land there
         }
+        settle_trial(true);
         if (split.RangedOverflowPosition() > done) {
             split.NoteQmdPatch(Outcome::MadeFloorUp);
         }
         NativeQmdScheduler::Descriptor qmd{};
         memory_manager.ReadBlockUnsafe(block_address, qmd.data(), size);
-        const GPUVAddr from = (std::max)(first, block_address);
-        const GPUVAddr to = (std::min)(last, block_address + size);
         std::memcpy(reinterpret_cast<u8*>(qmd.data()) + (from - block_address),
                     data + (from - first), to - from);
         // EDEN_NX2_FEED_MEMORY_OVERLAY's belt (fable_answer_pair_2 2.1): the stamps above see

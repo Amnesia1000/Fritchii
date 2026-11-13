@@ -1584,12 +1584,20 @@ not stamped by device address: with 1 they count for every address until the bac
 (With 2 the device stamps are taken too, for the trial; they can only make a stamp newer.)
 The ring scans (QueuedGuestWriters, ExactWriterCheck) still compare GPU addresses only; they
 keep the overflow, so their answers are as before.
-With 2 everything behaves as 0, and the QMD copy checks what 1 would have served: at a patch
-nothing but the overflow refused it builds the overlay 1 would make into a small trial table
-(never served); at a read that waits and would not at 1 it takes that trial overlay, or reads
-guest memory before the wait, and compares it with what it reads after the wait. "differed" on
-the line below must be 0 (the first 16 are logged as errors with the word); comparisons are
-skipped where an upload shadow of the QMD is queued. To judge 1: profile_toggle.py on EXP126,
+With 2 everything behaves as 0, and the QMD copy follows what 1's copy would hold where it
+differs, in a trial table (never served): the overlay 1 makes from memory at a patch nothing but
+the overflow refused, and an overlay or upload shadow block that takes a patch at 1 only (a
+holder still_holds refused for the overflow alone), each patched further as 1's PatchHolders
+would. At every read it works out what 1 would serve (an overlay, a shadow block, guest memory
+at once, or a wait, with 1's target and those holders) and, where that is something else than
+this copy serves or the same without the wait, compares the 256 bytes with what this copy
+reads (after its wait, if it waits). "differed" on the line below must be 0 (the first 16 are
+logged as errors with the word and the source). A change 1 would make that the table does not
+follow (a holder 1 drops as newer than a patch, an overlay this copy makes where 1 keeps its
+own) marks the block: its reads are counted as not compared until the back passes it; entries
+dropped at the table's limit (4,096 blocks, only after those the back passed) count as lost.
+Not followed at all: the overlay table's capacity at 1 (its evictions and evicted floor). To
+judge 1: profile_toggle.py on EXP126,
 0 against 1, market heavy phase uncapped with EDEN_NX2_GPU_PROFILE, and watch "qmd read" in the
 front waits by site, the EXP13 lines' "after a wait" and "ranged overflow" waits, overlays from
 memory, the fence writers wait and fps; with 1 the EXP13 checks (payload differs, unpredicted,
@@ -1626,8 +1634,9 @@ The line gives:
   ranged overflow, with the ring words each;
 - EXP126 not 0: ranged writes stamped by device address a second, and those counted for every
   address instead (a queued function, sparse pages, no memory manager given);
-- EXP126 = 2: reads compared from memory and from a trial overlay, how many differed, trial
-  overlays built and reads not compared (counts for the window).
+- EXP126 = 2: reads compared, by what 1 serves (guest memory, an overlay, an upload shadow
+  block), how many differed, trial overlays and blocks built, reads not compared and trial
+  entries lost (counts for the window).
 
 ### EXP101
 
