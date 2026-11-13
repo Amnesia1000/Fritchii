@@ -579,8 +579,14 @@ session after a catch-up could not finish (below; logged).
   what the front published (it waits for more input and ends at the first entry that needs
   GPUMem; "runs kept lent at the end of the input" on the window line); a served draw sends the
   vertex input state only when it may have changed (the back's VertexBuffers flag, not the
-  cache's in served mode, is cleared with each send). With EDEN_NX2_GPU_PROFILE=2 GPUMem's
+  cache's in served mode, is cleared at a packet's draw as the cache's vertex buffer update
+  clears it with one thread, and with each send). With EDEN_NX2_GPU_PROFILE=2 GPUMem's
   profile splits its entry loop into "stage entries" and, inside it, "stage cb words".
+- The second fps fixes (window open only): GPUMem's wait for the front spins about 200 us before
+  it sleeps (level mode keeps about 2,000 pauses; the link line's "slept n/s" adds how many of
+  those sleeps waited for the front); the back prefetches the first 1 KiB of the next packet in
+  ring B when it takes one; the back's loop calls the ring's per-entry work (BackEntry, the run's
+  edges, BackAfter) only at a batch's first entry and where a run starts or ends.
 - Other changes it makes: packet ticks keep one unplayed mark per thread (the close takes the
   lowest, and ring B's oldest packet; the ring's start and end clear GPUMem's); the lend's flag
   hand-over happens at the run's first entry; a sync in GPUMem's fill, and a join in it over
