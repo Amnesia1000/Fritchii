@@ -41,6 +41,7 @@ class MemoryManager;
 
 namespace VideoCommon {
 class GpuSplit;
+struct MemStageShadowAccess;
 }
 
 namespace VideoCore {
@@ -3607,6 +3608,9 @@ private:
                            GPUVAddr source, u32 ram, u32 words);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
     void FinishFrontMacro(Core::System& system);
+    /// The closures the memory stage reads (StageTag, memstage_shadow.h), with fixed payloads.
+    struct StageCall;
+    friend struct VideoCommon::MemStageShadowAccess;
     // EXP22 bit 2: instance-loop groups held back and sent as DrawBatch entries.
     bool FrontBatchWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
                          u32 argument, u32 value, bool is_last_call, bool from_macro);

@@ -34,6 +34,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/nx2_fastdraw_count.h"
 #include "video_core/gpu_split.h"
+#include "video_core/memstage_shadow.h"
 #include "video_core/nx2_split_stats.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
@@ -1400,7 +1401,8 @@ void GpuSplit::NoteDispatchWriter() {
     if (records != dispatch_records) {
         dispatch_records = records;
         last_unrecorded_dispatch_position = write_position;
-        Defer([this, records] { back_dispatch_records = records; }, Effect::None);
+        Defer([this, records] { back_dispatch_records = records; }, Effect::None,
+              StageTagBits(StageTag::Pass));
     } else if (!records) {
         last_unrecorded_dispatch_position = write_position;
     }

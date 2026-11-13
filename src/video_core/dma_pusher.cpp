@@ -37,6 +37,7 @@
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
+#include "video_core/memstage_shadow.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
@@ -410,7 +411,10 @@ void DmaPusher::DispatchCalls() {
                 gpu->OnCommandListEnd();
             },
             // Delta draw count: neutral, a submit moves the tick and released fences break.
-            VideoCommon::GpuSplit::Effect::None, VideoCommon::Nx2FastDrawCount::Neutral());
+            // The memory stage passes it (spec 3.3).
+            VideoCommon::GpuSplit::Effect::None,
+            VideoCommon::Nx2FastDrawCount::Neutral() |
+                VideoCommon::StageTagBits(VideoCommon::StageTag::Pass));
         split.Publish();
         return;
     }
