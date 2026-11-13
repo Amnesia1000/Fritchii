@@ -1562,6 +1562,22 @@ void MemoryStageLink::RingLoop(std::stop_token& stop, u64 start) {
                             PublishStaged(until);
                         }
                         LinkBump(counters.run_input_waits);
+                        if (Ring::Consumed().load(std::memory_order_acquire) >= until) {
+                            // The back finished the run's part and is parked: GPUMem's idle
+                            // work runs here too, or it would starve while runs are kept lent
+                            // (the buffer recycler's doomed buffers, EXP104), and so do its
+                            // once-a-second lines. The cache is GPUMem's again until the run
+                            // is extended (the back ended its part).
+                            t_stage_user = true;
+                            StageIdle(stop);
+                            t_stage_user = false;
+                            const u64 now = LinkNowNs();
+                            if (now - last_tick_ns >= 1'000'000'000ULL) {
+                                last_tick_ns = now;
+                                MemStageShadow::StageTick();
+                                Nx2Profile::Report("GPU memory thread");
+                            }
+                        }
                         if (!StageWaitFor(stop, StageWait::Input, until) ||
                             !ring_wanted.load(std::memory_order_acquire)) {
                             break;
