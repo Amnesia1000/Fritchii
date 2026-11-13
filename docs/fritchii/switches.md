@@ -1415,7 +1415,8 @@ compare the "past the scan" count and the macro dma read drains.
 
 ### EXP121
 
-EXP121 (live, 0 = off; fable52_answer_kills 3, fix 1): the texture cache's collector, once device
+EXP121 (live, 0 = off, DEFAULT 1 since 2026-11-13: verified 0 mismatches, fight +1.7 fps twice;
+fable52_answer_kills 3, fix 1): the texture cache's collector, once device
 memory is at its expected threshold, downloads each GPU-written image it evicts and waits for
 the GPU every time (2 to 3 ms, then ten more short waits, in fight frames). With 1 it records
 the download into a staging buffer without waiting and deletes the image at a later frame end,
