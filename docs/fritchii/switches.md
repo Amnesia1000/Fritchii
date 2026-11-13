@@ -1118,9 +1118,14 @@ the call, as with 1). There is no tick guard: packet ticks keep a held packet's 
 "Flushed while held" (5.5) counts held packets whose fill and PlayRest are in different command
 buffers (a flush or finish in between, syncs included; the first 16 logged with the caller):
 expected near 0, as a vertex binding the fill did not see dirty is not bound again in the new
-command buffer. The stats line gets a "memory seam 2b" line: held and
+command buffer. Texture writes while held: the texture cache writes game memory inside Configure
+(GC downloads, EXP121's landed downloads, a flushed download), after the early fill read. Each
+held fill keeps the device ranges it read (uniform copies, uploads, bound ranges, storage and
+table addresses); every such write is counted, and a write over one of those ranges is counted
+apart and the first 16 logged as "Memory seam: texture write over fill read". That count must
+read 0 for 2 to be exact. The stats line gets a "memory seam 2b" line: held and
 late fill draws and dispatches a second, packets not held (arena busy on another thread), flushed
-while held, rest plays (and descriptors dropped), descriptor form mismatches (must be 0), and fill
+while held, texture writes while held (over fill reads, must be 0), rest plays (and descriptors dropped), descriptor form mismatches (must be 0), and fill
 and play time with EDEN_NX2_GPU_PROFILE. The GPU profile gets two zones, "memory fill" (every fill
 at 2, the buffer cache's own work included: what leaves the back in step 6) and "memory play".
 FRITCHII_MEMSTAGE_READ_LOG adds the read log (5.3). Compare 1 and 2 with profile_toggle.py

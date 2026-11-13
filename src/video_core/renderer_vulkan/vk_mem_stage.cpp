@@ -38,6 +38,12 @@
 //        buffers (a flush or finish in between, the clock's syncs included). Expected near 0;
 //        the first 16 are logged with their caller. A vertex binding the fill did not see dirty
 //        is not bound again in the new command buffer (step 6's full vertex bindings).
+//   Texture writes while held: the texture cache writes game memory inside Configure (GC
+//        downloads, EXP121's LandCollectDownloads, a flushed download; SwizzleImage and the
+//        buffer download's WriteBlockUnsafe call MemReadLog::GuestWrite), after the early fill
+//        read. Each held fill keeps the device ranges it read (every MemReadLog line, read log on
+//        or not); a write over one is counted and the first 16 logged ("Memory seam: texture
+//        write over fill read"). Must be 0 for SEAM 2 to be exact.
 //   5.3, the read log (FRITCHII_MEMSTAGE_READ_LOG=N, boot): every Nth draw, dispatch and operation
 //        packet logs what its fill read from game memory (the buffer cache's MemReadLog lines:
 //        uniforms copied to the stream, buffer uploads with their staged bytes, bound cached
@@ -498,6 +504,7 @@ MemStage::~MemStage() {
         SeamHook::g_watch.fetch_sub(1, std::memory_order_relaxed);
     }
     VideoCommon::MemReadLog::g_on.store(false, std::memory_order_relaxed);
+    VideoCommon::MemReadLog::g_held.store(false, std::memory_order_relaxed);
 }
 
 void MemStage::Attach(Cache& cache_) noexcept {
@@ -918,6 +925,7 @@ void MemStage::TakeHeld(HeldKind kind) {
     }
     held = kind;
     t_holding = true;
+    VideoCommon::MemReadLog::g_held.store(true, std::memory_order_relaxed);
     if (ticks) {
         UpdateUnplayed();
     }
@@ -936,6 +944,7 @@ struct MemStage::HeldFillEnd {
 void MemStage::EndHeldFill() {
     filling_held = false;
     fill_form = -1;
+    t_reads = nullptr;
     if (held != HeldKind::None) {
         return;
     }
@@ -978,6 +987,8 @@ const MemStage::DrawPacket* MemStage::FillDraw(Cache& cache_, const DrawFacts& f
     filling_kind = HeldKind::Draw;
     held_flush_seen = false;
     t_holding = true;
+    held_reads.clear();
+    t_reads = &held_reads;
     const HeldFillEnd fill_end{*this};
     if (ticks) {
         held_from = draw.number;
@@ -1062,6 +1073,8 @@ const MemStage::DispatchPacket* MemStage::FillDispatch(Cache& cache_,
     filling_kind = HeldKind::Dispatch;
     held_flush_seen = false;
     t_holding = true;
+    held_reads.clear();
+    t_reads = &held_reads;
     const HeldFillEnd fill_end{*this};
     if (ticks) {
         held_from = dispatch.number;
@@ -1164,6 +1177,8 @@ void MemStage::PlayRest() {
     PlayHeldTo(held_arena.Size(), true);
     held = HeldKind::None;
     t_holding = false;
+    VideoCommon::MemReadLog::g_held.store(false, std::memory_order_relaxed);
+    held_reads.clear();
     if (ticks) {
         UpdateUnplayed();
     }
@@ -1481,8 +1496,8 @@ void MemStage::TickFrame() {
         seam_value.store(value, std::memory_order_relaxed);
         seam_on.store(on, std::memory_order_relaxed);
         player.ForgetBindings();
-        VideoCommon::MemReadLog::g_on.store(value >= 2 && read_log_every > 0,
-                                            std::memory_order_relaxed);
+        // At 2 and 3 always: a held fill keeps its read ranges for the texture write check.
+        VideoCommon::MemReadLog::g_on.store(value >= 2, std::memory_order_relaxed);
         LOG_INFO(Render_Vulkan, "Memory seam (EXP123): {}{}",
                  value >= 2  ? "2, one fill per draw and dispatch before the texture work"
                  : on        ? "1, recorder and player"
@@ -1613,13 +1628,14 @@ void MemStage::LogStats() {
         LOG_INFO(Render_Vulkan,
                  "  memory seam 2b: held draws {:.0f}/s, late fill draws {:.0f}/s (texel "
                  "buffers), held dispatches {:.0f}/s, late fill dispatches {:.0f}/s, not held "
-                 "(arena busy) {}; flushed while held (5.5) {}; rest plays {} ({} descriptors "
-                 "dropped); "
+                 "(arena busy) {}; flushed while held (5.5) {}; texture writes while held {} "
+                 "(over fill reads {}, must be 0); rest plays {} ({} descriptors dropped); "
                  "descriptor form mismatches {}; fill {:.3f} ms/s ({:.2f} us a packet), play "
                  "{:.3f} ms/s (inclusive, with EDEN_NX2_GPU_PROFILE)",
                  rate(held_draws), rate(delta(&Counts::late_draws)), rate(held_dispatches),
                  rate(delta(&Counts::late_dispatches)), delta(&Counts::unheld),
-                 delta(&Counts::held_flushed), delta(&Counts::rest_plays),
+                 delta(&Counts::held_flushed), delta(&Counts::texture_writes),
+                 delta(&Counts::texture_overlaps), delta(&Counts::rest_plays),
                  delta(&Counts::rest_descriptors), delta(&Counts::form_mismatch),
                  static_cast<double>(delta(&Counts::fill_ns)) / 1e6 / seconds,
                  held_packets != 0 ? static_cast<double>(delta(&Counts::fill_ns)) / 1e3 /
@@ -1665,6 +1681,8 @@ void MemStage::Snapshot(Counts& out) const {
     out.unheld = counters.unheld.load(std::memory_order_relaxed);
     out.held_flushed = counters.held_flushed.load(std::memory_order_relaxed);
     out.seam_clamped = counters.seam_clamped.load(std::memory_order_relaxed);
+    out.texture_writes = counters.texture_writes.load(std::memory_order_relaxed);
+    out.texture_overlaps = counters.texture_overlaps.load(std::memory_order_relaxed);
     out.rest_plays = counters.rest_plays.load(std::memory_order_relaxed);
     out.rest_descriptors = counters.rest_descriptors.load(std::memory_order_relaxed);
     out.form_mismatch = counters.form_mismatch.load(std::memory_order_relaxed);
@@ -2567,6 +2585,7 @@ namespace VideoCommon::MemReadLog {
 using Vulkan::MemStage;
 
 void NoteBytes(Kind kind, Tegra::MaxwellDeviceMemoryManager& memory, u64 address, u64 size) {
+    MemStage::NoteRead(kind, address, size);
     MemStage::ReadLog* const log = MemStage::t_log;
     if (log == nullptr || size == 0) {
         return;
@@ -2592,6 +2611,7 @@ void NoteBytes(Kind kind, Tegra::MaxwellDeviceMemoryManager& memory, u64 address
 
 void NoteStaged(Kind kind, Tegra::MaxwellDeviceMemoryManager& memory, u64 address,
                 const u8* staged, u64 size) {
+    MemStage::NoteRead(kind, address, size);
     MemStage::ReadLog* const log = MemStage::t_log;
     if (log == nullptr || size == 0) {
         return;
@@ -2613,6 +2633,12 @@ void NoteStaged(Kind kind, Tegra::MaxwellDeviceMemoryManager& memory, u64 addres
 }
 
 void NoteValue(Kind kind, Tegra::MemoryManager* memory, u64 address, u64 value, u32 size) {
+    if (MemStage::t_reads != nullptr && memory != nullptr) {
+        // A GPU address: kept as the device range it maps to.
+        if (const auto device_address = memory->GpuToCpuAddress(address)) {
+            MemStage::NoteRead(kind, *device_address, size);
+        }
+    }
     MemStage::ReadLog* const log = MemStage::t_log;
     if (log == nullptr || memory == nullptr) {
         return;
@@ -2629,6 +2655,7 @@ void NoteValue(Kind kind, Tegra::MemoryManager* memory, u64 address, u64 value, 
 }
 
 void NoteRange(Kind kind, u64 address, u64 size) {
+    MemStage::NoteRead(kind, address, size);
     MemStage::ReadLog* const log = MemStage::t_log;
     if (log == nullptr || size == 0) {
         return;
@@ -2642,6 +2669,45 @@ void NoteRange(Kind kind, u64 address, u64 size) {
         .data = nullptr,
         .memory = nullptr,
     });
+}
+
+// The texture cache wrote game memory while a draw or dispatch is held (SEAM 2/3): its GC
+// downloads, EXP121's landed downloads, a flushed download. The fill read before the texture
+// work; at SEAM 0 and 1 the same reads come after this write. Counted; a write over one of the
+// fill's read ranges is a crossing the early fill gets wrong (must be 0).
+void NoteGuestWrite(Tegra::MemoryManager& memory, u64 gpu_addr, u64 size) {
+    MemStage* const stage = Vulkan::g_stage.load(std::memory_order_acquire);
+    if (stage == nullptr || size == 0) {
+        return;
+    }
+    Vulkan::Bump(stage->counters.texture_writes);
+    if (!Vulkan::t_holding || stage->held == MemStage::HeldKind::None) {
+        // Another thread's write: counted only (the ranges belong to the holding thread).
+        return;
+    }
+    for (const auto& [device_address, length] : memory.GetSubmappedDeviceRange(gpu_addr, size)) {
+        const u64 end = device_address + length;
+        for (const MemStage::ReadRange& read : stage->held_reads) {
+            if (device_address >= read.end || read.begin >= end) {
+                continue;
+            }
+            Vulkan::Bump(stage->counters.texture_overlaps);
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                const bool is_draw = stage->held == MemStage::HeldKind::Draw;
+                LOG_WARNING(Render_Vulkan,
+                            "Memory seam: texture write over fill read: {:#x}+{:#x} (device "
+                            "{:#x}) over the {} read at {:#x}+{:#x} of {} {} (programs {:016x} "
+                            "{:016x})",
+                            gpu_addr, size, device_address,
+                            Vulkan::READ_KIND_NAMES[static_cast<size_t>(read.kind)], read.begin,
+                            read.end - read.begin, is_draw ? "draw" : "dispatch",
+                            is_draw ? stage->draw.number : stage->dispatch.number,
+                            stage->held_hashes[0], stage->held_hashes[1]);
+            }
+            return;
+        }
+    }
 }
 
 } // namespace VideoCommon::MemReadLog

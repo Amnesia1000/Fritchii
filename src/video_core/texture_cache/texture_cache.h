@@ -28,6 +28,7 @@
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/slot_vector.h"
+#include "video_core/buffer_cache/mem_read_log.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/kepler_compute.h"
@@ -3087,6 +3088,7 @@ void TextureCache<P>::PopAsyncFlushes() {
                         DropCollectDownloadsIn(*cpu_addr, buffer_info.size);
                     }
                 }
+                MemReadLog::GuestWrite(*gpu_memory, buffer_info.address, buffer_info.size);
                 gpu_memory->WriteBlockUnsafe(buffer_info.address, download_span.data(),
                                              buffer_info.size);
                 ClearStaleGpu(buffer_info.address, buffer_info.size);

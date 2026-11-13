@@ -463,6 +463,7 @@ private:
     friend void VideoCommon::MemReadLog::NoteValue(VideoCommon::MemReadLog::Kind,
                                                    Tegra::MemoryManager*, u64, u64, u32);
     friend void VideoCommon::MemReadLog::NoteRange(VideoCommon::MemReadLog::Kind, u64, u64);
+    friend void VideoCommon::MemReadLog::NoteGuestWrite(Tegra::MemoryManager&, u64, u64);
 
     enum class HeldKind : u8 { None, Draw, Dispatch };
 
@@ -491,6 +492,19 @@ private:
     };
 
     inline static thread_local ReadLog* t_log = nullptr;
+
+    /// A device range a held fill read (any kind), for the texture write check.
+    struct ReadRange {
+        u64 begin;
+        u64 end;
+        VideoCommon::MemReadLog::Kind kind;
+    };
+    inline static thread_local std::vector<ReadRange>* t_reads = nullptr;
+    static void NoteRead(VideoCommon::MemReadLog::Kind kind, u64 address, u64 size) {
+        if (t_reads != nullptr && size != 0) {
+            t_reads->push_back({address, address + size, kind});
+        }
+    }
 
     struct Part {
         const void* data;
@@ -529,6 +543,8 @@ private:
         u64 unheld{};
         u64 held_flushed{};
         u64 seam_clamped{};
+        u64 texture_writes{};
+        u64 texture_overlaps{};
         u64 rest_plays{};
         u64 rest_descriptors{};
         u64 form_mismatch{};
@@ -590,6 +606,7 @@ private:
     u32 held_cursor{};
     bool held_form{};
     std::array<u64, 2> held_hashes{};
+    std::vector<ReadRange> held_reads;
     ReadLog op_log;
     ReadLog held_log;
     bool held_log_pending{};
@@ -632,6 +649,8 @@ private:
         std::atomic<u64> unheld{};
         std::atomic<u64> held_flushed{};
         std::atomic<u64> seam_clamped{};
+        std::atomic<u64> texture_writes{};
+        std::atomic<u64> texture_overlaps{};
         std::atomic<u64> rest_plays{};
         std::atomic<u64> rest_descriptors{};
         std::atomic<u64> form_mismatch{};
