@@ -136,6 +136,26 @@ enum class BlitMiss : u32 {
     Count,
 };
 std::array<u64, static_cast<size_t>(BlitMiss::Count)> g_blit_misses{};
+/// Blit launches that found destination registers the front never saw sent (the engine was
+/// set up before the split started) and took them from the back after a drain.
+u64 g_blit_seeds{};
+
+// Fermi2D's front copy of the destination registers (FrontNoteMethod) from what the engine
+// holds: its registers and, after them, its method sink. Only after a drain: the back is idle
+// and has run every write sent, so this is the state the next blit sees.
+void SeedFrontCopy(Engines::Fermi2D& blitter) {
+    constexpr u32 first = 0x200; // dst
+    constexpr u32 count = 10;
+    for (u32 i = 0; i < count; ++i) {
+        blitter.FrontNoteMethod(first + i, blitter.regs.reg_array[first + i]);
+    }
+    for (const auto& [method, value] : blitter.method_sink) {
+        const u32 index = method & ~Engines::EngineInterface::SplitPlainTag;
+        if (index - first < count) {
+            blitter.FrontNoteMethod(index, value);
+        }
+    }
+}
 /// The largest write noted by its range, and the most device ranges it may map to.
 constexpr u64 MaxNotedWrite = u64{1} << 30;
 constexpr size_t MaxNotedPieces = 16;
@@ -181,8 +201,27 @@ void NoteEngineWriter(VideoCommon::GpuSplit& split, const MemoryManager& memory_
             kind = Kind::BlitLaunch;
             writes = true;
             ranged = blitter->FrontBlitRange(begin, size);
+            if (!ranged && (size & 0xff) == static_cast<u64>(BlitMiss::NotSeen) &&
+                VideoCore::Nx2Debug::Experiment(120) >= 2) {
+                // Registers sent before the split started (or before its last restart) went
+                // past the front's copy: take them from the engine once, after a drain. The
+                // copy sees every write after that, so each engine drains here at most once.
+                static u32 logged{};
+                if (logged++ < 8) {
+                    LOG_INFO(HW_GPU,
+                             "EXP120: blit destination registers not sent since the split "
+                             "started: {:#x} (bit n: register {:#x} + n); taken from the "
+                             "engine after a drain",
+                             size >> 8, static_cast<u32>(FERMI2D_REG_INDEX(dst)));
+                }
+                split.Drain(VideoCommon::DrainSite::Other);
+                SeedFrontCopy(*blitter);
+                ++g_blit_seeds;
+                ranged = blitter->FrontBlitRange(begin, size);
+            }
             if (!ranged) {
-                miss = size <= static_cast<u64>(BlitMiss::Empty) ? static_cast<BlitMiss>(size)
+                const u64 code = size & 0xff;
+                miss = code <= static_cast<u64>(BlitMiss::Empty) ? static_cast<BlitMiss>(code)
                                                                  : BlitMiss::Other;
             }
         }
@@ -239,10 +278,11 @@ void NoteEngineWriter(VideoCommon::GpuSplit& split, const MemoryManager& memory_
 std::string FritchiiBlitMissText() {
     const auto at = [](BlitMiss reason) { return g_blit_misses[static_cast<size_t>(reason)]; };
     return fmt::format("{} register not sent, {} format, {} empty, {} over 1 GiB, {} unmapped, "
-                       "{} over {} device ranges, {} other",
+                       "{} over {} device ranges, {} other; {} took the registers from the "
+                       "engine",
                        at(BlitMiss::NotSeen), at(BlitMiss::Format), at(BlitMiss::Empty),
                        at(BlitMiss::Large), at(BlitMiss::Unmapped), at(BlitMiss::Pieces),
-                       MaxNotedPieces, at(BlitMiss::Other));
+                       MaxNotedPieces, at(BlitMiss::Other), g_blit_seeds);
 }
 
 namespace {

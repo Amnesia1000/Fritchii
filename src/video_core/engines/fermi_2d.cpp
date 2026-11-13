@@ -63,8 +63,9 @@ void Fermi2D::FrontNoteMethod(u32 method, u32 argument) {
     front_seen |= 1U << (method - FrontFirst);
 }
 
-// On false, `size` says why (DmaPusher's BlitMiss): 1 a destination register the range needs
-// was not sent yet, 2 an undecodable format, 3 an empty surface.
+// On false, `size` says why (DmaPusher's BlitMiss) in its low byte: 1 a destination register
+// the range needs was not sent yet (bits 8 and up: which, bit n for dst register 0x200 + n), 2
+// an undecodable format, 3 an empty surface.
 bool Fermi2D::FrontBlitRange(GPUVAddr& begin, u64& size) const {
     static_assert(sizeof(Surface) == FrontCount * sizeof(u32));
     Surface dst;
@@ -75,7 +76,7 @@ bool Fermi2D::FrontBlitRange(GPUVAddr& begin, u64& size) const {
     const bool block_linear = dst.linear == MemoryLayout::BlockLinear;
     const u32 needed = 0x3C3 | (block_linear ? 1U << 2 : 1U << 5);
     if ((front_seen & needed) != needed) {
-        size = 1;
+        size = 1 | (u64{needed & ~front_seen} << 8);
         return false;
     }
     // SoftwareBlitEngine::Blit's get_surface_size for the destination; it refuses an
