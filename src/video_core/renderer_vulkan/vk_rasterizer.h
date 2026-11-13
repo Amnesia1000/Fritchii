@@ -238,8 +238,8 @@ private:
     void TraceRenderState(bool is_indexed, const char* outcome, const Framebuffer* framebuffer);
 
     /// Records the copies of the command list pages the work just recorded wrote and submits, so
-    /// the GPU makes them now (BufferCache::Nx2CopyListPages).
-    void SubmitNx2ListCopies(u64 writer);
+    /// the GPU makes them now (BufferCache::Nx2CopyListPages). True if it recorded any.
+    bool SubmitNx2ListCopies(u64 writer);
 
     /// Records the dynamic state of the draw being prepared with `pipeline` (null for
     /// DrawTexture's blit).

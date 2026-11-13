@@ -4094,10 +4094,11 @@ void BufferCache<P>::ProbeExtentTail(u32 index, const Binding& binding) {
 }
 
 template <class P>
-void BufferCache<P>::RecordComputeExtentProbes() {
+u32 BufferCache<P>::RecordComputeExtentProbes() {
     if constexpr (IS_OPENGL) {
-        return;
+        return 0;
     } else {
+    u32 recorded = 0;
     for (ExtentProbe& probe : extent_probes) {
         if (probe.after || !slot_buffers.contains(probe.buffer_id)) {
             continue;
@@ -4111,7 +4112,9 @@ void BufferCache<P>::RecordComputeExtentProbes() {
         };
         runtime.CopyBuffer(probe.after->buffer, buffer, std::span{&copy, 1}, true);
         probe.tick = runtime.CurrentTick();
+        ++recorded;
     }
+    return recorded;
     }
 }
 
@@ -4526,6 +4529,8 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
     if (VideoCommon::GpuSplit::RecordingDispatch()) [[unlikely]] {
         VideoCommon::GpuSplit::Get().RecordDispatchWrite(device_addr, size);
     }
+    ++nx2_written_marks;
+    nx2_written_mark_bytes += size;
     // FRITCHII_READ_RUNS: the write mark, with the writer its bind set (the "Read writer" lines).
     if (ReadRunStats::g_enabled) [[unlikely]] {
         ReadRunStats::NoteWrite(device_addr, size);

@@ -1445,6 +1445,8 @@ void MemStage::FillTrackerRecord(Cache& cache_, TrackerRecord& record) {
 
 const MemStage::DispatchPacket* MemStage::FillDispatchHere(Cache& cache_,
                                                            const DispatchFacts& facts) {
+    // fable_memstage_compute_brief 3: the dispatch's fill, a fine zone of its own.
+    const Profile::FineScope fill_zone{Profile::Zone::DispatchFill};
     if (seam_value.load(std::memory_order_relaxed) < 2) {
         return nullptr;
     }

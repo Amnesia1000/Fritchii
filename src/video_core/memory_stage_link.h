@@ -635,6 +635,23 @@ private:
         alignas(64) std::array<std::atomic<u64>, static_cast<size_t>(Check::Count)> checks{};
     };
     Counters counters;
+    /// fable_memstage_compute_brief 3: GPUMem's level runs by channel (0-6, then any other) and
+    /// by size (entries, compute launches), with their time. Taken and reset at each line.
+    static constexpr size_t RunChannels = 8;
+    static constexpr size_t RunBuckets = 6; ///< 0, 1, 2-7, 8-63, 64-511, 512 and more
+    struct alignas(64) RunShape {
+        std::array<std::atomic<u64>, RunChannels> runs{};
+        std::array<std::atomic<u64>, RunChannels> entries{};
+        std::array<std::atomic<u64>, RunChannels> launches{};
+        std::array<std::atomic<u64>, RunChannels> ns{};
+        std::array<std::atomic<u64>, RunBuckets> by_entries{};
+        std::array<std::atomic<u64>, RunBuckets> by_entries_ns{};
+        std::array<std::atomic<u64>, RunBuckets> by_launches{};
+        std::array<std::atomic<u64>, RunBuckets> by_launches_ns{};
+    };
+    RunShape run_shape;
+    void NoteRunShape(s32 channel, u64 entries, u64 launches, u64 ns) noexcept;
+    void LogRunShape(double seconds);
     struct Snapshot {
         std::array<u64, static_cast<size_t>(HandOff::Count)> calls{};
         u64 call_ns{};

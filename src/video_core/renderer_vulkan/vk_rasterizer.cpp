@@ -1148,12 +1148,26 @@ void RasterizerVulkan::DeltaPathSnapshot() {
 // (a read flush and its gather, a MustFlushRegion question, collected ranges) runs on GPUMem, the
 // cache's holder, while the back waits; inline everywhere else.
 
+namespace {
+/// The back is in DispatchCompute (fable_memstage_compute_brief 3: served calls by cause).
+thread_local bool t_in_dispatch = false;
+} // Anonymous namespace
+
 template <typename F>
 void RasterizerVulkan::OnStage(u8 cause, F&& body) {
     using Link = VideoCommon::MemoryStageLink;
     if (!Link::BackServed()) {
         body();
         return;
+    }
+    if (t_in_dispatch && VideoCommon::Nx2Profile::Fine() &&
+        cause < static_cast<u8>(Link::Served::Count)) [[unlikely]] {
+        using Fine = VideoCommon::Nx2Profile::FineCounter;
+        static_assert(static_cast<u32>(Fine::ServedInDispatchFallback) -
+                          static_cast<u32>(Fine::ServedInDispatch) + 1 ==
+                      static_cast<u32>(Link::Served::Count));
+        VideoCommon::Nx2Profile::AddFine(
+            static_cast<Fine>(static_cast<u32>(Fine::ServedInDispatch) + cause), 1);
     }
     // The buffer cache's lock, if the back holds it (EXP118's delta draws), goes with the call.
     Common::SpinRecursiveMutex* const held =
@@ -3428,6 +3442,10 @@ void RasterizerVulkan::Clear(u32 layer_count) {
 
 void RasterizerVulkan::DispatchCompute() {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Compute};
+    t_in_dispatch = true;
+    SCOPE_EXIT {
+        t_in_dispatch = false;
+    };
     if (InvalidateBeforeUse()) {
         gpu.InvalidateGPUCache();
     }
@@ -3476,6 +3494,53 @@ void RasterizerVulkan::DispatchCompute() {
         VideoCommon::MemStageStats::ComputeProgram(pipeline->ShaderHash());
     }
     std::scoped_lock lock{texture_cache.mutex, buffer_cache.mutex};
+    // fable_memstage_compute_brief 3 (GPU profile 2): the dispatch by what its fill marks (the
+    // cache's lock is held from here to the end), and what else it took.
+    struct DispatchKinds {
+        bool recorded{};
+        bool indirect{};
+        bool replaced{};
+        bool list_copies{};
+        bool extent_probes{};
+    } dispatch_kinds;
+    const bool count_dispatch = VideoCommon::Nx2Profile::Fine();
+    const u64 marks_before = buffer_cache.nx2_written_marks;
+    const u64 mark_bytes_before = buffer_cache.nx2_written_mark_bytes;
+    SCOPE_EXIT {
+        if (!count_dispatch) {
+            return;
+        }
+        using Fine = VideoCommon::Nx2Profile::FineCounter;
+        const auto add = [](Fine counter, u64 amount = 1) {
+            VideoCommon::Nx2Profile::AddFine(counter, amount);
+        };
+        if (buffer_cache.nx2_written_marks != marks_before) {
+            add(Fine::DispatchMarksBuffer);
+            add(Fine::DispatchMarkBytes, buffer_cache.nx2_written_mark_bytes - mark_bytes_before);
+        } else if (!pipeline->WrittenImages().empty()) {
+            add(Fine::DispatchImagesOnly);
+        } else {
+            add(Fine::DispatchMarksNothing);
+        }
+        if (dispatch_kinds.indirect) {
+            add(Fine::DispatchIndirect);
+        }
+        if (pipeline->MemFacts().has_texel_buffers) {
+            add(Fine::DispatchTexelBuffers);
+        }
+        if (!dispatch_kinds.recorded) {
+            add(Fine::DispatchSkipped);
+        }
+        if (dispatch_kinds.replaced) {
+            add(Fine::DispatchReplaced);
+        }
+        if (dispatch_kinds.list_copies) {
+            add(Fine::DispatchListCopies);
+        }
+        if (dispatch_kinds.extent_probes) {
+            add(Fine::DispatchExtentProbes);
+        }
+    };
     std::optional<ByteAddressedShadow> byte_addressed_shadow;
     mem_stage.BeginDispatch();
     buffer_cache.Nx2CollectListCopies(true);
@@ -3602,10 +3667,13 @@ void RasterizerVulkan::DispatchCompute() {
                 cmdbuf.DispatchIndirect(indirect_buffer, indirect_offset);
             });
         });
-        mem_stage.Ref(MemStage::Site::DispatchAfter,
-                      [&] { buffer_cache.RecordComputeExtentProbes(); });
+        dispatch_kinds.extent_probes = mem_stage.Ref(MemStage::Site::DispatchAfter, [&] {
+            return buffer_cache.RecordComputeExtentProbes();
+        }) != 0;
         compute_since_count_barrier = true;
-        SubmitNx2ListCopies(pipeline->ShaderHash());
+        dispatch_kinds.list_copies = SubmitNx2ListCopies(pipeline->ShaderHash());
+        dispatch_kinds.recorded = true;
+        dispatch_kinds.indirect = true;
         return;
     }
     const std::array<u32, 3> dim{qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z};
@@ -3675,13 +3743,17 @@ void RasterizerVulkan::DispatchCompute() {
             TextureCacheRuntime::CopyByteAddressedShadow(cmdbuf, *byte_addressed_shadow, true);
         }
     });
-    mem_stage.Ref(MemStage::Site::DispatchAfter, [&] { buffer_cache.RecordComputeExtentProbes(); });
+    dispatch_kinds.extent_probes = mem_stage.Ref(MemStage::Site::DispatchAfter, [&] {
+        return buffer_cache.RecordComputeExtentProbes();
+    }) != 0;
     if (can_replace || marking_effects) {
         // The deferred native binding may follow DLSS's command buffer bindings.
         scheduler.InvalidateState();
     }
     compute_since_count_barrier = true;
-    SubmitNx2ListCopies(pipeline->ShaderHash());
+    dispatch_kinds.list_copies = SubmitNx2ListCopies(pipeline->ShaderHash());
+    dispatch_kinds.recorded = true;
+    dispatch_kinds.replaced = replacement != nullptr;
 
     if (!can_replace) {
         TryOcarinaUpscale(*pipeline, false);
@@ -3727,23 +3799,24 @@ void Vulkan::RasterizerVulkan::DisableGraphicsUniformBuffer(size_t stage, u32 in
 
 void RasterizerVulkan::FlushAll() {}
 
-void RasterizerVulkan::SubmitNx2ListCopies(u64 writer) {
+bool RasterizerVulkan::SubmitNx2ListCopies(u64 writer) {
     // Submitted at once: ReadGpuWrittenCommands waits on these copies, so they can't sit out
     // the longer DeferFlush interval.
     if (!mem_stage.Ref(MemStage::Site::DispatchAfter,
                        [&] { return buffer_cache.Nx2CopyListPages(mem_clock.Now(), writer); })) {
-        return;
+        return false;
     }
     // EDEN_NX2_EXP27 & 8 (the original's DISPATCH_BATCH): the front reads few of the lists
     // (Ocarina: ~150 dispatches a frame, a submission each), so the copies go when it waits for
     // one (BufferCacheRuntime::WaitSubmittedTick asks the back), when the back goes idle, or
     // with the next submission.
     if ((VideoCore::Nx2Debug::Experiment(27) & 8) != 0 && scheduler.DeferFlushUntilWanted()) {
-        return;
+        return true;
     }
     if (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::FenceFlush) || !scheduler.DeferFlush()) {
         scheduler.Flush();
     }
+    return true;
 }
 
 VideoCore::RasterizerInterface::GpuWrittenList RasterizerVulkan::ReadGpuWrittenCommandList(
@@ -5869,6 +5942,14 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
 void RasterizerVulkan::AccelerateInlineToMemoryImpl(GPUVAddr address, size_t copy_size,
                                                     std::span<const u8> memory) {
     const Common::WriteRing::SiteScope write_site{"inline upload (AccelerateInlineToMemory)", false};
+    const VideoCommon::Nx2Profile::FineScope inline_zone{VideoCommon::Nx2Profile::Zone::InlineUpload};
+    using Fine = VideoCommon::Nx2Profile::FineCounter;
+    // fable_memstage_compute_brief 3 (GPU profile 2): by size, and below by branch.
+    VideoCommon::Nx2Profile::AddFine(copy_size <= 4     ? Fine::InlineSize4
+                                     : copy_size <= 64  ? Fine::InlineSize64
+                                     : copy_size <= 256 ? Fine::InlineSize256
+                                                        : Fine::InlineSizeMore,
+                                     1);
     auto cpu_addr = gpu_memory->GpuToCpuAddress(address);
     // EDEN_NX2_MEMSTAGE_STATS: an inline upload, and whether it lands on texture pages (join 2).
     VideoCommon::MemStageStats::StreamWrite(VideoCommon::MemStageStats::Write::Inline,
@@ -5888,6 +5969,7 @@ void RasterizerVulkan::AccelerateInlineToMemoryImpl(GPUVAddr address, size_t cop
         }
     }
     if (!cpu_addr) [[unlikely]] {
+        VideoCommon::Nx2Profile::AddFine(Fine::InlineUnmapped, 1);
         gpu_memory->WriteBlock(address, memory.data(), copy_size);
         return;
     }
@@ -5905,6 +5987,7 @@ void RasterizerVulkan::AccelerateInlineToMemoryImpl(GPUVAddr address, size_t cop
         const DAddr page_begin = Common::AlignDown(*cpu_addr, Core::DEVICE_PAGESIZE);
         const DAddr page_end = Common::AlignUp(*cpu_addr + copy_size, Core::DEVICE_PAGESIZE);
         if (!MayBeGpuModified(page_begin, page_end - page_begin)) {
+            VideoCommon::Nx2Profile::AddFine(Fine::InlineNeverWritten, 1);
             buffer_cache.Nx2NoteListHostWrite(*cpu_addr, copy_size);
             if (query_cache.page_filter.Any(*cpu_addr, copy_size)) {
                 query_cache.InvalidateRegion(*cpu_addr, copy_size);
@@ -5926,6 +6009,7 @@ void RasterizerVulkan::AccelerateInlineToMemoryImpl(GPUVAddr address, size_t cop
             buffer_cache.WriteMemory(*cpu_addr, copy_size);
         }
     }
+    VideoCommon::Nx2Profile::AddFine(uploaded ? Fine::InlineInPlace : Fine::InlineNotUploaded, 1);
     // Pending query results must not land over the new words later: drop them now.
     query_cache.InvalidateRegion(*cpu_addr, copy_size);
     if (!uploaded && defer) {

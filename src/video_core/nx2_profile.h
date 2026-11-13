@@ -122,6 +122,10 @@ enum class Zone : u32 {
     DrawAfter,    ///< From Configure's end to dynamic state: trackers, traces, dumps
     RingFacts,    ///< Of draw setup, THREAD=2: the facts published under the stage's key
     RestTail,     ///< Of draw: PlayRest after the play (held flags, ticks mark, the watch count)
+    // The three halves of a dispatch (fable_memstage_compute_brief 3; fine zones):
+    InlineUpload, ///< Of method: an inline upload's write (AccelerateInlineToMemoryImpl)
+    DispatchFill, ///< Of compute: the dispatch's buffer fill (MemStage::FillDispatchHere)
+    QmdSignal,    ///< Of method: a QMD signal (scheduler, releases; the dispatch is "compute")
     Count,
 };
 
@@ -146,7 +150,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "memory fill", "memory play", "memory hand-off", "memory sync wait",
     "stage wait", "level run", "stage entries", "stage cb words",
     "ring take", "ring take copy", "draw locks", "draw after configure", "ring facts",
-    "rest tail",
+    "rest tail", "inline upload", "dispatch fill", "qmd signal",
 };
 static_assert(zone_names.back() != nullptr, "a zone without a name");
 
@@ -237,6 +241,36 @@ enum class FineCounter : u32 {
     StorageNoUpload, ///< Graphics storage synchronizes that uploaded nothing
     StorageUploads,  ///< Graphics storage synchronizes that uploaded something
     StorageMemoHits, ///< Graphics storage synchronizes skipped (EDEN_NX2_STORAGE_SYNC_MEMO)
+    // fable_memstage_compute_brief 3 (compute and the upload words):
+    UploadWordsMacro,  ///< Front: compute upload data words a macro emitted
+    UploadWordsMethod, ///< Front: compute upload data words sent by FrontCallMethod
+    UploadWordsMulti,  ///< Front: compute upload data words sent by FrontCallMultiMethod
+    InlineSize4,       ///< Inline uploads (AccelerateInlineToMemoryImpl) of 4 bytes or less
+    InlineSize64,      ///< ... of 5-64 bytes
+    InlineSize256,     ///< ... of 65-256 bytes
+    InlineSizeMore,    ///< ... of more
+    InlineNeverWritten, ///< ... to pages never GPU-written (EXP85's branch: no cache lock)
+    InlineInPlace,     ///< ... uploaded in place into GPU-written buffer data
+    InlineNotUploaded, ///< ... under the cache's lock, not uploaded (invalidations follow)
+    InlineUnmapped,    ///< ... to an unmapped destination
+    DispatchMarksBuffer, ///< Dispatches whose fill marks a buffer GPU-written
+    DispatchMarkBytes,   ///< ... the bytes those marks cover
+    DispatchImagesOnly,  ///< Dispatches that mark no buffer but write images
+    DispatchMarksNothing, ///< Dispatches that mark no buffer and write no image
+    DispatchIndirect,    ///< Indirect dispatches
+    DispatchTexelBuffers, ///< Dispatches with texel buffers (their fill comes late)
+    DispatchSkipped,     ///< Dispatches DispatchCompute ended before the record
+    DispatchReplaced,    ///< Dispatches the upscaler replaced
+    DispatchListCopies,  ///< Dispatches whose written command list pages were copied
+    DispatchExtentProbes, ///< Dispatches that left extent probes to record
+    // Served calls made inside a dispatch (OnStage), in MemoryStageLink::Served's order.
+    ServedInDispatch,
+    ServedInDispatchForRead,
+    ServedInDispatchGather,
+    ServedInDispatchInvalidation,
+    ServedInDispatchInner,
+    ServedInDispatchMustFlush,
+    ServedInDispatchFallback,
     Count,
 };
 
@@ -246,6 +280,18 @@ inline constexpr std::array<const char*, static_cast<size_t>(FineCounter::Count)
         "uniform bytes",   "storage binds",    "texture handles", "storage KiB",
         "storage written binds", "storage multi-range binds", "storage syncs without upload",
         "storage syncs uploading", "storage sync memo hits",
+        "upload words (macro emit)", "upload words (method)", "upload words (multi-method)",
+        "inline uploads 4 B", "inline uploads 5-64 B", "inline uploads 65-256 B",
+        "inline uploads over 256 B", "inline uploads to never GPU-written pages",
+        "inline uploads uploaded in place", "inline uploads not uploaded",
+        "inline uploads unmapped", "dispatches marking a buffer GPU-written",
+        "dispatch marked bytes", "dispatches writing images only",
+        "dispatches marking nothing", "indirect dispatches", "dispatches with texel buffers",
+        "dispatches skipped", "dispatches replaced", "dispatches copying list pages",
+        "dispatches with extent probes", "served in a dispatch: FlushRegion",
+        "served in a dispatch: FlushRegionForRead", "served in a dispatch: gather",
+        "served in a dispatch: single invalidation", "served in a dispatch: InnerInvalidation",
+        "served in a dispatch: MustFlushRegion", "served in a dispatch: fallback fill",
     };
 static_assert(fine_counter_names.back() != nullptr, "a fine counter without a name");
 

@@ -1560,6 +1560,33 @@ dispatches with values a second (values each, how many filled in Configure, how 
 skipped and their values), QMDs a second (and reads that ran no dispatch), null pointer slots,
 and the verify counters below. Values below 3 change nothing here.
 
+### Compute counters (fable_memstage_compute_brief 3)
+
+Counting only, no switch; for one market run with FRITCHII_MEMSTAGE_THREAD=2, AHEAD unlimited
+and EDEN_NX2_GPU_PROFILE=2.
+- "Memory stage runs by channel n s" (THREAD 2, every 10 s after the "Memory stage ring" line):
+  GPUMem's level runs by the channel the stage had bound at the run's first entry (0 to 6, then
+  "other"): runs a second, entries and compute launches each (0xaf with bit 1, 0xb0 above 1,
+  0x107, as the compute front notes dispatch writers), and GPUMem's run time in ms/s (from the
+  lend to the return). Then runs a second and ms/s by entries a run (1, 2-7, 8-63, 64-511, 512+)
+  and by compute launches a run (0, 1, 2-7, ...): the ms/s in compute lists against small runs.
+- Fine zones (GPU profile 2): "inline upload" (AccelerateInlineToMemoryImpl, inside "method"),
+  "dispatch fill" (MemStage::FillDispatchHere, on whichever thread fills) and "qmd signal" (the
+  QMD scheduler's signal with its QMD reads and releases; the dispatches it runs stay
+  "compute"). Zones are exclusive, so "method" and "compute" lose what they cover.
+- Fine counters (GPU profile 2, each thread's "fine counters per second" line). The front
+  thread: compute upload data words by path, "upload words (macro emit)", "(method)"
+  (FrontCallMethod) and "(multi-method)" (FrontCallMultiMethod). The back: inline uploads by
+  size ("inline uploads 4 B", "5-64 B", "65-256 B", "over 256 B") and by branch ("to never
+  GPU-written pages", EXP85's branch; "uploaded in place"; "not uploaded"; "unmapped");
+  dispatches by what their fill marks ("marking a buffer GPU-written" with "dispatch marked
+  bytes", "writing images only", "marking nothing": the buffer cache's GPU-written marks made
+  while DispatchCompute holds its lock), "indirect dispatches", "dispatches with texel buffers"
+  (late fill), "dispatches skipped" (DispatchCompute ended before the record: unconfigured, grid
+  over the device's limit, an exception), "dispatches replaced" (the upscaler), "dispatches
+  copying list pages", "dispatches with extent probes"; and served calls made inside a dispatch
+  by cause ("served in a dispatch: FlushRegion", ... in the "Memory stage ring" line's order).
+
 ### EXP101
 
 EXP101 (live, 0 = off, 1 = runs, 2 = cached page pointer + prefetch; fable52_answer_presenter): nvhost_gpu::SubmitGPFIFOImpl's pushbuffer

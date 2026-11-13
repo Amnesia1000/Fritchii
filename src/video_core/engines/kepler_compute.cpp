@@ -835,6 +835,10 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
         SCOPE_EXIT {
             split.EndDispatchRecord();
         };
+        // fable_memstage_compute_brief 3: the signal's own time (scheduler, QMD reads, releases);
+        // the dispatches it runs are "compute".
+        const VideoCommon::Nx2Profile::FineScope signal_zone{
+            VideoCommon::Nx2Profile::Zone::QmdSignal};
         u64 running_qmd = 0; // The QMD the releases below belong to (read last), for EXP13
         const NativeQmdScheduler::Descriptor* running_descriptor = nullptr;
         const auto error = native_qmd.Signal(qmd_address, argument,
@@ -2252,6 +2256,10 @@ void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit&
     split.Method(this, method, argument, is_last_call, segment, FrontEffect(method));
     FrontNoteWrites(split, fs, method);
     FrontNoteWriter(split, fs, method, argument);
+    if (method == KEPLER_COMPUTE_REG_INDEX(data_upload)) {
+        VideoCommon::Nx2Profile::AddFine(VideoCommon::Nx2Profile::FineCounter::UploadWordsMethod,
+                                         1);
+    }
     if (method == KEPLER_COMPUTE_REG_INDEX(data_upload) &&
         VideoCommon::QmdPrediction::MirrorMode()) {
         // EXP13=2: the copy takes an entry's words at once (6f (c) b).
@@ -3030,6 +3038,10 @@ void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuS
     split.MultiMethod(this, method, base_start, amount, methods_pending, segment,
                       FrontEffect(method));
     FrontNoteWrites(split, fs, method);
+    if (method == KEPLER_COMPUTE_REG_INDEX(data_upload)) {
+        VideoCommon::Nx2Profile::AddFine(VideoCommon::Nx2Profile::FineCounter::UploadWordsMulti,
+                                         amount);
+    }
     // An inline upload's words all write its one range.
     const u32 notes = method == KEPLER_COMPUTE_REG_INDEX(data_upload) ? 1 : amount;
     for (u32 i = 0; i < notes; ++i) {
@@ -3170,6 +3182,10 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         split.MacroWrite(this, address, value, FrontEffect(address));
         FrontNoteWrites(split, fs, address);
         FrontNoteWriter(split, fs, address, value);
+        if (address == KEPLER_COMPUTE_REG_INDEX(data_upload)) {
+            VideoCommon::Nx2Profile::AddFine(
+                VideoCommon::Nx2Profile::FineCounter::UploadWordsMacro, 1);
+        }
         if (address == KEPLER_COMPUTE_REG_INDEX(data_upload) &&
             VideoCommon::QmdPrediction::MirrorMode()) {
             fs.upload_batch.push_back(value);
