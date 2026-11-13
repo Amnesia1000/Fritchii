@@ -495,7 +495,8 @@ void MemStage::SetPending() {
     if (!pending) {
         pending = true;
         if (ticks) {
-            ticks->SetUnplayed(ticks->Current());
+            pending_from = ticks->Current();
+            UpdateUnplayed();
         }
         SeamHook::g_watch.fetch_add(1, std::memory_order_relaxed);
     }
@@ -540,7 +541,7 @@ void MemStage::PlayPending([[maybe_unused]] bool late) {
     }
     pending = false;
     if (ticks) {
-        ticks->ClearUnplayed();
+        UpdateUnplayed();
     }
     last_entry = ~0U;
     SeamHook::g_watch.fetch_sub(1, std::memory_order_relaxed);
@@ -860,6 +861,24 @@ bool MemStage::ClaimHeld() {
     return true;
 }
 
+// Packet ticks: the numbers whose entries wait for their play stay open past a tick's end
+// (SeamTicks::Close carries from the first). Two sources: the pending entries (as without SEAM 2)
+// and a held packet, from its fill to its PlayRest. A sync inside the held fill plays the
+// scheduler entries, but the descriptors and later entries still wait; an operation packet
+// played inside Configure does not end the held one. Without a held packet this is SetPending's
+// and PlayPending's set and clear.
+void MemStage::UpdateUnplayed() {
+    u64 from = held != HeldKind::None || filling_held ? held_from : 0;
+    if (pending && (from == 0 || pending_from < from)) {
+        from = pending_from;
+    }
+    if (from != 0) {
+        ticks->SetUnplayed(from);
+    } else {
+        ticks->ClearUnplayed();
+    }
+}
+
 void MemStage::TakeHeld(HeldKind kind) {
     // The arena holding the packet becomes the held one; the next fill starts on an empty arena.
     // Entries a sync played during the fill are behind play_cursor.
@@ -876,6 +895,9 @@ void MemStage::TakeHeld(HeldKind kind) {
     marked.clear();
     held = kind;
     t_holding = true;
+    if (ticks) {
+        UpdateUnplayed();
+    }
     // Watched while held: a flush before the plays is logged with its caller.
     SeamHook::g_watch.fetch_add(1, std::memory_order_relaxed);
 }
@@ -907,6 +929,10 @@ const MemStage::DrawPacket* MemStage::FillDraw(Cache& cache_, const DrawFacts& f
     marked.clear();
     t_marked = &marked;
     filling_held = true;
+    if (ticks) {
+        held_from = draw.number;
+        UpdateUnplayed();
+    }
     const bool logging = read_log_every > 0 && StartReadLog(held_log, draw.number);
     {
         // Today's calls in today's relative order (ConfigureImpl): the uniform state, per stage
@@ -989,6 +1015,10 @@ const MemStage::DispatchPacket* MemStage::FillDispatch(Cache& cache_,
     marked.clear();
     t_marked = &marked;
     filling_held = true;
+    if (ticks) {
+        held_from = dispatch.number;
+        UpdateUnplayed();
+    }
     const bool logging = read_log_every > 0 && StartReadLog(held_log, dispatch.number);
     {
         // ComputePipeline::Configure's calls in its order: the uniform state, the storage binds
@@ -1113,6 +1143,9 @@ void MemStage::PlayRest() {
     PlayHeldTo(held_arena.Size(), true);
     held = HeldKind::None;
     t_holding = false;
+    if (ticks) {
+        UpdateUnplayed();
+    }
     SeamHook::g_watch.fetch_sub(1, std::memory_order_relaxed);
     held_arena.Reset();
     held_cursor = 0;

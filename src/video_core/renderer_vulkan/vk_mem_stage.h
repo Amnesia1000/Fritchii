@@ -562,6 +562,7 @@ private:
     void LogValueStats(double seconds, bool first);
 
     bool ClaimHeld();
+    void UpdateUnplayed();
     void TakeHeld(HeldKind kind);
     void CheckHeld();
     void PlayHeldTo(u32 end, bool rest);
@@ -604,6 +605,9 @@ private:
     u64 packet_number{};
     std::unique_ptr<SeamTicks> ticks;
     u64 op_number{};
+    /// Packet ticks: the first number of the pending entries and of the held packet (SEAM >= 2).
+    u64 pending_from{};
+    u64 held_from{};
     DrawPacket draw{};
     DispatchPacket dispatch{};
     OpPacket op{};
