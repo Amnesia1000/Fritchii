@@ -29,6 +29,7 @@
 #include "video_core/host1x/host1x.h"
 #include "video_core/invalidation_accumulator.h"
 #include "video_core/memory_manager.h"
+#include "video_core/memstage_shadow.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
@@ -1368,6 +1369,13 @@ void MemoryManager::FlushCaching() {
                            constant_buffer_writes.end());
         constant_buffer_writes.clear();
         invalidate = true;
+    }
+    // FRITCHII_MEMSTAGE_SHADOW: the memory stage's collected constant buffer ranges against
+    // these (compare d); also when there are none.
+    if (VideoCommon::MemStageShadow::g_on) [[unlikely]] {
+        VideoCommon::MemStageShadow::BackFlush(
+            *this, std::span<const std::pair<DAddr, std::size_t>>{page_stash2.data(),
+                                                                  page_stash2.size()});
     }
     if (invalidate) {
         rasterizer->InnerInvalidation(page_stash2);

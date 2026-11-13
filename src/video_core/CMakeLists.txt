@@ -260,6 +260,7 @@ add_library(video_core STATIC
     renderer_vulkan/vk_mem_stage.cpp
     renderer_vulkan/vk_mem_stage.h
     renderer_vulkan/vk_mem_stage_hook.h
+    renderer_vulkan/vk_mem_stage_shadow.h
     renderer_vulkan/vk_pipeline_cache.cpp
     renderer_vulkan/vk_pipeline_cache.h
     renderer_vulkan/vk_pipeline_translate_queue.cpp
