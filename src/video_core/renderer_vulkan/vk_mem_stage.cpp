@@ -1274,6 +1274,14 @@ void MemStage::HandOff(Cache& cache_, u8 kind, Body& body) {
         body();
     };
     Link::Get().Call(static_cast<Link::HandOff>(kind), run);
+    if (held_log_on_stage) [[unlikely]] {
+        // The read log's "this thread since the fill" counts the holding thread's gathers and
+        // FlushRegion calls: the back's, as at FRITCHII_MEMSTAGE_THREAD=0 (syncs it served
+        // during the fill count as inside the fill, as they would on one thread).
+        held_log_on_stage = false;
+        held_log.gathers = t_gathers;
+        held_log.flush_regions = t_flush_regions;
+    }
 }
 
 const MemStage::DrawPacket* MemStage::FillDraw(Cache& cache_, const DrawFacts& facts,
@@ -1467,6 +1475,8 @@ void MemStage::StopReadLog(ReadLog& log, bool held_packet) {
     log.flush_regions = t_flush_regions;
     if (held_packet) {
         gather_frame_count = 0;
+        // On GPUMem these are GPUMem's counters; HandOff takes the back's when the call returns.
+        held_log_on_stage = Link::OnStageThread();
     }
     for (ReadRecord& record : log.records) {
         if (record.how != ReadRecord::How::Range) {

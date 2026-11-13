@@ -701,6 +701,9 @@ private:
     ReadLog op_log;
     ReadLog held_log;
     bool held_log_pending{};
+    /// FRITCHII_MEMSTAGE_THREAD=1: held_log was stopped on GPUMem; HandOff stamps it with the
+    /// back's gather counters (they are per thread, and the back holds the packet).
+    bool held_log_on_stage{};
     u64 op_fills{};
     std::vector<u8> compare_scratch;
     Tegra::GPU* gpu{};
