@@ -195,6 +195,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/memory_stage_link.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_fastdraw_count.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2_runahead.h"
@@ -3032,11 +3033,15 @@ void MemStage::TickThread(int seam) {
     // 6b's level mode, 65,536 and above unlimited (the harness sends 2147483647).
     const int ahead = Debug::SwitchValue(Debug::g_memstage_ahead, "FRITCHII_MEMSTAGE_AHEAD");
     // EDEN_NX2_RUNAHEAD applies due CPU-write chunks on the back before each entry: GPUMem would
-    // fill those entries before the chunks are applied. The window runs 0 while it is on.
+    // fill those entries before the chunks are applied. The window runs 0 while it is on. The
+    // same with the delta path on at boot (EXP118, or its count): a delta draw holds the buffer
+    // cache's lock through Configure, where a read flush is a served call (StageContendedHook
+    // covers that too; this keeps the case out of the window altogether).
     const char* const blocked =
         VideoCommon::Runahead::CurrentMode() != VideoCommon::Runahead::Mode::Off
             ? "EDEN_NX2_RUNAHEAD"
-            : nullptr;
+        : VideoCommon::Nx2FastDrawCount::g_on ? "the delta path (EXP118)"
+                                              : nullptr;
     link.SetAhead(link.Mode() == 2 && ahead > 0 ? static_cast<u32>(ahead) : 0U, blocked);
     // The window's verify (its own-write ring and the image check) only with a verify on.
     Link::SetVerify(read_log_every > 0 || Link::RingVerify());

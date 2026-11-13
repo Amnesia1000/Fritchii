@@ -541,7 +541,9 @@ draw packets GPUMem may fill ahead of the back's take. 0 is 6b's level mode, unc
 of 65,536 or more is unlimited (the test harness sends 2147483647); the frame end is a level run,
 so the lead never passes one frame. Ignored (0) while THREAD is not 2; "Memory stage window
 (FRITCHII_MEMSTAGE_AHEAD=n)" is logged when it changes. It runs 0 while EDEN_NX2_RUNAHEAD is on
-(the back applies due CPU-write chunks before each entry; logged once), and for the rest of the
+(the back applies due CPU-write chunks before each entry; logged once), while the delta path
+(EXP118, or EDEN_NX2_FASTDRAW_COUNT) was on at boot (a delta draw holds the buffer cache's lock
+through Configure, where a read flush is a served call; logged once), and for the rest of the
 session after a catch-up could not finish (below; logged).
 
 - GPUMem waits only while that many packets are in ring B that the back has not taken, while
