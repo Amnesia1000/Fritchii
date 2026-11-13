@@ -1246,6 +1246,10 @@ bool RasterizerVulkan::StageFillDraw(VideoCommon::MemStageShadowEngine& copy, bo
                                      std::vector<std::pair<u64, std::size_t>>& ranges) {
     using Link = VideoCommon::MemoryStageLink;
     Link& link = Link::Get();
+    // Step 7: the window and room in ring B, tested here, before a packet (not per entry).
+    if (!link.StageBeforeFill(position)) {
+        return false; // GPUMem is stopping: the draw is left to the back
+    }
     // Join 1 (spec 4.4): a miss leaves the draw to the back, which publishes the facts.
     if (!mem_stage.LookupFacts(VideoCommon::MemStageShadow::StageProgramKey(copy), stage_facts)) {
         link.NoteLevelDraw(4);

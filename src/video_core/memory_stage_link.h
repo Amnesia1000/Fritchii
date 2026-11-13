@@ -253,6 +253,9 @@ public:
     /// Does nothing in level mode (the stage is level before each entry there) or off GPUMem.
     /// False when GPUMem is stopping (the caller stops its work).
     bool StageLevel(u64 position, LevelReason reason);
+    /// GPUMem, before a draw's fill at `position` (outside any fill and lock): waits for the
+    /// window and for room in ring B (fps fix 1: not before every entry). False when stopping.
+    bool StageBeforeFill(u64 position);
     /// The staging pool's stream was busy on GPUMem with the window open: it took a new buffer
     /// (the pool never waits for a region, so a stamp not played yet is never waited on).
     static void NoteStagingFallback() noexcept {
@@ -532,6 +535,9 @@ private:
     u32 ring_window{};
     /// The entry GPUMem processes (GPUMem only).
     u64 stage_entry{};
+    /// GPUMem's busy time is timed per publish batch: its start, 0 when no batch is open.
+    u64 busy_batch_start{};
+    void CloseBusyBatch() noexcept;
     /// Buffers joined by GPUMem's fills, with the entry (GPUMem only; served calls run there too).
     struct Join {
         u64 begin;
