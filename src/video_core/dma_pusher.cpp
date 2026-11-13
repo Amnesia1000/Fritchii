@@ -13,6 +13,7 @@
 #include <unordered_map>
 #include <cstdlib>
 #include <cstdio>
+#include <optional>
 #include <string_view>
 #include <vector>
 
@@ -28,7 +29,9 @@
 #include "video_core/dma_pusher.h"
 #include "video_core/command_fetch_order.h"
 #include "video_core/control/channel_state.h"
+#include "video_core/engines/fermi_2d.h"
 #include "video_core/engines/kepler_compute.h"
+#include "video_core/engines/kepler_memory.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/gpu.h"
@@ -87,6 +90,81 @@ bool WritesMemory(Engines::EngineInterface* engine, Engines::EngineTypes type, u
         }
     }
     return false;
+}
+
+// Whether GPU range [begin, begin + size) maps to device range [device, device + size), page by
+// page.
+[[nodiscard]] bool MapsContiguously(const MemoryManager& memory_manager, GPUVAddr begin,
+                                    u64 size, DAddr device) {
+    for (u64 offset = 0x1000 - (begin & 0xfff); offset < size; offset += 0x1000) {
+        const auto page = memory_manager.GpuToCpuAddress(begin + offset);
+        if (!page || *page != device + offset) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The KeplerMemory or Fermi2D method just sent on the split (`words`: its `count` words, `multi`:
+// a non-incrementing run, CallMultiMethod). EXP120 = 0 notes every one as an unranged writer,
+// which ends every macro DMA read snapshot (fable_answer_long_drains 8.4). EXP120 = 1: the back
+// writes memory only on KeplerMemory's data method and Fermi2D's blit launch (their CallMethod),
+// so the methods that only store a register are not noted, nor a single data word that is not
+// its method's last (Upload::State::ProcessData writes with the last one); a linear upload's data
+// notes the bytes it may write (NoteMemoryWrite). Blits and block linear uploads stay unranged.
+void NoteEngineWriter(VideoCommon::GpuSplit& split, const MemoryManager& memory_manager,
+                      Engines::EngineInterface* engine, Engines::EngineTypes type, u32 method,
+                      const u32* words, u32 count, bool is_last, bool multi) {
+    using Kind = VideoCommon::GpuSplit::EngineWriteKind;
+    using Note = VideoCommon::GpuSplit::EngineWriteNote;
+    if (count == 0) {
+        return split.NoteUnrangedWriter();
+    }
+    Kind kind = Kind::BlitRegister;
+    bool writes = false;
+    bool ranged = false;
+    GPUVAddr begin{};
+    u64 size{};
+    if (type == Engines::EngineTypes::KeplerMemory) {
+        auto* const memory = static_cast<Engines::KeplerMemory*>(engine);
+        // Kept with EXP120 off too, so turning it on live finds the registers sent before.
+        memory->FrontNoteMethod(method, words[count - 1]);
+        if (method == KEPLERMEMORY_REG_INDEX(data)) {
+            kind = Kind::I2mData;
+            writes = multi || is_last;
+            ranged = writes && memory->FrontDataRange(begin, size);
+        } else {
+            kind = Kind::I2mRegister;
+        }
+    } else if (method == FERMI2D_REG_INDEX(pixels_from_memory.src_y0) + 1) {
+        kind = Kind::BlitLaunch;
+        writes = true;
+    }
+    const auto unranged = [&] {
+        split.NoteUnrangedWriter();
+        split.CountEngineWrite(multi, kind, Note::Unranged);
+    };
+    if (VideoCore::Nx2Debug::Experiment(120) == 0) {
+        return unranged();
+    }
+    if (!writes) {
+        split.NoteUnrangedWriterSpared();
+        split.CountEngineWrite(multi, kind, Note::Nothing);
+        return;
+    }
+    // A large upload, or one over unmapped or scattered pages, stays unranged.
+    std::optional<DAddr> device;
+    if (ranged) {
+        device = memory_manager.GpuToCpuAddress(begin);
+    }
+    if (!device || size > (u64{1} << 20) ||
+        !MapsContiguously(memory_manager, begin, size, *device)) {
+        return unranged();
+    }
+    split.NoteMemoryWriter();
+    split.NoteMemoryWrite(*device, size, "KeplerMemory upload");
+    split.NoteUnrangedWriterSpared();
+    split.CountEngineWrite(multi, kind, Note::Ranged);
 }
 
 // EDEN_NX2_LIST_CHANGE_TRACE=1: per GPU-written command list address, how often its words differ
@@ -754,7 +832,8 @@ void DmaPusher::CallMethod(u32 argument) {
                     g_last_copy_writer = split.SentPosition();
                 }
             } else if (memory_writer) {
-                split.NoteUnrangedWriter();
+                NoteEngineWriter(split, memory_manager, subchannel, engine_type,
+                                 dma_state.method, &argument, 1, dma_state.is_last_call, false);
             }
         };
         if (split.Active()) {
@@ -834,7 +913,9 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
                     g_last_copy_writer = split.SentPosition();
                 }
             } else if (memory_writer) {
-                split.NoteUnrangedWriter();
+                NoteEngineWriter(split, memory_manager, subchannel, engine_type,
+                                 dma_state.method, base_start, num_methods,
+                                 dma_state.is_last_call, true);
             }
         };
         if (split.Active()) {

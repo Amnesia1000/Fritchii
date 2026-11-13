@@ -264,6 +264,8 @@ void GpuSplit::Stop() {
     ForgetFencesQuiet();
     last_writer_position = 0;
     last_memory_writer_position = 0;
+    last_unranged_position = 0;
+    unranged_without_exp120 = 0;
     pending_write_count = 0;
     writer_range_count = 0;
     last_unbounded_writer_position = 0;

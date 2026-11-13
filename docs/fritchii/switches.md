@@ -873,6 +873,24 @@ runs started and ran, counter resets (in runs), today's path by reason, render e
 (without lookup, with one lock) and with 2 the compares and mismatches. Toggle live 0/1 with
 profile_toggle.py; zones "query report", "counter reset", "render enable" (GPU profile 2).
 
+### EXP120
+
+EXP120 (live, 0 = off; DmaPusher's NoteEngineWriter, fable_answer_long_drains 8.4): the
+KeplerMemory and Fermi2D methods the GPU thread split sends are noted for the macro DMA read
+snapshots (EDEN_NX2_DMA_SNAPSHOT) by what the back really writes, instead of every one as an
+unranged writer, which ends every snapshot ("unranged" misses in the "DMA snapshot" line). With
+1: a method that only stores a register (every KeplerMemory method but data, every Fermi2D
+method but the blit launch, pixels_from_memory.src_y0 + 1) and a single data word that is not
+its method's last (the upload is written with the last one) are not noted; the data of a linear
+upload notes the bytes it may write (from the upload registers as sent: line_length_in,
+line_count, address, pitch, and the exec's copy size), when they are under 1 MiB and map to one
+device range. Blits, block linear uploads and anything else stay unranged. "DMA snapshot
+unranged notes (EXP120=n; single/run)" logs, every 5 s with the "DMA snapshot" line, each kind
+of method by call (single method / non-incrementing run): noted unranged, ranged, not noted;
+and the reads EXP120 let skip the drain (an unranged note it spared since the page's snapshot)
+with their own "differed" count, which EDEN_NX2_DMA_SNAPSHOT=10 checks and must stay 0. With 0
+the counts show who notes the unranged writers. Toggle live 0/1 with profile_toggle.py.
+
 ### EXP101
 
 EXP101 (live, 0 = off, 1 = runs, 2 = cached page pointer + prefetch; fable52_answer_presenter): nvhost_gpu::SubmitGPFIFOImpl's pushbuffer
