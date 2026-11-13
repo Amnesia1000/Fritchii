@@ -47,7 +47,7 @@ Keep changes focused and distinguish code-level checks from actual gameplay test
 
 ## Artwork
 
-The Fritchii logo (`dist/fritchii.png`, `dist/fritchii.ico`) is by Frizti.
+The Fritchii logo, the pear (`dist/fritchii.png`, `dist/fritchii.ico`), was made for Fritchii by Freshdyno.
 
 ## Credits and license
 
