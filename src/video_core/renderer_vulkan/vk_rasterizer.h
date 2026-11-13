@@ -193,6 +193,15 @@ public:
                                   std::span<const u8> memory) override;
     void AccelerateInlineToMemoryImpl(GPUVAddr address, size_t copy_size,
                                       std::span<const u8> memory);
+    void AccelerateInlineWords(GPUVAddr address, size_t copy_size,
+                               std::span<const u8> memory) override;
+    /// AccelerateInlineToMemoryImpl's parts: what it notes first (counters, stats, traces), its
+    /// EXP85 test (no GPU write ever marked the pages: the caches need no look), and that
+    /// branch's work after the write; `per_word`: the invalidations accumulated word by word.
+    void InlineUploadNote(GPUVAddr address, std::optional<DAddr> cpu_addr, size_t copy_size,
+                          std::span<const u8> memory);
+    [[nodiscard]] bool InlineSkipsCaches(DAddr cpu_addr, size_t copy_size);
+    void InlineUntouchedTail(GPUVAddr address, DAddr cpu_addr, size_t copy_size, bool per_word);
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                            const VideoCore::DiskResourceLoadCallback& callback) override;
 

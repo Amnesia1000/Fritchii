@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <functional>
 #include <optional>
@@ -353,6 +354,19 @@ public:
 
     virtual void AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                           std::span<const u8> memory) = 0;
+
+    /// EXP124: an inline upload's data words flushed at once (Upload::State, a macro's words):
+    /// [address, address + copy_size) written as the calls the words would have made one by one,
+    /// AccelerateInlineToMemory of 4 bytes from `address` each (the last one maybe shorter). The
+    /// default makes those calls; a backend may write a run of words in one call where the
+    /// result is the same.
+    virtual void AccelerateInlineWords(GPUVAddr address, size_t copy_size,
+                                       std::span<const u8> memory) {
+        for (size_t offset = 0; offset < copy_size; offset += sizeof(u32)) {
+            const size_t size = (std::min)(sizeof(u32), copy_size - offset);
+            AccelerateInlineToMemory(address + offset, size, memory.subspan(offset, size));
+        }
+    }
 
     /// Initialize disk cached resources for the game being emulated
     virtual void LoadDiskResources(u64 title_id, std::stop_token stop_loading,

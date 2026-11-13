@@ -271,6 +271,16 @@ enum class FineCounter : u32 {
     ServedInDispatchInner,
     ServedInDispatchMustFlush,
     ServedInDispatchFallback,
+    // EXP124 (fable_memstage_compute_brief 4.4): a macro's upload words as one entry.
+    UploadEntries,        ///< Front: uploads sent as one entry (GpuSplit::MacroWords)
+    UploadEntryWords,     ///< Front: ... their data words
+    InlinePiecesOne,      ///< Back: pieces (a 4 KiB page each) written in one call
+    InlinePiecesWritten,  ///< Back: pieces word by word, the page may be GPU-written (or EXP85 off)
+    InlinePiecesUnmapped, ///< Back: pieces word by word, unmapped or on sparse memory
+    InlineWordsGrid,      ///< Back: flushes word by word, a grid placeholder live
+    InlineWordsUnaligned, ///< Back: flushes word by word, not on a 4-byte boundary
+    InlinePiecesChecked,  ///< Back, EXP124=2: one-call pieces whose words were each asked
+    InlinePiecesDisagree, ///< Back, EXP124=2: ... whose words disagreed (must be 0)
     Count,
 };
 
@@ -292,6 +302,12 @@ inline constexpr std::array<const char*, static_cast<size_t>(FineCounter::Count)
         "served in a dispatch: FlushRegionForRead", "served in a dispatch: gather",
         "served in a dispatch: single invalidation", "served in a dispatch: InnerInvalidation",
         "served in a dispatch: MustFlushRegion", "served in a dispatch: fallback fill",
+        "upload entries (EXP124)", "upload entry words", "upload pieces in one call",
+        "upload pieces word by word (page may be GPU-written)",
+        "upload pieces word by word (unmapped or sparse)",
+        "upload flushes word by word (grid placeholder live)",
+        "upload flushes word by word (not word-aligned)", "upload pieces checked (EXP124=2)",
+        "upload pieces whose words disagree (must be 0)",
     };
 static_assert(fine_counter_names.back() != nullptr, "a fine counter without a name");
 

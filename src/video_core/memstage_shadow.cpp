@@ -1584,7 +1584,8 @@ size_t Process(State& s, u64 position, bool executed) {
             break;
         }
         if (s.engine_copy == nullptr) {
-            other_engine(method, s.engine->execution_mask[method]);
+            // Direct: a macro's words (GpuSplit::MacroWords, EXP124), called as a Direct Method.
+            other_engine(method, (head & Access::Direct) != 0 || s.engine->execution_mask[method]);
             if (method == 0xaf || method == 0xb0 || method == 0x107) {
                 const u32* const words = reinterpret_cast<const u32*>(entry + data);
                 for (u32 i = 0; i < amount; ++i) {

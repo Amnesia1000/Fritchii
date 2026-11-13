@@ -5939,18 +5939,26 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
     AccelerateInlineToMemoryImpl(address, copy_size, memory);
 }
 
-void RasterizerVulkan::AccelerateInlineToMemoryImpl(GPUVAddr address, size_t copy_size,
-                                                    std::span<const u8> memory) {
-    const Common::WriteRing::SiteScope write_site{"inline upload (AccelerateInlineToMemory)", false};
-    const VideoCommon::Nx2Profile::FineScope inline_zone{VideoCommon::Nx2Profile::Zone::InlineUpload};
+namespace {
+/// EDEN_NX2_INLINE_DEFER=0: invalidate every cache at once (for comparisons).
+bool InlineDefer() {
+    static const bool defer = [] {
+        const char* value = std::getenv("EDEN_NX2_INLINE_DEFER");
+        return value == nullptr || value[0] != '0';
+    }();
+    return defer;
+}
+} // Anonymous namespace
+
+void RasterizerVulkan::InlineUploadNote(GPUVAddr address, std::optional<DAddr> cpu_addr,
+                                        size_t copy_size, std::span<const u8> memory) {
     using Fine = VideoCommon::Nx2Profile::FineCounter;
-    // fable_memstage_compute_brief 3 (GPU profile 2): by size, and below by branch.
+    // fable_memstage_compute_brief 3 (GPU profile 2): by size; the caller counts the branch.
     VideoCommon::Nx2Profile::AddFine(copy_size <= 4     ? Fine::InlineSize4
                                      : copy_size <= 64  ? Fine::InlineSize64
                                      : copy_size <= 256 ? Fine::InlineSize256
                                                         : Fine::InlineSizeMore,
                                      1);
-    auto cpu_addr = gpu_memory->GpuToCpuAddress(address);
     // EDEN_NX2_MEMSTAGE_STATS: an inline upload, and whether it lands on texture pages (join 2).
     VideoCommon::MemStageStats::StreamWrite(VideoCommon::MemStageStats::Write::Inline,
                                             cpu_addr.value_or(0), copy_size);
@@ -5968,33 +5976,152 @@ void RasterizerVulkan::AccelerateInlineToMemoryImpl(GPUVAddr address, size_t cop
                      address, copy_size, first_word);
         }
     }
+}
+
+bool RasterizerVulkan::InlineSkipsCaches(DAddr cpu_addr, size_t copy_size) {
+    // EDEN_NX2_EXP85 & 1 (live; fable52_answer_microcuts 1): no GPU write ever marked these pages,
+    // so InlineMemory would find no GPU-modified range to upload into (both gpu_modified_ranges.Add
+    // sites mark the GPU-written bit, on this thread): skip the buffer cache's lock.
+    if (!InlineDefer() || (VideoCore::Nx2Debug::Experiment(85) & 1) == 0) {
+        return false;
+    }
+    const DAddr page_begin = Common::AlignDown(cpu_addr, Core::DEVICE_PAGESIZE);
+    const DAddr page_end = Common::AlignUp(cpu_addr + copy_size, Core::DEVICE_PAGESIZE);
+    return !MayBeGpuModified(page_begin, page_end - page_begin);
+}
+
+void RasterizerVulkan::InlineUntouchedTail(GPUVAddr address, DAddr cpu_addr, size_t copy_size,
+                                           bool per_word) {
+    // InlineSkipsCaches's branch, after the write. The list note takes its own mutex; the query
+    // cache only where its filter says it holds something.
+    VideoCommon::Nx2Profile::AddFine(VideoCommon::Nx2Profile::FineCounter::InlineNeverWritten, 1);
+    buffer_cache.Nx2NoteListHostWrite(cpu_addr, copy_size);
+    if (query_cache.page_filter.Any(cpu_addr, copy_size)) {
+        query_cache.InvalidateRegion(cpu_addr, copy_size);
+    }
+    if (!per_word) {
+        gpu_memory->AccumulateInvalidation(address, copy_size);
+        return;
+    }
+    // EXP124: the accumulator keeps a range per call where one range does not extend the last,
+    // and skips a call inside it: words added one by one leave what the word calls left.
+    for (size_t offset = 0; offset < copy_size; offset += sizeof(u32)) {
+        gpu_memory->AccumulateInvalidation(address + offset,
+                                           (std::min)(sizeof(u32), copy_size - offset));
+    }
+}
+
+void RasterizerVulkan::AccelerateInlineWords(GPUVAddr address, size_t copy_size,
+                                             std::span<const u8> memory) {
+    // EXP124 (fable_memstage_compute_brief 4.2): a macro's upload words, flushed at once, written
+    // as their calls one by one would have been. Pieces of one 4 KiB page each take one call
+    // where every word of it would take InlineSkipsCaches's branch: there each step (the write,
+    // the list note, the query filter and its invalidation, and the accumulated invalidation,
+    // added word by word) over the piece is the same as over its words, and the page test gives
+    // every word of the page the same answer. Everything else goes word by word, as before.
+    using Fine = VideoCommon::Nx2Profile::FineCounter;
+    const auto add = [](Fine counter) { VideoCommon::Nx2Profile::AddFine(counter, 1); };
+    const auto word_calls = [&](size_t begin, size_t end) {
+        for (size_t offset = begin; offset < end; offset += sizeof(u32)) {
+            const size_t size = (std::min)(sizeof(u32), end - offset);
+            AccelerateInlineToMemory(address + offset, size, memory.subspan(offset, size));
+        }
+    };
+    if (Tegra::Nx2IndirectGrid::AnyLive()) {
+        // The placeholder scan copies x, y and z when it sees all three in one write, x alone in
+        // a word's.
+        add(Fine::InlineWordsGrid);
+        word_calls(0, copy_size);
+        return;
+    }
+    if ((address & 3) != 0) {
+        // The list note clears the page's GPU word marks only for words a write covers whole:
+        // word calls off a 4-byte boundary clear none, one call clears those inside it.
+        add(Fine::InlineWordsUnaligned);
+        word_calls(0, copy_size);
+        return;
+    }
+    constexpr GPUVAddr page_size = GPUVAddr{1} << 12;
+    const bool verify = VideoCore::Nx2Debug::Experiment(124) == 2;
+    for (size_t offset = 0; offset < copy_size;) {
+        const GPUVAddr piece_address = address + offset;
+        const size_t end = (std::min<size_t>)(copy_size,
+                                              offset + (page_size - (piece_address & (page_size - 1))));
+        const size_t size = end - offset;
+        const std::span<const u8> bytes = memory.subspan(offset, size);
+        const std::optional<DAddr> cpu_addr = gpu_memory->GpuToCpuAddress(piece_address);
+        // Sparse pages: Nx2BackSparseWrite saw the words one at a time (WriteWordsCached).
+        const bool sparse =
+            piece_address + size > Tegra::g_nx2_sparse_low.load(std::memory_order_relaxed) &&
+            piece_address < Tegra::g_nx2_sparse_high.load(std::memory_order_relaxed);
+        if (!cpu_addr || sparse) {
+            add(Fine::InlinePiecesUnmapped);
+            word_calls(offset, end);
+            offset = end;
+            continue;
+        }
+        if (!InlineSkipsCaches(*cpu_addr, size)) {
+            add(Fine::InlinePiecesWritten);
+            word_calls(offset, end);
+            offset = end;
+            continue;
+        }
+        if (verify) {
+            // EXP124=2: every word asked as its own call would ask; a piece whose words disagree
+            // goes word by word (must stay 0).
+            add(Fine::InlinePiecesChecked);
+            bool agree = true;
+            for (size_t word = offset; word < end && agree; word += sizeof(u32)) {
+                const size_t word_size = (std::min)(sizeof(u32), end - word);
+                const std::optional<DAddr> word_cpu = gpu_memory->GpuToCpuAddress(address + word);
+                agree = word_cpu && *word_cpu == *cpu_addr + (word - offset) &&
+                        InlineSkipsCaches(*word_cpu, word_size);
+            }
+            if (!agree) {
+                add(Fine::InlinePiecesDisagree);
+                static std::atomic<u32> logged{};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                    LOG_WARNING(Render_Vulkan,
+                                "Upload words (EXP124=2): the words of the piece at {:#x} ({} "
+                                "bytes, device {:#x}) disagree with its page test",
+                                piece_address, size, *cpu_addr);
+                }
+                word_calls(offset, end);
+                offset = end;
+                continue;
+            }
+        }
+        add(Fine::InlinePiecesOne);
+        {
+            const Common::WriteRing::SiteScope write_site{"inline upload (AccelerateInlineWords)",
+                                                          false};
+            const VideoCommon::Nx2Profile::FineScope inline_zone{
+                VideoCommon::Nx2Profile::Zone::InlineUpload};
+            InlineUploadNote(piece_address, cpu_addr, size, bytes);
+            gpu_memory->WriteBlockUnsafe(piece_address, bytes.data(), size);
+            InlineUntouchedTail(piece_address, *cpu_addr, size, true);
+        }
+        offset = end;
+    }
+}
+
+void RasterizerVulkan::AccelerateInlineToMemoryImpl(GPUVAddr address, size_t copy_size,
+                                                    std::span<const u8> memory) {
+    const Common::WriteRing::SiteScope write_site{"inline upload (AccelerateInlineToMemory)", false};
+    const VideoCommon::Nx2Profile::FineScope inline_zone{VideoCommon::Nx2Profile::Zone::InlineUpload};
+    using Fine = VideoCommon::Nx2Profile::FineCounter;
+    const auto cpu_addr = gpu_memory->GpuToCpuAddress(address);
+    InlineUploadNote(address, cpu_addr, copy_size, memory);
     if (!cpu_addr) [[unlikely]] {
         VideoCommon::Nx2Profile::AddFine(Fine::InlineUnmapped, 1);
         gpu_memory->WriteBlock(address, memory.data(), copy_size);
         return;
     }
     gpu_memory->WriteBlockUnsafe(address, memory.data(), copy_size);
-    // EDEN_NX2_INLINE_DEFER=0: invalidate every cache at once (for comparisons).
-    static const bool defer = [] {
-        const char* value = std::getenv("EDEN_NX2_INLINE_DEFER");
-        return value == nullptr || value[0] != '0';
-    }();
-    // EDEN_NX2_EXP85 & 1 (live; fable52_answer_microcuts 1): no GPU write ever marked these pages,
-    // so InlineMemory would find no GPU-modified range to upload into (both gpu_modified_ranges.Add
-    // sites mark the GPU-written bit, on this thread): skip the buffer cache's lock. The list note
-    // takes its own mutex; the query cache only where its filter says it holds something.
-    if (defer && (VideoCore::Nx2Debug::Experiment(85) & 1) != 0) {
-        const DAddr page_begin = Common::AlignDown(*cpu_addr, Core::DEVICE_PAGESIZE);
-        const DAddr page_end = Common::AlignUp(*cpu_addr + copy_size, Core::DEVICE_PAGESIZE);
-        if (!MayBeGpuModified(page_begin, page_end - page_begin)) {
-            VideoCommon::Nx2Profile::AddFine(Fine::InlineNeverWritten, 1);
-            buffer_cache.Nx2NoteListHostWrite(*cpu_addr, copy_size);
-            if (query_cache.page_filter.Any(*cpu_addr, copy_size)) {
-                query_cache.InvalidateRegion(*cpu_addr, copy_size);
-            }
-            gpu_memory->AccumulateInvalidation(address, copy_size);
-            return;
-        }
+    const bool defer = InlineDefer();
+    if (InlineSkipsCaches(*cpu_addr, copy_size)) {
+        InlineUntouchedTail(address, *cpu_addr, copy_size, false);
+        return;
     }
     // One cache at a time: holding both while waiting for either (std::lock) waited longer, the
     // fencing thread and CPU write traps holding one of them most of the time.

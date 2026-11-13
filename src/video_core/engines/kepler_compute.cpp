@@ -1081,6 +1081,32 @@ void KeplerCompute::CallMultiMethod(Core::System& system, u32 method, const u32*
     }
 }
 
+void KeplerCompute::CallMacroWords(Core::System& system, u32 method, const u32* words,
+                                   u32 amount) {
+    // EXP124 (fable_memstage_compute_brief 4.2). Each word was a last call: with the flush in
+    // place, each flushed itself alone. Here only the last word flushes, and AccelerateInlineWords
+    // writes the words as those calls would have. Every word still goes through CallMethod, so
+    // the registers and the upload's state end as the word calls left them.
+    if (method != KEPLER_COMPUTE_REG_INDEX(data_upload) || amount == 0 ||
+        !upload_state.FlushesInPlace()) {
+        EngineInterface::CallMacroWords(system, method, words, amount);
+        return;
+    }
+    u32 first = 0;
+    if (upload_state.HasUnflushed()) {
+        // Words an earlier call left unflushed: the first word's call flushes them with it.
+        CallMethod(system, method, words[0], true);
+        first = 1;
+    }
+    upload_state.SetWordsAsCalls(true);
+    SCOPE_EXIT {
+        upload_state.SetWordsAsCalls(false);
+    };
+    for (u32 i = first; i < amount; ++i) {
+        CallMethod(system, method, words[i], i + 1 == amount);
+    }
+}
+
 bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& qmd) {
     launch_description = {};
     launch_description.grid_dim_x.Assign(qmd[12]);
@@ -2115,6 +2141,8 @@ struct KeplerCompute::FrontState {
     u64 upload_tag{};
     std::vector<u32> upload_batch;
     u64 upload_batch_position{};
+    /// EXP124: data_upload words the running macro emitted, not sent yet (FrontSendUploadWords).
+    std::vector<u32> macro_upload_words;
 };
 
 namespace {
@@ -2757,6 +2785,30 @@ void KeplerCompute::FrontFlushUploads(VideoCommon::GpuSplit& split, FrontState& 
     fs.upload_batch.clear();
 }
 
+void KeplerCompute::FrontSendUploadWords(VideoCommon::GpuSplit& split, FrontState& fs) {
+    auto& words = fs.macro_upload_words;
+    if (words.empty()) {
+        return;
+    }
+    constexpr u32 method = KEPLER_COMPUTE_REG_INDEX(data_upload);
+    const u32 count = static_cast<u32>(words.size());
+    split.MacroWords(this, method, words.data(), count, FrontEffect(method));
+    // After the entry, in the order each word's MacroWrite made them: the notes stamp the write
+    // position, so a note before the entry would name a position before it. Each word noted
+    // the upload's whole range; one note at the entry's end says the same (FrontNoteWrites
+    // notes nothing for data_upload).
+    FrontNoteWriter(split, fs, method, words.back());
+    if (VideoCommon::QmdPrediction::MirrorMode()) {
+        // EXP13=2: the copy's batch, at the entry's position (FrontFlushUploads follows).
+        fs.upload_batch.insert(fs.upload_batch.end(), words.begin(), words.end());
+        fs.upload_batch_position = split.SentPosition();
+    }
+    VideoCommon::Nx2Profile::AddFine(VideoCommon::Nx2Profile::FineCounter::UploadEntries, 1);
+    VideoCommon::Nx2Profile::AddFine(VideoCommon::Nx2Profile::FineCounter::UploadEntryWords,
+                                     count);
+    words.clear();
+}
+
 void KeplerCompute::FrontPatchOverlays(VideoCommon::GpuSplit& split, FrontState& fs,
                                        const u32* words, u32 count, u64 position) const {
     // As Upload::State::ProcessData: the data words fill the upload's bytes in order, four each
@@ -3164,6 +3216,9 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
             }
         }
     }
+    // EXP124 (fable_memstage_compute_brief 4.2): the macro's upload data words go as one entry,
+    // sent before any other write it emits and at its end. Read once a call.
+    const bool upload_words_entry = VideoCore::Nx2Debug::Experiment(124) != 0;
     const auto emit = [&](u32 address, u32 value) {
         if (trace) [[unlikely]] {
             trace_text += fmt::format(" {:x}={:x}", address, value);
@@ -3172,6 +3227,9 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         if (address >= 0xe00) {
             return false;
         }
+        if (!fs.macro_upload_words.empty() && address != KEPLER_COMPUTE_REG_INDEX(data_upload)) {
+            FrontSendUploadWords(split, fs);
+        }
         if (!fs.upload_batch.empty() && address != KEPLER_COMPUTE_REG_INDEX(data_upload)) {
             FrontFlushUploads(split, fs);
         }
@@ -3179,6 +3237,13 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
             return true;
         }
         FrontApply(fs, address, value);
+        if (upload_words_entry && address == KEPLER_COMPUTE_REG_INDEX(data_upload)) {
+            // FrontApply above: a later register read of the macro sees the word.
+            VideoCommon::Nx2Profile::AddFine(
+                VideoCommon::Nx2Profile::FineCounter::UploadWordsMacro, 1);
+            fs.macro_upload_words.push_back(value);
+            return true;
+        }
         split.MacroWrite(this, address, value, FrontEffect(address));
         FrontNoteWrites(split, fs, address);
         FrontNoteWriter(split, fs, address, value);
@@ -3207,7 +3272,8 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
     const auto result =
         macro.native_interpreter.Execute(macro.native_code, start, fs.parameters, read, emit);
 #endif
-    FrontFlushUploads(split, fs); // The macro's upload words, at once
+    FrontSendUploadWords(split, fs); // EXP124: the macro's last upload words
+    FrontFlushUploads(split, fs);    // The macro's upload words, at once
     if (!result.success) {
         macro.native_execution_failed = true;
         LOG_ERROR(HW_GPU, "Native MME (split front) failed: compute start={:#x}, consumed={}, error={}",
