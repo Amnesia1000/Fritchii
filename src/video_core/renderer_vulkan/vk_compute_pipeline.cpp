@@ -28,6 +28,7 @@
 #include "video_core/nx2_profile.h"
 #include "video_core/shader_handle_program.h"
 #include "video_core/shader_notify.h"
+#include "video_core/texture_handle_values.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
@@ -395,6 +396,23 @@ bool ComputePipeline::CanReplaceOcarinaUpscale() const {
            std::ranges::none_of(info.storage_buffers_descriptors, &Shader::StorageBufferDescriptor::is_written);
 }
 
+// SEAM >= 3 (EXP123, vk_mem_stage.cpp): every raw handle this dispatch binds, in the order
+// Configure's handle loop reads them, into the dispatch packet. Called by the early fill, or by
+// Configure when no fill made them.
+void ComputePipeline::FillHandleValues(MemStage& seam,
+                                       const Tegra::Engines::KeplerCompute& kepler_compute,
+                                       Tegra::MemoryManager& gpu_memory, bool null_pointer_handles,
+                                       bool in_configure) {
+    seam.FillHandleValues(true, null_pointer_handles, in_configure, [&](std::vector<u32>& values) {
+        const auto& qmd{kepler_compute.launch_description};
+        VideoCommon::FillStageHandleValues<true>(
+            info, gpu_memory,
+            VideoCommon::ComputeHandleCbufs<std::remove_cvref_t<decltype(qmd)>>{qmd},
+            device.GetStorageBufferAlignment(), null_pointer_handles,
+            [&values](u32 raw) { values.push_back(raw); });
+    });
+}
+
 bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                                 Tegra::MemoryManager& gpu_memory, Scheduler& scheduler,
                                 BufferCache& buffer_cache, TextureCache& texture_cache,
@@ -430,52 +448,55 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     boost::container::small_vector<VideoCommon::SamplerId, 64> samplers;
 
     const auto& qmd{kepler_compute.launch_description};
-    const auto& cbufs{qmd.const_buffer_config};
     const bool via_header_index{qmd.linked_tsc != 0};
-    const auto cbuf_address{[&](u32 cbuf) -> GPUVAddr {
-        return cbuf < cbufs.size() && ((qmd.const_buffer_enable_mask >> cbuf) & 1) != 0
-                   ? cbufs[cbuf].Address()
-                   : GPUVAddr{};
+    // The handle words and handle programs: one function for the back's own read and the memory
+    // seam's fill (texture_handle_values.h). EDEN_NX2_HANDLE_ALIGN=0 reads a single handle
+    // program's words at the unaligned address (A/B, HandleProgramAlignment).
+    const VideoCommon::ComputeHandleCbufs<std::remove_cvref_t<decltype(qmd)>> cbuf_view{qmd};
+    const u64 storage_alignment{device.GetStorageBufferAlignment()};
+    // SEAM >= 3 (EXP123, vk_mem_stage.cpp): the raw handles come in the dispatch packet, with the
+    // EXP21 value they were made with; made here when no early fill made them.
+    MemStage& seam{buffer_cache.runtime.Seam()};
+    const std::vector<u32>* handle_values{};
+    bool packet_null_pointers{};
+    if (seam.ValuesByValue()) {
+        handle_values = seam.HandleValues(true, packet_null_pointers);
+        if (handle_values == nullptr) {
+            FillHandleValues(seam, kepler_compute, gpu_memory,
+                             VideoCore::Nx2Debug::Experiment(21) != 0, true);
+            handle_values = seam.HandleValues(true, packet_null_pointers);
+        }
+    }
+    const bool verify_handles{handle_values != nullptr &&
+                              (MemStage::VerifyBits() & MemStage::VerifyHandles) != 0};
+    size_t handle_cursor{};
+    const auto next_value{[&](u32& value) {
+        if (handle_cursor < handle_values->size()) {
+            value = (*handle_values)[handle_cursor++];
+            return true;
+        }
+        ++handle_cursor;
+        return false;
     }};
     const auto read_handle{[&](const auto& desc, u32 index) {
-        if (desc.handle_program != ~0U) {
-            // EDEN_NX2_MEMSTAGE_STATS: a handle program (its storage reads are not sized).
-            VideoCommon::MemStageStats::Read(VideoCommon::MemStageStats::Kind::CHandleProgram, 0);
-            // Read by the shader from a storage buffer: computed for this dispatch.
-            // EDEN_NX2_HANDLE_ALIGN=0 reads the words at the unaligned address (A/B).
-            static const bool align_storage{[] {
-                const char* const value{std::getenv("EDEN_NX2_HANDLE_ALIGN")};
-                return value == nullptr || *value != '0';
-            }()};
-            return TexturePair(VideoCommon::EvaluateTextureHandle(
-                                   info, desc.handle_program, gpu_memory, cbuf_address,
-                                   align_storage ? device.GetStorageBufferAlignment() : 1,
-                                   index),
+        if (handle_values == nullptr) {
+            return TexturePair(VideoCommon::RawTextureHandle<true>(info, desc, index, gpu_memory,
+                                                                   cbuf_view, storage_alignment),
                                via_header_index);
         }
-        ASSERT(((qmd.const_buffer_enable_mask >> desc.cbuf_index) & 1) != 0);
-        const u32 index_offset{index << desc.size_shift};
-        const u32 offset{desc.cbuf_offset + index_offset};
-        const GPUVAddr addr{cbufs[desc.cbuf_index].Address() + offset};
-        if constexpr (std::is_same_v<decltype(desc), const Shader::TextureDescriptor&> ||
-                      std::is_same_v<decltype(desc), const Shader::TextureBufferDescriptor&>) {
-            if (desc.has_secondary) {
-                ASSERT(((qmd.const_buffer_enable_mask >> desc.secondary_cbuf_index) & 1) != 0);
-                const u32 secondary_offset{desc.secondary_cbuf_offset};
-                const GPUVAddr separate_addr{cbufs[desc.secondary_cbuf_index].Address() +
-                                             secondary_offset};
-                const u32 lhs_raw{gpu_memory.ReadHandleWord(addr) << desc.shift_left};
-                const u32 rhs_raw{gpu_memory.ReadHandleWord(separate_addr) << desc.secondary_shift_left};
-                // EDEN_NX2_MEMSTAGE_STATS: two handle words.
-                VideoCommon::MemStageStats::Read(VideoCommon::MemStageStats::Kind::CHandleWord,
-                                                 2 * sizeof(u32), 2);
-                return TexturePair(lhs_raw | rhs_raw, via_header_index);
-            }
+        u32 value{};
+        if (!next_value(value)) [[unlikely]] {
+            value = VideoCommon::RawTextureHandle<true>(info, desc, index, gpu_memory, cbuf_view,
+                                                        storage_alignment);
+        } else if (verify_handles) [[unlikely]] {
+            // FRITCHII_MEMSTAGE_VERIFY & 1 (5.4): the back's own read.
+            const u32 own{VideoCommon::RawTextureHandle<true>(info, desc, index, gpu_memory,
+                                                              cbuf_view, storage_alignment)};
+            seam.NoteValueCheck(MemStage::Value::Handle, own == value,
+                                VideoCommon::HandleWordAddress(desc, index, cbuf_view),
+                                shader_hash, value, own);
         }
-        // EDEN_NX2_MEMSTAGE_STATS: one handle word.
-        VideoCommon::MemStageStats::Read(VideoCommon::MemStageStats::Kind::CHandleWord,
-                                         sizeof(u32));
-        return TexturePair(gpu_memory.ReadHandleWord(addr), via_header_index);
+        return TexturePair(value, via_header_index);
     }};
     const auto add_image{[&](const auto& desc, bool blacklist) {
         for (u32 index = 0; index < desc.count; ++index) {
@@ -494,7 +515,10 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         add_image(desc, false);
     }
     // EDEN_NX2_EXP21 (default 1; 0 = off): no texture for a handle that is a buffer address.
-    const bool null_pointer_handles{VideoCore::Nx2Debug::Experiment(21) != 0};
+    // SEAM >= 3: the value the packet's handles were made with.
+    const bool null_pointer_handles{handle_values != nullptr
+                                        ? packet_null_pointers
+                                        : VideoCore::Nx2Debug::Experiment(21) != 0};
     u32 texture{};
     for (const auto& desc : info.texture_descriptors) {
         if (desc.count > 1 && desc.handle_program != ~0U) {
@@ -503,17 +527,40 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
             const size_t first{views.size()};
             u32 last_sampler_index{~0U};
             VideoCommon::SamplerId sampler{};
-            VideoCommon::EvaluateTextureHandles(
-                info, desc.handle_program, gpu_memory, cbuf_address,
-                device.GetStorageBufferAlignment(), desc.count, [&](u32, u32 raw) {
-                    const auto handle{TexturePair(raw, via_header_index)};
-                    views.push_back({handle.first});
-                    if (handle.second != last_sampler_index) {
-                        sampler = texture_cache.GetSamplerId(handle.second, true);
-                        last_sampler_index = handle.second;
+            const auto table_element{[&](u32, u32 raw) {
+                const auto handle{TexturePair(raw, via_header_index)};
+                views.push_back({handle.first});
+                if (handle.second != last_sampler_index) {
+                    sampler = texture_cache.GetSamplerId(handle.second, true);
+                    last_sampler_index = handle.second;
+                }
+                samplers.push_back(sampler);
+            }};
+            if (handle_values == nullptr) {
+                VideoCommon::RawTextureHandleTable(info, desc, gpu_memory, cbuf_view,
+                                                   storage_alignment, table_element);
+            } else {
+                // SEAM >= 3: the table's values from the dispatch packet.
+                boost::container::small_vector<u32, 16> own;
+                if (verify_handles || handle_cursor + desc.count > handle_values->size())
+                    [[unlikely]] {
+                    VideoCommon::RawTextureHandleTable(
+                        info, desc, gpu_memory, cbuf_view, storage_alignment,
+                        [&own](u32, u32 raw) { own.push_back(raw); });
+                }
+                for (u32 element = 0; element < desc.count; ++element) {
+                    u32 value{};
+                    if (!next_value(value)) [[unlikely]] {
+                        value = own[element];
+                    } else if (verify_handles) [[unlikely]] {
+                        seam.NoteValueCheck(MemStage::Value::Handle, own[element] == value,
+                                            VideoCommon::HandleWordAddress(desc, element,
+                                                                           cbuf_view),
+                                            shader_hash, value, own[element]);
                     }
-                    samplers.push_back(sampler);
-                });
+                    table_element(element, value);
+                }
+            }
             if (VideoCommon::HandleTableNotes::Wanted()) {
                 std::vector<u32> tics(desc.count);
                 for (u32 index = 0; index < desc.count; ++index) {
@@ -525,10 +572,14 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
             continue;
         }
         for (u32 index = 0; index < desc.count; ++index) {
-            const auto handle{null_pointer_handles &&
-                                      VideoCommon::HandleIsStoragePointer(info, desc, index)
-                                  ? VideoCommon::NULL_TEXTURE_HANDLE
-                                  : read_handle(desc, index)};
+            const bool null_handle{null_pointer_handles &&
+                                   VideoCommon::HandleIsStoragePointer(info, desc, index)};
+            if (null_handle && handle_values != nullptr) {
+                // SEAM >= 3: the packet keeps its place (SKIPPED_HANDLE_VALUE).
+                ++handle_cursor;
+            }
+            const auto handle{null_handle ? VideoCommon::NULL_TEXTURE_HANDLE
+                                          : read_handle(desc, index)};
             views.push_back({handle.first});
 
             VideoCommon::SamplerId sampler = texture_cache.GetSamplerId(handle.second, true);
@@ -538,6 +589,9 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     }
     for (const auto& desc : info.image_descriptors) {
         add_image(desc, desc.is_written);
+    }
+    if (handle_values != nullptr) {
+        seam.LookedAtHandleValues(true, handle_cursor);
     }
     texture_cache.FillImageViews(std::span(views.data(), views.size()), true);
     views_scope.reset();

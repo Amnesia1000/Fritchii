@@ -38,6 +38,7 @@
 #include "video_core/memstage_stats.h"
 #include "video_core/shader_handle_program.h"
 #include "video_core/shader_notify.h"
+#include "video_core/texture_handle_values.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/gpu_logging/gpu_logging.h"
@@ -1219,6 +1220,25 @@ bool GraphicsPipeline::ComputedHandlesChanged(const Tegra::Engines::Maxwell3D& m
     return false;
 }
 
+// SEAM >= 3 (EXP123, vk_mem_stage.cpp): every raw handle this draw binds, in the order
+// ConfigureImpl's handle loop reads them, into the draw packet. Called by the early fill, or by
+// ConfigureImpl when no fill made them. `maxwell3d` and `gpu_memory` are the draw's (SetEngine).
+void GraphicsPipeline::FillHandleValues(MemStage& seam, bool null_pointer_handles,
+                                        bool in_configure) {
+    seam.FillHandleValues(false, null_pointer_handles, in_configure, [&](std::vector<u32>& values) {
+        values.reserve(num_image_elements);
+        const auto& stages{maxwell3d->state.shader_stages};
+        using Cbufs = std::remove_cvref_t<decltype(stages[0].const_buffers)>;
+        VideoCommon::FillGraphicsHandleValues(
+            std::span<const Shader::Info>{stage_infos}, *gpu_memory,
+            [&stages](size_t stage) {
+                return VideoCommon::GraphicsHandleCbufs<Cbufs>{stages[stage].const_buffers};
+            },
+            device.GetStorageBufferAlignment(), null_pointer_handles,
+            [&values](u32 raw) { values.push_back(raw); });
+    });
+}
+
 bool GraphicsPipeline::TexBankEligible() {
     TexBankMemo& memo = tex_bank_memo;
     if (memo.eligible < 0) [[unlikely]] {
@@ -1494,7 +1514,28 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             texture_cache.TexBankReset();
         }
     }
-    const bool tex_bank_null_pointers{!Delta && VideoCore::Nx2Debug::Experiment(21) != 0};
+    // SEAM >= 3 (EXP123, vk_mem_stage.cpp): the raw handles come in the draw packet, with the
+    // EXP21 value they were made with. When no early fill made them they are made here, before
+    // the bank decision: the fill always runs, a TEX_BANK_GEN hit then does not look at them.
+    MemStage& seam{buffer_cache.runtime.Seam()};
+    const std::vector<u32>* handle_values{};
+    bool packet_null_pointers{};
+    if constexpr (!Delta) {
+        if (seam.ValuesByValue()) {
+            handle_values = seam.HandleValues(false, packet_null_pointers);
+            if (handle_values == nullptr) {
+                Profile::Scope scope{Profile::Zone::ReadHandles};
+                FillHandleValues(seam, VideoCore::Nx2Debug::Experiment(21) != 0, true);
+                handle_values = seam.HandleValues(false, packet_null_pointers);
+            }
+        }
+    }
+    const bool verify_handles{handle_values != nullptr &&
+                              (MemStage::VerifyBits() & MemStage::VerifyHandles) != 0};
+    size_t handle_cursor{};
+    const bool tex_bank_null_pointers{
+        !Delta && (handle_values != nullptr ? packet_null_pointers
+                                            : VideoCore::Nx2Debug::Experiment(21) != 0)};
     const bool tex_bank_on = tex_bank_switch > 0 && TexBankEligible();
     if (tex_bank_switch > 0 && !tex_bank_on) {
         ++TexBankControl::Get().ineligible;
@@ -1553,27 +1594,49 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         const auto cbuf_address{[&cbufs](u32 cbuf) -> GPUVAddr {
             return cbuf < cbufs.size() && cbufs[cbuf].enabled ? cbufs[cbuf].address : GPUVAddr{};
         }};
+        // The handle words and handle programs: one function for the back's own read and the
+        // memory seam's fill (texture_handle_values.h).
+        const VideoCommon::GraphicsHandleCbufs<std::remove_cvref_t<decltype(cbufs)>> cbuf_view{
+            cbufs};
+        const u64 storage_alignment{device.GetStorageBufferAlignment()};
+        // SEAM >= 3: the next value of the draw packet, false past its end (a count mismatch,
+        // counted when the loop ends).
+        const auto next_value{[&](u32& value) {
+            if (handle_cursor < handle_values->size()) {
+                value = (*handle_values)[handle_cursor++];
+                return true;
+            }
+            ++handle_cursor;
+            return false;
+        }};
+        const auto raw_handle{[&](const auto& desc, u32 index) -> u32 {
+            if (handle_values == nullptr) {
+                return VideoCommon::RawTextureHandle<false>(info, desc, index, *gpu_memory,
+                                                            cbuf_view, storage_alignment);
+            }
+            u32 value{};
+            if (!next_value(value)) [[unlikely]] {
+                return VideoCommon::RawTextureHandle<false>(info, desc, index, *gpu_memory,
+                                                            cbuf_view, storage_alignment);
+            }
+            if (verify_handles) [[unlikely]] {
+                // FRITCHII_MEMSTAGE_VERIFY & 1 (5.4): the back's own read.
+                const u32 own{VideoCommon::RawTextureHandle<false>(
+                    info, desc, index, *gpu_memory, cbuf_view, storage_alignment)};
+                seam.NoteValueCheck(MemStage::Value::Handle, own == value,
+                                    VideoCommon::HandleWordAddress(desc, index, cbuf_view),
+                                    key.unique_hashes[stage + 1], value, own);
+            }
+            return value;
+        }};
         const auto read_handle{[&](const auto& desc, u32 index) {
+            const u32 raw{raw_handle(desc, index)};
             if (desc.handle_program != ~0U) {
-                // EDEN_NX2_MEMSTAGE_STATS: a handle program (its storage reads are not sized).
-                VideoCommon::MemStageStats::Read(VideoCommon::MemStageStats::Kind::HandleProgram,
-                                                 0);
                 // Read by the shader from a storage buffer: computed for this draw.
                 // (for an array, for each element: EDEN_NX2_LIGHT_TABLE_ARRAYS)
-                const auto evaluate{[&](u64 storage_alignment) {
-                    return VideoCommon::EvaluateTextureHandle(info, desc.handle_program,
-                                                              *gpu_memory, cbuf_address,
-                                                              storage_alignment, index);
-                }};
                 // The program's storage offsets are relative to the buffer address aligned down
-                // to the host storage alignment (StorageOffset). EDEN_NX2_HANDLE_ALIGN=0 reads
-                // the words at the unaligned address instead (A/B).
-                static const bool align_storage{[] {
-                    const char* const value{std::getenv("EDEN_NX2_HANDLE_ALIGN")};
-                    return value == nullptr || *value != '0';
-                }()};
-                const u64 storage_alignment{device.GetStorageBufferAlignment()};
-                const u32 raw{evaluate(align_storage ? storage_alignment : 1)};
+                // to the host storage alignment (StorageOffset); EDEN_NX2_HANDLE_ALIGN=0 reads
+                // the words at the unaligned address instead (A/B, HandleProgramAlignment).
                 if constexpr (KeepLast) {
                     kept_draw->handles.push_back(raw);
                     kept_draw->computed.push_back({
@@ -1581,7 +1644,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                         .program = desc.handle_program,
                         .element = index,
                         .value = raw,
-                        .alignment = align_storage ? storage_alignment : 1,
+                        .alignment = VideoCommon::HandleProgramAlignment(storage_alignment),
                     });
                 }
                 if (raw == 0) {
@@ -1589,6 +1652,11 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                     static std::set<std::pair<u64, u32>> logged;
                     const std::pair key_program{key.unique_hashes[stage + 1], desc.handle_program};
                     if (logged.size() < 64 && logged.insert(key_program).second) {
+                        const auto evaluate{[&](u64 alignment) {
+                            return VideoCommon::EvaluateTextureHandle(info, desc.handle_program,
+                                                                      *gpu_memory, cbuf_address,
+                                                                      alignment, index);
+                        }};
                         LOG_INFO(Render_Vulkan,
                                  "Texture handle program {} of stage {} (shader {:016x}) gave 0; "
                                  "aligned to {} it gives {:#x}, unaligned {:#x}",
@@ -1598,40 +1666,10 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 }
                 return TexturePair(raw, via_header_index);
             }
-            ASSERT(cbufs[desc.cbuf_index].enabled);
-            const u32 index_offset{index << desc.size_shift};
-            const u32 offset{desc.cbuf_offset + index_offset};
-            const GPUVAddr addr{cbufs[desc.cbuf_index].address + offset};
-            if constexpr (std::is_same_v<decltype(desc), const Shader::TextureDescriptor&> ||
-                          std::is_same_v<decltype(desc), const Shader::TextureBufferDescriptor&>) {
-                if (desc.has_secondary) {
-                    ASSERT(cbufs[desc.secondary_cbuf_index].enabled);
-                    const u32 second_offset{desc.secondary_cbuf_offset};
-                    const GPUVAddr separate_addr{cbufs[desc.secondary_cbuf_index].address +
-                                                 second_offset};
-                    const u32 lhs_raw{gpu_memory->ReadHandleWord(addr) << desc.shift_left};
-                    const u32 rhs_raw{gpu_memory->ReadHandleWord(separate_addr)
-                                      << desc.secondary_shift_left};
-                    const u32 raw{lhs_raw | rhs_raw};
-                    // EDEN_NX2_MEMSTAGE_STATS: two handle words.
-                    VideoCommon::MemStageStats::Read(VideoCommon::MemStageStats::Kind::HandleWord,
-                                                     2 * sizeof(u32), 2);
-                    if constexpr (KeepLast) {
-                        kept_draw->handles.push_back(raw);
-                    }
-                    return TexturePair(raw, via_header_index);
-                }
-            }
-            // EDEN_NX2_MEMSTAGE_STATS: one handle word.
-            VideoCommon::MemStageStats::Read(VideoCommon::MemStageStats::Kind::HandleWord,
-                                             sizeof(u32));
             if constexpr (KeepLast) {
-                const u32 raw{gpu_memory->ReadHandleWord(addr)};
                 kept_draw->handles.push_back(raw);
-                return TexturePair(raw, via_header_index);
-            } else {
-                return TexturePair(gpu_memory->ReadHandleWord(addr), via_header_index);
             }
+            return TexturePair(raw, via_header_index);
         }};
         const auto add_image{[&](const auto& desc, bool blacklist) LAMBDA_FORCEINLINE {
             for (u32 index = 0; index < desc.count; ++index) {
@@ -1668,40 +1706,62 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 const size_t first{views.size()};
                 u32 last_sampler_index{~0U};
                 VideoCommon::SamplerId sampler{};
-                VideoCommon::EvaluateTextureHandles(
-                    info, desc.handle_program, *gpu_memory, cbuf_address,
-                    device.GetStorageBufferAlignment(), desc.count,
-                    [&]([[maybe_unused]] u32 element, u32 raw) {
-                        if constexpr (KeepLast) {
-                            kept_draw->handles.push_back(raw);
-                            kept_draw->computed.push_back({
-                                .stage = static_cast<u32>(stage),
-                                .program = desc.handle_program,
-                                .element = element,
-                                .value = raw,
-                                .alignment = device.GetStorageBufferAlignment(),
-                            });
+                const auto table_element{[&]([[maybe_unused]] u32 element, u32 raw) {
+                    if constexpr (KeepLast) {
+                        kept_draw->handles.push_back(raw);
+                        kept_draw->computed.push_back({
+                            .stage = static_cast<u32>(stage),
+                            .program = desc.handle_program,
+                            .element = element,
+                            .value = raw,
+                            .alignment = device.GetStorageBufferAlignment(),
+                        });
+                    }
+                    const auto handle{TexturePair(raw, via_header_index)};
+                    views.push_back({handle.first});
+                    if (tex_bank_on) {
+                        tex_bank_sampler_handles.push_back(handle.second);
+                    }
+                    if (texture_memo_on || use_template) {
+                        sampler_handles.push_back(handle.second);
+                    } else {
+                        if (handle.second != last_sampler_index) {
+                            sampler = texture_cache.GetSamplerId(handle.second, false);
+                            last_sampler_index = handle.second;
                         }
-                        const auto handle{TexturePair(raw, via_header_index)};
-                        views.push_back({handle.first});
-                        if (tex_bank_on) {
-                            tex_bank_sampler_handles.push_back(handle.second);
+                        samplers.push_back(sampler);
+                    }
+                    if (use_template) {
+                        template_handles.push_back(via_header_index
+                                                       ? handle.first
+                                                       : handle.first | (handle.second << 20));
+                    }
+                }};
+                if (handle_values == nullptr) {
+                    VideoCommon::RawTextureHandleTable(info, desc, *gpu_memory, cbuf_view,
+                                                       storage_alignment, table_element);
+                } else {
+                    // SEAM >= 3: the table's values from the draw packet.
+                    boost::container::small_vector<u32, 16> own;
+                    if (verify_handles || handle_cursor + desc.count > handle_values->size())
+                        [[unlikely]] {
+                        VideoCommon::RawTextureHandleTable(
+                            info, desc, *gpu_memory, cbuf_view, storage_alignment,
+                            [&own](u32, u32 raw) { own.push_back(raw); });
+                    }
+                    for (u32 element = 0; element < desc.count; ++element) {
+                        u32 value{};
+                        if (!next_value(value)) [[unlikely]] {
+                            value = own[element];
+                        } else if (verify_handles) [[unlikely]] {
+                            seam.NoteValueCheck(
+                                MemStage::Value::Handle, own[element] == value,
+                                VideoCommon::HandleWordAddress(desc, element, cbuf_view),
+                                key.unique_hashes[stage + 1], value, own[element]);
                         }
-                        if (texture_memo_on || use_template) {
-                            sampler_handles.push_back(handle.second);
-                        } else {
-                            if (handle.second != last_sampler_index) {
-                                sampler = texture_cache.GetSamplerId(handle.second, false);
-                                last_sampler_index = handle.second;
-                            }
-                            samplers.push_back(sampler);
-                        }
-                        if (use_template) {
-                            template_handles.push_back(via_header_index
-                                                           ? handle.first
-                                                           : handle.first | (handle.second << 20));
-                        }
-                    });
+                        table_element(element, value);
+                    }
+                }
                 if (VideoCommon::HandleTableNotes::Wanted()) {
                     std::vector<u32> tics(desc.count);
                     for (u32 index = 0; index < desc.count; ++index) {
@@ -1714,10 +1774,14 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 continue;
             }
             for (u32 index = 0; index < desc.count; ++index) {
-                const auto handle{null_pointer_handles &&
-                                          VideoCommon::HandleIsStoragePointer(info, desc, index)
-                                      ? VideoCommon::NULL_TEXTURE_HANDLE
-                                      : read_handle(desc, index)};
+                const bool null_handle{null_pointer_handles &&
+                                       VideoCommon::HandleIsStoragePointer(info, desc, index)};
+                if (null_handle && handle_values != nullptr) {
+                    // SEAM >= 3: the packet keeps its place (SKIPPED_HANDLE_VALUE).
+                    ++handle_cursor;
+                }
+                const auto handle{null_handle ? VideoCommon::NULL_TEXTURE_HANDLE
+                                              : read_handle(desc, index)};
                 if constexpr (KeepLast) {
                     // EXP21's null handle read no word: keep its place (one word per view).
                     if (kept_draw->handles.size() == views.size()) {
@@ -1800,6 +1864,10 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
         if constexpr (Spec::enabled_stages[4]) {
             config_stage(4);
+        }
+        if (handle_values != nullptr) {
+            // None taken: a bank hit skipped the loop. Else all must have been.
+            seam.LookedAtHandleValues(false, handle_cursor);
         }
         if (tex_bank_hit) {
             const TexBankMemo& memo = tex_bank_memo;

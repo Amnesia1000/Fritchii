@@ -61,6 +61,10 @@ public:
                                  std::optional<ByteAddressedShadow>& shadow,
                                  BindCommand* deferred_bind = nullptr);
 
+    void FillHandleValues(MemStage& seam, const Tegra::Engines::KeplerCompute& kepler_compute,
+                          Tegra::MemoryManager& gpu_memory, bool null_pointer_handles,
+                          bool in_configure);
+
     static constexpr u64 Ocarina1440pShader = 0x6bd913e1f34e83ebULL;
     /// The same output pass at 1:1, run at 1920x1080 in handheld with the Max Resolution add-on.
     static constexpr u64 OcarinaFullSizeShader = 0xc033c3ddc9f0897bULL;
