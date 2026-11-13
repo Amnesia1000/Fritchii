@@ -8,10 +8,13 @@
 
 #include "dynarmic/backend/x64/a64_emit_x64.h"
 
+#include <algorithm>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <fmt/ostream.h>
 #include "common/assert.h"
 #include "common/common_types.h"
+#include "common/logging.h"
 #include "dynarmic/ir/terminal.h"
 #include "dynarmic/mcl/integer_of_size.hpp"
 #include <boost/container/static_vector.hpp>
@@ -55,8 +58,41 @@ FP::FPCR A64EmitContext::FPCR(bool fpcr_controlled) const {
     return fpcr_controlled ? Location().FPCR() : Location().FPCR().ASIMDStandardValue();
 }
 
+namespace {
+
+// Fritchii: FRITCHII_JIT_DISPATCH_BITS, the A64 fast dispatch table holds 2^bits entries
+// (12..20, default 20, which is the old fixed size). The table only caches block lookups (a
+// miss takes the full lookup and refills the slot), so its size changes nothing the guest
+// sees. Read once per process; logged once.
+unsigned FastDispatchTableBits(unsigned default_bits, unsigned min_bits) {
+    static const unsigned bits = [default_bits, min_bits] {
+        unsigned value = default_bits;
+        const char* text = std::getenv("FRITCHII_JIT_DISPATCH_BITS");
+        if (text != nullptr && *text != '\0') {
+            char* end = nullptr;
+            const unsigned long parsed = std::strtoul(text, &end, 10);
+            if (end != text && parsed >= min_bits && parsed <= default_bits) {
+                value = unsigned(parsed);
+            } else {
+                LOG_WARNING(Core_ARM, "FRITCHII_JIT_DISPATCH_BITS={} is outside {}..{}, using {}",
+                            text, min_bits, default_bits, default_bits);
+            }
+        }
+        LOG_INFO(Core_ARM, "JIT fast dispatch table: 2^{} entries ({} KiB per core)", value,
+                 (size_t{1} << value) * 16 / 1024);
+        return value;
+    }();
+    return bits;
+}
+
+}  // namespace
+
 A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_interface)
-        : EmitX64(code), conf(conf), jit_interface{jit_interface} {
+        : EmitX64(code), conf(conf)
+        , fast_dispatch_table_size{size_t{1} << FastDispatchTableBits(fast_dispatch_table_default_bits, fast_dispatch_table_min_bits)}
+        , fast_dispatch_table_mask{u32((fast_dispatch_table_size - 1) * sizeof(FastDispatchEntry))}
+        , fast_dispatch_table{new FastDispatchEntry[fast_dispatch_table_size]}
+        , jit_interface{jit_interface} {
     GenMemory128Accessors();
     GenFastmemFallbacks();
     GenTerminalHandlers();
@@ -181,7 +217,7 @@ void A64EmitX64::InvalidateCacheRanges(const boost::icl::interval_set<u64>& rang
 
 void A64EmitX64::ClearFastDispatchTable() {
     if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
-        fast_dispatch_table.fill({});
+        std::fill_n(fast_dispatch_table.get(), fast_dispatch_table_size, FastDispatchEntry{});
     }
 }
 
@@ -225,7 +261,7 @@ void A64EmitX64::GenTerminalHandlers() {
         terminal_handler_fast_dispatch_hint = code.getCurr<const void*>();
         calculate_location_descriptor();
         code.L(rsb_cache_miss);
-        code.mov(r8, u64(fast_dispatch_table.data()));
+        code.mov(r8, u64(fast_dispatch_table.get()));
         //code.mov(r12, qword[code.ABI_JIT_PTR + offsetof(A64JitState, pc)]);
         code.mov(r12, rbx);
         if (code.HasHostFeature(HostFeature::SSE42)) {
@@ -245,7 +281,7 @@ void A64EmitX64::GenTerminalHandlers() {
 
         code.align();
         fast_dispatch_table_lookup = code.getCurr<FastDispatchEntry& (*)(u64)>();
-        code.mov(code.ABI_PARAM2, u64(fast_dispatch_table.data()));
+        code.mov(code.ABI_PARAM2, u64(fast_dispatch_table.get()));
         if (code.HasHostFeature(HostFeature::SSE42)) {
             code.crc32(code.ABI_PARAM1, code.ABI_PARAM2);
         }

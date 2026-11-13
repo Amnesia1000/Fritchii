@@ -272,6 +272,18 @@ more. On integrated GPUs the two split the one stream buffer instead. EXP104's b
 both pools' recyclers together, and the new allocator takes no memory until used. Read once
 when the device is made.
 
+### FRITCHII_JIT_DISPATCH_BITS
+
+FRITCHII_JIT_DISPATCH_BITS (boot, default 20; fable52_answer_guest 2.1): the A64 JIT's fast
+dispatch table holds 2^bits entries of 16 bytes, 12..20 (default 20 = 16 MiB per core, the old
+fixed size; 16 = 1 MiB, 12 = 64 KiB). A profile of the game's CPU threads put the read of the
+table entry (after `cmp rbx, [r12]` in GenTerminalHandlers) as the hottest instruction in
+translated code, 3.2% of JIT time: hot targets spread over 4,096 pages and miss the TLB. The
+table only caches block lookups (a miss takes the full lookup and refills the slot), so the
+size changes nothing the guest sees, only the hit rate and the cache/TLB footprint. Read once
+per process when the first A64 JIT is made (a64_emit_x64.cpp), logged as "JIT fast dispatch
+table: 2^N entries"; values outside 12..20 log a warning and keep 20. A32 is unchanged (2^16).
+
 ## Numbered experiments (EDEN_NX2_EXPn)
 
 Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP79, live through the debug server:

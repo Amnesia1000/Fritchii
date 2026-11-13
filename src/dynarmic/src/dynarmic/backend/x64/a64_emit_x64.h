@@ -10,6 +10,7 @@
 
 #include <array>
 #include <map>
+#include <memory>
 #include <optional>
 #include <tuple>
 #include "common/container/unordered_map.h"
@@ -60,8 +61,11 @@ public:
         const void* code_ptr = nullptr;
     };
     static_assert(sizeof(FastDispatchEntry) == 0x10);
-    static constexpr u64 fast_dispatch_table_mask = 0xFFFFF0;
-    static constexpr size_t fast_dispatch_table_size = 0x100000;
+    // Fritchii: the table's size is chosen once per JIT (FRITCHII_JIT_DISPATCH_BITS, entries =
+    // 2^bits, 12..20, default 20 = 0x100000 entries). The mask is a byte offset into the table,
+    // so its low 4 bits are 0 (16-byte entries): default 0xFFFFF0.
+    static constexpr unsigned fast_dispatch_table_default_bits = 20;
+    static constexpr unsigned fast_dispatch_table_min_bits = 12;
 
     void ClearFastDispatchTable();
     void GenMemory128Accessors();
@@ -126,7 +130,9 @@ public:
     const A64::UserConfig conf;
     RegAlloc reg_alloc; //reusable reg alloc
     BlockRangeInformation<u64> block_ranges;
-    std::array<FastDispatchEntry, fast_dispatch_table_size> fast_dispatch_table;
+    const size_t fast_dispatch_table_size;
+    const u32 fast_dispatch_table_mask;
+    std::unique_ptr<FastDispatchEntry[]> fast_dispatch_table;
     std::vector<FastmemPatchInfo> fastmem_patch_info;  // sorted by rip
     ::Common::unordered_map<std::tuple<bool, size_t, int, int>, void (*)()> read_fallbacks;
     ::Common::unordered_map<std::tuple<bool, size_t, int, int>, void (*)()> write_fallbacks;
