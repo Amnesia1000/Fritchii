@@ -152,6 +152,7 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_indirect_grid.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/page_filter.h"
 
 namespace VideoCommon {
@@ -1018,6 +1019,9 @@ void StageWriteWords(State& s, Copy& c, GPUVAddr address, const u32* data, u64 s
 /// (a mode the stage does not implement: hard) only the offset advances, as in a run (plan 3.2).
 /// 6b: a served entry's words are written here (StageWriteWords).
 void ConstBufferWords(State& s, Copy& c, u32 amount, const u32* data) {
+    // Step 7 fps fix 4 (profiling): GPUMem's constant buffer path, a fine zone inside its entries'.
+    const Nx2Profile::Scope zone{Nx2Profile::Zone::StageCbWords, s.ring && Nx2Profile::Fine(),
+                                 false};
     Regs& regs = c.e->regs;
     const GPUVAddr address = regs.const_buffer.Address();
     const u64 copy_size = u64{amount} * sizeof(u32);

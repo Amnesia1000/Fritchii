@@ -355,6 +355,15 @@ fable_memstage_step2_spec.md 7.2): what the buffer cache side's stamps are.
   carried skipped, split (a number handed out in two ticks without a carry), unchecked
   (older than the 2^18-number ring) and epoch off. Early, late, split, epoch off and held
   must all read 0. Disagreements log the first 16 lines with the packet and both ticks.
+- With FRITCHII_MEMSTAGE_AHEAD (the window open, the ring running) each thread stamps with its
+  own packet instead of the newest number anyone opened: GPUMem with the draw it fills or the
+  operation it runs (under its mark), the back with the packet it holds or fills and after it
+  the last one while not published. The check then also counts "stamps on a number already
+  published" (must be 0: such a use would be freed early), "splits that raced the tick advance"
+  (a split by one tick of a number above what the closing tick's close saw: a stamp taken on the
+  other thread between a close and the tick's advance; reported) and GPUMem's "epoch reads
+  racing a close" (reported). Carried ranges are kept until older than the stamp ring. Late is
+  a warning with two threads (it is the conservative side).
 
 ### FRITCHII_MEMSTAGE_SHADOW
 
@@ -564,6 +573,14 @@ session after a catch-up could not finish (below; logged).
 - So what the back reads in a served draw is its position's: texture handles (EXP123=3), uniforms
   and storage addresses come in the packet; with the OoT trackers on, the bytes they read (the
   camera block, the actor's origin and bones) are copied at the fill and come in the packet too.
+- GPUMem's loop with the window open (the step 7 fps fixes): the window and the room are tested
+  before a draw's fill, not before every entry; GPUMem's busy time is timed per publish batch; a
+  run publishes its end once, after GPUMem followed it, and stays lent when it reaches the end of
+  what the front published (it waits for more input and ends at the first entry that needs
+  GPUMem; "runs kept lent at the end of the input" on the window line); a served draw sends the
+  vertex input state only when it may have changed (the back's VertexBuffers flag, not the
+  cache's in served mode, is cleared with each send). With EDEN_NX2_GPU_PROFILE=2 GPUMem's
+  profile splits its entry loop into "stage entries" and, inside it, "stage cb words".
 - Other changes it makes: packet ticks keep one unplayed mark per thread (the close takes the
   lowest, and ring B's oldest packet; the ring's start and end clear GPUMem's); the lend's flag
   hand-over happens at the run's first entry; a sync in GPUMem's fill, and a join in it over

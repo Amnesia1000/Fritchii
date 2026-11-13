@@ -40,11 +40,43 @@ public:
     }
 
     [[nodiscard]] u64 Now() noexcept {
-        const u64 number = open.load(std::memory_order_acquire);
+        const u64 number = Mine();
         if (verify) [[unlikely]] {
             NoteStamp(number);
         }
         return number;
+    }
+
+    /// Step 7 (vk_mem_stage.cpp, "Stamps per thread"): while the window is open each thread
+    /// stamps with its own packet, not with the newest number anyone opened. GPUMem: the packet
+    /// it fills or the operation it runs, under its mark (`stage` true). The back: the packet it
+    /// holds or fills, and outside one the last it had, while that is not published yet. Else
+    /// (no packet, or the ring off) `open`, as before.
+    [[nodiscard]] u64 Mine() const noexcept {
+        if (per_thread.load(std::memory_order_relaxed)) [[unlikely]] {
+            const u64 mine = t_stamp;
+            if (mine != 0 && (t_stamp_stage || mine > published.load(std::memory_order_acquire))) {
+                return mine;
+            }
+        }
+        return open.load(std::memory_order_acquire);
+    }
+    static void SetStamp(u64 number, bool stage) noexcept {
+        t_stamp = number;
+        t_stamp_stage = stage;
+    }
+    /// This thread's stamp state (a served sync runs on the back with GPUMem's).
+    [[nodiscard]] static u64 CurrentStamp() noexcept {
+        return t_stamp;
+    }
+    [[nodiscard]] static bool CurrentStampStage() noexcept {
+        return t_stamp_stage;
+    }
+    void SetPerThread(bool on) noexcept {
+        per_thread.store(on, std::memory_order_relaxed);
+    }
+    [[nodiscard]] bool PerThread() const noexcept {
+        return per_thread.load(std::memory_order_relaxed);
     }
 
     u64 BeginPacket() noexcept {
@@ -169,6 +201,16 @@ private:
     alignas(64) std::atomic<u64> open{1};
     alignas(64) std::atomic<u64> unplayed_from{0};
     alignas(64) std::atomic<u64> stage_unplayed{0};
+    std::atomic<bool> per_thread{false};
+    static inline thread_local u64 t_stamp = 0;
+    static inline thread_local bool t_stamp_stage = false;
+    /// The `open` each recent close saw, by tick (the split check's "raced the tick advance";
+    /// with the verify, under the lock).
+    struct CloseOpen {
+        u64 tick;
+        u64 open;
+    };
+    std::deque<CloseOpen> close_opens;
     alignas(64) std::atomic<u64> free_number{0};
     std::atomic<u64> advanced_gpu{0};
     std::atomic<u64> published{0};
@@ -192,6 +234,8 @@ private:
         std::atomic<u64> split{};
         std::atomic<u64> epoch_off{};
         std::atomic<u64> epoch_racing{}; ///< GPUMem's reads one apart from a close (step 7)
+        std::atomic<u64> stamp_published{}; ///< a stamp on a number already published (must be 0)
+        std::atomic<u64> split_raced{};     ///< a split that raced the tick advance (reported)
     };
     Counters counters;
     struct Snap {
@@ -207,6 +251,8 @@ private:
         u64 split{};
         u64 epoch_off{};
         u64 epoch_racing{};
+        u64 stamp_published{};
+        u64 split_raced{};
     };
     void Take(Snap& out) const noexcept;
     Snap reported{};

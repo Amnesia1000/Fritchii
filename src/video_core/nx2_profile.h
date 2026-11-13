@@ -113,6 +113,8 @@ enum class Zone : u32 {
     MemorySyncWait,
     StageWait,
     LevelRun,
+    StageEntries, ///< GPUMem's entry loop, the entries themselves (fine zone)
+    StageCbWords, ///< ... their constant buffer words (fine zone, inside StageEntries)
     Count,
 };
 
@@ -135,7 +137,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "stage texture buffers", "storage synchronize", "storage written marks",
     "image create", "pool destroy here", "pool destroy idle", "pool destroy backlog",
     "memory fill", "memory play", "memory hand-off", "memory sync wait",
-    "stage wait", "level run",
+    "stage wait", "level run", "stage entries", "stage cb words",
 };
 static_assert(zone_names.back() != nullptr, "a zone without a name");
 

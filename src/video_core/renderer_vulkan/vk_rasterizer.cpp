@@ -1246,6 +1246,10 @@ bool RasterizerVulkan::StageFillDraw(VideoCommon::MemStageShadowEngine& copy, bo
                                      std::vector<std::pair<u64, std::size_t>>& ranges) {
     using Link = VideoCommon::MemoryStageLink;
     Link& link = Link::Get();
+    // Step 7: the window and room in ring B, tested here, before a packet (not per entry).
+    if (!link.StageBeforeFill(position)) {
+        return false; // GPUMem is stopping: the draw is left to the back
+    }
     // Join 1 (spec 4.4): a miss leaves the draw to the back, which publishes the facts.
     if (!mem_stage.LookupFacts(VideoCommon::MemStageShadow::StageProgramKey(copy), stage_facts)) {
         link.NoteLevelDraw(4);
@@ -1292,13 +1296,24 @@ bool RasterizerVulkan::StageFillDraw(VideoCommon::MemStageShadowEngine& copy, bo
     SCOPE_EXIT {
         buffer_cache.SetInputsOverride(nullptr);
     };
-    const u32 repack_dirty = buffer_cache_runtime.SetVertexRepackLayout(
-        inputs.RepackLayoutRegs(), stage_facts.dynamic_vertex_input);
-    mem_stage.BeginDraw(buffer_cache_runtime.RepackMask(), repack_dirty);
-    // The packet number BeginDraw opened is GPUMem's unplayed mark until the push, or until here.
+    // The packet number BeginDraw opens is GPUMem's unplayed mark until the push, or until here.
     SCOPE_EXIT {
         mem_stage.EndStageFill();
     };
+    // Stamps per thread (the window open): the draw's number exists before anything here can
+    // stamp, so every stamp of the fill carries it under GPUMem's mark. Level mode keeps the
+    // order it had.
+    const bool number_first = Link::Ahead() != 0;
+    if (number_first) {
+        mem_stage.BeginDraw(0, 0);
+    }
+    const u32 repack_dirty = buffer_cache_runtime.SetVertexRepackLayout(
+        inputs.RepackLayoutRegs(), stage_facts.dynamic_vertex_input);
+    if (number_first) {
+        mem_stage.SetDrawRepack(buffer_cache_runtime.RepackMask(), repack_dirty);
+    } else {
+        mem_stage.BeginDraw(buffer_cache_runtime.RepackMask(), repack_dirty);
+    }
     if (repack_dirty) {
         inputs.MarkVertexBuffersDirty(repack_dirty);
     }
@@ -6965,6 +6980,16 @@ void RasterizerVulkan::UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs) 
         return;
     }
     dirty[Dirty::VertexInput] = false;
+    // Step 7 (fps fix 2), a served draw with the window open: the back's VertexBuffers flag is
+    // not the cache's (GPUMem's copy holds it and its fills clear it there, plan 4.2), so on the
+    // back nothing cleared it and it stayed raised: every draw sent the vertex input state again
+    // (88,500 sends a second, 45,000 the same as the last). Here it only means "a stream register
+    // changed, or a new command buffer, since the last send", so it is cleared with the send. A
+    // lend sets the back's cache flags from GPUMem's copy again.
+    if (vertex_buffers_dirty && VideoCommon::MemoryStageLink::BackServed() &&
+        VideoCommon::MemoryStageLink::Ahead() != 0) {
+        dirty[VideoCommon::Dirty::VertexBuffers] = false;
+    }
 
     boost::container::static_vector<VkVertexInputBindingDescription2EXT, 32> bindings;
     boost::container::static_vector<VkVertexInputAttributeDescription2EXT, 32> attributes;

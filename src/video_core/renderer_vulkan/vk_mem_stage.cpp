@@ -527,7 +527,22 @@ MemStage::Fill::Fill(MemStage& stage_, Site site_, u32 index_)
             }
         }
         if (stage.ticks && IsOpSite(site)) {
-            stage.op_number.store(stage.ticks->BeginPacket(), std::memory_order_relaxed);
+            u64 number;
+            if (stage.ticks->PerThread() && Link::OnStageThread()) {
+                // Step 7, stamps per thread: an operation on GPUMem (a served call) opens its
+                // number under the close's lock with GPUMem's mark, as a draw does, and its
+                // stamps carry it until the bracket ends.
+                number = stage.ticks->BeginStagePacket();
+                stage.stage_op_from = number;
+                stage_op = true;
+                SeamTicks::SetStamp(number, true);
+            } else {
+                number = stage.ticks->BeginPacket();
+                // No GPUMem mark covers it: not a stage stamp, so a leftover one is checked
+                // against `published` if per-thread stamps turn on before the next open.
+                SeamTicks::SetStamp(number, false);
+            }
+            stage.op_number.store(number, std::memory_order_relaxed);
         }
     }
     begin = stage.OwnedHere() ? stage.arena.Size() : 0;
@@ -550,6 +565,13 @@ MemStage::Fill::~Fill() {
     t_site = previous_site;
     if (--t_fill_depth == 0 && stage.OwnedHere() && !stage.pending) {
         stage.owner.store(0, std::memory_order_release);
+    }
+    if (stage_op) {
+        // GPUMem's operation is over: its pending entries (played next, FillPlay) keep their own
+        // mark; GPUMem stamps with no packet of its own until the next.
+        stage.stage_op_from = 0;
+        SeamTicks::SetStamp(0, true);
+        stage.UpdateUnplayed();
     }
 }
 
@@ -645,7 +667,8 @@ void MemStage::SetPending() {
     if (!pending) {
         pending = true;
         if (ticks) {
-            pending_from = ticks->Current();
+            // The caller's packet (step 7, stamps per thread; `open` otherwise, as before).
+            pending_from = ticks->Mine();
             UpdateUnplayed();
         }
         SeamHook::g_watch.fetch_add(1, std::memory_order_relaxed);
@@ -775,8 +798,11 @@ void MemStage::BeginDraw(u32 repack_mask, u32 repack_dirty) {
         if (stage_fill_from == 0) {
             stage_fill_from = draw.number;
         }
+        SeamTicks::SetStamp(draw.number, true); // its stamps carry its number (stamps per thread)
     } else {
         draw.number = ticks ? ticks->BeginPacket() : ++packet_number;
+        // No GPUMem mark covers it (see Fill::Fill): checked against `published` if left over.
+        SeamTicks::SetStamp(draw.number, false);
     }
     draw.repack_mask = repack_mask;
     draw.repack_dirty = repack_dirty;
@@ -793,6 +819,9 @@ void MemStage::BeginDispatch() {
         dispatch = DispatchPacket{};
         dispatch.number = ticks ? ticks->BeginPacket() : ++packet_number;
     }
+    // Stamps per thread: a dispatch is filled where it is played (the back, or GPUMem by
+    // hand-off at THREAD 1, where stamps per thread are off).
+    SeamTicks::SetStamp(dispatch.number, false);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -872,6 +901,7 @@ void MemStage::OpenDispatchByValue() {
     RetireDispatchValues();
     dispatch = DispatchPacket{};
     dispatch.number = ticks ? ticks->BeginPacket() : ++packet_number;
+    SeamTicks::SetStamp(dispatch.number, false);
     dispatch_open = true;
 }
 
@@ -1094,6 +1124,9 @@ void MemStage::UpdateUnplayed() {
         const bool owned = OwnedHere();
         if (Link::OnStageThread() || t_identity != 0) {
             u64 from = stage_fill_from;
+            if (stage_op_from != 0 && (from == 0 || stage_op_from < from)) {
+                from = stage_op_from;
+            }
             if (owned && pending && (from == 0 || pending_from < from)) {
                 from = pending_from;
             }
@@ -1590,6 +1623,7 @@ void MemStage::EndStageFill() {
     // that made no packet, or threw).
     if (stage_fill_from != 0) {
         stage_fill_from = 0;
+        SeamTicks::SetStamp(0, true);
         if (ticks) {
             UpdateUnplayed();
         }
@@ -1605,8 +1639,12 @@ void MemStage::ResetStageSide(bool end) {
         owner.store(0, std::memory_order_release);
     }
     stage_fill_from = 0;
+    stage_op_from = 0;
     if (ticks) {
         ticks->SetStageUnplayed(0);
+        if (end) {
+            ticks->SetPerThread(false); // the ring is off: `open` again until the next frame end
+        }
         UpdateUnplayed();
     }
 }
@@ -1683,6 +1721,7 @@ void MemStage::PushRingDraw() {
     ring_b_sent.store(ring_b_write, std::memory_order_release);
     // GPUMem's mark goes only after the packet is in ring B (a close reads the mark first).
     stage_fill_from = 0;
+    SeamTicks::SetStamp(0, true); // no packet of GPUMem's own until the next (stamps per thread)
     const u64 sent = ring_packets_sent.load(std::memory_order_relaxed) + 1;
     ring_packets_sent.store(sent, std::memory_order_seq_cst);
     Link::Get().NotePacketSent(bytes,
@@ -1779,6 +1818,8 @@ void MemStage::TakeRingHeader(const RingHeader& header) {
     played_stage_writes = header.stage_writes;
     const bool logged = (header.flags & 2) != 0;
     const u64 number = header.number;
+    // Stamps per thread: the back stamps with the packet it plays, and after it with the last.
+    SeamTicks::SetStamp(number, false);
     ring_b_read += header.bytes;
     ring_b_freed.store(ring_b_read, std::memory_order_seq_cst);
     // Step 7: the window and the room GPUMem may wait for (it is woken if it sleeps).
@@ -2014,9 +2055,19 @@ void MemStage::OnBackImpl(void (*function)(void*), void* argument) {
         bool holding;
         ReadLog* log;
         std::vector<ReadRange>* reads;
+        u64 stamp;       ///< Stamps per thread (step 7): a served sync stamps with GPUMem's packet
+        bool stamp_stage;
     };
     const auto capture = [] {
-        return State{t_identity, t_fill_depth, t_play_depth, t_site, t_holding, t_log, t_reads};
+        return State{t_identity,
+                     t_fill_depth,
+                     t_play_depth,
+                     t_site,
+                     t_holding,
+                     t_log,
+                     t_reads,
+                     SeamTicks::CurrentStamp(),
+                     SeamTicks::CurrentStampStage()};
     };
     const auto install = [](const State& state) {
         t_identity = state.identity;
@@ -2026,6 +2077,7 @@ void MemStage::OnBackImpl(void (*function)(void*), void* argument) {
         t_holding = state.holding;
         t_log = state.log;
         t_reads = state.reads;
+        SeamTicks::SetStamp(state.stamp, state.stamp_stage);
     };
     State gpumem = capture();
     gpumem.identity = ThisThread();
@@ -3097,6 +3149,11 @@ void MemStage::TickThread(int seam) {
     // The window's verify (its own-write ring and the image check) only with a verify on.
     Link::SetVerify(read_log_every > 0 || Link::RingVerify());
     ring_read_log.store(read_log_every > 0 && Link::Ahead() != 0, std::memory_order_relaxed);
+    // Stamps per thread while the window is open and the ring runs (here both threads are level;
+    // the ring's end turns it off, ResetStageSide). Otherwise `open`, as before.
+    if (ticks) {
+        ticks->SetPerThread(Link::RingActive() && Link::Ahead() != 0);
+    }
     const bool full =
         Debug::SwitchValue(Debug::g_memstage_full_binds, "FRITCHII_MEMSTAGE_FULL_BINDS") > 0 ||
         link.Mode() == 2;
@@ -3494,6 +3551,18 @@ u64 SeamClock::SubmitForHostRead(std::source_location location) {
 // the back) stays open until its entries are recorded: its buffers, staging and stream regions
 // outlive it. At AHEAD = 0 the two threads take turns and the three marks give the old answer.
 //
+// Stamps per thread (step 7, the window open and the ring running; Fable's split answer). Now()
+// returned `open`, the newest number anyone opened: on one thread that is the caller's packet,
+// with two it is not. GPUMem stamping with `open` while it held no mark (before its draw's
+// number, between packets, in an operation opened with a plain BeginPacket) let a close by the
+// back publish that number with the tick being closed: the use was freed a tick early. So each
+// thread stamps with its own packet (SeamTicks::Mine): GPUMem with the draw it fills (BeginDraw
+// opens it before anything in StageFillDraw can stamp) or the operation it runs (opened under
+// the close's lock with GPUMem's mark, stage_op_from), and with `open` only between them; the
+// back with the packet it holds or fills, and after it with the last one while that is not
+// published (a host read then waits for its own tick, not the tick of GPUMem's newest packet,
+// which was the "late" of the AHEAD 8 verify). Off (level mode, the ring off): `open`, as before.
+//
 // Users that compare stamps for equality (the stream uniform reuse and its keeps: "same tick, so
 // the stream copy is still there") take Epoch(): the number of closes. A copy made at epoch E
 // carries a number not yet published; its stream region is only recycled once that number is
@@ -3511,6 +3580,12 @@ u64 SeamClock::SubmitForHostRead(std::source_location location) {
 //   split:     a number handed out in two ticks without a carry (a tick ended without a close).
 //              Must be 0.
 //   unchecked: stamps older than the ring.
+//   (step 7) splits that raced the tick advance: a split by one tick of a number above the
+//              `open` the close of the first tick saw (a stamp taken on the other thread between
+//              that close and the tick's advance). Reported, not a failure; the rest of the
+//              splits stay must be 0. Carried ranges are kept until older than the stamp ring.
+//   (step 7) stamps on a number already published: a stamp whose number a close published
+//              before it was taken (its use would be freed early). Must be 0.
 //   epoch off: Epoch() differed from the scheduler's tick. Must be 0. (With step 7's window,
 //              GPUMem's reads one apart from the tick race a close, which bumps the epoch just
 //              before the tick advances: counted apart as "GPUMem's epoch reads racing a close".)
@@ -3585,19 +3660,31 @@ void SeamTicks::Close(u64 tick) {
         lower(ring_oldest(ring_context));
     }
     u64 last;
+    u64 open_seen;
     if (unplayed != 0) {
         last = unplayed - 1;
+        open_seen = open.load(std::memory_order_acquire);
         Bump(counters.carried);
         if (verify) {
-            const u64 to = open.load(std::memory_order_acquire);
+            const u64 to = open_seen;
             carried_ranges.push_back(Range{.from = unplayed, .to = to});
-            if (carried_ranges.size() > 1024) {
+            // Dropped by number, once older than the stamp ring (a stamp there is unchecked
+            // anyway), not by count: with the window open nearly every close carries.
+            while (!carried_ranges.empty() && carried_ranges.front().to + StampSlots < to) {
                 carried_ranges.pop_front();
             }
             carried_to.store(to, std::memory_order_release);
         }
     } else {
         last = open.fetch_add(1, std::memory_order_acq_rel);
+        open_seen = last;
+    }
+    if (verify) {
+        // The split check's "raced the tick advance": the `open` this close saw, by its tick.
+        close_opens.push_back(CloseOpen{.tick = tick, .open = open_seen});
+        if (close_opens.size() > 4096) {
+            close_opens.pop_front();
+        }
     }
     if (last > published.load(std::memory_order_relaxed)) {
         ring.push_back(Published{.last = last, .tick = tick});
@@ -3659,6 +3746,19 @@ void SeamTicks::NoteHeld(u64 newly_held) noexcept {
 }
 
 void SeamTicks::NoteStamp(u64 number) noexcept {
+    // The real case of a split, caught where it happens (Fable's split answer): a stamp on a
+    // number a close published already. Its use is recorded later than that close's tick, so it
+    // would be freed early. Must be 0 (it does not depend on ticks).
+    if (number != 0 && number <= published.load(std::memory_order_acquire)) [[unlikely]] {
+        Bump(counters.stamp_published);
+        if (g_ticks_logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+            LOG_WARNING(Render_Vulkan,
+                        "Memory seam ticks: a stamp on packet {}, published already (published up "
+                        "to {}, open {})",
+                        number, published.load(std::memory_order_relaxed),
+                        open.load(std::memory_order_relaxed));
+        }
+    }
     StampSlot& slot = slots[number & (StampSlots - 1)];
     const u64 tick = master->CurrentTick();
     if (slot.number.load(std::memory_order_acquire) != number) {
@@ -3695,6 +3795,18 @@ bool SeamTicks::OldTick(u64 stamp, u64& tick) {
         return false;
     }
     if (first != last) {
+        // "Raced the tick advance" (reported, not a failure): the stamp was taken on another
+        // thread while the back was between a close and the tick's advance, so it read the old
+        // tick for a number the close of that tick did not publish (above the `open` it saw).
+        if (first + 1 == last) {
+            std::scoped_lock lock{mutex};
+            const auto close = std::ranges::find_if(
+                close_opens, [first](const CloseOpen& entry) { return entry.tick == first; });
+            if (close != close_opens.end() && stamp > close->open) {
+                Bump(counters.split_raced);
+                return false;
+            }
+        }
         Bump(counters.split);
         if (g_ticks_logged.fetch_add(1, std::memory_order_relaxed) < 16) {
             LOG_WARNING(Render_Vulkan,
@@ -3794,6 +3906,8 @@ void SeamTicks::Take(Snap& out) const noexcept {
     out.split = counters.split.load(std::memory_order_relaxed);
     out.epoch_off = counters.epoch_off.load(std::memory_order_relaxed);
     out.epoch_racing = counters.epoch_racing.load(std::memory_order_relaxed);
+    out.stamp_published = counters.stamp_published.load(std::memory_order_relaxed);
+    out.split_raced = counters.split_raced.load(std::memory_order_relaxed);
 }
 
 void SeamTicks::LogStats() {
@@ -3833,11 +3947,15 @@ void SeamTicks::LogStats() {
         }
         LOG_INFO(Render_Vulkan,
                  "  memory seam ticks check: early {}, late {}; {}; carried skipped {}, split {}, "
-                 "unchecked {}, epoch off {}; GPUMem's epoch reads racing a close {}",
+                 "unchecked {}, epoch off {}; GPUMem's epoch reads racing a close {}; splits that "
+                 "raced the tick advance {} (reported); stamps on a number already published {} "
+                 "(must be 0)",
                  early, late, checks, current.carried_skipped - reported.carried_skipped,
                  current.split - reported.split, current.unchecked - reported.unchecked,
                  current.epoch_off - reported.epoch_off,
-                 current.epoch_racing - reported.epoch_racing);
+                 current.epoch_racing - reported.epoch_racing,
+                 current.split_raced - reported.split_raced,
+                 current.stamp_published - reported.stamp_published);
     }
     reported = current;
 }
