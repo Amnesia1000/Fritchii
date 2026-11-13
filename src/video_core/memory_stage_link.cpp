@@ -213,6 +213,7 @@ constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::Check::Co
     "a packet asked for at a draw the stage sent none for",
     "a packet left unplayed at a run's start",
     "ring B full",
+    "draws issued by the back and the stage differ at a run's end (compare a)",
 };
 constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::HandOff::Count)>
     LINK_HANDOFF_NAMES{"draw fills", "dispatch fills", "idle destroys", "served for the back"};
@@ -985,6 +986,12 @@ void MemoryStageLink::RingLoop(std::stop_token& stop, u64 start) {
             ring_backend.back_channel != nullptr ? ring_backend.back_channel(ring_backend.context)
                                                  : 0);
         LinkBump(counters.copies, copies);
+        // Compare a with two threads: both sides counted every draw since the ring started. A
+        // difference would mispair every later packet; the back's count is taken (it is parked).
+        if (const u64 stage_seq = MemStageShadow::StageDrawSeq(back_draw_seq);
+            stage_seq != back_draw_seq) [[unlikely]] {
+            Note(Check::DrawCount, "the stage's count set to the back's");
+        }
         t_stage_user = true;
         position = until;
         since_publish = 0;

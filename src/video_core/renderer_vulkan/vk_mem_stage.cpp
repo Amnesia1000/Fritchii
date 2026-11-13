@@ -785,10 +785,12 @@ void MemStage::CloseHandleValues(bool dispatch_side, bool null_pointer_handles,
                                  bool in_configure) {
     const size_t side = dispatch_side ? 1 : 0;
     const u32 count = static_cast<u32>((dispatch_side ? dispatch_values : draw_values).size());
-    u32& flags = dispatch_side ? dispatch.flags : draw.flags;
+    // THREAD = 2: a draw from ring B keeps its values' state in its own copy (played_draw).
+    DrawPacket& values_draw = held_ring ? played_draw : draw;
+    u32& flags = dispatch_side ? dispatch.flags : values_draw.flags;
     flags &= ~(HandleNullPointers | HandleValuesLooked | HandleValuesRetired);
     flags |= HandleValuesFilled | (null_pointer_handles ? HandleNullPointers : 0U);
-    (dispatch_side ? dispatch.handle_values : draw.handle_values) = Span{0, count};
+    (dispatch_side ? dispatch.handle_values : values_draw.handle_values) = Span{0, count};
     Bump(value_counters.fills[side]);
     Bump(value_counters.values[side], count);
     if (in_configure) {
@@ -798,7 +800,8 @@ void MemStage::CloseHandleValues(bool dispatch_side, bool null_pointer_handles,
 
 const std::vector<u32>* MemStage::HandleValues(bool dispatch_side,
                                                bool& null_pointer_handles) const noexcept {
-    const u32 flags = dispatch_side ? dispatch.flags : draw.flags;
+    const u32 flags =
+        dispatch_side ? dispatch.flags : (held_ring ? played_draw.flags : draw.flags);
     if ((flags & HandleValuesFilled) == 0) {
         return nullptr;
     }
@@ -807,7 +810,7 @@ const std::vector<u32>* MemStage::HandleValues(bool dispatch_side,
 }
 
 void MemStage::LookedAtHandleValues(bool dispatch_side, size_t taken) {
-    u32& flags = dispatch_side ? dispatch.flags : draw.flags;
+    u32& flags = dispatch_side ? dispatch.flags : (held_ring ? played_draw.flags : draw.flags);
     const size_t count = (dispatch_side ? dispatch_values : draw_values).size();
     if (taken == 0 && count != 0) {
         // The back skipped its handle loop (a TEX_BANK_GEN hit): retired as skipped.

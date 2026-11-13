@@ -165,6 +165,8 @@ void StageLend();
 u64 StageReturn(const void* drew_engine, const void* state_engine, s32 back_channel);
 void StageTick();
 [[nodiscard]] std::vector<std::pair<u64, std::size_t>>& StageRanges();
+/// Sets the stage's draw count to `back_seq`; returns what it was.
+u64 StageDrawSeq(u64 back_seq);
 [[nodiscard]] u64 BackStateHash(const Tegra::Engines::Maxwell3D& maxwell3d);
 [[nodiscard]] u64 BackProgramKey(const Tegra::Engines::Maxwell3D& maxwell3d);
 [[nodiscard]] u64 StageProgramKey(const MemStageShadowEngine& copy);

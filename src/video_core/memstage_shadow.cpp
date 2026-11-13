@@ -2104,6 +2104,10 @@ std::vector<std::pair<u64, std::size_t>>& StageRanges() {
     return S().ring_ranges;
 }
 
+u64 StageDrawSeq(u64 back_seq) {
+    return std::exchange(S().ring_seq, back_seq);
+}
+
 u64 BackStateHash(const Maxwell3D& maxwell3d) {
     return StateHash(maxwell3d, &maxwell3d);
 }

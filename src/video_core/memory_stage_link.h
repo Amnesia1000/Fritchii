@@ -44,6 +44,7 @@ public:
         PacketMissing,
         PacketUnplayed,
         RingFull,
+        DrawCount,
         Count,
     };
 
