@@ -160,6 +160,21 @@ public:
         return discard_decision.serial == lookup_serial && discard_decision.skip;
     }
 
+    /// EXP118 (the delta path, fritchii_delta_path.h): what a lookup now would give a draw that
+    /// follows `pipeline`'s draw with only light state changed (the delta draw count's serial).
+    enum class DeltaLookup : u8 {
+        Keeps,       ///< The lookup would return `pipeline`
+        NotCurrent,  ///< The cache's current pipeline is another one
+        Inputs,      ///< The programs or viewport swizzles are marked: the lookup reads them again
+        VertexInput, ///< Vertex input moved: static vertex input, or other keyed attribute types
+    };
+    /// Keeps when `pipeline` is the current pipeline, no flag that only the lookup clears is
+    /// raised, and with Dirty::VertexInput raised the pipeline takes its vertex input dynamically
+    /// and the attribute types its programs read are its key's. `apply` (the draw takes no
+    /// lookup): leaves the types as that lookup would. The draw's vertex input update clears the
+    /// flag, and RefreshGraphicsKey rewrites the unmasked types only while it is raised.
+    [[nodiscard]] DeltaLookup DeltaKeeps(const GraphicsPipeline& pipeline, bool apply);
+
     void TickFrame();
 
     /// What the "Memory owners" log line counts here (GPU thread).

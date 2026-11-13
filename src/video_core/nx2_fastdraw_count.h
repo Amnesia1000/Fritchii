@@ -20,6 +20,8 @@
 
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "video_core/fritchii_delta_path.h"
+#include "video_core/nx2_debug_control.h"
 
 /// EDEN_NX2_FASTDRAW_COUNT=1 (read once, by the first Maxwell3D): counts the draws that could
 /// take the original delta ("fast") draw path, which keeps the previous draw's
@@ -129,17 +131,29 @@ inline constexpr std::array<const char*, NumGroups> group_names{
     }
 }
 
-/// EDEN_NX2_FASTDRAW_COUNT == "1". A plain bool: every site tests it and nothing else when off.
+/// Breaks are raised (the serial and everything below): EDEN_NX2_FASTDRAW_COUNT == "1", or
+/// Fritchii's delta path (EXP118, fritchii_delta_path.h) on at boot. A plain bool: every site
+/// tests it and nothing else when off.
 inline bool g_on{};
+/// EDEN_NX2_FASTDRAW_COUNT == "1": the count itself and its 5 s lines.
+inline bool g_count{};
 
-/// Reads the switch once (Maxwell3D's constructor: after main() applied nx2_switches.txt).
+/// Reads the switches once (Maxwell3D's constructor: after main() applied nx2_switches.txt).
 inline void Init() {
     static const bool once = [] {
         const char* const value = std::getenv("EDEN_NX2_FASTDRAW_COUNT");
-        g_on = value != nullptr && value[0] == '1';
-        if (g_on) {
+        g_count = value != nullptr && value[0] == '1';
+        // EXP118 is live, but its breaks must run from the start: on at boot, they stay on
+        // (the switch can then go 0 to 3 and back); off at boot, it does nothing this session.
+        const bool delta_path =
+            VideoCore::Nx2Debug::Experiment(VideoCommon::FritchiiDeltaPath::Switch) != 0;
+        g_on = g_count || delta_path;
+        if (g_count) {
             LOG_INFO(HW_GPU, "Delta draw count on (EDEN_NX2_FASTDRAW_COUNT=1): counting only, "
                              "ported rules");
+        }
+        if (delta_path) {
+            LOG_INFO(HW_GPU, "Delta path (EXP118): on at boot, its breaks are raised this session");
         }
         return true;
     }();
@@ -506,6 +520,7 @@ struct PreviousDraw {
     u64 tick{};
     u64 render_pass{};
     u32 topology{};
+    u32 engine_state{}; ///< Maxwell3D::engine_state (the HLE macro hint the pipeline key reads)
     bool is_indexed{};
     bool valid{};
 };

@@ -592,6 +592,12 @@ public:
         return scale_epoch;
     }
 
+    /// Bumped whenever SynchronizeDescriptors finds the descriptor pools moved (EXP118=3: a
+    /// delta draw that skipped it synchronizes afterwards and checks this stayed).
+    [[nodiscard]] u64 TextureBindingsSerial() const noexcept {
+        return texture_bindings_serial;
+    }
+
     /// The device page `gpu_addr` lies in, or nullopt when unmapped.
     [[nodiscard]] std::optional<DAddr> TexBankDevicePage(GPUVAddr gpu_addr) const;
 

@@ -82,6 +82,7 @@
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/memory_manager.h"
 #include "video_core/buffer_churn_stats.h"
+#include "video_core/fritchii_delta_path.h"
 #include "video_core/fritchii_draw_kinds.h"
 #include "video_core/memstage_stats.h"
 #include "video_core/nx2.h"
@@ -909,6 +910,9 @@ void RasterizerVulkan::FastDrawCountDecide(const GraphicsPipeline* pipeline, boo
         return full(Count::Full::ComputedHandles);
     }
     ++stats.delta;
+    if (VideoCommon::FritchiiDrawKinds::g_on) [[unlikely]] {
+        VideoCommon::FritchiiDrawKinds::NoteWouldBeDelta();
+    }
     // The full resolve picked another pipeline: a delta draw would have kept the wrong one.
     stats.other_pipeline += pipeline != previous ? 1 : 0;
 }
@@ -968,9 +972,105 @@ void RasterizerVulkan::FastDrawCountResolved(const GraphicsPipeline* pipeline, b
         .tick = scheduler.CurrentTick(),
         .render_pass = scheduler.RenderPassSerial(),
         .topology = static_cast<u32>(topology),
+        .engine_state = static_cast<u32>(maxwell3d->engine_state),
         .is_indexed = is_indexed,
         .valid = true,
     };
+}
+
+GraphicsPipeline* RasterizerVulkan::DeltaPathDecide(bool is_indexed, bool is_indirect) {
+    namespace Count = VideoCommon::Nx2FastDrawCount;
+    using Fallback = VideoCommon::FritchiiDeltaPath::Fallback;
+    VideoCommon::FritchiiDeltaPath::Stats& stats = delta_path;
+    ++stats.draws;
+    delta_vertex_moved = false;
+    const auto fall = [&stats](Fallback reason) -> GraphicsPipeline* {
+        stats.Fall(reason);
+        return nullptr;
+    };
+    const Count::Counter& counter = fast_draw_count;
+    // The count's tests (FastDrawCountDecide), before the lookup: the draw before was eligible
+    // (FastDrawCountResolved), and nothing but light state changed since its caches were locked.
+    const Count::PreviousDraw& draw = counter.taken;
+    if (!draw.valid) {
+        return fall(Fallback::NoCandidate);
+    }
+    const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    if (is_indirect || draw.is_indexed != is_indexed || draw.maxwell3d != maxwell3d ||
+        draw.topology != static_cast<u32>(draw_state.topology) ||
+        draw.engine_state != static_cast<u32>(maxwell3d->engine_state) ||
+        !draw_state.inline_index_draw_indexes.empty() || frame_dump.Capturing()) {
+        return fall(Fallback::Kind);
+    }
+    if (draw.serial != counter.take_serial) {
+        return fall(Fallback::StateChanged);
+    }
+    if (draw.map_serial != gpu_memory->MapSerial()) {
+        return fall(Fallback::Map);
+    }
+    if (draw.tick != scheduler.CurrentTick()) {
+        return fall(Fallback::Submitted);
+    }
+    auto* const previous = static_cast<GraphicsPipeline*>(const_cast<void*>(draw.pipeline));
+    if (draw.render_pass != scheduler.RenderPassSerial() || !scheduler.IsRenderPassActive() ||
+        scheduler.BoundGraphicsPipeline() != previous) {
+        return fall(Fallback::RenderPass);
+    }
+    // The first cut: nothing to sample, so no handle, view or sampler can go stale.
+    if (!previous->SamplesNothing() || previous->IsMeshPipeline()) {
+        return fall(Fallback::Samples);
+    }
+    // The texture memos change what Configure does for every draw (the plan: off, or no delta).
+    if (VideoCore::Nx2Debug::Experiment(32) != 0 || VideoCore::Nx2Debug::Experiment(87) != 0 ||
+        VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_tex_bank_gen,
+                                         "EDEN_NX2_TEX_BANK_GEN") > 0) {
+        return fall(Fallback::MemoSwitches);
+    }
+    // What the lookup reads besides the registers the serial covers.
+    delta_vertex_moved = maxwell3d->dirty.flags[Dirty::VertexInput];
+    switch (pipeline_cache.DeltaKeeps(*previous, false)) {
+    case PipelineCache::DeltaLookup::Keeps:
+        return previous;
+    case PipelineCache::DeltaLookup::NotCurrent:
+        return fall(Fallback::NotCurrent);
+    case PipelineCache::DeltaLookup::Inputs:
+        return fall(Fallback::LookupInputs);
+    case PipelineCache::DeltaLookup::VertexInput:
+        return fall(Fallback::VertexInput);
+    }
+    return fall(Fallback::NotCurrent);
+}
+
+bool RasterizerVulkan::DeltaPathCompare(const GraphicsPipeline* kept, const GraphicsPipeline* looked,
+                                        int mode) {
+    VideoCommon::FritchiiDeltaPath::Stats& stats = delta_path;
+    ++stats.compared;
+    if (kept == looked) {
+        return true;
+    }
+    ++stats.differences;
+    if (stats.total_differences++ < 16) {
+        const auto describe = [](const GraphicsPipeline* pipeline) {
+            return pipeline == nullptr
+                       ? std::string{"none"}
+                       : fmt::format("{:016x} (vs {:016x} fs {:016x})", pipeline->Key().Hash(),
+                                     pipeline->ShaderHashes()[1], pipeline->ShaderHashes()[5]);
+        };
+        LOG_WARNING(Render_Vulkan,
+                    "Delta path (EXP118={}) difference: kept pipeline {}, the full lookup gave "
+                    "{}; vertex input moved {}, topology {}, indexed {}",
+                    mode, describe(kept), describe(looked), delta_vertex_moved,
+                    static_cast<u32>(maxwell3d->draw_manager.draw_state.topology),
+                    fast_draw_count.taken.is_indexed);
+    }
+    return false;
+}
+
+void RasterizerVulkan::DeltaPathSnapshot() {
+    namespace Count = VideoCommon::Nx2FastDrawCount;
+    Count::Counter& counter = fast_draw_count;
+    counter.draw_serial = Count::g_serial.load(std::memory_order_relaxed);
+    counter.draw_map_serial = gpu_memory->MapSerial();
 }
 
 template <typename Func>
@@ -1015,9 +1115,64 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         frame_dump.DrainIfFull();
     }
     // EDEN_NX2_FASTDRAW_COUNT: counting only, at the original TakeReusableDraw.
-    const bool fast_draw_counting = VideoCommon::Nx2FastDrawCount::g_on;
-    if (fast_draw_counting) [[unlikely]] {
+    const bool fast_draw_counting = VideoCommon::Nx2FastDrawCount::g_count;
+    // EXP118 (fritchii_delta_path.h; live, but nothing unless it was on at boot, which raises
+    // its breaks): a draw that follows its pipeline's last draw with only light state changed,
+    // for a pipeline that samples nothing, keeps the pipeline (no lookup) and configures it
+    // without the texture steps. 2 = decide only, then compare with the full lookup.
+    const int delta_mode =
+        VideoCommon::Nx2FastDrawCount::g_on
+            ? VideoCore::Nx2Debug::Experiment(VideoCommon::FritchiiDeltaPath::Switch)
+            : 0;
+    const bool draw_tracking = fast_draw_counting || delta_mode != 0;
+    // The caches' locks: a delta draw takes them here, for its last test; every other draw
+    // below, after its lookup, as before. Released at the end, before the SCOPE_EXITs above.
+    std::unique_lock buffer_lock{buffer_cache.mutex, std::defer_lock};
+    std::unique_lock texture_lock{texture_cache.mutex, std::defer_lock};
+    GraphicsPipeline* delta_pipeline = nullptr; ///< EXP118 1 or 3: this draw is a delta draw
+    GraphicsPipeline* would_pipeline = nullptr; ///< EXP118=2: what a delta draw would keep
+    if (draw_tracking) [[unlikely]] {
         FastDrawCountBegin();
+        if (delta_mode != 0) {
+            using Fallback = VideoCommon::FritchiiDeltaPath::Fallback;
+            delta_path.MaybeLog(delta_mode);
+            GraphicsPipeline* const candidate = DeltaPathDecide(is_indexed, is_indirect);
+            if (candidate != nullptr && delta_mode == 2) {
+                would_pipeline = candidate;
+            } else if (candidate != nullptr) {
+                bool keep = true;
+                if (delta_mode == 3) {
+                    // Verify harder: the full lookup as well, outside the locks as always. If
+                    // it gives another pipeline, the draw is drawn the full way.
+                    GraphicsPipeline* looked;
+                    {
+                        Profile::Scope scope{Profile::Zone::PipelineLookup};
+                        looked = pipeline_cache.CurrentGraphicsPipeline();
+                    }
+                    keep = DeltaPathCompare(candidate, looked, delta_mode);
+                    if (!keep) {
+                        delta_path.Fall(Fallback::LookupDiffers);
+                    }
+                }
+                if (keep) {
+                    std::lock(buffer_lock, texture_lock);
+                    // Late test: a break on another thread since FastDrawCountBegin took the
+                    // serial. Then the full path: locks released first, its lookup outside them.
+                    if (VideoCommon::Nx2FastDrawCount::g_serial.load(std::memory_order_relaxed) !=
+                            fast_draw_count.take_serial ||
+                        pipeline_cache.DeltaKeeps(*candidate, true) !=
+                            PipelineCache::DeltaLookup::Keeps) {
+                        texture_lock.unlock();
+                        buffer_lock.unlock();
+                        delta_path.Fall(Fallback::Late);
+                    } else {
+                        delta_pipeline = candidate;
+                        ++delta_path.taken;
+                        delta_path.vertex_kept += delta_vertex_moved ? 1 : 0;
+                    }
+                }
+            }
+        }
     }
 
     const auto report_failure = [&](std::string_view reason) {
@@ -1040,7 +1195,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                         regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height);
         }
     };
-    GraphicsPipeline* const pipeline{[&] {
+    GraphicsPipeline* const pipeline{[&]() -> GraphicsPipeline* {
+        if (delta_pipeline != nullptr) {
+            return delta_pipeline; // EXP118: kept, no lookup
+        }
         Profile::Scope scope{Profile::Zone::PipelineLookup};
         return pipeline_cache.CurrentGraphicsPipeline();
     }()};
@@ -1067,6 +1225,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             }
         }
         return;
+    }
+    // FRITCHII_DRAW_KINDS: whether the draw's pipeline samples nothing.
+    if (VideoCommon::FritchiiDrawKinds::g_on) [[unlikely]] {
+        VideoCommon::FritchiiDrawKinds::NotePipeline(pipeline->SamplesNothing());
     }
     // EDEN_NX2_MEMSTAGE_STATS: the first draw of each shader set (the memory stage's join 1).
     if (VideoCommon::MemStageStats::Enabled()) [[unlikely]] {
@@ -1235,11 +1397,27 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         mesh_emulation_groups = groups;
         mesh_emulation_vertices_per_group = pipeline->MeshEmulationVerticesPerGroup();
     }
-    std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+    if (!buffer_lock.owns_lock()) {
+        std::lock(buffer_lock, texture_lock);
+    }
     // EDEN_NX2_FASTDRAW_COUNT: the original reads the serial the next draw compares with here, once the
     // caches are locked, and checks DeltaStillHolds.
     if (fast_draw_counting) [[unlikely]] {
         FastDrawCountDecide(pipeline, is_indexed, is_indirect);
+    } else if (draw_tracking) [[unlikely]] {
+        DeltaPathSnapshot();
+    }
+    if (would_pipeline != nullptr) [[unlikely]] {
+        // EXP118=2: the draw would have been a delta draw if nothing broke since the decision;
+        // the full lookup must have given the pipeline it would have kept.
+        if (VideoCommon::Nx2FastDrawCount::g_serial.load(std::memory_order_relaxed) !=
+            fast_draw_count.take_serial) {
+            delta_path.Fall(VideoCommon::FritchiiDeltaPath::Fallback::Late);
+        } else {
+            ++delta_path.would;
+            delta_path.vertex_kept += delta_vertex_moved ? 1 : 0;
+            DeltaPathCompare(would_pipeline, pipeline, delta_mode);
+        }
     }
     // update engine as channel may be different.
     pipeline->SetEngine(maxwell3d, gpu_memory);
@@ -1262,10 +1440,26 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         fast_draw_counting ||
         VideoCore::Nx2Debug::g_experiments[106].load(std::memory_order_relaxed) != 0;
     if (Profile::Scope scope{Profile::Zone::Configure};
-        !pipeline->Configure(is_indexed, keep_last_draw)) {
+        !(delta_pipeline != nullptr ? pipeline->ConfigureDelta(is_indexed)
+                                    : pipeline->Configure(is_indexed, keep_last_draw))) {
         report_failure("configure failed");
         TraceRenderState(is_indexed, "configure-failed", nullptr);
         return;
+    }
+    if (delta_pipeline != nullptr && delta_mode == 3) [[unlikely]] {
+        // EXP118=3: the descriptor pools' sync the delta configure left out must change nothing.
+        const u64 bindings = texture_cache.TextureBindingsSerial();
+        texture_cache.SynchronizeDescriptors(false);
+        ++delta_path.sync_checked;
+        if (texture_cache.TextureBindingsSerial() != bindings) {
+            ++delta_path.sync_changed;
+            if (delta_path.total_differences++ < 16) {
+                LOG_WARNING(Render_Vulkan,
+                            "Delta path (EXP118=3) difference: the descriptor pools moved on a "
+                            "delta draw (vs {:016x} fs {:016x})",
+                            pipeline->ShaderHashes()[1], pipeline->ShaderHashes()[5]);
+            }
+        }
     }
 
     TrackOcarinaCamera();
@@ -1359,7 +1553,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             });
     }
     submitted = true;
-    if (fast_draw_counting) [[unlikely]] {
+    if (draw_tracking) [[unlikely]] {
         FastDrawCountResolved(pipeline, is_indexed, is_indirect);
     }
     constexpr u64 final_vertex = 0x16aff33d999f993fULL;
@@ -4634,7 +4828,10 @@ void RasterizerVulkan::TickFrame() {
     VideoCommon::MemStageStats::TickFrame();
     VideoCommon::BufferChurnStats::TickFrame();
     if (VideoCommon::Nx2FastDrawCount::g_on) [[unlikely]] {
-        fast_draw_count.MaybeLog();
+        if (VideoCommon::Nx2FastDrawCount::g_count) {
+            fast_draw_count.MaybeLog();
+        }
+        VideoCommon::FritchiiDeltaPath::g_frames.fetch_add(1, std::memory_order_relaxed);
         VideoCommon::Nx2FastDrawCount::Break(VideoCommon::Nx2FastDrawCount::Reason::Frame);
     }
     if (MemoryOwnersEnabled()) {

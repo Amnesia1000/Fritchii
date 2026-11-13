@@ -473,15 +473,15 @@ bool Passes(const std::array<bool, NUM_STAGES>& stages,
 
 using ConfigureFuncPtr = bool (*)(GraphicsPipeline*, bool);
 
-template <bool KeepLast, typename Spec, typename... Specs>
+template <bool KeepLast, bool Delta, typename Spec, typename... Specs>
 ConfigureFuncPtr FindSpec(const std::array<bool, NUM_STAGES>& stages,
                           const std::array<Shader::Info, NUM_STAGES>& stage_infos) {
     if constexpr (sizeof...(Specs) > 0) {
         if (!Passes<Spec>(stages, stage_infos)) {
-            return FindSpec<KeepLast, Specs...>(stages, stage_infos);
+            return FindSpec<KeepLast, Delta, Specs...>(stages, stage_infos);
         }
     }
-    return GraphicsPipeline::MakeConfigureSpecFunc<Spec, KeepLast>();
+    return GraphicsPipeline::MakeConfigureSpecFunc<Spec, KeepLast, Delta>();
 }
 
 struct SimpleVertexFragmentSpec {
@@ -525,11 +525,12 @@ struct DefaultSpec {
 };
 
 /// KeepLast: the delta draw record's instantiation (GraphicsPipeline::Configure's keep_last).
-template <bool KeepLast = false>
+/// Delta: EXP118's (GraphicsPipeline::ConfigureDelta), the same Spec as Configure's.
+template <bool KeepLast = false, bool Delta = false>
 ConfigureFuncPtr ConfigureFunc(const std::array<bool, NUM_STAGES>& stages,
                                const std::array<Shader::Info, NUM_STAGES>& infos) {
-    return FindSpec<KeepLast, SimpleVertexSpec, SimpleVertexFragmentSpec, SimpleStorageSpec,
-                    SimpleImageSpec, DefaultSpec>(stages, infos);
+    return FindSpec<KeepLast, Delta, SimpleVertexSpec, SimpleVertexFragmentSpec,
+                    SimpleStorageSpec, SimpleImageSpec, DefaultSpec>(stages, infos);
 }
 
 std::atomic<std::chrono::nanoseconds::rep> hold_time_ns{};
@@ -665,6 +666,10 @@ GraphicsPipeline::GraphicsPipeline(
     writes_storage = std::ranges::any_of(stage_infos, [&](const Shader::Info& info) {
         return info.stores_global_memory || any_written(info.storage_buffers_descriptors) ||
                any_written(info.image_descriptors) || any_written(info.image_buffer_descriptors);
+    });
+    samples_nothing = std::ranges::all_of(stage_infos, [](const Shader::Info& info) {
+        return info.texture_descriptors.empty() && info.texture_buffer_descriptors.empty() &&
+               info.image_descriptors.empty() && info.image_buffer_descriptors.empty();
     });
     // EXP87 (the original texture_memo_eligible).
     template_eligible = std::ranges::all_of(stage_infos, [](const Shader::Info& info) {
@@ -891,6 +896,9 @@ GraphicsPipeline::GraphicsPipeline(
     has_tessellation = !IsMeshPipeline() && (present_stages[1] || present_stages[2]);
     configure_func = ConfigureFunc(present_stages, stage_infos);
     configure_keep_func = ConfigureFunc<true>(present_stages, stage_infos);
+    if (samples_nothing && !IsMeshPipeline()) {
+        configure_delta_func = ConfigureFunc<false, true>(present_stages, stage_infos);
+    }
     build.emplace(worker_thread, std::move(func));
 }
 
@@ -1419,8 +1427,13 @@ void GraphicsPipeline::RecordTexBank(const TextureCache::TextureMemoState& state
     ++control.recorded;
 }
 
-template <typename Spec, bool KeepLast>
+template <typename Spec, bool KeepLast, bool Delta>
 bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+    // EXP118 (Delta, fritchii_delta_path.h): the pipeline samples nothing and the draw follows its
+    // last with only light state changed. The descriptor pools' sync, the memo switches (the
+    // decision found them off) and the texture steps are left out; with no texture, image or
+    // texture buffer they bind nothing. Every other step below runs as for a full draw.
+    static_assert(!(KeepLast && Delta), "a delta draw keeps nothing");
     // Delta draws (D2): with KeepLast the handle words and computed handles are kept as they are
     // read, the rest at the end (KeepLastDraw). Without it nothing below changes: every addition
     // is under `if constexpr (KeepLast)`.
@@ -1439,7 +1452,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     samplers.reserve(num_textures);
     // EDEN_NX2_EXP32: texture binding memo (TextureMemo), for pipelines whose image bindings are
     // all sampled textures. Their sampler handles are kept and resolved after the lookup.
-    const int memo_switch = VideoCore::Nx2Debug::Experiment(32);
+    const int memo_switch = Delta ? 0 : VideoCore::Nx2Debug::Experiment(32);
     const bool texture_memo_on = memo_switch != 0 && num_textures != 0 &&
                                  num_image_elements == num_textures &&
                                  TextureMemoControl::Get().Usable(memo_switch);
@@ -1457,7 +1470,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
     };
     mark();
-    {
+    if constexpr (!Delta) {
         Profile::Scope scope{Profile::Zone::SyncDescriptors};
         texture_cache.SynchronizeDescriptors(false);
     }
@@ -1472,14 +1485,16 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     // entries were read from kept their generations (TexBankHit). Not with EXP32.
     // Not while CPU inner invalidation is skipped: constant buffer words then mark no page.
     const int tex_bank_switch =
-        memo_switch == 0 && !Settings::values.skip_cpu_inner_invalidation.GetValue()
+        !Delta && memo_switch == 0 && !Settings::values.skip_cpu_inner_invalidation.GetValue()
             ? VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_tex_bank_gen,
                                                "EDEN_NX2_TEX_BANK_GEN")
             : 0;
-    if (tex_bank_switch <= 0 && texture_cache.TexBankWatching()) [[unlikely]] {
-        texture_cache.TexBankReset();
+    if constexpr (!Delta) {
+        if (tex_bank_switch <= 0 && texture_cache.TexBankWatching()) [[unlikely]] {
+            texture_cache.TexBankReset();
+        }
     }
-    const bool tex_bank_null_pointers{VideoCore::Nx2Debug::Experiment(21) != 0};
+    const bool tex_bank_null_pointers{!Delta && VideoCore::Nx2Debug::Experiment(21) != 0};
     const bool tex_bank_on = tex_bank_switch > 0 && TexBankEligible();
     if (tex_bank_switch > 0 && !tex_bank_on) {
         ++TexBankControl::Get().ineligible;
@@ -1505,7 +1520,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     // earlier draw kept, also in an earlier frame, keyed on the handle words read below. Not with
     // EXP32 or TEX_BANK_GEN on (their own memos of the textures), for mesh pipelines, or while
     // EDEN_NX2_FRAME_DUMP_SAMPLED records (the original left its memo off for that too). 2 = verify.
-    const int template_switch = VideoCore::Nx2Debug::Experiment(87);
+    const int template_switch = Delta ? 0 : VideoCore::Nx2Debug::Experiment(87);
     const bool use_template = template_switch != 0 && template_eligible && memo_switch == 0 &&
                               tex_bank_switch <= 0 && !record_sampled && !IsMeshPipeline();
     const bool template_verify = template_switch == 2;
@@ -1525,6 +1540,10 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                     ++ssbo_index;
                 }
             }
+        }
+        if constexpr (Delta) {
+            // EXP118: no handle to read.
+            return true;
         }
         if (tex_bank_hit) {
             // EDEN_NX2_TEX_BANK_GEN: the textures come from the memo (no handle reads).
@@ -1852,7 +1871,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     bool memo_hit = false;
     bool memo_verify = false;
     TextureCache::TextureMemoState memo_state{};
-    {
+    if constexpr (!Delta) {
         Profile::Scope scope{Profile::Zone::FillImageViews};
         if (texture_memo_on) {
             memo_state = texture_cache.GraphicsTextureMemoState();

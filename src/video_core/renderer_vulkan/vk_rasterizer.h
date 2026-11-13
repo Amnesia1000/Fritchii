@@ -35,6 +35,7 @@
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
+#include "video_core/fritchii_delta_path.h"
 #include "video_core/nx2_fastdraw_count.h"
 #include "video_core/nx2_runahead.h"
 
@@ -395,6 +396,18 @@ private:
     /// After the draw was recorded: whether the next draw may follow it (NoteResolvedDraw).
     void FastDrawCountResolved(const GraphicsPipeline* pipeline, bool is_indexed,
                                bool is_indirect);
+    /// EXP118 (fritchii_delta_path.h): the delta path's counts, and whether the draw being
+    /// decided had its vertex input moved.
+    VideoCommon::FritchiiDeltaPath::Stats delta_path;
+    bool delta_vertex_moved{};
+    /// EXP118, after FastDrawCountBegin, before the pipeline lookup: the pipeline the draw would
+    /// keep as a delta draw, or null (the reason counted). Changes nothing.
+    GraphicsPipeline* DeltaPathDecide(bool is_indexed, bool is_indirect);
+    /// EXP118: counts a full lookup compared with the kept pipeline; logs a difference.
+    bool DeltaPathCompare(const GraphicsPipeline* kept, const GraphicsPipeline* looked, int mode);
+    /// Once the caches are locked, with the count off: the serials the next draw compares with
+    /// (FastDrawCountDecide takes them while the count runs).
+    void DeltaPathSnapshot();
     /// List draws (nx2_list_draw.h): DrawIndirect for IndirectParams::list_words.
     void DrawListWords();
     VideoCommon::OotNetwork::BypassState oot_network_bypass;
