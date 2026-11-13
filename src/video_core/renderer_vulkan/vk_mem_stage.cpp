@@ -1802,6 +1802,9 @@ u64 MemStage::RingOldestNumber() {
 void MemStage::TakeRingHeader(const RingHeader& header) {
     // The back holds the packet as a held one: PlayHeld and PlayRest play it as today.
     PlayRest();
+    // TEST (EDEN_NX2_GPU_PROFILE=2): the copies out of ring B, up to the tracker bytes.
+    std::optional<Profile::FineScope> copy_scope;
+    copy_scope.emplace(Profile::Zone::RingTakeCopy);
     const u8* const data = reinterpret_cast<const u8*>(&header);
     held_arena.Reset();
     if (header.entry_bytes != 0) {
@@ -1829,6 +1832,7 @@ void MemStage::TakeRingHeader(const RingHeader& header) {
     const u8* const tracker_data = data + sizeof(RingHeader) + sizeof(DrawPacket) +
                                    header.entry_bytes + size_t{header.value_count} * sizeof(u32);
     played_tracker_data.assign(tracker_data, tracker_data + header.tracker_bytes);
+    copy_scope.reset();
     held_cursor = header.held_cursor;
     held_form = (header.flags & 1) != 0;
     held_hashes = header.hashes;
