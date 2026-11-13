@@ -46,6 +46,10 @@ public:
             VideoCommon::BufferChurnStats::StagingCaller::Other);
     void FreeDeferred(StagingBufferRef& ref);
 
+    /// The memory seam's tick guard (SEAM = 2): cached staging buffers stamped `from` get the
+    /// current tick (the copy that reads them was recorded after a flush).
+    void Retick(u64 from);
+
     [[nodiscard]] VkBuffer StreamBuf() const noexcept {
         return *stream_buffer;
     }
@@ -63,6 +67,13 @@ public:
     /// EXP104's pool, shared with the buffer cache that uses this staging pool.
     [[nodiscard]] BufferRecycler& Recycler() noexcept {
         return recycler;
+    }
+
+    /// The buffer cache's clock for this pool and its recycler, before any request: with
+    /// FRITCHII_MEMSTAGE_TICKS their stamps are packet numbers.
+    void UseClock(const SeamClock& clock_) {
+        clock = clock_;
+        recycler.UseClock(clock_);
     }
 
 private:

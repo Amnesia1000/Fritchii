@@ -20,6 +20,8 @@ add_library(video_core STATIC
     buffer_cache/buffer_cache_base.h
     buffer_cache/buffer_cache.cpp
     buffer_cache/buffer_cache.h
+    buffer_cache/cache_inputs.h
+    buffer_cache/mem_read_log.h
     buffer_cache/memory_tracker_base.h
     buffer_cache/nx2_bytes_equal.h
     buffer_cache/usage_tracker.h
@@ -323,6 +325,7 @@ add_library(video_core STATIC
     shader_environment.h
     evicted_pointer_slots.h
     shader_handle_program.h
+    texture_handle_values.h
     shader_notify.cpp
     shader_notify.h
     shader_warm/shader_archives.cpp

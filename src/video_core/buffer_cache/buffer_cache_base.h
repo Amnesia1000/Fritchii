@@ -39,6 +39,7 @@
 #include "core/gpu_dirty_memory_manager.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/buffer_cache/buffer_base.h"
+#include "video_core/buffer_cache/cache_inputs.h"
 #include "video_core/buffer_cache/download_read_stats.h"
 #include "video_core/buffer_cache/gpu_written_mirror.h"
 #include "video_core/buffer_cache/read_run_stats.h"
@@ -586,6 +587,11 @@ public:
         current_draw_indirect = current_draw_indirect_;
     }
 
+    /// Everything the cache reads from the engines (cache_inputs.h), for the bound channel.
+    [[nodiscard]] CacheInputs Inputs() const noexcept {
+        return CacheInputs{maxwell3d, kepler_compute, gpu_memory, current_draw_indirect};
+    }
+
     [[nodiscard]] std::pair<Buffer*, u32> GetDrawIndirectCount();
 
     [[nodiscard]] std::pair<Buffer*, u32> GetDrawIndirectBuffer();
@@ -1044,7 +1050,7 @@ private:
 #else
     static constexpr size_t TICKS_TO_DESTROY = 8;
 #endif
-    DelayedDestructionRing<Buffer, TICKS_TO_DESTROY> delayed_destruction_ring;
+    StampedDestructionRing<Buffer, TICKS_TO_DESTROY> delayed_destruction_ring;
 
     const Tegra::Engines::Maxwell3D::DrawManager::IndirectParams* current_draw_indirect{};
 

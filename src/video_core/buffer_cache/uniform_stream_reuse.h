@@ -31,7 +31,7 @@ concept StreamUniformReusable = requires(R& runtime, u32 size) {
     requires std::is_trivially_copyable_v<typename R::StreamUniformRef>;
     { runtime.LastStreamUniformRef() } -> std::same_as<typename R::StreamUniformRef>;
     runtime.RebindStreamUniform(runtime.LastStreamUniformRef(), size);
-    { runtime.CurrentTick() } -> std::convertible_to<u64>;
+    { runtime.StreamEpoch() } -> std::convertible_to<u64>;
 };
 
 /// EDEN_NX2_UBOREUSE=0 turns the reuse off (every small uniform buffer is copied, as before).
@@ -94,7 +94,8 @@ public:
     static constexpr size_t NumCopies = NumPrivate + NumSets * NumWays;
 
     /// Bytes copied to a stream allocation, and that allocation: `ref` was filled from exactly
-    /// these bytes on scheduler tick `tick`. The bytes change only together with the serial.
+    /// these bytes at stream epoch `tick` (the runtime's StreamEpoch: the scheduler's tick, or the
+    /// count of packet tick closes). The bytes change only together with the serial.
     struct Copy {
         Ref ref{};
         u64 tick{};
@@ -207,7 +208,7 @@ template <class Runtime, class DeviceMemory>
         device_memory.ReadBlockUnsafe(device_addr, reuse.scratch.data(), size);
         guest = reuse.scratch.data();
     }
-    const u64 tick = runtime.CurrentTick();
+    const u64 tick = runtime.StreamEpoch();
     const auto same_bytes = [&](size_t copy_index) {
         return reuse.copies[copy_index].size == size &&
                std::memcmp(reuse.Bytes(copy_index), guest, size) == 0;
@@ -283,8 +284,8 @@ template <class Runtime, class DeviceMemory>
     const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
     std::memcpy(span.data(), reuse.Bytes(target), size);
     copy.ref = runtime.LastStreamUniformRef();
-    // After the allocation: the tick the stream region is tagged with is the one current now.
-    copy.tick = runtime.CurrentTick();
+    // After the allocation: the epoch the stream region is tagged in is the one current now.
+    copy.tick = runtime.StreamEpoch();
     // EXP115: a slot whose bytes differed from its copy again counts a miss (`slot` still holds
     // the previous count here); enough in a row and it copies directly for a while.
     const u16 misses = slot_same || miss_streak == 0 ? u16{0} : static_cast<u16>(slot.misses + 1);

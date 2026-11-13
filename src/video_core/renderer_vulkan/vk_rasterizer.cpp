@@ -576,6 +576,8 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
       frame_dump(device, memory_allocator, scheduler),
       flash_watch(device, memory_allocator, scheduler) {
     scheduler.SetQueryCache(query_cache);
+    // The memory seam's read log asks this cache's tracker; its tick guard restamps this pool.
+    mem_stage.Attach(buffer_cache, buffer_staging_pool);
     VideoCommon::FritchiiDrawKinds::Init();
     // EDEN_NX2_MEMSTAGE_STATS: stream writes are tested against the texture cache's pages.
     VideoCommon::MemStageStats::SetImagePageFilters(&texture_cache.page_filter,
@@ -1467,17 +1469,12 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     // update engine as channel may be different.
     pipeline->SetEngine(maxwell3d, gpu_memory);
     const u32 repack_dirty = buffer_cache_runtime.SetVertexRepackLayout(
-        maxwell3d->regs, pipeline->HasDynamicVertexInput());
+        buffer_cache.Inputs().RepackLayoutRegs(), pipeline->HasDynamicVertexInput());
     mem_stage.BeginDraw(buffer_cache_runtime.RepackMask(), repack_dirty);
     if (repack_dirty) {
-        auto& flags = maxwell3d->dirty.flags;
-        flags[VideoCommon::Dirty::VertexBuffers] = true;
-        flags[Dirty::VertexInput] = true;
-        for (u32 binding = 0; binding < 32; ++binding) {
-            if (repack_dirty & (1U << binding)) {
-                flags[VideoCommon::Dirty::VertexBuffer0 + binding] = true;
-            }
-        }
+        // The cache's flags through its inputs; the vertex input state is the back's own.
+        buffer_cache.Inputs().MarkVertexBuffersDirty(repack_dirty);
+        maxwell3d->dirty.flags[Dirty::VertexInput] = true;
     }
     setup_scope.reset();
     // Delta draws (Fable's port plan step D2): the pipeline keeps this draw as its last while the
@@ -1485,9 +1482,13 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     const bool keep_last_draw =
         fast_draw_counting ||
         VideoCore::Nx2Debug::g_experiments[106].load(std::memory_order_relaxed) != 0;
+    // SEAM = 2 (EXP123): the draw's buffer side is filled here, before the texture work;
+    // Configure plays its sections and PlayRestAfter what is left, whatever Configure returns.
+    mem_stage.FillDraw(buffer_cache, pipeline->MemFacts(), is_indexed);
     if (Profile::Scope scope{Profile::Zone::Configure};
-        !(delta_pipeline != nullptr ? pipeline->ConfigureDelta(is_indexed)
-                                    : pipeline->Configure(is_indexed, keep_last_draw))) {
+        !mem_stage.PlayRestAfter(delta_pipeline != nullptr
+                                     ? pipeline->ConfigureDelta(is_indexed)
+                                     : pipeline->Configure(is_indexed, keep_last_draw))) {
         report_failure("configure failed");
         TraceRenderState(is_indexed, "configure-failed", nullptr);
         return;
@@ -2190,6 +2191,18 @@ bool RasterizerVulkan::Nx2ListDrawSupported() const {
 // buffer cache's buffer at the list's address, which GPU work wrote: nothing is read back.
 bool RasterizerVulkan::Nx2ListDispatchSupported() const {
     return Tegra::Nx2ListDispatch::Mode() != 0;
+}
+
+// The memory seam, SEAM >= 3 (vk_mem_stage.cpp): KeplerCompute's QMD read comes through the open
+// dispatch packet. False below 3: the engine reads it itself, as before.
+bool RasterizerVulkan::MemStageQmd(Tegra::MemoryManager& memory, GPUVAddr address,
+                                   std::span<u32, 64> out) {
+    if (!mem_stage.ValuesByValue()) {
+        return false;
+    }
+    const std::array<u32, 64>& qmd = mem_stage.Qmd(memory, address);
+    std::copy(qmd.begin(), qmd.end(), out.begin());
+    return true;
 }
 
 // List draws and list dispatches: a copy of the list words at their place in the stream, for the
@@ -2977,9 +2990,13 @@ void RasterizerVulkan::DispatchCompute() {
     const bool marking_effects = oot_effects_frame == render_trace_frame && OcarinaTemporalEnabled() &&
                                  !indirect_address && !frame_dump.Capturing();
     ComputePipeline::BindCommand deferred_bind;
-    if (!pipeline->Configure(*kepler_compute, *gpu_memory, scheduler, buffer_cache,
-                             texture_cache, texture_cache_runtime, byte_addressed_shadow,
-                             can_replace || marking_effects ? &deferred_bind : nullptr)) {
+    // SEAM = 2 (EXP123): the dispatch's buffer side is filled here, before Configure's texture
+    // work; Configure plays it and PlayRestAfter what is left.
+    mem_stage.FillDispatch(buffer_cache, pipeline->MemFacts());
+    if (!mem_stage.PlayRestAfter(pipeline->Configure(
+            *kepler_compute, *gpu_memory, scheduler, buffer_cache, texture_cache,
+            texture_cache_runtime, byte_addressed_shadow,
+            can_replace || marking_effects ? &deferred_bind : nullptr))) {
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute resources unavailable");
         return;
     }

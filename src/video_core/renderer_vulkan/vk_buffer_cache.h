@@ -72,6 +72,9 @@ public:
         return last_usage_tick;
     }
 
+    /// The memory seam's tick guard: a use stamped `from` is recorded in the current tick.
+    void Restamp(u64 from) noexcept;
+
     [[nodiscard]] std::span<const u8> Mapped() const noexcept {
         return buffer.IsHostCoherent() ? buffer.Mapped() : std::span<const u8>{};
     }
@@ -153,14 +156,28 @@ public:
         return vertex_repack_mask;
     }
 
+    /// The clock's stamp (SeamClock: a scheduler tick, or a packet number with
+    /// FRITCHII_MEMSTAGE_TICKS). IsFree, Wait, WaitSubmittedTick, WaitForHostRead and IsFreeNow
+    /// take these, as does what SubmitForHostRead returns.
     u64 CurrentTick();
 
     bool IsFree(u64 tick);
 
     void Wait(u64 tick);
 
+    /// Changes exactly when the scheduler's tick does (one thread): the stream uniform reuse's
+    /// "the stream copy is still there" test (vk_mem_stage.cpp, "Packet ticks").
+    [[nodiscard]] u64 StreamEpoch() const noexcept {
+        return clock.Epoch();
+    }
+
+    /// Whether a buffer deleted at `stamp` may be destroyed once its frames have passed.
+    [[nodiscard]] bool DeletedBufferFree(u64 stamp);
+    void NoteHeldBuffers(u64 newly_held);
+
     /// Waits for a submitted tick without flushing: safe on threads other than the GPU thread.
     void WaitSubmittedTick(u64 tick, u64 writer = 0);
+    /// `tick`: a scheduler tick (WaitSubmittedTick translated the stamp).
     void WaitSubmittedTickImpl(u64 tick);
 
     void Finish();
@@ -259,8 +276,7 @@ public:
     /// it and the GPU has not even started on it.
     void RebindStreamUniform(const StreamUniformRef& ref, u32 size) {
         mem_stage.PushDescriptor(UpdateDescriptorQueue::MakeBufferEntry(
-            guest_descriptor_queue.UsesDescriptorBuffer(), ref.buffer, ref.device_address,
-            ref.offset, size));
+            DescriptorForm(), ref.buffer, ref.device_address, ref.offset, size));
     }
 
     [[nodiscard]] VkDeviceSize SparseAlignmentFor(bool sparse_compatible) const noexcept {
@@ -320,8 +336,8 @@ public:
         }
         const VkBufferView view = buffer.View(offset, size, format);
         mem_stage.PushDescriptor(UpdateDescriptorQueue::MakeTexelEntry(
-            guest_descriptor_queue.UsesDescriptorBuffer(), view, buffer.DeviceAddress(), offset,
-            size, TexelBufferFormat(format)), true);
+            DescriptorForm(), view, buffer.DeviceAddress(), offset, size,
+            TexelBufferFormat(format)), true);
     }
 
     bool ShouldLimitDynamicStorageBuffers() const {
@@ -335,7 +351,7 @@ public:
 private:
     void BindBuffer(const Buffer& buffer, u32 offset, u32 size) {
         const VkBuffer handle = buffer.Handle();
-        const bool descriptor_buffer = guest_descriptor_queue.UsesDescriptorBuffer();
+        const bool descriptor_buffer = DescriptorForm();
         if (handle == VK_NULL_HANDLE) {
             mem_stage.PushDescriptor(UpdateDescriptorQueue::MakeBufferEntry(
                 descriptor_buffer, handle, 0, 0, VK_WHOLE_SIZE));
@@ -343,6 +359,12 @@ private:
             mem_stage.PushDescriptor(UpdateDescriptorQueue::MakeBufferEntry(
                 descriptor_buffer, handle, buffer.DeviceAddress(), offset, size));
         }
+    }
+
+    /// The form of the descriptor entries pushed now: a held fill's pipeline's (SEAM = 2 fills
+    /// before Acquire), else the queue's.
+    [[nodiscard]] bool DescriptorForm() const noexcept {
+        return mem_stage.DescriptorForm(guest_descriptor_queue.UsesDescriptorBuffer());
     }
 
     VkFormat TexelBufferFormat(VideoCore::Surface::PixelFormat format) const;

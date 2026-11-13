@@ -278,6 +278,57 @@ when the device is made.
 FRITCHII_MEMSTAGE_SEAM_STATS=1 (boot, diagnostic): the memory seam's stats line (EXP123) every
 10 s also with EXP123 = 0, which shows what the seam carries at today's timing.
 
+### FRITCHII_MEMSTAGE_READ_LOG
+
+FRITCHII_MEMSTAGE_READ_LOG=N (boot, diagnostic, default 0 = off; the memory stage's sub-step 2b,
+fable_memstage_step2_spec.md 5.3): with EXP123 = 2 or 3, every Nth draw, dispatch and operation
+packet logs what its fill read from game memory (uniforms copied to the stream, buffer uploads
+with their staged bytes, cached ranges bound without an upload, storage and table addresses and
+size words, compute pointers, the inline page write), and at the old read position (a draw's or
+dispatch's first play; an operation's end) reads it all again: bytes and values are compared,
+bound ranges are asked whether the CPU wrote them since. Differences are counted by kind; the
+first 16 are logged as "Memory seam (5.3)" with the kind, address, size and the programs. Must
+read 0. Reads past 1 MiB a packet are not logged (counted as "not logged"). The counts are in the
+"memory seam read log" line of EXP123's stats every 10 s. N = 8 is the spec's value; N = 1 checks
+every packet (slower). Not FRITCHII_MEMSTAGE_VERIFY, which is 2c's by-value checks (bit flags).
+
+### FRITCHII_MEMSTAGE_VERIFY
+
+FRITCHII_MEMSTAGE_VERIFY (boot, bit flags, default 0; spec 5.4): with EXP123 = 3 the back also
+makes its own read and compares it with the packet's value (not the early fill's read log: that
+is FRITCHII_MEMSTAGE_READ_LOG). 1 = handle values, 2 = the QMD, 4 = null pointer slots (7 = all).
+Checks and mismatches are counted by kind in the "memory seam by value" line; the first 16 mismatches are logged as "Memory seam by value (5.4)" with the
+address (a handle word's address, or for a handle program bit 63 set, the program in bits 32-62
+and the element in bits 0-31), the kind and the shader (the stage's hash; the program address
+for the QMD and null slots). Must read 0: same thread, same instant. "count" (the back took a
+different number of handle values than the fill made) is counted always and must be 0 too. The
+own reads double the handle reads EDEN_NX2_MEMSTAGE_STATS counts. Later sub-steps may add bits.
+
+### FRITCHII_MEMSTAGE_TICKS
+
+FRITCHII_MEMSTAGE_TICKS (boot, default 0; the memory stage's build step 4,
+fable_memstage_step2_spec.md 7.2): what the buffer cache side's stamps are.
+- 0: scheduler ticks, as before (SeamClock forwards to the scheduler).
+- 1: packet ticks. The memory stage numbers its packets (each draw, dispatch and operation
+  packet takes the next number) and every stamp the buffer cache side takes is the number
+  current then: buffer usage (and so CanReorderUpload's "used since"), staging buffers and
+  the stream ring's lazy region stamps, EXP104's recycler, write ticks, extent probes, list
+  page copies, host read flushes. The GPU thread publishes at the end of every scheduler
+  tick "every number up to N was recorded in tick K"; a stamp is free when its tick is
+  complete. Numbers whose entries still wait for their play stay open past a tick's end, so
+  an early fill (EXP123 = 2) needs no tick guard. Deleted buffers wait their 8 frames and also
+  their packet. The stream uniform reuse compares a close count instead of the tick. On one
+  thread every answer is the scheduler's. With FRITCHII_MEMSTAGE_SPLIT_ALLOC=0 the texture
+  cache's staging (the shared pool) gets packet stamps too, right on one thread.
+- 2: as 1, and every answer is checked against the scheduler ticks' answer. The line
+  "Memory seam ticks (FRITCHII_MEMSTAGE_TICKS=n)" every 10 s gives packets/s, tick closes/s,
+  the published ticks waiting, carried closes and deleted buffers held past their frames (with
+  1 too); with 2, "memory seam ticks check" gives early (the packet answer frees or waits
+  less: unsafe) and late (holds longer) per check (is free, stream known, wait, host read),
+  carried skipped, split (a number handed out in two ticks without a carry), unchecked
+  (older than the 2^18-number ring) and epoch off. Early, late, split, epoch off and held
+  must all read 0. Disagreements log the first 16 lines with the packet and both ticks.
+
 ### FRITCHII_JIT_DISPATCH_BITS
 
 FRITCHII_JIT_DISPATCH_BITS (boot, default 20; fable52_answer_guest 2.1): the A64 JIT's fast
@@ -1041,6 +1092,51 @@ fence commits a second with entries each, deferred entries and plays a second, t
 above, entries a second by kind (which kinds OoT uses at all: convert, multi-range, texel
 buffers), fills by site with entries each, syncs by kind, and entries run outside any fill by
 kind. Compare 0 and 1 with profile_toggle.py ("back us a draw", heavy-phase market, 4 cycles).
+
+EXP123 = 2 (sub-step 2b, spec 4 and 6.2): as 1, and each draw and dispatch is filled once,
+before the texture work. The draw's fill (MemStage::FillDraw, at the rasterizer's draw site after
+the vertex repack layout) runs SetUniformBuffersState, every prepared stage's storage binds, the
+texture buffer unbinds, UpdateGraphicsBuffers, BindHostGeometryBuffers and every stage's
+BindHostStageBuffers; the dispatch's (MemStage::FillDispatch, before ComputePipeline::Configure)
+the uniform state, the storage binds and shader hash, the texture buffer unbinds,
+UpdateComputeBuffers and BindHostComputeBuffers. Configure no longer calls the buffer cache: it
+plays the packet's sections where the calls were (the geometry after the texture buffer binds,
+each stage after Acquire and before its image descriptors, the dispatch's section before its
+image descriptors). When Configure returns, true or false, whatever is left is played (the cache
+believes those uploads are on their way); descriptors left then are dropped with the draw.
+Descriptor entries take the pipeline's form (descriptor buffer or not), as the fill runs before
+Acquire. Pipelines with texture or image buffers keep their fill in Configure as with 1
+("late fill": the binds need the texture cache's views). The indirect dispatch's ObtainBuffer, the
+extent probes, list page copies and draw indirect buffers stay where they are (fill and play at
+the call, as with 1). The tick guard (5.5): when the scheduler submitted between a packet's fill
+and a play, the play gives the buffer cache's staging buffers stamped with the fill's tick and
+the buffers the fill marked used the current tick (counted "tick moved", the first 16 logged with
+the caller of the submit; expected near 0; off with FRITCHII_MEMSTAGE_TICKS, whose stamps are
+packet numbers). The stats line gets a "memory seam 2b" line: held and
+late fill draws and dispatches a second, packets not held (arena busy on another thread), tick
+moved, rest plays (and descriptors dropped), descriptor form mismatches (must be 0), and fill
+and play time with EDEN_NX2_GPU_PROFILE. The GPU profile gets two zones, "memory fill" (every fill
+at 2, the buffer cache's own work included: what leaves the back in step 6) and "memory play".
+FRITCHII_MEMSTAGE_READ_LOG adds the read log (5.3). Compare 1 and 2 with profile_toggle.py
+("back us a draw", heavy-phase market, 4 cycles).
+
+EXP123 = 3 (sub-step 2c, spec 6.3 and 9.1-9.3; as 2: the recorder, the player and the early
+fill): what the back reads from game memory that the stream writes comes in the packet by value. Handle values: the
+raw handle of every image element a draw or dispatch binds, in the order the handle loops read
+them (per stage: texture buffers, image buffers, textures with handle tables expanded, images;
+one value per element, EXP21's buffer address words keep their place unread), made by one
+function for both sides (texture_handle_values.h: RawTextureHandle, FillStageHandleValues), so
+handle programs' constant buffer words, storage buffer addresses and storage words are read by
+the fill. The fill always runs: draws whose handle loop the back skips (TEX_BANK_GEN hits) now
+pay for those reads and are counted. The handle values are not part of 2b's early fill yet: the
+pipeline's Configure fills them at the top of its handle work ("filled in Configure"). The QMD: the
+native QMD scheduler's 256-byte read goes through the dispatch packet (MemStage::Qmd), which
+opens there; the error path's 512-byte read stays direct. Null pointer slots: the compute
+pipeline lookup's pointer read (StaleNullPointerSlot) goes through the open dispatch packet too
+(MemStage::ReadPointerSlot). With 3 the stats line adds "memory seam by value": draws and
+dispatches with values a second (values each, how many filled in Configure, how many the back
+skipped and their values), QMDs a second (and reads that ran no dispatch), null pointer slots,
+and the verify counters below. Values below 3 change nothing here.
 
 ### EXP101
 

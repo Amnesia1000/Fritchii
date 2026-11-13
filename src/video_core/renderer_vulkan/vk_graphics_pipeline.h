@@ -165,6 +165,19 @@ public:
         return key.unique_hashes;
     }
 
+    /// What the memory stage's FillDraw needs (SEAM = 2, vk_mem_stage.cpp).
+    [[nodiscard]] MemStage::DrawFacts MemFacts() const noexcept {
+        return {
+            .uniform_masks = &enabled_uniform_buffer_masks,
+            .uniform_sizes = &uniform_buffer_sizes,
+            .stage_infos = stage_infos.data(),
+            .stages = spec_stages,
+            .has_texel_buffers = has_texel_buffers,
+            .uses_descriptor_buffer = uses_descriptor_buffer,
+            .hashes = {key.unique_hashes[1], key.unique_hashes[5]},
+        };
+    }
+
     struct SampledImage {
         u32 stage;
         u32 tic;
@@ -314,6 +327,8 @@ public:
     /// samplers resolved from the old one. Needs a KeptLastDraw.
     [[nodiscard]] bool ComputedHandlesChanged(const Tegra::Engines::Maxwell3D& maxwell3d_,
                                               Tegra::MemoryManager& gpu_memory_) const;
+
+    void FillHandleValues(MemStage& seam, bool null_pointer_handles, bool in_configure);
 
     [[nodiscard]] GraphicsPipeline* Next(const GraphicsPipelineCacheKey& current_key) noexcept {
         if (key == current_key) {
@@ -575,6 +590,10 @@ private:
     u32 color_output_mask{};
     bool writes_storage{};
     bool samples_nothing{}; ///< SamplesNothing
+    /// The memory stage's facts: the stages Configure prepares (its Spec's), and whether any
+    /// stage binds texture or image buffers (the fill then stays in Configure: LateFill).
+    u32 spec_stages{};
+    bool has_texel_buffers{};
     TextureMemo texture_memo;
     TexBankMemo tex_bank_memo;
     /// EDEN_NX2_TEX_BANK_GEN: (stage, constant buffer index) of every handle word read.

@@ -841,7 +841,11 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                 running_qmd = address;
                 running_descriptor = nullptr;
                 if (!memory_manager.IsFullyMappedRange(address, sizeof(descriptor))) return false;
-                memory_manager.ReadBlockUnsafe(address, descriptor.data(), sizeof(descriptor));
+                // The memory seam (EXP123 >= 3): the QMD comes in the dispatch packet by value.
+                if (rasterizer == nullptr ||
+                    !rasterizer->MemStageQmd(memory_manager, address, descriptor)) {
+                    memory_manager.ReadBlockUnsafe(address, descriptor.data(), sizeof(descriptor));
+                }
                 // EDEN_NX2_MEMSTAGE_STATS: the QMD (the memory stage would pass it by value).
                 VideoCommon::MemStageStats::Read(VideoCommon::MemStageStats::Kind::Qmd,
                                                  sizeof(descriptor));

@@ -14,20 +14,31 @@
 #include <span>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #include "common/common_types.h"
+#include "video_core/buffer_cache/buffer_cache_base.h"
+#include "video_core/buffer_cache/mem_read_log.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_mem_stage_hook.h"
 #include "video_core/renderer_vulkan/vk_seam_clock.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
+namespace Tegra {
+class MemoryManager;
+}
+
 namespace Vulkan {
 
+class Buffer;
+struct BufferCacheParams;
 class Device;
 class MemoryAllocator;
 class MemPlayer;
 class Scheduler;
+class StagingBufferPool;
 
 class MemStage {
 public:
@@ -56,6 +67,7 @@ public:
         Barrier = 2,
         DynamicState = 4,
         ForgetOnly = 8,
+        Played = 0x80, ///< Played early by a sync inside a held fill (SEAM = 2)
     };
 
     struct Entry {
@@ -143,7 +155,7 @@ public:
         BufferRef indirect;
         BufferRef indirect_count;
         Span reads;
-        Span handle_words;
+        Span handle_values;
     };
     struct DispatchPacket {
         u64 number;
@@ -154,8 +166,10 @@ public:
         BufferRef indirect;
         Span after;
         Span reads;
-        Span handle_words;
+        Span handle_values;
         std::array<u32, 64> qmd;
+        std::array<u64, 8> null_slot_values;
+        u32 null_slot_count;
     };
     struct OpPacket {
         u64 number;
@@ -184,8 +198,40 @@ public:
         ImageCopy,
         Query,
         Fence,
+        Draw,
+        Dispatch,
         Count,
     };
+
+    /// DrawPacket and DispatchPacket flags.
+    enum PacketFlag : u32 {
+        LateFill = 1,   ///< Texel buffers: filled where the calls are (as with SEAM = 1)
+        Held = 2,       ///< Filled before the texture work, its sections played later
+        RestPlayed = 4, ///< Configure did not play every section: PlayRest did
+    };
+
+    /// What FillDraw needs from the graphics pipeline (spec 4.2's StageFacts).
+    struct DrawFacts {
+        const std::array<u32, 5>* uniform_masks;
+        const VideoCommon::UniformBufferSizes* uniform_sizes;
+        const Shader::Info* stage_infos; ///< 5 of them
+        u32 stages;                      ///< The stages Configure prepares, one bit each
+        bool has_texel_buffers;
+        bool uses_descriptor_buffer;
+        std::array<u64, 2> hashes; ///< Vertex and fragment program, for the logs
+    };
+
+    /// What FillDispatch needs from the compute pipeline (spec 4.3's ComputeFacts).
+    struct DispatchFacts {
+        u32 uniform_mask;
+        const VideoCommon::ComputeUniformBufferSizes* uniform_sizes;
+        const Shader::Info* info;
+        u64 shader_hash;
+        bool has_texel_buffers;
+        bool uses_descriptor_buffer;
+    };
+
+    using Cache = VideoCommon::BufferCache<BufferCacheParams>;
 
     enum class Sync : u8 {
         Finish,
@@ -215,6 +261,11 @@ public:
         [[nodiscard]] const u8* At(u32 offset) const noexcept {
             return data.get() + offset;
         }
+        void Swap(Arena& other) noexcept {
+            data.swap(other.data);
+            std::swap(capacity, other.capacity);
+            std::swap(cursor, other.cursor);
+        }
 
     private:
         std::unique_ptr<u8[]> data;
@@ -236,6 +287,8 @@ public:
         u32 index;
         Site previous_site;
         u32 begin{};
+        bool reads{}; ///< This bracket started an operation packet's read log
+        std::optional<VideoCommon::Nx2Profile::Scope> zone;
     };
 
     /// A fill bracket that plays what it filled when it ends.
@@ -272,6 +325,11 @@ public:
         return player;
     }
 
+    /// FRITCHII_MEMSTAGE_TICKS >= 1: the packet numbers and published ticks; null at 0.
+    [[nodiscard]] SeamTicks* Ticks() const noexcept {
+        return ticks.get();
+    }
+
     /// Runs `fill` in a fill bracket, then plays: for the calls that return a buffer the caller
     /// records with.
     template <typename Func>
@@ -291,6 +349,89 @@ public:
 
     void BeginDraw(u32 repack_mask, u32 repack_dirty);
     void BeginDispatch();
+
+    /// The cache whose ranges the read log asks about and the staging pool the tick guard
+    /// restamps (the buffer cache's own).
+    void Attach(Cache& cache, StagingBufferPool& staging_pool) noexcept;
+
+    /// SEAM = 2: the draw's whole fill, before the texture work. Null when the draw is not held
+    /// (another SEAM, texel buffers: LateFill, or the arena busy on another thread); Configure
+    /// then fills where the calls are. A held packet is always played whole: PlayRestAfter.
+    const DrawPacket* FillDraw(Cache& cache, const DrawFacts& facts, bool is_indexed);
+    /// SEAM = 2: the dispatch's `before` section, before Configure. Null as for FillDraw.
+    const DispatchPacket* FillDispatch(Cache& cache, const DispatchFacts& facts);
+
+    [[nodiscard]] const DrawPacket* HeldDraw() const noexcept {
+        return held == HeldKind::Draw ? &draw : nullptr;
+    }
+    [[nodiscard]] const DispatchPacket* HeldDispatch() const noexcept {
+        return held == HeldKind::Dispatch ? &dispatch : nullptr;
+    }
+
+    /// Plays the held packet up to the end of `span` (the old position of that section).
+    void PlayHeld(Span span);
+    /// Plays what is left of the held packet (descriptors left out) and ends it.
+    void PlayRest();
+    /// PlayRest, then `configured`: for Configure's call site.
+    bool PlayRestAfter(bool configured) {
+        PlayRest();
+        return configured;
+    }
+
+    /// The descriptor form the runtime's descriptor entries take: the held fill's pipeline's
+    /// (it runs before Acquire), else the queue's.
+    [[nodiscard]] bool DescriptorForm(bool queue_form) const noexcept {
+        return fill_form < 0 ? queue_form : fill_form != 0;
+    }
+
+    /// Buffer::MarkUsage: the buffers a held fill stamps (the tick guard restamps them).
+    static void NoteMarked(Buffer* buffer) {
+        if (t_marked != nullptr) [[unlikely]] {
+            t_marked->push_back(buffer);
+        }
+    }
+
+    enum class Value : u8 {
+        Handle,
+        Qmd,
+        NullSlot,
+        Shape,
+        Count,
+    };
+    enum ValueFlag : u32 {
+        HandleValuesFilled = 1U << 16,
+        HandleNullPointers = 1U << 17,
+        HandleValuesLooked = 1U << 18,
+        HandleValuesRetired = 1U << 19,
+        QmdByValue = 1U << 20,
+    };
+    enum VerifyBit : u32 {
+        VerifyHandles = 1,
+        VerifyQmd = 2,
+        VerifyNullSlots = 4,
+    };
+
+    [[nodiscard]] bool ValuesByValue() const noexcept {
+        return seam_level.load(std::memory_order_relaxed) >= 3;
+    }
+    [[nodiscard]] static u32 VerifyBits() noexcept;
+
+    template <typename FillFn>
+    void FillHandleValues(bool dispatch_side, bool null_pointer_handles, bool in_configure,
+                          FillFn&& fill) {
+        std::vector<u32>& values = dispatch_side ? dispatch_values : draw_values;
+        values.clear();
+        fill(values);
+        CloseHandleValues(dispatch_side, null_pointer_handles, in_configure);
+    }
+    [[nodiscard]] const std::vector<u32>* HandleValues(bool dispatch_side,
+                                                       bool& null_pointer_handles) const noexcept;
+    void LookedAtHandleValues(bool dispatch_side, size_t taken);
+    void NoteValueCheck(Value kind, bool same, u64 address, u64 shader, u64 packet_value,
+                        u64 own_value);
+
+    const std::array<u32, 64>& Qmd(Tegra::MemoryManager& gpu_memory, GPUVAddr address);
+    u64 ReadPointerSlot(Tegra::MemoryManager& gpu_memory, GPUVAddr address);
 
     /// Once a frame on the GPU thread: reads SEAM (EDEN_NX2_EXP123) and logs the stats line.
     void TickFrame();
@@ -316,6 +457,45 @@ public:
 private:
     friend class SeamClock;
     friend void SeamHook::OnUse(SeamHook::Use use, const std::source_location& location);
+    friend void SeamHook::OnTickEnd(u64 tick);
+    friend void VideoCommon::MemReadLog::NoteBytes(VideoCommon::MemReadLog::Kind,
+                                                   Tegra::MaxwellDeviceMemoryManager&, u64, u64);
+    friend void VideoCommon::MemReadLog::NoteStaged(VideoCommon::MemReadLog::Kind,
+                                                    Tegra::MaxwellDeviceMemoryManager&, u64,
+                                                    const u8*, u64);
+    friend void VideoCommon::MemReadLog::NoteValue(VideoCommon::MemReadLog::Kind,
+                                                   Tegra::MemoryManager*, u64, u64, u32);
+    friend void VideoCommon::MemReadLog::NoteRange(VideoCommon::MemReadLog::Kind, u64, u64);
+
+    enum class HeldKind : u8 { None, Draw, Dispatch };
+
+    /// One read of game memory a fill made (spec 5.3).
+    struct ReadRecord {
+        enum class How : u8 { Bytes, Staged, Value, Range };
+        VideoCommon::MemReadLog::Kind kind;
+        How how;
+        u32 size;
+        u64 address;
+        u64 value;        ///< Value: the value read; Bytes: offset of the copy; Range: fill state
+        const void* data; ///< Staged: the staged bytes
+        void* memory;     ///< The device or GPU memory read
+    };
+    struct ReadLog {
+        std::vector<ReadRecord> records;
+        std::vector<u8> bytes;
+        u64 skipped{}; ///< Not logged: past the byte budget
+        u64 budget{};  ///< Bytes to read again at the compare
+        void Clear() noexcept {
+            records.clear();
+            bytes.clear();
+            skipped = 0;
+            budget = 0;
+        }
+    };
+
+    inline static thread_local ReadLog* t_log = nullptr;
+
+    inline static thread_local std::vector<Buffer*>* t_marked = nullptr;
 
     struct Part {
         const void* data;
@@ -347,6 +527,21 @@ private:
         u64 late{};
         u64 unclocked{};
         u64 texel{};
+        u64 held_draws{};
+        u64 late_draws{};
+        u64 held_dispatches{};
+        u64 late_dispatches{};
+        u64 unheld{};
+        u64 tick_moved{};
+        u64 rest_plays{};
+        u64 rest_descriptors{};
+        u64 form_mismatch{};
+        u64 read_packets{};
+        u64 read_records{};
+        u64 read_skipped{};
+        u64 fill_ns{};
+        u64 play_ns{};
+        std::array<u64, static_cast<size_t>(VideoCommon::MemReadLog::Kind::Count)> read_diffs{};
     };
 
     void PushParts(Cmd kind, u8 flags, u32 count, std::initializer_list<Part> parts);
@@ -360,17 +555,59 @@ private:
     void Note(SeamHook::Use use, const std::source_location& location, bool around);
     void LogStats();
     void Snapshot(Counts& out) const;
+    void CloseHandleValues(bool dispatch_side, bool null_pointer_handles, bool in_configure);
+    void RetireDrawValues();
+    void RetireDispatchValues();
+    void OpenDispatchByValue();
+    void LogValueStats(double seconds, bool first);
+
+    bool ClaimHeld();
+    void UpdateUnplayed();
+    void TakeHeld(HeldKind kind);
+    void CheckHeld();
+    void PlayHeldTo(u32 end, bool rest);
+    bool StartReadLog(ReadLog& log, u64 number);
+    void StopReadLog(ReadLog& log, bool held_packet);
+    void NoteHeldFlush(SeamHook::Use use, const std::source_location& location);
+    void CompareReads(ReadLog& log, const char* what, u64 number, u64 hash_a, u64 hash_b);
 
     MemPlayer& player;
     Arena arena;
     std::atomic<uintptr_t> owner{0};
     std::atomic<bool> seam_on{false};
+    std::atomic<int> seam_value{0};
+    /// FRITCHII_MEMSTAGE_READ_LOG: every Nth packet's reads are compared, 0 off
+    int read_log_every{};
+    Cache* cache{};
+    StagingBufferPool* staging_pool{};
+
+    HeldKind held{HeldKind::None};
+    bool filling_held{};
+    s8 fill_form{-1};
+    Arena held_arena;
+    u32 held_cursor{};
+    bool held_form{};
+    std::array<u64, 2> held_hashes{};
+    std::vector<Buffer*> marked;
+    std::vector<Buffer*> held_marked;
+    ReadLog op_log;
+    ReadLog held_log;
+    bool held_log_pending{};
+    u64 op_fills{};
+    std::vector<u8> compare_scratch;
+    std::atomic<u32> diffs_logged{};
+    std::atomic<u32> ticks_logged{};
     bool claim_deferring{};
     bool pending{};
     u32 play_cursor{};
     u32 last_entry{~0U};
 
     u64 packet_number{};
+    std::unique_ptr<SeamTicks> ticks;
+    u64 op_number{};
+    /// Packet ticks: the first number of the pending entries and of the held packet (SEAM >= 2).
+    u64 pending_from{};
+    u64 held_from{};
     DrawPacket draw{};
     DispatchPacket dispatch{};
     OpPacket op{};
@@ -389,10 +626,61 @@ private:
         std::atomic<u64> late{};
         std::atomic<u64> unclocked{};
         std::atomic<u64> texel{};
+        std::atomic<u64> held_draws{};
+        std::atomic<u64> late_draws{};
+        std::atomic<u64> held_dispatches{};
+        std::atomic<u64> late_dispatches{};
+        std::atomic<u64> unheld{};
+        std::atomic<u64> tick_moved{};
+        std::atomic<u64> rest_plays{};
+        std::atomic<u64> rest_descriptors{};
+        std::atomic<u64> form_mismatch{};
+        std::atomic<u64> read_packets{};
+        std::atomic<u64> read_records{};
+        std::atomic<u64> read_skipped{};
+        std::atomic<u64> fill_ns{};
+        std::atomic<u64> play_ns{};
+        std::array<std::atomic<u64>, static_cast<size_t>(VideoCommon::MemReadLog::Kind::Count)>
+            read_diffs{};
     };
     Counters counters;
     Counts reported;
     u64 last_log_ns{};
+
+    std::atomic<int> seam_level{0};
+    bool dispatch_open{};
+    std::vector<u32> draw_values;
+    std::vector<u32> dispatch_values;
+
+    struct ValueCounts {
+        std::array<u64, 2> fills{};
+        std::array<u64, 2> values{};
+        std::array<u64, 2> in_configure{};
+        std::array<u64, 2> skipped{};
+        std::array<u64, 2> skipped_values{};
+        u64 qmds{};
+        u64 qmds_unused{};
+        u64 null_slots{};
+        u64 null_slots_unkept{};
+        std::array<u64, static_cast<size_t>(Value::Count)> checks{};
+        std::array<u64, static_cast<size_t>(Value::Count)> mismatches{};
+    };
+    struct ValueCounters {
+        std::array<std::atomic<u64>, 2> fills{};
+        std::array<std::atomic<u64>, 2> values{};
+        std::array<std::atomic<u64>, 2> in_configure{};
+        std::array<std::atomic<u64>, 2> skipped{};
+        std::array<std::atomic<u64>, 2> skipped_values{};
+        std::atomic<u64> qmds{};
+        std::atomic<u64> qmds_unused{};
+        std::atomic<u64> null_slots{};
+        std::atomic<u64> null_slots_unkept{};
+        std::array<std::atomic<u64>, static_cast<size_t>(Value::Count)> checks{};
+        std::array<std::atomic<u64>, static_cast<size_t>(Value::Count)> mismatches{};
+    };
+    ValueCounters value_counters;
+    ValueCounts reported_values;
+    void SnapshotValues(ValueCounts& out) const;
 };
 
 /// Turns the memory stage's entries into scheduler and descriptor queue calls: the only copy of

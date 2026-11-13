@@ -102,6 +102,8 @@ public:
     void DrawIndirect() override;
     [[nodiscard]] bool Nx2ListDrawSupported() const override;
     [[nodiscard]] bool Nx2ListDispatchSupported() const override;
+    [[nodiscard]] bool MemStageQmd(Tegra::MemoryManager& memory, GPUVAddr address,
+                                   std::span<u32, 64> out) override;
     void Nx2KeepListWords(u64 keep_id, GPUVAddr address, u32 count) override;
     [[nodiscard]] bool Nx2ReadKeptListWords(u64 keep_id, std::span<u32> words) override;
     void DrawTexture() override;

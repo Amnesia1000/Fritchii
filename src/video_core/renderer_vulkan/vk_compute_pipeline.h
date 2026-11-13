@@ -61,6 +61,10 @@ public:
                                  std::optional<ByteAddressedShadow>& shadow,
                                  BindCommand* deferred_bind = nullptr);
 
+    void FillHandleValues(MemStage& seam, const Tegra::Engines::KeplerCompute& kepler_compute,
+                          Tegra::MemoryManager& gpu_memory, bool null_pointer_handles,
+                          bool in_configure);
+
     static constexpr u64 Ocarina1440pShader = 0x6bd913e1f34e83ebULL;
     /// The same output pass at 1:1, run at 1920x1080 in handheld with the Max Resolution add-on.
     static constexpr u64 OcarinaFullSizeShader = 0xc033c3ddc9f0897bULL;
@@ -72,6 +76,19 @@ public:
 
     [[nodiscard]] u64 ShaderHash() const noexcept {
         return shader_hash;
+    }
+
+    /// What the memory stage's FillDispatch needs (SEAM = 2, vk_mem_stage.cpp).
+    [[nodiscard]] MemStage::DispatchFacts MemFacts() const noexcept {
+        return {
+            .uniform_mask = info.constant_buffer_mask,
+            .uniform_sizes = &uniform_buffer_sizes,
+            .info = &info,
+            .shader_hash = shader_hash,
+            .has_texel_buffers =
+                !info.texture_buffer_descriptors.empty() || !info.image_buffer_descriptors.empty(),
+            .uses_descriptor_buffer = uses_descriptor_buffer,
+        };
     }
 
     /// Storage images written by the last configured dispatch

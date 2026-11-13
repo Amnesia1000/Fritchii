@@ -53,6 +53,10 @@ public:
         return use_descriptor_buffer;
     }
 
+    [[nodiscard]] bool FormFor(bool use_descriptor_buffer_) const noexcept {
+        return supports_descriptor_buffer && use_descriptor_buffer_;
+    }
+
     /// The entry AddBuffer adds, in the form `descriptor_buffer` asks for.
     [[nodiscard]] static DescriptorUpdateEntry MakeBufferEntry(bool descriptor_buffer,
                                                                VkBuffer buffer,
