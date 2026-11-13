@@ -97,6 +97,29 @@ public:
         unplayed_from.store(0, std::memory_order_release);
     }
 
+    /// FRITCHII_MEMSTAGE_THREAD = 2 (vk_mem_stage.cpp, "Packet ticks with the stage ahead"): the
+    /// back's mark is SetUnplayed's, GPUMem keeps its own here (its fill, its pending entries), and
+    /// Close takes the lowest of the two and ring B's oldest packet, each written by its own side.
+    void SetStageUnplayed(u64 number) noexcept {
+        stage_unplayed.store(number, std::memory_order_release);
+    }
+    [[nodiscard]] u64 StageUnplayed() const noexcept {
+        return stage_unplayed.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] u64 BackUnplayed() const noexcept {
+        return unplayed_from.load(std::memory_order_acquire);
+    }
+    /// GPUMem: the next packet number, its own mark set to it under the close's lock, so a close
+    /// either ends before the number exists or sees the mark.
+    u64 BeginStagePacket();
+    /// Ring B's oldest packet number, 0 when empty (read by Close on the recording thread).
+    using RingOldest = u64 (*)(void* context);
+    void SetRingOldest(RingOldest reader, void* context) noexcept {
+        std::scoped_lock lock{mutex};
+        ring_oldest = reader;
+        ring_context = context;
+    }
+
     void NoteHeld(u64 newly_held) noexcept;
     void LogStats();
 
@@ -145,6 +168,7 @@ private:
 
     alignas(64) std::atomic<u64> open{1};
     alignas(64) std::atomic<u64> unplayed_from{0};
+    alignas(64) std::atomic<u64> stage_unplayed{0};
     alignas(64) std::atomic<u64> free_number{0};
     std::atomic<u64> advanced_gpu{0};
     std::atomic<u64> published{0};
@@ -152,6 +176,8 @@ private:
 
     std::mutex mutex;
     std::deque<Published> ring;
+    RingOldest ring_oldest{};
+    void* ring_context{};
 
     struct Counters {
         std::atomic<u64> closes{};

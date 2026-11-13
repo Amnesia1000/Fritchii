@@ -133,6 +133,8 @@
 #include <windows.h>
 #endif
 
+#include <boost/container/small_vector.hpp>
+
 #include "common/fritchii_write_ring.h"
 #include "common/logging.h"
 #include "video_core/buffer_cache/cache_inputs.h"
@@ -218,6 +220,8 @@ enum class LevelType : u8 {
     CacheCall,    ///< a closure tagged StageTag::Cache; id: its address in the executable
     // 6b
     LevelDraw,    ///< a draw the stage cannot serve (THREAD = 2); id: the kind
+    // 7
+    CbGpuWritten, ///< constant buffer words onto GPU-written buffer data, the window open
 };
 enum class EngineType : u32 { KeplerCompute, KeplerMemory, MaxwellDMA, Fermi2D, Other };
 
@@ -343,6 +347,9 @@ std::string LevelName(u64 key) {
         break;
     case LevelType::LevelDraw:
         what = fmt::format("level draw (kind {})", id);
+        break;
+    case LevelType::CbGpuWritten:
+        what = "constant buffer words onto GPU-written data (the window open)";
         break;
     }
     return fmt::format("{} ch{}", what, channel);
@@ -766,6 +773,8 @@ struct State {
     u32 ring_packets{};       ///< Packets the entry sent
     Class last_class{Class::Pass};
     std::vector<std::pair<u64, std::size_t>> ring_ranges; ///< Collected, not applied yet
+    /// Step 7: the flags a deferred lend hands over, per engine (BackTakeLend).
+    std::vector<std::pair<Maxwell3D*, Flags>> lend_flags;
     Counters counters;
     Counters totals;
     std::chrono::steady_clock::time_point window_start{};
@@ -938,6 +947,62 @@ void Collect(State& s, const Copy& c, GPUVAddr address, u64 size) {
 /// collected for the buffer half (the back's accumulator is not used).
 void StageWriteWords(State& s, Copy& c, GPUVAddr address, const u32* data, u64 size) {
     const Common::WriteRing::SiteScope write_site{"3D constant buffer data (memory stage)", false};
+    MemoryStageLink& link = MemoryStageLink::Get();
+    const bool ahead = MemoryStageLink::Ahead() != 0;
+    // The write's device ranges, rounded as the back's invalidation rounds (32 bytes), split where
+    // the GPU pages map: the buffer half the next fill (or a lend) applies.
+    boost::container::small_vector<std::pair<u64, std::size_t>, 4> pieces;
+    {
+        constexpr u64 Atom = 32;
+        constexpr u64 Page = 0x1000;
+        GPUVAddr begin = address & ~(Atom - 1);
+        const GPUVAddr end = (address + size + Atom - 1) & ~(Atom - 1);
+        while (begin < end) {
+            const GPUVAddr piece_end = (std::min)(end, (begin + Page) & ~(Page - 1));
+            if (const std::optional<DAddr> device = c.memory->GpuToCpuAddress(begin)) {
+                pieces.emplace_back(*device, static_cast<std::size_t>(piece_end - begin));
+            }
+            begin = piece_end;
+        }
+    }
+    // Step 7, the window open (Fable's review, A): words onto GPU-written buffer data. A served
+    // download the back makes before this entry would copy the GPU's older bytes over them, and
+    // the claim would then upload those. Coming level and claiming at once is not enough: the
+    // packets of this entry's earlier draws are still in ring B (a writing draw into these pages,
+    // a join's copy) and the claim's download would be recorded before them. So the entry turns
+    // hard here, before the write: the back runs it in a level run and writes the words with its
+    // own code, in stream order (re-review N1). The words written before in this entry are the
+    // same bytes; the back writes them again.
+    const auto& backend = link.Backend();
+    if (ahead && !pieces.empty() && backend.ranges_gpu_written != nullptr &&
+        backend.ranges_gpu_written(backend.context, pieces.data(), pieces.size())) [[unlikely]] {
+        link.NoteWriteLevel();
+        Hard(s, LevelType::CbGpuWritten, 0);
+        return;
+    }
+    // The stage's own ring keeps these writes with their entry while the window's verify runs
+    // (the read compare leaves them out, the image check looks for them); the emulator's write
+    // ring would only wrap on them over a lead of a frame, so they stay out of it then.
+    const bool kept = MemoryStageLink::StageWritesKept();
+    struct Quiet {
+        bool was;
+        explicit Quiet(bool on) : was{Common::WriteRing::t_quiet} {
+            Common::WriteRing::t_quiet = was || on;
+        }
+        ~Quiet() {
+            Common::WriteRing::t_quiet = was;
+        }
+    } quiet{kept};
+    if (kept) {
+        constexpr u64 Page = 0x1000;
+        for (GPUVAddr piece = address; piece < address + size;) {
+            const GPUVAddr piece_end = (std::min)(address + size, (piece + Page) & ~(Page - 1));
+            if (const std::optional<DAddr> device = c.memory->GpuToCpuAddress(piece)) {
+                link.NoteStageWrite(*device, piece_end - piece, s.processing_position);
+            }
+            piece = piece_end;
+        }
+    }
     if (address + size > Tegra::g_nx2_sparse_low.load(std::memory_order_relaxed) &&
         address < Tegra::g_nx2_sparse_high.load(std::memory_order_relaxed)) {
         for (u64 i = 0; i < size / sizeof(u32); ++i) {
@@ -946,17 +1011,7 @@ void StageWriteWords(State& s, Copy& c, GPUVAddr address, const u32* data, u64 s
     } else {
         c.memory->WriteBlockStage(address, data, size);
     }
-    constexpr u64 Atom = 32;
-    constexpr u64 Page = 0x1000;
-    GPUVAddr begin = address & ~(Atom - 1);
-    const GPUVAddr end = (address + size + Atom - 1) & ~(Atom - 1);
-    while (begin < end) {
-        const GPUVAddr piece_end = (std::min)(end, (begin + Page) & ~(Page - 1));
-        if (const std::optional<DAddr> device = c.memory->GpuToCpuAddress(begin)) {
-            s.ring_ranges.emplace_back(*device, static_cast<std::size_t>(piece_end - begin));
-        }
-        begin = piece_end;
-    }
+    s.ring_ranges.insert(s.ring_ranges.end(), pieces.begin(), pieces.end());
 }
 
 /// Maxwell3D::ProcessCBMultiData: computes the write and its range, writes nothing. With EXP107
@@ -2044,6 +2099,65 @@ void StageLend() {
         }
     }
     ++s.counters.lends;
+}
+
+void StageLendDeferred() {
+    // GPUMem: what StageLend would set, kept for the back. Nothing changes the copies' flags
+    // until the run returns (the run's entries GPUMem follows meanwhile are other engines' and
+    // closures), and the back reads this only after the run is published.
+    State& s = S();
+    s.lend_flags.clear();
+    for (Copy& copy : s.copies) {
+        if (!copy.stale) {
+            s.lend_flags.emplace_back(copy.back, copy.e->dirty.flags & CacheFlagMask());
+        }
+    }
+    ++s.counters.lends;
+}
+
+void BackTakeLend() {
+    // The back, at the run's first entry: S() is GPUMem's state, which is parked on this run.
+    for (const auto& [engine, flags] : S().lend_flags) {
+        TakeCacheFlags(engine->dirty.flags, flags);
+    }
+}
+
+bool StageMayCopy(u64 position) {
+    // As Process and Use: the copy an entry applies to, when it is missing or stale, is taken
+    // from the back (Resync).
+    State& s = S();
+    const u64* const entry = &Access::Ring()[position & Access::RingMask];
+    const u64 head = entry[0];
+    const auto needs = [&s](Maxwell3D* engine) {
+        if (engine == nullptr) {
+            return false;
+        }
+        for (const Copy& copy : s.copies) {
+            if (copy.back == engine) {
+                return copy.stale;
+            }
+        }
+        return true; // a new copy starts stale
+    };
+    switch (static_cast<Kind>(head & 0xf)) {
+    case Kind::Method:
+    case Kind::Multi:
+    case Kind::Pairs:
+    case Kind::StateDelta:
+    case Kind::DrawBatch:
+        return s.engine_copy != nullptr && s.engine_copy->stale;
+    case Kind::Call:
+        switch (StageTagOf(head)) {
+        case StageTag::Writes:
+        case StageTag::FinishMacro:
+        case StageTag::DrawLoop:
+            return needs(As3D(entry[2]));
+        default:
+            return false;
+        }
+    default:
+        return false;
+    }
 }
 
 u64 StageReturn(const void* drew_engine, const void* state_engine, s32 back_channel) {

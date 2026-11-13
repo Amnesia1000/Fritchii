@@ -151,9 +151,11 @@
 // match; packets of earlier draws the back never prepared are played whole first) into the held
 // arena, and from there plays it exactly as a held packet (PlayHeld, PlayRest). The read log and
 // the texture write check stay off for ring packets (they compare one fill with its own play on
-// one thread). The facts table: the back publishes each pipeline's facts (by value) under the
-// stage's program key at every draw it prepares; GPUMem copies an entry out under its sequence
-// word. A miss makes the draw level (the back prepares it, and publishes).
+// one thread); with the window open (step 7) the read log runs for them in its own form, compared
+// at the take ("Step 7's verify" below). The facts table: the back publishes each pipeline's
+// facts (by value) under the stage's program key at every draw it prepares; GPUMem copies an
+// entry out under its sequence word (each side keeps a cache of its own: step 7). A miss makes
+// the draw level (the back prepares it, and publishes).
 //
 // FRITCHII_MEMSTAGE_VERIFY (boot, bit flags; spec 5.4; not 2b's FRITCHII_MEMSTAGE_READ_LOG): with
 // SEAM = 3 the back also makes its own read and compares it with the packet's value: 1 handle
@@ -171,6 +173,7 @@
 #include <memory>
 #include <string>
 
+#include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 
@@ -192,8 +195,10 @@
 #include "video_core/memory_manager.h"
 #include "video_core/memory_stage_link.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_fastdraw_count.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_runahead.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_mem_stage.h"
@@ -522,7 +527,7 @@ MemStage::Fill::Fill(MemStage& stage_, Site site_, u32 index_)
             }
         }
         if (stage.ticks && IsOpSite(site)) {
-            stage.op_number = stage.ticks->BeginPacket();
+            stage.op_number.store(stage.ticks->BeginPacket(), std::memory_order_relaxed);
         }
     }
     begin = stage.OwnedHere() ? stage.arena.Size() : 0;
@@ -570,7 +575,9 @@ MemStage::SyncScope::~SyncScope() {
 MemStage::MemStage(MemPlayer& player_)
     : player{player_}, arena{256 * 1024}, held_arena{256 * 1024},
       ring_b{std::make_unique_for_overwrite<u8[]>(RingBytes)},
-      facts_table{std::make_unique<FactsSlot[]>(FactsSlots)} {
+      facts_table{std::make_unique<FactsSlot[]>(FactsSlots)},
+      published_memo{std::make_unique<PublishedMemo[]>(MemoSlots)},
+      stage_facts_cache{std::make_unique<StageFactsSlot[]>(StageFactsSlots)} {
     player.stage = this;
     if (const char* const value = std::getenv("FRITCHII_MEMSTAGE_READ_LOG")) {
         read_log_every = (std::max)(0, std::atoi(value));
@@ -579,9 +586,18 @@ MemStage::MemStage(MemPlayer& player_)
         // The read log's classes: every emulator write to game memory goes to the ring from now.
         Common::WriteRing::g_on.store(true, std::memory_order_relaxed);
         ring_owner = true;
+        // Step 7's verify: the cache's CPU-written marks (NoteCpuMark).
+        cpu_marks = std::make_unique<CpuMark[]>(CpuMarkSlots);
     }
     if (const u32 mode = TicksMode(); mode != 0) {
         ticks = std::make_unique<SeamTicks>(player.scheduler.GetMasterSemaphore(), mode == 2);
+        // Ring B's packets are unplayed too: a close asks for the oldest itself (THREAD = 2). It
+        // reads the back's cursor: every close runs on the recording thread, the back (GPUMem's
+        // syncs are served there), except Serve's fallback at shutdown, which runs on GPUMem only
+        // once the back has left its loop and touches the cursor no more.
+        ticks->SetRingOldest(
+            [](void* context) { return static_cast<MemStage*>(context)->RingOldestNumber(); },
+            this);
         LOG_INFO(Render_Vulkan, "Memory seam: packet ticks (FRITCHII_MEMSTAGE_TICKS={}){}", mode,
                  mode == 2 ? ", checked against the scheduler's ticks" : "");
     }
@@ -729,7 +745,7 @@ void MemStage::CloseSection(Site site, u32 index, u32 begin) {
         break;
     default:
         if (t_fill_depth == 1) {
-            op.number = ticks ? op_number : ++packet_number;
+            op.number = ticks ? op_number.load(std::memory_order_relaxed) : ++packet_number;
             op.entries = span;
         }
         break;
@@ -752,7 +768,16 @@ void MemStage::BeginDraw(u32 repack_mask, u32 repack_dirty) {
     Bump(counters.draws);
     RetireDrawValues();
     draw = DrawPacket{};
-    draw.number = ticks ? ticks->BeginPacket() : ++packet_number;
+    if (ticks && Link::OnStageThread() && Link::RingActive()) {
+        // THREAD = 2: GPUMem's mark is the draw's number from the moment it exists (the back
+        // may close a tick meanwhile); EndStageFill clears it however the fill ends.
+        draw.number = ticks->BeginStagePacket();
+        if (stage_fill_from == 0) {
+            stage_fill_from = draw.number;
+        }
+    } else {
+        draw.number = ticks ? ticks->BeginPacket() : ++packet_number;
+    }
     draw.repack_mask = repack_mask;
     draw.repack_dirty = repack_dirty;
 }
@@ -1020,6 +1045,34 @@ bool MemStage::ClaimHeld() {
 // played inside Configure does not end the held one. Without a held packet this is SetPending's
 // and PlayPending's set and clear.
 void MemStage::UpdateUnplayed() {
+    if (Link::RingActive()) {
+        // THREAD = 2 ("Packet ticks with the stage ahead"): each side writes only its own mark,
+        // from its own fields; the close takes the lower one and ring B's oldest packet itself.
+        // GPUMem: the draw it fills (from BeginDraw to the push) and its pending entries. The
+        // back: the packet it holds, its own fill in a run, its pending entries. (The arena and
+        // its pending flag belong to whichever thread owns it: GPUMem's while it fills; the back
+        // reads them as GPUMem's only while it serves GPUMem's sync with GPUMem's identity, and
+        // then writes GPUMem's mark.)
+        const bool owned = OwnedHere();
+        if (Link::OnStageThread() || t_identity != 0) {
+            u64 from = stage_fill_from;
+            if (owned && pending && (from == 0 || pending_from < from)) {
+                from = pending_from;
+            }
+            ticks->SetStageUnplayed(from);
+            return;
+        }
+        u64 from = held != HeldKind::None || (owned && filling_held) ? held_from : 0;
+        if (owned && pending && (from == 0 || pending_from < from)) {
+            from = pending_from;
+        }
+        if (from != 0) {
+            ticks->SetUnplayed(from);
+        } else {
+            ticks->ClearUnplayed();
+        }
+        return;
+    }
     u64 from = held != HeldKind::None || filling_held ? held_from : 0;
     // THREAD = 2: the packets in ring B are not played yet either.
     if (const u64 oldest = RingOldestNumber(); oldest != 0 && (from == 0 || oldest < from)) {
@@ -1070,8 +1123,9 @@ void MemStage::EndHeldFill() {
     fill_form = -1;
     t_reads = nullptr;
     // A ring push ended the fill too. ring_pushed is FillRingDraw's answer: read here, not taken
-    // (taking it here made every served draw look unfilled to the stage, hence level).
-    if (held != HeldKind::None || ring_pushed) {
+    // (taking it here made every served draw look unfilled to the stage, hence level). A ring fill
+    // asks only that: `held` is the back's (it may hold another packet right now).
+    if (ring_fill ? ring_pushed : held != HeldKind::None) {
         return;
     }
     // The fill threw before TakeHeld: nothing is held. Its entries stay pending and the next
@@ -1080,6 +1134,13 @@ void MemStage::EndHeldFill() {
     if (t_log == &held_log) {
         t_log = nullptr;
         held_log.Clear();
+    }
+    if (ring_fill && stage_log) {
+        // A ring fill that made no packet: its log goes back to the pool.
+        if (t_log == stage_log.get()) {
+            t_log = nullptr;
+        }
+        RecycleRingLog(std::move(stage_log));
     }
     if (ticks) {
         UpdateUnplayed();
@@ -1106,23 +1167,35 @@ const MemStage::DrawPacket* MemStage::FillDrawHere(Cache& cache_, const DrawFact
     const u64 start = timed ? NowNs() : 0;
     Bump(counters.held_draws);
     draw.flags |= Held;
-    held_hashes = facts.hashes;
-    held_form = player.guest_descriptor_queue.FormFor(facts.uses_descriptor_buffer);
-    fill_form = held_form ? 1 : 0;
+    const bool form = player.guest_descriptor_queue.FormFor(facts.uses_descriptor_buffer);
+    if (ring_fill) {
+        // THREAD = 2: the fill side's own fields (the back holds and plays another packet at the
+        // same time with the window open); they go to the back in the ring header.
+        fill_hashes = facts.hashes;
+        fill_held_form = form;
+    } else {
+        held_hashes = facts.hashes;
+        held_form = form;
+        held_flush_seen = false;
+        held_reads.clear();
+    }
+    fill_form = form ? 1 : 0;
     filling_held = true;
     filling_kind = HeldKind::Draw;
-    held_flush_seen = false;
     t_holding = true;
-    held_reads.clear();
     // THREAD = 2: no texture write check and no read log for ring packets (Ring B above).
     t_reads = ring_fill ? nullptr : &held_reads;
     const HeldFillEnd fill_end{*this};
     if (ticks) {
-        held_from = draw.number;
+        if (!ring_fill) {
+            held_from = draw.number;
+        }
         UpdateUnplayed();
     }
+    // A ring packet's log is the stage's own (step 7, the window open; compared at the take).
     const bool logging =
-        read_log_every > 0 && !ring_fill && StartReadLog(held_log, draw.number);
+        read_log_every > 0 &&
+        (ring_fill ? StartRingReadLog(draw.number) : StartReadLog(held_log, draw.number));
     {
         // Today's calls in today's relative order (ConfigureImpl): the uniform state, per stage
         // the storage binds, the texture buffer unbinds, then the geometry and each stage's
@@ -1180,7 +1253,11 @@ const MemStage::DrawPacket* MemStage::FillDrawHere(Cache& cache_, const DrawFact
         }
         last_entry = ~0U;
         if (logging) {
-            StopReadLog(held_log, true);
+            if (ring_fill) {
+                StopRingReadLog();
+            } else {
+                StopReadLog(held_log, true);
+            }
         }
         if (ring_fill) {
             // The cache's "uploaded" mark is the back's question in Configure: it goes in the
@@ -1190,8 +1267,14 @@ const MemStage::DrawPacket* MemStage::FillDrawHere(Cache& cache_, const DrawFact
                 cache_.any_buffer_uploaded = false;
             }
             // The trackers' record goes in the packet: taken before the push.
+            fill_tracker_data.clear();
             if (tracker_record.load(std::memory_order_relaxed)) [[unlikely]] {
                 FillTrackerRecord(cache_, draw.trackers);
+                if (Link::Ahead() != 0) {
+                    // Step 7: with the window open the back draws after GPUMem wrote later
+                    // constant buffer words: the bytes the trackers read come with the packet.
+                    CopyTrackerBytes(draw.trackers, facts.hashes[0]);
+                }
             }
             PushRingDraw();
         } else {
@@ -1207,6 +1290,52 @@ const MemStage::DrawPacket* MemStage::FillDrawHere(Cache& cache_, const DrawFact
         Bump(counters.fill_ns, NowNs() - start);
     }
     return &draw;
+}
+
+void MemStage::CopyTrackerBytes(TrackerRecord& record, u64 vertex_program) {
+    // What TrackOcarinaCamera and TrackOcarinaActor read of game memory, under the same tests of
+    // the record (the trackers' other tests, on the render targets and the registers, are the
+    // back's and come after): the camera block of slot 3, the origin in slot 4 and the bones of
+    // slot 6 of the actor's draw.
+    if (device_memory == nullptr) {
+        return;
+    }
+    const auto copy = [&](size_t slot, u64 address, u32 bytes) {
+        const size_t at = fill_tracker_data.size();
+        fill_tracker_data.resize(at + bytes);
+        device_memory->ReadBlockUnsafe(address, fill_tracker_data.data() + at, bytes);
+        record.copied[slot] = bytes;
+    };
+    const TrackerSlot& camera = record.slots[0];
+    if (camera.bound && camera.size >= TrackerRecord::CameraBytes && !camera.gpu_modified) {
+        copy(0, camera.address, TrackerRecord::CameraBytes);
+    }
+    if (vertex_program != TrackerRecord::ActorShader) {
+        return;
+    }
+    const TrackerSlot& origin = record.slots[1];
+    if (origin.bound && !origin.gpu_modified &&
+        origin.size >= TrackerRecord::OriginOffset + TrackerRecord::OriginBytes) {
+        copy(1, origin.address + TrackerRecord::OriginOffset, TrackerRecord::OriginBytes);
+    }
+    const TrackerSlot& bones = record.slots[2];
+    if (bones.bound && !bones.gpu_modified && bones.size == TrackerRecord::BonesSlotSize) {
+        copy(2, bones.address, TrackerRecord::BonesBytes);
+    }
+}
+
+const u8* MemStage::TrackerBytes(const TrackerRecord& record, size_t slot) const noexcept {
+    if (slot >= record.copied.size() || record.copied[slot] == 0) {
+        return nullptr;
+    }
+    size_t at = 0;
+    for (size_t i = 0; i < slot; ++i) {
+        at += record.copied[i];
+    }
+    if (at + record.copied[slot] > played_tracker_data.size()) {
+        return nullptr;
+    }
+    return played_tracker_data.data() + at;
 }
 
 void MemStage::FillTrackerRecord(Cache& cache_, TrackerRecord& record) {
@@ -1418,6 +1547,32 @@ bool MemStage::FillRingDraw(Cache& cache_, const DrawFacts& facts, bool is_index
     return packet != nullptr && std::exchange(ring_pushed, false);
 }
 
+void MemStage::EndStageFill() {
+    // GPUMem's mark, however its draw's fill ended (a push clears it first; this covers a fill
+    // that made no packet, or threw).
+    if (stage_fill_from != 0) {
+        stage_fill_from = 0;
+        if (ticks) {
+            UpdateUnplayed();
+        }
+    }
+}
+
+void MemStage::ResetStageSide(bool end) {
+    if (end && pending) {
+        // GPUMem's entries left pending by a fill that threw: played on the back, in order,
+        // before anything else is recorded (GPUMem is out of its loop).
+        owner.store(ThisThread(), std::memory_order_relaxed);
+        PlayPending(true);
+        owner.store(0, std::memory_order_release);
+    }
+    stage_fill_from = 0;
+    if (ticks) {
+        ticks->SetStageUnplayed(0);
+        UpdateUnplayed();
+    }
+}
+
 bool MemStage::RingRoom() const noexcept {
     // Several packets can be in flight in level mode: the draws of one entry, and a deferred
     // draw the stage's copy flushed at a sink-bound write, whose packet waits for the back's
@@ -1430,8 +1585,9 @@ bool MemStage::RingRoom() const noexcept {
 void MemStage::PushRingDraw() {
     const u32 entries = arena.Size();
     const u32 value_count = ring_values != nullptr ? static_cast<u32>(ring_values->size()) : 0U;
+    const u32 tracker_bytes = static_cast<u32>(fill_tracker_data.size());
     const u64 bytes = Align8(static_cast<u32>(sizeof(RingHeader) + sizeof(DrawPacket) + entries +
-                                              value_count * sizeof(u32)));
+                                              value_count * sizeof(u32) + tracker_bytes));
     u64 index = ring_b_write % RingBytes;
     if (index + bytes > RingBytes) {
         // Packets never wrap: a pad to the end (no header when fewer bytes than one are left).
@@ -1452,7 +1608,7 @@ void MemStage::PushRingDraw() {
     RingHeader header{};
     header.bytes = static_cast<u32>(bytes);
     header.kind = 1;
-    header.flags = held_form ? 1 : 0;
+    header.flags = fill_held_form ? 1 : 0;
     header.part = 0;
     header.position = ring_fill_position;
     header.number = draw.number;
@@ -1460,9 +1616,16 @@ void MemStage::PushRingDraw() {
     header.hash = ring_fill_hash;
     header.held_cursor = play_cursor;
     header.entry_bytes = entries;
-    header.hashes = held_hashes;
+    header.hashes = fill_hashes;
     header.value_count = value_count;
     header.value_flags = (ring_values != nullptr ? 1U : 0U) | (ring_null_pointers ? 2U : 0U);
+    header.tracker_bytes = tracker_bytes;
+    if (stage_log) {
+        // Step 7's verify: the fill's read log, in packet order, before the packet is visible.
+        header.flags |= 2;
+        std::scoped_lock lock{ring_logs_mutex};
+        ring_logs.emplace_back(draw.number, std::move(stage_log));
+    }
     u8* const out = ring_b.get() + index;
     std::memcpy(out, &header, sizeof(header));
     std::memcpy(out + sizeof(header), &draw, sizeof(DrawPacket));
@@ -1473,9 +1636,18 @@ void MemStage::PushRingDraw() {
         std::memcpy(out + sizeof(header) + sizeof(DrawPacket) + entries, ring_values->data(),
                     value_count * sizeof(u32));
     }
+    if (tracker_bytes != 0) {
+        std::memcpy(out + sizeof(header) + sizeof(DrawPacket) + entries + value_count * sizeof(u32),
+                    fill_tracker_data.data(), tracker_bytes);
+    }
     ring_b_write += bytes;
     ring_b_sent.store(ring_b_write, std::memory_order_release);
-    Link::Get().NotePacketSent(bytes);
+    // GPUMem's mark goes only after the packet is in ring B (a close reads the mark first).
+    stage_fill_from = 0;
+    const u64 sent = ring_packets_sent.load(std::memory_order_relaxed) + 1;
+    ring_packets_sent.store(sent, std::memory_order_seq_cst);
+    Link::Get().NotePacketSent(bytes,
+                               sent - ring_packets_done.load(std::memory_order_seq_cst));
     // As TakeHeld: the arena is done with; the next fill starts on an empty one.
     arena.Reset();
     play_cursor = 0;
@@ -1558,15 +1730,24 @@ void MemStage::TakeRingHeader(const RingHeader& header) {
         Bump(value_counters.fills[0]);
         Bump(value_counters.values[0], header.value_count);
     }
+    // Step 7: the trackers' bytes the fill copied (TrackerBytes).
+    const u8* const tracker_data = data + sizeof(RingHeader) + sizeof(DrawPacket) +
+                                   header.entry_bytes + size_t{header.value_count} * sizeof(u32);
+    played_tracker_data.assign(tracker_data, tracker_data + header.tracker_bytes);
     held_cursor = header.held_cursor;
     held_form = (header.flags & 1) != 0;
     held_hashes = header.hashes;
+    const bool logged = (header.flags & 2) != 0;
     const u64 number = header.number;
     ring_b_read += header.bytes;
-    ring_b_freed.store(ring_b_read, std::memory_order_release);
+    ring_b_freed.store(ring_b_read, std::memory_order_seq_cst);
+    // Step 7: the window and the room GPUMem may wait for (it is woken if it sleeps).
+    ring_packets_done.fetch_add(1, std::memory_order_seq_cst);
+    Link::Get().NoteRingFreed();
     held = HeldKind::Draw;
     held_ring = true;
     held_reads.clear();
+    held_flush_seen = false; // the back's packet now (the ring fill leaves it to the back)
     held_log_pending = false;
     t_holding = true;
     VideoCommon::MemReadLog::g_held.store(true, std::memory_order_relaxed);
@@ -1574,6 +1755,14 @@ void MemStage::TakeRingHeader(const RingHeader& header) {
     if (ticks) {
         held_from = number;
         UpdateUnplayed();
+    }
+    if (logged) {
+        // Step 7's verify (spec 6.4): the reads of the packet's fill against game memory now, at
+        // the back's position (before anything of this draw runs).
+        if (std::unique_ptr<ReadLog> log = TakeRingLog(number)) {
+            CompareRingReads(*log, number, held_hashes[0], held_hashes[1]);
+            RecycleRingLog(std::move(log));
+        }
     }
 }
 
@@ -1635,8 +1824,14 @@ void MemStage::PlayPostCopyBarrier() {
 }
 
 void MemStage::DiscardRingHeader(const RingHeader& header) {
+    if ((header.flags & 2) != 0) {
+        // Not played: its read log is not compared.
+        RecycleRingLog(TakeRingLog(header.number));
+    }
     ring_b_read += header.bytes;
-    ring_b_freed.store(ring_b_read, std::memory_order_release);
+    ring_b_freed.store(ring_b_read, std::memory_order_seq_cst);
+    ring_packets_done.fetch_add(1, std::memory_order_seq_cst);
+    Link::Get().NoteRingFreed();
     if (ticks) {
         UpdateUnplayed();
     }
@@ -1656,14 +1851,21 @@ u64 MemStage::DropRingPackets(u64 position) {
 void MemStage::PublishFacts(u64 key, const void* source, const DrawFacts& facts,
                             bool dynamic_input) {
     key = key != 0 ? key : 1;
+    // The back's memo (step 7): every write of the table goes through here and updates it, so a
+    // hit means the table holds this source under this key already. No lock then.
+    PublishedMemo& memo = published_memo[FactsHash(key) & (MemoSlots - 1)];
+    if (memo.key == key && memo.source == source) {
+        return;
+    }
     constexpr size_t Mask = FactsSlots - 1;
-    const size_t home = static_cast<size_t>((key * 0x9e3779b97f4a7c15ULL) >> 52) & Mask;
+    const size_t home = FactsHash(key) & Mask;
     std::scoped_lock lock{facts_mutex};
     FactsSlot* target = &facts_table[home];
     for (size_t probe = 0, index = home; probe < 16; ++probe, index = (index + 1) & Mask) {
         FactsSlot& slot = facts_table[index];
         if (slot.key == key) {
             if (slot.source == source) {
+                memo = PublishedMemo{key, source};
                 return; // published already
             }
             target = &slot;
@@ -1707,20 +1909,49 @@ void MemStage::PublishFacts(u64 key, const void* source, const DrawFacts& facts,
         }
         staged.infos = std::move(infos);
     }
+    if (target->key != 0 && target->key != key) {
+        // An entry pushed out of a full probe run: its memo must not say "published" any more.
+        PublishedMemo& evicted = published_memo[FactsHash(target->key) & (MemoSlots - 1)];
+        if (evicted.key == target->key) {
+            evicted = PublishedMemo{};
+        }
+    }
     target->key = key;
     target->source = source;
     target->facts = std::move(staged);
+    memo = PublishedMemo{key, source};
+    facts_generation.fetch_add(1, std::memory_order_release);
 }
 
 bool MemStage::LookupFacts(u64 key, StagedFacts& out) const {
     key = key != 0 ? key : 1;
+    // GPUMem's cache (step 7): valid while no write happened since it was filled. A write right
+    // after this test is one the lookup could have missed under the lock too (the back publishes
+    // at its own, earlier, position).
+    const u64 generation = facts_generation.load(std::memory_order_acquire);
+    if (generation != stage_facts_generation) {
+        for (size_t i = 0; i < StageFactsSlots; ++i) {
+            stage_facts_cache[i].key = 0;
+        }
+        stage_facts_generation = generation;
+    }
+    StageFactsSlot& cached = stage_facts_cache[FactsHash(key) & (StageFactsSlots - 1)];
+    if (cached.key == key) {
+        out = cached.facts;
+        return true;
+    }
     constexpr size_t Mask = FactsSlots - 1;
-    const size_t home = static_cast<size_t>((key * 0x9e3779b97f4a7c15ULL) >> 52) & Mask;
+    const size_t home = FactsHash(key) & Mask;
     std::scoped_lock lock{facts_mutex};
     for (size_t probe = 0, index = home; probe < 16; ++probe, index = (index + 1) & Mask) {
         const FactsSlot& slot = facts_table[index];
         if (slot.key == key) {
             out = slot.facts;
+            if (facts_generation.load(std::memory_order_relaxed) == generation) {
+                // Kept only when the table is still the generation the cache stands for.
+                cached.key = key;
+                cached.facts = slot.facts;
+            }
             return true;
         }
         if (slot.key == 0) {
@@ -1872,18 +2103,21 @@ void MemStage::PlayRest() {
 }
 
 void MemStage::NoteHeldFlush(SeamHook::Use use, const std::source_location& location) {
-    if (held_flush_seen) {
+    if (held_flush_seen.exchange(true)) {
         return;
     }
-    held_flush_seen = true;
     Bump(counters.held_flushed);
     static std::atomic<u32> logged{};
     if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
-        const bool is_draw = (filling_held ? filling_kind : held) == HeldKind::Draw;
+        // THREAD = 2: a ring packet the back holds is played_draw (GPUMem's fields are its own).
+        const bool ring = held_ring && held == HeldKind::Draw;
+        const bool is_draw =
+            ring || (filling_held.load() ? filling_kind.load() : held) == HeldKind::Draw;
         LOG_WARNING(Render_Vulkan,
                     "Memory seam (5.5): a {}{} between the fill and the PlayRest of {} {}: {}:{} {}",
                     UseName(use), t_play_depth != 0 ? " (in a sync)" : "",
-                    is_draw ? "draw" : "dispatch", is_draw ? draw.number : dispatch.number,
+                    is_draw ? "draw" : "dispatch",
+                    ring ? played_draw.number : is_draw ? draw.number : dispatch.number,
                     location.file_name(), location.line(), location.function_name());
     }
 }
@@ -1984,9 +2218,317 @@ void MemStage::CompareReads(ReadLog& log, const char* what, u64 number, u64 hash
     log.Clear();
 }
 
+// ---------------------------------------------------------------------------------------------
+// Step 7's verify: the read compare of ring packets (spec 6.4; the design's 2.5)
+//
+// With the window open (FRITCHII_MEMSTAGE_AHEAD > 0) and FRITCHII_MEMSTAGE_READ_LOG=N, every Nth
+// ring packet's fill logs its reads of game memory on GPUMem as the read log does (StartRingReadLog;
+// the hooks are the same), the log goes to the back with the packet (ring_logs, in packet order),
+// and the back reads every range again at the take, before anything of that draw runs, and
+// compares. Left out: bytes GPUMem itself wrote after the fill (its constant buffer words for
+// later entries, from its own ring of writes with their entries, MemoryStageLink::NoteStageWrite;
+// those writes are kept out of the emulator's write ring meanwhile, where they would only wrap it
+// over a lead of a frame). Counted as "left out: GPUMem's own later writes". What is left is
+// classed as every read log difference ("Who wrote" above), so the gate is the read log's:
+// unexplained 0 (emulator writes that are not download landings, unclassified), ring wrapped 0
+// (GPUMem's own ring counts there too). A bound range has no tracker on the back (the cache is
+// GPUMem's): it differs when an emulator write noted since the fill, a mark the cache took since
+// or a pending game-side mark covers it, and is classed the same way. The marks the cache takes
+// (a served gather or invalidation, a game core's trapped store) go to a small ring of their own
+// while the compare runs (NoteCpuMark): a difference over one, with no emulator write, is "game
+// write, marked" (the tracker holds it, the next bind uploads), not "mark already taken". Every
+// ring that wrapped since a fill counts as "ring wrapped". Only GPUMem's own constant buffer
+// writes are kept out of the emulator's write ring (counted): every other compare ends before
+// GPUMem writes again (held packets in runs, where GPUMem is parked; operations, compared at once).
+
+void MemStage::NoteCpuMarkSlow(u64 address, u64 size) noexcept {
+    if (!cpu_marks || size == 0) {
+        return;
+    }
+    const u64 number = cpu_mark_count.fetch_add(1, std::memory_order_relaxed);
+    CpuMark& slot = cpu_marks[number % CpuMarkSlots];
+    slot.seq.store(0, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    slot.begin.store(address, std::memory_order_relaxed);
+    slot.end.store(address + size, std::memory_order_relaxed);
+    slot.seq.store(number + 1, std::memory_order_release);
+}
+
+bool MemStage::CpuMarkedSince(u64 since, u64 begin, u64 end, bool& complete) const {
+    if (!cpu_marks) {
+        return false;
+    }
+    const u64 count = cpu_mark_count.load(std::memory_order_acquire);
+    if (count <= since) {
+        return false;
+    }
+    if (count - since > CpuMarkSlots) {
+        complete = false;
+    }
+    const u64 oldest = count - since > CpuMarkSlots ? count - CpuMarkSlots : since;
+    for (u64 n = count; n > oldest; --n) {
+        const CpuMark& slot = cpu_marks[(n - 1) % CpuMarkSlots];
+        if (slot.seq.load(std::memory_order_acquire) != n) {
+            continue; // being written (a later mark), or reused
+        }
+        const u64 mark_begin = slot.begin.load(std::memory_order_relaxed);
+        const u64 mark_end = slot.end.load(std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (slot.seq.load(std::memory_order_relaxed) != n) {
+            continue;
+        }
+        if (mark_begin < end && begin < mark_end) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool MemStage::StartRingReadLog(u64 number) {
+    if (Link::Ahead() == 0 || read_log_every <= 0 ||
+        number % static_cast<u64>(read_log_every) != 0 || t_log != nullptr) {
+        return false;
+    }
+    {
+        std::scoped_lock lock{ring_logs_mutex};
+        if (!ring_log_pool.empty()) {
+            stage_log = std::move(ring_log_pool.back());
+            ring_log_pool.pop_back();
+        }
+    }
+    if (!stage_log) {
+        stage_log = std::make_unique<ReadLog>();
+    }
+    stage_log->Clear();
+    stage_log->ring_seq = Common::WriteRing::Sequence();
+    stage_log->position = ring_fill_position;
+    t_log = stage_log.get();
+    return true;
+}
+
+void MemStage::StopRingReadLog() {
+    t_log = nullptr;
+    if (!stage_log) {
+        return;
+    }
+    ReadLog& log = *stage_log;
+    log.stage_writes = Link::Get().StageWriteCount();
+    log.cpu_marks = cpu_mark_count.load(std::memory_order_acquire);
+    for (ReadRecord& record : log.records) {
+        if (record.how == ReadRecord::How::Range) {
+            // The tracker's answer at the fill's end (GPUMem holds the cache).
+            record.value =
+                cache == nullptr || cache->IsRegionCpuModified(record.address, record.size) ? 1 : 0;
+        }
+    }
+}
+
+std::unique_ptr<MemStage::ReadLog> MemStage::TakeRingLog(u64 number) {
+    std::scoped_lock lock{ring_logs_mutex};
+    // Logs of packets taken out of order cannot exist: ring B is played in order. An older one
+    // left (a packet dropped some other way) goes back to the pool.
+    while (!ring_logs.empty() && ring_logs.front().first < number) {
+        ring_log_pool.push_back(std::move(ring_logs.front().second));
+        ring_logs.pop_front();
+    }
+    if (ring_logs.empty() || ring_logs.front().first != number) {
+        return nullptr;
+    }
+    std::unique_ptr<ReadLog> log = std::move(ring_logs.front().second);
+    ring_logs.pop_front();
+    return log;
+}
+
+void MemStage::RecycleRingLog(std::unique_ptr<ReadLog> log) {
+    if (!log) {
+        return;
+    }
+    log->Clear();
+    std::scoped_lock lock{ring_logs_mutex};
+    if (ring_log_pool.size() < 256) {
+        ring_log_pool.push_back(std::move(log));
+    }
+}
+
+void MemStage::CompareRingReads(ReadLog& log, u64 number, u64 hash_a, u64 hash_b) {
+    using How = ReadRecord::How;
+    thread_local std::vector<u8> scratch;
+    // Class D (gathers on this thread since the fill): the compare is at the take, before any.
+    log.gathers = t_gathers;
+    log.flush_regions = t_flush_regions;
+    Link& link = Link::Get();
+    // GPUMem's writes after the fill over [begin, end): the intervals the compare leaves out.
+    boost::container::small_vector<std::pair<u64, u64>, 8> later;
+    const auto later_writes = [&](u64 begin, u64 end) {
+        later.clear();
+        const bool complete = link.ForEachStageWriteSince(
+            log.stage_writes, [&](u64 write_begin, u64 write_end, u64) {
+                if (write_begin < end && begin < write_end) {
+                    later.emplace_back((std::max)(write_begin, begin), (std::min)(write_end, end));
+                }
+                return false;
+            });
+        if (!complete) {
+            Bump(counters.ring_wrapped);
+        }
+    };
+    const auto left_out = [&](u64 device) {
+        return std::any_of(later.begin(), later.end(), [device](const std::pair<u64, u64>& w) {
+            return device >= w.first && device < w.second;
+        });
+    };
+    for (const ReadRecord& record : log.records) {
+        Bump(counters.read_kind_records[static_cast<size_t>(record.kind)]);
+        bool differs = false;
+        bool own_later = false;
+        u64 first = 0;
+        u64 last = record.size != 0 ? record.size - 1 : 0;
+        switch (record.how) {
+        case How::Bytes:
+        case How::Staged: {
+            scratch.resize(record.size);
+            static_cast<Tegra::MaxwellDeviceMemoryManager*>(record.memory)
+                ->ReadBlockUnsafe(record.address, scratch.data(), record.size);
+            const u8* const expected = record.how == How::Bytes
+                                           ? log.bytes.data() + record.value
+                                           : static_cast<const u8*>(record.data);
+            if (record.size == 0 || std::memcmp(scratch.data(), expected, record.size) == 0) {
+                break;
+            }
+            later_writes(record.address, record.address + record.size);
+            bool found = false;
+            for (u64 i = 0; i < record.size; ++i) {
+                if (scratch[i] == expected[i]) {
+                    continue;
+                }
+                if (left_out(record.address + i)) {
+                    own_later = true;
+                    continue;
+                }
+                if (!found) {
+                    first = i;
+                    found = true;
+                }
+                last = i;
+            }
+            differs = found;
+            break;
+        }
+        case How::Value: {
+            const auto* const memory = static_cast<const Tegra::MemoryManager*>(record.memory);
+            const u64 now = record.size == 4 ? u64{memory->Read<u32>(record.address)}
+                                             : memory->Read<u64>(record.address);
+            if (now == record.value) {
+                break;
+            }
+            const u64 changed = now ^ record.value;
+            first = static_cast<u64>(std::countr_zero(changed)) / 8;
+            last = static_cast<u64>(63 - std::countl_zero(changed)) / 8;
+            if (const auto device = memory->GpuToCpuAddress(record.address)) {
+                // Left out only when every changed byte is one GPUMem wrote later (R5c). A
+                // value is 4 or 8 aligned bytes: one page, so the device bytes follow on.
+                later_writes(*device, *device + record.size);
+                bool all_own = true;
+                bool any_own = false;
+                u64 kept_first = ~u64{0};
+                u64 kept_last = 0;
+                for (u64 i = first; i <= last; ++i) {
+                    if (((changed >> (i * 8)) & 0xff) == 0) {
+                        continue;
+                    }
+                    if (left_out(*device + i)) {
+                        any_own = true;
+                        continue;
+                    }
+                    all_own = false;
+                    kept_first = (std::min)(kept_first, i);
+                    kept_last = i;
+                }
+                own_later = any_own;
+                if (all_own) {
+                    break;
+                }
+                first = kept_first;
+                last = kept_last;
+            }
+            differs = true;
+            break;
+        }
+        case How::Range: {
+            if (record.value != 0) {
+                break; // CPU-written at the fill already: uploaded or read as such
+            }
+            // No tracker on the back: an emulator write noted since the fill, a mark the cache
+            // took since (CpuMarks), or a game-side mark pending now, over the range.
+            const u64 begin = record.address;
+            const u64 end = begin + record.size;
+            const bool complete = Common::WriteRing::ForEachSince(
+                log.ring_seq, [&](const Common::WriteRing::Entry& e) {
+                    differs = e.address < end && begin < e.address + e.size;
+                    return differs;
+                });
+            if (!complete) {
+                // R5a: writers since the fill unknown, as ClassifyDiff counts it.
+                Bump(counters.ring_wrapped);
+            }
+            if (!differs) {
+                bool marks_complete = true;
+                differs = CpuMarkedSince(log.cpu_marks, begin, end, marks_complete);
+                if (!marks_complete) {
+                    Bump(counters.ring_wrapped);
+                }
+            }
+            if (!differs && gpu != nullptr) {
+                gpu->ForEachPendingCpuWrite([&](DAddr address, size_t size) {
+                    differs = differs || (address < end && begin < address + size);
+                });
+            }
+            break;
+        }
+        }
+        if (own_later) {
+            Bump(counters.diff_stage_own);
+        }
+        if (!differs) {
+            continue;
+        }
+        Bump(counters.read_diffs[static_cast<size_t>(record.kind)]);
+        // Fable's review, 2: a game store the cache took since the fill (a served gather, a
+        // trapped store) leaves no pending mark; the tracker holds it, the next bind uploads.
+        bool tracker_holds = false;
+        std::optional<u64> device;
+        if (record.how == How::Value) {
+            if (const auto* const memory = static_cast<const Tegra::MemoryManager*>(record.memory)) {
+                device = memory->GpuToCpuAddress(record.address + first);
+            }
+        } else {
+            device = record.address + first;
+        }
+        if (device) {
+            bool marks_complete = true;
+            tracker_holds =
+                CpuMarkedSince(log.cpu_marks, *device, *device + (last - first + 1), marks_complete);
+            if (!marks_complete) {
+                Bump(counters.ring_wrapped);
+            }
+        }
+        ClassifyDiff(log, record, first, last, "ring draw", number, hash_a, hash_b, tracker_holds);
+    }
+    Bump(counters.read_packets);
+    Bump(counters.ring_reads);
+    if (cpu_mark_count.load(std::memory_order_acquire) != log.cpu_marks) {
+        // The cache took a game-side mark (anywhere) between this packet's fill and its take.
+        Bump(counters.ring_reads_marked);
+    }
+    Bump(counters.read_records, log.records.size());
+    Bump(counters.read_skipped, log.skipped);
+    log.Clear();
+}
+
 // Every difference gets a class (A, B, D) and a place (C); see "Who wrote" at the top.
 void MemStage::ClassifyDiff(const ReadLog& log, const ReadRecord& record, u64 first, u64 last,
-                            const char* what, u64 number, u64 hash_a, u64 hash_b) {
+                            const char* what, u64 number, u64 hash_a, u64 hash_b,
+                            bool tracker_holds) {
     using How = ReadRecord::How;
     using Kind = VideoCommon::MemReadLog::Kind;
     // The changed bytes as a device range (a value is read by GPU address).
@@ -2054,6 +2596,9 @@ void MemStage::ClassifyDiff(const ReadLog& log, const ReadRecord& record, u64 fi
         kind = DiffClass::BackGather;
     } else if (found) {
         kind = writer.landing ? DiffClass::Landing : DiffClass::EmulatorWrite;
+    } else if (tracker_holds && device && complete) {
+        // Step 7: the cache took a game-side mark over these bytes since the fill (CpuMarks).
+        kind = DiffClass::GameMarked;
     } else if (!device || !complete || !asked) {
         kind = DiffClass::Unclassified;
     } else if (record.how == How::Range) {
@@ -2452,7 +2997,7 @@ void MemStage::TickFrame() {
 // THREAD = 2 (piece 6b) needs the same, and EXP53 off (with it every conditional block is a level
 // entry the registers do not decide); without it, it runs as 1, logged once. It forces full vertex
 // binds (plan 4.2: the flags the state tracker raises on the back are dropped at each lend).
-// FRITCHII_MEMSTAGE_AHEAD (boot) is step 7's window: 6b runs 0 (level mode) and says so.
+// FRITCHII_MEMSTAGE_AHEAD (live, here too) is step 7's window (memory_stage_link.cpp); 0 is 6b.
 void MemStage::TickThread(int seam) {
     namespace Debug = VideoCore::Nx2Debug;
     const int wanted = Debug::SwitchValue(Debug::g_memstage_thread, "FRITCHII_MEMSTAGE_THREAD");
@@ -2485,17 +3030,26 @@ void MemStage::TickThread(int seam) {
         }
         mode = 1;
     }
-    if (mode == 2 && !ahead_logged) {
-        ahead_logged = true;
-        if (const char* const ahead = std::getenv("FRITCHII_MEMSTAGE_AHEAD");
-            ahead != nullptr && std::atoi(ahead) != 0) {
-            LOG_WARNING(Render_Vulkan, "FRITCHII_MEMSTAGE_AHEAD={}: the window is step 7; the "
-                                       "ring-fed stage runs level mode (AHEAD=0)",
-                        ahead);
-        }
-    }
     Link& link = Link::Get();
     link.SetMode(mode);
+    // Step 7's window (live, here at a frame end, a level run: GPUMem is parked on it and reads
+    // the new value at its next entry). Packets GPUMem may fill ahead of the back's take; 0 is
+    // 6b's level mode, 65,536 and above unlimited (the harness sends 2147483647).
+    const int ahead = Debug::SwitchValue(Debug::g_memstage_ahead, "FRITCHII_MEMSTAGE_AHEAD");
+    // EDEN_NX2_RUNAHEAD applies due CPU-write chunks on the back before each entry: GPUMem would
+    // fill those entries before the chunks are applied. The window runs 0 while it is on. The
+    // same with the delta path on at boot (EXP118, or its count): a delta draw holds the buffer
+    // cache's lock through Configure, where a read flush is a served call (StageContendedHook
+    // covers that too; this keeps the case out of the window altogether).
+    const char* const blocked =
+        VideoCommon::Runahead::CurrentMode() != VideoCommon::Runahead::Mode::Off
+            ? "EDEN_NX2_RUNAHEAD"
+        : VideoCommon::Nx2FastDrawCount::g_on ? "the delta path (EXP118)"
+                                              : nullptr;
+    link.SetAhead(link.Mode() == 2 && ahead > 0 ? static_cast<u32>(ahead) : 0U, blocked);
+    // The window's verify (its own-write ring and the image check) only with a verify on.
+    Link::SetVerify(read_log_every > 0 || Link::RingVerify());
+    ring_read_log.store(read_log_every > 0 && Link::Ahead() != 0, std::memory_order_relaxed);
     const bool full =
         Debug::SwitchValue(Debug::g_memstage_full_binds, "FRITCHII_MEMSTAGE_FULL_BINDS") > 0 ||
         link.Mode() == 2;
@@ -2646,12 +3200,24 @@ void MemStage::LogStats() {
                                             READ_KIND_NAMES[i], n);
                 }
             }
+            // Step 7: GPUMem's writes kept out of the emulator's write ring (in its own ring), and
+            // the cache's CPU-written marks noted for the compare.
+            const u64 quiet = Common::WriteRing::g_quiet.load(std::memory_order_relaxed);
+            const u64 marks = cpu_mark_count.load(std::memory_order_relaxed);
             LOG_INFO(Render_Vulkan,
                      "  memory seam read log (FRITCHII_MEMSTAGE_READ_LOG={}): {} packets, {} reads "
-                     "compared{}{}{}, {} not logged (budget); differences (5.3) {}{}{}",
+                     "compared{}{}{}, {} not logged (budget); differences (5.3) {}{}{}; ring "
+                     "packets compared at the take (step 7) {} ({} with a CPU-written mark since "
+                     "the fill), left out as GPUMem's own later writes {}; GPUMem's writes kept "
+                     "out of the write ring {}; CPU-written marks noted {}",
                      read_log_every, delta(&Counts::read_packets), delta(&Counts::read_records),
                      compared.empty() ? "" : " (", compared, compared.empty() ? "" : ")",
-                     delta(&Counts::read_skipped), diff_total, diffs.empty() ? "" : ": ", diffs);
+                     delta(&Counts::read_skipped), diff_total, diffs.empty() ? "" : ": ", diffs,
+                     delta(&Counts::ring_reads), delta(&Counts::ring_reads_marked),
+                     delta(&Counts::diff_stage_own), quiet - reported_quiet,
+                     marks - reported_marks);
+            reported_quiet = quiet;
+            reported_marks = marks;
             const auto by_class = [&](DiffClass kind) {
                 const size_t i = static_cast<size_t>(kind);
                 return current.diff_classes[i] - reported.diff_classes[i];
@@ -2766,6 +3332,9 @@ void MemStage::Snapshot(Counts& out) const {
     }
     out.diff_own = counters.diff_own.load(std::memory_order_relaxed);
     out.diff_over = counters.diff_over.load(std::memory_order_relaxed);
+    out.diff_stage_own = counters.diff_stage_own.load(std::memory_order_relaxed);
+    out.ring_reads = counters.ring_reads.load(std::memory_order_relaxed);
+    out.ring_reads_marked = counters.ring_reads_marked.load(std::memory_order_relaxed);
     out.ring_wrapped = counters.ring_wrapped.load(std::memory_order_relaxed);
     out.gathers_held = counters.gathers_held.load(std::memory_order_relaxed);
     for (size_t i = 0; i < out.flush_regions_held.size(); ++i) {
@@ -2864,6 +3433,18 @@ u64 SeamClock::SubmitForHostRead(std::source_location location) {
 // (TickOf falls back to the current tick, right only when the two are level) become a join:
 // the stage asks the GPU thread to play up to that packet and flush.
 //
+// Packet ticks with the stage ahead (FRITCHII_MEMSTAGE_THREAD = 2, step 7's window). GPUMem fills
+// while the back records, so one `unplayed_from` written by both would lose the lower mark (the
+// back clearing it from a stale look at ring B while GPUMem pushes). While the ring runs each side
+// writes only its own mark: the back's (`unplayed_from`: the packet it holds, its own fill in a
+// level run, its pending entries) and GPUMem's (`stage_unplayed`: the draw it fills, from the
+// number BeginDraw opens under the close's lock (BeginStagePacket) to the push, and its pending
+// entries). Close, on the recording thread, takes the lowest of the two and of ring B's oldest
+// packet, which it reads itself after GPUMem's mark: a push puts the packet in ring B before the
+// mark clears. So every number a packet in flight carries (in GPUMem's fill, in ring B, held by
+// the back) stays open until its entries are recorded: its buffers, staging and stream regions
+// outlive it. At AHEAD = 0 the two threads take turns and the three marks give the old answer.
+//
 // Users that compare stamps for equality (the stream uniform reuse and its keeps: "same tick, so
 // the stream copy is still there") take Epoch(): the number of closes. A copy made at epoch E
 // carries a number not yet published; its stream region is only recycled once that number is
@@ -2928,9 +3509,30 @@ u64 SeamTicks::AdvanceLocked(u64 known) {
     return free;
 }
 
+u64 SeamTicks::BeginStagePacket() {
+    std::scoped_lock lock{mutex};
+    const u64 number = open.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (stage_unplayed.load(std::memory_order_relaxed) == 0) {
+        stage_unplayed.store(number, std::memory_order_release);
+    }
+    return number;
+}
+
 void SeamTicks::Close(u64 tick) {
     std::scoped_lock lock{mutex};
-    const u64 unplayed = unplayed_from.load(std::memory_order_acquire);
+    // The back's mark, then GPUMem's, then ring B's oldest packet ("Packet ticks with the stage
+    // ahead"): GPUMem's mark before the ring, because a packet it pushes is in ring B before its
+    // mark clears. Off THREAD = 2 the last two are 0.
+    u64 unplayed = unplayed_from.load(std::memory_order_acquire);
+    const auto lower = [&unplayed](u64 number) {
+        if (number != 0 && (unplayed == 0 || number < unplayed)) {
+            unplayed = number;
+        }
+    };
+    lower(stage_unplayed.load(std::memory_order_acquire));
+    if (ring_oldest != nullptr) {
+        lower(ring_oldest(ring_context));
+    }
     u64 last;
     if (unplayed != 0) {
         last = unplayed - 1;

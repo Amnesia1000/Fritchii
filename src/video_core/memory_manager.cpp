@@ -847,7 +847,8 @@ void MemoryManager::WriteBlockCached(GPUVAddr gpu_dest_addr, const void* src_buf
 void MemoryManager::WriteBlockStage(GPUVAddr gpu_dest_addr, const void* src_buffer,
                                     std::size_t size) {
     // FRITCHII_MEMSTAGE_THREAD=2: constant buffer words the memory stage writes on GPUMem, while
-    // the back is parked (memstage_shadow.cpp). The stage collects and applies their ranges.
+    // the back is parked, or ahead of it with FRITCHII_MEMSTAGE_AHEAD (memstage_shadow.cpp). The
+    // stage collects and applies their ranges.
     WriteBlockImpl(gpu_dest_addr, src_buffer, size, VideoCommon::CacheType::None, true, false);
 }
 

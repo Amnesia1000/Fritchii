@@ -585,6 +585,7 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
     // The memory seam's read log asks this cache's tracker.
     mem_stage.Attach(buffer_cache);
     mem_stage.AttachGpu(gpu);
+    mem_stage.AttachDeviceMemory(device_memory);
     if (split_buffer_staging) {
         // The memory stage's thread checks who requests from the cache's own pool.
         split_buffer_staging->MarkCacheSide();
@@ -1184,6 +1185,7 @@ void RasterizerVulkan::SetRingBackend() {
     };
     backend.bind_channel = [](void* context, s32 bind_id) {
         auto* const self = static_cast<RasterizerVulkan*>(context);
+        const Link::CleanPoint clean;
         std::scoped_lock lock{self->buffer_cache.mutex};
         self->buffer_cache.BindToChannel(bind_id);
     };
@@ -1222,6 +1224,20 @@ void RasterizerVulkan::SetRingBackend() {
     backend.back_channel = [](void* context) {
         return static_cast<s32>(static_cast<RasterizerVulkan*>(context)->current_channel_id);
     };
+    backend.ring_packets = [](void* context) {
+        return static_cast<RasterizerVulkan*>(context)->mem_stage.RingPackets();
+    };
+    backend.ring_room = [](void* context) {
+        return static_cast<RasterizerVulkan*>(context)->mem_stage.RingRoom();
+    };
+    Link::Get().SetCacheLock(&buffer_cache.mutex);
+    backend.reset_stage = [](void* context, bool end) {
+        static_cast<RasterizerVulkan*>(context)->mem_stage.ResetStageSide(end);
+    };
+    backend.ranges_gpu_written = [](void* context, const std::pair<u64, std::size_t>* ranges,
+                                    size_t count) {
+        return static_cast<RasterizerVulkan*>(context)->StageRangesOverGpuWritten({ranges, count});
+    };
     Link::Get().SetRingBackend(backend);
 }
 
@@ -1247,7 +1263,27 @@ bool RasterizerVulkan::StageFillDraw(VideoCommon::MemStageShadowEngine& copy, bo
         link.NoteLevelDraw(5);
         return false;
     }
+    if (Link::Ahead() != 0) [[unlikely]] {
+        // Step 7, the window open: the back answers its served calls (a read flush's download, a
+        // gather's claims, MustFlushRegion) from the cache as GPUMem has it. That is the back's
+        // answer while no packet ahead of the back changes what those calls read: the buffers'
+        // GPU-written marks. Two fills would: a draw that writes buffers (its marks), and the
+        // collected constant buffer ranges claiming GPU-written data (their claims). Those fill
+        // level: GPUMem first waits for the back to reach this entry (StageLevel).
+        bool going = true;
+        if (StageDrawWritesBuffers(copy)) {
+            going = link.StageLevel(position, Link::LevelReason::WritingDraw);
+        } else if (StageRangesOverGpuWritten(ranges)) {
+            going = link.StageLevel(position, Link::LevelReason::Claim);
+        }
+        if (!going) {
+            return false; // GPUMem is stopping: the draw is left to the back
+        }
+    }
+    // A clean point: while it waits for the lock the back holds, GPUMem serves the back's call.
+    std::optional<Link::CleanPoint> clean{std::in_place};
     std::scoped_lock lock{buffer_cache.mutex};
+    clean.reset();
     // The fill reads the stage's copy (plan 5.4), as at FRITCHII_MEMSTAGE_SHADOW=3.
     const VideoCommon::CacheInputs inputs =
         buffer_cache.StageInputs(copy.regs, copy.state, copy.root_tables,
@@ -1259,6 +1295,10 @@ bool RasterizerVulkan::StageFillDraw(VideoCommon::MemStageShadowEngine& copy, bo
     const u32 repack_dirty = buffer_cache_runtime.SetVertexRepackLayout(
         inputs.RepackLayoutRegs(), stage_facts.dynamic_vertex_input);
     mem_stage.BeginDraw(buffer_cache_runtime.RepackMask(), repack_dirty);
+    // The packet number BeginDraw opened is GPUMem's unplayed mark until the push, or until here.
+    SCOPE_EXIT {
+        mem_stage.EndStageFill();
+    };
     if (repack_dirty) {
         inputs.MarkVertexBuffersDirty(repack_dirty);
     }
@@ -1306,6 +1346,93 @@ bool RasterizerVulkan::StageFillDraw(VideoCommon::MemStageShadowEngine& copy, bo
         link.NoteLevelDraw(7);
     }
     return filled;
+}
+
+void RasterizerVulkan::CheckServedJoins(DAddr addr, u64 size) {
+    // Step 7, in a call GPUMem serves for the back (the cache's lock held): a download of
+    // GPU-written data from a buffer a packet ahead of the back joined reads that buffer before
+    // the join's copy (must be 0; the window's StageLevel rules keep the marks the back's).
+    using Link = VideoCommon::MemoryStageLink;
+    if (!Link::OnStageThread() || Link::Ahead() == 0 || addr == 0 || size == 0) {
+        return;
+    }
+    Link& link = Link::Get();
+    const u64 back_position = VideoCommon::GpuSplit::Get().BackEntryPosition();
+    switch (link.JoinedAhead(addr, size, back_position)) {
+    case Link::Joined::Yes:
+        if (buffer_cache.IsRegionGpuModified(addr, size)) [[unlikely]] {
+            Link::Note(Link::Check::ServedAheadJoin, "a served call's download");
+        }
+        break;
+    case Link::Joined::Unknown:
+        link.NoteJoinUnknown();
+        break;
+    case Link::Joined::No:
+        break;
+    }
+    // Fable's review, A: the download writes the GPU's bytes into game memory; a constant buffer
+    // write GPUMem made there, for an entry past the back's, on GPU-written data, would be lost
+    // (StageWriteWords comes level before such a write; this checks it while the window's verify
+    // keeps GPUMem's writes).
+    if (Link::StageWritesKept()) {
+        const u64 end = addr + size;
+        bool hit = false;
+        link.ForEachStageWriteSince(0, [&](u64 write_begin, u64 write_end, u64 position) {
+            if (position <= back_position) {
+                return true;
+            }
+            const u64 begin = (std::max)(write_begin, u64{addr});
+            const u64 last = (std::min)(write_end, end);
+            hit = begin < last && buffer_cache.IsRegionGpuModified(begin, last - begin);
+            return hit;
+        });
+        if (hit) [[unlikely]] {
+            Link::Note(Link::Check::ServedOverStageWrite, "a served call's download");
+        }
+    }
+}
+
+bool RasterizerVulkan::StageDrawWritesBuffers(const VideoCommon::MemStageShadowEngine& copy) const {
+    // The fill marks GPU-written ranges for written storage buffers (BindGraphicsStorageBuffer's
+    // is_written) and for transform feedback.
+    if (copy.regs.transform_feedback_enabled != 0) {
+        return true;
+    }
+    for (u32 stage = 0; stage < 5; ++stage) {
+        if ((stage_facts.stages & (1U << stage)) == 0) {
+            continue;
+        }
+        for (u32 i = 0; i < stage_facts.ssbo_counts[stage]; ++i) {
+            if (stage_facts.ssbos[stage][i].is_written) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool RasterizerVulkan::StageRangesOverGpuWritten(
+    std::span<const std::pair<DAddr, std::size_t>> ranges) {
+    // The page bits first (they never clear, so a clear one proves nothing GPU-written is there),
+    // then the cache's own answer under its lock.
+    bool maybe = false;
+    for (const auto& [addr, size] : ranges) {
+        if (MayBeGpuModified(addr, size)) {
+            maybe = true;
+            break;
+        }
+    }
+    if (!maybe) {
+        return false;
+    }
+    const VideoCommon::MemoryStageLink::CleanPoint clean;
+    std::scoped_lock lock{buffer_cache.mutex};
+    for (const auto& [addr, size] : ranges) {
+        if (buffer_cache.IsRegionGpuModified(addr, size)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void RasterizerVulkan::StageApplyRanges(std::span<const std::pair<DAddr, std::size_t>> ranges,
@@ -3636,6 +3763,7 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType 
         // draw's Configure).
         OnStage(static_cast<u8>(VideoCommon::MemoryStageLink::Served::FlushRegion), [&] {
             std::scoped_lock lock{buffer_cache.mutex};
+            CheckServedJoins(addr, size);
             MemStage::FillPlay seam{mem_stage, MemStage::Site::Download};
             buffer_cache.DownloadMemory(addr, size);
         });
@@ -3661,6 +3789,7 @@ void RasterizerVulkan::FlushRegionForRead(DAddr addr, u64 size) {
     }
     OnStage(static_cast<u8>(VideoCommon::MemoryStageLink::Served::FlushRegionForRead), [&] {
         std::scoped_lock lock{buffer_cache.mutex};
+        CheckServedJoins(addr, size);
         MemStage::FillPlay seam{mem_stage, MemStage::Site::DownloadForRead};
         buffer_cache.DownloadMemoryForRead(addr, size);
     });
@@ -4171,6 +4300,7 @@ void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::Cache
         std::scoped_lock lock{buffer_cache.mutex};
         MemStage::FillPlay seam{mem_stage, MemStage::Site::Invalidation};
         buffer_cache.WriteMemory(addr, size);
+        mem_stage.NoteCpuMark(addr, size); // step 7's verify (re-review N4)
     }
     if ((True(which & VideoCommon::CacheType::QueryCache))) {
         query_cache.InvalidateRegion(addr, size);
@@ -4192,6 +4322,10 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
     // EXP91 (stage 0, counting) and EXP92 (uniform keeps, tier 1): every cached write range, in
     // the keeps' ring, before any early return.
     buffer_cache.NoteCachedWrites(sequences);
+    // Step 7's verify: marks the cache takes inline, on any thread (re-review N4).
+    for (const auto& [addr, size] : sequences) {
+        mem_stage.NoteCpuMark(addr, size);
+    }
     if (VideoCommon::Nx2FastDrawCount::g_on) [[unlikely]] {
         for (const auto& [addr, size] : sequences) {
             VideoCommon::Nx2FastDrawCount::NotePoolWrite(addr, size);
@@ -4323,6 +4457,8 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
                 VideoCommon::t_deferred_page_caching = nullptr;
             }
         }
+        // Step 7's verify: a game core's trapped store marked the tracker directly.
+        mem_stage.NoteCpuMark(addr, size);
         if (defer) {
             deferred.ApplyAll();
         }
@@ -4348,7 +4484,11 @@ void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64
     }
     if (VideoCommon::MemoryStageLink::BackServed()) [[unlikely]] {
         // FRITCHII_MEMSTAGE_THREAD = 2, a gather inside a served entry (a read flush's): the
-        // buffer half on GPUMem (claims first, as below), the other caches' here.
+        // buffer half on GPUMem (claims first, as below), the other caches' here. Step 7's
+        // verify notes the marks the cache takes (a game write the tracker holds from now).
+        for (const auto& [addr, size] : ranges) {
+            mem_stage.NoteCpuMark(addr, size);
+        }
         OnStage(static_cast<u8>(VideoCommon::MemoryStageLink::Served::Gather), [&] {
             std::scoped_lock lock{buffer_cache.mutex};
             MemStage::FillPlay seam{mem_stage, MemStage::Site::Invalidation};
@@ -4373,6 +4513,10 @@ void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64
             pipeline_cache.InvalidateRegion(addr, size);
         }
         return;
+    }
+    // Step 7's verify: the marks a gather applied here, on any thread (re-review N4).
+    for (const auto& [addr, size] : ranges) {
+        mem_stage.NoteCpuMark(addr, size);
     }
     namespace CbPath = VideoCommon::Nx2CbPath;
     const int cb_path = CbPath::Mode();
@@ -4478,6 +4622,7 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.WriteMemory(addr, size);
     }
+    mem_stage.NoteCpuMark(addr, size); // step 7's verify, as in OnCacheInvalidations
     OnStage(static_cast<u8>(VideoCommon::MemoryStageLink::Served::Invalidation), [&] {
         std::scoped_lock lock{buffer_cache.mutex};
         MemStage::FillPlay seam{mem_stage, MemStage::Site::Invalidation};
@@ -4923,9 +5068,14 @@ void RasterizerVulkan::TrackOcarinaCamera(const MemStage::TrackerRecord* record)
     }
 
     // The camera block of vertex uniform slot 3, when bound that large and not GPU-modified.
-    const auto sample = [&](DAddr address) {
+    // `copied`: the bytes the packet's fill copied (step 7, the window open), else game memory.
+    const auto sample = [&](DAddr address, const u8* copied) {
         std::array<f32, 0x230 / sizeof(f32)> camera;
-        device_memory.ReadBlockUnsafe(address, camera.data(), sizeof(camera));
+        if (copied != nullptr) {
+            std::memcpy(camera.data(), copied, sizeof(camera));
+        } else {
+            device_memory.ReadBlockUnsafe(address, camera.data(), sizeof(camera));
+        }
         constexpr size_t extent_offset = 0x120 / sizeof(f32);
         constexpr size_t projection_wz = 0xa8 / sizeof(f32);
         if (camera[extent_offset] != static_cast<f32>(color.size.width) ||
@@ -4946,7 +5096,7 @@ void RasterizerVulkan::TrackOcarinaCamera(const MemStage::TrackerRecord* record)
         // the end of the fill.
         const MemStage::TrackerSlot& slot = record->slots[0];
         if (slot.bound && slot.size >= MemStage::TrackerRecord::CameraBytes && !slot.gpu_modified) {
-            sample(slot.address);
+            sample(slot.address, mem_stage.TrackerBytes(*record, 0));
         }
         return;
     }
@@ -4959,7 +5109,7 @@ void RasterizerVulkan::TrackOcarinaCamera(const MemStage::TrackerRecord* record)
                                              MemStage::TrackerRecord::CameraBytes)) {
             return;
         }
-        sample(binding.device_addr);
+        sample(binding.device_addr, nullptr);
     });
 }
 
@@ -5014,7 +5164,7 @@ void RasterizerVulkan::UpdateOcarinaJitter() {
 /// Capture the skinning pose of the recognized Link draw for frame-to-frame motion.
 void RasterizerVulkan::TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool is_indirect,
                                          const MemStage::TrackerRecord* record) {
-    if (shader_hash != 0x28c6e527634f814aULL || !is_indexed || is_indirect ||
+    if (shader_hash != MemStage::TrackerRecord::ActorShader || !is_indexed || is_indirect ||
         !OcarinaTemporalEnabled() || oot_actor.frame == render_trace_frame) {
         return;
     }
@@ -5044,14 +5194,27 @@ void RasterizerVulkan::TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool 
         .base_vertex = static_cast<s32>(draw.base_index),
     };
     bool origin_found{}, bones_found{};
-    // Vertex uniform slots 4 (the origin) and 6 (the bones), when not GPU-modified.
-    const auto sample = [&](u32 index, DAddr address, u32 size) {
-        if (index == 4 && size >= 0x40 + 3 * sizeof(f32)) {
-            device_memory.ReadBlockUnsafe(address + 0x40, pose.origin.data(), 3 * sizeof(f32));
+    // Vertex uniform slots 4 (the origin) and 6 (the bones), when not GPU-modified. `copied`: the
+    // bytes the packet's fill copied (step 7, the window open), else game memory.
+    using Tracker = MemStage::TrackerRecord;
+    static_assert(Tracker::OriginBytes == 3 * sizeof(f32));
+    static_assert(Tracker::BonesBytes == sizeof(pose.bones));
+    const auto sample = [&](u32 index, DAddr address, u32 size, const u8* copied) {
+        if (index == 4 && size >= Tracker::OriginOffset + Tracker::OriginBytes) {
+            if (copied != nullptr) {
+                std::memcpy(pose.origin.data(), copied, Tracker::OriginBytes);
+            } else {
+                device_memory.ReadBlockUnsafe(address + Tracker::OriginOffset, pose.origin.data(),
+                                              Tracker::OriginBytes);
+            }
             origin_found = true;
         }
-        if (index == 6 && size == 13568) {
-            device_memory.ReadBlockUnsafe(address, pose.bones.data(), sizeof(pose.bones));
+        if (index == 6 && size == Tracker::BonesSlotSize) {
+            if (copied != nullptr) {
+                std::memcpy(pose.bones.data(), copied, sizeof(pose.bones));
+            } else {
+                device_memory.ReadBlockUnsafe(address, pose.bones.data(), sizeof(pose.bones));
+            }
             bones_found = true;
         }
     };
@@ -5060,7 +5223,7 @@ void RasterizerVulkan::TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool 
         for (size_t i = 1; i < record->slots.size(); ++i) {
             const MemStage::TrackerSlot& slot = record->slots[i];
             if (slot.bound && !slot.gpu_modified) {
-                sample(MemStage::TrackerRecord::Slots[i], slot.address, slot.size);
+                sample(Tracker::Slots[i], slot.address, slot.size, mem_stage.TrackerBytes(*record, i));
             }
         }
     } else {
@@ -5071,7 +5234,7 @@ void RasterizerVulkan::TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool 
                 buffer_cache.IsRegionGpuModified(binding.device_addr, size)) {
                 return;
             }
-            sample(index, binding.device_addr, size);
+            sample(index, binding.device_addr, size, nullptr);
         });
     }
     if (origin_found && bones_found) {

@@ -4973,6 +4973,14 @@ bool BufferCache<P>::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
     });
     new_buffer.MarkUsage(copies[0].dst_offset, copies[0].size);
     VideoCommon::Churn::Add(VideoCommon::Churn::BuffersJoined);
+    // Memory stage step 7: a join in a fill ahead of the back. Over GPU-written data the back
+    // first plays the packets ahead (a download it records later must not read the new buffer
+    // before this copy); kept for the served calls' check either way.
+    if (VideoCommon::MemoryStageLink::JoinNeedsTest() &&
+        IsRegionGpuModified(overlap.CpuAddr(), overlap.SizeBytes())) [[unlikely]] {
+        VideoCommon::MemoryStageLink::JoinOverGpuWritten();
+    }
+    VideoCommon::MemoryStageLink::NoteBufferJoin(overlap.CpuAddr(), overlap.SizeBytes());
     // EDEN_NX2_JOIN_SKIP_CPU=1 (fable_answer_17 4): a drifted per-frame range the guest rewrote
     // whole since its last upload needs no copy, the first bind uploads all of it anyway
     // (JoinCopyIsDead). Read on first use: nx2_switches.txt is applied after static init.

@@ -161,8 +161,17 @@ public:
     struct TrackerRecord {
         std::array<TrackerSlot, 3> slots;
         bool filled;
+        /// Step 7 (the window open): the bytes each tracker reads, copied at the fill, as many
+        /// per slot (0: not copied, the tracker reads game memory); MemStage::TrackerBytes.
+        std::array<u32, 3> copied;
         static constexpr std::array<u32, 3> Slots{3, 4, 6};
         static constexpr u32 CameraBytes = 0x230;
+        /// The actor tracker's draw (its vertex program) and what it reads of slots 4 and 6.
+        static constexpr u64 ActorShader = 0x28c6e527634f814aULL;
+        static constexpr u32 OriginOffset = 0x40;
+        static constexpr u32 OriginBytes = 3 * sizeof(float);
+        static constexpr u32 BonesSlotSize = 13568; ///< the binding the actor's draw has
+        static constexpr u32 BonesBytes = 280 * 12 * sizeof(float); ///< what the tracker reads
     };
     struct DrawPacket {
         u64 number;
@@ -437,6 +446,22 @@ public:
     }
     /// The record of slots 3, 4 and 6 from the cache as it is now (FillDraw; the verify).
     static void FillTrackerRecord(Cache& cache, TrackerRecord& record);
+    /// The back: the bytes a ring packet's fill copied for tracker slot `slot` (0 to 2) of the
+    /// draw it holds, or null (read game memory then).
+    [[nodiscard]] const u8* TrackerBytes(const TrackerRecord& record, size_t slot) const noexcept;
+    /// Step 7's verify: the cache marked [address, address + size) CPU-written for a game write
+    /// (a served gather or invalidation, a game core's trapped store). Any thread; only while ring
+    /// packets' reads are compared. A difference over one is "game write, marked": the tracker
+    /// holds it and the next bind uploads.
+    void NoteCpuMark(u64 address, u64 size) noexcept {
+        if (ring_read_log.load(std::memory_order_relaxed)) [[unlikely]] {
+            NoteCpuMarkSlow(address, size);
+        }
+    }
+    /// The device memory the trackers' bytes are copied from (the rasterizer's).
+    void AttachDeviceMemory(Tegra::MaxwellDeviceMemoryManager& memory) noexcept {
+        device_memory = &memory;
+    }
 
     /// On GPUMem inside a hand-off: runs `body` on the back with this thread's seam state (a
     /// sync, an entry that must run now). Anywhere else: runs it here.
@@ -472,6 +497,16 @@ public:
     }
     /// GPUMem: room for another packet.
     [[nodiscard]] bool RingRoom() const noexcept;
+    /// GPUMem: its draw's fill is over, packet or not (BeginDraw opened its packet number).
+    void EndStageFill();
+    /// The back, both threads parked at the ring's start or end (`end`): GPUMem's fill side starts
+    /// clean; at the end its pending entries (a fill that threw) are played here first.
+    void ResetStageSide(bool end);
+    /// Packets in ring B the back has not taken or dropped yet (step 7's window).
+    [[nodiscard]] u64 RingPackets() const noexcept {
+        return ring_packets_sent.load(std::memory_order_seq_cst) -
+               ring_packets_done.load(std::memory_order_seq_cst);
+    }
     /// The back: the packet of its draw `seq` (packets of earlier draws are played whole first),
     /// held as a filled draw is; null when there is none. `hash`: the back's compare b hash.
     const DrawPacket* TakeRingDraw(u64 seq, u64 back_position, u64 hash, bool verify);
@@ -611,6 +646,12 @@ private:
         u64 ring_seq{};      ///< Common::WriteRing's sequence when the fill began
         u64 gathers{};       ///< This thread's gathers applied when the fill ended
         u64 flush_regions{}; ///< This thread's FlushRegion calls when the fill ended
+        /// Step 7, a ring packet's log: GPUMem's own writes noted when the fill ended (the
+        /// compare leaves out the ones after), the CPU-written marks noted then (CpuMarks), and
+        /// the packet's entry.
+        u64 stage_writes{};
+        u64 cpu_marks{};
+        u64 position{};
         void Clear() noexcept {
             records.clear();
             bytes.clear();
@@ -620,6 +661,9 @@ private:
             ring_seq = 0;
             gathers = 0;
             flush_regions = 0;
+            stage_writes = 0;
+            cpu_marks = 0;
+            position = 0;
         }
     };
 
@@ -699,6 +743,9 @@ private:
         std::array<u64, static_cast<size_t>(DiffClass::Count)> diff_classes{};
         u64 diff_own{};
         u64 diff_over{};
+        u64 diff_stage_own{};
+        u64 ring_reads{};
+        u64 ring_reads_marked{};
         u64 ring_wrapped{};
         u64 gathers_held{};
         std::array<u64, 3> flush_regions_held{};
@@ -742,7 +789,8 @@ private:
     void NoteHeldFlush(SeamHook::Use use, const std::source_location& location);
     void CompareReads(ReadLog& log, const char* what, u64 number, u64 hash_a, u64 hash_b);
     void ClassifyDiff(const ReadLog& log, const ReadRecord& record, u64 first, u64 last,
-                      const char* what, u64 number, u64 hash_a, u64 hash_b);
+                      const char* what, u64 number, u64 hash_a, u64 hash_b,
+                      bool tracker_holds = false);
     void CountDiffSite(const char* name, bool landing);
     std::string GatherFrames() const;
 
@@ -765,10 +813,12 @@ private:
     bool clamp_logged{};
 
     HeldKind held{HeldKind::None};
-    bool filling_held{};
-    HeldKind filling_kind{HeldKind::None};
-    /// The held packet saw a flush between its fill and its PlayRest (counted once).
-    bool held_flush_seen{};
+    /// Atomic (step 7): the arena owner's, read by the other thread's logs and checks.
+    std::atomic<bool> filling_held{};
+    std::atomic<HeldKind> filling_kind{HeldKind::None};
+    /// The held packet saw a flush between its fill and its PlayRest (counted once). Atomic: the
+    /// thread that holds a packet sets it, another thread's sync can reach NoteHeldFlush.
+    std::atomic<bool> held_flush_seen{};
     s8 fill_form{-1};
     Arena held_arena;
     u32 held_cursor{};
@@ -799,7 +849,8 @@ private:
 
     u64 packet_number{};
     std::unique_ptr<SeamTicks> ticks;
-    u64 op_number{};
+    /// Atomic (step 7): an operation's fill can open on any thread (a guest core's invalidation).
+    std::atomic<u64> op_number{};
     /// Packet ticks: the first number of the pending entries and of the held packet (SEAM >= 2).
     u64 pending_from{};
     u64 held_from{};
@@ -845,6 +896,9 @@ private:
         std::array<std::atomic<u64>, static_cast<size_t>(DiffClass::Count)> diff_classes{};
         std::atomic<u64> diff_own{};
         std::atomic<u64> diff_over{};
+        std::atomic<u64> diff_stage_own{}; ///< Step 7: changed only by GPUMem's later writes
+        std::atomic<u64> ring_reads{};     ///< Step 7: ring packets whose reads were compared
+        std::atomic<u64> ring_reads_marked{}; ///< ... with a CPU-written mark since the fill
         std::atomic<u64> ring_wrapped{};
         std::atomic<u64> gathers_held{};
         std::array<std::atomic<u64>, 3> flush_regions_held{};
@@ -857,7 +911,6 @@ private:
     bool thread_clamp_logged{};
     bool ring_clamp_logged{};
     bool ring_seam_logged{};
-    bool ahead_logged{};
 
     std::atomic<int> seam_level{0};
     bool dispatch_open{};
@@ -877,6 +930,8 @@ private:
         std::array<u64, 2> hashes;
         u32 value_count;  ///< Handle values after the entries
         u32 value_flags;  ///< 1: filled, 2: EXP21's null pointer handles
+        u32 tracker_bytes; ///< Step 7: the trackers' bytes after the values
+        u32 reserved;
     };
     static constexpr u64 RingBytes = u64{4} << 20;
     std::unique_ptr<u8[]> ring_b;
@@ -884,6 +939,8 @@ private:
     std::atomic<u64> ring_b_sent{};  ///< Bytes GPUMem committed
     u64 ring_b_read{};               ///< The back
     std::atomic<u64> ring_b_freed{}; ///< Bytes the back is done with
+    std::atomic<u64> ring_packets_sent{}; ///< GPUMem: packets pushed
+    std::atomic<u64> ring_packets_done{}; ///< The back: packets taken or dropped
     /// The fill in progress goes to ring B (FillRingDraw).
     bool ring_fill{};
     bool ring_pushed{};
@@ -897,6 +954,45 @@ private:
     /// The held draw came from ring B: its packet is played_draw.
     bool held_ring{};
     DrawPacket played_draw{};
+    /// GPUMem's side of a ring fill (THREAD = 2; the back's held_* fields are the back's): the
+    /// open packet number (its unplayed mark), the program hashes and the descriptor form.
+    u64 stage_fill_from{};
+    std::array<u64, 2> fill_hashes{};
+    bool fill_held_form{};
+    /// Step 7: the trackers' bytes, GPUMem's for the fill, the back's for the packet it holds.
+    std::vector<u8> fill_tracker_data;
+    std::vector<u8> played_tracker_data;
+    Tegra::MaxwellDeviceMemoryManager* device_memory{};
+    void CopyTrackerBytes(TrackerRecord& record, u64 vertex_program);
+    /// Step 7's verify (spec 6.4, the design's 2.5 read compare): a ring packet's read log, filled
+    /// by GPUMem (stage_log while it fills), handed over in packet order, compared by the back at
+    /// the take. Logs are pooled.
+    std::mutex ring_logs_mutex;
+    std::deque<std::pair<u64, std::unique_ptr<ReadLog>>> ring_logs;
+    std::vector<std::unique_ptr<ReadLog>> ring_log_pool;
+    std::unique_ptr<ReadLog> stage_log;
+    /// Ring packets' reads are compared (the window open, FRITCHII_MEMSTAGE_READ_LOG).
+    std::atomic<bool> ring_read_log{false};
+    /// The CPU-written marks (NoteCpuMark): several writers, a sequence word per slot.
+    struct CpuMark {
+        std::atomic<u64> seq{};
+        std::atomic<u64> begin{};
+        std::atomic<u64> end{};
+    };
+    static constexpr u64 CpuMarkSlots = 8192;
+    std::unique_ptr<CpuMark[]> cpu_marks;
+    std::atomic<u64> cpu_mark_count{0};
+    u64 reported_quiet{};
+    u64 reported_marks{};
+    void NoteCpuMarkSlow(u64 address, u64 size) noexcept;
+    /// Whether a mark noted since `since` covers [begin, end); `complete` false when the ring
+    /// wrapped since.
+    bool CpuMarkedSince(u64 since, u64 begin, u64 end, bool& complete) const;
+    bool StartRingReadLog(u64 number);
+    void StopRingReadLog();
+    std::unique_ptr<ReadLog> TakeRingLog(u64 number);
+    void RecycleRingLog(std::unique_ptr<ReadLog> log);
+    void CompareRingReads(ReadLog& log, u64 number, u64 hash_a, u64 hash_b);
     void PushRingDraw();
     const RingHeader* PeekRing();
     void TakeRingHeader(const RingHeader& header);
@@ -912,6 +1008,27 @@ private:
     static constexpr size_t FactsSlots = 4096;
     std::unique_ptr<FactsSlot[]> facts_table;
     mutable std::mutex facts_mutex;
+    /// Step 7: with the window open both threads use the table at every draw, so each keeps a
+    /// cache of its own and takes the lock only on a miss. Bumped (under the lock) at every write.
+    std::atomic<u64> facts_generation{0};
+    /// The back's: what it published, one slot per key hash (no lock while it holds).
+    struct PublishedMemo {
+        u64 key{};
+        const void* source{};
+    };
+    static constexpr size_t MemoSlots = 1024;
+    std::unique_ptr<PublishedMemo[]> published_memo;
+    /// GPUMem's: the entries it looked up, valid while the generation it saw holds.
+    struct StageFactsSlot {
+        u64 key{};
+        StagedFacts facts{};
+    };
+    static constexpr size_t StageFactsSlots = 512;
+    mutable std::unique_ptr<StageFactsSlot[]> stage_facts_cache;
+    mutable u64 stage_facts_generation{~u64{0}};
+    static size_t FactsHash(u64 key) noexcept {
+        return static_cast<size_t>((key * 0x9e3779b97f4a7c15ULL) >> 52);
+    }
     std::vector<u32> draw_values;
     std::vector<u32> dispatch_values;
 

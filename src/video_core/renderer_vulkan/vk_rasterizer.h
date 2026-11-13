@@ -314,6 +314,11 @@ private:
     bool StageFillDraw(VideoCommon::MemStageShadowEngine& copy, bool is_indexed, u64 position,
                        u64 seq, u64 hash, std::vector<std::pair<u64, std::size_t>>& ranges);
     void StageApplyRanges(std::span<const std::pair<DAddr, std::size_t>> ranges, bool bracket);
+    /// Step 7 (GPUMem): fills the window must not run ahead of (StageFillDraw).
+    bool StageDrawWritesBuffers(const VideoCommon::MemStageShadowEngine& copy) const;
+    bool StageRangesOverGpuWritten(std::span<const std::pair<DAddr, std::size_t>> ranges);
+    /// Step 7 (GPUMem, in a served call): a download over a buffer joined ahead of the back.
+    void CheckServedJoins(DAddr addr, u64 size);
     void InnerInvalidationServed(std::span<const std::pair<DAddr, std::size_t>> sequences);
     template <typename F>
     void OnStage(u8 cause, F&& body);

@@ -169,6 +169,9 @@ StagingBufferRef StagingBufferPool::GetStreamBuffer(
                          (std::min)(Region(iterator + size) + 1, NUM_SYNCS))) {
         // EDEN_NX2_MEMSTAGE_STATS: the stream ring is busy (the memory stage's join 3).
         VideoCommon::MemStageStats::StreamFull();
+        // Memory stage step 7: on GPUMem with the window open the busy regions may be stamped
+        // with packets not played yet; they are never waited for, a new buffer is taken (counted).
+        VideoCommon::MemoryStageLink::NoteStagingFallback();
         // Avoid waiting for the previous usages to be free
         return GetStagingBuffer(size, MemoryUsage::Upload, false, caller, true);
     }
@@ -189,6 +192,7 @@ StagingBufferRef StagingBufferPool::GetStreamBuffer(
 
         if (AreRegionsActive(0, Region(size) + 1)) {
             VideoCommon::MemStageStats::StreamFull();
+            VideoCommon::MemoryStageLink::NoteStagingFallback();
             // Avoid waiting for the previous usages to be free
             return GetStagingBuffer(size, MemoryUsage::Upload, false, caller, true);
         }
