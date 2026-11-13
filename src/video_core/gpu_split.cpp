@@ -292,6 +292,10 @@ void GpuSplit::Stop() {
     last_method_write_position = 0;
     previous_method_write_position = 0;
     ranged_overflow_position = 0;
+    ranged_device_stamps = false;
+    ranged_device_since = 0;
+    stamp_memory = nullptr;
+    stamp_page = ~GPUVAddr{0};
     if (write_stamps) {
         // The next session's positions start at 0 again.
         std::fill_n(block_stamps.get(), BlockStamps, StampSlot{});
@@ -567,7 +571,8 @@ bool GpuSplit::WaitForSyncedWriters(DrainSite site) {
     return WaitFor(std::min({last_writer_position, last_sync_position, write_position}), site);
 }
 
-void GpuSplit::RangeLastWrite(GPUVAddr begin, GPUVAddr end, const u32* data, size_t space) {
+void GpuSplit::RangeLastWrite(GPUVAddr begin, GPUVAddr end, const u32* data, size_t space,
+                              const Tegra::MemoryManager* memory) {
     static const bool enabled = [] {
         const char* const value = std::getenv("EDEN_NX2_RANGED_WAITS");
         return value == nullptr || value[0] != '0';
@@ -584,6 +589,14 @@ void GpuSplit::RangeLastWrite(GPUVAddr begin, GPUVAddr end, const u32* data, siz
     }
     if (write_stamps) [[unlikely]] {
         StampWrite(begin, end, true);
+        if (RangedDeviceStamps()) {
+            if (memory != nullptr) {
+                StampRangedDevice(*memory, begin, end);
+            } else {
+                write_stamp_floor = write_position; // No translation: it may write anything
+                ++floor_stats.device_floors;
+            }
+        }
     }
     static const bool forward = [] {
         const char* const value = std::getenv("EDEN_NX2_FORWARD_READS");
@@ -627,6 +640,52 @@ void GpuSplit::RangeLastWrite(GPUVAddr begin, GPUVAddr end, const u32* data, siz
         write.space = space;
         write.data.assign(data, data + words);
     }
+}
+
+bool GpuSplit::RangedDeviceStamps() {
+    const bool on = OverflowFloorMode() != 0;
+    if (on != ranged_device_stamps) {
+        ranged_device_stamps = on;
+        // Turned on: the ranged writes sent so far were stamped by GPU address only.
+        ranged_device_since = on ? write_position : 0;
+    }
+    return on;
+}
+
+void GpuSplit::StampRangedDevice(const Tegra::MemoryManager& memory, GPUVAddr begin,
+                                 GPUVAddr end) {
+    // As TryNoteWriterRange: while a queued function may still remap the range the back may
+    // translate it differently, and sparse pages are written through their own backing. Then
+    // the write counts for every address until the back ran it.
+    if (last_function_position > consumed_cache) {
+        consumed_cache = consumed.load(std::memory_order_acquire);
+    }
+    const bool sparse = begin < Tegra::g_nx2_sparse_high.load(std::memory_order_relaxed) &&
+                        Tegra::g_nx2_sparse_low.load(std::memory_order_relaxed) < end;
+    if (last_function_position > consumed_cache || sparse) {
+        write_stamp_floor = write_position;
+        ++floor_stats.device_floors;
+        return;
+    }
+    constexpr GPUVAddr page_size = 0x1000;
+    for (GPUVAddr page = begin & ~(page_size - 1); page < end; page += page_size) {
+        if (&memory != stamp_memory || page != stamp_page ||
+            stamp_function != last_function_position) {
+            const std::optional<DAddr> device = memory.GpuToCpuAddress(page);
+            stamp_memory = &memory;
+            stamp_page = page;
+            stamp_function = last_function_position;
+            stamp_mapped = device.has_value();
+            stamp_device = device.value_or(0);
+        }
+        if (!stamp_mapped) {
+            continue; // Unmapped: the back writes nothing there
+        }
+        const GPUVAddr from = (std::max)(begin, page);
+        const GPUVAddr to = (std::min)(end, page + page_size);
+        StampWrite(stamp_device + (from - page), stamp_device + (to - page), false);
+    }
+    ++floor_stats.device_stamped;
 }
 
 bool GpuSplit::ForwardRead(size_t space, GPUVAddr begin, u32 words, u32* out) {
@@ -846,8 +905,11 @@ u64 GpuSplit::WriteStamp(u64 device, u64 size, GPUVAddr address, u64 skip_tag) c
     }
     // EXP126 = 1 (fable_qmd_wait_brief piece 2): without the ranged overflow. RangeLastWrite
     // stamps a ranged write's bytes before it touches the ring, so a dropped one is still found
-    // over its own bytes below; only its count for every other address goes.
-    const u64 overflow = OverflowFloorOff() ? 0 : ranged_overflow_position;
+    // over its own bytes below; only its count for every other address goes. Its device bytes
+    // too (RangeLastWrite stamps them with EXP126 on), so a read through another GPU address
+    // of the same memory finds it; the writes sent before EXP126 turned on count until they ran.
+    const u64 overflow =
+        OverflowFloorOff() ? FloorlessOverflowTerm() : ranged_overflow_position;
     u64 stamp = (std::max)({write_stamp_floor, unknown_write_position,
                             last_unbounded_writer_position, last_unranged_position,
                             last_function_position, last_method_write_position, overflow});
@@ -895,16 +957,15 @@ GpuSplit::StampWhy GpuSplit::WriteStampWhy(u64 device, u64 size, GPUVAddr addres
         {last_unranged_position, StampTerm::Unranged},
         {last_function_position, StampTerm::Function},
         {last_method_write_position, StampTerm::MethodWrite},
-        {ranged_overflow_position, StampTerm::RangedOverflow},
+        // As WriteStamp: with EXP126 = 1 the writes not stamped by device address stand for it.
+        {OverflowFloorOff() ? FloorlessOverflowTerm() : ranged_overflow_position,
+         StampTerm::RangedOverflow},
     }};
-    StampWhy why{0, 0, 0, StampTerm::None};
-    const bool floor_off = OverflowFloorOff();
+    // `floorless` (what 1 answers): with device stamps on (EXP126 not 0) the writes sent before
+    // they started; with 0 (counters only) nothing for the overflow.
+    StampWhy why{0, ranged_device_stamps ? ranged_device_since : 0, 0, StampTerm::None};
     for (const auto& [position, term] : terms) {
-        if (term == StampTerm::RangedOverflow) {
-            if (floor_off) {
-                continue; // As WriteStamp
-            }
-        } else {
+        if (term != StampTerm::RangedOverflow) {
             why.floorless = (std::max)(why.floorless, position);
         }
         if (position > why.term_position) {
@@ -1012,8 +1073,9 @@ void GpuSplit::ReportQmdFloor() {
              "{:.0f} of them by the overflow alone; block/page stamps against the exact scan "
              "(writer found, older or unbounded only, nothing): patches {}/{}/{}, reads "
              "{}/{}/{}; macro DMA read waits {:.0f}/s, {:.0f}/s on the overflow ({:.0f} words "
-             "each); trial (EXP126=2): {} reads compared from memory, {} from a trial overlay, "
-             "{} differed, {} trial overlays built, {} not compared",
+             "each); ranged writes stamped by device address {:.0f}/s, {:.0f}/s counted for every "
+             "address instead; trial (EXP126=2): {} reads compared from memory, {} from a trial "
+             "overlay, {} differed, {} trial overlays built, {} not compared",
              mode, rate(s.overflows), MaxRangedWrites(),
              rate(s.qmd_reads), rate(s.reads_floor_up),
              s.reads_floor_up != 0 ? static_cast<double>(s.floor_words) /
@@ -1030,7 +1092,8 @@ void GpuSplit::ReportQmdFloor() {
              s.dma_overflow_waits != 0 ? static_cast<double>(s.dma_overflow_words) /
                                              static_cast<double>(s.dma_overflow_waits)
                                        : 0.0,
-             s.trial_compared[0], s.trial_compared[1], s.trial_differed, s.trial_built,
+             rate(s.device_stamped), rate(s.device_floors), s.trial_compared[0],
+             s.trial_compared[1], s.trial_differed, s.trial_built,
              s.trial_skipped);
     if (s.trial_differed != 0) {
         LOG_ERROR(HW_GPU,

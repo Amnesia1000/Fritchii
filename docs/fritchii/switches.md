@@ -1572,8 +1572,18 @@ the ring, so a dropped write is still found over its own bytes, and stamps only 
 collision makes one newer, never older). Unranged 3D writes still count for every address;
 QueuedGuestWriters and the macro DMA reads (MemoryWriterTarget) scan the ring and keep the
 overflow as before. An overlay from memory made while the overflow is queued is kept out of the
-EXP13 feed (its unbounded-writer check sees the overflow). The same hole as before stays: memory
-mapped at two GPU addresses is stamped by the address it was written through only.
+EXP13 feed (its unbounded-writer check sees the overflow). Aliases: with EXP126 not 0 every
+ranged write is stamped by device address as well as by GPU address (the page translated once
+and cached, as NoteWrite does), so a QMD or semaphore read of the same memory through another
+GPU address finds it in WriteStamp (the QMD sites, PatchHolders and the semaphore feed check all
+ask it with the device address). With 0 they are stamped by GPU address only, as before (the
+overflow floor covered the dropped ones; the newest 256 had that hole already). While a queued
+function may remap the range, or for sparse pages, the write counts for every address instead
+(the stamp floor) until the back ran it. When EXP126 turns on, the ranged writes sent before were
+not stamped by device address: with 1 they count for every address until the back ran them.
+(With 2 the device stamps are taken too, for the trial; they can only make a stamp newer.)
+The ring scans (QueuedGuestWriters, ExactWriterCheck) still compare GPU addresses only; they
+keep the overflow, so their answers are as before.
 With 2 everything behaves as 0, and the QMD copy checks what 1 would have served: at a patch
 nothing but the overflow refused it builds the overlay 1 would make into a small trial table
 (never served); at a read that waits and would not at 1 it takes that trial overlay, or reads
@@ -1614,6 +1624,8 @@ The line gives:
   the window: patches a/b/c, reads a/b/c;
 - macro DMA read waits a second (WaitForMemoryWriters with a range) and those whose target is the
   ranged overflow, with the ring words each;
+- EXP126 not 0: ranged writes stamped by device address a second, and those counted for every
+  address instead (a queued function, sparse pages, no memory manager given);
 - EXP126 = 2: reads compared from memory and from a trial overlay, how many differed, trial
   overlays built and reads not compared (counts for the window).
 

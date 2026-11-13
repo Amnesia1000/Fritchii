@@ -1039,7 +1039,10 @@ public:
     /// keeps every write counting.
     /// `data` (optional): the words it writes there, in address space `space`, which a macro
     /// memory read of them takes without waiting (ForwardRead).
-    void RangeLastWrite(GPUVAddr begin, GPUVAddr end, const u32* data = nullptr, size_t space = 0);
+    /// `memory` (optional): the memory manager [begin, end) is in; with EXP126 not 0 the range is
+    /// stamped by device address too (StampRangedDevice).
+    void RangeLastWrite(GPUVAddr begin, GPUVAddr end, const u32* data = nullptr, size_t space = 0,
+                        const Tegra::MemoryManager* memory = nullptr);
     /// For a macro memory read of `words` words at `begin` in address space `space`: when the
     /// newest work that may write them is one constant buffer upload still queued for the back,
     /// copies its words to `out` and returns true; the read then needs no wait.
@@ -1617,6 +1620,27 @@ private:
     GPUVAddr note_page{~GPUVAddr{0}};
     u64 note_device{};
     u64 note_function{};
+    /// EXP126 not 0 (review fix 2 of fable_qmd_wait_brief): ranged writes are stamped by device
+    /// address too, so a read of the same memory through another GPU address finds them (the
+    /// GPU stamp alone did not; the overflow floor hid that once the ring was full). Since
+    /// `ranged_device_since` (the switch turned on): the writes sent before were stamped by GPU
+    /// address only, and count for every address with the overflow left out until they ran.
+    bool ranged_device_stamps{};
+    u64 ranged_device_since{};
+    /// StampRangedDevice's last translation, as NoteWrite's.
+    const Tegra::MemoryManager* stamp_memory{};
+    GPUVAddr stamp_page{~GPUVAddr{0}};
+    u64 stamp_device{};
+    u64 stamp_function{};
+    bool stamp_mapped{};
+    /// Whether ranged writes are stamped by device address now (EXP126 not 0), noting a turn on.
+    bool RangedDeviceStamps();
+    void StampRangedDevice(const Tegra::MemoryManager& memory, GPUVAddr begin, GPUVAddr end);
+    /// What stands for the ranged overflow when WriteStamp leaves it out: the writes not
+    /// stamped by device address, or the overflow itself while device stamps are off.
+    [[nodiscard]] u64 FloorlessOverflowTerm() const {
+        return ranged_device_stamps ? ranged_device_since : ranged_overflow_position;
+    }
     u64 published_local{};
     u64 consumed_cache{};
     /// Words between publishes: small right after a drain, while the back has nothing to do.
@@ -1664,6 +1688,10 @@ private:
         u64 dma_waits;          ///< WaitForMemoryWriters(site, begin, end) that waited
         u64 dma_overflow_waits; ///< ... whose target is the ranged overflow
         u64 dma_overflow_words; ///< ... and the ring words they waited for
+        /// EXP126 not 0: ranged writes stamped by device address, and those that could not be
+        /// (a queued function may remap, sparse) and count for every address instead.
+        u64 device_stamped;
+        u64 device_floors;
         /// EXP126 = 2: reads compared (from memory, from a trial overlay), those that differed,
         /// trial overlays built, reads not compared.
         std::array<u64, 2> trial_compared;
