@@ -583,8 +583,10 @@ session after a catch-up could not finish (below; logged).
   clears it with one thread, and with each send). With EDEN_NX2_GPU_PROFILE=2 GPUMem's
   profile splits its entry loop into "stage entries" and, inside it, "stage cb words"; the back's
   "draw" splits off "ring take" (the packet's take from ring B) with "ring take copy" inside it
-  (its bytes copied out), "draw locks" (inside "draw setup") and "draw after configure" (the
-  trackers, traces and dumps between Configure and dynamic state).
+  (its bytes copied out), "draw locks" and "ring facts" (inside "draw setup": the caches' locks,
+  and the facts published under the stage's program key), "draw after configure" (the
+  trackers, traces and dumps between Configure and dynamic state) and "rest tail" (PlayRest after
+  its play: the held flags, the ticks mark, the watch count).
 - The second fps fixes (window open only): GPUMem's wait for the front spins about 200 us before
   it sleeps (level mode keeps about 2,000 pauses; the link line's "slept n/s" adds how many of
   those sleeps waited for the front); the back prefetches the first 1 KiB of the next packet in

@@ -2213,6 +2213,7 @@ void MemStage::PlayRest() {
         return;
     }
     PlayHeldTo(held_arena.Size(), true);
+    const Profile::FineScope tail_scope{Profile::Zone::RestTail};
     held = HeldKind::None;
     held_ring = false;
     t_holding = false;

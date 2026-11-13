@@ -1890,6 +1890,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     pipeline->SetEngine(maxwell3d, gpu_memory);
     // THREAD = 2: the facts table (join 1) learns this pipeline's facts under the stage's key.
     if (ring_on) [[unlikely]] {
+        const Profile::FineScope facts_scope{Profile::Zone::RingFacts};
         mem_stage.PublishFacts(VideoCommon::MemStageShadow::BackProgramKey(*maxwell3d), pipeline,
                                pipeline->MemFacts(), pipeline->HasDynamicVertexInput());
     }
