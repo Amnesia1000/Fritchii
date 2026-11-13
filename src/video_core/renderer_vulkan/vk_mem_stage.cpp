@@ -1069,7 +1069,9 @@ void MemStage::EndHeldFill() {
     filling_held = false;
     fill_form = -1;
     t_reads = nullptr;
-    if (held != HeldKind::None || std::exchange(ring_pushed, false)) {
+    // A ring push ended the fill too. ring_pushed is FillRingDraw's answer: read here, not taken
+    // (taking it here made every served draw look unfilled to the stage, hence level).
+    if (held != HeldKind::None || ring_pushed) {
         return;
     }
     // The fill threw before TakeHeld: nothing is held. Its entries stay pending and the next
