@@ -2762,17 +2762,21 @@ bool KeplerCompute::FrontReadQmd(VideoCommon::GpuSplit& split, u64 address,
         }
         // The QMD wait floor counters (fable_qmd_wait_brief piece 1): which stamp term set the
         // target and, for a block or page stamp, whether the exact scan finds the writer too.
-        const auto why = split.WriteStampWhy(*device, size, address);
-        const bool evicted = target > why.stamp;
-        const bool stamped =
-            why.term == VideoCommon::StampTerm::Block || why.term == VideoCommon::StampTerm::Page;
-        split.NoteQmdReadWait(
-            why, done, target, evicted,
-            !evicted && stamped
-                ? split.ExactWriterCheck(done, address, *device, size, why.term_position)
-                : u8{3});
-        if (VideoCommon::GpuSplit::OverflowFloorMode() == 2 &&
-            (overlay == nullptr || overlay->position <= done)) {
+        // Only with the line on (EDEN_NX2_GPU_PROFILE or EXP126).
+        const int floor_mode = VideoCommon::GpuSplit::OverflowFloorMode();
+        VideoCommon::GpuSplit::StampWhy why{};
+        if (floor_mode != 0 || VideoCommon::Nx2Profile::Enabled()) {
+            why = split.WriteStampWhy(*device, size, address);
+            const bool evicted = target > why.stamp;
+            const bool stamped = why.term == VideoCommon::StampTerm::Block ||
+                                 why.term == VideoCommon::StampTerm::Page;
+            split.NoteQmdReadWait(
+                why, done, target, evicted,
+                !evicted && stamped
+                    ? split.ExactWriterCheck(done, address, *device, size, why.term_position)
+                    : u8{3});
+        }
+        if (floor_mode == 2 && (overlay == nullptr || overlay->position <= done)) {
             // As this function would decide with the target 1 gives (fable_qmd_wait_brief 4.3):
             // the trial overlay a patch would have made, if nothing stamped after it; else, with
             // no overlay of it queued, guest memory now if nothing queued may write the QMD.
@@ -2907,7 +2911,8 @@ void KeplerCompute::FrontPatchOverlays(VideoCommon::GpuSplit& split, FrontState&
         }
         // The QMD wait floor counters (fable_qmd_wait_brief piece 1): each outcome.
         using Outcome = VideoCommon::QmdPatchOutcome;
-        const bool trial_mode = VideoCommon::GpuSplit::OverflowFloorMode() == 2;
+        const int floor_mode = VideoCommon::GpuSplit::OverflowFloorMode();
+        const bool trial_mode = floor_mode == 2;
         if (trial_mode) {
             // A later patch of the block: its trial overlay is rebuilt below or not compared.
             mirror.DropTrial(&memory_manager, block_address);
@@ -2931,7 +2936,12 @@ void KeplerCompute::FrontPatchOverlays(VideoCommon::GpuSplit& split, FrontState&
         }
         if (split.WriteStamp(*device, size, block_address, fs.upload_tag) > done) {
             // Which term refused it; for a block or page stamp, whether the exact scan (this
-            // upload's own range left out) finds the writer too.
+            // upload's own range left out) finds the writer too. Only with the line on
+            // (EDEN_NX2_GPU_PROFILE or EXP126).
+            if (floor_mode == 0 && !VideoCommon::Nx2Profile::Enabled()) {
+                split.NoteQmdPatch(Outcome::Stamp);
+                continue; // Another write may still land there
+            }
             const auto why = split.WriteStampWhy(*device, size, block_address, fs.upload_tag);
             const bool stamped = why.term == VideoCommon::StampTerm::Block ||
                                  why.term == VideoCommon::StampTerm::Page;

@@ -1605,6 +1605,9 @@ The line gives:
   many of those nothing but the overflow refused;
 - QMD read waits a second by the term that set the target (the same terms, and evicted inline
   QMD) with the ring words each waited, and how many nothing but the overflow made wait;
+- the stamp terms, the "overflow alone" counts and the exact scan below are worked out only with
+  the line on (EDEN_NX2_GPU_PROFILE or EXP126 not 0; WriteStampWhy and the scan cost the front
+  otherwise); without it refusals count under "by the stamp" with no terms;
 - for refusals and waits set by a block or page stamp: whether the exact scan over the same bytes
   (GpuSplit::QueuedGuestWriters) finds the writer at the stamp, only an older or unbounded one, or
   nothing (a hash collision, or a page stamp of a write elsewhere in the page), as counts for
