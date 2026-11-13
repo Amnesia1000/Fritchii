@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -92,46 +93,52 @@ bool WritesMemory(Engines::EngineInterface* engine, Engines::EngineTypes type, u
     return false;
 }
 
-// Whether GPU range [begin, begin + size) maps to device range [device, device + size), page by
-// page.
-[[nodiscard]] bool MapsContiguously(const MemoryManager& memory_manager, GPUVAddr begin,
-                                    u64 size, DAddr device) {
-    for (u64 offset = 0x1000 - (begin & 0xfff); offset < size; offset += 0x1000) {
-        const auto page = memory_manager.GpuToCpuAddress(begin + offset);
-        if (!page || *page != device + offset) {
-            return false;
-        }
-    }
-    return true;
-}
+using DeviceRanges = boost::container::small_vector<std::pair<DAddr, std::size_t>, 32>;
 
-// The device range GPU range [begin, begin + size) maps to as one piece, or none (unmapped or
-// scattered pages). The last answer is kept until the page tables change (MapSerial): a blit's
-// destination surface is the same one frame after frame and can be MiBs (a page lookup each).
-// Front only.
-[[nodiscard]] std::optional<DAddr> ContiguousDevice(const MemoryManager& memory_manager,
-                                                    GPUVAddr begin, u64 size) {
+// The device ranges GPU range [begin, begin + size) maps to (MemoryManager::
+// GetSubmappedDeviceRange: contiguous pages merged, unmapped ones left out, which nothing
+// writes). The last answer is kept until the page tables change (MapSerial): a blit's destination
+// surface is the same one frame after frame. Front only.
+[[nodiscard]] const DeviceRanges& DeviceRangesOf(const MemoryManager& memory_manager,
+                                                 GPUVAddr begin, u64 size) {
     struct Memo {
         const MemoryManager* memory_manager;
         GPUVAddr begin;
         u64 size;
         u64 serial;
-        std::optional<DAddr> device;
+        DeviceRanges ranges;
     };
     static Memo memo{};
     const u64 serial = memory_manager.MapSerial();
-    if (memo.memory_manager == &memory_manager && memo.begin == begin && memo.size == size &&
-        memo.serial == serial) {
-        return memo.device;
+    if (memo.memory_manager != &memory_manager || memo.begin != begin || memo.size != size ||
+        memo.serial != serial) {
+        // The serial is taken before the walk: a change during it makes the next call look again.
+        memo.memory_manager = &memory_manager;
+        memo.begin = begin;
+        memo.size = size;
+        memo.serial = serial;
+        memo.ranges = memory_manager.GetSubmappedDeviceRange(begin, size);
     }
-    std::optional<DAddr> device = memory_manager.GpuToCpuAddress(begin);
-    if (device && !MapsContiguously(memory_manager, begin, size, *device)) {
-        device.reset();
-    }
-    // Taken before the walk: a change during it leaves the next call looking again.
-    memo = {&memory_manager, begin, size, serial, device};
-    return device;
+    return memo.ranges;
 }
+
+// Why a blit launch stayed an unranged writer with EXP120 = 2 (Fermi2D::FrontBlitRange's codes
+// first), for FrontDmaRead's "unranged notes" line (FritchiiBlitMissText). Front only.
+enum class BlitMiss : u32 {
+    None,
+    NotSeen,  ///< 1: a destination register the range needs was not sent yet
+    Format,   ///< 2: an undecodable format
+    Empty,    ///< 3: an empty surface
+    Large,    ///< Over MaxNotedWrite
+    Unmapped, ///< No byte of it mapped
+    Pieces,   ///< More device ranges than MaxNotedPieces
+    Other,    ///< An unknown FrontBlitRange code
+    Count,
+};
+std::array<u64, static_cast<size_t>(BlitMiss::Count)> g_blit_misses{};
+/// The largest write noted by its range, and the most device ranges it may map to.
+constexpr u64 MaxNotedWrite = u64{1} << 30;
+constexpr size_t MaxNotedPieces = 16;
 
 // The KeplerMemory or Fermi2D method just sent on the split (`words`: its `count` words, `multi`:
 // a non-incrementing run, CallMultiMethod). EXP120 = 0 notes every one as an unranged writer,
@@ -139,9 +146,9 @@ bool WritesMemory(Engines::EngineInterface* engine, Engines::EngineTypes type, u
 // writes memory only on KeplerMemory's data method and Fermi2D's blit launch (their CallMethod),
 // so the methods that only store a register are not noted, nor a single data word that is not
 // its method's last (Upload::State::ProcessData writes with the last one); a linear upload's data
-// notes the bytes it may write (NoteMemoryWrite). EXP120 = 2 also notes a blit's whole
-// destination surface (Fermi2D::FrontBlitRange). Block linear uploads stay unranged, and so does
-// anything whose bytes are not one device range.
+// notes the bytes it may write (NoteMemoryWrite, one per device range). EXP120 = 2 also notes a
+// blit's whole destination surface (Fermi2D::FrontBlitRange). Block linear uploads stay
+// unranged, and so does anything over MaxNotedWrite, MaxNotedPieces device ranges or unmapped.
 void NoteEngineWriter(VideoCommon::GpuSplit& split, const MemoryManager& memory_manager,
                       Engines::EngineInterface* engine, Engines::EngineTypes type, u32 method,
                       const u32* words, u32 count, bool is_last, bool multi) {
@@ -155,6 +162,7 @@ void NoteEngineWriter(VideoCommon::GpuSplit& split, const MemoryManager& memory_
     bool ranged = false;
     GPUVAddr begin{};
     u64 size{};
+    BlitMiss miss = BlitMiss::None;
     if (type == Engines::EngineTypes::KeplerMemory) {
         auto* const memory = static_cast<Engines::KeplerMemory*>(engine);
         // Kept with EXP120 off too, so turning it on live finds the registers sent before.
@@ -173,6 +181,10 @@ void NoteEngineWriter(VideoCommon::GpuSplit& split, const MemoryManager& memory_
             kind = Kind::BlitLaunch;
             writes = true;
             ranged = blitter->FrontBlitRange(begin, size);
+            if (!ranged) {
+                miss = size <= static_cast<u64>(BlitMiss::Empty) ? static_cast<BlitMiss>(size)
+                                                                 : BlitMiss::Other;
+            }
         }
     }
     const auto unranged = [&] {
@@ -188,21 +200,52 @@ void NoteEngineWriter(VideoCommon::GpuSplit& split, const MemoryManager& memory_
         split.CountEngineWrite(multi, kind, Note::Nothing);
         return;
     }
-    // A large upload or surface, or one over unmapped or scattered pages, stays unranged.
+    // A huge upload or surface, one with no byte mapped or over too many device ranges, stays
+    // unranged.
     const bool blit = kind == Kind::BlitLaunch;
-    const u64 limit = blit ? u64{64} << 20 : u64{1} << 20;
-    if (!ranged || (blit && mode < 2) || size > limit) {
+    if (blit && mode < 2) {
         return unranged();
     }
-    const std::optional<DAddr> device = ContiguousDevice(memory_manager, begin, size);
-    if (!device) {
-        return unranged();
+    const auto missed = [&](BlitMiss reason) {
+        if (blit) {
+            ++g_blit_misses[static_cast<size_t>(reason)];
+        }
+        unranged();
+    };
+    if (!ranged) {
+        return missed(miss);
+    }
+    if (size > MaxNotedWrite) {
+        return missed(BlitMiss::Large);
+    }
+    const DeviceRanges& pieces = DeviceRangesOf(memory_manager, begin, size);
+    if (pieces.empty()) {
+        return missed(BlitMiss::Unmapped);
+    }
+    if (pieces.size() > MaxNotedPieces) {
+        return missed(BlitMiss::Pieces);
     }
     split.NoteMemoryWriter();
-    split.NoteMemoryWrite(*device, size, blit ? "Fermi2D blit" : "KeplerMemory upload");
+    for (const auto& [device, length] : pieces) {
+        split.NoteMemoryWrite(device, length, blit ? "Fermi2D blit" : "KeplerMemory upload");
+    }
     split.NoteUnrangedWriterSpared();
     split.CountEngineWrite(multi, kind, Note::Ranged);
 }
+
+} // Anonymous namespace
+
+// Declared in maxwell_3d.cpp for FrontDmaRead's log (not in a header).
+std::string FritchiiBlitMissText() {
+    const auto at = [](BlitMiss reason) { return g_blit_misses[static_cast<size_t>(reason)]; };
+    return fmt::format("{} register not sent, {} format, {} empty, {} over 1 GiB, {} unmapped, "
+                       "{} over {} device ranges, {} other",
+                       at(BlitMiss::NotSeen), at(BlitMiss::Format), at(BlitMiss::Empty),
+                       at(BlitMiss::Large), at(BlitMiss::Unmapped), at(BlitMiss::Pieces),
+                       MaxNotedPieces, at(BlitMiss::Other));
+}
+
+namespace {
 
 // EDEN_NX2_LIST_CHANGE_TRACE=1: per GPU-written command list address, how often its words differ
 // from the last read of the same address (a wait that only guards unchanged words could go).

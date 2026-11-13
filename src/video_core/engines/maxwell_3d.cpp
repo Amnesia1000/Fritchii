@@ -52,6 +52,11 @@
 #include "video_core/macro_turing_jit.h"
 #endif
 
+namespace Tegra {
+/// Why EXP120 = 2 left blit launches unranged (dma_pusher.cpp).
+std::string FritchiiBlitMissText();
+} // namespace Tegra
+
 namespace Tegra::Engines {
 
 /// First register id that is actually a Macro call.
@@ -3747,11 +3752,12 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                         LOG_INFO(HW_GPU,
                                  "DMA snapshot unranged notes (EXP120={}; single/run): "
                                  "KeplerMemory data {}; KeplerMemory registers {}; Fermi2D blits "
-                                 "{}; Fermi2D registers {}; {} reads skipped by EXP120 ({} "
-                                 "differed)",
+                                 "{} (left unranged by EXP120=2: {}); Fermi2D registers {}; {} "
+                                 "reads skipped by EXP120 ({} differed)",
                                  VideoCore::Nx2Debug::Experiment(120), kind(Kind::I2mData),
                                  kind(Kind::I2mRegister), kind(Kind::BlitLaunch),
-                                 kind(Kind::BlitRegister), unranged_skips, unranged_differences);
+                                 Tegra::FritchiiBlitMissText(), kind(Kind::BlitRegister),
+                                 unranged_skips, unranged_differences);
                     }
                     if (ranged_writers) {
                         using Unbounded = VideoCommon::GpuSplit::DispatchUnbounded;
