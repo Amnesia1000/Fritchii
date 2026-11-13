@@ -1880,6 +1880,14 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         // may still be writing would only bounce between the two cores).
         const bool ring_prefetch = (VideoCore::Nx2Debug::Experiment(27) & 4) != 0;
         u64 prefetched = read_position;
+        // Step 7 (fps fix 3): with the window open the ring's per-entry calls run only at the
+        // batch's first entry and where a run starts or ends. The limits stay the batch's, so
+        // between their edges BackEntry would do what it did at the edge, and BackAfter can end
+        // a run only at or past lent_until (every entry there while the run stays open: the
+        // stage may extend it). Level mode (AHEAD = 0) calls them for every entry.
+        const bool ring_edges = ring_on && MemoryStageLink::Ahead() != 0;
+        u64 ring_next_edge = read_position;
+        bool ring_run = false;
         while (read_position != available) {
             const size_t index = read_position & RingMask;
             if (ring_prefetch) {
@@ -1900,7 +1908,16 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             // The entries Execute may take with this one (constant buffer words) stop at a level
             // run's edge, so each entry runs lent or served as a whole.
             u64 end = available;
-            if (ring_on) [[unlikely]] {
+            if (ring_edges) {
+                if (read_position >= ring_next_edge) [[unlikely]] {
+                    link.BackEntry(read_position, limits);
+                    ring_run = MemoryStageLink::BackInRun();
+                    ring_next_edge = read_position < limits.lent_from    ? limits.lent_from
+                                     : read_position < limits.lent_until ? limits.lent_until
+                                                                         : ~u64{0};
+                }
+                end = (std::min)(end, ring_next_edge);
+            } else if (ring_on) [[unlikely]] {
                 link.BackEntry(read_position, limits);
                 if (read_position < limits.lent_from) {
                     end = (std::min)(end, limits.lent_from);
@@ -1915,7 +1932,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             const size_t size =
                 Execute(&ring[index], std::min<u64>(end - read_position, RingWords - index));
             read_position += size != 0 ? size : RingWords - index;
-            if (ring_on && link.BackAfter(read_position, limits)) [[unlikely]] {
+            if (ring_on && (!ring_edges || (ring_run && read_position >= limits.lent_until)) &&
+                link.BackAfter(read_position, limits)) [[unlikely]] {
+                ring_run = false;
                 // The run's last entry ran (spec 1.5, plan 5.2): no register write still waits in
                 // the sink, then the run's collected ranges; then `consumed` below.
                 if (back_engine != nullptr) {

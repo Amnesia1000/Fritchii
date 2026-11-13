@@ -183,6 +183,9 @@
 #endif
 #include <windows.h> // RtlCaptureStackBackTrace (the read log's gather callers)
 #endif
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
 
 #include "common/assert.h"
 #include "common/fritchii_write_ring.h"
@@ -210,6 +213,20 @@
 
 namespace Vulkan {
 namespace {
+
+/// Step 7: how much of the next ring B packet the back prefetches when it takes one (the header,
+/// the draw and the first entries; a packet is usually 10 to 12 lines).
+constexpr u64 RingPrefetchBytes = 1024;
+
+void PrefetchLine(const u8* address) {
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    _mm_prefetch(reinterpret_cast<const char*>(address), _MM_HINT_T0);
+#elif defined(__clang__) || defined(__GNUC__)
+    __builtin_prefetch(address, 0, 3);
+#else
+    static_cast<void>(address);
+#endif
+}
 
 thread_local u32 t_fill_depth = 0;
 thread_local u32 t_play_depth = 0;
@@ -1822,6 +1839,18 @@ void MemStage::TakeRingHeader(const RingHeader& header) {
     SeamTicks::SetStamp(number, false);
     ring_b_read += header.bytes;
     ring_b_freed.store(ring_b_read, std::memory_order_seq_cst);
+    if (Link::Ahead() != 0) {
+        // Step 7: the next packet is usually committed already (the window keeps several
+        // ahead); GPUMem's core wrote its lines microseconds ago. They are fetched while this
+        // draw runs, not at the next take. Only committed bytes, up to the end of the ring.
+        const u64 committed = ring_b_sent.load(std::memory_order_acquire) - ring_b_read;
+        const u64 index = ring_b_read % RingBytes;
+        const u64 bytes = (std::min)({committed, RingBytes - index, RingPrefetchBytes});
+        const u8* const next = ring_b.get() + index;
+        for (u64 offset = 0; offset < bytes; offset += 64) {
+            PrefetchLine(next + offset);
+        }
+    }
     // Step 7: the window and the room GPUMem may wait for (it is woken if it sleeps).
     ring_packets_done.fetch_add(1, std::memory_order_seq_cst);
     Link::Get().NoteRingFreed();

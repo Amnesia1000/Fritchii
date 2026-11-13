@@ -246,6 +246,8 @@ using Ring = MemoryStageRingAccess;
 
 /// About 2,000 pauses (spec 6.1) before a wait sleeps.
 constexpr u32 LinkSpinPauses = 2048;
+/// With the window open, how long the stage's wait for the front spins before it sleeps.
+constexpr u64 InputSpinNs = 200'000;
 /// Entries the stage reads before it publishes them anyway (spec 4.1).
 constexpr u64 PublishEvery = 64;
 
@@ -1094,6 +1096,11 @@ bool MemoryStageLink::StageWaitFor(std::stop_token& stop, StageWait reason, u64 
             return Ring::Consumed().load(std::memory_order_acquire) >= target;
         }
     };
+    // With the window open, the wait for the front spins about 200 us before it sleeps: a
+    // sleeping stage costs the front a wake in its next publish and a wake-up inside the drain
+    // that follows. Level mode keeps the short spin.
+    const bool long_spin = reason == StageWait::Input && ring_window != 0;
+    u64 spin_from = start;
     bool ok = true;
     for (u32 spin = 0;;) {
         if (stop.stop_requested()) {
@@ -1105,9 +1112,13 @@ bool MemoryStageLink::StageWaitFor(std::stop_token& stop, StageWait reason, u64 
         }
         if (StageServeCalls()) {
             spin = 0;
+            if (long_spin) {
+                spin_from = LinkNowNs();
+            }
             continue;
         }
-        if (spin < LinkSpinPauses) {
+        if (spin < LinkSpinPauses ||
+            (long_spin && ((spin % 64) != 0 || LinkNowNs() - spin_from < InputSpinNs))) {
             ++spin;
             LinkPause();
             continue;
@@ -1118,6 +1129,9 @@ bool MemoryStageLink::StageWaitFor(std::stop_token& stop, StageWait reason, u64 
             !stop.stop_requested()) {
             stage_word.wait(word, std::memory_order_seq_cst);
             LinkBump(counters.stage_sleeps);
+            if (reason == StageWait::Input) {
+                LinkBump(counters.stage_input_sleeps);
+            }
         }
         stage_sleeping.store(false, std::memory_order_relaxed);
     }
@@ -1675,6 +1689,7 @@ void MemoryStageLink::Take(Snapshot& out) const noexcept {
     out.served_ns = load(counters.served_ns);
     out.back_sleeps = load(counters.back_sleeps);
     out.stage_sleeps = load(counters.stage_sleeps);
+    out.stage_input_sleeps = load(counters.stage_input_sleeps);
     for (size_t i = 0; i < out.checks.size(); ++i) {
         out.checks[i] = load(counters.checks[i]);
     }
@@ -1771,12 +1786,13 @@ void MemoryStageLink::LogStats() {
     LOG_INFO(HW_GPU,
              "Memory stage link (FRITCHII_MEMSTAGE_THREAD={}) {:.0f} s: hand-offs {:.0f}/s ({}); "
              "the back waited {:.1f} ms/s ({:.2f} us a hand-off, slept {:.0f}/s), GPUMem ran "
-             "{:.1f} ms/s and slept {:.0f}/s; served syncs {:.0f}/s ({:.2f} ms/s on the back); "
-             "must be 0: {}{}",
+             "{:.1f} ms/s and slept {:.0f}/s ({:.0f}/s waiting for the front); served syncs "
+             "{:.0f}/s ({:.2f} ms/s on the back); must be 0: {}{}",
              mode, seconds, rate(total_calls), calls_text, ms(call_ns), per(call_ns, total_calls),
              rate(current.back_sleeps - reported.back_sleeps),
              ms(current.stage_ns - reported.stage_ns),
              rate(current.stage_sleeps - reported.stage_sleeps),
+             rate(current.stage_input_sleeps - reported.stage_input_sleeps),
              rate(current.served - reported.served), ms(current.served_ns - reported.served_ns),
              total_checks, checks_text);
     if (mode == 2) {
