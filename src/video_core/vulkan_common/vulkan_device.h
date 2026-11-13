@@ -23,6 +23,7 @@
 
 VK_DEFINE_HANDLE(VmaAllocator)
 VK_DEFINE_HANDLE(VmaPool)
+struct VmaBudget;
 
 // Define all features which may be used by the implementation here.
 // Vulkan version in the macro describes the minimum version required for feature availability.
@@ -1186,6 +1187,14 @@ FN_MAX_LIMIT_LIST
     u64 GetDeviceMemoryUsage() const;
     /// GetDeviceMemoryUsage without EXP29's reuse: always asks the driver.
     u64 QueryDeviceMemoryUsage() const;
+    /// The last GetDeviceMemoryUsage() answer.
+    [[nodiscard]] u64 LastDeviceMemoryUsage() const noexcept {
+        return memory_usage_value.load(std::memory_order_relaxed);
+    }
+
+    /// The buffer allocator's heap budgets as its user published them (vulkan_device.cpp).
+    void BufferHeapBudgets(VmaBudget* budgets) const;
+    void PublishBufferHeapBudgets() const;
 
     /// The driver's current memory budget for this process (VK_EXT_memory_budget), in
     /// GetDeviceMemoryUsage() terms: the usage at which the main device-local heap reaches its
@@ -1388,6 +1397,10 @@ private:
     VkInstance instance;         ///< Vulkan instance.
     VmaAllocator allocator{};    ///< VMA allocator.
     VmaAllocator buffer_allocator{}; ///< See GetBufferAllocator; null when not split.
+    /// BufferHeapBudgets: per heap block count, allocation count, block bytes, allocation bytes,
+    /// usage, budget; and the allocator's operation count they were taken at.
+    mutable std::array<std::array<std::atomic<u64>, 6>, VK_MAX_MEMORY_HEAPS> buffer_budgets{};
+    mutable std::atomic<u64> buffer_budget_ops{~u64{0}};
     bool allocator_thread_safe{}; ///< See IsAllocatorThreadSafe.
     mutable std::mutex separate_pools_mutex;
     /// [allocator: main, buffers][SeparatePool][memory type]

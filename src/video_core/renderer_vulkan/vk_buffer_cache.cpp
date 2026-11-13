@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "video_core/buffer_cache/buffer_cache_base.h"
+#include "video_core/memory_stage_link.h"
 #include "video_core/nx2_async_readback.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_perf.h"
@@ -473,6 +474,11 @@ u64 BufferCacheRuntime::GetDeviceLocalMemory() const {
 }
 
 u64 BufferCacheRuntime::GetDeviceMemoryUsage() const {
+    if (VideoCommon::MemoryStageLink::OnStageThread()) [[unlikely]] {
+        // The memory stage's thread never asks the main allocator (spec 5.3): the back's last
+        // answer, which it takes at least once a frame (TickFrame).
+        return device.LastDeviceMemoryUsage();
+    }
     return device.GetDeviceMemoryUsage();
 }
 
@@ -579,6 +585,13 @@ void BufferCacheRuntime::WaitSubmittedTick(u64 stamp, u64 writer) {
     if (clock.IsFree(stamp)) {
         return;
     }
+    if (VideoCommon::MemoryStageLink::InCall()) [[unlikely]] {
+        // A sync the memory stage's thread must never reach (spec 5.7): the back serves it.
+        VideoCommon::MemoryStageLink::Note(VideoCommon::MemoryStageLink::Check::FrontWaitOnStage,
+                                           "WaitSubmittedTick");
+        MemStage::OnBack([&] { WaitSubmittedTick(stamp, writer); });
+        return;
+    }
     auto& master = scheduler.GetMasterSemaphore();
     const u64 tick = clock.TickOf(stamp);
     // The split's front waits for the GPU: the back runs meanwhile what the front sent, also the
@@ -631,6 +644,12 @@ u64 BufferCacheRuntime::SubmitForHostRead() {
 
 void BufferCacheRuntime::WaitForHostRead(u64 stamp) {
     if (clock.IsFree(stamp)) {
+        return;
+    }
+    if (VideoCommon::MemoryStageLink::InCall()) [[unlikely]] {
+        VideoCommon::MemoryStageLink::Note(VideoCommon::MemoryStageLink::Check::FrontWaitOnStage,
+                                           "WaitForHostRead");
+        MemStage::OnBack([&] { WaitForHostRead(stamp); });
         return;
     }
     auto& master = scheduler.GetMasterSemaphore();
@@ -745,11 +764,13 @@ bool BufferCacheRuntime::BindMultiRangeStorageBuffer(u64 key, bool is_written) {
         return false;
     }
     // A sync: Get can take the submit mutex, bind sparse memory and wait for a fence.
-    const MultiRangeRef ref = [&] {
+    // On the memory stage's thread the back serves it (MemStage::OnBack).
+    MultiRangeRef ref{};
+    MemStage::OnBack([&] {
         MemStage::SyncScope sync{&mem_stage, MemStage::Sync::MultiRange};
-        return multi_range_buffers.Get(device, clock, memory_allocator, key, multi_range_sources,
-                                       multi_range_total);
-    }();
+        ref = multi_range_buffers.Get(device, clock, memory_allocator, key, multi_range_sources,
+                                      multi_range_total);
+    });
     if (ref.handle == VK_NULL_HANDLE) {
         return false;
     }

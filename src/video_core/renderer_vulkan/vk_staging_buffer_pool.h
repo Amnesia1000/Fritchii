@@ -72,7 +72,14 @@ public:
         recycler.UseClock(clock_);
     }
 
+    /// The buffer cache's own pool (FRITCHII_MEMSTAGE_SPLIT_ALLOC): its requests are checked
+    /// against the cache's user (memory stage spec 5.1).
+    void MarkCacheSide() noexcept {
+        cache_side = true;
+    }
+
 private:
+    bool cache_side{};
     struct StreamBufferCommit {
         size_t upper_bound;
         u64 tick;

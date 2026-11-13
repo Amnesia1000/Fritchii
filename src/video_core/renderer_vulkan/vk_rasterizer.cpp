@@ -578,6 +578,10 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
     scheduler.SetQueryCache(query_cache);
     // The memory seam's read log asks this cache's tracker.
     mem_stage.Attach(buffer_cache);
+    if (split_buffer_staging) {
+        // The memory stage's thread checks who requests from the cache's own pool.
+        split_buffer_staging->MarkCacheSide();
+    }
     VideoCommon::FritchiiDrawKinds::Init();
     // EDEN_NX2_MEMSTAGE_STATS: stream writes are tested against the texture cache's pages.
     VideoCommon::MemStageStats::SetImagePageFilters(&texture_cache.page_filter,
@@ -596,14 +600,15 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
                 rasterizer->texture_cache_runtime.DestroyIdlePooledImages(2);
             }
             // EXP104: evicted pool buffers go the same way, whatever EXP104 is now (switching it
-            // off evicts everything). The allocator stays on the back's thread. With
-            // FRITCHII_MEMSTAGE_SPLIT_ALLOC the buffer cache's recycler first, then the back's:
-            // still at most 2 a call.
+            // off evicts everything). With FRITCHII_MEMSTAGE_SPLIT_ALLOC the buffer cache's
+            // recycler first, then the back's: still at most 2 a call. The first is the buffer
+            // allocator's, so it runs on the cache's thread (memory stage spec 5.2: GPUMem by
+            // hand-off at FRITCHII_MEMSTAGE_THREAD=1); the second stays on the back.
             if (VideoCommon::GpuSplit::InIdleWait()) {
                 BufferRecycler& buffers = rasterizer->buffer_staging_pool.Recycler();
                 BufferRecycler& others = rasterizer->staging_pool.Recycler();
                 if (buffers.HasDoomed()) {
-                    buffers.DestroyIdle(2);
+                    rasterizer->mem_stage.CacheIdle([&buffers] { buffers.DestroyIdle(2); });
                 } else if (others.HasDoomed()) {
                     others.DestroyIdle(2);
                 }

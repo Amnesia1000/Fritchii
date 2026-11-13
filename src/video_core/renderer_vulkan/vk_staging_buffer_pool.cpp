@@ -18,6 +18,7 @@
 #include "video_core/buffer_churn_stats.h"
 #include "video_core/churn_counters.h"
 #include "video_core/gpu_split.h"
+#include "video_core/memory_stage_link.h"
 #include "video_core/memstage_stats.h"
 #include "video_core/nx2_debug_control.h"
 #include "common/logging.h"
@@ -132,6 +133,9 @@ StagingBufferPool::~StagingBufferPool() = default;
 
 StagingBufferRef StagingBufferPool::Request(size_t size, MemoryUsage usage, bool deferred,
                                             VideoCommon::BufferChurnStats::StagingCaller caller) {
+    if (cache_side) {
+        VideoCommon::MemoryStageLink::CheckCacheUser(VideoCommon::MemoryStageLink::Check::StagingUser);
+    }
     if (!deferred && usage == MemoryUsage::Upload && size <= region_size) {
         return GetStreamBuffer(size, caller);
     }
