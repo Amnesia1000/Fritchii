@@ -23,6 +23,7 @@
 #include "common/div_ceil.h"
 #include "common/scratch_buffer.h"
 #include "common/settings.h"
+#include "video_core/buffer_cache/mem_read_log.h"
 #include "video_core/compatible_formats.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/guest_memory.h"
@@ -1530,6 +1531,10 @@ boost::container::small_vector<SwizzleParameters, 16> FullUploadSwizzles(const I
 void SwizzleImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
                   std::span<const BufferImageCopy> copies, std::span<const u8> memory,
                   Common::ScratchBuffer<u8>& tmp_buffer) {
+    // The memory seam (SEAM 2/3): a guest write between a held fill and its draw is checked.
+    if (MemReadLog::g_held.load(std::memory_order_relaxed)) [[unlikely]] {
+        MemReadLog::NoteGuestWrite(gpu_memory, gpu_addr, CalculateGuestSizeInBytes(info));
+    }
     const bool is_pitch_linear = info.type == ImageType::Linear;
     for (const BufferImageCopy& copy : copies) {
         if (is_pitch_linear) {

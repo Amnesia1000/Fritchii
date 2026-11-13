@@ -132,13 +132,6 @@ Buffer::Buffer(BufferCacheRuntime& runtime, DAddr cpu_addr_, u64 size_bytes_,
 void Buffer::MarkUsage(u64 offset, u64 size) noexcept {
     tracker.Track(offset, size);
     last_usage_tick = clock->Now();
-    MemStage::NoteMarked(this);
-}
-
-void Buffer::Restamp(u64 from) noexcept {
-    if (last_usage_tick == from) {
-        last_usage_tick = clock->Now();
-    }
 }
 
 VkBufferView Buffer::View(u32 offset, u32 size, VideoCore::Surface::PixelFormat format) {

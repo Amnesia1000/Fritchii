@@ -63,4 +63,15 @@ inline void Range(Kind kind, u64 address, u64 size) {
     }
 }
 
+/// A held packet exists (SEAM 2/3): the texture cache's guest writes are tested against its fill.
+inline std::atomic<bool> g_held{false};
+
+void NoteGuestWrite(Tegra::MemoryManager& memory, u64 gpu_addr, u64 size);
+
+inline void GuestWrite(Tegra::MemoryManager& memory, u64 gpu_addr, u64 size) {
+    if (g_held.load(std::memory_order_relaxed)) [[unlikely]] {
+        NoteGuestWrite(memory, gpu_addr, size);
+    }
+}
+
 } // namespace VideoCommon::MemReadLog

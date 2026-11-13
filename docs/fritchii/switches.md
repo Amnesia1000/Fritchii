@@ -315,8 +315,9 @@ fable_memstage_step2_spec.md 7.2): what the buffer cache side's stamps are.
   the stream ring's lazy region stamps, EXP104's recycler, write ticks, extent probes, list
   page copies, host read flushes. The GPU thread publishes at the end of every scheduler
   tick "every number up to N was recorded in tick K"; a stamp is free when its tick is
-  complete. Numbers whose entries still wait for their play stay open past a tick's end, so
-  an early fill (EXP123 = 2) needs no tick guard. Deleted buffers wait their 8 frames and also
+  complete. Numbers whose entries still wait for their play stay open past a tick's end (a
+  held packet's until its PlayRest), which is what makes EXP123 = 2 and 3 safe: they need
+  1 or 2 here and run as EXP123 = 1 without it. Deleted buffers wait their 8 frames and also
   their packet. The stream uniform reuse compares a close count instead of the tick. On one
   thread every answer is the scheduler's. With FRITCHII_MEMSTAGE_SPLIT_ALLOC=0 the texture
   cache's staging (the shared pool) gets packet stamps too, right on one thread.
@@ -1094,7 +1095,9 @@ buffers), fills by site with entries each, syncs by kind, and entries run outsid
 kind. Compare 0 and 1 with profile_toggle.py ("back us a draw", heavy-phase market, 4 cycles).
 
 EXP123 = 2 (sub-step 2b, spec 4 and 6.2): as 1, and each draw and dispatch is filled once,
-before the texture work. The draw's fill (MemStage::FillDraw, at the rasterizer's draw site after
+before the texture work. Needs FRITCHII_MEMSTAGE_TICKS=1 or 2 (boot): without packet ticks 2 and
+3 run as 1, logged once ("SEAM 2/3 need FRITCHII_MEMSTAGE_TICKS=1 (or 2); running SEAM 1") and
+counted in frames on the "Memory seam" line. The draw's fill (MemStage::FillDraw, at the rasterizer's draw site after
 the vertex repack layout) runs SetUniformBuffersState, every prepared stage's storage binds, the
 texture buffer unbinds, UpdateGraphicsBuffers, BindHostGeometryBuffers and every stage's
 BindHostStageBuffers; the dispatch's (MemStage::FillDispatch, before ComputePipeline::Configure)
@@ -1102,19 +1105,27 @@ the uniform state, the storage binds and shader hash, the texture buffer unbinds
 UpdateComputeBuffers and BindHostComputeBuffers. Configure no longer calls the buffer cache: it
 plays the packet's sections where the calls were (the geometry after the texture buffer binds,
 each stage after Acquire and before its image descriptors, the dispatch's section before its
-image descriptors). When Configure returns, true or false, whatever is left is played (the cache
+image descriptors). A sync inside the fill (the multi-range bind, the kept words wait) plays only
+what it needs (copies, uploads, barriers, conversions); the index, vertex and xfb binds and the
+descriptors wait for the packet's plays. When Configure ends, true, false or by an exception (a
+scope guard at the call site, MemStage::RestAtEnd), whatever is left is played (the cache
 believes those uploads are on their way); descriptors left then are dropped with the draw.
 Descriptor entries take the pipeline's form (descriptor buffer or not), as the fill runs before
 Acquire. Pipelines with texture or image buffers keep their fill in Configure as with 1
 ("late fill": the binds need the texture cache's views). The indirect dispatch's ObtainBuffer, the
 extent probes, list page copies and draw indirect buffers stay where they are (fill and play at
-the call, as with 1). The tick guard (5.5): when the scheduler submitted between a packet's fill
-and a play, the play gives the buffer cache's staging buffers stamped with the fill's tick and
-the buffers the fill marked used the current tick (counted "tick moved", the first 16 logged with
-the caller of the submit; expected near 0; off with FRITCHII_MEMSTAGE_TICKS, whose stamps are
-packet numbers). The stats line gets a "memory seam 2b" line: held and
-late fill draws and dispatches a second, packets not held (arena busy on another thread), tick
-moved, rest plays (and descriptors dropped), descriptor form mismatches (must be 0), and fill
+the call, as with 1). There is no tick guard: packet ticks keep a held packet's numbers open.
+"Flushed while held" (5.5) counts held packets whose fill and PlayRest are in different command
+buffers (a flush or finish in between, syncs included; the first 16 logged with the caller):
+expected near 0, as a vertex binding the fill did not see dirty is not bound again in the new
+command buffer. Texture writes while held: the texture cache writes game memory inside Configure
+(GC downloads, EXP121's landed downloads, a flushed download), after the early fill read. Each
+held fill keeps the device ranges it read (uniform copies, uploads, bound ranges, storage and
+table addresses); every such write is counted, and a write over one of those ranges is counted
+apart and the first 16 logged as "Memory seam: texture write over fill read". That count must
+read 0 for 2 to be exact. The stats line gets a "memory seam 2b" line: held and
+late fill draws and dispatches a second, packets not held (arena busy on another thread), flushed
+while held, texture writes while held (over fill reads, must be 0), rest plays (and descriptors dropped), descriptor form mismatches (must be 0), and fill
 and play time with EDEN_NX2_GPU_PROFILE. The GPU profile gets two zones, "memory fill" (every fill
 at 2, the buffer cache's own work included: what leaves the back in step 6) and "memory play".
 FRITCHII_MEMSTAGE_READ_LOG adds the read log (5.3). Compare 1 and 2 with profile_toggle.py

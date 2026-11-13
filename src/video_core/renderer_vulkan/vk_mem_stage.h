@@ -32,13 +32,11 @@ class MemoryManager;
 
 namespace Vulkan {
 
-class Buffer;
 struct BufferCacheParams;
 class Device;
 class MemoryAllocator;
 class MemPlayer;
 class Scheduler;
-class StagingBufferPool;
 
 class MemStage {
 public:
@@ -144,7 +142,6 @@ public:
     };
     struct DrawPacket {
         u64 number;
-        u64 fill_tick;
         u32 flags;
         u32 repack_mask;
         u32 repack_dirty;
@@ -159,7 +156,6 @@ public:
     };
     struct DispatchPacket {
         u64 number;
-        u64 fill_tick;
         u32 flags;
         Span before;
         Span descriptors;
@@ -350,13 +346,12 @@ public:
     void BeginDraw(u32 repack_mask, u32 repack_dirty);
     void BeginDispatch();
 
-    /// The cache whose ranges the read log asks about and the staging pool the tick guard
-    /// restamps (the buffer cache's own).
-    void Attach(Cache& cache, StagingBufferPool& staging_pool) noexcept;
+    /// The cache whose ranges the read log asks about.
+    void Attach(Cache& cache) noexcept;
 
     /// SEAM = 2: the draw's whole fill, before the texture work. Null when the draw is not held
     /// (another SEAM, texel buffers: LateFill, or the arena busy on another thread); Configure
-    /// then fills where the calls are. A held packet is always played whole: PlayRestAfter.
+    /// then fills where the calls are. A held packet is always played whole: RestAtEnd.
     const DrawPacket* FillDraw(Cache& cache, const DrawFacts& facts, bool is_indexed);
     /// SEAM = 2: the dispatch's `before` section, before Configure. Null as for FillDraw.
     const DispatchPacket* FillDispatch(Cache& cache, const DispatchFacts& facts);
@@ -372,23 +367,25 @@ public:
     void PlayHeld(Span span);
     /// Plays what is left of the held packet (descriptors left out) and ends it.
     void PlayRest();
-    /// PlayRest, then `configured`: for Configure's call site.
-    bool PlayRestAfter(bool configured) {
-        PlayRest();
-        return configured;
-    }
+
+    /// PlayRest when Configure ends: every return, true or false, and an exception.
+    class RestAtEnd {
+    public:
+        explicit RestAtEnd(MemStage& stage_) noexcept : stage{stage_} {}
+        ~RestAtEnd() {
+            stage.PlayRest();
+        }
+        RestAtEnd(const RestAtEnd&) = delete;
+        RestAtEnd& operator=(const RestAtEnd&) = delete;
+
+    private:
+        MemStage& stage;
+    };
 
     /// The descriptor form the runtime's descriptor entries take: the held fill's pipeline's
     /// (it runs before Acquire), else the queue's.
     [[nodiscard]] bool DescriptorForm(bool queue_form) const noexcept {
         return fill_form < 0 ? queue_form : fill_form != 0;
-    }
-
-    /// Buffer::MarkUsage: the buffers a held fill stamps (the tick guard restamps them).
-    static void NoteMarked(Buffer* buffer) {
-        if (t_marked != nullptr) [[unlikely]] {
-            t_marked->push_back(buffer);
-        }
     }
 
     enum class Value : u8 {
@@ -466,6 +463,7 @@ private:
     friend void VideoCommon::MemReadLog::NoteValue(VideoCommon::MemReadLog::Kind,
                                                    Tegra::MemoryManager*, u64, u64, u32);
     friend void VideoCommon::MemReadLog::NoteRange(VideoCommon::MemReadLog::Kind, u64, u64);
+    friend void VideoCommon::MemReadLog::NoteGuestWrite(Tegra::MemoryManager&, u64, u64);
 
     enum class HeldKind : u8 { None, Draw, Dispatch };
 
@@ -495,7 +493,18 @@ private:
 
     inline static thread_local ReadLog* t_log = nullptr;
 
-    inline static thread_local std::vector<Buffer*>* t_marked = nullptr;
+    /// A device range a held fill read (any kind), for the texture write check.
+    struct ReadRange {
+        u64 begin;
+        u64 end;
+        VideoCommon::MemReadLog::Kind kind;
+    };
+    inline static thread_local std::vector<ReadRange>* t_reads = nullptr;
+    static void NoteRead(VideoCommon::MemReadLog::Kind kind, u64 address, u64 size) {
+        if (t_reads != nullptr && size != 0) {
+            t_reads->push_back({address, address + size, kind});
+        }
+    }
 
     struct Part {
         const void* data;
@@ -532,7 +541,10 @@ private:
         u64 held_dispatches{};
         u64 late_dispatches{};
         u64 unheld{};
-        u64 tick_moved{};
+        u64 held_flushed{};
+        u64 seam_clamped{};
+        u64 texture_writes{};
+        u64 texture_overlaps{};
         u64 rest_plays{};
         u64 rest_descriptors{};
         u64 form_mismatch{};
@@ -564,6 +576,8 @@ private:
     bool ClaimHeld();
     void UpdateUnplayed();
     void TakeHeld(HeldKind kind);
+    struct HeldFillEnd;
+    void EndHeldFill();
     void CheckHeld();
     void PlayHeldTo(u32 end, bool rest);
     bool StartReadLog(ReadLog& log, u64 number);
@@ -579,24 +593,26 @@ private:
     /// FRITCHII_MEMSTAGE_READ_LOG: every Nth packet's reads are compared, 0 off
     int read_log_every{};
     Cache* cache{};
-    StagingBufferPool* staging_pool{};
+    /// SEAM 2/3 asked for without packet ticks: run as SEAM 1 (logged once).
+    bool clamp_logged{};
 
     HeldKind held{HeldKind::None};
     bool filling_held{};
+    HeldKind filling_kind{HeldKind::None};
+    /// The held packet saw a flush between its fill and its PlayRest (counted once).
+    bool held_flush_seen{};
     s8 fill_form{-1};
     Arena held_arena;
     u32 held_cursor{};
     bool held_form{};
     std::array<u64, 2> held_hashes{};
-    std::vector<Buffer*> marked;
-    std::vector<Buffer*> held_marked;
+    std::vector<ReadRange> held_reads;
     ReadLog op_log;
     ReadLog held_log;
     bool held_log_pending{};
     u64 op_fills{};
     std::vector<u8> compare_scratch;
     std::atomic<u32> diffs_logged{};
-    std::atomic<u32> ticks_logged{};
     bool claim_deferring{};
     bool pending{};
     u32 play_cursor{};
@@ -631,7 +647,10 @@ private:
         std::atomic<u64> held_dispatches{};
         std::atomic<u64> late_dispatches{};
         std::atomic<u64> unheld{};
-        std::atomic<u64> tick_moved{};
+        std::atomic<u64> held_flushed{};
+        std::atomic<u64> seam_clamped{};
+        std::atomic<u64> texture_writes{};
+        std::atomic<u64> texture_overlaps{};
         std::atomic<u64> rest_plays{};
         std::atomic<u64> rest_descriptors{};
         std::atomic<u64> form_mismatch{};
