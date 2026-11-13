@@ -26,6 +26,7 @@
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/fritchii_draw_kinds.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/nx2_qmd_prediction.h"
@@ -353,6 +354,9 @@ size_t Maxwell3D::EstimateIndexBufferSize() {
 
 void Maxwell3D::ConsumeSinkImpl(Core::System& system) {
     const VideoCommon::Nx2Profile::FineScope profile_scope{VideoCommon::Nx2Profile::Zone::Sink};
+    if (VideoCommon::FritchiiDrawKinds::g_on) [[unlikely]] {
+        VideoCommon::FritchiiDrawKinds::NoteWrites(method_sink.size());
+    }
     const auto control = shadow_state.shadow_ram_control;
     // Sunk methods are state writes only (not in execution_mask): skip unchanged values, as
     // CallMethod does.
@@ -381,6 +385,9 @@ void Maxwell3D::ApplyPairs(Core::System& system, const u64* pairs, u32 count) {
     // EDEN_NX2_RING_PAIRS: state writes the front would have sunk (never in execution_mask),
     // applied as ConsumeSinkImpl applies the sink. The shadow RAM mode cannot change inside a
     // block: shadow_ram_control is executable, and any other entry ends the block.
+    if (VideoCommon::FritchiiDrawKinds::g_on) [[unlikely]] {
+        VideoCommon::FritchiiDrawKinds::NoteWrites(count);
+    }
     const auto control = shadow_state.shadow_ram_control;
     const bool track = control == Regs::ShadowRamControl::Track ||
                        control == Regs::ShadowRamControl::TrackWithFilter;
@@ -757,6 +764,9 @@ void Maxwell3D::TraceFirstMethodWrite(u32 method, u32 argument) {
 }
 
 void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call) {
+    if (VideoCommon::FritchiiDrawKinds::g_on) [[unlikely]] {
+        VideoCommon::FritchiiDrawKinds::NoteWrites(1);
+    }
     if (VideoCommon::Nx2Profile::Enabled()) [[unlikely]] {
         return ProfiledCallMethod(system, method, method_argument, is_last_call);
     }
@@ -939,6 +949,9 @@ void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods,
     }
     // Counted and timed as CallMethod counts and times each word (EDEN_NX2_GPU_PROFILE).
     const VideoCommon::Nx2Profile::SampledScope scope{VideoCommon::Nx2Profile::Zone::Method, count};
+    if (VideoCommon::FritchiiDrawKinds::g_on) [[unlikely]] {
+        VideoCommon::FritchiiDrawKinds::NoteWrites(count);
+    }
     const bool profile = VideoCommon::Nx2Profile::Enabled();
     // As CallMethodFast for each word: the first may issue a deferred draw, before any upload.
     for (u32 i = 0; i < count; ++i) {
@@ -1067,6 +1080,20 @@ void Maxwell3D::CallMultiMethod(Core::System& system, u32 method, const u32* bas
     RecordWrite(method, amount ? base_start[0] : 0, amount, methods_pending);
     // Methods after 0xE00 are special, they're actually triggers for some microcode that was
     // uploaded to the GPU during initialization.
+    // FRITCHII_DRAW_KINDS: the words written here (the default path counts them in CallMethod).
+    if (VideoCommon::FritchiiDrawKinds::g_on) [[unlikely]] {
+        constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+        const bool per_word =
+            method < MacroRegistersStart && method - cb_data >= 16 &&
+            method != MAXWELL3D_REG_INDEX(inline_data) &&
+            ((method != MAXWELL3D_REG_INDEX(draw_inline_index) &&
+              method != MAXWELL3D_REG_INDEX(inline_index_2x16.even) &&
+              method != MAXWELL3D_REG_INDEX(inline_index_4x8.index0)) ||
+             shadow_state.shadow_ram_control == Regs::ShadowRamControl::Replay);
+        if (!per_word) {
+            VideoCommon::FritchiiDrawKinds::NoteWrites(amount);
+        }
+    }
     if (method >= MacroRegistersStart) {
         ProcessMacro(system, method, base_start, amount, amount == methods_pending);
         return;
@@ -1170,6 +1197,17 @@ void Maxwell3D::ProcessQueryGet() {
         static_cast<VideoCommon::QueryType>(regs.report_semaphore.query.report.Value());
     const u32 payload = regs.report_semaphore.payload;
     const u32 subreport = regs.report_semaphore.query.sub_report;
+    // FRITCHII_DRAW_KINDS: a sample count report marks the draw before it.
+    if (VideoCommon::FritchiiDrawKinds::g_on) [[unlikely]] {
+        using Report = Regs::ReportSemaphore::Report;
+        using Operation = Regs::ReportSemaphore::Operation;
+        const Report report = regs.report_semaphore.query.report;
+        const Operation operation = regs.report_semaphore.query.operation;
+        if ((report == Report::ZPassPixelCount || report == Report::ZPassPixelCount64) &&
+            (operation == Operation::Release || operation == Operation::ReportOnly)) {
+            VideoCommon::FritchiiDrawKinds::NoteZPassReport();
+        }
+    }
     if (VideoCommon::Nx2FastDrawCount::g_on) [[unlikely]] {
         // Ported fix: the release lands in guest memory (a short one the payload, a long one the
         // 16-byte report), noted as constant data.
@@ -4030,6 +4068,9 @@ void Maxwell3D::ApplyFrontDelta(Core::System& system, const u64* writes, u32 cou
     ConsumeSink(system);
     if (VideoCommon::Nx2Profile::Enabled()) [[unlikely]] {
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::MethodWrites, count);
+    }
+    if (VideoCommon::FritchiiDrawKinds::g_on) [[unlikely]] {
+        VideoCommon::FritchiiDrawKinds::NoteWrites(count);
     }
     const auto control = shadow_state.shadow_ram_control;
     const bool track = control == Regs::ShadowRamControl::Track ||
