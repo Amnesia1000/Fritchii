@@ -30,9 +30,11 @@
 // ever played by the thread that pushed them.
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 
 #include <boost/container/static_vector.hpp>
@@ -89,10 +91,30 @@ const T* PayloadAt(const MemStage::Entry& entry, u32 offset) noexcept {
 }
 
 /// Where an entry executed at once is written: per thread, reused for every push.
+// One scratch arena per nesting level of immediate pushes: an Exec that pushed again on the same
+// thread would otherwise reset (or grow and free) the arena holding the entry it is still
+// reading. No path does that today (review of 2a); this keeps it safe if one appears.
+thread_local u32 t_scratch_depth = 0;
+
 MemStage::Arena& Scratch() {
-    thread_local MemStage::Arena arena{4096};
-    return arena;
+    constexpr u32 Levels = 4;
+    thread_local std::array<std::unique_ptr<MemStage::Arena>, Levels> arenas;
+    ASSERT_MSG(t_scratch_depth < Levels, "memory seam: immediate pushes nested too deep");
+    auto& slot = arenas[t_scratch_depth];
+    if (!slot) {
+        slot = std::make_unique<MemStage::Arena>(4096);
+    }
+    return *slot;
 }
+
+struct ScratchDepth {
+    ScratchDepth() noexcept {
+        ++t_scratch_depth;
+    }
+    ~ScratchDepth() {
+        --t_scratch_depth;
+    }
+};
 
 void HostReadBarrier(vk::CommandBuffer cmdbuf) {
     const VkMemoryBarrier barrier{
@@ -427,6 +449,7 @@ void MemStage::PushParts(Cmd kind, u8 flags, u32 count, std::initializer_list<Pa
         return;
     }
     PlayDepth depth;
+    const ScratchDepth scratch_depth;
     player.Exec(*reinterpret_cast<const Entry*>(out));
 }
 
