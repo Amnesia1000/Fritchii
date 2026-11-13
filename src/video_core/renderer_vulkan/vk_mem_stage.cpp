@@ -3577,6 +3577,12 @@ u64 SeamClock::SubmitForHostRead(std::source_location location) {
 //   split:     a number handed out in two ticks without a carry (a tick ended without a close).
 //              Must be 0.
 //   unchecked: stamps older than the ring.
+//   (step 7) splits that raced the tick advance: a split by one tick of a number above the
+//              `open` the close of the first tick saw (a stamp taken on the other thread between
+//              that close and the tick's advance). Reported, not a failure; the rest of the
+//              splits stay must be 0. Carried ranges are kept until older than the stamp ring.
+//   (step 7) stamps on a number already published: a stamp whose number a close published
+//              before it was taken (its use would be freed early). Must be 0.
 //   epoch off: Epoch() differed from the scheduler's tick. Must be 0. (With step 7's window,
 //              GPUMem's reads one apart from the tick race a close, which bumps the epoch just
 //              before the tick advances: counted apart as "GPUMem's epoch reads racing a close".)
@@ -3651,19 +3657,31 @@ void SeamTicks::Close(u64 tick) {
         lower(ring_oldest(ring_context));
     }
     u64 last;
+    u64 open_seen;
     if (unplayed != 0) {
         last = unplayed - 1;
+        open_seen = open.load(std::memory_order_acquire);
         Bump(counters.carried);
         if (verify) {
-            const u64 to = open.load(std::memory_order_acquire);
+            const u64 to = open_seen;
             carried_ranges.push_back(Range{.from = unplayed, .to = to});
-            if (carried_ranges.size() > 1024) {
+            // Dropped by number, once older than the stamp ring (a stamp there is unchecked
+            // anyway), not by count: with the window open nearly every close carries.
+            while (!carried_ranges.empty() && carried_ranges.front().to + StampSlots < to) {
                 carried_ranges.pop_front();
             }
             carried_to.store(to, std::memory_order_release);
         }
     } else {
         last = open.fetch_add(1, std::memory_order_acq_rel);
+        open_seen = last;
+    }
+    if (verify) {
+        // The split check's "raced the tick advance": the `open` this close saw, by its tick.
+        close_opens.push_back(CloseOpen{.tick = tick, .open = open_seen});
+        if (close_opens.size() > 4096) {
+            close_opens.pop_front();
+        }
     }
     if (last > published.load(std::memory_order_relaxed)) {
         ring.push_back(Published{.last = last, .tick = tick});
@@ -3725,6 +3743,19 @@ void SeamTicks::NoteHeld(u64 newly_held) noexcept {
 }
 
 void SeamTicks::NoteStamp(u64 number) noexcept {
+    // The real case of a split, caught where it happens (Fable's split answer): a stamp on a
+    // number a close published already. Its use is recorded later than that close's tick, so it
+    // would be freed early. Must be 0 (it does not depend on ticks).
+    if (number != 0 && number <= published.load(std::memory_order_acquire)) [[unlikely]] {
+        Bump(counters.stamp_published);
+        if (g_ticks_logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+            LOG_WARNING(Render_Vulkan,
+                        "Memory seam ticks: a stamp on packet {}, published already (published up "
+                        "to {}, open {})",
+                        number, published.load(std::memory_order_relaxed),
+                        open.load(std::memory_order_relaxed));
+        }
+    }
     StampSlot& slot = slots[number & (StampSlots - 1)];
     const u64 tick = master->CurrentTick();
     if (slot.number.load(std::memory_order_acquire) != number) {
@@ -3761,6 +3792,18 @@ bool SeamTicks::OldTick(u64 stamp, u64& tick) {
         return false;
     }
     if (first != last) {
+        // "Raced the tick advance" (reported, not a failure): the stamp was taken on another
+        // thread while the back was between a close and the tick's advance, so it read the old
+        // tick for a number the close of that tick did not publish (above the `open` it saw).
+        if (first + 1 == last) {
+            std::scoped_lock lock{mutex};
+            const auto close = std::ranges::find_if(
+                close_opens, [first](const CloseOpen& entry) { return entry.tick == first; });
+            if (close != close_opens.end() && stamp > close->open) {
+                Bump(counters.split_raced);
+                return false;
+            }
+        }
         Bump(counters.split);
         if (g_ticks_logged.fetch_add(1, std::memory_order_relaxed) < 16) {
             LOG_WARNING(Render_Vulkan,
@@ -3860,6 +3903,8 @@ void SeamTicks::Take(Snap& out) const noexcept {
     out.split = counters.split.load(std::memory_order_relaxed);
     out.epoch_off = counters.epoch_off.load(std::memory_order_relaxed);
     out.epoch_racing = counters.epoch_racing.load(std::memory_order_relaxed);
+    out.stamp_published = counters.stamp_published.load(std::memory_order_relaxed);
+    out.split_raced = counters.split_raced.load(std::memory_order_relaxed);
 }
 
 void SeamTicks::LogStats() {
@@ -3899,11 +3944,15 @@ void SeamTicks::LogStats() {
         }
         LOG_INFO(Render_Vulkan,
                  "  memory seam ticks check: early {}, late {}; {}; carried skipped {}, split {}, "
-                 "unchecked {}, epoch off {}; GPUMem's epoch reads racing a close {}",
+                 "unchecked {}, epoch off {}; GPUMem's epoch reads racing a close {}; splits that "
+                 "raced the tick advance {} (reported); stamps on a number already published {} "
+                 "(must be 0)",
                  early, late, checks, current.carried_skipped - reported.carried_skipped,
                  current.split - reported.split, current.unchecked - reported.unchecked,
                  current.epoch_off - reported.epoch_off,
-                 current.epoch_racing - reported.epoch_racing);
+                 current.epoch_racing - reported.epoch_racing,
+                 current.split_raced - reported.split_raced,
+                 current.stamp_published - reported.stamp_published);
     }
     reported = current;
 }

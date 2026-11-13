@@ -204,6 +204,13 @@ private:
     std::atomic<bool> per_thread{false};
     static inline thread_local u64 t_stamp = 0;
     static inline thread_local bool t_stamp_stage = false;
+    /// The `open` each recent close saw, by tick (the split check's "raced the tick advance";
+    /// with the verify, under the lock).
+    struct CloseOpen {
+        u64 tick;
+        u64 open;
+    };
+    std::deque<CloseOpen> close_opens;
     alignas(64) std::atomic<u64> free_number{0};
     std::atomic<u64> advanced_gpu{0};
     std::atomic<u64> published{0};
@@ -227,6 +234,8 @@ private:
         std::atomic<u64> split{};
         std::atomic<u64> epoch_off{};
         std::atomic<u64> epoch_racing{}; ///< GPUMem's reads one apart from a close (step 7)
+        std::atomic<u64> stamp_published{}; ///< a stamp on a number already published (must be 0)
+        std::atomic<u64> split_raced{};     ///< a split that raced the tick advance (reported)
     };
     Counters counters;
     struct Snap {
@@ -242,6 +251,8 @@ private:
         u64 split{};
         u64 epoch_off{};
         u64 epoch_racing{};
+        u64 stamp_published{};
+        u64 split_raced{};
     };
     void Take(Snap& out) const noexcept;
     Snap reported{};
