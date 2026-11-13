@@ -242,17 +242,33 @@ enum class Fed : u32 { QueuedPlain, LandedPending, Bound, Count };
 
 constexpr std::array<const char*, static_cast<size_t>(Source::Count)> source_names{
     "not a QMD", "inline QMD", "patched inline QMD", "overlay from memory", "upload shadow",
-    "memory", "memory after a wait", "overlay from memory (not checked for the feed)"};
+    "memory", "memory after a wait", "overlay from memory (not checked for the feed)",
+    "overlay from memory (the stamped overflow queued)", "memory, checked"};
+
+/// The sources EXP127 = 2 adds to the feed (fable_fence_writers_brief piece 2), with
+/// EDEN_NX2_FEED_MEMORY_OVERLAY on. Overlays from memory built while the ranged overflow was the
+/// only unbounded writer queued: its writes are stamped by GPU and device address (EXP126 = 1),
+/// and the overlay was built only with no stamp over the QMD newer than the back. Plain memory
+/// reads past the same guards as an overlay from memory (mapped, not GPU-written, no inline QMD
+/// of it queued or evicted, no stamp over it newer than the back) and its belt (no unbounded
+/// writer queued): the back reads the same bytes unless something outside the stream writes the
+/// QMD in between, the overlays' exposure too.
+constexpr std::array<Source, 2> NewSources{Source::OverlayFromMemoryOverflow,
+                                           Source::MemoryChecked};
+bool NewFeedSource(Source source) {
+    return std::ranges::find(NewSources, source) != NewSources.end() && FeedMemoryOverlays();
+}
 
 /// Provenance gating (6f (b) 3): what the feed takes predictions from until the audit is clean
 /// for the others. Overlays from memory with EDEN_NX2_FEED_MEMORY_OVERLAY (fable_answer_pair_2
 /// section 2): built only from a guarded read (no queued write noted over the QMD, not
 /// GPU-written, no inline QMD of it queued or evicted, no unbounded writer queued), and verified
-/// by the back like every other record.
+/// by the back like every other record. EXP127 = 2: NewFeedSource's too.
 bool FeedSource(Source source) {
     return source == Source::Other || source == Source::InlineOverlay ||
            source == Source::PatchedOverlay || source == Source::Shadow ||
-           (source == Source::OverlayFromMemory && FeedMemoryOverlays());
+           (source == Source::OverlayFromMemory && FeedMemoryOverlays()) ||
+           (FeedSourcesMode() == 2 && NewFeedSource(source));
 }
 
 /// For the audit at a turn-off: the word, the offending record (sequence; position, decisions
@@ -492,6 +508,28 @@ struct State {
     u64 session_audit_checked{};
     u64 session_audit_wrong{};
     u32 audit_logged{};
+    /// EXP127 (fable_fence_writers_brief piece 2): the back's check of the QMD records by their
+    /// source: matched, payload differs, and unpredicted (by the source of the copy's last read).
+    std::array<std::array<u64, 3>, static_cast<size_t>(Source::Count)> back_by_source{};
+    /// EXP127 = 1: the acquires the feed would have met through NewFeedSource's records, by
+    /// source and by how (Fed), and those decisions, checked as the audit's are (CheckAudit).
+    std::array<std::array<u64, static_cast<size_t>(Fed::Count)>,
+               static_cast<size_t>(Source::Count)>
+        would_fed{};
+    /// 4096 (about 8 s of decisions at the market's rate), checked every 256 decisions as well
+    /// as at each report, so none leaves the ring unjudged (they turn unknown after 2 s);
+    /// `would_dropped` counts those that do anyway.
+    std::array<Decision, 4096> would_audit{};
+    u64 would_audit_count{};
+    u64 would_checked{};
+    u64 would_wrong{};
+    u64 would_unknown{};
+    u64 would_dropped{};
+    u64 session_would_checked{};
+    u64 session_would_wrong{};
+    u32 would_logged{};
+    /// EXP127 = 2: the acquires fed through NewFeedSource's records, by source.
+    std::array<u64, static_cast<size_t>(Source::Count)> fed_through{};
 
     /// Re-reads the pending violations (of `device` only, if given): recovered once the word
     /// reached the bound, never recovered after 100 ms.
@@ -544,6 +582,7 @@ struct State {
         }
         CheckLost();
         CheckAudit(now);
+        CheckWouldAudit(now);
         // Bounds whose newest folded record never landed (dropped from the table, or far late).
         for (size_t i = 0; i < feed_check_count;) {
             if (now - feed_checks[i].since >= std::chrono::seconds{2}) {
@@ -648,10 +687,13 @@ struct State {
                      fed_rate(Fed::LandedPending, 0), fed_rate(Fed::LandedPending, 1),
                      fed_rate(Fed::Bound, 0), fed_rate(Fed::Bound, 1), fed_checks_passed,
                      fed_checks_violated, fed_checks_unverified, fed_checks_full,
-                     feed_check_count, not_fed_source[static_cast<size_t>(Source::Memory)],
+                     feed_check_count,
+                     not_fed_source[static_cast<size_t>(Source::Memory)] +
+                         not_fed_source[static_cast<size_t>(Source::MemoryChecked)],
                      not_fed_source[static_cast<size_t>(Source::Waited)],
                      not_fed_source[static_cast<size_t>(Source::OverlayFromMemory)] +
-                         not_fed_source[static_cast<size_t>(Source::OverlayFromMemoryUnchecked)],
+                         not_fed_source[static_cast<size_t>(Source::OverlayFromMemoryUnchecked)] +
+                         not_fed_source[static_cast<size_t>(Source::OverlayFromMemoryOverflow)],
                      audit_checked, audit_wrong, audit_unknown, session_audit_checked,
                      session_audit_wrong, mode == 3 ? "narrow" : "full",
                      rate(not_fed_nonsimple), narrow_share, deferred_events,
@@ -664,6 +706,43 @@ struct State {
                      FeedMemoryOverlays() ? 1 : 0, rate(fed_memory_overlay),
                      not_fed_source[static_cast<size_t>(Source::OverlayFromMemoryUnchecked)],
                      mirrored(Mirror::OverlayFromMemoryUnbounded));
+        }
+        if (const int sources_mode = FeedSourcesMode(); sources_mode != 0 && MirrorMode()) {
+            // fable_fence_writers_brief piece 2: the back's check by source, and what the new
+            // sources would meet (1) or met (2).
+            std::string checks;
+            for (size_t i = 1; i < back_by_source.size(); ++i) {
+                checks += fmt::format("{}{} {:.0f}/{:.0f}/{:.0f}", checks.empty() ? "" : ", ",
+                                      source_names[i], rate(back_by_source[i][0]),
+                                      rate(back_by_source[i][1]), rate(back_by_source[i][2]));
+            }
+            std::string would;
+            std::string through;
+            for (const Source source : NewSources) {
+                const size_t i = static_cast<size_t>(source);
+                would += fmt::format("{}{} {:.0f}/{:.0f}/{:.0f}", would.empty() ? "" : ", ",
+                                     source_names[i], rate(would_fed[i][0]),
+                                     rate(would_fed[i][1]), rate(would_fed[i][2]));
+                through += fmt::format("{}{} {:.0f}", through.empty() ? "" : ", ",
+                                       source_names[i], rate(fed_through[i]));
+            }
+            LOG_INFO(HW_GPU,
+                     "QMD feed sources (EXP127={}, EXP126={}): back checks of QMD records by "
+                     "source, /s matched/payload differs/unpredicted (by the copy's last read): "
+                     "{}; overlays from memory built/s with only the stamped ranged overflow "
+                     "queued {:.0f}; QMD reads/s from memory (nothing queued over them) with no "
+                     "unbounded writer queued {:.0f}, with one {:.0f}, GPU-written by then "
+                     "{:.0f}; acquires/s the feed would "
+                     "meet through the new sources "
+                     "(queued plain/run unlanded/bound): {}; those checked at their landing: {} "
+                     "right, {} wrongly met, {} unknown, {} dropped unchecked (session {} "
+                     "checked, {} wrongly met); acquires/s fed through them: {}",
+                     sources_mode, VideoCore::Nx2Debug::Experiment(126), checks,
+                     mirrored(Mirror::OverlayFromMemoryOverflow),
+                     mirrored(Mirror::MemoryChecked), mirrored(Mirror::MemoryUnbounded),
+                     mirrored(Mirror::MemoryGpuWritten), would,
+                     would_checked - would_wrong, would_wrong, would_unknown, would_dropped,
+                     session_would_checked, session_would_wrong, through);
         }
         if (MirrorMode()) {
             LOG_INFO(HW_GPU,
@@ -788,6 +867,10 @@ struct State {
         plain_gates = {};
         not_fed_source = {};
         audit_checked = audit_wrong = audit_unknown = 0;
+        back_by_source = {};
+        would_fed = {};
+        would_checked = would_wrong = would_unknown = would_dropped = 0;
+        fed_through = {};
         not_fed_nonsimple = 0;
         fed_memory_overlay = 0;
         deferred_events = 0;
@@ -1161,6 +1244,30 @@ struct State {
 
     /// EXP13=3, each report: the decisions whose record has landed since, against the value it
     /// landed with; those whose record left the table, or did not land in 2 s, are unknown.
+    /// A decision against its record: still to land, unknown (left the table, or not landed in
+    /// 2 s), met by the value it landed with, or not. Marks it checked once judged.
+    enum class Judged { Pending, Unknown, Right, Wrong };
+    Judged Judge(Decision& decision, Clock::time_point now, const Prediction*& record) const {
+        record = nullptr;
+        for (const Prediction& way : predictions[Bucket(decision.device)]) {
+            if (way.position != 0 && way.sequence == decision.sequence) {
+                record = &way;
+                break;
+            }
+        }
+        if (record == nullptr || !record->landed) {
+            if (record == nullptr || now - decision.when >= std::chrono::seconds{2}) {
+                decision.checked = true;
+                return Judged::Unknown;
+            }
+            return Judged::Pending;
+        }
+        decision.checked = true;
+        return Meets(CompareOf(decision.operation), decision.value, record->landed_value)
+                   ? Judged::Right
+                   : Judged::Wrong;
+    }
+
     void CheckAudit(Clock::time_point now) {
         const u64 stored = (std::min<u64>)(audit_count, audit.size());
         for (u64 i = 0; i < stored; ++i) {
@@ -1169,23 +1276,17 @@ struct State {
                 continue;
             }
             const Prediction* record = nullptr;
-            for (const Prediction& way : predictions[Bucket(decision.device)]) {
-                if (way.position != 0 && way.sequence == decision.sequence) {
-                    record = &way;
-                    break;
-                }
-            }
-            if (record == nullptr || !record->landed) {
-                if (record == nullptr || now - decision.when >= std::chrono::seconds{2}) {
-                    decision.checked = true;
-                    ++audit_unknown;
-                }
+            const Judged judged = Judge(decision, now, record);
+            if (judged == Judged::Pending) {
                 continue;
             }
-            decision.checked = true;
+            if (judged == Judged::Unknown) {
+                ++audit_unknown;
+                continue;
+            }
             ++audit_checked;
             ++session_audit_checked;
-            if (Meets(CompareOf(decision.operation), decision.value, record->landed_value)) {
+            if (judged == Judged::Right) {
                 continue;
             }
             ++audit_wrong;
@@ -1205,6 +1306,55 @@ struct State {
 
     void Audit(const Decision& decision) {
         audit[audit_count++ % audit.size()] = decision;
+    }
+
+    /// EXP127 = 1: the feed would have met an acquire through a record of `source`
+    /// (NewFeedSource). Counted and checked like a decision, nothing else.
+    void WouldFeed(Source source, const Decision& decision) {
+        ++would_fed[static_cast<size_t>(source)][static_cast<size_t>(decision.kind)];
+        if (would_audit_count % 256 == 0) {
+            CheckWouldAudit(decision.when);
+        }
+        Decision& slot = would_audit[would_audit_count++ % would_audit.size()];
+        would_dropped += would_audit_count > would_audit.size() && !slot.checked ? 1 : 0;
+        slot = decision;
+    }
+
+    /// EXP127 = 1, each report: CheckAudit for WouldFeed's decisions.
+    void CheckWouldAudit(Clock::time_point now) {
+        const u64 stored = (std::min<u64>)(would_audit_count, would_audit.size());
+        for (u64 i = 0; i < stored; ++i) {
+            Decision& decision = would_audit[i];
+            if (decision.checked) {
+                continue;
+            }
+            const Prediction* record = nullptr;
+            const Judged judged = Judge(decision, now, record);
+            if (judged == Judged::Pending) {
+                continue;
+            }
+            if (judged == Judged::Unknown) {
+                ++would_unknown;
+                continue;
+            }
+            ++would_checked;
+            ++session_would_checked;
+            if (judged == Judged::Right) {
+                continue;
+            }
+            ++would_wrong;
+            ++session_would_wrong;
+            if (would_logged < 8) {
+                ++would_logged;
+                LOG_ERROR(HW_GPU,
+                          "QMD feed sources (EXP127=1) audit: an acquire the feed would have met "
+                          "wrongly on device {:#x}: op {} value {:#x}, by {} {:#x}, the word "
+                          "landed {:#x}",
+                          decision.device, decision.operation, decision.value,
+                          decision.kind == Fed::Bound ? "the bound" : "a release",
+                          decision.expected, record->landed_value);
+            }
+        }
     }
 
     /// EXP13=3: events lost to full rings make the marks and matches unreliable.
@@ -1695,7 +1845,15 @@ void ApplyVerify(State& state, const VerifyEvent& event, bool retry, bool last_t
         return;
     }
     const size_t index = static_cast<size_t>(writer);
+    // EXP127: by source (0 matched, 1 payload differs, 2 unpredicted, by the copy's last read).
+    const auto by_source = [&](size_t outcome) {
+        if (writer == Writer::Qmd) {
+            const Source source = found != nullptr ? found->source : state.last_read_source;
+            ++state.back_by_source[static_cast<size_t>(source)][outcome];
+        }
+    };
     if (reduction) {
+        by_source(!found ? 2 : found->payload == payload ? 0 : 1);
         if (!found) {
             ++state.unpredicted_reductions;
             log_unpredicted();
@@ -1733,6 +1891,7 @@ void ApplyVerify(State& state, const VerifyEvent& event, bool retry, bool last_t
     if (found) {
         found->matched = true;
     }
+    by_source(!found ? 2 : found->payload == payload ? 0 : 1);
     if (!found) {
         ++state.unpredicted[index];
         log_unpredicted();
@@ -2128,6 +2287,14 @@ bool Feed(const AcquireCheck& check, bool resume, FedRelease* fed) {
         } else if (!FeedSource(newest.source)) {
             stop(PlainGate::Source);
             ++state.not_fed_source[static_cast<size_t>(newest.source)];
+            // EXP127 = 1: what 2 would do here (the gate below included).
+            if (FeedSourcesMode() == 1 && NewFeedSource(newest.source) &&
+                !(narrow && newest.writer == Writer::Qmd && !newest.simple)) {
+                state.WouldFeed(newest.source,
+                                {check.device, newest.sequence, newest.position, Clock::now(),
+                                 check.value, check.operation, newest.payload,
+                                 queued ? Fed::QueuedPlain : Fed::LandedPending, false});
+            }
             return false;
         } else if (narrow && newest.writer == Writer::Qmd && !newest.simple) {
             stop(PlainGate::NotSimple);
@@ -2137,6 +2304,8 @@ bool Feed(const AcquireCheck& check, bool resume, FedRelease* fed) {
             const Fed kind = queued ? Fed::QueuedPlain : Fed::LandedPending;
             ++state.fed[static_cast<size_t>(kind)][resumed];
             state.fed_memory_overlay += newest.source == Source::OverlayFromMemory ? 1 : 0;
+            state.fed_through[static_cast<size_t>(newest.source)] +=
+                NewFeedSource(newest.source) ? 1 : 0;
             if (fed != nullptr) {
                 *fed = {.payload = newest.payload,
                         .position = newest.position,
@@ -2158,19 +2327,44 @@ bool Feed(const AcquireCheck& check, bool resume, FedRelease* fed) {
     if (!folded.ok || folded.bound.value < check.value) {
         return false;
     }
-    for (size_t i = 0; i < count; ++i) {
-        if (!records[i]->landed && !FeedSource(records[i]->source)) {
-            ++state.not_fed_source[static_cast<size_t>(records[i]->source)];
-            return false;
-        }
-    }
     // The narrow feed: an unlanded record of a dependency-waiting QMD on the word, whose timing
     // is the uncertain thing, means no feed.
-    for (size_t i = 0; narrow && i < count; ++i) {
-        if (!records[i]->landed && records[i]->writer == Writer::Qmd && !records[i]->simple) {
-            ++state.not_fed_nonsimple;
-            return false;
+    const auto nonsimple_unlanded = [&] {
+        for (size_t i = 0; narrow && i < count; ++i) {
+            if (!records[i]->landed && records[i]->writer == Writer::Qmd && !records[i]->simple) {
+                return true;
+            }
         }
+        return false;
+    };
+    // The first unlanded record of a source the feed refuses, and whether EXP127 = 2 takes all
+    // of them (NewFeedSource).
+    const Prediction* refused = nullptr;
+    bool all_new = true;
+    for (size_t i = 0; i < count; ++i) {
+        if (!records[i]->landed && !FeedSource(records[i]->source)) {
+            refused = refused != nullptr ? refused : records[i];
+            all_new = all_new && NewFeedSource(records[i]->source);
+        }
+    }
+    if (refused != nullptr) {
+        ++state.not_fed_source[static_cast<size_t>(refused->source)];
+        // EXP127 = 1: what 2 would do here (the narrow gate included; 2 may still find the check
+        // table full).
+        if (FeedSourcesMode() == 1 && all_new && !nonsimple_unlanded()) {
+            u64 position = 0;
+            for (size_t i = 0; i < count; ++i) {
+                position = records[i]->sequence == folded.newest ? records[i]->position : position;
+            }
+            state.WouldFeed(refused->source,
+                            {check.device, folded.newest, position, Clock::now(), check.value,
+                             check.operation, folded.bound.value, Fed::Bound, false});
+        }
+        return false;
+    }
+    if (nonsimple_unlanded()) {
+        ++state.not_fed_nonsimple;
+        return false;
     }
     if (state.feed_check_count == state.feed_checks.size()) {
         ++state.fed_checks_full;
@@ -2184,6 +2378,12 @@ bool Feed(const AcquireCheck& check, bool resume, FedRelease* fed) {
     for (size_t i = 0; i < count; ++i) {
         if (!records[i]->landed && records[i]->source == Source::OverlayFromMemory) {
             ++state.fed_memory_overlay;
+            break;
+        }
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (!records[i]->landed && NewFeedSource(records[i]->source)) {
+            ++state.fed_through[static_cast<size_t>(records[i]->source)];
             break;
         }
     }

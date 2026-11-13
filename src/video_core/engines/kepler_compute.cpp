@@ -103,9 +103,11 @@ struct FrontQmdMirror {
         /// patch: replacing it raises `evicted`.
         bool inline_qmd;
         bool patched; ///< An upload wrote over it since
-        /// From memory: built in a feed mode with EDEN_NX2_FEED_MEMORY_OVERLAY on and no
-        /// unbounded writer queued over the QMD (QueuedGuestWriters), so the feed may take it.
-        bool feed_checked;
+        /// From memory: the source its reads give. OverlayFromMemory when built in a feed mode
+        /// with EDEN_NX2_FEED_MEMORY_OVERLAY on and no unbounded writer queued over the QMD
+        /// (QueuedGuestWriters), so the feed may take it; OverlayFromMemoryOverflow (EXP127) when
+        /// that writer was the stamped ranged overflow alone; else OverlayFromMemoryUnchecked.
+        VideoCommon::QmdPrediction::Source memory_source;
         NativeQmdScheduler::Descriptor words;
     };
     static constexpr size_t MaxOverlays = 256; ///< the original has 64; OoT keeps more in flight
@@ -236,7 +238,9 @@ struct FrontQmdMirror {
     }
 
     void AddOverlay(const void* space, GPUVAddr address, u64 position, const u32* words,
-                    bool inline_qmd, bool feed_checked = false) {
+                    bool inline_qmd,
+                    VideoCommon::QmdPrediction::Source memory_source =
+                        VideoCommon::QmdPrediction::Source::OverlayFromMemoryUnchecked) {
         Overlay* slot = nullptr;
         for (Overlay& overlay : overlays) {
             if (overlay.position != 0 && overlay.address == address && overlay.space == space) {
@@ -261,7 +265,7 @@ struct FrontQmdMirror {
         slot->position = position;
         slot->inline_qmd = inline_qmd;
         slot->patched = false;
-        slot->feed_checked = feed_checked;
+        slot->memory_source = memory_source;
         std::memcpy(slot->words.data(), words, sizeof(slot->words));
     }
 
@@ -379,10 +383,12 @@ std::string ProbeFrontQmd(u64 qmd) {
     if (read == g_front_qmd.reads.end() || read->second.space == nullptr) {
         return text + "; no read noted";
     }
-    constexpr std::array<const char*, 8> sources{"not a QMD", "inline QMD", "patched inline QMD",
-                                                 "overlay from memory", "upload shadow",
-                                                 "memory", "memory after a wait",
-                                                 "overlay from memory (not checked for the feed)"};
+    constexpr std::array<const char*, 10> sources{
+        "not a QMD",           "inline QMD",
+        "patched inline QMD",  "overlay from memory",
+        "upload shadow",       "memory",
+        "memory after a wait", "overlay from memory (not checked for the feed)",
+        "overlay from memory (the stamped overflow queued)", "memory, checked"};
     constexpr std::array<const char*, 13> causes{
         "none", "noted write", "writer range", "3D ranged write", "unbounded writer",
         "unranged writer", "queued function", "3D method write", "unknown noted write",
@@ -3010,11 +3016,9 @@ bool KeplerCompute::FrontReadQmd(VideoCommon::GpuSplit& split, u64 address,
     if (overlay_ok && (!shadow_ok || overlay->position >= block_position)) {
         descriptor = overlay->words;
         compare_at_1(Served::Overlay, false);
-        info.source = !overlay->inline_qmd
-                          ? (overlay->feed_checked ? Prediction::Source::OverlayFromMemory
-                                                   : Prediction::Source::OverlayFromMemoryUnchecked)
-                      : overlay->patched ? Prediction::Source::PatchedOverlay
-                                         : Prediction::Source::InlineOverlay;
+        info.source = !overlay->inline_qmd ? overlay->memory_source
+                      : overlay->patched   ? Prediction::Source::PatchedOverlay
+                                           : Prediction::Source::InlineOverlay;
         Prediction::NoteMirror(Prediction::Mirror::Overlay);
         return true;
     }
@@ -3084,6 +3088,30 @@ bool KeplerCompute::FrontReadQmd(VideoCommon::GpuSplit& split, u64 address,
         Prediction::NoteWait(cause, what);
     } else {
         Prediction::NoteMirror(Prediction::Mirror::Memory);
+        // EXP127 not 0 (fable_fence_writers_brief 2b): this read passed the guards an overlay
+        // from memory passes (mapped, not GPU-written, no inline QMD of it queued or evicted: its
+        // overlay would serve or set the target, no stamp over it newer than `done`); with the
+        // overlays' belt too (no unbounded writer queued; the stamped overflow as at the patch)
+        // its records get a source the feed takes with EXP127 = 2. Asked only when it could.
+        // Only with EXP126 not 0: at 0 ranged writes are stamped and scanned by GPU address
+        // only, so a write through another GPU address of the same memory would be missed.
+        // The GPU-written check above ran before `done` was loaded: a GPU writer of these bytes
+        // the back ran in between is at or below `done`, past the stamps and the belt, so it is
+        // asked again now (the read below follows it).
+        if (Prediction::FeedSourcesMode() != 0 && Prediction::FeedRequested() &&
+            Prediction::FeedMemoryOverlays() &&
+            VideoCommon::GpuSplit::OverflowFloorMode() != 0) {
+            if (Nx2MayBeGpuWritten(*device, size)) {
+                Prediction::NoteMirror(Prediction::Mirror::MemoryGpuWritten);
+            } else if (split.QueuedGuestWriters(done, address, *device, size, {},
+                                                split.OverflowFloorOff())
+                           .unbounded == 0) {
+                info.source = Prediction::Source::MemoryChecked;
+                Prediction::NoteMirror(Prediction::Mirror::MemoryChecked);
+            } else {
+                Prediction::NoteMirror(Prediction::Mirror::MemoryUnbounded);
+            }
+        }
     }
     memory_manager.ReadBlockUnsafe(address, descriptor.data(), size);
     compare_at_1(Served::Memory, waited);
@@ -3305,16 +3333,26 @@ void KeplerCompute::FrontPatchOverlays(VideoCommon::GpuSplit& split, FrontState&
         // every writer the front notes; one that may write anything (a compute or copy writer
         // without a range, an unranged writer, a scan past what is remembered) keeps the
         // overlay's records out of the feed. Asked only when the feed could take them.
-        bool feed_checked = false;
+        // EXP127 not 0 with EXP126 = 1 (fable_fence_writers_brief 2a): the ranged overflow is no
+        // such writer. Its dropped writes were stamped by GPU and device address before they
+        // entered the ring (those before the device stamps count still), and the stamp check
+        // above found none over the QMD newer than `done`; only its records' source tells it.
+        auto memory_source = Prediction::Source::OverlayFromMemoryUnchecked;
         if (Prediction::FeedRequested() && Prediction::FeedMemoryOverlays()) {
-            feed_checked =
-                split.QueuedGuestWriters(done, block_address, *device, size).unbounded == 0;
-            if (!feed_checked) {
+            const bool overflow_stamped =
+                Prediction::FeedSourcesMode() != 0 && split.OverflowFloorOff();
+            if (split.QueuedGuestWriters(done, block_address, *device, size, {}, overflow_stamped)
+                    .unbounded != 0) {
                 Prediction::NoteMirror(Prediction::Mirror::OverlayFromMemoryUnbounded);
+            } else if (overflow_stamped && split.RangedOverflowPosition() > done) {
+                memory_source = Prediction::Source::OverlayFromMemoryOverflow;
+                Prediction::NoteMirror(Prediction::Mirror::OverlayFromMemoryOverflow);
+            } else {
+                memory_source = Prediction::Source::OverlayFromMemory;
             }
         }
         mirror.AddOverlay(&memory_manager, block_address, position, qmd.data(), false,
-                          feed_checked);
+                          memory_source);
         Prediction::NoteMirror(Prediction::Mirror::OverlayFromMemory);
         split.NoteQmdPatch(Outcome::Made);
     }

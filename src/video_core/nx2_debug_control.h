@@ -143,7 +143,7 @@ inline std::atomic<int> g_memstage_ahead{-1};
 /// Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP<ExperimentCount - 1>, live
 /// through the debug server. What each one does: docs/fritchii/switches.md; the defaults:
 /// src/common/fritchii_switch_defaults.cpp (LoadExperiments).
-inline constexpr int ExperimentCount = 127;
+inline constexpr int ExperimentCount = 128;
 inline std::atomic<int> g_experiments[ExperimentCount]{};
 /// Set once LoadExperiments has run: Experiment() tests it inline instead of calling
 /// LoadExperiments (a function-local static guard) on every check (0.5% of the back thread in

@@ -1080,6 +1080,12 @@ public:
     /// `skip` don't count); `unbounded`: the newest that may write anything (compute and copy
     /// writers without a range, unranged writers, 3D memory writes without a range, the ranged
     /// ring's overflow, maps, more writes than are remembered). 0 for none.
+    /// `overflow_stamped` (EXP127, fable_fence_writers_brief 2a): the ranged overflow counts only
+    /// for the dropped writes no device stamp covers (those sent before the device stamps
+    /// started; all of them while the stamps are off). Exact only for a caller that has found
+    /// WriteStamp over the same bytes not newer than `done` with EXP126 = 1: every other dropped
+    /// write was stamped by GPU and device address before it entered the ring, so that check
+    /// already says none of them writes these bytes. Its other unbounded writers count as ever.
     struct GuestWriters {
         u64 noted;
         u64 unbounded;
@@ -1092,7 +1098,8 @@ public:
         u64 range_end;
     };
     [[nodiscard]] GuestWriters QueuedGuestWriters(u64 done, GPUVAddr address, u64 device, u64 size,
-                                                  std::span<const u64> skip = {}) const;
+                                                  std::span<const u64> skip = {},
+                                                  bool overflow_stamped = false) const;
     /// EXP13=2/3, the inverse of QueuedGuestWriters (fable_answer_6 6f (c) a): once enabled,
     /// every write the front notes stamps the 256-byte blocks it covers (4 KB pages for ranges
     /// over 16 KB, everything for ranges over 1 MB) with its position, in hashed tables whose

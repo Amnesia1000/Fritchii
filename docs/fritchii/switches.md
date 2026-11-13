@@ -233,7 +233,8 @@ feed takes records whose QMD the copy read from an overlay built from guest memo
 small upload patched over it (QmdPrediction::Source::OverlayFromMemory; OoT's per-dispatch
 12-byte release patch at QMD word 52). Only overlays built while the feed and this switch were
 on and no unbounded writer was queued over the QMD (GpuSplit::QueuedGuestWriters) count; the
-back verifies every release either way (QmdPrediction::Verify). 0 = refused as before.
+back verifies every release either way (QmdPrediction::Verify). 0 = refused as before. EXP127 = 2
+adds sources under this switch (EXP127).
 
 ### EDEN_NX2_QMD_3D_PATCH
 
@@ -1686,7 +1687,8 @@ the ring, so a dropped write is still found over its own bytes, and stamps only 
 collision makes one newer, never older). Unranged 3D writes still count for every address;
 QueuedGuestWriters and the macro DMA reads (MemoryWriterTarget) scan the ring and keep the
 overflow as before. An overlay from memory made while the overflow is queued is kept out of the
-EXP13 feed (its unbounded-writer check sees the overflow). Aliases: with EXP126 not 0 every
+EXP13 feed (its unbounded-writer check sees the overflow; EXP127 not 0 changes that, see
+EXP127). Aliases: with EXP126 not 0 every
 ranged write is stamped by device address as well as by GPU address (the page translated once
 and cached, as NoteWrite does), so a QMD or semaphore read of the same memory through another
 GPU address finds it in WriteStamp (the QMD sites, PatchHolders and the semaphore feed check all
@@ -1754,6 +1756,85 @@ The line gives:
 - EXP126 = 2: reads compared, by what 1 serves (guest memory, an overlay, an upload shadow
   block), how many differed, trial overlays and blocks built, reads not compared and trial
   entries lost (counts for the window).
+
+### EXP127
+
+EXP127 (live, 0 = off, default 0; fable_fence_writers_brief piece 2): QMD sources the EXP13=3/4
+feed refuses today although the copy read them as safely as one it takes. 1 = audit, 2 = on.
+With 0 nothing changes. With 1 and 2 the copy tags the records with the sources below and the
+"QMD feed sources" line (next section) is written; with 1 the feed takes nothing new and counts
+what 2 would have met; with 2 it takes them (EDEN_NX2_FEED_MEMORY_OVERLAY on, as for overlays
+from memory). The value is read at each feed decision, so a record tagged while 1 or 2 was on
+is refused again at 0.
+- Overlays from memory built while the ranged overflow was queued (2a; needs EXP126 = 1). The
+  belt that keeps an overlay from memory out of the feed when an unbounded writer is queued over
+  the QMD (GpuSplit::QueuedGuestWriters, EDEN_NX2_FEED_MEMORY_OVERLAY) counted the ranged ring's
+  overflow as one, so with the back far behind (the market) every such overlay was "not checked"
+  (220 to 233 a second). With EXP127 not 0 and EXP126 = 1 the belt counts the overflow only for
+  the dropped writes no device stamp covers (those sent before the device stamps started; its
+  other unbounded writers count as before), and an overlay that only the overflow kept out gets
+  the source "overlay from memory (the stamped overflow queued)"
+  (QmdPrediction::Source::OverlayFromMemoryOverflow). Why it is exact: the belt is for writers
+  the write stamps cannot see, and the overflow is not one. RangeLastWrite stamps a ranged write
+  by GPU address and, with EXP126 not 0, by device address before it enters the ring, and the
+  overlay is built only when WriteStamp over the QMD (both addresses, with EXP126 = 1 the writes
+  sent before the device stamps as a floor) is not newer than the back's position. So no dropped
+  write still queued writes the QMD's bytes; EXP126's trial compared about 560 reads a window, 0
+  differed. With EXP126 at 0 or 2 the belt is as before.
+- Plain memory reads (2b): a QMD read from guest memory with nothing queued over it
+  (Source::Memory, 174 to 202 refusals a second at the market with EXP126 = 1) passes the guards
+  an overlay from memory passes: mapped, not GPU-written, no inline QMD of it queued or evicted
+  (a queued overlay of it would serve the read or set its target past the back), no upload
+  shadow block of it queued (it would serve the read), no write stamp over it newer than the
+  back. With EXP127 not 0 (EXP13 3 or 4, EDEN_NX2_FEED_MEMORY_OVERLAY on) and EXP126 not 0 (at 0
+  ranged writes are stamped and scanned by GPU address only, so a write through another GPU
+  address of the same memory would be missed) the read asks the GPU-written check again (the
+  first one ran before the back's position was loaded: a GPU writer the back ran in between
+  would be at or below it, past the stamps) and the overlays' belt (QueuedGuestWriters: no
+  unbounded writer queued; the overflow as above with EXP126 = 1); with both clean its records
+  get the source "memory, checked"
+  (QmdPrediction::Source::MemoryChecked). Exact on the same ground as the overlays from memory:
+  the copy reads the QMD at the same signal the back reads it at, so the back reads the same
+  bytes unless something outside the stream (the guest CPU, a read-back landing) writes the QMD
+  in between, and the overlays have that exposure too (their bytes come from memory at the
+  patch, earlier still). The back checks every release against its record, and the feed turns
+  itself off at the first one that differs.
+To judge: one market and one fight window at 1 (the "QMD feed sources" line: the new sources'
+back checks must show 0 payload differs and 0 unpredicted, and their would-be decisions 0
+wrongly met), then profile_toggle.py on EXP127 1 against 2 at the market, heavy phase,
+uncapped, GPU_PROFILE on. At 2 these must stay 0 / on: the EXP13 feed line's "feed on", "0
+violated", "0 wrongly met", "0 not fed (check table full)"; the EXP13 line's "back QMD: ... 0
+payload differs, 0 unpredicted" and "0 resyncs/s". Should move at 2: the feed line's "not fed
+for their QMD source" (from memory, overlays from memory; with 1 these count the new sources
+too, as at 0) and "built/s with an unbounded writer queued" to
+near 0, "met by a queued plain release" up by 80 to 100 a second, the fence writer line's
+readable acquires unmet down by 105 to 120 a second, the EXP13 line's "would be met by a
+predicted queued release" to near 0.
+
+### QMD feed sources line
+
+"QMD feed sources (EXP127=n, EXP126=m)" (HW_GPU, every 5 s with EXP127 not 0 and EXP13 2 to 4):
+- the back's check of the copy's QMD records by the source their QMD was read from, per second
+  as matched/payload differs/unpredicted (an unpredicted release has no record: it counts under
+  the source of the copy's last QMD read), for every source: inline QMD, patched inline QMD,
+  overlay from memory, upload shadow, memory, memory after a wait, overlay from memory (not
+  checked for the feed), overlay from memory (the stamped overflow queued), memory, checked;
+  releases and reductions together;
+- overlays from memory built a second with the stamped overflow as the only unbounded writer
+  queued (with EXP127 not 0 these no longer count in the feed line's "built/s with an unbounded
+  writer queued");
+- QMD reads a second from memory with nothing queued over them (the EXP13 line's "from memory")
+  whose belt was clean ("memory, checked"), those with an unbounded writer queued, and those
+  whose page was GPU-written by the time the back's position was loaded (EXP13 3 or 4 with
+  EDEN_NX2_FEED_MEMORY_OVERLAY on and EXP126 not 0; 0 otherwise);
+- EXP127 = 1: acquires a second (resume polls included) the feed would have met through the new
+  sources, by source, as queued plain/run but unlanded/reduction bound (the plain and narrow
+  gates as at 2; the bound's check table is not asked), and those decisions checked once their
+  record landed as the feed's own audit checks its decisions: right, wrongly met (must be 0; the
+  first 8 are logged as errors "QMD feed sources (EXP127=1) audit"), unknown (left the table, or
+  not landed in 2 s), dropped unchecked (the 4,096-decision ring, checked every 256 decisions
+  and at each report, overwrote one not judged yet; should be 0), and session totals;
+- EXP127 = 2: acquires a second fed through the new sources, by source.
 
 ### EXP101
 
