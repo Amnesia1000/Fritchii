@@ -538,7 +538,9 @@ MemStage::Fill::Fill(MemStage& stage_, Site site_, u32 index_)
                 SeamTicks::SetStamp(number, true);
             } else {
                 number = stage.ticks->BeginPacket();
-                SeamTicks::SetStamp(number, Link::OnStageThread());
+                // No GPUMem mark covers it: not a stage stamp, so a leftover one is checked
+                // against `published` if per-thread stamps turn on before the next open.
+                SeamTicks::SetStamp(number, false);
             }
             stage.op_number.store(number, std::memory_order_relaxed);
         }
@@ -799,7 +801,8 @@ void MemStage::BeginDraw(u32 repack_mask, u32 repack_dirty) {
         SeamTicks::SetStamp(draw.number, true); // its stamps carry its number (stamps per thread)
     } else {
         draw.number = ticks ? ticks->BeginPacket() : ++packet_number;
-        SeamTicks::SetStamp(draw.number, Link::OnStageThread());
+        // No GPUMem mark covers it (see Fill::Fill): checked against `published` if left over.
+        SeamTicks::SetStamp(draw.number, false);
     }
     draw.repack_mask = repack_mask;
     draw.repack_dirty = repack_dirty;
