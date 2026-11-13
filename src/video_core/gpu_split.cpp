@@ -1819,6 +1819,18 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 if (available == read_position) {
                     CheckFencesQuiet(read_position);
                 }
+            } else if (available == read_position && idle_hook != nullptr && ring_on &&
+                       MemoryStageLink::Ahead() != 0 &&
+                       hook_requested.load(std::memory_order_seq_cst)) [[unlikely]] {
+                // THREAD=2 with the window open (step 7), the stage busy: a waiter asked for the
+                // hook. Run it as the mid-batch
+                // path below does (its flush needs nothing of the stage; the idle-only parts skip
+                // outside the idle wait), or the back could not sleep while the request stands.
+                hook_requested.store(false, std::memory_order_seq_cst);
+                ForgetFencesQuiet();
+                idle_hook(idle_argument);
+                link.NoteHookFlush();
+                available = limit();
             }
             if (available == read_position) {
                 // Publish bumps `wake` when it sees back_waiting: read it before the last look

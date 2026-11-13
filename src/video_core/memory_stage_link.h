@@ -101,6 +101,13 @@ public:
         /// Step 7: packets in ring B the back has not taken yet; whether ring B has room.
         u64 (*ring_packets)(void* context){};
         bool (*ring_room)(void* context){};
+        /// The back, both threads parked at the ring's start (`end` false) or end: GPUMem's fill
+        /// side starts clean (its unplayed mark 0; at the end its pending entries played first).
+        void (*reset_stage)(void* context, bool end){};
+        /// GPUMem, inside an entry: whether these ranges cover GPU-written buffer data (the page
+        /// bits, then the cache's answer under its lock).
+        bool (*ranges_gpu_written)(void* context, const std::pair<u64, std::size_t>* ranges,
+                                   size_t count){};
     };
 
     [[nodiscard]] static MemoryStageLink& Get() noexcept {
@@ -225,8 +232,8 @@ public:
     /// Values at or above this are unlimited (spec 1.4: 65,536).
     static constexpr u32 AheadUnlimited = 65536;
     /// The back, at a frame end (a level run: GPUMem is parked): the window, in packets. 0 is
-    /// level mode (6b).
-    void SetAhead(u32 packets);
+    /// level mode (6b). `blocked`: a setting the window does not run with (it runs 0 then).
+    void SetAhead(u32 packets, const char* blocked = nullptr);
     /// The window GPUMem uses (read at its loop top; it changes only while GPUMem is parked).
     [[nodiscard]] static u32 Ahead() noexcept {
         return g_ahead.load(std::memory_order_relaxed);
@@ -234,13 +241,39 @@ public:
     /// GPUMem, inside an entry at `position`, outside any fill: waits until the back has run every
     /// entry before it (so every packet before it is played), serving the back's calls meanwhile.
     /// Does nothing in level mode (the stage is level before each entry there) or off GPUMem.
-    void StageLevel(u64 position, LevelReason reason);
+    /// False when GPUMem is stopping (the caller stops its work).
+    bool StageLevel(u64 position, LevelReason reason);
+
+    /// GPUMem, around a lock of the buffer cache taken outside any fill and outside a served
+    /// call: while it waits for the lock, held by the back, it serves the back's call (step 7).
+    class CleanPoint {
+    public:
+        CleanPoint() noexcept : was{t_stage_clean} {
+            t_stage_clean = t_on_stage;
+        }
+        ~CleanPoint() {
+            t_stage_clean = was;
+        }
+        CleanPoint(const CleanPoint&) = delete;
+        CleanPoint& operator=(const CleanPoint&) = delete;
+
+    private:
+        bool was;
+    };
     /// The buffer cache joined a buffer at [address, address + size) into a new one
     /// (BufferCache::JoinOverlap): with the window open GPUMem keeps where (the entry it fills).
     static void NoteBufferJoin(u64 address, u64 size) {
         if (t_on_stage && g_ahead.load(std::memory_order_relaxed) != 0) [[unlikely]] {
             instance.NoteBufferJoinSlow(address, size);
         }
+    }
+    /// BufferCache::JoinOverlap, before a join: whether the window needs the join's GPU-written
+    /// test (GPUMem's own fill, the window open), and then the catch-up it asks for.
+    [[nodiscard]] static bool JoinNeedsTest() noexcept {
+        return t_on_stage && !t_serving_back && g_ahead.load(std::memory_order_relaxed) != 0;
+    }
+    static void JoinOverGpuWritten() {
+        instance.StageJoinCatchUpSlow();
     }
     /// GPUMem, in a call it serves for the back at entry `back_position`: whether a buffer over
     /// [address, address + size) was joined by a fill of a later entry (its copy is in a packet
@@ -339,6 +372,8 @@ public:
     /// The back's idle hook is about to run: false when the stage is busy (the hook is skipped).
     bool BackEnterHook();
     void BackLeaveHook();
+    /// Step 7: the back ran its idle hook from the wait though the stage was busy (a request).
+    void NoteHookFlush() noexcept;
     /// The back drew (DrawManager, every draw, before the render-enable test).
     void NoteBackDraw(const void* engine) noexcept;
     void NoteBackDrawState(const void* engine) noexcept;
@@ -370,6 +405,9 @@ private:
     /// Step 7, GPUMem in its own fill, before a sync goes to the back: the back first plays every
     /// packet before the published position (unless it waits in a call GPUMem must serve first).
     void StageSyncCatchUp();
+    void StageJoinCatchUpSlow();
+    /// The back runs up to the published position; false when it could not (counted).
+    bool StageCatchUp(const char* what);
     bool StageServeCalls();
     bool BecomeBusy(std::stop_token& stop);
     void StageIdle(std::stop_token& stop);
@@ -388,6 +426,8 @@ private:
     static inline thread_local bool t_on_stage{};
     /// GPUMem runs a call the back posted (a served call): its syncs go to the back at once.
     static inline thread_local bool t_serving_back{};
+    /// GPUMem is at a lock site that is a clean point (CleanPoint).
+    static inline thread_local bool t_stage_clean{};
     static inline thread_local bool t_in_call{};
     static inline thread_local bool t_stage_user{};
     static inline thread_local bool t_back_lent{};
@@ -440,6 +480,10 @@ private:
     /// Step 7: the lend's flag hand-over waits for the back's run start (the back is not parked
     /// at a lend with the window open). Written by the stage before it publishes the run.
     bool lend_flags_deferred{};
+    /// Step 7: the window is refused for the session (a sync went to a back that had not played
+    /// the packets ahead of it); the last blocking setting logged.
+    std::atomic<bool> ahead_refused{false};
+    const char* ahead_blocked_logged{};
     /// GPUMem's loop: its stop token while the ring runs, and the window it read last.
     std::stop_token* ring_stop{};
     u32 ring_window{};
@@ -470,7 +514,10 @@ private:
     std::atomic<std::thread::id> stage_thread{};
     /// Bumped while the back waits for a lock GPUMem holds (StageSyncCatchUp gives up then).
     std::atomic<u64> back_contended{0};
-    static void BackContendedHook(std::thread::id holder);
+    static void BackContendedHook(std::thread::id holder, bool first);
+    /// The back's thread id (GPUMem serves the back's call while it waits for a lock it holds).
+    std::atomic<std::thread::id> back_thread{};
+    static void StageContendedHook(std::thread::id holder, bool first);
     /// Back: the run it is in.
     u64 back_run_from{};
     u64 back_draw_seq{};
@@ -519,6 +566,13 @@ private:
         std::atomic<u64> catchups{};
         std::atomic<u64> catchup_ns{};
         std::atomic<u64> deferred_lends{};
+        std::atomic<u64> back_lock_waits{};   ///< the back waited for the lock GPUMem held
+        std::atomic<u64> stage_lock_serves{}; ///< GPUMem served a call while waiting for it
+        std::atomic<u64> join_catchups{};
+        std::atomic<u64> joins_unknown{};     ///< a served download past the join ring's reach
+        std::atomic<u64> write_levels{};      ///< words onto GPU-written data: level at the write
+        std::atomic<u64> hook_flushes{};      ///< the back's skipped idle hook, its flush run
+        std::atomic<u64> stage_idles{};
     };
     Counters counters;
     struct Snapshot {
@@ -557,6 +611,13 @@ private:
         u64 catchups{};
         u64 catchup_ns{};
         u64 deferred_lends{};
+        u64 back_lock_waits{};
+        u64 stage_lock_serves{};
+        u64 join_catchups{};
+        u64 joins_unknown{};
+        u64 write_levels{};
+        u64 hook_flushes{};
+        u64 stage_idles{};
     };
     void Take(Snapshot& out) const noexcept;
     Snapshot reported{};

@@ -197,6 +197,7 @@
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_runahead.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_mem_stage.h"
@@ -525,7 +526,7 @@ MemStage::Fill::Fill(MemStage& stage_, Site site_, u32 index_)
             }
         }
         if (stage.ticks && IsOpSite(site)) {
-            stage.op_number = stage.ticks->BeginPacket();
+            stage.op_number.store(stage.ticks->BeginPacket(), std::memory_order_relaxed);
         }
     }
     begin = stage.OwnedHere() ? stage.arena.Size() : 0;
@@ -587,7 +588,10 @@ MemStage::MemStage(MemPlayer& player_)
     }
     if (const u32 mode = TicksMode(); mode != 0) {
         ticks = std::make_unique<SeamTicks>(player.scheduler.GetMasterSemaphore(), mode == 2);
-        // Ring B's packets are unplayed too: a close asks for the oldest itself (THREAD = 2).
+        // Ring B's packets are unplayed too: a close asks for the oldest itself (THREAD = 2). It
+        // reads the back's cursor: every close runs on the recording thread, the back (GPUMem's
+        // syncs are served there), except Serve's fallback at shutdown, which runs on GPUMem only
+        // once the back has left its loop and touches the cursor no more.
         ticks->SetRingOldest(
             [](void* context) { return static_cast<MemStage*>(context)->RingOldestNumber(); },
             this);
@@ -738,7 +742,7 @@ void MemStage::CloseSection(Site site, u32 index, u32 begin) {
         break;
     default:
         if (t_fill_depth == 1) {
-            op.number = ticks ? op_number : ++packet_number;
+            op.number = ticks ? op_number.load(std::memory_order_relaxed) : ++packet_number;
             op.entries = span;
         }
         break;
@@ -1551,6 +1555,21 @@ void MemStage::EndStageFill() {
     }
 }
 
+void MemStage::ResetStageSide(bool end) {
+    if (end && pending) {
+        // GPUMem's entries left pending by a fill that threw: played on the back, in order,
+        // before anything else is recorded (GPUMem is out of its loop).
+        owner.store(ThisThread(), std::memory_order_relaxed);
+        PlayPending(true);
+        owner.store(0, std::memory_order_release);
+    }
+    stage_fill_from = 0;
+    if (ticks) {
+        ticks->SetStageUnplayed(0);
+        UpdateUnplayed();
+    }
+}
+
 bool MemStage::RingRoom() const noexcept {
     // Several packets can be in flight in level mode: the draws of one entry, and a deferred
     // draw the stage's copy flushed at a sink-bound write, whose packet waits for the back's
@@ -1725,6 +1744,7 @@ void MemStage::TakeRingHeader(const RingHeader& header) {
     held = HeldKind::Draw;
     held_ring = true;
     held_reads.clear();
+    held_flush_seen = false; // the back's packet now (the ring fill leaves it to the back)
     held_log_pending = false;
     t_holding = true;
     VideoCommon::MemReadLog::g_held.store(true, std::memory_order_relaxed);
@@ -2080,16 +2100,16 @@ void MemStage::PlayRest() {
 }
 
 void MemStage::NoteHeldFlush(SeamHook::Use use, const std::source_location& location) {
-    if (held_flush_seen) {
+    if (held_flush_seen.exchange(true)) {
         return;
     }
-    held_flush_seen = true;
     Bump(counters.held_flushed);
     static std::atomic<u32> logged{};
     if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
         // THREAD = 2: a ring packet the back holds is played_draw (GPUMem's fields are its own).
         const bool ring = held_ring && held == HeldKind::Draw;
-        const bool is_draw = ring || (filling_held ? filling_kind : held) == HeldKind::Draw;
+        const bool is_draw =
+            ring || (filling_held.load() ? filling_kind.load() : held) == HeldKind::Draw;
         LOG_WARNING(Render_Vulkan,
                     "Memory seam (5.5): a {}{} between the fill and the PlayRest of {} {}: {}:{} {}",
                     UseName(use), t_play_depth != 0 ? " (in a sync)" : "",
@@ -2904,7 +2924,13 @@ void MemStage::TickThread(int seam) {
     // the new value at its next entry). Packets GPUMem may fill ahead of the back's take; 0 is
     // 6b's level mode, 65,536 and above unlimited (the harness sends 2147483647).
     const int ahead = Debug::SwitchValue(Debug::g_memstage_ahead, "FRITCHII_MEMSTAGE_AHEAD");
-    link.SetAhead(link.Mode() == 2 && ahead > 0 ? static_cast<u32>(ahead) : 0U);
+    // EDEN_NX2_RUNAHEAD applies due CPU-write chunks on the back before each entry: GPUMem would
+    // fill those entries before the chunks are applied. The window runs 0 while it is on.
+    const char* const blocked =
+        VideoCommon::Runahead::CurrentMode() != VideoCommon::Runahead::Mode::Off
+            ? "EDEN_NX2_RUNAHEAD"
+            : nullptr;
+    link.SetAhead(link.Mode() == 2 && ahead > 0 ? static_cast<u32>(ahead) : 0U, blocked);
     const bool full =
         Debug::SwitchValue(Debug::g_memstage_full_binds, "FRITCHII_MEMSTAGE_FULL_BINDS") > 0 ||
         link.Mode() == 2;

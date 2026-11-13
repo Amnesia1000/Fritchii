@@ -1185,6 +1185,7 @@ void RasterizerVulkan::SetRingBackend() {
     };
     backend.bind_channel = [](void* context, s32 bind_id) {
         auto* const self = static_cast<RasterizerVulkan*>(context);
+        const Link::CleanPoint clean;
         std::scoped_lock lock{self->buffer_cache.mutex};
         self->buffer_cache.BindToChannel(bind_id);
     };
@@ -1229,6 +1230,13 @@ void RasterizerVulkan::SetRingBackend() {
     backend.ring_room = [](void* context) {
         return static_cast<RasterizerVulkan*>(context)->mem_stage.RingRoom();
     };
+    backend.reset_stage = [](void* context, bool end) {
+        static_cast<RasterizerVulkan*>(context)->mem_stage.ResetStageSide(end);
+    };
+    backend.ranges_gpu_written = [](void* context, const std::pair<u64, std::size_t>* ranges,
+                                    size_t count) {
+        return static_cast<RasterizerVulkan*>(context)->StageRangesOverGpuWritten({ranges, count});
+    };
     Link::Get().SetRingBackend(backend);
 }
 
@@ -1261,13 +1269,20 @@ bool RasterizerVulkan::StageFillDraw(VideoCommon::MemStageShadowEngine& copy, bo
         // GPU-written marks. Two fills would: a draw that writes buffers (its marks), and the
         // collected constant buffer ranges claiming GPU-written data (their claims). Those fill
         // level: GPUMem first waits for the back to reach this entry (StageLevel).
+        bool going = true;
         if (StageDrawWritesBuffers(copy)) {
-            link.StageLevel(position, Link::LevelReason::WritingDraw);
+            going = link.StageLevel(position, Link::LevelReason::WritingDraw);
         } else if (StageRangesOverGpuWritten(ranges)) {
-            link.StageLevel(position, Link::LevelReason::Claim);
+            going = link.StageLevel(position, Link::LevelReason::Claim);
+        }
+        if (!going) {
+            return false; // GPUMem is stopping: the draw is left to the back
         }
     }
+    // A clean point: while it waits for the lock the back holds, GPUMem serves the back's call.
+    std::optional<Link::CleanPoint> clean{std::in_place};
     std::scoped_lock lock{buffer_cache.mutex};
+    clean.reset();
     // The fill reads the stage's copy (plan 5.4), as at FRITCHII_MEMSTAGE_SHADOW=3.
     const VideoCommon::CacheInputs inputs =
         buffer_cache.StageInputs(copy.regs, copy.state, copy.root_tables,
@@ -1379,6 +1394,7 @@ bool RasterizerVulkan::StageRangesOverGpuWritten(
     if (!maybe) {
         return false;
     }
+    const VideoCommon::MemoryStageLink::CleanPoint clean;
     std::scoped_lock lock{buffer_cache.mutex};
     for (const auto& [addr, size] : ranges) {
         if (buffer_cache.IsRegionGpuModified(addr, size)) {

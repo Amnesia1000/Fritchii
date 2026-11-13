@@ -490,6 +490,9 @@ public:
     [[nodiscard]] bool RingRoom() const noexcept;
     /// GPUMem: its draw's fill is over, packet or not (BeginDraw opened its packet number).
     void EndStageFill();
+    /// The back, both threads parked at the ring's start or end (`end`): GPUMem's fill side starts
+    /// clean; at the end its pending entries (a fill that threw) are played here first.
+    void ResetStageSide(bool end);
     /// Packets in ring B the back has not taken or dropped yet (step 7's window).
     [[nodiscard]] u64 RingPackets() const noexcept {
         return ring_packets_sent.load(std::memory_order_seq_cst) -
@@ -796,10 +799,12 @@ private:
     bool clamp_logged{};
 
     HeldKind held{HeldKind::None};
-    bool filling_held{};
-    HeldKind filling_kind{HeldKind::None};
-    /// The held packet saw a flush between its fill and its PlayRest (counted once).
-    bool held_flush_seen{};
+    /// Atomic (step 7): the arena owner's, read by the other thread's logs and checks.
+    std::atomic<bool> filling_held{};
+    std::atomic<HeldKind> filling_kind{HeldKind::None};
+    /// The held packet saw a flush between its fill and its PlayRest (counted once). Atomic: the
+    /// thread that holds a packet sets it, another thread's sync can reach NoteHeldFlush.
+    std::atomic<bool> held_flush_seen{};
     s8 fill_form{-1};
     Arena held_arena;
     u32 held_cursor{};
@@ -830,7 +835,8 @@ private:
 
     u64 packet_number{};
     std::unique_ptr<SeamTicks> ticks;
-    u64 op_number{};
+    /// Atomic (step 7): an operation's fill can open on any thread (a guest core's invalidation).
+    std::atomic<u64> op_number{};
     /// Packet ticks: the first number of the pending entries and of the held packet (SEAM >= 2).
     u64 pending_from{};
     u64 held_from{};

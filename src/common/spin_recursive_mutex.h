@@ -88,8 +88,9 @@ public:
     /// A thread that may have to work for the holder while it waits for the lock (the memory
     /// stage's back serves GPUMem's syncs, and GPUMem can hold the buffer cache's lock while it
     /// waits for one: FRITCHII_MEMSTAGE_AHEAD). Set per thread; while set, a contended lock calls
-    /// it between tries with the holder's id and never sleeps. Null everywhere else.
-    using ContendedHook = void (*)(std::thread::id holder);
+    /// it between tries with the holder's id (`first`: the first try of this wait) and never
+    /// sleeps. Null everywhere else.
+    using ContendedHook = void (*)(std::thread::id holder, bool first);
     static inline thread_local ContendedHook t_contended_hook = nullptr;
 
 private:
@@ -121,7 +122,7 @@ private:
                         return;
                     }
                 }
-                t_contended_hook(owner.load(std::memory_order_relaxed));
+                t_contended_hook(owner.load(std::memory_order_relaxed), spin == 0);
                 if (spin < SpinCount) {
                     Pause();
                 } else {
