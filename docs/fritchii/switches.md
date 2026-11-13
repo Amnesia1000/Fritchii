@@ -392,8 +392,59 @@ engine, the closure (`call +0x...`: its address in the executable, for the symbo
 constant buffer case; this table is the go/no-go for piece 6b. The first 16 differences of each
 compare are logged as "Memory stage shadow (a/b/c/d)", (b) naming the registers. The stage
 implements the default constant buffer write; with EXP107 on, constant buffer words are level.
-Not covered yet: render_enable.mode is always level (the back asks the query cache), and the
-watched pages leave out shader code and query addresses.
+Not covered yet: the watched pages leave out shader code and query addresses.
+
+Piece 5c (fable_memstage_6b_plan.md sections 2 to 4 and 6.1), in every mode:
+- Classes: pass, work, level ("hard": needs the buffer cache on the back) and neutral (another
+  engine's plain register write). clear_report_value, fragment_barrier, tiled_cache_barrier and
+  report_semaphore.query are pass, except a fence report (Release, short query), which is hard.
+  render_enable.mode is work when the registers decide it (an override, or mode False / True: the
+  stage sets execute_on), else hard. Other engines: only their executable methods are hard. The
+  front's EXP105 command list check is tagged pass; the list draw's address and keep id are a
+  tagged closure (work); the 3D macro data closure (dma_pusher.cpp, IsMemoryDirty) is not sent
+  when the front runs the macro (front macros and the native Turing macro engine: the back never
+  reads it then). A new tag, StageTag::Cache (hard, no copy after), is on no closure yet.
+- Follow: hard entries are applied to the stage's copy as well (the store; falcon[4]'s scratch
+  word), so the copy is taken from the back again ("full copy") only after an entry it cannot
+  follow: an untagged closure, an unknown tag, a 3D macro run on the back, methods before any
+  engine entry. After an undecided render_enable.mode the copy takes execute_on from the back, and
+  after a draw the back issued in a hard entry, an indirect draw or a GPU-counted draw the draw
+  manager's scalar state, both at the next entry.
+- Runs: a run starts at a hard entry and ends after the last hard entry reached through pass and
+  neutral entries; a work entry or a draw ends it.
+- Compare b's dirty flags: only flags 15 to 48 (the buffer cache's: VertexBuffers, VertexBuffer0
+  to 31, IndexBuffer). The copy keeps them as the cache's own state (its stores raise them, a full
+  copy takes the back's, what the back's fill clears is cleared on the copy), and they must be
+  equal at each draw both ways, or a subset of the back's when the state tracker raised them since
+  the back's previous draw. Counted per flag.
+- 3: as 2, and the buffer cache's fills read the stage's copy outside runs (CacheInputs pointing
+  at the copy's registers, bindings, root tables, draw state and flags): at every draw the back
+  issues outside a hard entry whose shadow draw matched, that is not indirect, and whose copy has
+  not changed since the shadow's draw. Otherwise the fill reads the engine as before. The cache's
+  flags 15 to 48 are then the copy's: at a run's start the back's are set to the copy's, inside a
+  run the copy takes the back's at every entry. Needs FRITCHII_MEMSTAGE_FULL_BINDS=1 (the
+  scheduler's flag raises on the back are dropped at the hand-over); while it is off, 3 runs as 2.
+  The flag part of compare b is skipped at 3. A check of the stage's inputs with the real
+  picture: flash-watch route, compare b and the seam's own counters must stay clean.
+Lines every 10 s, with the others: "Memory stage 5c runs" (runs/s, entries per run, neutral
+entries/s, served draws between two runs as a histogram 0, 1, 2-3, 4-7, 8-15, 16+, full copies/s
+and MB/s, the takes, 3D macros run on the back/s, fence reports/s); "Memory stage 5c runs by first
+hard kind" (top 12); "Memory stage 5c full copies by cause" (top 8); "Memory stage 5c
+render_enable.mode by override and mode" (must show only False / True or an override: the
+undecided count must be 0); "Memory stage 5c flags 15-48" (compares, mismatches by flag, at 3
+where the fills read from and why not the copy, and the OoT tracker record check below); and
+"Memory stage 5c gate: pass/fail", the stop thresholds of plan 6.1, read in the market's window:
+runs above 15,000/s, full copies above 2,000/s, or any undecided render_enable.mode in the session.
+
+The OoT temporal trackers (TrackOcarinaCamera, TrackOcarinaActor; plan 5.1) no longer ask the
+buffer cache after the fill when the draw has a packet (EXP123 >= 2): while the trackers are on
+(published at each frame end), the draw's fill adds a record of the vertex stage's uniform slots
+3, 4 and 6 (address, bound size, and whether the bytes the trackers read are GPU-modified) to the
+packet, and the trackers read that. Without a packet (EXP123 < 2, texel buffer draws, the first
+frame) they ask the cache as before. With FRITCHII_MEMSTAGE_SHADOW on, every such draw compares
+the record with today's query ("OoT tracker record vs today's query": mismatches must be 0; the
+first 16 log "Memory stage shadow (OoT trackers)"). The shadow's "diagnostics" draw kind is now a
+frame dump or a trace only.
 
 ### FRITCHII_MEMSTAGE_THREAD
 
