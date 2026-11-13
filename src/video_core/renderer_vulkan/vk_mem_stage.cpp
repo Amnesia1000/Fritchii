@@ -3502,7 +3502,9 @@ u64 SeamClock::SubmitForHostRead(std::source_location location) {
 //   split:     a number handed out in two ticks without a carry (a tick ended without a close).
 //              Must be 0.
 //   unchecked: stamps older than the ring.
-//   epoch off: Epoch() differed from the scheduler's tick. Must be 0.
+//   epoch off: Epoch() differed from the scheduler's tick. Must be 0. (With step 7's window,
+//              GPUMem's reads one apart from the tick race a close, which bumps the epoch just
+//              before the tick advances: counted apart as "GPUMem's epoch reads racing a close".)
 // Deleted buffers held past their frames (buffer_cache.h's ring waits for their stamp as well)
 // are counted with 1 and 2; on one thread they must be 0.
 
@@ -3737,6 +3739,14 @@ void SeamTicks::CheckKnown(u64 stamp, bool free) {
 
 void SeamTicks::CheckEpoch(u64 value) {
     const u64 tick = master->CurrentTick();
+    if (value != tick && Link::OnStageThread() && value + 1 >= tick && value <= tick + 1) {
+        // Step 7: GPUMem reads the epoch while the back closes ticks. Close bumps the epoch just
+        // before the scheduler's tick advances (SubmitExecution), and the tick can advance between
+        // GPUMem's two reads, so one apart is a read racing a close, not an epoch that is off.
+        // (The stream copies' test stays safe: an epoch read a close early only fails a reuse.)
+        Bump(counters.epoch_racing);
+        return;
+    }
     if (value != tick) {
         Bump(counters.epoch_off);
         if (g_ticks_logged.fetch_add(1, std::memory_order_relaxed) < 16) {
@@ -3774,6 +3784,7 @@ void SeamTicks::Take(Snap& out) const noexcept {
     out.unchecked = counters.unchecked.load(std::memory_order_relaxed);
     out.split = counters.split.load(std::memory_order_relaxed);
     out.epoch_off = counters.epoch_off.load(std::memory_order_relaxed);
+    out.epoch_racing = counters.epoch_racing.load(std::memory_order_relaxed);
 }
 
 void SeamTicks::LogStats() {
@@ -3813,10 +3824,11 @@ void SeamTicks::LogStats() {
         }
         LOG_INFO(Render_Vulkan,
                  "  memory seam ticks check: early {}, late {}; {}; carried skipped {}, split {}, "
-                 "unchecked {}, epoch off {}",
+                 "unchecked {}, epoch off {}; GPUMem's epoch reads racing a close {}",
                  early, late, checks, current.carried_skipped - reported.carried_skipped,
                  current.split - reported.split, current.unchecked - reported.unchecked,
-                 current.epoch_off - reported.epoch_off);
+                 current.epoch_off - reported.epoch_off,
+                 current.epoch_racing - reported.epoch_racing);
     }
     reported = current;
 }
