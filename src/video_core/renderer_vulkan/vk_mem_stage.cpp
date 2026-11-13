@@ -304,6 +304,23 @@ u32 TicksMode() {
     return (std::min)(static_cast<u32>(std::atoi(value)), 2U);
 }
 
+/// Entries a sync inside a held fill leaves for the packet's plays: descriptors and the command
+/// buffer's binding state.
+bool WaitsForPlay(MemStage::Cmd kind) {
+    switch (kind) {
+    case MemStage::Cmd::Descriptors:
+    case MemStage::Cmd::BindIndex:
+    case MemStage::Cmd::BindIndexAlways:
+    case MemStage::Cmd::BindVertex:
+    case MemStage::Cmd::BindVertices:
+    case MemStage::Cmd::BindXfb:
+    case MemStage::Cmd::BindXfbs:
+        return true;
+    default:
+        return false;
+    }
+}
+
 bool IsRecord(SeamHook::Use use) {
     switch (use) {
     case SeamHook::Use::Record:
@@ -517,9 +534,12 @@ void MemStage::PlayPending([[maybe_unused]] bool late) {
     PlayDepth depth;
     Bump(counters.plays);
     if (filling_held) [[unlikely]] {
-        // A sync inside a held fill (SEAM = 2): the scheduler work it needs runs now, but the
-        // descriptor entries wait for the packet's plays (no Acquire yet). Played entries are
-        // marked, and the cursor stays at the first descriptor entry left.
+        // A sync inside a held fill (SEAM = 2): what the sync needs (copies, uploads, clears,
+        // barriers, conversions) runs now; the descriptors (no Acquire yet) and the index,
+        // vertex and xfb binds wait for the packet's plays. A bind recorded now would be lost if
+        // the texture work flushes before the draw. Delaying a bind past a copy into the same
+        // buffer is fine (a bind reads nothing); the copies still come before the draw. Played
+        // entries are marked, and the cursor stays at the first entry left.
         u32 first_left = ~0U;
         for (u32 at = play_cursor; at < arena.Size();) {
             Entry& entry = *reinterpret_cast<Entry*>(arena.At(at));
@@ -528,7 +548,7 @@ void MemStage::PlayPending([[maybe_unused]] bool late) {
             if ((entry.flags & Played) != 0) {
                 continue;
             }
-            if (entry.kind == Cmd::Descriptors) {
+            if (WaitsForPlay(entry.kind)) {
                 first_left = (std::min)(first_left, here);
                 continue;
             }

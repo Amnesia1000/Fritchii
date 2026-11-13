@@ -1105,7 +1105,9 @@ the uniform state, the storage binds and shader hash, the texture buffer unbinds
 UpdateComputeBuffers and BindHostComputeBuffers. Configure no longer calls the buffer cache: it
 plays the packet's sections where the calls were (the geometry after the texture buffer binds,
 each stage after Acquire and before its image descriptors, the dispatch's section before its
-image descriptors). When Configure returns, true or false, whatever is left is played (the cache
+image descriptors). A sync inside the fill (the multi-range bind, the kept words wait) plays only
+what it needs (copies, uploads, barriers, conversions); the index, vertex and xfb binds and the
+descriptors wait for the packet's plays. When Configure returns, true or false, whatever is left is played (the cache
 believes those uploads are on their way); descriptors left then are dropped with the draw.
 Descriptor entries take the pipeline's form (descriptor buffer or not), as the fill runs before
 Acquire. Pipelines with texture or image buffers keep their fill in Configure as with 1
