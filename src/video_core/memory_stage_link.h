@@ -53,6 +53,7 @@ public:
         SyncAhead,
         ServedAheadJoin,
         FutureWriteUnderImage,
+        ServedOverStageWrite,
         Count,
     };
 
@@ -243,6 +244,21 @@ public:
     /// Does nothing in level mode (the stage is level before each entry there) or off GPUMem.
     /// False when GPUMem is stopping (the caller stops its work).
     bool StageLevel(u64 position, LevelReason reason);
+    /// GPUMem came level at a constant buffer write onto GPU-written data (counted).
+    void NoteWriteLevel() noexcept {
+        counters.write_levels.store(counters.write_levels.load(std::memory_order_relaxed) + 1,
+                                    std::memory_order_relaxed);
+    }
+    /// The back, at a frame end: the window's verify runs (FRITCHII_MEMSTAGE_READ_LOG or
+    /// FRITCHII_MEMSTAGE_RING_VERIFY): GPUMem keeps its own writes, images look for them.
+    static void SetVerify(bool on) noexcept {
+        g_verify.store(on, std::memory_order_relaxed);
+    }
+    /// GPUMem keeps its own writes in its ring (the window open and its verify on).
+    [[nodiscard]] static bool StageWritesKept() noexcept {
+        return g_ahead.load(std::memory_order_relaxed) != 0 &&
+               g_verify.load(std::memory_order_relaxed);
+    }
 
     /// GPUMem, around a lock of the buffer cache taken outside any fill and outside a served
     /// call: while it waits for the lock, held by the back, it serves the back's call (step 7).
@@ -278,7 +294,14 @@ public:
     /// GPUMem, in a call it serves for the back at entry `back_position`: whether a buffer over
     /// [address, address + size) was joined by a fill of a later entry (its copy is in a packet
     /// the back has not played).
-    [[nodiscard]] bool JoinedAhead(u64 address, u64 size, u64 back_position) const noexcept;
+    enum class Joined : u8 { No, Yes, Unknown };
+    [[nodiscard]] Joined JoinedAhead(u64 address, u64 size, u64 back_position) const noexcept;
+    /// GPUMem, in a download it serves for the back: the join ring could not answer (every kept
+    /// join is ahead of the back). Counted, not a failure.
+    void NoteJoinUnknown() noexcept {
+        counters.joins_unknown.store(counters.joins_unknown.load(std::memory_order_relaxed) + 1,
+                                     std::memory_order_relaxed);
+    }
     /// GPUMem processes the entry at `position` (the joins' and the stage writes' position).
     [[nodiscard]] u64 StageEntry() const noexcept {
         return stage_entry;
@@ -328,10 +351,10 @@ public:
         return complete;
     }
     /// The back registers an image over [address, address + size) (the texture cache): risk 9.1,
-    /// a constant buffer write GPUMem made for a later entry under it (must be 0).
+    /// a constant buffer write GPUMem made for a later entry under it (must be 0). Only while the
+    /// window's verify runs (StageWritesKept): the fps gate measures play without the walk.
     static void NoteImageRegistered(u64 address, u64 size) {
-        if (g_ring_active.load(std::memory_order_relaxed) &&
-            g_ahead.load(std::memory_order_relaxed) != 0) [[unlikely]] {
+        if (g_ring_active.load(std::memory_order_relaxed) && StageWritesKept()) [[unlikely]] {
             instance.NoteImageRegisteredSlow(address, size);
         }
     }
@@ -422,6 +445,7 @@ private:
     static inline std::atomic<bool> g_full_vertex_binds{false};
     static inline std::atomic<bool> g_ring_active{false};
     static inline std::atomic<u32> g_ahead{0};
+    static inline std::atomic<bool> g_verify{false};
 
     static inline thread_local bool t_on_stage{};
     /// GPUMem runs a call the back posted (a served call): its syncs go to the back at once.
@@ -495,7 +519,7 @@ private:
         u64 end;
         u64 position;
     };
-    static constexpr size_t JoinSlots = 256;
+    static constexpr size_t JoinSlots = 4096;
     std::array<Join, JoinSlots> joins{};
     u64 join_count{};
     void NoteBufferJoinSlow(u64 address, u64 size) noexcept;

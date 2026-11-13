@@ -1355,9 +1355,39 @@ void RasterizerVulkan::CheckServedJoins(DAddr addr, u64 size) {
     if (!Link::OnStageThread() || Link::Ahead() == 0 || addr == 0 || size == 0) {
         return;
     }
-    if (Link::Get().JoinedAhead(addr, size, VideoCommon::GpuSplit::Get().BackEntryPosition()) &&
-        buffer_cache.IsRegionGpuModified(addr, size)) [[unlikely]] {
-        Link::Note(Link::Check::ServedAheadJoin, "a served call's download");
+    Link& link = Link::Get();
+    const u64 back_position = VideoCommon::GpuSplit::Get().BackEntryPosition();
+    switch (link.JoinedAhead(addr, size, back_position)) {
+    case Link::Joined::Yes:
+        if (buffer_cache.IsRegionGpuModified(addr, size)) [[unlikely]] {
+            Link::Note(Link::Check::ServedAheadJoin, "a served call's download");
+        }
+        break;
+    case Link::Joined::Unknown:
+        link.NoteJoinUnknown();
+        break;
+    case Link::Joined::No:
+        break;
+    }
+    // Fable's review, A: the download writes the GPU's bytes into game memory; a constant buffer
+    // write GPUMem made there, for an entry past the back's, on GPU-written data, would be lost
+    // (StageWriteWords comes level before such a write; this checks it while the window's verify
+    // keeps GPUMem's writes).
+    if (Link::StageWritesKept()) {
+        const u64 end = addr + size;
+        bool hit = false;
+        link.ForEachStageWriteSince(0, [&](u64 write_begin, u64 write_end, u64 position) {
+            if (position <= back_position) {
+                return true;
+            }
+            const u64 begin = (std::max)(write_begin, u64{addr});
+            const u64 last = (std::min)(write_end, end);
+            hit = begin < last && buffer_cache.IsRegionGpuModified(begin, last - begin);
+            return hit;
+        });
+        if (hit) [[unlikely]] {
+            Link::Note(Link::Check::ServedOverStageWrite, "a served call's download");
+        }
     }
 }
 
@@ -1428,16 +1458,8 @@ void RasterizerVulkan::StageApplyRanges(std::span<const std::pair<DAddr, std::si
 
 void RasterizerVulkan::InnerInvalidationServed(
     std::span<const std::pair<DAddr, std::size_t>> sequences) {
-    OnStage(static_cast<u8>(VideoCommon::MemoryStageLink::Served::InnerInvalidation), [&] {
-        if (VideoCommon::MemoryStageLink::OnStageThread() &&
-            VideoCommon::MemoryStageLink::Ahead() != 0) {
-            std::scoped_lock lock{buffer_cache.mutex};
-            for (const auto& [addr, size] : sequences) {
-                CheckServedJoins(addr, size);
-            }
-        }
-        StageApplyRanges(sequences, true);
-    });
+    OnStage(static_cast<u8>(VideoCommon::MemoryStageLink::Served::InnerInvalidation),
+            [&] { StageApplyRanges(sequences, true); });
     if (Settings::values.skip_cpu_inner_invalidation.GetValue()) {
         return;
     }
@@ -4457,9 +4479,6 @@ void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64
         // buffer half on GPUMem (claims first, as below), the other caches' here.
         OnStage(static_cast<u8>(VideoCommon::MemoryStageLink::Served::Gather), [&] {
             std::scoped_lock lock{buffer_cache.mutex};
-            for (const auto& [addr, size] : ranges) {
-                CheckServedJoins(addr, size);
-            }
             MemStage::FillPlay seam{mem_stage, MemStage::Site::Invalidation};
             buffer_cache.ClaimCpuWrites(ranges);
             for (const auto& [addr, size] : ranges) {
@@ -4589,7 +4608,6 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
     }
     OnStage(static_cast<u8>(VideoCommon::MemoryStageLink::Served::Invalidation), [&] {
         std::scoped_lock lock{buffer_cache.mutex};
-        CheckServedJoins(addr, size);
         MemStage::FillPlay seam{mem_stage, MemStage::Site::Invalidation};
         buffer_cache.WriteMemory(addr, size);
     });

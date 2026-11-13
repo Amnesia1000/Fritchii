@@ -2931,6 +2931,8 @@ void MemStage::TickThread(int seam) {
             ? "EDEN_NX2_RUNAHEAD"
             : nullptr;
     link.SetAhead(link.Mode() == 2 && ahead > 0 ? static_cast<u32>(ahead) : 0U, blocked);
+    // The window's verify (its own-write ring and the image check) only with a verify on.
+    Link::SetVerify(read_log_every > 0 || Link::RingVerify());
     const bool full =
         Debug::SwitchValue(Debug::g_memstage_full_binds, "FRITCHII_MEMSTAGE_FULL_BINDS") > 0 ||
         link.Mode() == 2;

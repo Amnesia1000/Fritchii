@@ -282,6 +282,7 @@ constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::Check::Co
     "a sync of GPUMem's fill sent to the back before it played the packets ahead of it",
     "a served download over GPU-written data in a buffer a packet ahead of the back joined",
     "an image registered over a constant buffer write GPUMem made for a later entry",
+    "a served download over a constant buffer write GPUMem made for a later entry",
 };
 constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::LevelReason::Count)>
     LEVEL_REASON_NAMES{"full copy", "writing draw", "ranges over GPU-written data"};
@@ -1210,24 +1211,27 @@ void MemoryStageLink::NoteBufferJoinSlow(u64 address, u64 size) noexcept {
     ++join_count;
 }
 
-bool MemoryStageLink::JoinedAhead(u64 address, u64 size, u64 back_position) const noexcept {
+MemoryStageLink::Joined MemoryStageLink::JoinedAhead(u64 address, u64 size,
+                                                     u64 back_position) const noexcept {
     // A join copies the old buffer's bytes into the new one in its packet: a download the back
     // records before that packet reads the new buffer before the copy. The served calls' answers
-    // stay the back's only while no such join is ahead of it over GPU-written data (step 7).
+    // stay the back's only while no such join is ahead of it over GPU-written data (step 7; joins
+    // over GPU-written data catch up first, so this is the check).
     const u64 end = address + size;
     const u64 kept = (std::min)(join_count, u64{JoinSlots});
     for (u64 i = 0; i < kept; ++i) {
         const Join& join = joins[(join_count - 1 - i) % JoinSlots];
         if (join.position <= back_position) {
-            return false; // the fills are in stream order: the rest are played
+            return Joined::No; // the fills are in stream order: the rest are played
         }
         if (join.begin < end && address < join.end) {
-            return true;
+            return Joined::Yes;
         }
     }
-    // Every kept join is ahead of the back: older ones are unknown, so say "maybe".
-    return kept == JoinSlots;
+    // Every kept join is ahead of the back: older ones are not known.
+    return kept == JoinSlots ? Joined::Unknown : Joined::No;
 }
+
 
 void MemoryStageLink::StageSyncCatchUp() {
     // GPUMem's fill reaches a sync with the window open. The back records the sync (and the

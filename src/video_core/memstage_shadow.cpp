@@ -133,6 +133,8 @@
 #include <windows.h>
 #endif
 
+#include <boost/container/small_vector.hpp>
+
 #include "common/fritchii_write_ring.h"
 #include "common/logging.h"
 #include "video_core/buffer_cache/cache_inputs.h"
@@ -940,11 +942,42 @@ void Collect(State& s, const Copy& c, GPUVAddr address, u64 size) {
 /// collected for the buffer half (the back's accumulator is not used).
 void StageWriteWords(State& s, Copy& c, GPUVAddr address, const u32* data, u64 size) {
     const Common::WriteRing::SiteScope write_site{"3D constant buffer data (memory stage)", false};
-    // Step 7, the window open: the stage's own ring keeps these writes with their entry (the
-    // read compare leaves them out, the image check looks for them); the emulator's write ring
-    // would only wrap on them over a lead of a frame.
     MemoryStageLink& link = MemoryStageLink::Get();
     const bool ahead = MemoryStageLink::Ahead() != 0;
+    // The write's device ranges, rounded as the back's invalidation rounds (32 bytes), split where
+    // the GPU pages map: the buffer half the next fill (or a lend) applies.
+    boost::container::small_vector<std::pair<u64, std::size_t>, 4> pieces;
+    {
+        constexpr u64 Atom = 32;
+        constexpr u64 Page = 0x1000;
+        GPUVAddr begin = address & ~(Atom - 1);
+        const GPUVAddr end = (address + size + Atom - 1) & ~(Atom - 1);
+        while (begin < end) {
+            const GPUVAddr piece_end = (std::min)(end, (begin + Page) & ~(Page - 1));
+            if (const std::optional<DAddr> device = c.memory->GpuToCpuAddress(begin)) {
+                pieces.emplace_back(*device, static_cast<std::size_t>(piece_end - begin));
+            }
+            begin = piece_end;
+        }
+    }
+    // Step 7, the window open (Fable's review, A): words onto GPU-written buffer data. A served
+    // download the back makes before this entry would copy the GPU's older bytes over them, and
+    // the claim would then upload those. So GPUMem comes level here, before the write, and applies
+    // the claim at once: the mark changes at the back's position, with no download in between.
+    const auto& backend = link.Backend();
+    bool claim_now = false;
+    if (ahead && !pieces.empty() && backend.ranges_gpu_written != nullptr &&
+        backend.ranges_gpu_written(backend.context, pieces.data(), pieces.size())) [[unlikely]] {
+        link.NoteWriteLevel();
+        if (!link.StageLevel(s.processing_position, MemoryStageLink::LevelReason::Claim)) {
+            return; // GPUMem is stopping
+        }
+        claim_now = backend.apply_ranges != nullptr;
+    }
+    // The stage's own ring keeps these writes with their entry while the window's verify runs
+    // (the read compare leaves them out, the image check looks for them); the emulator's write
+    // ring would only wrap on them over a lead of a frame, so they stay out of it then.
+    const bool kept = MemoryStageLink::StageWritesKept();
     struct Quiet {
         bool was;
         explicit Quiet(bool on) : was{Common::WriteRing::t_quiet} {
@@ -953,8 +986,8 @@ void StageWriteWords(State& s, Copy& c, GPUVAddr address, const u32* data, u64 s
         ~Quiet() {
             Common::WriteRing::t_quiet = was;
         }
-    } quiet{ahead};
-    if (ahead) {
+    } quiet{kept};
+    if (kept) {
         constexpr u64 Page = 0x1000;
         for (GPUVAddr piece = address; piece < address + size;) {
             const GPUVAddr piece_end = (std::min)(address + size, (piece + Page) & ~(Page - 1));
@@ -972,17 +1005,11 @@ void StageWriteWords(State& s, Copy& c, GPUVAddr address, const u32* data, u64 s
     } else {
         c.memory->WriteBlockStage(address, data, size);
     }
-    constexpr u64 Atom = 32;
-    constexpr u64 Page = 0x1000;
-    GPUVAddr begin = address & ~(Atom - 1);
-    const GPUVAddr end = (address + size + Atom - 1) & ~(Atom - 1);
-    while (begin < end) {
-        const GPUVAddr piece_end = (std::min)(end, (begin + Page) & ~(Page - 1));
-        if (const std::optional<DAddr> device = c.memory->GpuToCpuAddress(begin)) {
-            s.ring_ranges.emplace_back(*device, static_cast<std::size_t>(piece_end - begin));
-        }
-        begin = piece_end;
+    if (claim_now) {
+        backend.apply_ranges(backend.context, pieces.data(), pieces.size());
+        return;
     }
+    s.ring_ranges.insert(s.ring_ranges.end(), pieces.begin(), pieces.end());
 }
 
 /// Maxwell3D::ProcessCBMultiData: computes the write and its range, writes nothing. With EXP107
