@@ -951,14 +951,16 @@ private:
     };
     static constexpr u64 RingBytes = u64{4} << 20;
     std::unique_ptr<u8[]> ring_b;
-    u64 ring_b_write{};              ///< GPUMem
-    std::atomic<u64> ring_b_sent{};  ///< Bytes GPUMem committed
-    u64 ring_b_read{};               ///< The back
-    std::atomic<u64> ring_b_freed{}; ///< Bytes the back is done with
+    // Each thread's control fields on their own cache line (step 7: with the window open both
+    // write theirs for every packet, and one shared line bounced between the cores).
+    alignas(64) u64 ring_b_write{};       ///< GPUMem
+    std::atomic<u64> ring_b_sent{};       ///< Bytes GPUMem committed
     std::atomic<u64> ring_packets_sent{}; ///< GPUMem: packets pushed
+    alignas(64) u64 ring_b_read{};        ///< The back
+    std::atomic<u64> ring_b_freed{};      ///< Bytes the back is done with
     std::atomic<u64> ring_packets_done{}; ///< The back: packets taken or dropped
     /// The fill in progress goes to ring B (FillRingDraw).
-    bool ring_fill{};
+    alignas(64) bool ring_fill{};
     bool ring_pushed{};
     u64 ring_fill_position{};
     u64 ring_fill_seq{};

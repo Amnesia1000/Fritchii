@@ -1552,6 +1552,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     const MemStage::DrawPacket* ring_packet = nullptr;
     std::optional<MemStage::RestAtEnd> ring_rest;
     if (ring_on && (served || Link::BackInRun())) [[unlikely]] {
+        const Profile::FineScope take_scope{Profile::Zone::RingTake};
         const bool verify = Link::RingVerify();
         ring_packet = mem_stage.TakeRingDraw(
             Link::Get().BackDrawSeq(), VideoCommon::GpuSplit::Get().BackEntryPosition(),
@@ -1859,6 +1860,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         mesh_emulation_vertices_per_group = pipeline->MeshEmulationVerticesPerGroup();
     }
     if (!buffer_lock.owns_lock()) {
+        const Profile::FineScope locks_scope{Profile::Zone::DrawLocks};
         if (ring_packet != nullptr && served) {
             texture_lock.lock(); // spec 5.6: the buffer cache's lock is the stage's
         } else {
@@ -1980,6 +1982,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         TraceRenderState(is_indexed, "configure-failed", nullptr);
         return;
     }
+    // TEST: from Configure's end to dynamic state (EDEN_NX2_GPU_PROFILE=2).
+    std::optional<Profile::FineScope> after_scope;
+    after_scope.emplace(Profile::Zone::DrawAfter);
     if (delta_pipeline != nullptr && delta_mode == 3) [[unlikely]] {
         // EXP118=3: the descriptor pools' sync the delta configure left out must change nothing.
         const u64 bindings = texture_cache.TextureBindingsSerial();
@@ -2043,6 +2048,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         }
     }
 
+    after_scope.reset();
     {
         Profile::Scope scope{Profile::Zone::DynamicState};
         UpdateOcarinaJitter();

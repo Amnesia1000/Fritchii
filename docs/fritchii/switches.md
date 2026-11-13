@@ -581,12 +581,18 @@ session after a catch-up could not finish (below; logged).
   vertex input state only when it may have changed (the back's VertexBuffers flag, not the
   cache's in served mode, is cleared at a packet's draw as the cache's vertex buffer update
   clears it with one thread, and with each send). With EDEN_NX2_GPU_PROFILE=2 GPUMem's
-  profile splits its entry loop into "stage entries" and, inside it, "stage cb words".
+  profile splits its entry loop into "stage entries" and, inside it, "stage cb words"; the back's
+  "draw" splits off "ring take" (the packet's take from ring B) with "ring take copy" inside it
+  (its bytes copied out), "draw locks" (inside "draw setup") and "draw after configure" (the
+  trackers, traces and dumps between Configure and dynamic state).
 - The second fps fixes (window open only): GPUMem's wait for the front spins about 200 us before
   it sleeps (level mode keeps about 2,000 pauses; the link line's "slept n/s" adds how many of
   those sleeps waited for the front); the back prefetches the first 1 KiB of the next packet in
   ring B when it takes one; the back's loop calls the ring's per-entry work (BackEntry, the run's
-  edges, BackAfter) only at a batch's first entry and where a run starts or ends.
+  edges, BackAfter) only at a batch's first entry and where a run starts or ends. A take wakes
+  GPUMem only when it sleeps on the window or on room in ring B (not on the back's position, a
+  run or the front, which a take does not end); ring B's control fields and the link's counters
+  sit on cache lines per thread.
 - Other changes it makes: packet ticks keep one unplayed mark per thread (the close takes the
   lowest, and ring B's oldest packet; the ring's start and end clear GPUMem's); the lend's flag
   hand-over happens at the run's first entry; a sync in GPUMem's fill, and a join in it over
@@ -601,7 +607,8 @@ session after a catch-up could not finish (below; logged).
   (average, maximum, and per second by 1, 2-3, 4-7, 8-15, 16-31, 32-63, 64-255, 256+ ahead), the
   back's waits for the stage (times and ms/s: should drop toward 0; spec 8.4's target is under
   20 ms/s, and 6b's run rate makes about 58 ms/s the floor until runs drop), GPUMem's waits for the
-  window, for room in ring B and to come level (ms/s, comings level a second by reason: full copy,
+  window, for room in ring B (and how often the back's takes woke it from them) and to come
+  level (ms/s, comings level a second by reason: full copy,
   writing draw, ranges over GPU-written data), entries made hard at a constant buffer write, new
   staging buffers for GPUMem with the stream busy, served calls
   made while packets were ahead, sync and join catch-ups, lends handed over at the run's start, the

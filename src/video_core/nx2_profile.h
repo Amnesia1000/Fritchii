@@ -115,6 +115,11 @@ enum class Zone : u32 {
     LevelRun,
     StageEntries, ///< GPUMem's entry loop, the entries themselves (fine zone)
     StageCbWords, ///< ... their constant buffer words (fine zone, inside StageEntries)
+    // Of draw, the back with FRITCHII_MEMSTAGE_THREAD=2 (fine zones):
+    RingTake,     ///< The ring B packet's take (TakeRingDraw: peek, counters, wakes, ticks)
+    RingTakeCopy, ///< ... the packet's bytes copied out of ring B (inside RingTake)
+    DrawLocks,    ///< The caches' locks taken for the draw (the texture cache's when served)
+    DrawAfter,    ///< From Configure's end to dynamic state: trackers, traces, dumps
     Count,
 };
 
@@ -138,6 +143,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "image create", "pool destroy here", "pool destroy idle", "pool destroy backlog",
     "memory fill", "memory play", "memory hand-off", "memory sync wait",
     "stage wait", "level run", "stage entries", "stage cb words",
+    "ring take", "ring take copy", "draw locks", "draw after configure",
 };
 static_assert(zone_names.back() != nullptr, "a zone without a name");
 

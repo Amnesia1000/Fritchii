@@ -504,6 +504,9 @@ private:
     alignas(64) std::atomic<u32> answered{0};
     alignas(64) std::atomic<u32> stage_word{0};
     std::atomic<bool> stage_sleeping{false};
+    /// Step 7: GPUMem's sleep waits for the window or for room in ring B, the only waits a take
+    /// ends (set before stage_sleeping, both seq_cst: a back that sees GPUMem asleep sees it).
+    std::atomic<bool> stage_ring_wait{false};
     alignas(64) std::atomic<u32> back_word{0};
     std::atomic<bool> back_sleeping{false};
 
@@ -576,55 +579,59 @@ private:
     /// The window's fill histogram: 1, 2-3, 4-7, 8-15, 16-31, 32-63, 64-255, 256 and more.
     static constexpr size_t WindowBuckets = 8;
 
-    struct Counters {
-        std::array<std::atomic<u64>, static_cast<size_t>(HandOff::Count)> calls{};
-        std::atomic<u64> call_ns{};
+    /// Grouped by the thread that bumps them, each group on its own cache lines (step 7: with
+    /// the window open both threads bump theirs for every packet; mixed lines bounced).
+    struct alignas(64) Counters {
+        // GPUMem's.
         std::atomic<u64> stage_ns{};
-        std::atomic<u64> served{};
-        std::atomic<u64> served_ns{};
-        std::atomic<u64> back_sleeps{};
         std::atomic<u64> stage_sleeps{};
         std::atomic<u64> stage_input_sleeps{}; ///< of stage_sleeps, waiting for the front
-        std::array<std::atomic<u64>, static_cast<size_t>(Check::Count)> checks{};
-        // THREAD = 2.
-        std::array<std::atomic<u64>, static_cast<size_t>(Served::Count)> served_calls{};
         std::array<std::atomic<u64>, 4> entries{}; ///< pass, work, level, neutral
         std::atomic<u64> runs{};
         std::atomic<u64> run_entries{};
         std::atomic<u64> run_ns{};       ///< the stage, from the lend to the return
-        std::atomic<u64> back_run_ns{};  ///< the back, from the lend seen to the next packet taken
-        std::atomic<u64> back_wait{};
-        std::atomic<u64> back_wait_ns{};
         std::array<std::atomic<u64>, static_cast<size_t>(StageWait::Count)> stage_wait_ns{};
         std::atomic<u64> stage_busy_ns{};
         std::atomic<u64> fill_ns{};
         std::atomic<u64> packets{};
         std::atomic<u64> packet_bytes{};
-        std::atomic<u64> taken{};
         std::atomic<u64> publishes{};
         std::atomic<u64> copies{};
         std::atomic<u64> flag_handovers{};
         std::array<std::atomic<u64>, 8> level_draws{};
-        std::atomic<u64> hashes{};
-        std::atomic<u64> hash_mismatches{};
         std::atomic<u64> ring_ahead_max{};
-        // Step 7.
         std::array<std::atomic<u64>, WindowBuckets> window{}; ///< packets in ring B at each push
         std::atomic<u64> ahead_sum{};
         std::array<std::atomic<u64>, static_cast<size_t>(LevelReason::Count)> levels{};
-        std::atomic<u64> served_ahead{};
         std::atomic<u64> catchups{};
         std::atomic<u64> catchup_ns{};
         std::atomic<u64> deferred_lends{};
-        std::atomic<u64> back_lock_waits{};   ///< the back waited for the lock GPUMem held
         std::atomic<u64> stage_lock_serves{}; ///< GPUMem served a call while waiting for it
         std::atomic<u64> join_catchups{};
         std::atomic<u64> joins_unknown{};     ///< a served download past the join ring's reach
         std::atomic<u64> write_levels{};      ///< words onto GPU-written data: the entry hard
         std::atomic<u64> staging_fallbacks{}; ///< GPUMem took a new staging buffer, stream busy
-        std::atomic<u64> hook_flushes{};      ///< the back's skipped idle hook, its flush run
         std::atomic<u64> stage_idles{};
         std::atomic<u64> run_input_waits{};   ///< fps fix 3: a run kept lent at the input's end
+        // The back's.
+        alignas(64) std::array<std::atomic<u64>, static_cast<size_t>(HandOff::Count)> calls{};
+        std::atomic<u64> call_ns{};
+        std::atomic<u64> served{};
+        std::atomic<u64> served_ns{};
+        std::atomic<u64> back_sleeps{};
+        std::array<std::atomic<u64>, static_cast<size_t>(Served::Count)> served_calls{};
+        std::atomic<u64> served_ahead{};
+        std::atomic<u64> back_run_ns{};  ///< the back, from the lend seen to the next packet taken
+        std::atomic<u64> back_wait{};
+        std::atomic<u64> back_wait_ns{};
+        std::atomic<u64> taken{};
+        std::atomic<u64> hashes{};
+        std::atomic<u64> hash_mismatches{};
+        std::atomic<u64> back_lock_waits{};   ///< the back waited for the lock GPUMem held
+        std::atomic<u64> hook_flushes{};      ///< the back's skipped idle hook, its flush run
+        std::atomic<u64> ring_wakes{};        ///< takes that woke GPUMem (window or room wait)
+        // Either thread's, rare (the must-be-0 checks).
+        alignas(64) std::array<std::atomic<u64>, static_cast<size_t>(Check::Count)> checks{};
     };
     Counters counters;
     struct Snapshot {
@@ -671,6 +678,7 @@ private:
         u64 write_levels{};
         u64 staging_fallbacks{};
         u64 hook_flushes{};
+        u64 ring_wakes{};
         u64 stage_idles{};
         u64 run_input_waits{};
     };
