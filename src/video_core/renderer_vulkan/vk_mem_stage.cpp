@@ -89,9 +89,10 @@
 //           everything else is "inside a range the packet binds" (for a dispatch, whole storage
 //           buffers).
 //        Unclassified: unmapped, no GPU, or the ring wrapped since the fill.
-//        The gate line: unexplained = emulator writes that are not landings + unclassified;
-//        "mark already taken", "untracked read changed" and "changed inside a range the packet
-//        binds" are reported apart, not failures.
+//        The gate line fails on unexplained (emulator writes that are not landings +
+//        unclassified) and on a wrapped ring (the run is not valid); "mark already taken",
+//        "untracked read changed" and "changed inside a range the packet binds" are reported
+//        apart, not failures.
 //        Off (no READ_LOG) every hook is one relaxed load and a branch.
 //   The held descriptors' form is compared with the queue's after Acquire. Must be 0.
 // The zones "memory fill" (fills at SEAM = 2, with what the cache does inside them) and "memory
@@ -2202,6 +2203,7 @@ void MemStage::LogStats() {
             const u64 own = delta(&Counts::diff_own);
             const u64 taken = by_class(DiffClass::MarkTaken);
             const u64 untracked = by_class(DiffClass::Untracked);
+            const u64 wrapped = delta(&Counts::ring_wrapped);
             LOG_INFO(Render_Vulkan,
                      "  memory seam read log classes: emulator write {}{}{}{}, game write marked "
                      "{}, game write mark already taken {}, untracked read changed {}, gather on "
@@ -2211,15 +2213,21 @@ void MemStage::LogStats() {
                      landings + emulator, sites.empty() ? "" : " (", sites,
                      sites.empty() ? "" : ")", by_class(DiffClass::GameMarked), taken, untracked,
                      by_class(DiffClass::BackGather), unclassified, delta(&Counts::diff_over), own,
-                     delta(&Counts::ring_wrapped), delta(&Counts::gathers_held),
+                     wrapped, delta(&Counts::gathers_held),
                      current.flush_regions_held[0] - reported.flush_regions_held[0],
                      current.flush_regions_held[1] - reported.flush_regions_held[1],
                      current.flush_regions_held[2] - reported.flush_regions_held[2]);
+            // Fails on any unexplained difference, and on a wrapped ring (the run is not valid:
+            // the writers since some fills are unknown).
+            const bool gate_pass = emulator + unclassified == 0 && wrapped == 0;
             LOG_INFO(Render_Vulkan,
-                     "  read log gate: unexplained {} (emulator writes that are not download "
-                     "landings {}, unclassified {}); mark already taken {} (tracked reads); "
-                     "untracked read changed {}; changed inside a range the packet binds {}",
-                     emulator + unclassified, emulator, unclassified, taken, untracked, own);
+                     "  read log gate {}: unexplained {} (emulator writes that are not download "
+                     "landings {}, unclassified {}); ring wrapped {}{}; mark already taken {} "
+                     "(tracked reads); untracked read changed {}; changed inside a range the "
+                     "packet binds {}",
+                     gate_pass ? "passed" : "FAILED", emulator + unclassified, emulator,
+                     unclassified, wrapped, wrapped != 0 ? " (run not valid)" : "", taken,
+                     untracked, own);
         }
     }
     const std::array<u64, 2> vertex_runs{

@@ -312,10 +312,11 @@ site, thread and sequence (vk_mem_stage.cpp, "Who wrote", lists every hook). Eac
   "inside a range the packet binds" (for a dispatch, whole storage buffers).
 The "memory seam read log classes" line has the counts by class and site, over-read and changed
 inside a bound range, ring wraps, and on the holding thread the gathers applied and FlushRegion
-calls by cache. The "read log gate" line: unexplained = emulator writes that are not download
-landings + unclassified; must be 0. "mark already taken", "untracked read changed" and "changed
-inside a range the packet binds" are reported beside it and are not failures. Off, every hook
-costs one relaxed load and a branch.
+calls by cache. The "read log gate" line says passed or FAILED: it fails on unexplained (emulator
+writes that are not download landings + unclassified) and on ring wrapped (the run is not valid;
+make the ring larger). "mark already taken", "untracked read changed" and "changed inside a range
+the packet binds" are reported beside it and are not failures (fable_memstage_readlog2.md). Off,
+every hook costs one relaxed load and a branch.
 
 ### FRITCHII_MEMSTAGE_VERIFY
 
