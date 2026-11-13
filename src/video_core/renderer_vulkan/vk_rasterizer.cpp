@@ -536,7 +536,8 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
                                    StateTracker& state_tracker_, Scheduler& scheduler_)
     : gpu{gpu_}, device_memory{device_memory_}, device{device_},
       memory_allocator{memory_allocator_}, state_tracker{state_tracker_}, scheduler{scheduler_},
-      staging_pool(device, memory_allocator, scheduler, device.HasSplitAllocators() ? 2 : 1),
+      staging_pool(device, memory_allocator, scheduler,
+                   device.HasSplitAllocators() && device.IsIntegrated() ? 2 : 1),
       split_buffer_allocator{device.HasSplitAllocators()
                                  ? std::make_unique<MemoryAllocator>(device, true)
                                  : nullptr},
