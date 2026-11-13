@@ -144,7 +144,7 @@ u64 g_blit_seeds{};
 // holds: its registers and, after them, its method sink. Only after a drain: the back is idle
 // and has run every write sent, so this is the state the next blit sees.
 void SeedFrontCopy(Engines::Fermi2D& blitter) {
-    constexpr u32 first = 0x200; // dst
+    constexpr u32 first = FERMI2D_REG_INDEX(dst); // 0x80
     constexpr u32 count = 10;
     for (u32 i = 0; i < count; ++i) {
         blitter.FrontNoteMethod(first + i, blitter.regs.reg_array[first + i]);
@@ -223,6 +223,13 @@ void NoteEngineWriter(VideoCommon::GpuSplit& split, const MemoryManager& memory_
                 const u64 code = size & 0xff;
                 miss = code <= static_cast<u64>(BlitMiss::Empty) ? static_cast<BlitMiss>(code)
                                                                  : BlitMiss::Other;
+                static u32 formats_logged{};
+                if (miss == BlitMiss::Format && formats_logged++ < 8) {
+                    LOG_INFO(HW_GPU,
+                             "EXP120: blit destination format {:#x} has no pixel format "
+                             "(TryPixelFormatFromRenderTargetFormat): left unranged",
+                             size >> 8);
+                }
             }
         }
     }

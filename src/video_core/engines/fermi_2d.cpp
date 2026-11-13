@@ -55,17 +55,22 @@ void Fermi2D::CallMultiMethod(Core::System& system, u32 method, const u32* base_
     }
 }
 
+// The destination surface's first register. Not the header's FrontFirst (0x200): that is dst's
+// byte offset (ASSERT_REG_POSITION here takes bytes), the register index is 0x80.
+constexpr u32 FrontDstFirst = FERMI2D_REG_INDEX(dst);
+static_assert(FrontDstFirst == 0x80);
+
 void Fermi2D::FrontNoteMethod(u32 method, u32 argument) {
-    if (method - FrontFirst >= FrontCount) {
+    if (method - FrontDstFirst >= FrontCount) {
         return;
     }
-    front_regs[method - FrontFirst] = argument;
-    front_seen |= 1U << (method - FrontFirst);
+    front_regs[method - FrontDstFirst] = argument;
+    front_seen |= 1U << (method - FrontDstFirst);
 }
 
 // On false, `size` says why (DmaPusher's BlitMiss) in its low byte: 1 a destination register
-// the range needs was not sent yet (bits 8 and up: which, bit n for dst register 0x200 + n), 2
-// an undecodable format, 3 an empty surface.
+// the range needs was not sent yet (bits 8 and up: which, bit n for dst register 0x80 + n), 2
+// an undecodable format (bits 8 and up: the format), 3 an empty surface.
 bool Fermi2D::FrontBlitRange(GPUVAddr& begin, u64& size) const {
     static_assert(sizeof(Surface) == FrontCount * sizeof(u32));
     Surface dst;
@@ -83,7 +88,7 @@ bool Fermi2D::FrontBlitRange(GPUVAddr& begin, u64& size) const {
     // undecodable format, the texture cache path writes no guest memory.
     const auto format = VideoCore::Surface::TryPixelFormatFromRenderTargetFormat(dst.format);
     if (!format) {
-        size = 2;
+        size = 2 | (u64{static_cast<u32>(dst.format)} << 8);
         return false;
     }
     const u32 bytes_per_pixel = VideoCore::Surface::BytesPerBlock(*format);
