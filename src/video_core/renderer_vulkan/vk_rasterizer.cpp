@@ -576,8 +576,8 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
       frame_dump(device, memory_allocator, scheduler),
       flash_watch(device, memory_allocator, scheduler) {
     scheduler.SetQueryCache(query_cache);
-    // The memory seam's read log asks this cache's tracker; its tick guard restamps this pool.
-    mem_stage.Attach(buffer_cache, buffer_staging_pool);
+    // The memory seam's read log asks this cache's tracker.
+    mem_stage.Attach(buffer_cache);
     VideoCommon::FritchiiDrawKinds::Init();
     // EDEN_NX2_MEMSTAGE_STATS: stream writes are tested against the texture cache's pages.
     VideoCommon::MemStageStats::SetImagePageFilters(&texture_cache.page_filter,

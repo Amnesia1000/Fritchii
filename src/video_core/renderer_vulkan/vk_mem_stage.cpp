@@ -28,13 +28,16 @@
 //      the texture cache's views). The descriptor entries take the pipeline's form (the fill runs
 //      before Acquire; DescriptorForm).
 //
+// SEAM 2 and 3 need packet ticks (FRITCHII_MEMSTAGE_TICKS=1 or 2): a held packet's numbers stay
+// open until its PlayRest ("Packet ticks" below), so what its early fill stamped is never free
+// before the tick its copies are recorded in. Without them TickFrame runs SEAM 1 (logged once,
+// counted on the stats line); there is no tick guard.
+//
 // SEAM = 2's checks:
-//   5.5, the tick guard: the staging taken at the fill is stamped with the fill's tick. If the
-//        scheduler flushed between the fill and a play, the play counts it, gives every cached
-//        staging buffer stamped with the fill's tick the current one (StagingBufferPool::Retick)
-//        and restamps the buffers the fill marked used. Expected near 0; the first 16 flushes
-//        inside a held packet are logged with their caller. Off with packet ticks
-//        (FRITCHII_MEMSTAGE_TICKS): the stamps are packet numbers then.
+//   5.5, flushed while held: held packets whose fill and PlayRest are in different command
+//        buffers (a flush or finish in between, the clock's syncs included). Expected near 0;
+//        the first 16 are logged with their caller. A vertex binding the fill did not see dirty
+//        is not bound again in the new command buffer (step 6's full vertex bindings).
 //   5.3, the read log (FRITCHII_MEMSTAGE_READ_LOG=N, boot): every Nth draw, dispatch and operation
 //        packet logs what its fill read from game memory (the buffer cache's MemReadLog lines:
 //        uniforms copied to the stream, buffer uploads with their staged bytes, bound cached
@@ -320,16 +323,18 @@ bool IsRecord(SeamHook::Use use) {
 // The hook
 
 void SeamHook::OnUse(Use use, const std::source_location& location) {
+    if (t_holding && (use == Use::Flush || use == Use::Finish)) [[unlikely]] {
+        // SEAM = 2: a submit between a held packet's fill and its PlayRest, syncs included.
+        if (MemStage* const stage = g_stage.load(std::memory_order_acquire)) {
+            stage->NoteHeldFlush(use, location);
+        }
+    }
     if (t_play_depth != 0) {
         return;
     }
     MemStage* const stage = g_stage.load(std::memory_order_acquire);
     if (stage == nullptr) {
         return;
-    }
-    if (t_holding && (use == Use::Flush || use == Use::Finish)) [[unlikely]] {
-        // SEAM = 2: a submit between a held packet's fill and its plays (the tick guard's case).
-        stage->NoteHeldFlush(use, location);
     }
     const bool in_fill = t_fill_depth != 0;
     if (in_fill) {
@@ -478,9 +483,8 @@ MemStage::~MemStage() {
     VideoCommon::MemReadLog::g_on.store(false, std::memory_order_relaxed);
 }
 
-void MemStage::Attach(Cache& cache_, StagingBufferPool& staging_pool_) noexcept {
+void MemStage::Attach(Cache& cache_) noexcept {
     cache = &cache_;
-    staging_pool = &staging_pool_;
 }
 
 bool MemStage::OwnedHere() const noexcept {
@@ -604,7 +608,6 @@ void MemStage::BeginDraw(u32 repack_mask, u32 repack_dirty) {
     RetireDrawValues();
     draw = DrawPacket{};
     draw.number = ticks ? ticks->BeginPacket() : ++packet_number;
-    draw.fill_tick = player.scheduler.CurrentTick();
     draw.repack_mask = repack_mask;
     draw.repack_dirty = repack_dirty;
 }
@@ -620,7 +623,6 @@ void MemStage::BeginDispatch() {
         dispatch = DispatchPacket{};
         dispatch.number = ticks ? ticks->BeginPacket() : ++packet_number;
     }
-    dispatch.fill_tick = player.scheduler.CurrentTick();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -891,8 +893,6 @@ void MemStage::TakeHeld(HeldKind kind) {
         pending = false;
         SeamHook::g_watch.fetch_sub(1, std::memory_order_relaxed);
     }
-    held_marked.swap(marked);
-    marked.clear();
     held = kind;
     t_holding = true;
     if (ticks) {
@@ -921,14 +921,14 @@ const MemStage::DrawPacket* MemStage::FillDraw(Cache& cache_, const DrawFacts& f
     const bool timed = Profile::Enabled();
     const u64 start = timed ? NowNs() : 0;
     Bump(counters.held_draws);
-    draw.fill_tick = player.scheduler.CurrentTick();
     draw.flags |= Held;
     held_hashes = facts.hashes;
     held_form = player.guest_descriptor_queue.FormFor(facts.uses_descriptor_buffer);
     fill_form = held_form ? 1 : 0;
-    marked.clear();
-    t_marked = &marked;
     filling_held = true;
+    filling_kind = HeldKind::Draw;
+    held_flush_seen = false;
+    t_holding = true;
     if (ticks) {
         held_from = draw.number;
         UpdateUnplayed();
@@ -982,7 +982,6 @@ const MemStage::DrawPacket* MemStage::FillDraw(Cache& cache_, const DrawFacts& f
         TakeHeld(HeldKind::Draw);
     }
     filling_held = false;
-    t_marked = nullptr;
     fill_form = -1;
     if (timed) {
         Bump(counters.fill_ns, NowNs() - start);
@@ -1007,14 +1006,14 @@ const MemStage::DispatchPacket* MemStage::FillDispatch(Cache& cache_,
     const bool timed = Profile::Enabled();
     const u64 start = timed ? NowNs() : 0;
     Bump(counters.held_dispatches);
-    dispatch.fill_tick = player.scheduler.CurrentTick();
     dispatch.flags |= Held;
     held_hashes = {facts.shader_hash, 0};
     held_form = player.guest_descriptor_queue.FormFor(facts.uses_descriptor_buffer);
     fill_form = held_form ? 1 : 0;
-    marked.clear();
-    t_marked = &marked;
     filling_held = true;
+    filling_kind = HeldKind::Dispatch;
+    held_flush_seen = false;
+    t_holding = true;
     if (ticks) {
         held_from = dispatch.number;
         UpdateUnplayed();
@@ -1049,7 +1048,6 @@ const MemStage::DispatchPacket* MemStage::FillDispatch(Cache& cache_,
         TakeHeld(HeldKind::Dispatch);
     }
     filling_held = false;
-    t_marked = nullptr;
     fill_form = -1;
     if (timed) {
         Bump(counters.fill_ns, NowNs() - start);
@@ -1058,30 +1056,6 @@ const MemStage::DispatchPacket* MemStage::FillDispatch(Cache& cache_,
 }
 
 void MemStage::CheckHeld() {
-    u64& fill_tick = held == HeldKind::Draw ? draw.fill_tick : dispatch.fill_tick;
-    const u64 now = player.scheduler.CurrentTick();
-    // With packet ticks (FRITCHII_MEMSTAGE_TICKS) the stamps are packet numbers, not ticks: no
-    // guard (the packet's numbers stay open until its play, "Packet ticks" below).
-    if (!ticks && now != fill_tick) [[unlikely]] {
-        // 5.5: the scheduler flushed between the fill and this play. What the fill stamped with
-        // its tick is used by this later submission: stamp it with the current one.
-        Bump(counters.tick_moved);
-        if (ticks_logged.fetch_add(1, std::memory_order_relaxed) < 16) {
-            LOG_WARNING(Render_Vulkan,
-                        "Memory seam (5.5): the tick moved from {} to {} between the fill and the "
-                        "play of {} {} (programs {:016x} {:016x}); restamped",
-                        fill_tick, now, held == HeldKind::Draw ? "draw" : "dispatch",
-                        held == HeldKind::Draw ? draw.number : dispatch.number, held_hashes[0],
-                        held_hashes[1]);
-        }
-        if (staging_pool != nullptr) {
-            staging_pool->Retick(fill_tick);
-        }
-        for (Buffer* const buffer : held_marked) {
-            buffer->Restamp(fill_tick);
-        }
-        fill_tick = now;
-    }
     if (held_log_pending) {
         // 5.3: the packet's first play is the old read position.
         held_log_pending = false;
@@ -1149,22 +1123,24 @@ void MemStage::PlayRest() {
     SeamHook::g_watch.fetch_sub(1, std::memory_order_relaxed);
     held_arena.Reset();
     held_cursor = 0;
-    held_marked.clear();
     held_log.Clear();
     held_log_pending = false;
 }
 
 void MemStage::NoteHeldFlush(SeamHook::Use use, const std::source_location& location) {
-    if (t_play_depth != 0) {
+    if (held_flush_seen) {
         return;
     }
+    held_flush_seen = true;
+    Bump(counters.held_flushed);
     static std::atomic<u32> logged{};
     if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+        const bool is_draw = (filling_held ? filling_kind : held) == HeldKind::Draw;
         LOG_WARNING(Render_Vulkan,
-                    "Memory seam (5.5): a {} between the fill and the plays of {} {}: {}:{} {}",
-                    UseName(use), held == HeldKind::Draw ? "draw" : "dispatch",
-                    held == HeldKind::Draw ? draw.number : dispatch.number, location.file_name(),
-                    location.line(), location.function_name());
+                    "Memory seam (5.5): a {}{} between the fill and the PlayRest of {} {}: {}:{} {}",
+                    UseName(use), t_play_depth != 0 ? " (in a sync)" : "",
+                    is_draw ? "draw" : "dispatch", is_draw ? draw.number : dispatch.number,
+                    location.file_name(), location.line(), location.function_name());
     }
 }
 
@@ -1418,7 +1394,17 @@ void MemStage::Note(SeamHook::Use use, const std::source_location& location, boo
 }
 
 void MemStage::TickFrame() {
-    const int value = VideoCore::Nx2Debug::Experiment(123);
+    int value = VideoCore::Nx2Debug::Experiment(123);
+    if (value >= 2 && !ticks) [[unlikely]] {
+        // The early fill needs packet ticks (the header comment): run SEAM 1.
+        Bump(counters.seam_clamped);
+        if (!clamp_logged) {
+            clamp_logged = true;
+            LOG_WARNING(Render_Vulkan, "SEAM 2/3 need FRITCHII_MEMSTAGE_TICKS=1 (or 2); running "
+                                       "SEAM 1");
+        }
+        value = 1;
+    }
     const bool on = value != 0;
     // A held packet never outlives its draw or dispatch; a safety net, as in BeginDraw.
     PlayRest();
@@ -1545,7 +1531,7 @@ void MemStage::LogStats() {
              "Memory seam (EXP123={}) {:.0f} s: draws {:.0f}/s ({:.2f} entries each), "
              "dispatches {:.0f}/s ({:.2f} each), fence commits {:.0f}/s ({:.2f} each); "
              "deferred {:.0f}/s, plays {:.0f}/s; around the packet (5.1) {}, late plays (5.2) {}, "
-             "scheduler uses not through the clock {}",
+             "scheduler uses not through the clock {}{}",
              seam_value.load(std::memory_order_relaxed), seconds, rate(draws),
              draws != 0 ? static_cast<double>(draw_entries) / static_cast<double>(draws) : 0.0,
              rate(dispatches),
@@ -1555,7 +1541,11 @@ void MemStage::LogStats() {
              fence_fills != 0 ? static_cast<double>(fence_entries) / static_cast<double>(fence_fills)
                               : 0.0,
              rate(delta(&Counts::deferred)), rate(delta(&Counts::plays)),
-             delta(&Counts::around), delta(&Counts::late), delta(&Counts::unclocked));
+             delta(&Counts::around), delta(&Counts::late), delta(&Counts::unclocked),
+             delta(&Counts::seam_clamped) != 0
+                 ? fmt::format("; SEAM 2/3 run as 1 without packet ticks: {} frames",
+                               delta(&Counts::seam_clamped))
+                 : std::string{});
     LOG_INFO(Render_Vulkan, "  memory seam entries/s by kind: {}; texel buffer descriptors {:.0f}/s",
              kinds.empty() ? "none" : kinds, rate(delta(&Counts::texel)));
     LOG_INFO(Render_Vulkan, "  memory seam fills/s by site: {}", sites.empty() ? "none" : sites);
@@ -1576,12 +1566,13 @@ void MemStage::LogStats() {
         LOG_INFO(Render_Vulkan,
                  "  memory seam 2b: held draws {:.0f}/s, late fill draws {:.0f}/s (texel "
                  "buffers), held dispatches {:.0f}/s, late fill dispatches {:.0f}/s, not held "
-                 "(arena busy) {}; tick moved (5.5) {}; rest plays {} ({} descriptors dropped); "
+                 "(arena busy) {}; flushed while held (5.5) {}; rest plays {} ({} descriptors "
+                 "dropped); "
                  "descriptor form mismatches {}; fill {:.3f} ms/s ({:.2f} us a packet), play "
                  "{:.3f} ms/s (inclusive, with EDEN_NX2_GPU_PROFILE)",
                  rate(held_draws), rate(delta(&Counts::late_draws)), rate(held_dispatches),
                  rate(delta(&Counts::late_dispatches)), delta(&Counts::unheld),
-                 delta(&Counts::tick_moved), delta(&Counts::rest_plays),
+                 delta(&Counts::held_flushed), delta(&Counts::rest_plays),
                  delta(&Counts::rest_descriptors), delta(&Counts::form_mismatch),
                  static_cast<double>(delta(&Counts::fill_ns)) / 1e6 / seconds,
                  held_packets != 0 ? static_cast<double>(delta(&Counts::fill_ns)) / 1e3 /
@@ -1625,7 +1616,8 @@ void MemStage::Snapshot(Counts& out) const {
     out.held_dispatches = counters.held_dispatches.load(std::memory_order_relaxed);
     out.late_dispatches = counters.late_dispatches.load(std::memory_order_relaxed);
     out.unheld = counters.unheld.load(std::memory_order_relaxed);
-    out.tick_moved = counters.tick_moved.load(std::memory_order_relaxed);
+    out.held_flushed = counters.held_flushed.load(std::memory_order_relaxed);
+    out.seam_clamped = counters.seam_clamped.load(std::memory_order_relaxed);
     out.rest_plays = counters.rest_plays.load(std::memory_order_relaxed);
     out.rest_descriptors = counters.rest_descriptors.load(std::memory_order_relaxed);
     out.form_mismatch = counters.form_mismatch.load(std::memory_order_relaxed);
@@ -1701,8 +1693,8 @@ u64 SeamClock::SubmitForHostRead(std::source_location location) {
 // What N a close publishes. Entries the stage filled and the player has not played are not
 // recorded yet: their number (`unplayed_from`, set when the first entry starts waiting) and every
 // later one stay open, and are published with a later tick, the one their play lands in. That is
-// what makes sub-step 2b's tick guard (StagingBufferPool::Retick) unnecessary with packet ticks:
-// a staging buffer stamped at an early fill is not free before the tick its copy is recorded in.
+// why SEAM 2 and 3 need packet ticks (and 2b has no tick guard): a staging buffer stamped at an
+// early fill is not free before the tick its copy is recorded in.
 // Otherwise the close takes the current number and moves the stage on to the next, so a stamp
 // taken after the tick ended is never published with it. On one thread each number then lives
 // in exactly one tick, and every answer is today's: IsFree(N) == IsFree(the tick N was handed
@@ -1727,7 +1719,7 @@ u64 SeamClock::SubmitForHostRead(std::source_location location) {
 //   early:     the packet answer frees (or waits for) less than the tick answer. Unsafe; must be 0.
 //   late:      the packet answer holds longer. Must be 0 on one thread.
 //   carried:   numbers a tick ended with unplayed (an early fill across a flush): skipped, the
-//              packet answer is the right one there and the tick answer is the one 2b guards.
+//              packet answer is the right one there (the tick answer would free too early).
 //   split:     a number handed out in two ticks without a carry (a tick ended without a close).
 //              Must be 0.
 //   unchecked: stamps older than the ring.

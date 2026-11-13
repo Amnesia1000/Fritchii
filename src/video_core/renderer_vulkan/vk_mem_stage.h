@@ -32,13 +32,11 @@ class MemoryManager;
 
 namespace Vulkan {
 
-class Buffer;
 struct BufferCacheParams;
 class Device;
 class MemoryAllocator;
 class MemPlayer;
 class Scheduler;
-class StagingBufferPool;
 
 class MemStage {
 public:
@@ -144,7 +142,6 @@ public:
     };
     struct DrawPacket {
         u64 number;
-        u64 fill_tick;
         u32 flags;
         u32 repack_mask;
         u32 repack_dirty;
@@ -159,7 +156,6 @@ public:
     };
     struct DispatchPacket {
         u64 number;
-        u64 fill_tick;
         u32 flags;
         Span before;
         Span descriptors;
@@ -350,9 +346,8 @@ public:
     void BeginDraw(u32 repack_mask, u32 repack_dirty);
     void BeginDispatch();
 
-    /// The cache whose ranges the read log asks about and the staging pool the tick guard
-    /// restamps (the buffer cache's own).
-    void Attach(Cache& cache, StagingBufferPool& staging_pool) noexcept;
+    /// The cache whose ranges the read log asks about.
+    void Attach(Cache& cache) noexcept;
 
     /// SEAM = 2: the draw's whole fill, before the texture work. Null when the draw is not held
     /// (another SEAM, texel buffers: LateFill, or the arena busy on another thread); Configure
@@ -382,13 +377,6 @@ public:
     /// (it runs before Acquire), else the queue's.
     [[nodiscard]] bool DescriptorForm(bool queue_form) const noexcept {
         return fill_form < 0 ? queue_form : fill_form != 0;
-    }
-
-    /// Buffer::MarkUsage: the buffers a held fill stamps (the tick guard restamps them).
-    static void NoteMarked(Buffer* buffer) {
-        if (t_marked != nullptr) [[unlikely]] {
-            t_marked->push_back(buffer);
-        }
     }
 
     enum class Value : u8 {
@@ -495,8 +483,6 @@ private:
 
     inline static thread_local ReadLog* t_log = nullptr;
 
-    inline static thread_local std::vector<Buffer*>* t_marked = nullptr;
-
     struct Part {
         const void* data;
         u32 bytes;
@@ -532,7 +518,8 @@ private:
         u64 held_dispatches{};
         u64 late_dispatches{};
         u64 unheld{};
-        u64 tick_moved{};
+        u64 held_flushed{};
+        u64 seam_clamped{};
         u64 rest_plays{};
         u64 rest_descriptors{};
         u64 form_mismatch{};
@@ -579,24 +566,25 @@ private:
     /// FRITCHII_MEMSTAGE_READ_LOG: every Nth packet's reads are compared, 0 off
     int read_log_every{};
     Cache* cache{};
-    StagingBufferPool* staging_pool{};
+    /// SEAM 2/3 asked for without packet ticks: run as SEAM 1 (logged once).
+    bool clamp_logged{};
 
     HeldKind held{HeldKind::None};
     bool filling_held{};
+    HeldKind filling_kind{HeldKind::None};
+    /// The held packet saw a flush between its fill and its PlayRest (counted once).
+    bool held_flush_seen{};
     s8 fill_form{-1};
     Arena held_arena;
     u32 held_cursor{};
     bool held_form{};
     std::array<u64, 2> held_hashes{};
-    std::vector<Buffer*> marked;
-    std::vector<Buffer*> held_marked;
     ReadLog op_log;
     ReadLog held_log;
     bool held_log_pending{};
     u64 op_fills{};
     std::vector<u8> compare_scratch;
     std::atomic<u32> diffs_logged{};
-    std::atomic<u32> ticks_logged{};
     bool claim_deferring{};
     bool pending{};
     u32 play_cursor{};
@@ -631,7 +619,8 @@ private:
         std::atomic<u64> held_dispatches{};
         std::atomic<u64> late_dispatches{};
         std::atomic<u64> unheld{};
-        std::atomic<u64> tick_moved{};
+        std::atomic<u64> held_flushed{};
+        std::atomic<u64> seam_clamped{};
         std::atomic<u64> rest_plays{};
         std::atomic<u64> rest_descriptors{};
         std::atomic<u64> form_mismatch{};

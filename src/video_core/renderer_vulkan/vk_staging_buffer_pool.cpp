@@ -150,19 +150,6 @@ void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
     it->deferred = false;
 }
 
-void StagingBufferPool::Retick(u64 from) {
-    const u64 now = clock.Now();
-    for (StagingBuffersCache* const cache : {&device_local_cache, &upload_cache, &download_cache}) {
-        for (StagingBuffers& level : *cache) {
-            for (StagingBuffer& entry : level.entries) {
-                if (!entry.deferred && entry.tick == from) {
-                    entry.tick = now;
-                }
-            }
-        }
-    }
-}
-
 void StagingBufferPool::TickFrame() {
     current_delete_level = (current_delete_level + 1) % NUM_LEVELS;
 

@@ -72,9 +72,6 @@ public:
         return last_usage_tick;
     }
 
-    /// The memory seam's tick guard: a use stamped `from` is recorded in the current tick.
-    void Restamp(u64 from) noexcept;
-
     [[nodiscard]] std::span<const u8> Mapped() const noexcept {
         return buffer.IsHostCoherent() ? buffer.Mapped() : std::span<const u8>{};
     }
