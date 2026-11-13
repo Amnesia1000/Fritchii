@@ -1293,7 +1293,7 @@ void Maxwell3D::ProcessQueryCondition() {
         VideoCommon::Nx2Profile::Zone::RenderEnable};
     const bool host_condition = rasterizer->AccelerateConditionalRendering();
     // FRITCHII_MEMSTAGE_SHADOW: draws under host conditional rendering are level (spec 3.4).
-    if (VideoCommon::MemStageShadow::g_on) [[unlikely]] {
+    if (VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
         VideoCommon::MemStageShadow::BackCondition(host_condition);
     }
     if (host_condition) {

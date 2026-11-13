@@ -31,7 +31,7 @@ struct BindChannelCall {
     void operator()() const {
         std::scoped_lock lk{*guard};
         gpu->BindChannel(static_cast<s32>(bind_id));
-        if (VideoCommon::MemStageShadow::g_on) [[unlikely]] {
+        if (VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
             VideoCommon::MemStageShadow::BackChannel(static_cast<s32>(bind_id));
         }
     }

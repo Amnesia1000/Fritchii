@@ -1384,7 +1384,7 @@ void MemoryManager::FlushCaching() {
     }
     // FRITCHII_MEMSTAGE_SHADOW: the memory stage's collected constant buffer ranges against
     // these (compare d); also when there are none.
-    if (VideoCommon::MemStageShadow::g_on) [[unlikely]] {
+    if (VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
         VideoCommon::MemStageShadow::BackFlush(
             *this, std::span<const std::pair<DAddr, std::size_t>>{page_stash2.data(),
                                                                   page_stash2.size()});

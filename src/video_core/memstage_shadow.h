@@ -3,6 +3,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <span>
 #include <utility>
 
@@ -72,8 +73,10 @@ enum class StageDrawLoop : u8 {
 /// shadow's. memstage_shadow.cpp has the details. Off, each hook below is one test of g_on.
 namespace MemStageShadow {
 
-/// FRITCHII_MEMSTAGE_SHADOW (boot): read by ReadSwitch before the back thread starts.
-inline bool g_on{};
+/// FRITCHII_MEMSTAGE_SHADOW (boot): read by ReadSwitch before the back thread starts. Atomic
+/// (relaxed): FlushRegion and FlushCaching test it on CPU threads too, while a new session's
+/// ReadSwitch may write it.
+inline std::atomic<bool> g_on{};
 
 /// Reads the switch (GpuSplit::MaybeStart, before the back thread exists).
 void ReadSwitch();

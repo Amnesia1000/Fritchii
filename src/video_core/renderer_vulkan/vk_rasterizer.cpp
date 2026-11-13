@@ -1293,7 +1293,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         VideoCommon::MemStageStats::ProgramSet(pipeline->ShaderHashes());
     }
     // FRITCHII_MEMSTAGE_SHADOW: the facts table's compare (c) and the draw kinds of spec 3.4.
-    if (VideoCommon::MemStageShadow::g_on) [[unlikely]] {
+    if (VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
         const MemStage::DrawFacts facts = pipeline->MemFacts();
         const bool diagnostic = frame_dump.Capturing() || VideoCommon::RenderTrace::Enabled() ||
                                 OcarinaTemporalEnabled();
@@ -1508,7 +1508,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     // false or an exception).
     mem_stage.FillDraw(buffer_cache, pipeline->MemFacts(), is_indexed);
     // FRITCHII_MEMSTAGE_SHADOW: read flushes from here to the record are counted.
-    if (VideoCommon::MemStageShadow::g_on) [[unlikely]] {
+    if (VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
         VideoCommon::MemStageShadow::BackDrawWindow(true);
     }
     bool configured{};
@@ -1600,7 +1600,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         Profile::Scope scope{Profile::Zone::DrawRecord};
         scheduler.TraceGraphicsPipeline(pipeline->ShaderHashes());
         trace_draw_hashes = {pipeline->ShaderHashes()[1], pipeline->ShaderHashes()[5]};
-        if (VideoCommon::MemStageShadow::g_on) [[unlikely]] {
+        if (VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
             VideoCommon::MemStageShadow::BackDrawWindow(false);
         }
         draw_func();
@@ -3302,7 +3302,7 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType 
         mem_stage.NoteGather(MemStage::Gather::FlushRegion, static_cast<u32>(which));
     }
     // FRITCHII_MEMSTAGE_SHADOW: read flushes inside a draw (between its fill and its record).
-    if (VideoCommon::MemStageShadow::g_on) [[unlikely]] {
+    if (VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
         using VideoCommon::CacheType;
         VideoCommon::MemStageShadow::BackFlushRegion(True(which & CacheType::TextureCache),
                                                      True(which & CacheType::BufferCache),
@@ -3333,7 +3333,7 @@ void RasterizerVulkan::FlushRegionForRead(DAddr addr, u64 size) {
     if (addr == 0 || size == 0) {
         return;
     }
-    if (VideoCommon::MemStageShadow::g_on) [[unlikely]] {
+    if (VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
         VideoCommon::MemStageShadow::BackFlushRegion(true, true, true);
     }
     // EDEN_NX2_EXP49: as FlushRegion, but the buffer cache doesn't wait for the host GPU here
@@ -4015,7 +4015,7 @@ void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64
     if (Common::WriteRing::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
         mem_stage.NoteGather(MemStage::Gather::Apply, 0);
     }
-    if (VideoCommon::MemStageShadow::g_on) [[unlikely]] {
+    if (VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
         VideoCommon::MemStageShadow::BackCacheInvalidation(true, ranges.size());
     }
     namespace CbPath = VideoCommon::Nx2CbPath;
@@ -4111,7 +4111,7 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
     if (addr == 0 || size == 0) {
         return;
     }
-    if (VideoCommon::MemStageShadow::g_on) [[unlikely]] {
+    if (VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
         VideoCommon::MemStageShadow::BackCacheInvalidation(false, 1);
     }
     if (VideoCommon::Nx2FastDrawCount::g_on) [[unlikely]] {

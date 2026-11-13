@@ -1695,7 +1695,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     g_back_thread_id.store(GetCurrentThreadId(), std::memory_order_relaxed);
 #endif
     u64 read_position = 0;
-    if (MemStageShadow::g_on) [[unlikely]] {
+    if (MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
         MemStageShadow::Start();
     }
     while (!stop_token.stop_requested()) {
@@ -1789,7 +1789,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             }
             // FRITCHII_MEMSTAGE_SHADOW: the memory stage's inputs for this entry, compared at
             // the back's draws (memstage_shadow.cpp). Off: this one test per entry.
-            if (MemStageShadow::g_on) [[unlikely]] {
+            if (MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
                 MemStageShadow::Before(read_position);
             }
             const size_t size =

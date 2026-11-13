@@ -1302,8 +1302,8 @@ std::pair<DAddr, DAddr> FirstUncovered(const std::vector<std::pair<DAddr, DAddr>
 void ReadSwitch() {
     const char* const value = std::getenv("FRITCHII_MEMSTAGE_SHADOW");
     g_mode = value != nullptr ? std::atoi(value) : 0;
-    g_on = g_mode != 0;
-    if (g_on) {
+    g_on.store(g_mode != 0, std::memory_order_relaxed);
+    if (g_mode != 0) {
         LOG_INFO(HW_GPU,
                  "Memory stage shadow (FRITCHII_MEMSTAGE_SHADOW={}): the stage's inputs run on the "
                  "back and are compared at every draw; nothing they compute is used",

@@ -431,7 +431,7 @@ void Maxwell3D::DrawManager::ProcessDraw(Engine& maxwell3d, bool draw_indexed, u
         maxwell3d.StageDraw(draw_indexed, instance_count, false);
     } else {
         // FRITCHII_MEMSTAGE_SHADOW: the stage's copy issued the same draw (compares a and b).
-        if (VideoCommon::MemStageShadow::g_on) [[unlikely]] {
+        if (VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
             VideoCommon::MemStageShadow::BackDraw(maxwell3d, draw_indexed, instance_count, false);
         }
         // EDEN_NX2_MEMSTAGE_STATS: draws per channel, and those render-enable skips (section 4).
@@ -452,7 +452,7 @@ void Maxwell3D::DrawManager::ProcessDrawIndirect(Engine& maxwell3d) {
     if constexpr (!IsBack<Engine>) {
         maxwell3d.StageDraw(true, 1, true);
     } else {
-        if (VideoCommon::MemStageShadow::g_on) [[unlikely]] {
+        if (VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
             VideoCommon::MemStageShadow::BackDraw(maxwell3d, indirect_state.is_indexed, 1, true);
         }
         VideoCommon::MemStageStats::Draw(!maxwell3d.ShouldExecute());
