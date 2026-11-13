@@ -116,6 +116,9 @@ enum class Source : u8 {
     /// EXP127 not 0 and EXP126 = 1: as OverlayFromMemory, built while the ranged overflow (whose
     /// writes are stamped) was the only unbounded writer queued; fed with EXP127 = 2
     OverlayFromMemoryOverflow,
+    /// EXP127 not 0: as Memory, with no unbounded writer queued over the QMD either (the
+    /// overlays' belt, QueuedGuestWriters); fed with EXP127 = 2
+    MemoryChecked,
     Count,
 };
 struct Record {
@@ -163,6 +166,10 @@ enum class Mirror : u32 {
     /// only unbounded writer queued
     /// (Source::OverlayFromMemoryOverflow; not counted in OverlayFromMemoryUnbounded)
     OverlayFromMemoryOverflow,
+    /// EXP127 not 0, of the Memory reads in a feed mode with EDEN_NX2_FEED_MEMORY_OVERLAY on:
+    /// no unbounded writer queued over the QMD (Source::MemoryChecked), or one queued
+    MemoryChecked,
+    MemoryUnbounded,
     Count,
 };
 void NoteMirror(Mirror event);

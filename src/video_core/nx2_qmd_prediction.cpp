@@ -243,13 +243,18 @@ enum class Fed : u32 { QueuedPlain, LandedPending, Bound, Count };
 constexpr std::array<const char*, static_cast<size_t>(Source::Count)> source_names{
     "not a QMD", "inline QMD", "patched inline QMD", "overlay from memory", "upload shadow",
     "memory", "memory after a wait", "overlay from memory (not checked for the feed)",
-    "overlay from memory (the stamped overflow queued)"};
+    "overlay from memory (the stamped overflow queued)", "memory, checked"};
 
 /// The sources EXP127 = 2 adds to the feed (fable_fence_writers_brief piece 2), with
 /// EDEN_NX2_FEED_MEMORY_OVERLAY on. Overlays from memory built while the ranged overflow was the
 /// only unbounded writer queued: its writes are stamped by GPU and device address (EXP126 = 1),
-/// and the overlay was built only with no stamp over the QMD newer than the back.
-constexpr std::array<Source, 1> NewSources{Source::OverlayFromMemoryOverflow};
+/// and the overlay was built only with no stamp over the QMD newer than the back. Plain memory
+/// reads past the same guards as an overlay from memory (mapped, not GPU-written, no inline QMD
+/// of it queued or evicted, no stamp over it newer than the back) and its belt (no unbounded
+/// writer queued): the back reads the same bytes unless something outside the stream writes the
+/// QMD in between, the overlays' exposure too.
+constexpr std::array<Source, 2> NewSources{Source::OverlayFromMemoryOverflow,
+                                           Source::MemoryChecked};
 bool NewFeedSource(Source source) {
     return std::ranges::find(NewSources, source) != NewSources.end() && FeedMemoryOverlays();
 }
@@ -678,7 +683,9 @@ struct State {
                      fed_rate(Fed::LandedPending, 0), fed_rate(Fed::LandedPending, 1),
                      fed_rate(Fed::Bound, 0), fed_rate(Fed::Bound, 1), fed_checks_passed,
                      fed_checks_violated, fed_checks_unverified, fed_checks_full,
-                     feed_check_count, not_fed_source[static_cast<size_t>(Source::Memory)],
+                     feed_check_count,
+                     not_fed_source[static_cast<size_t>(Source::Memory)] +
+                         not_fed_source[static_cast<size_t>(Source::MemoryChecked)],
                      not_fed_source[static_cast<size_t>(Source::Waited)],
                      not_fed_source[static_cast<size_t>(Source::OverlayFromMemory)] +
                          not_fed_source[static_cast<size_t>(Source::OverlayFromMemoryUnchecked)] +
@@ -719,12 +726,15 @@ struct State {
                      "QMD feed sources (EXP127={}, EXP126={}): back checks of QMD records by "
                      "source, /s matched/payload differs/unpredicted (by the copy's last read): "
                      "{}; overlays from memory built/s with only the stamped ranged overflow "
-                     "queued {:.0f}; acquires/s the feed would meet through the new sources "
+                     "queued {:.0f}; QMD reads/s from memory (nothing queued over them) with no "
+                     "unbounded writer queued {:.0f}, with one {:.0f}; acquires/s the feed would "
+                     "meet through the new sources "
                      "(queued plain/run unlanded/bound): {}; those checked at their landing: {} "
                      "right, {} wrongly met, {} unknown (session {} checked, {} wrongly met); "
                      "acquires/s fed through them: {}",
                      sources_mode, VideoCore::Nx2Debug::Experiment(126), checks,
-                     mirrored(Mirror::OverlayFromMemoryOverflow), would,
+                     mirrored(Mirror::OverlayFromMemoryOverflow),
+                     mirrored(Mirror::MemoryChecked), mirrored(Mirror::MemoryUnbounded), would,
                      would_checked - would_wrong, would_wrong, would_unknown,
                      session_would_checked, session_would_wrong, through);
         }

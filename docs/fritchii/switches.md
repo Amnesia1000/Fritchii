@@ -1746,13 +1746,28 @@ is refused again at 0.
   sent before the device stamps as a floor) is not newer than the back's position. So no dropped
   write still queued writes the QMD's bytes; EXP126's trial compared about 560 reads a window, 0
   differed. With EXP126 at 0 or 2 the belt is as before.
+- Plain memory reads (2b): a QMD read from guest memory with nothing queued over it
+  (Source::Memory, 174 to 202 refusals a second at the market with EXP126 = 1) passes the guards
+  an overlay from memory passes: mapped, not GPU-written, no inline QMD of it queued or evicted
+  (a queued overlay of it would serve the read or set its target past the back), no upload
+  shadow block of it queued (it would serve the read), no write stamp over it newer than the
+  back. With EXP127 not 0 (EXP13 3 or 4, EDEN_NX2_FEED_MEMORY_OVERLAY on) the read also asks the
+  overlays' belt (QueuedGuestWriters: no unbounded writer queued; the overflow as above with
+  EXP126 = 1), and with it clean its records get the source "memory, checked"
+  (QmdPrediction::Source::MemoryChecked). Exact on the same ground as the overlays from memory:
+  the copy reads the QMD at the same signal the back reads it at, so the back reads the same
+  bytes unless something outside the stream (the guest CPU, a read-back landing) writes the QMD
+  in between, and the overlays have that exposure too (their bytes come from memory at the
+  patch, earlier still). The back checks every release against its record, and the feed turns
+  itself off at the first one that differs.
 To judge: one market and one fight window at 1 (the "QMD feed sources" line: the new sources'
 back checks must show 0 payload differs and 0 unpredicted, and their would-be decisions 0
 wrongly met), then profile_toggle.py on EXP127 1 against 2 at the market, heavy phase,
 uncapped, GPU_PROFILE on. At 2 these must stay 0 / on: the EXP13 feed line's "feed on", "0
 violated", "0 wrongly met", "0 not fed (check table full)"; the EXP13 line's "back QMD: ... 0
 payload differs, 0 unpredicted" and "0 resyncs/s". Should move at 2: the feed line's "not fed
-for their QMD source" (overlays from memory) and "built/s with an unbounded writer queued" to
+for their QMD source" (from memory, overlays from memory; with 1 these count the new sources
+too, as at 0) and "built/s with an unbounded writer queued" to
 near 0, "met by a queued plain release" up by 80 to 100 a second, the fence writer line's
 readable acquires unmet down by 105 to 120 a second, the EXP13 line's "would be met by a
 predicted queued release" to near 0.
@@ -1764,11 +1779,14 @@ predicted queued release" to near 0.
   as matched/payload differs/unpredicted (an unpredicted release has no record: it counts under
   the source of the copy's last QMD read), for every source: inline QMD, patched inline QMD,
   overlay from memory, upload shadow, memory, memory after a wait, overlay from memory (not
-  checked for the feed), overlay from memory (the stamped overflow queued); releases and
-  reductions together;
+  checked for the feed), overlay from memory (the stamped overflow queued), memory, checked;
+  releases and reductions together;
 - overlays from memory built a second with the stamped overflow as the only unbounded writer
   queued (with EXP127 not 0 these no longer count in the feed line's "built/s with an unbounded
   writer queued");
+- QMD reads a second from memory with nothing queued over them (the EXP13 line's "from memory")
+  whose belt was clean ("memory, checked") and those with an unbounded writer queued (EXP13 3
+  or 4 with EDEN_NX2_FEED_MEMORY_OVERLAY on; 0 otherwise);
 - EXP127 = 1: acquires a second (resume polls included) the feed would have met through the new
   sources, by source, as queued plain/run but unlanded/reduction bound (the plain and narrow
   gates as at 2; the bound's check table is not asked), and those decisions checked once their

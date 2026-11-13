@@ -383,12 +383,12 @@ std::string ProbeFrontQmd(u64 qmd) {
     if (read == g_front_qmd.reads.end() || read->second.space == nullptr) {
         return text + "; no read noted";
     }
-    constexpr std::array<const char*, 9> sources{
+    constexpr std::array<const char*, 10> sources{
         "not a QMD",           "inline QMD",
         "patched inline QMD",  "overlay from memory",
         "upload shadow",       "memory",
         "memory after a wait", "overlay from memory (not checked for the feed)",
-        "overlay from memory (the stamped overflow queued)"};
+        "overlay from memory (the stamped overflow queued)", "memory, checked"};
     constexpr std::array<const char*, 13> causes{
         "none", "noted write", "writer range", "3D ranged write", "unbounded writer",
         "unranged writer", "queued function", "3D method write", "unknown noted write",
@@ -3088,6 +3088,22 @@ bool KeplerCompute::FrontReadQmd(VideoCommon::GpuSplit& split, u64 address,
         Prediction::NoteWait(cause, what);
     } else {
         Prediction::NoteMirror(Prediction::Mirror::Memory);
+        // EXP127 not 0 (fable_fence_writers_brief 2b): this read passed the guards an overlay
+        // from memory passes (mapped, not GPU-written, no inline QMD of it queued or evicted: its
+        // overlay would serve or set the target, no stamp over it newer than `done`); with the
+        // overlays' belt too (no unbounded writer queued; the stamped overflow as at the patch)
+        // its records get a source the feed takes with EXP127 = 2. Asked only when it could.
+        if (Prediction::FeedSourcesMode() != 0 && Prediction::FeedRequested() &&
+            Prediction::FeedMemoryOverlays()) {
+            if (split.QueuedGuestWriters(done, address, *device, size, {},
+                                         split.OverflowFloorOff())
+                    .unbounded == 0) {
+                info.source = Prediction::Source::MemoryChecked;
+                Prediction::NoteMirror(Prediction::Mirror::MemoryChecked);
+            } else {
+                Prediction::NoteMirror(Prediction::Mirror::MemoryUnbounded);
+            }
+        }
     }
     memory_manager.ReadBlockUnsafe(address, descriptor.data(), size);
     compare_at_1(Served::Memory, waited);
