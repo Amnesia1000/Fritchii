@@ -623,6 +623,7 @@ private:
         std::atomic<u64> staging_fallbacks{}; ///< GPUMem took a new staging buffer, stream busy
         std::atomic<u64> hook_flushes{};      ///< the back's skipped idle hook, its flush run
         std::atomic<u64> stage_idles{};
+        std::atomic<u64> run_input_waits{};   ///< fps fix 3: a run kept lent at the input's end
     };
     Counters counters;
     struct Snapshot {
@@ -669,6 +670,7 @@ private:
         u64 staging_fallbacks{};
         u64 hook_flushes{};
         u64 stage_idles{};
+        u64 run_input_waits{};
     };
     void Take(Snapshot& out) const noexcept;
     Snapshot reported{};

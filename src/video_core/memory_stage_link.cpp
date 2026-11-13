@@ -1543,8 +1543,27 @@ void MemoryStageLink::RingLoop(std::stop_token& stop, u64 start) {
                 // back's batches short). Level mode publishes each, as before.
                 const bool publish_once = ring_window != 0;
                 for (;;) {
-                    if (until == Ring::Published().load(std::memory_order_acquire) ||
-                        !MemStageShadow::StageExtendsRun(until)) {
+                    if (until == Ring::Published().load(std::memory_order_acquire)) {
+                        if (!publish_once) {
+                            break; // level mode: the run ends at the input's end, as before
+                        }
+                        // fps fix 3: the run reached the end of what the front published. Ending
+                        // it here and lending again at the next hard entry cut one run in two
+                        // (about 4,700 lends a second at the market). With the window open it
+                        // stays lent: the back gets what is followed so far, GPUMem waits for
+                        // more input, and the run ends at the first entry that needs GPUMem.
+                        if (until != staged_local) {
+                            Ring::LentUntil().store(until, std::memory_order_relaxed);
+                            PublishStaged(until);
+                        }
+                        LinkBump(counters.run_input_waits);
+                        if (!StageWaitFor(stop, StageWait::Input, until) ||
+                            !ring_wanted.load(std::memory_order_acquire)) {
+                            break;
+                        }
+                        continue;
+                    }
+                    if (!MemStageShadow::StageExtendsRun(until)) {
                         break;
                     }
                     const MemStageShadow::StageResult more = MemStageShadow::StageProcess(until, true);
@@ -1685,6 +1704,7 @@ void MemoryStageLink::Take(Snapshot& out) const noexcept {
     out.staging_fallbacks = load(counters.staging_fallbacks);
     out.hook_flushes = load(counters.hook_flushes);
     out.stage_idles = load(counters.stage_idles);
+    out.run_input_waits = load(counters.run_input_waits);
 }
 
 void MemoryStageLink::LogStats() {
@@ -1818,7 +1838,7 @@ void MemoryStageLink::LogStats() {
                 "waited for the cache's lock held by GPUMem {:.0f}/s; GPUMem served the back's "
                 "call while waiting for the lock {:.0f}/s; served downloads past the join ring's "
                 "reach {:.0f}/s; idle hook runs with the stage busy {:.0f}/s; GPUMem idle work "
-                "{:.0f}/s",
+                "{:.0f}/s; runs kept lent at the end of the input {:.0f}/s",
                 window >= AheadUnlimited ? std::string{"unlimited"} : fmt::format("{}", window),
                 seconds,
                 packets != 0 ? static_cast<double>(delta(&Snapshot::ahead_sum)) /
@@ -1835,7 +1855,7 @@ void MemoryStageLink::LogStats() {
                 rate(delta(&Snapshot::join_catchups)), rate(delta(&Snapshot::deferred_lends)),
                 rate(delta(&Snapshot::back_lock_waits)), rate(delta(&Snapshot::stage_lock_serves)),
                 rate(delta(&Snapshot::joins_unknown)), rate(delta(&Snapshot::hook_flushes)),
-                rate(delta(&Snapshot::stage_idles)));
+                rate(delta(&Snapshot::stage_idles)), rate(delta(&Snapshot::run_input_waits)));
         }
     }
     reported = current;
