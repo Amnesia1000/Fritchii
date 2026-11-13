@@ -25,6 +25,7 @@
 #include "core/device_memory_manager.h"
 #include "core/memory.h"
 #include "core/nx2_protect_stats.h"
+#include "video_core/back_read_audit.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_perf.h"
 
@@ -394,24 +395,32 @@ void DeviceMemoryManager<Traits>::TrackContinuityImpl(DAddr address, VAddr virtu
         tracked_entries.GetUnchecked(start_page_d + index).continuity_tracker = static_cast<u32>(page_count) - 1;
     }
 }
+// FRITCHII_BACK_READ_AUDIT (video_core/back_read_audit.cpp): the read functions below count
+// their caller on the GPU back thread. One branch on a static bool each while off.
 template <typename Traits>
 u8* DeviceMemoryManager<Traits>::GetSpan(const DAddr src_addr, const std::size_t size) {
-    size_t page_index = src_addr >> page_bits;
-    size_t subbits = src_addr & page_mask;
-    if ((static_cast<size_t>(tracked_entries[page_index].continuity_tracker+1) << page_bits) >= size + subbits) {
-        return GetPointer<u8>(src_addr);
-    }
-    return nullptr;
+    const auto body = [&]() -> u8* {
+        size_t page_index = src_addr >> page_bits;
+        size_t subbits = src_addr & page_mask;
+        if ((static_cast<size_t>(tracked_entries[page_index].continuity_tracker+1) << page_bits) >= size + subbits) {
+            return GetPointer<u8>(src_addr);
+        }
+        return nullptr;
+    };
+    FRITCHII_BACK_READ_AUDITED(size, VideoCommon::BackReadAudit::Kind::DevGetSpanMut, body);
 }
 
 template <typename Traits>
 const u8* DeviceMemoryManager<Traits>::GetSpan(const DAddr src_addr, const std::size_t size) const {
-    size_t page_index = src_addr >> page_bits;
-    size_t subbits = src_addr & page_mask;
-    if ((static_cast<size_t>(tracked_entries[page_index].continuity_tracker+1) << page_bits) >= size + subbits) {
-        return GetPointer<u8>(src_addr);
-    }
-    return nullptr;
+    const auto body = [&]() -> const u8* {
+        size_t page_index = src_addr >> page_bits;
+        size_t subbits = src_addr & page_mask;
+        if ((static_cast<size_t>(tracked_entries[page_index].continuity_tracker+1) << page_bits) >= size + subbits) {
+            return GetPointer<u8>(src_addr);
+        }
+        return nullptr;
+    };
+    FRITCHII_BACK_READ_AUDITED(size, VideoCommon::BackReadAudit::Kind::DevGetSpan, body);
 }
 
 template <typename Traits>
@@ -431,6 +440,7 @@ void DeviceMemoryManager<Traits>::InnerGatherDeviceAddresses(Common::ScratchBuff
 template <typename Traits>
 template <typename T>
 T* DeviceMemoryManager<Traits>::GetPointer(DAddr address) {
+    FRITCHII_BACK_READ_NOTE(0, VideoCommon::BackReadAudit::Kind::DevGetPointerMut);
     const size_t index = address >> Memory::YUZU_PAGEBITS;
     const size_t offset = address & Memory::YUZU_PAGEMASK;
     auto phys_addr = tracked_entries[index].compressed_physical_ptr;
@@ -442,6 +452,7 @@ T* DeviceMemoryManager<Traits>::GetPointer(DAddr address) {
 template <typename Traits>
 template <typename T>
 const T* DeviceMemoryManager<Traits>::GetPointer(DAddr address) const {
+    FRITCHII_BACK_READ_NOTE(0, VideoCommon::BackReadAudit::Kind::DevGetPointer);
     const size_t index = address >> Memory::YUZU_PAGEBITS;
     const size_t offset = address & Memory::YUZU_PAGEMASK;
     auto phys_addr = tracked_entries[index].compressed_physical_ptr;
@@ -453,8 +464,11 @@ const T* DeviceMemoryManager<Traits>::GetPointer(DAddr address) const {
 template <typename Traits>
 template <typename T>
 void DeviceMemoryManager<Traits>::Write(DAddr address, T value) {
-    Common::WritePagedScalar(address, value, [&](DAddr page_address) {
-        return page_address < device_as_size ? GetPointer<u8>(page_address) : nullptr;
+    // A write: its pointer getter is hidden from the back read audit.
+    VideoCommon::BackReadAudit::Unaudited([&] {
+        Common::WritePagedScalar(address, value, [&](DAddr page_address) {
+            return page_address < device_as_size ? GetPointer<u8>(page_address) : nullptr;
+        });
     });
     Common::UniformKeepPages::Note(address, sizeof(T)); // EXP92, after the store
 }
@@ -462,9 +476,12 @@ void DeviceMemoryManager<Traits>::Write(DAddr address, T value) {
 template <typename Traits>
 template <typename T>
 T DeviceMemoryManager<Traits>::Read(DAddr address) const {
-    return Common::ReadPagedScalar<T>(address, [&](DAddr page_address) {
-        return page_address < device_as_size ? GetPointer<u8>(page_address) : nullptr;
-    });
+    const auto body = [&]() -> T {
+        return Common::ReadPagedScalar<T>(address, [&](DAddr page_address) {
+            return page_address < device_as_size ? GetPointer<u8>(page_address) : nullptr;
+        });
+    };
+    FRITCHII_BACK_READ_AUDITED(sizeof(T), VideoCommon::BackReadAudit::Kind::DevRead, body);
 }
 
 template <typename Traits>
@@ -498,6 +515,7 @@ void DeviceMemoryManager<Traits>::WalkBlock(DAddr addr, std::size_t size, auto o
 
 template <typename Traits>
 void DeviceMemoryManager<Traits>::ReadBlock(DAddr address, void* dest_pointer, size_t size) {
+    FRITCHII_BACK_READ_NOTE(size, VideoCommon::BackReadAudit::Kind::DevReadBlock);
     device_inter->FlushRegion(address, size);
     const std::size_t page_offset = address & Memory::YUZU_PAGEMASK;
     if (size <= Memory::YUZU_PAGESIZE - page_offset) {
@@ -565,6 +583,7 @@ void DeviceMemoryManager<Traits>::WriteBlock(DAddr address, const void* src_poin
 
 template <typename Traits>
 void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_pointer, size_t size) {
+    FRITCHII_BACK_READ_NOTE(size, VideoCommon::BackReadAudit::Kind::DevReadBlockUnsafe);
     const std::size_t page_offset = address & Memory::YUZU_PAGEMASK;
     if (size <= Memory::YUZU_PAGESIZE - page_offset) {
         const DAddr guest_page = address & ~static_cast<DAddr>(Memory::YUZU_PAGEMASK);

@@ -284,6 +284,42 @@ size changes nothing the guest sees, only the hit rate and the cache/TLB footpri
 per process when the first A64 JIT is made (a64_emit_x64.cpp), logged as "JIT fast dispatch
 table: 2^N entries"; values outside 12..20 log a warning and keep 20. A32 is unchanged (2^16).
 
+### FRITCHII_BACK_READ_AUDIT
+
+FRITCHII_BACK_READ_AUDIT=1 (boot, default off; Fable's ideal pipeline design 2.5, memory stage
+step 2 spec 7.3): counts every read of game memory the GPU back thread makes, by call site, so
+the memory stage knows every crossing. The rule for step 7 is that memory the stream writes is
+read by the stage only: the list must come down to texture contents, the texture and sampler
+tables and shader code; any other site is a crossing to move into the packet. Needs the GPU
+split on (only the back counts). Read once when the first GPU address space is made, after
+nx2_switches.txt is applied.
+
+Hooked, in the read functions themselves (video_core/back_read_audit.h/.cpp): Tegra::
+MemoryManager's Read<T>, GetPointer, ReadHandleWord, GetPointerForDescriptor, ReadBlock,
+ReadBlockUnsafe, ReadBlockGuarded, ReadWordsUnsafe, GetSpan and CopyBlock, and the device
+memory's (MaxwellDeviceMemoryManager) Read<T>, GetPointer<T>, GetSpan, ReadBlock and
+ReadBlockUnsafe. GpuGuestMemory and DeviceGuestMemory read through those, as does a
+GpuToCpuAddress followed by a device read. A MemoryManager read counts once, at its caller (its
+own device reads are hidden); the managers' writes through the same getters are hidden. Pointer
+getters called from outside may still be writes: their kinds end in Mut. Bytes are counted
+where the size is known (not for the pointer getters).
+
+Off: one predictable branch on a static bool per read call. On: a thread-local check, then a
+lock-free table of 512 call sites (open addressing on the return address). Every 10 s the back
+logs the top 40 by reads, as offsets from the exe's base (logged once as "Back read audit: on,
+image base ..."):
+
+    Back read audit: 10.0 s, 87 sites, 123456 reads/s, 4567890 bytes/s, 0 reads dropped (table full)
+    Back read audit: #01 +0x1a2b3c4 MmReadHandleWord 51234.5 reads/s 204938 bytes/s
+
+`python -I E:\OotRemakeEmulation\work\back_read_audit.py [log] [--exe EXE] [--windows N]
+[--chain]` reads those lines (default: the live log), averages the last session's windows and
+symbolizes the sites with llvm-symbolizer against the exe that wrote the log (its .pdb next to
+it), marking each site CROSSING, allowed (texture cache, descriptor tables, shader code; a guess
+from the file name) or helper (a GuestMemory helper that was not inlined: the caller is one
+level out). A read function the compiler inlined into its caller (ThinLTO can, across files)
+reports the caller's caller: read such a row as "a read somewhere under this call".
+
 ## Numbered experiments (EDEN_NX2_EXPn)
 
 Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP79, live through the debug server:
