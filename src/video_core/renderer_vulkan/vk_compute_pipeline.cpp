@@ -667,12 +667,17 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     std::ranges::for_each(info.image_buffer_descriptors, add_buffer);
 
     {
-        const Profile::Scope resolve_scope{Profile::Zone::ComputeResolve};
-        buffer_cache.UpdateComputeBuffers();
-    }
-    {
-        const Profile::Scope sync_scope{Profile::Zone::ComputeSync};
-        buffer_cache.BindHostComputeBuffers();
+        // The dispatch's `before` section: its uploads, binds and descriptors are played here,
+        // before the image descriptors.
+        MemStage::FillPlay seam{buffer_cache.runtime.Seam(), MemStage::Site::DispatchBefore};
+        {
+            const Profile::Scope resolve_scope{Profile::Zone::ComputeResolve};
+            buffer_cache.UpdateComputeBuffers();
+        }
+        {
+            const Profile::Scope sync_scope{Profile::Zone::ComputeSync};
+            buffer_cache.BindHostComputeBuffers();
+        }
     }
     if (buffer_cache.any_buffer_uploaded) {
         buffer_cache.runtime.PostCopyBarrier();

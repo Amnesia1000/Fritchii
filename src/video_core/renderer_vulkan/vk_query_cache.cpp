@@ -1511,7 +1511,9 @@ void QueryCacheRuntime::HostConditionalRenderingCompareValueImpl(VideoCommon::Lo
         static constexpr auto sync_info = VideoCommon::ObtainBufferSynchronize::FullSynchronize;
         const auto post_op = VideoCommon::ObtainBufferOperation::DoNothing;
         const auto [buffer, offset] =
-            impl->buffer_cache.ObtainCPUBuffer(object.address, 8, sync_info, post_op);
+            impl->buffer_cache.runtime.Seam().Ref(MemStage::Site::Query, [&] {
+                return impl->buffer_cache.ObtainCPUBuffer(object.address, 8, sync_info, post_op);
+            });
         VideoCommon::MemStageStats::Read(VideoCommon::MemStageStats::Kind::QueryBuffer, 8);
         impl->hcr_buffer = buffer->Handle();
         impl->hcr_offset = offset;
@@ -1547,7 +1549,10 @@ void QueryCacheRuntime::HostConditionalRenderingCompareBCImpl(DAddr address, boo
         const auto sync_info = VideoCommon::ObtainBufferSynchronize::FullSynchronize;
         const auto post_op = VideoCommon::ObtainBufferOperation::DoNothing;
         const auto [buffer, offset] =
-            impl->buffer_cache.ObtainCPUBuffer(address, resolve_size, sync_info, post_op);
+            impl->buffer_cache.runtime.Seam().Ref(MemStage::Site::Query, [&] {
+                return impl->buffer_cache.ObtainCPUBuffer(address, resolve_size, sync_info,
+                                                          post_op);
+            });
         VideoCommon::MemStageStats::Read(VideoCommon::MemStageStats::Kind::QueryBuffer,
                                          resolve_size);
         to_resolve = buffer->Handle();
@@ -1772,6 +1777,9 @@ void QueryCacheRuntime::SyncValues(std::span<SyncValuesType> values, VkBuffer ba
 
     // Vulkan part.
     std::scoped_lock lk(impl->buffer_cache.mutex);
+    // The ranges' buffers: what they upload is played before the query cache's own copies.
+    std::optional<MemStage::FillPlay> seam{std::in_place, impl->buffer_cache.runtime.Seam(),
+                                           MemStage::Site::Query};
     impl->buffer_cache.BufferOperations([&] {
         impl->buffers_to_upload_to.clear();
         for (auto& pair : impl->little_cache) {
@@ -1784,6 +1792,7 @@ void QueryCacheRuntime::SyncValues(std::span<SyncValuesType> values, VkBuffer ba
             impl->buffers_to_upload_to.emplace_back(buffer->Handle(), offset);
         }
     });
+    seam.reset();
     // EDEN_NX2_EXP49: the copies below are GPU writes the buffer cache doesn't record. Read
     // downloads taken before them must not keep the bytes they downloaded as the newest.
     for (const auto& value : values) {

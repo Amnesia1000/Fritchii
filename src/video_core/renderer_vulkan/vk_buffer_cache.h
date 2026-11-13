@@ -131,6 +131,10 @@ public:
         return mem_stage.Player();
     }
 
+    /// The fence commit's fill bracket (FenceManager): its downloads are played as it ends.
+    [[nodiscard]] MemStage::FillPlay FenceCommitBracket() {
+        return MemStage::FillPlay{mem_stage, MemStage::Site::Fence};
+    }
 
     void TickFrame(Common::SlotVector<Buffer>& slot_buffers) noexcept;
 

@@ -1468,6 +1468,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     pipeline->SetEngine(maxwell3d, gpu_memory);
     const u32 repack_dirty = buffer_cache_runtime.SetVertexRepackLayout(
         maxwell3d->regs, pipeline->HasDynamicVertexInput());
+    mem_stage.BeginDraw(buffer_cache_runtime.RepackMask(), repack_dirty);
     if (repack_dirty) {
         auto& flags = maxwell3d->dirty.flags;
         flags[VideoCommon::Dirty::VertexBuffers] = true;
@@ -1802,9 +1803,12 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                 grid.draws_refused.fetch_add(1, std::memory_order_relaxed);
             } else {
                 std::scoped_lock lock{buffer_cache.mutex};
-                const auto [buffer, offset] = buffer_cache.ObtainBuffer(
-                    *source, sizeof(u32), VideoCommon::ObtainBufferSynchronize::FullSynchronize,
-                    VideoCommon::ObtainBufferOperation::DoNothing);
+                const auto [buffer, offset] = mem_stage.Ref(MemStage::Site::DrawCount, [&] {
+                    return buffer_cache.ObtainBuffer(
+                        *source, sizeof(u32),
+                        VideoCommon::ObtainBufferSynchronize::FullSynchronize,
+                        VideoCommon::ObtainBufferOperation::DoNothing);
+                });
                 gpu_count.emplace(buffer->Handle(), offset);
                 // The count comes from a dispatch before: make its writes visible to the draw's
                 // indirect read (once per batch of dispatches; it ends a render pass).
@@ -2103,7 +2107,8 @@ void RasterizerVulkan::DrawIndirect() {
             }
             return;
         }
-        const auto indirect_buffer = buffer_cache.GetDrawIndirectBuffer();
+        const auto indirect_buffer = mem_stage.Ref(
+            MemStage::Site::DrawIndirect, [&] { return buffer_cache.GetDrawIndirectBuffer(); });
         const auto& buffer = indirect_buffer.first;
         const auto& offset = indirect_buffer.second;
         if (params.is_byte_count) {
@@ -2118,7 +2123,8 @@ void RasterizerVulkan::DrawIndirect() {
             return;
         }
         if (params.include_count) {
-            const auto count = buffer_cache.GetDrawIndirectCount();
+            const auto count = mem_stage.Ref(MemStage::Site::DrawIndirect,
+                                             [&] { return buffer_cache.GetDrawIndirectCount(); });
             const auto& draw_buffer = count.first;
             const auto& offset_base = count.second;
             scheduler.Record([this, draw_buffer_obj = draw_buffer->Handle(),
@@ -2190,9 +2196,11 @@ bool RasterizerVulkan::Nx2ListDispatchSupported() const {
 // front to read back if it needs their values after all.
 void RasterizerVulkan::Nx2KeepListWords(u64 keep_id, GPUVAddr address, u32 count) {
     std::scoped_lock lock{buffer_cache.mutex};
-    const auto [buffer, offset] = buffer_cache.ObtainBuffer(
-        address, count * sizeof(u32), VideoCommon::ObtainBufferSynchronize::FullSynchronize,
-        VideoCommon::ObtainBufferOperation::DoNothing);
+    const auto [buffer, offset] = mem_stage.Ref(MemStage::Site::ListWords, [&] {
+        return buffer_cache.ObtainBuffer(address, count * sizeof(u32),
+                                         VideoCommon::ObtainBufferSynchronize::FullSynchronize,
+                                         VideoCommon::ObtainBufferOperation::DoNothing);
+    });
     if (buffer == nullptr) {
         return;
     }
@@ -2945,6 +2953,7 @@ void RasterizerVulkan::DispatchCompute() {
     }
     std::scoped_lock lock{texture_cache.mutex, buffer_cache.mutex};
     std::optional<ByteAddressedShadow> byte_addressed_shadow;
+    mem_stage.BeginDispatch();
     buffer_cache.Nx2CollectListCopies(true);
     SCOPE_EXIT {
         buffer_cache.Nx2CollectListCopies(false);
@@ -3043,8 +3052,9 @@ void RasterizerVulkan::DispatchCompute() {
         // DispatchIndirect
         static constexpr auto sync_info = VideoCommon::ObtainBufferSynchronize::FullSynchronize;
         const auto post_op = VideoCommon::ObtainBufferOperation::DiscardWrite;
-        const auto [buffer, offset] =
-            buffer_cache.ObtainBuffer(*indirect_address, 12, sync_info, post_op);
+        const auto [buffer, offset] = mem_stage.Ref(MemStage::Site::DispatchIndirect, [&] {
+            return buffer_cache.ObtainBuffer(*indirect_address, 12, sync_info, post_op);
+        });
         scheduler.RequestOutsideRenderPassOperationContext();
         scheduler.NoteComputeWrites();
         scheduler.TraceComputePipeline(pipeline->ShaderHash());
@@ -3058,7 +3068,8 @@ void RasterizerVulkan::DispatchCompute() {
                 cmdbuf.DispatchIndirect(indirect_buffer, indirect_offset);
             });
         });
-        buffer_cache.RecordComputeExtentProbes();
+        mem_stage.Ref(MemStage::Site::DispatchAfter,
+                      [&] { buffer_cache.RecordComputeExtentProbes(); });
         compute_since_count_barrier = true;
         SubmitNx2ListCopies(pipeline->ShaderHash());
         return;
@@ -3130,7 +3141,7 @@ void RasterizerVulkan::DispatchCompute() {
             TextureCacheRuntime::CopyByteAddressedShadow(cmdbuf, *byte_addressed_shadow, true);
         }
     });
-    buffer_cache.RecordComputeExtentProbes();
+    mem_stage.Ref(MemStage::Site::DispatchAfter, [&] { buffer_cache.RecordComputeExtentProbes(); });
     if (can_replace || marking_effects) {
         // The deferred native binding may follow DLSS's command buffer bindings.
         scheduler.InvalidateState();
@@ -3185,7 +3196,8 @@ void RasterizerVulkan::FlushAll() {}
 void RasterizerVulkan::SubmitNx2ListCopies(u64 writer) {
     // Submitted at once: ReadGpuWrittenCommands waits on these copies, so they can't sit out
     // the longer DeferFlush interval.
-    if (!buffer_cache.Nx2CopyListPages(mem_clock.Now(), writer)) {
+    if (!mem_stage.Ref(MemStage::Site::DispatchAfter,
+                       [&] { return buffer_cache.Nx2CopyListPages(mem_clock.Now(), writer); })) {
         return;
     }
     // EDEN_NX2_EXP27 & 8 (the original's DISPATCH_BATCH): the front reads few of the lists
@@ -3222,6 +3234,7 @@ void RasterizerVulkan::NoteGpuWrittenCommandListSynced(DAddr page) {
 void RasterizerVulkan::FlushGpuWrittenCommandListPages(std::span<const DAddr> pages) {
     gpu.InvalidateGPUCache();
     std::scoped_lock lock{buffer_cache.mutex};
+    MemStage::FillPlay seam{mem_stage, MemStage::Site::ListPages};
     buffer_cache.Nx2FlushListPages(pages);
 }
 
@@ -3242,6 +3255,7 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType 
     }
     if ((True(which & VideoCommon::CacheType::BufferCache))) {
         std::scoped_lock lock{buffer_cache.mutex};
+        MemStage::FillPlay seam{mem_stage, MemStage::Site::Download};
         buffer_cache.DownloadMemory(addr, size);
     }
     if ((True(which & VideoCommon::CacheType::QueryCache))) {
@@ -3262,6 +3276,7 @@ void RasterizerVulkan::FlushRegionForRead(DAddr addr, u64 size) {
     }
     {
         std::scoped_lock lock{buffer_cache.mutex};
+        MemStage::FillPlay seam{mem_stage, MemStage::Site::DownloadForRead};
         buffer_cache.DownloadMemoryForRead(addr, size);
     }
     query_cache.FlushRegion(addr, size);
@@ -3765,6 +3780,7 @@ void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::Cache
     }
     if ((True(which & VideoCommon::CacheType::BufferCache))) {
         std::scoped_lock lock{buffer_cache.mutex};
+        MemStage::FillPlay seam{mem_stage, MemStage::Site::Invalidation};
         buffer_cache.WriteMemory(addr, size);
     }
     if ((True(which & VideoCommon::CacheType::QueryCache))) {
@@ -3809,6 +3825,7 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
     // FlushCaching's ranges are the GPU's own engines' writes (EXP108).
     if ((cb_path & CbPath::SkipBit) == 0) {
         std::scoped_lock lock{buffer_cache.mutex};
+        MemStage::FillPlay seam{mem_stage, MemStage::Site::Invalidation};
         // As OnCacheInvalidations: out of the GPU-written ranges first, so applying one range
         // doesn't download the GPU's bytes over a later range on the same page.
         buffer_cache.ClaimCpuWrites(sequences);
@@ -3844,6 +3861,7 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
             CbPath::Count(counters.lock_skips);
         } else {
             std::scoped_lock lock{buffer_cache.mutex};
+            MemStage::FillPlay seam{mem_stage, MemStage::Site::Invalidation};
             // As above: claim every range applied below first. Skipped ranges
             // (Reach::None) were never GPU-written, so the claim has nothing to take there.
             boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> applied;
@@ -3950,11 +3968,13 @@ void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64
         // ClaimCpuWrites acts only on pages a GPU-modified mark ever reached.
         if (buffer_cache.ClaimMayFindGpuWrites(ranges)) {
             std::scoped_lock lock{buffer_cache.mutex};
+            MemStage::FillPlay seam{mem_stage, MemStage::Site::Invalidation};
             buffer_cache.ClaimCpuWrites(ranges);
         } else {
             CbPath::Count(counters.guest_claim_skips);
             if (verify) {
                 std::scoped_lock lock{buffer_cache.mutex};
+                MemStage::FillPlay seam{mem_stage, MemStage::Site::Invalidation};
                 for (const auto& [addr, size] : ranges) {
                     CbPath::Count(counters.verify_skip_checked);
                     if (buffer_cache.IsRegionGpuModified(addr, size)) {
@@ -3984,6 +4004,7 @@ void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64
                 buffer_cache.NoteWriteUnlocked(addr, size);
             } else {
                 std::scoped_lock lock{buffer_cache.mutex};
+                MemStage::FillPlay seam{mem_stage, MemStage::Site::Invalidation};
                 if (skip) {
                     CbPath::Count(counters.verify_skip_checked);
                     if (!buffer_cache.WriteChangesNothing(addr, size)) {
@@ -4002,6 +4023,7 @@ void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64
     // on its pages (WriteMemory), which would write over the next collected write.
     {
         std::scoped_lock lock{buffer_cache.mutex};
+        MemStage::FillPlay seam{mem_stage, MemStage::Site::Invalidation};
         buffer_cache.ClaimCpuWrites(ranges);
     }
     for (const auto& [addr, size] : ranges) {
@@ -4023,6 +4045,7 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
     }
     {
         std::scoped_lock lock{buffer_cache.mutex};
+        MemStage::FillPlay seam{mem_stage, MemStage::Site::Invalidation};
         buffer_cache.WriteMemory(addr, size);
     }
     pipeline_cache.InvalidateRegion(addr, size);
@@ -4047,6 +4070,7 @@ void RasterizerVulkan::Nx2ApplyRunaheadChunk(const VideoCommon::Runahead::Chunk&
     };
     {
         std::scoped_lock lock{buffer_cache.mutex};
+        MemStage::FillPlay seam{mem_stage, MemStage::Site::Invalidation};
         buffer_cache.ClaimCpuWrites(ranges);
     }
     // Images still upload from guest memory when next used (the front writes no word early for
@@ -4061,6 +4085,7 @@ void RasterizerVulkan::Nx2ApplyRunaheadChunk(const VideoCommon::Runahead::Chunk&
     }
     {
         std::scoped_lock lock{buffer_cache.mutex};
+        MemStage::FillPlay seam{mem_stage, MemStage::Site::Invalidation};
         for (const auto& range : chunk.ranges) {
             buffer_cache.Nx2ApplyCpuBytes(static_cast<DAddr>(range.address), range.size,
                                           chunk.bytes.data() + range.offset);
@@ -4110,6 +4135,7 @@ void RasterizerVulkan::UnmapMemory(DAddr addr, u64 size) {
     }
     {
         std::scoped_lock lock{buffer_cache.mutex};
+        MemStage::FillPlay seam{mem_stage, MemStage::Site::Unmap};
         buffer_cache.WriteMemory(addr, size, false);
     }
     pipeline_cache.OnCacheInvalidation(addr, size);
@@ -5015,8 +5041,11 @@ void RasterizerVulkan::TickFrame() {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.TickFrame();
     }
+    // SEAM (EXP123) is read here, once a frame, with nothing pending.
+    mem_stage.TickFrame();
     {
         std::scoped_lock lock{buffer_cache.mutex};
+        MemStage::FillPlay seam{mem_stage, MemStage::Site::Frame};
         buffer_cache.TickFrame();
     }
 }
@@ -5099,6 +5128,7 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
             // The write's own invalidation first: it would upload the placeholders over the copy.
             gpu_memory->FlushCaching();
             std::scoped_lock lock{buffer_cache.mutex};
+            MemStage::FillPlay seam{mem_stage, MemStage::Site::Dma};
             for (const auto& [source, destination, count] : grids) {
                 Tegra::Nx2IndirectGrid::Get().copied.fetch_add(1, std::memory_order_relaxed);
                 if (!buffer_cache.DMACopy(source, destination, count * sizeof(u32))) {
@@ -5167,6 +5197,7 @@ void RasterizerVulkan::AccelerateInlineToMemoryImpl(GPUVAddr address, size_t cop
     bool uploaded;
     {
         std::scoped_lock lock{buffer_cache.mutex};
+        MemStage::FillPlay seam{mem_stage, MemStage::Site::InlineUpload};
         // Guest memory has the words now: a command list copy of the page no longer does.
         buffer_cache.Nx2NoteListHostWrite(*cpu_addr, copy_size);
         uploaded = buffer_cache.InlineMemory(*cpu_addr, copy_size, memory);
@@ -5315,14 +5346,23 @@ AccelerateDMA::AccelerateDMA(BufferCache& buffer_cache_, TextureCache& texture_c
 
 bool AccelerateDMA::BufferClear(GPUVAddr src_address, u64 amount, u32 value) {
     std::scoped_lock lock{buffer_cache.mutex};
+    MemStage::FillPlay seam{buffer_cache.runtime.Seam(), MemStage::Site::Dma};
     return buffer_cache.DMAClear(src_address, amount, value);
 }
 
 bool AccelerateDMA::BufferCopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount) {
     std::scoped_lock lock{buffer_cache.mutex};
-    buffer_cache.Nx2CollectListCopies(true);
-    const bool copied = buffer_cache.DMACopy(src_address, dest_address, amount);
-    if (buffer_cache.Nx2CopyListPages(buffer_cache.runtime.Clock().Now())) {
+    MemStage& seam = buffer_cache.runtime.Seam();
+    bool copied;
+    bool list_copied;
+    {
+        MemStage::Fill fill{seam, MemStage::Site::Dma};
+        buffer_cache.Nx2CollectListCopies(true);
+        copied = buffer_cache.DMACopy(src_address, dest_address, amount);
+        list_copied = buffer_cache.Nx2CopyListPages(buffer_cache.runtime.Clock().Now());
+    }
+    seam.Play();
+    if (list_copied) {
         scheduler.Flush();
     }
     buffer_cache.Nx2CollectListCopies(false);
@@ -5342,8 +5382,9 @@ bool AccelerateDMA::DmaBufferImageCopy(const Tegra::DMA::ImageCopy& copy_info,
     static constexpr auto sync_info = VideoCommon::ObtainBufferSynchronize::FullSynchronize;
     const auto post_op = IS_IMAGE_UPLOAD ? VideoCommon::ObtainBufferOperation::DoNothing
                                          : VideoCommon::ObtainBufferOperation::MarkAsWritten;
-    const auto [buffer, offset] =
-        buffer_cache.ObtainBuffer(buffer_operand.address, buffer_size, sync_info, post_op);
+    const auto [buffer, offset] = buffer_cache.runtime.Seam().Ref(MemStage::Site::ImageCopy, [&] {
+        return buffer_cache.ObtainBuffer(buffer_operand.address, buffer_size, sync_info, post_op);
+    });
 
     const auto [image, copy] = texture_cache.DmaBufferImageCopy(
         copy_info, buffer_operand, image_operand, image_id, IS_IMAGE_UPLOAD);
