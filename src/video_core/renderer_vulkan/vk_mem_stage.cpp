@@ -21,9 +21,9 @@
 //      BindHostComputeBuffers). The packet is held apart from the arena (held_arena), so the
 //      texture side's records do not play it; Configure plays its sections at today's places
 //      (PlayHeld: the geometry after the texture buffer binds, each stage after Acquire, the
-//      dispatch's `before` before the image descriptors) and PlayRestAfter plays whatever is
-//      left when Configure returns, true or false: the cache believes its uploads are on their
-//      way. Descriptors left over then are dropped (the draw is dropped too). Pipelines with
+//      dispatch's `before` before the image descriptors) and RestAtEnd plays whatever is left
+//      when Configure ends, true, false or by an exception: the cache believes its uploads are
+//      on their way. A fill that throws ends without a held packet (EndHeldFill). Descriptors left over then are dropped (the draw is dropped too). Pipelines with
 //      texel buffers keep the fill where the calls are (LateFill: the texture buffer binds need
 //      the texture cache's views). The descriptor entries take the pipeline's form (the fill runs
 //      before Acquire; DescriptorForm).
@@ -560,7 +560,10 @@ void MemStage::PlayPending([[maybe_unused]] bool late) {
         while (play_cursor < arena.Size()) {
             const Entry& entry = *reinterpret_cast<const Entry*>(arena.At(play_cursor));
             play_cursor += entry.bytes;
-            player.Exec(entry);
+            // Played: only after a held fill that threw (EndHeldFill) left its entries pending.
+            if ((entry.flags & Played) == 0) [[likely]] {
+                player.Exec(entry);
+            }
         }
     }
     pending = false;
@@ -622,7 +625,7 @@ void MemStage::EnterSync(Sync kind) {
 }
 
 void MemStage::BeginDraw(u32 repack_mask, u32 repack_dirty) {
-    // A held packet ends at its Configure's PlayRestAfter; this is only a safety net.
+    // A held packet ends at its Configure's RestAtEnd; this is only a safety net.
     PlayRest();
     Bump(counters.draws);
     RetireDrawValues();
@@ -922,6 +925,32 @@ void MemStage::TakeHeld(HeldKind kind) {
     SeamHook::g_watch.fetch_add(1, std::memory_order_relaxed);
 }
 
+/// Ends a held fill however it ends: TakeHeld ran, or the cache threw inside the fill.
+struct MemStage::HeldFillEnd {
+    MemStage& stage;
+    ~HeldFillEnd() {
+        stage.EndHeldFill();
+    }
+};
+
+void MemStage::EndHeldFill() {
+    filling_held = false;
+    fill_form = -1;
+    if (held != HeldKind::None) {
+        return;
+    }
+    // The fill threw before TakeHeld: nothing is held. Its entries stay pending and the next
+    // play runs them (the ones a sync played are marked and skipped).
+    t_holding = false;
+    if (t_log == &held_log) {
+        t_log = nullptr;
+        held_log.Clear();
+    }
+    if (ticks) {
+        UpdateUnplayed();
+    }
+}
+
 const MemStage::DrawPacket* MemStage::FillDraw(Cache& cache_, const DrawFacts& facts,
                                                bool is_indexed) {
     if (seam_value.load(std::memory_order_relaxed) < 2) {
@@ -949,6 +978,7 @@ const MemStage::DrawPacket* MemStage::FillDraw(Cache& cache_, const DrawFacts& f
     filling_kind = HeldKind::Draw;
     held_flush_seen = false;
     t_holding = true;
+    const HeldFillEnd fill_end{*this};
     if (ticks) {
         held_from = draw.number;
         UpdateUnplayed();
@@ -1001,8 +1031,6 @@ const MemStage::DrawPacket* MemStage::FillDraw(Cache& cache_, const DrawFacts& f
         }
         TakeHeld(HeldKind::Draw);
     }
-    filling_held = false;
-    fill_form = -1;
     if (timed) {
         Bump(counters.fill_ns, NowNs() - start);
     }
@@ -1034,6 +1062,7 @@ const MemStage::DispatchPacket* MemStage::FillDispatch(Cache& cache_,
     filling_kind = HeldKind::Dispatch;
     held_flush_seen = false;
     t_holding = true;
+    const HeldFillEnd fill_end{*this};
     if (ticks) {
         held_from = dispatch.number;
         UpdateUnplayed();
@@ -1067,8 +1096,6 @@ const MemStage::DispatchPacket* MemStage::FillDispatch(Cache& cache_,
         }
         TakeHeld(HeldKind::Dispatch);
     }
-    filling_held = false;
-    fill_form = -1;
     if (timed) {
         Bump(counters.fill_ns, NowNs() - start);
     }

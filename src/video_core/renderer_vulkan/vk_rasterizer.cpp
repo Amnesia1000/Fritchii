@@ -1483,12 +1483,17 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         fast_draw_counting ||
         VideoCore::Nx2Debug::g_experiments[106].load(std::memory_order_relaxed) != 0;
     // SEAM = 2 (EXP123): the draw's buffer side is filled here, before the texture work;
-    // Configure plays its sections and PlayRestAfter what is left, whatever Configure returns.
+    // Configure plays its sections and RestAtEnd what is left, however Configure ends (true,
+    // false or an exception).
     mem_stage.FillDraw(buffer_cache, pipeline->MemFacts(), is_indexed);
-    if (Profile::Scope scope{Profile::Zone::Configure};
-        !mem_stage.PlayRestAfter(delta_pipeline != nullptr
-                                     ? pipeline->ConfigureDelta(is_indexed)
-                                     : pipeline->Configure(is_indexed, keep_last_draw))) {
+    bool configured{};
+    {
+        Profile::Scope scope{Profile::Zone::Configure};
+        const MemStage::RestAtEnd rest{mem_stage};
+        configured = delta_pipeline != nullptr ? pipeline->ConfigureDelta(is_indexed)
+                                               : pipeline->Configure(is_indexed, keep_last_draw);
+    }
+    if (!configured) {
         report_failure("configure failed");
         TraceRenderState(is_indexed, "configure-failed", nullptr);
         return;
@@ -2991,12 +2996,18 @@ void RasterizerVulkan::DispatchCompute() {
                                  !indirect_address && !frame_dump.Capturing();
     ComputePipeline::BindCommand deferred_bind;
     // SEAM = 2 (EXP123): the dispatch's buffer side is filled here, before Configure's texture
-    // work; Configure plays it and PlayRestAfter what is left.
+    // work; Configure plays it and RestAtEnd what is left, however Configure ends (true, false
+    // or an exception: the native R16 shadow checks throw).
     mem_stage.FillDispatch(buffer_cache, pipeline->MemFacts());
-    if (!mem_stage.PlayRestAfter(pipeline->Configure(
-            *kepler_compute, *gpu_memory, scheduler, buffer_cache, texture_cache,
-            texture_cache_runtime, byte_addressed_shadow,
-            can_replace || marking_effects ? &deferred_bind : nullptr))) {
+    bool configured{};
+    {
+        const MemStage::RestAtEnd rest{mem_stage};
+        configured = pipeline->Configure(*kepler_compute, *gpu_memory, scheduler, buffer_cache,
+                                         texture_cache, texture_cache_runtime,
+                                         byte_addressed_shadow,
+                                         can_replace || marking_effects ? &deferred_bind : nullptr);
+    }
+    if (!configured) {
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute resources unavailable");
         return;
     }

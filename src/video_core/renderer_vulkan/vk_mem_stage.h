@@ -351,7 +351,7 @@ public:
 
     /// SEAM = 2: the draw's whole fill, before the texture work. Null when the draw is not held
     /// (another SEAM, texel buffers: LateFill, or the arena busy on another thread); Configure
-    /// then fills where the calls are. A held packet is always played whole: PlayRestAfter.
+    /// then fills where the calls are. A held packet is always played whole: RestAtEnd.
     const DrawPacket* FillDraw(Cache& cache, const DrawFacts& facts, bool is_indexed);
     /// SEAM = 2: the dispatch's `before` section, before Configure. Null as for FillDraw.
     const DispatchPacket* FillDispatch(Cache& cache, const DispatchFacts& facts);
@@ -367,11 +367,20 @@ public:
     void PlayHeld(Span span);
     /// Plays what is left of the held packet (descriptors left out) and ends it.
     void PlayRest();
-    /// PlayRest, then `configured`: for Configure's call site.
-    bool PlayRestAfter(bool configured) {
-        PlayRest();
-        return configured;
-    }
+
+    /// PlayRest when Configure ends: every return, true or false, and an exception.
+    class RestAtEnd {
+    public:
+        explicit RestAtEnd(MemStage& stage_) noexcept : stage{stage_} {}
+        ~RestAtEnd() {
+            stage.PlayRest();
+        }
+        RestAtEnd(const RestAtEnd&) = delete;
+        RestAtEnd& operator=(const RestAtEnd&) = delete;
+
+    private:
+        MemStage& stage;
+    };
 
     /// The descriptor form the runtime's descriptor entries take: the held fill's pipeline's
     /// (it runs before Acquire), else the queue's.
@@ -551,6 +560,8 @@ private:
     bool ClaimHeld();
     void UpdateUnplayed();
     void TakeHeld(HeldKind kind);
+    struct HeldFillEnd;
+    void EndHeldFill();
     void CheckHeld();
     void PlayHeldTo(u32 end, bool rest);
     bool StartReadLog(ReadLog& log, u64 number);

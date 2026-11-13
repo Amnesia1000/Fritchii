@@ -1107,7 +1107,8 @@ plays the packet's sections where the calls were (the geometry after the texture
 each stage after Acquire and before its image descriptors, the dispatch's section before its
 image descriptors). A sync inside the fill (the multi-range bind, the kept words wait) plays only
 what it needs (copies, uploads, barriers, conversions); the index, vertex and xfb binds and the
-descriptors wait for the packet's plays. When Configure returns, true or false, whatever is left is played (the cache
+descriptors wait for the packet's plays. When Configure ends, true, false or by an exception (a
+scope guard at the call site, MemStage::RestAtEnd), whatever is left is played (the cache
 believes those uploads are on their way); descriptors left then are dropped with the draw.
 Descriptor entries take the pipeline's form (descriptor buffer or not), as the fill runs before
 Acquire. Pipelines with texture or image buffers keep their fill in Configure as with 1
