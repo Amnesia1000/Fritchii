@@ -521,10 +521,14 @@ void MemStage::OpenDispatchByValue() {
 }
 
 const std::array<u32, 64>& MemStage::Qmd(Tegra::MemoryManager& gpu_memory, GPUVAddr address) {
-    if (dispatch_open && (dispatch.flags & QmdByValue) != 0) {
-        // The scheduler read a QMD that ran no dispatch (a load, or a QMD that waits on its
-        // dependencies): the next read begins the packet again.
-        Bump(value_counters.qmds_unused);
+    if (dispatch_open) {
+        // A QMD read always begins a new dispatch (the pipeline lookup's pointer slots come after
+        // it). An open packet is one that ran no dispatch: a QMD the scheduler read for a load or
+        // that waits on its dependencies, or only a pointer slot read by a lookup that found no
+        // pipeline (review of 2c: it was carried into the next dispatch).
+        if ((dispatch.flags & QmdByValue) != 0) {
+            Bump(value_counters.qmds_unused);
+        }
         dispatch_open = false;
     }
     OpenDispatchByValue();
