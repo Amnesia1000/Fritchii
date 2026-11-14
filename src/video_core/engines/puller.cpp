@@ -702,7 +702,7 @@ struct FenceWriterStats {
     u64 saved_ns{};   ///< EXP12=3: the full drains' time past the target, of acquires met there
     u64 resumed{};    ///< Readable acquires suspended after their fence release, resumed since
     u64 resume_ns{};  ///< Their time from the acquire to the resume
-    u64 skipped{};        ///< EXP12=4/5: writer waits not made
+    u64 skipped{};        ///< EXP12=4/5/6: writer waits not made
     /// Of them, the back's stored position was short of the target. Overstates: the back stores
     /// its position only every few thousand words of a batch and at its end.
     u64 skipped_behind{};
@@ -724,6 +724,13 @@ struct FenceWriterStats {
     u64 lagged_waits{};
     u64 lagged_wait_ns{};
     u64 lagged_met{};
+    /// EXP12=6: acquires whose word had a queued writer (waited for it) or none (suspended at
+    /// once), which term set the wait's target (an unlanded prediction record, the write stamp,
+    /// a queued puller release), and those with the write stamps off (mode 2's target).
+    u64 word_waits{};
+    u64 word_none{};
+    std::array<u64, 3> word_terms{};
+    u64 word_stamps_off{};
     /// Suspended acquires still pending 100 ms after the acquire, each counted once: [0] fence
     /// path, [1] the others. Must stay 0.
     std::array<u64, 2> long_pending{};
@@ -856,15 +863,19 @@ struct FenceWriterStats {
                  "ms/5 ms/longer: {}; poll drains of these acquires pending under 2 ms {:.0f}/s "
                  "{:.2f} ms/s, 2 ms or more {:.0f}/s {:.2f} ms/s, of other acquires {:.0f}/s "
                  "{:.2f} ms/s; lagged checks (EXP12=5/6) {:.0f}/s, waited {:.0f}/s {:.2f} ms/s, "
-                 "met there {:.0f}/s; pending over 100 ms (must be 0): {} fence path, {} other; "
+                 "met there {:.0f}/s; word writer waits (EXP12=6) {:.0f}/s (target by an "
+                 "unlanded prediction record {:.0f}, the write stamp {:.0f}, a queued release "
+                 "{:.0f}; stamps off {:.0f}), none queued {:.0f}/s; "
+                 "pending over 100 ms (must be 0): {} fence path, {} other; "
                  "reduction bounds of the resumed (EXP12=4) {:.0f}/s checked, "
                  "{:.0f}/s not (latch, front answer, drain or after 1 ms); by channel:{}",
                  VideoCore::Nx2Debug::Experiment(12), rate(skipped), rate(skipped_behind), routes,
                  rate(poll_drains[0]), ms(poll_drain_ns[0]), rate(poll_drains[1]),
                  ms(poll_drain_ns[1]), rate(other_poll_drains), ms(other_poll_drain_ns),
                  rate(lagged_checks), rate(lagged_waits), ms(lagged_wait_ns), rate(lagged_met),
-                 long_pending[0], long_pending[1], rate(resume_bound_checks),
-                 rate(resume_bound_dropped), rows);
+                 rate(word_waits), rate(word_terms[0]), rate(word_terms[1]),
+                 rate(word_terms[2]), rate(word_stamps_off), rate(word_none), long_pending[0],
+                 long_pending[1], rate(resume_bound_checks), rate(resume_bound_dropped), rows);
         *this = {};
         since = now;
     }
@@ -1142,8 +1153,12 @@ static bool RunaheadAnswer(DmaPusher& dma_pusher, const Puller::PendingAcquire& 
 // queued, the back latches it at any release that meets the value (OnWrite), and a suspended
 // channel resumes only on that latch or on a met read of the word (CanResumeAcquire), the same
 // polls 2's unmet acquires go through after their wait. The wait only made the front look
-// later. 5 = 4 here; its polls check lagged instead of draining (CanResumeAcquire).
-// `skipped_wait` (optional): set when 4 or 5 skipped it. Not with delayed fences, whose
+// later. 5 = 4 here; its polls check lagged instead of draining (CanResumeAcquire). 6 = 5, but
+// waits here when something queued can write the word itself (fable_fence_writers_2 section 4):
+// to the newest of the QMD prediction's unlanded record for the word, the write stamp over it
+// and a queued puller release to it (mode 2's target while the write stamps are off); with none
+// past the back's position it suspends at once as 4. Exact as 4: it only chooses when to look.
+// `skipped_wait` (optional): set when 4, 5 or 6 skipped the wait. Not with delayed fences, whose
 // releases land when the host GPU passed them, not when the back runs them.
 static bool ReleaseFencesForReadable(DmaPusher& dma_pusher, const void* owner,
                                      const Puller::PendingAcquire& acquire,
@@ -1166,7 +1181,7 @@ static bool ReleaseFencesForReadable(DmaPusher& dma_pusher, const void* owner,
             return true;
         }
     }
-    if (mode <= 0 || mode > 5 || !device || !split.Active() ||
+    if (mode <= 0 || mode > 6 || !device || !split.Active() ||
         VideoCore::Nx2Debug::DelayedFences()) {
         stats.delayed += mode != 0 ? 1 : 0;
         const auto begin = Clock::now();
@@ -1180,7 +1195,32 @@ static bool ReleaseFencesForReadable(DmaPusher& dma_pusher, const void* owner,
         stats.Tick();
         return result;
     }
-    const u64 target = split.UntrackedWriterPosition(*device);
+    // Before the fence release is queued, which would count as a writer itself.
+    u64 target = 0;
+    bool word_writer = true;
+    if (mode == 6) {
+        if (split.WriteStampsOn()) {
+            const u64 done = split.ConsumedNow();
+            const u64 predicted = VideoCommon::QmdPrediction::Enabled()
+                                      ? VideoCommon::QmdPrediction::NewestUnlandedPosition(*device)
+                                      : 0;
+            const u64 stamp = split.WriteStamp(*device, sizeof(u32), acquire.address);
+            u64 release = 0;
+            (void)split.QueuedReleaseTo(*device, done, release);
+            target = (std::max)({predicted, stamp, release});
+            word_writer = target > done;
+            if (word_writer) {
+                ++stats.word_terms[target == predicted ? 0 : target == stamp ? 1 : 2];
+            }
+        } else {
+            ++stats.word_stamps_off;
+            target = split.UntrackedWriterPosition(*device);
+        }
+        stats.word_waits += word_writer ? 1 : 0;
+        stats.word_none += word_writer ? 0 : 1;
+    } else {
+        target = split.UntrackedWriterPosition(*device);
+    }
     // Memory stage tag Cache: the fence manager only; no 3D state.
     split.Defer([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); },
                 VideoCommon::GpuSplit::Effect::Unknown,
@@ -1188,7 +1228,7 @@ static bool ReleaseFencesForReadable(DmaPusher& dma_pusher, const void* owner,
                     VideoCommon::StageTagBits(VideoCommon::StageTag::Cache));
     split.NoteMemoryWrite();
     const auto begin = Clock::now();
-    const bool no_wait = mode == 4 || mode == 5;
+    const bool no_wait = mode == 4 || mode == 5 || (mode == 6 && !word_writer);
     if (no_wait) {
         // No wait: the back runs the writers and the fence release on its own (Publish below).
         ++stats.skipped;
@@ -1196,7 +1236,8 @@ static bool ReleaseFencesForReadable(DmaPusher& dma_pusher, const void* owner,
         if (skipped_wait) {
             *skipped_wait = true;
         }
-    } else if (split.WaitUntil(target, VideoCommon::DrainSite::FenceWriters)) {
+    } else if (split.WaitUntil(target, mode == 6 ? VideoCommon::DrainSite::FenceWordWriters
+                                                 : VideoCommon::DrainSite::FenceWriters)) {
         ++stats.waits;
     }
     const auto reached = Clock::now();

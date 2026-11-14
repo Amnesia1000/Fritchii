@@ -818,6 +818,18 @@ path and others; must stay 0). Judge 4 against 5 (GPU_WAKE=1 on both): poll drai
 acquires pending under 2 ms to near 0, the split drain zone down, latch and lagged resumes
 under 1 ms up, channel 2's time to resume down.
 
+6 = 5, but the acquire waits when something queued can write its word itself
+(fable_fence_writers_2 section 4): the target is the newest of the QMD prediction's record for
+the word that has not landed, the write stamp over the word (GpuSplit::WriteStamp, which
+counts unbounded writers too) and a queued puller release to it, taken before the fence
+release is queued. Past the back's position: wait for it (drain site "fence word writers"),
+then the latch and the word, as 2. Otherwise suspend at once, as 4. While the write stamps are
+off (before the front's QMD copy started them) it waits for 2's target. Exact as 4: it only
+chooses when to look. The polls check lagged as 5. The "Fence writer resumes" line adds word
+writer waits/s, which term set their target (unlanded prediction record, write stamp, queued
+release), how many had the stamps off, and how many acquires had none queued. Judge 5 against
+6 (GPU_WAKE=1).
+
 ### EXP17
 
 EXP17 = 1: a small streamed uniform buffer binds again any stage or slot's copy of the same

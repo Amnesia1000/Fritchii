@@ -2503,4 +2503,15 @@ void NoteMetBy(MetBy met_by) {
     ++state.met_by[static_cast<size_t>(met_by)];
 }
 
+u64 NewestUnlandedPosition(u64 device) {
+    auto& state = Front();
+    u64 newest = 0;
+    for (const Prediction& way : state.predictions[Bucket(device)]) {
+        if (way.position != 0 && way.device == device && !way.landed) {
+            newest = (std::max)(newest, way.position);
+        }
+    }
+    return newest;
+}
+
 } // namespace VideoCommon::QmdPrediction

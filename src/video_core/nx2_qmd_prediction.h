@@ -296,4 +296,9 @@ enum class MetBy : u32 { QmdRelease, QmdReduction, DmaRelease, Other, Unmet, Bef
 /// Front: what met an acquire NoteAcquire counted, once its fences were released.
 void NoteMetBy(MetBy met_by);
 
+/// Front, EXP12=6 (puller.cpp ReleaseFencesForReadable): the ring position of the newest record
+/// of any kind for the u32 at `device` that has not landed, 0 for none. Without EXP13=2's
+/// landing marks every record counts as not landed.
+[[nodiscard]] u64 NewestUnlandedPosition(u64 device);
+
 } // namespace VideoCommon::QmdPrediction
