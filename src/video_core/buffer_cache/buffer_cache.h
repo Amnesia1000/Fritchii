@@ -101,6 +101,7 @@ BufferCache<P>::~BufferCache() {
 
 template <class P>
 void BufferCache<P>::RunGarbageCollector(bool aggressive_gc) {
+    PromoteAhead(); // FRITCHII_MEMSTAGE_MARKS_AHEAD: a reader of the real sets
     const u64 ticks_to_destroy = aggressive_gc ? 60 : 120;
     int num_iterations = aggressive_gc ? 64 : 32;
     // Their GPU-written data is downloaded first, all with one wait for the GPU: one wait per
@@ -137,6 +138,7 @@ void BufferCache<P>::RunGarbageCollector(bool aggressive_gc) {
 
 template <class P>
 void BufferCache<P>::TickFrame() {
+    PromoteAhead(); // FRITCHII_MEMSTAGE_MARKS_AHEAD: a reader of the real sets
     VideoCommon::g_hot_page_epoch.fetch_add(1, std::memory_order_relaxed);
     VideoCommon::g_hot_pages_on.store(VideoCommon::HotPagesEnabled(), std::memory_order_relaxed);
     // Homebrew console apps don't create or bind any channels, so this will be nullptr.
@@ -341,6 +343,8 @@ template <class P>
 void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu_data,
                                  bool engine_write) {
     VideoCommon::MemoryStageLink::CheckBackCache("WriteMemory");
+    PromoteAhead();
+    NoteAheadLevelCall(device_addr, size, "WriteMemory");
     Nx2NoteListHostWrite(device_addr, size);
     Core::g_buffer_write_pages.Mark(device_addr, size);
     Core::g_watch_write_pages.Mark(device_addr, size);
@@ -456,6 +460,7 @@ bool BufferCache<P>::WriteChangesNothing(DAddr device_addr, u64 size) {
     const DAddr page_begin = Common::AlignDown(device_addr, DEVICE_PAGESIZE);
     const DAddr page_end = Common::AlignUp(device_addr + size, DEVICE_PAGESIZE);
     if (gpu_modified_ranges.Intersects(page_begin, page_end - page_begin) ||
+        AheadHere(page_begin, page_end - page_begin) ||
         !memory_tracker.IsRegionUntouched(device_addr, size)) {
         return false;
     }
@@ -482,6 +487,8 @@ bool BufferCache<P>::ClaimMayFindGpuWrites(
 
 template <class P>
 void BufferCache<P>::CachedWriteMemory(DAddr device_addr, u64 size) {
+    PromoteAhead();
+    NoteAheadLevelCall(device_addr, size, "CachedWriteMemory");
     const bool is_dirty = IsRegionRegistered(device_addr, size);
     if (!is_dirty) {
         return;
@@ -502,6 +509,7 @@ void BufferCache<P>::CachedWriteMemory(DAddr device_addr, u64 size) {
 
 template <class P>
 bool BufferCache<P>::OnCPUWrite(DAddr device_addr, u64 size) {
+    PromoteAhead(); // FRITCHII_MEMSTAGE_MARKS_AHEAD: a reader of the real sets
     const bool is_dirty = IsRegionRegistered(device_addr, size);
     if (!is_dirty) {
         return false;
@@ -516,6 +524,7 @@ bool BufferCache<P>::OnCPUWrite(DAddr device_addr, u64 size) {
 template <class P>
 std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DAddr device_addr,
                                                                               u64 size) {
+    PromoteAhead(); // FRITCHII_MEMSTAGE_MARKS_AHEAD: a reader of the real sets
     std::optional<VideoCore::RasterizerDownloadArea> area{};
     area.emplace();
     DAddr device_addr_start_aligned = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
@@ -702,6 +711,7 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
 template <class P>
 void BufferCache<P>::DownloadMemory(DAddr device_addr, u64 size) {
     VideoCommon::MemoryStageLink::CheckBackCache("DownloadMemory");
+    PromoteAhead();
     const Common::WriteRing::SiteScope write_site{"buffer download (DownloadMemory)", true};
     if constexpr (USE_MEMORY_MAPS) {
         if (download_cpu_read_ranges) {
@@ -729,6 +739,7 @@ void BufferCache<P>::DownloadMemory(DAddr device_addr, u64 size) {
 template <class P>
 void BufferCache<P>::DownloadMemoryForRead(DAddr device_addr, u64 size) {
     VideoCommon::MemoryStageLink::CheckBackCache("DownloadMemoryForRead");
+    PromoteAhead();
     const Common::WriteRing::SiteScope write_site{"buffer download (DownloadMemoryForRead)", true};
     if constexpr (IS_OPENGL || !USE_MEMORY_MAPS) {
         DownloadMemory(device_addr, size);
@@ -804,6 +815,7 @@ template <class P>
 std::pair<DAddr, DAddr> BufferCache<P>::GpuModifiedRunAround(DAddr begin, DAddr end,
                                                              u64 max_bytes,
                                                              bool stop_at_preflushable) {
+    PromoteAhead(); // FRITCHII_MEMSTAGE_MARKS_AHEAD: a reader of the real sets
     DAddr buffer_begin = 0;
     DAddr buffer_end = 0;
     ForEachBufferInRange(begin, end - begin, [&](BufferId, Buffer& buffer) {
@@ -848,6 +860,7 @@ std::pair<DAddr, DAddr> BufferCache<P>::GpuModifiedRunAround(DAddr begin, DAddr 
 
 template <class P>
 void BufferCache<P>::RecordReadDownload(std::span<const std::pair<DAddr, u64>> ranges) {
+    PromoteAhead(); // FRITCHII_MEMSTAGE_MARKS_AHEAD: a reader of the real sets
     if constexpr (!IS_OPENGL && USE_MEMORY_MAPS) {
         struct Copy {
             BufferId buffer_id;
@@ -996,6 +1009,7 @@ bool BufferCache<P>::WriteFinishedReadDownloads(DAddr device_addr, u64 size) {
 
 template <class P>
 void BufferCache<P>::WriteReadDownloads(u64 tick) {
+    PromoteAhead(); // FRITCHII_MEMSTAGE_MARKS_AHEAD: a reader of the real sets
     const Common::WriteRing::SiteScope write_site{"buffer read download (WriteReadDownloads)", true};
     if constexpr (!IS_OPENGL) {
         while (!read_downloads.empty() && read_downloads.front().tick <= tick) {
@@ -1036,7 +1050,9 @@ void BufferCache<P>::WriteReadDownloads(u64 tick) {
                 const DAddr last = Common::AlignUp(end, DEVICE_PAGESIZE);
                 for (DAddr page = Common::AlignDown(start, DEVICE_PAGESIZE); page < last;
                      page += DEVICE_PAGESIZE) {
-                    if (!gpu_modified_ranges.Intersects(page, DEVICE_PAGESIZE)) {
+                    // A mark ahead of the back keeps its bit (its step e ran at the fill).
+                    if (!gpu_modified_ranges.Intersects(page, DEVICE_PAGESIZE) &&
+                        !AheadIntersects(page, DEVICE_PAGESIZE)) {
                         memory_tracker.UnmarkRegionAsGpuModified(page, DEVICE_PAGESIZE);
                     }
                 }
@@ -1074,6 +1090,7 @@ bool BufferCache<P>::ReadDownloadsCover(DAddr device_addr, u64 size) const {
 
 template <class P>
 void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>> ranges) {
+    PromoteAhead(); // FRITCHII_MEMSTAGE_MARKS_AHEAD: a reader of the real sets
     struct Download {
         BufferId buffer_id;
         BufferCopy copy;
@@ -1138,6 +1155,7 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
 
 template <class P>
 void BufferCache<P>::DownloadMemoryRanges(std::span<const std::pair<DAddr, u64>> ranges) {
+    PromoteAhead(); // FRITCHII_MEMSTAGE_MARKS_AHEAD: a reader of the real sets
     constexpr bool has_mapped = requires(Buffer& buffer) {
         buffer.Mapped();
         buffer.LastUsageTick();
@@ -1272,6 +1290,7 @@ void BufferCache<P>::ClearReplacedDownload(DAddr device_addr, u64 size) {
 
 template <class P>
 void BufferCache<P>::ClearFenceDownloads(DAddr device_addr, u64 size) {
+    PromoteAhead(); // FRITCHII_MEMSTAGE_MARKS_AHEAD: a reader of the real sets
     for (auto& ranges : pending_download_ranges) {
         ranges.Subtract(device_addr, size);
     }
@@ -1289,6 +1308,9 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
     if (!cpu_src_address || !cpu_dest_address) {
         return false;
     }
+    PromoteAhead();
+    NoteAheadLevelCall(*cpu_src_address, amount, "DMACopy");
+    NoteAheadLevelCall(*cpu_dest_address, amount, "DMACopy");
     const bool source_dirty = IsRegionRegistered(*cpu_src_address, amount);
     const bool dest_dirty = IsRegionRegistered(*cpu_dest_address, amount);
     if (!source_dirty && !dest_dirty) {
@@ -1372,6 +1394,8 @@ bool BufferCache<P>::DMAClear(GPUVAddr dst_address, u64 amount, u32 value) {
     // `amount` counts words: the check looked at a quarter of the range (fixed in a
     // ported change).
     const size_t size = amount * sizeof(u32);
+    PromoteAhead();
+    NoteAheadLevelCall(*cpu_dst_address, size, "DMAClear");
     const bool dest_dirty = IsRegionRegistered(*cpu_dst_address, size);
     if (!dest_dirty) {
         return false;
@@ -1427,6 +1451,8 @@ std::pair<typename P::Buffer*, u32> BufferCache<P>::ObtainCPUBuffer(
         MarkWrittenBuffer(buffer_id, device_addr, size);
         break;
     case ObtainBufferOperation::DiscardWrite: {
+        PromoteAhead();
+        NoteAheadLevelCall(device_addr, size, "ObtainCPUBuffer (DiscardWrite)");
         ClearDownload(device_addr, size);
         gpu_modified_ranges.Subtract(device_addr, size);
         break;
@@ -1891,11 +1917,16 @@ void BufferCache<P>::FlushCachedWrites() {
 
 template <class P>
 bool BufferCache<P>::HasUncommittedFlushes() const noexcept {
+    // FRITCHII_MEMSTAGE_MARKS_AHEAD: its callers promote first (the fence commit, FencesQuiet).
+    if (AheadDue()) [[unlikely]] {
+        NoteAheadCheck(AheadCheck::Stale, "HasUncommittedFlushes");
+    }
     return !uncommitted_gpu_modified_ranges.Empty() || !committed_gpu_modified_ranges.empty();
 }
 
 template <class P>
 void BufferCache<P>::AccumulateFlushes() {
+    PromoteAhead(); // FRITCHII_MEMSTAGE_MARKS_AHEAD: a reader of the real sets
     if (uncommitted_gpu_modified_ranges.Empty()) {
         return;
     }
@@ -2042,6 +2073,7 @@ template <typename Ranges>
 void BufferCache<P>::ClaimCpuWrites(const Ranges& ranges) {
     VideoCommon::MemoryStageLink::CheckBackCache("ClaimCpuWrites");
     for (const auto& [device_addr, size] : ranges) {
+        NoteAheadLevelCall(device_addr, size, "ClaimCpuWrites");
         if (IsRegionGpuModified(device_addr, size)) {
             // The CPU's bytes are in guest memory: read downloads leave the range.
             ClearReplacedDownload(device_addr, size);
@@ -2101,6 +2133,7 @@ void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_wr
 
 template <class P>
 void BufferCache<P>::PopAsyncBuffers() {
+    PromoteAhead(); // FRITCHII_MEMSTAGE_MARKS_AHEAD: a reader of the real sets
     const Common::WriteRing::SiteScope write_site{"buffer download landing (PopAsyncBuffers)", true};
     // EDEN_NX2_EXP49: the host GPU is past this fence. The read downloads taken before its copies
     // are complete and go to guest memory first; those taken after took their bytes out of its
@@ -2201,6 +2234,7 @@ void BufferCache<P>::PopAsyncBuffers() {
 template <class P>
 bool BufferCache<P>::IsRegionGpuModified(DAddr addr, size_t size) {
     VideoCommon::MemoryStageLink::CheckBackCache("IsRegionGpuModified");
+    PromoteAhead(); // FRITCHII_MEMSTAGE_MARKS_AHEAD: the back's question (GPUMem's: GpuWrittenHere)
     // One lookup instead of visiting every range inside (~4% of the GPU thread for title 1's
     // inline uploads once GPU-written ranges are no longer cleared by downloads).
     return gpu_modified_ranges.Intersects(addr, size);
@@ -2253,7 +2287,7 @@ void BufferCache<P>::BindHostIndexBuffer() {
             if (!draw_state.inline_index_draw_indexes.empty()) {
                 indices = std::span{draw_state.inline_index_draw_indexes.data(), size};
             } else if (guest_size != 0 &&
-                       !IsRegionGpuModified(channel_state->index_buffer.device_addr, guest_size)) {
+                       !GpuWrittenHere(channel_state->index_buffer.device_addr, guest_size)) {
                 guest_uint8_indices.resize(guest_size);
                 device_memory.ReadBlockUnsafe(channel_state->index_buffer.device_addr,
                                               guest_uint8_indices.data(), guest_size);
@@ -3582,7 +3616,8 @@ void BufferCache<P>::NoteNativeBankPageChanged(DAddr page, [[maybe_unused]] cons
             page >= upload_to->CpuAddr() &&
             page + Core::DEVICE_PAGESIZE <= upload_to->CpuAddr() + upload_to->SizeBytes() &&
             !memory_tracker.IsRegionGpuModified(page, Core::DEVICE_PAGESIZE) &&
-            !gpu_modified_ranges.Intersects(page, Core::DEVICE_PAGESIZE)) {
+            !gpu_modified_ranges.Intersects(page, Core::DEVICE_PAGESIZE) &&
+            !AheadHere(page, Core::DEVICE_PAGESIZE)) {
             uploads.pages[uploads.count++] = NativeBankUpload{.page = page, .words = words};
             return;
         }
@@ -4086,7 +4121,7 @@ void BufferCache<P>::ProbeExtentTail(u32 index, const Binding& binding) {
                 probe.skip.emplace_back(begin - tail, end - tail);
             }
         };
-        gpu_modified_ranges.ForEachInRange(tail, span, skip);
+        ForEachGpuWrittenHere(tail, span, skip);
         PendingCpuWriteRanges().ForEachInRange(tail, span, skip);
         extent_probes.push_back(std::move(probe));
         extent_trust[compute_shader_hash].probe_pending = true;
@@ -4526,6 +4561,14 @@ void BufferCache<P>::UpdateComputeTextureBuffers() {
 template <class P>
 void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u32 size, bool needs_sync,
                                        bool capped) {
+    // FRITCHII_MEMSTAGE_MARKS_AHEAD: GPUMem's own fill puts the mark on the list ("Marks ahead of
+    // the back", below). Anywhere else the whole of it runs here, after the due promotions.
+    if (marks_ahead.load(std::memory_order_relaxed)) [[unlikely]] {
+        if (MarkWrittenAhead(buffer_id, device_addr, size, needs_sync, capped)) {
+            return;
+        }
+    }
+    PromoteAhead();
     if (VideoCommon::GpuSplit::RecordingDispatch()) [[unlikely]] {
         VideoCommon::GpuSplit::Get().RecordDispatchWrite(device_addr, size);
     }
@@ -4564,6 +4607,450 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
     if (ampere) {
         Nx2NoteListWrite(buffer_id, device_addr, size, capped);
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Marks ahead of the back: FRITCHII_MEMSTAGE_MARKS_AHEAD (live, read at a frame end; default 0;
+// it runs only with the window open: FRITCHII_MEMSTAGE_THREAD=2 and FRITCHII_MEMSTAGE_AHEAD > 0).
+// Fable's design (fable_stage_compute.md, part 1 with its section 10).
+//
+// Off, a draw whose fill writes buffers (storage writes, transform feedback) makes GPUMem come
+// level first (StageLevel, "writing draw"): the back's served calls and fences read the
+// GPU-written marks, so no packet ahead of the back may carry new ones. On, that wait goes:
+//   - every existing set keeps meaning "as of the back": gpu_modified_ranges, the uncommitted
+//     and committed fence sets, pending_download_ranges, the read downloads, the read traps;
+//   - MarkWrittenBuffer on GPUMem's own fill (MemoryStageLink::JoinNeedsTest: GPUMem, not in a
+//     served call, the window open) runs at once the steps GPUMem's later fills need: the
+//     dispatch write record, the buffer's write tick, the tracker's GPU-modified bit, the vertex
+//     buffers' stale flags, the page bits that never clear. The rest (the taken fence downloads'
+//     subtract, the read downloads' outdate, gpu_modified_ranges, the fence download and its
+//     read traps, the command list note) waits on `ahead_writes`, keyed by the push index of the
+//     ring B packet the fill makes: ring B's packet order, the back's issue order (ring B is
+//     taken strictly in order, and a deferred draw's packet stays in it until the back issues
+//     the draw);
+//   - the back promotes them right after it played that packet (the header's flag,
+//     NoteRingPlayed): under the lock the deferred steps run with today's code, in packet order.
+//     It never blocks inside the lock for it: while GPUMem holds the lock (its fill) the back
+//     retries and serves GPUMem's requests, and a GPUMem that waits for the back meanwhile (a
+//     sync's or a join's catch-up) promotes for it. Every reader of the real sets promotes first;
+//   - GPUMem's own work reads both (GpuWrittenHere, ForEachGpuWrittenHere): a write ahead of the
+//     back is before it in the stream;
+//   - the promotion sets the tracker's bit again: a served WriteMemory at the back's position,
+//     before the write in stream order, may have dropped it since the fill, and THREAD 0's order
+//     has the bit set after such a write;
+//   - a fill whose packet never went into ring B (it threw, or made none) takes its marks back,
+//     as does a packet the back drops unplayed (must be 0): the back fills that draw itself.
+// The level rules that stay test both sets (vk_rasterizer.cpp, StageFillDraw; the words' test).
+// Must be 0, logged with the "Memory stage marks ahead" line every 10 s: the AheadCheck list.
+
+namespace MarksAheadDetail {
+/// A stats counter: a plain load and store (one writer at a time: the lock, or one thread).
+inline void AheadBump(std::atomic<u64>& counter, u64 amount = 1) noexcept {
+    counter.store(counter.load(std::memory_order_relaxed) + amount, std::memory_order_relaxed);
+}
+inline u64 AheadNowNs() noexcept {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+}
+} // namespace MarksAheadDetail
+using MarksAheadDetail::AheadBump;
+using MarksAheadDetail::AheadNowNs;
+
+template <class P>
+bool BufferCache<P>::MarkWrittenAhead(BufferId buffer_id, DAddr device_addr, u32 size,
+                                      bool needs_sync, bool capped) {
+    using Link = VideoCommon::MemoryStageLink;
+    if (Link::ServingBack()) [[unlikely]] {
+        // At the back's position: today's code (none does today).
+        NoteAheadCheck(AheadCheck::ServedMark, "MarkWrittenBuffer");
+        return false;
+    }
+    if (!Link::JoinNeedsTest()) {
+        return false; // the back (a run), another thread, or the window closed: today's code
+    }
+    if (ahead_fill_index == 0) [[unlikely]] {
+        NoteAheadCheck(AheadCheck::OutsideFill, "MarkWrittenBuffer");
+        return false;
+    }
+    PromoteAhead();
+    // The steps that run now (the spec's a, b, e, f, h), in today's order.
+    if (VideoCommon::GpuSplit::RecordingDispatch()) [[unlikely]] {
+        VideoCommon::GpuSplit::Get().RecordDispatchWrite(device_addr, size);
+    }
+    if (VideoCommon::Nx2Profile::Fine()) [[unlikely]] {
+        ++nx2_written_marks;
+        nx2_written_mark_bytes += size;
+    }
+    if (ReadRunStats::g_enabled) [[unlikely]] {
+        ReadRunStats::NoteWrite(device_addr, size);
+    }
+    if constexpr (!IS_OPENGL) {
+        if (needs_sync) {
+            Buffer& buffer = slot_buffers[buffer_id];
+            buffer.setWriteTick(runtime.CurrentTick());
+        }
+    }
+    memory_tracker.MarkRegionAsGpuModified(device_addr, size);
+    MarkVertexBuffersStale(device_addr, size);
+    const bool ampere = Tegra::g_nx2_ampere.load(std::memory_order_relaxed);
+    if (ampere) {
+        Tegra::Nx2MarkGpuWritten(device_addr, size);
+    }
+    // The rest at the promotion (c, d, g, i, j).
+    if (ahead_writes.empty()) {
+        ahead_oldest.store(ahead_fill_index, std::memory_order_release);
+    }
+    ahead_writes.push_back(AheadWrite{
+        .index = ahead_fill_index,
+        .addr = device_addr,
+        .size = size,
+        .capped = capped,
+        .ampere = ampere,
+    });
+    ahead_ranges.Add(device_addr, size);
+    AheadBump(ahead_stats.pushed);
+    const u64 length = ahead_writes.size();
+    AheadBump(ahead_stats.length_sum, length);
+    AheadBump(ahead_stats.length_samples);
+    if (length > ahead_stats.length_max.load(std::memory_order_relaxed)) {
+        ahead_stats.length_max.store(length, std::memory_order_relaxed);
+    }
+    return true;
+}
+
+template <class P>
+void BufferCache<P>::PromoteAheadSlow(bool by_back) {
+    if (!mutex.IsHeldByCurrentThread()) [[unlikely]] {
+        // Every reader of the real sets holds the lock; one that does not cannot promote.
+        NoteAheadCheck(AheadCheck::Stale, "a reader of the real sets without the cache's lock");
+        return;
+    }
+    const u64 discarded = ahead_discarded.load(std::memory_order_acquire);
+    const u64 played = ahead_played.load(std::memory_order_acquire);
+    u64 promoted = 0;
+    while (!ahead_writes.empty() && ahead_writes.front().index <= played) {
+        const AheadWrite write = ahead_writes.front();
+        ahead_writes.pop_front();
+        ahead_ranges.Subtract(write.addr, write.size);
+        if (write.index == discarded) [[unlikely]] {
+            AheadBump(ahead_stats.retracted); // its packet was dropped unplayed: not written
+            continue;
+        }
+        if (write.index < ahead_last_promoted) [[unlikely]] {
+            NoteAheadCheck(AheadCheck::Order, "PromoteAhead");
+        }
+        ahead_last_promoted = write.index;
+        // MarkWrittenBuffer's deferred steps, in its order. The downloads already taken hold
+        // older bytes (c), and so do the read downloads (d).
+        for (auto& ranges : pending_download_ranges) {
+            ranges.Subtract(write.addr, write.size);
+        }
+        OutdateReadDownloads(write.addr, write.size);
+        // e again (the block comment above): THREAD 0 has the bit set after anything before the
+        // write in stream order.
+        memory_tracker.MarkRegionAsGpuModified(write.addr, write.size);
+        gpu_modified_ranges.Add(write.addr, write.size);
+        // h ran at the fill, before this arms the read traps.
+        QueueFenceDownload(write.addr, write.size);
+        if (write.ampere) {
+            // The buffer there now: its id is used only while list copies are collected.
+            const BufferId buffer_id = page_table[write.addr >> CACHING_PAGEBITS];
+            Nx2NoteListWrite(buffer_id, write.addr, write.size, write.capped);
+        }
+        ++promoted;
+    }
+    ahead_oldest.store(ahead_writes.empty() ? ~u64{0} : ahead_writes.front().index,
+                       std::memory_order_release);
+    AheadBump(by_back ? ahead_stats.promoted_back : ahead_stats.promoted_other, promoted);
+}
+
+template <class P>
+void BufferCache<P>::RetractAhead(u64 index) {
+    for (auto it = ahead_writes.begin(); it != ahead_writes.end();) {
+        if (it->index != index) {
+            ++it;
+            continue;
+        }
+        ahead_ranges.Subtract(it->addr, it->size);
+        it = ahead_writes.erase(it);
+        AheadBump(ahead_stats.retracted);
+    }
+    ahead_oldest.store(ahead_writes.empty() ? ~u64{0} : ahead_writes.front().index,
+                       std::memory_order_release);
+}
+
+template <class P>
+bool BufferCache<P>::AheadIntersects(DAddr addr, u64 size) const {
+    if (ahead_writes.empty() || size == 0) {
+        return false;
+    }
+    bool hit = false;
+    ahead_ranges.ForEachInRange(addr, size, [&hit](DAddr lower, DAddr upper, s32) {
+        hit = hit || lower < upper;
+    });
+    return hit;
+}
+
+template <class P>
+bool BufferCache<P>::AheadIntersectsPages(DAddr addr, u64 size) const {
+    if (ahead_writes.empty() || size == 0) {
+        return false;
+    }
+    const DAddr begin = Common::AlignDown(addr, DEVICE_PAGESIZE);
+    const DAddr end = Common::AlignUp(addr + size, DEVICE_PAGESIZE);
+    return AheadIntersects(begin, end - begin);
+}
+
+template <class P>
+template <typename Func>
+void BufferCache<P>::ForEachGpuWrittenHere(DAddr addr, u64 size, Func&& func) {
+    if (ahead_writes.empty() || !VideoCommon::MemoryStageLink::JoinNeedsTest()) [[likely]] {
+        gpu_modified_ranges.ForEachInRange(addr, size, func);
+        return;
+    }
+    // Both sets, merged in address order (callers walk the gaps between the ranges).
+    boost::container::small_vector<std::pair<DAddr, DAddr>, 16> spans;
+    gpu_modified_ranges.ForEachInRange(addr, size, [&spans](DAddr lower, DAddr upper) {
+        spans.emplace_back(lower, upper);
+    });
+    ahead_ranges.ForEachInRange(addr, size, [&spans](DAddr lower, DAddr upper, s32) {
+        if (lower < upper) {
+            spans.emplace_back(lower, upper);
+        }
+    });
+    if (spans.empty()) {
+        return;
+    }
+    std::sort(spans.begin(), spans.end());
+    std::pair<DAddr, DAddr> current = spans.front();
+    for (size_t i = 1; i < spans.size(); ++i) {
+        if (spans[i].first <= current.second) {
+            current.second = (std::max)(current.second, spans[i].second);
+            continue;
+        }
+        func(current.first, current.second);
+        current = spans[i];
+    }
+    func(current.first, current.second);
+}
+
+template <class P>
+void BufferCache<P>::BeginAheadFill(u64 index) {
+    // GPUMem at a fill's start: one compare when nothing is due.
+    PromoteAhead();
+    ahead_fill_index = index;
+    ahead_fill_pushed = false;
+}
+
+template <class P>
+bool BufferCache<P>::AheadFillPushed(u64 index) {
+    if (ahead_fill_index == 0) {
+        return false;
+    }
+    ahead_fill_pushed = true;
+    if (index != ahead_fill_index) [[unlikely]] {
+        // The fill's marks are the newest: they go with the packet that carries the fill.
+        NoteAheadCheck(AheadCheck::PushMismatch, "PushRingDraw");
+        for (auto it = ahead_writes.rbegin();
+             it != ahead_writes.rend() && it->index == ahead_fill_index; ++it) {
+            it->index = index;
+        }
+        ahead_fill_index = index;
+        ahead_oldest.store(ahead_writes.empty() ? ~u64{0} : ahead_writes.front().index,
+                           std::memory_order_release);
+    }
+    return !ahead_writes.empty() && ahead_writes.back().index == index;
+}
+
+template <class P>
+void BufferCache<P>::EndAheadFill() {
+    if (ahead_fill_index == 0) {
+        return;
+    }
+    if (!ahead_fill_pushed && !ahead_writes.empty() &&
+        ahead_writes.back().index == ahead_fill_index) [[unlikely]] {
+        // No packet carries them: the back fills this draw itself and marks it then.
+        while (!ahead_writes.empty() && ahead_writes.back().index == ahead_fill_index) {
+            ahead_ranges.Subtract(ahead_writes.back().addr, ahead_writes.back().size);
+            ahead_writes.pop_back();
+            AheadBump(ahead_stats.retracted);
+        }
+        ahead_oldest.store(ahead_writes.empty() ? ~u64{0} : ahead_writes.front().index,
+                           std::memory_order_release);
+    }
+    ahead_fill_index = 0;
+    ahead_fill_pushed = false;
+}
+
+template <class P>
+bool BufferCache<P>::TryPromoteAhead(void* self_) {
+    BufferCache& self = *static_cast<BufferCache*>(self_);
+    if (!self.AheadDue()) {
+        return true; // promoted, by the back or by the lock's holder
+    }
+    if (!self.mutex.try_lock()) {
+        return false;
+    }
+    std::scoped_lock lock{std::adopt_lock, self.mutex};
+    self.PromoteAhead(true);
+    return true;
+}
+
+template <class P>
+void BufferCache<P>::NoteRingPlayed(u64 index, bool marked) {
+    ahead_played.store(index, std::memory_order_release);
+    if (!marked || TryPromoteAhead(this)) [[likely]] {
+        return;
+    }
+    // GPUMem (its fill) or another thread holds the lock.
+    const u64 start = AheadNowNs();
+    VideoCommon::MemoryStageLink::Get().BackPromoteMarks(&TryPromoteAhead, this);
+    AheadBump(ahead_stats.back_waits);
+    AheadBump(ahead_stats.back_wait_ns, AheadNowNs() - start);
+}
+
+template <class P>
+void BufferCache<P>::NoteRingDiscarded(u64 index, bool marked) {
+    if (marked) {
+        ahead_discarded.store(index, std::memory_order_release);
+    }
+    NoteRingPlayed(index, marked);
+}
+
+template <class P>
+void BufferCache<P>::CheckAheadAt(AheadPoint where) {
+    if (where == AheadPoint::RunStart) {
+        // Marks of packets the run takes later (its first entry's draws GPUMem filled) stay;
+        // the back promoted every packet it played.
+        if (AheadDue()) [[unlikely]] {
+            NoteAheadCheck(AheadCheck::RunDue, "a run's first entry");
+            std::scoped_lock lock{mutex};
+            PromoteAhead(true);
+        }
+        return;
+    }
+    if (ahead_oldest.load(std::memory_order_acquire) == ~u64{0}) [[likely]] {
+        return; // empty
+    }
+    std::scoped_lock lock{mutex};
+    PromoteAhead(true);
+    if (ahead_writes.empty()) {
+        return;
+    }
+    NoteAheadCheck(AheadCheck::NotEmpty,
+                   where == AheadPoint::RingStart ? "the ring's start" : "the ring's end");
+    // No packet will play them: dropped (their early steps only made the cache more careful).
+    while (!ahead_writes.empty()) {
+        ahead_ranges.Subtract(ahead_writes.back().addr, ahead_writes.back().size);
+        ahead_writes.pop_back();
+        AheadBump(ahead_stats.retracted);
+    }
+    ahead_oldest.store(~u64{0}, std::memory_order_release);
+}
+
+template <class P>
+void BufferCache<P>::NoteAheadLevel(AheadLevel kind) noexcept {
+    AheadBump(ahead_stats.levels[static_cast<size_t>(kind)]);
+}
+
+template <class P>
+void BufferCache<P>::NoteAheadLevelCallSlow(DAddr addr, u64 size, const char* where) {
+    if (VideoCommon::MemoryStageLink::JoinNeedsTest() && AheadIntersectsPages(addr, size)) {
+        NoteAheadCheck(AheadCheck::Claim, where);
+    }
+}
+
+template <class P>
+void BufferCache<P>::NoteAheadCheck(AheadCheck check, const char* where) const noexcept {
+    static constexpr std::array<const char*, static_cast<size_t>(AheadCheck::Count)> names{
+        "a level function on GPUMem's own work over a page with a mark ahead",
+        "a promotion out of packet order",
+        "the list not empty",
+        "a mark due at a run's first entry",
+        "a due mark a reader could not promote",
+        "a GPU-written mark in a call GPUMem serves for the back",
+        "a GPU-written mark on GPUMem's own work outside a draw fill",
+        "the packet pushed is not the one the fill's marks were keyed with",
+    };
+    const size_t index = static_cast<size_t>(check);
+    ahead_stats.checks[index].fetch_add(1, std::memory_order_relaxed);
+    static std::array<std::atomic<u32>, static_cast<size_t>(AheadCheck::Count)> logged{};
+    if (logged[index].fetch_add(1, std::memory_order_relaxed) < 16) {
+        LOG_ERROR(HW_GPU, "Memory stage marks ahead (must be 0): {} ({})", names[index], where);
+    }
+}
+
+template <class P>
+void BufferCache<P>::SetMarksAhead(bool on, bool wanted) {
+    if (on != marks_ahead.load(std::memory_order_relaxed) || wanted != marks_ahead_wanted) {
+        LOG_INFO(HW_GPU, "Memory stage marks ahead (FRITCHII_MEMSTAGE_MARKS_AHEAD={}): {}",
+                 wanted ? 1 : 0,
+                 on       ? "GPUMem's writing fills mark ahead of the back, no level wait"
+                 : wanted ? "off while the window is closed (FRITCHII_MEMSTAGE_THREAD=2 and "
+                            "FRITCHII_MEMSTAGE_AHEAD > 0)"
+                          : "off");
+        marks_ahead_wanted = wanted;
+        marks_ahead.store(on, std::memory_order_relaxed);
+    }
+    LogMarksAhead();
+}
+
+template <class P>
+void BufferCache<P>::LogMarksAhead() {
+    const u64 now = AheadNowNs();
+    if (ahead_log_ns == 0) {
+        ahead_log_ns = now;
+        return;
+    }
+    if (now - ahead_log_ns < 10'000'000'000ULL) {
+        return;
+    }
+    const double seconds = static_cast<double>(now - ahead_log_ns) / 1e9;
+    ahead_log_ns = now;
+    const auto take = [&](size_t slot, const std::atomic<u64>& counter) {
+        const u64 value = counter.load(std::memory_order_relaxed);
+        const u64 delta = value - ahead_reported[slot];
+        ahead_reported[slot] = value;
+        return delta;
+    };
+    AheadStats& s = ahead_stats;
+    const u64 pushed = take(0, s.pushed);
+    const u64 by_back = take(1, s.promoted_back);
+    const u64 by_other = take(2, s.promoted_other);
+    const u64 retracted = take(3, s.retracted);
+    const u64 length_sum = take(4, s.length_sum);
+    const u64 samples = take(5, s.length_samples);
+    const u64 waits = take(6, s.back_waits);
+    const u64 wait_ns = take(7, s.back_wait_ns);
+    const u64 claims = s.levels[0].exchange(0, std::memory_order_relaxed);
+    const u64 refused = s.levels[1].exchange(0, std::memory_order_relaxed);
+    const u64 bound = s.levels[2].exchange(0, std::memory_order_relaxed);
+    const u64 length_max = s.length_max.exchange(0, std::memory_order_relaxed);
+    std::string checks;
+    u64 any_check = 0;
+    for (size_t i = 0; i < s.checks.size(); ++i) {
+        const u64 value = s.checks[i].load(std::memory_order_relaxed);
+        any_check += value - ahead_checks_reported[i];
+        checks += fmt::format("{}{}", i == 0 ? "" : " ", value);
+        ahead_checks_reported[i] = value;
+    }
+    if (!marks_ahead.load(std::memory_order_relaxed) && pushed == 0 && by_back == 0 &&
+        by_other == 0 && any_check == 0) {
+        return;
+    }
+    const auto rate = [seconds](u64 value) { return static_cast<double>(value) / seconds; };
+    LOG_INFO(HW_GPU,
+             "Memory stage marks ahead {:.0f} s: put on the list {:.0f}/s, promoted by the back at "
+             "the play {:.0f}/s, by others {:.0f}/s, taken back {:.1f}/s; list length avg {:.1f} "
+             "max {}; the back's waits for the lock at a promotion {:.1f}/s ({:.2f} ms/s); level "
+             "waits: claims {:.1f}/s (refused after the wait {:.1f}/s), at the bound {:.1f}/s; "
+             "must be 0 (claim, order, not empty, run due, stale, served mark, outside a fill, push "
+             "mismatch; totals): {}",
+             seconds, rate(pushed), rate(by_back), rate(by_other), rate(retracted),
+             samples != 0 ? static_cast<double>(length_sum) / static_cast<double>(samples) : 0.0,
+             length_max, rate(waits), static_cast<double>(wait_ns) / 1e6 / seconds, rate(claims),
+             rate(refused), rate(bound), checks);
 }
 
 template <class P>
@@ -5005,7 +5492,7 @@ bool BufferCache<P>::JoinCopyIsDead(DAddr device_addr, u64 size) {
     // GPU-modified or Preflushable, GPU writes the upload skips (gpu_modified_ranges), and GPU
     // writes queued or in flight for download.
     if (!memory_tracker.IsRegionWhollyCpuModified(device_addr, size) ||
-        gpu_modified_ranges.Intersects(device_addr, size) ||
+        gpu_modified_ranges.Intersects(device_addr, size) || AheadHere(device_addr, size) ||
         uncommitted_gpu_modified_ranges.Intersects(device_addr, size)) {
         return false;
     }
@@ -5037,7 +5524,7 @@ bool BufferCache<P>::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
     // first plays the packets ahead (a download it records later must not read the new buffer
     // before this copy); kept for the served calls' check either way.
     if (VideoCommon::MemoryStageLink::JoinNeedsTest() &&
-        IsRegionGpuModified(overlap.CpuAddr(), overlap.SizeBytes())) [[unlikely]] {
+        GpuWrittenHere(overlap.CpuAddr(), overlap.SizeBytes())) [[unlikely]] {
         VideoCommon::MemoryStageLink::JoinOverGpuWritten();
     }
     VideoCommon::MemoryStageLink::NoteBufferJoin(overlap.CpuAddr(), overlap.SizeBytes());
@@ -5229,7 +5716,7 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
         };
         for_each_upload_range([&](u64 device_addr_out, u64 range_size) {
             DAddr upload_start = device_addr_out;
-            gpu_modified_ranges.ForEachInRange(device_addr_out, range_size, [&](DAddr gpu_start, DAddr gpu_end) {
+            ForEachGpuWrittenHere(device_addr_out, range_size, [&](DAddr gpu_start, DAddr gpu_end) {
                 add_upload(upload_start, gpu_start);
                 upload_start = gpu_end;
             });
@@ -5506,6 +5993,8 @@ void BufferCache<P>::MappedUploadMemory([[maybe_unused]] Buffer& buffer,
 template <class P>
 bool BufferCache<P>::InlineMemory(DAddr dest_address, size_t copy_size,
                                   std::span<const u8> inlined_buffer) {
+    PromoteAhead();
+    NoteAheadLevelCall(dest_address, copy_size, "InlineMemory");
     const bool is_dirty = IsRegionRegistered(dest_address, copy_size);
     if (!is_dirty) {
         return false;
@@ -5524,6 +6013,7 @@ bool BufferCache<P>::InlineMemory(DAddr dest_address, size_t copy_size,
 template <class P>
 void BufferCache<P>::InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
                                                 std::span<const u8> inlined_buffer) {
+    NoteAheadLevelCall(dest_address, copy_size, "InlineMemoryImplementation");
     Core::g_buffer_write_pages.Mark(dest_address, copy_size);
     Core::g_watch_write_pages.Mark(dest_address, copy_size);
     ClearDownload(dest_address, copy_size);
@@ -5557,6 +6047,7 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer) {
 
 template <class P>
 void BufferCache<P>::DownloadBuffersMemory(std::span<const BufferId> buffer_ids) {
+    PromoteAhead(); // FRITCHII_MEMSTAGE_MARKS_AHEAD: a reader of the real sets
     const Common::WriteRing::SiteScope write_site{"buffer download (DownloadBuffersMemory)", true};
     struct Download {
         BufferId buffer_id;
@@ -5614,6 +6105,7 @@ void BufferCache<P>::DownloadBuffersMemory(std::span<const BufferId> buffer_ids)
 
 template <class P>
 void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64 size) {
+    PromoteAhead(); // FRITCHII_MEMSTAGE_MARKS_AHEAD: a reader of the real sets
     boost::container::small_vector<BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
     u64 largest_copy = 0;

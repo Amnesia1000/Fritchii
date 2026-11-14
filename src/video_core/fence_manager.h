@@ -33,6 +33,7 @@
 #include "video_core/gpu_wait_site.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/syncpoint_manager.h"
+#include "video_core/memory_stage_link.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/rasterizer_interface.h"
@@ -72,6 +73,9 @@ public:
             TryReleasePendingFences<false>();
         }
         std::scoped_lock lock{buffer_cache.mutex};
+        // FRITCHII_MEMSTAGE_MARKS_AHEAD: on the back, under the lock, also while served
+        // (AccumulateFlushes promotes the due marks first).
+        const VideoCommon::MemoryStageLink::BackCacheScope back_cache;
         buffer_cache.AccumulateFlushes();
     }
 
@@ -308,6 +312,9 @@ public:
         }
         {
             std::unique_lock lock{buffer_cache.mutex, std::try_to_lock};
+            if (lock) {
+                buffer_cache.PromoteAhead(); // FRITCHII_MEMSTAGE_MARKS_AHEAD
+            }
             if (!lock || buffer_cache.HasUncommittedFlushes()) {
                 return false;
             }
@@ -776,7 +783,10 @@ private:
         const int fast = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_fence_commit_fast,
                                                           "FRITCHII_FENCE_COMMIT_FAST");
         const bool texture_idle = fast != 0 && !texture_cache.MayHaveAsyncFlushWork();
-        const bool buffer_idle = fast != 0 && !buffer_cache.MayHaveUncommittedFlushes();
+        // FRITCHII_MEMSTAGE_MARKS_AHEAD: a played packet's marks still to promote may queue a
+        // download: the half runs then.
+        const bool buffer_idle = fast != 0 && !buffer_cache.MayHaveUncommittedFlushes() &&
+                                 !buffer_cache.AheadDue();
         if (fast != 0) [[unlikely]] {
             NoteFenceCommitFast(fast, texture_idle, buffer_idle);
         }
@@ -792,6 +802,12 @@ private:
         }
         if (!buffer_idle) {
             std::scoped_lock lock{buffer_cache.mutex};
+            // FRITCHII_MEMSTAGE_MARKS_AHEAD (fable_stage_compute 2.4): the commit runs on the back
+            // under the lock, also while served (the cache's user here); the real sets hold the
+            // writes the back recorded before this fence and none after, once the due marks are
+            // promoted.
+            const VideoCommon::MemoryStageLink::BackCacheScope back_cache;
+            buffer_cache.PromoteAhead();
             [[maybe_unused]] auto seam = [&] {
                 if constexpr (requires { buffer_cache.runtime.FenceCommitBracket(); }) {
                     return buffer_cache.runtime.FenceCommitBracket();

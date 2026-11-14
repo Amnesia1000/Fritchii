@@ -547,6 +547,65 @@ public:
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(DAddr addr, size_t size);
 
+    // --- FRITCHII_MEMSTAGE_MARKS_AHEAD (memory stage compute, part 1): GPU-written marks made
+    // ahead of the back. The real sets (gpu_modified_ranges, the fence and read downloads) stay
+    // "as of the back"; a writing fill on GPUMem puts its marks on a list keyed by ring B's
+    // packet order, and they enter the real sets when the back has played that packet
+    // (buffer_cache.h, "Marks ahead of the back"). ---
+
+    /// Where the ahead list must be empty, or hold nothing due (CheckAheadAt).
+    enum class AheadPoint : u8 { RingStart, RingEnd, RunStart };
+    /// The level rules' counts (RasterizerVulkan::StageFillDraw).
+    enum class AheadLevel : u8 { Claim, ClaimRefused, Bound };
+
+    /// The back, at a frame end (a level point: GPUMem is parked): the switch as it runs (`on`:
+    /// the switch and the window open) and as set. Logs "Memory stage marks ahead" every 10 s.
+    void SetMarksAhead(bool on, bool wanted);
+    [[nodiscard]] bool MarksAhead() const noexcept {
+        return marks_ahead.load(std::memory_order_relaxed);
+    }
+    /// Any thread, no lock: the back has played a packet whose marks are still on the list.
+    [[nodiscard]] bool AheadDue() const noexcept {
+        return ahead_oldest.load(std::memory_order_acquire) <=
+               ahead_played.load(std::memory_order_acquire);
+    }
+    /// The lock held: the due marks go into the real sets (one compare when none is due). Every
+    /// reader of the real sets calls it first.
+    void PromoteAhead(bool by_back = false) {
+        if (AheadDue()) [[unlikely]] {
+            PromoteAheadSlow(by_back);
+        }
+    }
+    /// The lock held: whether a mark on the list covers a byte of [addr, addr + size), or of its
+    /// pages.
+    [[nodiscard]] bool AheadIntersects(DAddr addr, u64 size) const;
+    [[nodiscard]] bool AheadIntersectsPages(DAddr addr, u64 size) const;
+    /// The lock held: IsRegionGpuModified as GPUMem's own work sees it (the real set, and on
+    /// GPUMem outside a served call the list too).
+    [[nodiscard]] bool GpuWrittenHere(DAddr addr, u64 size) {
+        return IsRegionGpuModified(addr, size) || AheadHere(addr, size);
+    }
+    /// GPUMem's draw fill, the lock held: the push index ring B's packet of this fill gets.
+    void BeginAheadFill(u64 index);
+    /// GPUMem's PushRingDraw, the lock held: packet `index` goes into ring B. True when its fill
+    /// marked writes (the header's flag: the back promotes after its play).
+    [[nodiscard]] bool AheadFillPushed(u64 index);
+    /// GPUMem, however its fill ended (the lock held): the marks of a fill whose packet never
+    /// went into ring B are taken back (the back fills that draw itself).
+    void EndAheadFill();
+    /// The back, at the end of ring packet `index`'s play. `marked`: its fill marked writes; the
+    /// back then promotes before it goes on (the lock, or its holder promotes for it).
+    void NoteRingPlayed(u64 index, bool marked);
+    /// The back dropped packet `index` unplayed (must be 0): its marks are taken back.
+    void NoteRingDiscarded(u64 index, bool marked);
+    /// The back, at a ring's start or end (the list empty) or a run's first entry (nothing due).
+    void CheckAheadAt(AheadPoint where);
+    void NoteAheadLevel(AheadLevel kind) noexcept;
+    /// The lock held: the list is at its bound (4,096 marks).
+    [[nodiscard]] bool AheadFull() const noexcept {
+        return ahead_writes.size() >= AheadBound;
+    }
+
     /// Visits the uniform and storage buffers bound for the last draw or dispatch with the cached
     /// host buffer holding each range, if one does, for EDEN_NX2_FRAME_DUMP_SAMPLED. Nothing is
     /// created or synchronized. Stage 5 is compute.
@@ -1364,6 +1423,92 @@ private:
     /// All the read downloads' clean_ranges (they don't overlap): GPU-modified bytes already on
     /// their way, which later reads wait for rather than download again.
     Common::RangeSet<DAddr> read_download_ranges;
+
+    // FRITCHII_MEMSTAGE_MARKS_AHEAD (buffer_cache.h, "Marks ahead of the back").
+    /// A GPU write a fill on GPUMem marked ahead of the back: what MarkWrittenBuffer still has to
+    /// do for it when the back has played ring B's packet `index`.
+    struct AheadWrite {
+        u64 index;
+        DAddr addr;
+        u32 size;
+        bool capped;
+        bool ampere;
+    };
+    static constexpr size_t AheadBound = 4096;
+    /// In fill order (= packet order), under `mutex`.
+    std::deque<AheadWrite> ahead_writes;
+    /// The counted union of their ranges, under `mutex`.
+    Common::OverlapRangeSet<DAddr> ahead_ranges;
+    /// The oldest entry's index (~0: none), and the last packet the back played (taken or
+    /// dropped). Written under `mutex` (ahead_played: by the back alone), read anywhere.
+    std::atomic<u64> ahead_oldest{~u64{0}};
+    std::atomic<u64> ahead_played{0};
+    /// A packet the back dropped unplayed: its marks are dropped instead of promoted (stored by
+    /// the back before ahead_played).
+    std::atomic<u64> ahead_discarded{0};
+    std::atomic<bool> marks_ahead{false};
+    bool marks_ahead_wanted{};
+    /// GPUMem's open draw fill: its packet's index (0: none), and whether the packet went.
+    u64 ahead_fill_index{};
+    bool ahead_fill_pushed{};
+    u64 ahead_last_promoted{};
+    /// Must be 0 (the "Memory stage marks ahead" line).
+    enum class AheadCheck : u8 {
+        Claim,        ///< a level function on GPUMem's own work over a page with a mark ahead
+        Order,        ///< a promotion out of packet order
+        NotEmpty,     ///< the list not empty at a ring's start or end
+        RunDue,       ///< a mark due at a run's first entry
+        Stale,        ///< a reader of the real sets found a due mark it could not promote
+        ServedMark,   ///< MarkWrittenBuffer in a call GPUMem serves for the back
+        OutsideFill,  ///< a mark on GPUMem's own work outside a draw fill
+        PushMismatch, ///< the packet pushed is not the one the fill was keyed with
+        Count,
+    };
+    struct AheadStats {
+        std::atomic<u64> pushed{};
+        std::atomic<u64> promoted_back{};
+        std::atomic<u64> promoted_other{};
+        std::atomic<u64> retracted{};
+        std::atomic<u64> length_sum{};
+        std::atomic<u64> length_samples{};
+        std::atomic<u64> length_max{};
+        std::atomic<u64> back_waits{};
+        std::atomic<u64> back_wait_ns{};
+        std::array<std::atomic<u64>, 3> levels{}; ///< AheadLevel
+        std::array<std::atomic<u64>, static_cast<size_t>(AheadCheck::Count)> checks{};
+    };
+    mutable AheadStats ahead_stats;
+    std::array<u64, 9> ahead_reported{};
+    std::array<u64, static_cast<size_t>(AheadCheck::Count)> ahead_checks_reported{};
+    u64 ahead_log_ns{};
+
+    void PromoteAheadSlow(bool by_back);
+    /// MarkWrittenBuffer on GPUMem's own fill: its steps that run now. False: today's path.
+    bool MarkWrittenAhead(BufferId buffer_id, DAddr device_addr, u32 size, bool needs_sync,
+                          bool capped);
+    /// Takes the marks of packet `index` off the list (not promoted).
+    void RetractAhead(u64 index);
+    /// The list's part of GpuWrittenHere: GPUMem's own work only (a served call and every other
+    /// thread act at the back's position, where those writes are not made yet).
+    [[nodiscard]] bool AheadHere(DAddr addr, u64 size) const {
+        return !ahead_writes.empty() && MemoryStageLink::JoinNeedsTest() &&
+               AheadIntersects(addr, size);
+    }
+    /// gpu_modified_ranges.ForEachInRange with the list's ranges merged in (AheadHere's rule).
+    template <typename Func>
+    void ForEachGpuWrittenHere(DAddr addr, u64 size, Func&& func);
+    /// At a level function's top (section 3's "level" rows): counted when GPUMem's own work
+    /// changes the real sets over a page with a mark ahead (must be 0).
+    void NoteAheadLevelCall(DAddr addr, u64 size, const char* where) {
+        if (!ahead_writes.empty()) [[unlikely]] {
+            NoteAheadLevelCallSlow(addr, size, where);
+        }
+    }
+    void NoteAheadLevelCallSlow(DAddr addr, u64 size, const char* where);
+    void NoteAheadCheck(AheadCheck check, const char* where) const noexcept;
+    /// The back's promotion try (MemoryStageLink::BackPromoteMarks): true when nothing is due.
+    static bool TryPromoteAhead(void* self);
+    void LogMarksAhead();
 
     std::deque<Async_Buffer> async_buffers_death_ring;
 
