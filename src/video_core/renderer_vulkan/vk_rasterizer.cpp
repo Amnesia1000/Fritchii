@@ -2402,8 +2402,10 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
 } // Anonymous namespace
 
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
-    // FRITCHII_DELAY_DRAW_US (live, 0 = off): the delay test "D", on the back thread only.
-    VideoCommon::GpuSplit::DelayWork(VideoCommon::GpuSplit::DelayTest::Draw);
+    // FRITCHII_DELAY_DRAW_US (live, 0 = off): the delay test "D", on the back thread only. Off:
+    // one load and a branch.
+    VideoCommon::GpuSplit::DelayWorkIf(VideoCore::Nx2Debug::g_delay_draw_us,
+                                       VideoCommon::GpuSplit::DelayTest::Draw);
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     const VideoCommon::FritchiiDrawKinds::Scope draw_kinds_scope{maxwell3d->regs};
     // A vertex count GPU work wrote (nx2_indirect_grid.h): drawn with that count, read on the GPU.
@@ -2725,8 +2727,9 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
 
 void RasterizerVulkan::DrawIndirect() {
     // FRITCHII_DELAY_DRAW_US (live, 0 = off): the delay test "D" (list draws included), on the
-    // back thread only.
-    VideoCommon::GpuSplit::DelayWork(VideoCommon::GpuSplit::DelayTest::Draw);
+    // back thread only. Off: one load and a branch.
+    VideoCommon::GpuSplit::DelayWorkIf(VideoCore::Nx2Debug::g_delay_draw_us,
+                                       VideoCommon::GpuSplit::DelayTest::Draw);
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     const VideoCommon::FritchiiDrawKinds::Scope draw_kinds_scope{maxwell3d->regs};
     const auto& params = maxwell3d->draw_manager.indirect_state;
@@ -3579,7 +3582,9 @@ void RasterizerVulkan::Clear(u32 layer_count) {
 
 void RasterizerVulkan::DispatchCompute() {
     // FRITCHII_DELAY_DISPATCH_US (live, 0 = off): the delay test "K", on the back thread only.
-    VideoCommon::GpuSplit::DelayWork(VideoCommon::GpuSplit::DelayTest::Dispatch);
+    // Off: one load and a branch.
+    VideoCommon::GpuSplit::DelayWorkIf(VideoCore::Nx2Debug::g_delay_dispatch_us,
+                                       VideoCommon::GpuSplit::DelayTest::Dispatch);
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Compute};
     t_in_dispatch = true;
     SCOPE_EXIT {

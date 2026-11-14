@@ -865,6 +865,14 @@ public:
     /// 0): spins the switch's microseconds for `test` (E2c, Dispatch or Draw) when it is set.
     /// Dispatch and Draw spin only on the back thread (never on GPUMem, nor without the split).
     static void DelayWork(DelayTest test);
+    /// DelayWork behind an inline test of `test`'s own switch, `value` (Nx2Debug::g_delay_e2c_us,
+    /// g_delay_dispatch_us or g_delay_draw_us; -1 until DelayWork's first read stores it): with
+    /// the switch at 0 a draw or dispatch pays one relaxed load and a branch, no call.
+    static void DelayWorkIf(const std::atomic<int>& value, DelayTest test) {
+        if (value.load(std::memory_order_relaxed) != 0) [[unlikely]] {
+            DelayWork(test);
+        }
+    }
     /// Front, right before a wait of `test`'s kind (a drain): 0 unless its switch is set and the
     /// back has not run everything sent (the drain will wait). With FRITCHII_DELAY_BEFORE=1 (the
     /// control run) it spins here and returns 0; otherwise it returns the microseconds the caller

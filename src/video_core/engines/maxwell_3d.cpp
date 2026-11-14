@@ -2865,8 +2865,9 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
     fs.e2c_call = oot == OotMacros::Id::E2C;
     if (fs.e2c_call) {
         // FRITCHII_DELAY_E2C_US (live, 0 = off): the delay test "W", every call (hits too),
-        // before its read, whether the handler or the JIT runs it.
-        VideoCommon::GpuSplit::DelayWork(VideoCommon::GpuSplit::DelayTest::E2c);
+        // before its read, whether the handler or the JIT runs it. Off: one load and a branch.
+        VideoCommon::GpuSplit::DelayWorkIf(VideoCore::Nx2Debug::g_delay_e2c_us,
+                                           VideoCommon::GpuSplit::DelayTest::E2c);
     }
     {
         VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
@@ -3573,7 +3574,8 @@ void Maxwell3D::FrontNoteMemoryWrite(VideoCommon::GpuSplit& split, FrontState& f
 
 namespace {
 
-// "Front 0xe2c misses" (fable_front_drains 1.3 A, the counter first; always on, only at misses):
+// "Front 0xe2c misses" (fable_front_drains 1.3 A, the counter first; FRITCHII_E2C_CENSUS, live,
+// default 0 since 2026-11-14: about 20 ms/s of the front at 2,600 misses a second; only at misses):
 // per MME DMA read of the 0xe2c occlusion macro that misses its page snapshot for a noted write
 // (EDEN_NX2_DMA_SNAPSHOT's reason "noted write"), the newest noted write since the snapshot over
 // bytes 0-8, 8-16 and 16-24 of the read (the macro compares the 64-bit words at 0 and 16; 8-16
@@ -3595,11 +3597,20 @@ struct E2cMissStats {
     u64 listed{};
     u64 overflows{};
     std::chrono::steady_clock::time_point since{};
+    std::chrono::steady_clock::time_point last{}; ///< The previous miss counted
 };
 E2cMissStats g_e2c_misses;
 
 void NoteE2cMiss(VideoCommon::GpuSplit& split, u64 snapshot, u64 device, bool listed) {
     auto& s = g_e2c_misses;
+    const auto now = std::chrono::steady_clock::now();
+    // A miss 10 s after the previous one: the switch was off (or nothing missed), so the window
+    // starts over here rather than reporting the old counts over the whole time.
+    if (s.since != std::chrono::steady_clock::time_point{} &&
+        now - s.last > std::chrono::seconds{10}) {
+        s = {};
+    }
+    s.last = now;
     const u64 done = split.ConsumedNow();
     const u64 behind = split.SentPosition() - (std::min)(done, split.SentPosition());
     std::array<VideoCommon::GpuSplit::NotedOver, 3> over;
@@ -3621,7 +3632,6 @@ void NoteE2cMiss(VideoCommon::GpuSplit& split, u64 snapshot, u64 device, bool li
         const bool ran = note.position != 0 && note.position <= done;
         ++s.notes[range][kind][note.known ? 1 : 0][ran ? 1 : 0];
     }
-    const auto now = std::chrono::steady_clock::now();
     if (s.since == std::chrono::steady_clock::time_point{}) {
         s.since = now;
         return;
@@ -3660,6 +3670,7 @@ void NoteE2cMiss(VideoCommon::GpuSplit& split, u64 snapshot, u64 device, bool li
     const auto start = now;
     s = {};
     s.since = start;
+    s.last = start;
 }
 
 // FRITCHII_FRONT_RAN_READS (live, default 0; the market's "Front 0xe2c misses" line: about 90%
@@ -4051,8 +4062,11 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                     }
                 }
                 byte_merges += snapshot.listed.merges - merges_before;
-                if (reason == 3 && fs.e2c_call && words == 6) {
-                    // "Front 0xe2c misses": what the noted write over the read's bytes is.
+                if (reason == 3 && fs.e2c_call && words == 6 &&
+                    VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_e2c_census,
+                                                     "FRITCHII_E2C_CENSUS") != 0) [[unlikely]] {
+                    // "Front 0xe2c misses" (FRITCHII_E2C_CENSUS, live, default 0: nothing here):
+                    // what the noted write over the read's bytes is.
                     NoteE2cMiss(split, since, *device,
                                 rasterizer->HasCachedReports(*device - 12,
                                                              u64{read_bytes} + 12));

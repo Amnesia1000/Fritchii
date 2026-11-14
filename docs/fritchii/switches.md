@@ -114,8 +114,15 @@ is critical by construction); these add work to one thread in the middle of its 
   y ms/s (front), FRITCHII_DELAY_DISPATCH_US=n ... (back), FRITCHII_DELAY_DRAW_US=n ... (back)".
 - Reading them: a spin on the thread that paces a pass costs about its ms/s in fps; one on a
   thread with slack there costs little.
+- Off (0), a call, draw or dispatch pays one relaxed load of its switch and a branch, inline at
+  the call site (GpuSplit::DelayWorkIf), no function call.
 
-### Front 0xe2c misses (always on, a counter)
+### FRITCHII_E2C_CENSUS (the "Front 0xe2c misses" line)
+
+FRITCHII_E2C_CENSUS (live, default 0 since 2026-11-14 = no work at all on the miss path; 1 = the
+line below). It cost the front about 20 ms/s at the market's 2,600 misses a second (the walk of
+the noted writes and the query cache look at each miss; fable_front_drains 8.4). A miss more than
+10 s after the previous counted one starts a new window, so turning it on live gives honest rates.
 
 "Front 0xe2c misses (noted write) 10 s" (HW_GPU, Info): the macro DMA reads of the 0xe2c
 occlusion macro (hash 0x3b26ab7eb3fc9863, its 0x158 read of six words; OoT macro slots, so only
@@ -222,7 +229,11 @@ makes a stamp newer). It then counts as the scan's miss (the page's checked coun
 - The stamps start over with each split session (positions start at 0).
 - 2 verifies these reads as the others.
 
-### Acquire resumes met by (always on, a counter)
+### FRITCHII_ACQUIRE_MET_BY (the "Acquire resumes met by" line)
+
+FRITCHII_ACQUIRE_MET_BY (live, default 0 since 2026-11-14 = one relaxed load per resume; 1 = the
+line below). On, each resume pays a page table lookup, the release tables, a scan of the noted
+writes and a clock read. A resume more than 5 s after the previous counted one starts a new window.
 
 "Acquire resumes met by" (HW_GPU, Info, every 5 s; fable_front_drains 2.3 items 2-3): for every
 suspended semaphore acquire that resumes (Puller::ResumeAcquire), the release that met it, as the

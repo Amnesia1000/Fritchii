@@ -985,7 +985,9 @@ void QmdPredictionMetBy(DmaPusher& dma_pusher, const QmdPredictionCheck& check,
     }
 }
 
-// "Acquire resumes met by" (fable_front_drains 2.3 items 2-3; always on, one look per resume):
+// "Acquire resumes met by" (fable_front_drains 2.3 items 2-3; FRITCHII_ACQUIRE_MET_BY, live,
+// default 0 since 2026-11-14: a page table lookup, two table looks, a noted-write scan and a clock
+// read per resume when on):
 // for every suspended acquire that resumes, the release that met it as the front's tables tell,
 // by kind, and whether its value was known to the front when it sent it; split into resumes by
 // the back's latch and by the other routes (word read, front answer, poll drain, lagged check).
@@ -1019,11 +1021,20 @@ public:
     }
 
     void Note(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire) {
+        const auto now = std::chrono::steady_clock::now();
+        // A resume 5 s after the previous one counted: the switch was off (or nothing resumed),
+        // so the window starts over here rather than reporting old counts over the whole time.
+        if (since != std::chrono::steady_clock::time_point{} &&
+            now - last > std::chrono::seconds{5}) {
+            counts = {};
+            since = {};
+        }
+        last = now;
         const bool latch = acquire.resume_route == static_cast<u8>(FenceResumeRoute::Latch);
         bool known = false;
         const Kind kind = Classify(dma_pusher, acquire, known);
         ++counts[latch ? 0 : 1][static_cast<size_t>(kind)][known ? 1 : 0];
-        Tick();
+        Tick(now);
     }
 
 private:
@@ -1098,8 +1109,7 @@ private:
         return Kind::OtherNoted;
     }
 
-    void Tick() {
-        const auto now = std::chrono::steady_clock::now();
+    void Tick(std::chrono::steady_clock::time_point now) {
         if (since == std::chrono::steady_clock::time_point{}) {
             since = now;
             return;
@@ -1136,6 +1146,7 @@ private:
     /// [0 latch, 1 other routes][Kind][known at send]
     std::array<std::array<std::array<u64, 2>, static_cast<size_t>(Kind::Count)>, 2> counts{};
     std::chrono::steady_clock::time_point since{};
+    std::chrono::steady_clock::time_point last{}; ///< The previous resume counted
 };
 
 // At a suspension: the QMD copy's back release count, for AcquireMetByStats at the resume.
@@ -2044,7 +2055,11 @@ bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
     // counting those made the count odd ("suspended") at random, so submit-time snapshots were
     // thrown away for about half of all entries (CommandList::snapshot_suspensions).
     if (pending_acquire) {
-        AcquireMetByStats::Get().Note(dma_pusher, *pending_acquire);
+        // FRITCHII_ACQUIRE_MET_BY (live, default 0: one load here): "Acquire resumes met by".
+        if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_acquire_met_by,
+                                             "FRITCHII_ACQUIRE_MET_BY") != 0) [[unlikely]] {
+            AcquireMetByStats::Get().Note(dma_pusher, *pending_acquire);
+        }
         if (pending_acquire->readable_release) {
             auto& stats = FenceWriterStats::Get();
             const u64 ns = FenceWriterStats::Nanoseconds(pending_acquire->since,
