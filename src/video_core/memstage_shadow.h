@@ -73,6 +73,22 @@ enum class StageDrawLoop : u8 {
     return static_cast<StageDrawLoop>((header >> 40) & 0xff);
 }
 
+/// StageTag::Cache's kind, in header bits 40-47 (FRITCHII_MEMSTAGE_RELEASE): which cache call it
+/// is, when the stage treats one apart. The payload stays the closure's own (no layout promised).
+enum class StageCacheCall : u8 {
+    Other = 0,            ///< any other cache call
+    SemaphoreRelease = 1, ///< the puller's semaphore release (WriteLong: QueryCache::CounterReport)
+};
+
+/// StageTag::Cache with its kind, for a Call entry's header.
+[[nodiscard]] constexpr u64 StageCacheCallBits(StageCacheCall which) noexcept {
+    return StageTagBits(StageTag::Cache) | (u64{static_cast<u8>(which)} << 40);
+}
+
+[[nodiscard]] constexpr StageCacheCall StageCacheCallOf(u64 header) noexcept {
+    return static_cast<StageCacheCall>((header >> 40) & 0xff);
+}
+
 /// Memory stage piece 5b (spec 6.2), FRITCHII_MEMSTAGE_SHADOW=1: the stage's classify, register
 /// copy, draw manager copy and handlers run on the back thread on each ring entry just before the
 /// back executes it, and produce nothing; every draw the back issues is compared with the

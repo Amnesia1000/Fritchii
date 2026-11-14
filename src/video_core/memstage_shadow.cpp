@@ -1619,6 +1619,73 @@ void StageGather(State& s, Copy& c, u32 method) {
                                          .count()));
 }
 
+/// The entry after the one at `position` (`size` words) is a hard closure the front has published
+/// (a Cache or untagged Call: a semaphore release, a fence), which a run started here would take
+/// in (StageExtendsRun).
+bool NextIsHardClosure(u64 position, size_t size) {
+    const u64 next = position + size;
+    if (next >= Access::Published()) {
+        return false;
+    }
+    const u64 head = Access::Ring()[next & Access::RingMask];
+    return static_cast<Kind>(head & 0xf) == Kind::Call &&
+           (StageTagOf(head) == StageTag::Cache || StageTagOf(head) == StageTag::Level);
+}
+
+/// FRITCHII_MEMSTAGE_RELEASE (GPUMem, at a Call entry tagged StageCacheCall::SemaphoreRelease, the
+/// whole entry): true when the back ran the closure at this entry on GPUMem's request, so the entry
+/// is work and no run; false: the caller makes it hard, as before. As StageGather (the gathers'
+/// comment has the argument): GPUMem comes level at the entry, the back runs the closure's thunk
+/// as a request (the cache's only user, the same call its Execute makes, at the same place in the
+/// stream: the query cache's report, the fence and its commits, the semaphore word), with the
+/// cache's flags handed over around it, and GpuSplit::Execute skips the entry when it reaches it.
+/// A Call entry is only its call on the back (no method sink, no deferred draw is issued there),
+/// so nothing of the entry comes before it. Kept as a run: a hard closure right after it (the run
+/// takes it in), no record room, the switch off or the window closed.
+bool StageRelease(State& s, const u64* entry, size_t size) {
+    using Outcome = MemoryStageLink::ReleaseOutcome;
+    MemoryStageLink& link = MemoryStageLink::Get();
+    if (s.ring_in_run) {
+        link.NoteRelease(Outcome::InRun);
+        return false;
+    }
+    if (!MemoryStageLink::ReleaseServed()) {
+        link.NoteRelease(Outcome::Closed);
+        return false;
+    }
+    if (NextIsHardClosure(s.processing_position, size)) {
+        link.NoteRelease(Outcome::NextHard);
+        return false;
+    }
+    if (!link.ReleaseRoom()) {
+        link.NoteRelease(Outcome::NoRoom);
+        return false;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    if (!link.StageLevel(s.processing_position, MemoryStageLink::LevelReason::Release)) {
+        link.NoteRelease(Outcome::Stopping);
+        return false;
+    }
+    // Level: the back is parked at this entry, which stays in ring A until the back passes it.
+    struct Run {
+        const u64* entry;
+        u64 draw_seq;
+    } run{entry, 0};
+    auto body = [&run] {
+        BackGatherLend();
+        reinterpret_cast<void (*)(const u64*)>(run.entry[1])(run.entry + 2);
+        BackGatherReturn();
+        run.draw_seq = MemoryStageLink::Get().BackDrawSeq();
+    };
+    link.ServeNow(body);
+    link.PushRelease(s.processing_position, run.draw_seq);
+    link.NoteRelease(Outcome::Served,
+                     static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::steady_clock::now() - start)
+                                          .count()));
+    return true;
+}
+
 /// Run bookkeeping for one entry (plan 3.2): a run starts at a hard entry and ends after the last
 /// hard entry reached through pass and neutral entries; a work entry, or one that issued a draw,
 /// ends it.
@@ -1810,6 +1877,13 @@ size_t Process(State& s, u64 position, bool executed) {
         case StageTag::Pass:
             break;
         case StageTag::Cache:
+            // FRITCHII_MEMSTAGE_RELEASE: the puller's semaphore release, run by the back at its
+            // entry on GPUMem's request (no run), or as any cache call.
+            if (s.ring && StageCacheCallOf(head) == StageCacheCall::SemaphoreRelease &&
+                StageRelease(s, entry, size)) {
+                cls = Class::Work;
+                break;
+            }
             // Uses the cache on the back, writes no 3D state: hard, no copy after (plan 3.3).
             Hard(s, LevelType::CacheCall, Rva(entry[1]));
             break;

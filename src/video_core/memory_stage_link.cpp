@@ -193,6 +193,14 @@
 // no record, a record of an entry the back passed (dropped at a later gather, a lend or the
 // ring's end), a draw on the back between the request and the entry. "Memory stage gathers"
 // logs the outcomes every 10 s (memstage_shadow.cpp's StageGather decides them).
+//
+// FRITCHII_MEMSTAGE_RELEASE (live, default 0; the window open only): the puller's semaphore
+// release closure (a Call entry tagged StageCacheCall::SemaphoreRelease) the same way: GPUMem level
+// at its entry, the back runs the closure's thunk as a request (the call Execute makes there, with
+// the flags handed over around it), PushRelease records the entry and GpuSplit::Execute skips it
+// (BackTakeRelease). A Call entry is only its call on the back, so nothing of the entry comes
+// before it. Its own records, checks and "Memory stage semaphore releases" line
+// (memstage_shadow.cpp's StageRelease decides).
 
 #include <algorithm>
 #include <bit>
@@ -325,6 +333,10 @@ constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::Check::Co
     "a served gather with no record of GPUMem's (the back ran it in a served entry)",
     "a gather GPUMem had the back run at an entry the back passed without it (record dropped)",
     "a draw on the back between a gather GPUMem had it run and the gather's entry",
+    "a served semaphore release with no record of GPUMem's (the back ran it in a served entry)",
+    "a semaphore release GPUMem had the back run at an entry the back passed without it (record "
+    "dropped)",
+    "a draw on the back between a semaphore release GPUMem had it run and the release's entry",
 };
 static_assert(LINK_CHECK_NAMES.back() != nullptr, "a name for every check");
 constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::ListDraw::Count)>
@@ -333,7 +345,16 @@ constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::ListDraw:
                     "level for a frame dump or trace"};
 static_assert(LIST_DRAW_NAMES.back() != nullptr, "a name for every list draw outcome");
 constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::LevelReason::Count)>
-    LEVEL_REASON_NAMES{"full copy", "writing draw", "ranges over GPU-written data", "gather"};
+    LEVEL_REASON_NAMES{"full copy", "writing draw", "ranges over GPU-written data", "gather",
+                       "semaphore release"};
+constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::ReleaseOutcome::Count)>
+    RELEASE_NAMES{"run at their entry",
+                  "level with the switch off or the window closed",
+                  "level before a hard closure (one run)",
+                  "level with no record room",
+                  "level as GPUMem stopped",
+                  "inside a level run"};
+static_assert(RELEASE_NAMES.back() != nullptr, "a name for every release outcome");
 constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::GatherOutcome::Count)>
     GATHER_NAMES{"run at their entry",
                  "level with the switch off or the window closed",
@@ -856,6 +877,8 @@ bool MemoryStageLink::BackRingTopImpl(u64 position) {
         // FRITCHII_MEMSTAGE_GATHER: no gather record outlives a ring (its end drops what is left).
         gather_head.store(0, std::memory_order_relaxed);
         gather_tail.store(0, std::memory_order_relaxed);
+        release_head.store(0, std::memory_order_relaxed);
+        release_tail.store(0, std::memory_order_relaxed);
         MemStageShadow::SetRingBack(true);
         g_ring_active.store(true, std::memory_order_seq_cst);
         ring_start.store(position, std::memory_order_release);
@@ -880,6 +903,7 @@ bool MemoryStageLink::BackRingTopImpl(u64 position) {
                 }
             }
             BackDropGathers(~u64{0}, "left when the ring ended");
+            BackDropReleases(~u64{0}, "left when the ring ended");
             // GPUMem's unplayed mark must not outlive the ring (a fill that threw leaves its
             // entries pending and its number open): its entries are played, after the packets
             // of earlier entries above (they are later in the stream), and the mark cleared;
@@ -947,6 +971,7 @@ void MemoryStageLink::BackEntry(u64 position, const BackLimits& limits) {
         // Gathers GPUMem had the back run at entries before the run: the back passed those
         // entries (must be 0; a record of the run's first entry stays, its gather is ahead).
         BackDropGathers(limits.lent_from, "at a lend");
+        BackDropReleases(limits.lent_from, "at a lend");
         if (!lend_ranges.empty() && ring_backend.apply_ranges != nullptr) {
             // The stage's constant buffer ranges no fill applied yet (plan 6.2 item 2).
             ring_backend.apply_ranges(ring_backend.context, lend_ranges.data(),
@@ -1342,6 +1367,65 @@ void MemoryStageLink::BackDropGathers(u64 before, const char* where) noexcept {
         Note(Check::GatherOrphan, where);
     }
     gather_head.store(head, std::memory_order_release);
+}
+
+void MemoryStageLink::SetRelease(bool on) {
+    // As SetGather.
+    g_release.store(on, std::memory_order_relaxed);
+    if (mode == 2 && release_logged != (on ? 1 : 0)) {
+        release_logged = on ? 1 : 0;
+        LOG_INFO(HW_GPU, "Memory stage semaphore releases (FRITCHII_MEMSTAGE_RELEASE={}): {}",
+                 on ? 1 : 0,
+                 on ? "GPUMem comes level at a puller semaphore release and has the back run it "
+                      "there, no run (while the window is open, FRITCHII_MEMSTAGE_AHEAD > 0)"
+                    : "each one starts a level run, as before");
+    }
+}
+
+void MemoryStageLink::PushRelease(u64 position, u64 draw_seq) noexcept {
+    // GPUMem only; ReleaseRoom said there is a slot.
+    const u64 tail = release_tail.load(std::memory_order_relaxed);
+    release_records[tail % ReleaseSlots] = GatherRecord{position, draw_seq};
+    release_tail.store(tail + 1, std::memory_order_release);
+}
+
+bool MemoryStageLink::BackTakeRelease(u64 position) noexcept {
+    // As BackTakeGather, on the release records.
+    u64 head = release_head.load(std::memory_order_relaxed);
+    const u64 tail = release_tail.load(std::memory_order_acquire);
+    bool taken = false;
+    while (head != tail) {
+        const GatherRecord& record = release_records[head % ReleaseSlots];
+        if (record.position > position) {
+            break;
+        }
+        ++head;
+        if (record.position < position) {
+            Note(Check::ReleaseOrphan, "at a later semaphore release");
+            continue;
+        }
+        if (record.draw_seq != back_draw_seq) [[unlikely]] {
+            Note(Check::ReleaseDrawBetween, "at the release's entry");
+        }
+        LinkBump(counters.releases_taken);
+        taken = true;
+        break;
+    }
+    release_head.store(head, std::memory_order_release);
+    if (!taken && BackServed()) [[unlikely]] {
+        Note(Check::ReleaseMissing, "GpuSplit::Execute");
+    }
+    return taken;
+}
+
+void MemoryStageLink::BackDropReleases(u64 before, const char* where) noexcept {
+    u64 head = release_head.load(std::memory_order_relaxed);
+    const u64 tail = release_tail.load(std::memory_order_acquire);
+    while (head != tail && release_records[head % ReleaseSlots].position < before) {
+        ++head;
+        Note(Check::ReleaseOrphan, where);
+    }
+    release_head.store(head, std::memory_order_release);
 }
 
 void MemoryStageLink::CloseBusyBatch() noexcept {
@@ -1979,6 +2063,11 @@ void MemoryStageLink::Take(Snapshot& out) const noexcept {
     out.gather_gpu_written = load(counters.gather_gpu_written);
     out.gathers_taken = load(counters.gathers_taken);
     out.gathers_taken_run = load(counters.gathers_taken_run);
+    for (size_t i = 0; i < out.releases.size(); ++i) {
+        out.releases[i] = load(counters.releases[i]);
+    }
+    out.release_ns = load(counters.release_ns);
+    out.releases_taken = load(counters.releases_taken);
 }
 
 void MemoryStageLink::LogStats() {
@@ -2138,6 +2227,32 @@ void MemoryStageLink::LogStats() {
                      rate(current.gather_ranges - reported.gather_ranges),
                      rate(current.gathers_taken - reported.gathers_taken),
                      rate(current.gathers_taken_run - reported.gathers_taken_run));
+        }
+        {
+            // FRITCHII_MEMSTAGE_RELEASE: the puller's semaphore releases, as the gathers' line.
+            std::string release_text;
+            u64 release_starters = 0;
+            for (size_t i = 0; i < current.releases.size(); ++i) {
+                const u64 n = current.releases[i] - reported.releases[i];
+                const auto what = static_cast<ReleaseOutcome>(i);
+                if (what != ReleaseOutcome::Served && what != ReleaseOutcome::InRun) {
+                    release_starters += n;
+                }
+                release_text += fmt::format("{}{} {:.0f}", i == 0 ? "" : ", ", RELEASE_NAMES[i],
+                                            rate(n));
+            }
+            const u64 served = current.releases[0] - reported.releases[0];
+            const u64 release_ns = current.release_ns - reported.release_ns;
+            LOG_INFO(HW_GPU,
+                     "Memory stage semaphore releases (FRITCHII_MEMSTAGE_RELEASE={}, window {}) "
+                     "{:.0f} s: per second {}; runs started by a release {:.0f}/s of {:.0f}/s; "
+                     "GPUMem in the ones run at their entry {:.1f} ms/s ({:.2f} us each: the wait "
+                     "to be level and the back's run of it); the back found {:.0f}/s run at their "
+                     "entry",
+                     g_release.load(std::memory_order_relaxed) ? 1 : 0,
+                     Ahead() != 0 ? "open" : "closed", seconds, release_text,
+                     rate(release_starters), rate(runs), ms(release_ns), per(release_ns, served),
+                     rate(current.releases_taken - reported.releases_taken));
         }
         if (Nx2Profile::Enabled()) {
             LogRunShape(seconds);

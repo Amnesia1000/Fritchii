@@ -789,7 +789,53 @@ a request GPUMem waits for; the back's own run of the entry then skips it. 0, AH
   cache, and leaves a pending query sync. Not Pass (it writes the semaphore word into game memory
   at the back's place, which uploads GPUMem made ahead could miss, and a fence commits cache
   state). It could be run at its entry the way gathers are here (GPUMem level, the back runs the
-  closure as a request), which needs a skip in the back's entry loop for Call entries; not done.
+  closure as a request), with a skip in the back's entry loop for Call entries:
+  FRITCHII_MEMSTAGE_RELEASE below.
+
+### FRITCHII_MEMSTAGE_RELEASE
+
+FRITCHII_MEMSTAGE_RELEASE (live, read at a frame end with FRITCHII_MEMSTAGE_AHEAD, default 0): with
+FRITCHII_MEMSTAGE_THREAD=2 and the window open (AHEAD > 0), the puller's semaphore release closure
+(Puller::ProcessSemaphoreTriggerMethod's WriteLong: QueryCache::CounterReport with the payload, a
+fence when RELEASE_SIZE is set on Switch 2; "cache call +0xc8d340" in ms46, the second run starter
+at 1,705 a second) no longer starts a level run, the same way FRITCHII_MEMSTAGE_GATHER handles
+gathers: GPUMem comes level at its entry (StageLevel, reason "semaphore release"), the back,
+parked there, runs the closure as a request GPUMem waits for, and GpuSplit::Execute skips the
+entry when it gets there. 0, AHEAD 0 and THREAD 0/1: as before.
+
+- Which: the closure carries StageCacheCall::SemaphoreRelease in its header (bits 40-47 of a Cache
+  tagged Call entry; Execute and every other reader ignore them). Outside a level run, with the
+  switch on and the window open. Kept as a run: a Cache or untagged closure right after it that
+  the front has published (the run takes it in, so coming level first would only add a wait and
+  a second run), no room for its record (256), GPUMem stopping.
+- Exact: once level, the back has run every entry before the release's and played every packet,
+  and GPUMem waits outside any fill: the back serving the request is the buffer cache's, the query
+  cache's and the fence manager's only user, at the release's place in the stream, and it makes
+  the call Execute makes (the entry's thunk on its payload, which stays in ring A until the back
+  passes the entry): the report, the fence and what it commits, the semaphore word written to
+  game memory, all where THREAD 0 does them. On the back a Call entry is only its call (no method
+  sink is consumed, no deferred draw is issued there), so nothing of the entry comes before it,
+  and there is no lone-method or deferred-draw exception as for the gathers. The cache's flags
+  15-48 go to the back's engines around the call and back to the copies (the fence's commits and
+  the query sync may delete buffers and mark bindings dirty), inside the request, as a run of
+  that entry hands them over. The front's bookkeeping of the release (NoteRelease, its waiters)
+  reads positions and the word: the word is written while the back is at the entry, as before;
+  `consumed` passes the entry later than the write, as before.
+- "Memory stage semaphore releases (FRITCHII_MEMSTAGE_RELEASE=n, window open/closed)" every 10 s
+  on THREAD 2: per second run at their entry and level by why (switch off or window closed,
+  before a hard closure, no record room, GPUMem stopping), inside a level run; runs started by a
+  release against all runs; GPUMem's ms a second in the served ones (and us each); the releases
+  the back found run at their entry (equals served). The window line's "level inside the window"
+  has a "semaphore release" reason; the link line's "served syncs" include the back's runs of
+  them.
+- Must be 0 (the link line): "a served semaphore release with no record of GPUMem's", "a
+  semaphore release GPUMem had the back run at an entry the back passed without it" and "a draw
+  on the back between a semaphore release GPUMem had it run and the release's entry", as the
+  gathers'.
+- With FRITCHII_MEMSTAGE_GATHER on too, a gather right before a release keeps its run, which
+  takes the release in (one run instead of two level waits).
+- Compare 0 and 1 with profile_toggle.py in one session (5c's run starters lose "cache call"
+  at the release's address).
 
 ### FRITCHII_MEMSTAGE_FULL_BINDS
 

@@ -65,6 +65,21 @@ public:
         GatherMissing,
         GatherOrphan,
         GatherDrawBetween,
+        ReleaseMissing,
+        ReleaseOrphan,
+        ReleaseDrawBetween,
+        Count,
+    };
+
+    /// FRITCHII_MEMSTAGE_RELEASE: what became of a puller semaphore release closure GPUMem reached
+    /// (StageCacheCall::SemaphoreRelease; counted).
+    enum class ReleaseOutcome : u8 {
+        Served,   ///< the back ran it at its entry on GPUMem's request, GPUMem level, no run
+        Closed,   ///< level: the switch off or the window closed (a run starts)
+        NextHard, ///< level: a hard closure follows, which the release's run takes in
+        NoRoom,   ///< level: no room for its record
+        Stopping, ///< level: GPUMem is stopping
+        InRun,    ///< inside a level run (followed; the back runs it lent)
         Count,
     };
 
@@ -99,6 +114,7 @@ public:
         WritingDraw, ///< a draw whose fill marks buffers GPU-written (storage writes, xfb)
         Claim,       ///< collected constant buffer ranges over GPU-written buffer data
         Gather,      ///< a gather the back runs at its entry (FRITCHII_MEMSTAGE_GATHER)
+        Release,     ///< a semaphore release the back runs at its entry (FRITCHII_MEMSTAGE_RELEASE)
         Count,
     };
 
@@ -360,6 +376,30 @@ public:
     /// it run already at this entry. Counts the must-be-0 cases (a served one with no record, a
     /// record of an entry the back passed, a draw in between).
     [[nodiscard]] bool BackTakeGather(u64 position) noexcept;
+
+    /// The back, at a frame end: FRITCHII_MEMSTAGE_RELEASE (live, default off).
+    void SetRelease(bool on);
+    /// GPUMem has the back run semaphore releases at their entry: the switch on, the window open.
+    [[nodiscard]] static bool ReleaseServed() noexcept {
+        return g_release.load(std::memory_order_relaxed) &&
+               g_ahead.load(std::memory_order_relaxed) != 0;
+    }
+    /// GPUMem: a semaphore release of the ring, and what became of it (`ns` for a served one).
+    void NoteRelease(ReleaseOutcome what, u64 ns = 0) noexcept {
+        BumpOne(counters.releases[static_cast<size_t>(what)], 1);
+        BumpOne(counters.release_ns, ns);
+    }
+    [[nodiscard]] bool ReleaseRoom() const noexcept {
+        return release_tail.load(std::memory_order_relaxed) -
+                   release_head.load(std::memory_order_acquire) <
+               ReleaseSlots;
+    }
+    /// GPUMem: the back ran the release closure of the entry at `position` (its draw count then
+    /// `draw_seq`); its own run of that entry skips it (BackTakeRelease).
+    void PushRelease(u64 position, u64 draw_seq) noexcept;
+    /// The back, at a release closure's Call entry (GpuSplit::Execute): true when GPUMem had it run
+    /// already at this entry (the call is skipped). Counts the must-be-0 cases as BackTakeGather.
+    [[nodiscard]] bool BackTakeRelease(u64 position) noexcept;
     /// The entry turned hard at a constant buffer write onto GPU-written data (counted).
     void NoteWriteLevel() noexcept {
         counters.write_levels.store(counters.write_levels.load(std::memory_order_relaxed) + 1,
@@ -564,6 +604,7 @@ private:
     static inline std::atomic<bool> g_verify{false};
     static inline std::atomic<bool> g_list_draws{false};
     static inline std::atomic<bool> g_gather{false};
+    static inline std::atomic<bool> g_release{false};
 
     /// A stats counter: a plain load and store (one writer each, or a lost count is fine).
     static void BumpOne(std::atomic<u64>& counter, u64 amount) noexcept {
@@ -679,6 +720,13 @@ private:
     void BackDropGathers(u64 before, const char* where) noexcept;
     /// FRITCHII_MEMSTAGE_GATHER's last value logged (-1: none yet).
     int gather_logged{-1};
+    /// FRITCHII_MEMSTAGE_RELEASE: the semaphore releases GPUMem had the back run, as the gathers'.
+    static constexpr u64 ReleaseSlots = 256;
+    std::array<GatherRecord, ReleaseSlots> release_records{};
+    alignas(64) std::atomic<u64> release_tail{0}; ///< pushed (GPUMem)
+    alignas(64) std::atomic<u64> release_head{0}; ///< taken (the back)
+    void BackDropReleases(u64 before, const char* where) noexcept;
+    int release_logged{-1};
     /// GPUMem's thread id (the back serves it while it waits for a lock GPUMem holds).
     std::atomic<std::thread::id> stage_thread{};
     /// Bumped while the back waits for a lock GPUMem holds (StageSyncCatchUp gives up then).
@@ -736,6 +784,8 @@ private:
         std::atomic<u64> gather_synced{};      ///< served ones whose wait for idle synced queries
         std::atomic<u64> gather_ranges{};      ///< game write ranges the served ones applied
         std::atomic<u64> gather_gpu_written{}; ///< served ones with a range by GPU-written data
+        std::array<std::atomic<u64>, static_cast<size_t>(ReleaseOutcome::Count)> releases{};
+        std::atomic<u64> release_ns{};         ///< GPUMem in served releases (level wait and run)
         // The back's.
         alignas(64) std::array<std::atomic<u64>, static_cast<size_t>(HandOff::Count)> calls{};
         std::atomic<u64> call_ns{};
@@ -756,6 +806,7 @@ private:
         std::atomic<u64> list_drawn{};        ///< served list draws drawn from the packet's buffer
         std::atomic<u64> gathers_taken{};     ///< gathers the back found run at their entry
         std::atomic<u64> gathers_taken_run{}; ///< ... of them inside a level run
+        std::atomic<u64> releases_taken{};    ///< releases the back found run at their entry
         // Either thread's, rare (the must-be-0 checks).
         alignas(64) std::array<std::atomic<u64>, static_cast<size_t>(Check::Count)> checks{};
     };
@@ -833,6 +884,9 @@ private:
         u64 gather_gpu_written{};
         u64 gathers_taken{};
         u64 gathers_taken_run{};
+        std::array<u64, static_cast<size_t>(ReleaseOutcome::Count)> releases{};
+        u64 release_ns{};
+        u64 releases_taken{};
     };
     void Take(Snapshot& out) const noexcept;
     Snapshot reported{};

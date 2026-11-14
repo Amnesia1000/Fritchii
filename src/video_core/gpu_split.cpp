@@ -1970,6 +1970,14 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
             NoteFastDrawCallBreak(entry[1]);
         }
         const size_t payload = static_cast<size_t>((head >> 8) & 0xffffff);
+        // FRITCHII_MEMSTAGE_RELEASE: GPUMem, level at this entry, had this thread run the puller's
+        // semaphore release already (memstage_shadow.cpp, StageRelease); skipped here. The test
+        // is on the header first: other calls pay one compare.
+        if (StageCacheCallOf(head) == StageCacheCall::SemaphoreRelease &&
+            StageTagOf(head) == StageTag::Cache && MemoryStageLink::RingActive() &&
+            MemoryStageLink::Get().BackTakeRelease(back_entry_position)) [[unlikely]] {
+            return 2 + payload;
+        }
         reinterpret_cast<void (*)(const u64*)>(entry[1])(entry + 2);
         return 2 + payload;
     }
