@@ -117,6 +117,62 @@ answer's same-frame sample counters). Per second:
 - Reading it: misses blocked by payload reports with the back far behind are answer A
   (bookkeeping on the front); counter or sample reports the back had not run, or a listed report
   on the bytes, are answer B (the value does not exist yet at the front).
+- With FRITCHII_FRONT_RAN_READS on, it counts only the misses that switch did not spare (with 2:
+  would not spare).
+
+### FRITCHII_FRONT_RAN_READS
+
+FRITCHII_FRONT_RAN_READS (live, default 0 = exactly as before; the market's "Front 0xe2c misses"
+line: about 90% of the noted-write misses wait for writes the back already ran). A macro DMA read
+(any macro, EDEN_NX2_DMA_SNAPSHOT's 0x158 reads) that misses its page snapshot only because a write
+was noted over its bytes since the snapshot (reason "noted write") reads guest memory at once,
+without the drain, when all of these hold (Maxwell3D::FrontDmaRead, RanReadCheck):
+- (a) the back ran every write noted over the read's bytes since the snapshot: none of those notes
+  is past the back's position (`consumed`, loaded first). The note table is in ring order, so the
+  scan stops at the first note at or before that position; every older one ran, the ones the table
+  dropped included. If the table ends before the scan gets there (the "notes past the table"
+  case), a dropped note may still be queued: it drains (GpuSplit::NotedWritesRan);
+- (e) the read is on one 4 KB device page;
+- (f) the page never held GPU-modified buffer data (the never-cleared GPU-written bit), or no
+  indirect grid placeholder was ever handed out: a 3D inline upload with placeholders is the one
+  noted write whose run leaves its bytes in the buffer cache only (the grid's DMA copy), which the
+  drained path's FlushRegion would bring back. Every other noted write writes guest memory itself:
+  3D reports and payload releases, puller semaphores (both through the query cache, at their run
+  or when the host query or fence completes), inline uploads (guest memory first, then the caches),
+  KeplerMemory data noted by EXP120;
+- (c) no async report is owed to the bytes: every report issued to their 16-byte slots completed
+  (Nx2AsyncReportsSettled, the rule SEM_FAST uses for semaphore words) and the newest async note
+  over them ran. This covers every way a report's value lands after the back ran it: counter and
+  sample reports, timed and fence releases, any accuracy or fence setting, EXP33's kept fence
+  reports, EXP119's report runs (all issue on the back before it passes the report's entry, and
+  complete only after the words are in guest memory). A report starting up to 15 bytes before the
+  read counts;
+- (b) the query cache lists no report on the bytes (the hit path's own test, 12 bytes back);
+- the other miss reasons (compute and copies, unranged writers; with EXP10 the dispatch check and
+  byte lists, which come after the noted-write test) are asked as for a hit and still drain.
+
+The page snapshot is left alone: the checks hold for the bytes read, not for the rest of the page,
+where a noted write may still be queued or owe a report, and the hit path asks neither (a) nor (c).
+So later reads of the page take the same check (a short scan) until a drain renews the snapshot.
+
+- With FRITCHII_MEMSTAGE_THREAD=2 the back still runs every report and semaphore entry (GPUMem only
+  fills draws; a lone gather or puller release it serves runs on the back before the back passes
+  it), and `consumed` is stored after the entries before it ran, so it is the right position.
+  Notes and the async slots are by device address, so another GPU address of the same bytes finds
+  them.
+- 2 = verify: the same decision, then the read drains anyway; the bytes read at once are compared
+  with the drained ones, which are used. "Front ran reads (must be 0): macro m read of n words at
+  a (device d) differs from the drained read: word i x, drained y" for the first 16. A guest CPU
+  write to the bytes between the two reads would also show (none expected on report memory).
+- "Front ran reads (FRITCHII_FRONT_RAN_READS=n) 10 s" (HW_GPU, Info): noted-write misses checked
+  a second, passed (with 2: would be served), of those drained after all for another writer (the
+  EXP10 dispatch check or byte lists), and the drained ones by first failed check: a note still
+  queued, notes past the table, two pages, GPU-written page, an async report owed, a listed
+  report; verify compared and differed (must be 0, with the session total).
+- Served reads count as "skipped the drain" in the "DMA snapshot" line.
+- Expected at the market: about 1,500 to 2,000 of the 2,300 drains a second go (the 1,520 counter
+  or sample reports and 548 "other" notes the back had run, minus the ones that owe a report or
+  are listed), 45 us each: about 70 to 90 ms/s of front waiting.
 
 ### Acquire resumes met by (always on, a counter)
 

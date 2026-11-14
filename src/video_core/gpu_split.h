@@ -935,6 +935,30 @@ public:
         }
         return remembered == pending_writes.size();
     }
+    /// FRITCHII_FRONT_RAN_READS (Maxwell3D::FrontDmaRead): whether the back ran every write noted
+    /// over [begin, begin + size) after `since`, that is none of them is past `done` (ConsumedNow,
+    /// loaded by the caller before it looks at anything else). The table is in ring order, newest
+    /// last, so the scan stops at the first note at or before `done` (or `since`): every older one
+    /// ran too, the ones the table dropped included. Queued: a note past `done` overlaps the
+    /// bytes. PastTable: the table ends before the scan reaches `done`, so a dropped note past it
+    /// may overlap them.
+    enum class NotedRun : u8 { Ran, Queued, PastTable };
+    [[nodiscard]] NotedRun NotedWritesRan(u64 since, u64 done, u64 begin, u64 size) const {
+        const u64 stop = (std::max)(since, done);
+        const u64 end = begin + size;
+        const u64 remembered = (std::min<u64>)(pending_write_count, pending_writes.size());
+        for (u64 scanned = 0; scanned < remembered; ++scanned) {
+            const PendingWrite& write =
+                pending_writes[(pending_write_count - 1 - scanned) % pending_writes.size()];
+            if (write.position <= stop) {
+                return NotedRun::Ran;
+            }
+            if (write.begin < end && begin < write.end) {
+                return NotedRun::Queued;
+            }
+        }
+        return remembered == pending_writes.size() ? NotedRun::PastTable : NotedRun::Ran;
+    }
     /// The newest NoteMemoryWrite / NoteMemoryWriteData sent after `since` over the u32 at
     /// `device` (what OverlayQueuedWrites(since) applies last to it), whether or not the back ran
     /// it since. `position` 0: none (or more were noted since than are remembered); `words` 0:
