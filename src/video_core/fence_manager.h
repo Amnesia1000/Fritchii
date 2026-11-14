@@ -183,6 +183,9 @@ public:
             return;
         }
         skipped_fences = 0;
+        // FRITCHII_DELAY_BACK_KIND=3 ("F", fable_stage_levelpoints 18.3): every made fence,
+        // after the skip test, on the back thread. Off: one relaxed load and a branch.
+        VideoCommon::GpuSplit::DelayBackIf(VideoCommon::GpuSplit::BackDelayKind::Fences);
         should_flush |= query_cache.HasUncommittedFlushes();
         query_cache.CommitAsyncFlushes();
         if constexpr (can_async_check) {

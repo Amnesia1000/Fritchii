@@ -23,6 +23,7 @@
 
 #include "common/common_types.h"
 #include "video_core/engines/engine_interface.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/split_write_tracker.h"
 
 namespace Core {
@@ -919,8 +920,57 @@ public:
         E2c,        ///< Front: every call of the 0xe2c occlusion macro ("W")
         Dispatch,   ///< Back: every compute dispatch (RasterizerVulkan::DispatchCompute, "K")
         Draw,       ///< Back: every 3D draw call (RasterizerVulkan::Draw/DrawIndirect, "D")
+        Back,       ///< Back: FRITCHII_DELAY_BACK_US at FRITCHII_DELAY_BACK_KIND's site (DelayBack)
+        Front, ///< Front: FRITCHII_DELAY_FRONT_US at FRITCHII_DELAY_FRONT_KIND's site (DelayFront)
+        Worker, ///< The Vulkan worker: FRITCHII_DELAY_WORKER_US per chunk (Scheduler::WorkerThread)
         Count,
     };
+    /// FRITCHII_DELAY_FRONT_US / _KIND (live, default 0; fable_stage_levelpoints 18.3): the sites.
+    enum class FrontDelayKind : u32 {
+        AcquireMet = 1,   ///< "A": a suspended acquire resumes (Puller::ResumeAcquire)
+        DispatchWait = 2, ///< "Q": a macro read's wait behind a dispatch (DispatchesMayWriteSince)
+        Macros = 3,       ///< "C": once every 64 3D macro calls (Maxwell3D::FrontRunMacro)
+    };
+    /// At a FRITCHII_DELAY_FRONT_KIND site: one relaxed load and a branch while
+    /// FRITCHII_DELAY_FRONT_US is 0. Kinds 1 and 2 are called on both sides of their wait
+    /// (`before`: right before it begins, else right after it ended) and spin on the side
+    /// FRITCHII_DELAY_BEFORE picks (0: after, the test; 1: before, the control).
+    static void DelayFrontIf(FrontDelayKind kind, bool before = false) {
+        if (VideoCore::Nx2Debug::g_delay_front_us.load(std::memory_order_relaxed) != 0)
+            [[unlikely]] {
+            DelayFront(kind, before);
+        }
+    }
+    static void DelayFront(FrontDelayKind kind, bool before);
+    /// FRITCHII_DELAY_WORKER_US (live, default 0; fable_stage_levelpoints 19.3/19.4): the Vulkan
+    /// worker spins n us after each chunk it ran, inside its execution lock. Off: one relaxed
+    /// load and a branch a chunk.
+    static void DelayWorkerIf() {
+        if (VideoCore::Nx2Debug::g_delay_worker_us.load(std::memory_order_relaxed) != 0)
+            [[unlikely]] {
+            if (const int us = DelayTestUs(DelayTest::Worker); us > 0) {
+                SpinDelay(DelayTest::Worker, static_cast<u32>(us));
+            }
+        }
+    }
+    /// The switch of a delay test (its microseconds; 0 or less: off).
+    static int DelayTestUs(DelayTest test);
+    /// FRITCHII_DELAY_BACK_US / _KIND (live, default 0; fable_stage_levelpoints 18.3): the sites.
+    enum class BackDelayKind : u32 {
+        Methods = 1,    ///< "M": once every 64 method-zone ring entries (BackLoop, after Execute)
+        StageBinds = 2, ///< "S": every 4th BindHostStageBuffers (GraphicsPipeline::ConfigureImpl)
+        Fences = 3,     ///< "F": every made fence, after the skip test (FenceManager::SignalFence)
+    };
+    /// At a FRITCHII_DELAY_BACK_KIND site: one relaxed load and a branch while
+    /// FRITCHII_DELAY_BACK_US is 0 (after its first read). `amount`: the site's items (ring
+    /// entries for Methods).
+    static void DelayBackIf(BackDelayKind kind, u32 amount = 1) {
+        if (VideoCore::Nx2Debug::g_delay_back_us.load(std::memory_order_relaxed) != 0)
+            [[unlikely]] {
+            DelayBack(kind, amount);
+        }
+    }
+    static void DelayBack(BackDelayKind kind, u32 amount);
     /// FRITCHII_DELAY_E2C_US, FRITCHII_DELAY_DISPATCH_US, FRITCHII_DELAY_DRAW_US (live, default
     /// 0): spins the switch's microseconds for `test` (E2c, Dispatch or Draw) when it is set.
     /// Dispatch and Draw spin only on the back thread (never on GPUMem, nor without the split).

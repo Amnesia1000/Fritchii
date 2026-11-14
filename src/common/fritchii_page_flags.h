@@ -15,6 +15,54 @@
 /// them Core::g_... (core/gpu_dirty_memory_manager.h).
 namespace Common {
 
+/// The price counters' page write generations (video_core/fritchii_price.h, rows 1 and 2 of
+/// work\fable_stage_levelpoints.md 18.4): a hash of the device page to 65,536 buckets, raised by
+/// every mark of the two flags the native bank check takes (g_collected_write_pages,
+/// g_buffer_write_pages) while g_price_gens_on (the GPU profile's dry counters ran). A collision
+/// only makes a range look written. A mark over more than 64 pages raises g_price_gens_wide,
+/// which every sum includes.
+inline constexpr size_t PriceGenBuckets = 65536;
+inline std::array<std::atomic<u32>, PriceGenBuckets> g_price_gens{};
+inline std::atomic<u32> g_price_gens_wide{0};
+inline std::atomic<bool> g_price_gens_on{false};
+
+[[nodiscard]] inline size_t PriceGenBucket(u64 page) noexcept {
+    return static_cast<size_t>((page * 0x9E3779B97F4A7C15ULL) >> 48);
+}
+
+inline void PriceMarkGens(u64 address, u64 size) noexcept {
+    if (size == 0) {
+        return;
+    }
+    const u64 first = address >> 12;
+    const u64 last = (address + size - 1) >> 12;
+    if (last - first >= 64) {
+        g_price_gens_wide.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    for (u64 page = first; page <= last; ++page) {
+        g_price_gens[PriceGenBucket(page)].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+/// The generations of the pages of [address, address + size) summed (they only grow, so an equal
+/// sum over the same range means no mark since). Over 64 pages: ~0, counted as written.
+[[nodiscard]] inline u64 PriceGenSum(u64 address, u64 size) noexcept {
+    if (size == 0) {
+        return 0;
+    }
+    const u64 first = address >> 12;
+    const u64 last = (address + size - 1) >> 12;
+    if (last - first >= 64) {
+        return ~u64{0};
+    }
+    u64 sum = u64{g_price_gens_wide.load(std::memory_order_relaxed)} << 32;
+    for (u64 page = first; page <= last; ++page) {
+        sum += g_price_gens[PriceGenBucket(page)].load(std::memory_order_relaxed);
+    }
+    return sum;
+}
+
 /// One bit per device page of the 36-bit device address space (2 MiB), set by writers and taken
 /// by the native uniform bank check (BufferCache, EDEN_NX2_EXP9).
 class DevicePageFlags {
@@ -22,7 +70,14 @@ public:
     static constexpr u64 AddressBits = 36;
     static constexpr u64 PageBits = 12;
 
+    /// `feeds_price_`: its marks also raise the price counters' generations (above).
+    constexpr explicit DevicePageFlags(bool feeds_price_ = false) noexcept
+        : feeds_price{feeds_price_} {}
+
     void Mark(u64 address, u64 size) noexcept {
+        if (feeds_price && g_price_gens_on.load(std::memory_order_relaxed)) [[unlikely]] {
+            PriceMarkGens(address, size);
+        }
         constexpr u64 limit = u64{1} << AddressBits;
         if (size == 0 || address >= limit) {
             return;
@@ -78,16 +133,17 @@ public:
 
 private:
     std::array<std::atomic<u64>, (u64{1} << (AddressBits - PageBits)) / 64> words{};
+    bool feeds_price{};
 };
 
 /// Pages guest CPU writes went to through the dirty memory managers: the buffer cache sees them
 /// only at the next InvalidateGPUCache. Set before the store (Core::Memory's
 /// HandleRasterizerWrite) and again after it (UniformKeepPages::AfterGuestStore).
-inline DevicePageFlags g_collected_write_pages;
+inline DevicePageFlags g_collected_write_pages{true};
 /// Pages whose guest memory the buffer cache saw change (WriteMemory, uploads in place,
 /// downloads), and every emulator write the write ring hears of, after its bytes landed
 /// (WriteRing::Note, MemoryManager::Write).
-inline DevicePageFlags g_buffer_write_pages;
+inline DevicePageFlags g_buffer_write_pages{true};
 /// EDEN_NX2_TEX_BANK_GEN: pages written by anyone the GPU side hears of: guest CPU writes that
 /// trapped (Memory::HandleRasterizerWrite, every one, collected or not), the buffer cache's
 /// writes (the same places as g_buffer_write_pages) and TextureCache::WriteMemory. Only the

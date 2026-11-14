@@ -33,6 +33,7 @@
 #include "core/core.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/fritchii_price.h"
 #include "video_core/nx2_fastdraw_count.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memstage_shadow.h"
@@ -87,6 +88,12 @@ int DelaySwitch(GpuSplit::DelayTest test) {
         return Debug::SwitchValue(Debug::g_delay_dispatch_us, "FRITCHII_DELAY_DISPATCH_US");
     case Test::Draw:
         return Debug::SwitchValue(Debug::g_delay_draw_us, "FRITCHII_DELAY_DRAW_US");
+    case Test::Back:
+        return Debug::SwitchValue(Debug::g_delay_back_us, "FRITCHII_DELAY_BACK_US");
+    case Test::Front:
+        return Debug::SwitchValue(Debug::g_delay_front_us, "FRITCHII_DELAY_FRONT_US");
+    case Test::Worker:
+        return Debug::SwitchValue(Debug::g_delay_worker_us, "FRITCHII_DELAY_WORKER_US");
     default:
         return 0;
     }
@@ -123,10 +130,16 @@ std::string DelayTestText(SiteWaitStats& stats, double window) {
     return fmt::format("; delay tests added ({} the drain, FRITCHII_DELAY_BEFORE={}): "
                        "FRITCHII_DELAY_MACRO_DRAIN_US{}, FRITCHII_DELAY_POLL_DRAIN_US{}, "
                        "FRITCHII_DELAY_E2C_US{} (front), FRITCHII_DELAY_DISPATCH_US{} (back), "
-                       "FRITCHII_DELAY_DRAW_US{} (back)",
+                       "FRITCHII_DELAY_DRAW_US{} (back), FRITCHII_DELAY_BACK_US{} KIND={} (back), "
+                       "FRITCHII_DELAY_FRONT_US{} KIND={} (front), FRITCHII_DELAY_WORKER_US{} "
+                       "(Vulkan worker, per chunk)",
                        before ? "before" : "after", before ? 1 : 0, test(Test::MacroDrain),
                        test(Test::PollDrain), test(Test::E2c), test(Test::Dispatch),
-                       test(Test::Draw));
+                       test(Test::Draw), test(Test::Back),
+                       Debug::SwitchValue(Debug::g_delay_back_kind, "FRITCHII_DELAY_BACK_KIND"),
+                       test(Test::Front),
+                       Debug::SwitchValue(Debug::g_delay_front_kind, "FRITCHII_DELAY_FRONT_KIND"),
+                       test(Test::Worker));
 }
 
 void NoteSiteWait(DrainSite site, u64 behind, u64 ns) {
@@ -289,6 +302,48 @@ void GpuSplit::DelayWork(DelayTest test) {
         return;
     }
     SpinDelay(test, static_cast<u32>(us));
+}
+
+void GpuSplit::DelayBack(BackDelayKind kind, u32 amount) {
+    namespace Debug = VideoCore::Nx2Debug;
+    const int us = DelaySwitch(DelayTest::Back);
+    if (us <= 0 || !on_back_thread ||
+        Debug::SwitchValue(Debug::g_delay_back_kind, "FRITCHII_DELAY_BACK_KIND") !=
+            static_cast<int>(kind)) {
+        return;
+    }
+    // Every 64 method-zone entries, every 4th stage bind, every made fence.
+    static constexpr std::array<u32, 4> period{1, 64, 4, 1};
+    static thread_local std::array<u32, 4> items{};
+    const auto index = static_cast<size_t>(kind);
+    items[index] += amount;
+    while (items[index] >= period[index]) {
+        items[index] -= period[index];
+        SpinDelay(DelayTest::Back, static_cast<u32>(us));
+    }
+}
+
+int GpuSplit::DelayTestUs(DelayTest test) {
+    return DelaySwitch(test);
+}
+
+void GpuSplit::DelayFront(FrontDelayKind kind, bool before) {
+    namespace Debug = VideoCore::Nx2Debug;
+    const int us = DelaySwitch(DelayTest::Front);
+    if (us <= 0 || on_back_thread ||
+        Debug::SwitchValue(Debug::g_delay_front_kind, "FRITCHII_DELAY_FRONT_KIND") !=
+            static_cast<int>(kind)) {
+        return;
+    }
+    if (kind == FrontDelayKind::Macros) {
+        static thread_local u32 calls{};
+        if ((++calls & 63) != 0) {
+            return;
+        }
+    } else if (before != (Debug::SwitchValue(Debug::g_delay_before, "FRITCHII_DELAY_BEFORE") > 0)) {
+        return;
+    }
+    SpinDelay(DelayTest::Front, static_cast<u32>(us));
 }
 
 void GpuSplit::SpinDelay(DelayTest test, u32 us) {
@@ -583,6 +638,10 @@ void GpuSplit::Drain(DrainSite site) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache == write_position) {
             publish_every = 8;
+            if (start != 0) [[unlikely]] {
+                // fable_stage_levelpoints 18.4 rows 7 and 8: until the back reached it, after.
+                FritchiiPrice::NoteFrontWait(static_cast<size_t>(site), write_position, start);
+            }
             Nx2Profile::AddDrain(site, start);
             NoteSiteWait(site, behind, Common::Nx2Hitch::NowNs() - begin_ns);
             return;
@@ -1355,6 +1414,10 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache >= target) {
             wait_target.store(~u64{0}, std::memory_order_relaxed);
+            if (start != 0) [[unlikely]] {
+                // fable_stage_levelpoints 18.4 rows 7 and 8: until the back reached it, after.
+                FritchiiPrice::NoteFrontWait(static_cast<size_t>(site), target, start);
+            }
             Nx2Profile::AddDrain(site, start);
             NoteSiteWait(site, behind, Common::Nx2Hitch::NowNs() - begin_ns);
             return true;
@@ -1894,7 +1957,11 @@ GpuSplit::DispatchCheck GpuSplit::DispatchesMayWriteSince(u64 since, u64 begin, 
         if (!wait) {
             return DispatchCheck::Queued;
         }
+        // FRITCHII_DELAY_FRONT_KIND=2 ("Q"): after this wait returned, or before it
+        // (FRITCHII_DELAY_BEFORE=1). Off: one relaxed load and a branch each side.
+        DelayFrontIf(FrontDelayKind::DispatchWait, true);
         WaitFor(last_dispatch_position, DrainSite::DispatchWait);
+        DelayFrontIf(FrontDelayKind::DispatchWait, false);
         waited = true;
     }
     // The back recorded every dispatch sent since before storing a position past it (acquired
@@ -2596,6 +2663,72 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         const bool ring_edges = ring_on && MemoryStageLink::Ahead() != 0;
         u64 ring_next_edge = read_position;
         bool ring_run = false;
+        // FRITCHII_DELAY_BACK_KIND=1 ("M", fable_stage_levelpoints 18.3): the method zone's
+        // entries are counted for the spin. Read once a batch: with the switch at 0 an entry pays
+        // a test of this local.
+        const bool entry_delay =
+            VideoCore::Nx2Debug::g_delay_back_us.load(std::memory_order_relaxed) != 0;
+        // fable_stage_levelpoints 18.4 row 4 and the waits' split (GPU profile on): each entry's
+        // kind and the "method" zone time it added; the position stores stamped.
+        const bool entry_price = FritchiiPrice::On();
+        const bool entry_hook = entry_delay || entry_price;
+        if (entry_price) [[unlikely]] {
+            FritchiiPrice::MaybeReport();
+        }
+        // Row 4's kind of an entry (`head`, `size` words run).
+        const auto entry_kind = [this](u64 head, size_t size, u32& entries) {
+            using Entry = FritchiiPrice::Entry;
+            entries = 1;
+            switch (static_cast<Kind>(head & 0xf)) {
+            case Kind::Method: {
+                using Tegra::Engines::Maxwell3D;
+                const u32 method = static_cast<u32>((head >> 8) & 0xffff);
+                constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+                if (back_engine == nullptr || !back_engine->fast_maxwell3d) {
+                    return Entry::MethodOther;
+                }
+                if (method - cb_data < 16 && (head & HasSegment) == 0) {
+                    entries = static_cast<u32>(size);
+                    return Entry::CbRun;
+                }
+                return Entry::Method3D;
+            }
+            case Kind::Multi:
+                return Entry::Multi;
+            case Kind::Call:
+                return Entry::Call;
+            case Kind::Pairs:
+                entries = static_cast<u32>(head >> 32);
+                return Entry::Pairs;
+            case Kind::StateDelta:
+                return Entry::StateDelta;
+            case Kind::DrawBatch:
+                return Entry::DrawBatch;
+            case Kind::CbWords:
+                entries = static_cast<u32>(head >> 32);
+                return Entry::CbWords;
+            default:
+                return Entry::Other;
+            }
+        };
+        // The ring entries an entry of the method zone stands for (Execute's cases with a
+        // "method" scope): a run of constant buffer words or a words block counts each word, a
+        // pairs block each pair; calls, engine switches and wraps count none.
+        const auto method_entries = [](u64 head, size_t size) -> u32 {
+            switch (static_cast<Kind>(head & 0xf)) {
+            case Kind::Method:
+                return (head & HasSegment) != 0 ? 1U : static_cast<u32>(size);
+            case Kind::Multi:
+            case Kind::StateDelta:
+            case Kind::DrawBatch:
+                return 1;
+            case Kind::Pairs:
+            case Kind::CbWords:
+                return static_cast<u32>(head >> 32);
+            default:
+                return 0;
+            }
+        };
         while (read_position != available) {
             const size_t index = read_position & RingMask;
             if (ring_prefetch) {
@@ -2637,8 +2770,30 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 // the back's draws (memstage_shadow.cpp). Off: this one test per entry.
                 MemStageShadow::Before(read_position);
             }
+            u64 method_before = 0;
+            if (entry_price) [[unlikely]] {
+                method_before = Nx2Profile::t_data
+                                    .exclusive_ns[static_cast<size_t>(Nx2Profile::Zone::Method)];
+            }
             const size_t size =
                 Execute(&ring[index], std::min<u64>(end - read_position, RingWords - index));
+            if (entry_hook) [[unlikely]] {
+                const u64 head = ring[index];
+                if (entry_price) {
+                    u32 entries = 1;
+                    const FritchiiPrice::Entry kind = entry_kind(head, size, entries);
+                    FritchiiPrice::g_entries.Note(
+                        static_cast<size_t>(kind), entries,
+                        Nx2Profile::t_data
+                                .exclusive_ns[static_cast<size_t>(Nx2Profile::Zone::Method)] -
+                            method_before);
+                }
+                if (entry_delay) {
+                    if (const u32 entries = method_entries(head, size); entries != 0) {
+                        DelayBackIf(BackDelayKind::Methods, entries);
+                    }
+                }
+            }
             read_position += size != 0 ? size : RingWords - index;
             if (ring_on && (!ring_edges || (ring_run && read_position >= limits.lent_until)) &&
                 link.BackAfter(read_position, limits)) [[unlikely]] {
@@ -2661,6 +2816,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             if ((read_position - last_store >= 4096 ||
                  read_position >= wait_target.load(std::memory_order_relaxed)) &&
                 read_position != available) {
+                if (entry_price) [[unlikely]] {
+                    FritchiiPrice::BackReached(read_position);
+                }
                 consumed.store(read_position, std::memory_order_seq_cst);
                 last_store = read_position;
                 NotifyFront();
@@ -2673,6 +2831,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             }
         }
         CheckFencesQuiet(read_position);
+        if (entry_price) [[unlikely]] {
+            FritchiiPrice::BackReached(read_position);
+        }
         consumed.store(read_position, std::memory_order_seq_cst);
         NotifyFront();
         if (ring_on) {

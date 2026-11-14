@@ -23,6 +23,7 @@
 #include <optional>
 
 #include "video_core/nx2_profile.h"
+#include "video_core/fritchii_price.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dma_pusher.h"
 #include "video_core/engines/fermi_2d.h"
@@ -1204,6 +1205,15 @@ void NoteBackSequence(Puller::PendingAcquire& acquire) {
     }
 }
 
+// At a suspension, GPU profile on (fable_stage_levelpoints 18.4 row 7): what was sent by now and
+// when, for the resume's split (until the back reached that position, then after).
+void NotePriceSuspension(Puller::PendingAcquire& acquire) {
+    if (VideoCommon::FritchiiPrice::On()) [[unlikely]] {
+        acquire.price_target = VideoCommon::GpuSplit::Get().SentPosition();
+        acquire.price_start = VideoCommon::FritchiiPrice::Ticks();
+    }
+}
+
 // EXP12=4: the QMD prediction's "met by" of an acquire the fence path suspended without waiting
 // for the writers is noted at its resume (Puller::ResumeAcquire) instead of at once, where
 // nearly all would count as unmet (the writers had not run). The reduction bound is checked
@@ -2105,6 +2115,18 @@ bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
     // counting those made the count odd ("suspended") at random, so submit-time snapshots were
     // thrown away for about half of all entries (CommandList::snapshot_suspensions).
     if (pending_acquire) {
+        // FRITCHII_DELAY_FRONT_KIND=1 ("A"): a suspended acquire found met, before the channel
+        // resumes (FRITCHII_DELAY_BEFORE=1 spins at the suspension instead). Off: one relaxed
+        // load and a branch.
+        VideoCommon::GpuSplit::DelayFrontIf(VideoCommon::GpuSplit::FrontDelayKind::AcquireMet,
+                                            false);
+        // fable_stage_levelpoints 18.4 row 7: the suspension split at the back's arrival at
+        // what was sent by then (GPU profile on).
+        if (pending_acquire->price_start != 0) [[unlikely]] {
+            VideoCommon::FritchiiPrice::NoteFrontWait(VideoCommon::FritchiiPrice::AcquireSite,
+                                                      pending_acquire->price_target,
+                                                      pending_acquire->price_start);
+        }
         // FRITCHII_ACQUIRE_MET_BY (live, default 0: one load here): "Acquire resumes met by".
         if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_acquire_met_by,
                                              "FRITCHII_ACQUIRE_MET_BY") != 0) [[unlikely]] {
@@ -2377,6 +2399,10 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                 NoteBackSequence(*pending_acquire);
                 dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
                 VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
+                NotePriceSuspension(*pending_acquire);
+                // FRITCHII_DELAY_FRONT_KIND=1 with FRITCHII_DELAY_BEFORE=1: the control spin.
+                VideoCommon::GpuSplit::DelayFrontIf(
+                    VideoCommon::GpuSplit::FrontDelayKind::AcquireMet, true);
                 return;
             }
         }
@@ -2448,6 +2474,10 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             if (learn) {
                 AcquireLearning::Instance().NoteSuspended(acquire.address);
             }
+            NotePriceSuspension(*pending_acquire);
+            // FRITCHII_DELAY_FRONT_KIND=1 with FRITCHII_DELAY_BEFORE=1: the control spin.
+            VideoCommon::GpuSplit::DelayFrontIf(VideoCommon::GpuSplit::FrontDelayKind::AcquireMet,
+                                                true);
         } else {
             waiters.Remove(this);
             record(AcquireTrace::MetAfterFences);
