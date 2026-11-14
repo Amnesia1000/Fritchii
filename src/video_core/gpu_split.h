@@ -230,6 +230,10 @@ public:
     [[nodiscard]] u64 PlayedNow(std::memory_order order) const {
         return two_positions ? played.load(order) : consumed.load(order);
     }
+    /// FRITCHII_ONEF_WAITS_E (fable_b_one_follower 11.2): whether a wait at `site` reads E's
+    /// position: game memory, QMDs, semaphore flushes, lists and the dispatch records are E's;
+    /// everything else (acquires, fences, the lagged check, report flushes, maps) waits for R.
+    [[nodiscard]] static bool SiteOnEngine(DrainSite site) noexcept;
     /// E's own position (step 5's E-only waits; with one follower off the same as PlayedNow).
     [[nodiscard]] u64 EngineConsumedNow() const {
         return consumed.load(std::memory_order_acquire);
@@ -1732,8 +1736,13 @@ private:
     void SwitchEngine(Tegra::Engines::EngineInterface* engine);
     bool WaitFor(u64 target, DrainSite site);
 
-    /// One step of a front wait for the back to consume `target`.
-    void Backoff(u32 spins, u64 target);
+    /// One step of a front wait for the back to consume `target` (`on_engine`: UsesEngine).
+    void Backoff(u32 spins, u64 target, bool on_engine);
+    /// SiteOnEngine with the switch and the two positions on (once per wait).
+    [[nodiscard]] bool UsesEngine(DrainSite site) const;
+    /// Whether the front's wait for `target` is over: R played it, or with `on_engine` E ran it
+    /// and R played the newest render op before it that writes game memory (a report).
+    [[nodiscard]] bool Reached(u64 target, bool on_engine, std::memory_order order) const;
     /// After the back stored `consumed`: wakes a front sleeping in Backoff.
     void NotifyFront() {
         if (front_waiting.load(std::memory_order_seq_cst)) {

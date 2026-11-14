@@ -65,6 +65,8 @@ struct SiteWaitStats {
     /// The delay tests' totals (g_delay_count, g_delay_ns) at the last line, by DelayTest.
     std::array<u64, static_cast<size_t>(GpuSplit::DelayTest::Count)> delay_count{};
     std::array<u64, static_cast<size_t>(GpuSplit::DelayTest::Count)> delay_ns{};
+    /// FRITCHII_ONEF_WAITS_E: waits that ended on E's position with R not there yet.
+    u64 engine_early{};
     u64 since{};
 };
 SiteWaitStats g_site_waits;
@@ -166,9 +168,13 @@ void NoteSiteWait(DrainSite site, u64 behind, u64 ns) {
     }
     std::ranges::sort(order, [&](size_t a, size_t b) { return stats.ns[a] > stats.ns[b]; });
     std::string sites;
+    // FRITCHII_ONEF_WAITS_E: the sites that read E's position are marked "(E)".
+    const bool waits_e = OneFollower::WaitsE();
     for (const size_t s : order) {
-        sites += fmt::format("{}{} {:.0f}/s {:.1f} ms/s behind {:.0f}", sites.empty() ? "" : "; ",
-                             drain_site_names[s], static_cast<double>(stats.count[s]) / window,
+        const bool on_e = waits_e && GpuSplit::SiteOnEngine(static_cast<DrainSite>(s));
+        sites += fmt::format("{}{}{} {:.0f}/s {:.1f} ms/s behind {:.0f}", sites.empty() ? "" : "; ",
+                             drain_site_names[s], on_e ? " (E)" : "",
+                             static_cast<double>(stats.count[s]) / window,
                              static_cast<double>(stats.ns[s]) / 1e6 / window,
                              static_cast<double>(stats.behind[s]) /
                                  static_cast<double>(stats.count[s]));
@@ -189,6 +195,13 @@ void NoteSiteWait(DrainSite site, u64 behind, u64 ns) {
              "front {:.1f} ms/s, GPU memory {:.1f} ms/s ({:.0f}/s), other threads {:.1f} ms/s{}",
              sites, lock_ms[1], lock_rate[1], lock_ms[3], lock_rate[3], lock_ms[2], lock_ms[4],
              lock_rate[4], lock_ms[0], DelayTestText(stats, window));
+    if (waits_e) {
+        LOG_INFO(HW_GPU,
+                 "One follower: front waits on E's position {:.0f}/s ended before R got there "
+                 "(FRITCHII_ONEF_WAITS_E=1)",
+                 static_cast<double>(stats.engine_early) / window);
+    }
+    stats.engine_early = 0;
     stats.count = {};
     stats.ns = {};
     stats.behind = {};
@@ -637,10 +650,55 @@ void GpuSplit::ReportBatched() {
     batched_since = now;
 }
 
+bool GpuSplit::SiteOnEngine(DrainSite site) noexcept {
+    switch (site) {
+    case DrainSite::MacroDmaRead:
+    case DrainSite::MacroDmaWrites:
+    case DrainSite::QmdRead:
+    case DrainSite::SemaphoreFlush:
+    case DrainSite::ListWriters:
+    case DrainSite::ListSync:
+    case DrainSite::ListCopies:
+    case DrainSite::ListFlush:
+    case DrainSite::DispatchWait:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool GpuSplit::UsesEngine(DrainSite site) const {
+    return two_positions && SiteOnEngine(site) && OneFollower::WaitsE();
+}
+
+bool GpuSplit::Reached(u64 target, bool on_engine, std::memory_order order) const {
+    if (!on_engine) {
+        return PlayedNow(order) >= target;
+    }
+    // Game memory, the buffer cache and the lists are E's: everything R does that the front
+    // could read there is lent (E parked until R ran it), except the plain reports
+    // (FRITCHII_ONEF_QUERY_OPS), which land on R. So: E ran `target`, and R played the newest
+    // report op from before it. The mark is read after `consumed`: a report in an entry E ran
+    // is in it. A newer mark (at `target` or later) may hide an older one: R's position then.
+    if (consumed.load(order) < target) {
+        return false;
+    }
+    const u64 mark = OneFollower::GuestWriteOpMark();
+    if (mark == 0) {
+        return true;
+    }
+    if (mark - 1 < target) {
+        return played.load(order) > mark - 1;
+    }
+    return played.load(order) >= target;
+}
+
 void GpuSplit::Drain(DrainSite site) {
     RunPendingFlush(); // Everything sent so far includes the held-back work
+    const bool on_engine = UsesEngine(site);
     consumed_cache = PlayedNow(std::memory_order_acquire);
-    if (consumed_cache == write_position) {
+    if (consumed_cache == write_position || Reached(write_position, on_engine,
+                                                    std::memory_order_acquire)) {
         return;
     }
     // Profile on: GPUMem's wait for this publish counts as the front's start of a wait (15.7).
@@ -656,7 +714,11 @@ void GpuSplit::Drain(DrainSite site) {
     const u64 behind = write_position - consumed_cache;
     for (u32 spins = 0;; ++spins) {
         consumed_cache = PlayedNow(std::memory_order_acquire);
-        if (consumed_cache == write_position) {
+        if (consumed_cache == write_position ||
+            Reached(write_position, on_engine, std::memory_order_acquire)) {
+            if (on_engine && consumed_cache != write_position) {
+                ++g_site_waits.engine_early;
+            }
             publish_every = 8;
             if (start != 0) [[unlikely]] {
                 // fable_stage_levelpoints 18.4 rows 7 and 8: until the back reached it, after.
@@ -666,7 +728,7 @@ void GpuSplit::Drain(DrainSite site) {
             NoteSiteWait(site, behind, Common::Nx2Hitch::NowNs() - begin_ns);
             return;
         }
-        Backoff(spins, write_position);
+        Backoff(spins, write_position, on_engine);
     }
 }
 
@@ -1417,8 +1479,9 @@ bool GpuSplit::WaitForMemoryWriters(DrainSite site, GPUVAddr begin, GPUVAddr end
 }
 
 bool GpuSplit::WaitFor(u64 target, DrainSite site) {
+    const bool on_engine = UsesEngine(site);
     consumed_cache = PlayedNow(std::memory_order_acquire);
-    if (consumed_cache >= target) {
+    if (consumed_cache >= target || Reached(target, on_engine, std::memory_order_acquire)) {
         return false;
     }
     Nx2Profile::Scope scope{Nx2Profile::Zone::WriterWait};
@@ -1432,7 +1495,10 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
     const u64 behind = target - consumed_cache;
     for (u32 spins = 0;; ++spins) {
         consumed_cache = PlayedNow(std::memory_order_acquire);
-        if (consumed_cache >= target) {
+        if (consumed_cache >= target || Reached(target, on_engine, std::memory_order_acquire)) {
+            if (on_engine && consumed_cache < target) {
+                ++g_site_waits.engine_early;
+            }
             wait_target.store(~u64{0}, std::memory_order_relaxed);
             if (start != 0) [[unlikely]] {
                 // fable_stage_levelpoints 18.4 rows 7 and 8: until the back reached it, after.
@@ -1442,11 +1508,11 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
             NoteSiteWait(site, behind, Common::Nx2Hitch::NowNs() - begin_ns);
             return true;
         }
-        Backoff(spins, target);
+        Backoff(spins, target, on_engine);
     }
 }
 
-void GpuSplit::Backoff(u32 spins, u64 target) {
+void GpuSplit::Backoff(u32 spins, u64 target, bool on_engine) {
     if (spins < 16384) {
         Pause();
         return;
@@ -1459,7 +1525,8 @@ void GpuSplit::Backoff(u32 spins, u64 target) {
     // back checks front_waiting after each store, the front checks the position after setting it.
     front_waiting.store(true, std::memory_order_seq_cst);
     const u32 seen = front_wake.load(std::memory_order_seq_cst);
-    if (PlayedNow(std::memory_order_seq_cst) < target) {
+    // E's `consumed` store and R's `played` raise both wake the front (RaisePlayed).
+    if (!Reached(target, on_engine, std::memory_order_seq_cst)) {
         front_wake.wait(seen, std::memory_order_seq_cst);
     }
     front_waiting.store(false, std::memory_order_relaxed);

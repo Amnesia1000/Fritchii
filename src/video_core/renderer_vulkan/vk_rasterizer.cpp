@@ -4604,7 +4604,7 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                         a.self->query_cache.CounterReportAt(a.gpu_addr, a.device, a.type, a.flags,
                                                             a.payload, a.subreport);
                     },
-                    &op, sizeof(op));
+                    &op, sizeof(op), true);
                 return;
             }
         }

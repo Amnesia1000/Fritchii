@@ -114,6 +114,7 @@ struct Impl {
     std::array<u64, static_cast<size_t>(QueryKind::Count)> query_ns_logged{};
     u64 query_log_ns{};
     std::atomic<bool> query_ops_logged{};
+    std::atomic<u64> guest_write_op{}; ///< GuestWriteOpMark
 
     // The hang watchdog's view: written relaxed by E and R (no clock), read once a second.
     std::jthread watchdog;
@@ -890,7 +891,8 @@ void Lend(LentOp op, LentReason reason, void (*function)(void*), void* argument)
     }
 }
 
-void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size) {
+void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size,
+            bool lands_in_memory) {
     if (!Detail::t_engine || !g.thread.joinable() || size > MaxPayloadBytes) {
         function(const_cast<void*>(payload));
         return;
@@ -915,6 +917,20 @@ void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size) {
     header.reserved2 = static_cast<u32>(spans_bytes);
     std::memcpy(buffer + sizeof(PacketHeader) + spans_bytes, payload, size);
     PushPacked(header, buffer, spans_bytes + ((size + 7) & ~u32{7}));
+    if (lands_in_memory) {
+        // Before E's next `consumed` store (seq_cst there): a front that sees E past this entry
+        // sees this mark too.
+        g.guest_write_op.store(header.position + 1, std::memory_order_release);
+    }
+}
+
+bool WaitsE() noexcept {
+    return g.on && VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_waits_e,
+                                                     "FRITCHII_ONEF_WAITS_E") != 0;
+}
+
+u64 GuestWriteOpMark() noexcept {
+    return g.guest_write_op.load(std::memory_order_acquire);
 }
 
 bool QueryOps() noexcept {

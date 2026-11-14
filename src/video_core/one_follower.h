@@ -500,7 +500,17 @@ void DisableUnlend(const char* why) noexcept;
 
 /// E: a render op R runs at its stream place while E goes on: `function(payload copy)` on R,
 /// `size` bytes (at most 64) copied into the packet. Elsewhere it runs in place.
-void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size);
+/// `lands_in_memory`: the op writes game memory later on R (a report): the front's E-position
+/// waits (FRITCHII_ONEF_WAITS_E) also wait for R to play it (GuestWriteOpMark).
+void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size,
+            bool lands_in_memory = false);
+
+/// FRITCHII_ONEF_WAITS_E (live; fable_b 11.2): the front's waits on game memory, QMDs,
+/// semaphore flushes and lists read E's position (`consumed`), the rest R's (`played`).
+[[nodiscard]] bool WaitsE() noexcept;
+/// The newest render op that writes game memory on R (a plain report): its ring A entry
+/// position + 1, 0 = none yet. E stores it before it stores a `consumed` past that entry.
+[[nodiscard]] u64 GuestWriteOpMark() noexcept;
 
 /// The pricing counter of fable_b 11.5: LentOp::Query by call site.
 enum class QueryKind : u8 {

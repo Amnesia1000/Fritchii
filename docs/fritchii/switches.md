@@ -1361,6 +1361,13 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   rate and parked ms/s (condition skipped/override/true/false/conditional/if equal/if not equal,
   reset, plain report, report on buffer page, fence report, payload release), with the switch off
   too.
+- FRITCHII_ONEF_WAITS_E (live, default 0; fable_b_one_follower 11.2): 1 = the front's waits at
+  the macro dma read/writes, qmd read, semaphore flush, list writers/sync/copy writers/flush and
+  macro dma dispatch sites end when E ran the target and R played the newest report render op
+  before it (reports are the one thing R writes to game memory without a lend); acquires, fence
+  releases, the lagged check, fence (word) writers, report flushes (macro dma flush), maps and
+  the rest still wait for R. The "Front waits for the back by site" line marks the E sites
+  "(E)", and a second line counts the waits that ended before R got there.
 - FRITCHII_ONEF_PIN (boot, default 1): R gets PinnedRole::GpuMem's physical core (as
   FRITCHII_PIN_GPUMEM=1 gives GPUMem), taken from the guest set. 0 leaves R unpinned.
 - FRITCHII_ONEF_VIEW (live, default 0): 1 = step 2, E packs the register delta, the R-owned dirty
