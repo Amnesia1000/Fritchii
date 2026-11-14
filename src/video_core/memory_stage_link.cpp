@@ -1166,6 +1166,7 @@ void MemoryStageLink::NoteBackDrawState(const void* engine) noexcept {
 }
 
 void MemoryStageLink::NoteBackWait(u64 ns) noexcept {
+    DelayHandover(2);
     LinkBump(counters.back_wait);
     LinkBump(counters.back_wait_ns, ns);
     if (back_after_run) {
@@ -1319,6 +1320,7 @@ bool MemoryStageLink::StageWaitFor(std::stop_token& stop, StageWait reason, u64 
     const bool ring_wait = reason == StageWait::Window || reason == StageWait::Room;
     u64 spin_from = start;
     bool ok = true;
+    bool waited_any = false;
     for (u32 spin = 0;;) {
         if (stop.stop_requested()) {
             ok = false;
@@ -1327,6 +1329,7 @@ bool MemoryStageLink::StageWaitFor(std::stop_token& stop, StageWait reason, u64 
         if (reached()) {
             break;
         }
+        waited_any = true;
         if (StageServeCalls()) {
             spin = 0;
             if (long_spin) {
@@ -1356,6 +1359,9 @@ bool MemoryStageLink::StageWaitFor(std::stop_token& stop, StageWait reason, u64 
         if (ring_wait) {
             stage_ring_wait.store(false, std::memory_order_relaxed);
         }
+    }
+    if (waited_any && ok) {
+        DelayHandover(reason == StageWait::Input ? 1 : 3);
     }
     const u64 ns = LinkNowNs() - start;
     LinkBump(counters.stage_wait_ns[static_cast<size_t>(reason)], ns);
@@ -1605,6 +1611,29 @@ void MemoryStageLink::DelayRun(u64 launches) noexcept {
     }
     const int kind = Debug::SwitchValue(Debug::g_delay_run_kind, "FRITCHII_DELAY_RUN_KIND");
     if ((kind == 0) != (launches == 0)) {
+        return;
+    }
+    const u64 start = LinkNowNs();
+    const u64 until = start + static_cast<u64>(us) * 1000;
+    u64 now = start;
+    while (now < until) {
+        LinkPause();
+        now = LinkNowNs();
+    }
+    LinkBump(pass_stats.delay_runs);
+    LinkBump(pass_stats.delay_ns, now - start);
+}
+
+void MemoryStageLink::DelayHandover(int kind_here) noexcept {
+    // FRITCHII_DELAY_HANDOVER_US=n (live, 0 = off): a Coz-style test of the hand-overs between
+    // the threads. The waiting thread busy-spins n us after it was handed work, so every such
+    // hand-over arrives n us later; the fps lost against n x the rate says how much of the
+    // hand-over time is on the frame's path.
+    namespace Debug = VideoCore::Nx2Debug;
+    const int us = Debug::SwitchValue(Debug::g_delay_handover_us, "FRITCHII_DELAY_HANDOVER_US");
+    if (us <= 0 ||
+        Debug::SwitchValue(Debug::g_delay_handover_kind, "FRITCHII_DELAY_HANDOVER_KIND") !=
+            kind_here) {
         return;
     }
     const u64 start = LinkNowNs();
@@ -2374,7 +2403,7 @@ void MemoryStageLink::LogPasses(double seconds) {
         "the back {:.1f}, for the front while lent {:.1f}, following {:.1f}; by compute "
         "launches a run (runs/s: back/front/following ms/s) {}; the back waited for the stage "
         "after a run's end, before its next packet, {:.0f}/s {:.1f} ms/s; delay test "
-        "FRITCHII_DELAY_RUN_US={} kind {}: {:.0f}/s {:.1f} ms/s; pass records {:.0f}/s with "
+        "FRITCHII_DELAY_RUN_US={} kind {} (or HANDOVER_US={} kind {}): {:.0f}/s {:.1f} ms/s; pass records {:.0f}/s with "
         "{:.0f} game write ranges/s, applied by the back {:.0f}/s; the back's own gathers while "
         "served taken on GPUMem {:.0f}/s ({:.0f}/s found writes)",
         g_pass.load(std::memory_order_relaxed) != 0
@@ -2388,6 +2417,8 @@ void MemoryStageLink::LogPasses(double seconds) {
         rate(take(stats.idle_waits)), ms(take(stats.idle_ns)),
         (std::max)(VideoCore::Nx2Debug::g_delay_run_us.load(std::memory_order_relaxed), 0),
         (std::max)(VideoCore::Nx2Debug::g_delay_run_kind.load(std::memory_order_relaxed), 0),
+        (std::max)(VideoCore::Nx2Debug::g_delay_handover_us.load(std::memory_order_relaxed), 0),
+        (std::max)(VideoCore::Nx2Debug::g_delay_handover_kind.load(std::memory_order_relaxed), 0),
         rate(take(stats.delay_runs)), ms(take(stats.delay_ns)), rate(take(stats.records)),
         rate(take(stats.record_ranges)), rate(take(stats.records_applied)),
         rate(takes_empty + takes_found), rate(takes_found));

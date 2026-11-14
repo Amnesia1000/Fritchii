@@ -1137,6 +1137,10 @@ private:
     bool back_after_run{};
     /// GPUMem, right after a run's end: FRITCHII_DELAY_RUN_US / _KIND's spin.
     void DelayRun(u64 launches) noexcept;
+    /// A hand-over delay test: FRITCHII_DELAY_HANDOVER_US / _KIND's spin (1: GPUMem after a wait
+    /// for the front that waited, 2: the back after a wait for the stage, 3: GPUMem after any
+    /// other stage wait that waited). Counted in delay_runs / delay_ns.
+    void DelayHandover(int kind_here) noexcept;
     void LogPasses(double seconds);
     struct Snapshot {
         std::array<u64, static_cast<size_t>(HandOff::Count)> calls{};
