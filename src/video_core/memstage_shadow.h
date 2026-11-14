@@ -114,6 +114,15 @@ enum class StageReleaseWord : u8 {
 /// shadow's. memstage_shadow.cpp has the details. Off, each hook below is one test of g_on.
 namespace MemStageShadow {
 
+/// Bumped whenever the shader cache drops a cached program because its code was written
+/// (ShaderCache::InvalidatePageEntries). The memory stage's facts table is keyed by the program
+/// registers (code addresses), not the code: an entry published before a code write may describe
+/// the old code at the same addresses. Each entry keeps the epoch read before its pipeline was
+/// looked up, and a lookup treats an entry older than the epoch as a miss (the draw is lent, and
+/// its own publish brings the entry up to date). One follower: code writes reach the shader cache
+/// on R in stream order with E parked, so E's lookups see every bump before its position.
+inline std::atomic<u64> g_program_code_epoch{};
+
 /// FRITCHII_MEMSTAGE_SHADOW (boot): read by ReadSwitch before the back thread starts. Atomic
 /// (relaxed): FlushRegion and FlushCaching test it on CPU threads too, while a new session's
 /// ReadSwitch may write it.

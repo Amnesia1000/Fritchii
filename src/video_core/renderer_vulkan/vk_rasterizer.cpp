@@ -2275,6 +2275,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                         regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height);
         }
     };
+    // Before the lookup: the facts this draw publishes describe code at least this new.
+    const u64 program_code_epoch =
+        VideoCommon::MemStageShadow::g_program_code_epoch.load(std::memory_order_acquire);
     GraphicsPipeline* const pipeline{[&]() -> GraphicsPipeline* {
         if (delta_pipeline != nullptr) {
             return delta_pipeline; // EXP118: kept, no lookup
@@ -2518,15 +2521,21 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     // update engine as channel may be different.
     pipeline->SetEngine(maxwell3d, gpu_memory);
     // THREAD = 2: the facts table (join 1) learns this pipeline's facts under the stage's key.
-    // One follower step 4: E looks them up for its fills (lent and played draws publish).
+    // One follower from step 3: E looks them up for its fills at step 4 and for the facts
+    // compare at step 3 (lent and played draws publish).
     if (ring_on || (VideoCommon::OneFollower::On() &&
-                    VideoCommon::OneFollower::Step() ==
-                        VideoCommon::OneFollower::StepLevel::Unlend)) [[unlikely]] {
+                    VideoCommon::OneFollower::Step() >=
+                        VideoCommon::OneFollower::StepLevel::Build)) [[unlikely]] {
         const Profile::FineScope facts_scope{Profile::Zone::RingFacts};
         VideoCommon::MemStageShadow::ProgramId program_id;
         VideoCommon::MemStageShadow::BackProgramId(*maxwell3d, program_id);
         mem_stage.PublishFacts(program_id, pipeline, pipeline->MemFacts(),
-                               pipeline->HasDynamicVertexInput());
+                               pipeline->HasDynamicVertexInput(), program_code_epoch);
+    }
+    if (VideoCommon::OneFollower::On()) [[unlikely]] {
+        // Part (c)'s facts compare: the programs this draw ran with (R only).
+        onef_pipeline_hashes = {pipeline->ShaderHashes()[1], pipeline->ShaderHashes()[5]};
+        onef_pipeline_seen = true;
     }
     // FRITCHII_MEMSTAGE_SHADOW (piece 5c): the cache's flags over the fill (compare b); with 3,
     // the fill below and the repack layout read the stage's copy of the engine (CacheInputs on

@@ -100,10 +100,15 @@ private:
     bool FillRing(Maxwell3D& engine, bool is_indexed, u64 position, u64 seq, u64& buffer_number,
                   LentReason& reason);
     void LendDraw(bool is_indexed, u32 instance_count, LentReason reason, bool verify);
+    /// What E's fill would use for a lent draw's programs (looked up on E before the lend).
+    struct FactsExpect {
+        bool found{};
+        std::array<u64, 2> hashes{};
+    };
 
     // R.
     /// A lent draw, E parked: the compares when `verify`, Draw, then the view's flags re-synced.
-    void RunLent(bool is_indexed, u32 instance_count, bool verify);
+    void RunLent(bool is_indexed, u32 instance_count, bool verify, const FactsExpect& expect);
     void Compare(Maxwell3D& engine, bool with_flags);
     void ResyncFlags(const Maxwell3D& engine);
     /// The view takes the spans of one packet.

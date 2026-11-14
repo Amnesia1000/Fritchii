@@ -583,13 +583,17 @@ public:
     /// The back publishes a pipeline's facts under the stage's program key; GPUMem looks them up.
     /// Entries match on the key and the registers it hashes (a key collision is a miss).
     using ProgramId = VideoCommon::MemStageShadow::ProgramId;
+    /// `code_epoch`: MemStageShadow::g_program_code_epoch read before the pipeline was looked
+    /// up (the code the facts describe is at least that new).
     void PublishFacts(const ProgramId& id, const void* source, const DrawFacts& facts,
-                      bool dynamic_input);
+                      bool dynamic_input, u64 code_epoch);
     [[nodiscard]] bool LookupFacts(const ProgramId& id, StagedFacts& out) const;
     /// The facts table's generation (bumped under its lock at every write): while it holds, a
     /// lookup of the same registers gives what it gave (FRITCHII_MEMSTAGE_SETUP_KEEP).
     [[nodiscard]] u64 FactsGeneration() const noexcept {
-        return facts_generation.load(std::memory_order_acquire);
+        // A code write (the program code epoch) changes what a lookup gives as a table write does.
+        return facts_generation.load(std::memory_order_acquire) +
+               VideoCommon::MemStageShadow::g_program_code_epoch.load(std::memory_order_acquire);
     }
     [[nodiscard]] const DispatchPacket* HeldDispatch() const noexcept {
         return held == HeldKind::Dispatch ? &dispatch : nullptr;
@@ -1110,6 +1114,7 @@ private:
         const void* source{};
         ProgramWords words{};
         StagedFacts facts{};
+        u64 epoch{}; ///< the program code epoch the facts are good for (a lookup's minimum)
     };
     static constexpr size_t FactsSlots = 4096;
     std::unique_ptr<FactsSlot[]> facts_table;
@@ -1122,6 +1127,7 @@ private:
         u64 key{};
         const void* source{};
         ProgramWords words{};
+        u64 epoch{};
     };
     static constexpr size_t MemoSlots = 1024;
     std::unique_ptr<PublishedMemo[]> published_memo;
@@ -1130,6 +1136,7 @@ private:
         u64 key{};
         ProgramWords words{};
         StagedFacts facts{};
+        u64 epoch{};
     };
     static constexpr size_t StageFactsSlots = 512;
     mutable std::unique_ptr<StageFactsSlot[]> stage_facts_cache;
