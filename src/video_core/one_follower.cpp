@@ -132,8 +132,22 @@ using Detail::t_render;
 thread_local u32 t_lent_depth{};
 /// R: inside PlayDraw of an unlent draw packet.
 thread_local bool t_playing_draw{};
-/// E's packet scratch: header and spans before they go into the ring.
-thread_local std::vector<u8> t_scratch;
+/// The most a packet's spans can take (every register word, the flags, the draw, the programs
+/// and the pools), and an op packet's payload after them.
+constexpr std::size_t MaxSpanBytes = sizeof(RegPair) * Maxwell3D::Regs::NUM_REGS +
+                                     sizeof(FlagBits) + sizeof(DrawValues) + sizeof(Programs) +
+                                     sizeof(Pools) + 64;
+constexpr std::size_t MaxPayloadBytes = 64;
+
+/// E's packet buffer (fable_b 11.1 item 0): allocated once per thread, written at a cursor, never
+/// resized or cleared on the hot path (the spans' bytes are written before they are sent).
+u8* PackBuffer() {
+    thread_local std::unique_ptr<u8[]> buffer;
+    if (!buffer) [[unlikely]] {
+        buffer.reset(new u8[sizeof(PacketHeader) + MaxSpanBytes + MaxPayloadBytes]);
+    }
+    return buffer.get();
+}
 /// E: the draw the next Lend or PackSpans is for (SetNextDraw), consumed by them.
 thread_local DrawValues t_next_draw{};
 thread_local bool t_next_draw_set{};
@@ -773,8 +787,8 @@ void Lend(LentOp op, LentReason reason, void (*function)(void*), void* argument)
     const u64 begin = timing ? Stats::Now() : 0;
     const u64 behind = Behind();
     const u64 number = ++g.pushed;
-    std::vector<u8>& scratch = t_scratch;
-    scratch.resize(sizeof(PacketHeader));
+    u8* const buffer = PackBuffer();
+    std::size_t spans_bytes = 0;
     PacketHeader header{};
     header.kind = PacketKind::Lent;
     header.op = static_cast<u8>(op);
@@ -786,13 +800,9 @@ void Lend(LentOp op, LentReason reason, void (*function)(void*), void* argument)
     const u32 kind = op == LentOp::Draw ? TakeDrawKind(header) : 0;
     if (step >= StepLevel::View) {
         if (Maxwell3D* const engine = g.engine.load(std::memory_order_acquire)) {
-            // The spans: everything E changed since the last packet. Room for every word.
-            scratch.resize(sizeof(PacketHeader) + sizeof(RegPair) * Maxwell3D::Regs::NUM_REGS +
-                           sizeof(FlagBits) + sizeof(DrawValues) + sizeof(Programs) +
-                           sizeof(Pools) + 64);
-            const std::size_t bytes = PackSpans(
-                *engine, header, std::span<u8>{scratch}.subspan(sizeof(PacketHeader)));
-            scratch.resize(sizeof(PacketHeader) + bytes);
+            // The spans: everything E changed since the last packet, after the header.
+            spans_bytes = PackSpans(*engine, header,
+                                    std::span<u8>{buffer + sizeof(PacketHeader), MaxSpanBytes});
             if (op == LentOp::Draw) {
                 header.flags |= PacketVerify;
             }
@@ -801,9 +811,9 @@ void Lend(LentOp op, LentReason reason, void (*function)(void*), void* argument)
     if (op == LentOp::Draw) {
         t_next_draw_set = false;
     }
-    header.bytes = static_cast<u32>(scratch.size());
-    std::memcpy(scratch.data(), &header, sizeof(header));
-    Commit(scratch.data(), header.bytes, number, header.position, false);
+    header.bytes = static_cast<u32>(sizeof(PacketHeader) + spans_bytes);
+    std::memcpy(buffer, &header, sizeof(header));
+    Commit(buffer, header.bytes, number, header.position, false);
     Stats::Pushed(header, kind, behind);
     // The park: R plays everything before, runs the call, releases E.
     g.e_wait_op.store(static_cast<u8>(op), std::memory_order_relaxed);
@@ -817,28 +827,34 @@ void Lend(LentOp op, LentReason reason, void (*function)(void*), void* argument)
     }
 }
 
-void Push(PacketHeader& header, std::span<const u8> spans) {
-    if (!Detail::t_engine || !g.thread.joinable()) {
-        t_next_draw_set = false;
-        return;
-    }
+namespace {
+/// E: commits a packet whose body (`body_bytes` after the header) is already in PackBuffer().
+void PushPacked(PacketHeader& header, u8* buffer, std::size_t body_bytes) {
     const u64 behind = Behind();
     header.number = ++g.pushed;
     header.position = GpuSplit::Get().BackEntryPosition();
     if (header.draw_seq == 0) {
         header.draw_seq = header.kind == PacketKind::Draw ? ++g.draw_seq : g.draw_seq;
     }
-    header.bytes = static_cast<u32>(sizeof(PacketHeader) + spans.size());
+    header.bytes = static_cast<u32>(sizeof(PacketHeader) + body_bytes);
     const u32 kind = header.kind == PacketKind::Draw ? TakeDrawKind(header) : 0;
     t_next_draw_set = false;
-    std::vector<u8>& scratch = t_scratch;
-    scratch.resize(header.bytes);
-    std::memcpy(scratch.data(), &header, sizeof(header));
-    if (!spans.empty()) {
-        std::memcpy(scratch.data() + sizeof(header), spans.data(), spans.size());
-    }
-    Commit(scratch.data(), header.bytes, header.number, header.position, true);
+    std::memcpy(buffer, &header, sizeof(header));
+    Commit(buffer, header.bytes, header.number, header.position, true);
     Stats::Pushed(header, kind, behind);
+}
+} // Anonymous namespace
+
+void Push(PacketHeader& header, std::span<const u8> spans) {
+    if (!Detail::t_engine || !g.thread.joinable()) {
+        t_next_draw_set = false;
+        return;
+    }
+    u8* const buffer = PackBuffer();
+    if (!spans.empty()) {
+        std::memcpy(buffer + sizeof(PacketHeader), spans.data(), spans.size());
+    }
+    PushPacked(header, buffer, spans.size());
 }
 
 void Drain() {
@@ -877,10 +893,11 @@ void PushDraw(const Maxwell3D& engine, u64 draw_seq, u64 buffer_number, u8 flags
     header.draw_seq = draw_seq;
     header.buffer_number = buffer_number;
     header.pipeline = pipeline;
-    std::vector<u8> spans(sizeof(RegPair) * Maxwell3D::Regs::NUM_REGS + sizeof(FlagBits) +
-                          sizeof(DrawValues) + sizeof(Programs) + sizeof(Pools) + 64);
-    const std::size_t bytes = PackSpans(engine, header, spans);
-    Push(header, std::span<const u8>{spans.data(), bytes});
+    // Packed straight into the packet buffer, after the header: no copy, no allocation.
+    u8* const buffer = PackBuffer();
+    const std::size_t bytes =
+        PackSpans(engine, header, std::span<u8>{buffer + sizeof(PacketHeader), MaxSpanBytes});
+    PushPacked(header, buffer, bytes);
 }
 
 void SetEngine(Maxwell3D* engine) noexcept {
