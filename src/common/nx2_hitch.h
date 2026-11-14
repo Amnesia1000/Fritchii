@@ -147,8 +147,8 @@ void RegisterThread(const char* name);
 /// From the game's present, one thread: `gap_us` since its previous present.
 void OnPresent(long long gap_us);
 
-// Stall snapshot (fable52_answer_stall2 section 2): EDEN_NX2_STALL_SNAPSHOT=1 (read as each
-// thread is named, so nx2_switches.txt applies). A present gap of 100 ms or more then logs one
+// Stall snapshot (fable52_answer_stall2 section 2): on by default since 2026-11-14,
+// EDEN_NX2_STALL_SNAPSHOT=0 turns it off (read as each thread is named, so nx2_switches.txt applies). A present gap of 100 ms or more then logs one
 // "Stall snapshot:" line after its Hitch line: for the GPU back, GPU front, Vulkan worker, GPU
 // fencing and present threads the span each is in now and for how long, and the longest span
 // each spent in the gap; the master semaphore's ticks; whether the present thread is between
@@ -165,7 +165,7 @@ struct StallSlot {
 };
 
 inline std::array<StallSlot, static_cast<size_t>(StallThread::Count)> g_stall_slots;
-/// Set when the first thread registers with EDEN_NX2_STALL_SNAPSHOT=1.
+/// Set when the first thread registers with the stall snapshot on (EDEN_NX2_STALL_SNAPSHOT not 0).
 inline std::atomic<bool> g_stall_on{false};
 /// This thread's slot (RegisterThread), null unless the snapshot is on and this is one of the five.
 inline thread_local StallSlot* t_stall_slot{};
