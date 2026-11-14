@@ -1747,10 +1747,11 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                                     ? VideoCommon::QueryPropertiesFlags::IsAFence
                                     : VideoCommon::QueryPropertiesFlags::HasTimeout;
         // Memory stage tag Cache: the query cache's report (a fence commits the buffer cache's
-        // async flushes); no 3D register, draw state, binding or channel is written.
+        // async flushes); no 3D register, draw state, binding or channel is written. Its kind
+        // lets GPUMem have the back run it at its entry (FRITCHII_MEMSTAGE_RELEASE).
         OnBack([rasterizer = dma_pusher.rasterizer, sequence_address, properties, payload] {
             rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload, properties, payload, 0);
-        }, VideoCommon::StageTagBits(VideoCommon::StageTag::Cache));
+        }, VideoCommon::StageCacheCallBits(VideoCommon::StageCacheCall::SemaphoreRelease));
         if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
             if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(sequence_address)) {
                 split.NoteRelease(*device, sequence_address, payload);

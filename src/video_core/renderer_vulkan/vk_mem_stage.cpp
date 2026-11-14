@@ -3224,6 +3224,13 @@ void MemStage::TickThread(int seam) {
     // (Link::FastLoop); level mode and THREAD 0/1 keep the loop as it was.
     link.SetFastLoop(
         Debug::SwitchValue(Debug::g_memstage_fast_loop, "FRITCHII_MEMSTAGE_FAST_LOOP", 1) > 0);
+    // Gathers run at their entry with GPUMem level instead of a run (live, default off): only
+    // while the window is open (Link::GatherServed); level mode and THREAD 0/1 never.
+    link.SetGather(
+        Debug::SwitchValue(Debug::g_memstage_gather, "FRITCHII_MEMSTAGE_GATHER", 0) > 0);
+    // The puller's semaphore releases the same way (live, default off; the window open only).
+    link.SetRelease(
+        Debug::SwitchValue(Debug::g_memstage_release, "FRITCHII_MEMSTAGE_RELEASE", 0) > 0);
     // The window's verify (its own-write ring and the image check) only with a verify on.
     Link::SetVerify(read_log_every > 0 || Link::RingVerify());
     ring_read_log.store(read_log_every > 0 && Link::Ahead() != 0, std::memory_order_relaxed);

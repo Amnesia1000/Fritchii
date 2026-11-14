@@ -1206,6 +1206,17 @@ bool QueryCacheBase<Traits>::HasPendingFenceWork(bool ignore_payload_sync) const
 }
 
 template <typename Traits>
+bool QueryCacheBase<Traits>::HasPendingSync() const {
+    // NotifyWFI's own test.
+    bool result = false;
+    impl->ForEachStreamer([&result](StreamerInterface* streamer) {
+        result |= streamer->HasPendingSync();
+        return result;
+    });
+    return result;
+}
+
+template <typename Traits>
 void QueryCacheBase<Traits>::NotePayloadSyncDeferred() {
     if (StreamerInterface* const payload =
             impl->streamers[static_cast<size_t>(QueryType::Payload)];

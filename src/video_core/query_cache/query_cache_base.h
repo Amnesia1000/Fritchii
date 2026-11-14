@@ -130,6 +130,9 @@ public:
     /// releases' host buffer syncs don't count; they wait for a later fence or wait for idle.
     bool HasPendingFenceWork(bool ignore_payload_sync = false) const;
 
+    /// Whether NotifyWFI would sync query results now (a streamer has pending syncs).
+    bool HasPendingSync() const;
+
     /// EXP28 & 1: a fence was skipped although payload releases wait for their host sync.
     void NotePayloadSyncDeferred();
 

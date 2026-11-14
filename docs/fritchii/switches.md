@@ -511,7 +511,9 @@ fills on a thread of their own by hand-off; 2 lets that thread read the ring its
     flags back (and a full copy only after a closure it cannot follow). Indirect and list draws
     (list draws are served with the window open, FRITCHII_MEMSTAGE_LIST_DRAWS below),
     GPU-counted draws, texel buffers, a facts miss, a frame dump or trace, host conditional
-    rendering and constant buffer words onto a watched page make their entry level;
+    rendering and constant buffer words onto a watched page make their entry level (a lone
+    gather does not with FRITCHII_MEMSTAGE_GATHER=1 and the window open: GPUMem comes level at it
+    and the back runs it there, below);
   - level mode (AHEAD = 0): GPUMem works only while the back is parked (it ran everything passed
     on and is not in its idle hook), so the two threads still take turns at every draw. Expect fps
     lower than 0; the point is correctness and what a run costs. Step 7 opens the window.
@@ -747,6 +749,139 @@ logged when it changes.
   b's hash at every served draw) and READ_LOG, once with 0 and once with 1; every must-be-0 line
   stays 0. Then 0 against 1 with profile_toggle.py at the market (GPUMem's "stage pairs" and "other"
   at EDEN_NX2_GPU_PROFILE=2, its busy time, fps).
+
+### FRITCHII_MEMSTAGE_GATHER
+
+FRITCHII_MEMSTAGE_GATHER (live, read at a frame end with FRITCHII_MEMSTAGE_AHEAD, default 0;
+lever B of work\fable_stage_drains.md): with FRITCHII_MEMSTAGE_THREAD=2 and the window open
+(AHEAD > 0), a gather (3D invalidate_texture_data_cache, 0x3dd: the game's collected CPU writes
+into the caches, then a wait for idle) no longer starts a level run. GPUMem comes level at its
+entry (StageLevel, reason "gather") and the back, parked there, runs the method's whole handler as
+a request GPUMem waits for; the back's own run of the entry then skips it. 0, AHEAD 0 and THREAD
+0/1 keep every gather as before (a run on THREAD 2, the back's own code otherwise).
+
+- Why not GPUMem's own work (the plan's first form: GPUMem takes the game's writes, applies the
+  buffer half, sends the ranges to the back for the other caches): the method's wait for idle
+  syncs query results into buffers (QueryCache::NotifyWFI, SyncValues: buffer lookups and uploads
+  in the buffer cache) and groups the async flushes (SignalOrdering), both in the buffer cache at
+  the gather's place in the stream, with the back's query state there. At the market that sync is
+  due at nearly every gather (about 68,000 reports a second, each leaves a pending sync until the
+  next wait for idle). GPUMem ahead of the back can't give the back that cache state, and a served
+  call would answer from GPUMem's later state (joins and uploads ahead). The gather line counts how
+  often the sync was due ("the wait for idle synced query results") and how often a game write
+  range lay by GPU-written buffer data, so the cost of that first form can be judged.
+- Which: a gather that is the whole entry (a lone Direct method entry) of the copy, outside a run
+  and outside a hard entry, with no draw before it in the entry. Level instead (a run, as before):
+  a gather inside a multi-word or packet entry (the back would run what precedes it in the entry
+  after the request), one the back's pending deferred draw would come before (its sink or the
+  gather's own store flushes it at the entry: tested by the request, on the back), one right
+  before a hard closure the front has published (a Cache or untagged Call, a semaphore release or
+  a fence: the gather's run takes it in, so coming level first would only add a wait), no room
+  for its record (256), GPUMem stopping.
+- Exact: once level, the back has run every entry before the gather's and played every packet;
+  GPUMem waits outside any fill, so the back serving the request is the buffer cache's only user,
+  at that place in the stream, and it runs InvalidateTextureDataCache's default, the same code
+  THREAD 0 runs there. The cache's flags 15-48 go to the back's engines before the gather and
+  back to the copies after it, inside the request on the back (GPUMem waits; the back's idle hook
+  flush, which may run while it is parked, is on the same thread), as a run of that one entry
+  hands them over (the request may mark bindings dirty). The record
+  (the entry's position and the back's draw count) makes the back skip the method when it runs
+  the entry: nothing of the entry comes before it there (a lone method, no deferred draw), and its
+  register store and dirty flags are the same either way.
+- What it saves against the run: the lend and the return (flag hand-overs, the run's start and end
+  on the back, FlushCaching), GPUMem parked through the back's run of the entry and of the entries
+  the run was extended over (GPUMem follows those itself now). What it keeps: GPUMem waits until the back reaches the gather (its lead is gone there, as
+  at a run), then for the request.
+- "Memory stage gathers (FRITCHII_MEMSTAGE_GATHER=n, window open/closed)" every 10 s on THREAD 2:
+  gathers a second run at their entry and level by why (switch off or window closed, not alone in
+  their entry, after a deferred draw, before a hard closure, no ring backend, no record room,
+  GPUMem stopping), inside a level run, in an entry hard already; runs started by a gather against all runs; GPUMem's ms a second in the
+  served ones (the wait to be level and the request, and us each); of those, how often the wait
+  for idle synced query results and a game write range lay by GPU-written buffer data, and the
+  game write ranges a second; the gathers the back found run at their entry (equals served; the
+  ones inside a level run should be 0, a lone gather's entry has nothing after it to turn hard). The window line's "level
+  inside the window" has a "gather" reason, and the link line's "served syncs" include the
+  back's runs of the served gathers. 5c's "runs by first hard kind" shows the gathers that
+  are left.
+- Must be 0 (the link line): "a served gather with no record of GPUMem's" (the back ran it in a
+  served entry: the two sides decided differently; it then runs it as before, which is not in
+  order), "a gather GPUMem had the back run at an entry the back passed without it" (a record
+  dropped at a later gather, a lend, the ring's end or start) and "a back draw between a gather
+  GPUMem had run and its entry" (the back's draw count moved between the request and its entry).
+  "Level after a deferred draw" is not one of them: the shadow applies sunk writes at once and
+  may issue that draw at an earlier entry, while the back issues it when it consumes its sink at
+  the gather's entry.
+- The record is pushed before the request and GPUMem publishes past the entry right after it (as
+  an entry with a packet): the back, parked there, goes on at once. If the request throws, the
+  ring ends at the entry and the record stays: the back's run of the entry without the ring
+  still skips the gather (a record at or past the ring's end is honoured), so it never runs
+  twice; the cache's flags come back to the copies in a scope guard either way. "The window open"
+  is GPUMem's own read of it at its loop top (what StageLevel goes by), not the live value.
+- The constant buffer ranges GPUMem collected and has not applied yet stay pending through the
+  request, as on THREAD 0, where the memory manager's cached ranges wait for FlushCaching at the
+  next draw (nothing in the gather, the wait for idle, the query sync or a fence calls it); a lent
+  run applies them at its start, earlier.
+- At the market (ms46, 2026-11-14): 4,579 runs a second start at a gather (43% of runs, 15 us
+  parked each). With the switch on they should go from the run starters; the gain is the run
+  overhead per gather, not the whole 15 us (GPUMem still waits to be level). Compare 0 and 1 with
+  profile_toggle.py in one session; the gather line has GPUMem's ms a second in the served ones.
+- "cache call +0xc8d340" (ms46, the second starter at 1,705 a second; symbolized against the
+  2026-11-14 03:09 release PDB): the closure at puller.cpp:1751, the puller's semaphore release
+  (WriteLong, Puller::ProcessSemaphoreTriggerMethod: QueryCache::CounterReport with the payload, a
+  fence when RELEASE_SIZE is set on Switch 2, so SignalFence and the fence manager), the same
+  closure as the earlier "+0xc744a0" and "+0xc8c700". Tagged Cache already, which is right: it
+  reaches the fence manager (its releases commit the buffer cache's async flushes) and the query
+  cache, and leaves a pending query sync. Not Pass (it writes the semaphore word into game memory
+  at the back's place, which uploads GPUMem made ahead could miss, and a fence commits cache
+  state). It could be run at its entry the way gathers are here (GPUMem level, the back runs the
+  closure as a request), with a skip in the back's entry loop for Call entries:
+  FRITCHII_MEMSTAGE_RELEASE below.
+
+### FRITCHII_MEMSTAGE_RELEASE
+
+FRITCHII_MEMSTAGE_RELEASE (live, read at a frame end with FRITCHII_MEMSTAGE_AHEAD, default 0): with
+FRITCHII_MEMSTAGE_THREAD=2 and the window open (AHEAD > 0), the puller's semaphore release closure
+(Puller::ProcessSemaphoreTriggerMethod's WriteLong: QueryCache::CounterReport with the payload, a
+fence when RELEASE_SIZE is set on Switch 2; "cache call +0xc8d340" in ms46, the second run starter
+at 1,705 a second) no longer starts a level run, the same way FRITCHII_MEMSTAGE_GATHER handles
+gathers: GPUMem comes level at its entry (StageLevel, reason "semaphore release"), the back,
+parked there, runs the closure as a request GPUMem waits for, and GpuSplit::Execute skips the
+entry when it gets there. 0, AHEAD 0 and THREAD 0/1: as before.
+
+- Which: the closure carries StageCacheCall::SemaphoreRelease in its header (bits 40-47 of a Cache
+  tagged Call entry; Execute and every other reader ignore them). Outside a level run, with the
+  switch on and the window open. Kept as a run: a Cache or untagged closure right after it that
+  the front has published (the run takes it in, so coming level first would only add a wait and
+  a second run), no room for its record (256), GPUMem stopping.
+- Exact: once level, the back has run every entry before the release's and played every packet,
+  and GPUMem waits outside any fill: the back serving the request is the buffer cache's, the query
+  cache's and the fence manager's only user, at the release's place in the stream, and it makes
+  the call Execute makes (the entry's thunk on its payload, which stays in ring A until the back
+  passes the entry): the report, the fence and what it commits, the semaphore word written to
+  game memory, all where THREAD 0 does them. On the back a Call entry is only its call (no method
+  sink is consumed, no deferred draw is issued there), so nothing of the entry comes before it,
+  and there is no lone-method or deferred-draw exception as for the gathers. The cache's flags
+  15-48 go to the back's engines around the call and back to the copies (the fence's commits and
+  the query sync may delete buffers and mark bindings dirty), inside the request, as a run of
+  that entry hands them over. The front's bookkeeping of the release (NoteRelease, its waiters)
+  reads positions and the word: the word is written while the back is at the entry, as before;
+  `consumed` passes the entry later than the write, as before.
+- "Memory stage semaphore releases (FRITCHII_MEMSTAGE_RELEASE=n, window open/closed)" every 10 s
+  on THREAD 2: per second run at their entry and level by why (switch off or window closed,
+  before a hard closure, no record room, GPUMem stopping), inside a level run; runs started by a
+  release against all runs; GPUMem's ms a second in the served ones (and us each); the releases
+  the back found run at their entry (equals served). The window line's "level inside the window"
+  has a "semaphore release" reason; the link line's "served syncs" include the back's runs of
+  them.
+- Must be 0 (the link line): "a served semaphore release with no record of GPUMem's", "a
+  semaphore release GPUMem had the back run at an entry the back passed without it" and "a back
+  draw between a semaphore release GPUMem had run and its entry", as the gathers'. The record
+  first, the publish right after and the record honoured past the ring's end as for the
+  gathers: a release is never made twice (a second report, fence and semaphore word write).
+- With FRITCHII_MEMSTAGE_GATHER on too, a gather right before a release keeps its run, which
+  takes the release in (one run instead of two level waits).
+- Compare 0 and 1 with profile_toggle.py in one session (5c's run starters lose "cache call"
+  at the release's address).
 
 ### FRITCHII_MEMSTAGE_FULL_BINDS
 

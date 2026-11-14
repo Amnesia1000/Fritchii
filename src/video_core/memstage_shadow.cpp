@@ -173,6 +173,10 @@ struct MemStageShadowAccess {
     static const u64* Ring() {
         return GpuSplit::Get().ring.get();
     }
+    /// How far the front has published (GPUMem may read the entries before it).
+    static u64 Published() {
+        return GpuSplit::Get().published.load(std::memory_order_acquire);
+    }
     static bool SkipSame(const Maxwell3D& maxwell3d) {
         return maxwell3d.skip_same_value_writes;
     }
@@ -842,6 +846,7 @@ struct State {
     bool ring_in_run{};       ///< The entry is followed inside a level run
     u64 ring_seq{};           ///< Draws the copies issued since the ring started
     u32 ring_packets{};       ///< Packets the entry sent
+    bool ring_ran_on_back{};  ///< The back ran its gather or semaphore release (StageResult)
     Class last_class{Class::Pass};
     std::vector<std::pair<u64, std::size_t>> ring_ranges; ///< Collected, not applied yet
     /// Step 7: the flags a deferred lend hands over, per engine (BackTakeLend).
@@ -1293,6 +1298,12 @@ void ConstBufferBind(Copy& c, size_t stage) {
 /// buffer words onto a watched page).
 enum class MethodKind : u8 { Work, Pass, Hard };
 
+/// FRITCHII_MEMSTAGE_GATHER: a gather (invalidate_texture_data_cache) GPUMem may have the back run
+/// at its entry (StageGather decides there, at the method). Anything else keeps it hard.
+bool GatherCandidate(const State& s) {
+    return s.ring && !s.ring_in_run && !s.entry_hard && MemoryStageLink::GatherServed();
+}
+
 MethodKind MethodKindOf(const Copy& c, u32 method) {
     switch (method) {
     // Hard: they need the back's caches (the gather, the wait, the upload engine's writes),
@@ -1303,8 +1314,9 @@ MethodKind MethodKindOf(const Copy& c, u32 method) {
     case MAXWELL3D_REG_INDEX(sync_info):
     case MAXWELL3D_REG_INDEX(launch_dma):
     case MAXWELL3D_REG_INDEX(inline_data):
-    case MAXWELL3D_REG_INDEX(invalidate_texture_data_cache):
         return MethodKind::Hard;
+    case MAXWELL3D_REG_INDEX(invalidate_texture_data_cache):
+        return GatherCandidate(S()) ? MethodKind::Work : MethodKind::Hard;
     // Pass (plan 2.2, 2.4, 2.5): the query streamer's reset, the scheduler's barrier, an empty
     // handler, and a report that is not a fence (the handler decides that). The store only.
     case MAXWELL3D_REG_INDEX(clear_report_value):
@@ -1358,6 +1370,8 @@ void Condition(State& s, Copy& c) {
     s.take_execute = &c;
 }
 
+void StageGather(State& s, Copy& c, u32 method);
+
 /// Maxwell3D::ProcessMethodCall's effects on the copy, for every executable method that is not a
 /// macro: the stage's handler (spec 3.2), or for a hard method what follow applies (plan 3.2).
 void MethodCall(State& s, Copy& c, u32 method, u32 value, u32 nonshadow) {
@@ -1385,11 +1399,15 @@ void MethodCall(State& s, Copy& c, u32 method, u32 value, u32 nonshadow) {
     }
     case MAXWELL3D_REG_INDEX(render_enable.mode):
         return Condition(s, c);
+    case MAXWELL3D_REG_INDEX(invalidate_texture_data_cache):
+        if (s.ring) {
+            StageGather(s, c, method); // FRITCHII_MEMSTAGE_GATHER, and its counters
+        }
+        return; // the store only
     case MAXWELL3D_REG_INDEX(wait_for_idle):
     case MAXWELL3D_REG_INDEX(sync_info):
     case MAXWELL3D_REG_INDEX(launch_dma):
     case MAXWELL3D_REG_INDEX(inline_data):
-    case MAXWELL3D_REG_INDEX(invalidate_texture_data_cache):
     case MAXWELL3D_REG_INDEX(clear_report_value):
     case MAXWELL3D_REG_INDEX(fragment_barrier):
     case MAXWELL3D_REG_INDEX(tiled_cache_barrier):
@@ -1592,6 +1610,160 @@ void Return(State& s) {
     ++s.counters.returns;
 }
 
+/// FRITCHII_MEMSTAGE_GATHER (GPUMem, at the gather's method; memory_stage_link.cpp's header has
+/// the whole argument). Why a gather can't be GPUMem's own work: the method is the game's CPU
+/// writes into the caches *and* a wait for idle, whose query result sync (NotifyWFI, SyncValues)
+/// and flush grouping (SignalOrdering) use the buffer cache at the gather's place in the stream,
+/// with the back's query state there. So GPUMem comes level at the entry instead of lending a run:
+/// the back, parked there with every packet before it played, runs the method's whole handler as
+/// a request (the cache's user while it serves), and its own run of the entry skips it. What stays
+/// a run: a gather that is not a lone Direct method (something before it in the entry would run on
+/// the back after it), one the back's pending deferred draw would come before, one right before a
+/// hard closure (the run takes it in), no record room, the switch off or the window closed.
+///
+/// The collected constant buffer ranges GPUMem holds (StageRanges) stay for its next fill, as on
+/// THREAD 0, where the memory manager's cached ranges wait for FlushCaching at the next draw (no
+/// part of the gather, the wait for idle, the query sync or a fence calls it): the request runs
+/// with them pending, as the back's own gather would. (A lent run applies them at its start,
+/// earlier than THREAD 0.)
+void StageGather(State& s, Copy& c, u32 method);
+
+/// The entry after the one at `position` (`size` words) is a hard closure the front has published
+/// (a Cache or untagged Call: a semaphore release, a fence), which a run started here would take
+/// in (StageExtendsRun).
+bool NextIsHardClosure(u64 position, size_t size) {
+    const u64 next = position + size;
+    if (next >= Access::Published()) {
+        return false;
+    }
+    const u64 head = Access::Ring()[next & Access::RingMask];
+    return static_cast<Kind>(head & 0xf) == Kind::Call &&
+           (StageTagOf(head) == StageTag::Cache || StageTagOf(head) == StageTag::Level);
+}
+
+void StageGather(State& s, Copy& c, u32 method) {
+    using Outcome = MemoryStageLink::GatherOutcome;
+    MemoryStageLink& link = MemoryStageLink::Get();
+    if (s.ring_in_run) {
+        return link.NoteGather(Outcome::InRun);
+    }
+    if (s.entry_hard) {
+        // MethodKindOf made it hard for this gather (the switch off or the window closed: it
+        // starts the run, as before), or something before it in the entry did.
+        const bool starts = !MemoryStageLink::GatherServed() &&
+                            s.entry_key == LevelKey(s.entry_type, s.channel, method);
+        return link.NoteGather(starts ? Outcome::Closed : Outcome::Late);
+    }
+    // A candidate (MethodKindOf said work): served here, or hard after all.
+    const auto level = [&](Outcome why) {
+        link.NoteGather(why);
+        Hard(s, s.entry_type, method);
+    };
+    const u64 head = Access::Ring()[s.processing_position & Access::RingMask];
+    if (static_cast<Kind>(head & 0xf) != Kind::Method || s.entry_draws != 0) {
+        // The back would run what comes before it in the entry (a draw the store flushed, other
+        // writes of the packet) after the request: not in stream order.
+        return level(Outcome::NotFirst);
+    }
+    // A hard closure right after it (a Cache or untagged Call: a semaphore release, a fence) would
+    // join the gather's run (StageExtendsRun) and start one of its own here: GPUMem would come
+    // level and then lend anyway. Kept as one run, when the front has published that entry.
+    if (NextIsHardClosure(s.processing_position, (head & Access::HasSegment) != 0 ? 2 : 1)) {
+        return level(Outcome::NextHard);
+    }
+    const auto& backend = link.Backend();
+    if (backend.gather == nullptr) {
+        return level(Outcome::NoBackend);
+    }
+    if (!link.GatherRoom()) {
+        return level(Outcome::NoRoom);
+    }
+    const auto start = std::chrono::steady_clock::now();
+    if (!link.StageLevel(s.processing_position, MemoryStageLink::LevelReason::Gather)) {
+        return level(Outcome::Stopping);
+    }
+    // Level: the back has run every entry before this one and is parked at it. The record first:
+    // if the request throws (the ring then ends at this entry), the back's run of the entry
+    // without the ring still skips the gather, so it never runs twice. The request reads and
+    // writes the back's state on the back (its idle hook's flush may run there meanwhile): it
+    // declines when the engine has a deferred draw, which this entry would issue first (its
+    // method sink's writes and the gather's own store flush it), before the gather; it hands the
+    // cache's flags over around the gather (BackGatherLend, BackGatherReturn). That decline is
+    // not a mismatch: the shadow applies sunk writes at once and may have issued that draw at an
+    // earlier entry, while the back issues it when it consumes its sink here.
+    link.PushGather(s.processing_position);
+    u64 draw_seq = 0;
+    if (!backend.gather(backend.context, c.back, draw_seq)) {
+        link.RetractGather();
+        return level(Outcome::DeferredDraw);
+    }
+    link.FinishGather(draw_seq);
+    s.ring_ran_on_back = true;
+    link.NoteGather(Outcome::Served,
+                    static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - start)
+                                         .count()));
+}
+
+/// FRITCHII_MEMSTAGE_RELEASE (GPUMem, at a Call entry tagged StageCacheCall::SemaphoreRelease, the
+/// whole entry): true when the back ran the closure at this entry on GPUMem's request, so the entry
+/// is work and no run; false: the caller makes it hard, as before. As StageGather (the gathers'
+/// comment has the argument): GPUMem comes level at the entry, the back runs the closure's thunk
+/// as a request (the cache's only user, the same call its Execute makes, at the same place in the
+/// stream: the query cache's report, the fence and its commits, the semaphore word), with the
+/// cache's flags handed over around it, and GpuSplit::Execute skips the entry when it reaches it.
+/// A Call entry is only its call on the back (no method sink, no deferred draw is issued there),
+/// so nothing of the entry comes before it. Kept as a run: a hard closure right after it (the run
+/// takes it in), no record room, the switch off or the window closed.
+bool StageRelease(State& s, const u64* entry, size_t size) {
+    using Outcome = MemoryStageLink::ReleaseOutcome;
+    MemoryStageLink& link = MemoryStageLink::Get();
+    if (s.ring_in_run) {
+        link.NoteRelease(Outcome::InRun);
+        return false;
+    }
+    if (!MemoryStageLink::ReleaseServed()) {
+        link.NoteRelease(Outcome::Closed);
+        return false;
+    }
+    if (NextIsHardClosure(s.processing_position, size)) {
+        link.NoteRelease(Outcome::NextHard);
+        return false;
+    }
+    if (!link.ReleaseRoom()) {
+        link.NoteRelease(Outcome::NoRoom);
+        return false;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    if (!link.StageLevel(s.processing_position, MemoryStageLink::LevelReason::Release)) {
+        link.NoteRelease(Outcome::Stopping);
+        return false;
+    }
+    // Level: the back is parked at this entry, which stays in ring A until the back passes it. The
+    // record first, as StageGather's: if the closure throws in the request (the ring then ends at
+    // this entry), the back's run of the entry without the ring still skips it, so the report,
+    // the fence and the semaphore word are never made twice.
+    link.PushRelease(s.processing_position);
+    struct Run {
+        const u64* entry;
+        u64 draw_seq;
+    } run{entry, 0};
+    auto body = [&run] {
+        BackGatherLend();
+        const BackGatherFlags flags; // BackGatherReturn, also if the closure throws
+        reinterpret_cast<void (*)(const u64*)>(run.entry[1])(run.entry + 2);
+        run.draw_seq = MemoryStageLink::Get().BackDrawSeq();
+    };
+    link.ServeNow(body);
+    link.FinishRelease(run.draw_seq);
+    s.ring_ran_on_back = true;
+    link.NoteRelease(Outcome::Served,
+                     static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::steady_clock::now() - start)
+                                          .count()));
+    return true;
+}
+
 /// Run bookkeeping for one entry (plan 3.2): a run starts at a hard entry and ends after the last
 /// hard entry reached through pass and neutral entries; a work entry, or one that issued a draw,
 /// ends it.
@@ -1789,6 +1961,13 @@ size_t Process(State& s, u64 position, bool executed) {
         case StageTag::Pass:
             break;
         case StageTag::Cache:
+            // FRITCHII_MEMSTAGE_RELEASE: the puller's semaphore release, run by the back at its
+            // entry on GPUMem's request (no run), or as any cache call.
+            if (s.ring && StageCacheCallOf(head) == StageCacheCall::SemaphoreRelease &&
+                StageRelease(s, entry, size)) {
+                cls = Class::Work;
+                break;
+            }
             // Uses the cache on the back, writes no 3D state: hard, no copy after (plan 3.3).
             Hard(s, LevelType::CacheCall, Rva(entry[1]));
             break;
@@ -2315,6 +2494,7 @@ StageResult StageProcess(u64 position, bool in_run) {
     State& s = S();
     s.ring_in_run = in_run;
     s.ring_packets = 0;
+    s.ring_ran_on_back = false;
     s.current = position;
     const size_t size = Process(s, position, false);
     s.cursor = position + size;
@@ -2325,6 +2505,7 @@ StageResult StageProcess(u64 position, bool in_run) {
         .packets = s.ring_packets,
         .launches = s.entry_launches,
         .channel = s.channel,
+        .ran_on_back = s.ring_ran_on_back,
     };
 }
 
@@ -2389,6 +2570,27 @@ void BackTakeLend() {
     // The back, at the run's first entry: S() is GPUMem's state, which is parked on this run.
     for (const auto& [engine, flags] : S().lend_flags) {
         TakeCacheFlags(engine->dirty.flags, flags);
+    }
+}
+
+void BackGatherLend() {
+    // The back, in GPUMem's gather request: S() is GPUMem's, which waits for the answer. As
+    // StageLend (level mode's lend), without its count.
+    for (Copy& copy : S().copies) {
+        if (!copy.stale) {
+            TakeCacheFlags(copy.back->dirty.flags, copy.e->dirty.flags);
+        }
+    }
+}
+
+void BackGatherReturn() {
+    // As StageReturn's take of the flags: the gather may have marked bindings dirty (a buffer the
+    // query sync's lookups deleted).
+    for (Copy& copy : S().copies) {
+        if (!copy.stale) {
+            TakeCacheFlags(copy.e->dirty.flags, copy.back->dirty.flags);
+            ++copy.generation;
+        }
     }
 }
 

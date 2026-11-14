@@ -73,6 +73,22 @@ enum class StageDrawLoop : u8 {
     return static_cast<StageDrawLoop>((header >> 40) & 0xff);
 }
 
+/// StageTag::Cache's kind, in header bits 40-47 (FRITCHII_MEMSTAGE_RELEASE): which cache call it
+/// is, when the stage treats one apart. The payload stays the closure's own (no layout promised).
+enum class StageCacheCall : u8 {
+    Other = 0,            ///< any other cache call
+    SemaphoreRelease = 1, ///< the puller's semaphore release (WriteLong: QueryCache::CounterReport)
+};
+
+/// StageTag::Cache with its kind, for a Call entry's header.
+[[nodiscard]] constexpr u64 StageCacheCallBits(StageCacheCall which) noexcept {
+    return StageTagBits(StageTag::Cache) | (u64{static_cast<u8>(which)} << 40);
+}
+
+[[nodiscard]] constexpr StageCacheCall StageCacheCallOf(u64 header) noexcept {
+    return static_cast<StageCacheCall>((header >> 40) & 0xff);
+}
+
 /// Memory stage piece 5b (spec 6.2), FRITCHII_MEMSTAGE_SHADOW=1: the stage's classify, register
 /// copy, draw manager copy and handlers run on the back thread on each ring entry just before the
 /// back executes it, and produce nothing; every draw the back issues is compared with the
@@ -155,6 +171,7 @@ struct StageResult {
     u32 packets;
     u32 launches; ///< Compute launches in the entry (0xaf, 0xb0, 0x107), for the run shape
     s32 channel;  ///< The channel the stage had bound at the entry, for the run shape
+    bool ran_on_back; ///< The back ran a gather or a semaphore release of it on GPUMem's request
 };
 /// The back: ring mode starts (its hooks off) or ended.
 void SetRingBack(bool on);
@@ -167,6 +184,21 @@ void StageLend();
 /// entry (BackTakeLend, on the back; the publish of the run orders the two).
 void StageLendDeferred();
 void BackTakeLend();
+/// FRITCHII_MEMSTAGE_GATHER, on the back inside GPUMem's request (GPUMem waits, level): the cache's
+/// flags 15-48 to the back's engines before the gather, and back to the copies after it, as a run
+/// of that one entry hands them over.
+void BackGatherLend();
+void BackGatherReturn();
+/// BackGatherReturn when it goes out of scope, also when the gather or the closure throws (the
+/// flags never stay on the back).
+struct BackGatherFlags {
+    BackGatherFlags() = default;
+    ~BackGatherFlags() {
+        BackGatherReturn();
+    }
+    BackGatherFlags(const BackGatherFlags&) = delete;
+    BackGatherFlags& operator=(const BackGatherFlags&) = delete;
+};
 /// Step 7: whether processing the entry at `position` may take a full copy from the back (a copy
 /// that is new or stale): GPUMem must be level there first.
 [[nodiscard]] bool StageMayCopy(u64 position);
