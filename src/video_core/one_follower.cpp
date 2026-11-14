@@ -494,7 +494,8 @@ void LogQueryKinds() {
     static constexpr std::array<const char*, static_cast<size_t>(InvalKind::Count)> inval_names{
         "run on E", "lent: texture page", "lent: shader page", "lent: query page",
         "lent: hit at the second look", "inline uploads on E",
-        "inline uploads with R's half lent", "inline uploads lent: query page"};
+        "inline uploads with R's half lent", "inline uploads lent: query page", "gathers on E",
+        "gathers lent: texture or shader page"};
     std::string inval;
     for (size_t i = 0; i < inval_names.size(); ++i) {
         const u64 count = g.inval_count[i].load(std::memory_order_relaxed);
@@ -1260,6 +1261,12 @@ bool InvalOnEngine() noexcept {
         });
     }
     return true;
+}
+
+bool GatherOnEngine() noexcept {
+    return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_gather_e,
+                                            "FRITCHII_ONEF_GATHER_E") != 0 &&
+           InvalOnEngine();
 }
 
 bool CopyOnEngine() noexcept {
