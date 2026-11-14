@@ -352,6 +352,7 @@ constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::Check::Co
     "a pass record's slot freed while its taken writes were listed and not applied (rule T)",
     "taken writes left listed (applying_writes) at the ring's end beyond the records kept",
     "a query result sync range at a P3-passed entry that none of the record's targets holds",
+    "a served 3D fence report with no pass record (the back ran it in a served entry)",
     "a kept draw setup whose full lookup gave other facts or none (FRITCHII_MEMSTAGE_SETUP_KEEP=2)",
 };
 static_assert(LINK_CHECK_NAMES.back() != nullptr, "a name for every check");
@@ -797,7 +798,7 @@ void MemoryStageLink::CheckCacheUserSlow(Check check) noexcept {
 void MemoryStageLink::Note(Check check, const char* where) noexcept {
     const size_t index = static_cast<size_t>(check);
     instance.counters.checks[index].fetch_add(1, std::memory_order_relaxed);
-    if (check >= Check::PassQuerySync && check <= Check::PassSyncTarget) {
+    if (check >= Check::PassQuerySync && check <= Check::PassFenceMissing) {
         // FRITCHII_MEMSTAGE_PASS runs as 0 from the next frame end (SetPass), for the session.
         instance.pass_refused.store(true, std::memory_order_relaxed);
     }
