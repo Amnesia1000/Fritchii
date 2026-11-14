@@ -2862,6 +2862,11 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
     fs.packet_on = fs.packet_mode != 0 && fs.exp22 == 0 && fs.same_experiment == 0 &&
                    !VideoCommon::GpuSplit::MacroSink();
     fs.e2c_call = oot == OotMacros::Id::E2C;
+    if (fs.e2c_call) {
+        // FRITCHII_DELAY_E2C_US (live, 0 = off): the delay test "W", every call (hits too),
+        // before its read, whether the handler or the JIT runs it.
+        VideoCommon::GpuSplit::DelayWork(VideoCommon::GpuSplit::DelayTest::E2c);
+    }
     {
         VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
         engine.native_interpreter.active_dram = &native_data_ram;

@@ -60,35 +60,73 @@ struct SiteWaitStats {
     std::array<u64, static_cast<size_t>(DrainSite::Count)> behind{};
     std::array<u64, static_cast<size_t>(Common::Nx2Hitch::Role::Count)> lock_ns{};
     std::array<u64, static_cast<size_t>(Common::Nx2Hitch::Role::Count)> lock_count{};
-    /// The delay tests' spins (GpuSplit::SpinDelay), by GpuSplit::DelayTest.
+    /// The delay tests' totals (g_delay_count, g_delay_ns) at the last line, by DelayTest.
     std::array<u64, static_cast<size_t>(GpuSplit::DelayTest::Count)> delay_count{};
     std::array<u64, static_cast<size_t>(GpuSplit::DelayTest::Count)> delay_ns{};
     u64 since{};
 };
 SiteWaitStats g_site_waits;
 
-// The delay tests' part of the line: only while a switch is set or spins were counted.
-std::string DelayTestText(const SiteWaitStats& stats, double window) {
+// The delay tests' spins (GpuSplit::SpinDelay), by GpuSplit::DelayTest, since the start: the
+// front's and the back's (Dispatch, Draw), so atomic. Only a spin adds to them.
+std::array<std::atomic<u64>, static_cast<size_t>(GpuSplit::DelayTest::Count)> g_delay_count{};
+std::array<std::atomic<u64>, static_cast<size_t>(GpuSplit::DelayTest::Count)> g_delay_ns{};
+
+// The switch of a delay test (its microseconds; 0 or less: off).
+int DelaySwitch(GpuSplit::DelayTest test) {
     namespace Debug = VideoCore::Nx2Debug;
-    const int macro_us =
-        Debug::SwitchValue(Debug::g_delay_macro_drain_us, "FRITCHII_DELAY_MACRO_DRAIN_US");
-    const int poll_us =
-        Debug::SwitchValue(Debug::g_delay_poll_drain_us, "FRITCHII_DELAY_POLL_DRAIN_US");
-    if (macro_us <= 0 && poll_us <= 0 &&
-        std::ranges::all_of(stats.delay_count, [](u64 count) { return count == 0; })) {
+    using Test = GpuSplit::DelayTest;
+    switch (test) {
+    case Test::MacroDrain:
+        return Debug::SwitchValue(Debug::g_delay_macro_drain_us, "FRITCHII_DELAY_MACRO_DRAIN_US");
+    case Test::PollDrain:
+        return Debug::SwitchValue(Debug::g_delay_poll_drain_us, "FRITCHII_DELAY_POLL_DRAIN_US");
+    case Test::E2c:
+        return Debug::SwitchValue(Debug::g_delay_e2c_us, "FRITCHII_DELAY_E2C_US");
+    case Test::Dispatch:
+        return Debug::SwitchValue(Debug::g_delay_dispatch_us, "FRITCHII_DELAY_DISPATCH_US");
+    case Test::Draw:
+        return Debug::SwitchValue(Debug::g_delay_draw_us, "FRITCHII_DELAY_DRAW_US");
+    default:
+        return 0;
+    }
+}
+
+// The delay tests' part of the line, the spins since the last line: only while a switch is set
+// or spins were counted.
+std::string DelayTestText(SiteWaitStats& stats, double window) {
+    namespace Debug = VideoCore::Nx2Debug;
+    using Test = GpuSplit::DelayTest;
+    constexpr size_t tests = static_cast<size_t>(Test::Count);
+    std::array<u64, tests> count{};
+    std::array<u64, tests> ns{};
+    bool any = false;
+    for (size_t i = 0; i < tests; ++i) {
+        const u64 total_count = g_delay_count[i].load(std::memory_order_relaxed);
+        const u64 total_ns = g_delay_ns[i].load(std::memory_order_relaxed);
+        count[i] = total_count - stats.delay_count[i];
+        ns[i] = total_ns - stats.delay_ns[i];
+        stats.delay_count[i] = total_count;
+        stats.delay_ns[i] = total_ns;
+        any |= count[i] != 0 || DelaySwitch(static_cast<Test>(i)) > 0;
+    }
+    if (!any) {
         return {};
     }
-    const auto test = [&](GpuSplit::DelayTest which) {
+    const auto test = [&](Test which) {
         const auto i = static_cast<size_t>(which);
-        return fmt::format("{:.0f}/s {:.1f} ms/s", static_cast<double>(stats.delay_count[i]) / window,
-                           static_cast<double>(stats.delay_ns[i]) / 1e6 / window);
+        return fmt::format("={} {:.0f}/s {:.1f} ms/s", (std::max)(DelaySwitch(which), 0),
+                           static_cast<double>(count[i]) / window,
+                           static_cast<double>(ns[i]) / 1e6 / window);
     };
     const bool before = Debug::SwitchValue(Debug::g_delay_before, "FRITCHII_DELAY_BEFORE") > 0;
     return fmt::format("; delay tests added ({} the drain, FRITCHII_DELAY_BEFORE={}): "
-                       "FRITCHII_DELAY_MACRO_DRAIN_US={} {}, FRITCHII_DELAY_POLL_DRAIN_US={} {}",
-                       before ? "before" : "after", before ? 1 : 0, macro_us,
-                       test(GpuSplit::DelayTest::MacroDrain), poll_us,
-                       test(GpuSplit::DelayTest::PollDrain));
+                       "FRITCHII_DELAY_MACRO_DRAIN_US{}, FRITCHII_DELAY_POLL_DRAIN_US{}, "
+                       "FRITCHII_DELAY_E2C_US{} (front), FRITCHII_DELAY_DISPATCH_US{} (back), "
+                       "FRITCHII_DELAY_DRAW_US{} (back)",
+                       before ? "before" : "after", before ? 1 : 0, test(Test::MacroDrain),
+                       test(Test::PollDrain), test(Test::E2c), test(Test::Dispatch),
+                       test(Test::Draw));
 }
 
 void NoteSiteWait(DrainSite site, u64 behind, u64 ns) {
@@ -140,8 +178,6 @@ void NoteSiteWait(DrainSite site, u64 behind, u64 ns) {
     stats.count = {};
     stats.ns = {};
     stats.behind = {};
-    stats.delay_count = {};
-    stats.delay_ns = {};
     stats.since = now;
 }
 
@@ -228,11 +264,7 @@ void GpuSplit::CheckOwner(const char* where) {
 
 u32 GpuSplit::DelayBeforeWait(DelayTest test) {
     namespace Debug = VideoCore::Nx2Debug;
-    const int us = test == DelayTest::MacroDrain
-                       ? Debug::SwitchValue(Debug::g_delay_macro_drain_us,
-                                            "FRITCHII_DELAY_MACRO_DRAIN_US")
-                       : Debug::SwitchValue(Debug::g_delay_poll_drain_us,
-                                            "FRITCHII_DELAY_POLL_DRAIN_US");
+    const int us = DelaySwitch(test);
     if (us <= 0) [[likely]] {
         return 0;
     }
@@ -247,6 +279,18 @@ u32 GpuSplit::DelayBeforeWait(DelayTest test) {
     return static_cast<u32>(us);
 }
 
+void GpuSplit::DelayWork(DelayTest test) {
+    const int us = DelaySwitch(test);
+    if (us <= 0) [[likely]] {
+        return;
+    }
+    // D and K are the back's: not GPUMem (the memory stage), not the single GPU thread.
+    if (test != DelayTest::E2c && !on_back_thread) {
+        return;
+    }
+    SpinDelay(test, static_cast<u32>(us));
+}
+
 void GpuSplit::SpinDelay(DelayTest test, u32 us) {
     const auto start = std::chrono::steady_clock::now();
     const auto until = start + std::chrono::microseconds{us};
@@ -256,9 +300,11 @@ void GpuSplit::SpinDelay(DelayTest test, u32 us) {
         now = std::chrono::steady_clock::now();
     }
     const auto i = static_cast<size_t>(test);
-    ++g_site_waits.delay_count[i];
-    g_site_waits.delay_ns[i] += static_cast<u64>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count());
+    g_delay_count[i].fetch_add(1, std::memory_order_relaxed);
+    g_delay_ns[i].fetch_add(
+        static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count()),
+        std::memory_order_relaxed);
 }
 
 GpuSplit GpuSplit::instance;

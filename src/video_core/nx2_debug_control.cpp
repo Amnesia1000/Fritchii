@@ -358,6 +358,15 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_DELAY_BEFORE") {
         return &g_delay_before;
     }
+    if (name == "FRITCHII_DELAY_E2C_US") {
+        return &g_delay_e2c_us;
+    }
+    if (name == "FRITCHII_DELAY_DISPATCH_US") {
+        return &g_delay_dispatch_us;
+    }
+    if (name == "FRITCHII_DELAY_DRAW_US") {
+        return &g_delay_draw_us;
+    }
     return nullptr;
 }
 
