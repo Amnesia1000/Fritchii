@@ -130,6 +130,10 @@ struct Impl {
     u64 ahead_checks_logged{};
 
     // fable_b 12.3's dry prices (E counts; the frame-end line reads them).
+    std::array<std::atomic<u64>, static_cast<size_t>(OpCount::Count)> op_count{};
+    std::atomic<u64> op_bytes{};
+    std::array<u64, static_cast<size_t>(OpCount::Count)> op_logged{};
+    u64 op_bytes_logged{};
     std::atomic<u64> fences_lent{};
     std::atomic<u64> fences_with_flush{};
     std::atomic<u64> gathers_lent{};
@@ -526,6 +530,25 @@ void LogQueryKinds() {
              Posted() ? 1 : 0, seconds, rate(0), rate(1), gathers,
              gathers > 0 ? rate(3) / gathers : 0.0);
     g.posting_logged = posting;
+    static constexpr std::array<const char*, static_cast<size_t>(OpCount::Count)> op_names{
+        "posted", "lent: a sync in a held fill", "lent: inside a draw fill", "lent: no room",
+        "lent: no packet ticks"};
+    std::string ops;
+    for (size_t i = 0; i < op_names.size(); ++i) {
+        const u64 count = g.op_count[i].load(std::memory_order_relaxed);
+        ops += fmt::format("{}{} {:.0f}/s", i == 0 ? "" : ", ", op_names[i],
+                           static_cast<double>(count - g.op_logged[i]) / seconds);
+        g.op_logged[i] = count;
+    }
+    const u64 op_bytes = g.op_bytes.load(std::memory_order_relaxed);
+    const double posted = static_cast<double>(g.op_count[0].load(std::memory_order_relaxed));
+    (void)posted;
+    LOG_INFO(HW_GPU,
+             "One follower op packets (fable_b 13.1; FRITCHII_ONEF_OP_INLINE={}) {:.0f} s: {}; "
+             "{:.1f} KiB/s of entries posted",
+             PostOpSite(15) ? 1 : 0, seconds, ops,
+             static_cast<double>(op_bytes - g.op_bytes_logged) / 1024.0 / seconds);
+    g.op_bytes_logged = op_bytes;
     LOG_INFO(HW_GPU,
              "One follower queries by kind (FRITCHII_ONEF_QUERY_OPS={}) {:.0f} s: {}; acquire "
              "latches this session by R {}, E {}, other threads {}",
@@ -1261,6 +1284,26 @@ bool InvalOnEngine() noexcept {
         });
     }
     return true;
+}
+
+bool PostOpSite(u8 site) noexcept {
+    if (!g.on || Step() != StepLevel::Unlend) {
+        return false;
+    }
+    using namespace VideoCore::Nx2Debug;
+    switch (site) {
+    case 15: // MemStage::Site::InlineUpload
+        return SwitchValue(g_onef_op_inline, "FRITCHII_ONEF_OP_INLINE") != 0;
+    default:
+        return false;
+    }
+}
+
+void CountOpPacket(OpCount kind, u64 bytes) noexcept {
+    g.op_count[static_cast<size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
+    if (bytes != 0) {
+        g.op_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
 }
 
 bool GatherOnEngine() noexcept {

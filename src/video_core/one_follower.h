@@ -179,6 +179,9 @@ enum class Check : u8 {
     /// stream (an invalidation E ran without R, on pages no image had yet): the section 5 hazard
     /// the page filter cannot see. The image uploads again at its next use.
     TextureReadAhead,
+    /// fable_b 13.2 R1: R at a BufferOp found another packet at ring B's head (its kind or
+    /// number differs from the name); the op's entries are not played.
+    RingPairing,
     Count,
 };
 
@@ -187,7 +190,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Check::Count)> chec
     "view pools",    "build pipeline",   "build image views", "build dynamic",
     "build descriptors", "build render targets", "stream write", "owner on E", "owner on R",
     "build draw params", "build condition", "render packet missing", "drop not plain",
-    "facts stale", "played lookup miss", "texture read ahead of R",
+    "facts stale", "played lookup miss", "texture read ahead of R", "ring B pairing",
 };
 
 // --- The packet (E to R) -----------------------------------------------------------------------------
@@ -539,6 +542,20 @@ void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size,
 /// writes (InvalidateGPUCache's gather) are taken and applied to the buffer cache on E; R's
 /// half (texture, shader caches) only where their filters are hit (then the gather is lent).
 [[nodiscard]] bool GatherOnEngine() noexcept;
+/// fable_b 13.1: whether E's pending buffer commands of memory seam site `site` (MemStage::Site)
+/// are posted as a ring B op packet (R plays them at a BufferOp) instead of lent. Group 1:
+/// FRITCHII_ONEF_OP_INLINE, the inline upload site. Step 4 only.
+[[nodiscard]] bool PostOpSite(u8 site) noexcept;
+/// The op packets' line (E counts): posted (with their entry bytes), or lent and why.
+enum class OpCount : u8 {
+    Posted,
+    LentHeldFill,   ///< a sync inside a held (draw) fill: R plays part of E's arena (R3)
+    LentRingFill,   ///< inside E's draw fill (FillRingDraw): its own ring B packet
+    LentNoRoom,     ///< ring B short of room
+    LentNoTicks,    ///< no packet ticks (R5 needs the op's number in their accounting)
+    Count,
+};
+void CountOpPacket(OpCount kind, u64 bytes = 0) noexcept;
 /// E: stamps [address, address + size)'s pages with the next packet's number (before the
 /// filters' second look: WrittenAheadOfRender's Dekker pair).
 void StampPageWrites(u64 address, u64 size) noexcept;

@@ -712,6 +712,7 @@ bool MemStage::Deferring() const noexcept {
 void MemStage::SetPending() {
     if (!pending) {
         pending = true;
+        pending_site = t_site;
         if (ticks) {
             // The caller's packet (step 7, stamps per thread; `open` otherwise, as before).
             pending_from = ticks->Mine();
@@ -726,6 +727,11 @@ void MemStage::PlayPending([[maybe_unused]] bool late) {
         return;
     }
     if (Link::InCall() || OneFollowerFill()) [[unlikely]] {
+        // One follower, fable_b 13.1: an op site posted (E recorded, R only plays): the pending
+        // entries go by value in a ring B op packet, E goes on.
+        if (!Link::InCall() && PostPendingOp()) {
+            return;
+        }
         // GPUMem (FRITCHII_MEMSTAGE_THREAD = 1): a play inside a fill (a sync's, a Ref's) records,
         // so the back runs it, as GPUMem. One follower: E's play goes to R the same way.
         OnBack([this, late] { PlayPending(late); });
@@ -1822,6 +1828,128 @@ void MemStage::PushRingDraw() {
     }
 }
 
+bool MemStage::PostPendingOp() {
+    namespace OneF = VideoCommon::OneFollower;
+    static_assert(static_cast<u8>(Site::InlineUpload) == 15, "PostOpSite's site numbers");
+    if (!OneF::PostOpSite(static_cast<u8>(pending_site))) {
+        return false;
+    }
+    // 13.2 R3: a sync inside a held fill plays part of the arena (its binds wait): R needs E's
+    // arena then, lent as before. E's own draw fill makes its own packet (FillRingDraw).
+    if (filling_held) {
+        OneF::CountOpPacket(OneF::OpCount::LentHeldFill);
+        return false;
+    }
+    if (ring_fill) {
+        OneF::CountOpPacket(OneF::OpCount::LentRingFill);
+        return false;
+    }
+    // 13.2 R5: the entries' buffers and staging live until R has played the packet: its number
+    // is the one their stamps carry (pending_from), and ring B's oldest packet counts in every
+    // close (UpdateUnplayed, RingOldestNumber).
+    if (!ticks) {
+        OneF::CountOpPacket(OneF::OpCount::LentNoTicks);
+        return false;
+    }
+    const u32 begin = play_cursor;
+    const u32 end = arena.Size();
+    const u32 entry_bytes = end > begin ? end - begin : 0;
+    const u64 bytes = Align8(static_cast<u32>(sizeof(RingHeader) + entry_bytes));
+    if (!RingRoom() || bytes > (u64{1} << 20)) {
+        OneF::CountOpPacket(OneF::OpCount::LentNoRoom);
+        return false;
+    }
+    const u64 number = pending_from;
+    if (entry_bytes != 0) {
+        u64 index = ring_b_write % RingBytes;
+        if (index + bytes > RingBytes) {
+            // Packets never wrap (as PushRingDraw).
+            if (RingBytes - index >= sizeof(RingHeader)) {
+                RingHeader pad{};
+                pad.bytes = static_cast<u32>(RingBytes - index);
+                pad.kind = 0;
+                std::memcpy(ring_b.get() + index, &pad, sizeof(pad));
+            }
+            ring_b_write += RingBytes - index;
+            index = 0;
+        }
+        RingHeader header{};
+        header.bytes = static_cast<u32>(bytes);
+        header.kind = RingKindOp;
+        header.part = static_cast<u16>(pending_site);
+        header.position = VideoCommon::GpuSplit::Get().BackEntryPosition();
+        header.number = number;
+        header.seq = 0; // an op takes no draw number (R takes it by `number`, R1)
+        header.entry_bytes = entry_bytes;
+        u8* const out = ring_b.get() + index;
+        std::memcpy(out, &header, sizeof(header));
+        std::memcpy(out + sizeof(header), arena.At(begin), entry_bytes);
+        // 13.2 R2: the packet is in ring B before the name that sends R to it.
+        ring_b_write += bytes;
+        ring_b_sent.store(ring_b_write, std::memory_order_release);
+        const u64 sent = ring_packets_sent.load(std::memory_order_relaxed) + 1;
+        ring_packets_sent.store(sent, std::memory_order_seq_cst);
+        struct Op {
+            MemStage* stage;
+            u64 number;
+        } const op{this, number};
+        OneF::PushOp(
+            OneF::LentOp::Copy,
+            [](void* raw) {
+                Op a;
+                std::memcpy(&a, raw, sizeof(a));
+                a.stage->PlayRingOp(a.number);
+            },
+            &op, sizeof(op));
+    }
+    OneF::CountOpPacket(OneF::OpCount::Posted, entry_bytes);
+    // As a play: the entries are R's now.
+    play_cursor = end;
+    pending = false;
+    last_entry = ~0U;
+    SeamHook::g_watch.fetch_sub(1, std::memory_order_relaxed);
+    UpdateUnplayed();
+    return true;
+}
+
+void MemStage::PlayRingOp(u64 number) {
+    // 13.2 R4: a held draw packet's rest first (E's calls' order is the record order).
+    PlayRest();
+    const RingHeader* const header = PeekRing();
+    if (header == nullptr || header->kind != RingKindOp || header->number != number) [[unlikely]] {
+        thread_local std::string note;
+        note = fmt::format("BufferOp {}: ring B's head is {}", number,
+                           header == nullptr ? std::string{"empty"}
+                                             : fmt::format("kind {} number {}", header->kind,
+                                                           header->number));
+        VideoCommon::OneFollower::Note(VideoCommon::OneFollower::Check::RingPairing,
+                                       note.c_str());
+        return;
+    }
+    // 13.3: R's own player state, the packet's stamp (its staging and buffers' number); no fill
+    // state of E's, no lock handed over: no entry's Exec enters the buffer cache ("owner on R"
+    // counts one that does).
+    SeamTicks::SetStamp(number, false);
+    {
+        PlayDepth depth;
+        const u8* const entries = reinterpret_cast<const u8*>(header) + sizeof(RingHeader);
+        for (u32 at = 0; at < header->entry_bytes;) {
+            const Entry& entry = *reinterpret_cast<const Entry*>(entries + at);
+            at += entry.bytes;
+            if ((entry.flags & Played) == 0) [[likely]] {
+                player.Exec(entry);
+            }
+        }
+    }
+    ring_b_read += header->bytes;
+    ring_b_freed.store(ring_b_read, std::memory_order_seq_cst);
+    ring_packets_done.fetch_add(1, std::memory_order_seq_cst);
+    Link::Get().NoteRingFreed();
+    if (ticks) {
+        UpdateUnplayed();
+    }
+}
+
 const MemStage::RingHeader* MemStage::PeekRing() {
     for (;;) {
         const u64 sent = ring_b_sent.load(std::memory_order_acquire);
@@ -1952,6 +2080,12 @@ const MemStage::DrawPacket* MemStage::TakeRingDraw(u64 seq, u64 back_position, u
                                                    bool verify) {
     for (;;) {
         const RingHeader* const header = PeekRing();
+        if (header != nullptr && header->kind == RingKindOp) [[unlikely]] {
+            // 13.2 R1: an op packet is taken by its BufferOp only.
+            VideoCommon::OneFollower::Note(VideoCommon::OneFollower::Check::RingPairing,
+                                           "a draw found an op packet at ring B's head");
+            return nullptr;
+        }
         if (header == nullptr || header->seq > seq) {
             return nullptr;
         }
