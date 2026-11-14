@@ -189,6 +189,8 @@ u64 EngineWait(Ready&& ready) {
             continue;
         }
         g.e_waiting.store(true, std::memory_order_seq_cst);
+        // The flag before `ready`'s loads (they are acquire loads): WakeEngine's fence pairs.
+        std::atomic_thread_fence(std::memory_order_seq_cst);
         const u32 seen = g.e_wake.load(std::memory_order_seq_cst);
         if (!ready()) {
             g.e_wake.wait(seen, std::memory_order_seq_cst);
@@ -198,7 +200,14 @@ u64 EngineWait(Ready&& ready) {
     return timing ? Stats::Now() - begin : 1;
 }
 
+// The wake handshakes are Dekker's: the sleeper stores its flag and then reads the condition; the
+// waker stores the condition and then reads the flag. The waker's condition stores (`sent`,
+// `freed`) are release stores, which x86 may hold in its store buffer past the flag's load
+// (store-load reordering): both sides then read the other's old value, the sleeper sleeps, the
+// waker sees no sleeper, and E (parked in a lend) and R (asleep with the lend in the ring) wait
+// for each other for good. The full fence before the flag's load closes it.
 void WakeRender() {
+    std::atomic_thread_fence(std::memory_order_seq_cst);
     if (g.r_sleeping.load(std::memory_order_seq_cst)) {
         g.r_wake.fetch_add(1, std::memory_order_seq_cst);
         g.r_wake.notify_one();
@@ -206,6 +215,7 @@ void WakeRender() {
 }
 
 void WakeEngine() {
+    std::atomic_thread_fence(std::memory_order_seq_cst);
     if (g.e_waiting.load(std::memory_order_seq_cst)) {
         g.e_wake.fetch_add(1, std::memory_order_seq_cst);
         g.e_wake.notify_one();
