@@ -159,6 +159,7 @@ add_library(video_core STATIC
     nx2_download_trace.h
     nx2_async_readback.h
     one_follower.h
+    one_follower_draw.cpp
     pending_maps.h
     present.h
     pte_kind.h
@@ -264,6 +265,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_mem_stage.h
     renderer_vulkan/vk_mem_stage_hook.h
     renderer_vulkan/vk_mem_stage_shadow.h
+    renderer_vulkan/vk_one_follower_draw.cpp
+    renderer_vulkan/vk_one_follower_draw.h
     renderer_vulkan/vk_pipeline_cache.cpp
     renderer_vulkan/vk_pipeline_cache.h
     renderer_vulkan/vk_pipeline_translate_queue.cpp

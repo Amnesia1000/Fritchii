@@ -71,6 +71,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 #include "video_core/renderer_vulkan/vk_mem_stage_shadow.h"
+#include "video_core/renderer_vulkan/vk_one_follower_draw.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/nx2_indirect_grid.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -676,9 +677,13 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
             },
     };
     VideoCommon::Runahead::SetHooks(&runahead_hooks);
+    // One follower, part c: R's draw player (idle below step 3).
+    onef_draw = std::make_unique<OneFollowerDraw>(*this);
+    VideoCommon::OneFollower::SetDrawPlayer(onef_draw.get());
 }
 
 RasterizerVulkan::~RasterizerVulkan() {
+    VideoCommon::OneFollower::SetDrawPlayer(nullptr);
     VideoCommon::Runahead::SetHooks(nullptr);
     VideoCommon::GpuSplit::Get().SetIdleHook(nullptr, nullptr);
     VideoCommon::GpuSplit::Get().SetFenceQuietCheck(nullptr, nullptr);
@@ -1984,10 +1989,19 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         ++trace_draws;
     }
 
+    // One follower step 4: R plays an unlent draw (vk_one_follower_draw.cpp). `maxwell3d` is R's
+    // view; E ran TickWork and the stream's invalidations around its push, and E filled the ring
+    // B packet taken below.
+    const VideoCommon::OneFollower::PacketHeader* const onef_play =
+        VideoCommon::OneFollower::On() && VideoCommon::OneFollower::OnRenderThread()
+            ? onef_draw->Playing()
+            : nullptr;
     SCOPE_EXIT {
-        const VideoCommon::Nx2Profile::FineScope tick_scope{
-            VideoCommon::Nx2Profile::Zone::TickWork};
-        gpu.TickWork();
+        if (onef_play == nullptr) {
+            const VideoCommon::Nx2Profile::FineScope tick_scope{
+                VideoCommon::Nx2Profile::Zone::TickWork};
+            gpu.TickWork();
+        }
     };
     bool submitted = false;
     SCOPE_EXIT {
@@ -2014,18 +2028,32 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     {
         Profile::Scope scope{Profile::Zone::FlushWork};
         FlushWork();
-        gpu_memory->FlushCaching();
+        if (onef_play == nullptr) {
+            gpu_memory->FlushCaching();
+        }
     }
     // FRITCHII_MEMSTAGE_THREAD = 2: a draw the stage filled takes its packet from ring B here, and
     // every return plays it (PlayRest, spec 4.2): the cache believes its uploads are recorded. In
     // a level run only the draws the stage filled before it found the entry hard have one; the
     // others the back fills itself, lent. A served draw without one is counted (must be 0) and
     // filled here (level mode: the stage is parked, so this is safe, only not where it belongs).
+    // One follower step 4: R takes the packet E filled for this draw and plays it as a served
+    // draw (Configure binds nothing in the buffer cache, only the texture cache's lock is taken).
     const bool ring_on = Link::RingActive();
-    const bool served = Link::BackServed();
+    const bool served = Link::BackServed() || onef_play != nullptr;
     const MemStage::DrawPacket* ring_packet = nullptr;
     std::optional<MemStage::RestAtEnd> ring_rest;
-    if (ring_on && (served || Link::BackInRun())) [[unlikely]] {
+    if (onef_play != nullptr) [[unlikely]] {
+        const Profile::FineScope take_scope{Profile::Zone::RingTake};
+        ring_packet = mem_stage.TakeRingDraw(onef_play->draw_seq, onef_play->position, 0, false);
+        ring_rest.emplace(mem_stage);
+        if (ring_packet == nullptr) {
+            // R cannot fill (the buffer cache is E's): the draw is not drawn (must be 0).
+            VideoCommon::OneFollower::Note(VideoCommon::OneFollower::Check::RenderPacketMissing,
+                                           "PrepareDraw");
+            return;
+        }
+    } else if (ring_on && (served || Link::BackInRun())) [[unlikely]] {
         const Profile::FineScope take_scope{Profile::Zone::RingTake};
         const bool verify = Link::RingVerify();
         ring_packet = mem_stage.TakeRingDraw(
@@ -2046,13 +2074,15 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         frame_dump.DrainIfFull();
     }
     // EDEN_NX2_FASTDRAW_COUNT: counting only, at the original TakeReusableDraw.
-    const bool fast_draw_counting = VideoCommon::Nx2FastDrawCount::g_count;
+    // Not on R's played draws (they take the buffer cache's lock; E lends draws while either is
+    // on, this covers a switch turned on between E's decision and R's play).
+    const bool fast_draw_counting = VideoCommon::Nx2FastDrawCount::g_count && onef_play == nullptr;
     // EXP118 (fritchii_delta_path.h; live, but nothing unless it was on at boot, which raises
     // its breaks): a draw that follows its pipeline's last draw with only light state changed,
     // for a pipeline that samples nothing, keeps the pipeline (no lookup) and configures it
     // without the texture steps. 2 = decide only, then compare with the full lookup.
     const int delta_mode =
-        VideoCommon::Nx2FastDrawCount::g_on
+        VideoCommon::Nx2FastDrawCount::g_on && onef_play == nullptr
             ? VideoCore::Nx2Debug::Experiment(VideoCommon::FritchiiDeltaPath::Switch)
             : 0;
     const bool draw_tracking = fast_draw_counting || delta_mode != 0;
@@ -2369,7 +2399,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     // update engine as channel may be different.
     pipeline->SetEngine(maxwell3d, gpu_memory);
     // THREAD = 2: the facts table (join 1) learns this pipeline's facts under the stage's key.
-    if (ring_on) [[unlikely]] {
+    // One follower step 4: E looks them up for its fills (lent and played draws publish).
+    if (ring_on || (VideoCommon::OneFollower::On() &&
+                    VideoCommon::OneFollower::Step() ==
+                        VideoCommon::OneFollower::StepLevel::Unlend)) [[unlikely]] {
         const Profile::FineScope facts_scope{Profile::Zone::RingFacts};
         VideoCommon::MemStageShadow::ProgramId program_id;
         VideoCommon::MemStageShadow::BackProgramId(*maxwell3d, program_id);
@@ -2415,9 +2448,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         // and cleared by nothing, sent it at about 20,000 draws a second with nothing changed.
         // Cleared here as that update would have; Dirty::VertexInput still sends every change of
         // the formats, the divisors and the repack layout. A lend sets the back's cache flags
-        // from GPUMem's copy again.
-        if (VideoCommon::MemoryStageLink::BackServed() &&
-            VideoCommon::MemoryStageLink::Ahead() != 0) {
+        // from GPUMem's copy again. One follower: E's fill ran that update on E's flags, so R
+        // clears its view's copy here for the same reason.
+        if (onef_play != nullptr || (VideoCommon::MemoryStageLink::BackServed() &&
+                                     VideoCommon::MemoryStageLink::Ahead() != 0)) {
             maxwell3d->dirty.flags[VideoCommon::Dirty::VertexBuffers] = false;
         }
     } else {
@@ -2759,6 +2793,12 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
     VideoCommon::GpuSplit::DelayWorkIf(VideoCore::Nx2Debug::g_delay_draw_us,
                                        VideoCommon::GpuSplit::DelayTest::Draw);
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
+    // One follower from step 3 (vk_one_follower_draw.cpp): on E the draw is lent or pushed to R
+    // here, before anything below reads `maxwell3d` (it names R's view while R plays a draw).
+    if (VideoCommon::OneFollower::On() && onef_draw->RouteDraw(is_indexed, instance_count))
+        [[unlikely]] {
+        return;
+    }
     const VideoCommon::FritchiiDrawKinds::Scope draw_kinds_scope{maxwell3d->regs};
     // A vertex count GPU work wrote (nx2_indirect_grid.h): drawn with that count, read on the GPU.
     // Draws that need the count here (the indirect reset, quads, a first vertex) read the words,

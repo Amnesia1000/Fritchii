@@ -6,6 +6,7 @@
 #pragma once
 
 #include <array>
+#include <memory>
 #include <optional>
 #include <string_view>
 
@@ -61,6 +62,7 @@ namespace Vulkan {
 
 struct FramebufferTextureInfo;
 
+class OneFollowerDraw;
 class StateTracker;
 
 class AccelerateDMA : public Tegra::Engines::AccelerateDMAInterface {
@@ -217,6 +219,12 @@ public:
                                                             u32 pixel_stride);
 
 private:
+    /// One follower, part c (vk_one_follower_draw.cpp): R's draws and the verify compares reach
+    /// the caches, the ring and the engine pointers.
+    friend class OneFollowerDraw;
+    /// Created at construction; idle unless FRITCHII_ONEF steps 3 and 4 are on.
+    std::unique_ptr<OneFollowerDraw> onef_draw;
+
     /// False when no page of the range was ever written by the GPU through the buffer cache.
     bool MayBeGpuModified(DAddr addr, u64 size);
 
