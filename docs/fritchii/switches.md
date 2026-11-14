@@ -814,21 +814,27 @@ at a time, which the drain hid). Unreadable words keep the drain path.
 Lines at 5: the "Fence writer resumes" line adds lagged checks/s, how many waited and their
 time (expect near 0), and how many found the acquire met; the "lagged check" route in the
 histogram and per channel; "pending over 100 ms" (every mode, counted once per acquire, fence
-path and others; must stay 0). Judge 4 against 5 (GPU_WAKE=1 on both): poll drains of these
+path and others; not a hard zero: acquires the guest CPU releases can wait that long during
+loads and pauses, so compare with EXP12=2 in the same scene). Judge 4 against 5 (GPU_WAKE=1 on
+both): poll drains of these
 acquires pending under 2 ms to near 0, the split drain zone down, latch and lagged resumes
 under 1 ms up, channel 2's time to resume down.
 
 6 = 5, but the acquire waits when something queued can write its word itself
 (fable_fence_writers_2 section 4): the target is the newest of the QMD prediction's record for
-the word that has not landed, the write stamp over the word (GpuSplit::WriteStamp, which
-counts unbounded writers too) and a queued puller release to it, taken before the fence
-release is queued. Past the back's position: wait for it (drain site "fence word writers"),
-then the latch and the word, as 2. Otherwise suspend at once, as 4. While the write stamps are
-off (before the front's QMD copy started them) it waits for 2's target. Exact as 4: it only
-chooses when to look. The polls check lagged as 5. The "Fence writer resumes" line adds word
-writer waits/s, which term set their target (unlanded prediction record, write stamp, queued
-release), how many had the stamps off, and how many acquires had none queued. Judge 5 against
-6 (GPU_WAKE=1).
+the word that has not landed, the block and page stamps over the word alone
+(GpuSplit::BytesStamp: WriteStamp without its floors, i.e. writers of anything, 3D method
+writes, unknown writes, functions, the overflow) and a queued puller release to it, taken
+before the fence release is queued. Past the back's position: wait for it (drain site "fence
+word writers"), then the latch and the word, as 2. Otherwise suspend at once, as 4. While the
+write stamps are off (before the front's QMD copy started them) it waits for 2's target. Exact
+as 4: it only chooses when to look, and a wait skipped is never a wrong answer. The polls check
+lagged as 5. With EDEN_NX2_GPU_WAKE=0, 6 keeps its wait at the acquire and only the polls fall
+back to 4's drain. The "Fence writer resumes" line adds word writer waits/s, which term set
+their target (unlanded prediction record, block/page stamp, queued release), how many had the
+stamps off, how many acquires had none queued, and (counting only) the term the full
+WriteStamp would have waited for, by StampTerm, which tells real writers (block, page stamp)
+from floors. Judge 5 against 6 (GPU_WAKE=1).
 
 ### EXP17
 
