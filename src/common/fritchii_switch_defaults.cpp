@@ -216,6 +216,13 @@ void LoadExperiments() {
         // latch and the resume path decide, as after mode 2's wait). With EDEN_NX2_GPU_WAKE=1
         // (built in with it): 59.3 -> 59.8 fps, 0.1% low 31.7 -> 37.0, the owner rarely saw <50.
         g_experiments[12].store(4, std::memory_order_relaxed);
+        // EXP52 = 1 + EXP55 = 1 (2026-11-14, autopilot; owner: "v6 gets every exact win"): the
+        // pipeline key is patched instead of fully refreshed when only the programs or only the
+        // vertex input moved. EXP52=2/EXP55=2 verify at the market: 594,768 keys compared in 10 s,
+        // 0 differ. Toggle 57.6 -> 58.2 fps, 1% low 38.8 -> 40.0; part of the combined keepers
+        // toggle (62.7 -> 64.1 fps, 1% 44.4 -> 45.5).
+        g_experiments[52].store(1, std::memory_order_relaxed);
+        g_experiments[55].store(1, std::memory_order_relaxed);
         // EXP49 = 1 (2026-11-10, owner's call for v5.7): the async read-back. Stalchild fight,
         // flipped every 30 s while the owner fought: 51.9 -> 56.9 fps, the back's read flushes
         // 35 -> 6 ms/s, guest lock waits halved. No beams in that session or two later ones

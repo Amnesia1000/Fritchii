@@ -202,6 +202,14 @@ constexpr std::pair<const char*, const char*> BuiltinSwitches[] = {
     // instead of 1 ms sleeps. Built in with EXP12 = 4 (2026-11-14, owner's call): without it a
     // latched resume could sit out a sleep and mode 4 lost 0.5 fps at the market.
     {"EDEN_NX2_GPU_WAKE", "1"},
+    // 2026-11-14 (autopilot; owner: v6 gets every exact win): the keepers, each exact by its
+    // verify mode, toggled together at the market in one session: 62.7 -> 64.1 fps, 1% low 44.4 ->
+    // 45.5, 0.1% low 37.7 -> 40.4, the back 7.27 -> 6.99 us a draw (V6_PLAN.md, V6_GOALS.md).
+    // Each stays live: =0 in nx2_switches.txt turns it off.
+    {"FRITCHII_GATHER_ONE_LOCK", "1"},    {"FRITCHII_GATHER_EMPTY_TEST", "1"},
+    {"FRITCHII_FENCE_COMMIT_FAST", "1"},  {"FRITCHII_FRONT_RAN_READS", "1"},
+    {"FRITCHII_VERTEX_INPUT_COMPACT", "1"}, {"FRITCHII_BIND_ADDR_MEMO", "1"},
+    {"FRITCHII_WORKER_SPIN", "80"},       {"FRITCHII_CB_WORDS_BLOCK", "1"},
 };
 
 static void LoadNx2Switches(const char* argv0) {

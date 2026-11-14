@@ -3267,3 +3267,11 @@ programs together with other state counts under that state). Off by default, not
 prove 2 shows 0 differ first (under EXP19=2 without EXP50, blend writes without
 Dirty::Blending already leave the clean lookup's attachments stale, and verify reports that
 too), then compare the lookup zone with profile_toggle (EXP52 0 vs 1).
+
+## Defaults changed on 2026-11-14 (autopilot)
+
+On by default since build after d5d510bb9c (src/yuzu/main.cpp BuiltinSwitches and
+src/common/fritchii_switch_defaults.cpp); each section below still says how it works and that =0 turns it off:
+FRITCHII_GATHER_ONE_LOCK=1, FRITCHII_GATHER_EMPTY_TEST=1, FRITCHII_FENCE_COMMIT_FAST=1, FRITCHII_FRONT_RAN_READS=1,
+FRITCHII_VERTEX_INPUT_COMPACT=1, FRITCHII_BIND_ADDR_MEMO=1, FRITCHII_WORKER_SPIN=80, FRITCHII_CB_WORDS_BLOCK=1,
+EDEN_NX2_EXP52=1, EDEN_NX2_EXP55=1. Combined toggle at the market (one session): 62.7 -> 64.1 fps, 1% low 44.4 -> 45.5.
