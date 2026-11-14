@@ -130,6 +130,18 @@ frame.
   FRITCHII_DELAY_RUN_US is set (memstage_shadow.cpp's count_launch).
 - Fable's reading: 5 us at kind 0 adds about 47 ms/s (9,471 runs a second); a frame 0.85 ms
   longer means parked time is fully on the path. 20 us at kind 1 adds about 21 ms/s.
+
+### FRITCHII_DELAY_HANDOVER_US, FRITCHII_DELAY_HANDOVER_KIND
+
+The hand-over delay test (live, default 0 = nothing changes), with FRITCHII_MEMSTAGE_THREAD=2:
+the thread that was handed work busy-spins n microseconds before it starts on it, so each
+hand-over arrives n us late. It checks Fable's "stage on reaches 76 if the hand-over losses
+go": if fps drops by what n x the hand-over rate predicts, the hand-overs are fully on the
+frame's path and cutting them pays one for one.
+- KIND 1: GPUMem after a wait for the front that waited (the front -> GPUMem hand-over).
+- KIND 2: the back after its wait for the stage (GPUMem -> back, BackWaitForStage).
+- KIND 3: GPUMem after its other waits that waited (the back, the window, ring B room).
+- Counted in the "Memory stage passes" line's delay test field (rate and ms/s).
 - The spin is outside the run's own time ("runs ... us each on GPUMem"); counted at the end of
   the "Memory stage passes" line ("delay test FRITCHII_DELAY_RUN_US=n kind k: x/s y ms/s").
 - Off (0): one relaxed load and a branch after each run.
