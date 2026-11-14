@@ -557,6 +557,39 @@ as before (the page is marked) and counted as "missed", which must stay 0, and p
 skipped bank that the page loop finds a reason for are counted as "disagreed" (must stay 0).
 Logged every 5 s ("Native bank slot skip"). Costs what the skip saves. 1 = on.
 
+### FRITCHII_BANK_CENSUS
+
+FRITCHII_BANK_CENSUS (live, default 0; counters only, nothing the check does changes;
+fable_perdraw_b cut 5 step 1). The tracked native bank check (EXP9) compares a page on every bind
+for HotFrames frames after any change ("hot"), because some writer of the game's banks sets no
+flag: 637,555 hot compares a 5 s window found 328 changes (21.7 ms/s of compares on the back).
+The census says, for each change the check finds, what touched the page since its last compare.
+- 1: changes by the reason that found them, and for the unflagged ones (hot, frame check, verify
+  only, EDEN_NX2_BANK_SKIP_VERIFY's missed) the evidence: binds since a collected CPU write or
+  buffer cache write flag was last taken on the page (a trapping writer marks before it stores:
+  its bytes can land after the compare that took the flag and after the one recheck), an upload
+  (UploadMemory) that read the page from guest memory after the last compare (a guest store
+  between that compare and the upload: the host buffer may hold it already), a GPU write mark
+  ever on the page, and "unseen" when none of these. Per constant buffer index (c3+ are the
+  game's).
+- 2: 1, and the write ring turned on (all emulator writes to game memory, with their site): the
+  newest ring entry over the page since its last compare, by site and write function. The ring
+  costs every emulator write a few stores: fps are not comparable. Not together with
+  FRITCHII_MEMSTAGE_READ_LOG (the ring is left on until the census goes below 2 only when the
+  census turned it on).
+- When no change is found it adds one flag take and two stores per compared page (one more
+  shared load at 2), and one load per upload. At 0, one load per bank bind.
+- "Native bank census (FRITCHII_BANK_CENSUS=n, 10 s): changes: collected C, buffer cache W,
+  recheck R, CPU-modified M, hot H, frame check F, verify only V (slot skip missed S); unflagged
+  U: flag taken <=4 / <=32 / <=256 / more / never binds before a / b / c / d / e (late flag L, of
+  them buffer cache B), uploaded since the last compare P (that compare CPU-modified Q), ever
+  GPU-written G, ring writer X (ring wrapped Y), unseen N (first compare this frame N1); slots:
+  cK n ... | site / via: n ..." (HW_GPU, Info). Counts start at the census' first bind; pages
+  first seen before it count their flags from their next compare.
+- What it must show before a slot can drop the hot rule (FRITCHII_BANK_FLAGGED, not written):
+  "unseen" 0 and no ring writer that sets no flag. Late flags are closed by a flag set after the
+  store lands; uploaded-since changes by marking the page for a compare at its next bind.
+
 ### EDEN_NX2_TEX_BANK_GEN
 
 EDEN_NX2_TEX_BANK_GEN (live, default 0; the recomp's per-stage
