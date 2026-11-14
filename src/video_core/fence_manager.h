@@ -761,17 +761,36 @@ private:
     /// lock is taken once, alone, and the fencing thread later takes only the lock of the cache
     /// with work, instead of holding both while it copies (the GPU thread's draws and uploads
     /// waited for it).
+    //
+    // FRITCHII_FENCE_COMMIT_FAST (live, default 0; fable_front_drains 8.3 row 3): a half whose
+    // cache's note says it has nothing is skipped, lock and seam bracket included. Exact: the
+    // note is raised in the locked section that queues the work (TextureCache: a download or
+    // its buffer; BufferCache: QueueFenceDownload's adds) and set from the containers only
+    // under the lock, so a lowered note means the containers HasAsyncFlushWork and
+    // HasUncommittedFlushes read were empty, and the half would only have taken its lock and
+    // opened an empty bracket. Work queued on this thread is seen in program order; work queued
+    // on a thread with no chain of synchronization to this fence is ordered after it, as when
+    // that thread takes the lock second (coherence: a raise that happens before this load is
+    // seen). The notes are kept up whatever the switch says.
     CacheFlushes CommitCacheFlushes() {
+        const int fast = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_fence_commit_fast,
+                                                          "FRITCHII_FENCE_COMMIT_FAST");
+        const bool texture_idle = fast != 0 && !texture_cache.MayHaveAsyncFlushWork();
+        const bool buffer_idle = fast != 0 && !buffer_cache.MayHaveUncommittedFlushes();
+        if (fast != 0) [[unlikely]] {
+            NoteFenceCommitFast(fast, texture_idle, buffer_idle);
+        }
         CacheFlushes flushes{};
-        {
+        if (!texture_idle) {
             std::scoped_lock lock{texture_cache.mutex};
             flushes.should_flush = texture_cache.HasUncommittedFlushes();
             if (texture_cache.HasAsyncFlushWork()) {
                 texture_cache.CommitAsyncFlushes();
                 flushes.committed |= TextureFlushes;
             }
+            texture_cache.RefreshAsyncFlushWorkNote();
         }
-        {
+        if (!buffer_idle) {
             std::scoped_lock lock{buffer_cache.mutex};
             [[maybe_unused]] auto seam = [&] {
                 if constexpr (requires { buffer_cache.runtime.FenceCommitBracket(); }) {
@@ -785,8 +804,53 @@ private:
                 flushes.should_flush = true;
                 flushes.committed |= BufferFlushes;
             }
+            buffer_cache.RefreshUncommittedFlushesNote();
         }
         return flushes;
+    }
+
+    /// FRITCHII_FENCE_COMMIT_FAST's counts, one line every 10 s (the clock is read every 1,024th
+    /// commit).
+    static void NoteFenceCommitFast(int mode, bool texture_idle, bool buffer_idle) {
+        static std::atomic<u64> commits{};
+        static std::atomic<u64> texture_skips{};
+        static std::atomic<u64> buffer_skips{};
+        static std::atomic<s64> since{};
+        if (texture_idle) {
+            texture_skips.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (buffer_idle) {
+            buffer_skips.fetch_add(1, std::memory_order_relaxed);
+        }
+        if ((commits.fetch_add(1, std::memory_order_relaxed) & 1023) != 0) {
+            return;
+        }
+        const s64 now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+        s64 last = since.load(std::memory_order_relaxed);
+        if (last == 0) {
+            since.compare_exchange_strong(last, now, std::memory_order_relaxed);
+            commits.store(0, std::memory_order_relaxed);
+            texture_skips.store(0, std::memory_order_relaxed);
+            buffer_skips.store(0, std::memory_order_relaxed);
+            return;
+        }
+        if (now - last < 10'000 ||
+            !since.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+            return;
+        }
+        const double window = static_cast<double>(now - last) / 1000.0;
+        const auto rate = [window](std::atomic<u64>& count) {
+            return static_cast<double>(count.exchange(0, std::memory_order_relaxed)) / window;
+        };
+        const double commit_rate = rate(commits);
+        const double texture_rate = rate(texture_skips);
+        const double buffer_rate = rate(buffer_skips);
+        LOG_INFO(HW_GPU,
+                 "Fence commit fast (FRITCHII_FENCE_COMMIT_FAST={}) {:.0f} s: commits {:.0f}/s, "
+                 "texture half skipped {:.0f}/s, buffer half skipped {:.0f}/s",
+                 mode, window, commit_rate, texture_rate, buffer_rate);
     }
 
     /// Whether a fence with no downloads would do nothing, so need not be made: with fast GPU

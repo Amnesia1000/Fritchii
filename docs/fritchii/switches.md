@@ -326,6 +326,30 @@ was 4.4 ms/s of the back.
   M/s (P%)" (HW_GPU, Info).
 - Expected: most of the 4.4 ms/s.
 
+### FRITCHII_FENCE_COMMIT_FAST
+
+FRITCHII_FENCE_COMMIT_FAST (live, default 0 = exactly as before; fable_front_drains 8.3 row 3).
+Every fence's FenceManager::CommitCacheFlushes takes the texture cache's lock and then the buffer
+cache's (with a memory seam bracket) to find out whether a download waits to be committed:
+10,606 fences a second in the market's compute stretch found none (5.3 ms/s).
+- 1: each half is skipped, lock and bracket included, when its cache's note says it has nothing:
+  TextureCache::MayHaveAsyncFlushWork (a download or download buffer queued since the last commit)
+  and BufferCache::MayHaveUncommittedFlushes (a fence download range queued, QueueFenceDownload).
+  Both notes are kept always (also at 0): raised where the work is queued, under the cache's
+  lock, and set again from the containers under the lock after each commit.
+- Why it is exact: a note is raised in the same locked section that adds to the containers its
+  cache's test reads (texture: uncommitted_downloads, uncommitted_async_buffers; buffer:
+  uncommitted_gpu_modified_ranges, which AccumulateFlushes moves to committed_gpu_modified_ranges)
+  and lowered only under the lock from the containers themselves, so "note down" means the
+  containers were empty at that point. With the containers empty the half does nothing but take
+  the lock and open an empty bracket (should_flush false, nothing committed). Work queued on the
+  fencing thread is seen in program order; work queued on another thread that does not happen
+  before the fence is ordered after it, as when that thread takes the lock second. The skipped
+  bracket held no entries; pending entries are played before anything else is recorded either way.
+- "Fence commit fast (FRITCHII_FENCE_COMMIT_FAST=n) 10 s: commits N/s, texture half skipped T/s,
+  buffer half skipped B/s" (HW_GPU, Info).
+- Expected: about 3 to 4 ms/s (both lock takes at most fences in the compute stretch).
+
 ### EDEN_NX2_ACCURATE_PARTS
 
 EDEN_NX2_ACCURATE_PARTS (bit mask, 0 = none, read once at boot): parts of GPU accuracy High in
