@@ -2143,6 +2143,29 @@ void MemStage::PublishFacts(const ProgramId& id, const void* source, const DrawF
     facts_generation.fetch_add(1, std::memory_order_release);
 }
 
+bool MemStage::LookupFactsLocked(const ProgramId& id, StagedFacts& out) const {
+    const u64 key = CodeKey(id);
+    const u64 epoch =
+        VideoCommon::MemStageShadow::g_program_code_epoch.load(std::memory_order_acquire);
+    constexpr size_t Mask = FactsSlots - 1;
+    std::scoped_lock lock{facts_mutex};
+    for (size_t probe = 0, index = FactsHash(key) & Mask; probe < 16;
+         ++probe, index = (index + 1) & Mask) {
+        const FactsSlot& slot = facts_table[index];
+        if (slot.key == key && slot.space == id.space && slot.code == id.code) {
+            if (slot.epoch < epoch) {
+                return false;
+            }
+            out = slot.facts;
+            return true;
+        }
+        if (slot.key == 0) {
+            return false;
+        }
+    }
+    return false;
+}
+
 bool MemStage::LookupFacts(const ProgramId& id, StagedFacts& out) const {
     const u64 key = CodeKey(id);
     // An entry published before the latest program code write may describe the old code at these

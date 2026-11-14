@@ -62,6 +62,9 @@ public:
     void OnPacket(const PacketHeader& header, const u8* spans) override;
     void PlayDraw(const PacketHeader& header) override;
     void Condition(bool engine_execute_on) override;
+    void BeforeLent() override;
+    void AfterLent() override;
+    void ViewOff() override;
 
     /// R, at GraphicsPipeline::ConfigureDraw's descriptor count mismatch on an unlent draw: logs
     /// once, at Critical, what E's fill used for the packet (program words and facts) against R's
@@ -137,6 +140,17 @@ private:
     const Maxwell3D* view_source{}; ///< the engine the view follows (its channel)
     const PacketHeader* playing{};
     bool nested{};                  ///< inside RunLent's own Draw call
+    /// fable_b 10.2 rule 2: the R-owned objects (the rasterizer's engine, the pipeline, texture
+    /// and query caches' engines, the state tracker's flags) name the view while this is set,
+    /// which is always on R outside lent calls once the view follows the bound channel.
+    bool on_view{};
+    Maxwell3D* saved_rasterizer{};
+    Maxwell3D* saved_pipeline{};
+    Maxwell3D* saved_texture{};
+    Maxwell3D* saved_query{};
+    Maxwell3D::DirtyState::Flags* saved_tracker{};
+    void EnterView();
+    void LeaveView();
     bool render_mode_on{true};      ///< R's 0xe2c mode
     /// Lent packets since the view's flags last took the engine's (RunLent, a seed): the step-3
     /// flags compare holds only at 1 (the draw's own packet).

@@ -351,10 +351,15 @@ Stats::RenderTime Play(const PacketHeader& header, const u8* spans) {
     DrawPlayer* const player = Step() >= StepLevel::Build ? GetDrawPlayer() : nullptr;
     if (player != nullptr) {
         player->OnPacket(header, spans);
+    } else if (DrawPlayer* const idle = GetDrawPlayer()) {
+        idle->ViewOff(); // below step 3 the view is not kept: R reads E's engine (lent only)
     }
     switch (header.kind) {
     case PacketKind::Lent: {
         const bool around = view_on && view.seeded && engine != nullptr;
+        if (player != nullptr) {
+            player->BeforeLent(); // rules 1 and 2: the lent call reads E's engine
+        }
         if (around) {
             BeforeLentCall(view, *engine);
             if ((header.flags & PacketVerify) != 0) {
@@ -372,6 +377,9 @@ Stats::RenderTime Play(const PacketHeader& header, const u8* spans) {
         --t_lent_depth;
         if (around) {
             AfterLentCall(view, *engine);
+        }
+        if (player != nullptr) {
+            player->AfterLent(); // the views take the engine's flags; R is on the view again
         }
         const LentOp op = static_cast<LentOp>(header.op);
         if (timing) {

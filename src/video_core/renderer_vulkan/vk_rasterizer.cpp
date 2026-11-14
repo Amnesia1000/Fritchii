@@ -618,6 +618,7 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
     // One follower: the stream-write guard's pages (section 7), and the locks its hang watchdog
     // names the holders of.
     VideoCommon::OneFollower::SetTexturePages(&texture_cache.page_filter);
+    VideoCommon::OneFollower::SetShaderPages(&pipeline_cache.page_filter);
     VideoCommon::OneFollower::WatchLock("buffer cache", &buffer_cache.mutex);
     VideoCommon::OneFollower::WatchLock("texture cache", &texture_cache.mutex);
     buffer_cache.SetPendingCpuWrites(
@@ -2283,6 +2284,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     // Before the lookup: the facts this draw publishes describe code at least this new.
     const u64 program_code_epoch =
         VideoCommon::MemStageShadow::g_program_code_epoch.load(std::memory_order_acquire);
+    // One follower step 4: a played draw's lookup must find a pipeline that exists (10.1 row 5).
+    const size_t onef_entries_before =
+        onef_play != nullptr ? pipeline_cache.GraphicsEntries() : 0;
     GraphicsPipeline* const pipeline{[&]() -> GraphicsPipeline* {
         if (delta_pipeline != nullptr) {
             return delta_pipeline; // EXP118: kept, no lookup
@@ -2290,6 +2294,16 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         Profile::Scope scope{Profile::Zone::PipelineLookup};
         return pipeline_cache.CurrentGraphicsPipeline();
     }()};
+    if (onef_play != nullptr &&
+        (!pipeline || pipeline_cache.GraphicsEntries() > onef_entries_before)) [[unlikely]] {
+        VideoCommon::OneFollower::Note(
+            VideoCommon::OneFollower::Check::PlayedLookupMiss,
+            !pipeline ? "played draw: no pipeline" : "played draw: a new pipeline built on R");
+        VideoCommon::OneFollower::DisableUnlend("a played draw's pipeline lookup missed");
+        if (!pipeline) {
+            return;
+        }
+    }
     if (!pipeline) {
         report_failure("no pipeline");
         TraceRenderState(is_indexed, "no-pipeline", nullptr);
@@ -2528,7 +2542,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     // THREAD = 2: the facts table (join 1) learns this pipeline's facts under the stage's key.
     // One follower from step 3: E looks them up for its fills at step 4 and for the facts
     // compare at step 3 (lent and played draws publish).
-    if (ring_on || (VideoCommon::OneFollower::On() &&
+    // Not from played draws (fable_b 10.1 row 2): their pipeline is R's finding on the view;
+    // a lent draw's comes from the engine itself, the authority.
+    if (ring_on || (VideoCommon::OneFollower::On() && onef_play == nullptr &&
                     VideoCommon::OneFollower::Step() >=
                         VideoCommon::OneFollower::StepLevel::Build)) [[unlikely]] {
         const Profile::FineScope facts_scope{Profile::Zone::RingFacts};
