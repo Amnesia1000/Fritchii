@@ -198,6 +198,10 @@ constexpr std::pair<const char*, const char*> BuiltinSwitches[] = {
     // has its own recompiler). Owner's call for v5.7 after the 2026-11-10 playtests: Kakariko
     // felt much better; repeat compiles after reloads 294 -> 8 ms in the night tests.
     {"EDEN_NX2_JIT_WARM", "1"},
+    // The GPU thread waits for suspended channels in a wait a latch or a new command ends,
+    // instead of 1 ms sleeps. Built in with EXP12 = 4 (2026-11-14, owner's call): without it a
+    // latched resume could sit out a sleep and mode 4 lost 0.5 fps at the market.
+    {"EDEN_NX2_GPU_WAKE", "1"},
 };
 
 static void LoadNx2Switches(const char* argv0) {

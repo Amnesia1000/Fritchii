@@ -76,7 +76,7 @@ every Idle.
 
 ### EDEN_NX2_GPU_WAKE
 
-EDEN_NX2_GPU_WAKE=1 (live, off by default; ported): the GPU
+EDEN_NX2_GPU_WAKE=1 (live, ON by default since 2026-11-14, built in with EXP12 = 4; ported): the GPU
 thread (the split's front) waits for suspended channels in a wait that ends on a wake, instead
 of polling them (ResumePending, then yield or sleep per EXP6, ~120-150 ms a second of front
 time in Ocarina of Time). A new command (PushCommand) or a GPU write that latches a waiter
@@ -757,7 +757,8 @@ ranges (N differed)" in the "DMA snapshot EXP10" line must stay 0.
 
 ### EXP12
 
-EXP12 (EDEN_NX2_SEM_FAST acquires read current but unmet, puller.cpp ReleaseFencesForReadable):
+EXP12 (DEFAULT 4 since 2026-11-14, with EDEN_NX2_GPU_WAKE=1 built in; EDEN_NX2_SEM_FAST
+acquires read current but unmet, puller.cpp ReleaseFencesForReadable):
 1 = their fence release waits only for the queued writers the read can't account for, full
 drain only if still unmet; 2 = suspend then too, without the full drain; 3 = measure only;
 4 = as 2 without the wait for those writers (the "fence writers" site): the fence release is
