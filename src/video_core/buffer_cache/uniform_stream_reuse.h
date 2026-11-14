@@ -13,6 +13,8 @@
 #include <type_traits>
 
 #include "common/common_types.h"
+#include "common/fritchii_page_flags.h"
+#include "video_core/fritchii_price.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2_debug_control.h"
 
@@ -194,6 +196,16 @@ template <class Runtime, class DeviceMemory>
         slot.serial = 0;
         return true;
     }
+    // fable_stage_levelpoints 18.4 row 1 (GPU profile on, the back): the guest read and the
+    // compare below are timed and the bind classed by verdict (FritchiiPrice::NoteUniformBind);
+    // its range's write generations are read first. Off: the profile's test and a branch.
+    const bool price = FritchiiPrice::On() && GpuSplit::OnBackThread();
+    u64 price_sum = 0;
+    u64 price_start = 0;
+    if (price) [[unlikely]] {
+        price_sum = Common::PriceGenSum(device_addr, size);
+        price_start = FritchiiPrice::Ticks();
+    }
     // The bytes are compared in guest memory with EDEN_NX2_UBO_INPLACE, else in a scratch copy.
     // The stream allocation is filled from the copy's bytes, never from guest memory, so a later
     // reuse finds exactly the bytes that were uploaded. Test memories have no GetSpan.
@@ -226,6 +238,11 @@ template <class Runtime, class DeviceMemory>
     if (slot.serial != 0 && reuse.copies[slot.copy].serial == slot.serial) {
         slot_copy = slot.copy;
         slot_same = same_bytes(slot_copy);
+    }
+    if (price) [[unlikely]] {
+        FritchiiPrice::NoteUniformBind(static_cast<u32>(stage * 32 + index), device_addr, size,
+                                       slot_same, FritchiiPrice::Ticks() - price_start,
+                                       price_sum);
     }
     if (in_place) {
         namespace Profile = Nx2Profile;

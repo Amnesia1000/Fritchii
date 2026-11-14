@@ -651,6 +651,10 @@ private:
     /// FRITCHII_NULL_RENDER: SetNullRenderNext, and the handle words its draws read.
     bool null_render_next{};
     std::vector<u32> null_render_handles;
+    /// fable_stage_levelpoints 18.4 row 2 (GPU profile on): the last draw's handle range key and
+    /// its pages' write generations (FritchiiPrice::ClassifyHandles).
+    u64 price_handle_key{};
+    u64 price_handle_sum{};
 
     std::vector<GraphicsPipelineCacheKey> transition_keys;
     /// Each transition key's Fingerprint(), kept with transition_keys (AddTransition and

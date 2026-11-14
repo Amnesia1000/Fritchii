@@ -112,6 +112,8 @@ add_library(video_core STATIC
     macro_memo.h
     macro_turing.h
     fence_manager.h
+    fritchii_price.cpp
+    fritchii_price.h
     gpu.cpp
     gpu.h
     gpu_timestamp.h

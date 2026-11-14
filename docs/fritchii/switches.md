@@ -199,6 +199,49 @@ worker's added ms/s grows, the worker is off the frame's path and has that much 
   ms/s (Vulkan worker, per chunk)".
 - Off (0): one relaxed load and a branch a chunk.
 
+### The price lines (dry counters, EDEN_NX2_GPU_PROFILE)
+
+The dry counters of work\fable_stage_levelpoints.md 18.4 (video_core/fritchii_price.h): each adds
+the time of exactly the items a cut would remove (the cut's size, X), where a delay test above
+gives its share. Only with the GPU profile on (EDEN_NX2_GPU_PROFILE=1 or 2); off, each site pays
+the profile's own enabled test and a branch. One line per group every 10 s, from the back thread,
+only when the group counted something. Times are time stamp ticks converted with the wall clock.
+- "Price uniform binds (back ...)", row 1: every compare of BindSmallUniformReusing on the back
+  (the stream path's reuse test, in place or through the scratch copy), by verdict: changed (or
+  no copy to compare with); unchanged and unflagged since its last bind (the cut: same range, no
+  mark on its pages since); unchanged but flagged; unchanged, another range than the slot's last
+  bind; unchanged with the bank marks off. The time is the guest read and the compare. "Flagged"
+  means a mark of either flag FRITCHII_BANK_FLAGGED takes (Common::g_collected_write_pages,
+  g_buffer_write_pages) on one of its pages since the last bind, kept as page write generations
+  (Common::PriceGenSum; a hash collision or a mark over 64 pages only makes more "flagged"). The
+  writers mark only while the bank marks are on: run with FRITCHII_BANK_CENSUS=1 (counters only)
+  or FRITCHII_BANK_FLAGGED=1 in the test block, else every unchanged bind reads "marks off".
+- "Price handle reads (back, draws ...)", row 2: draws by their handle range since that
+  pipeline's last draw: unflagged (the cut), flagged, another range (a constant buffer moved, the
+  first draw, or a handle program, which reads storage too), marks off. The range is each
+  descriptor's words in its constant buffers. Two sites: FillHandleValues (EXP123 3, its time
+  alone) and ConfigureImpl's handle loop (EXP123 below 3, the stage-off default: the time also
+  holds the storage binds and the samplers' and views' index work done in that loop, so it is an
+  upper bound of what a kept-handles cut removes). Draws a TEX_BANK_GEN hit served are not
+  counted (they read nothing).
+- "Price constant buffer word calls (back ...)", row 3: by run length (1, 2, 3-4, 5-8, 9-16,
+  17+ words), calls and words a second and the write half's time: CallConstBufferWords and
+  ProcessCBMultiData from past the BackServed test to their end (the compare, the write and the
+  invalidation; zone "cb upload" and its tests).
+- "Price back ring entries by kind ...", row 4: the back's ring entries by kind (constant buffer
+  word runs counted per word, 3D single, other engine single, multi, call, pairs per pair, state
+  delta, draw batch, words blocks per word, engine/wrap) and the "method" zone ms/s each kind
+  added (the zone's own estimate: 3D methods are sampled about one in 32).
+- "Price front waits split ...", rows 7 and 8: each wait of the front for the back by site (the
+  drain sites of "Front waits for the back by site") and the suspended acquires, split into
+  "until the back reached it" and "after". The back stamps each position it stores as consumed;
+  the wait's end looks up the first stamp at or past its target (a drain: what was sent; a
+  WaitFor: its target; an acquire: what was sent at its suspension, to its resume). "After" is the
+  front's wake for a drain; for an acquire it is the host GPU, the fence thread, other channels'
+  work and the wake. A stamp is stored at most every 4,096 ring words or at a waited target, so
+  "until" can run late by that much; targets older than the 256 stamps count as "not in the
+  stamps" (all "until").
+
 ### FRITCHII_NULL_RENDER
 
 FRITCHII_NULL_RENDER=1 (live, default 0; test only, the picture is broken: nothing is drawn;

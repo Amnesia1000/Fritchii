@@ -33,6 +33,7 @@
 #include "core/core.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/fritchii_price.h"
 #include "video_core/nx2_fastdraw_count.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memstage_shadow.h"
@@ -637,6 +638,10 @@ void GpuSplit::Drain(DrainSite site) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache == write_position) {
             publish_every = 8;
+            if (start != 0) [[unlikely]] {
+                // fable_stage_levelpoints 18.4 rows 7 and 8: until the back reached it, after.
+                FritchiiPrice::NoteFrontWait(static_cast<size_t>(site), write_position, start);
+            }
             Nx2Profile::AddDrain(site, start);
             NoteSiteWait(site, behind, Common::Nx2Hitch::NowNs() - begin_ns);
             return;
@@ -1409,6 +1414,10 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache >= target) {
             wait_target.store(~u64{0}, std::memory_order_relaxed);
+            if (start != 0) [[unlikely]] {
+                // fable_stage_levelpoints 18.4 rows 7 and 8: until the back reached it, after.
+                FritchiiPrice::NoteFrontWait(static_cast<size_t>(site), target, start);
+            }
             Nx2Profile::AddDrain(site, start);
             NoteSiteWait(site, behind, Common::Nx2Hitch::NowNs() - begin_ns);
             return true;
@@ -2659,6 +2668,49 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         // a test of this local.
         const bool entry_delay =
             VideoCore::Nx2Debug::g_delay_back_us.load(std::memory_order_relaxed) != 0;
+        // fable_stage_levelpoints 18.4 row 4 and the waits' split (GPU profile on): each entry's
+        // kind and the "method" zone time it added; the position stores stamped.
+        const bool entry_price = FritchiiPrice::On();
+        const bool entry_hook = entry_delay || entry_price;
+        if (entry_price) [[unlikely]] {
+            FritchiiPrice::MaybeReport();
+        }
+        // Row 4's kind of an entry (`head`, `size` words run).
+        const auto entry_kind = [this](u64 head, size_t size, u32& entries) {
+            using Entry = FritchiiPrice::Entry;
+            entries = 1;
+            switch (static_cast<Kind>(head & 0xf)) {
+            case Kind::Method: {
+                using Tegra::Engines::Maxwell3D;
+                const u32 method = static_cast<u32>((head >> 8) & 0xffff);
+                constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+                if (back_engine == nullptr || !back_engine->fast_maxwell3d) {
+                    return Entry::MethodOther;
+                }
+                if (method - cb_data < 16 && (head & HasSegment) == 0) {
+                    entries = static_cast<u32>(size);
+                    return Entry::CbRun;
+                }
+                return Entry::Method3D;
+            }
+            case Kind::Multi:
+                return Entry::Multi;
+            case Kind::Call:
+                return Entry::Call;
+            case Kind::Pairs:
+                entries = static_cast<u32>(head >> 32);
+                return Entry::Pairs;
+            case Kind::StateDelta:
+                return Entry::StateDelta;
+            case Kind::DrawBatch:
+                return Entry::DrawBatch;
+            case Kind::CbWords:
+                entries = static_cast<u32>(head >> 32);
+                return Entry::CbWords;
+            default:
+                return Entry::Other;
+            }
+        };
         // The ring entries an entry of the method zone stands for (Execute's cases with a
         // "method" scope): a run of constant buffer words or a words block counts each word, a
         // pairs block each pair; calls, engine switches and wraps count none.
@@ -2718,11 +2770,28 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 // the back's draws (memstage_shadow.cpp). Off: this one test per entry.
                 MemStageShadow::Before(read_position);
             }
+            u64 method_before = 0;
+            if (entry_price) [[unlikely]] {
+                method_before = Nx2Profile::t_data
+                                    .exclusive_ns[static_cast<size_t>(Nx2Profile::Zone::Method)];
+            }
             const size_t size =
                 Execute(&ring[index], std::min<u64>(end - read_position, RingWords - index));
-            if (entry_delay) [[unlikely]] {
-                if (const u32 entries = method_entries(ring[index], size); entries != 0) {
-                    DelayBackIf(BackDelayKind::Methods, entries);
+            if (entry_hook) [[unlikely]] {
+                const u64 head = ring[index];
+                if (entry_price) {
+                    u32 entries = 1;
+                    const FritchiiPrice::Entry kind = entry_kind(head, size, entries);
+                    FritchiiPrice::g_entries.Note(
+                        static_cast<size_t>(kind), entries,
+                        Nx2Profile::t_data
+                                .exclusive_ns[static_cast<size_t>(Nx2Profile::Zone::Method)] -
+                            method_before);
+                }
+                if (entry_delay) {
+                    if (const u32 entries = method_entries(head, size); entries != 0) {
+                        DelayBackIf(BackDelayKind::Methods, entries);
+                    }
                 }
             }
             read_position += size != 0 ? size : RingWords - index;
@@ -2747,6 +2816,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             if ((read_position - last_store >= 4096 ||
                  read_position >= wait_target.load(std::memory_order_relaxed)) &&
                 read_position != available) {
+                if (entry_price) [[unlikely]] {
+                    FritchiiPrice::BackReached(read_position);
+                }
                 consumed.store(read_position, std::memory_order_seq_cst);
                 last_store = read_position;
                 NotifyFront();
@@ -2759,6 +2831,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             }
         }
         CheckFencesQuiet(read_position);
+        if (entry_price) [[unlikely]] {
+            FritchiiPrice::BackReached(read_position);
+        }
         consumed.store(read_position, std::memory_order_seq_cst);
         NotifyFront();
         if (ring_on) {
