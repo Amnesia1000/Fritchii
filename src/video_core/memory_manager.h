@@ -156,6 +156,26 @@ public:
     void WriteBlockCached(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size);
     /// WriteBlockCached's bytes without its range (the memory stage collects its own).
     void WriteBlockStage(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size);
+    /// Where WriteBlockStage's page walk writes a range within one 4 KiB GPU page.
+    enum class StageWrite : u8 {
+        None,          ///< Nowhere: unmapped, or a small page under a reserved big page
+        BigContinuous, ///< A big page backed by one host range
+        BigSplit,      ///< A big page whose host memory is split (the device write)
+        Small,         ///< A small page (nothing written where it has no host pointer)
+    };
+    /// The memory stage's constant buffer words (FRITCHII_MEMSTAGE_THREAD=2): one page lookup
+    /// for a range within one 4 KiB GPU page, giving both what GpuToCpuAddress(gpu_addr) returns
+    /// and where WriteBlockStage writes, which would each look the page up again.
+    struct StageTarget {
+        std::optional<DAddr> device; ///< GpuToCpuAddress(gpu_addr)
+        DAddr write_device{};        ///< The device address WriteBlockStage writes at
+        StageWrite write{StageWrite::None};
+    };
+    [[nodiscard]] StageTarget ResolveStage(GPUVAddr gpu_addr) const;
+    /// WriteBlockStage(gpu_dest_addr, src_buffer, size) through `target`, which is
+    /// ResolveStage(gpu_dest_addr); the range lies within one 4 KiB GPU page.
+    void WriteBlockStageAt(const StageTarget& target, GPUVAddr gpu_dest_addr,
+                           const void* src_buffer, std::size_t size);
     /// WriteBlockCached of `count` consecutive words within one device page, in a single write.
     void WriteWordsCached(GPUVAddr gpu_dest_addr, const u32* words, std::size_t count);
     /// EXP88 & 2: constant buffer data written at
@@ -210,9 +230,27 @@ public:
 
     size_t MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const;
 
-    /// Bumped after each page table change: lookups cached under one value stay valid until then.
+    /// Bumped at the start and at the end of each page table change: lookups cached under one
+    /// value stay valid until then.
     [[nodiscard]] u64 MapSerial() const {
         return map_serial.load(std::memory_order_acquire);
+    }
+
+    /// A lookup that will be cached under the map counter (a sequence lock's read side): the
+    /// counter and whether a page table change is running, loaded before the lookup.
+    struct MapRead {
+        u64 serial;
+        bool busy;
+    };
+    [[nodiscard]] MapRead BeginMapRead() const {
+        const u64 serial = map_serial.load(std::memory_order_acquire);
+        return {serial, map_changes_running.load(std::memory_order_acquire) != 0};
+    }
+    /// After the lookup: whether it saw whole tables and may be cached under `read.serial`. No
+    /// change was running when it started, and none started since (that bumps the counter).
+    [[nodiscard]] bool MapReadStable(const MapRead& read) const {
+        std::atomic_thread_fence(std::memory_order_acquire);
+        return !read.busy && map_serial.load(std::memory_order_relaxed) == read.serial;
     }
 
     /// Changes whenever this address space or the device memory behind it is mapped or unmapped:
@@ -336,7 +374,6 @@ private:
     Common::SparseLargeVector<u32> big_page_table_dev;
 
     std::vector<u64> big_page_continuous;
-    boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> page_stash{};
     boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> page_stash2{};
 
     bool native_tiling{};
@@ -347,8 +384,32 @@ private:
     mutable std::shared_mutex page_table_lock;
     /// Shared lock of page_table_lock, waiting 2 ms at most.
     [[nodiscard]] bool TryLockPageTableShared() const;
-    /// Bumped after each page table change; readers keep their MappingSnapshot until then.
+    /// Bumped at the start and at the end of each page table change (MapChange); readers keep
+    /// their MappingSnapshot until then.
     std::atomic<u64> map_serial{};
+    /// Page table changes running now (MapChange). A count, not the counter's parity: Switch 2
+    /// maps run on the GPU thread (MapInOrder, RunInOrder) while other mappings run on the
+    /// guest's thread, so two changes can overlap.
+    std::atomic<u32> map_changes_running{};
+    /// Around PageTableOp and BigPageTableOp: the write side of BeginMapRead/MapReadStable.
+    class MapChange {
+    public:
+        explicit MapChange(MemoryManager& manager_) : manager{manager_} {
+            manager.map_changes_running.fetch_add(1, std::memory_order_seq_cst);
+            manager.map_serial.fetch_add(1, std::memory_order_seq_cst);
+            // The table writes below stay after both.
+            std::atomic_thread_fence(std::memory_order_release);
+        }
+        ~MapChange() {
+            manager.map_serial.fetch_add(1, std::memory_order_release);
+            manager.map_changes_running.fetch_sub(1, std::memory_order_release);
+        }
+        MapChange(const MapChange&) = delete;
+        MapChange& operator=(const MapChange&) = delete;
+
+    private:
+        MemoryManager& manager;
+    };
 
     struct ContinuousRun {
         GPUVAddr end;

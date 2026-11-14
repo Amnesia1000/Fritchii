@@ -1540,9 +1540,15 @@ bool Maxwell3D::WriteBoundConstantBuffer(u32 offset, const void* data, u32 bytes
     // device memory and the same ranges the same invalidation, translated when written instead
     // of when flushed; map_serial covers a remap between writes.
     if (bound.address != address || bound.size != size || bound.map_serial != map_serial) {
-        bound = {address, size, map_serial, 0};
+        const Tegra::MemoryManager::MapRead read = memory_manager.BeginMapRead();
+        bound = {address, size, read.serial, 0};
         if (address != 0 && size != 0 && memory_manager.IsContinuousRange(address, size)) {
             bound.device = memory_manager.GpuToCpuAddress(address).value_or(0);
+        }
+        // A page table change overlapped the translation: used for this write only (the
+        // counter never reaches ~0, so the next write translates again).
+        if (!memory_manager.MapReadStable(read)) {
+            bound.map_serial = ~u64{0};
         }
     }
     if (bound.device == 0) {
