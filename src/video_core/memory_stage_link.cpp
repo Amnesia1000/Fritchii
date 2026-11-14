@@ -1234,6 +1234,20 @@ void MemoryStageLink::SetListDraws(bool on) {
     }
 }
 
+void MemoryStageLink::SetFastLoop(bool on) {
+    // At a frame end, a level run (GPUMem is parked on it), as SetListDraws: GPUMem reads it at
+    // its next entry. Used only while the window is open too (FastLoop).
+    g_fast_loop.store(on, std::memory_order_relaxed);
+    if (mode == 2 && fast_loop_logged != (on ? 1 : 0)) {
+        fast_loop_logged = on ? 1 : 0;
+        LOG_INFO(HW_GPU, "Memory stage fast entry loop (FRITCHII_MEMSTAGE_FAST_LOOP={}): {}",
+                 on ? 1 : 0,
+                 on ? "GPUMem applies a Pairs block's writes in one loop and reads the input's end "
+                      "once per stretch, while the window is open (FRITCHII_MEMSTAGE_AHEAD > 0)"
+                    : "GPUMem's entry loop as before");
+    }
+}
+
 void MemoryStageLink::CloseBusyBatch() noexcept {
     if (busy_batch_start != 0) {
         LinkBump(counters.stage_busy_ns, LinkNowNs() - busy_batch_start);
@@ -1483,6 +1497,7 @@ void MemoryStageLink::RingLoop(std::stop_token& stop, u64 start) {
                                    ? ring_backend.back_channel(ring_backend.context)
                                    : 0);
     u64 position = start;
+    u64 known_available = 0; ///< The input's end as last read (FRITCHII_MEMSTAGE_FAST_LOOP)
     u64 since_publish = 0;
     u64 last_tick_ns = LinkNowNs();
     // GPUMem's busy time, timed per publish batch (fps fix 1: two clock reads an entry were a
@@ -1505,7 +1520,14 @@ void MemoryStageLink::RingLoop(std::stop_token& stop, u64 start) {
                 }
                 break;
             }
-            const u64 available = Ring::Published().load(std::memory_order_acquire);
+            // FRITCHII_MEMSTAGE_FAST_LOOP: the input's end is read again only where GPUMem has
+            // reached the last one it read (the front writes it at every publish: a load per entry
+            // mostly missed in GPUMem's cache). Entries before it stay published, and its acquire
+            // made them visible. Off, or with the window closed, it is read at every entry.
+            if (!FastLoop() || position >= known_available) {
+                known_available = Ring::Published().load(std::memory_order_acquire);
+            }
+            const u64 available = known_available;
             if (available == position) {
                 close_batch();
                 PublishStaged(position);

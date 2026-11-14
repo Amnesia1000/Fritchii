@@ -720,6 +720,34 @@ THREAD 0/1 keep them as before (level draws on THREAD 2, the back's own fill oth
   kept list words closure (KeplerCompute's list dispatch) runs about 850 a second and sits in
   front of its dispatch, inside the dispatch's run. Left as they are here.
 
+### FRITCHII_MEMSTAGE_FAST_LOOP
+
+FRITCHII_MEMSTAGE_FAST_LOOP (live, read at a frame end with FRITCHII_MEMSTAGE_AHEAD, default 1;
+lever A of work\fable_stage_drains.md): with FRITCHII_MEMSTAGE_THREAD=2 and the window open
+(AHEAD > 0), GPUMem's entry loop takes two shortcuts that leave its copy in exactly the state the
+loop leaves it in without them. 0, AHEAD 0 and THREAD 0/1 run the loop as before (the shadow on
+the back never takes them). "Memory stage fast entry loop (FRITCHII_MEMSTAGE_FAST_LOOP=n)" is
+logged when it changes.
+
+- Pairs and StateDelta blocks (3.7 million writes a second in 1.45 million blocks at the market)
+  are applied in one loop (memstage_shadow.cpp, PairsFast) instead of StateWrite per write. While
+  a deferred draw waits the writes still go one by one through StateWrite (the first stored write
+  that is not an instance loop method draws it, reading the copy as it is then); after it no
+  write in the block can issue a draw, so the loop reads the shadow RAM's mode once (again after a
+  tracked write to shadow_ram_control's own word, the one write that changes it), keeps the
+  same-value skip, gathers each stored register's two dirty flags and raises them on the copy
+  (and in the flags raised since its last draw) at the block's end, and advances the copy's
+  generation by the number of stores. Registers, shadow RAM, every dirty flag, the generation and
+  the draws end the same; nothing reads the copy inside a block.
+- The input's end (the front's `published`, written at every publish) is read again only where
+  GPUMem reaches the last value it read, not at every entry. Entries before it stay published and
+  that read's acquire made them visible, so GPUMem reads the same entries in the same order and
+  stops for input at the same positions.
+- The verify: the memstage gate (work\memstage_gate.py) with FRITCHII_MEMSTAGE_RING_VERIFY (compare
+  b's hash at every served draw) and READ_LOG, once with 0 and once with 1; every must-be-0 line
+  stays 0. Then 0 against 1 with profile_toggle.py at the market (GPUMem's "stage pairs" and "other"
+  at EDEN_NX2_GPU_PROFILE=2, its busy time, fps).
+
 ### FRITCHII_MEMSTAGE_FULL_BINDS
 
 FRITCHII_MEMSTAGE_FULL_BINDS (live, read at a frame end, default 0; spec 4.2): every draw binds
