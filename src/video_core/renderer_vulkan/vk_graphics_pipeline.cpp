@@ -2409,6 +2409,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         fresh_rescaled_cursor = fresh_rescaled.data();
     }
     const auto prepare_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
+        // FRITCHII_DELAY_BACK_KIND=2 ("S", fable_stage_levelpoints 18.3): every 4th stage bind,
+        // on the back thread, outside the zone. Off: one relaxed load and a branch.
+        VideoCommon::GpuSplit::DelayBackIf(VideoCommon::GpuSplit::BackDelayKind::StageBinds);
         {
             Profile::Scope scope{Profile::Zone::BindStageBuffers};
             if (held != nullptr) {

@@ -147,6 +147,26 @@ frame's path and cutting them pays one for one.
 - Off (0): one relaxed load and a branch after each run.
 - Measure with profile_toggle.py in one session (0 against n).
 
+### FRITCHII_DELAY_BACK_US, FRITCHII_DELAY_BACK_KIND
+
+The back's zone delay tests (live, default 0 = nothing changes; work\fable_stage_levelpoints.md
+18.3, the share of a stage-off cut before it is built): the GPU back thread busy-spins n
+microseconds at one kind of site, as FRITCHII_DELAY_DRAW_US does at every draw.
+- KIND 1 ("M", rows 3 and 4): once every 64 ring entries of the method zone, after the entry
+  ran (GpuSplit::BackLoop, after Execute). A run of constant buffer words or a FRITCHII_CB_WORDS
+  block counts each word, a pairs block each pair; a multi-word method, state delta or draw
+  batch one; deferred calls, engine switches and wraps none. n = 1 is about 71 ms/s.
+- KIND 2 ("S", rows 1, 2, 5): every 4th BindHostStageBuffers in GraphicsPipeline::ConfigureImpl,
+  before its "bind stage buffers" zone. n = 1 is about 61 ms/s.
+- KIND 3 ("F", the fences of row 6): every made fence in FenceManager::SignalFence, right after
+  the skip test (skipped fences don't spin). n = 5 is about 79 ms/s.
+- On the back thread only (never GPUMem, not without the split). The spin is counted in the
+  "Front waits for the back by site" line's ending: "FRITCHII_DELAY_BACK_US=n x/s y ms/s KIND=k
+  (back)" (the spins of whatever kind is set).
+- Off (0): one relaxed load and a branch at a stage bind and at a made fence; the method entries
+  pay a test of a local the back loads once a batch.
+- Measure with profile_toggle.py in one session (0 against n, KIND fixed in the test block).
+
 ### FRITCHII_NULL_RENDER
 
 FRITCHII_NULL_RENDER=1 (live, default 0; test only, the picture is broken: nothing is drawn;

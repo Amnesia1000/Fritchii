@@ -87,6 +87,8 @@ int DelaySwitch(GpuSplit::DelayTest test) {
         return Debug::SwitchValue(Debug::g_delay_dispatch_us, "FRITCHII_DELAY_DISPATCH_US");
     case Test::Draw:
         return Debug::SwitchValue(Debug::g_delay_draw_us, "FRITCHII_DELAY_DRAW_US");
+    case Test::Back:
+        return Debug::SwitchValue(Debug::g_delay_back_us, "FRITCHII_DELAY_BACK_US");
     default:
         return 0;
     }
@@ -123,10 +125,11 @@ std::string DelayTestText(SiteWaitStats& stats, double window) {
     return fmt::format("; delay tests added ({} the drain, FRITCHII_DELAY_BEFORE={}): "
                        "FRITCHII_DELAY_MACRO_DRAIN_US{}, FRITCHII_DELAY_POLL_DRAIN_US{}, "
                        "FRITCHII_DELAY_E2C_US{} (front), FRITCHII_DELAY_DISPATCH_US{} (back), "
-                       "FRITCHII_DELAY_DRAW_US{} (back)",
+                       "FRITCHII_DELAY_DRAW_US{} (back), FRITCHII_DELAY_BACK_US{} KIND={} (back)",
                        before ? "before" : "after", before ? 1 : 0, test(Test::MacroDrain),
                        test(Test::PollDrain), test(Test::E2c), test(Test::Dispatch),
-                       test(Test::Draw));
+                       test(Test::Draw), test(Test::Back),
+                       Debug::SwitchValue(Debug::g_delay_back_kind, "FRITCHII_DELAY_BACK_KIND"));
 }
 
 void NoteSiteWait(DrainSite site, u64 behind, u64 ns) {
@@ -289,6 +292,25 @@ void GpuSplit::DelayWork(DelayTest test) {
         return;
     }
     SpinDelay(test, static_cast<u32>(us));
+}
+
+void GpuSplit::DelayBack(BackDelayKind kind, u32 amount) {
+    namespace Debug = VideoCore::Nx2Debug;
+    const int us = DelaySwitch(DelayTest::Back);
+    if (us <= 0 || !on_back_thread ||
+        Debug::SwitchValue(Debug::g_delay_back_kind, "FRITCHII_DELAY_BACK_KIND") !=
+            static_cast<int>(kind)) {
+        return;
+    }
+    // Every 64 method-zone entries, every 4th stage bind, every made fence.
+    static constexpr std::array<u32, 4> period{1, 64, 4, 1};
+    static thread_local std::array<u32, 4> items{};
+    const auto index = static_cast<size_t>(kind);
+    items[index] += amount;
+    while (items[index] >= period[index]) {
+        items[index] -= period[index];
+        SpinDelay(DelayTest::Back, static_cast<u32>(us));
+    }
 }
 
 void GpuSplit::SpinDelay(DelayTest test, u32 us) {
@@ -2596,6 +2618,29 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         const bool ring_edges = ring_on && MemoryStageLink::Ahead() != 0;
         u64 ring_next_edge = read_position;
         bool ring_run = false;
+        // FRITCHII_DELAY_BACK_KIND=1 ("M", fable_stage_levelpoints 18.3): the method zone's
+        // entries are counted for the spin. Read once a batch: with the switch at 0 an entry pays
+        // a test of this local.
+        const bool entry_delay =
+            VideoCore::Nx2Debug::g_delay_back_us.load(std::memory_order_relaxed) != 0;
+        // The ring entries an entry of the method zone stands for (Execute's cases with a
+        // "method" scope): a run of constant buffer words or a words block counts each word, a
+        // pairs block each pair; calls, engine switches and wraps count none.
+        const auto method_entries = [](u64 head, size_t size) -> u32 {
+            switch (static_cast<Kind>(head & 0xf)) {
+            case Kind::Method:
+                return (head & HasSegment) != 0 ? 1U : static_cast<u32>(size);
+            case Kind::Multi:
+            case Kind::StateDelta:
+            case Kind::DrawBatch:
+                return 1;
+            case Kind::Pairs:
+            case Kind::CbWords:
+                return static_cast<u32>(head >> 32);
+            default:
+                return 0;
+            }
+        };
         while (read_position != available) {
             const size_t index = read_position & RingMask;
             if (ring_prefetch) {
@@ -2639,6 +2684,11 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             }
             const size_t size =
                 Execute(&ring[index], std::min<u64>(end - read_position, RingWords - index));
+            if (entry_delay) [[unlikely]] {
+                if (const u32 entries = method_entries(ring[index], size); entries != 0) {
+                    DelayBackIf(BackDelayKind::Methods, entries);
+                }
+            }
             read_position += size != 0 ? size : RingWords - index;
             if (ring_on && (!ring_edges || (ring_run && read_position >= limits.lent_until)) &&
                 link.BackAfter(read_position, limits)) [[unlikely]] {

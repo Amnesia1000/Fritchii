@@ -23,6 +23,7 @@
 
 #include "common/common_types.h"
 #include "video_core/engines/engine_interface.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/split_write_tracker.h"
 
 namespace Core {
@@ -919,8 +920,25 @@ public:
         E2c,        ///< Front: every call of the 0xe2c occlusion macro ("W")
         Dispatch,   ///< Back: every compute dispatch (RasterizerVulkan::DispatchCompute, "K")
         Draw,       ///< Back: every 3D draw call (RasterizerVulkan::Draw/DrawIndirect, "D")
+        Back,       ///< Back: FRITCHII_DELAY_BACK_US at FRITCHII_DELAY_BACK_KIND's site (DelayBack)
         Count,
     };
+    /// FRITCHII_DELAY_BACK_US / _KIND (live, default 0; fable_stage_levelpoints 18.3): the sites.
+    enum class BackDelayKind : u32 {
+        Methods = 1,    ///< "M": once every 64 method-zone ring entries (BackLoop, after Execute)
+        StageBinds = 2, ///< "S": every 4th BindHostStageBuffers (GraphicsPipeline::ConfigureImpl)
+        Fences = 3,     ///< "F": every made fence, after the skip test (FenceManager::SignalFence)
+    };
+    /// At a FRITCHII_DELAY_BACK_KIND site: one relaxed load and a branch while
+    /// FRITCHII_DELAY_BACK_US is 0 (after its first read). `amount`: the site's items (ring
+    /// entries for Methods).
+    static void DelayBackIf(BackDelayKind kind, u32 amount = 1) {
+        if (VideoCore::Nx2Debug::g_delay_back_us.load(std::memory_order_relaxed) != 0)
+            [[unlikely]] {
+            DelayBack(kind, amount);
+        }
+    }
+    static void DelayBack(BackDelayKind kind, u32 amount);
     /// FRITCHII_DELAY_E2C_US, FRITCHII_DELAY_DISPATCH_US, FRITCHII_DELAY_DRAW_US (live, default
     /// 0): spins the switch's microseconds for `test` (E2c, Dispatch or Draw) when it is set.
     /// Dispatch and Draw spin only on the back thread (never on GPUMem, nor without the split).
