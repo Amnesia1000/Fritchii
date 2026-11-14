@@ -40,6 +40,7 @@
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_fastdraw_count.h"
 #include "video_core/nx2_indirect_grid.h"
+#include "video_core/one_follower_stats.h"
 #include "video_core/render_trace.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/vk_one_follower_draw.h"
@@ -381,6 +382,9 @@ void OneFollowerDraw::RunLent(bool is_indexed, u32 instance_count, bool verify) 
 
 void OneFollowerDraw::Compare(Maxwell3D& engine, bool with_flags) {
     counts.verified.fetch_add(1, std::memory_order_relaxed);
+    // Part (d)'s coverage count ("build compares" on the verify line): was never fed, so step 3
+    // read as vacuous while its compares ran.
+    OneF::Stats::BuildCompared();
     const Maxwell& e = engine.regs;
     const Maxwell& v = view->regs;
     // Pipeline: the key each engine gives (pure, full refresh) and what RefreshStages reads.

@@ -522,6 +522,13 @@ public:
         OnBackImpl([](void* argument) { (*static_cast<Body*>(argument))(); }, &body);
     }
     static void OnBackImpl(void (*function)(void*), void* argument);
+    /// One follower at step 4, on E filling ring B: E has no player and no scheduler (R's), as
+    /// GPUMem in a hand-off has none. Every entry that must run now and every sync goes to R
+    /// (OnBack lends it, E parked), as THREAD = 2 sends GPUMem's to the back.
+    [[nodiscard]] static bool OneFollowerFill() noexcept;
+    /// OnBack's one-follower route: lends `function` to R with E's seam state installed there and
+    /// the buffer cache's lock handed to R (the hand-off's served call, over one follower's lend).
+    static void OnRenderImpl(void (*function)(void*), void* argument);
 
     /// The buffer cache's idle work, on its user's thread (hand-off at FRITCHII_MEMSTAGE_THREAD=1).
     template <typename F>

@@ -177,6 +177,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <string_view>
 
 #include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
@@ -724,9 +725,9 @@ void MemStage::PlayPending([[maybe_unused]] bool late) {
     if (!pending) {
         return;
     }
-    if (Link::InCall()) [[unlikely]] {
+    if (Link::InCall() || OneFollowerFill()) [[unlikely]] {
         // GPUMem (FRITCHII_MEMSTAGE_THREAD = 1): a play inside a fill (a sync's, a Ref's) records,
-        // so the back runs it, as GPUMem.
+        // so the back runs it, as GPUMem. One follower: E's play goes to R the same way.
         OnBack([this, late] { PlayPending(late); });
         return;
     }
@@ -2169,7 +2170,15 @@ bool MemStage::LookupFacts(const ProgramId& id, StagedFacts& out) const {
     return false;
 }
 
+bool MemStage::OneFollowerFill() noexcept {
+    return VideoCommon::OneFollower::OnEngineThread() && OneFollowerRing();
+}
+
 void MemStage::OnBackImpl(void (*function)(void*), void* argument) {
+    if (OneFollowerFill()) [[unlikely]] {
+        OnRenderImpl(function, argument);
+        return;
+    }
     if (!Link::InCall()) {
         function(argument);
         return;
@@ -2232,6 +2241,62 @@ void MemStage::OnBackImpl(void (*function)(void*), void* argument) {
     Link::Get().Serve(served);
     gpumem.identity = 0;
     install(gpumem);
+}
+
+void MemStage::OnRenderImpl(void (*function)(void*), void* argument) {
+    // As OnBackImpl's served call, with E in GPUMem's place and R in the back's: R runs the sync
+    // or the entry with E's fill state (its arena identity, depths, site, holding, logs, stamp),
+    // holding the cache's lock E holds, while E is parked in the lend.
+    struct State {
+        uintptr_t identity;
+        u32 fill_depth;
+        bool fill_lean;
+        u32 play_depth;
+        Site site;
+        bool holding;
+        ReadLog* log;
+        std::vector<ReadRange>* reads;
+        u64 stamp;
+        bool stamp_stage;
+    };
+    const auto capture = [] {
+        return State{t_identity, t_fill_depth, t_fill_lean, t_play_depth, t_site, t_holding,
+                     t_log,      t_reads,      SeamTicks::CurrentStamp(),  SeamTicks::CurrentStampStage()};
+    };
+    const auto install = [](const State& state) {
+        t_identity = state.identity;
+        t_fill_depth = state.fill_depth;
+        t_fill_lean = state.fill_lean;
+        t_play_depth = state.play_depth;
+        t_site = state.site;
+        t_holding = state.holding;
+        t_log = state.log;
+        t_reads = state.reads;
+        SeamTicks::SetStamp(state.stamp, state.stamp_stage);
+    };
+    State engine = capture();
+    engine.identity = ThisThread();
+    MemStage* const stage = g_stage.load(std::memory_order_acquire);
+    const std::thread::id engine_thread = std::this_thread::get_id();
+    auto served = [&] {
+        const State render = capture();
+        install(engine);
+        Common::SpinRecursiveMutex* const lent = stage != nullptr ? stage->lent_mutex : nullptr;
+        if (lent != nullptr) {
+            lent->HandOver(std::this_thread::get_id());
+        }
+        SCOPE_EXIT {
+            if (lent != nullptr) {
+                lent->HandOver(engine_thread);
+            }
+            engine = capture();
+            install(render);
+        };
+        function(argument);
+    };
+    VideoCommon::OneFollower::Lend(VideoCommon::OneFollower::LentOp::Other, served);
+    engine.identity = 0;
+    install(engine);
 }
 
 void MemStage::CacheIdleImpl(void (*function)(void*), void* argument) {
@@ -2983,9 +3048,12 @@ void MemStage::RunNow(Cmd kind, PlayFn&& play) {
     if (Link::Checking() && pending && OwnedHere()) [[unlikely]] {
         Link::Note(Link::Check::PushWhilePending, CMD_NAMES[static_cast<size_t>(kind)]);
     }
-    if (Link::InCall()) [[unlikely]] {
-        // GPUMem has nowhere to put it (spec 5.5): the back records it, counted.
-        Link::Note(Link::Check::PushNowhere, CMD_NAMES[static_cast<size_t>(kind)]);
+    if (Link::InCall() || OneFollowerFill()) [[unlikely]] {
+        // GPUMem has nowhere to put it (spec 5.5): the back records it, counted. One follower:
+        // E has no player either; R records it (lent).
+        if (Link::InCall()) {
+            Link::Note(Link::Check::PushNowhere, CMD_NAMES[static_cast<size_t>(kind)]);
+        }
         OnBack([&play] {
             PlayDepth depth;
             play();
@@ -3037,9 +3105,12 @@ void MemStage::PushParts(Cmd kind, u8 flags, u32 count, std::initializer_list<Pa
         Link::Note(Link::Check::PushWhilePending, CMD_NAMES[static_cast<size_t>(kind)]);
     }
     const ScratchDepth scratch_depth;
-    if (Link::InCall()) [[unlikely]] {
-        // GPUMem has nowhere to put it (spec 5.5): the back records it, counted.
-        Link::Note(Link::Check::PushNowhere, CMD_NAMES[static_cast<size_t>(kind)]);
+    if (Link::InCall() || OneFollowerFill()) [[unlikely]] {
+        // GPUMem has nowhere to put it (spec 5.5): the back records it, counted. One follower:
+        // R records it (lent).
+        if (Link::InCall()) {
+            Link::Note(Link::Check::PushNowhere, CMD_NAMES[static_cast<size_t>(kind)]);
+        }
         OnBack([this, out] {
             PlayDepth depth;
             player.Exec(*reinterpret_cast<const Entry*>(out));
@@ -3160,8 +3231,10 @@ void MemStage::PushDescriptor(const DescriptorUpdateEntry& descriptor, bool texe
         if (Link::Checking() && pending && OwnedHere()) [[unlikely]] {
             Link::Note(Link::Check::PushWhilePending, "descriptor");
         }
-        if (Link::InCall()) [[unlikely]] {
-            Link::Note(Link::Check::PushNowhere, "descriptor");
+        if (Link::InCall() || OneFollowerFill()) [[unlikely]] {
+            if (Link::InCall()) {
+                Link::Note(Link::Check::PushNowhere, "descriptor");
+            }
             OnBack([this, &descriptor] {
                 PlayDepth depth;
                 player.AddDescriptors(&descriptor, 1);
@@ -4235,6 +4308,11 @@ void MemPlayer::ForgetBindings() noexcept {
 void MemPlayer::CheckBack(const char* where) noexcept {
     if (Link::OnStageThread()) [[unlikely]] {
         Link::Note(Link::Check::PlayerOnStage, where);
+    }
+    // One follower at step 4: the player is R's; E reaching it while it fills is "owner on E"
+    // (the seam itself is E's way to fill: not counted).
+    if (MemStage::OneFollowerFill() && std::string_view{where} != "runtime.Seam()") [[unlikely]] {
+        VideoCommon::OneFollower::Note(VideoCommon::OneFollower::Check::OwnerOnE, where);
     }
 }
 

@@ -49,6 +49,7 @@
 #include "common/settings.h"
 #include "shader_recompiler/exception.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/one_follower.h"
 
 #if defined(__clang__) && defined(NDEBUG)
 #define LAMBDA_FORCEINLINE __attribute__((always_inline))
@@ -2693,6 +2694,14 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     if (guest_descriptor_queue.UpdateCount() != num_descriptor_entries) {
         LOG_CRITICAL(Render_Vulkan, "Graphics descriptor count mismatch: expected {}, got {}",
                      num_descriptor_entries, guest_descriptor_queue.UpdateCount());
+        // One follower step 4: an unlent draw R built wrong. Counted (must be 0), not drawn,
+        // and step 4 stops for the session (every later draw lent) before more go wrong.
+        if (VideoCommon::OneFollower::PlayingUnlentDraw()) [[unlikely]] {
+            VideoCommon::OneFollower::Note(VideoCommon::OneFollower::Check::BuildDescriptors,
+                                           "unlent draw: descriptor count against its pipeline");
+            VideoCommon::OneFollower::DisableUnlend(
+                "an unlent draw's descriptor count did not match its pipeline");
+        }
         return false;
     }
     const void* const descriptor_data{guest_descriptor_queue.UpdateData()};
