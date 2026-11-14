@@ -388,6 +388,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_FENCE_COMMIT_FAST") {
         return &g_fence_commit_fast;
     }
+    if (name == "FRITCHII_VERTEX_INPUT_COMPACT") {
+        return &g_vertex_input_compact;
+    }
     return nullptr;
 }
 

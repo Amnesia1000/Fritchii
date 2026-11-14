@@ -7432,6 +7432,91 @@ void RasterizerVulkan::UpdateStencilTestEnable(Tegra::Engines::Maxwell3D::Regs& 
     });
 }
 
+namespace {
+// FRITCHII_VERTEX_INPUT_COMPACT: a vertex input command sized to what it carries. The full
+// command captured two static_vectors of 32 Vulkan structs (about 2 KB of chunk space, copied
+// into the chunk with every send); this one keeps 12 bytes a binding or attribute in one of
+// three size classes and builds the Vulkan structs on the worker.
+struct PackedVertexBinding {
+    u32 stride;
+    u32 divisor;
+    u8 binding;
+    u8 input_rate; // VkVertexInputRate: 0 vertex, 1 instance
+};
+struct PackedVertexAttribute {
+    VkFormat format;
+    u32 offset;
+    u8 location;
+    u8 binding;
+};
+
+template <size_t NumBindings, size_t NumAttributes>
+struct CompactVertexInputCommand {
+    std::array<PackedVertexBinding, NumBindings> bindings;
+    std::array<PackedVertexAttribute, NumAttributes> attributes;
+    u8 num_bindings;
+    u8 num_attributes;
+
+    void operator()(vk::CommandBuffer cmdbuf) const {
+        std::array<VkVertexInputBindingDescription2EXT, NumBindings> vk_bindings;
+        std::array<VkVertexInputAttributeDescription2EXT, NumAttributes> vk_attributes;
+        for (u32 i = 0; i < num_bindings; ++i) {
+            const PackedVertexBinding& b = bindings[i];
+            vk_bindings[i] = {
+                .sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT,
+                .pNext = nullptr,
+                .binding = b.binding,
+                .stride = b.stride,
+                .inputRate = static_cast<VkVertexInputRate>(b.input_rate),
+                .divisor = b.divisor,
+            };
+        }
+        for (u32 i = 0; i < num_attributes; ++i) {
+            const PackedVertexAttribute& a = attributes[i];
+            vk_attributes[i] = {
+                .sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT,
+                .pNext = nullptr,
+                .location = a.location,
+                .binding = a.binding,
+                .format = a.format,
+                .offset = a.offset,
+            };
+        }
+        cmdbuf.SetVertexInputEXT(
+            vk::Span<VkVertexInputBindingDescription2EXT>(vk_bindings.data(), num_bindings),
+            vk::Span<VkVertexInputAttributeDescription2EXT>(vk_attributes.data(), num_attributes));
+    }
+};
+
+template <size_t NumBindings, size_t NumAttributes>
+void RecordCompactVertexInput(Scheduler& scheduler,
+                              std::span<const VkVertexInputBindingDescription2EXT> bindings,
+                              std::span<const VkVertexInputAttributeDescription2EXT> attributes) {
+    CompactVertexInputCommand<NumBindings, NumAttributes> command;
+    command.num_bindings = static_cast<u8>(bindings.size());
+    command.num_attributes = static_cast<u8>(attributes.size());
+    for (size_t i = 0; i < bindings.size(); ++i) {
+        const auto& b = bindings[i];
+        command.bindings[i] = {
+            .stride = b.stride,
+            .divisor = b.divisor,
+            .binding = static_cast<u8>(b.binding),
+            .input_rate = static_cast<u8>(b.inputRate),
+        };
+    }
+    for (size_t i = 0; i < attributes.size(); ++i) {
+        const auto& a = attributes[i];
+        command.attributes[i] = {
+            .format = a.format,
+            .offset = a.offset,
+            .location = static_cast<u8>(a.location),
+            .binding = static_cast<u8>(a.binding),
+        };
+    }
+    scheduler.Record(std::move(command));
+}
+} // Anonymous namespace
+
 void RasterizerVulkan::UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs) {
     auto& dirty{maxwell3d->dirty.flags};
     const bool vertex_input_dirty = dirty[Dirty::VertexInput];
@@ -7461,6 +7546,17 @@ void RasterizerVulkan::UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs) 
         static_cast<u32>(std::min<size_t>(Maxwell::NumVertexArrays,
                                           device.GetMaxVertexInputBindings()));
 
+    // FRITCHII_VERTEX_INPUT_COMPACT (live, default 0; fable_perdraw_b 3.2): 1 = describe only
+    // the bindings an attribute below names, in a command sized to its content. The attribute
+    // list is the same in both modes (every non-constant location the registers define), so the
+    // state no longer depends on which pipeline drew first: vkCmdSetVertexInputEXT replaces the
+    // whole vertex input state, a shader reads locations, every location the registers define
+    // is described with its binding, and a binding no attribute names cannot be read by any
+    // pipeline (buffers bound to it are ignored). Strides, rates and divisors of the bindings
+    // that are described are unchanged.
+    const int compact = VideoCore::Nx2Debug::SwitchValue(
+        VideoCore::Nx2Debug::g_vertex_input_compact, "FRITCHII_VERTEX_INPUT_COMPACT");
+    u32 referenced_bindings = 0;
 
     for (u32 index = 0; index < max_attributes; ++index) {
         const Maxwell::VertexAttribute attribute{regs.vertex_attrib_format[index]};
@@ -7468,6 +7564,7 @@ void RasterizerVulkan::UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs) 
         if (attribute.constant || binding >= max_bindings) {
             continue;
         }
+        referenced_bindings |= 1U << binding;
         attributes.push_back({
             .sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT,
             .pNext = nullptr,
@@ -7479,7 +7576,7 @@ void RasterizerVulkan::UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs) 
         });
     }
 
-    for (u32 binding = 0; binding < max_bindings; ++binding) {
+    const auto push_binding = [&](u32 binding) {
         const auto& input_binding{regs.vertex_streams[binding]};
         const bool is_instanced{regs.vertex_stream_instances.IsInstancingEnabled(binding)};
         bindings.push_back({
@@ -7490,6 +7587,16 @@ void RasterizerVulkan::UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs) 
             .inputRate = is_instanced ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX,
             .divisor = is_instanced ? input_binding.frequency : 1,
         });
+    };
+    if (compact != 0) {
+        // Ascending binding order, as below (only bits under max_bindings are set).
+        for (u32 mask = referenced_bindings; mask != 0; mask &= mask - 1) {
+            push_binding(static_cast<u32>(std::countr_zero(mask)));
+        }
+    } else {
+        for (u32 binding = 0; binding < max_bindings; ++binding) {
+            push_binding(binding);
+        }
     }
 
     for (size_t index = 0; index < Maxwell::NumVertexAttributes; ++index) {
@@ -7534,6 +7641,38 @@ void RasterizerVulkan::UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs) 
     vertex_input_memo_attributes = attributes;
     vertex_input_memo_generation = state_tracker.vertex_input_generation;
     vertex_input_memo_valid = true;
+
+    // FRITCHII_VERTEX_INPUT_COMPACT's counts (kept in both modes: at 0 they say what 1 saves).
+    constexpr size_t full_command_bytes = sizeof(bindings) + sizeof(attributes);
+    size_t command_bytes = full_command_bytes;
+    const size_t num_bindings = bindings.size();
+    const size_t num_attributes = attributes.size();
+    if (compact != 0) {
+        const std::span<const VkVertexInputBindingDescription2EXT> binding_span(bindings.data(),
+                                                                                num_bindings);
+        const std::span<const VkVertexInputAttributeDescription2EXT> attribute_span(
+            attributes.data(), num_attributes);
+        if (num_bindings <= 4 && num_attributes <= 8) {
+            command_bytes = sizeof(CompactVertexInputCommand<4, 8>);
+            RecordCompactVertexInput<4, 8>(scheduler, binding_span, attribute_span);
+        } else if (num_bindings <= 8 && num_attributes <= 16) {
+            command_bytes = sizeof(CompactVertexInputCommand<8, 16>);
+            RecordCompactVertexInput<8, 16>(scheduler, binding_span, attribute_span);
+        } else {
+            command_bytes = sizeof(CompactVertexInputCommand<32, 32>);
+            RecordCompactVertexInput<32, 32>(scheduler, binding_span, attribute_span);
+        }
+    } else {
+        scheduler.Record([bindings, attributes](vk::CommandBuffer cmdbuf) {
+            cmdbuf.SetVertexInputEXT(bindings, attributes);
+        });
+    }
+    ++vertex_input_recorded;
+    vertex_input_bindings_described += num_bindings;
+    vertex_input_bindings_referenced += static_cast<u64>(std::popcount(referenced_bindings));
+    vertex_input_attributes_described += num_attributes;
+    vertex_input_command_bytes += command_bytes;
+
     static auto last_log = std::chrono::steady_clock::now();
     if (const auto now = std::chrono::steady_clock::now();
         now - last_log >= std::chrono::seconds{10}) {
@@ -7541,13 +7680,22 @@ void RasterizerVulkan::UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs) 
                  "Vertex input (EXP83={}) last 10 s: {} sends, {} the same as the last one ({})",
                  memo_mode, vertex_input_sent, vertex_input_repeats,
                  memo_mode != 0 ? "skipped" : "sent anyway");
+        const double recorded = static_cast<double>(std::max<u64>(vertex_input_recorded, 1));
+        LOG_INFO(Render_Vulkan,
+                 "Vertex input compact (FRITCHII_VERTEX_INPUT_COMPACT={}) last 10 s: {} recorded, "
+                 "bindings described {:.1f} a send (referenced {:.1f}), attributes {:.1f} a send, "
+                 "command {:.0f} bytes a send (full {})",
+                 compact, vertex_input_recorded,
+                 static_cast<double>(vertex_input_bindings_described) / recorded,
+                 static_cast<double>(vertex_input_bindings_referenced) / recorded,
+                 static_cast<double>(vertex_input_attributes_described) / recorded,
+                 static_cast<double>(vertex_input_command_bytes) / recorded, full_command_bytes);
         vertex_input_sent = vertex_input_repeats = 0;
+        vertex_input_recorded = vertex_input_bindings_described = 0;
+        vertex_input_bindings_referenced = vertex_input_attributes_described = 0;
+        vertex_input_command_bytes = 0;
         last_log = now;
     }
-
-    scheduler.Record([bindings, attributes](vk::CommandBuffer cmdbuf) {
-        cmdbuf.SetVertexInputEXT(bindings, attributes);
-    });
 }
 
 void RasterizerVulkan::InitializeChannel(Tegra::Control::ChannelState& channel) {

@@ -1312,6 +1312,44 @@ from the file name) or helper (a GuestMemory helper that was not inlined: the ca
 level out). A read function the compiler inlined into its caller (ThinLTO can, across files)
 reports the caller's caller: read such a row as "a read somewhere under this call".
 
+### FRITCHII_VERTEX_INPUT_COMPACT
+
+FRITCHII_VERTEX_INPUT_COMPACT (live, default 0 = exactly as before; fable_perdraw_b 3.2).
+RasterizerVulkan::UpdateVertexInput sent all 32 vertex bindings, used or not, about 59,000 times
+a second (only about 1,500 of them equal to the one before, so EXP83's memo cannot help), in a
+command that captured two 32-entry arrays: about 2 KB of chunk space copied for every send, and
+a full 32 KB chunk (one worker dispatch) every 16 sends.
+- 1: only the bindings that an attribute in the list names are described, and the command keeps
+  12 bytes a binding or attribute in one of three size classes (up to 4 bindings and 8
+  attributes, up to 8 and 16, else 32 and 32); the worker builds the Vulkan structs. The
+  attribute list is the same as at 0: every non-constant location the registers define.
+- Why it is exact: vkCmdSetVertexInputEXT replaces the whole vertex input state. A draw reads
+  vertex data only through its shader's input locations; each location reads the binding its
+  attribute description names. Every location the registers define is described as before, and
+  so is the binding it names, with the same stride, input rate and divisor. A binding that no
+  attribute names has no effect on any draw: a buffer bound to it (vkCmdBindVertexBuffers2) is
+  ignored, and leaving it out also drops its stride and divisor checks (an unused stream's
+  divisor of 0, a big unused stride). The repack path (stride 72) only changes bindings that
+  attributes name; mesh emulation does not use this state.
+- A later pipeline and a left-out binding: the described set depends on the registers only,
+  not on the pipeline, so it cannot happen that a later pipeline reads a binding an earlier
+  compact command left out. A pipeline reads locations, every defined location is described
+  with its binding, and a register write that moves an attribute to another binding raises
+  VertexInput and sends the state again. That is also why the attribute list is not cut to the
+  locations the bound pipeline's vertex program reads: the state outlives that pipeline,
+  UpdateVertexInput returns at once when no input register changed whatever pipeline is bound,
+  and delta draws skip it, so such a cut would need a send whenever a pipeline reads a location
+  the last send left out.
+- EXP83's memo compares the lists that were built, so it works the same in both modes (a switch
+  flip mid-game just makes the next compare differ and sends).
+- "Vertex input compact (FRITCHII_VERTEX_INPUT_COMPACT=n) last 10 s: N recorded, bindings
+  described B a send (referenced R), attributes A a send, command C bytes a send (full F)"
+  (Render_Vulkan, Info, next to the EXP83 line). At 0 it says what 1 would save: "referenced"
+  is what 1 describes.
+- Expected: about half of the 24 ms/s UpdateVertexInput takes on the back, fewer chunk
+  dispatches (and worker wakes), and a cheaper SetVertexInputEXT on the worker. Picture check
+  across areas before it becomes a default (vertex layouts differ by scene).
+
 ## Numbered experiments (EDEN_NX2_EXPn)
 
 Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP79, live through the debug server:
