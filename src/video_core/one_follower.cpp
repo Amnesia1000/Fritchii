@@ -65,7 +65,8 @@ constexpr u8 PadKind = 0xff;
 constexpr u32 SpinLimit = 8192;
 
 struct Impl {
-    bool on{};   ///< FRITCHII_ONEF=1 at boot (sticks for the process)
+    bool on{};   ///< FRITCHII_ONEF=1 (or FRITCHII_ONEF_LEAN=1) at boot (sticks for the process)
+    bool lean{}; ///< FRITCHII_ONEF_LEAN=1 at boot: step 4 from boot, no compares
     bool read{}; ///< ReadSwitches ran
     bool pin{};  ///< FRITCHII_ONEF_PIN
     Core::System* system{};
@@ -183,8 +184,10 @@ thread_local bool t_next_draw_set{};
 void Refresh(u32 generation) {
     std::scoped_lock lock{g.refresh_mutex};
     using namespace VideoCore::Nx2Debug;
-    const int view = SwitchValue(g_onef_view, "FRITCHII_ONEF_VIEW");
-    const int build = SwitchValue(g_onef_build, "FRITCHII_ONEF_BUILD");
+    // FRITCHII_ONEF_LEAN: steps 2 and 3 are asked for by the lean mode itself (their compares
+    // stay off: no PacketVerify, VERIFY_EVERY 0); step 4 by FRITCHII_ONEF_UNLEND (lean's 3).
+    const int view = g.lean ? 1 : SwitchValue(g_onef_view, "FRITCHII_ONEF_VIEW");
+    const int build = g.lean ? 1 : SwitchValue(g_onef_build, "FRITCHII_ONEF_BUILD");
     const int unlend = SwitchValue(g_onef_unlend, "FRITCHII_ONEF_UNLEND");
     g.verify_every.store(SwitchValue(g_onef_verify_every, "FRITCHII_ONEF_VERIFY_EVERY",
                                      DefaultVerifyEvery),
@@ -239,6 +242,10 @@ void Refresh(u32 generation) {
         LOG_INFO(HW_GPU, "One follower: step {} (unlend mask {:#x}, verify every {}, ahead {})",
                  static_cast<int>(level), mask, g.verify_every.load(std::memory_order_relaxed),
                  g.ahead.load(std::memory_order_relaxed));
+    }
+    if (g.lean && level != StepLevel::Unlend && unlend != 0 &&
+        !g.unlend_disabled.load(std::memory_order_relaxed) && GetDrawPlayer() == nullptr) {
+        return; // LEAN before R's draw player exists (boot): ask again at the next Step()
     }
     g.seen_generation.store(generation, std::memory_order_release);
 }
@@ -815,8 +822,39 @@ void ReadSwitches() {
     }
     g.read = true;
     using namespace VideoCore::Nx2Debug;
-    g.on = SwitchValue(g_onef, "FRITCHII_ONEF") == 1;
+    g.lean = SwitchValue(g_onef_lean, "FRITCHII_ONEF_LEAN") == 1;
+    g.on = g.lean || SwitchValue(g_onef, "FRITCHII_ONEF") == 1;
     g.pin = SwitchValue(g_onef_pin, "FRITCHII_ONEF_PIN", 1) != 0;
+    if (g.lean) {
+        // The verified configuration as defaults; a switch set in the environment (the test
+        // block) or read before this keeps its value.
+        const auto preset = [](std::atomic<int>& value, const char* name, int lean) {
+            int unset = -1;
+            if (std::getenv(name) == nullptr && value.compare_exchange_strong(unset, lean)) {
+                BumpSwitchGeneration();
+            }
+            return SwitchValue(value, name);
+        };
+        const int unlend = preset(g_onef_unlend, "FRITCHII_ONEF_UNLEND", 3);
+        const int e_pipeline = preset(g_onef_e_pipeline, "FRITCHII_ONEF_E_PIPELINE", 1);
+        const int query_ops = preset(g_onef_query_ops, "FRITCHII_ONEF_QUERY_OPS", 1);
+        const int waits_e = preset(g_onef_waits_e, "FRITCHII_ONEF_WAITS_E", 1);
+        const int inval_e = preset(g_onef_inval_e, "FRITCHII_ONEF_INVAL_E", 1);
+        const int verify_every =
+            preset(g_onef_verify_every, "FRITCHII_ONEF_VERIFY_EVERY", 0);
+        // EXP12=5, the lagged acquire check (fable_b 11.3), from boot. Loaded first, so the
+        // experiments' own load does not replace it later.
+        (void)Experiment(12);
+        if (std::getenv("EDEN_NX2_EXP12") == nullptr) {
+            g_experiments[12].store(5, std::memory_order_relaxed);
+            BumpSwitchGeneration();
+        }
+        LOG_INFO(HW_GPU,
+                 "One follower LEAN (FRITCHII_ONEF_LEAN=1): step 4 from boot, view and build "
+                 "compares off, no forced verify; UNLEND={:#x} E_PIPELINE={} QUERY_OPS={} "
+                 "WAITS_E={} INVAL_E={} VERIFY_EVERY={} EXP12={}",
+                 unlend, e_pipeline, query_ops, waits_e, inval_e, verify_every, Experiment(12));
+    }
     // Default 1 (the step 4 probes ran with it; 0 keeps the facts table path).
     g_e_pipeline = g.on && SwitchValue(g_onef_e_pipeline, "FRITCHII_ONEF_E_PIPELINE", 1) == 1;
     if (g_e_pipeline) {
@@ -978,8 +1016,8 @@ void Lend(LentOp op, LentReason reason, void (*function)(void*), void* argument)
             // The spans: everything E changed since the last packet, after the header.
             spans_bytes = PackSpans(*engine, header,
                                     std::span<u8>{buffer + sizeof(PacketHeader), MaxSpanBytes});
-            if (op == LentOp::Draw) {
-                header.flags |= PacketVerify;
+            if (op == LentOp::Draw && !g.lean) {
+                header.flags |= PacketVerify; // FRITCHII_ONEF_LEAN: no view compare
             }
         }
     }
@@ -1056,7 +1094,10 @@ u64 GuestWriteOpMark() noexcept {
 
 bool QueryOps() noexcept {
     using namespace VideoCore::Nx2Debug;
-    const bool on = g.on && SwitchValue(g_onef_query_ops, "FRITCHII_ONEF_QUERY_OPS") != 0;
+    // From step 3 only: below it R's objects read E's engine, which a render op (E not parked)
+    // must not.
+    const bool on = g.on && SwitchValue(g_onef_query_ops, "FRITCHII_ONEF_QUERY_OPS") != 0 &&
+                    Step() >= StepLevel::Build;
     if (on && !g.query_ops_logged.load(std::memory_order_relaxed) &&
         !g.query_ops_logged.exchange(true)) [[unlikely]] {
         // fable_b 11.3: with reports landing on R the full-drain acquire poll (EXP12 = 4) drains

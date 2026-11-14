@@ -2558,7 +2558,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     // compare at step 3 (lent and played draws publish).
     // Not from played draws (fable_b 10.1 row 2): their pipeline is R's finding on the view;
     // a lent draw's comes from the engine itself, the authority.
-    if (ring_on || (VideoCommon::OneFollower::On() && onef_play == nullptr &&
+    // With E_PIPELINE (rule 3; implied by FRITCHII_ONEF_LEAN) nothing reads the table: E fills
+    // from the pipeline's own facts.
+    if (ring_on || (VideoCommon::OneFollower::On() && !VideoCommon::OneFollower::g_e_pipeline &&
+                    onef_play == nullptr &&
                     VideoCommon::OneFollower::Step() >=
                         VideoCommon::OneFollower::StepLevel::Build)) [[unlikely]] {
         const Profile::FineScope facts_scope{Profile::Zone::RingFacts};
