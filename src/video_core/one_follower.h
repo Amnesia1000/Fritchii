@@ -175,9 +175,6 @@ enum class Check : u8 {
     /// new one built on R from the view, whose constant buffer bindings are only as new as the
     /// last lent packet). Step 4 stops for the session.
     PlayedLookupMiss,
-    /// FRITCHII_ONEF_QUERY_OPS: a plain report whose target page the buffer cache has registered
-    /// (E would upload it without seeing R's later write): it stays lent.
-    ReportOnBufferPage,
     Count,
 };
 
@@ -186,7 +183,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Check::Count)> chec
     "view pools",    "build pipeline",   "build image views", "build dynamic",
     "build descriptors", "build render targets", "stream write", "owner on E", "owner on R",
     "build draw params", "build condition", "render packet missing", "drop not plain",
-    "facts stale", "played lookup miss", "report on buffer page",
+    "facts stale", "played lookup miss",
 };
 
 // --- The packet (E to R) -----------------------------------------------------------------------------
@@ -500,7 +497,17 @@ void DisableUnlend(const char* why) noexcept;
 
 /// E: a render op R runs at its stream place while E goes on: `function(payload copy)` on R,
 /// `size` bytes (at most 64) copied into the packet. Elsewhere it runs in place.
-void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size);
+/// `lands_in_memory`: the op writes game memory later on R (a report): the front's E-position
+/// waits (FRITCHII_ONEF_WAITS_E) also wait for R to play it (GuestWriteOpMark).
+void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size,
+            bool lands_in_memory = false);
+
+/// FRITCHII_ONEF_WAITS_E (live; fable_b 11.2): the front's waits on game memory, QMDs,
+/// semaphore flushes and lists read E's position (`consumed`), the rest R's (`played`).
+[[nodiscard]] bool WaitsE() noexcept;
+/// The newest render op that writes game memory on R (a plain report): its ring A entry
+/// position + 1, 0 = none yet. E stores it before it stores a `consumed` past that entry.
+[[nodiscard]] u64 GuestWriteOpMark() noexcept;
 
 /// The pricing counter of fable_b 11.5: LentOp::Query by call site.
 enum class QueryKind : u8 {
@@ -513,7 +520,7 @@ enum class QueryKind : u8 {
     ConditionIfNotEqual,   ///< lent: mode IfNotEqual
     Reset,                 ///< a counter reset (lent, or a render op with QUERY_OPS)
     PlainReport,           ///< a report, not a fence (lent, or a render op with QUERY_OPS)
-    ReportOnBufferPage,    ///< a plain report kept lent by the guard
+    ReportOnBufferPage,    ///< a plain report kept lent by the guard (a lend reason, common)
     FenceReport,           ///< a fence-flagged report (lent; item 4)
     PayloadRelease,        ///< a payload release (lent; item 4)
     Count,

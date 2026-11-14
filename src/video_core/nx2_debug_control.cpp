@@ -485,6 +485,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_ONEF_QUERY_OPS") {
         return &g_onef_query_ops;
     }
+    if (name == "FRITCHII_ONEF_WAITS_E") {
+        return &g_onef_waits_e;
+    }
     return nullptr;
 }
 

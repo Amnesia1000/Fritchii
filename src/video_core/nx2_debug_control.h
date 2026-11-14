@@ -238,6 +238,9 @@ inline std::atomic<int> g_onef_pin{-1};
 inline std::atomic<int> g_onef_e_pipeline{-1};
 /// FRITCHII_ONEF_QUERY_OPS (live, default 0): fable_b 11.1 item 1, queries without parking E.
 inline std::atomic<int> g_onef_query_ops{-1};
+/// FRITCHII_ONEF_WAITS_E (live, default 0): fable_b 11.2, the front's waits on game memory and
+/// lists read E's position.
+inline std::atomic<int> g_onef_waits_e{-1};
 /// EDEN_NX2_LIGHT_TABLE_ARRAYS: docs/fritchii/switches.md.
 [[nodiscard]] inline bool LightTableArrays() {
     static const bool on = EnvSwitch("EDEN_NX2_LIGHT_TABLE_ARRAYS") > 0;

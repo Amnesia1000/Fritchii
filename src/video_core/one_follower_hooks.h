@@ -33,6 +33,15 @@ inline thread_local bool t_engine{};
 inline thread_local bool t_render{};
 } // namespace Detail
 
+/// fable_b 11.3: acquire latches (Nx2SemaphoreWaiters::OnWrite) by the thread that ran the
+/// release: R, E, any other. With one follower every release is a lent call or a render op, so
+/// R's count is the latch; E's or another's is what the queries line names.
+inline std::atomic<u64> g_latches[3]{};
+inline void NoteLatch() noexcept {
+    g_latches[Detail::t_render ? 0 : Detail::t_engine ? 1 : 2].fetch_add(
+        1, std::memory_order_relaxed);
+}
+
 /// Owner asserts (section 5), for the caches' entry points: one thread-local load when off.
 void CheckRenderOwned(const char* where) noexcept;
 void CheckEngineOwned(const char* where) noexcept;

@@ -4582,8 +4582,7 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                 registered = buffer_cache.IsRegionRegistered(*device, 16);
             }
             if (registered) {
-                OneF::Note(OneF::Check::ReportOnBufferPage,
-                           "a plain report on a buffer cache page (kept lent)");
+                // A lend reason, not a must-be-0: OoT's reports often land in buffers.
                 OneF::SetQueryKind(OneF::QueryKind::ReportOnBufferPage);
             } else {
                 OneF::SetQueryKind(OneF::QueryKind::PlainReport);
@@ -4604,7 +4603,7 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                         a.self->query_cache.CounterReportAt(a.gpu_addr, a.device, a.type, a.flags,
                                                             a.payload, a.subreport);
                     },
-                    &op, sizeof(op));
+                    &op, sizeof(op), true);
                 return;
             }
         }
@@ -6956,8 +6955,11 @@ bool RasterizerVulkan::AccelerateConditionalRendering() {
             onef_condition_may_be_set = true;
         } else if (!onef_condition_may_be_set && OneF::QueryOps()) {
             // fable_b 11.1 item 1(a): override or True/False only ends host conditional
-            // rendering (false, no lookup), a no-op while nothing ever began it. FlushCaching is
-            // left to the next draw, which flushes before it reads.
+            // rendering (false, no lookup), a no-op while nothing ever began it. The call's
+            // FlushCaching runs here, at E's place, as without one follower: clears, copies and
+            // dispatches before the next draw see the stream's writes invalidated (lent only
+            // when there are ranges, which InnerInvalidation lends).
+            gpu_memory->FlushCaching();
             OneF::CountQueryKind(OneF::QueryKind::ConditionSkipped);
             return false;
         }

@@ -34,6 +34,7 @@
 #include "core/core.h"
 #include "video_core/gpu_split.h"
 #include "video_core/gpu_wait_site.h"
+#include "video_core/nx2.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/one_follower.h"
 #include "video_core/one_follower_stats.h"
@@ -114,6 +115,7 @@ struct Impl {
     std::array<u64, static_cast<size_t>(QueryKind::Count)> query_ns_logged{};
     u64 query_log_ns{};
     std::atomic<bool> query_ops_logged{};
+    std::atomic<u64> guest_write_op{}; ///< GuestWriteOpMark
 
     // The hang watchdog's view: written relaxed by E and R (no clock), read once a second.
     std::jthread watchdog;
@@ -341,6 +343,14 @@ u64 Floor(u64 played, u64 sent_packets) {
 /// R (after each unparked packet) and E (EngineConsumed): GpuSplit's `played` (8.2) =
 /// min(what E ran, R's oldest unplayed packet). The front's waits read it.
 void RaisePlayed() {
+    // A Dekker pair: E stores `intended` then reads `played`; R stores `played` then reads
+    // `intended`. Without this fence E's load could pass its store (x86 reorders a store with a
+    // later load) while R read the old `intended`: both raised GpuSplit's `played` short of the
+    // truth and neither raised it again, the front waiting for a position E and R had both passed
+    // (the FRITCHII_ONEF_QUERY_OPS hang: E and R idle, GPUWatch silent; render ops made E end its
+    // batches with R's packets unplayed, which opened the window). With it at least one side
+    // reads the other's store.
+    std::atomic_thread_fence(std::memory_order_seq_cst);
     // `intended` before `sent_packets` (acquire both): an `intended` E stored after committing a
     // packet comes with that packet's count.
     const u64 intended = g.intended.load(std::memory_order_acquire);
@@ -371,8 +381,13 @@ void LogQueryKinds() {
         g.query_count_logged[i] = count;
         g.query_ns_logged[i] = ns;
     }
-    LOG_INFO(HW_GPU, "One follower queries by kind (FRITCHII_ONEF_QUERY_OPS={}) {:.0f} s: {}",
-             QueryOps() ? 1 : 0, seconds, text);
+    // fable_b 11.3: the acquire latches by thread (session totals): R's is the expected one.
+    LOG_INFO(HW_GPU,
+             "One follower queries by kind (FRITCHII_ONEF_QUERY_OPS={}) {:.0f} s: {}; acquire "
+             "latches this session by R {}, E {}, other threads {}",
+             QueryOps() ? 1 : 0, seconds, text, g_latches[0].load(std::memory_order_relaxed),
+             g_latches[1].load(std::memory_order_relaxed),
+             g_latches[2].load(std::memory_order_relaxed));
 }
 
 void LogMaybe() {
@@ -564,6 +579,50 @@ std::string ThreadName(std::thread::id id) {
     return fmt::format("another thread ({:#x})", std::hash<std::thread::id>{}(id));
 }
 
+/// The watchdog's second line: the front's wait and the acquires it may be held by.
+void ReportFrontAndAcquires(bool front_stuck, bool e_outside, u64 now_ns) {
+    auto& split = GpuSplit::Get();
+    const auto& front = split.FrontWaitNow();
+    const u64 begin = front.begin_ns.load(std::memory_order_acquire);
+    const u32 site = front.site.load(std::memory_order_relaxed);
+    std::string waiters;
+    u32 count = 0;
+    Tegra::Nx2SemaphoreWaiters::Get().ForEach(
+        [&](u64 address, u32 value, u32 operation, bool latched, const u32* word) {
+            if (++count > 16) {
+                return;
+            }
+            waiters += fmt::format(
+                "{}{:#x} {} {:#x}{}{}", waiters.empty() ? "" : "; ", address,
+                operation == Tegra::Nx2SemaphoreWaiters::AcquireEqual    ? "=="
+                : operation == Tegra::Nx2SemaphoreWaiters::AcquireGequal ? ">="
+                : operation == Tegra::Nx2SemaphoreWaiters::AcquireMask   ? "&"
+                                                                          : "?",
+                value, latched ? " latched" : "",
+                word != nullptr ? fmt::format(" (word now {:#x})",
+                                              std::atomic_ref<u32>{*const_cast<u32*>(word)}
+                                                  .load(std::memory_order_relaxed))
+                                : std::string{});
+        });
+    LOG_CRITICAL(
+        HW_GPU,
+        "One follower hang watchdog: front {} (site {}, target {}, {}, for {:.1f} s, wait #{}); "
+        "published {}, consumed (E) {}, played (R) {}; E {}; acquire waiters {}: {}; latches by "
+        "R {}, E {}, other {}",
+        begin != 0 ? (front_stuck ? "stuck in a wait" : "in a wait") : "not in a wait",
+        site < drain_site_names.size() ? drain_site_names[site] : "none",
+        front.target.load(std::memory_order_relaxed),
+        front.on_engine.load(std::memory_order_relaxed) ? "on E's position" : "on R's position",
+        begin != 0 ? static_cast<double>(now_ns - begin) / 1e9 : 0.0,
+        front.seq.load(std::memory_order_relaxed), split.PublishedNow(),
+        split.EngineConsumedNow(), split.PlayedNow(std::memory_order_acquire),
+        e_outside ? "owes work and has not moved for 2 s outside its one-follower waits"
+                  : "not stuck outside its waits",
+        count, waiters.empty() ? std::string{"none"} : waiters,
+        g_latches[0].load(std::memory_order_relaxed), g_latches[1].load(std::memory_order_relaxed),
+        g_latches[2].load(std::memory_order_relaxed));
+}
+
 /// The hang watchdog (FRITCHII_ONEF=1): one wake a second. Two seconds without progress where
 /// progress is owed (R has a packet it does not finish, or packets it does not take; E in one wait
 /// that does not end) logs the whole state once, at Critical, then gives both sides a wake (a
@@ -575,9 +634,12 @@ void WatchMain(std::stop_token stop) {
         u64 r_packet{};
         u64 r_progress{};
         u64 e_wait_seq{};
+        u64 front_seq{};
+        u64 consumed{};
     } last{};
     u32 r_strikes = 0;
     u32 e_strikes = 0;
+    u32 e_out_strikes = 0;
     bool reported = false;
     bool lost_wakeup = false;
     for (;;) {
@@ -601,8 +663,21 @@ void WatchMain(std::stop_token stop) {
         const bool e_still = e_wait != 0 && e_wait_seq == last.e_wait_seq;
         r_strikes = r_still ? r_strikes + 1 : 0;
         e_strikes = e_still ? e_strikes + 1 : 0;
-        last = Seen{played, r_packet, r_progress, e_wait_seq};
-        const bool hung = r_strikes >= 2 || e_strikes >= 2;
+        // The front in one wait for over 2 s (GpuSplit's WaitFor or Drain), and E owing work
+        // (the front published past its position) without moving and outside its own waits: both
+        // were invisible to the R and E strikes (the first QUERY_OPS hang).
+        auto& split_now = GpuSplit::Get();
+        const auto& front = split_now.FrontWaitNow();
+        const u64 front_begin = front.begin_ns.load(std::memory_order_acquire);
+        const u64 front_seq = front.seq.load(std::memory_order_relaxed);
+        const u64 now_ns = Common::Nx2Hitch::NowNs();
+        const bool front_stuck = front_begin != 0 && now_ns - front_begin > 2'000'000'000ULL;
+        const u64 consumed_now = split_now.EngineConsumedNow();
+        const bool e_out_still = e_wait == 0 && split_now.PublishedNow() > consumed_now &&
+                                 consumed_now == last.consumed;
+        e_out_strikes = e_out_still ? e_out_strikes + 1 : 0;
+        last = Seen{played, r_packet, r_progress, e_wait_seq, front_seq, consumed_now};
+        const bool hung = r_strikes >= 2 || e_strikes >= 2 || front_stuck || e_out_strikes >= 2;
         if (!hung) {
             if (reported) {
                 LOG_CRITICAL(HW_GPU, "One follower hang watchdog: progress again ({}; {} wakes "
@@ -629,16 +704,29 @@ void WatchMain(std::stop_token stop) {
                                      ThreadName(g.locks[i].second->Owner()));
             }
             const char* const back_site = back_wait_site.load(std::memory_order_relaxed);
+            ReportFrontAndAcquires(front_stuck, e_out_strikes >= 2, now_ns);
+            // A lost raise: R has nothing unplayed and E is idle, yet `played` is short of
+            // E's position. Raise it (the min of the two, as RaisePlayed always takes) and say so.
+            const u64 intended = g.intended.load(std::memory_order_seq_cst);
+            if (!r_owes && split.PlayedNow(std::memory_order_seq_cst) < intended) {
+                LOG_CRITICAL(HW_GPU,
+                             "One follower hang watchdog: a lost raise of `played` ({} short of "
+                             "E's {}, R with nothing unplayed): raised now",
+                             split.PlayedNow(std::memory_order_relaxed), intended);
+                RaisePlayed();
+            }
             const u8 r_kind = g.r_kind.load(std::memory_order_relaxed);
             const u8 r_op = g.r_op.load(std::memory_order_relaxed);
             const u8 e_op = g.e_wait_op.load(std::memory_order_relaxed);
             LOG_CRITICAL(
                 HW_GPU,
-                "One follower hang watchdog: no progress for 2 s ({}{}{}); step {}; "
+                "One follower hang watchdog: no progress for 2 s ({}{}{}{}{}); step {}; "
                 "positions: published {}, consumed (E) {}, played (R) {}; packets: pushed {}, "
                 "played {}, ring bytes sent {} freed {}; E: {} (op {}, packet {}), e_waiting {}, "
                 "back wait site {}; R: {} (packet {}, kind {}, op {}), r_sleeping {}; locks: {}",
                 r_strikes >= 2 ? "R" : "", e_strikes >= 2 ? (r_strikes >= 2 ? " and E" : "E") : "",
+                front_stuck ? " the front in one wait" : "",
+                e_out_strikes >= 2 ? " E owing work outside its waits" : "",
                 lost_wakeup ? ", a lost wakeup: a side asleep with its condition met" : "",
                 static_cast<int>(g.step.load(std::memory_order_relaxed)), split.PublishedNow(),
                 split.EngineConsumedNow(), split.PlayedNow(std::memory_order_acquire),
@@ -890,7 +978,8 @@ void Lend(LentOp op, LentReason reason, void (*function)(void*), void* argument)
     }
 }
 
-void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size) {
+void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size,
+            bool lands_in_memory) {
     if (!Detail::t_engine || !g.thread.joinable() || size > MaxPayloadBytes) {
         function(const_cast<void*>(payload));
         return;
@@ -915,6 +1004,20 @@ void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size) {
     header.reserved2 = static_cast<u32>(spans_bytes);
     std::memcpy(buffer + sizeof(PacketHeader) + spans_bytes, payload, size);
     PushPacked(header, buffer, spans_bytes + ((size + 7) & ~u32{7}));
+    if (lands_in_memory) {
+        // Before E's next `consumed` store (seq_cst there): a front that sees E past this entry
+        // sees this mark too.
+        g.guest_write_op.store(header.position + 1, std::memory_order_release);
+    }
+}
+
+bool WaitsE() noexcept {
+    return g.on && VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_waits_e,
+                                                     "FRITCHII_ONEF_WAITS_E") != 0;
+}
+
+u64 GuestWriteOpMark() noexcept {
+    return g.guest_write_op.load(std::memory_order_acquire);
 }
 
 bool QueryOps() noexcept {
@@ -922,18 +1025,23 @@ bool QueryOps() noexcept {
     const bool on = g.on && SwitchValue(g_onef_query_ops, "FRITCHII_ONEF_QUERY_OPS") != 0;
     if (on && !g.query_ops_logged.load(std::memory_order_relaxed) &&
         !g.query_ops_logged.exchange(true)) [[unlikely]] {
-        // fable_b 11.3: with reports landing on R the full-drain acquire poll drains to R; the
-        // lagged check (EXP12 = 5) becomes the default, its target R's position (`played`).
+        // fable_b 11.3: with reports landing on R the full-drain acquire poll (EXP12 = 4) drains
+        // to R; the lagged check (EXP12 = 5) is the mode to run with, its target R's position
+        // (`played`). Not switched here: the wait mode of acquires already suspended does not
+        // change under them (the 4 -> 5 flip went with the first QUERY_OPS hang). Set it from
+        // boot.
         const int exp12 = Experiment(12);
         if (exp12 != 5 && exp12 != 6) {
-            g_experiments[12].store(5, std::memory_order_relaxed);
-            BumpSwitchGeneration();
+            LOG_WARNING(HW_GPU,
+                        "One follower: FRITCHII_ONEF_QUERY_OPS=1 with EXP12={}: set EXP12=5 from "
+                        "boot (the lagged acquire check, fable_b 11.3)",
+                        exp12);
         }
         LOG_INFO(HW_GPU,
                  "One follower: FRITCHII_ONEF_QUERY_OPS=1 (render enables that cannot set host "
                  "conditional rendering not sent, resets and plain reports as render ops); EXP12 "
-                 "{} -> {}",
-                 exp12, Experiment(12));
+                 "{}",
+                 exp12);
     }
     return on;
 }
@@ -994,7 +1102,7 @@ u64 Behind() noexcept {
 }
 
 void EngineConsumed(u64 position) noexcept {
-    g.intended.store(position, std::memory_order_release);
+    g.intended.store(position, std::memory_order_seq_cst); // RaisePlayed's fence pairs with R's
     RaisePlayed();
 }
 

@@ -1353,14 +1353,23 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
 - FRITCHII_ONEF_QUERY_OPS (live, default 0; fable_b_one_follower 11.1 item 1): 1 = queries stop
   parking E. A render enable with an override or mode True/False sends nothing while no
   Conditional/IfEqual/IfNotEqual one was ever lent (it could only end host conditional
-  rendering, which nothing began); counter resets and plain reports (not fences, not payload
-  releases) are render ops R runs at their place while E goes on, the report's address
-  translated on E. A plain report on a page the buffer cache has registered stays lent and counts
-  "report on buffer page" (must be 0). Turning it on also sets EXP12=5 (the lagged acquire check,
-  11.3) unless EXP12 is 5 or 6. Every 10 s "One follower queries by kind" logs each call site's
+  rendering, which nothing began; E still runs the call's FlushCaching); counter resets and plain
+  reports (not fences, not payload releases) are render ops R runs at their place while E goes
+  on, the report's address translated on E. A plain report on a page the buffer cache has
+  registered stays lent (a lend reason, "report on buffer page" in the kinds line; common in
+  OoT). Run it with EXP12=5 set from boot (the lagged acquire check, 11.3); with another EXP12
+  it logs a warning (it no longer switches EXP12 itself: the first QUERY_OPS hang came with that
+  live 4 -> 5 flip). Every 10 s "One follower queries by kind" logs each call site's
   rate and parked ms/s (condition skipped/override/true/false/conditional/if equal/if not equal,
   reset, plain report, report on buffer page, fence report, payload release), with the switch off
   too.
+- FRITCHII_ONEF_WAITS_E (live, default 0; fable_b_one_follower 11.2): 1 = the front's waits at
+  the macro dma read/writes, qmd read, semaphore flush, list writers/sync/copy writers/flush and
+  macro dma dispatch sites end when E ran the target and R played the newest report render op
+  before it (reports are the one thing R writes to game memory without a lend); acquires, fence
+  releases, the lagged check, fence (word) writers, report flushes (macro dma flush), maps and
+  the rest still wait for R. The "Front waits for the back by site" line marks the E sites
+  "(E)", and a second line counts the waits that ended before R got there.
 - FRITCHII_ONEF_PIN (boot, default 1): R gets PinnedRole::GpuMem's physical core (as
   FRITCHII_PIN_GPUMEM=1 gives GPUMem), taken from the guest set. 0 leaves R unpinned.
 - FRITCHII_ONEF_VIEW (live, default 0): 1 = step 2, E packs the register delta, the R-owned dirty
