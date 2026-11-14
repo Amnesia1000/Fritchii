@@ -331,7 +331,10 @@ void VerifyView(const RegisterView& view, const Maxwell3D& engine) {
                              engine.regs.reg_array[first]);
         Note(Check::ViewWords, t_note.c_str());
     }
-    const FlagBits flags = (view.flags ^ engine.dirty.flags) & parts.forward;
+    // At step 4 E's buffer fill clears E's copies of the shared flags (VertexBuffers) for its
+    // unlent draws while the view keeps them raised: only the R-only flags must agree then.
+    const FlagBits flag_mask = Step() == StepLevel::Unlend ? parts.render_only : parts.forward;
+    const FlagBits flags = (view.flags ^ engine.dirty.flags) & flag_mask;
     if (flags.any()) {
         u32 flag = 0;
         while (!flags.test(flag)) {
