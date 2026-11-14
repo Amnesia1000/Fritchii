@@ -16,6 +16,12 @@ namespace VideoCommon::OneFollower {
 /// (FRITCHII_ONEF_VIEW). Off: one relaxed load and a branch per register write.
 inline std::atomic<bool> g_track_writes{};
 
+/// FRITCHII_ONEF_E_PIPELINE=1 (boot, with FRITCHII_ONEF=1; fable_b_one_follower 10.2 rule 3): E
+/// owns the pipeline lookup. The pipeline cache always reads E's engine (R's view never replaces
+/// it), E looks a draw's pipeline up before its fill and the packet carries it, R never looks
+/// one up outside a lent call. Set once by ReadSwitches.
+inline bool g_e_pipeline{};
+
 /// Register word `index` of the engine was written on E (one_follower_view.cpp). Words written on
 /// another thread (the front's own copy) are not E's and are ignored there.
 void NoteRegWrite(u32 index) noexcept;

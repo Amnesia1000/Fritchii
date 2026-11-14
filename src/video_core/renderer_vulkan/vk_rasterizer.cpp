@@ -2121,6 +2121,13 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         VideoCommon::OneFollower::On() && VideoCommon::OneFollower::OnRenderThread()
             ? onef_draw->Playing()
             : nullptr;
+    // fable_b 10.2 rule 2's assert: on R outside a lent call the rasterizer names the view, never
+    // the channel's real engine (E's, which E writes meanwhile).
+    if (VideoCommon::OneFollower::OnRenderThread() && !VideoCommon::OneFollower::InLent() &&
+        channel_state != nullptr && maxwell3d == &channel_state->maxwell3d) [[unlikely]] {
+        VideoCommon::OneFollower::Note(VideoCommon::OneFollower::Check::OwnerOnR,
+                                       "a draw on R outside a lent call names E's engine");
+    }
     SCOPE_EXIT {
         if (onef_play == nullptr) {
             const VideoCommon::Nx2Profile::FineScope tick_scope{
@@ -2285,16 +2292,23 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     const u64 program_code_epoch =
         VideoCommon::MemStageShadow::g_program_code_epoch.load(std::memory_order_acquire);
     // One follower step 4: a played draw's lookup must find a pipeline that exists (10.1 row 5).
-    const size_t onef_entries_before =
-        onef_play != nullptr ? pipeline_cache.GraphicsEntries() : 0;
+    // With rule 3 the packet carries E's pipeline (no lookup on R, and graphics_cache is E's).
+    const bool onef_lookup = onef_play != nullptr && onef_play->pipeline == nullptr;
+    const size_t onef_entries_before = onef_lookup ? pipeline_cache.GraphicsEntries() : 0;
     GraphicsPipeline* const pipeline{[&]() -> GraphicsPipeline* {
         if (delta_pipeline != nullptr) {
             return delta_pipeline; // EXP118: kept, no lookup
         }
+        if (onef_play != nullptr && onef_play->pipeline != nullptr) {
+            // Rule 3 (FRITCHII_ONEF_E_PIPELINE): E looked this draw's pipeline up at its own
+            // position; R binds it and looks nothing up.
+            return const_cast<GraphicsPipeline*>(
+                static_cast<const GraphicsPipeline*>(onef_play->pipeline));
+        }
         Profile::Scope scope{Profile::Zone::PipelineLookup};
         return pipeline_cache.CurrentGraphicsPipeline();
     }()};
-    if (onef_play != nullptr &&
+    if (onef_lookup &&
         (!pipeline || pipeline_cache.GraphicsEntries() > onef_entries_before)) [[unlikely]] {
         VideoCommon::OneFollower::Note(
             VideoCommon::OneFollower::Check::PlayedLookupMiss,

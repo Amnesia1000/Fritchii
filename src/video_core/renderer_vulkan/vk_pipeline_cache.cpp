@@ -2763,7 +2763,13 @@ void PipelineCache::RefreshGraphicsKey() {
 }
 
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
-    VideoCommon::OneFollower::RenderOwned("PipelineCache::CurrentGraphicsPipeline");
+    // One follower: the pipeline cache is R's, or E's with rule 3 (then R looks up only inside a
+    // lent call: "owner on R" otherwise).
+    if (VideoCommon::OneFollower::g_e_pipeline) {
+        VideoCommon::OneFollower::EngineOwned("PipelineCache::CurrentGraphicsPipeline");
+    } else {
+        VideoCommon::OneFollower::RenderOwned("PipelineCache::CurrentGraphicsPipeline");
+    }
     ++lookup_serial;
     if (const int clean_mode = PipelineCleanMode(); clean_mode != 0) {
         return CurrentGraphicsPipelineClean(clean_mode == 2);

@@ -1344,6 +1344,12 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   operation is lent. The picture is today's; it prices the hop (one round trip a draw). 0 is
   today's code path, untouched. Not live: ownership of the caches and the scheduler cannot change
   in a session. Needs the GPU thread split.
+- FRITCHII_ONEF_E_PIPELINE (boot, default 0; fable_b_one_follower 10.2 rule 3): 1 = E owns the
+  pipeline lookup. The pipeline cache always reads E's engine (R's view never replaces it); at
+  step 4 E looks each unlent draw's pipeline up before its fill (a miss or a build not ready is a
+  lent draw, "pipeline miss"), fills from that pipeline's own facts and puts the pipeline in the
+  packet; R binds it and looks nothing up. The facts table then plays no part in unlent draws.
+  R calling the lookup outside a lent call counts "owner on R".
 - FRITCHII_ONEF_PIN (boot, default 1): R gets PinnedRole::GpuMem's physical core (as
   FRITCHII_PIN_GPUMEM=1 gives GPUMem), taken from the guest set. 0 leaves R unpinned.
 - FRITCHII_ONEF_VIEW (live, default 0): 1 = step 2, E packs the register delta, the R-owned dirty

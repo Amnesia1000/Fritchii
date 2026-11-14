@@ -285,6 +285,9 @@ struct PacketHeader {
     LentCall call;    ///< PacketKind::Lent
     s32 channel;      ///< the channel bound at the packet
     u32 reserved2;
+    /// PacketKind::Draw with FRITCHII_ONEF_E_PIPELINE: the GraphicsPipeline E looked up for the
+    /// draw (R binds it, no lookup of its own). Null otherwise.
+    const void* pipeline;
 };
 static_assert(sizeof(PacketHeader) % 8 == 0);
 
@@ -422,7 +425,8 @@ void SetDrawPlayer(DrawPlayer* player) noexcept;
 /// carries `draw_seq` (the seq E filled ring B's packet with), `buffer_number` (that packet's push
 /// index) and `flags` (PacketFlag), with the spans PackSpans gives; E goes on within
 /// FRITCHII_ONEF_AHEAD.
-void PushDraw(const Maxwell3D& engine, u64 draw_seq, u64 buffer_number, u8 flags);
+void PushDraw(const Maxwell3D& engine, u64 draw_seq, u64 buffer_number, u8 flags,
+              const void* pipeline = nullptr);
 
 /// E, at the end of Maxwell3D::ProcessQueryCondition when the host did not take the condition:
 /// from step 3, R computes the mode on its view at this place (in the lent call when one is

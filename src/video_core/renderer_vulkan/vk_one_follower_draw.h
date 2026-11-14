@@ -106,7 +106,10 @@ private:
                                            u32 kind);
     /// Fills ring B for an unlent draw from E's engine (as GPUMem's StageFillDraw does from its
     /// copy). False with `reason` when the draw must be lent.
-    bool FillRing(Maxwell3D& engine, bool is_indexed, u64 position, u64 seq, u64& buffer_number,
+    /// `pipeline` (FRITCHII_ONEF_E_PIPELINE): the one E looked up; its own facts fill the draw.
+    /// Null: the facts table's entry for the draw's programs.
+    bool FillRing(Maxwell3D& engine, GraphicsPipeline* pipeline, bool is_indexed, u64 position,
+                  u64 seq, u64& buffer_number,
                   LentReason& reason);
     void LendDraw(bool is_indexed, u32 instance_count, LentReason reason, bool verify);
     /// What E's fill would use for a lent draw's programs (looked up on E before the lend).
