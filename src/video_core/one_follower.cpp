@@ -157,6 +157,22 @@ thread_local u32 t_lent_depth{};
 thread_local bool t_playing_draw{};
 /// E: the kind of the query being lent or pushed (SetQueryKind), consumed by it.
 thread_local QueryKind t_query_kind{QueryKind::Count};
+/// E: SetLendSite's name for the next Lend, consumed by it.
+thread_local const char* t_lend_site{};
+/// E's lends by call site (written on E; the 10 s line reads them on R in a frame-end lend,
+/// E parked). Keyed by the name's pointer (one literal per site); the rest counted together.
+struct LendSite {
+    const char* name{};
+    u8 op{};
+    u64 count{};
+    u64 ns{};
+    u64 count_logged{};
+    u64 ns_logged{};
+};
+constexpr size_t LendSiteSlots = 96;
+std::array<LendSite, LendSiteSlots> g_lend_sites{};
+LendSite g_lend_sites_rest{};
+u64 g_lend_sites_log_ns{};
 /// R: the number of the packet it plays (or played last): its place for the page write stamps.
 thread_local u32 t_play_number{};
 constexpr u64 StampSlots = u64{1} << 22;
@@ -380,6 +396,71 @@ void RaisePlayed() {
     GpuSplit::Get().RaisePlayed((std::min)(intended, Floor(played, sent_packets)));
 }
 
+/// E, after a lend's park: its site's count and time.
+void NoteLendSite(LentOp op, u64 ns) {
+    const char* const name = std::exchange(t_lend_site, nullptr);
+    LendSite* slot = &g_lend_sites_rest;
+    for (auto& site : g_lend_sites) {
+        if (site.name == name && site.op == static_cast<u8>(op)) {
+            slot = &site;
+            break;
+        }
+        if (site.name == nullptr && site.count == 0) {
+            site.name = name; // null: Lend called directly (draws, verify compares)
+            site.op = static_cast<u8>(op);
+            slot = &site;
+            break;
+        }
+    }
+    ++slot->count;
+    slot->ns += ns;
+}
+
+/// The lends by site, every 10 s (R, at frame-end lends: E parked), the 16 costliest.
+void LogLendSites() {
+    const u64 now = Common::Nx2Hitch::NowNs();
+    if (g_lend_sites_log_ns == 0) {
+        g_lend_sites_log_ns = now;
+        return;
+    }
+    if (now - g_lend_sites_log_ns < 10'000'000'000ULL) {
+        return;
+    }
+    const double seconds = static_cast<double>(now - g_lend_sites_log_ns) / 1e9;
+    g_lend_sites_log_ns = now;
+    struct Row {
+        const LendSite* site;
+        u64 count;
+        u64 ns;
+    };
+    std::vector<Row> rows;
+    const auto take = [&](LendSite& site) {
+        const Row row{&site, site.count - site.count_logged, site.ns - site.ns_logged};
+        site.count_logged = site.count;
+        site.ns_logged = site.ns;
+        if (row.count != 0) {
+            rows.push_back(row);
+        }
+    };
+    for (auto& site : g_lend_sites) {
+        take(site);
+    }
+    take(g_lend_sites_rest);
+    std::ranges::sort(rows, [](const Row& a, const Row& b) { return a.ns > b.ns; });
+    std::string text;
+    for (size_t i = 0; i < rows.size() && i < 16; ++i) {
+        const LendSite& site = *rows[i].site;
+        const char* const op = site.op < lent_op_names.size() ? lent_op_names[site.op] : "?";
+        text += fmt::format("{}{} ({}) {:.0f}/s {:.1f} ms/s", text.empty() ? "" : "; ",
+                            &site == &g_lend_sites_rest ? "other sites"
+                            : site.name != nullptr      ? site.name
+                                                        : "direct",
+                            op, static_cast<double>(rows[i].count) / seconds,
+                            static_cast<double>(rows[i].ns) / 1e6 / seconds);
+    }
+    LOG_INFO(HW_GPU, "One follower lends by site (E parked, 10 s, costliest first): {}", text);
+}
+
 /// The query kinds' 10 s line (R, at frame-end lends).
 void LogQueryKinds() {
     const u64 now = Common::Nx2Hitch::NowNs();
@@ -405,7 +486,8 @@ void LogQueryKinds() {
     // fable_b 11.3: the acquire latches by thread (session totals): R's is the expected one.
     static constexpr std::array<const char*, static_cast<size_t>(InvalKind::Count)> inval_names{
         "run on E", "lent: texture page", "lent: shader page", "lent: query page",
-        "lent: hit at the second look"};
+        "lent: hit at the second look", "inline uploads on E",
+        "inline uploads with R's half lent", "inline uploads lent: query page"};
     std::string inval;
     for (size_t i = 0; i < inval_names.size(); ++i) {
         const u64 count = g.inval_count[i].load(std::memory_order_relaxed);
@@ -431,6 +513,7 @@ void LogQueryKinds() {
 
 void LogMaybe() {
     LogQueryKinds();
+    LogLendSites();
     Stats::Logged now{};
     now.step = static_cast<StepLevel>(g.step.load(std::memory_order_relaxed));
     now.asked = g.asked.load(std::memory_order_relaxed);
@@ -991,13 +1074,14 @@ void Lend(LentOp op, LentReason reason, void (*function)(void*), void* argument)
         if (op == LentOp::Draw) {
             t_next_draw_set = false;
         }
+        t_lend_site = nullptr;
         function(argument); // R, another thread, or R not running: in place, as today
         return;
     }
     const StepLevel step = Step();
     const bool timing = Stats::Timing();
     const u64 begin = timing ? Stats::Now() : 0;
-    const u64 begin_clock = op == LentOp::Query ? Common::Nx2Hitch::NowNs() : 0;
+    const u64 begin_clock = Common::Nx2Hitch::NowNs();
     const u64 behind = Behind();
     const u64 number = ++g.pushed;
     u8* const buffer = PackBuffer();
@@ -1032,11 +1116,12 @@ void Lend(LentOp op, LentReason reason, void (*function)(void*), void* argument)
     g.e_wait_op.store(static_cast<u8>(op), std::memory_order_relaxed);
     EngineWait([&] { return g.played.load(std::memory_order_acquire) >= number; }, EWait::Park,
                number);
+    const u64 parked_ns = Common::Nx2Hitch::NowNs() - begin_clock;
+    NoteLendSite(op, parked_ns);
     if (op == LentOp::Query && t_query_kind != QueryKind::Count) {
         const size_t kind_index = static_cast<size_t>(t_query_kind);
         g.query_count[kind_index].fetch_add(1, std::memory_order_relaxed);
-        g.query_parked_ns[kind_index].fetch_add(Common::Nx2Hitch::NowNs() - begin_clock,
-                                                std::memory_order_relaxed);
+        g.query_parked_ns[kind_index].fetch_add(parked_ns, std::memory_order_relaxed);
         t_query_kind = QueryKind::Count;
     }
     if (timing) {
@@ -1153,6 +1238,12 @@ bool InvalOnEngine() noexcept {
     return true;
 }
 
+bool CopyOnEngine() noexcept {
+    return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_copy_e,
+                                            "FRITCHII_ONEF_COPY_E") != 0 &&
+           InvalOnEngine();
+}
+
 void StampPageWrites(u64 address, u64 size) noexcept {
     if (size == 0 || !g.stamps_on.load(std::memory_order_acquire)) {
         return;
@@ -1189,6 +1280,15 @@ bool WrittenAheadOfRender(u64 address, u64 size) noexcept {
         }
     }
     return false;
+}
+
+bool QueryOpsOnBufferPages() noexcept {
+    return QueryOps() && VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_query_ops,
+                                                          "FRITCHII_ONEF_QUERY_OPS") >= 2;
+}
+
+void SetLendSite(const char* site) noexcept {
+    t_lend_site = site;
 }
 
 void SetQueryKind(QueryKind kind) noexcept {

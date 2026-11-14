@@ -494,6 +494,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_ONEF_LEAN") {
         return &g_onef_lean;
     }
+    if (name == "FRITCHII_ONEF_COPY_E") {
+        return &g_onef_copy_e;
+    }
     return nullptr;
 }
 

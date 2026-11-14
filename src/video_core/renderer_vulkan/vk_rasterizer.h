@@ -237,6 +237,9 @@ private:
     /// E (FRITCHII_ONEF_INVAL_E): whether this invalidation runs on E (no range on R's pages).
     [[nodiscard]] bool OneFollowerInvalidationOnEngine(
         std::span<const std::pair<DAddr, std::size_t>> sequences);
+    /// E (FRITCHII_ONEF_COPY_E): runs an inline upload here; false = lend it whole.
+    [[nodiscard]] bool OneFollowerInlineOnEngine(GPUVAddr address, size_t copy_size,
+                                                 std::span<const u8> memory);
 
     /// False when no page of the range was ever written by the GPU through the buffer cache.
     bool MayBeGpuModified(DAddr addr, u64 size);
