@@ -3892,6 +3892,31 @@ bool RasterizerVulkan::ClearVolumeSlices(const Framebuffer* framebuffer, u32 fir
 }
 
 void RasterizerVulkan::Clear(u32 layer_count) {
+    // FRITCHII_ONEF_OP_CLEAR (fable_b 13.4 group 3): E has decided ShouldExecute (DrawManager)
+    // and runs the clear's one E half, FlushCaching, here; the rest is R's (render targets and
+    // clear values are view registers, the texture cache and scheduler R's): a render op, its
+    // R-only flags by rule 1 (PacketRenderState).
+    if (VideoCommon::OneFollower::ShouldLend() && VideoCommon::OneFollower::PostClears())
+        [[unlikely]] {
+        gpu_memory->FlushCaching();
+        struct Op {
+            RasterizerVulkan* self;
+            u32 layer_count;
+        } const op{this, layer_count};
+        VideoCommon::OneFollower::PushOp(
+            VideoCommon::OneFollower::LentOp::Clear,
+            [](void* raw) {
+                Op a;
+                std::memcpy(&a, raw, sizeof(a));
+                a.self->onef_clear_posted = true;
+                SCOPE_EXIT {
+                    a.self->onef_clear_posted = false;
+                };
+                a.self->Clear(a.layer_count);
+            },
+            &op, sizeof(op), false, VideoCommon::OneFollower::PacketRenderState);
+        return;
+    }
     ONEF_LEND(Clear, Clear(layer_count))
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Clear};
     const VideoCommon::FritchiiDrawKinds::Scope draw_kinds_scope{maxwell3d->regs, true};
@@ -3911,7 +3936,9 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     const auto alloc_before = alloc_timing ? Vulkan::MemoryAllocator::ReadImageTiming()
                                            : Vulkan::MemoryAllocator::ImageTiming{};
     FlushWork();
-    gpu_memory->FlushCaching();
+    if (!onef_clear_posted) {
+        gpu_memory->FlushCaching(); // a posted clear's ran on E, at its place
+    }
     const auto clear_flushed = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point clear_targets_ready{};
     // What the texture cache did for this clear's targets (JoinImages, framebuffers).
@@ -5937,13 +5964,25 @@ bool RasterizerVulkan::TryCacheInvalidation(DAddr addr, u64 size) {
     return true;
 }
 
+bool RasterizerVulkan::OneFollowerRunaheadOff(const char* where) {
+    const auto mode = VideoCommon::Runahead::CurrentMode();
+    // FRITCHII_ONEF_GATHER_E's last condition, logged once per change.
+    static std::atomic<int> logged{-1};
+    if (logged.exchange(static_cast<int>(mode), std::memory_order_relaxed) !=
+        static_cast<int>(mode)) [[unlikely]] {
+        LOG_INFO(Render_Vulkan, "One follower: gathers on E see runahead mode {} (at {})",
+                 static_cast<int>(mode), where);
+    }
+    return mode == VideoCommon::Runahead::Mode::Off;
+}
+
 void RasterizerVulkan::InvalidateGPUCache() {
     // FRITCHII_ONEF_GATHER_E: the take runs on E (GPU::InvalidateGPUCache, as on the split's back
     // without one follower); OnCacheInvalidations then applies or lends. Runahead keeps the
     // whole gather lent (its boundary state).
     const bool onef_on_engine =
         VideoCommon::OneFollower::ShouldLend() && VideoCommon::OneFollower::GatherOnEngine() &&
-        VideoCommon::Runahead::CurrentMode() == VideoCommon::Runahead::Mode::Off;
+        OneFollowerRunaheadOff("InvalidateGPUCache");
     if (!onef_on_engine) {
         ONEF_LEND(Invalidation, InvalidateGPUCache())
     }
@@ -5962,7 +6001,7 @@ void RasterizerVulkan::InvalidateTextureDataCache() {
     // FRITCHII_ONEF_GATHER_E: on E (its gather as InvalidateGPUCache's; WaitForIdle stays lent).
     const bool onef_on_engine =
         VideoCommon::OneFollower::ShouldLend() && VideoCommon::OneFollower::GatherOnEngine() &&
-        VideoCommon::Runahead::CurrentMode() == VideoCommon::Runahead::Mode::Off;
+        OneFollowerRunaheadOff("InvalidateTextureDataCache");
     if (!onef_on_engine) {
         ONEF_LEND(Invalidation, InvalidateTextureDataCache())
     }

@@ -130,6 +130,10 @@ struct Impl {
     u64 ahead_checks_logged{};
 
     // fable_b 12.3's dry prices (E counts; the frame-end line reads them).
+    std::array<std::atomic<u64>, static_cast<size_t>(OpCount::Count)> op_count{};
+    std::atomic<u64> op_bytes{};
+    std::array<u64, static_cast<size_t>(OpCount::Count)> op_logged{};
+    u64 op_bytes_logged{};
     std::atomic<u64> fences_lent{};
     std::atomic<u64> fences_with_flush{};
     std::atomic<u64> gathers_lent{};
@@ -526,6 +530,25 @@ void LogQueryKinds() {
              Posted() ? 1 : 0, seconds, rate(0), rate(1), gathers,
              gathers > 0 ? rate(3) / gathers : 0.0);
     g.posting_logged = posting;
+    static constexpr std::array<const char*, static_cast<size_t>(OpCount::Count)> op_names{
+        "posted", "lent: a sync in a held fill", "lent: inside a draw fill", "lent: no room",
+        "lent: no packet ticks"};
+    std::string ops;
+    for (size_t i = 0; i < op_names.size(); ++i) {
+        const u64 count = g.op_count[i].load(std::memory_order_relaxed);
+        ops += fmt::format("{}{} {:.0f}/s", i == 0 ? "" : ", ", op_names[i],
+                           static_cast<double>(count - g.op_logged[i]) / seconds);
+        g.op_logged[i] = count;
+    }
+    const u64 op_bytes = g.op_bytes.load(std::memory_order_relaxed);
+    const double posted = static_cast<double>(g.op_count[0].load(std::memory_order_relaxed));
+    (void)posted;
+    LOG_INFO(HW_GPU,
+             "One follower op packets (fable_b 13.1; FRITCHII_ONEF_OP_INLINE={}) {:.0f} s: {}; "
+             "{:.1f} KiB/s of entries posted",
+             PostOpSite(15) ? 1 : 0, seconds, ops,
+             static_cast<double>(op_bytes - g.op_bytes_logged) / 1024.0 / seconds);
+    g.op_bytes_logged = op_bytes;
     LOG_INFO(HW_GPU,
              "One follower queries by kind (FRITCHII_ONEF_QUERY_OPS={}) {:.0f} s: {}; acquire "
              "latches this session by R {}, E {}, other threads {}",
@@ -1159,7 +1182,7 @@ void Lend(LentOp op, LentReason reason, void (*function)(void*), void* argument)
 }
 
 void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size,
-            bool lands_in_memory) {
+            bool lands_in_memory, u8 packet_flags) {
     if (!Detail::t_engine || !g.thread.joinable() || size > MaxPayloadBytes) {
         function(const_cast<void*>(payload));
         return;
@@ -1171,6 +1194,7 @@ void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size,
     u8* const buffer = PackBuffer();
     PacketHeader header{};
     header.kind = PacketKind::Op;
+    header.flags = packet_flags;
     header.op = static_cast<u8>(op);
     header.call = LentCall{function, nullptr};
     std::size_t spans_bytes = 0;
@@ -1263,10 +1287,50 @@ bool InvalOnEngine() noexcept {
     return true;
 }
 
+bool PostClears() noexcept {
+    return g.on && Step() == StepLevel::Unlend &&
+           VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_op_clear,
+                                            "FRITCHII_ONEF_OP_CLEAR") != 0 &&
+           ViewReady();
+}
+
+bool PostOpSite(u8 site) noexcept {
+    if (!g.on || Step() != StepLevel::Unlend) {
+        return false;
+    }
+    using namespace VideoCore::Nx2Debug;
+    switch (site) {
+    case 15: // MemStage::Site::InlineUpload
+        return SwitchValue(g_onef_op_inline, "FRITCHII_ONEF_OP_INLINE") != 0;
+    default:
+        return false;
+    }
+}
+
+void CountOpPacket(OpCount kind, u64 bytes) noexcept {
+    g.op_count[static_cast<size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
+    if (bytes != 0) {
+        g.op_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
+}
+
 bool GatherOnEngine() noexcept {
-    return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_gather_e,
-                                            "FRITCHII_ONEF_GATHER_E") != 0 &&
-           InvalOnEngine();
+    const int value = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_gather_e,
+                                                       "FRITCHII_ONEF_GATHER_E");
+    const bool inval = value != 0 && InvalOnEngine();
+    // The guard's parts, logged once per change (the GATHER_E probe found it never true).
+    static std::atomic<int> logged{-1};
+    const int state = (value != 0 ? 1 : 0) | (inval ? 2 : 0) |
+                      (static_cast<int>(Step()) << 2) | (g_e_pipeline ? 32 : 0);
+    if (logged.exchange(state, std::memory_order_relaxed) != state) [[unlikely]] {
+        LOG_INFO(HW_GPU,
+                 "One follower: FRITCHII_ONEF_GATHER_E={} (INVAL_E's conditions {}, step {}, "
+                 "E_PIPELINE {}, INVAL_E switch {})",
+                 value, inval ? "met" : "not met", static_cast<int>(Step()), g_e_pipeline ? 1 : 0,
+                 VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_inval_e,
+                                                  "FRITCHII_ONEF_INVAL_E"));
+    }
+    return inval;
 }
 
 bool CopyOnEngine() noexcept {

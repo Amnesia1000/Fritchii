@@ -858,6 +858,11 @@ private:
     [[nodiscard]] bool OwnedHere() const noexcept;
     void SetPending();
     void PlayPending(bool late);
+    /// One follower (fable_b 13.1): E posts its pending entries as one ring B op packet and
+    /// pushes BufferOp{its number}; false = not posted (the caller lends, as before).
+    bool PostPendingOp();
+    /// R, at a BufferOp: plays the op packet `number` (13.2 R1: by name).
+    void PlayRingOp(u64 number);
     void CloseSection(Site site, u32 index, u32 begin);
     void EnterSync(Sync kind);
     void Note(SeamHook::Use use, const std::source_location& location, bool around);
@@ -946,6 +951,8 @@ private:
     std::array<DiffSite, DIFF_SITES> diff_site_table{};
     bool claim_deferring{};
     bool pending{};
+    /// The site of the bracket the first pending entry was recorded in (PostPendingOp).
+    Site pending_site{Site::Count};
     u32 play_cursor{};
     u32 last_entry{~0U};
 
@@ -1037,6 +1044,9 @@ private:
         u64 stage_writes;  ///< Step 7: GPUMem's own writes noted when the fill ended
     };
     static constexpr u64 RingBytes = u64{4} << 20;
+    /// RingHeader::kind of an op packet (fable_b 13.1): 0 pad, 1 draw.
+    static constexpr u8 RingKindOp = 2;
+    static_assert(sizeof(RingHeader) % 8 == 0, "op entries are played in place (8-aligned)");
     std::unique_ptr<u8[]> ring_b;
     // Each thread's control fields on their own cache line (step 7: with the window open both
     // write theirs for every packet, and one shared line bounced between the cores).

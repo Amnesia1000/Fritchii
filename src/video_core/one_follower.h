@@ -179,6 +179,9 @@ enum class Check : u8 {
     /// stream (an invalidation E ran without R, on pages no image had yet): the section 5 hazard
     /// the page filter cannot see. The image uploads again at its next use.
     TextureReadAhead,
+    /// fable_b 13.2 R1: R at a BufferOp found another packet at ring B's head (its kind or
+    /// number differs from the name); the op's entries are not played.
+    RingPairing,
     Count,
 };
 
@@ -187,7 +190,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Check::Count)> chec
     "view pools",    "build pipeline",   "build image views", "build dynamic",
     "build descriptors", "build render targets", "stream write", "owner on E", "owner on R",
     "build draw params", "build condition", "render packet missing", "drop not plain",
-    "facts stale", "played lookup miss", "texture read ahead of R",
+    "facts stale", "played lookup miss", "texture read ahead of R", "ring B pairing",
 };
 
 // --- The packet (E to R) -----------------------------------------------------------------------------
@@ -224,6 +227,10 @@ enum PacketFlag : u8 {
     /// mode (DrawPlayer::Condition, at the condition's stream place) is not False; a dropped
     /// draw's ring B packet is still played (its uploads and binds). Step 5 sets it; R honours it.
     PacketConditional = 4,
+    /// An op packet whose call reads and consumes R's render state (a clear): its R-only dirty
+    /// flags go by rule 1, as a draw packet's (PackSpans forwards each set one and clears it on
+    /// E's engine), not by difference.
+    PacketRenderState = 8,
 };
 
 /// One changed register word R watches.
@@ -518,8 +525,14 @@ void CountLentGatherRanges(u64 ranges) noexcept;
 /// `size` bytes (at most 64) copied into the packet. Elsewhere it runs in place.
 /// `lands_in_memory`: the op writes game memory later on R (a report): the front's E-position
 /// waits (FRITCHII_ONEF_WAITS_E) also wait for R to play it (GuestWriteOpMark).
+/// `packet_flags`: PacketFlag bits for the op's header (PacketRenderState).
 void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size,
-            bool lands_in_memory = false);
+            bool lands_in_memory = false, u8 packet_flags = 0);
+/// FRITCHII_ONEF_OP_CLEAR (live; fable_b 13.4 group 3; step 4, the view tracked): clears as render
+/// ops R plays from its view; E runs the clear's FlushCaching first.
+[[nodiscard]] bool PostClears() noexcept;
+/// E: the view is tracked and seeded at R (a posted op reads it).
+[[nodiscard]] bool ViewReady() noexcept;
 
 /// FRITCHII_ONEF_WAITS_E (live; fable_b 11.2): the front's waits on game memory, QMDs,
 /// semaphore flushes and lists read E's position (`consumed`), the rest R's (`played`).
@@ -539,6 +552,20 @@ void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size,
 /// writes (InvalidateGPUCache's gather) are taken and applied to the buffer cache on E; R's
 /// half (texture, shader caches) only where their filters are hit (then the gather is lent).
 [[nodiscard]] bool GatherOnEngine() noexcept;
+/// fable_b 13.1: whether E's pending buffer commands of memory seam site `site` (MemStage::Site)
+/// are posted as a ring B op packet (R plays them at a BufferOp) instead of lent. Group 1:
+/// FRITCHII_ONEF_OP_INLINE, the inline upload site. Step 4 only.
+[[nodiscard]] bool PostOpSite(u8 site) noexcept;
+/// The op packets' line (E counts): posted (with their entry bytes), or lent and why.
+enum class OpCount : u8 {
+    Posted,
+    LentHeldFill,   ///< a sync inside a held (draw) fill: R plays part of E's arena (R3)
+    LentRingFill,   ///< inside E's draw fill (FillRingDraw): its own ring B packet
+    LentNoRoom,     ///< ring B short of room
+    LentNoTicks,    ///< no packet ticks (R5 needs the op's number in their accounting)
+    Count,
+};
+void CountOpPacket(OpCount kind, u64 bytes = 0) noexcept;
 /// E: stamps [address, address + size)'s pages with the next packet's number (before the
 /// filters' second look: WrittenAheadOfRender's Dekker pair).
 void StampPageWrites(u64 address, u64 size) noexcept;

@@ -1400,6 +1400,19 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   FRITCHII_ONEF_COPY_E also runs AccelerateInlineWords on E (no piece on a query page; its
   pages stamped first), and FRITCHII_ONEF_POSTED posts FragmentBarrier and FlushCommands as
   render ops (R's scheduler and counters only).
+- FRITCHII_ONEF_OP_INLINE (live, default 0; fable_b_one_follower 13.1, 13.4 group 1; step 4):
+  1 = the buffer commands E's inline uploads record (FRITCHII_ONEF_COPY_E runs them on E) are
+  posted: at the play of the pending entries E writes them by value as one ring B op packet
+  (kind 2, its number the entries' packet tick) and pushes a BufferOp naming it; R plays it
+  through MemPlayer::Exec, after any held draw packet's rest, with no fill state of E's and no
+  lock handed over. Lent as before: a sync inside a held fill, E's own draw fill, no room, no
+  packet ticks. Must be 0: "ring B pairing" (R found another packet at the head), "owner on R"
+  (an entry's play entered the buffer cache). The "One follower op packets" line counts them.
+- FRITCHII_ONEF_OP_CLEAR (live, default 0; fable_b_one_follower 13.4 group 3; step 4, view
+  tracked): 1 = clears are render ops. E has decided the render enable (DrawManager tests
+  ShouldExecute) and runs the clear's FlushCaching; R plays Clear from its view (every clear
+  register is a watched word) without it. The op carries its R-only dirty flags by rule 1, as a
+  draw packet does (PacketRenderState). Counted as "clear" lends gone from the lends-by-site line.
 - With FRITCHII_ONEF=1 (or LEAN), every 10 s "One follower lends by site" lists the 16 lent
   call sites that parked E longest (the rasterizer function's name and its op, rate and parked
   ms/s; "direct" = Lend called outside the rasterizer's entry points: lent draws, verify
