@@ -1071,9 +1071,16 @@ private:
                                     bool ring_marked, u64 ring_since, bool first_this_frame,
                                     u32 index);
     /// FRITCHII_BANK_FLAGGED: the snapshot bytes of [device_addr, device_addr + size) set to
-    /// `bytes`, what an upload staged for the host buffer (MappedUploadMemory). Pages without a
-    /// snapshot are left alone (their first bind takes one and marks the page changed).
+    /// `bytes` (cached memory, never the write-combined staging), what an upload gives the host
+    /// buffer (MappedUploadMemory, InlineMemoryImplementation). Pages without a snapshot are left
+    /// alone (their first bind takes one and marks the page changed).
     void RefreshNativeBankSnapshots(DAddr device_addr, u64 size, const u8* bytes);
+    /// FRITCHII_BANK_FLAGGED: whether any page of [begin, end) has a snapshot (the table's
+    /// present bits, 64 pages a word; with the node map, whether it holds any snapshot).
+    [[nodiscard]] bool NativeBankAnySnapshot(DAddr begin, DAddr end);
+    /// FRITCHII_BANK_FLAGGED: guest bytes of an upload over snapshotted pages, read once here
+    /// (cached), then copied to staging and into the snapshots.
+    Common::ScratchBuffer<u8> native_bank_refresh_scratch;
     /// FRITCHII_BANK_CENSUS: the 10 s line.
     void LogNativeBankCensus(std::chrono::steady_clock::time_point now);
     /// Sets the page's recheck flag (and its region bit with the table).

@@ -4173,6 +4173,47 @@ bool BufferCache<P>::NativeBankPagesSettled(DAddr first_page, DAddr end) {
 }
 
 template <class P>
+bool BufferCache<P>::NativeBankAnySnapshot(DAddr begin, DAddr end) {
+    if (begin >= end) {
+        return false;
+    }
+    if (!native_bank_table_on || ((end - 1) >> NativeBankAddressBits) != 0) {
+        // The node map: no range lookup, so any snapshot at all counts.
+        return !native_indirect_page_snapshots.empty() ||
+               (native_bank_table_on && native_bank_table_pages != 0);
+    }
+    if (!native_bank_regions || native_bank_table_pages == 0) {
+        return false;
+    }
+    // The table's present bits, a word (64 pages) at a time.
+    for (DAddr page = Common::AlignDown(begin, Core::DEVICE_PAGESIZE); page < end;) {
+        const u64 region_index = page >> NativeBankRegionBits;
+        const DAddr region_end_full = (region_index + 1) << NativeBankRegionBits;
+        const NativeBankRegion* const region =
+            region_index == native_bank_last_region_index
+                ? native_bank_last_region
+                : (*native_bank_regions)[region_index].get();
+        if (region != nullptr) {
+            const DAddr region_end = (std::min<DAddr>)(end, region_end_full);
+            u64 slot = (page >> Core::DEVICE_PAGEBITS) & (NativeBankRegionPages - 1);
+            const u64 last = ((region_end - 1) >> Core::DEVICE_PAGEBITS) &
+                             (NativeBankRegionPages - 1);
+            while (slot <= last) {
+                const u64 first_bit = slot % 64;
+                const u64 bits = (std::min<u64>)(64 - first_bit, last - slot + 1);
+                const u64 mask = (bits == 64 ? ~u64{0} : (u64{1} << bits) - 1) << first_bit;
+                if ((region->present[slot / 64] & mask) != 0) {
+                    return true;
+                }
+                slot += bits;
+            }
+        }
+        page = region_end_full;
+    }
+    return false;
+}
+
+template <class P>
 void BufferCache<P>::ClearNativeBankSnapshots() {
     native_indirect_page_snapshots.clear();
     if (native_bank_regions) {
@@ -6405,14 +6446,23 @@ void BufferCache<P>::MappedUploadMemory([[maybe_unused]] Buffer& buffer,
         for (BufferCopy& copy : copies) {
             u8* const src_pointer = staging_pointer.data() + copy.src_offset;
             const DAddr device_addr = buffer.CpuAddr() + copy.dst_offset;
-            device_memory.ReadBlockUnsafe(device_addr, src_pointer, copy.size);
+            // FRITCHII_BANK_FLAGGED: the bank snapshots of these bytes become what the host
+            // buffer gets (guest memory may hold newer bytes already). Never read back from the
+            // staging memory: it is write-combined, uncached for the CPU (reading it back cost
+            // 60% of the back thread at 2,500 pages a second). A copy over a snapshotted page
+            // reads guest memory once into cached scratch, which fills staging and snapshots.
+            if (native_bank_flagged_on &&
+                NativeBankAnySnapshot(device_addr, device_addr + copy.size)) [[unlikely]] {
+                native_bank_refresh_scratch.resize_destructive(copy.size);
+                u8* const scratch = native_bank_refresh_scratch.data();
+                device_memory.ReadBlockUnsafe(device_addr, scratch, copy.size);
+                std::memcpy(src_pointer, scratch, copy.size);
+                RefreshNativeBankSnapshots(device_addr, copy.size, scratch);
+            } else {
+                device_memory.ReadBlockUnsafe(device_addr, src_pointer, copy.size);
+            }
             MemReadLog::Staged(MemReadLog::Kind::Upload, device_memory, device_addr, src_pointer,
                                copy.size);
-            // FRITCHII_BANK_FLAGGED: the bank snapshots of these bytes become what the host
-            // buffer gets, the staged copy (guest memory may hold newer bytes already).
-            if (native_bank_flagged_on) [[unlikely]] {
-                RefreshNativeBankSnapshots(device_addr, copy.size, src_pointer);
-            }
             // Large uploads are mostly geometry the host GPU now has its own copy of: TickFrame
             // marks their guest memory cold (see TextureCache::RefreshContents).
             if (copy.size >= 256_KiB) {
@@ -6469,9 +6519,11 @@ void BufferCache<P>::InlineMemoryImplementation(DAddr dest_address, size_t copy_
         }};
         u8* const src_pointer = upload_staging.mapped_span.data();
         std::memcpy(src_pointer, inlined_buffer.data(), copy_size);
-        // FRITCHII_BANK_FLAGGED: these bytes are the host copy's now, as an upload's are.
-        if (native_bank_flagged_on) [[unlikely]] {
-            RefreshNativeBankSnapshots(dest_address, copy_size, src_pointer);
+        // FRITCHII_BANK_FLAGGED: these bytes are the host copy's now, as an upload's are (from
+        // the caller's cached bytes, never the write-combined staging memory).
+        if (native_bank_flagged_on &&
+            NativeBankAnySnapshot(dest_address, dest_address + copy_size)) [[unlikely]] {
+            RefreshNativeBankSnapshots(dest_address, copy_size, inlined_buffer.data());
         }
         const bool can_reorder = runtime.CanReorderUpload(buffer, copies);
         runtime.CopyBuffer(buffer, upload_staging.buffer, copies, true, can_reorder);
