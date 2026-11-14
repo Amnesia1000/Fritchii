@@ -763,6 +763,35 @@ public:
     /// instead of answering Overlap; changed only on a Miss.
     DispatchCheck DispatchesMayWriteSince(u64 since, u64 begin, u64 size, bool wait, u64& checked,
                                           bool& waited, ListedWrites* listed = nullptr);
+    /// FRITCHII_FRONT_RAN_READS, after DispatchesMayWriteSince answered ScanLimit (so every
+    /// dispatch sent after `since` ran and recorded its writes): whether no dispatch write at or
+    /// after `since` was recorded over [begin, begin + size), from the dispatch stamps (the
+    /// newest recorded position per 64 KB block, in a hashed table whose collisions only make a
+    /// stamp newer; writes over 4 GB or unbounded ones stamp everything). The answer of the scan
+    /// without its limit, or stricter. `count` gets DispatchWriteCount() loaded before the
+    /// stamps: every record below it is covered by the answer. `wide`: refused by a write that
+    /// stamped everything.
+    [[nodiscard]] bool DispatchStampsMissSince(u64 since, u64 begin, u64 size, u64& count,
+                                               bool& wide) const {
+        count = dispatch_write_count.load(std::memory_order_acquire);
+        if (dispatch_wide_stamp.load(std::memory_order_acquire) >= since) {
+            wide = true;
+            return false;
+        }
+        wide = false;
+        if (size == 0) {
+            return true;
+        }
+        const u64 first = begin >> DispatchStampBits;
+        const u64 last = (begin + size - 1) >> DispatchStampBits;
+        for (u64 block = first; block <= last; ++block) {
+            if (dispatch_stamps[block % DispatchStampSlots].load(std::memory_order_acquire) >=
+                since) {
+                return false;
+            }
+        }
+        return true;
+    }
     /// The writes the back recorded so far.
     [[nodiscard]] u64 DispatchWriteCount() const {
         return dispatch_write_count.load(std::memory_order_acquire);
@@ -1635,6 +1664,13 @@ private:
     static constexpr u64 MaxDispatchScan = 2048;
     std::array<DispatchWrite, DispatchWriteSlots> dispatch_writes{};
     alignas(64) std::atomic<u64> dispatch_write_count{};
+    /// DispatchStampsMissSince's stamps: per 64 KB device block (hashed by block number), the
+    /// newest position a dispatch write over it was recorded at; `dispatch_wide_stamp` for the
+    /// writes that cover everything. Stored by AppendDispatchWrite before the count.
+    static constexpr u64 DispatchStampBits = 16;
+    static constexpr u64 DispatchStampSlots = 65536;
+    std::array<std::atomic<u64>, DispatchStampSlots> dispatch_stamps{};
+    std::atomic<u64> dispatch_wide_stamp{};
     std::atomic<u64> dispatches_bounded{};
     std::array<std::atomic<u64>, static_cast<size_t>(DispatchUnbounded::Count)>
         dispatches_unbounded{};

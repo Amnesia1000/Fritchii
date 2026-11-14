@@ -395,6 +395,11 @@ void GpuSplit::Stop() {
     dispatch_records = false;
     back_dispatch_records = false;
     dispatch_write_count.store(0, std::memory_order_relaxed);
+    // Positions start over: stamps of the old session would refuse every read.
+    for (auto& stamp : dispatch_stamps) {
+        stamp.store(0, std::memory_order_relaxed);
+    }
+    dispatch_wide_stamp.store(0, std::memory_order_relaxed);
     back_entry_position = 0;
     async_writes.clear();
     last_sync_position = 0;
@@ -1936,6 +1941,28 @@ void GpuSplit::AppendDispatchWrite(u64 begin, u64 end) {
     write.position.store(back_entry_position, std::memory_order_relaxed);
     write.begin.store(begin, std::memory_order_relaxed);
     write.end.store(end, std::memory_order_relaxed);
+    // DispatchStampsMissSince: the stamps before the count, so a front that loaded the count
+    // sees the stamps of every record below it. A max that holds even with two writers (the
+    // back, and GPUMem in a fill it runs for the back).
+    const u64 position = back_entry_position;
+    const auto raise = [position](std::atomic<u64>& stamp) {
+        u64 current = stamp.load(std::memory_order_relaxed);
+        while (current < position &&
+               !stamp.compare_exchange_weak(current, position, std::memory_order_release,
+                                            std::memory_order_relaxed)) {
+        }
+    };
+    if (begin < end) {
+        const u64 first = begin >> DispatchStampBits;
+        const u64 last = (end - 1) >> DispatchStampBits;
+        if ((begin == 0 && end == ~u64{0}) || last - first >= DispatchStampSlots) {
+            raise(dispatch_wide_stamp);
+        } else {
+            for (u64 block = first; block <= last; ++block) {
+                raise(dispatch_stamps[block % DispatchStampSlots]);
+            }
+        }
+    }
     dispatch_write_count.store(count + 1, std::memory_order_release);
 }
 

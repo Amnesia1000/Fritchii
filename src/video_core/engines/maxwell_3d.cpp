@@ -3687,7 +3687,15 @@ void NoteE2cMiss(VideoCommon::GpuSplit& split, u64 snapshot, u64 device, bool li
 // are compared with the drained ones ("Front ran reads (must be 0)"), which are used.
 // The page snapshot is left alone: (a)-(c) hold for the bytes read, not for the rest of the page,
 // whose noted writes may still be queued or owe a report; a snapshot moved to `done` would let
-// the hit path (which asks neither (a) nor (c)) serve those. Front thread only.
+// the hit path (which asks neither (a) nor (c)) serve those.
+// The same switch answers EXP10's dispatch check past its scan limit (DispatchCheck::ScanLimit:
+// more dispatch writes recorded since the page's last check than the scan compares, or the ring
+// dropped them): the scan has made every dispatch sent since run by then, each recorded write
+// stamped its 64 KB blocks before the record was counted, so no stamp at or after the snapshot
+// on the page's block is the scan's own "miss" without its limit (GpuSplit::
+// DispatchStampsMissSince); a block stamped since, or a write that stamped everything (an
+// unbounded or unconfirmed dispatch, an image without a guest range), still drains. Front
+// thread only.
 struct RanReadStats {
     enum Outcome : u32 { Served, Queued, PastTable, TwoPages, GpuWritten, Async, Listed, Count };
     static constexpr std::array<const char*, Count> names{
@@ -3695,6 +3703,35 @@ struct RanReadStats {
         "GPU-written page", "an async report owed", "a listed report"};
     std::array<u64, Count> outcomes{};
     u64 then_missed{}; ///< Spared the noted write, then drained for another writer
+    /// The compute/copy misses (reason 1) of reads while the switch is on, by cause. The dispatch
+    /// scan's limit (DispatchCheck::ScanLimit) is then answered by the dispatch stamps
+    /// (GpuSplit::DispatchStampsMissSince): passed, or refused by a stamp on the page's block or
+    /// by a write that stamped everything.
+    enum Compute : u32 {
+        WriterUnbounded,
+        WriterOverlap,
+        WriterScanLimit,
+        WriterForgotten,
+        DispatchQueued,
+        DispatchOverlap,
+        DispatchUnbounded,
+        ScanPassed,
+        ScanBlock,
+        ScanWide,
+        ByteOverlap,
+        ComputeCount,
+    };
+    static constexpr std::array<const char*, ComputeCount> compute_names{
+        "unbounded writer",          "writer range overlap",
+        "writer ranges past the scan", "writer ranges left the ring",
+        "dispatch queued",           "dispatch write overlap",
+        "unbounded dispatch",        "dispatches past the scan, passed by the stamps",
+        "dispatches past the scan, block stamped since", "dispatches past the scan, a wide write since",
+        "listed byte overlap"};
+    std::array<u64, ComputeCount> compute{};
+    /// Reads served (with 2: that would be) by what was spared: the noted write, the dispatch
+    /// scan's limit, both.
+    std::array<u64, 3> served{};
     u64 compared{};
     u64 differed{};
     u64 session_differed{};
@@ -3755,14 +3792,24 @@ void MaybeLogRanReads(int mode) {
                                    RanReadStats::names[i], rate(s.outcomes[i]));
         }
     }
+    std::string compute;
+    for (u32 i = 0; i < RanReadStats::ComputeCount; ++i) {
+        if (s.compute[i] != 0) {
+            compute += fmt::format("{} {} {:.0f}/s", compute.empty() ? "" : ",",
+                                   RanReadStats::compute_names[i], rate(s.compute[i]));
+        }
+    }
     LOG_INFO(HW_GPU,
              "Front ran reads (FRITCHII_FRONT_RAN_READS={}) {:.0f} s: noted-write misses checked "
              "{:.0f}/s, passed {:.0f}/s{} (of them drained for another writer after it "
-             "{:.0f}/s); drained:{}; verify: {} compared, {} differed (must be 0; {} this "
-             "session)",
+             "{:.0f}/s); drained:{}; compute/copy checks:{}; reads served{}: {:.0f}/s spared a "
+             "noted write, {:.0f}/s the dispatch scan's limit, {:.0f}/s both; verify: {} "
+             "compared, {} differed (must be 0; {} this session)",
              mode, seconds, rate(checked), rate(s.outcomes[RanReadStats::Served]),
              mode == 2 ? " (mode 2: would be; drained and compared)" : "", rate(s.then_missed),
-             drained, s.compared, s.differed, s.session_differed);
+             drained, compute.empty() ? std::string{" none"} : compute,
+             mode == 2 ? " (would be)" : "", rate(s.served[0]), rate(s.served[1]),
+             rate(s.served[2]), s.compared, s.differed, s.session_differed);
     const u64 session = s.session_differed;
     s = {};
     s.since = now;
@@ -3893,6 +3940,8 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             const int ran_mode = VideoCore::Nx2Debug::SwitchValue(
                 VideoCore::Nx2Debug::g_front_ran_reads, "FRITCHII_FRONT_RAN_READS");
             bool ran_passed = false;
+            // The dispatch scan's limit answered by the dispatch stamps (below).
+            bool scan_passed = false;
             const auto noted_write = [&](u64 since) {
                 if (!split.NotedWriteSince(since, *device, read_bytes)) {
                     return false;
@@ -3939,6 +3988,15 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                     ++(split.LastUnboundedWriterPosition() > since ? writer_unbounded
                                                                    : writer_overlaps);
                     ++writer_checks[static_cast<size_t>(writer_check)];
+                    if (ran_mode != 0) {
+                        ++g_ran_reads.compute[writer_check == WriterCheck::Unbounded
+                                                  ? RanReadStats::WriterUnbounded
+                                              : writer_check == WriterCheck::ScanLimit
+                                                  ? RanReadStats::WriterScanLimit
+                                              : writer_check == WriterCheck::Forgotten
+                                                  ? RanReadStats::WriterForgotten
+                                                  : RanReadStats::WriterOverlap];
+                    }
                 } else if (split.LastUnrangedPosition() > since) {
                     reason = 2;
                 } else if (noted_write(since)) {
@@ -3946,10 +4004,34 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                 } else {
                     // Last: the only check that may wait.
                     bool waited = false;
-                    const DispatchCheck check = split.DispatchesMayWriteSince(
+                    DispatchCheck check = split.DispatchesMayWriteSince(
                         since, page << 12, 0x1000, (exp10 & 3) != 2, snapshot.dispatch_writes,
                         waited, listed);
                     dispatch_waits += waited ? 1 : 0;
+                    // FRITCHII_FRONT_RAN_READS: past the scan's limit every dispatch sent since
+                    // has run and recorded its writes (the scan waits for that first, or answers
+                    // Queued); the dispatch stamps answer what the scan without its limit would.
+                    if (check == DispatchCheck::ScanLimit && ran_mode != 0) {
+                        u64 count = 0;
+                        bool wide = false;
+                        if (split.DispatchStampsMissSince(since, page << 12, 0x1000, count,
+                                                          wide)) {
+                            // As a scan miss: the records below `count` miss the page, and
+                            // there was nothing to list.
+                            check = DispatchCheck::Miss;
+                            snapshot.dispatch_writes = count;
+                            scan_passed = true;
+                            ++g_ran_reads.compute[RanReadStats::ScanPassed];
+                        } else {
+                            ++g_ran_reads.compute[wide ? RanReadStats::ScanWide
+                                                       : RanReadStats::ScanBlock];
+                        }
+                    } else if (check != DispatchCheck::Miss && ran_mode != 0) {
+                        ++g_ran_reads.compute[check == DispatchCheck::Queued ? RanReadStats::DispatchQueued
+                                              : check == DispatchCheck::Overlap
+                                                  ? RanReadStats::DispatchOverlap
+                                                  : RanReadStats::DispatchUnbounded];
+                    }
                     if (check != DispatchCheck::Miss) {
                         reason = 1;
                         ++dispatch_checks[static_cast<size_t>(check)];
@@ -3958,6 +4040,9 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                         if (listed->Overlaps(page << 12, *device, read_end)) {
                             reason = 1;
                             ++byte_overlaps;
+                            if (ran_mode != 0) {
+                                ++g_ran_reads.compute[RanReadStats::ByteOverlap];
+                            }
                         } else {
                             byte_skip = true;
                         }
@@ -3992,15 +4077,19 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             // with 2 a read it would serve drains all the same, the bytes read now kept to compare.
             thread_local std::vector<u32> ran_words;
             bool ran_verify = false;
-            if (ran_passed) {
-                if (!hit) {
-                    ++g_ran_reads.then_missed;
-                } else if (ran_mode == 2) {
+            if (ran_passed && !hit) {
+                ++g_ran_reads.then_missed;
+            }
+            const size_t spared = ran_passed && scan_passed ? 2 : ran_passed ? 0 : 1;
+            if ((ran_passed || scan_passed) && hit) {
+                if (ran_mode == 2) {
+                    // Counted here (would be served); 1 counts them where they are served.
+                    ++g_ran_reads.served[spared];
                     ran_words.resize(words);
                     memory_manager.ReadBlockUnsafe(source, ran_words.data(), read_bytes);
                     ran_verify = true;
                     hit = false;
-                    ++miss_reasons[3];
+                    ++miss_reasons[ran_passed ? 3 : 1];
                 }
             }
             if (ran_mode != 0) {
@@ -4013,6 +4102,9 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                 snap_words.resize(words);
                 if (hit) {
                     ++hits;
+                    if (ran_passed || scan_passed) {
+                        ++g_ran_reads.served[spared];
+                    }
                     memory_manager.ReadBlockUnsafe(source, snap_words.data(), read_bytes);
                     if (snapshot_mode == 10) {
                         split.Drain(VideoCommon::DrainSite::MacroDmaRead);
