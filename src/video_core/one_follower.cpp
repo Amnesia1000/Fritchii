@@ -13,19 +13,27 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <exception>
+#include <functional>
+#include <string>
 #include <memory>
 #include <mutex>
 #include <thread>
 #include <utility>
 #include <vector>
 
+#include <fmt/format.h>
+
 #include "common/dkb_cpu_trace.h"
+#include "common/spin_recursive_mutex.h"
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "common/thread.h"
 #include "core/core.h"
 #include "video_core/gpu_split.h"
+#include "video_core/gpu_wait_site.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/one_follower.h"
 #include "video_core/one_follower_stats.h"
@@ -97,6 +105,22 @@ struct Impl {
     std::atomic<bool> e_waiting{};
 
     std::exception_ptr lent_error; ///< thrown by a lent call on R, rethrown on E
+
+    // The hang watchdog's view: written relaxed by E and R (no clock), read once a second.
+    std::jthread watchdog;
+    std::atomic<u8> e_wait{};         ///< EWait: what E waits for
+    std::atomic<u64> e_wait_seq{};    ///< E's waits begun (one that never ends keeps it still)
+    std::atomic<u8> e_wait_op{};      ///< the lend's LentOp (EWait::Park)
+    std::atomic<u64> e_wait_number{}; ///< the packet E waits for (park, drain) or pushes (room)
+    std::atomic<u64> r_packet{};      ///< the packet R plays, 0 between packets
+    std::atomic<u8> r_kind{};         ///< its PacketKind
+    std::atomic<u8> r_op{};           ///< its LentOp, for a lent packet
+    std::atomic<u64> r_progress{};    ///< packets and pads R finished
+    std::atomic<u64> rescued{};       ///< wakes the watchdog gave
+    std::atomic<std::thread::id> e_thread{};
+    std::atomic<std::thread::id> r_thread{};
+    std::array<std::pair<const char*, const Common::SpinRecursiveMutex*>, 4> locks{};
+    std::atomic<u32> lock_count{};
 
     std::atomic<Maxwell3D*> engine{};
 };
@@ -172,12 +196,25 @@ void Refresh(u32 generation) {
     g.seen_generation.store(generation, std::memory_order_release);
 }
 
+/// What E waits for (the watchdog's report).
+enum class EWait : u8 { None, Park, Room, Drain };
+constexpr std::array<const char*, 4> e_wait_names{"running", "parked in a lend",
+                                                  "waiting for ring room or the window",
+                                                  "draining R"};
+
 /// E waits until `ready` holds; returns the nanoseconds waited (0 at once, or without the profile).
 template <typename Ready>
-u64 EngineWait(Ready&& ready) {
+u64 EngineWait(Ready&& ready, EWait kind = EWait::Room, u64 number = 0) {
     if (ready()) {
         return 0;
     }
+    g.e_wait_number.store(number, std::memory_order_relaxed);
+    g.e_wait.store(static_cast<u8>(kind), std::memory_order_relaxed);
+    g.e_wait_seq.store(g.e_wait_seq.load(std::memory_order_relaxed) + 1,
+                       std::memory_order_relaxed);
+    SCOPE_EXIT {
+        g.e_wait.store(static_cast<u8>(EWait::None), std::memory_order_relaxed);
+    };
     const bool timing = Stats::Timing();
     const u64 begin = timing ? Stats::Now() : 0;
     for (u32 spins = 0;; ++spins) {
@@ -189,6 +226,8 @@ u64 EngineWait(Ready&& ready) {
             continue;
         }
         g.e_waiting.store(true, std::memory_order_seq_cst);
+        // The flag before `ready`'s loads (they are acquire loads): WakeEngine's fence pairs.
+        std::atomic_thread_fence(std::memory_order_seq_cst);
         const u32 seen = g.e_wake.load(std::memory_order_seq_cst);
         if (!ready()) {
             g.e_wake.wait(seen, std::memory_order_seq_cst);
@@ -198,7 +237,14 @@ u64 EngineWait(Ready&& ready) {
     return timing ? Stats::Now() - begin : 1;
 }
 
+// The wake handshakes are Dekker's: the sleeper stores its flag and then reads the condition; the
+// waker stores the condition and then reads the flag. The waker's condition stores (`sent`,
+// `freed`) are release stores, which x86 may hold in its store buffer past the flag's load
+// (store-load reordering): both sides then read the other's old value, the sleeper sleeps, the
+// waker sees no sleeper, and E (parked in a lend) and R (asleep with the lend in the ring) wait
+// for each other for good. The full fence before the flag's load closes it.
 void WakeRender() {
+    std::atomic_thread_fence(std::memory_order_seq_cst);
     if (g.r_sleeping.load(std::memory_order_seq_cst)) {
         g.r_wake.fetch_add(1, std::memory_order_seq_cst);
         g.r_wake.notify_one();
@@ -206,6 +252,7 @@ void WakeRender() {
 }
 
 void WakeEngine() {
+    std::atomic_thread_fence(std::memory_order_seq_cst);
     if (g.e_waiting.load(std::memory_order_seq_cst)) {
         g.e_wake.fetch_add(1, std::memory_order_seq_cst);
         g.e_wake.notify_one();
@@ -220,9 +267,9 @@ void Commit(const u8* packet, u32 bytes, u64 number, u64 position, bool windowed
     const u64 offset = g.write % RingBytes;
     if (offset + bytes > RingBytes) {
         const u64 pad = RingBytes - offset;
-        waited += EngineWait([&] {
-            return g.write + pad - g.freed.load(std::memory_order_acquire) <= RingBytes;
-        });
+        waited += EngineWait(
+            [&] { return g.write + pad - g.freed.load(std::memory_order_acquire) <= RingBytes; },
+            EWait::Room, number);
         PacketHeader header{};
         header.bytes = static_cast<u32>(pad);
         header.kind = static_cast<PacketKind>(PadKind);
@@ -239,7 +286,7 @@ void Commit(const u8* packet, u32 bytes, u64 number, u64 position, bool windowed
         // The window: packets pushed before this one that R has not played.
         return !windowed || ahead <= 0 ||
                number - 1 - g.played.load(std::memory_order_acquire) < static_cast<u64>(ahead);
-    });
+    }, EWait::Room, number);
     if (waited != 0) {
         Stats::WindowWait(waited);
     }
@@ -360,6 +407,7 @@ void RenderMain(std::stop_token stop) {
         Common::PinCurrentThread(Common::PinnedRole::GpuMem);
     }
     g.system->RegisterHostThread();
+    g.r_thread.store(std::this_thread::get_id(), std::memory_order_relaxed);
     for (;;) {
         u64 sent = g.sent.load(std::memory_order_acquire);
         if (sent == g.read_at && !stop.stop_requested()) {
@@ -394,12 +442,20 @@ void RenderMain(std::stop_token stop) {
         if (static_cast<u8>(header.kind) == PadKind) {
             g.read_at += header.bytes;
             g.freed.store(g.read_at, std::memory_order_release);
+            g.r_progress.store(g.r_progress.load(std::memory_order_relaxed) + 1,
+                               std::memory_order_relaxed);
             WakeEngine();
             continue;
         }
         const bool timing = Stats::Timing();
         const u64 begin = timing ? Stats::Now() : 0;
+        g.r_kind.store(static_cast<u8>(header.kind), std::memory_order_relaxed);
+        g.r_op.store(header.op, std::memory_order_relaxed);
+        g.r_packet.store(header.number, std::memory_order_relaxed);
         const Stats::RenderTime where = Play(header, at + sizeof(PacketHeader));
+        g.r_packet.store(0, std::memory_order_relaxed);
+        g.r_progress.store(g.r_progress.load(std::memory_order_relaxed) + 1,
+                           std::memory_order_relaxed);
         if (timing && where != Stats::RenderTime::LentCalls) {
             Stats::RenderTimeSpent(where, Stats::Now() - begin);
         }
@@ -411,6 +467,127 @@ void RenderMain(std::stop_token stop) {
             // Step 4: E raised `played` only to this packet while it was unplayed.
             RaisePlayed();
         }
+    }
+}
+
+/// The watchdog's names for the threads it knows.
+std::string ThreadName(std::thread::id id) {
+    if (id == std::thread::id{}) {
+        return "free";
+    }
+    if (id == g.e_thread.load(std::memory_order_relaxed)) {
+        return "GPUBack (E)";
+    }
+    if (id == g.r_thread.load(std::memory_order_relaxed)) {
+        return "GPURender (R)";
+    }
+    return fmt::format("another thread ({:#x})", std::hash<std::thread::id>{}(id));
+}
+
+/// The hang watchdog (FRITCHII_ONEF=1): one wake a second. Two seconds without progress where
+/// progress is owed (R has a packet it does not finish, or packets it does not take; E in one wait
+/// that does not end) logs the whole state once, at Critical, then gives both sides a wake (a
+/// lost wakeup ends there, and the log says so when progress resumes).
+void WatchMain(std::stop_token stop) {
+    Common::SetCurrentThreadName("GPUWatch");
+    struct Seen {
+        u64 played{};
+        u64 r_packet{};
+        u64 r_progress{};
+        u64 e_wait_seq{};
+    } last{};
+    u32 r_strikes = 0;
+    u32 e_strikes = 0;
+    bool reported = false;
+    bool lost_wakeup = false;
+    for (;;) {
+        for (int i = 0; i < 10; ++i) {
+            if (stop.stop_requested()) {
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{100});
+        }
+        const u64 played = g.played.load(std::memory_order_acquire);
+        const u64 sent_packets = g.sent_packets.load(std::memory_order_acquire);
+        const u64 r_packet = g.r_packet.load(std::memory_order_relaxed);
+        const u64 r_progress = g.r_progress.load(std::memory_order_relaxed);
+        const u8 e_wait = g.e_wait.load(std::memory_order_relaxed);
+        const u64 e_wait_seq = g.e_wait_seq.load(std::memory_order_relaxed);
+        const u64 sent = g.sent.load(std::memory_order_acquire);
+        const u64 freed = g.freed.load(std::memory_order_acquire);
+        // R owes progress when it holds a packet, or when packets wait in the ring.
+        const bool r_owes = r_packet != 0 || sent != freed || sent_packets > played;
+        const bool r_still = r_owes && r_packet == last.r_packet && r_progress == last.r_progress;
+        const bool e_still = e_wait != 0 && e_wait_seq == last.e_wait_seq;
+        r_strikes = r_still ? r_strikes + 1 : 0;
+        e_strikes = e_still ? e_strikes + 1 : 0;
+        last = Seen{played, r_packet, r_progress, e_wait_seq};
+        const bool hung = r_strikes >= 2 || e_strikes >= 2;
+        if (!hung) {
+            if (reported) {
+                LOG_CRITICAL(HW_GPU, "One follower hang watchdog: progress again ({}; {} wakes "
+                                     "given this session)",
+                             lost_wakeup ? "a lost wakeup, ended by the watchdog's wake"
+                                         : "a long wait that ended",
+                             g.rescued.load(std::memory_order_relaxed));
+                reported = false;
+            }
+            continue;
+        }
+        if (!reported) {
+            reported = true;
+            // A lost wakeup: a side asleep although what it waits for is there.
+            lost_wakeup = (g.r_sleeping.load(std::memory_order_seq_cst) && sent != freed) ||
+                          (e_wait == static_cast<u8>(EWait::Park) &&
+                           g.e_waiting.load(std::memory_order_seq_cst) &&
+                           played >= g.e_wait_number.load(std::memory_order_relaxed));
+            auto& split = GpuSplit::Get();
+            std::string locks;
+            const u32 lock_count = g.lock_count.load(std::memory_order_acquire);
+            for (u32 i = 0; i < lock_count; ++i) {
+                locks += fmt::format("{}{} held by {}", i == 0 ? "" : ", ", g.locks[i].first,
+                                     ThreadName(g.locks[i].second->Owner()));
+            }
+            const char* const back_site = back_wait_site.load(std::memory_order_relaxed);
+            const u8 r_kind = g.r_kind.load(std::memory_order_relaxed);
+            const u8 r_op = g.r_op.load(std::memory_order_relaxed);
+            const u8 e_op = g.e_wait_op.load(std::memory_order_relaxed);
+            LOG_CRITICAL(
+                HW_GPU,
+                "One follower hang watchdog: no progress for 2 s ({}{}{}); step {}; "
+                "positions: published {}, consumed (E) {}, played (R) {}; packets: pushed {}, "
+                "played {}, ring bytes sent {} freed {}; E: {} (op {}, packet {}), e_waiting {}, "
+                "back wait site {}; R: {} (packet {}, kind {}, op {}), r_sleeping {}; locks: {}",
+                r_strikes >= 2 ? "R" : "", e_strikes >= 2 ? (r_strikes >= 2 ? " and E" : "E") : "",
+                lost_wakeup ? ", a lost wakeup: a side asleep with its condition met" : "",
+                static_cast<int>(g.step.load(std::memory_order_relaxed)), split.PublishedNow(),
+                split.EngineConsumedNow(), split.PlayedNow(std::memory_order_acquire),
+                sent_packets, played, sent, freed,
+                e_wait_names[(std::min)(static_cast<size_t>(e_wait), e_wait_names.size() - 1)],
+                e_op < lent_op_names.size() ? lent_op_names[e_op] : "?",
+                g.e_wait_number.load(std::memory_order_relaxed),
+                g.e_waiting.load(std::memory_order_relaxed),
+                back_site != nullptr ? back_site : "none tracked",
+                r_packet != 0 ? "in a packet"
+                : g.r_sleeping.load(std::memory_order_relaxed) ? "asleep"
+                                                               : "between packets",
+                r_packet,
+                r_kind == static_cast<u8>(PacketKind::Lent)    ? "lent"
+                : r_kind == static_cast<u8>(PacketKind::Draw)  ? "draw"
+                : r_kind == static_cast<u8>(PacketKind::Delta) ? "delta"
+                                                               : "?",
+                r_kind == static_cast<u8>(PacketKind::Lent) && r_op < lent_op_names.size()
+                    ? lent_op_names[r_op]
+                    : "-",
+                g.r_sleeping.load(std::memory_order_relaxed),
+                locks.empty() ? std::string{"none registered"} : locks);
+        }
+        // A wake to both sides: harmless if they are not asleep (each rechecks its condition).
+        g.rescued.fetch_add(1, std::memory_order_relaxed);
+        g.r_wake.fetch_add(1, std::memory_order_seq_cst);
+        g.r_wake.notify_one();
+        g.e_wake.fetch_add(1, std::memory_order_seq_cst);
+        g.e_wake.notify_one();
     }
 }
 
@@ -474,6 +651,7 @@ bool InLent() noexcept {
 void MarkEngineThread() noexcept {
     if (g.on) {
         Detail::t_engine = true;
+        g.e_thread.store(std::this_thread::get_id(), std::memory_order_relaxed);
     }
 }
 
@@ -503,16 +681,37 @@ void Start(Core::System& system) {
     g.seen_generation.store(~u32{0}, std::memory_order_relaxed);
     (void)Step();
     g.thread = std::jthread([](std::stop_token stop) { RenderMain(stop); });
+    g.watchdog = std::jthread([](std::stop_token stop) { WatchMain(stop); });
 }
 
 void Stop() {
     if (!g.thread.joinable()) {
         return;
     }
+    if (g.watchdog.joinable()) {
+        g.watchdog.request_stop();
+        g.watchdog.join();
+    }
     g.thread.request_stop();
     g.r_wake.fetch_add(1, std::memory_order_seq_cst);
     g.r_wake.notify_one();
     g.thread.join();
+}
+
+void WatchLock(const char* name, const Common::SpinRecursiveMutex* mutex) noexcept {
+    const u32 count = g.lock_count.load(std::memory_order_relaxed);
+    for (u32 i = 0; i < count; ++i) {
+        if (std::strcmp(g.locks[i].first, name) == 0) {
+            g.locks[i].second = mutex; // a new rasterizer (session): its lock replaces the old
+            return;
+        }
+    }
+    const u32 index = count;
+    if (index >= g.locks.size()) {
+        return;
+    }
+    g.locks[index] = {name, mutex};
+    g.lock_count.store(index + 1, std::memory_order_release);
 }
 
 void SetNextDraw(u32 kind, bool indexed, bool indirect, u32 instance_arg) noexcept {
@@ -570,7 +769,9 @@ void Lend(LentOp op, LentReason reason, void (*function)(void*), void* argument)
     Commit(scratch.data(), header.bytes, number, header.position, false);
     Stats::Pushed(header, kind, behind);
     // The park: R plays everything before, runs the call, releases E.
-    EngineWait([&] { return g.played.load(std::memory_order_acquire) >= number; });
+    g.e_wait_op.store(static_cast<u8>(op), std::memory_order_relaxed);
+    EngineWait([&] { return g.played.load(std::memory_order_acquire) >= number; }, EWait::Park,
+               number);
     if (timing) {
         Stats::Parked(op, Stats::Now() - begin);
     }
@@ -609,7 +810,8 @@ void Drain() {
     }
     const u64 target = g.pushed;
     const u64 waited =
-        EngineWait([&] { return g.played.load(std::memory_order_acquire) >= target; });
+        EngineWait([&] { return g.played.load(std::memory_order_acquire) >= target; },
+                   EWait::Drain, target);
     if (waited != 0) {
         Stats::Drained(Stats::Timing() ? waited : 0);
     }

@@ -92,6 +92,11 @@ public:
         return owner.load(std::memory_order_relaxed) == std::this_thread::get_id();
     }
 
+    /// The holding thread, or a default id when free (a watchdog's snapshot, racy by nature).
+    [[nodiscard]] std::thread::id Owner() const {
+        return owner.load(std::memory_order_relaxed);
+    }
+
     /// The holding thread's: the mutex stays held, by `thread` from now on (a thread that works
     /// for the holder while the holder waits). The caller orders the two threads.
     void HandOver(std::thread::id thread) {

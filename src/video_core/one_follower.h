@@ -52,6 +52,10 @@ namespace Core {
 class System;
 }
 
+namespace Common {
+class SpinRecursiveMutex;
+}
+
 namespace VideoCommon {
 class PageFilter;
 }
@@ -426,6 +430,11 @@ void MarkEngineThread() noexcept;
 /// GpuSplit::MaybeStart, before the back thread starts / GpuSplit::Stop, after it joined.
 void Start(Core::System& system);
 void Stop();
+
+/// The hang watchdog (always on with FRITCHII_ONEF=1, one wake a second): a lock whose holder it
+/// names when E or R stop making progress (the rasterizer registers the buffer and texture
+/// caches' mutexes). Up to four; `name` must outlive the session.
+void WatchLock(const char* name, const Common::SpinRecursiveMutex* mutex) noexcept;
 
 // R's draw player and E's routing of draws from step 3: part (c)'s DrawPlayer, SetDrawPlayer,
 // PushDraw (above) and Vulkan::OneFollowerDraw::RouteDraw. Below step 3 the rasterizer lends
