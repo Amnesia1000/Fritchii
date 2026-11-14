@@ -569,6 +569,11 @@ void OneFollowerDraw::UpdateDiagnostic() {
 
 void OneFollowerDraw::OnPacket(const PacketHeader& header, const u8* spans) {
     if (header.kind == OneF::PacketKind::Lent) {
+        // At boot, lent packets arrive before the game binds a channel (steps 2-3 on from boot):
+        // nothing to sync yet; the first lent packet after the bind seeds the view.
+        if (rasterizer.channel_state == nullptr) [[unlikely]] {
+            return;
+        }
         // E is parked: take what deltas do not carry before the spans, which are newer.
         Maxwell3D& engine = rasterizer.channel_state->maxwell3d;
         const bool full = (header.flags & OneF::PacketSeed) != 0 || seeded_step != OneF::Step();
