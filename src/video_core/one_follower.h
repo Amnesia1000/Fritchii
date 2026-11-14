@@ -182,6 +182,9 @@ enum class Check : u8 {
     /// fable_b 13.2 R1: R at a BufferOp found another packet at ring B's head (its kind or
     /// number differs from the name); the op's entries are not played.
     RingPairing,
+    /// R waited for a lock E holds (the buffer cache's), outside a lent call: R reaches into E's
+    /// cache ("player in the cache" as a lock-try); its stack is logged for the first reports.
+    RenderWaitsEngineLock,
     Count,
 };
 
@@ -191,6 +194,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Check::Count)> chec
     "build descriptors", "build render targets", "stream write", "owner on E", "owner on R",
     "build draw params", "build condition", "render packet missing", "drop not plain",
     "facts stale", "played lookup miss", "texture read ahead of R", "ring B pairing",
+    "R waits for E's lock",
 };
 
 // --- The packet (E to R) -----------------------------------------------------------------------------

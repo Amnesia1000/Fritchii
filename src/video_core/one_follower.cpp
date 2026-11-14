@@ -45,6 +45,9 @@
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
 #include <intrin.h>
 #endif
+#ifdef _WIN32
+#include <windows.h> // RtlCaptureStackBackTrace (R's waits for E's lock)
+#endif
 
 namespace VideoCommon::OneFollower {
 
@@ -120,6 +123,9 @@ struct Impl {
     u64 query_log_ns{};
     std::atomic<bool> query_ops_logged{};
     std::atomic<u64> guest_write_op{}; ///< GuestWriteOpMark
+    /// Lends E made holding a watched lock (handed to R for the park), the op packets' line.
+    std::atomic<u64> lends_holding_lock{};
+    u64 lends_holding_lock_logged{};
 
     // FRITCHII_ONEF_INVAL_E (item 2): E's page write stamps, the next packet number (low 32
     // bits) at each write of an invalidation E ran itself, by device page (2^22 pages = 16 GiB
@@ -657,9 +663,13 @@ void LogQueryKinds() {
     (void)posted;
     LOG_INFO(HW_GPU,
              "One follower op packets (fable_b 13.1; FRITCHII_ONEF_OP_INLINE={}) {:.0f} s: {}; "
-             "{:.1f} KiB/s of entries posted",
+             "{:.1f} KiB/s of entries posted; lends parked holding a lock {:.0f}/s (handed to R)",
              PostOpSite(15) ? 1 : 0, seconds, ops,
-             static_cast<double>(op_bytes - g.op_bytes_logged) / 1024.0 / seconds);
+             static_cast<double>(op_bytes - g.op_bytes_logged) / 1024.0 / seconds,
+             static_cast<double>(g.lends_holding_lock.load(std::memory_order_relaxed) -
+                                 g.lends_holding_lock_logged) /
+                 seconds);
+    g.lends_holding_lock_logged = g.lends_holding_lock.load(std::memory_order_relaxed);
     g.op_bytes_logged = op_bytes;
     LOG_INFO(HW_GPU,
              "One follower queries by kind (FRITCHII_ONEF_QUERY_OPS={}) {:.0f} s: {}; acquire "
@@ -770,10 +780,48 @@ Stats::RenderTime Play(const PacketHeader& header, const u8* spans) {
     return Stats::RenderTime::OtherPackets;
 }
 
+/// R's contended-lock hook (SpinRecursiveMutex::t_contended_hook): R waiting for a lock E holds
+/// outside a lent call is R reaching into E's cache. Counted with the call stack (first reports):
+/// the deadlock of 12 Nov had R in a draw packet waiting for the buffer cache's lock while E
+/// was parked in a lend holding it.
+bool RenderContended(std::thread::id holder, bool first) {
+    if (!first || holder != g.e_thread.load(std::memory_order_relaxed) || t_lent_depth != 0) {
+        return false;
+    }
+    std::string stack;
+#ifdef _WIN32
+    static std::atomic<u32> reports{};
+    if (reports.fetch_add(1, std::memory_order_relaxed) < 12) {
+        void* frames[32];
+        const USHORT count = RtlCaptureStackBackTrace(1, 32, frames, nullptr);
+        for (USHORT i = 0; i < count; ++i) {
+            HMODULE module{};
+            char name[MAX_PATH] = "?";
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   static_cast<LPCSTR>(frames[i]), &module)) {
+                GetModuleFileNameA(module, name, sizeof(name));
+            }
+            const char* const base_name = std::strrchr(name, '\\');
+            stack += fmt::format(" {}+{:#x}", base_name != nullptr ? base_name + 1 : name,
+                                 reinterpret_cast<uintptr_t>(frames[i]) -
+                                     reinterpret_cast<uintptr_t>(module));
+        }
+    }
+#endif
+    thread_local std::string note;
+    note = fmt::format("R (packet {}) waits for a lock E holds; stack:{}",
+                       g.r_packet.load(std::memory_order_relaxed),
+                       stack.empty() ? std::string{" (not logged)"} : stack);
+    Note(Check::RenderWaitsEngineLock, note.c_str());
+    return false;
+}
+
 void RenderMain(std::stop_token stop) {
     const Common::DkbCpuTrace::Registration cpu_trace{Common::DkbCpuTrace::Role::GpuMem};
     Common::SetCurrentThreadName("GPURender");
     t_render = true;
+    Common::SpinRecursiveMutex::t_contended_hook = &RenderContended;
     GpuSplit::MarkRenderThread();
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
     Common::SetCurrentThreadToPerformanceCores();
@@ -1305,6 +1353,34 @@ void Lend(LentOp op, LentReason reason, void (*function)(void*), void* argument)
     if (counting) {
         Stats::Pushed(header, kind, behind);
     }
+    // E never parks holding a lock R may take (the deadlock of 12 Nov: E parked in a seam play's
+    // lend holding the buffer cache's lock, R in an earlier draw packet waiting for it): a
+    // watched lock E holds goes to R for the park (R takes it as its own, recursively; guest
+    // threads stay out) and comes back after. R reaching into the buffer cache outside the lent
+    // call still counts as "owner on R" (its entry points' asserts name where).
+    std::array<Common::SpinRecursiveMutex*, 4> handed{};
+    u32 handed_count = 0;
+    {
+        const std::thread::id self = std::this_thread::get_id();
+        const std::thread::id render = g.r_thread.load(std::memory_order_relaxed);
+        const u32 lock_count = g.lock_count.load(std::memory_order_acquire);
+        for (u32 i = 0; i < lock_count && handed_count < handed.size(); ++i) {
+            auto* const mutex = const_cast<Common::SpinRecursiveMutex*>(g.locks[i].second);
+            if (mutex != nullptr && mutex->Owner() == self) {
+                mutex->HandOver(render);
+                handed[handed_count++] = mutex;
+            }
+        }
+        if (handed_count != 0) {
+            g.lends_holding_lock.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    SCOPE_EXIT {
+        const std::thread::id self = std::this_thread::get_id();
+        for (u32 i = 0; i < handed_count; ++i) {
+            handed[i]->HandOver(self);
+        }
+    };
     // The park: R plays everything before, runs the call, releases E. Its own profile zone
     // (fable_b 14.1): without it the park landed in whatever zone the lend was made in ("other"
     // for a call entry, "method" for a method's).
