@@ -117,6 +117,24 @@ is critical by construction); these add work to one thread in the middle of its 
 - Off (0), a call, draw or dispatch pays one relaxed load of its switch and a branch, inline at
   the call site (GpuSplit::DelayWorkIf), no function call.
 
+### FRITCHII_DELAY_RUN_US, FRITCHII_DELAY_RUN_KIND
+
+The memory stage's delay test (live, default 0 = nothing changes; fable_stage_levelpoints 5.1),
+with FRITCHII_MEMSTAGE_THREAD=2: GPUMem busy-spins n microseconds right after a level run's end
+(its StageWaitFor of the run returned, before the return's flag take), so the back stays parked
+that much longer. It tells whether GPUMem's time parked in runs is on the frame's path: if fps
+drops by about what the added ms a second predict, every ms/s of parked time cut is a ms/s of
+frame.
+- FRITCHII_DELAY_RUN_KIND: 0 (default) spins after runs without a compute launch, 1 after runs
+  with one. The launches are counted with the GPU profile on (EDEN_NX2_GPU_PROFILE) or while
+  FRITCHII_DELAY_RUN_US is set (memstage_shadow.cpp's count_launch).
+- Fable's reading: 5 us at kind 0 adds about 47 ms/s (9,471 runs a second); a frame 0.85 ms
+  longer means parked time is fully on the path. 20 us at kind 1 adds about 21 ms/s.
+- The spin is outside the run's own time ("runs ... us each on GPUMem"); counted at the end of
+  the "Memory stage passes" line ("delay test FRITCHII_DELAY_RUN_US=n kind k: x/s y ms/s").
+- Off (0): one relaxed load and a branch after each run.
+- Measure with profile_toggle.py in one session (0 against n).
+
 ### FRITCHII_E2C_CENSUS (the "Front 0xe2c misses" line)
 
 FRITCHII_E2C_CENSUS (live, default 0 since 2026-11-14 = no work at all on the miss path; 1 = the
@@ -1426,6 +1444,176 @@ entry when it gets there. 0, AHEAD 0 and THREAD 0/1: as before.
   takes the release in (one run instead of two level waits).
 - Compare 0 and 1 with profile_toggle.py in one session (5c's run starters lose "cache call"
   at the release's address).
+- Since fable_stage_p3 section 3 all three puller releases are one closure with a fixed layout
+  (puller.cpp's ReleaseCall: the rasterizer, the GPU address, the payload and the
+  QueryPropertiesFlags, the channel's memory manager; memstage_shadow.h's StageReleaseWord) and
+  carry StageCacheCall::SemaphoreRelease: WriteLong as before, and ProcessSemaphoreRelease and
+  SemaphoreExecute's release (both fence-flagged), which were untagged closures before: each one
+  made GPUMem's copies stale (a full copy at the next 3D entry; very likely the "call +0xc99160"
+  behind most of the full copies). They are cache calls now (hard, no copy after) and candidates
+  for this switch's request path too.
+
+### FRITCHII_MEMSTAGE_PASS
+
+FRITCHII_MEMSTAGE_PASS (live, read at a frame end with FRITCHII_MEMSTAGE_AHEAD, default 0;
+work\fable_stage_levelpoints.md sections 4 to 6, with Fable's amendment and fable_stage_p3.md
+section 1): with FRITCHII_MEMSTAGE_THREAD=2 and the window open (AHEAD > 0), bit 1 (=1) makes a
+lone gather (3D invalidate_texture_data_cache, 0x3dd) or wait for idle (0x44) a passed entry
+instead of a level run: GPUMem does what the entry does to the buffer cache itself, at its
+position, and goes on; the back runs the entry later, served, with its own code, and finds
+nothing to do in the buffer cache there. 0, AHEAD 0 and THREAD 0/1: as before (the passes line
+is then dry). Bit 2 (fence entries, fable_stage_p3) is not built: it is masked off.
+- Which (tried before FRITCHII_MEMSTAGE_GATHER; one that does not pass goes to what that switch
+  says, a run otherwise): a lone method entry outside a run, no draw before it in the entry,
+  - rule Q: no query result sync can be pending at the entry (the mirror in the passes line);
+  - rule C: no read download tracking (EXP49 off, none pending) and no uncommitted buffer flush
+    (the note, else the sets under the lock): only a fill that marks GPU-written data adds one,
+    and those come level first or run lent, so a set empty at GPUMem's position is empty when
+    the back gets there;
+  - room for its record (256).
+- A passed gather (rule G): GPUMem takes the game's collected writes (nothing when every
+  collector says empty) and, under the buffer cache's lock, tests their pages (page-aligned, as
+  WriteMemory's recording branch reads whole pages: the page bits, then the cache). No
+  GPU-written data there: the served gather's buffer half at once (claims, WriteMemory per range:
+  on such pages only marks, no command; the vertex-stale marks reach GPUMem's copy through the
+  mark hook). GPU-written data on a page: nothing applied, the record goes whole and the entry is
+  a level run (its gather applies the ranges with the full path before it takes more).
+- Every passed entry pushes a record (its position; a gather's ranges). The back asks for it
+  first at the entry (RasterizerVulkan::InvalidateTextureDataCache, GpuSplit::Execute for a
+  release, Maxwell3D's wait_for_idle), so FRITCHII_MEMSTAGE_GATHER's / _RELEASE's "served ...
+  with no record" stay real must-be-0s. At the gather, RasterizerVulkan::InvalidateGPUCache
+  applies the record's other half (the texture and pipeline caches), then the back's own gather
+  runs. A record lives until the back asks for a later entry's (one it never asked for is late,
+  applied there), or is dropped at a lend (before the run's first entry), the ring's start and
+  end (one at or past the end stays for the back's run of that entry without the ring).
+- The back in a served entry: its own gathers (GPU::Impl::InvalidateGPUCache, read tracking off)
+  return at once when every collector is empty; otherwise the take and the buffer half run on
+  GPUMem in one served call (RasterizerVulkan::GatherOnStage), the other caches' half on the back: only
+  GPUMem takes while the back is served. Its wait for idle and flush grouping (SignalOrdering)
+  find nothing to do: a pending sync there, or a set uncommitted-flush note, is a must-be-0 (then
+  they run as today).
+- Must be 0 (the link line), each turning the switch to 0 for the session from the next frame
+  end (logged once): "a query result sync pending at a passed entry's wait for idle", "uncommitted
+  buffer flushes at a passed entry's flush grouping", "a pass record of an entry the back passed
+  without asking for it", "a passed gather's buffer half recorded a command" (the seam arena grew
+  in its bracket), "a served wait for idle with no pass record".
+- Exactness, in short: the back's query state at the entry has no pending sync (every caller of
+  Query is an entry the mirror's table counts, below); the uncommitted set is empty there (above);
+  the game writes taken at the gather were collected before GPUMem read the list, and both halves
+  land at the entry, the buffer half before GPUMem's next fill (THREAD 0's order). A write made
+  while the list runs has no position the game can count on and is taken at the next gather.
+- The passes line counts passed ones and the first failed test per method, records and ranges a
+  second, the records the back applied, and the back's own served gathers taken on GPUMem.
+- Compare 0 and 1 with profile_toggle.py in one session; expected (Fable, an estimate): runs
+  from about 10,500 to about 7,000 a second, GPUMem's run wait down 30 to 45 ms/s, +1 to +2 fps
+  at the market.
+
+### Memory stage passes (the "Memory stage passes" line)
+
+Every 10 s on THREAD 2 (fable_stage_levelpoints 5.2), "Memory stage passes (dry, window
+open/closed)": the counts P1 (passed gathers and waits for idle) and P3 (fence entries) are
+judged by. Dry means decided and counted, the entries behave as before.
+- Per method (gathers 0x3dd, waits for idle 0x44), each lone one GPUMem reaches: passed (dry: it
+  would pass P1's tests up to the flush test), or the first test it failed: window closed, in a
+  run, late (its entry hard already), not first (not a lone method entry, or a draw before it),
+  sync may be pending (the mirror below), read tracking (EXP49 or a pending read download),
+  flushes uncommitted (the buffer cache's uncommitted set, its note first, then under the lock),
+  no record room, GPU-written page (both P1 only).
+- The mirror of the back's query_cache.HasPendingSync() at GPUMem's place (fable_stage_levelpoints
+  6.1 and 12): a function of the entries before that place, each applied in stream order where
+  GPUMem's Process reaches it, runs included (their entries go through Process too, so a run's
+  return changes nothing). Unknown at the ring's start. A lone 0x3dd or 0x44 (a Method entry)
+  clears it whatever becomes of it (passed, run at its entry, or hard in a run: the back runs its
+  wait for idle there, which syncs every streamer). A 3D report that is not a fence adds one. A
+  3D fence report at a mapped address clears it (its fence is made and syncs), or adds one with
+  EXP28 & 1; unmapped, no change. A puller release (hard or run at its entry by
+  FRITCHII_MEMSTAGE_RELEASE): unmapped no change, not fence-flagged a report, fence-flagged as
+  the fence report. An executable compute method other than 0x6c and 0x6d, a DMA engine method,
+  an engine of no known type, and an unfollowed entry make it unknown. Any other hard entry, any
+  other cache call (none calls Query: the rule beside StageCacheCall), the upload and 2D engines:
+  no change.
+- "The mirror at the gathers the back ran at their entry": with FRITCHII_MEMSTAGE_GATHER on, each
+  served gather checks the mirror against the back's own answer (it had query results to sync):
+  "clear but the back synced" must be 0 (fable_stage_levelpoints 12.3: the proof of the rule).
+- Fence entries outside a run (the puller's release closures and the 3D fence reports): whether
+  rule C holds there (no read tracking, no uncommitted flush).
+- Puller releases on the front (WriteLong): timestamped and fence-flagged (RELEASE_SIZE), each
+  with its unmapped ones.
+- GPUMem from a run's lend to its return: waiting for the back (the run's end), for the front
+  while the run is kept lent, following (the rest); then by compute launches a run (0, 1, 2-7,
+  8-63, 64-511, 512+; launches are counted with the GPU profile or the delay test on), runs a
+  second with back/front/following ms a second.
+- The back's waits for the stage between a run's end and its next packet (its true idle after a
+  level point), count and ms a second.
+- The delay test FRITCHII_DELAY_RUN_US's spins.
+- Then pass records and their game write ranges a second, the records the back applied, and the
+  back's own gathers in served entries taken on GPUMem (FRITCHII_MEMSTAGE_PASS on).
+
+"Memory stage passes P3 (dry)" (fable_stage_p3 section 6, after the passes line): per kind
+(gathers, waits for idle, the puller's releases, 3D fence reports), whether P3 would pass it and
+otherwise the first reason, in this order: not lone (a run, late, not a lone method entry; a
+fence report inside a packet or batch); for a release, unmapped (passes: the back's Query returns
+at once) or not fence-flagged (passes: no fence, no cache; its page joins the mirror); EXP28 & 1
+(fence kinds: the fence may not sync); read tracking; flushes uncommitted; for a sync point with
+no report pending, pass (P1's); reports unknown (after a compute or DMA method, an unfollowed
+entry, or a report across a page end); the fence behaviour Accurate; then the targets: the report pages GPUMem saw since the
+last sync point (and the entry's own) as maximal runs of adjacent 4 KiB device pages, more than 8
+runs, a run no existing buffer holds on its first page ("no buffer": the sync would create one;
+should fall to near 0 after the first seconds, else pages are being collected or re-made), a run
+past that buffer, a run with CPU-modified bytes (the sync would upload: the count that decides
+P3's worth). Then the report pages per sync point that reached the target test (average and
+maximum). The target test is BufferCache::ProbeSyncTarget under the cache's lock: it changes
+nothing (no usage mark in dry). P3's mirror (its report pages) follows the same table as the
+mirror above, so it does not depend on what is passed.
+
+### FRITCHII_MEMSTAGE_MARKS_AHEAD
+
+FRITCHII_MEMSTAGE_MARKS_AHEAD (live, read at a frame end with FRITCHII_MEMSTAGE_AHEAD, default 0;
+fable_stage_compute.md part 1 with its section 10): with FRITCHII_MEMSTAGE_THREAD=2 and the window
+open (AHEAD > 0), a draw whose fill writes buffers (written storage buffers, transform feedback)
+no longer makes GPUMem come level first (the window line's "writing draw" reason goes to 0, about
+310 waits a second at the market). 0, AHEAD 0 and THREAD 0/1: as before.
+
+- How: every set the buffer cache had keeps meaning "as of the back" (gpu_modified_ranges, the
+  uncommitted and committed fence downloads, the taken downloads, the read downloads, the read
+  traps). A write mark GPUMem's own fill makes runs at once only what its later fills need (the
+  dispatch write record, the buffer's write tick, the tracker's GPU-modified bit, the vertex
+  buffers' stale flags, the page bits that never clear) and puts the rest on a list in the
+  buffer cache, keyed by the push index of the ring B packet the fill makes (ring B's packet
+  order: the back's issue order, deferred draws included). The packet's header carries a flag;
+  right after the back played such a packet it takes the cache's lock and the rest runs, with
+  today's code, in packet order ("promotion"). Every reader of the real sets promotes first.
+  GPUMem's own work asks both the real sets and the list (upload skips, the index fast path, the
+  bank page copies, join tests, the trackers' record, the level tests).
+- The back never blocks inside the lock for a promotion: while GPUMem holds it (its fill) the
+  back retries, serving GPUMem's requests, and GPUMem promotes for it when it waits for the back
+  meanwhile (a sync's or a join's catch-up), instead of giving up.
+- Still level, the test on both sets: claims (collected constant buffer ranges over GPU-written
+  data; the list on the ranges' pages), joins over GPU-written data, constant buffer words onto
+  GPU-written data. After a claim's wait, a mark of a draw the back still holds deferred on those
+  pages refuses the fill (the entry is a run). The list's bound, 4,096 marks, waits as a writing
+  draw did.
+- The fence commit (FenceManager::CommitCacheFlushes, SignalOrdering) promotes first and runs on
+  the back under the lock, also while served (the link's user checks accept it there).
+- Exact: a mark enters the real sets after the back recorded its draw and before anything else
+  can read or change them (all promote first, under the same lock): against every other event
+  (a landing, a game thread's read, a later fence) it falls where THREAD 0 puts it, give or take
+  that one packet's play, and nothing after the draw is signalled to the game in that time. The
+  tracker's bit is set again at the promotion (a served write at the back's position may have
+  dropped it since the fill, and THREAD 0 has it set after such a write); a landing keeps the bit
+  on pages with a mark on the list. A fill whose packet never went into ring B, or a packet the
+  back drops unplayed, takes its marks back: the back fills that draw itself.
+- "Memory stage marks ahead" every 10 s while on: marks put on the list, promoted by the back at
+  the play and by others, taken back; the list's length (average, maximum); the back's waits for
+  the lock at a promotion (count, ms); level waits for claims (and refused after the wait) and at
+  the bound; the must-be-0 totals: a level function on GPUMem's own work over a page with a mark
+  on the list, a promotion out of order, the list not empty at a ring's start or end, a mark due
+  at a run's first entry, a due mark a reader could not promote, a mark in a call GPUMem serves
+  for the back, a mark on GPUMem's own work outside a draw fill, a pushed packet that is not the
+  fill's. Each is logged as "Memory stage marks ahead (must be 0)" (the first 16).
+- Gate: memstage_gate.py with the read log at market and fight; the fight with kills (the
+  read-back counters and the hitch log must not move); the flash watch route; an area load.
+  Compare 0 and 1 with profile_toggle.py in one session.
 
 ### FRITCHII_MEMSTAGE_FULL_BINDS
 

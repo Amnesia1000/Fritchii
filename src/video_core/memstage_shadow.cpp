@@ -139,6 +139,7 @@
 
 #include "common/fritchii_write_ring.h"
 #include "common/logging.h"
+#include "common/settings.h"
 #include "video_core/buffer_cache/cache_inputs.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/fermi_2d.h"
@@ -156,6 +157,7 @@
 #include "video_core/nx2_indirect_grid.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/page_filter.h"
+#include "video_core/query_cache/types.h"
 
 namespace VideoCommon {
 
@@ -848,6 +850,24 @@ struct State {
     u64 ring_seq{};           ///< Draws the copies issued since the ring started
     u32 ring_packets{};       ///< Packets the entry sent
     bool ring_ran_on_back{};  ///< The back ran its gather or semaphore release (StageResult)
+    bool ring_publish_now{};  ///< GPUMem passed it (FRITCHII_MEMSTAGE_PASS; StageResult)
+    // The mirror of the back's query_cache.HasPendingSync() at GPUMem's place in the stream
+    // (fable_stage_levelpoints 6.1 and 12.2): a function of the entries before that place, each
+    // applied in order as Process reaches it (MirrorClear, MirrorReport; unknown in Unfollow and
+    // other_engine). A sync
+    // may be pending unless `sync_unknown` is false and no report went by since the last clear.
+    bool sync_unknown{true};
+    u32 sync_reports{};
+    // P3's form of it (fable_stage_p3 4.1, its dry counters): the device pages (4 KiB) of the
+    // reports since the last clear, and whether others may be pending. The same table.
+    bool p3_unknown{true};
+    boost::container::small_vector<u64, 16> p3_pages;
+    /// The last report's GPU page, its device page (~0: unmapped), the address space and the
+    /// map counter it was looked up under.
+    u64 report_gpu_page{~u64{0}};
+    u64 report_device_page{};
+    const Tegra::MemoryManager* report_memory{};
+    u64 report_map_serial{};
     Class last_class{Class::Pass};
     std::vector<std::pair<u64, std::size_t>> ring_ranges; ///< Collected, not applied yet
     /// Step 7: the flags a deferred lend hands over, per engine (BackTakeLend).
@@ -878,6 +898,10 @@ void Hard(State& s, LevelType type, u64 id) {
 /// The entry cannot be followed: hard, and the copies go stale after it (plan 3.2).
 void Unfollow(State& s, LevelType type, u64 id) {
     Hard(s, type, id);
+    // The sync mirror (fable_stage_levelpoints 12.2): an entry that cannot be read may have
+    // called Query with addresses GPUMem does not see.
+    s.sync_unknown = true;
+    s.p3_unknown = true;
     if (!s.entry_unfollowed) {
         s.entry_unfollowed = true;
         s.stale_cause = LevelKey(type, s.channel, id);
@@ -1305,19 +1329,26 @@ bool GatherCandidate(const State& s) {
     return s.ring && !s.ring_in_run && !s.entry_hard && MemoryStageLink::GatherServed();
 }
 
+/// FRITCHII_MEMSTAGE_PASS bit 1: a gather or wait for idle GPUMem may pass (StagePass decides
+/// there, at the method). Anything else keeps it hard.
+bool PassCandidate(const State& s) {
+    return s.ring && !s.ring_in_run && !s.entry_hard && MemoryStageLink::PassServed(1);
+}
+
 MethodKind MethodKindOf(const Copy& c, u32 method) {
     switch (method) {
     // Hard: they need the back's caches (the gather, the wait, the upload engine's writes),
     // or (falcon[4]) were level in the first version. Followed: the store, and falcon[4]'s
     // scratch word.
-    case MAXWELL3D_REG_INDEX(wait_for_idle):
     case MAXWELL3D_REG_INDEX(falcon[4]):
     case MAXWELL3D_REG_INDEX(sync_info):
     case MAXWELL3D_REG_INDEX(launch_dma):
     case MAXWELL3D_REG_INDEX(inline_data):
         return MethodKind::Hard;
+    case MAXWELL3D_REG_INDEX(wait_for_idle):
+        return PassCandidate(S()) ? MethodKind::Work : MethodKind::Hard;
     case MAXWELL3D_REG_INDEX(invalidate_texture_data_cache):
-        return GatherCandidate(S()) ? MethodKind::Work : MethodKind::Hard;
+        return GatherCandidate(S()) || PassCandidate(S()) ? MethodKind::Work : MethodKind::Hard;
     // Pass (plan 2.2, 2.4, 2.5): the query streamer's reset, the scheduler's barrier, an empty
     // handler, and a report that is not a fence (the handler decides that). The store only.
     case MAXWELL3D_REG_INDEX(clear_report_value):
@@ -1373,6 +1404,335 @@ void Condition(State& s, Copy& c) {
 
 void StageGather(State& s, Copy& c, u32 method);
 
+/// The ring backend's pass_ready (read tracking, rule C) at GPUMem's position.
+MemoryStageLink::PassReady PassReadyNow() {
+    const auto& backend = MemoryStageLink::Get().Backend();
+    return backend.pass_ready != nullptr
+               ? static_cast<MemoryStageLink::PassReady>(backend.pass_ready(backend.context))
+               : MemoryStageLink::PassReady::Tracking;
+}
+
+/// P0 (fable_stage_levelpoints 5.2): a fence entry outside a run, and whether rule C would hold
+/// there (`kind` 0: the puller's release closure, 1: a 3D fence report). Returns the answer.
+MemoryStageLink::PassReady NoteFenceEntry(u32 kind) {
+    const MemoryStageLink::PassReady ready = PassReadyNow();
+    MemoryStageLink::Get().NoteFenceEntry(kind, ready);
+    return ready;
+}
+
+// --- fable_stage_p3 section 6: P3's dry counters, and its mirror of the report pages (4.1) ---
+
+constexpr u64 ReportPage = 0x1000;
+constexpr u64 NoPage = ~u64{0};
+
+/// The device page of a report at `address` (NoPage: unmapped), the last lookup kept under the
+/// address space's map counter (reports come in rows on one page).
+u64 ReportDevicePage(State& s, Tegra::MemoryManager& memory, GPUVAddr address) {
+    const u64 gpu_page = address & ~(ReportPage - 1);
+    if (gpu_page == s.report_gpu_page && &memory == s.report_memory &&
+        memory.MapSerial() == s.report_map_serial) [[likely]] {
+        return s.report_device_page;
+    }
+    const auto read = memory.BeginMapRead();
+    const std::optional<DAddr> device = memory.GpuToCpuAddress(gpu_page);
+    const u64 page = device ? (*device & ~(ReportPage - 1)) : NoPage;
+    if (memory.MapReadStable(read)) {
+        s.report_gpu_page = gpu_page;
+        s.report_device_page = page;
+        s.report_memory = &memory;
+        s.report_map_serial = read.serial;
+    }
+    return page;
+}
+
+/// A report P3 would leave pending (4.1): its page joins the mirror. Across a page end: unknown.
+void P3AddReport(State& s, Tegra::MemoryManager& memory, GPUVAddr address) {
+    if ((address & (ReportPage - 1)) > ReportPage - 8) {
+        s.p3_unknown = true;
+        return;
+    }
+    const u64 page = ReportDevicePage(s, memory, address);
+    if (page == NoPage) {
+        return; // the back's CounterReport returns before WriteCounter
+    }
+    if (std::find(s.p3_pages.begin(), s.p3_pages.end(), page) != s.p3_pages.end()) {
+        return;
+    }
+    if (s.p3_pages.size() >= 256) {
+        s.p3_unknown = true;
+        return;
+    }
+    s.p3_pages.push_back(page);
+}
+
+// The sync mirror's three effects (fable_stage_levelpoints 12.2), applied where Process reaches
+// the method or closure, in stream order (a report after a fence report in one entry counts).
+
+/// Nothing pending after it: a sync ran there (a wait for idle, a made fence's NotifyWFI).
+void MirrorClear(State& s) {
+    s.sync_unknown = false;
+    s.sync_reports = 0;
+    s.p3_unknown = false;
+    s.p3_pages.clear();
+}
+
+/// After a 0x3dd or 0x44 of the copy (once the pass and gather decisions read the mirror): a lone
+/// one (a Method entry: nothing after it in the entry) clears it, whatever became of it, passed,
+/// run by the back at its entry or hard in a run: the back runs its wait for idle there, which
+/// always calls NotifyWFI, and every sync clears every streamer's list. One inside a multi-word
+/// or packet entry leaves it as it is (12.2: "same").
+void MirrorAfterSyncPoint(State& s) {
+    const u64 head = Access::Ring()[s.processing_position & Access::RingMask];
+    if (static_cast<Kind>(head & 0xf) == Kind::Method) {
+        MirrorClear(s);
+    }
+}
+
+/// One more pending report (WriteCounter), at `address` of `memory`'s address space.
+void MirrorReport(State& s, Tegra::MemoryManager& memory, GPUVAddr address) {
+    ++s.sync_reports;
+    P3AddReport(s, memory, address);
+}
+
+/// A fence-flagged report (a 3D fence report, a fence-flagged release) at a mapped address: its
+/// own report makes the fence (SkipEmptyFence says no), whose CommitAsyncFlushes runs NotifyWFI.
+/// With EXP28 & 1 the fence may not sync (deferred payload syncs): a report then.
+void MirrorFence(State& s, Tegra::MemoryManager& memory, GPUVAddr address) {
+    if ((VideoCore::Nx2Debug::Experiment(28) & 1) != 0) {
+        MirrorReport(s, memory, address);
+    } else {
+        MirrorClear(s);
+    }
+}
+
+/// A release closure (StageCacheCall::SemaphoreRelease, its fixed payload `words`), hard or run
+/// by the back at its entry: unmapped, no change (CounterReport returns before anything); not
+/// fence-flagged, a report; fence-flagged, as MirrorFence.
+void MirrorRelease(State& s, const u64* words) {
+    const GPUVAddr address = words[static_cast<size_t>(StageReleaseWord::Address)];
+    const u32 properties =
+        static_cast<u32>(words[static_cast<size_t>(StageReleaseWord::PayloadProperties)] >> 32);
+    auto* const memory = reinterpret_cast<Tegra::MemoryManager*>(
+        words[static_cast<size_t>(StageReleaseWord::Memory)]);
+    if (memory == nullptr || ReportDevicePage(s, *memory, address) == NoPage) {
+        return;
+    }
+    constexpr u32 IsAFence = static_cast<u32>(VideoCommon::QueryPropertiesFlags::IsAFence);
+    if ((properties & IsAFence) == 0) {
+        MirrorReport(s, *memory, address);
+    } else {
+        MirrorFence(s, *memory, address);
+    }
+}
+
+/// P3's targets (4.2), dry: the mirror's pages and `own_page` as maximal runs of adjacent pages,
+/// each tested as the sync would look it up.
+MemoryStageLink::P3Outcome P3Targets(State& s, u64 own_page) {
+    using Outcome = MemoryStageLink::P3Outcome;
+    MemoryStageLink& link = MemoryStageLink::Get();
+    boost::container::small_vector<u64, 17> pages(s.p3_pages.begin(), s.p3_pages.end());
+    if (own_page != NoPage) {
+        pages.push_back(own_page);
+    }
+    std::sort(pages.begin(), pages.end());
+    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+    link.NoteP3Pages(pages.size());
+    boost::container::small_vector<std::pair<u64, u64>, 8> runs;
+    for (const u64 page : pages) {
+        if (!runs.empty() && runs.back().first + runs.back().second == page) {
+            runs.back().second += ReportPage;
+            continue;
+        }
+        if (runs.size() == 8) {
+            return Outcome::TooManyRuns;
+        }
+        runs.emplace_back(page, ReportPage);
+    }
+    if (runs.empty()) {
+        return Outcome::Passed;
+    }
+    const auto& backend = link.Backend();
+    if (backend.sync_probe == nullptr) {
+        return Outcome::NoBuffer;
+    }
+    return static_cast<Outcome>(backend.sync_probe(backend.context, runs.data(), runs.size()));
+}
+
+/// P3's decision (4.3), dry, past the structural tests: a sync point (`fence_entry` false) or a
+/// fence-flagged release or report with its own report's page.
+MemoryStageLink::P3Outcome P3Decide(State& s, MemoryStageLink::PassReady ready, bool fence_entry,
+                                    u64 own_page) {
+    using Outcome = MemoryStageLink::P3Outcome;
+    using Ready = MemoryStageLink::PassReady;
+    if (fence_entry && (VideoCore::Nx2Debug::Experiment(28) & 1) != 0) {
+        return Outcome::Trim;
+    }
+    if (ready == Ready::Tracking) {
+        return Outcome::Tracking;
+    }
+    if (ready == Ready::Flushes) {
+        return Outcome::Flushes;
+    }
+    if (!fence_entry && !s.p3_unknown && s.p3_pages.empty()) {
+        return Outcome::Passed; // P1's pass: nothing can be pending
+    }
+    if (s.p3_unknown) {
+        return Outcome::ReportsUnknown;
+    }
+    if (Settings::IsGPUFenceBehaviorAccurate()) {
+        return Outcome::Accurate;
+    }
+    return P3Targets(s, own_page);
+}
+
+/// Counts P3's decision of a kind (the mirror's effect of the entry comes from 12.2's table,
+/// whatever P3 would decide).
+void P3Note(State& s, MemoryStageLink::P3Kind kind, MemoryStageLink::P3Outcome what) {
+    static_cast<void>(s);
+    MemoryStageLink::Get().NoteP3(kind, what);
+}
+
+/// fable_stage_p3 6 at a release closure GPUMem reaches outside a run (`words`: its payload,
+/// StageReleaseWord's layout). Before the closure's own effect on the mirror (MirrorRelease).
+void P3Release(State& s, const u64* words, MemoryStageLink::PassReady ready) {
+    using Kind3 = MemoryStageLink::P3Kind;
+    using Outcome = MemoryStageLink::P3Outcome;
+    const GPUVAddr address = words[static_cast<size_t>(StageReleaseWord::Address)];
+    const u32 properties =
+        static_cast<u32>(words[static_cast<size_t>(StageReleaseWord::PayloadProperties)] >> 32);
+    auto* const memory = reinterpret_cast<Tegra::MemoryManager*>(
+        words[static_cast<size_t>(StageReleaseWord::Memory)]);
+    const u64 page = memory != nullptr ? ReportDevicePage(s, *memory, address) : NoPage;
+    if (page == NoPage) {
+        return P3Note(s, Kind3::Release, Outcome::PassedUnmapped);
+    }
+    constexpr u32 IsAFence = static_cast<u32>(VideoCommon::QueryPropertiesFlags::IsAFence);
+    if ((properties & IsAFence) == 0) {
+        return P3Note(s, Kind3::Release, Outcome::PassedNoFence);
+    }
+    P3Note(s, Kind3::Release, P3Decide(s, ready, true, page));
+}
+
+/// FRITCHII_MEMSTAGE_PASS (fable_stage_levelpoints 6.2), at a gather (0x3dd) or a wait for idle
+/// (0x44) of the copy, before StageGather: P1's tests, in its order, each way out counted. Off
+/// (dry), the decision is counted and the entry goes on as before (hard: a run, or GATHER's
+/// request). The mirror is cleared after it by MethodCall, whatever became of it (12.2).
+///
+/// On (bit 1, the window open), a passed entry: GPUMem has done what the entry does to the buffer
+/// cache, at its position, and goes on; the back runs the entry later, served, with its own code,
+/// and finds nothing to do in the buffer cache there (levelpoints section 4, rules C, G, Q):
+/// - rule Q: no query sync can be pending (the mirror), so the wait for idle's NotifyWFI does
+///   nothing (the back checks: PassQuerySync);
+/// - rule C: no uncommitted flush (read under the lock when the note is set), so the flush
+///   grouping (SignalOrdering) has nothing to group (the back checks: PassFlushes);
+/// - rule G, 0x3dd: GPUMem takes the game's collected writes and applies their buffer half at once
+///   (the fable amendment: WriteMemory only marks on pages without GPU-written data, no command);
+///   the record carries them to the back for the texture and pipeline caches. A write on such a
+///   page: nothing applied, the record whole, the entry a level run (its gather applies them).
+/// Every passed entry pushes a record (fable_stage_p3 1): the back asks for it at the entry.
+enum class PassResult : u8 {
+    Today,  ///< not passed: today's path (StageGather, or hard)
+    Passed, ///< passed: work, no run
+    Hard,   ///< the take found GPU-written data: hard, the record whole (no StageGather)
+};
+PassResult StagePass(State& s, Copy& c, u32 method) {
+    using Outcome = MemoryStageLink::PassOutcome;
+    using Ready = MemoryStageLink::PassReady;
+    using Take = MemoryStageLink::PassTake;
+    static_cast<void>(c);
+    MemoryStageLink& link = MemoryStageLink::Get();
+    const bool gather = method == MAXWELL3D_REG_INDEX(invalidate_texture_data_cache);
+    const auto which =
+        gather ? MemoryStageLink::PassMethod::Gather : MemoryStageLink::PassMethod::WaitForIdle;
+    if (!MemoryStageLink::StageWindowOpen()) {
+        link.NotePass(which, Outcome::Closed);
+        return PassResult::Today;
+    }
+    const bool dry = !MemoryStageLink::PassServed(1);
+    const auto kind3 = gather ? MemoryStageLink::P3Kind::Gather : MemoryStageLink::P3Kind::WaitForIdle;
+    // Step 1: outside a run, the entry not hard.
+    if (s.ring_in_run) {
+        link.NotePass(which, Outcome::InRun);
+        link.NoteP3(kind3, MemoryStageLink::P3Outcome::NotLone);
+        return PassResult::Today;
+    }
+    // Dry, the method made the entry hard itself (MethodKindOf; a lone method has nothing
+    // before it). Otherwise MethodKindOf said work: hard here means hard before it.
+    if (s.entry_hard && (!dry || s.entry_key != LevelKey(s.entry_type, s.channel, method))) {
+        link.NotePass(which, Outcome::Late);
+        link.NoteP3(kind3, MemoryStageLink::P3Outcome::NotLone);
+        return PassResult::Today;
+    }
+    // Step 2: a lone method entry, no draw before it in it (as StageGather).
+    const u64 head = Access::Ring()[s.processing_position & Access::RingMask];
+    if (static_cast<Kind>(head & 0xf) != Kind::Method || s.entry_draws != 0) {
+        link.NotePass(which, Outcome::NotFirst);
+        link.NoteP3(kind3, MemoryStageLink::P3Outcome::NotLone);
+        return PassResult::Today;
+    }
+    const auto& backend = link.Backend();
+    // Step 4's answer (read tracking, rule C), asked once for P1 and P3's dry counters.
+    const Ready ready = PassReadyNow();
+    P3Note(s, kind3, P3Decide(s, ready, false, NoPage)); // fable_stage_p3 6 (dry)
+    // Step 3: no query sync can be pending (rule Q, the mirror).
+    if (s.sync_unknown || s.sync_reports != 0) {
+        link.NotePass(which, Outcome::SyncPending);
+        return PassResult::Today;
+    }
+    // Step 4: no read tracking, no uncommitted flush (rule C).
+    if (ready == Ready::Tracking) {
+        link.NotePass(which, Outcome::Tracking);
+        return PassResult::Today;
+    }
+    if (ready == Ready::Flushes) {
+        link.NotePass(which, Outcome::Flushes);
+        return PassResult::Today;
+    }
+    if (dry) {
+        link.NotePass(which, Outcome::Passed);
+        return PassResult::Today;
+    }
+    // Step 5: room for the record (every passed entry has one).
+    if (!link.PassRoom() || (gather && backend.pass_gather == nullptr)) {
+        link.NotePass(which, Outcome::NoRoom);
+        return PassResult::Today;
+    }
+    MemoryStageLink::PassRecord& record = link.PassBegin(s.processing_position);
+    if (gather) {
+        // Steps 6 and 7: the take, the page-aligned GPU-written test and the buffer half, at
+        // once (the backend, under the buffer cache's lock).
+        Take took;
+        try {
+            took = static_cast<Take>(backend.pass_gather(backend.context, record.ranges));
+        } catch (...) {
+            // The ring ends (RingFailed); the taken writes must not be lost: the record goes
+            // whole, so the back's run of this entry applies them all (the marks again, which
+            // changes nothing where they were applied already).
+            record.whole = true;
+            link.PassPush();
+            throw;
+        }
+        if (took == Take::GpuWritten) {
+            // WriteMemory would download or upload in place there, which must be recorded where
+            // the back is: the entry runs as a level run, and its gather applies the ranges
+            // taken here whole (BackApplyPasses) before it takes more.
+            record.whole = true;
+            link.PassPush();
+            link.NotePass(which, Outcome::GpuWritten);
+            Hard(s, s.entry_type, method);
+            return PassResult::Hard;
+        }
+        if (took == Take::Recorded) [[unlikely]] {
+            MemoryStageLink::Note(MemoryStageLink::Check::PassCommand,
+                                  "StagePass (a passed gather's buffer half)");
+        }
+    }
+    link.PassPush();
+    link.NotePass(which, Outcome::Passed);
+    s.ring_publish_now = true;
+    return PassResult::Passed;
+}
+
 /// Maxwell3D::ProcessMethodCall's effects on the copy, for every executable method that is not a
 /// macro: the stage's handler (spec 3.2), or for a hard method what follow applies (plan 3.2).
 void MethodCall(State& s, Copy& c, u32 method, u32 value, u32 nonshadow) {
@@ -1391,10 +1751,45 @@ void MethodCall(State& s, Copy& c, u32 method, u32 value, u32 nonshadow) {
         // cache's async flushes (plan 2.4): hard. Any other report is the store only.
         ++s.counters.reports;
         const auto& query = e.regs.report_semaphore.query;
-        if (query.operation.Value() == Regs::ReportSemaphore::Operation::Release &&
-            query.short_query != 0) {
+        using Operation = Regs::ReportSemaphore::Operation;
+        if (query.operation.Value() == Operation::Release && query.short_query != 0) {
             ++s.counters.fence_reports;
+            if (s.ring && MemoryStageLink::StageWindowOpen()) {
+                using Outcome3 = MemoryStageLink::P3Outcome;
+                const auto kind3 = MemoryStageLink::P3Kind::FenceReport;
+                const u64 head = Access::Ring()[s.processing_position & Access::RingMask];
+                // P0: rule C's rate at the fence reports outside a run.
+                const auto ready = s.ring_in_run ? MemoryStageLink::PassReady::Tracking
+                                                 : NoteFenceEntry(1);
+                if (s.ring_in_run || s.entry_hard || s.entry_draws != 0 ||
+                    static_cast<Kind>(head & 0xf) != Kind::Method) {
+                    // fable_stage_p3 4.3: not lone (in a packet or batch, a run): hard.
+                    MemoryStageLink::Get().NoteP3(kind3, Outcome3::NotLone);
+                } else {
+                    // fable_stage_p3 6 (dry).
+                    const GPUVAddr address = e.regs.report_semaphore.Address();
+                    const u64 page = ReportDevicePage(s, *c.memory, address);
+                    P3Note(s, kind3,
+                           page == NoPage ? Outcome3::PassedUnmapped
+                                          : P3Decide(s, ready, true, page));
+                }
+            }
             Hard(s, LevelType::FenceReport, method);
+            // The mirror (12.2), after P3's decision above: mapped, the fence it makes syncs
+            // (or a report with EXP28 & 1); unmapped, CounterReport returns before anything.
+            if (s.ring) {
+                const GPUVAddr address = e.regs.report_semaphore.Address();
+                if (ReportDevicePage(s, *c.memory, address) != NoPage) {
+                    MirrorFence(s, *c.memory, address);
+                }
+            }
+        } else if (query.operation.Value() == Operation::Release ||
+                   query.operation.Value() == Operation::ReportOnly) {
+            // Maxwell3D::ProcessQueryGet calls rasterizer->Query: a sync may be pending now
+            // (the mirror, fable_stage_levelpoints 6.1 and 12.2; P3's pages, fable_stage_p3 4.1).
+            if (s.ring) {
+                MirrorReport(s, *c.memory, e.regs.report_semaphore.Address());
+            }
         }
         return;
     }
@@ -1402,10 +1797,26 @@ void MethodCall(State& s, Copy& c, u32 method, u32 value, u32 nonshadow) {
         return Condition(s, c);
     case MAXWELL3D_REG_INDEX(invalidate_texture_data_cache):
         if (s.ring) {
-            StageGather(s, c, method); // FRITCHII_MEMSTAGE_GATHER, and its counters
+            // FRITCHII_MEMSTAGE_PASS first (dry: its counters only), then
+            // FRITCHII_MEMSTAGE_GATHER and its counters. MethodKindOf made it work for either:
+            // without GATHER's candidate it is hard here, as before the passes.
+            if (StagePass(s, c, method) == PassResult::Today) {
+                if (!s.entry_hard && !GatherCandidate(s)) {
+                    Hard(s, s.entry_type, method);
+                }
+                StageGather(s, c, method);
+            }
+            MirrorAfterSyncPoint(s);
         }
         return; // the store only
     case MAXWELL3D_REG_INDEX(wait_for_idle):
+        if (s.ring) {
+            if (StagePass(s, c, method) == PassResult::Today && !s.entry_hard) {
+                Hard(s, s.entry_type, method); // not passed: hard, as before the passes
+            }
+            MirrorAfterSyncPoint(s);
+        }
+        return; // the store only
     case MAXWELL3D_REG_INDEX(sync_info):
     case MAXWELL3D_REG_INDEX(launch_dma):
     case MAXWELL3D_REG_INDEX(inline_data):
@@ -1700,6 +2111,9 @@ void StageGather(State& s, Copy& c, u32 method) {
     }
     link.FinishGather(draw_seq);
     s.ring_ran_on_back = true;
+    // The sync mirror (fable_stage_levelpoints 6.1, 12.3) against what the back's run found:
+    // "clear, but the back synced" must stay 0. MethodCall clears it after this.
+    link.NoteMirrorCheck(!s.sync_unknown && s.sync_reports == 0, link.LastGatherSynced());
     link.NoteGather(Outcome::Served,
                     static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                          std::chrono::steady_clock::now() - start)
@@ -1721,7 +2135,18 @@ bool StageRelease(State& s, const u64* entry, size_t size) {
     MemoryStageLink& link = MemoryStageLink::Get();
     if (s.ring_in_run) {
         link.NoteRelease(Outcome::InRun);
+        if (MemoryStageLink::StageWindowOpen()) {
+            link.NoteP3(MemoryStageLink::P3Kind::Release, MemoryStageLink::P3Outcome::NotLone);
+        }
         return false;
+    }
+    if (MemoryStageLink::StageWindowOpen()) {
+        // P0: rule C's rate at the release closures; fable_stage_p3 6 (dry), on the closure's
+        // fixed payload (puller.cpp's ReleaseCall).
+        const auto ready = NoteFenceEntry(0);
+        if (size == 2 + 4) {
+            P3Release(s, entry + 2, ready);
+        }
     }
     if (!MemoryStageLink::ReleaseServed()) {
         link.NoteRelease(Outcome::Closed);
@@ -1831,15 +2256,30 @@ size_t Process(State& s, u64 position, bool executed) {
         if (executable) {
             Hard(s, LevelType::EngineMethod,
                  (u64{static_cast<u32>(s.engine_type)} << 16) | (method & 0xffff));
+            // The sync mirror (fable_stage_levelpoints 12.2): the compute engine's signals and
+            // report semaphore and the DMA engine's launches call Query with addresses GPUMem
+            // does not see (0x6c and 0x6d do not); the upload and 2D engines never do. An engine
+            // of no known type: unknown too.
+            const bool queries =
+                (s.engine_type == EngineType::KeplerCompute && method != 0x6c && method != 0x6d) ||
+                s.engine_type == EngineType::MaxwellDMA || s.engine_type == EngineType::Other;
+            if (queries) {
+                s.sync_unknown = true;
+                s.p3_unknown = true;
+            }
         } else {
             cls = Class::Neutral;
         }
     };
     // fable_memstage_compute_brief 3: the compute launches among another engine's methods (as
     // the compute front notes dispatch writers), for the runs by size (counting only).
-    // With the GPU profile only (the line is logged then).
+    // With the GPU profile only (the line is logged then), or while FRITCHII_DELAY_RUN_US is set
+    // (its kind tells runs by launches).
+    const bool launches_counted =
+        Nx2Profile::Enabled() ||
+        VideoCore::Nx2Debug::g_delay_run_us.load(std::memory_order_relaxed) > 0;
     const auto count_launch = [&](u32 method, u32 argument) {
-        if (Nx2Profile::Enabled() && s.engine_type == EngineType::KeplerCompute &&
+        if (launches_counted && s.engine_type == EngineType::KeplerCompute &&
             ((method == 0xaf && (argument & 2) != 0) ||
              (method == 0xb0 && (argument & 15) > 1) || method == 0x107)) {
             ++s.entry_launches;
@@ -1925,7 +2365,7 @@ size_t Process(State& s, u64 position, bool executed) {
         if (s.engine_copy == nullptr) {
             // Direct: a macro's words (GpuSplit::MacroWords, EXP124), called as a Direct Method.
             other_engine(method, (head & Access::Direct) != 0 || s.engine->execution_mask[method]);
-            if (Nx2Profile::Enabled() && (method == 0xaf || method == 0xb0 || method == 0x107)) {
+            if (launches_counted && (method == 0xaf || method == 0xb0 || method == 0x107)) {
                 const u32* const words = reinterpret_cast<const u32*>(entry + data);
                 for (u32 i = 0; i < amount; ++i) {
                     count_launch(method, words[i]);
@@ -1997,12 +2437,24 @@ size_t Process(State& s, u64 position, bool executed) {
         case StageTag::Cache:
             // FRITCHII_MEMSTAGE_RELEASE: the puller's semaphore release, run by the back at its
             // entry on GPUMem's request (no run), or as any cache call.
-            if (s.ring && StageCacheCallOf(head) == StageCacheCall::SemaphoreRelease &&
-                StageRelease(s, entry, size)) {
-                cls = Class::Work;
-                break;
+            if (s.ring && StageCacheCallOf(head) == StageCacheCall::SemaphoreRelease) {
+                const bool served = StageRelease(s, entry, size);
+                // The sync mirror (fable_stage_levelpoints 12.2), after the decisions above read
+                // it: the release row, whether the back runs it in a run or at its entry
+                // (FRITCHII_MEMSTAGE_RELEASE). Its fixed payload says which (StageReleaseWord).
+                if (size == 2 + 4) {
+                    MirrorRelease(s, entry + 2);
+                } else {
+                    s.sync_unknown = true; // not the fixed layout: cannot be read
+                    s.p3_unknown = true;
+                }
+                if (served) {
+                    cls = Class::Work;
+                    break;
+                }
             }
-            // Uses the cache on the back, writes no 3D state: hard, no copy after (plan 3.3).
+            // Uses the cache on the back, writes no 3D state: hard, no copy after (plan 3.3). Any
+            // other cache call leaves the mirror as it is: none calls Query (StageCacheCall).
             Hard(s, LevelType::CacheCall, Rva(entry[1]));
             break;
         case StageTag::Channel:
@@ -2161,6 +2613,11 @@ size_t Process(State& s, u64 position, bool executed) {
             copy.stale = true;
         }
     }
+    // The sync mirror (fable_stage_levelpoints 12.2) took this entry's effects where they came,
+    // in order: a lone 0x3dd or 0x44 clears it (MirrorAfterSyncPoint), a 3D report adds one,
+    // a fence report or a release follows its row (MirrorFence, MirrorRelease), an executable
+    // compute or DMA method and an unfollowed entry make it unknown (other_engine, Unfollow).
+    // Any other hard entry leaves it: none calls Query.
     return size;
 }
 
@@ -2529,6 +2986,7 @@ StageResult StageProcess(u64 position, bool in_run) {
     s.ring_in_run = in_run;
     s.ring_packets = 0;
     s.ring_ran_on_back = false;
+    s.ring_publish_now = false;
     s.current = position;
     const size_t size = Process(s, position, false);
     s.cursor = position + size;
@@ -2540,6 +2998,7 @@ StageResult StageProcess(u64 position, bool in_run) {
         .launches = s.entry_launches,
         .channel = s.channel,
         .ran_on_back = s.ring_ran_on_back,
+        .publish_now = s.ring_publish_now,
     };
 }
 
@@ -2670,6 +3129,8 @@ bool StageMayCopy(u64 position) {
 
 u64 StageReturn(const void* drew_engine, const void* state_engine, s32 back_channel) {
     State& s = S();
+    // The sync mirror is left as it is (fable_stage_levelpoints 12.1): GPUMem processed every
+    // entry of the run before the back ran it, and each one applied its own effect.
     for (Copy& copy : s.copies) {
         if (!copy.stale) {
             TakeCacheFlags(copy.e->dirty.flags, copy.back->dirty.flags);

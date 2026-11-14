@@ -1061,6 +1061,7 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
             VideoCommon::Nx2Profile::Zone::QmdSignal};
         u64 running_qmd = 0; // The QMD the releases below belong to (read last), for EXP13
         const NativeQmdScheduler::Descriptor* running_descriptor = nullptr;
+        u32 signal_dispatches = 0; // The dispatches this signal ran (fine counters below)
         const auto error = native_qmd.Signal(qmd_address, argument,
             [&](u64 address, NativeQmdScheduler::Descriptor& descriptor) {
                 running_qmd = address;
@@ -1095,6 +1096,16 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
             [&](u64 address, u32 payload, u32 flags) {
                 const bool four_words = (flags >> 30) == 0;
                 if (!memory_manager.IsFullyMappedRange(address, four_words ? 16 : sizeof(payload))) return false;
+                // fable_stage_compute 14 (GPU profile 2): the release's kind, in the branch order
+                // below.
+                if (VideoCommon::Nx2Profile::Fine()) [[unlikely]] {
+                    using Fine = VideoCommon::Nx2Profile::FineCounter;
+                    VideoCommon::Nx2Profile::AddFine((flags & (1U << 26))  ? Fine::QmdReleaseReduction
+                                                     : four_words          ? Fine::QmdReleaseFourWords
+                                                     : (flags & (1U << 19)) ? Fine::QmdReleaseMaximum
+                                                                            : Fine::QmdReleasePlain,
+                                                     1);
+                }
                 if (VideoCommon::QmdPrediction::Enabled() &&
                     VideoCommon::GpuSplit::OnBackThread()) {
                     if (const auto device = memory_manager.GpuToCpuAddress(address)) {
@@ -1179,7 +1190,21 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                         VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
                 }
                 return true;
-            }, [&](const auto& descriptor) { return DispatchNativeCompute(descriptor); });
+            }, [&](const auto& descriptor) {
+                ++signal_dispatches;
+                return DispatchNativeCompute(descriptor);
+            });
+        // fable_stage_compute 14 (GPU profile 2): the signal by the dispatches it ran (failed
+        // signals included).
+        if (VideoCommon::Nx2Profile::Fine()) [[unlikely]] {
+            using Fine = VideoCommon::Nx2Profile::FineCounter;
+            VideoCommon::Nx2Profile::AddFine(signal_dispatches == 0  ? Fine::QmdSignalDispatches0
+                                             : signal_dispatches == 1 ? Fine::QmdSignalDispatches1
+                                             : signal_dispatches < 4  ? Fine::QmdSignalDispatches2
+                                             : signal_dispatches < 8  ? Fine::QmdSignalDispatches4
+                                                                      : Fine::QmdSignalDispatches8,
+                                             1);
+        }
         if (error.empty()) {
             LOG_DEBUG(HW_GPU, "Native QMD control action={:#x}, QMD={:#x}", argument, qmd_address);
             return true;

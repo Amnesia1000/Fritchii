@@ -7,6 +7,8 @@
 
 #include <functional>
 #include <memory>
+#include <utility>
+#include <vector>
 
 #include "common/bit_field.h"
 #include "common/common_types.h"
@@ -147,6 +149,9 @@ public:
     void FlushCommands();
     /// Synchronizes CPU writes with Host GPU memory.
     void InvalidateGPUCache();
+    /// The memory stage (FRITCHII_MEMSTAGE_PASS), read tracking off: takes the game's collected
+    /// CPU writes into `out` without applying them (nothing when every collector is empty).
+    void TakeCpuWrites(std::vector<std::pair<DAddr, u64>>& out);
     /// Calls `callback` for each CPU write into GPU-written memory that InvalidateGPUCache has not
     /// applied yet.
     void ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback);

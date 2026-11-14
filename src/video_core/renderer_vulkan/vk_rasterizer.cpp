@@ -1253,7 +1253,14 @@ void RasterizerVulkan::SetRingBackend() {
         }
     };
     backend.drop_packets = [](void* context, u64 position) {
-        return static_cast<RasterizerVulkan*>(context)->mem_stage.DropRingPackets(position);
+        auto* const self = static_cast<RasterizerVulkan*>(context);
+        const u64 dropped = self->mem_stage.DropRingPackets(position);
+        if (position != ~u64{0}) {
+            // FRITCHII_MEMSTAGE_MARKS_AHEAD: a run's first entry, nothing due (the ring's end is
+            // checked at reset_stage).
+            self->buffer_cache.CheckAheadAt(BufferCache::AheadPoint::RunStart);
+        }
+        return dropped;
     };
     backend.back_channel = [](void* context) {
         return static_cast<s32>(static_cast<RasterizerVulkan*>(context)->current_channel_id);
@@ -1266,7 +1273,17 @@ void RasterizerVulkan::SetRingBackend() {
     };
     Link::Get().SetCacheLock(&buffer_cache.mutex);
     backend.reset_stage = [](void* context, bool end) {
-        static_cast<RasterizerVulkan*>(context)->mem_stage.ResetStageSide(end);
+        auto* const self = static_cast<RasterizerVulkan*>(context);
+        self->mem_stage.ResetStageSide(end);
+        // FRITCHII_MEMSTAGE_MARKS_AHEAD: no mark ahead at a ring's start or end (both threads
+        // parked, every packet played).
+        self->buffer_cache.CheckAheadAt(end ? BufferCache::AheadPoint::RingEnd
+                                            : BufferCache::AheadPoint::RingStart);
+    };
+    backend.promote_marks = [](void* context) {
+        auto& cache = static_cast<RasterizerVulkan*>(context)->buffer_cache;
+        std::scoped_lock lock{cache.mutex};
+        cache.PromoteAhead();
     };
     backend.ranges_gpu_written = [](void* context, const std::pair<u64, std::size_t>* ranges,
                                     size_t count) {
@@ -1278,6 +1295,65 @@ void RasterizerVulkan::SetRingBackend() {
     backend.gather = [](void* context, void* engine, u64& draw_seq) {
         return static_cast<RasterizerVulkan*>(context)->StageRunGather(
             *static_cast<Tegra::Engines::Maxwell3D*>(engine), draw_seq);
+    };
+    backend.pass_ready = [](void* context) -> u8 {
+        // fable_stage_levelpoints 6.2 step 4, on GPUMem outside any fill. Read tracking as
+        // GPU::Impl::InvalidateGPUCache tests it. Rule C: only a fill that marks GPU-written data
+        // adds an uncommitted flush, and those fills come level first (StageDrawWritesBuffers)
+        // or run lent, so a set found empty here is empty when the back reaches this entry.
+        auto* const self = static_cast<RasterizerVulkan*>(context);
+        if (VideoCore::g_read_downloads.load(std::memory_order_acquire) != 0 ||
+            VideoCore::Nx2Debug::Experiment(49) != 0) {
+            return static_cast<u8>(Link::PassReady::Tracking);
+        }
+        auto& cache = self->buffer_cache;
+        if (!cache.MayHaveUncommittedFlushes()) {
+            return static_cast<u8>(Link::PassReady::Ready);
+        }
+        const Link::CleanPoint clean;
+        std::scoped_lock lock{cache.mutex};
+        const bool flushes = cache.HasUncommittedFlushes();
+        cache.RefreshUncommittedFlushesNote();
+        return static_cast<u8>(flushes ? Link::PassReady::Flushes : Link::PassReady::Ready);
+    };
+    backend.pass_gather = [](void* context, std::vector<std::pair<u64, u64>>& ranges) -> u8 {
+        return static_cast<RasterizerVulkan*>(context)->StagePassGather(ranges);
+    };
+    backend.apply_pass = [](void* context, const std::pair<u64, u64>* ranges, size_t count,
+                            bool whole) {
+        // The back, at a passed gather's entry (or late): the half it owes. Whole: the full
+        // gather path (the entry runs as a level run: the back holds the cache).
+        auto* const self = static_cast<RasterizerVulkan*>(context);
+        const std::span<const std::pair<DAddr, u64>> span{ranges, count};
+        if (whole) {
+            self->OnCacheInvalidations(span);
+            return;
+        }
+        if (Common::WriteRing::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
+            self->mem_stage.NoteGather(MemStage::Gather::Apply, 0);
+        }
+        self->ApplyGatherOtherHalf(span);
+    };
+    backend.sync_probe = [](void* context, const std::pair<u64, u64>* runs, size_t count) -> u8 {
+        // fable_stage_p3 6 (dry, GPUMem outside any fill): the first run whose sync would not be
+        // a pure lookup, by cause.
+        auto& cache = static_cast<RasterizerVulkan*>(context)->buffer_cache;
+        using Probe = std::remove_cvref_t<decltype(cache)>::SyncProbe;
+        const Link::CleanPoint clean;
+        std::scoped_lock lock{cache.mutex};
+        for (size_t i = 0; i < count; ++i) {
+            switch (cache.ProbeSyncTarget(runs[i].first, runs[i].second)) {
+            case Probe::Pure:
+                break;
+            case Probe::NoBuffer:
+                return static_cast<u8>(Link::P3Outcome::NoBuffer);
+            case Probe::NotInBounds:
+                return static_cast<u8>(Link::P3Outcome::NotInBounds);
+            case Probe::CpuModified:
+                return static_cast<u8>(Link::P3Outcome::CpuModified);
+            }
+        }
+        return static_cast<u8>(Link::P3Outcome::Passed);
     };
     Link::Get().SetRingBackend(backend);
 }
@@ -1317,11 +1393,46 @@ bool RasterizerVulkan::StageFillDraw(VideoCommon::MemStageShadowEngine& copy, bo
         // GPU-written marks. Two fills would: a draw that writes buffers (its marks), and the
         // collected constant buffer ranges claiming GPU-written data (their claims). Those fill
         // level: GPUMem first waits for the back to reach this entry (StageLevel).
+        //
+        // FRITCHII_MEMSTAGE_MARKS_AHEAD: a writing fill's marks wait on the cache's list until the
+        // back has played its packet (buffer_cache.h, "Marks ahead of the back"), so the writing
+        // draw fills ahead. The claims stay level, tested on both sets (the list on the ranges'
+        // pages); after the wait the back has played every packet before this entry, except a
+        // draw it still holds deferred: marks of one on these pages refuse the fill (the entry is
+        // a run: the back issues that draw, then fills this one itself, in its order). The list's
+        // bound (4,096 marks) waits as a writing draw did.
+        const bool marks_ahead = buffer_cache.MarksAhead();
         bool going = true;
-        if (StageDrawWritesBuffers(copy)) {
+        if (!marks_ahead && StageDrawWritesBuffers(copy)) {
             going = link.StageLevel(position, Link::LevelReason::WritingDraw);
-        } else if (StageRangesOverGpuWritten(ranges)) {
+        } else if (StageRangesOverGpuWritten(ranges, true)) {
             going = link.StageLevel(position, Link::LevelReason::Claim);
+            if (marks_ahead && going) {
+                buffer_cache.NoteAheadLevel(BufferCache::AheadLevel::Claim);
+                const bool still = [&] {
+                    const Link::CleanPoint clean_point;
+                    std::scoped_lock lock{buffer_cache.mutex};
+                    buffer_cache.PromoteAhead();
+                    return std::ranges::any_of(ranges, [&](const auto& range) {
+                        return buffer_cache.AheadIntersectsPages(range.first, range.second);
+                    });
+                }();
+                if (still) [[unlikely]] {
+                    buffer_cache.NoteAheadLevel(BufferCache::AheadLevel::ClaimRefused);
+                    return false;
+                }
+            }
+        } else if (marks_ahead && StageDrawWritesBuffers(copy)) {
+            bool full;
+            {
+                const Link::CleanPoint clean_point;
+                std::scoped_lock lock{buffer_cache.mutex};
+                full = buffer_cache.AheadFull();
+            }
+            if (full) [[unlikely]] {
+                buffer_cache.NoteAheadLevel(BufferCache::AheadLevel::Bound);
+                going = link.StageLevel(position, Link::LevelReason::WritingDraw);
+            }
         }
         if (!going) {
             return false; // GPUMem is stopping: the draw is left to the back
@@ -1331,6 +1442,17 @@ bool RasterizerVulkan::StageFillDraw(VideoCommon::MemStageShadowEngine& copy, bo
     std::optional<Link::CleanPoint> clean{std::in_place};
     std::scoped_lock lock{buffer_cache.mutex};
     clean.reset();
+    // FRITCHII_MEMSTAGE_MARKS_AHEAD: the fill's marks are keyed with the push index of the
+    // packet it makes; a fill whose packet never goes takes them back (under the lock).
+    const bool marks_fill = buffer_cache.MarksAhead();
+    if (marks_fill) {
+        buffer_cache.BeginAheadFill(mem_stage.NextRingPacketIndex());
+    }
+    SCOPE_EXIT {
+        if (marks_fill) {
+            buffer_cache.EndAheadFill();
+        }
+    };
     // A list draw (FRITCHII_MEMSTAGE_LIST_DRAWS; the copy's draw manager is inside DrawEnd's
     // list branch, MemStageShadowEngine::StageDraw sent it): the fill binds its two words as the
     // back's own fill does with SetDrawIndirect, from the copy's indirect parameters.
@@ -1474,14 +1596,31 @@ bool RasterizerVulkan::StageDrawWritesBuffers(const VideoCommon::MemStageShadowE
 }
 
 bool RasterizerVulkan::StageRangesOverGpuWritten(
-    std::span<const std::pair<DAddr, std::size_t>> ranges) {
+    std::span<const std::pair<DAddr, std::size_t>> ranges, bool claim) {
     // The page bits first (they never clear, so a clear one proves nothing GPU-written is there),
     // then the cache's own answer under its lock.
+    // FRITCHII_MEMSTAGE_MARKS_AHEAD: the marks GPUMem made ahead of the back count too (their
+    // page bits are set at the fill). A claim looks at their pages: WriteMemory acts on the
+    // written pages, and must not run over a mark ahead (the must-be-0 "claim").
+    // The real set keeps today's byte test (WriteMemory's page work on it is today's).
+    const bool ahead = buffer_cache.MarksAhead();
+    const auto pages = [](DAddr addr, std::size_t size) {
+        const DAddr begin = Common::AlignDown(addr, Core::DEVICE_PAGESIZE);
+        return std::pair<DAddr, u64>{begin,
+                                     Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE) - begin};
+    };
     bool maybe = false;
     for (const auto& [addr, size] : ranges) {
         if (MayBeGpuModified(addr, size)) {
             maybe = true;
             break;
+        }
+        if (ahead && claim && size != 0) {
+            const auto [begin, length] = pages(addr, size);
+            if (MayBeGpuModified(begin, length)) {
+                maybe = true;
+                break;
+            }
         }
     }
     if (!maybe) {
@@ -1492,6 +1631,14 @@ bool RasterizerVulkan::StageRangesOverGpuWritten(
     for (const auto& [addr, size] : ranges) {
         if (buffer_cache.IsRegionGpuModified(addr, size)) {
             return true;
+        }
+    }
+    if (ahead) {
+        for (const auto& [addr, size] : ranges) {
+            if (claim ? buffer_cache.AheadIntersectsPages(addr, size)
+                      : buffer_cache.AheadIntersects(addr, size)) {
+                return true;
+            }
         }
     }
     return false;
@@ -1565,7 +1712,9 @@ void RasterizerVulkan::ProbeGatherRanges(std::span<const std::pair<DAddr, u64>> 
             continue;
         }
         std::scoped_lock lock{buffer_cache.mutex};
-        if (buffer_cache.IsRegionGpuModified(begin, end - begin)) {
+        // FRITCHII_MEMSTAGE_MARKS_AHEAD: both sets (a deferred draw's marks can be ahead here).
+        if (buffer_cache.IsRegionGpuModified(begin, end - begin) ||
+            buffer_cache.AheadIntersects(begin, end - begin)) {
             probe.gpu_written = true;
             return;
         }
@@ -4750,27 +4899,9 @@ void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64
         }
         OnStage(static_cast<u8>(VideoCommon::MemoryStageLink::Served::Gather), [&] {
             std::scoped_lock lock{buffer_cache.mutex};
-            MemStage::FillPlay seam{mem_stage, MemStage::Site::Invalidation};
-            buffer_cache.ClaimCpuWrites(ranges);
-            for (const auto& [addr, size] : ranges) {
-                if (addr != 0 && size != 0) {
-                    buffer_cache.WriteMemory(addr, size);
-                }
-            }
+            ApplyGatherBufferHalf(ranges);
         });
-        for (const auto& [addr, size] : ranges) {
-            if (addr == 0 || size == 0) {
-                continue;
-            }
-            if (VideoCommon::Nx2FastDrawCount::g_on) [[unlikely]] {
-                VideoCommon::Nx2FastDrawCount::NotePoolWrite(addr, size);
-            }
-            {
-                std::scoped_lock lock{texture_cache.mutex};
-                texture_cache.WriteMemory(addr, size);
-            }
-            pipeline_cache.InvalidateRegion(addr, size);
-        }
+        ApplyGatherOtherHalf(ranges);
         return;
     }
     // Step 7's verify: the marks a gather applied here, on any thread (re-review N4).
@@ -4927,6 +5058,118 @@ void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64
     }
 }
 
+bool RasterizerVulkan::ApplyGatherBufferHalf(std::span<const std::pair<DAddr, u64>> ranges) {
+    // The buffer cache's lock held (the served gather's body, OnCacheInvalidations; and
+    // FRITCHII_MEMSTAGE_PASS on GPUMem). Claims first (as OnCacheInvalidations), then WriteMemory
+    // per range, in one seam bracket. True when the bracket recorded a command (the arena grew).
+    MemStage::FillPlay seam{mem_stage, MemStage::Site::Invalidation};
+    const u32 arena_before = mem_stage.ArenaHere();
+    buffer_cache.ClaimCpuWrites(ranges);
+    for (const auto& [addr, size] : ranges) {
+        if (addr != 0 && size != 0) {
+            buffer_cache.WriteMemory(addr, size);
+        }
+    }
+    return mem_stage.ArenaHere() != arena_before;
+}
+
+void RasterizerVulkan::ApplyGatherOtherHalf(std::span<const std::pair<DAddr, u64>> ranges) {
+    // The served gather's tail (OnCacheInvalidations): the texture and pipeline caches, on the
+    // back, range by range.
+    for (const auto& [addr, size] : ranges) {
+        if (addr == 0 || size == 0) {
+            continue;
+        }
+        if (VideoCommon::Nx2FastDrawCount::g_on) [[unlikely]] {
+            VideoCommon::Nx2FastDrawCount::NotePoolWrite(addr, size);
+        }
+        {
+            std::scoped_lock lock{texture_cache.mutex};
+            texture_cache.WriteMemory(addr, size);
+        }
+        pipeline_cache.InvalidateRegion(addr, size);
+    }
+}
+
+u8 RasterizerVulkan::StagePassGather(std::vector<std::pair<u64, u64>>& ranges) {
+    // GPUMem at a passed gather (fable_stage_levelpoints 6.2 steps 6 and 7, with the amendment):
+    // the take, then under the buffer cache's lock the page-aligned GPU-written test (as
+    // ProbeGatherRanges: WriteMemory's recording branch looks at whole pages) and, when no page
+    // holds GPU-written data, the served gather's buffer half at once: on such pages WriteMemory
+    // only marks (the page flags, MarkRegionAsCpuModified, MarkVertexBuffersStale, which reach
+    // the copy through the mark hook) and ClaimCpuWrites does nothing, so no command is needed.
+    // The verify's marks as at the served gather.
+    using Link = VideoCommon::MemoryStageLink;
+    gpu.TakeCpuWrites(ranges);
+    if (ranges.empty()) {
+        return static_cast<u8>(Link::PassTake::Empty);
+    }
+    bool maybe = false;
+    for (const auto& [addr, size] : ranges) {
+        if (addr == 0 || size == 0) {
+            continue;
+        }
+        const DAddr begin = Common::AlignDown(addr, Core::DEVICE_PAGESIZE);
+        const DAddr end = Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE);
+        if (MayBeGpuModified(begin, end - begin)) {
+            maybe = true;
+            break;
+        }
+    }
+    const Link::CleanPoint clean;
+    std::scoped_lock lock{buffer_cache.mutex};
+    if (maybe) {
+        for (const auto& [addr, size] : ranges) {
+            if (addr == 0 || size == 0) {
+                continue;
+            }
+            const DAddr begin = Common::AlignDown(addr, Core::DEVICE_PAGESIZE);
+            const DAddr end = Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE);
+            if (buffer_cache.IsRegionGpuModified(begin, end - begin)) {
+                return static_cast<u8>(Link::PassTake::GpuWritten);
+            }
+        }
+    }
+    for (const auto& [addr, size] : ranges) {
+        mem_stage.NoteCpuMark(addr, size);
+    }
+    const bool recorded = ApplyGatherBufferHalf(ranges);
+    return static_cast<u8>(recorded ? Link::PassTake::Recorded : Link::PassTake::Applied);
+}
+
+bool RasterizerVulkan::GatherOnStage() {
+    // FRITCHII_MEMSTAGE_PASS bit 1 (fable_stage_levelpoints 6.3), the back in a served entry with
+    // writes collected (GPU::Impl::InvalidateGPUCache tested that): GPUMem takes them and applies
+    // their buffer half in one served call, the other caches' half follows here, as the served
+    // branch of OnCacheInvalidations. The take is always GPUMem's while the back is served.
+    using Link = VideoCommon::MemoryStageLink;
+    std::vector<std::pair<DAddr, u64>> writes;
+    OnStage(static_cast<u8>(Link::Served::Gather), [&] {
+        gpu.TakeCpuWrites(writes);
+        if (writes.empty()) {
+            return;
+        }
+        for (const auto& [addr, size] : writes) {
+            mem_stage.NoteCpuMark(addr, size);
+        }
+        std::scoped_lock lock{buffer_cache.mutex};
+        ApplyGatherBufferHalf(writes);
+    });
+    Link::Get().NoteServedTake(!writes.empty());
+    if (writes.empty()) {
+        return true;
+    }
+    // The memory seam's read log (5.3, test D) and the shadow's count, as OnCacheInvalidations.
+    if (Common::WriteRing::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
+        mem_stage.NoteGather(MemStage::Gather::Apply, 0);
+    }
+    if (VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
+        VideoCommon::MemStageShadow::BackCacheInvalidation(true, writes.size());
+    }
+    ApplyGatherOtherHalf(writes);
+    return true;
+}
+
 void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
     if (addr == 0 || size == 0) {
         return;
@@ -5018,6 +5261,14 @@ bool RasterizerVulkan::TryCacheInvalidation(DAddr addr, u64 size) {
 }
 
 void RasterizerVulkan::InvalidateGPUCache() {
+    // FRITCHII_MEMSTAGE_PASS (fable_stage_levelpoints 6.5): at a passed gather's entry, the half
+    // of GPUMem's take the back owes (the other caches', or all of it when the entry runs as a
+    // level run), before this gather takes more. Records of earlier entries the back never asked
+    // for are late (must be 0) and applied there.
+    using Link = VideoCommon::MemoryStageLink;
+    if (Link::RingActive() || Link::Get().PassPending()) [[unlikely]] {
+        Link::Get().BackApplyPasses(VideoCommon::GpuSplit::Get().BackEntryPosition());
+    }
     gpu.InvalidateGPUCache();
 }
 
@@ -5028,10 +5279,16 @@ void RasterizerVulkan::InvalidateTextureDataCache() {
     // run, the default below.
     // A record can outlive the ring by one entry (GPUMem failed in the request): it is honoured
     // without the ring too, so a gather is never run twice.
+    // FRITCHII_MEMSTAGE_PASS: a gather GPUMem passed has a pass record, asked for first
+    // (fable_stage_p3 1): it runs here (InvalidateGPUCache applies the record), and
+    // BackTakeGather, which counts a served gather without a request record, is not asked.
     using Link = VideoCommon::MemoryStageLink;
     Link& link = Link::Get();
-    if ((Link::RingActive() || link.GatherPending()) &&
-        link.BackTakeGather(VideoCommon::GpuSplit::Get().BackEntryPosition())) [[unlikely]] {
+    const u64 position = VideoCommon::GpuSplit::Get().BackEntryPosition();
+    const bool passed =
+        (Link::RingActive() || link.PassPending()) && link.BackPassRecord(position) != nullptr;
+    if (!passed && (Link::RingActive() || link.GatherPending()) && link.BackTakeGather(position))
+        [[unlikely]] {
         return;
     }
     InvalidateGPUCache();
@@ -5166,6 +5423,13 @@ void RasterizerVulkan::WaitForIdle() {
         flags |= VK_PIPELINE_STAGE_TRANSFORM_FEEDBACK_BIT_EXT;
     }
 
+    // FRITCHII_MEMSTAGE_PASS (fable_stage_levelpoints 6.5): served, this is a passed entry's
+    // wait for idle, whose mirror said no query sync could be pending (rule Q): one here would
+    // sync through the buffer cache on the back (must be 0; it then runs as today).
+    if (VideoCommon::MemoryStageLink::BackServed() && query_cache.HasPendingSync()) [[unlikely]] {
+        VideoCommon::MemoryStageLink::Note(VideoCommon::MemoryStageLink::Check::PassQuerySync,
+                                           "RasterizerVulkan::WaitForIdle");
+    }
     query_cache.NotifyWFI();
 
     if (device.IsMoltenVK() && scheduler.IsRenderPassActive()) {
@@ -6345,6 +6609,8 @@ void RasterizerVulkan::AccelerateInlineToMemoryImpl(GPUVAddr address, size_t cop
     gpu_memory->WriteBlockUnsafe(address, memory.data(), copy_size);
     const bool defer = InlineDefer();
     if (InlineSkipsCaches(*cpu_addr, copy_size)) {
+        // Counted as InlineNeverWritten (in InlineUntouchedTail): with InlineUnmapped,
+        // InlineInPlace and InlineNotUploaded it sums to the size counters.
         InlineUntouchedTail(address, *cpu_addr, copy_size, false);
         return;
     }

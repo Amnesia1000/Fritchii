@@ -486,6 +486,11 @@ public:
     [[nodiscard]] bool Packets() const noexcept {
         return seam_value.load(std::memory_order_relaxed) >= 2;
     }
+    /// The arena's size when this thread owns it, else 0: inside a fill bracket, a growth means
+    /// an entry was recorded (FRITCHII_MEMSTAGE_PASS's "a passed gather recorded a command").
+    [[nodiscard]] u32 ArenaHere() const noexcept {
+        return OwnedHere() ? arena.Size() : 0;
+    }
     /// The record of slots 3, 4 and 6 from the cache as it is now (FillDraw; the verify).
     static void FillTrackerRecord(Cache& cache, TrackerRecord& record);
     /// The back: the bytes a ring packet's fill copied for tracker slot `slot` (0 to 2) of the
@@ -551,6 +556,11 @@ public:
     [[nodiscard]] u64 RingPackets() const noexcept {
         return ring_packets_sent.load(std::memory_order_seq_cst) -
                ring_packets_done.load(std::memory_order_seq_cst);
+    }
+    /// GPUMem (the only pusher): the push index the next packet gets, counted from 1 (packets
+    /// are taken or dropped in this order: FRITCHII_MEMSTAGE_MARKS_AHEAD keys its marks by it).
+    [[nodiscard]] u64 NextRingPacketIndex() const noexcept {
+        return ring_packets_sent.load(std::memory_order_relaxed) + 1;
     }
     /// The back: the packet of its draw `seq` (packets of earlier draws are played whole first),
     /// held as a filled draw is; null when there is none. `hash`: the back's compare b hash.
@@ -984,7 +994,7 @@ private:
     struct RingHeader {
         u32 bytes;
         u8 kind;
-        u8 flags;
+        u8 flags; ///< 1: held form, 2: read log, 4: its fill marked writes (RingMarkedWrites)
         u16 part;
         u64 position; ///< Ring A position of the entry the packet belongs to
         u64 number;
@@ -1023,6 +1033,11 @@ private:
     /// The held draw came from ring B: its packet is played_draw.
     bool held_ring{};
     DrawPacket played_draw{};
+    /// FRITCHII_MEMSTAGE_MARKS_AHEAD: the held ring packet's push index, and whether its fill
+    /// marked writes ahead of the back (RingMarkedWrites: promoted when its play ends).
+    u64 held_packet_index{};
+    bool held_marks{};
+    static constexpr u8 RingMarkedWrites = 4; ///< RingHeader::flags
     /// GPUMem's side of a ring fill (THREAD = 2; the back's held_* fields are the back's): the
     /// open packet number (its unplayed mark), the program hashes and the descriptor form.
     u64 stage_fill_from{};

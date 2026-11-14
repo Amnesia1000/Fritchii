@@ -74,10 +74,19 @@ enum class StageDrawLoop : u8 {
 }
 
 /// StageTag::Cache's kind, in header bits 40-47 (FRITCHII_MEMSTAGE_RELEASE): which cache call it
-/// is, when the stage treats one apart. The payload stays the closure's own (no layout promised).
+/// is, when the stage treats one apart. Other's payload stays the closure's own (no layout
+/// promised); SemaphoreRelease's is StageReleaseWord's.
+///
+/// Rule (fable_stage_levelpoints 12.2, the memory stage's sync mirror): a new closure that calls
+/// rasterizer->Query (a query report, a semaphore release) must carry the SemaphoreRelease kind
+/// and its layout, or be untagged. GPUMem takes every other Cache-tagged closure as one that adds
+/// no pending query sync; a Query in one would make a passed sync point's wait for idle find a
+/// sync pending (must be 0: PassQuerySync), or a dry count wrong.
 enum class StageCacheCall : u8 {
     Other = 0,            ///< any other cache call
-    SemaphoreRelease = 1, ///< the puller's semaphore release (WriteLong: QueryCache::CounterReport)
+    /// The puller's semaphore releases (WriteLong, SemaphoreRelease, SemaphoreExecute's release:
+    /// QueryCache::CounterReport with the payload).
+    SemaphoreRelease = 1,
 };
 
 /// StageTag::Cache with its kind, for a Call entry's header.
@@ -88,6 +97,15 @@ enum class StageCacheCall : u8 {
 [[nodiscard]] constexpr StageCacheCall StageCacheCallOf(u64 header) noexcept {
     return static_cast<StageCacheCall>((header >> 40) & 0xff);
 }
+
+/// StageCacheCall::SemaphoreRelease's payload (fable_stage_p3 3), a fixed layout: puller.cpp's
+/// ReleaseCall, which static_asserts these words. Four words.
+enum class StageReleaseWord : u8 {
+    Rasterizer = 0,        ///< VideoCore::RasterizerInterface*
+    Address = 1,           ///< the semaphore's GPU address
+    PayloadProperties = 2, ///< the payload (low half), the QueryPropertiesFlags (high half)
+    Memory = 3,            ///< the channel's Tegra::MemoryManager*
+};
 
 /// Memory stage piece 5b (spec 6.2), FRITCHII_MEMSTAGE_SHADOW=1: the stage's classify, register
 /// copy, draw manager copy and handlers run on the back thread on each ring entry just before the
@@ -172,6 +190,7 @@ struct StageResult {
     u32 launches; ///< Compute launches in the entry (0xaf, 0xb0, 0x107), for the run shape
     s32 channel;  ///< The channel the stage had bound at the entry, for the run shape
     bool ran_on_back; ///< The back ran a gather or a semaphore release of it on GPUMem's request
+    bool publish_now; ///< GPUMem passed it (FRITCHII_MEMSTAGE_PASS): published at once
 };
 /// The back: ring mode starts (its hooks off) or ended.
 void SetRingBack(bool on);
