@@ -456,6 +456,11 @@ public:
     [[nodiscard]] bool Packets() const noexcept {
         return seam_value.load(std::memory_order_relaxed) >= 2;
     }
+    /// The arena's size when this thread owns it, else 0: inside a fill bracket, a growth means
+    /// an entry was recorded (FRITCHII_MEMSTAGE_PASS's "a passed gather recorded a command").
+    [[nodiscard]] u32 ArenaHere() const noexcept {
+        return OwnedHere() ? arena.Size() : 0;
+    }
     /// The record of slots 3, 4 and 6 from the cache as it is now (FillDraw; the verify).
     static void FillTrackerRecord(Cache& cache, TrackerRecord& record);
     /// The back: the bytes a ring packet's fill copied for tracker slot `slot` (0 to 2) of the

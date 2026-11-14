@@ -172,6 +172,7 @@ struct StageResult {
     u32 launches; ///< Compute launches in the entry (0xaf, 0xb0, 0x107), for the run shape
     s32 channel;  ///< The channel the stage had bound at the entry, for the run shape
     bool ran_on_back; ///< The back ran a gather or a semaphore release of it on GPUMem's request
+    bool publish_now; ///< GPUMem passed it (FRITCHII_MEMSTAGE_PASS): published at once
 };
 /// The back: ring mode starts (its hooks off) or ended.
 void SetRingBack(bool on);

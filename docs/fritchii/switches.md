@@ -1271,6 +1271,61 @@ entry when it gets there. 0, AHEAD 0 and THREAD 0/1: as before.
 - Compare 0 and 1 with profile_toggle.py in one session (5c's run starters lose "cache call"
   at the release's address).
 
+### FRITCHII_MEMSTAGE_PASS
+
+FRITCHII_MEMSTAGE_PASS (live, read at a frame end with FRITCHII_MEMSTAGE_AHEAD, default 0;
+work\fable_stage_levelpoints.md sections 4 to 6, with Fable's amendment and fable_stage_p3.md
+section 1): with FRITCHII_MEMSTAGE_THREAD=2 and the window open (AHEAD > 0), bit 1 (=1) makes a
+lone gather (3D invalidate_texture_data_cache, 0x3dd) or wait for idle (0x44) a passed entry
+instead of a level run: GPUMem does what the entry does to the buffer cache itself, at its
+position, and goes on; the back runs the entry later, served, with its own code, and finds
+nothing to do in the buffer cache there. 0, AHEAD 0 and THREAD 0/1: as before (the passes line
+is then dry). Bit 2 (fence entries, fable_stage_p3) is not built: it is masked off.
+- Which (tried before FRITCHII_MEMSTAGE_GATHER; one that does not pass goes to what that switch
+  says, a run otherwise): a lone method entry outside a run, no draw before it in the entry,
+  - rule Q: no query result sync can be pending at the entry (the mirror in the passes line);
+  - rule C: no read download tracking (EXP49 off, none pending) and no uncommitted buffer flush
+    (the note, else the sets under the lock): only a fill that marks GPU-written data adds one,
+    and those come level first or run lent, so a set empty at GPUMem's position is empty when
+    the back gets there;
+  - room for its record (256).
+- A passed gather (rule G): GPUMem takes the game's collected writes (nothing when every
+  collector says empty) and, under the buffer cache's lock, tests their pages (page-aligned, as
+  WriteMemory's recording branch reads whole pages: the page bits, then the cache). No
+  GPU-written data there: the served gather's buffer half at once (claims, WriteMemory per range:
+  on such pages only marks, no command; the vertex-stale marks reach GPUMem's copy through the
+  mark hook). GPU-written data on a page: nothing applied, the record goes whole and the entry is
+  a level run (its gather applies the ranges with the full path before it takes more).
+- Every passed entry pushes a record (its position; a gather's ranges). The back asks for it
+  first at the entry (RasterizerVulkan::InvalidateTextureDataCache, GpuSplit::Execute for a
+  release, Maxwell3D's wait_for_idle), so FRITCHII_MEMSTAGE_GATHER's / _RELEASE's "served ...
+  with no record" stay real must-be-0s. At the gather, RasterizerVulkan::InvalidateGPUCache
+  applies the record's other half (the texture and pipeline caches), then the back's own gather
+  runs. A record lives until the back asks for a later entry's (one it never asked for is late,
+  applied there), or is dropped at a lend (before the run's first entry), the ring's start and
+  end (one at or past the end stays for the back's run of that entry without the ring).
+- The back in a served entry: its own gathers (GPU::Impl::InvalidateGPUCache, read tracking off)
+  return at once when every collector is empty; otherwise the take and the buffer half run on
+  GPUMem in one served call (RasterizerVulkan::GatherOnStage), the other caches' half on the back: only
+  GPUMem takes while the back is served. Its wait for idle and flush grouping (SignalOrdering)
+  find nothing to do: a pending sync there, or a set uncommitted-flush note, is a must-be-0 (then
+  they run as today).
+- Must be 0 (the link line), each turning the switch to 0 for the session from the next frame
+  end (logged once): "a query result sync pending at a passed entry's wait for idle", "uncommitted
+  buffer flushes at a passed entry's flush grouping", "a pass record of an entry the back passed
+  without asking for it", "a passed gather's buffer half recorded a command" (the seam arena grew
+  in its bracket), "a served wait for idle with no pass record".
+- Exactness, in short: the back's query state at the entry has no pending sync (every source of
+  one is a 3D report GPUMem counts or a hard entry); the uncommitted set is empty there (above);
+  the game writes taken at the gather were collected before GPUMem read the list, and both halves
+  land at the entry, the buffer half before GPUMem's next fill (THREAD 0's order). A write made
+  while the list runs has no position the game can count on and is taken at the next gather.
+- The passes line counts passed ones and the first failed test per method, records and ranges a
+  second, the records the back applied, and the back's own served gathers taken on GPUMem.
+- Compare 0 and 1 with profile_toggle.py in one session; expected (Fable, an estimate): runs
+  from about 10,500 to about 7,000 a second, GPUMem's run wait down 30 to 45 ms/s, +1 to +2 fps
+  at the market.
+
 ### Memory stage passes (the "Memory stage passes" line)
 
 Every 10 s on THREAD 2 (fable_stage_levelpoints 5.2), "Memory stage passes (dry, window

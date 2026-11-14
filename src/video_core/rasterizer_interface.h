@@ -280,6 +280,13 @@ public:
         WaitForIdle();
     }
 
+    /// The memory stage (FRITCHII_MEMSTAGE_PASS, the back in a served entry): the game's
+    /// collected writes taken and their buffer half applied on the memory stage's thread, the
+    /// other caches' half here. False: not done (the caller gathers as usual).
+    virtual bool GatherOnStage() {
+        return false;
+    }
+
     /// Unmap memory range
     virtual void UnmapMemory(DAddr addr, u64 size) = 0;
 

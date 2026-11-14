@@ -2112,11 +2112,20 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
         // semaphore release already (memstage_shadow.cpp, StageRelease); skipped here, also when
         // the record outlived the ring by this entry (GPUMem failed in the request), so it never
         // runs twice. The test is on the header first: other calls pay one compare.
+        // FRITCHII_MEMSTAGE_PASS (fable_stage_p3 1): a release GPUMem passed has a pass record,
+        // asked for first: the call runs here, and BackTakeRelease (which counts a served one
+        // without a request record) is not asked.
         if (StageCacheCallOf(head) == StageCacheCall::SemaphoreRelease &&
             StageTagOf(head) == StageTag::Cache &&
-            (MemoryStageLink::RingActive() || MemoryStageLink::Get().ReleasePending()) &&
-            MemoryStageLink::Get().BackTakeRelease(back_entry_position)) [[unlikely]] {
-            return 2 + payload;
+            (MemoryStageLink::RingActive() || MemoryStageLink::Get().ReleasePending() ||
+             MemoryStageLink::Get().PassPending())) [[unlikely]] {
+            MemoryStageLink& link = MemoryStageLink::Get();
+            const bool passed =
+                link.PassPending() && link.BackPassRecord(back_entry_position) != nullptr;
+            if (!passed && (MemoryStageLink::RingActive() || link.ReleasePending()) &&
+                link.BackTakeRelease(back_entry_position)) {
+                return 2 + payload;
+            }
         }
         reinterpret_cast<void (*)(const u64*)>(entry[1])(entry + 2);
         return 2 + payload;

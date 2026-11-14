@@ -3231,6 +3231,9 @@ void MemStage::TickThread(int seam) {
     // The puller's semaphore releases the same way (live, default off; the window open only).
     link.SetRelease(
         Debug::SwitchValue(Debug::g_memstage_release, "FRITCHII_MEMSTAGE_RELEASE", 0) > 0);
+    // Passed gathers and waits for idle (live, default off; the window open only; bit 1).
+    link.SetPass(static_cast<u32>(
+        (std::max)(Debug::SwitchValue(Debug::g_memstage_pass, "FRITCHII_MEMSTAGE_PASS", 0), 0)));
     // The window's verify (its own-write ring and the image check) only with a verify on.
     Link::SetVerify(read_log_every > 0 || Link::RingVerify());
     ring_read_log.store(read_log_every > 0 && Link::Ahead() != 0, std::memory_order_relaxed);

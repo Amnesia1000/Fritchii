@@ -70,6 +70,11 @@ public:
         ReleaseOrphan,
         ReleaseDrawBetween,
         RunOverlap,
+        PassQuerySync,
+        PassFlushes,
+        PassLate,
+        PassCommand,
+        PassWaitMissing,
         Count,
     };
 
@@ -178,7 +183,18 @@ public:
         /// Flushes: the buffer cache has uncommitted flushes (its note, then under its lock the
         /// sets, refreshing the note).
         u8 (*pass_ready)(void* context){};
+        /// GPUMem, at a passed gather (FRITCHII_MEMSTAGE_PASS bit 1, outside any fill): takes the
+        /// game's collected writes into `ranges` (nothing when every collector is empty) and,
+        /// unless one lies on a page with GPU-written buffer data, applies their buffer half at
+        /// once. A PassTake.
+        u8 (*pass_gather)(void* context, std::vector<std::pair<u64, u64>>& ranges){};
+        /// The back: a pass record's half for the other caches (`whole`: the full gather path,
+        /// the buffer half too: the entry ran as a level run, or the record is late and lent).
+        void (*apply_pass)(void* context, const std::pair<u64, u64>* ranges, size_t count,
+                           bool whole){};
     };
+    /// pass_gather's answer.
+    enum class PassTake : u8 { Empty, Applied, GpuWritten, Recorded };
 
     [[nodiscard]] static MemoryStageLink& Get() noexcept {
         return instance;
@@ -497,6 +513,63 @@ public:
     /// GPUMem: the window is open (P0's dry counters only count there).
     [[nodiscard]] static bool StageWindowOpen() noexcept {
         return t_on_stage && instance.ring_window != 0;
+    }
+    /// The back (any thread): bit 1 of the switch is on and the window open, as last set at a
+    /// frame end (the back's own gathers while served go to GPUMem then, levelpoints 6.3).
+    [[nodiscard]] static bool PassOn(u32 bit) noexcept {
+        return (g_pass.load(std::memory_order_relaxed) & bit) != 0 &&
+               g_ahead.load(std::memory_order_relaxed) != 0;
+    }
+    /// The back, at a frame end: FRITCHII_MEMSTAGE_PASS (live, default 0). Runs as 0 for the
+    /// session after a must-be-0 of the passes.
+    void SetPass(u32 bits);
+
+    /// A passed entry's record (levelpoints 6.4, fable_stage_p3 1): its position, and for a
+    /// gather the game's writes GPUMem took there (`whole`: nothing of them applied, the entry
+    /// runs as a level run). One writer (GPUMem), one reader (the back), 256 slots; a record
+    /// lives until the back asks for a later entry's.
+    struct PassRecord {
+        u64 position{};
+        bool whole{};
+        bool seen{};           ///< The back found it at its entry (BackPassRecord)
+        bool ranges_applied{}; ///< The back applied its half (BackApplyPasses)
+        std::vector<std::pair<u64, u64>> ranges;
+    };
+    static constexpr u64 PassSlots = 256;
+    /// GPUMem: room for one more record.
+    [[nodiscard]] bool PassRoom() const noexcept {
+        return pass_tail.load(std::memory_order_relaxed) -
+                   pass_head.load(std::memory_order_acquire) <
+               PassSlots;
+    }
+    /// GPUMem (PassRoom said yes): the next record, cleared, for the entry at `position`; it is
+    /// the back's once PassPush publishes it.
+    PassRecord& PassBegin(u64 position) noexcept {
+        PassRecord& record = pass_records[pass_tail.load(std::memory_order_relaxed) % PassSlots];
+        record.position = position;
+        record.whole = false;
+        record.seen = false;
+        record.ranges_applied = false;
+        record.ranges.clear();
+        return record;
+    }
+    void PassPush() noexcept;
+    /// The back: whether a record waits (any mode: one can outlive the ring at its end).
+    [[nodiscard]] bool PassPending() const noexcept {
+        return pass_head.load(std::memory_order_relaxed) !=
+               pass_tail.load(std::memory_order_acquire);
+    }
+    /// The back: frees the records of entries before `position` (one it never found is late:
+    /// must be 0, its half applied there), then returns the record of `position` if there is
+    /// one, without freeing it (it may be asked for twice in an entry).
+    PassRecord* BackPassRecord(u64 position) noexcept;
+    /// The back, at a passed gather's entry (RasterizerVulkan::InvalidateGPUCache): applies the
+    /// half of the record of `position` the back owes, once.
+    void BackApplyPasses(u64 position) noexcept;
+    /// The back, served: one of its own gathers taken on GPUMem (levelpoints 6.3), and whether it
+    /// found writes.
+    void NoteServedTake(bool found) noexcept {
+        BumpOne(pass_stats.served_takes[found ? 1 : 0], 1);
     }
 
     /// The entry turned hard at a constant buffer write onto GPU-written data (counted).
@@ -961,15 +1034,28 @@ private:
         std::array<std::atomic<u64>, RunBuckets> split_front_ns{};
         std::atomic<u64> delay_runs{};
         std::atomic<u64> delay_ns{};
+        std::atomic<u64> records{};
+        std::atomic<u64> record_ranges{};
         // The back's: its waits for the stage after a run's end, before its next packet.
         alignas(64) std::atomic<u64> idle_waits{};
         std::atomic<u64> idle_ns{};
+        std::array<std::atomic<u64>, 2> served_takes{}; ///< [found writes]
+        std::atomic<u64> records_applied{};
         // The front's: puller releases [timestamped unmapped, mapped, fence unmapped, mapped].
         alignas(64) std::array<std::atomic<u64>, 4> front_releases{};
     };
     PassStats pass_stats;
     /// Set by NoteGatherRun (GPUMem, after the back's run of a gather it asked for).
     bool gather_last_synced{};
+    /// FRITCHII_MEMSTAGE_PASS: the records (one writer, GPUMem; one reader, the back).
+    std::array<PassRecord, PassSlots> pass_records{};
+    alignas(64) std::atomic<u64> pass_tail{0}; ///< pushed (GPUMem)
+    alignas(64) std::atomic<u64> pass_head{0}; ///< freed (the back)
+    /// The back: frees every record of an entry before `before` (late ones applied).
+    void BackDropPasses(u64 before) noexcept;
+    /// A must-be-0 of the passes was counted: the switch runs as 0 from the next frame end.
+    std::atomic<bool> pass_refused{false};
+    int pass_logged{-1};
     /// The back: a run ended and no packet was taken since (its waits then are idle).
     bool back_after_run{};
     /// GPUMem, right after a run's end: FRITCHII_DELAY_RUN_US / _KIND's spin.

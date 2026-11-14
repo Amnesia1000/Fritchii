@@ -737,6 +737,17 @@ void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argume
         root_tables.offset += 4;
         return;
     case MAXWELL3D_REG_INDEX(wait_for_idle):
+        // FRITCHII_MEMSTAGE_PASS (fable_stage_p3 1.4): the back runs a wait for idle in a served
+        // entry only when GPUMem passed it, with a record of the entry (must be 0 otherwise).
+        if (VideoCommon::MemoryStageLink::BackServed()) [[unlikely]] {
+            auto& link = VideoCommon::MemoryStageLink::Get();
+            if (link.BackPassRecord(VideoCommon::GpuSplit::Get().BackEntryPosition()) ==
+                nullptr) {
+                VideoCommon::MemoryStageLink::Note(
+                    VideoCommon::MemoryStageLink::Check::PassWaitMissing,
+                    "Maxwell3D::ProcessMethodCall (wait_for_idle)");
+            }
+        }
         return rasterizer->WaitForIdle();
     case MAXWELL3D_REG_INDEX(shadow_ram_control):
         shadow_state.shadow_ram_control = static_cast<Regs::ShadowRamControl>(nonshadow_argument);

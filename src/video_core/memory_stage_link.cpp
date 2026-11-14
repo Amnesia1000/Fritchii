@@ -344,6 +344,11 @@ constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::Check::Co
     "dropped)",
     "a back draw between a semaphore release GPUMem had run and its entry",
     "a run start while the back was still in the last run (its end was missed)",
+    "a query result sync pending at a passed entry's wait for idle (the mirror said none)",
+    "uncommitted buffer flushes at a passed entry's flush grouping (SignalOrdering)",
+    "a pass record of an entry the back passed without asking for it (applied late)",
+    "a passed gather's buffer half recorded a command",
+    "a served wait for idle with no pass record (the back ran it in a served entry)",
 };
 static_assert(LINK_CHECK_NAMES.back() != nullptr, "a name for every check");
 constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::ListDraw::Count)>
@@ -461,6 +466,9 @@ void MemoryStageLink::Start(Core::System& system_) {
     gather_tail.store(0, std::memory_order_relaxed);
     release_head.store(0, std::memory_order_relaxed);
     release_tail.store(0, std::memory_order_relaxed);
+    pass_head.store(0, std::memory_order_relaxed);
+    pass_tail.store(0, std::memory_order_relaxed);
+    pass_refused.store(false, std::memory_order_relaxed);
     thread = std::jthread([this](std::stop_token stop) { StageMain(stop); });
     LOG_INFO(HW_GPU, "Memory stage thread (GPUMem) started, sleeping until "
                      "FRITCHII_MEMSTAGE_THREAD=1 or 2 gives it work");
@@ -779,6 +787,10 @@ void MemoryStageLink::CheckCacheUserSlow(Check check) noexcept {
 void MemoryStageLink::Note(Check check, const char* where) noexcept {
     const size_t index = static_cast<size_t>(check);
     instance.counters.checks[index].fetch_add(1, std::memory_order_relaxed);
+    if (check >= Check::PassQuerySync && check <= Check::PassWaitMissing) {
+        // FRITCHII_MEMSTAGE_PASS runs as 0 from the next frame end (SetPass), for the session.
+        instance.pass_refused.store(true, std::memory_order_relaxed);
+    }
     static std::array<std::atomic<u32>, static_cast<size_t>(Check::Count)> logged{};
     if (logged[index].fetch_add(1, std::memory_order_relaxed) < 16) {
         LOG_ERROR(HW_GPU, "Memory stage link (must be 0): {} on {}{}{}", LINK_CHECK_NAMES[index],
@@ -891,6 +903,7 @@ bool MemoryStageLink::BackRingTopImpl(u64 position) {
         // back has run since (must be 0 left here: dropped as passed).
         BackDropGathers(position, "at the ring's start");
         BackDropReleases(position, "at the ring's start");
+        BackDropPasses(position);
         MemStageShadow::SetRingBack(true);
         g_ring_active.store(true, std::memory_order_seq_cst);
         ring_start.store(position, std::memory_order_release);
@@ -919,6 +932,9 @@ bool MemoryStageLink::BackRingTopImpl(u64 position) {
             // the back's run of that entry without the ring still skips it, so it never runs twice.
             BackDropGathers(position, "when the ring ended");
             BackDropReleases(position, "when the ring ended");
+            // Pass records of entries the back passed (each one late); one at or past the end
+            // stays for the back's run of its entry without the ring.
+            BackDropPasses(position);
             // GPUMem's unplayed mark must not outlive the ring (a fill that threw leaves its
             // entries pending and its number open): its entries are played, after the packets
             // of earlier entries above (they are later in the stream), and the mark cleared;
@@ -1030,6 +1046,9 @@ void MemoryStageLink::BackEntry(u64 position, const BackLimits& limits) {
         // entries (must be 0; a record of the run's first entry stays, its gather is ahead).
         BackDropGathers(limits.lent_from, "at a lend");
         BackDropReleases(limits.lent_from, "at a lend");
+        // Pass records of entries before the run (one never asked for is late); the run's first
+        // entry's own record stays for its gather call (levelpoints 6.5).
+        BackDropPasses(limits.lent_from);
         if (!lend_ranges.empty() && ring_backend.apply_ranges != nullptr) {
             // The stage's constant buffer ranges no fill applied yet (plan 6.2 item 2).
             ring_backend.apply_ranges(ring_backend.context, lend_ranges.data(),
@@ -1557,6 +1576,90 @@ void MemoryStageLink::DelayRun(u64 launches) noexcept {
     LinkBump(pass_stats.delay_ns, now - start);
 }
 
+void MemoryStageLink::SetPass(u32 bits) {
+    // At a frame end, as SetGather: GPUMem reads it at its next sync point. Records already
+    // pushed are taken whatever the switch says (BackPassRecord does not read it).
+    if (bits != 0 && pass_refused.load(std::memory_order_relaxed)) {
+        if (pass_logged != -2) {
+            pass_logged = -2;
+            LOG_CRITICAL(HW_GPU, "Memory stage passes (FRITCHII_MEMSTAGE_PASS={}): a must-be-0 of "
+                                 "the passes was counted; the switch runs as 0 for this session",
+                         bits);
+        }
+        bits = 0;
+    }
+    bits &= 1; // bit 1 (P1); bit 2 (P3) is not built yet
+    g_pass.store(bits, std::memory_order_relaxed);
+    if (mode == 2 && pass_logged != static_cast<int>(bits) && pass_logged != -2) {
+        pass_logged = static_cast<int>(bits);
+        LOG_INFO(HW_GPU, "Memory stage passes (FRITCHII_MEMSTAGE_PASS={}): {}", bits,
+                 bits != 0 ? "GPUMem passes lone gathers and waits for idle with no query sync "
+                             "pending, no read tracking and no uncommitted flush, no run (while "
+                             "the window is open, FRITCHII_MEMSTAGE_AHEAD > 0)"
+                           : "gathers and waits for idle as before (the passes line is dry)");
+    }
+}
+
+void MemoryStageLink::PassPush() noexcept {
+    // GPUMem; PassBegin filled the slot. The back reads it only past this store.
+    const u64 tail = pass_tail.load(std::memory_order_relaxed);
+    const PassRecord& record = pass_records[tail % PassSlots];
+    LinkBump(pass_stats.records);
+    LinkBump(pass_stats.record_ranges, record.ranges.size());
+    pass_tail.store(tail + 1, std::memory_order_release);
+}
+
+void MemoryStageLink::BackDropPasses(u64 before) noexcept {
+    u64 head = pass_head.load(std::memory_order_relaxed);
+    const u64 tail = pass_tail.load(std::memory_order_acquire);
+    while (head != tail) {
+        PassRecord& record = pass_records[head % PassSlots];
+        if (record.position >= before) {
+            break;
+        }
+        if (!record.seen) {
+            // The back passed the entry without asking for its record (must be 0): its half is
+            // applied here, late, so no invalidation is ever lost.
+            Note(Check::PassLate, ("a pass record" + BackRingState(record.position)).c_str());
+        }
+        if (!record.ranges_applied && !record.ranges.empty() && ring_backend.apply_pass != nullptr) {
+            ring_backend.apply_pass(ring_backend.context, record.ranges.data(),
+                                    record.ranges.size(), record.whole);
+        }
+        record.ranges_applied = true;
+        ++head;
+        // Freed one by one: GPUMem may refill a slot as soon as it sees it free.
+        pass_head.store(head, std::memory_order_release);
+    }
+}
+
+MemoryStageLink::PassRecord* MemoryStageLink::BackPassRecord(u64 position) noexcept {
+    BackDropPasses(position);
+    const u64 head = pass_head.load(std::memory_order_relaxed);
+    if (head == pass_tail.load(std::memory_order_acquire)) {
+        return nullptr;
+    }
+    PassRecord& record = pass_records[head % PassSlots];
+    if (record.position != position) {
+        return nullptr;
+    }
+    record.seen = true;
+    return &record;
+}
+
+void MemoryStageLink::BackApplyPasses(u64 position) noexcept {
+    PassRecord* const record = BackPassRecord(position);
+    if (record == nullptr || record->ranges_applied) {
+        return;
+    }
+    record->ranges_applied = true;
+    if (!record->ranges.empty() && ring_backend.apply_pass != nullptr) {
+        LinkBump(pass_stats.records_applied);
+        ring_backend.apply_pass(ring_backend.context, record->ranges.data(),
+                                record->ranges.size(), record->whole);
+    }
+}
+
 void MemoryStageLink::CloseBusyBatch() noexcept {
     if (busy_batch_start != 0) {
         LinkBump(counters.stage_busy_ns, LinkNowNs() - busy_batch_start);
@@ -1910,7 +2013,8 @@ void MemoryStageLink::RingLoop(std::stop_token& stop, u64 start) {
                 // An entry the back ran for GPUMem (a gather or a semaphore release at its entry,
                 // FRITCHII_MEMSTAGE_GATHER / _RELEASE) is published at once as one with a packet:
                 // the back is parked at it and has its record.
-                if (result.packets != 0 || result.ran_on_back ||
+                // A passed entry (FRITCHII_MEMSTAGE_PASS) too: the back gets going on it at once.
+                if (result.packets != 0 || result.ran_on_back || result.publish_now ||
                     ++since_publish >= PublishEvery) {
                     since_publish = 0;
                     close_batch();
@@ -2198,6 +2302,8 @@ void MemoryStageLink::LogPasses(double seconds) {
     for (size_t i = 0; i < releases.size(); ++i) {
         releases[i] = take(stats.front_releases[i]);
     }
+    const u64 takes_empty = take(stats.served_takes[0]);
+    const u64 takes_found = take(stats.served_takes[1]);
     LOG_INFO(
         HW_GPU,
         "Memory stage passes ({}, window {}) {:.0f} s: per second {}; fence entries outside a "
@@ -2209,7 +2315,9 @@ void MemoryStageLink::LogPasses(double seconds) {
         "the back {:.1f}, for the front while lent {:.1f}, following {:.1f}; by compute "
         "launches a run (runs/s: back/front/following ms/s) {}; the back waited for the stage "
         "after a run's end, before its next packet, {:.0f}/s {:.1f} ms/s; delay test "
-        "FRITCHII_DELAY_RUN_US={} kind {}: {:.0f}/s {:.1f} ms/s",
+        "FRITCHII_DELAY_RUN_US={} kind {}: {:.0f}/s {:.1f} ms/s; pass records {:.0f}/s with "
+        "{:.0f} game write ranges/s, applied by the back {:.0f}/s; the back's own gathers while "
+        "served taken on GPUMem {:.0f}/s ({:.0f}/s found writes)",
         g_pass.load(std::memory_order_relaxed) != 0
             ? fmt::format("FRITCHII_MEMSTAGE_PASS={}", g_pass.load(std::memory_order_relaxed))
             : std::string{"dry"},
@@ -2222,7 +2330,9 @@ void MemoryStageLink::LogPasses(double seconds) {
         rate(take(stats.idle_waits)), ms(take(stats.idle_ns)),
         (std::max)(VideoCore::Nx2Debug::g_delay_run_us.load(std::memory_order_relaxed), 0),
         (std::max)(VideoCore::Nx2Debug::g_delay_run_kind.load(std::memory_order_relaxed), 0),
-        rate(take(stats.delay_runs)), ms(take(stats.delay_ns)));
+        rate(take(stats.delay_runs)), ms(take(stats.delay_ns)), rate(take(stats.records)),
+        rate(take(stats.record_ranges)), rate(take(stats.records_applied)),
+        rate(takes_empty + takes_found), rate(takes_found));
 }
 
 void MemoryStageLink::Take(Snapshot& out) const noexcept {

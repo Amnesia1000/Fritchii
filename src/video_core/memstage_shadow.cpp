@@ -847,6 +847,7 @@ struct State {
     u64 ring_seq{};           ///< Draws the copies issued since the ring started
     u32 ring_packets{};       ///< Packets the entry sent
     bool ring_ran_on_back{};  ///< The back ran its gather or semaphore release (StageResult)
+    bool ring_publish_now{};  ///< GPUMem passed it (FRITCHII_MEMSTAGE_PASS; StageResult)
     // fable_stage_levelpoints 6.1: the mirror of the back's query_cache.HasPendingSync() at
     // GPUMem's place in the stream. A sync may be pending unless `sync_unknown` is false and no
     // report went by since the last sync point. The alternative mirror (P0's counter only) is
@@ -1318,19 +1319,26 @@ bool GatherCandidate(const State& s) {
     return s.ring && !s.ring_in_run && !s.entry_hard && MemoryStageLink::GatherServed();
 }
 
+/// FRITCHII_MEMSTAGE_PASS bit 1: a gather or wait for idle GPUMem may pass (StagePass decides
+/// there, at the method). Anything else keeps it hard.
+bool PassCandidate(const State& s) {
+    return s.ring && !s.ring_in_run && !s.entry_hard && MemoryStageLink::PassServed(1);
+}
+
 MethodKind MethodKindOf(const Copy& c, u32 method) {
     switch (method) {
     // Hard: they need the back's caches (the gather, the wait, the upload engine's writes),
     // or (falcon[4]) were level in the first version. Followed: the store, and falcon[4]'s
     // scratch word.
-    case MAXWELL3D_REG_INDEX(wait_for_idle):
     case MAXWELL3D_REG_INDEX(falcon[4]):
     case MAXWELL3D_REG_INDEX(sync_info):
     case MAXWELL3D_REG_INDEX(launch_dma):
     case MAXWELL3D_REG_INDEX(inline_data):
         return MethodKind::Hard;
+    case MAXWELL3D_REG_INDEX(wait_for_idle):
+        return PassCandidate(S()) ? MethodKind::Work : MethodKind::Hard;
     case MAXWELL3D_REG_INDEX(invalidate_texture_data_cache):
-        return GatherCandidate(S()) ? MethodKind::Work : MethodKind::Hard;
+        return GatherCandidate(S()) || PassCandidate(S()) ? MethodKind::Work : MethodKind::Hard;
     // Pass (plan 2.2, 2.4, 2.5): the query streamer's reset, the scheduler's barrier, an empty
     // handler, and a report that is not a fence (the handler decides that). The store only.
     case MAXWELL3D_REG_INDEX(clear_report_value):
@@ -1401,67 +1409,128 @@ void NoteFenceEntry(u32 kind) {
 /// FRITCHII_MEMSTAGE_PASS (fable_stage_levelpoints 6.2), at a gather (0x3dd) or a wait for idle
 /// (0x44) of the copy, before StageGather: P1's tests, in its order, each way out counted. Off
 /// (dry), the decision is counted and the entry goes on as before (hard: a run, or GATHER's
-/// request); the mirror then takes it as P1 would (EntrySync, run_from_dry_pass). True when the
-/// entry passed.
-bool StagePass(State& s, Copy& c, u32 method) {
+/// request); the mirror then takes it as P1 would (EntrySync, run_from_dry_pass).
+///
+/// On (bit 1, the window open), a passed entry: GPUMem has done what the entry does to the buffer
+/// cache, at its position, and goes on; the back runs the entry later, served, with its own code,
+/// and finds nothing to do in the buffer cache there (levelpoints section 4, rules C, G, Q):
+/// - rule Q: no query sync can be pending (the mirror), so the wait for idle's NotifyWFI does
+///   nothing (the back checks: PassQuerySync);
+/// - rule C: no uncommitted flush (read under the lock when the note is set), so the flush
+///   grouping (SignalOrdering) has nothing to group (the back checks: PassFlushes);
+/// - rule G, 0x3dd: GPUMem takes the game's collected writes and applies their buffer half at once
+///   (the fable amendment: WriteMemory only marks on pages without GPU-written data, no command);
+///   the record carries them to the back for the texture and pipeline caches. A write on such a
+///   page: nothing applied, the record whole, the entry a level run (its gather applies them).
+/// Every passed entry pushes a record (fable_stage_p3 1): the back asks for it at the entry.
+enum class PassResult : u8 {
+    Today,  ///< not passed: today's path (StageGather, or hard)
+    Passed, ///< passed: work, no run
+    Hard,   ///< the take found GPU-written data: hard, the record whole (no StageGather)
+};
+PassResult StagePass(State& s, Copy& c, u32 method) {
     using Outcome = MemoryStageLink::PassOutcome;
     using Ready = MemoryStageLink::PassReady;
+    using Take = MemoryStageLink::PassTake;
     static_cast<void>(c);
     MemoryStageLink& link = MemoryStageLink::Get();
-    const auto which = method == MAXWELL3D_REG_INDEX(invalidate_texture_data_cache)
-                           ? MemoryStageLink::PassMethod::Gather
-                           : MemoryStageLink::PassMethod::WaitForIdle;
+    const bool gather = method == MAXWELL3D_REG_INDEX(invalidate_texture_data_cache);
+    const auto which =
+        gather ? MemoryStageLink::PassMethod::Gather : MemoryStageLink::PassMethod::WaitForIdle;
     if (!MemoryStageLink::StageWindowOpen()) {
         link.NotePass(which, Outcome::Closed);
-        return false;
+        return PassResult::Today;
     }
     const bool dry = !MemoryStageLink::PassServed(1);
+    // Step 1: outside a run, the entry not hard.
     if (s.ring_in_run) {
         link.NotePass(which, Outcome::InRun);
-        return false;
+        return PassResult::Today;
     }
     // Dry, the method made the entry hard itself (MethodKindOf; a lone method has nothing
     // before it). Otherwise MethodKindOf said work: hard here means hard before it.
     if (s.entry_hard && (!dry || s.entry_key != LevelKey(s.entry_type, s.channel, method))) {
         link.NotePass(which, Outcome::Late);
-        return false;
+        return PassResult::Today;
     }
+    // Step 2: a lone method entry, no draw before it in it (as StageGather).
     const u64 head = Access::Ring()[s.processing_position & Access::RingMask];
     if (static_cast<Kind>(head & 0xf) != Kind::Method || s.entry_draws != 0) {
         link.NotePass(which, Outcome::NotFirst);
-        return false;
+        return PassResult::Today;
     }
     // A lone sync point: whatever becomes of it, the back runs its wait for idle at this entry.
     s.entry_sync = State::EntrySync::Ran;
     const auto& backend = link.Backend();
+    // Step 3: no query sync can be pending (rule Q, the mirror).
     const bool clear = !s.sync_unknown && s.sync_reports == 0;
     const bool alt_clear = !s.alt_unknown && s.alt_reports == 0;
     if (!clear && !alt_clear) {
         link.NotePass(which, Outcome::SyncPending);
-        return false;
+        return PassResult::Today;
     }
+    // Step 4: no read tracking, no uncommitted flush (rule C).
     const Ready ready = backend.pass_ready != nullptr
                             ? static_cast<Ready>(backend.pass_ready(backend.context))
                             : Ready::Tracking;
     if (!clear) {
         link.NotePass(which, Outcome::SyncPending, ready == Ready::Ready);
-        return false;
+        return PassResult::Today;
     }
     if (ready == Ready::Tracking) {
         link.NotePass(which, Outcome::Tracking);
-        return false;
+        return PassResult::Today;
     }
     if (ready == Ready::Flushes) {
         link.NotePass(which, Outcome::Flushes);
-        return false;
+        return PassResult::Today;
     }
     if (dry) {
         link.NotePass(which, Outcome::Passed);
         s.entry_sync = State::EntrySync::Cleared;
         s.entry_dry_pass = true;
-        return false;
+        return PassResult::Today;
     }
-    return false;
+    // Step 5: room for the record (every passed entry has one).
+    if (!link.PassRoom() || (gather && backend.pass_gather == nullptr)) {
+        link.NotePass(which, Outcome::NoRoom);
+        return PassResult::Today;
+    }
+    MemoryStageLink::PassRecord& record = link.PassBegin(s.processing_position);
+    if (gather) {
+        // Steps 6 and 7: the take, the page-aligned GPU-written test and the buffer half, at
+        // once (the backend, under the buffer cache's lock).
+        Take took;
+        try {
+            took = static_cast<Take>(backend.pass_gather(backend.context, record.ranges));
+        } catch (...) {
+            // The ring ends (RingFailed); the taken writes must not be lost: the record goes
+            // whole, so the back's run of this entry applies them all (the marks again, which
+            // changes nothing where they were applied already).
+            record.whole = true;
+            link.PassPush();
+            throw;
+        }
+        if (took == Take::GpuWritten) {
+            // WriteMemory would download or upload in place there, which must be recorded where
+            // the back is: the entry runs as a level run, and its gather applies the ranges
+            // taken here whole (BackApplyPasses) before it takes more.
+            record.whole = true;
+            link.PassPush();
+            link.NotePass(which, Outcome::GpuWritten);
+            Hard(s, s.entry_type, method);
+            return PassResult::Hard;
+        }
+        if (took == Take::Recorded) [[unlikely]] {
+            MemoryStageLink::Note(MemoryStageLink::Check::PassCommand,
+                                  "StagePass (a passed gather's buffer half)");
+        }
+    }
+    link.PassPush();
+    link.NotePass(which, Outcome::Passed);
+    s.entry_sync = State::EntrySync::Cleared;
+    s.ring_publish_now = true;
+    return PassResult::Passed;
 }
 
 /// Maxwell3D::ProcessMethodCall's effects on the copy, for every executable method that is not a
@@ -1502,13 +1571,21 @@ void MethodCall(State& s, Copy& c, u32 method, u32 value, u32 nonshadow) {
         return Condition(s, c);
     case MAXWELL3D_REG_INDEX(invalidate_texture_data_cache):
         if (s.ring) {
-            StagePass(s, c, method);   // FRITCHII_MEMSTAGE_PASS (dry: its counters only)
-            StageGather(s, c, method); // FRITCHII_MEMSTAGE_GATHER, and its counters
+            // FRITCHII_MEMSTAGE_PASS first (dry: its counters only), then
+            // FRITCHII_MEMSTAGE_GATHER and its counters. MethodKindOf made it work for either:
+            // without GATHER's candidate it is hard here, as before the passes.
+            if (StagePass(s, c, method) != PassResult::Today) {
+                return;
+            }
+            if (!s.entry_hard && !GatherCandidate(s)) {
+                Hard(s, s.entry_type, method);
+            }
+            StageGather(s, c, method);
         }
         return; // the store only
     case MAXWELL3D_REG_INDEX(wait_for_idle):
-        if (s.ring) {
-            StagePass(s, c, method); // FRITCHII_MEMSTAGE_PASS (dry: its counters only)
+        if (s.ring && StagePass(s, c, method) == PassResult::Today && !s.entry_hard) {
+            Hard(s, s.entry_type, method); // not passed: hard, as before the passes
         }
         return; // the store only
     case MAXWELL3D_REG_INDEX(sync_info):
@@ -2640,6 +2717,7 @@ StageResult StageProcess(u64 position, bool in_run) {
     s.ring_in_run = in_run;
     s.ring_packets = 0;
     s.ring_ran_on_back = false;
+    s.ring_publish_now = false;
     s.current = position;
     const size_t size = Process(s, position, false);
     s.cursor = position + size;
@@ -2654,6 +2732,7 @@ StageResult StageProcess(u64 position, bool in_run) {
         .launches = s.entry_launches,
         .channel = s.channel,
         .ran_on_back = s.ring_ran_on_back,
+        .publish_now = s.ring_publish_now,
     };
 }
 

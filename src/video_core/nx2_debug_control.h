@@ -142,6 +142,8 @@ inline std::atomic<int> g_memstage_fast_loop{-1};
 inline std::atomic<int> g_memstage_gather{-1};
 /// FRITCHII_MEMSTAGE_RELEASE: docs/fritchii/switches.md.
 inline std::atomic<int> g_memstage_release{-1};
+/// FRITCHII_MEMSTAGE_PASS: docs/fritchii/switches.md.
+inline std::atomic<int> g_memstage_pass{-1};
 /// FRITCHII_DELAY_MACRO_DRAIN_US: docs/fritchii/switches.md.
 inline std::atomic<int> g_delay_macro_drain_us{-1};
 /// FRITCHII_DELAY_POLL_DRAIN_US: docs/fritchii/switches.md.

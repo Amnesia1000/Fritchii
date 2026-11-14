@@ -33,6 +33,7 @@
 #include "video_core/gpu_wait_site.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/syncpoint_manager.h"
+#include "video_core/memory_stage_link.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/rasterizer_interface.h"
@@ -70,6 +71,17 @@ public:
     void SignalOrdering() {
         if constexpr (!can_async_check) {
             TryReleasePendingFences<false>();
+        }
+        // FRITCHII_MEMSTAGE_PASS (fable_stage_levelpoints 6.5): served, this is a passed entry's
+        // flush grouping, which GPUMem passed only with no uncommitted flush (rule C): nothing to
+        // group, and the back stays out of the buffer cache. A set note there is a must-be-0 (it
+        // then groups as today).
+        if (MemoryStageLink::BackServed()) [[unlikely]] {
+            if (!buffer_cache.MayHaveUncommittedFlushes()) {
+                return;
+            }
+            MemoryStageLink::Note(MemoryStageLink::Check::PassFlushes,
+                                  "FenceManager::SignalOrdering");
         }
         std::scoped_lock lock{buffer_cache.mutex};
         buffer_cache.AccumulateFlushes();

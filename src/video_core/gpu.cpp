@@ -40,6 +40,7 @@
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/syncpoint_manager.h"
 #include "video_core/memory_manager.h"
+#include "video_core/memory_stage_link.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_async_readback.h"
 #include "video_core/nx2_debug_control.h"
@@ -187,6 +188,23 @@ struct GPU::Impl {
         // with none pending and the switch off nothing is tracked and no lock is taken.
         const bool track = VideoCore::g_read_downloads.load(std::memory_order_acquire) != 0 ||
                            VideoCore::Nx2Debug::Experiment(49) != 0;
+        // FRITCHII_MEMSTAGE_PASS bit 1 (fable_stage_levelpoints 6.3): the back in a served entry
+        // takes nothing itself. Empty collectors: nothing to do (a write collected after this
+        // test is taken at the next gather, as one collected after the managers' locks). Else
+        // the take and the buffer half run on GPUMem in one served call, so only GPUMem takes
+        // while the back is served (no write sits between two takers while a fill passes).
+        if (!track && VideoCommon::MemoryStageLink::BackServed() &&
+            VideoCommon::MemoryStageLink::PassOn(1)) {
+            if (std::ranges::all_of(system.GetGPUDirtyMemoryManager(),
+                                    [](const Core::GPUDirtyMemoryManager& manager) {
+                                        return manager.NothingCollected();
+                                    })) {
+                return;
+            }
+            if (renderer->ReadRasterizer()->GatherOnStage()) {
+                return;
+            }
+        }
         if (!track) {
             system.GatherGPUDirtyMemory(callback_writes);
             if (!writes.empty()) {
@@ -209,6 +227,19 @@ struct GPU::Impl {
             std::erase(applying_writes, &writes);
         };
         renderer->ReadRasterizer()->OnCacheInvalidations(writes);
+    }
+
+    /// FRITCHII_MEMSTAGE_PASS (GPUMem, read tracking off): the take alone (GPU::TakeCpuWrites).
+    void TakeCpuWrites(std::vector<std::pair<DAddr, u64>>& out) {
+        if (std::ranges::all_of(system.GetGPUDirtyMemoryManager(),
+                                [](const Core::GPUDirtyMemoryManager& manager) {
+                                    return manager.NothingCollected();
+                                })) {
+            return;
+        }
+        std::function<void(PAddr, size_t)> callback(
+            [&out](PAddr address, size_t size) { out.emplace_back(address, size); });
+        system.GatherGPUDirtyMemory(callback);
     }
 
     void ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback) {
@@ -670,6 +701,10 @@ void GPU::FlushCommands() {
 
 void GPU::InvalidateGPUCache() {
     impl->InvalidateGPUCache();
+}
+
+void GPU::TakeCpuWrites(std::vector<std::pair<DAddr, u64>>& out) {
+    impl->TakeCpuWrites(out);
 }
 
 bool GPU::HasPendingCPUWrites(DAddr addr, u64 size) {
