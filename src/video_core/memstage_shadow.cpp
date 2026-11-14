@@ -1659,6 +1659,8 @@ size_t Process(State& s, u64 position, bool executed) {
             cls = executable && MethodKindOf(c0, method) == MethodKind::Work ? Class::Work
                                                                              : Class::Pass;
             if (Copy* const c = Use(s, c0.back, executed)) {
+                const Nx2Profile::Scope zone{Nx2Profile::Zone::StageMethods,
+                                             s.ring && Nx2Profile::Fine(), false};
                 CallMethod(s, *c, method, argument);
             } else if (executable && MethodKindOf(c0, method) == MethodKind::Hard) {
                 Hard(s, LevelType::Method3D, method);
@@ -1668,6 +1670,8 @@ size_t Process(State& s, u64 position, bool executed) {
         // Into the back's method sink: applied now, which is the same state at the next
         // executable method (spec 4.2); a deferred draw it flushes comes later on the back.
         if (Copy* const c = Use(s, c0.back, executed)) {
+            const Nx2Profile::Scope zone{Nx2Profile::Zone::StageMethods,
+                                         s.ring && Nx2Profile::Fine(), false};
             s.processing_sunk = true;
             StateWrite(*c, method, argument);
             s.processing_sunk = false;
@@ -1704,6 +1708,8 @@ size_t Process(State& s, u64 position, bool executed) {
         cls = executable && MethodKindOf(c0, method) == MethodKind::Work ? Class::Work
                                                                          : Class::Pass;
         if (Copy* const c = Use(s, c0.back, executed)) {
+            const Nx2Profile::Scope zone{Nx2Profile::Zone::StageMethods,
+                                         s.ring && Nx2Profile::Fine(), false};
             CallMultiMethod(s, *c, method, reinterpret_cast<const u32*>(entry + data), amount);
         } else if (executable && MethodKindOf(c0, method) == MethodKind::Hard) {
             Hard(s, LevelType::Method3D, method);
@@ -1742,6 +1748,8 @@ size_t Process(State& s, u64 position, bool executed) {
             cls = Class::Work;
             s.entry_type = LevelType::Packet3D;
             if (Copy* const c = Use(s, engine, executed)) {
+                const Nx2Profile::Scope zone{Nx2Profile::Zone::StagePackets,
+                                             s.ring && Nx2Profile::Fine(), false};
                 for (u32 i = 0; i < count; ++i) {
                     CallMethod(s, *c, static_cast<u32>(writes[i] & 0xffff),
                                static_cast<u32>(writes[i] >> 32));
@@ -1804,6 +1812,8 @@ size_t Process(State& s, u64 position, bool executed) {
             break;
         }
         if (Copy* const c = Use(s, s.engine_copy->back, executed)) {
+            const Nx2Profile::Scope zone{Nx2Profile::Zone::StagePairs,
+                                         s.ring && Nx2Profile::Fine(), false};
             for (u32 i = 0; i < count; ++i) {
                 StateWrite(*c, static_cast<u32>(entry[1 + i] & 0xffff),
                            static_cast<u32>(entry[1 + i] >> 32));
@@ -1827,6 +1837,8 @@ size_t Process(State& s, u64 position, bool executed) {
         cls = Class::Work;
         s.entry_type = LevelType::Batch3D;
         if (Copy* const c = Use(s, c0.back, executed)) {
+            const Nx2Profile::Scope zone{Nx2Profile::Zone::StagePackets,
+                                         s.ring && Nx2Profile::Fine(), false};
             // Maxwell3D::RunDrawBatch: the group once, then the repeats as instances.
             for (u32 i = 0; i < count; ++i) {
                 CallMethod(s, *c, static_cast<u32>(entry[1 + i] & 0xffff),
@@ -2912,6 +2924,8 @@ void MemStageShadowEngine::StageDraw(bool indexed, u32 instance_count, bool indi
     Shadow::State& s = Shadow::S();
     if (s.ring) {
         // 6b (memstage_shadow.cpp's header): serve the draw, or make its entry hard.
+        // Profiling: the draw's own share of GPUMem's entries (its fill is a zone of its own).
+        const Nx2Profile::Scope zone{Nx2Profile::Zone::StageDrawSetup, Nx2Profile::Fine(), false};
         MemoryStageLink& link = MemoryStageLink::Get();
         const u64 seq = ++s.ring_seq;
         ++s.entry_draws;

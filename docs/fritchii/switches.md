@@ -591,7 +591,13 @@ session after a catch-up could not finish (below; logged).
   vertex input state only when it may have changed (the back's VertexBuffers flag, not the
   cache's in served mode, is cleared at a packet's draw as the cache's vertex buffer update
   clears it with one thread, and with each send). With EDEN_NX2_GPU_PROFILE=2 GPUMem's
-  profile splits its entry loop into "stage entries" and, inside it, "stage cb words"; the back's
+  profile splits its entry loop into "stage entries" and, inside it, "stage cb words", "stage
+  pairs" (Pairs and StateDelta blocks' writes), "stage methods" (Method and Multi entries'
+  handlers, their words and draws excluded), "stage packets" (Writes-tagged draw packets and
+  DrawBatch entries) and "stage draw setup" (a draw the copy issued, served or made level, its
+  fill excluded); what stays in "stage entries" is the per-entry bookkeeping (classify, the
+  copy's lookup, runs, counters) and the closures, and GPUMem's "other" is the loop around the
+  entries (the input's and the back's positions, served calls, publishes); the back's
   "draw" splits off "ring take" (the packet's take from ring B) with "ring take copy" inside it
   (its bytes copied out), "draw locks" and "ring facts" (inside "draw setup": the caches' locks,
   and the facts published under the stage's program key), "draw after configure" (the

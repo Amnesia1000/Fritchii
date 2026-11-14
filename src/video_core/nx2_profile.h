@@ -115,6 +115,13 @@ enum class Zone : u32 {
     LevelRun,
     StageEntries, ///< GPUMem's entry loop, the entries themselves (fine zone)
     StageCbWords, ///< ... their constant buffer words (fine zone, inside StageEntries)
+    // Of stage entries (fine zones): what GPUMem's entry loop spends per kind of entry. What
+    // stays in "stage entries" is the per-entry bookkeeping (classify, the copy's lookup, runs,
+    // counters) and the closures.
+    StagePairs,     ///< Pairs and StateDelta blocks' writes on the copy
+    StageMethods,   ///< Method and Multi entries' handlers on the copy (words and draws excluded)
+    StagePackets,   ///< Writes-tagged draw packets and DrawBatch entries on the copy
+    StageDrawSetup, ///< A draw the copy issued: serve or level it (its fill excluded)
     // Of draw, the back with FRITCHII_MEMSTAGE_THREAD=2 (fine zones):
     RingTake,     ///< The ring B packet's take (TakeRingDraw: peek, counters, wakes, ticks)
     RingTakeCopy, ///< ... the packet's bytes copied out of ring B (inside RingTake)
@@ -149,6 +156,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "image create", "pool destroy here", "pool destroy idle", "pool destroy backlog",
     "memory fill", "memory play", "memory hand-off", "memory sync wait",
     "stage wait", "level run", "stage entries", "stage cb words",
+    "stage pairs", "stage methods", "stage packets", "stage draw setup",
     "ring take", "ring take copy", "draw locks", "draw after configure", "ring facts",
     "rest tail", "inline upload", "dispatch fill", "qmd signal",
 };
