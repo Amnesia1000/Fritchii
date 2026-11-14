@@ -719,7 +719,47 @@ struct Copy {
     u64 cb_page{~u64{0}};
     u64 cb_map_serial{};
     Tegra::MemoryManager::StageTarget cb_target{};
+    /// FRITCHII_MEMSTAGE_ENTRY_FAST: each 3D method's MethodClass (ClassOfMethod, from the back's
+    /// execution mask, which Maxwell3D sets once in its constructor).
+    std::array<u8, MacroRegistersStart> method_class{};
 };
+
+/// FRITCHII_MEMSTAGE_ENTRY_FAST (fable_stage_levelpoints 15.3 row 1): how a 3D method entry goes
+/// through GPUMem's short path (EntryFast), from the method alone.
+/// - Store: not executable. Process applies it with StateWrite (as CallMethod does for one).
+/// - Work: executable, and MethodKindOf's default (work, whatever the state): CallMethod's
+///   ShadowRam, DirtyStore and MethodCall.
+/// - CbWord: a constant buffer data word: as Work while CbMode() is off (with it, hard: Process).
+/// - Slow: a method MethodKindOf names (its kind may depend on the state), Process's path.
+enum class MethodClass : u8 { Slow, Store, Work, CbWord };
+
+/// MethodKindOf's cases are the Slow ones here: keep the two lists in step.
+MethodClass ClassOfMethod(u32 method, bool executable) {
+    if (!executable) {
+        return MethodClass::Store;
+    }
+    if (method - CbData < 16) {
+        return MethodClass::CbWord;
+    }
+    switch (method) {
+    case MAXWELL3D_REG_INDEX(falcon[4]):
+    case MAXWELL3D_REG_INDEX(sync_info):
+    case MAXWELL3D_REG_INDEX(launch_dma):
+    case MAXWELL3D_REG_INDEX(inline_data):
+    case MAXWELL3D_REG_INDEX(wait_for_idle):
+    case MAXWELL3D_REG_INDEX(invalidate_texture_data_cache):
+    case MAXWELL3D_REG_INDEX(clear_report_value):
+    case MAXWELL3D_REG_INDEX(fragment_barrier):
+    case MAXWELL3D_REG_INDEX(tiled_cache_barrier):
+    case MAXWELL3D_REG_INDEX(report_semaphore.query):
+    case MAXWELL3D_REG_INDEX(load_mme.instruction_ptr):
+    case MAXWELL3D_REG_INDEX(load_mme.instruction):
+    case MAXWELL3D_REG_INDEX(load_mme.start_address):
+        return MethodClass::Slow;
+    default:
+        return MethodClass::Work;
+    }
+}
 
 /// Histogram buckets of served draws between two runs: 0, 1, 2-3, 4-7, 8-15, 16+.
 constexpr size_t GapBuckets = 6;
@@ -788,6 +828,9 @@ struct Counters {
     u64 lends{}, returns{};
     // The OoT trackers' record (plan 5.1) against today's query.
     u64 tracker_compared{}, tracker_mismatches{}, tracker_without{};
+    // FRITCHII_MEMSTAGE_ENTRY_FAST (fable_stage_levelpoints 15.7): 3D Method and CbWords entries,
+    // and how many of them took the short path (EntryFast).
+    u64 method_entries{}, fast_entries{};
 };
 
 struct State {
@@ -939,6 +982,10 @@ Copy* FindCopy(State& s, Maxwell3D* back) {
     copy.tables = &back->dirty.tables;
     copy.skip_same = Access::SkipSame(*back);
     copy.front_macros = Access::FrontMacros(*back);
+    for (u32 method = 0; method < MacroRegistersStart; ++method) {
+        copy.method_class[method] =
+            static_cast<u8>(ClassOfMethod(method, back->execution_mask[method]));
+    }
     s.copies.push_back(std::move(copy));
     return &s.copies.back();
 }
@@ -1335,6 +1382,7 @@ bool PassCandidate(const State& s) {
     return s.ring && !s.ring_in_run && !s.entry_hard && MemoryStageLink::PassServed(1);
 }
 
+/// Its cases are ClassOfMethod's Slow ones (FRITCHII_MEMSTAGE_ENTRY_FAST): keep them in step.
 MethodKind MethodKindOf(const Copy& c, u32 method) {
     switch (method) {
     // Hard: they need the back's caches (the gather, the wait, the upload engine's writes),
@@ -2227,6 +2275,143 @@ void Runs(State& s, Class cls) {
     }
 }
 
+/// The end of Process for every entry: the class as applied (hard wins), the runs, the counters,
+/// the copies stale after an entry that cannot be followed.
+void EndEntry(State& s, Class cls, bool executed) {
+    if (s.entry_hard) {
+        cls = Class::Level;
+    }
+    s.last_class = cls;
+    Runs(s, cls);
+    switch (cls) {
+    case Class::Pass:
+        ++s.counters.pass;
+        break;
+    case Class::Work:
+        ++s.counters.work;
+        break;
+    case Class::Neutral:
+        ++s.counters.neutral;
+        break;
+    case Class::Level:
+        ++s.counters.level;
+        ++s.counters.level_kinds[s.entry_key];
+        s.level_since_flush = true;
+        if (!executed) {
+            s.current_level = true;
+        }
+        break;
+    }
+    if (s.entry_unfollowed) {
+        s.channel_stale = true;
+        for (Copy& copy : s.copies) {
+            copy.stale = true;
+        }
+    }
+    // The sync mirror (fable_stage_levelpoints 12.2) took this entry's effects where they came,
+    // in order: a lone 0x3dd or 0x44 clears it (MirrorAfterSyncPoint), a 3D report adds one,
+    // a fence report or a release follows its row (MirrorFence, MirrorRelease), an executable
+    // compute or DMA method and an unfollowed entry make it unknown (other_engine, Unfollow).
+    // Any other hard entry leaves it: none calls Query.
+}
+
+/// FRITCHII_MEMSTAGE_ENTRY_FAST (GPUMem with the window open, not in a run; fable_stage_levelpoints
+/// 15.3 row 1): a 3D Method entry, or a CbWords block, whose method class (the copy's
+/// method_class table, ClassOfMethod) needs no look at the state, applied in one short path
+/// instead of Process's switch. Returns its size, or 0 when it is not such an entry (Process takes
+/// it). Process's prologue has run. Exactly what Process does for the same entry:
+/// - Store: Process's sink path (not Direct: StateWrite with processing_sunk set) or CallMethod's
+///   first branch (Direct: StateWrite), class pass;
+/// - Work and CbWord (CbMode() off): CallMethod's ShadowRam, DirtyStore and MethodCall, class
+///   work (MethodKindOf says work for them: never hard before the handler);
+/// - a CbWords block: CallMethod per word (the words' own path as above when they are CbWord, as
+///   GpuSplit sends them), class work;
+/// - the copy is s.engine_copy, as Use returns it for the entry's engine, and not stale (a stale
+///   copy is taken from the back first: Process). Methods at or past MacroRegistersStart, the
+///   Sink tag and the engine missing are Process's.
+/// Not taken: the per-entry lambdas, the launch count setup (other engines only), MethodKindOf
+/// up to three times, Use, CallMethod's tests of the execution mask and the kind.
+size_t EntryFast(State& s, const u64* entry, u64 head) {
+    Copy* const c = s.engine_copy;
+    if (c == nullptr || c->stale) {
+        return 0;
+    }
+    switch (static_cast<Kind>(head & 0xf)) {
+    case Kind::Method: {
+        if ((head & Access::Sink) != 0) {
+            return 0;
+        }
+        const u32 method = static_cast<u32>((head >> 8) & 0xffff);
+        if (method >= MacroRegistersStart) {
+            return 0;
+        }
+        const u32 argument = static_cast<u32>(head >> 32);
+        Class cls;
+        switch (static_cast<MethodClass>(c->method_class[method])) {
+        case MethodClass::Store: {
+            const Nx2Profile::Scope zone{Nx2Profile::Zone::StageMethods, Nx2Profile::Fine(),
+                                         false};
+            s.processing_sunk = (head & Access::Direct) == 0;
+            StateWrite(*c, method, argument);
+            s.processing_sunk = false;
+            cls = Class::Pass;
+            break;
+        }
+        case MethodClass::CbWord:
+            if (CbMode()) {
+                return 0;
+            }
+            [[fallthrough]];
+        case MethodClass::Work: {
+            const Nx2Profile::Scope zone{Nx2Profile::Zone::StageMethods, Nx2Profile::Fine(),
+                                         false};
+            const u32 value = ShadowRam(*c->e, method, argument);
+            DirtyStore(*c, method, value);
+            MethodCall(s, *c, method, value, argument);
+            cls = Class::Work;
+            break;
+        }
+        default:
+            return 0;
+        }
+        ++s.counters.method_entries;
+        ++s.counters.fast_entries;
+        EndEntry(s, cls, false);
+        return (head & Access::HasSegment) != 0 ? 2 : 1;
+    }
+    case Kind::CbWords: {
+        if (CbMode()) {
+            return 0;
+        }
+        const u32 count = static_cast<u32>(head >> 32);
+        const size_t first = (head & Access::CbVerify) != 0 ? 2 : 1;
+        const u64* const words = entry + first;
+        {
+            const Nx2Profile::Scope zone{Nx2Profile::Zone::StageMethods, Nx2Profile::Fine(),
+                                         false};
+            for (u32 i = 0; i < count; ++i) {
+                const u32 method = static_cast<u32>((words[i] >> 8) & 0xffff);
+                const u32 argument = static_cast<u32>(words[i] >> 32);
+                if (method < MacroRegistersStart &&
+                    c->method_class[method] == static_cast<u8>(MethodClass::CbWord)) [[likely]] {
+                    const u32 value = ShadowRam(*c->e, method, argument);
+                    DirtyStore(*c, method, value);
+                    MethodCall(s, *c, method, value, argument);
+                } else {
+                    CallMethod(s, *c, method, argument);
+                }
+            }
+        }
+        ++s.counters.method_entries;
+        ++s.counters.fast_entries;
+        EndEntry(s, Class::Work, false);
+        return first + count;
+    }
+    default:
+        return 0;
+    }
+}
+
 /// Classifies the entry at `position`, applies it to the copies (hard entries too: follow, plan
 /// 3.2, unless it cannot be followed), and returns its size in words (for a wrap: the rest of the
 /// ring).
@@ -2248,6 +2433,11 @@ size_t Process(State& s, u64 position, bool executed) {
         // closure may bind one).
         s.channel = s.back_channel;
         s.channel_stale = false;
+    }
+    if (s.ring && !s.ring_in_run && !executed && MemoryStageLink::EntryFast()) {
+        if (const size_t fast_size = EntryFast(s, entry, head); fast_size != 0) {
+            return fast_size;
+        }
     }
     Class cls = Class::Pass;
     size_t size = 1;
@@ -2338,6 +2528,9 @@ size_t Process(State& s, u64 position, bool executed) {
         size = (head & Access::HasSegment) != 0 ? 2 : 1;
         const u32 method = static_cast<u32>((head >> 8) & 0xffff);
         const u32 argument = static_cast<u32>(head >> 32);
+        if (s.engine_copy != nullptr) {
+            ++s.counters.method_entries;
+        }
         if (s.engine == nullptr) {
             Unfollow(s, LevelType::NoEngine, 0);
             break;
@@ -2445,6 +2638,7 @@ size_t Process(State& s, u64 position, bool executed) {
             break;
         }
         Copy& c0 = *s.engine_copy;
+        ++s.counters.method_entries;
         // As Kind::Method for an executable 3D method (what every word is, GpuSplit checks).
         cls = MethodKindOf(c0, CbData) == MethodKind::Work ? Class::Work : Class::Pass;
         if (Copy* const c = Use(s, c0.back, executed)) {
@@ -2618,41 +2812,7 @@ size_t Process(State& s, u64 position, bool executed) {
         break;
     }
     }
-    if (s.entry_hard) {
-        cls = Class::Level;
-    }
-    s.last_class = cls;
-    Runs(s, cls);
-    switch (cls) {
-    case Class::Pass:
-        ++s.counters.pass;
-        break;
-    case Class::Work:
-        ++s.counters.work;
-        break;
-    case Class::Neutral:
-        ++s.counters.neutral;
-        break;
-    case Class::Level:
-        ++s.counters.level;
-        ++s.counters.level_kinds[s.entry_key];
-        s.level_since_flush = true;
-        if (!executed) {
-            s.current_level = true;
-        }
-        break;
-    }
-    if (s.entry_unfollowed) {
-        s.channel_stale = true;
-        for (Copy& copy : s.copies) {
-            copy.stale = true;
-        }
-    }
-    // The sync mirror (fable_stage_levelpoints 12.2) took this entry's effects where they came,
-    // in order: a lone 0x3dd or 0x44 clears it (MirrorAfterSyncPoint), a 3D report adds one,
-    // a fence report or a release follows its row (MirrorFence, MirrorRelease), an executable
-    // compute or DMA method and an unfollowed entry make it unknown (other_engine, Unfollow).
-    // Any other hard entry leaves it: none calls Query.
+    EndEntry(s, cls, executed);
     return size;
 }
 
@@ -2851,6 +3011,23 @@ void Report5c(State& s, double seconds) {
              CopyLimit, t.condition_hard, why);
 }
 
+/// GPUMem's own-work cuts of fable_stage_levelpoints 15.3 (their counters, 15.7).
+void ReportCuts(State& s, double seconds) {
+    const Counters& c = s.counters;
+    const auto rate = [seconds](u64 value) { return static_cast<double>(value) / seconds; };
+    const auto share = [](u64 part, u64 whole) {
+        return whole != 0 ? 100.0 * static_cast<double>(part) / static_cast<double>(whole) : 0.0;
+    };
+    const u64 entries = c.pass + c.work + c.level + c.neutral;
+    LOG_INFO(HW_GPU,
+             "Memory stage GPUMem entry path (FRITCHII_MEMSTAGE_ENTRY_FAST={}): fast entries/s "
+             "{:.0f} = {:.1f}% of 3D method and CB words entries ({:.0f}/s), {:.1f}% of all "
+             "entries ({:.0f}/s)",
+             MemoryStageLink::EntryFast() ? 1 : 0, rate(c.fast_entries),
+             share(c.fast_entries, c.method_entries), rate(c.method_entries),
+             share(c.fast_entries, entries), rate(entries));
+}
+
 void Report(State& s, std::chrono::steady_clock::time_point now) {
     const double seconds =
         std::chrono::duration<double>(now - s.window_start).count();
@@ -2913,6 +3090,9 @@ void Report(State& s, std::chrono::steady_clock::time_point now) {
     LOG_INFO(HW_GPU, "Memory stage shadow level entries by kind and channel (top 12 of {}): {}",
              kinds.size(), top.empty() ? "none" : top);
     Report5c(s, seconds);
+    if (s.ring) {
+        ReportCuts(s, seconds);
+    }
     std::unordered_map<u64, u64> keep;
     keep.swap(c.level_kinds);
     keep.clear();

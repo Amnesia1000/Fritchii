@@ -1363,6 +1363,34 @@ logged when it changes.
   stays 0. Then 0 against 1 with profile_toggle.py at the market (GPUMem's "stage pairs" and "other"
   at EDEN_NX2_GPU_PROFILE=2, its busy time, fps).
 
+### FRITCHII_MEMSTAGE_ENTRY_FAST
+
+FRITCHII_MEMSTAGE_ENTRY_FAST (live, read at a frame end with FRITCHII_MEMSTAGE_AHEAD, default 0;
+work\fable_stage_levelpoints.md 15.3 row 1): with FRITCHII_MEMSTAGE_THREAD=2 and the window open
+(AHEAD > 0), GPUMem takes 3D Method entries and CbWords blocks through a short path
+(memstage_shadow.cpp, EntryFast) instead of Process's switch. 0, AHEAD 0 and THREAD 0/1 run
+every entry through Process as before. "Memory stage entry path (FRITCHII_MEMSTAGE_ENTRY_FAST=n)"
+is logged when it changes.
+
+- Each copy keeps one byte a 3D method (ClassOfMethod, from the engine's execution mask, fixed at
+  its construction): store (not executable), work (executable, MethodKindOf's default), a constant
+  buffer data word, or slow (every method MethodKindOf names: its kind can depend on the state).
+- Store: StateWrite, as Process's sink path (processing_sunk set) or CallMethod (Direct); class
+  pass. Work and constant buffer words (EXP107 off): ShadowRam, DirtyStore and MethodCall, as
+  CallMethod; class work. A CbWords block: the same per word (CallMethod for a word of another
+  class, as Process). The copy is the engine's copy, as Use returns it; a stale copy, a Sink
+  entry, a macro method, a slow method and everything else go through Process. The entry's end
+  (class, runs, counters, stale copies) is one function both paths call (EndEntry).
+- Left out per entry: the per-entry lambdas and launch count setup (other engines only),
+  MethodKindOf up to three times, Use, and CallMethod's execution mask and kind tests.
+- The "Memory stage GPUMem entry path" line (every 10 s, GPUMem) gives the hit rate: fast entries a
+  second, their share of the 3D Method and CbWords entries and of all entries. It counts with the
+  switch off too (0 fast entries then).
+- The verify: the memstage gate with FRITCHII_MEMSTAGE_RING_VERIFY (compare b's hash at every
+  served draw) and READ_LOG with the switch on; every must-be-0 line stays 0. Then 0 against 1 with
+  profile_toggle.py, stage on, at the market: GPUMem's busy time and fps (the fine zones of
+  EDEN_NX2_GPU_PROFILE=2 time each entry and hide what is cut).
+
 ### FRITCHII_MEMSTAGE_GATHER
 
 FRITCHII_MEMSTAGE_GATHER (live, read at a frame end with FRITCHII_MEMSTAGE_AHEAD, default 0;

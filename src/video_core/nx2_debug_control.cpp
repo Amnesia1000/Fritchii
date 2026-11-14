@@ -343,6 +343,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_MEMSTAGE_FAST_LOOP") {
         return &g_memstage_fast_loop;
     }
+    if (name == "FRITCHII_MEMSTAGE_ENTRY_FAST") {
+        return &g_memstage_entry_fast;
+    }
     if (name == "FRITCHII_MEMSTAGE_GATHER") {
         return &g_memstage_gather;
     }

@@ -1492,6 +1492,19 @@ void MemoryStageLink::SetFastLoop(bool on) {
     }
 }
 
+void MemoryStageLink::SetEntryFast(bool on) {
+    // At a frame end, as SetFastLoop: GPUMem reads it at its next entry (EntryFast).
+    g_entry_fast.store(on, std::memory_order_relaxed);
+    if (mode == 2 && entry_fast_logged != (on ? 1 : 0)) {
+        entry_fast_logged = on ? 1 : 0;
+        LOG_INFO(HW_GPU, "Memory stage entry path (FRITCHII_MEMSTAGE_ENTRY_FAST={}): {}",
+                 on ? 1 : 0,
+                 on ? "GPUMem takes 3D Method and CbWords entries of a fixed class through its "
+                      "short path, while the window is open (FRITCHII_MEMSTAGE_AHEAD > 0)"
+                    : "every entry through Process's switch, as before");
+    }
+}
+
 void MemoryStageLink::SetGather(bool on) {
     // At a frame end, as SetListDraws: GPUMem reads it at its next gather. Records already pushed
     // are taken whatever the switch says (BackTakeGather does not read it).
