@@ -1377,6 +1377,13 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   image takes that write as the invalidation would have (it uploads again at its next use). The
   "One follower invalidations" line (every 10 s) splits them: run on E, lent by texture, shader
   or query page, lent at the second look; and the uploads checked per second.
+- FRITCHII_ONEF_COPY_E (live, default 0; fable_b_one_follower 11.1 item 6, first piece; with
+  FRITCHII_ONEF_INVAL_E's conditions): 1 = inline uploads (AccelerateInlineToMemory, deferred
+  path) run on E: the guest write (its stream-write guard drains R on a texture or shader page),
+  the buffer cache, the accumulated invalidation. Lent whole when a range is on a query page or a
+  report op E pushed; after an in-place upload the texture and shader half is lent alone where
+  their filters are hit. E stamps the pages before the write (item 2's pair). Counted in the
+  invalidations line ("inline uploads on E / with R's half lent / lent: query page").
 - With FRITCHII_ONEF=1 (or LEAN), every 10 s "One follower lends by site" lists the 16 lent
   call sites that parked E longest (the rasterizer function's name and its op, rate and parked
   ms/s; "direct" = Lend called outside the rasterizer's entry points: lent draws, verify

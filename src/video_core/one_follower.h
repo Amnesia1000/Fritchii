@@ -524,6 +524,9 @@ void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size,
 /// 4): E runs the draw's invalidation (the buffer half) itself when no range touches a page an
 /// image, a shader, a query or a pushed report op was ever on; otherwise it stays lent.
 [[nodiscard]] bool InvalOnEngine() noexcept;
+/// FRITCHII_ONEF_COPY_E (live; with FRITCHII_ONEF_INVAL_E's conditions and stamps): inline
+/// uploads (AccelerateInlineToMemory) run on E; R's halves only where their pages are hit.
+[[nodiscard]] bool CopyOnEngine() noexcept;
 /// E: stamps [address, address + size)'s pages with the next packet's number (before the
 /// filters' second look: WrittenAheadOfRender's Dekker pair).
 void StampPageWrites(u64 address, u64 size) noexcept;
@@ -534,6 +537,9 @@ enum class InvalKind : u8 {
     Shader,   ///< lent: a range on a shader page
     Query,    ///< lent: a range on a query page or a pushed report op's
     Recheck,  ///< lent: no hit, then a hit at the second look (R registered meanwhile)
+    InlineOnEngine,  ///< FRITCHII_ONEF_COPY_E: an inline upload run on E
+    InlineRHalf,     ///< ... whose texture/shader half was lent alone (in-place upload, a hit)
+    InlineQuery,     ///< ... lent whole: a query page or a pushed report op's
     Count,
 };
 void CountInvalidation(InvalKind kind) noexcept;

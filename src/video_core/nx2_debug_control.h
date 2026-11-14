@@ -246,6 +246,8 @@ inline std::atomic<int> g_onef_query_ops{-1};
 inline std::atomic<int> g_onef_waits_e{-1};
 /// FRITCHII_ONEF_INVAL_E (live, default 0): fable_b 11.1 item 2, the draw's invalidation on E.
 inline std::atomic<int> g_onef_inval_e{-1};
+/// FRITCHII_ONEF_COPY_E (live, default 0): fable_b 11.1 item 6's first piece, inline uploads on E.
+inline std::atomic<int> g_onef_copy_e{-1};
 /// EDEN_NX2_LIGHT_TABLE_ARRAYS: docs/fritchii/switches.md.
 [[nodiscard]] inline bool LightTableArrays() {
     static const bool on = EnvSwitch("EDEN_NX2_LIGHT_TABLE_ARRAYS") > 0;

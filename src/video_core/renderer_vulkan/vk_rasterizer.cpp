@@ -7094,7 +7094,11 @@ Tegra::Engines::AccelerateDMAInterface& RasterizerVulkan::AccessAccelerateDMA() 
 void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                                 std::span<const u8> memory) {
     // One follower: the write and the buffer half are E's (section 5), the query and texture
-    // halves R's; the whole upload stays lent in this branch (step 5 splits it).
+    // halves R's. FRITCHII_ONEF_COPY_E runs it on E (R's halves lent only where hit); else lent.
+    if (VideoCommon::OneFollower::ShouldLend() &&
+        OneFollowerInlineOnEngine(address, copy_size, memory)) [[unlikely]] {
+        return;
+    }
     ONEF_LEND(Copy, AccelerateInlineToMemory(address, copy_size, memory))
     // Grid placeholders among the words (a compute macro's constant buffer of its dispatch's
     // size): the GPU copies the words they stand for over them once the write is done.
@@ -7307,6 +7311,75 @@ void RasterizerVulkan::AccelerateInlineWords(GPUVAddr address, size_t copy_size,
         }
         offset = end;
     }
+}
+
+bool RasterizerVulkan::OneFollowerInlineOnEngine(GPUVAddr address, size_t copy_size,
+                                                 std::span<const u8> memory) {
+    namespace OneF = VideoCommon::OneFollower;
+    // AccelerateInlineToMemoryImpl's deferred path (EDEN_NX2_INLINE_DEFER, the default), E's
+    // parts here: the guest write, the list note, the buffer cache, the accumulated
+    // invalidation (FlushCaching later: item 2's test). R's: the query cache (the whole upload
+    // is lent when a range is on a query page or a report op E pushed), the texture and shader
+    // caches after an in-place upload (that half lent alone, where their filters are hit).
+    if (!OneF::CopyOnEngine() || !InlineDefer() || copy_size == 0 ||
+        Tegra::Nx2IndirectGrid::AnyLive()) {
+        return false;
+    }
+    const auto cpu_addr = gpu_memory->GpuToCpuAddress(address);
+    if (!cpu_addr) {
+        return false;
+    }
+    if (query_cache.page_filter.Any(*cpu_addr, copy_size) ||
+        (onef_report_pages != nullptr && onef_report_pages->Any(*cpu_addr, copy_size))) {
+        OneF::CountInvalidation(OneF::InvalKind::InlineQuery);
+        return false;
+    }
+    // Item 2's pair, before the write: the write's guard (GuardStreamWrite in WriteBlock) reads
+    // the texture and shader filters after these stamps and drains R on a hit; R registering an
+    // image meanwhile reads the stamps after its mark (WrittenAheadOfRender).
+    OneF::StampPageWrites(*cpu_addr, copy_size);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    const Common::WriteRing::SiteScope write_site{"inline upload (AccelerateInlineToMemory)", false};
+    const VideoCommon::Nx2Profile::FineScope inline_zone{VideoCommon::Nx2Profile::Zone::InlineUpload};
+    using Fine = VideoCommon::Nx2Profile::FineCounter;
+    InlineUploadNote(address, cpu_addr, copy_size, memory);
+    gpu_memory->WriteBlockUnsafe(address, memory.data(), copy_size);
+    OneF::CountInvalidation(OneF::InvalKind::InlineOnEngine);
+    if (InlineSkipsCaches(*cpu_addr, copy_size)) {
+        // Its query test finds nothing (tested above; only R's plays of E's report ops, in
+        // E's own filter, or lent calls mark the query filter).
+        InlineUntouchedTail(address, *cpu_addr, copy_size, false);
+        return true;
+    }
+    bool uploaded;
+    {
+        std::scoped_lock lock{buffer_cache.mutex};
+        MemStage::FillPlay seam{mem_stage, MemStage::Site::InlineUpload};
+        buffer_cache.Nx2NoteListHostWrite(*cpu_addr, copy_size);
+        uploaded = buffer_cache.InlineMemory(*cpu_addr, copy_size, memory);
+    }
+    VideoCommon::Nx2Profile::AddFine(uploaded ? Fine::InlineInPlace : Fine::InlineNotUploaded, 1);
+    // (query_cache.InvalidateRegion: no query page here, tested above.)
+    if (!uploaded) {
+        gpu_memory->AccumulateInvalidation(address, copy_size);
+        return true;
+    }
+    // In place: the texture and shader halves now, as the Impl does, lent where they are hit.
+    if (texture_cache.page_filter.Any(*cpu_addr, copy_size) ||
+        pipeline_cache.page_filter.Any(*cpu_addr, copy_size)) {
+        OneF::CountInvalidation(OneF::InvalKind::InlineRHalf);
+        const DAddr device = *cpu_addr;
+        auto r_half = [this, device, copy_size] {
+            {
+                std::scoped_lock lock{texture_cache.mutex};
+                texture_cache.WriteMemory(device, copy_size);
+            }
+            pipeline_cache.InvalidateRegion(device, copy_size);
+        };
+        OneF::SetLendSite("inline upload, R's half");
+        OneF::Lend(OneF::LentOp::Copy, r_half);
+    }
+    return true;
 }
 
 void RasterizerVulkan::AccelerateInlineToMemoryImpl(GPUVAddr address, size_t copy_size,
