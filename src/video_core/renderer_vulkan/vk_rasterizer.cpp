@@ -2121,6 +2121,13 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         VideoCommon::OneFollower::On() && VideoCommon::OneFollower::OnRenderThread()
             ? onef_draw->Playing()
             : nullptr;
+    // fable_b 10.2 rule 2's assert: on R outside a lent call the rasterizer names the view, never
+    // the channel's real engine (E's, which E writes meanwhile).
+    if (VideoCommon::OneFollower::OnRenderThread() && !VideoCommon::OneFollower::InLent() &&
+        channel_state != nullptr && maxwell3d == &channel_state->maxwell3d) [[unlikely]] {
+        VideoCommon::OneFollower::Note(VideoCommon::OneFollower::Check::OwnerOnR,
+                                       "a draw on R outside a lent call names E's engine");
+    }
     SCOPE_EXIT {
         if (onef_play == nullptr) {
             const VideoCommon::Nx2Profile::FineScope tick_scope{
