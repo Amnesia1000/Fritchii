@@ -4814,6 +4814,67 @@ void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64
                 buffer_cache.ClaimCpuWrites(ranges);
             }
         }
+        // FRITCHII_GATHER_ONE_LOCK (live, default 0; fable_front_drains 8.2 G1): the same calls
+        // in two passes, the texture and pipeline caches' first, then the buffer cache's under
+        // one hold of its lock and one seam bracket (taken at the first range that needs them),
+        // instead of a lock and a bracket per range. Each cache sees its calls in the order
+        // below. Exact: no range's effect here depends on another cache's effect of another
+        // range. The texture cache's WriteMemory and the pipeline cache's InvalidateRegion
+        // change only their own state; the buffer cache's WriteMemory changes its own state and
+        // guest memory (a page download, after the claim above) and records commands, neither
+        // of which those two read. What they share is the device pages' cached counts, which
+        // these calls only lower: the sum, and the moment a page's count reaches zero (it is
+        // unprotected once its last user has marked its data CPU-modified, in the same call),
+        // do not depend on the order. The bracket plays its entries before anything else is
+        // recorded (SeamHook::OnUse), so one bracket records the same commands in the same
+        // order as one per range.
+        if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_gather_one_lock,
+                                             "FRITCHII_GATHER_ONE_LOCK") != 0) {
+            for (const auto& [addr, size] : ranges) {
+                if (addr == 0 || size == 0) {
+                    continue;
+                }
+                CbPath::Count(counters.guest_ranges);
+                if (texture_cache.page_filter.Any(addr, size)) {
+                    std::scoped_lock lock{texture_cache.mutex};
+                    texture_cache.WriteMemory(addr, size);
+                }
+                if (pipeline_cache.page_filter.Any(addr, size)) {
+                    pipeline_cache.InvalidateRegion(addr, size);
+                }
+            }
+            // The bracket ends before the lock is released, as in the per-range scope.
+            std::unique_lock buffer_lock{buffer_cache.mutex, std::defer_lock};
+            std::optional<MemStage::FillPlay> seam;
+            for (const auto& [addr, size] : ranges) {
+                if (addr == 0 || size == 0) {
+                    continue;
+                }
+                const bool skip = buffer_cache.WriteReachesBuffers(addr, size) ==
+                                  BufferCache::WriteReach::None;
+                if (skip) {
+                    CbPath::Count(counters.guest_skipped);
+                }
+                if (skip && !verify) {
+                    buffer_cache.NoteWriteUnlocked(addr, size);
+                    continue;
+                }
+                if (!buffer_lock.owns_lock()) {
+                    buffer_lock.lock();
+                    seam.emplace(mem_stage, MemStage::Site::Invalidation);
+                    CbPath::Count(counters.guest_one_lock_holds);
+                }
+                if (skip) {
+                    CbPath::Count(counters.verify_skip_checked);
+                    if (!buffer_cache.WriteChangesNothing(addr, size)) {
+                        note_mismatch(addr, size, "the skipped write would change the buffer cache");
+                    }
+                }
+                buffer_cache.WriteMemory(addr, size);
+            }
+            seam.reset();
+            return;
+        }
         for (const auto& [addr, size] : ranges) {
             if (addr == 0 || size == 0) {
                 continue;

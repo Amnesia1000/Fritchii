@@ -273,6 +273,34 @@ channel sent the release asks too. Never inside a list: that would change the ch
   was queued but the word read could not show it, or waited for it (a 16-byte note over the word,
   the throttle).
 
+### FRITCHII_GATHER_ONE_LOCK
+
+FRITCHII_GATHER_ONE_LOCK (live, default 0 = exactly as before; fable_front_drains 8.2 G1). The
+game's collected writes, applied at a gather on the back (RasterizerVulkan::OnCacheInvalidations,
+EXP88's path), took the buffer cache's lock and opened and closed a memory seam bracket
+(MemStage::FillPlay) once per range: 63,000 to 73,000 ranges a second at the market, 2.5 ms/s in
+the lock and 7.3 ms/s closing brackets (5.4 of it one shared atomic in Fill::~Fill).
+- 1: two passes over the gather's ranges. First the texture cache's WriteMemory and the pipeline
+  cache's InvalidateRegion for every range, as before. Then the buffer cache's part (the reach
+  test, NoteWriteUnlocked or WriteMemory, the verify check) for every range, under one hold of its
+  lock and one bracket, taken at the first range that needs them (a gather whose ranges all skip
+  takes neither, as before).
+- Why it is exact: each cache gets the same calls in the same order. Across caches nothing
+  depends on order. The texture and pipeline calls change only their own state. The buffer
+  cache's WriteMemory changes its own state, guest memory (a page download, after the claim) and
+  records commands; the other two read none of that. The shared part is the device pages' cached
+  counts, which all three only lower here: the sum does not depend on the order, and a page is
+  unprotected only when its last user lowers it, in the same call that marks that user's data
+  CPU-modified. The bracket plays its entries before anything else is recorded (SeamHook::OnUse),
+  so one bracket records the same commands in the same order as one per range. Other threads that
+  want the buffer lock wait for the whole buffer pass instead of one range.
+- What changes besides time: the seam's counters (fills per site; one Invalidation fill per
+  gather) and, with packet ticks, one operation packet number per gather instead of per range.
+- Count: "N gathers under one buffer lock (FRITCHII_GATHER_ONE_LOCK)" in the "Constant buffer
+  path (EXP88=n, 5 s)" line.
+- Expected: about 8 to 9 ms/s off the back at the market (stage off), the per-range lock and
+  bracket close; the bracket's atomic runs about 1,400 times a second instead of 68,000.
+
 ### EDEN_NX2_ACCURATE_PARTS
 
 EDEN_NX2_ACCURATE_PARTS (bit mask, 0 = none, read once at boot): parts of GPU accuracy High in
