@@ -111,9 +111,10 @@
 // - a draw the copy's draw manager issues with execute_on, outside a run and before the entry
 //   turned hard, is filled at once (the ring backend's fill_draw, from the copy) and its packet
 //   goes to ring B with the draw's sequence number (every draw counts, on both threads, from the
-//   ring's start). A draw the stage cannot serve makes its entry hard: indirect and list draws,
-//   GPU-counted draws, draws while the back asks for level draws (diagnostics), facts misses and
-//   texel buffers (fill_draw says so);
+//   ring's start). A draw the stage cannot serve makes its entry hard: indirect draws, list draws
+//   (served with the window open and FRITCHII_MEMSTAGE_LIST_DRAWS on, unless the back reads their
+//   words back), GPU-counted draws, draws while the back asks for level draws (diagnostics),
+//   facts misses and texel buffers (fill_draw says so);
 // - StageLend hands the cache's flags 15-48 to the back's engines, StageReturn takes them back,
 //   with execute_on (5c's take), the scalar draw state when the back drew in the run, and full
 //   copies of the copies an unfollowed entry left stale. The back is parked at both moments.

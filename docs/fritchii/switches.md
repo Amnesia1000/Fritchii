@@ -508,7 +508,8 @@ fills on a thread of their own by hand-off; 2 lets that thread read the ring its
     the back takes the packet at its draw and plays it, without entering the buffer cache;
   - everything GPUMem does not implement is a level run: the cache, its flags and the words'
     ranges are lent to the back, which runs those entries exactly as today, then GPUMem takes the
-    flags back (and a full copy only after a closure it cannot follow). Indirect and list draws,
+    flags back (and a full copy only after a closure it cannot follow). Indirect and list draws
+    (list draws are served with the window open, FRITCHII_MEMSTAGE_LIST_DRAWS below),
     GPU-counted draws, texel buffers, a facts miss, a frame dump or trace, host conditional
     rendering and constant buffer words onto a watched page make their entry level;
   - level mode (AHEAD = 0): GPUMem works only while the back is parked (it ran everything passed
@@ -668,6 +669,48 @@ session after a catch-up could not finish (below; logged).
   The QMD and null pointer slot checks read twice at once inside level runs and are unchanged.
 - Order of the verify runs: 1, 8, 64, unlimited (work\run_step7_verify.sh), then the fps gate
   against THREAD 0 (work\run_step7_gate.sh).
+
+### FRITCHII_MEMSTAGE_LIST_DRAWS
+
+FRITCHII_MEMSTAGE_LIST_DRAWS (live, read at a frame end with FRITCHII_MEMSTAGE_AHEAD, default 1;
+fix 6 of work\fable_memstage_step7_fps.md, work\fable_memstage_6b_plan.md 7.2): with
+FRITCHII_MEMSTAGE_THREAD=2 and the window open (AHEAD > 0), GPUMem serves list draws (OoT's
+culled object draws, nx2_list_draw.h) instead of making each one a level run. 0, AHEAD 0 and
+THREAD 0/1 keep them as before (level draws on THREAD 2, the back's own fill otherwise).
+
+- Which: a list draw GPUMem's copy issues outside a hard entry, when the back would draw it
+  indirectly from the two words. The ones the back reads back on the CPU (EDEN_NX2_LIST_DRAW other
+  than 1, quads, a base instance, transform feedback, EDEN_NX2_MESH_FIRST; one test,
+  ListDrawReadsBack, on the copy and on the back) stay level, and so do a refused fill (facts
+  miss, texel buffers, no room in ring B) and a frame dump or trace.
+- How: GPUMem fills it as any served draw, non-indexed, with the copy's indirect parameters in the
+  cache's inputs, so the fill's geometry section binds and synchronizes the two words exactly as
+  the back's own fill does after SetDrawIndirect; the packet then carries their buffer and offset
+  (what the back's Configure asked the cache for, GetDrawIndirectBuffer). The back takes the
+  packet in PrepareDraw and records the copy into the draw command from that buffer: it does not
+  enter the cache. The copy is recorded at the draw's place in the stream, so the GPU reads the
+  words the dispatches before it wrote; the buffer outlives the packet's play (packet ticks), as
+  every vertex buffer a packet binds does.
+- "Memory stage list draws (FRITCHII_MEMSTAGE_LIST_DRAWS=n, window open/closed)" every 10 s on
+  THREAD 2: list draws a second served, and level by why (the window closed or the switch off,
+  read back on the CPU, the fill refused it); runs started by a list draw against all runs (each
+  level one starts a run); the back's draws from the packet's buffer (equals served). List draws
+  in an entry that is hard already are the ring line's "late" level draws. The ring line's level
+  draw kind 0 is "indirect" only now, and 5c's "runs by first hard kind" names the level draw
+  kinds ("level draw (list, read back)", ...).
+- Must be 0 (the link line): "a served list draw the back would read back" (the two sides decided
+  differently: their state differs) and "a served list draw whose packet has no list words
+  buffer" (the back asked the cache).
+- At the market: about 1,600 runs a second start at a list draw (step 7 run, s7g); with the
+  switch on they should go, and with them their lends, returns and the back's wait for GPUMem in
+  each (step 7 fps list: about -30 ms/s for GPUMem parked, -23 ms/s of the back's wait).
+  Compare 0 and 1 with profile_toggle.py in one session.
+- Not the second starter at the same rate, "cache call +0xc744a0" (s7g; +0xc8c700 in the
+  2026-11-14 build's stage-again run, symbolized against that build's PDB): it is the puller's
+  semaphore release (WriteLong, Puller::ProcessSemaphoreTriggerMethod: the query cache's
+  payload report, a fence when RELEASE_SIZE is set on Switch 2), not a list-words closure. The
+  kept list words closure (KeplerCompute's list dispatch) runs about 850 a second and sits in
+  front of its dispatch, inside the dispatch's run. Left as they are here.
 
 ### FRITCHII_MEMSTAGE_FULL_BINDS
 
