@@ -171,6 +171,10 @@ enum class Check : u8 {
     /// draw's program registers names other programs than the pipeline the draw ran with (code
     /// rewritten at the same addresses and the entry not retired).
     FactsStale,
+    /// Step 4 (fable_b 10.1 row 5): a played draw's pipeline lookup missed (no pipeline, or a
+    /// new one built on R from the view, whose constant buffer bindings are only as new as the
+    /// last lent packet). Step 4 stops for the session.
+    PlayedLookupMiss,
     Count,
 };
 
@@ -179,7 +183,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Check::Count)> chec
     "view pools",    "build pipeline",   "build image views", "build dynamic",
     "build descriptors", "build render targets", "stream write", "owner on E", "owner on R",
     "build draw params", "build condition", "render packet missing", "drop not plain",
-    "facts stale",
+    "facts stale", "played lookup miss",
 };
 
 // --- The packet (E to R) -----------------------------------------------------------------------------
@@ -399,6 +403,14 @@ public:
     /// compared with E's `execute_on` (Check::BuildCondition). PlayDraw drops PacketConditional
     /// draws while it is False.
     virtual void Condition(bool engine_execute_on) = 0;
+    /// fable_b 10.2 rules 1 and 2, around EVERY lent call (E parked), from step 3: before it,
+    /// the R-owned objects go back to E's engine and the engine takes the R-owned flags the view
+    /// has not consumed; after it, the view takes the engine's flags and the R-owned objects
+    /// name the view again (the default on R outside lent calls).
+    virtual void BeforeLent() {}
+    virtual void AfterLent() {}
+    /// R, a packet while the step is below 3: the R-owned objects name E's engine again.
+    virtual void ViewOff() {}
 
 protected:
     ~DrawPlayer() = default;
@@ -490,6 +502,8 @@ void DisableUnlend(const char* why) noexcept;
 /// The texture cache's "pages that ever held an image" filter (set by the rasterizer at creation):
 /// StreamWriteHits looks there.
 void SetTexturePages(const PageFilter* filter) noexcept;
+/// The shader cache's code pages (fable_b 10.1 row 8): R reads programs there too.
+void SetShaderPages(const PageFilter* filter) noexcept;
 /// E's stream writes (Maxwell3D's constant buffer words, memory_manager.cpp's cached writes): on a
 /// texture page they are counted (StreamWritesOnTexturePages, informational at every step), and
 /// with R behind (step 4) Check::StreamWrite is counted and E drains R before the write lands.

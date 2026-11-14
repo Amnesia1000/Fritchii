@@ -588,6 +588,8 @@ public:
     void PublishFacts(const ProgramId& id, const void* source, const DrawFacts& facts,
                       bool dynamic_input, u64 code_epoch);
     [[nodiscard]] bool LookupFacts(const ProgramId& id, StagedFacts& out) const;
+    /// LookupFacts without its one-reader cache (any thread; the cache is E's or GPUMem's).
+    [[nodiscard]] bool LookupFactsLocked(const ProgramId& id, StagedFacts& out) const;
     /// The facts table's generation (bumped under its lock at every write): while it holds, a
     /// lookup of the same registers gives what it gave (FRITCHII_MEMSTAGE_SETUP_KEEP).
     /// The back's held ring packet: the vertex and fragment program hashes of the facts its fill

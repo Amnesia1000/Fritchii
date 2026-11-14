@@ -32,6 +32,7 @@
 #include <fmt/format.h>
 
 #include "video_core/dirty_flags.h"
+#include "video_core/memory_manager.h"
 #include "video_core/one_follower.h"
 #include "video_core/one_follower_stats.h"
 #include "video_core/page_filter.h"
@@ -96,12 +97,17 @@ struct EngineSide {
     bool started{};  ///< the view was seeded since tracking (re)started
     std::atomic<bool> restart{true};
     u64 on_texture{}; ///< stream writes onto texture pages (StreamWritesOnTexturePages)
+    /// The TIC and TSC pools' device ranges [begin, end) at E's position (PackSpans), which R
+    /// reads for its descriptors (fable_b 10.1 row 8).
+    std::array<std::pair<DAddr, DAddr>, 2> pools{};
     bool stream_hit{}; ///< a guard hit since the last draw (TakeStreamWriteLend)
 };
 
 EngineSide g_e;
 RegisterView g_view;
 const PageFilter* g_texture_pages{};
+const PageFilter* g_shader_pages{};
+
 
 /// R: the last applied packet carried a draw span (VerifyView compares it then).
 thread_local bool t_draw_fresh{};
@@ -115,6 +121,24 @@ Pools PoolsOf(const Maxwell3D::Regs& regs) {
     pools.tsc_linked =
         regs.sampler_binding == Maxwell3D::Regs::SamplerBinding::ViaHeaderBinding ? 1U : 0U;
     return pools;
+}
+
+/// E: the pools' device ranges from the engine's registers (contiguous from their first page:
+/// a pool is one mapping in practice; a write past a discontinuity is missed, not misread).
+void NotePools(const Maxwell3D& engine) {
+    const Pools pools = PoolsOf(engine.regs);
+    auto& memory = const_cast<Maxwell3D&>(engine).GetMemoryManager();
+    const auto range = [&memory](GPUVAddr address, u64 bytes) -> std::pair<DAddr, DAddr> {
+        if (address == 0) {
+            return {};
+        }
+        const std::optional<DAddr> begin = memory.GpuToCpuAddress(address);
+        return begin ? std::pair<DAddr, DAddr>{*begin, *begin + bytes} : std::pair<DAddr, DAddr>{};
+    };
+    constexpr u64 EntryBytes = 0x20; // TICEntry and TSCEntry
+    g_e.pools[0] = range(pools.tic_address, (u64{pools.tic_limit} + 1) * EntryBytes);
+    const u32 tsc_limit = pools.tsc_linked != 0 ? pools.tic_limit : pools.tsc_limit;
+    g_e.pools[1] = range(pools.tsc_address, (u64{tsc_limit} + 1) * EntryBytes);
 }
 
 void FillDraw(DrawValues& values, const Maxwell3D& engine) {
@@ -220,6 +244,7 @@ std::size_t PackSpans(const Maxwell3D& engine, PacketHeader& header, std::span<u
         }
         g_e.touched.clear();
         g_e.after = engine.dirty.flags & parts.forward;
+        NotePools(engine);
         header.flags |= PacketSeed;
         draw_span();
         return used;
@@ -243,10 +268,21 @@ std::size_t PackSpans(const Maxwell3D& engine, PacketHeader& header, std::span<u
         header.delta_count = count;
         used += count * sizeof(RegPair);
     }
-    // The forwarded flags raised since the last packet.
+    // The forwarded flags. fable_b 10.2 rule 1, one home for each R-only flag: an unlent draw's
+    // packet takes every R-only flag set on E's engine and clears it there (R consumes them on
+    // its view; a later raise is then a real 0 to 1 edge again). A difference against a baseline
+    // missed the second raise of a flag the engine still held (Shaders: the step 4 trips). A
+    // lent packet forwards by difference (the lent call runs on the engine, and both views take
+    // the engine's flags after it). The shared flags always by difference: E keeps its copy.
     const FlagBits now = engine.dirty.flags & parts.forward;
-    const FlagBits raised = now & ~g_e.after;
-    g_e.after = now;
+    FlagBits raised;
+    if (header.kind == PacketKind::Draw) {
+        raised = (now & parts.render_only) | (now & parts.shared & ~g_e.after);
+        const_cast<Maxwell3D&>(engine).dirty.flags &= ~parts.render_only; // E's engine
+    } else {
+        raised = now & ~g_e.after;
+    }
+    g_e.after = engine.dirty.flags & parts.forward;
     if (raised.any()) {
         header.spans |= SpanFlags;
         put(&raised, sizeof(raised));
@@ -255,6 +291,7 @@ std::size_t PackSpans(const Maxwell3D& engine, PacketHeader& header, std::span<u
     // Programs: not sent. The six hashes come from ShaderCache::RefreshStages, which is the
     // pipeline cache's (R's) and reads the program words R's view has; R computes them itself.
     if (pools_changed) {
+        NotePools(engine);
         const Pools pools = PoolsOf(engine.regs);
         header.spans |= SpanPools;
         put(&pools, sizeof(pools));
@@ -333,7 +370,9 @@ void VerifyView(const RegisterView& view, const Maxwell3D& engine) {
     }
     // At step 4 E's buffer fill clears E's copies of the shared flags (VertexBuffers) for its
     // unlent draws while the view keeps them raised: only the R-only flags must agree then.
-    const FlagBits flag_mask = Step() == StepLevel::Unlend ? parts.render_only : parts.forward;
+    // And with rule 1 the R-only flags live on R's draw view (part c) at step 4, not here: the
+    // engine takes that view's before the call. So no flags compare at step 4.
+    const FlagBits flag_mask = Step() == StepLevel::Unlend ? FlagBits{} : parts.forward;
     const FlagBits flags = (view.flags ^ engine.dirty.flags) & flag_mask;
     if (flags.any()) {
         u32 flag = 0;
@@ -376,6 +415,10 @@ void SetTexturePages(const PageFilter* filter) noexcept {
     g_texture_pages = filter;
 }
 
+void SetShaderPages(const PageFilter* filter) noexcept {
+    g_shader_pages = filter;
+}
+
 bool StreamWriteHits(DAddr address, u64 size) noexcept {
     return g_texture_pages != nullptr && g_texture_pages->Any(address, size) && Behind() != 0;
 }
@@ -385,7 +428,17 @@ void GuardStreamWrite(DAddr address, u64 size) noexcept {
         return;
     }
     Stats::StreamWriteChecked();
-    if (!g_texture_pages->Any(address, size)) {
+    const DAddr end = address + size;
+    const auto in_pools = [&] {
+        for (const auto& [begin, pool_end] : g_e.pools) {
+            if (begin < end && address < pool_end) {
+                return true;
+            }
+        }
+        return false;
+    };
+    if (!g_texture_pages->Any(address, size) &&
+        (g_shader_pages == nullptr || !g_shader_pages->Any(address, size)) && !in_pools()) {
         return;
     }
     ++g_e.on_texture;

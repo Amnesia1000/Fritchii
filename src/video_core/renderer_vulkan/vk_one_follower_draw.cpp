@@ -72,6 +72,18 @@ namespace {
 /// The kinds R has a path for at step 4; the other bits stay lent (vk_one_follower_draw.h).
 constexpr u32 PlayableKinds = OneF::PlainIndexed | OneF::PlainArrays | OneF::InstanceLoop;
 
+/// The register words RefreshStages reads (the programs, their region, rasterization, mesh).
+using Maxwell3D = Tegra::Engines::Maxwell3D; // MAXWELL3D_REG_INDEX names it
+constexpr u32 ProgramWordsBegin = static_cast<u32>(MAXWELL3D_REG_INDEX(pipelines));
+constexpr u32 ProgramWordsEnd =
+    ProgramWordsBegin + static_cast<u32>(sizeof(Maxwell3D::Regs::pipelines) / sizeof(u32));
+constexpr u32 ProgramRegionBegin = static_cast<u32>(MAXWELL3D_REG_INDEX(program_region));
+constexpr u32 ProgramRegionEnd =
+    ProgramRegionBegin +
+    static_cast<u32>(sizeof(Maxwell3D::Regs::program_region) / sizeof(u32));
+constexpr u32 RasterizeEnableWord = static_cast<u32>(MAXWELL3D_REG_INDEX(rasterize_enable));
+constexpr u32 MeshControlWord = static_cast<u32>(Maxwell3D::Regs::MeshControl);
+
 template <typename T>
 [[nodiscard]] bool SameBytes(const T& a, const T& b) noexcept {
     static_assert(std::is_trivially_copyable_v<T>);
@@ -523,6 +535,14 @@ void OneFollowerDraw::ApplyViewSpans(const PacketHeader& header, const u8* spans
             std::memcpy(&pair, cursor + size_t{i} * sizeof(pair), sizeof(pair));
             if (pair.index < Maxwell::NUM_REGS) {
                 view->regs.reg_array[pair.index] = pair.value;
+                // fable_b_one_follower 10.3 (a), a cheap belt: a program register in the delta
+                // raises Shaders on the view whatever the flags span says (RefreshStages returns
+                // on a clear flag and would keep the previous draw's programs).
+                if ((pair.index >= ProgramWordsBegin && pair.index < ProgramWordsEnd) ||
+                    (pair.index >= ProgramRegionBegin && pair.index < ProgramRegionEnd) ||
+                    pair.index == RasterizeEnableWord || pair.index == MeshControlWord) {
+                    view->dirty.flags[VideoCommon::Dirty::Shaders] = true;
+                }
             }
         }
         cursor += Padded(size_t{header.delta_count} * sizeof(OneF::RegPair));
@@ -556,7 +576,9 @@ void OneFollowerDraw::ApplyViewSpans(const PacketHeader& header, const u8* spans
 
 void OneFollowerDraw::SyncFromEngine(Maxwell3D& engine, bool full) {
     if (view == nullptr || view_source != &engine) {
-        // A new channel: the view follows its memory manager (a reference in Maxwell3D).
+        // A new channel: the view follows its memory manager (a reference in Maxwell3D). The
+        // R-owned objects stop naming the old view first (rule 2).
+        LeaveView();
         view = std::make_unique<Maxwell3D>(engine.GetMemoryManager());
         view_source = &engine;
         full = true;
@@ -653,13 +675,85 @@ void OneFollowerDraw::PlayDraw(const PacketHeader& header) {
         return;
     }
     const OneF::DrawValues values = last_draw;
-    ViewScope scope{rasterizer, *view};
+    if (rasterizer.channel_state == nullptr || view_source != &rasterizer.channel_state->maxwell3d)
+        [[unlikely]] {
+        // The view follows another channel than the bound one: E lends after a bind until a lent
+        // packet syncs the new channel's view, so this must not happen.
+        OneF::Note(Check::RenderPacketMissing, "a played draw with the view of another channel");
+        DropDraw(header);
+        return;
+    }
+    EnterView(); // the default on R already (rule 2); here for the first draw after a step change
     playing = &header;
     SCOPE_EXIT {
         playing = nullptr;
     };
     rasterizer.Draw(values.indexed != 0, values.instance_arg);
     counts.played.fetch_add(1, std::memory_order_relaxed);
+}
+
+// --- R: rules 1 and 2 around lent calls (fable_b 10.2) ----------------------------------------------
+
+void OneFollowerDraw::EnterView() {
+    if (on_view || view == nullptr) {
+        return;
+    }
+    auto& r = rasterizer;
+    saved_rasterizer = r.ExchangeMaxwell3D(view.get());
+    saved_pipeline = r.pipeline_cache.ExchangeMaxwell3D(view.get());
+    saved_texture = r.texture_cache.ExchangeMaxwell3D(view.get());
+    saved_query = r.query_cache.ExchangeMaxwell3D(view.get());
+    saved_tracker = r.state_tracker.ExchangeFlags(&view->dirty.flags);
+    on_view = true;
+}
+
+void OneFollowerDraw::LeaveView() {
+    if (!on_view) {
+        return;
+    }
+    auto& r = rasterizer;
+    r.state_tracker.ExchangeFlags(saved_tracker);
+    r.query_cache.ExchangeMaxwell3D(saved_query);
+    r.texture_cache.ExchangeMaxwell3D(saved_texture);
+    r.pipeline_cache.ExchangeMaxwell3D(saved_pipeline);
+    r.ExchangeMaxwell3D(saved_rasterizer);
+    on_view = false;
+}
+
+void OneFollowerDraw::BeforeLent() {
+    // Rule 2: the lent call is E's code on E's engine.
+    LeaveView();
+    // Rule 1: the R-owned flags the view raised and R has not consumed go to the engine, so the
+    // lent call recomputes what they ask for (shared ones too: one rebind too many at worst).
+    if (rasterizer.channel_state == nullptr || view == nullptr) {
+        return;
+    }
+    Maxwell3D& engine = rasterizer.channel_state->maxwell3d;
+    if (view_source == &engine) {
+        engine.dirty.flags |= view->dirty.flags & render_flags;
+    }
+}
+
+void OneFollowerDraw::AfterLent() {
+    if (rasterizer.channel_state == nullptr || view == nullptr) {
+        return;
+    }
+    Maxwell3D& engine = rasterizer.channel_state->maxwell3d;
+    if (view_source != &engine) {
+        return; // a channel bind ran: the next lent packet makes the new channel's view
+    }
+    // Rule 1: after every lent call (not only lent draws) the view takes the engine's flags:
+    // what the call consumed is consumed, what it raised (a new command buffer's invalidations)
+    // is raised.
+    ResyncFlags(engine);
+    // Rule 2: R names the view again until the next lent call.
+    if (view_ready && OneF::Step() >= StepLevel::Build) {
+        EnterView();
+    }
+}
+
+void OneFollowerDraw::ViewOff() {
+    LeaveView();
 }
 
 // --- R: a played draw that did not build ------------------------------------------------------------
@@ -717,7 +811,8 @@ void OneFollowerDraw::ReportDescriptorMismatch(const GraphicsPipeline& pipeline,
         }
     }
     MemStage::StagedFacts table{};
-    const bool in_table = self->rasterizer.mem_stage.LookupFacts(view_id, table);
+    // The locked path: the lookup cache is E's (fable_b 10.1 row 9).
+    const bool in_table = self->rasterizer.mem_stage.LookupFactsLocked(view_id, table);
     const auto hashes = pipeline.ShaderHashes();
     LOG_CRITICAL(
         Render_Vulkan,

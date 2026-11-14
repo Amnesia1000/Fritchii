@@ -162,6 +162,11 @@ public:
 
     /// The device features FixedPipelineState::Refresh builds keys with (one follower's verify,
     /// vk_one_follower_draw.cpp, builds a key from each engine with them).
+    /// graphics_cache's entries (one follower: a played draw's lookup that adds one missed).
+    [[nodiscard]] size_t GraphicsEntries() const noexcept {
+        return graphics_cache.size();
+    }
+
     [[nodiscard]] const DynamicFeatures& Features() const noexcept {
         return dynamic_features;
     }
