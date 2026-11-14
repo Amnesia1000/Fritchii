@@ -502,6 +502,14 @@ void DisableUnlend(const char* why) noexcept;
 /// FRITCHII_ONEF_QUERY_OPS (live; fable_b 11.1 item 1): render enables that cannot have set host
 /// conditional rendering send nothing, counter resets and plain reports are render ops (no park).
 [[nodiscard]] bool QueryOps() noexcept;
+/// FRITCHII_ONEF_POSTED (live; fable_b 12.2): an R-side operation that returns nothing to E is
+/// posted by value, lent only where R must read the engine or E needs the result. Applied so far
+/// (fable_b 12.3's order): fix 1, the reports on buffer pages (as QUERY_OPS=2; QUERY_OPS on).
+[[nodiscard]] bool Posted() noexcept;
+/// fable_b 12.3's prices before building (the "One follower posting (dry)" line): E, at a lent
+/// fence (a buffer flush pending or not) and at a lent gather (its ranges).
+void CountLentFence(bool buffer_flush) noexcept;
+void CountLentGatherRanges(u64 ranges) noexcept;
 /// FRITCHII_ONEF_QUERY_OPS=2: plain reports on buffer cache pages are render ops too, when their
 /// type lands later (at a fence or flush, lent), not inside CounterReport.
 [[nodiscard]] bool QueryOpsOnBufferPages() noexcept;

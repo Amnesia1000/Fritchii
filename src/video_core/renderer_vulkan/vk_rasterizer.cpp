@@ -5301,6 +5301,7 @@ bool RasterizerVulkan::OneFollowerInvalidationOnEngine(
     };
     if (const auto first = hit()) {
         OneF::CountInvalidation(*first);
+        OneF::CountLentGatherRanges(sequences.size());
         return false;
     }
     // The Dekker pair with R's image registration (it marks the texture filter, fences, then
@@ -5966,7 +5967,16 @@ void RasterizerVulkan::ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) {
     buffer_cache.UnmapGPUMemory(as_id, addr, size);
 }
 
+void RasterizerVulkan::OneFollowerCountFence() {
+    // fable_b 12.3 fix 3's price: a fence whose cache commit has no buffer half to do on E.
+    VideoCommon::OneFollower::CountLentFence(buffer_cache.MayHaveUncommittedFlushes() ||
+                                             buffer_cache.AheadDue());
+}
+
 void RasterizerVulkan::SignalFence(std::function<void()>&& func) {
+    if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
+        OneFollowerCountFence();
+    }
     ONEF_LEND(Fence, SignalFence(std::move(func)))
     fence_manager.SignalFence(std::move(func));
 }
@@ -5992,11 +6002,17 @@ void RasterizerVulkan::SyncOperationKeepStamp(std::function<void()>&& func) {
 }
 
 void RasterizerVulkan::SignalSyncPoint(u32 value) {
+    if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
+        OneFollowerCountFence();
+    }
     ONEF_LEND(Fence, SignalSyncPoint(value))
     fence_manager.SignalSyncPoint(value);
 }
 
 void RasterizerVulkan::SignalReference() {
+    if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
+        OneFollowerCountFence();
+    }
     ONEF_LEND(Fence, SignalReference())
     fence_manager.SignalReference();
 }
