@@ -1837,7 +1837,10 @@ void MemStage::PushRingDraw() {
 
 bool MemStage::PostPendingOp() {
     namespace OneF = VideoCommon::OneFollower;
-    static_assert(static_cast<u8>(Site::InlineUpload) == 15, "PostOpSite's site numbers");
+    static_assert(static_cast<u8>(Site::InlineUpload) == 15 &&
+                      static_cast<u8>(Site::Invalidation) == 10 &&
+                      static_cast<u8>(Site::ListWords) == 7 && static_cast<u8>(Site::Dma) == 14,
+                  "PostOpSite's site numbers");
     if (!OneF::PostOpSite(static_cast<u8>(pending_site))) {
         return false;
     }

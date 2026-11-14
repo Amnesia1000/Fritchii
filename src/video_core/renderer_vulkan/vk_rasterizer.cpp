@@ -4728,6 +4728,35 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType 
         return;
     }
     ONEF_LEND(ReadBack, FlushRegion(addr, size, which))
+    // One follower: R outside a lent call, an unlent draw's image upload reading game memory
+    // (TextureCache::UploadImageContents -> MemoryManager::ReadBlock). The gather and the buffer
+    // half below are E's cache, E running ahead (the hangs of 12 Nov: R took the buffer cache's
+    // lock here, and its download waited on E). Pages the GPU never wrote have nothing to
+    // download, and the gather only orders the guest's writes before a download: both are
+    // skipped then, exactly. A GPU-written page is a must-be-0 that stops step 4; the image
+    // takes the range again so its next use (lent) uploads it right.
+    if (VideoCommon::OneFollower::OnRenderThread() &&
+        !VideoCommon::OneFollower::RenderInLentCall()) [[unlikely]] {
+        using VideoCommon::CacheType;
+        const bool needs_engine =
+            (True(which & CacheType::BufferCache) && Tegra::Nx2MayBeGpuWritten(addr, size)) ||
+            (True(which & CacheType::TextureCache) && texture_cache.page_filter.Any(addr, size));
+        if (needs_engine) {
+            thread_local std::string note;
+            note = fmt::format("FlushRegion {:#x}+{:#x} (cache bits {:#x}) in an unlent draw", addr,
+                               size, static_cast<u32>(which));
+            VideoCommon::OneFollower::Note(
+                VideoCommon::OneFollower::Check::RenderNeedsEngineFlush, note.c_str());
+            VideoCommon::OneFollower::DisableUnlend(
+                "an unlent draw's image upload needed E's buffer flush");
+            std::scoped_lock lock{texture_cache.mutex};
+            texture_cache.WriteMemory(addr, size);
+        }
+        if (True(which & CacheType::QueryCache)) {
+            query_cache.FlushRegion(addr, size); // R's own
+        }
+        return;
+    }
     if (Common::WriteRing::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
         mem_stage.NoteGather(MemStage::Gather::FlushRegion, static_cast<u32>(which));
     }

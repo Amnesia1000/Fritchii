@@ -1408,6 +1408,10 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   lock handed over. Lent as before: a sync inside a held fill, E's own draw fill, no room, no
   packet ticks. Must be 0: "ring B pairing" (R found another packet at the head), "owner on R"
   (an entry's play entered the buffer cache). The "One follower op packets" line counts them.
+- FRITCHII_ONEF_OP_INVAL (live, default 0; fable_b_one_follower 13.4, step 4): 1 = the buffer
+  commands E's own invalidation work records (INVAL_E's draw invalidation, GATHER_E's gathers:
+  the Invalidation site) are posted as ring B op packets, as FRITCHII_ONEF_OP_INLINE does for
+  inline uploads, instead of a lent seam play (which E made holding the buffer cache's lock).
 - FRITCHII_ONEF_OP_CLEAR (live, default 0; fable_b_one_follower 13.4 group 3; step 4, view
   tracked): 1 = clears are render ops. E has decided the render enable (DrawManager tests
   ShouldExecute) and runs the clear's FlushCaching; R plays Clear from its view (every clear
@@ -1419,6 +1423,11 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   packets since its previous record), written every second to <log>/onef_lend_trace.bin, the
   site names to onef_lend_trace_sites.txt. work/lend_replay.py replays it with any kinds marked
   posted. A 72 MiB ring; at about 100,000 records a second the file grows 7 MiB a second.
+- One follower step 4, R's FlushRegion outside a lent call (an unlent draw's image upload reads
+  game memory): the gather and the buffer cache's download are E's, so R skips them when no
+  page of the range was ever GPU-written (nothing to download, exactly). A GPU-written page (or
+  a texture download R cannot order after the gather) counts must-be-0 "R needs E's buffer
+  flush" and stops step 4 for the session.
 - With FRITCHII_ONEF=1 (or LEAN), every 10 s "One follower lends by site" lists the 16 lent
   call sites that parked E longest (the rasterizer function's name and its op, rate and parked
   ms/s; "direct" = Lend called outside the rasterizer's entry points: lent draws, verify
