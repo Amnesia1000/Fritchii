@@ -1199,6 +1199,44 @@ fills on a thread of their own by hand-off; 2 lets that thread read the ring its
   - The read log (FRITCHII_MEMSTAGE_READ_LOG) and the texture-write check do not cover ring
     packets in level mode; with FRITCHII_MEMSTAGE_AHEAD the read log does (below).
 
+### FRITCHII_ONEF (one follower, steps 1 to 4)
+
+The one-follower renderer front end (work\fable_b_one_follower.md, sections 8 and 8.1;
+src/video_core/one_follower.h). The back thread becomes E, the engine thread; a new thread R,
+"GPURender", owns the pipeline, texture and query caches, the fences and the Vulkan scheduler and
+plays packets E sends. Anything R cannot do from a packet runs "lent": E parks, R runs E's code
+reading E's engine, then releases E. The switches nest: each refuses to turn on without the one
+before it and logs why ("FRITCHII_ONEF_VIEW=1 needs FRITCHII_ONEF=1; running 0"). Turn them on in
+this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND live.
+- FRITCHII_ONEF (boot, default 0): 1 = step 1, R exists and every draw and every R-owned
+  operation is lent. The picture is today's; it prices the hop (one round trip a draw). 0 is
+  today's code path, untouched. Not live: ownership of the caches and the scheduler cannot change
+  in a session. Needs the GPU thread split.
+- FRITCHII_ONEF_PIN (boot, default 1): R gets PinnedRole::GpuMem's physical core (as
+  FRITCHII_PIN_GPUMEM=1 gives GPUMem), taken from the guest set. 0 leaves R unpinned.
+- FRITCHII_ONEF_VIEW (live, default 0): 1 = step 2, E packs the register delta, the R-owned dirty
+  flags it raised, the draw state, the program hashes and the pools into each packet; R applies
+  them to its register view and compares it with the engine at every lent draw ("view ..." checks,
+  must be 0). No fps change expected.
+- FRITCHII_ONEF_BUILD (live, default 0): 1 = step 3, R also builds each lent draw from the packet
+  and its view (pipeline, image views, dynamic state, descriptors, render targets) and compares
+  it with what the lent path used ("build ..." checks, must be 0).
+- FRITCHII_ONEF_UNLEND (live, default 0): step 4, a mask of draw kinds that run on R from the
+  packet alone while E goes on: 1 plain indexed, 2 plain non-indexed, 4 instance loops,
+  8 indirect, 16 list, 32 mesh, 64 GPU-counted, 128 inline index. Start with 3. Every lent draw
+  counts its reason (step below 4, kind not in mask, pipeline miss, verify, stream write,
+  diagnostic, transient). Clears, dispatches, reports, fences and read-backs stay lent (step 5).
+- FRITCHII_ONEF_VERIFY_EVERY (live, default 64): with UNLEND on, every Nth unlent draw is forced
+  lent and runs step 3's compare: step 4's own must-be-0. 0 = never.
+- FRITCHII_ONEF_AHEAD (live, default 1): packets E may push that R has not played: 1, 8, or 0
+  for the ring's room. 1 is step 1 without the wait for the result (ordering bugs apart from
+  run-ahead bugs).
+- The stream-write guard (section 7 of the design): a game memory write from the stream onto a
+  page the texture cache tracks while R has unplayed packets is counted ("stream write", must be
+  0) and made lent.
+- Must-be-0 line, every 10 s: "One follower checks (must be 0; this window / session): view words
+  a / b, ...". Ownership: "owner on E" (an R-owned object used on E while R ran) and "owner on R".
+
 ### FRITCHII_MEMSTAGE_AHEAD
 
 FRITCHII_MEMSTAGE_AHEAD (live, read at a frame end, default 0; the memory stage's step 7, "the

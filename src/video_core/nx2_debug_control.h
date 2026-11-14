@@ -208,6 +208,20 @@ inline std::atomic<int> g_vertex_input_compact{-1};
 inline std::atomic<int> g_worker_spin{-1};
 /// FRITCHII_BIND_ADDR_MEMO: docs/fritchii/switches.md.
 inline std::atomic<int> g_bind_addr_memo{-1};
+/// FRITCHII_ONEF (boot): one follower step 1, the render thread R (one_follower.h).
+inline std::atomic<int> g_onef{-1};
+/// FRITCHII_ONEF_VIEW (live): step 2, needs FRITCHII_ONEF=1.
+inline std::atomic<int> g_onef_view{-1};
+/// FRITCHII_ONEF_BUILD (live): step 3, needs FRITCHII_ONEF_VIEW=1.
+inline std::atomic<int> g_onef_build{-1};
+/// FRITCHII_ONEF_UNLEND (live): step 4's draw kind mask, needs FRITCHII_ONEF_BUILD=1.
+inline std::atomic<int> g_onef_unlend{-1};
+/// FRITCHII_ONEF_VERIFY_EVERY (live): every Nth unlent draw forced lent and compared.
+inline std::atomic<int> g_onef_verify_every{-1};
+/// FRITCHII_ONEF_AHEAD (live): packets E may run ahead of R (0 = the ring).
+inline std::atomic<int> g_onef_ahead{-1};
+/// FRITCHII_ONEF_PIN (boot, default 1): R on PinnedRole::GpuMem's core.
+inline std::atomic<int> g_onef_pin{-1};
 /// EDEN_NX2_LIGHT_TABLE_ARRAYS: docs/fritchii/switches.md.
 [[nodiscard]] inline bool LightTableArrays() {
     static const bool on = EnvSwitch("EDEN_NX2_LIGHT_TABLE_ARRAYS") > 0;
