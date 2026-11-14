@@ -237,6 +237,10 @@ private:
     /// E (FRITCHII_ONEF_INVAL_E): whether this invalidation runs on E (no range on R's pages).
     [[nodiscard]] bool OneFollowerInvalidationOnEngine(
         std::span<const std::pair<DAddr, std::size_t>> sequences);
+    /// E (FRITCHII_ONEF_COPY_E): whether AccelerateInlineWords runs here (stamps its pages).
+    [[nodiscard]] bool OneFollowerInlineWordsOnEngine(GPUVAddr address, size_t copy_size);
+    /// E (FRITCHII_ONEF_GATHER_E): applies a gather's buffer half here; false = lend it.
+    [[nodiscard]] bool OneFollowerGatherOnEngine(std::span<const std::pair<DAddr, u64>> ranges);
     /// E: fable_b 12.3 fix 3's price (CountLentFence) at a lent fence.
     void OneFollowerCountFence();
     /// E (FRITCHII_ONEF_COPY_E): runs an inline upload here; false = lend it whole.

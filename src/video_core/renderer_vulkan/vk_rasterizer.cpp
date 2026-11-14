@@ -5494,7 +5494,44 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
     return false;
 }
 
+bool RasterizerVulkan::OneFollowerGatherOnEngine(
+    std::span<const std::pair<DAddr, u64>> ranges) {
+    namespace OneF = VideoCommon::OneFollower;
+    if (!OneF::GatherOnEngine()) {
+        return false;
+    }
+    // fable_b 12.3 fix 5: R's half is the texture and shader caches (ApplyGatherOtherHalf; the
+    // query cache is not in a gather). No range on their pages: it does nothing, and E applies
+    // the buffer half (ApplyGatherBufferHalf, the served gather's). The guest's writes are in
+    // memory before the take, and R fences between an image's filter mark and its upload
+    // (WrittenAheadOfRender): R either uploads the written bytes or its mark is seen here.
+    for (const auto& [addr, size] : ranges) {
+        if (addr != 0 && size != 0 &&
+            (texture_cache.page_filter.Any(addr, size) ||
+             pipeline_cache.page_filter.Any(addr, size))) {
+            OneF::CountInvalidation(OneF::InvalKind::GatherLent);
+            OneF::CountLentGatherRanges(ranges.size());
+            return false;
+        }
+    }
+    for (const auto& [addr, size] : ranges) {
+        mem_stage.NoteCpuMark(addr, size);
+        if (VideoCommon::Nx2FastDrawCount::g_on && addr != 0 && size != 0) [[unlikely]] {
+            VideoCommon::Nx2FastDrawCount::NotePoolWrite(addr, size);
+        }
+    }
+    {
+        std::scoped_lock lock{buffer_cache.mutex};
+        (void)ApplyGatherBufferHalf(ranges);
+    }
+    OneF::CountInvalidation(OneF::InvalKind::GatherOnEngine);
+    return true;
+}
+
 void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) {
+    if (VideoCommon::OneFollower::ShouldLend() && OneFollowerGatherOnEngine(ranges)) {
+        return;
+    }
     ONEF_LEND(Invalidation, OnCacheInvalidations(ranges))
     if (t_gather_probe != nullptr) [[unlikely]] {
         ProbeGatherRanges(ranges); // FRITCHII_MEMSTAGE_GATHER's counters only
@@ -5901,7 +5938,15 @@ bool RasterizerVulkan::TryCacheInvalidation(DAddr addr, u64 size) {
 }
 
 void RasterizerVulkan::InvalidateGPUCache() {
-    ONEF_LEND(Invalidation, InvalidateGPUCache())
+    // FRITCHII_ONEF_GATHER_E: the take runs on E (GPU::InvalidateGPUCache, as on the split's back
+    // without one follower); OnCacheInvalidations then applies or lends. Runahead keeps the
+    // whole gather lent (its boundary state).
+    const bool onef_on_engine =
+        VideoCommon::OneFollower::ShouldLend() && VideoCommon::OneFollower::GatherOnEngine() &&
+        VideoCommon::Runahead::CurrentMode() == VideoCommon::Runahead::Mode::Off;
+    if (!onef_on_engine) {
+        ONEF_LEND(Invalidation, InvalidateGPUCache())
+    }
     // FRITCHII_MEMSTAGE_PASS (fable_stage_levelpoints 6.5): at a passed gather's entry, the half
     // of GPUMem's take the back owes (the other caches', or all of it when the entry runs as a
     // level run), before this gather takes more. Records of earlier entries the back never asked
@@ -5914,7 +5959,13 @@ void RasterizerVulkan::InvalidateGPUCache() {
 }
 
 void RasterizerVulkan::InvalidateTextureDataCache() {
-    ONEF_LEND(Invalidation, InvalidateTextureDataCache())
+    // FRITCHII_ONEF_GATHER_E: on E (its gather as InvalidateGPUCache's; WaitForIdle stays lent).
+    const bool onef_on_engine =
+        VideoCommon::OneFollower::ShouldLend() && VideoCommon::OneFollower::GatherOnEngine() &&
+        VideoCommon::Runahead::CurrentMode() == VideoCommon::Runahead::Mode::Off;
+    if (!onef_on_engine) {
+        ONEF_LEND(Invalidation, InvalidateTextureDataCache())
+    }
     // FRITCHII_MEMSTAGE_GATHER: GPUMem, level at this entry, had the back run this gather already
     // (StageRunGather); the back's own run of the entry skips it. BackTakeGather counts a served
     // gather with no record (must be 0). Without the ring, and for every gather that started a
@@ -6127,6 +6178,21 @@ void RasterizerVulkan::WaitForIdle() {
 }
 
 void RasterizerVulkan::FragmentBarrier() {
+    // FRITCHII_ONEF_POSTED: R's scheduler alone, nothing back to E: a render op.
+    if (VideoCommon::OneFollower::ShouldLend() && VideoCommon::OneFollower::Posted() &&
+        VideoCommon::OneFollower::Step() >= VideoCommon::OneFollower::StepLevel::Build)
+        [[unlikely]] {
+        RasterizerVulkan* const self = this;
+        VideoCommon::OneFollower::PushOp(
+            VideoCommon::OneFollower::LentOp::Other,
+            [](void* raw) {
+                RasterizerVulkan* rasterizer;
+                std::memcpy(&rasterizer, raw, sizeof(rasterizer));
+                rasterizer->FragmentBarrier();
+            },
+            &self, sizeof(self));
+        return;
+    }
     ONEF_LEND(Other, FragmentBarrier())
     // The next draw breaks the render pass only if it reads what this one wrote: Ocarina
     // ended ~5,900 render passes a second here.
@@ -6143,6 +6209,22 @@ void RasterizerVulkan::TiledCacheBarrier() {
 }
 
 void RasterizerVulkan::FlushCommands() {
+    // FRITCHII_ONEF_POSTED: R's own counters (draw_counter, pending_native_work: R's draws,
+    // clears and dispatches) and its scheduler, nothing back to E: a render op.
+    if (VideoCommon::OneFollower::ShouldLend() && VideoCommon::OneFollower::Posted() &&
+        VideoCommon::OneFollower::Step() >= VideoCommon::OneFollower::StepLevel::Build)
+        [[unlikely]] {
+        RasterizerVulkan* const self = this;
+        VideoCommon::OneFollower::PushOp(
+            VideoCommon::OneFollower::LentOp::FrameEnd,
+            [](void* raw) {
+                RasterizerVulkan* rasterizer;
+                std::memcpy(&rasterizer, raw, sizeof(rasterizer));
+                rasterizer->FlushCommands();
+            },
+            &self, sizeof(self));
+        return;
+    }
     ONEF_LEND(FrameEnd, FlushCommands())
     if (draw_counter == 0 && !pending_native_work) {
         return;
@@ -7236,7 +7318,13 @@ void RasterizerVulkan::InlineUntouchedTail(GPUVAddr address, DAddr cpu_addr, siz
 
 void RasterizerVulkan::AccelerateInlineWords(GPUVAddr address, size_t copy_size,
                                              std::span<const u8> memory) {
-    ONEF_LEND(Copy, AccelerateInlineWords(address, copy_size, memory))
+    // FRITCHII_ONEF_COPY_E: on E when no piece is on a query page (word calls go through
+    // AccelerateInlineToMemory's own E path or lend alone).
+    const bool onef_on_engine = VideoCommon::OneFollower::ShouldLend() &&
+                                OneFollowerInlineWordsOnEngine(address, copy_size);
+    if (!onef_on_engine) {
+        ONEF_LEND(Copy, AccelerateInlineWords(address, copy_size, memory))
+    }
     // EXP124 (fable_memstage_compute_brief 4.2): a macro's upload words, flushed at once, written
     // as their calls one by one would have been. Pieces of one 4 KiB page each take one call
     // where every word of it would take InlineSkipsCaches's branch: there each step (the write,
@@ -7327,6 +7415,42 @@ void RasterizerVulkan::AccelerateInlineWords(GPUVAddr address, size_t copy_size,
         }
         offset = end;
     }
+}
+
+bool RasterizerVulkan::OneFollowerInlineWordsOnEngine(GPUVAddr address, size_t copy_size) {
+    namespace OneF = VideoCommon::OneFollower;
+    if (!OneF::CopyOnEngine() || !InlineDefer() || copy_size == 0) {
+        return false;
+    }
+    // The pieces' own path (InlineUntouchedTail) invalidates the query cache where its filter
+    // is hit: R's. Any piece on a query page, or a report op E pushed: lent whole. Then the
+    // stamps (item 2's pair with R's image registration), before any write.
+    constexpr GPUVAddr page_size = GPUVAddr{1} << 12;
+    for (size_t offset = 0; offset < copy_size;) {
+        const GPUVAddr piece = address + offset;
+        const size_t end =
+            (std::min<size_t>)(copy_size, offset + (page_size - (piece & (page_size - 1))));
+        if (const auto device = gpu_memory->GpuToCpuAddress(piece)) {
+            if (query_cache.page_filter.Any(*device, end - offset) ||
+                (onef_report_pages != nullptr && onef_report_pages->Any(*device, end - offset))) {
+                OneF::CountInvalidation(OneF::InvalKind::InlineQuery);
+                return false;
+            }
+        }
+        offset = end;
+    }
+    for (size_t offset = 0; offset < copy_size;) {
+        const GPUVAddr piece = address + offset;
+        const size_t end =
+            (std::min<size_t>)(copy_size, offset + (page_size - (piece & (page_size - 1))));
+        if (const auto device = gpu_memory->GpuToCpuAddress(piece)) {
+            OneF::StampPageWrites(*device, end - offset);
+        }
+        offset = end;
+    }
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    OneF::CountInvalidation(OneF::InvalKind::InlineOnEngine);
+    return true;
 }
 
 bool RasterizerVulkan::OneFollowerInlineOnEngine(GPUVAddr address, size_t copy_size,

@@ -535,6 +535,10 @@ void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size,
 /// FRITCHII_ONEF_COPY_E (live; with FRITCHII_ONEF_INVAL_E's conditions and stamps): inline
 /// uploads (AccelerateInlineToMemory) run on E; R's halves only where their pages are hit.
 [[nodiscard]] bool CopyOnEngine() noexcept;
+/// FRITCHII_ONEF_GATHER_E (live; with FRITCHII_ONEF_INVAL_E's conditions): the guest's collected
+/// writes (InvalidateGPUCache's gather) are taken and applied to the buffer cache on E; R's
+/// half (texture, shader caches) only where their filters are hit (then the gather is lent).
+[[nodiscard]] bool GatherOnEngine() noexcept;
 /// E: stamps [address, address + size)'s pages with the next packet's number (before the
 /// filters' second look: WrittenAheadOfRender's Dekker pair).
 void StampPageWrites(u64 address, u64 size) noexcept;
@@ -548,6 +552,8 @@ enum class InvalKind : u8 {
     InlineOnEngine,  ///< FRITCHII_ONEF_COPY_E: an inline upload run on E
     InlineRHalf,     ///< ... whose texture/shader half was lent alone (in-place upload, a hit)
     InlineQuery,     ///< ... lent whole: a query page or a pushed report op's
+    GatherOnEngine,  ///< FRITCHII_ONEF_GATHER_E: a gather applied on E
+    GatherLent,      ///< ... lent: a range on a texture or shader page
     Count,
 };
 void CountInvalidation(InvalKind kind) noexcept;

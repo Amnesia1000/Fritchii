@@ -1392,6 +1392,14 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   pending (the others need no E half), lent gathers and their ranges each; copies by class are
   the "lends by site" line's BufferCopy, BufferClear, DmaBufferImageCopy, AccelerateSurfaceCopy
   and AccelerateInlineToMemory rows.
+- FRITCHII_ONEF_GATHER_E (live, default 0; fable_b_one_follower 12.3 fix 5; with
+  FRITCHII_ONEF_INVAL_E's conditions): 1 = InvalidateGPUCache's gather of the guest's writes
+  runs on E: the take, then the buffer half (ApplyGatherBufferHalf). A range on a texture or
+  shader page lends the gather (R's half); the query cache has no part in a gather. Runahead
+  keeps it lent. Counted in the invalidations line ("gathers on E / gathers lent").
+  FRITCHII_ONEF_COPY_E also runs AccelerateInlineWords on E (no piece on a query page; its
+  pages stamped first), and FRITCHII_ONEF_POSTED posts FragmentBarrier and FlushCommands as
+  render ops (R's scheduler and counters only).
 - With FRITCHII_ONEF=1 (or LEAN), every 10 s "One follower lends by site" lists the 16 lent
   call sites that parked E longest (the rasterizer function's name and its op, rate and parked
   ms/s; "direct" = Lend called outside the rasterizer's entry points: lent draws, verify

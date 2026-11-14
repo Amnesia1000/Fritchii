@@ -251,6 +251,8 @@ inline std::atomic<int> g_onef_copy_e{-1};
 /// FRITCHII_ONEF_POSTED (live, default 0): fable_b 12.2, posted is the default, lent the
 /// exception (docs/fritchii/switches.md).
 inline std::atomic<int> g_onef_posted{-1};
+/// FRITCHII_ONEF_GATHER_E (live, default 0): fable_b 12.3 fix 5, the guest-write gathers on E.
+inline std::atomic<int> g_onef_gather_e{-1};
 /// EDEN_NX2_LIGHT_TABLE_ARRAYS: docs/fritchii/switches.md.
 [[nodiscard]] inline bool LightTableArrays() {
     static const bool on = EnvSwitch("EDEN_NX2_LIGHT_TABLE_ARRAYS") > 0;
