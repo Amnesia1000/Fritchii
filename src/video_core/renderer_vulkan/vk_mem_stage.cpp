@@ -1900,6 +1900,7 @@ bool MemStage::PostPendingOp() {
             MemStage* stage;
             u64 number;
         } const op{this, number};
+        OneF::SetLendSite("op packet (posted)");
         OneF::PushOp(
             OneF::LentOp::Copy,
             [](void* raw) {

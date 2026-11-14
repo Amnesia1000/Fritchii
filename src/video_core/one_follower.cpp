@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cstring>
 #include <exception>
+#include <fstream>
 #include <functional>
 #include <string>
 #include <memory>
@@ -27,6 +28,7 @@
 #include <fmt/format.h>
 
 #include "common/dkb_cpu_trace.h"
+#include "common/fs/path_util.h"
 #include "common/spin_recursive_mutex.h"
 #include "common/logging.h"
 #include "common/scope_exit.h"
@@ -177,6 +179,109 @@ bool CountersOn() noexcept {
 
 /// E: SetLendSite's name for the next Lend, consumed by it.
 thread_local const char* t_lend_site{};
+
+// FRITCHII_ONEF_TRACE (boot; fable_b 15.5): one record per lend and per posted op, by packet
+// number in a ring. E writes its half (site, op, posted, its arrival, its work since its last
+// record, its resume), R its own (the call's start and end, its busy time on other packets since
+// its last record), GPUWatch writes the finished ones to <log>/onef_lend_trace.bin every second
+// (and the site names to onef_lend_trace_sites.txt). lend_replay.py reads them.
+struct TraceRecord {
+    u64 number;   ///< the packet number (0: no record in this slot yet)
+    u64 site;     ///< the site name's address (onef_lend_trace_sites.txt), 0 = none
+    u64 e_arrive; ///< E at the push (ns, Nx2Hitch::NowNs)
+    u64 r_start;  ///< R starts the packet
+    u64 r_end;    ///< R ends it
+    u64 e_resume; ///< E released (lent), 0 for a posted op
+    u64 e_work;   ///< E's time since its previous record ended (its resume or post)
+    u64 r_busy;   ///< R's time on other packets since its previous record
+    u8 op;        ///< LentOp
+    u8 posted;    ///< 1: a posted op (E did not wait)
+    u8 pad[6];
+};
+static_assert(sizeof(TraceRecord) == 72);
+constexpr u64 TraceSlots = u64{1} << 20;
+bool g_trace{};
+std::unique_ptr<TraceRecord[]> g_trace_ring;
+u64 g_trace_written{}; ///< GPUWatch: the next packet number to write
+u64 g_trace_records{};
+u64 g_trace_lost{};
+std::ofstream g_trace_file;
+std::mutex g_trace_sites_mutex;
+std::vector<const char*> g_trace_sites;
+bool g_trace_sites_dirty{};
+/// E: the end of its previous record (resume or post).
+thread_local u64 t_e_last{};
+/// R: its time on other packets since its previous record.
+thread_local u64 t_r_busy{};
+
+/// E: a record's E half at the push (before the packet can be played: R writes other fields).
+void TraceArrive(u64 number, const char* site, LentOp op, bool posted, u64 now) {
+    TraceRecord& record = g_trace_ring[number % TraceSlots];
+    record.site = reinterpret_cast<u64>(site);
+    record.op = static_cast<u8>(op);
+    record.posted = posted ? 1 : 0;
+    record.e_arrive = now;
+    record.e_work = t_e_last != 0 && now > t_e_last ? now - t_e_last : 0;
+    record.e_resume = 0;
+    t_e_last = now;
+    if (site != nullptr) {
+        std::scoped_lock lock{g_trace_sites_mutex};
+        if (std::ranges::find(g_trace_sites, site) == g_trace_sites.end()) {
+            g_trace_sites.push_back(site);
+            g_trace_sites_dirty = true;
+        }
+    }
+    // Last: the slot is this packet's now (GPUWatch tests it).
+    std::atomic_ref<u64>{record.number}.store(number, std::memory_order_release);
+}
+
+/// GPUWatch: writes every finished record (both halves in), and the site names when new.
+void TraceFlush(bool final) {
+    if (!g_trace || !g_trace_file) {
+        return;
+    }
+    // A record is finished once R played it and E pushed past it (its resume was written
+    // before its next push); a margin covers a posted op's E half, written right after its push.
+    const u64 played = g.played.load(std::memory_order_acquire);
+    const u64 sent = g.sent_packets.load(std::memory_order_acquire);
+    u64 safe = (std::min)(played, sent);
+    safe = final ? safe : (safe > 64 ? safe - 64 : 0);
+    if (g_trace_written == 0) {
+        g_trace_written = safe > TraceSlots ? safe - TraceSlots + 1 : 1;
+    }
+    if (safe >= g_trace_written + TraceSlots) {
+        g_trace_lost += safe - TraceSlots + 1 - g_trace_written;
+        g_trace_written = safe - TraceSlots + 1;
+    }
+    for (; g_trace_written <= safe; ++g_trace_written) {
+        const TraceRecord& record = g_trace_ring[g_trace_written % TraceSlots];
+        if (std::atomic_ref<u64>{const_cast<u64&>(record.number)}.load(std::memory_order_acquire) !=
+            g_trace_written) {
+            continue; // a draw or delta packet: no record
+        }
+        g_trace_file.write(reinterpret_cast<const char*>(&record), sizeof(record));
+        ++g_trace_records;
+    }
+    g_trace_file.flush();
+    std::vector<const char*> sites;
+    {
+        std::scoped_lock lock{g_trace_sites_mutex};
+        if (!std::exchange(g_trace_sites_dirty, false) && !final) {
+            return;
+        }
+        sites = g_trace_sites;
+    }
+    std::ofstream names{Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir) /
+                            "onef_lend_trace_sites.txt",
+                        std::ios::trunc};
+    for (const char* const site : sites) {
+        names << fmt::format("{:#x}\t{}\n", reinterpret_cast<u64>(site), site);
+    }
+    if (final) {
+        LOG_INFO(HW_GPU, "One follower lend trace: {} records written, {} lost (ring overrun)",
+                 g_trace_records, g_trace_lost);
+    }
+}
 /// E's lends by call site (written on E; the 10 s line reads them on R in a frame-end lend,
 /// E parked). Keyed by the name's pointer (one literal per site); the rest counted together.
 struct LendSite {
@@ -723,7 +828,19 @@ void RenderMain(std::stop_token stop) {
         g.r_kind.store(static_cast<u8>(header.kind), std::memory_order_relaxed);
         g.r_op.store(header.op, std::memory_order_relaxed);
         g.r_packet.store(header.number, std::memory_order_relaxed);
+        const u64 trace_start = g_trace ? Common::Nx2Hitch::NowNs() : 0;
         const Stats::RenderTime where = Play(header, at + sizeof(PacketHeader));
+        if (g_trace) [[unlikely]] {
+            const u64 trace_end = Common::Nx2Hitch::NowNs();
+            if (header.kind == PacketKind::Lent || header.kind == PacketKind::Op) {
+                TraceRecord& record = g_trace_ring[header.number % TraceSlots];
+                record.r_start = trace_start;
+                record.r_end = trace_end;
+                record.r_busy = std::exchange(t_r_busy, 0);
+            } else {
+                t_r_busy += trace_end - trace_start;
+            }
+        }
         g.r_packet.store(0, std::memory_order_relaxed);
         g.r_progress.store(g.r_progress.load(std::memory_order_relaxed) + 1,
                            std::memory_order_relaxed);
@@ -825,6 +942,7 @@ void WatchMain(std::stop_token stop) {
             }
             std::this_thread::sleep_for(std::chrono::milliseconds{100});
         }
+        TraceFlush(false);
         const u64 played = g.played.load(std::memory_order_acquire);
         const u64 sent_packets = g.sent_packets.load(std::memory_order_acquire);
         const u64 r_packet = g.r_packet.load(std::memory_order_relaxed);
@@ -964,6 +1082,7 @@ void ReadSwitches() {
     g_track_writes_always = g.lean;
     g.on = g.lean || SwitchValue(g_onef, "FRITCHII_ONEF") == 1;
     g.pin = SwitchValue(g_onef_pin, "FRITCHII_ONEF_PIN", 1) != 0;
+    g_trace = g.on && SwitchValue(g_onef_trace, "FRITCHII_ONEF_TRACE") == 1;
     if (g.lean) {
         // The verified configuration as defaults; a switch set in the environment (the test
         // block) or read before this keeps its value.
@@ -1078,6 +1197,14 @@ void Start(Core::System& system) {
     Detail::ViewTrackingStopped();
     g.seen_generation.store(~u32{0}, std::memory_order_relaxed);
     (void)Step();
+    if (g_trace && !g_trace_ring) {
+        g_trace_ring = std::make_unique<TraceRecord[]>(TraceSlots);
+        const auto path =
+            Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir) / "onef_lend_trace.bin";
+        g_trace_file.open(path, std::ios::binary | std::ios::trunc);
+        LOG_INFO(HW_GPU, "One follower lend trace (FRITCHII_ONEF_TRACE=1): {} ({} MiB ring)",
+                 path.string(), TraceSlots * sizeof(TraceRecord) >> 20);
+    }
     g.thread = std::jthread([](std::stop_token stop) { RenderMain(stop); });
     g.watchdog = std::jthread([](std::stop_token stop) { WatchMain(stop); });
 }
@@ -1094,6 +1221,10 @@ void Stop() {
     g.r_wake.fetch_add(1, std::memory_order_seq_cst);
     g.r_wake.notify_one();
     g.thread.join();
+    TraceFlush(true);
+    if (g_trace_file.is_open()) {
+        g_trace_file.close();
+    }
 }
 
 void WatchLock(const char* name, const Common::SpinRecursiveMutex* mutex) noexcept {
@@ -1141,6 +1272,9 @@ void Lend(LentOp op, LentReason reason, void (*function)(void*), void* argument)
     const u64 begin_clock = counting ? Common::Nx2Hitch::NowNs() : 0;
     const u64 behind = counting ? Behind() : 0;
     const u64 number = ++g.pushed;
+    if (g_trace) [[unlikely]] {
+        TraceArrive(number, t_lend_site, op, false, Common::Nx2Hitch::NowNs());
+    }
     u8* const buffer = PackBuffer();
     std::size_t spans_bytes = 0;
     PacketHeader header{};
@@ -1180,6 +1314,11 @@ void Lend(LentOp op, LentReason reason, void (*function)(void*), void* argument)
         EngineWait([&] { return g.played.load(std::memory_order_acquire) >= number; },
                    EWait::Park, number);
     }
+    if (g_trace) [[unlikely]] {
+        const u64 now = Common::Nx2Hitch::NowNs();
+        g_trace_ring[number % TraceSlots].e_resume = now;
+        t_e_last = now;
+    }
     const u64 parked_ns = counting ? Common::Nx2Hitch::NowNs() - begin_clock : 0;
     if (counting) {
         NoteLendSite(op, parked_ns);
@@ -1207,6 +1346,7 @@ void Lend(LentOp op, LentReason reason, void (*function)(void*), void* argument)
 void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size,
             bool lands_in_memory, u8 packet_flags) {
     if (!Detail::t_engine || !g.thread.joinable() || size > MaxPayloadBytes) {
+        t_lend_site = nullptr;
         function(const_cast<void*>(payload));
         return;
     }
@@ -1230,7 +1370,11 @@ void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size,
     }
     header.reserved2 = static_cast<u32>(spans_bytes);
     std::memcpy(buffer + sizeof(PacketHeader) + spans_bytes, payload, size);
+    const char* const trace_site = std::exchange(t_lend_site, nullptr);
     PushPacked(header, buffer, spans_bytes + ((size + 7) & ~u32{7}));
+    if (g_trace) [[unlikely]] {
+        TraceArrive(header.number, trace_site, op, true, Common::Nx2Hitch::NowNs());
+    }
     if (lands_in_memory) {
         // Before E's next `consumed` store (seq_cst there): a front that sees E past this entry
         // sees this mark too.
