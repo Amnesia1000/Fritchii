@@ -530,6 +530,8 @@ u32 MemoryStageLink::SetMode(u32 wanted) {
 void MemoryStageLink::WakeStage() {
     stage_word.fetch_add(1, std::memory_order_seq_cst);
     if (stage_sleeping.load(std::memory_order_seq_cst)) {
+        // fable_stage_levelpoints 14.9: GPUMem's wake latency (StageWaitFor), from here.
+        run_waits.wake_call_ns.store(LinkNowNs(), std::memory_order_relaxed);
         stage_word.notify_one();
     }
 }
@@ -1073,6 +1075,10 @@ void MemoryStageLink::BackEntry(u64 position, const BackLimits& limits) {
             return;
         }
         back_run_seen_ns = LinkNowNs();
+        // 14.9's run wait split: GPUMem reads these after its run wait (the back's later
+        // `consumed` store orders them).
+        run_waits.reached_ns.store(back_run_seen_ns, std::memory_order_relaxed);
+        run_waits.reached_from.store(limits.lent_from, std::memory_order_release);
         back_drew_in_run.store(nullptr, std::memory_order_relaxed);
         back_state_in_run.store(nullptr, std::memory_order_relaxed);
         if (std::exchange(lend_flags_deferred, false)) {
@@ -1361,6 +1367,8 @@ bool MemoryStageLink::StageWaitFor(std::stop_token& stop, StageWait reason, u64 
         }
         // The back's take wakes only these two waits (NoteRingFreed).
         stage_ring_wait.store(ring_wait, std::memory_order_seq_cst);
+        // Before stage_sleeping: a wake call that sees this sleep stamps after it (14.9).
+        run_waits.wake_call_ns.store(0, std::memory_order_relaxed);
         stage_sleeping.store(true, std::memory_order_seq_cst);
         const u32 word = stage_word.load(std::memory_order_seq_cst);
         if (!reached() && calls.load(std::memory_order_seq_cst) == calls_seen &&
@@ -1370,7 +1378,16 @@ bool MemoryStageLink::StageWaitFor(std::stop_token& stop, StageWait reason, u64 
             if (reason == StageWait::Input) {
                 LinkBump(counters.stage_input_sleeps);
             }
-            LinkBump(run_waits.sleeps[static_cast<size_t>(reason)]);
+            const size_t r = static_cast<size_t>(reason);
+            LinkBump(run_waits.sleeps[r]);
+            if (const u64 called = run_waits.wake_call_ns.exchange(0, std::memory_order_relaxed);
+                called != 0) {
+                const u64 now = LinkNowNs();
+                if (now > called) {
+                    LinkBump(run_waits.woken[r]);
+                    LinkBump(run_waits.wake_ns[r], now - called);
+                }
+            }
         }
         stage_sleeping.store(false, std::memory_order_relaxed);
         if (ring_wait) {
@@ -2136,6 +2153,9 @@ void MemoryStageLink::RingLoop(std::stop_token& stop, u64 start) {
             u64 until = position + result.size;
             u64 run_entries = 1;
             u64 run_launches = result.launches;
+            // 14.9's counters, GPU profile on: the run's first hard kind, the run wait's split.
+            const bool run_counters = Nx2Profile::Enabled();
+            const u64 run_kind = run_counters ? MemStageShadow::StageEntryKey() : 0;
             close_batch();
             Lend(position, until);
             const u64 run_start = LinkNowNs();
@@ -2207,8 +2227,12 @@ void MemoryStageLink::RingLoop(std::stop_token& stop, u64 start) {
                 }
                 span.Set(0, {"entries", run_entries});
                 LinkBump(counters.run_entries, run_entries);
+                const u64 run_wait_from = run_counters ? LinkNowNs() : 0;
                 if (!StageWaitFor(stop, StageWait::Run, until, &run_back_ns)) {
                     break;
+                }
+                if (run_counters) {
+                    NoteRunWaitSplit(position, run_wait_from, run_back_ns);
                 }
             }
             {
@@ -2220,6 +2244,9 @@ void MemoryStageLink::RingLoop(std::stop_token& stop, u64 start) {
                 LinkBump(pass_stats.split_ns[bucket], run_time);
                 LinkBump(pass_stats.split_back_ns[bucket], run_back_ns);
                 LinkBump(pass_stats.split_front_ns[bucket], run_front_ns);
+                if (run_counters) {
+                    NoteRunKind(run_kind, run_time, run_back_ns, run_front_ns);
+                }
             }
             // FRITCHII_DELAY_RUN_US (live, 0 = off; P0's delay test): GPUMem spins right after
             // the run's end, before the return, so the back stays parked that much longer. Off:
@@ -2347,6 +2374,71 @@ void MemoryStageLink::LogRunShape(double seconds) {
              "launches a run: {}",
              seconds, channels.empty() ? std::string{"none"} : channels, by_entries,
              by_launches);
+}
+
+void MemoryStageLink::NoteRunWaitSplit(u64 run_from, u64 wait_from, u64 wait_ns) noexcept {
+    // GPUMem, after a run's wait for the back (fable_stage_levelpoints 14.9): the part before the
+    // back reached the run's first entry is its backlog (ring B's packets and entries before the
+    // run), the rest the run itself. A back that reached it before the wait began: all the run.
+    if (run_waits.reached_from.load(std::memory_order_acquire) != run_from) {
+        LinkBump(run_waits.split_other);
+        return;
+    }
+    const u64 reached = run_waits.reached_ns.load(std::memory_order_relaxed);
+    const u64 reach = reached > wait_from ? (std::min)(reached - wait_from, wait_ns) : 0;
+    LinkBump(run_waits.split_runs);
+    LinkBump(run_waits.reach_ns, reach);
+    LinkBump(run_waits.run_ns, wait_ns - reach);
+}
+
+void MemoryStageLink::NoteRunKind(u64 key, u64 ns, u64 back_ns, u64 front_ns) {
+    std::scoped_lock lock{run_kinds_mutex};
+    RunKind& kind = run_kinds[key];
+    ++kind.runs;
+    kind.ns += ns;
+    kind.back_ns += back_ns;
+    kind.front_ns += front_ns;
+}
+
+void MemoryStageLink::LogRunWaits(double seconds) {
+    // fable_stage_levelpoints 14.9, GPU profile on: "Memory stage run waits".
+    const auto take = [](std::atomic<u64>& value) {
+        return value.exchange(0, std::memory_order_relaxed);
+    };
+    const auto rate = [seconds](u64 value) { return static_cast<double>(value) / seconds; };
+    const auto ms = [seconds](u64 ns) { return static_cast<double>(ns) / 1e6 / seconds; };
+    const auto us_each = [](u64 ns, u64 count) {
+        return count != 0 ? static_cast<double>(ns) / 1e3 / static_cast<double>(count) : 0.0;
+    };
+    const u64 split_runs = take(run_waits.split_runs);
+    const u64 reach_ns = take(run_waits.reach_ns);
+    const u64 run_ns = take(run_waits.run_ns);
+    const u64 split_other = take(run_waits.split_other);
+    std::unordered_map<u64, RunKind> kinds;
+    {
+        std::scoped_lock lock{run_kinds_mutex};
+        kinds.swap(run_kinds);
+    }
+    std::vector<std::pair<u64, RunKind>> list(kinds.begin(), kinds.end());
+    std::sort(list.begin(), list.end(),
+              [](const auto& a, const auto& b) { return a.second.runs > b.second.runs; });
+    std::string kinds_text;
+    for (size_t i = 0; i < list.size() && i < 12; ++i) {
+        const RunKind& kind = list[i].second;
+        kinds_text += fmt::format(
+            "{}{} {:.0f}/s: {:.1f}/{:.1f}/{:.1f}", i == 0 ? "" : "; ",
+            MemStageShadow::StageKindName(list[i].first), rate(kind.runs), ms(kind.back_ns),
+            ms(kind.front_ns), ms(kind.ns - (std::min)(kind.ns, kind.back_ns + kind.front_ns)));
+    }
+    LOG_INFO(HW_GPU,
+             "Memory stage run waits {:.0f} s: GPUMem's wait for the back at a run's end, {:.0f} "
+             "runs/s: until the back reached the run's first entry {:.1f} ms/s ({:.2f} us a run), "
+             "the run {:.1f} ms/s ({:.2f} us a run); not split (the back's mark was another "
+             "run's) {:.0f}/s | lend to return by the run's first hard kind (top 12, runs/s: "
+             "back/front/following ms/s): {}",
+             seconds, rate(split_runs), ms(reach_ns), us_each(reach_ns, split_runs), ms(run_ns),
+             us_each(run_ns, split_runs), rate(split_other),
+             kinds_text.empty() ? std::string{"none"} : kinds_text);
 }
 
 void MemoryStageLink::LogPasses(double seconds) {
@@ -2598,16 +2690,23 @@ void MemoryStageLink::LogStats() {
     const u64 call_ns = current.call_ns - reported.call_ns;
     // GPUMem's sleeps in StageWaitFor by reason (fable_stage_levelpoints 14.4 row 4).
     static_assert(STAGE_WAIT_NAMES.size() == static_cast<size_t>(StageWait::Count));
+    // 14.9: of them, woken by a wake call that found GPUMem asleep, and the time from that call
+    // to GPUMem running.
     std::string sleeps_text;
     for (size_t i = 0; i < run_waits.sleeps.size(); ++i) {
-        sleeps_text += fmt::format("{}{} {:.0f}", i == 0 ? "" : ", ", STAGE_WAIT_NAMES[i],
-                                   rate(run_waits.sleeps[i].exchange(0, std::memory_order_relaxed)));
+        const u64 sleeps = run_waits.sleeps[i].exchange(0, std::memory_order_relaxed);
+        const u64 woken = run_waits.woken[i].exchange(0, std::memory_order_relaxed);
+        const u64 wake_ns = run_waits.wake_ns[i].exchange(0, std::memory_order_relaxed);
+        sleeps_text += fmt::format("{}{} {:.0f} (woken {:.0f}, {:.1f} us)", i == 0 ? "" : ", ",
+                                   STAGE_WAIT_NAMES[i], rate(sleeps), rate(woken),
+                                   per(wake_ns, woken));
     }
     LOG_INFO(HW_GPU,
              "Memory stage link (FRITCHII_MEMSTAGE_THREAD={}) {:.0f} s: hand-offs {:.0f}/s ({}); "
              "the back waited {:.1f} ms/s ({:.2f} us a hand-off, slept {:.0f}/s), GPUMem ran "
              "{:.1f} ms/s and slept {:.0f}/s ({:.0f}/s waiting for the front; in its waits by "
-             "reason, FRITCHII_MEMSTAGE_RUN_SPIN_US={}: {}); served syncs "
+             "reason, FRITCHII_MEMSTAGE_RUN_SPIN_US={}, a second (woken by a wake call a second, "
+             "us from that call to running): {}); served syncs "
              "{:.0f}/s ({:.2f} ms/s on the back); must be 0: {}{}",
              mode, seconds, rate(total_calls), calls_text, ms(call_ns), per(call_ns, total_calls),
              rate(current.back_sleeps - reported.back_sleeps),
@@ -2753,6 +2852,7 @@ void MemoryStageLink::LogStats() {
         }
         if (Nx2Profile::Enabled()) {
             LogRunShape(seconds);
+            LogRunWaits(seconds);
         }
         LogPasses(seconds);
         // Step 7's window (spec 8.3: the stage's lead; 6.4's counters).

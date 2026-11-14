@@ -7,8 +7,10 @@
 #include <atomic>
 #include <exception>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -1089,8 +1091,36 @@ private:
     struct alignas(64) RunWaitStats {
         // GPUMem's.
         std::array<std::atomic<u64>, static_cast<size_t>(StageWait::Count)> sleeps{};
+        /// Of the sleeps, those ended after a wake call that found GPUMem asleep, and the time
+        /// from that call to GPUMem running again (the wake latency).
+        std::array<std::atomic<u64>, static_cast<size_t>(StageWait::Count)> woken{};
+        std::array<std::atomic<u64>, static_cast<size_t>(StageWait::Count)> wake_ns{};
+        /// GPU profile on: the run's wait for the back (StageWait::Run), split where the back
+        /// reached the run's first entry: before it (the back's backlog) and after (the run).
+        std::atomic<u64> split_runs{};
+        std::atomic<u64> reach_ns{};
+        std::atomic<u64> run_ns{};
+        std::atomic<u64> split_other{}; ///< not split: the back's mark was another run's
+        // The back's: where and when it reached a run's first entry (BackEntry).
+        alignas(64) std::atomic<u64> reached_from{~u64{0}};
+        std::atomic<u64> reached_ns{};
+        // The waker's (the back or the front): when a wake call found GPUMem asleep.
+        alignas(64) std::atomic<u64> wake_call_ns{};
     };
     RunWaitStats run_waits;
+    /// GPUMem, GPU profile on: lend to return by the run's first hard kind (MemStageShadow's
+    /// StageEntryKey). Under its lock (one take a run; the line swaps the map out).
+    struct RunKind {
+        u64 runs{};
+        u64 ns{};
+        u64 back_ns{};
+        u64 front_ns{};
+    };
+    std::mutex run_kinds_mutex;
+    std::unordered_map<u64, RunKind> run_kinds;
+    void NoteRunWaitSplit(u64 run_from, u64 wait_from, u64 wait_ns) noexcept;
+    void NoteRunKind(u64 key, u64 ns, u64 back_ns, u64 front_ns);
+    void LogRunWaits(double seconds);
     /// fable_stage_levelpoints 5.2 (P0) and 6.6 (P1): the "Memory stage passes" line's counts,
     /// taken and reset at each line (a lost count is fine). Grouped by the thread that bumps them.
     struct alignas(64) PassStats {

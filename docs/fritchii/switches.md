@@ -2795,6 +2795,17 @@ and EDEN_NX2_GPU_PROFILE=2. Nothing is counted without the GPU profile.
   0x107, as the compute front notes dispatch writers), and GPUMem's run time in ms/s (from the
   lend to the return). Then runs a second and ms/s by entries a run (1, 2-7, 8-63, 64-511, 512+)
   and by compute launches a run (0, 1, 2-7, ...): the ms/s in compute lists against small runs.
+- "Memory stage run waits n s" (THREAD 2 with EDEN_NX2_GPU_PROFILE, right after it;
+  work\fable_stage_levelpoints.md 14.9): GPUMem's wait for the back at a run's end, split where
+  the back reached the run's first entry (BackEntry's mark): the part before is the back's
+  backlog (ring B and the entries before the run), the part after the run itself, ms/s and us a
+  run (a back that was there before the wait began: all of it is the run; "not split" counts
+  runs whose mark was another run's, should be about 0). Then GPUMem's lend to return by the
+  run's first hard kind (the 5c line's key, top 12): runs a second, back/front/following ms/s,
+  as the passes line's buckets by compute launches. Nothing is counted without the profile.
+- On the link line (always): GPUMem's sleeps in its waits by reason, each with how many a wake
+  call ended (one that found GPUMem asleep: the back's take, its position, the front's publish)
+  and the time from that call to GPUMem running, in us (the wake latency, 14.4 row 4's size).
 - Fine zones (GPU profile 2): "inline upload" (AccelerateInlineToMemoryImpl, inside "method"),
   "dispatch fill" (MemStage::FillDispatchHere, on whichever thread fills) and "qmd signal" (the
   QMD scheduler's signal with its QMD reads and releases; the dispatches it runs stay

@@ -3226,6 +3226,14 @@ u64 StageDrawSeq(u64 back_seq) {
     return std::exchange(S().ring_seq, back_seq);
 }
 
+u64 StageEntryKey() {
+    return S().entry_key;
+}
+
+std::string StageKindName(u64 key) {
+    return LevelName(key);
+}
+
 u64 BackStateHash(const Maxwell3D& maxwell3d) {
     return StateHash(maxwell3d, &maxwell3d);
 }
