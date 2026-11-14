@@ -3435,7 +3435,8 @@ private:
             dirty.flags[table[method]] = true;
         }
         // One follower, step 2+: the word goes in the next packet's delta (R's view).
-        if (VideoCommon::OneFollower::g_track_writes.load(std::memory_order_relaxed)) [[unlikely]] {
+        if (VideoCommon::OneFollower::g_track_writes_always ||
+            VideoCommon::OneFollower::g_track_writes.load(std::memory_order_relaxed)) [[unlikely]] {
             VideoCommon::OneFollower::NoteRegWrite(method);
         }
     }

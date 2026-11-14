@@ -15,6 +15,10 @@ namespace VideoCommon::OneFollower {
 /// Maxwell3D's register write paths test this before NoteRegWrite: set while step 2 or more is on
 /// (FRITCHII_ONEF_VIEW). Off: one relaxed load and a branch per register write.
 inline std::atomic<bool> g_track_writes{};
+/// FRITCHII_ONEF_LEAN: the register writes are tracked from boot (set before E starts, never
+/// changed), so the hooks test this plain bool first (fable_b 14.4 cut 2: an atomic load at
+/// each of 2.6 million writes a second).
+inline bool g_track_writes_always{};
 
 /// FRITCHII_ONEF_E_PIPELINE=1 (boot, with FRITCHII_ONEF=1; fable_b_one_follower 10.2 rule 3): E
 /// owns the pipeline lookup. The pipeline cache always reads E's engine (R's view never replaces

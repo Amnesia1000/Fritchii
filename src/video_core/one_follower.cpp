@@ -953,6 +953,9 @@ void ReadSwitches() {
     g.read = true;
     using namespace VideoCore::Nx2Debug;
     g.lean = SwitchValue(g_onef_lean, "FRITCHII_ONEF_LEAN") == 1;
+    // Before E starts (ReadSwitches runs ahead of the back thread): LEAN is always at step 2 or
+    // more once it runs, and tracking from boot only marks words the first seed then covers.
+    g_track_writes_always = g.lean;
     g.on = g.lean || SwitchValue(g_onef, "FRITCHII_ONEF") == 1;
     g.pin = SwitchValue(g_onef_pin, "FRITCHII_ONEF_PIN", 1) != 0;
     if (g.lean) {
