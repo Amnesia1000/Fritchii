@@ -949,11 +949,12 @@ void TextureCache<P>::TickFrame() {
     unmap_stats.held_byte_frames += unmapped_live_bytes;
     unmap_stats.held_peak = (std::max)(unmap_stats.held_peak, unmapped_live_bytes);
     if (frame_tick % 600 == 0) {
-        if (log_tc) {
+        if (log_tc || SweepUnmappedMode() != 0) {
             LogUnmapStats();
         }
         unmap_stats = {};
     }
+    SweepUnmapped();
     SweepColdImages();
     // An image that could not be made at all: the driver is out of memory whatever the counts
     // say, so collect as at the critical threshold.
@@ -2633,9 +2634,12 @@ void TextureCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t siz
 }
 
 template <class P>
-void TextureCache<P>::NoteUnmapped(ImageId, Image& image) {
+void TextureCache<P>::NoteUnmapped(ImageId image_id, Image& image) {
     image.unmapped_tick = frame_tick + 1;
     image.unmapped_bytes = ImageMemoryBytes(image);
+    image.unmapped_index = static_cast<u32>(unmapped_images.size());
+    image.unmapped_verify = 0;
+    unmapped_images.push_back(image_id);
     unmapped_live_bytes += image.unmapped_bytes;
     ++unmapped_live_images;
     ++unmap_stats.flagged;
@@ -2667,14 +2671,129 @@ void TextureCache<P>::LogUnmapStats() {
              at(s.died, DeleteReason::Unmap), at(s.died_unused, DeleteReason::Unmap),
              others(s.died), others(s.died_unused), unmapped_live_images,
              unmapped_live_bytes >> 20, (s.held_byte_frames / 600) >> 20, s.held_peak >> 20);
+    const int mode = SweepUnmappedMode();
+    if (mode == 0) {
+        return;
+    }
+    LOG_INFO(HW_GPU,
+             "Texture cache last 600 frames: unmapped sweep (EDEN_NX2_SWEEP_UNMAPPED={}) deleted "
+             "{} ({} MiB), {} looked at; would delete {} ({} MiB), of those later found again {}, "
+             "uploaded into {} ({} GPU-written before the unmap), presented {}, written whole {}, "
+             "deleted unused by another path {}",
+             mode, s.swept, s.swept_bytes >> 20, s.sweep_scanned, s.would_sweep,
+             s.would_sweep_bytes >> 20, s.would_refound, s.would_reuploaded,
+             s.would_reuploaded_gpu, s.would_presented, s.would_overwritten, s.would_died_unused);
 }
 
 template <class P>
-void TextureCache<P>::ForgetUnmapped(ImageId, ImageBase& image) {
+void TextureCache<P>::ForgetUnmapped(ImageId image_id, ImageBase& image) {
     unmapped_live_bytes -= (std::min)(unmapped_live_bytes, image.unmapped_bytes);
     unmapped_live_images -= unmapped_live_images != 0 ? 1 : 0;
+    const u32 index = image.unmapped_index;
+    if (index < unmapped_images.size() && unmapped_images[index] == image_id) {
+        const ImageId last = unmapped_images.back();
+        unmapped_images[index] = last;
+        slot_images[last].unmapped_index = index;
+        unmapped_images.pop_back();
+    }
     image.unmapped_tick = 0;
     image.unmapped_bytes = 0;
+    image.unmapped_index = ~0U;
+    image.unmapped_verify = 0;
+}
+
+template <class P>
+void TextureCache<P>::NotePresented(ImageId image_id) {
+    if (std::ranges::find(presented_images, image_id) == presented_images.end()) {
+        presented_images[presented_next] = image_id;
+        presented_next = (presented_next + 1) % static_cast<u32>(presented_images.size());
+    }
+    ImageBase& image = slot_images[image_id];
+    if (image.unmapped_verify == 1) {
+        ++unmap_stats.would_presented;
+        image.unmapped_verify = 2;
+    }
+}
+
+template <class P>
+void TextureCache<P>::SweepUnmapped() {
+    // UnmapGPUMemory flags the images in an unmapped GPU range Remapped and CpuModified. Lookups
+    // skip them (FindImage unless EXP76 & 1 keeps one at the same address and shape, FindDMAImage,
+    // joins, which delete them without a download when a new image covers their memory), so most
+    // of them sit until the collector's age limit (50 frames, 10 near the budget). Ocarina of
+    // Time at 3440x1440 unmaps and maps its render targets again every frame or two while the
+    // camera turns in the Castle Town guard house; the dead sets overflowed 12 GB cards.
+    //
+    // Deleted here, 2 frames after their last use and without a download, only when nothing can
+    // still need their contents, so the result is what the collector does later:
+    // - CpuModified still set: nothing uploaded into it or wrote it whole since the unmap (a
+    //   cached descriptor or a render target binding can still reach it; that upload clears the
+    //   flag). Such an image is never downloaded (IsSafeGpuCopy), by the collector or a guest
+    //   read, and its next use would upload guest memory again, as a new image does. The GPU
+    //   data from before the unmap is already given up when the unmap set the flag.
+    // - No aliases: SynchronizeAliases copies from an alias without preparing it.
+    // - Not among the last images shown: presenting reads an image without preparing it.
+    // - Not a bound render target, no download queued, no decode in flight, not sparse or
+    //   unbacked (their own handling), and EXP121 has not taken it.
+    // MarkStale and untracking as the collector does for an image it does not download.
+    const int mode = SweepUnmappedMode();
+    if (mode == 0 || unmapped_images.empty()) {
+        return;
+    }
+    const DeleteReasonScope delete_reason_scope{*this, DeleteReason::UnmapSweep};
+    constexpr u64 IdleFrames = 2;
+    constexpr ImageFlagBits excluded =
+        ImageFlagBits::Sparse | ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
+        ImageFlagBits::UnwrittenSparse | ImageFlagBits::Unbacked | ImageFlagBits::IsDecoding |
+        ImageFlagBits::CollectPending;
+    const auto queued = [](ImageId image_id, const auto& downloads) {
+        return std::ranges::any_of(downloads, [image_id](const auto& download) {
+            return download.is_swizzle && download.object_id == image_id;
+        });
+    };
+    const auto bound = [this](const ImageBase& image) {
+        return std::ranges::any_of(image.image_view_ids, [this](ImageViewId view) {
+            return render_targets.depth_buffer_id == view ||
+                   std::ranges::find(render_targets.color_buffer_ids, view) !=
+                       render_targets.color_buffer_ids.end();
+        });
+    };
+    const auto download_queued = [&](ImageId image_id) {
+        return queued(image_id, uncommitted_downloads) ||
+               std::ranges::any_of(committed_downloads, [&](const auto& downloads) {
+                   return queued(image_id, downloads);
+               });
+    };
+    for (size_t index = 0; index < unmapped_images.size();) {
+        ++unmap_stats.sweep_scanned;
+        const ImageId image_id = unmapped_images[index];
+        Image& image = slot_images[image_id];
+        if (False(image.flags & ImageFlagBits::Remapped) ||
+            False(image.flags & ImageFlagBits::Registered) ||
+            False(image.flags & ImageFlagBits::CpuModified) || True(image.flags & excluded) ||
+            !image.aliased_images.empty() || image.unmapped_verify != 0 ||
+            frame_tick - lru_cache.Tick(image.lru_index) < IdleFrames || bound(image) ||
+            std::ranges::find(presented_images, image_id) != presented_images.end() ||
+            download_queued(image_id)) {
+            ++index;
+            continue;
+        }
+        if (mode == 2) {
+            image.unmapped_verify = 1;
+            ++unmap_stats.would_sweep;
+            unmap_stats.would_sweep_bytes += image.unmapped_bytes;
+            ++index;
+            continue;
+        }
+        ++unmap_stats.swept;
+        unmap_stats.swept_bytes += image.unmapped_bytes;
+        MarkStale(image); // before UntrackImage (see MarkStale)
+        if (True(image.flags & ImageFlagBits::Tracked)) {
+            UntrackImage(image, image_id);
+        }
+        UnregisterImage(image_id);
+        DeleteImage(image_id); // takes it out of the list: the last entry moves to this index
+    }
 }
 
 template <class P>
@@ -3021,6 +3140,7 @@ std::pair<typename P::ImageView*, bool> TextureCache<P>::TryFindFramebufferImage
             info.z_source = static_cast<u8>(SwizzleSource::B);
             info.w_source = static_cast<u8>(SwizzleSource::OneFloat);
         }
+        NotePresented(image_id);
         return std::make_pair(&slot_image_views[FindOrEmplaceImageView(image_id, info)],
                               slot_images[image_id].IsRescaled());
     };
@@ -3348,6 +3468,11 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
 
     if (image.unmapped_tick != 0) {
         ++unmap_stats.reuploaded; // still Remapped: reached through a cached descriptor or binding
+        if (image.unmapped_verify == 1) {
+            ++unmap_stats.would_reuploaded;
+            unmap_stats.would_reuploaded_gpu += True(image.flags & ImageFlagBits::GpuModified);
+            image.unmapped_verify = 2;
+        }
     }
     image.flags &= ~ImageFlagBits::CpuModified;
     // EXP76 & 2: the hash of the last whole upload, cleared here so any other way this refresh
@@ -3965,6 +4090,7 @@ ImageId TextureCache<P>::FindImage(const ImageInfo& info, GPUVAddr gpu_addr,
             ++nx2_kept_after_remap;
             if (existing_image.unmapped_tick != 0) {
                 ++unmap_stats.refound;
+                unmap_stats.would_refound += existing_image.unmapped_verify == 1 ? 1 : 0;
                 ForgetUnmapped(existing_image_id, existing_image);
             }
             image_id = existing_image_id;
@@ -4523,9 +4649,9 @@ void TextureCache<P>::NoteNewSampledImage(ImageId image_id, GPUVAddr gpu_addr) {
              "New sampled images (EDEN_NX2_IMAGE_HASH_LOG) last 10 s: {} made, {} with bytes made "
              "before ({} KiB); {} different so far; most made:{}",
              made, made_again, bytes_again >> 10, seen.size(), text.empty() ? " none twice" : text);
-    // Reason order: other, garbage collect, cold sweep, unmap, join, slot retire.
+    // Reason order: other, garbage collect, cold sweep, unmap, join, slot retire, unmap sweep.
     static constexpr std::array<const char*, static_cast<size_t>(DeleteReason::Count)> names{
-        "other", "garbage collect", "cold sweep", "unmap", "join", "slot retire"};
+        "other", "garbage collect", "cold sweep", "unmap", "join", "slot retire", "unmap sweep"};
     std::string deletes;
     std::string remade;
     for (size_t r = 0; r < names.size(); ++r) {
@@ -6230,6 +6356,12 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
                 unmap_stats.collector_unused_frames += frame_tick + 1 - image.unmapped_tick;
                 unmap_stats.collector_unused_bytes += image.unmapped_bytes;
             }
+        }
+        if (image.unmapped_verify == 1) {
+            // EDEN_NX2_SWEEP_UNMAPPED=2: nothing uploaded into it since it was picked. Without
+            // CpuModified, a target written whole took it (the invalidate path): nothing read.
+            ++(True(image.flags & ImageFlagBits::CpuModified) ? unmap_stats.would_died_unused
+                                                               : unmap_stats.would_overwritten);
         }
         ForgetUnmapped(image_id, image);
     }

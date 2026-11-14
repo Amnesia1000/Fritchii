@@ -750,7 +750,16 @@ private:
         }();
         return enabled;
     }
-    enum class DeleteReason : u8 { Other, GarbageCollect, ColdSweep, Unmap, Join, SlotRetire, Count };
+    enum class DeleteReason : u8 {
+        Other,
+        GarbageCollect,
+        ColdSweep,
+        Unmap,
+        Join,
+        SlotRetire,
+        UnmapSweep,
+        Count
+    };
     DeleteReason delete_reason = DeleteReason::Other;
     struct DeleteReasonScope {
         DeleteReasonScope(TextureCache& cache_, DeleteReason reason)
@@ -793,15 +802,46 @@ private:
         u64 collector_unused_bytes = 0;  ///< Their device memory, summed
         u64 held_byte_frames = 0;        ///< Device memory of flagged images, summed per frame
         u64 held_peak = 0;               ///< The most at one frame end
+        /// EDEN_NX2_SWEEP_UNMAPPED: entries looked at, images deleted and their memory (1); or
+        /// would have deleted, and what happened to those afterwards (2).
+        u64 sweep_scanned = 0;
+        u64 swept = 0;
+        u64 swept_bytes = 0;
+        u64 would_sweep = 0;
+        u64 would_sweep_bytes = 0;
+        u64 would_refound = 0;     ///< Found again at the same address (EXP76 & 1)
+        u64 would_reuploaded = 0;  ///< Uploaded into (a cached descriptor or binding)
+        u64 would_reuploaded_gpu = 0; ///< ... with GPU-written contents from before the unmap
+        u64 would_presented = 0;   ///< Shown (TryFindFramebufferImageView)
+        u64 would_overwritten = 0; ///< Used again as a target written whole (nothing read)
+        u64 would_died_unused = 0; ///< Deleted later by another path, unused
     };
     UnmapStats unmap_stats;
     u64 unmapped_live_bytes = 0;  ///< Device memory of the images flagged now
     u64 unmapped_live_images = 0; ///< How many
+    /// The images flagged now (ImageBase::unmapped_index is the place of each).
+    std::vector<ImageId> unmapped_images;
+    /// The last images shown (TryFindFramebufferImageView): the sweep leaves them alone, since
+    /// presenting reads an image without preparing it.
+    std::array<ImageId, 8> presented_images{};
+    u32 presented_next = 0;
     /// UnmapGPUMemory flagged it Remapped: counted and remembered (unmapped_tick).
     void NoteUnmapped(ImageId image_id, Image& image);
     /// Remapped cleared (found again) or the image deleted: no longer counted as flagged.
     void ForgetUnmapped(ImageId image_id, ImageBase& image);
     void LogUnmapStats();
+    void NotePresented(ImageId image_id);
+    /// EDEN_NX2_SWEEP_UNMAPPED (read at startup): 0 = off, 1 = delete flagged images untouched
+    /// since the unmap after 2 frames, 2 = only count what 1 would delete and what used it later.
+    static int SweepUnmappedMode() {
+        static const int mode = [] {
+            const char* const value = std::getenv("EDEN_NX2_SWEEP_UNMAPPED");
+            return value == nullptr ? 0 : value[0] == '1' ? 1 : value[0] == '2' ? 2 : 0;
+        }();
+        return mode;
+    }
+    /// Deletes (or with 2 counts) flagged images nothing could still read (see the definition).
+    void SweepUnmapped();
     /// EXP77: shapes of GPU-written images the cold sweep deleted, by address (at most 65,536),
     /// and the shapes guarded because a texture header asked for that address again.
     ::Common::unordered_map<GPUVAddr, u64> nx2_swept_shapes;

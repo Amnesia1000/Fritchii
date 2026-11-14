@@ -162,6 +162,11 @@ struct ImageBase {
     /// memory then.
     u64 unmapped_tick = 0;
     u64 unmapped_bytes = 0;
+    /// Its place in the cache's list of such images (~0 = not in it), and with
+    /// EDEN_NX2_SWEEP_UNMAPPED=2: 1 once the sweep would have deleted it, 2 once a use after that
+    /// was counted.
+    u32 unmapped_index = ~0U;
+    u8 unmapped_verify = 0;
 
     /// Asynchronous shaders' skip rule (EDEN_NX2_ASYNC_DISCARD=2, ClassifyClearedTarget): the
     /// render frames of the image's last two full clears that had a write between them (~0 =
