@@ -451,16 +451,28 @@ void MemoryManager::Write(GPUVAddr addr, T data) {
     }
     // EXP92 (uniform keeps, tier 2): the word's device pages, after it landed. One relaxed load
     // until a keep was ever made.
+    // FRITCHII_BANK_FLAGGED: and with the bank marks on the native bank check's page mark
+    // (semaphore and report words, the 3D engine's stamps, compute releases), after the word
+    // landed.
     const auto note_keeps = [this, addr] {
-        if (Common::UniformKeepPages::AnyKept()) [[unlikely]] {
-            if (const auto address = GpuToCpuAddress(addr)) {
-                Common::UniformKeepPages::Note(*address, sizeof(T));
-            }
+        const bool marks = Common::BankMarks();
+        const bool kept = Common::UniformKeepPages::AnyKept();
+        const bool ring = Common::WriteRing::g_on.load(std::memory_order_relaxed);
+        if (!marks && !kept && !ring) [[likely]] {
+            return;
         }
-        if (Common::WriteRing::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
-            if (const auto address = GpuToCpuAddress(addr)) {
-                Common::WriteRing::Record(*address, sizeof(T), "GPU Write");
-            }
+        const auto address = GpuToCpuAddress(addr);
+        if (!address) {
+            return;
+        }
+        if (marks) {
+            Common::g_buffer_write_pages.Mark(*address, sizeof(T));
+        }
+        if (kept) {
+            Common::UniformKeepPages::Note(*address, sizeof(T));
+        }
+        if (ring) {
+            Common::WriteRing::Record(*address, sizeof(T), "GPU Write");
         }
     };
     // A write: its pointer getter is hidden from the back read audit.
@@ -834,8 +846,9 @@ void MemoryManager::WriteBlockUnsafe(GPUVAddr gpu_dest_addr, const void* src_buf
 }
 
 void MemoryManager::NoteHostStore(GPUVAddr gpu_addr, std::size_t size) {
+    // Also with the bank marks on: WriteRing::Note marks the native bank check's write flag.
     if ((!Common::UniformKeepPages::AnyKept() &&
-         !Common::WriteRing::g_on.load(std::memory_order_relaxed)) ||
+         !Common::WriteRing::g_on.load(std::memory_order_relaxed) && !Common::BankMarks()) ||
         size == 0) [[likely]] {
         return;
     }

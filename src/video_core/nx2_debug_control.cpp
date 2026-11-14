@@ -409,6 +409,12 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_BANK_CENSUS") {
         return &g_bank_census;
     }
+    if (name == "FRITCHII_BANK_FLAGGED") {
+        return &g_bank_flagged;
+    }
+    if (name == "FRITCHII_BANK_FLAGGED_SLOTS") {
+        return &g_bank_flagged_slots;
+    }
     if (name == "FRITCHII_VERTEX_INPUT_COMPACT") {
         return &g_vertex_input_compact;
     }

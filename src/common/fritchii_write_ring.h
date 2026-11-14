@@ -9,10 +9,11 @@
 #include <cstring>
 
 #include "common/common_types.h"
+#include "common/fritchii_page_flags.h"
 
 /// Who wrote game memory (FRITCHII_MEMSTAGE_READ_LOG, the memory seam's read log): every write
 /// emulator code makes to game memory, on any thread, after its bytes landed, by device address.
-/// One relaxed load per write while off. The read log and the hook list are explained in
+/// While off, one relaxed load per write (two in Note: the bank marks' gate). The read log and the hook list are explained in
 /// vk_mem_stage.cpp ("Who wrote").
 namespace Common::WriteRing {
 
@@ -67,6 +68,8 @@ inline void NameThread(const char* name) noexcept {
 }
 
 inline void Record(u64 address, u64 size, const char* via) noexcept {
+    // FRITCHII_BANK_CENSUS=2: which pages the ring heard of, for writes the ring lost to wrapping.
+    g_ring_write_pages.Mark(address, size);
     const u64 seq = g_state.next.fetch_add(1, std::memory_order_relaxed) + 1;
     Slot& slot = g_state.slots[seq & (Size - 1)];
     slot.seq.store(0, std::memory_order_relaxed);
@@ -85,7 +88,14 @@ inline void Record(u64 address, u64 size, const char* via) noexcept {
 /// After the bytes of [address, address + size) landed in game memory (device address).
 /// Writes kept out while t_quiet (counted: the read log's line says how many).
 inline std::atomic<u64> g_quiet{0};
+/// With the bank marks on (BankMarks: FRITCHII_BANK_FLAGGED or FRITCHII_BANK_CENSUS), also marks
+/// the pages for the native bank check (g_buffer_write_pages, after the bytes landed: a bind that
+/// takes the mark reads them). The census found writers that set no other flag (query
+/// completions writing reports into the game's banks).
 inline void Note(u64 address, u64 size, const char* via) noexcept {
+    if (BankMarks()) [[unlikely]] {
+        g_buffer_write_pages.Mark(address, size);
+    }
     if (g_on.load(std::memory_order_relaxed)) [[unlikely]] {
         if (t_quiet) {
             g_quiet.fetch_add(1, std::memory_order_relaxed);

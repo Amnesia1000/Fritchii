@@ -886,8 +886,28 @@ public:
         u64 skip_verified = 0;
         u64 skip_missed = 0;
         u64 skip_disagreed = 0;
+        /// FRITCHII_BANK_FLAGGED: the same counts for its slots alone, and the snapshot pages
+        /// uploads refreshed (RefreshNativeBankSnapshots), those whose bytes differed.
+        u64 flagged_binds = 0;
+        u64 flagged_skipped = 0;
+        u64 flagged_hot_left = 0;
+        u64 flagged_verified = 0;
+        u64 flagged_missed = 0;
+        u64 flagged_disagreed = 0;
+        u64 refreshed_pages = 0;
+        u64 refreshed_changed = 0;
         std::chrono::steady_clock::time_point last_log{};
     } native_bank_tracked_stats;
+    /// FRITCHII_BANK_FLAGGED: on at the last bank bind (uploads refresh the snapshots while on),
+    /// Common::g_collected_overflows as of the last snapshot drop, and how many drops so far.
+    bool native_bank_flagged_on = false;
+    u64 native_bank_flagged_overflows = 0;
+    u64 native_bank_flagged_resets = 0;
+    /// The bank marks' gate (Common::g_bank_marks) as last set, the frame it changed, and whether
+    /// the snapshots were dropped two frames after it opened (the flagged rule waits for that).
+    bool native_bank_marks_wanted = false;
+    bool native_bank_marks_ready = false;
+    u64 native_bank_marks_since = 0;
     /// EDEN_NX2_BANK_SLOT_STATS: the tracked check's counts per constant buffer index (c0..c17),
     /// logged and cleared with native_bank_tracked_stats.
     struct NativeBankSlotStats {
@@ -917,10 +937,14 @@ public:
         u64 uploaded_after_dirty = 0; ///< of those, the last compare was for a CPU-modified page
         u64 gpu_written = 0;       ///< unflagged, the page ever had a GPU write mark
         u64 ring_found = 0;        ///< unflagged, a write ring entry since the last compare (2)
-        u64 ring_wrapped = 0;      ///< unflagged, none found but the ring wrapped since (2)
-        u64 unseen = 0;            ///< unflagged with none of the above
+        u64 ring_lost = 0;         ///< unflagged, the ring's page mark set but no entry found (2)
+        u64 ring_wrapped = 0;      ///< of those, the ring wrapped since the last compare
+        /// Unflagged with no late flag, no upload since the compare and (2) no emulator write.
+        u64 unseen = 0;
         u64 unseen_first = 0;      ///< of those, the page's first compare this frame
+        u64 unseen_gpu_written = 0; ///< of those, the page ever had a GPU write mark
         std::array<u64, Tegra::Engines::Maxwell3D::Regs::MaxConstBuffers> slots{}; ///< unflagged
+        std::array<u64, Tegra::Engines::Maxwell3D::Regs::MaxConstBuffers> slots_unseen{};
         /// The newest write ring entry over the page since its last compare, by site and write
         /// function (2).
         struct Writer {
@@ -1033,11 +1057,17 @@ private:
     /// FRITCHII_BANK_CENSUS: one change the tracked check found on `page` (after the compare,
     /// before the snapshot is taken again). `unflagged`: found by no write flag (hot, frame
     /// check, verify only, skip verify); `uploaded`: the census' upload flag the compare took;
-    /// `ring_since`: the page's write ring sequence before this compare; `first_this_frame`:
-    /// the page's first compare this frame.
+    /// `ring_marked`: the write ring's page mark the compare took (2); `ring_since`: the page's
+    /// write ring sequence before this compare; `first_this_frame`: the page's first compare
+    /// this frame.
     void NoteNativeBankCensusChange(DAddr page, const NativeBankPage& snapshot, int census,
                                     NativeBankReason reason, bool unflagged, bool uploaded,
-                                    u64 ring_since, bool first_this_frame, u32 index);
+                                    bool ring_marked, u64 ring_since, bool first_this_frame,
+                                    u32 index);
+    /// FRITCHII_BANK_FLAGGED: the snapshot bytes of [device_addr, device_addr + size) set to
+    /// `bytes`, what an upload staged for the host buffer (MappedUploadMemory). Pages without a
+    /// snapshot are left alone (their first bind takes one and marks the page changed).
+    void RefreshNativeBankSnapshots(DAddr device_addr, u64 size, const u8* bytes);
     /// FRITCHII_BANK_CENSUS: the 10 s line.
     void LogNativeBankCensus(std::chrono::steady_clock::time_point now);
     /// Sets the page's recheck flag (and its region bit with the table).
