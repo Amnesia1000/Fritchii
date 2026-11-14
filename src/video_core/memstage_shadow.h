@@ -267,10 +267,14 @@ struct ProgramId {
     u64 space{};
     std::array<u64, 6> code{};
 };
-/// Fills `id.space` and `id.code` from `id.words` (ProgramWords' layout) through `memory`.
-/// Translated once per program register change: kept per thread while the words, the address
-/// space and its map serial stay the same.
-void ResolveProgramCode(const Tegra::MemoryManager& memory, ProgramId& id);
+/// Fills `id.space` and `id.code` from `id.words` (ProgramWords' layout) through `memory`,
+/// as ShaderCache::RefreshStages finds the code: with the native macro engine (`native`) a
+/// slot's address is its reserved words, else program region + offset; the pixel slot is off
+/// without `rasterize`; the geometry slot is off with `native` and `mesh`. Translated once per
+/// change: kept per thread while the words, those three, the address space and its map serial
+/// stay the same.
+void ResolveProgramCode(const Tegra::MemoryManager& memory, bool native, bool rasterize,
+                        bool mesh, ProgramId& id);
 /// StageProgramWords' twin for the code: through the copy's back engine's address space.
 void StageProgramCode(const MemStageShadowEngine& copy, ProgramId& id);
 void BackProgramId(const Tegra::Engines::Maxwell3D& maxwell3d, ProgramId& out);

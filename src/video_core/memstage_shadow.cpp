@@ -4051,20 +4051,25 @@ u64 BackStateHash(const Maxwell3D& maxwell3d) {
     return StateHash(maxwell3d, &maxwell3d);
 }
 
-void ResolveProgramCode(const Tegra::MemoryManager& memory, ProgramId& id) {
+void ResolveProgramCode(const Tegra::MemoryManager& memory, bool native, bool rasterize,
+                        bool mesh, ProgramId& id) {
     struct Memo {
         bool valid{};
         size_t memory_id{};
         u64 map_serial{};
+        u32 mode{};
         std::array<u64, ProgramWordCount> words{};
         std::array<u64, 6> code{};
     };
     thread_local Memo memo{};
     const size_t memory_id = memory.GetID();
     const u64 map_serial = memory.MapSerial();
-    id.space = u64{memory_id} + 1;
+    const u32 mode = (native ? 1U : 0U) | (rasterize ? 2U : 0U) | (mesh ? 4U : 0U);
+    // The mode too: the same words are other code with the native engine on (its addresses are
+    // the slots' reserved words) or with rasterization off (no pixel program).
+    id.space = ((u64{memory_id} + 1) << 3) | mode;
     if (memo.valid && memo.memory_id == memory_id && memo.map_serial == map_serial &&
-        memo.words == id.words) {
+        memo.mode == mode && memo.words == id.words) {
         id.code = memo.code;
         return;
     }
@@ -4075,20 +4080,28 @@ void ResolveProgramCode(const Tegra::MemoryManager& memory, ProgramId& id) {
     Regs::ProgramRegion region;
     std::memcpy(&region, id.words.data() + 48, sizeof(region));
     for (size_t index = 0; index < id.code.size(); ++index) {
-        // As Regs::IsShaderConfigEnabled: VertexB (1) is always on.
-        const bool enabled = index == 1 || pipelines[index].enable != 0;
-        id.code[index] =
-            enabled ? memory.GpuToCpuAddress(region.Address() + pipelines[index].offset).value_or(0)
-                    : 0;
+        // As ShaderCache::RefreshStages: VertexB (1) is always on; Pixel (5) is off without
+        // rasterization; Geometry (4) is a header without code with native mesh programs.
+        bool enabled = index == 1 || pipelines[index].enable != 0;
+        if ((index == 5 && !rasterize) || (index == 4 && native && mesh)) {
+            enabled = false;
+        }
+        const auto& slot = pipelines[index];
+        const GPUVAddr address =
+            native ? (static_cast<GPUVAddr>(slot.reserved[0] & 0xff) << 32) | slot.reserved[1]
+                   : region.Address() + slot.offset;
+        id.code[index] = enabled ? memory.GpuToCpuAddress(address).value_or(0) : 0;
     }
-    memo = Memo{true, memory_id, map_serial, id.words, id.code};
+    memo = Memo{true, memory_id, map_serial, mode, id.words, id.code};
 }
 
 void BackProgramId(const Maxwell3D& maxwell3d, ProgramId& out) {
     ProgramWords(maxwell3d, out.words);
     out.key = HashProgramWords(out.words);
-    // GetMemoryManager has no const form; it is only read here.
-    ResolveProgramCode(const_cast<Maxwell3D&>(maxwell3d).GetMemoryManager(), out);
+    // GetMemoryManager and GetNativeMacroEngine have no const forms; they are only read here.
+    auto& engine = const_cast<Maxwell3D&>(maxwell3d);
+    ResolveProgramCode(engine.GetMemoryManager(), engine.GetNativeMacroEngine().native_turing,
+                       maxwell3d.regs.rasterize_enable != 0, maxwell3d.regs.IsMeshEnabled(), out);
 }
 
 void StageProgramCode(const MemStageShadowEngine& copy, ProgramId& id) {
@@ -4097,7 +4110,10 @@ void StageProgramCode(const MemStageShadowEngine& copy, ProgramId& id) {
         id.code = {};
         return;
     }
-    ResolveProgramCode(copy.back->GetMemoryManager(), id);
+    // The macro mode is not a register: the back engine's (the copy follows its stream).
+    ResolveProgramCode(copy.back->GetMemoryManager(),
+                       copy.back->GetNativeMacroEngine().native_turing,
+                       copy.regs.rasterize_enable != 0, copy.regs.IsMeshEnabled(), id);
 }
 
 void StageProgramId(const MemStageShadowEngine& copy, ProgramId& out) {
