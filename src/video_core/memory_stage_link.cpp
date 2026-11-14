@@ -704,6 +704,8 @@ void MemoryStageLink::StageMain(std::stop_token stop) {
     // As the back (spec 5.8); not pinned in 6a and 6b.
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
     Common::SetCurrentThreadToPerformanceCores();
+    // FRITCHII_PIN_GPUMEM=1 (boot): its own physical core (no-op otherwise).
+    Common::PinCurrentThread(Common::PinnedRole::GpuMem);
     system->RegisterHostThread();
     // Start reset `calls` to 0 before this thread ran: a Call posted before here is seen.
     calls_seen = 0;

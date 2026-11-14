@@ -135,7 +135,10 @@ void SetCurrentThreadToPerformanceCores();
 /// Windows: one physical performance core each for the split GPU thread's halves and the guest
 /// cores kept off them, so an SMT sibling never shares the GPU threads' core. See
 /// ThreadPinning::MakePlan for when it applies; EDEN_NX2_PIN_THREADS=0 turns it off, 1 forces it.
-enum class PinnedRole : u32 { GpuFront, GpuBack, GuestCore };
+/// GpuMem (FRITCHII_PIN_GPUMEM=1, boot, default off): the memory stage's thread gets one physical
+/// core of its own, taken from the guest set (Fable B, 2026-11-14: unpinned, it shared cores and
+/// unchanged front/back work cost 9-21% more a draw with the stage on).
+enum class PinnedRole : u32 { GpuFront, GpuBack, GuestCore, GpuMem };
 /// `guest_core`: the guest core index for GuestCore. With EDEN_NX2_GUEST_PIN_EACH=1 each guest core
 /// gets one physical core of the guest set to itself (its SMT siblings) instead of the whole set.
 void PinCurrentThread(PinnedRole role, int guest_core = -1);

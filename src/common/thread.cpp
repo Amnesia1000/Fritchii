@@ -727,11 +727,26 @@ void PinCurrentThread(PinnedRole role, int guest_core) {
     // Off with EDEN_NX2_PIN_THREADS=0, forced with 1, otherwise on with enough performance cores
     // (ThreadPinning::MakePlan): the split's back did about 8% more draws a second at Lake Hylia
     // (Ryzen 7 7800X3D), its worst window 29 -> 54 fps, once no SMT sibling shared its core.
+    static u64 mem_mask = 0;
     static const ThreadPinning::Plan plan = [] {
         const auto mode = ThreadPinning::ParseMode(std::getenv("EDEN_NX2_PIN_THREADS"));
         const ThreadPinning::Topology topology = ReadPinningTopology();
-        const ThreadPinning::Plan result = ThreadPinning::MakePlan(topology, mode);
+        ThreadPinning::Plan result = ThreadPinning::MakePlan(topology, mode);
         LOG_INFO(Common, "Thread pinning: {}", ThreadPinning::Describe(result, topology, mode));
+        // FRITCHII_PIN_GPUMEM=1: the last physical core of the guest set goes to GPUMem alone.
+        const char* const pin_mem = std::getenv("FRITCHII_PIN_GPUMEM");
+        if (pin_mem != nullptr && pin_mem[0] == '1' && result.guest != 0) {
+            for (auto it = topology.cores.rbegin(); it != topology.cores.rend(); ++it) {
+                if (it->mask != 0 && (it->mask & ~result.guest) == 0 &&
+                    (result.guest & ~it->mask) != 0) {
+                    mem_mask = it->mask;
+                    result.guest &= ~it->mask;
+                    break;
+                }
+            }
+            LOG_INFO(Common, "Thread pinning: GPUMem {:#x} (FRITCHII_PIN_GPUMEM=1), guest cores now {:#x}",
+                     mem_mask, result.guest);
+        }
         return result;
     }();
     u64 mask{};
@@ -741,6 +756,9 @@ void PinCurrentThread(PinnedRole role, int guest_core) {
         break;
     case PinnedRole::GpuBack:
         mask = plan.back;
+        break;
+    case PinnedRole::GpuMem:
+        mask = mem_mask;
         break;
     case PinnedRole::GuestCore: {
         mask = plan.guest;
