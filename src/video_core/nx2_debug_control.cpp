@@ -412,6 +412,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_DELAY_FRONT_KIND") {
         return &g_delay_front_kind;
     }
+    if (name == "FRITCHII_DELAY_WORKER_US") {
+        return &g_delay_worker_us;
+    }
     if (name == "FRITCHII_MEMSTAGE_RUN_SPIN_US") {
         return &g_memstage_run_spin_us;
     }

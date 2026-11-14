@@ -187,6 +187,18 @@ The front's delay tests (live, default 0 = nothing changes; work\fable_stage_lev
   "FRITCHII_DELAY_FRONT_US=n x/s y ms/s KIND=k (front)".
 - Off (0): one relaxed load and a branch at each site (both sides of the waits).
 
+### FRITCHII_DELAY_WORKER_US
+
+FRITCHII_DELAY_WORKER_US=n (live, default 0 = nothing changes; work\fable_stage_levelpoints.md
+19.3 and 19.4): the Vulkan scheduler's worker busy-spins n microseconds after each chunk it ran
+(Scheduler::WorkerThread, after ExecuteAll and the command buffer reallocation, still holding
+the execution lock, so a Finish or WaitWorker waits for the spin as for the chunk). It prices
+the worker's room before work is moved into its recorded lambdas: if fps holds while the
+worker's added ms/s grows, the worker is off the frame's path and has that much room.
+- Counted in the "Front waits for the back by site" ending: "FRITCHII_DELAY_WORKER_US=n x/s y
+  ms/s (Vulkan worker, per chunk)".
+- Off (0): one relaxed load and a branch a chunk.
+
 ### FRITCHII_NULL_RENDER
 
 FRITCHII_NULL_RENDER=1 (live, default 0; test only, the picture is broken: nothing is drawn;

@@ -788,6 +788,10 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
             if (has_submit) {
                 AllocateWorkerCommandBuffer();
             }
+            // FRITCHII_DELAY_WORKER_US (live, 0 = off; fable_stage_levelpoints 19.3/19.4): n us
+            // after each chunk, inside the execution lock, as if the chunk took that much
+            // longer. Off: one relaxed load and a branch a chunk.
+            VideoCommon::GpuSplit::DelayWorkerIf();
         }
 
         {

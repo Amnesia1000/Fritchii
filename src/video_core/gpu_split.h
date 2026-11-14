@@ -922,6 +922,7 @@ public:
         Draw,       ///< Back: every 3D draw call (RasterizerVulkan::Draw/DrawIndirect, "D")
         Back,       ///< Back: FRITCHII_DELAY_BACK_US at FRITCHII_DELAY_BACK_KIND's site (DelayBack)
         Front, ///< Front: FRITCHII_DELAY_FRONT_US at FRITCHII_DELAY_FRONT_KIND's site (DelayFront)
+        Worker, ///< The Vulkan worker: FRITCHII_DELAY_WORKER_US per chunk (Scheduler::WorkerThread)
         Count,
     };
     /// FRITCHII_DELAY_FRONT_US / _KIND (live, default 0; fable_stage_levelpoints 18.3): the sites.
@@ -941,6 +942,19 @@ public:
         }
     }
     static void DelayFront(FrontDelayKind kind, bool before);
+    /// FRITCHII_DELAY_WORKER_US (live, default 0; fable_stage_levelpoints 19.3/19.4): the Vulkan
+    /// worker spins n us after each chunk it ran, inside its execution lock. Off: one relaxed
+    /// load and a branch a chunk.
+    static void DelayWorkerIf() {
+        if (VideoCore::Nx2Debug::g_delay_worker_us.load(std::memory_order_relaxed) != 0)
+            [[unlikely]] {
+            if (const int us = DelayTestUs(DelayTest::Worker); us > 0) {
+                SpinDelay(DelayTest::Worker, static_cast<u32>(us));
+            }
+        }
+    }
+    /// The switch of a delay test (its microseconds; 0 or less: off).
+    static int DelayTestUs(DelayTest test);
     /// FRITCHII_DELAY_BACK_US / _KIND (live, default 0; fable_stage_levelpoints 18.3): the sites.
     enum class BackDelayKind : u32 {
         Methods = 1,    ///< "M": once every 64 method-zone ring entries (BackLoop, after Execute)

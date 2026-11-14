@@ -91,6 +91,8 @@ int DelaySwitch(GpuSplit::DelayTest test) {
         return Debug::SwitchValue(Debug::g_delay_back_us, "FRITCHII_DELAY_BACK_US");
     case Test::Front:
         return Debug::SwitchValue(Debug::g_delay_front_us, "FRITCHII_DELAY_FRONT_US");
+    case Test::Worker:
+        return Debug::SwitchValue(Debug::g_delay_worker_us, "FRITCHII_DELAY_WORKER_US");
     default:
         return 0;
     }
@@ -128,13 +130,15 @@ std::string DelayTestText(SiteWaitStats& stats, double window) {
                        "FRITCHII_DELAY_MACRO_DRAIN_US{}, FRITCHII_DELAY_POLL_DRAIN_US{}, "
                        "FRITCHII_DELAY_E2C_US{} (front), FRITCHII_DELAY_DISPATCH_US{} (back), "
                        "FRITCHII_DELAY_DRAW_US{} (back), FRITCHII_DELAY_BACK_US{} KIND={} (back), "
-                       "FRITCHII_DELAY_FRONT_US{} KIND={} (front)",
+                       "FRITCHII_DELAY_FRONT_US{} KIND={} (front), FRITCHII_DELAY_WORKER_US{} "
+                       "(Vulkan worker, per chunk)",
                        before ? "before" : "after", before ? 1 : 0, test(Test::MacroDrain),
                        test(Test::PollDrain), test(Test::E2c), test(Test::Dispatch),
                        test(Test::Draw), test(Test::Back),
                        Debug::SwitchValue(Debug::g_delay_back_kind, "FRITCHII_DELAY_BACK_KIND"),
                        test(Test::Front),
-                       Debug::SwitchValue(Debug::g_delay_front_kind, "FRITCHII_DELAY_FRONT_KIND"));
+                       Debug::SwitchValue(Debug::g_delay_front_kind, "FRITCHII_DELAY_FRONT_KIND"),
+                       test(Test::Worker));
 }
 
 void NoteSiteWait(DrainSite site, u64 behind, u64 ns) {
@@ -316,6 +320,10 @@ void GpuSplit::DelayBack(BackDelayKind kind, u32 amount) {
         items[index] -= period[index];
         SpinDelay(DelayTest::Back, static_cast<u32>(us));
     }
+}
+
+int GpuSplit::DelayTestUs(DelayTest test) {
+    return DelaySwitch(test);
 }
 
 void GpuSplit::DelayFront(FrontDelayKind kind, bool before) {
