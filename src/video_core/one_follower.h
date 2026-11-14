@@ -175,9 +175,6 @@ enum class Check : u8 {
     /// new one built on R from the view, whose constant buffer bindings are only as new as the
     /// last lent packet). Step 4 stops for the session.
     PlayedLookupMiss,
-    /// FRITCHII_ONEF_QUERY_OPS: a plain report whose target page the buffer cache has registered
-    /// (E would upload it without seeing R's later write): it stays lent.
-    ReportOnBufferPage,
     Count,
 };
 
@@ -186,7 +183,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Check::Count)> chec
     "view pools",    "build pipeline",   "build image views", "build dynamic",
     "build descriptors", "build render targets", "stream write", "owner on E", "owner on R",
     "build draw params", "build condition", "render packet missing", "drop not plain",
-    "facts stale", "played lookup miss", "report on buffer page",
+    "facts stale", "played lookup miss",
 };
 
 // --- The packet (E to R) -----------------------------------------------------------------------------
@@ -523,7 +520,7 @@ enum class QueryKind : u8 {
     ConditionIfNotEqual,   ///< lent: mode IfNotEqual
     Reset,                 ///< a counter reset (lent, or a render op with QUERY_OPS)
     PlainReport,           ///< a report, not a fence (lent, or a render op with QUERY_OPS)
-    ReportOnBufferPage,    ///< a plain report kept lent by the guard
+    ReportOnBufferPage,    ///< a plain report kept lent by the guard (a lend reason, common)
     FenceReport,           ///< a fence-flagged report (lent; item 4)
     PayloadRelease,        ///< a payload release (lent; item 4)
     Count,

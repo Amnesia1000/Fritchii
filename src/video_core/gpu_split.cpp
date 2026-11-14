@@ -71,6 +71,18 @@ struct SiteWaitStats {
 };
 SiteWaitStats g_site_waits;
 
+/// One follower's hang watchdog: the front starts a wait (GpuSplit::FrontWaitNow).
+void NoteFrontWait(GpuSplit::FrontWait& wait, DrainSite site, u64 target, bool on_engine) {
+    if (!OneFollower::On()) {
+        return;
+    }
+    wait.site.store(static_cast<u32>(site), std::memory_order_relaxed);
+    wait.target.store(target, std::memory_order_relaxed);
+    wait.on_engine.store(on_engine, std::memory_order_relaxed);
+    wait.seq.fetch_add(1, std::memory_order_relaxed);
+    wait.begin_ns.store(Common::Nx2Hitch::NowNs(), std::memory_order_release);
+}
+
 // The delay tests' spins (GpuSplit::SpinDelay), by GpuSplit::DelayTest, since the start: the
 // front's and the back's (Dispatch, Draw), so atomic. Only a spin adds to them.
 std::array<std::atomic<u64>, static_cast<size_t>(GpuSplit::DelayTest::Count)> g_delay_count{};
@@ -704,6 +716,10 @@ void GpuSplit::Drain(DrainSite site) {
     // Profile on: GPUMem's wait for this publish counts as the front's start of a wait (15.7).
     Nx2Profile::FrontWaitBegin(site);
     Publish();
+    NoteFrontWait(front_wait, site, write_position, on_engine);
+    SCOPE_EXIT {
+        front_wait.begin_ns.store(0, std::memory_order_relaxed);
+    };
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
     // "behind": the ring words the back had left to run, which tells a slow back from a front
     // far ahead (tools/nx2/critical_path.py).
@@ -1490,6 +1506,10 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
     wait_target.store(target, std::memory_order_seq_cst);
     Nx2Profile::FrontWaitBegin(site);
     Publish();
+    NoteFrontWait(front_wait, site, target, on_engine);
+    SCOPE_EXIT {
+        front_wait.begin_ns.store(0, std::memory_order_relaxed);
+    };
     const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Ticks() : 0;
     const u64 begin_ns = Common::Nx2Hitch::NowNs();
     const u64 behind = target - consumed_cache;

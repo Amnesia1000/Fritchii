@@ -242,6 +242,18 @@ public:
     [[nodiscard]] u64 PublishedNow() const {
         return published.load(std::memory_order_acquire);
     }
+    /// One follower's hang watchdog: the front's wait now (WaitFor, Drain). `begin_ns` 0 = not
+    /// waiting; `seq` counts the waits, so one long wait tells from many short ones.
+    struct FrontWait {
+        std::atomic<u32> site{static_cast<u32>(DrainSite::Count)};
+        std::atomic<u64> target{};
+        std::atomic<u64> begin_ns{};
+        std::atomic<u64> seq{};
+        std::atomic<bool> on_engine{};
+    };
+    [[nodiscard]] const FrontWait& FrontWaitNow() const {
+        return front_wait;
+    }
     /// One follower: `played` grows to `position` (never shrinks), and the front is woken. E
     /// raises it with what it ran clamped to R's oldest unplayed packet; R raises it as it plays
     /// (OneFollower::EngineConsumed).
@@ -2156,6 +2168,7 @@ private:
     alignas(128) std::atomic<u64> played{};
     /// FRITCHII_ONEF=1 (set at MaybeStart, before the back exists): the front waits on `played`.
     bool two_positions{};
+    FrontWait front_wait; ///< FrontWaitNow
     /// FRITCHII_MEMSTAGE_THREAD=2: the stage's read position (the back's limit) and its level run.
     alignas(128) std::atomic<u64> staged{};
     std::atomic<u64> lent_from{};

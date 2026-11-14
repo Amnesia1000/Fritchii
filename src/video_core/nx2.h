@@ -18,6 +18,7 @@
 #include "common/nx2_gpu_write_listener.h"
 #include "common/thread.h"
 #include "video_core/nx2_frame_fence.h"
+#include "video_core/one_follower_hooks.h"
 
 namespace Tegra {
 
@@ -636,8 +637,19 @@ public:
             }
         }
         if (latched) {
+            VideoCommon::OneFollower::NoteLatch();
             // EDEN_NX2_GPU_WAKE: wakes the GPU thread's wait (returns at once while it is off).
             Nx2PendingWake::Get().Notify();
+        }
+    }
+
+    /// One follower's hang watchdog: each waiter as `f(address, value, operation, latched,
+    /// word)`, `word` the semaphore's host copy or null. Under the lock: `f` must not block.
+    template <typename F>
+    void ForEach(F&& f) {
+        std::scoped_lock lk{mutex};
+        for (const auto& w : waiters) {
+            f(w.address, w.value, w.operation, w.latched, w.word);
         }
     }
 
