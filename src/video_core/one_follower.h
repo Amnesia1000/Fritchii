@@ -46,6 +46,15 @@
 
 #include "common/common_types.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/one_follower_hooks.h"
+
+namespace Core {
+class System;
+}
+
+namespace VideoCommon {
+class PageFilter;
+}
 
 namespace VideoCommon::OneFollower {
 
@@ -346,8 +355,114 @@ void VerifyView(const RegisterView& view, const Maxwell3D& engine);
 
 /// E writes game memory from the stream (constant buffer words, inline uploads, copies, reports):
 /// true when it lands on a page the texture cache tracks while R has unplayed packets. The caller
-/// then makes that write lent (Check::StreamWrite counted, LentReason::StreamWrite for the next
-/// draw).
+/// then makes that write lent (Check::StreamWrite counted). GuardStreamWrite below does both: it
+/// drains R before the write, which is the write run lent; no draw is lent for it, so
+/// LentReason::StreamWrite stays 0 in this branch.
 [[nodiscard]] bool StreamWriteHits(DAddr address, u64 size) noexcept;
+
+// --- Added with part (a): the thread, the ring, the lend (one_follower.cpp) ------------------------
+
+// Detail::t_engine and Detail::t_render (ShouldLend's one load): one_follower_hooks.h.
+
+/// E's rasterizer entry points: true on E with one follower on; the call is then lent to R (or
+/// pushed, step 4). On R and on every other thread the call runs where it is, as today.
+[[nodiscard]] inline bool ShouldLend() noexcept {
+    return Detail::t_engine;
+}
+/// GpuSplit::BackLoop at its start: this thread is E (no-op with FRITCHII_ONEF=0).
+void MarkEngineThread() noexcept;
+[[nodiscard]] inline bool OnEngineThread() noexcept {
+    return Detail::t_engine;
+}
+
+/// GpuSplit::MaybeStart, before the back thread starts / GpuSplit::Stop, after it joined.
+void Start(Core::System& system);
+void Stop();
+
+/// Step 4, part (c): R plays an unlent draw packet with this (the rasterizer registers it).
+using DrawPlayer = void (*)(void* context, const PacketHeader& header, const u8* spans);
+void SetDrawPlayer(DrawPlayer player, void* context) noexcept;
+[[nodiscard]] bool HasDrawPlayer() noexcept;
+/// Step 4, part (c): E's side of an unlent draw (the buffer fill into ring B, PackSpans, Push).
+/// Returns false when it could not; the caller then lends the draw (LentReason::Transient).
+using DrawPusher = bool (*)(void* context, bool is_indexed, u32 instance_count);
+void SetDrawPusher(DrawPusher pusher, void* context) noexcept;
+[[nodiscard]] bool PushDraw(bool is_indexed, u32 instance_count);
+
+/// E, at each draw (RasterizerVulkan::OneFollowerDraw): LentReason::Count when the draw of
+/// UnlendKind `kind` may run unlent, else why it is lent (the first reason that applies).
+/// `diagnostic`: a frame dump, trace or probe wants E's state at this draw.
+[[nodiscard]] LentReason DecideDraw(u32 kind, bool diagnostic) noexcept;
+/// R (part c) at an unlent draw it could not play from the packet (no ready pipeline, ...):
+/// counted under that reason; the draw is still R's to finish (E has moved on).
+void NoteUnlentFallback(LentReason reason) noexcept;
+/// Those fallbacks, by reason (not lends: a test can tell them from LentReason counts).
+[[nodiscard]] u64 UnlentFallbacks(LentReason reason) noexcept;
+
+/// E, before Lend or PushDraw of a draw: what the draw is (DrawValues' kind, indexed, indirect
+/// and the instance count argument). Lend puts the kind in the header (reserved[0], the UnlendKind
+/// bit) for the counters, PackSpans puts all of it in the draw span. Consumed by the next packet.
+void SetNextDraw(u32 kind, bool indexed, bool indirect, u32 instance_arg) noexcept;
+
+/// E: pushes a packet R plays while E goes on (PacketKind::Draw or Delta), within the window
+/// (FRITCHII_ONEF_AHEAD) and the ring's room. Fills number, position and draw_seq.
+void Push(PacketHeader& header, std::span<const u8> spans);
+
+/// The engine R's view mirrors (the bound channel's Maxwell3D): set by the channel bind (on R
+/// under a lent packet, or on E). PackSpans reads it on E, the seed and VerifyView on R.
+void SetEngine(Maxwell3D* engine) noexcept;
+[[nodiscard]] Maxwell3D* Engine() noexcept;
+
+/// GpuSplit's two positions (8.2): E stores its own `consumed`, then calls this, which raises
+/// GpuSplit's `played` (what every front wait reads) to that position clamped to the oldest packet
+/// R has not played; R raises `played` again after each packet it plays (step 4).
+void EngineConsumed(u64 position) noexcept;
+
+/// Live switch values (refreshed with Step()).
+[[nodiscard]] u32 UnlendMask() noexcept;
+[[nodiscard]] int VerifyEvery() noexcept;
+[[nodiscard]] int Ahead() noexcept;
+
+// The counters and the 10 s lines are part (d)'s: one_follower_stats.h (Note() is defined there).
+
+// --- Added with part (b): the engine side's write tracking (one_follower_view.cpp) ---------------
+
+// g_track_writes and NoteRegWrite: one_follower_hooks.h.
+
+/// E: the view's spans need a full seed first (tracking just started, a step change or a channel
+/// bind): the next lent packet carries PacketSeed. Unlent draws wait for it (LentReason::Transient).
+[[nodiscard]] bool ViewReady() noexcept;
+
+/// The texture cache's "pages that ever held an image" filter (set by the rasterizer at creation):
+/// StreamWriteHits looks there.
+void SetTexturePages(const PageFilter* filter) noexcept;
+/// E's stream writes (Maxwell3D's constant buffer words, memory_manager.cpp's cached writes): on a
+/// texture page they are counted (StreamWritesOnTexturePages, informational at every step), and
+/// with R behind (step 4) Check::StreamWrite is counted and E drains R before the write lands.
+void GuardStreamWrite(DAddr address, u64 size) noexcept;
+/// Writes that landed on texture pages, any step (section 7's run 4 number; not a must-be-0).
+[[nodiscard]] u64 StreamWritesOnTexturePages() noexcept;
+
+/// R, under a lent packet with PacketSeed (or a channel bind): the view takes the engine's
+/// registers, flags, draw state and pools in full.
+void SeedView(RegisterView& view, const Maxwell3D& engine);
+/// R, around a lent call (step 2+): before, at step 4 the engine's forwarded flags take the
+/// view's (R's truth); after, the view takes what the lent code left in the engine.
+void BeforeLentCall(RegisterView& view, Maxwell3D& engine);
+void AfterLentCall(RegisterView& view, Maxwell3D& engine);
+
+/// E, step 4 (part c's pusher), right after its buffer fill of an unlent draw: the forwarded flags
+/// the fill left are E's baseline for the next packet's flag span (the fill clears E's copies of
+/// the shared flags; their raises were packed before it).
+void NoteEngineFlags(const Maxwell3D& engine) noexcept;
+
+namespace Detail {
+/// Between one_follower.cpp and one_follower_view.cpp.
+/// The draw SetNextDraw described, or null (E; PackSpans's draw span).
+[[nodiscard]] const DrawValues* NextDraw() noexcept;
+/// E's write tracking stops (step below 2) or its engine changed: the next lent packet seeds the
+/// view in full. On E, or on R under a lent packet (E parked).
+void ViewTrackingStopped() noexcept;
+} // namespace Detail
 
 } // namespace VideoCommon::OneFollower

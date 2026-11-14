@@ -215,6 +215,7 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
+#include "video_core/one_follower.h"
 
 namespace Vulkan {
 namespace {
@@ -3277,6 +3278,15 @@ void MemStage::TickThread(int seam) {
     namespace Debug = VideoCore::Nx2Debug;
     const int wanted = Debug::SwitchValue(Debug::g_memstage_thread, "FRITCHII_MEMSTAGE_THREAD");
     u32 mode = wanted >= 2 ? 2U : wanted > 0 ? 1U : 0U;
+    if (mode != 0 && VideoCommon::OneFollower::On()) {
+        // One follower (FRITCHII_ONEF=1) replaces GPUMem: the stage stays off.
+        if (!thread_clamp_logged) {
+            thread_clamp_logged = true;
+            LOG_WARNING(Render_Vulkan, "FRITCHII_MEMSTAGE_THREAD={} with FRITCHII_ONEF=1; running 0",
+                        wanted);
+        }
+        mode = 0;
+    }
     if (mode != 0 && (seam < 2 || !ticks || !player.device.HasSplitAllocators())) {
         if (!thread_clamp_logged) {
             thread_clamp_logged = true;

@@ -1234,6 +1234,34 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
 - The stream-write guard (section 7 of the design): a game memory write from the stream onto a
   page the texture cache tracks while R has unplayed packets is counted ("stream write", must be
   0) and made lent.
+- How it is built (parts a and b, one_follower.cpp and one_follower_view.cpp):
+  - Lent: every RasterizerVulkan entry E calls that touches R's objects (draws, clears,
+    dispatches, queries, fences and sync operations, flushes and read-backs, invalidations, DMA
+    and inline uploads, surface copies, the display, channels, the frame end, the back's idle hook
+    and fence-quiet check) parks E and runs on R. Calls from other threads (the front, guest
+    cores) run where they ran, as today. R counts as the back for every OnBackThread check.
+  - The delta: Maxwell3D's register writes on E (ProcessDirtyRegisters, ApplyDeltaWrites) note
+    their word while VIEW is on; each packet carries the watched words noted since the last one
+    (every word but the constant buffer data words and offset, falcon and the shadow scratch).
+  - The flags: forwarded = every dirty flag but IndexBuffer and VertexBuffer0..31 (the buffer
+    cache's alone); VertexBuffers is on both sides. A packet forwards what is raised now and was
+    not after the last packet or lent call; no raise site is hooked. The program hashes are not
+    sent (RefreshStages is the pipeline cache's, R's); R computes them from its view.
+  - The guard drains R at the write itself (MemoryManager's block, word and constant buffer
+    writes on E), which is that write run lent, so no draw is lent for it ("stream write" on the
+    verify line counts the hits; "stream write not lent" must be 0).
+  - Owner asserts: the scheduler (its existing owner check, on with FRITCHII_ONEF=1), the
+    pipeline lookup, the texture cache's render targets and the query cache's reports count
+    "owner on E" when E uses them with R not parked or drained; the buffer cache's graphics
+    update counts "owner on R" outside a lent call. Both must be 0; below step 4 they cannot fire
+    (R is never behind outside a lend), so they gate step 4.
+  - Two positions (design 8.2): GpuSplit's `consumed` stays E's (what the back ran) and a new
+    `played` is R's (E's position clamped to R's oldest unplayed packet, raised by E and by R as
+    it plays). Every front wait and ring-space check reads `played`, "R has played P", today's
+    meaning; step 5 moves single wait kinds to E's position (EngineConsumedNow). Without
+    FRITCHII_ONEF the front reads `consumed` as before.
+  - Busy per frame for the step 4 gate (8.2): E = the back's busy less "E parked in lends"
+    (both ms/s, divided by fps); R = "R busy" on the "One follower threads" line (GPU profile).
 - Must-be-0 line, every 10 s: "One follower checks (must be 0; this window / session): view words
   a / b, ...". Ownership: "owner on E" (an R-owned object used on E while R ran) and "owner on R".
 

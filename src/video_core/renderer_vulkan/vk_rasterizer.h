@@ -326,6 +326,11 @@ private:
                            const MemStage::TrackerRecord* record);
     /// FRITCHII_MEMSTAGE_SHADOW: the trackers' record against today's query.
     void VerifyTrackerRecord(const MemStage::TrackerRecord* record);
+    // One follower (one_follower.h), on E: a draw lent to R, or pushed at step 4.
+    void OneFollowerDraw(bool is_indexed, u32 instance_count);
+    void OneFollowerDrawIndirect();
+    /// GpuSplit's idle hook (lent to R with one follower on); `idle`: InIdleWait on the back.
+    void RunIdleHook(bool idle);
     // FRITCHII_MEMSTAGE_THREAD = 2 (vk_rasterizer.cpp).
     void SetRingBackend();
     bool StageFillDraw(VideoCommon::MemStageShadowEngine& copy, bool is_indexed, u64 position,

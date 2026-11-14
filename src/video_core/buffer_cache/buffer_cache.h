@@ -35,6 +35,7 @@
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_stage_link.h"
+#include "video_core/one_follower_hooks.h"
 #include "video_core/memstage_stats.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cmdpage_diag.h"
@@ -1586,6 +1587,7 @@ void BufferCache<P>::DisableGraphicsUniformBuffer(size_t stage, u32 index) {
 template <class P>
 void BufferCache<P>::UpdateGraphicsBuffers(bool is_indexed) {
     VideoCommon::MemoryStageLink::CheckBackCache("UpdateGraphicsBuffers");
+    VideoCommon::OneFollower::EngineOwned("BufferCache::UpdateGraphicsBuffers");
     ++native_bank_draw;
     do {
         channel_state->has_deleted_buffers = false;

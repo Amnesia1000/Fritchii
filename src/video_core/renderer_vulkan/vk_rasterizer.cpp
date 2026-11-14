@@ -100,6 +100,24 @@
 #include "video_core/nx2_list_dispatch.h"
 #include "video_core/nx2_list_draw.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/one_follower.h"
+
+// One follower (one_follower.h), step 1: on E (the back) every entry into the renderer runs lent
+// on R, E parked; on R and every other thread it runs where it is, as today. FRITCHII_ONEF=0: one
+// thread-local load and a branch per entry.
+#define ONEF_LEND(op, call)                                                                        \
+    if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {                                     \
+        auto onef_call = [&] { call; };                                                            \
+        VideoCommon::OneFollower::Lend(VideoCommon::OneFollower::LentOp::op, onef_call);           \
+        return;                                                                                    \
+    }
+#define ONEF_LEND_RESULT(op, call)                                                                 \
+    if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {                                     \
+        std::optional<std::remove_cvref_t<decltype(call)>> onef_result;                            \
+        auto onef_call = [&] { onef_result.emplace(call); };                                       \
+        VideoCommon::OneFollower::Lend(VideoCommon::OneFollower::LentOp::op, onef_call);           \
+        return std::move(*onef_result);                                                            \
+    }
 
 namespace Vulkan {
 
@@ -596,6 +614,8 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
                                                     &texture_cache.image_count_filter);
     // FRITCHII_MEMSTAGE_SHADOW: the watched pages of join 2 (image pages).
     VideoCommon::MemStageShadow::SetWatchFilter(&texture_cache.page_filter);
+    // One follower: the stream-write guard's pages (section 7).
+    VideoCommon::OneFollower::SetTexturePages(&texture_cache.page_filter);
     buffer_cache.SetPendingCpuWrites(
         [this](const std::function<void(DAddr, size_t)>& callback) {
             gpu.ForEachPendingCpuWrite(callback);
@@ -603,26 +623,15 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
     VideoCommon::GpuSplit::Get().SetIdleHook(
         [](void* argument) {
             auto* const rasterizer = static_cast<RasterizerVulkan*>(argument);
-            rasterizer->scheduler.FlushDeferred();
-            // EXP99 = 1: evicted pool images (OoT's per-NPC depth targets) go while idle.
-            // Only when it ran out of work: a RequestIdleHook mid-batch has a waiter (Fable).
-            if (VideoCore::Nx2Debug::Experiment(99) == 1 && VideoCommon::GpuSplit::InIdleWait()) {
-                rasterizer->texture_cache_runtime.DestroyIdlePooledImages(2);
+            // One follower: the hook is R's work (the scheduler, the pools), lent with the idle
+            // state E had (InIdleWait is E's thread-local).
+            const bool idle = VideoCommon::GpuSplit::InIdleWait();
+            if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
+                auto run = [rasterizer, idle] { rasterizer->RunIdleHook(idle); };
+                VideoCommon::OneFollower::Lend(VideoCommon::OneFollower::LentOp::FrameEnd, run);
+                return;
             }
-            // EXP104: evicted pool buffers go the same way, whatever EXP104 is now (switching it
-            // off evicts everything). With FRITCHII_MEMSTAGE_SPLIT_ALLOC the buffer cache's
-            // recycler first, then the back's: still at most 2 a call. The first is the buffer
-            // allocator's, so it runs on the cache's thread (memory stage spec 5.2: GPUMem by
-            // hand-off at FRITCHII_MEMSTAGE_THREAD=1); the second stays on the back.
-            if (VideoCommon::GpuSplit::InIdleWait()) {
-                BufferRecycler& buffers = rasterizer->buffer_staging_pool.Recycler();
-                BufferRecycler& others = rasterizer->staging_pool.Recycler();
-                if (buffers.HasDoomed()) {
-                    rasterizer->mem_stage.CacheIdle([&buffers] { buffers.DestroyIdle(2); });
-                } else if (others.HasDoomed()) {
-                    others.DestroyIdle(2);
-                }
-            }
+            rasterizer->RunIdleHook(idle);
         },
         this);
     SetRingBackend();
@@ -676,6 +685,81 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
             },
     };
     VideoCommon::Runahead::SetHooks(&runahead_hooks);
+}
+
+void RasterizerVulkan::OneFollowerDraw(bool is_indexed, u32 instance_count) {
+    namespace OneF = VideoCommon::OneFollower;
+    // The draw's kind, from E's engine (UnlendKind): the first that applies.
+    const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    using DrawMode = Tegra::Engines::Maxwell3D::DrawManager::DrawMode;
+    u32 kind;
+    if (!is_indexed && Tegra::Nx2IndirectGrid::AnyLive() &&
+        Tegra::Nx2IndirectGrid::LooksLikeDrawPlaceholder(draw_state.vertex_buffer.count)) {
+        kind = OneF::GpuCount;
+    } else if (maxwell3d->regs.IsMeshEnabled()) {
+        kind = OneF::Mesh;
+    } else if (draw_state.draw_mode == DrawMode::InlineIndex ||
+               !draw_state.inline_index_draw_indexes.empty()) {
+        kind = OneF::InlineIndex;
+    } else if (draw_state.draw_mode == DrawMode::Instance) {
+        kind = OneF::InstanceLoop;
+    } else {
+        kind = is_indexed ? OneF::PlainIndexed : OneF::PlainArrays;
+    }
+    // Diagnostics read E's state at the draw (the frame dump changes only at a frame end, which
+    // is lent: E is parked then, so this read does not race).
+    const bool diagnostic = frame_dump.Capturing() || VideoCommon::RenderTrace::Enabled() ||
+                            Common::DkbFrameTrace::Enabled();
+    OneF::LentReason reason = OneF::DecideDraw(kind, diagnostic);
+    OneF::SetNextDraw(kind, is_indexed, false, instance_count);
+    if (reason == OneF::LentReason::Count) {
+        // Step 4 (part c's pusher): the fill on E, the packet to R, and E goes on.
+        if (OneF::PushDraw(is_indexed, instance_count)) {
+            return;
+        }
+        reason = OneF::LentReason::Transient;
+        OneF::SetNextDraw(kind, is_indexed, false, instance_count);
+    }
+    auto call = [this, is_indexed, instance_count] { Draw(is_indexed, instance_count); };
+    OneF::Lend(OneF::LentOp::Draw, reason, call);
+}
+
+void RasterizerVulkan::OneFollowerDrawIndirect() {
+    namespace OneF = VideoCommon::OneFollower;
+    const u32 kind = maxwell3d->draw_manager.indirect_state.list_words ? OneF::List : OneF::Indirect;
+    const bool diagnostic = frame_dump.Capturing() || VideoCommon::RenderTrace::Enabled() ||
+                            Common::DkbFrameTrace::Enabled();
+    OneF::LentReason reason = OneF::DecideDraw(kind, diagnostic);
+    if (reason == OneF::LentReason::Count) {
+        // No pusher for indirect and list draws in this branch: their bits ask for nothing yet.
+        reason = OneF::LentReason::Transient;
+    }
+    OneF::SetNextDraw(kind, maxwell3d->draw_manager.indirect_state.is_indexed, true, 0);
+    auto call = [this] { DrawIndirect(); };
+    OneF::Lend(OneF::LentOp::Draw, reason, call);
+}
+
+void RasterizerVulkan::RunIdleHook(bool idle) {
+    scheduler.FlushDeferred();
+    // EXP99 = 1: evicted pool images (OoT's per-NPC depth targets) go while idle.
+    // Only when it ran out of work: a RequestIdleHook mid-batch has a waiter (Fable).
+    if (VideoCore::Nx2Debug::Experiment(99) == 1 && idle) {
+        texture_cache_runtime.DestroyIdlePooledImages(2);
+    }
+    // EXP104: evicted pool buffers go the same way, whatever EXP104 is now (switching it
+    // off evicts everything). With FRITCHII_MEMSTAGE_SPLIT_ALLOC the buffer cache's
+    // recycler first, then the back's: still at most 2 a call. The first is the buffer
+    // allocator's, so it runs on the cache's thread (memory stage spec 5.2: GPUMem by
+    // hand-off at FRITCHII_MEMSTAGE_THREAD=1); the second stays on the back.
+    if (idle) {
+        BufferRecycler& buffers = buffer_staging_pool.Recycler();
+        BufferRecycler& others = staging_pool.Recycler();
+        if (buffers.HasDoomed()) {
+            mem_stage.CacheIdle([&buffers] { buffers.DestroyIdle(2); });
+        } else if (others.HasDoomed()) {
+            others.DestroyIdle(2);
+        }
+    }
 }
 
 RasterizerVulkan::~RasterizerVulkan() {
@@ -2758,6 +2842,11 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
     // one load and a branch.
     VideoCommon::GpuSplit::DelayWorkIf(VideoCore::Nx2Debug::g_delay_draw_us,
                                        VideoCommon::GpuSplit::DelayTest::Draw);
+    // One follower: E lends the draw to R (step 4 pushes the kinds in FRITCHII_ONEF_UNLEND).
+    if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
+        OneFollowerDraw(is_indexed, instance_count);
+        return;
+    }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     const VideoCommon::FritchiiDrawKinds::Scope draw_kinds_scope{maxwell3d->regs};
     // A vertex count GPU work wrote (nx2_indirect_grid.h): drawn with that count, read on the GPU.
@@ -3082,6 +3171,11 @@ void RasterizerVulkan::DrawIndirect() {
     // back thread only. Off: one load and a branch.
     VideoCommon::GpuSplit::DelayWorkIf(VideoCore::Nx2Debug::g_delay_draw_us,
                                        VideoCommon::GpuSplit::DelayTest::Draw);
+    // One follower: indirect and list draws stay lent in this branch (their own UnlendKind bits).
+    if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
+        OneFollowerDrawIndirect();
+        return;
+    }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     const VideoCommon::FritchiiDrawKinds::Scope draw_kinds_scope{maxwell3d->regs};
     const auto& params = maxwell3d->draw_manager.indirect_state;
@@ -3211,6 +3305,7 @@ bool RasterizerVulkan::MemStageQmd(Tegra::MemoryManager& memory, GPUVAddr addres
 // List draws and list dispatches: a copy of the list words at their place in the stream, for the
 // front to read back if it needs their values after all.
 void RasterizerVulkan::Nx2KeepListWords(u64 keep_id, GPUVAddr address, u32 count) {
+    ONEF_LEND(Copy, Nx2KeepListWords(keep_id, address, count))
     std::scoped_lock lock{buffer_cache.mutex};
     const auto [buffer, offset] = mem_stage.Ref(MemStage::Site::ListWords, [&] {
         return buffer_cache.ObtainBuffer(address, count * sizeof(u32),
@@ -3491,6 +3586,7 @@ void RasterizerVulkan::CollectIndirectTrace() {
 }
 
 void RasterizerVulkan::DrawTexture() {
+    ONEF_LEND(Draw, DrawTexture())
 
     SCOPE_EXIT {
         gpu.TickWork();
@@ -3628,6 +3724,7 @@ bool RasterizerVulkan::ClearVolumeSlices(const Framebuffer* framebuffer, u32 fir
 }
 
 void RasterizerVulkan::Clear(u32 layer_count) {
+    ONEF_LEND(Clear, Clear(layer_count))
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Clear};
     const VideoCommon::FritchiiDrawKinds::Scope draw_kinds_scope{maxwell3d->regs, true};
     if (Tegra::Engines::g_nx2_trace_draws_after_upscale > 0) {
@@ -3937,6 +4034,7 @@ void RasterizerVulkan::DispatchCompute() {
     // Off: one load and a branch.
     VideoCommon::GpuSplit::DelayWorkIf(VideoCore::Nx2Debug::g_delay_dispatch_us,
                                        VideoCommon::GpuSplit::DelayTest::Dispatch);
+    ONEF_LEND(Dispatch, DispatchCompute())
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Compute};
     t_in_dispatch = true;
     SCOPE_EXIT {
@@ -4266,6 +4364,7 @@ void RasterizerVulkan::DispatchCompute() {
 }
 
 void RasterizerVulkan::ResetCounter(VideoCommon::QueryType type) {
+    ONEF_LEND(Query, ResetCounter(type))
     switch (type) {
     case VideoCommon::QueryType::ZPassPixelCount64:
     case VideoCommon::QueryType::StreamingByteCount:
@@ -4281,6 +4380,7 @@ void RasterizerVulkan::ResetCounter(VideoCommon::QueryType type) {
 
 void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                              VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) {
+    ONEF_LEND(Query, Query(gpu_addr, type, flags, payload, subreport))
     query_cache.CounterReport(gpu_addr, type, flags, payload, subreport);
 }
 
@@ -4296,6 +4396,7 @@ void Vulkan::RasterizerVulkan::DisableGraphicsUniformBuffer(size_t stage, u32 in
 void RasterizerVulkan::FlushAll() {}
 
 bool RasterizerVulkan::SubmitNx2ListCopies(u64 writer) {
+    ONEF_LEND_RESULT(Copy, SubmitNx2ListCopies(writer))
     // Submitted at once: ReadGpuWrittenCommands waits on these copies, so they can't sit out
     // the longer DeferFlush interval.
     if (!mem_stage.Ref(MemStage::Site::DispatchAfter,
@@ -4335,6 +4436,7 @@ void RasterizerVulkan::NoteGpuWrittenCommandListSynced(DAddr page) {
 }
 
 void RasterizerVulkan::FlushGpuWrittenCommandListPages(std::span<const DAddr> pages) {
+    ONEF_LEND(ReadBack, FlushGpuWrittenCommandListPages(pages))
     gpu.InvalidateGPUCache();
     std::scoped_lock lock{buffer_cache.mutex};
     MemStage::FillPlay seam{mem_stage, MemStage::Site::ListPages};
@@ -4345,6 +4447,7 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType 
     if (addr == 0 || size == 0) {
         return;
     }
+    ONEF_LEND(ReadBack, FlushRegion(addr, size, which))
     if (Common::WriteRing::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
         mem_stage.NoteGather(MemStage::Gather::FlushRegion, static_cast<u32>(which));
     }
@@ -4385,6 +4488,7 @@ void RasterizerVulkan::FlushRegionForRead(DAddr addr, u64 size) {
     if (addr == 0 || size == 0) {
         return;
     }
+    ONEF_LEND(ReadBack, FlushRegionForRead(addr, size))
     if (VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
         VideoCommon::MemStageShadow::BackFlushRegion(true, true, true);
     }
@@ -4409,6 +4513,7 @@ void RasterizerVulkan::FinishRead(DAddr addr, u64 size) {
 }
 
 bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
+    ONEF_LEND_RESULT(ReadBack, MustFlushRegion(addr, size, which))
     if ((True(which & VideoCommon::CacheType::BufferCache)) && MayBeGpuModified(addr, size)) {
         bool modified = false;
         OnStage(static_cast<u8>(VideoCommon::MemoryStageLink::Served::MustFlush), [&] {
@@ -4608,6 +4713,7 @@ bool RasterizerVulkan::WaitFenceDownload(u64 sequence) {
 }
 
 VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64 size) {
+    ONEF_LEND_RESULT(ReadBack, GetFlushArea(addr, size))
     // A guest read of cached memory asked under both caches' mutexes, which the split's back holds
     // through each draw: 12% of the guest cores' busy time at Castle Town went to waiting for
     // them. Pages no image was ever registered on (page_filter) and that no GPU write ever marked
@@ -4890,6 +4996,7 @@ void RasterizerVulkan::PrepareRegionWrite(DAddr addr, u64 size, VideoCommon::Cac
     if (addr == 0 || size == 0 || False(which & VideoCommon::CacheType::BufferCache)) {
         return;
     }
+    ONEF_LEND(Invalidation, PrepareRegionWrite(addr, size, which))
     std::scoped_lock lock{buffer_cache.mutex};
     // MemoryManager landed the read downloads here just before (FinishRead) and writes guest
     // memory next: landing a newer one would wait for the host GPU with the lock held.
@@ -4900,6 +5007,7 @@ void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::Cache
     if (addr == 0 || size == 0) {
         return;
     }
+    ONEF_LEND(Invalidation, InvalidateRegion(addr, size, which))
     if (True(which & VideoCommon::CacheType::TextureCache)) {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.WriteMemory(addr, size);
@@ -4919,6 +5027,7 @@ void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::Cache
 }
 
 void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) {
+    ONEF_LEND(Invalidation, InnerInvalidation(sequences))
     if (VideoCommon::MemoryStageLink::BackServed() && !sequences.empty()) [[unlikely]] {
         // FRITCHII_MEMSTAGE_THREAD = 2 (plan 5.2): collected ranges on the back outside a run.
         // Must be 0; served on GPUMem all the same.
@@ -5040,6 +5149,7 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
 }
 
 bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
+    ONEF_LEND_RESULT(Invalidation, OnCPUWrite(addr, size))
     DEBUG_ASSERT(addr != 0 || size != 0);
     CountGuestAccess(g_guest_access.write_locked);
     if (VideoCommon::Nx2FastDrawCount::g_on) [[unlikely]] {
@@ -5083,6 +5193,7 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
 }
 
 void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) {
+    ONEF_LEND(Invalidation, OnCacheInvalidations(ranges))
     if (t_gather_probe != nullptr) [[unlikely]] {
         ProbeGatherRanges(ranges); // FRITCHII_MEMSTAGE_GATHER's counters only
     }
@@ -5396,6 +5507,7 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
     if (addr == 0 || size == 0) {
         return;
     }
+    ONEF_LEND(Invalidation, OnCacheInvalidation(addr, size))
     if (VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
         VideoCommon::MemStageShadow::BackCacheInvalidation(false, 1);
     }
@@ -5465,6 +5577,7 @@ void RasterizerVulkan::Nx2ApplyRunaheadChunk(const VideoCommon::Runahead::Chunk&
 
 bool RasterizerVulkan::TryCacheInvalidation(DAddr addr, u64 size) {
     if (addr == 0 || size == 0) return true;
+    ONEF_LEND_RESULT(Invalidation, TryCacheInvalidation(addr, size))
     {
         std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
         // WriteMemory downloads GPU-written bytes elsewhere on the written pages, which only the
@@ -5483,6 +5596,7 @@ bool RasterizerVulkan::TryCacheInvalidation(DAddr addr, u64 size) {
 }
 
 void RasterizerVulkan::InvalidateGPUCache() {
+    ONEF_LEND(Invalidation, InvalidateGPUCache())
     // FRITCHII_MEMSTAGE_PASS (fable_stage_levelpoints 6.5): at a passed gather's entry, the half
     // of GPUMem's take the back owes (the other caches', or all of it when the entry runs as a
     // level run), before this gather takes more. Records of earlier entries the back never asked
@@ -5495,6 +5609,7 @@ void RasterizerVulkan::InvalidateGPUCache() {
 }
 
 void RasterizerVulkan::InvalidateTextureDataCache() {
+    ONEF_LEND(Invalidation, InvalidateTextureDataCache())
     // FRITCHII_MEMSTAGE_GATHER: GPUMem, level at this entry, had the back run this gather already
     // (StageRunGather); the back's own run of the entry skips it. BackTakeGather counts a served
     // gather with no record (must be 0). Without the ring, and for every gather that started a
@@ -5518,6 +5633,7 @@ void RasterizerVulkan::InvalidateTextureDataCache() {
 }
 
 void RasterizerVulkan::UnmapMemory(DAddr addr, u64 size) {
+    ONEF_LEND(Invalidation, UnmapMemory(addr, size))
     // EXP92 (fable52_answer_uniformkeeps 3.3): the uniform keeps' page watches on this device
     // memory are given back here, before the backing is cleared (no cache lock held). A later keep
     // watches the page again. DeviceMemoryManager::Map and Unmap do the same for backing changes
@@ -5538,6 +5654,7 @@ void RasterizerVulkan::UnmapMemory(DAddr addr, u64 size) {
 }
 
 void RasterizerVulkan::ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) {
+    ONEF_LEND(Invalidation, ModifyGPUMemory(as_id, addr, size))
     {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.UnmapGPUMemory(as_id, addr, size);
@@ -5546,38 +5663,47 @@ void RasterizerVulkan::ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) {
 }
 
 void RasterizerVulkan::SignalFence(std::function<void()>&& func) {
+    ONEF_LEND(Fence, SignalFence(std::move(func)))
     fence_manager.SignalFence(std::move(func));
 }
 
 void RasterizerVulkan::SyncOperation(std::function<void()>&& func) {
+    ONEF_LEND(Fence, SyncOperation(std::move(func)))
     fence_manager.SyncOperation(std::move(func));
 }
 
 u64 RasterizerVulkan::SyncOperationStamped(std::function<void()>&& func) {
+    ONEF_LEND_RESULT(Fence, SyncOperationStamped(std::move(func)))
     return fence_manager.SyncOperationStamped(std::move(func));
 }
 
 bool RasterizerVulkan::AppendToLastOperation(u64 stamp, void (*append)(void*), void* context) {
+    ONEF_LEND_RESULT(Fence, AppendToLastOperation(stamp, append, context))
     return fence_manager.AppendToLastOperation(stamp, append, context);
 }
 
 void RasterizerVulkan::SyncOperationKeepStamp(std::function<void()>&& func) {
+    ONEF_LEND(Fence, SyncOperationKeepStamp(std::move(func)))
     fence_manager.SyncOperationKeepStamp(std::move(func));
 }
 
 void RasterizerVulkan::SignalSyncPoint(u32 value) {
+    ONEF_LEND(Fence, SignalSyncPoint(value))
     fence_manager.SignalSyncPoint(value);
 }
 
 void RasterizerVulkan::SignalReference() {
+    ONEF_LEND(Fence, SignalReference())
     fence_manager.SignalReference();
 }
 
 void RasterizerVulkan::ReleaseFences(bool force) {
+    ONEF_LEND(Fence, ReleaseFences(force))
     fence_manager.WaitPendingFences(force);
 }
 
 bool RasterizerVulkan::FencesQuiet(bool strict, u64& epoch) {
+    ONEF_LEND_RESULT(Fence, FencesQuiet(strict, epoch))
     return fence_manager.FencesQuiet(strict, epoch);
 }
 
@@ -5586,6 +5712,7 @@ u64 RasterizerVulkan::FenceWorkEpoch() const {
 }
 
 void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
+    ONEF_LEND(ReadBack, FlushQueryResults(addr, size))
     if (addr == 0 || size == 0 || !query_cache.SemiFlushRegion(addr, size)) {
         return;
     }
@@ -5633,6 +5760,7 @@ void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
 }
 
 void RasterizerVulkan::WaitForIdle() {
+    ONEF_LEND(ReadBack, WaitForIdle())
     // Everything but wait pixel operations. This intentionally includes FRAGMENT_SHADER_BIT because
     // fragment shaders can still write storage buffers.
     VkPipelineStageFlags flags =
@@ -5679,6 +5807,7 @@ void RasterizerVulkan::WaitForIdle() {
 }
 
 void RasterizerVulkan::FragmentBarrier() {
+    ONEF_LEND(Other, FragmentBarrier())
     // The next draw breaks the render pass only if it reads what this one wrote: Ocarina
     // ended ~5,900 render passes a second here.
     if (device.IsMoltenVK() || VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::FragmentBarrier)) {
@@ -5694,6 +5823,7 @@ void RasterizerVulkan::TiledCacheBarrier() {
 }
 
 void RasterizerVulkan::FlushCommands() {
+    ONEF_LEND(FrameEnd, FlushCommands())
     if (draw_counter == 0 && !pending_native_work) {
         return;
     }
@@ -6386,6 +6516,7 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
 void NoteDrawReuseProbeFrame(); // vk_graphics_pipeline.cpp
 
 void RasterizerVulkan::TickFrame() {
+    ONEF_LEND(FrameEnd, TickFrame())
 #ifdef _WIN32
     // EXP111 (live; 0 = Windows' default, 1 = above normal, 2 = high): the process priority
     // class. The owner sees more fps with the window focused: Windows boosts the foreground
@@ -6560,6 +6691,7 @@ void RasterizerVulkan::TickFrame() {
 }
 
 bool RasterizerVulkan::AccelerateConditionalRendering() {
+    ONEF_LEND_RESULT(Query, AccelerateConditionalRendering())
     gpu_memory->FlushCaching();
     return query_cache.AccelerateHostConditionalRendering();
 }
@@ -6571,6 +6703,7 @@ bool RasterizerVulkan::HasDrawTransformFeedback() {
 bool RasterizerVulkan::AccelerateSurfaceCopy(const Tegra::Engines::Fermi2D::Surface& src,
                                              const Tegra::Engines::Fermi2D::Surface& dst,
                                              const Tegra::Engines::Fermi2D::Config& copy_config) {
+    ONEF_LEND_RESULT(Copy, AccelerateSurfaceCopy(src, dst, copy_config))
     std::scoped_lock lock{texture_cache.mutex};
     return texture_cache.BlitImage(dst, src, copy_config);
 }
@@ -6598,6 +6731,8 @@ bool RasterizerVulkan::AccelerateTemporalUpscale(
     const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst,
     const Tegra::Engines::Fermi2D::Surface& motion_vectors, const Tegra::Texture::TICEntry* depth,
     std::array<f32, 2> jitter, std::array<f32, 2> motion_scale, bool use_history) {
+    ONEF_LEND_RESULT(Copy, AccelerateTemporalUpscale(src, dst, motion_vectors, depth, jitter,
+                                                     motion_scale, use_history))
     std::scoped_lock lock{texture_cache.mutex};
     return texture_cache.TemporalUpscale(dst, src, motion_vectors, depth, jitter, motion_scale,
                                           use_history);
@@ -6609,6 +6744,9 @@ Tegra::Engines::AccelerateDMAInterface& RasterizerVulkan::AccessAccelerateDMA() 
 
 void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                                 std::span<const u8> memory) {
+    // One follower: the write and the buffer half are E's (section 5), the query and texture
+    // halves R's; the whole upload stays lent in this branch (step 5 splits it).
+    ONEF_LEND(Copy, AccelerateInlineToMemory(address, copy_size, memory))
     // Grid placeholders among the words (a compute macro's constant buffer of its dispatch's
     // size): the GPU copies the words they stand for over them once the write is done.
     if (Tegra::Nx2IndirectGrid::AnyLive() && !Tegra::Nx2IndirectGrid::g_writing_qmd &&
@@ -6729,6 +6867,7 @@ void RasterizerVulkan::InlineUntouchedTail(GPUVAddr address, DAddr cpu_addr, siz
 
 void RasterizerVulkan::AccelerateInlineWords(GPUVAddr address, size_t copy_size,
                                              std::span<const u8> memory) {
+    ONEF_LEND(Copy, AccelerateInlineWords(address, copy_size, memory))
     // EXP124 (fable_memstage_compute_brief 4.2): a macro's upload words, flushed at once, written
     // as their calls one by one would have been. Pieces of one 4 KiB page each take one call
     // where every word of it would take InlineSkipsCaches's branch: there each step (the write,
@@ -6878,6 +7017,7 @@ std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
     if (!framebuffer_addr) {
         return {};
     }
+    ONEF_LEND_RESULT(FrameEnd, AccelerateDisplay(config, framebuffer_addr, pixel_stride))
     std::scoped_lock lock{texture_cache.mutex};
     const auto [image_view, scaled] =
         texture_cache.TryFindFramebufferImageView(config, framebuffer_addr);
@@ -6995,12 +7135,14 @@ AccelerateDMA::AccelerateDMA(BufferCache& buffer_cache_, TextureCache& texture_c
     : buffer_cache{buffer_cache_}, texture_cache{texture_cache_}, scheduler{scheduler_} {}
 
 bool AccelerateDMA::BufferClear(GPUVAddr src_address, u64 amount, u32 value) {
+    ONEF_LEND_RESULT(Copy, BufferClear(src_address, amount, value))
     std::scoped_lock lock{buffer_cache.mutex};
     MemStage::FillPlay seam{buffer_cache.runtime.Seam(), MemStage::Site::Dma};
     return buffer_cache.DMAClear(src_address, amount, value);
 }
 
 bool AccelerateDMA::BufferCopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount) {
+    ONEF_LEND_RESULT(Copy, BufferCopy(src_address, dest_address, amount))
     std::scoped_lock lock{buffer_cache.mutex};
     MemStage& seam = buffer_cache.runtime.Seam();
     bool copied;
@@ -7023,6 +7165,8 @@ template <bool IS_IMAGE_UPLOAD>
 bool AccelerateDMA::DmaBufferImageCopy(const Tegra::DMA::ImageCopy& copy_info,
                                        const Tegra::DMA::BufferOperand& buffer_operand,
                                        const Tegra::DMA::ImageOperand& image_operand) {
+    ONEF_LEND_RESULT(Copy, DmaBufferImageCopy<IS_IMAGE_UPLOAD>(copy_info, buffer_operand,
+                                                               image_operand))
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
     const auto image_id = texture_cache.DmaImageId(image_operand, IS_IMAGE_UPLOAD);
     if (image_id == VideoCommon::NULL_IMAGE_ID) {
@@ -8192,6 +8336,7 @@ void RasterizerVulkan::UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs) 
 }
 
 void RasterizerVulkan::InitializeChannel(Tegra::Control::ChannelState& channel) {
+    ONEF_LEND(Channel, InitializeChannel(channel))
     CreateChannel(channel);
     {
         std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
@@ -8204,6 +8349,7 @@ void RasterizerVulkan::InitializeChannel(Tegra::Control::ChannelState& channel) 
 }
 
 void RasterizerVulkan::BindChannel(Tegra::Control::ChannelState& channel) {
+    ONEF_LEND(Channel, BindChannel(channel))
     const s32 channel_id = channel.bind_id;
     VideoCommon::MemStageStats::ChannelBound(channel_id);
     const size_t previous_channel = current_channel_id;
@@ -8230,9 +8376,14 @@ void RasterizerVulkan::BindChannel(Tegra::Control::ChannelState& channel) {
     query_cache.BindToChannel(channel_id);
     state_tracker.ChangeChannel(channel);
     state_tracker.InvalidateState();
+    if (VideoCommon::OneFollower::On()) {
+        // R's view follows the bound channel's engine (seeded in full at the next lent packet).
+        VideoCommon::OneFollower::SetEngine(maxwell3d);
+    }
 }
 
 void RasterizerVulkan::ReleaseChannel(s32 channel_id) {
+    ONEF_LEND(Channel, ReleaseChannel(channel_id))
     EraseChannel(channel_id);
     {
         std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
