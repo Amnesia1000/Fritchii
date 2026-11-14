@@ -1194,6 +1194,10 @@ bool OnRenderThread() noexcept {
     return t_render;
 }
 
+bool RenderInLentCall() noexcept {
+    return t_lent_depth != 0;
+}
+
 bool InLent() noexcept {
     return t_render && t_lent_depth != 0;
 }

@@ -1423,6 +1423,11 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   packets since its previous record), written every second to <log>/onef_lend_trace.bin, the
   site names to onef_lend_trace_sites.txt. work/lend_replay.py replays it with any kinds marked
   posted. A 72 MiB ring; at about 100,000 records a second the file grows 7 MiB a second.
+- One follower step 4, R's FlushRegion outside a lent call (an unlent draw's image upload reads
+  game memory): the gather and the buffer cache's download are E's, so R skips them when no
+  page of the range was ever GPU-written (nothing to download, exactly). A GPU-written page (or
+  a texture download R cannot order after the gather) counts must-be-0 "R needs E's buffer
+  flush" and stops step 4 for the session.
 - With FRITCHII_ONEF=1 (or LEAN), every 10 s "One follower lends by site" lists the 16 lent
   call sites that parked E longest (the rasterizer function's name and its op, rate and parked
   ms/s; "direct" = Lend called outside the rasterizer's entry points: lent draws, verify

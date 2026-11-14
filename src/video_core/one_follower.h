@@ -185,6 +185,12 @@ enum class Check : u8 {
     /// R waited for a lock E holds (the buffer cache's), outside a lent call: R reaches into E's
     /// cache ("player in the cache" as a lock-try); its stack is logged for the first reports.
     RenderWaitsEngineLock,
+    /// R outside a lent call (an unlent draw's image upload reads game memory through
+    /// MemoryManager::ReadBlock) needed a flush of E's buffer cache: pages the GPU may have
+    /// written. R cannot run it (E's cache, E running ahead): the upload reads game memory as it
+    /// is, the image takes the range again (it uploads at its next use) and step 4 stops for the
+    /// session, so every later draw is lent.
+    RenderNeedsEngineFlush,
     Count,
 };
 
@@ -194,7 +200,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Check::Count)> chec
     "build descriptors", "build render targets", "stream write", "owner on E", "owner on R",
     "build draw params", "build condition", "render packet missing", "drop not plain",
     "facts stale", "played lookup miss", "texture read ahead of R", "ring B pairing",
-    "R waits for E's lock",
+    "R waits for E's lock", "R needs E's buffer flush",
 };
 
 // --- The packet (E to R) -----------------------------------------------------------------------------
@@ -343,6 +349,8 @@ void ReadSwitches();
 [[nodiscard]] StepLevel Step() noexcept;
 /// True on R.
 [[nodiscard]] bool OnRenderThread() noexcept;
+/// R inside a lent call (E parked at its place): E's caches may be used.
+[[nodiscard]] bool RenderInLentCall() noexcept;
 /// R runs a lent call now (true on R inside a lent packet).
 [[nodiscard]] bool InLent() noexcept;
 
