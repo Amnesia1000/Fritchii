@@ -3467,6 +3467,18 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         // Only upload modified images
         return;
     }
+    // FRITCHII_ONEF_INVAL_E: pages E wrote after R's place, in an invalidation it ran without
+    // R (must be 0): the image takes that write as WriteMemory would have at its place, once
+    // this upload is done, so its next use uploads again.
+    const DAddr onef_addr = image.cpu_addr;
+    const size_t onef_size = image.guest_size_bytes;
+    const bool onef_ahead =
+        VideoCommon::OneFollower::WrittenAheadOfRender(onef_addr, onef_size);
+    SCOPE_EXIT {
+        if (onef_ahead) {
+            WriteMemory(onef_addr, onef_size);
+        }
+    };
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
 
     if (image.unmapped_tick != 0) {

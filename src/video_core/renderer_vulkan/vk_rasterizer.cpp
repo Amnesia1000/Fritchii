@@ -4586,6 +4586,14 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                 OneF::SetQueryKind(OneF::QueryKind::ReportOnBufferPage);
             } else {
                 OneF::SetQueryKind(OneF::QueryKind::PlainReport);
+                if (device) {
+                    // Item 2: E's invalidations see this page as a query's before R plays the op
+                    // (R marks the query cache's own filter only then).
+                    if (onef_report_pages == nullptr) [[unlikely]] {
+                        onef_report_pages = std::make_unique<VideoCommon::PageFilter>();
+                    }
+                    onef_report_pages->Mark(*device, 16);
+                }
                 struct Op {
                     RasterizerVulkan* self;
                     GPUVAddr gpu_addr;
@@ -5254,8 +5262,56 @@ void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::Cache
     }
 }
 
+bool RasterizerVulkan::OneFollowerInvalidationOnEngine(
+    std::span<const std::pair<DAddr, std::size_t>> sequences) {
+    namespace OneF = VideoCommon::OneFollower;
+    if (!OneF::InvalOnEngine()) {
+        return false;
+    }
+    // fable_b 11.1 item 2: a range on no page an image, a shader or a query was ever on (nor a
+    // report op E pushed and R has not played) invalidates nothing of R's: E runs the rest.
+    const auto hit = [&]() -> std::optional<OneF::InvalKind> {
+        for (const auto& [addr, size] : sequences) {
+            if (texture_cache.page_filter.Any(addr, size)) {
+                return OneF::InvalKind::Texture;
+            }
+            if (pipeline_cache.page_filter.Any(addr, size)) {
+                return OneF::InvalKind::Shader;
+            }
+            if (query_cache.page_filter.Any(addr, size) ||
+                (onef_report_pages != nullptr && onef_report_pages->Any(addr, size))) {
+                return OneF::InvalKind::Query;
+            }
+        }
+        return std::nullopt;
+    };
+    if (const auto first = hit()) {
+        OneF::CountInvalidation(*first);
+        return false;
+    }
+    // The Dekker pair with R's image registration (it marks the texture filter, fences, then
+    // reads these stamps before its upload, WrittenAheadOfRender): stamp, fence, look again.
+    // Either this sees R's mark (lent, in order) or R sees the stamp (its image uploads again).
+    for (const auto& [addr, size] : sequences) {
+        OneF::StampPageWrites(addr, size);
+    }
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (hit()) {
+        OneF::CountInvalidation(OneF::InvalKind::Recheck);
+        return false;
+    }
+    OneF::CountInvalidation(OneF::InvalKind::OnEngine);
+    return true;
+}
+
 void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) {
-    ONEF_LEND(Invalidation, InnerInvalidation(sequences))
+    // FRITCHII_ONEF_INVAL_E: on E with no range on R's pages, E runs the buffer half here and
+    // skips R's halves (they would find nothing); anything else is lent as before.
+    const bool onef_engine_half = VideoCommon::OneFollower::ShouldLend() &&
+                                  OneFollowerInvalidationOnEngine(sequences);
+    if (!onef_engine_half) {
+        ONEF_LEND(Invalidation, InnerInvalidation(sequences))
+    }
     if (VideoCommon::MemoryStageLink::BackServed() && !sequences.empty()) [[unlikely]] {
         // FRITCHII_MEMSTAGE_THREAD = 2 (plan 5.2): collected ranges on the back outside a run.
         // Must be 0; served on GPUMem all the same.
@@ -5289,7 +5345,7 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
         }
         return false;
     };
-    if (any(texture_cache.page_filter)) {
+    if (!onef_engine_half && any(texture_cache.page_filter)) {
         std::scoped_lock lock{texture_cache.mutex};
         for (const auto& [addr, size] : sequences) {
             texture_cache.WriteMemory(addr, size);
@@ -5365,6 +5421,9 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
                 buffer_cache.WriteMemory(range.first, range.second, true, true);
             }
         }
+    }
+    if (onef_engine_half) {
+        return; // R's halves: no range on their pages (OneFollowerInvalidationOnEngine)
     }
     if (any(query_cache.page_filter)) {
         for (const auto& [addr, size] : sequences) {
