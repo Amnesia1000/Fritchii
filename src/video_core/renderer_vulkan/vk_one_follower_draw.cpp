@@ -369,7 +369,9 @@ void OneFollowerDraw::LendDraw(bool is_indexed, u32 instance_count, LentReason r
     // The facts compare (Check::FactsStale): with the verify, the facts table entry E's fill
     // would use for these program registers now, before the lent draw publishes its own.
     FactsExpect expect{};
-    if (verify) {
+    // With rule 3 (FRITCHII_ONEF_E_PIPELINE) E fills from the pipeline it looked up and the facts
+    // table plays no part: nothing to compare.
+    if (verify && !VideoCommon::OneFollower::g_e_pipeline) {
         VideoCommon::MemStageShadow::ProgramId program_id;
         VideoCommon::MemStageShadow::BackProgramId(rasterizer.channel_state->maxwell3d,
                                                    program_id);

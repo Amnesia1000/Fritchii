@@ -175,6 +175,9 @@ enum class Check : u8 {
     /// new one built on R from the view, whose constant buffer bindings are only as new as the
     /// last lent packet). Step 4 stops for the session.
     PlayedLookupMiss,
+    /// FRITCHII_ONEF_QUERY_OPS: a plain report whose target page the buffer cache has registered
+    /// (E would upload it without seeing R's later write): it stays lent.
+    ReportOnBufferPage,
     Count,
 };
 
@@ -183,7 +186,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Check::Count)> chec
     "view pools",    "build pipeline",   "build image views", "build dynamic",
     "build descriptors", "build render targets", "stream write", "owner on E", "owner on R",
     "build draw params", "build condition", "render packet missing", "drop not plain",
-    "facts stale", "played lookup miss",
+    "facts stale", "played lookup miss", "report on buffer page",
 };
 
 // --- The packet (E to R) -----------------------------------------------------------------------------
@@ -197,6 +200,9 @@ enum class PacketKind : u8 {
     Draw = 0,  ///< an unlent draw: R plays it from the packet and its view (step 4)
     Lent = 1,  ///< E is parked: R plays what is before, runs `call`, releases E
     Delta = 2, ///< spans only (the delta before a lent op, so R's view is current when it runs)
+    /// A render op (fable_b 11.1): R runs `call.function` on the payload after the spans
+    /// (`reserved2` = the spans' bytes) at its stream place, E not parked (PushOp).
+    Op = 3,
 };
 
 enum SpanBit : u8 {
@@ -487,6 +493,40 @@ void EngineConsumed(u64 position) noexcept;
 /// its pipeline). Logs once at Critical; FRITCHII_ONEF_UNLEND then runs 0 for the session (every
 /// draw lent again). Any thread.
 void DisableUnlend(const char* why) noexcept;
+
+/// FRITCHII_ONEF_QUERY_OPS (live; fable_b 11.1 item 1): render enables that cannot have set host
+/// conditional rendering send nothing, counter resets and plain reports are render ops (no park).
+[[nodiscard]] bool QueryOps() noexcept;
+
+/// E: a render op R runs at its stream place while E goes on: `function(payload copy)` on R,
+/// `size` bytes (at most 64) copied into the packet. Elsewhere it runs in place.
+void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size);
+
+/// The pricing counter of fable_b 11.5: LentOp::Query by call site.
+enum class QueryKind : u8 {
+    ConditionSkipped,      ///< item 1(a): a render enable that could not change anything, not sent
+    ConditionOverride,     ///< lent: override always or never
+    ConditionTrue,         ///< lent: mode True
+    ConditionFalse,        ///< lent: mode False
+    ConditionConditional,  ///< lent: mode Conditional
+    ConditionIfEqual,      ///< lent: mode IfEqual
+    ConditionIfNotEqual,   ///< lent: mode IfNotEqual
+    Reset,                 ///< a counter reset (lent, or a render op with QUERY_OPS)
+    PlainReport,           ///< a report, not a fence (lent, or a render op with QUERY_OPS)
+    ReportOnBufferPage,    ///< a plain report kept lent by the guard
+    FenceReport,           ///< a fence-flagged report (lent; item 4)
+    PayloadRelease,        ///< a payload release (lent; item 4)
+    Count,
+};
+inline constexpr std::array<const char*, static_cast<size_t>(QueryKind::Count)> query_kind_names{
+    "condition skipped", "condition override", "condition true", "condition false",
+    "condition conditional", "condition if equal", "condition if not equal", "reset",
+    "plain report", "report on buffer page", "fence report", "payload release",
+};
+/// E, before the Lend or PushOp of a query: its kind (counted with the park's time).
+void SetQueryKind(QueryKind kind) noexcept;
+/// E: a query handled without a packet (item 1(a)).
+void CountQueryKind(QueryKind kind) noexcept;
 
 /// Live switch values (refreshed with Step()).
 [[nodiscard]] u32 UnlendMask() noexcept;

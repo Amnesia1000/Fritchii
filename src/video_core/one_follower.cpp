@@ -105,6 +105,15 @@ struct Impl {
     std::atomic<bool> e_waiting{};
 
     std::exception_ptr lent_error; ///< thrown by a lent call on R, rethrown on E
+    std::exception_ptr op_error;   ///< thrown by a render op on R, rethrown at E's next lend
+
+    // The pricing counter of fable_b 11.5 (E writes; the frame end logs on R).
+    std::array<std::atomic<u64>, static_cast<size_t>(QueryKind::Count)> query_count{};
+    std::array<std::atomic<u64>, static_cast<size_t>(QueryKind::Count)> query_parked_ns{};
+    std::array<u64, static_cast<size_t>(QueryKind::Count)> query_count_logged{};
+    std::array<u64, static_cast<size_t>(QueryKind::Count)> query_ns_logged{};
+    u64 query_log_ns{};
+    std::atomic<bool> query_ops_logged{};
 
     // The hang watchdog's view: written relaxed by E and R (no clock), read once a second.
     std::jthread watchdog;
@@ -132,8 +141,24 @@ using Detail::t_render;
 thread_local u32 t_lent_depth{};
 /// R: inside PlayDraw of an unlent draw packet.
 thread_local bool t_playing_draw{};
-/// E's packet scratch: header and spans before they go into the ring.
-thread_local std::vector<u8> t_scratch;
+/// E: the kind of the query being lent or pushed (SetQueryKind), consumed by it.
+thread_local QueryKind t_query_kind{QueryKind::Count};
+/// The most a packet's spans can take (every register word, the flags, the draw, the programs
+/// and the pools), and an op packet's payload after them.
+constexpr std::size_t MaxSpanBytes = sizeof(RegPair) * Maxwell3D::Regs::NUM_REGS +
+                                     sizeof(FlagBits) + sizeof(DrawValues) + sizeof(Programs) +
+                                     sizeof(Pools) + 64;
+constexpr std::size_t MaxPayloadBytes = 64;
+
+/// E's packet buffer (fable_b 11.1 item 0): allocated once per thread, written at a cursor, never
+/// resized or cleared on the hot path (the spans' bytes are written before they are sent).
+u8* PackBuffer() {
+    thread_local std::unique_ptr<u8[]> buffer;
+    if (!buffer) [[unlikely]] {
+        buffer.reset(new u8[sizeof(PacketHeader) + MaxSpanBytes + MaxPayloadBytes]);
+    }
+    return buffer.get();
+}
 /// E: the draw the next Lend or PackSpans is for (SetNextDraw), consumed by them.
 thread_local DrawValues t_next_draw{};
 thread_local bool t_next_draw_set{};
@@ -324,7 +349,34 @@ void RaisePlayed() {
     GpuSplit::Get().RaisePlayed((std::min)(intended, Floor(played, sent_packets)));
 }
 
+/// The query kinds' 10 s line (R, at frame-end lends).
+void LogQueryKinds() {
+    const u64 now = Common::Nx2Hitch::NowNs();
+    if (g.query_log_ns == 0) {
+        g.query_log_ns = now;
+        return;
+    }
+    if (now - g.query_log_ns < 10'000'000'000ULL) {
+        return;
+    }
+    const double seconds = static_cast<double>(now - g.query_log_ns) / 1e9;
+    g.query_log_ns = now;
+    std::string text;
+    for (size_t i = 0; i < query_kind_names.size(); ++i) {
+        const u64 count = g.query_count[i].load(std::memory_order_relaxed);
+        const u64 ns = g.query_parked_ns[i].load(std::memory_order_relaxed);
+        text += fmt::format("{}{} {:.0f}/s {:.1f} ms/s", i == 0 ? "" : ", ", query_kind_names[i],
+                            static_cast<double>(count - g.query_count_logged[i]) / seconds,
+                            static_cast<double>(ns - g.query_ns_logged[i]) / 1e6 / seconds);
+        g.query_count_logged[i] = count;
+        g.query_ns_logged[i] = ns;
+    }
+    LOG_INFO(HW_GPU, "One follower queries by kind (FRITCHII_ONEF_QUERY_OPS={}) {:.0f} s: {}",
+             QueryOps() ? 1 : 0, seconds, text);
+}
+
 void LogMaybe() {
+    LogQueryKinds();
     Stats::Logged now{};
     now.step = static_cast<StepLevel>(g.step.load(std::memory_order_relaxed));
     now.asked = g.asked.load(std::memory_order_relaxed);
@@ -407,6 +459,16 @@ Stats::RenderTime Play(const PacketHeader& header, const u8* spans) {
         }
         return Stats::RenderTime::DrawPackets;
     case PacketKind::Delta:
+        break;
+    case PacketKind::Op:
+        // A render op at its stream place (E not parked): R's own code on R's state.
+        try {
+            header.call.function(const_cast<u8*>(spans) + header.reserved2);
+        } catch (...) {
+            if (!g.op_error) {
+                g.op_error = std::current_exception();
+            }
+        }
         break;
     }
     return Stats::RenderTime::OtherPackets;
@@ -760,6 +822,10 @@ void SetNextDraw(u32 kind, bool indexed, bool indirect, u32 instance_arg) noexce
     t_next_draw_set = true;
 }
 
+namespace {
+void PushPacked(PacketHeader& header, u8* buffer, std::size_t body_bytes);
+} // Anonymous namespace
+
 void Lend(LentOp op, LentReason reason, void (*function)(void*), void* argument) {
     if (!Detail::t_engine || !g.thread.joinable()) {
         if (op == LentOp::Draw) {
@@ -771,10 +837,11 @@ void Lend(LentOp op, LentReason reason, void (*function)(void*), void* argument)
     const StepLevel step = Step();
     const bool timing = Stats::Timing();
     const u64 begin = timing ? Stats::Now() : 0;
+    const u64 begin_clock = op == LentOp::Query ? Common::Nx2Hitch::NowNs() : 0;
     const u64 behind = Behind();
     const u64 number = ++g.pushed;
-    std::vector<u8>& scratch = t_scratch;
-    scratch.resize(sizeof(PacketHeader));
+    u8* const buffer = PackBuffer();
+    std::size_t spans_bytes = 0;
     PacketHeader header{};
     header.kind = PacketKind::Lent;
     header.op = static_cast<u8>(op);
@@ -786,13 +853,9 @@ void Lend(LentOp op, LentReason reason, void (*function)(void*), void* argument)
     const u32 kind = op == LentOp::Draw ? TakeDrawKind(header) : 0;
     if (step >= StepLevel::View) {
         if (Maxwell3D* const engine = g.engine.load(std::memory_order_acquire)) {
-            // The spans: everything E changed since the last packet. Room for every word.
-            scratch.resize(sizeof(PacketHeader) + sizeof(RegPair) * Maxwell3D::Regs::NUM_REGS +
-                           sizeof(FlagBits) + sizeof(DrawValues) + sizeof(Programs) +
-                           sizeof(Pools) + 64);
-            const std::size_t bytes = PackSpans(
-                *engine, header, std::span<u8>{scratch}.subspan(sizeof(PacketHeader)));
-            scratch.resize(sizeof(PacketHeader) + bytes);
+            // The spans: everything E changed since the last packet, after the header.
+            spans_bytes = PackSpans(*engine, header,
+                                    std::span<u8>{buffer + sizeof(PacketHeader), MaxSpanBytes});
             if (op == LentOp::Draw) {
                 header.flags |= PacketVerify;
             }
@@ -801,44 +864,116 @@ void Lend(LentOp op, LentReason reason, void (*function)(void*), void* argument)
     if (op == LentOp::Draw) {
         t_next_draw_set = false;
     }
-    header.bytes = static_cast<u32>(scratch.size());
-    std::memcpy(scratch.data(), &header, sizeof(header));
-    Commit(scratch.data(), header.bytes, number, header.position, false);
+    header.bytes = static_cast<u32>(sizeof(PacketHeader) + spans_bytes);
+    std::memcpy(buffer, &header, sizeof(header));
+    Commit(buffer, header.bytes, number, header.position, false);
     Stats::Pushed(header, kind, behind);
     // The park: R plays everything before, runs the call, releases E.
     g.e_wait_op.store(static_cast<u8>(op), std::memory_order_relaxed);
     EngineWait([&] { return g.played.load(std::memory_order_acquire) >= number; }, EWait::Park,
                number);
+    if (op == LentOp::Query && t_query_kind != QueryKind::Count) {
+        const size_t kind_index = static_cast<size_t>(t_query_kind);
+        g.query_count[kind_index].fetch_add(1, std::memory_order_relaxed);
+        g.query_parked_ns[kind_index].fetch_add(Common::Nx2Hitch::NowNs() - begin_clock,
+                                                std::memory_order_relaxed);
+        t_query_kind = QueryKind::Count;
+    }
     if (timing) {
         Stats::Parked(op, Stats::Now() - begin);
     }
     if (g.lent_error) [[unlikely]] {
         std::rethrow_exception(std::exchange(g.lent_error, nullptr));
     }
+    if (g.op_error) [[unlikely]] {
+        std::rethrow_exception(std::exchange(g.op_error, nullptr));
+    }
 }
 
-void Push(PacketHeader& header, std::span<const u8> spans) {
-    if (!Detail::t_engine || !g.thread.joinable()) {
-        t_next_draw_set = false;
+void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size) {
+    if (!Detail::t_engine || !g.thread.joinable() || size > MaxPayloadBytes) {
+        function(const_cast<void*>(payload));
         return;
     }
+    if (op == LentOp::Query && t_query_kind != QueryKind::Count) {
+        g.query_count[static_cast<size_t>(t_query_kind)].fetch_add(1, std::memory_order_relaxed);
+        t_query_kind = QueryKind::Count;
+    }
+    u8* const buffer = PackBuffer();
+    PacketHeader header{};
+    header.kind = PacketKind::Op;
+    header.op = static_cast<u8>(op);
+    header.call = LentCall{function, nullptr};
+    std::size_t spans_bytes = 0;
+    if (Step() >= StepLevel::View) {
+        if (Maxwell3D* const engine = g.engine.load(std::memory_order_acquire)) {
+            // E's changes before the op, so R's view is at the op's place when it runs.
+            spans_bytes = PackSpans(*engine, header,
+                                    std::span<u8>{buffer + sizeof(PacketHeader), MaxSpanBytes});
+        }
+    }
+    header.reserved2 = static_cast<u32>(spans_bytes);
+    std::memcpy(buffer + sizeof(PacketHeader) + spans_bytes, payload, size);
+    PushPacked(header, buffer, spans_bytes + ((size + 7) & ~u32{7}));
+}
+
+bool QueryOps() noexcept {
+    using namespace VideoCore::Nx2Debug;
+    const bool on = g.on && SwitchValue(g_onef_query_ops, "FRITCHII_ONEF_QUERY_OPS") != 0;
+    if (on && !g.query_ops_logged.load(std::memory_order_relaxed) &&
+        !g.query_ops_logged.exchange(true)) [[unlikely]] {
+        // fable_b 11.3: with reports landing on R the full-drain acquire poll drains to R; the
+        // lagged check (EXP12 = 5) becomes the default, its target R's position (`played`).
+        const int exp12 = Experiment(12);
+        if (exp12 != 5 && exp12 != 6) {
+            g_experiments[12].store(5, std::memory_order_relaxed);
+            BumpSwitchGeneration();
+        }
+        LOG_INFO(HW_GPU,
+                 "One follower: FRITCHII_ONEF_QUERY_OPS=1 (render enables that cannot set host "
+                 "conditional rendering not sent, resets and plain reports as render ops); EXP12 "
+                 "{} -> {}",
+                 exp12, Experiment(12));
+    }
+    return on;
+}
+
+void SetQueryKind(QueryKind kind) noexcept {
+    t_query_kind = kind;
+}
+
+void CountQueryKind(QueryKind kind) noexcept {
+    g.query_count[static_cast<size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
+}
+
+namespace {
+/// E: commits a packet whose body (`body_bytes` after the header) is already in PackBuffer().
+void PushPacked(PacketHeader& header, u8* buffer, std::size_t body_bytes) {
     const u64 behind = Behind();
     header.number = ++g.pushed;
     header.position = GpuSplit::Get().BackEntryPosition();
     if (header.draw_seq == 0) {
         header.draw_seq = header.kind == PacketKind::Draw ? ++g.draw_seq : g.draw_seq;
     }
-    header.bytes = static_cast<u32>(sizeof(PacketHeader) + spans.size());
+    header.bytes = static_cast<u32>(sizeof(PacketHeader) + body_bytes);
     const u32 kind = header.kind == PacketKind::Draw ? TakeDrawKind(header) : 0;
     t_next_draw_set = false;
-    std::vector<u8>& scratch = t_scratch;
-    scratch.resize(header.bytes);
-    std::memcpy(scratch.data(), &header, sizeof(header));
-    if (!spans.empty()) {
-        std::memcpy(scratch.data() + sizeof(header), spans.data(), spans.size());
-    }
-    Commit(scratch.data(), header.bytes, header.number, header.position, true);
+    std::memcpy(buffer, &header, sizeof(header));
+    Commit(buffer, header.bytes, header.number, header.position, true);
     Stats::Pushed(header, kind, behind);
+}
+} // Anonymous namespace
+
+void Push(PacketHeader& header, std::span<const u8> spans) {
+    if (!Detail::t_engine || !g.thread.joinable()) {
+        t_next_draw_set = false;
+        return;
+    }
+    u8* const buffer = PackBuffer();
+    if (!spans.empty()) {
+        std::memcpy(buffer + sizeof(PacketHeader), spans.data(), spans.size());
+    }
+    PushPacked(header, buffer, spans.size());
 }
 
 void Drain() {
@@ -877,10 +1012,11 @@ void PushDraw(const Maxwell3D& engine, u64 draw_seq, u64 buffer_number, u8 flags
     header.draw_seq = draw_seq;
     header.buffer_number = buffer_number;
     header.pipeline = pipeline;
-    std::vector<u8> spans(sizeof(RegPair) * Maxwell3D::Regs::NUM_REGS + sizeof(FlagBits) +
-                          sizeof(DrawValues) + sizeof(Programs) + sizeof(Pools) + 64);
-    const std::size_t bytes = PackSpans(engine, header, spans);
-    Push(header, std::span<const u8>{spans.data(), bytes});
+    // Packed straight into the packet buffer, after the header: no copy, no allocation.
+    u8* const buffer = PackBuffer();
+    const std::size_t bytes =
+        PackSpans(engine, header, std::span<u8>{buffer + sizeof(PacketHeader), MaxSpanBytes});
+    PushPacked(header, buffer, bytes);
 }
 
 void SetEngine(Maxwell3D* engine) noexcept {

@@ -229,6 +229,9 @@ private:
     std::array<u64, 2> onef_pipeline_hashes{};
     bool onef_pipeline_seen{};
     std::string onef_precheck_note; ///< R: the pre-record check's must-be-0 text
+    /// E: a render enable that can begin host conditional rendering was lent (sticks). While
+    /// false, FRITCHII_ONEF_QUERY_OPS sends no override/True/False render enable.
+    bool onef_condition_may_be_set{};
 
     /// False when no page of the range was ever written by the GPU through the buffer cache.
     bool MayBeGpuModified(DAddr addr, u64 size);
