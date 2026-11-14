@@ -90,6 +90,11 @@ public:
         /// (Scheduler::ResumePending, then ResumeAcquire): the first answer is kept.
         static constexpr u8 RouteUnset = 0xFF;
         u8 resume_route{RouteUnset};
+        /// Counted once in the 100 ms pending count (FenceWriterStats).
+        bool long_pending{};
+        /// EXP12=5/6: the ring position its next lagged check waits for (the position sent at
+        /// the previous check; at the suspension for the first).
+        u64 lagged_target{};
 
         [[nodiscard]] bool Matches(u32 current) const;
     };

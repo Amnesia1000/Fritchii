@@ -65,6 +65,8 @@ enum class DrainSite : u32 {
     FenceWriters,   ///< EXP12: a fence release waits for the writers a semaphore read can't see
     QmdRead,        ///< EXP13=2: the front's QMD scheduler copy reads a QMD queued work writes
     ListCopies,     ///< Lists on GPU-written pages: the dispatches and copies before the last sync
+    LaggedCheck,    ///< EXP12=5/6: a suspended acquire's poll waits for what was sent 1 ms before
+    FenceWordWriters, ///< EXP12=6: a fence release waits for the queued writers of its word
     Count,
 };
 
@@ -73,7 +75,8 @@ inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> 
     "list writers", "list sync",      "list flush", "macro dma read",  "macro dma writes",
     "macro dma flush",
     "gp sync fence", "map",           "front start", "front verify",  "macro dma check",
-    "macro dma dispatch", "fence writers", "qmd read", "list copy writers",
+    "macro dma dispatch", "fence writers", "qmd read", "list copy writers", "lagged check",
+    "fence word writers",
 };
 
 /// EXP13=2: which queued writer set GpuSplit::QueuedGuestWriters' position (a wait cause).
@@ -1118,6 +1121,10 @@ public:
         return ++write_stamp_tags;
     }
     [[nodiscard]] u64 WriteStamp(u64 device, u64 size, GPUVAddr address, u64 skip_tag = 0) const;
+    /// Whether EnableWriteStamps ran (WriteStamp answers the write position until then).
+    [[nodiscard]] bool WriteStampsOn() const {
+        return write_stamps;
+    }
     /// The QMD wait floor counters (fable_qmd_wait_brief piece 1), front only. WriteStampWhy is
     /// WriteStamp's diagnostic twin, for the two QMD sites: `stamp` is what WriteStamp answers,
     /// `floorless` what it answers without the ranged overflow (EXP126 = 1), `term` which term

@@ -789,13 +789,46 @@ Lines, every 5 s:
   when a word read met it within 1 ms of the acquire, as 2's read after its wait; by a latch or
   later the word may already be a later write's. Compare "safety: N checked" in the QMD
   prediction's reduction bound line between 2 and 4.
-- With EDEN_NX2_GPU_WAKE=0 (the default) a latch does not wake the GPU thread: once nothing
-  moved for 500 us it sleeps 1 ms at a time (EXP6=0), so a latched resume can wait out one
-  sleep. 4 leans on latches for the acquires 2 met after its wait.
+- With EDEN_NX2_GPU_WAKE=0 (the default before 2026-11-14) a latch does not wake the GPU
+  thread: once nothing moved for 500 us it sleeps 1 ms at a time (EXP6=0), so a latched resume
+  can wait out one sleep. 4 leans on latches for the acquires 2 met after its wait.
 
 Must stay 0 at 4: the 2 s "waits on semaphore" warning. Judge 2 against 4 with a live toggle:
 "fence writers" in the front waits by site to 0, the "acquire" site under 20 ms/s, "from
 acquire to resume" not higher.
+
+5 = 4, and the poll of a suspended acquire whose word reads current (CanResumeAcquire's
+readable branch) no longer drains the back in full (fable_fence_writers_2 section 3). Once 1 ms
+passed since the last check (the 16-poll count no longer applies there), a lagged check
+publishes what was sent, waits only for what was sent by the previous check (by the suspension
+for the first: the "lagged check" drain site), then asks the latch and the word again and the
+queued release, QMD prediction and GEQUAL tests, without ReadSemaphoreWord. Exact: the drain
+added only the latch, asked again, and ReadSemaphoreWord, which differs from the plain read
+only when the buffer cache holds GPU-written bytes of the word; those mark its page GPU-written
+(never cleared), which makes the word unreadable, so that poll takes the drain as before. No
+hang: everything sent is published, and what was sent by one check has run by the next, where
+it latched, shows in the word, or marked the page. Only with EDEN_NX2_GPU_WAKE on (read live)
+and default fences; otherwise the drain as for 4 (without the wake an idle front sleeps 1 ms
+at a time, which the drain hid). Unreadable words keep the drain path.
+
+Lines at 5: the "Fence writer resumes" line adds lagged checks/s, how many waited and their
+time (expect near 0), and how many found the acquire met; the "lagged check" route in the
+histogram and per channel; "pending over 100 ms" (every mode, counted once per acquire, fence
+path and others; must stay 0). Judge 4 against 5 (GPU_WAKE=1 on both): poll drains of these
+acquires pending under 2 ms to near 0, the split drain zone down, latch and lagged resumes
+under 1 ms up, channel 2's time to resume down.
+
+6 = 5, but the acquire waits when something queued can write its word itself
+(fable_fence_writers_2 section 4): the target is the newest of the QMD prediction's record for
+the word that has not landed, the write stamp over the word (GpuSplit::WriteStamp, which
+counts unbounded writers too) and a queued puller release to it, taken before the fence
+release is queued. Past the back's position: wait for it (drain site "fence word writers"),
+then the latch and the word, as 2. Otherwise suspend at once, as 4. While the write stamps are
+off (before the front's QMD copy started them) it waits for 2's target. Exact as 4: it only
+chooses when to look. The polls check lagged as 5. The "Fence writer resumes" line adds word
+writer waits/s, which term set their target (unlanded prediction record, write stamp, queued
+release), how many had the stamps off, and how many acquires had none queued. Judge 5 against
+6 (GPU_WAKE=1).
 
 ### EXP17
 
