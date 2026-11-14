@@ -168,11 +168,38 @@ So later reads of the page take the same check (a short scan) until a drain rene
   a second, passed (with 2: would be served), of those drained after all for another writer (the
   EXP10 dispatch check or byte lists), and the drained ones by first failed check: a note still
   queued, notes past the table, two pages, GPU-written page, an async report owed, a listed
-  report; verify compared and differed (must be 0, with the session total).
+  report; then the compute/copy checks by cause (unbounded writer, writer range overlap, writer
+  ranges past the scan, writer ranges left the ring, dispatch queued, dispatch write overlap,
+  unbounded dispatch, the dispatch scan's limit passed by the stamps / refused by a block stamped
+  since / by a wide write since, listed byte overlap); the reads served (with 2: that would be)
+  by what was spared (a noted write, the dispatch scan's limit, both); verify compared and
+  differed (must be 0, with the session total).
 - Served reads count as "skipped the drain" in the "DMA snapshot" line.
 - Expected at the market: about 1,500 to 2,000 of the 2,300 drains a second go (the 1,520 counter
   or sample reports and 548 "other" notes the back had run, minus the ones that owe a report or
   are listed), 45 us each: about 70 to 90 ms/s of front waiting.
+
+The dispatch scan's limit (any read, with the switch on; EXP10's "past the scan"). EXP10's
+dispatch check compares the dispatch writes the back recorded since the page was last checked, at
+most 2,048 of a ring of 8,192; past that, or when the ring dropped some, it answers "may write"
+and the read drains (about 1,660 a second at the market once the noted writes pass, because the
+pages are read rarely). By then the check has made every dispatch sent since the snapshot run
+(it waits for that, or answers "queued" first), and every write the back recorded for them
+(GpuSplit::AppendDispatchWrite: storage and texture buffers the buffer cache marks written,
+written images' guest ranges, indirect arguments, QMD releases) stamped its 64 KB blocks with the
+record's position before the record was counted. So the read passes when no block stamp of the
+page is at or after the snapshot (GpuSplit::DispatchStampsMissSince): the answer the scan would
+give without its limit, or stricter (the table is hashed by block, 65,536 slots; a collision only
+makes a stamp newer). It then counts as the scan's miss (the page's checked count moves on).
+- Still drains: a block stamped since, and a write that stamps everything (an unbounded or
+  unconfirmed dispatch, an image without a guest range, a range over 4 GB). Unbounded compute and
+  copy writers, writer ranges, unranged writers and dispatches still queued are asked before and
+  drain as before.
+- Not the GPU-written page bit: it is set for the buffer cache's GPU-modified ranges only, not for
+  images a dispatch writes (texture cache) nor QMD releases (written into guest memory by the
+  fence callback), and it is never cleared, so a page written once would never pass.
+- The stamps start over with each split session (positions start at 0).
+- 2 verifies these reads as the others.
 
 ### Acquire resumes met by (always on, a counter)
 
