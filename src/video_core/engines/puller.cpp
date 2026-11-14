@@ -725,14 +725,18 @@ struct FenceWriterStats {
     u64 lagged_wait_ns{};
     u64 lagged_met{};
     /// EXP12=6: acquires whose word had a queued writer (waited for it) or none (suspended at
-    /// once), which term set the wait's target (an unlanded prediction record, the write stamp,
-    /// a queued puller release), and those with the write stamps off (mode 2's target).
+    /// once), which term set the wait's target (an unlanded prediction record, the block or page
+    /// stamp over the word, a queued puller release), and those with the write stamps off (mode
+    /// 2's target). `stamp_terms`: the term the full WriteStamp would have waited for, by
+    /// StampTerm (counting only).
     u64 word_waits{};
     u64 word_none{};
     std::array<u64, 3> word_terms{};
     u64 word_stamps_off{};
+    std::array<u64, static_cast<size_t>(VideoCommon::StampTerm::Count)> stamp_terms{};
     /// Suspended acquires still pending 100 ms after the acquire, each counted once: [0] fence
-    /// path, [1] the others. Must stay 0.
+    /// path, [1] the others. Acquires the guest CPU releases can legitimately wait that long
+    /// (loads, pauses): compare with EXP12=2 in the same scene.
     std::array<u64, 2> long_pending{};
     std::array<Channel, 8> channels{};
     size_t channel_count{};
@@ -857,6 +861,21 @@ struct FenceWriterStats {
             add_row(channels[i], false);
         }
         add_row(other_channels, true);
+        // StampTerm's order (gpu_split.h).
+        constexpr std::array<const char*, static_cast<size_t>(VideoCommon::StampTerm::Count)>
+            stamp_names{"none",          "block stamp",      "page stamp",
+                        "stamps on since/over 1 MiB", "unknown write", "unbounded writer",
+                        "unranged writer", "queued function", "3D method write",
+                        "ranged overflow"};
+        std::string stamp_text;
+        for (size_t i = 0; i < stamp_terms.size(); ++i) {
+            if (stamp_terms[i] != 0) {
+                stamp_text += fmt::format(" {} {:.0f}/s", stamp_names[i], rate(stamp_terms[i]));
+            }
+        }
+        if (stamp_text.empty()) {
+            stamp_text = " nothing";
+        }
         LOG_INFO(HW_GPU,
                  "Fence writer resumes (EXP12={}): writer waits skipped {:.0f}/s (back short of "
                  "the target {:.0f}/s); acquire to resume per route, /s under 100 us/500 us/1 "
@@ -864,9 +883,11 @@ struct FenceWriterStats {
                  "{:.2f} ms/s, 2 ms or more {:.0f}/s {:.2f} ms/s, of other acquires {:.0f}/s "
                  "{:.2f} ms/s; lagged checks (EXP12=5/6) {:.0f}/s, waited {:.0f}/s {:.2f} ms/s, "
                  "met there {:.0f}/s; word writer waits (EXP12=6) {:.0f}/s (target by an "
-                 "unlanded prediction record {:.0f}, the write stamp {:.0f}, a queued release "
-                 "{:.0f}; stamps off {:.0f}), none queued {:.0f}/s; "
-                 "pending over 100 ms (must be 0): {} fence path, {} other; "
+                 "unlanded prediction record {:.0f}, the block/page stamp {:.0f}, a queued "
+                 "release {:.0f}; stamps off {:.0f}), none queued {:.0f}/s; the full write "
+                 "stamp would have waited by:{}; "
+                 "pending over 100 ms (compare with EXP12=2 in the same scene): {} fence path, "
+                 "{} other; "
                  "reduction bounds of the resumed (EXP12=4) {:.0f}/s checked, "
                  "{:.0f}/s not (latch, front answer, drain or after 1 ms); by channel:{}",
                  VideoCore::Nx2Debug::Experiment(12), rate(skipped), rate(skipped_behind), routes,
@@ -874,7 +895,8 @@ struct FenceWriterStats {
                  ms(poll_drain_ns[1]), rate(other_poll_drains), ms(other_poll_drain_ns),
                  rate(lagged_checks), rate(lagged_waits), ms(lagged_wait_ns), rate(lagged_met),
                  rate(word_waits), rate(word_terms[0]), rate(word_terms[1]),
-                 rate(word_terms[2]), rate(word_stamps_off), rate(word_none), long_pending[0],
+                 rate(word_terms[2]), rate(word_stamps_off), rate(word_none), stamp_text,
+                 long_pending[0],
                  long_pending[1], rate(resume_bound_checks), rate(resume_bound_dropped), rows);
         *this = {};
         since = now;
@@ -1204,13 +1226,23 @@ static bool ReleaseFencesForReadable(DmaPusher& dma_pusher, const void* owner,
             const u64 predicted = VideoCommon::QmdPrediction::Enabled()
                                       ? VideoCommon::QmdPrediction::NewestUnlandedPosition(*device)
                                       : 0;
-            const u64 stamp = split.WriteStamp(*device, sizeof(u32), acquire.address);
+            // The block and page stamps alone: WriteStamp's floors (writers of anything, 3D
+            // method writes, ...) would make this wait as often as 2. A wait skipped is never
+            // a wrong answer.
+            const u64 stamp = split.BytesStamp(*device, sizeof(u32), acquire.address);
             u64 release = 0;
             (void)split.QueuedReleaseTo(*device, done, release);
             target = (std::max)({predicted, stamp, release});
             word_writer = target > done;
             if (word_writer) {
                 ++stats.word_terms[target == predicted ? 0 : target == stamp ? 1 : 2];
+            }
+            // Counting only: the term the full WriteStamp would have waited for, real writers
+            // (block, page) against floors.
+            if (const auto why = split.WriteStampWhy(*device, sizeof(u32), acquire.address);
+                why.stamp > done) {
+                ++stats.stamp_terms[(std::min)(static_cast<size_t>(why.term),
+                                               stats.stamp_terms.size() - 1)];
             }
         } else {
             ++stats.word_stamps_off;
@@ -1314,7 +1346,7 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
                     dma_pusher.memory_manager.Read<u32>((pending_acquire->address & ~GPUVAddr{0xf}) + 8),
                     dma_pusher.memory_manager.Read<u32>((pending_acquire->address & ~GPUVAddr{0xf}) + 12));
     };
-    // Acquires pending 100 ms, counted once each (FenceWriterStats; must stay 0).
+    // Acquires pending 100 ms, counted once each (FenceWriterStats).
     if (!pending_acquire->long_pending &&
         std::chrono::steady_clock::now() - pending_acquire->since >
             std::chrono::milliseconds{100}) {
@@ -1827,6 +1859,12 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                         WatchedSemaphoreWord(dma_pusher.memory_manager, acquire.address));
                 }
                 pending_acquire = acquire;
+                // EXP12=5/6, as the other suspension: the first lagged check comes 1 ms from
+                // here, not at the first poll (other modes keep their first poll's drain).
+                if (const int fence_mode = VideoCore::Nx2Debug::Experiment(12);
+                    fence_mode == 5 || fence_mode == 6) {
+                    pending_acquire->last_drain = std::chrono::steady_clock::now();
+                }
                 pending_acquire->lagged_target = VideoCommon::GpuSplit::Get().SentPosition();
                 dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
                 VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);

@@ -1125,6 +1125,17 @@ public:
     [[nodiscard]] bool WriteStampsOn() const {
         return write_stamps;
     }
+    /// EXP12=6: WriteStamp's block and page stamps over the bytes alone, without its floors
+    /// (unbounded and unranged writers, 3D method writes, functions, unknown writes, the
+    /// overflow): the newest write noted over them. The write position while the stamps are off.
+    [[nodiscard]] u64 BytesStamp(u64 device, u64 size, GPUVAddr address) const {
+        if (!write_stamps) {
+            return write_position;
+        }
+        return (std::min)((std::max)(StampOf(device, device + size, false, 0),
+                                     StampOf(address, address + size, true, 0)),
+                          write_position);
+    }
     /// The QMD wait floor counters (fable_qmd_wait_brief piece 1), front only. WriteStampWhy is
     /// WriteStamp's diagnostic twin, for the two QMD sites: `stamp` is what WriteStamp answers,
     /// `floorless` what it answers without the ranged overflow (EXP126 = 1), `term` which term
