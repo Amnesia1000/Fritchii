@@ -817,7 +817,8 @@ void ReadSwitches() {
     using namespace VideoCore::Nx2Debug;
     g.on = SwitchValue(g_onef, "FRITCHII_ONEF") == 1;
     g.pin = SwitchValue(g_onef_pin, "FRITCHII_ONEF_PIN", 1) != 0;
-    g_e_pipeline = g.on && SwitchValue(g_onef_e_pipeline, "FRITCHII_ONEF_E_PIPELINE") == 1;
+    // Default 1 (the step 4 probes ran with it; 0 keeps the facts table path).
+    g_e_pipeline = g.on && SwitchValue(g_onef_e_pipeline, "FRITCHII_ONEF_E_PIPELINE", 1) == 1;
     if (g_e_pipeline) {
         LOG_INFO(HW_GPU, "One follower: E owns the pipeline lookup (FRITCHII_ONEF_E_PIPELINE=1)");
     }
