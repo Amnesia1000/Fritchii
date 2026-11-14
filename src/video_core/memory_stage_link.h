@@ -79,6 +79,7 @@ public:
         PassWaitMissing,
         PassListedFreed,
         PassListedLeft,
+        SetupKeepDisagree,
         Count,
     };
 

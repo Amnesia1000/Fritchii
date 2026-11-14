@@ -351,6 +351,7 @@ constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::Check::Co
     "a served wait for idle with no pass record (the back ran it in a served entry)",
     "a pass record's slot freed while its taken writes were listed and not applied (rule T)",
     "taken writes left listed (applying_writes) at the ring's end beyond the records kept",
+    "a kept draw setup whose full lookup gave other facts or none (FRITCHII_MEMSTAGE_SETUP_KEEP=2)",
 };
 static_assert(LINK_CHECK_NAMES.back() != nullptr, "a name for every check");
 constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::ListDraw::Count)>

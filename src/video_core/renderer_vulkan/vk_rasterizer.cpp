@@ -1383,9 +1383,7 @@ bool RasterizerVulkan::StageFillDraw(VideoCommon::MemStageShadowEngine& copy, bo
         return false; // GPUMem is stopping: the draw is left to the back
     }
     // Join 1 (spec 4.4): a miss leaves the draw to the back, which publishes the facts.
-    VideoCommon::MemStageShadow::ProgramId program_id;
-    VideoCommon::MemStageShadow::StageProgramId(copy, program_id);
-    if (!mem_stage.LookupFacts(program_id, stage_facts)) {
+    if (!StageSetupFacts(copy)) {
         link.NoteLevelDraw(4);
         return false;
     }
@@ -1545,6 +1543,76 @@ bool RasterizerVulkan::StageFillDraw(VideoCommon::MemStageShadowEngine& copy, bo
         link.NoteLevelDraw(7);
     }
     return filled;
+}
+
+bool RasterizerVulkan::StageSetupFacts(const VideoCommon::MemStageShadowEngine& copy) {
+    // FRITCHII_MEMSTAGE_SETUP_KEEP (live; fable_stage_levelpoints 15.3 row 3): most draws repeat
+    // the programs of the draw before. The lookup's inputs are the copy's program registers (the
+    // 49 words StageProgramId hashes) and the facts table; the table moves its generation at
+    // every write. So while both are what the last lookup that found the facts saw, stage_facts
+    // still holds that lookup's answer, and the hash and the lookup (its words compare and the
+    // copy of the facts, with the infos' reference count) are skipped. The words are compared
+    // themselves, not a counter of program register writes: a write path that missed the
+    // counter (the entry loop's fast paths, a resync) would keep stale facts; 392 bytes compare
+    // in a few ns. 0 = today, 1 = keep, 2 = verify (the full lookup at every kept setup, compared
+    // with what was kept: must be 0, on the link line).
+    namespace Shadow = VideoCommon::MemStageShadow;
+    namespace Debug = VideoCore::Nx2Debug;
+    const int keep =
+        Debug::SwitchValue(Debug::g_memstage_setup_keep, "FRITCHII_MEMSTAGE_SETUP_KEEP");
+    Shadow::ProgramId program_id;
+    if (keep == 0) {
+        setup_keep.valid = false;
+        Shadow::StageProgramId(copy, program_id);
+        return mem_stage.LookupFacts(program_id, stage_facts);
+    }
+    // Before the words and the lookup: a table write after this load moves the generation, so
+    // the next setup looks up again (LookupFacts' own cache keeps its generation the same way).
+    const u64 generation = mem_stage.FactsGeneration();
+    Shadow::StageProgramWords(copy, program_id.words);
+    const bool same = setup_keep.valid && setup_keep.generation == generation &&
+                      setup_keep.words == program_id.words;
+    ++setup_keep.setups;
+    bool found;
+    if (same && keep == 1) {
+        ++setup_keep.kept;
+        found = true;
+    } else {
+        program_id.key = Shadow::ProgramWordsKey(program_id.words);
+        if (same) {
+            // Verify: the full setup anyway, its answer used, the kept one compared with it.
+            MemStage::StagedFacts looked{};
+            found = mem_stage.LookupFacts(program_id, looked);
+            ++setup_keep.checked;
+            if (!found || !(looked == stage_facts)) [[unlikely]] {
+                ++setup_keep.disagreed;
+                VideoCommon::MemoryStageLink::Note(
+                    VideoCommon::MemoryStageLink::Check::SetupKeepDisagree,
+                    found ? "other facts" : "the lookup missed");
+            }
+            if (found) {
+                stage_facts = std::move(looked);
+            }
+        } else {
+            found = mem_stage.LookupFacts(program_id, stage_facts);
+        }
+        setup_keep.valid = found;
+        setup_keep.generation = generation;
+        setup_keep.words = program_id.words;
+    }
+    constexpr u64 SetupKeepLogEvery = u64{1} << 20; // about 10 s at the market's draw rate
+    if (setup_keep.setups >= SetupKeepLogEvery) [[unlikely]] {
+        LOG_INFO(HW_GPU,
+                 "Memory stage draw setup (FRITCHII_MEMSTAGE_SETUP_KEEP={}): {} setups, facts kept "
+                 "{}, verified {}, disagreed {} (must be 0)",
+                 keep, setup_keep.setups, setup_keep.kept, setup_keep.checked,
+                 setup_keep.disagreed);
+        setup_keep.setups = 0;
+        setup_keep.kept = 0;
+        setup_keep.checked = 0;
+        setup_keep.disagreed = 0;
+    }
+    return found;
 }
 
 void RasterizerVulkan::CheckServedJoins(DAddr addr, u64 size) {

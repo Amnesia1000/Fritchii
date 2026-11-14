@@ -3248,6 +3248,15 @@ void StageProgramId(const MemStageShadowEngine& copy, ProgramId& out) {
     out.key = HashProgramWords(out.words);
 }
 
+void StageProgramWords(const MemStageShadowEngine& copy,
+                       std::array<u64, ProgramWordCount>& words) {
+    ProgramWords(copy, words);
+}
+
+u64 ProgramWordsKey(const std::array<u64, ProgramWordCount>& words) {
+    return HashProgramWords(words);
+}
+
 void ReadSwitch() {
     const char* const value = std::getenv("FRITCHII_MEMSTAGE_SHADOW");
     g_mode = value != nullptr ? std::atoi(value) : 0;

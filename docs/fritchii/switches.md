@@ -162,6 +162,30 @@ in the wait restarts the spin, as in the wait for the front.
 - Measure 0 against 200 with profile_toggle.py in one session. Its worth falls as P3 and compute
   part 2 remove the stops it shortens.
 
+### FRITCHII_MEMSTAGE_SETUP_KEEP
+
+FRITCHII_MEMSTAGE_SETUP_KEEP (live, default 0 = today; work\fable_stage_levelpoints.md 15.3 row 3),
+with FRITCHII_MEMSTAGE_THREAD=2: GPUMem's draw setup (RasterizerVulkan::StageFillDraw's join 1)
+keeps the facts of the last lookup while nothing it read changed, instead of hashing the program
+registers and looking the facts up at every served draw.
+- 0: today: the program id (49 words hashed) and LookupFacts at every draw.
+- 1: keep. The lookup's inputs are the copy's program registers (the six pipeline slots and the
+  program region, the 49 words the id hashes) and the facts table, whose generation moves under
+  its lock at every write. When the words equal the last lookup's and the generation is the one
+  read before it, the facts it found are still in stage_facts: no hash, no lookup, no copy of the
+  facts. The words are compared themselves (a few ns), not a write counter, so no write path of
+  the copy (the entry loop's fast paths, resyncs, the sink) can be missed. A lookup that missed
+  keeps nothing.
+- 2: verify. Every setup 1 would keep does the full lookup anyway, uses its answer and compares
+  it with the kept facts (every field; the programs' infos by pointer). A difference or a miss is
+  "a kept draw setup whose full lookup gave other facts or none" on the link line's must-be-0
+  list (logged with "other facts" or "the lookup missed").
+- "Memory stage draw setup (FRITCHII_MEMSTAGE_SETUP_KEEP=n)" (HW_GPU, Info, every 1,048,576
+  setups at 1 or 2, about 10 s at the market): setups, facts kept (1), verified (2), disagreed
+  (must be 0).
+- Test: one window at 2 (disagreed 0, verified close to the kept count 1 gives), then a 0/1
+  toggle with the stage on. The GPU profile at 2 shows the setup's own split ("setup program").
+
 ### FRITCHII_E2C_CENSUS (the "Front 0xe2c misses" line)
 
 FRITCHII_E2C_CENSUS (live, default 0 since 2026-11-14 = no work at all on the miss path; 1 = the

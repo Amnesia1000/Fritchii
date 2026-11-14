@@ -244,6 +244,11 @@ struct ProgramId {
 };
 void BackProgramId(const Tegra::Engines::Maxwell3D& maxwell3d, ProgramId& out);
 void StageProgramId(const MemStageShadowEngine& copy, ProgramId& out);
+/// StageProgramId in two steps (FRITCHII_MEMSTAGE_SETUP_KEEP): the copy's program words, then
+/// their key. StageProgramWords then ProgramWordsKey gives exactly StageProgramId's id.
+void StageProgramWords(const MemStageShadowEngine& copy,
+                       std::array<u64, ProgramWordCount>& words);
+[[nodiscard]] u64 ProgramWordsKey(const std::array<u64, ProgramWordCount>& words);
 
 } // namespace MemStageShadow
 
