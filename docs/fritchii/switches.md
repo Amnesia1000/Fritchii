@@ -68,6 +68,30 @@ fps drops by about what the added ms a second predict, it is; if not, shortening
   FRITCHII_DELAY_POLL_DRAIN_US=n x/s y ms/s" while a switch is set or spins were counted.
 - Measure with profile_toggle.py in one session (0 against n).
 
+### Front 0xe2c misses (always on, a counter)
+
+"Front 0xe2c misses (noted write) 10 s" (HW_GPU, Info): the macro DMA reads of the 0xe2c
+occlusion macro (hash 0x3b26ab7eb3fc9863, its 0x158 read of six words; OoT macro slots, so only
+with a macro switch on, as by default) that miss their page snapshot because a write the front
+noted since overlaps the read's bytes (EDEN_NX2_DMA_SNAPSHOT's "noted write" misses). Counted only
+at those misses (fable_front_drains 1.3 A: the counter that tells its answer from the second
+answer's same-frame sample counters). Per second:
+- the misses; how far behind the back was at each (ring words between `consumed` and what the
+  front sent: average and maximum); the misses with a report the query cache still lists on the
+  read's bytes (the hit path's own test, 12 bytes back); the misses where more writes were noted
+  since the snapshot than the table remembers (the per-range answers are then "none").
+- For bytes 0-8, 8-16 and 16-24 of the read (the macro compares the 64-bit words at 0 and 16;
+  8-16 is the first report's timestamp): the newest noted write since the snapshot over them, by
+  kind: "payload report (16 bytes)" (report Payload with the timestamp; the front had the payload
+  in its registers but notes 16 unknown bytes), "payload release (4 bytes)" (a short payload
+  release, its word known), "counter or sample report" (any other report type: written when the
+  host query completes), "other" (puller semaphores, uploads, unknown ranges), "none" (no note
+  over that range; the miss came from another one). Each as "known a/b unknown c/d": the front
+  knows its words or not, the back had run it (a, c) or not (b, d) when the read missed.
+- Reading it: misses blocked by payload reports with the back far behind are answer A
+  (bookkeeping on the front); counter or sample reports the back had not run, or a listed report
+  on the bytes, are answer B (the value does not exist yet at the front).
+
 ### EDEN_NX2_ACCURATE_PARTS
 
 EDEN_NX2_ACCURATE_PARTS (bit mask, 0 = none, read once at boot): parts of GPU accuracy High in

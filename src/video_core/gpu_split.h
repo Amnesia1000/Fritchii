@@ -79,6 +79,15 @@ inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> 
     "fence word writers",
 };
 
+/// Maxwell3D::FrontNoteMemoryWrite's notes of 3D reports (the pending write's `what`), told apart
+/// by address in the "Front 0xe2c misses" line (inline variables: one address in every unit).
+/// A payload report with the timestamp (16 bytes, report Payload, not short).
+inline constexpr char NotedPayloadReport[] = "3D payload report";
+/// A short payload release (4 bytes, its word known).
+inline constexpr char NotedPayloadRelease[] = "3D payload release";
+/// Any other report: counters and sample counts (written when the host query completes).
+inline constexpr char NotedCounterReport[] = "3D report";
+
 /// EXP13=2: which queued writer set GpuSplit::QueuedGuestWriters' position (a wait cause).
 enum class GuestWriterCause : u8 {
     None,
@@ -948,6 +957,40 @@ public:
         }
         return {};
     }
+    /// "Front 0xe2c misses" (FrontDmaRead): for each of `out.size()` byte ranges [begin + i *
+    /// span, begin + (i + 1) * span), the newest NoteMemoryWrite / NoteMemoryWriteData sent after
+    /// `since` over it, whether or not the back ran it. `position` 0: none (or more were noted
+    /// since than are remembered: `overflow`); `known`: its words are known to the front. Front
+    /// only; one scan, newest first, stopping once every range has its write.
+    struct NotedOver {
+        u64 position;
+        const char* what;
+        bool known;
+    };
+    void NewestNotedWritesOver(u64 since, u64 begin, u64 span, std::span<NotedOver> out,
+                               bool& overflow) const {
+        std::ranges::fill(out, NotedOver{});
+        overflow = false;
+        size_t found = 0;
+        const u64 remembered = (std::min<u64>)(pending_write_count, pending_writes.size());
+        u64 scanned = 0;
+        for (; scanned < remembered && found < out.size(); ++scanned) {
+            const PendingWrite& write =
+                pending_writes[(pending_write_count - 1 - scanned) % pending_writes.size()];
+            if (write.position <= since) {
+                return;
+            }
+            for (size_t i = 0; i < out.size(); ++i) {
+                const u64 range_begin = begin + i * span;
+                if (out[i].position == 0 && write.begin < range_begin + span &&
+                    range_begin < write.end) {
+                    out[i] = {write.position, write.what, write.words != 0};
+                    ++found;
+                }
+            }
+        }
+        overflow = found < out.size() && scanned == pending_writes.size();
+    }
     /// Work that writes the device range [begin, begin + size) was just sent (an inline upload, a
     /// report, a semaphore release). size ~0 means an unknown range.
     void NoteMemoryWrite(u64 begin, u64 size, const char* what = "unknown") {
@@ -967,14 +1010,14 @@ public:
     }
     /// As NoteMemoryWrite, for a write whose words the front knows (a fence release payload,
     /// linear inline upload data): reads overlay them instead of waiting.
-    void NoteMemoryWriteData(u64 begin, const u32* data, u32 words) {
+    void NoteMemoryWriteData(u64 begin, const u32* data, u32 words, const char* what = "known") {
         if (write_stamps) [[unlikely]] {
             StampWrite(begin, begin + u64{words} * sizeof(u32), false);
         }
         while (words != 0) {
             const u32 count = (std::min<u32>)(words, PendingWriteWords);
             PendingWrite& write = pending_writes[pending_write_count++ % pending_writes.size()];
-            write.what = "known";
+            write.what = what;
             write.begin = begin;
             write.end = begin + u64{count} * sizeof(u32);
             write.position = write_position;
