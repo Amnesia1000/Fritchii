@@ -2811,6 +2811,9 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
     // one load and a branch.
     VideoCommon::GpuSplit::DelayWorkIf(VideoCore::Nx2Debug::g_delay_draw_us,
                                        VideoCommon::GpuSplit::DelayTest::Draw);
+    // fable_stage_levelpoints 19.4 (GPU profile on, the back): the draw path's whole time, and
+    // which Scheduler::Record calls fall inside it ("Price Vulkan worker").
+    const VideoCommon::FritchiiPrice::DrawScope price_draw_scope;
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     const VideoCommon::FritchiiDrawKinds::Scope draw_kinds_scope{maxwell3d->regs};
     // A vertex count GPU work wrote (nx2_indirect_grid.h): drawn with that count, read on the GPU.
@@ -3135,6 +3138,7 @@ void RasterizerVulkan::DrawIndirect() {
     // back thread only. Off: one load and a branch.
     VideoCommon::GpuSplit::DelayWorkIf(VideoCore::Nx2Debug::g_delay_draw_us,
                                        VideoCommon::GpuSplit::DelayTest::Draw);
+    const VideoCommon::FritchiiPrice::DrawScope price_draw_scope; // as in Draw
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     const VideoCommon::FritchiiDrawKinds::Scope draw_kinds_scope{maxwell3d->regs};
     const auto& params = maxwell3d->draw_manager.indirect_state;

@@ -241,6 +241,16 @@ only when the group counted something. Times are time stamp ticks converted with
   work and the wake. A stamp is stored at most every 4,096 ring words or at a waited target, so
   "until" can run late by that much; targets older than the 256 stamps count as "not in the
   stamps" (all "until").
+- "Price Vulkan worker ..." (19.4): the scheduler worker's busy ms/s (ExecuteAll, which records
+  the chunk's commands and, for a chunk with one, submits; plus the command buffer
+  reallocation), split by chunks without and with a submit; idle = the rest of the second (the
+  wait for work, FRITCHII_WORKER_SPIN's spin, the lock); FRITCHII_DELAY_WORKER_US's spins apart.
+  Then, on the back: the time in Scheduler::Record calls (the recorded lambda's capture, the
+  chunk append, a full chunk's hand-off to the worker; about one call in 8 timed), inside
+  RasterizerVulkan::Draw or DrawIndirect and outside, against the draws' whole time (from past
+  the D spin to the end). This is the recording-only part the back pays today; the code that
+  only computes what a record captures (dynamic state compares, descriptor packing) is not in it
+  and stays in its own zones (dynamic state, push descriptors, configure draw, draw record).
 
 ### FRITCHII_NULL_RENDER
 

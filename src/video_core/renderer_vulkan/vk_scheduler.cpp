@@ -782,16 +782,30 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
             const bool has_submit = work->HasSubmit();
             Common::Nx2Timeline::Span timeline_span{has_submit ? "record commands + submit"
                                                                : "record commands"};
+            // fable_stage_levelpoints 19.4 (GPU profile on): the worker's busy time, its chunks'
+            // recording (and submit) and the command buffer reallocation ("Price Vulkan worker").
+            namespace Price = VideoCommon::FritchiiPrice;
+            const u64 price_start = Price::On() ? Price::Ticks() : 0;
             work->ExecuteAll(current_cmdbuf, current_upload_cmdbuf);
 
             // If the chunk was a submission, reallocate the command buffer.
             if (has_submit) {
                 AllocateWorkerCommandBuffer();
             }
-            // FRITCHII_DELAY_WORKER_US (live, 0 = off; fable_stage_levelpoints 19.3/19.4): n us
-            // after each chunk, inside the execution lock, as if the chunk took that much
-            // longer. Off: one relaxed load and a branch a chunk.
-            VideoCommon::GpuSplit::DelayWorkerIf();
+            if (price_start != 0) [[unlikely]] {
+                const u64 executed = Price::Ticks();
+                const size_t kind = has_submit ? 1 : 0;
+                Price::Add(Price::g_worker.chunks[kind], 1);
+                Price::Add(Price::g_worker.busy[kind], executed - price_start);
+                // FRITCHII_DELAY_WORKER_US's spin, apart from the busy time.
+                VideoCommon::GpuSplit::DelayWorkerIf();
+                Price::Add(Price::g_worker.delay_ticks, Price::Ticks() - executed);
+            } else {
+                // FRITCHII_DELAY_WORKER_US (live, 0 = off; fable_stage_levelpoints 19.3/19.4): n
+                // us after each chunk, inside the execution lock, as if the chunk took that much
+                // longer. Off: one relaxed load and a branch a chunk.
+                VideoCommon::GpuSplit::DelayWorkerIf();
+            }
         }
 
         {
