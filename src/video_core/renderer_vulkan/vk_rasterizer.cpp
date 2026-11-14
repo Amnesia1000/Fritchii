@@ -1595,6 +1595,12 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         ring_rest.emplace(mem_stage);
         if (ring_packet == nullptr && served) {
             Link::Note(Link::Check::PacketMissing, "PrepareDraw (the back fills it)");
+            // A served list draw skipped SetDrawIndirect (DrawListWords): the back's own fill
+            // binds and syncs the two words only with it, as before the list draws were served.
+            if (maxwell3d->draw_manager.indirect_state.list_words) {
+                buffer_cache.SetDrawIndirect(&maxwell3d->draw_manager.indirect_state);
+                list_fallback_indirect = true;
+            }
         }
     }
     if (frame_dump.Capturing()) {
@@ -2014,6 +2020,12 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         const MemStage::RestAtEnd rest{mem_stage};
         configured = delta_pipeline != nullptr ? pipeline->ConfigureDelta(is_indexed)
                                                : pipeline->Configure(is_indexed, keep_last_draw);
+    }
+    // FRITCHII_MEMSTAGE_LIST_DRAWS: GPUMem filled this draw as a list draw, the back's is not one
+    // (no list arguments asked for): the two sides' draws differ (must be 0).
+    if (ring_packet != nullptr && (ring_packet->flags & MemStage::ListArgs) != 0 &&
+        !mem_player.ListDrawArgsRequested()) [[unlikely]] {
+        Link::Note(Link::Check::ListArgsUnasked, "PrepareDraw");
     }
     if (!configured) {
         report_failure("configure failed");
@@ -2843,7 +2855,8 @@ void RasterizerVulkan::DrawListWords() {
     }, true);
     // A draw that was not prepared as far as its copy leaves the request behind.
     (void)mem_player.TakeListDrawArgs();
-    if (!served) {
+    // Also after PrepareDraw's fallback for a served list draw without its packet (it set them).
+    if (!served || std::exchange(list_fallback_indirect, false)) {
         buffer_cache.SetDrawIndirect(nullptr);
     }
     ListDraw::Count(!recorded ? ListDraw::g_stats.not_recorded

@@ -303,11 +303,14 @@ constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::Check::Co
     "facts key collisions (one program key for two programs' registers: told apart, a miss)",
     "a served list draw the back would read back (the stage and the back decided differently)",
     "a served list draw whose packet has no list words buffer (the back asked the cache)",
+    "a list draw packet at a back draw that asked for no list arguments (the draws differ)",
 };
 static_assert(LINK_CHECK_NAMES.back() != nullptr, "a name for every check");
 constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::ListDraw::Count)>
-    LIST_DRAW_NAMES{"served", "level, the window closed or the switch off",
-                    "level, read back on the CPU", "level, the fill refused it"};
+    LIST_DRAW_NAMES{"served", "level with the window closed or the switch off",
+                    "level read back on the CPU", "level as the fill refused it",
+                    "level for a frame dump or trace"};
+static_assert(LIST_DRAW_NAMES.back() != nullptr, "a name for every list draw outcome");
 constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::LevelReason::Count)>
     LEVEL_REASON_NAMES{"full copy", "writing draw", "ranges over GPU-written data"};
 constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::HandOff::Count)>

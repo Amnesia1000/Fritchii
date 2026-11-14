@@ -693,14 +693,16 @@ THREAD 0/1 keep them as before (level draws on THREAD 2, the back's own fill oth
   every vertex buffer a packet binds does.
 - "Memory stage list draws (FRITCHII_MEMSTAGE_LIST_DRAWS=n, window open/closed)" every 10 s on
   THREAD 2: list draws a second served, and level by why (the window closed or the switch off,
-  read back on the CPU, the fill refused it); runs started by a list draw against all runs (each
-  level one starts a run); the back's draws from the packet's buffer (equals served). List draws
-  in an entry that is hard already are the ring line's "late" level draws. The ring line's level
-  draw kind 0 is "indirect" only now, and 5c's "runs by first hard kind" names the level draw
-  kinds ("level draw (list, read back)", ...).
+  read back on the CPU, the fill refused it, a frame dump or trace); runs started by a list draw
+  against all runs (each level one starts a run); the back's draws from the packet's buffer
+  (equals served). List draws in an entry that is hard already are the ring line's "late" level
+  draws. The ring line's level draw kind 0 is "indirect" only now, and 5c's "runs by first hard
+  kind" names the level draw kinds ("level draw (list read back)", ...).
 - Must be 0 (the link line): "a served list draw the back would read back" (the two sides decided
-  differently: their state differs) and "a served list draw whose packet has no list words
-  buffer" (the back asked the cache).
+  differently: their state differs), "a served list draw whose packet has no list words buffer"
+  (the back asked the cache) and "a list draw packet at a back draw that asked for no list
+  arguments" (the other direction). A served list draw whose packet is missing (PacketMissing)
+  is filled by the back as before, with the cache's indirect parameters set for it.
 - At the market: about 1,600 runs a second start at a list draw (step 7 run, s7g); with the
   switch on they should go, and with them their lends, returns and the back's wait for GPUMem in
   each (step 7 fps list: about -30 ms/s for GPUMem parked, -23 ms/s of the back's wait).

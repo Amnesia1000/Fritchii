@@ -353,7 +353,8 @@ std::string LevelName(u64 key) {
         static constexpr std::array<const char*, 11> names{
             "indirect", "GPU count", "texel buffers", "forced",
             "fill refused", "no room", "late", "other",
-            "list, window closed or switch off", "list, read back", "list, fill refused"};
+            "list with the window closed or the switch off", "list read back",
+            "list fill refused"};
         what = fmt::format("level draw ({})", id < names.size() ? names[id] : "?");
         break;
     }
@@ -2868,7 +2869,7 @@ void MemStageShadowEngine::StageDraw(bool indexed, u32 instance_count, bool indi
         }
         if (Shadow::g_ring_level_draws.load(std::memory_order_relaxed)) {
             if (list) {
-                link.NoteListDraw(MemoryStageLink::ListDraw::Refused);
+                link.NoteListDraw(MemoryStageLink::ListDraw::Forced);
             }
             return level(Shadow::RingLevel::Forced);
         }

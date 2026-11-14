@@ -61,6 +61,7 @@ public:
         FactsKeyCollision,
         ListReadBack,
         ListArgsMissing,
+        ListArgsUnasked,
         Count,
     };
 
@@ -70,6 +71,7 @@ public:
         Closed,   ///< level: the window closed (AHEAD 0) or the switch off
         ReadBack, ///< level: the back reads the two words on the CPU (DrawListWords' on_cpu)
         Refused,  ///< level: the fill refused it (facts miss, texel buffers, no room)
+        Forced,   ///< level: every draw is (a frame dump or a trace, g_ring_level_draws)
         Count,
     };
 
