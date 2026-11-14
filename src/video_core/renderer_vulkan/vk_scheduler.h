@@ -6,6 +6,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -570,6 +571,28 @@ private:
     std::mutex queue_mutex;
     std::condition_variable_any event_cv;
     bool worker_waiting{}; ///< The worker is waiting for work (guarded by queue_mutex)
+    /// FRITCHII_WORKER_SPIN: the worker is spinning for work outside the lock and looks at the
+    /// queue under the lock before it sleeps (guarded by queue_mutex).
+    bool worker_spinning{};
+    /// FRITCHII_WORKER_SPIN: chunks queued since start, raised under queue_mutex with each push;
+    /// the spinning worker watches it without the lock.
+    std::atomic<u64> dispatch_serial{};
+    /// Spins the worker for up to `spin_us` microseconds (without a lock) until dispatch_serial
+    /// moves from `seen`. Returns whether it moved.
+    bool SpinForWork(u64 seen, int spin_us, const std::stop_token& stop_token);
+    /// FRITCHII_WORKER_SPIN's counts: dispatches by the recording thread, the worker's spins.
+    struct WakeStats {
+        u64 dispatches{};
+        u64 notified{};
+        u64 skipped_busy{};
+        u64 skipped_spinning{};
+        std::chrono::steady_clock::time_point since{};
+    };
+    WakeStats wake_stats;
+    std::atomic<u64> worker_spins{};
+    std::atomic<u64> worker_spin_hits{};
+    std::atomic<u64> worker_spin_ns{};
+    void NoteDispatchWake(bool notified, bool spinning);
     std::jthread worker_thread;
 
     std::chrono::steady_clock::duration frame_interval{};

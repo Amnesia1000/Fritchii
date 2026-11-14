@@ -391,6 +391,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_VERTEX_INPUT_COMPACT") {
         return &g_vertex_input_compact;
     }
+    if (name == "FRITCHII_WORKER_SPIN") {
+        return &g_worker_spin;
+    }
     return nullptr;
 }
 

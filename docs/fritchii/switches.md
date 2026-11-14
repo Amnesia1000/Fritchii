@@ -1350,6 +1350,30 @@ a full 32 KB chunk (one worker dispatch) every 16 sends.
   dispatches (and worker wakes), and a cheaper SetVertexInputEXT on the worker. Picture check
   across areas before it becomes a default (vertex layouts differ by scene).
 
+### FRITCHII_WORKER_SPIN
+
+FRITCHII_WORKER_SPIN (live, value = microseconds, default 0 = exactly as before; fable_perdraw_b
+3.6). Scheduler::DispatchWork wakes the Vulkan worker with condition_variable::notify_all when it
+sleeps, a system call: about 12 ms/s on the back, since the worker waits about half its time.
+- n > 0: with an empty queue the worker first spins outside the queue lock for up to n us,
+  watching dispatch_serial (raised under the lock with every push), before it waits as before.
+  While it spins worker_waiting stays false, so a dispatch skips the notify. Try 50 to 100.
+- Why no wakeup is lost: worker_waiting is set and read only under queue_mutex. After the spin
+  (work seen or time up) the worker takes the lock again and the condition wait tests the queue
+  under it before sleeping, so a chunk pushed during the spin is popped there. A chunk pushed
+  after that test finds worker_waiting true and notifies, which the waiter, registered before it
+  released the lock, receives. The spin only changes when the worker sleeps, never what it runs
+  or in which order. WaitWorker's waits are untouched (the worker still notifies on each pop),
+  and the spin holds no lock, so they are not held up by it.
+- Cost: worker CPU while it spins (the worker runs at critical priority on a performance core);
+  the process already uses about 7.5 CPUs, so judge it on a toggle with the 1% lows.
+- "Worker wake (FRITCHII_WORKER_SPIN=n) 10 s: dispatches D/s, notified N/s, skipped B/s busy +
+  S/s spinning; worker spins W/s, H/s found work, spinning M ms/s" (Render_Vulkan, Info; counted
+  in both modes, at 0 the spin numbers are 0). "busy" is the old skip (the worker was running a
+  chunk), "spinning" is the new one.
+- Expected: 6 to 11 ms/s on the back (most of the notifies), at the price of the worker's spin
+  time shown on the line.
+
 ## Numbered experiments (EDEN_NX2_EXPn)
 
 Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP79, live through the debug server:

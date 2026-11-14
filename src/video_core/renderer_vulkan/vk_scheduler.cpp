@@ -17,6 +17,10 @@
 
 #include <fmt/format.h>
 
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#include <intrin.h> // _mm_pause (FRITCHII_WORKER_SPIN)
+#endif
+
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 
 #include "common/logging.h"
@@ -28,6 +32,7 @@
 #include "common/nx2_timeline.h"
 #include "common/thread.h"
 #include "video_core/gpu_logging/gpu_logging.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_fastdraw_count.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
@@ -378,17 +383,96 @@ void Scheduler::DispatchWork() {
     if (chunk && !chunk->Empty()) {
         // Waking the worker is a system call (~2% of the GPU thread at one dispatch per 8
         // draws): skip it while the worker is still busy, it pops the queue before waiting.
+        // FRITCHII_WORKER_SPIN: a spinning worker has worker_waiting false too, so it is not
+        // woken either; it sees dispatch_serial move, or looks at the queue under the lock
+        // before it sleeps (WorkerThread).
         bool wake;
+        bool spinning;
         {
             std::scoped_lock ql{queue_mutex};
             work_queue.push(std::move(chunk));
+            // Only written under queue_mutex: a plain increment, no locked add.
+            dispatch_serial.store(dispatch_serial.load(std::memory_order_relaxed) + 1,
+                                  std::memory_order_release);
             wake = worker_waiting;
+            spinning = worker_spinning;
         }
         if (wake) {
             event_cv.notify_all();
         }
+        NoteDispatchWake(wake, spinning);
         AcquireNewChunk();
     }
+}
+
+bool Scheduler::SpinForWork(u64 seen, int spin_us, const std::stop_token& stop_token) {
+    const auto start = std::chrono::steady_clock::now();
+    const auto deadline = start + std::chrono::microseconds{spin_us};
+    bool moved = false;
+    for (u32 spins = 0;; ++spins) {
+        if (dispatch_serial.load(std::memory_order_acquire) != seen) {
+            moved = true;
+            break;
+        }
+        // The clock and the stop token every 16th look (a clock read is ~20 ns).
+        if ((spins & 15) == 15 &&
+            (stop_token.stop_requested() || std::chrono::steady_clock::now() >= deadline)) {
+            break;
+        }
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+        _mm_pause();
+#elif defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#elif defined(__aarch64__)
+        asm volatile("yield");
+#else
+        std::this_thread::yield();
+#endif
+    }
+    worker_spin_ns.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                  std::chrono::steady_clock::now() - start)
+                                                  .count()),
+                             std::memory_order_relaxed);
+    return moved;
+}
+
+void Scheduler::NoteDispatchWake(bool notified, bool spinning) {
+    WakeStats& s = wake_stats;
+    ++s.dispatches;
+    if (notified) {
+        ++s.notified;
+    } else if (spinning) {
+        ++s.skipped_spinning;
+    } else {
+        ++s.skipped_busy;
+    }
+    // The clock every 256th dispatch; one line every 10 s.
+    if ((s.dispatches & 255) != 0) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (s.since == std::chrono::steady_clock::time_point{}) {
+        s = WakeStats{.since = now};
+        return;
+    }
+    if (now - s.since < std::chrono::seconds{10}) {
+        return;
+    }
+    const double window = std::chrono::duration<double>(now - s.since).count();
+    const u64 spins = worker_spins.exchange(0, std::memory_order_relaxed);
+    const u64 hits = worker_spin_hits.exchange(0, std::memory_order_relaxed);
+    const u64 spun_ns = worker_spin_ns.exchange(0, std::memory_order_relaxed);
+    LOG_INFO(Render_Vulkan,
+             "Worker wake (FRITCHII_WORKER_SPIN={}) {:.0f} s: dispatches {:.0f}/s, notified "
+             "{:.0f}/s, skipped {:.0f}/s busy + {:.0f}/s spinning; worker spins {:.0f}/s, {:.0f}/s "
+             "found work, spinning {:.1f} ms/s",
+             VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_worker_spin,
+                                              "FRITCHII_WORKER_SPIN"),
+             window, static_cast<double>(s.dispatches) / window,
+             static_cast<double>(s.notified) / window, static_cast<double>(s.skipped_busy) / window,
+             static_cast<double>(s.skipped_spinning) / window, static_cast<double>(spins) / window,
+             static_cast<double>(hits) / window, static_cast<double>(spun_ns) / 1e6 / window);
+    s = WakeStats{.since = now};
 }
 
 void Scheduler::RecordUpload(VkBuffer src, VkBuffer dst, std::span<const VkBufferCopy> copies) {
@@ -650,6 +734,28 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
 
         {
             std::unique_lock lk{queue_mutex};
+
+            // FRITCHII_WORKER_SPIN (live, value = microseconds, default 0 = off): with an empty
+            // queue the worker first spins outside the lock for up to that long. worker_waiting
+            // stays false, so a dispatch meanwhile skips the notify system call. No wakeup is
+            // lost: after the spin the worker takes the lock again and the wait below tests the
+            // queue under it before sleeping, so a chunk pushed during the spin is popped there;
+            // a chunk pushed after that test finds worker_waiting true (set under the same lock
+            // in the predicate) and notifies, as without the spin.
+            if (const int spin_us = VideoCore::Nx2Debug::SwitchValue(
+                    VideoCore::Nx2Debug::g_worker_spin, "FRITCHII_WORKER_SPIN");
+                spin_us > 0 && work_queue.empty() && !stop_token.stop_requested()) {
+                const u64 seen = dispatch_serial.load(std::memory_order_relaxed);
+                worker_spinning = true;
+                lk.unlock();
+                const bool moved = SpinForWork(seen, spin_us, stop_token);
+                lk.lock();
+                worker_spinning = false;
+                worker_spins.fetch_add(1, std::memory_order_relaxed);
+                if (moved) {
+                    worker_spin_hits.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
 
             // Wait for work.
             {
