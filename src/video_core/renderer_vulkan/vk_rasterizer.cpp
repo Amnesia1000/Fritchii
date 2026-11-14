@@ -1977,6 +1977,40 @@ void RasterizerVulkan::InnerInvalidationServed(
     }
 }
 
+namespace {
+/// FRITCHII_NULL_RENDER: whether this draw is null-rendered (the switch on and the draw
+/// `eligible`), counted for the "Null render" line every 10 s (the back thread's draws only).
+bool NullRenderDraw(bool eligible) {
+    struct Counts {
+        u64 nulled{};
+        u64 drawn{};
+        std::chrono::steady_clock::time_point since{};
+    };
+    static Counts counts;
+    const bool on = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_null_render,
+                                                     "FRITCHII_NULL_RENDER") > 0;
+    const bool nulled = on && eligible;
+    if (on) {
+        ++(nulled ? counts.nulled : counts.drawn);
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (counts.since == std::chrono::steady_clock::time_point{}) {
+        counts.since = now;
+    } else if (const double window = std::chrono::duration<double>(now - counts.since).count();
+               window >= 10.0) {
+        LOG_INFO(Render_Vulkan,
+                 "Null render (FRITCHII_NULL_RENDER={}, 10 s): {:.0f} draws/s null-rendered "
+                 "(buffer side only), {:.0f} draws/s drawn in full (stage on, a held packet, a "
+                 "delta or mesh draw)",
+                 on ? 1 : 0, static_cast<double>(counts.nulled) / window,
+                 static_cast<double>(counts.drawn) / window);
+        counts = {};
+        counts.since = now;
+    }
+    return nulled;
+}
+} // Anonymous namespace
+
 template <typename Func>
 void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_indirect) {
 
@@ -2448,6 +2482,25 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     std::optional<MemStage::TrackerRecord> tracker_record;
     if (packet != nullptr && packet->trackers.filled) [[unlikely]] {
         tracker_record = packet->trackers;
+    }
+    // FRITCHII_NULL_RENDER (live, default 0; test only, the picture is broken): the draw does the
+    // buffer side alone (GraphicsPipeline::ConfigureImpl's null path) and returns before the
+    // texture work, render targets, dynamic state, queries and the record. Only with the stage
+    // off and no held packet (EXP123 below 2); a delta or mesh draw is drawn as usual. Off: one
+    // relaxed load and a branch a draw.
+    if (VideoCore::Nx2Debug::g_null_render.load(std::memory_order_relaxed) != 0) [[unlikely]] {
+        const bool eligible = packet == nullptr && !ring_on && delta_pipeline == nullptr &&
+                              !mesh_draw;
+        if (NullRenderDraw(eligible)) {
+            {
+                Profile::Scope scope{Profile::Zone::Configure};
+                const MemStage::RestAtEnd rest{mem_stage};
+                pipeline->SetNullRenderNext();
+                static_cast<void>(pipeline->Configure(is_indexed, keep_last_draw));
+            }
+            submitted = true; // not a failed native draw
+            return;
+        }
     }
     // FRITCHII_MEMSTAGE_SHADOW: read flushes from here to the record are counted.
     if (VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {

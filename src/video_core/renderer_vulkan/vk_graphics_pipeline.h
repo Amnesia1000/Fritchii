@@ -349,6 +349,13 @@ public:
         return configure_delta_func(this, is_indexed);
     }
 
+    /// FRITCHII_NULL_RENDER (test only): the next Configure does only the buffer side of the draw
+    /// (fable_b_one_follower 7 run 1: thread E's part) and returns false. RasterizerVulkan::
+    /// PrepareDraw sets it for a draw it null-renders; ConfigureImpl clears it.
+    void SetNullRenderNext() {
+        null_render_next = true;
+    }
+
     /// Delta draws (D2): the previous draw as its Configure kept it with `keep_last`, or null
     /// when it wasn't kept whole. Only meaningful for the pipeline's last configured draw.
     [[nodiscard]] const KeptDraw* KeptLastDraw() const noexcept {
@@ -641,6 +648,9 @@ private:
     bool (*configure_delta_func)(GraphicsPipeline*, bool){};
     /// Delta draws (D2): the last draw configured with keep_last; made on the first.
     std::unique_ptr<KeptDraw> kept_draw;
+    /// FRITCHII_NULL_RENDER: SetNullRenderNext, and the handle words its draws read.
+    bool null_render_next{};
+    std::vector<u32> null_render_handles;
 
     std::vector<GraphicsPipelineCacheKey> transition_keys;
     /// Each transition key's Fingerprint(), kept with transition_keys (AddTransition and

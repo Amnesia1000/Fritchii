@@ -147,6 +147,33 @@ frame's path and cutting them pays one for one.
 - Off (0): one relaxed load and a branch after each run.
 - Measure with profile_toggle.py in one session (0 against n).
 
+### FRITCHII_NULL_RENDER
+
+FRITCHII_NULL_RENDER=1 (live, default 0; test only, the picture is broken: nothing is drawn;
+work\fable_b_one_follower.md section 7, run 1): with the stage off, each 3D draw does only the
+part the one-follower design gives the engine thread E, then returns. The fps it shows is the
+design's ceiling (the front and the game threads); the back's us a draw is E's budget (a low
+bound: with nothing drawn every occlusion test fails, so the game may send fewer draws).
+- Kept (E): PrepareDraw's flush work, the pipeline lookup (the fill needs its layout; the design
+  has E find the draw's facts too), the repack layout, and in GraphicsPipeline::ConfigureImpl the
+  uniform state, each stage's storage binds, the handle words read as the seam's fill reads them
+  (FillGraphicsHandleValues, not resolved), the texture buffer unbinds, UpdateGraphicsBuffers and
+  the geometry binds, the descriptor reservation the buffer binds write into, each stage's
+  BindHostStageBuffers and the post-copy barrier. The read-back flushes after the draw
+  (TickWork) still run.
+- Left out (R): the descriptor pools' sync, image views and samplers (with the EXP32 memo, EXP87
+  templates and TEX_BANK_GEN), texture buffer binds (they need the views), image descriptors and
+  rescaling, render targets, configure draw, dynamic state, the query segment and the record.
+- Where the cut sits: with the stage off the seam is at EXP123 = 0, where the buffer fill is
+  inside Configure (interleaved with the texture work), so the cut is a separate path at the top
+  of ConfigureImpl in today's call order, not MemStage::FillDraw (which needs EXP123 2 or 3 and
+  FRITCHII_MEMSTAGE_TICKS, a different code path than the stage-off zones the budget is from).
+- Not null-rendered: draws with a held packet (EXP123 2 or 3), the stage on, delta draws (EXP118)
+  and mesh draws. Dispatches, clears and DrawTexture blits run as usual.
+- "Null render (FRITCHII_NULL_RENDER=1, 10 s): x draws/s null-rendered (buffer side only), y
+  draws/s drawn in full" every 10 s while on.
+- Off (0): one relaxed load and a branch a draw.
+
 ### FRITCHII_MEMSTAGE_RUN_SPIN_US
 
 FRITCHII_MEMSTAGE_RUN_SPIN_US (live, default 0 = today: about 2,048 pauses, then a sleep;

@@ -174,6 +174,8 @@ inline std::atomic<int> g_delay_handover_kind{-1};
 inline std::atomic<int> g_delay_runkind_us{-1};
 /// FRITCHII_DELAY_RUNKIND_CLASS: docs/fritchii/switches.md.
 inline std::atomic<int> g_delay_runkind_class{-1};
+/// FRITCHII_NULL_RENDER: docs/fritchii/switches.md.
+inline std::atomic<int> g_null_render{-1};
 /// FRITCHII_MEMSTAGE_RUN_SPIN_US: docs/fritchii/switches.md.
 inline std::atomic<int> g_memstage_run_spin_us{-1};
 /// FRITCHII_MEMSTAGE_SETUP_KEEP: docs/fritchii/switches.md.

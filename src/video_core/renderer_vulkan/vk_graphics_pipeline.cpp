@@ -1499,6 +1499,88 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     // (MemStage::FillDraw); its calls below are skipped and its sections played in their place.
     MemStage& mem_stage = buffer_cache.runtime.Seam();
     const MemStage::DrawPacket* const held = mem_stage.HeldDraw();
+    // FRITCHII_NULL_RENDER (test only, the picture is broken; fable_b_one_follower 7 run 1): the
+    // draw's buffer side alone, which the one-follower design gives the engine thread E, in
+    // today's order: the uniform state, per stage the storage binds, the handle words (read, not
+    // resolved), the texture buffer unbinds, the geometry, the descriptor reservation the binds
+    // write into, per stage the buffer binds, the post-copy barrier. Left out, the render thread
+    // R's part: the descriptor pools' sync, the image views and samplers (and the memos and
+    // templates that keep them), the texture buffer binds (they need the views), the image
+    // descriptors and rescaling, render targets, configure draw. PrepareDraw returns after this.
+    // Only without a held packet (SEAM 0 and 1, the stage off): PrepareDraw checks.
+    if constexpr (!Delta) {
+        if (null_render_next) [[unlikely]] {
+            null_render_next = false;
+            namespace NullProfile = VideoCommon::Nx2Profile;
+            buffer_cache.SetUniformBuffersState(enabled_uniform_buffer_masks,
+                                                &uniform_buffer_sizes);
+            {
+                NullProfile::Scope scope{NullProfile::Zone::ReadHandles};
+                for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+                    if (!Spec::enabled_stages[stage]) {
+                        continue;
+                    }
+                    const NullProfile::FineScope storage_scope{
+                        NullProfile::Zone::StorageBindings};
+                    buffer_cache.UnbindGraphicsStorageBuffers(stage);
+                    if constexpr (Spec::has_storage_buffers) {
+                        size_t ssbo_index{};
+                        for (const auto& desc : stage_infos[stage].storage_buffers_descriptors) {
+                            ASSERT(desc.count == 1);
+                            buffer_cache.BindGraphicsStorageBuffer(
+                                stage, ssbo_index, desc.cbuf_index, desc.cbuf_offset,
+                                desc.is_written, desc.indirect_offset);
+                            ++ssbo_index;
+                        }
+                    }
+                }
+                // The handle words, as the seam's fill reads them (FillHandleValues), kept here.
+                null_render_handles.clear();
+                const auto& stages{maxwell3d->state.shader_stages};
+                using Cbufs = std::remove_cvref_t<decltype(stages[0].const_buffers)>;
+                VideoCommon::FillGraphicsHandleValues(
+                    std::span<const Shader::Info>{stage_infos}, *gpu_memory,
+                    [&stages](size_t stage) {
+                        return VideoCommon::GraphicsHandleCbufs<Cbufs>{
+                            stages[stage].const_buffers};
+                    },
+                    device.GetStorageBufferAlignment(),
+                    VideoCore::Nx2Debug::Experiment(21) != 0,
+                    [this](u32 raw) { null_render_handles.push_back(raw); });
+            }
+            for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+                if (Spec::enabled_stages[stage]) {
+                    buffer_cache.UnbindGraphicsTextureBuffers(stage);
+                }
+            }
+            {
+                NullProfile::Scope scope{NullProfile::Zone::UpdateBuffers};
+                MemStage::FillPlay seam{mem_stage, MemStage::Site::Geometry};
+                buffer_cache.UpdateGraphicsBuffers(is_indexed);
+                const NullProfile::FineScope geometry_scope{NullProfile::Zone::GeometryBuffers};
+                buffer_cache.BindHostGeometryBuffers(is_indexed);
+            }
+            {
+                NullProfile::Scope scope{NullProfile::Zone::DescriptorAcquire};
+                guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries,
+                                               uses_descriptor_buffer);
+            }
+            for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+                if (!Spec::enabled_stages[stage]) {
+                    continue;
+                }
+                NullProfile::Scope scope{NullProfile::Zone::BindStageBuffers};
+                MemStage::FillPlay seam{mem_stage, MemStage::Site::Stage,
+                                        static_cast<u32>(stage)};
+                buffer_cache.BindHostStageBuffers(stage);
+            }
+            if (buffer_cache.any_buffer_uploaded) {
+                buffer_cache.runtime.PostCopyBarrier();
+                buffer_cache.any_buffer_uploaded = false;
+            }
+            return false;
+        }
+    }
     boost::container::small_vector<VideoCommon::ImageViewInOut, 160> views;
     boost::container::small_vector<VideoCommon::SamplerId, 96> samplers;
     views.reserve(num_image_elements);
