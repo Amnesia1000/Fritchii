@@ -2297,10 +2297,7 @@ void MemoryStageLink::LogPasses(double seconds) {
             text += fmt::format("{}{} {:.0f}", i == 0 ? "" : ", ", outcome_names[i],
                                 rate(take(stats.outcomes[m][i])));
         }
-        methods += fmt::format("{}{}: {} (of the sync-pending ones, clear in the alternative "
-                               "mirror and ready {:.0f})",
-                               m == 0 ? "" : "; ", method_names[m], text,
-                               rate(take(stats.alt_passes[m])));
+        methods += fmt::format("{}{}: {}", m == 0 ? "" : "; ", method_names[m], text);
     }
     static constexpr std::array<const char*, 2> fence_names{"release closures", "fence reports"};
     std::string fences;
@@ -2345,8 +2342,7 @@ void MemoryStageLink::LogPasses(double seconds) {
         "run {}; puller releases on the front {:.0f}/s timestamped ({:.0f}/s unmapped), "
         "{:.0f}/s fence-flagged ({:.0f}/s unmapped); the "
         "mirror at the gathers the back ran at their entry ({:.0f}/s): clear {:.0f}/s, clear "
-        "but a sync found {:.0f}/s (must be 0 for the passes), the alternative mirror clear "
-        "{:.0f}/s, clear but found {:.0f}/s; GPUMem lend to return {:.1f} ms/s: waiting for "
+        "but the back synced {:.0f}/s (must be 0); GPUMem lend to return {:.1f} ms/s: waiting for "
         "the back {:.1f}, for the front while lent {:.1f}, following {:.1f}; by compute "
         "launches a run (runs/s: back/front/following ms/s) {}; the back waited for the stage "
         "after a run's end, before its next packet, {:.0f}/s {:.1f} ms/s; delay test "
@@ -2359,8 +2355,7 @@ void MemoryStageLink::LogPasses(double seconds) {
         Ahead() != 0 ? "open" : "closed", seconds, methods, fences,
         rate(releases[0] + releases[1]), rate(releases[0]), rate(releases[2] + releases[3]),
         rate(releases[2]), rate(checks),
-        rate(take(stats.mirror_clear)), rate(take(stats.mirror_wrong)),
-        rate(take(stats.alt_clear)), rate(take(stats.alt_wrong)), ms(all_ns), ms(all_back),
+        rate(take(stats.mirror_clear)), rate(take(stats.mirror_wrong)), ms(all_ns), ms(all_back),
         ms(all_front), ms(all_ns - (std::min)(all_ns, all_back + all_front)), buckets,
         rate(take(stats.idle_waits)), ms(take(stats.idle_ns)),
         (std::max)(VideoCore::Nx2Debug::g_delay_run_us.load(std::memory_order_relaxed), 0),

@@ -851,27 +851,17 @@ struct State {
     u32 ring_packets{};       ///< Packets the entry sent
     bool ring_ran_on_back{};  ///< The back ran its gather or semaphore release (StageResult)
     bool ring_publish_now{};  ///< GPUMem passed it (FRITCHII_MEMSTAGE_PASS; StageResult)
-    // fable_stage_levelpoints 6.1: the mirror of the back's query_cache.HasPendingSync() at
-    // GPUMem's place in the stream. A sync may be pending unless `sync_unknown` is false and no
-    // report went by since the last sync point. The alternative mirror (P0's counter only) is
-    // also cleared by a lone sync point that runs (the back runs its wait for idle at the
-    // entry), and a run's return leaves it.
+    // The mirror of the back's query_cache.HasPendingSync() at GPUMem's place in the stream
+    // (fable_stage_levelpoints 6.1 and 12.2): a function of the entries before that place, each
+    // applied in order as Process reaches it (MirrorClear, MirrorReport; unknown in Unfollow and
+    // other_engine). A sync
+    // may be pending unless `sync_unknown` is false and no report went by since the last clear.
     bool sync_unknown{true};
     u32 sync_reports{};
-    bool alt_unknown{true};
-    u32 alt_reports{};
-    /// The entry is a lone 0x3dd or 0x44: what its end does to the mirror.
-    enum class EntrySync : u8 { None, Cleared, Ran } entry_sync{EntrySync::None};
-    /// Dry (the switch off): the entry would have passed; the run it starts is not one P1 has.
-    bool entry_dry_pass{};
-    bool run_from_dry_pass{};
-    // fable_stage_p3 4.1, for its dry counters (section 6): the device pages (4 KiB) of the
-    // reports GPUMem saw since the last sync point, and whether others may be pending. Kept as
-    // P3 would have it (an entry P3 would pass does not count as hard or as a run).
+    // P3's form of it (fable_stage_p3 4.1, its dry counters): the device pages (4 KiB) of the
+    // reports since the last clear, and whether others may be pending. The same table.
     bool p3_unknown{true};
     boost::container::small_vector<u64, 16> p3_pages;
-    enum class P3Effect : u8 { None, Cleared, Kept } entry_p3{P3Effect::None};
-    bool run_from_p3_pass{};
     /// The last report's GPU page, its device page (~0: unmapped), the address space and the
     /// map counter it was looked up under.
     u64 report_gpu_page{~u64{0}};
@@ -908,6 +898,10 @@ void Hard(State& s, LevelType type, u64 id) {
 /// The entry cannot be followed: hard, and the copies go stale after it (plan 3.2).
 void Unfollow(State& s, LevelType type, u64 id) {
     Hard(s, type, id);
+    // The sync mirror (fable_stage_levelpoints 12.2): an entry that cannot be read may have
+    // called Query with addresses GPUMem does not see.
+    s.sync_unknown = true;
+    s.p3_unknown = true;
     if (!s.entry_unfollowed) {
         s.entry_unfollowed = true;
         s.stale_cause = LevelKey(type, s.channel, id);
@@ -1471,6 +1465,66 @@ void P3AddReport(State& s, Tegra::MemoryManager& memory, GPUVAddr address) {
     s.p3_pages.push_back(page);
 }
 
+// The sync mirror's three effects (fable_stage_levelpoints 12.2), applied where Process reaches
+// the method or closure, in stream order (a report after a fence report in one entry counts).
+
+/// Nothing pending after it: a sync ran there (a wait for idle, a made fence's NotifyWFI).
+void MirrorClear(State& s) {
+    s.sync_unknown = false;
+    s.sync_reports = 0;
+    s.p3_unknown = false;
+    s.p3_pages.clear();
+}
+
+/// After a 0x3dd or 0x44 of the copy (once the pass and gather decisions read the mirror): a lone
+/// one (a Method entry: nothing after it in the entry) clears it, whatever became of it, passed,
+/// run by the back at its entry or hard in a run: the back runs its wait for idle there, which
+/// always calls NotifyWFI, and every sync clears every streamer's list. One inside a multi-word
+/// or packet entry leaves it as it is (12.2: "same").
+void MirrorAfterSyncPoint(State& s) {
+    const u64 head = Access::Ring()[s.processing_position & Access::RingMask];
+    if (static_cast<Kind>(head & 0xf) == Kind::Method) {
+        MirrorClear(s);
+    }
+}
+
+/// One more pending report (WriteCounter), at `address` of `memory`'s address space.
+void MirrorReport(State& s, Tegra::MemoryManager& memory, GPUVAddr address) {
+    ++s.sync_reports;
+    P3AddReport(s, memory, address);
+}
+
+/// A fence-flagged report (a 3D fence report, a fence-flagged release) at a mapped address: its
+/// own report makes the fence (SkipEmptyFence says no), whose CommitAsyncFlushes runs NotifyWFI.
+/// With EXP28 & 1 the fence may not sync (deferred payload syncs): a report then.
+void MirrorFence(State& s, Tegra::MemoryManager& memory, GPUVAddr address) {
+    if ((VideoCore::Nx2Debug::Experiment(28) & 1) != 0) {
+        MirrorReport(s, memory, address);
+    } else {
+        MirrorClear(s);
+    }
+}
+
+/// A release closure (StageCacheCall::SemaphoreRelease, its fixed payload `words`), hard or run
+/// by the back at its entry: unmapped, no change (CounterReport returns before anything); not
+/// fence-flagged, a report; fence-flagged, as MirrorFence.
+void MirrorRelease(State& s, const u64* words) {
+    const GPUVAddr address = words[static_cast<size_t>(StageReleaseWord::Address)];
+    const u32 properties =
+        static_cast<u32>(words[static_cast<size_t>(StageReleaseWord::PayloadProperties)] >> 32);
+    auto* const memory = reinterpret_cast<Tegra::MemoryManager*>(
+        words[static_cast<size_t>(StageReleaseWord::Memory)]);
+    if (memory == nullptr || ReportDevicePage(s, *memory, address) == NoPage) {
+        return;
+    }
+    constexpr u32 IsAFence = static_cast<u32>(VideoCommon::QueryPropertiesFlags::IsAFence);
+    if ((properties & IsAFence) == 0) {
+        MirrorReport(s, *memory, address);
+    } else {
+        MirrorFence(s, *memory, address);
+    }
+}
+
 /// P3's targets (4.2), dry: the mirror's pages and `own_page` as maximal runs of adjacent pages,
 /// each tested as the sync would look it up.
 MemoryStageLink::P3Outcome P3Targets(State& s, u64 own_page) {
@@ -1531,19 +1585,15 @@ MemoryStageLink::P3Outcome P3Decide(State& s, MemoryStageLink::PassReady ready, 
     return P3Targets(s, own_page);
 }
 
-/// Counts P3's decision of a kind; one it would pass changes the mirror as P3 would.
+/// Counts P3's decision of a kind (the mirror's effect of the entry comes from 12.2's table,
+/// whatever P3 would decide).
 void P3Note(State& s, MemoryStageLink::P3Kind kind, MemoryStageLink::P3Outcome what) {
-    using Outcome = MemoryStageLink::P3Outcome;
+    static_cast<void>(s);
     MemoryStageLink::Get().NoteP3(kind, what);
-    if (what == Outcome::Passed) {
-        s.entry_p3 = State::P3Effect::Cleared;
-    } else if (what == Outcome::PassedUnmapped || what == Outcome::PassedNoFence) {
-        s.entry_p3 = State::P3Effect::Kept;
-    }
 }
 
 /// fable_stage_p3 6 at a release closure GPUMem reaches outside a run (`words`: its payload,
-/// StageReleaseWord's layout).
+/// StageReleaseWord's layout). Before the closure's own effect on the mirror (MirrorRelease).
 void P3Release(State& s, const u64* words, MemoryStageLink::PassReady ready) {
     using Kind3 = MemoryStageLink::P3Kind;
     using Outcome = MemoryStageLink::P3Outcome;
@@ -1558,7 +1608,6 @@ void P3Release(State& s, const u64* words, MemoryStageLink::PassReady ready) {
     }
     constexpr u32 IsAFence = static_cast<u32>(VideoCommon::QueryPropertiesFlags::IsAFence);
     if ((properties & IsAFence) == 0) {
-        P3AddReport(s, *memory, address);
         return P3Note(s, Kind3::Release, Outcome::PassedNoFence);
     }
     P3Note(s, Kind3::Release, P3Decide(s, ready, true, page));
@@ -1567,7 +1616,7 @@ void P3Release(State& s, const u64* words, MemoryStageLink::PassReady ready) {
 /// FRITCHII_MEMSTAGE_PASS (fable_stage_levelpoints 6.2), at a gather (0x3dd) or a wait for idle
 /// (0x44) of the copy, before StageGather: P1's tests, in its order, each way out counted. Off
 /// (dry), the decision is counted and the entry goes on as before (hard: a run, or GATHER's
-/// request); the mirror then takes it as P1 would (EntrySync, run_from_dry_pass).
+/// request). The mirror is cleared after it by MethodCall, whatever became of it (12.2).
 ///
 /// On (bit 1, the window open), a passed entry: GPUMem has done what the entry does to the buffer
 /// cache, at its position, and goes on; the back runs the entry later, served, with its own code,
@@ -1621,24 +1670,16 @@ PassResult StagePass(State& s, Copy& c, u32 method) {
         link.NoteP3(kind3, MemoryStageLink::P3Outcome::NotLone);
         return PassResult::Today;
     }
-    // A lone sync point: whatever becomes of it, the back runs its wait for idle at this entry.
-    s.entry_sync = State::EntrySync::Ran;
     const auto& backend = link.Backend();
     // Step 4's answer (read tracking, rule C), asked once for P1 and P3's dry counters.
     const Ready ready = PassReadyNow();
     P3Note(s, kind3, P3Decide(s, ready, false, NoPage)); // fable_stage_p3 6 (dry)
     // Step 3: no query sync can be pending (rule Q, the mirror).
-    const bool clear = !s.sync_unknown && s.sync_reports == 0;
-    const bool alt_clear = !s.alt_unknown && s.alt_reports == 0;
-    if (!clear && !alt_clear) {
+    if (s.sync_unknown || s.sync_reports != 0) {
         link.NotePass(which, Outcome::SyncPending);
         return PassResult::Today;
     }
     // Step 4: no read tracking, no uncommitted flush (rule C).
-    if (!clear) {
-        link.NotePass(which, Outcome::SyncPending, ready == Ready::Ready);
-        return PassResult::Today;
-    }
     if (ready == Ready::Tracking) {
         link.NotePass(which, Outcome::Tracking);
         return PassResult::Today;
@@ -1649,8 +1690,6 @@ PassResult StagePass(State& s, Copy& c, u32 method) {
     }
     if (dry) {
         link.NotePass(which, Outcome::Passed);
-        s.entry_sync = State::EntrySync::Cleared;
-        s.entry_dry_pass = true;
         return PassResult::Today;
     }
     // Step 5: room for the record (every passed entry has one).
@@ -1690,8 +1729,6 @@ PassResult StagePass(State& s, Copy& c, u32 method) {
     }
     link.PassPush();
     link.NotePass(which, Outcome::Passed);
-    s.entry_sync = State::EntrySync::Cleared;
-    s.entry_p3 = State::P3Effect::Cleared; // its wait for idle syncs every streamer
     s.ring_publish_now = true;
     return PassResult::Passed;
 }
@@ -1738,14 +1775,20 @@ void MethodCall(State& s, Copy& c, u32 method, u32 value, u32 nonshadow) {
                 }
             }
             Hard(s, LevelType::FenceReport, method);
+            // The mirror (12.2), after P3's decision above: mapped, the fence it makes syncs
+            // (or a report with EXP28 & 1); unmapped, CounterReport returns before anything.
+            if (s.ring) {
+                const GPUVAddr address = e.regs.report_semaphore.Address();
+                if (ReportDevicePage(s, *c.memory, address) != NoPage) {
+                    MirrorFence(s, *c.memory, address);
+                }
+            }
         } else if (query.operation.Value() == Operation::Release ||
                    query.operation.Value() == Operation::ReportOnly) {
             // Maxwell3D::ProcessQueryGet calls rasterizer->Query: a sync may be pending now
-            // (the mirror, fable_stage_levelpoints 6.1; P3's pages, fable_stage_p3 4.1).
-            ++s.sync_reports;
-            ++s.alt_reports;
+            // (the mirror, fable_stage_levelpoints 6.1 and 12.2; P3's pages, fable_stage_p3 4.1).
             if (s.ring) {
-                P3AddReport(s, *c.memory, e.regs.report_semaphore.Address());
+                MirrorReport(s, *c.memory, e.regs.report_semaphore.Address());
             }
         }
         return;
@@ -1757,18 +1800,21 @@ void MethodCall(State& s, Copy& c, u32 method, u32 value, u32 nonshadow) {
             // FRITCHII_MEMSTAGE_PASS first (dry: its counters only), then
             // FRITCHII_MEMSTAGE_GATHER and its counters. MethodKindOf made it work for either:
             // without GATHER's candidate it is hard here, as before the passes.
-            if (StagePass(s, c, method) != PassResult::Today) {
-                return;
+            if (StagePass(s, c, method) == PassResult::Today) {
+                if (!s.entry_hard && !GatherCandidate(s)) {
+                    Hard(s, s.entry_type, method);
+                }
+                StageGather(s, c, method);
             }
-            if (!s.entry_hard && !GatherCandidate(s)) {
-                Hard(s, s.entry_type, method);
-            }
-            StageGather(s, c, method);
+            MirrorAfterSyncPoint(s);
         }
         return; // the store only
     case MAXWELL3D_REG_INDEX(wait_for_idle):
-        if (s.ring && StagePass(s, c, method) == PassResult::Today && !s.entry_hard) {
-            Hard(s, s.entry_type, method); // not passed: hard, as before the passes
+        if (s.ring) {
+            if (StagePass(s, c, method) == PassResult::Today && !s.entry_hard) {
+                Hard(s, s.entry_type, method); // not passed: hard, as before the passes
+            }
+            MirrorAfterSyncPoint(s);
         }
         return; // the store only
     case MAXWELL3D_REG_INDEX(sync_info):
@@ -2065,12 +2111,9 @@ void StageGather(State& s, Copy& c, u32 method) {
     }
     link.FinishGather(draw_seq);
     s.ring_ran_on_back = true;
-    // The sync mirror (fable_stage_levelpoints 6.1) against what the back's run found, then
-    // cleared: the gather's wait for idle synced every streamer at this entry.
-    link.NoteMirrorCheck(!s.sync_unknown && s.sync_reports == 0,
-                         !s.alt_unknown && s.alt_reports == 0, link.LastGatherSynced());
-    s.entry_sync = State::EntrySync::Cleared;
-    s.entry_p3 = State::P3Effect::Cleared;
+    // The sync mirror (fable_stage_levelpoints 6.1, 12.3) against what the back's run found:
+    // "clear, but the back synced" must stay 0. MethodCall clears it after this.
+    link.NoteMirrorCheck(!s.sync_unknown && s.sync_reports == 0, link.LastGatherSynced());
     link.NoteGather(Outcome::Served,
                     static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                          std::chrono::steady_clock::now() - start)
@@ -2200,9 +2243,6 @@ size_t Process(State& s, u64 position, bool executed) {
     s.entry_draws = 0;
     s.entry_served = 0;
     s.entry_launches = 0;
-    s.entry_sync = State::EntrySync::None;
-    s.entry_dry_pass = false;
-    s.entry_p3 = State::P3Effect::None;
     if (s.channel_stale && !executed) {
         // After an entry that cannot be followed, the channel as the back has it (an untagged
         // closure may bind one).
@@ -2216,6 +2256,17 @@ size_t Process(State& s, u64 position, bool executed) {
         if (executable) {
             Hard(s, LevelType::EngineMethod,
                  (u64{static_cast<u32>(s.engine_type)} << 16) | (method & 0xffff));
+            // The sync mirror (fable_stage_levelpoints 12.2): the compute engine's signals and
+            // report semaphore and the DMA engine's launches call Query with addresses GPUMem
+            // does not see (0x6c and 0x6d do not); the upload and 2D engines never do. An engine
+            // of no known type: unknown too.
+            const bool queries =
+                (s.engine_type == EngineType::KeplerCompute && method != 0x6c && method != 0x6d) ||
+                s.engine_type == EngineType::MaxwellDMA || s.engine_type == EngineType::Other;
+            if (queries) {
+                s.sync_unknown = true;
+                s.p3_unknown = true;
+            }
         } else {
             cls = Class::Neutral;
         }
@@ -2386,20 +2437,24 @@ size_t Process(State& s, u64 position, bool executed) {
         case StageTag::Cache:
             // FRITCHII_MEMSTAGE_RELEASE: the puller's semaphore release, run by the back at its
             // entry on GPUMem's request (no run), or as any cache call.
-            if (s.ring && StageCacheCallOf(head) == StageCacheCall::SemaphoreRelease &&
-                StageRelease(s, entry, size)) {
-                cls = Class::Work;
-                // The back ran its Query at the entry, not hard: a sync may be pending now (the
-                // mirror, levelpoints 6.1's "a Cache call that is not a passed one"), and P3's
-                // reports are unknown unless P3 would have passed it (fable_stage_p3 4.1).
-                s.sync_unknown = true;
-                s.alt_unknown = true;
-                if (s.entry_p3 == State::P3Effect::None) {
+            if (s.ring && StageCacheCallOf(head) == StageCacheCall::SemaphoreRelease) {
+                const bool served = StageRelease(s, entry, size);
+                // The sync mirror (fable_stage_levelpoints 12.2), after the decisions above read
+                // it: the release row, whether the back runs it in a run or at its entry
+                // (FRITCHII_MEMSTAGE_RELEASE). Its fixed payload says which (StageReleaseWord).
+                if (size == 2 + 4) {
+                    MirrorRelease(s, entry + 2);
+                } else {
+                    s.sync_unknown = true; // not the fixed layout: cannot be read
                     s.p3_unknown = true;
                 }
-                break;
+                if (served) {
+                    cls = Class::Work;
+                    break;
+                }
             }
-            // Uses the cache on the back, writes no 3D state: hard, no copy after (plan 3.3).
+            // Uses the cache on the back, writes no 3D state: hard, no copy after (plan 3.3). Any
+            // other cache call leaves the mirror as it is: none calls Query (StageCacheCall).
             Hard(s, LevelType::CacheCall, Rva(entry[1]));
             break;
         case StageTag::Channel:
@@ -2558,46 +2613,11 @@ size_t Process(State& s, u64 position, bool executed) {
             copy.stale = true;
         }
     }
-    if (s.ring) {
-        // The sync mirror (fable_stage_levelpoints 6.1): a pending sync is only ever added by
-        // rasterizer->Query, which a served entry reaches only through the 3D report method
-        // (counted in MethodCall); every other caller is a hard or unfollowed entry.
-        switch (s.entry_sync) {
-        case State::EntrySync::Cleared:
-            // Passed, or run by the back at its entry: its wait for idle syncs every streamer.
-            s.sync_unknown = false;
-            s.sync_reports = 0;
-            s.alt_unknown = false;
-            s.alt_reports = 0;
-            break;
-        case State::EntrySync::Ran:
-            s.sync_unknown = true;
-            s.alt_unknown = false;
-            s.alt_reports = 0;
-            break;
-        case State::EntrySync::None:
-            if (s.entry_hard || s.entry_unfollowed) {
-                s.sync_unknown = true;
-                s.alt_unknown = true;
-            }
-            break;
-        }
-        // P3's mirror (fable_stage_p3 4.1) as P3 would keep it: an entry it would pass clears it
-        // (a sync point or a fence) or leaves it (a release with no fence, already added).
-        switch (s.entry_p3) {
-        case State::P3Effect::Cleared:
-            s.p3_pages.clear();
-            s.p3_unknown = false;
-            break;
-        case State::P3Effect::Kept:
-            break;
-        case State::P3Effect::None:
-            if (s.entry_hard || s.entry_unfollowed) {
-                s.p3_unknown = true;
-            }
-            break;
-        }
-    }
+    // The sync mirror (fable_stage_levelpoints 12.2) took this entry's effects where they came,
+    // in order: a lone 0x3dd or 0x44 clears it (MirrorAfterSyncPoint), a 3D report adds one,
+    // a fence report or a release follows its row (MirrorFence, MirrorRelease), an executable
+    // compute or DMA method and an unfollowed entry make it unknown (other_engine, Unfollow).
+    // Any other hard entry leaves it: none calls Query.
     return size;
 }
 
@@ -2970,10 +2990,6 @@ StageResult StageProcess(u64 position, bool in_run) {
     s.current = position;
     const size_t size = Process(s, position, false);
     s.cursor = position + size;
-    if (!in_run) {
-        s.run_from_dry_pass = s.entry_dry_pass;
-        s.run_from_p3_pass = s.entry_p3 != State::P3Effect::None;
-    }
     return StageResult{
         .size = size,
         .cls = static_cast<u8>(s.last_class),
@@ -3113,14 +3129,8 @@ bool StageMayCopy(u64 position) {
 
 u64 StageReturn(const void* drew_engine, const void* state_engine, s32 back_channel) {
     State& s = S();
-    // The sync mirror (6.1): after every run, a sync may be pending. Not after a run P1 would
-    // not have (dry: its first entry would have passed; its other entries set it themselves).
-    if (!std::exchange(s.run_from_dry_pass, false)) {
-        s.sync_unknown = true;
-    }
-    if (!std::exchange(s.run_from_p3_pass, false)) {
-        s.p3_unknown = true; // P3's mirror (fable_stage_p3 4.1), as P3 would keep it
-    }
+    // The sync mirror is left as it is (fable_stage_levelpoints 12.1): GPUMem processed every
+    // entry of the run before the back ran it, and each one applied its own effect.
     for (Copy& copy : s.copies) {
         if (!copy.stale) {
             TakeCacheFlags(copy.e->dirty.flags, copy.back->dirty.flags);

@@ -504,24 +504,18 @@ public:
     enum class PassMethod : u8 { Gather, WaitForIdle, Count };
     /// The backend's pass_ready answer (rule C and read tracking, at GPUMem's position).
     enum class PassReady : u8 { Ready, Tracking, Flushes };
-    /// GPUMem: a pass decision. `alt`: the alternative mirror (a lone sync point clears it also
-    /// when it runs; a run's return leaves it) would have let it pass the mirror test.
-    void NotePass(PassMethod method, PassOutcome what, bool alt = false) noexcept {
-        auto& stats = pass_stats;
-        BumpOne(stats.outcomes[static_cast<size_t>(method)][static_cast<size_t>(what)], 1);
-        if (alt) {
-            BumpOne(stats.alt_passes[static_cast<size_t>(method)], 1);
-        }
+    /// GPUMem: a pass decision.
+    void NotePass(PassMethod method, PassOutcome what) noexcept {
+        BumpOne(pass_stats.outcomes[static_cast<size_t>(method)][static_cast<size_t>(what)], 1);
     }
     /// GPUMem, after the back ran a gather at its entry (FRITCHII_MEMSTAGE_GATHER): whether the
-    /// mirror (and the alternative one) said no sync could be pending, against what the back found.
-    void NoteMirrorCheck(bool clear, bool alt_clear, bool synced) noexcept {
+    /// mirror said no sync could be pending, against what the back found (fable_stage_levelpoints
+    /// 12.3: "clear, but the back synced" must be 0).
+    void NoteMirrorCheck(bool clear, bool synced) noexcept {
         auto& stats = pass_stats;
         BumpOne(stats.mirror_checks, 1);
         BumpOne(stats.mirror_clear, clear ? 1 : 0);
         BumpOne(stats.mirror_wrong, clear && synced ? 1 : 0);
-        BumpOne(stats.alt_clear, alt_clear ? 1 : 0);
-        BumpOne(stats.alt_wrong, alt_clear && synced ? 1 : 0);
     }
     /// GPUMem: whether the back's run of the gather it last asked for synced query results.
     [[nodiscard]] bool LastGatherSynced() const noexcept {
@@ -1086,12 +1080,9 @@ private:
         std::array<std::array<std::atomic<u64>, static_cast<size_t>(PassOutcome::Count)>,
                    static_cast<size_t>(PassMethod::Count)>
             outcomes{};
-        std::array<std::atomic<u64>, static_cast<size_t>(PassMethod::Count)> alt_passes{};
         std::atomic<u64> mirror_checks{};
         std::atomic<u64> mirror_clear{};
         std::atomic<u64> mirror_wrong{};
-        std::atomic<u64> alt_clear{};
-        std::atomic<u64> alt_wrong{};
         std::array<std::array<std::atomic<u64>, 3>, 2> fence_entries{}; ///< [kind][PassReady]
         /// GPUMem from the lend to the return: waiting for the back (the run's end), for the
         /// front while the run is kept lent; by the run's compute launches (RunBucket), with the

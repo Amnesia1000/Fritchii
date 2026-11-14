@@ -1427,8 +1427,8 @@ is then dry). Bit 2 (fence entries, fable_stage_p3) is not built: it is masked o
   buffer flushes at a passed entry's flush grouping", "a pass record of an entry the back passed
   without asking for it", "a passed gather's buffer half recorded a command" (the seam arena grew
   in its bracket), "a served wait for idle with no pass record".
-- Exactness, in short: the back's query state at the entry has no pending sync (every source of
-  one is a 3D report GPUMem counts or a hard entry); the uncommitted set is empty there (above);
+- Exactness, in short: the back's query state at the entry has no pending sync (every caller of
+  Query is an entry the mirror's table counts, below); the uncommitted set is empty there (above);
   the game writes taken at the gather were collected before GPUMem read the list, and both halves
   land at the entry, the buffer half before GPUMem's next fill (THREAD 0's order). A write made
   while the list runs has no position the game can count on and is taken at the next gather.
@@ -1448,19 +1448,23 @@ judged by. Dry means decided and counted, the entries behave as before.
   run, late (its entry hard already), not first (not a lone method entry, or a draw before it),
   sync may be pending (the mirror below), read tracking (EXP49 or a pending read download),
   flushes uncommitted (the buffer cache's uncommitted set, its note first, then under the lock),
-  no record room, GPU-written page (both P1 only). "Of the sync-pending ones, clear in the
-  alternative mirror and ready": how many more would pass with that mirror.
-- The mirror (6.1) of the back's query_cache.HasPendingSync() at GPUMem's place: unknown at the
-  ring's start, after every run's return and after every hard or unfollowed entry; a 3D report
-  that is not a fence (Release or ReportOnly) makes a sync pending; a lone 0x3dd or 0x44 that
-  passed (dry: would pass) or that the back ran at its entry (FRITCHII_MEMSTAGE_GATHER) clears
-  it. The alternative mirror is the same, but a lone 0x3dd or 0x44 that runs as a level run
-  clears it too (the back runs its wait for idle at that entry), and a run's return leaves it as
-  it is (every entry of the run went through GPUMem, so the hard ones set it themselves). Dry, a
-  sync point that would pass and a run it starts are taken as P1 would (cleared, no run).
+  no record room, GPU-written page (both P1 only).
+- The mirror of the back's query_cache.HasPendingSync() at GPUMem's place (fable_stage_levelpoints
+  6.1 and 12): a function of the entries before that place, each applied in stream order where
+  GPUMem's Process reaches it, runs included (their entries go through Process too, so a run's
+  return changes nothing). Unknown at the ring's start. A lone 0x3dd or 0x44 (a Method entry)
+  clears it whatever becomes of it (passed, run at its entry, or hard in a run: the back runs its
+  wait for idle there, which syncs every streamer). A 3D report that is not a fence adds one. A
+  3D fence report at a mapped address clears it (its fence is made and syncs), or adds one with
+  EXP28 & 1; unmapped, no change. A puller release (hard or run at its entry by
+  FRITCHII_MEMSTAGE_RELEASE): unmapped no change, not fence-flagged a report, fence-flagged as
+  the fence report. An executable compute method other than 0x6c and 0x6d, a DMA engine method,
+  an engine of no known type, and an unfollowed entry make it unknown. Any other hard entry, any
+  other cache call (none calls Query: the rule beside StageCacheCall), the upload and 2D engines:
+  no change.
 - "The mirror at the gathers the back ran at their entry": with FRITCHII_MEMSTAGE_GATHER on, each
   served gather checks the mirror against the back's own answer (it had query results to sync):
-  "clear but a sync found" must be 0 for the passes, for each mirror.
+  "clear but the back synced" must be 0 (fable_stage_levelpoints 12.3: the proof of the rule).
 - Fence entries outside a run (the puller's release closures and the 3D fence reports): whether
   rule C holds there (no read tracking, no uncommitted flush).
 - Puller releases on the front (WriteLong): timestamped and fence-flagged (RELEASE_SIZE), each
@@ -1481,16 +1485,16 @@ otherwise the first reason, in this order: not lone (a run, late, not a lone met
 fence report inside a packet or batch); for a release, unmapped (passes: the back's Query returns
 at once) or not fence-flagged (passes: no fence, no cache; its page joins the mirror); EXP28 & 1
 (fence kinds: the fence may not sync); read tracking; flushes uncommitted; for a sync point with
-no report pending, pass (P1's); reports unknown (after a run's return or a hard or unfollowed
-entry); the fence behaviour Accurate; then the targets: the report pages GPUMem saw since the
+no report pending, pass (P1's); reports unknown (after a compute or DMA method, an unfollowed
+entry, or a report across a page end); the fence behaviour Accurate; then the targets: the report pages GPUMem saw since the
 last sync point (and the entry's own) as maximal runs of adjacent 4 KiB device pages, more than 8
 runs, a run no existing buffer holds on its first page ("no buffer": the sync would create one;
 should fall to near 0 after the first seconds, else pages are being collected or re-made), a run
 past that buffer, a run with CPU-modified bytes (the sync would upload: the count that decides
 P3's worth). Then the report pages per sync point that reached the target test (average and
 maximum). The target test is BufferCache::ProbeSyncTarget under the cache's lock: it changes
-nothing (no usage mark in dry). P3's mirror is kept as P3 would keep it: an entry it would pass
-does not count as hard, and the run such an entry starts does not count as a run.
+nothing (no usage mark in dry). P3's mirror (its report pages) follows the same table as the
+mirror above, so it does not depend on what is passed.
 
 ### FRITCHII_MEMSTAGE_MARKS_AHEAD
 
