@@ -738,9 +738,12 @@ void PinCurrentThread(PinnedRole role, int guest_core) {
         // One follower (FRITCHII_ONEF=1, boot): its render thread R takes the same core unless
         // FRITCHII_ONEF_PIN=0 (default 1; video_core/one_follower.h). R and GPUMem never run
         // together: the memory stage stays off with one follower on.
+        // FRITCHII_ONEF_LEAN=1 turns one follower on too.
         const char* const onef = std::getenv("FRITCHII_ONEF");
+        const char* const onef_lean = std::getenv("FRITCHII_ONEF_LEAN");
         const char* const onef_pin = std::getenv("FRITCHII_ONEF_PIN");
-        const bool pin_render = onef != nullptr && onef[0] == '1' &&
+        const bool pin_render = ((onef != nullptr && onef[0] == '1') ||
+                                 (onef_lean != nullptr && onef_lean[0] == '1')) &&
                                 (onef_pin == nullptr || onef_pin[0] != '0');
         if (((pin_mem != nullptr && pin_mem[0] == '1') || pin_render) && result.guest != 0) {
             for (auto it = topology.cores.rbegin(); it != topology.cores.rend(); ++it) {

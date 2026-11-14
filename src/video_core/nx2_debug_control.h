@@ -234,8 +234,11 @@ inline std::atomic<int> g_onef_verify_every{-1};
 inline std::atomic<int> g_onef_ahead{-1};
 /// FRITCHII_ONEF_PIN (boot, default 1): R on PinnedRole::GpuMem's core.
 inline std::atomic<int> g_onef_pin{-1};
-/// FRITCHII_ONEF_E_PIPELINE (boot, default 0): fable_b 10.2 rule 3, E owns the pipeline lookup.
+/// FRITCHII_ONEF_E_PIPELINE (boot, default 1): fable_b 10.2 rule 3, E owns the pipeline lookup.
 inline std::atomic<int> g_onef_e_pipeline{-1};
+/// FRITCHII_ONEF_LEAN (boot, default 0): one follower at step 4 from boot with the verified
+/// configuration and no compares (docs/fritchii/switches.md).
+inline std::atomic<int> g_onef_lean{-1};
 /// FRITCHII_ONEF_QUERY_OPS (live, default 0): fable_b 11.1 item 1, queries without parking E.
 inline std::atomic<int> g_onef_query_ops{-1};
 /// FRITCHII_ONEF_WAITS_E (live, default 0): fable_b 11.2, the front's waits on game memory and

@@ -1344,7 +1344,8 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   operation is lent. The picture is today's; it prices the hop (one round trip a draw). 0 is
   today's code path, untouched. Not live: ownership of the caches and the scheduler cannot change
   in a session. Needs the GPU thread split.
-- FRITCHII_ONEF_E_PIPELINE (boot, default 0; fable_b_one_follower 10.2 rule 3): 1 = E owns the
+- FRITCHII_ONEF_E_PIPELINE (boot, default 1 with FRITCHII_ONEF=1; fable_b_one_follower 10.2
+  rule 3; 0 goes back to the facts table path): 1 = E owns the
   pipeline lookup. The pipeline cache always reads E's engine (R's view never replaces it); at
   step 4 E looks each unlent draw's pipeline up before its fill (a miss or a build not ready is a
   lent draw, "pipeline miss"), fills from that pipeline's own facts and puts the pipeline in the
@@ -1380,6 +1381,15 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   releases, the lagged check, fence (word) writers, report flushes (macro dma flush), maps and
   the rest still wait for R. The "Front waits for the back by site" line marks the E sites
   "(E)", and a second line counts the waits that ended before R got there.
+- FRITCHII_ONEF_LEAN (boot, default 0): 1 = one follower on (no FRITCHII_ONEF=1 needed) at
+  step 4 from boot with the verified configuration, for measuring and later shipping. Defaults
+  it sets unless the environment sets them: FRITCHII_ONEF_UNLEND=3, FRITCHII_ONEF_E_PIPELINE=1,
+  FRITCHII_ONEF_QUERY_OPS=1, FRITCHII_ONEF_WAITS_E=1, FRITCHII_ONEF_INVAL_E=1,
+  FRITCHII_ONEF_VERIFY_EVERY=0, EDEN_NX2_EXP12=5. VIEW and BUILD are not needed (asked for by
+  the lean mode); the view compare (PacketVerify), the build compares and the forced verify are
+  off, the facts table is not written (E_PIPELINE). The must-be-0 checks that cost nothing stay
+  on (owner asserts, stream-write guard, the pre-record hash check and its safety stop,
+  descriptor counts, texture read ahead of R). One log line at boot names the configuration.
 - FRITCHII_ONEF_PIN (boot, default 1): R gets PinnedRole::GpuMem's physical core (as
   FRITCHII_PIN_GPUMEM=1 gives GPUMem), taken from the guest set. 0 leaves R unpinned.
 - FRITCHII_ONEF_VIEW (live, default 0): 1 = step 2, E packs the register delta, the R-owned dirty
