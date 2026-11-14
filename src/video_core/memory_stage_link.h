@@ -7,6 +7,7 @@
 #include <atomic>
 #include <exception>
 #include <memory>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -766,6 +767,12 @@ private:
     static bool StageContendedHook(std::thread::id holder, bool first);
     /// Back: the run it is in.
     u64 back_run_from{};
+    /// The limits the back's last BackEntry had (its batch's) and that entry's position: the
+    /// must-be-0 notes of the gathers, releases and runs log them (BackRingState).
+    BackLimits back_entry_limits{};
+    u64 back_entry_at{};
+    /// The back's ring state for a must-be-0 note at `position` (formatted; that path only).
+    std::string BackRingState(u64 position) const;
     u64 back_draw_seq{};
     std::atomic<const void*> back_drew_in_run{};
     std::atomic<const void*> back_state_in_run{};
