@@ -40,8 +40,8 @@ inline std::atomic<bool> g_detail{false};
 inline std::atomic<u8> g_zone_gate{0};
 inline constexpr u8 ZoneGateTimeline = 1;
 inline constexpr u8 ZoneGateProfile = 2;
-/// Bit 2 while EDEN_NX2_STALL_SNAPSHOT keeps per-thread span slots (Nx2Hitch::RegisterThread).
-inline constexpr u8 ZoneGateStall = 4;
+// EDEN_NX2_STALL_SNAPSHOT does not open the gate (it did until 2026-11-14, bit 2): only the
+// profiler's wait zones mark its slots, and they test Nx2Hitch::t_stall_slot inline.
 
 [[nodiscard]] inline bool ZoneGateOpen() {
     return g_zone_gate.load(std::memory_order_relaxed) != 0;

@@ -15,6 +15,27 @@ thread sample which guest pages are resident every 10 s (HostMemory::SampleResid
 in the owner's playtest, so it only runs for a memory hunt; without it the line's resident and
 guest-unique figures read 0. EDEN_NX2_MEM_HEAPS=1 (the heap walk, ~250 ms) is separate.
 
+### EDEN_NX2_STALL_SNAPSHOT
+
+On by default since 2026-11-14; EDEN_NX2_STALL_SNAPSHOT=0 turns it off (read as each thread is
+named, so nx2_switches.txt applies). A present gap of 100 ms or more logs a "Stall snapshot:"
+line after its Hitch line: for the GPU back, front, Vulkan worker, fencing, present and GPUMem
+threads the span each is in now and for how long, the longest span each spent in the gap, the
+master semaphore's ticks, and whether the present thread is between acquire and present
+(common/nx2_hitch.h).
+- Cost (2026-11-14, fable_front_drains 8.4): it no longer opens the profiler's zone gate and reads
+  no clock. Spans take their times from a tick the OS keeps (Windows: the kernel's interrupt time,
+  0.5 ms steps with Fritchii's timer resolution, 15.6 ms at worst; Linux: the coarse monotonic
+  clock), so marking a span is a few loads and stores. Before, every coarse profiler zone called
+  out of line and read the wall clock twice (83 ms/s on the front at the market).
+- Only waits mark the slots: the timeline's spans (fence, worker, present and host GPU waits),
+  the profiler's wait zones (idle, pending sleep, split drain, writer wait, list waits, query DMA
+  wait, read flush, image create, pool destroy here) and the front's per-list "push". The
+  per-draw, per-dispatch, per-macro and per-fence zones no longer do: time in them reads as the
+  span around them ("push" on the front) or "(no span)" (busy outside every wait, the back's
+  draws and dispatches mostly). Times are good to about one tick.
+- With EDEN_NX2_GPU_PROFILE or a timeline recording the zones are timed exactly as before.
+
 ### EDEN_NX2_DMA_WAIT_WRITERS
 
 EXPERIMENT (not for nx2): EDEN_NX2_DMA_WAIT_WRITERS, read at startup and settable live by the
