@@ -391,6 +391,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_PIPELINE_KEY_HASH") {
         return &g_pipeline_key_hash;
     }
+    if (name == "FRITCHII_CB_WORDS_BLOCK") {
+        return &g_cb_words_block;
+    }
     return nullptr;
 }
 

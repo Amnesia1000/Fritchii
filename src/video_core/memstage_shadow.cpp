@@ -167,6 +167,7 @@ struct MemStageShadowAccess {
     static constexpr u64 HasSegment = GpuSplit::HasSegment;
     static constexpr u64 Direct = GpuSplit::Direct;
     static constexpr u64 Sink = GpuSplit::Sink;
+    static constexpr u64 CbVerify = GpuSplit::CbVerify;
     static constexpr size_t RingWords = GpuSplit::RingWords;
     static constexpr size_t RingMask = GpuSplit::RingMask;
 
@@ -1950,6 +1951,39 @@ size_t Process(State& s, u64 position, bool executed) {
         }
         break;
     }
+    case Kind::CbWords: {
+        // FRITCHII_CB_WORDS_BLOCK (GpuSplit::CbWord): 3D constant buffer data words that were
+        // Method entries in a row, each followed as Kind::Method follows such an entry
+        // (CallMethod); the block is one entry, hard as a whole when any word makes it hard
+        // (the back then writes every word itself, the ones written here again).
+        const u32 count = static_cast<u32>(head >> 32);
+        const size_t first = (head & Access::CbVerify) != 0 ? 2 : 1;
+        size = first + count;
+        const u64* const words = entry + first;
+        if (s.engine == nullptr) {
+            Unfollow(s, LevelType::NoEngine, 0);
+            break;
+        }
+        if (s.engine_copy == nullptr) {
+            // Only the 3D engine sends blocks; any other engine's executable method is level.
+            other_engine(count != 0 ? static_cast<u32>((words[0] >> 8) & 0xffff) : CbData, true);
+            break;
+        }
+        Copy& c0 = *s.engine_copy;
+        // As Kind::Method for an executable 3D method (what every word is, GpuSplit checks).
+        cls = MethodKindOf(c0, CbData) == MethodKind::Work ? Class::Work : Class::Pass;
+        if (Copy* const c = Use(s, c0.back, executed)) {
+            const Nx2Profile::Scope zone{Nx2Profile::Zone::StageMethods,
+                                         s.ring && Nx2Profile::Fine(), false};
+            for (u32 i = 0; i < count; ++i) {
+                CallMethod(s, *c, static_cast<u32>((words[i] >> 8) & 0xffff),
+                           static_cast<u32>(words[i] >> 32));
+            }
+        } else if (MethodKindOf(c0, CbData) == MethodKind::Hard) {
+            Hard(s, LevelType::Method3D, CbData);
+        }
+        break;
+    }
     case Kind::Call: {
         const size_t payload = static_cast<size_t>((head >> 8) & 0xffffff);
         size = 2 + payload;
@@ -2536,6 +2570,7 @@ bool StageExtendsRun(u64 position) {
     case Kind::Method:
     case Kind::Multi:
     case Kind::Pairs:
+    case Kind::CbWords:
         return s.engine != nullptr && s.engine_copy == nullptr;
     default:
         return false;
@@ -2617,6 +2652,7 @@ bool StageMayCopy(u64 position) {
     case Kind::Pairs:
     case Kind::StateDelta:
     case Kind::DrawBatch:
+    case Kind::CbWords:
         return s.engine_copy != nullptr && s.engine_copy->stale;
     case Kind::Call:
         switch (StageTagOf(head)) {

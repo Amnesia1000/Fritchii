@@ -382,6 +382,69 @@ cache's (with a memory seam bracket) to find out whether a download waits to be 
   buffer half skipped B/s" (HW_GPU, Info).
 - Expected: about 3 to 4 ms/s (both lock takes at most fences in the compute stretch).
 
+### FRITCHII_CB_WORDS_BLOCK
+
+FRITCHII_CB_WORDS_BLOCK (live, default 0 = exactly as before; fable_perdraw_b 3.1). About 1.36
+million 3D constant buffer data words a second (0x8e4 to 0x8f3: the command list's increasing
+uploads, the draw macros' base vertex and instance words) each went through the split's ring as
+its own Method entry.
+- 1: Maxwell3D::FrontWrite puts such a word in the open CbWords block (GpuSplit::CbWord) as the
+  very Method word its entry would have carried (Direct and last-call from a macro, the command
+  list's last-call bit otherwise), up to 64 words a block. Everything else in FrontWrite stays:
+  the front's register copy and offset per word, the NoteWrite, RangeLastWrite and
+  NoteMethodWrite per word, each at the word's own position (every word is committed as its
+  entry was). The block ends at anything else reserved (another entry, an engine switch, held
+  back work first), at a publish, and when the sent position is read (SentPosition). The back
+  runs the block as one entry: its words go through Execute as the entries in a row did, whose
+  constant buffer gather takes them in one CallConstBufferWords (or word by word where the
+  gather is off). The memory stage follows the block as one entry, each word through the same
+  CallMethod as a Method entry.
+- 2: as 1, and each block carries the front's address of its first word. The back compares it
+  with its registers after the sink (the address the front's notes used), then applies the
+  block, records the offset, the 16 data registers, their shadow RAM words and the dirty flags,
+  checks memory holds the words' values (when it wrote them itself, not served by the memory
+  stage), puts the state back and applies the words one entry at a time, and compares. Not
+  applied twice: one word, a deferred draw waiting (it can draw once), the gather off.
+- Why it is exact:
+  - Order and position: the words sit in the ring in the same order between the same other
+    entries. The back stores `consumed` only at entry ends, so a note at a word's position inside
+    a block counts as run exactly when the whole block ran: waits end at the block's end, never
+    before the word ran. The notes themselves (range, data, position) are the same calls.
+  - Dirty flags: each word still goes through ProcessShadowRam and ProcessDirtyRegisters, in
+    order; the first word issues a waiting deferred draw before any word is uploaded, as its own
+    entry did. Checked by =2.
+  - Same-value skip: constant buffer data is executable, so neither the front's skip nor the
+    back's (state registers only) ever applied; EXP107's memory compare runs per
+    CallConstBufferWords call on the back, in order, as with the gather (a call over different
+    words only changes whether equal bytes are written again).
+  - Shadow RAM: the block carries the raw argument as the Method word did; the back and the stage
+    apply the shadow RAM per word. The mode cannot change inside a block (shadow_ram_control is
+    another method, which ends it).
+  - Macro reads of the offset and data registers read the front's copy, which FrontWrite still
+    updates per word. Macro DMA reads see each word's note at its position, as before.
+  - EXP88: WriteBoundConstantBuffer gets the same calls the gather made; its device ranges merge
+    where they touch, and FlushCaching invalidates them at the next draw, which cannot come
+    inside a block.
+  - FRITCHII_FRONT_RAN_READS: the noted writes it scans (reports, inline uploads) are never made
+    for constant buffer words, and a page snapshot's position is SentPosition, which ends the
+    block, so no snapshot or noted write position falls inside a block.
+  - Packet ticks: no draw, closure or seam bracket can fall between a block's words, so the
+    words' ranges reach the same draw's FlushCaching (back) or the same fill (stage) as before.
+  - Memory stage (FRITCHII_MEMSTAGE_THREAD=2): the block is one entry, served or lent as a whole.
+    A word that makes it hard (a watched page, GPU-written data, EXP107) makes all of it hard:
+    the back then writes every word, the ones the stage wrote already being the same bytes.
+- "CB words block (FRITCHII_CB_WORDS_BLOCK=n) 10 s: front blocks B/s with W words/s (W/B a
+  block), ring entries saved S/s, blocks ended full F/s; ranged write overflows O/s; back
+  totals: blocks, words; must be 0: broken blocks, bad blocks; verify (=2): addresses checked,
+  differ; applied both ways, differ, not applied twice" (HW_GPU, Info). Broken blocks (a commit
+  after a block that did not end it), bad blocks (words that are not constant buffer data) and
+  both differ counts must stay 0.
+- Expected: the back's constant buffer gather already took words that arrived together, so the
+  back saves the per-entry decode and the splits at early publishes (the front published every 8
+  words to a waiting back); the front saves the engine select and reserve per word. The ranged
+  write overflows are not expected to drop: RangeLastWrite already extends the last range for
+  each next word, so they count runs to other places (the line shows them for the A/B).
+
 ### EDEN_NX2_ACCURATE_PARTS
 
 EDEN_NX2_ACCURATE_PARTS (bit mask, 0 = none, read once at boot): parts of GPU accuracy High in
