@@ -249,11 +249,16 @@ void MemoryManager::BindRasterizer(VideoCore::RasterizerInterface* rasterizer_) 
 }
 
 namespace {
-// The page table lock is only taken while translation workers read guest memory
-// (EDEN_NX2_ASYNC_TRANSLATE=1 or 2); otherwise the writers below run exactly as before.
+// Every page table change holds the lock, whether or not translation workers read guest memory
+// (EDEN_NX2_ASYNC_TRANSLATE=1 or 2, its guarded readers): SetEntry and SetBigPageContinuous
+// rewrite a whole u64 of 32 (or 64) neighbouring entries, and two changes can overlap (Switch 2
+// maps and unmaps run on the GPU thread, MapInOrder and RunInOrder, without the nvhost mutex the
+// guest thread's mappings hold), so one could write back the other's old neighbours. Uncontended
+// it costs nothing next to a change. Order: this lock, then the caches' locks the change's
+// ModifyGPUMemory takes; nothing that holds a cache lock waits for it (the guarded readers only
+// try it, 2 ms at most, MapChange's readers never take it).
 std::unique_lock<std::shared_mutex> LockPageTableForWrite(std::shared_mutex& lock) {
-    static const bool enabled = VideoCommon::AsyncTranslateWorkers();
-    return enabled ? std::unique_lock{lock} : std::unique_lock<std::shared_mutex>{};
+    return std::unique_lock{lock};
 }
 } // Anonymous namespace
 
@@ -275,12 +280,13 @@ void MemoryManager::Unmap(GPUVAddr gpu_addr, std::size_t size) {
     if (size == 0) {
         return;
     }
+    // A local list, not a member: two unmaps can overlap (see LockPageTableForWrite).
+    boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> page_stash;
     GetSubmappedRangeImpl<false>(gpu_addr, size, page_stash);
 
     for (const auto& [map_addr, map_size] : page_stash) {
         rasterizer->UnmapMemory(map_addr, map_size);
     }
-    page_stash.clear();
 
     // Only around the table updates: the caches' unmap callbacks above stay outside the lock.
     const auto lock = LockPageTableForWrite(page_table_lock);
@@ -357,12 +363,14 @@ std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr gpu_addr) const {
     MapRead read{};
     if (use_cache) [[unlikely]] {
         owner_id = (u64{unique_identifier} << 1) | 1; // Never 0, the empty slot
-        read = BeginMapRead();
         slot = &cache[(page ^ (page >> 11)) % CacheSize];
-        if (slot->owner == owner_id && slot->page == page && slot->serial == read.serial)
+        // A hit needs the counter only (a slot is stored stable, and any later change moves it);
+        // the running-changes count is loaded on a miss, before the lookup.
+        if (slot->owner == owner_id && slot->page == page && slot->serial == MapSerial())
             [[likely]] {
             return slot->device_page + (gpu_addr & SubpageMask);
         }
+        read = BeginMapRead();
     }
     DAddr dev_addr;
     if (GetEntry(gpu_addr, true) != EntryType::Mapped) [[unlikely]] {
