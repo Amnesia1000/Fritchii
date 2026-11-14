@@ -651,6 +651,14 @@ void QueryCacheBase<Traits>::BindToChannel(s32 id) {
 template <typename Traits>
 void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type,
                                            QueryPropertiesFlags flags, u32 payload, u32 subreport) {
+    CounterReportAt(addr, gpu_memory->GpuToCpuAddress(addr), counter_type, flags, payload,
+                    subreport);
+}
+
+template <typename Traits>
+void QueryCacheBase<Traits>::CounterReportAt(GPUVAddr addr, std::optional<DAddr> device,
+                                             QueryType counter_type, QueryPropertiesFlags flags,
+                                             u32 payload, u32 subreport) {
     VideoCommon::OneFollower::RenderOwned("QueryCache::CounterReport");
     const bool has_timestamp = True(flags & QueryPropertiesFlags::HasTimeout);
     const bool is_fence = True(flags & QueryPropertiesFlags::IsAFence);
@@ -678,7 +686,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         streamer_id = static_cast<size_t>(counter_type);
         streamer = impl->streamers[streamer_id];
     }
-    auto cpu_addr_opt = gpu_memory->GpuToCpuAddress(addr);
+    auto cpu_addr_opt = device;
     if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Request)) {
         LOG_INFO(HW_GPU,
                  "DKB_QUERY request n={} as={} gpu={:#x} device={:#x} mapped={} type={} "

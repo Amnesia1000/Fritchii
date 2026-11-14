@@ -1350,6 +1350,17 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   lent draw, "pipeline miss"), fills from that pipeline's own facts and puts the pipeline in the
   packet; R binds it and looks nothing up. The facts table then plays no part in unlent draws.
   R calling the lookup outside a lent call counts "owner on R".
+- FRITCHII_ONEF_QUERY_OPS (live, default 0; fable_b_one_follower 11.1 item 1): 1 = queries stop
+  parking E. A render enable with an override or mode True/False sends nothing while no
+  Conditional/IfEqual/IfNotEqual one was ever lent (it could only end host conditional
+  rendering, which nothing began); counter resets and plain reports (not fences, not payload
+  releases) are render ops R runs at their place while E goes on, the report's address
+  translated on E. A plain report on a page the buffer cache has registered stays lent and counts
+  "report on buffer page" (must be 0). Turning it on also sets EXP12=5 (the lagged acquire check,
+  11.3) unless EXP12 is 5 or 6. Every 10 s "One follower queries by kind" logs each call site's
+  rate and parked ms/s (condition skipped/override/true/false/conditional/if equal/if not equal,
+  reset, plain report, report on buffer page, fence report, payload release), with the switch off
+  too.
 - FRITCHII_ONEF_PIN (boot, default 1): R gets PinnedRole::GpuMem's physical core (as
   FRITCHII_PIN_GPUMEM=1 gives GPUMem), taken from the guest set. 0 leaves R unpinned.
 - FRITCHII_ONEF_VIEW (live, default 0): 1 = step 2, E packs the register delta, the R-owned dirty

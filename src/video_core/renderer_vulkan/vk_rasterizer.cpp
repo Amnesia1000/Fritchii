@@ -4527,6 +4527,26 @@ void RasterizerVulkan::DispatchCompute() {
 }
 
 void RasterizerVulkan::ResetCounter(VideoCommon::QueryType type) {
+    if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
+        namespace OneF = VideoCommon::OneFollower;
+        OneF::SetQueryKind(OneF::QueryKind::Reset);
+        if (OneF::QueryOps()) {
+            // fable_b 11.1 item 1(b): a render op, E not parked (nothing comes back).
+            struct Op {
+                RasterizerVulkan* self;
+                VideoCommon::QueryType type;
+            } const op{this, type};
+            OneF::PushOp(
+                OneF::LentOp::Query,
+                [](void* raw) {
+                    Op a;
+                    std::memcpy(&a, raw, sizeof(a));
+                    a.self->ResetCounter(a.type);
+                },
+                &op, sizeof(op));
+            return;
+        }
+    }
     ONEF_LEND(Query, ResetCounter(type))
     switch (type) {
     case VideoCommon::QueryType::ZPassPixelCount64:
@@ -4543,6 +4563,52 @@ void RasterizerVulkan::ResetCounter(VideoCommon::QueryType type) {
 
 void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                              VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) {
+    if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
+        namespace OneF = VideoCommon::OneFollower;
+        if (True(flags & VideoCommon::QueryPropertiesFlags::IsAFence)) {
+            OneF::SetQueryKind(OneF::QueryKind::FenceReport); // lent (fable_b item 4)
+        } else if (type == VideoCommon::QueryType::Payload) {
+            OneF::SetQueryKind(OneF::QueryKind::PayloadRelease); // lent (fable_b item 4)
+        } else if (!OneF::QueryOps()) {
+            OneF::SetQueryKind(OneF::QueryKind::PlainReport);
+        } else {
+            // fable_b 11.1 item 1(c): a plain report is a render op, translated here at E's
+            // stream place. Guard: a target the buffer cache has registered stays lent (E's
+            // uploads would not see R's later write).
+            const std::optional<DAddr> device = gpu_memory->GpuToCpuAddress(gpu_addr);
+            bool registered = false;
+            if (device) {
+                std::scoped_lock lock{buffer_cache.mutex};
+                registered = buffer_cache.IsRegionRegistered(*device, 16);
+            }
+            if (registered) {
+                OneF::Note(OneF::Check::ReportOnBufferPage,
+                           "a plain report on a buffer cache page (kept lent)");
+                OneF::SetQueryKind(OneF::QueryKind::ReportOnBufferPage);
+            } else {
+                OneF::SetQueryKind(OneF::QueryKind::PlainReport);
+                struct Op {
+                    RasterizerVulkan* self;
+                    GPUVAddr gpu_addr;
+                    std::optional<DAddr> device;
+                    VideoCommon::QueryType type;
+                    VideoCommon::QueryPropertiesFlags flags;
+                    u32 payload;
+                    u32 subreport;
+                } const op{this, gpu_addr, device, type, flags, payload, subreport};
+                OneF::PushOp(
+                    OneF::LentOp::Query,
+                    [](void* raw) {
+                        Op a;
+                        std::memcpy(&a, raw, sizeof(a));
+                        a.self->query_cache.CounterReportAt(a.gpu_addr, a.device, a.type, a.flags,
+                                                            a.payload, a.subreport);
+                    },
+                    &op, sizeof(op));
+                return;
+            }
+        }
+    }
     ONEF_LEND(Query, Query(gpu_addr, type, flags, payload, subreport))
     query_cache.CounterReport(gpu_addr, type, flags, payload, subreport);
 }
@@ -6857,6 +6923,46 @@ void RasterizerVulkan::TickFrame() {
 }
 
 bool RasterizerVulkan::AccelerateConditionalRendering() {
+    if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
+        namespace OneF = VideoCommon::OneFollower;
+        using RenderEnable = Maxwell::RenderEnable;
+        // E's engine (the rasterizer's own may point at R's view).
+        const auto& regs = channel_state->maxwell3d.regs;
+        OneF::QueryKind kind = OneF::QueryKind::ConditionOverride;
+        if (regs.render_enable_override == RenderEnable::Override::UseRenderEnable) {
+            switch (regs.render_enable.mode) {
+            case RenderEnable::Mode::True:
+                kind = OneF::QueryKind::ConditionTrue;
+                break;
+            case RenderEnable::Mode::False:
+                kind = OneF::QueryKind::ConditionFalse;
+                break;
+            case RenderEnable::Mode::Conditional:
+                kind = OneF::QueryKind::ConditionConditional;
+                break;
+            case RenderEnable::Mode::IfEqual:
+                kind = OneF::QueryKind::ConditionIfEqual;
+                break;
+            default:
+                kind = OneF::QueryKind::ConditionIfNotEqual;
+                break;
+            }
+        }
+        const bool may_begin = kind == OneF::QueryKind::ConditionConditional ||
+                               kind == OneF::QueryKind::ConditionIfEqual ||
+                               kind == OneF::QueryKind::ConditionIfNotEqual;
+        if (may_begin) {
+            // Set with the switch off too, so turning it on later stays exact.
+            onef_condition_may_be_set = true;
+        } else if (!onef_condition_may_be_set && OneF::QueryOps()) {
+            // fable_b 11.1 item 1(a): override or True/False only ends host conditional
+            // rendering (false, no lookup), a no-op while nothing ever began it. FlushCaching is
+            // left to the next draw, which flushes before it reads.
+            OneF::CountQueryKind(OneF::QueryKind::ConditionSkipped);
+            return false;
+        }
+        OneF::SetQueryKind(kind);
+    }
     ONEF_LEND_RESULT(Query, AccelerateConditionalRendering())
     gpu_memory->FlushCaching();
     return query_cache.AccelerateHostConditionalRendering();

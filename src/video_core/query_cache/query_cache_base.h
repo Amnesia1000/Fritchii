@@ -116,6 +116,11 @@ public:
     void CounterReport(GPUVAddr addr, QueryType counter_type, QueryPropertiesFlags flags,
                        u32 payload, u32 subreport);
 
+    /// CounterReport with `addr` already translated (FRITCHII_ONEF_QUERY_OPS: E translates at
+    /// its stream place, R writes the report).
+    void CounterReportAt(GPUVAddr addr, std::optional<DAddr> device, QueryType counter_type,
+                         QueryPropertiesFlags flags, u32 payload, u32 subreport);
+
     void NotifyWFI();
 
     bool AccelerateHostConditionalRendering();
