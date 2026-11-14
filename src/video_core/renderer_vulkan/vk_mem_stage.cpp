@@ -1454,7 +1454,7 @@ void MemStage::FillTrackerRecord(Cache& cache_, TrackerRecord& record) {
         // large), the whole binding of slots 4 and 6.
         const u64 bytes = index == 3 ? u64{TrackerRecord::CameraBytes} : u64{size};
         slot.gpu_modified = slot.bound && (index != 3 || size >= TrackerRecord::CameraBytes) &&
-                            cache_.IsRegionGpuModified(address, bytes);
+                            cache_.GpuWrittenHere(address, bytes); // with marks ahead on GPUMem
     }
     record.filled = true;
 }
@@ -1736,6 +1736,11 @@ void MemStage::PushRingDraw() {
     header.value_flags = (ring_values != nullptr ? 1U : 0U) | (ring_null_pointers ? 2U : 0U);
     header.tracker_bytes = tracker_bytes;
     header.stage_writes = Link::Get().StageWriteCount();
+    // FRITCHII_MEMSTAGE_MARKS_AHEAD: the fill's marks wait for this packet's play (GPUMem holds
+    // the cache's lock in its fill).
+    if (cache != nullptr && cache->AheadFillPushed(NextRingPacketIndex())) {
+        header.flags |= RingMarkedWrites;
+    }
     if (stage_log) {
         // Step 7's verify: the fill's read log, in packet order, before the packet is visible.
         header.flags |= 2;
@@ -1860,6 +1865,7 @@ void MemStage::TakeRingHeader(const RingHeader& header) {
     held_hashes = header.hashes;
     played_stage_writes = header.stage_writes;
     const bool logged = (header.flags & 2) != 0;
+    const bool marks = (header.flags & RingMarkedWrites) != 0;
     const u64 number = header.number;
     // Stamps per thread: the back stamps with the packet it plays, and after it with the last.
     SeamTicks::SetStamp(number, false);
@@ -1878,7 +1884,10 @@ void MemStage::TakeRingHeader(const RingHeader& header) {
         }
     }
     // Step 7: the window and the room GPUMem may wait for (it is woken if it sleeps).
-    ring_packets_done.fetch_add(1, std::memory_order_seq_cst);
+    // FRITCHII_MEMSTAGE_MARKS_AHEAD: packets are taken or dropped in push order, so the count is
+    // this one's push index.
+    held_packet_index = ring_packets_done.fetch_add(1, std::memory_order_seq_cst) + 1;
+    held_marks = marks;
     Link::Get().NoteRingFreed();
     held = HeldKind::Draw;
     held_ring = true;
@@ -1964,12 +1973,18 @@ void MemStage::DiscardRingHeader(const RingHeader& header) {
         // Not played: its read log is not compared.
         RecycleRingLog(TakeRingLog(header.number));
     }
+    const bool marked = (header.flags & RingMarkedWrites) != 0; // before the bytes are freed
     ring_b_read += header.bytes;
     ring_b_freed.store(ring_b_read, std::memory_order_seq_cst);
-    ring_packets_done.fetch_add(1, std::memory_order_seq_cst);
+    const u64 index = ring_packets_done.fetch_add(1, std::memory_order_seq_cst) + 1;
     Link::Get().NoteRingFreed();
     if (ticks) {
         UpdateUnplayed();
+    }
+    // FRITCHII_MEMSTAGE_MARKS_AHEAD: its fill's marks are dropped, not promoted (the back fills
+    // the draw itself).
+    if (cache != nullptr) {
+        cache->NoteRingDiscarded(index, marked);
     }
 }
 
@@ -2259,6 +2274,7 @@ void MemStage::PlayRest() {
     }
     PlayHeldTo(held_arena.Size(), true);
     const Profile::FineScope tail_scope{Profile::Zone::RestTail};
+    const bool ring_packet = held_ring;
     held = HeldKind::None;
     held_ring = false;
     t_holding = false;
@@ -2272,6 +2288,11 @@ void MemStage::PlayRest() {
     held_cursor = 0;
     held_log.Clear();
     held_log_pending = false;
+    // FRITCHII_MEMSTAGE_MARKS_AHEAD: the packet is played whole; the marks its fill made ahead
+    // go into the buffer cache's real sets now, before the back goes on.
+    if (ring_packet && cache != nullptr) {
+        cache->NoteRingPlayed(held_packet_index, std::exchange(held_marks, false));
+    }
 }
 
 void MemStage::NoteHeldFlush(SeamHook::Use use, const std::source_location& location) {
@@ -3304,6 +3325,16 @@ void MemStage::TickThread(int seam) {
     // Passed gathers and waits for idle (live, default off; the window open only; bit 1).
     link.SetPass(static_cast<u32>(
         (std::max)(Debug::SwitchValue(Debug::g_memstage_pass, "FRITCHII_MEMSTAGE_PASS", 0), 0)));
+    // GPU-written marks made ahead of the back (live, default off; buffer_cache.h, "Marks ahead
+    // of the back"): they run only with the window open. Here both threads are level, so the
+    // cache's list is empty when it turns on or off.
+    {
+        const bool marks = Debug::SwitchValue(Debug::g_memstage_marks_ahead,
+                                              "FRITCHII_MEMSTAGE_MARKS_AHEAD", 0) > 0;
+        if (cache != nullptr) {
+            cache->SetMarksAhead(marks && link.Mode() == 2 && Link::Ahead() != 0, marks);
+        }
+    }
     // The window's verify (its own-write ring and the image check) only with a verify on.
     Link::SetVerify(read_log_every > 0 || Link::RingVerify());
     ring_read_log.store(read_log_every > 0 && Link::Ahead() != 0, std::memory_order_relaxed);

@@ -1492,6 +1492,55 @@ maximum). The target test is BufferCache::ProbeSyncTarget under the cache's lock
 nothing (no usage mark in dry). P3's mirror is kept as P3 would keep it: an entry it would pass
 does not count as hard, and the run such an entry starts does not count as a run.
 
+### FRITCHII_MEMSTAGE_MARKS_AHEAD
+
+FRITCHII_MEMSTAGE_MARKS_AHEAD (live, read at a frame end with FRITCHII_MEMSTAGE_AHEAD, default 0;
+fable_stage_compute.md part 1 with its section 10): with FRITCHII_MEMSTAGE_THREAD=2 and the window
+open (AHEAD > 0), a draw whose fill writes buffers (written storage buffers, transform feedback)
+no longer makes GPUMem come level first (the window line's "writing draw" reason goes to 0, about
+310 waits a second at the market). 0, AHEAD 0 and THREAD 0/1: as before.
+
+- How: every set the buffer cache had keeps meaning "as of the back" (gpu_modified_ranges, the
+  uncommitted and committed fence downloads, the taken downloads, the read downloads, the read
+  traps). A write mark GPUMem's own fill makes runs at once only what its later fills need (the
+  dispatch write record, the buffer's write tick, the tracker's GPU-modified bit, the vertex
+  buffers' stale flags, the page bits that never clear) and puts the rest on a list in the
+  buffer cache, keyed by the push index of the ring B packet the fill makes (ring B's packet
+  order: the back's issue order, deferred draws included). The packet's header carries a flag;
+  right after the back played such a packet it takes the cache's lock and the rest runs, with
+  today's code, in packet order ("promotion"). Every reader of the real sets promotes first.
+  GPUMem's own work asks both the real sets and the list (upload skips, the index fast path, the
+  bank page copies, join tests, the trackers' record, the level tests).
+- The back never blocks inside the lock for a promotion: while GPUMem holds it (its fill) the
+  back retries, serving GPUMem's requests, and GPUMem promotes for it when it waits for the back
+  meanwhile (a sync's or a join's catch-up), instead of giving up.
+- Still level, the test on both sets: claims (collected constant buffer ranges over GPU-written
+  data; the list on the ranges' pages), joins over GPU-written data, constant buffer words onto
+  GPU-written data. After a claim's wait, a mark of a draw the back still holds deferred on those
+  pages refuses the fill (the entry is a run). The list's bound, 4,096 marks, waits as a writing
+  draw did.
+- The fence commit (FenceManager::CommitCacheFlushes, SignalOrdering) promotes first and runs on
+  the back under the lock, also while served (the link's user checks accept it there).
+- Exact: a mark enters the real sets after the back recorded its draw and before anything else
+  can read or change them (all promote first, under the same lock): against every other event
+  (a landing, a game thread's read, a later fence) it falls where THREAD 0 puts it, give or take
+  that one packet's play, and nothing after the draw is signalled to the game in that time. The
+  tracker's bit is set again at the promotion (a served write at the back's position may have
+  dropped it since the fill, and THREAD 0 has it set after such a write); a landing keeps the bit
+  on pages with a mark on the list. A fill whose packet never went into ring B, or a packet the
+  back drops unplayed, takes its marks back: the back fills that draw itself.
+- "Memory stage marks ahead" every 10 s while on: marks put on the list, promoted by the back at
+  the play and by others, taken back; the list's length (average, maximum); the back's waits for
+  the lock at a promotion (count, ms); level waits for claims (and refused after the wait) and at
+  the bound; the must-be-0 totals: a level function on GPUMem's own work over a page with a mark
+  on the list, a promotion out of order, the list not empty at a ring's start or end, a mark due
+  at a run's first entry, a due mark a reader could not promote, a mark in a call GPUMem serves
+  for the back, a mark on GPUMem's own work outside a draw fill, a pushed packet that is not the
+  fill's. Each is logged as "Memory stage marks ahead (must be 0)" (the first 16).
+- Gate: memstage_gate.py with the read log at market and fight; the fight with kills (the
+  read-back counters and the hitch log must not move); the flash watch route; an area load.
+  Compare 0 and 1 with profile_toggle.py in one session.
+
 ### FRITCHII_MEMSTAGE_FULL_BINDS
 
 FRITCHII_MEMSTAGE_FULL_BINDS (live, read at a frame end, default 0; spec 4.2): every draw binds

@@ -196,6 +196,9 @@ public:
         /// runs [begin, bytes) would be pure lookups (BufferCache::ProbeSyncTarget, under the
         /// lock); the first failure, a P3Outcome (Passed when all are pure). Changes nothing.
         u8 (*sync_probe)(void* context, const std::pair<u64, u64>* runs, size_t count){};
+        /// GPUMem, in a catch-up while the back waits to promote the marks a packet's fill made
+        /// ahead (FRITCHII_MEMSTAGE_MARKS_AHEAD): promotes them for it (GPUMem may hold the lock).
+        void (*promote_marks)(void* context){};
     };
     /// pass_gather's answer.
     enum class PassTake : u8 { Empty, Applied, GpuWritten, Recorded };
@@ -313,10 +316,36 @@ public:
     }
     /// At a buffer cache entry point: the back in the cache while not lent (must be 0).
     static void CheckBackCache(const char* where) noexcept {
-        if (t_back_served && !t_back_serving) [[unlikely]] {
+        if (t_back_served && !t_back_serving && !t_back_cache) [[unlikely]] {
             Note(Check::BackInCache, where);
         }
     }
+    /// GPUMem runs a call it serves for the back (it acts at the back's position).
+    [[nodiscard]] static bool ServingBack() noexcept {
+        return t_on_stage && t_serving_back;
+    }
+    /// FRITCHII_MEMSTAGE_MARKS_AHEAD: the back holds the buffer cache's lock for the fence
+    /// commit (FenceManager::CommitCacheFlushes, SignalOrdering), also while served: it is the
+    /// cache's user there (the user checks and CheckBackCache accept it).
+    class BackCacheScope {
+    public:
+        BackCacheScope() noexcept : was{t_back_cache} {
+            t_back_cache = true;
+        }
+        ~BackCacheScope() {
+            t_back_cache = was;
+        }
+        BackCacheScope(const BackCacheScope&) = delete;
+        BackCacheScope& operator=(const BackCacheScope&) = delete;
+
+    private:
+        bool was;
+    };
+    /// FRITCHII_MEMSTAGE_MARKS_AHEAD, the back after a packet whose fill marked writes ahead:
+    /// calls `promote` (a try of the cache's lock; true when nothing is due any more) until it
+    /// succeeds, serving GPUMem's requests meanwhile. It never blocks inside the lock: GPUMem may
+    /// hold it in a fill and wait for the back (StageCatchUp promotes for it then).
+    void BackPromoteMarks(bool (*promote)(void* argument), void* argument);
     /// The back, served: runs `function` on GPUMem, which holds the cache.
     void ServeOnStage(Served cause, Function function, void* argument);
     template <typename F>
@@ -834,6 +863,8 @@ private:
     static inline thread_local bool t_back_serving{};
     static inline thread_local bool t_back_run{};
     static inline thread_local bool t_back_served{};
+    /// The back holds the cache's lock for a fence commit (BackCacheScope).
+    static inline thread_local bool t_back_cache{};
 
     Core::System* system{};
     u32 mode{};
@@ -943,6 +974,8 @@ private:
     std::atomic<std::thread::id> stage_thread{};
     /// Bumped while the back waits for a lock GPUMem holds (StageSyncCatchUp gives up then).
     std::atomic<u64> back_contended{0};
+    /// The back waits to promote marks made ahead (BackPromoteMarks; a catch-up promotes then).
+    std::atomic<bool> back_promote_wait{false};
     static bool BackContendedHook(std::thread::id holder, bool first);
     /// The back's thread id (GPUMem serves the back's call while it waits for a lock it holds).
     std::atomic<std::thread::id> back_thread{};

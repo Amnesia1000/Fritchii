@@ -1253,7 +1253,14 @@ void RasterizerVulkan::SetRingBackend() {
         }
     };
     backend.drop_packets = [](void* context, u64 position) {
-        return static_cast<RasterizerVulkan*>(context)->mem_stage.DropRingPackets(position);
+        auto* const self = static_cast<RasterizerVulkan*>(context);
+        const u64 dropped = self->mem_stage.DropRingPackets(position);
+        if (position != ~u64{0}) {
+            // FRITCHII_MEMSTAGE_MARKS_AHEAD: a run's first entry, nothing due (the ring's end is
+            // checked at reset_stage).
+            self->buffer_cache.CheckAheadAt(BufferCache::AheadPoint::RunStart);
+        }
+        return dropped;
     };
     backend.back_channel = [](void* context) {
         return static_cast<s32>(static_cast<RasterizerVulkan*>(context)->current_channel_id);
@@ -1266,7 +1273,17 @@ void RasterizerVulkan::SetRingBackend() {
     };
     Link::Get().SetCacheLock(&buffer_cache.mutex);
     backend.reset_stage = [](void* context, bool end) {
-        static_cast<RasterizerVulkan*>(context)->mem_stage.ResetStageSide(end);
+        auto* const self = static_cast<RasterizerVulkan*>(context);
+        self->mem_stage.ResetStageSide(end);
+        // FRITCHII_MEMSTAGE_MARKS_AHEAD: no mark ahead at a ring's start or end (both threads
+        // parked, every packet played).
+        self->buffer_cache.CheckAheadAt(end ? BufferCache::AheadPoint::RingEnd
+                                            : BufferCache::AheadPoint::RingStart);
+    };
+    backend.promote_marks = [](void* context) {
+        auto& cache = static_cast<RasterizerVulkan*>(context)->buffer_cache;
+        std::scoped_lock lock{cache.mutex};
+        cache.PromoteAhead();
     };
     backend.ranges_gpu_written = [](void* context, const std::pair<u64, std::size_t>* ranges,
                                     size_t count) {
@@ -1376,11 +1393,46 @@ bool RasterizerVulkan::StageFillDraw(VideoCommon::MemStageShadowEngine& copy, bo
         // GPU-written marks. Two fills would: a draw that writes buffers (its marks), and the
         // collected constant buffer ranges claiming GPU-written data (their claims). Those fill
         // level: GPUMem first waits for the back to reach this entry (StageLevel).
+        //
+        // FRITCHII_MEMSTAGE_MARKS_AHEAD: a writing fill's marks wait on the cache's list until the
+        // back has played its packet (buffer_cache.h, "Marks ahead of the back"), so the writing
+        // draw fills ahead. The claims stay level, tested on both sets (the list on the ranges'
+        // pages); after the wait the back has played every packet before this entry, except a
+        // draw it still holds deferred: marks of one on these pages refuse the fill (the entry is
+        // a run: the back issues that draw, then fills this one itself, in its order). The list's
+        // bound (4,096 marks) waits as a writing draw did.
+        const bool marks_ahead = buffer_cache.MarksAhead();
         bool going = true;
-        if (StageDrawWritesBuffers(copy)) {
+        if (!marks_ahead && StageDrawWritesBuffers(copy)) {
             going = link.StageLevel(position, Link::LevelReason::WritingDraw);
-        } else if (StageRangesOverGpuWritten(ranges)) {
+        } else if (StageRangesOverGpuWritten(ranges, true)) {
             going = link.StageLevel(position, Link::LevelReason::Claim);
+            if (marks_ahead && going) {
+                buffer_cache.NoteAheadLevel(BufferCache::AheadLevel::Claim);
+                const bool still = [&] {
+                    const Link::CleanPoint clean_point;
+                    std::scoped_lock lock{buffer_cache.mutex};
+                    buffer_cache.PromoteAhead();
+                    return std::ranges::any_of(ranges, [&](const auto& range) {
+                        return buffer_cache.AheadIntersectsPages(range.first, range.second);
+                    });
+                }();
+                if (still) [[unlikely]] {
+                    buffer_cache.NoteAheadLevel(BufferCache::AheadLevel::ClaimRefused);
+                    return false;
+                }
+            }
+        } else if (marks_ahead && StageDrawWritesBuffers(copy)) {
+            bool full;
+            {
+                const Link::CleanPoint clean_point;
+                std::scoped_lock lock{buffer_cache.mutex};
+                full = buffer_cache.AheadFull();
+            }
+            if (full) [[unlikely]] {
+                buffer_cache.NoteAheadLevel(BufferCache::AheadLevel::Bound);
+                going = link.StageLevel(position, Link::LevelReason::WritingDraw);
+            }
         }
         if (!going) {
             return false; // GPUMem is stopping: the draw is left to the back
@@ -1390,6 +1442,17 @@ bool RasterizerVulkan::StageFillDraw(VideoCommon::MemStageShadowEngine& copy, bo
     std::optional<Link::CleanPoint> clean{std::in_place};
     std::scoped_lock lock{buffer_cache.mutex};
     clean.reset();
+    // FRITCHII_MEMSTAGE_MARKS_AHEAD: the fill's marks are keyed with the push index of the
+    // packet it makes; a fill whose packet never goes takes them back (under the lock).
+    const bool marks_fill = buffer_cache.MarksAhead();
+    if (marks_fill) {
+        buffer_cache.BeginAheadFill(mem_stage.NextRingPacketIndex());
+    }
+    SCOPE_EXIT {
+        if (marks_fill) {
+            buffer_cache.EndAheadFill();
+        }
+    };
     // A list draw (FRITCHII_MEMSTAGE_LIST_DRAWS; the copy's draw manager is inside DrawEnd's
     // list branch, MemStageShadowEngine::StageDraw sent it): the fill binds its two words as the
     // back's own fill does with SetDrawIndirect, from the copy's indirect parameters.
@@ -1533,14 +1596,31 @@ bool RasterizerVulkan::StageDrawWritesBuffers(const VideoCommon::MemStageShadowE
 }
 
 bool RasterizerVulkan::StageRangesOverGpuWritten(
-    std::span<const std::pair<DAddr, std::size_t>> ranges) {
+    std::span<const std::pair<DAddr, std::size_t>> ranges, bool claim) {
     // The page bits first (they never clear, so a clear one proves nothing GPU-written is there),
     // then the cache's own answer under its lock.
+    // FRITCHII_MEMSTAGE_MARKS_AHEAD: the marks GPUMem made ahead of the back count too (their
+    // page bits are set at the fill). A claim looks at their pages: WriteMemory acts on the
+    // written pages, and must not run over a mark ahead (the must-be-0 "claim").
+    // The real set keeps today's byte test (WriteMemory's page work on it is today's).
+    const bool ahead = buffer_cache.MarksAhead();
+    const auto pages = [](DAddr addr, std::size_t size) {
+        const DAddr begin = Common::AlignDown(addr, Core::DEVICE_PAGESIZE);
+        return std::pair<DAddr, u64>{begin,
+                                     Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE) - begin};
+    };
     bool maybe = false;
     for (const auto& [addr, size] : ranges) {
         if (MayBeGpuModified(addr, size)) {
             maybe = true;
             break;
+        }
+        if (ahead && claim && size != 0) {
+            const auto [begin, length] = pages(addr, size);
+            if (MayBeGpuModified(begin, length)) {
+                maybe = true;
+                break;
+            }
         }
     }
     if (!maybe) {
@@ -1551,6 +1631,14 @@ bool RasterizerVulkan::StageRangesOverGpuWritten(
     for (const auto& [addr, size] : ranges) {
         if (buffer_cache.IsRegionGpuModified(addr, size)) {
             return true;
+        }
+    }
+    if (ahead) {
+        for (const auto& [addr, size] : ranges) {
+            if (claim ? buffer_cache.AheadIntersectsPages(addr, size)
+                      : buffer_cache.AheadIntersects(addr, size)) {
+                return true;
+            }
         }
     }
     return false;
@@ -1624,7 +1712,9 @@ void RasterizerVulkan::ProbeGatherRanges(std::span<const std::pair<DAddr, u64>> 
             continue;
         }
         std::scoped_lock lock{buffer_cache.mutex};
-        if (buffer_cache.IsRegionGpuModified(begin, end - begin)) {
+        // FRITCHII_MEMSTAGE_MARKS_AHEAD: both sets (a deferred draw's marks can be ahead here).
+        if (buffer_cache.IsRegionGpuModified(begin, end - begin) ||
+            buffer_cache.AheadIntersects(begin, end - begin)) {
             probe.gpu_written = true;
             return;
         }

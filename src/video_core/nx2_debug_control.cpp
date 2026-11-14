@@ -352,6 +352,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_MEMSTAGE_PASS") {
         return &g_memstage_pass;
     }
+    if (name == "FRITCHII_MEMSTAGE_MARKS_AHEAD") {
+        return &g_memstage_marks_ahead;
+    }
     if (name == "FRITCHII_DELAY_MACRO_DRAIN_US") {
         return &g_delay_macro_drain_us;
     }

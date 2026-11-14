@@ -768,7 +768,7 @@ bool MemoryStageLink::IsCacheUserSlow() noexcept {
     if (!GpuSplit::OnBackThread()) {
         return false;
     }
-    if (t_back_serving) {
+    if (t_back_serving || t_back_cache) {
         return true;
     }
     if (g_ring_active.load(std::memory_order_relaxed)) {
@@ -847,6 +847,31 @@ bool MemoryStageLink::BackContendedHook(std::thread::id holder, bool first) {
         link.BackServeRequests();
     }
     return true;
+}
+
+void MemoryStageLink::BackPromoteMarks(bool (*promote)(void* argument), void* argument) {
+    // FRITCHII_MEMSTAGE_MARKS_AHEAD (buffer_cache.h, "Marks ahead of the back"): the back has
+    // played a packet whose fill marked writes, and their marks go into the cache's real sets
+    // before it goes on. The lock's holder may be GPUMem in a fill, which can wait for the back
+    // (a sync: served here; a sync's or a join's catch-up: it promotes for the back, which the
+    // flag asks for), so the back only tries the lock and never sleeps inside it.
+    back_promote_wait.store(true, std::memory_order_seq_cst);
+    if (stage_sleeping.load(std::memory_order_seq_cst)) {
+        WakeStage();
+    }
+    for (u32 spin = 0; !promote(argument);) {
+        if (!t_back_serving && BackRequestPending()) {
+            BackServeRequests();
+            continue;
+        }
+        if (spin < LinkSpinPauses) {
+            ++spin;
+            LinkPause();
+        } else {
+            std::this_thread::yield();
+        }
+    }
+    back_promote_wait.store(false, std::memory_order_seq_cst);
 }
 
 bool MemoryStageLink::StageContendedHook(std::thread::id holder, bool first) {
@@ -1822,11 +1847,21 @@ bool MemoryStageLink::StageCatchUp(const char* what) {
                (ring_stop != nullptr && ring_stop->stop_requested()) ||
                !GpuSplit::Get().BackRunning();
     };
+    // FRITCHII_MEMSTAGE_MARKS_AHEAD: the back waits on purpose for the lock GPUMem may hold, to
+    // promote a played packet's marks (BackPromoteMarks; it only tries the lock, so it is not
+    // "contended"). Not a reason to give up: GPUMem promotes for it and waits on.
+    const auto promote_wanted = [&] {
+        return ring_backend.promote_marks != nullptr &&
+               back_promote_wait.load(std::memory_order_seq_cst);
+    };
     {
         const StageWaitScope site{"the back's catch-up (a sync or a join in GPUMem's fill)"};
         for (u32 spin = 0;;) {
             if (done()) {
                 break;
+            }
+            if (promote_wanted()) {
+                ring_backend.promote_marks(ring_backend.context);
             }
             if (stuck()) {
                 caught_up = false;
@@ -1846,7 +1881,7 @@ bool MemoryStageLink::StageCatchUp(const char* what) {
             }
             stage_sleeping.store(true, std::memory_order_seq_cst);
             const u32 word = stage_word.load(std::memory_order_seq_cst);
-            if (!done() && !stuck()) {
+            if (!done() && !stuck() && !promote_wanted()) {
                 stage_word.wait(word, std::memory_order_seq_cst);
                 LinkBump(counters.stage_sleeps);
             }
