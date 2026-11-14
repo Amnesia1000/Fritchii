@@ -3903,6 +3903,7 @@ void RasterizerVulkan::Clear(u32 layer_count) {
             RasterizerVulkan* self;
             u32 layer_count;
         } const op{this, layer_count};
+        VideoCommon::OneFollower::SetLendSite("Clear (posted)");
         VideoCommon::OneFollower::PushOp(
             VideoCommon::OneFollower::LentOp::Clear,
             [](void* raw) {
@@ -4568,6 +4569,7 @@ void RasterizerVulkan::ResetCounter(VideoCommon::QueryType type) {
                 RasterizerVulkan* self;
                 VideoCommon::QueryType type;
             } const op{this, type};
+            OneF::SetLendSite("ResetCounter (posted)");
             OneF::PushOp(
                 OneF::LentOp::Query,
                 [](void* raw) {
@@ -4644,6 +4646,7 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                     u32 payload;
                     u32 subreport;
                 } const op{this, gpu_addr, device, type, flags, payload, subreport};
+                OneF::SetLendSite("Query (posted)");
                 OneF::PushOp(
                     OneF::LentOp::Query,
                     [](void* raw) {
@@ -6222,6 +6225,7 @@ void RasterizerVulkan::FragmentBarrier() {
         VideoCommon::OneFollower::Step() >= VideoCommon::OneFollower::StepLevel::Build)
         [[unlikely]] {
         RasterizerVulkan* const self = this;
+        VideoCommon::OneFollower::SetLendSite("FragmentBarrier (posted)");
         VideoCommon::OneFollower::PushOp(
             VideoCommon::OneFollower::LentOp::Other,
             [](void* raw) {
@@ -6254,6 +6258,7 @@ void RasterizerVulkan::FlushCommands() {
         VideoCommon::OneFollower::Step() >= VideoCommon::OneFollower::StepLevel::Build)
         [[unlikely]] {
         RasterizerVulkan* const self = this;
+        VideoCommon::OneFollower::SetLendSite("FlushCommands (posted)");
         VideoCommon::OneFollower::PushOp(
             VideoCommon::OneFollower::LentOp::FrameEnd,
             [](void* raw) {

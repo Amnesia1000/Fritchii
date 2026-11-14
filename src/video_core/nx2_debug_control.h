@@ -258,6 +258,9 @@ inline std::atomic<int> g_onef_gather_e{-1};
 inline std::atomic<int> g_onef_op_inline{-1};
 /// FRITCHII_ONEF_OP_CLEAR (live, default 0): fable_b 13.4 group 3, clears as render ops.
 inline std::atomic<int> g_onef_op_clear{-1};
+/// FRITCHII_ONEF_TRACE (boot, default 0): fable_b 15.5's lend trace (one record per lend and
+/// per posted op) to the log folder.
+inline std::atomic<int> g_onef_trace{-1};
 /// EDEN_NX2_LIGHT_TABLE_ARRAYS: docs/fritchii/switches.md.
 [[nodiscard]] inline bool LightTableArrays() {
     static const bool on = EnvSwitch("EDEN_NX2_LIGHT_TABLE_ARRAYS") > 0;
