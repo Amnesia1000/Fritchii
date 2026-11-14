@@ -179,10 +179,18 @@ registers and looking the facts up at every served draw.
 - 2: verify. Every setup 1 would keep does the full lookup anyway, uses its answer and compares
   it with the kept facts (every field; the programs' infos by pointer). A difference or a miss is
   "a kept draw setup whose full lookup gave other facts or none" on the link line's must-be-0
-  list (logged with "other facts" or "the lookup missed").
+  list (logged with "other facts" or "the lookup missed"), unless the table's generation moved
+  between the keep's check and the end of the lookup: the back published another pipeline of
+  the same programs in those few ns (a new infos pointer, maybe another dynamic vertex input), so
+  the lookup answers for a later table than the check, and today's lookup made at the check
+  would have answered as the keep. Those are "raced", not compared (the first gate's 21-32
+  disagreements a window fit this: about 100 ns between the check's generation read and the
+  lookup's, a few hundred table writes a second; the field line below confirms it).
+  "Memory stage draw setup verify" (HW_GPU, Warning, the first 16 raced and the first 16 not
+  raced that differed) names the fields that differed and both generations.
 - "Memory stage draw setup (FRITCHII_MEMSTAGE_SETUP_KEEP=n)" (HW_GPU, Info, every 1,048,576
   setups at 1 or 2, about 10 s at the market): setups, facts kept (1), verified (2), disagreed
-  (must be 0).
+  (must be 0), raced with a table write (not compared) and how many of those differed.
 - Test: one window at 2 (disagreed 0, verified close to the kept count 1 gives), then a 0/1
   toggle with the stage on. The GPU profile at 2 shows the setup's own split ("setup program").
 
