@@ -1270,6 +1270,14 @@ entry when it gets there. 0, AHEAD 0 and THREAD 0/1: as before.
   takes the release in (one run instead of two level waits).
 - Compare 0 and 1 with profile_toggle.py in one session (5c's run starters lose "cache call"
   at the release's address).
+- Since fable_stage_p3 section 3 all three puller releases are one closure with a fixed layout
+  (puller.cpp's ReleaseCall: the rasterizer, the GPU address, the payload and the
+  QueryPropertiesFlags, the channel's memory manager; memstage_shadow.h's StageReleaseWord) and
+  carry StageCacheCall::SemaphoreRelease: WriteLong as before, and ProcessSemaphoreRelease and
+  SemaphoreExecute's release (both fence-flagged), which were untagged closures before: each one
+  made GPUMem's copies stale (a full copy at the next 3D entry; very likely the "call +0xc99160"
+  behind most of the full copies). They are cache calls now (hard, no copy after) and candidates
+  for this switch's request path too.
 
 ### FRITCHII_MEMSTAGE_PASS
 

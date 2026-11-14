@@ -74,10 +74,13 @@ enum class StageDrawLoop : u8 {
 }
 
 /// StageTag::Cache's kind, in header bits 40-47 (FRITCHII_MEMSTAGE_RELEASE): which cache call it
-/// is, when the stage treats one apart. The payload stays the closure's own (no layout promised).
+/// is, when the stage treats one apart. Other's payload stays the closure's own (no layout
+/// promised); SemaphoreRelease's is StageReleaseWord's.
 enum class StageCacheCall : u8 {
     Other = 0,            ///< any other cache call
-    SemaphoreRelease = 1, ///< the puller's semaphore release (WriteLong: QueryCache::CounterReport)
+    /// The puller's semaphore releases (WriteLong, SemaphoreRelease, SemaphoreExecute's release:
+    /// QueryCache::CounterReport with the payload).
+    SemaphoreRelease = 1,
 };
 
 /// StageTag::Cache with its kind, for a Call entry's header.
@@ -88,6 +91,15 @@ enum class StageCacheCall : u8 {
 [[nodiscard]] constexpr StageCacheCall StageCacheCallOf(u64 header) noexcept {
     return static_cast<StageCacheCall>((header >> 40) & 0xff);
 }
+
+/// StageCacheCall::SemaphoreRelease's payload (fable_stage_p3 3), a fixed layout: puller.cpp's
+/// ReleaseCall, which static_asserts these words. Four words.
+enum class StageReleaseWord : u8 {
+    Rasterizer = 0,        ///< VideoCore::RasterizerInterface*
+    Address = 1,           ///< the semaphore's GPU address
+    PayloadProperties = 2, ///< the payload (low half), the QueryPropertiesFlags (high half)
+    Memory = 3,            ///< the channel's Tegra::MemoryManager*
+};
 
 /// Memory stage piece 5b (spec 6.2), FRITCHII_MEMSTAGE_SHADOW=1: the stage's classify, register
 /// copy, draw manager copy and handlers run on the back thread on each ring entry just before the

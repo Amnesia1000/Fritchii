@@ -7,9 +7,11 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdlib>
 #include <mutex>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -91,6 +93,45 @@ void OnBack(const Func& func, u64 flags = 0) {
 
 void DrainBack() {
     VideoCommon::GpuSplit::Get().Drain(VideoCommon::DrainSite::Acquire);
+}
+
+/// The puller's semaphore release on the back (fable_stage_p3 3): a fixed layout, which the
+/// memory stage reads (StageTag::Cache, StageCacheCall::SemaphoreRelease, memstage_shadow.h's
+/// StageReleaseWord). One struct for the three releases: WriteLong, SemaphoreRelease and
+/// SemaphoreExecute's release.
+struct ReleaseCall {
+    VideoCore::RasterizerInterface* rasterizer; ///< word 0
+    GPUVAddr address;                           ///< word 1
+    u32 payload;                                ///< word 2, low half
+    u32 properties;                             ///< word 2, high half: QueryPropertiesFlags
+    Tegra::MemoryManager* memory;               ///< word 3: the channel's address space
+    void operator()() const {
+        rasterizer->Query(address, VideoCommon::QueryType::Payload,
+                          static_cast<VideoCommon::QueryPropertiesFlags>(properties), payload, 0);
+    }
+};
+static_assert(sizeof(ReleaseCall) == 32 && std::is_trivially_copyable_v<ReleaseCall>);
+static_assert(offsetof(ReleaseCall, address) ==
+                  8 * static_cast<size_t>(VideoCommon::StageReleaseWord::Address) &&
+              offsetof(ReleaseCall, payload) ==
+                  8 * static_cast<size_t>(VideoCommon::StageReleaseWord::PayloadProperties) &&
+              offsetof(ReleaseCall, properties) ==
+                  8 * static_cast<size_t>(VideoCommon::StageReleaseWord::PayloadProperties) + 4 &&
+              offsetof(ReleaseCall, memory) ==
+                  8 * static_cast<size_t>(VideoCommon::StageReleaseWord::Memory));
+
+/// A semaphore release, tagged for the memory stage, and the front's count of it (the passes
+/// line: releases by fence flag and mapped).
+void SendRelease(DmaPusher& dma_pusher, GPUVAddr address, u32 payload,
+                 VideoCommon::QueryPropertiesFlags properties) {
+    OnBack(ReleaseCall{dma_pusher.rasterizer, address, payload, static_cast<u32>(properties),
+                       &dma_pusher.memory_manager},
+           VideoCommon::StageCacheCallBits(VideoCommon::StageCacheCall::SemaphoreRelease));
+    if (VideoCommon::MemoryStageLink::RingActive()) {
+        VideoCommon::MemoryStageLink::Get().NoteFrontRelease(
+            properties == VideoCommon::QueryPropertiesFlags::IsAFence,
+            dma_pusher.memory_manager.GpuToCpuAddress(address).has_value());
+    }
 }
 
 // EDEN_NX2_RUNAHEAD (nx2_runahead.h): `acquire` of the u32 at `device` is answered met by the
@@ -2208,19 +2249,11 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         // Memory stage tag Cache: the query cache's report (a fence commits the buffer cache's
         // async flushes); no 3D register, draw state, binding or channel is written. Its kind
         // lets GPUMem have the back run it at its entry (FRITCHII_MEMSTAGE_RELEASE).
-        OnBack([rasterizer = dma_pusher.rasterizer, sequence_address, properties, payload] {
-            rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload, properties, payload, 0);
-        }, VideoCommon::StageCacheCallBits(VideoCommon::StageCacheCall::SemaphoreRelease));
+        SendRelease(dma_pusher, sequence_address, payload, properties);
         if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
-            const auto device = dma_pusher.memory_manager.GpuToCpuAddress(sequence_address);
-            if (device) {
+            if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(sequence_address)) {
                 split.NoteRelease(*device, sequence_address, payload,
                                   VideoCommon::GpuSplit::ReleaseKind::Puller);
-            }
-            // The memory stage's passes (fable_stage_levelpoints 5.2): releases by fence flag.
-            if (VideoCommon::MemoryStageLink::RingActive()) {
-                VideoCommon::MemoryStageLink::Get().NoteFrontRelease(
-                    properties == VideoCommon::QueryPropertiesFlags::IsAFence, device.has_value());
             }
         }
         RecordPullerRelease(dma_pusher, sequence_address, payload);
@@ -2449,10 +2482,9 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
 void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
     const GPUVAddr sequence_address{regs.semaphore_address.SemaphoreAddress()};
     const u32 payload = regs.semaphore_release;
-    OnBack([rasterizer = dma_pusher.rasterizer, sequence_address, payload] {
-        rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload,
-                          VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
-    });
+    // Tagged for the memory stage (fable_stage_p3 3): untagged, each one made GPUMem's copies
+    // stale (a full copy at the next 3D entry).
+    SendRelease(dma_pusher, sequence_address, payload, VideoCommon::QueryPropertiesFlags::IsAFence);
     RecordPullerRelease(dma_pusher, sequence_address, payload);
 }
 
@@ -2482,10 +2514,8 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
     const u32 payload = regs.reg_array[0x19];
     const u32 operation = argument & 7;
     if (operation == 1) { // RELEASE
-        OnBack([rasterizer = dma_pusher.rasterizer, address, payload] {
-            rasterizer->Query(address, VideoCommon::QueryType::Payload,
-                              VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
-        });
+        // Tagged for the memory stage (fable_stage_p3 3), as ProcessSemaphoreRelease.
+        SendRelease(dma_pusher, address, payload, VideoCommon::QueryPropertiesFlags::IsAFence);
         // An acquire it meets while queued needs no drain (ported).
         if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
             if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address)) {
