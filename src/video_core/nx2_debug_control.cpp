@@ -373,6 +373,12 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_ACQUIRE_TABLE_FIRST") {
         return &g_acquire_table_first;
     }
+    if (name == "FRITCHII_E2C_CENSUS") {
+        return &g_e2c_census;
+    }
+    if (name == "FRITCHII_ACQUIRE_MET_BY") {
+        return &g_acquire_met_by;
+    }
     return nullptr;
 }
 

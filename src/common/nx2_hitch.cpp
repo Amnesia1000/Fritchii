@@ -222,17 +222,9 @@ std::mutex g_stall_reporter_mutex;
 std::string (*g_stall_reporter)(const void*){};
 const void* g_stall_reporter_owner{};
 
+// The snapshot's times, all on one clock: the slots', the acquire's and the line's "now".
 u64 StallNow() {
-    return static_cast<u64>(Common::g_wall_clock.GetTimeNS().count());
-}
-
-// Only the slot's own thread writes it; a span within 0.5 ms of the recorded one does not replace
-// it, so a wait keeps its inner name ("macro dma read") over the zone around it ("split drain").
-void NoteLongest(StallSlot* slot, const char* zone, u64 ns) {
-    if (ns > slot->longest_ns.load(std::memory_order_relaxed) + 500'000) {
-        slot->longest_zone.store(zone, std::memory_order_relaxed);
-        slot->longest_ns.store(ns, std::memory_order_release);
-    }
+    return StallTickNs();
 }
 
 // EDEN_NX2_STALL_SNAPSHOT, read at every thread name (not cached: threads are named before
@@ -244,28 +236,6 @@ bool StallSwitch() {
 }
 
 } // Anonymous namespace
-
-StallMark StallEnterSlow(StallSlot* slot, const char* zone) {
-    const u64 now = StallNow();
-    StallMark mark{slot, slot->zone.load(std::memory_order_relaxed),
-                   slot->since.load(std::memory_order_relaxed), now};
-    if (mark.prev_zone == nullptr && mark.prev_since != 0) {
-        NoteLongest(slot, "(no span)", now - mark.prev_since);
-    }
-    slot->zone.store(zone, std::memory_order_relaxed);
-    slot->since.store(now, std::memory_order_relaxed);
-    return mark;
-}
-
-void StallLeaveSlow(const StallMark& mark) {
-    StallSlot* const slot = mark.slot;
-    const u64 now = StallNow();
-    NoteLongest(slot, slot->zone.load(std::memory_order_relaxed), now - mark.since);
-    // Back in the span around this one, with its own start; outside every span from now.
-    slot->zone.store(mark.prev_zone, std::memory_order_relaxed);
-    slot->since.store(mark.prev_zone != nullptr ? mark.prev_since : now,
-                      std::memory_order_relaxed);
-}
 
 void StallAcquired() {
     if (StallOn()) {
@@ -704,9 +674,8 @@ void RegisterThread(const char* name) {
             slot.since.store(StallNow(), std::memory_order_relaxed);
             t_stall_slot = &slot;
             if (!g_stall_on.exchange(true, std::memory_order_relaxed)) {
-                // The profiler's zones call out of line for the slots too (coarse zones only).
-                Nx2Timeline::g_zone_gate.fetch_or(Nx2Timeline::ZoneGateStall,
-                                                  std::memory_order_release);
+                // The profiler's zone gate stays closed: its wait zones test t_stall_slot inline
+                // (Nx2Profile::IsStallZone), every other zone costs what it costs with this off.
                 LOG_INFO(Render, "Stall snapshot on (the default; EDEN_NX2_STALL_SNAPSHOT=0 turns "
                                  "it off): a line after each Hitch line of 100 ms or more");
             }

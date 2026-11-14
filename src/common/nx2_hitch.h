@@ -6,8 +6,13 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <string>
 #include <vector>
+
+#if defined(__linux__)
+#include <time.h>
+#endif
 
 #include "common/common_types.h"
 
@@ -153,13 +158,37 @@ void OnPresent(long long gap_us);
 // fencing and present threads the span each is in now and for how long, and the longest span
 // each spent in the gap; the master semaphore's ticks; whether the present thread is between
 // vkAcquireNextImageKHR and vkQueuePresentKHR. Spans are the timeline's (Nx2Timeline::Span,
-// ArgSpan), the profiler's coarse zones and a few marks of its own (StallScope). Off, a span pays
-// one thread_local load (t_stall_slot stays null on every thread).
+// ArgSpan), the profiler's wait zones (Nx2Profile::IsStallZone: waits, sleeps, host calls, the
+// front's per-list push) and a few marks of its own (StallScope). Off, a span pays one
+// thread_local load (t_stall_slot stays null on every thread). On, a span reads no clock: its
+// times come from StallTickNs, a tick the OS keeps (2026-11-14: two fenced clock reads per
+// coarse zone cost the front 83 ms/s, fable_front_drains 8.4).
 enum class StallThread : u8 { GpuBack, GpuFront, VulkanWorker, Fencing, Present, GpuMem, Count };
+
+/// The snapshot's clock, in ns: a coarse tick the OS keeps in memory it maps into every process,
+/// so reading it is one plain load (no time stamp instruction, no fence). Windows: the kernel's
+/// interrupt time (KUSER_SHARED_DATA, advanced at every timer interrupt: every 0.5 ms with the
+/// timer resolution Fritchii asks for at boot, 15.6 ms at worst). Linux: CLOCK_MONOTONIC_COARSE
+/// (the vDSO's tick, 1 to 4 ms). Elsewhere steady_clock. A 100 ms stall needs no better.
+[[nodiscard]] inline u64 StallTickNs() {
+#if defined(_WIN32) &&                                                                             \
+    (defined(_M_X64) || defined(_M_ARM64) || defined(__x86_64__) || defined(__aarch64__))
+    // InterruptTime at offset 8 of KUSER_SHARED_DATA (0x7FFE0000), 100 ns units. On 64-bit
+    // Windows it is one aligned 64-bit word, read whole (wdm.h's KeQueryInterruptTime reads it
+    // the same way).
+    return *reinterpret_cast<const volatile u64*>(std::uintptr_t{0x7FFE0008}) * 100;
+#elif defined(__linux__)
+    timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
+    return static_cast<u64>(ts.tv_sec) * 1'000'000'000 + static_cast<u64>(ts.tv_nsec);
+#else
+    return NowNs();
+#endif
+}
 
 struct StallSlot {
     std::atomic<const char*> zone{}; ///< The innermost span now, nullptr outside every span
-    std::atomic<u64> since{};        ///< Wall clock ns it began (or the last span ended); 0 never
+    std::atomic<u64> since{};        ///< StallTickNs when it began (or the last span ended); 0 never
     std::atomic<const char*> longest_zone{}; ///< The longest span since the last present
     std::atomic<u64> longest_ns{};
 };
@@ -188,8 +217,38 @@ struct StallMark {
     u64 since;
 };
 
-StallMark StallEnterSlow(StallSlot* slot, const char* zone);
-void StallLeaveSlow(const StallMark& mark);
+/// A span ending (or a stretch outside every span) is the slot's longest only if it beats the
+/// recorded one by 2 ms, so a wait keeps its inner name ("macro dma read") over the zone around it
+/// ("split drain"): ticks are coarse, so the two can read up to two ticks apart (1 ms at 0.5 ms).
+/// Only the slot's own thread writes it.
+inline void StallNoteLongest(StallSlot* slot, const char* zone, u64 ns) {
+    if (ns > slot->longest_ns.load(std::memory_order_relaxed) + 2'000'000) {
+        slot->longest_zone.store(zone, std::memory_order_relaxed);
+        slot->longest_ns.store(ns, std::memory_order_release);
+    }
+}
+
+inline StallMark StallEnterSlow(StallSlot* slot, const char* zone) {
+    const u64 now = StallTickNs();
+    StallMark mark{slot, slot->zone.load(std::memory_order_relaxed),
+                   slot->since.load(std::memory_order_relaxed), now};
+    if (mark.prev_zone == nullptr && mark.prev_since != 0) {
+        StallNoteLongest(slot, "(no span)", now - mark.prev_since);
+    }
+    slot->zone.store(zone, std::memory_order_relaxed);
+    slot->since.store(now, std::memory_order_relaxed);
+    return mark;
+}
+
+inline void StallLeaveSlow(const StallMark& mark) {
+    StallSlot* const slot = mark.slot;
+    const u64 now = StallTickNs();
+    StallNoteLongest(slot, slot->zone.load(std::memory_order_relaxed), now - mark.since);
+    // Back in the span around this one, with its own start; outside every span from now.
+    slot->zone.store(mark.prev_zone, std::memory_order_relaxed);
+    slot->since.store(mark.prev_zone != nullptr ? mark.prev_since : now,
+                      std::memory_order_relaxed);
+}
 
 [[nodiscard]] inline StallMark StallEnter(const char* zone) {
     StallSlot* const slot = t_stall_slot;

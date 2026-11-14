@@ -15,6 +15,27 @@ thread sample which guest pages are resident every 10 s (HostMemory::SampleResid
 in the owner's playtest, so it only runs for a memory hunt; without it the line's resident and
 guest-unique figures read 0. EDEN_NX2_MEM_HEAPS=1 (the heap walk, ~250 ms) is separate.
 
+### EDEN_NX2_STALL_SNAPSHOT
+
+On by default since 2026-11-14; EDEN_NX2_STALL_SNAPSHOT=0 turns it off (read as each thread is
+named, so nx2_switches.txt applies). A present gap of 100 ms or more logs a "Stall snapshot:"
+line after its Hitch line: for the GPU back, front, Vulkan worker, fencing, present and GPUMem
+threads the span each is in now and for how long, the longest span each spent in the gap, the
+master semaphore's ticks, and whether the present thread is between acquire and present
+(common/nx2_hitch.h).
+- Cost (2026-11-14, fable_front_drains 8.4): it no longer opens the profiler's zone gate and reads
+  no clock. Spans take their times from a tick the OS keeps (Windows: the kernel's interrupt time,
+  0.5 ms steps with Fritchii's timer resolution, 15.6 ms at worst; Linux: the coarse monotonic
+  clock), so marking a span is a few loads and stores. Before, every coarse profiler zone called
+  out of line and read the wall clock twice (83 ms/s on the front at the market).
+- Only waits mark the slots: the timeline's spans (fence, worker, present and host GPU waits),
+  the profiler's wait zones (idle, pending sleep, split drain, writer wait, list waits, query DMA
+  wait, read flush, image create, pool destroy here) and the front's per-list "push". The
+  per-draw, per-dispatch, per-macro and per-fence zones no longer do: time in them reads as the
+  span around them ("push" on the front) or "(no span)" (busy outside every wait, the back's
+  draws and dispatches mostly). Times are good to about one tick.
+- With EDEN_NX2_GPU_PROFILE or a timeline recording the zones are timed exactly as before.
+
 ### EDEN_NX2_DMA_WAIT_WRITERS
 
 EXPERIMENT (not for nx2): EDEN_NX2_DMA_WAIT_WRITERS, read at startup and settable live by the
@@ -93,8 +114,15 @@ is critical by construction); these add work to one thread in the middle of its 
   y ms/s (front), FRITCHII_DELAY_DISPATCH_US=n ... (back), FRITCHII_DELAY_DRAW_US=n ... (back)".
 - Reading them: a spin on the thread that paces a pass costs about its ms/s in fps; one on a
   thread with slack there costs little.
+- Off (0), a call, draw or dispatch pays one relaxed load of its switch and a branch, inline at
+  the call site (GpuSplit::DelayWorkIf), no function call.
 
-### Front 0xe2c misses (always on, a counter)
+### FRITCHII_E2C_CENSUS (the "Front 0xe2c misses" line)
+
+FRITCHII_E2C_CENSUS (live, default 0 since 2026-11-14 = no work at all on the miss path; 1 = the
+line below). It cost the front about 20 ms/s at the market's 2,600 misses a second (the walk of
+the noted writes and the query cache look at each miss; fable_front_drains 8.4). A miss more than
+10 s after the previous counted one starts a new window, so turning it on live gives honest rates.
 
 "Front 0xe2c misses (noted write) 10 s" (HW_GPU, Info): the macro DMA reads of the 0xe2c
 occlusion macro (hash 0x3b26ab7eb3fc9863, its 0x158 read of six words; OoT macro slots, so only
@@ -201,7 +229,11 @@ makes a stamp newer). It then counts as the scan's miss (the page's checked coun
 - The stamps start over with each split session (positions start at 0).
 - 2 verifies these reads as the others.
 
-### Acquire resumes met by (always on, a counter)
+### FRITCHII_ACQUIRE_MET_BY (the "Acquire resumes met by" line)
+
+FRITCHII_ACQUIRE_MET_BY (live, default 0 since 2026-11-14 = one relaxed load per resume; 1 = the
+line below). On, each resume pays a page table lookup, the release tables, a scan of the noted
+writes and a clock read. A resume more than 5 s after the previous counted one starts a new window.
 
 "Acquire resumes met by" (HW_GPU, Info, every 5 s; fable_front_drains 2.3 items 2-3): for every
 suspended semaphore acquire that resumes (Puller::ResumeAcquire), the release that met it, as the

@@ -369,6 +369,33 @@ inline thread_local ThreadData t_data;
     }
 }
 
+/// The zones that mark EDEN_NX2_STALL_SNAPSHOT's span slot: the ones that can hold a thread up
+/// (waits, sleeps, host GPU waits, read flushes, host image creates and destroys) and the front's
+/// per-list push, so a busy front reads "push" rather than "(no span)". Per-draw, per-dispatch,
+/// per-macro and per-fence work zones (draw, compute, macro, fence, flush work...) do not: with
+/// the profile off they cost the inline gate check only, as with the snapshot off (fable_front_
+/// drains 8.4). Waits inside them have zones or timeline spans of their own (split drain, "wait
+/// for host GPU", "fence: wait for fence", "wait for Vulkan worker"). The split's wait for work
+/// ("split wait") is marked by its timeline span.
+[[nodiscard]] constexpr bool IsStallZone(Zone zone) {
+    switch (zone) {
+    case Zone::Idle:
+    case Zone::PendingSleep:
+    case Zone::Push:
+    case Zone::SplitDrain:
+    case Zone::WriterWait:
+    case Zone::ListSubmitWait:
+    case Zone::ListGpuWait:
+    case Zone::QueryDmaWait:
+    case Zone::ReadFlush:
+    case Zone::ImageCreate:
+    case Zone::PoolDestroyHere:
+        return true;
+    default:
+        return false;
+    }
+}
+
 #if defined(_MSC_VER)
 #define NX2_PROFILE_FORCEINLINE __forceinline
 #define NX2_PROFILE_NOINLINE __declspec(noinline)
@@ -380,12 +407,16 @@ inline thread_local ThreadData t_data;
 /// A zone. With the profiler off and no timeline recording (every normal run), entering one is
 /// one relaxed load of Common::Nx2Timeline::g_zone_gate and a not-taken branch, inlined at the
 /// call site; leaving it tests one byte of the object. The timing and the timeline span are in
-/// Begin and End, out of line.
+/// Begin and End, out of line. A stall zone (IsStallZone) also loads Nx2Hitch::t_stall_slot and,
+/// with the stall snapshot on, writes the slot without reading a clock.
 class Scope {
 public:
     NX2_PROFILE_FORCEINLINE explicit Scope(Zone zone_) {
         if (Common::Nx2Timeline::ZoneGateOpen()) [[unlikely]] {
             Begin(zone_, Enabled(), true);
+        } else if (IsStallZone(zone_)) {
+            // A constant at every call site: no code at all for the other zones.
+            BeginStall(zone_);
         }
     }
 
@@ -394,6 +425,8 @@ public:
     NX2_PROFILE_FORCEINLINE Scope(Zone zone_, bool on, bool timeline_on) {
         if (on || (timeline_on && Common::Nx2Timeline::ZoneGateOpen())) [[unlikely]] {
             Begin(zone_, on, timeline_on);
+        } else if (timeline_on && IsStallZone(zone_)) {
+            BeginStall(zone_);
         }
     }
 
@@ -411,13 +444,24 @@ private:
     static constexpr u8 StateTimeline = 2;
     static constexpr u8 StateStall = 4;
 
+    /// EDEN_NX2_STALL_SNAPSHOT with the gate closed (profile off, no recording): a wait zone marks
+    /// the thread's span slot, if it has one. No clock read (Nx2Hitch::StallTickNs).
+    NX2_PROFILE_FORCEINLINE void BeginStall(Zone zone_) {
+        Common::Nx2Hitch::StallSlot* const slot = Common::Nx2Hitch::t_stall_slot;
+        if (slot != nullptr) {
+            stall_mark = Common::Nx2Hitch::StallEnterSlow(
+                slot, zone_names[static_cast<size_t>(zone_)]);
+            state = StateStall;
+        }
+    }
+
     NX2_PROFILE_NOINLINE void Begin(Zone zone_, bool on, bool timeline_on) {
         zone = zone_;
         const bool timeline = timeline_on && Common::Nx2Timeline::Active() &&
                               (Common::Nx2Timeline::Detail() || IsCoarse(zone_));
         state = static_cast<u8>((on ? StateTimed : 0) | (timeline ? StateTimeline : 0));
-        // EDEN_NX2_STALL_SNAPSHOT: the coarse zones also mark the thread's span slot.
-        if (Common::Nx2Hitch::t_stall_slot != nullptr && IsCoarse(zone_)) [[unlikely]] {
+        // EDEN_NX2_STALL_SNAPSHOT: the wait zones also mark the thread's span slot.
+        if (Common::Nx2Hitch::t_stall_slot != nullptr && IsStallZone(zone_)) [[unlikely]] {
             stall_mark = Common::Nx2Hitch::StallEnter(zone_names[static_cast<size_t>(zone_)]);
             state = static_cast<u8>(state | StateStall);
         }
