@@ -226,6 +226,11 @@ struct BackGatherFlags {
 u64 StageReturn(const void* drew_engine, const void* state_engine, s32 back_channel);
 void StageTick();
 [[nodiscard]] std::vector<std::pair<u64, std::size_t>>& StageRanges();
+/// GPUMem, before it publishes past the entries it followed (PublishStaged) and when the ring
+/// ends: FRITCHII_MEMSTAGE_CB_RUNS' run of constant buffer words ends, its bytes written and its
+/// range collected, so the back (and the front's waits for it) never pass a word whose bytes are
+/// not in game memory.
+void StageEndWords();
 /// Sets the stage's draw count to `back_seq`; returns what it was.
 u64 StageDrawSeq(u64 back_seq);
 /// GPUMem, right after StageProcess returned a hard entry: its first hard kind (the key of the

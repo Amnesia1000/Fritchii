@@ -426,6 +426,22 @@ public:
         return g_fast_loop.load(std::memory_order_relaxed) &&
                g_ahead.load(std::memory_order_relaxed) != 0;
     }
+    /// The back, at a frame end: FRITCHII_MEMSTAGE_ENTRY_FAST (live, default off).
+    void SetEntryFast(bool on);
+    /// GPUMem's short path for 3D Method and CbWords entries (memstage_shadow.cpp, EntryFast):
+    /// the switch on and the window open (AHEAD 0 keeps Process's path).
+    [[nodiscard]] static bool EntryFast() noexcept {
+        return g_entry_fast.load(std::memory_order_relaxed) &&
+               g_ahead.load(std::memory_order_relaxed) != 0;
+    }
+    /// The back, at a frame end: FRITCHII_MEMSTAGE_CB_RUNS (live, default off).
+    void SetCbRuns(bool on);
+    /// GPUMem writes runs of constant buffer words as one (memstage_shadow.cpp, CbWords): the
+    /// switch on and the window open (AHEAD 0 keeps a write per call).
+    [[nodiscard]] static bool CbRuns() noexcept {
+        return g_cb_runs.load(std::memory_order_relaxed) &&
+               g_ahead.load(std::memory_order_relaxed) != 0;
+    }
     /// GPUMem: a list draw of its copy, served or level (and why).
     void NoteListDraw(ListDraw what) noexcept {
         auto& counter = counters.list_draws[static_cast<size_t>(what)];
@@ -891,6 +907,8 @@ private:
     static inline std::atomic<bool> g_verify{false};
     static inline std::atomic<bool> g_list_draws{false};
     static inline std::atomic<bool> g_fast_loop{false};
+    static inline std::atomic<bool> g_entry_fast{false};
+    static inline std::atomic<bool> g_cb_runs{false};
     static inline std::atomic<bool> g_gather{false};
     static inline std::atomic<bool> g_release{false};
     /// FRITCHII_MEMSTAGE_PASS's bits as GPUMem uses them (0 after a must-be-0 of the passes).
@@ -1292,6 +1310,10 @@ private:
     int list_draws_logged{-1};
     /// FRITCHII_MEMSTAGE_FAST_LOOP's last value logged (-1: none yet).
     int fast_loop_logged{-1};
+    /// FRITCHII_MEMSTAGE_ENTRY_FAST's last value logged (-1: none yet).
+    int entry_fast_logged{-1};
+    /// FRITCHII_MEMSTAGE_CB_RUNS's last value logged (-1: none yet).
+    int cb_runs_logged{-1};
     u64 last_log_ns{};
     u64 back_run_seen_ns{};
 

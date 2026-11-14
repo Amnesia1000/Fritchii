@@ -1276,6 +1276,12 @@ bool MemoryStageLink::RingVerify() noexcept {
 // THREAD = 2: the stage's loop
 
 void MemoryStageLink::PublishStaged(u64 position) {
+    if (position != staged_local) {
+        // FRITCHII_MEMSTAGE_CB_RUNS: the words followed so far are in game memory before the back
+        // may run past them (the front's waits for writers read the back's position), written
+        // while GPUMem is still busy, as at their entries.
+        MemStageShadow::StageEndWords();
+    }
     stage_busy.store(false, std::memory_order_seq_cst);
     if (position == staged_local) {
         return;
@@ -1490,6 +1496,33 @@ void MemoryStageLink::SetFastLoop(bool on) {
                  on ? "GPUMem applies a Pairs block's writes in one loop and reads the input's end "
                       "once per stretch, while the window is open (FRITCHII_MEMSTAGE_AHEAD > 0)"
                     : "GPUMem's entry loop as before");
+    }
+}
+
+void MemoryStageLink::SetEntryFast(bool on) {
+    // At a frame end, as SetFastLoop: GPUMem reads it at its next entry (EntryFast).
+    g_entry_fast.store(on, std::memory_order_relaxed);
+    if (mode == 2 && entry_fast_logged != (on ? 1 : 0)) {
+        entry_fast_logged = on ? 1 : 0;
+        LOG_INFO(HW_GPU, "Memory stage entry path (FRITCHII_MEMSTAGE_ENTRY_FAST={}): {}",
+                 on ? 1 : 0,
+                 on ? "GPUMem takes 3D Method and CbWords entries of a fixed class through its "
+                      "short path, while the window is open (FRITCHII_MEMSTAGE_AHEAD > 0)"
+                    : "every entry through Process's switch, as before");
+    }
+}
+
+void MemoryStageLink::SetCbRuns(bool on) {
+    // At a frame end, as SetFastLoop: GPUMem reads it at its next constant buffer word (CbRuns).
+    // A run pending when it changes is written all the same (its own flag).
+    g_cb_runs.store(on, std::memory_order_relaxed);
+    if (mode == 2 && cb_runs_logged != (on ? 1 : 0)) {
+        cb_runs_logged = on ? 1 : 0;
+        LOG_INFO(HW_GPU, "Memory stage constant buffer word runs (FRITCHII_MEMSTAGE_CB_RUNS={}): {}",
+                 on ? 1 : 0,
+                 on ? "GPUMem writes a run of words that follow each other in one page as one, "
+                      "while the window is open (FRITCHII_MEMSTAGE_AHEAD > 0)"
+                    : "a write per call, as before");
     }
 }
 
@@ -2298,6 +2331,9 @@ void MemoryStageLink::RingLoop(std::stop_token& stop, u64 start) {
     } catch (...) {
         position = RingFailed(stop, "an exception of no standard type");
     }
+    // FRITCHII_MEMSTAGE_CB_RUNS: a run of constant buffer words still open (a stop) is written,
+    // and its range collected for the hand-over below.
+    MemStageShadow::StageEndWords();
     t_in_call = false;
     t_stage_user = false;
     ring_window = 0;

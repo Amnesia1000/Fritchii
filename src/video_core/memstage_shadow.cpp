@@ -719,6 +719,64 @@ struct Copy {
     u64 cb_page{~u64{0}};
     u64 cb_map_serial{};
     Tegra::MemoryManager::StageTarget cb_target{};
+    /// FRITCHII_MEMSTAGE_ENTRY_FAST: each 3D method's MethodClass (ClassOfMethod, from the back's
+    /// execution mask, which Maxwell3D sets once in its constructor).
+    std::array<u8, MacroRegistersStart> method_class{};
+};
+
+/// FRITCHII_MEMSTAGE_ENTRY_FAST (fable_stage_levelpoints 15.3 row 1): how a 3D method entry goes
+/// through GPUMem's short path (EntryFast), from the method alone.
+/// - Store: not executable. Process applies it with StateWrite (as CallMethod does for one).
+/// - Work: executable, and MethodKindOf's default (work, whatever the state): CallMethod's
+///   ShadowRam, DirtyStore and MethodCall.
+/// - CbWord: a constant buffer data word: as Work while CbMode() is off (with it, hard: Process).
+/// - Slow: a method MethodKindOf names (its kind may depend on the state), Process's path.
+enum class MethodClass : u8 { Slow, Store, Work, CbWord };
+
+/// MethodKindOf's cases are the Slow ones here: keep the two lists in step.
+MethodClass ClassOfMethod(u32 method, bool executable) {
+    if (!executable) {
+        return MethodClass::Store;
+    }
+    if (method - CbData < 16) {
+        return MethodClass::CbWord;
+    }
+    switch (method) {
+    case MAXWELL3D_REG_INDEX(falcon[4]):
+    case MAXWELL3D_REG_INDEX(sync_info):
+    case MAXWELL3D_REG_INDEX(launch_dma):
+    case MAXWELL3D_REG_INDEX(inline_data):
+    case MAXWELL3D_REG_INDEX(wait_for_idle):
+    case MAXWELL3D_REG_INDEX(invalidate_texture_data_cache):
+    case MAXWELL3D_REG_INDEX(clear_report_value):
+    case MAXWELL3D_REG_INDEX(fragment_barrier):
+    case MAXWELL3D_REG_INDEX(tiled_cache_barrier):
+    case MAXWELL3D_REG_INDEX(report_semaphore.query):
+    case MAXWELL3D_REG_INDEX(load_mme.instruction_ptr):
+    case MAXWELL3D_REG_INDEX(load_mme.instruction):
+    case MAXWELL3D_REG_INDEX(load_mme.start_address):
+        return MethodClass::Slow;
+    default:
+        return MethodClass::Work;
+    }
+}
+
+/// FRITCHII_MEMSTAGE_CB_RUNS' counters: words a call or a run holds, 1, 2, 3-4, 5-8, 9-16, 17+.
+constexpr size_t CbWordBuckets = 6;
+size_t CbWordBucket(u64 words) {
+    return words <= 1 ? 0 : (std::min)(static_cast<size_t>(std::bit_width(words - 1)),
+                                       CbWordBuckets - 1);
+}
+
+/// What ended a run of constant buffer words (CbRunEnd).
+enum class CbEnd : u8 {
+    Entry,   ///< an entry that is not a word, a store or a wrap (KeepsCbRun)
+    Publish, ///< GPUMem published past it (PublishStaged), or the ring ended
+    Draw,    ///< a draw of the copies (StageDraw)
+    Hard,    ///< the entry turned hard (Hard)
+    Apart,   ///< a word that does not extend it (another place, page or copy)
+    Other,   ///< a word outside the run path (not one page, sparse memory, EXP107, a run, ...)
+    Count,
 };
 
 /// Histogram buckets of served draws between two runs: 0, 1, 2-3, 4-7, 8-15, 16+.
@@ -788,6 +846,41 @@ struct Counters {
     u64 lends{}, returns{};
     // The OoT trackers' record (plan 5.1) against today's query.
     u64 tracker_compared{}, tracker_mismatches{}, tracker_without{};
+    // FRITCHII_MEMSTAGE_ENTRY_FAST (fable_stage_levelpoints 15.7): 3D Method and CbWords entries,
+    // and how many of them took the short path (EntryFast).
+    u64 method_entries{}, fast_entries{};
+    // FRITCHII_MEMSTAGE_CB_RUNS (15.7), counted with the switch off too: constant buffer word calls
+    // (ConstBufferWords on GPUMem, outside runs) by words, those that extend the run before them,
+    // the runs by words and by what ended them, and runs whose page may hold GPU-written data.
+    std::array<u64, CbWordBuckets> cb_calls{};
+    u64 cb_extends{};
+    std::array<u64, CbWordBuckets> cb_runs{};
+    u64 cb_run_words{};
+    std::array<u64, static_cast<size_t>(CbEnd::Count)> cb_ends{};
+    u64 cb_dirty_pages{};
+};
+
+/// FRITCHII_MEMSTAGE_CB_RUNS (fable_stage_levelpoints 15.3 row 2): the constant buffer words GPUMem
+/// followed in a row since the last entry or event that ends a run (CbRunEnd's callers): calls
+/// whose bytes follow each other in one 4 KiB GPU page of one copy's address space, under the same
+/// page lookup. With the switch on their bytes wait here (`pending`) and are written, noted and
+/// collected as one range when the run ends; off, it is followed for the counters only.
+struct CbRun {
+    Copy* copy{};     ///< The run's copy (null: no run)
+    GPUVAddr begin{}; ///< Its first byte
+    GPUVAddr end{};   ///< Past its last byte: the address a call extends it at
+    u32 words{};      ///< Words in it
+    bool pending{};   ///< The switch on: `bytes` are not written yet
+    bool clean{};     ///< Its page tested not GPU-written at its first call (the switch on)
+    Tegra::MemoryManager::StageTarget target{}; ///< CbTarget(begin)
+    /// The window's verify (StageWritesKept): each call's own-write note, made at the run's end.
+    struct Note {
+        u64 position;
+        u32 offset;
+        u32 size;
+    };
+    std::vector<Note> notes;
+    std::array<u8, 0x1000> bytes; ///< [begin, end), a run lies in one 4 KiB page
 };
 
 struct State {
@@ -870,6 +963,7 @@ struct State {
     u64 report_map_serial{};
     Class last_class{Class::Pass};
     std::vector<std::pair<u64, std::size_t>> ring_ranges; ///< Collected, not applied yet
+    CbRun cb_run; ///< FRITCHII_MEMSTAGE_CB_RUNS: the run of constant buffer words
     /// Step 7: the flags a deferred lend hands over, per engine (BackTakeLend).
     std::vector<std::pair<Maxwell3D*, Flags>> lend_flags;
     Counters counters;
@@ -887,8 +981,21 @@ State& S() {
     return state;
 }
 
+void CbRunEnd(State& s, CbEnd why);
+
+/// FRITCHII_MEMSTAGE_CB_RUNS: ends the run of constant buffer words, if there is one (its bytes
+/// are written now with the switch on).
+inline void CbRunBreak(State& s, CbEnd why) {
+    if (s.cb_run.copy != nullptr) {
+        CbRunEnd(s, why);
+    }
+}
+
 /// The entry being processed is hard (a level entry); the first kind names it.
 void Hard(State& s, LevelType type, u64 id) {
+    // FRITCHII_MEMSTAGE_CB_RUNS: the words before it are in game memory before the entry's run
+    // (the lend hands their ranges over; the back runs from this entry).
+    CbRunBreak(s, CbEnd::Hard);
     if (!s.entry_hard) {
         s.entry_hard = true;
         s.entry_key = LevelKey(type, s.channel, id);
@@ -939,6 +1046,10 @@ Copy* FindCopy(State& s, Maxwell3D* back) {
     copy.tables = &back->dirty.tables;
     copy.skip_same = Access::SkipSame(*back);
     copy.front_macros = Access::FrontMacros(*back);
+    for (u32 method = 0; method < MacroRegistersStart; ++method) {
+        copy.method_class[method] =
+            static_cast<u8>(ClassOfMethod(method, back->execution_mask[method]));
+    }
     s.copies.push_back(std::move(copy));
     return &s.copies.back();
 }
@@ -1257,6 +1368,158 @@ void StageWriteWords(State& s, Copy& c, GPUVAddr address, const u32* data, u64 s
     s.ring_ranges.insert(s.ring_ranges.end(), pieces.begin(), pieces.end());
 }
 
+/// Whether a write of [address, address + size) touches Switch 2 sparse memory (StageWriteWords
+/// writes such words one at a time).
+bool SparseWrite(GPUVAddr address, u64 size) {
+    return address + size > Tegra::g_nx2_sparse_low.load(std::memory_order_relaxed) &&
+           address < Tegra::g_nx2_sparse_high.load(std::memory_order_relaxed);
+}
+
+/// FRITCHII_MEMSTAGE_CB_RUNS: whether `target` (CbTarget of an address `offset` bytes past the
+/// run's start, in its page) is the run's own lookup moved by `offset`: the same page lookup.
+bool SameLookup(const StageTarget& run, u64 offset, const StageTarget& target) {
+    return target.write == run.write && target.write_device == run.write_device + offset &&
+           target.device.has_value() == run.device.has_value() &&
+           (!target.device || *target.device == *run.device + offset);
+}
+
+/// FRITCHII_MEMSTAGE_CB_RUNS: a pending run's bytes into game memory, as StageWriteWords writes
+/// each of its calls' (the write ring's site; the notes kept out of the emulator's write ring while
+/// the window's verify keeps them): each call's own-write note with its entry, then the bytes in
+/// one write through the run's page lookup (each call's write is that lookup at its offset, within
+/// the page), then one collected range: the union of the calls' 32-byte ranges, which for bytes
+/// that follow each other in one page is the run's own 32-byte range (OnePiece).
+void CbRunWrite(State& s, Copy& c, CbRun& r) {
+    const u64 size = r.end - r.begin;
+    const Common::WriteRing::SiteScope write_site{"3D constant buffer data (memory stage)", false};
+    const bool kept = MemoryStageLink::StageWritesKept();
+    struct Quiet {
+        bool was;
+        explicit Quiet(bool on) : was{Common::WriteRing::t_quiet} {
+            Common::WriteRing::t_quiet = was || on;
+        }
+        ~Quiet() {
+            Common::WriteRing::t_quiet = was;
+        }
+    } quiet{kept};
+    if (kept && r.target.device) {
+        MemoryStageLink& link = MemoryStageLink::Get();
+        for (const CbRun::Note& note : r.notes) {
+            link.NoteStageWrite(*r.target.device + note.offset, note.size, note.position);
+        }
+    }
+    r.notes.clear();
+    c.memory->WriteBlockStageAt(r.target, r.begin, r.bytes.data(), size);
+    if (const auto piece = OnePiece(r.target, r.begin, size)) {
+        s.ring_ranges.push_back(*piece);
+    }
+}
+
+/// FRITCHII_MEMSTAGE_CB_RUNS: ends the run (CbRunBreak), counted by `why`. With the switch on its
+/// bytes are written now: before any entry, draw, hard entry or publish that could read them
+/// (CbRunEnd's callers), so every reader finds what the calls' own writes would have left.
+void CbRunEnd(State& s, CbEnd why) {
+    CbRun& r = s.cb_run;
+    Copy* const copy = std::exchange(r.copy, nullptr);
+    Counters& n = s.counters;
+    ++n.cb_runs[CbWordBucket(r.words)];
+    n.cb_run_words += r.words;
+    ++n.cb_ends[static_cast<size_t>(why)];
+    r.words = 0;
+    if (std::exchange(r.pending, false)) {
+        CbRunWrite(s, *copy, r);
+    }
+}
+
+/// ConstBufferWords on GPUMem for a served entry's call outside a run, within one 4 KiB page
+/// (`target`: its CbTarget) and off sparse memory. The switch off: today's tests and write
+/// (Watched, StageWriteWords), the run followed for the counters only. On
+/// (fable_stage_levelpoints 15.3 row 2):
+/// - a call extends the run when its bytes start at the run's end, in the run's page, for the same
+///   copy, under the same page lookup; any other call ends it first;
+/// - the watch test is the call's own (Watched, as today; the run's bytes are written before its
+///   Hard). The GPU-written test is a page test (its page bits, then the cache's ranges and marks
+///   ahead, all of which only grow between two entries GPUMem follows: what sets them is a fill or
+///   a run, and both end the run first): the run's first call tests its whole page, and a clean
+///   page answers for every call of the run. Otherwise each call tests its own 32-byte range, as
+///   today; a hit makes the entry hard after the run's earlier bytes are written (Hard), and the
+///   back writes this entry's words itself, as today;
+/// - the call's bytes join the run's and are written when it ends (CbRunEnd).
+void CbWords(State& s, Copy& c, GPUVAddr begin, const u32* data, u64 size,
+             const StageTarget& target) {
+    constexpr u64 Page = 0x1000;
+    CbRun& r = s.cb_run;
+    Counters& n = s.counters;
+    ++n.cb_calls[CbWordBucket(size / sizeof(u32))];
+    const bool on = MemoryStageLink::CbRuns();
+    const bool extends = r.copy == &c && r.pending == on && begin == r.end &&
+                         ((begin ^ r.begin) & ~(Page - 1)) == 0 &&
+                         SameLookup(r.target, begin - r.begin, target);
+    if (!extends) {
+        CbRunBreak(s, CbEnd::Apart);
+    }
+    bool clean = false;
+    if (!on) {
+        // ConstBufferWords' own path.
+        if (Watched(c, begin, size, &target)) [[unlikely]] {
+            ++n.watched_hits;
+            Hard(s, LevelType::CbWatched, 0);
+            return;
+        }
+        StageWriteWords(s, c, begin, data, size, &target);
+        if (s.entry_hard) {
+            return; // onto GPU-written data (Hard ended the run)
+        }
+    } else {
+        if (Watched(c, begin, size, &target)) [[unlikely]] {
+            ++n.watched_hits;
+            Hard(s, LevelType::CbWatched, 0); // the run's bytes first
+            return;
+        }
+        MemoryStageLink& link = MemoryStageLink::Get();
+        const auto& backend = link.Backend();
+        clean = extends && r.clean;
+        if (MemoryStageLink::Ahead() != 0 && target.device && backend.ranges_gpu_written != nullptr) {
+            if (!extends) {
+                const std::pair<u64, std::size_t> page{*target.device - (begin & (Page - 1)),
+                                                       static_cast<std::size_t>(Page)};
+                clean = !backend.ranges_gpu_written(backend.context, &page, 1);
+                n.cb_dirty_pages += clean ? 0 : 1;
+            }
+            if (!clean) {
+                const auto piece = OnePiece(target, begin, size);
+                if (backend.ranges_gpu_written(backend.context, &*piece, 1)) [[unlikely]] {
+                    // As StageWriteWords: hard before the write (the back writes the words).
+                    link.NoteWriteLevel();
+                    Hard(s, LevelType::CbGpuWritten, 0); // the run's bytes first
+                    return;
+                }
+            }
+        }
+    }
+    if (extends) {
+        ++n.cb_extends;
+    } else {
+        r.copy = &c;
+        r.begin = begin;
+        r.end = begin;
+        r.words = 0;
+        r.target = target;
+        r.pending = on;
+        r.clean = clean;
+    }
+    if (on) {
+        const u64 offset = begin - r.begin;
+        std::memcpy(r.bytes.data() + offset, data, size);
+        if (MemoryStageLink::StageWritesKept()) {
+            r.notes.push_back({s.processing_position, static_cast<u32>(offset),
+                               static_cast<u32>(size)});
+        }
+    }
+    r.end = begin + size;
+    r.words += static_cast<u32>(size / sizeof(u32));
+}
+
 /// Maxwell3D::ProcessCBMultiData: computes the write and its range, writes nothing. With EXP107
 /// (a mode the stage does not implement: hard) only the offset advances, as in a run (plan 3.2).
 /// 6b: a served entry's words are written here (StageWriteWords).
@@ -1280,16 +1543,24 @@ void ConstBufferWords(State& s, Copy& c, u32 amount, const u32* data) {
             one_page = CbTarget(c, begin);
         }
         const StageTarget* const target = one_page ? &*one_page : nullptr;
-        if (Watched(c, begin, write_size, target)) [[unlikely]] {
-            // Join 2: the stage leaves this entry to the back (hard). It follows it: the
-            // offset below; the back writes the words.
-            ++s.counters.watched_hits;
-            Hard(s, LevelType::CbWatched, 0);
-        }
-        if (!s.ring) {
-            Collect(s, c, begin, write_size, target);
-        } else if (!s.ring_in_run && !s.entry_hard) {
-            StageWriteWords(s, c, begin, data, write_size, target);
+        if (s.ring && !s.ring_in_run && !s.entry_hard && target != nullptr &&
+            !SparseWrite(begin, write_size)) [[likely]] {
+            // GPUMem, a served entry's words within one page: the same tests and write below
+            // (FRITCHII_MEMSTAGE_CB_RUNS off), or the run's (on).
+            CbWords(s, c, begin, data, write_size, *target);
+        } else {
+            CbRunBreak(s, CbEnd::Other);
+            if (Watched(c, begin, write_size, target)) [[unlikely]] {
+                // Join 2: the stage leaves this entry to the back (hard). It follows it: the
+                // offset below; the back writes the words.
+                ++s.counters.watched_hits;
+                Hard(s, LevelType::CbWatched, 0);
+            }
+            if (!s.ring) {
+                Collect(s, c, begin, write_size, target);
+            } else if (!s.ring_in_run && !s.entry_hard) {
+                StageWriteWords(s, c, begin, data, write_size, target);
+            }
         }
     }
     regs.const_buffer.offset += static_cast<u32>(copy_size);
@@ -1336,6 +1607,7 @@ bool PassCandidate(const State& s) {
     return s.ring && !s.ring_in_run && !s.entry_hard && MemoryStageLink::PassServed(3);
 }
 
+/// Its cases are ClassOfMethod's Slow ones (FRITCHII_MEMSTAGE_ENTRY_FAST): keep them in step.
 MethodKind MethodKindOf(const Copy& c, u32 method) {
     switch (method) {
     // Hard: they need the back's caches (the gather, the wait, the upload engine's writes),
@@ -2371,6 +2643,173 @@ void Runs(State& s, Class cls) {
     }
 }
 
+/// The end of Process for every entry: the class as applied (hard wins), the runs, the counters,
+/// the copies stale after an entry that cannot be followed.
+void EndEntry(State& s, Class cls, bool executed) {
+    if (s.entry_hard) {
+        cls = Class::Level;
+    }
+    s.last_class = cls;
+    Runs(s, cls);
+    switch (cls) {
+    case Class::Pass:
+        ++s.counters.pass;
+        break;
+    case Class::Work:
+        ++s.counters.work;
+        break;
+    case Class::Neutral:
+        ++s.counters.neutral;
+        break;
+    case Class::Level:
+        ++s.counters.level;
+        ++s.counters.level_kinds[s.entry_key];
+        s.level_since_flush = true;
+        if (!executed) {
+            s.current_level = true;
+        }
+        break;
+    }
+    if (s.entry_unfollowed) {
+        s.channel_stale = true;
+        for (Copy& copy : s.copies) {
+            copy.stale = true;
+        }
+    }
+    // The sync mirror (fable_stage_levelpoints 12.2) took this entry's effects where they came,
+    // in order: a lone 0x3dd or 0x44 clears it (MirrorAfterSyncPoint), a 3D report adds one,
+    // a fence report or a release follows its row (MirrorFence, MirrorRelease), an executable
+    // compute or DMA method and an unfollowed entry make it unknown (other_engine, Unfollow).
+    // Any other hard entry leaves it: none calls Query.
+}
+
+/// FRITCHII_MEMSTAGE_CB_RUNS: whether the run of constant buffer words may go on over `entry`:
+/// another constant buffer word entry of the 3D engine (a Method, CbWords or Multi entry: its
+/// calls decide), a plain store of it (a not executable Method, a Pairs or StateDelta block:
+/// registers only; a deferred draw one of them issues ends the run in StageDraw), or a wrap. None
+/// of them reads game memory. Any other entry ends the run before it is applied.
+bool KeepsCbRun(const State& s, const u64* entry) {
+    const u64 head = entry[0];
+    const Copy* const c = s.engine_copy;
+    switch (static_cast<Kind>(head & 0xf)) {
+    case Kind::Wrap:
+        return true;
+    case Kind::Method: {
+        const u32 method = static_cast<u32>((head >> 8) & 0xffff);
+        if (c == nullptr || (head & Access::Sink) != 0 || method >= MacroRegistersStart) {
+            return false;
+        }
+        const auto method_class = static_cast<MethodClass>(c->method_class[method]);
+        return method_class == MethodClass::Store || method_class == MethodClass::CbWord;
+    }
+    case Kind::Multi:
+        return c != nullptr && static_cast<u32>((head >> 8) & 0xffff) - CbData < 16;
+    case Kind::CbWords:
+    case Kind::Pairs:
+    case Kind::StateDelta:
+        return c != nullptr;
+    default:
+        return false;
+    }
+}
+
+/// FRITCHII_MEMSTAGE_ENTRY_FAST (GPUMem with the window open, not in a run; fable_stage_levelpoints
+/// 15.3 row 1): a 3D Method entry, or a CbWords block, whose method class (the copy's
+/// method_class table, ClassOfMethod) needs no look at the state, applied in one short path
+/// instead of Process's switch. Returns its size, or 0 when it is not such an entry (Process takes
+/// it). Process's prologue has run. Exactly what Process does for the same entry:
+/// - Store: Process's sink path (not Direct: StateWrite with processing_sunk set) or CallMethod's
+///   first branch (Direct: StateWrite), class pass;
+/// - Work and CbWord (CbMode() off): CallMethod's ShadowRam, DirtyStore and MethodCall, class
+///   work (MethodKindOf says work for them: never hard before the handler);
+/// - a CbWords block: CallMethod per word (the words' own path as above when they are CbWord, as
+///   GpuSplit sends them), class work;
+/// - the copy is s.engine_copy, as Use returns it for the entry's engine, and not stale (a stale
+///   copy is taken from the back first: Process). Methods at or past MacroRegistersStart, the
+///   Sink tag and the engine missing are Process's.
+/// Not taken: the per-entry lambdas, the launch count setup (other engines only), MethodKindOf
+/// up to three times, Use, CallMethod's tests of the execution mask and the kind.
+size_t EntryFast(State& s, const u64* entry, u64 head) {
+    Copy* const c = s.engine_copy;
+    if (c == nullptr || c->stale) {
+        return 0;
+    }
+    switch (static_cast<Kind>(head & 0xf)) {
+    case Kind::Method: {
+        if ((head & Access::Sink) != 0) {
+            return 0;
+        }
+        const u32 method = static_cast<u32>((head >> 8) & 0xffff);
+        if (method >= MacroRegistersStart) {
+            return 0;
+        }
+        const u32 argument = static_cast<u32>(head >> 32);
+        Class cls;
+        switch (static_cast<MethodClass>(c->method_class[method])) {
+        case MethodClass::Store: {
+            const Nx2Profile::Scope zone{Nx2Profile::Zone::StageMethods, Nx2Profile::Fine(),
+                                         false};
+            s.processing_sunk = (head & Access::Direct) == 0;
+            StateWrite(*c, method, argument);
+            s.processing_sunk = false;
+            cls = Class::Pass;
+            break;
+        }
+        case MethodClass::CbWord:
+            if (CbMode()) {
+                return 0;
+            }
+            [[fallthrough]];
+        case MethodClass::Work: {
+            const Nx2Profile::Scope zone{Nx2Profile::Zone::StageMethods, Nx2Profile::Fine(),
+                                         false};
+            const u32 value = ShadowRam(*c->e, method, argument);
+            DirtyStore(*c, method, value);
+            MethodCall(s, *c, method, value, argument);
+            cls = Class::Work;
+            break;
+        }
+        default:
+            return 0;
+        }
+        ++s.counters.method_entries;
+        ++s.counters.fast_entries;
+        EndEntry(s, cls, false);
+        return (head & Access::HasSegment) != 0 ? 2 : 1;
+    }
+    case Kind::CbWords: {
+        if (CbMode()) {
+            return 0;
+        }
+        const u32 count = static_cast<u32>(head >> 32);
+        const size_t first = (head & Access::CbVerify) != 0 ? 2 : 1;
+        const u64* const words = entry + first;
+        {
+            const Nx2Profile::Scope zone{Nx2Profile::Zone::StageMethods, Nx2Profile::Fine(),
+                                         false};
+            for (u32 i = 0; i < count; ++i) {
+                const u32 method = static_cast<u32>((words[i] >> 8) & 0xffff);
+                const u32 argument = static_cast<u32>(words[i] >> 32);
+                if (method < MacroRegistersStart &&
+                    c->method_class[method] == static_cast<u8>(MethodClass::CbWord)) [[likely]] {
+                    const u32 value = ShadowRam(*c->e, method, argument);
+                    DirtyStore(*c, method, value);
+                    MethodCall(s, *c, method, value, argument);
+                } else {
+                    CallMethod(s, *c, method, argument);
+                }
+            }
+        }
+        ++s.counters.method_entries;
+        ++s.counters.fast_entries;
+        EndEntry(s, Class::Work, false);
+        return first + count;
+    }
+    default:
+        return 0;
+    }
+}
+
 /// Classifies the entry at `position`, applies it to the copies (hard entries too: follow, plan
 /// 3.2, unless it cannot be followed), and returns its size in words (for a wrap: the rest of the
 /// ring).
@@ -2392,6 +2831,14 @@ size_t Process(State& s, u64 position, bool executed) {
         // closure may bind one).
         s.channel = s.back_channel;
         s.channel_stale = false;
+    }
+    if (s.cb_run.copy != nullptr && !KeepsCbRun(s, entry)) {
+        CbRunEnd(s, CbEnd::Entry); // FRITCHII_MEMSTAGE_CB_RUNS: its bytes before this entry
+    }
+    if (s.ring && !s.ring_in_run && !executed && MemoryStageLink::EntryFast()) {
+        if (const size_t fast_size = EntryFast(s, entry, head); fast_size != 0) {
+            return fast_size;
+        }
     }
     Class cls = Class::Pass;
     size_t size = 1;
@@ -2482,6 +2929,9 @@ size_t Process(State& s, u64 position, bool executed) {
         size = (head & Access::HasSegment) != 0 ? 2 : 1;
         const u32 method = static_cast<u32>((head >> 8) & 0xffff);
         const u32 argument = static_cast<u32>(head >> 32);
+        if (s.engine_copy != nullptr) {
+            ++s.counters.method_entries;
+        }
         if (s.engine == nullptr) {
             Unfollow(s, LevelType::NoEngine, 0);
             break;
@@ -2589,6 +3039,7 @@ size_t Process(State& s, u64 position, bool executed) {
             break;
         }
         Copy& c0 = *s.engine_copy;
+        ++s.counters.method_entries;
         // As Kind::Method for an executable 3D method (what every word is, GpuSplit checks).
         cls = MethodKindOf(c0, CbData) == MethodKind::Work ? Class::Work : Class::Pass;
         if (Copy* const c = Use(s, c0.back, executed)) {
@@ -2763,41 +3214,7 @@ size_t Process(State& s, u64 position, bool executed) {
         break;
     }
     }
-    if (s.entry_hard) {
-        cls = Class::Level;
-    }
-    s.last_class = cls;
-    Runs(s, cls);
-    switch (cls) {
-    case Class::Pass:
-        ++s.counters.pass;
-        break;
-    case Class::Work:
-        ++s.counters.work;
-        break;
-    case Class::Neutral:
-        ++s.counters.neutral;
-        break;
-    case Class::Level:
-        ++s.counters.level;
-        ++s.counters.level_kinds[s.entry_key];
-        s.level_since_flush = true;
-        if (!executed) {
-            s.current_level = true;
-        }
-        break;
-    }
-    if (s.entry_unfollowed) {
-        s.channel_stale = true;
-        for (Copy& copy : s.copies) {
-            copy.stale = true;
-        }
-    }
-    // The sync mirror (fable_stage_levelpoints 12.2) took this entry's effects where they came,
-    // in order: a lone 0x3dd or 0x44 clears it (MirrorAfterSyncPoint), a 3D report adds one,
-    // a fence report or a release follows its row (MirrorFence, MirrorRelease), an executable
-    // compute or DMA method and an unfollowed entry make it unknown (other_engine, Unfollow).
-    // Any other hard entry leaves it: none calls Query.
+    EndEntry(s, cls, executed);
     return size;
 }
 
@@ -2996,6 +3413,50 @@ void Report5c(State& s, double seconds) {
              CopyLimit, t.condition_hard, why);
 }
 
+/// GPUMem's own-work cuts of fable_stage_levelpoints 15.3 (their counters, 15.7).
+void ReportCuts(State& s, double seconds) {
+    const Counters& c = s.counters;
+    const auto rate = [seconds](u64 value) { return static_cast<double>(value) / seconds; };
+    const auto share = [](u64 part, u64 whole) {
+        return whole != 0 ? 100.0 * static_cast<double>(part) / static_cast<double>(whole) : 0.0;
+    };
+    const u64 entries = c.pass + c.work + c.level + c.neutral;
+    LOG_INFO(HW_GPU,
+             "Memory stage GPUMem entry path (FRITCHII_MEMSTAGE_ENTRY_FAST={}): fast entries/s "
+             "{:.0f} = {:.1f}% of 3D method and CB words entries ({:.0f}/s), {:.1f}% of all "
+             "entries ({:.0f}/s)",
+             MemoryStageLink::EntryFast() ? 1 : 0, rate(c.fast_entries),
+             share(c.fast_entries, c.method_entries), rate(c.method_entries),
+             share(c.fast_entries, entries), rate(entries));
+    const auto buckets = [&rate](const std::array<u64, CbWordBuckets>& counts) {
+        std::string text;
+        for (size_t i = 0; i < counts.size(); ++i) {
+            text += fmt::format("{}{:.0f}", i == 0 ? "" : " ", rate(counts[i]));
+        }
+        return text;
+    };
+    u64 calls = 0;
+    for (const u64 count : c.cb_calls) {
+        calls += count;
+    }
+    u64 runs = 0;
+    for (const u64 count : c.cb_runs) {
+        runs += count;
+    }
+    const auto end = [&](CbEnd why) { return rate(c.cb_ends[static_cast<size_t>(why)]); };
+    LOG_INFO(HW_GPU,
+             "Memory stage GPUMem CB word runs (FRITCHII_MEMSTAGE_CB_RUNS={}): calls/s {:.0f} by "
+             "words (1, 2, 3-4, 5-8, 9-16, 17+): {}; extending the run before them {:.0f}/s "
+             "({:.1f}%); runs/s {:.0f} ({:.2f} words each) by words: {}; ended by an entry "
+             "{:.0f}/s, publish {:.0f}, draw {:.0f}, hard {:.0f}, a word apart {:.0f}, a word off "
+             "the path {:.0f}; runs on a page that may be GPU-written/s {:.1f}",
+             MemoryStageLink::CbRuns() ? 1 : 0, rate(calls), buckets(c.cb_calls),
+             rate(c.cb_extends), share(c.cb_extends, calls), rate(runs),
+             runs != 0 ? static_cast<double>(c.cb_run_words) / static_cast<double>(runs) : 0.0,
+             buckets(c.cb_runs), end(CbEnd::Entry), end(CbEnd::Publish), end(CbEnd::Draw),
+             end(CbEnd::Hard), end(CbEnd::Apart), end(CbEnd::Other), rate(c.cb_dirty_pages));
+}
+
 void Report(State& s, std::chrono::steady_clock::time_point now) {
     const double seconds =
         std::chrono::duration<double>(now - s.window_start).count();
@@ -3058,6 +3519,9 @@ void Report(State& s, std::chrono::steady_clock::time_point now) {
     LOG_INFO(HW_GPU, "Memory stage shadow level entries by kind and channel (top 12 of {}): {}",
              kinds.size(), top.empty() ? "none" : top);
     Report5c(s, seconds);
+    if (s.ring) {
+        ReportCuts(s, seconds);
+    }
     std::unordered_map<u64, u64> keep;
     keep.swap(c.level_kinds);
     keep.clear();
@@ -3365,6 +3829,10 @@ void StageTick() {
 
 std::vector<std::pair<u64, std::size_t>>& StageRanges() {
     return S().ring_ranges;
+}
+
+void StageEndWords() {
+    CbRunBreak(S(), CbEnd::Publish);
 }
 
 u64 StageDrawSeq(u64 back_seq) {
@@ -3879,6 +4347,9 @@ void MemStageShadowEngine::StageDraw(bool indexed, u32 instance_count, bool indi
         // 6b (memstage_shadow.cpp's header): serve the draw, or make its entry hard.
         // Profiling: the draw's own share of GPUMem's entries (its fill is a zone of its own).
         const Nx2Profile::Scope zone{Nx2Profile::Zone::StageDrawSetup, Nx2Profile::Fine(), false};
+        // FRITCHII_MEMSTAGE_CB_RUNS: the words before the draw are in game memory, and their
+        // range collected, before its fill reads them (or its entry turns hard).
+        Shadow::CbRunBreak(s, Shadow::CbEnd::Draw);
         MemoryStageLink& link = MemoryStageLink::Get();
         const u64 seq = ++s.ring_seq;
         ++s.entry_draws;

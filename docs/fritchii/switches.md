@@ -1363,6 +1363,76 @@ logged when it changes.
   stays 0. Then 0 against 1 with profile_toggle.py at the market (GPUMem's "stage pairs" and "other"
   at EDEN_NX2_GPU_PROFILE=2, its busy time, fps).
 
+### FRITCHII_MEMSTAGE_ENTRY_FAST
+
+FRITCHII_MEMSTAGE_ENTRY_FAST (live, read at a frame end with FRITCHII_MEMSTAGE_AHEAD, default 0;
+work\fable_stage_levelpoints.md 15.3 row 1): with FRITCHII_MEMSTAGE_THREAD=2 and the window open
+(AHEAD > 0), GPUMem takes 3D Method entries and CbWords blocks through a short path
+(memstage_shadow.cpp, EntryFast) instead of Process's switch. 0, AHEAD 0 and THREAD 0/1 run
+every entry through Process as before. "Memory stage entry path (FRITCHII_MEMSTAGE_ENTRY_FAST=n)"
+is logged when it changes.
+
+- Each copy keeps one byte a 3D method (ClassOfMethod, from the engine's execution mask, fixed at
+  its construction): store (not executable), work (executable, MethodKindOf's default), a constant
+  buffer data word, or slow (every method MethodKindOf names: its kind can depend on the state).
+- Store: StateWrite, as Process's sink path (processing_sunk set) or CallMethod (Direct); class
+  pass. Work and constant buffer words (EXP107 off): ShadowRam, DirtyStore and MethodCall, as
+  CallMethod; class work. A CbWords block: the same per word (CallMethod for a word of another
+  class, as Process). The copy is the engine's copy, as Use returns it; a stale copy, a Sink
+  entry, a macro method, a slow method and everything else go through Process. The entry's end
+  (class, runs, counters, stale copies) is one function both paths call (EndEntry).
+- Left out per entry: the per-entry lambdas and launch count setup (other engines only),
+  MethodKindOf up to three times, Use, and CallMethod's execution mask and kind tests.
+- The "Memory stage GPUMem entry path" line (every 10 s, GPUMem) gives the hit rate: fast entries a
+  second, their share of the 3D Method and CbWords entries and of all entries. It counts with the
+  switch off too (0 fast entries then).
+- The verify: the memstage gate with FRITCHII_MEMSTAGE_RING_VERIFY (compare b's hash at every
+  served draw) and READ_LOG with the switch on; every must-be-0 line stays 0. Then 0 against 1 with
+  profile_toggle.py, stage on, at the market: GPUMem's busy time and fps (the fine zones of
+  EDEN_NX2_GPU_PROFILE=2 time each entry and hide what is cut).
+
+### FRITCHII_MEMSTAGE_CB_RUNS
+
+FRITCHII_MEMSTAGE_CB_RUNS (live, read at a frame end with FRITCHII_MEMSTAGE_AHEAD, default 0;
+work\fable_stage_levelpoints.md 15.3 row 2): with FRITCHII_MEMSTAGE_THREAD=2 and the window open
+(AHEAD > 0), GPUMem handles constant buffer words that follow each other as one run
+(memstage_shadow.cpp, CbWords) instead of a page test, a backend call, a game memory write and a
+collected range per call (1.2 million calls a second at the market, 10.6 a draw). 0, AHEAD 0 and
+THREAD 0/1 write each call's words as before. "Memory stage constant buffer word runs
+(FRITCHII_MEMSTAGE_CB_RUNS=n)" is logged when it changes.
+
+- A run: calls of served entries, each within one 4 KiB GPU page and off Switch 2 sparse memory,
+  whose bytes start where the run's end, in the run's page, on the same copy, under the same page
+  lookup (CbTarget). Other words (several pages, sparse memory, EXP107, inside a run or a hard
+  entry) take today's path after the run ends.
+- It goes on over the entries that read no game memory: other constant buffer word entries (their
+  calls decide), plain 3D stores (not executable Method entries, Pairs and StateDelta blocks) and
+  wraps. It ends, its bytes written first, at any other entry, at every draw of the copies (before
+  the fill, or before the draw makes its entry hard), when the entry turns hard (before its run is
+  lent), and whenever GPUMem publishes past the entries it followed (PublishStaged) and at the
+  ring's end. So the back never runs past a word whose bytes are not in game memory (the front's
+  waits for writers wait for the back's position), and no fill, run or served release reads them
+  before they are there.
+- Tests, as exact as each call's: the watch test (Watched) stays per call. The GPU-written test
+  is a page test that can only turn from clean to written through a fill or a run, and both end
+  the run: the run's first call tests its whole page (the backend's ranges_gpu_written on the
+  page), and a clean page answers for each of its calls. On a page that may hold GPU-written data
+  every call tests its own 32-byte range, as today. A hit makes the entry hard after the run's
+  earlier bytes are written; the back writes the entry's words itself, as today.
+- The write: one WriteBlockStageAt through the run's page lookup (each call's write is that lookup
+  at its offset), and one collected range: the union of the calls' 32-byte ranges, which for bytes
+  that follow each other in one page is the run's own 32-byte range. With the window's verify on
+  (StageWritesKept) each call still gets its own-write note with its own entry, made just before
+  the write.
+- The "Memory stage GPUMem CB word runs" line (every 10 s, GPUMem, counted with the switch off too,
+  from the same run bookkeeping): calls a second by words (1, 2, 3-4, 5-8, 9-16, 17+), the calls
+  that extend the run before them, runs by words, what ended them (an entry, a publish, a draw, a
+  hard entry, a word apart, a word off the path), and runs on a page that may be GPU-written.
+  With the switch off it sizes the cut: calls minus runs is the writes, tests and ranges saved.
+- The verify: the memstage gate with FRITCHII_MEMSTAGE_RING_VERIFY and READ_LOG with the switch
+  on (the read compare and the image check see each call's note); every must-be-0 line stays 0.
+  Then 0 against 1 with profile_toggle.py, stage on, at the market: GPUMem's busy time and fps.
+
 ### FRITCHII_MEMSTAGE_GATHER
 
 FRITCHII_MEMSTAGE_GATHER (live, read at a frame end with FRITCHII_MEMSTAGE_AHEAD, default 0;
