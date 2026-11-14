@@ -321,6 +321,16 @@ public:
 
     void InvalidateState();
 
+    /// One follower (vk_one_follower_draw.cpp): the dirty flags this tracker reads and clears,
+    /// swapped for R's view engine's while R plays an unlent draw and back after (ChangeChannel
+    /// sets them as before). Returns the ones it had.
+    Tegra::Engines::Maxwell3D::DirtyState::Flags* ExchangeFlags(
+        Tegra::Engines::Maxwell3D::DirtyState::Flags* new_flags) noexcept {
+        Tegra::Engines::Maxwell3D::DirtyState::Flags* const previous = flags;
+        flags = new_flags;
+        return previous;
+    }
+
 private:
     static constexpr auto INVALID_TOPOLOGY = static_cast<Maxwell::PrimitiveTopology>(~0u);
 
