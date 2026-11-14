@@ -76,6 +76,12 @@ enum class StageDrawLoop : u8 {
 /// StageTag::Cache's kind, in header bits 40-47 (FRITCHII_MEMSTAGE_RELEASE): which cache call it
 /// is, when the stage treats one apart. Other's payload stays the closure's own (no layout
 /// promised); SemaphoreRelease's is StageReleaseWord's.
+///
+/// Rule (fable_stage_levelpoints 12.2, the memory stage's sync mirror): a new closure that calls
+/// rasterizer->Query (a query report, a semaphore release) must carry the SemaphoreRelease kind
+/// and its layout, or be untagged. GPUMem takes every other Cache-tagged closure as one that adds
+/// no pending query sync; a Query in one would make a passed sync point's wait for idle find a
+/// sync pending (must be 0: PassQuerySync), or a dry count wrong.
 enum class StageCacheCall : u8 {
     Other = 0,            ///< any other cache call
     /// The puller's semaphore releases (WriteLong, SemaphoreRelease, SemaphoreExecute's release:
