@@ -65,8 +65,34 @@ fps drops by about what the added ms a second predict, it is; if not, shortening
   Nothing is published before a spin.
 - "Front waits for the back by site" (every 5 s) ends with "delay tests added (after/before the
   drain, FRITCHII_DELAY_BEFORE=b): FRITCHII_DELAY_MACRO_DRAIN_US=n x/s y ms/s,
-  FRITCHII_DELAY_POLL_DRAIN_US=n x/s y ms/s" while a switch is set or spins were counted.
+  FRITCHII_DELAY_POLL_DRAIN_US=n x/s y ms/s" and the three work tests below, while a delay
+  switch is set or spins were counted.
 - Measure with profile_toggle.py in one session (0 against n).
+
+### FRITCHII_DELAY_E2C_US, FRITCHII_DELAY_DISPATCH_US, FRITCHII_DELAY_DRAW_US
+
+Three more delay tests (live, default 0 = nothing changes; fable_front_drains section 6, Fable's
+W, K and D), the same busy spin of n microseconds. The drain spins above can't tell "the front
+paces" from "the back paces" (right after a full drain the back is empty, so any front spin there
+is critical by construction); these add work to one thread in the middle of its pass:
+- FRITCHII_DELAY_E2C_US=n ("W", front): every call of the 0xe2c occlusion macro (hits and
+  misses, about 33,000 a second at the market), at the start of the call, before its read,
+  whether the OoT handler or the JIT runs it (Maxwell3D::FrontRunMacroFeatures, where the call's
+  macro slot is identified; with every macro switch off the plain body runs and there is no
+  spin). n = 3 is about 100 ms/s of front work.
+- FRITCHII_DELAY_DISPATCH_US=n ("K", back): every compute dispatch, at the start of
+  RasterizerVulkan::DispatchCompute. n = 12 is about 96 ms/s.
+- FRITCHII_DELAY_DRAW_US=n ("D", back): every 3D draw call (not per instance), at the start of
+  RasterizerVulkan::Draw and DrawIndirect (list draws included; not DrawTexture blits). n = 1 is
+  about 110 ms/s.
+- K and D spin only on the GPU back thread (GpuSplit::OnBackThread): never on GPUMem with
+  FRITCHII_MEMSTAGE_THREAD=2 (a draw GPUMem serves is still played on the back, which spins
+  there), and not at all without the split. The spin sits outside the profile's "draw" and
+  "compute" zones.
+- Counted in the same "Front waits for the back by site" ending: "FRITCHII_DELAY_E2C_US=n x/s
+  y ms/s (front), FRITCHII_DELAY_DISPATCH_US=n ... (back), FRITCHII_DELAY_DRAW_US=n ... (back)".
+- Reading them: a spin on the thread that paces a pass costs about its ms/s in fps; one on a
+  thread with slack there costs little.
 
 ### Front 0xe2c misses (always on, a counter)
 

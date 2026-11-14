@@ -819,14 +819,23 @@ public:
     }
     /// Waits until the back executed every NoteWriter and NoteMemoryWriter work sent so far.
     bool WaitForMemoryWriters();
-    /// The delay tests (Coz-style causal profiling, fable_front_drains section 3): the front wait
-    /// a busy spin is added in front of. FRITCHII_DELAY_MACRO_DRAIN_US and
-    /// FRITCHII_DELAY_POLL_DRAIN_US.
+    /// The delay tests (Coz-style causal profiling, fable_front_drains sections 3 and 6): where a
+    /// busy spin is added. The drains: FRITCHII_DELAY_MACRO_DRAIN_US and
+    /// FRITCHII_DELAY_POLL_DRAIN_US. Work, to tell which thread paces which pass:
+    /// FRITCHII_DELAY_E2C_US (front), FRITCHII_DELAY_DISPATCH_US and FRITCHII_DELAY_DRAW_US
+    /// (back).
     enum class DelayTest : u32 {
         MacroDrain, ///< A macro DMA read that waits for the back (FrontDmaRead)
         PollDrain,  ///< A suspended acquire's poll that drains (Puller::CanResumeAcquire)
+        E2c,        ///< Front: every call of the 0xe2c occlusion macro ("W")
+        Dispatch,   ///< Back: every compute dispatch (RasterizerVulkan::DispatchCompute, "K")
+        Draw,       ///< Back: every 3D draw call (RasterizerVulkan::Draw/DrawIndirect, "D")
         Count,
     };
+    /// FRITCHII_DELAY_E2C_US, FRITCHII_DELAY_DISPATCH_US, FRITCHII_DELAY_DRAW_US (live, default
+    /// 0): spins the switch's microseconds for `test` (E2c, Dispatch or Draw) when it is set.
+    /// Dispatch and Draw spin only on the back thread (never on GPUMem, nor without the split).
+    static void DelayWork(DelayTest test);
     /// Front, right before a wait of `test`'s kind (a drain): 0 unless its switch is set and the
     /// back has not run everything sent (the drain will wait). With FRITCHII_DELAY_BEFORE=1 (the
     /// control run) it spins here and returns 0; otherwise it returns the microseconds the caller
@@ -840,7 +849,8 @@ public:
         }
     }
     /// Busy-spins `us` microseconds on this thread (steady_clock with a pause, not a sleep) and
-    /// counts it for the "Front waits for the back by site" line. Publishes nothing. Front only.
+    /// counts it for the "Front waits for the back by site" line (atomic counts: the back's
+    /// spins too). Publishes nothing.
     static void SpinDelay(DelayTest test, u32 us);
     /// memory-writing work whose range the front does not note was just sent (KeplerMemory
     /// and Fermi2D methods; DmaPusher is the only caller). Ends every macro DMA read snapshot.
