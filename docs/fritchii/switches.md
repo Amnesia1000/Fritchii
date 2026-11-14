@@ -1521,7 +1521,8 @@ lone gather (3D invalidate_texture_data_cache, 0x3dd) or wait for idle (0x44) a 
 instead of a level run: GPUMem does what the entry does to the buffer cache itself, at its
 position, and goes on; the back runs the entry later, served, with its own code, and finds
 nothing to do in the buffer cache there. 0, AHEAD 0 and THREAD 0/1: as before (the passes line
-is then dry). Bit 2 (fence entries, fable_stage_p3) is not built: it is masked off.
+is then dry). Bit 2 (=2, or =3 with bit 1) is P3, below: the same for sync points where a query
+result sync is pending, and for the puller's release closures and lone 3D fence reports.
 - Which (tried before FRITCHII_MEMSTAGE_GATHER; one that does not pass goes to what that switch
   says, a run otherwise): a lone method entry outside a run, no draw before it in the entry,
   - rule Q: no query result sync can be pending at the entry (the mirror in the passes line);
@@ -1585,6 +1586,54 @@ is then dry). Bit 2 (fence entries, fable_stage_p3) is not built: it is masked o
   from about 10,500 to about 7,000 a second, GPUMem's run wait down 30 to 45 ms/s, +1 to +2 fps
   at the market.
 
+Bit 2, P3 (work\fable_stage_p3.md sections 2 to 7, fable_stage_levelpoints 13.6 and 14.3 to
+14.5): the entries where rule Q fails because a query result sync is pending, and the fence
+entries. GPUMem resolves the sync's buffers itself, at the entry, when that is a pure lookup, and
+puts them in the record; the back's QueryCacheRuntime::SyncValues copies the values into them and
+never enters the buffer cache.
+- The pure lookup: the report pages P3's mirror holds (every report since the last sync point;
+  unknown when there may be others) plus the entry's own, as maximal runs of adjacent 4 KiB
+  device pages, at most 16 runs (Fable's 8 raised, levelpoints 14.5). Under the cache's lock
+  (BufferCache::ProbeSyncTarget for each run first): an existing buffer holds the run, and no page
+  of it is CPU-modified or untracked (an untracked page is a cached write's: the sync's walk would
+  re-track it). Then the sync's own ObtainCPUBuffer(FullSynchronize) on each run, at the entry's
+  place in the cache's order: it finds that buffer, uploads nothing and marks the usage, as on
+  THREAD 0 (the mark keeps a later upload of those bytes after the query's copy). Accurate fences
+  never pass (the lookup may wait there). Anything else (no buffer yet, CPU-modified bytes,
+  reports unknown, more than 16 runs) is not passed: today's path.
+- Which: a lone gather or wait for idle with a sync pending (after P1's tests, the targets before
+  the take); a release closure outside a run (StageCacheCall::SemaphoreRelease): unmapped and not
+  fence-flagged ones pass outright, a fence-flagged one with the targets, rule C and EXP28 & 1 off
+  (deferred payload syncs: its fence may not sync); a 3D fence report alone in its Method entry
+  outside a run, as a fence-flagged release (its address from GPUMem's copy). Each needs room for
+  its record and pushes one marked `sync`, then is published at once.
+- The back: SyncValues while served takes the buffers from the entry's record (a range none of
+  its targets holds: must be 0, then today's block); OutdateReadDownloads only with a read
+  download pending (g_read_downloads), under the lock. A sync while served at an entry without a
+  P3 record is today's block (a read flush's own fence; counted, not a must-be-0). The fence's
+  CommitCacheFlushes at a P3-passed entry skips the buffer half on its note whatever
+  FRITCHII_FENCE_COMMIT_FAST says; a set note there is a must-be-0 (not with
+  FRITCHII_MEMSTAGE_MARKS_AHEAD, where the back commits there under the lock). With bits 0 and 1
+  every other path runs as before. The fence's own
+  gather while served goes to GPUMem as P1's does (GatherOnStage), for either bit. WaitForIdle's
+  "a query result sync pending at a passed entry" counts only when the entry has no P3 record.
+- Must be 0, added: "a query result sync range at a P3-passed entry that none of the record's
+  targets holds". "Uncommitted buffer flushes at a passed entry's flush grouping" is now also
+  counted at a P3-passed fence's commit (FenceManager::CommitCacheFlushes). Both turn the switch
+  to 0 for the session, as the others.
+- Why it is exact (fable_stage_p3 7): GPUMem's lookup at the entry's place returns what the back's
+  ObtainCPUBuffer would return there and changes what it changes (the usage mark); a later fill
+  that joins that buffer has its copy in its own packet, played after the back's query copy; the
+  pages were clean at the entry, so THREAD 0's sync would upload nothing either; and each range
+  the back's sync groups lies in one of GPUMem's runs (a sync covers exactly the reports since
+  the last one).
+- "Memory stage passes P3 (FRITCHII_MEMSTAGE_PASS=n)" (after the dry P3 line, while bit 2 is on):
+  passed per kind, sync targets a second, and the back's syncs while served from a record and
+  without one. The dry P3 line then counts the live decisions (with "no record room").
+- Test: a gate run with FRITCHII_MEMSTAGE_PASS=3 (memstage_gate.py, read log on, flash watch
+  route, an area load, and a fight), then a PASS 1/3 toggle with profile_toggle.py. Expected
+  (Fable, an estimate): 48 to 59 ms/s off GPUMem's waits for the back, +2 to +3.7 fps at 100%.
+
 ### Memory stage passes (the "Memory stage passes" line)
 
 Every 10 s on THREAD 2 (fable_stage_levelpoints 5.2), "Memory stage passes (dry, window
@@ -1638,14 +1687,15 @@ at once) or not fence-flagged (passes: no fence, no cache; its page joins the mi
 for a sync point with no report pending, pass (P1's); reports unknown (after a timestamped
 compute report, a DMA method, an unfollowed
 entry, or a report across a page end); the fence behaviour Accurate; then the targets: the report pages GPUMem saw since the
-last sync point (and the entry's own) as maximal runs of adjacent 4 KiB device pages, more than 8
+last sync point (and the entry's own) as maximal runs of adjacent 4 KiB device pages, more than 16
 runs, a run no existing buffer holds on its first page ("no buffer": the sync would create one;
 should fall to near 0 after the first seconds, else pages are being collected or re-made), a run
-past that buffer, a run with CPU-modified bytes (the sync would upload: the count that decides
-P3's worth). Then the report pages per sync point that reached the target test (average and
-maximum). The target test is BufferCache::ProbeSyncTarget under the cache's lock: it changes
-nothing (no usage mark in dry). P3's mirror (its report pages) follows the same table as the
-mirror above, so it does not depend on what is passed.
+past that buffer, a run with CPU-modified or untracked bytes (the sync would upload or re-track:
+the count that decides P3's worth). Then the report pages per sync point that reached the target
+test (average and maximum). The target test is BufferCache::ProbeSyncTarget under the cache's
+lock: it changes nothing (no usage mark in dry). P3's mirror (its report pages) follows the same
+table as the mirror above, so it does not depend on what is passed. With bit 2 on, the same line
+holds P3's live decisions (plus "no record room").
 
 ### FRITCHII_MEMSTAGE_MARKS_AHEAD
 

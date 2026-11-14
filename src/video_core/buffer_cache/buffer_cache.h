@@ -1959,8 +1959,9 @@ void BufferCache<P>::FlushCachedWrites() {
 
 template <class P>
 typename BufferCache<P>::SyncProbe BufferCache<P>::ProbeSyncTarget(DAddr begin, u64 bytes) {
-    // FindBuffer's hit (else CreateBuffer), then SynchronizeBuffer's test (ForEachUploadRange
-    // clears CPU-modified bits even where it uploads nothing).
+    // FindBuffer's hit (else CreateBuffer), then SynchronizeBuffer's test: ForEachUploadRange
+    // clears CPU-modified bits even where it uploads nothing, and re-tracks untracked pages (a
+    // cached write's), so either one is a change only the back may make at its place.
     const u64 page = begin >> CACHING_PAGEBITS;
     if (begin == 0 || page >= page_table.size()) {
         return SyncProbe::NoBuffer;
@@ -1972,7 +1973,7 @@ typename BufferCache<P>::SyncProbe BufferCache<P>::ProbeSyncTarget(DAddr begin, 
     if (!slot_buffers[buffer_id].IsInBounds(begin, bytes)) {
         return SyncProbe::NotInBounds;
     }
-    if (memory_tracker.IsRegionCpuModified(begin, bytes)) {
+    if (!memory_tracker.IsRegionSyncClean(begin, bytes)) {
         return SyncProbe::CpuModified;
     }
     return SyncProbe::Pure;

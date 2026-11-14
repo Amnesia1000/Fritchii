@@ -79,6 +79,7 @@ public:
         PassWaitMissing,
         PassListedFreed,
         PassListedLeft,
+        PassSyncTarget,
         Count,
     };
 
@@ -140,6 +141,16 @@ public:
         MustFlush,
         Fallback,
         Count,
+    };
+
+    /// FRITCHII_MEMSTAGE_PASS bit 2 (fable_stage_p3 4.2): one maximal run of report pages GPUMem
+    /// resolved at a sync point, [begin, begin + bytes) of device memory, and the buffer the
+    /// back's query result sync copies into there (a VkBuffer, as u64) at `offset` for `begin`.
+    struct SyncTarget {
+        u64 begin;
+        u64 bytes;
+        u64 buffer;
+        u64 offset;
     };
 
     /// THREAD = 2: what the Vulkan side does for the stage (memory_stage_link.cpp).
@@ -204,6 +215,13 @@ public:
         /// runs [begin, bytes) would be pure lookups (BufferCache::ProbeSyncTarget, under the
         /// lock); the first failure, a P3Outcome (Passed when all are pure). Changes nothing.
         u8 (*sync_probe)(void* context, const std::pair<u64, u64>* runs, size_t count){};
+        /// GPUMem, P3 (FRITCHII_MEMSTAGE_PASS bit 2, fable_stage_p3 4.2), outside any fill: as
+        /// sync_probe, and when every run is a pure lookup, the sync's ObtainCPUBuffer
+        /// (FullSynchronize) on each, here at the entry's place in the cache's order (it then only
+        /// marks the usage), into `out[0, count)`. A P3Outcome; nothing is obtained when it is not
+        /// Passed.
+        u8 (*sync_targets)(void* context, const std::pair<u64, u64>* runs, size_t count,
+                           SyncTarget* out){};
         /// GPUMem, in a catch-up while the back waits to promote the marks a packet's fill made
         /// ahead (FRITCHII_MEMSTAGE_MARKS_AHEAD): promotes them for it (GPUMem may hold the lock).
         void (*promote_marks)(void* context){};
@@ -539,8 +557,10 @@ public:
     void NoteFrontRelease(bool fence, bool mapped) noexcept {
         BumpOne(pass_stats.front_releases[(fence ? 2 : 0) + (mapped ? 1 : 0)], 1);
     }
-    /// GPUMem: the switch's bit `bit` (1: gathers and waits for idle) is on, the window open as
-    /// GPUMem's loop read it, and no must-be-0 of the passes turned it off. GPUMem only.
+    /// GPUMem: the switch's bit `bit` (1: gathers and waits for idle with no query sync pending;
+    /// 2: P3, sync points with a pending sync, release closures and 3D fence reports; 3: either)
+    /// is on, the window open as GPUMem's loop read it, and no must-be-0 of the passes turned it
+    /// off. GPUMem only.
     [[nodiscard]] static bool PassServed(u32 bit) noexcept {
         return (g_pass.load(std::memory_order_relaxed) & bit) != 0 && t_on_stage &&
                instance.ring_window != 0;
@@ -549,8 +569,8 @@ public:
     [[nodiscard]] static bool StageWindowOpen() noexcept {
         return t_on_stage && instance.ring_window != 0;
     }
-    /// The back (any thread): bit 1 of the switch is on and the window open, as last set at a
-    /// frame end (the back's own gathers while served go to GPUMem then, levelpoints 6.3).
+    /// The back (any thread): a bit of `bit` of the switch is on and the window open, as last set
+    /// at a frame end (the back's own gathers while served go to GPUMem then, levelpoints 6.3).
     [[nodiscard]] static bool PassOn(u32 bit) noexcept {
         return (g_pass.load(std::memory_order_relaxed) & bit) != 0 &&
                g_ahead.load(std::memory_order_relaxed) != 0;
@@ -571,7 +591,12 @@ public:
         /// Rule T (fable_stage_levelpoints 13.3): `ranges` is on GPU's applying_writes until the
         /// back applies it (a whole record). It must not move or change meanwhile.
         bool listed{};
+        /// P3 (bit 2, fable_stage_p3 4 and 5.1): GPUMem resolved the entry's query result sync:
+        /// `targets` holds a buffer for every report page that may be pending there (none when
+        /// none is). The back's SyncValues copies into them and stays out of the buffer cache.
+        bool sync{};
         std::vector<std::pair<u64, u64>> ranges;
+        std::vector<SyncTarget> targets;
     };
     static constexpr u64 PassSlots = 256;
     /// GPUMem: room for one more record.
@@ -589,7 +614,9 @@ public:
         record.seen = false;
         record.ranges_applied = false;
         record.listed = false;
+        record.sync = false;
         record.ranges.clear();
+        record.targets.clear();
         return record;
     }
     void PassPush() noexcept;
@@ -605,8 +632,12 @@ public:
     /// The back, at a passed gather's entry (RasterizerVulkan::InvalidateGPUCache): applies the
     /// half of the record of `position` the back owes, once.
     void BackApplyPasses(u64 position) noexcept;
+    /// The back: BackPassRecord of the entry it runs now (GpuSplit's BackEntryPosition); null when
+    /// it has none, or no record waits at all.
+    PassRecord* BackCurrentPassRecord() noexcept;
     /// fable_stage_p3 section 6, dry (decided and counted, behaving as today): would P3 pass the
-    /// entry, and if not the first reason, per kind.
+    /// entry, and if not the first reason, per kind. With bit 2 on, the same counters hold the
+    /// live decisions (the entries that reached them).
     enum class P3Outcome : u8 {
         Passed,         ///< would pass (a sync point, a fence entry with pure targets)
         PassedUnmapped, ///< a release to an unmapped address (the back's Query returns at once)
@@ -617,15 +648,27 @@ public:
         Tracking,       ///< read download tracking on
         Flushes,        ///< uncommitted buffer flushes
         ReportsUnknown, ///< reports GPUMem did not see may be pending (after a run, a hard entry)
-        TooManyRuns,    ///< the report pages make more than 8 runs
+        TooManyRuns,    ///< the report pages make more than 16 runs
         NoBuffer,       ///< a report page no buffer holds (the sync would create one)
         NotInBounds,    ///< a run past the buffer on its first page
-        CpuModified,    ///< a report page with CPU-modified bytes (the sync would upload)
+        CpuModified,    ///< a report page with CPU-modified (or untracked) bytes: it would upload
+        NoRoom,         ///< live (bit 2): no room for the record
         Count,
     };
     enum class P3Kind : u8 { Gather, WaitForIdle, Release, FenceReport, Count };
     void NoteP3(P3Kind kind, P3Outcome what) noexcept {
         BumpOne(pass_stats.p3[static_cast<size_t>(kind)][static_cast<size_t>(what)], 1);
+    }
+    /// GPUMem, bit 2: an entry of `kind` P3 passed (pushed its record), with `targets` runs.
+    void NoteP3Passed(P3Kind kind, u64 targets) noexcept {
+        BumpOne(pass_stats.p3_passed[static_cast<size_t>(kind)], 1);
+        BumpOne(pass_stats.p3_targets, targets);
+    }
+    /// The back, served, at a query result sync (QueryCacheRuntime::SyncValues): from a pass
+    /// record's targets (no buffer cache), or not (no record of P3's: today's block, which is not
+    /// a must-be-0, a read flush's own fence syncs there).
+    void NoteP3BackSync(bool from_record) noexcept {
+        BumpOne(pass_stats.p3_back_syncs[from_record ? 1 : 0], 1);
     }
     /// P3 dry: the report pages of a sync point that reached the target test.
     void NoteP3Pages(u64 pages) noexcept {
@@ -1149,11 +1192,14 @@ private:
         std::atomic<u64> p3_sync_points{};
         std::atomic<u64> p3_pages{};
         std::atomic<u64> p3_pages_max{};
+        std::array<std::atomic<u64>, static_cast<size_t>(P3Kind::Count)> p3_passed{};
+        std::atomic<u64> p3_targets{};
         // The back's: its waits for the stage after a run's end, before its next packet.
         alignas(64) std::atomic<u64> idle_waits{};
         std::atomic<u64> idle_ns{};
         std::array<std::atomic<u64>, 2> served_takes{}; ///< [found writes]
         std::atomic<u64> records_applied{};
+        std::array<std::atomic<u64>, 2> p3_back_syncs{}; ///< [from a record's targets]
         // The front's: puller releases [timestamped unmapped, mapped, fence unmapped, mapped].
         alignas(64) std::array<std::atomic<u64>, 4> front_releases{};
     };

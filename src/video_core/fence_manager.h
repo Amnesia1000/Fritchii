@@ -800,8 +800,26 @@ private:
         const bool texture_idle = fast != 0 && !texture_cache.MayHaveAsyncFlushWork();
         // FRITCHII_MEMSTAGE_MARKS_AHEAD: a played packet's marks still to promote may queue a
         // download: the half runs then.
-        const bool buffer_idle = fast != 0 && !buffer_cache.MayHaveUncommittedFlushes() &&
-                                 !buffer_cache.AheadDue();
+        bool buffer_idle = fast != 0 && !buffer_cache.MayHaveUncommittedFlushes() &&
+                           !buffer_cache.AheadDue();
+        // FRITCHII_MEMSTAGE_PASS bit 2 (fable_stage_p3 5.2): served, the fence of an entry GPUMem
+        // passed with P3's record (a release closure, a 3D fence report). The buffer half is
+        // skipped on the note whatever FRITCHII_FENCE_COMMIT_FAST says, so the back stays out of
+        // the buffer cache: GPUMem passed the entry only with no uncommitted flush (rule C), so a
+        // set note there is a must-be-0 (PassFlushes; with marks ahead the back commits here under
+        // the lock, levelpoints 14.7). It then commits as today. Any other served fence (a read
+        // flush's own) runs as before.
+        if (MemoryStageLink::BackServed()) [[unlikely]] {
+            const auto* const record = MemoryStageLink::Get().BackCurrentPassRecord();
+            if (record != nullptr && record->sync) {
+                if (!buffer_cache.MayHaveUncommittedFlushes() && !buffer_cache.AheadDue()) {
+                    buffer_idle = true;
+                } else if (!buffer_cache.MarksAhead()) {
+                    MemoryStageLink::Note(MemoryStageLink::Check::PassFlushes,
+                                          "FenceManager::CommitCacheFlushes");
+                }
+            }
+        }
         if (fast != 0) [[unlikely]] {
             NoteFenceCommitFast(fast, texture_idle, buffer_idle);
         }

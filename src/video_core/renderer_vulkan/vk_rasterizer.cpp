@@ -1370,6 +1370,46 @@ void RasterizerVulkan::SetRingBackend() {
         }
         return static_cast<u8>(Link::P3Outcome::Passed);
     };
+    backend.sync_targets = [](void* context, const std::pair<u64, u64>* runs, size_t count,
+                              Link::SyncTarget* out) -> u8 {
+        // FRITCHII_MEMSTAGE_PASS bit 2 (fable_stage_p3 4.2), GPUMem outside any fill, at the
+        // entry's place in the cache's order (every fill before it done, none after it): the
+        // query result sync's lookups, here instead of on the back. Every run is tested first;
+        // only when each is a pure lookup (an existing buffer holds it, no page of it is
+        // CPU-modified or untracked) is the sync's own ObtainCPUBuffer called on each, which then
+        // finds that buffer, walks nothing to upload and marks the usage, as on THREAD 0 (the
+        // mark keeps a later upload of those bytes after the query's copy in the submission).
+        // Accurate fences are refused before this (FindBuffer would wait there).
+        auto& cache = static_cast<RasterizerVulkan*>(context)->buffer_cache;
+        using Probe = std::remove_cvref_t<decltype(cache)>::SyncProbe;
+        const Link::CleanPoint clean;
+        std::scoped_lock lock{cache.mutex};
+        for (size_t i = 0; i < count; ++i) {
+            switch (cache.ProbeSyncTarget(runs[i].first, runs[i].second)) {
+            case Probe::Pure:
+                break;
+            case Probe::NoBuffer:
+                return static_cast<u8>(Link::P3Outcome::NoBuffer);
+            case Probe::NotInBounds:
+                return static_cast<u8>(Link::P3Outcome::NotInBounds);
+            case Probe::CpuModified:
+                return static_cast<u8>(Link::P3Outcome::CpuModified);
+            }
+        }
+        for (size_t i = 0; i < count; ++i) {
+            const auto [buffer, offset] = cache.ObtainCPUBuffer(
+                runs[i].first, static_cast<u32>(runs[i].second),
+                VideoCommon::ObtainBufferSynchronize::FullSynchronize,
+                VideoCommon::ObtainBufferOperation::DoNothing);
+            out[i] = Link::SyncTarget{
+                .begin = runs[i].first,
+                .bytes = runs[i].second,
+                .buffer = std::bit_cast<u64>(buffer->Handle()),
+                .offset = offset,
+            };
+        }
+        return static_cast<u8>(Link::P3Outcome::Passed);
+    };
     Link::Get().SetRingBackend(backend);
 }
 
@@ -5459,10 +5499,15 @@ void RasterizerVulkan::WaitForIdle() {
 
     // FRITCHII_MEMSTAGE_PASS (fable_stage_levelpoints 6.5): served, this is a passed entry's
     // wait for idle, whose mirror said no query sync could be pending (rule Q): one here would
-    // sync through the buffer cache on the back (must be 0; it then runs as today).
+    // sync through the buffer cache on the back (must be 0; it then runs as today). Bit 2 (P3,
+    // fable_stage_p3 5.5): unless GPUMem resolved the sync's buffers in the entry's record, which
+    // SyncValues then uses (and checks: PassSyncTarget).
     if (VideoCommon::MemoryStageLink::BackServed() && query_cache.HasPendingSync()) [[unlikely]] {
-        VideoCommon::MemoryStageLink::Note(VideoCommon::MemoryStageLink::Check::PassQuerySync,
-                                           "RasterizerVulkan::WaitForIdle");
+        const auto* const record = VideoCommon::MemoryStageLink::Get().BackCurrentPassRecord();
+        if (record == nullptr || !record->sync) {
+            VideoCommon::MemoryStageLink::Note(VideoCommon::MemoryStageLink::Check::PassQuerySync,
+                                               "RasterizerVulkan::WaitForIdle");
+        }
     }
     query_cache.NotifyWFI();
 
