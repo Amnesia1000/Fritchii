@@ -672,11 +672,13 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
             },
         .bound_programs =
             [](void* argument) {
-                const auto* const maxwell = static_cast<RasterizerVulkan*>(argument)->maxwell3d;
-                if (maxwell == nullptr) {
+                // The bound channel's engine, not `maxwell3d`: with one follower at step 4 that
+                // names R's view engine while R plays a draw, and this runs on E (ApplyDue).
+                const auto* const rasterizer = static_cast<RasterizerVulkan*>(argument);
+                if (rasterizer->channel_state == nullptr) {
                     return std::array<u64, 2>{};
                 }
-                const auto& regs = maxwell->regs;
+                const auto& regs = rasterizer->channel_state->maxwell3d.regs;
                 return std::array<u64, 2>{
                     (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) |
                         regs.pipelines[1].reserved[1],
@@ -700,14 +702,16 @@ void RasterizerVulkan::OneFollowerLendDraw(bool is_indexed, u32 instance_count) 
         return;
     }
     // Steps 1 and 2: every draw lent. The draw's kind, from E's engine (UnlendKind), for the
-    // counters and the draw span.
-    const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    // counters and the draw span. The channel's engine, as everywhere on E (`maxwell3d` names R's
+    // view while R plays a draw at step 4).
+    const Tegra::Engines::Maxwell3D& engine = channel_state->maxwell3d;
+    const auto& draw_state = engine.draw_manager.draw_state;
     using DrawMode = Tegra::Engines::Maxwell3D::DrawManager::DrawMode;
     u32 kind;
     if (!is_indexed && Tegra::Nx2IndirectGrid::AnyLive() &&
         Tegra::Nx2IndirectGrid::LooksLikeDrawPlaceholder(draw_state.vertex_buffer.count)) {
         kind = OneF::GpuCount;
-    } else if (maxwell3d->regs.IsMeshEnabled()) {
+    } else if (engine.regs.IsMeshEnabled()) {
         kind = OneF::Mesh;
     } else if (draw_state.draw_mode == DrawMode::InlineIndex ||
                !draw_state.inline_index_draw_indexes.empty()) {
@@ -5622,6 +5626,9 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
 }
 
 void RasterizerVulkan::Nx2ApplyRunaheadChunk(const VideoCommon::Runahead::Chunk& chunk) {
+    // One follower: runs on E (Runahead::ApplyDue) and touches the texture and pipeline caches,
+    // which are R's: lent like OnCacheInvalidations.
+    ONEF_LEND(Invalidation, Nx2ApplyRunaheadChunk(chunk))
     // As OnCacheInvalidations, with the buffer cache taking the chunk's bytes instead of a mark.
     std::vector<std::pair<DAddr, u64>> ranges;
     ranges.reserve(chunk.ranges.size());
@@ -6816,6 +6823,8 @@ bool RasterizerVulkan::SupportsGameDlssNetwork() const {
 
 std::optional<VideoCore::GameDlssProbe> RasterizerVulkan::ProbeGameDlssOutput(
     const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst) {
+    // One follower: Fermi2D asks on E; the texture cache is R's.
+    ONEF_LEND_RESULT(Copy, ProbeGameDlssOutput(src, dst))
     std::scoped_lock lock{texture_cache.mutex};
     return texture_cache.ProbeGameDlssOutput(dst, src);
 }
