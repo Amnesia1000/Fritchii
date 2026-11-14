@@ -277,8 +277,12 @@ bool OneFollowerDraw::FillRing(Maxwell3D& engine, GraphicsPipeline* pipeline, bo
                                u64 position, u64 seq, u64& buffer_number, LentReason& reason) {
     auto& r = rasterizer;
     reason = LentReason::Transient;
-    VideoCommon::MemStageShadow::ProgramId program_id;
-    VideoCommon::MemStageShadow::BackProgramId(engine, program_id);
+    VideoCommon::MemStageShadow::ProgramId program_id{};
+    // fable_b 14.4 cut 4: with E's pipeline (rule 3) nothing looks the facts up by program id;
+    // it only names the fill in ReportDescriptorMismatch's record (left 0 then).
+    if (pipeline == nullptr) {
+        VideoCommon::MemStageShadow::BackProgramId(engine, program_id);
+    }
     // Rule 3: the pipeline E looked up gives the layout itself, as stage off's own fill takes
     // it (MemFacts). Else join 1 (spec 4.4): the facts R published for these programs.
     const MemStage::DrawFacts pipeline_facts =

@@ -151,6 +151,7 @@ enum class Zone : u32 {
     FrontMethods, ///< Of push and resume pending: a GP entry's methods (ProcessCommands; macros out)
     Publish,      ///< The split's publishes (GpuSplit::Publish; the wakes out)
     PublishWake,  ///< Of publish: a wake of the sleeping back or GPUMem (notify)
+    OnefParked,   ///< One follower: E parked in a lend (it waits for R to play the call)
     Count,
 };
 
@@ -179,7 +180,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "rest tail", "inline upload", "dispatch fill", "qmd signal",
     "setup window", "setup program", "setup level tests", "setup lock", "setup inputs",
     "setup handle values", "fill ranges", "fill bind setup", "fill geometry", "fill stage buffers",
-    "fill packet", "front methods", "publish", "publish wake",
+    "fill packet", "front methods", "publish", "publish wake", "parked in lends",
 };
 static_assert(zone_names.back() != nullptr, "a zone without a name");
 

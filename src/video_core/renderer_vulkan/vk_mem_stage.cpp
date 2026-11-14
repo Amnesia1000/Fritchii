@@ -598,12 +598,19 @@ void MemStage::Fill::Open(Site site_, u32 index_) {
     }
     begin = stage.OwnedHere() ? stage.arena.Size() : 0;
     t_site = site;
-    SeamHook::g_watch.fetch_add(1, std::memory_order_relaxed);
+    // One follower (fable_b 14.4 cut 3): the watch makes scheduler uses play pending entries.
+    // E never uses the scheduler (its uses are lent, "owner on E" counts one that is not), and
+    // R's uses do not play E's arena (not its owner): E's brackets leave the shared count alone.
+    if (!VideoCommon::OneFollower::OnEngineThread()) {
+        SeamHook::g_watch.fetch_add(1, std::memory_order_relaxed);
+    }
     Bump(stage.counters.site_fills[static_cast<size_t>(site)]);
 }
 
 void MemStage::Fill::Close() {
-    SeamHook::g_watch.fetch_sub(1, std::memory_order_relaxed);
+    if (!VideoCommon::OneFollower::OnEngineThread()) {
+        SeamHook::g_watch.fetch_sub(1, std::memory_order_relaxed); // as Open
+    }
     if (stage.OwnedHere()) {
         stage.CloseSection(site, index, begin);
     }

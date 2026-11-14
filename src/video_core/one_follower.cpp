@@ -37,6 +37,7 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/one_follower.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/one_follower_stats.h"
 
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
@@ -168,6 +169,12 @@ thread_local u32 t_lent_depth{};
 thread_local bool t_playing_draw{};
 /// E: the kind of the query being lent or pushed (SetQueryKind), consumed by it.
 thread_local QueryKind t_query_kind{QueryKind::Count};
+/// fable_b 14.4 cut 1: the hot-path counters (hand-overs, behind, lends by site, query kinds,
+/// invalidations) run unless LEAN without the GPU profile.
+bool CountersOn() noexcept {
+    return !g.lean || Nx2Profile::Enabled();
+}
+
 /// E: SetLendSite's name for the next Lend, consumed by it.
 thread_local const char* t_lend_site{};
 /// E's lends by call site (written on E; the 10 s line reads them on R in a frame-end lend,
@@ -952,6 +959,9 @@ void ReadSwitches() {
     g.read = true;
     using namespace VideoCore::Nx2Debug;
     g.lean = SwitchValue(g_onef_lean, "FRITCHII_ONEF_LEAN") == 1;
+    // Before E starts (ReadSwitches runs ahead of the back thread): LEAN is always at step 2 or
+    // more once it runs, and tracking from boot only marks words the first seed then covers.
+    g_track_writes_always = g.lean;
     g.on = g.lean || SwitchValue(g_onef, "FRITCHII_ONEF") == 1;
     g.pin = SwitchValue(g_onef_pin, "FRITCHII_ONEF_PIN", 1) != 0;
     if (g.lean) {
@@ -1127,8 +1137,9 @@ void Lend(LentOp op, LentReason reason, void (*function)(void*), void* argument)
     const StepLevel step = Step();
     const bool timing = Stats::Timing();
     const u64 begin = timing ? Stats::Now() : 0;
-    const u64 begin_clock = Common::Nx2Hitch::NowNs();
-    const u64 behind = Behind();
+    const bool counting = CountersOn();
+    const u64 begin_clock = counting ? Common::Nx2Hitch::NowNs() : 0;
+    const u64 behind = counting ? Behind() : 0;
     const u64 number = ++g.pushed;
     u8* const buffer = PackBuffer();
     std::size_t spans_bytes = 0;
@@ -1157,14 +1168,26 @@ void Lend(LentOp op, LentReason reason, void (*function)(void*), void* argument)
     header.bytes = static_cast<u32>(sizeof(PacketHeader) + spans_bytes);
     std::memcpy(buffer, &header, sizeof(header));
     Commit(buffer, header.bytes, number, header.position, false);
-    Stats::Pushed(header, kind, behind);
-    // The park: R plays everything before, runs the call, releases E.
+    if (counting) {
+        Stats::Pushed(header, kind, behind);
+    }
+    // The park: R plays everything before, runs the call, releases E. Its own profile zone
+    // (fable_b 14.1): without it the park landed in whatever zone the lend was made in ("other"
+    // for a call entry, "method" for a method's).
     g.e_wait_op.store(static_cast<u8>(op), std::memory_order_relaxed);
-    EngineWait([&] { return g.played.load(std::memory_order_acquire) >= number; }, EWait::Park,
-               number);
-    const u64 parked_ns = Common::Nx2Hitch::NowNs() - begin_clock;
-    NoteLendSite(op, parked_ns);
-    if (op == LentOp::Query && t_query_kind != QueryKind::Count) {
+    {
+        const Nx2Profile::Scope parked_zone{Nx2Profile::Zone::OnefParked};
+        EngineWait([&] { return g.played.load(std::memory_order_acquire) >= number; },
+                   EWait::Park, number);
+    }
+    const u64 parked_ns = counting ? Common::Nx2Hitch::NowNs() - begin_clock : 0;
+    if (counting) {
+        NoteLendSite(op, parked_ns);
+    } else {
+        t_lend_site = nullptr;
+        t_query_kind = QueryKind::Count; // consumed uncounted
+    }
+    if (counting && op == LentOp::Query && t_query_kind != QueryKind::Count) {
         const size_t kind_index = static_cast<size_t>(t_query_kind);
         g.query_count[kind_index].fetch_add(1, std::memory_order_relaxed);
         g.query_parked_ns[kind_index].fetch_add(parked_ns, std::memory_order_relaxed);
@@ -1350,6 +1373,9 @@ void StampPageWrites(u64 address, u64 size) noexcept {
 }
 
 void CountInvalidation(InvalKind kind) noexcept {
+    if (!CountersOn()) {
+        return;
+    }
     g.inval_count[static_cast<size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -1409,13 +1435,17 @@ void SetQueryKind(QueryKind kind) noexcept {
 }
 
 void CountQueryKind(QueryKind kind) noexcept {
+    if (!CountersOn()) {
+        return;
+    }
     g.query_count[static_cast<size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
 }
 
 namespace {
 /// E: commits a packet whose body (`body_bytes` after the header) is already in PackBuffer().
 void PushPacked(PacketHeader& header, u8* buffer, std::size_t body_bytes) {
-    const u64 behind = Behind();
+    const bool counting = CountersOn();
+    const u64 behind = counting ? Behind() : 0;
     header.number = ++g.pushed;
     header.position = GpuSplit::Get().BackEntryPosition();
     if (header.draw_seq == 0) {
@@ -1426,7 +1456,9 @@ void PushPacked(PacketHeader& header, u8* buffer, std::size_t body_bytes) {
     t_next_draw_set = false;
     std::memcpy(buffer, &header, sizeof(header));
     Commit(buffer, header.bytes, header.number, header.position, true);
-    Stats::Pushed(header, kind, behind);
+    if (counting) {
+        Stats::Pushed(header, kind, behind);
+    }
 }
 } // Anonymous namespace
 
