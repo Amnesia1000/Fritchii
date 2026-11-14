@@ -211,7 +211,11 @@ void LoadExperiments() {
         // EXP12=3 verify: met there = met after the drain; no prediction error. Owner's kill
         // playtest with both on: never under 48 fps, picture clean.
         g_experiments[13].store(4, std::memory_order_relaxed);
-        g_experiments[12].store(2, std::memory_order_relaxed);
+        // EXP12 = 4 (2026-11-14, owner's call after watching the market toggle): the fence path
+        // suspends without waiting for every queued compute/copy writer first (exact: the waiter
+        // latch and the resume path decide, as after mode 2's wait). With EDEN_NX2_GPU_WAKE=1
+        // (built in with it): 59.3 -> 59.8 fps, 0.1% low 31.7 -> 37.0, the owner rarely saw <50.
+        g_experiments[12].store(4, std::memory_order_relaxed);
         // EXP49 = 1 (2026-11-10, owner's call for v5.7): the async read-back. Stalchild fight,
         // flipped every 30 s while the owner fought: 51.9 -> 56.9 fps, the back's read flushes
         // 35 -> 6 ms/s, guest lock waits halved. No beams in that session or two later ones
