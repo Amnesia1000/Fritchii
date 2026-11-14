@@ -649,6 +649,14 @@ when the device is made.
 FRITCHII_MEMSTAGE_SEAM_STATS=1 (boot, diagnostic): the memory seam's stats line (EXP123) every
 10 s also with EXP123 = 0, which shows what the seam carries at today's timing.
 
+Without it, and without FRITCHII_MEMSTAGE_TICKS, EXP123 = 0 runs the seam lean (no switch): a fill
+bracket only counts its depth (no arena claim, no watch on the scheduler, no site counts), and the
+stats counts are skipped. Entries that run as pushed (EXP123 = 0, and outside a deferring bracket
+at 1 to 3) go straight to the player's typed call without being written to the scratch arena.
+The same calls in the same order: nothing defers at 0, so what the lean drops is the deferring
+modes' checks and the stats. With SEAM_STATS set, EXP123 = 0 keeps the full bracket, so its line
+still counts the records inside fills.
+
 ### FRITCHII_MEMSTAGE_READ_LOG
 
 FRITCHII_MEMSTAGE_READ_LOG=N (boot, diagnostic, default 0 = off; the memory stage's sub-step 2b,
@@ -1450,6 +1458,28 @@ dual-source bit are compared with the key's: equal keeps the pipeline without a 
 different patches only the blend part of the key. Reads the registers, so the ported change's writes
 without the flag are still caught. Logs "saved by the blend value check" and why the other
 lookups refreshed in "EDEN_NX2_PIPELINE_CLEAN per second". Off by default, not measured yet.
+
+### FRITCHII_PIPELINE_KEY_HASH
+
+FRITCHII_PIPELINE_KEY_HASH (live, default 0): the graphics pipeline lookup after a key change
+(GraphicsPipeline::Next: the current pipeline's key, then each transition's, a full key compare
+each) compares a 64-bit fingerprint of the keys first (GraphicsPipelineCacheKey::Fingerprint,
+over exactly the bytes the key compare reads) and runs the full compare only where the
+fingerprints match.
+
+- 0: Next as before.
+- 1: fingerprints first. The pipelines' fingerprints are made once (their keys never change),
+  the current key's once per lookup, from the key as the lookup has it.
+- 2: both, Next's answer kept; the answers that differ are counted (must be 0) and the first 16
+  logged.
+
+Exact: equal keys have equal fingerprints, so a candidate skipped by its fingerprint is one the
+full compare rejects, and the candidates are tried in Next's order. Works with or without
+EDEN_NX2_PIPELINE_CLEAN, EXP52 and EXP55 (they decide when the lookup runs, this how it compares).
+
+Counts, one line every 10 s while on: "Pipeline key hash": lookups/s, keys looked at (and per
+lookup), full compares, compares skipped by the fingerprint, fingerprint matches with another key,
+and the verify's checked / differ.
 
 ### EXP22
 

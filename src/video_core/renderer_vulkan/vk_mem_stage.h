@@ -332,19 +332,40 @@ public:
     };
 
     /// A fill bracket: with SEAM on, the entries pushed inside wait for a play.
+    /// The seam lean (Lean(): EXP123 = 0, no packet ticks, no stats line): the bracket only keeps
+    /// this thread's fill depth; nested brackets follow their outermost one (t_fill_lean).
     class Fill {
     public:
-        Fill(MemStage& stage, Site site, u32 index = 0);
-        ~Fill();
+        Fill(MemStage& stage_, Site site_, u32 index_ = 0) : stage{stage_} {
+            if (t_fill_depth++ == 0) {
+                t_fill_lean = stage_.lean.load(std::memory_order_relaxed);
+            }
+            lean = t_fill_lean;
+            if (!lean) [[unlikely]] {
+                Open(site_, index_);
+            }
+        }
+        ~Fill() {
+            if (lean) [[likely]] {
+                --t_fill_depth;
+                return;
+            }
+            Close();
+        }
         Fill(const Fill&) = delete;
         Fill& operator=(const Fill&) = delete;
 
     private:
+        /// The full bracket (t_fill_depth already counts this one) and its end.
+        void Open(Site site_, u32 index_);
+        void Close();
+
         MemStage& stage;
-        Site site;
-        u32 index;
-        Site previous_site;
+        Site site{};
+        u32 index{};
+        Site previous_site{};
         u32 begin{};
+        bool lean{};
         bool reads{}; ///< This bracket started an operation packet's read log
         bool stage_op{}; ///< Step 7: GPUMem's operation, opened with its mark (stamps per thread)
         std::optional<VideoCommon::Nx2Profile::Scope> zone;
@@ -353,10 +374,12 @@ public:
     /// A fill bracket that plays what it filled when it ends.
     class FillPlay {
     public:
-        FillPlay(MemStage& stage_, Site site, u32 index = 0) : stage{stage_} {
-            fill.emplace(stage_, site, index);
+        FillPlay(MemStage& stage_, Site site, u32 index = 0)
+            : stage{stage_}, fill{std::in_place, stage_, site, index} {}
+        ~FillPlay() {
+            fill.reset();
+            stage.PlayIfOwned();
         }
-        ~FillPlay();
         FillPlay(const FillPlay&) = delete;
         FillPlay& operator=(const FillPlay&) = delete;
 
@@ -396,7 +419,7 @@ public:
         struct PlayAtEnd {
             MemStage& stage;
             ~PlayAtEnd() {
-                stage.Play();
+                stage.PlayIfOwned();
             }
         } play{*this};
         Fill bracket{*this, site};
@@ -405,6 +428,13 @@ public:
 
     /// Plays every pending entry this thread pushed.
     void Play();
+    /// Play, without the call when no thread owns the arena: Play does nothing then (it plays only
+    /// for the owner, and no thread's identity is 0). The seam lean's brackets claim nothing.
+    void PlayIfOwned() {
+        if (owner.load(std::memory_order_relaxed) != 0) {
+            Play();
+        }
+    }
 
     void BeginDraw(u32 repack_mask, u32 repack_dirty);
     /// The repack layout of the draw BeginDraw opened (GPUMem opens it first, step 7).
@@ -702,6 +732,10 @@ private:
 
     inline static thread_local ReadLog* t_log = nullptr;
 
+    /// Fill brackets open on this thread, and whether the outermost one opened lean (Fill).
+    inline static thread_local u32 t_fill_depth = 0;
+    inline static thread_local bool t_fill_lean = false;
+
     /// A device range a held fill read (any kind), for the texture write check.
     struct ReadRange {
         u64 begin;
@@ -779,6 +813,9 @@ private:
     };
 
     void PushParts(Cmd kind, u8 flags, u32 count, std::initializer_list<Part> parts);
+    /// An entry that runs as pushed (not Deferring): its typed play, with PushParts's checks.
+    template <typename PlayFn>
+    void RunNow(Cmd kind, PlayFn&& play);
     void CountPush(Cmd kind) noexcept;
     [[nodiscard]] bool Deferring() const noexcept;
     [[nodiscard]] bool OwnedHere() const noexcept;
@@ -824,6 +861,9 @@ private:
     std::atomic<uintptr_t> owner{0};
     std::atomic<bool> seam_on{false};
     std::atomic<int> seam_value{0};
+    /// The seam lean (TickFrame): SEAM 0, no packet ticks, no stats line. Brackets keep only their
+    /// depth, and entries pushed at once skip the stats counts.
+    std::atomic<bool> lean{false};
     std::atomic<bool> tracker_record{false};
     /// FRITCHII_MEMSTAGE_READ_LOG: every Nth packet's reads are compared, 0 off
     int read_log_every{};
@@ -1126,6 +1166,16 @@ public:
 
     void Exec(const MemStage::Entry& entry);
 
+    /// The typed plays Exec decodes these kinds to; an entry run as pushed calls them directly.
+    void PlayCopy(MemStage::Cmd kind, u8 flags, VkBuffer src_buffer, VkBuffer dst_buffer,
+                  std::span<const VkBufferCopy> copies);
+    void PlayIndex(MemStage::Cmd kind, u8 flags, VkBuffer vk_buffer, VkDeviceSize vk_offset,
+                   VkIndexType vk_index_type);
+    void PlayVertex(u8 flags, u32 index, VkBuffer buffer, u32 offset, u32 size, u32 stride);
+    void PlayVertices(u8 flags, u32 first, u32 binding_count, const VkBuffer* handles,
+                      const VkDeviceSize* offsets, const VkDeviceSize* sizes,
+                      const VkDeviceSize* strides);
+
     void AddDescriptors(const DescriptorUpdateEntry* entries, size_t count);
 
     /// The remembered index and vertex buffers are forgotten (SEAM changed).
@@ -1167,6 +1217,8 @@ public:
 private:
     friend class MemStage;
 
+    /// Every play's start: the player check and the flag's render pass exit.
+    void BeginPlay(u8 flags);
     void EnsureListKeepBuffer();
 
     const Device& device;

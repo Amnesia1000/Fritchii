@@ -8,7 +8,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -53,6 +55,38 @@ struct GraphicsPipelineCacheKey {
 
     size_t Size() const noexcept {
         return sizeof(unique_hashes) + state.Size();
+    }
+
+    /// FRITCHII_PIPELINE_KEY_HASH: a cheap hash of exactly the bytes operator== compares (the
+    /// first Size() bytes; Size() is read from raw1, which those bytes hold, so equal keys hash
+    /// the same). Two rotate-xor lanes over 8-byte words, mixed at the end: keys of one size that
+    /// differ in one word never hash the same. A prefilter only: the full compare decides.
+    u64 Fingerprint() const noexcept {
+        const size_t size = Size();
+        const u8* const bytes = reinterpret_cast<const u8*>(this);
+        u64 lane_a = 0;
+        u64 lane_b = 0;
+        size_t at = 0;
+        for (; at + 16 <= size; at += 16) {
+            u64 word_a;
+            u64 word_b;
+            std::memcpy(&word_a, bytes + at, sizeof(word_a));
+            std::memcpy(&word_b, bytes + at + 8, sizeof(word_b));
+            lane_a = std::rotl(lane_a, 5) ^ word_a;
+            lane_b = std::rotl(lane_b, 7) ^ word_b;
+        }
+        if (at + 8 <= size) {
+            u64 word;
+            std::memcpy(&word, bytes + at, sizeof(word));
+            lane_a = std::rotl(lane_a, 5) ^ word;
+            at += 8;
+        }
+        if (at < size) {
+            u64 word = 0;
+            std::memcpy(&word, bytes + at, size - at);
+            lane_b = std::rotl(lane_b, 7) ^ word;
+        }
+        return (lane_a * 0x9e3779b97f4a7c15ULL) ^ (lane_b * 0xc2b2ae3d27d4eb4fULL) ^ size;
     }
 };
 static_assert(std::has_unique_object_representations_v<GraphicsPipelineCacheKey>);
@@ -339,6 +373,42 @@ public:
                                            : nullptr;
     }
 
+    /// What Next tests, in Next's order (FRITCHII_PIPELINE_KEY_HASH counts them).
+    struct NextCounts {
+        u64 candidates{}; ///< Keys looked at (this pipeline's and the transitions')
+        u64 compared{};   ///< Fingerprints that matched: the full key compare ran
+        u64 collisions{}; ///< ... and the keys differed
+    };
+
+    /// Next with the fingerprints first (FRITCHII_PIPELINE_KEY_HASH): `current_hash` is
+    /// current_key.Fingerprint(). Equal keys have equal fingerprints, so a candidate whose
+    /// fingerprint differs is one Next's compare rejects; the others get Next's compare. The same
+    /// candidates in the same order: the same answer.
+    [[nodiscard]] GraphicsPipeline* NextHashed(const GraphicsPipelineCacheKey& current_key,
+                                               u64 current_hash, NextCounts& counts) noexcept {
+        ++counts.candidates;
+        if (key_hash == current_hash) {
+            ++counts.compared;
+            if (key == current_key) {
+                return this;
+            }
+            ++counts.collisions;
+        }
+        const size_t count = transition_hashes.size();
+        counts.candidates += count;
+        for (size_t i = 0; i < count; ++i) {
+            if (transition_hashes[i] != current_hash) {
+                continue;
+            }
+            ++counts.compared;
+            if (transition_keys[i] == current_key) {
+                return transitions[i];
+            }
+            ++counts.collisions;
+        }
+        return nullptr;
+    }
+
     /// The frame the pipeline cache last handed this pipeline out (evicts long unused ones).
     void MarkUsed(u64 frame) noexcept {
         last_use_frame = frame;
@@ -367,6 +437,7 @@ public:
     /// Forgets the transitions, which may point to pipelines the cache evicted.
     void ClearTransitions() noexcept {
         transition_keys.clear();
+        transition_hashes.clear();
         transitions.clear();
     }
 
@@ -545,6 +616,8 @@ private:
     void Validate();
 
     const GraphicsPipelineCacheKey key;
+    /// key.Fingerprint(): the key never changes (NextHashed).
+    const u64 key_hash{key.Fingerprint()};
     Tegra::Engines::Maxwell3D* maxwell3d;
     Tegra::MemoryManager* gpu_memory;
     const Device& device;
@@ -570,6 +643,9 @@ private:
     std::unique_ptr<KeptDraw> kept_draw;
 
     std::vector<GraphicsPipelineCacheKey> transition_keys;
+    /// Each transition key's Fingerprint(), kept with transition_keys (AddTransition and
+    /// ClearTransitions are their only writers).
+    std::vector<u64> transition_hashes;
     std::vector<GraphicsPipeline*> transitions;
     VideoCommon::EvictedPointerSlots::Slots mapped_pointers;
     u64 last_use_frame{};
