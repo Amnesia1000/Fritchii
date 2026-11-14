@@ -711,7 +711,12 @@ With the switch on (Vulkan's mapped uploads only):
 - Every upload that stages guest bytes for a host buffer (MappedUploadMemory, and the inline
   writes of InlineMemoryImplementation) copies them into the bank snapshots of those pages
   (RefreshNativeBankSnapshots): a snapshot holds what its page's host copy holds. A refresh that
-  changed bytes makes the page hot, as the change found at its next bind used to.
+  changed bytes makes the page hot, as the change found at its next bind used to. The bytes come
+  from cached memory, never back out of the staging buffer (write-combined: the first version
+  read it back and spent 60% of the back thread there, 59.7 -> 28.4 fps). A copy that covers no
+  snapshot page (the table's present bits, 64 pages a word) goes straight to staging as before;
+  one that does is read from guest memory once into a scratch buffer, copied to staging, and
+  compared and copied into the snapshots of the pages it covers, only the overlapping bytes.
 - When it turns on, and whenever g_collected_overflows moved, every snapshot is dropped: each
   page's next bind takes a new one and marks the page changed (as the 16384-page reset does).
 - 2: 1, and every page of the flagged slots without a reason is compared anyway (not only the
