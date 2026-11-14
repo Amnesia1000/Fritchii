@@ -692,7 +692,7 @@ The census says, for each change the check finds, what touched the page since it
 
 ### FRITCHII_BANK_FLAGGED
 
-FRITCHII_BANK_FLAGGED (live, default 0; fable_perdraw_b cut 5 step 2). The game's banks keep
+FRITCHII_BANK_FLAGGED (live, default 1 since 2026-11-14 via the built-in switches in src/yuzu/main.cpp; fable_perdraw_b cut 5 step 2). The game's banks keep
 the hot rule (every page that changed in the last 120 frames compared at every bind: ~600,000
 compares per 5 s for c6, 21.7 ms/s on the back) because writers set no flag. The census named
 them; these marks set the bank check's flags, each after its bytes landed, while the bank marks'
@@ -732,8 +732,10 @@ With the switch on (Vulkan's mapped uploads only):
 - When it turns on, and whenever g_collected_overflows moved, every snapshot is dropped: each
   page's next bind takes a new one and marks the page changed (as the 16384-page reset does).
 - 2: 1, and every page of the flagged slots without a reason is compared anyway (not only the
-  hot ones): a change is taken as any change is and counted as "missed". "missed" and
-  "disagreed" must stay 0. Costs more than the hot rule did.
+  hot ones): a change is taken as any change is and counted as "missed". "never flagged" and
+  disagreed "recheck" / "CPU-modified" must stay 0; "then flagged" and disagreed "collected" /
+  "buffer cache" are writes racing the bind (below) and grow with fps. Costs more than the hot
+  rule did.
 - "Native bank flagged (FRITCHII_BANK_FLAGGED=n, slots S, 5 s): B binds, K skipped whole, H hot
   pages not compared; verify: V compared, M missed (then flagged F, never flagged U), D
   disagreed (collected a, buffer cache b, recheck c, CPU-modified d); uploads refreshed R pages
@@ -748,7 +750,13 @@ With the switch on (Vulkan's mapped uploads only):
   them shows as a collected or buffer cache reason in the loop, and stays set for the next bind
   when the bank is skipped. Recheck or CPU-modified there would be a real disagreement. First
   verify run (market, d5d510bb9c, 26 fps): 2 missed and 5 disagreed in 28 windows of 5 s, the
-  census at the same build 1 unflagged change per 10 s, a late flag.
+  census at the same build 1 unflagged change per 10 s, a late flag. With the refresh from
+  cached bytes (0d73686ef2, 61 fps): 12 missed, all then flagged, never flagged 0, and 200
+  disagreed, all collected, in 29 windows (16x per bind: the back no longer stalls the guest, so
+  more guest stores overlap the bind loop). The refresh cannot cause either: it runs on the
+  bank check's thread under the same lock, gives the snapshot exactly the bytes it stages, and
+  touches no flag, recheck or present bit (the whole-bank skip's inputs); its present-bits gate
+  (NativeBankAnySnapshot) covers every page FindNativeBankSnapshot would find.
 
 Why no stale bank reaches a draw on a flagged slot. The bank check marks a page CPU-modified
 (so the bind's sync uploads it) when the page's guest bytes differ from its snapshot. The rule
