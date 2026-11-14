@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "common/fritchii_page_flags.h"
 
 /// EXP92 (fable52_answer_uniformkeeps 3, tier 2): what the
 /// buffer cache's uniform keeps need to know about writes to guest memory that are not the back's
@@ -180,6 +181,15 @@ inline void RecordGuestStore(u64 address, u64 size) noexcept {
 
 inline void AfterGuestStoreSlow() noexcept {
     ThreadStores& stores = t_stores;
+    // FRITCHII_BANK_FLAGGED: the collected write's page flag again, now that the bytes landed
+    // (HandleRasterizerWrite set it before the store; a bank check may have taken it, and its one
+    // recheck passed, before the bytes arrived). Always; a lost range moves the overflow count.
+    if (stores.overflow) [[unlikely]] {
+        g_collected_overflows.fetch_add(1, std::memory_order_seq_cst);
+    }
+    for (u32 i = 0; i < stores.count; ++i) {
+        g_collected_write_pages.Mark(stores.address[i], stores.size[i]);
+    }
     if (AnyKept()) {
         std::atomic_thread_fence(std::memory_order_seq_cst);
         if (stores.overflow) {

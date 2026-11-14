@@ -54,6 +54,7 @@ add_library(
     nx2_uniform_keep_pages.h
     fritchii_switch_defaults.cpp
     fritchii_write_ring.h
+    fritchii_page_flags.h
     dynamic_library.cpp
     dynamic_library.h
     elf.h

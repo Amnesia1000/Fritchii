@@ -633,25 +633,95 @@ The census says, for each change the check finds, what touched the page since it
   its bytes can land after the compare that took the flag and after the one recheck), an upload
   (UploadMemory) that read the page from guest memory after the last compare (a guest store
   between that compare and the upload: the host buffer may hold it already), a GPU write mark
-  ever on the page, and "unseen" when none of these. Per constant buffer index (c3+ are the
-  game's).
+  ever on the page, and "unseen" when no late flag, no upload and (at 2) no emulator write
+  explains it (a GPU write mark explains nothing by itself). Per constant buffer index (c3+
+  are the game's), unflagged and unseen.
 - 2: 1, and the write ring turned on (all emulator writes to game memory, with their site): the
   newest ring entry over the page since its last compare, by site and write function. The ring
-  costs every emulator write a few stores: fps are not comparable. Not together with
-  FRITCHII_MEMSTAGE_READ_LOG (the ring is left on until the census goes below 2 only when the
-  census turned it on).
+  also marks each page it records (Common::g_ring_write_pages, taken at each compare), so an
+  emulator write whose entry the ring wrapped over counts as "ring writer lost", not as
+  unseen. The ring costs every emulator write a few stores: fps are not comparable. Not
+  together with FRITCHII_MEMSTAGE_READ_LOG (the ring is left on until the census goes below 2
+  only when the census turned it on).
 - When no change is found it adds one flag take and two stores per compared page (one more
   shared load at 2), and one load per upload. At 0, one load per bank bind.
 - "Native bank census (FRITCHII_BANK_CENSUS=n, 10 s): changes: collected C, buffer cache W,
   recheck R, CPU-modified M, hot H, frame check F, verify only V (slot skip missed S); unflagged
   U: flag taken <=4 / <=32 / <=256 / more / never binds before a / b / c / d / e (late flag L, of
   them buffer cache B), uploaded since the last compare P (that compare CPU-modified Q), ever
-  GPU-written G, ring writer X (ring wrapped Y), unseen N (first compare this frame N1); slots:
-  cK n ... | site / via: n ..." (HW_GPU, Info). Counts start at the census' first bind; pages
-  first seen before it count their flags from their next compare.
-- What it must show before a slot can drop the hot rule (FRITCHII_BANK_FLAGGED, not written):
-  "unseen" 0 and no ring writer that sets no flag. Late flags are closed by a flag set after the
-  store lands; uploaded-since changes by marking the page for a compare at its next bind.
+  GPU-written G, ring writer named X, ring writer lost Z (ring wrapped Y), unseen N (first
+  compare this frame N1, ever GPU-written N2); slots (unflagged / unseen): cK n / u ... | site /
+  via: n ..." (HW_GPU, Info). Counts start at the census' first bind; pages first seen before
+  it count their flags from their next compare.
+- First run (market, build 5ffb7a1d35, 2): ~1,385 unflagged changes per 10 s, c6 1,362, c7 16;
+  ring writer 1,044-1,072, all "GPU write: query-completion" (report values the query cache
+  writes into the game's c6 bank when a host query completes, which set no bank flag);
+  uploaded since the compare ~1,005; late flag 7-8; unseen 8-9 with 322-334 ring wraps. Fixed
+  by FRITCHII_BANK_FLAGGED's always-on marks (below).
+
+### FRITCHII_BANK_FLAGGED
+
+FRITCHII_BANK_FLAGGED (live, default 0; fable_perdraw_b cut 5 step 2). The game's banks keep
+the hot rule (every page that changed in the last 120 frames compared at every bind: ~600,000
+compares per 5 s for c6, 21.7 ms/s on the back) because writers set no flag. The census named
+them; these marks now set the bank check's flags always (also at 0), each after its bytes
+landed:
+- the write ring's Note (every emulator write to game memory, any thread: query completions,
+  immediate and semi-flush report writes, device and GPU block writes, span stores, our own
+  constant buffer words, downloads, DMA, blits) marks g_buffer_write_pages;
+- MemoryManager::Write (the 3D engine's stamps, compute and QMD releases) marks it;
+- unsafe guest memory writes (Core::Memory::WriteBlockUnsafe) and in-place span stores
+  (GuestMemoryScoped, Core::Memory::NoteHostStore) on rasterizer-cached pages go through the
+  ring's Note now always, not only while the ring or a uniform keep was on;
+- the guest store's after-store point (UniformKeepPages::AfterGuestStore) marks
+  g_collected_write_pages again for the ranges HandleRasterizerWrite recorded before the store.
+  A store whose ranges did not fit (more than 4) moves Common::g_collected_overflows.
+At 0 these only add compares that find what the hot rule would have found (or a real change no
+rule saw); nothing else changes.
+
+With the switch on (Vulkan's mapped uploads only):
+- 1: the constant buffer indices of FRITCHII_BANK_FLAGGED_SLOTS (live, bit n = cn, default 0x40
+  = c6, the only slot the first census measured) get EDEN_NX2_BANK_SLOTS' rule: no hot rule,
+  and a bank with no flag, no recheck, no CPU-modified page and every page snapshotted is
+  skipped whole. Not while CPU inner invalidation is skipped.
+- Every upload that stages guest bytes for a host buffer (MappedUploadMemory, and the inline
+  writes of InlineMemoryImplementation) copies them into the bank snapshots of those pages
+  (RefreshNativeBankSnapshots): a snapshot holds what its page's host copy holds. A refresh that
+  changed bytes makes the page hot, as the change found at its next bind used to.
+- When it turns on, and whenever g_collected_overflows moved, every snapshot is dropped: each
+  page's next bind takes a new one and marks the page changed (as the 16384-page reset does).
+- 2: 1, and every page of the flagged slots without a reason is compared anyway (not only the
+  hot ones): a change is taken as any change is and counted as "missed". "missed" and
+  "disagreed" must stay 0. Costs more than the hot rule did.
+- "Native bank flagged (FRITCHII_BANK_FLAGGED=n, slots S, 5 s): B binds, K skipped whole, H hot
+  pages not compared; verify: V compared, M missed, D disagreed; uploads refreshed R pages (C
+  changed); snapshots dropped N times so far" (HW_GPU, Info).
+
+Why no stale bank reaches a draw on a flagged slot. The bank check marks a page CPU-modified
+(so the bind's sync uploads it) when the page's guest bytes differ from its snapshot. The rule
+compares a page only when a flag, a recheck or the tracker's CPU-modified state says so. So it
+is exact if (a) the snapshot equals the host copy whenever no flag is pending, and (b) every
+change of the page's guest bytes is followed by a flag or CPU-modified state that a later bind
+sees. Every bind ordered after the write sees it: flags are set after the bytes land, a flag
+is cleared only by the Take that reads it before the compare, and a mark that is set after a
+Take's look stays set for the next one. A bind that runs at the same time as the write and is
+not ordered after it may run before the mark, and so before the bytes; the hot rule saw such a
+write only when the timing happened to fall its way. (a): snapshots are taken from guest memory
+and the page marked changed, so the sync uploads at least those bytes; after that every upload
+or inline write copies the bytes it gave the host into the snapshot. GPU-written pages are not
+checked (the bind skips the bank while any of its range is GPU-modified). (b), writer by writer:
+- guest CPU stores to protected pages trap: HandleRasterizerWrite marks before the store, the
+  after-store point marks again after it (the late landings the census saw, 7-8 per 10 s);
+- guest CPU stores to unprotected pages: the page is CPU-modified until a sync re-protects it
+  (protection is set before the upload reads the bytes, so a store after the read traps);
+- every emulator write the write ring hears of (the ring's contract: every write emulator code
+  makes to game memory, after it landed) and every MemoryManager::Write;
+- our own constant buffer words: the ring's Note at the write, and WriteMemory at FlushCaching.
+What is not covered is a writer outside all of these: a guest store through a mapping the
+rasterizer does not protect, or emulator code storing through a raw pointer without a Note. The
+census at 2 counts those as "unseen" per slot, which is why a slot goes into
+FRITCHII_BANK_FLAGGED_SLOTS only after a census run shows unseen 0 for it, and why =2 compares
+every page.
 
 ### EDEN_NX2_TEX_BANK_GEN
 

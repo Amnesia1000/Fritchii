@@ -374,10 +374,10 @@ struct Memory::Impl {
             }
             std::memcpy(ptr, reinterpret_cast<u8 const*>(buffer) + offset, copy_amount);
             VideoCommon::WriteTrack::CloseIfArmed();
-            // EXP92: the after-store point (unsafe writes recorded nothing: noted here).
+            // EXP92: the after-store point (unsafe writes recorded nothing: noted here, always:
+            // the write ring's Note marks the native bank check's flag, FRITCHII_BANK_FLAGGED).
             Common::UniformKeepPages::AfterGuestStore();
-            if (unsafe && (Common::UniformKeepPages::AnyKept() ||
-                           Common::WriteRing::g_on.load(std::memory_order_relaxed))) [[unlikely]] {
+            if (unsafe) [[unlikely]] {
                 NoteUnrecordedStore(GetInteger(current_vaddr), copy_amount);
             }
         });
@@ -1110,8 +1110,9 @@ struct Memory::Impl {
     }
 
     /// EXP92: a store to a rasterizer-cached page that HandleRasterizerWrite did not see
-    /// (WriteBlockUnsafe), after the bytes landed: noted for the uniform keeps by device address.
-    /// Only once a keep was ever made. Its own scratch buffer: any thread may call it.
+    /// (WriteBlockUnsafe, in-place span stores), after the bytes landed: noted for the uniform
+    /// keeps and the write ring (whose Note marks the native bank check's flag) by device
+    /// address. Its own scratch buffer: any thread may call it.
     void NoteUnrecordedStore(VAddr v_address, size_t size) {
         const auto* p = GetPointerImpl(
             v_address, []() {}, []() {});
@@ -1329,6 +1330,21 @@ bool Memory::WriteBlock(const Common::ProcessAddress dest_addr, const void* src_
 bool Memory::WriteBlockUnsafe(const Common::ProcessAddress dest_addr, const void* src_buffer,
                               const std::size_t size) {
     return impl->WriteBlockImpl(dest_addr, src_buffer, size, true);
+}
+
+void Memory::NoteHostStore(u64 dest_addr, std::size_t size) {
+    // Page by page: each CPU page has its own backing. Only rasterizer-cached pages: the others
+    // are CPU-modified in the buffer cache's tracker or held by no buffer.
+    const u64 end = dest_addr + size;
+    for (u64 page = dest_addr; page < end;) {
+        const u64 next = (std::min<u64>)(end, (page & ~u64{YUZU_PAGEMASK}) + YUZU_PAGESIZE);
+        bool cached = false;
+        (void)impl->GetPointerImpl(page, [] {}, [&cached] { cached = true; });
+        if (cached) {
+            impl->NoteUnrecordedStore(page, next - page);
+        }
+        page = next;
+    }
 }
 
 bool Memory::CopyBlock(Common::ProcessAddress dest_addr, Common::ProcessAddress src_addr,

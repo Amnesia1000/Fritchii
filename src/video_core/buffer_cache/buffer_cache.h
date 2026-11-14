@@ -3376,6 +3376,28 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
     SelectNativeBankStore();
     auto& stats = native_bank_tracked_stats;
     ++stats.binds;
+    // FRITCHII_BANK_FLAGGED (1 on, 2 verify): the slots of FRITCHII_BANK_FLAGGED_SLOTS drop the
+    // hot rule, as EDEN_NX2_BANK_SLOTS' do (the exactness argument is in docs/fritchii/
+    // switches.md). It needs every snapshot to hold what its page's host copy holds, which
+    // uploads keep from now on (RefreshNativeBankSnapshots, mapped uploads only): when it turns on
+    // every snapshot is dropped, so each page's next bind takes a new one and marks the page
+    // changed. A guest store whose range the after-store point lost (the overflow count) set no
+    // flag after its bytes landed: every snapshot is dropped then too.
+    const int flagged = USE_MEMORY_MAPS_FOR_UPLOADS
+                            ? VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_bank_flagged,
+                                                               "FRITCHII_BANK_FLAGGED")
+                            : 0;
+    if (flagged != 0) [[unlikely]] {
+        const u64 overflows = Common::g_collected_overflows.load(std::memory_order_seq_cst);
+        if (!native_bank_flagged_on || overflows != native_bank_flagged_overflows) {
+            native_bank_flagged_overflows = overflows;
+            native_bank_flagged_on = true;
+            ClearNativeBankSnapshots();
+            ++native_bank_flagged_resets;
+        }
+    } else {
+        native_bank_flagged_on = false;
+    }
     // FRITCHII_BANK_CENSUS (counters only): for each change found, what touched the page since
     // its last compare (NoteNativeBankCensusChange). 2 also turns the write ring on.
     const int census = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_bank_census,
@@ -3427,12 +3449,25 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
     const u32 own_slots = static_cast<u32>(
         VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_bank_slots, "EDEN_NX2_BANK_SLOTS",
                                          NativeBankDefaultsForOcarina() ? 0x2 : 0));
+    // FRITCHII_BANK_FLAGGED: the game's slots the census cleared (unseen 0), with the same rule.
+    const u32 flagged_slots =
+        flagged != 0 ? static_cast<u32>(VideoCore::Nx2Debug::SwitchValue(
+                           VideoCore::Nx2Debug::g_bank_flagged_slots,
+                           "FRITCHII_BANK_FLAGGED_SLOTS", 0x40))
+                     : 0;
+    const bool flagged_slot = index < 32 && ((flagged_slots >> index) & 1) != 0;
     // Not while CPU inner invalidation is skipped: our constant buffer words then set no flag.
-    const bool own_slot = index < 32 && ((own_slots >> index) & 1) != 0 &&
+    const bool own_slot = index < 32 && (((own_slots >> index) & 1) != 0 || flagged_slot) &&
                           !Settings::values.skip_cpu_inner_invalidation.GetValue();
+    // FRITCHII_BANK_FLAGGED=2 verifies its slots as EDEN_NX2_BANK_SKIP_VERIFY does.
     const bool slot_verify =
-        own_slot && VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_bank_skip_verify,
-                                                     "EDEN_NX2_BANK_SKIP_VERIFY") != 0;
+        own_slot &&
+        ((flagged_slot && flagged == 2) ||
+         VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_bank_skip_verify,
+                                          "EDEN_NX2_BANK_SKIP_VERIFY") != 0);
+    if (own_slot && flagged_slot) [[unlikely]] {
+        ++stats.flagged_binds;
+    }
     bool skip_verify = false;
     if (own_slot && mode == 3 && native_bank_table_on) {
         // The whole bound range, page aligned: a superset of what the loop below walks.
@@ -3444,6 +3479,7 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
             NativeBankPagesSettled(bank_first, bank_end) &&
             !memory_tracker.IsRegionCpuModified(bank_first, bank_bytes)) {
             ++stats.banks_skipped;
+            stats.flagged_skipped += flagged_slot ? 1 : 0;
             if (slot_stats != nullptr) [[unlikely]] {
                 ++slot_stats->banks_skipped;
             }
@@ -3493,6 +3529,7 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
             if (census != 0) [[unlikely]] {
                 // FRITCHII_BANK_CENSUS: the census' marks start at this snapshot.
                 (void)census_uploads->Take(page);
+                (void)Common::g_ring_write_pages.Take(page);
                 snapshot.census_ring_seq = census >= 2 ? Common::WriteRing::Sequence() : 0;
                 snapshot.census_flag = collected ? 1 : (written ? 2 : 0);
                 snapshot.census_flag_bind = collected || written ? native_bank_census_bind : 0;
@@ -3531,16 +3568,22 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
         if (skip_verify && reason != BankNone) [[unlikely]] {
             // The whole-bank skip passed over a page the loop has a reason for: must not happen.
             ++stats.skip_disagreed;
+            stats.flagged_disagreed += flagged_slot ? 1 : 0;
         }
         const bool own_hot = reason == BankNone && own_slot && hot;
         if (own_hot) {
             ++stats.hot_left;
+            stats.flagged_hot_left += flagged_slot ? 1 : 0;
             if (slot_stats != nullptr) [[unlikely]] {
                 ++slot_stats->hot_left;
             }
         }
         // EDEN_NX2_BANK_SKIP_VERIFY: what the slot rule left alone is compared all the same.
-        const bool verify_skip = reason == BankNone && (skip_verify || (own_hot && slot_verify));
+        // FRITCHII_BANK_FLAGGED=2: every page of its slots without a reason, not only the hot ones
+        // (a change no flag announced is "missed" whether or not the hot rule would have seen it).
+        const bool verify_skip =
+            reason == BankNone && (skip_verify || (own_hot && slot_verify) ||
+                                   (flagged_slot && own_slot && flagged == 2));
         const bool first_this_frame = snapshot.checked_frame != frame_tick;
         if (reason != BankNone) {
             snapshot.checked_frame = frame_tick;
@@ -3551,11 +3594,15 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
         // FRITCHII_BANK_CENSUS: what this compare's change (if any) is attributed to, taken
         // before the bytes are read, as the write flags are.
         bool census_uploaded = false;
+        bool census_ring_marked = false;
         u64 census_ring_since = 0;
         if (census != 0) [[unlikely]] {
             census_uploaded = census_uploads->Take(page);
             census_ring_since = snapshot.census_ring_seq;
             if (census >= 2) {
+                // The ring's page mark: an emulator write since the last compare, even when the
+                // ring wrapped over its entry.
+                census_ring_marked = Common::g_ring_write_pages.Take(page);
                 snapshot.census_ring_seq = Common::WriteRing::Sequence();
             }
             if (collected || written) {
@@ -3565,6 +3612,7 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
         }
         if (verify_skip) {
             ++stats.skip_verified;
+            stats.flagged_verified += flagged_slot ? 1 : 0;
         } else {
             ++stats.compared[reason];
             if (slot_stats != nullptr) [[unlikely]] {
@@ -3585,8 +3633,8 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
             const bool unflagged = verify_skip || reason == BankHot || reason == BankFrame ||
                                    reason == BankNone;
             NoteNativeBankCensusChange(page, snapshot, census, reason, unflagged,
-                                       census_uploaded, census_ring_since, first_this_frame,
-                                       index);
+                                       census_uploaded, census_ring_marked, census_ring_since,
+                                       first_this_frame, index);
             if (verify_skip) {
                 ++native_bank_census.skip_missed;
             }
@@ -3595,6 +3643,7 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
         if (verify_skip) {
             // Missed by the slot rule: taken as any change is (marked), and counted.
             ++stats.skip_missed;
+            stats.flagged_missed += flagged_slot ? 1 : 0;
         } else {
             ++stats.changed[reason];
             if (slot_stats != nullptr) [[unlikely]] {
@@ -3675,16 +3724,55 @@ void BufferCache<P>::LogNativeBankTrackedStats(int mode) {
                  stats.banks_skipped, stats.hot_left, stats.skip_verified, stats.skip_missed,
                  stats.skip_disagreed);
     }
+    // FRITCHII_BANK_FLAGGED: the same for its slots alone, with the snapshot refreshes uploads
+    // made. With =2, "missed" and "disagreed" must stay 0.
+    if (stats.flagged_binds != 0) {
+        LOG_INFO(HW_GPU,
+                 "Native bank flagged (FRITCHII_BANK_FLAGGED={}, slots {:#x}, 5 s): {} binds, {} "
+                 "skipped whole, {} hot pages not compared; verify: {} compared, {} missed, {} "
+                 "disagreed; uploads refreshed {} pages ({} changed); snapshots dropped {} times "
+                 "so far (switch on, lost guest store ranges)",
+                 VideoCore::Nx2Debug::g_bank_flagged.load(std::memory_order_relaxed),
+                 VideoCore::Nx2Debug::g_bank_flagged_slots.load(std::memory_order_relaxed),
+                 stats.flagged_binds, stats.flagged_skipped, stats.flagged_hot_left,
+                 stats.flagged_verified, stats.flagged_missed, stats.flagged_disagreed,
+                 stats.refreshed_pages, stats.refreshed_changed, native_bank_flagged_resets);
+    }
     native_bank_slot_stats = {};
     stats = {};
     stats.last_log = now;
 }
 
 template <class P>
+void BufferCache<P>::RefreshNativeBankSnapshots(DAddr device_addr, u64 size, const u8* bytes) {
+    auto& stats = native_bank_tracked_stats;
+    const DAddr end = device_addr + size;
+    for (DAddr address = device_addr; address < end;) {
+        const DAddr page = Common::AlignDown(address, Core::DEVICE_PAGESIZE);
+        const DAddr next = (std::min)(end, page + Core::DEVICE_PAGESIZE);
+        if (NativeBankPage* const snapshot = FindNativeBankSnapshot(page)) {
+            u8* const words = snapshot->words.data() + (address - page);
+            const u8* const staged = bytes + (address - device_addr);
+            const size_t amount = static_cast<size_t>(next - address);
+            ++stats.refreshed_pages;
+            if (std::memcmp(words, staged, amount) != 0) {
+                std::memcpy(words, staged, amount);
+                // As when the bank check finds the change itself: the page is hot again, so the
+                // slots that keep the hot rule compare it as before.
+                snapshot->changed_frame = frame_tick;
+                ++stats.refreshed_changed;
+            }
+        }
+        address = next;
+    }
+}
+
+template <class P>
 void BufferCache<P>::NoteNativeBankCensusChange(DAddr page, const NativeBankPage& snapshot,
                                                 int census, NativeBankReason reason,
-                                                bool unflagged, bool uploaded, u64 ring_since,
-                                                bool first_this_frame, u32 index) {
+                                                bool unflagged, bool uploaded, bool ring_marked,
+                                                u64 ring_since, bool first_this_frame,
+                                                u32 index) {
     auto& c = native_bank_census;
     ++c.changed[reason];
     if (!unflagged) {
@@ -3728,8 +3816,10 @@ void BufferCache<P>::NoteNativeBankCensusChange(DAddr page, const NativeBankPage
         ++c.gpu_written;
     }
     // FRITCHII_BANK_CENSUS=2: the newest emulator write over the page since the last compare.
+    // The ring's page mark says whether there was one at all; the ring names it unless it
+    // wrapped over the entry.
     bool ring_found = false;
-    if (census >= 2) {
+    if (census >= 2 && ring_marked) {
         const u64 page_end = page + Core::DEVICE_PAGESIZE;
         Common::WriteRing::Entry newest{};
         const bool complete =
@@ -3757,14 +3847,26 @@ void BufferCache<P>::NoteNativeBankCensusChange(DAddr page, const NativeBankPage
             } else {
                 ++c.writers_other;
             }
-        } else if (!complete) {
-            ++c.ring_wrapped;
+        } else {
+            // An emulator write landed on the page, its entry gone (the ring wrapped) or, when
+            // complete, written before the compare but recorded after it.
+            ++c.ring_lost;
+            c.ring_wrapped += complete ? 0 : 1;
         }
     }
-    if (!flag_late && !uploaded && !gpu_written && !ring_found) {
+    // Unseen: no late flag, no upload after the compare, no emulator write (2; with 1 the ring's
+    // writers count here too). A GPU write mark on the page explains nothing by itself.
+    const bool ring_writer = census >= 2 ? ring_marked : false;
+    if (!flag_late && !uploaded && !ring_writer) {
         ++c.unseen;
         if (first_this_frame) {
             ++c.unseen_first;
+        }
+        if (gpu_written) {
+            ++c.unseen_gpu_written;
+        }
+        if (index < c.slots_unseen.size()) {
+            ++c.slots_unseen[index];
         }
     }
 }
@@ -3779,7 +3881,7 @@ void BufferCache<P>::LogNativeBankCensus(std::chrono::steady_clock::time_point n
     std::string slots;
     for (size_t slot = 0; slot < c.slots.size(); ++slot) {
         if (c.slots[slot] != 0) {
-            slots += fmt::format(" c{} {}", slot, c.slots[slot]);
+            slots += fmt::format(" c{} {} / {}", slot, c.slots[slot], c.slots_unseen[slot]);
         }
     }
     std::string writers;
@@ -3799,13 +3901,14 @@ void BufferCache<P>::LogNativeBankCensus(std::chrono::steady_clock::time_point n
              "skip missed {}); unflagged {}: flag taken <=4 / <=32 / <=256 / more / never binds "
              "before {} / {} / {} / {} / {} (late flag {}, of them buffer cache {}), uploaded since "
              "the last compare {} (that compare CPU-modified {}), ever GPU-written {}, ring writer "
-             "{} (ring wrapped {}), unseen {} (first compare this frame {}); slots:{}{}",
+             "named {}, ring writer lost {} (ring wrapped {}), unseen {} (first compare this frame "
+             "{}, ever GPU-written {}); slots (unflagged / unseen):{}{}",
              VideoCore::Nx2Debug::g_bank_census.load(std::memory_order_relaxed),
              d[BankCollected], d[BankWritten], d[BankRecheck], d[BankCpuDirty], d[BankHot],
              d[BankFrame], d[BankNone], c.skip_missed, c.unflagged, f[0], f[1], f[2], f[3], f[4],
              c.flag_late, c.flag_late_buffer, c.uploaded, c.uploaded_after_dirty, c.gpu_written,
-             c.ring_found, c.ring_wrapped, c.unseen, c.unseen_first,
-             slots.empty() ? " none" : slots, writers);
+             c.ring_found, c.ring_lost, c.ring_wrapped, c.unseen, c.unseen_first,
+             c.unseen_gpu_written, slots.empty() ? " none" : slots, writers);
     c = {};
     c.last_log = now;
 }
@@ -5750,6 +5853,11 @@ void BufferCache<P>::MappedUploadMemory([[maybe_unused]] Buffer& buffer,
             device_memory.ReadBlockUnsafe(device_addr, src_pointer, copy.size);
             MemReadLog::Staged(MemReadLog::Kind::Upload, device_memory, device_addr, src_pointer,
                                copy.size);
+            // FRITCHII_BANK_FLAGGED: the bank snapshots of these bytes become what the host
+            // buffer gets, the staged copy (guest memory may hold newer bytes already).
+            if (native_bank_flagged_on) [[unlikely]] {
+                RefreshNativeBankSnapshots(device_addr, copy.size, src_pointer);
+            }
             // Large uploads are mostly geometry the host GPU now has its own copy of: TickFrame
             // marks their guest memory cold (see TextureCache::RefreshContents).
             if (copy.size >= 256_KiB) {
@@ -5803,6 +5911,10 @@ void BufferCache<P>::InlineMemoryImplementation(DAddr dest_address, size_t copy_
         }};
         u8* const src_pointer = upload_staging.mapped_span.data();
         std::memcpy(src_pointer, inlined_buffer.data(), copy_size);
+        // FRITCHII_BANK_FLAGGED: these bytes are the host copy's now, as an upload's are.
+        if (native_bank_flagged_on) [[unlikely]] {
+            RefreshNativeBankSnapshots(dest_address, copy_size, src_pointer);
+        }
         const bool can_reorder = runtime.CanReorderUpload(buffer, copies);
         runtime.CopyBuffer(buffer, upload_staging.buffer, copies, true, can_reorder);
     } else {

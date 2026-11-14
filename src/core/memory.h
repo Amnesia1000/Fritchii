@@ -419,6 +419,10 @@ public:
     bool WriteBlockUnsafe(Common::ProcessAddress dest_addr, const void* src_buffer,
                           std::size_t size);
 
+    /// Bytes stored in place through a span (GuestMemoryScoped), after they landed: noted as an
+    /// unsafe write's are (the uniform keeps, the write ring and the native bank check's flag).
+    void NoteHostStore(u64 dest_addr, std::size_t size);
+
     /**
      * Copies data within a process' address space to another location within the
      * same address space.

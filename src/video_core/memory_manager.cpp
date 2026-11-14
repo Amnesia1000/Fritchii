@@ -451,16 +451,19 @@ void MemoryManager::Write(GPUVAddr addr, T data) {
     }
     // EXP92 (uniform keeps, tier 2): the word's device pages, after it landed. One relaxed load
     // until a keep was ever made.
+    // FRITCHII_BANK_FLAGGED: and always the native bank check's page mark (semaphore and report
+    // words, the 3D engine's stamps, compute releases), after the word landed.
     const auto note_keeps = [this, addr] {
+        const auto address = GpuToCpuAddress(addr);
+        if (!address) {
+            return;
+        }
+        Common::g_buffer_write_pages.Mark(*address, sizeof(T));
         if (Common::UniformKeepPages::AnyKept()) [[unlikely]] {
-            if (const auto address = GpuToCpuAddress(addr)) {
-                Common::UniformKeepPages::Note(*address, sizeof(T));
-            }
+            Common::UniformKeepPages::Note(*address, sizeof(T));
         }
         if (Common::WriteRing::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
-            if (const auto address = GpuToCpuAddress(addr)) {
-                Common::WriteRing::Record(*address, sizeof(T), "GPU Write");
-            }
+            Common::WriteRing::Record(*address, sizeof(T), "GPU Write");
         }
     };
     // A write: its pointer getter is hidden from the back read audit.
@@ -834,9 +837,8 @@ void MemoryManager::WriteBlockUnsafe(GPUVAddr gpu_dest_addr, const void* src_buf
 }
 
 void MemoryManager::NoteHostStore(GPUVAddr gpu_addr, std::size_t size) {
-    if ((!Common::UniformKeepPages::AnyKept() &&
-         !Common::WriteRing::g_on.load(std::memory_order_relaxed)) ||
-        size == 0) [[likely]] {
+    // Always: WriteRing::Note marks the native bank check's write flag (FRITCHII_BANK_FLAGGED).
+    if (size == 0) {
         return;
     }
     // Page by page: a GPU range may map to scattered device pages.

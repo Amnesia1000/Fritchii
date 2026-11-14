@@ -174,6 +174,10 @@ inline std::atomic<int> g_pipeline_key_hash{-1};
 inline std::atomic<int> g_cb_words_block{-1};
 /// FRITCHII_BANK_CENSUS: docs/fritchii/switches.md.
 inline std::atomic<int> g_bank_census{-1};
+/// FRITCHII_BANK_FLAGGED: docs/fritchii/switches.md.
+inline std::atomic<int> g_bank_flagged{-1};
+/// FRITCHII_BANK_FLAGGED_SLOTS: docs/fritchii/switches.md.
+inline std::atomic<int> g_bank_flagged_slots{-1};
 /// FRITCHII_VERTEX_INPUT_COMPACT: docs/fritchii/switches.md.
 inline std::atomic<int> g_vertex_input_compact{-1};
 /// FRITCHII_WORKER_SPIN: docs/fritchii/switches.md.
