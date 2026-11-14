@@ -28,6 +28,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/fritchii_draw_kinds.h"
+#include "video_core/fritchii_price.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/nx2_qmd_prediction.h"
@@ -1061,6 +1062,9 @@ void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods,
         regs.const_buffer.offset += static_cast<u32>(bytes);
         return;
     }
+    // fable_stage_levelpoints 18.4 row 3 (GPU profile on, the back): the write half's time by run
+    // length. Off: the profile's test and a branch.
+    const VideoCommon::FritchiiPrice::CbWriteScope price_scope{count};
     const VideoCommon::Nx2Profile::FineScope upload_scope{VideoCommon::Nx2Profile::Zone::CbUpload};
     const GPUVAddr destination = address + offset;
     // EDEN_NX2_MEMSTAGE_STATS: constant buffer words (the slow paths above count each word in
@@ -1513,6 +1517,9 @@ void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
         regs.const_buffer.offset += static_cast<u32>(copy_size);
         return;
     }
+    // fable_stage_levelpoints 18.4 row 3: as in CallConstBufferWords (single words and the slow
+    // paths' runs).
+    const VideoCommon::FritchiiPrice::CbWriteScope price_scope{amount};
     // EDEN_NX2_MEMSTAGE_STATS: constant buffer words, and whether they land on texture pages.
     if (VideoCommon::MemStageStats::Enabled() && write_size != 0) [[unlikely]] {
         VideoCommon::MemStageStats::StreamWrite(
@@ -2688,6 +2695,9 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
 
 void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
                               FrontState& fs) {
+    // FRITCHII_DELAY_FRONT_KIND=3 ("C", fable_stage_levelpoints 18.3): once every 64 3D macro
+    // calls on the front, before the call. Off: one relaxed load and a branch.
+    VideoCommon::GpuSplit::DelayFrontIf(VideoCommon::GpuSplit::FrontDelayKind::Macros);
     // Fable's feature byte (fable_answer_regression_2 3.1): with every macro switch off, v5.7's
     // body and emit, without the per-call switch reads, slot lookup, predicate test, fold and
     // packet setup and report tick the switches added (FrontRunMacro itself 4 -> 17 ns a call,

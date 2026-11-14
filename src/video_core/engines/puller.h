@@ -99,6 +99,11 @@ public:
         /// resume can ask which release the back made for the word since ("Acquire resumes met
         /// by"); ~0 when not taken.
         u64 back_sequence{~u64{0}};
+        /// fable_stage_levelpoints 18.4 rows 7 (GPU profile on): the ring position sent at the
+        /// suspension and when it began (time stamp ticks; 0: not timed), for the price line's
+        /// split of the wait (FritchiiPrice::NoteFrontWait).
+        u64 price_target{};
+        u64 price_start{};
 
         [[nodiscard]] bool Matches(u32 current) const;
     };

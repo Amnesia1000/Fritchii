@@ -26,6 +26,7 @@
 #include "common/polyfill_thread.h"
 #include "common/nx2_timeline.h"
 #include "common/settings.h"
+#include "video_core/fritchii_price.h"
 #include "video_core/gpu_split.h"
 #include "video_core/gpu_wait_site.h"
 #include "video_core/renderer_vulkan/fragment_barrier_state.h"
@@ -219,6 +220,10 @@ public:
     template <typename T>
         requires std::is_invocable_v<T, vk::CommandBuffer, vk::CommandBuffer>
     void RecordCommand(T&& command) {
+        // fable_stage_levelpoints 19.4 (GPU profile on, the back): this call's time (the lambda's
+        // capture, the chunk append, a full chunk's hand-off), sampled ("Price Vulkan worker").
+        // Off: the profile's test and a branch.
+        const VideoCommon::FritchiiPrice::RecordScope price_scope;
         if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
             VideoCommon::GpuSplit::CheckOwner("Scheduler::Record");
         }

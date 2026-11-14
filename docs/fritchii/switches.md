@@ -147,6 +147,138 @@ frame's path and cutting them pays one for one.
 - Off (0): one relaxed load and a branch after each run.
 - Measure with profile_toggle.py in one session (0 against n).
 
+### FRITCHII_DELAY_BACK_US, FRITCHII_DELAY_BACK_KIND
+
+The back's zone delay tests (live, default 0 = nothing changes; work\fable_stage_levelpoints.md
+18.3, the share of a stage-off cut before it is built): the GPU back thread busy-spins n
+microseconds at one kind of site, as FRITCHII_DELAY_DRAW_US does at every draw.
+- KIND 1 ("M", rows 3 and 4): once every 64 ring entries of the method zone, after the entry
+  ran (GpuSplit::BackLoop, after Execute). A run of constant buffer words or a FRITCHII_CB_WORDS
+  block counts each word, a pairs block each pair; a multi-word method, state delta or draw
+  batch one; deferred calls, engine switches and wraps none. n = 1 is about 71 ms/s.
+- KIND 2 ("S", rows 1, 2, 5): every 4th BindHostStageBuffers in GraphicsPipeline::ConfigureImpl,
+  before its "bind stage buffers" zone. n = 1 is about 61 ms/s.
+- KIND 3 ("F", the fences of row 6): every made fence in FenceManager::SignalFence, right after
+  the skip test (skipped fences don't spin). n = 5 is about 79 ms/s.
+- On the back thread only (never GPUMem, not without the split). The spin is counted in the
+  "Front waits for the back by site" line's ending: "FRITCHII_DELAY_BACK_US=n x/s y ms/s KIND=k
+  (back)" (the spins of whatever kind is set).
+- Off (0): one relaxed load and a branch at a stage bind and at a made fence; the method entries
+  pay a test of a local the back loads once a batch.
+- Measure with profile_toggle.py in one session (0 against n, KIND fixed in the test block).
+
+### FRITCHII_DELAY_FRONT_US, FRITCHII_DELAY_FRONT_KIND
+
+The front's delay tests (live, default 0 = nothing changes; work\fable_stage_levelpoints.md
+18.3, rows 7 and 8 and the front's macros): the GPU front thread busy-spins n microseconds.
+- KIND 1 ("A", row 7): a suspended acquire found met, as the channel resumes
+  (Puller::ResumeAcquire's resume from a suspension; once per resume). n = 100 is about 60 ms/s.
+- KIND 2 ("Q", row 8): a macro memory read's wait behind a queued dispatch (GpuSplit::
+  DispatchesMayWriteSince's WaitFor, the "macro dma dispatch" site), right after the wait
+  returned. n = 200 is about 48 ms/s.
+- KIND 3 ("C"): once every 64 3D macro calls on the front (Maxwell3D::FrontRunMacro, before the
+  call; with the split only). n = 2 is about 78 ms/s.
+- FRITCHII_DELAY_BEFORE=1 (the existing switch, which also moves the drain tests) moves kinds 1
+  and 2 before their wait: kind 1 spins at the acquire's suspension, kind 2 right before the
+  wait begins. The control: after the wait the back has reached what was waited for, so a spin
+  there is on the path by construction; a spin before it overlaps the back's backlog, and if it
+  costs little the wait is backlog that back cuts already shrink.
+- Not on the back thread. Counted in the "Front waits for the back by site" ending:
+  "FRITCHII_DELAY_FRONT_US=n x/s y ms/s KIND=k (front)".
+- Off (0): one relaxed load and a branch at each site (both sides of the waits).
+
+### FRITCHII_DELAY_WORKER_US
+
+FRITCHII_DELAY_WORKER_US=n (live, default 0 = nothing changes; work\fable_stage_levelpoints.md
+19.3 and 19.4): the Vulkan scheduler's worker busy-spins n microseconds after each chunk it ran
+(Scheduler::WorkerThread, after ExecuteAll and the command buffer reallocation, still holding
+the execution lock, so a Finish or WaitWorker waits for the spin as for the chunk). It prices
+the worker's room before work is moved into its recorded lambdas: if fps holds while the
+worker's added ms/s grows, the worker is off the frame's path and has that much room.
+- Counted in the "Front waits for the back by site" ending: "FRITCHII_DELAY_WORKER_US=n x/s y
+  ms/s (Vulkan worker, per chunk)".
+- Off (0): one relaxed load and a branch a chunk.
+
+### The price lines (dry counters, EDEN_NX2_GPU_PROFILE)
+
+The dry counters of work\fable_stage_levelpoints.md 18.4 (video_core/fritchii_price.h): each adds
+the time of exactly the items a cut would remove (the cut's size, X), where a delay test above
+gives its share. Only with the GPU profile on (EDEN_NX2_GPU_PROFILE=1 or 2); off, each site pays
+the profile's own enabled test and a branch. One line per group every 10 s, from the back thread,
+only when the group counted something. Times are time stamp ticks converted with the wall clock.
+- "Price uniform binds (back ...)", row 1: every compare of BindSmallUniformReusing on the back
+  (the stream path's reuse test, in place or through the scratch copy), by verdict: changed (or
+  no copy to compare with); unchanged and unflagged since its last bind (the cut: same range, no
+  mark on its pages since); unchanged but flagged; unchanged, another range than the slot's last
+  bind; unchanged with the bank marks off. The time is the guest read and the compare. "Flagged"
+  means a mark of either flag FRITCHII_BANK_FLAGGED takes (Common::g_collected_write_pages,
+  g_buffer_write_pages) on one of its pages since the last bind, kept as page write generations
+  (Common::PriceGenSum; a hash collision or a mark over 64 pages only makes more "flagged"). The
+  writers mark only while the bank marks are on: run with FRITCHII_BANK_CENSUS=1 (counters only)
+  or FRITCHII_BANK_FLAGGED=1 in the test block, else every unchanged bind reads "marks off".
+- "Price handle reads (back, draws ...)", row 2: draws by their handle range since that
+  pipeline's last draw: unflagged (the cut), flagged, another range (a constant buffer moved, the
+  first draw, or a handle program, which reads storage too), marks off. The range is each
+  descriptor's words in its constant buffers. Two sites: FillHandleValues (EXP123 3, its time
+  alone) and ConfigureImpl's handle loop (EXP123 below 3, the stage-off default: the time also
+  holds the storage binds and the samplers' and views' index work done in that loop, so it is an
+  upper bound of what a kept-handles cut removes). Draws a TEX_BANK_GEN hit served are not
+  counted (they read nothing).
+- "Price constant buffer word calls (back ...)", row 3: by run length (1, 2, 3-4, 5-8, 9-16,
+  17+ words), calls and words a second and the write half's time: CallConstBufferWords and
+  ProcessCBMultiData from past the BackServed test to their end (the compare, the write and the
+  invalidation; zone "cb upload" and its tests).
+- "Price back ring entries by kind ...", row 4: the back's ring entries by kind (constant buffer
+  word runs counted per word, 3D single, other engine single, multi, call, pairs per pair, state
+  delta, draw batch, words blocks per word, engine/wrap) and the "method" zone ms/s each kind
+  added (the zone's own estimate: 3D methods are sampled about one in 32).
+- "Price front waits split ...", rows 7 and 8: each wait of the front for the back by site (the
+  drain sites of "Front waits for the back by site") and the suspended acquires, split into
+  "until the back reached it" and "after". The back stamps each position it stores as consumed;
+  the wait's end looks up the first stamp at or past its target (a drain: what was sent; a
+  WaitFor: its target; an acquire: what was sent at its suspension, to its resume). "After" is the
+  front's wake for a drain; for an acquire it is the host GPU, the fence thread, other channels'
+  work and the wake. A stamp is stored at most every 4,096 ring words or at a waited target, so
+  "until" can run late by that much; targets older than the 256 stamps count as "not in the
+  stamps" (all "until").
+- "Price Vulkan worker ..." (19.4): the scheduler worker's busy ms/s (ExecuteAll, which records
+  the chunk's commands and, for a chunk with one, submits; plus the command buffer
+  reallocation), split by chunks without and with a submit; idle = the rest of the second (the
+  wait for work, FRITCHII_WORKER_SPIN's spin, the lock); FRITCHII_DELAY_WORKER_US's spins apart.
+  Then, on the back: the time in Scheduler::Record calls (the recorded lambda's capture, the
+  chunk append, a full chunk's hand-off to the worker; about one call in 8 timed), inside
+  RasterizerVulkan::Draw or DrawIndirect and outside, against the draws' whole time (from past
+  the D spin to the end). This is the recording-only part the back pays today; the code that
+  only computes what a record captures (dynamic state compares, descriptor packing) is not in it
+  and stays in its own zones (dynamic state, push descriptors, configure draw, draw record).
+
+### FRITCHII_NULL_RENDER
+
+FRITCHII_NULL_RENDER=1 (live, default 0; test only, the picture is broken: nothing is drawn;
+work\fable_b_one_follower.md section 7, run 1): with the stage off, each 3D draw does only the
+part the one-follower design gives the engine thread E, then returns. The fps it shows is the
+design's ceiling (the front and the game threads); the back's us a draw is E's budget (a low
+bound: with nothing drawn every occlusion test fails, so the game may send fewer draws).
+- Kept (E): PrepareDraw's flush work, the pipeline lookup (the fill needs its layout; the design
+  has E find the draw's facts too), the repack layout, and in GraphicsPipeline::ConfigureImpl the
+  uniform state, each stage's storage binds, the handle words read as the seam's fill reads them
+  (FillGraphicsHandleValues, not resolved), the texture buffer unbinds, UpdateGraphicsBuffers and
+  the geometry binds, the descriptor reservation the buffer binds write into, each stage's
+  BindHostStageBuffers and the post-copy barrier. The read-back flushes after the draw
+  (TickWork) still run.
+- Left out (R): the descriptor pools' sync, image views and samplers (with the EXP32 memo, EXP87
+  templates and TEX_BANK_GEN), texture buffer binds (they need the views), image descriptors and
+  rescaling, render targets, configure draw, dynamic state, the query segment and the record.
+- Where the cut sits: with the stage off the seam is at EXP123 = 0, where the buffer fill is
+  inside Configure (interleaved with the texture work), so the cut is a separate path at the top
+  of ConfigureImpl in today's call order, not MemStage::FillDraw (which needs EXP123 2 or 3 and
+  FRITCHII_MEMSTAGE_TICKS, a different code path than the stage-off zones the budget is from).
+- Not null-rendered: draws with a held packet (EXP123 2 or 3), the stage on, delta draws (EXP118)
+  and mesh draws. Dispatches, clears and DrawTexture blits run as usual.
+- "Null render (FRITCHII_NULL_RENDER=1, 10 s): x draws/s null-rendered (buffer side only), y
+  draws/s drawn in full" every 10 s while on.
+- Off (0): one relaxed load and a branch a draw.
+
 ### FRITCHII_MEMSTAGE_RUN_SPIN_US
 
 FRITCHII_MEMSTAGE_RUN_SPIN_US (live, default 0 = today: about 2,048 pauses, then a sleep;

@@ -24,7 +24,9 @@
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 
 #include "common/bit_field.h"
+#include "common/fritchii_page_flags.h"
 #include "common/scope_exit.h"
+#include "video_core/fritchii_price.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
@@ -1499,6 +1501,88 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     // (MemStage::FillDraw); its calls below are skipped and its sections played in their place.
     MemStage& mem_stage = buffer_cache.runtime.Seam();
     const MemStage::DrawPacket* const held = mem_stage.HeldDraw();
+    // FRITCHII_NULL_RENDER (test only, the picture is broken; fable_b_one_follower 7 run 1): the
+    // draw's buffer side alone, which the one-follower design gives the engine thread E, in
+    // today's order: the uniform state, per stage the storage binds, the handle words (read, not
+    // resolved), the texture buffer unbinds, the geometry, the descriptor reservation the binds
+    // write into, per stage the buffer binds, the post-copy barrier. Left out, the render thread
+    // R's part: the descriptor pools' sync, the image views and samplers (and the memos and
+    // templates that keep them), the texture buffer binds (they need the views), the image
+    // descriptors and rescaling, render targets, configure draw. PrepareDraw returns after this.
+    // Only without a held packet (SEAM 0 and 1, the stage off): PrepareDraw checks.
+    if constexpr (!Delta) {
+        if (null_render_next) [[unlikely]] {
+            null_render_next = false;
+            namespace NullProfile = VideoCommon::Nx2Profile;
+            buffer_cache.SetUniformBuffersState(enabled_uniform_buffer_masks,
+                                                &uniform_buffer_sizes);
+            {
+                NullProfile::Scope scope{NullProfile::Zone::ReadHandles};
+                for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+                    if (!Spec::enabled_stages[stage]) {
+                        continue;
+                    }
+                    const NullProfile::FineScope storage_scope{
+                        NullProfile::Zone::StorageBindings};
+                    buffer_cache.UnbindGraphicsStorageBuffers(stage);
+                    if constexpr (Spec::has_storage_buffers) {
+                        size_t ssbo_index{};
+                        for (const auto& desc : stage_infos[stage].storage_buffers_descriptors) {
+                            ASSERT(desc.count == 1);
+                            buffer_cache.BindGraphicsStorageBuffer(
+                                stage, ssbo_index, desc.cbuf_index, desc.cbuf_offset,
+                                desc.is_written, desc.indirect_offset);
+                            ++ssbo_index;
+                        }
+                    }
+                }
+                // The handle words, as the seam's fill reads them (FillHandleValues), kept here.
+                null_render_handles.clear();
+                const auto& stages{maxwell3d->state.shader_stages};
+                using Cbufs = std::remove_cvref_t<decltype(stages[0].const_buffers)>;
+                VideoCommon::FillGraphicsHandleValues(
+                    std::span<const Shader::Info>{stage_infos}, *gpu_memory,
+                    [&stages](size_t stage) {
+                        return VideoCommon::GraphicsHandleCbufs<Cbufs>{
+                            stages[stage].const_buffers};
+                    },
+                    device.GetStorageBufferAlignment(),
+                    VideoCore::Nx2Debug::Experiment(21) != 0,
+                    [this](u32 raw) { null_render_handles.push_back(raw); });
+            }
+            for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+                if (Spec::enabled_stages[stage]) {
+                    buffer_cache.UnbindGraphicsTextureBuffers(stage);
+                }
+            }
+            {
+                NullProfile::Scope scope{NullProfile::Zone::UpdateBuffers};
+                MemStage::FillPlay seam{mem_stage, MemStage::Site::Geometry};
+                buffer_cache.UpdateGraphicsBuffers(is_indexed);
+                const NullProfile::FineScope geometry_scope{NullProfile::Zone::GeometryBuffers};
+                buffer_cache.BindHostGeometryBuffers(is_indexed);
+            }
+            {
+                NullProfile::Scope scope{NullProfile::Zone::DescriptorAcquire};
+                guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries,
+                                               uses_descriptor_buffer);
+            }
+            for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+                if (!Spec::enabled_stages[stage]) {
+                    continue;
+                }
+                NullProfile::Scope scope{NullProfile::Zone::BindStageBuffers};
+                MemStage::FillPlay seam{mem_stage, MemStage::Site::Stage,
+                                        static_cast<u32>(stage)};
+                buffer_cache.BindHostStageBuffers(stage);
+            }
+            if (buffer_cache.any_buffer_uploaded) {
+                buffer_cache.runtime.PostCopyBarrier();
+                buffer_cache.any_buffer_uploaded = false;
+            }
+            return false;
+        }
+    }
     boost::container::small_vector<VideoCommon::ImageViewInOut, 160> views;
     boost::container::small_vector<VideoCommon::SamplerId, 96> samplers;
     views.reserve(num_image_elements);
@@ -1554,6 +1638,71 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     // the bank decision: the fill always runs, a TEX_BANK_GEN hit then does not look at them.
     const std::vector<u32>* handle_values{};
     bool packet_null_pointers{};
+    // fable_stage_levelpoints 18.4 row 2 (GPU profile on, the back): the handle reads timed and
+    // the draw classed by its handle range since this pipeline's last draw. The range: the words
+    // each descriptor reads in its constant buffers (a key of their addresses, the write
+    // generations of their pages); a handle program (it reads storage too) makes no key, so its
+    // draws count as "another range". Off: the profile's test and a branch.
+    const bool price_handles = !Delta && VideoCommon::FritchiiPrice::On() &&
+                               VideoCommon::GpuSplit::OnBackThread();
+    const auto price_handle_range{[&](u64& sum) -> u64 {
+        u64 key = 0xcbf29ce484222325ULL;
+        bool keyed = true;
+        sum = 0;
+        const auto add = [&](GPUVAddr begin, u64 bytes) {
+            key = (key ^ begin) * 0x100000001b3ULL;
+            key = (key ^ bytes) * 0x100000001b3ULL;
+            const std::optional<DAddr> device =
+                begin != 0 ? gpu_memory->GpuToCpuAddress(begin) : std::nullopt;
+            const u64 part = device ? Common::PriceGenSum(*device, bytes) : ~u64{0};
+            sum = part == ~u64{0} || sum == ~u64{0} ? ~u64{0} : sum + part;
+        };
+        for (size_t stage = 0; stage < NUM_STAGES && keyed; ++stage) {
+            if (!Spec::enabled_stages[stage]) {
+                continue;
+            }
+            const Shader::Info& info{stage_infos[stage]};
+            const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
+            const auto base = [&cbufs](u32 index) -> GPUVAddr {
+                return index < cbufs.size() && cbufs[index].enabled ? cbufs[index].address
+                                                                    : GPUVAddr{};
+            };
+            const auto range = [&](const auto& desc) {
+                if (desc.handle_program != ~0U || desc.count == 0) {
+                    keyed = desc.count == 0 && keyed;
+                    return;
+                }
+                add(base(desc.cbuf_index) + desc.cbuf_offset,
+                    (u64{desc.count - 1} << desc.size_shift) + sizeof(u32));
+                if constexpr (requires { desc.has_secondary; }) {
+                    if (desc.has_secondary) {
+                        add(base(desc.secondary_cbuf_index) + desc.secondary_cbuf_offset,
+                            sizeof(u32));
+                    }
+                }
+            };
+            for (const auto& desc : info.texture_buffer_descriptors) {
+                range(desc);
+            }
+            for (const auto& desc : info.image_buffer_descriptors) {
+                range(desc);
+            }
+            for (const auto& desc : info.texture_descriptors) {
+                range(desc);
+            }
+            for (const auto& desc : info.image_descriptors) {
+                range(desc);
+            }
+        }
+        return keyed ? key : 0;
+    }};
+    const auto price_handle_note{[&](size_t site, u64 key, u64 sum, u64 start) {
+        const auto verdict =
+            VideoCommon::FritchiiPrice::ClassifyHandles(key, sum, price_handle_key, price_handle_sum);
+        VideoCommon::FritchiiPrice::g_handles[site].Note(static_cast<size_t>(verdict), 1,
+                                                         VideoCommon::FritchiiPrice::Ticks() -
+                                                             start);
+    }};
     if constexpr (!Delta) {
         if (mem_stage.ValuesByValue()) {
             handle_values = mem_stage.HandleValues(false, packet_null_pointers);
@@ -1565,7 +1714,17 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                         "a served draw's handles read in Configure");
                 }
                 Profile::Scope scope{Profile::Zone::ReadHandles};
+                u64 price_key = 0;
+                u64 price_sum = 0;
+                u64 price_start = 0;
+                if (price_handles) [[unlikely]] {
+                    price_key = price_handle_range(price_sum);
+                    price_start = VideoCommon::FritchiiPrice::Ticks();
+                }
                 FillHandleValues(mem_stage, VideoCore::Nx2Debug::Experiment(21) != 0, true);
+                if (price_handles) [[unlikely]] {
+                    price_handle_note(0, price_key, price_sum, price_start);
+                }
                 handle_values = mem_stage.HandleValues(false, packet_null_pointers);
             }
         } else if (mem_stage.HeldFromRing()) [[unlikely]] {
@@ -1929,6 +2088,21 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     }};
     {
         Profile::Scope scope{Profile::Zone::ReadHandles};
+        // Row 2 at EXP123 below 3: the loop reads the words itself (with the storage binds and
+        // the samplers' and views' indices, all in this time).
+        const bool price_loop = price_handles && handle_values == nullptr && !tex_bank_hit;
+        u64 price_key = 0;
+        u64 price_sum = 0;
+        u64 price_start = 0;
+        if (price_loop) [[unlikely]] {
+            price_key = price_handle_range(price_sum);
+            price_start = VideoCommon::FritchiiPrice::Ticks();
+        }
+        SCOPE_EXIT {
+            if (price_loop) [[unlikely]] {
+                price_handle_note(1, price_key, price_sum, price_start);
+            }
+        };
         if constexpr (Spec::enabled_stages[0]) {
             config_stage(0);
         }
@@ -2327,6 +2501,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         fresh_rescaled_cursor = fresh_rescaled.data();
     }
     const auto prepare_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
+        // FRITCHII_DELAY_BACK_KIND=2 ("S", fable_stage_levelpoints 18.3): every 4th stage bind,
+        // on the back thread, outside the zone. Off: one relaxed load and a branch.
+        VideoCommon::GpuSplit::DelayBackIf(VideoCommon::GpuSplit::BackDelayKind::StageBinds);
         {
             Profile::Scope scope{Profile::Zone::BindStageBuffers};
             if (held != nullptr) {
