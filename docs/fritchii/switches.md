@@ -1484,18 +1484,29 @@ is then dry). Bit 2 (fence entries, fable_stage_p3) is not built: it is masked o
 - Which (tried before FRITCHII_MEMSTAGE_GATHER; one that does not pass goes to what that switch
   says, a run otherwise): a lone method entry outside a run, no draw before it in the entry,
   - rule Q: no query result sync can be pending at the entry (the mirror in the passes line);
-  - rule C: no read download tracking (EXP49 off, none pending) and no uncommitted buffer flush
-    (the note, else the sets under the lock): only a fill that marks GPU-written data adds one,
-    and those come level first or run lent, so a set empty at GPUMem's position is empty when
-    the back gets there;
+  - rule C: no uncommitted buffer flush (the note, else the sets under the lock): only a fill
+    that marks GPU-written data adds one, and those come level first or run lent, so a set empty
+    at GPUMem's position is empty when the back gets there;
   - room for its record (256).
+  There is no read tracking test any more (fable_stage_levelpoints 13: EXP49 is on by default,
+  and that test refused every pass); rule T below closes the window it guarded.
 - A passed gather (rule G): GPUMem takes the game's collected writes (nothing when every
   collector says empty) and, under the buffer cache's lock, tests their pages (page-aligned, as
-  WriteMemory's recording branch reads whole pages: the page bits, then the cache). No
+  WriteMemory's recording branch reads whole pages: the page bits, then GPUMem's own question,
+  GpuWrittenHere: the real set or a mark a fill ahead made, FRITCHII_MEMSTAGE_MARKS_AHEAD). No
   GPU-written data there: the served gather's buffer half at once (claims, WriteMemory per range:
   on such pages only marks, no command; the vertex-stale marks reach GPUMem's copy through the
   mark hook). GPU-written data on a page: nothing applied, the record goes whole and the entry is
   a level run (its gather applies the ranges with the full path before it takes more).
+- Rule T (13.3): every take on GPUMem (a passed gather's, GatherOnStage's) is listed on
+  GPU::Impl's applying_writes, whatever EXP49 says, until the buffer cache has the writes, so a
+  landing of downloaded GPU bytes in guest memory (read downloads, fence downloads: they hold
+  the cache's lock and ask ForEachPendingCpuWrite) leaves those bytes out meanwhile, as for a
+  tracked gather on THREAD 0. A passed gather unlists under the cache's lock right after its
+  buffer half; a whole record stays listed until the back's apply at the entry (unlisted right
+  after it, also when it throws); GatherOnStage unlists inside its served call. Lock order: the
+  cache's lock, then applying_writes_mutex, then the managers' locks. A game write is always in
+  a collector, on that list, or in the buffer cache: THREAD 0's invariant.
 - Every passed entry pushes a record (its position; a gather's ranges). The back asks for it
   first at the entry (RasterizerVulkan::InvalidateTextureDataCache, GpuSplit::Execute for a
   release, Maxwell3D's wait_for_idle), so FRITCHII_MEMSTAGE_GATHER's / _RELEASE's "served ...
@@ -1504,8 +1515,8 @@ is then dry). Bit 2 (fence entries, fable_stage_p3) is not built: it is masked o
   runs. A record lives until the back asks for a later entry's (one it never asked for is late,
   applied there), or is dropped at a lend (before the run's first entry), the ring's start and
   end (one at or past the end stays for the back's run of that entry without the ring).
-- The back in a served entry: its own gathers (GPU::Impl::InvalidateGPUCache, read tracking off)
-  return at once when every collector is empty; otherwise the take and the buffer half run on
+- The back in a served entry: its own gathers (GPU::Impl::InvalidateGPUCache, read tracking on
+  or off) return at once when every collector is empty; otherwise the take and the buffer half run on
   GPUMem in one served call (RasterizerVulkan::GatherOnStage), the other caches' half on the back: only
   GPUMem takes while the back is served. Its wait for idle and flush grouping (SignalOrdering)
   find nothing to do: a pending sync there, or a set uncommitted-flush note, is a must-be-0 (then
@@ -1514,7 +1525,9 @@ is then dry). Bit 2 (fence entries, fable_stage_p3) is not built: it is masked o
   end (logged once): "a query result sync pending at a passed entry's wait for idle", "uncommitted
   buffer flushes at a passed entry's flush grouping", "a pass record of an entry the back passed
   without asking for it", "a passed gather's buffer half recorded a command" (the seam arena grew
-  in its bracket), "a served wait for idle with no pass record".
+  in its bracket), "a served wait for idle with no pass record", "a pass record's slot freed while
+  its taken writes were listed and not applied" (rule T), "taken writes left listed at the ring's
+  end beyond the records kept".
 - Exactness, in short: the back's query state at the entry has no pending sync (every caller of
   Query is an entry the mirror's table counts, below); the uncommitted set is empty there (above);
   the game writes taken at the gather were collected before GPUMem read the list, and both halves
@@ -1534,7 +1547,7 @@ judged by. Dry means decided and counted, the entries behave as before.
 - Per method (gathers 0x3dd, waits for idle 0x44), each lone one GPUMem reaches: passed (dry: it
   would pass P1's tests up to the flush test), or the first test it failed: window closed, in a
   run, late (its entry hard already), not first (not a lone method entry, or a draw before it),
-  sync may be pending (the mirror below), read tracking (EXP49 or a pending read download),
+  sync may be pending (the mirror below), read tracking (no longer asked since rule T: 0),
   flushes uncommitted (the buffer cache's uncommitted set, its note first, then under the lock),
   no record room, GPU-written page (both P1 only).
 - The mirror of the back's query_cache.HasPendingSync() at GPUMem's place (fable_stage_levelpoints
@@ -1546,10 +1559,13 @@ judged by. Dry means decided and counted, the entries behave as before.
   3D fence report at a mapped address clears it (its fence is made and syncs), or adds one with
   EXP28 & 1; unmapped, no change. A puller release (hard or run at its entry by
   FRITCHII_MEMSTAGE_RELEASE): unmapped no change, not fence-flagged a report, fence-flagged as
-  the fence report. An executable compute method other than 0x6c and 0x6d, a DMA engine method,
-  an engine of no known type, and an unfollowed entry make it unknown. Any other hard entry, any
-  other cache call (none calls Query: the rule beside StageCacheCall), the upload and 2D engines:
-  no change.
+  the fence report. The compute engine (13.5), with EXP28 & 1 off: no change (its dispatches call
+  no Query, its releases are fences, which then can only clear), except a 0x6c3 report semaphore
+  of the timestamped form (operation 0 or 2, neither the reduction bit 3 nor the one-word bit
+  28): one more report, P3's pages unknown; with EXP28 & 1 on, any executable compute method
+  but 0x6c and 0x6d: unknown. A DMA engine method, an engine of no known type, a macro run on
+  another engine, and an unfollowed entry make it unknown. Any other hard entry, any other cache
+  call (none calls Query: the rule beside StageCacheCall), the upload and 2D engines: no change.
 - "The mirror at the gathers the back ran at their entry": with FRITCHII_MEMSTAGE_GATHER on, each
   served gather checks the mirror against the back's own answer (it had query results to sync):
   "clear but the back synced" must be 0 (fable_stage_levelpoints 12.3: the proof of the rule).
@@ -1572,8 +1588,9 @@ judged by. Dry means decided and counted, the entries behave as before.
 otherwise the first reason, in this order: not lone (a run, late, not a lone method entry; a
 fence report inside a packet or batch); for a release, unmapped (passes: the back's Query returns
 at once) or not fence-flagged (passes: no fence, no cache; its page joins the mirror); EXP28 & 1
-(fence kinds: the fence may not sync); read tracking; flushes uncommitted; for a sync point with
-no report pending, pass (P1's); reports unknown (after a compute or DMA method, an unfollowed
+(fence kinds: the fence may not sync); flushes uncommitted (no read tracking test since rule T);
+for a sync point with no report pending, pass (P1's); reports unknown (after a timestamped
+compute report, a DMA method, an unfollowed
 entry, or a report across a page end); the fence behaviour Accurate; then the targets: the report pages GPUMem saw since the
 last sync point (and the entry's own) as maximal runs of adjacent 4 KiB device pages, more than 8
 runs, a run no existing buffer holds on its first page ("no buffer": the sync would create one;

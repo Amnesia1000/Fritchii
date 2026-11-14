@@ -1297,15 +1297,11 @@ void RasterizerVulkan::SetRingBackend() {
             *static_cast<Tegra::Engines::Maxwell3D*>(engine), draw_seq);
     };
     backend.pass_ready = [](void* context) -> u8 {
-        // fable_stage_levelpoints 6.2 step 4, on GPUMem outside any fill. Read tracking as
-        // GPU::Impl::InvalidateGPUCache tests it. Rule C: only a fill that marks GPU-written data
-        // adds an uncommitted flush, and those fills come level first (StageDrawWritesBuffers)
-        // or run lent, so a set found empty here is empty when the back reaches this entry.
+        // fable_stage_levelpoints 6.2 step 4, on GPUMem outside any fill. Rule C: only a fill
+        // that marks GPU-written data adds an uncommitted flush, and those fills come level first
+        // (StageDrawWritesBuffers) or run lent, so a set found empty here is empty when the back
+        // reaches this entry. No read tracking answer (13.3): the pass lists its take (rule T).
         auto* const self = static_cast<RasterizerVulkan*>(context);
-        if (VideoCore::g_read_downloads.load(std::memory_order_acquire) != 0 ||
-            VideoCore::Nx2Debug::Experiment(49) != 0) {
-            return static_cast<u8>(Link::PassReady::Tracking);
-        }
         auto& cache = self->buffer_cache;
         if (!cache.MayHaveUncommittedFlushes()) {
             return static_cast<u8>(Link::PassReady::Ready);
@@ -1319,12 +1315,20 @@ void RasterizerVulkan::SetRingBackend() {
     backend.pass_gather = [](void* context, std::vector<std::pair<u64, u64>>& ranges) -> u8 {
         return static_cast<RasterizerVulkan*>(context)->StagePassGather(ranges);
     };
-    backend.apply_pass = [](void* context, const std::pair<u64, u64>* ranges, size_t count,
-                            bool whole) {
+    backend.apply_pass = [](void* context, const std::vector<std::pair<u64, u64>>& ranges,
+                            bool whole, bool listed) {
         // The back, at a passed gather's entry (or late): the half it owes. Whole: the full
-        // gather path (the entry runs as a level run: the back holds the cache).
+        // gather path (the entry runs as a level run: the back holds the cache). A listed take
+        // (rule T, fable_stage_levelpoints 13.3) leaves applying_writes right after the apply,
+        // also when it throws, as GPU::Impl::InvalidateGPUCache's tracked gather does: a write
+        // still listed after it was applied would hold back a landing of later GPU bytes.
         auto* const self = static_cast<RasterizerVulkan*>(context);
-        const std::span<const std::pair<DAddr, u64>> span{ranges, count};
+        SCOPE_EXIT {
+            if (listed) {
+                self->gpu.ReleaseTakenWrites(&ranges);
+            }
+        };
+        const std::span<const std::pair<DAddr, u64>> span{ranges.data(), ranges.size()};
         if (whole) {
             self->OnCacheInvalidations(span);
             return;
@@ -1333,6 +1337,9 @@ void RasterizerVulkan::SetRingBackend() {
             self->mem_stage.NoteGather(MemStage::Gather::Apply, 0);
         }
         self->ApplyGatherOtherHalf(span);
+    };
+    backend.listed_writes = [](void* context) -> size_t {
+        return static_cast<RasterizerVulkan*>(context)->gpu.ListedWrites();
     };
     backend.sync_probe = [](void* context, const std::pair<u64, u64>* runs, size_t count) -> u8 {
         // fable_stage_p3 6 (dry, GPUMem outside any fill): the first run whose sync would not be
@@ -5099,8 +5106,15 @@ u8 RasterizerVulkan::StagePassGather(std::vector<std::pair<u64, u64>>& ranges) {
     // only marks (the page flags, MarkRegionAsCpuModified, MarkVertexBuffersStale, which reach
     // the copy through the mark hook) and ClaimCpuWrites does nothing, so no command is needed.
     // The verify's marks as at the served gather.
+    //
+    // Rule T (fable_stage_levelpoints 13.3): the take is listed on applying_writes until the
+    // buffer cache has it, so a landing of downloaded GPU bytes (read downloads, fence
+    // downloads: the cache's lock held) leaves those bytes out meanwhile, as for a tracked
+    // gather. Unlisted under the lock right after the buffer half; on a GPU-written page (or an
+    // exception) it stays listed and the record goes whole: the back unlists it after its apply.
+    // Lock order: the cache's lock, then applying_writes_mutex (a landing's, and the unlist's).
     using Link = VideoCommon::MemoryStageLink;
-    gpu.TakeCpuWrites(ranges);
+    const bool listed = gpu.TakeCpuWrites(ranges);
     if (ranges.empty()) {
         return static_cast<u8>(Link::PassTake::Empty);
     }
@@ -5125,7 +5139,9 @@ u8 RasterizerVulkan::StagePassGather(std::vector<std::pair<u64, u64>>& ranges) {
             }
             const DAddr begin = Common::AlignDown(addr, Core::DEVICE_PAGESIZE);
             const DAddr end = Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE);
-            if (buffer_cache.IsRegionGpuModified(begin, end - begin)) {
+            // GPUMem's own question (13.4): the real set, or a mark a fill ahead of the back
+            // made (FRITCHII_MEMSTAGE_MARKS_AHEAD's list): such a page makes the record whole.
+            if (buffer_cache.GpuWrittenHere(begin, end - begin)) {
                 return static_cast<u8>(Link::PassTake::GpuWritten);
             }
         }
@@ -5134,6 +5150,9 @@ u8 RasterizerVulkan::StagePassGather(std::vector<std::pair<u64, u64>>& ranges) {
         mem_stage.NoteCpuMark(addr, size);
     }
     const bool recorded = ApplyGatherBufferHalf(ranges);
+    if (listed) {
+        gpu.ReleaseTakenWrites(&ranges); // the cache's lock still held: no landing in between
+    }
     return static_cast<u8>(recorded ? Link::PassTake::Recorded : Link::PassTake::Applied);
 }
 
@@ -5145,7 +5164,9 @@ bool RasterizerVulkan::GatherOnStage() {
     using Link = VideoCommon::MemoryStageLink;
     std::vector<std::pair<DAddr, u64>> writes;
     OnStage(static_cast<u8>(Link::Served::Gather), [&] {
-        gpu.TakeCpuWrites(writes);
+        // Rule T (fable_stage_levelpoints 13.3): the take listed until the buffer half is done,
+        // unlisted inside the call under the cache's lock (also when the half throws).
+        const bool listed = gpu.TakeCpuWrites(writes);
         if (writes.empty()) {
             return;
         }
@@ -5153,6 +5174,11 @@ bool RasterizerVulkan::GatherOnStage() {
             mem_stage.NoteCpuMark(addr, size);
         }
         std::scoped_lock lock{buffer_cache.mutex};
+        SCOPE_EXIT {
+            if (listed) {
+                gpu.ReleaseTakenWrites(&writes);
+            }
+        };
         ApplyGatherBufferHalf(writes);
     });
     Link::Get().NoteServedTake(!writes.empty());

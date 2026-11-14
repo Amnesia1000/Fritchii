@@ -178,23 +178,13 @@ struct GPU::Impl {
                 return;
             }
         }
-        std::vector<std::pair<DAddr, u64>> writes;
-        std::function<void(PAddr, size_t)> callback_writes(
-            [&writes](PAddr address, size_t size) { writes.emplace_back(address, size); });
-        // EDEN_NX2_EXP49: gathered writes stay pending (ForEachPendingCpuWrite) until they are
-        // applied. A read download written to guest memory meanwhile on a reading thread
-        // (FinishRead) would otherwise write the GPU's older bytes over them. Read downloads are
-        // recorded on the thread that applies these (FlushRegionForRead calls this first), so
-        // with none pending and the switch off nothing is tracked and no lock is taken.
-        const bool track = VideoCore::g_read_downloads.load(std::memory_order_acquire) != 0 ||
-                           VideoCore::Nx2Debug::Experiment(49) != 0;
-        // FRITCHII_MEMSTAGE_PASS bit 1 (fable_stage_levelpoints 6.3): the back in a served entry
-        // takes nothing itself. Empty collectors: nothing to do (a write collected after this
-        // test is taken at the next gather, as one collected after the managers' locks). Else
-        // the take and the buffer half run on GPUMem in one served call, so only GPUMem takes
-        // while the back is served (no write sits between two takers while a fill passes).
-        if (!track && VideoCommon::MemoryStageLink::BackServed() &&
-            VideoCommon::MemoryStageLink::PassOn(1)) {
+        // FRITCHII_MEMSTAGE_PASS bit 1 (fable_stage_levelpoints 6.3, 13.3 item 5): the back in a
+        // served entry takes nothing itself, read tracking or not. Empty collectors: nothing to
+        // do (a write collected after this test is taken at the next gather, as one collected
+        // after the managers' locks). Else the take and the buffer half run on GPUMem in one
+        // served call, so only GPUMem takes while the back is served (no write sits between two
+        // takers while a fill passes); that take is listed as below (rule T).
+        if (VideoCommon::MemoryStageLink::BackServed() && VideoCommon::MemoryStageLink::PassOn(1)) {
             if (std::ranges::all_of(system.GetGPUDirtyMemoryManager(),
                                     [](const Core::GPUDirtyMemoryManager& manager) {
                                         return manager.NothingCollected();
@@ -205,6 +195,16 @@ struct GPU::Impl {
                 return;
             }
         }
+        std::vector<std::pair<DAddr, u64>> writes;
+        std::function<void(PAddr, size_t)> callback_writes(
+            [&writes](PAddr address, size_t size) { writes.emplace_back(address, size); });
+        // EDEN_NX2_EXP49: gathered writes stay pending (ForEachPendingCpuWrite) until they are
+        // applied. A read download written to guest memory meanwhile on a reading thread
+        // (FinishRead) would otherwise write the GPU's older bytes over them. Read downloads are
+        // recorded on the thread that applies these (FlushRegionForRead calls this first), so
+        // with none pending and the switch off nothing is tracked and no lock is taken.
+        const bool track = VideoCore::g_read_downloads.load(std::memory_order_acquire) != 0 ||
+                           VideoCore::Nx2Debug::Experiment(49) != 0;
         if (!track) {
             system.GatherGPUDirtyMemory(callback_writes);
             if (!writes.empty()) {
@@ -229,17 +229,40 @@ struct GPU::Impl {
         renderer->ReadRasterizer()->OnCacheInvalidations(writes);
     }
 
-    /// FRITCHII_MEMSTAGE_PASS (GPUMem, read tracking off): the take alone (GPU::TakeCpuWrites).
-    void TakeCpuWrites(std::vector<std::pair<DAddr, u64>>& out) {
+    /// FRITCHII_MEMSTAGE_PASS (GPUMem): the take alone (GPU::TakeCpuWrites), listed on
+    /// applying_writes whatever EXP49 says (fable_stage_levelpoints 13.3, rule T): until the
+    /// buffer cache has the writes, a landing of downloaded GPU bytes leaves them out, as for a
+    /// tracked gather. `out` must not move or change while listed. True when listed.
+    bool TakeCpuWrites(std::vector<std::pair<DAddr, u64>>& out) {
         if (std::ranges::all_of(system.GetGPUDirtyMemoryManager(),
                                 [](const Core::GPUDirtyMemoryManager& manager) {
                                     return manager.NothingCollected();
                                 })) {
-            return;
+            return false;
         }
         std::function<void(PAddr, size_t)> callback(
             [&out](PAddr address, size_t size) { out.emplace_back(address, size); });
+        // Lock order: applying_writes_mutex, then the managers' (as ForEachPendingCpuWrite).
+        std::scoped_lock lock{applying_writes_mutex};
         system.GatherGPUDirtyMemory(callback);
+        if (out.empty()) {
+            return false;
+        }
+        applying_writes.push_back(&out);
+        return true;
+    }
+
+    /// Rule T: the list TakeCpuWrites listed leaves applying_writes (the buffer cache has it).
+    void ReleaseTakenWrites(const std::vector<std::pair<DAddr, u64>>* list) {
+        std::scoped_lock lock{applying_writes_mutex};
+        std::erase(applying_writes, list);
+    }
+
+    /// Rule T's check: how many lists are on applying_writes (0 at the ring's end, no gather
+    /// running).
+    size_t ListedWrites() {
+        std::scoped_lock lock{applying_writes_mutex};
+        return applying_writes.size();
     }
 
     void ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback) {
@@ -703,8 +726,16 @@ void GPU::InvalidateGPUCache() {
     impl->InvalidateGPUCache();
 }
 
-void GPU::TakeCpuWrites(std::vector<std::pair<DAddr, u64>>& out) {
-    impl->TakeCpuWrites(out);
+bool GPU::TakeCpuWrites(std::vector<std::pair<DAddr, u64>>& out) {
+    return impl->TakeCpuWrites(out);
+}
+
+void GPU::ReleaseTakenWrites(const std::vector<std::pair<DAddr, u64>>* list) {
+    impl->ReleaseTakenWrites(list);
+}
+
+size_t GPU::ListedWrites() {
+    return impl->ListedWrites();
 }
 
 bool GPU::HasPendingCPUWrites(DAddr addr, u64 size) {
