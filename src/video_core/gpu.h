@@ -149,9 +149,14 @@ public:
     void FlushCommands();
     /// Synchronizes CPU writes with Host GPU memory.
     void InvalidateGPUCache();
-    /// The memory stage (FRITCHII_MEMSTAGE_PASS), read tracking off: takes the game's collected
-    /// CPU writes into `out` without applying them (nothing when every collector is empty).
-    void TakeCpuWrites(std::vector<std::pair<DAddr, u64>>& out);
+    /// The memory stage (FRITCHII_MEMSTAGE_PASS): takes the game's collected CPU writes into
+    /// `out` without applying them (nothing when every collector is empty), and lists `out` as
+    /// pending until ReleaseTakenWrites (rule T: landings of downloaded bytes leave them out).
+    /// `out` must not move or change while listed. True when listed.
+    bool TakeCpuWrites(std::vector<std::pair<DAddr, u64>>& out);
+    void ReleaseTakenWrites(const std::vector<std::pair<DAddr, u64>>* list);
+    /// The lists taken and not applied yet (applying_writes; rule T's check).
+    [[nodiscard]] size_t ListedWrites();
     /// Calls `callback` for each CPU write into GPU-written memory that InvalidateGPUCache has not
     /// applied yet.
     void ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback);

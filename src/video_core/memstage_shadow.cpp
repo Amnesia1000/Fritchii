@@ -1404,12 +1404,12 @@ void Condition(State& s, Copy& c) {
 
 void StageGather(State& s, Copy& c, u32 method);
 
-/// The ring backend's pass_ready (read tracking, rule C) at GPUMem's position.
+/// The ring backend's pass_ready (rule C) at GPUMem's position; no backend: Flushes (no pass).
 MemoryStageLink::PassReady PassReadyNow() {
     const auto& backend = MemoryStageLink::Get().Backend();
     return backend.pass_ready != nullptr
                ? static_cast<MemoryStageLink::PassReady>(backend.pass_ready(backend.context))
-               : MemoryStageLink::PassReady::Tracking;
+               : MemoryStageLink::PassReady::Flushes;
 }
 
 /// P0 (fable_stage_levelpoints 5.2): a fence entry outside a run, and whether rule C would hold
@@ -1567,9 +1567,7 @@ MemoryStageLink::P3Outcome P3Decide(State& s, MemoryStageLink::PassReady ready, 
     if (fence_entry && (VideoCore::Nx2Debug::Experiment(28) & 1) != 0) {
         return Outcome::Trim;
     }
-    if (ready == Ready::Tracking) {
-        return Outcome::Tracking;
-    }
+    // No read tracking test (fable_stage_levelpoints 13.3: rule T lists the take instead).
     if (ready == Ready::Flushes) {
         return Outcome::Flushes;
     }
@@ -1679,11 +1677,8 @@ PassResult StagePass(State& s, Copy& c, u32 method) {
         link.NotePass(which, Outcome::SyncPending);
         return PassResult::Today;
     }
-    // Step 4: no read tracking, no uncommitted flush (rule C).
-    if (ready == Ready::Tracking) {
-        link.NotePass(which, Outcome::Tracking);
-        return PassResult::Today;
-    }
+    // Step 4: no uncommitted flush (rule C). No read tracking test: the take is listed until the
+    // buffer cache has it (rule T, fable_stage_levelpoints 13.3).
     if (ready == Ready::Flushes) {
         link.NotePass(which, Outcome::Flushes);
         return PassResult::Today;
@@ -1707,16 +1702,20 @@ PassResult StagePass(State& s, Copy& c, u32 method) {
         } catch (...) {
             // The ring ends (RingFailed); the taken writes must not be lost: the record goes
             // whole, so the back's run of this entry applies them all (the marks again, which
-            // changes nothing where they were applied already).
+            // changes nothing where they were applied already). Rule T: they stay listed until
+            // then (the back unlists them right after its apply).
             record.whole = true;
+            record.listed = !record.ranges.empty();
             link.PassPush();
             throw;
         }
         if (took == Take::GpuWritten) {
             // WriteMemory would download or upload in place there, which must be recorded where
             // the back is: the entry runs as a level run, and its gather applies the ranges
-            // taken here whole (BackApplyPasses) before it takes more.
+            // taken here whole (BackApplyPasses) before it takes more. Rule T: listed until then,
+            // as the write waits in its collector for THREAD 0's gather at this entry.
             record.whole = true;
+            record.listed = true;
             link.PassPush();
             link.NotePass(which, Outcome::GpuWritten);
             Hard(s, s.entry_type, method);
@@ -1759,7 +1758,7 @@ void MethodCall(State& s, Copy& c, u32 method, u32 value, u32 nonshadow) {
                 const auto kind3 = MemoryStageLink::P3Kind::FenceReport;
                 const u64 head = Access::Ring()[s.processing_position & Access::RingMask];
                 // P0: rule C's rate at the fence reports outside a run.
-                const auto ready = s.ring_in_run ? MemoryStageLink::PassReady::Tracking
+                const auto ready = s.ring_in_run ? MemoryStageLink::PassReady::Flushes
                                                  : NoteFenceEntry(1);
                 if (s.ring_in_run || s.entry_hard || s.entry_draws != 0 ||
                     static_cast<Kind>(head & 0xf) != Kind::Method) {
@@ -2252,21 +2251,53 @@ size_t Process(State& s, u64 position, bool executed) {
     Class cls = Class::Pass;
     size_t size = 1;
     // Another engine's method: neutral unless executable (plan 2.6).
-    const auto other_engine = [&](u32 method, bool executable) {
+    // The sync mirror (fable_stage_levelpoints 12.2, the compute rows narrowed by 13.5) for an
+    // executable method of another engine with its words (`args`, `count`; `macro`: a macro run
+    // on the back, which may issue anything):
+    // - the upload (KeplerMemory) and 2D engines: no Query, no change;
+    // - the compute engine, EXP28 & 1 off: no change, except a 0x6c3 report semaphore of the
+    //   timestamped form (operation 0 or 2, no reduction bit 3, no one-word bit 28), a Query that
+    //   is not a fence at an address GPUMem does not keep: one more report, P3's pages unknown.
+    //   Its dispatches call no Query, and its releases are fences (a closure, or a fence-flagged
+    //   Query), which with EXP28 & 1 off can only clear (SkipEmptyFence refuses to skip while a
+    //   sync is pending; a made fence's CommitAsyncFlushes runs NotifyWFI). "No change" errs to
+    //   pending;
+    // - the compute engine with EXP28 & 1 on (but 0x6c, 0x6d), the DMA engine, an engine of no
+    //   known type, a macro: unknown.
+    const auto engine_mirror = [&](u32 method, const u32* args, u32 count, bool macro) {
+        if (s.engine_type == EngineType::KeplerMemory || s.engine_type == EngineType::Fermi2D) {
+            return;
+        }
+        if (s.engine_type == EngineType::KeplerCompute && !macro &&
+            method < MacroRegistersStart) {
+            if ((VideoCore::Nx2Debug::Experiment(28) & 1) == 0) {
+                if (method != 0x6c3) {
+                    return;
+                }
+                for (u32 i = 0; i < count; ++i) {
+                    const u32 control = args[i];
+                    const u32 operation = control & 3;
+                    if ((operation == 0 || operation == 2) && ((control >> 3) & 1) == 0 &&
+                        ((control >> 28) & 1) == 0) {
+                        ++s.sync_reports;
+                        s.p3_unknown = true;
+                    }
+                }
+                return;
+            }
+            if (method == 0x6c || method == 0x6d) {
+                return;
+            }
+        }
+        s.sync_unknown = true;
+        s.p3_unknown = true;
+    };
+    const auto other_engine = [&](u32 method, bool executable, const u32* args, u32 count,
+                                  bool macro) {
         if (executable) {
             Hard(s, LevelType::EngineMethod,
                  (u64{static_cast<u32>(s.engine_type)} << 16) | (method & 0xffff));
-            // The sync mirror (fable_stage_levelpoints 12.2): the compute engine's signals and
-            // report semaphore and the DMA engine's launches call Query with addresses GPUMem
-            // does not see (0x6c and 0x6d do not); the upload and 2D engines never do. An engine
-            // of no known type: unknown too.
-            const bool queries =
-                (s.engine_type == EngineType::KeplerCompute && method != 0x6c && method != 0x6d) ||
-                s.engine_type == EngineType::MaxwellDMA || s.engine_type == EngineType::Other;
-            if (queries) {
-                s.sync_unknown = true;
-                s.p3_unknown = true;
-            }
+            engine_mirror(method, args, count, macro);
         } else {
             cls = Class::Neutral;
         }
@@ -2312,9 +2343,10 @@ size_t Process(State& s, u64 position, bool executed) {
         }
         if (s.engine_copy == nullptr) {
             // A Sink write is a plain store (GpuSplit::SinkMethod); Direct is called.
-            other_engine(method, (head & Access::Direct) != 0 ||
-                                     ((head & Access::Sink) == 0 &&
-                                      s.engine->execution_mask[method]));
+            other_engine(method,
+                         (head & Access::Direct) != 0 ||
+                             ((head & Access::Sink) == 0 && s.engine->execution_mask[method]),
+                         &argument, 1, false);
             count_launch(method, argument);
             break;
         }
@@ -2364,9 +2396,10 @@ size_t Process(State& s, u64 position, bool executed) {
         }
         if (s.engine_copy == nullptr) {
             // Direct: a macro's words (GpuSplit::MacroWords, EXP124), called as a Direct Method.
-            other_engine(method, (head & Access::Direct) != 0 || s.engine->execution_mask[method]);
+            const u32* const words = reinterpret_cast<const u32*>(entry + data);
+            other_engine(method, (head & Access::Direct) != 0 || s.engine->execution_mask[method],
+                         words, amount, (head & Access::Direct) != 0);
             if (launches_counted && (method == 0xaf || method == 0xb0 || method == 0x107)) {
-                const u32* const words = reinterpret_cast<const u32*>(entry + data);
                 for (u32 i = 0; i < amount; ++i) {
                     count_launch(method, words[i]);
                 }
@@ -2406,7 +2439,8 @@ size_t Process(State& s, u64 position, bool executed) {
         }
         if (s.engine_copy == nullptr) {
             // Only the 3D engine sends blocks; any other engine's executable method is level.
-            other_engine(count != 0 ? static_cast<u32>((words[0] >> 8) & 0xffff) : CbData, true);
+            other_engine(count != 0 ? static_cast<u32>((words[0] >> 8) & 0xffff) : CbData, true,
+                         nullptr, 0, true); // not expected: unknown for the mirror
             break;
         }
         Copy& c0 = *s.engine_copy;

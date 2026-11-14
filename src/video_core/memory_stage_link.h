@@ -75,6 +75,8 @@ public:
         PassLate,
         PassCommand,
         PassWaitMissing,
+        PassListedFreed,
+        PassListedLeft,
         Count,
     };
 
@@ -190,8 +192,12 @@ public:
         u8 (*pass_gather)(void* context, std::vector<std::pair<u64, u64>>& ranges){};
         /// The back: a pass record's half for the other caches (`whole`: the full gather path,
         /// the buffer half too: the entry ran as a level run, or the record is late and lent).
-        void (*apply_pass)(void* context, const std::pair<u64, u64>* ranges, size_t count,
-                           bool whole){};
+        /// `listed`: the ranges are on GPU's applying_writes (rule T): unlisted right after the
+        /// apply, also when it throws.
+        void (*apply_pass)(void* context, const std::vector<std::pair<u64, u64>>& ranges,
+                           bool whole, bool listed){};
+        /// The back, at the ring's end: how many taken lists are still on applying_writes.
+        size_t (*listed_writes)(void* context){};
         /// GPUMem, P3's dry counters (fable_stage_p3 6): whether a query sync over these device
         /// runs [begin, bytes) would be pure lookups (BufferCache::ProbeSyncTarget, under the
         /// lock); the first failure, a P3Outcome (Passed when all are pure). Changes nothing.
@@ -560,6 +566,9 @@ public:
         bool whole{};
         bool seen{};           ///< The back found it at its entry (BackPassRecord)
         bool ranges_applied{}; ///< The back applied its half (BackApplyPasses)
+        /// Rule T (fable_stage_levelpoints 13.3): `ranges` is on GPU's applying_writes until the
+        /// back applies it (a whole record). It must not move or change meanwhile.
+        bool listed{};
         std::vector<std::pair<u64, u64>> ranges;
     };
     static constexpr u64 PassSlots = 256;
@@ -577,6 +586,7 @@ public:
         record.whole = false;
         record.seen = false;
         record.ranges_applied = false;
+        record.listed = false;
         record.ranges.clear();
         return record;
     }
@@ -1118,6 +1128,8 @@ private:
     alignas(64) std::atomic<u64> pass_head{0}; ///< freed (the back)
     /// The back: frees every record of an entry before `before` (late ones applied).
     void BackDropPasses(u64 before) noexcept;
+    /// The back: a record's half, once (apply_pass), unlisting it when listed (rule T).
+    void BackApplyRecord(PassRecord& record) noexcept;
     /// A must-be-0 of the passes was counted: the switch runs as 0 from the next frame end.
     std::atomic<bool> pass_refused{false};
     int pass_logged{-1};

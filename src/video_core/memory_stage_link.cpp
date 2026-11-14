@@ -349,6 +349,8 @@ constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::Check::Co
     "a pass record of an entry the back passed without asking for it (applied late)",
     "a passed gather's buffer half recorded a command",
     "a served wait for idle with no pass record (the back ran it in a served entry)",
+    "a pass record's slot freed while its taken writes were listed and not applied (rule T)",
+    "taken writes left listed (applying_writes) at the ring's end beyond the records kept",
 };
 static_assert(LINK_CHECK_NAMES.back() != nullptr, "a name for every check");
 constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::ListDraw::Count)>
@@ -787,7 +789,7 @@ void MemoryStageLink::CheckCacheUserSlow(Check check) noexcept {
 void MemoryStageLink::Note(Check check, const char* where) noexcept {
     const size_t index = static_cast<size_t>(check);
     instance.counters.checks[index].fetch_add(1, std::memory_order_relaxed);
-    if (check >= Check::PassQuerySync && check <= Check::PassWaitMissing) {
+    if (check >= Check::PassQuerySync && check <= Check::PassListedLeft) {
         // FRITCHII_MEMSTAGE_PASS runs as 0 from the next frame end (SetPass), for the session.
         instance.pass_refused.store(true, std::memory_order_relaxed);
     }
@@ -960,6 +962,21 @@ bool MemoryStageLink::BackRingTopImpl(u64 position) {
             // Pass records of entries the back passed (each one late); one at or past the end
             // stays for the back's run of its entry without the ring.
             BackDropPasses(position);
+            // Rule T's check (fable_stage_levelpoints 13.8): no gather runs here (GPUMem stopped,
+            // the back at its loop top), so the only taken lists left on applying_writes are
+            // those of the records kept (must be 0 beyond them).
+            if (ring_backend.listed_writes != nullptr) {
+                size_t kept = 0;
+                const u64 tail = pass_tail.load(std::memory_order_acquire);
+                for (u64 i = pass_head.load(std::memory_order_relaxed); i != tail; ++i) {
+                    kept += pass_records[i % PassSlots].listed ? 1 : 0;
+                }
+                const size_t listed = ring_backend.listed_writes(ring_backend.context);
+                if (listed > kept) [[unlikely]] {
+                    Note(Check::PassListedLeft,
+                         fmt::format("{} lists, {} kept by pass records", listed, kept).c_str());
+                }
+            }
             // GPUMem's unplayed mark must not outlive the ring (a fill that threw leaves its
             // entries pending and its number open): its entries are played, after the packets
             // of earlier entries above (they are later in the stream), and the mark cleared;
@@ -1647,11 +1664,15 @@ void MemoryStageLink::BackDropPasses(u64 before) noexcept {
             // applied here, late, so no invalidation is ever lost.
             Note(Check::PassLate, ("a pass record" + BackRingState(record.position)).c_str());
         }
-        if (!record.ranges_applied && !record.ranges.empty() && ring_backend.apply_pass != nullptr) {
-            ring_backend.apply_pass(ring_backend.context, record.ranges.data(),
-                                    record.ranges.size(), record.whole);
+        if (record.listed && !record.ranges_applied) {
+            // Rule T: a whole record's ranges stay listed until the back applies them at the
+            // entry; freed listed, the entry's gather never ran them (must be 0). Applied and
+            // unlisted here.
+            Note(Check::PassListedFreed, ("a pass record" + BackRingState(record.position)).c_str());
         }
-        record.ranges_applied = true;
+        if (!record.ranges_applied) {
+            BackApplyRecord(record);
+        }
         ++head;
         // Freed one by one: GPUMem may refill a slot as soon as it sees it free.
         pass_head.store(head, std::memory_order_release);
@@ -1677,11 +1698,18 @@ void MemoryStageLink::BackApplyPasses(u64 position) noexcept {
     if (record == nullptr || record->ranges_applied) {
         return;
     }
-    record->ranges_applied = true;
-    if (!record->ranges.empty() && ring_backend.apply_pass != nullptr) {
+    if (!record->ranges.empty()) {
         LinkBump(pass_stats.records_applied);
-        ring_backend.apply_pass(ring_backend.context, record->ranges.data(),
-                                record->ranges.size(), record->whole);
+    }
+    BackApplyRecord(*record);
+}
+
+void MemoryStageLink::BackApplyRecord(PassRecord& record) noexcept {
+    // Once. A listed record (rule T) is unlisted by apply_pass right after its apply.
+    record.ranges_applied = true;
+    const bool listed = std::exchange(record.listed, false);
+    if ((!record.ranges.empty() || listed) && ring_backend.apply_pass != nullptr) {
+        ring_backend.apply_pass(ring_backend.context, record.ranges, record.whole, listed);
     }
 }
 
