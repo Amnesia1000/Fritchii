@@ -332,8 +332,20 @@ bool OneFollowerDraw::FillRing(Maxwell3D& engine, bool is_indexed, u64 position,
 
 void OneFollowerDraw::LendDraw(bool is_indexed, u32 instance_count, LentReason reason,
                                bool verify) {
-    auto body = [this, is_indexed, instance_count, verify] {
-        RunLent(is_indexed, instance_count, verify);
+    // The facts compare (Check::FactsStale): with the verify, the facts table entry E's fill
+    // would use for these program registers now, before the lent draw publishes its own.
+    FactsExpect expect{};
+    if (verify) {
+        VideoCommon::MemStageShadow::ProgramId program_id;
+        VideoCommon::MemStageShadow::BackProgramId(rasterizer.channel_state->maxwell3d,
+                                                   program_id);
+        MemStage::StagedFacts looked{};
+        if (rasterizer.mem_stage.LookupFacts(program_id, looked)) {
+            expect = FactsExpect{true, looked.hashes};
+        }
+    }
+    auto body = [this, is_indexed, instance_count, verify, expect] {
+        RunLent(is_indexed, instance_count, verify, expect);
     };
     OneF::Lend(LentOp::Draw, reason, body);
 }
@@ -348,7 +360,7 @@ bool OneFollowerDraw::RouteDraw(bool is_indexed, u32 instance_count) {
             return false; // RunLent's or PlayDraw's own call of Draw
         }
         // A lent call from elsewhere (part a) runs this draw on R with E parked.
-        RunLent(is_indexed, instance_count, step == StepLevel::Build);
+        RunLent(is_indexed, instance_count, step == StepLevel::Build, FactsExpect{});
         return true;
     }
     // E. The engine is the channel's (the rasterizer's own pointer names the view while R plays).
@@ -388,7 +400,8 @@ bool OneFollowerDraw::RouteDraw(bool is_indexed, u32 instance_count) {
 
 // --- R: lent draws and the compares ----------------------------------------------------------------
 
-void OneFollowerDraw::RunLent(bool is_indexed, u32 instance_count, bool verify) {
+void OneFollowerDraw::RunLent(bool is_indexed, u32 instance_count, bool verify,
+                              const FactsExpect& expect) {
     Maxwell3D& engine = rasterizer.channel_state->maxwell3d;
     nested = true;
     SCOPE_EXIT {
@@ -403,7 +416,14 @@ void OneFollowerDraw::RunLent(bool is_indexed, u32 instance_count, bool verify) 
         // there that the view never sees (not a forwarding miss).
         Compare(engine, OneF::Step() == StepLevel::Build && lent_since_resync == 1);
     }
+    rasterizer.onef_pipeline_seen = false;
     rasterizer.Draw(is_indexed, instance_count);
+    // The programs the draw ran with against the facts E's fill would have used for them: a
+    // difference is a stale entry (the 2026-11-14 step 4 failure, caught at step 3).
+    if (expect.found && rasterizer.onef_pipeline_seen &&
+        expect.hashes != rasterizer.onef_pipeline_hashes) [[unlikely]] {
+        OneF::Note(Check::FactsStale, "lent draw: the facts entry for its program registers");
+    }
 }
 
 void OneFollowerDraw::Compare(Maxwell3D& engine, bool with_flags) {

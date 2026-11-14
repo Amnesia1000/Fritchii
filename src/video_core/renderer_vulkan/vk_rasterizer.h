@@ -224,6 +224,10 @@ private:
     friend class OneFollowerDraw;
     /// Created at construction; idle unless FRITCHII_ONEF steps 3 and 4 are on.
     std::unique_ptr<OneFollowerDraw> onef_draw;
+    /// R: the vertex and fragment program hashes of the last draw PrepareDraw found a pipeline
+    /// for (part c's facts compare reads them after a lent draw).
+    std::array<u64, 2> onef_pipeline_hashes{};
+    bool onef_pipeline_seen{};
 
     /// False when no page of the range was ever written by the GPU through the buffer cache.
     bool MayBeGpuModified(DAddr addr, u64 size);

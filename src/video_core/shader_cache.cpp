@@ -29,6 +29,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
+#include "video_core/memstage_shadow.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_fastdraw_count.h"
 #include "video_core/pipeline_cache_policy.h"
@@ -488,6 +489,7 @@ void ShaderCache::RemovePendingShaders() {
 
 void ShaderCache::InvalidatePageEntries(std::vector<Entry*>& entries, VAddr addr, VAddr addr_end) {
     size_t index = 0;
+    bool dropped = false;
     while (index < entries.size()) {
         Entry* const entry = entries[index];
         if (!entry->Overlaps(addr, addr_end)) {
@@ -498,6 +500,11 @@ void ShaderCache::InvalidatePageEntries(std::vector<Entry*>& entries, VAddr addr
         UnmarkMemory(entry);
         RemoveEntryFromInvalidationCache(entry);
         marked_for_removal.push_back(entry);
+        dropped = true;
+    }
+    if (dropped) {
+        // A program's code was written: the memory stage's facts for these addresses are stale.
+        MemStageShadow::g_program_code_epoch.fetch_add(1, std::memory_order_release);
     }
 }
 

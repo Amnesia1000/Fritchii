@@ -2037,13 +2037,14 @@ u64 MemStage::DropRingPackets(u64 position) {
 }
 
 void MemStage::PublishFacts(const ProgramId& id, const void* source, const DrawFacts& facts,
-                            bool dynamic_input) {
+                            bool dynamic_input, u64 code_epoch) {
     const u64 key = id.key != 0 ? id.key : 1;
     // The back's memo (step 7): every write of the table goes through here and updates it, so a
     // hit means the table holds this source under these registers already. No lock then. The
     // registers are compared too: one key for two programs is a miss, never the other's entry.
+    // The epoch too: a republish after a code write anywhere makes the entry good for it again.
     PublishedMemo& memo = published_memo[FactsHash(key) & (MemoSlots - 1)];
-    if (memo.key == key && memo.source == source) {
+    if (memo.key == key && memo.source == source && memo.epoch >= code_epoch) {
         if (memo.words == id.words) {
             return;
         }
@@ -2062,8 +2063,13 @@ void MemStage::PublishFacts(const ProgramId& id, const void* source, const DrawF
                 continue;
             }
             if (slot.source == source) {
-                memo = PublishedMemo{key, source, id.words};
-                return; // published already
+                // Published already: the same pipeline's facts are good for this epoch too.
+                if (slot.epoch < code_epoch) {
+                    slot.epoch = code_epoch;
+                    facts_generation.fetch_add(1, std::memory_order_release);
+                }
+                memo = PublishedMemo{key, source, id.words, slot.epoch};
+                return;
             }
             target = &slot;
             break;
@@ -2118,12 +2124,17 @@ void MemStage::PublishFacts(const ProgramId& id, const void* source, const DrawF
     target->source = source;
     target->words = id.words;
     target->facts = std::move(staged);
-    memo = PublishedMemo{key, source, id.words};
+    target->epoch = code_epoch;
+    memo = PublishedMemo{key, source, id.words, code_epoch};
     facts_generation.fetch_add(1, std::memory_order_release);
 }
 
 bool MemStage::LookupFacts(const ProgramId& id, StagedFacts& out) const {
     const u64 key = id.key != 0 ? id.key : 1;
+    // An entry published before the latest program code write may describe the old code at these
+    // addresses: a miss (MemStageShadow::g_program_code_epoch).
+    const u64 epoch =
+        VideoCommon::MemStageShadow::g_program_code_epoch.load(std::memory_order_acquire);
     // GPUMem's cache (step 7): valid while no write happened since it was filled. A write right
     // after this test is one the lookup could have missed under the lock too (the back publishes
     // at its own, earlier, position).
@@ -2139,6 +2150,9 @@ bool MemStage::LookupFacts(const ProgramId& id, StagedFacts& out) const {
     StageFactsSlot& cached = stage_facts_cache[FactsHash(key) & (StageFactsSlots - 1)];
     if (cached.key == key) {
         if (cached.words == id.words) {
+            if (cached.epoch < epoch) {
+                return false; // stale since a code write
+            }
             out = cached.facts;
             return true;
         }
@@ -2154,12 +2168,16 @@ bool MemStage::LookupFacts(const ProgramId& id, StagedFacts& out) const {
                 Link::Note(Link::Check::FactsKeyCollision, "the facts table (lookup)");
                 continue;
             }
+            if (slot.epoch < epoch) {
+                return false; // published before the latest code write: maybe the old code's
+            }
             out = slot.facts;
             if (facts_generation.load(std::memory_order_relaxed) == generation) {
                 // Kept only when the table is still the generation the cache stands for.
                 cached.key = key;
                 cached.words = id.words;
                 cached.facts = slot.facts;
+                cached.epoch = slot.epoch;
             }
             return true;
         }

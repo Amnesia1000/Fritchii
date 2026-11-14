@@ -1403,6 +1403,13 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   R-owned caches pointed at it. Steps 1 and 2 lend every draw from RasterizerVulkan itself.
   Indirect and list draws stay lent at every step. Ring B with one follower: E is the fill side
   (BeginDraw, ClaimHeld and the packet ticks treat it as GPUMem at THREAD=2).
+- The facts table (E's fills look up a pipeline's buffer layout by its program registers) is
+  keyed by code addresses: a game that rewrites shader code at the same addresses left entries
+  for the old code (step 4's first unlent draw got 7 descriptors for a 5-descriptor pipeline).
+  Every shader cache drop of a cached program bumps a program code epoch; an entry published
+  before the latest bump is a miss (the draw is lent and republishes it). "facts stale" (must be
+  0) compares, at every verified lent draw from step 3, the entry E would use with the programs
+  the draw ran with.
 
 ### FRITCHII_MEMSTAGE_AHEAD
 

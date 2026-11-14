@@ -167,6 +167,10 @@ enum class Check : u8 {
     BuildCondition,      ///< step 3: R's 0xe2c mode on its view differs from E's execute_on
     RenderPacketMissing, ///< step 4: R found no ring B packet for an unlent draw (not drawn)
     DropNotPlain,        ///< 0xe2c: a dropped draw's packet held more than uploads and binds
+    /// Step 3 (and step 4's forced-lent draws): the facts table entry E's fill would use for the
+    /// draw's program registers names other programs than the pipeline the draw ran with (code
+    /// rewritten at the same addresses and the entry not retired).
+    FactsStale,
     Count,
 };
 
@@ -175,6 +179,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Check::Count)> chec
     "view pools",    "build pipeline",   "build image views", "build dynamic",
     "build descriptors", "build render targets", "stream write", "owner on E", "owner on R",
     "build draw params", "build condition", "render packet missing", "drop not plain",
+    "facts stale",
 };
 
 // --- The packet (E to R) -----------------------------------------------------------------------------
