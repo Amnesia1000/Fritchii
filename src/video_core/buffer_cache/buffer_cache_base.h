@@ -470,9 +470,11 @@ public:
         uncommitted_flushes_noted.store(HasUncommittedFlushes(), std::memory_order_relaxed);
     }
 
-    /// The memory stage's dry counters (fable_stage_p3 4.2 and 6): whether a query result sync's
+    /// The memory stage's P3 (fable_stage_p3 4.2 and 6): whether a query result sync's
     /// ObtainCPUBuffer(FullSynchronize) on [begin, begin + bytes) would be a pure lookup (one
-    /// existing buffer holds it, no byte of it CPU-modified). Changes nothing. Under the lock.
+    /// existing buffer holds it, no page of it CPU-modified or untracked: the sync would then
+    /// only mark the usage). Changes nothing (it may create the tracker's missing managers, as
+    /// the sync would). Under the lock.
     enum class SyncProbe : u8 { Pure, NoBuffer, NotInBounds, CpuModified };
     [[nodiscard]] SyncProbe ProbeSyncTarget(DAddr begin, u64 bytes);
 

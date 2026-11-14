@@ -56,6 +56,19 @@ public:
         });
     }
 
+    /// The memory stage's P3 (fable_stage_p3 4.2): whether no page of the region is CPU-modified
+    /// or untracked (a cached write's page), so an upload walk over it (SynchronizeBuffer's, any
+    /// of its forms) finds and changes nothing: it uploads the first and re-tracks both. Missing
+    /// managers are created, as the walk creates them (all dirty: not clean).
+    [[nodiscard]] bool IsRegionSyncClean(VAddr query_cpu_addr, u64 query_size) noexcept {
+        return !IteratePages<true>(query_cpu_addr, query_size,
+                                   [](Manager* manager, u64 offset, size_t size) {
+                                       return manager->IsRegionModified(Type::CPU, offset, size) ||
+                                              manager->IsRegionModified(Type::Untracked, offset,
+                                                                        size);
+                                   });
+    }
+
     /// Returns true if every page of a region is CPU-modified and none is GPU-modified or
     /// Preflushable. False where the tracker has no manager yet (nothing to prove it).
     [[nodiscard]] bool IsRegionWhollyCpuModified(VAddr query_cpu_addr, u64 query_size) noexcept {
