@@ -1475,9 +1475,14 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     }
     // The release may still be queued for the split GPU thread's back half (and the caches
     // ReadSemaphoreWord asks are its state).
+    // FRITCHII_DELAY_POLL_DRAIN_US (live, 0 = off): the delay test of this drain, outside the
+    // poll drain's own time below.
+    using DelayTest = VideoCommon::GpuSplit::DelayTest;
+    const u32 delay_us = VideoCommon::GpuSplit::Get().DelayBeforeWait(DelayTest::PollDrain);
     const auto drain_begin = std::chrono::steady_clock::now();
     DrainBack();
     pending_acquire->last_drain = std::chrono::steady_clock::now();
+    VideoCommon::GpuSplit::DelayAfterWait(DelayTest::PollDrain, delay_us);
     FenceWriterStats::Get().NotePollDrain(
         pending_acquire->readable_release,
         drain_begin - pending_acquire->since < std::chrono::milliseconds{2},

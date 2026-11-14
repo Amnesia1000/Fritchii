@@ -3783,7 +3783,11 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                     const GPUVAddr flush_begin = source & ~GPUVAddr{0xfff};
                     const GPUVAddr flush_end = (source + read_bytes + 0xfff) & ~GPUVAddr{0xfff};
                     const size_t flush_bytes = static_cast<size_t>(flush_end - flush_begin);
+                    // FRITCHII_DELAY_MACRO_DRAIN_US (live, 0 = off): the delay test of this drain.
+                    using DelayTest = VideoCommon::GpuSplit::DelayTest;
+                    const u32 delay_us = split.DelayBeforeWait(DelayTest::MacroDrain);
                     split.Drain(VideoCommon::DrainSite::MacroDmaRead);
+                    VideoCommon::GpuSplit::DelayAfterWait(DelayTest::MacroDrain, delay_us);
                     if (memory_manager.IsMemoryDirty(flush_begin, flush_bytes,
                                                      VideoCommon::CacheType::BufferCache)) {
                         split.Run(
