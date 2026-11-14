@@ -226,6 +226,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
                 DropCollectDownloadsIn(image.cpu_addr, image.guest_size_bytes);
                 SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);
                 ++gc_download_deletes;
+                unmap_stats.downloads += image.unmapped_tick != 0 ? 1 : 0;
                 // Guest memory holds the GPU's data now (DeleteImage must not mark it stale).
                 image.flags &= ~ImageFlagBits::GpuModified;
                 ClearStaleImage(image);
@@ -447,6 +448,7 @@ void TextureCache<P>::LandCollectDownloads() {
                          entry.map.mapped_span, swizzle_data_buffer);
             ++collect_stats.landed;
             collect_stats.land_frames += frame_tick - entry.frame;
+            unmap_stats.downloads += image.unmapped_tick != 0 ? 1 : 0;
             const ImageId image_id = entry.image_id;
             DropCollectDownload(i);
             // As the waiting path, a few frames later.
@@ -943,6 +945,14 @@ void TextureCache<P>::TickFrame() {
                      collect_download_staging >> 20);
         }
         s = {};
+    }
+    unmap_stats.held_byte_frames += unmapped_live_bytes;
+    unmap_stats.held_peak = (std::max)(unmap_stats.held_peak, unmapped_live_bytes);
+    if (frame_tick % 600 == 0) {
+        if (log_tc) {
+            LogUnmapStats();
+        }
+        unmap_stats = {};
     }
     SweepColdImages();
     // An image that could not be made at all: the driver is out of memory whatever the counts
@@ -2418,6 +2428,7 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
             (image.relocation_guard_noted & GuardCpuRead) == 0 && RelocationShaped(image.info)) {
             NoteRelocationGuard(image, GuardCpuRead);
         }
+        unmap_stats.downloads += image.unmapped_tick != 0 ? 1 : 0;
         image.flags &= ~ImageFlagBits::GpuModified;
         images.push_back(image_id);
     });
@@ -2600,6 +2611,8 @@ void TextureCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t siz
     if (VideoCommon::Nx2FastDrawCount::g_on && !deleted_images.empty()) [[unlikely]] {
         VideoCommon::Nx2FastDrawCount::Break(VideoCommon::Nx2FastDrawCount::Reason::Map);
     }
+    unmap_stats.unmaps_hit += deleted_images.empty() ? 0 : 1;
+    unmap_stats.images_hit += deleted_images.size();
     for (const ImageId id : deleted_images) {
         Image& image = slot_images[id];
         ++bindings_epoch;
@@ -2615,7 +2628,53 @@ void TextureCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t siz
         }
         image.flags |= ImageFlagBits::Remapped;
         ++nx2_flagged_remapped;
+        NoteUnmapped(id, image);
     }
+}
+
+template <class P>
+void TextureCache<P>::NoteUnmapped(ImageId, Image& image) {
+    image.unmapped_tick = frame_tick + 1;
+    image.unmapped_bytes = ImageMemoryBytes(image);
+    unmapped_live_bytes += image.unmapped_bytes;
+    ++unmapped_live_images;
+    ++unmap_stats.flagged;
+}
+
+template <class P>
+void TextureCache<P>::LogUnmapStats() {
+    auto& s = unmap_stats;
+    const auto at = [](const auto& counts, DeleteReason reason) {
+        return counts[static_cast<size_t>(reason)];
+    };
+    const auto others = [&](const auto& counts) {
+        return at(counts, DeleteReason::Other) + at(counts, DeleteReason::ColdSweep) +
+               at(counts, DeleteReason::SlotRetire);
+    };
+    const u64 collector_unused = at(s.died_unused, DeleteReason::GarbageCollect);
+    const double per_death = collector_unused != 0 ? static_cast<double>(collector_unused) : 1.0;
+    LOG_INFO(HW_GPU,
+             "Texture cache last 600 frames: GPU memory unmaps {} hit {} images, {} newly flagged "
+             "remapped; flagged images found again {}, uploaded into {}, downloaded {}; deleted "
+             "while flagged (of them unused since the unmap): collector {} ({}, {:.1f} frames "
+             "after it, {} KiB each), join {} ({}), unmap {} ({}), other {} ({}); flagged now {} "
+             "images {} MiB, held {} MiB on average, {} MiB peak",
+             s.unmaps_hit, s.images_hit, s.flagged, s.refound, s.reuploaded, s.downloads,
+             at(s.died, DeleteReason::GarbageCollect), collector_unused,
+             static_cast<double>(s.collector_unused_frames) / per_death,
+             static_cast<u64>(static_cast<double>(s.collector_unused_bytes) / per_death) >> 10,
+             at(s.died, DeleteReason::Join), at(s.died_unused, DeleteReason::Join),
+             at(s.died, DeleteReason::Unmap), at(s.died_unused, DeleteReason::Unmap),
+             others(s.died), others(s.died_unused), unmapped_live_images,
+             unmapped_live_bytes >> 20, (s.held_byte_frames / 600) >> 20, s.held_peak >> 20);
+}
+
+template <class P>
+void TextureCache<P>::ForgetUnmapped(ImageId, ImageBase& image) {
+    unmapped_live_bytes -= (std::min)(unmapped_live_bytes, image.unmapped_bytes);
+    unmapped_live_images -= unmapped_live_images != 0 ? 1 : 0;
+    image.unmapped_tick = 0;
+    image.unmapped_bytes = 0;
 }
 
 template <class P>
@@ -3287,6 +3346,9 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
 
+    if (image.unmapped_tick != 0) {
+        ++unmap_stats.reuploaded; // still Remapped: reached through a cached descriptor or binding
+    }
     image.flags &= ~ImageFlagBits::CpuModified;
     // EXP76 & 2: the hash of the last whole upload, cleared here so any other way this refresh
     // changes the texels (layers, sparse pieces, the stale skip) leaves no hash behind.
@@ -3901,6 +3963,10 @@ ImageId TextureCache<P>::FindImage(const ImageInfo& info, GPUVAddr gpu_addr,
             existing_image.flags |= ImageFlagBits::CpuModified;
             ++bindings_epoch;
             ++nx2_kept_after_remap;
+            if (existing_image.unmapped_tick != 0) {
+                ++unmap_stats.refound;
+                ForgetUnmapped(existing_image_id, existing_image);
+            }
             image_id = existing_image_id;
             image_ids.clear();
             image_ids.push_back(existing_image_id);
@@ -6153,6 +6219,20 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     }
     ++images_deleted;
     Churn::Add(Churn::ImagesDeleted);
+    if (image.unmapped_tick != 0) {
+        // Still flagged by an unmap. Unused since: no upload or full overwrite took the
+        // CpuModified the unmap set, so nothing could have downloaded it either.
+        const auto reason = static_cast<size_t>(delete_reason);
+        ++unmap_stats.died[reason];
+        if (True(image.flags & ImageFlagBits::CpuModified)) {
+            ++unmap_stats.died_unused[reason];
+            if (delete_reason == DeleteReason::GarbageCollect) {
+                unmap_stats.collector_unused_frames += frame_tick + 1 - image.unmapped_tick;
+                unmap_stats.collector_unused_bytes += image.unmapped_bytes;
+            }
+        }
+        ForgetUnmapped(image_id, image);
+    }
     ++bindings_epoch;
     VideoCommon::Nx2FastDrawCount::Break(VideoCommon::Nx2FastDrawCount::Reason::Invalidation);
     if ((VideoCore::Nx2Debug::Experiment(76) & 4) != 0) [[unlikely]] {

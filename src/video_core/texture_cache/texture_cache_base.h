@@ -775,6 +775,33 @@ private:
     u64 nx2_upload_skips = 0;
     u64 nx2_upload_skip_bytes = 0;
     u64 nx2_upload_hash_checks = 0;
+    /// Images an unmap of their GPU memory flagged Remapped, and what became of them: the
+    /// "Texture cache last 600 frames: GPU memory unmaps" line (EDEN_NX2_TC_LOG). Counted off the
+    /// draw path only (unmaps, uploads, downloads, deletes, the frame end).
+    struct UnmapStats {
+        u64 unmaps_hit = 0;  ///< UnmapGPUMemory calls that found images
+        u64 images_hit = 0;  ///< Images they found, flagged before or not
+        u64 flagged = 0;     ///< Images newly flagged Remapped
+        u64 refound = 0;     ///< Found again at the same address and shape (EXP76 & 1)
+        u64 reuploaded = 0;  ///< Uploads into a flagged image (a cached descriptor or binding)
+        u64 downloads = 0;   ///< Downloads of a flagged image (collector, guest reads)
+        /// Deleted while flagged, by reason; and of those, the ones not used since the unmap
+        /// (still CpuModified: no path would have downloaded them).
+        std::array<u64, static_cast<size_t>(DeleteReason::Count)> died{};
+        std::array<u64, static_cast<size_t>(DeleteReason::Count)> died_unused{};
+        u64 collector_unused_frames = 0; ///< Frames from the unmap, summed over those
+        u64 collector_unused_bytes = 0;  ///< Their device memory, summed
+        u64 held_byte_frames = 0;        ///< Device memory of flagged images, summed per frame
+        u64 held_peak = 0;               ///< The most at one frame end
+    };
+    UnmapStats unmap_stats;
+    u64 unmapped_live_bytes = 0;  ///< Device memory of the images flagged now
+    u64 unmapped_live_images = 0; ///< How many
+    /// UnmapGPUMemory flagged it Remapped: counted and remembered (unmapped_tick).
+    void NoteUnmapped(ImageId image_id, Image& image);
+    /// Remapped cleared (found again) or the image deleted: no longer counted as flagged.
+    void ForgetUnmapped(ImageId image_id, ImageBase& image);
+    void LogUnmapStats();
     /// EXP77: shapes of GPU-written images the cold sweep deleted, by address (at most 65,536),
     /// and the shapes guarded because a texture header asked for that address again.
     ::Common::unordered_map<GPUVAddr, u64> nx2_swept_shapes;
