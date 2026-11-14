@@ -160,6 +160,12 @@ public:
         return discard_decision.serial == lookup_serial && discard_decision.skip;
     }
 
+    /// The device features FixedPipelineState::Refresh builds keys with (one follower's verify,
+    /// vk_one_follower_draw.cpp, builds a key from each engine with them).
+    [[nodiscard]] const DynamicFeatures& Features() const noexcept {
+        return dynamic_features;
+    }
+
     /// EXP118 (the delta path, fritchii_delta_path.h): what a lookup now would give a draw that
     /// follows `pipeline`'s draw with only light state changed (the delta draw count's serial).
     enum class DeltaLookup : u8 {

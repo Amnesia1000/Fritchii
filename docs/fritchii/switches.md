@@ -1396,6 +1396,13 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
     (both ms/s, divided by fps); R = "R busy" on the "One follower threads" line (GPU profile).
 - Must-be-0 line, every 10 s: "One follower checks (must be 0; this window / session): view words
   a / b, ...". Ownership: "owner on E" (an R-owned object used on E while R ran) and "owner on R".
+- Steps 3 and 4 (part c, vk_one_follower_draw.cpp): from step 3 E's draws go through
+  OneFollowerDraw::RouteDraw (lent with the build compare; at step 4 the playable kinds, plain
+  indexed, plain arrays and instance loops, are filled into ring B on E and pushed). R keeps a view
+  engine (a Maxwell3D no method reaches) fed by the same spans, and plays a pushed draw with the
+  R-owned caches pointed at it. Steps 1 and 2 lend every draw from RasterizerVulkan itself.
+  Indirect and list draws stay lent at every step. Ring B with one follower: E is the fill side
+  (BeginDraw, ClaimHeld and the packet ticks treat it as GPUMem at THREAD=2).
 
 ### FRITCHII_MEMSTAGE_AHEAD
 

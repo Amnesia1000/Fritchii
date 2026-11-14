@@ -59,6 +59,15 @@ public:
     /// Erase channel's state.
     void EraseChannel(s32 id);
 
+    /// One follower (vk_one_follower_draw.cpp): the 3D engine this cache reads, swapped for R's
+    /// view engine while R plays an unlent draw and back after (BindToChannel sets it as before).
+    /// Returns the one it had.
+    Tegra::Engines::Maxwell3D* ExchangeMaxwell3D(Tegra::Engines::Maxwell3D* engine) noexcept {
+        Tegra::Engines::Maxwell3D* const previous = maxwell3d;
+        maxwell3d = engine;
+        return previous;
+    }
+
     Tegra::MemoryManager* GetFromID(size_t id) const {
         std::unique_lock<std::mutex> lk(config_mutex);
         const auto ref = address_spaces.find(id);
