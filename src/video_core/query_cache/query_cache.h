@@ -649,6 +649,13 @@ void QueryCacheBase<Traits>::BindToChannel(s32 id) {
 }
 
 template <typename Traits>
+bool QueryCacheBase<Traits>::ReportLandsLater(QueryType type) const {
+    const auto index = static_cast<size_t>(type);
+    return type != QueryType::Payload && index < impl->streamers.size() &&
+           impl->streamers[index] != nullptr;
+}
+
+template <typename Traits>
 void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type,
                                            QueryPropertiesFlags flags, u32 payload, u32 subreport) {
     CounterReportAt(addr, gpu_memory->GpuToCpuAddress(addr), counter_type, flags, payload,

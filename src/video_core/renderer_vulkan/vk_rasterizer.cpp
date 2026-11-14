@@ -108,12 +108,14 @@
 // thread-local load and a branch per entry.
 #define ONEF_LEND(op, call)                                                                        \
     if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {                                     \
+        VideoCommon::OneFollower::SetLendSite(__func__);                                           \
         auto onef_call = [&] { call; };                                                            \
         VideoCommon::OneFollower::Lend(VideoCommon::OneFollower::LentOp::op, onef_call);           \
         return;                                                                                    \
     }
 #define ONEF_LEND_RESULT(op, call)                                                                 \
     if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {                                     \
+        VideoCommon::OneFollower::SetLendSite(__func__);                                           \
         std::optional<std::remove_cvref_t<decltype(call)>> onef_result;                            \
         auto onef_call = [&] { onef_result.emplace(call); };                                       \
         VideoCommon::OneFollower::Lend(VideoCommon::OneFollower::LentOp::op, onef_call);           \
@@ -4584,11 +4586,20 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                 std::scoped_lock lock{buffer_cache.mutex};
                 registered = buffer_cache.IsRegionRegistered(*device, 16);
             }
-            if (registered) {
+            // QUERY_OPS=2: the guard is about a report that lands inside CounterReport (a type
+            // without a streamer becomes a payload write there; lent, E resumes after it landed).
+            // A counter report only queues: it lands at a fence or flush, which is lent, in both
+            // forms, and its buffer side (SyncValues) runs there. Nothing E reads changes in
+            // CounterReport itself (E's own report page filter, below, stands for the query
+            // cache's until R plays it).
+            const bool buffer_page_op =
+                registered && OneF::QueryOpsOnBufferPages() && query_cache.ReportLandsLater(type);
+            if (registered && !buffer_page_op) {
                 // A lend reason, not a must-be-0: OoT's reports often land in buffers.
                 OneF::SetQueryKind(OneF::QueryKind::ReportOnBufferPage);
             } else {
-                OneF::SetQueryKind(OneF::QueryKind::PlainReport);
+                OneF::SetQueryKind(buffer_page_op ? OneF::QueryKind::BufferPageOp
+                                                  : OneF::QueryKind::PlainReport);
                 if (device) {
                     // Item 2: E's invalidations see this page as a query's before R plays the op
                     // (R marks the query cache's own filter only then).

@@ -116,6 +116,11 @@ public:
     void CounterReport(GPUVAddr addr, QueryType counter_type, QueryPropertiesFlags flags,
                        u32 payload, u32 subreport);
 
+    /// One follower (FRITCHII_ONEF_QUERY_OPS=2): whether a report of `type` lands later, at a
+    /// fence or flush (a streamer exists), not inside CounterReport (the payload write a type
+    /// without a streamer becomes).
+    [[nodiscard]] bool ReportLandsLater(QueryType type) const;
+
     /// CounterReport with `addr` already translated (FRITCHII_ONEF_QUERY_OPS: E translates at
     /// its stream place, R writes the report).
     void CounterReportAt(GPUVAddr addr, std::optional<DAddr> device, QueryType counter_type,

@@ -347,6 +347,10 @@ void Lend(LentOp op, F& function) {
     Lend(op, LentReason::StepBelowUnlend, function);
 }
 
+/// E: the call site of the next Lend (the rasterizer's ONEF_LEND passes its function's name),
+/// for the "lends by site" line (fable_b 11.5's pricing of items 3 to 7). A string literal.
+void SetLendSite(const char* site) noexcept;
+
 /// E: wait until R has played every packet pushed (E is about to touch an R-owned object itself).
 void Drain();
 /// E: packets R has not played.
@@ -498,6 +502,9 @@ void DisableUnlend(const char* why) noexcept;
 /// FRITCHII_ONEF_QUERY_OPS (live; fable_b 11.1 item 1): render enables that cannot have set host
 /// conditional rendering send nothing, counter resets and plain reports are render ops (no park).
 [[nodiscard]] bool QueryOps() noexcept;
+/// FRITCHII_ONEF_QUERY_OPS=2: plain reports on buffer cache pages are render ops too, when their
+/// type lands later (at a fence or flush, lent), not inside CounterReport.
+[[nodiscard]] bool QueryOpsOnBufferPages() noexcept;
 
 /// E: a render op R runs at its stream place while E goes on: `function(payload copy)` on R,
 /// `size` bytes (at most 64) copied into the packet. Elsewhere it runs in place.
@@ -543,6 +550,7 @@ enum class QueryKind : u8 {
     Reset,                 ///< a counter reset (lent, or a render op with QUERY_OPS)
     PlainReport,           ///< a report, not a fence (lent, or a render op with QUERY_OPS)
     ReportOnBufferPage,    ///< a plain report kept lent by the guard (a lend reason, common)
+    BufferPageOp,          ///< QUERY_OPS=2: a plain report on a buffer page as a render op
     FenceReport,           ///< a fence-flagged report (lent; item 4)
     PayloadRelease,        ///< a payload release (lent; item 4)
     Count,
@@ -550,7 +558,8 @@ enum class QueryKind : u8 {
 inline constexpr std::array<const char*, static_cast<size_t>(QueryKind::Count)> query_kind_names{
     "condition skipped", "condition override", "condition true", "condition false",
     "condition conditional", "condition if equal", "condition if not equal", "reset",
-    "plain report", "report on buffer page", "fence report", "payload release",
+    "plain report", "report on buffer page", "report on buffer page as op", "fence report",
+    "payload release",
 };
 /// E, before the Lend or PushOp of a query: its kind (counted with the park's time).
 void SetQueryKind(QueryKind kind) noexcept;
