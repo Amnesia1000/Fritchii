@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <bitset>
 #include <chrono>
@@ -456,6 +457,18 @@ public:
 
     /// Return true when there are uncommitted buffers to be downloaded
     [[nodiscard]] bool HasUncommittedFlushes() const noexcept;
+
+    /// FRITCHII_FENCE_COMMIT_FAST: false only when HasUncommittedFlushes was false at the last
+    /// refresh (under the lock) and no fence download was queued since (QueueFenceDownload
+    /// raises it, under the lock). Any thread, no lock.
+    [[nodiscard]] bool MayHaveUncommittedFlushes() const noexcept {
+        return uncommitted_flushes_noted.load(std::memory_order_relaxed);
+    }
+
+    /// FRITCHII_FENCE_COMMIT_FAST: the note from the range sets. Under the lock.
+    void RefreshUncommittedFlushesNote() noexcept {
+        uncommitted_flushes_noted.store(HasUncommittedFlushes(), std::memory_order_relaxed);
+    }
 
     void AccumulateFlushes();
 
@@ -1112,6 +1125,9 @@ private:
 
     MemoryTracker memory_tracker;
     Common::RangeSet<DAddr> uncommitted_gpu_modified_ranges;
+    /// MayHaveUncommittedFlushes's note: raised before every add to the set above (its ranges
+    /// move to committed_gpu_modified_ranges only from there).
+    std::atomic<bool> uncommitted_flushes_noted{false};
 
     /// Whether GPU-written buffer ranges are copied back to guest memory at the next fence;
     /// otherwise only when something flushes them (as the original code below High GPU accuracy).
@@ -1213,7 +1229,9 @@ private:
             const char* value = std::getenv("EDEN_NX2_EXACT_PREFLUSH");
             return value == nullptr || value[0] != '0';
         }();
+        // FRITCHII_FENCE_COMMIT_FAST: each add below raises the note first.
         if (AsyncBufferDownloads()) {
+            uncommitted_flushes_noted.store(true, std::memory_order_relaxed);
             uncommitted_gpu_modified_ranges.Add(device_addr, size);
             return;
         }
@@ -1223,6 +1241,7 @@ private:
         // flushes on demand only while the data is still in flight (GetFlushArea).
         if (!exact) {
             if (memory_tracker.IsRegionPreflushable(device_addr, size)) {
+                uncommitted_flushes_noted.store(true, std::memory_order_relaxed);
                 uncommitted_gpu_modified_ranges.Add(device_addr, size);
             }
             ArmReadTraps(device_addr, size);
@@ -1234,6 +1253,7 @@ private:
             const DAddr lower = (std::max)(begin, device_addr);
             const DAddr upper = (std::min)(begin + length, end);
             if (lower < upper) {
+                uncommitted_flushes_noted.store(true, std::memory_order_relaxed);
                 uncommitted_gpu_modified_ranges.Add(lower, upper - lower);
                 queued += upper - lower;
             }

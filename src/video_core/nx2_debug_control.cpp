@@ -379,6 +379,15 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_ACQUIRE_MET_BY") {
         return &g_acquire_met_by;
     }
+    if (name == "FRITCHII_GATHER_ONE_LOCK") {
+        return &g_gather_one_lock;
+    }
+    if (name == "FRITCHII_GATHER_EMPTY_TEST") {
+        return &g_gather_empty_test;
+    }
+    if (name == "FRITCHII_FENCE_COMMIT_FAST") {
+        return &g_fence_commit_fast;
+    }
     return nullptr;
 }
 

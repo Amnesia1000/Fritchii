@@ -305,6 +305,83 @@ channel sent the release asks too. Never inside a list: that would change the ch
   was queued but the word read could not show it, or waited for it (a 16-byte note over the word,
   the throttle).
 
+### FRITCHII_GATHER_ONE_LOCK
+
+FRITCHII_GATHER_ONE_LOCK (live, default 0 = exactly as before; fable_front_drains 8.2 G1). The
+game's collected writes, applied at a gather on the back (RasterizerVulkan::OnCacheInvalidations,
+EXP88's path), took the buffer cache's lock and opened and closed a memory seam bracket
+(MemStage::FillPlay) once per range: 63,000 to 73,000 ranges a second at the market, 2.5 ms/s in
+the lock and 7.3 ms/s closing brackets (5.4 of it one shared atomic in Fill::~Fill).
+- 1: two passes over the gather's ranges. First the texture cache's WriteMemory and the pipeline
+  cache's InvalidateRegion for every range, as before. Then the buffer cache's part (the reach
+  test, NoteWriteUnlocked or WriteMemory, the verify check) for every range, under one hold of its
+  lock and one bracket, taken at the first range that needs them (a gather whose ranges all skip
+  takes neither, as before).
+- Why it is exact: each cache gets the same calls in the same order. Across caches nothing
+  depends on order. The texture and pipeline calls change only their own state. The buffer
+  cache's WriteMemory changes its own state, guest memory (a page download, after the claim) and
+  records commands; the other two read none of that. The shared part is the device pages' cached
+  counts, which all three only lower here: the sum does not depend on the order, and a page is
+  unprotected only when its last user lowers it, in the same call that marks that user's data
+  CPU-modified. The bracket plays its entries before anything else is recorded (SeamHook::OnUse),
+  so one bracket records the same commands in the same order as one per range. Other threads that
+  want the buffer lock wait for the whole buffer pass instead of one range.
+- What changes besides time: the seam's counters (fills per site; one Invalidation fill per
+  gather) and, with packet ticks, one operation packet number per gather instead of per range.
+- Count: "N gathers under one buffer lock (FRITCHII_GATHER_ONE_LOCK)" in the "Constant buffer
+  path (EXP88=n, 5 s)" line.
+- Expected: about 8 to 9 ms/s off the back at the market (stage off), the per-range lock and
+  bracket close; the bracket's atomic runs about 1,400 times a second instead of 68,000.
+
+### FRITCHII_GATHER_EMPTY_TEST
+
+FRITCHII_GATHER_EMPTY_TEST (live, default 0 = exactly as before; fable_front_drains 8.2 G3). About
+20,000 gathers a second reach GPU::InvalidateGPUCache at the market, 93% of them with nothing
+collected; asking the four game cores' managers (two mutexes each, a std::function, a vector)
+was 4.4 ms/s of the back.
+- 1: before the gather (after run-ahead's own check), each manager answers
+  GPUDirtyMemoryManager::NothingCollected, one lock-free 8-byte load of its `current` word. When
+  all four say nothing, the gather is not made. Nothing is added on the game threads' side: the
+  flag is `current` itself.
+- Why it is exact: a manager holds a collected write that no gather took only while `current` is
+  not the empty word {~0, 0}. Collect leaves `current` holding the write (its CAS) or, when it
+  moves to another 2 KB block, pushes the old word to the back list and stores the new one in the
+  same locked section; only Gather stores the empty word, in the locked section that also takes
+  the back list. A write collected before the test (any chain of locks or atomics from the
+  game thread's Collect to the back, which the game's submit always is) is, by the atomics'
+  coherence, seen by the test as that Collect's store or a later one: a later Collect (not empty)
+  or a Gather's empty word, which took it. A write collected after the test is taken by the next
+  gather, as today. A second gatherer (a FlushRegion off the back) no longer waits for another
+  one's collection in progress; it never waited for that one's application either, and the
+  pending-write list (EXP49) still closes the gap for landing downloads.
+- "Gather empty test (FRITCHII_GATHER_EMPTY_TEST=n) 10 s: gathers asked N/s, skipped as empty
+  M/s (P%)" (HW_GPU, Info).
+- Expected: most of the 4.4 ms/s.
+
+### FRITCHII_FENCE_COMMIT_FAST
+
+FRITCHII_FENCE_COMMIT_FAST (live, default 0 = exactly as before; fable_front_drains 8.3 row 3).
+Every fence's FenceManager::CommitCacheFlushes takes the texture cache's lock and then the buffer
+cache's (with a memory seam bracket) to find out whether a download waits to be committed:
+10,606 fences a second in the market's compute stretch found none (5.3 ms/s).
+- 1: each half is skipped, lock and bracket included, when its cache's note says it has nothing:
+  TextureCache::MayHaveAsyncFlushWork (a download or download buffer queued since the last commit)
+  and BufferCache::MayHaveUncommittedFlushes (a fence download range queued, QueueFenceDownload).
+  Both notes are kept always (also at 0): raised where the work is queued, under the cache's
+  lock, and set again from the containers under the lock after each commit.
+- Why it is exact: a note is raised in the same locked section that adds to the containers its
+  cache's test reads (texture: uncommitted_downloads, uncommitted_async_buffers; buffer:
+  uncommitted_gpu_modified_ranges, which AccumulateFlushes moves to committed_gpu_modified_ranges)
+  and lowered only under the lock from the containers themselves, so "note down" means the
+  containers were empty at that point. With the containers empty the half does nothing but take
+  the lock and open an empty bracket (should_flush false, nothing committed). Work queued on the
+  fencing thread is seen in program order; work queued on another thread that does not happen
+  before the fence is ordered after it, as when that thread takes the lock second. The skipped
+  bracket held no entries; pending entries are played before anything else is recorded either way.
+- "Fence commit fast (FRITCHII_FENCE_COMMIT_FAST=n) 10 s: commits N/s, texture half skipped T/s,
+  buffer half skipped B/s" (HW_GPU, Info).
+- Expected: about 3 to 4 ms/s (both lock takes at most fences in the compute stretch).
+
 ### EDEN_NX2_ACCURATE_PARTS
 
 EDEN_NX2_ACCURATE_PARTS (bit mask, 0 = none, read once at boot): parts of GPU accuracy High in

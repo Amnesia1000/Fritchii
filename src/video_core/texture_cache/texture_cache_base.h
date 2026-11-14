@@ -383,6 +383,18 @@ public:
     /// Whether CommitAsyncFlushes would commit anything (downloads or their buffers).
     [[nodiscard]] bool HasAsyncFlushWork() const noexcept;
 
+    /// FRITCHII_FENCE_COMMIT_FAST: false only when HasAsyncFlushWork was false at the last
+    /// refresh (under the lock) and nothing was queued since. Raised in the locked sections that
+    /// queue a download or its buffer. Any thread, no lock.
+    [[nodiscard]] bool MayHaveAsyncFlushWork() const noexcept {
+        return async_flush_work_noted.load(std::memory_order_relaxed);
+    }
+
+    /// FRITCHII_FENCE_COMMIT_FAST: the note from the containers. Under the lock.
+    void RefreshAsyncFlushWorkNote() noexcept {
+        async_flush_work_noted.store(HasAsyncFlushWork(), std::memory_order_relaxed);
+    }
+
     /// Return true when the caller should wait for async downloads
     [[nodiscard]] bool ShouldWaitAsyncFlushes() const noexcept;
 
@@ -1419,6 +1431,8 @@ private:
     std::vector<PendingDownload> uncommitted_downloads;
     std::deque<std::vector<PendingDownload>> committed_downloads;
     std::vector<AsyncBuffer> uncommitted_async_buffers;
+    /// MayHaveAsyncFlushWork's note: raised with every add to the two lists above.
+    std::atomic<bool> async_flush_work_noted{false};
     std::deque<std::vector<AsyncBuffer>> async_buffers;
     std::deque<AsyncBuffer> async_buffers_death_ring;
 

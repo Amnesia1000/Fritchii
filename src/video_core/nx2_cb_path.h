@@ -41,6 +41,8 @@ struct Counters {
     std::atomic<u64> guest_ranges{};
     std::atomic<u64> guest_skipped{};
     std::atomic<u64> guest_claim_skips{}; ///< Batches whose ClaimCpuWrites needed no lock
+    /// FRITCHII_GATHER_ONE_LOCK: gathers whose buffer part took the lock once for all ranges.
+    std::atomic<u64> guest_one_lock_holds{};
     // Parts a and b (Maxwell3D::WriteBoundConstantBuffer).
     std::atomic<u64> direct_writes{};
     std::atomic<u64> fallback_device0{}; ///< The bound buffer isn't one mapped device range
@@ -86,7 +88,8 @@ inline void MaybeLog(int mode) {
              "Constant buffer path (EXP88={}, 5 s): flush ranges {}, c skipped {} ({:.1f}%), "
              "locked {} (kept: ever synchronized {}, may be GPU-written {}, vertex binding {}), "
              "{} flushes without the buffer lock; guest write ranges {}, c skipped {}, {} claims "
-             "without the lock; a+b direct writes {}, fallbacks device 0 {}, sparse {}; verify "
+             "without the lock, {} gathers under one buffer lock (FRITCHII_GATHER_ONE_LOCK); a+b "
+             "direct writes {}, fallbacks device 0 {}, sparse {}; verify "
              "skip {} checked, {} would change (whole session, must be 0), direct {} checked, {} "
              "differ (whole session, must be 0)",
              mode, ranges, skipped, ranges != 0 ? 100.0 * double(skipped) / double(ranges) : 0.0,
@@ -98,6 +101,7 @@ inline void MaybeLog(int mode) {
              c.guest_ranges.exchange(0, std::memory_order_relaxed),
              c.guest_skipped.exchange(0, std::memory_order_relaxed),
              c.guest_claim_skips.exchange(0, std::memory_order_relaxed),
+             c.guest_one_lock_holds.exchange(0, std::memory_order_relaxed),
              c.direct_writes.exchange(0, std::memory_order_relaxed),
              c.fallback_device0.exchange(0, std::memory_order_relaxed),
              c.fallback_sparse.exchange(0, std::memory_order_relaxed),

@@ -85,6 +85,17 @@ public:
         front_buffer.clear();
     }
 
+    /// FRITCHII_GATHER_EMPTY_TEST: true when no collected write waits for a gather, without a lock.
+    /// Only Gather stores the empty word, in the locked section that also takes back_buffer;
+    /// every Collect that adds bits leaves `current` holding a word that is not the empty one
+    /// (its CAS, or the push's exchange, made in the same locked section as the push). So a
+    /// Collect that happens before this load is seen as its own store or a later one: another
+    /// Collect's (not empty) or a Gather's empty word, which took it (atomics' coherence).
+    [[nodiscard]] bool NothingCollected() const noexcept {
+        const TransformAddress t = current.load(std::memory_order_acquire);
+        return t.address == default_transform.address && t.mask == default_transform.mask;
+    }
+
     /// Returns true when collected writes not yet gathered overlap [address, address + size).
     bool Overlaps(PAddr address, size_t size) {
         const PAddr end = address + size;
