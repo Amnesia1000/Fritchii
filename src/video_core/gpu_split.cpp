@@ -2179,6 +2179,7 @@ void CbBump(std::atomic<u64>& counter, u64 amount = 1) {
 void GpuSplit::ExecuteCbWords(const u64* words, u32 count, const u64* verify_address) {
     // Must be 0: a word that is not what CbWord writes (a Method word for a constant buffer data
     // register, without a segment or the sink tag), or a block longer than CbWord makes one.
+    using Tegra::Engines::Maxwell3D;
     constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
     bool well_formed = count != 0 && count <= MaxCbWords;
     for (u32 i = 0; i < count && well_formed; ++i) {
