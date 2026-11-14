@@ -2389,7 +2389,21 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         fs.sink_pending = false; // Held executable writes: each consumes the sink when sent
         return;
     }
-    if (from_macro && (execution_mask[method] || !VideoCommon::GpuSplit::MacroSink())) {
+    // FRITCHII_CB_WORDS_BLOCK (live, default 0): a constant buffer data word goes into the open
+    // CbWords block as the very Method word its own entry would carry (Direct and last from a
+    // macro, as MacroWrite; the command list's last-call bit, as Method), committed and noted at
+    // its own position (GpuSplit::CbWord); the notes below are made as for its entry. 2 also
+    // sends the address noted for a block's first word, which the back compares.
+    int cb_block = 0;
+    if (cb_write) {
+        cb_block = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_cb_words_block,
+                                                    "FRITCHII_CB_WORDS_BLOCK");
+    }
+    if (cb_block != 0) {
+        split.CbWord(this, method, argument, from_macro || is_last_call, from_macro, effect,
+                     cb_block == 2 ? &*cb_write : nullptr);
+        fs.sink_pending = false; // The back's block consumes the sink first, as each entry did
+    } else if (from_macro && (execution_mask[method] || !VideoCommon::GpuSplit::MacroSink())) {
         if (fs.packet_on && IsDrawPacketMethod(method)) [[unlikely]] {
             // EDEN_NX2_DRAW_PACKET: the same Direct write, held in the draw packet (none of
             // these methods writes memory or is noted below).

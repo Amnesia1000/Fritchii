@@ -434,6 +434,10 @@ void GpuSplit::Stop() {
     pairs_count = 0;
     delta_header = nullptr;
     delta_count = 0;
+    cb_header = nullptr;
+    cb_count = 0;
+    cb_verify = false;
+    cb_end = 0;
     pending_flush = nullptr;
     pending_flush_argument = nullptr;
     fold_count = 0;
@@ -491,6 +495,7 @@ void GpuSplit::Publish() {
     // The back may read what is published: the open blocks are final from here on.
     pairs_header = nullptr;
     delta_header = nullptr;
+    cb_header = nullptr;
     if (published_local == write_position) {
         return;
     }
@@ -510,6 +515,7 @@ void GpuSplit::Publish() {
     if ((++publishes & 1023) == 0) [[unlikely]] {
         ReportBatched();
         ReportQmdFloor();
+        ReportCbWords();
     }
 }
 
@@ -749,6 +755,7 @@ void GpuSplit::RangeLastWrite(GPUVAddr begin, GPUVAddr end, const u32* data, siz
         }
         ranged_overflow_position = (std::max)(ranged_overflow_position, oldest.position);
         ++floor_stats.overflows;
+        ++ranged_overflow_count;
         ranged_writes.pop_front();
     }
     RangedWrite& write = ranged_writes.push_back(write_position, begin, end, method);
@@ -2150,8 +2157,231 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
             ->RunDrawBatch(*system, entry + 1, count, repeats);
         return 1 + size_t{count};
     }
+    case Kind::CbWords: {
+        // FRITCHII_CB_WORDS_BLOCK: one entry for what were `count` Method entries in a row.
+        const u32 count = static_cast<u32>(head >> 32);
+        const bool verify = (head & CbVerify) != 0;
+        const size_t first = verify ? 2 : 1;
+        ExecuteCbWords(entry + first, count, verify ? entry + 1 : nullptr);
+        return first + size_t{count};
+    }
     }
     return 1;
+}
+
+namespace {
+/// A counter with one writer (the back): a plain load and store.
+void CbBump(std::atomic<u64>& counter, u64 amount = 1) {
+    counter.store(counter.load(std::memory_order_relaxed) + amount, std::memory_order_relaxed);
+}
+} // Anonymous namespace
+
+void GpuSplit::ExecuteCbWords(const u64* words, u32 count, const u64* verify_address) {
+    // Must be 0: a word that is not what CbWord writes (a Method word for a constant buffer data
+    // register, without a segment or the sink tag), or a block longer than CbWord makes one.
+    constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+    bool well_formed = count != 0 && count <= MaxCbWords;
+    for (u32 i = 0; i < count && well_formed; ++i) {
+        const u64 word = words[i];
+        well_formed = static_cast<Kind>(word & 0xf) == Kind::Method &&
+                      (word & (HasSegment | Sink)) == 0 &&
+                      static_cast<u32>((word >> 8) & 0xffff) - cb_data < 16;
+    }
+    CbBump(cb_back.blocks);
+    CbBump(cb_back.words, count);
+    if (!well_formed) [[unlikely]] {
+        CbBump(cb_back.bad);
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_ERROR(HW_GPU, "CB words block: a block of {} words holds other words (first {:#x})",
+                      count, count != 0 ? words[0] : 0);
+        }
+        // Each Method word on its own, as its entry would run (none has a segment word to
+        // read); anything else is dropped.
+        for (u32 i = 0; i < count; ++i) {
+            if (static_cast<Kind>(words[i] & 0xf) == Kind::Method &&
+                (words[i] & HasSegment) == 0) {
+                Execute(words + i, 1);
+            }
+        }
+        return;
+    }
+    if (verify_address != nullptr) [[unlikely]] {
+        VerifyCbWords(words, count, *verify_address);
+        return;
+    }
+    // As the entries in a row ran: Execute's Method case takes the constant buffer words that
+    // follow it (up to 64, the block's limit) in one CallConstBufferWords, or runs each alone
+    // where that gather is off (Nx2Perf cb_batch, not fast_maxwell3d).
+    for (u32 done = 0; done < count;) {
+        done += static_cast<u32>(Execute(words + done, count - done));
+    }
+}
+
+void GpuSplit::VerifyCbWords(const u64* words, u32 count, u64 front_address) {
+    using Tegra::Engines::Maxwell3D;
+    const auto run_block = [&] {
+        for (u32 done = 0; done < count;) {
+            done += static_cast<u32>(Execute(words + done, count - done));
+        }
+    };
+    auto* const maxwell3d = dynamic_cast<Maxwell3D*>(back_engine);
+    if (maxwell3d == nullptr) {
+        CbBump(cb_back.apply_skipped);
+        run_block();
+        return;
+    }
+    // The sink first, as the block's first word does (the offset may wait there): from here
+    // the registers are those the words see.
+    maxwell3d->ConsumeSink(*system);
+    auto& regs = maxwell3d->regs;
+    // 1. Where the back writes the first word against where the front noted it (its NoteWrite,
+    // RangeLastWrite and macro reads used this address).
+    const GPUVAddr back_address = regs.const_buffer.Address() + regs.const_buffer.offset;
+    CbBump(cb_back.address_checked);
+    if (back_address != front_address) {
+        CbBump(cb_back.address_differ);
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+            LOG_ERROR(HW_GPU,
+                      "CB words block (FRITCHII_CB_WORDS_BLOCK=2): {} words go to {:#x} on the "
+                      "back, the front noted {:#x}",
+                      count, back_address, front_address);
+        }
+    }
+    // 2. Applied as the block, then from the same state word by word (each as its own entry
+    // ran: Execute with one word). Not when the first word would draw a deferred draw (it can
+    // run once), and not where both are one path (one word, the gather off).
+    if (count < 2 || !maxwell3d->fast_maxwell3d || !Nx2Perf::On(Nx2Perf::Opt::CbBatch) ||
+        maxwell3d->draw_manager.HasDeferredDraw()) {
+        CbBump(cb_back.apply_skipped);
+        run_block();
+        return;
+    }
+    constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+    struct State {
+        u32 offset;
+        std::array<u32, 16> data;
+        std::array<u32, 16> shadow;
+        Maxwell3D::DirtyState::Flags flags;
+    };
+    const auto take = [&] {
+        State state{};
+        state.offset = regs.const_buffer.offset;
+        for (u32 i = 0; i < 16; ++i) {
+            state.data[i] = regs.reg_array[cb_data + i];
+            state.shadow[i] = maxwell3d->shadow_state.reg_array[cb_data + i];
+        }
+        state.flags = maxwell3d->dirty.flags;
+        return state;
+    };
+    const auto put = [&](const State& state) {
+        regs.const_buffer.offset = state.offset;
+        for (u32 i = 0; i < 16; ++i) {
+            regs.reg_array[cb_data + i] = state.data[i];
+            maxwell3d->shadow_state.reg_array[cb_data + i] = state.shadow[i];
+        }
+        maxwell3d->dirty.flags = state.flags;
+    };
+    const State before = take();
+    // The words' values as ProcessCBMultiData writes them, one at a time (the shadow RAM's mode
+    // stays for the block: shadow_ram_control is another method), and the words that fit the
+    // buffer (its room is checked word by word there).
+    const bool replay =
+        maxwell3d->shadow_state.shadow_ram_control == Maxwell3D::Regs::ShadowRamControl::Replay;
+    std::array<u32, MaxCbWords> values{};
+    for (u32 i = 0; i < count; ++i) {
+        const u32 method = static_cast<u32>((words[i] >> 8) & 0xffff);
+        values[i] = replay ? before.shadow[method - cb_data] : static_cast<u32>(words[i] >> 32);
+    }
+    const GPUVAddr address = regs.const_buffer.Address();
+    const u32 size = regs.const_buffer.size;
+    u32 fitting = 0;
+    while (fitting < count && u64{before.offset} + (u64{fitting} + 1) * sizeof(u32) <= size) {
+        ++fitting;
+    }
+    run_block();
+    const State as_block = take();
+    bool differs = false;
+    // Memory: only where the back writes it itself (not served by the memory stage, whose
+    // thread may already have written later words over these).
+    const u64 bytes = u64{fitting} * sizeof(u32);
+    auto& memory = maxwell3d->GetMemoryManager();
+    if (bytes != 0 && address != 0 && !MemoryStageLink::BackServed() &&
+        !MemoryStageLink::RingActive() &&
+        memory.IsFullyMappedRange(address + before.offset, bytes)) {
+        std::array<u32, MaxCbWords> written{};
+        memory.ReadBlockUnsafe(address + before.offset, written.data(), bytes);
+        if (std::memcmp(written.data(), values.data(), bytes) != 0) {
+            differs = true;
+        }
+    }
+    put(before);
+    for (u32 i = 0; i < count; ++i) {
+        Execute(words + i, 1);
+    }
+    const State by_word = take();
+    differs |= as_block.offset != by_word.offset || as_block.data != by_word.data ||
+               as_block.shadow != by_word.shadow || as_block.flags != by_word.flags;
+    CbBump(cb_back.applied_twice);
+    if (differs) {
+        CbBump(cb_back.apply_differ);
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+            LOG_ERROR(HW_GPU,
+                      "CB words block (FRITCHII_CB_WORDS_BLOCK=2): {} words at {:#x}+{:#x}: "
+                      "offset {:#x} as a block, {:#x} word by word; data {}, shadow {}, dirty "
+                      "flags {}, memory checked {}",
+                      count, address, before.offset, as_block.offset, by_word.offset,
+                      as_block.data == by_word.data ? "same" : "differ",
+                      as_block.shadow == by_word.shadow ? "same" : "differ",
+                      as_block.flags == by_word.flags ? "same" : "differ", bytes);
+        }
+    }
+}
+
+void GpuSplit::ReportCbWords() {
+    const auto now = std::chrono::steady_clock::now();
+    if (cb_since == std::chrono::steady_clock::time_point{}) {
+        cb_since = now;
+        cb_reported = cb_stats;
+        cb_reported_overflows = ranged_overflow_count;
+        return;
+    }
+    const double seconds = std::chrono::duration<double>(now - cb_since).count();
+    if (seconds < 10.0) {
+        return;
+    }
+    const int mode = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_cb_words_block,
+                                                      "FRITCHII_CB_WORDS_BLOCK");
+    const u64 blocks = cb_stats.blocks - cb_reported.blocks;
+    const u64 words = cb_stats.words - cb_reported.words;
+    const u64 overflows = ranged_overflow_count - cb_reported_overflows;
+    // The back's counts are totals since the start (one writer, read here relaxed).
+    const auto back = [](const std::atomic<u64>& counter) {
+        return counter.load(std::memory_order_relaxed);
+    };
+    if (mode != 0 || blocks != 0) {
+        LOG_INFO(HW_GPU,
+                 "CB words block (FRITCHII_CB_WORDS_BLOCK={}) {:.0f} s: front blocks {:.0f}/s "
+                 "with {:.0f} words/s ({:.2f} a block), ring entries saved {:.0f}/s, blocks "
+                 "ended full {:.0f}/s; ranged write overflows {:.0f}/s; back totals: blocks {}, "
+                 "words {}; must be 0: broken blocks {}, bad blocks {}; verify (=2): addresses "
+                 "checked {}, differ {}; applied both ways {}, differ {}, not applied twice {}",
+                 mode, seconds, static_cast<double>(blocks) / seconds,
+                 static_cast<double>(words) / seconds,
+                 blocks != 0 ? static_cast<double>(words) / static_cast<double>(blocks) : 0.0,
+                 static_cast<double>(words - blocks) / seconds,
+                 static_cast<double>(cb_stats.full - cb_reported.full) / seconds,
+                 static_cast<double>(overflows) / seconds, back(cb_back.blocks),
+                 back(cb_back.words), cb_stats.broken, back(cb_back.bad),
+                 back(cb_back.address_checked), back(cb_back.address_differ),
+                 back(cb_back.applied_twice), back(cb_back.apply_differ),
+                 back(cb_back.apply_skipped));
+    }
+    cb_since = now;
+    cb_reported = cb_stats;
+    cb_reported_overflows = ranged_overflow_count;
 }
 
 void GpuSplit::CheckFencesQuiet(u64 position) {

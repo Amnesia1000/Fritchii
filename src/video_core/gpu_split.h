@@ -310,6 +310,66 @@ public:
             NoteMethodWrite(engine, method);
         }
     }
+    /// FRITCHII_CB_WORDS_BLOCK (Maxwell3D::FrontWrite): a 3D constant buffer data word, as the
+    /// Method word Method (`direct` false) or MacroWrite (`direct` true) would send it, appended
+    /// to the open CbWords block or opening one. The block is open only until anything else is
+    /// reserved, the ring is published or the sent position is read (Reserve, Publish,
+    /// SentPosition), and not past held-back work (pending_flush), so its words sit in the ring
+    /// in the order and between the same entries as their own entries would, and a published
+    /// block never changes (as a Pairs block). Each word is committed and noted at its own
+    /// position (Commit, NoteMethodWrite), as its entry was; the back stores `consumed` only at
+    /// entry ends, so a position inside the block counts as run exactly when the whole block ran.
+    /// `verify_address` (FRITCHII_CB_WORDS_BLOCK=2): the front's address of the word, kept for a
+    /// new block's first word, which the back compares with its registers.
+    void CbWord(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument, bool is_last,
+                bool direct, Effect effect, const GPUVAddr* verify_address) {
+        const u64 word = static_cast<u64>(Kind::Method) | (is_last ? IsLast : 0) |
+                         (direct ? Direct : 0) | (u64{method & 0xffff} << 8) |
+                         (u64{argument} << 32);
+        const bool verify = verify_address != nullptr;
+        const size_t index = write_position & RingMask;
+        if (cb_header != nullptr) {
+            if (pending_flush == nullptr && engine == front_engine && index != 0 &&
+                cb_count < MaxCbWords && verify == cb_verify &&
+                write_position + 1 - consumed_cache <= RingWords) [[likely]] {
+                if (write_position == cb_end) [[likely]] {
+                    ring[index] = word;
+                    ++cb_count;
+                    *cb_header = (*cb_header & 0xffff'ffffULL) | (u64{cb_count} << 32);
+                    ++cb_stats.words;
+                    Commit(1, effect); // A publish here ends the block (Publish)
+                    cb_end = write_position;
+                    if (engine->memory_write_mask[method]) {
+                        NoteMethodWrite(engine, method);
+                    }
+                    return;
+                }
+                // Something was committed after the block without ending it (must be 0).
+                ++cb_stats.broken;
+            } else if (cb_count >= MaxCbWords) {
+                ++cb_stats.full;
+            }
+        }
+        SelectEngine(engine);
+        const size_t head = verify ? 2 : 1;
+        u64* const entry = Reserve(head + 1);
+        entry[0] = static_cast<u64>(Kind::CbWords) | (verify ? CbVerify : 0) | (u64{1} << 32);
+        if (verify) {
+            entry[1] = *verify_address;
+        }
+        entry[head] = word;
+        // Open before the commit, which may publish it (and so end it).
+        cb_header = entry;
+        cb_count = 1;
+        cb_verify = verify;
+        ++cb_stats.blocks;
+        ++cb_stats.words;
+        Commit(head + 1, effect);
+        cb_end = write_position;
+        if (engine->memory_write_mask[method]) {
+            NoteMethodWrite(engine, method);
+        }
+    }
     /// EDEN_NX2_MACRO_SINK: a write that only stores a register's value, to an engine whose
     /// execution_mask has the register (native compute): the back puts it in the engine's method
     /// sink tagged EngineInterface::SplitPlainTag, applied before the engine's next other write.
@@ -932,8 +992,11 @@ public:
     [[nodiscard]] const EngineWriteNotes& GetEngineWriteNotes() const {
         return engine_write_notes;
     }
-    /// the ring position of everything sent so far.
+    /// the ring position of everything sent so far. It ends the open CbWords block (CbWord): a
+    /// caller that keeps the position for "before what is sent after this" (run-ahead's apply
+    /// stamps) then sees later words in a later entry, as it saw their own entries.
     [[nodiscard]] u64 SentPosition() const {
+        cb_header = nullptr;
         return write_position;
     }
     /// the last compute/copy and unranged writer positions.
@@ -1435,11 +1498,18 @@ private:
         Pairs,  ///< Bits 32-63 count; then one word per write: bits 0-15 method, 32-63 value
         StateDelta, ///< As Pairs, Maxwell3D macro writes (DeltaWrite)
         DrawBatch,  ///< Bits 8-15 count, 32-63 repeats; then count words (method | arg << 32)
+        /// FRITCHII_CB_WORDS_BLOCK (CbWord): bits 32-63 count; with CbVerify word 1 is the
+        /// front's address of the first word; then count Method words, each the word its own
+        /// Method entry would have been (3D constant buffer data, no segment)
+        CbWords,
     };
     static constexpr u64 IsLast = 1 << 4;
     static constexpr u64 HasSegment = 1 << 5;
     static constexpr u64 Direct = 1 << 6; ///< Method: call it even if not executable (macros)
     static constexpr u64 Sink = 1 << 7;   ///< Method: into the method sink, tagged (SinkMethod)
+    static constexpr u64 CbVerify = 1 << 4; ///< CbWords: FRITCHII_CB_WORDS_BLOCK=2, word 1 held
+    /// The most words a CbWords block holds: one back gather (Execute, CallConstBufferWords).
+    static constexpr u32 MaxCbWords = 64;
 
     // Read when the split first starts (MaybeStart), after main() applied nx2_switches.txt: a
     // static initialiser would run before it.
@@ -1541,9 +1611,10 @@ private:
     /// Room for an entry of `words` at the write position (never across the ring's end).
     u64* Reserve(size_t words) {
         RunPendingFlush(); // Held-back work goes before any other entry
-        // What follows ends the open Pairs or StateDelta block.
+        // What follows ends the open Pairs, StateDelta or CbWords block.
         pairs_header = nullptr;
         delta_header = nullptr;
+        cb_header = nullptr;
         const size_t index = write_position & RingMask;
         if (index + words <= RingWords && write_position + words - consumed_cache <= RingWords)
             [[likely]] {
@@ -1558,12 +1629,12 @@ private:
         // EXP39 & 1: the back waits for work at the last
         // position published (it stored it in back_idle_at before it spun), so it waits for
         // exactly the words the front holds: it gets them after PublishAfterWait, not after
-        // publish_every. Not while a Pairs or StateDelta block is open (publishing ends it).
-        // Replaces EXP27 & 2, which published every entry while the back was idle.
+        // publish_every. Not while a Pairs, StateDelta or CbWords block is open (publishing ends
+        // it). Replaces EXP27 & 2, which published every entry while the back was idle.
         const u64 unpublished = write_position - published_local;
         if (unpublished >= publish_every ||
             (publish_waiting && unpublished >= PublishAfterWait && pairs_header == nullptr &&
-             delta_header == nullptr &&
+             delta_header == nullptr && cb_header == nullptr &&
              back_idle_at.load(std::memory_order_relaxed) == published_local)) {
             Publish();
         }
@@ -1593,6 +1664,16 @@ private:
     void BackWaitForStage(std::stop_token& stop_token, u64 read_position);
     /// Runs the entry at `entry` (of the `words` published before the ring's end), returns its size.
     size_t Execute(const u64* entry, size_t words);
+    /// Back, Kind::CbWords: the block's `count` Method words, each run as its own entry would
+    /// run (Execute, whose constant buffer gather takes them at once). `verify_address`: the
+    /// front's address word (FRITCHII_CB_WORDS_BLOCK=2, VerifyCbWords).
+    void ExecuteCbWords(const u64* words, u32 count, const u64* verify_address);
+    /// FRITCHII_CB_WORDS_BLOCK=2 on the back: the front's address against the registers', then
+    /// the block applied once as a block and once word by word from the same state, registers,
+    /// shadow RAM words and dirty flags compared, memory against the words' values.
+    void VerifyCbWords(const u64* words, u32 count, u64 front_address);
+    /// Front: the "CB words block" line every 10 s (from Publish, with ReportBatched).
+    void ReportCbWords();
 
     Core::System* system{};
     bool active{};
@@ -1851,6 +1932,27 @@ private:
     /// The open StateDelta block's head (DeltaWrite), and its count.
     u64* delta_header{};
     u32 delta_count{};
+    /// FRITCHII_CB_WORDS_BLOCK: the open CbWords block's head (CbWord), its count, whether it
+    /// holds the verify word, and the position right after its last word. Mutable: SentPosition
+    /// ends the block.
+    mutable u64* cb_header{};
+    u32 cb_count{};
+    bool cb_verify{};
+    u64 cb_end{};
+    /// Front counts for ReportCbWords: blocks opened, words sent in blocks, blocks ended at
+    /// MaxCbWords, blocks found with a commit after their end (must be 0).
+    struct CbFrontStats {
+        u64 blocks;
+        u64 words;
+        u64 full;
+        u64 broken;
+    };
+    CbFrontStats cb_stats{};
+    /// RangeLastWrite's overflows (floor_stats.overflows is reset by its own report).
+    u64 ranged_overflow_count{};
+    std::chrono::steady_clock::time_point cb_since{};
+    CbFrontStats cb_reported{};
+    u64 cb_reported_overflows{};
     /// Held-back front work (SetPendingFlush).
     PendingFlush pending_flush{};
     void* pending_flush_argument{};
@@ -1905,6 +2007,22 @@ private:
     Tegra::Engines::EngineInterface* back_engine{};
     /// The position of the entry being run (dispatch writes record it).
     u64 back_entry_position{};
+    /// FRITCHII_CB_WORDS_BLOCK, written by the back only (a plain load and store), read by the
+    /// front's ReportCbWords: blocks and words run; blocks whose words were not all 3D constant
+    /// buffer data Method words (must be 0); with =2 the addresses compared and those that
+    /// differed (must be 0), the blocks applied both ways, those that differed (must be 0), and
+    /// those not applied twice (one word, a deferred draw waiting, the gather off).
+    struct CbBackStats {
+        std::atomic<u64> blocks;
+        std::atomic<u64> words;
+        std::atomic<u64> bad;
+        std::atomic<u64> address_checked;
+        std::atomic<u64> address_differ;
+        std::atomic<u64> applied_twice;
+        std::atomic<u64> apply_differ;
+        std::atomic<u64> apply_skipped;
+    };
+    alignas(128) CbBackStats cb_back{};
     /// EXP10: the front asked the back to record dispatch writes (NoteDispatchWriter).
     bool back_dispatch_records{};
     /// The dispatch being run: the rasterizer recorded its writes, it recorded an unbounded one.
