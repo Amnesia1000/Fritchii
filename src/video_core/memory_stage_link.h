@@ -1083,6 +1083,14 @@ private:
     RunShape run_shape;
     void NoteRunShape(s32 channel, u64 entries, u64 launches, u64 ns) noexcept;
     void LogRunShape(double seconds);
+    /// fable_stage_levelpoints 14.4 row 4 and 14.9: GPUMem's sleeps in StageWaitFor by reason
+    /// (always counted: a sleep is a system call anyway), and the "Memory stage run waits" line's
+    /// counts. Taken and reset at each line (a lost count is fine).
+    struct alignas(64) RunWaitStats {
+        // GPUMem's.
+        std::array<std::atomic<u64>, static_cast<size_t>(StageWait::Count)> sleeps{};
+    };
+    RunWaitStats run_waits;
     /// fable_stage_levelpoints 5.2 (P0) and 6.6 (P1): the "Memory stage passes" line's counts,
     /// taken and reset at each line (a lost count is fine). Grouped by the thread that bumps them.
     struct alignas(64) PassStats {

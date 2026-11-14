@@ -147,6 +147,21 @@ frame's path and cutting them pays one for one.
 - Off (0): one relaxed load and a branch after each run.
 - Measure with profile_toggle.py in one session (0 against n).
 
+### FRITCHII_MEMSTAGE_RUN_SPIN_US
+
+FRITCHII_MEMSTAGE_RUN_SPIN_US (live, default 0 = today: about 2,048 pauses, then a sleep;
+work\fable_stage_levelpoints.md 14.4 row 4), with FRITCHII_MEMSTAGE_THREAD=2: GPUMem's waits for the
+back in a run (the run's end) and inside the window (level inside the window) spin n
+microseconds before they sleep, as the wait for the front spins 200 us. Each wake from a sleep is
+latency on a path the delay test puts at 100% (14.8 kind 3). Clamped to 10,000 us. A served call
+in the wait restarts the spin, as in the wait for the front.
+- The link line counts GPUMem's sleeps in its waits by reason ("in its waits by reason,
+  FRITCHII_MEMSTAGE_RUN_SPIN_US=n: the front, the back (level mode), the run, the window, room in
+  ring B, level inside the window", a second). The run's should fall towards 0 at 200.
+- Costs a core spinning while GPUMem waits for the back (it spins 2,048 pauses today anyway).
+- Measure 0 against 200 with profile_toggle.py in one session. Its worth falls as P3 and compute
+  part 2 remove the stops it shortens.
+
 ### FRITCHII_E2C_CENSUS (the "Front 0xe2c misses" line)
 
 FRITCHII_E2C_CENSUS (live, default 0 since 2026-11-14 = no work at all on the miss path; 1 = the
@@ -1080,7 +1095,8 @@ fills on a thread of their own by hand-off; 2 lets that thread read the ring its
 - Expect fps lower than 0: two thread wake-ups a draw. The point is the thread rules, not speed.
 - "Memory stage link (FRITCHII_MEMSTAGE_THREAD=1)" every 10 s: hand-offs a second (draw fills,
   dispatch fills, idle destroys), the back's wait in ms/s and per hand-off, GPUMem's run time,
-  sleeps on both sides, served syncs a second, and the counters that must be 0: a buffer
+  sleeps on both sides (GPUMem's at THREAD=2 also by the wait's reason, see
+  FRITCHII_MEMSTAGE_RUN_SPIN_US), served syncs a second, and the counters that must be 0: a buffer
   allocator call, a buffer staging request or a seam push by a thread that is not the cache's
   user; a VMA heap budget read off its allocator's user; a scheduler or descriptor queue use on
   GPUMem; an entry GPUMem would run at once (served on the back instead); an entry run at once

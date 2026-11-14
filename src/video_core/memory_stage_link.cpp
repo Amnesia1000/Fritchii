@@ -358,6 +358,10 @@ constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::ListDraw:
                     "level read back on the CPU", "level as the fill refused it",
                     "level for a frame dump or trace"};
 static_assert(LIST_DRAW_NAMES.back() != nullptr, "a name for every list draw outcome");
+/// MemoryStageLink::StageWait's, short (its size is checked where they are used).
+constexpr std::array<const char*, 6> STAGE_WAIT_NAMES{
+    "the front", "the back (level mode)", "the run", "the window", "room in ring B",
+    "level inside the window"};
 constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::LevelReason::Count)>
     LEVEL_REASON_NAMES{"full copy", "writing draw", "ranges over GPU-written data", "gather",
                        "semaphore release"};
@@ -1318,6 +1322,18 @@ bool MemoryStageLink::StageWaitFor(std::stop_token& stop, StageWait reason, u64 
     // that follows. Level mode keeps the short spin.
     const bool long_spin = reason == StageWait::Input && ring_window != 0;
     const bool ring_wait = reason == StageWait::Window || reason == StageWait::Room;
+    // FRITCHII_MEMSTAGE_RUN_SPIN_US (live, 0 = today's 2,048 pauses, fable_stage_levelpoints
+    // 14.4 row 4): the waits for the back in a run and inside the window spin that long before
+    // they sleep, as the wait for the front does: each wake from the sleep is latency on a path
+    // the delay test puts at 100%.
+    u64 spin_ns = long_spin ? InputSpinNs : 0;
+    if (reason == StageWait::Run || reason == StageWait::Level) {
+        namespace Debug = VideoCore::Nx2Debug;
+        const int us = Debug::SwitchValue(Debug::g_memstage_run_spin_us,
+                                          "FRITCHII_MEMSTAGE_RUN_SPIN_US");
+        spin_ns = static_cast<u64>(std::clamp(us, 0, 10'000)) * 1000;
+    }
+    const bool timed_spin = spin_ns != 0;
     u64 spin_from = start;
     bool ok = true;
     bool waited_any = false;
@@ -1332,13 +1348,13 @@ bool MemoryStageLink::StageWaitFor(std::stop_token& stop, StageWait reason, u64 
         waited_any = true;
         if (StageServeCalls()) {
             spin = 0;
-            if (long_spin) {
+            if (timed_spin) {
                 spin_from = LinkNowNs();
             }
             continue;
         }
         if (spin < LinkSpinPauses ||
-            (long_spin && ((spin % 64) != 0 || LinkNowNs() - spin_from < InputSpinNs))) {
+            (timed_spin && ((spin % 64) != 0 || LinkNowNs() - spin_from < spin_ns))) {
             ++spin;
             LinkPause();
             continue;
@@ -1354,6 +1370,7 @@ bool MemoryStageLink::StageWaitFor(std::stop_token& stop, StageWait reason, u64 
             if (reason == StageWait::Input) {
                 LinkBump(counters.stage_input_sleeps);
             }
+            LinkBump(run_waits.sleeps[static_cast<size_t>(reason)]);
         }
         stage_sleeping.store(false, std::memory_order_relaxed);
         if (ring_wait) {
@@ -2579,16 +2596,27 @@ void MemoryStageLink::LogStats() {
         }
     }
     const u64 call_ns = current.call_ns - reported.call_ns;
+    // GPUMem's sleeps in StageWaitFor by reason (fable_stage_levelpoints 14.4 row 4).
+    static_assert(STAGE_WAIT_NAMES.size() == static_cast<size_t>(StageWait::Count));
+    std::string sleeps_text;
+    for (size_t i = 0; i < run_waits.sleeps.size(); ++i) {
+        sleeps_text += fmt::format("{}{} {:.0f}", i == 0 ? "" : ", ", STAGE_WAIT_NAMES[i],
+                                   rate(run_waits.sleeps[i].exchange(0, std::memory_order_relaxed)));
+    }
     LOG_INFO(HW_GPU,
              "Memory stage link (FRITCHII_MEMSTAGE_THREAD={}) {:.0f} s: hand-offs {:.0f}/s ({}); "
              "the back waited {:.1f} ms/s ({:.2f} us a hand-off, slept {:.0f}/s), GPUMem ran "
-             "{:.1f} ms/s and slept {:.0f}/s ({:.0f}/s waiting for the front); served syncs "
+             "{:.1f} ms/s and slept {:.0f}/s ({:.0f}/s waiting for the front; in its waits by "
+             "reason, FRITCHII_MEMSTAGE_RUN_SPIN_US={}: {}); served syncs "
              "{:.0f}/s ({:.2f} ms/s on the back); must be 0: {}{}",
              mode, seconds, rate(total_calls), calls_text, ms(call_ns), per(call_ns, total_calls),
              rate(current.back_sleeps - reported.back_sleeps),
              ms(current.stage_ns - reported.stage_ns),
              rate(current.stage_sleeps - reported.stage_sleeps),
              rate(current.stage_input_sleeps - reported.stage_input_sleeps),
+             (std::max)(VideoCore::Nx2Debug::g_memstage_run_spin_us.load(std::memory_order_relaxed),
+                        0),
+             sleeps_text,
              rate(current.served - reported.served), ms(current.served_ns - reported.served_ns),
              total_checks, checks_text);
     if (mode == 2) {
