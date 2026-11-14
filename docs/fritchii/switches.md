@@ -301,6 +301,31 @@ the lock and 7.3 ms/s closing brackets (5.4 of it one shared atomic in Fill::~Fi
 - Expected: about 8 to 9 ms/s off the back at the market (stage off), the per-range lock and
   bracket close; the bracket's atomic runs about 1,400 times a second instead of 68,000.
 
+### FRITCHII_GATHER_EMPTY_TEST
+
+FRITCHII_GATHER_EMPTY_TEST (live, default 0 = exactly as before; fable_front_drains 8.2 G3). About
+20,000 gathers a second reach GPU::InvalidateGPUCache at the market, 93% of them with nothing
+collected; asking the four game cores' managers (two mutexes each, a std::function, a vector)
+was 4.4 ms/s of the back.
+- 1: before the gather (after run-ahead's own check), each manager answers
+  GPUDirtyMemoryManager::NothingCollected, one lock-free 8-byte load of its `current` word. When
+  all four say nothing, the gather is not made. Nothing is added on the game threads' side: the
+  flag is `current` itself.
+- Why it is exact: a manager holds a collected write that no gather took only while `current` is
+  not the empty word {~0, 0}. Collect leaves `current` holding the write (its CAS) or, when it
+  moves to another 2 KB block, pushes the old word to the back list and stores the new one in the
+  same locked section; only Gather stores the empty word, in the locked section that also takes
+  the back list. A write collected before the test (any chain of locks or atomics from the
+  game thread's Collect to the back, which the game's submit always is) is, by the atomics'
+  coherence, seen by the test as that Collect's store or a later one: a later Collect (not empty)
+  or a Gather's empty word, which took it. A write collected after the test is taken by the next
+  gather, as today. A second gatherer (a FlushRegion off the back) no longer waits for another
+  one's collection in progress; it never waited for that one's application either, and the
+  pending-write list (EXP49) still closes the gap for landing downloads.
+- "Gather empty test (FRITCHII_GATHER_EMPTY_TEST=n) 10 s: gathers asked N/s, skipped as empty
+  M/s (P%)" (HW_GPU, Info).
+- Expected: most of the 4.4 ms/s.
+
 ### EDEN_NX2_ACCURATE_PARTS
 
 EDEN_NX2_ACCURATE_PARTS (bit mask, 0 = none, read once at boot): parts of GPU accuracy High in

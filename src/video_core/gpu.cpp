@@ -3,6 +3,7 @@
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -113,12 +114,68 @@ struct GPU::Impl {
         renderer->ReadRasterizer()->FlushCommands();
     }
 
+    /// FRITCHII_GATHER_EMPTY_TEST's counts, one line every 10 s (any gathering thread; the clock
+    /// is read every 1,024th test).
+    static void NoteGatherEmptyTest(int mode, bool empty) {
+        static std::atomic<u64> asked{};
+        static std::atomic<u64> skipped{};
+        static std::atomic<s64> since{};
+        if (empty) {
+            skipped.fetch_add(1, std::memory_order_relaxed);
+        }
+        if ((asked.fetch_add(1, std::memory_order_relaxed) & 1023) != 0) {
+            return;
+        }
+        const s64 now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+        s64 last = since.load(std::memory_order_relaxed);
+        if (last == 0) {
+            since.compare_exchange_strong(last, now, std::memory_order_relaxed);
+            asked.store(0, std::memory_order_relaxed);
+            skipped.store(0, std::memory_order_relaxed);
+            return;
+        }
+        if (now - last < 10'000 ||
+            !since.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+            return;
+        }
+        const double window = static_cast<double>(now - last) / 1000.0;
+        const u64 asked_count = asked.exchange(0, std::memory_order_relaxed);
+        const u64 skipped_count = skipped.exchange(0, std::memory_order_relaxed);
+        LOG_INFO(HW_GPU,
+                 "Gather empty test (FRITCHII_GATHER_EMPTY_TEST={}) {:.0f} s: gathers asked "
+                 "{:.0f}/s, skipped as empty {:.0f}/s ({:.1f}%)",
+                 mode, window, static_cast<double>(asked_count) / window,
+                 static_cast<double>(skipped_count) / window,
+                 asked_count != 0 ? 100.0 * static_cast<double>(skipped_count) /
+                                        static_cast<double>(asked_count)
+                                  : 0.0);
+    }
+
     /// Synchronizes CPU writes with Host GPU memory.
     void InvalidateGPUCache() {
         // EDEN_NX2_RUNAHEAD: behind the frontier the guest's newest bytes are not the draws'
         // (the front's next boundary takes them); past it they are applied at once (exact).
         if (VideoCommon::Runahead::HandleInvalidate(system)) {
             return;
+        }
+        // FRITCHII_GATHER_EMPTY_TEST (live, default 0; fable_front_drains 8.2 G3): most gathers
+        // find nothing. Each manager answers that without a lock (NothingCollected: a write
+        // collected before this test is seen, or a gather already took it); a write collected
+        // after it is taken by the next gather, as when it lands after the managers' locks.
+        if (const int empty_test = VideoCore::Nx2Debug::SwitchValue(
+                VideoCore::Nx2Debug::g_gather_empty_test, "FRITCHII_GATHER_EMPTY_TEST");
+            empty_test != 0) {
+            const bool empty = std::ranges::all_of(
+                system.GetGPUDirtyMemoryManager(),
+                [](const Core::GPUDirtyMemoryManager& manager) {
+                    return manager.NothingCollected();
+                });
+            NoteGatherEmptyTest(empty_test, empty);
+            if (empty) {
+                return;
+            }
         }
         std::vector<std::pair<DAddr, u64>> writes;
         std::function<void(PAddr, size_t)> callback_writes(

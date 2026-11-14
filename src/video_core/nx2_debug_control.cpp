@@ -376,6 +376,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_GATHER_ONE_LOCK") {
         return &g_gather_one_lock;
     }
+    if (name == "FRITCHII_GATHER_EMPTY_TEST") {
+        return &g_gather_empty_test;
+    }
     return nullptr;
 }
 
