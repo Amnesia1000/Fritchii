@@ -272,6 +272,14 @@ public:
     /// Sync memory between guest and host.
     virtual void InvalidateGPUCache() = 0;
 
+    /// Maxwell3D's invalidate_texture_data_cache: the game's collected CPU writes into the
+    /// caches, then a wait for idle. One call, so the Vulkan side can find it run already at its
+    /// entry (the memory stage, FRITCHII_MEMSTAGE_GATHER).
+    virtual void InvalidateTextureDataCache() {
+        InvalidateGPUCache();
+        WaitForIdle();
+    }
+
     /// Unmap memory range
     virtual void UnmapMemory(DAddr addr, u64 size) = 0;
 
