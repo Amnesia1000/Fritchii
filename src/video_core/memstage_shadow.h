@@ -238,6 +238,10 @@ u64 StageDrawSeq(u64 back_seq);
 /// lend to return by kind (memory_stage_link.cpp, GPU profile on).
 [[nodiscard]] u64 StageEntryKey();
 [[nodiscard]] std::string StageKindName(u64 key);
+/// FRITCHII_DELAY_RUNKIND_CLASS's classes of a run's first hard kind (StageEntryKey): 1 the 3D
+/// texture invalidate (0x3dd), 2 a compute engine method, 3 a 3D fence report, 4 the 3D wait for
+/// idle (0x44), 5 a cache call (StageTag::Cache closure), 6 anything else.
+[[nodiscard]] int StageKindClass(u64 key);
 [[nodiscard]] u64 BackStateHash(const Tegra::Engines::Maxwell3D& maxwell3d);
 /// The registers that select the programs (the six pipeline slots, then the program region), as
 /// 8-byte words, and their hash: the facts table's key. The table compares the words on a key

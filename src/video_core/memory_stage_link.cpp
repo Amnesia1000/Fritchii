@@ -2217,7 +2217,7 @@ void MemoryStageLink::RingLoop(std::stop_token& stop, u64 start) {
             u64 run_launches = result.launches;
             // 14.9's counters, GPU profile on: the run's first hard kind, the run wait's split.
             const bool run_counters = Nx2Profile::Enabled();
-            const u64 run_kind = run_counters ? MemStageShadow::StageEntryKey() : 0;
+            const u64 run_kind = MemStageShadow::StageEntryKey(); // a load
             close_batch();
             Lend(position, until);
             const u64 run_start = LinkNowNs();
@@ -2316,6 +2316,28 @@ void MemoryStageLink::RingLoop(std::stop_token& stop, u64 start) {
             if (VideoCore::Nx2Debug::g_delay_run_us.load(std::memory_order_relaxed) != 0)
                 [[unlikely]] {
                 DelayRun(run_launches);
+            }
+            // FRITCHII_DELAY_RUNKIND_US with _CLASS (live, 0 = off; 2026-11-14): the same spin,
+            // only after runs whose first hard kind is of that class (StageKindClass), so each
+            // kind's stop is priced alone before anyone builds its removal.
+            if (VideoCore::Nx2Debug::g_delay_runkind_us.load(std::memory_order_relaxed) != 0)
+                [[unlikely]] {
+                namespace Debug = VideoCore::Nx2Debug;
+                const int us = Debug::SwitchValue(Debug::g_delay_runkind_us,
+                                                  "FRITCHII_DELAY_RUNKIND_US");
+                if (us > 0 && MemStageShadow::StageKindClass(run_kind) ==
+                                  Debug::SwitchValue(Debug::g_delay_runkind_class,
+                                                     "FRITCHII_DELAY_RUNKIND_CLASS")) {
+                    const u64 start = LinkNowNs();
+                    const u64 until_ns = start + static_cast<u64>(us) * 1000;
+                    u64 now = start;
+                    while (now < until_ns) {
+                        LinkPause();
+                        now = LinkNowNs();
+                    }
+                    LinkBump(pass_stats.delay_runs);
+                    LinkBump(pass_stats.delay_ns, now - start);
+                }
             }
             // The return (back parked at `until`): flags, takes, full copies.
             if (!BecomeBusy(stop)) {

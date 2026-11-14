@@ -391,6 +391,12 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_DELAY_HANDOVER_KIND") {
         return &g_delay_handover_kind;
     }
+    if (name == "FRITCHII_DELAY_RUNKIND_US") {
+        return &g_delay_runkind_us;
+    }
+    if (name == "FRITCHII_DELAY_RUNKIND_CLASS") {
+        return &g_delay_runkind_class;
+    }
     if (name == "FRITCHII_MEMSTAGE_RUN_SPIN_US") {
         return &g_memstage_run_spin_us;
     }

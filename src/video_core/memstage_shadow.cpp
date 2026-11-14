@@ -4030,6 +4030,23 @@ std::string StageKindName(u64 key) {
     return LevelName(key);
 }
 
+int StageKindClass(u64 key) {
+    const auto type = static_cast<LevelType>(key >> 56);
+    const u64 id = key & 0xffff'ffff'ffffULL;
+    switch (type) {
+    case LevelType::Method3D:
+        return id == 0x3dd ? 1 : id == 0x44 ? 4 : 6;
+    case LevelType::EngineMethod:
+        return static_cast<EngineType>(id >> 16) == EngineType::KeplerCompute ? 2 : 6;
+    case LevelType::FenceReport:
+        return 3;
+    case LevelType::CacheCall:
+        return 5;
+    default:
+        return 6;
+    }
+}
+
 u64 BackStateHash(const Maxwell3D& maxwell3d) {
     return StateHash(maxwell3d, &maxwell3d);
 }
