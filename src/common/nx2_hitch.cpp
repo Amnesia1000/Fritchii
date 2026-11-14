@@ -235,11 +235,12 @@ void NoteLongest(StallSlot* slot, const char* zone, u64 ns) {
     }
 }
 
-// EDEN_NX2_STALL_SNAPSHOT=1, read at every thread name (not cached: threads are named before
-// main() applies nx2_switches.txt).
+// EDEN_NX2_STALL_SNAPSHOT, read at every thread name (not cached: threads are named before
+// main() applies nx2_switches.txt). On by default since 2026-11-14 (owner): a 750 ms freeze in an
+// owner playtest could not be explained without it. EDEN_NX2_STALL_SNAPSHOT=0 turns it off.
 bool StallSwitch() {
     const char* const value = std::getenv("EDEN_NX2_STALL_SNAPSHOT");
-    return value != nullptr && value[0] == '1';
+    return value == nullptr || value[0] != '0';
 }
 
 } // Anonymous namespace
@@ -706,8 +707,8 @@ void RegisterThread(const char* name) {
                 // The profiler's zones call out of line for the slots too (coarse zones only).
                 Nx2Timeline::g_zone_gate.fetch_or(Nx2Timeline::ZoneGateStall,
                                                   std::memory_order_release);
-                LOG_INFO(Render, "Stall snapshot on (EDEN_NX2_STALL_SNAPSHOT=1): a line after "
-                                 "each Hitch line of 100 ms or more");
+                LOG_INFO(Render, "Stall snapshot on (the default; EDEN_NX2_STALL_SNAPSHOT=0 turns "
+                                 "it off): a line after each Hitch line of 100 ms or more");
             }
         } else {
             t_stall_slot = nullptr;
