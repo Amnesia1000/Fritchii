@@ -3220,6 +3220,10 @@ void MemStage::TickThread(int seam) {
     // (Link::ListDrawsServed); level mode and THREAD 0/1 never serve them.
     link.SetListDraws(
         Debug::SwitchValue(Debug::g_memstage_list_draws, "FRITCHII_MEMSTAGE_LIST_DRAWS", 1) > 0);
+    // GPUMem's fast entry loop (live, default on): only while the window is open too
+    // (Link::FastLoop); level mode and THREAD 0/1 keep the loop as it was.
+    link.SetFastLoop(
+        Debug::SwitchValue(Debug::g_memstage_fast_loop, "FRITCHII_MEMSTAGE_FAST_LOOP", 1) > 0);
     // The window's verify (its own-write ring and the image check) only with a verify on.
     Link::SetVerify(read_log_every > 0 || Link::RingVerify());
     ring_read_log.store(read_log_every > 0 && Link::Ahead() != 0, std::memory_order_relaxed);

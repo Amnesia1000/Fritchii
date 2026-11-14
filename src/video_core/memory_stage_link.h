@@ -288,6 +288,14 @@ public:
         return g_list_draws.load(std::memory_order_relaxed) &&
                g_ahead.load(std::memory_order_relaxed) != 0;
     }
+    /// The back, at a frame end: FRITCHII_MEMSTAGE_FAST_LOOP (live, default on).
+    void SetFastLoop(bool on);
+    /// GPUMem's fast entry loop (memstage_shadow.cpp, PairsFast; the input's end read once per
+    /// stretch in the loop): the switch on and the window open (AHEAD 0 keeps today's loop).
+    [[nodiscard]] static bool FastLoop() noexcept {
+        return g_fast_loop.load(std::memory_order_relaxed) &&
+               g_ahead.load(std::memory_order_relaxed) != 0;
+    }
     /// GPUMem: a list draw of its copy, served or level (and why).
     void NoteListDraw(ListDraw what) noexcept {
         auto& counter = counters.list_draws[static_cast<size_t>(what)];
@@ -501,6 +509,7 @@ private:
     static inline std::atomic<u32> g_ahead{0};
     static inline std::atomic<bool> g_verify{false};
     static inline std::atomic<bool> g_list_draws{false};
+    static inline std::atomic<bool> g_fast_loop{false};
 
     static inline thread_local bool t_on_stage{};
     /// GPUMem runs a call the back posted (a served call): its syncs go to the back at once.
@@ -742,6 +751,8 @@ private:
     Snapshot reported{};
     /// FRITCHII_MEMSTAGE_LIST_DRAWS's last value logged (-1: none yet).
     int list_draws_logged{-1};
+    /// FRITCHII_MEMSTAGE_FAST_LOOP's last value logged (-1: none yet).
+    int fast_loop_logged{-1};
     u64 last_log_ns{};
     u64 back_run_seen_ns{};
 

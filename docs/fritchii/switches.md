@@ -591,7 +591,13 @@ session after a catch-up could not finish (below; logged).
   vertex input state only when it may have changed (the back's VertexBuffers flag, not the
   cache's in served mode, is cleared at a packet's draw as the cache's vertex buffer update
   clears it with one thread, and with each send). With EDEN_NX2_GPU_PROFILE=2 GPUMem's
-  profile splits its entry loop into "stage entries" and, inside it, "stage cb words"; the back's
+  profile splits its entry loop into "stage entries" and, inside it, "stage cb words", "stage
+  pairs" (Pairs and StateDelta blocks' writes), "stage methods" (Method and Multi entries'
+  handlers, their words and draws excluded), "stage packets" (Writes-tagged draw packets and
+  DrawBatch entries) and "stage draw setup" (a draw the copy issued, served or made level, its
+  fill excluded); what stays in "stage entries" is the per-entry bookkeeping (classify, the
+  copy's lookup, runs, counters) and the closures, and GPUMem's "other" is the loop around the
+  entries (the input's and the back's positions, served calls, publishes); the back's
   "draw" splits off "ring take" (the packet's take from ring B) with "ring take copy" inside it
   (its bytes copied out), "draw locks" and "ring facts" (inside "draw setup": the caches' locks,
   and the facts published under the stage's program key), "draw after configure" (the
@@ -713,6 +719,34 @@ THREAD 0/1 keep them as before (level draws on THREAD 2, the back's own fill oth
   payload report, a fence when RELEASE_SIZE is set on Switch 2), not a list-words closure. The
   kept list words closure (KeplerCompute's list dispatch) runs about 850 a second and sits in
   front of its dispatch, inside the dispatch's run. Left as they are here.
+
+### FRITCHII_MEMSTAGE_FAST_LOOP
+
+FRITCHII_MEMSTAGE_FAST_LOOP (live, read at a frame end with FRITCHII_MEMSTAGE_AHEAD, default 1;
+lever A of work\fable_stage_drains.md): with FRITCHII_MEMSTAGE_THREAD=2 and the window open
+(AHEAD > 0), GPUMem's entry loop takes two shortcuts that leave its copy in exactly the state the
+loop leaves it in without them. 0, AHEAD 0 and THREAD 0/1 run the loop as before (the shadow on
+the back never takes them). "Memory stage fast entry loop (FRITCHII_MEMSTAGE_FAST_LOOP=n)" is
+logged when it changes.
+
+- Pairs and StateDelta blocks (3.7 million writes a second in 1.45 million blocks at the market)
+  are applied in one loop (memstage_shadow.cpp, PairsFast) instead of StateWrite per write. While
+  a deferred draw waits the writes still go one by one through StateWrite (the first stored write
+  that is not an instance loop method draws it, reading the copy as it is then); after it no
+  write in the block can issue a draw, so the loop reads the shadow RAM's mode once (again after a
+  tracked write to shadow_ram_control's own word, the one write that changes it), keeps the
+  same-value skip, gathers each stored register's two dirty flags and raises them on the copy
+  (and in the flags raised since its last draw) at the block's end, and advances the copy's
+  generation by the number of stores. Registers, shadow RAM, every dirty flag, the generation and
+  the draws end the same; nothing reads the copy inside a block.
+- The input's end (the front's `published`, written at every publish) is read again only where
+  GPUMem reaches the last value it read, not at every entry. Entries before it stay published and
+  that read's acquire made them visible, so GPUMem reads the same entries in the same order and
+  stops for input at the same positions.
+- The verify: the memstage gate (work\memstage_gate.py) with FRITCHII_MEMSTAGE_RING_VERIFY (compare
+  b's hash at every served draw) and READ_LOG, once with 0 and once with 1; every must-be-0 line
+  stays 0. Then 0 against 1 with profile_toggle.py at the market (GPUMem's "stage pairs" and "other"
+  at EDEN_NX2_GPU_PROFILE=2, its busy time, fps).
 
 ### FRITCHII_MEMSTAGE_FULL_BINDS
 

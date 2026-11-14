@@ -968,6 +968,68 @@ void StateWrite(Copy& c, u32 method, u32 argument) {
     }
 }
 
+/// FRITCHII_MEMSTAGE_FAST_LOOP (GPUMem with the window open): a Pairs or StateDelta block's
+/// writes, ending in exactly the state StateWrite leaves them in one by one, in one loop:
+/// - while a deferred draw waits, write by write through StateWrite: the first stored write that
+///   is not an instance loop method draws it (reading the registers and flags as they are then).
+///   That draw leaves none waiting (DrawDeferred zeroes the count and the folded instance), and a
+///   state write cannot start one (only executable methods reach the draw manager), so after it
+///   no write of the block issues a draw, and nothing reads the copy until the block's end;
+/// - then the shadow RAM's mode read once (StateWrite reads it per write: only a tracked write
+///   to shadow_ram_control's own word changes it, and the loop reads it again after one), the
+///   same-value skip as StateWrite's, each stored register's two dirty flags gathered and raised
+///   on the copy and in `raised` at the end, and the generation advanced by the stores (one per
+///   store, as DirtyStore).
+void PairsFast(Copy& c, const u64* writes, u32 count) {
+    constexpr u32 ShadowRamControlMethod = MAXWELL3D_REG_INDEX(shadow_ram_control);
+    static_assert(std::tuple_size_v<Maxwell3D::DirtyState::Tables> == 2);
+    Engine& e = *c.e;
+    u32 i = 0;
+    for (; i < count && e.draw_manager.HasDeferredDraw(); ++i) {
+        StateWrite(c, static_cast<u32>(writes[i] & 0xffff), static_cast<u32>(writes[i] >> 32));
+    }
+    if (i == count) {
+        return;
+    }
+    const auto& table0 = (*c.tables)[0];
+    const auto& table1 = (*c.tables)[1];
+    u32* const reg_array = e.regs.reg_array.data();
+    u32* const shadow_array = e.shadow_state.reg_array.data();
+    const bool skip_same = c.skip_same;
+    Flags raised;
+    u64 stores = 0;
+    while (i < count) {
+        // shadow_state.shadow_ram_control, read as the word the loop writes (no aliasing doubt).
+        const auto control =
+            static_cast<Regs::ShadowRamControl>(shadow_array[ShadowRamControlMethod]);
+        const bool track = control == Regs::ShadowRamControl::Track ||
+                           control == Regs::ShadowRamControl::TrackWithFilter;
+        const bool replay = control == Regs::ShadowRamControl::Replay;
+        for (; i < count; ++i) {
+            const u32 method = static_cast<u32>(writes[i] & 0xffff);
+            u32 value = static_cast<u32>(writes[i] >> 32);
+            if (track) {
+                shadow_array[method] = value;
+            } else if (replay) {
+                value = shadow_array[method];
+            }
+            if (!skip_same || reg_array[method] != value) {
+                reg_array[method] = value;
+                raised[table0[method]] = true;
+                raised[table1[method]] = true;
+                ++stores;
+            }
+            if (track && method == ShadowRamControlMethod) [[unlikely]] {
+                ++i;
+                break; // the mode is the word just tracked: read it again
+            }
+        }
+    }
+    c.generation += stores;
+    e.dirty.flags |= raised;
+    c.raised |= raised;
+}
+
 bool CbMode() {
     return VideoCore::Nx2Debug::Experiment(107) != 0;
 }
@@ -1659,6 +1721,8 @@ size_t Process(State& s, u64 position, bool executed) {
             cls = executable && MethodKindOf(c0, method) == MethodKind::Work ? Class::Work
                                                                              : Class::Pass;
             if (Copy* const c = Use(s, c0.back, executed)) {
+                const Nx2Profile::Scope zone{Nx2Profile::Zone::StageMethods,
+                                             s.ring && Nx2Profile::Fine(), false};
                 CallMethod(s, *c, method, argument);
             } else if (executable && MethodKindOf(c0, method) == MethodKind::Hard) {
                 Hard(s, LevelType::Method3D, method);
@@ -1668,6 +1732,8 @@ size_t Process(State& s, u64 position, bool executed) {
         // Into the back's method sink: applied now, which is the same state at the next
         // executable method (spec 4.2); a deferred draw it flushes comes later on the back.
         if (Copy* const c = Use(s, c0.back, executed)) {
+            const Nx2Profile::Scope zone{Nx2Profile::Zone::StageMethods,
+                                         s.ring && Nx2Profile::Fine(), false};
             s.processing_sunk = true;
             StateWrite(*c, method, argument);
             s.processing_sunk = false;
@@ -1704,6 +1770,8 @@ size_t Process(State& s, u64 position, bool executed) {
         cls = executable && MethodKindOf(c0, method) == MethodKind::Work ? Class::Work
                                                                          : Class::Pass;
         if (Copy* const c = Use(s, c0.back, executed)) {
+            const Nx2Profile::Scope zone{Nx2Profile::Zone::StageMethods,
+                                         s.ring && Nx2Profile::Fine(), false};
             CallMultiMethod(s, *c, method, reinterpret_cast<const u32*>(entry + data), amount);
         } else if (executable && MethodKindOf(c0, method) == MethodKind::Hard) {
             Hard(s, LevelType::Method3D, method);
@@ -1742,6 +1810,8 @@ size_t Process(State& s, u64 position, bool executed) {
             cls = Class::Work;
             s.entry_type = LevelType::Packet3D;
             if (Copy* const c = Use(s, engine, executed)) {
+                const Nx2Profile::Scope zone{Nx2Profile::Zone::StagePackets,
+                                             s.ring && Nx2Profile::Fine(), false};
                 for (u32 i = 0; i < count; ++i) {
                     CallMethod(s, *c, static_cast<u32>(writes[i] & 0xffff),
                                static_cast<u32>(writes[i] >> 32));
@@ -1804,6 +1874,12 @@ size_t Process(State& s, u64 position, bool executed) {
             break;
         }
         if (Copy* const c = Use(s, s.engine_copy->back, executed)) {
+            const Nx2Profile::Scope zone{Nx2Profile::Zone::StagePairs,
+                                         s.ring && Nx2Profile::Fine(), false};
+            if (s.ring && MemoryStageLink::FastLoop()) {
+                PairsFast(*c, entry + 1, count);
+                break;
+            }
             for (u32 i = 0; i < count; ++i) {
                 StateWrite(*c, static_cast<u32>(entry[1 + i] & 0xffff),
                            static_cast<u32>(entry[1 + i] >> 32));
@@ -1827,6 +1903,8 @@ size_t Process(State& s, u64 position, bool executed) {
         cls = Class::Work;
         s.entry_type = LevelType::Batch3D;
         if (Copy* const c = Use(s, c0.back, executed)) {
+            const Nx2Profile::Scope zone{Nx2Profile::Zone::StagePackets,
+                                         s.ring && Nx2Profile::Fine(), false};
             // Maxwell3D::RunDrawBatch: the group once, then the repeats as instances.
             for (u32 i = 0; i < count; ++i) {
                 CallMethod(s, *c, static_cast<u32>(entry[1 + i] & 0xffff),
@@ -2912,6 +2990,8 @@ void MemStageShadowEngine::StageDraw(bool indexed, u32 instance_count, bool indi
     Shadow::State& s = Shadow::S();
     if (s.ring) {
         // 6b (memstage_shadow.cpp's header): serve the draw, or make its entry hard.
+        // Profiling: the draw's own share of GPUMem's entries (its fill is a zone of its own).
+        const Nx2Profile::Scope zone{Nx2Profile::Zone::StageDrawSetup, Nx2Profile::Fine(), false};
         MemoryStageLink& link = MemoryStageLink::Get();
         const u64 seq = ++s.ring_seq;
         ++s.entry_draws;
