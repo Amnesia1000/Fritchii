@@ -1590,9 +1590,10 @@ never enters the buffer cache.
   its targets holds: must be 0, then today's block); OutdateReadDownloads only with a read
   download pending (g_read_downloads), under the lock. A sync while served at an entry without a
   P3 record is today's block (a read flush's own fence; counted, not a must-be-0). The fence's
-  CommitCacheFlushes while served skips the buffer half on its note whatever
-  FRITCHII_FENCE_COMMIT_FAST says; a set note at a P3-passed entry is a must-be-0 (not with
-  FRITCHII_MEMSTAGE_MARKS_AHEAD, where the back commits there under the lock). The fence's own
+  CommitCacheFlushes at a P3-passed entry skips the buffer half on its note whatever
+  FRITCHII_FENCE_COMMIT_FAST says; a set note there is a must-be-0 (not with
+  FRITCHII_MEMSTAGE_MARKS_AHEAD, where the back commits there under the lock). With bits 0 and 1
+  every other path runs as before. The fence's own
   gather while served goes to GPUMem as P1's does (GatherOnStage), for either bit. WaitForIdle's
   "a query result sync pending at a passed entry" counts only when the entry has no P3 record.
 - Must be 0, added: "a query result sync range at a P3-passed entry that none of the record's
