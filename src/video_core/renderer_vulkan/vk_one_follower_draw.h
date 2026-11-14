@@ -69,6 +69,12 @@ public:
     static void ReportDescriptorMismatch(const GraphicsPipeline& pipeline, u32 expected,
                                          u32 got);
 
+    /// R: the address space E's fill resolved draw `seq`'s programs in (id + 1), 0 if unknown.
+    [[nodiscard]] u64 FillSpace(u64 seq) const noexcept {
+        const FillRecord& record = fill_records[seq % FillRecords];
+        return record.seq == seq ? record.space : 0;
+    }
+
     /// R, in PrepareDraw: the header of the unlent draw being played, or null.
     [[nodiscard]] const PacketHeader* Playing() const noexcept {
         return playing;
@@ -104,6 +110,7 @@ private:
     struct FactsExpect {
         bool found{};
         std::array<u64, 2> hashes{};
+        u64 space{}; ///< the address space E looked the programs up in (id + 1)
     };
 
     // R.
@@ -150,6 +157,8 @@ private:
     struct FillRecord {
         u64 seq;
         u64 key;
+        u64 space;                 ///< the address space E resolved the programs in (id + 1)
+        std::array<u64, 6> code;   ///< the programs' device addresses there
         std::array<u64, VideoCommon::MemStageShadow::ProgramWordCount> words;
         std::array<u64, 2> hashes;
         std::array<u32, 5> uniform_masks;

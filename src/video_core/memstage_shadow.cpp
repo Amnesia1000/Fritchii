@@ -4051,14 +4051,59 @@ u64 BackStateHash(const Maxwell3D& maxwell3d) {
     return StateHash(maxwell3d, &maxwell3d);
 }
 
+void ResolveProgramCode(const Tegra::MemoryManager& memory, ProgramId& id) {
+    struct Memo {
+        bool valid{};
+        size_t memory_id{};
+        u64 map_serial{};
+        std::array<u64, ProgramWordCount> words{};
+        std::array<u64, 6> code{};
+    };
+    thread_local Memo memo{};
+    const size_t memory_id = memory.GetID();
+    const u64 map_serial = memory.MapSerial();
+    id.space = u64{memory_id} + 1;
+    if (memo.valid && memo.memory_id == memory_id && memo.map_serial == map_serial &&
+        memo.words == id.words) {
+        id.code = memo.code;
+        return;
+    }
+    using Regs = Maxwell3D::Regs;
+    std::array<Regs::Pipeline, Regs::MaxShaderProgram> pipelines;
+    static_assert(sizeof(pipelines) == 48 * sizeof(u64));
+    std::memcpy(pipelines.data(), id.words.data(), sizeof(pipelines));
+    Regs::ProgramRegion region;
+    std::memcpy(&region, id.words.data() + 48, sizeof(region));
+    for (size_t index = 0; index < id.code.size(); ++index) {
+        // As Regs::IsShaderConfigEnabled: VertexB (1) is always on.
+        const bool enabled = index == 1 || pipelines[index].enable != 0;
+        id.code[index] =
+            enabled ? memory.GpuToCpuAddress(region.Address() + pipelines[index].offset).value_or(0)
+                    : 0;
+    }
+    memo = Memo{true, memory_id, map_serial, id.words, id.code};
+}
+
 void BackProgramId(const Maxwell3D& maxwell3d, ProgramId& out) {
     ProgramWords(maxwell3d, out.words);
     out.key = HashProgramWords(out.words);
+    // GetMemoryManager has no const form; it is only read here.
+    ResolveProgramCode(const_cast<Maxwell3D&>(maxwell3d).GetMemoryManager(), out);
+}
+
+void StageProgramCode(const MemStageShadowEngine& copy, ProgramId& id) {
+    if (copy.back == nullptr) {
+        id.space = 0; // no address space: matches nothing the back published
+        id.code = {};
+        return;
+    }
+    ResolveProgramCode(copy.back->GetMemoryManager(), id);
 }
 
 void StageProgramId(const MemStageShadowEngine& copy, ProgramId& out) {
     ProgramWords(copy, out.words);
     out.key = HashProgramWords(out.words);
+    StageProgramCode(copy, out);
 }
 
 void StageProgramWords(const MemStageShadowEngine& copy,

@@ -2036,16 +2036,28 @@ u64 MemStage::DropRingPackets(u64 position) {
     return dropped;
 }
 
+namespace {
+/// The facts table's key: a hash of the code identity (the address space and each program slot's
+/// device address), never 0.
+u64 CodeKey(const VideoCommon::MemStageShadow::ProgramId& id) {
+    u64 hash = id.space * 0x9E3779B185EBCA87ULL;
+    for (const u64 address : id.code) {
+        hash = std::rotl(hash ^ address, 27) * 0xC2B2AE3D27D4EB4FULL + 0x165667B19E3779F9ULL;
+    }
+    return hash != 0 ? hash : 1;
+}
+} // Anonymous namespace
+
 void MemStage::PublishFacts(const ProgramId& id, const void* source, const DrawFacts& facts,
                             bool dynamic_input, u64 code_epoch) {
-    const u64 key = id.key != 0 ? id.key : 1;
+    const u64 key = CodeKey(id);
     // The back's memo (step 7): every write of the table goes through here and updates it, so a
     // hit means the table holds this source under these registers already. No lock then. The
     // registers are compared too: one key for two programs is a miss, never the other's entry.
     // The epoch too: a republish after a code write anywhere makes the entry good for it again.
     PublishedMemo& memo = published_memo[FactsHash(key) & (MemoSlots - 1)];
     if (memo.key == key && memo.source == source && memo.epoch >= code_epoch) {
-        if (memo.words == id.words) {
+        if (memo.space == id.space && memo.code == id.code) {
             return;
         }
         Link::Note(Link::Check::FactsKeyCollision, "the back's facts memo");
@@ -2057,8 +2069,8 @@ void MemStage::PublishFacts(const ProgramId& id, const void* source, const DrawF
     for (size_t probe = 0, index = home; probe < 16; ++probe, index = (index + 1) & Mask) {
         FactsSlot& slot = facts_table[index];
         if (slot.key == key) {
-            if (slot.words != id.words) {
-                // Another program's registers under the same key: a separate entry.
+            if (slot.space != id.space || slot.code != id.code) {
+                // Other code under the same key: a separate entry.
                 Link::Note(Link::Check::FactsKeyCollision, "the facts table (publish)");
                 continue;
             }
@@ -2068,7 +2080,7 @@ void MemStage::PublishFacts(const ProgramId& id, const void* source, const DrawF
                     slot.epoch = code_epoch;
                     facts_generation.fetch_add(1, std::memory_order_release);
                 }
-                memo = PublishedMemo{key, source, id.words, slot.epoch};
+                memo = PublishedMemo{key, source, id.space, id.code, slot.epoch};
                 return;
             }
             target = &slot;
@@ -2112,7 +2124,8 @@ void MemStage::PublishFacts(const ProgramId& id, const void* source, const DrawF
         }
         staged.infos = std::move(infos);
     }
-    if (target->key != 0 && (target->key != key || target->words != id.words)) {
+    if (target->key != 0 &&
+        (target->key != key || target->space != id.space || target->code != id.code)) {
         // An entry pushed out of a full probe run: its memo must not say "published" any more
         // (cleared on the key alone: a memo cleared needlessly costs one locked look).
         PublishedMemo& evicted = published_memo[FactsHash(target->key) & (MemoSlots - 1)];
@@ -2122,15 +2135,16 @@ void MemStage::PublishFacts(const ProgramId& id, const void* source, const DrawF
     }
     target->key = key;
     target->source = source;
-    target->words = id.words;
+    target->space = id.space;
+    target->code = id.code;
     target->facts = std::move(staged);
     target->epoch = code_epoch;
-    memo = PublishedMemo{key, source, id.words, code_epoch};
+    memo = PublishedMemo{key, source, id.space, id.code, code_epoch};
     facts_generation.fetch_add(1, std::memory_order_release);
 }
 
 bool MemStage::LookupFacts(const ProgramId& id, StagedFacts& out) const {
-    const u64 key = id.key != 0 ? id.key : 1;
+    const u64 key = CodeKey(id);
     // An entry published before the latest program code write may describe the old code at these
     // addresses: a miss (MemStageShadow::g_program_code_epoch).
     const u64 epoch =
@@ -2149,7 +2163,7 @@ bool MemStage::LookupFacts(const ProgramId& id, StagedFacts& out) const {
     // (counted, must be 0 in practice), never the other program's facts.
     StageFactsSlot& cached = stage_facts_cache[FactsHash(key) & (StageFactsSlots - 1)];
     if (cached.key == key) {
-        if (cached.words == id.words) {
+        if (cached.space == id.space && cached.code == id.code) {
             if (cached.epoch < epoch) {
                 return false; // stale since a code write
             }
@@ -2164,7 +2178,7 @@ bool MemStage::LookupFacts(const ProgramId& id, StagedFacts& out) const {
     for (size_t probe = 0, index = home; probe < 16; ++probe, index = (index + 1) & Mask) {
         const FactsSlot& slot = facts_table[index];
         if (slot.key == key) {
-            if (slot.words != id.words) {
+            if (slot.space != id.space || slot.code != id.code) {
                 Link::Note(Link::Check::FactsKeyCollision, "the facts table (lookup)");
                 continue;
             }
@@ -2175,7 +2189,8 @@ bool MemStage::LookupFacts(const ProgramId& id, StagedFacts& out) const {
             if (facts_generation.load(std::memory_order_relaxed) == generation) {
                 // Kept only when the table is still the generation the cache stands for.
                 cached.key = key;
-                cached.words = id.words;
+                cached.space = id.space;
+                cached.code = id.code;
                 cached.facts = slot.facts;
                 cached.epoch = slot.epoch;
             }

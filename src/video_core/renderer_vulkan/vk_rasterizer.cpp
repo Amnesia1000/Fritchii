@@ -1748,8 +1748,11 @@ bool RasterizerVulkan::StageSetupFacts(const VideoCommon::MemStageShadowEngine& 
     // the next setup looks up again (LookupFacts' own cache keeps its generation the same way).
     const u64 generation = mem_stage.FactsGeneration();
     Shadow::StageProgramWords(copy, program_id.words);
+    // The code the words name (translated only when they or the address space moved).
+    Shadow::StageProgramCode(copy, program_id);
     const bool same = setup_keep.valid && setup_keep.generation == generation &&
-                      setup_keep.words == program_id.words;
+                      setup_keep.words == program_id.words &&
+                      setup_keep.space == program_id.space && setup_keep.code == program_id.code;
     ++setup_keep.setups;
     bool found;
     if (same && keep == 1) {
@@ -1806,6 +1809,8 @@ bool RasterizerVulkan::StageSetupFacts(const VideoCommon::MemStageShadowEngine& 
         setup_keep.valid = found;
         setup_keep.generation = generation;
         setup_keep.words = program_id.words;
+        setup_keep.space = program_id.space;
+        setup_keep.code = program_id.code;
     }
     constexpr u64 SetupKeepLogEvery = u64{1} << 20; // about 10 s at the market's draw rate
     if (setup_keep.setups >= SetupKeepLogEvery) [[unlikely]] {
@@ -2536,6 +2541,25 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         // Part (c)'s facts compare: the programs this draw ran with (R only).
         onef_pipeline_hashes = {pipeline->ShaderHashes()[1], pipeline->ShaderHashes()[5]};
         onef_pipeline_seen = true;
+        // One follower step 4, before anything is recorded: the facts E filled this unlent draw's
+        // packet from must name the programs of the pipeline about to be bound. Any cause of a
+        // disagreement (stale facts, another channel's code, a view that is off) stops here: the
+        // draw is not recorded (its packet's uploads still play), "facts stale" counts it, and
+        // step 4 stops for the session.
+        if (onef_play != nullptr && mem_stage.HeldHashes() != onef_pipeline_hashes)
+            [[unlikely]] {
+            const auto& held = mem_stage.HeldHashes();
+            onef_precheck_note = fmt::format(
+                "unlent draw before recording: E's facts {:#x}/{:#x}, pipeline {:#x}/{:#x}; "
+                "E's address space {}, R's {}",
+                held[0], held[1], onef_pipeline_hashes[0], onef_pipeline_hashes[1],
+                onef_draw->FillSpace(onef_play->draw_seq), gpu_memory->GetID() + 1);
+            VideoCommon::OneFollower::Note(VideoCommon::OneFollower::Check::FactsStale,
+                                           onef_precheck_note.c_str());
+            VideoCommon::OneFollower::DisableUnlend(
+                "an unlent draw's facts named other programs than its pipeline");
+            return;
+        }
     }
     // FRITCHII_MEMSTAGE_SHADOW (piece 5c): the cache's flags over the fill (compare b); with 3,
     // the fill below and the repack layout read the stage's copy of the engine (CacheInputs on
