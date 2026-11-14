@@ -1264,6 +1264,9 @@ void RasterizerVulkan::SetRingBackend() {
                                     size_t count) {
         return static_cast<RasterizerVulkan*>(context)->StageRangesOverGpuWritten({ranges, count});
     };
+    backend.list_reads_back = [](void*, const VideoCommon::MemStageShadowEngine& copy) {
+        return ListDrawReadsBack(copy.draw_manager.draw_state, copy.regs);
+    };
     Link::Get().SetRingBackend(backend);
 }
 
@@ -1316,10 +1319,14 @@ bool RasterizerVulkan::StageFillDraw(VideoCommon::MemStageShadowEngine& copy, bo
     std::optional<Link::CleanPoint> clean{std::in_place};
     std::scoped_lock lock{buffer_cache.mutex};
     clean.reset();
+    // A list draw (FRITCHII_MEMSTAGE_LIST_DRAWS; the copy's draw manager is inside DrawEnd's
+    // list branch, MemStageShadowEngine::StageDraw sent it): the fill binds its two words as the
+    // back's own fill does with SetDrawIndirect, from the copy's indirect parameters.
+    const bool list_draw = copy.draw_manager.indirect_state.list_words;
     // The fill reads the stage's copy (plan 5.4), as at FRITCHII_MEMSTAGE_SHADOW=3.
-    const VideoCommon::CacheInputs inputs =
-        buffer_cache.StageInputs(copy.regs, copy.state, copy.root_tables,
-                                 copy.draw_manager.draw_state, copy.dirty.flags);
+    const VideoCommon::CacheInputs inputs = buffer_cache.StageInputs(
+        copy.regs, copy.state, copy.root_tables, copy.draw_manager.draw_state, copy.dirty.flags,
+        list_draw ? &copy.draw_manager.indirect_state : nullptr);
     buffer_cache.SetInputsOverride(&inputs);
     SCOPE_EXIT {
         buffer_cache.SetInputsOverride(nullptr);
@@ -1384,7 +1391,7 @@ bool RasterizerVulkan::StageFillDraw(VideoCommon::MemStageShadowEngine& copy, bo
             p->self->StageApplyRanges(*p->ranges, false);
             p->ranges->clear();
         },
-        &pre, values, null_pointer_handles);
+        &pre, values, null_pointer_handles, list_draw);
     if (!filled) {
         link.NoteLevelDraw(7);
     }

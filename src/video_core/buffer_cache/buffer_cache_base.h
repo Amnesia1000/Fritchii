@@ -611,13 +611,15 @@ public:
     }
 
     /// FRITCHII_MEMSTAGE_THREAD=2: the memory stage's copy as the bound channel's inputs.
-    [[nodiscard]] CacheInputs StageInputs(const CacheInputs::Regs& regs_,
-                                          const Tegra::Engines::Maxwell3D::State& state_,
-                                          const Tegra::Engines::Maxwell3D::RootTables& tables_,
-                                          const CacheInputs::DrawManagerState& draw_state_,
-                                          CacheInputs::DirtyFlags& flags_) const noexcept {
+    /// `draw_indirect_`: the copy's indirect parameters for a list draw it serves, else null.
+    [[nodiscard]] CacheInputs StageInputs(
+        const CacheInputs::Regs& regs_, const Tegra::Engines::Maxwell3D::State& state_,
+        const Tegra::Engines::Maxwell3D::RootTables& tables_,
+        const CacheInputs::DrawManagerState& draw_state_, CacheInputs::DirtyFlags& flags_,
+        const Tegra::Engines::Maxwell3D::DrawManager::IndirectParams* draw_indirect_ =
+            nullptr) const noexcept {
         return CacheInputs::OfStage(maxwell3d, regs_, state_, tables_, draw_state_, flags_,
-                                    kepler_compute, gpu_memory, nullptr);
+                                    kepler_compute, gpu_memory, draw_indirect_);
     }
 
     /// Graphics uniform buffer `index` of `stage` as ForEachBoundBuffer visits it: its device

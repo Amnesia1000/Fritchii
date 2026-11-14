@@ -1354,6 +1354,15 @@ const MemStage::DrawPacket* MemStage::FillDrawHere(Cache& cache_, const DrawFact
                 draw.flags |= PostCopyBarrier;
                 cache_.any_buffer_uploaded = false;
             }
+            if (ring_list_args) {
+                // A list draw (FRITCHII_MEMSTAGE_LIST_DRAWS): the geometry section bound and
+                // synchronized its two words (the inputs' indirect parameters); their buffer
+                // and offset are the back's question in Configure (ConfigureDraw), answered here
+                // as the cache answers it there, after the fill.
+                const auto [list_buffer, list_offset] = cache_.GetDrawIndirectBuffer();
+                draw.indirect = BufferRef{list_buffer->Handle(), list_offset};
+                draw.flags |= ListArgs;
+            }
             // The trackers' record goes in the packet: taken before the push.
             fill_tracker_data.clear();
             if (tracker_record.load(std::memory_order_relaxed)) [[unlikely]] {
@@ -1614,9 +1623,11 @@ const MemStage::DispatchPacket* MemStage::FillDispatch(Cache& cache_,
 
 bool MemStage::FillRingDraw(Cache& cache_, const DrawFacts& facts, bool is_indexed, u64 position,
                             u64 seq, u64 hash, void (*pre)(void*), void* pre_argument,
-                            const std::vector<u32>* values, bool null_pointer_handles) {
+                            const std::vector<u32>* values, bool null_pointer_handles,
+                            bool list_args) {
     ring_values = values;
     ring_null_pointers = null_pointer_handles;
+    ring_list_args = list_args;
     ring_fill = true;
     ring_pushed = false;
     ring_fill_position = position;
@@ -1631,6 +1642,7 @@ bool MemStage::FillRingDraw(Cache& cache_, const DrawFacts& facts, bool is_index
         ring_pre = nullptr;
         ring_pre_argument = nullptr;
         ring_values = nullptr;
+        ring_list_args = false;
         lent_mutex = nullptr;
     };
     const DrawPacket* const packet = FillDrawHere(cache_, facts, is_indexed);

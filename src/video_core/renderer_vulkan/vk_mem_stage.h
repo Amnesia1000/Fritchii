@@ -500,9 +500,12 @@ public:
     /// GPUMem: FillDraw for a draw the stage serves (after BeginDraw); the packet goes to ring B.
     /// `pre` runs inside the fill bracket first (the buffer half of the stage's ranges).
     /// `values`: the draw's raw handles the stage read at its position (SEAM 3), or null.
+    /// `list_args`: a list draw (the cache's inputs carry its indirect parameters): the packet
+    /// takes the buffer of its two words (ListArgs).
     bool FillRingDraw(Cache& cache, const DrawFacts& facts, bool is_indexed, u64 position, u64 seq,
                       u64 hash, void (*pre)(void*), void* pre_argument,
-                      const std::vector<u32>* values, bool null_pointer_handles);
+                      const std::vector<u32>* values, bool null_pointer_handles,
+                      bool list_args = false);
     /// The back holds a draw packet from ring B.
     [[nodiscard]] bool HeldFromRing() const noexcept {
         return held == HeldKind::Draw && held_ring;
@@ -976,6 +979,7 @@ private:
     void* ring_pre_argument{};
     const std::vector<u32>* ring_values{};
     bool ring_null_pointers{};
+    bool ring_list_args{};
     /// The held draw came from ring B: its packet is played_draw.
     bool held_ring{};
     DrawPacket played_draw{};

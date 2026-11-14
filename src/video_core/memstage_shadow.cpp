@@ -347,9 +347,15 @@ std::string LevelName(u64 key) {
     case LevelType::CacheCall:
         what = fmt::format("cache call +{:#x}", id);
         break;
-    case LevelType::LevelDraw:
-        what = fmt::format("level draw (kind {})", id);
+    case LevelType::LevelDraw: {
+        // MemStageShadowEngine::StageDraw's ids (RingLevel).
+        static constexpr std::array<const char*, 11> names{
+            "indirect", "GPU count", "texel buffers", "forced",
+            "fill refused", "no room", "late", "other",
+            "list, window closed or switch off", "list, read back", "list, fill refused"};
+        what = fmt::format("level draw ({})", id < names.size() ? names[id] : "?");
         break;
+    }
     case LevelType::CbGpuWritten:
         what = "constant buffer words onto GPU-written data (the window open)";
         break;
@@ -2071,8 +2077,19 @@ std::pair<DAddr, DAddr> FirstUncovered(const std::vector<std::pair<DAddr, DAddr>
     return {0, 0};
 }
 
-/// 6b: what the stage cannot serve, as a LevelDraw id and the link's level draw kind.
-enum class RingLevel : u32 { Indirect = 0, GpuCount = 1, Forced = 3, Late = 6 };
+/// 6b: what the stage cannot serve, as a LevelDraw id and the link's level draw kind. The list
+/// draw ids (8 and up) name run starters only; the link counts list draws on their own
+/// (MemoryStageLink::ListDraw).
+enum class RingLevel : u32 {
+    Indirect = 0,
+    GpuCount = 1,
+    Forced = 3,
+    Refused = 4,
+    Late = 6,
+    List = 8,         ///< a list draw, the window closed or FRITCHII_MEMSTAGE_LIST_DRAWS off
+    ListReadBack = 9, ///< a list draw the back reads back on the CPU
+    ListRefused = 10, ///< a list draw the fill refused (facts miss, texel buffers, no room)
+};
 
 /// The copy's state in compare b's words (the narrow set, channel 0), hashed: the verify of
 /// compare b with two threads. The back hashes the same words of its engine at the take.
@@ -2819,7 +2836,28 @@ void MemStageShadowEngine::StageDraw(bool indexed, u32 instance_count, bool indi
             link.NoteLevelDraw(static_cast<u32>(kind));
             Shadow::Hard(s, Shadow::LevelType::LevelDraw, static_cast<u64>(kind));
         };
-        if (indirect) {
+        const auto& backend = link.Backend();
+        // List draws (FRITCHII_MEMSTAGE_LIST_DRAWS, the window open): DrawEnd's list branch, a
+        // non-indexed draw from the two words at indirect_state.indirect_start_address. Served
+        // when the back would draw them indirectly (not read them back): the fill binds the
+        // words from the copy's indirect parameters and the packet carries their buffer
+        // (vk_rasterizer.cpp, StageFillDraw). Every level one starts a run (entry_hard is false
+        // here): counted by why.
+        const bool list = indirect && draw_manager.indirect_state.list_words;
+        const auto list_level = [&](MemoryStageLink::ListDraw why, Shadow::RingLevel kind) {
+            link.NoteListDraw(why);
+            Shadow::Hard(s, Shadow::LevelType::LevelDraw, static_cast<u64>(kind));
+        };
+        if (list) {
+            if (!MemoryStageLink::ListDrawsServed()) {
+                return list_level(MemoryStageLink::ListDraw::Closed, Shadow::RingLevel::List);
+            }
+            if (backend.list_reads_back == nullptr ||
+                backend.list_reads_back(backend.context, *this)) {
+                return list_level(MemoryStageLink::ListDraw::ReadBack,
+                                  Shadow::RingLevel::ListReadBack);
+            }
+        } else if (indirect) {
             return level(Shadow::RingLevel::Indirect);
         }
         if (!indexed && Tegra::Nx2IndirectGrid::AnyLive() &&
@@ -2828,16 +2866,28 @@ void MemStageShadowEngine::StageDraw(bool indexed, u32 instance_count, bool indi
             return level(Shadow::RingLevel::GpuCount);
         }
         if (Shadow::g_ring_level_draws.load(std::memory_order_relaxed)) {
+            if (list) {
+                link.NoteListDraw(MemoryStageLink::ListDraw::Refused);
+            }
             return level(Shadow::RingLevel::Forced);
         }
-        const auto& backend = link.Backend();
         const u64 hash = MemoryStageLink::RingVerify() ? Shadow::StateHash(*this, back) : 0;
+        // A list draw is drawn non-indexed (DrawListWords' PrepareDraw); DrawManager hands every
+        // indirect draw over as indexed.
         if (backend.fill_draw == nullptr ||
-            !backend.fill_draw(backend.context, *this, indexed, s.processing_position, seq, hash,
-                               s.ring_ranges)) {
+            !backend.fill_draw(backend.context, *this, list ? false : indexed,
+                               s.processing_position, seq, hash, s.ring_ranges)) {
             // fill_draw counted the kind (facts miss, texel buffers, no room).
-            Shadow::Hard(s, Shadow::LevelType::LevelDraw, 4);
+            if (list) {
+                return list_level(MemoryStageLink::ListDraw::Refused,
+                                  Shadow::RingLevel::ListRefused);
+            }
+            Shadow::Hard(s, Shadow::LevelType::LevelDraw,
+                         static_cast<u64>(Shadow::RingLevel::Refused));
             return;
+        }
+        if (list) {
+            link.NoteListDraw(MemoryStageLink::ListDraw::Served);
         }
         ++s.entry_served;
         ++s.counters.served_draws;
