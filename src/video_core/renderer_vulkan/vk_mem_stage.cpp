@@ -3319,6 +3319,10 @@ void MemStage::TickThread(int seam) {
     // (Link::EntryFast).
     link.SetEntryFast(
         Debug::SwitchValue(Debug::g_memstage_entry_fast, "FRITCHII_MEMSTAGE_ENTRY_FAST", 0) > 0);
+    // GPUMem's runs of constant buffer words (live, default off): only while the window is open
+    // too (Link::CbRuns).
+    link.SetCbRuns(
+        Debug::SwitchValue(Debug::g_memstage_cb_runs, "FRITCHII_MEMSTAGE_CB_RUNS", 0) > 0);
     // Gathers run at their entry with GPUMem level instead of a run (live, default off): only
     // while the window is open (Link::GatherServed); level mode and THREAD 0/1 never.
     link.SetGather(
