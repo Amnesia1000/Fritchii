@@ -39,6 +39,7 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_cb_path.h"
 #include "video_core/nx2_cmdpage_diag.h"
+#include "video_core/nx2_indirect_grid.h"
 #include "video_core/nx2_list_dispatch.h"
 #include "video_core/nx2_list_draw.h"
 #include "video_core/nx2_perf.h"
@@ -3661,6 +3662,113 @@ void NoteE2cMiss(VideoCommon::GpuSplit& split, u64 snapshot, u64 device, bool li
     s.since = start;
 }
 
+// FRITCHII_FRONT_RAN_READS (live, default 0; the market's "Front 0xe2c misses" line: about 90%
+// of the noted-write misses wait for writes the back already ran): a macro DMA read that misses
+// its page snapshot only for a noted write (reason 3) reads guest memory at once, without the
+// drain, when the drained read could not give other bytes:
+//   (a) the back ran every write noted over the bytes since the snapshot (GpuSplit::
+//       NotedWritesRan: none past ConsumedNow, the dropped ones included);
+//   (e) the read is on one page (the snapshot, the GPU-written bit and (a) are per page);
+//   (f) the page never held GPU-modified buffer data, or no indirect grid placeholder was ever
+//       handed out: the grid's DMA copy inside a 3D inline upload is the one noted write whose
+//       run leaves its bytes in the buffer cache only (marking the page GPU-written), which the
+//       drained path's FlushRegion would bring back. Without placeholders every noted write
+//       (3D reports and payload releases, puller semaphores, inline uploads, KeplerMemory data
+//       with EXP120) writes guest memory itself, at its run or when its async report completes;
+//   (c) no async report write to the bytes is still owed: every report issued to their 16-byte
+//       slots completed (Nx2AsyncReportsSettled; counter reports, timed and fence releases, with
+//       any accuracy or fence setting, EXP33 and EXP119's runs; issued on the back before it
+//       passed the report's entry), and the newest async note over them has run (SEM_FAST's
+//       rule). A report starting up to 15 bytes before the read is included;
+//   (b) the query cache lists no report on the bytes (the hit path's own test, 12 bytes back).
+// The other miss reasons (compute and copies, unranged writers, and with EXP10 the dispatch
+// check and byte lists, which come after the noted-write test) are asked as for a hit and still
+// drain. 2 = verify: the same decision, then the read drains anyway, and the bytes read at once
+// are compared with the drained ones ("Front ran reads (must be 0)"), which are used.
+// The page snapshot is left alone: (a)-(c) hold for the bytes read, not for the rest of the page,
+// whose noted writes may still be queued or owe a report; a snapshot moved to `done` would let
+// the hit path (which asks neither (a) nor (c)) serve those. Front thread only.
+struct RanReadStats {
+    enum Outcome : u32 { Served, Queued, PastTable, TwoPages, GpuWritten, Async, Listed, Count };
+    static constexpr std::array<const char*, Count> names{
+        "served",          "a note still queued", "notes past the table", "two pages",
+        "GPU-written page", "an async report owed", "a listed report"};
+    std::array<u64, Count> outcomes{};
+    u64 then_missed{}; ///< Spared the noted write, then drained for another writer
+    u64 compared{};
+    u64 differed{};
+    u64 session_differed{};
+    std::chrono::steady_clock::time_point since{};
+};
+RanReadStats g_ran_reads;
+
+RanReadStats::Outcome RanReadCheck(VideoCommon::GpuSplit& split,
+                                   VideoCore::RasterizerInterface& rasterizer, u64 since,
+                                   u64 device, u64 bytes, bool one_page) {
+    if (!one_page || device < 16) {
+        return RanReadStats::TwoPages;
+    }
+    // The back's position first: everything it ran before it is visible from here on.
+    const u64 done = split.ConsumedNow();
+    switch (split.NotedWritesRan(since, done, device, bytes)) {
+    case VideoCommon::GpuSplit::NotedRun::Queued:
+        return RanReadStats::Queued;
+    case VideoCommon::GpuSplit::NotedRun::PastTable:
+        return RanReadStats::PastTable;
+    case VideoCommon::GpuSplit::NotedRun::Ran:
+        break;
+    }
+    if (Tegra::Nx2IndirectGrid::AnyLive() &&
+        (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed) ||
+         Tegra::Nx2MayBeGpuWritten(device, bytes))) {
+        return RanReadStats::GpuWritten;
+    }
+    // A 16-byte report written up to 15 bytes before the read overlaps it.
+    if (split.HasAsyncWrite(device - 15, bytes + 15) > done ||
+        !Tegra::Nx2AsyncReportsSettled(device - 15, bytes + 15)) {
+        return RanReadStats::Async;
+    }
+    if (rasterizer.HasCachedReports(device - 12, bytes + 12)) {
+        return RanReadStats::Listed;
+    }
+    return RanReadStats::Served;
+}
+
+void MaybeLogRanReads(int mode) {
+    auto& s = g_ran_reads;
+    const auto now = std::chrono::steady_clock::now();
+    if (s.since == std::chrono::steady_clock::time_point{}) {
+        s.since = now;
+        return;
+    }
+    const double seconds = std::chrono::duration<double>(now - s.since).count();
+    if (seconds < 10.0) {
+        return;
+    }
+    const auto rate = [seconds](u64 count) { return static_cast<double>(count) / seconds; };
+    u64 checked = 0;
+    std::string drained;
+    for (u32 i = 0; i < RanReadStats::Count; ++i) {
+        checked += s.outcomes[i];
+        if (i != RanReadStats::Served) {
+            drained += fmt::format("{} {} {:.0f}/s", drained.empty() ? "" : ",",
+                                   RanReadStats::names[i], rate(s.outcomes[i]));
+        }
+    }
+    LOG_INFO(HW_GPU,
+             "Front ran reads (FRITCHII_FRONT_RAN_READS={}) {:.0f} s: noted-write misses checked "
+             "{:.0f}/s, passed {:.0f}/s{} (of them drained for another writer after it "
+             "{:.0f}/s); drained:{}; verify: {} compared, {} differed (must be 0; {} this "
+             "session)",
+             mode, seconds, rate(checked), rate(s.outcomes[RanReadStats::Served]),
+             mode == 2 ? " (mode 2: would be; drained and compared)" : "", rate(s.then_missed),
+             drained, s.compared, s.differed, s.session_differed);
+    const u64 session = s.session_differed;
+    s = {};
+    s.since = now;
+    s.session_differed = session;
+}
+
 } // Anonymous namespace
 
 void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 macro,
@@ -3779,6 +3887,28 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             bool unranged_skip = false;
             const u64 first_page = *device >> 12;
             const u64 last_page = (*device + read_bytes - 1) >> 12;
+            // FRITCHII_FRONT_RAN_READS (live, 0 = off; RanReadCheck above): a noted write since
+            // the snapshot whose every note over the bytes already ran and landed is no miss.
+            // The checks after it (EXP10's dispatches and byte lists) are asked as for a hit.
+            const int ran_mode = VideoCore::Nx2Debug::SwitchValue(
+                VideoCore::Nx2Debug::g_front_ran_reads, "FRITCHII_FRONT_RAN_READS");
+            bool ran_passed = false;
+            const auto noted_write = [&](u64 since) {
+                if (!split.NotedWriteSince(since, *device, read_bytes)) {
+                    return false;
+                }
+                if (ran_mode == 0) {
+                    return true;
+                }
+                const auto outcome = RanReadCheck(split, *rasterizer, since, *device, read_bytes,
+                                                  first_page == last_page);
+                ++g_ran_reads.outcomes[outcome];
+                if (outcome != RanReadStats::Served) {
+                    return true;
+                }
+                ran_passed = true;
+                return false;
+            };
             bool hit = true;
             bool census_pending = false;
             for (u64 page = first_page; page <= last_page && hit; ++page) {
@@ -3799,8 +3929,8 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                 if (!ranged_writers) {
                     reason = writer_since                             ? 1
                              : split.LastUnrangedPosition() > since ? 2
-                             : split.NotedWriteSince(since, *device, read_bytes) ? 3
-                                                                                 : 4;
+                             : noted_write(since)                   ? 3
+                                                                    : 4;
                 } else if (split.WritersMayWriteSince(since, page << 12, 0x1000,
                                                       &snapshot.writer_ranges, listed,
                                                       &writer_check)) {
@@ -3811,7 +3941,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                     ++writer_checks[static_cast<size_t>(writer_check)];
                 } else if (split.LastUnrangedPosition() > since) {
                     reason = 2;
-                } else if (split.NotedWriteSince(since, *device, read_bytes)) {
+                } else if (noted_write(since)) {
                     reason = 3;
                 } else {
                     // Last: the only check that may wait.
@@ -3857,6 +3987,24 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             }
             if (hit && unranged_skip) {
                 ++unranged_skips;
+            }
+            // FRITCHII_FRONT_RAN_READS: spared the noted write, then drained for another writer;
+            // with 2 a read it would serve drains all the same, the bytes read now kept to compare.
+            thread_local std::vector<u32> ran_words;
+            bool ran_verify = false;
+            if (ran_passed) {
+                if (!hit) {
+                    ++g_ran_reads.then_missed;
+                } else if (ran_mode == 2) {
+                    ran_words.resize(words);
+                    memory_manager.ReadBlockUnsafe(source, ran_words.data(), read_bytes);
+                    ran_verify = true;
+                    hit = false;
+                    ++miss_reasons[3];
+                }
+            }
+            if (ran_mode != 0) {
+                MaybeLogRanReads(ran_mode);
             }
             // A report's value is up to 8 bytes, listed by its first 4: look 12 bytes back. A
             // listed report may not be in guest memory yet: take the drained path.
@@ -3933,6 +4081,25 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                         split.WatchPage(page);
                     }
                     memory_manager.ReadBlockUnsafe(source, snap_words.data(), read_bytes);
+                    if (ran_verify) {
+                        // FRITCHII_FRONT_RAN_READS=2: the drained words are used.
+                        ++g_ran_reads.compared;
+                        if (ran_words != snap_words) {
+                            ++g_ran_reads.differed;
+                            if (g_ran_reads.session_differed++ < 16) {
+                                u32 index = 0;
+                                while (index + 1 < words && ran_words[index] == snap_words[index]) {
+                                    ++index;
+                                }
+                                LOG_WARNING(HW_GPU,
+                                            "Front ran reads (must be 0): macro {:#x} read of {} "
+                                            "words at {:#x} (device {:#x}) differs from the "
+                                            "drained read: word {} {:#x}, drained {:#x}",
+                                            macro, words, source, *device, index,
+                                            ran_words[index], snap_words[index]);
+                            }
+                        }
+                    }
                 }
                 static auto last_log = std::chrono::steady_clock::now();
                 if (const auto now = std::chrono::steady_clock::now();

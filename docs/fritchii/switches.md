@@ -117,6 +117,62 @@ answer's same-frame sample counters). Per second:
 - Reading it: misses blocked by payload reports with the back far behind are answer A
   (bookkeeping on the front); counter or sample reports the back had not run, or a listed report
   on the bytes, are answer B (the value does not exist yet at the front).
+- With FRITCHII_FRONT_RAN_READS on, it counts only the misses that switch did not spare (with 2:
+  would not spare).
+
+### FRITCHII_FRONT_RAN_READS
+
+FRITCHII_FRONT_RAN_READS (live, default 0 = exactly as before; the market's "Front 0xe2c misses"
+line: about 90% of the noted-write misses wait for writes the back already ran). A macro DMA read
+(any macro, EDEN_NX2_DMA_SNAPSHOT's 0x158 reads) that misses its page snapshot only because a write
+was noted over its bytes since the snapshot (reason "noted write") reads guest memory at once,
+without the drain, when all of these hold (Maxwell3D::FrontDmaRead, RanReadCheck):
+- (a) the back ran every write noted over the read's bytes since the snapshot: none of those notes
+  is past the back's position (`consumed`, loaded first). The note table is in ring order, so the
+  scan stops at the first note at or before that position; every older one ran, the ones the table
+  dropped included. If the table ends before the scan gets there (the "notes past the table"
+  case), a dropped note may still be queued: it drains (GpuSplit::NotedWritesRan);
+- (e) the read is on one 4 KB device page;
+- (f) the page never held GPU-modified buffer data (the never-cleared GPU-written bit), or no
+  indirect grid placeholder was ever handed out: a 3D inline upload with placeholders is the one
+  noted write whose run leaves its bytes in the buffer cache only (the grid's DMA copy), which the
+  drained path's FlushRegion would bring back. Every other noted write writes guest memory itself:
+  3D reports and payload releases, puller semaphores (both through the query cache, at their run
+  or when the host query or fence completes), inline uploads (guest memory first, then the caches),
+  KeplerMemory data noted by EXP120;
+- (c) no async report is owed to the bytes: every report issued to their 16-byte slots completed
+  (Nx2AsyncReportsSettled, the rule SEM_FAST uses for semaphore words) and the newest async note
+  over them ran. This covers every way a report's value lands after the back ran it: counter and
+  sample reports, timed and fence releases, any accuracy or fence setting, EXP33's kept fence
+  reports, EXP119's report runs (all issue on the back before it passes the report's entry, and
+  complete only after the words are in guest memory). A report starting up to 15 bytes before the
+  read counts;
+- (b) the query cache lists no report on the bytes (the hit path's own test, 12 bytes back);
+- the other miss reasons (compute and copies, unranged writers; with EXP10 the dispatch check and
+  byte lists, which come after the noted-write test) are asked as for a hit and still drain.
+
+The page snapshot is left alone: the checks hold for the bytes read, not for the rest of the page,
+where a noted write may still be queued or owe a report, and the hit path asks neither (a) nor (c).
+So later reads of the page take the same check (a short scan) until a drain renews the snapshot.
+
+- With FRITCHII_MEMSTAGE_THREAD=2 the back still runs every report and semaphore entry (GPUMem only
+  fills draws; a lone gather or puller release it serves runs on the back before the back passes
+  it), and `consumed` is stored after the entries before it ran, so it is the right position.
+  Notes and the async slots are by device address, so another GPU address of the same bytes finds
+  them.
+- 2 = verify: the same decision, then the read drains anyway; the bytes read at once are compared
+  with the drained ones, which are used. "Front ran reads (must be 0): macro m read of n words at
+  a (device d) differs from the drained read: word i x, drained y" for the first 16. A guest CPU
+  write to the bytes between the two reads would also show (none expected on report memory).
+- "Front ran reads (FRITCHII_FRONT_RAN_READS=n) 10 s" (HW_GPU, Info): noted-write misses checked
+  a second, passed (with 2: would be served), of those drained after all for another writer (the
+  EXP10 dispatch check or byte lists), and the drained ones by first failed check: a note still
+  queued, notes past the table, two pages, GPU-written page, an async report owed, a listed
+  report; verify compared and differed (must be 0, with the session total).
+- Served reads count as "skipped the drain" in the "DMA snapshot" line.
+- Expected at the market: about 1,500 to 2,000 of the 2,300 drains a second go (the 1,520 counter
+  or sample reports and 548 "other" notes the back had run, minus the ones that owe a report or
+  are listed), 45 us each: about 70 to 90 ms/s of front waiting.
 
 ### Acquire resumes met by (always on, a counter)
 
@@ -141,6 +197,54 @@ and by the other routes (word read, front answer, poll drain, lagged check).
 - Reading it: latch resumes by releases known at send are what resolving acquires at the front
   (resume when the newest queued release over the word has a known value that meets it) would
   take off the front's blocked time.
+- With FRITCHII_ACQUIRE_TABLE_FIRST on, its resumes count under "the other routes".
+
+### FRITCHII_ACQUIRE_TABLE_FIRST
+
+FRITCHII_ACQUIRE_TABLE_FIRST (live, default 0 = exactly as before; fable_front_drains 2.3 item 2
+and 6.3). A suspended acquire's poll (Puller::CanResumeAcquire) asks the front's release table
+right after the latch: before the word read (SEM_FAST's read, which waits for the noted writers
+of the word when it can't overlay them) and above the unmet-poll throttle (16 polls or 1 ms, and
+EXP12=5/6's 1 ms lagged check), which held MetByQueuedRelease back until then. Every poll point
+the front has asks (each command list's end, the idle loop), so the first poll after another
+channel sent the release asks too. Never inside a list: that would change the channels' order.
+- 1: met when the newest release recorded for the word (GpuSplit::NoteRelease) is a puller
+  release (WriteLong, SEM_EXECUTE) or a 3D payload release (4 bytes) or report (16 bytes), all
+  known at send, still queued, with a payload that meets the acquire and nothing sent after it
+  that may write the word: MetByQueuedRelease's rule, which the acquire's parse and the throttled
+  poll already use. The resumed channel's entries go into the ring after the release, so the
+  back runs the release first, and the answer is the one a later poll would give from the word
+  once the back ran it. Off with delayed fences (the release lands at a later fence), and for the
+  16-byte report with accurate queries (its operation waits for a fence too). Compute 0x6c3
+  releases stay with the throttled path.
+- 2: also the QMD feed (EXP13=3/4, MetByQmdPrediction) at the same place, before the word read
+  (today it is asked after it, also above the throttle). Its own rules, unchanged. When a
+  prediction can be wrong: the QMD words the front's copy read differ from what the back reads at
+  the launch (a writer of the QMD the copy did not see, an overlay from guest memory), the
+  copy's scheduler differs from the back's (dependency counts, chained dependents, decrements),
+  or a max release or reduction (a bound, not a value). The checks: the back compares every
+  release it makes with its record (the feed turns itself off for the session at the first
+  mismatch, an ERROR line) and the feed audits each acquire it met ("acquire wrongly met"). Both
+  find a wrong answer only after the resumed channel ran, so 2 stays a test mode. When the table
+  does not meet, the poll asks the feed again after the word read (that read may have waited), so
+  the feed's gate counters count both asks.
+- Must be 0 (1's resumes): each resume watches its word with a waiter of its own
+  (Nx2SemaphoreWaiters, added before the last check); once the back ran the release (`consumed`
+  past it, its async report settled) the waiter must have latched, that is the back wrote a value
+  that meets the acquire. If the word already met when the waiter was added (the release landed
+  first), the watch is not judged. 16 watches at most; one not settled within 2 s is dropped
+  ("unresolved"). "Acquire table first (must be 0): device d op o value v: the release it was
+  resumed on (payload p, ring r) ran, and no write that met it was seen; the word is w now" for the
+  first 8.
+- "Acquire table first (FRITCHII_ACQUIRE_TABLE_FIRST=n) 5 s" (HW_GPU, Info): resumes a second by
+  kind (puller release, 3D payload release (4 bytes), 3D payload report (16 bytes), QMD feed
+  exact, QMD feed other), the watches (met at the write, landed before the watch, unwatched,
+  unresolved after 2 s, open) and the must-be-0 count with the session total.
+- Expected: small. At the market the 256 3D payload releases and 228 QMD releases a second that
+  met parked acquires were resumed by the latch: the back had run them by the next poll point,
+  which the front reaches only at a list's end. What 1 can take are the polls where the release
+  was queued but the word read could not show it, or waited for it (a 16-byte note over the word,
+  the throttle).
 
 ### EDEN_NX2_ACCURATE_PARTS
 

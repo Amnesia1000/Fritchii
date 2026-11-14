@@ -154,6 +154,10 @@ inline std::atomic<int> g_delay_e2c_us{-1};
 inline std::atomic<int> g_delay_dispatch_us{-1};
 /// FRITCHII_DELAY_DRAW_US: docs/fritchii/switches.md.
 inline std::atomic<int> g_delay_draw_us{-1};
+/// FRITCHII_FRONT_RAN_READS: docs/fritchii/switches.md.
+inline std::atomic<int> g_front_ran_reads{-1};
+/// FRITCHII_ACQUIRE_TABLE_FIRST: docs/fritchii/switches.md.
+inline std::atomic<int> g_acquire_table_first{-1};
 /// EDEN_NX2_LIGHT_TABLE_ARRAYS: docs/fritchii/switches.md.
 [[nodiscard]] inline bool LightTableArrays() {
     static const bool on = EnvSwitch("EDEN_NX2_LIGHT_TABLE_ARRAYS") > 0;

@@ -1202,8 +1202,10 @@ void RecordPullerRelease(DmaPusher& dma_pusher, GPUVAddr address, u32 payload) {
 // EXP13=3 (nx2_qmd_prediction.h): an acquire a queued release or the reduction bound meets goes
 // on as one a queued release meets does (MetByQueuedRelease): the back runs the channel's later
 // work behind the releases, and it counts as a host-level wait (NoteSync).
+// `fed_out` (optional): what met it (FRITCHII_ACQUIRE_TABLE_FIRST's count).
 bool MetByQmdPrediction(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire,
-                        bool resume) {
+                        bool resume,
+                        VideoCommon::QmdPrediction::FedRelease* fed_out = nullptr) {
     namespace Prediction = VideoCommon::QmdPrediction;
     auto& split = VideoCommon::GpuSplit::Get();
     if (!Prediction::FeedRequested() || !split.Active()) {
@@ -1232,6 +1234,9 @@ bool MetByQmdPrediction(DmaPusher& dma_pusher, const Puller::PendingAcquire& acq
             resume, &fed)) {
         return false;
     }
+    if (fed_out != nullptr) {
+        *fed_out = fed;
+    }
     split.NoteSync();
     // EDEN_NX2_RUNAHEAD: a queued plain release with an exact payload is a boundary too (the
     // untracked writers the drain path can't answer are mostly these QMD releases).
@@ -1244,6 +1249,267 @@ bool MetByQmdPrediction(DmaPusher& dma_pusher, const Puller::PendingAcquire& acq
     }
     return true;
 }
+
+// FRITCHII_ACQUIRE_TABLE_FIRST (live, default 0; fable_front_drains 2.3 item 2 and 6.3, the
+// market's "Acquire resumes met by" line): a suspended acquire's poll asks the front's release
+// table first, right after the latch: before the word read (SemaphoreReadableNow, which waits for
+// the noted writers of the word when it can't overlay them) and above the unmet-poll throttle
+// (16 polls or 1 ms; EXP12=5/6's 1 ms lagged check), which held MetByQueuedRelease back. Every
+// poll point the front has (each command list's end, the idle loop) asks, so the first poll after
+// another channel sent the release asks too.
+// 1: met when the newest release recorded for the word (GpuSplit::NoteRelease) is a puller
+//    release or a 3D payload release or report (values known at send), still queued, its payload
+//    meets the acquire and nothing sent after it may write the word: MetByQueuedRelease's own
+//    rule, which the parse of the acquire and the throttled poll use today. The resumed
+//    channel's entries go into the ring after the release, so the back runs the release first.
+//    Not with delayed fences (the release lands at a later fence, not when the back runs it),
+//    nor a 16-byte report with accurate queries (its operation waits for a fence too).
+// 2: also the QMD feed (EXP13=3/4, MetByQmdPrediction) at the same place, before the word read
+//    (today: after it, still above the throttle). Its own rules and checks, unchanged: the back's
+//    check of every release against its record (the feed turns itself off at the first
+//    mismatch) and its audit of met acquires ("acquire wrongly met"). A test mode: a wrong
+//    prediction is found only after the resumed channel ran.
+// Must be 0, for 1: each resume watches its word with a waiter of its own (Nx2SemaphoreWaiters,
+// added before the last check), and once the back ran the release (consumed past it, its async
+// report settled) the waiter must have latched: the back wrote a value that meets the acquire.
+// If the word met already when the waiter was added (the release landed first) the watch is not
+// judged. Front thread only.
+class AcquireTableFirst {
+public:
+    enum class Kind : u8 { Puller, Payload3DShort, Payload3DLong, FeedExact, FeedOther, Count };
+
+    static AcquireTableFirst& Get() {
+        static AcquireTableFirst table;
+        return table;
+    }
+
+    [[nodiscard]] static int Mode() {
+        return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_acquire_table_first,
+                                                "FRITCHII_ACQUIRE_TABLE_FIRST");
+    }
+
+    /// A poll of `acquire` (after the latch): whether the tables meet it. `first`: no earlier
+    /// answer of this suspension (ResumeAcquire asks again; counted and watched once). With 2 the
+    /// poll asks the feed again after the word read when this does not meet (the read may have
+    /// waited for writers since), so the feed's own gate counters count both asks.
+    bool Met(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire, int mode,
+             bool first) {
+        Settle();
+        Tick(mode);
+        auto& split = VideoCommon::GpuSplit::Get();
+        if (!split.Active() || VideoCore::Nx2Debug::DelayedFences()) {
+            return false;
+        }
+        const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address);
+        if (!device) {
+            return false;
+        }
+        u64 position = 0;
+        const std::optional<u32> newest = split.NewestReleaseTo(*device, position);
+        const Kind kind = TableKind(split.RecordedReleaseKind(*device));
+        if (newest && kind != Kind::Count && position > split.ConsumedNow() &&
+            acquire.Matches(*newest)) {
+            // The watch first: a write the back makes after this sees its waiter.
+            const s32 slot = first ? Watch(dma_pusher, acquire, *device, *newest, position) : -1;
+            if (MetByQueuedRelease(dma_pusher, acquire)) {
+                if (first) {
+                    ++resumed[static_cast<size_t>(kind)];
+                    if (slot < 0) {
+                        ++unwatched;
+                    }
+                }
+                return true;
+            }
+            Unwatch(slot);
+        }
+        if (mode >= 2) {
+            VideoCommon::QmdPrediction::FedRelease fed{};
+            if (MetByQmdPrediction(dma_pusher, acquire, true, &fed)) {
+                if (first) {
+                    ++resumed[static_cast<size_t>(fed.exact ? Kind::FeedExact : Kind::FeedOther)];
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// The switch went to 0: the watches' waiters go.
+    void Clear() {
+        if (active == 0) {
+            return;
+        }
+        for (s32 i = 0; i < static_cast<s32>(watches.size()); ++i) {
+            if (watches[i].active) {
+                Unwatch(i);
+            }
+        }
+    }
+
+private:
+    using Clock = std::chrono::steady_clock;
+
+    struct WatchEntry {
+        bool active;
+        bool landed_before; ///< The word met when the waiter was added: not judged
+        u32 operation;
+        u32 value;
+        u32 payload;
+        u64 device;
+        u64 position;
+        const u8* pointer;
+        Clock::time_point since;
+    };
+
+    static Kind TableKind(VideoCommon::GpuSplit::ReleaseKind kind) {
+        using Release = VideoCommon::GpuSplit::ReleaseKind;
+        switch (kind) {
+        case Release::Puller:
+            return Kind::Puller;
+        case Release::Payload3DShort:
+            return Kind::Payload3DShort;
+        case Release::Payload3DLong:
+            // Not a fence: with accurate queries its operation runs at a later fence.
+            return VideoCore::Nx2Debug::AccuratePart(1) ? Kind::Count : Kind::Payload3DLong;
+        default:
+            return Kind::Count;
+        }
+    }
+
+    static u32 WordAt(const u8* pointer) {
+        return std::atomic_ref<u32>{*reinterpret_cast<u32*>(const_cast<u8*>(pointer))}.load(
+            std::memory_order_acquire);
+    }
+
+    /// A free watch for the release at `position` (-1: none free, or the word has no host
+    /// memory).
+    s32 Watch(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire, u64 device,
+              u32 payload, u64 position) {
+        using Waiters = Tegra::Nx2SemaphoreWaiters;
+        const u8* const pointer = dma_pusher.memory_manager.GetPointer(acquire.address);
+        if (pointer == nullptr || (reinterpret_cast<uintptr_t>(pointer) & 3) != 0 ||
+            (acquire.operation != Waiters::AcquireEqual &&
+             acquire.operation != Waiters::AcquireGequal &&
+             acquire.operation != Waiters::AcquireMask)) {
+            return -1;
+        }
+        for (s32 i = 0; i < static_cast<s32>(watches.size()); ++i) {
+            WatchEntry& entry = watches[i];
+            if (entry.active) {
+                continue;
+            }
+            Tegra::Nx2SemaphoreWaiters::Get().Add(&tokens[i], device, acquire.value,
+                                                  acquire.operation);
+            // After the waiter: a release that landed before it shows in the word.
+            entry = {.active = true,
+                     .landed_before = acquire.Matches(WordAt(pointer)),
+                     .operation = acquire.operation,
+                     .value = acquire.value,
+                     .payload = payload,
+                     .device = device,
+                     .position = position,
+                     .pointer = pointer,
+                     .since = Clock::now()};
+            ++active;
+            return i;
+        }
+        return -1;
+    }
+
+    void Unwatch(s32 slot) {
+        if (slot < 0 || !watches[slot].active) {
+            return;
+        }
+        Tegra::Nx2SemaphoreWaiters::Get().Remove(&tokens[slot]);
+        watches[slot].active = false;
+        --active;
+    }
+
+    /// Judges the watches whose release the back ran.
+    void Settle() {
+        if (active == 0) {
+            return;
+        }
+        auto& split = VideoCommon::GpuSplit::Get();
+        const u64 done = split.ConsumedNow();
+        const auto now = Clock::now();
+        for (s32 i = 0; i < static_cast<s32>(watches.size()); ++i) {
+            WatchEntry& entry = watches[i];
+            if (!entry.active) {
+                continue;
+            }
+            if (entry.position > done || !Tegra::Nx2AsyncReportsSettled(entry.device, 4)) {
+                if (now - entry.since > std::chrono::seconds{2}) {
+                    ++unresolved;
+                    Unwatch(i);
+                }
+                continue;
+            }
+            const bool latched = Tegra::Nx2SemaphoreWaiters::Get().Latched(&tokens[i]);
+            if (latched) {
+                ++met_at_write;
+            } else if (entry.landed_before) {
+                ++landed_before;
+            } else {
+                ++not_met;
+                ++session_not_met;
+                if (session_not_met <= 8) {
+                    LOG_WARNING(HW_GPU,
+                                "Acquire table first (must be 0): device {:#x} op {} value {:#x}: "
+                                "the release it was resumed on (payload {:#x}, ring {}) ran, and "
+                                "no write that met it was seen; the word is {:#x} now",
+                                entry.device, entry.operation, entry.value, entry.payload,
+                                entry.position, WordAt(entry.pointer));
+                }
+            }
+            Unwatch(i);
+        }
+    }
+
+    void Tick(int mode) {
+        const auto now = Clock::now();
+        if (since == Clock::time_point{}) {
+            since = now;
+            return;
+        }
+        const double window = std::chrono::duration<double>(now - since).count();
+        if (window < 5.0) {
+            return;
+        }
+        const auto rate = [window](u64 count) { return static_cast<double>(count) / window; };
+        const auto kind = [&](Kind k) { return rate(resumed[static_cast<size_t>(k)]); };
+        LOG_INFO(HW_GPU,
+                 "Acquire table first (FRITCHII_ACQUIRE_TABLE_FIRST={}) {:.0f} s: resumed, /s: "
+                 "puller release {:.0f}, 3D payload release (4 bytes) {:.0f}, 3D payload report "
+                 "(16 bytes) {:.0f}, QMD feed exact {:.0f}, QMD feed other {:.0f}; watches: met "
+                 "at the write {}, landed before the watch {}, unwatched {}, unresolved after 2 s "
+                 "{}, open {}; not met at the write (must be 0) {} ({} this session)",
+                 mode, window, kind(Kind::Puller), kind(Kind::Payload3DShort),
+                 kind(Kind::Payload3DLong), kind(Kind::FeedExact), kind(Kind::FeedOther),
+                 met_at_write, landed_before, unwatched, unresolved, active, not_met,
+                 session_not_met);
+        resumed = {};
+        met_at_write = 0;
+        landed_before = 0;
+        unwatched = 0;
+        unresolved = 0;
+        not_met = 0;
+        since = now;
+    }
+
+    std::array<WatchEntry, 16> watches{};
+    /// The watches' waiter owners (one address each).
+    std::array<u8, 16> tokens{};
+    u32 active{};
+    std::array<u64, static_cast<size_t>(Kind::Count)> resumed{};
+    u64 met_at_write{};
+    u64 landed_before{};
+    u64 unwatched{};
+    u64 unresolved{};
+    u64 not_met{};
+    u64 session_not_met{};
+    Clock::time_point since{};
+};
 
 } // Anonymous namespace
 
@@ -1517,6 +1783,17 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
         // The back ran a release that met the value and latched this waiter: resume at once.
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquirePollsFast, 1);
         return met_by(FenceResumeRoute::Latch);
+    }
+    // FRITCHII_ACQUIRE_TABLE_FIRST (live, 0 = off; AcquireTableFirst above): the release table,
+    // with 2 the QMD feed too, before the word read and above the unmet-poll throttle.
+    if (const int table_first = AcquireTableFirst::Mode(); table_first != 0) {
+        if (AcquireTableFirst::Get().Met(
+                dma_pusher, *pending_acquire, table_first,
+                pending_acquire->resume_route == PendingAcquire::RouteUnset)) {
+            return met_by(FenceResumeRoute::Answer);
+        }
+    } else {
+        AcquireTableFirst::Get().Clear();
     }
     // EXP13=3: asked once per poll, before the unmet-poll throttle most polls end at.
     bool predicted = false;
