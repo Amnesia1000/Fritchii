@@ -175,6 +175,10 @@ enum class Check : u8 {
     /// new one built on R from the view, whose constant buffer bindings are only as new as the
     /// last lent packet). Step 4 stops for the session.
     PlayedLookupMiss,
+    /// FRITCHII_ONEF_INVAL_E: R uploaded an image from pages E wrote after R's place in the
+    /// stream (an invalidation E ran without R, on pages no image had yet): the section 5 hazard
+    /// the page filter cannot see. The image uploads again at its next use.
+    TextureReadAhead,
     Count,
 };
 
@@ -183,7 +187,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Check::Count)> chec
     "view pools",    "build pipeline",   "build image views", "build dynamic",
     "build descriptors", "build render targets", "stream write", "owner on E", "owner on R",
     "build draw params", "build condition", "render packet missing", "drop not plain",
-    "facts stale", "played lookup miss",
+    "facts stale", "played lookup miss", "texture read ahead of R",
 };
 
 // --- The packet (E to R) -----------------------------------------------------------------------------
@@ -508,6 +512,24 @@ void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size,
 /// The newest render op that writes game memory on R (a plain report): its ring A entry
 /// position + 1, 0 = none yet. E stores it before it stores a `consumed` past that entry.
 [[nodiscard]] u64 GuestWriteOpMark() noexcept;
+
+/// FRITCHII_ONEF_INVAL_E (live; fable_b 11.1 item 2; needs FRITCHII_ONEF_E_PIPELINE=1 and step
+/// 4): E runs the draw's invalidation (the buffer half) itself when no range touches a page an
+/// image, a shader, a query or a pushed report op was ever on; otherwise it stays lent.
+[[nodiscard]] bool InvalOnEngine() noexcept;
+/// E: stamps [address, address + size)'s pages with the next packet's number (before the
+/// filters' second look: WrittenAheadOfRender's Dekker pair).
+void StampPageWrites(u64 address, u64 size) noexcept;
+/// Where each of E's invalidations went (the "One follower invalidations" line).
+enum class InvalKind : u8 {
+    OnEngine, ///< run on E, nothing for R
+    Texture,  ///< lent: a range on a texture page
+    Shader,   ///< lent: a range on a shader page
+    Query,    ///< lent: a range on a query page or a pushed report op's
+    Recheck,  ///< lent: no hit, then a hit at the second look (R registered meanwhile)
+    Count,
+};
+void CountInvalidation(InvalKind kind) noexcept;
 
 /// The pricing counter of fable_b 11.5: LentOp::Query by call site.
 enum class QueryKind : u8 {

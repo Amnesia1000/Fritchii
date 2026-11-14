@@ -232,6 +232,11 @@ private:
     /// E: a render enable that can begin host conditional rendering was lent (sticks). While
     /// false, FRITCHII_ONEF_QUERY_OPS sends no override/True/False render enable.
     bool onef_condition_may_be_set{};
+    /// E: the pages of the report ops it pushed (FRITCHII_ONEF_QUERY_OPS), for item 2's test.
+    std::unique_ptr<VideoCommon::PageFilter> onef_report_pages;
+    /// E (FRITCHII_ONEF_INVAL_E): whether this invalidation runs on E (no range on R's pages).
+    [[nodiscard]] bool OneFollowerInvalidationOnEngine(
+        std::span<const std::pair<DAddr, std::size_t>> sequences);
 
     /// False when no page of the range was ever written by the GPU through the buffer cache.
     bool MayBeGpuModified(DAddr addr, u64 size);

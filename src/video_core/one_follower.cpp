@@ -117,6 +117,17 @@ struct Impl {
     std::atomic<bool> query_ops_logged{};
     std::atomic<u64> guest_write_op{}; ///< GuestWriteOpMark
 
+    // FRITCHII_ONEF_INVAL_E (item 2): E's page write stamps, the next packet number (low 32
+    // bits) at each write of an invalidation E ran itself, by device page (2^22 pages = 16 GiB
+    // direct, higher pages share slots: a shared slot only answers "ahead" more often).
+    std::unique_ptr<std::atomic<u32>[]> stamps;
+    std::atomic<bool> stamps_on{};
+    std::atomic<bool> inval_refused_logged{};
+    std::array<std::atomic<u64>, static_cast<size_t>(InvalKind::Count)> inval_count{};
+    std::array<u64, static_cast<size_t>(InvalKind::Count)> inval_logged{};
+    std::atomic<u64> ahead_checks{};
+    u64 ahead_checks_logged{};
+
     // The hang watchdog's view: written relaxed by E and R (no clock), read once a second.
     std::jthread watchdog;
     std::atomic<u8> e_wait{};         ///< EWait: what E waits for
@@ -145,6 +156,9 @@ thread_local u32 t_lent_depth{};
 thread_local bool t_playing_draw{};
 /// E: the kind of the query being lent or pushed (SetQueryKind), consumed by it.
 thread_local QueryKind t_query_kind{QueryKind::Count};
+/// R: the number of the packet it plays (or played last): its place for the page write stamps.
+thread_local u32 t_play_number{};
+constexpr u64 StampSlots = u64{1} << 22;
 /// The most a packet's spans can take (every register word, the flags, the draw, the programs
 /// and the pools), and an op packet's payload after them.
 constexpr std::size_t MaxSpanBytes = sizeof(RegPair) * Maxwell3D::Regs::NUM_REGS +
@@ -382,6 +396,24 @@ void LogQueryKinds() {
         g.query_ns_logged[i] = ns;
     }
     // fable_b 11.3: the acquire latches by thread (session totals): R's is the expected one.
+    static constexpr std::array<const char*, static_cast<size_t>(InvalKind::Count)> inval_names{
+        "run on E", "lent: texture page", "lent: shader page", "lent: query page",
+        "lent: hit at the second look"};
+    std::string inval;
+    for (size_t i = 0; i < inval_names.size(); ++i) {
+        const u64 count = g.inval_count[i].load(std::memory_order_relaxed);
+        inval += fmt::format("{}{} {:.0f}/s", i == 0 ? "" : ", ", inval_names[i],
+                             static_cast<double>(count - g.inval_logged[i]) / seconds);
+        g.inval_logged[i] = count;
+    }
+    const u64 checks = g.ahead_checks.load(std::memory_order_relaxed);
+    LOG_INFO(HW_GPU,
+             "One follower invalidations (FRITCHII_ONEF_INVAL_E={}) {:.0f} s: {}; image uploads "
+             "checked against the page write stamps {:.0f}/s (\"texture read ahead of R\" in the "
+             "checks line, must be 0)",
+             InvalOnEngine() ? 1 : 0, seconds, inval,
+             static_cast<double>(checks - g.ahead_checks_logged) / seconds);
+    g.ahead_checks_logged = checks;
     LOG_INFO(HW_GPU,
              "One follower queries by kind (FRITCHII_ONEF_QUERY_OPS={}) {:.0f} s: {}; acquire "
              "latches this session by R {}, E {}, other threads {}",
@@ -403,6 +435,7 @@ void LogMaybe() {
 
 /// R: one packet. Returns where its time goes (Stats::RenderTime).
 Stats::RenderTime Play(const PacketHeader& header, const u8* spans) {
+    t_play_number = static_cast<u32>(header.number);
     RegisterView& view = View();
     Maxwell3D* const engine = g.engine.load(std::memory_order_acquire);
     const bool view_on = Step() >= StepLevel::View;
@@ -1044,6 +1077,76 @@ bool QueryOps() noexcept {
                  exp12);
     }
     return on;
+}
+
+bool InvalOnEngine() noexcept {
+    using namespace VideoCore::Nx2Debug;
+    if (!g.on || SwitchValue(g_onef_inval_e, "FRITCHII_ONEF_INVAL_E") == 0) {
+        return false;
+    }
+    if (!g_e_pipeline) {
+        // Exact only while E owns the shader registrations (rule 3): R's own lookups would mark
+        // the shader filter without E seeing it in order.
+        if (!g.inval_refused_logged.exchange(true, std::memory_order_relaxed)) {
+            LOG_WARNING(HW_GPU, "One follower: FRITCHII_ONEF_INVAL_E=1 needs "
+                                "FRITCHII_ONEF_E_PIPELINE=1 (boot); running 0");
+        }
+        return false;
+    }
+    if (Step() != StepLevel::Unlend) {
+        return false;
+    }
+    if (!g.stamps_on.load(std::memory_order_acquire)) [[unlikely]] {
+        // The first call with the switch on: R starts reading the table once `stamps_on` shows
+        // it; never freed while the process runs (R may be reading it).
+        static std::once_flag once;
+        std::call_once(once, [] {
+            g.stamps = std::make_unique<std::atomic<u32>[]>(StampSlots);
+            g.stamps_on.store(true, std::memory_order_release);
+            LOG_INFO(HW_GPU,
+                     "One follower: page write stamps on (FRITCHII_ONEF_INVAL_E=1, {} MiB)",
+                     StampSlots * sizeof(u32) >> 20);
+        });
+    }
+    return true;
+}
+
+void StampPageWrites(u64 address, u64 size) noexcept {
+    if (size == 0 || !g.stamps_on.load(std::memory_order_acquire)) {
+        return;
+    }
+    const u32 stamp = static_cast<u32>(g.pushed + 1);
+    for (u64 page = address >> 12; page <= (address + size - 1) >> 12; ++page) {
+        g.stamps[page & (StampSlots - 1)].store(stamp, std::memory_order_relaxed);
+    }
+}
+
+void CountInvalidation(InvalKind kind) noexcept {
+    g.inval_count[static_cast<size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
+}
+
+bool WrittenAheadOfRender(u64 address, u64 size) noexcept {
+    if (!Detail::t_render || size == 0 || !g.stamps_on.load(std::memory_order_acquire)) {
+        return false;
+    }
+    // The other half of E's pair: R marked the texture filter (registering the image) before
+    // this; E stamps, fences, then looks at the filter again. Either E saw the mark (the
+    // invalidation went to R in order) or this sees E's stamp.
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    g.ahead_checks.fetch_add(1, std::memory_order_relaxed);
+    const u32 place = t_play_number;
+    for (u64 page = address >> 12; page <= (address + size - 1) >> 12; ++page) {
+        const u32 stamp = g.stamps[page & (StampSlots - 1)].load(std::memory_order_relaxed);
+        if (stamp != 0 && static_cast<s32>(stamp - place) > 0) {
+            thread_local std::string note;
+            note = fmt::format("image {:#x}+{:#x}: page {:#x} written by E before packet {}, R "
+                               "at packet {}",
+                               address, size, page << 12, stamp, place);
+            Note(Check::TextureReadAhead, note.c_str());
+            return true;
+        }
+    }
+    return false;
 }
 
 void SetQueryKind(QueryKind kind) noexcept {

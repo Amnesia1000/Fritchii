@@ -1363,6 +1363,16 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   rate and parked ms/s (condition skipped/override/true/false/conditional/if equal/if not equal,
   reset, plain report, report on buffer page, fence report, payload release), with the switch off
   too.
+- FRITCHII_ONEF_INVAL_E (live, default 0; fable_b_one_follower 11.1 item 2; needs
+  FRITCHII_ONEF_E_PIPELINE=1 from boot and step 4, else it logs and runs 0): 1 = E runs the
+  draw's invalidation (FlushCaching's ranges) itself, the buffer half, when no range touches a
+  page an image, a shader or a query was ever on, nor a report op E pushed; such a range keeps it
+  lent. E stamps the pages it wrote that way with the next packet number (a 16 MiB table, made at
+  the first use), fences and looks at the filters again; R, before an image upload, reads the
+  stamps: a page E wrote after R's place counts "texture read ahead of R" (must be 0) and the
+  image takes that write as the invalidation would have (it uploads again at its next use). The
+  "One follower invalidations" line (every 10 s) splits them: run on E, lent by texture, shader
+  or query page, lent at the second look; and the uploads checked per second.
 - FRITCHII_ONEF_WAITS_E (live, default 0; fable_b_one_follower 11.2): 1 = the front's waits at
   the macro dma read/writes, qmd read, semaphore flush, list writers/sync/copy writers/flush and
   macro dma dispatch sites end when E ran the target and R played the newest report render op

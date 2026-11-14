@@ -52,6 +52,13 @@ inline void RenderOwned(const char* where) noexcept {
         CheckRenderOwned(where);
     }
 }
+/// FRITCHII_ONEF_INVAL_E (fable_b 11.1 item 2), R: before an image upload reads game memory,
+/// whether E wrote a page of [address, address + size) after the packet R plays now (E's page
+/// write stamps of the invalidations it ran itself). True counts "texture read ahead of R"
+/// (must be 0) and the caller makes the image upload again at its next use. Off (no stamps
+/// yet, or not R): false at once.
+[[nodiscard]] bool WrittenAheadOfRender(u64 address, u64 size) noexcept;
+
 /// The buffer cache (E's) is used here: counted on R outside a lent call ("owner on R").
 inline void EngineOwned(const char* where) noexcept {
     if (Detail::t_render) [[unlikely]] {
