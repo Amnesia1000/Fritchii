@@ -1384,6 +1384,14 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   report op E pushed; after an in-place upload the texture and shader half is lent alone where
   their filters are hit. E stamps the pages before the write (item 2's pair). Counted in the
   invalidations line ("inline uploads on E / with R's half lent / lent: query page").
+- FRITCHII_ONEF_POSTED (live, default 0; fable_b_one_follower 12.2): posted is the default,
+  lent the exception: an R-side operation that returns nothing to E goes by value. Applied so
+  far, in 12.3's order: fix 1, plain reports on buffer cache pages as render ops (what
+  FRITCHII_ONEF_QUERY_OPS=2 does; POSTED also turns QUERY_OPS on). The "One follower posting
+  (dry)" line prices the next fixes: lent fences a second and how many have a buffer flush
+  pending (the others need no E half), lent gathers and their ranges each; copies by class are
+  the "lends by site" line's BufferCopy, BufferClear, DmaBufferImageCopy, AccelerateSurfaceCopy
+  and AccelerateInlineToMemory rows.
 - With FRITCHII_ONEF=1 (or LEAN), every 10 s "One follower lends by site" lists the 16 lent
   call sites that parked E longest (the rasterizer function's name and its op, rate and parked
   ms/s; "direct" = Lend called outside the rasterizer's entry points: lent draws, verify

@@ -129,6 +129,13 @@ struct Impl {
     std::atomic<u64> ahead_checks{};
     u64 ahead_checks_logged{};
 
+    // fable_b 12.3's dry prices (E counts; the frame-end line reads them).
+    std::atomic<u64> fences_lent{};
+    std::atomic<u64> fences_with_flush{};
+    std::atomic<u64> gathers_lent{};
+    std::atomic<u64> gather_ranges{};
+    std::array<u64, 4> posting_logged{};
+
     // The hang watchdog's view: written relaxed by E and R (no clock), read once a second.
     std::jthread watchdog;
     std::atomic<u8> e_wait{};         ///< EWait: what E waits for
@@ -503,6 +510,21 @@ void LogQueryKinds() {
              InvalOnEngine() ? 1 : 0, seconds, inval,
              static_cast<double>(checks - g.ahead_checks_logged) / seconds);
     g.ahead_checks_logged = checks;
+    const std::array<u64, 4> posting{g.fences_lent.load(std::memory_order_relaxed),
+                                     g.fences_with_flush.load(std::memory_order_relaxed),
+                                     g.gathers_lent.load(std::memory_order_relaxed),
+                                     g.gather_ranges.load(std::memory_order_relaxed)};
+    const auto rate = [&](size_t i) {
+        return static_cast<double>(posting[i] - g.posting_logged[i]) / seconds;
+    };
+    const double gathers = rate(2);
+    LOG_INFO(HW_GPU,
+             "One follower posting (dry, FRITCHII_ONEF_POSTED={}) {:.0f} s: lent fences {:.0f}/s, "
+             "{:.0f}/s with a buffer flush pending (the rest need no E half); lent gathers "
+             "{:.0f}/s, {:.1f} ranges each",
+             Posted() ? 1 : 0, seconds, rate(0), rate(1), gathers,
+             gathers > 0 ? rate(3) / gathers : 0.0);
+    g.posting_logged = posting;
     LOG_INFO(HW_GPU,
              "One follower queries by kind (FRITCHII_ONEF_QUERY_OPS={}) {:.0f} s: {}; acquire "
              "latches this session by R {}, E {}, other threads {}",
@@ -1181,7 +1203,9 @@ bool QueryOps() noexcept {
     using namespace VideoCore::Nx2Debug;
     // From step 3 only: below it R's objects read E's engine, which a render op (E not parked)
     // must not.
-    const bool on = g.on && SwitchValue(g_onef_query_ops, "FRITCHII_ONEF_QUERY_OPS") != 0 &&
+    const bool on = g.on &&
+                    (SwitchValue(g_onef_query_ops, "FRITCHII_ONEF_QUERY_OPS") != 0 ||
+                     SwitchValue(g_onef_posted, "FRITCHII_ONEF_POSTED") != 0) &&
                     Step() >= StepLevel::Build;
     if (on && !g.query_ops_logged.load(std::memory_order_relaxed) &&
         !g.query_ops_logged.exchange(true)) [[unlikely]] {
@@ -1283,8 +1307,26 @@ bool WrittenAheadOfRender(u64 address, u64 size) noexcept {
 }
 
 bool QueryOpsOnBufferPages() noexcept {
-    return QueryOps() && VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_query_ops,
-                                                          "FRITCHII_ONEF_QUERY_OPS") >= 2;
+    return QueryOps() && (Posted() || VideoCore::Nx2Debug::SwitchValue(
+                                          VideoCore::Nx2Debug::g_onef_query_ops,
+                                          "FRITCHII_ONEF_QUERY_OPS") >= 2);
+}
+
+bool Posted() noexcept {
+    return g.on && VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_posted,
+                                                    "FRITCHII_ONEF_POSTED") != 0;
+}
+
+void CountLentFence(bool buffer_flush) noexcept {
+    g.fences_lent.fetch_add(1, std::memory_order_relaxed);
+    if (buffer_flush) {
+        g.fences_with_flush.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void CountLentGatherRanges(u64 ranges) noexcept {
+    g.gathers_lent.fetch_add(1, std::memory_order_relaxed);
+    g.gather_ranges.fetch_add(ranges, std::memory_order_relaxed);
 }
 
 void SetLendSite(const char* site) noexcept {

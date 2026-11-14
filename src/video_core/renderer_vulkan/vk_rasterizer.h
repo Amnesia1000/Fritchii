@@ -237,6 +237,8 @@ private:
     /// E (FRITCHII_ONEF_INVAL_E): whether this invalidation runs on E (no range on R's pages).
     [[nodiscard]] bool OneFollowerInvalidationOnEngine(
         std::span<const std::pair<DAddr, std::size_t>> sequences);
+    /// E: fable_b 12.3 fix 3's price (CountLentFence) at a lent fence.
+    void OneFollowerCountFence();
     /// E (FRITCHII_ONEF_COPY_E): runs an inline upload here; false = lend it whole.
     [[nodiscard]] bool OneFollowerInlineOnEngine(GPUVAddr address, size_t copy_size,
                                                  std::span<const u8> memory);
