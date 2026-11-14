@@ -106,6 +106,32 @@ chunks compared with guest memory at their stamp); 3 = early answers without wri
 
 EDEN_NX2_RUNAHEAD_MS (live, default 16): how far the back may lag the oldest early answer.
 
+### EDEN_NX2_SWEEP_UNMAPPED
+
+EXPERIMENT, off by default (2026-11-14): EDEN_NX2_SWEEP_UNMAPPED (read at startup;
+TextureCache::SweepUnmapped). An unmap of GPU memory flags the images in it Remapped and
+CpuModified; lookups skip them, so most sit until the collector's age limit (50 frames, 10 near
+the budget). Ocarina of Time at 3440x1440 unmaps and maps its render targets again every frame
+or two in the Castle Town guard house and the dead sets overflowed a 12 GB card. 0 = today. 1 =
+at each frame end, delete flagged images untouched for 2 frames, without a download, when
+nothing can still need their contents: still CpuModified (nothing uploaded into it or wrote it
+whole since the unmap, so neither the collector nor a guest read would ever download it), no
+aliases, not among the last 8 images shown, not a bound render target, no download queued, no
+decode in flight, not sparse or unbacked, not taken by EXP121. 2 = verify: deletes nothing,
+marks the images 1 would delete and counts what reached them later (found again by EXP76 & 1,
+uploaded into, and of those GPU-written before the unmap, presented, written whole, deleted
+unused by another path). The "Texture cache last 600 frames: GPU memory unmaps" line (with
+EDEN_NX2_TC_LOG or this switch) counts unmaps that hit images, images newly flagged, found
+again, uploaded into, downloaded, deaths by path (collector, join, unmap, other) with how many
+were unused since the unmap, frames and KiB of the collector's unused deaths, and the memory
+flagged images hold (now, average, peak). With 1 or 2 a second line, "unmapped sweep", gives
+deletions and MiB, entries looked at, and 2's counts. Judge with 2 first: "uploaded into ...
+GPU-written before the unmap" and "presented" should stay 0 (an upload into a deleted image's
+replacement may be skipped as stale where the kept image would load guest memory, both garbage
+next to the lost GPU data), then 1 against 0 for device memory and fps on 8 GB cards. With
+EDEN_NX2_IMAGE_HASH_LOG, "unmap sweep" in the 10 s delete lines shows sampled images made again
+where the sweep deleted one.
+
 ### EDEN_NX2_BUFFER_CHURN_STATS
 
 EDEN_NX2_BUFFER_CHURN_STATS=1 (live, diagnostic, off by default; Fable's ideal pipeline design
