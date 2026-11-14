@@ -65,6 +65,7 @@ enum class DrainSite : u32 {
     FenceWriters,   ///< EXP12: a fence release waits for the writers a semaphore read can't see
     QmdRead,        ///< EXP13=2: the front's QMD scheduler copy reads a QMD queued work writes
     ListCopies,     ///< Lists on GPU-written pages: the dispatches and copies before the last sync
+    LaggedCheck,    ///< EXP12=5/6: a suspended acquire's poll waits for what was sent 1 ms before
     Count,
 };
 
@@ -73,7 +74,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> 
     "list writers", "list sync",      "list flush", "macro dma read",  "macro dma writes",
     "macro dma flush",
     "gp sync fence", "map",           "front start", "front verify",  "macro dma check",
-    "macro dma dispatch", "fence writers", "qmd read", "list copy writers",
+    "macro dma dispatch", "fence writers", "qmd read", "list copy writers", "lagged check",
 };
 
 /// EXP13=2: which queued writer set GpuSplit::QueuedGuestWriters' position (a wait cause).
