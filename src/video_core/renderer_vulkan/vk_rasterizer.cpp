@@ -6609,6 +6609,8 @@ void RasterizerVulkan::AccelerateInlineToMemoryImpl(GPUVAddr address, size_t cop
     gpu_memory->WriteBlockUnsafe(address, memory.data(), copy_size);
     const bool defer = InlineDefer();
     if (InlineSkipsCaches(*cpu_addr, copy_size)) {
+        // Counted as InlineNeverWritten (in InlineUntouchedTail): with InlineUnmapped,
+        // InlineInPlace and InlineNotUploaded it sums to the size counters.
         InlineUntouchedTail(address, *cpu_addr, copy_size, false);
         return;
     }

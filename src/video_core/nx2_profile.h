@@ -290,6 +290,17 @@ enum class FineCounter : u32 {
     InlineWordsUnaligned, ///< Back: flushes word by word, not on a 4-byte boundary
     InlinePiecesChecked,  ///< Back, EXP124=2: one-call pieces whose words were each asked
     InlinePiecesDisagree, ///< Back, EXP124=2: ... whose words disagreed (must be 0)
+    // fable_stage_compute 14: QMD releases by kind (KeplerCompute's release callback, in its
+    // branch order) and QMD signals by the dispatches each one ran.
+    QmdReleaseReduction, ///< Releases with the reduction bit (26)
+    QmdReleaseFourWords, ///< ... else four-word (report) releases
+    QmdReleaseMaximum,   ///< ... else maximum releases (bit 19)
+    QmdReleasePlain,     ///< ... else plain one-word releases
+    QmdSignalDispatches0, ///< Signals that ran no dispatch
+    QmdSignalDispatches1, ///< ... one
+    QmdSignalDispatches2, ///< ... 2-3
+    QmdSignalDispatches4, ///< ... 4-7
+    QmdSignalDispatches8, ///< ... 8 or more
     Count,
 };
 
@@ -317,6 +328,10 @@ inline constexpr std::array<const char*, static_cast<size_t>(FineCounter::Count)
         "upload flushes word by word (grid placeholder live)",
         "upload flushes word by word (not word-aligned)", "upload pieces checked (EXP124=2)",
         "upload pieces whose words disagree (must be 0)",
+        "qmd releases reduction", "qmd releases four words", "qmd releases maximum",
+        "qmd releases plain", "qmd signals with 0 dispatches", "qmd signals with 1 dispatch",
+        "qmd signals with 2-3 dispatches", "qmd signals with 4-7 dispatches",
+        "qmd signals with 8+ dispatches",
     };
 static_assert(fine_counter_names.back() != nullptr, "a fine counter without a name");
 
