@@ -69,8 +69,10 @@ using Maxwell = Tegra::Engines::Maxwell3D::Regs;
 
 namespace {
 
-/// The kinds R has a path for at step 4; the other bits stay lent (vk_one_follower_draw.h).
-constexpr u32 PlayableKinds = OneF::PlainIndexed | OneF::PlainArrays | OneF::InstanceLoop;
+/// The kinds R has a path for at step 4 through Draw; List goes through DrawIndirect
+/// (RouteListDraw); the other bits stay lent (vk_one_follower_draw.h).
+constexpr u32 PlayableKinds =
+    OneF::PlainIndexed | OneF::PlainArrays | OneF::InstanceLoop | OneF::Mesh;
 
 /// The register words RefreshStages reads (the programs, their region, rasterization, mesh).
 using Maxwell3D = Tegra::Engines::Maxwell3D; // MAXWELL3D_REG_INDEX names it
@@ -259,6 +261,9 @@ OneF::LentReason OneFollowerDraw::UnlentBlocker(Maxwell3D& engine, bool is_index
         VideoCommon::MemoryStageLink::RingActive()) {
         return LentReason::Transient;
     }
+    if (kind == OneF::List) {
+        return LentReason::Count; // Draw's early outs below are not DrawListWords'
+    }
     // Draw's own early outs: skipped past 16M vertices, the experimental indirect reset.
     const u64 first = is_indexed ? draw.index_buffer.first : draw.vertex_buffer.first;
     const u64 count = is_indexed ? draw.index_buffer.count : draw.vertex_buffer.count;
@@ -269,12 +274,12 @@ OneF::LentReason OneFollowerDraw::UnlentBlocker(Maxwell3D& engine, bool is_index
         draw.topology == Maxwell::PrimitiveTopology::Points) {
         return LentReason::Transient; // a candidate for IsNx2IndirectReset
     }
-    (void)kind;
     return LentReason::Count;
 }
 
 bool OneFollowerDraw::FillRing(Maxwell3D& engine, GraphicsPipeline* pipeline, bool is_indexed,
-                               u64 position, u64 seq, u64& buffer_number, LentReason& reason) {
+                               u64 position, u64 seq, u64& buffer_number, LentReason& reason,
+                               bool list_args) {
     auto& r = rasterizer;
     reason = LentReason::Transient;
     VideoCommon::MemStageShadow::ProgramId program_id{};
@@ -311,6 +316,17 @@ bool OneFollowerDraw::FillRing(Maxwell3D& engine, GraphicsPipeline* pipeline, bo
     std::scoped_lock lock{r.buffer_cache.mutex};
     SCOPE_EXIT {
         r.mem_stage.EndStageFill();
+    };
+    // A list draw: the cache's indirect parameters are the engine's for this fill, as
+    // DrawListWords sets them around its own fill (the geometry section binds and synchronizes
+    // the two words; FillRingDraw takes their buffer after it, as ConfigureDraw would).
+    if (list_args) {
+        r.buffer_cache.SetDrawIndirect(&engine.draw_manager.indirect_state);
+    }
+    SCOPE_EXIT {
+        if (list_args) {
+            r.buffer_cache.SetDrawIndirect(nullptr);
+        }
     };
     // The repack layout and the cache's flags, as PrepareDraw's own fill sets them.
     const u32 repack_dirty = r.buffer_cache_runtime.SetVertexRepackLayout(
@@ -350,7 +366,7 @@ bool OneFollowerDraw::FillRing(Maxwell3D& engine, GraphicsPipeline* pipeline, bo
     buffer_number = r.mem_stage.NextRingPacketIndex();
     const bool filled =
         r.mem_stage.FillRingDraw(r.buffer_cache, draw_facts, is_indexed, position, seq, 0, nullptr,
-                                 nullptr, &handle_values, null_pointer_handles, false);
+                                 nullptr, &handle_values, null_pointer_handles, list_args);
     if (filled) {
         // For ReportDescriptorMismatch: what this fill used, before the push publishes it.
         FillRecord& record = fill_records[seq % FillRecords];
@@ -369,7 +385,7 @@ bool OneFollowerDraw::FillRing(Maxwell3D& engine, GraphicsPipeline* pipeline, bo
 }
 
 void OneFollowerDraw::LendDraw(bool is_indexed, u32 instance_count, LentReason reason,
-                               bool verify) {
+                               bool verify, bool list) {
     // The facts compare (Check::FactsStale): with the verify, the facts table entry E's fill
     // would use for these program registers now, before the lent draw publishes its own.
     FactsExpect expect{};
@@ -384,10 +400,47 @@ void OneFollowerDraw::LendDraw(bool is_indexed, u32 instance_count, LentReason r
             expect = FactsExpect{true, looked.hashes, program_id.space};
         }
     }
-    auto body = [this, is_indexed, instance_count, verify, expect] {
-        RunLent(is_indexed, instance_count, verify, expect);
+    auto body = [this, is_indexed, instance_count, verify, expect, list] {
+        RunLent(is_indexed, instance_count, verify, expect, list);
     };
     OneF::Lend(LentOp::Draw, reason, body);
+}
+
+bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, bool list,
+                                  LentReason& reason) {
+    // Today's PrepareDraw head, E's half: the stream's invalidations before the fill.
+    engine.GetMemoryManager().FlushCaching();
+    // Rule 3 (FRITCHII_ONEF_E_PIPELINE): E looks the pipeline up itself, at its own position,
+    // on its own engine (the pipeline cache never names R's view then). A miss, or a build
+    // not ready, is known here: the draw is lent. The lookup consumes pipeline-key flags on
+    // E's engine that R's dynamic state still reads (VertexInput and the like): they are
+    // raised again, so the pack below hands them to R and clears them (rule 1).
+    GraphicsPipeline* pipeline = nullptr;
+    if (VideoCommon::OneFollower::g_e_pipeline) {
+        const auto flags_before = engine.dirty.flags;
+        pipeline = rasterizer.pipeline_cache.CurrentGraphicsPipeline();
+        engine.dirty.flags |= flags_before;
+        if (pipeline == nullptr) {
+            reason = LentReason::PipelineMiss;
+            return false;
+        }
+        // UNLEND's Mesh bit covers native task/mesh pipelines only (RouteDraw tests the device;
+        // this is the pipeline's own word for it).
+        if (pipeline->IsEmulatedMesh()) [[unlikely]] {
+            reason = LentReason::NoPath;
+            return false;
+        }
+    }
+    const u64 position = VideoCommon::GpuSplit::Get().BackEntryPosition();
+    u64 buffer_number = 0;
+    if (!FillRing(engine, pipeline, is_indexed, position, seq, buffer_number, reason, list)) {
+        return false;
+    }
+    OneF::PushDraw(engine, seq, buffer_number, 0, pipeline);
+    counts.pushed.fetch_add(1, std::memory_order_relaxed);
+    // PrepareDraw's tail, E's half (read-backs wait on E's work).
+    rasterizer.gpu.TickWork();
+    return true;
 }
 
 bool OneFollowerDraw::RouteDraw(bool is_indexed, u32 instance_count) {
@@ -421,42 +474,62 @@ bool OneFollowerDraw::RouteDraw(bool is_indexed, u32 instance_count) {
         return true;
     }
     LentReason reason = UnlentBlocker(engine, is_indexed, instance_count, kind);
-    if (reason == LentReason::Count) {
-        // Today's PrepareDraw head, E's half: the stream's invalidations before the fill.
-        engine.GetMemoryManager().FlushCaching();
-        // Rule 3 (FRITCHII_ONEF_E_PIPELINE): E looks the pipeline up itself, at its own position,
-        // on its own engine (the pipeline cache never names R's view then). A miss, or a build
-        // not ready, is known here: the draw is lent. The lookup consumes pipeline-key flags on
-        // E's engine that R's dynamic state still reads (VertexInput and the like): they are
-        // raised again, so the pack below hands them to R and clears them (rule 1).
-        GraphicsPipeline* pipeline = nullptr;
-        if (VideoCommon::OneFollower::g_e_pipeline) {
-            const auto flags_before = engine.dirty.flags;
-            pipeline = rasterizer.pipeline_cache.CurrentGraphicsPipeline();
-            engine.dirty.flags |= flags_before;
-            if (pipeline == nullptr) {
-                reason = LentReason::PipelineMiss;
-            }
-        }
-        const u64 position = VideoCommon::GpuSplit::Get().BackEntryPosition();
-        u64 buffer_number = 0;
-        if ((!VideoCommon::OneFollower::g_e_pipeline || pipeline != nullptr) &&
-            FillRing(engine, pipeline, is_indexed, position, seq, buffer_number, reason)) {
-            OneF::PushDraw(engine, seq, buffer_number, 0, pipeline);
-            counts.pushed.fetch_add(1, std::memory_order_relaxed);
-            // PrepareDraw's tail, E's half (read-backs wait on E's work).
-            rasterizer.gpu.TickWork();
-            return true;
-        }
+    // Mesh: native task/mesh pipelines only (the emulation's buffers are not R's alone). Without
+    // VK_EXT_mesh_shader every mesh pipeline is emulated or skipped.
+    if (reason == LentReason::Count && kind == OneF::Mesh &&
+        !rasterizer.device.IsExtMeshShaderSupported()) {
+        reason = LentReason::NoPath;
+    }
+    if (reason == LentReason::Count && FillAndPush(engine, is_indexed, seq, false, reason)) {
+        return true;
     }
     LendDraw(is_indexed, instance_count, reason, reason == LentReason::Verify);
+    return true;
+}
+
+bool OneFollowerDraw::RouteListDraw() {
+    if (OneF::Step() != StepLevel::Unlend || OneF::OnRenderThread()) {
+        return false; // below step 4: the caller lends it as before; on R it runs where it is
+    }
+    const u32 mask = static_cast<u32>(VideoCore::Nx2Debug::SwitchValue(
+        VideoCore::Nx2Debug::g_onef_unlend, "FRITCHII_ONEF_UNLEND"));
+    if ((mask & OneF::List) == 0) {
+        return false; // the caller lends it as before (KindNotInMask)
+    }
+    // E. The engine is the channel's (the rasterizer's own pointer names the view while R plays).
+    Maxwell3D& engine = rasterizer.channel_state->maxwell3d;
+    const auto& indirect = engine.draw_manager.indirect_state;
+    if (!indirect.list_words) {
+        return false;
+    }
+    const u64 seq = ++e_draw_seq;
+    // As OneFollowerDrawIndirect describes it: a list draw is drawn non-indexed (DrawListWords).
+    OneF::SetNextDraw(OneF::List, false, true, 0);
+    LentReason reason;
+    if (engine.GetNativeMacroEngine().native_turing && engine.regs.IsMeshEnabled() &&
+        (mask & OneF::Mesh) == 0) {
+        reason = LentReason::KindNotInMask; // a list draw on a mesh pipeline needs both bits
+    } else if (RasterizerVulkan::OneFollowerListOnCpu(engine)) {
+        // DrawListWords reads the two words on the CPU (a flush, game memory): E's work.
+        reason = LentReason::NoPath;
+    } else {
+        reason = UnlentBlocker(engine, false, 0, OneF::List);
+    }
+    if (reason == LentReason::Count && FillAndPush(engine, false, seq, true, reason)) {
+        // R records the kept words when it plays this draw: a read of them on E drains R first.
+        if (indirect.list_keep_id != 0) {
+            rasterizer.onef_list_keeps_unplayed = true;
+        }
+        return true;
+    }
+    LendDraw(false, 0, reason, reason == LentReason::Verify, true);
     return true;
 }
 
 // --- R: lent draws and the compares ----------------------------------------------------------------
 
 void OneFollowerDraw::RunLent(bool is_indexed, u32 instance_count, bool verify,
-                              const FactsExpect& expect) {
+                              const FactsExpect& expect, bool list) {
     Maxwell3D& engine = rasterizer.channel_state->maxwell3d;
     nested = true;
     SCOPE_EXIT {
@@ -470,9 +543,18 @@ void OneFollowerDraw::RunLent(bool is_indexed, u32 instance_count, bool verify,
         // clear, query or dispatch in between ran R's code on E's engine, which may raise flags
         // there that the view never sees (not a forwarding miss).
         Compare(engine, OneF::Step() == StepLevel::Build && lent_since_resync == 1);
+        if (list) {
+            CompareList(engine);
+        }
     }
     rasterizer.onef_pipeline_seen = false;
-    rasterizer.Draw(is_indexed, instance_count);
+    if (list) {
+        // A list draw (RouteListDraw): DrawIndirect's list path on E's engine, as the lend of
+        // OneFollowerDrawIndirect runs it.
+        rasterizer.DrawIndirect();
+    } else {
+        rasterizer.Draw(is_indexed, instance_count);
+    }
     // The programs the draw ran with against the facts E's fill would have used for them: a
     // difference is a stale entry (the 2026-11-14 step 4 failure, caught at step 3).
     if (expect.found && rasterizer.onef_pipeline_seen &&
@@ -502,6 +584,9 @@ void OneFollowerDraw::Compare(Maxwell3D& engine, bool with_flags) {
                !SameBytes(e.program_region, v.program_region) ||
                e.rasterize_enable != v.rasterize_enable) {
         OneF::Note(Check::BuildPipeline, "programs");
+    } else if (e.IsMeshEnabled() != v.IsMeshEnabled()) {
+        // UNLEND's Mesh bit: whether RefreshStages takes the task/mesh programs.
+        OneF::Note(Check::BuildPipeline, "mesh enable");
     }
     // Render targets: the registers UpdateRenderTargets and the framebuffer read.
     if (!SameBytes(e.rt, v.rt) || !SameBytes(e.rt_control, v.rt_control) ||
@@ -556,6 +641,40 @@ void OneFollowerDraw::Compare(Maxwell3D& engine, bool with_flags) {
         parts[static_cast<size_t>(FlagPart::Other)]) {
         OneF::Note(Check::BuildDynamic, "flag not forwarded");
     }
+}
+
+void OneFollowerDraw::CompareList(Maxwell3D& engine) {
+    // What a played list draw would have used: the draw span's list values (its view's indirect
+    // state, SetViewList) and DrawListWords' read-back test on the view. The lent list draw uses
+    // E's engine, here, with E parked inside DrawEnd's list branch.
+    const auto& indirect = engine.draw_manager.indirect_state;
+    if (!have_draw || last_draw.list_words != (indirect.list_words ? 1U : 0U) ||
+        last_draw.list_keep_id != indirect.list_keep_id ||
+        last_draw.list_address != indirect.indirect_start_address) {
+        OneF::Note(Check::BuildList, "the draw span's list values against the indirect state");
+        return;
+    }
+    // The read-back test reads the draw state and registers the view has (Compare checks them
+    // too; this is the decision itself).
+    if (RasterizerVulkan::OneFollowerListOnCpu(*view) !=
+        RasterizerVulkan::OneFollowerListOnCpu(engine)) {
+        OneF::Note(Check::BuildList, "the read-back decision on the view against the engine");
+    }
+}
+
+void OneFollowerDraw::SetViewList(const OneF::DrawValues& values) {
+    // DrawEnd's list branch, field by field (the rest of the indirect state is constant there).
+    auto& indirect = view->draw_manager.indirect_state;
+    indirect.is_byte_count = false;
+    indirect.is_indexed = false;
+    indirect.include_count = false;
+    indirect.count_start_address = 0;
+    indirect.indirect_start_address = values.list_address;
+    indirect.buffer_size = 2 * sizeof(u32);
+    indirect.max_draw_counts = 1;
+    indirect.stride = 0;
+    indirect.list_words = values.list_words != 0;
+    indirect.list_keep_id = values.list_keep_id;
 }
 
 void OneFollowerDraw::ResyncFlags(const Maxwell3D& engine) {
@@ -673,7 +792,19 @@ void OneFollowerDraw::OnPacket(const PacketHeader& header, const u8* spans) {
         // This packet's own operation; a seed took the flags too, so it starts the count again.
         lent_since_resync = full ? 1 : lent_since_resync + 1;
         if (full) {
-            // The seed is the engine at this lent packet, spans included.
+            // The seed is the engine at this lent packet, spans included. The draw span's own
+            // values are still this draw's (CompareList reads the list values from it).
+            if (spans != nullptr && (header.spans & OneF::SpanDraw) != 0) {
+                size_t at = 0;
+                if ((header.spans & OneF::SpanDelta) != 0) {
+                    at += Padded(size_t{header.delta_count} * sizeof(OneF::RegPair));
+                }
+                if ((header.spans & OneF::SpanFlags) != 0) {
+                    at += Padded(sizeof(OneF::FlagBits));
+                }
+                std::memcpy(&last_draw, spans + at, sizeof(last_draw));
+                have_draw = true;
+            }
             return;
         }
     }
@@ -725,11 +856,34 @@ void OneFollowerDraw::PlayDraw(const PacketHeader& header) {
         return;
     }
     EnterView(); // the default on R already (rule 2); here for the first draw after a step change
+    if (values.list_words != 0) {
+        // UNLEND's List bit: the view's indirect state as DrawEnd's list branch set it on E, for
+        // DrawListWords (its keep id, the words' address; ring B's packet has their buffer).
+        SetViewList(values);
+        if (RasterizerVulkan::OneFollowerListOnCpu(*view)) [[unlikely]] {
+            // E lends these (NoPath): the view must decide as E's engine did.
+            OneF::Note(Check::PlayedNoPath, "a played list draw that reads its words on the CPU");
+            OneF::DisableUnlend("a played list draw needed its words on the CPU");
+            DropDraw(header);
+            view->draw_manager.indirect_state.list_words = false;
+            view->draw_manager.indirect_state.list_keep_id = 0;
+            return;
+        }
+    }
     playing = &header;
     SCOPE_EXIT {
         playing = nullptr;
+        if (values.list_words != 0) {
+            // As DrawEnd after ProcessDrawIndirect: the next draw is not a list draw.
+            view->draw_manager.indirect_state.list_words = false;
+            view->draw_manager.indirect_state.list_keep_id = 0;
+        }
     };
-    rasterizer.Draw(values.indexed != 0, values.instance_arg);
+    if (values.list_words != 0) {
+        rasterizer.DrawIndirect();
+    } else {
+        rasterizer.Draw(values.indexed != 0, values.instance_arg);
+    }
     counts.played.fetch_add(1, std::memory_order_relaxed);
 }
 

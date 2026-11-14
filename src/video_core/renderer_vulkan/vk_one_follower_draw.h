@@ -21,10 +21,14 @@
 // its next build redoes that part from registers equal to the other side's (conservative, exact).
 // After every lent draw this file runs (RunLent), the view's R-owned flags take the engine's.
 //
-// Draw kinds R plays at step 4 (UnlendKind): PlainIndexed, PlainArrays and InstanceLoop. Indirect,
-// List, Mesh, GpuCount and InlineIndex keep their bits but stay lent here (KindNotInMask): their
-// R side needs values E owns (indirect words, the GPU count's buffer, the staging pool of mesh
-// emulation, the inline index vector).
+// Draw kinds R plays at step 4 (UnlendKind): PlainIndexed, PlainArrays, InstanceLoop, Mesh (native
+// task/mesh pipelines; emulated ones need the staging pool and stay lent, NoPath) and List (E's
+// fill binds the two words and puts their buffer in ring B's packet, ListArgs, as GPUMem's served
+// list draws did; the draw span carries the keep id and the words' address, R's view takes them
+// into its indirect state for DrawListWords; a list draw that reads its words on the CPU stays
+// lent, NoPath; one on a mesh pipeline needs Mesh too). Indirect, GpuCount and InlineIndex keep
+// their bits but stay lent here (KindNotInMask): their R side needs values E owns (indirect
+// words and counts, the GPU count's buffer, the inline index vector).
 
 #include <array>
 #include <atomic>
@@ -57,6 +61,10 @@ public:
     /// or filled into ring B and pushed; on R inside a foreign lent call: run with the verify).
     /// False: go on with Draw (steps 0 to 2, or R inside this file's own call).
     bool RouteDraw(bool is_indexed, u32 instance_count);
+    /// RasterizerVulkan::DrawIndirect's first step on E for a list draw (indirect_state.list_words)
+    /// at step 4 with UNLEND's List bit: filled into ring B and pushed, or lent with its reason
+    /// (and the verify). True: done. False: the caller lends it as before (step below 4, no bit).
+    bool RouteListDraw();
 
     // DrawPlayer (R).
     void OnPacket(const PacketHeader& header, const u8* spans) override;
@@ -108,10 +116,17 @@ private:
     /// copy). False with `reason` when the draw must be lent.
     /// `pipeline` (FRITCHII_ONEF_E_PIPELINE): the one E looked up; its own facts fill the draw.
     /// Null: the facts table's entry for the draw's programs.
+    /// `list_args`: a list draw, the fill binds its two words (the cache's indirect parameters are
+    /// the engine's for the fill) and the packet takes their buffer (ListArgs).
     bool FillRing(Maxwell3D& engine, GraphicsPipeline* pipeline, bool is_indexed, u64 position,
                   u64 seq, u64& buffer_number,
-                  LentReason& reason);
-    void LendDraw(bool is_indexed, u32 instance_count, LentReason reason, bool verify);
+                  LentReason& reason, bool list_args = false);
+    /// E's fill and push of an unlent draw (RouteDraw's and RouteListDraw's common tail). False
+    /// with `reason` when it must be lent after all.
+    bool FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, bool list, LentReason& reason);
+    /// `list`: a list draw (R runs DrawIndirect, not Draw).
+    void LendDraw(bool is_indexed, u32 instance_count, LentReason reason, bool verify,
+                  bool list = false);
     /// What E's fill would use for a lent draw's programs (looked up on E before the lend).
     struct FactsExpect {
         bool found{};
@@ -121,8 +136,14 @@ private:
 
     // R.
     /// A lent draw, E parked: the compares when `verify`, Draw, then the view's flags re-synced.
-    void RunLent(bool is_indexed, u32 instance_count, bool verify, const FactsExpect& expect);
+    void RunLent(bool is_indexed, u32 instance_count, bool verify, const FactsExpect& expect,
+                 bool list = false);
     void Compare(Maxwell3D& engine, bool with_flags);
+    /// A forced-lent list draw: the list values the packet's draw span gave the view, and R's
+    /// read-back decision on the view, against E's engine (Check::BuildList).
+    void CompareList(Maxwell3D& engine);
+    /// The view's indirect state as DrawEnd's list branch sets it, from the draw span.
+    void SetViewList(const VideoCommon::OneFollower::DrawValues& values);
     void ResyncFlags(const Maxwell3D& engine);
     /// The view takes the spans of one packet.
     void ApplyViewSpans(const PacketHeader& header, const u8* spans);

@@ -153,6 +153,11 @@ void FillDraw(DrawValues& values, const Maxwell3D& engine) {
     values.vertex_buffer = state.vertex_buffer;
     values.index_buffer = state.index_buffer;
     values.draw_indexed = state.draw_indexed ? 1 : 0;
+    // A list draw (inside DrawEnd's list branch): what R's view needs of the indirect state.
+    const auto& indirect = engine.draw_manager.indirect_state;
+    values.list_words = indirect.list_words ? 1 : 0;
+    values.list_keep_id = indirect.list_words ? indirect.list_keep_id : 0;
+    values.list_address = indirect.list_words ? indirect.indirect_start_address : 0;
 }
 
 bool SameDraw(const DrawValues& view, const Maxwell3D& engine) {

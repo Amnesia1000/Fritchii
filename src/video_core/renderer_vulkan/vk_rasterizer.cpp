@@ -736,9 +736,14 @@ void RasterizerVulkan::OneFollowerDrawIndirect() {
     namespace OneF = VideoCommon::OneFollower;
     // E's engine is the channel's: at step 4 `maxwell3d` names R's view while R plays a draw.
     const auto& indirect = channel_state->maxwell3d.draw_manager.indirect_state;
+    // Step 4 with the List bit: list draws are filled into ring B and pushed, or lent with their
+    // reason and the verify (vk_one_follower_draw.cpp). Without the bit, as before.
+    if (indirect.list_words && onef_draw->RouteListDraw()) {
+        return;
+    }
     const u32 kind = indirect.list_words ? OneF::List : OneF::Indirect;
-    // Indirect and list draws have no R path in this branch: lent at every step (their mask
-    // bits ask for nothing yet).
+    // Indirect draws have no R path in this branch: lent at every step (their mask bit asks for
+    // nothing yet). So are list draws without the List bit.
     const OneF::LentReason reason = OneF::Step() < OneF::StepLevel::Unlend
                                         ? OneF::LentReason::StepBelowUnlend
                                         : OneF::LentReason::KindNotInMask;
@@ -1265,6 +1270,10 @@ bool ListDrawReadsBack(const Tegra::Engines::Maxwell3D::DrawManager::State& draw
            regs.transform_feedback_enabled != 0 || Shader::Backend::SPIRV::MeshFirstEnabled();
 }
 } // Anonymous namespace
+
+bool RasterizerVulkan::OneFollowerListOnCpu(const Tegra::Engines::Maxwell3D& engine) {
+    return ListDrawReadsBack(engine.draw_manager.draw_state, engine.regs);
+}
 
 template <typename F>
 void RasterizerVulkan::OnStage(u8 cause, F&& body) {
@@ -2187,6 +2196,17 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                                            "PrepareDraw");
             return;
         }
+        // UNLEND's List bit: a played list draw records its copy from the packet's buffer of the
+        // two words (ConfigureDraw); without it R would ask the cache (E's). Either way round a
+        // disagreement is E and R seeing different draws.
+        const bool list_args = (ring_packet->flags & MemStage::ListArgs) != 0;
+        if (list_args != maxwell3d->draw_manager.indirect_state.list_words) [[unlikely]] {
+            VideoCommon::OneFollower::Note(VideoCommon::OneFollower::Check::PlayedListArgs,
+                                           list_args ? "list arguments in a non-list draw's packet"
+                                                     : "a list draw's packet without its words");
+            VideoCommon::OneFollower::DisableUnlend("a played draw's list arguments disagreed");
+            return;
+        }
     } else if (ring_on && (served || Link::BackInRun())) [[unlikely]] {
         const Profile::FineScope take_scope{Profile::Zone::RingTake};
         const bool verify = Link::RingVerify();
@@ -2382,6 +2402,14 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         no_mesh = std::filesystem::exists(no_mesh_file);
     }
     const bool emulated_mesh{mesh_draw && pipeline->IsEmulatedMesh()};
+    // UNLEND's Mesh bit: E unlends native mesh draws only (the emulation takes the staging pool
+    // and the mesh arenas, which R does not own alone).
+    if (onef_play != nullptr && emulated_mesh) [[unlikely]] {
+        VideoCommon::OneFollower::Note(VideoCommon::OneFollower::Check::PlayedNoPath,
+                                       "a played draw on an emulated mesh pipeline");
+        VideoCommon::OneFollower::DisableUnlend("a played draw needed mesh emulation");
+        return;
+    }
     if (mesh_draw &&
         (no_mesh || (!device.IsExtMeshShaderSupported() && !emulated_mesh) ||
          (emulated_mesh && is_indirect))) {
@@ -3487,6 +3515,13 @@ void RasterizerVulkan::Nx2KeepListWords(u64 keep_id, GPUVAddr address, u32 count
 }
 
 bool RasterizerVulkan::Nx2ReadKeptListWords(u64 keep_id, std::span<u32> words) {
+    // One follower (UNLEND's List bit): R records an unlent list draw's kept words when it plays
+    // the draw, after E went on. E reads them at its own place here: R plays every packet first,
+    // so the copy is there as a lent list draw left it (and R writes no keep meanwhile).
+    if (VideoCommon::OneFollower::ShouldLend() && onef_list_keeps_unplayed) [[unlikely]] {
+        onef_list_keeps_unplayed = false;
+        VideoCommon::OneFollower::Drain();
+    }
     return mem_player.ReadKeptListWords(keep_id, words);
 }
 
@@ -3538,7 +3573,10 @@ void RasterizerVulkan::DrawListWords() {
     // (GraphicsPipeline::ConfigureDraw), without asking the cache. Nor does it set the cache's
     // indirect parameters (SetDrawIndirect, what the back's own fill reads): GPUMem runs ahead and
     // uses the cache meanwhile. Until now every list draw ran lent, with GPUMem parked.
-    const bool served = Link::BackServed();
+    // One follower step 4, a list draw R plays unlent (UNLEND's List bit): E's fill did the same
+    // (FillRing with the list arguments); the cache is E's and is not touched here.
+    const bool served = Link::BackServed() || (VideoCommon::OneFollower::OnRenderThread() &&
+                                               onef_draw->Playing() != nullptr);
     if (!served) {
         buffer_cache.SetDrawIndirect(&params);
     }
