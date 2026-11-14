@@ -1151,6 +1151,18 @@ void RasterizerVulkan::DeltaPathSnapshot() {
 namespace {
 /// The back is in DispatchCompute (fable_memstage_compute_brief 3: served calls by cause).
 thread_local bool t_in_dispatch = false;
+
+/// List draws (nx2_list_draw.h): whether DrawListWords reads the two words back on the CPU
+/// instead of drawing indirectly from them. GPUMem asks the same of its copy's registers and draw
+/// state (FRITCHII_MEMSTAGE_LIST_DRAWS): such a list draw stays level. The list draw mode and
+/// EDEN_NX2_MESH_FIRST are read once.
+bool ListDrawReadsBack(const Tegra::Engines::Maxwell3D::DrawManager::State& draw_state,
+                       const Maxwell& regs) {
+    const bool quads = draw_state.topology == Maxwell::PrimitiveTopology::Quads ||
+                       draw_state.topology == Maxwell::PrimitiveTopology::QuadStrip;
+    return Tegra::Nx2ListDraw::Mode() != 1 || quads || draw_state.base_instance != 0 ||
+           regs.transform_feedback_enabled != 0 || Shader::Backend::SPIRV::MeshFirstEnabled();
+}
 } // Anonymous namespace
 
 template <typename F>
@@ -2751,17 +2763,19 @@ bool RasterizerVulkan::Nx2ReadKeptListWords(u64 keep_id, std::span<u32> words) {
 
 void RasterizerVulkan::DrawListWords() {
     namespace ListDraw = Tegra::Nx2ListDraw;
+    using Link = VideoCommon::MemoryStageLink;
     auto& draw_state = maxwell3d->draw_manager.draw_state;
     const auto& params = maxwell3d->draw_manager.indirect_state;
     // The draw command has one instance from instance 0 and counts vertices as they are drawn
     // (a task/mesh pipeline ignores all three; the pipeline is not known yet). EDEN_NX2_MESH_FIRST
     // pushes the first vertex to task/mesh pipelines from the CPU: those words are read back.
-    const bool quads = draw_state.topology == Maxwell::PrimitiveTopology::Quads ||
-                       draw_state.topology == Maxwell::PrimitiveTopology::QuadStrip;
-    const bool on_cpu = ListDraw::Mode() != 1 || quads || draw_state.base_instance != 0 ||
-                        maxwell3d->regs.transform_feedback_enabled != 0 ||
-                        Shader::Backend::SPIRV::MeshFirstEnabled();
+    const bool on_cpu = ListDrawReadsBack(draw_state, maxwell3d->regs);
     if (on_cpu) {
+        // FRITCHII_MEMSTAGE_LIST_DRAWS: GPUMem keeps these level (the same test on its copy); a
+        // served one here means the two sides' state differs (must be 0).
+        if (Link::BackServed()) [[unlikely]] {
+            Link::Note(Link::Check::ListReadBack, "DrawListWords");
+        }
         const GPUVAddr address = params.indirect_start_address;
         std::array<u32, 2> words{};
         if (gpu_memory->IsMemoryDirty(address, sizeof(words),
@@ -2789,6 +2803,11 @@ void RasterizerVulkan::DrawListWords() {
     if (Common::DkbFrameTrace::Enabled()) {
         ++trace_indirect;
     }
+    // FRITCHII_MEMSTAGE_LIST_DRAWS, a list draw GPUMem served (the entry is not lent): its fill
+    // bound and synchronized the two words (the geometry section) and put their buffer in the
+    // packet; PrepareDraw takes the packet and Configure records the copy from that buffer
+    // (GraphicsPipeline::ConfigureDraw), without asking the cache. SetDrawIndirect only stores the
+    // pointer a fill of the back's own reads (the cache's Inputs), as before.
     buffer_cache.SetDrawIndirect(&params);
     mem_player.RequestListDrawArgs(params.list_keep_id);
     bool recorded = false;

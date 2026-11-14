@@ -240,6 +240,9 @@ public:
         Held = 2,       ///< Filled before the texture work, its sections played later
         RestPlayed = 4, ///< Configure did not play every section: PlayRest did
         PostCopyBarrier = 8, ///< THREAD = 2: the fill uploaded; the back records the barrier
+        /// THREAD = 2, a list draw GPUMem served (FRITCHII_MEMSTAGE_LIST_DRAWS): `indirect` is the
+        /// buffer and offset of its two words (the cache's GetDrawIndirectBuffer at the fill).
+        ListArgs = 16,
     };
 
     /// THREAD = 2: a facts table entry (spec 4.4), copied by value from the pipeline.
