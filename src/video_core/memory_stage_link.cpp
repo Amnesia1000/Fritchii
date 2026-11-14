@@ -301,7 +301,13 @@ constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::Check::Co
     "an image registered over a constant buffer write GPUMem made for a later entry",
     "a served download over a constant buffer write GPUMem made for a later entry",
     "facts key collisions (one program key for two programs' registers: told apart, a miss)",
+    "a served list draw the back would read back (the stage and the back decided differently)",
+    "a served list draw whose packet has no list words buffer (the back asked the cache)",
 };
+static_assert(LINK_CHECK_NAMES.back() != nullptr, "a name for every check");
+constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::ListDraw::Count)>
+    LIST_DRAW_NAMES{"served", "level, the window closed or the switch off",
+                    "level, read back on the CPU", "level, the fill refused it"};
 constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::LevelReason::Count)>
     LEVEL_REASON_NAMES{"full copy", "writing draw", "ranges over GPU-written data"};
 constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::HandOff::Count)>
@@ -310,7 +316,7 @@ constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::Served::C
     SERVED_NAMES{"FlushRegion", "FlushRegionForRead", "gather", "single invalidation",
                  "InnerInvalidation", "MustFlushRegion", "fallback fill"};
 constexpr std::array<const char*, 8> LEVEL_DRAW_NAMES{
-    "indirect or list", "GPU count", "texel buffers", "diagnostic or forced",
+    "indirect", "GPU count", "texel buffers", "diagnostic or forced",
     "facts miss",       "no packet room", "late (after a hard method)", "other"};
 
 /// The calling code's frames as module+offset (for a counter "by call site").
@@ -1213,6 +1219,18 @@ void MemoryStageLink::SetAhead(u32 packets, const char* blocked) {
     }
 }
 
+void MemoryStageLink::SetListDraws(bool on) {
+    // At a frame end, a level run (GPUMem is parked on it), as SetAhead: GPUMem reads it at its
+    // next list draw. Served only while the window is open too (ListDrawsServed).
+    g_list_draws.store(on, std::memory_order_relaxed);
+    if (mode == 2 && list_draws_logged != (on ? 1 : 0)) {
+        list_draws_logged = on ? 1 : 0;
+        LOG_INFO(HW_GPU, "Memory stage list draws (FRITCHII_MEMSTAGE_LIST_DRAWS={}): {}", on ? 1 : 0,
+                 on ? "served by GPUMem while the window is open (FRITCHII_MEMSTAGE_AHEAD > 0)"
+                    : "level draws, as before");
+    }
+}
+
 void MemoryStageLink::CloseBusyBatch() noexcept {
     if (busy_batch_start != 0) {
         LinkBump(counters.stage_busy_ns, LinkNowNs() - busy_batch_start);
@@ -1835,6 +1853,10 @@ void MemoryStageLink::Take(Snapshot& out) const noexcept {
     out.ring_wakes = load(counters.ring_wakes);
     out.stage_idles = load(counters.stage_idles);
     out.run_input_waits = load(counters.run_input_waits);
+    for (size_t i = 0; i < out.list_draws.size(); ++i) {
+        out.list_draws[i] = load(counters.list_draws[i]);
+    }
+    out.list_drawn = load(counters.list_drawn);
 }
 
 void MemoryStageLink::LogStats() {
@@ -1938,6 +1960,28 @@ void MemoryStageLink::LogStats() {
                  rate(current.flag_handovers - reported.flag_handovers), served_text, level_text,
                  hashes, current.hash_mismatches - reported.hash_mismatches,
                  RingVerify() ? "on" : "off");
+        {
+            // FRITCHII_MEMSTAGE_LIST_DRAWS: what became of the list draws GPUMem's copy issued
+            // outside a hard entry. Each level one made its entry the first hard entry of a run
+            // (it starts the run); each served one is a run not started.
+            std::string list_text;
+            u64 list_level = 0;
+            for (size_t i = 0; i < current.list_draws.size(); ++i) {
+                const u64 n = current.list_draws[i] - reported.list_draws[i];
+                if (static_cast<ListDraw>(i) != ListDraw::Served) {
+                    list_level += n;
+                }
+                list_text += fmt::format("{}{} {:.0f}", i == 0 ? "" : ", ", LIST_DRAW_NAMES[i],
+                                         rate(n));
+            }
+            LOG_INFO(HW_GPU,
+                     "Memory stage list draws (FRITCHII_MEMSTAGE_LIST_DRAWS={}, window {}) {:.0f} "
+                     "s: per second {}; runs started by a list draw {:.0f}/s of {:.0f}/s; the back "
+                     "drew {:.0f}/s from the packet's list words buffer",
+                     g_list_draws.load(std::memory_order_relaxed) ? 1 : 0,
+                     Ahead() != 0 ? "open" : "closed", seconds, list_text, rate(list_level),
+                     rate(runs), rate(current.list_drawn - reported.list_drawn));
+        }
         if (Nx2Profile::Enabled()) {
             LogRunShape(seconds);
         }

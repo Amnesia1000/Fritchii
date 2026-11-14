@@ -3204,6 +3204,10 @@ void MemStage::TickThread(int seam) {
         : VideoCommon::Nx2FastDrawCount::g_on ? "the delta path (EXP118)"
                                               : nullptr;
     link.SetAhead(link.Mode() == 2 && ahead > 0 ? static_cast<u32>(ahead) : 0U, blocked);
+    // List draws served by GPUMem (live, default on): only while the window is open
+    // (Link::ListDrawsServed); level mode and THREAD 0/1 never serve them.
+    link.SetListDraws(
+        Debug::SwitchValue(Debug::g_memstage_list_draws, "FRITCHII_MEMSTAGE_LIST_DRAWS", 1) > 0);
     // The window's verify (its own-write ring and the image check) only with a verify on.
     Link::SetVerify(read_log_every > 0 || Link::RingVerify());
     ring_read_log.store(read_log_every > 0 && Link::Ahead() != 0, std::memory_order_relaxed);
