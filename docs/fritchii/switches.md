@@ -774,7 +774,15 @@ a request GPUMem waits for; the back's own run of the entry then skips it. 0, AH
   order), "a gather GPUMem had the back run at an entry the back passed without it" (a record
   dropped at a later gather, a lend, the ring's end or start) and "a back draw between a gather
   GPUMem had run and its entry" (the back's draw count moved between the request and its entry).
-  "Level after a deferred draw" is not one of them: the shadow applies sunk writes at once and
+  The first market run (build 44a2974be6) counted about one "served gather with no record" every
+  10 s with the switch off: not the gathers but the window itself. The back read lent_from and
+  lent_until with two loads, and a lend between them gave it the last run's start with the next
+  run's end: it took the entries between the two runs as lent, stayed "in a run" and at the next
+  run's start skipped that start (no flag hand-over, no lend ranges, its first entry run with the
+  back served; a gather is the usual first entry). BackLoad now reads one run's pair (lent_until
+  stored with release after lent_from, lent_from read again), and a run start that finds the back
+  still in another run is a must-be-0 of its own ("a run start while the back was still in the
+  last run"), whose end is then taken there. "Level after a deferred draw" is not one of them: the shadow applies sunk writes at once and
   may issue that draw at an earlier entry, while the back issues it when it consumes its sink at
   the gather's entry.
 - The record is pushed before the request and GPUMem publishes past the entry right after it (as

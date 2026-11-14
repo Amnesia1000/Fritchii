@@ -68,6 +68,7 @@ public:
         ReleaseMissing,
         ReleaseOrphan,
         ReleaseDrawBetween,
+        RunOverlap,
         Count,
     };
 
