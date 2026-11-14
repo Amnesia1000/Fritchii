@@ -795,6 +795,23 @@ void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argume
     case MAXWELL3D_REG_INDEX(bind_groups[4].raw_config):
         return ProcessCBBind(4);
     case MAXWELL3D_REG_INDEX(report_semaphore.query):
+        // FRITCHII_MEMSTAGE_PASS bit 2 (fable_stage_p3 1.2 and 1.4): a fence report (a Release
+        // with short_query) runs served only when GPUMem passed it, with a record of the entry.
+        // The back asks for it here, at the entry, as for the other passed kinds: an unmapped one
+        // reaches nothing else that asks (CounterReport returns at once), and a record the back
+        // passed without asking is applied late (PassLate). No record: must be 0.
+        if (VideoCommon::MemoryStageLink::BackServed() &&
+            regs.report_semaphore.query.operation.Value() ==
+                Regs::ReportSemaphore::Operation::Release &&
+            regs.report_semaphore.query.short_query != 0) [[unlikely]] {
+            auto& link = VideoCommon::MemoryStageLink::Get();
+            if (link.BackPassRecord(VideoCommon::GpuSplit::Get().BackEntryPosition()) ==
+                nullptr) {
+                VideoCommon::MemoryStageLink::Note(
+                    VideoCommon::MemoryStageLink::Check::PassFenceMissing,
+                    "Maxwell3D::ProcessMethodCall (a fence report)");
+            }
+        }
         return ProcessQueryGet();
     case MAXWELL3D_REG_INDEX(render_enable.mode):
         return ProcessQueryCondition();

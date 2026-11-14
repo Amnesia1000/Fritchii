@@ -1617,8 +1617,11 @@ never enters the buffer cache.
   every other path runs as before. The fence's own
   gather while served goes to GPUMem as P1's does (GatherOnStage), for either bit. WaitForIdle's
   "a query result sync pending at a passed entry" counts only when the entry has no P3 record.
+- The back asks for the record at every passed entry, at the entry: a 3D fence report in
+  Maxwell3D's report_semaphore.query case (an unmapped one reaches nothing else that asks; the
+  first gate run counted those as late records).
 - Must be 0, added: "a query result sync range at a P3-passed entry that none of the record's
-  targets holds". "Uncommitted buffer flushes at a passed entry's flush grouping" is now also
+  targets holds", "a served 3D fence report with no pass record". "Uncommitted buffer flushes at a passed entry's flush grouping" is now also
   counted at a P3-passed fence's commit (FenceManager::CommitCacheFlushes). Both turn the switch
   to 0 for the session, as the others.
 - Why it is exact (fable_stage_p3 7): GPUMem's lookup at the entry's place returns what the back's
