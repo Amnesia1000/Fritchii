@@ -339,6 +339,7 @@ constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::GatherOut
                  "level with the switch off or the window closed",
                  "level not alone in their entry",
                  "level after a deferred draw",
+                 "level before a hard closure (one run)",
                  "level with no record room",
                  "level as GPUMem stopped",
                  "inside a level run",

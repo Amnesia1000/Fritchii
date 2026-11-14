@@ -75,6 +75,7 @@ public:
         Closed,       ///< level: the switch off or the window closed (a run starts)
         NotFirst,     ///< level: not a lone Direct method, or a draw before it in its entry
         DeferredDraw, ///< level: the back had a deferred draw it would issue first at the entry
+        NextHard,     ///< level: a hard closure follows, which the gather's run takes in
         NoRoom,       ///< level: no room for its record
         Stopping,     ///< level: GPUMem is stopping
         InRun,        ///< inside a level run (followed; the back runs it lent)
@@ -149,8 +150,10 @@ public:
         /// (RasterizerVulkan::DrawListWords' test, on the copy's registers and draw state).
         bool (*list_reads_back)(void* context, const MemStageShadowEngine& copy){};
         /// GPUMem, level at a gather's entry (the back parked there; FRITCHII_MEMSTAGE_GATHER):
-        /// the back runs the gather now, as a request GPUMem waits for (ServeNow).
-        void (*gather)(void* context){};
+        /// the back runs the gather now, as a request GPUMem waits for (ServeNow), unless its
+        /// engine `engine` (a Maxwell3D) has a deferred draw. True when it ran; `draw_seq` is the
+        /// back's draw count then.
+        bool (*gather)(void* context, void* engine, u64& draw_seq){};
     };
 
     [[nodiscard]] static MemoryStageLink& Get() noexcept {

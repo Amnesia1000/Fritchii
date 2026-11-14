@@ -740,13 +740,17 @@ a request GPUMem waits for; the back's own run of the entry then skips it. 0, AH
   and outside a hard entry, with no draw before it in the entry. Level instead (a run, as before):
   a gather inside a multi-word or packet entry (the back would run what precedes it in the entry
   after the request), one the back's pending deferred draw would come before (its sink or the
-  gather's own store flushes it at the entry: tested on the back's engine once level), no room
+  gather's own store flushes it at the entry: tested by the request, on the back), one right
+  before a hard closure the front has published (a Cache or untagged Call, a semaphore release or
+  a fence: the gather's run takes it in, so coming level first would only add a wait), no room
   for its record (256), GPUMem stopping.
 - Exact: once level, the back has run every entry before the gather's and played every packet;
   GPUMem waits outside any fill, so the back serving the request is the buffer cache's only user,
   at that place in the stream, and it runs InvalidateTextureDataCache's default, the same code
-  THREAD 0 runs there. The cache's flags 15-48 go to the back for the request and come back after
-  it, as a run of that one entry hands them over (the request may mark bindings dirty). The record
+  THREAD 0 runs there. The cache's flags 15-48 go to the back's engines before the gather and
+  back to the copies after it, inside the request on the back (GPUMem waits; the back's idle hook
+  flush, which may run while it is parked, is on the same thread), as a run of that one entry
+  hands them over (the request may mark bindings dirty). The record
   (the entry's position and the back's draw count) makes the back skip the method when it runs
   the entry: nothing of the entry comes before it there (a lone method, no deferred draw), and its
   register store and dirty flags are the same either way.
@@ -756,7 +760,8 @@ a request GPUMem waits for; the back's own run of the entry then skips it. 0, AH
   at a run), then for the request.
 - "Memory stage gathers (FRITCHII_MEMSTAGE_GATHER=n, window open/closed)" every 10 s on THREAD 2:
   gathers a second run at their entry and level by why (switch off or window closed, not alone in
-  their entry, after a deferred draw, no record room, GPUMem stopping), inside a level run, in an
+  their entry, after a deferred draw, before a hard closure, no record room, GPUMem stopping),
+  inside a level run, in an
   entry hard already; runs started by a gather against all runs; GPUMem's ms a second in the
   served ones (the wait to be level and the request, and us each); of those, how often the wait
   for idle synced query results and a game write range lay by GPU-written buffer data, and the

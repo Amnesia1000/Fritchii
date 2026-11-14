@@ -1275,8 +1275,9 @@ void RasterizerVulkan::SetRingBackend() {
     backend.list_reads_back = [](void*, const VideoCommon::MemStageShadowEngine& copy) {
         return ListDrawReadsBack(copy.draw_manager.draw_state, copy.regs);
     };
-    backend.gather = [](void* context) {
-        static_cast<RasterizerVulkan*>(context)->StageRunGather();
+    backend.gather = [](void* context, void* engine, u64& draw_seq) {
+        return static_cast<RasterizerVulkan*>(context)->StageRunGather(
+            *static_cast<Tegra::Engines::Maxwell3D*>(engine), draw_seq);
     };
     Link::Get().SetRingBackend(backend);
 }
@@ -1496,32 +1497,50 @@ bool RasterizerVulkan::StageRangesOverGpuWritten(
     return false;
 }
 
-void RasterizerVulkan::StageRunGather() {
+bool RasterizerVulkan::StageRunGather(Tegra::Engines::Maxwell3D& engine, u64& draw_seq) {
     // GPUMem, level at the gather's entry (MemStageShadow's StageGather): the back is parked there
     // with every packet before it played and GPUMem waits outside any fill, so the back serving
     // this request is the cache's only user, at the gather's place in the stream. It runs what its
-    // own run of the entry would: InvalidateTextureDataCache's default, the same code as THREAD 0.
-    // Counted: whether the wait for idle had query results to sync (they need the buffer cache at
-    // this place: why the gather can't be GPUMem's own work), and the game write ranges.
+    // own run of the entry would: InvalidateTextureDataCache's default, the same code as THREAD 0,
+    // with the cache's flags handed over around it. Not when `engine` has a deferred draw: the
+    // entry issues it before the gather. Counted: whether the wait for idle had query results to
+    // sync (they need the buffer cache at this place: why the gather can't be GPUMem's own work),
+    // whether a game write range lay by GPU-written data, the ranges.
+    using Link = VideoCommon::MemoryStageLink;
     struct Run {
         RasterizerVulkan* self;
+        Tegra::Engines::Maxwell3D* engine;
+        bool ran;
         bool synced;
+        u64 draw_seq;
         GatherProbe probe;
-    } run{this, false, GatherProbe{0, false}};
+    } run{this, &engine, false, false, 0, GatherProbe{0, false}};
     auto body = [&run] {
+        if (run.engine->draw_manager.HasDeferredDraw()) {
+            return;
+        }
         RasterizerVulkan& self = *run.self;
         run.synced = self.query_cache.HasPendingSync();
-        t_gather_probe = &run.probe;
-        SCOPE_EXIT {
-            t_gather_probe = nullptr;
-        };
-        self.InvalidateGPUCache();
-        t_gather_probe = nullptr;
+        VideoCommon::MemStageShadow::BackGatherLend();
+        {
+            t_gather_probe = &run.probe;
+            SCOPE_EXIT {
+                t_gather_probe = nullptr;
+            };
+            self.InvalidateGPUCache();
+        }
         self.WaitForIdle();
+        VideoCommon::MemStageShadow::BackGatherReturn();
+        run.draw_seq = Link::Get().BackDrawSeq();
+        run.ran = true;
     };
-    VideoCommon::MemoryStageLink& link = VideoCommon::MemoryStageLink::Get();
+    Link& link = Link::Get();
     link.ServeNow(body);
-    link.NoteGatherRun(run.synced, run.probe.ranges, run.probe.gpu_written);
+    if (run.ran) {
+        link.NoteGatherRun(run.synced, run.probe.ranges, run.probe.gpu_written);
+    }
+    draw_seq = run.draw_seq;
+    return run.ran;
 }
 
 void RasterizerVulkan::ProbeGatherRanges(std::span<const std::pair<DAddr, u64>> ranges) {

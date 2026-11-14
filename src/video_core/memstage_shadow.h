@@ -167,6 +167,11 @@ void StageLend();
 /// entry (BackTakeLend, on the back; the publish of the run orders the two).
 void StageLendDeferred();
 void BackTakeLend();
+/// FRITCHII_MEMSTAGE_GATHER, on the back inside GPUMem's request (GPUMem waits, level): the cache's
+/// flags 15-48 to the back's engines before the gather, and back to the copies after it, as a run
+/// of that one entry hands them over.
+void BackGatherLend();
+void BackGatherReturn();
 /// Step 7: whether processing the entry at `position` may take a full copy from the back (a copy
 /// that is new or stale): GPUMem must be level there first.
 [[nodiscard]] bool StageMayCopy(u64 position);

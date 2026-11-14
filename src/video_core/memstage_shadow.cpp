@@ -173,6 +173,10 @@ struct MemStageShadowAccess {
     static const u64* Ring() {
         return GpuSplit::Get().ring.get();
     }
+    /// How far the front has published (GPUMem may read the entries before it).
+    static u64 Published() {
+        return GpuSplit::Get().published.load(std::memory_order_acquire);
+    }
     static bool SkipSame(const Maxwell3D& maxwell3d) {
         return maxwell3d.skip_same_value_writes;
     }
@@ -1551,8 +1555,8 @@ void Return(State& s) {
 /// the back, parked there with every packet before it played, runs the method's whole handler as
 /// a request (the cache's user while it serves), and its own run of the entry skips it. What stays
 /// a run: a gather that is not a lone Direct method (something before it in the entry would run on
-/// the back after it), one the back's pending deferred draw would come before, no record room,
-/// the switch off or the window closed.
+/// the back after it), one the back's pending deferred draw would come before, one right before a
+/// hard closure (the run takes it in), no record room, the switch off or the window closed.
 void StageGather(State& s, Copy& c, u32 method) {
     using Outcome = MemoryStageLink::GatherOutcome;
     MemoryStageLink& link = MemoryStageLink::Get();
@@ -1577,6 +1581,17 @@ void StageGather(State& s, Copy& c, u32 method) {
         // writes of the packet) after the request: not in stream order.
         return level(Outcome::NotFirst);
     }
+    // A hard closure right after it (a Cache or untagged Call: a semaphore release, a fence) would
+    // join the gather's run (StageExtendsRun) and start one of its own here: GPUMem would come
+    // level and then lend anyway. Kept as one run, when the front has published that entry.
+    const u64 next = s.processing_position + ((head & Access::HasSegment) != 0 ? 2 : 1);
+    if (next < Access::Published()) {
+        const u64 next_head = Access::Ring()[next & Access::RingMask];
+        if (static_cast<Kind>(next_head & 0xf) == Kind::Call &&
+            (StageTagOf(next_head) == StageTag::Cache || StageTagOf(next_head) == StageTag::Level)) {
+            return level(Outcome::NextHard);
+        }
+    }
     const auto& backend = link.Backend();
     if (backend.gather == nullptr) {
         return level(Outcome::Closed);
@@ -1588,28 +1603,16 @@ void StageGather(State& s, Copy& c, u32 method) {
     if (!link.StageLevel(s.processing_position, MemoryStageLink::LevelReason::Gather)) {
         return level(Outcome::Stopping);
     }
-    // Level: the back has run every entry before this one and is parked at it. A draw it deferred
-    // would be issued at this entry first (its method sink's writes and the gather's own store
-    // flush it): before the gather, so not by a request ahead of it.
-    if (c.back->draw_manager.HasDeferredDraw()) {
+    // Level: the back has run every entry before this one and is parked at it. The request reads
+    // and writes the back's state on the back (its idle hook's flush may run there meanwhile): it
+    // declines when the engine has a deferred draw, which this entry would issue first (its method
+    // sink's writes and the gather's own store flush it), before the gather; it hands the cache's
+    // flags over around the gather (BackGatherLend, BackGatherReturn).
+    u64 draw_seq = 0;
+    if (!backend.gather(backend.context, c.back, draw_seq)) {
         return level(Outcome::DeferredDraw);
     }
-    // The cache's flags go to the back for the request and come back after it, as a run of this
-    // one entry would hand them over (level mode's lend, StageReturn's take): the request may
-    // mark bindings dirty (a buffer the query sync's lookups delete).
-    for (Copy& copy : s.copies) {
-        if (!copy.stale) {
-            TakeCacheFlags(copy.back->dirty.flags, copy.e->dirty.flags);
-        }
-    }
-    backend.gather(backend.context);
-    for (Copy& copy : s.copies) {
-        if (!copy.stale) {
-            TakeCacheFlags(copy.e->dirty.flags, copy.back->dirty.flags);
-            ++copy.generation;
-        }
-    }
-    link.PushGather(s.processing_position, link.BackDrawSeq());
+    link.PushGather(s.processing_position, draw_seq);
     link.NoteGather(Outcome::Served,
                     static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                          std::chrono::steady_clock::now() - start)
@@ -2397,6 +2400,27 @@ void BackTakeLend() {
     // The back, at the run's first entry: S() is GPUMem's state, which is parked on this run.
     for (const auto& [engine, flags] : S().lend_flags) {
         TakeCacheFlags(engine->dirty.flags, flags);
+    }
+}
+
+void BackGatherLend() {
+    // The back, in GPUMem's gather request: S() is GPUMem's, which waits for the answer. As
+    // StageLend (level mode's lend), without its count.
+    for (Copy& copy : S().copies) {
+        if (!copy.stale) {
+            TakeCacheFlags(copy.back->dirty.flags, copy.e->dirty.flags);
+        }
+    }
+}
+
+void BackGatherReturn() {
+    // As StageReturn's take of the flags: the gather may have marked bindings dirty (a buffer the
+    // query sync's lookups deleted).
+    for (Copy& copy : S().copies) {
+        if (!copy.stale) {
+            TakeCacheFlags(copy.e->dirty.flags, copy.back->dirty.flags);
+            ++copy.generation;
+        }
     }
 }
 
