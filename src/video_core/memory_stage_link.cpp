@@ -959,15 +959,38 @@ MemoryStageLink::BackLimits MemoryStageLink::BackLoad(u64 published) const noexc
     }
 }
 
+std::string MemoryStageLink::BackRingState(u64 position) const {
+    // Fable's ask (fable_front_drains.md 4): whether a must-be-0 at a run's first entry came from
+    // limits older or newer than the entry. "Below the batch's run" means the batch's pair is of
+    // a later run than the entry's.
+    const BackLimits& batch = back_entry_limits;
+    const char* const where = position < batch.lent_from    ? "below the batch's run"
+                              : position < batch.lent_until ? "inside the batch's run"
+                                                            : "past the batch's run";
+    return fmt::format(
+        " (entry {:#x}, {}; the batch's limits from its entry {:#x}: available {:#x}, lent "
+        "[{:#x}, {:#x}); now lent [{:#x}, {:#x}), staged {:#x}, consumed {:#x}, published {:#x}; "
+        "back_run_from {:#x}, in a run {}, served {})",
+        position, where, back_entry_at, batch.available, batch.lent_from, batch.lent_until,
+        Ring::LentFrom().load(std::memory_order_acquire),
+        Ring::LentUntil().load(std::memory_order_acquire),
+        Ring::Staged().load(std::memory_order_acquire),
+        Ring::Consumed().load(std::memory_order_acquire),
+        Ring::Published().load(std::memory_order_acquire), back_run_from, t_back_run ? 1 : 0,
+        t_back_served ? 1 : 0);
+}
+
 void MemoryStageLink::BackEntry(u64 position, const BackLimits& limits) {
     if (!t_back_served && !t_back_run) {
         return; // the ring is off
     }
+    back_entry_limits = limits;
+    back_entry_at = position;
     const bool lent = position >= limits.lent_from && position < limits.lent_until;
     if (lent && t_back_run && limits.lent_from != back_run_from) [[unlikely]] {
         // Another run starts while the back is still in the last one (its end was missed): must
         // be 0. That run's end is taken here, and this one starts as any other.
-        Note(Check::RunOverlap, "BackEntry");
+        Note(Check::RunOverlap, ("BackEntry" + BackRingState(position)).c_str());
         BackEndRun();
     }
     if (lent && !t_back_run) {
@@ -1396,7 +1419,8 @@ bool MemoryStageLink::BackTakeGather(u64 position) noexcept {
     }
     gather_head.store(head, std::memory_order_release);
     if (!taken && BackServed()) [[unlikely]] {
-        Note(Check::GatherMissing, "RasterizerVulkan::InvalidateTextureDataCache");
+        Note(Check::GatherMissing,
+             ("RasterizerVulkan::InvalidateTextureDataCache" + BackRingState(position)).c_str());
     }
     return taken;
 }
@@ -1461,7 +1485,7 @@ bool MemoryStageLink::BackTakeRelease(u64 position) noexcept {
     }
     release_head.store(head, std::memory_order_release);
     if (!taken && BackServed()) [[unlikely]] {
-        Note(Check::ReleaseMissing, "GpuSplit::Execute");
+        Note(Check::ReleaseMissing, ("GpuSplit::Execute" + BackRingState(position)).c_str());
     }
     return taken;
 }
