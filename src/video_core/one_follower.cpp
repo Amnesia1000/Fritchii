@@ -82,7 +82,6 @@ struct Impl {
     alignas(64) u64 write{}; ///< bytes written
     u64 pushed{};            ///< packets pushed
     u64 draw_seq{};
-    u64 verify_counter{};             ///< unlent-eligible draws since the last forced verify
     std::atomic<u64> sent{};          ///< bytes committed
     std::atomic<u64> sent_packets{};  ///< packets committed
     std::atomic<u64> intended{};      ///< the consumed position E last stored (EngineConsumed)
@@ -100,11 +99,6 @@ struct Impl {
     std::exception_ptr lent_error; ///< thrown by a lent call on R, rethrown on E
 
     std::atomic<Maxwell3D*> engine{};
-    DrawPlayer player{};
-    void* player_context{};
-    DrawPusher pusher{};
-    void* pusher_context{};
-    std::array<std::atomic<u64>, static_cast<size_t>(LentReason::Count)> fallbacks{};
 };
 
 Impl g;
@@ -155,9 +149,8 @@ void Refresh(u32 generation) {
     if (unlend != 0) {
         if (level != StepLevel::Build) {
             refuse(g.logged_unlend, unlend, "FRITCHII_ONEF_UNLEND", "FRITCHII_ONEF_BUILD=1");
-        } else if (g.player == nullptr || g.pusher == nullptr) {
-            refuse(g.logged_unlend, unlend, "FRITCHII_ONEF_UNLEND",
-                   "R's draw player and E's pusher (part c)");
+        } else if (GetDrawPlayer() == nullptr) {
+            refuse(g.logged_unlend, unlend, "FRITCHII_ONEF_UNLEND", "R's draw player (part c)");
         } else {
             level = StepLevel::Unlend;
             mask = static_cast<u32>(unlend) & AllKinds;
@@ -300,6 +293,12 @@ Stats::RenderTime Play(const PacketHeader& header, const u8* spans) {
     if (header.spans != 0 && view.seeded) {
         ApplySpans(view, header, spans);
     }
+    // Part (c)'s view engine (from step 3): every packet after the spans, a lent one before its
+    // call runs (E parked). Below step 3 it is idle and costs nothing.
+    DrawPlayer* const player = Step() >= StepLevel::Build ? GetDrawPlayer() : nullptr;
+    if (player != nullptr) {
+        player->OnPacket(header, spans);
+    }
     switch (header.kind) {
     case PacketKind::Lent: {
         const bool around = view_on && view.seeded && engine != nullptr;
@@ -336,8 +335,10 @@ Stats::RenderTime Play(const PacketHeader& header, const u8* spans) {
         return Stats::RenderTime::LentCalls;
     }
     case PacketKind::Draw:
-        if (g.player != nullptr) {
-            g.player(g.player_context, header, spans);
+        if (DrawPlayer* const draws = GetDrawPlayer(); draws != nullptr) {
+            draws->PlayDraw(header);
+        } else {
+            Note(Check::RenderPacketMissing, "a draw packet with no player");
         }
         return Stats::RenderTime::DrawPackets;
     case PacketKind::Delta:
@@ -490,7 +491,6 @@ void Start(Core::System& system) {
     g.write = 0;
     g.pushed = 0;
     g.draw_seq = 0;
-    g.verify_counter = 0;
     g.sent.store(0, std::memory_order_relaxed);
     g.sent_packets.store(0, std::memory_order_relaxed);
     g.intended.store(0, std::memory_order_relaxed);
@@ -526,7 +526,9 @@ void SetNextDraw(u32 kind, bool indexed, bool indirect, u32 instance_arg) noexce
 
 void Lend(LentOp op, LentReason reason, void (*function)(void*), void* argument) {
     if (!Detail::t_engine || !g.thread.joinable()) {
-        t_next_draw_set = false;
+        if (op == LentOp::Draw) {
+            t_next_draw_set = false;
+        }
         function(argument); // R, another thread, or R not running: in place, as today
         return;
     }
@@ -560,7 +562,9 @@ void Lend(LentOp op, LentReason reason, void (*function)(void*), void* argument)
             }
         }
     }
-    t_next_draw_set = false;
+    if (op == LentOp::Draw) {
+        t_next_draw_set = false;
+    }
     header.bytes = static_cast<u32>(scratch.size());
     std::memcpy(scratch.data(), &header, sizeof(header));
     Commit(scratch.data(), header.bytes, number, header.position, false);
@@ -583,7 +587,9 @@ void Push(PacketHeader& header, std::span<const u8> spans) {
     const u64 behind = Behind();
     header.number = ++g.pushed;
     header.position = GpuSplit::Get().BackEntryPosition();
-    header.draw_seq = header.kind == PacketKind::Draw ? ++g.draw_seq : g.draw_seq;
+    if (header.draw_seq == 0) {
+        header.draw_seq = header.kind == PacketKind::Draw ? ++g.draw_seq : g.draw_seq;
+    }
     header.bytes = static_cast<u32>(sizeof(PacketHeader) + spans.size());
     const u32 kind = header.kind == PacketKind::Draw ? TakeDrawKind(header) : 0;
     t_next_draw_set = false;
@@ -618,56 +624,22 @@ void EngineConsumed(u64 position) noexcept {
     RaisePlayed();
 }
 
-void SetDrawPlayer(DrawPlayer player, void* context) noexcept {
-    g.player_context = context;
-    g.player = player;
-    g.seen_generation.store(~u32{0}, std::memory_order_release); // the step may change
-}
-
-bool HasDrawPlayer() noexcept {
-    return g.player != nullptr;
-}
-
-void SetDrawPusher(DrawPusher pusher, void* context) noexcept {
-    g.pusher_context = context;
-    g.pusher = pusher;
-    g.seen_generation.store(~u32{0}, std::memory_order_release); // the step may change
-}
-
-bool PushDraw(bool is_indexed, u32 instance_count) {
-    return g.pusher != nullptr && g.pusher(g.pusher_context, is_indexed, instance_count);
-}
-
-LentReason DecideDraw(u32 kind, bool diagnostic) noexcept {
-    if (Step() < StepLevel::Unlend) {
-        return LentReason::StepBelowUnlend;
+void PushDraw(const Maxwell3D& engine, u64 draw_seq, u64 buffer_number, u8 flags) {
+    if (!Detail::t_engine || !g.thread.joinable()) {
+        t_next_draw_set = false;
+        return;
     }
-    if ((g.unlend_mask.load(std::memory_order_relaxed) & kind) == 0) {
-        return LentReason::KindNotInMask;
-    }
-    if (diagnostic) {
-        return LentReason::Diagnostic;
-    }
-    if (!ViewReady() || g.pusher == nullptr ||
-        g.engine.load(std::memory_order_relaxed) == nullptr) {
-        return LentReason::Transient;
-    }
-    // LentReason::StreamWrite is not decided here: the guard (GuardStreamWrite) drains R at the
-    // write itself, which is that write run lent; the draws after it need nothing more.
-    const int every = g.verify_every.load(std::memory_order_relaxed);
-    if (every > 0 && ++g.verify_counter >= static_cast<u64>(every)) {
-        g.verify_counter = 0;
-        return LentReason::Verify;
-    }
-    return LentReason::Count;
-}
-
-void NoteUnlentFallback(LentReason reason) noexcept {
-    g.fallbacks[static_cast<size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
-}
-
-u64 UnlentFallbacks(LentReason reason) noexcept {
-    return g.fallbacks[static_cast<size_t>(reason)].load(std::memory_order_relaxed);
+    // Part (c)'s unlent draw: its ring B packet is filled; this packet carries the spans (the
+    // draw span always) and names it. E goes on within FRITCHII_ONEF_AHEAD.
+    PacketHeader header{};
+    header.kind = PacketKind::Draw;
+    header.flags = flags;
+    header.draw_seq = draw_seq;
+    header.buffer_number = buffer_number;
+    std::vector<u8> spans(sizeof(RegPair) * Maxwell3D::Regs::NUM_REGS + sizeof(FlagBits) +
+                          sizeof(DrawValues) + sizeof(Programs) + sizeof(Pools) + 64);
+    const std::size_t bytes = PackSpans(engine, header, spans);
+    Push(header, std::span<const u8>{spans.data(), bytes});
 }
 
 void SetEngine(Maxwell3D* engine) noexcept {

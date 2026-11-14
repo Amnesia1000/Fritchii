@@ -267,6 +267,26 @@ uintptr_t ThisThread() noexcept {
 
 using Link = VideoCommon::MemoryStageLink;
 
+// Ring B with one follower (FRITCHII_ONEF step 4): E fills its unlent draws' packets
+// (FillRingDraw, as GPUMem does at THREAD = 2) while R takes and plays them, so the fill side's
+// rules apply to E: it never plays the held packet (that is R's), and the packet ticks keep two
+// marks (E's fill, R's held packet) with ring B's oldest packet between them. Audited for this:
+// BeginDraw, ClaimHeld and UpdateUnplayed. The other OnStageThread tests are GPUMem's own checks
+// and served calls, which one follower does not use (its E-side work that needs R is lent).
+[[nodiscard]] static bool OneFollowerRing() noexcept {
+    return VideoCommon::OneFollower::On() &&
+           VideoCommon::OneFollower::Step() == VideoCommon::OneFollower::StepLevel::Unlend;
+}
+/// The thread that fills ring B for another to play: GPUMem, or E with one follower at step 4.
+[[nodiscard]] static bool FillSide() noexcept {
+    return Link::OnStageThread() ||
+           (VideoCommon::OneFollower::OnEngineThread() && OneFollowerRing());
+}
+/// Ring B has its filler and its player on two threads.
+[[nodiscard]] static bool TwoThreadRing() noexcept {
+    return Link::RingActive() || OneFollowerRing();
+}
+
 struct PlayDepth {
     PlayDepth() noexcept {
         ++t_play_depth;
@@ -809,14 +829,14 @@ void MemStage::EnterSync(Sync kind) {
 
 void MemStage::BeginDraw(u32 repack_mask, u32 repack_dirty) {
     // A held packet ends at its Configure's RestAtEnd; this is only a safety net. (On GPUMem,
-    // THREAD = 2, the held packet is the back's.)
-    if (!Link::OnStageThread()) {
+    // THREAD = 2, the held packet is the back's; with one follower at step 4, E's is R's.)
+    if (!FillSide()) {
         PlayRest();
     }
     Bump(counters.draws);
     RetireDrawValues();
     draw = DrawPacket{};
-    if (ticks && Link::OnStageThread() && Link::RingActive()) {
+    if (ticks && FillSide() && TwoThreadRing()) {
         // THREAD = 2: GPUMem's mark is the draw's number from the moment it exists (the back
         // may close a tick meanwhile); EndStageFill clears it however the fill ends.
         draw.number = ticks->BeginStagePacket();
@@ -1109,7 +1129,7 @@ bool MemStage::ClaimHeld() {
         // Inside another fill or a play: not a draw site. Fill where the calls are.
         return false;
     }
-    if (!Link::OnStageThread()) {
+    if (!FillSide()) {
         PlayRest();
     }
     const uintptr_t me = ThisThread();
@@ -1138,7 +1158,7 @@ bool MemStage::ClaimHeld() {
 // played inside Configure does not end the held one. Without a held packet this is SetPending's
 // and PlayPending's set and clear.
 void MemStage::UpdateUnplayed() {
-    if (Link::RingActive()) {
+    if (TwoThreadRing()) {
         // THREAD = 2 ("Packet ticks with the stage ahead"): each side writes only its own mark,
         // from its own fields; the close takes the lower one and ring B's oldest packet itself.
         // GPUMem: the draw it fills (from BeginDraw to the push) and its pending entries. The
@@ -1147,7 +1167,7 @@ void MemStage::UpdateUnplayed() {
         // reads them as GPUMem's only while it serves GPUMem's sync with GPUMem's identity, and
         // then writes GPUMem's mark.)
         const bool owned = OwnedHere();
-        if (Link::OnStageThread() || t_identity != 0) {
+        if (FillSide() || t_identity != 0) {
             u64 from = stage_fill_from;
             if (stage_op_from != 0 && (from == 0 || stage_op_from < from)) {
                 from = stage_op_from;

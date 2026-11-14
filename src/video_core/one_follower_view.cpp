@@ -26,6 +26,7 @@
 #include <bitset>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <fmt/format.h>
@@ -95,6 +96,7 @@ struct EngineSide {
     bool started{};  ///< the view was seeded since tracking (re)started
     std::atomic<bool> restart{true};
     u64 on_texture{}; ///< stream writes onto texture pages (StreamWritesOnTexturePages)
+    bool stream_hit{}; ///< a guard hit since the last draw (TakeStreamWriteLend)
 };
 
 EngineSide g_e;
@@ -191,13 +193,20 @@ std::size_t PackSpans(const Maxwell3D& engine, PacketHeader& header, std::span<u
         std::memcpy(out.data() + used, data, bytes);
         used += (bytes + 7) & ~std::size_t{7};
     };
+    // Every draw packet and lent draw carries the draw span (part c's PlayDraw and Compare read
+    // it); SetNextDraw adds what only the caller knows (kind, indexed, the instance argument).
+    const bool is_draw = header.kind == PacketKind::Draw ||
+                         (header.kind == PacketKind::Lent &&
+                          header.op == static_cast<u8>(LentOp::Draw));
     const auto draw_span = [&] {
-        if (const DrawValues* next = Detail::NextDraw()) {
-            DrawValues values = *next;
-            FillDraw(values, engine);
-            header.spans |= SpanDraw;
-            put(&values, sizeof(values));
+        if (!is_draw) {
+            return;
         }
+        const DrawValues* const next = Detail::NextDraw();
+        DrawValues values = next != nullptr ? *next : DrawValues{};
+        FillDraw(values, engine);
+        header.spans |= SpanDraw;
+        put(&values, sizeof(values));
     };
     if (g_e.restart.load(std::memory_order_acquire) || !g_e.started) {
         if (header.kind != PacketKind::Lent) {
@@ -342,15 +351,11 @@ void VerifyView(const RegisterView& view, const Maxwell3D& engine) {
 }
 
 void BeforeLentCall(RegisterView& view, Maxwell3D& engine) {
-    if (Step() < StepLevel::Unlend) {
-        return; // verify only: the engine stays the truth
-    }
-    // Step 4: R's draws cleared R's flags on the view only. The lent code reads the engine: R-only
-    // flags take the view's; shared ones are raised if either side has them (a rebind too many,
-    // never one too few).
-    const Partition& parts = Parts();
-    engine.dirty.flags = (engine.dirty.flags & ~parts.render_only) |
-                         (view.flags & parts.render_only) | (view.flags & parts.shared);
+    // Nothing: the engine's flags stay E's. Part (c)'s model (vk_one_follower_draw.h): a side
+    // that did not consume a flag keeps it raised, so a lent draw after unlent ones redoes that
+    // part from registers equal to the view's (a rebind too many, never one too few).
+    (void)view;
+    (void)engine;
 }
 
 void AfterLentCall(RegisterView& view, Maxwell3D& engine) {
@@ -391,6 +396,13 @@ void GuardStreamWrite(DAddr address, u64 size) noexcept {
     Note(Check::StreamWrite, t_note.c_str());
     Drain();
     Stats::StreamWriteHandled(Behind() == 0);
+    // Part (c): the next draw is lent too (LentReason::StreamWrite), so its build reads E's
+    // engine with the write landed.
+    g_e.stream_hit = true;
+}
+
+bool TakeStreamWriteLend() noexcept {
+    return std::exchange(g_e.stream_hit, false);
 }
 
 u64 StreamWritesOnTexturePages() noexcept {

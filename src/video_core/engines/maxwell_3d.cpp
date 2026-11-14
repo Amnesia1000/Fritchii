@@ -44,6 +44,7 @@
 #include "video_core/nx2_list_dispatch.h"
 #include "video_core/nx2_list_draw.h"
 #include "video_core/nx2_perf.h"
+#include "video_core/one_follower.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2_report_census.h"
 #include "video_core/nx2_runahead.h"
@@ -1416,6 +1417,10 @@ void Maxwell3D::ProcessQueryCondition() {
         }
         break;
     }
+    }
+    // One follower from step 3 (part c): R's own mode at this place, compared with this one.
+    if (VideoCommon::OneFollower::On()) [[unlikely]] {
+        VideoCommon::OneFollower::NoteCondition(execute_on);
     }
     if (const u64 trace =
             VideoCommon::QueryTrace::Sample(VideoCommon::QueryTrace::Event::CpuCondition)) {
