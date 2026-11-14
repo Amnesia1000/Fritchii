@@ -38,6 +38,7 @@
 
 namespace Vulkan {
 
+class GraphicsPipeline;
 class RasterizerVulkan;
 
 class OneFollowerDraw final : public VideoCommon::OneFollower::DrawPlayer {
@@ -61,6 +62,12 @@ public:
     void OnPacket(const PacketHeader& header, const u8* spans) override;
     void PlayDraw(const PacketHeader& header) override;
     void Condition(bool engine_execute_on) override;
+
+    /// R, at GraphicsPipeline::ConfigureDraw's descriptor count mismatch on an unlent draw: logs
+    /// once, at Critical, what E's fill used for the packet (program words and facts) against R's
+    /// pipeline (its programs, the view's program words, descriptors per stage), and the packet.
+    static void ReportDescriptorMismatch(const GraphicsPipeline& pipeline, u32 expected,
+                                         u32 got);
 
     /// R, in PrepareDraw: the header of the unlent draw being played, or null.
     [[nodiscard]] const PacketHeader* Playing() const noexcept {
@@ -133,6 +140,21 @@ private:
     Maxwell3D::EngineHint synced_engine_state{};
     bool synced_native{};
     VideoCommon::OneFollower::StepLevel seeded_step{};
+
+    /// What E's fill used for a pushed draw (E writes before the push, R reads at a mismatch).
+    struct FillRecord {
+        u64 seq;
+        u64 key;
+        std::array<u64, VideoCommon::MemStageShadow::ProgramWordCount> words;
+        std::array<u64, 2> hashes;
+        std::array<u32, 5> uniform_masks;
+        std::array<u8, 5> ssbo_counts;
+        u32 stages;
+        u64 buffer_number;
+    };
+    static constexpr size_t FillRecords = 64;
+    std::array<FillRecord, FillRecords> fill_records{};
+    std::atomic<bool> mismatch_reported{};
 
     // E only.
     u64 e_draw_seq{};

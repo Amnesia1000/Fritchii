@@ -22,12 +22,16 @@
 //   R tracks its own mode at each condition (NoteCondition) and compares it (BuildCondition), and
 //   drops PacketConditional draws while it is False. Step 5 makes E send those.
 
+#include <bit>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <span>
+#include <string>
 #include <string_view>
 #include <type_traits>
+
+#include <fmt/format.h>
 
 #include "common/dkb_frame_trace.h"
 #include "common/scope_exit.h"
@@ -43,12 +47,18 @@
 #include "video_core/one_follower_stats.h"
 #include "video_core/render_trace.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
+#include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_one_follower_draw.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
 #include "video_core/texture_handle_values.h"
 
 namespace Vulkan {
+
+namespace {
+/// The instance ReportDescriptorMismatch reports for (one rasterizer at a time).
+std::atomic<OneFollowerDraw*> g_instance{nullptr};
+} // Anonymous namespace
 
 namespace OneF = VideoCommon::OneFollower;
 using OneF::Check;
@@ -153,6 +163,7 @@ private:
 // --- Construction ----------------------------------------------------------------------------------
 
 OneFollowerDraw::OneFollowerDraw(RasterizerVulkan& rasterizer_) : rasterizer{rasterizer_} {
+    g_instance.store(this, std::memory_order_release);
     for (size_t flag = 0; flag < render_flags.size(); ++flag) {
         render_flags[flag] = OneF::OwnerOf(static_cast<u8>(flag)) != OneF::FlagOwner::E;
     }
@@ -164,7 +175,10 @@ OneFollowerDraw::OneFollowerDraw(RasterizerVulkan& rasterizer_) : rasterizer{ras
                  std::getenv("EDEN_DKB_INDIRECT_READBACK") != nullptr;
 }
 
-OneFollowerDraw::~OneFollowerDraw() = default;
+OneFollowerDraw::~OneFollowerDraw() {
+    OneFollowerDraw* self = this;
+    g_instance.compare_exchange_strong(self, nullptr, std::memory_order_acq_rel);
+}
 
 // --- E: routing a draw -----------------------------------------------------------------------------
 
@@ -301,6 +315,18 @@ bool OneFollowerDraw::FillRing(Maxwell3D& engine, bool is_indexed, u64 position,
     const bool filled =
         r.mem_stage.FillRingDraw(r.buffer_cache, draw_facts, is_indexed, position, seq, 0, nullptr,
                                  nullptr, &handle_values, null_pointer_handles, false);
+    if (filled) {
+        // For ReportDescriptorMismatch: what this fill used, before the push publishes it.
+        FillRecord& record = fill_records[seq % FillRecords];
+        record.seq = seq;
+        record.key = program_id.key;
+        record.words = program_id.words;
+        record.hashes = facts.hashes;
+        record.uniform_masks = facts.uniform_masks;
+        record.ssbo_counts = facts.ssbo_counts;
+        record.stages = facts.stages;
+        record.buffer_number = buffer_number;
+    }
     return filled;
 }
 
@@ -601,6 +627,69 @@ void OneFollowerDraw::PlayDraw(const PacketHeader& header) {
     };
     rasterizer.Draw(values.indexed != 0, values.instance_arg);
     counts.played.fetch_add(1, std::memory_order_relaxed);
+}
+
+// --- R: a played draw that did not build ------------------------------------------------------------
+
+void OneFollowerDraw::ReportDescriptorMismatch(const GraphicsPipeline& pipeline, u32 expected,
+                                               u32 got) {
+    OneFollowerDraw* const self = g_instance.load(std::memory_order_acquire);
+    if (self == nullptr || self->playing == nullptr ||
+        self->mismatch_reported.exchange(true, std::memory_order_relaxed)) {
+        return;
+    }
+    const PacketHeader& header = *self->playing;
+    const FillRecord& fill = self->fill_records[header.draw_seq % FillRecords];
+    const bool have_fill = fill.seq == header.draw_seq;
+    // R's side: the view's program words (the rasterizer's engine is the view while it plays),
+    // the pipeline's programs and its descriptors per stage.
+    VideoCommon::MemStageShadow::ProgramId view_id;
+    VideoCommon::MemStageShadow::BackProgramId(*self->rasterizer.maxwell3d, view_id);
+    const MemStage::DrawFacts facts = pipeline.MemFacts();
+    std::string stages_text;
+    for (size_t stage = 0; stage < 5; ++stage) {
+        const Shader::Info& info = facts.stage_infos[stage];
+        const int uniforms = std::popcount((*facts.uniform_masks)[stage]);
+        const size_t storage = info.storage_buffers_descriptors.size();
+        const u32 textures = Shader::NumDescriptors(info.texture_descriptors) +
+                             Shader::NumDescriptors(info.image_descriptors) +
+                             Shader::NumDescriptors(info.texture_buffer_descriptors) +
+                             Shader::NumDescriptors(info.image_buffer_descriptors);
+        stages_text += fmt::format(
+            "{}s{}: R uniforms {} storage {} textures {} / E uniforms {} storage {}",
+            stage == 0 ? "" : "; ", stage, uniforms, storage, textures,
+            have_fill ? std::popcount(fill.uniform_masks[stage]) : -1,
+            have_fill ? static_cast<int>(fill.ssbo_counts[stage]) : -1);
+    }
+    std::string words_text;
+    size_t differing = 0;
+    if (have_fill) {
+        for (size_t i = 0; i < fill.words.size(); ++i) {
+            if (fill.words[i] != view_id.words[i]) {
+                if (differing++ < 8) {
+                    words_text += fmt::format("{}[{}] E {:#x} R {:#x}",
+                                              words_text.empty() ? "" : ", ", i, fill.words[i],
+                                              view_id.words[i]);
+                }
+            }
+        }
+    }
+    MemStage::StagedFacts table{};
+    const bool in_table = self->rasterizer.mem_stage.LookupFacts(view_id, table);
+    const auto hashes = pipeline.ShaderHashes();
+    LOG_CRITICAL(
+        Render_Vulkan,
+        "One follower: unlent draw descriptor mismatch (expected {}, got {}): packet {} draw seq "
+        "{} ring B {} position {:#x}; E's fill {}: program key {:#x}, hashes {:#x}/{:#x}, stages "
+        "{:#x}; R's pipeline: hashes {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}, stages {:#x}, view "
+        "program key {:#x}; program words E vs R: {} differ{}{}; per stage: {}; the facts table "
+        "now for R's key: {} (hashes {:#x}/{:#x}, stages {:#x})",
+        expected, got, header.number, header.draw_seq, header.buffer_number, header.position,
+        have_fill ? "recorded" : "not recorded (overwritten)", fill.key, fill.hashes[0],
+        fill.hashes[1], fill.stages, hashes[0], hashes[1], hashes[2], hashes[3], hashes[4],
+        hashes[5], facts.stages, view_id.key, differing, differing != 0 ? ": " : "", words_text,
+        stages_text, in_table ? "found" : "missing", table.hashes[0], table.hashes[1],
+        table.stages);
 }
 
 // --- 0xe2c -------------------------------------------------------------------------------------------
