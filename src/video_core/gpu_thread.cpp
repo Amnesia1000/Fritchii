@@ -130,6 +130,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                         // every 20 us catches what sends no wake and changes no word, such as a
                         // release a shader wrote to the caches.
                         Profile::Scope scope{Profile::Zone::PendingSleep};
+                        const Profile::FrontWaitScope wait_mark{Profile::FrontDid::Pending};
                         const auto now = std::chrono::steady_clock::now();
                         if (now - last_progress < PendingPoll) {
                             const auto poll_end =
@@ -155,6 +156,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     // ~330 times a second and its present waits for the work behind them; on
                     // Windows a sleep still lasts one timer tick, ~0.5 ms), 2 = always yield.
                     Profile::Scope scope{Profile::Zone::PendingSleep};
+                    const Profile::FrontWaitScope wait_mark{Profile::FrontDid::Pending};
                     const int poll = VideoCore::Nx2Debug::Experiment(6);
                     if (poll == 2 || std::chrono::steady_clock::now() - last_progress <
                                          std::chrono::microseconds{500}) {
@@ -182,6 +184,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 }
             } else {
                 Profile::Scope scope{Profile::Zone::Idle};
+                const Profile::FrontWaitScope wait_mark{Profile::FrontDid::Idle};
                 state.queue.PopWait(next, stop_token);
             }
             if (stop_token.stop_requested()) {

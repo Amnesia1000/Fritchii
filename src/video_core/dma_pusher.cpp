@@ -786,6 +786,10 @@ static bool RecordParsedEntries() {
 }
 
 size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset) {
+    // fable_stage_levelpoints 15.7 (profile 2): a GP entry's methods out of "push" (and out of
+    // "resume pending" for a resumed channel's); "push" keeps the entry's fetch and checks.
+    const VideoCommon::Nx2Profile::Scope methods_zone{
+        VideoCommon::Nx2Profile::Zone::FrontMethods, VideoCommon::Nx2Profile::Fine(), false};
     for (size_t index = 0; index < commands.size();) {
         // Data word of methods command
         if (dma_state.method_count && dma_state.non_incrementing) {

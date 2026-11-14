@@ -1296,11 +1296,23 @@ const MemStage::DrawPacket* MemStage::FillDrawHere(Cache& cache_, const DrawFact
         // the storage binds, the texture buffer unbinds, then the geometry and each stage's
         // buffers, each in its own section.
         Fill whole{*this, Site::Draw};
+        // fable_stage_levelpoints 15.7: the fill's steps as fine zones inside "memory fill"
+        // (profile 2), one at a time; the brackets' own work stays in "memory fill".
+        const bool fine = Profile::Fine();
+        std::optional<Profile::Scope> step;
+        const auto zone = [&](Profile::Zone next) {
+            step.reset();
+            if (fine) {
+                step.emplace(next, true, false);
+            }
+        };
         if (ring_fill && ring_pre != nullptr) {
+            zone(Profile::Zone::FillRanges);
             // THREAD = 2: the buffer half of the stage's collected ranges, where FlushCaching is
             // today (the top of PrepareDraw); what it pushes is played with the packet.
             ring_pre(ring_pre_argument);
         }
+        zone(Profile::Zone::FillBindSetup);
         cache_.SetUniformBuffersState(*facts.uniform_masks, facts.uniform_sizes);
         for (u32 stage = 0; stage < 5; ++stage) {
             if ((facts.stages & (1U << stage)) == 0) {
@@ -1331,11 +1343,13 @@ const MemStage::DrawPacket* MemStage::FillDrawHere(Cache& cache_, const DrawFact
             }
         }
         last_entry = ~0U;
+        zone(Profile::Zone::FillGeometry);
         {
             Fill geometry{*this, Site::Geometry};
             cache_.UpdateGraphicsBuffers(is_indexed);
             cache_.BindHostGeometryBuffers(is_indexed);
         }
+        zone(Profile::Zone::FillStages);
         for (u32 stage = 0; stage < 5; ++stage) {
             if ((facts.stages & (1U << stage)) == 0) {
                 continue;
@@ -1346,6 +1360,7 @@ const MemStage::DrawPacket* MemStage::FillDrawHere(Cache& cache_, const DrawFact
             Fill section{*this, Site::Stage, stage};
             cache_.BindHostStageBuffers(stage);
         }
+        zone(Profile::Zone::FillPacket);
         last_entry = ~0U;
         if (logging) {
             if (ring_fill) {

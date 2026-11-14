@@ -172,6 +172,8 @@ inline std::atomic<int> g_delay_handover_us{-1};
 inline std::atomic<int> g_delay_handover_kind{-1};
 /// FRITCHII_MEMSTAGE_RUN_SPIN_US: docs/fritchii/switches.md.
 inline std::atomic<int> g_memstage_run_spin_us{-1};
+/// FRITCHII_MEMSTAGE_SETUP_KEEP: docs/fritchii/switches.md.
+inline std::atomic<int> g_memstage_setup_keep{-1};
 /// FRITCHII_FRONT_RAN_READS: docs/fritchii/switches.md.
 inline std::atomic<int> g_front_ran_reads{-1};
 /// FRITCHII_ACQUIRE_TABLE_FIRST: docs/fritchii/switches.md.

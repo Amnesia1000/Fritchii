@@ -80,6 +80,7 @@ public:
         PassListedFreed,
         PassListedLeft,
         PassSyncTarget,
+        SetupKeepDisagree,
         Count,
     };
 

@@ -251,6 +251,7 @@ public:
         u32 cbuf_offset;
         u32 indirect_offset;
         bool is_written;
+        bool operator==(const FactsSsbo&) const = default;
     };
     static constexpr u32 MaxFactsSsbos = 16;
     struct StagedFacts {
@@ -265,6 +266,9 @@ public:
         std::array<u64, 2> hashes;
         /// The programs' infos, for the handle values the stage reads at its fill.
         std::shared_ptr<const std::array<Shader::Info, 5>> infos;
+        /// FRITCHII_MEMSTAGE_SETUP_KEEP=2: every field, the infos by pointer (one table entry
+        /// hands out one pointer; a new one comes with a new generation).
+        bool operator==(const StagedFacts&) const = default;
     };
 
     /// What FillDraw needs from the graphics pipeline (spec 4.2's StageFacts).
@@ -575,6 +579,11 @@ public:
     void PublishFacts(const ProgramId& id, const void* source, const DrawFacts& facts,
                       bool dynamic_input);
     [[nodiscard]] bool LookupFacts(const ProgramId& id, StagedFacts& out) const;
+    /// The facts table's generation (bumped under its lock at every write): while it holds, a
+    /// lookup of the same registers gives what it gave (FRITCHII_MEMSTAGE_SETUP_KEEP).
+    [[nodiscard]] u64 FactsGeneration() const noexcept {
+        return facts_generation.load(std::memory_order_acquire);
+    }
     [[nodiscard]] const DispatchPacket* HeldDispatch() const noexcept {
         return held == HeldKind::Dispatch ? &dispatch : nullptr;
     }

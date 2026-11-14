@@ -133,6 +133,24 @@ enum class Zone : u32 {
     InlineUpload, ///< Of method: an inline upload's write (AccelerateInlineToMemoryImpl)
     DispatchFill, ///< Of compute: the dispatch's buffer fill (MemStage::FillDispatchHere)
     QmdSignal,    ///< Of method: a QMD signal (scheduler, releases; the dispatch is "compute")
+    // fable_stage_levelpoints 15.7 (fine zones). GPUMem's draw setup (StageFillDraw, inside
+    // "stage draw setup"):
+    SetupWindow,  ///< The window and ring B's room tested before the fill (StageBeforeFill)
+    SetupProgram, ///< The program id and the facts lookup (or FRITCHII_MEMSTAGE_SETUP_KEEP's keep)
+    SetupLevel,   ///< The window's tests: a writing draw, the ranges over GPU-written data
+    SetupLock,    ///< The buffer cache's lock taken (a served call in the wait is its own zone)
+    SetupInputs,  ///< The copy's cache inputs, the repack layout, the draw's number
+    SetupHandles, ///< The draw's raw handle values read (SEAM 3, FillGraphicsHandleValues)
+    // The fill (MemStage::FillDrawHere, inside "memory fill"; the brackets stay there):
+    FillRanges,    ///< The stage's collected constant buffer ranges applied (ring_pre)
+    FillBindSetup, ///< The uniform state, the storage binds, the texture buffer unbinds
+    FillGeometry,  ///< The vertex and index buffers (UpdateGraphicsBuffers, BindHostGeometryBuffers)
+    FillStages,    ///< Each stage's buffers (BindHostStageBuffers; its uniform and storage zones out)
+    FillPacket,    ///< The trackers' record and the packet's push (PushRingDraw)
+    // The front (15.5 row 5: its "push" doubles with the stage on):
+    FrontMethods, ///< Of push and resume pending: a GP entry's methods (ProcessCommands; macros out)
+    Publish,      ///< The split's publishes (GpuSplit::Publish; the wakes out)
+    PublishWake,  ///< Of publish: a wake of the sleeping back or GPUMem (notify)
     Count,
 };
 
@@ -159,6 +177,9 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "stage pairs", "stage methods", "stage packets", "stage draw setup",
     "ring take", "ring take copy", "draw locks", "draw after configure", "ring facts",
     "rest tail", "inline upload", "dispatch fill", "qmd signal",
+    "setup window", "setup program", "setup level tests", "setup lock", "setup inputs",
+    "setup handle values", "fill ranges", "fill bind setup", "fill geometry", "fill stage buffers",
+    "fill packet", "front methods", "publish", "publish wake",
 };
 static_assert(zone_names.back() != nullptr, "a zone without a name");
 
@@ -301,6 +322,25 @@ enum class FineCounter : u32 {
     QmdSignalDispatches2, ///< ... 2-3
     QmdSignalDispatches4, ///< ... 4-7
     QmdSignalDispatches8, ///< ... 8 or more
+    // fable_stage_levelpoints 15.7, for 15.3 row 4's census: the 3D register writes GPUMem's copy
+    // follows (memstage_shadow.cpp, CountWriteGroup), by register group, in this order.
+    StageWritesProgram,     ///< pipelines, program_region
+    StageWritesVertexStreams, ///< vertex_streams, vertex_stream_limits, _instances, _substitute
+    StageWritesVertexAttribs, ///< vertex_attrib_format
+    StageWritesIndexBuffer, ///< index_buffer and its first/subsequent words
+    StageWritesDrawParams,  ///< draw, vertex_buffer, bases, instances, topology, inline indices
+    StageWritesCbBind,      ///< const_buffer's address, size and offset, bind_groups
+    StageWritesCbData,      ///< const_buffer.buffer (the constant buffer data words)
+    StageWritesTextures,    ///< tex_header, tex_sampler, sampler_binding, the bindless slot
+    StageWritesRenderTargets, ///< rt, zeta, surface clip, rt_control, layers, color masks
+    StageWritesViewports,   ///< viewport_transform, viewports, windows, scissors, window origin
+    StageWritesBlend,       ///< blend, blend_per_target, blend color, logic op
+    StageWritesDepthStencil, ///< depth, stencil, depth bias, depth bounds, polygon offset
+    StageWritesRaster,      ///< cull, front face, polygon modes, point and line, alpha test
+    StageWritesTransformFeedback, ///< transform_feedback, stream_out_layout, its enable
+    StageWritesShadowScratch, ///< shadow_scratch, falcon
+    StageWritesOther,       ///< everything else below the macro registers
+    StageWritesExecutable,  ///< Of the above: executable methods (CallMethod's handlers)
     Count,
 };
 
@@ -332,11 +372,35 @@ inline constexpr std::array<const char*, static_cast<size_t>(FineCounter::Count)
         "qmd releases plain", "qmd signals with 0 dispatches", "qmd signals with 1 dispatch",
         "qmd signals with 2-3 dispatches", "qmd signals with 4-7 dispatches",
         "qmd signals with 8+ dispatches",
+        "stage writes: program", "stage writes: vertex streams", "stage writes: vertex attributes",
+        "stage writes: index buffer", "stage writes: draw parameters",
+        "stage writes: constant buffer binds", "stage writes: constant buffer data",
+        "stage writes: textures and samplers", "stage writes: render targets",
+        "stage writes: viewports and scissors", "stage writes: blend",
+        "stage writes: depth and stencil", "stage writes: raster", "stage writes: transform feedback",
+        "stage writes: shadow scratch", "stage writes: other",
+        "stage writes: of them executable",
     };
 static_assert(fine_counter_names.back() != nullptr, "a fine counter without a name");
 
+/// fable_stage_levelpoints 15.7: what the front did while GPUMem waited for its next publish.
+/// The drain sites first (the front finished a wait for the back at that site), then these.
+enum class FrontDid : u32 {
+    Idle = static_cast<u32>(DrainSite::Count), ///< finished an idle wait (no command list)
+    Pending,     ///< finished a pending sleep (a suspended channel's poll gap)
+    WorkingInto, ///< no wait; published as it began a wait for the back (Drain, WaitFor)
+    Working,     ///< no wait; published while working
+    Count,
+};
+inline constexpr size_t FrontWaitKinds = static_cast<size_t>(FrontDid::Count);
+
 struct ThreadData {
     std::array<u64, static_cast<size_t>(FineCounter::Count)> fine_counters{}; ///< TEST
+    /// GPUMem's waits for the front by FrontDid (StageInputWaited): ns, waits; and those
+    /// in which the front finished more than one wait.
+    std::array<u64, FrontWaitKinds> front_wait_ns{};
+    std::array<u64, FrontWaitKinds> front_wait_count{};
+    u64 front_wait_several{};
     std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
     std::array<u64, 64> counters{}; ///< See Counter (static_assert below)
@@ -748,12 +812,75 @@ inline void AddFine(FineCounter counter, u64 amount) {
     }
 }
 
+/// fable_stage_levelpoints 15.7 (profile on): the front's last finished wait, as
+/// (waits finished << 8) | FrontDid, and the site + 1 of a wait for the back it is in (0: none).
+/// Written by the front alone; GPUMem reads them around its waits for the front.
+inline std::atomic<u64> g_front_wait_mark{0};
+inline std::atomic<u32> g_front_in_wait{0};
+
+/// The front: a wait for the back at `site` begins (before the publish that goes with it).
+inline void FrontWaitBegin(DrainSite site) {
+    if (Enabled()) {
+        g_front_in_wait.store(static_cast<u32>(site) + 1, std::memory_order_relaxed);
+    }
+}
+
+/// The front: a wait ended (`kind`: a DrainSite or FrontDid::Idle, ::Pending).
+inline void FrontWaitEnd(u32 kind) {
+    if (Enabled()) {
+        g_front_in_wait.store(0, std::memory_order_relaxed);
+        const u64 waits = (g_front_wait_mark.load(std::memory_order_relaxed) >> 8) + 1;
+        g_front_wait_mark.store((waits << 8) | kind, std::memory_order_release);
+    }
+}
+
+/// The front: marks the end of an idle or pending wait (gpu_thread.cpp) at scope exit.
+class FrontWaitScope {
+public:
+    explicit FrontWaitScope(FrontDid kind_) : kind{kind_} {}
+    ~FrontWaitScope() {
+        FrontWaitEnd(static_cast<u32>(kind));
+    }
+    FrontWaitScope(const FrontWaitScope&) = delete;
+    FrontWaitScope& operator=(const FrontWaitScope&) = delete;
+
+private:
+    FrontDid kind;
+};
+
+/// GPUMem, before a wait for the front: the mark to compare with after it.
+[[nodiscard]] inline u64 FrontWaitMark() {
+    return Enabled() ? g_front_wait_mark.load(std::memory_order_acquire) : 0;
+}
+
+/// GPUMem waited `ns` for the front's publish; `before`: FrontWaitMark() at the wait's start.
+/// The front finished a wait since: that wait's kind (the last one, if several). None: it was
+/// working, and it published either as it began a wait for the back or while working.
+inline void StageInputWaited(u64 before, u64 ns) {
+    if (!Enabled()) {
+        return;
+    }
+    const u64 after = g_front_wait_mark.load(std::memory_order_acquire);
+    size_t kind;
+    if ((after >> 8) != (before >> 8)) {
+        kind = (std::min)(static_cast<size_t>(after & 0xff), FrontWaitKinds - 1);
+        t_data.front_wait_several += (after >> 8) - (before >> 8) > 1 ? 1 : 0;
+    } else if (g_front_in_wait.load(std::memory_order_relaxed) != 0) {
+        kind = static_cast<size_t>(FrontDid::WorkingInto);
+    } else {
+        kind = static_cast<size_t>(FrontDid::Working);
+    }
+    t_data.front_wait_ns[kind] += ns;
+    ++t_data.front_wait_count[kind];
+}
+
 /// The front waited for the back since `start` (Ticks) for `site`.
 inline void AddDrain(DrainSite site, u64 start) {
     if (Enabled()) {
         const auto index = static_cast<size_t>(site);
         t_data.drain_ns[index] += Ticks() - start;
         ++t_data.drain_count[index];
+        FrontWaitEnd(static_cast<u32>(site));
     }
 }
 
@@ -911,6 +1038,33 @@ inline void Report(const char* thread_name = "GPU thread") {
                             static_cast<double>(window) / 1e6);
     }
     LOG_INFO(HW_GPU, "{} per second:{}", thread_name, line);
+    if (std::ranges::any_of(data.front_wait_count, [](u64 count) { return count != 0; })) {
+        // fable_stage_levelpoints 15.7 (GPUMem): its waits for the front's next publish by what
+        // the front did meanwhile (StageInputWaited).
+        static constexpr std::array<const char*, 4> own{
+            "idle (no command list)", "pending sleep", "working, published as it began a wait for "
+            "the back", "working"};
+        static_assert(own.size() == FrontWaitKinds - static_cast<size_t>(DrainSite::Count));
+        std::string kinds;
+        for (size_t i = 0; i < FrontWaitKinds; ++i) {
+            if (data.front_wait_count[i] == 0) {
+                continue;
+            }
+            constexpr size_t Sites = static_cast<size_t>(DrainSite::Count);
+            const std::string name = i < Sites ? fmt::format("waited for the back at {}",
+                                                             drain_site_names[i])
+                                               : std::string{own[i - Sites]};
+            kinds += fmt::format(" {} {:.1f} ms ({:.0f}/s),", name,
+                                 static_cast<double>(data.front_wait_ns[i]) * 1000.0 / window,
+                                 static_cast<double>(data.front_wait_count[i]) * 1e9 / window);
+        }
+        kinds.pop_back();
+        LOG_INFO(HW_GPU,
+                 "{} waits for the front by what the front did before its publish, per second:{}; "
+                 "{:.0f}/s spanned several front waits (the last one counted)",
+                 thread_name, kinds,
+                 static_cast<double>(data.front_wait_several) * 1e9 / window);
+    }
     if (Fine()) {
         // TEST: the fine counters.
         std::string fine;

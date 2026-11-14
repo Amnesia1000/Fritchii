@@ -331,6 +331,9 @@ private:
     bool StageFillDraw(VideoCommon::MemStageShadowEngine& copy, bool is_indexed, u64 position,
                        u64 seq, u64 hash, std::vector<std::pair<u64, std::size_t>>& ranges);
     void StageApplyRanges(std::span<const std::pair<DAddr, std::size_t>> ranges, bool bracket);
+    /// GPUMem, StageFillDraw's join 1: stage_facts for the copy's programs; false on a miss.
+    /// FRITCHII_MEMSTAGE_SETUP_KEEP: kept from the last lookup while its inputs are unchanged.
+    bool StageSetupFacts(const VideoCommon::MemStageShadowEngine& copy);
     /// Step 7 (GPUMem): fills the window must not run ahead of (StageFillDraw).
     bool StageDrawWritesBuffers(const VideoCommon::MemStageShadowEngine& copy) const;
     /// `claim`: the collected ranges a fill claims (FRITCHII_MEMSTAGE_MARKS_AHEAD: marks ahead
@@ -568,6 +571,20 @@ private:
     bool list_fallback_indirect{};
     /// GPUMem's copy of the facts of the draw it fills (the cache keeps a pointer to the sizes).
     MemStage::StagedFacts stage_facts{};
+    /// FRITCHII_MEMSTAGE_SETUP_KEEP (GPUMem): what stage_facts was looked up for, the program
+    /// registers and the facts table's generation then. Valid only after a lookup that found
+    /// the facts.
+    struct SetupKeep {
+        std::array<u64, VideoCommon::MemStageShadow::ProgramWordCount> words{};
+        u64 generation{};
+        bool valid{};
+        // Per setup at SETUP_KEEP != 0, logged every SetupKeepLogEvery setups.
+        u64 setups{};
+        u64 kept{};
+        u64 checked{};
+        u64 disagreed{};
+    };
+    SetupKeep setup_keep{};
     /// GPUMem: the raw handles of the draw it fills (SEAM 3).
     std::vector<u32> stage_handle_values;
 };
