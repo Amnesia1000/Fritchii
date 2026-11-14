@@ -2813,9 +2813,13 @@ void RasterizerVulkan::DrawListWords() {
     // FRITCHII_MEMSTAGE_LIST_DRAWS, a list draw GPUMem served (the entry is not lent): its fill
     // bound and synchronized the two words (the geometry section) and put their buffer in the
     // packet; PrepareDraw takes the packet and Configure records the copy from that buffer
-    // (GraphicsPipeline::ConfigureDraw), without asking the cache. SetDrawIndirect only stores the
-    // pointer a fill of the back's own reads (the cache's Inputs), as before.
-    buffer_cache.SetDrawIndirect(&params);
+    // (GraphicsPipeline::ConfigureDraw), without asking the cache. Nor does it set the cache's
+    // indirect parameters (SetDrawIndirect, what the back's own fill reads): GPUMem runs ahead and
+    // uses the cache meanwhile. Until now every list draw ran lent, with GPUMem parked.
+    const bool served = Link::BackServed();
+    if (!served) {
+        buffer_cache.SetDrawIndirect(&params);
+    }
     mem_player.RequestListDrawArgs(params.list_keep_id);
     bool recorded = false;
     bool mesh = false;
@@ -2839,7 +2843,9 @@ void RasterizerVulkan::DrawListWords() {
     }, true);
     // A draw that was not prepared as far as its copy leaves the request behind.
     (void)mem_player.TakeListDrawArgs();
-    buffer_cache.SetDrawIndirect(nullptr);
+    if (!served) {
+        buffer_cache.SetDrawIndirect(nullptr);
+    }
     ListDraw::Count(!recorded ? ListDraw::g_stats.not_recorded
                     : mesh    ? ListDraw::g_stats.indirect_mesh
                               : ListDraw::g_stats.indirect);
