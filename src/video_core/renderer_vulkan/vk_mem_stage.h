@@ -240,6 +240,9 @@ public:
         Held = 2,       ///< Filled before the texture work, its sections played later
         RestPlayed = 4, ///< Configure did not play every section: PlayRest did
         PostCopyBarrier = 8, ///< THREAD = 2: the fill uploaded; the back records the barrier
+        /// THREAD = 2, a list draw GPUMem served (FRITCHII_MEMSTAGE_LIST_DRAWS): `indirect` is the
+        /// buffer and offset of its two words (the cache's GetDrawIndirectBuffer at the fill).
+        ListArgs = 16,
     };
 
     /// THREAD = 2: a facts table entry (spec 4.4), copied by value from the pipeline.
@@ -497,9 +500,12 @@ public:
     /// GPUMem: FillDraw for a draw the stage serves (after BeginDraw); the packet goes to ring B.
     /// `pre` runs inside the fill bracket first (the buffer half of the stage's ranges).
     /// `values`: the draw's raw handles the stage read at its position (SEAM 3), or null.
+    /// `list_args`: a list draw (the cache's inputs carry its indirect parameters): the packet
+    /// takes the buffer of its two words (ListArgs).
     bool FillRingDraw(Cache& cache, const DrawFacts& facts, bool is_indexed, u64 position, u64 seq,
                       u64 hash, void (*pre)(void*), void* pre_argument,
-                      const std::vector<u32>* values, bool null_pointer_handles);
+                      const std::vector<u32>* values, bool null_pointer_handles,
+                      bool list_args = false);
     /// The back holds a draw packet from ring B.
     [[nodiscard]] bool HeldFromRing() const noexcept {
         return held == HeldKind::Draw && held_ring;
@@ -973,6 +979,7 @@ private:
     void* ring_pre_argument{};
     const std::vector<u32>* ring_values{};
     bool ring_null_pointers{};
+    bool ring_list_args{};
     /// The held draw came from ring B: its packet is played_draw.
     bool held_ring{};
     DrawPacket played_draw{};

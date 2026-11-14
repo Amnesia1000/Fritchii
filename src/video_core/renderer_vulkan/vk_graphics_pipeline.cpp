@@ -2695,10 +2695,26 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     if (buffer_cache.runtime.Player().ListDrawArgsRequested()) {
         // List draws (nx2_list_draw.h): outside the render pass, before the
         // draw's counters start.
-        const auto [list_buffer, list_offset] = buffer_cache.runtime.Seam().Ref(
-            MemStage::Site::ListArgs, [&] { return buffer_cache.GetDrawIndirectBuffer(); });
-        buffer_cache.runtime.Player().RecordListDrawArgs(list_buffer->Handle(), list_offset,
-                                                         IsMeshPipeline());
+        using Link = VideoCommon::MemoryStageLink;
+        MemStage& seam = buffer_cache.runtime.Seam();
+        const MemStage::DrawPacket* const ring_packet =
+            seam.HeldFromRing() ? seam.HeldDraw() : nullptr;
+        if (ring_packet != nullptr && (ring_packet->flags & MemStage::ListArgs) != 0) {
+            // FRITCHII_MEMSTAGE_LIST_DRAWS: GPUMem's fill bound the two words and took their
+            // buffer and offset where this call took them (GetDrawIndirectBuffer after the
+            // geometry section), at the same position in the stream.
+            buffer_cache.runtime.Player().RecordListDrawArgs(
+                ring_packet->indirect.buffer, ring_packet->indirect.offset, IsMeshPipeline());
+            Link::Get().NoteListDrawn();
+        } else {
+            if (Link::BackServed()) [[unlikely]] {
+                Link::Note(Link::Check::ListArgsMissing, "ConfigureDraw");
+            }
+            const auto [list_buffer, list_offset] = seam.Ref(
+                MemStage::Site::ListArgs, [&] { return buffer_cache.GetDrawIndirectBuffer(); });
+            buffer_cache.runtime.Player().RecordListDrawArgs(list_buffer->Handle(), list_offset,
+                                                             IsMeshPipeline());
+        }
     }
     scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
     if (writes_storage) {

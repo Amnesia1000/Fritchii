@@ -539,6 +539,9 @@ private:
     /// The vertex repack mask of the draw being prepared (the stage's, from its packet, at
     /// FRITCHII_MEMSTAGE_THREAD = 2).
     u32 back_repack_mask{};
+    /// FRITCHII_MEMSTAGE_LIST_DRAWS: PrepareDraw set the cache's indirect parameters for a served
+    /// list draw without its packet (the fallback fill); DrawListWords clears them after.
+    bool list_fallback_indirect{};
     /// GPUMem's copy of the facts of the draw it fills (the cache keeps a pointer to the sizes).
     MemStage::StagedFacts stage_facts{};
     /// GPUMem: the raw handles of the draw it fills (SEAM 3).

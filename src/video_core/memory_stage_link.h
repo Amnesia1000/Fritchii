@@ -59,6 +59,19 @@ public:
         FutureWriteUnderImage,
         ServedOverStageWrite,
         FactsKeyCollision,
+        ListReadBack,
+        ListArgsMissing,
+        ListArgsUnasked,
+        Count,
+    };
+
+    /// FRITCHII_MEMSTAGE_LIST_DRAWS: what became of a list draw GPUMem's copy issued (counted).
+    enum class ListDraw : u8 {
+        Served,   ///< filled on GPUMem, the list words' buffer in the packet
+        Closed,   ///< level: the window closed (AHEAD 0) or the switch off
+        ReadBack, ///< level: the back reads the two words on the CPU (DrawListWords' on_cpu)
+        Refused,  ///< level: the fill refused it (facts miss, texel buffers, no room)
+        Forced,   ///< level: every draw is (a frame dump or a trace, g_ring_level_draws)
         Count,
     };
 
@@ -114,6 +127,9 @@ public:
         /// bits, then the cache's answer under its lock).
         bool (*ranges_gpu_written)(void* context, const std::pair<u64, std::size_t>* ranges,
                                    size_t count){};
+        /// GPUMem, at a list draw of its copy: whether the back reads the two words on the CPU
+        /// (RasterizerVulkan::DrawListWords' test, on the copy's registers and draw state).
+        bool (*list_reads_back)(void* context, const MemStageShadowEngine& copy){};
     };
 
     [[nodiscard]] static MemoryStageLink& Get() noexcept {
@@ -264,6 +280,23 @@ public:
             auto& counter = instance.counters.staging_fallbacks;
             counter.store(counter.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
         }
+    }
+    /// The back, at a frame end: FRITCHII_MEMSTAGE_LIST_DRAWS (live, default on).
+    void SetListDraws(bool on);
+    /// GPUMem serves list draws: the switch on and the window open (AHEAD 0 keeps them level).
+    [[nodiscard]] static bool ListDrawsServed() noexcept {
+        return g_list_draws.load(std::memory_order_relaxed) &&
+               g_ahead.load(std::memory_order_relaxed) != 0;
+    }
+    /// GPUMem: a list draw of its copy, served or level (and why).
+    void NoteListDraw(ListDraw what) noexcept {
+        auto& counter = counters.list_draws[static_cast<size_t>(what)];
+        counter.store(counter.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    }
+    /// The back drew a served list draw from its packet's list words buffer.
+    void NoteListDrawn() noexcept {
+        counters.list_drawn.store(counters.list_drawn.load(std::memory_order_relaxed) + 1,
+                                  std::memory_order_relaxed);
     }
     /// The entry turned hard at a constant buffer write onto GPU-written data (counted).
     void NoteWriteLevel() noexcept {
@@ -467,6 +500,7 @@ private:
     static inline std::atomic<bool> g_ring_active{false};
     static inline std::atomic<u32> g_ahead{0};
     static inline std::atomic<bool> g_verify{false};
+    static inline std::atomic<bool> g_list_draws{false};
 
     static inline thread_local bool t_on_stage{};
     /// GPUMem runs a call the back posted (a served call): its syncs go to the back at once.
@@ -614,6 +648,7 @@ private:
         std::atomic<u64> staging_fallbacks{}; ///< GPUMem took a new staging buffer, stream busy
         std::atomic<u64> stage_idles{};
         std::atomic<u64> run_input_waits{};   ///< fps fix 3: a run kept lent at the input's end
+        std::array<std::atomic<u64>, static_cast<size_t>(ListDraw::Count)> list_draws{};
         // The back's.
         alignas(64) std::array<std::atomic<u64>, static_cast<size_t>(HandOff::Count)> calls{};
         std::atomic<u64> call_ns{};
@@ -631,6 +666,7 @@ private:
         std::atomic<u64> back_lock_waits{};   ///< the back waited for the lock GPUMem held
         std::atomic<u64> hook_flushes{};      ///< the back's skipped idle hook, its flush run
         std::atomic<u64> ring_wakes{};        ///< takes that woke GPUMem (window or room wait)
+        std::atomic<u64> list_drawn{};        ///< served list draws drawn from the packet's buffer
         // Either thread's, rare (the must-be-0 checks).
         alignas(64) std::array<std::atomic<u64>, static_cast<size_t>(Check::Count)> checks{};
     };
@@ -699,9 +735,13 @@ private:
         u64 ring_wakes{};
         u64 stage_idles{};
         u64 run_input_waits{};
+        std::array<u64, static_cast<size_t>(ListDraw::Count)> list_draws{};
+        u64 list_drawn{};
     };
     void Take(Snapshot& out) const noexcept;
     Snapshot reported{};
+    /// FRITCHII_MEMSTAGE_LIST_DRAWS's last value logged (-1: none yet).
+    int list_draws_logged{-1};
     u64 last_log_ns{};
     u64 back_run_seen_ns{};
 
