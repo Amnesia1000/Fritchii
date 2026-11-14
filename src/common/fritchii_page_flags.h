@@ -93,6 +93,17 @@ inline DevicePageFlags g_buffer_write_pages;
 /// writes (the same places as g_buffer_write_pages) and TextureCache::WriteMemory. Only the
 /// texture cache's watched-page harvest takes them (TextureCache::TexBankPageGen).
 inline DevicePageFlags g_watch_write_pages;
+/// The bank marks' gate: true while FRITCHII_BANK_FLAGGED or FRITCHII_BANK_CENSUS is non-zero
+/// (set by the bank check, BufferCache::CheckNativeBankPagesTracked). Off, each mark below that
+/// the hot rule made unneeded (the write ring's Note, MemoryManager::Write, unsafe and span
+/// stores reaching Note, the after-store re-mark) is one relaxed load and a branch. The bank check
+/// trusts no snapshot from before the gate opened: it drops them all two frames after.
+inline std::atomic<bool> g_bank_marks{false};
+
+[[nodiscard]] inline bool BankMarks() noexcept {
+    return g_bank_marks.load(std::memory_order_relaxed);
+}
+
 /// Guest stores whose ranges the after-store point could not hold (more than a thread records):
 /// no page flag was set after them. The bank check with FRITCHII_BANK_FLAGGED drops every
 /// snapshot when this moves.

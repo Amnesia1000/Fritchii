@@ -3438,10 +3438,36 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
     // every snapshot is dropped, so each page's next bind takes a new one and marks the page
     // changed. A guest store whose range the after-store point lost (the overflow count) set no
     // flag after its bytes landed: every snapshot is dropped then too.
-    const int flagged = USE_MEMORY_MAPS_FOR_UPLOADS
-                            ? VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_bank_flagged,
-                                                               "FRITCHII_BANK_FLAGGED")
-                            : 0;
+    const int flagged_switch =
+        USE_MEMORY_MAPS_FOR_UPLOADS
+            ? VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_bank_flagged,
+                                               "FRITCHII_BANK_FLAGGED")
+            : 0;
+    // FRITCHII_BANK_CENSUS (counters only): for each change found, what touched the page since
+    // its last compare (NoteNativeBankCensusChange). 2 also turns the write ring on.
+    const int census = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_bank_census,
+                                                        "FRITCHII_BANK_CENSUS");
+    // The bank marks' gate (Common::g_bank_marks): the writers' marks the hot rule made unneeded
+    // are set only while one of the two switches is on. A writer that loaded the gate shut set no
+    // mark, so nothing snapshotted before it opened is trusted: two frames after it opened (every
+    // writer's next load sees it by then) every snapshot is dropped once, and the flagged rule
+    // works only from then on.
+    const bool want_marks = flagged_switch != 0 || census != 0;
+    if (want_marks != native_bank_marks_wanted) [[unlikely]] {
+        native_bank_marks_wanted = want_marks;
+        native_bank_marks_ready = false;
+        native_bank_marks_since = frame_tick;
+        Common::g_bank_marks.store(want_marks, std::memory_order_seq_cst);
+    }
+    if (want_marks && !native_bank_marks_ready &&
+        frame_tick - native_bank_marks_since >= 2) [[unlikely]] {
+        native_bank_marks_ready = true;
+        native_bank_flagged_overflows =
+            Common::g_collected_overflows.load(std::memory_order_seq_cst);
+        ClearNativeBankSnapshots();
+        ++native_bank_flagged_resets;
+    }
+    const int flagged = native_bank_marks_ready ? flagged_switch : 0;
     if (flagged != 0) [[unlikely]] {
         const u64 overflows = Common::g_collected_overflows.load(std::memory_order_seq_cst);
         if (!native_bank_flagged_on || overflows != native_bank_flagged_overflows) {
@@ -3453,10 +3479,6 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
     } else {
         native_bank_flagged_on = false;
     }
-    // FRITCHII_BANK_CENSUS (counters only): for each change found, what touched the page since
-    // its last compare (NoteNativeBankCensusChange). 2 also turns the write ring on.
-    const int census = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_bank_census,
-                                                        "FRITCHII_BANK_CENSUS");
     Core::DevicePageFlags* census_uploads = nullptr;
     if (census != 0 || native_bank_census_ring_wanted) [[unlikely]] {
         const bool want_ring = census >= 2;

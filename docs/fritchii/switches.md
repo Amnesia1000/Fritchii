@@ -675,27 +675,33 @@ The census says, for each change the check finds, what touched the page since it
   ring writer 1,044-1,072, all "GPU write: query-completion" (report values the query cache
   writes into the game's c6 bank when a host query completes, which set no bank flag);
   uploaded since the compare ~1,005; late flag 7-8; unseen 8-9 with 322-334 ring wraps. Fixed
-  by FRITCHII_BANK_FLAGGED's always-on marks (below).
+  by FRITCHII_BANK_FLAGGED's marks (below), whose gate the census opens too: a census run sees
+  the marked writers as flagged.
 
 ### FRITCHII_BANK_FLAGGED
 
 FRITCHII_BANK_FLAGGED (live, default 0; fable_perdraw_b cut 5 step 2). The game's banks keep
 the hot rule (every page that changed in the last 120 frames compared at every bind: ~600,000
 compares per 5 s for c6, 21.7 ms/s on the back) because writers set no flag. The census named
-them; these marks now set the bank check's flags always (also at 0), each after its bytes
-landed:
+them; these marks set the bank check's flags, each after its bytes landed, while the bank marks'
+gate (Common::g_bank_marks) is open, which is while FRITCHII_BANK_FLAGGED or
+FRITCHII_BANK_CENSUS is non-zero (the bank check sets it). Shut, each site is one relaxed load
+and a branch:
 - the write ring's Note (every emulator write to game memory, any thread: query completions,
   immediate and semi-flush report writes, device and GPU block writes, span stores, our own
   constant buffer words, downloads, DMA, blits) marks g_buffer_write_pages;
 - MemoryManager::Write (the 3D engine's stamps, compute and QMD releases) marks it;
 - unsafe guest memory writes (Core::Memory::WriteBlockUnsafe) and in-place span stores
   (GuestMemoryScoped, Core::Memory::NoteHostStore) on rasterizer-cached pages go through the
-  ring's Note now always, not only while the ring or a uniform keep was on;
+  ring's Note also while the gate is open, not only while the ring or a uniform keep is on;
 - the guest store's after-store point (UniformKeepPages::AfterGuestStore) marks
   g_collected_write_pages again for the ranges HandleRasterizerWrite recorded before the store.
   A store whose ranges did not fit (more than 4) moves Common::g_collected_overflows.
-At 0 these only add compares that find what the hot rule would have found (or a real change no
-rule saw); nothing else changes.
+With both switches at 0 nothing changes. Open, the marks only add compares that find what the
+hot rule would have found (or a real change no rule saw). A writer that loaded the gate shut set
+no mark, so no snapshot from before the gate opened is trusted: two frames after it opens (every
+writer's next load sees it by then) the bank check drops every snapshot once, and the flagged
+rule below works only from then on.
 
 With the switch on (Vulkan's mapped uploads only):
 - 1: the constant buffer indices of FRITCHII_BANK_FLAGGED_SLOTS (live, bit n = cn, default 0x40

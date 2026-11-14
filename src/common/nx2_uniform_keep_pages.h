@@ -183,12 +183,15 @@ inline void AfterGuestStoreSlow() noexcept {
     ThreadStores& stores = t_stores;
     // FRITCHII_BANK_FLAGGED: the collected write's page flag again, now that the bytes landed
     // (HandleRasterizerWrite set it before the store; a bank check may have taken it, and its one
-    // recheck passed, before the bytes arrived). Always; a lost range moves the overflow count.
-    if (stores.overflow) [[unlikely]] {
-        g_collected_overflows.fetch_add(1, std::memory_order_seq_cst);
-    }
-    for (u32 i = 0; i < stores.count; ++i) {
-        g_collected_write_pages.Mark(stores.address[i], stores.size[i]);
+    // recheck passed, before the bytes arrived). With the bank marks on; a lost range moves the
+    // overflow count.
+    if (BankMarks()) [[unlikely]] {
+        if (stores.overflow) {
+            g_collected_overflows.fetch_add(1, std::memory_order_seq_cst);
+        }
+        for (u32 i = 0; i < stores.count; ++i) {
+            g_collected_write_pages.Mark(stores.address[i], stores.size[i]);
+        }
     }
     if (AnyKept()) {
         std::atomic_thread_fence(std::memory_order_seq_cst);

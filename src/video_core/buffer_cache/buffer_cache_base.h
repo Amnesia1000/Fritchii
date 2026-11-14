@@ -903,6 +903,11 @@ public:
     bool native_bank_flagged_on = false;
     u64 native_bank_flagged_overflows = 0;
     u64 native_bank_flagged_resets = 0;
+    /// The bank marks' gate (Common::g_bank_marks) as last set, the frame it changed, and whether
+    /// the snapshots were dropped two frames after it opened (the flagged rule waits for that).
+    bool native_bank_marks_wanted = false;
+    bool native_bank_marks_ready = false;
+    u64 native_bank_marks_since = 0;
     /// EDEN_NX2_BANK_SLOT_STATS: the tracked check's counts per constant buffer index (c0..c17),
     /// logged and cleared with native_bank_tracked_stats.
     struct NativeBankSlotStats {

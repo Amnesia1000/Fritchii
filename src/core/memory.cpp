@@ -374,10 +374,12 @@ struct Memory::Impl {
             }
             std::memcpy(ptr, reinterpret_cast<u8 const*>(buffer) + offset, copy_amount);
             VideoCommon::WriteTrack::CloseIfArmed();
-            // EXP92: the after-store point (unsafe writes recorded nothing: noted here, always:
-            // the write ring's Note marks the native bank check's flag, FRITCHII_BANK_FLAGGED).
+            // EXP92: the after-store point (unsafe writes recorded nothing: noted here; also with
+            // the bank marks on, whose flag the write ring's Note sets, FRITCHII_BANK_FLAGGED).
             Common::UniformKeepPages::AfterGuestStore();
-            if (unsafe) [[unlikely]] {
+            if (unsafe && (Common::UniformKeepPages::AnyKept() ||
+                           Common::WriteRing::g_on.load(std::memory_order_relaxed) ||
+                           Common::BankMarks())) [[unlikely]] {
                 NoteUnrecordedStore(GetInteger(current_vaddr), copy_amount);
             }
         });
@@ -1332,7 +1334,7 @@ bool Memory::WriteBlockUnsafe(const Common::ProcessAddress dest_addr, const void
     return impl->WriteBlockImpl(dest_addr, src_buffer, size, true);
 }
 
-void Memory::NoteHostStore(u64 dest_addr, std::size_t size) {
+void Memory::NoteHostStoreSlow(u64 dest_addr, std::size_t size) {
     // Page by page: each CPU page has its own backing. Only rasterizer-cached pages: the others
     // are CPU-modified in the buffer cache's tracker or held by no buffer.
     const u64 end = dest_addr + size;
