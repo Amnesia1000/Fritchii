@@ -230,9 +230,27 @@ public:
 
     size_t MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const;
 
-    /// Bumped after each page table change: lookups cached under one value stay valid until then.
+    /// Bumped at the start and at the end of each page table change: lookups cached under one
+    /// value stay valid until then.
     [[nodiscard]] u64 MapSerial() const {
         return map_serial.load(std::memory_order_acquire);
+    }
+
+    /// A lookup that will be cached under the map counter (a sequence lock's read side): the
+    /// counter and whether a page table change is running, loaded before the lookup.
+    struct MapRead {
+        u64 serial;
+        bool busy;
+    };
+    [[nodiscard]] MapRead BeginMapRead() const {
+        const u64 serial = map_serial.load(std::memory_order_acquire);
+        return {serial, map_changes_running.load(std::memory_order_acquire) != 0};
+    }
+    /// After the lookup: whether it saw whole tables and may be cached under `read.serial`. No
+    /// change was running when it started, and none started since (that bumps the counter).
+    [[nodiscard]] bool MapReadStable(const MapRead& read) const {
+        std::atomic_thread_fence(std::memory_order_acquire);
+        return !read.busy && map_serial.load(std::memory_order_relaxed) == read.serial;
     }
 
     /// Changes whenever this address space or the device memory behind it is mapped or unmapped:
@@ -367,8 +385,32 @@ private:
     mutable std::shared_mutex page_table_lock;
     /// Shared lock of page_table_lock, waiting 2 ms at most.
     [[nodiscard]] bool TryLockPageTableShared() const;
-    /// Bumped after each page table change; readers keep their MappingSnapshot until then.
+    /// Bumped at the start and at the end of each page table change (MapChange); readers keep
+    /// their MappingSnapshot until then.
     std::atomic<u64> map_serial{};
+    /// Page table changes running now (MapChange). A count, not the counter's parity: Switch 2
+    /// maps run on the GPU thread (MapInOrder, RunInOrder) while other mappings run on the
+    /// guest's thread, so two changes can overlap.
+    std::atomic<u32> map_changes_running{};
+    /// Around PageTableOp and BigPageTableOp: the write side of BeginMapRead/MapReadStable.
+    class MapChange {
+    public:
+        explicit MapChange(MemoryManager& manager_) : manager{manager_} {
+            manager.map_changes_running.fetch_add(1, std::memory_order_seq_cst);
+            manager.map_serial.fetch_add(1, std::memory_order_seq_cst);
+            // The table writes below stay after both.
+            std::atomic_thread_fence(std::memory_order_release);
+        }
+        ~MapChange() {
+            manager.map_serial.fetch_add(1, std::memory_order_release);
+            manager.map_changes_running.fetch_sub(1, std::memory_order_release);
+        }
+        MapChange(const MapChange&) = delete;
+        MapChange& operator=(const MapChange&) = delete;
+
+    private:
+        MemoryManager& manager;
+    };
 
     struct ContinuousRun {
         GPUVAddr end;

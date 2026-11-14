@@ -977,23 +977,30 @@ bool OnePage(GPUVAddr address, u64 size) {
 
 /// ResolveStage(address) for a write within one 4 KiB page, through the copy's last page: kept
 /// while the page and the memory map counter (MemoryManager::MapSerial, EXP88's key on the back)
-/// stay the same. A map or unmap changes the tables first and then bumps the counter (release;
-/// MapSerial loads it with acquire), so a word that loads the bumped value sees the new tables
-/// and looks the page up again. The counter is loaded before the lookup (as GpuToCpuAddress's
-/// translation cache does): a lookup that overlaps a remap is kept under the old value and
-/// replaced once the bump shows. Within a 4 KiB page the lookup only shifts by the offset (the
-/// same table entries, the same device page).
+/// stay the same. A map or unmap bumps the counter before its first table write and after its
+/// last (MemoryManager::MapChange), so a word after a change started misses and looks the page
+/// up again, and a lookup that overlapped a change is not kept (BeginMapRead, MapReadStable).
+/// Within a 4 KiB page the lookup only shifts by the offset (the same table entries, the same
+/// device page).
 StageTarget CbTarget(Copy& c, GPUVAddr address) {
     constexpr u64 Page = 0x1000;
     const u64 page = address & ~(Page - 1);
-    const u64 serial = c.memory->MapSerial();
-    if (page != c.cb_page || serial != c.cb_map_serial) [[unlikely]] {
-        c.cb_target = c.memory->ResolveStage(page);
-        c.cb_page = page;
-        c.cb_map_serial = serial;
+    StageTarget target;
+    if (page == c.cb_page && c.memory->MapSerial() == c.cb_map_serial) [[likely]] {
+        target = c.cb_target;
+    } else {
+        // A sequence lock's read: kept only if no page table change ran when the lookup started
+        // and none started before it ended (a change can mark a page mapped before it writes
+        // the page's address). Otherwise used for this word only.
+        const Tegra::MemoryManager::MapRead read = c.memory->BeginMapRead();
+        target = c.memory->ResolveStage(page);
+        if (c.memory->MapReadStable(read)) {
+            c.cb_target = target;
+            c.cb_page = page;
+            c.cb_map_serial = read.serial;
+        }
     }
     const u64 offset = address - page;
-    StageTarget target = c.cb_target;
     target.write_device += offset;
     if (target.device) {
         *target.device += offset;

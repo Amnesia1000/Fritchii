@@ -136,6 +136,9 @@ inline void MemoryManager::SetBigPageContinuous(size_t big_page_index, bool valu
 }
 
 GPUVAddr MemoryManager::PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr dev_addr, size_t size, PTEKind kind, MemoryManager::EntryType entry_type) {
+    // The counter moves before the first table write and after the last (step 7 fps fix 4: a
+    // lookup that overlaps the change is not cached under it, BeginMapRead).
+    const MapChange change{*this};
     [[maybe_unused]] u64 remaining_size{size};
     if (entry_type == EntryType::Mapped) {
         page_table.ReserveRange(gpu_addr, size);
@@ -178,11 +181,11 @@ GPUVAddr MemoryManager::PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr de
     if (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::Bounds)) {
         UpdateContinuousRuns(gpu_addr, size);
     }
-    map_serial.fetch_add(1, std::memory_order_release);
-    return gpu_addr;
+    return gpu_addr; // MapChange bumps the counter again (the end)
 }
 
 GPUVAddr MemoryManager::BigPageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr dev_addr, size_t size, PTEKind kind, MemoryManager::EntryType entry_type) {
+    const MapChange change{*this}; // As PageTableOp's
     [[maybe_unused]] u64 remaining_size{size};
     GPUVAddr modified_start{};
     u64 modified_size{};
@@ -238,8 +241,7 @@ GPUVAddr MemoryManager::BigPageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr
     if (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::Bounds)) {
         UpdateContinuousRuns(gpu_addr, size);
     }
-    map_serial.fetch_add(1, std::memory_order_release);
-    return gpu_addr;
+    return gpu_addr; // MapChange bumps the counter again (the end)
 }
 
 void MemoryManager::BindRasterizer(VideoCore::RasterizerInterface* rasterizer_) {
@@ -352,12 +354,13 @@ std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr gpu_addr) const {
     const u64 page = gpu_addr >> SubpageBits;
     CachedPage* slot = nullptr;
     u64 owner_id = 0;
-    u64 serial = 0;
+    MapRead read{};
     if (use_cache) [[unlikely]] {
         owner_id = (u64{unique_identifier} << 1) | 1; // Never 0, the empty slot
-        serial = map_serial.load(std::memory_order_acquire);
+        read = BeginMapRead();
         slot = &cache[(page ^ (page >> 11)) % CacheSize];
-        if (slot->owner == owner_id && slot->page == page && slot->serial == serial) [[likely]] {
+        if (slot->owner == owner_id && slot->page == page && slot->serial == read.serial)
+            [[likely]] {
             return slot->device_page + (gpu_addr & SubpageMask);
         }
     }
@@ -376,8 +379,10 @@ std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr gpu_addr) const {
                   dev_addr);
         return std::nullopt;
     }
-    if (slot != nullptr) {
-        *slot = CachedPage{owner_id, serial, page, dev_addr - (gpu_addr & SubpageMask)};
+    // Kept only when no page table change overlapped the lookup (it could have read a page
+    // marked mapped before its address was written).
+    if (slot != nullptr && MapReadStable(read)) {
+        *slot = CachedPage{owner_id, read.serial, page, dev_addr - (gpu_addr & SubpageMask)};
     }
     return dev_addr;
 }
