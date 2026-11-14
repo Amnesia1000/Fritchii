@@ -583,6 +583,10 @@ private:
         u64 kept{};
         u64 checked{};
         u64 disagreed{};
+        /// Verify: the table was written between the keep's check and the full lookup (its
+        /// generation moved): not compared; of those, the ones whose facts differed.
+        u64 raced{};
+        u64 raced_differed{};
     };
     SetupKeep setup_keep{};
     /// GPUMem: the raw handles of the draw it fills (SEAM 3).

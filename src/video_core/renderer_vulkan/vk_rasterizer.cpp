@@ -1603,6 +1603,36 @@ bool RasterizerVulkan::StageFillDraw(VideoCommon::MemStageShadowEngine& copy, bo
     return filled;
 }
 
+namespace {
+/// FRITCHII_MEMSTAGE_SETUP_KEEP=2: the fields in which the kept facts and the full lookup's
+/// differ, for the verify's log line.
+std::string DiffStagedFacts(const MemStage::StagedFacts& kept,
+                            const MemStage::StagedFacts& looked) {
+    std::string fields;
+    const auto add = [&fields](bool differs, std::string_view name) {
+        if (differs) {
+            fields += fields.empty() ? "" : ", ";
+            fields += name;
+        }
+    };
+    add(kept.uniform_masks != looked.uniform_masks, "uniform_masks");
+    add(kept.uniform_sizes != looked.uniform_sizes, "uniform_sizes");
+    add(kept.ssbos != looked.ssbos, "ssbos");
+    add(kept.ssbo_counts != looked.ssbo_counts, "ssbo_counts");
+    add(kept.stages != looked.stages, "stages");
+    add(kept.has_texel_buffers != looked.has_texel_buffers, "has_texel_buffers");
+    add(kept.uses_descriptor_buffer != looked.uses_descriptor_buffer, "uses_descriptor_buffer");
+    add(kept.dynamic_vertex_input != looked.dynamic_vertex_input,
+        fmt::format("dynamic_vertex_input {} -> {}", kept.dynamic_vertex_input,
+                    looked.dynamic_vertex_input));
+    add(kept.hashes != looked.hashes,
+        fmt::format("hashes {:016x}/{:016x} -> {:016x}/{:016x}", kept.hashes[0], kept.hashes[1],
+                    looked.hashes[0], looked.hashes[1]));
+    add(kept.infos != looked.infos, "infos (pointer)");
+    return fields.empty() ? std::string{"no field (compare)"} : fields;
+}
+} // Anonymous namespace
+
 bool RasterizerVulkan::StageSetupFacts(const VideoCommon::MemStageShadowEngine& copy) {
     // FRITCHII_MEMSTAGE_SETUP_KEEP (live; fable_stage_levelpoints 15.3 row 3): most draws repeat
     // the programs of the draw before. The lookup's inputs are the copy's program registers (the
@@ -1639,14 +1669,43 @@ bool RasterizerVulkan::StageSetupFacts(const VideoCommon::MemStageShadowEngine& 
         program_id.key = Shadow::ProgramWordsKey(program_id.words);
         if (same) {
             // Verify: the full setup anyway, its answer used, the kept one compared with it.
+            // The keep stands for a lookup at the generation its check read (`generation`): the
+            // same answer a full lookup made at the check gives. A table write that lands
+            // between the check and this lookup (the back publishing another pipeline of the
+            // same programs: a new infos pointer, maybe another dynamic vertex input) moves the
+            // generation; this lookup then answers for a later table, and today's lookup made
+            // a few ns earlier would have answered as the keep did. Those are counted as raced,
+            // not compared (the first 2026-11-14 gate's 32 a window were these).
             MemStage::StagedFacts looked{};
             found = mem_stage.LookupFacts(program_id, looked);
+            const bool raced = mem_stage.FactsGeneration() != generation;
             ++setup_keep.checked;
-            if (!found || !(looked == stage_facts)) [[unlikely]] {
+            const bool differ = !found || !(looked == stage_facts);
+            if (raced) {
+                ++setup_keep.raced;
+                setup_keep.raced_differed += differ ? 1 : 0;
+            } else if (differ) [[unlikely]] {
                 ++setup_keep.disagreed;
                 VideoCommon::MemoryStageLink::Note(
                     VideoCommon::MemoryStageLink::Check::SetupKeepDisagree,
                     found ? "other facts" : "the lookup missed");
+            }
+            if (differ) [[unlikely]] {
+                // Which fields: the first 16 of each kind (raced or not) in the log.
+                static u32 logged_raced = 0;
+                static u32 logged_disagreed = 0;
+                u32& logged = raced ? logged_raced : logged_disagreed;
+                if (logged < 16) {
+                    ++logged;
+                    LOG_WARNING(HW_GPU,
+                                "Memory stage draw setup verify (FRITCHII_MEMSTAGE_SETUP_KEEP=2): "
+                                "{}: {} (generation at the check {}, after the lookup {})",
+                                raced ? "raced with a table write, not counted"
+                                      : "disagreed (must be 0)",
+                                found ? DiffStagedFacts(stage_facts, looked)
+                                      : std::string{"the lookup missed"},
+                                generation, mem_stage.FactsGeneration());
+                }
             }
             if (found) {
                 stage_facts = std::move(looked);
@@ -1662,13 +1721,16 @@ bool RasterizerVulkan::StageSetupFacts(const VideoCommon::MemStageShadowEngine& 
     if (setup_keep.setups >= SetupKeepLogEvery) [[unlikely]] {
         LOG_INFO(HW_GPU,
                  "Memory stage draw setup (FRITCHII_MEMSTAGE_SETUP_KEEP={}): {} setups, facts kept "
-                 "{}, verified {}, disagreed {} (must be 0)",
+                 "{}, verified {}, disagreed {} (must be 0), raced with a table write {} (not "
+                 "compared; {} of them differed)",
                  keep, setup_keep.setups, setup_keep.kept, setup_keep.checked,
-                 setup_keep.disagreed);
+                 setup_keep.disagreed, setup_keep.raced, setup_keep.raced_differed);
         setup_keep.setups = 0;
         setup_keep.kept = 0;
         setup_keep.checked = 0;
         setup_keep.disagreed = 0;
+        setup_keep.raced = 0;
+        setup_keep.raced_differed = 0;
     }
     return found;
 }
