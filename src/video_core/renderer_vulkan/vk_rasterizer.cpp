@@ -1377,16 +1377,29 @@ bool RasterizerVulkan::StageFillDraw(VideoCommon::MemStageShadowEngine& copy, bo
                                      u64 position, u64 seq, u64 hash,
                                      std::vector<std::pair<u64, std::size_t>>& ranges) {
     using Link = VideoCommon::MemoryStageLink;
+    namespace Profile = VideoCommon::Nx2Profile;
     Link& link = Link::Get();
+    // fable_stage_levelpoints 15.7: the setup's steps as fine zones (profile 2), one at a time.
+    const bool fine = Profile::Fine();
+    std::optional<Profile::Scope> step;
+    const auto zone = [&](Profile::Zone next) {
+        step.reset();
+        if (fine) {
+            step.emplace(next, true, false);
+        }
+    };
+    zone(Profile::Zone::SetupWindow);
     // Step 7: the window and room in ring B, tested here, before a packet (not per entry).
     if (!link.StageBeforeFill(position)) {
         return false; // GPUMem is stopping: the draw is left to the back
     }
+    zone(Profile::Zone::SetupProgram);
     // Join 1 (spec 4.4): a miss leaves the draw to the back, which publishes the facts.
     if (!StageSetupFacts(copy)) {
         link.NoteLevelDraw(4);
         return false;
     }
+    step.reset();
     if (stage_facts.has_texel_buffers) {
         link.NoteLevelDraw(2); // LateFill: the texture buffer binds need the texture cache
         return false;
@@ -1400,6 +1413,7 @@ bool RasterizerVulkan::StageFillDraw(VideoCommon::MemStageShadowEngine& copy, bo
         return false;
     }
     if (Link::Ahead() != 0) [[unlikely]] {
+        zone(Profile::Zone::SetupLevel);
         // Step 7, the window open: the back answers its served calls (a read flush's download, a
         // gather's claims, MustFlushRegion) from the cache as GPUMem has it. That is the back's
         // answer while no packet ahead of the back changes what those calls read: the buffers'
@@ -1451,10 +1465,12 @@ bool RasterizerVulkan::StageFillDraw(VideoCommon::MemStageShadowEngine& copy, bo
             return false; // GPUMem is stopping: the draw is left to the back
         }
     }
+    zone(Profile::Zone::SetupLock);
     // A clean point: while it waits for the lock the back holds, GPUMem serves the back's call.
     std::optional<Link::CleanPoint> clean{std::in_place};
     std::scoped_lock lock{buffer_cache.mutex};
     clean.reset();
+    zone(Profile::Zone::SetupInputs);
     // FRITCHII_MEMSTAGE_MARKS_AHEAD: the fill's marks are keyed with the push index of the
     // packet it makes; a fill whose packet never goes takes them back (under the lock).
     const bool marks_fill = buffer_cache.MarksAhead();
@@ -1514,6 +1530,7 @@ bool RasterizerVulkan::StageFillDraw(VideoCommon::MemStageShadowEngine& copy, bo
     const std::vector<u32>* values = nullptr;
     const bool null_pointer_handles = VideoCore::Nx2Debug::Experiment(21) != 0;
     if (mem_stage.ValuesByValue() && stage_facts.infos != nullptr) {
+        zone(Profile::Zone::SetupHandles);
         stage_handle_values.clear();
         const auto& stages = copy.state.shader_stages;
         using Cbufs = std::remove_cvref_t<decltype(stages[0].const_buffers)>;
@@ -1526,6 +1543,7 @@ bool RasterizerVulkan::StageFillDraw(VideoCommon::MemStageShadowEngine& copy, bo
             [this](u32 raw) { stage_handle_values.push_back(raw); });
         values = &stage_handle_values;
     }
+    step.reset(); // the fill has zones of its own ("memory fill" and its fine zones)
     struct Pre {
         RasterizerVulkan* self;
         std::vector<std::pair<u64, std::size_t>>* ranges;

@@ -1242,6 +1242,40 @@ session after a catch-up could not finish (below; logged).
   and the facts published under the stage's program key), "draw after configure" (the
   trackers, traces and dumps between Configure and dynamic state) and "rest tail" (PlayRest after
   its play: the held flags, the ticks mark, the watch count).
+- work\fable_stage_levelpoints.md 15.7's zones and counters (EDEN_NX2_GPU_PROFILE=2 unless said):
+  - Inside "stage draw setup" (StageFillDraw): "setup window" (StageBeforeFill), "setup program"
+    (the program id and the facts lookup, or FRITCHII_MEMSTAGE_SETUP_KEEP's keep), "setup level
+    tests" (window open: a writing draw, the ranges over GPU-written data; StageLevel's waits are
+    "stage wait"), "setup lock" (the buffer cache's lock taken), "setup inputs" (the copy's cache
+    inputs, the repack layout, the draw's number) and "setup handle values" (SEAM 3's raw
+    handles, read before the fill). What stays in "stage draw setup" is StageDraw's own tests.
+  - Inside "memory fill" (FillDrawHere, on GPUMem and on the back): "fill ranges" (the stage's
+    collected constant buffer ranges applied), "fill bind setup" (the uniform state, the storage
+    binds, the texture buffer unbinds), "fill geometry" (vertex and index buffers), "fill stage
+    buffers" (BindHostStageBuffers; its "uniform buffers" and "stage storage buffers" zones stay
+    their own) and "fill packet" (the trackers' record and the push). "memory fill" keeps the
+    brackets (the arena, the packet number, the counters).
+  - GPUMem's fine counters "stage writes: <group>": the 3D register writes its copy follows, by
+    register group (program, vertex streams, vertex attributes, index buffer, draw parameters,
+    constant buffer binds, constant buffer data, textures and samplers, render targets,
+    viewports and scissors, blend, depth and stencil, raster, transform feedback, shadow scratch,
+    other), and "stage writes: of them executable". For 15.3 row 4's census: the groups the fill
+    never reads are what following only the read set would skip. Counted where they arrive
+    (StateWrite, PairsFast, CallMethod's executable writes, CallMultiMethod's constant buffer
+    runs); inline index runs of CallMultiMethod are not counted.
+  - "GPU memory thread waits for the front by what the front did before its publish, per second"
+    (profile 1 or 2): GPUMem's waits for the front's next publish (the "the front" wait), by
+    what the front did meanwhile: "waited for the back at <site>" (it finished a drain or a wait
+    for writers at that site: its own wait held GPUMem's), "idle (no command list)", "pending
+    sleep" (a suspended channel's poll gap), "working, published as it began a wait for the back"
+    (no wait finished; the publish that ended GPUMem's wait was a drain's), "working". A wait in
+    which the front finished several waits counts under the last one ("spanned several front
+    waits"). Ring-full waits (WaitForSpace) are not marked.
+  - The front's "push" (15.5 row 5): "front methods" (a GP entry's methods, ProcessCommands, out of
+    "push" and out of "resume pending" for a resumed channel's; macros stay "macro"), "publish"
+    (GpuSplit::Publish when it publishes; its calls are the publishes a second) and "publish wake"
+    (the publish woke the sleeping back or GPUMem: a notify). What stays in "push" is the entry's
+    fetch and checks (list writers' waits are "writer wait").
 - The second fps fixes (window open only): GPUMem's wait for the front spins about 200 us before
   it sleeps (level mode keeps about 2,000 pauses; the link line's "slept n/s" adds how many of
   those sleeps waited for the front); the back prefetches the first 1 KiB of the next packet in

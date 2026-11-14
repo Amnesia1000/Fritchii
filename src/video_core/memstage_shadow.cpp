@@ -990,8 +990,176 @@ void DirtyStore(Copy& c, u32 method, u32 value) {
     }
 }
 
+/// fable_stage_levelpoints 15.7, for 15.3 row 4's census (EDEN_NX2_GPU_PROFILE=2): the 3D
+/// register writes the copy follows by register group (Nx2Profile::FineCounter::StageWrites*, in
+/// WriteGroup's order). Counted where they arrive: StateWrite, PairsFast's loop, CallMethod's
+/// executable writes, CallMultiMethod's word runs.
+enum class WriteGroup : u8 {
+    Program,
+    VertexStreams,
+    VertexAttribs,
+    IndexBuffer,
+    DrawParams,
+    CbBind,
+    CbData,
+    Textures,
+    RenderTargets,
+    Viewports,
+    Blend,
+    DepthStencil,
+    Raster,
+    TransformFeedback,
+    ShadowScratch,
+    Other,
+    Count,
+};
+static_assert(static_cast<u32>(Nx2Profile::FineCounter::StageWritesOther) -
+                  static_cast<u32>(Nx2Profile::FineCounter::StageWritesProgram) + 1 ==
+              static_cast<u32>(WriteGroup::Count));
+
+const std::array<u8, MacroRegistersStart>& WriteGroups() {
+    static const std::array<u8, MacroRegistersStart> groups = [] {
+        std::array<u8, MacroRegistersStart> table;
+        table.fill(static_cast<u8>(WriteGroup::Other));
+        const auto mark = [&table](WriteGroup group, size_t first, size_t bytes) {
+            const size_t words = (std::max)(bytes / sizeof(u32), size_t{1});
+            for (size_t i = first; i < first + words && i < table.size(); ++i) {
+                table[i] = static_cast<u8>(group);
+            }
+        };
+#define STAGE_WRITE_GROUP(group, field)                                                            \
+    mark(WriteGroup::group, MAXWELL3D_REG_INDEX(field), sizeof(std::declval<const Regs&>().field))
+        STAGE_WRITE_GROUP(Program, pipelines);
+        STAGE_WRITE_GROUP(Program, program_region);
+        STAGE_WRITE_GROUP(VertexStreams, vertex_streams);
+        STAGE_WRITE_GROUP(VertexStreams, vertex_stream_limits);
+        STAGE_WRITE_GROUP(VertexStreams, vertex_stream_instances);
+        STAGE_WRITE_GROUP(VertexStreams, vertex_stream_substitute);
+        STAGE_WRITE_GROUP(VertexAttribs, vertex_attrib_format);
+        STAGE_WRITE_GROUP(IndexBuffer, index_buffer);
+        STAGE_WRITE_GROUP(IndexBuffer, index_buffer32_first);
+        STAGE_WRITE_GROUP(IndexBuffer, index_buffer16_first);
+        STAGE_WRITE_GROUP(IndexBuffer, index_buffer8_first);
+        STAGE_WRITE_GROUP(IndexBuffer, index_buffer32_subsequent);
+        STAGE_WRITE_GROUP(IndexBuffer, index_buffer16_subsequent);
+        STAGE_WRITE_GROUP(IndexBuffer, index_buffer8_subsequent);
+        STAGE_WRITE_GROUP(DrawParams, draw);
+        STAGE_WRITE_GROUP(DrawParams, vertex_buffer);
+        STAGE_WRITE_GROUP(DrawParams, vertex_id_base);
+        STAGE_WRITE_GROUP(DrawParams, global_base_vertex_index);
+        STAGE_WRITE_GROUP(DrawParams, global_base_instance_index);
+        STAGE_WRITE_GROUP(DrawParams, vertex_array_instance_first);
+        STAGE_WRITE_GROUP(DrawParams, vertex_array_instance_subsequent);
+        STAGE_WRITE_GROUP(DrawParams, primitive_topology_control);
+        STAGE_WRITE_GROUP(DrawParams, topology_override);
+        STAGE_WRITE_GROUP(DrawParams, draw_inline_index);
+        STAGE_WRITE_GROUP(DrawParams, inline_index_2x16);
+        STAGE_WRITE_GROUP(DrawParams, inline_index_4x8);
+        STAGE_WRITE_GROUP(DrawParams, primitive_restart);
+        STAGE_WRITE_GROUP(DrawParams, draw_auto_byte_count);
+        STAGE_WRITE_GROUP(DrawParams, draw_auto_stride);
+        STAGE_WRITE_GROUP(DrawParams, draw_auto_start_byte_count);
+        STAGE_WRITE_GROUP(CbBind, const_buffer);
+        STAGE_WRITE_GROUP(CbBind, bind_groups);
+        STAGE_WRITE_GROUP(CbData, const_buffer.buffer); // after const_buffer: its data words
+        STAGE_WRITE_GROUP(Textures, tex_header);
+        STAGE_WRITE_GROUP(Textures, tex_sampler);
+        STAGE_WRITE_GROUP(Textures, sampler_binding);
+        STAGE_WRITE_GROUP(Textures, bindless_texture_const_buffer_slot);
+        STAGE_WRITE_GROUP(RenderTargets, rt);
+        STAGE_WRITE_GROUP(RenderTargets, zeta);
+        STAGE_WRITE_GROUP(RenderTargets, zeta_size);
+        STAGE_WRITE_GROUP(RenderTargets, zeta_enable);
+        STAGE_WRITE_GROUP(RenderTargets, rt_control);
+        STAGE_WRITE_GROUP(RenderTargets, rt_layer);
+        STAGE_WRITE_GROUP(RenderTargets, surface_clip);
+        STAGE_WRITE_GROUP(RenderTargets, anti_alias_samples_mode);
+        STAGE_WRITE_GROUP(RenderTargets, color_mask);
+        STAGE_WRITE_GROUP(RenderTargets, color_mask_common);
+        STAGE_WRITE_GROUP(RenderTargets, framebuffer_srgb);
+        STAGE_WRITE_GROUP(Viewports, viewport_transform);
+        STAGE_WRITE_GROUP(Viewports, viewports);
+        STAGE_WRITE_GROUP(Viewports, windows);
+        STAGE_WRITE_GROUP(Viewports, scissor_test);
+        STAGE_WRITE_GROUP(Viewports, window_offset_x);
+        STAGE_WRITE_GROUP(Viewports, window_offset_y);
+        STAGE_WRITE_GROUP(Viewports, window_origin);
+        STAGE_WRITE_GROUP(Viewports, viewport_clip_control);
+        STAGE_WRITE_GROUP(Viewports, viewport_scale_offset_enabled);
+        STAGE_WRITE_GROUP(Viewports, viewport_pixel_center);
+        STAGE_WRITE_GROUP(Viewports, clip_id_extent);
+        STAGE_WRITE_GROUP(Blend, blend);
+        STAGE_WRITE_GROUP(Blend, blend_per_target);
+        STAGE_WRITE_GROUP(Blend, blend_color);
+        STAGE_WRITE_GROUP(Blend, blend_per_target_enabled);
+        STAGE_WRITE_GROUP(Blend, iterated_blend);
+        STAGE_WRITE_GROUP(Blend, logic_op);
+        STAGE_WRITE_GROUP(DepthStencil, depth_test_enable);
+        STAGE_WRITE_GROUP(DepthStencil, depth_write_enabled);
+        STAGE_WRITE_GROUP(DepthStencil, depth_test_func);
+        STAGE_WRITE_GROUP(DepthStencil, depth_mode);
+        STAGE_WRITE_GROUP(DepthStencil, depth_bounds);
+        STAGE_WRITE_GROUP(DepthStencil, depth_bounds_enable);
+        STAGE_WRITE_GROUP(DepthStencil, depth_bias);
+        STAGE_WRITE_GROUP(DepthStencil, slope_scale_depth_bias);
+        STAGE_WRITE_GROUP(DepthStencil, depth_bias_clamp);
+        STAGE_WRITE_GROUP(DepthStencil, stencil_enable);
+        STAGE_WRITE_GROUP(DepthStencil, stencil_front_op);
+        STAGE_WRITE_GROUP(DepthStencil, stencil_front_ref);
+        STAGE_WRITE_GROUP(DepthStencil, stencil_front_func_mask);
+        STAGE_WRITE_GROUP(DepthStencil, stencil_front_mask);
+        STAGE_WRITE_GROUP(DepthStencil, stencil_back_op);
+        STAGE_WRITE_GROUP(DepthStencil, stencil_back_ref);
+        STAGE_WRITE_GROUP(DepthStencil, stencil_back_mask);
+        STAGE_WRITE_GROUP(DepthStencil, stencil_back_func_mask);
+        STAGE_WRITE_GROUP(DepthStencil, stencil_two_side_enable);
+        STAGE_WRITE_GROUP(DepthStencil, polygon_offset_point_enable);
+        STAGE_WRITE_GROUP(DepthStencil, polygon_offset_line_enable);
+        STAGE_WRITE_GROUP(DepthStencil, polygon_offset_fill_enable);
+        STAGE_WRITE_GROUP(Raster, gl_cull_test_enabled);
+        STAGE_WRITE_GROUP(Raster, gl_front_face);
+        STAGE_WRITE_GROUP(Raster, gl_cull_face);
+        STAGE_WRITE_GROUP(Raster, polygon_mode_front);
+        STAGE_WRITE_GROUP(Raster, polygon_mode_back);
+        STAGE_WRITE_GROUP(Raster, point_size);
+        STAGE_WRITE_GROUP(Raster, line_width_smooth);
+        STAGE_WRITE_GROUP(Raster, line_width_aliased);
+        STAGE_WRITE_GROUP(Raster, fill_mode);
+        STAGE_WRITE_GROUP(Raster, shade_mode);
+        STAGE_WRITE_GROUP(Raster, alpha_test_enabled);
+        STAGE_WRITE_GROUP(Raster, alpha_test_ref);
+        STAGE_WRITE_GROUP(Raster, alpha_test_func);
+        STAGE_WRITE_GROUP(Raster, rasterize_enable);
+        STAGE_WRITE_GROUP(Raster, user_clip_enable);
+        STAGE_WRITE_GROUP(Raster, provoking_vertex);
+        STAGE_WRITE_GROUP(Raster, point_sprite_enable);
+        STAGE_WRITE_GROUP(Raster, anti_alias_enable);
+        STAGE_WRITE_GROUP(TransformFeedback, transform_feedback);
+        STAGE_WRITE_GROUP(TransformFeedback, stream_out_layout);
+        STAGE_WRITE_GROUP(TransformFeedback, transform_feedback_enabled);
+        STAGE_WRITE_GROUP(ShadowScratch, shadow_scratch);
+        STAGE_WRITE_GROUP(ShadowScratch, falcon);
+#undef STAGE_WRITE_GROUP
+        return table;
+    }();
+    return groups;
+}
+
+/// `amount` writes to `method` arrived at the copy (profile 2 only).
+void CountWriteGroup(u32 method, u64 amount = 1) {
+    if (!Nx2Profile::Fine()) [[likely]] {
+        return;
+    }
+    const auto& groups = WriteGroups();
+    const u32 group = method < groups.size() ? groups[method] : static_cast<u32>(WriteGroup::Other);
+    Nx2Profile::AddFine(static_cast<Nx2Profile::FineCounter>(
+                            static_cast<u32>(Nx2Profile::FineCounter::StageWritesProgram) + group),
+                        amount);
+}
+
 /// Maxwell3D::WriteStateRegister (and ConsumeSinkImpl, ApplyPairs, ApplyFrontDelta per write).
 void StateWrite(Copy& c, u32 method, u32 argument) {
+    CountWriteGroup(method);
     const u32 value = ShadowRam(*c.e, method, argument);
     if (!c.skip_same || c.e->regs.reg_array[method] != value) {
         DirtyStore(c, method, value);
@@ -1020,6 +1188,12 @@ void PairsFast(Copy& c, const u64* writes, u32 count) {
     }
     if (i == count) {
         return;
+    }
+    if (Nx2Profile::Fine()) [[unlikely]] {
+        // The census (CountWriteGroup) of the writes the loop below applies, outside the loop.
+        for (u32 k = i; k < count; ++k) {
+            CountWriteGroup(static_cast<u32>(writes[k] & 0xffff));
+        }
     }
     const auto& table0 = (*c.tables)[0];
     const auto& table1 = (*c.tables)[1];
@@ -1873,6 +2047,10 @@ void CallMethod(State& s, Copy& c, u32 method, u32 argument) {
     if (MethodKindOf(c, method) == MethodKind::Hard) {
         Hard(s, s.entry_type, method);
     }
+    if (Nx2Profile::Fine()) [[unlikely]] {
+        CountWriteGroup(method);
+        Nx2Profile::AddFine(Nx2Profile::FineCounter::StageWritesExecutable, 1);
+    }
     const u32 value = ShadowRam(*c.e, method, argument);
     DirtyStore(c, method, value);
     MethodCall(s, c, method, value, argument);
@@ -1889,6 +2067,11 @@ void CallMultiMethod(State& s, Copy& c, u32 method, const u32* words, u32 amount
         Hard(s, s.entry_type, method);
     }
     if (method - CbData < 16) {
+        // Executable words that skip CallMethod: counted here (the census, profile 2).
+        if (Nx2Profile::Fine()) [[unlikely]] {
+            CountWriteGroup(method, amount);
+            Nx2Profile::AddFine(Nx2Profile::FineCounter::StageWritesExecutable, amount);
+        }
         return ConstBufferWords(s, c, amount, words);
     }
     switch (method) {

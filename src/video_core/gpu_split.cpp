@@ -499,6 +499,10 @@ void GpuSplit::Publish() {
     if (published_local == write_position) {
         return;
     }
+    // fable_stage_levelpoints 15.7: the front's "push" doubles with the stage on. The publishes
+    // that publish (their count: the zone's calls) and their wakes (PublishWake, in
+    // MemoryStageLink::NotePublished too) are zones of their own (profile 2).
+    const Nx2Profile::Scope zone{Nx2Profile::Zone::Publish, Nx2Profile::Fine(), false};
     if (Nx2SplitStats::Enabled()) [[unlikely]] {
         Nx2SplitStats::NotePublish(write_position - published_local);
     }
@@ -507,6 +511,8 @@ void GpuSplit::Publish() {
     publish_waiting = (VideoCore::Nx2Debug::Experiment(39) & 1) != 0;
     published.store(write_position, std::memory_order_seq_cst);
     if (back_waiting.load(std::memory_order_seq_cst)) {
+        const Nx2Profile::Scope wake_zone{Nx2Profile::Zone::PublishWake, Nx2Profile::Fine(),
+                                          false};
         wake.fetch_add(1, std::memory_order_seq_cst);
         wake.notify_one();
     }
@@ -562,6 +568,8 @@ void GpuSplit::Drain(DrainSite site) {
     if (consumed_cache == write_position) {
         return;
     }
+    // Profile on: GPUMem's wait for this publish counts as the front's start of a wait (15.7).
+    Nx2Profile::FrontWaitBegin(site);
     Publish();
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
     // "behind": the ring words the back had left to run, which tells a slow back from a front
@@ -1338,6 +1346,7 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
     Common::Nx2Timeline::ArgSpan timeline_span{drain_site_names[static_cast<size_t>(site)],
                                                {"behind", target - consumed_cache}};
     wait_target.store(target, std::memory_order_seq_cst);
+    Nx2Profile::FrontWaitBegin(site);
     Publish();
     const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Ticks() : 0;
     const u64 begin_ns = Common::Nx2Hitch::NowNs();

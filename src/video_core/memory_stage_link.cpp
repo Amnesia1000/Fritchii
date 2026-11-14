@@ -1198,6 +1198,9 @@ void MemoryStageLink::NoteConsumed(u64 position) noexcept {
 void MemoryStageLink::NotePublished() noexcept {
     if (g_ring_active.load(std::memory_order_relaxed) &&
         stage_sleeping.load(std::memory_order_seq_cst)) {
+        // The front's publish wakes GPUMem (fable_stage_levelpoints 15.7, profile 2).
+        const Nx2Profile::Scope wake_zone{Nx2Profile::Zone::PublishWake, Nx2Profile::Fine(),
+                                          false};
         WakeStage();
     }
 }
@@ -1341,6 +1344,9 @@ bool MemoryStageLink::StageWaitFor(std::stop_token& stop, StageWait reason, u64 
         spin_ns = static_cast<u64>(std::clamp(us, 0, 10'000)) * 1000;
     }
     const bool timed_spin = spin_ns != 0;
+    // fable_stage_levelpoints 15.7 (profile on): the wait for the front, by what the front did
+    // until the publish that ended it (Nx2Profile::StageInputWaited).
+    const u64 front_mark = reason == StageWait::Input ? Nx2Profile::FrontWaitMark() : 0;
     u64 spin_from = start;
     bool ok = true;
     bool waited_any = false;
@@ -1400,6 +1406,9 @@ bool MemoryStageLink::StageWaitFor(std::stop_token& stop, StageWait reason, u64 
     }
     const u64 ns = LinkNowNs() - start;
     LinkBump(counters.stage_wait_ns[static_cast<size_t>(reason)], ns);
+    if (reason == StageWait::Input && waited_any) {
+        Nx2Profile::StageInputWaited(front_mark, ns);
+    }
     if (waited != nullptr) {
         *waited += ns;
     }
