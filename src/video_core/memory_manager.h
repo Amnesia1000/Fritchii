@@ -253,6 +253,54 @@ public:
         return !read.busy && map_serial.load(std::memory_order_relaxed) == read.serial;
     }
 
+    /// FRITCHII_BIND_ADDR_MEMO: one remembered translation of one small GPU page (page_bits),
+    /// kept by its user (a vertex stream, the index buffer, a uniform slot).
+    struct TranslationMemo {
+        size_t as_id{~size_t{0}}; ///< unique_identifier of the manager it was looked up in
+        u64 serial{};             ///< map_serial of a stable lookup (MapReadStable)
+        u64 page{~u64{0}};        ///< gpu_addr >> page_bits
+        DAddr device_page{};      ///< What GpuToCpuAddress gives for the page's first byte
+    };
+    /// Counts for the "Bind address memo" line (the caller's thread only).
+    struct TranslationMemoStats {
+        u64 hits{};
+        u64 lookups{};  ///< Misses: GpuToCpuAddress ran
+        u64 unstable{}; ///< Misses not kept: a page table change overlapped the lookup
+    };
+    /// GpuToCpuAddress(gpu_addr) through `memo`. A hit needs the same manager, the same small
+    /// page and an unmoved map_serial: every page table change (PageTableOp, BigPageTableOp:
+    /// Map, MapSparse, Unmap, remaps) bumps it before its first table write and after its last,
+    /// so a hit returns what the walk returns now. Within one small page the translation is
+    /// linear (the page and big page tables map whole small pages), so the page's base plus the
+    /// offset is the walk's result. Unmapped results are not kept. A lookup is kept only when no
+    /// change overlapped it (BeginMapRead, MapReadStable), as the EXP63 page cache does.
+    [[nodiscard]] std::optional<DAddr> GpuToCpuAddressMemo(GPUVAddr gpu_addr, TranslationMemo& memo,
+                                                          TranslationMemoStats& stats) const {
+        const u64 page = gpu_addr >> page_bits;
+        if (memo.page == page && memo.as_id == unique_identifier &&
+            memo.serial == map_serial.load(std::memory_order_acquire)) {
+            ++stats.hits;
+            return memo.device_page + (gpu_addr & page_mask);
+        }
+        ++stats.lookups;
+        const MapRead read = BeginMapRead();
+        const std::optional<DAddr> device_addr = GpuToCpuAddress(gpu_addr);
+        if (device_addr) {
+            if (MapReadStable(read)) {
+                memo = TranslationMemo{
+                    .as_id = unique_identifier,
+                    .serial = read.serial,
+                    .page = page,
+                    .device_page = *device_addr - (gpu_addr & page_mask),
+                };
+            } else {
+                ++stats.unstable;
+                memo.page = ~u64{0};
+            }
+        }
+        return device_addr;
+    }
+
     /// Changes whenever this address space or the device memory behind it is mapped or unmapped:
     /// a host pointer GetPointer returned is only good while it stays the same.
     [[nodiscard]] u64 HostPointerSerial() const {

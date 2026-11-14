@@ -1374,6 +1374,35 @@ sleeps, a system call: about 12 ms/s on the back, since the worker waits about h
 - Expected: 6 to 11 ms/s on the back (most of the notifies), at the price of the worker's spin
   time shown on the line.
 
+### FRITCHII_BIND_ADDR_MEMO
+
+FRITCHII_BIND_ADDR_MEMO (live, default 0 = exactly as before; fable_perdraw_b 3.7).
+GpuToCpuAddress costs the back about 30 ms/s, 16 of it in the vertex, index and uniform binds
+(UpdateVertexBuffer 8.4, BindGraphicsUniformBuffer 4.1, UpdateIndexBuffer 3.5), which translate
+the same few pages again and again.
+- 1: each vertex stream, the index buffer and each graphics uniform slot (stage, slot) keeps its
+  last translation: the manager (unique_identifier), the small GPU page (page_bits), its device
+  page and the manager's map_serial when it was looked up (Tegra::MemoryManager::
+  GpuToCpuAddressMemo). A hit needs all three equal and costs one load of map_serial. A disabled
+  vertex stream is not translated at all (it becomes a null binding whatever the translation
+  gives).
+- Why it is exact: a translation is a function of the address and this manager's page tables
+  only, and those change only in PageTableOp and BigPageTableOp (Map, MapSparse, Unmap and the
+  remaps through Map), which bump map_serial before their first table write and after their
+  last (MapChange). So an unmoved serial means the tables are the ones the remembered lookup
+  read. A lookup is kept only when no change was running when it started and none started
+  before it ended (BeginMapRead, MapReadStable, the sequence lock the EXP63 page cache uses), so
+  a half-written table is never remembered. Within a small page the translation is linear (both
+  tables map whole small pages), so base plus offset is what the walk returns. Another address
+  space (a channel switch) has another unique_identifier and misses. Unmapped results are not
+  kept. A change running at the moment of a hit is ordered after it, as for a walk that races it.
+- "Bind address memo (FRITCHII_BIND_ADDR_MEMO=n) 10 s: hits H/s, translations T/s (U/s not kept:
+  a map change overlapped), disabled vertex streams not translated D/s" (HW_GPU, Info; only
+  while the switch is on).
+- Expected: 8 to 12 ms/s on the back. The memos sit beside EXP18's uniform bind memo, which
+  skips the whole bind; this one only shortens the translation when EXP18's memo misses or is
+  off.
+
 ## Numbered experiments (EDEN_NX2_EXPn)
 
 Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP79, live through the debug server:

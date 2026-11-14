@@ -172,6 +172,8 @@ inline std::atomic<int> g_fence_commit_fast{-1};
 inline std::atomic<int> g_vertex_input_compact{-1};
 /// FRITCHII_WORKER_SPIN: docs/fritchii/switches.md.
 inline std::atomic<int> g_worker_spin{-1};
+/// FRITCHII_BIND_ADDR_MEMO: docs/fritchii/switches.md.
+inline std::atomic<int> g_bind_addr_memo{-1};
 /// EDEN_NX2_LIGHT_TABLE_ARRAYS: docs/fritchii/switches.md.
 [[nodiscard]] inline bool LightTableArrays() {
     static const bool on = EnvSwitch("EDEN_NX2_LIGHT_TABLE_ARRAYS") > 0;

@@ -1455,6 +1455,46 @@ void BufferCache<P>::MarkUsed(DAddr device_addr, u64 size) {
 }
 
 template <class P>
+bool BufferCache<P>::BindAddrMemo() {
+    const int mode = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_bind_addr_memo,
+                                                      "FRITCHII_BIND_ADDR_MEMO");
+    if (mode == 0) [[likely]] {
+        return false;
+    }
+    if ((++bind_addr_calls & 4095) == 0) {
+        const auto now = std::chrono::steady_clock::now();
+        if (bind_addr_since == std::chrono::steady_clock::time_point{}) {
+            bind_addr_since = now;
+            bind_addr_stats = {};
+            bind_addr_disabled_skips = 0;
+        } else if (now - bind_addr_since >= std::chrono::seconds{10}) {
+            const double window = std::chrono::duration<double>(now - bind_addr_since).count();
+            LOG_INFO(HW_GPU,
+                     "Bind address memo (FRITCHII_BIND_ADDR_MEMO={}) {:.0f} s: hits {:.0f}/s, "
+                     "translations {:.0f}/s ({:.0f}/s not kept: a map change overlapped), "
+                     "disabled vertex streams not translated {:.0f}/s",
+                     mode, window, static_cast<double>(bind_addr_stats.hits) / window,
+                     static_cast<double>(bind_addr_stats.lookups) / window,
+                     static_cast<double>(bind_addr_stats.unstable) / window,
+                     static_cast<double>(bind_addr_disabled_skips) / window);
+            bind_addr_since = now;
+            bind_addr_stats = {};
+            bind_addr_disabled_skips = 0;
+        }
+    }
+    return true;
+}
+
+template <class P>
+std::optional<DAddr> BufferCache<P>::TranslateBind(bool on, GPUVAddr gpu_addr,
+                                                   Tegra::MemoryManager::TranslationMemo& memo) {
+    if (!on) {
+        return gpu_memory->GpuToCpuAddress(gpu_addr);
+    }
+    return gpu_memory->GpuToCpuAddressMemo(gpu_addr, memo, bind_addr_stats);
+}
+
+template <class P>
 void BufferCache<P>::BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr,
                                                u32 size) {
     VideoCommon::MemoryStageLink::CheckBackCache("BindGraphicsUniformBuffer");
@@ -1477,7 +1517,8 @@ void BufferCache<P>::BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr
     }
     // Before the translation: a map in between makes the memo miss next time.
     const u64 map_serial = gpu_memory->MapSerial();
-    const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
+    const std::optional<DAddr> device_addr =
+        TranslateBind(BindAddrMemo(), gpu_addr, uniform_addr_memo[stage][index]);
     if (!device_addr) {
         current = NULL_BINDING;
         memo.epoch = 0;
@@ -4290,7 +4331,8 @@ void BufferCache<P>::UpdateIndexBuffer() {
 
     const GPUVAddr gpu_addr_begin = index_buffer_ref.StartAddress();
     const GPUVAddr gpu_addr_end = index_buffer_ref.EndAddress();
-    const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr_begin);
+    const std::optional<DAddr> device_addr =
+        TranslateBind(BindAddrMemo(), gpu_addr_begin, index_addr_memo);
     const u32 address_size = static_cast<u32>(gpu_addr_end - gpu_addr_begin);
     const u32 draw_size = (index_buffer_ref.count + index_buffer_ref.first) * u32(index_buffer_ref.FormatSizeInBytes());
     const u32 size = (std::min)(address_size, draw_size);
@@ -4333,7 +4375,15 @@ void BufferCache<P>::UpdateVertexBuffer(u32 index) {
         throw std::runtime_error("Native vertex stream exceeds supported 32-bit buffer size");
     }
     const GPUVAddr gpu_addr_end = native ? gpu_addr_begin + native_size : limit.Address() + 1;
-    const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr_begin);
+    // FRITCHII_BIND_ADDR_MEMO: through the stream's memo, and a disabled stream is not translated
+    // (it becomes NULL_BINDING below whatever the translation gives).
+    const bool addr_memo = BindAddrMemo();
+    std::optional<DAddr> device_addr;
+    if (!addr_memo || array.enable != 0) {
+        device_addr = TranslateBind(addr_memo, gpu_addr_begin, vertex_addr_memo[index]);
+    } else {
+        ++bind_addr_disabled_skips;
+    }
     const u32 address_size = static_cast<u32>(gpu_addr_end - gpu_addr_begin);
     u32 size = address_size; // TODO: Analyze stride and number of vertices
     if (array.enable == 0 || size == 0 || !device_addr) {

@@ -1547,6 +1547,24 @@ private:
     std::array<std::array<UniformBindMemo, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES>
         uniform_bind_memo{};
 
+    /// FRITCHII_BIND_ADDR_MEMO: the last address translation of each vertex stream, the index
+    /// buffer and each graphics uniform slot (Tegra::MemoryManager::GpuToCpuAddressMemo), and the
+    /// counts for the "Bind address memo" line.
+    std::array<Tegra::MemoryManager::TranslationMemo, NUM_VERTEX_BUFFERS> vertex_addr_memo{};
+    Tegra::MemoryManager::TranslationMemo index_addr_memo{};
+    std::array<std::array<Tegra::MemoryManager::TranslationMemo, NUM_GRAPHICS_UNIFORM_BUFFERS>,
+               NUM_STAGES>
+        uniform_addr_memo{};
+    Tegra::MemoryManager::TranslationMemoStats bind_addr_stats{};
+    u64 bind_addr_disabled_skips{}; ///< Disabled vertex streams not translated at all
+    u64 bind_addr_calls{};
+    std::chrono::steady_clock::time_point bind_addr_since{};
+    /// The switch, and the counts' line every 10 s (the clock every 4,096th call).
+    [[nodiscard]] bool BindAddrMemo();
+    /// GpuToCpuAddress, or GpuToCpuAddressMemo through `memo` when `on`.
+    [[nodiscard]] std::optional<DAddr> TranslateBind(bool on, GPUVAddr gpu_addr,
+                                                     Tegra::MemoryManager::TranslationMemo& memo);
+
     /// One storage binding's last lookup when it resolved to a single buffer (no segments)
     /// (EXP18 & 2). Index NUM_STAGES is compute.
     struct StorageBindingMemo {
