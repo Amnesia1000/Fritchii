@@ -1279,6 +1279,26 @@ void RasterizerVulkan::SetRingBackend() {
         return static_cast<RasterizerVulkan*>(context)->StageRunGather(
             *static_cast<Tegra::Engines::Maxwell3D*>(engine), draw_seq);
     };
+    backend.pass_ready = [](void* context) -> u8 {
+        // fable_stage_levelpoints 6.2 step 4, on GPUMem outside any fill. Read tracking as
+        // GPU::Impl::InvalidateGPUCache tests it. Rule C: only a fill that marks GPU-written data
+        // adds an uncommitted flush, and those fills come level first (StageDrawWritesBuffers)
+        // or run lent, so a set found empty here is empty when the back reaches this entry.
+        auto* const self = static_cast<RasterizerVulkan*>(context);
+        if (VideoCore::g_read_downloads.load(std::memory_order_acquire) != 0 ||
+            VideoCore::Nx2Debug::Experiment(49) != 0) {
+            return static_cast<u8>(Link::PassReady::Tracking);
+        }
+        auto& cache = self->buffer_cache;
+        if (!cache.MayHaveUncommittedFlushes()) {
+            return static_cast<u8>(Link::PassReady::Ready);
+        }
+        const Link::CleanPoint clean;
+        std::scoped_lock lock{cache.mutex};
+        const bool flushes = cache.HasUncommittedFlushes();
+        cache.RefreshUncommittedFlushesNote();
+        return static_cast<u8>(flushes ? Link::PassReady::Flushes : Link::PassReady::Ready);
+    };
     Link::Get().SetRingBackend(backend);
 }
 

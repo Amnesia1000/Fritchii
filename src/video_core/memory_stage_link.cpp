@@ -222,6 +222,7 @@
 #include "video_core/gpu_wait_site.h"
 #include "video_core/memory_stage_link.h"
 #include "video_core/memstage_shadow.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_profile.h"
 
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
@@ -298,6 +299,11 @@ u64 LinkNowNs() noexcept {
 /// Stats counters: a plain load and store (one writer each, or a lost count is fine).
 void LinkBump(std::atomic<u64>& counter, u64 amount = 1) noexcept {
     counter.store(counter.load(std::memory_order_relaxed) + amount, std::memory_order_relaxed);
+}
+
+/// The run shape's buckets: 0, 1, 2-7, 8-63, 64-511, 512 and more.
+size_t RunBucketOf(u64 count) noexcept {
+    return count == 0 ? 0 : count == 1 ? 1 : count < 8 ? 2 : count < 64 ? 3 : count < 512 ? 4 : 5;
 }
 
 constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::Check::Count)>
@@ -1054,6 +1060,7 @@ void MemoryStageLink::BackEndRun() {
     }
     t_back_run = false;
     t_back_served = true;
+    back_after_run = true; // P0: the back's waits until its next packet are idle after the run
 }
 
 bool MemoryStageLink::BackServeRequests() {
@@ -1100,6 +1107,12 @@ void MemoryStageLink::NoteBackDrawState(const void* engine) noexcept {
 void MemoryStageLink::NoteBackWait(u64 ns) noexcept {
     LinkBump(counters.back_wait);
     LinkBump(counters.back_wait_ns, ns);
+    if (back_after_run) {
+        // P0 (fable_stage_levelpoints 5.2): a wait for the stage between a run's end and the
+        // back's next packet, the back's true idle after a level point.
+        LinkBump(pass_stats.idle_waits);
+        LinkBump(pass_stats.idle_ns, ns);
+    }
 }
 
 void MemoryStageLink::NoteConsumed(u64 position) noexcept {
@@ -1160,6 +1173,7 @@ void MemoryStageLink::NoteRingFreed() noexcept {
 
 void MemoryStageLink::NotePacketTaken() noexcept {
     LinkBump(counters.taken);
+    back_after_run = false;
     if (back_run_seen_ns != 0) {
         LinkBump(counters.back_run_ns, LinkNowNs() - back_run_seen_ns);
         back_run_seen_ns = 0;
@@ -1209,7 +1223,8 @@ bool MemoryStageLink::StageServeCalls() {
     return true;
 }
 
-bool MemoryStageLink::StageWaitFor(std::stop_token& stop, StageWait reason, u64 target) {
+bool MemoryStageLink::StageWaitFor(std::stop_token& stop, StageWait reason, u64 target,
+                                   u64* waited) {
     const u64 start = LinkNowNs();
     static constexpr std::array<const char*, static_cast<size_t>(StageWait::Count)> names{
         "the front",          "the back (level mode)", "the back (level run)",
@@ -1281,7 +1296,11 @@ bool MemoryStageLink::StageWaitFor(std::stop_token& stop, StageWait reason, u64 
             stage_ring_wait.store(false, std::memory_order_relaxed);
         }
     }
-    LinkBump(counters.stage_wait_ns[static_cast<size_t>(reason)], LinkNowNs() - start);
+    const u64 ns = LinkNowNs() - start;
+    LinkBump(counters.stage_wait_ns[static_cast<size_t>(reason)], ns);
+    if (waited != nullptr) {
+        *waited += ns;
+    }
     return ok;
 }
 
@@ -1512,6 +1531,30 @@ void MemoryStageLink::BackDropReleases(u64 before, const char* where) noexcept {
         Note(Check::ReleaseOrphan, where);
     }
     release_head.store(head, std::memory_order_release);
+}
+
+void MemoryStageLink::DelayRun(u64 launches) noexcept {
+    // FRITCHII_DELAY_RUN_US=n with FRITCHII_DELAY_RUN_KIND (0: runs without a compute launch, 1:
+    // runs with one): GPUMem busy-spins n us after such a run's end. The launches are counted
+    // with the GPU profile on, or while this switch is set (memstage_shadow.cpp's count_launch).
+    namespace Debug = VideoCore::Nx2Debug;
+    const int us = Debug::SwitchValue(Debug::g_delay_run_us, "FRITCHII_DELAY_RUN_US");
+    if (us <= 0) {
+        return;
+    }
+    const int kind = Debug::SwitchValue(Debug::g_delay_run_kind, "FRITCHII_DELAY_RUN_KIND");
+    if ((kind == 0) != (launches == 0)) {
+        return;
+    }
+    const u64 start = LinkNowNs();
+    const u64 until = start + static_cast<u64>(us) * 1000;
+    u64 now = start;
+    while (now < until) {
+        LinkPause();
+        now = LinkNowNs();
+    }
+    LinkBump(pass_stats.delay_runs);
+    LinkBump(pass_stats.delay_ns, now - start);
 }
 
 void MemoryStageLink::CloseBusyBatch() noexcept {
@@ -1883,6 +1926,10 @@ void MemoryStageLink::RingLoop(std::stop_token& stop, u64 start) {
             close_batch();
             Lend(position, until);
             const u64 run_start = LinkNowNs();
+            // P0 (fable_stage_levelpoints 5.2): GPUMem's waits inside the run, for the front
+            // while it is kept lent and for the back at its end.
+            u64 run_front_ns = 0;
+            u64 run_back_ns = 0;
             {
                 const Nx2Profile::Scope zone{Nx2Profile::Zone::LevelRun};
                 Common::Nx2Timeline::ArgSpan span{"level run", {"entries", 1}};
@@ -1921,7 +1968,7 @@ void MemoryStageLink::RingLoop(std::stop_token& stop, u64 start) {
                                 Nx2Profile::Report("GPU memory thread");
                             }
                         }
-                        if (!StageWaitFor(stop, StageWait::Input, until) ||
+                        if (!StageWaitFor(stop, StageWait::Input, until, &run_front_ns) ||
                             !ring_wanted.load(std::memory_order_acquire)) {
                             break;
                         }
@@ -1947,7 +1994,7 @@ void MemoryStageLink::RingLoop(std::stop_token& stop, u64 start) {
                 }
                 span.Set(0, {"entries", run_entries});
                 LinkBump(counters.run_entries, run_entries);
-                if (!StageWaitFor(stop, StageWait::Run, until)) {
+                if (!StageWaitFor(stop, StageWait::Run, until, &run_back_ns)) {
                     break;
                 }
             }
@@ -1955,6 +2002,18 @@ void MemoryStageLink::RingLoop(std::stop_token& stop, u64 start) {
                 const u64 run_time = LinkNowNs() - run_start;
                 LinkBump(counters.run_ns, run_time);
                 NoteRunShape(result.channel, run_entries, run_launches, run_time);
+                const size_t bucket = RunBucketOf(run_launches);
+                LinkBump(pass_stats.split_runs[bucket]);
+                LinkBump(pass_stats.split_ns[bucket], run_time);
+                LinkBump(pass_stats.split_back_ns[bucket], run_back_ns);
+                LinkBump(pass_stats.split_front_ns[bucket], run_front_ns);
+            }
+            // FRITCHII_DELAY_RUN_US (live, 0 = off; P0's delay test): GPUMem spins right after
+            // the run's end, before the return, so the back stays parked that much longer. Off:
+            // one load and a branch. Outside run_ns above.
+            if (VideoCore::Nx2Debug::g_delay_run_us.load(std::memory_order_relaxed) != 0)
+                [[unlikely]] {
+                DelayRun(run_launches);
             }
             // The return (back parked at `until`): flags, takes, full copies.
             if (!BecomeBusy(stop)) {
@@ -2010,13 +2069,6 @@ void MemoryStageLink::RingLoop(std::stop_token& stop, u64 start) {
 // ---------------------------------------------------------------------------------------------
 // Stats
 
-namespace {
-/// The run shape's buckets: 0, 1, 2-7, 8-63, 64-511, 512 and more.
-size_t RunBucket(u64 count) noexcept {
-    return count == 0 ? 0 : count == 1 ? 1 : count < 8 ? 2 : count < 64 ? 3 : count < 512 ? 4 : 5;
-}
-} // Anonymous namespace
-
 void MemoryStageLink::NoteRunShape(s32 channel, u64 entries, u64 launches, u64 ns) noexcept {
     // GPUMem, once a run: a few relaxed adds, with the GPU profile only.
     if (!Nx2Profile::Enabled()) {
@@ -2030,10 +2082,10 @@ void MemoryStageLink::NoteRunShape(s32 channel, u64 entries, u64 launches, u64 n
     LinkBump(shape.entries[slot], entries);
     LinkBump(shape.launches[slot], launches);
     LinkBump(shape.ns[slot], ns);
-    const size_t by_entries = RunBucket(entries);
+    const size_t by_entries = RunBucketOf(entries);
     LinkBump(shape.by_entries[by_entries]);
     LinkBump(shape.by_entries_ns[by_entries], ns);
-    const size_t by_launches = RunBucket(launches);
+    const size_t by_launches = RunBucketOf(launches);
     LinkBump(shape.by_launches[by_launches]);
     LinkBump(shape.by_launches_ns[by_launches], ns);
 }
@@ -2082,6 +2134,95 @@ void MemoryStageLink::LogRunShape(double seconds) {
              "launches a run: {}",
              seconds, channels.empty() ? std::string{"none"} : channels, by_entries,
              by_launches);
+}
+
+void MemoryStageLink::LogPasses(double seconds) {
+    // fable_stage_levelpoints 5.2 (P0) and 6.6 (P1): "Memory stage passes", dry while
+    // FRITCHII_MEMSTAGE_PASS is 0 (decided and counted, the entries behave as before).
+    PassStats& stats = pass_stats;
+    const auto take = [](std::atomic<u64>& value) {
+        return value.exchange(0, std::memory_order_relaxed);
+    };
+    const auto rate = [seconds](u64 value) { return static_cast<double>(value) / seconds; };
+    const auto ms = [seconds](u64 ns) { return static_cast<double>(ns) / 1e6 / seconds; };
+    static constexpr std::array<const char*, static_cast<size_t>(PassOutcome::Count)>
+        outcome_names{"passed",     "window closed", "in a run",  "late",       "not first",
+                      "sync may be pending", "read tracking", "flushes uncommitted",
+                      "no record room", "GPU-written page"};
+    static constexpr std::array<const char*, static_cast<size_t>(PassMethod::Count)>
+        method_names{"gathers 0x3dd", "waits for idle 0x44"};
+    std::string methods;
+    for (size_t m = 0; m < method_names.size(); ++m) {
+        std::string text;
+        for (size_t i = 0; i < outcome_names.size(); ++i) {
+            text += fmt::format("{}{} {:.0f}", i == 0 ? "" : ", ", outcome_names[i],
+                                rate(take(stats.outcomes[m][i])));
+        }
+        methods += fmt::format("{}{}: {} (of the sync-pending ones, clear in the alternative "
+                               "mirror and ready {:.0f})",
+                               m == 0 ? "" : "; ", method_names[m], text,
+                               rate(take(stats.alt_passes[m])));
+    }
+    static constexpr std::array<const char*, 2> fence_names{"release closures", "fence reports"};
+    std::string fences;
+    for (size_t k = 0; k < fence_names.size(); ++k) {
+        const u64 ready = take(stats.fence_entries[k][static_cast<size_t>(PassReady::Ready)]);
+        const u64 tracking = take(stats.fence_entries[k][static_cast<size_t>(PassReady::Tracking)]);
+        const u64 flushes = take(stats.fence_entries[k][static_cast<size_t>(PassReady::Flushes)]);
+        fences += fmt::format("{}{} {:.0f} (rule C holds {:.0f}, read tracking {:.0f}, flushes "
+                              "uncommitted {:.0f})",
+                              k == 0 ? "" : ", ", fence_names[k],
+                              rate(ready + tracking + flushes), rate(ready), rate(tracking),
+                              rate(flushes));
+    }
+    static constexpr std::array<const char*, RunBuckets> bucket_names{"0",    "1",      "2-7",
+                                                                      "8-63", "64-511", "512+"};
+    u64 all_ns = 0;
+    u64 all_back = 0;
+    u64 all_front = 0;
+    std::string buckets;
+    for (size_t i = 0; i < RunBuckets; ++i) {
+        const u64 runs = take(stats.split_runs[i]);
+        const u64 ns = take(stats.split_ns[i]);
+        const u64 back = take(stats.split_back_ns[i]);
+        const u64 front = take(stats.split_front_ns[i]);
+        all_ns += ns;
+        all_back += back;
+        all_front += front;
+        buckets += fmt::format("{}{} {:.0f}/s: {:.1f}/{:.1f}/{:.1f}", i == 0 ? "" : ", ",
+                               bucket_names[i], rate(runs), ms(back), ms(front),
+                               ms(ns - (std::min)(ns, back + front)));
+    }
+    const u64 checks = take(stats.mirror_checks);
+    std::array<u64, 4> releases{};
+    for (size_t i = 0; i < releases.size(); ++i) {
+        releases[i] = take(stats.front_releases[i]);
+    }
+    LOG_INFO(
+        HW_GPU,
+        "Memory stage passes ({}, window {}) {:.0f} s: per second {}; fence entries outside a "
+        "run {}; puller releases on the front {:.0f}/s timestamped ({:.0f}/s unmapped), "
+        "{:.0f}/s fence-flagged ({:.0f}/s unmapped); the "
+        "mirror at the gathers the back ran at their entry ({:.0f}/s): clear {:.0f}/s, clear "
+        "but a sync found {:.0f}/s (must be 0 for the passes), the alternative mirror clear "
+        "{:.0f}/s, clear but found {:.0f}/s; GPUMem lend to return {:.1f} ms/s: waiting for "
+        "the back {:.1f}, for the front while lent {:.1f}, following {:.1f}; by compute "
+        "launches a run (runs/s: back/front/following ms/s) {}; the back waited for the stage "
+        "after a run's end, before its next packet, {:.0f}/s {:.1f} ms/s; delay test "
+        "FRITCHII_DELAY_RUN_US={} kind {}: {:.0f}/s {:.1f} ms/s",
+        g_pass.load(std::memory_order_relaxed) != 0
+            ? fmt::format("FRITCHII_MEMSTAGE_PASS={}", g_pass.load(std::memory_order_relaxed))
+            : std::string{"dry"},
+        Ahead() != 0 ? "open" : "closed", seconds, methods, fences,
+        rate(releases[0] + releases[1]), rate(releases[0]), rate(releases[2] + releases[3]),
+        rate(releases[2]), rate(checks),
+        rate(take(stats.mirror_clear)), rate(take(stats.mirror_wrong)),
+        rate(take(stats.alt_clear)), rate(take(stats.alt_wrong)), ms(all_ns), ms(all_back),
+        ms(all_front), ms(all_ns - (std::min)(all_ns, all_back + all_front)), buckets,
+        rate(take(stats.idle_waits)), ms(take(stats.idle_ns)),
+        (std::max)(VideoCore::Nx2Debug::g_delay_run_us.load(std::memory_order_relaxed), 0),
+        (std::max)(VideoCore::Nx2Debug::g_delay_run_kind.load(std::memory_order_relaxed), 0),
+        rate(take(stats.delay_runs)), ms(take(stats.delay_ns)));
 }
 
 void MemoryStageLink::Take(Snapshot& out) const noexcept {
@@ -2357,6 +2498,7 @@ void MemoryStageLink::LogStats() {
         if (Nx2Profile::Enabled()) {
             LogRunShape(seconds);
         }
+        LogPasses(seconds);
         // Step 7's window (spec 8.3: the stage's lead; 6.4's counters).
         static constexpr std::array<const char*, WindowBuckets> bucket_names{
             "1", "2-3", "4-7", "8-15", "16-31", "32-63", "64-255", "256+"};

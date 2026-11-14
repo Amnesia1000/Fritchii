@@ -117,6 +117,24 @@ is critical by construction); these add work to one thread in the middle of its 
 - Off (0), a call, draw or dispatch pays one relaxed load of its switch and a branch, inline at
   the call site (GpuSplit::DelayWorkIf), no function call.
 
+### FRITCHII_DELAY_RUN_US, FRITCHII_DELAY_RUN_KIND
+
+The memory stage's delay test (live, default 0 = nothing changes; fable_stage_levelpoints 5.1),
+with FRITCHII_MEMSTAGE_THREAD=2: GPUMem busy-spins n microseconds right after a level run's end
+(its StageWaitFor of the run returned, before the return's flag take), so the back stays parked
+that much longer. It tells whether GPUMem's time parked in runs is on the frame's path: if fps
+drops by about what the added ms a second predict, every ms/s of parked time cut is a ms/s of
+frame.
+- FRITCHII_DELAY_RUN_KIND: 0 (default) spins after runs without a compute launch, 1 after runs
+  with one. The launches are counted with the GPU profile on (EDEN_NX2_GPU_PROFILE) or while
+  FRITCHII_DELAY_RUN_US is set (memstage_shadow.cpp's count_launch).
+- Fable's reading: 5 us at kind 0 adds about 47 ms/s (9,471 runs a second); a frame 0.85 ms
+  longer means parked time is fully on the path. 20 us at kind 1 adds about 21 ms/s.
+- The spin is outside the run's own time ("runs ... us each on GPUMem"); counted at the end of
+  the "Memory stage passes" line ("delay test FRITCHII_DELAY_RUN_US=n kind k: x/s y ms/s").
+- Off (0): one relaxed load and a branch after each run.
+- Measure with profile_toggle.py in one session (0 against n).
+
 ### FRITCHII_E2C_CENSUS (the "Front 0xe2c misses" line)
 
 FRITCHII_E2C_CENSUS (live, default 0 since 2026-11-14 = no work at all on the miss path; 1 = the
@@ -1252,6 +1270,41 @@ entry when it gets there. 0, AHEAD 0 and THREAD 0/1: as before.
   takes the release in (one run instead of two level waits).
 - Compare 0 and 1 with profile_toggle.py in one session (5c's run starters lose "cache call"
   at the release's address).
+
+### Memory stage passes (the "Memory stage passes" line)
+
+Every 10 s on THREAD 2 (fable_stage_levelpoints 5.2), "Memory stage passes (dry, window
+open/closed)": the counts P1 (passed gathers and waits for idle) and P3 (fence entries) are
+judged by. Dry means decided and counted, the entries behave as before.
+- Per method (gathers 0x3dd, waits for idle 0x44), each lone one GPUMem reaches: passed (dry: it
+  would pass P1's tests up to the flush test), or the first test it failed: window closed, in a
+  run, late (its entry hard already), not first (not a lone method entry, or a draw before it),
+  sync may be pending (the mirror below), read tracking (EXP49 or a pending read download),
+  flushes uncommitted (the buffer cache's uncommitted set, its note first, then under the lock),
+  no record room, GPU-written page (both P1 only). "Of the sync-pending ones, clear in the
+  alternative mirror and ready": how many more would pass with that mirror.
+- The mirror (6.1) of the back's query_cache.HasPendingSync() at GPUMem's place: unknown at the
+  ring's start, after every run's return and after every hard or unfollowed entry; a 3D report
+  that is not a fence (Release or ReportOnly) makes a sync pending; a lone 0x3dd or 0x44 that
+  passed (dry: would pass) or that the back ran at its entry (FRITCHII_MEMSTAGE_GATHER) clears
+  it. The alternative mirror is the same, but a lone 0x3dd or 0x44 that runs as a level run
+  clears it too (the back runs its wait for idle at that entry), and a run's return leaves it as
+  it is (every entry of the run went through GPUMem, so the hard ones set it themselves). Dry, a
+  sync point that would pass and a run it starts are taken as P1 would (cleared, no run).
+- "The mirror at the gathers the back ran at their entry": with FRITCHII_MEMSTAGE_GATHER on, each
+  served gather checks the mirror against the back's own answer (it had query results to sync):
+  "clear but a sync found" must be 0 for the passes, for each mirror.
+- Fence entries outside a run (the puller's release closures and the 3D fence reports): whether
+  rule C holds there (no read tracking, no uncommitted flush).
+- Puller releases on the front (WriteLong): timestamped and fence-flagged (RELEASE_SIZE), each
+  with its unmapped ones.
+- GPUMem from a run's lend to its return: waiting for the back (the run's end), for the front
+  while the run is kept lent, following (the rest); then by compute launches a run (0, 1, 2-7,
+  8-63, 64-511, 512+; launches are counted with the GPU profile or the delay test on), runs a
+  second with back/front/following ms a second.
+- The back's waits for the stage between a run's end and its next packet (its true idle after a
+  level point), count and ms a second.
+- The delay test FRITCHII_DELAY_RUN_US's spins.
 
 ### FRITCHII_MEMSTAGE_FULL_BINDS
 

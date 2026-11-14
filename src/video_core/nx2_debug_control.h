@@ -154,6 +154,10 @@ inline std::atomic<int> g_delay_e2c_us{-1};
 inline std::atomic<int> g_delay_dispatch_us{-1};
 /// FRITCHII_DELAY_DRAW_US: docs/fritchii/switches.md.
 inline std::atomic<int> g_delay_draw_us{-1};
+/// FRITCHII_DELAY_RUN_US: docs/fritchii/switches.md.
+inline std::atomic<int> g_delay_run_us{-1};
+/// FRITCHII_DELAY_RUN_KIND: docs/fritchii/switches.md.
+inline std::atomic<int> g_delay_run_kind{-1};
 /// FRITCHII_FRONT_RAN_READS: docs/fritchii/switches.md.
 inline std::atomic<int> g_front_ran_reads{-1};
 /// FRITCHII_ACQUIRE_TABLE_FIRST: docs/fritchii/switches.md.

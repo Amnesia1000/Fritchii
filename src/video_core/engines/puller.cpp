@@ -31,6 +31,7 @@
 #include "video_core/engines/puller.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
+#include "video_core/memory_stage_link.h"
 #include "video_core/memstage_shadow.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_fastdraw_count.h"
@@ -2211,9 +2212,15 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload, properties, payload, 0);
         }, VideoCommon::StageCacheCallBits(VideoCommon::StageCacheCall::SemaphoreRelease));
         if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
-            if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(sequence_address)) {
+            const auto device = dma_pusher.memory_manager.GpuToCpuAddress(sequence_address);
+            if (device) {
                 split.NoteRelease(*device, sequence_address, payload,
                                   VideoCommon::GpuSplit::ReleaseKind::Puller);
+            }
+            // The memory stage's passes (fable_stage_levelpoints 5.2): releases by fence flag.
+            if (VideoCommon::MemoryStageLink::RingActive()) {
+                VideoCommon::MemoryStageLink::Get().NoteFrontRelease(
+                    properties == VideoCommon::QueryPropertiesFlags::IsAFence, device.has_value());
             }
         }
         RecordPullerRelease(dma_pusher, sequence_address, payload);

@@ -847,6 +847,20 @@ struct State {
     u64 ring_seq{};           ///< Draws the copies issued since the ring started
     u32 ring_packets{};       ///< Packets the entry sent
     bool ring_ran_on_back{};  ///< The back ran its gather or semaphore release (StageResult)
+    // fable_stage_levelpoints 6.1: the mirror of the back's query_cache.HasPendingSync() at
+    // GPUMem's place in the stream. A sync may be pending unless `sync_unknown` is false and no
+    // report went by since the last sync point. The alternative mirror (P0's counter only) is
+    // also cleared by a lone sync point that runs (the back runs its wait for idle at the
+    // entry), and a run's return leaves it.
+    bool sync_unknown{true};
+    u32 sync_reports{};
+    bool alt_unknown{true};
+    u32 alt_reports{};
+    /// The entry is a lone 0x3dd or 0x44: what its end does to the mirror.
+    enum class EntrySync : u8 { None, Cleared, Ran } entry_sync{EntrySync::None};
+    /// Dry (the switch off): the entry would have passed; the run it starts is not one P1 has.
+    bool entry_dry_pass{};
+    bool run_from_dry_pass{};
     Class last_class{Class::Pass};
     std::vector<std::pair<u64, std::size_t>> ring_ranges; ///< Collected, not applied yet
     /// Step 7: the flags a deferred lend hands over, per engine (BackTakeLend).
@@ -1372,6 +1386,84 @@ void Condition(State& s, Copy& c) {
 
 void StageGather(State& s, Copy& c, u32 method);
 
+/// P0 (fable_stage_levelpoints 5.2): a fence entry outside a run, and whether rule C would hold
+/// there (`kind` 0: the puller's release closure, 1: a 3D fence report).
+void NoteFenceEntry(u32 kind) {
+    MemoryStageLink& link = MemoryStageLink::Get();
+    const auto& backend = link.Backend();
+    if (backend.pass_ready == nullptr) {
+        return;
+    }
+    link.NoteFenceEntry(kind,
+                        static_cast<MemoryStageLink::PassReady>(backend.pass_ready(backend.context)));
+}
+
+/// FRITCHII_MEMSTAGE_PASS (fable_stage_levelpoints 6.2), at a gather (0x3dd) or a wait for idle
+/// (0x44) of the copy, before StageGather: P1's tests, in its order, each way out counted. Off
+/// (dry), the decision is counted and the entry goes on as before (hard: a run, or GATHER's
+/// request); the mirror then takes it as P1 would (EntrySync, run_from_dry_pass). True when the
+/// entry passed.
+bool StagePass(State& s, Copy& c, u32 method) {
+    using Outcome = MemoryStageLink::PassOutcome;
+    using Ready = MemoryStageLink::PassReady;
+    static_cast<void>(c);
+    MemoryStageLink& link = MemoryStageLink::Get();
+    const auto which = method == MAXWELL3D_REG_INDEX(invalidate_texture_data_cache)
+                           ? MemoryStageLink::PassMethod::Gather
+                           : MemoryStageLink::PassMethod::WaitForIdle;
+    if (!MemoryStageLink::StageWindowOpen()) {
+        link.NotePass(which, Outcome::Closed);
+        return false;
+    }
+    const bool dry = !MemoryStageLink::PassServed(1);
+    if (s.ring_in_run) {
+        link.NotePass(which, Outcome::InRun);
+        return false;
+    }
+    // Dry, the method made the entry hard itself (MethodKindOf; a lone method has nothing
+    // before it). Otherwise MethodKindOf said work: hard here means hard before it.
+    if (s.entry_hard && (!dry || s.entry_key != LevelKey(s.entry_type, s.channel, method))) {
+        link.NotePass(which, Outcome::Late);
+        return false;
+    }
+    const u64 head = Access::Ring()[s.processing_position & Access::RingMask];
+    if (static_cast<Kind>(head & 0xf) != Kind::Method || s.entry_draws != 0) {
+        link.NotePass(which, Outcome::NotFirst);
+        return false;
+    }
+    // A lone sync point: whatever becomes of it, the back runs its wait for idle at this entry.
+    s.entry_sync = State::EntrySync::Ran;
+    const auto& backend = link.Backend();
+    const bool clear = !s.sync_unknown && s.sync_reports == 0;
+    const bool alt_clear = !s.alt_unknown && s.alt_reports == 0;
+    if (!clear && !alt_clear) {
+        link.NotePass(which, Outcome::SyncPending);
+        return false;
+    }
+    const Ready ready = backend.pass_ready != nullptr
+                            ? static_cast<Ready>(backend.pass_ready(backend.context))
+                            : Ready::Tracking;
+    if (!clear) {
+        link.NotePass(which, Outcome::SyncPending, ready == Ready::Ready);
+        return false;
+    }
+    if (ready == Ready::Tracking) {
+        link.NotePass(which, Outcome::Tracking);
+        return false;
+    }
+    if (ready == Ready::Flushes) {
+        link.NotePass(which, Outcome::Flushes);
+        return false;
+    }
+    if (dry) {
+        link.NotePass(which, Outcome::Passed);
+        s.entry_sync = State::EntrySync::Cleared;
+        s.entry_dry_pass = true;
+        return false;
+    }
+    return false;
+}
+
 /// Maxwell3D::ProcessMethodCall's effects on the copy, for every executable method that is not a
 /// macro: the stage's handler (spec 3.2), or for a hard method what follow applies (plan 3.2).
 void MethodCall(State& s, Copy& c, u32 method, u32 value, u32 nonshadow) {
@@ -1390,10 +1482,19 @@ void MethodCall(State& s, Copy& c, u32 method, u32 value, u32 nonshadow) {
         // cache's async flushes (plan 2.4): hard. Any other report is the store only.
         ++s.counters.reports;
         const auto& query = e.regs.report_semaphore.query;
-        if (query.operation.Value() == Regs::ReportSemaphore::Operation::Release &&
-            query.short_query != 0) {
+        using Operation = Regs::ReportSemaphore::Operation;
+        if (query.operation.Value() == Operation::Release && query.short_query != 0) {
             ++s.counters.fence_reports;
+            if (s.ring && !s.ring_in_run && MemoryStageLink::StageWindowOpen()) {
+                NoteFenceEntry(1); // P0: rule C's rate at the fence reports
+            }
             Hard(s, LevelType::FenceReport, method);
+        } else if (query.operation.Value() == Operation::Release ||
+                   query.operation.Value() == Operation::ReportOnly) {
+            // Maxwell3D::ProcessQueryGet calls rasterizer->Query: a sync may be pending now
+            // (the mirror, fable_stage_levelpoints 6.1).
+            ++s.sync_reports;
+            ++s.alt_reports;
         }
         return;
     }
@@ -1401,10 +1502,15 @@ void MethodCall(State& s, Copy& c, u32 method, u32 value, u32 nonshadow) {
         return Condition(s, c);
     case MAXWELL3D_REG_INDEX(invalidate_texture_data_cache):
         if (s.ring) {
+            StagePass(s, c, method);   // FRITCHII_MEMSTAGE_PASS (dry: its counters only)
             StageGather(s, c, method); // FRITCHII_MEMSTAGE_GATHER, and its counters
         }
         return; // the store only
     case MAXWELL3D_REG_INDEX(wait_for_idle):
+        if (s.ring) {
+            StagePass(s, c, method); // FRITCHII_MEMSTAGE_PASS (dry: its counters only)
+        }
+        return; // the store only
     case MAXWELL3D_REG_INDEX(sync_info):
     case MAXWELL3D_REG_INDEX(launch_dma):
     case MAXWELL3D_REG_INDEX(inline_data):
@@ -1699,6 +1805,11 @@ void StageGather(State& s, Copy& c, u32 method) {
     }
     link.FinishGather(draw_seq);
     s.ring_ran_on_back = true;
+    // The sync mirror (fable_stage_levelpoints 6.1) against what the back's run found, then
+    // cleared: the gather's wait for idle synced every streamer at this entry.
+    link.NoteMirrorCheck(!s.sync_unknown && s.sync_reports == 0,
+                         !s.alt_unknown && s.alt_reports == 0, link.LastGatherSynced());
+    s.entry_sync = State::EntrySync::Cleared;
     link.NoteGather(Outcome::Served,
                     static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                          std::chrono::steady_clock::now() - start)
@@ -1721,6 +1832,9 @@ bool StageRelease(State& s, const u64* entry, size_t size) {
     if (s.ring_in_run) {
         link.NoteRelease(Outcome::InRun);
         return false;
+    }
+    if (MemoryStageLink::StageWindowOpen()) {
+        NoteFenceEntry(0); // P0: rule C's rate at the release closures
     }
     if (!MemoryStageLink::ReleaseServed()) {
         link.NoteRelease(Outcome::Closed);
@@ -1817,6 +1931,8 @@ size_t Process(State& s, u64 position, bool executed) {
     s.entry_draws = 0;
     s.entry_served = 0;
     s.entry_launches = 0;
+    s.entry_sync = State::EntrySync::None;
+    s.entry_dry_pass = false;
     if (s.channel_stale && !executed) {
         // After an entry that cannot be followed, the channel as the back has it (an untagged
         // closure may bind one).
@@ -1836,9 +1952,13 @@ size_t Process(State& s, u64 position, bool executed) {
     };
     // fable_memstage_compute_brief 3: the compute launches among another engine's methods (as
     // the compute front notes dispatch writers), for the runs by size (counting only).
-    // With the GPU profile only (the line is logged then).
+    // With the GPU profile only (the line is logged then), or while FRITCHII_DELAY_RUN_US is set
+    // (its kind tells runs by launches).
+    const bool launches_counted =
+        Nx2Profile::Enabled() ||
+        VideoCore::Nx2Debug::g_delay_run_us.load(std::memory_order_relaxed) > 0;
     const auto count_launch = [&](u32 method, u32 argument) {
-        if (Nx2Profile::Enabled() && s.engine_type == EngineType::KeplerCompute &&
+        if (launches_counted && s.engine_type == EngineType::KeplerCompute &&
             ((method == 0xaf && (argument & 2) != 0) ||
              (method == 0xb0 && (argument & 15) > 1) || method == 0x107)) {
             ++s.entry_launches;
@@ -1924,7 +2044,7 @@ size_t Process(State& s, u64 position, bool executed) {
         if (s.engine_copy == nullptr) {
             // Direct: a macro's words (GpuSplit::MacroWords, EXP124), called as a Direct Method.
             other_engine(method, (head & Access::Direct) != 0 || s.engine->execution_mask[method]);
-            if (Nx2Profile::Enabled() && (method == 0xaf || method == 0xb0 || method == 0x107)) {
+            if (launches_counted && (method == 0xaf || method == 0xb0 || method == 0x107)) {
                 const u32* const words = reinterpret_cast<const u32*>(entry + data);
                 for (u32 i = 0; i < amount; ++i) {
                     count_launch(method, words[i]);
@@ -2125,6 +2245,31 @@ size_t Process(State& s, u64 position, bool executed) {
         s.channel_stale = true;
         for (Copy& copy : s.copies) {
             copy.stale = true;
+        }
+    }
+    if (s.ring) {
+        // The sync mirror (fable_stage_levelpoints 6.1): a pending sync is only ever added by
+        // rasterizer->Query, which a served entry reaches only through the 3D report method
+        // (counted in MethodCall); every other caller is a hard or unfollowed entry.
+        switch (s.entry_sync) {
+        case State::EntrySync::Cleared:
+            // Passed, or run by the back at its entry: its wait for idle syncs every streamer.
+            s.sync_unknown = false;
+            s.sync_reports = 0;
+            s.alt_unknown = false;
+            s.alt_reports = 0;
+            break;
+        case State::EntrySync::Ran:
+            s.sync_unknown = true;
+            s.alt_unknown = false;
+            s.alt_reports = 0;
+            break;
+        case State::EntrySync::None:
+            if (s.entry_hard || s.entry_unfollowed) {
+                s.sync_unknown = true;
+                s.alt_unknown = true;
+            }
+            break;
         }
     }
     return size;
@@ -2498,6 +2643,9 @@ StageResult StageProcess(u64 position, bool in_run) {
     s.current = position;
     const size_t size = Process(s, position, false);
     s.cursor = position + size;
+    if (!in_run) {
+        s.run_from_dry_pass = s.entry_dry_pass;
+    }
     return StageResult{
         .size = size,
         .cls = static_cast<u8>(s.last_class),
@@ -2634,6 +2782,11 @@ bool StageMayCopy(u64 position) {
 
 u64 StageReturn(const void* drew_engine, const void* state_engine, s32 back_channel) {
     State& s = S();
+    // The sync mirror (6.1): after every run, a sync may be pending. Not after a run P1 would
+    // not have (dry: its first entry would have passed; its other entries set it themselves).
+    if (!std::exchange(s.run_from_dry_pass, false)) {
+        s.sync_unknown = true;
+    }
     for (Copy& copy : s.copies) {
         if (!copy.stale) {
             TakeCacheFlags(copy.e->dirty.flags, copy.back->dirty.flags);
