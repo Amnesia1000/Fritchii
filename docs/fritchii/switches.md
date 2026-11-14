@@ -1511,7 +1511,10 @@ is then dry). Bit 2 (fence entries, fable_stage_p3) is not built: it is masked o
   - rule Q: no query result sync can be pending at the entry (the mirror in the passes line);
   - rule C: no uncommitted buffer flush (the note, else the sets under the lock): only a fill
     that marks GPU-written data adds one, and those come level first or run lent, so a set empty
-    at GPUMem's position is empty when the back gets there;
+    at GPUMem's position is empty when the back gets there. With FRITCHII_MEMSTAGE_MARKS_AHEAD
+    on, rule C is not tested (fable_stage_levelpoints 14.7): a writing draw queues its download
+    when the back promotes its marks, after GPUMem's place, so the note says nothing there; the
+    back groups and commits under the lock at its own place instead (below);
   - room for its record (256).
   There is no read tracking test any more (fable_stage_levelpoints 13: EXP49 is on by default,
   and that test refused every pass); rule T below closes the window it guarded.
@@ -1544,11 +1547,13 @@ is then dry). Bit 2 (fence entries, fable_stage_p3) is not built: it is masked o
   or off) return at once when every collector is empty; otherwise the take and the buffer half run on
   GPUMem in one served call (RasterizerVulkan::GatherOnStage), the other caches' half on the back: only
   GPUMem takes while the back is served. Its wait for idle and flush grouping (SignalOrdering)
-  find nothing to do: a pending sync there, or a set uncommitted-flush note, is a must-be-0 (then
-  they run as today).
+  find nothing to do: a pending sync there, or (MARKS_AHEAD off) a set uncommitted-flush note, is
+  a must-be-0 (then they run as today). With MARKS_AHEAD on, a set note or a played packet's
+  marks still due (AheadDue) make the served flush grouping take the lock and group as today,
+  on the back at its place (exact: the real sets are as of the back), and that is not counted.
 - Must be 0 (the link line), each turning the switch to 0 for the session from the next frame
   end (logged once): "a query result sync pending at a passed entry's wait for idle", "uncommitted
-  buffer flushes at a passed entry's flush grouping", "a pass record of an entry the back passed
+  buffer flushes at a passed entry's flush grouping" (MARKS_AHEAD off only), "a pass record of an entry the back passed
   without asking for it", "a passed gather's buffer half recorded a command" (the seam arena grew
   in its bracket), "a served wait for idle with no pass record", "a pass record's slot freed while
   its taken writes were listed and not applied" (rule T), "taken writes left listed at the ring's

@@ -1621,8 +1621,9 @@ void P3Release(State& s, const u64* words, MemoryStageLink::PassReady ready) {
 /// and finds nothing to do in the buffer cache there (levelpoints section 4, rules C, G, Q):
 /// - rule Q: no query sync can be pending (the mirror), so the wait for idle's NotifyWFI does
 ///   nothing (the back checks: PassQuerySync);
-/// - rule C: no uncommitted flush (read under the lock when the note is set), so the flush
-///   grouping (SignalOrdering) has nothing to group (the back checks: PassFlushes);
+/// - rule C, MARKS_AHEAD off: no uncommitted flush (read under the lock when the note is set), so
+///   the flush grouping (SignalOrdering) has nothing to group (the back checks: PassFlushes);
+///   MARKS_AHEAD on: not tested, the back groups at its own place (levelpoints 14.7);
 /// - rule G, 0x3dd: GPUMem takes the game's collected writes and applies their buffer half at once
 ///   (the fable amendment: WriteMemory only marks on pages without GPU-written data, no command);
 ///   the record carries them to the back for the texture and pipeline caches. A write on such a
