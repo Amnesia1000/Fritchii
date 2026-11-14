@@ -1202,7 +1202,7 @@ void RecordPullerRelease(DmaPusher& dma_pusher, GPUVAddr address, u32 payload) {
 // EXP13=3 (nx2_qmd_prediction.h): an acquire a queued release or the reduction bound meets goes
 // on as one a queued release meets does (MetByQueuedRelease): the back runs the channel's later
 // work behind the releases, and it counts as a host-level wait (NoteSync).
-// `fed_out` (optional): what met it (EDEN_NX2_ACQUIRE_TABLE_FIRST's count).
+// `fed_out` (optional): what met it (FRITCHII_ACQUIRE_TABLE_FIRST's count).
 bool MetByQmdPrediction(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire,
                         bool resume,
                         VideoCommon::QmdPrediction::FedRelease* fed_out = nullptr) {
@@ -1250,7 +1250,7 @@ bool MetByQmdPrediction(DmaPusher& dma_pusher, const Puller::PendingAcquire& acq
     return true;
 }
 
-// EDEN_NX2_ACQUIRE_TABLE_FIRST (live, default 0; fable_front_drains 2.3 item 2 and 6.3, the
+// FRITCHII_ACQUIRE_TABLE_FIRST (live, default 0; fable_front_drains 2.3 item 2 and 6.3, the
 // market's "Acquire resumes met by" line): a suspended acquire's poll asks the front's release
 // table first, right after the latch: before the word read (SemaphoreReadableNow, which waits for
 // the noted writers of the word when it can't overlay them) and above the unmet-poll throttle
@@ -1285,7 +1285,7 @@ public:
 
     [[nodiscard]] static int Mode() {
         return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_acquire_table_first,
-                                                "EDEN_NX2_ACQUIRE_TABLE_FIRST");
+                                                "FRITCHII_ACQUIRE_TABLE_FIRST");
     }
 
     /// A poll of `acquire` (after the latch): whether the tables meet it. `first`: no earlier
@@ -1479,7 +1479,7 @@ private:
         const auto rate = [window](u64 count) { return static_cast<double>(count) / window; };
         const auto kind = [&](Kind k) { return rate(resumed[static_cast<size_t>(k)]); };
         LOG_INFO(HW_GPU,
-                 "Acquire table first (EDEN_NX2_ACQUIRE_TABLE_FIRST={}) {:.0f} s: resumed, /s: "
+                 "Acquire table first (FRITCHII_ACQUIRE_TABLE_FIRST={}) {:.0f} s: resumed, /s: "
                  "puller release {:.0f}, 3D payload release (4 bytes) {:.0f}, 3D payload report "
                  "(16 bytes) {:.0f}, QMD feed exact {:.0f}, QMD feed other {:.0f}; watches: met "
                  "at the write {}, landed before the watch {}, unwatched {}, unresolved after 2 s "
@@ -1784,7 +1784,7 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquirePollsFast, 1);
         return met_by(FenceResumeRoute::Latch);
     }
-    // EDEN_NX2_ACQUIRE_TABLE_FIRST (live, 0 = off; AcquireTableFirst above): the release table,
+    // FRITCHII_ACQUIRE_TABLE_FIRST (live, 0 = off; AcquireTableFirst above): the release table,
     // with 2 the QMD feed too, before the word read and above the unmet-poll throttle.
     if (const int table_first = AcquireTableFirst::Mode(); table_first != 0) {
         if (AcquireTableFirst::Get().Met(

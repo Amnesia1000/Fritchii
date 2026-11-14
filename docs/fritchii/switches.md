@@ -197,11 +197,11 @@ and by the other routes (word read, front answer, poll drain, lagged check).
 - Reading it: latch resumes by releases known at send are what resolving acquires at the front
   (resume when the newest queued release over the word has a known value that meets it) would
   take off the front's blocked time.
-- With EDEN_NX2_ACQUIRE_TABLE_FIRST on, its resumes count under "the other routes".
+- With FRITCHII_ACQUIRE_TABLE_FIRST on, its resumes count under "the other routes".
 
-### EDEN_NX2_ACQUIRE_TABLE_FIRST
+### FRITCHII_ACQUIRE_TABLE_FIRST
 
-EDEN_NX2_ACQUIRE_TABLE_FIRST (live, default 0 = exactly as before; fable_front_drains 2.3 item 2
+FRITCHII_ACQUIRE_TABLE_FIRST (live, default 0 = exactly as before; fable_front_drains 2.3 item 2
 and 6.3). A suspended acquire's poll (Puller::CanResumeAcquire) asks the front's release table
 right after the latch: before the word read (SEM_FAST's read, which waits for the noted writers
 of the word when it can't overlay them) and above the unmet-poll throttle (16 polls or 1 ms, and
@@ -236,7 +236,7 @@ channel sent the release asks too. Never inside a list: that would change the ch
   ("unresolved"). "Acquire table first (must be 0): device d op o value v: the release it was
   resumed on (payload p, ring r) ran, and no write that met it was seen; the word is w now" for the
   first 8.
-- "Acquire table first (EDEN_NX2_ACQUIRE_TABLE_FIRST=n) 5 s" (HW_GPU, Info): resumes a second by
+- "Acquire table first (FRITCHII_ACQUIRE_TABLE_FIRST=n) 5 s" (HW_GPU, Info): resumes a second by
   kind (puller release, 3D payload release (4 bytes), 3D payload report (16 bytes), QMD feed
   exact, QMD feed other), the watches (met at the write, landed before the watch, unwatched,
   unresolved after 2 s, open) and the must-be-0 count with the session total.
