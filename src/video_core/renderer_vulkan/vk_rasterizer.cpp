@@ -1297,12 +1297,20 @@ void RasterizerVulkan::SetRingBackend() {
             *static_cast<Tegra::Engines::Maxwell3D*>(engine), draw_seq);
     };
     backend.pass_ready = [](void* context) -> u8 {
-        // fable_stage_levelpoints 6.2 step 4, on GPUMem outside any fill. Rule C: only a fill
-        // that marks GPU-written data adds an uncommitted flush, and those fills come level first
-        // (StageDrawWritesBuffers) or run lent, so a set found empty here is empty when the back
-        // reaches this entry. No read tracking answer (13.3): the pass lists its take (rule T).
+        // fable_stage_levelpoints 6.2 step 4, on GPUMem outside any fill. Rule C, MARKS_AHEAD
+        // off: only a fill that marks GPU-written data adds an uncommitted flush, and those fills
+        // come level first (StageDrawWritesBuffers) or run lent, so a set found empty here is
+        // empty when the back reaches this entry. No read tracking answer (13.3): the pass lists
+        // its take (rule T).
         auto* const self = static_cast<RasterizerVulkan*>(context);
         auto& cache = self->buffer_cache;
+        // MARKS_AHEAD on (14.7): a writing draw queues its download when the back promotes its
+        // marks, after GPUMem's place, so the note here says nothing. Rule C is not needed: the
+        // back groups and commits under the lock at its own place (SignalOrdering's served
+        // branch). Read nothing of the cache: no due mark to miss a promotion of.
+        if (cache.MarksAhead()) {
+            return static_cast<u8>(Link::PassReady::Ready);
+        }
         if (!cache.MayHaveUncommittedFlushes()) {
             return static_cast<u8>(Link::PassReady::Ready);
         }

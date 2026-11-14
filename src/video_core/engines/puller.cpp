@@ -691,14 +691,20 @@ void ReleaseFences(DmaPusher& dma_pusher) {
                           dma_pusher.rasterizer->FenceWorkEpoch() == epoch;
         skips.Count(state, skip);
         if (skip) {
+            // Memory stage tag Cache (fable_stage_levelpoints 14.5): a gather (the buffer,
+            // texture and pipeline caches); no 3D state, no Query.
             OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->InvalidateGPUCache(); },
-                   VideoCommon::Nx2FastDrawCount::Neutral());
+                   VideoCommon::Nx2FastDrawCount::Neutral() |
+                       VideoCommon::StageTagBits(VideoCommon::StageTag::Cache));
             return;
         }
     }
     // Delta draw count: fence releases are neutral, the fence manager breaks per fence released.
+    // Memory stage tag Cache: the fence manager only; no 3D state.
     split.Run([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); },
-              VideoCommon::DrainSite::FenceRelease, VideoCommon::Nx2FastDrawCount::Neutral());
+              VideoCommon::DrainSite::FenceRelease,
+              VideoCommon::Nx2FastDrawCount::Neutral() |
+                  VideoCommon::StageTagBits(VideoCommon::StageTag::Cache));
 }
 
 // How a suspended acquire was found met (Puller::PendingAcquire::resume_route, set by
@@ -1629,9 +1635,11 @@ static bool RunaheadAnswer(DmaPusher& dma_pusher, const Puller::PendingAcquire& 
     if (mode == Runahead::Mode::On) {
         RunaheadBoundary(dma_pusher, acquire, device, *release, position);
     }
+    // Memory stage tag Cache: the fence manager only; no 3D state.
     split.Defer([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); },
                 VideoCommon::GpuSplit::Effect::Unknown,
-                VideoCommon::Nx2FastDrawCount::Neutral());
+                VideoCommon::Nx2FastDrawCount::Neutral() |
+                    VideoCommon::StageTagBits(VideoCommon::StageTag::Cache));
     split.NoteMemoryWrite();
     // A host-level wait for the commands after it, as the drain was.
     split.NoteSync();
@@ -2529,9 +2537,12 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
     // Acquires: the result only feeds the warning below, so with the split the pending fences are
     // released in order on the back instead of after a drain (ported). Later
     // GPU-written list fetches and macro reads still wait for the work before it (NoteSync).
+    // Memory stage tag Cache (both closures here, fable_stage_levelpoints 14.5): the fence manager
+    // only; no 3D state.
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
         OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); },
-               VideoCommon::Nx2FastDrawCount::Neutral());
+               VideoCommon::Nx2FastDrawCount::Neutral() |
+                   VideoCommon::StageTagBits(VideoCommon::StageTag::Cache));
         split.NoteSync();
         return;
     }
@@ -2540,7 +2551,8 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
         VideoCommon::GpuSplit::Get().Active()) {
         // Only the warning below reads the result: release the fences in order instead.
         OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); },
-               VideoCommon::Nx2FastDrawCount::Neutral());
+               VideoCommon::Nx2FastDrawCount::Neutral() |
+                   VideoCommon::StageTagBits(VideoCommon::StageTag::Cache));
         return;
     }
     DrainBack();
@@ -2683,8 +2695,11 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
     }
     case BufferMethods::MemOpB: {
         // Implement this better.
+        // Memory stage tag Cache: a gather (the buffer, texture and pipeline caches); no 3D
+        // state, no Query.
         OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->InvalidateGPUCache(); },
-               VideoCommon::Nx2FastDrawCount::Neutral());
+               VideoCommon::Nx2FastDrawCount::Neutral() |
+                   VideoCommon::StageTagBits(VideoCommon::StageTag::Cache));
         break;
     }
     case BufferMethods::MemOpC:

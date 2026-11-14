@@ -73,15 +73,19 @@ public:
             TryReleasePendingFences<false>();
         }
         // FRITCHII_MEMSTAGE_PASS (fable_stage_levelpoints 6.5): served, this is a passed entry's
-        // flush grouping, which GPUMem passed only with no uncommitted flush (rule C): nothing to
-        // group, and the back stays out of the buffer cache. A set note there is a must-be-0 (it
-        // then groups as today).
+        // flush grouping. MARKS_AHEAD off: GPUMem passed it only with no uncommitted flush (rule
+        // C): nothing to group, and the back stays out of the buffer cache; a set note there is a
+        // must-be-0 (it then groups as today). MARKS_AHEAD on (14.7): GPUMem does not test rule C;
+        // a played packet's marks may still queue a download (AheadDue, as CommitCacheFlushes),
+        // so the back groups here under the lock at its own place, and that is no failure.
         if (MemoryStageLink::BackServed()) [[unlikely]] {
-            if (!buffer_cache.MayHaveUncommittedFlushes()) {
+            if (!buffer_cache.MayHaveUncommittedFlushes() && !buffer_cache.AheadDue()) {
                 return;
             }
-            MemoryStageLink::Note(MemoryStageLink::Check::PassFlushes,
-                                  "FenceManager::SignalOrdering");
+            if (!buffer_cache.MarksAhead()) {
+                MemoryStageLink::Note(MemoryStageLink::Check::PassFlushes,
+                                      "FenceManager::SignalOrdering");
+            }
         }
         std::scoped_lock lock{buffer_cache.mutex};
         // FRITCHII_MEMSTAGE_MARKS_AHEAD: on the back, under the lock, also while served
