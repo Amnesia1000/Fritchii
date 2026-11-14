@@ -197,6 +197,54 @@ and by the other routes (word read, front answer, poll drain, lagged check).
 - Reading it: latch resumes by releases known at send are what resolving acquires at the front
   (resume when the newest queued release over the word has a known value that meets it) would
   take off the front's blocked time.
+- With EDEN_NX2_ACQUIRE_TABLE_FIRST on, its resumes count under "the other routes".
+
+### EDEN_NX2_ACQUIRE_TABLE_FIRST
+
+EDEN_NX2_ACQUIRE_TABLE_FIRST (live, default 0 = exactly as before; fable_front_drains 2.3 item 2
+and 6.3). A suspended acquire's poll (Puller::CanResumeAcquire) asks the front's release table
+right after the latch: before the word read (SEM_FAST's read, which waits for the noted writers
+of the word when it can't overlay them) and above the unmet-poll throttle (16 polls or 1 ms, and
+EXP12=5/6's 1 ms lagged check), which held MetByQueuedRelease back until then. Every poll point
+the front has asks (each command list's end, the idle loop), so the first poll after another
+channel sent the release asks too. Never inside a list: that would change the channels' order.
+- 1: met when the newest release recorded for the word (GpuSplit::NoteRelease) is a puller
+  release (WriteLong, SEM_EXECUTE) or a 3D payload release (4 bytes) or report (16 bytes), all
+  known at send, still queued, with a payload that meets the acquire and nothing sent after it
+  that may write the word: MetByQueuedRelease's rule, which the acquire's parse and the throttled
+  poll already use. The resumed channel's entries go into the ring after the release, so the
+  back runs the release first, and the answer is the one a later poll would give from the word
+  once the back ran it. Off with delayed fences (the release lands at a later fence), and for the
+  16-byte report with accurate queries (its operation waits for a fence too). Compute 0x6c3
+  releases stay with the throttled path.
+- 2: also the QMD feed (EXP13=3/4, MetByQmdPrediction) at the same place, before the word read
+  (today it is asked after it, also above the throttle). Its own rules, unchanged. When a
+  prediction can be wrong: the QMD words the front's copy read differ from what the back reads at
+  the launch (a writer of the QMD the copy did not see, an overlay from guest memory), the
+  copy's scheduler differs from the back's (dependency counts, chained dependents, decrements),
+  or a max release or reduction (a bound, not a value). The checks: the back compares every
+  release it makes with its record (the feed turns itself off for the session at the first
+  mismatch, an ERROR line) and the feed audits each acquire it met ("acquire wrongly met"). Both
+  find a wrong answer only after the resumed channel ran, so 2 stays a test mode. When the table
+  does not meet, the poll asks the feed again after the word read (that read may have waited), so
+  the feed's gate counters count both asks.
+- Must be 0 (1's resumes): each resume watches its word with a waiter of its own
+  (Nx2SemaphoreWaiters, added before the last check); once the back ran the release (`consumed`
+  past it, its async report settled) the waiter must have latched, that is the back wrote a value
+  that meets the acquire. If the word already met when the waiter was added (the release landed
+  first), the watch is not judged. 16 watches at most; one not settled within 2 s is dropped
+  ("unresolved"). "Acquire table first (must be 0): device d op o value v: the release it was
+  resumed on (payload p, ring r) ran, and no write that met it was seen; the word is w now" for the
+  first 8.
+- "Acquire table first (EDEN_NX2_ACQUIRE_TABLE_FIRST=n) 5 s" (HW_GPU, Info): resumes a second by
+  kind (puller release, 3D payload release (4 bytes), 3D payload report (16 bytes), QMD feed
+  exact, QMD feed other), the watches (met at the write, landed before the watch, unwatched,
+  unresolved after 2 s, open) and the must-be-0 count with the session total.
+- Expected: small. At the market the 256 3D payload releases and 228 QMD releases a second that
+  met parked acquires were resumed by the latch: the back had run them by the next poll point,
+  which the front reaches only at a list's end. What 1 can take are the polls where the release
+  was queued but the word read could not show it, or waited for it (a 16-byte note over the word,
+  the throttle).
 
 ### EDEN_NX2_ACCURATE_PARTS
 
