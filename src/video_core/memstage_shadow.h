@@ -259,7 +259,20 @@ inline constexpr std::size_t ProgramWordCount = 49;
 struct ProgramId {
     u64 key{};
     std::array<u64, ProgramWordCount> words{};
+    /// The code itself, what the facts table is keyed by (2026-11-15: the words alone are no
+    /// identity; the same program addresses in another channel, or after a remap, are other
+    /// code): the address space (its memory manager's id + 1) and each program slot's device
+    /// address (program region + offset through that address space; 0 when the slot is off or
+    /// unmapped). ResolveProgramCode fills them.
+    u64 space{};
+    std::array<u64, 6> code{};
 };
+/// Fills `id.space` and `id.code` from `id.words` (ProgramWords' layout) through `memory`.
+/// Translated once per program register change: kept per thread while the words, the address
+/// space and its map serial stay the same.
+void ResolveProgramCode(const Tegra::MemoryManager& memory, ProgramId& id);
+/// StageProgramWords' twin for the code: through the copy's back engine's address space.
+void StageProgramCode(const MemStageShadowEngine& copy, ProgramId& id);
 void BackProgramId(const Tegra::Engines::Maxwell3D& maxwell3d, ProgramId& out);
 void StageProgramId(const MemStageShadowEngine& copy, ProgramId& out);
 /// StageProgramId in two steps (FRITCHII_MEMSTAGE_SETUP_KEEP): the copy's program words, then

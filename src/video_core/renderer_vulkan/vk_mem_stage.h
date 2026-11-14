@@ -590,6 +590,11 @@ public:
     [[nodiscard]] bool LookupFacts(const ProgramId& id, StagedFacts& out) const;
     /// The facts table's generation (bumped under its lock at every write): while it holds, a
     /// lookup of the same registers gives what it gave (FRITCHII_MEMSTAGE_SETUP_KEEP).
+    /// The back's held ring packet: the vertex and fragment program hashes of the facts its fill
+    /// used (one follower's pre-record check against the pipeline about to be bound).
+    [[nodiscard]] const std::array<u64, 2>& HeldHashes() const noexcept {
+        return held_hashes;
+    }
     [[nodiscard]] u64 FactsGeneration() const noexcept {
         // A code write (the program code epoch) changes what a lookup gives as a table write does.
         return facts_generation.load(std::memory_order_acquire) +
@@ -1109,10 +1114,12 @@ private:
 
     // The facts table (spec 4.4): open addressing under a lock (written rarely, by the back).
     using ProgramWords = std::array<u64, VideoCommon::MemStageShadow::ProgramWordCount>;
+    /// Slots match on the code identity (ProgramId's space and code), the key is its hash.
     struct FactsSlot {
         u64 key{};
         const void* source{};
-        ProgramWords words{};
+        u64 space{};
+        std::array<u64, 6> code{};
         StagedFacts facts{};
         u64 epoch{}; ///< the program code epoch the facts are good for (a lookup's minimum)
     };
@@ -1126,7 +1133,8 @@ private:
     struct PublishedMemo {
         u64 key{};
         const void* source{};
-        ProgramWords words{};
+        u64 space{};
+        std::array<u64, 6> code{};
         u64 epoch{};
     };
     static constexpr size_t MemoSlots = 1024;
@@ -1134,7 +1142,8 @@ private:
     /// GPUMem's: the entries it looked up, valid while the generation it saw holds.
     struct StageFactsSlot {
         u64 key{};
-        ProgramWords words{};
+        u64 space{};
+        std::array<u64, 6> code{};
         StagedFacts facts{};
         u64 epoch{};
     };

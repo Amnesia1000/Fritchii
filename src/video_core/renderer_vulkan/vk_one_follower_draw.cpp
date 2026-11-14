@@ -320,6 +320,8 @@ bool OneFollowerDraw::FillRing(Maxwell3D& engine, bool is_indexed, u64 position,
         FillRecord& record = fill_records[seq % FillRecords];
         record.seq = seq;
         record.key = program_id.key;
+        record.space = program_id.space;
+        record.code = program_id.code;
         record.words = program_id.words;
         record.hashes = facts.hashes;
         record.uniform_masks = facts.uniform_masks;
@@ -341,7 +343,7 @@ void OneFollowerDraw::LendDraw(bool is_indexed, u32 instance_count, LentReason r
                                                    program_id);
         MemStage::StagedFacts looked{};
         if (rasterizer.mem_stage.LookupFacts(program_id, looked)) {
-            expect = FactsExpect{true, looked.hashes};
+            expect = FactsExpect{true, looked.hashes, program_id.space};
         }
     }
     auto body = [this, is_indexed, instance_count, verify, expect] {
@@ -422,7 +424,13 @@ void OneFollowerDraw::RunLent(bool is_indexed, u32 instance_count, bool verify,
     // difference is a stale entry (the 2026-11-14 step 4 failure, caught at step 3).
     if (expect.found && rasterizer.onef_pipeline_seen &&
         expect.hashes != rasterizer.onef_pipeline_hashes) [[unlikely]] {
-        OneF::Note(Check::FactsStale, "lent draw: the facts entry for its program registers");
+        thread_local std::string note;
+        note = fmt::format("lent draw: the facts entry E would use {:#x}/{:#x}, the pipeline drawn "
+                           "{:#x}/{:#x}; E's address space {}, R's {}",
+                           expect.hashes[0], expect.hashes[1],
+                           rasterizer.onef_pipeline_hashes[0], rasterizer.onef_pipeline_hashes[1],
+                           expect.space, rasterizer.gpu_memory->GetID() + 1);
+        OneF::Note(Check::FactsStale, note.c_str());
     }
 }
 
@@ -686,6 +694,15 @@ void OneFollowerDraw::ReportDescriptorMismatch(const GraphicsPipeline& pipeline,
             have_fill ? std::popcount(fill.uniform_masks[stage]) : -1,
             have_fill ? static_cast<int>(fill.ssbo_counts[stage]) : -1);
     }
+    std::string code_text;
+    if (have_fill) {
+        for (size_t slot = 0; slot < fill.code.size(); ++slot) {
+            if (fill.code[slot] != view_id.code[slot]) {
+                code_text += fmt::format("{}[{}] E {:#x} R {:#x}", code_text.empty() ? "" : ", ",
+                                         slot, fill.code[slot], view_id.code[slot]);
+            }
+        }
+    }
     std::string words_text;
     size_t differing = 0;
     if (have_fill) {
@@ -707,12 +724,15 @@ void OneFollowerDraw::ReportDescriptorMismatch(const GraphicsPipeline& pipeline,
         "One follower: unlent draw descriptor mismatch (expected {}, got {}): packet {} draw seq "
         "{} ring B {} position {:#x}; E's fill {}: program key {:#x}, hashes {:#x}/{:#x}, stages "
         "{:#x}; R's pipeline: hashes {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}, stages {:#x}, view "
-        "program key {:#x}; program words E vs R: {} differ{}{}; per stage: {}; the facts table "
-        "now for R's key: {} (hashes {:#x}/{:#x}, stages {:#x})",
+        "program key {:#x}; address spaces (channel's memory manager id + 1) E {} R {} (R bound "
+        "{}); program code addresses E vs R: {}; program words E vs R: {} differ{}{}; per stage: "
+        "{}; the facts table now for R's code: {} (hashes {:#x}/{:#x}, stages {:#x})",
         expected, got, header.number, header.draw_seq, header.buffer_number, header.position,
         have_fill ? "recorded" : "not recorded (overwritten)", fill.key, fill.hashes[0],
         fill.hashes[1], fill.stages, hashes[0], hashes[1], hashes[2], hashes[3], hashes[4],
-        hashes[5], facts.stages, view_id.key, differing, differing != 0 ? ": " : "", words_text,
+        hashes[5], facts.stages, view_id.key, have_fill ? fill.space : 0, view_id.space,
+        self->rasterizer.gpu_memory->GetID() + 1, code_text.empty() ? "the same" : code_text,
+        differing, differing != 0 ? ": " : "", words_text,
         stages_text, in_table ? "found" : "missing", table.hashes[0], table.hashes[1],
         table.stages);
 }
