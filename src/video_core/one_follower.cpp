@@ -1545,6 +1545,8 @@ bool PostOpSite(u8 site) noexcept {
     switch (site) {
     case 15: // MemStage::Site::InlineUpload
         return SwitchValue(g_onef_op_inline, "FRITCHII_ONEF_OP_INLINE") != 0;
+    case 10: // MemStage::Site::Invalidation: E's buffer halves (INVAL_E, GATHER_E)
+        return SwitchValue(g_onef_op_inval, "FRITCHII_ONEF_OP_INVAL") != 0;
     default:
         return false;
     }

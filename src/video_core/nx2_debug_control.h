@@ -261,6 +261,8 @@ inline std::atomic<int> g_onef_op_clear{-1};
 /// FRITCHII_ONEF_TRACE (boot, default 0): fable_b 15.5's lend trace (one record per lend and
 /// per posted op) to the log folder.
 inline std::atomic<int> g_onef_trace{-1};
+/// FRITCHII_ONEF_OP_INVAL (live, default 0): fable_b 13.4, the invalidation site's buffer commands posted as op packets.
+inline std::atomic<int> g_onef_op_inval{-1};
 /// EDEN_NX2_LIGHT_TABLE_ARRAYS: docs/fritchii/switches.md.
 [[nodiscard]] inline bool LightTableArrays() {
     static const bool on = EnvSwitch("EDEN_NX2_LIGHT_TABLE_ARRAYS") > 0;

@@ -1408,6 +1408,10 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   lock handed over. Lent as before: a sync inside a held fill, E's own draw fill, no room, no
   packet ticks. Must be 0: "ring B pairing" (R found another packet at the head), "owner on R"
   (an entry's play entered the buffer cache). The "One follower op packets" line counts them.
+- FRITCHII_ONEF_OP_INVAL (live, default 0; fable_b_one_follower 13.4, step 4): 1 = the buffer
+  commands E's own invalidation work records (INVAL_E's draw invalidation, GATHER_E's gathers:
+  the Invalidation site) are posted as ring B op packets, as FRITCHII_ONEF_OP_INLINE does for
+  inline uploads, instead of a lent seam play (which E made holding the buffer cache's lock).
 - FRITCHII_ONEF_OP_CLEAR (live, default 0; fable_b_one_follower 13.4 group 3; step 4, view
   tracked): 1 = clears are render ops. E has decided the render enable (DrawManager tests
   ShouldExecute) and runs the clear's FlushCaching; R plays Clear from its view (every clear
