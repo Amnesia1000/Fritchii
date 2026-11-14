@@ -1182,7 +1182,7 @@ void Lend(LentOp op, LentReason reason, void (*function)(void*), void* argument)
 }
 
 void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size,
-            bool lands_in_memory) {
+            bool lands_in_memory, u8 packet_flags) {
     if (!Detail::t_engine || !g.thread.joinable() || size > MaxPayloadBytes) {
         function(const_cast<void*>(payload));
         return;
@@ -1194,6 +1194,7 @@ void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size,
     u8* const buffer = PackBuffer();
     PacketHeader header{};
     header.kind = PacketKind::Op;
+    header.flags = packet_flags;
     header.op = static_cast<u8>(op);
     header.call = LentCall{function, nullptr};
     std::size_t spans_bytes = 0;
@@ -1286,6 +1287,13 @@ bool InvalOnEngine() noexcept {
     return true;
 }
 
+bool PostClears() noexcept {
+    return g.on && Step() == StepLevel::Unlend &&
+           VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_op_clear,
+                                            "FRITCHII_ONEF_OP_CLEAR") != 0 &&
+           ViewReady();
+}
+
 bool PostOpSite(u8 site) noexcept {
     if (!g.on || Step() != StepLevel::Unlend) {
         return false;
@@ -1307,9 +1315,22 @@ void CountOpPacket(OpCount kind, u64 bytes) noexcept {
 }
 
 bool GatherOnEngine() noexcept {
-    return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_gather_e,
-                                            "FRITCHII_ONEF_GATHER_E") != 0 &&
-           InvalOnEngine();
+    const int value = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_gather_e,
+                                                       "FRITCHII_ONEF_GATHER_E");
+    const bool inval = value != 0 && InvalOnEngine();
+    // The guard's parts, logged once per change (the GATHER_E probe found it never true).
+    static std::atomic<int> logged{-1};
+    const int state = (value != 0 ? 1 : 0) | (inval ? 2 : 0) |
+                      (static_cast<int>(Step()) << 2) | (g_e_pipeline ? 32 : 0);
+    if (logged.exchange(state, std::memory_order_relaxed) != state) [[unlikely]] {
+        LOG_INFO(HW_GPU,
+                 "One follower: FRITCHII_ONEF_GATHER_E={} (INVAL_E's conditions {}, step {}, "
+                 "E_PIPELINE {}, INVAL_E switch {})",
+                 value, inval ? "met" : "not met", static_cast<int>(Step()), g_e_pipeline ? 1 : 0,
+                 VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_inval_e,
+                                                  "FRITCHII_ONEF_INVAL_E"));
+    }
+    return inval;
 }
 
 bool CopyOnEngine() noexcept {

@@ -276,7 +276,8 @@ std::size_t PackSpans(const Maxwell3D& engine, PacketHeader& header, std::span<u
     // the engine's flags after it). The shared flags always by difference: E keeps its copy.
     const FlagBits now = engine.dirty.flags & parts.forward;
     FlagBits raised;
-    if (header.kind == PacketKind::Draw) {
+    if (header.kind == PacketKind::Draw ||
+        (header.kind == PacketKind::Op && (header.flags & PacketRenderState) != 0)) {
         raised = (now & parts.render_only) | (now & parts.shared & ~g_e.after);
         const_cast<Maxwell3D&>(engine).dirty.flags &= ~parts.render_only; // E's engine
     } else {

@@ -256,6 +256,8 @@ inline std::atomic<int> g_onef_gather_e{-1};
 /// FRITCHII_ONEF_OP_INLINE (live, default 0): fable_b 13.4 group 1, inline uploads' buffer
 /// commands posted as ring B op packets.
 inline std::atomic<int> g_onef_op_inline{-1};
+/// FRITCHII_ONEF_OP_CLEAR (live, default 0): fable_b 13.4 group 3, clears as render ops.
+inline std::atomic<int> g_onef_op_clear{-1};
 /// EDEN_NX2_LIGHT_TABLE_ARRAYS: docs/fritchii/switches.md.
 [[nodiscard]] inline bool LightTableArrays() {
     static const bool on = EnvSwitch("EDEN_NX2_LIGHT_TABLE_ARRAYS") > 0;

@@ -1408,6 +1408,11 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   lock handed over. Lent as before: a sync inside a held fill, E's own draw fill, no room, no
   packet ticks. Must be 0: "ring B pairing" (R found another packet at the head), "owner on R"
   (an entry's play entered the buffer cache). The "One follower op packets" line counts them.
+- FRITCHII_ONEF_OP_CLEAR (live, default 0; fable_b_one_follower 13.4 group 3; step 4, view
+  tracked): 1 = clears are render ops. E has decided the render enable (DrawManager tests
+  ShouldExecute) and runs the clear's FlushCaching; R plays Clear from its view (every clear
+  register is a watched word) without it. The op carries its R-only dirty flags by rule 1, as a
+  draw packet does (PacketRenderState). Counted as "clear" lends gone from the lends-by-site line.
 - With FRITCHII_ONEF=1 (or LEAN), every 10 s "One follower lends by site" lists the 16 lent
   call sites that parked E longest (the rasterizer function's name and its op, rate and parked
   ms/s; "direct" = Lend called outside the rasterizer's entry points: lent draws, verify

@@ -227,6 +227,10 @@ enum PacketFlag : u8 {
     /// mode (DrawPlayer::Condition, at the condition's stream place) is not False; a dropped
     /// draw's ring B packet is still played (its uploads and binds). Step 5 sets it; R honours it.
     PacketConditional = 4,
+    /// An op packet whose call reads and consumes R's render state (a clear): its R-only dirty
+    /// flags go by rule 1, as a draw packet's (PackSpans forwards each set one and clears it on
+    /// E's engine), not by difference.
+    PacketRenderState = 8,
 };
 
 /// One changed register word R watches.
@@ -521,8 +525,14 @@ void CountLentGatherRanges(u64 ranges) noexcept;
 /// `size` bytes (at most 64) copied into the packet. Elsewhere it runs in place.
 /// `lands_in_memory`: the op writes game memory later on R (a report): the front's E-position
 /// waits (FRITCHII_ONEF_WAITS_E) also wait for R to play it (GuestWriteOpMark).
+/// `packet_flags`: PacketFlag bits for the op's header (PacketRenderState).
 void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size,
-            bool lands_in_memory = false);
+            bool lands_in_memory = false, u8 packet_flags = 0);
+/// FRITCHII_ONEF_OP_CLEAR (live; fable_b 13.4 group 3; step 4, the view tracked): clears as render
+/// ops R plays from its view; E runs the clear's FlushCaching first.
+[[nodiscard]] bool PostClears() noexcept;
+/// E: the view is tracked and seeded at R (a posted op reads it).
+[[nodiscard]] bool ViewReady() noexcept;
 
 /// FRITCHII_ONEF_WAITS_E (live; fable_b 11.2): the front's waits on game memory, QMDs,
 /// semaphore flushes and lists read E's position (`consumed`), the rest R's (`played`).

@@ -232,6 +232,10 @@ private:
     /// E: a render enable that can begin host conditional rendering was lent (sticks). While
     /// false, FRITCHII_ONEF_QUERY_OPS sends no override/True/False render enable.
     bool onef_condition_may_be_set{};
+    /// R: inside a posted clear (FRITCHII_ONEF_OP_CLEAR): E ran its FlushCaching.
+    bool onef_clear_posted{};
+    /// E: FRITCHII_ONEF_GATHER_E's runahead condition (logged once per change).
+    [[nodiscard]] bool OneFollowerRunaheadOff(const char* where);
     /// E: the pages of the report ops it pushed (FRITCHII_ONEF_QUERY_OPS), for item 2's test.
     std::unique_ptr<VideoCommon::PageFilter> onef_report_pages;
     /// E (FRITCHII_ONEF_INVAL_E): whether this invalidation runs on E (no range on R's pages).
