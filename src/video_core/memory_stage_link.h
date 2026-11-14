@@ -62,6 +62,23 @@ public:
         ListReadBack,
         ListArgsMissing,
         ListArgsUnasked,
+        GatherMissing,
+        GatherOrphan,
+        GatherDrawBetween,
+        Count,
+    };
+
+    /// FRITCHII_MEMSTAGE_GATHER: what became of a gather (3D invalidate_texture_data_cache) GPUMem's
+    /// copy reached (counted).
+    enum class GatherOutcome : u8 {
+        Served,       ///< the back ran it at its entry on GPUMem's request, GPUMem level, no run
+        Closed,       ///< level: the switch off or the window closed (a run starts)
+        NotFirst,     ///< level: not a lone Direct method, or a draw before it in its entry
+        DeferredDraw, ///< level: the back had a deferred draw it would issue first at the entry
+        NoRoom,       ///< level: no room for its record
+        Stopping,     ///< level: GPUMem is stopping
+        InRun,        ///< inside a level run (followed; the back runs it lent)
+        Late,         ///< in an entry that was hard already
         Count,
     };
 
@@ -80,6 +97,7 @@ public:
         Copy,        ///< a full copy of the back's engine (a new or stale copy)
         WritingDraw, ///< a draw whose fill marks buffers GPU-written (storage writes, xfb)
         Claim,       ///< collected constant buffer ranges over GPU-written buffer data
+        Gather,      ///< a gather the back runs at its entry (FRITCHII_MEMSTAGE_GATHER)
         Count,
     };
 
@@ -130,6 +148,9 @@ public:
         /// GPUMem, at a list draw of its copy: whether the back reads the two words on the CPU
         /// (RasterizerVulkan::DrawListWords' test, on the copy's registers and draw state).
         bool (*list_reads_back)(void* context, const MemStageShadowEngine& copy){};
+        /// GPUMem, level at a gather's entry (the back parked there; FRITCHII_MEMSTAGE_GATHER):
+        /// the back runs the gather now, as a request GPUMem waits for (ServeNow).
+        void (*gather)(void* context){};
     };
 
     [[nodiscard]] static MemoryStageLink& Get() noexcept {
@@ -156,6 +177,13 @@ public:
     template <typename F>
     void Serve(F& function) {
         Serve([](void* argument) { (*static_cast<F*>(argument))(); }, &function);
+    }
+    /// Serve without the window's catch-up: GPUMem in its entry, level (StageLevel), so the back is
+    /// parked at the entry with every packet before it played.
+    void ServeNow(Function function, void* argument);
+    template <typename F>
+    void ServeNow(F& function) {
+        ServeNow([](void* argument) { (*static_cast<F*>(argument))(); }, &function);
     }
 
     [[nodiscard]] static bool OnStageThread() noexcept {
@@ -298,6 +326,37 @@ public:
         counters.list_drawn.store(counters.list_drawn.load(std::memory_order_relaxed) + 1,
                                   std::memory_order_relaxed);
     }
+    /// The back, at a frame end: FRITCHII_MEMSTAGE_GATHER (live, default off).
+    void SetGather(bool on);
+    /// GPUMem has the back run gathers at their entry: the switch on and the window open.
+    [[nodiscard]] static bool GatherServed() noexcept {
+        return g_gather.load(std::memory_order_relaxed) &&
+               g_ahead.load(std::memory_order_relaxed) != 0;
+    }
+    /// GPUMem: a gather of its copy, and what became of it (`ns`: GPUMem's time for a served one).
+    void NoteGather(GatherOutcome what, u64 ns = 0) noexcept {
+        BumpOne(counters.gathers[static_cast<size_t>(what)], 1);
+        BumpOne(counters.gather_ns, ns);
+    }
+    /// GPUMem, after a served gather: what the back's run of it found (counted).
+    void NoteGatherRun(bool synced_queries, u64 ranges, bool gpu_written) noexcept {
+        BumpOne(counters.gather_synced, synced_queries ? 1 : 0);
+        BumpOne(counters.gather_ranges, ranges);
+        BumpOne(counters.gather_gpu_written, gpu_written ? 1 : 0);
+    }
+    /// GPUMem: room for one more gather record.
+    [[nodiscard]] bool GatherRoom() const noexcept {
+        return gather_tail.load(std::memory_order_relaxed) -
+                   gather_head.load(std::memory_order_acquire) <
+               GatherSlots;
+    }
+    /// GPUMem: the back ran the gather of the entry at `position` (its draw count then
+    /// `draw_seq`); its own run of that entry skips it (BackTakeGather).
+    void PushGather(u64 position, u64 draw_seq) noexcept;
+    /// The back, at a gather (RasterizerVulkan::InvalidateTextureDataCache): true when GPUMem had
+    /// it run already at this entry. Counts the must-be-0 cases (a served one with no record, a
+    /// record of an entry the back passed, a draw in between).
+    [[nodiscard]] bool BackTakeGather(u64 position) noexcept;
     /// The entry turned hard at a constant buffer write onto GPU-written data (counted).
     void NoteWriteLevel() noexcept {
         counters.write_levels.store(counters.write_levels.load(std::memory_order_relaxed) + 1,
@@ -501,6 +560,12 @@ private:
     static inline std::atomic<u32> g_ahead{0};
     static inline std::atomic<bool> g_verify{false};
     static inline std::atomic<bool> g_list_draws{false};
+    static inline std::atomic<bool> g_gather{false};
+
+    /// A stats counter: a plain load and store (one writer each, or a lost count is fine).
+    static void BumpOne(std::atomic<u64>& counter, u64 amount) noexcept {
+        counter.store(counter.load(std::memory_order_relaxed) + amount, std::memory_order_relaxed);
+    }
 
     static inline thread_local bool t_on_stage{};
     /// GPUMem runs a call the back posted (a served call): its syncs go to the back at once.
@@ -597,6 +662,20 @@ private:
     std::unique_ptr<StageWrite[]> stage_writes;
     std::atomic<u64> stage_write_count{0};
     void NoteImageRegisteredSlow(u64 address, u64 size);
+    /// FRITCHII_MEMSTAGE_GATHER: the gathers GPUMem had the back run at their entry, oldest first
+    /// (one writer, GPUMem; one reader, the back). Emptied at the ring's start and end.
+    struct GatherRecord {
+        u64 position;
+        u64 draw_seq; ///< the back's draw count when it ran the gather
+    };
+    static constexpr u64 GatherSlots = 256;
+    std::array<GatherRecord, GatherSlots> gather_records{};
+    alignas(64) std::atomic<u64> gather_tail{0}; ///< pushed (GPUMem)
+    alignas(64) std::atomic<u64> gather_head{0}; ///< taken (the back)
+    /// The back: drops the records of entries before `before` (each one must-be-0 orphan).
+    void BackDropGathers(u64 before, const char* where) noexcept;
+    /// FRITCHII_MEMSTAGE_GATHER's last value logged (-1: none yet).
+    int gather_logged{-1};
     /// GPUMem's thread id (the back serves it while it waits for a lock GPUMem holds).
     std::atomic<std::thread::id> stage_thread{};
     /// Bumped while the back waits for a lock GPUMem holds (StageSyncCatchUp gives up then).
@@ -649,6 +728,11 @@ private:
         std::atomic<u64> stage_idles{};
         std::atomic<u64> run_input_waits{};   ///< fps fix 3: a run kept lent at the input's end
         std::array<std::atomic<u64>, static_cast<size_t>(ListDraw::Count)> list_draws{};
+        std::array<std::atomic<u64>, static_cast<size_t>(GatherOutcome::Count)> gathers{};
+        std::atomic<u64> gather_ns{};          ///< GPUMem in served gathers (level wait and run)
+        std::atomic<u64> gather_synced{};      ///< served ones whose wait for idle synced queries
+        std::atomic<u64> gather_ranges{};      ///< game write ranges the served ones applied
+        std::atomic<u64> gather_gpu_written{}; ///< served ones with a range by GPU-written data
         // The back's.
         alignas(64) std::array<std::atomic<u64>, static_cast<size_t>(HandOff::Count)> calls{};
         std::atomic<u64> call_ns{};
@@ -667,6 +751,8 @@ private:
         std::atomic<u64> hook_flushes{};      ///< the back's skipped idle hook, its flush run
         std::atomic<u64> ring_wakes{};        ///< takes that woke GPUMem (window or room wait)
         std::atomic<u64> list_drawn{};        ///< served list draws drawn from the packet's buffer
+        std::atomic<u64> gathers_taken{};     ///< gathers the back found run at their entry
+        std::atomic<u64> gathers_taken_run{}; ///< ... of them inside a level run
         // Either thread's, rare (the must-be-0 checks).
         alignas(64) std::array<std::atomic<u64>, static_cast<size_t>(Check::Count)> checks{};
     };
@@ -737,6 +823,13 @@ private:
         u64 run_input_waits{};
         std::array<u64, static_cast<size_t>(ListDraw::Count)> list_draws{};
         u64 list_drawn{};
+        std::array<u64, static_cast<size_t>(GatherOutcome::Count)> gathers{};
+        u64 gather_ns{};
+        u64 gather_synced{};
+        u64 gather_ranges{};
+        u64 gather_gpu_written{};
+        u64 gathers_taken{};
+        u64 gathers_taken_run{};
     };
     void Take(Snapshot& out) const noexcept;
     Snapshot reported{};

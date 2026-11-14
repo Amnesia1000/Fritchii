@@ -3220,6 +3220,10 @@ void MemStage::TickThread(int seam) {
     // (Link::ListDrawsServed); level mode and THREAD 0/1 never serve them.
     link.SetListDraws(
         Debug::SwitchValue(Debug::g_memstage_list_draws, "FRITCHII_MEMSTAGE_LIST_DRAWS", 1) > 0);
+    // Gathers run at their entry with GPUMem level instead of a run (live, default off): only
+    // while the window is open (Link::GatherServed); level mode and THREAD 0/1 never.
+    link.SetGather(
+        Debug::SwitchValue(Debug::g_memstage_gather, "FRITCHII_MEMSTAGE_GATHER", 0) > 0);
     // The window's verify (its own-write ring and the image check) only with a verify on.
     Link::SetVerify(read_log_every > 0 || Link::RingVerify());
     ring_read_log.store(read_log_every > 0 && Link::Ahead() != 0, std::memory_order_relaxed);

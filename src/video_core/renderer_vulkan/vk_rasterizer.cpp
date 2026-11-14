@@ -1152,6 +1152,14 @@ namespace {
 /// The back is in DispatchCompute (fable_memstage_compute_brief 3: served calls by cause).
 thread_local bool t_in_dispatch = false;
 
+/// FRITCHII_MEMSTAGE_GATHER: what the back's run of a gather GPUMem asked for applied (its
+/// OnCacheInvalidations, StageRunGather's request), for the gather line. Null otherwise.
+struct GatherProbe {
+    u64 ranges;
+    bool gpu_written;
+};
+thread_local GatherProbe* t_gather_probe = nullptr;
+
 /// List draws (nx2_list_draw.h): whether DrawListWords reads the two words back on the CPU
 /// instead of drawing indirectly from them. GPUMem asks the same of its copy's registers and draw
 /// state (FRITCHII_MEMSTAGE_LIST_DRAWS): such a list draw stays level. The list draw mode and
@@ -1266,6 +1274,9 @@ void RasterizerVulkan::SetRingBackend() {
     };
     backend.list_reads_back = [](void*, const VideoCommon::MemStageShadowEngine& copy) {
         return ListDrawReadsBack(copy.draw_manager.draw_state, copy.regs);
+    };
+    backend.gather = [](void* context) {
+        static_cast<RasterizerVulkan*>(context)->StageRunGather();
     };
     Link::Get().SetRingBackend(backend);
 }
@@ -1483,6 +1494,60 @@ bool RasterizerVulkan::StageRangesOverGpuWritten(
         }
     }
     return false;
+}
+
+void RasterizerVulkan::StageRunGather() {
+    // GPUMem, level at the gather's entry (MemStageShadow's StageGather): the back is parked there
+    // with every packet before it played and GPUMem waits outside any fill, so the back serving
+    // this request is the cache's only user, at the gather's place in the stream. It runs what its
+    // own run of the entry would: InvalidateTextureDataCache's default, the same code as THREAD 0.
+    // Counted: whether the wait for idle had query results to sync (they need the buffer cache at
+    // this place: why the gather can't be GPUMem's own work), and the game write ranges.
+    struct Run {
+        RasterizerVulkan* self;
+        bool synced;
+        GatherProbe probe;
+    } run{this, false, GatherProbe{0, false}};
+    auto body = [&run] {
+        RasterizerVulkan& self = *run.self;
+        run.synced = self.query_cache.HasPendingSync();
+        t_gather_probe = &run.probe;
+        SCOPE_EXIT {
+            t_gather_probe = nullptr;
+        };
+        self.InvalidateGPUCache();
+        t_gather_probe = nullptr;
+        self.WaitForIdle();
+    };
+    VideoCommon::MemoryStageLink& link = VideoCommon::MemoryStageLink::Get();
+    link.ServeNow(body);
+    link.NoteGatherRun(run.synced, run.probe.ranges, run.probe.gpu_written);
+}
+
+void RasterizerVulkan::ProbeGatherRanges(std::span<const std::pair<DAddr, u64>> ranges) {
+    // The back serving StageRunGather's request, before the ranges are applied: would a gather on
+    // GPUMem have had to come level for GPU-written data on their pages (WriteMemory downloads or
+    // uploads in place there)? Counted only; the page bits first, then the cache under its lock.
+    GatherProbe& probe = *t_gather_probe;
+    probe.ranges += ranges.size();
+    if (probe.gpu_written) {
+        return;
+    }
+    for (const auto& [addr, size] : ranges) {
+        if (addr == 0 || size == 0) {
+            continue;
+        }
+        const DAddr begin = Common::AlignDown(addr, Core::DEVICE_PAGESIZE);
+        const DAddr end = Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE);
+        if (!MayBeGpuModified(begin, end - begin)) {
+            continue;
+        }
+        std::scoped_lock lock{buffer_cache.mutex};
+        if (buffer_cache.IsRegionGpuModified(begin, end - begin)) {
+            probe.gpu_written = true;
+            return;
+        }
+    }
 }
 
 void RasterizerVulkan::StageApplyRanges(std::span<const std::pair<DAddr, std::size_t>> ranges,
@@ -4632,6 +4697,9 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
 }
 
 void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) {
+    if (t_gather_probe != nullptr) [[unlikely]] {
+        ProbeGatherRanges(ranges); // FRITCHII_MEMSTAGE_GATHER's counters only
+    }
     // The memory seam's read log (5.3, test D): gathers applied on this thread.
     if (Common::WriteRing::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
         mem_stage.NoteGather(MemStage::Gather::Apply, 0);
@@ -4856,6 +4924,21 @@ bool RasterizerVulkan::TryCacheInvalidation(DAddr addr, u64 size) {
 
 void RasterizerVulkan::InvalidateGPUCache() {
     gpu.InvalidateGPUCache();
+}
+
+void RasterizerVulkan::InvalidateTextureDataCache() {
+    // FRITCHII_MEMSTAGE_GATHER: GPUMem, level at this entry, had the back run this gather already
+    // (StageRunGather); the back's own run of the entry skips it. BackTakeGather counts a served
+    // gather with no record (must be 0). Without the ring, and for every gather that started a
+    // run, the default below.
+    using Link = VideoCommon::MemoryStageLink;
+    if (Link::RingActive() &&
+        Link::Get().BackTakeGather(VideoCommon::GpuSplit::Get().BackEntryPosition()))
+        [[unlikely]] {
+        return;
+    }
+    InvalidateGPUCache();
+    WaitForIdle();
 }
 
 void RasterizerVulkan::UnmapMemory(DAddr addr, u64 size) {

@@ -148,6 +148,7 @@ public:
     bool TryCacheInvalidation(DAddr addr, u64 size) override;
     bool OnCPUWrite(DAddr addr, u64 size) override;
     void InvalidateGPUCache() override;
+    void InvalidateTextureDataCache() override;
     void UnmapMemory(DAddr addr, u64 size) override;
     void ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) override;
     void SignalFence(std::function<void()>&& func) override;
@@ -326,6 +327,11 @@ private:
     /// Step 7 (GPUMem): fills the window must not run ahead of (StageFillDraw).
     bool StageDrawWritesBuffers(const VideoCommon::MemStageShadowEngine& copy) const;
     bool StageRangesOverGpuWritten(std::span<const std::pair<DAddr, std::size_t>> ranges);
+    /// FRITCHII_MEMSTAGE_GATHER (GPUMem, level at a gather's entry): the back runs the gather's
+    /// handler now, as a request; then its counters.
+    void StageRunGather();
+    /// The served gather's game write ranges, while the back runs it (OnCacheInvalidations).
+    void ProbeGatherRanges(std::span<const std::pair<DAddr, u64>> ranges);
     /// Step 7 (GPUMem, in a served call): a download over a buffer joined ahead of the back.
     void CheckServedJoins(DAddr addr, u64 size);
     void InnerInvalidationServed(std::span<const std::pair<DAddr, std::size_t>> sequences);

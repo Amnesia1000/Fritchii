@@ -175,6 +175,24 @@
 // its busy time and fill time, full copies, flag hand-overs, served calls by cause, level draws by
 // kind, the verify hashes, and the must-be-0 counters. 5c's lines (runs by first hard kind, full
 // copies by cause, ...) come from the stage's own copy of the shadow's state every 10 s too.
+//
+// ---------------------------------------------------------------------------------------------
+// FRITCHII_MEMSTAGE_GATHER (live, default 0; the window open only): the gathers, 3D
+// invalidate_texture_data_cache (the game's collected CPU writes into the caches, then a wait for
+// idle), the top run starter at the market. They can't be GPUMem's own work: the wait for idle
+// syncs query results into buffers and groups the async flushes in the buffer cache at the
+// gather's place in the stream, with the back's query state there, and that sync is due at nearly
+// every gather. So a lone gather (the whole entry, no draw before it in it) makes GPUMem come
+// level at its entry instead of lending a run (StageLevel, reason "gather"): the back is parked
+// there with every packet before it played, GPUMem waits outside any fill, and the back runs the
+// method's handler as a request (ServeNow; the cache's only user while it serves, the same code
+// THREAD 0 runs there), with the cache's flags handed over around it as a run of that entry would.
+// GPUMem then records the entry (PushGather) and goes on; the back's own run of the entry finds
+// the record and skips the method (BackTakeGather; nothing of the entry comes before it there: a
+// lone method, and a deferred draw of the back's makes it a run). Must be 0: a served gather with
+// no record, a record of an entry the back passed (dropped at a later gather, a lend or the
+// ring's end), a draw on the back between the request and the entry. "Memory stage gathers"
+// logs the outcomes every 10 s (memstage_shadow.cpp's StageGather decides them).
 
 #include <algorithm>
 #include <bit>
@@ -304,6 +322,9 @@ constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::Check::Co
     "a served list draw the back would read back (the stage and the back decided differently)",
     "a served list draw whose packet has no list words buffer (the back asked the cache)",
     "a list draw packet at a back draw that asked for no list arguments (the draws differ)",
+    "a served gather with no record of GPUMem's (the back ran it in a served entry)",
+    "a gather GPUMem had the back run at an entry the back passed without it (record dropped)",
+    "a draw on the back between a gather GPUMem had it run and the gather's entry",
 };
 static_assert(LINK_CHECK_NAMES.back() != nullptr, "a name for every check");
 constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::ListDraw::Count)>
@@ -312,7 +333,17 @@ constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::ListDraw:
                     "level for a frame dump or trace"};
 static_assert(LIST_DRAW_NAMES.back() != nullptr, "a name for every list draw outcome");
 constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::LevelReason::Count)>
-    LEVEL_REASON_NAMES{"full copy", "writing draw", "ranges over GPU-written data"};
+    LEVEL_REASON_NAMES{"full copy", "writing draw", "ranges over GPU-written data", "gather"};
+constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::GatherOutcome::Count)>
+    GATHER_NAMES{"run at their entry",
+                 "level with the switch off or the window closed",
+                 "level not alone in their entry",
+                 "level after a deferred draw",
+                 "level with no record room",
+                 "level as GPUMem stopped",
+                 "inside a level run",
+                 "in an entry hard already"};
+static_assert(GATHER_NAMES.back() != nullptr, "a name for every gather outcome");
 constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::HandOff::Count)>
     LINK_HANDOFF_NAMES{"draw fills", "dispatch fills", "idle destroys", "served for the back"};
 constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::Served::Count)>
@@ -557,6 +588,14 @@ void MemoryStageLink::Serve(Function function, void* argument) {
         // Step 7: GPUMem's own fill, the window open. The back records this sync where it is;
         // the packets GPUMem sent before must be played first (StageSyncCatchUp).
         StageSyncCatchUp();
+    }
+    ServeNow(function, argument);
+}
+
+void MemoryStageLink::ServeNow(Function function, void* argument) {
+    if (!t_in_call) {
+        function(argument);
+        return;
     }
     request_function = function;
     request_argument = argument;
@@ -813,6 +852,9 @@ bool MemoryStageLink::BackRingTopImpl(u64 position) {
         }
         t_back_run = false;
         t_back_served = true;
+        // FRITCHII_MEMSTAGE_GATHER: no gather record outlives a ring (its end drops what is left).
+        gather_head.store(0, std::memory_order_relaxed);
+        gather_tail.store(0, std::memory_order_relaxed);
         MemStageShadow::SetRingBack(true);
         g_ring_active.store(true, std::memory_order_seq_cst);
         ring_start.store(position, std::memory_order_release);
@@ -836,6 +878,7 @@ bool MemoryStageLink::BackRingTopImpl(u64 position) {
                     Note(Check::PacketOrphan, "left in ring B when the ring ended");
                 }
             }
+            BackDropGathers(~u64{0}, "left when the ring ended");
             // GPUMem's unplayed mark must not outlive the ring (a fill that threw leaves its
             // entries pending and its number open): its entries are played, after the packets
             // of earlier entries above (they are later in the stream), and the mark cleared;
@@ -900,6 +943,9 @@ void MemoryStageLink::BackEntry(u64 position, const BackLimits& limits) {
                 Note(Check::PacketUnplayed, "at a lend");
             }
         }
+        // Gathers GPUMem had the back run at entries before the run: the back passed those
+        // entries (must be 0; a record of the run's first entry stays, its gather is ahead).
+        BackDropGathers(limits.lent_from, "at a lend");
         if (!lend_ranges.empty() && ring_backend.apply_ranges != nullptr) {
             // The stage's constant buffer ranges no fill applied yet (plan 6.2 item 2).
             ring_backend.apply_ranges(ring_backend.context, lend_ranges.data(),
@@ -1232,6 +1278,69 @@ void MemoryStageLink::SetListDraws(bool on) {
                  on ? "served by GPUMem while the window is open (FRITCHII_MEMSTAGE_AHEAD > 0)"
                     : "level draws, as before");
     }
+}
+
+void MemoryStageLink::SetGather(bool on) {
+    // At a frame end, as SetListDraws: GPUMem reads it at its next gather. Records already pushed
+    // are taken whatever the switch says (BackTakeGather does not read it).
+    g_gather.store(on, std::memory_order_relaxed);
+    if (mode == 2 && gather_logged != (on ? 1 : 0)) {
+        gather_logged = on ? 1 : 0;
+        LOG_INFO(HW_GPU, "Memory stage gathers (FRITCHII_MEMSTAGE_GATHER={}): {}", on ? 1 : 0,
+                 on ? "GPUMem comes level at a lone gather and has the back run it there, no run "
+                      "(while the window is open, FRITCHII_MEMSTAGE_AHEAD > 0)"
+                    : "each gather starts a level run, as before");
+    }
+}
+
+void MemoryStageLink::PushGather(u64 position, u64 draw_seq) noexcept {
+    // GPUMem only; GatherRoom said there is a slot (the back only frees them).
+    const u64 tail = gather_tail.load(std::memory_order_relaxed);
+    gather_records[tail % GatherSlots] = GatherRecord{position, draw_seq};
+    gather_tail.store(tail + 1, std::memory_order_release);
+}
+
+bool MemoryStageLink::BackTakeGather(u64 position) noexcept {
+    // Records are pushed in stream order before GPUMem publishes past their entry, so the back
+    // finds its entry's record first; older ones are entries it passed (must be 0).
+    u64 head = gather_head.load(std::memory_order_relaxed);
+    const u64 tail = gather_tail.load(std::memory_order_acquire);
+    bool taken = false;
+    while (head != tail) {
+        const GatherRecord& record = gather_records[head % GatherSlots];
+        if (record.position > position) {
+            break;
+        }
+        ++head;
+        if (record.position < position) {
+            Note(Check::GatherOrphan, "at a later gather");
+            continue;
+        }
+        if (record.draw_seq != back_draw_seq) [[unlikely]] {
+            Note(Check::GatherDrawBetween, "at the gather's entry");
+        }
+        LinkBump(counters.gathers_taken);
+        if (t_back_run) {
+            LinkBump(counters.gathers_taken_run);
+        }
+        taken = true;
+        break;
+    }
+    gather_head.store(head, std::memory_order_release);
+    if (!taken && BackServed()) [[unlikely]] {
+        Note(Check::GatherMissing, "RasterizerVulkan::InvalidateTextureDataCache");
+    }
+    return taken;
+}
+
+void MemoryStageLink::BackDropGathers(u64 before, const char* where) noexcept {
+    u64 head = gather_head.load(std::memory_order_relaxed);
+    const u64 tail = gather_tail.load(std::memory_order_acquire);
+    while (head != tail && gather_records[head % GatherSlots].position < before) {
+        ++head;
+        Note(Check::GatherOrphan, where);
+    }
+    gather_head.store(head, std::memory_order_release);
 }
 
 void MemoryStageLink::CloseBusyBatch() noexcept {
@@ -1860,6 +1969,15 @@ void MemoryStageLink::Take(Snapshot& out) const noexcept {
         out.list_draws[i] = load(counters.list_draws[i]);
     }
     out.list_drawn = load(counters.list_drawn);
+    for (size_t i = 0; i < out.gathers.size(); ++i) {
+        out.gathers[i] = load(counters.gathers[i]);
+    }
+    out.gather_ns = load(counters.gather_ns);
+    out.gather_synced = load(counters.gather_synced);
+    out.gather_ranges = load(counters.gather_ranges);
+    out.gather_gpu_written = load(counters.gather_gpu_written);
+    out.gathers_taken = load(counters.gathers_taken);
+    out.gathers_taken_run = load(counters.gathers_taken_run);
 }
 
 void MemoryStageLink::LogStats() {
@@ -1984,6 +2102,41 @@ void MemoryStageLink::LogStats() {
                      g_list_draws.load(std::memory_order_relaxed) ? 1 : 0,
                      Ahead() != 0 ? "open" : "closed", seconds, list_text, rate(list_level),
                      rate(runs), rate(current.list_drawn - reported.list_drawn));
+        }
+        {
+            // FRITCHII_MEMSTAGE_GATHER: what became of the gathers GPUMem's copy reached. The
+            // level ones outside a run and outside a hard entry each started a run; a served one
+            // is a run not started (GPUMem level at its entry instead, the back ran it there).
+            std::string gather_text;
+            u64 gather_starters = 0;
+            for (size_t i = 0; i < current.gathers.size(); ++i) {
+                const u64 n = current.gathers[i] - reported.gathers[i];
+                const auto what = static_cast<GatherOutcome>(i);
+                if (what != GatherOutcome::Served && what != GatherOutcome::InRun &&
+                    what != GatherOutcome::Late) {
+                    gather_starters += n;
+                }
+                gather_text += fmt::format("{}{} {:.0f}", i == 0 ? "" : ", ", GATHER_NAMES[i],
+                                           rate(n));
+            }
+            const u64 served = current.gathers[0] - reported.gathers[0];
+            const u64 gather_ns = current.gather_ns - reported.gather_ns;
+            LOG_INFO(HW_GPU,
+                     "Memory stage gathers (FRITCHII_MEMSTAGE_GATHER={}, window {}) {:.0f} s: per "
+                     "second {}; runs started by a gather {:.0f}/s of {:.0f}/s; GPUMem in the ones "
+                     "run at their entry {:.1f} ms/s ({:.2f} us each: the wait to be level and the "
+                     "back's run of it); of those, the wait for idle synced query results {:.0f}/s, "
+                     "a game write range lay by GPU-written buffer data {:.0f}/s, game write "
+                     "ranges {:.0f}/s; the back found {:.0f}/s run at their entry ({:.0f}/s inside "
+                     "a level run)",
+                     g_gather.load(std::memory_order_relaxed) ? 1 : 0,
+                     Ahead() != 0 ? "open" : "closed", seconds, gather_text, rate(gather_starters),
+                     rate(runs), ms(gather_ns), per(gather_ns, served),
+                     rate(current.gather_synced - reported.gather_synced),
+                     rate(current.gather_gpu_written - reported.gather_gpu_written),
+                     rate(current.gather_ranges - reported.gather_ranges),
+                     rate(current.gathers_taken - reported.gathers_taken),
+                     rate(current.gathers_taken_run - reported.gathers_taken_run));
         }
         if (Nx2Profile::Enabled()) {
             LogRunShape(seconds);

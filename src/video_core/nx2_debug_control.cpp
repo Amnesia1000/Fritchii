@@ -340,6 +340,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_MEMSTAGE_LIST_DRAWS") {
         return &g_memstage_list_draws;
     }
+    if (name == "FRITCHII_MEMSTAGE_GATHER") {
+        return &g_memstage_gather;
+    }
     return nullptr;
 }
 
