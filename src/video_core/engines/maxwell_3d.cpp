@@ -2688,6 +2688,9 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
 
 void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
                               FrontState& fs) {
+    // FRITCHII_DELAY_FRONT_KIND=3 ("C", fable_stage_levelpoints 18.3): once every 64 3D macro
+    // calls on the front, before the call. Off: one relaxed load and a branch.
+    VideoCommon::GpuSplit::DelayFrontIf(VideoCommon::GpuSplit::FrontDelayKind::Macros);
     // Fable's feature byte (fable_answer_regression_2 3.1): with every macro switch off, v5.7's
     // body and emit, without the per-call switch reads, slot lookup, predicate test, fold and
     // packet setup and report tick the switches added (FrontRunMacro itself 4 -> 17 ns a call,

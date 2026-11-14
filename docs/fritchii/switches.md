@@ -167,6 +167,26 @@ microseconds at one kind of site, as FRITCHII_DELAY_DRAW_US does at every draw.
   pay a test of a local the back loads once a batch.
 - Measure with profile_toggle.py in one session (0 against n, KIND fixed in the test block).
 
+### FRITCHII_DELAY_FRONT_US, FRITCHII_DELAY_FRONT_KIND
+
+The front's delay tests (live, default 0 = nothing changes; work\fable_stage_levelpoints.md
+18.3, rows 7 and 8 and the front's macros): the GPU front thread busy-spins n microseconds.
+- KIND 1 ("A", row 7): a suspended acquire found met, as the channel resumes
+  (Puller::ResumeAcquire's resume from a suspension; once per resume). n = 100 is about 60 ms/s.
+- KIND 2 ("Q", row 8): a macro memory read's wait behind a queued dispatch (GpuSplit::
+  DispatchesMayWriteSince's WaitFor, the "macro dma dispatch" site), right after the wait
+  returned. n = 200 is about 48 ms/s.
+- KIND 3 ("C"): once every 64 3D macro calls on the front (Maxwell3D::FrontRunMacro, before the
+  call; with the split only). n = 2 is about 78 ms/s.
+- FRITCHII_DELAY_BEFORE=1 (the existing switch, which also moves the drain tests) moves kinds 1
+  and 2 before their wait: kind 1 spins at the acquire's suspension, kind 2 right before the
+  wait begins. The control: after the wait the back has reached what was waited for, so a spin
+  there is on the path by construction; a spin before it overlaps the back's backlog, and if it
+  costs little the wait is backlog that back cuts already shrink.
+- Not on the back thread. Counted in the "Front waits for the back by site" ending:
+  "FRITCHII_DELAY_FRONT_US=n x/s y ms/s KIND=k (front)".
+- Off (0): one relaxed load and a branch at each site (both sides of the waits).
+
 ### FRITCHII_NULL_RENDER
 
 FRITCHII_NULL_RENDER=1 (live, default 0; test only, the picture is broken: nothing is drawn;

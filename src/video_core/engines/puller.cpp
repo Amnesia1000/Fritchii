@@ -2105,6 +2105,11 @@ bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
     // counting those made the count odd ("suspended") at random, so submit-time snapshots were
     // thrown away for about half of all entries (CommandList::snapshot_suspensions).
     if (pending_acquire) {
+        // FRITCHII_DELAY_FRONT_KIND=1 ("A"): a suspended acquire found met, before the channel
+        // resumes (FRITCHII_DELAY_BEFORE=1 spins at the suspension instead). Off: one relaxed
+        // load and a branch.
+        VideoCommon::GpuSplit::DelayFrontIf(VideoCommon::GpuSplit::FrontDelayKind::AcquireMet,
+                                            false);
         // FRITCHII_ACQUIRE_MET_BY (live, default 0: one load here): "Acquire resumes met by".
         if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_acquire_met_by,
                                              "FRITCHII_ACQUIRE_MET_BY") != 0) [[unlikely]] {
@@ -2377,6 +2382,9 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                 NoteBackSequence(*pending_acquire);
                 dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
                 VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
+                // FRITCHII_DELAY_FRONT_KIND=1 with FRITCHII_DELAY_BEFORE=1: the control spin.
+                VideoCommon::GpuSplit::DelayFrontIf(
+                    VideoCommon::GpuSplit::FrontDelayKind::AcquireMet, true);
                 return;
             }
         }
@@ -2448,6 +2456,9 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             if (learn) {
                 AcquireLearning::Instance().NoteSuspended(acquire.address);
             }
+            // FRITCHII_DELAY_FRONT_KIND=1 with FRITCHII_DELAY_BEFORE=1: the control spin.
+            VideoCommon::GpuSplit::DelayFrontIf(VideoCommon::GpuSplit::FrontDelayKind::AcquireMet,
+                                                true);
         } else {
             waiters.Remove(this);
             record(AcquireTrace::MetAfterFences);

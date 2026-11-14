@@ -89,6 +89,8 @@ int DelaySwitch(GpuSplit::DelayTest test) {
         return Debug::SwitchValue(Debug::g_delay_draw_us, "FRITCHII_DELAY_DRAW_US");
     case Test::Back:
         return Debug::SwitchValue(Debug::g_delay_back_us, "FRITCHII_DELAY_BACK_US");
+    case Test::Front:
+        return Debug::SwitchValue(Debug::g_delay_front_us, "FRITCHII_DELAY_FRONT_US");
     default:
         return 0;
     }
@@ -125,11 +127,14 @@ std::string DelayTestText(SiteWaitStats& stats, double window) {
     return fmt::format("; delay tests added ({} the drain, FRITCHII_DELAY_BEFORE={}): "
                        "FRITCHII_DELAY_MACRO_DRAIN_US{}, FRITCHII_DELAY_POLL_DRAIN_US{}, "
                        "FRITCHII_DELAY_E2C_US{} (front), FRITCHII_DELAY_DISPATCH_US{} (back), "
-                       "FRITCHII_DELAY_DRAW_US{} (back), FRITCHII_DELAY_BACK_US{} KIND={} (back)",
+                       "FRITCHII_DELAY_DRAW_US{} (back), FRITCHII_DELAY_BACK_US{} KIND={} (back), "
+                       "FRITCHII_DELAY_FRONT_US{} KIND={} (front)",
                        before ? "before" : "after", before ? 1 : 0, test(Test::MacroDrain),
                        test(Test::PollDrain), test(Test::E2c), test(Test::Dispatch),
                        test(Test::Draw), test(Test::Back),
-                       Debug::SwitchValue(Debug::g_delay_back_kind, "FRITCHII_DELAY_BACK_KIND"));
+                       Debug::SwitchValue(Debug::g_delay_back_kind, "FRITCHII_DELAY_BACK_KIND"),
+                       test(Test::Front),
+                       Debug::SwitchValue(Debug::g_delay_front_kind, "FRITCHII_DELAY_FRONT_KIND"));
 }
 
 void NoteSiteWait(DrainSite site, u64 behind, u64 ns) {
@@ -311,6 +316,25 @@ void GpuSplit::DelayBack(BackDelayKind kind, u32 amount) {
         items[index] -= period[index];
         SpinDelay(DelayTest::Back, static_cast<u32>(us));
     }
+}
+
+void GpuSplit::DelayFront(FrontDelayKind kind, bool before) {
+    namespace Debug = VideoCore::Nx2Debug;
+    const int us = DelaySwitch(DelayTest::Front);
+    if (us <= 0 || on_back_thread ||
+        Debug::SwitchValue(Debug::g_delay_front_kind, "FRITCHII_DELAY_FRONT_KIND") !=
+            static_cast<int>(kind)) {
+        return;
+    }
+    if (kind == FrontDelayKind::Macros) {
+        static thread_local u32 calls{};
+        if ((++calls & 63) != 0) {
+            return;
+        }
+    } else if (before != (Debug::SwitchValue(Debug::g_delay_before, "FRITCHII_DELAY_BEFORE") > 0)) {
+        return;
+    }
+    SpinDelay(DelayTest::Front, static_cast<u32>(us));
 }
 
 void GpuSplit::SpinDelay(DelayTest test, u32 us) {
@@ -1916,7 +1940,11 @@ GpuSplit::DispatchCheck GpuSplit::DispatchesMayWriteSince(u64 since, u64 begin, 
         if (!wait) {
             return DispatchCheck::Queued;
         }
+        // FRITCHII_DELAY_FRONT_KIND=2 ("Q"): after this wait returned, or before it
+        // (FRITCHII_DELAY_BEFORE=1). Off: one relaxed load and a branch each side.
+        DelayFrontIf(FrontDelayKind::DispatchWait, true);
         WaitFor(last_dispatch_position, DrainSite::DispatchWait);
+        DelayFrontIf(FrontDelayKind::DispatchWait, false);
         waited = true;
     }
     // The back recorded every dispatch sent since before storing a position past it (acquired

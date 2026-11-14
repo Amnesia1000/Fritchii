@@ -921,8 +921,26 @@ public:
         Dispatch,   ///< Back: every compute dispatch (RasterizerVulkan::DispatchCompute, "K")
         Draw,       ///< Back: every 3D draw call (RasterizerVulkan::Draw/DrawIndirect, "D")
         Back,       ///< Back: FRITCHII_DELAY_BACK_US at FRITCHII_DELAY_BACK_KIND's site (DelayBack)
+        Front, ///< Front: FRITCHII_DELAY_FRONT_US at FRITCHII_DELAY_FRONT_KIND's site (DelayFront)
         Count,
     };
+    /// FRITCHII_DELAY_FRONT_US / _KIND (live, default 0; fable_stage_levelpoints 18.3): the sites.
+    enum class FrontDelayKind : u32 {
+        AcquireMet = 1,   ///< "A": a suspended acquire resumes (Puller::ResumeAcquire)
+        DispatchWait = 2, ///< "Q": a macro read's wait behind a dispatch (DispatchesMayWriteSince)
+        Macros = 3,       ///< "C": once every 64 3D macro calls (Maxwell3D::FrontRunMacro)
+    };
+    /// At a FRITCHII_DELAY_FRONT_KIND site: one relaxed load and a branch while
+    /// FRITCHII_DELAY_FRONT_US is 0. Kinds 1 and 2 are called on both sides of their wait
+    /// (`before`: right before it begins, else right after it ended) and spin on the side
+    /// FRITCHII_DELAY_BEFORE picks (0: after, the test; 1: before, the control).
+    static void DelayFrontIf(FrontDelayKind kind, bool before = false) {
+        if (VideoCore::Nx2Debug::g_delay_front_us.load(std::memory_order_relaxed) != 0)
+            [[unlikely]] {
+            DelayFront(kind, before);
+        }
+    }
+    static void DelayFront(FrontDelayKind kind, bool before);
     /// FRITCHII_DELAY_BACK_US / _KIND (live, default 0; fable_stage_levelpoints 18.3): the sites.
     enum class BackDelayKind : u32 {
         Methods = 1,    ///< "M": once every 64 method-zone ring entries (BackLoop, after Execute)
