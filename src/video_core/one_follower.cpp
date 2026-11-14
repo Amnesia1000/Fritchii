@@ -37,6 +37,7 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/one_follower.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/one_follower_stats.h"
 
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
@@ -1158,10 +1159,15 @@ void Lend(LentOp op, LentReason reason, void (*function)(void*), void* argument)
     std::memcpy(buffer, &header, sizeof(header));
     Commit(buffer, header.bytes, number, header.position, false);
     Stats::Pushed(header, kind, behind);
-    // The park: R plays everything before, runs the call, releases E.
+    // The park: R plays everything before, runs the call, releases E. Its own profile zone
+    // (fable_b 14.1): without it the park landed in whatever zone the lend was made in ("other"
+    // for a call entry, "method" for a method's).
     g.e_wait_op.store(static_cast<u8>(op), std::memory_order_relaxed);
-    EngineWait([&] { return g.played.load(std::memory_order_acquire) >= number; }, EWait::Park,
-               number);
+    {
+        const Nx2Profile::Scope parked_zone{Nx2Profile::Zone::OnefParked};
+        EngineWait([&] { return g.played.load(std::memory_order_acquire) >= number; },
+                   EWait::Park, number);
+    }
     const u64 parked_ns = Common::Nx2Hitch::NowNs() - begin_clock;
     NoteLendSite(op, parked_ns);
     if (op == LentOp::Query && t_query_kind != QueryKind::Count) {
