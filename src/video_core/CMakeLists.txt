@@ -158,7 +158,10 @@ add_library(video_core STATIC
     nx2_perf.h
     nx2_download_trace.h
     nx2_async_readback.h
+    one_follower.cpp
     one_follower.h
+    one_follower_hooks.h
+    one_follower_view.cpp
     one_follower_stats.cpp
     one_follower_stats.h
     pending_maps.h

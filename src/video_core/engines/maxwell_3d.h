@@ -28,6 +28,7 @@
 #include "video_core/nx2_fastdraw_count.h"
 #include "video_core/nx2_list_dispatch.h"
 #include "video_core/nx2_list_reader.h"
+#include "video_core/one_follower_hooks.h"
 #include "video_core/textures/texture.h"
 #include "video_core/engines/maxwell_3d.h"
 
@@ -3432,6 +3433,10 @@ private:
         regs.reg_array[method] = argument;
         for (const auto& table : dirty.tables) {
             dirty.flags[table[method]] = true;
+        }
+        // One follower, step 2+: the word goes in the next packet's delta (R's view).
+        if (VideoCommon::OneFollower::g_track_writes.load(std::memory_order_relaxed)) [[unlikely]] {
+            VideoCommon::OneFollower::NoteRegWrite(method);
         }
     }
 

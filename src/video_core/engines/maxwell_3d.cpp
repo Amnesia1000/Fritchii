@@ -4660,6 +4660,10 @@ void ApplyDeltaWrites(Maxwell3D& maxwell3d, const u64* writes, u32 count) {
         reg_array[method] = value;
         raised[table0[method]] = true;
         raised[table1[method]] = true;
+        // One follower, step 2+: as ProcessDirtyRegisters notes it.
+        if (VideoCommon::OneFollower::g_track_writes.load(std::memory_order_relaxed)) [[unlikely]] {
+            VideoCommon::OneFollower::NoteRegWrite(method);
+        }
     }
     maxwell3d.dirty.flags |= raised;
 }
