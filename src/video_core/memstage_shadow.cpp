@@ -699,6 +699,11 @@ struct Copy {
     /// Bumped at every change to what the fill reads (SHADOW=3: a draw whose copy moved on since
     /// the shadow's draw reads the engine instead).
     u64 generation{};
+    /// Step 7 fps fix 4: ResolveStage of the last 4 KiB GPU page a constant buffer write went to,
+    /// at the page's start, and the memory map counter it was looked up under (CbTarget).
+    u64 cb_page{~u64{0}};
+    u64 cb_map_serial{};
+    Tegra::MemoryManager::StageTarget cb_target{};
 };
 
 /// Histogram buckets of served draws between two runs: 0, 1, 2-3, 4-7, 8-15, 16+.
@@ -970,6 +975,32 @@ bool OnePage(GPUVAddr address, u64 size) {
     return (address & (Page - 1)) + size <= Page;
 }
 
+/// ResolveStage(address) for a write within one 4 KiB page, through the copy's last page: kept
+/// while the page and the memory map counter (MemoryManager::MapSerial, EXP88's key on the back)
+/// stay the same. A map or unmap changes the tables first and then bumps the counter (release;
+/// MapSerial loads it with acquire), so a word that loads the bumped value sees the new tables
+/// and looks the page up again. The counter is loaded before the lookup (as GpuToCpuAddress's
+/// translation cache does): a lookup that overlaps a remap is kept under the old value and
+/// replaced once the bump shows. Within a 4 KiB page the lookup only shifts by the offset (the
+/// same table entries, the same device page).
+StageTarget CbTarget(Copy& c, GPUVAddr address) {
+    constexpr u64 Page = 0x1000;
+    const u64 page = address & ~(Page - 1);
+    const u64 serial = c.memory->MapSerial();
+    if (page != c.cb_page || serial != c.cb_map_serial) [[unlikely]] {
+        c.cb_target = c.memory->ResolveStage(page);
+        c.cb_page = page;
+        c.cb_map_serial = serial;
+    }
+    const u64 offset = address - page;
+    StageTarget target = c.cb_target;
+    target.write_device += offset;
+    if (target.device) {
+        *target.device += offset;
+    }
+    return target;
+}
+
 /// The one piece Collect's loop makes of a write within one 4 KiB page: the 32-byte rounding
 /// stays in the page (its end is 32-byte aligned), and the rounded start is on the same device
 /// page as `address`, so its device address is the lookup's minus the rounding.
@@ -1139,7 +1170,7 @@ void ConstBufferWords(State& s, Copy& c, u32 amount, const u32* data) {
         // Step 7 fps fix 4: one lookup for the whole path when the write lies within one page.
         std::optional<StageTarget> one_page;
         if (OnePage(begin, write_size)) [[likely]] {
-            one_page = c.memory->ResolveStage(begin);
+            one_page = CbTarget(c, begin);
         }
         const StageTarget* const target = one_page ? &*one_page : nullptr;
         if (Watched(c, begin, write_size, target)) [[unlikely]] {
