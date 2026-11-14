@@ -18,7 +18,8 @@
 // split_overlap is quarantined. Frizti build: the options reviewed as exact rewrites are on by
 // default; those that change timing or reuse ideas reverted with a ported change (its
 // slab of wrong geometry in Kokiri Forest) are off until EDEN_NX2_PERF_ON=<name>,... turns them
-// on: frames_ahead, clean_words, index_rebind, submit_budget, fence_flush, fragment_barrier,
+// on: frames_ahead, clean_words, index_rebind, fence_flush, fragment_barrier (submit_budget is
+// on since 2026-11-14),
 // front_sleep, async_pipelines, and bounds (this tree keeps its own range cache).
 // EDEN_NX2_PERF_OPT=0 turns every one off for the A/B; EDEN_NX2_PERF_OFF=<name>,... turns off
 // only those named (Opt below). EDEN_NX2_PERF_VERIFY=1 computes each optimized answer the old
@@ -87,8 +88,11 @@ inline bool On(Opt opt) {
         };
         // FramesAhead is on: with Ocarina's CPU readbacks preflushed it is worth ~1 fps (48.3 ->
         // 49.5 on the Kokiri porch) and it waits for this frame too whenever the GPU falls behind.
+        // SubmitBudget is on (2026-11-14, owner's call): fresh market A/B (2 off, 2 on, 90 s):
+        // median 53.4 -> 55.1 fps, 1% low 39.8 -> 40.8; a submit boundary changes when the card
+        // starts, not what it draws (fable_submits_brief 2). EDEN_NX2_PERF_OFF=submit_budget.
         const unsigned default_off = bit(Opt::CleanWords) |
-                                     bit(Opt::IndexRebind) | bit(Opt::SubmitBudget) |
+                                     bit(Opt::IndexRebind) |
                                      bit(Opt::FenceFlush) | bit(Opt::FragmentBarrier) |
                                      bit(Opt::FrontSleep) | bit(Opt::AsyncPipelines) |
                                      bit(Opt::Bounds);
