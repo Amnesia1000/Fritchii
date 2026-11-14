@@ -273,19 +273,35 @@ OneF::LentReason OneFollowerDraw::UnlentBlocker(Maxwell3D& engine, bool is_index
     return LentReason::Count;
 }
 
-bool OneFollowerDraw::FillRing(Maxwell3D& engine, bool is_indexed, u64 position, u64 seq,
-                               u64& buffer_number, LentReason& reason) {
+bool OneFollowerDraw::FillRing(Maxwell3D& engine, GraphicsPipeline* pipeline, bool is_indexed,
+                               u64 position, u64 seq, u64& buffer_number, LentReason& reason) {
     auto& r = rasterizer;
     reason = LentReason::Transient;
-    // Join 1 (spec 4.4) with E's own registers: the facts R published for these programs.
     VideoCommon::MemStageShadow::ProgramId program_id;
     VideoCommon::MemStageShadow::BackProgramId(engine, program_id);
-    if (!r.mem_stage.LookupFacts(program_id, facts)) {
+    // Rule 3: the pipeline E looked up gives the layout itself, as stage off's own fill takes
+    // it (MemFacts). Else join 1 (spec 4.4): the facts R published for these programs.
+    const MemStage::DrawFacts pipeline_facts =
+        pipeline != nullptr ? pipeline->MemFacts() : MemStage::DrawFacts{};
+    if (pipeline != nullptr) {
+        if (pipeline_facts.has_texel_buffers || pipeline_facts.stage_infos == nullptr) {
+            return false; // texel buffers need the texture cache (LateFill)
+        }
+        facts.hashes = pipeline_facts.hashes;
+        facts.uniform_masks = *pipeline_facts.uniform_masks;
+        facts.stages = pipeline_facts.stages;
+        for (u32 stage = 0; stage < 5; ++stage) {
+            facts.ssbo_counts[stage] = static_cast<u8>(
+                pipeline_facts.stage_infos[stage].storage_buffers_descriptors.size());
+        }
+        facts.dynamic_vertex_input = pipeline->HasDynamicVertexInput();
+    } else if (!r.mem_stage.LookupFacts(program_id, facts)) {
         reason = LentReason::PipelineMiss;
         return false;
     }
-    if (facts.has_texel_buffers || facts.infos == nullptr || !r.mem_stage.Packets() ||
-        !r.mem_stage.ValuesByValue() || !r.mem_stage.RingRoom() || r.buffer_cache.MarksAhead()) {
+    if ((pipeline == nullptr && (facts.has_texel_buffers || facts.infos == nullptr)) ||
+        !r.mem_stage.Packets() || !r.mem_stage.ValuesByValue() || !r.mem_stage.RingRoom() ||
+        r.buffer_cache.MarksAhead()) {
         return false; // texel buffers need the texture cache (LateFill); no room or no values
     }
     std::scoped_lock lock{r.buffer_cache.mutex};
@@ -301,23 +317,27 @@ bool OneFollowerDraw::FillRing(Maxwell3D& engine, bool is_indexed, u64 position,
         // The lent draws read E's engine: raise it there too (R raises its own from the packet).
         engine.dirty.flags[Dirty::VertexInput] = true;
     }
-    const MemStage::DrawFacts draw_facts{
-        .uniform_masks = &facts.uniform_masks,
-        .uniform_sizes = &facts.uniform_sizes,
-        .stage_infos = nullptr,
-        .stages = facts.stages,
-        .has_texel_buffers = false,
-        .uses_descriptor_buffer = facts.uses_descriptor_buffer,
-        .hashes = facts.hashes,
-        .staged = &facts,
-    };
+    const MemStage::DrawFacts draw_facts =
+        pipeline != nullptr ? pipeline_facts
+                            : MemStage::DrawFacts{
+                                  .uniform_masks = &facts.uniform_masks,
+                                  .uniform_sizes = &facts.uniform_sizes,
+                                  .stage_infos = nullptr,
+                                  .stages = facts.stages,
+                                  .has_texel_buffers = false,
+                                  .uses_descriptor_buffer = facts.uses_descriptor_buffer,
+                                  .hashes = facts.hashes,
+                                  .staged = &facts,
+                              };
     // The draw's raw handles at E's position (SEAM 3): R's Configure takes them from the packet.
     const bool null_pointer_handles = VideoCore::Nx2Debug::Experiment(21) != 0;
     handle_values.clear();
     const auto& stages = engine.state.shader_stages;
     using Cbufs = std::remove_cvref_t<decltype(stages[0].const_buffers)>;
     VideoCommon::FillGraphicsHandleValues(
-        std::span<const Shader::Info>{*facts.infos}, engine.GetMemoryManager(),
+        pipeline != nullptr ? std::span<const Shader::Info>{pipeline_facts.stage_infos, 5}
+                            : std::span<const Shader::Info>{*facts.infos},
+        engine.GetMemoryManager(),
         [&stages](size_t stage) {
             return VideoCommon::GraphicsHandleCbufs<Cbufs>{stages[stage].const_buffers};
         },
@@ -398,10 +418,25 @@ bool OneFollowerDraw::RouteDraw(bool is_indexed, u32 instance_count) {
     if (reason == LentReason::Count) {
         // Today's PrepareDraw head, E's half: the stream's invalidations before the fill.
         engine.GetMemoryManager().FlushCaching();
+        // Rule 3 (FRITCHII_ONEF_E_PIPELINE): E looks the pipeline up itself, at its own position,
+        // on its own engine (the pipeline cache never names R's view then). A miss, or a build
+        // not ready, is known here: the draw is lent. The lookup consumes pipeline-key flags on
+        // E's engine that R's dynamic state still reads (VertexInput and the like): they are
+        // raised again, so the pack below hands them to R and clears them (rule 1).
+        GraphicsPipeline* pipeline = nullptr;
+        if (VideoCommon::OneFollower::g_e_pipeline) {
+            const auto flags_before = engine.dirty.flags;
+            pipeline = rasterizer.pipeline_cache.CurrentGraphicsPipeline();
+            engine.dirty.flags |= flags_before;
+            if (pipeline == nullptr) {
+                reason = LentReason::PipelineMiss;
+            }
+        }
         const u64 position = VideoCommon::GpuSplit::Get().BackEntryPosition();
         u64 buffer_number = 0;
-        if (FillRing(engine, is_indexed, position, seq, buffer_number, reason)) {
-            OneF::PushDraw(engine, seq, buffer_number, 0);
+        if ((!VideoCommon::OneFollower::g_e_pipeline || pipeline != nullptr) &&
+            FillRing(engine, pipeline, is_indexed, position, seq, buffer_number, reason)) {
+            OneF::PushDraw(engine, seq, buffer_number, 0, pipeline);
             counts.pushed.fetch_add(1, std::memory_order_relaxed);
             // PrepareDraw's tail, E's half (read-backs wait on E's work).
             rasterizer.gpu.TickWork();
@@ -700,7 +735,10 @@ void OneFollowerDraw::EnterView() {
     }
     auto& r = rasterizer;
     saved_rasterizer = r.ExchangeMaxwell3D(view.get());
-    saved_pipeline = r.pipeline_cache.ExchangeMaxwell3D(view.get());
+    // Rule 3: the pipeline cache is E's then and always reads E's engine.
+    if (!VideoCommon::OneFollower::g_e_pipeline) {
+        saved_pipeline = r.pipeline_cache.ExchangeMaxwell3D(view.get());
+    }
     saved_texture = r.texture_cache.ExchangeMaxwell3D(view.get());
     saved_query = r.query_cache.ExchangeMaxwell3D(view.get());
     saved_tracker = r.state_tracker.ExchangeFlags(&view->dirty.flags);
@@ -715,7 +753,9 @@ void OneFollowerDraw::LeaveView() {
     r.state_tracker.ExchangeFlags(saved_tracker);
     r.query_cache.ExchangeMaxwell3D(saved_query);
     r.texture_cache.ExchangeMaxwell3D(saved_texture);
-    r.pipeline_cache.ExchangeMaxwell3D(saved_pipeline);
+    if (!VideoCommon::OneFollower::g_e_pipeline) {
+        r.pipeline_cache.ExchangeMaxwell3D(saved_pipeline);
+    }
     r.ExchangeMaxwell3D(saved_rasterizer);
     on_view = false;
 }

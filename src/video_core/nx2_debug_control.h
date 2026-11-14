@@ -234,6 +234,8 @@ inline std::atomic<int> g_onef_verify_every{-1};
 inline std::atomic<int> g_onef_ahead{-1};
 /// FRITCHII_ONEF_PIN (boot, default 1): R on PinnedRole::GpuMem's core.
 inline std::atomic<int> g_onef_pin{-1};
+/// FRITCHII_ONEF_E_PIPELINE (boot, default 0): fable_b 10.2 rule 3, E owns the pipeline lookup.
+inline std::atomic<int> g_onef_e_pipeline{-1};
 /// EDEN_NX2_LIGHT_TABLE_ARRAYS: docs/fritchii/switches.md.
 [[nodiscard]] inline bool LightTableArrays() {
     static const bool on = EnvSwitch("EDEN_NX2_LIGHT_TABLE_ARRAYS") > 0;

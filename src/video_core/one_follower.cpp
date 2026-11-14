@@ -634,6 +634,10 @@ void ReadSwitches() {
     using namespace VideoCore::Nx2Debug;
     g.on = SwitchValue(g_onef, "FRITCHII_ONEF") == 1;
     g.pin = SwitchValue(g_onef_pin, "FRITCHII_ONEF_PIN", 1) != 0;
+    g_e_pipeline = g.on && SwitchValue(g_onef_e_pipeline, "FRITCHII_ONEF_E_PIPELINE") == 1;
+    if (g_e_pipeline) {
+        LOG_INFO(HW_GPU, "One follower: E owns the pipeline lookup (FRITCHII_ONEF_E_PIPELINE=1)");
+    }
     if (g.on) {
         LOG_INFO(HW_GPU,
                  "One follower (FRITCHII_ONEF=1): the render thread R runs the renderer, every "
@@ -859,7 +863,8 @@ void EngineConsumed(u64 position) noexcept {
     RaisePlayed();
 }
 
-void PushDraw(const Maxwell3D& engine, u64 draw_seq, u64 buffer_number, u8 flags) {
+void PushDraw(const Maxwell3D& engine, u64 draw_seq, u64 buffer_number, u8 flags,
+              const void* pipeline) {
     if (!Detail::t_engine || !g.thread.joinable()) {
         t_next_draw_set = false;
         return;
@@ -871,6 +876,7 @@ void PushDraw(const Maxwell3D& engine, u64 draw_seq, u64 buffer_number, u8 flags
     header.flags = flags;
     header.draw_seq = draw_seq;
     header.buffer_number = buffer_number;
+    header.pipeline = pipeline;
     std::vector<u8> spans(sizeof(RegPair) * Maxwell3D::Regs::NUM_REGS + sizeof(FlagBits) +
                           sizeof(DrawValues) + sizeof(Programs) + sizeof(Pools) + 64);
     const std::size_t bytes = PackSpans(engine, header, spans);
