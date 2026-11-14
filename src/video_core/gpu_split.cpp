@@ -60,9 +60,36 @@ struct SiteWaitStats {
     std::array<u64, static_cast<size_t>(DrainSite::Count)> behind{};
     std::array<u64, static_cast<size_t>(Common::Nx2Hitch::Role::Count)> lock_ns{};
     std::array<u64, static_cast<size_t>(Common::Nx2Hitch::Role::Count)> lock_count{};
+    /// The delay tests' spins (GpuSplit::SpinDelay), by GpuSplit::DelayTest.
+    std::array<u64, static_cast<size_t>(GpuSplit::DelayTest::Count)> delay_count{};
+    std::array<u64, static_cast<size_t>(GpuSplit::DelayTest::Count)> delay_ns{};
     u64 since{};
 };
 SiteWaitStats g_site_waits;
+
+// The delay tests' part of the line: only while a switch is set or spins were counted.
+std::string DelayTestText(const SiteWaitStats& stats, double window) {
+    namespace Debug = VideoCore::Nx2Debug;
+    const int macro_us =
+        Debug::SwitchValue(Debug::g_delay_macro_drain_us, "FRITCHII_DELAY_MACRO_DRAIN_US");
+    const int poll_us =
+        Debug::SwitchValue(Debug::g_delay_poll_drain_us, "FRITCHII_DELAY_POLL_DRAIN_US");
+    if (macro_us <= 0 && poll_us <= 0 &&
+        std::ranges::all_of(stats.delay_count, [](u64 count) { return count == 0; })) {
+        return {};
+    }
+    const auto test = [&](GpuSplit::DelayTest which) {
+        const auto i = static_cast<size_t>(which);
+        return fmt::format("{:.0f}/s {:.1f} ms/s", static_cast<double>(stats.delay_count[i]) / window,
+                           static_cast<double>(stats.delay_ns[i]) / 1e6 / window);
+    };
+    const bool before = Debug::SwitchValue(Debug::g_delay_before, "FRITCHII_DELAY_BEFORE") > 0;
+    return fmt::format("; delay tests added ({} the drain, FRITCHII_DELAY_BEFORE={}): "
+                       "FRITCHII_DELAY_MACRO_DRAIN_US={} {}, FRITCHII_DELAY_POLL_DRAIN_US={} {}",
+                       before ? "before" : "after", before ? 1 : 0, macro_us,
+                       test(GpuSplit::DelayTest::MacroDrain), poll_us,
+                       test(GpuSplit::DelayTest::PollDrain));
+}
 
 void NoteSiteWait(DrainSite site, u64 behind, u64 ns) {
     auto& stats = g_site_waits;
@@ -107,12 +134,14 @@ void NoteSiteWait(DrainSite site, u64 behind, u64 ns) {
     LOG_INFO(HW_GPU,
              "Front waits for the back by site (ring words behind at the start): {}; cache lock "
              "waits: guest cores {:.1f} ms/s ({:.0f}/s), GPU back {:.1f} ms/s ({:.0f}/s), GPU "
-             "front {:.1f} ms/s, GPU memory {:.1f} ms/s ({:.0f}/s), other threads {:.1f} ms/s",
+             "front {:.1f} ms/s, GPU memory {:.1f} ms/s ({:.0f}/s), other threads {:.1f} ms/s{}",
              sites, lock_ms[1], lock_rate[1], lock_ms[3], lock_rate[3], lock_ms[2], lock_ms[4],
-             lock_rate[4], lock_ms[0]);
+             lock_rate[4], lock_ms[0], DelayTestText(stats, window));
     stats.count = {};
     stats.ns = {};
     stats.behind = {};
+    stats.delay_count = {};
+    stats.delay_ns = {};
     stats.since = now;
 }
 
@@ -195,6 +224,41 @@ void GpuSplit::CheckOwner(const char* where) {
 #else
     (void)where;
 #endif
+}
+
+u32 GpuSplit::DelayBeforeWait(DelayTest test) {
+    namespace Debug = VideoCore::Nx2Debug;
+    const int us = test == DelayTest::MacroDrain
+                       ? Debug::SwitchValue(Debug::g_delay_macro_drain_us,
+                                            "FRITCHII_DELAY_MACRO_DRAIN_US")
+                       : Debug::SwitchValue(Debug::g_delay_poll_drain_us,
+                                            "FRITCHII_DELAY_POLL_DRAIN_US");
+    if (us <= 0) [[likely]] {
+        return 0;
+    }
+    // Only drains that wait (the site line counts those): the back has not run everything sent.
+    if (consumed.load(std::memory_order_acquire) == write_position) {
+        return 0;
+    }
+    if (Debug::SwitchValue(Debug::g_delay_before, "FRITCHII_DELAY_BEFORE") > 0) {
+        SpinDelay(test, static_cast<u32>(us));
+        return 0;
+    }
+    return static_cast<u32>(us);
+}
+
+void GpuSplit::SpinDelay(DelayTest test, u32 us) {
+    const auto start = std::chrono::steady_clock::now();
+    const auto until = start + std::chrono::microseconds{us};
+    auto now = start;
+    while (now < until) {
+        Pause();
+        now = std::chrono::steady_clock::now();
+    }
+    const auto i = static_cast<size_t>(test);
+    ++g_site_waits.delay_count[i];
+    g_site_waits.delay_ns[i] += static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count());
 }
 
 GpuSplit GpuSplit::instance;
@@ -1129,7 +1193,7 @@ u32 GpuSplit::QueuedWriterKind(GPUVAddr begin, GPUVAddr end, u32& method) {
                                                   : 4;
 }
 
-void GpuSplit::NoteRelease(u64 device, GPUVAddr address, u32 payload) {
+void GpuSplit::NoteRelease(u64 device, GPUVAddr address, u32 payload, ReleaseKind kind) {
     static const bool enabled = [] {
         const char* const value = std::getenv("EDEN_NX2_ACQUIRE_QUEUED");
         return value == nullptr || value[0] != '0';
@@ -1137,7 +1201,8 @@ void GpuSplit::NoteRelease(u64 device, GPUVAddr address, u32 payload) {
     if (!enabled) {
         return;
     }
-    queued_releases[(device >> 2) % queued_releases.size()] = {write_position, device, payload};
+    queued_releases[(device >> 2) % queued_releases.size()] = {write_position, device, payload,
+                                                               kind};
 }
 
 std::optional<u32> GpuSplit::QueuedReleasePayload(u64 device, GPUVAddr address, u32* miss) {

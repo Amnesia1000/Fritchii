@@ -1722,6 +1722,10 @@ struct Maxwell3D::FrontState {
     /// the two stale registers: check each of its register reads (our macro bodies; the plain
     /// one stays v5.7's).
     bool guard_list_reads{};
+    /// Set by FrontRunMacroFeatures for one call of the 0xe2c occlusion macro (hash
+    /// 0x3b26ab7eb3fc9863, OotMacros::Id::E2C), handler or JIT: its MME DMA read is counted in
+    /// the "Front 0xe2c misses" line (FrontDmaRead).
+    bool e2c_call{};
     bool skip_same{}; ///< SkipSameValueWrites() && FrontSkipSame(), read once
     /// The inline upload being sent, when its words land linearly (EDEN_NX2_DMA_WAIT_WRITERS).
     bool upload_known{};
@@ -2445,7 +2449,10 @@ void Maxwell3D::FrontNoteRelease(VideoCommon::GpuSplit& split, const FrontState&
         fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_low)];
     if (const auto device = memory_manager.GpuToCpuAddress(address)) {
         const u32 payload = fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.payload)];
-        split.NoteRelease(*device, address, payload);
+        split.NoteRelease(*device, address, payload,
+                          report.query.short_query != 0
+                              ? VideoCommon::GpuSplit::ReleaseKind::Payload3DShort
+                              : VideoCommon::GpuSplit::ReleaseKind::Payload3DLong);
         if (VideoCommon::QmdPrediction::MirrorMode()) {
             // EXP13=2: recorded so the reduction bound sees it queued or run but not landed.
             namespace Prediction = VideoCommon::QmdPrediction;
@@ -2854,6 +2861,7 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
                                       : 0;
     fs.packet_on = fs.packet_mode != 0 && fs.exp22 == 0 && fs.same_experiment == 0 &&
                    !VideoCommon::GpuSplit::MacroSink();
+    fs.e2c_call = oot == OotMacros::Id::E2C;
     {
         VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
         engine.native_interpreter.active_dram = &native_data_ram;
@@ -3000,6 +3008,7 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
             }
         }
     }
+    fs.e2c_call = false;
     if (fs.packet_on) [[unlikely]] {
         // The call's last packet goes now (it is the pending flush when it holds writes).
         fs.packet_on = false;
@@ -3468,13 +3477,17 @@ void Maxwell3D::FrontNoteMemoryWrite(VideoCommon::GpuSplit& split, FrontState& f
             query_regs.query.short_query != 0 &&
             query_regs.query.report == Regs::ReportSemaphore::Report::Payload) {
             const u32 payload = fs.regs[base + 2];
-            split.NoteMemoryWriteData(*device, &payload, 1);
+            split.NoteMemoryWriteData(*device, &payload, 1, VideoCommon::NotedPayloadRelease);
         } else {
             // Counters and timed releases are written when the host query completes, not when
             // the back runs them: reads of these bytes wait until the back ran the report and
-            // the host query completed.
+            // the host query completed. (Which of the two, for the "Front 0xe2c misses" line.)
             split.NoteAsyncWrite(*device, 16);
-            split.NoteMemoryWrite(*device, 16, "3D report");
+            split.NoteMemoryWrite(*device, 16,
+                                  query_regs.query.report ==
+                                          Regs::ReportSemaphore::Report::Payload
+                                      ? VideoCommon::NotedPayloadReport
+                                      : VideoCommon::NotedCounterReport);
         }
         return;
     }
@@ -3551,6 +3564,99 @@ void Maxwell3D::FrontNoteMemoryWrite(VideoCommon::GpuSplit& split, FrontState& f
     split.RangedMethodWrite();
     fs.upload_offset += (std::min<u32>)(count * 4, remaining_bytes);
 }
+
+namespace {
+
+// "Front 0xe2c misses" (fable_front_drains 1.3 A, the counter first; always on, only at misses):
+// per MME DMA read of the 0xe2c occlusion macro that misses its page snapshot for a noted write
+// (EDEN_NX2_DMA_SNAPSHOT's reason "noted write"), the newest noted write since the snapshot over
+// bytes 0-8, 8-16 and 16-24 of the read (the macro compares the 64-bit words at 0 and 16; 8-16
+// is the timestamp): what wrote it (a 16-byte payload report, whose payload the front had in its
+// registers; a 4-byte payload release; a counter or sample count report; anything else: puller
+// semaphores, uploads, unknown ranges), whether the front knows its words, whether the back had
+// run it; how far behind the back was (ring words between `consumed` and the front) and whether
+// the query cache listed a report on the bytes (the hit path's own test). Front thread only.
+struct E2cMissStats {
+    enum Kind : u32 { PayloadReport, PayloadRelease, CounterReport, Other, None, KindCount };
+    static constexpr std::array<const char*, KindCount> kind_names{
+        "payload report (16 bytes)", "payload release (4 bytes)", "counter or sample report",
+        "other", "none"};
+    /// [byte range][kind][words known][run by the back]
+    std::array<std::array<std::array<std::array<u64, 2>, 2>, KindCount>, 3> notes{};
+    u64 misses{};
+    u64 behind_words{};
+    u64 behind_max{};
+    u64 listed{};
+    u64 overflows{};
+    std::chrono::steady_clock::time_point since{};
+};
+E2cMissStats g_e2c_misses;
+
+void NoteE2cMiss(VideoCommon::GpuSplit& split, u64 snapshot, u64 device, bool listed) {
+    auto& s = g_e2c_misses;
+    const u64 done = split.ConsumedNow();
+    const u64 behind = split.SentPosition() - (std::min)(done, split.SentPosition());
+    std::array<VideoCommon::GpuSplit::NotedOver, 3> over;
+    bool overflow = false;
+    split.NewestNotedWritesOver(snapshot, device, 8, over, overflow);
+    ++s.misses;
+    s.behind_words += behind;
+    s.behind_max = (std::max)(s.behind_max, behind);
+    s.listed += listed ? 1 : 0;
+    s.overflows += overflow ? 1 : 0;
+    for (size_t range = 0; range < over.size(); ++range) {
+        const auto& note = over[range];
+        const E2cMissStats::Kind kind =
+            note.position == 0                             ? E2cMissStats::None
+            : note.what == VideoCommon::NotedPayloadReport ? E2cMissStats::PayloadReport
+            : note.what == VideoCommon::NotedPayloadRelease ? E2cMissStats::PayloadRelease
+            : note.what == VideoCommon::NotedCounterReport ? E2cMissStats::CounterReport
+                                                           : E2cMissStats::Other;
+        const bool ran = note.position != 0 && note.position <= done;
+        ++s.notes[range][kind][note.known ? 1 : 0][ran ? 1 : 0];
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (s.since == std::chrono::steady_clock::time_point{}) {
+        s.since = now;
+        return;
+    }
+    const double seconds = std::chrono::duration<double>(now - s.since).count();
+    if (seconds < 10.0) {
+        return;
+    }
+    const auto rate = [seconds](u64 count) { return static_cast<double>(count) / seconds; };
+    std::string ranges;
+    constexpr std::array<const char*, 3> range_names{"0-8", "8-16", "16-24"};
+    for (size_t range = 0; range < s.notes.size(); ++range) {
+        ranges += fmt::format("; bytes {}:", range_names[range]);
+        for (u32 kind = 0; kind < E2cMissStats::KindCount; ++kind) {
+            const auto& n = s.notes[range][kind];
+            if (n[0][0] + n[0][1] + n[1][0] + n[1][1] == 0) {
+                continue;
+            }
+            ranges += fmt::format(" {} known {:.0f}/{:.0f} unknown {:.0f}/{:.0f},",
+                                  E2cMissStats::kind_names[kind], rate(n[1][1]), rate(n[1][0]),
+                                  rate(n[0][1]), rate(n[0][0]));
+        }
+        if (ranges.back() == ',') {
+            ranges.pop_back();
+        }
+    }
+    LOG_INFO(HW_GPU,
+             "Front 0xe2c misses (noted write) {:.0f} s: {:.0f}/s, back behind {:.0f} ring words "
+             "on average ({} at most), a listed report on the bytes {:.0f}/s, notes past the "
+             "table {:.0f}/s; the newest note since the page snapshot per byte range, /s, value "
+             "known at the front run/queued, unknown run/queued{}",
+             seconds, rate(s.misses),
+             s.misses != 0 ? static_cast<double>(s.behind_words) / static_cast<double>(s.misses)
+                           : 0.0,
+             s.behind_max, rate(s.listed), rate(s.overflows), ranges);
+    const auto start = now;
+    s = {};
+    s.since = start;
+}
+
+} // Anonymous namespace
 
 void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 macro,
                              u32 method, u32 count) {
@@ -3725,6 +3831,12 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                     }
                 }
                 byte_merges += snapshot.listed.merges - merges_before;
+                if (reason == 3 && fs.e2c_call && words == 6) {
+                    // "Front 0xe2c misses": what the noted write over the read's bytes is.
+                    NoteE2cMiss(split, since, *device,
+                                rasterizer->HasCachedReports(*device - 12,
+                                                             u64{read_bytes} + 12));
+                }
                 if (reason != 4) {
                     hit = false;
                     ++miss_reasons[reason];
@@ -3783,7 +3895,11 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                     const GPUVAddr flush_begin = source & ~GPUVAddr{0xfff};
                     const GPUVAddr flush_end = (source + read_bytes + 0xfff) & ~GPUVAddr{0xfff};
                     const size_t flush_bytes = static_cast<size_t>(flush_end - flush_begin);
+                    // FRITCHII_DELAY_MACRO_DRAIN_US (live, 0 = off): the delay test of this drain.
+                    using DelayTest = VideoCommon::GpuSplit::DelayTest;
+                    const u32 delay_us = split.DelayBeforeWait(DelayTest::MacroDrain);
                     split.Drain(VideoCommon::DrainSite::MacroDmaRead);
+                    VideoCommon::GpuSplit::DelayAfterWait(DelayTest::MacroDrain, delay_us);
                     if (memory_manager.IsMemoryDirty(flush_begin, flush_bytes,
                                                      VideoCommon::CacheType::BufferCache)) {
                         split.Run(

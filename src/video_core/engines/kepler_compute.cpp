@@ -2532,7 +2532,8 @@ void KeplerCompute::FrontNoteRelease(VideoCommon::GpuSplit& split, const FrontSt
     const GPUVAddr address =
         (GPUVAddr{fs.registers[0x6c0] & 0x1ffffff} << 32) | fs.registers[0x6c1];
     if (const auto device = memory_manager.GpuToCpuAddress(address)) {
-        split.NoteRelease(*device, address, fs.registers[0x6c2]);
+        split.NoteRelease(*device, address, fs.registers[0x6c2],
+                          VideoCommon::GpuSplit::ReleaseKind::ComputeReport);
         if (VideoCommon::QmdPrediction::MirrorMode()) {
             // EXP13=2: recorded so the reduction bound sees it queued or run but not landed.
             namespace Prediction = VideoCommon::QmdPrediction;

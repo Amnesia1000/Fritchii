@@ -46,6 +46,76 @@ read flushed whole skip the drain while nothing sent since may write them (Maxwe
 FrontDmaRead). 9 = on (default: Lake Hylia 46.5 -> 52.3 fps; verify 0 differences in 235k
 reads), 10 = on and verify every skipped read against the drained path, 0 = off.
 
+### FRITCHII_DELAY_MACRO_DRAIN_US, FRITCHII_DELAY_POLL_DRAIN_US, FRITCHII_DELAY_BEFORE
+
+Delay tests (live, default 0 = nothing changes; Coz-style causal profiling, fable_front_drains
+section 3): each adds a busy spin of n microseconds on the front (steady_clock with a pause, not a
+sleep) at one kind of front drain, to see whether that wait is on the frame's critical path. If
+fps drops by about what the added ms a second predict, it is; if not, shortening it won't help.
+- FRITCHII_DELAY_MACRO_DRAIN_US=n: a macro DMA read snapshot miss (Maxwell3D::FrontDmaRead, the
+  split.Drain(MacroDmaRead) of EDEN_NX2_DMA_SNAPSHOT's miss path, the 0xe2c occlusion reads'
+  "noted write" misses among them). Fable's T1: 50 us adds about 120 ms/s at the market.
+- FRITCHII_DELAY_POLL_DRAIN_US=n: a suspended acquire's poll that falls through to the full drain
+  (Puller::CanResumeAcquire's DrainBack, the "acquire" site). Fable's T2: 600 us adds about 111
+  ms/s. The spin is outside the poll drain's own time in the "Fence writer resumes" line.
+- Only drains that wait spin: the back had not run everything sent when the drain began.
+- Where: right after the drain returns (the test: the back has nothing queued then, so the spin
+  is added front time). FRITCHII_DELAY_BEFORE=1 moves both spins to right before the drain (the
+  control: the spin overlaps the back's backlog, which keeps shrinking, so it should cost little).
+  Nothing is published before a spin.
+- "Front waits for the back by site" (every 5 s) ends with "delay tests added (after/before the
+  drain, FRITCHII_DELAY_BEFORE=b): FRITCHII_DELAY_MACRO_DRAIN_US=n x/s y ms/s,
+  FRITCHII_DELAY_POLL_DRAIN_US=n x/s y ms/s" while a switch is set or spins were counted.
+- Measure with profile_toggle.py in one session (0 against n).
+
+### Front 0xe2c misses (always on, a counter)
+
+"Front 0xe2c misses (noted write) 10 s" (HW_GPU, Info): the macro DMA reads of the 0xe2c
+occlusion macro (hash 0x3b26ab7eb3fc9863, its 0x158 read of six words; OoT macro slots, so only
+with a macro switch on, as by default) that miss their page snapshot because a write the front
+noted since overlaps the read's bytes (EDEN_NX2_DMA_SNAPSHOT's "noted write" misses). Counted only
+at those misses (fable_front_drains 1.3 A: the counter that tells its answer from the second
+answer's same-frame sample counters). Per second:
+- the misses; how far behind the back was at each (ring words between `consumed` and what the
+  front sent: average and maximum); the misses with a report the query cache still lists on the
+  read's bytes (the hit path's own test, 12 bytes back); the misses where more writes were noted
+  since the snapshot than the table remembers (the per-range answers are then "none").
+- For bytes 0-8, 8-16 and 16-24 of the read (the macro compares the 64-bit words at 0 and 16;
+  8-16 is the first report's timestamp): the newest noted write since the snapshot over them, by
+  kind: "payload report (16 bytes)" (report Payload with the timestamp; the front had the payload
+  in its registers but notes 16 unknown bytes), "payload release (4 bytes)" (a short payload
+  release, its word known), "counter or sample report" (any other report type: written when the
+  host query completes), "other" (puller semaphores, uploads, unknown ranges), "none" (no note
+  over that range; the miss came from another one). Each as "known a/b unknown c/d": the front
+  knows its words or not, the back had run it (a, c) or not (b, d) when the read missed.
+- Reading it: misses blocked by payload reports with the back far behind are answer A
+  (bookkeeping on the front); counter or sample reports the back had not run, or a listed report
+  on the bytes, are answer B (the value does not exist yet at the front).
+
+### Acquire resumes met by (always on, a counter)
+
+"Acquire resumes met by" (HW_GPU, Info, every 5 s; fable_front_drains 2.3 items 2-3): for every
+suspended semaphore acquire that resumes (Puller::ResumeAcquire), the release that met it, as the
+front's tables tell, by kind, each as "known/unknown" a second: whether the front knew the value
+when it sent it. Two groups: resumed by the back's latch (it ran a release that met the value),
+and by the other routes (word read, front answer, poll drain, lagged check).
+- Which release, in order: with EXP13 on, the newest release the back made for the word since
+  the suspension (the QMD copy's table, as its own "met by" asks), when it meets the acquire or is
+  a reduction; else the release recorded for the word (GpuSplit::NoteRelease: puller releases,
+  3D payload releases and reports, compute 0x6c3 releases) when its payload meets it; else the
+  newest write noted over the word in the last 2^18 ring words; else "not seen by the front" (the
+  guest CPU, or a writer the front does not note). It looks, it does not prove: a table slot
+  shared with another word, or an older release with the same payload, can name the wrong one.
+- Kinds: puller release, 3D payload release (4 bytes), 3D payload report (16 bytes), compute
+  0x6c3 release, QMD release, QMD reduction, copy semaphore, counter or sample report, other
+  noted write, not seen by the front.
+- Known at send: payload releases the front records (it had the payload in its registers), QMD
+  and copy releases while the QMD copy predicts them (EXP13 2-4; reductions never: bounds only),
+  noted writes with known words. Counter and sample reports never.
+- Reading it: latch resumes by releases known at send are what resolving acquires at the front
+  (resume when the newest queued release over the word has a known value that meets it) would
+  take off the front's blocked time.
+
 ### EDEN_NX2_ACCURATE_PARTS
 
 EDEN_NX2_ACCURATE_PARTS (bit mask, 0 = none, read once at boot): parts of GPU accuracy High in

@@ -142,6 +142,12 @@ inline std::atomic<int> g_memstage_fast_loop{-1};
 inline std::atomic<int> g_memstage_gather{-1};
 /// FRITCHII_MEMSTAGE_RELEASE: docs/fritchii/switches.md.
 inline std::atomic<int> g_memstage_release{-1};
+/// FRITCHII_DELAY_MACRO_DRAIN_US: docs/fritchii/switches.md.
+inline std::atomic<int> g_delay_macro_drain_us{-1};
+/// FRITCHII_DELAY_POLL_DRAIN_US: docs/fritchii/switches.md.
+inline std::atomic<int> g_delay_poll_drain_us{-1};
+/// FRITCHII_DELAY_BEFORE: docs/fritchii/switches.md.
+inline std::atomic<int> g_delay_before{-1};
 /// EDEN_NX2_LIGHT_TABLE_ARRAYS: docs/fritchii/switches.md.
 [[nodiscard]] inline bool LightTableArrays() {
     static const bool on = EnvSwitch("EDEN_NX2_LIGHT_TABLE_ARRAYS") > 0;

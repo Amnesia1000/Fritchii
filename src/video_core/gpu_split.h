@@ -79,6 +79,15 @@ inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> 
     "fence word writers",
 };
 
+/// Maxwell3D::FrontNoteMemoryWrite's notes of 3D reports (the pending write's `what`), told apart
+/// by address in the "Front 0xe2c misses" line (inline variables: one address in every unit).
+/// A payload report with the timestamp (16 bytes, report Payload, not short).
+inline constexpr char NotedPayloadReport[] = "3D payload report";
+/// A short payload release (4 bytes, its word known).
+inline constexpr char NotedPayloadRelease[] = "3D payload release";
+/// Any other report: counters and sample counts (written when the host query completes).
+inline constexpr char NotedCounterReport[] = "3D report";
+
 /// EXP13=2: which queued writer set GpuSplit::QueuedGuestWriters' position (a wait cause).
 enum class GuestWriterCause : u8 {
     None,
@@ -810,6 +819,29 @@ public:
     }
     /// Waits until the back executed every NoteWriter and NoteMemoryWriter work sent so far.
     bool WaitForMemoryWriters();
+    /// The delay tests (Coz-style causal profiling, fable_front_drains section 3): the front wait
+    /// a busy spin is added in front of. FRITCHII_DELAY_MACRO_DRAIN_US and
+    /// FRITCHII_DELAY_POLL_DRAIN_US.
+    enum class DelayTest : u32 {
+        MacroDrain, ///< A macro DMA read that waits for the back (FrontDmaRead)
+        PollDrain,  ///< A suspended acquire's poll that drains (Puller::CanResumeAcquire)
+        Count,
+    };
+    /// Front, right before a wait of `test`'s kind (a drain): 0 unless its switch is set and the
+    /// back has not run everything sent (the drain will wait). With FRITCHII_DELAY_BEFORE=1 (the
+    /// control run) it spins here and returns 0; otherwise it returns the microseconds the caller
+    /// spins once the drain returned (DelayAfterWait). The spin after the drain is the test: the
+    /// back has nothing queued then, so the spin is added front time. A spin before it overlaps
+    /// the back's backlog, which keeps shrinking meanwhile, so it costs little: the control.
+    [[nodiscard]] u32 DelayBeforeWait(DelayTest test);
+    static void DelayAfterWait(DelayTest test, u32 us) {
+        if (us != 0) [[unlikely]] {
+            SpinDelay(test, us);
+        }
+    }
+    /// Busy-spins `us` microseconds on this thread (steady_clock with a pause, not a sleep) and
+    /// counts it for the "Front waits for the back by site" line. Publishes nothing. Front only.
+    static void SpinDelay(DelayTest test, u32 us);
     /// memory-writing work whose range the front does not note was just sent (KeplerMemory
     /// and Fermi2D methods; DmaPusher is the only caller). Ends every macro DMA read snapshot.
     void NoteUnrangedWriter() {
@@ -925,6 +957,40 @@ public:
         }
         return {};
     }
+    /// "Front 0xe2c misses" (FrontDmaRead): for each of `out.size()` byte ranges [begin + i *
+    /// span, begin + (i + 1) * span), the newest NoteMemoryWrite / NoteMemoryWriteData sent after
+    /// `since` over it, whether or not the back ran it. `position` 0: none (or more were noted
+    /// since than are remembered: `overflow`); `known`: its words are known to the front. Front
+    /// only; one scan, newest first, stopping once every range has its write.
+    struct NotedOver {
+        u64 position;
+        const char* what;
+        bool known;
+    };
+    void NewestNotedWritesOver(u64 since, u64 begin, u64 span, std::span<NotedOver> out,
+                               bool& overflow) const {
+        std::ranges::fill(out, NotedOver{});
+        overflow = false;
+        size_t found = 0;
+        const u64 remembered = (std::min<u64>)(pending_write_count, pending_writes.size());
+        u64 scanned = 0;
+        for (; scanned < remembered && found < out.size(); ++scanned) {
+            const PendingWrite& write =
+                pending_writes[(pending_write_count - 1 - scanned) % pending_writes.size()];
+            if (write.position <= since) {
+                return;
+            }
+            for (size_t i = 0; i < out.size(); ++i) {
+                const u64 range_begin = begin + i * span;
+                if (out[i].position == 0 && write.begin < range_begin + span &&
+                    range_begin < write.end) {
+                    out[i] = {write.position, write.what, write.words != 0};
+                    ++found;
+                }
+            }
+        }
+        overflow = found < out.size() && scanned == pending_writes.size();
+    }
     /// Work that writes the device range [begin, begin + size) was just sent (an inline upload, a
     /// report, a semaphore release). size ~0 means an unknown range.
     void NoteMemoryWrite(u64 begin, u64 size, const char* what = "unknown") {
@@ -944,14 +1010,14 @@ public:
     }
     /// As NoteMemoryWrite, for a write whose words the front knows (a fence release payload,
     /// linear inline upload data): reads overlay them instead of waiting.
-    void NoteMemoryWriteData(u64 begin, const u32* data, u32 words) {
+    void NoteMemoryWriteData(u64 begin, const u32* data, u32 words, const char* what = "known") {
         if (write_stamps) [[unlikely]] {
             StampWrite(begin, begin + u64{words} * sizeof(u32), false);
         }
         while (words != 0) {
             const u32 count = (std::min<u32>)(words, PendingWriteWords);
             PendingWrite& write = pending_writes[pending_write_count++ % pending_writes.size()];
-            write.what = "known";
+            write.what = what;
             write.begin = begin;
             write.end = begin + u64{count} * sizeof(u32);
             write.position = write_position;
@@ -1069,9 +1135,25 @@ public:
     /// Diagnostics: the newest queued work that may write [begin, end): 0 none, 1 compute or
     /// copy, 2 work before a host sync, 3 an unranged memory write (`method`), 4 a ranged write.
     u32 QueuedWriterKind(GPUVAddr begin, GPUVAddr end, u32& method);
+    /// What sent a release NoteRelease records (the "Acquire resumes met by" counter).
+    enum class ReleaseKind : u8 {
+        Other,
+        Puller,         ///< A puller semaphore release (WriteLong, SEM_EXECUTE)
+        Payload3DShort, ///< A 3D payload release of 4 bytes (short query)
+        Payload3DLong,  ///< A 3D payload report of 16 bytes (with the timestamp)
+        ComputeReport,  ///< A compute 0x6c3 payload release
+    };
     /// A semaphore release that writes `payload` at device address `device` (from GPU address
     /// `address`) was just sent (a puller release, a 3D payload report).
-    void NoteRelease(u64 device, GPUVAddr address, u32 payload);
+    void NoteRelease(u64 device, GPUVAddr address, u32 payload,
+                     ReleaseKind kind = ReleaseKind::Other);
+    /// The kind of the release recorded for the u32 at `device` (NoteRelease), whether or not the
+    /// back ran it; Other when none is recorded there.
+    [[nodiscard]] ReleaseKind RecordedReleaseKind(u64 device) const {
+        const QueuedRelease& release = queued_releases[(device >> 2) % queued_releases.size()];
+        return release.device == device && release.position != 0 ? release.kind
+                                                                   : ReleaseKind::Other;
+    }
     /// EXP13=2 (diagnostic): the newest work sent after `done` that may write guest memory over
     /// device bytes [device, device + size) (GPU addresses from `address`) when the back runs
     /// it, leaving out native compute launches and inline QMDs (the front's QMD scheduler copy
@@ -1643,6 +1725,7 @@ private:
         u64 position;
         u64 device;
         u32 payload;
+        ReleaseKind kind;
     };
     std::array<QueuedRelease, 64> queued_releases{};
     /// Drops consumed ranged writes; returns the position a memory read of [begin, end) waits
