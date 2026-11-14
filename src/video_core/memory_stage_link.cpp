@@ -332,11 +332,11 @@ constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::Check::Co
     "a list draw packet at a back draw that asked for no list arguments (the draws differ)",
     "a served gather with no record of GPUMem's (the back ran it in a served entry)",
     "a gather GPUMem had the back run at an entry the back passed without it (record dropped)",
-    "a draw on the back between a gather GPUMem had it run and the gather's entry",
+    "a back draw between a gather GPUMem had run and its entry",
     "a served semaphore release with no record of GPUMem's (the back ran it in a served entry)",
     "a semaphore release GPUMem had the back run at an entry the back passed without it (record "
     "dropped)",
-    "a draw on the back between a semaphore release GPUMem had it run and the release's entry",
+    "a back draw between a semaphore release GPUMem had run and its entry",
 };
 static_assert(LINK_CHECK_NAMES.back() != nullptr, "a name for every check");
 constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::ListDraw::Count)>
@@ -361,6 +361,7 @@ constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::GatherOut
                  "level not alone in their entry",
                  "level after a deferred draw",
                  "level before a hard closure (one run)",
+                 "level with no ring backend",
                  "level with no record room",
                  "level as GPUMem stopped",
                  "inside a level run",
@@ -448,6 +449,11 @@ void MemoryStageLink::Start(Core::System& system_) {
     // A refusal of the window is for one game session (re-review N3).
     ahead_refused.store(false, std::memory_order_relaxed);
     ahead_blocked_logged = nullptr;
+    // Ring positions start over with the session: no gather or release record carries over.
+    gather_head.store(0, std::memory_order_relaxed);
+    gather_tail.store(0, std::memory_order_relaxed);
+    release_head.store(0, std::memory_order_relaxed);
+    release_tail.store(0, std::memory_order_relaxed);
     thread = std::jthread([this](std::stop_token stop) { StageMain(stop); });
     LOG_INFO(HW_GPU, "Memory stage thread (GPUMem) started, sleeping until "
                      "FRITCHII_MEMSTAGE_THREAD=1 or 2 gives it work");
@@ -874,11 +880,10 @@ bool MemoryStageLink::BackRingTopImpl(u64 position) {
         }
         t_back_run = false;
         t_back_served = true;
-        // FRITCHII_MEMSTAGE_GATHER: no gather record outlives a ring (its end drops what is left).
-        gather_head.store(0, std::memory_order_relaxed);
-        gather_tail.store(0, std::memory_order_relaxed);
-        release_head.store(0, std::memory_order_relaxed);
-        release_tail.store(0, std::memory_order_relaxed);
+        // FRITCHII_MEMSTAGE_GATHER / _RELEASE: a record the last ring's end kept is of an entry the
+        // back has run since (must be 0 left here: dropped as passed).
+        BackDropGathers(position, "at the ring's start");
+        BackDropReleases(position, "at the ring's start");
         MemStageShadow::SetRingBack(true);
         g_ring_active.store(true, std::memory_order_seq_cst);
         ring_start.store(position, std::memory_order_release);
@@ -902,8 +907,11 @@ bool MemoryStageLink::BackRingTopImpl(u64 position) {
                     Note(Check::PacketOrphan, "left in ring B when the ring ended");
                 }
             }
-            BackDropGathers(~u64{0}, "left when the ring ended");
-            BackDropReleases(~u64{0}, "left when the ring ended");
+            // Records of entries the back passed are dropped (must be 0). One at or past the end
+            // (GPUMem failed in or after the request, before it published past the entry) stays:
+            // the back's run of that entry without the ring still skips it, so it never runs twice.
+            BackDropGathers(position, "when the ring ended");
+            BackDropReleases(position, "when the ring ended");
             // GPUMem's unplayed mark must not outlive the ring (a fill that threw leaves its
             // entries pending and its number open): its entries are played, after the packets
             // of earlier entries above (they are later in the stream), and the mark cleared;
@@ -1319,11 +1327,22 @@ void MemoryStageLink::SetGather(bool on) {
     }
 }
 
-void MemoryStageLink::PushGather(u64 position, u64 draw_seq) noexcept {
-    // GPUMem only; GatherRoom said there is a slot (the back only frees them).
+void MemoryStageLink::PushGather(u64 position) noexcept {
+    // GPUMem only; GatherRoom said there is a slot (the back only frees them). The back, parked
+    // at `position`, reads the record only once GPUMem publishes past it (or the ring ends there).
     const u64 tail = gather_tail.load(std::memory_order_relaxed);
-    gather_records[tail % GatherSlots] = GatherRecord{position, draw_seq};
+    gather_records[tail % GatherSlots] = GatherRecord{position, ~u64{0}};
     gather_tail.store(tail + 1, std::memory_order_release);
+}
+
+void MemoryStageLink::FinishGather(u64 draw_seq) noexcept {
+    const u64 tail = gather_tail.load(std::memory_order_relaxed);
+    gather_records[(tail - 1) % GatherSlots].draw_seq = draw_seq;
+}
+
+void MemoryStageLink::RetractGather() noexcept {
+    // The request declined: the back ran nothing and has not looked (it is parked at the entry).
+    gather_tail.store(gather_tail.load(std::memory_order_relaxed) - 1, std::memory_order_release);
 }
 
 bool MemoryStageLink::BackTakeGather(u64 position) noexcept {
@@ -1342,7 +1361,9 @@ bool MemoryStageLink::BackTakeGather(u64 position) noexcept {
             Note(Check::GatherOrphan, "at a later gather");
             continue;
         }
-        if (record.draw_seq != back_draw_seq) [[unlikely]] {
+        // The draw counts start over with a ring (a record the ring's end kept has no count).
+        if (g_ring_active.load(std::memory_order_relaxed) && record.draw_seq != back_draw_seq)
+            [[unlikely]] {
             Note(Check::GatherDrawBetween, "at the gather's entry");
         }
         LinkBump(counters.gathers_taken);
@@ -1382,11 +1403,16 @@ void MemoryStageLink::SetRelease(bool on) {
     }
 }
 
-void MemoryStageLink::PushRelease(u64 position, u64 draw_seq) noexcept {
-    // GPUMem only; ReleaseRoom said there is a slot.
+void MemoryStageLink::PushRelease(u64 position) noexcept {
+    // As PushGather; ReleaseRoom said there is a slot.
     const u64 tail = release_tail.load(std::memory_order_relaxed);
-    release_records[tail % ReleaseSlots] = GatherRecord{position, draw_seq};
+    release_records[tail % ReleaseSlots] = GatherRecord{position, ~u64{0}};
     release_tail.store(tail + 1, std::memory_order_release);
+}
+
+void MemoryStageLink::FinishRelease(u64 draw_seq) noexcept {
+    const u64 tail = release_tail.load(std::memory_order_relaxed);
+    release_records[(tail - 1) % ReleaseSlots].draw_seq = draw_seq;
 }
 
 bool MemoryStageLink::BackTakeRelease(u64 position) noexcept {
@@ -1404,7 +1430,8 @@ bool MemoryStageLink::BackTakeRelease(u64 position) noexcept {
             Note(Check::ReleaseOrphan, "at a later semaphore release");
             continue;
         }
-        if (record.draw_seq != back_draw_seq) [[unlikely]] {
+        if (g_ring_active.load(std::memory_order_relaxed) && record.draw_seq != back_draw_seq)
+            [[unlikely]] {
             Note(Check::ReleaseDrawBetween, "at the release's entry");
         }
         LinkBump(counters.releases_taken);
@@ -1768,7 +1795,11 @@ void MemoryStageLink::RingLoop(std::stop_token& stop, u64 start) {
             if (!result.hard) {
                 t_in_call = false;
                 position += result.size;
-                if (result.packets != 0 || ++since_publish >= PublishEvery) {
+                // An entry the back ran for GPUMem (a gather or a semaphore release at its entry,
+                // FRITCHII_MEMSTAGE_GATHER / _RELEASE) is published at once as one with a packet:
+                // the back is parked at it and has its record.
+                if (result.packets != 0 || result.ran_on_back ||
+                    ++since_publish >= PublishEvery) {
                     since_publish = 0;
                     close_batch();
                     PublishStaged(position);

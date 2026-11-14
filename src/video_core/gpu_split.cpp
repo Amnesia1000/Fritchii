@@ -1971,10 +1971,12 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
         }
         const size_t payload = static_cast<size_t>((head >> 8) & 0xffffff);
         // FRITCHII_MEMSTAGE_RELEASE: GPUMem, level at this entry, had this thread run the puller's
-        // semaphore release already (memstage_shadow.cpp, StageRelease); skipped here. The test
-        // is on the header first: other calls pay one compare.
+        // semaphore release already (memstage_shadow.cpp, StageRelease); skipped here, also when
+        // the record outlived the ring by this entry (GPUMem failed in the request), so it never
+        // runs twice. The test is on the header first: other calls pay one compare.
         if (StageCacheCallOf(head) == StageCacheCall::SemaphoreRelease &&
-            StageTagOf(head) == StageTag::Cache && MemoryStageLink::RingActive() &&
+            StageTagOf(head) == StageTag::Cache &&
+            (MemoryStageLink::RingActive() || MemoryStageLink::Get().ReleasePending()) &&
             MemoryStageLink::Get().BackTakeRelease(back_entry_position)) [[unlikely]] {
             return 2 + payload;
         }

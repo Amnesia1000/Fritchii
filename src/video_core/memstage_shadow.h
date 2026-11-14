@@ -171,6 +171,7 @@ struct StageResult {
     u32 packets;
     u32 launches; ///< Compute launches in the entry (0xaf, 0xb0, 0x107), for the run shape
     s32 channel;  ///< The channel the stage had bound at the entry, for the run shape
+    bool ran_on_back; ///< The back ran a gather or a semaphore release of it on GPUMem's request
 };
 /// The back: ring mode starts (its hooks off) or ended.
 void SetRingBack(bool on);
@@ -188,6 +189,16 @@ void BackTakeLend();
 /// of that one entry hands them over.
 void BackGatherLend();
 void BackGatherReturn();
+/// BackGatherReturn when it goes out of scope, also when the gather or the closure throws (the
+/// flags never stay on the back).
+struct BackGatherFlags {
+    BackGatherFlags() = default;
+    ~BackGatherFlags() {
+        BackGatherReturn();
+    }
+    BackGatherFlags(const BackGatherFlags&) = delete;
+    BackGatherFlags& operator=(const BackGatherFlags&) = delete;
+};
 /// Step 7: whether processing the entry at `position` may take a full copy from the back (a copy
 /// that is new or stale): GPUMem must be level there first.
 [[nodiscard]] bool StageMayCopy(u64 position);

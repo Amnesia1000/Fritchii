@@ -846,6 +846,7 @@ struct State {
     bool ring_in_run{};       ///< The entry is followed inside a level run
     u64 ring_seq{};           ///< Draws the copies issued since the ring started
     u32 ring_packets{};       ///< Packets the entry sent
+    bool ring_ran_on_back{};  ///< The back ran its gather or semaphore release (StageResult)
     Class last_class{Class::Pass};
     std::vector<std::pair<u64, std::size_t>> ring_ranges; ///< Collected, not applied yet
     /// Step 7: the flags a deferred lend hands over, per engine (BackTakeLend).
@@ -1557,6 +1558,27 @@ void Return(State& s) {
 /// a run: a gather that is not a lone Direct method (something before it in the entry would run on
 /// the back after it), one the back's pending deferred draw would come before, one right before a
 /// hard closure (the run takes it in), no record room, the switch off or the window closed.
+///
+/// The collected constant buffer ranges GPUMem holds (StageRanges) stay for its next fill, as on
+/// THREAD 0, where the memory manager's cached ranges wait for FlushCaching at the next draw (no
+/// part of the gather, the wait for idle, the query sync or a fence calls it): the request runs
+/// with them pending, as the back's own gather would. (A lent run applies them at its start,
+/// earlier than THREAD 0.)
+void StageGather(State& s, Copy& c, u32 method);
+
+/// The entry after the one at `position` (`size` words) is a hard closure the front has published
+/// (a Cache or untagged Call: a semaphore release, a fence), which a run started here would take
+/// in (StageExtendsRun).
+bool NextIsHardClosure(u64 position, size_t size) {
+    const u64 next = position + size;
+    if (next >= Access::Published()) {
+        return false;
+    }
+    const u64 head = Access::Ring()[next & Access::RingMask];
+    return static_cast<Kind>(head & 0xf) == Kind::Call &&
+           (StageTagOf(head) == StageTag::Cache || StageTagOf(head) == StageTag::Level);
+}
+
 void StageGather(State& s, Copy& c, u32 method) {
     using Outcome = MemoryStageLink::GatherOutcome;
     MemoryStageLink& link = MemoryStageLink::Get();
@@ -1584,17 +1606,12 @@ void StageGather(State& s, Copy& c, u32 method) {
     // A hard closure right after it (a Cache or untagged Call: a semaphore release, a fence) would
     // join the gather's run (StageExtendsRun) and start one of its own here: GPUMem would come
     // level and then lend anyway. Kept as one run, when the front has published that entry.
-    const u64 next = s.processing_position + ((head & Access::HasSegment) != 0 ? 2 : 1);
-    if (next < Access::Published()) {
-        const u64 next_head = Access::Ring()[next & Access::RingMask];
-        if (static_cast<Kind>(next_head & 0xf) == Kind::Call &&
-            (StageTagOf(next_head) == StageTag::Cache || StageTagOf(next_head) == StageTag::Level)) {
-            return level(Outcome::NextHard);
-        }
+    if (NextIsHardClosure(s.processing_position, (head & Access::HasSegment) != 0 ? 2 : 1)) {
+        return level(Outcome::NextHard);
     }
     const auto& backend = link.Backend();
     if (backend.gather == nullptr) {
-        return level(Outcome::Closed);
+        return level(Outcome::NoBackend);
     }
     if (!link.GatherRoom()) {
         return level(Outcome::NoRoom);
@@ -1603,33 +1620,27 @@ void StageGather(State& s, Copy& c, u32 method) {
     if (!link.StageLevel(s.processing_position, MemoryStageLink::LevelReason::Gather)) {
         return level(Outcome::Stopping);
     }
-    // Level: the back has run every entry before this one and is parked at it. The request reads
-    // and writes the back's state on the back (its idle hook's flush may run there meanwhile): it
-    // declines when the engine has a deferred draw, which this entry would issue first (its method
-    // sink's writes and the gather's own store flush it), before the gather; it hands the cache's
-    // flags over around the gather (BackGatherLend, BackGatherReturn).
+    // Level: the back has run every entry before this one and is parked at it. The record first:
+    // if the request throws (the ring then ends at this entry), the back's run of the entry
+    // without the ring still skips the gather, so it never runs twice. The request reads and
+    // writes the back's state on the back (its idle hook's flush may run there meanwhile): it
+    // declines when the engine has a deferred draw, which this entry would issue first (its
+    // method sink's writes and the gather's own store flush it), before the gather; it hands the
+    // cache's flags over around the gather (BackGatherLend, BackGatherReturn). That decline is
+    // not a mismatch: the shadow applies sunk writes at once and may have issued that draw at an
+    // earlier entry, while the back issues it when it consumes its sink here.
+    link.PushGather(s.processing_position);
     u64 draw_seq = 0;
     if (!backend.gather(backend.context, c.back, draw_seq)) {
+        link.RetractGather();
         return level(Outcome::DeferredDraw);
     }
-    link.PushGather(s.processing_position, draw_seq);
+    link.FinishGather(draw_seq);
+    s.ring_ran_on_back = true;
     link.NoteGather(Outcome::Served,
                     static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                          std::chrono::steady_clock::now() - start)
                                          .count()));
-}
-
-/// The entry after the one at `position` (`size` words) is a hard closure the front has published
-/// (a Cache or untagged Call: a semaphore release, a fence), which a run started here would take
-/// in (StageExtendsRun).
-bool NextIsHardClosure(u64 position, size_t size) {
-    const u64 next = position + size;
-    if (next >= Access::Published()) {
-        return false;
-    }
-    const u64 head = Access::Ring()[next & Access::RingMask];
-    return static_cast<Kind>(head & 0xf) == Kind::Call &&
-           (StageTagOf(head) == StageTag::Cache || StageTagOf(head) == StageTag::Level);
 }
 
 /// FRITCHII_MEMSTAGE_RELEASE (GPUMem, at a Call entry tagged StageCacheCall::SemaphoreRelease, the
@@ -1666,19 +1677,24 @@ bool StageRelease(State& s, const u64* entry, size_t size) {
         link.NoteRelease(Outcome::Stopping);
         return false;
     }
-    // Level: the back is parked at this entry, which stays in ring A until the back passes it.
+    // Level: the back is parked at this entry, which stays in ring A until the back passes it. The
+    // record first, as StageGather's: if the closure throws in the request (the ring then ends at
+    // this entry), the back's run of the entry without the ring still skips it, so the report,
+    // the fence and the semaphore word are never made twice.
+    link.PushRelease(s.processing_position);
     struct Run {
         const u64* entry;
         u64 draw_seq;
     } run{entry, 0};
     auto body = [&run] {
         BackGatherLend();
+        const BackGatherFlags flags; // BackGatherReturn, also if the closure throws
         reinterpret_cast<void (*)(const u64*)>(run.entry[1])(run.entry + 2);
-        BackGatherReturn();
         run.draw_seq = MemoryStageLink::Get().BackDrawSeq();
     };
     link.ServeNow(body);
-    link.PushRelease(s.processing_position, run.draw_seq);
+    link.FinishRelease(run.draw_seq);
+    s.ring_ran_on_back = true;
     link.NoteRelease(Outcome::Served,
                      static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                           std::chrono::steady_clock::now() - start)
@@ -2400,6 +2416,7 @@ StageResult StageProcess(u64 position, bool in_run) {
     State& s = S();
     s.ring_in_run = in_run;
     s.ring_packets = 0;
+    s.ring_ran_on_back = false;
     s.current = position;
     const size_t size = Process(s, position, false);
     s.cursor = position + size;
@@ -2410,6 +2427,7 @@ StageResult StageProcess(u64 position, bool in_run) {
         .packets = s.ring_packets,
         .launches = s.entry_launches,
         .channel = s.channel,
+        .ran_on_back = s.ring_ran_on_back,
     };
 }
 

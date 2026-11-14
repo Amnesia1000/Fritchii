@@ -91,6 +91,7 @@ public:
         NotFirst,     ///< level: not a lone Direct method, or a draw before it in its entry
         DeferredDraw, ///< level: the back had a deferred draw it would issue first at the entry
         NextHard,     ///< level: a hard closure follows, which the gather's run takes in
+        NoBackend,    ///< level: no ring backend runs gathers (not the Vulkan rasterizer)
         NoRoom,       ///< level: no room for its record
         Stopping,     ///< level: GPUMem is stopping
         InRun,        ///< inside a level run (followed; the back runs it lent)
@@ -347,10 +348,12 @@ public:
     }
     /// The back, at a frame end: FRITCHII_MEMSTAGE_GATHER (live, default off).
     void SetGather(bool on);
-    /// GPUMem has the back run gathers at their entry: the switch on and the window open.
+    /// GPUMem has the back run gathers at their entry: the switch on and the window open, as
+    /// GPUMem's loop read it (ring_window, what StageLevel goes by; g_ahead may have moved since).
+    /// GPUMem only.
     [[nodiscard]] static bool GatherServed() noexcept {
-        return g_gather.load(std::memory_order_relaxed) &&
-               g_ahead.load(std::memory_order_relaxed) != 0;
+        return g_gather.load(std::memory_order_relaxed) && t_on_stage &&
+               instance.ring_window != 0;
     }
     /// GPUMem: a gather of its copy, and what became of it (`ns`: GPUMem's time for a served one).
     void NoteGather(GatherOutcome what, u64 ns = 0) noexcept {
@@ -369,9 +372,19 @@ public:
                    gather_head.load(std::memory_order_acquire) <
                GatherSlots;
     }
-    /// GPUMem: the back ran the gather of the entry at `position` (its draw count then
-    /// `draw_seq`); its own run of that entry skips it (BackTakeGather).
-    void PushGather(u64 position, u64 draw_seq) noexcept;
+    /// GPUMem, before it asks the back to run the gather of the entry at `position`: its record,
+    /// so that the back's own run of that entry skips it (BackTakeGather) even when the request
+    /// throws and the ring ends at the entry. The back is parked at the entry and takes nothing
+    /// until GPUMem publishes past it: FinishGather sets the back's draw count then, RetractGather
+    /// takes the record back when the request declined.
+    void PushGather(u64 position) noexcept;
+    void FinishGather(u64 draw_seq) noexcept;
+    void RetractGather() noexcept;
+    /// The back: whether a gather record waits (any mode: one can outlive the ring at its end).
+    [[nodiscard]] bool GatherPending() const noexcept {
+        return gather_head.load(std::memory_order_relaxed) !=
+               gather_tail.load(std::memory_order_acquire);
+    }
     /// The back, at a gather (RasterizerVulkan::InvalidateTextureDataCache): true when GPUMem had
     /// it run already at this entry. Counts the must-be-0 cases (a served one with no record, a
     /// record of an entry the back passed, a draw in between).
@@ -379,10 +392,11 @@ public:
 
     /// The back, at a frame end: FRITCHII_MEMSTAGE_RELEASE (live, default off).
     void SetRelease(bool on);
-    /// GPUMem has the back run semaphore releases at their entry: the switch on, the window open.
+    /// GPUMem has the back run semaphore releases at their entry: the switch on, the window open
+    /// (ring_window, as GatherServed). GPUMem only.
     [[nodiscard]] static bool ReleaseServed() noexcept {
-        return g_release.load(std::memory_order_relaxed) &&
-               g_ahead.load(std::memory_order_relaxed) != 0;
+        return g_release.load(std::memory_order_relaxed) && t_on_stage &&
+               instance.ring_window != 0;
     }
     /// GPUMem: a semaphore release of the ring, and what became of it (`ns` for a served one).
     void NoteRelease(ReleaseOutcome what, u64 ns = 0) noexcept {
@@ -394,9 +408,14 @@ public:
                    release_head.load(std::memory_order_acquire) <
                ReleaseSlots;
     }
-    /// GPUMem: the back ran the release closure of the entry at `position` (its draw count then
-    /// `draw_seq`); its own run of that entry skips it (BackTakeRelease).
-    void PushRelease(u64 position, u64 draw_seq) noexcept;
+    /// GPUMem, before it asks the back to run the release closure of the entry at `position`: as
+    /// PushGather (a record the back's own run of that entry skips, BackTakeRelease).
+    void PushRelease(u64 position) noexcept;
+    void FinishRelease(u64 draw_seq) noexcept;
+    [[nodiscard]] bool ReleasePending() const noexcept {
+        return release_head.load(std::memory_order_relaxed) !=
+               release_tail.load(std::memory_order_acquire);
+    }
     /// The back, at a release closure's Call entry (GpuSplit::Execute): true when GPUMem had it run
     /// already at this entry (the call is skipped). Counts the must-be-0 cases as BackTakeGather.
     [[nodiscard]] bool BackTakeRelease(u64 position) noexcept;

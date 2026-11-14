@@ -1523,14 +1523,17 @@ bool RasterizerVulkan::StageRunGather(Tegra::Engines::Maxwell3D& engine, u64& dr
         run.synced = self.query_cache.HasPendingSync();
         VideoCommon::MemStageShadow::BackGatherLend();
         {
-            t_gather_probe = &run.probe;
-            SCOPE_EXIT {
-                t_gather_probe = nullptr;
-            };
-            self.InvalidateGPUCache();
+            // BackGatherReturn at the end of this block, also if the gather throws.
+            const VideoCommon::MemStageShadow::BackGatherFlags flags;
+            {
+                t_gather_probe = &run.probe;
+                SCOPE_EXIT {
+                    t_gather_probe = nullptr;
+                };
+                self.InvalidateGPUCache();
+            }
+            self.WaitForIdle();
         }
-        self.WaitForIdle();
-        VideoCommon::MemStageShadow::BackGatherReturn();
         run.draw_seq = Link::Get().BackDrawSeq();
         run.ran = true;
     };
@@ -4950,10 +4953,12 @@ void RasterizerVulkan::InvalidateTextureDataCache() {
     // (StageRunGather); the back's own run of the entry skips it. BackTakeGather counts a served
     // gather with no record (must be 0). Without the ring, and for every gather that started a
     // run, the default below.
+    // A record can outlive the ring by one entry (GPUMem failed in the request): it is honoured
+    // without the ring too, so a gather is never run twice.
     using Link = VideoCommon::MemoryStageLink;
-    if (Link::RingActive() &&
-        Link::Get().BackTakeGather(VideoCommon::GpuSplit::Get().BackEntryPosition()))
-        [[unlikely]] {
+    Link& link = Link::Get();
+    if ((Link::RingActive() || link.GatherPending()) &&
+        link.BackTakeGather(VideoCommon::GpuSplit::Get().BackEntryPosition())) [[unlikely]] {
         return;
     }
     InvalidateGPUCache();
