@@ -3,6 +3,8 @@
 
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cstddef>
 #include <limits>
@@ -19,9 +21,11 @@
 #include "common/common_types.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/memory_stage_link.h"
 #include "video_core/memstage_stats.h"
 #include "video_core/query_cache/frame_trace.h"
 #include "video_core/query_cache/query_cache.h"
+#include "video_core/rasterizer_download_area.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
@@ -1776,27 +1780,74 @@ void QueryCacheRuntime::SyncValues(std::span<SyncValuesType> values, VkBuffer ba
     }
 
     // Vulkan part.
-    std::scoped_lock lk(impl->buffer_cache.mutex);
-    // The ranges' buffers: what they upload is played before the query cache's own copies.
-    std::optional<MemStage::FillPlay> seam{std::in_place, impl->buffer_cache.runtime.Seam(),
-                                           MemStage::Site::Query};
-    impl->buffer_cache.BufferOperations([&] {
+    // FRITCHII_MEMSTAGE_PASS bit 2 (fable_stage_p3 5.1): served, at an entry GPUMem passed with
+    // the sync resolved, the buffers come from its pass record. GPUMem made the sync's own
+    // lookups at the entry's place in the cache's order, where each was pure (an existing buffer,
+    // nothing to upload) and only marked the usage; the back copies into those buffers and does
+    // not enter the buffer cache (no lock, no bracket: nothing of the cache's is recorded here).
+    // A range none of the targets holds is a must-be-0 (PassSyncTarget): today's block then.
+    using Link = VideoCommon::MemoryStageLink;
+    const bool from_record = [&] {
+        if (!Link::BackServed()) [[likely]] {
+            return false;
+        }
+        Link& link = Link::Get();
+        const Link::PassRecord* const record = link.BackCurrentPassRecord();
+        if (record == nullptr || !record->sync) {
+            // Not a passed entry's sync (a read flush's own fence syncs here): today's block.
+            link.NoteP3BackSync(false);
+            return false;
+        }
         impl->buffers_to_upload_to.clear();
-        for (auto& pair : impl->little_cache) {
-            static constexpr auto sync_info = VideoCommon::ObtainBufferSynchronize::FullSynchronize;
-            const auto post_op = VideoCommon::ObtainBufferOperation::DoNothing;
-            const auto [buffer, offset] = impl->buffer_cache.ObtainCPUBuffer(
-                pair.first, static_cast<u32>(pair.second - pair.first), sync_info, post_op);
+        for (const auto& pair : impl->little_cache) {
+            const auto target = std::ranges::find_if(record->targets, [&](const auto& t) {
+                return t.begin <= pair.first && pair.second <= t.begin + t.bytes;
+            });
+            if (target == record->targets.end()) [[unlikely]] {
+                Link::Note(Link::Check::PassSyncTarget, "QueryCacheRuntime::SyncValues");
+                impl->buffers_to_upload_to.clear();
+                return false;
+            }
             VideoCommon::MemStageStats::Read(VideoCommon::MemStageStats::Kind::QueryBuffer,
                                              pair.second - pair.first);
-            impl->buffers_to_upload_to.emplace_back(buffer->Handle(), offset);
+            impl->buffers_to_upload_to.emplace_back(std::bit_cast<VkBuffer>(target->buffer),
+                                                    target->offset + (pair.first - target->begin));
         }
-    });
-    seam.reset();
-    // EDEN_NX2_EXP49: the copies below are GPU writes the buffer cache doesn't record. Read
-    // downloads taken before them must not keep the bytes they downloaded as the newest.
-    for (const auto& value : values) {
-        impl->buffer_cache.OutdateReadDownloads(value.address, value.size);
+        link.NoteP3BackSync(true);
+        return true;
+    }();
+    if (!from_record) {
+        std::scoped_lock lk(impl->buffer_cache.mutex);
+        // The ranges' buffers: what they upload is played before the query cache's own copies.
+        std::optional<MemStage::FillPlay> seam{std::in_place, impl->buffer_cache.runtime.Seam(),
+                                               MemStage::Site::Query};
+        impl->buffer_cache.BufferOperations([&] {
+            impl->buffers_to_upload_to.clear();
+            for (auto& pair : impl->little_cache) {
+                static constexpr auto sync_info =
+                    VideoCommon::ObtainBufferSynchronize::FullSynchronize;
+                const auto post_op = VideoCommon::ObtainBufferOperation::DoNothing;
+                const auto [buffer, offset] = impl->buffer_cache.ObtainCPUBuffer(
+                    pair.first, static_cast<u32>(pair.second - pair.first), sync_info, post_op);
+                VideoCommon::MemStageStats::Read(VideoCommon::MemStageStats::Kind::QueryBuffer,
+                                                 pair.second - pair.first);
+                impl->buffers_to_upload_to.emplace_back(buffer->Handle(), offset);
+            }
+        });
+        seam.reset();
+        // EDEN_NX2_EXP49: the copies below are GPU writes the buffer cache doesn't record. Read
+        // downloads taken before them must not keep the bytes they downloaded as the newest.
+        for (const auto& value : values) {
+            impl->buffer_cache.OutdateReadDownloads(value.address, value.size);
+        }
+    } else if (VideoCore::g_read_downloads.load(std::memory_order_acquire) != 0) [[unlikely]] {
+        // As above, only with a read download pending (the read download lists alone; the
+        // back is the cache's user for them under the lock, as at a fence commit).
+        std::scoped_lock lk(impl->buffer_cache.mutex);
+        const Link::BackCacheScope back_cache;
+        for (const auto& value : values) {
+            impl->buffer_cache.OutdateReadDownloads(value.address, value.size);
+        }
     }
 
     VkBuffer src_buffer;

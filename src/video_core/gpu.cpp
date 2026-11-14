@@ -184,7 +184,8 @@ struct GPU::Impl {
         // after the managers' locks). Else the take and the buffer half run on GPUMem in one
         // served call, so only GPUMem takes while the back is served (no write sits between two
         // takers while a fill passes); that take is listed as below (rule T).
-        if (VideoCommon::MemoryStageLink::BackServed() && VideoCommon::MemoryStageLink::PassOn(1)) {
+        // Bit 2 too (P3): a passed fence entry's fence ends in this gather while served.
+        if (VideoCommon::MemoryStageLink::BackServed() && VideoCommon::MemoryStageLink::PassOn(3)) {
             if (std::ranges::all_of(system.GetGPUDirtyMemoryManager(),
                                     [](const Core::GPUDirtyMemoryManager& manager) {
                                         return manager.NothingCollected();

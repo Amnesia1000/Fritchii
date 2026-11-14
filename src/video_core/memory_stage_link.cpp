@@ -351,6 +351,7 @@ constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::Check::Co
     "a served wait for idle with no pass record (the back ran it in a served entry)",
     "a pass record's slot freed while its taken writes were listed and not applied (rule T)",
     "taken writes left listed (applying_writes) at the ring's end beyond the records kept",
+    "a query result sync range at a P3-passed entry that none of the record's targets holds",
 };
 static_assert(LINK_CHECK_NAMES.back() != nullptr, "a name for every check");
 constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::ListDraw::Count)>
@@ -789,7 +790,7 @@ void MemoryStageLink::CheckCacheUserSlow(Check check) noexcept {
 void MemoryStageLink::Note(Check check, const char* where) noexcept {
     const size_t index = static_cast<size_t>(check);
     instance.counters.checks[index].fetch_add(1, std::memory_order_relaxed);
-    if (check >= Check::PassQuerySync && check <= Check::PassListedLeft) {
+    if (check >= Check::PassQuerySync && check <= Check::PassSyncTarget) {
         // FRITCHII_MEMSTAGE_PASS runs as 0 from the next frame end (SetPass), for the session.
         instance.pass_refused.store(true, std::memory_order_relaxed);
     }
@@ -1659,15 +1660,25 @@ void MemoryStageLink::SetPass(u32 bits) {
         }
         bits = 0;
     }
-    bits &= 1; // bit 1 (P1); bit 2 (P3) is not built yet
+    bits &= 3; // bit 1 (P1), bit 2 (P3, fable_stage_p3)
     g_pass.store(bits, std::memory_order_relaxed);
     if (mode == 2 && pass_logged != static_cast<int>(bits) && pass_logged != -2) {
         pass_logged = static_cast<int>(bits);
-        LOG_INFO(HW_GPU, "Memory stage passes (FRITCHII_MEMSTAGE_PASS={}): {}", bits,
-                 bits != 0 ? "GPUMem passes lone gathers and waits for idle with no query sync "
-                             "pending, no read tracking and no uncommitted flush, no run (while "
-                             "the window is open, FRITCHII_MEMSTAGE_AHEAD > 0)"
-                           : "gathers and waits for idle as before (the passes line is dry)");
+        const char* const what =
+            bits == 0 ? "gathers, waits for idle and fence entries as before (the passes lines "
+                        "are dry)"
+            : bits == 1
+                ? "GPUMem passes lone gathers and waits for idle with no query sync pending and no "
+                  "uncommitted flush, no run (while the window is open, FRITCHII_MEMSTAGE_AHEAD > "
+                  "0)"
+            : bits == 2
+                ? "GPUMem passes lone gathers and waits for idle with a query sync pending, the "
+                  "puller's release closures and lone 3D fence reports, where every report page "
+                  "has a buffer and is clean (P3), no run (while the window is open)"
+                : "GPUMem passes lone gathers and waits for idle, the puller's release closures "
+                  "and lone 3D fence reports, where no query sync is pending or every report page "
+                  "has a buffer and is clean (P1 and P3), no run (while the window is open)";
+        LOG_INFO(HW_GPU, "Memory stage passes (FRITCHII_MEMSTAGE_PASS={}): {}", bits, what);
     }
 }
 
@@ -1720,6 +1731,13 @@ MemoryStageLink::PassRecord* MemoryStageLink::BackPassRecord(u64 position) noexc
     }
     record.seen = true;
     return &record;
+}
+
+MemoryStageLink::PassRecord* MemoryStageLink::BackCurrentPassRecord() noexcept {
+    if (!PassPending()) {
+        return nullptr;
+    }
+    return BackPassRecord(GpuSplit::Get().BackEntryPosition());
 }
 
 void MemoryStageLink::BackApplyPasses(u64 position) noexcept {
@@ -2427,7 +2445,7 @@ void MemoryStageLink::LogPasses(double seconds) {
         "pass",           "pass (unmapped)",   "pass (not a fence)", "not lone",
         "Accurate",       "EXP28 trim",        "read tracking",      "flushes uncommitted",
         "reports unknown", "too many runs",    "no buffer on a report page",
-        "run past the buffer", "CPU-modified report page"};
+        "run past the buffer", "CPU-modified report page", "no record room"};
     static constexpr std::array<const char*, static_cast<size_t>(P3Kind::Count)> p3_kinds{
         "gathers", "waits for idle", "releases", "fence reports"};
     std::string p3_text;
@@ -2451,6 +2469,24 @@ void MemoryStageLink::LogPasses(double seconds) {
              sync_points != 0 ? static_cast<double>(pages) / static_cast<double>(sync_points)
                               : 0.0,
              rate(sync_points), stats.p3_pages_max.exchange(0, std::memory_order_relaxed));
+    // FRITCHII_MEMSTAGE_PASS bit 2: what P3 passed (the line above then holds its decisions).
+    std::array<u64, static_cast<size_t>(P3Kind::Count)> passed{};
+    for (size_t k = 0; k < passed.size(); ++k) {
+        passed[k] = take(stats.p3_passed[k]);
+    }
+    const u64 targets = take(stats.p3_targets);
+    const u64 back_unpassed = take(stats.p3_back_syncs[0]);
+    const u64 back_targeted = take(stats.p3_back_syncs[1]);
+    if ((g_pass.load(std::memory_order_relaxed) & 2) != 0) {
+        LOG_INFO(HW_GPU,
+                 "Memory stage passes P3 (FRITCHII_MEMSTAGE_PASS={}) {:.0f} s: passed per second "
+                 "gathers {:.0f}, waits for idle {:.0f}, releases {:.0f}, fence reports {:.0f}, "
+                 "with {:.0f} sync targets/s; the back's query result syncs while served: from a "
+                 "pass record {:.0f}/s, without one {:.0f}/s (today's path; a read flush's fence)",
+                 g_pass.load(std::memory_order_relaxed), seconds, rate(passed[0]),
+                 rate(passed[1]), rate(passed[2]), rate(passed[3]),
+                 rate(targets), rate(back_targeted), rate(back_unpassed));
+    }
 }
 
 void MemoryStageLink::Take(Snapshot& out) const noexcept {
