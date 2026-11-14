@@ -718,8 +718,20 @@ With the switch on (Vulkan's mapped uploads only):
   hot ones): a change is taken as any change is and counted as "missed". "missed" and
   "disagreed" must stay 0. Costs more than the hot rule did.
 - "Native bank flagged (FRITCHII_BANK_FLAGGED=n, slots S, 5 s): B binds, K skipped whole, H hot
-  pages not compared; verify: V compared, M missed, D disagreed; uploads refreshed R pages (C
-  changed); snapshots dropped N times so far" (HW_GPU, Info).
+  pages not compared; verify: V compared, M missed (then flagged F, never flagged U), D
+  disagreed (collected a, buffer cache b, recheck c, CPU-modified d); uploads refreshed R pages
+  (C changed); snapshots dropped N times so far" (HW_GPU, Info).
+- What a non-zero "missed" or "disagreed" means. Writers on other threads mark the page flags
+  without the bank check's lock, after their bytes land. "Missed": a verify compare found
+  bytes that landed during this bind, before their writer's mark; the mark reaches the page at a
+  later bind (the page is watched for 8 visits: "then flagged"). That bind's draw is not ordered
+  after the write, so either contents are right for it (the hot rule caught such writes only by
+  timing). "Never flagged" is a writer no mark covers and must stay 0. "Disagreed": the
+  whole-bank skip's flag look (Any) and the loop's take (Take) are two reads; a mark set between
+  them shows as a collected or buffer cache reason in the loop, and stays set for the next bind
+  when the bank is skipped. Recheck or CPU-modified there would be a real disagreement. First
+  verify run (market, d5d510bb9c, 26 fps): 2 missed and 5 disagreed in 28 windows of 5 s, the
+  census at the same build 1 unflagged change per 10 s, a late flag.
 
 Why no stale bank reaches a draw on a flagged slot. The bank check marks a page CPU-modified
 (so the bind's sync uploads it) when the page's guest bytes differ from its snapshot. The rule

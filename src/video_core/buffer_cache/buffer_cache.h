@@ -3618,6 +3618,17 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
             NoteNativeBankPageChanged(page, snapshot.words.data(), upload_to, uploads);
             continue;
         }
+        // FRITCHII_BANK_FLAGGED=2: a page whose change was "missed" is watched for its next 8
+        // visits: a flag then is the late mark of a writer that ran during the bind (its bytes
+        // landed before its mark); none means a writer no mark covers.
+        if (snapshot.missed_watch != 0) [[unlikely]] {
+            if (collected || written) {
+                snapshot.missed_watch = 0;
+                ++stats.flagged_missed_then_flagged;
+            } else if (--snapshot.missed_watch == 0) {
+                ++stats.flagged_missed_never_flagged;
+            }
+        }
         // A flagged write's bytes may land after this compare: compare again at the next bind.
         const bool recheck = snapshot.recheck;
         if (recheck != (collected || written)) {
@@ -3643,9 +3654,14 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
             reason = BankFrame;
         }
         if (skip_verify && reason != BankNone) [[unlikely]] {
-            // The whole-bank skip passed over a page the loop has a reason for: must not happen.
+            // The whole-bank skip passed over a page the loop has a reason for. The skip's flag
+            // looks (Any) come before the loop's takes: a writer on another thread can mark in
+            // between, and its mark stays for the next bind. Counted by the reason found.
             ++stats.skip_disagreed;
-            stats.flagged_disagreed += flagged_slot ? 1 : 0;
+            if (flagged_slot) {
+                ++stats.flagged_disagreed;
+                ++stats.flagged_disagreed_by[reason];
+            }
         }
         const bool own_hot = reason == BankNone && own_slot && hot;
         if (own_hot) {
@@ -3720,7 +3736,10 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
         if (verify_skip) {
             // Missed by the slot rule: taken as any change is (marked), and counted.
             ++stats.skip_missed;
-            stats.flagged_missed += flagged_slot ? 1 : 0;
+            if (flagged_slot) {
+                ++stats.flagged_missed;
+                snapshot.missed_watch = 8;
+            }
         } else {
             ++stats.changed[reason];
             if (slot_stats != nullptr) [[unlikely]] {
@@ -3802,18 +3821,24 @@ void BufferCache<P>::LogNativeBankTrackedStats(int mode) {
                  stats.skip_disagreed);
     }
     // FRITCHII_BANK_FLAGGED: the same for its slots alone, with the snapshot refreshes uploads
-    // made. With =2, "missed" and "disagreed" must stay 0.
+    // made. With =2: "missed" pages whose page was flagged within its next 8 visits were writers
+    // running during the bind (bytes before mark); "never flagged" must stay 0. "Disagreed" by
+    // reason: collected or buffer cache marks set between the skip's look and the loop's take.
     if (stats.flagged_binds != 0) {
+        const auto& by = stats.flagged_disagreed_by;
         LOG_INFO(HW_GPU,
                  "Native bank flagged (FRITCHII_BANK_FLAGGED={}, slots {:#x}, 5 s): {} binds, {} "
-                 "skipped whole, {} hot pages not compared; verify: {} compared, {} missed, {} "
-                 "disagreed; uploads refreshed {} pages ({} changed); snapshots dropped {} times "
-                 "so far (switch on, lost guest store ranges)",
+                 "skipped whole, {} hot pages not compared; verify: {} compared, {} missed (then "
+                 "flagged {}, never flagged {}), {} disagreed (collected {}, buffer cache {}, "
+                 "recheck {}, CPU-modified {}); uploads refreshed {} pages ({} changed); "
+                 "snapshots dropped {} times so far (switch on, lost guest store ranges)",
                  VideoCore::Nx2Debug::g_bank_flagged.load(std::memory_order_relaxed),
                  VideoCore::Nx2Debug::g_bank_flagged_slots.load(std::memory_order_relaxed),
                  stats.flagged_binds, stats.flagged_skipped, stats.flagged_hot_left,
-                 stats.flagged_verified, stats.flagged_missed, stats.flagged_disagreed,
-                 stats.refreshed_pages, stats.refreshed_changed, native_bank_flagged_resets);
+                 stats.flagged_verified, stats.flagged_missed, stats.flagged_missed_then_flagged,
+                 stats.flagged_missed_never_flagged, stats.flagged_disagreed, by[BankCollected],
+                 by[BankWritten], by[BankRecheck], by[BankCpuDirty], stats.refreshed_pages,
+                 stats.refreshed_changed, native_bank_flagged_resets);
     }
     native_bank_slot_stats = {};
     stats = {};
