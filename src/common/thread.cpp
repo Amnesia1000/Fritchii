@@ -735,7 +735,14 @@ void PinCurrentThread(PinnedRole role, int guest_core) {
         LOG_INFO(Common, "Thread pinning: {}", ThreadPinning::Describe(result, topology, mode));
         // FRITCHII_PIN_GPUMEM=1: the last physical core of the guest set goes to GPUMem alone.
         const char* const pin_mem = std::getenv("FRITCHII_PIN_GPUMEM");
-        if (pin_mem != nullptr && pin_mem[0] == '1' && result.guest != 0) {
+        // One follower (FRITCHII_ONEF=1, boot): its render thread R takes the same core unless
+        // FRITCHII_ONEF_PIN=0 (default 1; video_core/one_follower.h). R and GPUMem never run
+        // together: the memory stage stays off with one follower on.
+        const char* const onef = std::getenv("FRITCHII_ONEF");
+        const char* const onef_pin = std::getenv("FRITCHII_ONEF_PIN");
+        const bool pin_render = onef != nullptr && onef[0] == '1' &&
+                                (onef_pin == nullptr || onef_pin[0] != '0');
+        if (((pin_mem != nullptr && pin_mem[0] == '1') || pin_render) && result.guest != 0) {
             for (auto it = topology.cores.rbegin(); it != topology.cores.rend(); ++it) {
                 if (it->mask != 0 && (it->mask & ~result.guest) == 0 &&
                     (result.guest & ~it->mask) != 0) {
@@ -744,8 +751,9 @@ void PinCurrentThread(PinnedRole role, int guest_core) {
                     break;
                 }
             }
-            LOG_INFO(Common, "Thread pinning: GPUMem {:#x} (FRITCHII_PIN_GPUMEM=1), guest cores now {:#x}",
-                     mem_mask, result.guest);
+            LOG_INFO(Common, "Thread pinning: {} {:#x} ({}), guest cores now {:#x}",
+                     pin_render ? "GPURender" : "GPUMem", mem_mask,
+                     pin_render ? "FRITCHII_ONEF=1" : "FRITCHII_PIN_GPUMEM=1", result.guest);
         }
         return result;
     }();

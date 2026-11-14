@@ -216,6 +216,34 @@ public:
     [[nodiscard]] static bool OnBackThread() {
         return on_back_thread;
     }
+    /// One follower (one_follower.h): R, the render thread, runs the back's render half (lent
+    /// calls with the back parked, unlent draws at step 4), so it is the back for every check
+    /// that asks (submits, idle-only work, the back-only paths of the caches).
+    static void MarkRenderThread() {
+        on_back_thread = true;
+    }
+    /// One follower (fable_b_one_follower.md 8.2): two positions. `consumed` is E's (what the
+    /// back ran); `played` is R's: the ring position before which R has finished every packet
+    /// too. Every front wait reads PlayedNow, "R has played P", which is today's meaning (all
+    /// work before P done); step 5 moves single wait kinds to E's position. Without one follower
+    /// PlayedNow is `consumed`, as before.
+    [[nodiscard]] u64 PlayedNow(std::memory_order order) const {
+        return two_positions ? played.load(order) : consumed.load(order);
+    }
+    /// E's own position (step 5's E-only waits; with one follower off the same as PlayedNow).
+    [[nodiscard]] u64 EngineConsumedNow() const {
+        return consumed.load(std::memory_order_acquire);
+    }
+    /// One follower: `played` grows to `position` (never shrinks), and the front is woken. E
+    /// raises it with what it ran clamped to R's oldest unplayed packet; R raises it as it plays
+    /// (OneFollower::EngineConsumed).
+    void RaisePlayed(u64 position) {
+        u64 current = played.load(std::memory_order_seq_cst);
+        while (current < position &&
+               !played.compare_exchange_weak(current, position, std::memory_order_seq_cst)) {
+        }
+        NotifyFront();
+    }
     /// Back: the ring position of the entry being run.
     [[nodiscard]] u64 BackEntryPosition() const {
         return back_entry_position;
@@ -241,7 +269,7 @@ public:
     /// Front: what the back's last check found, if it was made with everything sent executed.
     /// `epoch`: the fence work epoch the back saw (compare with FenceWorkEpoch()).
     [[nodiscard]] FenceQuiet FencesQuietNow(u64& epoch) const {
-        if (consumed.load(std::memory_order_acquire) != write_position) {
+        if (PlayedNow(std::memory_order_acquire) != write_position) {
             return FenceQuiet::Behind;
         }
         if (fence_quiet_position.load(std::memory_order_acquire) == write_position) {
@@ -1214,7 +1242,7 @@ public:
     }
     /// The back's position, for OverlayQueuedWrites: take it before reading guest memory.
     [[nodiscard]] u64 ConsumedNow() {
-        return consumed.load(std::memory_order_acquire);
+        return PlayedNow(std::memory_order_acquire);
     }
     /// Applies to `out` (the words at device address `begin`, read from guest memory after
     /// `since` = ConsumedNow()) the queued writes the front knows the words of. False when an
@@ -1264,7 +1292,7 @@ public:
     /// Whether the back executed the work sent before `position` (as far as it stored `consumed`,
     /// every few thousand words of a batch and at its end).
     [[nodiscard]] bool Ran(u64 position) const {
-        return consumed.load(std::memory_order_acquire) >= position;
+        return PlayedNow(std::memory_order_acquire) >= position;
     }
     /// Deferred work that can write memory was just sent (puller semaphore releases, maps).
     void NoteMemoryWrite() {
@@ -1710,6 +1738,10 @@ private:
         }
     }
 
+    /// The back's store of `consumed` (and the front's wake). With one follower on, clamped to
+    /// R's oldest unplayed packet (step 4; with every packet lent R is never behind here).
+    void StoreConsumed(u64 position);
+
     void BackLoop(std::stop_token stop_token);
     void BackWaitForStage(std::stop_token& stop_token, u64 read_position);
     /// Runs the entry at `entry` (of the `words` published before the ring's end), returns its size.
@@ -2107,6 +2139,10 @@ private:
     // always touched together by both threads, so they share a block.
     alignas(128) std::atomic<u64> published{};
     alignas(128) std::atomic<u64> consumed{};
+    /// One follower: R's position (RaisePlayed), on its own line (R and E both raise it).
+    alignas(128) std::atomic<u64> played{};
+    /// FRITCHII_ONEF=1 (set at MaybeStart, before the back exists): the front waits on `played`.
+    bool two_positions{};
     /// FRITCHII_MEMSTAGE_THREAD=2: the stage's read position (the back's limit) and its level run.
     alignas(128) std::atomic<u64> staged{};
     std::atomic<u64> lent_from{};

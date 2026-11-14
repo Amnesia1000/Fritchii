@@ -89,6 +89,7 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
+#include "video_core/one_follower_hooks.h"
 #ifdef _WIN32
 #include <windows.h> // already in through vulkan.h, for the disk cache reader
 #else
@@ -2762,6 +2763,7 @@ void PipelineCache::RefreshGraphicsKey() {
 }
 
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
+    VideoCommon::OneFollower::RenderOwned("PipelineCache::CurrentGraphicsPipeline");
     ++lookup_serial;
     if (const int clean_mode = PipelineCleanMode(); clean_mode != 0) {
         return CurrentGraphicsPipelineClean(clean_mode == 2);

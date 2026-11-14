@@ -35,6 +35,7 @@
 #include "video_core/query_cache/frame_trace.h"
 #include "video_core/query_cache/query_base.h"
 #include "video_core/query_cache/query_cache_base.h"
+#include "video_core/one_follower_hooks.h"
 #include "video_core/query_cache/query_stream.h"
 #include "video_core/query_cache/types.h"
 
@@ -650,6 +651,7 @@ void QueryCacheBase<Traits>::BindToChannel(s32 id) {
 template <typename Traits>
 void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type,
                                            QueryPropertiesFlags flags, u32 payload, u32 subreport) {
+    VideoCommon::OneFollower::RenderOwned("QueryCache::CounterReport");
     const bool has_timestamp = True(flags & QueryPropertiesFlags::HasTimeout);
     const bool is_fence = True(flags & QueryPropertiesFlags::IsAFence);
     const auto requested_type = counter_type;

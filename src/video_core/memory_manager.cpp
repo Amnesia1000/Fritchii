@@ -32,6 +32,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/memstage_shadow.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/one_follower.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
 #include "video_core/texture_cache/util.h"
@@ -440,6 +441,12 @@ T MemoryManager::Read(GPUVAddr addr) const {
 
 template <typename T>
 void MemoryManager::Write(GPUVAddr addr, T data) {
+    // One follower: as WriteBlockImpl's guard (the puller's semaphore words, reports).
+    if (VideoCommon::OneFollower::OnEngineThread()) [[unlikely]] {
+        if (const auto address = GpuToCpuAddress(addr)) {
+            VideoCommon::OneFollower::GuardStreamWrite(*address, sizeof(T));
+        }
+    }
     // EDEN_NX2_EXP49: a download for a guest read not yet in guest memory would land over this
     // write later. One relaxed load while none is pending.
     if (VideoCore::g_read_downloads.load(std::memory_order_relaxed) != 0) [[unlikely]] {
@@ -777,6 +784,11 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
     // EDEN_NX2_EXP49: a download for a guest read not yet in guest memory would land over this
     // write later. One relaxed load while none is pending.
     const auto finish_reads = [this](DAddr dev_addr, std::size_t amount) {
+        // One follower (section 7's guard): E's stream write onto a texture page R may still
+        // read waits for R first. FRITCHII_ONEF=0: one thread-local load.
+        if (VideoCommon::OneFollower::OnEngineThread()) [[unlikely]] {
+            VideoCommon::OneFollower::GuardStreamWrite(dev_addr, amount);
+        }
         if (VideoCore::g_read_downloads.load(std::memory_order_relaxed) != 0) [[unlikely]] {
             if (rasterizer != nullptr && VideoCore::ReadDownloadsMayCover(dev_addr, amount)) {
                 rasterizer->FinishRead(dev_addr, amount);
@@ -957,6 +969,10 @@ void MemoryManager::WriteConstantBufferData(DAddr device_addr, GPUVAddr gpu_addr
                                             const void* data, std::size_t size, bool verify) {
     if (size == 0) {
         return;
+    }
+    // One follower: as WriteBlockImpl's guard.
+    if (VideoCommon::OneFollower::OnEngineThread()) [[unlikely]] {
+        VideoCommon::OneFollower::GuardStreamWrite(device_addr, size);
     }
     // As WriteBlockImpl's unsafe write: a download for a guest read not yet in guest memory
     // would land over this write later.

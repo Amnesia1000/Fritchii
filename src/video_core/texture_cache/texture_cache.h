@@ -48,6 +48,7 @@
 #include "video_core/nx2_profile.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/nx2_report_census.h"
+#include "video_core/one_follower_hooks.h"
 #include "video_core/render_trace.h"
 #include "video_core/textures/decoders.h"
 
@@ -2038,6 +2039,7 @@ bool TextureCache<P>::RescaleRenderTargets() {
 
 template <class P>
 void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
+    VideoCommon::OneFollower::RenderOwned("TextureCache::UpdateRenderTargets");
     using namespace VideoCommon::Dirty;
     struct ClearingScope {
         bool& flag;

@@ -45,6 +45,7 @@
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2_runahead.h"
+#include "video_core/one_follower.h"
 
 namespace VideoCommon {
 
@@ -244,6 +245,15 @@ void GpuSplit::CheckOwner(const char* where) {
     if (!instance.back_running.load(std::memory_order_acquire)) {
         return;
     }
+    // One follower: the scheduler is R's. R passes; E passes only with R parked or drained
+    // (OneFollower's "owner on E", must be 0); any other thread is reported below as before.
+    if (OneFollower::OnRenderThread()) {
+        return;
+    }
+    if (OneFollower::OnEngineThread()) {
+        OneFollower::CheckRenderOwned(where);
+        return;
+    }
     const DWORD thread = GetCurrentThreadId();
     if (thread == g_back_thread_id.load(std::memory_order_relaxed)) {
         return;
@@ -282,7 +292,7 @@ u32 GpuSplit::DelayBeforeWait(DelayTest test) {
         return 0;
     }
     // Only drains that wait (the site line counts those): the back has not run everything sent.
-    if (consumed.load(std::memory_order_acquire) == write_position) {
+    if (PlayedNow(std::memory_order_acquire) == write_position) {
         return 0;
     }
     if (Debug::SwitchValue(Debug::g_delay_before, "FRITCHII_DELAY_BEFORE") > 0) {
@@ -404,12 +414,19 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     (void)switches_read;
     // FRITCHII_MEMSTAGE_SHADOW (memstage_shadow.cpp): before the back thread exists.
     MemStageShadow::ReadSwitch();
+    // FRITCHII_ONEF (boot): the render thread R starts before the back, so E's first lend has it.
+    OneFollower::ReadSwitches();
+    // Its owner asserts ride on the scheduler's owner check: always on with it.
+    check_owner = check_owner || OneFollower::On();
+    // 8.2: the front's waits read R's position (`played`), E keeps `consumed`.
+    two_positions = OneFollower::On();
     ring = std::make_unique<u64[]>(RingWords);
     ++session;
     // EDEN_NX2_RUNAHEAD: Ocarina of Time only.
     Runahead::Reset();
     Runahead::SetProgramId(system_.GetApplicationProcessProgramID());
     MemoryStageLink::Get().Start(system_);
+    OneFollower::Start(system_);
     back_thread = std::jthread([this](std::stop_token stop_token) { BackLoop(stop_token); });
     active = true;
     const char* jit = std::getenv("EDEN_NX2_MME_JIT");
@@ -426,6 +443,8 @@ void GpuSplit::Stop() {
     wake.fetch_add(1, std::memory_order_seq_cst);
     wake.notify_one();
     back_thread.join();
+    // After the back: every lent packet it pushed has been played.
+    OneFollower::Stop();
     MemoryStageLink::Get().Stop();
     active = false;
     // The split is static and outlives the emulation session. The next session's back thread
@@ -502,6 +521,7 @@ void GpuSplit::Stop() {
     front_macros = false;
     published.store(0, std::memory_order_relaxed);
     consumed.store(0, std::memory_order_relaxed);
+    played.store(0, std::memory_order_relaxed);
     staged.store(0, std::memory_order_relaxed);
     lent_from.store(0, std::memory_order_relaxed);
     lent_until.store(0, std::memory_order_relaxed);
@@ -533,7 +553,7 @@ void GpuSplit::WaitForSpace(size_t words) {
     Publish();
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
     for (u32 spins = 0;; ++spins) {
-        consumed_cache = consumed.load(std::memory_order_acquire);
+        consumed_cache = PlayedNow(std::memory_order_acquire);
         if (write_position + words - consumed_cache <= RingWords) {
             return;
         }
@@ -619,7 +639,7 @@ void GpuSplit::ReportBatched() {
 
 void GpuSplit::Drain(DrainSite site) {
     RunPendingFlush(); // Everything sent so far includes the held-back work
-    consumed_cache = consumed.load(std::memory_order_acquire);
+    consumed_cache = PlayedNow(std::memory_order_acquire);
     if (consumed_cache == write_position) {
         return;
     }
@@ -635,7 +655,7 @@ void GpuSplit::Drain(DrainSite site) {
     const u64 begin_ns = Common::Nx2Hitch::NowNs();
     const u64 behind = write_position - consumed_cache;
     for (u32 spins = 0;; ++spins) {
-        consumed_cache = consumed.load(std::memory_order_acquire);
+        consumed_cache = PlayedNow(std::memory_order_acquire);
         if (consumed_cache == write_position) {
             publish_every = 8;
             if (start != 0) [[unlikely]] {
@@ -660,7 +680,7 @@ bool GpuSplit::WaitForMemoryWriters() {
 }
 
 bool GpuSplit::WaitForWritesTo(u64 begin, u64 size) {
-    consumed_cache = consumed.load(std::memory_order_acquire);
+    consumed_cache = PlayedNow(std::memory_order_acquire);
     const u64 end = begin + size;
     const u64 remembered = (std::min<u64>)(pending_write_count, pending_writes.size());
     u64 target = 0;
@@ -685,7 +705,7 @@ bool GpuSplit::WaitForWritesTo(u64 begin, u64 size) {
 }
 
 bool GpuSplit::HasQueuedWritesTo(u64 begin, u64 size) {
-    consumed_cache = consumed.load(std::memory_order_acquire);
+    consumed_cache = PlayedNow(std::memory_order_acquire);
     const u64 end = begin + size;
     const u64 remembered = (std::min<u64>)(pending_write_count, pending_writes.size());
     for (u64 scanned = 0; scanned < remembered; ++scanned) {
@@ -848,7 +868,7 @@ void GpuSplit::StampRangedDevice(const Tegra::MemoryManager& memory, GPUVAddr be
     // translate it differently, and sparse pages are written through their own backing. Then
     // the write counts for every address until the back ran it.
     if (last_function_position > consumed_cache) {
-        consumed_cache = consumed.load(std::memory_order_acquire);
+        consumed_cache = PlayedNow(std::memory_order_acquire);
     }
     const bool sparse = begin < Tegra::g_nx2_sparse_high.load(std::memory_order_relaxed) &&
                         Tegra::g_nx2_sparse_low.load(std::memory_order_relaxed) < end;
@@ -880,7 +900,7 @@ void GpuSplit::StampRangedDevice(const Tegra::MemoryManager& memory, GPUVAddr be
 
 bool GpuSplit::ForwardRead(size_t space, GPUVAddr begin, u32 words, u32* out) {
     const GPUVAddr end = begin + GPUVAddr{words} * sizeof(u32);
-    const u64 done = consumed.load(std::memory_order_acquire);
+    const u64 done = PlayedNow(std::memory_order_acquire);
     u32 method{};
     const u64 target = MemoryWriterTarget(done, begin, end, method);
     if (target <= done) {
@@ -1301,13 +1321,13 @@ void GpuSplit::ReportQmdFloor() {
 }
 
 bool GpuSplit::HasQueuedMemoryWriters(GPUVAddr begin, GPUVAddr end) {
-    const u64 done = consumed.load(std::memory_order_acquire);
+    const u64 done = PlayedNow(std::memory_order_acquire);
     u32 method{};
     return MemoryWriterTarget(done, begin, end, method) > done;
 }
 
 u32 GpuSplit::QueuedWriterKind(GPUVAddr begin, GPUVAddr end, u32& method) {
-    const u64 done = consumed.load(std::memory_order_acquire);
+    const u64 done = PlayedNow(std::memory_order_acquire);
     const u64 target = MemoryWriterTarget(done, begin, end, method);
     if (target <= done) {
         return 0;
@@ -1332,7 +1352,7 @@ void GpuSplit::NoteRelease(u64 device, GPUVAddr address, u32 payload, ReleaseKin
 
 std::optional<u32> GpuSplit::QueuedReleasePayload(u64 device, GPUVAddr address, u32* miss) {
     const QueuedRelease& release = queued_releases[(device >> 2) % queued_releases.size()];
-    const u64 done = consumed.load(std::memory_order_acquire);
+    const u64 done = PlayedNow(std::memory_order_acquire);
     if (release.device != device || release.position == 0) {
         if (miss) *miss = 1;
         return std::nullopt;
@@ -1352,7 +1372,7 @@ std::optional<u32> GpuSplit::QueuedReleasePayload(u64 device, GPUVAddr address, 
 }
 
 bool GpuSplit::WaitForMemoryWriters(DrainSite site, GPUVAddr begin, GPUVAddr end) {
-    const u64 done = consumed.load(std::memory_order_acquire);
+    const u64 done = PlayedNow(std::memory_order_acquire);
     u32 target_method{};
     const u64 target = MemoryWriterTarget(done, begin, end, target_method);
     const u64 unranged =
@@ -1397,7 +1417,7 @@ bool GpuSplit::WaitForMemoryWriters(DrainSite site, GPUVAddr begin, GPUVAddr end
 }
 
 bool GpuSplit::WaitFor(u64 target, DrainSite site) {
-    consumed_cache = consumed.load(std::memory_order_acquire);
+    consumed_cache = PlayedNow(std::memory_order_acquire);
     if (consumed_cache >= target) {
         return false;
     }
@@ -1411,7 +1431,7 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
     const u64 begin_ns = Common::Nx2Hitch::NowNs();
     const u64 behind = target - consumed_cache;
     for (u32 spins = 0;; ++spins) {
-        consumed_cache = consumed.load(std::memory_order_acquire);
+        consumed_cache = PlayedNow(std::memory_order_acquire);
         if (consumed_cache >= target) {
             wait_target.store(~u64{0}, std::memory_order_relaxed);
             if (start != 0) [[unlikely]] {
@@ -1439,7 +1459,7 @@ void GpuSplit::Backoff(u32 spins, u64 target) {
     // back checks front_waiting after each store, the front checks the position after setting it.
     front_waiting.store(true, std::memory_order_seq_cst);
     const u32 seen = front_wake.load(std::memory_order_seq_cst);
-    if (consumed.load(std::memory_order_seq_cst) < target) {
+    if (PlayedNow(std::memory_order_seq_cst) < target) {
         front_wake.wait(seen, std::memory_order_seq_cst);
     }
     front_waiting.store(false, std::memory_order_relaxed);
@@ -1581,7 +1601,7 @@ GpuSplit::ReleaseNote GpuSplit::TryNoteWriterRange(const Tegra::MemoryManager& m
     // As NoteWrite: a queued function may still remap the range, sparse pages are written through
     // their own backing. One device range only, as the reads compare device addresses.
     if (last_function_position > consumed_cache) {
-        consumed_cache = consumed.load(std::memory_order_acquire);
+        consumed_cache = PlayedNow(std::memory_order_acquire);
     }
     if (writer_range_count > writer_range_sealed && &memory == writer_range_memory &&
         address == writer_range_address && size == writer_range_size &&
@@ -1951,7 +1971,7 @@ GpuSplit::DispatchCheck GpuSplit::DispatchesMayWriteSince(u64 since, u64 begin, 
         return DispatchCheck::Unbounded;
     }
     if (consumed_cache < last_dispatch_position) {
-        consumed_cache = consumed.load(std::memory_order_acquire);
+        consumed_cache = PlayedNow(std::memory_order_acquire);
     }
     if (consumed_cache < last_dispatch_position) {
         if (!wait) {
@@ -2072,7 +2092,7 @@ void GpuSplit::FinishDispatch(bool ran, bool replaced) {
 
 u64 GpuSplit::SettleWrites() {
     WaitFor((std::min)(last_function_position, write_position), DrainSite::Map);
-    consumed_cache = consumed.load(std::memory_order_acquire);
+    consumed_cache = PlayedNow(std::memory_order_acquire);
     writes.Retire(consumed_cache);
     return consumed_cache;
 }
@@ -2522,10 +2542,23 @@ void GpuSplit::BackWaitForStage(std::stop_token& stop_token, u64 read_position) 
     link.NoteBackWait(Common::Nx2Hitch::NowNs() - begin_ns);
 }
 
+void GpuSplit::StoreConsumed(u64 position) {
+    consumed.store(position, std::memory_order_seq_cst);
+    if (OneFollower::OnEngineThread()) [[unlikely]] {
+        // `played`: this position clamped to R's oldest unplayed packet (RaisePlayed wakes the
+        // front). Below step 4 R is never behind here, so it is this position.
+        OneFollower::EngineConsumed(position);
+        return;
+    }
+    NotifyFront();
+}
+
 void GpuSplit::BackLoop(std::stop_token stop_token) {
     const Common::DkbCpuTrace::Registration cpu_trace{Common::DkbCpuTrace::Role::GpuBack};
     Common::SetCurrentThreadName("GPUBack");
     on_back_thread = true;
+    // FRITCHII_ONEF=1: this thread is E; the renderer's calls from it are lent to R.
+    OneFollower::MarkEngineThread();
     back_running.store(true, std::memory_order_release);
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
     Common::PinCurrentThread(Common::PinnedRole::GpuBack);
@@ -2819,9 +2852,8 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 if (entry_price) [[unlikely]] {
                     FritchiiPrice::BackReached(read_position);
                 }
-                consumed.store(read_position, std::memory_order_seq_cst);
+                StoreConsumed(read_position);
                 last_store = read_position;
-                NotifyFront();
                 if (ring_on) {
                     link.NoteConsumed(read_position);
                 }
@@ -2834,8 +2866,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         if (entry_price) [[unlikely]] {
             FritchiiPrice::BackReached(read_position);
         }
-        consumed.store(read_position, std::memory_order_seq_cst);
-        NotifyFront();
+        StoreConsumed(read_position);
         if (ring_on) {
             link.NoteConsumed(read_position);
         }
