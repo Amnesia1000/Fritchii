@@ -142,6 +142,8 @@ inline std::atomic<int> g_memstage_fast_loop{-1};
 inline std::atomic<int> g_memstage_gather{-1};
 /// FRITCHII_MEMSTAGE_RELEASE: docs/fritchii/switches.md.
 inline std::atomic<int> g_memstage_release{-1};
+/// FRITCHII_MEMSTAGE_PASS: docs/fritchii/switches.md.
+inline std::atomic<int> g_memstage_pass{-1};
 /// FRITCHII_DELAY_MACRO_DRAIN_US: docs/fritchii/switches.md.
 inline std::atomic<int> g_delay_macro_drain_us{-1};
 /// FRITCHII_DELAY_POLL_DRAIN_US: docs/fritchii/switches.md.
@@ -154,6 +156,10 @@ inline std::atomic<int> g_delay_e2c_us{-1};
 inline std::atomic<int> g_delay_dispatch_us{-1};
 /// FRITCHII_DELAY_DRAW_US: docs/fritchii/switches.md.
 inline std::atomic<int> g_delay_draw_us{-1};
+/// FRITCHII_DELAY_RUN_US: docs/fritchii/switches.md.
+inline std::atomic<int> g_delay_run_us{-1};
+/// FRITCHII_DELAY_RUN_KIND: docs/fritchii/switches.md.
+inline std::atomic<int> g_delay_run_kind{-1};
 /// FRITCHII_FRONT_RAN_READS: docs/fritchii/switches.md.
 inline std::atomic<int> g_front_ran_reads{-1};
 /// FRITCHII_ACQUIRE_TABLE_FIRST: docs/fritchii/switches.md.

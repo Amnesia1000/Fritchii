@@ -1932,6 +1932,27 @@ void BufferCache<P>::FlushCachedWrites() {
 }
 
 template <class P>
+typename BufferCache<P>::SyncProbe BufferCache<P>::ProbeSyncTarget(DAddr begin, u64 bytes) {
+    // FindBuffer's hit (else CreateBuffer), then SynchronizeBuffer's test (ForEachUploadRange
+    // clears CPU-modified bits even where it uploads nothing).
+    const u64 page = begin >> CACHING_PAGEBITS;
+    if (begin == 0 || page >= page_table.size()) {
+        return SyncProbe::NoBuffer;
+    }
+    const BufferId buffer_id = page_table[page];
+    if (!buffer_id) {
+        return SyncProbe::NoBuffer;
+    }
+    if (!slot_buffers[buffer_id].IsInBounds(begin, bytes)) {
+        return SyncProbe::NotInBounds;
+    }
+    if (memory_tracker.IsRegionCpuModified(begin, bytes)) {
+        return SyncProbe::CpuModified;
+    }
+    return SyncProbe::Pure;
+}
+
+template <class P>
 bool BufferCache<P>::HasUncommittedFlushes() const noexcept {
     return !uncommitted_gpu_modified_ranges.Empty() || !committed_gpu_modified_ranges.empty();
 }
