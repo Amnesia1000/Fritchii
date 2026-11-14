@@ -680,7 +680,7 @@ The census says, for each change the check finds, what touched the page since it
 
 ### FRITCHII_BANK_FLAGGED
 
-FRITCHII_BANK_FLAGGED (live, default 0; fable_perdraw_b cut 5 step 2). The game's banks keep
+FRITCHII_BANK_FLAGGED (live, default 1 since 2026-11-14 via the built-in switches in src/yuzu/main.cpp; fable_perdraw_b cut 5 step 2). The game's banks keep
 the hot rule (every page that changed in the last 120 frames compared at every bind: ~600,000
 compares per 5 s for c6, 21.7 ms/s on the back) because writers set no flag. The census named
 them; these marks set the bank check's flags, each after its bytes landed, while the bank marks'
