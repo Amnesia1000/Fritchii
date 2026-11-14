@@ -1135,9 +1135,25 @@ public:
     /// Diagnostics: the newest queued work that may write [begin, end): 0 none, 1 compute or
     /// copy, 2 work before a host sync, 3 an unranged memory write (`method`), 4 a ranged write.
     u32 QueuedWriterKind(GPUVAddr begin, GPUVAddr end, u32& method);
+    /// What sent a release NoteRelease records (the "Acquire resumes met by" counter).
+    enum class ReleaseKind : u8 {
+        Other,
+        Puller,         ///< A puller semaphore release (WriteLong, SEM_EXECUTE)
+        Payload3DShort, ///< A 3D payload release of 4 bytes (short query)
+        Payload3DLong,  ///< A 3D payload report of 16 bytes (with the timestamp)
+        ComputeReport,  ///< A compute 0x6c3 payload release
+    };
     /// A semaphore release that writes `payload` at device address `device` (from GPU address
     /// `address`) was just sent (a puller release, a 3D payload report).
-    void NoteRelease(u64 device, GPUVAddr address, u32 payload);
+    void NoteRelease(u64 device, GPUVAddr address, u32 payload,
+                     ReleaseKind kind = ReleaseKind::Other);
+    /// The kind of the release recorded for the u32 at `device` (NoteRelease), whether or not the
+    /// back ran it; Other when none is recorded there.
+    [[nodiscard]] ReleaseKind RecordedReleaseKind(u64 device) const {
+        const QueuedRelease& release = queued_releases[(device >> 2) % queued_releases.size()];
+        return release.device == device && release.position != 0 ? release.kind
+                                                                   : ReleaseKind::Other;
+    }
     /// EXP13=2 (diagnostic): the newest work sent after `done` that may write guest memory over
     /// device bytes [device, device + size) (GPU addresses from `address`) when the back runs
     /// it, leaving out native compute launches and inline QMDs (the front's QMD scheduler copy
@@ -1709,6 +1725,7 @@ private:
         u64 position;
         u64 device;
         u32 payload;
+        ReleaseKind kind;
     };
     std::array<QueuedRelease, 64> queued_releases{};
     /// Drops consumed ranged writes; returns the position a memory read of [begin, end) waits

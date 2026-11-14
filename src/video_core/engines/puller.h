@@ -95,6 +95,10 @@ public:
         /// EXP12=5/6: the ring position its next lagged check waits for (the position sent at
         /// the previous check; at the suspension for the first).
         u64 lagged_target{};
+        /// EXP13 on: the QMD copy's count of the back's releases at the suspension, so the
+        /// resume can ask which release the back made for the word since ("Acquire resumes met
+        /// by"); ~0 when not taken.
+        u64 back_sequence{~u64{0}};
 
         [[nodiscard]] bool Matches(u32 current) const;
     };

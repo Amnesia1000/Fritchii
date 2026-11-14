@@ -1193,7 +1193,7 @@ u32 GpuSplit::QueuedWriterKind(GPUVAddr begin, GPUVAddr end, u32& method) {
                                                   : 4;
 }
 
-void GpuSplit::NoteRelease(u64 device, GPUVAddr address, u32 payload) {
+void GpuSplit::NoteRelease(u64 device, GPUVAddr address, u32 payload, ReleaseKind kind) {
     static const bool enabled = [] {
         const char* const value = std::getenv("EDEN_NX2_ACQUIRE_QUEUED");
         return value == nullptr || value[0] != '0';
@@ -1201,7 +1201,8 @@ void GpuSplit::NoteRelease(u64 device, GPUVAddr address, u32 payload) {
     if (!enabled) {
         return;
     }
-    queued_releases[(device >> 2) % queued_releases.size()] = {write_position, device, payload};
+    queued_releases[(device >> 2) % queued_releases.size()] = {write_position, device, payload,
+                                                               kind};
 }
 
 std::optional<u32> GpuSplit::QueuedReleasePayload(u64 device, GPUVAddr address, u32* miss) {

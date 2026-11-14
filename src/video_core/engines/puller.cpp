@@ -985,6 +985,166 @@ void QmdPredictionMetBy(DmaPusher& dma_pusher, const QmdPredictionCheck& check,
     }
 }
 
+// "Acquire resumes met by" (fable_front_drains 2.3 items 2-3; always on, one look per resume):
+// for every suspended acquire that resumes, the release that met it as the front's tables tell,
+// by kind, and whether its value was known to the front when it sent it; split into resumes by
+// the back's latch and by the other routes (word read, front answer, poll drain, lagged check).
+// Logged every 5 s. Front thread only.
+// Which release: with EXP13 on, the newest the back made for the word since the suspension (the
+// QMD copy's table, as QmdPredictionMetBy asks), if it meets the acquire (or is a reduction);
+// else the release recorded for the word (GpuSplit::NoteRelease) if its payload meets it; else
+// the newest write noted over the word in the last 2^18 ring words; else none the front saw
+// (the guest CPU, or a writer the front does not note). Known at send: the payload releases the
+// front records (puller, 3D, compute 0x6c3) and the noted writes with known words; QMD and copy
+// releases when the QMD copy predicts them (EXP13 2-4, reductions never).
+class AcquireMetByStats {
+public:
+    enum class Kind : u8 {
+        PullerRelease,
+        Payload3DShort,
+        Payload3DLong,
+        ComputeReport,
+        QmdRelease,
+        QmdReduction,
+        CopyRelease,
+        CounterReport,
+        OtherNoted,
+        Unseen,
+        Count,
+    };
+
+    static AcquireMetByStats& Get() {
+        static AcquireMetByStats stats;
+        return stats;
+    }
+
+    void Note(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire) {
+        const bool latch = acquire.resume_route == static_cast<u8>(FenceResumeRoute::Latch);
+        bool known = false;
+        const Kind kind = Classify(dma_pusher, acquire, known);
+        ++counts[latch ? 0 : 1][static_cast<size_t>(kind)][known ? 1 : 0];
+        Tick();
+    }
+
+private:
+    static Kind FromRelease(VideoCommon::GpuSplit::ReleaseKind kind) {
+        using Release = VideoCommon::GpuSplit::ReleaseKind;
+        switch (kind) {
+        case Release::Puller:
+            return Kind::PullerRelease;
+        case Release::Payload3DShort:
+            return Kind::Payload3DShort;
+        case Release::Payload3DLong:
+            return Kind::Payload3DLong;
+        case Release::ComputeReport:
+            return Kind::ComputeReport;
+        default:
+            return Kind::OtherNoted;
+        }
+    }
+
+    static Kind Classify(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire,
+                         bool& known) {
+        namespace Prediction = VideoCommon::QmdPrediction;
+        auto& split = VideoCommon::GpuSplit::Get();
+        const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address);
+        if (!device || !split.Active()) {
+            return Kind::Unseen;
+        }
+        if (Prediction::Enabled() && acquire.back_sequence != ~u64{0}) {
+            if (const auto release = Prediction::BackReleaseSince(*device, acquire.back_sequence);
+                release && (release->reduction || acquire.Matches(release->payload))) {
+                switch (release->writer) {
+                case Prediction::Writer::Qmd:
+                    known = !release->reduction && Prediction::MirrorMode();
+                    return release->reduction ? Kind::QmdReduction : Kind::QmdRelease;
+                case Prediction::Writer::Dma:
+                    known = Prediction::MirrorMode();
+                    return Kind::CopyRelease;
+                default:
+                    // Puller and report releases: the front had the payload when it sent them.
+                    known = true;
+                    if (release->writer == Prediction::Writer::Puller) {
+                        return Kind::PullerRelease;
+                    }
+                    return FromRelease(split.RecordedReleaseKind(*device));
+                }
+            }
+        }
+        if (u64 position = 0; const auto payload = split.NewestReleaseTo(*device, position)) {
+            if (acquire.Matches(*payload)) {
+                known = true;
+                return FromRelease(split.RecordedReleaseKind(*device));
+            }
+        }
+        constexpr u64 NotedWindow = u64{1} << 18;
+        const u64 sent = split.SentPosition();
+        const auto noted = split.NewestNotedWriteTo(sent > NotedWindow ? sent - NotedWindow : 0,
+                                                    *device);
+        if (noted.position == 0) {
+            return Kind::Unseen;
+        }
+        known = noted.words != 0;
+        if (noted.what == VideoCommon::NotedCounterReport) {
+            return Kind::CounterReport;
+        }
+        if (noted.what == VideoCommon::NotedPayloadReport) {
+            known = true; // The payload was in the front's registers
+            return Kind::Payload3DLong;
+        }
+        if (noted.what == VideoCommon::NotedPayloadRelease) {
+            return Kind::Payload3DShort;
+        }
+        return Kind::OtherNoted;
+    }
+
+    void Tick() {
+        const auto now = std::chrono::steady_clock::now();
+        if (since == std::chrono::steady_clock::time_point{}) {
+            since = now;
+            return;
+        }
+        const double window = std::chrono::duration<double>(now - since).count();
+        if (window < 5.0) {
+            return;
+        }
+        constexpr std::array<const char*, static_cast<size_t>(Kind::Count)> names{
+            "puller release",       "3D payload release (4 bytes)", "3D payload report (16 bytes)",
+            "compute 0x6c3 release", "QMD release",                  "QMD reduction",
+            "copy semaphore",       "counter or sample report",     "other noted write",
+            "not seen by the front"};
+        const auto group = [&](size_t g) {
+            std::string text;
+            for (size_t k = 0; k < names.size(); ++k) {
+                const auto& n = counts[g][k];
+                if (n[0] + n[1] != 0) {
+                    text += fmt::format("{} {} {:.0f}/{:.0f}", text.empty() ? "" : ",", names[k],
+                                        static_cast<double>(n[1]) / window,
+                                        static_cast<double>(n[0]) / window);
+                }
+            }
+            return text.empty() ? std::string{" none"} : text;
+        };
+        LOG_INFO(HW_GPU,
+                 "Acquire resumes met by (suspended acquires; the release that met each, /s with "
+                 "its value known at send/unknown): by the latch:{}; by the other routes:{}",
+                 group(0), group(1));
+        counts = {};
+        since = now;
+    }
+
+    /// [0 latch, 1 other routes][Kind][known at send]
+    std::array<std::array<std::array<u64, 2>, static_cast<size_t>(Kind::Count)>, 2> counts{};
+    std::chrono::steady_clock::time_point since{};
+};
+
+// At a suspension: the QMD copy's back release count, for AcquireMetByStats at the resume.
+void NoteBackSequence(Puller::PendingAcquire& acquire) {
+    if (VideoCommon::QmdPrediction::Enabled()) {
+        acquire.back_sequence = VideoCommon::QmdPrediction::BackSequence();
+    }
+}
+
 // EXP12=4: the QMD prediction's "met by" of an acquire the fence path suspended without waiting
 // for the writers is noted at its resume (Puller::ResumeAcquire) instead of at once, where
 // nearly all would count as unmet (the writers had not run). The reduction bound is checked
@@ -1607,6 +1767,7 @@ bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
     // counting those made the count odd ("suspended") at random, so submit-time snapshots were
     // thrown away for about half of all entries (CommandList::snapshot_suspensions).
     if (pending_acquire) {
+        AcquireMetByStats::Get().Note(dma_pusher, *pending_acquire);
         if (pending_acquire->readable_release) {
             auto& stats = FenceWriterStats::Get();
             const u64 ns = FenceWriterStats::Nanoseconds(pending_acquire->since,
@@ -1759,7 +1920,8 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         }, VideoCommon::StageCacheCallBits(VideoCommon::StageCacheCall::SemaphoreRelease));
         if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
             if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(sequence_address)) {
-                split.NoteRelease(*device, sequence_address, payload);
+                split.NoteRelease(*device, sequence_address, payload,
+                                  VideoCommon::GpuSplit::ReleaseKind::Puller);
             }
         }
         RecordPullerRelease(dma_pusher, sequence_address, payload);
@@ -1872,6 +2034,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                     pending_acquire->last_drain = std::chrono::steady_clock::now();
                 }
                 pending_acquire->lagged_target = VideoCommon::GpuSplit::Get().SentPosition();
+                NoteBackSequence(*pending_acquire);
                 dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
                 VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
                 return;
@@ -1938,6 +2101,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             pending_acquire->readable_release = readable;
             // EXP12=5/6: the first lagged check waits for the acquire's own fence release.
             pending_acquire->lagged_target = VideoCommon::GpuSplit::Get().SentPosition();
+            NoteBackSequence(*pending_acquire);
             dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
             VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
             record(AcquireTrace::Suspended);
@@ -2026,7 +2190,8 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
         // An acquire it meets while queued needs no drain (ported).
         if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
             if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address)) {
-                split.NoteRelease(*device, address, payload);
+                split.NoteRelease(*device, address, payload,
+                                  VideoCommon::GpuSplit::ReleaseKind::Puller);
             }
         }
         RecordPullerRelease(dma_pusher, address, payload);

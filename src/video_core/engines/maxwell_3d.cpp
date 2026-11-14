@@ -2449,7 +2449,10 @@ void Maxwell3D::FrontNoteRelease(VideoCommon::GpuSplit& split, const FrontState&
         fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_low)];
     if (const auto device = memory_manager.GpuToCpuAddress(address)) {
         const u32 payload = fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.payload)];
-        split.NoteRelease(*device, address, payload);
+        split.NoteRelease(*device, address, payload,
+                          report.query.short_query != 0
+                              ? VideoCommon::GpuSplit::ReleaseKind::Payload3DShort
+                              : VideoCommon::GpuSplit::ReleaseKind::Payload3DLong);
         if (VideoCommon::QmdPrediction::MirrorMode()) {
             // EXP13=2: recorded so the reduction bound sees it queued or run but not landed.
             namespace Prediction = VideoCommon::QmdPrediction;

@@ -92,6 +92,30 @@ answer's same-frame sample counters). Per second:
   (bookkeeping on the front); counter or sample reports the back had not run, or a listed report
   on the bytes, are answer B (the value does not exist yet at the front).
 
+### Acquire resumes met by (always on, a counter)
+
+"Acquire resumes met by" (HW_GPU, Info, every 5 s; fable_front_drains 2.3 items 2-3): for every
+suspended semaphore acquire that resumes (Puller::ResumeAcquire), the release that met it, as the
+front's tables tell, by kind, each as "known/unknown" a second: whether the front knew the value
+when it sent it. Two groups: resumed by the back's latch (it ran a release that met the value),
+and by the other routes (word read, front answer, poll drain, lagged check).
+- Which release, in order: with EXP13 on, the newest release the back made for the word since
+  the suspension (the QMD copy's table, as its own "met by" asks), when it meets the acquire or is
+  a reduction; else the release recorded for the word (GpuSplit::NoteRelease: puller releases,
+  3D payload releases and reports, compute 0x6c3 releases) when its payload meets it; else the
+  newest write noted over the word in the last 2^18 ring words; else "not seen by the front" (the
+  guest CPU, or a writer the front does not note). It looks, it does not prove: a table slot
+  shared with another word, or an older release with the same payload, can name the wrong one.
+- Kinds: puller release, 3D payload release (4 bytes), 3D payload report (16 bytes), compute
+  0x6c3 release, QMD release, QMD reduction, copy semaphore, counter or sample report, other
+  noted write, not seen by the front.
+- Known at send: payload releases the front records (it had the payload in its registers), QMD
+  and copy releases while the QMD copy predicts them (EXP13 2-4; reductions never: bounds only),
+  noted writes with known words. Counter and sample reports never.
+- Reading it: latch resumes by releases known at send are what resolving acquires at the front
+  (resume when the newest queued release over the word has a known value that meets it) would
+  take off the front's blocked time.
+
 ### EDEN_NX2_ACCURATE_PARTS
 
 EDEN_NX2_ACCURATE_PARTS (bit mask, 0 = none, read once at boot): parts of GPU accuracy High in
