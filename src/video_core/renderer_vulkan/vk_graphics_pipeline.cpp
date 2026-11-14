@@ -50,6 +50,7 @@
 #include "shader_recompiler/exception.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/one_follower.h"
+#include "video_core/renderer_vulkan/vk_one_follower_draw.h"
 
 #if defined(__clang__) && defined(NDEBUG)
 #define LAMBDA_FORCEINLINE __attribute__((always_inline))
@@ -2697,6 +2698,8 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         // One follower step 4: an unlent draw R built wrong. Counted (must be 0), not drawn,
         // and step 4 stops for the session (every later draw lent) before more go wrong.
         if (VideoCommon::OneFollower::PlayingUnlentDraw()) [[unlikely]] {
+            OneFollowerDraw::ReportDescriptorMismatch(*this, num_descriptor_entries,
+                                                      guest_descriptor_queue.UpdateCount());
             VideoCommon::OneFollower::Note(VideoCommon::OneFollower::Check::BuildDescriptors,
                                            "unlent draw: descriptor count against its pipeline");
             VideoCommon::OneFollower::DisableUnlend(
