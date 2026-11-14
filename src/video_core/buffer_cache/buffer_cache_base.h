@@ -736,6 +736,13 @@ public:
         /// frame_tick when the page was last seen changed: such pages are compared on every bind.
         u64 changed_frame = ~u64{0};
         bool recheck = false;
+        /// FRITCHII_BANK_CENSUS (counters only, set while it is on): the write ring's sequence
+        /// before the page's last compare (2), the census bind number when the page's last
+        /// collected or buffer cache write flag was taken (0: none yet), and that compare's reason.
+        u8 census_flag = 0; ///< 1 collected CPU write, 2 buffer cache write
+        u8 census_last_reason = 0;
+        u64 census_ring_seq = 0;
+        u64 census_flag_bind = 0;
     };
     /// Node map: NoteNativeBankPageChanged keeps pointers to earlier pages' words until the bind's
     /// uploads are flushed, so entries must not move (std::unordered_map's lookups were ~2% of the
@@ -830,6 +837,45 @@ public:
     };
     std::array<NativeBankSlotStats, Tegra::Engines::Maxwell3D::Regs::MaxConstBuffers>
         native_bank_slot_stats{};
+    /// FRITCHII_BANK_CENSUS: for each change the tracked check finds, what touched the page
+    /// since its last compare, logged and cleared every 10 s (LogNativeBankCensus).
+    struct NativeBankCensusStats {
+        std::array<u64, BankReasons> changed{}; ///< changes by reason (all of them)
+        u64 skip_missed = 0;  ///< EDEN_NX2_BANK_SKIP_VERIFY's "missed"
+        u64 unflagged = 0;    ///< hot, frame check, verify only and skip-verify changes
+        /// Unflagged changes by census binds since the page's last flag take: <= 4, <= 32,
+        /// <= 256, more, never.
+        std::array<u64, 5> flag_distance{};
+        u64 flag_late = 0;         ///< unflagged, a flag taken <= 32 binds before
+        u64 flag_late_buffer = 0;  ///< of those, the flag was a buffer cache write's
+        u64 uploaded = 0;          ///< unflagged, an upload covered the page since its last compare
+        u64 uploaded_after_dirty = 0; ///< of those, the last compare was for a CPU-modified page
+        u64 gpu_written = 0;       ///< unflagged, the page ever had a GPU write mark
+        u64 ring_found = 0;        ///< unflagged, a write ring entry since the last compare (2)
+        u64 ring_wrapped = 0;      ///< unflagged, none found but the ring wrapped since (2)
+        u64 unseen = 0;            ///< unflagged with none of the above
+        u64 unseen_first = 0;      ///< of those, the page's first compare this frame
+        std::array<u64, Tegra::Engines::Maxwell3D::Regs::MaxConstBuffers> slots{}; ///< unflagged
+        /// The newest write ring entry over the page since its last compare, by site and write
+        /// function (2).
+        struct Writer {
+            const char* site = nullptr;
+            const char* via = nullptr;
+            u64 count = 0;
+        };
+        std::array<Writer, 12> writers{};
+        u64 writers_other = 0;
+        std::chrono::steady_clock::time_point last_log{};
+    } native_bank_census;
+    /// FRITCHII_BANK_CENSUS: bank binds counted while it is on (never cleared: page distances).
+    u64 native_bank_census_bind = 0;
+    /// FRITCHII_BANK_CENSUS: pages an upload (UploadMemory) copied to a host buffer, taken by the
+    /// page's next compare. Made at the census' first bind; read by UploadMemory without the lock.
+    std::unique_ptr<Core::DevicePageFlags> native_bank_census_upload_owner;
+    std::atomic<Core::DevicePageFlags*> native_bank_census_uploads{nullptr};
+    /// FRITCHII_BANK_CENSUS=2 asked for the write ring, and whether it turned it on.
+    bool native_bank_census_ring_wanted = false;
+    bool native_bank_census_ring_owner = false;
     /// EDEN_NX2_EXP26 & 4: changed bank pages of one bind, copied to the host buffer from their
     /// snapshots (FlushNativeBankUploads) instead of being marked CPU-modified. A 64 KiB bank
     /// spans at most 17 pages.
@@ -919,6 +965,16 @@ private:
     [[nodiscard]] bool NativeBankPagesSettled(DAddr first_page, DAddr end);
     /// The tracked check's 5 s report (every 1024 binds it looks at the clock).
     void LogNativeBankTrackedStats(int mode);
+    /// FRITCHII_BANK_CENSUS: one change the tracked check found on `page` (after the compare,
+    /// before the snapshot is taken again). `unflagged`: found by no write flag (hot, frame
+    /// check, verify only, skip verify); `uploaded`: the census' upload flag the compare took;
+    /// `ring_since`: the page's write ring sequence before this compare; `first_this_frame`:
+    /// the page's first compare this frame.
+    void NoteNativeBankCensusChange(DAddr page, const NativeBankPage& snapshot, int census,
+                                    NativeBankReason reason, bool unflagged, bool uploaded,
+                                    u64 ring_since, bool first_this_frame, u32 index);
+    /// FRITCHII_BANK_CENSUS: the 10 s line.
+    void LogNativeBankCensus(std::chrono::steady_clock::time_point now);
     /// Sets the page's recheck flag (and its region bit with the table).
     static void SetNativeBankRecheck(const NativeBankSnapshotRef& ref, DAddr page, bool value) {
         ref.page->recheck = value;
