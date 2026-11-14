@@ -337,6 +337,7 @@ constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::Check::Co
     "a semaphore release GPUMem had the back run at an entry the back passed without it (record "
     "dropped)",
     "a back draw between a semaphore release GPUMem had run and its entry",
+    "a run start while the back was still in the last run (its end was missed)",
 };
 static_assert(LINK_CHECK_NAMES.back() != nullptr, "a name for every check");
 constexpr std::array<const char*, static_cast<size_t>(MemoryStageLink::ListDraw::Count)>
@@ -940,8 +941,22 @@ MemoryStageLink::BackLimits MemoryStageLink::BackLoad(u64 published) const noexc
         return {published, 0, 0};
     }
     const u64 available = Ring::Staged().load(std::memory_order_acquire);
-    return {available, Ring::LentFrom().load(std::memory_order_relaxed),
-            Ring::LentUntil().load(std::memory_order_relaxed)};
+    // One run's two ends, never a mix: GPUMem may lend the next run between two loads, and
+    // the last run's lent_from with the next one's lent_until made every entry from the last
+    // run's end on look lent (BackEntry then took them as a continued run, and at the next
+    // run's start, still "in a run", skipped its start: no flag hand-over, no lend ranges, and
+    // its first entry ran with the back served). GPUMem stores lent_from, then lent_until with
+    // release (Lend); lent_from only grows within a ring, so an unchanged re-read means both
+    // are of one lend.
+    u64 from = Ring::LentFrom().load(std::memory_order_acquire);
+    for (;;) {
+        const u64 until = Ring::LentUntil().load(std::memory_order_acquire);
+        const u64 again = Ring::LentFrom().load(std::memory_order_acquire);
+        if (again == from) [[likely]] {
+            return {available, from, until};
+        }
+        from = again;
+    }
 }
 
 void MemoryStageLink::BackEntry(u64 position, const BackLimits& limits) {
@@ -949,6 +964,12 @@ void MemoryStageLink::BackEntry(u64 position, const BackLimits& limits) {
         return; // the ring is off
     }
     const bool lent = position >= limits.lent_from && position < limits.lent_until;
+    if (lent && t_back_run && limits.lent_from != back_run_from) [[unlikely]] {
+        // Another run starts while the back is still in the last one (its end was missed): must
+        // be 0. That run's end is taken here, and this one starts as any other.
+        Note(Check::RunOverlap, "BackEntry");
+        BackEndRun();
+    }
     if (lent && !t_back_run) {
         // A run starts: the cache is the back's until its last entry. A run the stage extended
         // after the back had ended it (same lent_from) goes on: what the back drew in its first
@@ -1685,8 +1706,10 @@ void MemoryStageLink::Lend(u64 from, u64 until) {
     }
     LinkBump(counters.flag_handovers);
     LinkBump(counters.runs);
+    // lent_until with release, after lent_from: a back that reads this lent_until reads this
+    // lent_from again (BackLoad's consistent pair).
     Ring::LentFrom().store(from, std::memory_order_relaxed);
-    Ring::LentUntil().store(until, std::memory_order_relaxed);
+    Ring::LentUntil().store(until, std::memory_order_release);
     t_stage_user = false;
     t_in_call = false;
     PublishStaged(until);
@@ -1854,7 +1877,7 @@ void MemoryStageLink::RingLoop(std::stop_token& stop, u64 start) {
                         // stays lent: the back gets what is followed so far, GPUMem waits for
                         // more input, and the run ends at the first entry that needs GPUMem.
                         if (until != staged_local) {
-                            Ring::LentUntil().store(until, std::memory_order_relaxed);
+                            Ring::LentUntil().store(until, std::memory_order_release);
                             PublishStaged(until);
                         }
                         LinkBump(counters.run_input_waits);
@@ -1889,13 +1912,13 @@ void MemoryStageLink::RingLoop(std::stop_token& stop, u64 start) {
                     ++run_entries;
                     run_launches += more.launches;
                     if (!publish_once) {
-                        Ring::LentUntil().store(until, std::memory_order_relaxed);
+                        Ring::LentUntil().store(until, std::memory_order_release);
                         PublishStaged(until);
                     }
                 }
                 if (publish_once && until != staged_local) {
                     // lent_until before `staged` (BackAfter reads it after the batch's limits).
-                    Ring::LentUntil().store(until, std::memory_order_relaxed);
+                    Ring::LentUntil().store(until, std::memory_order_release);
                     PublishStaged(until);
                 }
                 span.Set(0, {"entries", run_entries});
