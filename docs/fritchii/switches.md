@@ -649,6 +649,14 @@ when the device is made.
 FRITCHII_MEMSTAGE_SEAM_STATS=1 (boot, diagnostic): the memory seam's stats line (EXP123) every
 10 s also with EXP123 = 0, which shows what the seam carries at today's timing.
 
+Without it, and without FRITCHII_MEMSTAGE_TICKS, EXP123 = 0 runs the seam lean (no switch): a fill
+bracket only counts its depth (no arena claim, no watch on the scheduler, no site counts), and the
+stats counts are skipped. Entries that run as pushed (EXP123 = 0, and outside a deferring bracket
+at 1 to 3) go straight to the player's typed call without being written to the scratch arena.
+The same calls in the same order: nothing defers at 0, so what the lean drops is the deferring
+modes' checks and the stats. With SEAM_STATS set, EXP123 = 0 keeps the full bracket, so its line
+still counts the records inside fills.
+
 ### FRITCHII_MEMSTAGE_READ_LOG
 
 FRITCHII_MEMSTAGE_READ_LOG=N (boot, diagnostic, default 0 = off; the memory stage's sub-step 2b,

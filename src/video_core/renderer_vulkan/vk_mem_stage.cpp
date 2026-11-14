@@ -6,10 +6,15 @@
 // Every Vulkan command the buffer cache runtime used to record itself is now an entry: the
 // runtime function keeps its own work (null replacement, the route of an upload, staging) and
 // pushes an entry; MemPlayer::Exec turns the entry into the scheduler or descriptor queue calls
-// the function made before. Exec is the only copy of that code.
+// the function made before. Exec, with the typed plays it decodes to, is the only copy of that
+// code.
 //
 // EDEN_NX2_EXP123 (SEAM, live, read once a frame in TickFrame):
 //   0: every entry is executed the moment it is pushed: today's calls at today's moments.
+//      Without packet ticks and FRITCHII_MEMSTAGE_SEAM_STATS this is the seam lean: a bracket
+//      only counts its depth (no owner claim, no watch, no site counts), and an entry run as
+//      pushed goes straight to its typed play (MemPlayer::PlayCopy ...) without being written.
+//      Entries pushed as they run take that typed path at every SEAM.
 //   1: inside a fill bracket (MemStage::Fill, FillPlay, Ref) the entries wait in the arena and
 //      are played where the call site plays them: right after the call, as today. Outside a
 //      bracket (a site that has none, another thread) they still run at once.
@@ -228,7 +233,7 @@ void PrefetchLine(const u8* address) {
 #endif
 }
 
-thread_local u32 t_fill_depth = 0;
+// The fill depth is MemStage::t_fill_depth (the header: the lean bracket counts it inline).
 thread_local u32 t_play_depth = 0;
 thread_local MemStage::Site t_site = MemStage::Site::Count;
 thread_local char t_thread_marker = 0;
@@ -473,7 +478,7 @@ void SeamHook::OnUse(Use use, const std::source_location& location) {
     if (stage == nullptr) {
         return;
     }
-    const bool in_fill = t_fill_depth != 0;
+    const bool in_fill = MemStage::t_fill_depth != 0;
     if (in_fill) {
         // A use inside a fill that is not the player's: a record is 5.1; a flush, finish or
         // state reset that did not go through the clock is counted beside it.
@@ -522,9 +527,16 @@ u32 MemStage::Arena::Reserve(u32 bytes) {
 // ---------------------------------------------------------------------------------------------
 // Brackets
 
-MemStage::Fill::Fill(MemStage& stage_, Site site_, u32 index_)
-    : stage{stage_}, site{site_}, index{index_}, previous_site{t_site} {
-    if (t_fill_depth++ == 0) {
+// The full bracket. The lean one (header) does only the depth: at SEAM 0 nothing defers
+// (claim_deferring is SEAM's, so the claim below only made this thread the owner of an arena it
+// never writes), no packet ticks number operations, no zone or read log runs (SEAM >= 2), and
+// the watch, the site and its counts serve the stats line and the 5.1 checks of the deferring
+// modes. Lean is set only with all of that off (TickFrame).
+void MemStage::Fill::Open(Site site_, u32 index_) {
+    site = site_;
+    index = index_;
+    previous_site = t_site;
+    if (t_fill_depth == 1) {
         const uintptr_t me = ThisThread();
         uintptr_t expected = 0;
         if (stage.owner.load(std::memory_order_relaxed) != me &&
@@ -568,7 +580,7 @@ MemStage::Fill::Fill(MemStage& stage_, Site site_, u32 index_)
     Bump(stage.counters.site_fills[static_cast<size_t>(site)]);
 }
 
-MemStage::Fill::~Fill() {
+void MemStage::Fill::Close() {
     SeamHook::g_watch.fetch_sub(1, std::memory_order_relaxed);
     if (stage.OwnedHere()) {
         stage.CloseSection(site, index, begin);
@@ -590,11 +602,6 @@ MemStage::Fill::~Fill() {
         SeamTicks::SetStamp(0, true);
         stage.UpdateUnplayed();
     }
-}
-
-MemStage::FillPlay::~FillPlay() {
-    fill.reset();
-    stage.Play();
 }
 
 MemStage::SyncScope::SyncScope(MemStage* stage, Sync kind) {
@@ -2119,6 +2126,7 @@ void MemStage::OnBackImpl(void (*function)(void*), void* argument) {
     struct State {
         uintptr_t identity;
         u32 fill_depth;
+        bool fill_lean;
         u32 play_depth;
         Site site;
         bool holding;
@@ -2130,6 +2138,7 @@ void MemStage::OnBackImpl(void (*function)(void*), void* argument) {
     const auto capture = [] {
         return State{t_identity,
                      t_fill_depth,
+                     t_fill_lean,
                      t_play_depth,
                      t_site,
                      t_holding,
@@ -2141,6 +2150,7 @@ void MemStage::OnBackImpl(void (*function)(void*), void* argument) {
     const auto install = [](const State& state) {
         t_identity = state.identity;
         t_fill_depth = state.fill_depth;
+        t_fill_lean = state.fill_lean;
         t_play_depth = state.play_depth;
         t_site = state.site;
         t_holding = state.holding;
@@ -2904,12 +2914,39 @@ void MemStage::CountPush(Cmd kind) noexcept {
     }
 }
 
+// PushParts's path for an entry that is not deferred, without the entry: the same checks in the
+// same order, then the typed play the entry's Exec would have called (MemPlayer::PlayCopy ...).
+// The seam lean skips the stats counts only (no stats line reads them while it holds).
+template <typename PlayFn>
+void MemStage::RunNow(Cmd kind, PlayFn&& play) {
+    if (!lean.load(std::memory_order_relaxed)) {
+        CountPush(kind);
+    }
+    Link::CheckCacheUser(Link::Check::PushUser);
+    if (Link::Checking() && pending && OwnedHere()) [[unlikely]] {
+        Link::Note(Link::Check::PushWhilePending, CMD_NAMES[static_cast<size_t>(kind)]);
+    }
+    if (Link::InCall()) [[unlikely]] {
+        // GPUMem has nowhere to put it (spec 5.5): the back records it, counted.
+        Link::Note(Link::Check::PushNowhere, CMD_NAMES[static_cast<size_t>(kind)]);
+        OnBack([&play] {
+            PlayDepth depth;
+            play();
+        });
+        return;
+    }
+    PlayDepth depth;
+    play();
+}
+
 void MemStage::PushParts(Cmd kind, u8 flags, u32 count, std::initializer_list<Part> parts) {
     u32 bytes = static_cast<u32>(sizeof(Entry));
     for (const Part& part : parts) {
         bytes += Align8(part.bytes);
     }
-    CountPush(kind);
+    if (!lean.load(std::memory_order_relaxed)) {
+        CountPush(kind);
+    }
     Link::CheckCacheUser(Link::Check::PushUser);
     const bool defer = Deferring();
     Arena& target = defer ? arena : Scratch();
@@ -2962,6 +2999,10 @@ void MemStage::Push(Cmd kind, u8 flags) {
 
 void MemStage::PushCopy(Cmd kind, u8 flags, VkBuffer src, VkBuffer dst,
                         std::span<const VkBufferCopy> copies) {
+    if (!Deferring()) {
+        RunNow(kind, [&] { player.PlayCopy(kind, flags, src, dst, copies); });
+        return;
+    }
     const CopyPayload payload{
         .src = src,
         .dst = dst,
@@ -2989,12 +3030,21 @@ void MemStage::PushNullInit(VkBuffer buffer) {
 
 void MemStage::PushIndex(Cmd kind, u8 flags, VkBuffer buffer, VkDeviceSize offset,
                          VkIndexType type) {
+    if (!Deferring()) {
+        RunNow(kind, [&] { player.PlayIndex(kind, flags, buffer, offset, type); });
+        return;
+    }
     const IndexPayload payload{.buffer = buffer, .offset = offset, .type = type};
     PushParts(kind, flags, 1, {PartOf(payload)});
 }
 
 void MemStage::PushVertex(u8 flags, u32 index, VkBuffer buffer, u32 offset, u32 size,
                           u32 stride) {
+    if (!Deferring()) {
+        RunNow(Cmd::BindVertex,
+               [&] { player.PlayVertex(flags, index, buffer, offset, size, stride); });
+        return;
+    }
     const VertexOne payload{
         .buffer = buffer, .index = index, .offset = offset, .size = size, .stride = stride};
     PushParts(Cmd::BindVertex, flags, 1, {PartOf(payload)});
@@ -3005,6 +3055,13 @@ void MemStage::PushVertices(u8 flags, u32 first, std::span<const VkBuffer> buffe
                             std::span<const VkDeviceSize> sizes,
                             std::span<const VkDeviceSize> strides) {
     const u32 count = static_cast<u32>(buffers.size());
+    if (!Deferring()) {
+        RunNow(Cmd::BindVertices, [&] {
+            player.PlayVertices(flags, first, count, buffers.data(), offsets.first(count).data(),
+                                sizes.first(count).data(), strides.first(count).data());
+        });
+        return;
+    }
     const VerticesPayload payload{.first = first, .count = count};
     PushParts(Cmd::BindVertices, flags, count,
               {PartOf(payload), PartOf(buffers), PartOf(offsets.first(count)),
@@ -3033,12 +3090,16 @@ void MemStage::PushConvert(Pass pass, const ComputePassRun& run) {
 
 void MemStage::PushDescriptor(const DescriptorUpdateEntry& descriptor, bool texel) {
     static_assert(sizeof(DescriptorUpdateEntry) % 8 == 0);
-    if (texel) {
+    // The seam lean: no stats line reads the counts.
+    const bool counted = !lean.load(std::memory_order_relaxed);
+    if (texel && counted) {
         Bump(counters.texel);
     }
     Link::CheckCacheUser(Link::Check::PushUser);
     if (!Deferring()) {
-        CountPush(Cmd::Descriptors);
+        if (counted) {
+            CountPush(Cmd::Descriptors);
+        }
         if (Link::Checking() && pending && OwnedHere()) [[unlikely]] {
             Link::Note(Link::Check::PushWhilePending, "descriptor");
         }
@@ -3131,6 +3192,13 @@ void MemStage::TickFrame() {
     if (OwnedHere() && t_fill_depth == 0) {
         owner.store(0, std::memory_order_release);
     }
+    // The seam lean: entries run as pushed and nothing reports the bracket's work. Turned off
+    // before a SEAM above 0 shows, turned on after SEAM 0 does.
+    static const bool stats_env = std::getenv("FRITCHII_MEMSTAGE_SEAM_STATS") != nullptr;
+    const bool lean_now = value == 0 && !ticks && !stats_env;
+    if (!lean_now) {
+        lean.store(false, std::memory_order_relaxed);
+    }
     if (value != seam_value.load(std::memory_order_relaxed)) {
         seam_value.store(value, std::memory_order_relaxed);
         seam_on.store(on, std::memory_order_relaxed);
@@ -3149,8 +3217,10 @@ void MemStage::TickFrame() {
                                    read_log_every)
                      : std::string{});
     }
+    if (lean_now) {
+        lean.store(true, std::memory_order_relaxed);
+    }
     TickThread(value);
-    static const bool stats_env = std::getenv("FRITCHII_MEMSTAGE_SEAM_STATS") != nullptr;
     if (on || stats_env) {
         LogStats();
     }
@@ -4087,12 +4157,9 @@ void MemPlayer::AddDescriptors(const DescriptorUpdateEntry* entries, size_t coun
 }
 
 void MemPlayer::Exec(const MemStage::Entry& entry) {
-    CheckBack("Exec");
     using Cmd = MemStage::Cmd;
     constexpr u32 HEAD = static_cast<u32>(sizeof(MemStage::Entry));
-    if ((entry.flags & MemStage::OutsideRenderPass) != 0) {
-        scheduler.RequestOutsideRenderPassOperationContext();
-    }
+    // The kinds with a typed play (entries run at once call it directly, MemStage::RunNow).
     switch (entry.kind) {
     case Cmd::UploadAhead:
     case Cmd::UploadBatched:
@@ -4100,40 +4167,48 @@ void MemPlayer::Exec(const MemStage::Entry& entry) {
         const auto& payload = *PayloadAt<MemStage::CopyPayload>(entry, HEAD);
         const VkBufferCopy* const copies = PayloadAt<VkBufferCopy>(
             entry, HEAD + Align8(static_cast<u32>(sizeof(MemStage::CopyPayload))));
-        const VkBuffer src_buffer = payload.src;
-        const VkBuffer dst_buffer = payload.dst;
-        if (entry.kind == Cmd::UploadBatched) {
-            scheduler.RecordUpload(src_buffer, dst_buffer,
-                                   std::span<const VkBufferCopy>{copies, payload.count});
-            break;
-        }
-        const boost::container::small_vector<VkBufferCopy, 8> vk_copies(copies,
-                                                                         copies + payload.count);
-        if (entry.kind == Cmd::UploadAhead) {
-            scheduler.RecordWithUploadBuffer([src_buffer, dst_buffer, vk_copies](
-                                                 vk::CommandBuffer, vk::CommandBuffer upload_cmdbuf) {
-                upload_cmdbuf.CopyBuffer(src_buffer, dst_buffer, vk_copies);
-            });
-            break;
-        }
-        const bool barrier = (entry.flags & MemStage::Barrier) != 0;
-        scheduler.Record([src_buffer, dst_buffer, vk_copies, barrier](vk::CommandBuffer cmdbuf) {
-            if (barrier) {
-                cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
-                                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, COPY_READ_BARRIER);
-            }
-            cmdbuf.CopyBuffer(src_buffer, dst_buffer, vk_copies);
-            if (barrier) {
-                // Later transfers too: a reordered upload of the same bytes in a later submission
-                // (RecordWithUploadBuffer, ahead of that submission's work) has no barrier of its
-                // own before it, and in-order copies don't count as uses for CanReorderUpload.
-                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                       vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, 0,
-                                       COPY_WRITE_BARRIER);
-            }
-        });
+        PlayCopy(entry.kind, entry.flags, payload.src, payload.dst,
+                 std::span<const VkBufferCopy>{copies, payload.count});
+        return;
+    }
+    case Cmd::BindIndex:
+    case Cmd::BindIndexAlways: {
+        const auto& payload = *PayloadAt<MemStage::IndexPayload>(entry, HEAD);
+        PlayIndex(entry.kind, entry.flags, payload.buffer, payload.offset, payload.type);
+        return;
+    }
+    case Cmd::BindVertex: {
+        const auto& payload = *PayloadAt<MemStage::VertexOne>(entry, HEAD);
+        PlayVertex(entry.flags, payload.index, payload.buffer, payload.offset, payload.size,
+                   payload.stride);
+        return;
+    }
+    case Cmd::BindVertices: {
+        const auto& payload = *PayloadAt<MemStage::VerticesPayload>(entry, HEAD);
+        const u32 binding_count = payload.count;
+        const u32 handles_at = HEAD + Align8(static_cast<u32>(sizeof(MemStage::VerticesPayload)));
+        const u32 array_bytes = binding_count * 8;
+        PlayVertices(entry.flags, payload.first, binding_count,
+                     PayloadAt<VkBuffer>(entry, handles_at),
+                     PayloadAt<VkDeviceSize>(entry, handles_at + array_bytes),
+                     PayloadAt<VkDeviceSize>(entry, handles_at + 2 * array_bytes),
+                     PayloadAt<VkDeviceSize>(entry, handles_at + 3 * array_bytes));
+        return;
+    }
+    default:
         break;
     }
+    BeginPlay(entry.flags);
+    switch (entry.kind) {
+    case Cmd::UploadAhead:
+    case Cmd::UploadBatched:
+    case Cmd::Copy:
+    case Cmd::BindIndex:
+    case Cmd::BindIndexAlways:
+    case Cmd::BindVertex:
+    case Cmd::BindVertices:
+        // Played above.
+        break;
     case Cmd::PreCopyBarrier:
         scheduler.Record([](vk::CommandBuffer cmdbuf) {
             cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
@@ -4196,126 +4271,6 @@ void MemPlayer::Exec(const MemStage::Entry& entry) {
         });
         break;
     }
-    case Cmd::BindIndex: {
-        const auto& payload = *PayloadAt<MemStage::IndexPayload>(entry, HEAD);
-        const VkBuffer vk_buffer = payload.buffer;
-        const VkDeviceSize vk_offset = payload.offset;
-        const VkIndexType vk_index_type = payload.type;
-        // The same index buffer is still bound in this command buffer: skip the rebind.
-        if (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::IndexRebind) &&
-            !VideoCommon::Nx2Perf::Verify()) {
-            const u64 epoch = scheduler.RecordingEpoch();
-            if (bound_index_valid && vk_buffer == bound_index_buffer &&
-                vk_offset == bound_index_offset && vk_index_type == bound_index_type &&
-                epoch == bound_index_epoch) {
-                break;
-            }
-            bound_index_valid = true;
-            bound_index_buffer = vk_buffer;
-            bound_index_offset = vk_offset;
-            bound_index_type = vk_index_type;
-            bound_index_epoch = epoch;
-        }
-        scheduler.Record([vk_buffer, vk_offset, vk_index_type](vk::CommandBuffer cmdbuf) {
-            cmdbuf.BindIndexBuffer(vk_buffer, vk_offset, vk_index_type);
-        });
-        break;
-    }
-    case Cmd::BindIndexAlways: {
-        bound_index_valid = false;
-        if ((entry.flags & MemStage::ForgetOnly) != 0) {
-            break;
-        }
-        const auto& payload = *PayloadAt<MemStage::IndexPayload>(entry, HEAD);
-        scheduler.Record([buffer = payload.buffer, offset = payload.offset,
-                          type = payload.type](vk::CommandBuffer cmdbuf) {
-            cmdbuf.BindIndexBuffer(buffer, offset, type);
-        });
-        break;
-    }
-    case Cmd::BindVertex: {
-        const auto& payload = *PayloadAt<MemStage::VertexOne>(entry, HEAD);
-        const u32 index = payload.index;
-        if (index < VideoCommon::NUM_VERTEX_BUFFERS) {
-            bound_vertex_buffers[index].epoch = ~u64{0};
-        }
-        if ((entry.flags & MemStage::ForgetOnly) != 0) {
-            break;
-        }
-        const VkBuffer buffer = payload.buffer;
-        const u32 offset = payload.offset;
-        if ((entry.flags & MemStage::DynamicState) != 0) {
-            scheduler.Record([index, buffer, offset, size = payload.size,
-                              stride = payload.stride](vk::CommandBuffer cmdbuf) {
-                const VkDeviceSize vk_offset = buffer != VK_NULL_HANDLE ? offset : 0;
-                const VkDeviceSize vk_size = buffer != VK_NULL_HANDLE ? size : VK_WHOLE_SIZE;
-                const VkDeviceSize vk_stride = stride;
-                cmdbuf.BindVertexBuffers2EXT(index, 1, &buffer, &vk_offset, &vk_size, &vk_stride);
-            });
-        } else {
-            scheduler.Record([index, buffer, offset](vk::CommandBuffer cmdbuf) {
-                cmdbuf.BindVertexBuffer(index, buffer, offset);
-            });
-        }
-        break;
-    }
-    case Cmd::BindVertices: {
-        const auto& payload = *PayloadAt<MemStage::VerticesPayload>(entry, HEAD);
-        const u32 first = payload.first;
-        const u32 binding_count = payload.count;
-        const u32 handles_at = HEAD + Align8(static_cast<u32>(sizeof(MemStage::VerticesPayload)));
-        const u32 array_bytes = binding_count * 8;
-        const VkBuffer* const handles = PayloadAt<VkBuffer>(entry, handles_at);
-        const VkDeviceSize* const offsets = PayloadAt<VkDeviceSize>(entry, handles_at + array_bytes);
-        const VkDeviceSize* const sizes =
-            PayloadAt<VkDeviceSize>(entry, handles_at + 2 * array_bytes);
-        const VkDeviceSize* const strides =
-            PayloadAt<VkDeviceSize>(entry, handles_at + 3 * array_bytes);
-        // The same buffers are still bound in this command buffer (as for index buffers): skip
-        // the rebind. Draws re-resolve their vertex streams when the guest rewrites unchanged
-        // registers.
-        if (!VideoCommon::Nx2Perf::Verify()) {
-            const u64 epoch = scheduler.RecordingEpoch();
-            bool unchanged = true;
-            for (u32 i = 0; unchanged && i < binding_count; ++i) {
-                const BoundVertexBuffer& bound = bound_vertex_buffers[first + i];
-                unchanged = bound.epoch == epoch && bound.buffer == handles[i] &&
-                            bound.offset == offsets[i] && bound.size == sizes[i] &&
-                            bound.stride == strides[i];
-            }
-            if (unchanged) {
-                Bump(vertex_runs_dropped);
-                break;
-            }
-            for (u32 i = 0; i < binding_count; ++i) {
-                bound_vertex_buffers[first + i] = {handles[i], offsets[i], sizes[i], strides[i],
-                                                   epoch};
-            }
-        }
-        Bump(vertex_runs_recorded);
-        using Handles = boost::container::static_vector<VkBuffer, NUM_BOUND_VERTEX_BUFFERS>;
-        using Sizes = boost::container::static_vector<VkDeviceSize, NUM_BOUND_VERTEX_BUFFERS>;
-        Handles buffer_handles(handles, handles + binding_count);
-        Sizes buffer_offsets(offsets, offsets + binding_count);
-        if ((entry.flags & MemStage::DynamicState) != 0) {
-            Sizes buffer_sizes(sizes, sizes + binding_count);
-            Sizes buffer_strides(strides, strides + binding_count);
-            scheduler.Record([first, binding_count, buffer_handles_ = std::move(buffer_handles),
-                              offsets_ = std::move(buffer_offsets),
-                              sizes_ = std::move(buffer_sizes),
-                              strides_ = std::move(buffer_strides)](vk::CommandBuffer cmdbuf) {
-                cmdbuf.BindVertexBuffers2EXT(first, binding_count, buffer_handles_.data(),
-                                             offsets_.data(), sizes_.data(), strides_.data());
-            });
-        } else {
-            scheduler.Record([first, binding_count, buffer_handles_ = std::move(buffer_handles),
-                              offsets_ = std::move(buffer_offsets)](vk::CommandBuffer cmdbuf) {
-                cmdbuf.BindVertexBuffers(first, binding_count, buffer_handles_.data(),
-                                         offsets_.data());
-            });
-        }
-        break;
-    }
     case Cmd::BindXfb: {
         const auto& payload = *PayloadAt<MemStage::XfbOne>(entry, HEAD);
         scheduler.Record([index = payload.index, buffer = payload.buffer, offset = payload.offset,
@@ -4370,6 +4325,157 @@ void MemPlayer::Exec(const MemStage::Entry& entry) {
     case Cmd::Count:
         ASSERT(false);
         break;
+    }
+}
+
+// The typed plays: Exec decodes an entry to these; an entry run as pushed comes here directly
+// (MemStage::RunNow), with the same arguments the entry would have carried.
+
+void MemPlayer::BeginPlay(u8 flags) {
+    CheckBack("Exec");
+    if ((flags & MemStage::OutsideRenderPass) != 0) {
+        scheduler.RequestOutsideRenderPassOperationContext();
+    }
+}
+
+void MemPlayer::PlayCopy(MemStage::Cmd kind, u8 flags, VkBuffer src_buffer, VkBuffer dst_buffer,
+                         std::span<const VkBufferCopy> copies) {
+    using Cmd = MemStage::Cmd;
+    BeginPlay(flags);
+    if (kind == Cmd::UploadBatched) {
+        scheduler.RecordUpload(src_buffer, dst_buffer, copies);
+        return;
+    }
+    const boost::container::small_vector<VkBufferCopy, 8> vk_copies(copies.begin(),
+                                                                     copies.end());
+    if (kind == Cmd::UploadAhead) {
+        scheduler.RecordWithUploadBuffer([src_buffer, dst_buffer, vk_copies](
+                                             vk::CommandBuffer, vk::CommandBuffer upload_cmdbuf) {
+            upload_cmdbuf.CopyBuffer(src_buffer, dst_buffer, vk_copies);
+        });
+        return;
+    }
+    const bool barrier = (flags & MemStage::Barrier) != 0;
+    scheduler.Record([src_buffer, dst_buffer, vk_copies, barrier](vk::CommandBuffer cmdbuf) {
+        if (barrier) {
+            cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0, COPY_READ_BARRIER);
+        }
+        cmdbuf.CopyBuffer(src_buffer, dst_buffer, vk_copies);
+        if (barrier) {
+            // Later transfers too: a reordered upload of the same bytes in a later submission
+            // (RecordWithUploadBuffer, ahead of that submission's work) has no barrier of its
+            // own before it, and in-order copies don't count as uses for CanReorderUpload.
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, 0,
+                                   COPY_WRITE_BARRIER);
+        }
+    });
+}
+
+void MemPlayer::PlayIndex(MemStage::Cmd kind, u8 flags, VkBuffer vk_buffer, VkDeviceSize vk_offset,
+                          VkIndexType vk_index_type) {
+    BeginPlay(flags);
+    if (kind == MemStage::Cmd::BindIndexAlways) {
+        bound_index_valid = false;
+        if ((flags & MemStage::ForgetOnly) != 0) {
+            return;
+        }
+        scheduler.Record([buffer = vk_buffer, offset = vk_offset,
+                          type = vk_index_type](vk::CommandBuffer cmdbuf) {
+            cmdbuf.BindIndexBuffer(buffer, offset, type);
+        });
+        return;
+    }
+    // The same index buffer is still bound in this command buffer: skip the rebind.
+    if (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::IndexRebind) &&
+        !VideoCommon::Nx2Perf::Verify()) {
+        const u64 epoch = scheduler.RecordingEpoch();
+        if (bound_index_valid && vk_buffer == bound_index_buffer &&
+            vk_offset == bound_index_offset && vk_index_type == bound_index_type &&
+            epoch == bound_index_epoch) {
+            return;
+        }
+        bound_index_valid = true;
+        bound_index_buffer = vk_buffer;
+        bound_index_offset = vk_offset;
+        bound_index_type = vk_index_type;
+        bound_index_epoch = epoch;
+    }
+    scheduler.Record([vk_buffer, vk_offset, vk_index_type](vk::CommandBuffer cmdbuf) {
+        cmdbuf.BindIndexBuffer(vk_buffer, vk_offset, vk_index_type);
+    });
+}
+
+void MemPlayer::PlayVertex(u8 flags, u32 index, VkBuffer buffer, u32 offset, u32 size,
+                           u32 stride) {
+    BeginPlay(flags);
+    if (index < VideoCommon::NUM_VERTEX_BUFFERS) {
+        bound_vertex_buffers[index].epoch = ~u64{0};
+    }
+    if ((flags & MemStage::ForgetOnly) != 0) {
+        return;
+    }
+    if ((flags & MemStage::DynamicState) != 0) {
+        scheduler.Record([index, buffer, offset, size, stride](vk::CommandBuffer cmdbuf) {
+            const VkDeviceSize vk_offset = buffer != VK_NULL_HANDLE ? offset : 0;
+            const VkDeviceSize vk_size = buffer != VK_NULL_HANDLE ? size : VK_WHOLE_SIZE;
+            const VkDeviceSize vk_stride = stride;
+            cmdbuf.BindVertexBuffers2EXT(index, 1, &buffer, &vk_offset, &vk_size, &vk_stride);
+        });
+    } else {
+        scheduler.Record([index, buffer, offset](vk::CommandBuffer cmdbuf) {
+            cmdbuf.BindVertexBuffer(index, buffer, offset);
+        });
+    }
+}
+
+void MemPlayer::PlayVertices(u8 flags, u32 first, u32 binding_count, const VkBuffer* handles,
+                             const VkDeviceSize* offsets, const VkDeviceSize* sizes,
+                             const VkDeviceSize* strides) {
+    BeginPlay(flags);
+    // The same buffers are still bound in this command buffer (as for index buffers): skip
+    // the rebind. Draws re-resolve their vertex streams when the guest rewrites unchanged
+    // registers.
+    if (!VideoCommon::Nx2Perf::Verify()) {
+        const u64 epoch = scheduler.RecordingEpoch();
+        bool unchanged = true;
+        for (u32 i = 0; unchanged && i < binding_count; ++i) {
+            const BoundVertexBuffer& bound = bound_vertex_buffers[first + i];
+            unchanged = bound.epoch == epoch && bound.buffer == handles[i] &&
+                        bound.offset == offsets[i] && bound.size == sizes[i] &&
+                        bound.stride == strides[i];
+        }
+        if (unchanged) {
+            Bump(vertex_runs_dropped);
+            return;
+        }
+        for (u32 i = 0; i < binding_count; ++i) {
+            bound_vertex_buffers[first + i] = {handles[i], offsets[i], sizes[i], strides[i],
+                                               epoch};
+        }
+    }
+    Bump(vertex_runs_recorded);
+    using Handles = boost::container::static_vector<VkBuffer, NUM_BOUND_VERTEX_BUFFERS>;
+    using Sizes = boost::container::static_vector<VkDeviceSize, NUM_BOUND_VERTEX_BUFFERS>;
+    Handles buffer_handles(handles, handles + binding_count);
+    Sizes buffer_offsets(offsets, offsets + binding_count);
+    if ((flags & MemStage::DynamicState) != 0) {
+        Sizes buffer_sizes(sizes, sizes + binding_count);
+        Sizes buffer_strides(strides, strides + binding_count);
+        scheduler.Record([first, binding_count, buffer_handles_ = std::move(buffer_handles),
+                          offsets_ = std::move(buffer_offsets),
+                          sizes_ = std::move(buffer_sizes),
+                          strides_ = std::move(buffer_strides)](vk::CommandBuffer cmdbuf) {
+            cmdbuf.BindVertexBuffers2EXT(first, binding_count, buffer_handles_.data(),
+                                         offsets_.data(), sizes_.data(), strides_.data());
+        });
+    } else {
+        scheduler.Record([first, binding_count, buffer_handles_ = std::move(buffer_handles),
+                          offsets_ = std::move(buffer_offsets)](vk::CommandBuffer cmdbuf) {
+            cmdbuf.BindVertexBuffers(first, binding_count, buffer_handles_.data(),
+                                     offsets_.data());
+        });
     }
 }
 
