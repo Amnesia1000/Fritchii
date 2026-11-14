@@ -959,9 +959,36 @@ bool CbMode() {
     return VideoCore::Nx2Debug::Experiment(107) != 0;
 }
 
+using StageTarget = Tegra::MemoryManager::StageTarget;
+
+/// Step 7 fps fix 4: whether a constant buffer write lies within one 4 KiB GPU page (every single
+/// word does, and most runs of words). Then its address is looked up once (ResolveStage) and
+/// Watched, Collect, the own-write ring and the write take that lookup, where each translated it
+/// again (the write by its page walk).
+bool OnePage(GPUVAddr address, u64 size) {
+    constexpr u64 Page = 0x1000;
+    return (address & (Page - 1)) + size <= Page;
+}
+
+/// The one piece Collect's loop makes of a write within one 4 KiB page: the 32-byte rounding
+/// stays in the page (its end is 32-byte aligned), and the rounded start is on the same device
+/// page as `address`, so its device address is the lookup's minus the rounding.
+std::optional<std::pair<u64, std::size_t>> OnePiece(const StageTarget& target, GPUVAddr address,
+                                                    u64 size) {
+    constexpr u64 Atom = 32;
+    if (!target.device) {
+        return std::nullopt;
+    }
+    const GPUVAddr begin = address & ~(Atom - 1);
+    const GPUVAddr end = (address + size + Atom - 1) & ~(Atom - 1);
+    return std::pair<u64, std::size_t>{*target.device - (address - begin),
+                                       static_cast<std::size_t>(end - begin)};
+}
+
 /// Whether [address, address + size) is on a page the back's caches watch (join 2): image
-/// pages (the texture cache's filter) or the texture header and sampler pools.
-bool Watched(const Copy& c, GPUVAddr address, u64 size) {
+/// pages (the texture cache's filter) or the texture header and sampler pools. `target`: the
+/// address already looked up (ResolveStage), or null.
+bool Watched(const Copy& c, GPUVAddr address, u64 size, const StageTarget* target) {
     const Regs& regs = c.e->regs;
     constexpr u64 HeaderSize = 0x20;
     const GPUVAddr tic = regs.tex_header.Address();
@@ -979,13 +1006,21 @@ bool Watched(const Copy& c, GPUVAddr address, u64 size) {
     if (g_watch_filter == nullptr) {
         return false;
     }
-    const std::optional<DAddr> device = c.memory->GpuToCpuAddress(address);
+    const std::optional<DAddr> device =
+        target != nullptr ? target->device : c.memory->GpuToCpuAddress(address);
     return device && g_watch_filter->Any(*device, size);
 }
 
 /// The device ranges of a constant buffer write at [address, address + size), rounded as the
-/// back's invalidation rounds (32 bytes), split where the GPU pages map.
-void Collect(State& s, const Copy& c, GPUVAddr address, u64 size) {
+/// back's invalidation rounds (32 bytes), split where the GPU pages map. `target`: as Watched's.
+void Collect(State& s, const Copy& c, GPUVAddr address, u64 size, const StageTarget* target) {
+    if (target != nullptr) {
+        if (const auto piece = OnePiece(*target, address, size)) {
+            s.ranges_since_draw.push_back({piece->first, piece->second, c.memory,
+                                           s.processing_position});
+        }
+        return;
+    }
     constexpr u64 Atom = 32;
     constexpr u64 Page = 0x1000;
     GPUVAddr begin = address & ~(Atom - 1);
@@ -1003,14 +1038,20 @@ void Collect(State& s, const Copy& c, GPUVAddr address, u64 size) {
 /// 6b: the bytes Maxwell3D::ProcessCBMultiData's write puts in game memory, written by the stage
 /// (words on Switch 2 sparse memory one at a time, as WriteWordsCached), and their device ranges
 /// collected for the buffer half (the back's accumulator is not used).
-void StageWriteWords(State& s, Copy& c, GPUVAddr address, const u32* data, u64 size) {
+/// `target`: as Watched's.
+void StageWriteWords(State& s, Copy& c, GPUVAddr address, const u32* data, u64 size,
+                     const StageTarget* target) {
     const Common::WriteRing::SiteScope write_site{"3D constant buffer data (memory stage)", false};
     MemoryStageLink& link = MemoryStageLink::Get();
     const bool ahead = MemoryStageLink::Ahead() != 0;
     // The write's device ranges, rounded as the back's invalidation rounds (32 bytes), split where
     // the GPU pages map: the buffer half the next fill (or a lend) applies.
     boost::container::small_vector<std::pair<u64, std::size_t>, 4> pieces;
-    {
+    if (target != nullptr) {
+        if (const auto piece = OnePiece(*target, address, size)) {
+            pieces.push_back(*piece);
+        }
+    } else {
         constexpr u64 Atom = 32;
         constexpr u64 Page = 0x1000;
         GPUVAddr begin = address & ~(Atom - 1);
@@ -1051,7 +1092,11 @@ void StageWriteWords(State& s, Copy& c, GPUVAddr address, const u32* data, u64 s
             Common::WriteRing::t_quiet = was;
         }
     } quiet{kept};
-    if (kept) {
+    if (kept && target != nullptr) {
+        if (target->device) {
+            link.NoteStageWrite(*target->device, size, s.processing_position);
+        }
+    } else if (kept) {
         constexpr u64 Page = 0x1000;
         for (GPUVAddr piece = address; piece < address + size;) {
             const GPUVAddr piece_end = (std::min)(address + size, (piece + Page) & ~(Page - 1));
@@ -1066,6 +1111,8 @@ void StageWriteWords(State& s, Copy& c, GPUVAddr address, const u32* data, u64 s
         for (u64 i = 0; i < size / sizeof(u32); ++i) {
             c.memory->WriteBlockStage(address + i * sizeof(u32), data + i, sizeof(u32));
         }
+    } else if (target != nullptr) {
+        c.memory->WriteBlockStageAt(*target, address, data, size);
     } else {
         c.memory->WriteBlockStage(address, data, size);
     }
@@ -1089,16 +1136,22 @@ void ConstBufferWords(State& s, Copy& c, u32 amount, const u32* data) {
     ++c.generation;
     if (write_size != 0 && !CbMode()) {
         const GPUVAddr begin = address + regs.const_buffer.offset;
-        if (Watched(c, begin, write_size)) [[unlikely]] {
+        // Step 7 fps fix 4: one lookup for the whole path when the write lies within one page.
+        std::optional<StageTarget> one_page;
+        if (OnePage(begin, write_size)) [[likely]] {
+            one_page = c.memory->ResolveStage(begin);
+        }
+        const StageTarget* const target = one_page ? &*one_page : nullptr;
+        if (Watched(c, begin, write_size, target)) [[unlikely]] {
             // Join 2: the stage leaves this entry to the back (hard). It follows it: the
             // offset below; the back writes the words.
             ++s.counters.watched_hits;
             Hard(s, LevelType::CbWatched, 0);
         }
         if (!s.ring) {
-            Collect(s, c, begin, write_size);
+            Collect(s, c, begin, write_size, target);
         } else if (!s.ring_in_run && !s.entry_hard) {
-            StageWriteWords(s, c, begin, data, write_size);
+            StageWriteWords(s, c, begin, data, write_size, target);
         }
     }
     regs.const_buffer.offset += static_cast<u32>(copy_size);

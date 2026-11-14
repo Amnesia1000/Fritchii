@@ -156,6 +156,26 @@ public:
     void WriteBlockCached(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size);
     /// WriteBlockCached's bytes without its range (the memory stage collects its own).
     void WriteBlockStage(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size);
+    /// Where WriteBlockStage's page walk writes a range within one 4 KiB GPU page.
+    enum class StageWrite : u8 {
+        None,          ///< Nowhere: unmapped, or a small page under a reserved big page
+        BigContinuous, ///< A big page backed by one host range
+        BigSplit,      ///< A big page whose host memory is split (the device write)
+        Small,         ///< A small page (nothing written where it has no host pointer)
+    };
+    /// The memory stage's constant buffer words (FRITCHII_MEMSTAGE_THREAD=2): one page lookup
+    /// for a range within one 4 KiB GPU page, giving both what GpuToCpuAddress(gpu_addr) returns
+    /// and where WriteBlockStage writes, which would each look the page up again.
+    struct StageTarget {
+        std::optional<DAddr> device; ///< GpuToCpuAddress(gpu_addr)
+        DAddr write_device{};        ///< The device address WriteBlockStage writes at
+        StageWrite write{StageWrite::None};
+    };
+    [[nodiscard]] StageTarget ResolveStage(GPUVAddr gpu_addr) const;
+    /// WriteBlockStage(gpu_dest_addr, src_buffer, size) through `target`, which is
+    /// ResolveStage(gpu_dest_addr); the range lies within one 4 KiB GPU page.
+    void WriteBlockStageAt(const StageTarget& target, GPUVAddr gpu_dest_addr,
+                           const void* src_buffer, std::size_t size);
     /// WriteBlockCached of `count` consecutive words within one device page, in a single write.
     void WriteWordsCached(GPUVAddr gpu_dest_addr, const u32* words, std::size_t count);
     /// EXP88 & 2: constant buffer data written at

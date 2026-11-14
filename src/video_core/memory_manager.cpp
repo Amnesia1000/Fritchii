@@ -852,6 +852,64 @@ void MemoryManager::WriteBlockStage(GPUVAddr gpu_dest_addr, const void* src_buff
     WriteBlockImpl(gpu_dest_addr, src_buffer, size, VideoCommon::CacheType::None, true, false);
 }
 
+MemoryManager::StageTarget MemoryManager::ResolveStage(GPUVAddr gpu_addr) const {
+    // GpuToCpuAddress's lookup, and the branch WriteBlockImpl's walk takes for the same page (one
+    // page: a range within 4 KiB lies within one small and one big page).
+    StageTarget target;
+    if (!IsWithinGPUAddressRange(gpu_addr)) [[unlikely]] {
+        return target; // Both: no address, nothing written
+    }
+    const EntryType big = GetEntry(gpu_addr, true);
+    DAddr dev_addr;
+    if (big == EntryType::Mapped) [[likely]] {
+        const std::size_t index = PageEntryIndex(gpu_addr, true);
+        dev_addr = (DAddr(big_page_table_dev[index]) << cpu_page_bits) + (gpu_addr & big_page_mask);
+        target.write = IsBigPageContinuous(index) ? StageWrite::BigContinuous : StageWrite::BigSplit;
+    } else {
+        if (GetEntry(gpu_addr, false) != EntryType::Mapped) {
+            return target;
+        }
+        dev_addr = (DAddr(page_table[PageEntryIndex(gpu_addr, false)]) << cpu_page_bits) +
+                   (gpu_addr & page_mask);
+        // The walk goes to the small pages under any big page that is not reserved.
+        target.write = big != EntryType::Reserved ? StageWrite::Small : StageWrite::None;
+    }
+    target.write_device = dev_addr;
+    if ((dev_addr >> MaxwellDeviceMemoryManager::AS_BITS) != 0) {
+        LOG_ERROR(HW_GPU, "GPU address {:#x} maps outside the device space, to {:#x}", gpu_addr,
+                  dev_addr);
+    } else {
+        target.device = dev_addr;
+    }
+    return target;
+}
+
+void MemoryManager::WriteBlockStageAt(const StageTarget& target, GPUVAddr gpu_dest_addr,
+                                      const void* src_buffer, std::size_t size) {
+    // WriteBlockImpl(unsafe, no keeps) on one page: its mapped_big or mapped_normal, as the page
+    // walk would pick it.
+    Tegra::Nx2BackSparseWrite(gpu_dest_addr, size, src_buffer);
+    if (target.write == StageWrite::None || size == 0) {
+        return;
+    }
+    const DAddr dev_addr = target.write_device;
+    if (VideoCore::g_read_downloads.load(std::memory_order_relaxed) != 0) [[unlikely]] {
+        if (rasterizer != nullptr && VideoCore::ReadDownloadsMayCover(dev_addr, size)) {
+            rasterizer->FinishRead(dev_addr, size);
+        }
+    }
+    u8* const physical =
+        target.write == StageWrite::BigSplit
+            ? nullptr
+            : BackReadAudit::Unaudited([&] { return memory.GetPointer<u8>(dev_addr); });
+    if (physical != nullptr) [[likely]] {
+        std::memcpy(physical, src_buffer, size);
+        Common::WriteRing::Note(dev_addr, size, "GPU WriteBlock");
+    } else if (target.write != StageWrite::Small) {
+        memory.WriteBlockUnsafe(dev_addr, src_buffer, size);
+    }
+}
+
 void MemoryManager::WriteWordsCached(GPUVAddr gpu_dest_addr, const u32* words, std::size_t count) {
     const std::size_t size = count * sizeof(u32);
     // Words on Switch 2 sparse memory go one at a time, as Nx2BackSparseWrite saw them.
