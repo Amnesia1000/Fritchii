@@ -2632,7 +2632,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineClean(bool patch) {
         RefreshGraphicsKey();
     }
     if (current_pipeline) {
-        GraphicsPipeline* const next{current_pipeline->Next(graphics_key)};
+        GraphicsPipeline* const next{NextGraphicsPipeline()};
         if (next) {
             current_pipeline = next;
             clean.pipeline = next;
@@ -2679,6 +2679,66 @@ PipelineCache::DeltaLookup PipelineCache::DeltaKeeps(const GraphicsPipeline& pip
     return DeltaLookup::Keeps;
 }
 
+// FRITCHII_PIPELINE_KEY_HASH. graphics_key's fingerprint is taken here, from the key as it is
+// now: every writer of the key (RefreshStages, Refresh, the clean lookup's patches, DeltaKeeps,
+// CanonicalizeKeyState) runs before the lookup, and nothing writes it between this line and
+// NextHashed. It is taken once per Next call, which is once per key change: the clean lookup's
+// hits return before Next. The pipelines' fingerprints are made once (their keys are const).
+GraphicsPipeline* PipelineCache::NextGraphicsPipeline() {
+    namespace Debug = VideoCore::Nx2Debug;
+    const int mode = Debug::SwitchValue(Debug::g_pipeline_key_hash, "FRITCHII_PIPELINE_KEY_HASH");
+    if (mode <= 0) [[likely]] {
+        return current_pipeline->Next(graphics_key);
+    }
+    KeyHashStats& stats = key_hash_stats;
+    ++stats.calls;
+    const u64 hash = graphics_key.Fingerprint();
+    GraphicsPipeline* const hashed = current_pipeline->NextHashed(graphics_key, hash, stats.counts);
+    GraphicsPipeline* result = hashed;
+    if (mode >= 2) {
+        // Verify: Next's answer decides.
+        result = current_pipeline->Next(graphics_key);
+        ++stats.verified;
+        if (result != hashed) {
+            ++stats.differ;
+            if (stats.differ_logged < 16) {
+                ++stats.differ_logged;
+                LOG_WARNING(Render_Vulkan,
+                            "FRITCHII_PIPELINE_KEY_HASH=2: the hashed lookup found {} where Next "
+                            "found {} (key {:016x}, fingerprint {:016x})",
+                            fmt::ptr(hashed), fmt::ptr(result), graphics_key.Hash(), hash);
+            }
+        }
+    }
+    if ((stats.calls & 0x3ff) == 0) {
+        const auto now = std::chrono::steady_clock::now();
+        if (stats.last_log == std::chrono::steady_clock::time_point{}) {
+            stats.last_log = now;
+        } else if (now - stats.last_log >= std::chrono::seconds{10}) {
+            const double seconds = std::chrono::duration<double>(now - stats.last_log).count();
+            const auto rate = [seconds](u64 count) { return static_cast<double>(count) / seconds; };
+            const auto& counts = stats.counts;
+            LOG_INFO(Render_Vulkan,
+                     "Pipeline key hash (FRITCHII_PIPELINE_KEY_HASH={}) {:.0f} s: lookups {:.0f}/s, "
+                     "keys looked at {:.0f}/s ({:.1f} each), full compares {:.0f}/s, skipped by "
+                     "the fingerprint {:.0f}/s, fingerprint matches with another key {}; verify: "
+                     "checked {}, {} differ",
+                     mode, seconds, rate(stats.calls), rate(counts.candidates),
+                     stats.calls != 0 ? static_cast<double>(counts.candidates) /
+                                            static_cast<double>(stats.calls)
+                                      : 0.0,
+                     rate(counts.compared), rate(counts.candidates - counts.compared),
+                     counts.collisions, stats.verified, stats.differ);
+            stats.calls = 0;
+            stats.counts = {};
+            stats.verified = 0;
+            stats.differ = 0;
+            stats.last_log = now;
+        }
+    }
+    return result;
+}
+
 void PipelineCache::RefreshGraphicsKey() {
     if (!dynamic_features.has_dynamic_vertex_input) {
         graphics_key.state.Refresh(*maxwell3d, dynamic_features);
@@ -2716,7 +2776,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
     RefreshGraphicsKey();
 
     if (current_pipeline) {
-        GraphicsPipeline* const next{current_pipeline->Next(graphics_key)};
+        GraphicsPipeline* const next{NextGraphicsPipeline()};
         if (next) {
             current_pipeline = next;
             current_pipeline->MarkUsed(frame_count);

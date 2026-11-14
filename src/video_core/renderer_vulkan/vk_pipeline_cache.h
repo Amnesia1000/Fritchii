@@ -212,6 +212,20 @@ public:
 private:
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineSlowPath();
 
+    /// current_pipeline->Next(graphics_key), with FRITCHII_PIPELINE_KEY_HASH (live, default 0):
+    /// 1 compares the keys' fingerprints first (GraphicsPipeline::NextHashed); 2 runs both and
+    /// counts the answers that differ (must be 0), keeping Next's. One counts line every 10 s.
+    [[nodiscard]] GraphicsPipeline* NextGraphicsPipeline();
+    struct KeyHashStats {
+        u64 calls{};
+        GraphicsPipeline::NextCounts counts{};
+        u64 verified{};
+        u64 differ{};
+        u64 differ_logged{};
+        std::chrono::steady_clock::time_point last_log{};
+    };
+    KeyHashStats key_hash_stats;
+
     /// FixedPipelineState::Refresh of graphics_key, keeping only the vertex attribute types the
     /// bound programs read (see VideoCommon::KeyedAttributeTypes).
     void RefreshGraphicsKey();
