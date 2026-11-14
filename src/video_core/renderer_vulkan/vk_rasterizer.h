@@ -300,6 +300,12 @@ private:
     bool vertex_input_memo_valid{};
     u64 vertex_input_sent{};
     u64 vertex_input_repeats{};
+    /// FRITCHII_VERTEX_INPUT_COMPACT's counts for the "Vertex input compact" line.
+    u64 vertex_input_recorded{};
+    u64 vertex_input_bindings_described{};
+    u64 vertex_input_bindings_referenced{};
+    u64 vertex_input_attributes_described{};
+    u64 vertex_input_command_bytes{};
 
     /// Clears a 3D color target whose slices the framebuffer can't reach. Returns true when handled.
     bool ClearVolumeSlices(const Framebuffer* framebuffer, u32 first_slice, u32 slice_count);

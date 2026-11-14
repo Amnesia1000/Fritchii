@@ -1416,6 +1416,97 @@ from the file name) or helper (a GuestMemory helper that was not inlined: the ca
 level out). A read function the compiler inlined into its caller (ThinLTO can, across files)
 reports the caller's caller: read such a row as "a read somewhere under this call".
 
+### FRITCHII_VERTEX_INPUT_COMPACT
+
+FRITCHII_VERTEX_INPUT_COMPACT (live, default 0 = exactly as before; fable_perdraw_b 3.2).
+RasterizerVulkan::UpdateVertexInput sent all 32 vertex bindings, used or not, about 59,000 times
+a second (only about 1,500 of them equal to the one before, so EXP83's memo cannot help), in a
+command that captured two 32-entry arrays: about 2 KB of chunk space copied for every send, and
+a full 32 KB chunk (one worker dispatch) every 16 sends.
+- 1: only the bindings that an attribute in the list names are described, and the command keeps
+  12 bytes a binding or attribute in one of three size classes (up to 4 bindings and 8
+  attributes, up to 8 and 16, else 32 and 32); the worker builds the Vulkan structs. The
+  attribute list is the same as at 0: every non-constant location the registers define.
+- Why it is exact: vkCmdSetVertexInputEXT replaces the whole vertex input state. A draw reads
+  vertex data only through its shader's input locations; each location reads the binding its
+  attribute description names. Every location the registers define is described as before, and
+  so is the binding it names, with the same stride, input rate and divisor. A binding that no
+  attribute names has no effect on any draw: a buffer bound to it (vkCmdBindVertexBuffers2) is
+  ignored, and leaving it out also drops its stride and divisor checks (an unused stream's
+  divisor of 0, a big unused stride). The repack path (stride 72) only changes bindings that
+  attributes name; mesh emulation does not use this state.
+- A later pipeline and a left-out binding: the described set depends on the registers only,
+  not on the pipeline, so it cannot happen that a later pipeline reads a binding an earlier
+  compact command left out. A pipeline reads locations, every defined location is described
+  with its binding, and a register write that moves an attribute to another binding raises
+  VertexInput and sends the state again. That is also why the attribute list is not cut to the
+  locations the bound pipeline's vertex program reads: the state outlives that pipeline,
+  UpdateVertexInput returns at once when no input register changed whatever pipeline is bound,
+  and delta draws skip it, so such a cut would need a send whenever a pipeline reads a location
+  the last send left out.
+- EXP83's memo compares the lists that were built, so it works the same in both modes (a switch
+  flip mid-game just makes the next compare differ and sends).
+- "Vertex input compact (FRITCHII_VERTEX_INPUT_COMPACT=n) last 10 s: N recorded, bindings
+  described B a send (referenced R), attributes A a send, command C bytes a send (full F)"
+  (Render_Vulkan, Info, next to the EXP83 line). At 0 it says what 1 would save: "referenced"
+  is what 1 describes.
+- Expected: about half of the 24 ms/s UpdateVertexInput takes on the back, fewer chunk
+  dispatches (and worker wakes), and a cheaper SetVertexInputEXT on the worker. Picture check
+  across areas before it becomes a default (vertex layouts differ by scene).
+
+### FRITCHII_WORKER_SPIN
+
+FRITCHII_WORKER_SPIN (live, value = microseconds, default 0 = exactly as before; fable_perdraw_b
+3.6). Scheduler::DispatchWork wakes the Vulkan worker with condition_variable::notify_all when it
+sleeps, a system call: about 12 ms/s on the back, since the worker waits about half its time.
+- n > 0: with an empty queue the worker first spins outside the queue lock for up to n us,
+  watching dispatch_serial (raised under the lock with every push), before it waits as before.
+  While it spins worker_waiting stays false, so a dispatch skips the notify. Try 50 to 100.
+- Why no wakeup is lost: worker_waiting is set and read only under queue_mutex. After the spin
+  (work seen or time up) the worker takes the lock again and the condition wait tests the queue
+  under it before sleeping, so a chunk pushed during the spin is popped there. A chunk pushed
+  after that test finds worker_waiting true and notifies, which the waiter, registered before it
+  released the lock, receives. The spin only changes when the worker sleeps, never what it runs
+  or in which order. WaitWorker's waits are untouched (the worker still notifies on each pop),
+  and the spin holds no lock, so they are not held up by it.
+- Cost: worker CPU while it spins (the worker runs at critical priority on a performance core);
+  the process already uses about 7.5 CPUs, so judge it on a toggle with the 1% lows.
+- "Worker wake (FRITCHII_WORKER_SPIN=n) 10 s: dispatches D/s, notified N/s, skipped B/s busy +
+  S/s spinning; worker spins W/s, H/s found work, spinning M ms/s" (Render_Vulkan, Info; counted
+  in both modes, at 0 the spin numbers are 0). "busy" is the old skip (the worker was running a
+  chunk), "spinning" is the new one.
+- Expected: 6 to 11 ms/s on the back (most of the notifies), at the price of the worker's spin
+  time shown on the line.
+
+### FRITCHII_BIND_ADDR_MEMO
+
+FRITCHII_BIND_ADDR_MEMO (live, default 0 = exactly as before; fable_perdraw_b 3.7).
+GpuToCpuAddress costs the back about 30 ms/s, 16 of it in the vertex, index and uniform binds
+(UpdateVertexBuffer 8.4, BindGraphicsUniformBuffer 4.1, UpdateIndexBuffer 3.5), which translate
+the same few pages again and again.
+- 1: each vertex stream, the index buffer and each graphics uniform slot (stage, slot) keeps its
+  last translation: the manager (unique_identifier), the small GPU page (page_bits), its device
+  page and the manager's map_serial when it was looked up (Tegra::MemoryManager::
+  GpuToCpuAddressMemo). A hit needs all three equal and costs one load of map_serial. A disabled
+  vertex stream is not translated at all (it becomes a null binding whatever the translation
+  gives).
+- Why it is exact: a translation is a function of the address and this manager's page tables
+  only, and those change only in PageTableOp and BigPageTableOp (Map, MapSparse, Unmap and the
+  remaps through Map), which bump map_serial before their first table write and after their
+  last (MapChange). So an unmoved serial means the tables are the ones the remembered lookup
+  read. A lookup is kept only when no change was running when it started and none started
+  before it ended (BeginMapRead, MapReadStable, the sequence lock the EXP63 page cache uses), so
+  a half-written table is never remembered. Within a small page the translation is linear (both
+  tables map whole small pages), so base plus offset is what the walk returns. Another address
+  space (a channel switch) has another unique_identifier and misses. Unmapped results are not
+  kept. A change running at the moment of a hit is ordered after it, as for a walk that races it.
+- "Bind address memo (FRITCHII_BIND_ADDR_MEMO=n) 10 s: hits H/s, translations T/s (U/s not kept:
+  a map change overlapped), disabled vertex streams not translated D/s" (HW_GPU, Info; only
+  while the switch is on).
+- Expected: 8 to 12 ms/s on the back. The memos sit beside EXP18's uniform bind memo, which
+  skips the whole bind; this one only shortens the translation when EXP18's memo misses or is
+  off.
+
 ## Numbered experiments (EDEN_NX2_EXPn)
 
 Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP79, live through the debug server:

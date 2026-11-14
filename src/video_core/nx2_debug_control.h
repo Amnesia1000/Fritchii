@@ -174,6 +174,12 @@ inline std::atomic<int> g_pipeline_key_hash{-1};
 inline std::atomic<int> g_cb_words_block{-1};
 /// FRITCHII_BANK_CENSUS: docs/fritchii/switches.md.
 inline std::atomic<int> g_bank_census{-1};
+/// FRITCHII_VERTEX_INPUT_COMPACT: docs/fritchii/switches.md.
+inline std::atomic<int> g_vertex_input_compact{-1};
+/// FRITCHII_WORKER_SPIN: docs/fritchii/switches.md.
+inline std::atomic<int> g_worker_spin{-1};
+/// FRITCHII_BIND_ADDR_MEMO: docs/fritchii/switches.md.
+inline std::atomic<int> g_bind_addr_memo{-1};
 /// EDEN_NX2_LIGHT_TABLE_ARRAYS: docs/fritchii/switches.md.
 [[nodiscard]] inline bool LightTableArrays() {
     static const bool on = EnvSwitch("EDEN_NX2_LIGHT_TABLE_ARRAYS") > 0;
