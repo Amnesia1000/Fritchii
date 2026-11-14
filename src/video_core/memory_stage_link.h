@@ -192,6 +192,10 @@ public:
         /// the buffer half too: the entry ran as a level run, or the record is late and lent).
         void (*apply_pass)(void* context, const std::pair<u64, u64>* ranges, size_t count,
                            bool whole){};
+        /// GPUMem, P3's dry counters (fable_stage_p3 6): whether a query sync over these device
+        /// runs [begin, bytes) would be pure lookups (BufferCache::ProbeSyncTarget, under the
+        /// lock); the first failure, a P3Outcome (Passed when all are pure). Changes nothing.
+        u8 (*sync_probe)(void* context, const std::pair<u64, u64>* runs, size_t count){};
     };
     /// pass_gather's answer.
     enum class PassTake : u8 { Empty, Applied, GpuWritten, Recorded };
@@ -566,6 +570,37 @@ public:
     /// The back, at a passed gather's entry (RasterizerVulkan::InvalidateGPUCache): applies the
     /// half of the record of `position` the back owes, once.
     void BackApplyPasses(u64 position) noexcept;
+    /// fable_stage_p3 section 6, dry (decided and counted, behaving as today): would P3 pass the
+    /// entry, and if not the first reason, per kind.
+    enum class P3Outcome : u8 {
+        Passed,         ///< would pass (a sync point, a fence entry with pure targets)
+        PassedUnmapped, ///< a release to an unmapped address (the back's Query returns at once)
+        PassedNoFence,  ///< a release that is not fence-flagged (no fence, no cache)
+        NotLone,        ///< in a run, late, or not a lone method entry
+        Accurate,       ///< the fence behaviour is Accurate (a lookup may wait)
+        Trim,           ///< EXP28 & 1 (deferred payload syncs: the fence may not sync)
+        Tracking,       ///< read download tracking on
+        Flushes,        ///< uncommitted buffer flushes
+        ReportsUnknown, ///< reports GPUMem did not see may be pending (after a run, a hard entry)
+        TooManyRuns,    ///< the report pages make more than 8 runs
+        NoBuffer,       ///< a report page no buffer holds (the sync would create one)
+        NotInBounds,    ///< a run past the buffer on its first page
+        CpuModified,    ///< a report page with CPU-modified bytes (the sync would upload)
+        Count,
+    };
+    enum class P3Kind : u8 { Gather, WaitForIdle, Release, FenceReport, Count };
+    void NoteP3(P3Kind kind, P3Outcome what) noexcept {
+        BumpOne(pass_stats.p3[static_cast<size_t>(kind)][static_cast<size_t>(what)], 1);
+    }
+    /// P3 dry: the report pages of a sync point that reached the target test.
+    void NoteP3Pages(u64 pages) noexcept {
+        BumpOne(pass_stats.p3_sync_points, 1);
+        BumpOne(pass_stats.p3_pages, pages);
+        if (pages > pass_stats.p3_pages_max.load(std::memory_order_relaxed)) {
+            pass_stats.p3_pages_max.store(pages, std::memory_order_relaxed);
+        }
+    }
+
     /// The back, served: one of its own gathers taken on GPUMem (levelpoints 6.3), and whether it
     /// found writes.
     void NoteServedTake(bool found) noexcept {
@@ -1036,6 +1071,12 @@ private:
         std::atomic<u64> delay_ns{};
         std::atomic<u64> records{};
         std::atomic<u64> record_ranges{};
+        std::array<std::array<std::atomic<u64>, static_cast<size_t>(P3Outcome::Count)>,
+                   static_cast<size_t>(P3Kind::Count)>
+            p3{};
+        std::atomic<u64> p3_sync_points{};
+        std::atomic<u64> p3_pages{};
+        std::atomic<u64> p3_pages_max{};
         // The back's: its waits for the stage after a run's end, before its next packet.
         alignas(64) std::atomic<u64> idle_waits{};
         std::atomic<u64> idle_ns{};

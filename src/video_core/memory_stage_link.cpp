@@ -2333,6 +2333,35 @@ void MemoryStageLink::LogPasses(double seconds) {
         rate(take(stats.delay_runs)), ms(take(stats.delay_ns)), rate(take(stats.records)),
         rate(take(stats.record_ranges)), rate(take(stats.records_applied)),
         rate(takes_empty + takes_found), rate(takes_found));
+    // fable_stage_p3 6: P3's dry counters, per kind.
+    static constexpr std::array<const char*, static_cast<size_t>(P3Outcome::Count)> p3_names{
+        "pass",           "pass (unmapped)",   "pass (not a fence)", "not lone",
+        "Accurate",       "EXP28 trim",        "read tracking",      "flushes uncommitted",
+        "reports unknown", "too many runs",    "no buffer on a report page",
+        "run past the buffer", "CPU-modified report page"};
+    static constexpr std::array<const char*, static_cast<size_t>(P3Kind::Count)> p3_kinds{
+        "gathers", "waits for idle", "releases", "fence reports"};
+    std::string p3_text;
+    for (size_t k = 0; k < p3_kinds.size(); ++k) {
+        std::string text;
+        for (size_t i = 0; i < p3_names.size(); ++i) {
+            const u64 n = take(stats.p3[k][i]);
+            if (n != 0) {
+                text += fmt::format("{}{} {:.0f}", text.empty() ? "" : ", ", p3_names[i], rate(n));
+            }
+        }
+        p3_text += fmt::format("{}{}: {}", k == 0 ? "" : "; ", p3_kinds[k],
+                               text.empty() ? std::string{"none"} : text);
+    }
+    const u64 sync_points = take(stats.p3_sync_points);
+    const u64 pages = take(stats.p3_pages);
+    LOG_INFO(HW_GPU,
+             "Memory stage passes P3 (dry) {:.0f} s: per second {}; report pages per sync point at "
+             "the target test {:.2f} on average ({:.0f}/s), {} at most",
+             seconds, p3_text,
+             sync_points != 0 ? static_cast<double>(pages) / static_cast<double>(sync_points)
+                              : 0.0,
+             rate(sync_points), stats.p3_pages_max.exchange(0, std::memory_order_relaxed));
 }
 
 void MemoryStageLink::Take(Snapshot& out) const noexcept {

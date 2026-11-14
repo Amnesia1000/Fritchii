@@ -1317,6 +1317,27 @@ void RasterizerVulkan::SetRingBackend() {
         }
         self->ApplyGatherOtherHalf(span);
     };
+    backend.sync_probe = [](void* context, const std::pair<u64, u64>* runs, size_t count) -> u8 {
+        // fable_stage_p3 6 (dry, GPUMem outside any fill): the first run whose sync would not be
+        // a pure lookup, by cause.
+        auto& cache = static_cast<RasterizerVulkan*>(context)->buffer_cache;
+        using Probe = std::remove_cvref_t<decltype(cache)>::SyncProbe;
+        const Link::CleanPoint clean;
+        std::scoped_lock lock{cache.mutex};
+        for (size_t i = 0; i < count; ++i) {
+            switch (cache.ProbeSyncTarget(runs[i].first, runs[i].second)) {
+            case Probe::Pure:
+                break;
+            case Probe::NoBuffer:
+                return static_cast<u8>(Link::P3Outcome::NoBuffer);
+            case Probe::NotInBounds:
+                return static_cast<u8>(Link::P3Outcome::NotInBounds);
+            case Probe::CpuModified:
+                return static_cast<u8>(Link::P3Outcome::CpuModified);
+            }
+        }
+        return static_cast<u8>(Link::P3Outcome::Passed);
+    };
     Link::Get().SetRingBackend(backend);
 }
 

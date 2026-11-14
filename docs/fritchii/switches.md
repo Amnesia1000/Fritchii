@@ -1368,6 +1368,25 @@ judged by. Dry means decided and counted, the entries behave as before.
 - The back's waits for the stage between a run's end and its next packet (its true idle after a
   level point), count and ms a second.
 - The delay test FRITCHII_DELAY_RUN_US's spins.
+- Then pass records and their game write ranges a second, the records the back applied, and the
+  back's own gathers in served entries taken on GPUMem (FRITCHII_MEMSTAGE_PASS on).
+
+"Memory stage passes P3 (dry)" (fable_stage_p3 section 6, after the passes line): per kind
+(gathers, waits for idle, the puller's releases, 3D fence reports), whether P3 would pass it and
+otherwise the first reason, in this order: not lone (a run, late, not a lone method entry; a
+fence report inside a packet or batch); for a release, unmapped (passes: the back's Query returns
+at once) or not fence-flagged (passes: no fence, no cache; its page joins the mirror); EXP28 & 1
+(fence kinds: the fence may not sync); read tracking; flushes uncommitted; for a sync point with
+no report pending, pass (P1's); reports unknown (after a run's return or a hard or unfollowed
+entry); the fence behaviour Accurate; then the targets: the report pages GPUMem saw since the
+last sync point (and the entry's own) as maximal runs of adjacent 4 KiB device pages, more than 8
+runs, a run no existing buffer holds on its first page ("no buffer": the sync would create one;
+should fall to near 0 after the first seconds, else pages are being collected or re-made), a run
+past that buffer, a run with CPU-modified bytes (the sync would upload: the count that decides
+P3's worth). Then the report pages per sync point that reached the target test (average and
+maximum). The target test is BufferCache::ProbeSyncTarget under the cache's lock: it changes
+nothing (no usage mark in dry). P3's mirror is kept as P3 would keep it: an entry it would pass
+does not count as hard, and the run such an entry starts does not count as a run.
 
 ### FRITCHII_MEMSTAGE_FULL_BINDS
 
