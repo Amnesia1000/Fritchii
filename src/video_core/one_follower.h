@@ -149,6 +149,11 @@ enum class Check : u8 {
     // Ownership.
     OwnerOnE, ///< E used an R-owned object while R was neither parked nor drained
     OwnerOnR, ///< R used the buffer cache or an engine outside a lent packet
+    // Part c (vk_one_follower_draw.cpp), appended so the values above keep theirs.
+    BuildDrawParams,     ///< step 3: the draw's first, count, base and instances differ
+    BuildCondition,      ///< step 3: R's 0xe2c mode on its view differs from E's execute_on
+    RenderPacketMissing, ///< step 4: R found no ring B packet for an unlent draw (not drawn)
+    DropNotPlain,        ///< 0xe2c: a dropped draw's packet held more than uploads and binds
     Count,
 };
 
@@ -156,6 +161,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Check::Count)> chec
     "view words",    "view flags",       "view draw",         "view programs",
     "view pools",    "build pipeline",   "build image views", "build dynamic",
     "build descriptors", "build render targets", "stream write", "owner on E", "owner on R",
+    "build draw params", "build condition", "render packet missing", "drop not plain",
 };
 
 // --- The packet (E to R) -----------------------------------------------------------------------------
@@ -185,6 +191,10 @@ enum PacketFlag : u8 {
     /// The view is seeded from the engine in full before the spans (channel bind, step change,
     /// first packet): R copies regs and flags from E's engine while E is parked (lent only).
     PacketSeed = 2,
+    /// A draw under a 0xe2c condition E did not decide (section 5): R plays it only when its own
+    /// mode (DrawPlayer::Condition, at the condition's stream place) is not False; a dropped
+    /// draw's ring B packet is still played (its uploads and binds). Step 5 sets it; R honours it.
+    PacketConditional = 4,
 };
 
 /// One changed register word R watches.
@@ -349,5 +359,43 @@ void VerifyView(const RegisterView& view, const Maxwell3D& engine);
 /// then makes that write lent (Check::StreamWrite counted, LentReason::StreamWrite for the next
 /// draw).
 [[nodiscard]] bool StreamWriteHits(DAddr address, u64 size) noexcept;
+/// E, at a draw: true once after StreamWriteHits returned true (that draw is lent with
+/// LentReason::StreamWrite). Implemented beside StreamWriteHits.
+[[nodiscard]] bool TakeStreamWriteLend() noexcept;
+
+// --- R's draws (part c: renderer_vulkan/vk_one_follower_draw.cpp, one_follower_draw.cpp) ----------
+
+/// R's side of the packets: the Vulkan rasterizer registers one at boot (SetDrawPlayer).
+/// R's packet loop (part a) calls OnPacket for every packet after ApplySpans (a Lent packet before
+/// its call runs, with E parked), then PlayDraw for a PacketKind::Draw.
+class DrawPlayer {
+public:
+    /// Every packet: R's view engine takes the same spans; at a Lent packet (E parked) it also
+    /// takes what deltas do not carry (constant buffer bindings, the engine hint, the macro mode,
+    /// a new channel), and with PacketSeed everything.
+    virtual void OnPacket(const PacketHeader& header, const u8* spans) = 0;
+    /// PacketKind::Draw (step 4): records the draw from the packet and the view while E goes on.
+    virtual void PlayDraw(const PacketHeader& header) = 0;
+    /// R at a 0xe2c condition's stream place (E parked): R's mode on its view; from step 3 it is
+    /// compared with E's `execute_on` (Check::BuildCondition). PlayDraw drops PacketConditional
+    /// draws while it is False.
+    virtual void Condition(bool engine_execute_on) = 0;
+
+protected:
+    ~DrawPlayer() = default;
+};
+void SetDrawPlayer(DrawPlayer* player) noexcept;
+[[nodiscard]] DrawPlayer* GetDrawPlayer() noexcept;
+
+/// E (part a, ring B's owner of the hand-over): pushes a PacketKind::Draw packet whose header
+/// carries `draw_seq` (the seq E filled ring B's packet with), `buffer_number` (that packet's push
+/// index) and `flags` (PacketFlag), with the spans PackSpans gives; E goes on within
+/// FRITCHII_ONEF_AHEAD.
+void PushDraw(const Maxwell3D& engine, u64 draw_seq, u64 buffer_number, u8 flags);
+
+/// E, at the end of Maxwell3D::ProcessQueryCondition when the host did not take the condition:
+/// from step 3, R computes the mode on its view at this place (in the lent call when one is
+/// running, else in a lent one of its own) and compares (DrawPlayer::Condition).
+void NoteCondition(bool execute_on);
 
 } // namespace VideoCommon::OneFollower
