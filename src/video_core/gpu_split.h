@@ -234,6 +234,10 @@ public:
     [[nodiscard]] u64 EngineConsumedNow() const {
         return consumed.load(std::memory_order_acquire);
     }
+    /// What the front published (one follower's hang watchdog).
+    [[nodiscard]] u64 PublishedNow() const {
+        return published.load(std::memory_order_acquire);
+    }
     /// One follower: `played` grows to `position` (never shrinks), and the front is woken. E
     /// raises it with what it ran clamped to R's oldest unplayed packet; R raises it as it plays
     /// (OneFollower::EngineConsumed).

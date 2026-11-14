@@ -615,8 +615,11 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
                                                     &texture_cache.image_count_filter);
     // FRITCHII_MEMSTAGE_SHADOW: the watched pages of join 2 (image pages).
     VideoCommon::MemStageShadow::SetWatchFilter(&texture_cache.page_filter);
-    // One follower: the stream-write guard's pages (section 7).
+    // One follower: the stream-write guard's pages (section 7), and the locks its hang watchdog
+    // names the holders of.
     VideoCommon::OneFollower::SetTexturePages(&texture_cache.page_filter);
+    VideoCommon::OneFollower::WatchLock("buffer cache", &buffer_cache.mutex);
+    VideoCommon::OneFollower::WatchLock("texture cache", &texture_cache.mutex);
     buffer_cache.SetPendingCpuWrites(
         [this](const std::function<void(DAddr, size_t)>& callback) {
             gpu.ForEachPendingCpuWrite(callback);
