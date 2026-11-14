@@ -123,12 +123,15 @@ struct Impl {
     std::atomic<u32> lock_count{};
 
     std::atomic<Maxwell3D*> engine{};
+    std::atomic<bool> unlend_disabled{}; ///< DisableUnlend: step 4 off for the session
 };
 
 Impl g;
 
 using Detail::t_render;
 thread_local u32 t_lent_depth{};
+/// R: inside PlayDraw of an unlent draw packet.
+thread_local bool t_playing_draw{};
 /// E's packet scratch: header and spans before they go into the ring.
 thread_local std::vector<u8> t_scratch;
 /// E: the draw the next Lend or PackSpans is for (SetNextDraw), consumed by them.
@@ -171,7 +174,10 @@ void Refresh(u32 generation) {
     }
     u32 mask = 0;
     if (unlend != 0) {
-        if (level != StepLevel::Build) {
+        if (g.unlend_disabled.load(std::memory_order_relaxed)) {
+            refuse(g.logged_unlend, unlend, "FRITCHII_ONEF_UNLEND",
+                   "a session without an unlent draw R could not build (it was disabled)");
+        } else if (level != StepLevel::Build) {
             refuse(g.logged_unlend, unlend, "FRITCHII_ONEF_UNLEND", "FRITCHII_ONEF_BUILD=1");
         } else if (GetDrawPlayer() == nullptr) {
             refuse(g.logged_unlend, unlend, "FRITCHII_ONEF_UNLEND", "R's draw player (part c)");
@@ -383,6 +389,10 @@ Stats::RenderTime Play(const PacketHeader& header, const u8* spans) {
     }
     case PacketKind::Draw:
         if (DrawPlayer* const draws = GetDrawPlayer(); draws != nullptr) {
+            t_playing_draw = true;
+            SCOPE_EXIT {
+                t_playing_draw = false;
+            };
             draws->PlayDraw(header);
         } else {
             Note(Check::RenderPacketMissing, "a draw packet with no player");
@@ -646,6 +656,21 @@ bool OnRenderThread() noexcept {
 
 bool InLent() noexcept {
     return t_render && t_lent_depth != 0;
+}
+
+bool PlayingUnlentDraw() noexcept {
+    return t_playing_draw;
+}
+
+void DisableUnlend(const char* why) noexcept {
+    if (g.unlend_disabled.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    LOG_CRITICAL(HW_GPU,
+                 "One follower: step 4 stopped for this session ({}); FRITCHII_ONEF_UNLEND runs 0, "
+                 "every draw is lent again",
+                 why != nullptr ? why : "?");
+    g.seen_generation.store(~u32{0}, std::memory_order_release); // Refresh at the next Step()
 }
 
 void MarkEngineThread() noexcept {

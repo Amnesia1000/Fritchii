@@ -585,10 +585,13 @@ void BufferCacheRuntime::WaitSubmittedTick(u64 stamp, u64 writer) {
     if (clock.IsFree(stamp)) {
         return;
     }
-    if (VideoCommon::MemoryStageLink::InCall()) [[unlikely]] {
+    if (VideoCommon::MemoryStageLink::InCall() || MemStage::OneFollowerFill()) [[unlikely]] {
         // A sync the memory stage's thread must never reach (spec 5.7): the back serves it.
-        VideoCommon::MemoryStageLink::Note(VideoCommon::MemoryStageLink::Check::FrontWaitOnStage,
-                                           "WaitSubmittedTick");
+        // One follower: E's fill sends it to R the same way.
+        if (VideoCommon::MemoryStageLink::InCall()) {
+            VideoCommon::MemoryStageLink::Note(
+                VideoCommon::MemoryStageLink::Check::FrontWaitOnStage, "WaitSubmittedTick");
+        }
         MemStage::OnBack([&] { WaitSubmittedTick(stamp, writer); });
         return;
     }
@@ -646,9 +649,11 @@ void BufferCacheRuntime::WaitForHostRead(u64 stamp) {
     if (clock.IsFree(stamp)) {
         return;
     }
-    if (VideoCommon::MemoryStageLink::InCall()) [[unlikely]] {
-        VideoCommon::MemoryStageLink::Note(VideoCommon::MemoryStageLink::Check::FrontWaitOnStage,
-                                           "WaitForHostRead");
+    if (VideoCommon::MemoryStageLink::InCall() || MemStage::OneFollowerFill()) [[unlikely]] {
+        if (VideoCommon::MemoryStageLink::InCall()) {
+            VideoCommon::MemoryStageLink::Note(
+                VideoCommon::MemoryStageLink::Check::FrontWaitOnStage, "WaitForHostRead");
+        }
         MemStage::OnBack([&] { WaitForHostRead(stamp); });
         return;
     }

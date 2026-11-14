@@ -460,6 +460,13 @@ void SetEngine(Maxwell3D* engine) noexcept;
 /// R has not played; R raises `played` again after each packet it plays (step 4).
 void EngineConsumed(u64 position) noexcept;
 
+/// R: true while it plays an unlent draw packet (DrawPlayer::PlayDraw).
+[[nodiscard]] bool PlayingUnlentDraw() noexcept;
+/// Step 4's safety stop: an unlent draw R could not build (a descriptor count that does not match
+/// its pipeline). Logs once at Critical; FRITCHII_ONEF_UNLEND then runs 0 for the session (every
+/// draw lent again). Any thread.
+void DisableUnlend(const char* why) noexcept;
+
 /// Live switch values (refreshed with Step()).
 [[nodiscard]] u32 UnlendMask() noexcept;
 [[nodiscard]] int VerifyEvery() noexcept;
