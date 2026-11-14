@@ -806,6 +806,8 @@ public:
         /// collected or buffer cache write flag was taken (0: none yet), and that compare's reason.
         u8 census_flag = 0; ///< 1 collected CPU write, 2 buffer cache write
         u8 census_last_reason = 0;
+        /// FRITCHII_BANK_FLAGGED=2: visits left to watch a "missed" page for a late flag.
+        u8 missed_watch = 0;
         u64 census_ring_seq = 0;
         u64 census_flag_bind = 0;
     };
@@ -893,7 +895,11 @@ public:
         u64 flagged_hot_left = 0;
         u64 flagged_verified = 0;
         u64 flagged_missed = 0;
+        /// Of the missed pages, those a flag reached within their next 8 visits, and those none did.
+        u64 flagged_missed_then_flagged = 0;
+        u64 flagged_missed_never_flagged = 0;
         u64 flagged_disagreed = 0;
+        std::array<u64, BankReasons> flagged_disagreed_by{}; ///< by the reason the loop found
         u64 refreshed_pages = 0;
         u64 refreshed_changed = 0;
         std::chrono::steady_clock::time_point last_log{};
