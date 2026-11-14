@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstddef>
 #include <span>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -227,6 +228,11 @@ void StageTick();
 [[nodiscard]] std::vector<std::pair<u64, std::size_t>>& StageRanges();
 /// Sets the stage's draw count to `back_seq`; returns what it was.
 u64 StageDrawSeq(u64 back_seq);
+/// GPUMem, right after StageProcess returned a hard entry: its first hard kind (the key of the
+/// 5c "runs by first hard kind" line), and the key's name. For fable_stage_levelpoints 14.9's
+/// lend to return by kind (memory_stage_link.cpp, GPU profile on).
+[[nodiscard]] u64 StageEntryKey();
+[[nodiscard]] std::string StageKindName(u64 key);
 [[nodiscard]] u64 BackStateHash(const Tegra::Engines::Maxwell3D& maxwell3d);
 /// The registers that select the programs (the six pipeline slots, then the program region), as
 /// 8-byte words, and their hash: the facts table's key. The table compares the words on a key
