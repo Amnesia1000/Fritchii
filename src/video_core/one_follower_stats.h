@@ -75,7 +75,7 @@ struct Counters {
     std::atomic<u64> window_ns{};
     std::atomic<u64> stream_checked{};
 
-    // Any thread (lent and delta packets, drains): fetch_add.
+    // Lent and delta packets: E only (Pushed bumps them); drains: fetch_add.
     std::atomic<u64> lent_packets{};
     std::atomic<u64> delta_packets{};
     std::atomic<u64> other_bytes{};
@@ -156,10 +156,12 @@ inline void Pushed(const PacketHeader& header, u32 kind, u64 behind) noexcept {
         }
         return;
     }
-    Add(header.kind == PacketKind::Lent ? c.lent_packets : c.delta_packets);
-    Add(c.other_bytes, header.bytes);
-    Add(c.other_words, header.delta_count);
-    Add(c.behind_other[slot]);
+    // Pushed runs on E only (Lend and PushPacked, both behind t_engine): single-writer bumps,
+    // not locked adds, for these as for the draw counters (about 200,000 op packets a second).
+    Bump(header.kind == PacketKind::Lent ? c.lent_packets : c.delta_packets);
+    Bump(c.other_bytes, header.bytes);
+    Bump(c.other_words, header.delta_count);
+    Bump(c.behind_other[slot]);
     u64 seen = c.behind_max_other.load(std::memory_order_relaxed);
     while (behind > seen &&
            !c.behind_max_other.compare_exchange_weak(seen, behind, std::memory_order_relaxed)) {
@@ -169,11 +171,11 @@ inline void Pushed(const PacketHeader& header, u32 kind, u64 behind) noexcept {
     }
     const size_t op = (std::min)(static_cast<size_t>(header.op),
                                  static_cast<size_t>(LentOp::Count) - 1);
-    Add(c.lent_op[op]);
+    Bump(c.lent_op[op]);
     if (static_cast<LentOp>(op) == LentOp::Draw) {
-        Add(c.lent_reason[(std::min)(static_cast<size_t>(header.reason),
-                                     static_cast<size_t>(LentReason::Count) - 1)]);
-        Add(c.lent_kind[KindSlot(kind)]);
+        Bump(c.lent_reason[(std::min)(static_cast<size_t>(header.reason),
+                                      static_cast<size_t>(LentReason::Count) - 1)]);
+        Bump(c.lent_kind[KindSlot(kind)]);
     }
 }
 

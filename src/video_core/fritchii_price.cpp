@@ -55,6 +55,9 @@ void NoteUniformBind(u32 slot_key, u64 device_addr, u32 size, bool same, u64 ela
         verdict = Uniform::Moved;
     } else {
         verdict = slot.sum == sum && sum != ~u64{0} ? Uniform::Unflagged : Uniform::Flagged;
+        if (verdict == Uniform::Unflagged && t_uniform_cpu_modified) {
+            verdict = Uniform::UnflaggedCpuModified; // guest stores there raise no flag
+        }
     }
     slot = UniformSlot{device_addr, sum, size, true};
     g_uniform.Note(static_cast<size_t>(verdict), 1, elapsed);
@@ -169,9 +172,10 @@ u64 Delta(const Counter& counter, u64& last) {
 }
 
 constexpr std::array<const char*, static_cast<size_t>(Uniform::Count)> uniform_names{
-    "changed", "unchanged and unflagged since its last bind (the cut)",
+    "changed", "unchanged and unflagged since its last bind, pages tracked (the cut)",
     "unchanged but flagged", "unchanged, another range than its last bind",
-    "unchanged, bank marks off"};
+    "unchanged, bank marks off",
+    "unchanged and unflagged, pages CPU-modified (guest stores raise no flag: not the cut)"};
 constexpr std::array<const char*, static_cast<size_t>(Handles::Count)> handle_names{
     "unflagged since the pipeline's last draw (the cut)", "flagged",
     "another range or first draw", "bank marks off"};

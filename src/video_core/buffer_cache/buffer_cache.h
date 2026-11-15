@@ -2859,6 +2859,12 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         }
         channel_state->fast_bound_uniform_buffers[stage] |= 1u << binding_index;
         channel_state->uniform_buffer_binding_sizes[stage][binding_index] = size;
+        // fable_b 14.4 cut 7, dry (GPU profile on): the price verdict splits the unflagged binds
+        // by whether a guest store on their pages would trap and raise a flag at all.
+        if (FritchiiPrice::On()) [[unlikely]] {
+            FritchiiPrice::t_uniform_cpu_modified =
+                memory_tracker.IsRegionCpuModified(device_addr, size);
+        }
         // Stream buffer path to avoid stalling on non-Nvidia drivers or Vulkan
         bool streamed = false;
         if constexpr (!IS_OPENGL && VideoCommon::StreamUniformReusable<Runtime>) {

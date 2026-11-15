@@ -305,6 +305,12 @@ inline std::atomic<int> g_onef_unlent_values{-1};
 /// FRITCHII_ONEF_BIND_SEED (live, default 0): fable_b 19 step 2, the lent channel bind re-seeds
 /// R's view and E's tracking inside its own call (no lent draw after a bind).
 inline std::atomic<int> g_onef_bind_seed{-1};
+/// FRITCHII_ONEF_CARRY_OPS (live, default 0): fable_b 22.3 step 2, samples counter resets and
+/// reports ride in E's next packet instead of an op packet each.
+inline std::atomic<int> g_onef_carry_ops{-1};
+/// FRITCHII_ONEF_UNION_FILTER (live, default 0): fable_b 14.4 cut 5, E's invalidations test the
+/// union of R's page filters first.
+inline std::atomic<int> g_onef_union_filter{-1};
 /// EDEN_NX2_LIGHT_TABLE_ARRAYS: docs/fritchii/switches.md.
 [[nodiscard]] inline bool LightTableArrays() {
     static const bool on = EnvSwitch("EDEN_NX2_LIGHT_TABLE_ARRAYS") > 0;

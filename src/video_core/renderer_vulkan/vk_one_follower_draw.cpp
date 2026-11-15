@@ -558,7 +558,9 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
         return false;
     }
     OneF::PushDraw(engine, seq, buffer_number, push_flags, pipeline);
-    counts.pushed.fetch_add(1, std::memory_order_relaxed);
+    // E is its only writer: a relaxed load and store, no locked instruction per draw.
+    counts.pushed.store(counts.pushed.load(std::memory_order_relaxed) + 1,
+                        std::memory_order_relaxed);
     // PrepareDraw's tail, E's half (read-backs wait on E's work).
     rasterizer.gpu.TickWork();
     return true;
@@ -1122,7 +1124,9 @@ void OneFollowerDraw::PlayDraw(const PacketHeader& header) {
     } else {
         rasterizer.Draw(values.indexed != 0, values.instance_arg);
     }
-    counts.played.fetch_add(1, std::memory_order_relaxed);
+    // R is its only writer (as `pushed` on E).
+    counts.played.store(counts.played.load(std::memory_order_relaxed) + 1,
+                        std::memory_order_relaxed);
 }
 
 // --- R: rules 1 and 2 around lent calls (fable_b 10.2) ----------------------------------------------

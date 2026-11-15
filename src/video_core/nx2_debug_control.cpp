@@ -563,6 +563,12 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_ONEF_BIND_SEED") {
         return &g_onef_bind_seed;
     }
+    if (name == "FRITCHII_ONEF_CARRY_OPS") {
+        return &g_onef_carry_ops;
+    }
+    if (name == "FRITCHII_ONEF_UNION_FILTER") {
+        return &g_onef_union_filter;
+    }
     return nullptr;
 }
 

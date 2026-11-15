@@ -330,6 +330,11 @@ enum PacketFlag : u8 {
     /// packet's spans included; R may compare its view's values with E's engine before it takes
     /// the engine's (Check::ViewValues).
     PacketValues = 32,
+    /// FRITCHII_ONEF_CARRY_OPS (fable_b 22.3 step 2): the packet carries render ops E deferred
+    /// since the last packet (counter resets and sample reports, which read nothing of R's view).
+    /// They follow the packet's body: CarryRecord + payload each, then a CarryTrailer as the
+    /// packet's last 8 bytes. R runs them, in order, before anything else of the packet.
+    PacketCarried = 64,
 };
 
 /// One changed register word R watches.
@@ -660,8 +665,15 @@ void CountLentGatherRanges(u64 ranges) noexcept;
 /// `lands_in_memory`: the op writes game memory later on R (a report): the front's E-position
 /// waits (FRITCHII_ONEF_WAITS_E) also wait for R to play it (GuestWriteOpMark).
 /// `packet_flags`: PacketFlag bits for the op's header (PacketRenderState).
+/// `carry` (FRITCHII_ONEF_CARRY_OPS on, fable_b 22.3 step 2): an op that reads nothing of R's
+/// view (a samples counter reset or report) is not a packet of its own: E keeps it and the next
+/// packet it pushes carries it (PacketCarried), R running it first. E sends what it keeps before
+/// its `consumed` store (FlushCarried), so the front's waits on E's position stay exact.
 void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size,
-            bool lands_in_memory = false, u8 packet_flags = 0);
+            bool lands_in_memory = false, u8 packet_flags = 0, bool carry = false);
+/// E: sends the ops it keeps for the next packet (FRITCHII_ONEF_CARRY_OPS) as a packet of
+/// their own, now. GpuSplit::StoreConsumed calls it before E's `consumed` store; Drain too.
+void FlushCarried() noexcept;
 /// FRITCHII_ONEF_OP_CLEAR (live; fable_b 13.4 group 3; step 4, the view tracked): clears as render
 /// ops R plays from its view; E runs the clear's FlushCaching first.
 [[nodiscard]] bool PostClears() noexcept;

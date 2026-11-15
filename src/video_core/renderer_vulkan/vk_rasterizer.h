@@ -303,6 +303,10 @@ private:
     [[nodiscard]] bool OneFollowerRunaheadOff(const char* where);
     /// E: the pages of the report ops it pushed (FRITCHII_ONEF_QUERY_OPS), for item 2's test.
     std::unique_ptr<VideoCommon::PageFilter> onef_report_pages;
+    /// fable_b 14.4 cut 5: the union of the texture, shader, query and report page filters (each
+    /// marks it too, PageFilter::AlsoMark), so FRITCHII_ONEF_UNION_FILTER tests one filter per
+    /// range at E's invalidations and the four only on a hit.
+    VideoCommon::PageFilter onef_union_pages;
     /// E (FRITCHII_ONEF_INVAL_E): whether this invalidation runs on E (no range on R's pages).
     [[nodiscard]] bool OneFollowerInvalidationOnEngine(
         std::span<const std::pair<DAddr, std::size_t>> sequences);

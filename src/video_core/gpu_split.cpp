@@ -2633,6 +2633,11 @@ void GpuSplit::BackWaitForStage(std::stop_token& stop_token, u64 read_position) 
 }
 
 void GpuSplit::StoreConsumed(u64 position) {
+    if (OneFollower::OnEngineThread()) [[unlikely]] {
+        // FRITCHII_ONEF_CARRY_OPS: ops E kept for its next packet go now, before the front can
+        // see E past them (a kept report's GuestWriteOpMark and its packet's floor come first).
+        OneFollower::FlushCarried();
+    }
     consumed.store(position, std::memory_order_seq_cst);
     if (OneFollower::OnEngineThread()) [[unlikely]] {
         // `played`: this position clamped to R's oldest unplayed packet (RaisePlayed wakes the
