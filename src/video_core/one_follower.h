@@ -257,6 +257,10 @@ enum class Check : u8 {
     /// kind E sends lent (the R16 shadow), or wrote images E did not see in the program's info.
     /// Posting stops.
     PlayedDispatchImage,
+    /// FRITCHII_ONEF_OP_DISPATCH bit 4: a posted indirect dispatch's grid words (copied on the
+    /// GPU right before it, read once its submission is done) exceed the device's workgroup
+    /// count limit. Seen after the fact (the dispatch ran); posting stops.
+    IndirectGridOverLimit,
     Count,
 };
 
@@ -271,7 +275,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Check::Count)> chec
     "sync target missing", "sync target unused", "played dispatch", "played dispatch off view", "lookup programs",
     "lookup blend", "lookup vertex input",
     "semaphore order", "unlent reset", "view values", "bind seed view",
-    "played dispatch indirect", "played dispatch image",
+    "played dispatch indirect", "played dispatch image", "indirect grid over the limit",
 };
 
 // --- The packet (E to R) -----------------------------------------------------------------------------
@@ -727,12 +731,16 @@ enum class DispatchCount : u8 {
     ImageShadow,    ///< lent (bit 2 on): writes a byte-addressed image (the R16 shadow path)
     PostedImage,    ///< posted (bit 2): writes an image (EXP10: recorded unbounded on E)
     PostedIndirect, ///< posted (bit 4): indirect, its arguments' buffer obtained by E
+    /// lent indirect dispatch whose grid words exceeded the device limit (the dry compare of
+    /// IndirectGridOverLimit: the game's own, if not 0)
+    LentGridOverLimit,
     Count,
 };
 /// The kinds that count a posted dispatch a second time (not in the line's total).
 [[nodiscard]] constexpr bool DispatchCountIsExtra(DispatchCount kind) noexcept {
     return kind == DispatchCount::TailListCopies || kind == DispatchCount::TailProbes ||
-           kind == DispatchCount::PostedImage || kind == DispatchCount::PostedIndirect;
+           kind == DispatchCount::PostedImage || kind == DispatchCount::PostedIndirect ||
+           kind == DispatchCount::LentGridOverLimit;
 }
 /// FRITCHII_ONEF_OP_DISPATCH's bits (any non-zero value turns the switch on).
 enum DispatchPostBit : u32 {
@@ -749,6 +757,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(DispatchCount::Coun
         "lent: texel buffers", "lent: writes an image", "lent: upscaler", "lent: grid limit",
         "lent: fill refused", "posted + list copies lent", "posted + extent probes lent",
         "lent: byte-addressed image write", "posted writing images", "posted indirect",
+        "lent indirect grid over the limit (dry)",
 };
 /// E: the first reason a dispatch cannot be posted before its lookup, Count when it may be;
 /// DispatchCount::Posted (never returned) is not a reason. Returns Count too when the switch is

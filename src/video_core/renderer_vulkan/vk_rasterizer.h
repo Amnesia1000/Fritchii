@@ -318,6 +318,19 @@ private:
     Tegra::MemoryManager* onef_kepler_view_memory{};
     /// E: the handle values of the dispatch it fills.
     std::vector<u32> onef_dispatch_values;
+    /// R, FRITCHII_ONEF_OP_DISPATCH on: each indirect dispatch's three grid words, copied on the
+    /// GPU right before it into a download slot, checked against the device limit once its
+    /// submission is done (posted ones: IndirectGridOverLimit, must be 0; lent ones: the dry
+    /// compare). The words are GPU-written: the CPU cannot read them before the dispatch.
+    struct OneFollowerGridCheck {
+        StagingBufferRef ref;
+        u64 tick;
+        u64 shader;
+        bool posted;
+    };
+    std::vector<OneFollowerGridCheck> onef_grid_checks;
+    /// R: checks the copies whose submission is done; the others wait for a later call.
+    void OneFollowerCheckGrids();
     /// E (FRITCHII_ONEF_COPY_E): runs an inline upload here; false = lend it whole.
     [[nodiscard]] bool OneFollowerInlineOnEngine(GPUVAddr address, size_t copy_size,
                                                  std::span<const u8> memory);
