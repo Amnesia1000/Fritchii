@@ -116,6 +116,16 @@ std::atomic<bool> g_list_skip_stopped{};
 }
 
 void MaybeLogListWaits() {
+    // FRITCHII_STEP_LEAN=1 (F6): the clock is read on every 256th call only (one read per entry
+    // was 13.5 ms/s of the front, sampled). The rates do not change: each is a count over the
+    // clock time between two lines; a line comes at most 255 entries (a few ms) later.
+    if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_step_lean,
+                                         "FRITCHII_STEP_LEAN") == 1) {
+        static thread_local u32 calls{};
+        if ((++calls & 255) != 0) {
+            return;
+        }
+    }
     ListWaitStats& s = g_list_waits;
     const auto now = std::chrono::steady_clock::now();
     if (s.since.time_since_epoch().count() == 0) {
@@ -363,7 +373,82 @@ void NoteEngineWriter(VideoCommon::GpuSplit& split, const MemoryManager& memory_
     split.CountEngineWrite(multi, kind, Note::Ranged);
 }
 
+// FRITCHII_STEP_LEAN=1 (dma_pusher.h, CommandListRecycling): the slots the front gives a run
+// list's storage back through. State 0 empty, 1 busy (one thread moves vectors in or out), 2
+// full; each change of owner is a compare-exchange (acquire), each hand-back a release store.
+struct RecycledStorage {
+    std::atomic<u32> state{0};
+    boost::container::small_vector<CommandListHeader, 512> command_lists;
+    std::vector<CommandHeader, DefaultInitAllocator<CommandHeader>> submitted_words;
+    std::vector<u32> submitted_offsets;
+    std::vector<u32> deferred_entries;
+};
+constexpr size_t RecycleSlots = 8;
+constexpr size_t InlineListEntries = 512; // CommandList::command_lists' inline capacity
+constexpr size_t MaxRecycledWords = size_t{1} << 22; // 16 MiB of words: freed, not kept
+std::array<RecycledStorage, RecycleSlots> g_recycled;
+
 } // Anonymous namespace
+
+bool CommandListRecycling() noexcept {
+    return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_step_lean,
+                                            "FRITCHII_STEP_LEAN") == 1;
+}
+
+void GiveCommandListStorage(CommandList& list) noexcept {
+    const bool heap_entries = list.command_lists.capacity() > InlineListEntries;
+    if ((!heap_entries && list.submitted_words.capacity() == 0 &&
+         list.submitted_offsets.capacity() == 0) ||
+        list.submitted_words.capacity() > MaxRecycledWords) {
+        return; // nothing on the heap worth keeping (or too much): freed with the list
+    }
+    for (RecycledStorage& slot : g_recycled) {
+        u32 expected = 0;
+        if (slot.state.load(std::memory_order_relaxed) != 0 ||
+            !slot.state.compare_exchange_strong(expected, 1, std::memory_order_acquire)) {
+            continue;
+        }
+        if (heap_entries) {
+            slot.command_lists = std::move(list.command_lists);
+        }
+        slot.submitted_words = std::move(list.submitted_words);
+        slot.submitted_offsets = std::move(list.submitted_offsets);
+        slot.deferred_entries = std::move(list.deferred_entries);
+        slot.state.store(2, std::memory_order_release);
+        return;
+    }
+    // Every slot full: the submitter is behind on taking them; freed here as before.
+}
+
+void TakeCommandListStorage(CommandList& list) noexcept {
+    for (RecycledStorage& slot : g_recycled) {
+        u32 expected = 2;
+        if (slot.state.load(std::memory_order_relaxed) != 2 ||
+            !slot.state.compare_exchange_strong(expected, 1, std::memory_order_acquire)) {
+            continue;
+        }
+        if (slot.command_lists.capacity() > InlineListEntries) {
+            list.command_lists = std::move(slot.command_lists);
+        }
+        list.submitted_words = std::move(slot.submitted_words);
+        list.submitted_offsets = std::move(slot.submitted_offsets);
+        list.deferred_entries = std::move(slot.deferred_entries);
+        slot.state.store(0, std::memory_order_release);
+        // Emptied, capacity kept: the submit sizes and fills them as on new vectors.
+        list.command_lists.clear();
+        list.submitted_words.clear();
+        list.submitted_offsets.clear();
+        list.deferred_entries.clear();
+        return;
+    }
+}
+
+void DmaPusher::PopFrontList() {
+    if (CommandListRecycling()) [[unlikely]] {
+        GiveCommandListStorage(dma_pushbuffer.front());
+    }
+    dma_pushbuffer.pop_front();
+}
 
 // Declared in maxwell_3d.cpp for FrontDmaRead's log (not in a header).
 std::string FritchiiBlitMissText() {
@@ -555,7 +640,7 @@ bool DmaPusher::Step() {
     const size_t command_list_size = command_list.command_lists.size();
 
     if (prefetch_size == 0 && command_list_size == 0) {
-        dma_pushbuffer.pop_front();
+        PopFrontList();
         dma_pushbuffer_subindex = 0;
         return true;
     }
@@ -569,7 +654,7 @@ bool DmaPusher::Step() {
             return false;
         }
         command_resume_offset = 0;
-        dma_pushbuffer.pop_front();
+        PopFrontList();
         return true;
     }
 
@@ -906,7 +991,7 @@ bool DmaPusher::Step() {
             }
         }
         parked_methods.clear();
-        dma_pushbuffer.pop_front();
+        PopFrontList();
         dma_pushbuffer_subindex = 0;
     } else {
         signal_sync = command_list.command_lists[dma_pushbuffer_subindex].sync && Settings::values.sync_memory_operations.GetValue();

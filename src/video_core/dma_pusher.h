@@ -131,12 +131,29 @@ struct DefaultInitAllocator : std::allocator<T> {
     }
 };
 
+struct CommandList;
+/// FRITCHII_STEP_LEAN=1 (live, default 0; F6 of work\FRONT_SPLIT_DESIGN.md 2d): a command list's
+/// heap storage (its entries past the inline 512, its submitted words, offsets and deferred
+/// entries) was freed on the front when the list ran out and allocated again on the submitting
+/// thread. The front gives it back through a few lock-free slots (DmaPusher::PopFrontList) and
+/// the submit's list takes it (the constructor below): vectors emptied, capacity kept. A slot
+/// is owned by whoever moved its state (empty, busy, full) with a compare-exchange; storage
+/// that finds no free slot is freed as before. Off: one relaxed load per list on each side.
+[[nodiscard]] bool CommandListRecycling() noexcept;
+void GiveCommandListStorage(CommandList& list) noexcept;
+void TakeCommandListStorage(CommandList& list) noexcept;
+
 struct CommandList final {
     CommandList() = default;
     explicit CommandList(std::size_t size) : command_lists(size) {}
     /// The entries left uninitialized: the caller writes all of them (a submit's copy).
-    CommandList(std::size_t size, boost::container::default_init_t)
-        : command_lists(size, boost::container::default_init) {}
+    /// FRITCHII_STEP_LEAN=1: on storage a list that ran gave back (CommandListRecycling).
+    CommandList(std::size_t size, boost::container::default_init_t) {
+        if (CommandListRecycling()) [[unlikely]] {
+            TakeCommandListStorage(*this);
+        }
+        command_lists.resize(size, boost::container::default_init);
+    }
     explicit CommandList(boost::container::small_vector<CommandHeader, 512>&& prefetch_command_list_)
         : prefetch_command_list{std::move(prefetch_command_list_)} {}
 
@@ -219,6 +236,8 @@ private:
     static constexpr u32 non_puller_methods = 0x40;
     static constexpr u32 max_subchannels = 8;
     bool Step();
+    /// Pops the list that ran out (FRITCHII_STEP_LEAN=1: its storage goes back to the submitter).
+    void PopFrontList();
     /// Returns how many words were processed: fewer than given when a semaphore acquire
     /// suspended the channel.
     size_t ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset = 0);

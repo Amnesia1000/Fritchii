@@ -2177,6 +2177,15 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   answered, why the others walked, walk notes the answered checks skip, the timed summary and
   walk ns and the saving in ms/s, the differences. Also in the "Front split dry" line. Off: one
   relaxed load per check, one plain load per note.
+- FRITCHII_STEP_LEAN (live, default 0; F6 of work/FRONT_SPLIT_DESIGN.md 2d): 1 = the list writer
+  waits line (MaybeLogListWaits) reads the clock on every 256th call instead of every list
+  entry (its rates are counts over the clock time between lines: unchanged, a line comes at
+  most 255 entries later), and a command list that ran out gives its heap storage (entries past
+  the inline 512, submitted words, offsets, deferred entries) back to the submitter through 8
+  lock-free slots instead of freeing it on the front; the submit's CommandList takes it
+  (emptied, capacity kept). Storage finding no free slot is freed as before; over 16 MiB of
+  words is never kept. Off: one relaxed load per list entry check and per list popped, one call
+  and a relaxed load per list submitted.
 - FRITCHII_ONEF_NULL_FILL (live, default 0; test only, the picture breaks): 1 = E skips
   FlushCaching, FillRing and PushDraw for every draw it would fill (no packet, R draws nothing;
   TickWork as after a push). The front-wall probe of work/FRONT_SPLIT_DESIGN.md 4.3. Line every
