@@ -1,55 +1,62 @@
-# Helper G status (JIT dense code, branch jit-layout), paused for account switch
+# Helper G status (JIT dense code, branch jit-layout): done, compile clean, not built or run
 
-## Done
-- Worktree E:/lichii-jitlayout on branch jit-layout from 7c2ab4b124.
-- Read Fable A sections 1, 2, 4.1 and the JIT code (a64_emit_x64.cpp, emit_x64.cpp,
-  block_of_code.*, a64_interface.cpp, the A64 translator's terminals, the fastmem patch code).
-- block_of_code.h: far-region API declared (EnableFarCode, Switch{To}Far/NearCode,
-  GetFarCodeCurr, SmallestRegionSize, members). No definitions yet, nothing calls them.
-  Default behaviour unchanged.
+## Commits
+- 82f4ad46ab WIP: far-region API declared (previous account)
+- 138c11fc44 FRITCHII_JIT_FAR_CODE: far region in BlockOfCode + deferred emits there
+- 6c43ea650c FRITCHII_JIT_DUMP (pcs as image-base offsets) + hot list takes offsets
+- 1e14a27e16 FRITCHII_JIT_CHAIN (bits 1/2/4, CHAIN_DEPTH)
+- b97ae9ff54 FAR_CODE logs near/far fill at each full cache clear
+- bc9508386d merge oot-gather-fix (helper H's pins + FLAG_BRANCH)
+- (last) docs/fritchii/switches.md entries + this file
 
-## Not started / half done
-1. block_of_code.cpp: define the far API. ClearCache resets both regions. SpaceRemaining =
-   min(near, far) when far is on. EnsureMemoryCommitted must commit the two regions separately
-   (factor the retry loop into CommitPrefix(base, committed, needed, limit); with far off it must
-   stay the same logic). EnableWriting/DisableWriting (NO_EXECUTE builds) also protect the far range.
-2. FRITCHII_JIT_FAR_CODE=1: in A64EmitX64's constructor, before PreludeComplete, call
-   code.EnableFarCode(total * 3 / 8) when the cache is 64 MiB or more. In Emit: no int3 after the
-   terminal, SwitchToFarCode, run the deferred emits, int3, SwitchToNearCode, then RegisterBlock.
-   PrecompileBlock's 256 MiB check should become SmallestRegionSize()/2 when far is on.
-   Checked: every hot-to-deferred jump already uses T_NEAR. Jumps back from deferred code go to
-   labels that are already defined. Fastmem patch info takes rips in any order, and the exception
-   handler covers the whole code space.
-3. FRITCHII_JIT_DUMP (1 = flush every 4096 blocks, 2 = flush only at cache clear and shutdown),
-   FRITCHII_JIT_DUMP_CORE (default 0), FRITCHII_JIT_DUMP_FILE (default jit-dump-core{N}.bin in
-   cwd; the tests should set it under work\measure), FRITCHII_JIT_DUMP_LIST (hex pc per line).
-   Planned format: 32-byte header "FJITDMP1", version, core, code base, code size. Then 56-byte
-   records: kind (1 block, 2 prelude), flags, descriptor, guest pc, near addr, far addr, guest
-   count, near size, far size, reserved. After each record: guest words, near bytes, far bytes.
-   Host bytes are read at flush time, so links show patched. Flush before ClearCache and in the
-   destructor.
-4. FRITCHII_JIT_CHAIN bits: 1 = chain the fall-through successor (needs FAR_CODE, implies 4),
-   2 = halt check only on backward links, 4 = compact link slots. Depth: FRITCHII_JIT_CHAIN_DEPTH,
-   default 4.
-   - Compact slot = 5-byte jmp. When unlinked it jumps to a far stub per target that sets pc and
-     goes to the dispatcher. A checked link becomes `cmp halt,0; jne halt_stub(target); slot`.
-     When the target sits right behind the slot, the patch writes nop5 (fall through).
-     Create both stubs before AddPatchLocation.
-   - Chain: in far mode Emit records the last slot. a64_interface GetBlock then translates and
-     emits the successor at that exact pointer (no align, only if getCurr matches and the code is
-     readable), up to the depth limit. If/CheckBit swap their leaves so the pc+4 leaf comes last
-     (inverted cond = cond ^ 1). Run() must skip its +15 & ~15 rounding when chaining is on.
-   - Bit 2: direct links keep or gain the check only when target.PC <= block start PC. That
-     includes adding it to backward LinkBlockFast (B, BL), which today has no check. Indirect
-     terminals (FastDispatchHint, PopRSBHint) gain `cmp halt; jne ForceReturn` (pc is already
-     stored). Proof: between checks, the path only takes forward edges, so block start pcs
-     strictly increase and the path is bounded by the number of compiled blocks. Off with cycle
-     counting.
+## Switches (all boot env, default 0 = old code)
+- FRITCHII_JIT_FAR_CODE=1: last 3/8 of the 512 MiB cache = far region for deferred emits.
+  Xbyak's maxSize_ is the near region's end while near code is emitted (overflow throws like the
+  end of the space); SetCodePtr picks the limit by the new position's region, so patches work
+  anywhere. Windows commits each region separately (CommitPrefix). No int3 after the terminal.
+- FRITCHII_JIT_CHAIN bits: 4 compact links (needs FAR_CODE), 2 halt check only on backward links
+  (+ indirect branches/returns gain one), 1 chain successors (needs FAR_CODE, implies 4).
+  FRITCHII_JIT_CHAIN_DEPTH (default 4). Off with cycle counting.
+- FRITCHII_JIT_DUMP=1/2, FRITCHII_JIT_DUMP_CORE (0, -1 all), FRITCHII_JIT_DUMP_FILE,
+  FRITCHII_JIT_DUMP_LIST. Header carries the image base, records the abs pc and pc - base.
+- FRITCHII_JIT_HOT_LIST: pcs below the image base are offsets (+ this launch's base); "{core}" in
+  the path; FRITCHII_JIT_HOT_LIST_ORDER=1 keeps file order.
+- Image base: UserConfig::image_base = KProcess::GetEntryPoint() (rtld's load address; main is
+  +0x20000 in OoT), set in ArmDynarmic64::MakeJit (interfaces are made after Initialize).
 
-## Open questions
-- Chaining compiles code before it runs. Guest code written without IC maintenance would go
-  stale (UB on hardware). Translating data after a function's end could hit translator asserts.
-  Worth a check.
-- Bit 2: halts raised inside a block (unmapped-access PrefetchAbort without the debugger) stop a
-  few forward blocks later. Memory aborts with the debugger stay immediate (EmitCheckMemoryAbort).
-- Far split 5/8 near, 3/8 far is a guess, check fill with a counter.
+## Merge with helper H (pins, FLAG_BRANCH)
+- Emit sets terminal_nzcv_in_host_flags / terminal_check_bit_in_host_zf around EmitTerminal, then
+  runs the far deferred emits. Chain swaps in If/CheckBit use EmitCondFromHostFlags / skip the cmp
+  the same way. All CHAIN halt checks sit inside leaves, after the condition jump.
+- Pin call hook stays on during far deferred emits (set once in the ctor). Stubs jump to the
+  dispatcher / force return, which handle the pins.
+
+## Compile-checked (check_compile.py, all OK after the merge)
+block_of_code.cpp, a64_emit_x64.cpp, a64_interface.cpp, a32_interface.cpp, emit_x64.cpp,
+arm_dynarmic_64.cpp (physical_core.cpp before the merge).
+
+## Test order
+1. FRITCHII_JIT_DUMP=2 with nothing else (cheap, default code): check the file parses, offsets
+   match work\fable_a_gc\hotlist-300-rel.txt. Then DUMP=2 + FAR_CODE=1 to see the far bytes.
+2. FRITCHII_JIT_FAR_CODE=1 alone: boot, market, fps vs off (fresh-launch A/B, boot switch);
+   watch for crashes in slow paths (NaN/fallback code) and the fill line at clears.
+3. FAR_CODE=1 + CHAIN=4 (compact links): exactness first (boot, play a minute), then fps.
+4. + CHAIN=6 (backward halt checks): check pausing, interrupts, loading screens, shutdown still
+   respond (halts must still land).
+5. + CHAIN=7 (chaining), depth 4; then depth 0/8 if it helps.
+6. Hot pack with the per-core rel lists: FRITCHII_JIT_HOT_LIST=...\hotlist-300-core{core}-rel.txt,
+   FRITCHII_JIT_HOT_LIST_ORDER=1 (optional; Fable expects 0 to 1%).
+
+## Open risks
+- Far code: a forward Xbyak label from far code to a label defined later in near code would
+  throw (rewrite past maxSize_). Checked none exist (deferred code only jumps back to defined
+  labels); a new deferred emit doing that would abort at emit with a clear message.
+- Short forward jumps over leaves (If/CheckBit) are the same kinds as before; a leaf over 127
+  bytes would throw at emit (true before too).
+- CHAIN=2: a halt raised inside a block (unmapped access without the debugger) stops a few
+  forward blocks later. Memory aborts with the debugger stay immediate.
+- CHAIN=1 compiles code before it runs: guest code changed without cache maintenance would be
+  stale (UB on hardware too). Only readable successors are chained.
+- Far split 5/8 : 3/8 is a guess; read the fill line.
+- Dump mode 1 writes host bytes early (links shown as of then); mode 2 holds records in memory
+  until a clear or shutdown.
