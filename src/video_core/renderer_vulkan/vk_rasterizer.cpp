@@ -4827,6 +4827,17 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                              VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) {
     if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
         namespace OneF = VideoCommon::OneFollower;
+        // FRITCHII_ONEF_DRY_RELEASE (fable_b 19.5 step 3): E passes this release.
+        if (OneF::DryReleaseOn()) [[unlikely]] {
+            if (const std::optional<DAddr> device = gpu_memory->GpuToCpuAddress(gpu_addr)) {
+                OneF::DryNotePass(
+                    *device,
+                    type != VideoCommon::QueryType::Payload ? OneF::DryKind::CounterReport
+                    : True(flags & VideoCommon::QueryPropertiesFlags::IsAFence)
+                        ? OneF::DryKind::PayloadFence
+                        : OneF::DryKind::PayloadRelease);
+            }
+        }
         // FRITCHII_ONEF_POST_FENCE: what this report owes the next fence. Samples reports made
         // with the mirror started and payload releases sync into buffers E obtains for a posted
         // fence (16.2); any other kind is owed (the fence is lent). Every report's page waits for

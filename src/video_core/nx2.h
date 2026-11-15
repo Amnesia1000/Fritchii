@@ -623,6 +623,7 @@ public:
     void OnWrite(u64 device_address, u32 value) {
         // (Common::Nx2GpuWrite::Notify, for Ocarina of Time's present poll, and Nx2NoteLanded
         // are called by each write site itself.)
+        VideoCommon::OneFollower::NoteSemaphoreWrite(device_address);
         if (count.load(std::memory_order_acquire) == 0) {
             return;
         }

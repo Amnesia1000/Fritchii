@@ -1029,6 +1029,18 @@ void QmdPredictionMetBy(DmaPusher& dma_pusher, const QmdPredictionCheck& check,
         met_by = release->writer == Prediction::Writer::Qmd ? MetBy::QmdRelease : MetBy::DmaRelease;
     }
     Prediction::NoteMetBy(met_by);
+    if (met_by == MetBy::Other) {
+        // fable_b 19.4: of these, the releases recorded for the word that meet it, by kind.
+        auto& split = VideoCommon::GpuSplit::Get();
+        u64 position = 0;
+        if (const auto payload = split.NewestReleaseTo(check.device, position);
+            payload && acquire.Matches(*payload)) {
+            Prediction::NoteMetBy(split.RecordedReleaseKind(check.device) ==
+                                          VideoCommon::GpuSplit::ReleaseKind::Puller
+                                      ? MetBy::OtherPullerRelease
+                                      : MetBy::OtherPayloadRelease);
+        }
+    }
     if (before_check && met_by != MetBy::Other) {
         Prediction::NoteMetBy(MetBy::BeforeCheck);
     }
@@ -1202,6 +1214,9 @@ private:
 void NoteBackSequence(Puller::PendingAcquire& acquire) {
     if (VideoCommon::QmdPrediction::Enabled()) {
         acquire.back_sequence = VideoCommon::QmdPrediction::BackSequence();
+    }
+    if (VideoCommon::OneFollower::g_dry_release.load(std::memory_order_relaxed)) [[unlikely]] {
+        acquire.dry_stall = VideoCommon::OneFollower::DryStallNow();
     }
 }
 
@@ -1911,6 +1926,7 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
             stats.lagged_checks += repeat ? 0 : 1;
             split.Publish();
             const auto wait_begin = std::chrono::steady_clock::now();
+            const VideoCommon::OneFollower::DryStallScope dry_stall;
             if (split.WaitUntil(pending_acquire->lagged_target,
                                 VideoCommon::DrainSite::LaggedCheck)) {
                 ++stats.lagged_waits;
@@ -2126,6 +2142,20 @@ bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
             VideoCommon::FritchiiPrice::NoteFrontWait(VideoCommon::FritchiiPrice::AcquireSite,
                                                       pending_acquire->price_target,
                                                       pending_acquire->price_start);
+        }
+        // FRITCHII_ONEF_DRY_RELEASE (fable_b 19.5 step 3): the release that met it, E's pass
+        // against its write, and the front's stall between.
+        if (VideoCommon::OneFollower::g_dry_release.load(std::memory_order_relaxed))
+            [[unlikely]] {
+            if (const auto device =
+                    dma_pusher.memory_manager.GpuToCpuAddress(pending_acquire->address)) {
+                VideoCommon::OneFollower::DryNoteResume(
+                    *device,
+                    static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         pending_acquire->since.time_since_epoch())
+                                         .count()),
+                    pending_acquire->dry_stall);
+            }
         }
         // FRITCHII_ACQUIRE_MET_BY (live, default 0: one load here): "Acquire resumes met by".
         if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_acquire_met_by,

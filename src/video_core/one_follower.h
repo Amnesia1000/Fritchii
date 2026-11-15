@@ -598,6 +598,8 @@ void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size,
 [[nodiscard]] bool PostFenceOn() noexcept;
 /// FRITCHII_ONEF_LOOKUP_CHECK: whether this unlent draw's lookup is checked (every Nth).
 [[nodiscard]] bool LookupCheckDue() noexcept;
+/// FRITCHII_ONEF_DRY_RELEASE: on (refreshes g_dry_release). E.
+[[nodiscard]] bool DryReleaseOn() noexcept;
 /// Stops FRITCHII_ONEF_POST_FENCE for the session (a must-be-0 of its own fired).
 void StopPostFence(const char* why) noexcept;
 /// E: the packet number of the packet it pushed last.

@@ -104,6 +104,8 @@ public:
         /// split of the wait (FritchiiPrice::NoteFrontWait).
         u64 price_target{};
         u64 price_start{};
+        /// FRITCHII_ONEF_DRY_RELEASE: the front's stalled time at the suspension.
+        u64 dry_stall{};
 
         [[nodiscard]] bool Matches(u32 current) const;
     };

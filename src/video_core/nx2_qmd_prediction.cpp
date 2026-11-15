@@ -617,7 +617,8 @@ struct State {
                  "ran ({:.0f} landed pending, {:.0f} really wrong), {:.0f} no prediction, {:.0f} "
                  "newest release a puller or report one; met after fences by: {:.0f} QMD "
                  "release, {:.0f} QMD reduction, {:.0f} copy semaphore, {:.0f} other writer "
-                 "({:.0f} of the met by a release run before the check), {:.0f} still unmet; "
+                 "({:.0f} puller payload releases, {:.0f} other payload releases; {:.0f} of the "
+                 "met by a release run before the check), {:.0f} still unmet; "
                  "QMD copy: QMD reads/s "
                  "{:.0f} from inline QMDs, {:.0f} from memory, {:.0f} after a wait; {:.0f} "
                  "inline QMDs patched by uploads/s; {:.0f} reads/s from upload shadows ({:.0f} "
@@ -637,7 +638,8 @@ struct State {
                  covered(Coverage::LandedPending), covered(Coverage::ReallyWrong),
                  covered(Coverage::None), covered(Coverage::OtherRelease),
                  met(MetBy::QmdRelease), met(MetBy::QmdReduction), met(MetBy::DmaRelease),
-                 met(MetBy::Other), met(MetBy::BeforeCheck), met(MetBy::Unmet),
+                 met(MetBy::Other), met(MetBy::OtherPullerRelease),
+                 met(MetBy::OtherPayloadRelease), met(MetBy::BeforeCheck), met(MetBy::Unmet),
                  mirrored(Mirror::Overlay), mirrored(Mirror::Memory), mirrored(Mirror::Waited),
                  mirrored(Mirror::Patched), mirrored(Mirror::Shadow),
                  mirrored(Mirror::ShadowCreated), mirrored(Mirror::ShadowEvicted),

@@ -1459,6 +1459,16 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   clear) are computed fresh from E's registers and compared: must-be-0 "lookup flags", the note
   naming the parts. The engine's flags are left as they were, except that a differing program
   refresh leaves Shaders raised so the next lookup takes the right key.
+- FRITCHII_ONEF_DRY_RELEASE (live, default 0; fable_b 19.5 step 3's price, counting only): E
+  stamps each release it passes (payload Query, fence-flagged payload, counter report, QMD
+  reduction or max callback) by its word; every GPU semaphore write stamps when it ran; the
+  front's pending sleeps and lagged check waits add up its stalled time. At each resumed
+  acquire the release that met it after the suspension gives "E ahead of the write" (the time
+  from E's pass, or the suspension, to the write) and the front's stalled time in it: the line
+  "One follower dry release price" every 5 s, by kind, with the sum as the price of running
+  those releases at E's place. Racy per word (a newer pass overwrites an older unwritten one).
+  The QMD prediction line's "other writer" count also splits off the resumes met by the
+  release recorded for the word: puller payload releases and other payload releases.
 - FRITCHII_ONEF_OP_CLEAR (live, default 0; fable_b_one_follower 13.4 group 3; step 4, view
   tracked): 1 = clears are render ops. E has decided the render enable (DrawManager tests
   ShouldExecute) and runs the clear's FlushCaching; R plays Clear from its view (every clear

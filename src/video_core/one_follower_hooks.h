@@ -46,6 +46,51 @@ inline void NoteLatch() noexcept {
         1, std::memory_order_relaxed);
 }
 
+/// fable_b 19.5 step 3's dry price (FRITCHII_ONEF_DRY_RELEASE, live, default 0; E keeps this
+/// current at its reports): for each resumed acquire, the release that met it as E passed it
+/// and as it was written, and the front's stalled time between the two.
+inline std::atomic<bool> g_dry_release{};
+/// The kind of release E passed.
+enum class DryKind : u8 {
+    PayloadRelease, ///< a payload Query, not fence-flagged (puller, 3D, compute, copy)
+    PayloadFence,   ///< a fence-flagged payload Query (QMD release, puller, Ampere)
+    CounterReport,  ///< a samples or other counter report
+    QmdReduction,   ///< a QMD release with a reduction (a SignalFence callback)
+    QmdMax,         ///< a QMD max release (a SignalFence callback)
+    Count,
+};
+/// E: it passes a release to the u32 at `device`.
+void DryNotePass(u64 device, DryKind kind) noexcept;
+/// Any thread, at a GPU write of a semaphore word (Nx2SemaphoreWaiters::OnWrite).
+void DryNoteRun(u64 device) noexcept;
+inline void NoteSemaphoreWrite(u64 device) noexcept {
+    if (g_dry_release.load(std::memory_order_relaxed)) [[unlikely]] {
+        DryNoteRun(device);
+    }
+}
+/// The front: the time it was stalled so far (pending sleeps, lagged check waits), ns.
+[[nodiscard]] u64 DryStallNow() noexcept;
+/// The front: a stall (a pending sleep, a lagged check's wait) begins or ends.
+void DryFrontStall(bool begin) noexcept;
+struct DryStallScope {
+    bool on = g_dry_release.load(std::memory_order_relaxed);
+    DryStallScope() {
+        if (on) [[unlikely]] {
+            DryFrontStall(true);
+        }
+    }
+    ~DryStallScope() {
+        if (on) [[unlikely]] {
+            DryFrontStall(false);
+        }
+    }
+    DryStallScope(const DryStallScope&) = delete;
+    DryStallScope& operator=(const DryStallScope&) = delete;
+};
+/// The front, at a suspended acquire's resume: `since_ns` the suspension (steady clock ns),
+/// `stall_at_since` DryStallNow then.
+void DryNoteResume(u64 device, u64 since_ns, u64 stall_at_since) noexcept;
+
 /// Owner asserts (section 5), for the caches' entry points: one thread-local load when off.
 void CheckRenderOwned(const char* where) noexcept;
 void CheckEngineOwned(const char* where) noexcept;

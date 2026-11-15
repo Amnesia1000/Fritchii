@@ -1126,6 +1126,18 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                         split.RecordDispatchWrite(*device, 16);
                     }
                 }
+                // FRITCHII_ONEF_DRY_RELEASE (fable_b 19.5 step 3): E passes a callback release.
+                if ((flags & (1U << 26)) != 0 || (!four_words && (flags & (1U << 19)) != 0)) {
+                    if (VideoCommon::OneFollower::g_dry_release.load(std::memory_order_relaxed) &&
+                        VideoCommon::OneFollower::Detail::t_engine) [[unlikely]] {
+                        if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+                            VideoCommon::OneFollower::DryNotePass(
+                                *device, (flags & (1U << 26)) != 0
+                                             ? VideoCommon::OneFollower::DryKind::QmdReduction
+                                             : VideoCommon::OneFollower::DryKind::QmdMax);
+                        }
+                    }
+                }
                 if (flags & (1U << 26)) {
                     rasterizer->SignalFence([this, address, payload, flags] {
                         const u32 value = ReduceSemaphore((flags >> 20) & 7, (flags >> 24) & 1,

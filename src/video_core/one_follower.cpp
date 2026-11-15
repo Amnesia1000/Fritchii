@@ -1574,6 +1574,153 @@ bool LookupCheckDue() noexcept {
     return g.on && every > 0 && ++g.lookup_checks % static_cast<u64>(every) == 0;
 }
 
+namespace {
+/// fable_b 19.5 step 3's dry price: a release per slot (by its word), as E passed it and as
+/// some thread wrote it. Racy by design (a counter): E stamps the pass, the writer the run, the
+/// front reads both at a resume.
+struct DrySlot {
+    std::atomic<u64> device{~u64{0}};
+    std::atomic<u64> pass_ns{};
+    std::atomic<u64> pass_stall{};
+    std::atomic<u64> run_ns{};
+    std::atomic<u64> run_stall{};
+    std::atomic<u8> kind{};
+};
+constexpr size_t DrySlots = 4096;
+std::array<DrySlot, DrySlots> g_dry_slots{};
+std::atomic<u64> g_dry_stall_total{};
+std::atomic<u64> g_dry_stall_since{};
+DrySlot& DrySlotFor(u64 device) {
+    return g_dry_slots[(device >> 2) % DrySlots];
+}
+/// The front's window (front thread only).
+struct DryWindow {
+    u64 since_ns{};
+    u64 last_ns{};
+    std::array<u64, static_cast<size_t>(DryKind::Count)> count{};
+    std::array<u64, static_cast<size_t>(DryKind::Count)> wall_ns{};
+    std::array<u64, static_cast<size_t>(DryKind::Count)> stalled_ns{};
+    u64 resumes{};
+    u64 not_passed{}; ///< no release E passed for the word
+    u64 not_run{};    ///< E passed one, not written yet (met another way)
+    u64 before{};     ///< written before the suspension
+};
+DryWindow g_dry_window{};
+} // Anonymous namespace
+
+bool DryReleaseOn() noexcept {
+    const bool on = g.on && VideoCore::Nx2Debug::SwitchValue(
+                                VideoCore::Nx2Debug::g_onef_dry_release,
+                                "FRITCHII_ONEF_DRY_RELEASE") != 0;
+    if (g_dry_release.load(std::memory_order_relaxed) != on) {
+        g_dry_release.store(on, std::memory_order_relaxed);
+    }
+    return on;
+}
+
+void DryNotePass(u64 device, DryKind kind) noexcept {
+    DrySlot& slot = DrySlotFor(device);
+    slot.run_ns.store(0, std::memory_order_relaxed);
+    slot.kind.store(static_cast<u8>(kind), std::memory_order_relaxed);
+    slot.pass_stall.store(DryStallNow(), std::memory_order_relaxed);
+    slot.pass_ns.store(Common::Nx2Hitch::NowNs(), std::memory_order_relaxed);
+    slot.device.store(device, std::memory_order_release);
+}
+
+void DryNoteRun(u64 device) noexcept {
+    DrySlot& slot = DrySlotFor(device);
+    if (slot.device.load(std::memory_order_acquire) != device ||
+        slot.run_ns.load(std::memory_order_relaxed) != 0) {
+        return;
+    }
+    slot.run_stall.store(DryStallNow(), std::memory_order_relaxed);
+    slot.run_ns.store(Common::Nx2Hitch::NowNs(), std::memory_order_release);
+}
+
+u64 DryStallNow() noexcept {
+    const u64 since = g_dry_stall_since.load(std::memory_order_acquire);
+    const u64 total = g_dry_stall_total.load(std::memory_order_acquire);
+    return since == 0 ? total : total + (Common::Nx2Hitch::NowNs() - since);
+}
+
+void DryFrontStall(bool begin) noexcept {
+    const u64 now = Common::Nx2Hitch::NowNs();
+    if (begin) {
+        g_dry_stall_since.store(now, std::memory_order_release);
+        return;
+    }
+    const u64 since = g_dry_stall_since.exchange(0, std::memory_order_acq_rel);
+    if (since != 0) {
+        g_dry_stall_total.fetch_add(now - since, std::memory_order_acq_rel);
+    }
+}
+
+void DryNoteResume(u64 device, u64 since_ns, u64 stall_at_since) noexcept {
+    auto& w = g_dry_window;
+    const u64 now = Common::Nx2Hitch::NowNs();
+    if (w.since_ns != 0 && now - w.last_ns > 5'000'000'000ULL) {
+        w = {}; // the switch was off, or nothing resumed: start over
+    }
+    if (w.since_ns == 0) {
+        w.since_ns = now;
+    }
+    w.last_ns = now;
+    ++w.resumes;
+    DrySlot& slot = DrySlotFor(device);
+    const u64 run_ns = slot.run_ns.load(std::memory_order_acquire);
+    if (slot.device.load(std::memory_order_acquire) != device) {
+        ++w.not_passed;
+    } else if (run_ns == 0) {
+        ++w.not_run;
+    } else if (run_ns < since_ns) {
+        ++w.before;
+    } else {
+        const size_t kind = (std::min)(static_cast<size_t>(slot.kind.load(std::memory_order_relaxed)),
+                                       static_cast<size_t>(DryKind::Count) - 1);
+        const u64 pass_ns = (std::max)(slot.pass_ns.load(std::memory_order_relaxed), since_ns);
+        const u64 pass_stall =
+            (std::max)(slot.pass_stall.load(std::memory_order_relaxed), stall_at_since);
+        const u64 run_stall = slot.run_stall.load(std::memory_order_relaxed);
+        ++w.count[kind];
+        w.wall_ns[kind] += run_ns > pass_ns ? run_ns - pass_ns : 0;
+        w.stalled_ns[kind] += run_stall > pass_stall ? run_stall - pass_stall : 0;
+    }
+    const double window = static_cast<double>(now - w.since_ns) / 1e9;
+    if (window < 5.0) {
+        return;
+    }
+    static constexpr std::array<const char*, static_cast<size_t>(DryKind::Count)> names{
+        "payload release", "fence-flagged payload", "counter report", "QMD reduction",
+        "QMD max"};
+    std::string kinds;
+    double stalled_all = 0;
+    for (size_t k = 0; k < names.size(); ++k) {
+        if (w.count[k] == 0) {
+            continue;
+        }
+        const double stalled = static_cast<double>(w.stalled_ns[k]) / 1e6 / window;
+        stalled_all += stalled;
+        kinds += fmt::format("{}{} {:.0f}/s (E ahead of the write {:.1f} ms/s, the front "
+                             "stalled in it {:.1f} ms/s)",
+                             kinds.empty() ? "" : "; ", names[k],
+                             static_cast<double>(w.count[k]) / window,
+                             static_cast<double>(w.wall_ns[k]) / 1e6 / window, stalled);
+    }
+    LOG_INFO(HW_GPU,
+             "One follower dry release price (fable_b 19.5 step 3): {:.0f} resumed acquires/s; "
+             "met after the suspension by a release E passed: {}; price (front stalled while "
+             "E was past the release and it was not written) {:.1f} ms/s; no release E passed "
+             "{:.0f}/s, passed but not written {:.0f}/s, written before the suspension "
+             "{:.0f}/s",
+             static_cast<double>(w.resumes) / window, kinds.empty() ? "none" : kinds,
+             stalled_all, static_cast<double>(w.not_passed) / window,
+             static_cast<double>(w.not_run) / window, static_cast<double>(w.before) / window);
+    const u64 last = w.last_ns;
+    w = {};
+    w.since_ns = now;
+    w.last_ns = last;
+}
+
 void StopPostFence(const char* why) noexcept {
     if (!g.post_fence_stopped.exchange(true, std::memory_order_relaxed)) {
         LOG_CRITICAL(HW_GPU, "One follower: FRITCHII_ONEF_POST_FENCE stops for this session ({})",
