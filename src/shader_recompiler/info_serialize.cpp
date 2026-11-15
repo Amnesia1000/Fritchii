@@ -15,10 +15,10 @@ namespace {
 // Bump Magic in vk_precompiled_kept.cpp when this layout changes.
 #if defined(_MSC_VER) && defined(_WIN64)
 // 7016 = 6960 + 12 inline TextureDescriptors x 4 (is_descriptor_array) + 8 for
-// binds_unmapped_pointer_word. Neither it nor TextureDescriptor's
-// handle_is_pointer_word is stored: both are only set with EDEN_NX2_LIGHT_TABLE_ARRAYS (off), and
-// The original's cached-record drop that reads the first is not ported. Store both (and bump Magic)
-// before that switch goes on.
+// binds_unmapped_pointer_word. TextureDescriptor's is_descriptor_array and handle_is_pointer_word
+// (only set with EDEN_NX2_LIGHT_TABLE_ARRAYS) are stored in is_depth's byte (VisitTexture).
+// binds_unmapped_pointer_word is not stored: only the original's cached-record drop reads it,
+// which is not ported.
 static_assert(sizeof(Info) == 7016,
               "Shader::Info changed: list the new fields in VisitInfo, then update this size");
 // The descriptors are held in vectors, so a field they grow does not change sizeof(Info).
@@ -222,7 +222,22 @@ void VisitImageBuffer(Io& io, D& d) {
 template <typename Io, typename D>
 void VisitTexture(Io& io, D& d) {
     io(d.type);
-    io(d.is_depth);
+    // is_depth in bit 0, and EDEN_NX2_LIGHT_TABLE_ARRAYS's two flags above it: bit 1
+    // handle_is_pointer_word (read at every bind: HandleIsStoragePointer binds no texture for
+    // such a word), bit 2 is_descriptor_array. Both are false with the switch off, so the byte,
+    // and every kept file written before, is what it was (no new Magic).
+    if constexpr (std::is_const_v<D>) {
+        const u8 packed = static_cast<u8>((d.is_depth ? 1U : 0U) |
+                                          (d.handle_is_pointer_word ? 2U : 0U) |
+                                          (d.is_descriptor_array ? 4U : 0U));
+        io(packed);
+    } else {
+        u8 packed{};
+        io(packed);
+        d.is_depth = (packed & 1U) != 0;
+        d.handle_is_pointer_word = (packed & 2U) != 0;
+        d.is_descriptor_array = (packed & 4U) != 0;
+    }
     io(d.is_multisample);
     io(d.is_integer);
     io(d.has_secondary);
@@ -235,10 +250,6 @@ void VisitTexture(Io& io, D& d) {
     io(d.count);
     io(d.size_shift);
     io(d.handle_program);
-    // Not d.is_descriptor_array (EDEN_NX2_LIGHT_TABLE_ARRAYS): only the
-    // texture pass and the array limits read it, while translating. Left out, the layout (and
-    // Magic) stays what it was, and a kept info reads back with it false, which nothing after
-    // translation looks at.
 }
 template <typename Io, typename D>
 void VisitImage(Io& io, D& d) {
