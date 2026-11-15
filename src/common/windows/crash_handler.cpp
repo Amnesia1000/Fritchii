@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
+#include <exception>
 
 #include <windows.h>
 
@@ -178,12 +179,38 @@ LONG WINAPI OnFirstChance(EXCEPTION_POINTERS* pointers) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
     const CodeAddress at = Locate(record.ExceptionAddress);
+    // A C++ throw (MSVC x64): name its types, and what() for a std::exception.
+    char types[256] = "";
+    const char* what = "";
+    if (record.ExceptionCode == 0xE06D7363 && record.NumberParameters >= 4 &&
+        record.ExceptionInformation[2] != 0) {
+        const auto base = static_cast<uintptr_t>(record.ExceptionInformation[3]);
+        const auto* throw_info = reinterpret_cast<const int*>(record.ExceptionInformation[2]);
+        const auto* type_array = reinterpret_cast<const int*>(base + unsigned(throw_info[3]));
+        std::size_t used = 0;
+        for (int i = 0; i < type_array[0] && i < 8; ++i) {
+            const auto* catchable = reinterpret_cast<const int*>(base + unsigned(type_array[1 + i]));
+            // CatchableType: properties, pType, PMD {mdisp, pdisp, vdisp}, size, copy.
+            const char* name =
+                reinterpret_cast<const char*>(base + unsigned(catchable[1])) + 2 * sizeof(void*);
+            const int written = std::snprintf(types + used, sizeof(types) - used, "%s%s",
+                                              i == 0 ? "" : " ", name);
+            if (written < 0 || used + static_cast<std::size_t>(written) >= sizeof(types)) {
+                break;
+            }
+            used += static_cast<std::size_t>(written);
+            if (std::strcmp(name, ".?AVexception@std@@") == 0 && catchable[3] == -1) {
+                const auto object = static_cast<uintptr_t>(record.ExceptionInformation[1]);
+                what = reinterpret_cast<const std::exception*>(object + unsigned(catchable[2]))->what();
+            }
+        }
+    }
     LOG_CRASH("First-chance exception (FRITCHII_CRASH_FIRST_CHANCE) {:#010x} at {}+{:#x} on thread "
-              "{}, info {:#x} {:#x}, rsp {:#x}",
+              "{}, info {:#x} {:#x}, rsp {:#x}; C++ types: {}; what: {}",
               record.ExceptionCode, at.module, at.offset, GetCurrentThreadId(),
               record.NumberParameters > 0 ? record.ExceptionInformation[0] : 0,
               record.NumberParameters > 1 ? record.ExceptionInformation[1] : 0,
-              pointers->ContextRecord->Rsp);
+              pointers->ContextRecord->Rsp, types, what);
     return EXCEPTION_CONTINUE_SEARCH;
 }
 

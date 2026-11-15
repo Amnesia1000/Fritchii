@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <exception>
 #include <cstdlib>
 #include <fmt/format.h>
 #include <fmt/ostream.h>
@@ -150,7 +151,9 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
 
 A64EmitX64::~A64EmitX64() = default;
 
-A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) noexcept {
+// Fritchii: a throw here (an Xbyak error) used to end the process without a word: it is called
+// from generated code (the dispatcher's block lookup), whose frames the unwinder cannot cross.
+A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) noexcept try {
     if (conf.very_verbose_debugging_output) [[unlikely]] {
         std::puts(IR::DumpBlock(block).c_str());
     }
@@ -250,6 +253,12 @@ finish_this_inst:
     code.DisableWriting();
     shared_labels.clear();
     return bdesc;
+} catch (const std::exception& error) {
+    ::Common::Log::FmtCrashMessage(__FILE__, __LINE__, __func__,
+                                   "JIT emit of block {:#x} (core {}) threw: {}; indirect sites {}",
+                                   A64::LocationDescriptor{block.Location()}.PC(), conf.processor_id,
+                                   error.what(), indirect_slots_used);
+    std::abort();
 }
 
 void A64EmitX64::ClearCache() {
