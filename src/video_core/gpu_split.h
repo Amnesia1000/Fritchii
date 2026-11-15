@@ -1157,9 +1157,15 @@ public:
     /// [begin, begin + size), or more were noted since than are remembered.
     /// FRITCHII_NOTED_SUMMARY (live, default 0; F4 of work\FRONT_SPLIT_DESIGN.md 2d): the page
     /// buckets answer first (NotedWriteSinceSummary). Off: one relaxed load and a branch.
+    /// FRITCHII_NOTED_FAST (live, default 0): the note chains answer instead of the walk
+    /// (NotedWriteSinceFast). Off: one relaxed load and a branch.
     [[nodiscard]] bool NotedWriteSince(u64 since, u64 begin, u64 size) const {
         if (last_memory_writer_position <= since) {
             return false;
+        }
+        if (VideoCore::Nx2Debug::g_noted_fast.load(std::memory_order_relaxed) != 0)
+            [[unlikely]] {
+            return NotedWriteSinceFast(since, begin, size);
         }
         if (VideoCore::Nx2Debug::g_noted_summary.load(std::memory_order_relaxed) != 0)
             [[unlikely]] {
@@ -1323,6 +1329,9 @@ public:
         write.end = size == ~u64{0} ? ~u64{0} : begin + size;
         write.position = write_position;
         write.words = 0;
+        if (noted_fast.live) [[unlikely]] {
+            LinkNotedFast(pending_write_count - 1); // FRITCHII_NOTED_FAST: one plain load off
+        }
     }
     /// As NoteMemoryWrite, for a write whose words the front knows (a fence release payload,
     /// linear inline upload data): reads overlay them instead of waiting.
@@ -1343,6 +1352,9 @@ public:
             write.position = write_position;
             write.words = count;
             std::memcpy(write.data.data(), data, count * sizeof(u32));
+            if (noted_fast.live) [[unlikely]] {
+                LinkNotedFast(pending_write_count - 1); // FRITCHII_NOTED_FAST
+            }
             begin += u64{count} * sizeof(u32);
             data += count;
             words -= count;
@@ -1892,7 +1904,8 @@ private:
         const char* what;
         std::array<u32, PendingWriteWords> data;
     };
-    std::array<PendingWrite, 8192> pending_writes{};
+    static constexpr size_t PendingWriteSlots = 8192;
+    std::array<PendingWrite, PendingWriteSlots> pending_writes{};
     u64 pending_write_count{};
     /// FRITCHII_NOTED_SUMMARY (F4, front only): the newest note position per page bucket (4,096
     /// buckets by page hash), and one for notes over more than 16 pages or of unknown range.
@@ -1920,6 +1933,63 @@ private:
     /// NotedWriteSince with the switch on (any value): modes 1, 2 and 3.
     [[nodiscard]] bool NotedWriteSinceSummary(u64 since, u64 begin, u64 size) const;
     void LogNotedSummary(int mode) const;
+    /// FRITCHII_NOTED_FAST (front only): every note in pending_writes sits in one chain, newest
+    /// first: the chain of its page bucket (4,096 by page hash) when it lies inside one page,
+    /// else the wide chain (more than one page, or an unknown range). `heads` and `wide_head`
+    /// hold the newest note's number + 1 (pending_write_count when it was made; 0: none),
+    /// `links` (per table slot) the previous note of the same chain, number + 1. Notes are
+    /// linked only while `live`; `floor` is the note number when it went live (older notes are
+    /// in no chain). Mutable: the const query turns it on and counts.
+    struct NotedFastStats {
+        u64 checks{};
+        u64 answered{};       ///< answered without the walk (modes 2 and 3: would be)
+        u64 answered_yes{};   ///< of them, a write since (overlap, or the table's overflow)
+        u64 overflow_yes{};   ///< of those, the table's overflow (no chain looked at)
+        u64 floor{};          ///< walked: the walk would reach a note older than the chains
+        u64 long_reads{};     ///< walked: a read over 16 pages (or wrapping)
+        u64 touched{};        ///< chain notes looked at on answered checks
+        u64 walk_notes{};     ///< walk notes on answered checks whose walk ran too
+        u64 walk_checks{};    ///< answered checks whose walk ran too
+        u64 timed{};          ///< 1 in 64 checks: both timed
+        u64 fast_ticks{};     ///< the chain answer (or its refusal) on timed checks
+        u64 walk_ticks{};     ///< the walk on timed answered checks
+        u64 differ{};         ///< the chains and the walk disagree (must be 0)
+        u64 linked{};         ///< notes linked
+        u64 linked_wide{};    ///< of them, into the wide chain
+        u64 linked_unknown{}; ///< of those, of unknown range
+        u64 linked_covered{}; ///< notes linked past their chain's head (it covers the head)
+    };
+    static constexpr size_t NotedChains = 4096;
+    struct NotedFastKind {
+        const char* what;
+        u64 count;
+    };
+    struct NotedFast {
+        bool live{};
+        u32 calls{};
+        u64 floor{};
+        u64 wide_head{};
+        u64 window_ns{};
+        u64 window_ticks{};
+        NotedFastStats stats{};
+        NotedFastStats logged{};
+        std::array<NotedFastKind, 8> wide_kinds{}; ///< the wide notes by `what`, this window
+        std::array<u64, NotedChains> heads{};
+        std::array<u64, PendingWriteSlots> links{};
+    };
+    mutable NotedFast noted_fast;
+    /// The note path's half (front, while live): links note number `seq` into its chain.
+    void LinkNotedFast(u64 seq);
+    /// NotedWriteSince with FRITCHII_NOTED_FAST set: modes 1, 2 and 3 (else the summary or the
+    /// walk, as with it at 0).
+    [[nodiscard]] bool NotedWriteSinceFast(u64 since, u64 begin, u64 size) const;
+    enum class NotedFastAnswer : u8 { No, Yes, Overflow, Floor, Long };
+    /// The chains' answer for NotedWriteSince: No / Yes / Overflow (exactly the walk's
+    /// None / Overlap / Overflow mapped to a bool), or Floor / Long (not answered: walk).
+    /// `touched`: the chain notes looked at.
+    [[nodiscard]] NotedFastAnswer NotedFastLookup(u64 since, u64 begin, u64 size,
+                                                  u64& touched) const;
+    void LogNotedFast(int mode) const;
     /// Compute and copy writes with a known device range (NoteWriterRange), newest last.
     struct WriterRange {
         u64 position;

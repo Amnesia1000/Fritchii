@@ -489,6 +489,7 @@ void GpuSplit::Stop() {
     unranged_without_exp120 = 0;
     pending_write_count = 0;
     noted_summary.live = false; // FRITCHII_NOTED_SUMMARY: positions start again at 0
+    noted_fast.live = false;    // FRITCHII_NOTED_FAST: note numbers too
     writer_range_count = 0;
     last_unbounded_writer_position = 0;
     writer_range_memory = nullptr;
@@ -1969,6 +1970,299 @@ void GpuSplit::LogNotedSummary(int mode) const {
     sum.logged = s;
     sum.window_ns = now;
     sum.window_ticks = ticks;
+}
+
+// FRITCHII_NOTED_FAST (live, default 0): NotedWalk was the front's biggest self-time item at the
+// Kakariko spot (7.4% of the GPU thread, ~74 ms/s; ~37 ms/s at the market). Every check walks
+// pending_writes (72-byte slots) from the newest note down to `since`, and a page snapshot's
+// `since` can be old, so walks of thousands of notes (or all 8,192: the table's overflow) are
+// common. FRITCHII_NOTED_SUMMARY answered none: a single "wide" position for every note over 16
+// pages or of unknown range was always newer than the read.
+//
+// The chains: every note is linked, newest first, into one chain: its page bucket's when it lies
+// inside one page, else the wide chain. A check looks only at the chains that can hold an
+// overlapping note: the wide chain and the buckets of the read's pages (at most 16), each down
+// to `since`. The table's overflow is one compare (the oldest remembered note).
+//
+// Exact (the answer equals the walk's, None against Overlap / Overflow, both ways):
+// - Positions never fall along the table (each note takes the write position, which only grows
+//   in a session; the reset turns the chains off), so the notes the walk looks at are the
+//   remembered notes with position > since, a run at the newest end of the table: S.
+// - Table full and its oldest note's position > since: S is the whole table, the walk returns
+//   Overlap or Overflow, both "write". The lookup answers Overflow ("write") without a chain.
+// - Else the walk returns None exactly when no note of S overlaps the read (it reaches a note at
+//   or before `since` before it runs out of table), and Overlap when one does.
+// - Every note of S was linked: notes before `floor` (made before the chains went live) are in no
+//   chain, so when the newest of them is still remembered and after `since` the check walks
+//   (Floor). From `floor` on every note was linked: `live` stays set, a note made while it was
+//   off would have been followed by a new floor.
+// - A chain runs newest first with positions not rising, so following it from its head until a
+//   note at or before `since`, or a link to a note the table forgot (number < the oldest
+//   remembered), visits every member that is in S. A link always names the chain's previous
+//   note, linked while live, so its slot holds that note while it is remembered.
+// - A chain passes over a note when a newer note of it covers its bytes (begin and end within
+//   the newer one's): every read the walk's test finds overlapping the older note overlaps the
+//   newer one too (nb <= cb < end and begin < ce <= ne), and the newer one is in S whenever the
+//   older one is (newer, so remembered, and its position is not lower). The newest of such a
+//   cover sequence is visited.
+// - A note of S that overlaps the read shares a byte with it (an empty note at b: the walk's
+//   test needs begin < b < end, so b is a byte of the read), so a note inside one page sits in
+//   the bucket of one of the read's pages. Every other note is in the wide chain. The lookup
+//   uses the walk's own overlap test on every note it visits. Collisions only add notes to look
+//   at. Reads over 16 pages or wrapping walk (Long).
+//
+// 1 = on (answered checks skip the walk; 1 in 64 checks walk anyway, timed and compared),
+// 2 = verify (the walk runs after every check and answers; differences counted, must be 0, first
+// 16 logged), 3 = dry (as 2, read for the counts and the timed saving). Line every 10 s.
+void GpuSplit::LinkNotedFast(u64 seq) {
+    auto& fast = noted_fast;
+    if (VideoCore::Nx2Debug::g_noted_fast.load(std::memory_order_relaxed) <= 0) {
+        fast.live = false; // Switched off: the next turn-on starts a new floor.
+        return;
+    }
+    const size_t slot = static_cast<size_t>(seq % PendingWriteSlots);
+    const PendingWrite& write = pending_writes[slot];
+    ++fast.stats.linked;
+    u64* head = nullptr;
+    if (write.end == write.begin ||
+        (write.end > write.begin && (write.begin >> 12) == ((write.end - 1) >> 12))) {
+        head = &fast.heads[NotedBucket(write.begin >> 12)];
+    } else {
+        head = &fast.wide_head;
+        ++fast.stats.linked_wide;
+        if (write.end == ~u64{0}) {
+            ++fast.stats.linked_unknown;
+        }
+        // Which writers send them, for the log line (first 8 kinds of the window).
+        for (auto& kind : fast.wide_kinds) {
+            if (kind.what == write.what || kind.what == nullptr) {
+                kind.what = write.what;
+                ++kind.count;
+                break;
+            }
+        }
+    }
+    // A head this note covers (its bytes within this note's) is passed over: every read that
+    // overlaps it overlaps this note, which is newer (in every walk the head is in). Repeated
+    // notes over the same bytes (a report slot each frame, unknown ranges, an upload noted again
+    // by each of its words) keep their chain one note long.
+    u64 link = *head;
+    if (link != 0 && link + PendingWriteSlots > seq + 1) { // the head is still remembered
+        const size_t head_slot = static_cast<size_t>((link - 1) % PendingWriteSlots);
+        const PendingWrite& covered = pending_writes[head_slot];
+        if (write.begin <= covered.begin && covered.end <= write.end) {
+            link = fast.links[head_slot];
+            ++fast.stats.linked_covered;
+        }
+    }
+    fast.links[slot] = link;
+    *head = seq + 1;
+}
+
+GpuSplit::NotedFastAnswer GpuSplit::NotedFastLookup(u64 since, u64 begin, u64 size,
+                                                    u64& touched) const {
+    const auto& fast = noted_fast;
+    const u64 count = pending_write_count;
+    const u64 remembered = (std::min<u64>)(count, PendingWriteSlots);
+    const u64 oldest = count - remembered; // the oldest remembered note's number
+    if (remembered == PendingWriteSlots &&
+        pending_writes[static_cast<size_t>(oldest % PendingWriteSlots)].position > since) {
+        return NotedFastAnswer::Overflow;
+    }
+    if (fast.floor > oldest &&
+        pending_writes[static_cast<size_t>((fast.floor - 1) % PendingWriteSlots)].position >
+            since) {
+        return NotedFastAnswer::Floor;
+    }
+    const u64 end = begin + size;
+    if (end < begin) {
+        return NotedFastAnswer::Long;
+    }
+    const u64 first = begin >> 12;
+    const u64 last = (begin + (std::max<u64>)(size, 1) - 1) >> 12;
+    if (last - first >= NotedMaxPages) {
+        return NotedFastAnswer::Long;
+    }
+    // True when a note of the chain from `link` after `since` overlaps the read (the walk's test).
+    const auto overlaps = [&](u64 link) {
+        while (link > oldest) {
+            const PendingWrite& write =
+                pending_writes[static_cast<size_t>((link - 1) % PendingWriteSlots)];
+            if (write.position <= since) {
+                return false;
+            }
+            ++touched;
+            if (write.begin < end && begin < write.end) {
+                return true;
+            }
+            link = fast.links[static_cast<size_t>((link - 1) % PendingWriteSlots)];
+        }
+        return false;
+    };
+    if (overlaps(fast.wide_head)) {
+        return NotedFastAnswer::Yes;
+    }
+    for (u64 page = first; page <= last; ++page) {
+        if (overlaps(fast.heads[NotedBucket(page)])) {
+            return NotedFastAnswer::Yes;
+        }
+    }
+    return NotedFastAnswer::No;
+}
+
+bool GpuSplit::NotedWriteSinceFast(u64 since, u64 begin, u64 size) const {
+    namespace Debug = VideoCore::Nx2Debug;
+    const int mode = Debug::SwitchValue(Debug::g_noted_fast, "FRITCHII_NOTED_FAST");
+    u64 scanned = 0;
+    if (mode < 1 || mode > 3) {
+        // As with the switch at 0.
+        if (Debug::g_noted_summary.load(std::memory_order_relaxed) != 0) {
+            return NotedWriteSinceSummary(since, begin, size);
+        }
+        return NotedWalk(since, begin, size, scanned) != NotedWalkResult::None;
+    }
+    auto& fast = noted_fast;
+    if (!fast.live) {
+        // Notes sent so far are in no chain: from here on every note is linked.
+        fast.heads.fill(0);
+        fast.wide_head = 0;
+        fast.floor = pending_write_count;
+        fast.live = true;
+        fast.window_ns = Common::Nx2Hitch::NowNs();
+        fast.window_ticks = Nx2Profile::Ticks();
+        fast.logged = fast.stats;
+        fast.wide_kinds = {};
+    }
+    auto& stats = fast.stats;
+    if ((++stats.checks & 1023) == 0) {
+        LogNotedFast(mode);
+    }
+    const bool timed = (++fast.calls & 63) == 0;
+    const u64 t0 = timed ? Nx2Profile::Ticks() : 0;
+    u64 touched = 0;
+    const NotedFastAnswer answer = NotedFastLookup(since, begin, size, touched);
+    const u64 t1 = timed ? Nx2Profile::Ticks() : 0;
+    const bool answered = answer == NotedFastAnswer::No || answer == NotedFastAnswer::Yes ||
+                          answer == NotedFastAnswer::Overflow;
+    const bool fast_write = answer == NotedFastAnswer::Yes || answer == NotedFastAnswer::Overflow;
+    switch (answer) {
+    case NotedFastAnswer::No:
+    case NotedFastAnswer::Yes:
+        break;
+    case NotedFastAnswer::Overflow:
+        ++stats.overflow_yes;
+        break;
+    case NotedFastAnswer::Floor:
+        ++stats.floor;
+        break;
+    case NotedFastAnswer::Long:
+        ++stats.long_reads;
+        break;
+    }
+    if (answered) {
+        ++stats.answered;
+        stats.touched += touched;
+        if (fast_write) {
+            ++stats.answered_yes;
+        }
+        if (mode == 1 && !timed) {
+            return fast_write;
+        }
+    }
+    const NotedWalkResult walk = NotedWalk(since, begin, size, scanned);
+    const u64 t2 = timed ? Nx2Profile::Ticks() : 0;
+    const bool walk_write = walk != NotedWalkResult::None;
+    if (timed) {
+        ++stats.timed;
+        stats.fast_ticks += t1 - t0;
+    }
+    if (answered) {
+        ++stats.walk_checks;
+        stats.walk_notes += scanned;
+        if (timed) {
+            stats.walk_ticks += t2 - t1;
+        }
+        if (fast_write != walk_write) [[unlikely]] {
+            if (stats.differ++ < 16) {
+                LOG_WARNING(HW_GPU,
+                            "NotedFastDiffer (FRITCHII_NOTED_FAST={}, must be 0): the chains say "
+                            "{} over {:#x}+{:#x} since {} (answer {}, floor {}, notes {}), the "
+                            "walk {} ({} notes looked at)",
+                            mode, fast_write ? "write" : "no write", begin, size, since,
+                            static_cast<int>(answer), fast.floor, pending_write_count,
+                            static_cast<int>(walk), scanned);
+            }
+        }
+    }
+    return walk_write; // modes 2 and 3, the timed checks at 1, and the checks the chains left
+}
+
+void GpuSplit::LogNotedFast(int mode) const {
+    auto& fast = noted_fast;
+    const u64 now = Common::Nx2Hitch::NowNs();
+    if (now - fast.window_ns < 10'000'000'000ULL) {
+        return;
+    }
+    const u64 ticks = Nx2Profile::Ticks();
+    const double window = static_cast<double>(now - fast.window_ns) / 1e9;
+    const double ns_per_tick =
+        static_cast<double>(now - fast.window_ns) /
+        static_cast<double>((std::max)(ticks - fast.window_ticks, u64{1}));
+    const NotedFastStats& s = fast.stats;
+    const NotedFastStats& l = fast.logged;
+    const auto rate = [window](u64 count) { return static_cast<double>(count) / window; };
+    const u64 checks = s.checks - l.checks;
+    const u64 answered = s.answered - l.answered;
+    const u64 walk_checks = s.walk_checks - l.walk_checks;
+    const u64 timed = s.timed - l.timed;
+    // Walk notes on answered checks less the chain notes they looked at. At 1 only the timed
+    // answered checks walked: scaled to all answered ones.
+    const double walk_notes = static_cast<double>(s.walk_notes - l.walk_notes);
+    const double touched = static_cast<double>(s.touched - l.touched);
+    const double scale = walk_checks != 0 ? static_cast<double>(answered) /
+                                                static_cast<double>(walk_checks)
+                                          : 0.0;
+    const double skipped = walk_notes * scale - touched;
+    // The walks the answered checks skip (would skip, at 2 and 3) less the chain lookup on every
+    // check, from the timed 1 in 64, scaled to all checks.
+    const double saving_ms =
+        timed != 0 ? (static_cast<double>(s.walk_ticks - l.walk_ticks) -
+                      static_cast<double>(s.fast_ticks - l.fast_ticks)) *
+                         ns_per_tick * static_cast<double>(checks) / static_cast<double>(timed) /
+                         1e6 / window
+                   : 0.0;
+    // The wide chain's writers, most first (up to 3).
+    auto kinds = fast.wide_kinds;
+    std::ranges::sort(kinds, [](const NotedFastKind& a, const NotedFastKind& b) {
+        return a.count > b.count;
+    });
+    std::string wide_text;
+    for (size_t i = 0; i < 3 && kinds[i].what != nullptr; ++i) {
+        wide_text += fmt::format("{}{} {:.0f}/s", i == 0 ? "" : ", ", kinds[i].what,
+                                 rate(kinds[i].count));
+    }
+    LOG_INFO(HW_GPU,
+             "Noted fast (FRITCHII_NOTED_FAST={}) {:.0f} s: checks {:.0f}/s, answered without "
+             "the walk {:.0f}/s ({:.0f}%; {}; a write {:.0f}/s, of it table overflow {:.0f}/s), "
+             "walk entries skipped {:.0f}/s, sampled saving {:.2f} ms/s, differ {} (must be 0, "
+             "session {}); walked anyway: older than the chains {:.0f}/s, read over 16 pages "
+             "{:.0f}/s; chain notes looked at {:.0f}/s; notes linked {:.0f}/s (past a covered "
+             "head {:.0f}/s), wide chain {:.0f}/s (unknown range {:.0f}/s; {})",
+             mode, window, rate(checks), rate(answered),
+             checks != 0 ? static_cast<double>(answered) * 100.0 / static_cast<double>(checks)
+                         : 0.0,
+             mode == 1 ? "walk skipped" : "the walk ran and answered",
+             rate(s.answered_yes - l.answered_yes), rate(s.overflow_yes - l.overflow_yes),
+             skipped / window, saving_ms, s.differ - l.differ, s.differ,
+             rate(s.floor - l.floor), rate(s.long_reads - l.long_reads), touched / window,
+             rate(s.linked - l.linked), rate(s.linked_covered - l.linked_covered),
+             rate(s.linked_wide - l.linked_wide),
+             rate(s.linked_unknown - l.linked_unknown),
+             wide_text.empty() ? std::string{"none"} : wide_text);
+    fast.logged = s;
+    fast.window_ns = now;
+    fast.window_ticks = ticks;
+    fast.wide_kinds = {};
 }
 
 void GpuSplit::NoteWrite(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size) {
