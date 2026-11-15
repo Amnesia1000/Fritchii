@@ -245,7 +245,17 @@ private:
 #ifdef _WIN32
     // Before constant_pool: its constructor commits code space (EnsureMemoryCommitted reads this).
     size_t committed_size = 0;
+    size_t far_committed_size = 0; // Fritchii (FRITCHII_JIT_FAR_CODE)
 #endif
+    // Fritchii (FRITCHII_JIT_FAR_CODE): offsets in the code space. far_code_begin 0 = no far
+    // region. The write position of the region not in use is kept in its *_offset. Before
+    // constant_pool too: its constructor reaches EnsureMemoryCommitted, which reads them (they
+    // were declared after it and read uninitialized: a boot crash with the switch off as well).
+    size_t far_code_begin = 0;
+    size_t far_code_offset = 0;
+    size_t near_code_offset = 0;
+    size_t code_space_size = 0; // the whole space (Xbyak's maxSize_ ends at the near region)
+    bool in_far_code = false;
     ConstantPool constant_pool;
     JitStateInfo jsi;
     std::array<const void*, 4> return_from_run_code;
@@ -254,16 +264,6 @@ private:
     RunCodeCallbacks cb;
     CodePtr code_begin = nullptr;
     bool prelude_complete = false;
-    // Fritchii (FRITCHII_JIT_FAR_CODE): offsets in the code space. far_code_begin 0 = no far
-    // region. The write position of the region not in use is kept in its *_offset.
-    size_t far_code_begin = 0;
-    size_t far_code_offset = 0;
-    size_t near_code_offset = 0;
-    size_t code_space_size = 0; // the whole space (Xbyak's maxSize_ ends at the near region)
-    bool in_far_code = false;
-#ifdef _WIN32
-    size_t far_committed_size = 0;
-#endif
     PinConfig pins;
     bool pin_call_hook = false;
 
