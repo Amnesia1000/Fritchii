@@ -365,6 +365,9 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     // Multi-process state
     config.processor_id = std::uint8_t(m_core_index);
     config.global_monitor = &m_exclusive_monitor.monitor;
+    // Fritchii: where this launch loaded the main image (rtld, then main at +0x20000 in OoT);
+    // set before the interfaces are made (KProcess::Initialize), random per launch.
+    config.image_base = GetInteger(m_cb->m_process->GetEntryPoint());
 
     // System registers
     config.tpidrro_el0 = &m_cb->m_tpidrro_el0;
@@ -654,35 +657,58 @@ std::size_t ArmDynarmic64::WarmCompile(std::span<const u64> keys, const std::ato
 
 namespace {
 /// FRITCHII_JIT_HOT_LIST: a text file of "pc fpcr samples" lines (hex, hex, decimal; Fable A's
-/// work\fable_a_gc\hot-blocks-market.txt), read once: the blocks' location keys in pc order.
-const std::vector<u64>& HotPackKeys() {
-    static const std::vector<u64> keys = [] {
-        std::vector<std::pair<u64, u32>> blocks;
-        if (const char* path = std::getenv("FRITCHII_JIT_HOT_LIST"); path != nullptr) {
-            std::ifstream file{path};
-            std::string pc_text, fpcr_text;
-            u64 samples = 0;
-            while (file >> pc_text >> fpcr_text >> samples) {
-                blocks.emplace_back(std::strtoull(pc_text.c_str(), nullptr, 16),
-                                    static_cast<u32>(std::strtoul(fpcr_text.c_str(), nullptr, 16)));
+/// work\fable_a_gc\hotlist-300*.txt). The game's image loads at a random address every launch,
+/// so a pc below the image base is an offset from it (the "-rel" lists) and gets this launch's
+/// base added; others are taken as absolute (lists from the launch that made them). "{core}" in
+/// the path is replaced by the core (Fable A's per-core lists). FRITCHII_JIT_HOT_LIST_ORDER=1
+/// keeps the file's order (the per-core lists are hottest tier first), else pc order. Read at
+/// every pack (rare): the blocks' location keys.
+std::vector<u64> HotPackKeys(u64 image_base, std::size_t core) {
+    std::vector<std::pair<u64, u32>> blocks;
+    std::string path;
+    if (const char* text = std::getenv("FRITCHII_JIT_HOT_LIST"); text != nullptr) {
+        path = text;
+    }
+    if (const std::size_t at = path.find("{core}"); at != std::string::npos) {
+        path.replace(at, 6, std::to_string(core));
+    }
+    std::size_t offsets = 0;
+    if (!path.empty()) {
+        std::ifstream file{path};
+        std::string pc_text, fpcr_text;
+        u64 samples = 0;
+        while (file >> pc_text >> fpcr_text >> samples) {
+            u64 pc = std::strtoull(pc_text.c_str(), nullptr, 16);
+            if (pc < image_base) {
+                pc += image_base;
+                ++offsets;
             }
+            blocks.emplace_back(pc, static_cast<u32>(std::strtoul(fpcr_text.c_str(), nullptr, 16)));
         }
+    }
+    const char* order = std::getenv("FRITCHII_JIT_HOT_LIST_ORDER");
+    const bool file_order = order != nullptr && std::atoi(order) == 1;
+    if (!file_order) {
         std::sort(blocks.begin(), blocks.end());
-        std::vector<u64> result;
-        result.reserve(blocks.size());
-        for (const auto& [pc, fpcr] : blocks) {
-            result.push_back(
-                Dynarmic::A64::LocationDescriptor{pc, Dynarmic::FP::FPCR{fpcr}, false}.UniqueHash());
-        }
-        LOG_INFO(Core_ARM, "FRITCHII_JIT_HOT_LIST: {} hot blocks", result.size());
-        return result;
-    }();
-    return keys;
+    }
+    std::vector<u64> result;
+    result.reserve(blocks.size());
+    for (const auto& [pc, fpcr] : blocks) {
+        result.push_back(
+            Dynarmic::A64::LocationDescriptor{pc, Dynarmic::FP::FPCR{fpcr}, false}.UniqueHash());
+    }
+    LOG_INFO(Core_ARM,
+             "FRITCHII_JIT_HOT_LIST: core {} {} hot blocks from {} ({} as offsets from the image "
+             "base {:#x}, {} absolute), {} order",
+             core, result.size(), path, offsets, image_base, result.size() - offsets,
+             file_order ? "file" : "pc");
+    return result;
 }
 } // namespace
 
 std::size_t ArmDynarmic64::PackHotCode(const std::atomic<bool>& stop) {
-    const std::vector<u64>& keys = HotPackKeys();
+    const std::vector<u64> keys =
+        HotPackKeys(GetInteger(m_cb->m_process->GetEntryPoint()), m_core_index);
     if (keys.empty()) {
         return 0;
     }

@@ -127,6 +127,43 @@ bool A64EmitX64::OmitFramePointer() {
     return omit;
 }
 
+bool A64EmitX64::FarCodeEnabled() {
+    static const bool enabled = [] {
+        const bool value = EnvSwitch("FRITCHII_JIT_FAR_CODE") != 0;
+        if (value) {
+            LOG_INFO(Core_ARM, "FRITCHII_JIT_FAR_CODE=1: slow paths in a far region (3/8 of the code cache)");
+        }
+        return value;
+    }();
+    return enabled;
+}
+
+int A64EmitX64::ChainBits() {
+    static const int bits = [] {
+        const int value = EnvSwitch("FRITCHII_JIT_CHAIN");
+        if (value < 0 || value > 7) {
+            LOG_WARNING(Core_ARM, "FRITCHII_JIT_CHAIN={} is outside 0..7, using 0", value);
+            return 0;
+        }
+        if (value != 0) {
+            LOG_INFO(Core_ARM, "FRITCHII_JIT_CHAIN={}: chain successors {}, halt checks only backward {}, compact links {}",
+                     value, (value & 1) != 0 ? "on" : "off", (value & 2) != 0 ? "on" : "off",
+                     (value & 5) != 0 ? "on" : "off");
+        }
+        return value;
+    }();
+    return bits;
+}
+
+int A64EmitX64::ChainDepth() {
+    static const int depth = [] {
+        const char* text = std::getenv("FRITCHII_JIT_CHAIN_DEPTH");
+        const int value = text == nullptr ? 4 : std::atoi(text);
+        return std::clamp(value, 0, 64);
+    }();
+    return depth;
+}
+
 int A64EmitX64::FlagBranchMode() {
     static const int mode = [] {
         const int value = EnvSwitch("FRITCHII_JIT_FLAG_BRANCH");
@@ -361,6 +398,28 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
     GenMemory128Accessors();
     GenFastmemFallbacks();
     GenTerminalHandlers();
+    // Fritchii (FRITCHII_JIT_FAR_CODE): 5/8 of the space for blocks, 3/8 for their slow paths.
+    if (FarCodeEnabled() && code.GetTotalCodeSize() >= (size_t{64} << 20)) {
+        code.EnableFarCode(code.GetTotalCodeSize() / 8 * 3);
+        far_code = true;
+    }
+    // Fritchii (FRITCHII_JIT_CHAIN): the halt checks it moves stand in for cycle counting's
+    // checks too, so not with cycle counting; compact links need the far region for their stubs.
+    if (const int chain = ChainBits(); chain != 0 && conf.HasOptimization(OptimizationFlag::BlockLinking)) {
+        if (conf.enable_cycle_counting) {
+            LOG_WARNING(Core_ARM, "FRITCHII_JIT_CHAIN={} is off with cycle counting", chain);
+        } else {
+            backward_halt_checks = (chain & 2) != 0;
+            if ((chain & 5) != 0) {
+                if (far_code) {
+                    compact_links = true;
+                    chain_successors = (chain & 1) != 0;
+                } else if (conf.processor_id == 0) {
+                    LOG_WARNING(Core_ARM, "FRITCHII_JIT_CHAIN={}: compact links and chaining need FRITCHII_JIT_FAR_CODE=1, off", chain);
+                }
+            }
+        }
+    }
     code.PreludeComplete();
     ClearFastDispatchTable();
 
@@ -375,7 +434,7 @@ A64EmitX64::~A64EmitX64() = default;
 
 // Fritchii: a throw here (an Xbyak error) used to end the process without a word: it is called
 // from generated code (the dispatcher's block lookup), whose frames the unwinder cannot cross.
-A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) noexcept try {
+A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block, bool chained) noexcept try {
     if (conf.very_verbose_debugging_output) [[unlikely]] {
         std::puts(IR::DumpBlock(block).c_str());
     }
@@ -399,7 +458,9 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) noexcept try {
     ctx.track_host_flags = track_host_flags;
 
     // Start emitting.
-    code.align();
+    if (!chained) {
+        code.align();
+    }
     const auto* const entrypoint = code.getCurr();
     // Fritchii: FRITCHII_JIT_NO_FRAME_POINTER leaves rbp as the dispatcher set it (no block
     // allocates rbp either way, reg_alloc.cpp): only stack walkers that follow rbp see a change.
@@ -473,13 +534,35 @@ finish_this_inst:
     // rbp mov above runs, unless cycle counting's sub (which writes the flags) does.
     terminal_nzcv_in_host_flags = track_host_flags && !conf.enable_cycle_counting && ctx.guest_nzcv_in_host_flags;
     terminal_check_bit_in_host_zf = flag_branch_mode >= 2 && !conf.enable_cycle_counting && ctx.check_bit_in_host_zf;
+    current_end_location = block.EndLocation();
+    chain_target.reset();
     EmitTerminal(block.terminal, ctx.Location().SetSingleStepping(false), ctx.IsSingleStep());
     terminal_nzcv_in_host_flags = false;
     terminal_check_bit_in_host_zf = false;
-    code.int3();
-    for (auto& deferred_emit : ctx.deferred_emits)
-        deferred_emit();
-    code.int3();
+    if (chain_target && code.getCurr() != chain_slot_end) {
+        chain_target.reset(); // something follows the last slot
+    }
+    last_far_entry = nullptr;
+    last_far_size = 0;
+    if (far_code) {
+        // Fritchii (FRITCHII_JIT_FAR_CODE): the terminal ends in a jump; the slow paths go to the
+        // far region (their jumps from the block are near jumps, their jumps back go to labels
+        // already defined), so the next block follows this one's terminal.
+        if (!ctx.deferred_emits.empty()) {
+            code.SwitchToFarCode();
+            last_far_entry = code.getCurr();
+            for (auto& deferred_emit : ctx.deferred_emits)
+                deferred_emit();
+            code.int3();
+            last_far_size = size_t(code.getCurr() - static_cast<const u8*>(last_far_entry));
+            code.SwitchToNearCode();
+        }
+    } else {
+        code.int3();
+        for (auto& deferred_emit : ctx.deferred_emits)
+            deferred_emit();
+        code.int3();
+    }
 
     const size_t size = size_t(code.getCurr() - entrypoint);
 
@@ -507,6 +590,87 @@ void A64EmitX64::ClearCache() {
     ClearFastDispatchTable();
     ClearIndirectSlots(true);
     fastmem_patch_info.clear();
+    link_stubs.clear();
+    halt_stubs.clear();
+    chain_target.reset();
+}
+
+std::optional<IR::LocationDescriptor> A64EmitX64::ChainCandidate() const {
+    if (!chain_successors || !chain_target || code.getCurr() != chain_slot_end) {
+        return std::nullopt;
+    }
+    return chain_target;
+}
+
+CodePtr A64EmitX64::LinkStub(const IR::LocationDescriptor& target) {
+    if (const auto it = link_stubs.find(target.Value()); it != link_stubs.end()) {
+        return it->second;
+    }
+    code.SwitchToFarCode();
+    const CodePtr stub = code.getCurr();
+    code.mov(rax, A64::LocationDescriptor{target}.PC());
+    code.mov(qword[code.ABI_JIT_PTR + offsetof(A64JitState, pc)], rax);
+    code.jmp(code.GetReturnFromRunCodeAddress(), code.T_NEAR);
+    code.SwitchToNearCode();
+    link_stubs.emplace(target.Value(), stub);
+    return stub;
+}
+
+CodePtr A64EmitX64::HaltStub(const IR::LocationDescriptor& target) {
+    if (const auto it = halt_stubs.find(target.Value()); it != halt_stubs.end()) {
+        return it->second;
+    }
+    code.SwitchToFarCode();
+    const CodePtr stub = code.getCurr();
+    code.mov(rax, A64::LocationDescriptor{target}.PC());
+    code.mov(qword[code.ABI_JIT_PTR + offsetof(A64JitState, pc)], rax);
+    code.ForceReturnFromRunCode();
+    code.SwitchToNearCode();
+    halt_stubs.emplace(target.Value(), stub);
+    return stub;
+}
+
+void A64EmitX64::EmitFritchiiLink(const IR::LocationDescriptor& target, IR::LocationDescriptor initial_location, bool checked_by_default) {
+    // FRITCHII_JIT_CHAIN=2: only a link that can close a loop checks for a halt.
+    const bool checked = backward_halt_checks
+                           ? A64::LocationDescriptor{target}.PC() <= A64::LocationDescriptor{initial_location}.PC()
+                           : checked_by_default;
+    const auto next_bb = GetBasicBlock(target);
+    if (compact_links) {
+        // Both stubs exist before the slot is recorded: Unpatch rewrites it to the link stub.
+        static_cast<void>(LinkStub(target));
+        if (checked) {
+            const CodePtr halt_stub = HaltStub(target);
+            code.cmp(dword[code.ABI_JIT_PTR + offsetof(A64JitState, halt_reason)], 0);
+            code.jne(halt_stub);
+        }
+        AddPatchLocation(target, EmitX64::PatchKind::Jmp);
+        EmitPatchJmp(target, next_bb ? next_bb->entrypoint : nullptr);
+        chain_target = target;
+        chain_slot_end = code.getCurr();
+        return;
+    }
+    if (checked) {
+        // LinkBlock's shape.
+        code.cmp(dword[code.ABI_JIT_PTR + offsetof(A64JitState, halt_reason)], 0);
+        AddPatchLocation(target, EmitX64::PatchKind::Jz);
+        if (next_bb) {
+            EmitPatchJz(target, next_bb->entrypoint);
+        } else {
+            EmitPatchJz(target);
+        }
+        code.mov(rax, A64::LocationDescriptor{target}.PC());
+        code.mov(qword[code.ABI_JIT_PTR + offsetof(A64JitState, pc)], rax);
+        code.ForceReturnFromRunCode();
+    } else {
+        // LinkBlockFast's shape.
+        AddPatchLocation(target, EmitX64::PatchKind::Jmp);
+        if (next_bb) {
+            EmitPatchJmp(target, next_bb->entrypoint);
+        } else {
+            EmitPatchJmp(target);
+        }
+    }
 }
 
 void A64EmitX64::InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges) {
@@ -1160,14 +1324,30 @@ std::string A64EmitX64::LocationDescriptorToFriendlyName(const IR::LocationDescr
 }
 
 namespace {
+/// Fritchii (FRITCHII_JIT_CHAIN): the leaf is a direct link to `location`.
+bool LeafLinksTo(const IR::Term::LeafTerminal& leaf, const IR::LocationDescriptor& location) {
+    if (const auto x = std::get_if<IR::Term::LinkBlock>(&leaf)) {
+        return x->next == location;
+    }
+    if (const auto x = std::get_if<IR::Term::LinkBlockFast>(&leaf)) {
+        return x->next == location;
+    }
+    return false;
+}
+
 bool EmitTerminalImpl(A64EmitX64& e, IR::Term::ReturnToDispatch, IR::LocationDescriptor, bool) {
     e.code.ReturnFromRunCode();
     return true;
 }
 
-bool EmitTerminalImpl(A64EmitX64& e, IR::Term::LinkBlock terminal, IR::LocationDescriptor, bool is_single_step) {
+bool EmitTerminalImpl(A64EmitX64& e, IR::Term::LinkBlock terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
     // Used for patches and linking
     if (e.conf.HasOptimization(OptimizationFlag::BlockLinking) && !is_single_step) {
+        if (e.compact_links || e.backward_halt_checks) {
+            // Fritchii (FRITCHII_JIT_CHAIN; never with cycle counting).
+            e.EmitFritchiiLink(terminal.next, initial_location, true);
+            return true;
+        }
         if (e.conf.enable_cycle_counting) {
             e.code.cmp(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], 0);
             e.AddPatchLocation(terminal.next, EmitX64::PatchKind::Jg);
@@ -1196,8 +1376,11 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::LinkBlock terminal, IR::LocationD
     return true;
 }
 
-bool EmitTerminalImpl(A64EmitX64& e, IR::Term::LinkBlockFast terminal, IR::LocationDescriptor, bool is_single_step) {
-    if (e.conf.HasOptimization(OptimizationFlag::BlockLinking) && !is_single_step) {
+bool EmitTerminalImpl(A64EmitX64& e, IR::Term::LinkBlockFast terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
+    if (e.conf.HasOptimization(OptimizationFlag::BlockLinking) && !is_single_step && (e.compact_links || e.backward_halt_checks)) {
+        // Fritchii (FRITCHII_JIT_CHAIN).
+        e.EmitFritchiiLink(terminal.next, initial_location, false);
+    } else if (e.conf.HasOptimization(OptimizationFlag::BlockLinking) && !is_single_step) {
         e.AddPatchLocation(terminal.next, EmitX64::PatchKind::Jmp);
         if (auto next_bb = e.GetBasicBlock(terminal.next)) {
             e.EmitPatchJmp(terminal.next, next_bb->entrypoint);
@@ -1214,6 +1397,11 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::LinkBlockFast terminal, IR::Locat
 
 bool EmitTerminalImpl(A64EmitX64& e, IR::Term::PopRSBHint, IR::LocationDescriptor, bool is_single_step) {
     if (e.conf.HasOptimization(OptimizationFlag::ReturnStackBuffer) && !is_single_step) {
+        if (e.backward_halt_checks) {
+            // FRITCHII_JIT_CHAIN=2: a return may go back (the pc is already stored).
+            e.code.cmp(dword[e.code.ABI_JIT_PTR + offsetof(A64JitState, halt_reason)], 0);
+            e.code.jne(e.code.GetForceReturnFromRunCodeAddress());
+        }
         if (e.indirect_cache_mode == 1 && e.terminal_handler_pop_rsb_dry != nullptr) {
             // FRITCHII_JIT_INDIRECT_CACHE=1: the dry handler counts this site's targets.
             if (auto* const slot = e.AllocateIndirectSlot()) {
@@ -1246,6 +1434,11 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::FastDispatchHint, IR::LocationDes
     if (!e.conf.HasOptimization(OptimizationFlag::FastDispatch) || is_single_step) {
         e.code.ReturnFromRunCode();
         return true;
+    }
+    if (e.backward_halt_checks) {
+        // FRITCHII_JIT_CHAIN=2: an indirect branch may go back (the pc is already stored).
+        e.code.cmp(dword[e.code.ABI_JIT_PTR + offsetof(A64JitState, halt_reason)], 0);
+        e.code.jne(e.code.GetForceReturnFromRunCodeAddress());
     }
     if (e.indirect_cache_mode != 0) {
         if (auto* const slot = e.AllocateIndirectSlot()) {
@@ -1281,6 +1474,18 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::If terminal, IR::LocationDescript
         break;
     default:
         // Fritchii (FRITCHII_JIT_FLAG_BRANCH): no reload when the host flags hold the NZCV.
+        if (e.chain_successors && !is_single_step && LeafLinksTo(terminal.else_, e.current_end_location) &&
+            !LeafLinksTo(terminal.then_, e.current_end_location)) {
+            // FRITCHII_JIT_CHAIN=1: the fall-through leaf last, so it can be chained (the
+            // inverted condition; the halt checks are inside the leaves, after the jump).
+            const IR::Cond inverted = IR::Cond(u32(terminal.if_) ^ 1);
+            Xbyak::Label fail = e.terminal_nzcv_in_host_flags ? e.EmitCondFromHostFlags(inverted)
+                                                              : e.EmitCond(inverted);
+            e.EmitLeafTerminal(terminal.then_, initial_location, is_single_step);
+            e.code.L(fail);
+            e.EmitLeafTerminal(terminal.else_, initial_location, is_single_step);
+            break;
+        }
         Xbyak::Label pass = e.terminal_nzcv_in_host_flags ? e.EmitCondFromHostFlags(terminal.if_)
                                                           : e.EmitCond(terminal.if_);
         e.EmitLeafTerminal(terminal.else_, initial_location, is_single_step);
@@ -1296,6 +1501,16 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::CheckBit terminal, IR::LocationDe
     // Fritchii (FRITCHII_JIT_FLAG_BRANCH=2): ZF already says whether the byte is 0.
     if (!e.terminal_check_bit_in_host_zf) {
         e.code.cmp(e.code.byte[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, check_bit)], u8(0));
+    }
+    if (e.chain_successors && !is_single_step && LeafLinksTo(terminal.then_, e.current_end_location) &&
+        !LeafLinksTo(terminal.else_, e.current_end_location)) {
+        // FRITCHII_JIT_CHAIN=1: the fall-through leaf last, so it can be chained.
+        Xbyak::Label pass;
+        e.code.jnz(pass);
+        e.EmitLeafTerminal(terminal.else_, initial_location, is_single_step);
+        e.code.L(pass);
+        e.EmitLeafTerminal(terminal.then_, initial_location, is_single_step);
+        return true;
     }
     e.code.jz(fail);
     e.EmitLeafTerminal(terminal.then_, initial_location, is_single_step);
@@ -1365,6 +1580,20 @@ void A64EmitX64::EmitPatchJz(const IR::LocationDescriptor& target_desc, CodePtr 
 
 void A64EmitX64::EmitPatchJmp(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr) {
     const CodePtr patch_location = code.getCurr();
+    if (compact_links) {
+        // Fritchii (FRITCHII_JIT_CHAIN): one 5-byte slot; falls through when the block follows.
+        if (target_code_ptr == static_cast<const u8*>(patch_location) + 5) {
+            code.nop(5);
+        } else if (target_code_ptr) {
+            code.jmp(target_code_ptr, code.T_NEAR);
+        } else {
+            const auto stub = link_stubs.find(target_desc.Value());
+            ASSERT(stub != link_stubs.end());
+            code.jmp(stub->second, code.T_NEAR);
+        }
+        code.EnsurePatchLocationSize(patch_location, 5);
+        return;
+    }
     if (target_code_ptr) {
         code.jmp(target_code_ptr);
     } else {

@@ -2911,6 +2911,13 @@ FRITCHII_JIT_HOT_PACK (live test hook, default 0; fable_a_gameceiling_answer 12.
 13.2% of the guest cores' busy time spent arriving at blocks: is it code layout (instruction
 fetch, instruction TLB)? Needs FRITCHII_JIT_HOT_LIST (boot env) = a text file of "pc fpcr samples"
 lines, e.g. E:\OotRemakeEmulation\work\fable_a_gc\hot-blocks-market.txt (19,332 blocks).
+- The game loads at a random address every launch (Fable A 8), so a list's absolute pcs only
+  fit the launch that made them. A pc below this launch's image base (rtld's load address) is
+  read as an offset from it: use the `-rel` lists (work\fable_a_gc\hotlist-300*-rel.txt).
+  Larger pcs are taken as absolute. "{core}" in the path is replaced by the core
+  (hotlist-300-core{core}-rel.txt). FRITCHII_JIT_HOT_LIST_ORDER=1 keeps the file's order (the
+  per-core lists are hottest tier first), else pc order. The log line names the file, how many
+  pcs were offsets and the image base.
 - Each new non-zero value (set it through the debug server's `switch`, e.g. 1, later 2 for a
   second round) makes every guest core, at its next idle, clear its own code cache and compile the
   hot list first, in guest pc order (PrecompileBlock through the warm-compile path, which now does
@@ -2924,6 +2931,55 @@ lines, e.g. E:\OotRemakeEmulation\work\fable_a_gc\hot-blocks-market.txt (19,332 
 - The test: market heavy phase, fps before, set the switch, wait for the six lines and about 30 s
   for the cold code to come back, fps after. Fable A: 1.5% or more means layout matters (then the
   real work: slow paths out of line, hot code together); nothing means drop that line of work.
+
+### FRITCHII_JIT_FAR_CODE
+
+FRITCHII_JIT_FAR_CODE (boot, default 0; Fable A 2.1). 1 = each block's slow paths (the deferred
+emits: NaN handling, fallbacks, page-boundary paths) go to a far region, the last 3/8 of the code
+cache, instead of right behind the block, so the hot bytes of blocks sit together (fewer cache
+lines and pages per core). Only with a code cache of 64 MiB or more (512 MiB here).
+- Exact: the same instructions, other addresses. A full region clears the cache like a full cache
+  does; PrecompileBlock (warm compile, hot pack) keeps half the smaller region free.
+- "JIT cache clear (FRITCHII_JIT_FAR_CODE) core c: near N MiB used, far F MiB used" (Core_ARM,
+  Info) at each full clear: checks the 5/8 : 3/8 split.
+- Expected 1 to 2% of game code time (Fable A, estimate).
+
+### FRITCHII_JIT_CHAIN
+
+FRITCHII_JIT_CHAIN (boot, bits, default 0; Fable A 2.2). Off with cycle counting (single core).
+- 4 = compact links (needs FAR_CODE): a direct block link is one 5-byte jump (today 22 to 53
+  bytes); when the target is not compiled it jumps to a far stub that stores the pc and goes to
+  the dispatcher. A link with a halt check is `cmp halt, 0; jne <far stub>; <jump>`.
+- 2 = halt check only on links back (target pc <= the block's start pc). Forward links lose it,
+  B/BL links back gain it (they have none today), indirect branches and returns gain one. Between
+  two checks only forward links run, so the code stops for a halt within a bounded number of
+  blocks. A halt raised inside a block without the debugger is noticed a few blocks later.
+- 1 = chain (needs FAR_CODE, implies 4): when a block ends in a link to a block not compiled yet,
+  that block is compiled right behind it and the link becomes a 5-byte nop; up to
+  FRITCHII_JIT_CHAIN_DEPTH blocks in a row (default 4, 0..64). Conditional branches put the
+  fall-through side last so it is the one chained. Code is compiled before it runs.
+- Useful values: 6 (compact + backward checks), 7 (all). Bits 1 and 4 without FAR_CODE log a
+  warning and stay off.
+- Expected 1 to 2% (Fable A, estimate).
+
+### FRITCHII_JIT_DUMP
+
+FRITCHII_JIT_DUMP (boot, default 0; Fable A 4.1 and 8.5). Writes the host code of each compiled
+block with its guest words, for offline reading. 1 = written every 4096 blocks, 2 = written only
+at full cache clears and shutdown (host bytes are read when written, so links show as patched).
+- FRITCHII_JIT_DUMP_CORE: the core that dumps (default 0, -1 = all).
+- FRITCHII_JIT_DUMP_FILE: the file (default jit-dump-core{core}.bin in the working directory;
+  put it under work\measure). "{core}" becomes the core; with -1 and no "{core}", ".coreN" is
+  appended.
+- FRITCHII_JIT_DUMP_LIST: only these blocks, one hex pc per line (first word of the line, so the
+  hot lists work). Pcs below the image base are offsets from it, others absolute.
+- Format: 64-byte header ("FJITDMP2", version 2, core, code base, code size, image base, far
+  region address or 0, flags bit 0 = far code, list entries). Then 64-byte records: kind (1 block,
+  2 prelude), flags (bit 0 far part, bit 1 chained), guest word count, location descriptor,
+  absolute guest pc, guest pc minus image base, near address, far address, near size, far size,
+  sequence number; each followed by its guest words, near bytes, far bytes. The image base
+  changes every launch: match blocks across launches by the offset.
+- "FRITCHII_JIT_DUMP: core c writes <file> (image base 0x...)" (Core_ARM, Info).
 
 ## Numbered experiments (EDEN_NX2_EXPn)
 

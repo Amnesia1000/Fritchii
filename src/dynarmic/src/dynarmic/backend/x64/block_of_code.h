@@ -57,6 +57,13 @@ class BlockOfCode final : public Xbyak::CodeGenerator {
 public:
     BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_code_size, std::function<void(BlockOfCode&)> rcp, PinConfig pins = {});
     BlockOfCode(const BlockOfCode&) = delete;
+    // Fritchii (FRITCHII_JIT_FAR_CODE): Xbyak's limit is the near region's end while near code is
+    // emitted; the base class frees the whole space.
+    ~BlockOfCode() {
+        if (far_code_begin != 0) {
+            maxSize_ = code_space_size;
+        }
+    }
 
     /// Call when external emitters have finished emitting their preludes.
     void PreludeComplete();
@@ -180,6 +187,31 @@ public:
     void SetCodePtr(CodePtr code_ptr);
     void EnsurePatchLocationSize(CodePtr begin, size_t size);
 
+    /// Fritchii (FRITCHII_JIT_FAR_CODE): the last `far_size` bytes of the code space become a
+    /// second region for code that rarely runs (slow paths, link stubs), so the blocks' hot
+    /// bytes sit next to each other. Both regions are reset together (ClearCache). Call before
+    /// PreludeComplete. Without it nothing changes.
+    void EnableFarCode(size_t far_size);
+    bool HasFarCode() const { return far_code_begin != 0; }
+    /// Offset of the far region in the code space (0 without one).
+    size_t FarCodeBegin() const { return far_code_begin; }
+    /// Bytes used in the near region (blocks, after the prelude) and in the far one.
+    size_t NearCodeUsed() const {
+        return (in_far_code ? near_code_offset : size_) -
+               size_t(static_cast<const u8*>(code_begin) - getCode());
+    }
+    size_t FarCodeUsed() const {
+        return far_code_begin == 0 ? 0 : (in_far_code ? size_ : far_code_offset) - far_code_begin;
+    }
+    /// Emission continues in the far region (where it last stopped) / back in the near one.
+    void SwitchToFarCode();
+    void SwitchToNearCode();
+    bool InFarCode() const { return in_far_code; }
+    /// Where far code would be emitted next (near code current; nullptr without far code).
+    CodePtr GetFarCodeCurr() const;
+    /// The smaller of the two regions (the whole space without far code).
+    size_t SmallestRegionSize() const;
+
     static const Xbyak::Reg64 ABI_JIT_PTR;
     // ABI registers
 #ifdef _WIN32
@@ -222,6 +254,16 @@ private:
     RunCodeCallbacks cb;
     CodePtr code_begin = nullptr;
     bool prelude_complete = false;
+    // Fritchii (FRITCHII_JIT_FAR_CODE): offsets in the code space. far_code_begin 0 = no far
+    // region. The write position of the region not in use is kept in its *_offset.
+    size_t far_code_begin = 0;
+    size_t far_code_offset = 0;
+    size_t near_code_offset = 0;
+    size_t code_space_size = 0; // the whole space (Xbyak's maxSize_ ends at the near region)
+    bool in_far_code = false;
+#ifdef _WIN32
+    size_t far_committed_size = 0;
+#endif
     PinConfig pins;
     bool pin_call_hook = false;
 
