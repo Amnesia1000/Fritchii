@@ -263,6 +263,7 @@ void StateTracker::ChangeChannel(Tegra::Control::ChannelState& channel_state) {
 void StateTracker::InvalidateState() {
     ++vertex_input_generation;
     flags->set();
+    VideoCommon::ESplit::NoteTrackerInvalidation(flags); // FRITCHII_ESPLIT_COUNT >= 2
     current_topology = INVALID_TOPOLOGY;
     current_host_topology = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
     stencil_reset = true;
