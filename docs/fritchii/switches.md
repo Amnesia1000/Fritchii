@@ -107,6 +107,30 @@ VMA default-size blocks at boot. Off on integrated GPUs. Log: "Kept blocks in 10
 M ms; F driver frees in T ms; R blocks reused, K kept, S not kept, G given back; holds H MiB". Note
 the Churn line's device allocations still count reused blocks (VMA's own callback).
 
+### FRITCHII_KILL_RT_POOL
+
+TEST, off by default (helper AV, 2026-11-15; the kill hitches in the Stalchild fight). Live: 0 =
+as before, 1 = colour render targets (colour attachment, not depth, 2D, not sparse or disjoint, not
+asked for dedicated memory) of up to 32 MiB are made with vkCreateImage, allocated from their own
+VMA pool per memory type (64 MiB blocks, like EDEN_NX2_DEPTH_POOL for depth) and bound; anything
+the pool refuses (over 32 MiB, no room within the budget, a failed bind) goes the old way. 2 = dry:
+nothing moves, the line counts the colour targets the pool would try and how many of them got
+memory of their own. Why: outside a pool the driver's preference gives a colour target its own
+memory, a driver allocation on the GPU back thread each time. In the owner's fights
+(fight-keepers*, 2026-11-14) the only frames over 50 ms after the load were single image creates
+of 35 and 124 ms at kills (159 ms once in a playtest), the back blocked and every other GPU thread
+idle behind it. Only memory placement changes, never what is drawn; images made before a switch
+change stay where they are. FRITCHII_KILL_RT_POOL_BLOCKS (boot, default 2, at most 8 = 512 MiB):
+blocks the pool makes when it is first used and never gives back. Log, every 10 s while the switch
+is not 0, and at 0 only for a window with a create of 20 ms or more: "Kill image creates
+(FRITCHII_KILL_RT_POOL=N) in 10 s: C made in T ms; per kind (colour in the kill pool, colour own
+memory, colour in a block, depth own memory, depth in a block, other own memory, other in a block):
+count (ms, over 5 ms, over 20 ms, longest); worst W ms: size, format, usage (kind); kill pool: P
+placed, O over 32 MiB, R refused, B blocks, U of M MiB used; dry: D colour targets the pool would
+try, K of them got memory of their own". Read the worst create's kind first: "colour own memory"
+is what the pool removes; "depth in a block" points at EDEN_NX2_DEPTH_POOL_MIN_BLOCKS; "other in a
+block" at FRITCHII_KEEP_BLOCKS.
+
 ### FRITCHII_STAGING_RING
 
 TEST, off by default (helper AO, 2026-11-15, port of DahBard/Blitchii's staging ring, r64). The
