@@ -916,6 +916,21 @@ public:
         std::array<u64, static_cast<size_t>(DispatchUnbounded::Count)> unbounded;
     };
     [[nodiscard]] DispatchStats GetDispatchStats() const;
+    /// FRITCHII_DISPATCH_WALK_SUMMARY (DispatchesMayWriteSince), front: the dispatch records the
+    /// walks loaded, the walks the dispatch stamps answered instead (a miss), the stamp checks
+    /// refused by a stamp on the page's block or by one that stamped everything, and with 2 the
+    /// walks that found a write the stamps said was not there (must be 0). Counted with the
+    /// switch off too, except the last three.
+    struct DispatchWalkStats {
+        u64 walked{};
+        u64 summary_misses{};
+        u64 refused_block{};
+        u64 refused_wide{};
+        u64 verify_disagreed{};
+    };
+    [[nodiscard]] const DispatchWalkStats& GetDispatchWalkStats() const {
+        return dispatch_walk;
+    }
 
     /// Back: whether the dispatches being run record their writes (BeginDispatchRecord).
     [[nodiscard]] static bool RecordingDispatch() {
@@ -1875,6 +1890,7 @@ private:
     std::array<std::atomic<u64>, static_cast<size_t>(DispatchUnbounded::Count)>
         dispatches_unbounded{};
     void AppendDispatchWrite(u64 begin, u64 end);
+    DispatchWalkStats dispatch_walk{};
     u64 last_sync_position{};
     u64 last_memory_write_position{};
     static constexpr u32 DeferredWrite = ~0U;

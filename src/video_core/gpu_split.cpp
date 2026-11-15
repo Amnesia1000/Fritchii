@@ -2207,6 +2207,33 @@ GpuSplit::DispatchCheck GpuSplit::DispatchesMayWriteSince(u64 since, u64 begin, 
         DelayFrontIf(FrontDelayKind::DispatchWait, false);
         waited = true;
     }
+    // FRITCHII_DISPATCH_WALK_SUMMARY (live, default 0 = the walk alone; fable_b2 2.4): with
+    // bounded records (FRITCHII_ONEF_DISPATCH_RANGES) a page's snapshot is never renewed, so
+    // each read walked every record made since its page's last read. The dispatch stamps answer
+    // first: every dispatch sent since `since` ran and recorded its writes (above), which is
+    // what DispatchStampsMissSince needs, and its count is loaded before the stamps, so a miss
+    // says no record below that count at or after `since` touches the page's 64 KB block (nor
+    // stamped everything). That is the walk's own miss over the same records, or stricter (the
+    // walk stops at the first record before `since`; collisions only make a stamp newer): the
+    // cursor moves to the count, nothing to list. A refusal walks as before. 2 also walks after
+    // a stamp miss and answers with the walk, counting a write it found (must be 0).
+    const int summary_mode = VideoCore::Nx2Debug::SwitchValue(
+        VideoCore::Nx2Debug::g_dispatch_walk_summary, "FRITCHII_DISPATCH_WALK_SUMMARY");
+    bool summary_miss = false;
+    if (summary_mode != 0) {
+        u64 summary_count = 0;
+        bool wide = false;
+        if (DispatchStampsMissSince(since, begin, size, summary_count, wide)) {
+            ++dispatch_walk.summary_misses;
+            if (summary_mode != 2) {
+                checked = (std::max)(checked, summary_count);
+                return DispatchCheck::Miss;
+            }
+            summary_miss = true;
+        } else {
+            ++(wide ? dispatch_walk.refused_wide : dispatch_walk.refused_block);
+        }
+    }
     // The back recorded every dispatch sent since before storing a position past it (acquired
     // by WaitFor or above). Records start at the entry that ran them: since and later is after
     // the snapshot.
@@ -2216,10 +2243,28 @@ GpuSplit::DispatchCheck GpuSplit::DispatchesMayWriteSince(u64 since, u64 begin, 
     ListedWrites found = listed != nullptr ? *listed : ListedWrites{};
     u64 index = count;
     bool reached = false;
+    // FRITCHII_DISPATCH_WALK_SUMMARY=2: a write over the bytes after a stamp miss. A record
+    // whose slot the back reused while it was read is a stray range, not a disagreement.
+    const auto disagree = [&](u64 write_begin, u64 write_end) {
+        if (!summary_miss ||
+            dispatch_write_count.load(std::memory_order_acquire) >= index + DispatchWriteSlots) {
+            return;
+        }
+        if (dispatch_walk.verify_disagreed++ < 16) {
+            LOG_WARNING(HW_GPU,
+                        "Dispatch walk summary (FRITCHII_DISPATCH_WALK_SUMMARY=2, must be 0): "
+                        "the stamps missed {:#x}+{:#x} since {}, but record {} ({:#x}-{:#x}) "
+                        "writes it",
+                        begin, size, since, index - 1, write_begin, write_end);
+        }
+    };
+    u64 walked = 0;
     for (u64 scanned = 0; index > (std::max)(checked, oldest); --index, ++scanned) {
         if (scanned == MaxDispatchScan) {
+            dispatch_walk.walked += walked;
             return DispatchCheck::ScanLimit;
         }
+        ++walked;
         const DispatchWrite& write = dispatch_writes[(index - 1) % DispatchWriteSlots];
         if (write.position.load(std::memory_order_relaxed) < since) {
             reached = true;
@@ -2228,16 +2273,22 @@ GpuSplit::DispatchCheck GpuSplit::DispatchesMayWriteSince(u64 since, u64 begin, 
         const u64 write_begin = write.begin.load(std::memory_order_relaxed);
         const u64 write_end = write.end.load(std::memory_order_relaxed);
         if (write_begin < end && begin < write_end) {
+            if (summary_miss) [[unlikely]] {
+                disagree(write_begin, write_end);
+            }
             if (write_end == ~u64{0} && write_begin == 0) {
+                dispatch_walk.walked += walked;
                 return DispatchCheck::Unbounded;
             }
             if (listed == nullptr) {
+                dispatch_walk.walked += walked;
                 return DispatchCheck::Overlap;
             }
             // A slot reused meanwhile lists a stray range; the reuse check below then misses.
             found.Add(begin, size, write_begin, write_end);
         }
     }
+    dispatch_walk.walked += walked;
     // Writes between `checked` and the oldest remembered were forgotten; the back may have
     // reused the slots read meanwhile (it only appends for dispatches sent after the newest).
     if ((!reached && oldest > checked) ||

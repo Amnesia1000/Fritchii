@@ -5214,6 +5214,39 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                                  watch.overflows, watch.verified, watch.mismatches,
                                  watch.unwatched_absent, watch.unwatched_newer,
                                  watch.unwatched_spans, watch.replaced);
+                        // FRITCHII_DISPATCH_WALK_SUMMARY (fable_b2 2.4): what the dispatch walks
+                        // cost (records loaded) and what the stamps answered, a second since the
+                        // last line.
+                        using WalkStats = VideoCommon::GpuSplit::DispatchWalkStats;
+                        static WalkStats walk_before{};
+                        // The first line: the line's own period (its clock starts at the first
+                        // snapshot read).
+                        static auto walk_logged = now - std::chrono::seconds{5};
+                        const WalkStats& walk = split.GetDispatchWalkStats();
+                        const double walk_seconds =
+                            (std::max)(std::chrono::duration<double>(now - walk_logged).count(),
+                                       1e-3);
+                        const auto walk_rate = [walk_seconds](u64 current, u64 before) {
+                            return static_cast<u64>(static_cast<double>(current - before) /
+                                                        walk_seconds +
+                                                    0.5);
+                        };
+                        LOG_INFO(HW_GPU,
+                                 "DMA snapshot EXP10 dispatch walk "
+                                 "(FRITCHII_DISPATCH_WALK_SUMMARY={}), a second: {} records "
+                                 "walked, {} summary misses (no walk), summary refused: {} block "
+                                 "stamp, {} wide stamp; summary verify disagreements (must be "
+                                 "0): {} session",
+                                 VideoCore::Nx2Debug::SwitchValue(
+                                     VideoCore::Nx2Debug::g_dispatch_walk_summary,
+                                     "FRITCHII_DISPATCH_WALK_SUMMARY"),
+                                 walk_rate(walk.walked, walk_before.walked),
+                                 walk_rate(walk.summary_misses, walk_before.summary_misses),
+                                 walk_rate(walk.refused_block, walk_before.refused_block),
+                                 walk_rate(walk.refused_wide, walk_before.refused_wide),
+                                 walk.verify_disagreed);
+                        walk_before = walk;
+                        walk_logged = now;
                     }
                 }
                 if (census_read) [[unlikely]] {

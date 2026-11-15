@@ -424,6 +424,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_FRONT_RAN_READS") {
         return &g_front_ran_reads;
     }
+    if (name == "FRITCHII_DISPATCH_WALK_SUMMARY") {
+        return &g_dispatch_walk_summary;
+    }
     if (name == "FRITCHII_ACQUIRE_TABLE_FIRST") {
         return &g_acquire_table_first;
     }
