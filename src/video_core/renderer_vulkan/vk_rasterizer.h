@@ -242,6 +242,16 @@ private:
     bool onef_mirror_lent_bit{};
     /// E: the mirror's update at a draw or clear (the count enable register, E's engine).
     void OneFollowerMirrorDraw();
+    /// E (FRITCHII_ONEF_POST_FENCE): a query sync may be owed at the next fence: a samples report
+    /// made with the mirror started, or any other report, since the last lent fence or wait for
+    /// idle (R syncs there with E parked).
+    bool onef_sync_owed{};
+    /// R: inside a posted fence (its closing gather ran on E).
+    bool onef_fence_posted{};
+    /// E: whether a fence op can be posted now, and the post (0 sync point, 1 reference,
+    /// 2 forced release).
+    [[nodiscard]] bool OneFollowerFenceClean();
+    void OneFollowerPostFence(u8 kind, u32 value);
     /// E: FRITCHII_ONEF_GATHER_E's runahead condition (logged once per change).
     [[nodiscard]] bool OneFollowerRunaheadOff(const char* where);
     /// E: the pages of the report ops it pushed (FRITCHII_ONEF_QUERY_OPS), for item 2's test.

@@ -527,6 +527,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_ONEF_SYNC_MIRROR") {
         return &g_onef_sync_mirror;
     }
+    if (name == "FRITCHII_ONEF_POST_FENCE") {
+        return &g_onef_post_fence;
+    }
     return nullptr;
 }
 

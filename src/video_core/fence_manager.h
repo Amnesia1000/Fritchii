@@ -99,6 +99,10 @@ public:
         SignalFence(std::move(do_nothing));
     }
 
+    /// One follower (FRITCHII_ONEF_POST_FENCE): set on R around a posted fence, whose buffer
+    /// half E owns (and found empty when it posted).
+    bool skip_buffer_half{};
+
     void SyncOperation(std::function<void()>&& func) {
         // Not only the GPU thread queues these (query cache work runs elsewhere too), while
         // SignalFence moves the list into pending_operations: unguarded, the list was corrupted
@@ -822,6 +826,11 @@ private:
                                           "FenceManager::CommitCacheFlushes");
                 }
             }
+        }
+        // One follower (FRITCHII_ONEF_POST_FENCE): a posted fence's buffer half is E's, and E
+        // posted it only with nothing to commit there.
+        if (skip_buffer_half) [[unlikely]] {
+            buffer_idle = true;
         }
         if (fast != 0) [[unlikely]] {
             NoteFenceCommitFast(fast, texture_idle, buffer_idle);

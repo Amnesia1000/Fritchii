@@ -144,6 +144,7 @@ struct Impl {
     std::array<u64, static_cast<size_t>(OpCount::Count)> op_logged{};
     u64 op_bytes_logged{};
     std::array<std::atomic<u64>, 3> mirror_count{}; ///< compared, E set R not, R set E not
+    std::atomic<bool> post_fence_stopped{};
     std::array<u64, 3> mirror_logged{};
     std::atomic<u64> fences_lent{};
     std::atomic<u64> fences_with_flush{};
@@ -1554,10 +1555,23 @@ bool SyncMirrorOn() noexcept {
                                                     "FRITCHII_ONEF_SYNC_MIRROR") != 0;
 }
 
+bool PostFenceOn() noexcept {
+    return g.on && Step() == StepLevel::Unlend &&
+           VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_post_fence,
+                                            "FRITCHII_ONEF_POST_FENCE") != 0 &&
+           !VideoCore::Nx2Debug::DelayedFences() &&
+           !g.post_fence_stopped.load(std::memory_order_relaxed);
+}
+
 void CountSyncMirror(bool engine_bit, bool render_bit) noexcept {
     g.mirror_count[0].fetch_add(1, std::memory_order_relaxed);
     if (engine_bit == render_bit) {
         return;
+    }
+    if (render_bit && !g.post_fence_stopped.exchange(true, std::memory_order_relaxed)) {
+        // E's "no sync owed" test reads the mirror as a superset of R's counter: wrong now.
+        LOG_CRITICAL(HW_GPU, "One follower: R's samples counter ran where E's mirror had it "
+                             "stopped; FRITCHII_ONEF_POST_FENCE stops for this session");
     }
     g.mirror_count[engine_bit ? 1 : 2].fetch_add(1, std::memory_order_relaxed);
     Note(Check::SyncMirror, engine_bit ? "a samples report: E's mirror started, R's counter not"

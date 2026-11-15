@@ -1433,6 +1433,16 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   mirror", and a 10 s line with the reports compared and the two kinds of mismatch. It prices
   the by-value query sync of posted fences: the sync needs this mirror exact. Clears count as a
   superset (R starts the count only for a clear it cannot defer).
+- FRITCHII_ONEF_POST_FENCE (live, default 0; fable_b_one_follower 16.3; step 4, immediate
+  fences only): 1 = a sync point, a reference or a forced fence release is posted when E finds it
+  clean: no query sync owed (no samples report since the last lent fence or wait for idle while
+  E's mirror had the counter started, and no report of another kind), and nothing for the
+  buffer cache to commit. E runs the fence's closing gather itself first; R runs the fence with
+  its buffer half and closing gather skipped, so it never enters the buffer cache. Fences with
+  a caller's callback (SignalFence) stay lent. A "sync mirror" mismatch with R's counter
+  started and E's mirror not stops it for the session (the test reads the mirror as a
+  superset). With immediate fences the forced release's wait ends inside its own SignalFence
+  (the callback runs there), so posting it changes no landing time.
 - FRITCHII_ONEF_OP_CLEAR (live, default 0; fable_b_one_follower 13.4 group 3; step 4, view
   tracked): 1 = clears are render ops. E has decided the render enable (DrawManager tests
   ShouldExecute) and runs the clear's FlushCaching; R plays Clear from its view (every clear

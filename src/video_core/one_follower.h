@@ -552,6 +552,11 @@ void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size,
 /// FRITCHII_ONEF_SYNC_MIRROR (live; fable_b 16.2, dry): E keeps a mirror of R's samples counter
 /// "started" bit and R compares it at every samples report ("sync mirror", must be 0).
 [[nodiscard]] bool SyncMirrorOn() noexcept;
+/// FRITCHII_ONEF_POST_FENCE (live; fable_b 16.3; step 4; immediate fences only): a sync point, a
+/// reference or a forced fence release E finds clean (no query sync owed, no buffer flush to
+/// commit) is posted; E runs the closing gather itself first. Stopped for the session by a "sync
+/// mirror" mismatch of the kind that makes E's test wrong (R started, E not).
+[[nodiscard]] bool PostFenceOn() noexcept;
 /// R, at a samples report: E's bit against R's streamer.
 void CountSyncMirror(bool engine_bit, bool render_bit) noexcept;
 /// E: the view is tracked and seeded at R (a posted op reads it).

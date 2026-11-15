@@ -271,6 +271,9 @@ inline std::atomic<int> g_onef_op_dma{-1};
 inline std::atomic<int> g_onef_flush_e{-1};
 /// FRITCHII_ONEF_SYNC_MIRROR (live, default 0): fable_b 16.2's samples counter mirror, dry.
 inline std::atomic<int> g_onef_sync_mirror{-1};
+/// FRITCHII_ONEF_POST_FENCE (live, default 0): fable_b 16.3, clean sync points, references and
+/// forced fence releases posted.
+inline std::atomic<int> g_onef_post_fence{-1};
 /// EDEN_NX2_LIGHT_TABLE_ARRAYS: docs/fritchii/switches.md.
 [[nodiscard]] inline bool LightTableArrays() {
     static const bool on = EnvSwitch("EDEN_NX2_LIGHT_TABLE_ARRAYS") > 0;
