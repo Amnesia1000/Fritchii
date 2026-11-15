@@ -480,6 +480,27 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     default:
         break;
     }
+    // FRITCHII_JIT_UNSAFE_EXTRA (boot, bits, default 0): Unsafe's float relaxations one at a time on
+    // top of the chosen accuracy (Auto already unfuses FMA and ignores the global monitor; the
+    // Unsafe sizing run was about +1 fps): 1 = reduced-error FP (estimates), 2 = inaccurate NaNs.
+    static const int unsafe_extra = [] {
+        const char* value = std::getenv("FRITCHII_JIT_UNSAFE_EXTRA");
+        const int bits = value != nullptr ? std::atoi(value) : 0;
+        if (bits != 0) {
+            LOG_WARNING(Core_ARM, "FRITCHII_JIT_UNSAFE_EXTRA={}: reduced-error FP {}, inaccurate NaN {}",
+                        bits, (bits & 1) != 0 ? "on" : "off", (bits & 2) != 0 ? "on" : "off");
+        }
+        return bits;
+    }();
+    if (unsafe_extra != 0) {
+        config.unsafe_optimizations = true;
+        if ((unsafe_extra & 1) != 0) {
+            config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP;
+        }
+        if ((unsafe_extra & 2) != 0) {
+            config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_InaccurateNaN;
+        }
+    }
     if (!Settings::IsFastmemEnabled()) {
         config.fastmem_pointer = std::nullopt;
         config.fastmem_exclusive_access = false;
