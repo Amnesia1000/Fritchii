@@ -331,6 +331,9 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 }
 #endif
 
+// main.cpp: the test switches this launch runs with, grouped by where each came from.
+std::string Nx2SwitchSummary();
+
 constexpr int default_mouse_hide_timeout = 2500;
 constexpr int default_input_update_timeout = 1;
 constexpr int EmuThreadStopTimeoutMs = 10'000;
@@ -2369,6 +2372,11 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
                      .arg(QString::fromStdString(title_name), instruction_set_suffix)
                      .toStdString();
     LOG_INFO(Frontend, "Booting game: {:016X} | {} | {}", title_id, title_name, title_version);
+    if (const std::string switches = Nx2SwitchSummary(); !switches.empty()) {
+        LOG_INFO(Frontend, "Test switches: {}", switches);
+    } else {
+        LOG_INFO(Frontend, "Test switches: none set");
+    }
     const auto gpu_vendor = QtCommon::system->GPU().Renderer().GetDeviceVendor();
     UpdateWindowTitle(title_name, title_version, gpu_vendor);
 
