@@ -211,6 +211,10 @@ private:
     // E only.
     u64 e_draw_seq{};
     u64 unlent_candidates{};
+    /// FillRing's last Transient refusal (fable_b 19's dry counter), and whether the fill of the
+    /// draw being routed refused (UnlentBlocker counts its own tests).
+    VideoCommon::OneFollower::TransientTest fill_test{};
+    bool filled_refused{};
     MemStage::StagedFacts facts{};
     std::vector<u32> handle_values;
 

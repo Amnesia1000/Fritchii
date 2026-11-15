@@ -680,6 +680,33 @@ inline constexpr std::array<const char*, static_cast<size_t>(QueryKind::Count)> 
     "plain report", "report on buffer page", "report on buffer page as op", "fence report",
     "payload release",
 };
+/// fable_b 19 step 2's dry counter: which test made a draw lend with LentReason::Transient, in
+/// the order UnlentBlocker and FillRing (vk_one_follower_draw.cpp) try them. Logged per second
+/// and per draw kind on the "One follower transient lends" line (with the hand-over line's 10 s
+/// window), so each fix below is checked against its own count.
+enum class TransientTest : u8 {
+    ViewNotSeeded, ///< no lent packet seeded R's view yet, or the step changed since the seed
+    Channel,       ///< the view follows another channel's engine (a bind since the last lent packet)
+    EngineHint,    ///< Maxwell3D::engine_state differs from what the last lent packet gave the view
+    NativeMode,    ///< the native macro mode differs likewise
+    BankReaders,   ///< R-side readers of the constant buffer bindings are on (TEX_BANK_GEN, ...)
+    BufferPaths,   ///< a path that touches the buffer cache on R or changes who fills
+    VertexLimit,   ///< first + count past 16M vertices (Draw skips it)
+    IndirectReset, ///< a non-indexed single-instance native draw of points (IsNx2IndirectReset)
+    FillTexel,     ///< E's fill refused: texel buffers (they need the texture cache)
+    FillRoom,      ///< E's fill refused: no room in ring B
+    FillOther,     ///< E's fill refused: packets or values by value off, marks ahead, the fill
+    Count,
+};
+inline constexpr std::array<const char*, static_cast<size_t>(TransientTest::Count)>
+    transient_test_names{
+        "view not seeded", "channel",      "engine hint",     "native mode",
+        "bank readers",    "buffer paths", "vertex limit",    "indirect reset",
+        "fill: texel buffers", "fill: no ring room", "fill: other",
+    };
+/// E: a draw of UnlendKind `kind` is lent as Transient because of `test`.
+void CountTransient(TransientTest test, u32 kind) noexcept;
+
 /// E, before the Lend or PushOp of a query: its kind (counted with the park's time).
 void SetQueryKind(QueryKind kind) noexcept;
 /// E: a query handled without a packet (item 1(a)).

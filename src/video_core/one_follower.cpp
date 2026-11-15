@@ -177,6 +177,13 @@ struct Impl {
 
     std::atomic<Maxwell3D*> engine{};
     std::atomic<bool> unlend_disabled{}; ///< DisableUnlend: step 4 off for the session
+
+    // fable_b 19 step 2's dry counter (E counts at each transient lend; LogQueryKinds reads).
+    std::array<std::array<std::atomic<u64>, Stats::KindSlots>,
+               static_cast<size_t>(TransientTest::Count)>
+        transient{};
+    std::array<std::array<u64, Stats::KindSlots>, static_cast<size_t>(TransientTest::Count)>
+        transient_logged{};
 };
 
 Impl g;
@@ -699,6 +706,35 @@ void LogQueryKinds() {
     g.landing_waits_logged = g.landing_waits.load(std::memory_order_relaxed);
     g.lends_holding_lock_logged = g.lends_holding_lock.load(std::memory_order_relaxed);
     g.op_bytes_logged = op_bytes;
+    // fable_b 19 step 2: transient lent draws by the test that fired, each split by kind.
+    {
+        std::string tests;
+        u64 total = 0;
+        for (size_t test = 0; test < transient_test_names.size(); ++test) {
+            u64 sum = 0;
+            std::string kinds;
+            for (size_t slot = 0; slot < Stats::KindSlots; ++slot) {
+                const u64 count = g.transient[test][slot].load(std::memory_order_relaxed);
+                const u64 delta = count - g.transient_logged[test][slot];
+                g.transient_logged[test][slot] = count;
+                if (delta == 0) {
+                    continue;
+                }
+                sum += delta;
+                kinds += fmt::format("{}{} {:.0f}", kinds.empty() ? "" : ", ",
+                                     Stats::kind_names[slot],
+                                     static_cast<double>(delta) / seconds);
+            }
+            total += sum;
+            tests += fmt::format("{}{} {:.0f}/s{}{}{}", test == 0 ? "" : ", ",
+                                 transient_test_names[test],
+                                 static_cast<double>(sum) / seconds, kinds.empty() ? "" : " (",
+                                 kinds, kinds.empty() ? "" : ")");
+        }
+        LOG_INFO(HW_GPU,
+                 "One follower transient lends (fable_b 19) {:.0f} s: {:.0f}/s; by test: {}",
+                 seconds, static_cast<double>(total) / seconds, tests);
+    }
     LOG_INFO(HW_GPU,
              "One follower queries by kind (FRITCHII_ONEF_QUERY_OPS={}) {:.0f} s: {}; acquire "
              "latches this session by R {}, E {}, other threads {}",
@@ -1783,6 +1819,12 @@ void CountLentGatherRanges(u64 ranges) noexcept {
 
 void SetLendSite(const char* site) noexcept {
     t_lend_site = site;
+}
+
+void CountTransient(TransientTest test, u32 kind) noexcept {
+    const size_t index = (std::min)(static_cast<size_t>(test),
+                                    static_cast<size_t>(TransientTest::Count) - 1);
+    g.transient[index][Stats::KindSlot(kind)].fetch_add(1, std::memory_order_relaxed);
 }
 
 void SetQueryKind(QueryKind kind) noexcept {

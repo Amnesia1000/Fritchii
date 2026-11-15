@@ -240,17 +240,32 @@ OneF::LentReason OneFollowerDraw::UnlentBlocker(Maxwell3D& engine, bool is_index
         Common::DkbFrameTrace::Enabled()) {
         return LentReason::Diagnostic;
     }
-    // Transient: what R's view or R's path cannot carry yet.
+    // Transient: what R's view or R's path cannot carry yet. Each test counts itself (fable_b
+    // 19 step 2's dry counter, the "One follower transient lends" line).
+    using OneF::TransientTest;
+    const auto transient = [kind](TransientTest test) {
+        OneF::CountTransient(test, kind);
+        return LentReason::Transient;
+    };
     const auto& draw = engine.draw_manager.draw_state;
     const bool native = engine.GetNativeMacroEngine().native_turing;
-    if (!view_ready || synced_engine != &engine || synced_engine_state != engine.engine_state ||
-        synced_native != native || seeded_step != OneF::Step()) {
-        return LentReason::Transient; // the lent packet seeds or syncs the view
+    // The lent packet seeds or syncs the view.
+    if (!view_ready || seeded_step != OneF::Step()) {
+        return transient(TransientTest::ViewNotSeeded);
+    }
+    if (synced_engine != &engine) {
+        return transient(TransientTest::Channel);
+    }
+    if (synced_engine_state != engine.engine_state) {
+        return transient(TransientTest::EngineHint);
+    }
+    if (synced_native != native) {
+        return transient(TransientTest::NativeMode);
     }
     // Readers of the constant buffer bindings on R (the view has them only from lent packets).
     if (Debug::SwitchValue(Debug::g_tex_bank_gen, "EDEN_NX2_TEX_BANK_GEN") > 0 ||
         Debug::Experiment(87) != 0 || (MemStage::VerifyBits() & MemStage::VerifyHandles) != 0) {
-        return LentReason::Transient;
+        return transient(TransientTest::BankReaders);
     }
     // Paths that touch the buffer cache or its lock on R, or change who fills.
     if (InvalidateBeforeUseOn() || engine.regs.transform_feedback_enabled != 0 ||
@@ -259,7 +274,7 @@ OneF::LentReason OneFollowerDraw::UnlentBlocker(Maxwell3D& engine, bool is_index
          Debug::Experiment(VideoCommon::FritchiiDeltaPath::Switch) != 0) ||
         VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed) ||
         VideoCommon::MemoryStageLink::RingActive()) {
-        return LentReason::Transient;
+        return transient(TransientTest::BufferPaths);
     }
     if (kind == OneF::List) {
         return LentReason::Count; // Draw's early outs below are not DrawListWords'
@@ -268,11 +283,11 @@ OneF::LentReason OneFollowerDraw::UnlentBlocker(Maxwell3D& engine, bool is_index
     const u64 first = is_indexed ? draw.index_buffer.first : draw.vertex_buffer.first;
     const u64 count = is_indexed ? draw.index_buffer.count : draw.vertex_buffer.count;
     if (first + count > (u64{1} << 24)) {
-        return LentReason::Transient;
+        return transient(TransientTest::VertexLimit);
     }
     if (!is_indexed && instance_count == 1 && native &&
         draw.topology == Maxwell::PrimitiveTopology::Points) {
-        return LentReason::Transient; // a candidate for IsNx2IndirectReset
+        return transient(TransientTest::IndirectReset); // a candidate for IsNx2IndirectReset
     }
     return LentReason::Count;
 }
@@ -292,8 +307,12 @@ bool OneFollowerDraw::FillRing(Maxwell3D& engine, GraphicsPipeline* pipeline, bo
     // it (MemFacts). Else join 1 (spec 4.4): the facts R published for these programs.
     const MemStage::DrawFacts pipeline_facts =
         pipeline != nullptr ? pipeline->MemFacts() : MemStage::DrawFacts{};
+    // Which refusal a Transient return is (the dry counter; RouteDraw and RouteListDraw count it).
+    fill_test = OneF::TransientTest::FillOther;
+    filled_refused = true;
     if (pipeline != nullptr) {
         if (pipeline_facts.has_texel_buffers || pipeline_facts.stage_infos == nullptr) {
+            fill_test = OneF::TransientTest::FillTexel;
             return false; // texel buffers need the texture cache (LateFill)
         }
         facts.hashes = pipeline_facts.hashes;
@@ -311,6 +330,12 @@ bool OneFollowerDraw::FillRing(Maxwell3D& engine, GraphicsPipeline* pipeline, bo
     if ((pipeline == nullptr && (facts.has_texel_buffers || facts.infos == nullptr)) ||
         !r.mem_stage.Packets() || !r.mem_stage.ValuesByValue() || !r.mem_stage.RingRoom() ||
         r.buffer_cache.MarksAhead()) {
+        fill_test = pipeline == nullptr && (facts.has_texel_buffers || facts.infos == nullptr)
+                        ? OneF::TransientTest::FillTexel
+                    : r.mem_stage.Packets() && r.mem_stage.ValuesByValue() &&
+                            !r.mem_stage.RingRoom()
+                        ? OneF::TransientTest::FillRoom
+                        : OneF::TransientTest::FillOther;
         return false; // texel buffers need the texture cache (LateFill); no room or no values
     }
     std::scoped_lock lock{r.buffer_cache.mutex};
@@ -473,6 +498,7 @@ bool OneFollowerDraw::RouteDraw(bool is_indexed, u32 instance_count) {
         LendDraw(is_indexed, instance_count, LentReason::KindNotInMask, false);
         return true;
     }
+    filled_refused = false;
     LentReason reason = UnlentBlocker(engine, is_indexed, instance_count, kind);
     // Mesh: native task/mesh pipelines only (the emulation's buffers are not R's alone). Without
     // VK_EXT_mesh_shader every mesh pipeline is emulated or skipped.
@@ -482,6 +508,9 @@ bool OneFollowerDraw::RouteDraw(bool is_indexed, u32 instance_count) {
     }
     if (reason == LentReason::Count && FillAndPush(engine, is_indexed, seq, false, reason)) {
         return true;
+    }
+    if (reason == LentReason::Transient && filled_refused) {
+        OneF::CountTransient(fill_test, kind); // FillRing's refusal (the dry counter)
     }
     LendDraw(is_indexed, instance_count, reason, reason == LentReason::Verify);
     return true;
@@ -506,6 +535,7 @@ bool OneFollowerDraw::RouteListDraw() {
     // As OneFollowerDrawIndirect describes it: a list draw is drawn non-indexed (DrawListWords).
     OneF::SetNextDraw(OneF::List, false, true, 0);
     LentReason reason;
+    filled_refused = false;
     if (engine.GetNativeMacroEngine().native_turing && engine.regs.IsMeshEnabled() &&
         (mask & OneF::Mesh) == 0) {
         reason = LentReason::KindNotInMask; // a list draw on a mesh pipeline needs both bits
@@ -521,6 +551,9 @@ bool OneFollowerDraw::RouteListDraw() {
             rasterizer.onef_list_keeps_unplayed = true;
         }
         return true;
+    }
+    if (reason == LentReason::Transient && filled_refused) {
+        OneF::CountTransient(fill_test, OneF::List); // FillRing's refusal (the dry counter)
     }
     LendDraw(false, 0, reason, reason == LentReason::Verify, true);
     return true;

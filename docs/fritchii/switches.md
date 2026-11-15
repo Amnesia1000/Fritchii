@@ -1478,6 +1478,11 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   call sites that parked E longest (the rasterizer function's name and its op, rate and parked
   ms/s; "direct" = Lend called outside the rasterizer's entry points: lent draws, verify
   compares, the memory seam's syncs): the pricing of fable_b 11.1 items 3 to 7.
+- With FRITCHII_ONEF=1 (or LEAN), every 10 s "One follower transient lends" (fable_b 19 step 2's
+  dry counter): the draws lent with reason "transient", per second, by the test that made them
+  lent (view not seeded, channel, engine hint, native mode, bank readers, buffer paths, vertex
+  limit, indirect reset, and E's fill refusing: texel buffers, no ring room, other), each split
+  by draw kind. FRITCHII_ONEF_UNLENT_RESET, _UNLENT_VALUES and _BIND_SEED are checked against it.
 - FRITCHII_ONEF_WAITS_E (live, default 0; fable_b_one_follower 11.2): 1 = the front's waits at
   the macro dma read/writes, qmd read, semaphore flush, list writers/sync/copy writers/flush and
   macro dma dispatch sites end when E ran the target and R played the newest report render op
