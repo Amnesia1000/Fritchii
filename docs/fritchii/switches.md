@@ -2562,7 +2562,9 @@ OnCPUWrite, collects the dirty bit, fences for a download landing and sets the c
   means no OnCPUWrite either). The landing wait: the memo is only kept when that path saw no
   landing published, so every landing published later found the block's collected bit (still
   collected: no gather) and keeps those bytes. The uniform keeps' record still runs on a hit.
-  The epoch moves whatever the switch says, so a switch change never trusts an old memo.
+  The epoch moves whatever the switch says, so a switch change never trusts an old memo. Its
+  cost with the switch off: two atomic adds per flag take that clears a set bit and per gather
+  that takes something (an empty gather now returns before its exchange and moves nothing).
 - "Store memo (FRITCHII_STORE_MEMO=n) 10000 ms: trapped stores S/s, would serve (=2: served) H/s
   (P%), same block but a mark taken since M/s; epoch moves: gathers G/s, flag takes T/s; since
   boot hits/stores by core ..." (HW_Memory, Info; at most every 10 s while the switch is on).
