@@ -3613,6 +3613,10 @@ private:
     /// FRITCHII_ONEF_DEAD_STORES (fable_b 27.7, count only): an 0xea0 call begins (`end`
     /// false: are the last call's trailing stores dead?) or ended (its stores noted).
     void FrontDeadStores(VideoCommon::GpuSplit& split, FrontState& state, bool end);
+    /// FRITCHII_ONEF_FILL_COUNT (fable_b 28.5, S4's count): a sampled bind's bytes as the front
+    /// reads them after the bind op, sent for E to compare with the bytes at its bind.
+    void FrontFillCount(VideoCommon::GpuSplit& split, FrontState& state);
+    static void BackFillCount(const u64* payload);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
     /// FrontRunMacro's two bodies: v5.7's (no macro switch on) and the one with EXP53,
     /// EDEN_NX2_OOT_MACROS, EDEN_NX2_FOLD_INSTANCE and EDEN_NX2_DRAW_PACKET. FrontState's

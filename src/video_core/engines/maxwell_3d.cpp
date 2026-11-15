@@ -20,6 +20,7 @@
 #include <vector>
 #include "common/assert.h"
 #include "common/bit_util.h"
+#include "common/cityhash.h"
 #include "common/fritchii_write_ring.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -1994,6 +1995,8 @@ struct Maxwell3D::FrontState {
         std::chrono::steady_clock::time_point report{};
     };
     DeadStores dead_stores{};
+    /// FRITCHII_ONEF_FILL_COUNT: bind ops seen (every 16th is sampled).
+    u64 fill_binds{};
 };
 
 namespace {
@@ -6257,6 +6260,11 @@ void Maxwell3D::FrontOpFinish(VideoCommon::GpuSplit& split, FrontState& fs, bool
         }
         FrontWriteNotes(split, fs, method, op.decisions[i]);
     }
+    if ((op.args.op == OotOps::Op::E02 || op.args.op == OotOps::Op::E08) &&
+        VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_fill_count,
+                                         "FRITCHII_ONEF_FILL_COUNT") != 0) [[unlikely]] {
+        FrontFillCount(split, fs);
+    }
 }
 
 void Maxwell3D::FrontOpReport(FrontState& fs, int mode) {
@@ -6626,6 +6634,80 @@ void Maxwell3D::FrontDeadStores(VideoCommon::GpuSplit& split, FrontState& fs, bo
              "resets overwritten by the next call with nothing sent between ({} of those upload "
              "the same two words as the call before), {} with entries between",
              d.calls, d.dead, d.same_upload, d.between);
+}
+
+namespace {
+/// FRITCHII_ONEF_FILL_COUNT: the bytes of a bound range compared (its first 4 KiB).
+constexpr u32 FillCountBytes = 0x1000;
+struct FillCounts {
+    std::atomic<u64> sampled{};
+    std::atomic<u64> same{};
+    std::atomic<u64> differ_queued{};
+    std::atomic<u64> differ_unqueued{};
+    std::chrono::steady_clock::time_point report{};
+};
+FillCounts g_fill_counts{};
+} // Anonymous namespace
+
+void Maxwell3D::FrontFillCount(VideoCommon::GpuSplit& split, FrontState& fs) {
+    // fable_b 28.5, count only: the assumption S4 rests on is that a bound range's bytes are the
+    // same when the front parses the bind and when E fills from it, unless a queued upload (the
+    // front notes those) writes them. A sample of the bind ops: the front's bytes (read raw,
+    // no flush) hashed here, with whether noted work that may write them is still queued; E
+    // reads the same bytes when it runs the entry, right after the bind, and counts.
+    if ((fs.fill_binds++ & 15) != 0) {
+        return;
+    }
+    const u32 size = fs.regs[MAXWELL3D_REG_INDEX(const_buffer.size)];
+    const GPUVAddr address =
+        (GPUVAddr{fs.regs[MAXWELL3D_REG_INDEX(const_buffer.address_high)]} << 32) |
+        fs.regs[MAXWELL3D_REG_INDEX(const_buffer.address_low)];
+    const u32 bytes = (std::min)(size, FillCountBytes) & ~3U;
+    if (bytes == 0 || !memory_manager.GpuToCpuAddress(address)) {
+        return;
+    }
+    std::array<u8, FillCountBytes> data;
+    memory_manager.ReadBlockUnsafe(address, data.data(), bytes);
+    const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(data.data()), bytes);
+    const bool queued = split.HasQueuedMemoryWriters(address, address + bytes);
+    split.CallWithPayload(
+        &Maxwell3D::BackFillCount, 4, VideoCommon::GpuSplit::Effect::None,
+        [&](u64* payload) {
+            payload[0] = reinterpret_cast<u64>(this);
+            payload[1] = address;
+            payload[2] = u64{bytes} | (u64{queued ? 1U : 0U} << 32);
+            payload[3] = hash;
+        },
+        VideoCommon::Nx2FastDrawCount::Neutral() |
+            VideoCommon::StageTagBits(VideoCommon::StageTag::Pass));
+}
+
+void Maxwell3D::BackFillCount(const u64* payload) {
+    auto* const self = reinterpret_cast<Maxwell3D*>(payload[0]);
+    const GPUVAddr address = payload[1];
+    const u32 bytes = (std::min)(static_cast<u32>(payload[2]), FillCountBytes);
+    const bool queued = (payload[2] >> 32) != 0;
+    std::array<u8, FillCountBytes> data;
+    self->memory_manager.ReadBlockUnsafe(address, data.data(), bytes);
+    const bool same =
+        Common::CityHash64(reinterpret_cast<const char*>(data.data()), bytes) == payload[3];
+    auto& c = g_fill_counts;
+    OpBump(c.sampled);
+    OpBump(same ? c.same : queued ? c.differ_queued : c.differ_unqueued);
+    if ((c.sampled.load(std::memory_order_relaxed) & 255) != 0) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - c.report < std::chrono::seconds{1}) {
+        return;
+    }
+    c.report = now;
+    LOG_INFO(HW_GPU,
+             "Fill count (FRITCHII_ONEF_FILL_COUNT): {} binds sampled, {} with the same bytes at "
+             "E's bind, {} differ with a queued writer, {} differ with none (expected 0)",
+             c.sampled.load(std::memory_order_relaxed), c.same.load(std::memory_order_relaxed),
+             c.differ_queued.load(std::memory_order_relaxed),
+             c.differ_unqueued.load(std::memory_order_relaxed));
 }
 
 } // namespace Tegra::Engines
