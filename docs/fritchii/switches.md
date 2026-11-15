@@ -1443,6 +1443,15 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   started and E's mirror not stops it for the session (the test reads the mirror as a
   superset). With immediate fences the forced release's wait ends inside its own SignalFence
   (the callback runs there), so posting it changes no landing time.
+  With fable_b 16.2 a fence that owes query syncs posts too: E obtains the buffers for the
+  slots R will sync there (samples reports made with the mirror started, cleared at every
+  fence; payload releases, kept until a lent fence) at the fence's place, their uploads an op
+  packet before it, and the op names them; R's SyncValues copies into them without the buffer
+  lock. Must be 0: "sync target missing" (a value no target holds: not copied, posting stops),
+  "sync target unused" (a samples target R had no value for). Only other report kinds still
+  make a fence lent. 13.0: every report's page then waits, in E's buffer cache reads of game
+  memory, for the posted fence after it to be played by R (a folded fence lands the queued
+  reports at R's place); counted in the op packets line.
 - FRITCHII_ONEF_OP_CLEAR (live, default 0; fable_b_one_follower 13.4 group 3; step 4, view
   tracked): 1 = clears are render ops. E has decided the render enable (DrawManager tests
   ShouldExecute) and runs the clear's FlushCaching; R plays Clear from its view (every clear

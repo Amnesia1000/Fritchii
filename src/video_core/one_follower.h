@@ -214,6 +214,12 @@ enum class Check : u8 {
     /// FRITCHII_ONEF_SYNC_MIRROR (dry): at a samples report, E's mirror of R's "counter
     /// started" bit (fable_b 16.2) differs from R's streamer.
     SyncMirror,
+    /// fable_b 16.2: R, syncing query values in a posted fence, found a range none of the op's
+    /// targets (the buffers E obtained) holds: the value is not copied, fences post no more.
+    SyncTargetMissing,
+    /// fable_b 16.2: a target E obtained for a samples report that R had no value for (E's
+    /// mirror said a sync was owed): its early upload may have cleared a mark serial keeps.
+    SyncTargetUnused,
     Count,
 };
 
@@ -225,6 +231,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Check::Count)> chec
     "facts stale", "played lookup miss", "texture read ahead of R", "ring B pairing",
     "R waits for E's lock", "R needs E's buffer flush",
     "build list draw", "played list args", "played kind without path", "sync mirror",
+    "sync target missing", "sync target unused",
 };
 
 // --- The packet (E to R) -----------------------------------------------------------------------------
@@ -584,6 +591,16 @@ void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size,
 /// commit) is posted; E runs the closing gather itself first. Stopped for the session by a "sync
 /// mirror" mismatch of the kind that makes E's test wrong (R started, E not).
 [[nodiscard]] bool PostFenceOn() noexcept;
+/// Stops FRITCHII_ONEF_POST_FENCE for the session (a must-be-0 of its own fired).
+void StopPostFence(const char* why) noexcept;
+/// E: the packet number of the packet it pushed last.
+[[nodiscard]] u64 PushedNow() noexcept;
+/// fable_b 13.0 (POST_FENCE), E: a report to `device`'s page was made; a fence op with `number`
+/// was posted (the reports since the last fence land there); a fence was lent (everything
+/// before it landed with E parked).
+void NoteReportPage(u64 device) noexcept;
+void NoteFencePosted(u64 number) noexcept;
+void NoteFenceLent() noexcept;
 /// R, at a samples report: E's bit against R's streamer.
 void CountSyncMirror(bool engine_bit, bool render_bit) noexcept;
 /// E: the view is tracked and seeded at R (a posted op reads it).

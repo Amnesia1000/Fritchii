@@ -22,6 +22,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -145,6 +146,12 @@ struct Impl {
     u64 op_bytes_logged{};
     std::array<std::atomic<u64>, 3> mirror_count{}; ///< compared, E set R not, R set E not
     std::atomic<bool> post_fence_stopped{};
+    // fable_b 13.0 (E only): pages with a report a posted fence lands, by that fence's packet
+    // number; and the report pages since the last fence.
+    std::unordered_map<u64, u64> landing_pages;
+    std::vector<u64> landing_unassigned;
+    std::atomic<u64> landing_waits{};
+    u64 landing_waits_logged{};
     std::array<u64, 3> mirror_logged{};
     std::atomic<u64> fences_lent{};
     std::atomic<u64> fences_with_flush{};
@@ -679,12 +686,17 @@ void LogQueryKinds() {
     (void)posted;
     LOG_INFO(HW_GPU,
              "One follower op packets (fable_b 13.1; FRITCHII_ONEF_OP_INLINE={}) {:.0f} s: {}; "
-             "{:.1f} KiB/s of entries posted; lends parked holding a lock {:.0f}/s (handed to R)",
+             "{:.1f} KiB/s of entries posted; lends parked holding a lock {:.0f}/s (handed to "
+             "R); E reads that waited for a posted fence's report landing {:.0f}/s",
              PostOpSite(15) ? 1 : 0, seconds, ops,
              static_cast<double>(op_bytes - g.op_bytes_logged) / 1024.0 / seconds,
              static_cast<double>(g.lends_holding_lock.load(std::memory_order_relaxed) -
                                  g.lends_holding_lock_logged) /
+                 seconds,
+             static_cast<double>(g.landing_waits.load(std::memory_order_relaxed) -
+                                 g.landing_waits_logged) /
                  seconds);
+    g.landing_waits_logged = g.landing_waits.load(std::memory_order_relaxed);
     g.lends_holding_lock_logged = g.lends_holding_lock.load(std::memory_order_relaxed);
     g.op_bytes_logged = op_bytes;
     LOG_INFO(HW_GPU,
@@ -1555,6 +1567,67 @@ bool SyncMirrorOn() noexcept {
                                                     "FRITCHII_ONEF_SYNC_MIRROR") != 0;
 }
 
+void StopPostFence(const char* why) noexcept {
+    if (!g.post_fence_stopped.exchange(true, std::memory_order_relaxed)) {
+        LOG_CRITICAL(HW_GPU, "One follower: FRITCHII_ONEF_POST_FENCE stops for this session ({})",
+                     why != nullptr ? why : "?");
+    }
+}
+
+u64 PushedNow() noexcept {
+    return g.pushed;
+}
+
+void NoteReportPage(u64 device) noexcept {
+    const u64 page = device >> 12;
+    if (g.landing_unassigned.empty() || g.landing_unassigned.back() != page) {
+        g.landing_unassigned.push_back(page);
+    }
+}
+
+void NoteFencePosted(u64 number) noexcept {
+    if (g.landing_unassigned.empty()) {
+        return;
+    }
+    const u64 played = g.played.load(std::memory_order_acquire);
+    if (g.landing_pages.size() > 4096) {
+        std::erase_if(g.landing_pages, [played](const auto& entry) { return entry.second <= played; });
+    }
+    for (const u64 page : g.landing_unassigned) {
+        g.landing_pages[page] = number;
+    }
+    g.landing_unassigned.clear();
+    g_report_landing_watch.store(true, std::memory_order_relaxed);
+}
+
+void NoteFenceLent() noexcept {
+    // R played everything before the lend, and a fence it ran there landed its reports.
+    g.landing_pages.clear();
+    g.landing_unassigned.clear();
+    g_report_landing_watch.store(false, std::memory_order_relaxed);
+}
+
+void WaitReportLanding(u64 address, u64 size) noexcept {
+    if (size == 0 || g.landing_pages.empty()) {
+        g_report_landing_watch.store(!g.landing_pages.empty(), std::memory_order_relaxed);
+        return;
+    }
+    for (u64 page = address >> 12; page <= (address + size - 1) >> 12; ++page) {
+        const auto it = g.landing_pages.find(page);
+        if (it == g.landing_pages.end()) {
+            continue;
+        }
+        const u64 number = it->second;
+        if (g.played.load(std::memory_order_acquire) < number) {
+            g.landing_waits.fetch_add(1, std::memory_order_relaxed);
+            EngineWait([&] { return g.played.load(std::memory_order_acquire) >= number; },
+                       EWait::Drain, number);
+        }
+        g.landing_pages.erase(it);
+    }
+    g_report_landing_watch.store(!g.landing_pages.empty(), std::memory_order_relaxed);
+}
+
 bool PostFenceOn() noexcept {
     return g.on && Step() == StepLevel::Unlend &&
            VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_post_fence,
@@ -1605,6 +1678,8 @@ bool PostOpSite(u8 site) noexcept {
         return SwitchValue(g_onef_op_listkeep, "FRITCHII_ONEF_OP_LISTKEEP") != 0;
     case 14: // MemStage::Site::Dma: AccelerateDMA's buffer copies and clears on E
         return SwitchValue(g_onef_op_dma, "FRITCHII_ONEF_OP_DMA") != 0;
+    case 18: // MemStage::Site::Query: the sync buffers E obtains for a posted fence (16.2)
+        return PostFenceOn();
     default:
         return false;
     }

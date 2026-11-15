@@ -409,6 +409,7 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu
             forced >= 0 ? forced == 1 : Tegra::g_nx2_ampere.load(std::memory_order_relaxed);
         if (inline_writes && IsRegionRegistered(device_addr, size)) {
             tmp_buffer.resize_destructive(size);
+            VideoCommon::OneFollower::BeforeEngineRead(device_addr, size);
             device_memory.ReadBlockUnsafe(device_addr, tmp_buffer.data(), size);
             MemReadLog::Bytes(MemReadLog::Kind::InlinePageWrite, device_memory, device_addr, size);
             InlineMemoryImplementation(device_addr, size, tmp_buffer);
@@ -504,6 +505,7 @@ void BufferCache<P>::CachedWriteMemory(DAddr device_addr, u64 size) {
 
     Nx2NoteListHostWrite(device_addr, size);
     tmp_buffer.resize_destructive(size);
+    VideoCommon::OneFollower::BeforeEngineRead(device_addr, size);
     device_memory.ReadBlockUnsafe(device_addr, tmp_buffer.data(), size);
 
     InlineMemoryImplementation(device_addr, size, tmp_buffer);
@@ -559,6 +561,7 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
             ReadRunStats::WriterAnswer& writer = ReadRunStats::t_writer_answer;
             writer.compared =
                 static_cast<u32>((std::min<u64>)(size, ReadRunStats::CompareBytes));
+            VideoCommon::OneFollower::BeforeEngineRead(device_addr, writer.compared);
             device_memory.ReadBlockUnsafe(device_addr, writer.before.data(), writer.compared);
             ReadRunStats::ByteCheck check{.begin = device_addr, .end = device_addr + size};
             gpu_modified_ranges.ForEachInRange(
@@ -2355,6 +2358,7 @@ void BufferCache<P>::BindHostIndexBuffer() {
             } else if (guest_size != 0 &&
                        !GpuWrittenHere(channel_state->index_buffer.device_addr, guest_size)) {
                 guest_uint8_indices.resize(guest_size);
+                VideoCommon::OneFollower::BeforeEngineRead(channel_state->index_buffer.device_addr, guest_size);
                 device_memory.ReadBlockUnsafe(channel_state->index_buffer.device_addr,
                                               guest_uint8_indices.data(), guest_size);
                 indices = guest_uint8_indices;
@@ -2731,6 +2735,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                 : nullptr;
         NativeBankUploads bank_uploads;
         for (DAddr page = first_page; page < end; page += Core::DEVICE_PAGESIZE) {
+            VideoCommon::OneFollower::BeforeEngineRead(page, Core::DEVICE_PAGESIZE);
             const u8* const guest = device_memory.template GetPointer<u8>(page);
             if (guest == nullptr) {
                 continue;
@@ -2897,6 +2902,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         }
         if (!streamed) {
             const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
+            VideoCommon::OneFollower::BeforeEngineRead(device_addr, size);
             device_memory.ReadBlockUnsafe(device_addr, span.data(), size);
             Nx2Profile::AddFine(Nx2Profile::FineCounter::UniformStreamed, 1);
         }
@@ -3213,6 +3219,7 @@ bool BufferCache<P>::BindSmallUniformKeeping(size_t stage, u32 index, u32 bindin
                 if (keeps.stale_logged < Keeps::MaxStaleLogs) {
                     ++keeps.stale_logged;
                     // Where the bytes differ, against guest memory now.
+                    VideoCommon::OneFollower::BeforeEngineRead(device_addr, size);
                     device_memory.ReadBlockUnsafe(device_addr, keeps.fresh_bytes.data(), size);
                     u32 first_diff = size;
                     for (u32 i = 0; i < size; ++i) {
@@ -3589,6 +3596,7 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
             : nullptr;
     NativeBankUploads uploads;
     for (DAddr page = first_page; page < end; page += Core::DEVICE_PAGESIZE) {
+        VideoCommon::OneFollower::BeforeEngineRead(page, Core::DEVICE_PAGESIZE);
         const u8* const guest = device_memory.template GetPointer<u8>(page);
         if (guest == nullptr) {
             continue;
@@ -4419,6 +4427,7 @@ void BufferCache<P>::BindHostComputeUniformBuffers() {
                                   size);
                 const std::span<u8> span =
                     runtime.BindMappedUniformBuffer(0, binding_index, size);
+                VideoCommon::OneFollower::BeforeEngineRead(binding.device_addr, size);
                 device_memory.ReadBlockUnsafe(binding.device_addr, span.data(), size);
                 return;
             }
@@ -4569,6 +4578,7 @@ void BufferCache<P>::ProbeExtentTail(u32 index, const Binding& binding) {
         // cache already knows the GPU wrote, and CPU writes not in the buffer yet, may differ for
         // other reasons: they are left out.
         probe.guest.resize(span);
+        VideoCommon::OneFollower::BeforeEngineRead(tail, span);
         device_memory.ReadBlockUnsafe(tail, probe.guest.data(), span);
         const auto skip = [&](DAddr begin, DAddr end) {
             begin = (std::max)(begin, tail);
@@ -5719,6 +5729,7 @@ void BufferCache<P>::Nx2ReadListWords(const Nx2ListPage& entry, DAddr device_add
             std::memcpy(out.data(), copy + offset, out.size());
             return;
         }
+        VideoCommon::OneFollower::BeforeEngineRead(device_addr, out.size());
         device_memory.ReadBlockUnsafe(device_addr, out.data(), out.size());
         for (u64 byte = offset; byte < end;) {
             const u64 next = (std::min)((byte / 4 + 1) * 4, end);
@@ -6422,6 +6433,7 @@ void BufferCache<P>::ImmediateUploadMemory([[maybe_unused]] Buffer& buffer,
         for (const BufferCopy& copy : copies) {
             std::span<const u8> upload_span;
             const DAddr device_addr = buffer.CpuAddr() + copy.dst_offset;
+            VideoCommon::OneFollower::BeforeEngineRead(device_addr, copy.size);
             if (IsRangeGranular(device_addr, copy.size)) {
                 auto* const ptr = device_memory.GetPointer<u8>(device_addr);
                 if (ptr != nullptr) {
@@ -6449,6 +6461,7 @@ void BufferCache<P>::MappedUploadMemory([[maybe_unused]] Buffer& buffer,
         for (BufferCopy& copy : copies) {
             u8* const src_pointer = staging_pointer.data() + copy.src_offset;
             const DAddr device_addr = buffer.CpuAddr() + copy.dst_offset;
+            VideoCommon::OneFollower::BeforeEngineRead(device_addr, copy.size);
             // FRITCHII_BANK_FLAGGED: the bank snapshots of these bytes become what the host
             // buffer gets (guest memory may hold newer bytes already). Never read back from the
             // staging memory: it is write-combined, uncached for the CPU (reading it back cost
@@ -7013,6 +7026,7 @@ TextureBufferBinding BufferCache<P>::GetTextureBufferBinding(GPUVAddr gpu_addr, 
 
 template <class P>
 std::span<const u8> BufferCache<P>::ImmediateBufferWithData(DAddr device_addr, size_t size) {
+    VideoCommon::OneFollower::BeforeEngineRead(device_addr, size);
     u8* const base_pointer = device_memory.GetPointer<u8>(device_addr);
     if (IsRangeGranular(device_addr, size) ||
         base_pointer + size == device_memory.GetPointer<u8>(device_addr + size)) {
