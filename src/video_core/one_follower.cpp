@@ -163,6 +163,9 @@ struct Impl {
     std::atomic<bool> post_dispatch_stopped{};
     std::atomic<bool> dispatch_refused_logged{};
     u64 lookup_checks{};
+    u64 landing_max{}; ///< E: the newest packet number 13.0 assigned report pages to
+    std::array<std::atomic<u64>, static_cast<size_t>(IdleDecision::Count)> idle_decisions{};
+    std::array<u64, static_cast<size_t>(IdleDecision::Count)> idle_decisions_logged{};
     std::array<std::atomic<u64>, static_cast<size_t>(FenceDecision::Count)> fence_decisions{};
     std::array<u64, static_cast<size_t>(FenceDecision::Count)> fence_decisions_logged{};
     std::atomic<u64> sync_target_superset{};
@@ -360,7 +363,7 @@ constexpr std::size_t MaxSpanBytes = sizeof(RegPair) * Maxwell3D::Regs::NUM_REGS
                                      sizeof(BindValue) * MaxBindValues + 64;
 // 128 (2026-11-15): SEM_E's payload fence op (targets, note) is 96 bytes; at 64 it ran on E
 // (PushOp's oversize fallback) and recorded R's Vulkan work from E: a driver crash at boot.
-constexpr std::size_t MaxPayloadBytes = 128;
+constexpr std::size_t MaxPayloadBytes = MaxOpPayloadBytes;
 
 /// FRITCHII_ONEF_CARRY_OPS (fable_b 22.3 step 2): one op E keeps for the next packet, followed by
 /// its payload padded to 8 bytes.
@@ -810,13 +813,25 @@ void LogQueryKinds() {
                                     seconds);
             g.fence_decisions_logged[i] = count;
         }
+        static constexpr std::array<const char*, static_cast<size_t>(IdleDecision::Count)>
+            idle_names{"posted, R caught up", "posted, R behind", "lent: R behind",
+                       "lent: landing due", "lent: sync owed"};
+        std::string idle;
+        for (size_t i = 0; i < idle_names.size(); ++i) {
+            const u64 count = g.idle_decisions[i].load(std::memory_order_relaxed);
+            idle += fmt::format("{}{} {:.0f}/s", i == 0 ? "" : ", ", idle_names[i],
+                                static_cast<double>(count - g.idle_decisions_logged[i]) /
+                                    seconds);
+            g.idle_decisions_logged[i] = count;
+        }
         const u64 superset = g.sync_target_superset.load(std::memory_order_relaxed);
         LOG_INFO(HW_GPU,
                  "One follower fence decisions (POST_FENCE={}, SEM_E={}) {:.0f} s: {}; samples "
-                 "sync targets R did not need, E's mirror ahead {:.1f}/s",
+                 "sync targets R did not need, E's mirror ahead {:.1f}/s; waits for idle "
+                 "(POST_IDLE={}): {}",
                  PostFenceOn() ? 1 : 0, g_sem_e.load(std::memory_order_relaxed) ? 1 : 0, seconds,
-                 text,
-                 static_cast<double>(superset - g.sync_target_superset_logged) / seconds);
+                 text, static_cast<double>(superset - g.sync_target_superset_logged) / seconds,
+                 PostIdleOn(), idle);
         g.sync_target_superset_logged = superset;
     }
     if (SyncMirrorOn()) {
@@ -2060,9 +2075,33 @@ bool SoftReleaseOnE() noexcept {
                                                     "FRITCHII_ONEF_SOFT_RELEASE_E") != 0;
 }
 
-bool PostIdleOn() noexcept {
-    return PostFenceOn() && VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_post_idle,
-                                                             "FRITCHII_ONEF_POST_IDLE") != 0;
+int PostIdleOn() noexcept {
+    if (!PostFenceOn()) {
+        return 0;
+    }
+    return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_post_idle,
+                                            "FRITCHII_ONEF_POST_IDLE");
+}
+
+bool RenderCaughtUp() noexcept {
+    return g.played.load(std::memory_order_acquire) >= g.pushed;
+}
+
+bool LandingOutstanding() noexcept {
+    return g.landing_max > g.played.load(std::memory_order_acquire);
+}
+
+void NoteEngineSignal(const char* what) noexcept {
+    if (LandingOutstanding()) [[unlikely]] {
+        thread_local std::string note;
+        note = fmt::format("{} on E while R has not played packet {} (it lands reports; R at {})",
+                           what, g.landing_max, g.played.load(std::memory_order_relaxed));
+        Note(Check::SignalAheadOfLanding, note.c_str());
+    }
+}
+
+void CountIdleDecision(IdleDecision decision) noexcept {
+    g.idle_decisions[static_cast<size_t>(decision)].fetch_add(1, std::memory_order_relaxed);
 }
 
 bool PostFenceReportOn() noexcept {
@@ -2200,6 +2239,7 @@ void NoteFencePosted(u64 number) noexcept {
         g.landing_pages[page] = number;
     }
     g.landing_unassigned.clear();
+    g.landing_max = (std::max)(g.landing_max, number);
     g_report_landing_watch.store(true, std::memory_order_relaxed);
 }
 

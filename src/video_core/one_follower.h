@@ -242,6 +242,10 @@ enum class Check : u8 {
     /// download over it that E did not land before posting, or found the buffer lock busy and
     /// skipped the landing (R never waits for that lock in a posted op).
     RenderReadLanding,
+    /// SEM_E: E made a game-visible signal (a sync point increment, a callback, a payload
+    /// write) while R had not yet played a posted fence that lands reports E queued before it
+    /// (the order a lent wait for idle kept: R caught up there, 5,900 times a second).
+    SignalAheadOfLanding,
     /// FRITCHII_ONEF_UNLENT_RESET (fable_b 19 step 2): a forced-lent draw where E's own indirect
     /// reset test (made before the lend) differs from the test on E's engine inside the lent
     /// call. The switch stops for the session.
@@ -274,7 +278,8 @@ inline constexpr std::array<const char*, static_cast<size_t>(Check::Count)> chec
     "build list draw", "played list args", "played kind without path", "sync mirror",
     "sync target missing", "sync target unused", "played dispatch", "played dispatch off view", "lookup programs",
     "lookup blend", "lookup vertex input",
-    "semaphore order", "R read landing", "unlent reset", "view values", "bind seed view",
+    "semaphore order", "R read landing",
+    "signal ahead of landing", "unlent reset", "view values", "bind seed view",
     "played dispatch indirect", "played dispatch image",
 };
 
@@ -661,7 +666,8 @@ void CountLentGatherRanges(u64 ranges) noexcept;
 [[nodiscard]] bool QueryOpsOnBufferPages() noexcept;
 
 /// E: a render op R runs at its stream place while E goes on: `function(payload copy)` on R,
-/// `size` bytes (at most 64) copied into the packet. Elsewhere it runs in place.
+/// `size` bytes (at most MaxOpPayloadBytes) copied into the packet. Elsewhere it runs in place.
+inline constexpr std::size_t MaxOpPayloadBytes = 128;
 /// `lands_in_memory`: the op writes game memory later on R (a report): the front's E-position
 /// waits (FRITCHII_ONEF_WAITS_E) also wait for R to play it (GuestWriteOpMark).
 /// `packet_flags`: PacketFlag bits for the op's header (PacketRenderState).
@@ -697,7 +703,23 @@ void FlushCarried() noexcept;
 /// FRITCHII_ONEF_SOFT_RELEASE_E: a non-forced ReleaseFences is answered on E.
 [[nodiscard]] bool SoftReleaseOnE() noexcept;
 /// FRITCHII_ONEF_POST_IDLE (with POST_FENCE on): WaitForIdle posted.
-[[nodiscard]] bool PostIdleOn() noexcept;
+[[nodiscard]] int PostIdleOn() noexcept;
+/// E: R played every packet E pushed.
+[[nodiscard]] bool RenderCaughtUp() noexcept;
+/// E: a posted fence that lands reports is not played by R yet (13.0's pages).
+[[nodiscard]] bool LandingOutstanding() noexcept;
+/// E (SEM_E): before a game-visible signal on E; the "signal ahead of landing" check.
+void NoteEngineSignal(const char* what) noexcept;
+/// E, at each WaitForIdle it could post (the fence decisions line).
+enum class IdleDecision : u8 {
+    PostedCaughtUp, ///< R had played everything
+    PostedBehind,   ///< POST_IDLE=2: R behind, no landing due
+    LentBehind,     ///< POST_IDLE=1: R behind
+    LentLanding,    ///< POST_IDLE=2: a landing due
+    LentSyncOwed,   ///< a report of another kind owes the sync
+    Count,
+};
+void CountIdleDecision(IdleDecision decision) noexcept;
 /// FRITCHII_ONEF_POST_FENCE_REPORT (with POST_FENCE on): counter fence reports posted.
 [[nodiscard]] bool PostFenceReportOn() noexcept;
 /// E: the report pages (device >> 12) since the last fence, which the next posted fence lands.
