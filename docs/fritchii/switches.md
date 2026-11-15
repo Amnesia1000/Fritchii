@@ -216,6 +216,10 @@ only when the group counted something. Times are time stamp ticks converted with
   (Common::PriceGenSum; a hash collision or a mark over 64 pages only makes more "flagged"). The
   writers mark only while the bank marks are on: run with FRITCHII_BANK_CENSUS=1 (counters only)
   or FRITCHII_BANK_FLAGGED=1 in the test block, else every unchanged bind reads "marks off".
+  fable_b_one_follower 14.4 cut 7 splits the unflagged ones (dry): "pages tracked (the cut)"
+  when the buffer cache's tracker holds the range's pages clean (a guest store there traps and
+  marks), "pages CPU-modified" when it does not (a guest store there raises no flag, so
+  unflagged does not prove the bytes untouched: a skip would need EXP92's page watching).
 - "Price handle reads (back, draws ...)", row 2: draws by their handle range since that
   pipeline's last draw: unflagged (the cut), flagged, another range (a constant buffer moved, the
   first draw, or a handle program, which reads storage too), marks off. The range is each

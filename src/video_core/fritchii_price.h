@@ -53,9 +53,17 @@ enum class Uniform : u32 {
     Flagged,   ///< same bytes, but a write flag was raised on its pages since the last bind
     Moved,     ///< same bytes, but another range than the slot's last bind (or none before)
     NoFlags,   ///< same bytes, the bank marks are off (FRITCHII_BANK_CENSUS or _FLAGGED unset)
+    /// fable_b 14.4 cut 7's split (dry): as Unflagged, but the buffer cache's tracker holds the
+    /// range's pages CPU-modified, so a guest store there traps nothing and raises no flag: an
+    /// unflagged verdict does not prove the bytes untouched (not skippable without watching).
+    UnflaggedCpuModified,
     Count,
 };
 inline Group<static_cast<size_t>(Uniform::Count)> g_uniform;
+/// The bind NoteUniformBind is called for: its range's pages are CPU-modified in the buffer
+/// cache's tracker (BufferCache::BindHostGraphicsUniformBuffer sets it while On(), before the
+/// small-uniform path).
+inline thread_local bool t_uniform_cpu_modified{};
 
 /// "Flagged since" for rows 1 and 2 uses Common::PriceGenSum (common/fritchii_page_flags.h): page
 /// write generations raised by every mark of the two flags FRITCHII_BANK_FLAGGED takes. The
