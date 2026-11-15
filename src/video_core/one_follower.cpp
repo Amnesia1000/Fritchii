@@ -754,8 +754,8 @@ void LogQueryKinds() {
             g.dispatch_logged[i] = count;
             any = any || rates[i] > 0.0;
             const auto kind = static_cast<DispatchCount>(i);
-            if (kind != DispatchCount::TailListCopies && kind != DispatchCount::TailProbes) {
-                total += rates[i]; // the tails are posted dispatches counted once more
+            if (!DispatchCountIsExtra(kind)) {
+                total += rates[i]; // the extras are posted dispatches counted once more
             }
         }
         if (any) {
@@ -765,9 +765,10 @@ void LogQueryKinds() {
                                           dispatch_count_names[i], rates[i]);
             }
             LOG_INFO(HW_GPU,
-                     "One follower dispatches (FRITCHII_ONEF_OP_DISPATCH, fable_b 13.4 group 6) "
-                     "{:.0f} s: {:.0f}/s, {:.1f}% posted: {}{}",
-                     seconds, total, total > 0.0 ? 100.0 * rates[0] / total : 0.0, dispatches,
+                     "One follower dispatches (FRITCHII_ONEF_OP_DISPATCH={}, BIND_SEED={}; "
+                     "fable_b 13.4 group 6) {:.0f} s: {:.0f}/s, {:.1f}% posted: {}{}",
+                     DispatchPostBits(), BindSeedOn() ? 1 : 0, seconds, total,
+                     total > 0.0 ? 100.0 * rates[0] / total : 0.0, dispatches,
                      g.post_dispatch_stopped.load(std::memory_order_relaxed)
                          ? " (STOPPED for the session: see the checks line)"
                          : "");
@@ -1906,6 +1907,12 @@ void StopPostFence(const char* why) noexcept {
         LOG_CRITICAL(HW_GPU, "One follower: FRITCHII_ONEF_POST_FENCE stops for this session ({})",
                      why != nullptr ? why : "?");
     }
+}
+
+u32 DispatchPostBits() noexcept {
+    return static_cast<u32>((std::max)(
+        0, VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_op_dispatch,
+                                            "FRITCHII_ONEF_OP_DISPATCH")));
 }
 
 DispatchCount PostDispatchBlocker(bool& off) noexcept {

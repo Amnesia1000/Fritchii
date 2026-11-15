@@ -80,6 +80,13 @@ public:
                std::ranges::any_of(info.image_buffer_descriptors,
                                    [](const auto& desc) { return desc.is_written; });
     }
+    /// One follower (E): whether a written image is byte-addressed (Configure's packed R16
+    /// shadow may apply: it throws on unsupported shapes and makes its own resources).
+    [[nodiscard]] bool WritesByteAddressedImages() const noexcept {
+        return std::ranges::any_of(info.image_descriptors, [](const auto& desc) {
+            return desc.is_written && desc.is_byte_addressed;
+        });
+    }
 
     static constexpr u64 Ocarina1440pShader = 0x6bd913e1f34e83ebULL;
     /// The same output pass at 1:1, run at 1920x1080 in handheld with the Max Resolution add-on.
