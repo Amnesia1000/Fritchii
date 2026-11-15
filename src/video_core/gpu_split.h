@@ -1100,6 +1100,11 @@ public:
         cb_header = nullptr;
         return write_position;
     }
+    /// FRITCHII_S4_COUNT (front, at a list entry): the same position without ending the open
+    /// block, so the counter changes nothing the ring holds.
+    [[nodiscard]] u64 WritePositionNow() const {
+        return write_position;
+    }
     /// the last compute/copy and unranged writer positions.
     [[nodiscard]] u64 LastWriterPosition() const {
         return last_writer_position;

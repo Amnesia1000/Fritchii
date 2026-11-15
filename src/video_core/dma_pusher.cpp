@@ -35,10 +35,12 @@
 #include "video_core/engines/kepler_memory.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_dma.h"
+#include "video_core/fritchii_s4_count.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memstage_shadow.h"
 #include "video_core/guest_memory.h"
+#include "video_core/host1x/host1x.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cmdpage_diag.h"
@@ -571,6 +573,13 @@ bool DmaPusher::Step() {
     if (header.size > 0) {
         if (header.sync && g_nx2_ampere.load(std::memory_order_relaxed)) {
             VideoCommon::GpuSplit::Get().NoteSync();
+        }
+        // FRITCHII_S4_COUNT (dry): where this list entry starts in the split's ring (a page
+        // mirror would be brought up to date here), and value 2's samples.
+        if (Common::S4Count::On() && command_resume_offset == 0) [[unlikely]] {
+            if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+                VideoCommon::S4Count::FrontEntry(split, system.Host1x().MemoryManager());
+            }
         }
         // EDEN_NX2_FETCH_DRAIN=1: wait for the back before every entry, as before the split
         // overlapped the two halves again.
