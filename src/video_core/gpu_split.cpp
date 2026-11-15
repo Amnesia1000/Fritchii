@@ -2360,7 +2360,11 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
                     ++count;
                 }
                 maxwell3d->ConsumeSink(*system);
-                if (count == 1) {
+                // FRITCHII_ONEF_CB_LEAN & 1 (fable_b 23.1 cut 3, on E): a single word too goes
+                // through the block write (CallConstBufferWords takes every check CallMethod's
+                // path would, and falls back to it where it cannot write the run in one).
+                if (count == 1 && (!OneFollower::OnEngineThread() ||
+                                   (OneFollower::CbLean() & 1) == 0)) {
                     maxwell3d->CallMethod(*system, method, argument, true);
                 } else {
                     maxwell3d->CallConstBufferWords(*system, methods.data(), arguments.data(),

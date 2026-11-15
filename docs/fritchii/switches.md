@@ -1717,6 +1717,17 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   the rasterizer's construction, the report filter when E makes it), inside the same Mark, so
   R's fence after its mark covers the union as it covers its own filter. Bits never clear, so
   a clear union bit proves all four clear: no behaviour change. Expected 5 to 8 ms/s on E.
+- FRITCHII_ONEF_CB_LEAN (live, default 0, bits; fable_b_one_follower 23.1 cut 3, on E): the
+  constant buffer words. 1 = a single word (275,000 calls a second in the of4 market, "1 words"
+  in "Price constant buffer word calls") goes through the block write,
+  Maxwell3D::CallConstBufferWords, as runs of two or more already do, instead of CallMethod,
+  DispatchMethod, CallMethodFast and ProcessCBData; the block write takes every check of that
+  path (fast mode, no macro collecting, a bound address, the buffer's size, one page) and falls
+  back to it where it cannot write the run in one. 2 = the stream-write guard
+  (GuardStreamWrite, one per constant buffer write) tests the union page filter first
+  (FRITCHII_ONEF_UNION_FILTER's, always kept) and the texture and shader filters only on a hit.
+  Exact: the union holds every bit of both. Small: about 2 to 5 ms/s unprofiled together. The
+  bind's translation memos already exist as switches (EXP18 & 1, FRITCHII_BIND_ADDR_MEMO).
 - FRITCHII_ONEF_TRACE (boot, default 0; fable_b_one_follower 15.5): 1 = the lend trace. One
   72-byte record per lend and per posted op (packet number, site, op kind, posted, E's arrival,
   R's start and end, E's resume, E's work since its previous record, R's busy time on other

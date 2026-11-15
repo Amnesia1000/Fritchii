@@ -317,6 +317,9 @@ inline std::atomic<int> g_onef_carry_ops{-1};
 /// FRITCHII_ONEF_UNION_FILTER (live, default 0): fable_b 14.4 cut 5, E's invalidations test the
 /// union of R's page filters first.
 inline std::atomic<int> g_onef_union_filter{-1};
+/// FRITCHII_ONEF_CB_LEAN (live, default 0, bits): fable_b 23.1 cut 3, 1 = single constant buffer
+/// words through the block write, 2 = the stream-write guard tests the union filter first.
+inline std::atomic<int> g_onef_cb_lean{-1};
 /// EDEN_NX2_LIGHT_TABLE_ARRAYS: docs/fritchii/switches.md.
 [[nodiscard]] inline bool LightTableArrays() {
     static const bool on = EnvSwitch("EDEN_NX2_LIGHT_TABLE_ARRAYS") > 0;
