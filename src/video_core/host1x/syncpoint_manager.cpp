@@ -63,10 +63,27 @@ void SyncpointManager::IncrementGuest(u32 syncpoint_id) {
         return;
     }
     Increment(syncpoints_guest[syncpoint_id], wait_guest_cv, guest_action_storage[syncpoint_id],
-              "syncpoint: guest increment", syncpoint_id);
+              "syncpoint: guest increment", syncpoint_id, true);
     if (const auto hook = guest_increment_hook.load(std::memory_order_acquire)) {
         hook(guest_increment_context.load(std::memory_order_relaxed));
     }
+}
+
+void SyncpointManager::SetGuestMirror(const void* owner, GuestMirror mirror) {
+    std::scoped_lock lk(guard);
+    guest_mirror = std::move(mirror);
+    guest_mirror_owner = guest_mirror ? owner : nullptr;
+    has_guest_mirror.store(static_cast<bool>(guest_mirror), std::memory_order_relaxed);
+}
+
+void SyncpointManager::ClearGuestMirror(const void* owner) {
+    std::scoped_lock lk(guard);
+    if (guest_mirror_owner != owner) {
+        return;
+    }
+    guest_mirror = {};
+    guest_mirror_owner = nullptr;
+    has_guest_mirror.store(false, std::memory_order_relaxed);
 }
 
 void SyncpointManager::IncrementHost(u32 syncpoint_id) {
@@ -87,14 +104,30 @@ void SyncpointManager::WaitHost(u32 syncpoint_id, u32 expected_value) {
 
 void SyncpointManager::Increment(std::atomic<u32>& syncpoint, std::condition_variable& wait_cv,
                                  std::list<RegisteredAction>& action_storage,
-                                 const char* timeline_name, u32 syncpoint_id) {
-    auto new_value{syncpoint.fetch_add(1, std::memory_order_acq_rel) + 1};
+                                 const char* timeline_name, u32 syncpoint_id, bool guest) {
+    std::unique_lock lk(guard, std::defer_lock);
+    u32 new_value;
+    if (guest && has_guest_mirror.load(std::memory_order_relaxed)) {
+        // Mirrored before the value is published: the lock-free ready checks (RegisterAction,
+        // Wait, IsReadyGuest) must not see a value the client's page does not hold yet. Guest
+        // increments take the lock first while a mirror is set, so they mirror in order.
+        lk.lock();
+        new_value = syncpoint.load(std::memory_order_relaxed) + 1;
+        if (guest_mirror) {
+            guest_mirror(syncpoint_id, new_value);
+        }
+        new_value = syncpoint.fetch_add(1, std::memory_order_acq_rel) + 1;
+    } else {
+        new_value = syncpoint.fetch_add(1, std::memory_order_acq_rel) + 1;
+    }
     // Before the actions it runs: what ends the waits on this value (critical_path.py).
     if (Common::Nx2Timeline::Active()) {
         Common::Nx2Timeline::Instant(timeline_name, {"id", syncpoint_id}, {"value", new_value});
     }
 
-    std::scoped_lock lk(guard);
+    if (!lk.owns_lock()) {
+        lk.lock();
+    }
     auto it = action_storage.begin();
     while (it != action_storage.end()) {
         if (it->expected_value > new_value) {

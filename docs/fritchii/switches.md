@@ -7,6 +7,36 @@ rebuilds nothing.
 
 ## Named switches
 
+### FRITCHII_SYNCPT_MIRROR
+
+Fix, on by default (helper AH, 2026-11-15, port of zortos293/Lichii #1512); read once when the
+nx2:gsv session sets up its syncpoint page (TIPC 204), FRITCHII_SYNCPT_MIRROR=0 turns it off.
+Switch 2 clients read syncpoint values from a page nx2:gsv fills; before, only the 500 us poll
+(and EXP37's poll-now) wrote it. A wait armed through nx2:syncpt 201 is answered the moment the
+value is reached, so the woken client could read the old value: nn::movie's TryWaitNativeSync then
+aborts on purpose with 2162-0001 (seen with the 3440x1440 ultrawide mod in the guard house). With
+the switch on, SyncpointManager calls a mirror under its lock with each guest increment's new value
+before the value is published and before the actions it meets run; the session stores it straight
+to the page's host memory, only ever forward (wrap-aware), and the poll stores forward too, so it
+cannot put the page back. Cost: guest increments take the manager's lock before the add instead of
+after it (it was taken right after anyway) plus one host store.
+
+### FRITCHII_WRITE_REMARK
+
+Fix, on by default (helper AH, 2026-11-15, port of zortos293/Lichii #1829); live,
+FRITCHII_WRITE_REMARK=0 turns it off. A CPU write to a page a GPU cache tracks marks the page first
+(HandleRasterizerWrite: collected write or OnCPUWrite) and stores its bytes after. A cache that
+takes the mark in between (the back's gather of the collected writes at FlushCaching, an upload
+that tracks the pages again) reads the old bytes and treats them as current; the stored bytes then
+never reach it until the page is written again (stale vertex, uniform or texture data). The window
+is wide when the mark waits for a cache mutex the GPU threads hold. Now each take moves
+Core::g_pages_tracked_generation (UpdatePagesCachedCount with a positive delta, and
+GPUDirtyMemoryManager::Gather when it took writes); Write, WriteBlock, ZeroBlock and the exclusive
+writes read it before the mark and again after the store (with a fence), and when it moved and a
+page of the write is still tracked they mark the write again. The log counts these writes ("CPU
+writes marked again after a cache took their marks before the store", at powers of two). Cost: a
+fence and a load after each trapped store; the second mark only when a take happened in the window.
+
 ### EDEN_NX2_MEM_SAMPLE
 
 TEST, off by default (2026-11-14): EDEN_NX2_MEM_SAMPLE=1 (read at startup) lets the MemoryProbe

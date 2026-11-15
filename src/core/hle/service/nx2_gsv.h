@@ -4165,6 +4165,8 @@ public:
     }
 
     ~INx2GraphicsSystemSession() override {
+        // Before the page and this session go: no mirror call runs after this returns.
+        system.Host1x().GetSyncpointManager().ClearGuestMirror(this);
         if (m_syncpt_poll_now) {
             system.Host1x().GetSyncpointManager().SetGuestIncrementHook(nullptr, nullptr);
             system.CoreTiming().UnscheduleEvent(m_syncpt_poll_now);
@@ -4336,6 +4338,22 @@ private:
             memory.Write32(m_syncpt_ro + 0x18, SyncptRwBitsOffset);
             memory.Write32(m_syncpt_ro + 0x1c, SyncptRoBitsOffset);
             UpdateSyncptValues();
+            // FRITCHII_SYNCPT_MIRROR (boot, default 1; 0 = values only from the 500 us poll, as
+            // before): each guest increment is copied to the page as it happens, before the waits
+            // it meets are answered. An answered wait (nx2:syncpt 201) wakes the client, whose
+            // TryWaitNativeSync reads this page: before the next poll it read the old value, and
+            // nn::movie then aborted on purpose (2162-0001; also seen loading the guard house at
+            // 3440x1440).
+            if (SyncptMirrorEnabled()) {
+                m_syncpt_mirror = true;
+                system.Host1x().GetSyncpointManager().SetGuestMirror(
+                    this, [memory = m_syncpt_memory, values = m_syncpt_ro + SyncptValuesOffset,
+                           count = std::min(m_syncpt_count, HostSyncpoints)](u32 id, u32 value) {
+                        if (id < count) {
+                            StoreSyncptValue(*memory, values + u64{id} * 8, value);
+                        }
+                    });
+            }
             if (!m_syncpt_poll) {
                 m_syncpt_poll = Core::Timing::CreateEvent(
                     "nx2:gsv:SyncptPoll",
@@ -4385,12 +4403,46 @@ private:
         for (u32 id = 0; id < std::min(m_syncpt_count, HostSyncpoints); ++id) {
             const u64 value = manager.GetGuestSyncpointValue(id);
             const u64 address = m_syncpt_ro + SyncptValuesOffset + id * 8;
+            if (m_syncpt_mirror) {
+                // The mirror writes too: only ever forward, so a value read here before a newer
+                // increment's mirror cannot put the page back.
+                changed |= StoreSyncptValue(*m_syncpt_memory, address, static_cast<u32>(value));
+                continue;
+            }
             if (m_syncpt_memory->Read64(address) != value) {
                 m_syncpt_memory->Write64(address, value);
                 changed = true;
             }
         }
         return changed;
+    }
+
+    /// FRITCHII_SYNCPT_MIRROR: docs/fritchii/switches.md.
+    static bool SyncptMirrorEnabled() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("FRITCHII_SYNCPT_MIRROR");
+            return value == nullptr || value[0] != '0';
+        }();
+        return enabled;
+    }
+
+    /// Stores a syncpoint value into its u64 slot of the RO page when it is ahead of the slot's
+    /// (wrap-aware), straight to the page's host memory: the mirror runs under the syncpoint
+    /// manager's lock on GPU threads, where no cache hook may run. Returns true if it stored.
+    static bool StoreSyncptValue(Core::Memory::Memory& memory, u64 address, u32 value) {
+        u8* const pointer = memory.GetPointerSilent(address);
+        if (pointer == nullptr || (reinterpret_cast<uintptr_t>(pointer) & 7) != 0) {
+            return false;
+        }
+        std::atomic_ref<u64> slot{*reinterpret_cast<u64*>(pointer)};
+        u64 current = slot.load(std::memory_order_relaxed);
+        while (static_cast<s32>(value - static_cast<u32>(current)) > 0) {
+            if (slot.compare_exchange_weak(current, u64{value}, std::memory_order_release,
+                                           std::memory_order_relaxed)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /// A guest syncpoint was incremented (any thread): with EXP37, poll at once.
@@ -4871,6 +4923,7 @@ private:
     u64 m_syncpt_ro{};
     u32 m_syncpt_count{};
     std::shared_ptr<Core::Timing::EventType> m_syncpt_poll;
+    bool m_syncpt_mirror{}; ///< FRITCHII_SYNCPT_MIRROR: the syncpoint manager mirrors increments
     /// EDEN_NX2_EXP37: PollSyncpts at once after a guest syncpoint increment (OnGuestIncrement),
     /// at most one pending.
     std::shared_ptr<Core::Timing::EventType> m_syncpt_poll_now;
