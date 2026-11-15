@@ -1785,6 +1785,14 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   the guest read, the compare or the reuse function; otherwise the usual bind. Line "Uniform
   keep" every 10 s. Expected 20 to 25 ms/s on E (the price line's cut class, 182,600 binds a
   second in of10).
+- FRITCHII_BANK_FAST (live, default 0; fable_b_one_follower 25.2 cut b): the native bank check
+  (CheckNativeBankPagesTracked, EXP9=3) skips a settled bank of its own or flagged slots whole
+  (no page flag, every page snapshotted and not due, no CPU-modified page), but only after its
+  switch reads, the marks gate, the census and the store upkeep. With the switch, a bind of a
+  slot the last full call would skip, while nothing that upkeep reads moved (the switch
+  generation, the lost-store count, the marks gate ready, the page table's size, the inner
+  invalidation setting), runs the same four tests first and returns with the same counts.
+  Same result. Expected 8 to 10 ms/s on E (56,000 bank binds a second at 246 ns).
 - FRITCHII_ONEF_TRACE (boot, default 0; fable_b_one_follower 15.5): 1 = the lend trace. One
   72-byte record per lend and per posted op (packet number, site, op kind, posted, E's arrival,
   R's start and end, E's resume, E's work since its previous record, R's busy time on other

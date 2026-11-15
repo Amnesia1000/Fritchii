@@ -890,6 +890,19 @@ public:
         BankNone,      ///< No reason: EXP9=2 compares these only to verify
         BankReasons,
     };
+    /// FRITCHII_BANK_FAST (fable_b 25.2 cut b): what the last full CheckNativeBankPagesTracked
+    /// decided that does not depend on the bank: the switch generation it read its switches at,
+    /// the lost-store count it saw, its mode, and the slots whose settled banks it skips whole.
+    struct NativeBankFast {
+        u32 generation{};
+        u64 overflows{};
+        u32 skip_slots{};    ///< own (or flagged) slots, no verify, mode 3, the page table on
+        u32 flagged_slots{}; ///< of those, FRITCHII_BANK_FLAGGED's (for its counts)
+        int mode{};
+        bool ready{};
+    } native_bank_fast;
+    u64 native_bank_fast_hits{};
+
     struct NativeBankTrackedStats {
         u64 binds = 0;
         u64 pages_new = 0;

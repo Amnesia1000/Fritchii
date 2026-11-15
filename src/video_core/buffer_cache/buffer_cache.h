@@ -3534,6 +3534,40 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
     // 2: every page as with 0, counting the changed pages the rules of 1 and 3 would have skipped.
     static_assert(Core::DevicePageFlags::AddressBits >=
                   Tegra::MaxwellDeviceTraits::device_virtual_bits);
+    // FRITCHII_BANK_FAST (live, default 0; fable_b 25.2 cut b): a settled bank of a slot the last
+    // full call would skip whole is skipped before the switch reads and the upkeep below, while
+    // nothing that upkeep reads moved: the switches (their generation), the lost-store count,
+    // the marks gate's state, the snapshot store's size, the inner invalidation setting. The
+    // test is the same four as the skip's own.
+    const u32 switch_generation =
+        VideoCore::Nx2Debug::g_switch_generation.load(std::memory_order_acquire);
+    if (native_bank_fast.ready && index < 32 && ((native_bank_fast.skip_slots >> index) & 1) != 0 &&
+        mode == native_bank_fast.mode && switch_generation == native_bank_fast.generation &&
+        VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_bank_fast, "FRITCHII_BANK_FAST") !=
+            0 &&
+        Common::g_collected_overflows.load(std::memory_order_seq_cst) ==
+            native_bank_fast.overflows &&
+        (native_bank_marks_ready || !native_bank_marks_wanted) && native_bank_table_on &&
+        native_bank_table_pages < 16384 &&
+        !Settings::values.skip_cpu_inner_invalidation.GetValue()) {
+        const DAddr bank_first = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
+        const DAddr bank_end = Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE);
+        const u64 bank_bytes = bank_end - bank_first;
+        if (!Core::g_collected_write_pages.Any(bank_first, bank_bytes) &&
+            !Core::g_buffer_write_pages.Any(bank_first, bank_bytes) &&
+            NativeBankPagesSettled(bank_first, bank_end) &&
+            !memory_tracker.IsRegionCpuModified(bank_first, bank_bytes)) {
+            auto& fast_stats = native_bank_tracked_stats;
+            const bool flagged_slot = ((native_bank_fast.flagged_slots >> index) & 1) != 0;
+            ++fast_stats.binds;
+            ++fast_stats.banks_skipped;
+            fast_stats.flagged_binds += flagged_slot ? 1 : 0;
+            fast_stats.flagged_skipped += flagged_slot ? 1 : 0;
+            ++native_bank_fast_hits;
+            LogNativeBankTrackedStats(mode);
+            return;
+        }
+    }
     SelectNativeBankStore();
     auto& stats = native_bank_tracked_stats;
     ++stats.binds;
@@ -3650,6 +3684,29 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
                                           "EDEN_NX2_BANK_SKIP_VERIFY") != 0);
     if (own_slot && flagged_slot) [[unlikely]] {
         ++stats.flagged_binds;
+    }
+    // FRITCHII_BANK_FAST: what this call decided for the slot, for the next binds' fast test
+    // (only while no census, slot counts or ring, which the fast test does not keep).
+    if (index < 32) {
+        NativeBankFast& fast = native_bank_fast;
+        const bool steady = census == 0 && slot_stats == nullptr &&
+                            !native_bank_census_ring_wanted;
+        if (!steady || fast.generation != switch_generation || fast.mode != mode ||
+            fast.overflows != native_bank_flagged_overflows) {
+            fast = NativeBankFast{};
+        }
+        if (steady) {
+            fast.generation = switch_generation;
+            fast.mode = mode;
+            fast.overflows = native_bank_flagged_overflows;
+            const u32 bit = 1u << index;
+            const bool skips = own_slot && mode == 3 && native_bank_table_on && !slot_verify &&
+                               (flagged == 0 || native_bank_flagged_on);
+            fast.skip_slots = skips ? fast.skip_slots | bit : fast.skip_slots & ~bit;
+            fast.flagged_slots =
+                skips && flagged_slot ? fast.flagged_slots | bit : fast.flagged_slots & ~bit;
+            fast.ready = true;
+        }
     }
     bool skip_verify = false;
     if (own_slot && mode == 3 && native_bank_table_on) {
