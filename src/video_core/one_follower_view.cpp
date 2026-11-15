@@ -36,6 +36,7 @@
 #include "video_core/one_follower.h"
 #include "video_core/one_follower_stats.h"
 #include "video_core/page_filter.h"
+#include "video_core/renderer_vulkan/vk_state_tracker.h"
 
 namespace VideoCommon::OneFollower {
 
@@ -50,6 +51,9 @@ struct Partition {
     FlagBits shared;      ///< on both sides
     FlagBits forward;     ///< R-only and shared: what packets carry and R's view holds
     FlagBits render_only;
+    /// R-only flags E's own pipeline lookup reads (rule 3, FRITCHII_ONEF_E_PIPELINE): the
+    /// programs, the blend and vertex input parts of the key, the viewport swizzles.
+    FlagBits lookup;
 
     Partition() {
         watched.set();
@@ -81,6 +85,11 @@ struct Partition {
         shared.set(Dirty::VertexBuffers);
         forward = ~engine_only;
         render_only = forward & ~shared;
+        lookup.set(VideoCommon::Dirty::Shaders);
+        lookup.set(Vulkan::Dirty::Blending);
+        lookup.set(Vulkan::Dirty::VertexInput);
+        lookup.set(Vulkan::Dirty::ViewportSwizzles);
+        lookup &= render_only;
     }
 };
 
@@ -281,10 +290,17 @@ std::size_t PackSpans(const Maxwell3D& engine, PacketHeader& header, std::span<u
     // the engine's flags after it). The shared flags always by difference: E keeps its copy.
     const FlagBits now = engine.dirty.flags & parts.forward;
     FlagBits raised;
-    if (header.kind == PacketKind::Draw ||
-        (header.kind == PacketKind::Op && (header.flags & PacketRenderState) != 0)) {
+    const bool draw_pack = header.kind == PacketKind::Draw;
+    const bool op_pack =
+        header.kind == PacketKind::Op && (header.flags & PacketRenderState) != 0;
+    if (draw_pack || op_pack) {
         raised = (now & parts.render_only) | (now & parts.shared & ~g_e.after);
-        const_cast<Maxwell3D&>(engine).dirty.flags &= ~parts.render_only; // E's engine
+        // fable_b 18.3 (the lean darkness, 15 Nov): a flag with a reader on E leaves E's engine
+        // only in a pack that follows that read. A draw packs after its lookup (FillAndPush);
+        // a posted clear packs with no lookup before it, so it keeps the lookup's flags on E
+        // for the next draw (R takes them now and again at that draw: one rebind too many).
+        const FlagBits taken = draw_pack ? parts.render_only : parts.render_only & ~parts.lookup;
+        const_cast<Maxwell3D&>(engine).dirty.flags &= ~taken; // E's engine
     } else {
         raised = now & ~g_e.after;
     }
