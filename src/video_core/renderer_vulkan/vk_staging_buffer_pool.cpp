@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <utility>
 #include <vector>
 
@@ -181,14 +182,27 @@ StagingBufferRef StagingBufferPool::GetStreamBuffer(
     std::fill(sync_ticks.begin() + Region(used_iterator), sync_ticks.begin() + Region(iterator),
               current_tick);
     used_iterator = iterator;
-    free_iterator = (std::max)(free_iterator, iterator + size);
+    // FRITCHII_STREAM_WRAP_GUARD (boot, default 1; port of zortos293/Lichii#1835 by
+    // anthonyloukinas): a wrap whose first regions are still in use keeps the position. Moved to
+    // the start before that check, the guard above would treat the first region as acquired and
+    // hand it out again while a recorded command buffer still reads it (OoT: white or false-colour
+    // 3D view). 0 = the old order.
+    static const bool wrap_guard = [] {
+        const char* value = std::getenv("FRITCHII_STREAM_WRAP_GUARD");
+        return value == nullptr || std::atoi(value) != 0;
+    }();
+    if (!wrap_guard) {
+        free_iterator = (std::max)(free_iterator, iterator + size);
+    }
 
     if (iterator + size >= stream_buffer_size) {
         std::fill(sync_ticks.begin() + Region(used_iterator), sync_ticks.begin() + NUM_SYNCS,
                   current_tick);
-        used_iterator = 0;
-        iterator = 0;
-        free_iterator = size;
+        if (!wrap_guard) {
+            used_iterator = 0;
+            iterator = 0;
+            free_iterator = size;
+        }
 
         if (AreRegionsActive(0, Region(size) + 1)) {
             VideoCommon::MemStageStats::StreamFull();
@@ -196,6 +210,13 @@ StagingBufferRef StagingBufferPool::GetStreamBuffer(
             // Avoid waiting for the previous usages to be free
             return GetStagingBuffer(size, MemoryUsage::Upload, false, caller, true);
         }
+        if (wrap_guard) {
+            used_iterator = 0;
+            iterator = 0;
+            free_iterator = size;
+        }
+    } else if (wrap_guard) {
+        free_iterator = (std::max)(free_iterator, iterator + size);
     }
     const size_t offset = iterator;
     iterator = Common::AlignUp(iterator + size, MAX_ALIGNMENT);
