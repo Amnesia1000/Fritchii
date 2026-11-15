@@ -177,6 +177,29 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         }();
         ticks_to_destroy = (std::max)(ticks_to_destroy, min_age);
         num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : 10);
+        // FRITCHII_TC_COLLECT_OVER (live, default 0): past the critical memory, 40 deletes a
+        // frame is not enough where the game makes more images than that. Breaking pots in
+        // OoT's Hyrule Castle makes ~55 a frame (about 25 new 384x384 D32 shadow maps and the
+        // frame's targets, at addresses that move every frame), none replacing an older one: the
+        // cache grew ~15 images a frame until device memory ran out and the driver crashed on
+        // the next image (zortos #1306, RX 9070 XT). So one more delete per 2 MiB over the
+        // critical memory (up to 1,024 more), and from 1 GiB over, images unused for 3 frames go
+        // too instead of 10.
+        if (aggressive_mode && total_used_memory > critical_memory &&
+            VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_tc_collect_over,
+                                             "FRITCHII_TC_COLLECT_OVER") != 0) {
+            const u64 over = total_used_memory - critical_memory;
+            const size_t extra = static_cast<size_t>((std::min)(over / 2_MiB, u64{1024}));
+            num_iterations += extra;
+            auto& stats = collect_port_stats;
+            ++stats.over_passes;
+            stats.over_extra += extra;
+            stats.over_peak = (std::max)(stats.over_peak, over);
+            if (over >= 1_GiB) {
+                ticks_to_destroy = (std::max)(min_age, u64{3});
+                ++stats.over_young;
+            }
+        }
     };
     const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode,
                           &evict_old_costly, out_of_memory](ImageId image_id) {
@@ -238,6 +261,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
                 UntrackImage(image, image_id);
             }
             ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
+            collect_port_stats.deleted_aggressive += aggressive_mode ? 1 : 0;
             UnregisterImage(image_id);
             DeleteImage(image_id, image.scale_tick > frame_tick + 5);
         }
@@ -944,6 +968,24 @@ void TextureCache<P>::TickFrame() {
                      s.dropped_used, s.dropped_written, s.dropped_deleted, s.fallback_cap,
                      s.fallback_oom, s.mismatches, collect_downloads.size(),
                      collect_download_staging >> 20);
+        }
+        s = {};
+    }
+    // FRITCHII_TC_COLLECT_OVER and FRITCHII_TC_COLLECT_EVICTABLE: what they did, every 600 frames.
+    if (frame_tick % 600 == 0) {
+        auto& s = collect_port_stats;
+        const int over = VideoCore::Nx2Debug::g_tc_collect_over.load(std::memory_order_relaxed);
+        const int evictable =
+            VideoCore::Nx2Debug::g_tc_collect_evictable.load(std::memory_order_relaxed);
+        if (over > 0 || evictable > 0) {
+            LOG_INFO(HW_GPU,
+                     "Collector ports (FRITCHII_TC_COLLECT_OVER={} FRITCHII_TC_COLLECT_EVICTABLE={}) "
+                     "last 600 frames: {} passes past critical (+{} deletes allowed, {} at 1 GiB+ "
+                     "over, peak {} MiB over), {} images deleted past critical; {} skipped as not "
+                     "deletable; device memory {} MiB (critical {} MiB)",
+                     (std::max)(over, 0), (std::max)(evictable, 0), s.over_passes, s.over_extra,
+                     s.over_young, s.over_peak >> 20, s.deleted_aggressive, s.skipped,
+                     total_used_memory >> 20, critical_memory >> 20);
         }
         s = {};
     }

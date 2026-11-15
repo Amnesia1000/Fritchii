@@ -409,6 +409,18 @@ inline std::atomic<int> g_front_trim_qmd{-1};
 /// slot: 1 = on, 2 = verify (both kept, the old table answers, differences counted), 3 = dry
 /// (both kept, counted and timed 1 in 64).
 inline std::atomic<int> g_front_async_table{-1};
+/// FRITCHII_TC_COLLECT_OVER (live, default 0; helper AG, port of zortos #1306): past the
+/// critical memory the collector deletes one more image a frame per 2 MiB over it (up to 1,024
+/// more), and from 1 GiB over also images unused for 3 frames instead of 10.
+inline std::atomic<int> g_tc_collect_over{-1};
+/// FRITCHII_TC_COLLECT_EVICTABLE (live, default 0; helper AG, port of zortos #1731): the collector
+/// skips images it may not delete in this pass before it counts them against its budget, the
+/// old costly pass sorts by memory block fill too, and deletes keep the block fill current.
+inline std::atomic<int> g_tc_collect_evictable{-1};
+/// FRITCHII_SWEEP_SUPERSEDED (live, frames, default 0 = off; helper AG, port of Skitchii
+/// 16fb54111d): GPU-written images untouched for N frames whose memory a newer image of another
+/// shape covers are deleted without a download, checked every min(N, 30) frames.
+inline std::atomic<int> g_sweep_superseded{-1};
 /// FRITCHII_NOTED_OVERFLOW (live, default 0; F7, with FRITCHII_NOTED_FAST 1 to 3): the table's
 /// overflow answer of NotedWriteSinceFast asked again of the note chains, which keep the position
 /// of each forgotten link: 1 = on (a chain-proved "no write" answers at FRITCHII_NOTED_FAST=1),

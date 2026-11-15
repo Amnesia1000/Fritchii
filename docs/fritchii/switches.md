@@ -3592,6 +3592,34 @@ at full cache clears and shutdown (host bytes are read when written, so links sh
   changes every launch: match blocks across launches by the offset.
 - "FRITCHII_JIT_DUMP: core c writes <file> (image base 0x...)" (Core_ARM, Info).
 
+### Texture cache churn ports (helper AG)
+
+- FRITCHII_TC_COLLECT_OVER (live, default 0; port of zortos #1306 by adamuremek): past the
+  critical memory the collector's aggressive pass may delete one more image per 2 MiB over it
+  (up to 1,024 on top of 40), and from 1 GiB over it also takes images unused for 3 frames
+  instead of 10. Breaking pots in OoT's Hyrule Castle makes ~55 images a frame (about 25 new
+  384x384 D32 shadow maps at moving addresses); at 40 deletes a frame the cache grew until
+  device memory ran out and the AMD driver crashed. Does nothing below the critical memory.
+  Line every 600 frames "Collector ports (...)": passes past critical, deletes allowed, passes
+  1 GiB+ over, peak MiB over, images deleted past critical.
+- FRITCHII_TC_COLLECT_EVICTABLE (live, default 0; port of zortos #1731 by moonzzeyy): the
+  collector checks whether it may delete an image in this pass (decoding, costly outside the
+  aggressive or old pass, needs a download outside high priority, already queued by EXP121)
+  before it counts it against the pass's budget, and its candidate walk leaves such images out.
+  Without it, 10 or 20 old costly (ASTC) images at the old end of the list used the whole budget
+  and the pass deleted nothing. Also: the old costly pass (EDEN_NX2_TC_OLD_AGE) goes through the
+  block-fill sort, and every delete takes its bytes off its block's fill. Same line as above:
+  images skipped.
+- FRITCHII_SWEEP_SUPERSEDED (live, frames, default 0 = off; port of Skitchii 16fb54111d by nup):
+  a GPU-written image untouched for N frames whose memory a newer image of another shape (used
+  since) covers is deleted without a download, checked every min(N, 30) frames, as EXP58 does
+  for the cold sweep's chain images after 60 frames. Not bound images, ones with a download
+  queued, sparse or decoding ones. Skitchii runs 3 (Castle Town guard house at 3440x1440: ~20
+  targets moved a frame while the camera turns, driver usage 13-15 GB on a 12 GB card; orbit
+  16-24 -> 42-51 fps; 2 lost fps standing). Line every 600 frames "Superseded sweep
+  (FRITCHII_SWEEP_SUPERSEDED=N)": images and MiB deleted, images looked at, ms spent.
+  Skitchii's EDEN_NX2_IMAGE_POOL_MIB is EXP66 here (live, MiB).
+
 ## Numbered experiments (EDEN_NX2_EXPn)
 
 Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP79, live through the debug server:

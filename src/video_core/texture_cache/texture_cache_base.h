@@ -1485,6 +1485,16 @@ private:
             fallback_oom, mismatches, land_frames;
     } collect_stats{};
 
+    /// FRITCHII_TC_COLLECT_OVER and FRITCHII_TC_COLLECT_EVICTABLE, since the last report.
+    struct CollectPortStats {
+        u64 over_passes{}; ///< Aggressive passes past the critical memory
+        u64 over_extra{};  ///< Deletes those passes were allowed on top of 40
+        u64 over_young{};  ///< Of them, 1 GiB or more over (images unused for 3 frames go)
+        u64 over_peak{};   ///< Most bytes over the critical memory
+        u64 deleted_aggressive{}; ///< Images deleted while past the critical memory
+        u64 skipped{};     ///< EVICTABLE: images skipped before they used the pass's budget
+    } collect_port_stats{};
+
     /// Bytes of images per device memory block, for the collector (refreshed every 60 frames).
     std::unordered_map<u64, u64> block_image_bytes;
     u64 block_image_bytes_frame{~0ULL};
