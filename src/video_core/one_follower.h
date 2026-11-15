@@ -954,6 +954,14 @@ void CountQueryKind(QueryKind kind) noexcept;
 void SetTexturePages(const PageFilter* filter) noexcept;
 /// The shader cache's code pages (fable_b 10.1 row 8): R reads programs there too.
 void SetShaderPages(const PageFilter* filter) noexcept;
+/// The rasterizer's union of the texture, shader, query and report filters (fable_b 14.4 cut 5):
+/// with FRITCHII_ONEF_CB_LEAN & 2 the stream-write guard tests it first (a superset of the two
+/// it needs).
+void SetUnionPages(const PageFilter* filter) noexcept;
+/// FRITCHII_ONEF_CB_LEAN (live, default 0; fable_b 23.1 cut 3), bits: 1 = a single constant
+/// buffer word goes through the block write (Maxwell3D::CallConstBufferWords) as runs of two or
+/// more do; 2 = the stream-write guard tests the union filter first.
+[[nodiscard]] int CbLean() noexcept;
 /// E's stream writes (Maxwell3D's constant buffer words, memory_manager.cpp's cached writes): on a
 /// texture page they are counted (StreamWritesOnTexturePages, informational at every step), and
 /// with R behind (step 4) Check::StreamWrite is counted and E drains R before the write lands.

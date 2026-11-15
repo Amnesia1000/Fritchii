@@ -34,6 +34,7 @@
 
 #include "video_core/dirty_flags.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/one_follower.h"
 #include "video_core/one_follower_stats.h"
 #include "video_core/page_filter.h"
@@ -124,6 +125,7 @@ EngineSide g_e;
 RegisterView g_view;
 const PageFilter* g_texture_pages{};
 const PageFilter* g_shader_pages{};
+const PageFilter* g_union_pages{}; ///< SetUnionPages (fable_b 14.4 cut 5's union)
 
 
 /// R: the last applied packet carried a draw span (VerifyView compares it then).
@@ -217,6 +219,11 @@ void NoteRegWrite(u32 index) noexcept {
     if (!Detail::t_engine && !InLent()) {
         return; // the front's copy, or another thread: not E's engine
     }
+    // FRITCHII_ONEF_KEY_KEEP: every write of a lookup word, before the per-packet dedupe.
+    if (g_key_watch && index < KeyWordSlots &&
+        ((g_key_words[index / 64] >> (index % 64)) & 1) != 0) {
+        ++g_key_writes;
+    }
     if (index >= NumRegs || g_e.noted.test(index)) {
         return;
     }
@@ -248,6 +255,7 @@ void NoteFlagRaised(u8 flag) noexcept {
 namespace Detail {
 void ViewTrackingStopped() noexcept {
     g_e.restart.store(true, std::memory_order_release);
+    ++g_key_writes; // FRITCHII_ONEF_KEY_KEEP: writes from now on may go unseen
 }
 
 void SeedAfterBind(RegisterView& view, const Maxwell3D& engine) {
@@ -541,6 +549,15 @@ void SetShaderPages(const PageFilter* filter) noexcept {
     g_shader_pages = filter;
 }
 
+void SetUnionPages(const PageFilter* filter) noexcept {
+    g_union_pages = filter;
+}
+
+int CbLean() noexcept {
+    return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_cb_lean,
+                                            "FRITCHII_ONEF_CB_LEAN");
+}
+
 bool StreamWriteHits(DAddr address, u64 size) noexcept {
     return g_texture_pages != nullptr && g_texture_pages->Any(address, size) && Behind() != 0;
 }
@@ -559,6 +576,12 @@ void GuardStreamWrite(DAddr address, u64 size) noexcept {
         }
         return false;
     };
+    // FRITCHII_ONEF_CB_LEAN & 2 (fable_b 23.1 cut 3): the union holds every texture and shader
+    // page bit (they mark it in the same Mark), so a clear union is both filters clear.
+    if (g_union_pages != nullptr && (CbLean() & 2) != 0 && !g_union_pages->Any(address, size) &&
+        !in_pools()) {
+        return;
+    }
     if (!g_texture_pages->Any(address, size) &&
         (g_shader_pages == nullptr || !g_shader_pages->Any(address, size)) && !in_pools()) {
         return;

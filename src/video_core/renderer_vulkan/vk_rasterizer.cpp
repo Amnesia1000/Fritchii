@@ -624,6 +624,7 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
     texture_cache.page_filter.AlsoMark(&onef_union_pages);
     pipeline_cache.page_filter.AlsoMark(&onef_union_pages);
     query_cache.page_filter.AlsoMark(&onef_union_pages);
+    VideoCommon::OneFollower::SetUnionPages(&onef_union_pages); // CB_LEAN & 2's guard
     VideoCommon::OneFollower::SetShaderPages(&pipeline_cache.page_filter);
     VideoCommon::OneFollower::WatchLock("buffer cache", &buffer_cache.mutex);
     VideoCommon::OneFollower::WatchLock("texture cache", &texture_cache.mutex);

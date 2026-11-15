@@ -236,6 +236,21 @@ only when the group counted something. Times are time stamp ticks converted with
   word runs counted per word, 3D single, other engine single, multi, call, pairs per pair, state
   delta, draw batch, words blocks per word, engine/wrap) and the "method" zone ms/s each kind
   added (the zone's own estimate: 3D methods are sampled about one in 32).
+- "Price handle values (E, unlent draws ...)", row 2b (fable_b_one_follower 23.1 cut 4): each
+  unlent draw's handle values (OneFollowerDraw::FillRing, the fill timed) against the same
+  pipeline's last unlent draw: changed or first; same, unflagged, pages tracked (the cut: same
+  constant buffer ranges, no flag on their pages since, the buffer cache's tracker holds them
+  clean, so a guest store would trap and flag); same, unflagged, a page CPU-modified (a guest
+  store there raises no flag: not provable); same but a page flagged (page grain: another word
+  on the page was written); same values from other ranges; handle program (reads storage, no
+  key); and "unflagged and tracked but changed", must be 0 (a keep would have been stale).
+- "Price back 3D methods ...", row 4b (fable_b_one_follower 22.3 step 2 and 23): row 4's "3D
+  single" entries by method, the 24 costliest by the "method" zone time each added (the same
+  sampled estimate), with the state writes each found sunk and consumed first (ConsumeSink:
+  the macro's sunk register writes are paid by the next executable method, so a draw method's
+  time holds them, and on E with one follower also the draw's unzoned work: the pipeline
+  lookup, the handle values, the per-draw FlushCaching, the pack and the push). Methods are
+  register indices (draw.end 0x585 and so on).
 - "Price front waits split ...", rows 7 and 8: each wait of the front for the back by site (the
   drain sites of "Front waits for the back by site") and the suspended acquires, split into
   "until the back reached it" and "after". The back stamps each position it stores as consumed;
@@ -1710,6 +1725,33 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   the rasterizer's construction, the report filter when E makes it), inside the same Mark, so
   R's fence after its mark covers the union as it covers its own filter. Bits never clear, so
   a clear union bit proves all four clear: no behaviour change. Expected 5 to 8 ms/s on E.
+- FRITCHII_ONEF_CB_LEAN (live, default 0, bits; fable_b_one_follower 23.1 cut 3, on E): the
+  constant buffer words. 1 = a single word (275,000 calls a second in the of4 market, "1 words"
+  in "Price constant buffer word calls") goes through the block write,
+  Maxwell3D::CallConstBufferWords, as runs of two or more already do, instead of CallMethod,
+  DispatchMethod, CallMethodFast and ProcessCBData; the block write takes every check of that
+  path (fast mode, no macro collecting, a bound address, the buffer's size, one page) and falls
+  back to it where it cannot write the run in one. 2 = the stream-write guard
+  (GuardStreamWrite, one per constant buffer write) tests the union page filter first
+  (FRITCHII_ONEF_UNION_FILTER's, always kept) and the texture and shader filters only on a hit.
+  Exact: the union holds every bit of both. Small: about 2 to 5 ms/s unprofiled together. The
+  bind's translation memos already exist as switches (EXP18 & 1, FRITCHII_BIND_ADDR_MEMO).
+- FRITCHII_ONEF_KEY_KEEP (live, default 0; fable_b_one_follower 23.1 cut 2; with
+  FRITCHII_ONEF_E_PIPELINE and the write tracking on, step 2+, LEAN): the clean pipeline lookup
+  (EXP19 / EDEN_NX2_PIPELINE_CLEAN) compares the key's watched register words with its snapshot
+  at every lookup (CleanInputsUnchanged, and the blend words with EXP50), about 45% of the
+  lookup. NoteRegWrite now counts every write of those words on E (or R in a lent call), before
+  its per-packet dedupe, into OneFollower::g_key_writes (the words: OneFollower::g_key_words,
+  set by BuildCleanWatch; the count also moves when the tracking stops). The lookup keeps the
+  count each time its snapshots equal the registers (a hit, or a new snapshot). 1 = count the
+  lookups that reach the compare with the count unmoved, and still compare: "Lookup key words
+  ... untouched since the snapshot N, compare kept out 0, untouched but the compare failed 0
+  (must be 0)" every 10 s next to the EDEN_NX2_PIPELINE_CLEAN line. 2 = those skip the
+  compares. Every flag, topology and engine-state test before the compare still runs, so no
+  flag leaves E's engine before its reader (section 18). Exact because every register write on
+  E goes through ProcessDirtyRegisters or ApplyDeltaWrites, which note it (the "view words"
+  must-be-0 checks the same notes). Expected 20 to 25 ms/s on E where most lookups find the
+  words untouched; run =1 first and read the count.
 - FRITCHII_ONEF_TRACE (boot, default 0; fable_b_one_follower 15.5): 1 = the lend trace. One
   72-byte record per lend and per posted op (packet number, site, op kind, posted, E's arrival,
   R's start and end, E's resume, E's work since its previous record, R's busy time on other

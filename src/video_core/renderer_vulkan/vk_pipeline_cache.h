@@ -313,6 +313,15 @@ private:
         /// miss_reasons[3] ("other state") by its first differing part: vertex input, viewport
         /// swizzles, topology, engine state, dual-source blend.
         std::array<u64, 5> other_parts{};
+        /// FRITCHII_ONEF_KEY_KEEP (fable_b 23.1 cut 2): OneFollower::g_key_writes when the
+        /// snapshots last equalled the registers (~0: unknown); lookups that found it unmoved,
+        /// those that kept the compare out (=2), and those whose compare then failed (=1, must
+        /// be 0).
+        u64 key_seen{~u64{0}};
+        u64 key_untouched{};
+        u64 key_skipped{};
+        u64 key_failed{};
+        u64 key_failed_session{};
         std::chrono::steady_clock::time_point last_log{};
     } clean;
 

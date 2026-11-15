@@ -149,6 +149,46 @@ enum class Entry : u32 {
 inline Group<static_cast<size_t>(Entry::Count)> g_entries;
 
 // ---------------------------------------------------------------------------------------------
+// Row 2b (fable_b_one_follower 23.1 cut 4, E; dry): unlent draws by their handle values against
+// the same pipeline's last unlent draw (OneFollowerDraw::FillRing's fill, timed).
+
+enum class HandleValues : u32 {
+    Changed,         ///< other values than the pipeline's last draw (or its first draw)
+    SameKeep,        ///< same values, same ranges, no flag on their pages, pages tracked: the cut
+    SameCpuModified, ///< as SameKeep, but a page is CPU-modified (guest stores raise no flag)
+    SameFlagged,     ///< same values, same ranges, a page flagged since (page, not word, grain)
+    SameMoved,       ///< same values from other ranges (a constant buffer rebound)
+    Program,         ///< a handle program (reads storage): no range key
+    /// Must be 0: same ranges, unflagged, tracked, yet other values (a keep would be stale).
+    KeepWouldDiffer,
+    Count,
+};
+inline Group<static_cast<size_t>(HandleValues::Count)> g_handle_values;
+/// E, at an unlent draw's handle fill (GPU profile on).
+void NoteHandleValues(HandleValues verdict, u64 ticks) noexcept;
+
+// ---------------------------------------------------------------------------------------------
+// Row 4b (fable_b_one_follower 22.3 step 2 and 23, the back; dry): the "3D single" entries of row
+// 4 by method. Each costs what Execute ran for it in the "method" zone: its own handler and the
+// state writes sunk before it, which it consumes first (ConsumeSink); `sunk` counts those.
+
+inline constexpr size_t Method3DSlots = 0x1000;
+struct Method3D {
+    std::array<Counter, Method3DSlots> count{};
+    std::array<Counter, Method3DSlots> ticks{};
+    std::array<Counter, Method3DSlots> sunk{};
+};
+inline Method3D g_method3d;
+/// The back, a single 3D method entry: its method, the zone time it added, the sunk writes it
+/// consumed.
+inline void NoteMethod3D(u32 method, u64 ticks, u64 sunk) noexcept {
+    const size_t slot = method < Method3DSlots ? method : Method3DSlots - 1;
+    Add(g_method3d.count[slot], 1);
+    Add(g_method3d.ticks[slot], ticks);
+    Add(g_method3d.sunk[slot], sunk);
+}
+
+// ---------------------------------------------------------------------------------------------
 // Front waits split (rows 7, 8): until the back reached the wait's target, then after (the
 // back's position stores are stamped; the front looks the target up when its wait ends).
 

@@ -33,6 +33,8 @@
 #include <array>
 #include <atomic>
 #include <memory>
+#include <span>
+#include <unordered_map>
 #include <vector>
 
 #include "common/common_types.h"
@@ -237,6 +239,18 @@ private:
     std::atomic<bool> mismatch_reported{};
 
     // E only.
+    /// fable_b 23.1 cut 4's dry price (GPU profile on): per pipeline, the handle values of its
+    /// last unlent draw, the key of the constant buffer ranges they came from and the write
+    /// generations of those pages (FritchiiPrice "Price handle values" line).
+    struct HandleMemo {
+        std::vector<u32> values;
+        u64 key{};
+        u64 sum{};
+        bool valid{};
+    };
+    std::unordered_map<const void*, HandleMemo> handle_memos;
+    void PriceHandleValues(Tegra::Engines::Maxwell3D& engine,
+                           std::span<const Shader::Info> infos, const void* pipeline, u64 ticks);
     u64 e_draw_seq{};
     u64 unlent_candidates{};
     /// FillRing's last Transient refusal (fable_b 19's dry counter), and whether the fill of the
