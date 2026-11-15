@@ -723,6 +723,22 @@ not worth turning on), then 2 (must be 0), then 1.
   interpreter (its 1.3 KB of zeroed stack and slots), the repeated storage base reads and the
   rest; the dry count says how much. Classes: same words, constant buffer rebound, words changed,
   no record. Verify: a same-words program is evaluated and its results compared.
+- FRITCHII_FILL_BRACKET_LEAN (cut h, "Fill bracket lean"), E's ring fills only:
+  - The trackers' record (only made while the OoT trackers are on): E fills only the slots R can
+    read on that draw, from E's registers: slot 0 only when one of the eight render targets is
+    B10G11R11_FLOAT (TrackOcarinaCamera reads it only when the first color target's view has
+    that format, which only that render target format gives), slots 1 and 2 only for an indexed
+    draw of the actor's vertex program (TrackOcarinaActor). At 1 the others stay unbound; at 2
+    and 3 the whole record is made. At every value the left-out slots are marked in the packet,
+    and R counts reading one ("R read a slot the lean record leaves out", must be 0; at 1 the
+    first one turns the cut off for the session).
+  - Ring B's push: the room check reads ring_b_freed (the back's line, written for every packet
+    it takes) only when the packet does not fit against the last value E read (it only grows),
+    and the link counts the packet and its bytes but not the window counters (packets in ring B
+    after the push, another read of the back's line; GPUMem's window question). Verify: the line
+    is read every time and a fit by the kept value that the real one refuses counts (must be 0).
+  - The fill bracket itself (fable_b 14.4 cut 3) is already lean on E: its brackets leave the
+    shared watch count alone (MemStage::Fill::Open). Nothing more is cut there.
 ### FRITCHII_ACQUIRE_MET_BY (the "Acquire resumes met by" line)
 
 FRITCHII_ACQUIRE_MET_BY (live, default 0 since 2026-11-14 = one relaxed load per resume; 1 = the

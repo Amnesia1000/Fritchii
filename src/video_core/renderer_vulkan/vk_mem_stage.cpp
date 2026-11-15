@@ -178,6 +178,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
@@ -203,6 +204,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/memory_stage_link.h"
+#include "video_core/fritchii_fill_cuts.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_fastdraw_count.h"
 #include "video_core/nx2_perf.h"
@@ -1434,7 +1436,11 @@ const MemStage::DrawPacket* MemStage::FillDrawHere(Cache& cache_, const DrawFact
             // The trackers' record goes in the packet: taken before the push.
             fill_tracker_data.clear();
             if (tracker_record.load(std::memory_order_relaxed)) [[unlikely]] {
-                FillTrackerRecord(cache_, draw.trackers);
+                if (ring_lean != 0) [[unlikely]] {
+                    FillTrackerLean(cache_); // FRITCHII_FILL_BRACKET_LEAN
+                } else {
+                    FillTrackerRecord(cache_, draw.trackers);
+                }
                 if (Link::Ahead() != 0) {
                     // Step 7: with the window open the back draws after GPUMem wrote later
                     // constant buffer words: the bytes the trackers read come with the packet.
@@ -1518,6 +1524,64 @@ void MemStage::FillTrackerRecord(Cache& cache_, TrackerRecord& record) {
                             cache_.GpuWrittenHere(address, bytes); // with marks ahead on GPUMem
     }
     record.filled = true;
+}
+
+void MemStage::FillTrackerSlots(Cache& cache_, TrackerRecord& record, u8 slots) {
+    for (size_t i = 0; i < record.slots.size(); ++i) {
+        TrackerSlot& slot = record.slots[i];
+        if ((slots & (1U << i)) == 0) {
+            slot = TrackerSlot{};
+            continue;
+        }
+        const u32 index = TrackerRecord::Slots[i];
+        const auto [address, size] = cache_.BoundGraphicsUniform(0, index);
+        slot.address = address;
+        slot.size = size;
+        slot.bound = size != 0;
+        // As FillTrackerRecord.
+        const u64 bytes = index == 3 ? u64{TrackerRecord::CameraBytes} : u64{size};
+        slot.gpu_modified = slot.bound && (index != 3 || size >= TrackerRecord::CameraBytes) &&
+                            cache_.GpuWrittenHere(address, bytes);
+    }
+    record.filled = true;
+}
+
+// FRITCHII_FILL_BRACKET_LEAN (fable_b 25.2 cut h): E's FillRing found which slots R can read on
+// this draw (ring_lean_slots): R reads slot 0 only for a draw whose first color target is
+// B10G11R11_FLOAT (TrackOcarinaCamera), slots 1 and 2 only for an indexed draw of the actor's
+// vertex program (TrackOcarinaActor). At 1 the others stay unbound; at 2 and 3 the whole record
+// is made. At every value the left-out slots are marked, and R counts reading one (must be 0; at
+// 1 it turns the cut off for the session).
+void MemStage::FillTrackerLean(Cache& cache_) {
+    namespace FillCuts = VideoCommon::FillCuts;
+    FillCuts::BracketStats& stats = FillCuts::g_bracket;
+    FillCuts::Add(stats.tracker_draws);
+    const u8 slots = ring_lean_slots & 7;
+    const u8 skipped = static_cast<u8>(~slots & 7);
+    FillCuts::Add(stats.lean_slots, static_cast<u64>(std::popcount(skipped)));
+    const bool timed = stats.tracker_sample.Take();
+    if (ring_lean == FillCuts::On) {
+        const u64 start = timed ? FillCuts::Ticks() : 0;
+        FillTrackerSlots(cache_, draw.trackers, slots);
+        if (timed) [[unlikely]] {
+            FillCuts::Add(stats.lean_ticks, FillCuts::Ticks() - start);
+        }
+        draw.trackers.lean_skipped = skipped;
+        return;
+    }
+    if (timed) [[unlikely]] {
+        // The lean record's time on the same draw (into a scratch record), then the whole one.
+        TrackerRecord scratch{};
+        const u64 lean_start = FillCuts::Ticks();
+        FillTrackerSlots(cache_, scratch, slots);
+        const u64 full_start = FillCuts::Ticks();
+        FillCuts::Add(stats.lean_ticks, full_start - lean_start);
+        FillTrackerRecord(cache_, draw.trackers);
+        FillCuts::Add(stats.full_ticks, FillCuts::Ticks() - full_start);
+    } else {
+        FillTrackerRecord(cache_, draw.trackers);
+    }
+    draw.trackers.lean_skipped = skipped;
 }
 
 const MemStage::DispatchPacket* MemStage::FillDispatchHere(Cache& cache_,
@@ -1712,6 +1776,8 @@ bool MemStage::FillRingDraw(Cache& cache_, const DrawFacts& facts, bool is_index
         ring_values = nullptr;
         ring_list_args = false;
         lent_mutex = nullptr;
+        ring_lean = 0; // FRITCHII_FILL_BRACKET_LEAN: set by E for this fill only
+        ring_lean_slots = 0x7;
     };
     const DrawPacket* const packet = FillDrawHere(cache_, facts, is_indexed);
     return packet != nullptr && std::exchange(ring_pushed, false);
@@ -1776,10 +1842,14 @@ void MemStage::PushRingDraw() {
         ring_b_write += RingBytes - index;
         index = 0;
     }
-    if (ring_b_write + bytes - ring_b_freed.load(std::memory_order_acquire) > RingBytes)
-        [[unlikely]] {
-        // RingRoom's margin makes this impossible below 1 MiB a packet.
-        Link::Note(Link::Check::RingFull, "a draw packet past ring B's room");
+    if (ring_lean == 0) [[likely]] {
+        if (ring_b_write + bytes - ring_b_freed.load(std::memory_order_acquire) > RingBytes)
+            [[unlikely]] {
+            // RingRoom's margin makes this impossible below 1 MiB a packet.
+            Link::Note(Link::Check::RingFull, "a draw packet past ring B's room");
+        }
+    } else {
+        PushRoomLean(bytes); // FRITCHII_FILL_BRACKET_LEAN
     }
     RingHeader header{};
     header.bytes = static_cast<u32>(bytes);
@@ -1829,8 +1899,12 @@ void MemStage::PushRingDraw() {
     SeamTicks::SetStamp(0, true); // no packet of GPUMem's own until the next (stamps per thread)
     const u64 sent = ring_packets_sent.load(std::memory_order_relaxed) + 1;
     ring_packets_sent.store(sent, std::memory_order_seq_cst);
-    Link::Get().NotePacketSent(bytes,
-                               sent - ring_packets_done.load(std::memory_order_seq_cst));
+    if (ring_lean == 0) [[likely]] {
+        Link::Get().NotePacketSent(bytes,
+                                   sent - ring_packets_done.load(std::memory_order_seq_cst));
+    } else {
+        PushStatsLean(bytes, sent); // FRITCHII_FILL_BRACKET_LEAN
+    }
     // As TakeHeld: the arena is done with; the next fill starts on an empty one.
     arena.Reset();
     play_cursor = 0;
@@ -1843,6 +1917,61 @@ void MemStage::PushRingDraw() {
     t_holding = false;
     if (ticks) {
         UpdateUnplayed();
+    }
+}
+
+// FRITCHII_FILL_BRACKET_LEAN (fable_b 25.2 cut h): the room check without ring_b_freed's line
+// (the back writes it for every packet it takes). The pusher keeps the last value it read:
+// ring_b_freed only grows, so a packet that fits against it fits now, and the check could not
+// fire. Only when it does not fit is the line read (and kept), and the check made as before.
+// 2 and 3 read it every time and count a fit by the kept value the real one refuses (must be 0).
+void MemStage::PushRoomLean(u64 bytes) {
+    namespace FillCuts = VideoCommon::FillCuts;
+    FillCuts::BracketStats& stats = FillCuts::g_bracket;
+    ring_lean_timed = stats.push_sample.Take();
+    const bool fits_kept = ring_b_write + bytes - ring_lean_freed <= RingBytes;
+    if (ring_lean == FillCuts::On && fits_kept) {
+        return;
+    }
+    const bool timed = ring_lean_timed && ring_lean == FillCuts::Dry && fits_kept;
+    const u64 start = timed ? FillCuts::Ticks() : 0;
+    const u64 freed = ring_b_freed.load(std::memory_order_acquire);
+    const bool full = ring_b_write + bytes - freed > RingBytes;
+    if (timed) [[unlikely]] {
+        FillCuts::Add(stats.push_ticks, FillCuts::Ticks() - start);
+    }
+    const u64 kept = std::exchange(ring_lean_freed, freed);
+    if (ring_lean != FillCuts::On && fits_kept) {
+        FillCuts::Add(stats.push_compare.checked);
+        if (full && stats.push_compare.Differ()) [[unlikely]] {
+            LOG_ERROR(Render_Vulkan,
+                      "Fill bracket lean (FRITCHII_FILL_BRACKET_LEAN={}): a draw packet of {} "
+                      "bytes fit by the kept freed count {:#x} but not by the real one {:#x}",
+                      ring_lean, bytes, kept, freed);
+        }
+    }
+    if (full) [[unlikely]] {
+        // RingRoom's margin makes this impossible below 1 MiB a packet.
+        Link::Note(Link::Check::RingFull, "a draw packet past ring B's room");
+    }
+}
+
+// FRITCHII_FILL_BRACKET_LEAN: at 1 the link counts the packet and its bytes only; the window's
+// counters (packets in ring B after the push, read from the back's line) are GPUMem's window
+// question (step 7), not E's. 2 and 3 count as before (3 times it).
+void MemStage::PushStatsLean(u64 bytes, u64 sent) {
+    namespace FillCuts = VideoCommon::FillCuts;
+    FillCuts::BracketStats& stats = FillCuts::g_bracket;
+    FillCuts::Add(stats.pushes);
+    if (ring_lean == FillCuts::On) {
+        Link::Get().NotePacketSentLean(bytes);
+        return;
+    }
+    const bool timed = ring_lean_timed && ring_lean == FillCuts::Dry;
+    const u64 start = timed ? FillCuts::Ticks() : 0;
+    Link::Get().NotePacketSent(bytes, sent - ring_packets_done.load(std::memory_order_seq_cst));
+    if (timed) [[unlikely]] {
+        FillCuts::Add(stats.push_ticks, FillCuts::Ticks() - start);
     }
 }
 

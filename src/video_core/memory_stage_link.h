@@ -382,6 +382,9 @@ public:
     }
     /// Ring B's counters, kept by the Vulkan side. `ahead`: packets in ring B after the push.
     void NotePacketSent(u64 bytes, u64 ahead) noexcept;
+    /// FRITCHII_FILL_BRACKET_LEAN (fable_b 25.2 cut h): E's push counts the packet and its bytes
+    /// only (the window's counters are GPUMem's question).
+    void NotePacketSentLean(u64 bytes) noexcept;
     void NotePacketTaken() noexcept;
     /// The back took or dropped a packet: wakes a stage that waits for the window or for room.
     void NoteRingFreed() noexcept;

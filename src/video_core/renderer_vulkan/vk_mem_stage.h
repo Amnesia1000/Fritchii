@@ -162,6 +162,10 @@ public:
     struct TrackerRecord {
         std::array<TrackerSlot, 3> slots;
         bool filled;
+        /// FRITCHII_FILL_BRACKET_LEAN (fable_b 25.2 cut h): bit i, slot i is one the lean record
+        /// leaves out (at 1 left unbound; at 2 and 3 filled anyway). R counts reading one (must
+        /// be 0; FillCuts::NoteTrackerRead).
+        u8 lean_skipped;
         /// Step 7 (the window open): the bytes each tracker reads, copied at the fill, as many
         /// per slot (0: not copied, the tracker reads game memory); MemStage::TrackerBytes.
         std::array<u32, 3> copied;
@@ -558,6 +562,12 @@ public:
     }
     /// GPUMem: room for another packet.
     [[nodiscard]] bool RingRoom() const noexcept;
+    /// FRITCHII_FILL_BRACKET_LEAN (fable_b 25.2 cut h), E, for its next FillRingDraw: the cut's
+    /// value and the tracker record slots R can read on that draw (bit i: slot i).
+    void SetRingLean(int mode, u8 tracker_slots) noexcept {
+        ring_lean = mode;
+        ring_lean_slots = tracker_slots;
+    }
     /// GPUMem: its draw's fill is over, packet or not (BeginDraw opened its packet number).
     void EndStageFill();
     /// The back, both threads parked at the ring's start or end (`end`): GPUMem's fill side starts
@@ -1091,6 +1101,15 @@ private:
     /// The fill in progress goes to ring B (FillRingDraw).
     alignas(64) bool ring_fill{};
     bool ring_pushed{};
+    /// FRITCHII_FILL_BRACKET_LEAN for the ring fill in progress (E's FillRing sets it, the fill's
+    /// end clears it; 0 for every other fill), and that draw's tracker slots R can read. On the
+    /// fill side's line, as the fields below.
+    int ring_lean{};
+    u8 ring_lean_slots{0x7};
+    /// The pusher's last read of ring_b_freed in a lean push (it only grows: room against it is
+    /// room now), and whether this push's lean parts are timed (1 in 64).
+    u64 ring_lean_freed{};
+    bool ring_lean_timed{};
     u64 ring_fill_position{};
     u64 ring_fill_seq{};
     u64 ring_fill_hash{};
@@ -1121,6 +1140,14 @@ private:
     u64 played_stage_writes{};
     Tegra::MaxwellDeviceMemoryManager* device_memory{};
     void CopyTrackerBytes(TrackerRecord& record, u64 vertex_program);
+    /// FRITCHII_FILL_BRACKET_LEAN: the trackers' record of a ring fill with the cut on.
+    void FillTrackerLean(Cache& cache);
+    /// The record of the slots in `slots` (bit i: slot i) as FillTrackerRecord makes it; the
+    /// others unbound.
+    static void FillTrackerSlots(Cache& cache, TrackerRecord& record, u8 slots);
+    /// FRITCHII_FILL_BRACKET_LEAN: PushRingDraw's room check and its stats count.
+    void PushRoomLean(u64 bytes);
+    void PushStatsLean(u64 bytes, u64 sent);
     /// Step 7's verify (spec 6.4, the design's 2.5 read compare): a ring packet's read log, filled
     /// by GPUMem (stage_log while it fills), handed over in packet order, compared by the back at
     /// the take. Logs are pooled.

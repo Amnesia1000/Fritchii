@@ -167,13 +167,33 @@ struct BracketStats {
     Counter pushes{};        ///< ring B draw pushes on E
     Counter push_ticks{};    ///< the push parts the lean push leaves out, sampled
     Compare push_compare{};  ///< the lean room rule said "fits" and the full check disagreed
-    Counter r_checked{};     ///< R: records whose slots R read (R writes)
+    Counter r_checked{};     ///< R: reads of a record with left-out slots (R writes)
     Counter r_differ{};      ///< R: a slot R read was one the lean record left out (must be 0)
     Counter r_differ_total{};
     Sample tracker_sample{};
     Sample push_sample{};
 };
 inline BracketStats g_bracket;
+
+/// Cut h, R: a draw packet's tracker record whose slots `read` (bit i: slot i) R reads now. A
+/// slot the lean record left out is a difference (must be 0); at 1 it turns the cut off for the
+/// session (its record then is whole again from the next draw E fills).
+inline void NoteTrackerRead(u8 lean_skipped, u8 read) noexcept {
+    BracketStats& s = g_bracket;
+    Add(s.r_checked);
+    if ((lean_skipped & read) == 0) [[likely]] {
+        return;
+    }
+    Add(s.r_differ);
+    Add(s.r_differ_total);
+    g_stopped[static_cast<size_t>(Cut::BracketLean)].store(true, std::memory_order_relaxed);
+    if (s.r_differ_total.load(std::memory_order_relaxed) <= 16) {
+        LOG_ERROR(HW_GPU,
+                  "Fill bracket lean (FRITCHII_FILL_BRACKET_LEAN): R read tracker slots {:#x} of "
+                  "a record that left out {:#x}; the cut's 1 is off for the session",
+                  read, lean_skipped);
+    }
+}
 
 namespace Detail {
 

@@ -481,6 +481,28 @@ bool OneFollowerDraw::FillRing(Maxwell3D& engine, GraphicsPipeline* pipeline, bo
                           VideoCommon::FritchiiPrice::Ticks() - handle_start);
     }
     buffer_number = r.mem_stage.NextRingPacketIndex();
+    // FRITCHII_FILL_BRACKET_LEAN (fable_b 25.2 cut h): the tracker record slots R can read on
+    // this draw, from E's registers. Slot 0: TrackOcarinaCamera reads it only when the first color
+    // target's view is B10G11R11_FLOAT, which only that render target format gives, so one of
+    // the eight targets has it. Slots 1 and 2: TrackOcarinaActor reads them only for an indexed
+    // draw of the actor's vertex program (the pipeline's unique_hashes[1], facts.hashes[0]).
+    // FillRingDraw's end sets the cut back to 0.
+    if (const int bracket_lean =
+            VideoCommon::FillCuts::Mode(VideoCommon::FillCuts::Cut::BracketLean);
+        bracket_lean != 0) [[unlikely]] {
+        u8 slots = 0;
+        for (const auto& rt : engine.regs.rt) {
+            if (rt.format == Tegra::RenderTargetFormat::B10G11R11_FLOAT) {
+                slots |= 1;
+                break;
+            }
+        }
+        if (is_indexed && facts.hashes[0] == MemStage::TrackerRecord::ActorShader) {
+            slots |= 6;
+        }
+        r.mem_stage.SetRingLean(bracket_lean, slots);
+        VideoCommon::FillCuts::MaybeReport();
+    }
     const bool filled =
         r.mem_stage.FillRingDraw(r.buffer_cache, draw_facts, is_indexed, position, seq, 0, nullptr,
                                  nullptr, &handle_values, null_pointer_handles, list_args);

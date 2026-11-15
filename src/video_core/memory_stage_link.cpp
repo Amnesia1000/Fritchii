@@ -1224,6 +1224,11 @@ void MemoryStageLink::NotePacketSent(u64 bytes, u64 ahead) noexcept {
     }
 }
 
+void MemoryStageLink::NotePacketSentLean(u64 bytes) noexcept {
+    LinkBump(counters.packets);
+    LinkBump(counters.packet_bytes, bytes);
+}
+
 void MemoryStageLink::WakeLockWaiters() noexcept {
     // This thread holds the buffer cache's lock and is about to wait for the other thread: if
     // that one sleeps on the lock (a hooked wait that read another holder), it wakes, sees this
