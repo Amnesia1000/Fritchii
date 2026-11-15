@@ -620,6 +620,10 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
     // One follower: the stream-write guard's pages (section 7), and the locks its hang watchdog
     // names the holders of.
     VideoCommon::OneFollower::SetTexturePages(&texture_cache.page_filter);
+    // fable_b 14.4 cut 5: the four filters E's invalidations test also mark one union.
+    texture_cache.page_filter.AlsoMark(&onef_union_pages);
+    pipeline_cache.page_filter.AlsoMark(&onef_union_pages);
+    query_cache.page_filter.AlsoMark(&onef_union_pages);
     VideoCommon::OneFollower::SetShaderPages(&pipeline_cache.page_filter);
     VideoCommon::OneFollower::WatchLock("buffer cache", &buffer_cache.mutex);
     VideoCommon::OneFollower::WatchLock("texture cache", &texture_cache.mutex);
@@ -5370,6 +5374,7 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                     // (R marks the query cache's own filter only then).
                     if (onef_report_pages == nullptr) [[unlikely]] {
                         onef_report_pages = std::make_unique<VideoCommon::PageFilter>();
+                        onef_report_pages->AlsoMark(&onef_union_pages); // cut 5
                     }
                     onef_report_pages->Mark(*device, 16);
                 }
@@ -6155,7 +6160,24 @@ bool RasterizerVulkan::OneFollowerInvalidationOnEngine(
     }
     // fable_b 11.1 item 2: a range on no page an image, a shader or a query was ever on (nor a
     // report op E pushed and R has not played) invalidates nothing of R's: E runs the rest.
+    // FRITCHII_ONEF_UNION_FILTER (fable_b 14.4 cut 5): the union of the four first; the four
+    // (which say which kind it is) only when it has a bit there.
+    const bool union_first =
+        VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_union_filter,
+                                         "FRITCHII_ONEF_UNION_FILTER") != 0;
     const auto hit = [&]() -> std::optional<OneF::InvalKind> {
+        if (union_first) {
+            bool any = false;
+            for (const auto& [addr, size] : sequences) {
+                if (onef_union_pages.Any(addr, size)) {
+                    any = true;
+                    break;
+                }
+            }
+            if (!any) {
+                return std::nullopt;
+            }
+        }
         for (const auto& [addr, size] : sequences) {
             if (texture_cache.page_filter.Any(addr, size)) {
                 return OneF::InvalKind::Texture;

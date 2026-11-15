@@ -557,6 +557,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_ONEF_CARRY_OPS") {
         return &g_onef_carry_ops;
     }
+    if (name == "FRITCHII_ONEF_UNION_FILTER") {
+        return &g_onef_union_filter;
+    }
     return nullptr;
 }
 

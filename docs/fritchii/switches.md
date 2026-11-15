@@ -1571,6 +1571,14 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   position. Line "One follower carried ops" every 10 s: ops carried a second, the packets that
   carried them (draw, lent, op, alone), and why alone ones went. Expected (Fable 22.3): 20 to
   30 ms/s off E, and R's per-packet cost for the same number of packets.
+- FRITCHII_ONEF_UNION_FILTER (live, default 0; fable_b_one_follower 14.4 cut 5;
+  FRITCHII_ONEF_INVAL_E): 1 = E's invalidation test (OneFollowerInvalidationOnEngine, about
+  157,000 a second, each range against the texture, shader, query and report page filters,
+  twice) tests one union filter per range first and the four only when it has a bit there.
+  The union is always kept: each of the four marks it too (PageFilter::AlsoMark, attached at
+  the rasterizer's construction, the report filter when E makes it), inside the same Mark, so
+  R's fence after its mark covers the union as it covers its own filter. Bits never clear, so
+  a clear union bit proves all four clear: no behaviour change. Expected 5 to 8 ms/s on E.
 - FRITCHII_ONEF_TRACE (boot, default 0; fable_b_one_follower 15.5): 1 = the lend trace. One
   72-byte record per lend and per posted op (packet number, site, op kind, posted, E's arrival,
   R's start and end, E's resume, E's work since its previous record, R's busy time on other

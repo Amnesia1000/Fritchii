@@ -38,6 +38,24 @@ public:
             }
             page += count;
         }
+        if (also != nullptr) {
+            also->Mark(address, size);
+        }
+    }
+
+    /// One follower (fable_b 14.4 cut 5): every later Mark also marks `union_filter`, which must
+    /// outlive this filter; the bits this filter holds now are copied into it first. A clear bit
+    /// in the union then proves a clear bit in every filter that feeds it.
+    void AlsoMark(PageFilter* union_filter) {
+        also = union_filter;
+        for (u64 i = 0; i < NumWords; ++i) {
+            if (const u64 bits = words[i].load(std::memory_order_relaxed); bits != 0) {
+                union_filter->words[i].fetch_or(bits, std::memory_order_relaxed);
+            }
+        }
+        if (overflow.load(std::memory_order_relaxed)) {
+            union_filter->overflow.store(true, std::memory_order_relaxed);
+        }
     }
 
     /// Whether the cache may hold objects on [address, address + size).
@@ -67,6 +85,7 @@ private:
     static constexpr u64 NumWords = (u64{1} << (36 - PageBits)) / 64; // 2 MiB of bits
     std::unique_ptr<std::atomic<u64>[]> words;
     std::atomic<bool> overflow{};
+    PageFilter* also{}; ///< AlsoMark's union, set before the threads that mark exist
 };
 
 /// EXP84 (fable52_answer_microcuts 3.4): how many registered objects cover each 64 KiB page now,
