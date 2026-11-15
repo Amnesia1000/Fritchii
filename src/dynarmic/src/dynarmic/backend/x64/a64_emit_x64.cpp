@@ -11,7 +11,10 @@
 #include <algorithm>
 #include <chrono>
 #include <exception>
+#include <cctype>
 #include <cstdlib>
+#include <string>
+#include <vector>
 #include <fmt/format.h>
 #include <fmt/ostream.h>
 #include "common/assert.h"
@@ -124,6 +127,207 @@ bool A64EmitX64::OmitFramePointer() {
     return omit;
 }
 
+int A64EmitX64::FlagBranchMode() {
+    static const int mode = [] {
+        const int value = EnvSwitch("FRITCHII_JIT_FLAG_BRANCH");
+        if (value < 0 || value > 2) {
+            LOG_WARNING(Core_ARM, "FRITCHII_JIT_FLAG_BRANCH={} is outside 0..2, using 0", value);
+            return 0;
+        }
+        if (value != 0) {
+            LOG_INFO(Core_ARM, "FRITCHII_JIT_FLAG_BRANCH={}: {}", value,
+                     value == 1 ? "conditional branches on host flags"
+                                : "conditional branches and cbz/tbz on host flags");
+        }
+        return value;
+    }();
+    return mode;
+}
+
+PinConfig A64EmitX64::PinSetup(const A64::UserConfig& conf) {
+    PinConfig pins;
+    if (EnvSwitch("FRITCHII_JIT_PIN") != 1) {
+        return pins;
+    }
+#ifdef _WIN32
+    if (conf.very_verbose_debugging_output) {
+        return pins;  // its register dump reads the state block between instructions
+    }
+    // rsi: callee-saved on Windows and named by no emitter. rbp: never allocated, but blocks
+    // write it unless FRITCHII_JIT_NO_FRAME_POINTER=1. r15/r14/r13 and rsp are taken, the other
+    // registers are used by name by the shared handlers between blocks.
+    std::vector<Xbyak::Reg64> hosts{Xbyak::util::rsi};
+    if (OmitFramePointer()) {
+        hosts.push_back(Xbyak::util::rbp);
+    }
+    const char* text = std::getenv("FRITCHII_JIT_PIN_REGS");
+    const std::string list = text != nullptr && *text != '\0' ? text : "sp,x0";
+    std::string names;
+    size_t start = 0;
+    while (start <= list.size() && pins.regs.size() < hosts.size()) {
+        size_t end = list.find(',', start);
+        if (end == std::string::npos) {
+            end = list.size();
+        }
+        std::string item;
+        for (size_t i = start; i < end; ++i) {
+            if (list[i] != ' ') {
+                item += char(std::tolower(static_cast<unsigned char>(list[i])));
+            }
+        }
+        start = end + 1;
+        if (item.empty()) {
+            continue;
+        }
+        u32 offset = 0;
+        if (item == "sp") {
+            offset = u32(offsetof(A64JitState, sp));
+        } else {
+            const char* digits = item.c_str() + (item[0] == 'x' ? 1 : 0);
+            char* digits_end = nullptr;
+            const unsigned long index = std::strtoul(digits, &digits_end, 10);
+            if (*digits == '\0' || *digits_end != '\0' || index > 30) {
+                LOG_WARNING(Core_ARM, "FRITCHII_JIT_PIN_REGS: '{}' is not sp or x0..x30, skipped", item);
+                continue;
+            }
+            offset = u32(offsetof(A64JitState, reg) + sizeof(u64) * index);
+        }
+        const bool duplicate = std::any_of(pins.regs.begin(), pins.regs.end(),
+                                           [offset](const PinnedRegister& pin) { return pin.state_offset == offset; });
+        if (duplicate) {
+            continue;
+        }
+        const Xbyak::Reg64 host = hosts[pins.regs.size()];
+        pins.regs.push_back(PinnedRegister{host, offset});
+        names += (names.empty() ? "" : ", ") + item + (host == Xbyak::util::rsi ? " in rsi" : " in rbp");
+    }
+    if (pins.regs.empty()) {
+        LOG_WARNING(Core_ARM, "FRITCHII_JIT_PIN=1: no usable register in FRITCHII_JIT_PIN_REGS, off");
+        return pins;
+    }
+    pins.verify = EnvSwitch("FRITCHII_JIT_VERIFY") == 1;
+    pins.mismatch_offset = u32(offsetof(A64JitState, pin_mismatches));
+    static const bool logged = [&] {
+        LOG_INFO(Core_ARM, "FRITCHII_JIT_PIN=1: {}{}{}", names,
+                 OmitFramePointer() ? "" : " (rbp needs FRITCHII_JIT_NO_FRAME_POINTER=1)",
+                 pins.verify ? "; FRITCHII_JIT_VERIFY=1: writes also go to the state block, checked at calls and exits" : "");
+        return true;
+    }();
+    (void)logged;
+#else
+    (void)conf;
+    static const bool logged = [] {
+        LOG_WARNING(Core_ARM, "FRITCHII_JIT_PIN=1 is Windows only (rsi is a parameter register here), off");
+        return true;
+    }();
+    (void)logged;
+#endif
+    return pins;
+}
+
+bool A64EmitX64::PinStatsMode() {
+    static const bool on = [] {
+        const bool value = EnvSwitch("FRITCHII_JIT_PIN_STATS") == 1;
+        if (value) {
+            LOG_INFO(Core_ARM, "FRITCHII_JIT_PIN_STATS=1: guest register reads and writes counted, "
+                               "FRITCHII_JIT_FLAG_BRANCH off");
+        }
+        return value;
+    }();
+    return on;
+}
+
+void A64EmitX64::LogPinStats(const std::array<u64, 64>& counts) {
+    const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    if (pin_stats_log_ns == 0) {
+        pin_stats_log_ns = now;
+        pin_stats_logged = counts;
+        return;
+    }
+    if (now - pin_stats_log_ns < 10'000'000'000LL) {
+        return;
+    }
+    const double seconds = double(now - pin_stats_log_ns) / 1e9;
+    std::array<size_t, 32> order;
+    std::array<u64, 32> total;
+    u64 all = 0;
+    for (size_t i = 0; i < 32; ++i) {
+        order[i] = i;
+        total[i] = (counts[i] - pin_stats_logged[i]) + (counts[i + 32] - pin_stats_logged[i + 32]);
+        all += total[i];
+    }
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return total[a] > total[b]; });
+    std::string line;
+    for (size_t k = 0; k < 8; ++k) {
+        const size_t i = order[k];
+        line += fmt::format("{}{} {:.1f}M/s ({:.0f}% reads)", k == 0 ? "" : ", ",
+                            i == 31 ? std::string("sp") : fmt::format("x{}", i), double(total[i]) / seconds / 1e6,
+                            total[i] == 0 ? 0.0 : 100.0 * double(counts[i] - pin_stats_logged[i]) / double(total[i]));
+    }
+    LOG_INFO(Core_ARM, "JIT register use (FRITCHII_JIT_PIN_STATS=1) core {} {:.1f} s: all {:.1f}M/s; {}",
+             conf.processor_id, seconds, double(all) / seconds / 1e6, line);
+    pin_stats_log_ns = now;
+    pin_stats_logged = counts;
+}
+
+void A64EmitX64::LogPinMismatches(u64 total) {
+    const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    if (pin_log_ns != 0 && now - pin_log_ns < 1'000'000'000LL) {
+        return;
+    }
+    LOG_INFO(Core_ARM, "JIT pin check (FRITCHII_JIT_VERIFY=1) core {}: mismatches {} new, {} total (must be 0)",
+             conf.processor_id, total - pin_mismatches_logged, total);
+    pin_log_ns = now;
+    pin_mismatches_logged = total;
+}
+
+namespace {
+
+// Fritchii (FRITCHII_JIT_FLAG_BRANCH): IR instructions whose code (with reg_alloc's moves, spills
+// and fills: mov, movd/movq, movaps/movss/movsd, xchg) never writes the host flags and which do
+// not change the guest NZCV or check bit, so what the flags were recorded to hold stays true
+// across them. Anything else may (an immediate 0 is loaded with xor, host calls, memory accesses,
+// arithmetic), and drops the record.
+bool PreservesHostFlags(const IR::Inst& inst) {
+    // An immediate a store takes as mov m, imm32; an immediate that does not fit is nonzero,
+    // loaded with mov r, imm (LoadImmediate's xor is for 0 only). Checked anyway.
+    const auto plain_store_arg = [&](size_t i) {
+        const IR::Value arg = inst.GetArg(i);
+        if (!arg.IsImmediate()) {
+            return true;
+        }
+        const s64 imm = s64(arg.GetImmediateAsU64());
+        return imm >= -s64(0x80000000) && imm <= s64(0x7FFFFFFF);
+    };
+    switch (inst.GetOpcode()) {
+    case IR::Opcode::Void:
+    case IR::Opcode::Identity:          // no code for a non-immediate (EmitIdentity)
+    case IR::Opcode::GetCarryFromOp:    // pseudo operations, no code
+    case IR::Opcode::GetOverflowFromOp:
+    case IR::Opcode::A64GetW:           // loads from the state block
+    case IR::Opcode::A64GetX:
+    case IR::Opcode::A64GetSP:
+        return true;
+    case IR::Opcode::GetNZCVFromOp:     // no code when its op made it; its own code sets the record
+        return true;
+    case IR::Opcode::A64SetNZCV:        // a store; it updates the record itself
+        return !inst.GetArg(0).IsImmediate();
+    case IR::Opcode::A64SetW:           // stores to the state block
+    case IR::Opcode::A64SetX:
+        return plain_store_arg(1);
+    case IR::Opcode::A64SetSP:
+        return plain_store_arg(0);
+    default:
+        return false;
+    }
+}
+
+}  // namespace
+
 A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_interface)
         : EmitX64(code), conf(conf)
         , fast_dispatch_table_size{size_t{1} << FastDispatchTableBits(fast_dispatch_table_default_bits, fast_dispatch_table_min_bits)}
@@ -133,9 +337,27 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
     // Fritchii: the per-site caches fall back on the fast dispatch table.
     indirect_cache_mode = conf.HasOptimization(OptimizationFlag::FastDispatch) ? IndirectCacheMode() : 0;
     omit_frame_pointer = OmitFramePointer();
+    // Fritchii: the debug output between instructions calls out and clobbers the flags.
+    flag_branch_mode = conf.very_verbose_debugging_output ? 0 : FlagBranchMode();
+    // Fritchii (FRITCHII_JIT_PIN_STATS): its counts are incs, which write the flags.
+    pin_stats = PinStatsMode();
+    if (pin_stats) {
+        flag_branch_mode = 0;
+    }
     if (indirect_cache_mode != 0) {
         indirect_slots.reset(new FastDispatchEntry[indirect_slot_capacity]);
     }
+    // Fritchii (FRITCHII_JIT_PIN): BlockOfCode holds the pins; everything emitted from here runs
+    // with them loaded (the exception handler's code, emitted by the base, does not).
+    pin_host_index.fill(-1);
+    for (const PinnedRegister& pin : code.Pins().regs) {
+        const size_t index = pin.state_offset == offsetof(A64JitState, sp)
+                                 ? 31
+                                 : (pin.state_offset - offsetof(A64JitState, reg)) / sizeof(u64);
+        pin_host_index[index] = pin.host.getIdx();
+    }
+    pin_verify = code.Pins().verify;
+    code.SetPinCallHook(true);
     GenMemory128Accessors();
     GenFastmemFallbacks();
     GenTerminalHandlers();
@@ -165,10 +387,16 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) noexcept try {
             gprs.reset(size_t(HostLoc::R13));
         if (conf.page_table)
             gprs.reset(size_t(HostLoc::R14));
+        for (const PinnedRegister& pin : code.Pins().regs)  // Fritchii (FRITCHII_JIT_PIN)
+            gprs.reset(size_t(pin.host.getIdx()));
         return gprs;
     }(), any_xmm);
 
     A64EmitContext ctx{conf, reg_alloc, block, shared_labels};
+    // Fritchii: FRITCHII_JIT_FLAG_BRANCH. The block entry's flags are the dispatcher's or the
+    // previous block's, never recorded.
+    const bool track_host_flags = flag_branch_mode != 0;
+    ctx.track_host_flags = track_host_flags;
 
     // Start emitting.
     code.align();
@@ -204,6 +432,7 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) noexcept try {
 
     for (auto& inst : block.instructions) {
         auto const opcode = inst.GetOpcode();
+        ctx.host_flags_set_here = false;
         // Call the relevant Emit* member function.
         switch (opcode) {
 #define OPCODE(name, type, ...) case IR::Opcode::name: goto opcode_branch;
@@ -223,6 +452,11 @@ a64_branch:
         (this->*a64_handlers[size_t(opcode) - std::size(opcode_handlers)])(ctx, &inst);
 finish_this_inst:
         ctx.reg_alloc.EndOfAllocScope();
+        // Fritchii (FRITCHII_JIT_FLAG_BRANCH): an instruction that neither recorded the flags it
+        // left nor is known to leave them alone ends what the record says.
+        if (track_host_flags && !ctx.host_flags_set_here && !PreservesHostFlags(inst)) {
+            ctx.HostFlagsUnknown();
+        }
 #ifndef NDEBUG
         if (conf.very_verbose_debugging_output)
             EmitVerboseDebuggingOutput(reg_alloc);
@@ -235,7 +469,13 @@ finish_this_inst:
     if (!omit_frame_pointer) {
         code.mov(rbp, code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)]);
     }
+    // Fritchii (FRITCHII_JIT_FLAG_BRANCH): between the last instruction and the terminal only the
+    // rbp mov above runs, unless cycle counting's sub (which writes the flags) does.
+    terminal_nzcv_in_host_flags = track_host_flags && !conf.enable_cycle_counting && ctx.guest_nzcv_in_host_flags;
+    terminal_check_bit_in_host_zf = flag_branch_mode >= 2 && !conf.enable_cycle_counting && ctx.check_bit_in_host_zf;
     EmitTerminal(block.terminal, ctx.Location().SetSingleStepping(false), ctx.IsSingleStep());
+    terminal_nzcv_in_host_flags = false;
+    terminal_check_bit_in_host_zf = false;
     code.int3();
     for (auto& deferred_emit : ctx.deferred_emits)
         deferred_emit();
@@ -493,6 +733,12 @@ void A64EmitX64::EmitA64SetCheckBit(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     const Xbyak::Reg8 to_store = ctx.reg_alloc.UseGpr(code, args[0]).cvt8();
     code.mov(code.byte[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, check_bit)], to_store);
+    if (flag_branch_mode >= 2) {
+        // Fritchii (FRITCHII_JIT_FLAG_BRANCH=2): ZF = (stored byte == 0), as the CheckBit
+        // terminal's cmp byte, 0 would find it.
+        code.test(to_store, to_store);
+        ctx.HostFlagsHoldCheckBit();
+    }
 }
 
 void A64EmitX64::EmitA64GetCFlag(A64EmitContext& ctx, IR::Inst* inst) {
@@ -540,22 +786,42 @@ void A64EmitX64::EmitA64SetNZCVRaw(A64EmitContext& ctx, IR::Inst* inst) {
 
 void A64EmitX64::EmitA64SetNZCV(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    // Fritchii (FRITCHII_JIT_FLAG_BRANCH): the guest NZCV becomes this value; it is in the host
+    // flags when they hold this very value's snapshot.
+    if (ctx.track_host_flags) {
+        const IR::Value value = inst->GetArg(0);
+        ctx.guest_nzcv_in_host_flags = !value.IsImmediate() && ctx.host_flags_nzcv != nullptr &&
+                                       value.GetInst() == ctx.host_flags_nzcv;
+    }
     const Xbyak::Reg32 to_store = ctx.reg_alloc.UseScratchGpr(code, args[0]).cvt32();
     code.mov(dword[code.ABI_JIT_PTR + offsetof(A64JitState, cpsr_nzcv)], to_store);
 }
 
 void A64EmitX64::EmitA64GetW(A64EmitContext& ctx, IR::Inst* inst) {
     const A64::Reg reg = inst->GetArg(0).GetA64RegRef();
+    EmitPinStat(size_t(reg), false);  // Fritchii (FRITCHII_JIT_PIN_STATS)
     const Xbyak::Reg32 result = ctx.reg_alloc.ScratchGpr(code).cvt32();
 
+    // Fritchii (FRITCHII_JIT_PIN): a pinned register's value is its host register's.
+    if (const auto host = PinnedHost(size_t(reg))) {
+        code.mov(result, host->cvt32());
+        ctx.reg_alloc.DefineValue(code, inst, result);
+        return;
+    }
     code.mov(result, dword[code.ABI_JIT_PTR + offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg)]);
     ctx.reg_alloc.DefineValue(code, inst, result);
 }
 
 void A64EmitX64::EmitA64GetX(A64EmitContext& ctx, IR::Inst* inst) {
     const A64::Reg reg = inst->GetArg(0).GetA64RegRef();
+    EmitPinStat(size_t(reg), false);  // Fritchii (FRITCHII_JIT_PIN_STATS)
     const Xbyak::Reg64 result = ctx.reg_alloc.ScratchGpr(code);
 
+    if (const auto host = PinnedHost(size_t(reg))) {  // Fritchii (FRITCHII_JIT_PIN)
+        code.mov(result, *host);
+        ctx.reg_alloc.DefineValue(code, inst, result);
+        return;
+    }
     code.mov(result, qword[code.ABI_JIT_PTR + offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg)]);
     ctx.reg_alloc.DefineValue(code, inst, result);
 }
@@ -588,7 +854,13 @@ void A64EmitX64::EmitA64GetQ(A64EmitContext& ctx, IR::Inst* inst) {
 }
 
 void A64EmitX64::EmitA64GetSP(A64EmitContext& ctx, IR::Inst* inst) {
+    EmitPinStat(31, false);  // Fritchii (FRITCHII_JIT_PIN_STATS)
     const Xbyak::Reg64 result = ctx.reg_alloc.ScratchGpr(code);
+    if (const auto host = PinnedHost(31)) {  // Fritchii (FRITCHII_JIT_PIN)
+        code.mov(result, *host);
+        ctx.reg_alloc.DefineValue(code, inst, result);
+        return;
+    }
     code.mov(result, qword[code.ABI_JIT_PTR + offsetof(A64JitState, sp)]);
     ctx.reg_alloc.DefineValue(code, inst, result);
 }
@@ -613,7 +885,26 @@ void A64EmitX64::EmitA64GetFPSR(A64EmitContext& ctx, IR::Inst* inst) {
 void A64EmitX64::EmitA64SetW(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     const A64::Reg reg = inst->GetArg(0).GetA64RegRef();
+    EmitPinStat(size_t(reg), true);  // Fritchii (FRITCHII_JIT_PIN_STATS)
     const auto addr = qword[code.ABI_JIT_PTR + offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg)];
+    // Fritchii (FRITCHII_JIT_PIN): the host register takes the value the qword store would
+    // have (an imm32 sign extends in both, a register's low half zero extends); with
+    // FRITCHII_JIT_VERIFY the state block gets it too.
+    if (const auto host = PinnedHost(size_t(reg))) {
+        if (args[1].FitsInImmediateS32()) {
+            code.mov(*host, u64(s64(args[1].GetImmediateS32())));
+            if (pin_verify) {
+                code.mov(addr, args[1].GetImmediateS32());
+            }
+        } else {
+            const Xbyak::Reg64 to_store = ctx.reg_alloc.UseGpr(code, args[1]);
+            code.mov(host->cvt32(), to_store.cvt32());
+            if (pin_verify) {
+                code.mov(addr, *host);
+            }
+        }
+        return;
+    }
     if (args[1].FitsInImmediateS32()) {
         code.mov(addr, args[1].GetImmediateS32());
     } else {
@@ -627,7 +918,12 @@ void A64EmitX64::EmitA64SetW(A64EmitContext& ctx, IR::Inst* inst) {
 void A64EmitX64::EmitA64SetX(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     const A64::Reg reg = inst->GetArg(0).GetA64RegRef();
+    EmitPinStat(size_t(reg), true);  // Fritchii (FRITCHII_JIT_PIN_STATS)
     const auto addr = qword[code.ABI_JIT_PTR + offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg)];
+    if (const auto host = PinnedHost(size_t(reg))) {  // Fritchii (FRITCHII_JIT_PIN)
+        EmitPinnedSet(ctx, *host, addr, args[1]);
+        return;
+    }
     if (args[1].FitsInImmediateS32()) {
         code.mov(addr, args[1].GetImmediateS32());
     } else if (args[1].IsInXmm(ctx.reg_alloc)) {
@@ -636,6 +932,22 @@ void A64EmitX64::EmitA64SetX(A64EmitContext& ctx, IR::Inst* inst) {
     } else {
         const Xbyak::Reg64 to_store = ctx.reg_alloc.UseGpr(code, args[1]);
         code.mov(addr, to_store);
+    }
+}
+
+// Fritchii (FRITCHII_JIT_PIN): SetX/SetSP of a pinned register. The host register takes the
+// value the qword store would have (an imm32 sign extends in both); with FRITCHII_JIT_VERIFY the
+// state block gets it too.
+void A64EmitX64::EmitPinnedSet(A64EmitContext& ctx, Xbyak::Reg64 host, const Xbyak::Address& addr, Argument& arg) {
+    if (arg.FitsInImmediateS32()) {
+        code.mov(host, u64(s64(arg.GetImmediateS32())));
+    } else if (arg.IsInXmm(ctx.reg_alloc)) {
+        code.movq(host, ctx.reg_alloc.UseXmm(code, arg));
+    } else {
+        code.mov(host, ctx.reg_alloc.UseGpr(code, arg));
+    }
+    if (pin_verify) {
+        code.mov(addr, host);
     }
 }
 
@@ -673,7 +985,12 @@ void A64EmitX64::EmitA64SetQ(A64EmitContext& ctx, IR::Inst* inst) {
 
 void A64EmitX64::EmitA64SetSP(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    EmitPinStat(31, true);  // Fritchii (FRITCHII_JIT_PIN_STATS)
     const auto addr = qword[code.ABI_JIT_PTR + offsetof(A64JitState, sp)];
+    if (const auto host = PinnedHost(31)) {  // Fritchii (FRITCHII_JIT_PIN)
+        EmitPinnedSet(ctx, *host, addr, args[0]);
+        return;
+    }
     if (args[0].FitsInImmediateS32()) {
         code.mov(addr, args[0].GetImmediateS32());
     } else if (args[0].IsInXmm(ctx.reg_alloc)) {
@@ -963,7 +1280,9 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::If terminal, IR::LocationDescript
         e.EmitLeafTerminal(terminal.then_, initial_location, is_single_step);
         break;
     default:
-        Xbyak::Label pass = e.EmitCond(terminal.if_);
+        // Fritchii (FRITCHII_JIT_FLAG_BRANCH): no reload when the host flags hold the NZCV.
+        Xbyak::Label pass = e.terminal_nzcv_in_host_flags ? e.EmitCondFromHostFlags(terminal.if_)
+                                                          : e.EmitCond(terminal.if_);
         e.EmitLeafTerminal(terminal.else_, initial_location, is_single_step);
         e.code.L(pass);
         e.EmitLeafTerminal(terminal.then_, initial_location, is_single_step);
@@ -974,7 +1293,10 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::If terminal, IR::LocationDescript
 
 bool EmitTerminalImpl(A64EmitX64& e, IR::Term::CheckBit terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
     Xbyak::Label fail;
-    e.code.cmp(e.code.byte[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, check_bit)], u8(0));
+    // Fritchii (FRITCHII_JIT_FLAG_BRANCH=2): ZF already says whether the byte is 0.
+    if (!e.terminal_check_bit_in_host_zf) {
+        e.code.cmp(e.code.byte[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, check_bit)], u8(0));
+    }
     e.code.jz(fail);
     e.EmitLeafTerminal(terminal.then_, initial_location, is_single_step);
     e.code.L(fail);

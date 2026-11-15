@@ -12,6 +12,7 @@
 #include <functional>
 #include <memory>
 #include <type_traits>
+#include <vector>
 
 #include "common/common_types.h"
 #include "common/x64/xbyak.h"
@@ -37,9 +38,24 @@ struct RunCodeCallbacks {
     bool enable_cycle_counting;
 };
 
+/// Fritchii (FRITCHII_JIT_PIN): guest registers that live in host registers while generated code
+/// runs. The state block's copy is current only outside generated code and around its calls out.
+struct PinnedRegister {
+    Xbyak::Reg64 host;
+    u32 state_offset;  ///< of the guest register's qword in the state block (ABI_JIT_PTR)
+};
+struct PinConfig {
+    std::vector<PinnedRegister> regs;  ///< empty = no pinning, old code
+    /// FRITCHII_JIT_VERIFY: guest register writes also go to the state block, and the dispatcher,
+    /// the exit and every call out compare each pinned register with it (a mismatch counts at
+    /// mismatch_offset, a qword in the state block, and the state block's value wins).
+    bool verify = false;
+    u32 mismatch_offset = 0;
+};
+
 class BlockOfCode final : public Xbyak::CodeGenerator {
 public:
-    BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_code_size, std::function<void(BlockOfCode&)> rcp);
+    BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_code_size, std::function<void(BlockOfCode&)> rcp, PinConfig pins = {});
     BlockOfCode(const BlockOfCode&) = delete;
 
     /// Call when external emitters have finished emitting their preludes.
@@ -87,14 +103,35 @@ public:
     template<typename F>
         requires std::is_pointer_v<F> && std::is_function_v<std::remove_pointer_t<F>>
     void CallFunction(F fn) {
+        PinsBeforeCall();
         ::Common::X64::CallFarFunction(*this, fn);
+        PinsAfterCall();
     }
 
     /// @brief Code emitter: Calls the lambda. Lambda must not have any captures.
     template<typename Lambda>
     void CallLambda(Lambda l) {
+        PinsBeforeCall();
         ::Common::X64::CallFarFunction(*this, Common::FptrCast(l));
+        PinsAfterCall();
     }
+
+    /// Fritchii (FRITCHII_JIT_PIN): the pinned guest registers.
+    const PinConfig& Pins() const { return pins; }
+    /// Code emitter: while the hook is on, calls out write the pinned registers to the state
+    /// block before (verify: compare them with it) and load them back after. On only where
+    /// ABI_JIT_PTR is the state and the pins are loaded (block code, the shared handlers, the
+    /// dispatcher); off for the exception handler's code and the run_code prologue.
+    void SetPinCallHook(bool on) { pin_call_hook = on && !pins.regs.empty(); }
+    /// Code emitter: around a raw call out (the hook's two halves; nothing while it is off).
+    void PinsBeforeCall();
+    void PinsAfterCall();
+    /// Code emitter: state block <- pinned registers / pinned registers <- state block.
+    void StorePinnedRegisters();
+    void LoadPinnedRegisters();
+    /// Code emitter (FRITCHII_JIT_VERIFY): each pinned register that differs from the state
+    /// block's copy counts one mismatch and takes the state block's value. Writes the flags.
+    void CheckPinnedRegisters();
 
     void ZeroExtendFrom(size_t bitsize, Xbyak::Reg64 reg) {
         switch (bitsize) {
@@ -185,6 +222,8 @@ private:
     RunCodeCallbacks cb;
     CodePtr code_begin = nullptr;
     bool prelude_complete = false;
+    PinConfig pins;
+    bool pin_call_hook = false;
 
     void GenRunCode(std::function<void(BlockOfCode&)> rcp);
 };

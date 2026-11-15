@@ -302,7 +302,8 @@ void AxxEmitX64::EmitExclusiveWriteMemory(AxxEmitContext& ctx, IR::Inst* inst) {
     code.mov(code.ABI_RETURN, u32(1));
     code.movzx(tmp.cvt32(), code.byte[code.ABI_JIT_PTR + offsetof(AxxJitState, exclusive_state)]);
     code.test(tmp.cvt8(), tmp.cvt8());
-    code.je(end);
+    // Fritchii (FRITCHII_JIT_PIN): the call's pin stores and reloads may outgrow a short jump.
+    code.je(end, code.Pins().regs.empty() ? code.T_AUTO : code.T_NEAR);
     code.xor_(tmp.cvt32(), tmp.cvt32());
     code.xchg(tmp.cvt8(), code.byte[code.ABI_JIT_PTR + offsetof(AxxJitState, exclusive_state)]);
     code.mov(code.ABI_PARAM1, u64(&conf));

@@ -69,6 +69,38 @@ struct EmitContext {
     RegAlloc& reg_alloc;
     IR::Block& block;
     boost::container::stable_vector<Xbyak::Label>& shared_labels;
+
+    // Fritchii: FRITCHII_JIT_FLAG_BRANCH (A64 blocks only; A64EmitX64::Emit sets track_host_flags
+    // and keeps the rest current, see there). What the host flags hold at the current point of
+    // the emitted code, so a block's conditional terminal can branch on them directly.
+    bool track_host_flags = false;
+    /// The NZCV value (a GetNZCVFromOp) whose lahf + seto snapshot is still the host SF, ZF, CF
+    /// and OF; nullptr = none.
+    IR::Inst* host_flags_nzcv = nullptr;
+    /// The guest NZCV is host_flags_nzcv (an A64SetNZCV of it ran since the flags got it).
+    bool guest_nzcv_in_host_flags = false;
+    /// Host ZF = (check bit == 0): A64SetCheckBit tested the byte it stored.
+    bool check_bit_in_host_zf = false;
+    /// Set by an emitter whose code left the host flags as recorded above.
+    bool host_flags_set_here = false;
+
+    void HostFlagsHoldNZCV(IR::Inst* nzcv) noexcept {
+        host_flags_nzcv = nzcv;
+        guest_nzcv_in_host_flags = false;
+        check_bit_in_host_zf = false;
+        host_flags_set_here = true;
+    }
+    void HostFlagsHoldCheckBit() noexcept {
+        host_flags_nzcv = nullptr;
+        guest_nzcv_in_host_flags = false;
+        check_bit_in_host_zf = true;
+        host_flags_set_here = true;
+    }
+    void HostFlagsUnknown() noexcept {
+        host_flags_nzcv = nullptr;
+        guest_nzcv_in_host_flags = false;
+        check_bit_in_host_zf = false;
+    }
 };
 
 class EmitX64 {
@@ -106,6 +138,11 @@ public:
     virtual std::string LocationDescriptorToFriendlyName(const IR::LocationDescriptor&) const = 0;
     void EmitAddCycles(size_t cycles);
     Xbyak::Label EmitCond(IR::Cond cond);
+    /// Fritchii (FRITCHII_JIT_FLAG_BRANCH): EmitCond's jump without its reload, for when the host
+    /// SF, ZF, CF and OF are the ones whose lahf + seto snapshot is the guest NZCV.
+    Xbyak::Label EmitCondFromHostFlags(IR::Cond cond);
+    /// The jump to `pass` for `cond`, the flags in EmitCond's reloaded form.
+    void EmitCondJump(IR::Cond cond, Xbyak::Label& pass);
     BlockDescriptor RegisterBlock(const IR::LocationDescriptor& location_descriptor, CodePtr entrypoint, size_t size);
     void PushRSBHelper(Xbyak::Reg64 loc_desc_reg, Xbyak::Reg64 index_reg, IR::LocationDescriptor target);
 
