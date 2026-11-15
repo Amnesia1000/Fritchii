@@ -63,6 +63,39 @@ inline void PriceMarkGens(u64 address, u64 size) noexcept {
     return sum;
 }
 
+/// FRITCHII_STORE_MEMO (core/memory.cpp, WriteToRasterizer): moved by everything that takes away
+/// a mark a guest store to a GPU-tracked page leaves (a 64-byte block's collected write in a dirty
+/// manager, the page's collected and watch flags). Such a clear runs inside a StoreMemoClear:
+/// the low 16 bits count clears running, and each clear's end raises a generation. A core's store
+/// memo keeps the value it read before its last full store path, and only when no clear was
+/// running then. While the value is unchanged, no clear began or ended since and none was running
+/// at the read, so no mark of that store was taken: a later store inside the same 64-byte block
+/// would find every mark set (each would be a no-op) and may skip them. Moved always, whatever the
+/// switch says, so a memo is never trusted across a switch change. Only equality is compared.
+/// Bits 16-39: dirty manager gathers, bits 40-63: flag takes (the dry counter's line); a carry
+/// from one field into the next changes the value all the same.
+inline std::atomic<u64> g_store_memo_epoch{0};
+inline constexpr u64 StoreMemoActiveMask = 0xffff;
+inline constexpr u64 StoreMemoGatherGen = u64{1} << 16;
+inline constexpr u64 StoreMemoTakeGen = u64{1} << 40;
+
+/// Around a clear of store marks (seq_cst both ways, so a store memo's seq_cst read of the epoch
+/// that comes after the clear in that order also comes after the begin).
+class StoreMemoClear {
+public:
+    explicit StoreMemoClear(u64 generation_) noexcept : generation{generation_} {
+        g_store_memo_epoch.fetch_add(1, std::memory_order_seq_cst);
+    }
+    ~StoreMemoClear() {
+        g_store_memo_epoch.fetch_add(generation - 1, std::memory_order_seq_cst);
+    }
+    StoreMemoClear(const StoreMemoClear&) = delete;
+    StoreMemoClear& operator=(const StoreMemoClear&) = delete;
+
+private:
+    u64 generation;
+};
+
 /// One bit per device page of the 36-bit device address space (2 MiB), set by writers and taken
 /// by the native uniform bank check (BufferCache, EDEN_NX2_EXP9).
 class DevicePageFlags {
@@ -71,8 +104,11 @@ public:
     static constexpr u64 PageBits = 12;
 
     /// `feeds_price_`: its marks also raise the price counters' generations (above).
-    constexpr explicit DevicePageFlags(bool feeds_price_ = false) noexcept
-        : feeds_price{feeds_price_} {}
+    /// `bumps_store_memo_`: a guest store's path marks it (Core::Memory's WriteToRasterizer), so
+    /// Take raises g_store_memo_epoch before it clears a set bit.
+    constexpr explicit DevicePageFlags(bool feeds_price_ = false,
+                                       bool bumps_store_memo_ = false) noexcept
+        : feeds_price{feeds_price_}, bumps_store_memo{bumps_store_memo_} {}
 
     void Mark(u64 address, u64 size) noexcept {
         if (feeds_price && g_price_gens_on.load(std::memory_order_relaxed)) [[unlikely]] {
@@ -128,18 +164,24 @@ public:
         if ((word.load(std::memory_order_relaxed) & bit) == 0) {
             return false;
         }
+        if (bumps_store_memo) {
+            // FRITCHII_STORE_MEMO: a guest store's path marks this flag (g_store_memo_epoch).
+            const StoreMemoClear clear{StoreMemoTakeGen};
+            return (word.fetch_and(~bit, std::memory_order_seq_cst) & bit) != 0;
+        }
         return (word.fetch_and(~bit, std::memory_order_seq_cst) & bit) != 0;
     }
 
 private:
     std::array<std::atomic<u64>, (u64{1} << (AddressBits - PageBits)) / 64> words{};
     bool feeds_price{};
+    bool bumps_store_memo{};
 };
 
 /// Pages guest CPU writes went to through the dirty memory managers: the buffer cache sees them
 /// only at the next InvalidateGPUCache. Set before the store (Core::Memory's
 /// HandleRasterizerWrite) and again after it (UniformKeepPages::AfterGuestStore).
-inline DevicePageFlags g_collected_write_pages{true};
+inline DevicePageFlags g_collected_write_pages{true, true};
 /// Pages whose guest memory the buffer cache saw change (WriteMemory, uploads in place,
 /// downloads), and every emulator write the write ring hears of, after its bytes landed
 /// (WriteRing::Note, MemoryManager::Write).
@@ -148,7 +190,7 @@ inline DevicePageFlags g_buffer_write_pages{true};
 /// trapped (Memory::HandleRasterizerWrite, every one, collected or not), the buffer cache's
 /// writes (the same places as g_buffer_write_pages) and TextureCache::WriteMemory. Only the
 /// texture cache's watched-page harvest takes them (TextureCache::TexBankPageGen).
-inline DevicePageFlags g_watch_write_pages;
+inline DevicePageFlags g_watch_write_pages{false, true};
 /// The bank marks' gate: true while FRITCHII_BANK_FLAGGED or FRITCHII_BANK_CENSUS is non-zero
 /// (set by the bank check, BufferCache::CheckNativeBankPagesTracked). Off, each mark below that
 /// the hot rule made unneeded (the write ring's Note, MemoryManager::Write, unsafe and span

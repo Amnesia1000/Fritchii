@@ -84,6 +84,19 @@ public:
         }
     }
 
+    /// Await, also saying whether no landing was published when it looked. True means every
+    /// landing published later finds this write's collected mark while it stays collected (the
+    /// fences' either-or above): FRITCHII_STORE_MEMO keeps a memo only after such a write.
+    [[nodiscard]] static bool AwaitIdle(DAddr addr, u64 size) noexcept {
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        const u64 sequence = state.sequence.load(std::memory_order_acquire);
+        if ((sequence & 1) != 0) [[unlikely]] {
+            Wait(sequence, addr, size);
+            return false;
+        }
+        return true;
+    }
+
     /// Writes that waited for a landing so far.
     [[nodiscard]] static u64 Waits() noexcept {
         return state.waits.load(std::memory_order_relaxed);

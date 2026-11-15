@@ -2540,6 +2540,36 @@ the same few pages again and again.
   skips the whole bind; this one only shortens the translation when EXP18's memo misses or is
   off.
 
+### FRITCHII_STORE_MEMO
+
+FRITCHII_STORE_MEMO (live, default 0 = exactly as before; fable_a_gameceiling_answer 12.1).
+Guest stores to GPU-tracked pages were 3.6% of the guest cores' busy time at the market: each
+one walks the page table twice and then sets the watch flag, records the store, asks or skips
+OnCPUWrite, collects the dirty bit, fences for a download landing and sets the collected flag.
+- Always (no switch, exact): the store's handler takes the host pointer the store's own walk
+  found instead of walking the page table a second time (Memory::WriteToRasterizer).
+- 1 (dry): each core keeps a one-entry memo of its last full store path and counts the stores it
+  would serve; the full path still runs for every store.
+- 2: a memo hit only records the store for the uniform keeps (thread-local) and returns.
+- A hit needs: the store inside one 64-byte device block, the same block as the core's last full
+  path, the memo epoch (Common::g_store_memo_epoch) unchanged since that path began, the core's
+  write area still on the page, and no run-ahead write tracking armed.
+- Why it is exact: the epoch moves around everything that takes such a mark away (a dirty manager
+  Gather, a Take of the collected or watch page flags): a count of clears running in its low 16
+  bits and a generation raised as each ends, so a memo is only kept when no clear ran at the read,
+  and any clear since changes the value. With it unchanged, every mark the last full path set is
+  still there, and the full path would have found each set (no-ops; last_address on the page
+  means no OnCPUWrite either). The landing wait: the memo is only kept when that path saw no
+  landing published, so every landing published later found the block's collected bit (still
+  collected: no gather) and keeps those bytes. The uniform keeps' record still runs on a hit.
+  The epoch moves whatever the switch says, so a switch change never trusts an old memo.
+- "Store memo (FRITCHII_STORE_MEMO=n) 10 s: trapped stores S/s, would serve (=2: served) H/s
+  (P%), same block but a mark taken since M/s; epoch moves: gathers G/s, flag takes T/s; since
+  boot hits/stores by core ..." (HW_Memory, Info; at most every 10 s while the switch is on).
+- Expected: 1.5 to 2% of the guest cores' busy time if most trapped stores hit (Fable A's guess:
+  stores come in runs over the same block); the dry line says how many do. If the flag takes or
+  gathers move the epoch too often the hit share stays low and the switch is not worth it.
+
 ## Numbered experiments (EDEN_NX2_EXPn)
 
 Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP79, live through the debug server:

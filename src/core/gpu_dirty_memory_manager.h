@@ -73,6 +73,8 @@ public:
         // gatherers so one cannot swap or clear front_buffer while another iterates it.
         std::scoped_lock gather_lk(gather_guard);
         {
+            // FRITCHII_STORE_MEMO: the collected writes are taken here (g_store_memo_epoch).
+            const Common::StoreMemoClear clear{Common::StoreMemoGatherGen};
             std::scoped_lock lk(guard);
             TransformAddress t = current.exchange(default_transform, std::memory_order_relaxed);
             front_buffer.swap(back_buffer);
