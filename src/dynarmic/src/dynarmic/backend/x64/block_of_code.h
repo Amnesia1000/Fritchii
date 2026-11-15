@@ -156,6 +156,8 @@ public:
     /// PreludeComplete. Without it nothing changes.
     void EnableFarCode(size_t far_size);
     bool HasFarCode() const { return far_code_begin != 0; }
+    /// Offset of the far region in the code space (0 without one).
+    size_t FarCodeBegin() const { return far_code_begin; }
     /// Emission continues in the far region (where it last stopped) / back in the near one.
     void SwitchToFarCode();
     void SwitchToNearCode();

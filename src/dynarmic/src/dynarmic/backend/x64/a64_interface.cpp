@@ -6,14 +6,18 @@
  * SPDX-License-Identifier: 0BSD
  */
 
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <string>
+#include <vector>
 #include <exception>
 #include <memory>
 #include <mutex>
 
 #include <boost/icl/interval_set.hpp>
 #include "common/assert.h"
+#include "common/logging.h"
 #include "common/nx2_hitch.h"
 #include "dynarmic/common/fp/fpcr.h"
 #include "dynarmic/common/llvm_disassemble.h"
@@ -53,6 +57,240 @@ static std::function<void(BlockOfCode&)> GenRCP(const A64::UserConfig& conf) {
         }
     };
 }
+
+namespace {
+
+/// Fritchii: FRITCHII_JIT_DUMP (boot, default 0; Fable A 4.1 and 8.5). Writes the code each
+/// block was compiled to, with its guest words, so the host code can be read offline.
+/// 1 = written every 4096 blocks, 2 = only at a full cache clear and at shutdown. Host bytes
+/// are read when written, so links show as patched by then.
+/// FRITCHII_JIT_DUMP_CORE: the core that dumps (default 0, -1 = every core).
+/// FRITCHII_JIT_DUMP_FILE: the file (default jit-dump-core{core}.bin in the working directory;
+/// "{core}" is replaced by the core, and with every core dumping ".core{N}" is appended when
+/// the name has no "{core}").
+/// FRITCHII_JIT_DUMP_LIST: only these blocks, one hex guest pc per line (first word of a line,
+/// so hot lists work too). Values below the image base are offsets from it (the lists made by
+/// earlier launches, as the base is random per launch), others absolute.
+/// File: a 64-byte header ("FJITDMP2", version 2, core, code space base and size, image base,
+/// far region start or 0, far code flag, entry count of the list), then 64-byte records, each
+/// followed by its guest words, near bytes and far bytes (see CodeDumpRecord).
+struct CodeDumpSettings {
+    int mode = 0;
+    int core = 0;
+    std::string file;
+    std::vector<u64> list; // as written in the list file
+};
+
+const CodeDumpSettings& GetCodeDumpSettings() {
+    static const CodeDumpSettings settings = [] {
+        CodeDumpSettings s;
+        const auto text = [](const char* name) {
+            const char* value = std::getenv(name);
+            return value != nullptr ? std::string{value} : std::string{};
+        };
+        s.mode = std::atoi(text("FRITCHII_JIT_DUMP").c_str());
+        if (s.mode < 0 || s.mode > 2) {
+            s.mode = 0;
+        }
+        if (s.mode == 0) {
+            return s;
+        }
+        s.core = std::atoi(text("FRITCHII_JIT_DUMP_CORE").c_str());
+        s.file = text("FRITCHII_JIT_DUMP_FILE");
+        if (const std::string list_path = text("FRITCHII_JIT_DUMP_LIST"); !list_path.empty()) {
+            if (std::FILE* const list = std::fopen(list_path.c_str(), "r")) {
+                char line[256];
+                while (std::fgets(line, sizeof(line), list) != nullptr) {
+                    char* end = nullptr;
+                    const u64 value = std::strtoull(line, &end, 16);
+                    if (end != line) {
+                        s.list.push_back(value);
+                    }
+                }
+                std::fclose(list);
+            }
+            LOG_INFO(Core_ARM, "FRITCHII_JIT_DUMP_LIST: {} pcs from {}", s.list.size(), list_path);
+        }
+        LOG_INFO(Core_ARM, "FRITCHII_JIT_DUMP={}: core {}, {}", s.mode, s.core,
+                 s.mode == 1 ? "written every 4096 blocks" : "written at cache clears and shutdown");
+        return s;
+    }();
+    return settings;
+}
+
+#pragma pack(push, 1)
+struct CodeDumpHeader {
+    char magic[8];
+    u32 version;
+    u32 core;
+    u64 code_base;
+    u64 code_size;
+    u64 image_base;
+    u64 far_begin;     ///< address of the far region, 0 without one
+    u32 flags;         ///< bit 0: far code
+    u32 list_entries;  ///< FRITCHII_JIT_DUMP_LIST entries (0 = every block)
+    u64 reserved;
+};
+struct CodeDumpRecord {
+    u16 kind;          ///< 1 block, 2 prelude (dispatcher, handlers, constant pool)
+    u16 flags;         ///< bit 0: far part present
+    u32 guest_count;   ///< guest instruction words that follow
+    u64 descriptor;    ///< location descriptor (pc, fpcr, single step)
+    u64 guest_pc;      ///< absolute guest pc
+    s64 guest_offset;  ///< guest pc minus the image base (the same in every launch)
+    u64 near_addr;
+    u64 far_addr;      ///< 0 without a far part
+    u32 near_size;
+    u32 far_size;
+    u64 sequence;      ///< emission order since the JIT was made
+};
+#pragma pack(pop)
+static_assert(sizeof(CodeDumpHeader) == 64 && sizeof(CodeDumpRecord) == 64);
+
+class CodeDump {
+public:
+    CodeDump(const UserConfig& conf, const BlockOfCode& code) : conf{conf}, code{code} {
+        const CodeDumpSettings& s = GetCodeDumpSettings();
+        if (s.mode == 0 || (s.core != -1 && s.core != int(conf.processor_id))) {
+            return;
+        }
+        mode = s.mode;
+        std::string name = s.file.empty() ? std::string{"jit-dump-core{core}.bin"} : s.file;
+        if (const size_t at = name.find("{core}"); at != std::string::npos) {
+            name.replace(at, 6, std::to_string(conf.processor_id));
+        } else if (s.core == -1) {
+            name += ".core" + std::to_string(conf.processor_id);
+        }
+        path = std::move(name);
+        list_entries = u32(s.list.size());
+        for (const u64 value : s.list) {
+            list.insert(value < conf.image_base ? value + conf.image_base : value);
+        }
+    }
+
+    ~CodeDump() {
+        Flush();
+        if (file != nullptr) {
+            std::fclose(file);
+        }
+    }
+
+    bool Active() const {
+        return mode != 0;
+    }
+
+    /// After a block was emitted. `get_code` reads its guest words.
+    template<typename GetCode>
+    void Record(const IR::Block& block, CodePtr near_addr, size_t near_size, CodePtr far_addr, size_t far_size, GetCode&& get_code) {
+        ++sequence;
+        const A64::LocationDescriptor location{block.Location()};
+        const u64 pc = location.PC();
+        if (!list.empty() && list.count(pc) == 0) {
+            return;
+        }
+        Pending& p = pending.emplace_back();
+        p.record.kind = 1;
+        p.record.flags = far_size != 0 ? 1 : 0;
+        p.record.descriptor = location.UniqueHash();
+        p.record.guest_pc = pc;
+        p.record.guest_offset = s64(pc - conf.image_base);
+        p.record.near_addr = u64(reinterpret_cast<uintptr_t>(near_addr));
+        p.record.far_addr = far_size != 0 ? u64(reinterpret_cast<uintptr_t>(far_addr)) : 0;
+        p.record.near_size = u32(near_size);
+        p.record.far_size = u32(far_size);
+        p.record.sequence = sequence;
+        const u64 end_pc = A64::LocationDescriptor{block.EndLocation()}.PC();
+        const u64 count = end_pc > pc ? (end_pc - pc) / 4 : 0;
+        p.words.reserve(size_t(count));
+        for (u64 i = 0; i < count; ++i) {
+            p.words.push_back(get_code(pc + i * 4).value_or(0));
+        }
+        p.record.guest_count = u32(p.words.size());
+        if (mode == 1 && pending.size() >= 4096) {
+            Flush();
+        }
+    }
+
+    /// Writes what is pending (the host bytes as they are now). Call before the code goes.
+    void Flush() {
+        if (pending.empty() || !Open()) {
+            pending.clear();
+            return;
+        }
+        for (const Pending& p : pending) {
+            WriteRecord(p.record, p.words.data());
+        }
+        std::fflush(file);
+        pending.clear();
+    }
+
+private:
+    struct Pending {
+        CodeDumpRecord record{};
+        std::vector<u32> words;
+    };
+
+    bool Open() {
+        if (file != nullptr) {
+            return true;
+        }
+        if (failed) {
+            return false;
+        }
+        file = std::fopen(path.c_str(), "wb");
+        if (file == nullptr) {
+            failed = true;
+            LOG_WARNING(Core_ARM, "FRITCHII_JIT_DUMP: can't open {}", path);
+            return false;
+        }
+        CodeDumpHeader header{};
+        std::memcpy(header.magic, "FJITDMP2", 8);
+        header.version = 2;
+        header.core = conf.processor_id;
+        header.code_base = u64(reinterpret_cast<uintptr_t>(code.getCode()));
+        header.code_size = code.GetTotalCodeSize();
+        header.image_base = conf.image_base;
+        header.far_begin = code.HasFarCode() ? u64(reinterpret_cast<uintptr_t>(code.getCode())) + code.FarCodeBegin() : 0;
+        header.flags = code.HasFarCode() ? 1 : 0;
+        header.list_entries = list_entries;
+        std::fwrite(&header, sizeof(header), 1, file);
+        // The prelude: everything before the first block, as it never moves.
+        CodeDumpRecord prelude{};
+        prelude.kind = 2;
+        prelude.near_addr = header.code_base;
+        prelude.near_size = u32(static_cast<const u8*>(code.GetCodeBegin()) - code.getCode());
+        WriteRecord(prelude, nullptr);
+        LOG_INFO(Core_ARM, "FRITCHII_JIT_DUMP: core {} writes {} (image base {:#x})",
+                 conf.processor_id, path, conf.image_base);
+        return true;
+    }
+
+    void WriteRecord(const CodeDumpRecord& record, const u32* words) {
+        std::fwrite(&record, sizeof(record), 1, file);
+        if (record.guest_count != 0) {
+            std::fwrite(words, sizeof(u32), record.guest_count, file);
+        }
+        if (record.near_size != 0) {
+            std::fwrite(reinterpret_cast<const void*>(uintptr_t(record.near_addr)), 1, record.near_size, file);
+        }
+        if (record.far_size != 0) {
+            std::fwrite(reinterpret_cast<const void*>(uintptr_t(record.far_addr)), 1, record.far_size, file);
+        }
+    }
+
+    const UserConfig& conf;
+    const BlockOfCode& code;
+    int mode = 0;
+    std::string path;
+    u32 list_entries = 0;
+    ::Common::unordered_set<u64> list;
+    std::vector<Pending> pending;
+    u64 sequence = 0;
+    std::FILE* file = nullptr;
+    bool failed = false;
+};
+
+} // namespace
 
 static Optimization::PolyfillOptions GenPolyfillOptions(const BlockOfCode& code) {
     return Optimization::PolyfillOptions{
@@ -319,7 +557,12 @@ private:
         if (conf.counters) {
             ++conf.counters->blocks_compiled;
         }
-        return emitter.Emit(ir_block).entrypoint;
+        const auto bdesc = emitter.Emit(ir_block);
+        if (code_dump.Active()) [[unlikely]] {
+            code_dump.Record(ir_block, bdesc.entrypoint, bdesc.size, emitter.last_far_entry,
+                             emitter.last_far_size, get_code);
+        }
+        return bdesc.entrypoint;
     }
 
     void PerformRequestedCacheInvalidation(HaltReason hr) {
@@ -337,6 +580,7 @@ private:
                 if (conf.counters) {
                     ++conf.counters->cache_clears;
                 }
+                code_dump.Flush(); // FRITCHII_JIT_DUMP: before the code goes
                 block_of_code.ClearCache();
                 emitter.ClearCache();
             } else {
@@ -353,6 +597,7 @@ private:
     BlockOfCode block_of_code;
     A64EmitX64 emitter;
     Optimization::PolyfillOptions polyfill_options;
+    CodeDump code_dump{conf, block_of_code}; // after the code: written out before it goes
     bool is_executing = false;
     u32 runs_since_counter_look = 0;
     bool invalidate_entire_cache = false;

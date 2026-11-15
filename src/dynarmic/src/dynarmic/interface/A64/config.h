@@ -211,6 +211,11 @@ struct UserConfig {
     // Maximum size is limited by the maximum length of a x86_64 / arm64 jump.
     std::uint32_t code_cache_size = 128 * 1024 * 1024;  // bytes
 
+    /// Fritchii: the guest address the main image (its first module) was loaded at, 0 when not
+    /// known. It changes with every launch (address space randomisation), so diagnostics record
+    /// guest pcs as offsets from it (FRITCHII_JIT_DUMP, FRITCHII_JIT_DUMP_LIST). Changes no code.
+    std::uint64_t image_base = 0;
+
     /// Diagnostics: when set, the x64 backend counts here the dispatcher's C++ block lookups,
     /// the blocks it compiles and full code cache clears. The thread that runs the JIT writes
     /// them (a clear asked for while it is idle runs on the asking thread); JITs that run on the
