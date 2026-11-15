@@ -89,6 +89,11 @@ public:
                 front_buffer.emplace_back(t);
             }
         }
+        // FRITCHII_WRITE_REMARK: the collected writes are taken, and their pages read from guest
+        // memory after this; a write whose mark was taken and whose bytes may not have landed yet
+        // sees the move after its store and marks again (Core::g_pages_tracked_generation).
+        g_pages_tracked_generation.fetch_add(1, std::memory_order_seq_cst);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
         for (auto& transform : front_buffer) {
             ForEachRun(transform, callback);
         }

@@ -244,6 +244,8 @@ inline std::atomic<int> g_worker_spin{-1};
 inline std::atomic<int> g_bind_addr_memo{-1};
 /// FRITCHII_STORE_MEMO: docs/fritchii/switches.md.
 inline std::atomic<int> g_store_memo{-1};
+/// FRITCHII_WRITE_REMARK (live, default 1): docs/fritchii/switches.md.
+inline std::atomic<int> g_write_remark{-1};
 /// FRITCHII_JIT_HOT_PACK: docs/fritchii/switches.md.
 inline std::atomic<int> g_jit_hot_pack{-1};
 /// FRITCHII_ONEF (boot): one follower step 1, the render thread R (one_follower.h).

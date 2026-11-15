@@ -496,6 +496,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_STORE_MEMO") {
         return &g_store_memo;
     }
+    if (name == "FRITCHII_WRITE_REMARK") {
+        return &g_write_remark;
+    }
     if (name == "FRITCHII_JIT_HOT_PACK") {
         return &g_jit_hot_pack;
     }
