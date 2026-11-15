@@ -30,6 +30,12 @@ inline bool g_e_pipeline{};
 /// another thread (the front's own copy) are not E's and are ignored there.
 void NoteRegWrite(u32 index) noexcept;
 
+/// FRITCHII_ONEF_UNLENT_VALUES (fable_b 19 step 2): Maxwell3D::ProcessCBBind tests this before
+/// NoteCbBind; set on E while the constant buffer bindings go to R's view by value.
+inline std::atomic<bool> g_track_binds{};
+/// E bound constant buffer `slot` of shader stage `stage` (one_follower_view.cpp).
+void NoteCbBind(size_t stage, u32 slot) noexcept;
+
 namespace Detail {
 /// True on E while FRITCHII_ONEF=1 (set once by MarkEngineThread): ShouldLend's one load.
 inline thread_local bool t_engine{};

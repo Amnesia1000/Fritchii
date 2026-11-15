@@ -156,6 +156,9 @@ struct Impl {
     std::array<u64, static_cast<size_t>(FenceDecision::Count)> fence_decisions_logged{};
     std::atomic<u64> sync_target_superset{};
     u64 sync_target_superset_logged{};
+    std::atomic<bool> unlent_reset_stopped{}; ///< StopUnlentReset
+    std::atomic<bool> unlent_values_stopped{}; ///< StopUnlentValues
+    std::atomic<bool> bind_seed_stopped{};     ///< StopBindSeed
     // fable_b 13.0 (E only): pages with a report a posted fence lands, by that fence's packet
     // number; and the report pages since the last fence.
     std::unordered_map<u64, u64> landing_pages;
@@ -187,6 +190,13 @@ struct Impl {
 
     std::atomic<Maxwell3D*> engine{};
     std::atomic<bool> unlend_disabled{}; ///< DisableUnlend: step 4 off for the session
+
+    // fable_b 19 step 2's dry counter (E counts at each transient lend; LogQueryKinds reads).
+    std::array<std::array<std::atomic<u64>, Stats::KindSlots>,
+               static_cast<size_t>(TransientTest::Count)>
+        transient{};
+    std::array<std::array<u64, Stats::KindSlots>, static_cast<size_t>(TransientTest::Count)>
+        transient_logged{};
 };
 
 Impl g;
@@ -325,11 +335,12 @@ u64 g_lend_sites_log_ns{};
 /// R: the number of the packet it plays (or played last): its place for the page write stamps.
 thread_local u32 t_play_number{};
 constexpr u64 StampSlots = u64{1} << 22;
-/// The most a packet's spans can take (every register word, the flags, the draw, the programs
-/// and the pools), and an op packet's payload after them.
+/// The most a packet's spans can take (every register word, the flags, the draw, the programs,
+/// the pools, the engine values and every binding), and an op packet's payload after them.
 constexpr std::size_t MaxSpanBytes = sizeof(RegPair) * Maxwell3D::Regs::NUM_REGS +
                                      sizeof(FlagBits) + sizeof(DrawValues) + sizeof(Programs) +
-                                     sizeof(Pools) + 64;
+                                     sizeof(Pools) + sizeof(EngineValues) + sizeof(BindsHeader) +
+                                     sizeof(BindValue) * MaxBindValues + 64;
 constexpr std::size_t MaxPayloadBytes = 64;
 
 /// E's packet buffer (fable_b 11.1 item 0): allocated once per thread, written at a cursor, never
@@ -762,6 +773,35 @@ void LogQueryKinds() {
                          : "");
         }
     }
+    // fable_b 19 step 2: transient lent draws by the test that fired, each split by kind.
+    {
+        std::string tests;
+        u64 total = 0;
+        for (size_t test = 0; test < transient_test_names.size(); ++test) {
+            u64 sum = 0;
+            std::string kinds;
+            for (size_t slot = 0; slot < Stats::KindSlots; ++slot) {
+                const u64 count = g.transient[test][slot].load(std::memory_order_relaxed);
+                const u64 delta = count - g.transient_logged[test][slot];
+                g.transient_logged[test][slot] = count;
+                if (delta == 0) {
+                    continue;
+                }
+                sum += delta;
+                kinds += fmt::format("{}{} {:.0f}", kinds.empty() ? "" : ", ",
+                                     Stats::kind_names[slot],
+                                     static_cast<double>(delta) / seconds);
+            }
+            total += sum;
+            tests += fmt::format("{}{} {:.0f}/s{}{}{}", test == 0 ? "" : ", ",
+                                 transient_test_names[test],
+                                 static_cast<double>(sum) / seconds, kinds.empty() ? "" : " (",
+                                 kinds, kinds.empty() ? "" : ")");
+        }
+        LOG_INFO(HW_GPU,
+                 "One follower transient lends (fable_b 19) {:.0f} s: {:.0f}/s; by test: {}",
+                 seconds, static_cast<double>(total) / seconds, tests);
+    }
     LOG_INFO(HW_GPU,
              "One follower queries by kind (FRITCHII_ONEF_QUERY_OPS={}) {:.0f} s: {}; acquire "
              "latches this session by R {}, E {}, other threads {}",
@@ -826,6 +866,15 @@ Stats::RenderTime Play(const PacketHeader& header, const u8* spans) {
         --t_lent_depth;
         if (around) {
             AfterLentCall(view, *engine);
+        }
+        // FRITCHII_ONEF_BIND_SEED: the call bound another channel (SetEngine), E is still
+        // parked: E's tracking and the views start over from the new engine here, not at the
+        // next lent packet (the draw after a bind was lent only to carry that seed).
+        if (view_on) {
+            Maxwell3D* const bound = g.engine.load(std::memory_order_acquire);
+            if (bound != nullptr && bound != engine && BindSeedOn()) {
+                Detail::SeedAfterBind(view, *bound);
+            }
         }
         if (player != nullptr) {
             player->AfterLent(); // the views take the engine's flags; R is on the view again
@@ -2106,6 +2155,55 @@ void CountLentGatherRanges(u64 ranges) noexcept {
 
 void SetLendSite(const char* site) noexcept {
     t_lend_site = site;
+}
+
+void CountTransient(TransientTest test, u32 kind) noexcept {
+    const size_t index = (std::min)(static_cast<size_t>(test),
+                                    static_cast<size_t>(TransientTest::Count) - 1);
+    g.transient[index][Stats::KindSlot(kind)].fetch_add(1, std::memory_order_relaxed);
+}
+
+bool UnlentResetOn() noexcept {
+    return g.on && Step() == StepLevel::Unlend &&
+           VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_unlent_reset,
+                                            "FRITCHII_ONEF_UNLENT_RESET") != 0 &&
+           !g.unlent_reset_stopped.load(std::memory_order_relaxed);
+}
+
+void StopUnlentReset(const char* why) noexcept {
+    if (!g.unlent_reset_stopped.exchange(true, std::memory_order_relaxed)) {
+        LOG_CRITICAL(HW_GPU, "One follower: FRITCHII_ONEF_UNLENT_RESET stops for this session ({})",
+                     why != nullptr ? why : "?");
+    }
+}
+
+bool UnlentValuesOn() noexcept {
+    return g.on && Step() == StepLevel::Unlend &&
+           VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_unlent_values,
+                                            "FRITCHII_ONEF_UNLENT_VALUES") != 0 &&
+           !g.unlent_values_stopped.load(std::memory_order_relaxed);
+}
+
+void StopUnlentValues(const char* why) noexcept {
+    if (!g.unlent_values_stopped.exchange(true, std::memory_order_relaxed)) {
+        LOG_CRITICAL(HW_GPU,
+                     "One follower: FRITCHII_ONEF_UNLENT_VALUES stops for this session ({})",
+                     why != nullptr ? why : "?");
+    }
+}
+
+bool BindSeedOn() noexcept {
+    return g.on && Step() == StepLevel::Unlend &&
+           VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_bind_seed,
+                                            "FRITCHII_ONEF_BIND_SEED") != 0 &&
+           !g.bind_seed_stopped.load(std::memory_order_relaxed);
+}
+
+void StopBindSeed(const char* why) noexcept {
+    if (!g.bind_seed_stopped.exchange(true, std::memory_order_relaxed)) {
+        LOG_CRITICAL(HW_GPU, "One follower: FRITCHII_ONEF_BIND_SEED stops for this session ({})",
+                     why != nullptr ? why : "?");
+    }
 }
 
 void SetQueryKind(QueryKind kind) noexcept {

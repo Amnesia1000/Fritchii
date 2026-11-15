@@ -545,6 +545,15 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_ONEF_CLEAR_NODEFER") {
         return &g_onef_clear_nodefer;
     }
+    if (name == "FRITCHII_ONEF_UNLENT_RESET") {
+        return &g_onef_unlent_reset;
+    }
+    if (name == "FRITCHII_ONEF_UNLENT_VALUES") {
+        return &g_onef_unlent_values;
+    }
+    if (name == "FRITCHII_ONEF_BIND_SEED") {
+        return &g_onef_bind_seed;
+    }
     return nullptr;
 }
 

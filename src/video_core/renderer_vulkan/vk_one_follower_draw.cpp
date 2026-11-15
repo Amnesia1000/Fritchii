@@ -30,6 +30,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 
 #include <fmt/format.h>
 
@@ -94,6 +95,51 @@ template <typename T>
 
 [[nodiscard]] constexpr size_t Padded(size_t bytes) noexcept {
     return (bytes + 7) & ~size_t{7};
+}
+
+/// Where span `bit` starts in a packet's spans (one_follower.h's order), or null without it.
+[[nodiscard]] const u8* SpanAt(const VideoCommon::OneFollower::PacketHeader& header,
+                               const u8* spans, u8 bit) noexcept {
+    namespace OneF = VideoCommon::OneFollower;
+    if (spans == nullptr || (header.spans & bit) == 0) {
+        return nullptr;
+    }
+    size_t at = 0;
+    const auto skip = [&](u8 span, size_t bytes) {
+        if ((header.spans & span) != 0) {
+            at += Padded(bytes);
+        }
+    };
+    const u8 order[] = {OneF::SpanDelta, OneF::SpanFlags,  OneF::SpanDraw, OneF::SpanPrograms,
+                        OneF::SpanPools, OneF::SpanEngine, OneF::SpanBinds};
+    for (const u8 span : order) {
+        if (span == bit) {
+            return spans + at;
+        }
+        switch (span) {
+        case OneF::SpanDelta:
+            skip(span, size_t{header.delta_count} * sizeof(OneF::RegPair));
+            break;
+        case OneF::SpanFlags:
+            skip(span, sizeof(OneF::FlagBits));
+            break;
+        case OneF::SpanDraw:
+            skip(span, sizeof(OneF::DrawValues));
+            break;
+        case OneF::SpanPrograms:
+            skip(span, sizeof(OneF::Programs));
+            break;
+        case OneF::SpanPools:
+            skip(span, sizeof(OneF::Pools));
+            break;
+        case OneF::SpanEngine:
+            skip(span, sizeof(OneF::EngineValues));
+            break;
+        default:
+            break;
+        }
+    }
+    return nullptr;
 }
 
 /// EDEN_NX2_INVALIDATE_BEFORE_DISPATCH's draw form (vk_rasterizer.cpp's InvalidateBeforeUse).
@@ -230,7 +276,20 @@ OneF::LentReason OneFollowerDraw::UnlentBlocker(Maxwell3D& engine, bool is_index
     const bool verify = every > 0 && (++unlent_candidates % static_cast<u64>(every)) == 0;
     // Read every draw, so a hit never waits for a later draw (the next draw after it is lent).
     const bool stream_write = OneF::TakeStreamWriteLend();
+    push_flags = 0;
+    verify_reset = {};
+    const auto& draw = engine.draw_manager.draw_state;
+    const bool native = engine.GetNativeMacroEngine().native_turing;
+    // IsNx2IndirectReset's cheap half (Draw's early out; the rest reads the program's code).
+    const bool reset_candidate = kind != OneF::List && !is_indexed && instance_count == 1 &&
+                                 native && draw.topology == Maxwell::PrimitiveTopology::Points;
     if (verify) {
+        // FRITCHII_ONEF_UNLENT_RESET's must-be-0: E's own test now, the lent draw's on E's engine
+        // inside the call (RunLent, Check::UnlentReset).
+        if (reset_candidate && OneF::UnlentResetOn()) {
+            verify_reset = ResetCheck{true, RasterizerVulkan::IsNx2IndirectResetOn(
+                                                engine, engine.GetMemoryManager(), false, 1)};
+        }
         return LentReason::Verify;
     }
     if (stream_write) {
@@ -240,17 +299,33 @@ OneF::LentReason OneFollowerDraw::UnlentBlocker(Maxwell3D& engine, bool is_index
         Common::DkbFrameTrace::Enabled()) {
         return LentReason::Diagnostic;
     }
-    // Transient: what R's view or R's path cannot carry yet.
-    const auto& draw = engine.draw_manager.draw_state;
-    const bool native = engine.GetNativeMacroEngine().native_turing;
-    if (!view_ready || synced_engine != &engine || synced_engine_state != engine.engine_state ||
-        synced_native != native || seeded_step != OneF::Step()) {
-        return LentReason::Transient; // the lent packet seeds or syncs the view
+    // Transient: what R's view or R's path cannot carry yet. Each test counts itself (fable_b
+    // 19 step 2's dry counter, the "One follower transient lends" line).
+    using OneF::TransientTest;
+    const auto transient = [kind](TransientTest test) {
+        OneF::CountTransient(test, kind);
+        return LentReason::Transient;
+    };
+    // The lent packet seeds or syncs the view.
+    if (!view_ready || seeded_step != OneF::Step()) {
+        return transient(TransientTest::ViewNotSeeded);
+    }
+    if (synced_engine != &engine) {
+        return transient(TransientTest::Channel);
+    }
+    // FRITCHII_ONEF_UNLENT_VALUES: at mode 1 every change since the last lent packet went to the
+    // view by value; at 2 the view may be newer than that packet's values: lent until the next.
+    const u8 values_mode = OneF::EngineValuesMode();
+    if (values_mode == 2 || (values_mode == 0 && synced_engine_state != engine.engine_state)) {
+        return transient(TransientTest::EngineHint);
+    }
+    if (values_mode == 0 && synced_native != native) {
+        return transient(TransientTest::NativeMode);
     }
     // Readers of the constant buffer bindings on R (the view has them only from lent packets).
     if (Debug::SwitchValue(Debug::g_tex_bank_gen, "EDEN_NX2_TEX_BANK_GEN") > 0 ||
         Debug::Experiment(87) != 0 || (MemStage::VerifyBits() & MemStage::VerifyHandles) != 0) {
-        return LentReason::Transient;
+        return transient(TransientTest::BankReaders);
     }
     // Paths that touch the buffer cache or its lock on R, or change who fills.
     if (InvalidateBeforeUseOn() || engine.regs.transform_feedback_enabled != 0 ||
@@ -259,7 +334,7 @@ OneF::LentReason OneFollowerDraw::UnlentBlocker(Maxwell3D& engine, bool is_index
          Debug::Experiment(VideoCommon::FritchiiDeltaPath::Switch) != 0) ||
         VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed) ||
         VideoCommon::MemoryStageLink::RingActive()) {
-        return LentReason::Transient;
+        return transient(TransientTest::BufferPaths);
     }
     if (kind == OneF::List) {
         return LentReason::Count; // Draw's early outs below are not DrawListWords'
@@ -268,11 +343,18 @@ OneF::LentReason OneFollowerDraw::UnlentBlocker(Maxwell3D& engine, bool is_index
     const u64 first = is_indexed ? draw.index_buffer.first : draw.vertex_buffer.first;
     const u64 count = is_indexed ? draw.index_buffer.count : draw.vertex_buffer.count;
     if (first + count > (u64{1} << 24)) {
-        return LentReason::Transient;
+        return transient(TransientTest::VertexLimit);
     }
-    if (!is_indexed && instance_count == 1 && native &&
-        draw.topology == Maxwell::PrimitiveTopology::Points) {
-        return LentReason::Transient; // a candidate for IsNx2IndirectReset
+    if (reset_candidate) {
+        // FRITCHII_ONEF_UNLENT_RESET: E runs the whole test at its own place on its own engine
+        // (the code read flushes as the lent draw's read would, here) and lends only a real
+        // reset; the rest are pushed with PacketNoReset, so R's Draw does not test again. A mesh
+        // pipeline is never one (the test's own early out): most points draws in the market.
+        if (!OneF::UnlentResetOn() || RasterizerVulkan::IsNx2IndirectResetOn(
+                                          engine, engine.GetMemoryManager(), false, 1)) {
+            return transient(TransientTest::IndirectReset);
+        }
+        push_flags |= OneF::PacketNoReset;
     }
     return LentReason::Count;
 }
@@ -292,8 +374,12 @@ bool OneFollowerDraw::FillRing(Maxwell3D& engine, GraphicsPipeline* pipeline, bo
     // it (MemFacts). Else join 1 (spec 4.4): the facts R published for these programs.
     const MemStage::DrawFacts pipeline_facts =
         pipeline != nullptr ? pipeline->MemFacts() : MemStage::DrawFacts{};
+    // Which refusal a Transient return is (the dry counter; RouteDraw and RouteListDraw count it).
+    fill_test = OneF::TransientTest::FillOther;
+    filled_refused = true;
     if (pipeline != nullptr) {
         if (pipeline_facts.has_texel_buffers || pipeline_facts.stage_infos == nullptr) {
+            fill_test = OneF::TransientTest::FillTexel;
             return false; // texel buffers need the texture cache (LateFill)
         }
         facts.hashes = pipeline_facts.hashes;
@@ -311,6 +397,12 @@ bool OneFollowerDraw::FillRing(Maxwell3D& engine, GraphicsPipeline* pipeline, bo
     if ((pipeline == nullptr && (facts.has_texel_buffers || facts.infos == nullptr)) ||
         !r.mem_stage.Packets() || !r.mem_stage.ValuesByValue() || !r.mem_stage.RingRoom() ||
         r.buffer_cache.MarksAhead()) {
+        fill_test = pipeline == nullptr && (facts.has_texel_buffers || facts.infos == nullptr)
+                        ? OneF::TransientTest::FillTexel
+                    : r.mem_stage.Packets() && r.mem_stage.ValuesByValue() &&
+                            !r.mem_stage.RingRoom()
+                        ? OneF::TransientTest::FillRoom
+                        : OneF::TransientTest::FillOther;
         return false; // texel buffers need the texture cache (LateFill); no room or no values
     }
     std::scoped_lock lock{r.buffer_cache.mutex};
@@ -389,6 +481,9 @@ void OneFollowerDraw::LendDraw(bool is_indexed, u32 instance_count, LentReason r
     // The facts compare (Check::FactsStale): with the verify, the facts table entry E's fill
     // would use for these program registers now, before the lent draw publishes its own.
     FactsExpect expect{};
+    if (verify) {
+        expect.reset = std::exchange(verify_reset, ResetCheck{});
+    }
     // With rule 3 (FRITCHII_ONEF_E_PIPELINE) E fills from the pipeline it looked up and the facts
     // table plays no part: nothing to compare.
     if (verify && !VideoCommon::OneFollower::g_e_pipeline) {
@@ -397,7 +492,9 @@ void OneFollowerDraw::LendDraw(bool is_indexed, u32 instance_count, LentReason r
                                                    program_id);
         MemStage::StagedFacts looked{};
         if (rasterizer.mem_stage.LookupFacts(program_id, looked)) {
-            expect = FactsExpect{true, looked.hashes, program_id.space};
+            expect.found = true;
+            expect.hashes = looked.hashes;
+            expect.space = program_id.space;
         }
     }
     auto body = [this, is_indexed, instance_count, verify, expect, list] {
@@ -454,7 +551,7 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
     if (!FillRing(engine, pipeline, is_indexed, position, seq, buffer_number, reason, list)) {
         return false;
     }
-    OneF::PushDraw(engine, seq, buffer_number, 0, pipeline);
+    OneF::PushDraw(engine, seq, buffer_number, push_flags, pipeline);
     counts.pushed.fetch_add(1, std::memory_order_relaxed);
     // PrepareDraw's tail, E's half (read-backs wait on E's work).
     rasterizer.gpu.TickWork();
@@ -491,6 +588,7 @@ bool OneFollowerDraw::RouteDraw(bool is_indexed, u32 instance_count) {
         LendDraw(is_indexed, instance_count, LentReason::KindNotInMask, false);
         return true;
     }
+    filled_refused = false;
     LentReason reason = UnlentBlocker(engine, is_indexed, instance_count, kind);
     // Mesh: native task/mesh pipelines only (the emulation's buffers are not R's alone). Without
     // VK_EXT_mesh_shader every mesh pipeline is emulated or skipped.
@@ -500,6 +598,9 @@ bool OneFollowerDraw::RouteDraw(bool is_indexed, u32 instance_count) {
     }
     if (reason == LentReason::Count && FillAndPush(engine, is_indexed, seq, false, reason)) {
         return true;
+    }
+    if (reason == LentReason::Transient && filled_refused) {
+        OneF::CountTransient(fill_test, kind); // FillRing's refusal (the dry counter)
     }
     LendDraw(is_indexed, instance_count, reason, reason == LentReason::Verify);
     return true;
@@ -524,6 +625,9 @@ bool OneFollowerDraw::RouteListDraw() {
     // As OneFollowerDrawIndirect describes it: a list draw is drawn non-indexed (DrawListWords).
     OneF::SetNextDraw(OneF::List, false, true, 0);
     LentReason reason;
+    filled_refused = false;
+    push_flags = 0;
+    verify_reset = {};
     if (engine.GetNativeMacroEngine().native_turing && engine.regs.IsMeshEnabled() &&
         (mask & OneF::Mesh) == 0) {
         reason = LentReason::KindNotInMask; // a list draw on a mesh pipeline needs both bits
@@ -539,6 +643,9 @@ bool OneFollowerDraw::RouteListDraw() {
             rasterizer.onef_list_keeps_unplayed = true;
         }
         return true;
+    }
+    if (reason == LentReason::Transient && filled_refused) {
+        OneF::CountTransient(fill_test, OneF::List); // FillRing's refusal (the dry counter)
     }
     LendDraw(false, 0, reason, reason == LentReason::Verify, true);
     return true;
@@ -563,6 +670,16 @@ void OneFollowerDraw::RunLent(bool is_indexed, u32 instance_count, bool verify,
         Compare(engine, OneF::Step() == StepLevel::Build && lent_since_resync == 1);
         if (list) {
             CompareList(engine);
+        }
+    }
+    if (verify && expect.reset.decided) {
+        // FRITCHII_ONEF_UNLENT_RESET: E's test before the lend against the test on E's engine at
+        // the same place (E parked; the rasterizer names E's engine inside a lent call).
+        const bool lent_says = rasterizer.IsNx2IndirectReset(is_indexed, instance_count);
+        if (lent_says != expect.reset.is_reset) [[unlikely]] {
+            OneF::Note(Check::UnlentReset, lent_says ? "E said no indirect reset, the lent draw is one"
+                                                     : "E said indirect reset, the lent draw is not");
+            OneF::StopUnlentReset("E's indirect reset test differs from the lent draw's");
         }
     }
     rasterizer.onef_pipeline_seen = false;
@@ -750,6 +867,64 @@ void OneFollowerDraw::ApplyViewSpans(const PacketHeader& header, const u8* spans
     }
     // Programs and Pools: R computes both from the registers itself (RefreshStages, the pools'
     // registers); part b's view keeps them for its compares.
+    ApplyValueSpans(header, spans);
+}
+
+void OneFollowerDraw::ApplyValueSpans(const PacketHeader& header, const u8* spans) {
+    if ((header.spans & (OneF::SpanEngine | OneF::SpanBinds)) == 0 || view == nullptr) {
+        return;
+    }
+    // FRITCHII_ONEF_UNLENT_VALUES: what SyncFromEngine takes at a lent packet, by value.
+    if (const u8* at = SpanAt(header, spans, OneF::SpanEngine)) {
+        OneF::EngineValues values;
+        std::memcpy(&values, at, sizeof(values));
+        view->engine_state = static_cast<Maxwell3D::EngineHint>(values.engine_state);
+        view->GetNativeMacroEngine().native_turing = values.native != 0;
+    }
+    if (const u8* at = SpanAt(header, spans, OneF::SpanBinds)) {
+        OneF::BindsHeader binds;
+        std::memcpy(&binds, at, sizeof(binds));
+        const u8* entry = at + sizeof(binds);
+        for (u32 i = 0; i < binds.count && i < OneF::MaxBindValues; ++i) {
+            OneF::BindValue value;
+            std::memcpy(&value, entry + size_t{i} * sizeof(value), sizeof(value));
+            if (value.stage < Maxwell::MaxShaderStage && value.slot < Maxwell::MaxConstBuffers) {
+                auto& info = view->state.shader_stages[value.stage].const_buffers[value.slot];
+                info.address = value.address;
+                info.size = value.size;
+                info.enabled = value.enabled != 0;
+            }
+        }
+    }
+}
+
+void OneFollowerDraw::CompareValues(Maxwell3D& engine) {
+    // The by-value values against E's engine at a lent packet (E parked, the packet's own value
+    // spans applied): Check::ViewValues.
+    const char* what = nullptr;
+    if (view->engine_state != engine.engine_state) {
+        what = "the engine hint";
+    } else if (view->GetNativeMacroEngine().native_turing !=
+               engine.GetNativeMacroEngine().native_turing) {
+        what = "the native macro mode";
+    } else {
+        for (size_t stage = 0; stage < Maxwell::MaxShaderStage && what == nullptr; ++stage) {
+            for (size_t slot = 0; slot < Maxwell::MaxConstBuffers; ++slot) {
+                const auto& v = view->state.shader_stages[stage].const_buffers[slot];
+                const auto& e = engine.state.shader_stages[stage].const_buffers[slot];
+                if (v.enabled != e.enabled || v.address != e.address || v.size != e.size) {
+                    what = "a constant buffer binding";
+                    break;
+                }
+            }
+        }
+    }
+    if (what != nullptr) [[unlikely]] {
+        thread_local std::string note;
+        note = fmt::format("lent packet: {} the packets carried differs from E's engine", what);
+        OneF::Note(Check::ViewValues, note.c_str());
+        OneF::StopUnlentValues("R's view took a value E's engine does not have");
+    }
 }
 
 void OneFollowerDraw::SyncFromEngine(Maxwell3D& engine, bool full) {
@@ -757,7 +932,33 @@ void OneFollowerDraw::SyncFromEngine(Maxwell3D& engine, bool full) {
         // A new channel: the view follows its memory manager (a reference in Maxwell3D). The
         // R-owned objects stop naming the old view first (rule 2).
         LeaveView();
-        view = std::make_unique<Maxwell3D>(engine.GetMemoryManager());
+        const void* const memory = &engine.GetMemoryManager();
+        const bool keep = OneF::BindSeedOn();
+        Maxwell3D* next = nullptr;
+        if (keep) {
+            // FRITCHII_ONEF_BIND_SEED: channels alternate hundreds of times a second; the view a
+            // channel had is seeded in full below, so only its construction is saved.
+            for (const ViewSlot& slot : views) {
+                if (slot.engine == &engine && slot.memory == memory) {
+                    next = slot.view.get();
+                    break;
+                }
+            }
+        }
+        if (next == nullptr) {
+            if (!keep) {
+                views.clear(); // one view, the old one goes (as before the switch)
+            } else {
+                std::erase_if(views, [&](const ViewSlot& slot) { return slot.engine == &engine; });
+                if (views.size() >= 4) {
+                    views.erase(views.begin()); // R named none of them since LeaveView
+                }
+            }
+            auto fresh = std::make_unique<Maxwell3D>(engine.GetMemoryManager());
+            next = fresh.get();
+            views.push_back(ViewSlot{&engine, memory, std::move(fresh)});
+        }
+        view = next;
         view_source = &engine;
         full = true;
     }
@@ -805,6 +1006,15 @@ void OneFollowerDraw::OnPacket(const PacketHeader& header, const u8* spans) {
         // E is parked: take what deltas do not carry before the spans, which are newer.
         Maxwell3D& engine = rasterizer.channel_state->maxwell3d;
         const bool full = (header.flags & OneF::PacketSeed) != 0 || seeded_step != OneF::Step();
+        // FRITCHII_ONEF_UNLENT_VALUES' must-be-0: before the view takes the engine's values, the
+        // ones the packets carried (this one's too) must equal them. At lent draws and every 16th
+        // other lent packet (the bindings compare is 90 entries, inside E's park).
+        if ((header.flags & OneF::PacketValues) != 0 && !full && view != nullptr &&
+            view_source == &engine &&
+            (header.op == static_cast<u8>(LentOp::Draw) || (header.number & 15) == 0)) {
+            ApplyValueSpans(header, spans);
+            CompareValues(engine);
+        }
         SyncFromEngine(engine, full);
         UpdateDiagnostic();
         // This packet's own operation; a seed took the flags too, so it starts the count again.
@@ -870,6 +1080,10 @@ void OneFollowerDraw::PlayDraw(const PacketHeader& header) {
         // The view follows another channel than the bound one: E lends after a bind until a lent
         // packet syncs the new channel's view, so this must not happen.
         OneF::Note(Check::RenderPacketMissing, "a played draw with the view of another channel");
+        if (OneF::BindSeedOn()) {
+            OneF::Note(Check::BindSeedView, "a played draw with the view of another channel");
+            OneF::StopBindSeed("a played draw found the view on another channel");
+        }
         DropDraw(header);
         return;
     }
@@ -912,13 +1126,13 @@ void OneFollowerDraw::EnterView() {
         return;
     }
     auto& r = rasterizer;
-    saved_rasterizer = r.ExchangeMaxwell3D(view.get());
+    saved_rasterizer = r.ExchangeMaxwell3D(view);
     // Rule 3: the pipeline cache is E's then and always reads E's engine.
     if (!VideoCommon::OneFollower::g_e_pipeline) {
-        saved_pipeline = r.pipeline_cache.ExchangeMaxwell3D(view.get());
+        saved_pipeline = r.pipeline_cache.ExchangeMaxwell3D(view);
     }
-    saved_texture = r.texture_cache.ExchangeMaxwell3D(view.get());
-    saved_query = r.query_cache.ExchangeMaxwell3D(view.get());
+    saved_texture = r.texture_cache.ExchangeMaxwell3D(view);
+    saved_query = r.query_cache.ExchangeMaxwell3D(view);
     saved_tracker = r.state_tracker.ExchangeFlags(&view->dirty.flags);
     on_view = true;
 }
@@ -958,7 +1172,13 @@ void OneFollowerDraw::AfterLent() {
     }
     Maxwell3D& engine = rasterizer.channel_state->maxwell3d;
     if (view_source != &engine) {
-        return; // a channel bind ran: the next lent packet makes the new channel's view
+        // A channel bind ran in this call. Without FRITCHII_ONEF_BIND_SEED the next lent packet
+        // makes the new channel's view (E's tracking waits for that packet's seed). With it
+        // Play re-seeded E's tracking here already (ViewReady): the view follows now, E parked.
+        if (!OneF::ViewReady() || OneF::Step() < StepLevel::Build) {
+            return;
+        }
+        SyncFromEngine(engine, true);
     }
     // Rule 1: after every lent call (not only lent draws) the view takes the engine's flags:
     // what the call consumed is consumed, what it raised (a new command buffer's invalidations)

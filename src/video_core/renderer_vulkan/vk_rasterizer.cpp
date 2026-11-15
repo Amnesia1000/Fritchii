@@ -787,24 +787,30 @@ RasterizerVulkan::~RasterizerVulkan() {
 // Experimental adaptation of a ported change: execute the reset shader's
 // indirect record writes on the host until general GPU-address translation is available.
 bool RasterizerVulkan::IsNx2IndirectReset(bool is_indexed, u32 instance_count) {
+    return IsNx2IndirectResetOn(*maxwell3d, *gpu_memory, is_indexed, instance_count);
+}
+
+bool RasterizerVulkan::IsNx2IndirectResetOn(Tegra::Engines::Maxwell3D& engine,
+                                            Tegra::MemoryManager& memory, bool is_indexed,
+                                            u32 instance_count) {
     static const bool enabled = [] {
         const char* value = std::getenv("EDEN_NX2_RESETFIX");
         return !value || std::string_view{value} != "0";
     }();
-    const auto& regs = maxwell3d->regs;
-    const auto& draw = maxwell3d->draw_manager.draw_state;
+    const auto& regs = engine.regs;
+    const auto& draw = engine.draw_manager.draw_state;
     if (!enabled || is_indexed || instance_count != 1 || regs.IsMeshEnabled() ||
         draw.topology != Maxwell::PrimitiveTopology::Points ||
-        !maxwell3d->GetNativeMacroEngine().native_turing) {
+        !engine.GetNativeMacroEngine().native_turing) {
         return false;
     }
     const GPUVAddr program =
         (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
     std::array<u32, VideoCommon::NativeIndirectReset::Program.size()> code{};
-    if (!gpu_memory->IsFullyMappedRange(program + 128, sizeof(code))) {
+    if (!memory.IsFullyMappedRange(program + 128, sizeof(code))) {
         return false;
     }
-    gpu_memory->ReadBlock(program + 128, code.data(), sizeof(code));
+    memory.ReadBlock(program + 128, code.data(), sizeof(code));
     return VideoCommon::NativeIndirectReset::Matches(code);
 }
 
@@ -3151,7 +3157,14 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
             return;
         }
     }
-    if (!gpu_count && TryNx2IndirectReset(is_indexed, instance_count)) {
+    // FRITCHII_ONEF_UNLENT_RESET: an unlent draw E tested at its place and found no indirect
+    // reset (PacketNoReset) is not tested again here (R reading the program's code).
+    const VideoCommon::OneFollower::PacketHeader* const onef_played =
+        VideoCommon::OneFollower::On() ? onef_draw->Playing() : nullptr;
+    const bool onef_no_reset =
+        onef_played != nullptr &&
+        (onef_played->flags & VideoCommon::OneFollower::PacketNoReset) != 0;
+    if (!gpu_count && !onef_no_reset && TryNx2IndirectReset(is_indexed, instance_count)) {
         return;
     }
     TraceWindowTarget(*maxwell3d, *gpu_memory, is_indexed ? "draw-indexed" : "draw",

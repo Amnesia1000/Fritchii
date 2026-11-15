@@ -1489,6 +1489,10 @@ void Maxwell3D::ProcessCBBind(size_t stage_index) {
     buffer.enabled = bind_data.valid.Value() != 0;
     buffer.address = regs.const_buffer.Address();
     buffer.size = regs.const_buffer.size;
+    // FRITCHII_ONEF_UNLENT_VALUES: the binding goes to R's view by value in the next packet.
+    if (VideoCommon::OneFollower::g_track_binds.load(std::memory_order_relaxed)) [[unlikely]] {
+        VideoCommon::OneFollower::NoteCbBind(stage_index, bind_data.shader_slot);
+    }
     if (VideoCommon::MemoryStageLink::BackServed()) [[unlikely]] {
         return; // FRITCHII_MEMSTAGE_THREAD=2: the memory stage bound it on the buffer cache
     }

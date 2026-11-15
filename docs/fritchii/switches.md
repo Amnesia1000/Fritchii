@@ -1522,6 +1522,39 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   posted, 114.5 without.
 - FRITCHII_ONEF_CLEAR_NODEFER (live, default 0; diagnostic for that fault): 1 = a posted clear
   on R clears at once instead of becoming the next render pass's load op (deferred clear).
+- FRITCHII_ONEF_UNLENT_RESET (live, default 0; fable_b_one_follower 19 step 2; step 4): 1 = a
+  non-indexed single-instance native draw of points is no longer lent as an indirect-reset
+  candidate. E runs IsNx2IndirectReset's whole test itself at its place on its own engine (a
+  mesh pipeline is never one; otherwise it reads the program's code with ReadBlock, whose flush
+  is lent or answered on E as any E read) and lends only a draw that is a reset. The others are
+  pushed with PacketNoReset and R's Draw skips the test (it would read game memory on R). The
+  forced-lent verify draws compare E's answer with the test on E's engine inside the lent call:
+  must-be-0 "unlent reset", which stops the switch for the session. "indirect reset" on the
+  transient lends line is what it removes (the market's mesh draws, about 290 a second, E).
+- FRITCHII_ONEF_UNLENT_VALUES (live, default 0; fable_b_one_follower 19 step 2; step 4): 1 = what
+  R's view took only at lent packets besides the registers (SyncFromEngine: the engine hint
+  engine_state, the native macro mode, the constant buffer bindings state.shader_stages) goes
+  in the packets by value when it changes: SpanEngine (8 bytes) and SpanBinds (each binding
+  ProcessCBBind wrote since the last packet, 16 bytes each), after the pools span. A draw after
+  an HLE macro or a macro mode change is then not lent to sync the view ("engine hint" and
+  "native mode" on the transient lends line). E takes the mode on at a lent packet (R's view
+  takes the engine's values there) and gives it up the same way: after the switch goes off,
+  draws are lent until the next lent packet. Must be 0: "view values", at lent draws and every
+  16th other lent packet R compares the view's by-value values with E's engine before taking
+  the engine's; a difference stops the switch for the session.
+- FRITCHII_ONEF_BIND_SEED (live, default 0; fable_b_one_follower 19 step 2; step 4): 1 = a lent
+  channel bind (BindChannel, about 800 a second in the market) re-seeds at its own end, E still
+  parked: E's tracking starts over from the new channel's engine (PackSpans' seed), the generic
+  view is seeded from it, and R's part (c) view follows the new channel (SyncFromEngine in full,
+  then R names it again). Before, the view kept the old channel until the next lent packet, so
+  the first draw after every bind was lent only to carry that seed ("channel" on the transient
+  lends line) and paid R's whole backlog. R's view engines are kept per channel (at most 4), so
+  a bind back costs a full copy, not a new engine. Must be 0: "bind seed view" (a played draw
+  found the view on another channel), which stops the switch for the session.
+  The bind itself stays lent: the rasterizer's channel fields (channel_state, maxwell3d,
+  gpu_memory, kepler_compute) are read by E (RouteDraw, the posted clear's FlushCaching, the
+  query and flush tests) and by R (played draws, ops) at their own places, and the view scope
+  saves and restores maxwell3d on R; a posted bind needs those split into E's and R's copies.
 - FRITCHII_ONEF_TRACE (boot, default 0; fable_b_one_follower 15.5): 1 = the lend trace. One
   72-byte record per lend and per posted op (packet number, site, op kind, posted, E's arrival,
   R's start and end, E's resume, E's work since its previous record, R's busy time on other
@@ -1537,6 +1570,11 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   call sites that parked E longest (the rasterizer function's name and its op, rate and parked
   ms/s; "direct" = Lend called outside the rasterizer's entry points: lent draws, verify
   compares, the memory seam's syncs): the pricing of fable_b 11.1 items 3 to 7.
+- With FRITCHII_ONEF=1 (or LEAN), every 10 s "One follower transient lends" (fable_b 19 step 2's
+  dry counter): the draws lent with reason "transient", per second, by the test that made them
+  lent (view not seeded, channel, engine hint, native mode, bank readers, buffer paths, vertex
+  limit, indirect reset, and E's fill refusing: texel buffers, no ring room, other), each split
+  by draw kind. FRITCHII_ONEF_UNLENT_RESET, _UNLENT_VALUES and _BIND_SEED are checked against it.
 - FRITCHII_ONEF_WAITS_E (live, default 0; fable_b_one_follower 11.2): 1 = the front's waits at
   the macro dma read/writes, qmd read, semaphore flush, list writers/sync/copy writers/flush and
   macro dma dispatch sites end when E ran the target and R played the newest report render op

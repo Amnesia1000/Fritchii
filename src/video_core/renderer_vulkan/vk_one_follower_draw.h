@@ -136,11 +136,17 @@ private:
     /// `list`: a list draw (R runs DrawIndirect, not Draw).
     void LendDraw(bool is_indexed, u32 instance_count, LentReason reason, bool verify,
                   bool list = false);
+    /// FRITCHII_ONEF_UNLENT_RESET on a forced-lent draw: E's own indirect reset test.
+    struct ResetCheck {
+        bool decided{}; ///< E ran the test (a candidate, the switch on)
+        bool is_reset{};
+    };
     /// What E's fill would use for a lent draw's programs (looked up on E before the lend).
     struct FactsExpect {
         bool found{};
         std::array<u64, 2> hashes{};
         u64 space{}; ///< the address space E looked the programs up in (id + 1)
+        ResetCheck reset{};
     };
 
     // R.
@@ -156,6 +162,11 @@ private:
     void ResyncFlags(const Maxwell3D& engine);
     /// The view takes the spans of one packet.
     void ApplyViewSpans(const PacketHeader& header, const u8* spans);
+    /// FRITCHII_ONEF_UNLENT_VALUES: the view takes a packet's SpanEngine and SpanBinds.
+    void ApplyValueSpans(const PacketHeader& header, const u8* spans);
+    /// At a lent packet with PacketValues (E parked): the view's by-value values against E's
+    /// engine (Check::ViewValues; the switch stops on a difference).
+    void CompareValues(Maxwell3D& engine);
     /// At a lent packet (E parked): the view takes from E's engine what deltas do not carry, or
     /// everything (`full`).
     void SyncFromEngine(Maxwell3D& engine, bool full);
@@ -169,7 +180,15 @@ private:
     RasterizerVulkan& rasterizer;
 
     // R only (E reads the synced_* fields below only after a lent packet released it).
-    std::unique_ptr<Maxwell3D> view;
+    Maxwell3D* view{}; ///< the view engine of the channel R follows (one of `views`)
+    /// The view engines: with FRITCHII_ONEF_BIND_SEED one per channel's engine (and its memory
+    /// manager), kept across binds; without it only the current one, as before.
+    struct ViewSlot {
+        const Maxwell3D* engine{};
+        const void* memory{};
+        std::unique_ptr<Maxwell3D> view;
+    };
+    std::vector<ViewSlot> views;
     const Maxwell3D* view_source{}; ///< the engine the view follows (its channel)
     const PacketHeader* playing{};
     bool nested{};                  ///< inside RunLent's own Draw call
@@ -220,6 +239,14 @@ private:
     // E only.
     u64 e_draw_seq{};
     u64 unlent_candidates{};
+    /// FillRing's last Transient refusal (fable_b 19's dry counter), and whether the fill of the
+    /// draw being routed refused (UnlentBlocker counts its own tests).
+    VideoCommon::OneFollower::TransientTest fill_test{};
+    bool filled_refused{};
+    /// UnlentBlocker's PacketFlag bits for the draw's packet (PacketNoReset), and its reset test
+    /// for a forced-lent draw (LendDraw hands it to RunLent).
+    u8 push_flags{};
+    ResetCheck verify_reset{};
     MemStage::StagedFacts facts{};
     std::vector<u32> handle_values;
 

@@ -23,6 +23,7 @@
 
 #include <array>
 #include <algorithm>
+#include <bit>
 #include <bitset>
 #include <cstring>
 #include <string>
@@ -110,6 +111,13 @@ struct EngineSide {
     /// reads for its descriptors (fable_b 10.1 row 8).
     std::array<std::pair<DAddr, DAddr>, 2> pools{};
     bool stream_hit{}; ///< a guard hit since the last draw (TakeStreamWriteLend)
+    // FRITCHII_ONEF_UNLENT_VALUES (fable_b 19 step 2): EngineValuesMode, the values R's view has
+    // from E (the last lent packet's or the last span's), the bindings bound since the last pack
+    // (bit stage * MaxConstBuffers + slot).
+    u8 values{};
+    u32 sent_engine_state{};
+    u8 sent_native{};
+    std::array<u64, 2> binds{};
 };
 
 EngineSide g_e;
@@ -175,6 +183,16 @@ bool SameDraw(const DrawValues& view, const Maxwell3D& engine) {
     return std::memcmp(&now, &view, sizeof(DrawValues)) == 0;
 }
 
+/// E at a lent packet (or R inside a lent bind, E parked): R's view takes the engine's values
+/// there (SyncFromEngine), so the by-value tracking starts over, on or off as the switch says.
+void ResetValues(const Maxwell3D& engine) {
+    g_e.values = UnlentValuesOn() ? 1 : 0;
+    g_e.sent_engine_state = static_cast<u32>(engine.engine_state);
+    g_e.sent_native = const_cast<Maxwell3D&>(engine).GetNativeMacroEngine().native_turing ? 1 : 0;
+    g_e.binds = {};
+    g_track_binds.store(g_e.values != 0, std::memory_order_relaxed);
+}
+
 /// R's note text for a must-be-0 (Note keeps the pointer only for its log call).
 thread_local std::string t_note;
 
@@ -206,6 +224,19 @@ void NoteRegWrite(u32 index) noexcept {
     g_e.touched.push_back(static_cast<u16>(index));
 }
 
+void NoteCbBind(size_t stage, u32 slot) noexcept {
+    if (!Detail::t_engine || g_e.values == 0 || stage >= Maxwell3D::Regs::MaxShaderStage ||
+        slot >= Maxwell3D::Regs::MaxConstBuffers) {
+        return;
+    }
+    const size_t bit = stage * Maxwell3D::Regs::MaxConstBuffers + slot;
+    g_e.binds[bit / 64] |= u64{1} << (bit % 64);
+}
+
+u8 EngineValuesMode() noexcept {
+    return g_e.values;
+}
+
 void NoteFlagRaised(u8 flag) noexcept {
     // Not needed with the `after` diff (see the top of this file); kept for raise sites that
     // clear on E between packets, should step 2's compare find one: forwarding it again is safe.
@@ -217,6 +248,21 @@ void NoteFlagRaised(u8 flag) noexcept {
 namespace Detail {
 void ViewTrackingStopped() noexcept {
     g_e.restart.store(true, std::memory_order_release);
+}
+
+void SeedAfterBind(RegisterView& view, const Maxwell3D& engine) {
+    // PackSpans' seed branch (E's side; R stands in for E, which is parked in this lent call),
+    // then Play's SeedView of the generic view.
+    g_e.restart.store(false, std::memory_order_relaxed);
+    g_e.started = true;
+    for (const u16 index : g_e.touched) {
+        g_e.noted.reset(index);
+    }
+    g_e.touched.clear();
+    g_e.after = engine.dirty.flags & Parts().forward;
+    NotePools(engine);
+    ResetValues(engine);
+    SeedView(view, engine);
 }
 } // namespace Detail
 
@@ -259,6 +305,7 @@ std::size_t PackSpans(const Maxwell3D& engine, PacketHeader& header, std::span<u
         g_e.touched.clear();
         g_e.after = engine.dirty.flags & parts.forward;
         NotePools(engine);
+        ResetValues(engine);
         header.flags |= PacketSeed;
         draw_span();
         return used;
@@ -317,6 +364,59 @@ std::size_t PackSpans(const Maxwell3D& engine, PacketHeader& header, std::span<u
         const Pools pools = PoolsOf(engine.regs);
         header.spans |= SpanPools;
         put(&pools, sizeof(pools));
+    }
+    // FRITCHII_ONEF_UNLENT_VALUES: what SyncFromEngine copies at a lent packet besides the
+    // registers, by value when it changed. Sent while the mode is 1 or 2 (2: the switch went off,
+    // the view stays exact until the next lent packet, which takes the engine's values anyway).
+    const bool lent_pack = header.kind == PacketKind::Lent;
+    if (g_e.values != 0) {
+        if (g_e.values == 1 && !UnlentValuesOn()) {
+            g_e.values = 2; // draws are lent until the next lent packet (UnlentBlocker)
+        }
+        Maxwell3D& e = const_cast<Maxwell3D&>(engine);
+        const u32 engine_state = static_cast<u32>(e.engine_state);
+        const u8 native = e.GetNativeMacroEngine().native_turing ? 1 : 0;
+        if (engine_state != g_e.sent_engine_state || native != g_e.sent_native) {
+            g_e.sent_engine_state = engine_state;
+            g_e.sent_native = native;
+            const EngineValues values{engine_state, native, {}};
+            header.spans |= SpanEngine;
+            put(&values, sizeof(values));
+        }
+        if ((g_e.binds[0] | g_e.binds[1]) != 0) {
+            const std::size_t at = used;
+            used += sizeof(BindsHeader);
+            BindsHeader binds{};
+            constexpr u32 Slots = Maxwell3D::Regs::MaxConstBuffers;
+            for (u32 word = 0; word < 2; ++word) {
+                u64 bits = g_e.binds[word];
+                while (bits != 0) {
+                    const u32 bit = word * 64 + static_cast<u32>(std::countr_zero(bits));
+                    bits &= bits - 1;
+                    const auto& info = e.state.shader_stages[bit / Slots].const_buffers[bit % Slots];
+                    const BindValue value{
+                        .stage = static_cast<u8>(bit / Slots),
+                        .slot = static_cast<u8>(bit % Slots),
+                        .enabled = static_cast<u8>(info.enabled ? 1 : 0),
+                        .reserved = 0,
+                        .size = info.size,
+                        .address = info.address,
+                    };
+                    std::memcpy(out.data() + used, &value, sizeof(value));
+                    used += sizeof(value);
+                    ++binds.count;
+                }
+            }
+            std::memcpy(out.data() + at, &binds, sizeof(binds));
+            g_e.binds = {};
+            header.spans |= SpanBinds;
+        }
+        if (lent_pack && g_e.values == 1) {
+            header.flags |= PacketValues; // R may compare before it takes the engine's values
+        }
+    }
+    if (lent_pack) {
+        ResetValues(engine); // R's view takes the engine's values at this packet
     }
     return used;
 }
