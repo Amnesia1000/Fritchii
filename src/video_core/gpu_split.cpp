@@ -2416,8 +2416,9 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
                 // FRITCHII_ONEF_CB_LEAN & 1 (fable_b 23.1 cut 3, on E): a single word too goes
                 // through the block write (CallConstBufferWords takes every check CallMethod's
                 // path would, and falls back to it where it cannot write the run in one).
-                if (count == 1 && (!OneFollower::OnEngineThread() ||
-                                   (OneFollower::CbLean() & 1) == 0)) {
+                // FRITCHII_ESPLIT's queued mode: the block write too (its memory half queues).
+                if (count == 1 && !ESplit::QueueMemoryWork() &&
+                    (!OneFollower::OnEngineThread() || (OneFollower::CbLean() & 1) == 0)) {
                     maxwell3d->CallMethod(*system, method, argument, true);
                 } else {
                     maxwell3d->CallConstBufferWords(*system, methods.data(), arguments.data(),
@@ -3180,6 +3181,20 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         // parts over (a draw's flush and tail, a bind's buffer cache half).
         const auto esplit_execute = [this](const ESplit::EntryInfo& info, const u64* entry,
                                            size_t words) -> size_t {
+            if (info.cls == ESplit::Class::E2 && ESplit::g_async) {
+                // The queued mode: no hand-over per entry. A constant buffer entry runs here, its
+                // register half on E1 and its memory half queued to E2 by value
+                // (Maxwell3D::CallConstBufferWords; the paths that write on E1 join there).
+                // Every other E2 entry is a join: E2 drained, E1 runs it itself.
+                const ESplit::JoinScope join{ESplit::Join::Entry, !info.cb_entry};
+                const size_t size = Execute(entry, words);
+                if (info.cb_entry) {
+                    // The write offset moved on E1's engine: E2's view takes it with the record.
+                    using Tegra::Engines::Maxwell3D;
+                    ESplit::NoteWord(MAXWELL3D_REG_INDEX(const_buffer.offset));
+                }
+                return size;
+            }
             if (info.cls == ESplit::Class::E2) {
                 if (info.sink_first && back_engine != nullptr) {
                     back_engine->ConsumeSink(*system);

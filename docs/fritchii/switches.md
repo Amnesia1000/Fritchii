@@ -2178,15 +2178,28 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   logged with the site), E2Order (E2 ran a hand-over out of order); seeds and untracked
   hand-overs. Gate 2 shape for S1: E2 busy <= today's E occupied - 0.7 x the dry net. Off:
   nothing starts; a hand-over site pays one load and a branch.
-- FRITCHII_ESPLIT_DEPTH (live, default 0; with FRITCHII_ESPLIT=1, step S2): N > 0 (1, 4, 16;
-  capped at 48) = async draw tails and binds. E1 posts a draw's tail and goes on, up to N tails
-  ahead of E2; a bind's buffer cache half goes by value. Everything else still waits for E2 to
-  drain (E2 entries and flushes in lockstep, joins, E1's own lends and pushes to R). An async
-  tail needs rule 3's pipeline, no texel buffers, ring B by value, no memory stage marks ahead,
-  no inline index bytes, no price timers, no FRITCHII_HANDLE_PROG_KEEP on a pipeline with handle
-  programs and no seed due; the others go lockstep. Rules: the buffer flags are E2's (E1 takes
-  the ones raised on its engine at each async draw record and clears them, E2 ORs them into its
-  view; wherever E2's work runs on the engine the view's flags are copied there and back); an
+- FRITCHII_ESPLIT_DEPTH (live, default 16 = the queued mode; with FRITCHII_ESPLIT=1, step S2;
+  0 = S1's lockstep, kept for the checks; capped at 48): E1 never waits per piece of work. It
+  appends records to E2's queue and goes on, up to N draw tails ahead: each constant buffer
+  write's memory half by value (Maxwell3D::CallConstBufferWords: the register half, the dirty
+  flags and the write offset stay on E1; the queued half carries the selection, the offset, the
+  words and the texture/sampler pool ranges), each bind's buffer cache half by value, each draw
+  tail with its record and R's packed packet, the `consumed` stores. E2 drains the queue on its
+  own and sleeps only when it is empty (E1 wakes it only then). E1 waits only at a real join:
+  another E2 entry (reports, sync points, wait for idle, barriers, compute, cache calls, multi
+  writes, a word with a segment: E1 runs it itself once E2 drained), a constant buffer write onto
+  guarded pages (R's texture or pool pages, shader pages: OneFollower::StreamWriteGuarded, E1
+  runs it), the draw's flush when E2 is idle (E1 runs it), a draw tail that cannot go async (E1
+  runs it), a seed of E2's view (first draw, channel switch; E1 seeds it), a lend or push to R, a
+  memory decision, a condition from memory, E's idle work. An async tail needs rule 3's
+  pipeline, no texel buffers, ring B by value, no memory stage marks ahead, no inline index bytes
+  (the GPU profile's price timers are skipped in an async fill, the handle program keep reads the
+  view's bindings). E1's lookup reads shader code from game memory: allowed (counted) unless a
+  write onto shader pages is pending, then E2 drains and the flush runs first (a lookup join).
+  Rules: the buffer flags are E2's (between transfers E1's engine holds only the flags its work
+  raised since the last one; an async draw record takes them and clears them, E2 ORs them into
+  its view; wherever E2's work runs on the engine the view's flags are ORed into the view's own
+  engine first and taken back after, the engine's then cleared); an
   async fill reads only E2's view; R's draw packet is packed by E1 at the record and pushed by E2
   after the fill (R's queue keeps one producer); a lend E2 makes holds E1 at its next safe point
   (each ring entry; every wait for E2 counts) and packs none of E1's registers; the repack

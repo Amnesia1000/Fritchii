@@ -3368,6 +3368,9 @@ public:
     /// done nothing, where the general path has to: the switch is off, the buffer isn't one
     /// mapped device range, or the write lands on Switch 2 sparse memory.
     bool WriteBoundConstantBuffer(u32 offset, const void* data, u32 bytes);
+    /// As WriteBoundConstantBuffer, through the given selection (CB_ADDRESS, CB_SIZE).
+    bool WriteBoundConstantBufferAt(GPUVAddr address, u32 size, u32 offset, const void* data,
+                                    u32 bytes);
 
     void ProcessInlineIndexMultiData(u32 method, const u32* start_base, u32 amount);
 
@@ -3405,13 +3408,6 @@ public:
     /// Unchanged where the GPU caches or a guest read download may hold other words there, the
     /// texture header or sampler pools are written (directly or through an alias), or run-ahead
     /// was used this session. Switch off: Changed, without reading memory.
-    ConstantWrite CompareConstantData(GPUVAddr begin, const void* data, u64 bytes);
-    /// Counting on: translates the texture header and sampler pools to device memory again if
-    /// they or the mappings changed, and publishes them for the writes applied to the caches
-    /// (Nx2FastDrawCount::NotePoolWrite). On the thread that runs this engine.
-    void UpdateFastDrawCountPools();
-
-private:
     /// The texture header (TIC) and sampler (TSC) pools as NoteFastDrawCountData sizes them.
     struct FastDrawCountPools {
         GPUVAddr tic;
@@ -3419,6 +3415,23 @@ private:
         GPUVAddr tsc;
         u64 tsc_size;
     };
+    /// `pools`: the texture and sampler pools at the write's place (FRITCHII_ESPLIT's queued
+    /// write runs after E1 moved on); null: the registers now.
+    ConstantWrite CompareConstantData(GPUVAddr begin, const void* data, u64 bytes,
+                                      const FastDrawCountPools* pools = nullptr);
+    /// CallConstBufferWords' memory half: `count` words at `address + offset` of the selection
+    /// (`address`, `size`), without the write offset's advance (the caller's).
+    void ConstBufferWriteHalf(GPUVAddr address, u32 size, u32 offset, const u32* values, u32 count,
+                              const FastDrawCountPools* pools);
+    /// FRITCHII_ESPLIT's queued mode, E1: the memory half goes to E2 by value. False: E1 runs it
+    /// (the pages are guarded: R's texture or pool pages, shader pages; or unmapped).
+    bool ForwardConstBufferWrite(GPUVAddr address, u32 offset, const u32* values, u32 count);
+    /// Counting on: translates the texture header and sampler pools to device memory again if
+    /// they or the mappings changed, and publishes them for the writes applied to the caches
+    /// (Nx2FastDrawCount::NotePoolWrite). On the thread that runs this engine.
+    void UpdateFastDrawCountPools();
+
+private:
     FastDrawCountPools FastDrawCountPoolRanges() const;
     VideoCommon::Nx2FastDrawCount::DeviceSpans fast_draw_count_tic_spans;
     VideoCommon::Nx2FastDrawCount::DeviceSpans fast_draw_count_tsc_spans;

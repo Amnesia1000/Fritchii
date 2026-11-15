@@ -1027,6 +1027,9 @@ void SetUnionPages(const PageFilter* filter) noexcept;
 /// texture page they are counted (StreamWritesOnTexturePages, informational at every step), and
 /// with R behind (step 4) Check::StreamWrite is counted and E drains R before the write lands.
 void GuardStreamWrite(DAddr address, u64 size) noexcept;
+/// FRITCHII_ESPLIT's queued mode, E1: whether GuardStreamWrite would act on this write (texture,
+/// shader or pool pages); `shader`: shader pages among them. Such writes stay with E1 (a join).
+[[nodiscard]] bool StreamWriteGuarded(DAddr address, u64 size, bool& shader) noexcept;
 /// Writes that landed on texture pages, any step (section 7's run 4 number; not a must-be-0).
 [[nodiscard]] u64 StreamWritesOnTexturePages() noexcept;
 

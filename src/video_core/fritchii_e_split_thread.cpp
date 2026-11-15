@@ -76,6 +76,7 @@
 #include "video_core/fritchii_e_split.h"
 #include "video_core/fritchii_e_split_thread.h"
 #include "video_core/gpu_split.h"
+#include "video_core/memory_manager.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/one_follower.h"
@@ -107,10 +108,11 @@ constexpr u64 SampleMask = 63;     ///< 1 hand-over in 64 compared (or hashed)
 constexpr size_t HandCount = static_cast<size_t>(Hand::Count);
 constexpr size_t JoinCount = static_cast<size_t>(Join::Count);
 constexpr size_t TouchCount = static_cast<size_t>(Touch::Count);
-constexpr std::array<const char*, HandCount> HandNames{"entries", "flushes", "draw tails", "binds",
-                                                       "stores"};
-constexpr std::array<const char*, JoinCount> JoinNames{"entries", "decisions", "conditions",
-                                                       "idle",    "pushes",    "lockstep"};
+constexpr std::array<const char*, HandCount> HandNames{
+    "entries", "flushes", "draw tails", "binds", "stores", "cb writes"};
+constexpr std::array<const char*, JoinCount> JoinNames{
+    "entries", "decisions", "conditions", "idle",  "pushes",
+    "lockstep", "lookups",  "flushes",    "tails", "seeds", "guarded writes"};
 constexpr std::array<const char*, TouchCount> TouchNames{"cache lock", "memory read",
                                                          "memory write"};
 
@@ -145,6 +147,9 @@ struct E1Counts {
     u64 visible{};
     u64 front_ahead{};
     u64 depth_sum{}; ///< draw tails outstanding at each async post
+    u64 lookups{};      ///< E1's lookups (thread mode)
+    u64 lookup_reads{}; ///< their game memory reads (shader code), allowed
+    u64 tail_reasons[4]{}; ///< draw tails that stayed with E1: no fit, record lost, a join, S1
 };
 struct E2Counts {
     std::atomic<u64> job_ticks{};
@@ -326,6 +331,10 @@ std::string Stack() {
 /// BackReadAudit's watcher: E's game memory reads.
 void ReadTouch(const void* caller) {
     if (t_role == 1 && t_join == 0 && g_thread) [[unlikely]] {
+        if (t_lookup) {
+            ++g_e1.lookup_reads; // shader code, no shader page write pending (LookupScope)
+            return;
+        }
         NoteTouchImpl(Touch::MemoryRead, caller);
     }
 }
@@ -348,9 +357,13 @@ void RunJob(Job& job) {
     g_e2_last_seq = job.seq;
     g_e2_last_position = job.position;
     t_e2_position = job.position;
-    OneF::PutEngineTls(job.tls);
-    if (g_fill_state.install != nullptr) {
-        g_fill_state.install(job.fill_state.data(), false);
+    // A queued write or bind runs on what it carries: no per-call state to move.
+    const bool moves_state = !job.async || job.info.hand == Hand::DrawTail;
+    if (moves_state) {
+        OneF::PutEngineTls(job.tls);
+        if (g_fill_state.install != nullptr) {
+            g_fill_state.install(job.fill_state.data(), false);
+        }
     }
     job.view_ok = false;
     if (job.record_kind != RecordKind::None) {
@@ -394,9 +407,11 @@ void RunJob(Job& job) {
     }
     // Lockstep: the state goes back to E1 with the job. Async: E1 moved on; E2's copy is dropped
     // (the next job installs its own).
-    OneF::TakeEngineTls(job.tls);
-    if (g_fill_state.capture != nullptr) {
-        g_fill_state.capture(job.fill_state.data(), false);
+    if (moves_state) {
+        OneF::TakeEngineTls(job.tls);
+        if (g_fill_state.capture != nullptr) {
+            g_fill_state.capture(job.fill_state.data(), false);
+        }
     }
     if (job.async && job.info.hand == Hand::DrawTail) {
         g.draws_done.store(g.draws_done.load(std::memory_order_relaxed) + 1,
@@ -445,14 +460,20 @@ void E2Main(std::stop_token) {
         if ((next & 1023) == 0) {
             g.e2_cpu_ns.store(Common::CurrentThreadCpuTimeNs().value_or(0),
                               std::memory_order_relaxed);
+            Profile::Report("GPU E2 thread");
         }
         ++next;
-        Profile::Report("GPU E2 thread");
     }
 }
 
+/// E2's nesting of holds (a guard inside a lend's way, say): only the outermost holds.
+thread_local u32 t_hold_depth{};
+
 /// E2, S2: E1 held at a safe point for an E2 lend.
 void HoldE1() noexcept {
+    if (t_hold_depth++ != 0) {
+        return;
+    }
     g_hold.store(1, std::memory_order_seq_cst);
     const u64 start = Profile::Ticks();
     u32 spins = 0;
@@ -468,6 +489,9 @@ void HoldE1() noexcept {
 }
 
 void ReleaseE1() noexcept {
+    if (--t_hold_depth != 0) {
+        return;
+    }
     g_hold.store(0, std::memory_order_seq_cst);
     g.e1_wake.fetch_add(1, std::memory_order_seq_cst);
     g.e1_wake.notify_all();
@@ -511,14 +535,12 @@ void WaitDrained() {
 void ToEngine() {
     if (Maxwell3D* const engine = OneF::Engine()) {
         ApplyBackRaises(*engine);
-        SyncFlagsToEngine(*engine);
     }
+    SyncFlagsToEngine();
 }
 
 void ToView() {
-    if (const Maxwell3D* const engine = OneF::Engine()) {
-        SyncFlagsToView(*engine);
-    }
+    SyncFlagsToView();
 }
 
 Job& TakeSlot(bool draw_tail) {
@@ -549,11 +571,13 @@ void SetDepth(int depth) {
         WaitDrained();
         if (!async) {
             ToEngine(); // the lockstep fills read the engine's flags again
+        } else {
+            ToView(); // from now the engine holds only E1's raises between transfers
         }
         g_async = async;
         LOG_INFO(HW_GPU, "E split thread: FRITCHII_ESPLIT_DEPTH={} ({})", depth,
-                 async ? "async: E1 posts draw tails and binds and runs ahead"
-                       : "lockstep: E1 waits for each hand-over");
+                 async ? "queued: E1 appends E2's work and waits only at joins"
+                       : "lockstep: E1 waits for each hand-over (the check mode)");
     }
     g_depth = depth;
 }
@@ -674,6 +698,12 @@ void Report(u64 now) {
              c.touches[0], TouchNames[1], c.touches[1], TouchNames[2], c.touches[2], order,
              c.visible, c.front_ahead, hash_differs, hash_checks, refused, c.seeds, c.lost);
     LOG_INFO(HW_GPU,
+             "E split thread 10 s: lookups {:.0f}/s, their shader code reads {:.0f}/s (allowed: no "
+             "shader page write pending; lookup joins in the join counts); draw tails E1 ran "
+             "itself: no async fit {:.0f}/s, view not seedable {:.0f}/s, S1 {:.0f}/s",
+             rate(c.lookups), rate(c.lookup_reads), rate(c.tail_reasons[0]),
+             rate(c.tail_reasons[1]), rate(c.tail_reasons[3]));
+    LOG_INFO(HW_GPU,
              "E split thread 10 s: async draw tails {:.0f}/s (mean {:.1f} ahead of E2 when "
              "posted), E2 lends holding E1 {:.0f}/s (E2 waited {:.2f} ms/s for E1 to park, E1 "
              "held {:.1f} ms/s), ring B room waits {:.0f}/s, flushes after E1's lookup with work "
@@ -766,8 +796,9 @@ void ThreadBatch() noexcept {
     if (!g_thread) {
         return;
     }
+    // Default 16: the queued mode; 0 = S1's lockstep (the check mode).
     int depth = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_esplit_depth,
-                                                 "FRITCHII_ESPLIT_DEPTH");
+                                                 "FRITCHII_ESPLIT_DEPTH", 16);
     depth = std::clamp(depth, 0, MaxDepth);
     if (depth != g_depth) [[unlikely]] {
         SetDepth(depth);
@@ -831,8 +862,25 @@ bool E2Idle() noexcept {
 }
 
 bool BeginAsyncDraw(Maxwell3D& engine, bool list_args, AsyncSlot& slot) noexcept {
-    if (!g_async || t_role != 1 || t_join != 0 || !ThreadRecordReady(engine)) {
+    if (!g_async || t_role != 1 || t_join != 0) {
         return false;
+    }
+    if (!ThreadRecordReady(engine)) {
+        // The first draw, a channel switch, or untracked writes: E1 seeds E2's view itself, E2
+        // drained (the view's old engine gets its whole flag state back first, the new one's
+        // goes to the view after: BeginJoin and EndJoin).
+        BeginJoin(Join::Seed);
+        u32 bytes = 0;
+        const RecordKind kind = ThreadBuild(engine, false, false,
+                                            g.buffers[g_next_seq % Slots].record.get(), bytes);
+        (void)ThreadConsume(kind, nullptr, engine, false, false, false);
+        g_e1.seeds += kind == RecordKind::Seed ? 1 : 0;
+        g_e1.lost += kind == RecordKind::Lost ? 1 : 0;
+        EndJoin();
+        if (!ThreadRecordReady(engine)) {
+            ++g_e1.tail_reasons[1];
+            return false;
+        }
     }
     const u64 ahead = g_draws_posted - g.draws_done.load(std::memory_order_acquire);
     Job& job = TakeSlot(true);
@@ -880,6 +928,45 @@ void PostAsync(void (*function)(void*)) noexcept {
         g_fill_state.capture(job.fill_state.data(), true);
     }
     Publish(job.seq);
+}
+
+void NoteGuardedWrite(bool shader) noexcept {
+    if (shader) {
+        g_shader_pending.store(true, std::memory_order_relaxed);
+    }
+}
+
+void NoteTailStayed(int reason) noexcept {
+    ++g_e1.tail_reasons[reason & 3];
+}
+
+void BeginLookupImpl() noexcept {
+    ++g_e1.lookups;
+    if (g_shader_pending.exchange(false, std::memory_order_acq_rel)) [[unlikely]] {
+        // A write onto shader pages (queued or run in a join) may not be flushed yet: E2 drained,
+        // the invalidation run here, then the lookup.
+        BeginJoin(Join::Lookup);
+        if (Maxwell3D* const engine = OneF::Engine()) {
+            auto& memory_manager = engine->GetMemoryManager();
+            if (memory_manager.HasPendingCachedWrites()) {
+                memory_manager.FlushCaching();
+            }
+        }
+        EndJoin();
+    }
+    t_lookup = true;
+}
+
+bool E2ExclusiveBegin() noexcept {
+    if (t_role != 2 || !g_async || t_skip_guard) {
+        return false;
+    }
+    HoldE1();
+    return true;
+}
+
+void E2ExclusiveEnd() noexcept {
+    ReleaseE1();
 }
 
 bool FillAsync() noexcept {

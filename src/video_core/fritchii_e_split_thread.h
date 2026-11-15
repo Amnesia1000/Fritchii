@@ -48,10 +48,15 @@ class RasterizerInterface;
 /// Measured: E2's busy time (zone "e split job"), E2's wait ("e split E2 wait"), E1's time in
 /// hand-overs ("e split hand-over") and the hand-over cost (E1's wait less E2's run).
 ///
-/// S2, FRITCHII_ESPLIT_DEPTH=N (1, 4, 16; live): async draw tails and binds. E1 posts them and
-/// goes on, up to N draw tails ahead of E2; everything else still waits (the S2 section of the
-/// .cpp has the rules: who owns the buffer flags, the R packet's packing on E1, the lends, the
-/// positions). Extra checks: E1Visible (a fence or query op made by E1 outside a join),
+/// S2, FRITCHII_ESPLIT_DEPTH=N (live; default 16 = the queued mode): E1 never waits per piece of
+/// work. It appends records to E2's queue (constant buffer writes by value, binds by value, draw
+/// tails with their record, `consumed` stores) and goes on, up to N draw tails ahead; E2 drains
+/// the queue on its own and sleeps only when it is empty. E1 waits only at a real join: an E2
+/// entry that is not a constant buffer write (reports, sync points, wait for idle, barriers,
+/// compute, cache calls, inline uploads; E1 runs it itself once E2 drained), a lend or push to R,
+/// a decision that reads game memory, a write onto pages R or the lookup read, a seed. DEPTH=0 is
+/// S1's lockstep, kept for the checks. The S2 section of the .cpp has the rules (who owns the
+/// buffer flags, the R packet's packing on E1, the lends, the positions). Extra checks: E1Visible (a fence or query op made by E1 outside a join),
 /// FrontAheadOfE2 (a `consumed` store on E1 with E2 behind), ESplitHash (a hash of what the fill
 /// reads, from the engine on E1 and from the view on E2, 1 draw in 64), E2Refused (an async
 /// fill refused after E1 moved on: the draw is dropped).
@@ -75,6 +80,7 @@ enum class Hand : u8 {
     DrawTail, ///< a draw's FillRing, R packet push and TickWork
     Bind,     ///< a constant buffer bind's buffer cache half, by value
     Store,    ///< S2: GpuSplit::StoreConsumed at E2's place
+    CbWrite,  ///< S2: a constant buffer write's memory half, by value (Maxwell3D)
     Count,
 };
 
@@ -85,7 +91,12 @@ enum class Join : u8 {
     Condition, ///< a render condition from game memory
     Idle,      ///< the idle hook and the fence check (E's idle work)
     Push,      ///< S2: E1 lends or pushes to R (R's packet queue has one producer)
-    Lockstep,  ///< S2: a hand-over that waits (seed, an entry, a draw that cannot go async)
+    Lockstep,  ///< S2: a hand-over that waits (none in the queued mode)
+    Lookup,    ///< S2: E1's lookup after a write onto shader pages (E2 drained, flushed first)
+    Flush,     ///< S2: the draw's flush, E2 idle (E1 runs it)
+    Tail,      ///< S2: a draw tail that cannot go async (E1 runs it)
+    Seed,      ///< S2: E2's view seeded (first draw, channel switch; E1 seeds it)
+    Guarded,   ///< S2: a constant buffer write onto texture, shader or pool pages (E1 runs it)
     Count,
 };
 
@@ -118,6 +129,48 @@ void ThreadBatch() noexcept;
 [[nodiscard]] inline bool ShouldHand() noexcept {
     return g_thread && t_role == 1 && t_join == 0;
 }
+/// The queued mode: E1 appends E2's work here instead of waiting for it.
+[[nodiscard]] inline bool QueueMemoryWork() noexcept {
+    return g_async && t_role == 1 && t_join == 0;
+}
+/// E2 runs a queued write E1 already checked against the stream write guard (its pages are
+/// neither R's texture or pool pages nor shader pages): GuardStreamWrite returns at once.
+inline thread_local bool t_skip_guard{};
+/// E1 inside its pipeline lookup (LookupScope): the lookup's shader code reads are allowed.
+inline thread_local bool t_lookup{};
+/// A write onto shader pages since E1's last lookup flush (any thread sets it): the next lookup
+/// drains E2 and flushes first (a join), so the lookup reads the new code.
+inline std::atomic<bool> g_shader_pending{};
+/// A constant buffer write E1 will run itself (guarded pages; `shader`: shader pages among them).
+void NoteGuardedWrite(bool shader) noexcept;
+
+void BeginLookupImpl() noexcept;
+/// Around E1's pipeline lookup (FillAndPush, rule 3): drains and flushes first when a shader page
+/// write is pending (a "lookup join"); the lookup's reads of shader code count as allowed.
+class LookupScope {
+public:
+    LookupScope() noexcept {
+        if (g_thread && t_role == 1 && t_join == 0) [[unlikely]] {
+            BeginLookupImpl();
+            active = true;
+        }
+    }
+    ~LookupScope() {
+        if (active) [[unlikely]] {
+            t_lookup = false;
+        }
+    }
+    LookupScope(const LookupScope&) = delete;
+    LookupScope& operator=(const LookupScope&) = delete;
+
+private:
+    bool active{};
+};
+
+/// OneFollower::GuardStreamWrite on E2 while E1 runs ahead (a write E1 did not check): E1 held
+/// for the guard (it reads E1's pool ranges and may drain R). True: release with E2ExclusiveEnd.
+[[nodiscard]] bool E2ExclusiveBegin() noexcept;
+void E2ExclusiveEnd() noexcept;
 
 struct HandInfo {
     Hand hand{Hand::Entry};
@@ -199,7 +252,7 @@ struct AsyncSlot {
     void* payload;
     u8* packet;
 };
-inline constexpr std::size_t AsyncPayloadBytes = 192;
+inline constexpr std::size_t AsyncPayloadBytes = 320;
 /// E1: an async draw tail can go now (record ready); waits for depth room, builds the record
 /// (taking the engine's buffer flags) and samples the hash. False: hand it over in lockstep.
 [[nodiscard]] bool BeginAsyncDraw(Tegra::Engines::Maxwell3D& engine, bool list_args,
@@ -208,6 +261,8 @@ inline constexpr std::size_t AsyncPayloadBytes = 192;
 void PostAsync(void (*function)(void*)) noexcept;
 /// E1: a slot for an async job without a record (a bind by value, a position store).
 [[nodiscard]] void* BeginAsync(Hand hand) noexcept;
+/// E1: a draw tail stayed with E1 (0: no async fit, 3: S1 lockstep), counted.
+void NoteTailStayed(int reason) noexcept;
 /// E2: the running job is async (its fill reads only the view and keeps the flags there).
 [[nodiscard]] bool FillAsync() noexcept;
 /// E2, async fill: the repack layout raised `flag` (VertexInput) for E1's engine; E1 raises it

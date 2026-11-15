@@ -514,7 +514,8 @@ bool OneFollowerDraw::FillRing(Maxwell3D& engine, GraphicsPipeline* pipeline, bo
         pipeline != nullptr ? std::span<const Shader::Info>{pipeline_facts.stage_infos, 5}
                             : std::span<const Shader::Info>{*facts.infos};
     // fable_b 23.1 cut 4, dry (GPU profile on): the fill timed and the draw classed.
-    const bool price_handles = VideoCommon::FritchiiPrice::On() && pipeline != nullptr;
+    const bool price_handles =
+        !esplit_async && VideoCommon::FritchiiPrice::On() && pipeline != nullptr;
     const u64 handle_start = price_handles ? VideoCommon::FritchiiPrice::Ticks() : 0;
     // FRITCHII_HANDLE_PROG_KEEP (fable_b 25.2 cut g): a pipeline with handle programs keeps their
     // results while every word they read is unchanged.
@@ -607,7 +608,10 @@ void OneFollowerDraw::FillHandleValuesKept(Maxwell3D& engine, std::span<const Sh
         memo.records.clear();
     }
     auto& memory = engine.GetMemoryManager();
-    const auto& stages = engine.state.shader_stages;
+    // FRITCHII_ESPLIT_DEPTH > 0: an async fill reads E2's view (E1's engine is ahead).
+    const auto& stages = VideoCommon::ESplit::FillAsync()
+                             ? VideoCommon::ESplit::ThreadView().state.shader_stages
+                             : engine.state.shader_stages;
     using Cbufs = std::remove_cvref_t<decltype(stages[0].const_buffers)>;
     // The evaluation RawTextureHandle (count 1) or RawTextureHandleTable (a table) makes, through
     // `mem` and `cbufs`, each value passed to out(raw).
@@ -830,18 +834,12 @@ bool OneFollowerDraw::AsyncTailFits(const Maxwell3D& engine,
     if (!r.mem_stage.Packets() || !r.mem_stage.ValuesByValue() || r.buffer_cache.MarksAhead()) {
         return false;
     }
-    if (!engine.draw_manager.draw_state.inline_index_draw_indexes.empty() ||
-        VideoCommon::FritchiiPrice::On()) {
-        return false; // the index bytes live on E1; the price timers read the engine
+    if (!engine.draw_manager.draw_state.inline_index_draw_indexes.empty()) {
+        return false; // the index bytes live on E1
     }
-    // FRITCHII_HANDLE_PROG_KEEP reads the engine's bindings (FillHandleValuesKept).
-    if (VideoCommon::FillCuts::Mode(VideoCommon::FillCuts::Cut::HandleProgKeep) != 0) {
-        for (u32 stage = 0; stage < 5; ++stage) {
-            if (!pipeline_facts.stage_infos[stage].handle_programs.empty()) {
-                return false;
-            }
-        }
-    }
+    // The step-in of 15 Nov (profiled): FritchiiPrice::On() is the GPU profile itself, so every
+    // draw stayed lockstep. An async fill skips the price timers (they read the engine) and the
+    // handle program keep reads the view's bindings (FillHandleValuesKept): neither blocks.
     return !VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed);
 }
 
@@ -862,8 +860,14 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
             auto& memory_manager = engine.GetMemoryManager();
             if (memory_manager.HasPendingCachedWrites() ||
                 VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) {
-                auto flush = [&memory_manager] { memory_manager.FlushCaching(); };
-                ESplit::HandTo(ESplit::HandInfo{.hand = ESplit::Hand::Flush}, flush);
+                if (ESplit::g_async) {
+                    // The queued mode: E2 is idle, E1 runs it (a join, no hand-over).
+                    const ESplit::JoinScope join{ESplit::Join::Flush};
+                    memory_manager.FlushCaching();
+                } else {
+                    auto flush = [&memory_manager] { memory_manager.FlushCaching(); };
+                    ESplit::HandTo(ESplit::HandInfo{.hand = ESplit::Hand::Flush}, flush);
+                }
             }
         } else {
             esplit_late_flush = true;
@@ -881,6 +885,9 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
     // raised again, so the pack below hands them to R and clears them (rule 1).
     GraphicsPipeline* pipeline = nullptr;
     if (VideoCommon::OneFollower::g_e_pipeline) {
+        // FRITCHII_ESPLIT: E1's lookup reads shader code from game memory, allowed unless a write
+        // onto shader pages is pending (then E2 drains and the flush runs first: a join).
+        const ESplit::LookupScope esplit_lookup;
         const ESplit::FlagProbe lookup_probe{engine, ESplit::FlagSite::Lookup, esplit};
         const auto flags_before = engine.dirty.flags;
         pipeline = rasterizer.pipeline_cache.CurrentGraphicsPipeline();
@@ -978,21 +985,9 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
             return true;
         }
     }
-    if (esplit_hand) [[unlikely]] {
-        if (esplit_late_flush) {
-            // E2 was behind at the lookup and this tail goes in lockstep: the flush first (the
-            // hand-over drains E2), as an async tail would run it.
-            auto& memory_manager = engine.GetMemoryManager();
-            auto flush = [&memory_manager] {
-                if (memory_manager.HasPendingCachedWrites() ||
-                    VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) {
-                    VideoCommon::ESplit::NoteLateFlush();
-                    memory_manager.FlushCaching();
-                }
-            };
-            ESplit::HandTo(ESplit::HandInfo{.hand = ESplit::Hand::Flush}, flush);
-        }
-        // FRITCHII_ESPLIT=1: the tail below on E2 (the record of its view first), E1 waits.
+    if (esplit_hand && !ESplit::g_async) [[unlikely]] {
+        // FRITCHII_ESPLIT_DEPTH=0 (S1): the tail below on E2 (the record of its view first), E1
+        // waits.
         bool pushed = false;
         auto tail = [&] {
             u64 number = 0;
@@ -1014,6 +1009,20 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
                                                                                     : nullptr},
                        tail);
         return pushed;
+    }
+    // FRITCHII_ESPLIT's queued mode: a tail that cannot go async runs here, E2 drained (a join);
+    // a flush E2 was behind for runs first.
+    const ESplit::JoinScope esplit_tail{ESplit::Join::Tail, esplit_hand};
+    if (esplit_hand) [[unlikely]] {
+        ESplit::NoteTailStayed(0);
+        if (esplit_late_flush) {
+            auto& memory_manager = engine.GetMemoryManager();
+            if (memory_manager.HasPendingCachedWrites() ||
+                VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) {
+                ESplit::NoteLateFlush();
+                memory_manager.FlushCaching();
+            }
+        }
     }
     u64 buffer_number = 0;
     // The fill, ring B's packet, R's packet (its span packing is E1's, carved in PushDraw) and
