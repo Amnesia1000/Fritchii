@@ -1458,7 +1458,9 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   register is a watched word) without it. The op carries its R-only dirty flags by rule 1, as a
   draw packet does (PacketRenderState). Counted as "clear" lends gone from the lends-by-site line.
   Known fault (15 Nov): with unlent array draws (UNLEND bit 0x2) the market renders about 15%
-  darker (mean luminance 100-104 against 119); either switch off restores it.
+  darker (mean luminance 100-104 against 119). Fixed in c1472cfd23 (fable_b 18.3: a posted
+  clear keeps the flags E's pipeline lookup reads on E's engine); measured 117.4 with clears
+  posted, 114.5 without.
 - FRITCHII_ONEF_CLEAR_NODEFER (live, default 0; diagnostic for that fault): 1 = a posted clear
   on R clears at once instead of becoming the next render pass's load op (deferred clear).
 - FRITCHII_ONEF_TRACE (boot, default 0; fable_b_one_follower 15.5): 1 = the lend trace. One
