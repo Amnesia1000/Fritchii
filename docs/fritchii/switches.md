@@ -3627,6 +3627,25 @@ at full cache clears and shutdown (host bytes are read when written, so links sh
   a frame; this raises the cap. Line every 600 frames "Cold sweep cap (...)" whenever the cap was
   reached (also with the switch at 0): frames that stopped at the cap, images watched.
 
+### FRITCHII_JIT_BLOCK_LIST (the "JIT block list" lines)
+
+Boot, default 0 (helper AG, port of the idea of zortos #1225 by ne1i). Every block the CPU
+recompiler compiles because the game ran it (not warm compiles), inside the application's code
+image, is recorded relative to the image in `<cache dir>/jit/<program id>-<build id>.blocks`
+(64-byte header naming the image, then append-only chunks of entries, each with a checksum; a
+torn tail is cut off at the next launch; at most 2M entries, 8 bytes each). A writer thread
+appends new blocks every 10 s and at shutdown. With 1 the next launch hands the list, in the
+order it was first compiled, to EDEN_NX2_JIT_WARM's idle compiles once nothing another core
+compiled is waiting, so every core compiles it ahead within the same budget (20 ms of every
+100 ms per idle core; precompiles stop with half the code space left, 256 MiB, or half the
+smaller region with FRITCHII_JIT_FAR_CODE, so the cache is never thrown away for them). 2 = record only (build the list; the A side of an A/B). Warm-up needs
+EDEN_NX2_JIT_WARM=1 (on by default), several cores, a 64-bit game and no debugger. OoT: after a
+save load one 721 ms frame then ~20 frames of 40-450 ms on zortos' build, a first-time code path
+compiling 700-7,763 blocks in one frame. Lines: "JIT block list (FRITCHII_JIT_BLOCK_LIST=N): K
+blocks loaded from ..." at boot; every 10 s with new blocks "... new blocks written, listed;
+warm-up handed out a/b/c/d of K loaded" (per core). The hitch line's warm compile time shows
+what the warm-up costs.
+
 ## Numbered experiments (EDEN_NX2_EXPn)
 
 Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP79, live through the debug server:

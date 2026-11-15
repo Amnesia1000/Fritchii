@@ -15,6 +15,7 @@
 #include <fmt/format.h>
 
 #include "common/cpu_features.h"
+#include "common/fritchii_jit_list.h"
 #include "common/host_memory.h"
 #include "common/logging.h"
 #include "common/nx2_hitch.h"
@@ -174,6 +175,9 @@ bool JitWarmEnabled() {
 }
 
 Cause CompileCause(u64 key, u32 core) {
+    if (!t_warming) {
+        FritchiiJitList::Note(key); // FRITCHII_JIT_BLOCK_LIST: one relaxed load when off
+    }
     const u8 bit = static_cast<u8>(1U << (core & 7));
     std::scoped_lock lock{g_compile_mutex};
     g_cores_seen |= bit;
@@ -198,7 +202,7 @@ Cause CompileCause(u64 key, u32 core) {
 
 size_t TakeWarmKeys(u32 core, std::vector<u64>& out, size_t max) {
     out.clear();
-    std::scoped_lock lock{g_compile_mutex};
+    std::unique_lock lock{g_compile_mutex};
     auto& queue = g_warm_queues[core & 7];
     const u8 bit = static_cast<u8>(1U << (core & 7));
     // Oldest first; skip keys this core compiled on demand meanwhile.
@@ -210,6 +214,28 @@ size_t TakeWarmKeys(u32 core, std::vector<u64>& out, size_t max) {
         }
     }
     queue.erase(queue.begin(), queue.begin() + static_cast<std::ptrdiff_t>(taken));
+    if (!out.empty() || !FritchiiJitList::Preloading()) {
+        return out.size();
+    }
+    // FRITCHII_JIT_BLOCK_LIST=1: with nothing another core compiled waiting, the next blocks of
+    // the title's list (earlier launches), skipping those this core compiled meanwhile. A few
+    // rounds at most, so a core that has compiled much of the list returns soon.
+    std::vector<u64> listed;
+    for (int round = 0; round < 32 && out.empty(); ++round) {
+        listed.clear();
+        lock.unlock(); // the list's own lock is never taken under this one
+        const size_t got = FritchiiJitList::TakePreload(core & 7, listed, max);
+        lock.lock();
+        if (got == 0) {
+            break;
+        }
+        for (const u64 key : listed) {
+            const auto it = g_compiled_on.find(key);
+            if (out.size() < max && (it == g_compiled_on.end() || (it->second & bit) == 0)) {
+                out.push_back(key);
+            }
+        }
+    }
     return out.size();
 }
 

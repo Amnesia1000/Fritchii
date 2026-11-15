@@ -53,6 +53,8 @@ add_library(
     nx2_gpu_write_listener.h
     nx2_uniform_keep_pages.h
     fritchii_switch_defaults.cpp
+    fritchii_jit_list.cpp
+    fritchii_jit_list.h
     fritchii_write_ring.h
     fritchii_page_flags.h
     fritchii_bind_skip.h
