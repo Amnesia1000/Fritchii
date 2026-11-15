@@ -673,6 +673,7 @@ bool GpuSplit::SiteOnEngine(DrainSite site) noexcept {
     case DrainSite::ListCopies:
     case DrainSite::ListFlush:
     case DrainSite::DispatchWait:
+    case DrainSite::LaggedCheckEngine:
         return true;
     default:
         return false;
@@ -680,7 +681,9 @@ bool GpuSplit::SiteOnEngine(DrainSite site) noexcept {
 }
 
 bool GpuSplit::UsesEngine(DrainSite site) const {
-    return two_positions && SiteOnEngine(site) && OneFollower::WaitsE();
+    // LaggedCheckEngine is chosen by FRITCHII_ONEF_SEM_E itself, not WAITS_E.
+    return two_positions && SiteOnEngine(site) &&
+           (site == DrainSite::LaggedCheckEngine || OneFollower::WaitsE());
 }
 
 bool GpuSplit::Reached(u64 target, bool on_engine, std::memory_order order) const {

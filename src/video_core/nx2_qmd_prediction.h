@@ -292,7 +292,19 @@ struct BackRelease {
 
 /// BeforeCheck counts on top: of the met ones, those whose release the back made before the
 /// check (it landed after it).
-enum class MetBy : u32 { QmdRelease, QmdReduction, DmaRelease, Other, Unmet, BeforeCheck, Count };
+/// OtherPullerRelease, OtherPayloadRelease: of Other, the release recorded for the word that
+/// meets it, a puller one or another payload release (fable_b 19.4).
+enum class MetBy : u32 {
+    QmdRelease,
+    QmdReduction,
+    DmaRelease,
+    Other,
+    Unmet,
+    BeforeCheck,
+    OtherPullerRelease,
+    OtherPayloadRelease,
+    Count
+};
 /// Front: what met an acquire NoteAcquire counted, once its fences were released.
 void NoteMetBy(MetBy met_by);
 

@@ -227,6 +227,15 @@ enum class Check : u8 {
     /// FRITCHII_ONEF_OP_DISPATCH: R played a dispatch while not on its register view (rule 2):
     /// its state invalidation would have reached E's engine. Skipped there; posting stops.
     PlayedDispatchNoView,
+    /// fable_b 18.4 (FRITCHII_ONEF_LOOKUP_CHECK): at an unlent draw's lookup on E, a part of the
+    /// key the lookup kept because its flag was clear (the programs, the blend, the vertex
+    /// input) differs from the same part computed fresh: a pack or path took the flag before
+    /// E's lookup read it.
+    LookupFlags,
+    /// fable_b 19.6 (FRITCHII_ONEF_SEM_E): a semaphore write on E or R to a word last written
+    /// from a later place in the stream (E's place: after the packets it pushed; R's: the
+    /// packet it plays). Every writer of a word must have one home.
+    SemaphoreOrder,
     Count,
 };
 
@@ -238,7 +247,8 @@ inline constexpr std::array<const char*, static_cast<size_t>(Check::Count)> chec
     "facts stale", "played lookup miss", "texture read ahead of R", "ring B pairing",
     "R waits for E's lock", "R needs E's buffer flush",
     "build list draw", "played list args", "played kind without path", "sync mirror",
-    "sync target missing", "sync target unused", "played dispatch", "played dispatch off view",
+    "sync target missing", "sync target unused", "played dispatch", "played dispatch off view", "lookup flags",
+    "semaphore order",
 };
 
 // --- The packet (E to R) -----------------------------------------------------------------------------
@@ -598,6 +608,29 @@ void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size,
 /// commit) is posted; E runs the closing gather itself first. Stopped for the session by a "sync
 /// mirror" mismatch of the kind that makes E's test wrong (R started, E not).
 [[nodiscard]] bool PostFenceOn() noexcept;
+/// FRITCHII_ONEF_LOOKUP_CHECK: whether this unlent draw's lookup is checked (every Nth).
+[[nodiscard]] bool LookupCheckDue() noexcept;
+/// FRITCHII_ONEF_DRY_RELEASE: on (refreshes g_dry_release). E.
+[[nodiscard]] bool DryReleaseOn() noexcept;
+/// FRITCHII_ONEF_SEM_E (with POST_FENCE on; refreshes g_sem_e): fable_b 19.4, 19.6, 20.3.
+[[nodiscard]] bool SemOnE() noexcept;
+/// E, at each fence it could post: what it did (dry counts, the fence decisions line).
+enum class FenceDecision : u8 {
+    Posted,           ///< posted, nothing for the buffer half
+    PostedWithCommit, ///< posted, E ran the buffer half's commit (19.6 step 1)
+    Off,              ///< lent: POST_FENCE off (or not at step 4)
+    Delayed,          ///< lent: delayed fences (accuracy)
+    Stopped,          ///< lent: POST_FENCE stopped for the session
+    SyncOwed,         ///< lent: a report of another kind owes the query sync
+    AheadDue,         ///< lent: memory stage marks ahead still to promote
+    Count,
+};
+void CountFenceDecision(FenceDecision decision) noexcept;
+/// Why PostFenceOn refuses: Off, Delayed or Stopped.
+[[nodiscard]] FenceDecision PostFenceRefusal() noexcept;
+/// R: an unused samples sync target explained by E's mirror superset (R's counter was stopped
+/// at the reports E listed): counted, not a check.
+void CountSyncTargetSuperset() noexcept;
 /// Stops FRITCHII_ONEF_POST_FENCE for the session (a must-be-0 of its own fired).
 void StopPostFence(const char* why) noexcept;
 
@@ -722,13 +755,15 @@ enum class QueryKind : u8 {
     BufferPageOp,          ///< QUERY_OPS=2: a plain report on a buffer page as a render op
     FenceReport,           ///< a fence-flagged report (lent; item 4)
     PayloadRelease,        ///< a payload release (lent; item 4)
+    PayloadReleaseOnE,     ///< FRITCHII_ONEF_SEM_E: a payload release E wrote (R notes the sync)
+    PayloadFenceOnE,       ///< FRITCHII_ONEF_SEM_E: a fence-flagged payload report E wrote
     Count,
 };
 inline constexpr std::array<const char*, static_cast<size_t>(QueryKind::Count)> query_kind_names{
     "condition skipped", "condition override", "condition true", "condition false",
     "condition conditional", "condition if equal", "condition if not equal", "reset",
     "plain report", "report on buffer page", "report on buffer page as op", "fence report",
-    "payload release",
+    "payload release", "payload release on E", "payload fence on E",
 };
 /// E, before the Lend or PushOp of a query: its kind (counted with the park's time).
 void SetQueryKind(QueryKind kind) noexcept;

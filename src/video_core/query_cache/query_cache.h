@@ -663,6 +663,48 @@ bool QueryCacheBase<Traits>::ReportLandsLater(QueryType type) const {
 }
 
 template <typename Traits>
+void QueryCacheBase<Traits>::WritePayloadNow(DAddr cpu_addr, GPUVAddr addr, u32 payload,
+                                             bool has_timestamp, bool completion) {
+    FinishReads(cpu_addr, has_timestamp ? 16 : 4);
+    u8* const pointer = impl->device_memory.template GetPointer<u8>(cpu_addr);
+    if (pointer == nullptr) [[unlikely]] {
+        return; // unmapped: nothing to write
+    }
+    // EXP13=2: marked before the word is written (nx2.h).
+    Tegra::Nx2NoteLanded(cpu_addr, payload,
+                         completion ? Tegra::Nx2Landing::QueryCompletion
+                                    : Tegra::Nx2Landing::QueryImmediate);
+    const bool superseded = VideoCommon::Runahead::LandingSuperseded(cpu_addr);
+    if (has_timestamp) {
+        const u64 ticks = impl->gpu.GetTicks();
+        if (u8* const ticks_pointer = impl->device_memory.template GetPointer<u8>(cpu_addr + 8)) {
+            std::memcpy(ticks_pointer, &ticks, sizeof(ticks));
+        }
+        if (!superseded) {
+            const u64 value = static_cast<u64>(payload);
+            std::memcpy(pointer, &value, sizeof(value));
+        }
+    } else if (!superseded) {
+        std::memcpy(pointer, &payload, sizeof(payload));
+    }
+    Tegra::Nx2SemaphoreWaiters::Get().OnWrite(cpu_addr, payload);
+    Common::Nx2GpuWrite::Notify(completion ? Common::Nx2GpuWrite::Path::QueryCompletion
+                                           : Common::Nx2GpuWrite::Path::QueryImmediate,
+                                cpu_addr, addr, pointer, payload);
+    if (!completion && VideoCommon::Nx2ReportCensus::Enabled()) [[unlikely]] {
+        VideoCommon::Nx2ReportCensus::Add(VideoCommon::Nx2ReportCensus::g_counters.immediate);
+    }
+}
+
+template <typename Traits>
+void QueryCacheBase<Traits>::NotePayloadWritten(DAddr cpu_addr, bool has_timestamp, u32 payload,
+                                                u32 subreport) {
+    VideoCommon::OneFollower::RenderOwned("QueryCache::NotePayloadWritten");
+    auto* const streamer = impl->streamers[static_cast<size_t>(QueryType::Payload)];
+    streamer->Free(streamer->WriteCounter(cpu_addr, has_timestamp, payload, subreport));
+}
+
+template <typename Traits>
 void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type,
                                            QueryPropertiesFlags flags, u32 payload, u32 subreport) {
     CounterReportAt(addr, gpu_memory->GpuToCpuAddress(addr), counter_type, flags, payload,

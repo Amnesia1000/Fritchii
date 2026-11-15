@@ -68,6 +68,9 @@ enum class DrainSite : u32 {
     ListCopies,     ///< Lists on GPU-written pages: the dispatches and copies before the last sync
     LaggedCheck,    ///< EXP12=5/6: a suspended acquire's poll waits for what was sent 1 ms before
     FenceWordWriters, ///< EXP12=6: a fence release waits for the queued writers of its word
+    /// FRITCHII_ONEF_SEM_E: a lagged check on a word whose newest release is a payload one,
+    /// written on E (or lent): E's position
+    LaggedCheckEngine,
     Count,
 };
 
@@ -77,7 +80,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> 
     "macro dma flush",
     "gp sync fence", "map",           "front start", "front verify",  "macro dma check",
     "macro dma dispatch", "fence writers", "qmd read", "list copy writers", "lagged check",
-    "fence word writers",
+    "fence word writers", "lagged check (E)",
 };
 
 /// Maxwell3D::FrontNoteMemoryWrite's notes of 3D reports (the pending write's `what`), told apart

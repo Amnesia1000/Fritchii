@@ -131,6 +131,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                         // release a shader wrote to the caches.
                         Profile::Scope scope{Profile::Zone::PendingSleep};
                         const Profile::FrontWaitScope wait_mark{Profile::FrontDid::Pending};
+                        const VideoCommon::OneFollower::DryStallScope dry_stall;
                         const auto now = std::chrono::steady_clock::now();
                         if (now - last_progress < PendingPoll) {
                             const auto poll_end =
@@ -157,6 +158,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     // Windows a sleep still lasts one timer tick, ~0.5 ms), 2 = always yield.
                     Profile::Scope scope{Profile::Zone::PendingSleep};
                     const Profile::FrontWaitScope wait_mark{Profile::FrontDid::Pending};
+                    const VideoCommon::OneFollower::DryStallScope dry_stall;
                     const int poll = VideoCore::Nx2Debug::Experiment(6);
                     if (poll == 2 || std::chrono::steady_clock::now() - last_progress <
                                          std::chrono::microseconds{500}) {

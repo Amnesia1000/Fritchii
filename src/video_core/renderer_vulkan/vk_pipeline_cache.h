@@ -154,6 +154,12 @@ public:
 
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline();
 
+    /// One follower (fable_b 18.4, E, right after a lookup): the key parts the lookup kept
+    /// because their flag was clear, computed fresh from the registers and compared: bit 0 the
+    /// programs (with `shaders_clear`), 1 the blend (`blending_clear`), 2 the vertex input
+    /// (`vertex_input_clear`). Leaves the engine's flags as they were.
+    [[nodiscard]] u32 OneFollowerLookupCheck(bool shaders_clear, bool blending_clear,
+                                             bool vertex_input_clear);
     /// Whether the last CurrentGraphicsPipeline returned null because its draw was skipped for an
     /// unbuilt pipeline (asynchronous shaders), not because there is no pipeline to build.
     [[nodiscard]] bool LastLookupSkipped() const noexcept {

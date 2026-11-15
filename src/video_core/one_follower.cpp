@@ -151,6 +151,11 @@ struct Impl {
     std::array<u64, static_cast<size_t>(DispatchCount::Count)> dispatch_logged{};
     std::atomic<bool> post_dispatch_stopped{};
     std::atomic<bool> dispatch_refused_logged{};
+    u64 lookup_checks{};
+    std::array<std::atomic<u64>, static_cast<size_t>(FenceDecision::Count)> fence_decisions{};
+    std::array<u64, static_cast<size_t>(FenceDecision::Count)> fence_decisions_logged{};
+    std::atomic<u64> sync_target_superset{};
+    u64 sync_target_superset_logged{};
     // fable_b 13.0 (E only): pages with a report a posted fence lands, by that fence's packet
     // number; and the report pages since the last fence.
     std::unordered_map<u64, u64> landing_pages;
@@ -663,6 +668,28 @@ void LogQueryKinds() {
              Posted() ? 1 : 0, seconds, rate(0), rate(1), gathers,
              gathers > 0 ? rate(3) / gathers : 0.0);
     g.posting_logged = posting;
+    {
+        static constexpr std::array<const char*, static_cast<size_t>(FenceDecision::Count)>
+            names{"posted",           "posted with E's buffer commit", "lent: POST_FENCE off",
+                  "lent: delayed",    "lent: stopped",                 "lent: sync owed",
+                  "lent: marks ahead due"};
+        std::string text;
+        for (size_t i = 0; i < names.size(); ++i) {
+            const u64 count = g.fence_decisions[i].load(std::memory_order_relaxed);
+            text += fmt::format("{}{} {:.0f}/s", i == 0 ? "" : ", ", names[i],
+                                static_cast<double>(count - g.fence_decisions_logged[i]) /
+                                    seconds);
+            g.fence_decisions_logged[i] = count;
+        }
+        const u64 superset = g.sync_target_superset.load(std::memory_order_relaxed);
+        LOG_INFO(HW_GPU,
+                 "One follower fence decisions (POST_FENCE={}, SEM_E={}) {:.0f} s: {}; samples "
+                 "sync targets R did not need, E's mirror ahead {:.1f}/s",
+                 PostFenceOn() ? 1 : 0, g_sem_e.load(std::memory_order_relaxed) ? 1 : 0, seconds,
+                 text,
+                 static_cast<double>(superset - g.sync_target_superset_logged) / seconds);
+        g.sync_target_superset_logged = superset;
+    }
     if (SyncMirrorOn()) {
         std::array<double, 3> rates{};
         for (size_t i = 0; i < rates.size(); ++i) {
@@ -1490,6 +1517,14 @@ void Lend(LentOp op, LentReason reason, void (*function)(void*), void* argument)
 void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size,
             bool lands_in_memory, u8 packet_flags) {
     if (!Detail::t_engine || !g.thread.joinable() || size > MaxPayloadBytes) {
+        if (size > MaxPayloadBytes && Detail::t_engine && g.thread.joinable()) [[unlikely]] {
+            // An R op run on E: a bug in the op's payload, never silent (its effects are R's).
+            static std::atomic<bool> logged{};
+            if (!logged.exchange(true, std::memory_order_relaxed)) {
+                LOG_CRITICAL(HW_GPU, "One follower: an op payload of {} bytes (max {}) at {} ran on E",
+                             size, MaxPayloadBytes, t_lend_site != nullptr ? t_lend_site : "?");
+            }
+        }
         t_lend_site = nullptr;
         function(const_cast<void*>(payload));
         return;
@@ -1601,6 +1636,220 @@ bool InvalOnEngine() noexcept {
 bool SyncMirrorOn() noexcept {
     return g.on && VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_sync_mirror,
                                                     "FRITCHII_ONEF_SYNC_MIRROR") != 0;
+}
+
+bool LookupCheckDue() noexcept {
+    const int every = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_lookup_check,
+                                                       "FRITCHII_ONEF_LOOKUP_CHECK");
+    return g.on && every > 0 && ++g.lookup_checks % static_cast<u64>(every) == 0;
+}
+
+namespace {
+/// fable_b 19.5 step 3's dry price: a release per slot (by its word), as E passed it and as
+/// some thread wrote it. Racy by design (a counter): E stamps the pass, the writer the run, the
+/// front reads both at a resume.
+struct DrySlot {
+    std::atomic<u64> device{~u64{0}};
+    std::atomic<u64> pass_ns{};
+    std::atomic<u64> pass_stall{};
+    std::atomic<u64> run_ns{};
+    std::atomic<u64> run_stall{};
+    std::atomic<u8> kind{};
+};
+constexpr size_t DrySlots = 4096;
+std::array<DrySlot, DrySlots> g_dry_slots{};
+std::atomic<u64> g_dry_stall_total{};
+std::atomic<u64> g_dry_stall_since{};
+DrySlot& DrySlotFor(u64 device) {
+    return g_dry_slots[(device >> 2) % DrySlots];
+}
+/// The front's window (front thread only).
+struct DryWindow {
+    u64 since_ns{};
+    u64 last_ns{};
+    std::array<u64, static_cast<size_t>(DryKind::Count)> count{};
+    std::array<u64, static_cast<size_t>(DryKind::Count)> wall_ns{};
+    std::array<u64, static_cast<size_t>(DryKind::Count)> stalled_ns{};
+    u64 resumes{};
+    u64 not_passed{}; ///< no release E passed for the word
+    u64 not_run{};    ///< E passed one, not written yet (met another way)
+    u64 before{};     ///< written before the suspension
+};
+DryWindow g_dry_window{};
+} // Anonymous namespace
+
+bool DryReleaseOn() noexcept {
+    const bool on = g.on && VideoCore::Nx2Debug::SwitchValue(
+                                VideoCore::Nx2Debug::g_onef_dry_release,
+                                "FRITCHII_ONEF_DRY_RELEASE") != 0;
+    if (g_dry_release.load(std::memory_order_relaxed) != on) {
+        g_dry_release.store(on, std::memory_order_relaxed);
+    }
+    return on;
+}
+
+void DryNotePass(u64 device, DryKind kind) noexcept {
+    DrySlot& slot = DrySlotFor(device);
+    slot.run_ns.store(0, std::memory_order_relaxed);
+    slot.kind.store(static_cast<u8>(kind), std::memory_order_relaxed);
+    slot.pass_stall.store(DryStallNow(), std::memory_order_relaxed);
+    slot.pass_ns.store(Common::Nx2Hitch::NowNs(), std::memory_order_relaxed);
+    slot.device.store(device, std::memory_order_release);
+}
+
+void DryNoteRun(u64 device) noexcept {
+    DrySlot& slot = DrySlotFor(device);
+    if (slot.device.load(std::memory_order_acquire) != device ||
+        slot.run_ns.load(std::memory_order_relaxed) != 0) {
+        return;
+    }
+    slot.run_stall.store(DryStallNow(), std::memory_order_relaxed);
+    slot.run_ns.store(Common::Nx2Hitch::NowNs(), std::memory_order_release);
+}
+
+u64 DryStallNow() noexcept {
+    const u64 since = g_dry_stall_since.load(std::memory_order_acquire);
+    const u64 total = g_dry_stall_total.load(std::memory_order_acquire);
+    return since == 0 ? total : total + (Common::Nx2Hitch::NowNs() - since);
+}
+
+void DryFrontStall(bool begin) noexcept {
+    const u64 now = Common::Nx2Hitch::NowNs();
+    if (begin) {
+        g_dry_stall_since.store(now, std::memory_order_release);
+        return;
+    }
+    const u64 since = g_dry_stall_since.exchange(0, std::memory_order_acq_rel);
+    if (since != 0) {
+        g_dry_stall_total.fetch_add(now - since, std::memory_order_acq_rel);
+    }
+}
+
+void DryNoteResume(u64 device, u64 since_ns, u64 stall_at_since) noexcept {
+    auto& w = g_dry_window;
+    const u64 now = Common::Nx2Hitch::NowNs();
+    if (w.since_ns != 0 && now - w.last_ns > 5'000'000'000ULL) {
+        w = {}; // the switch was off, or nothing resumed: start over
+    }
+    if (w.since_ns == 0) {
+        w.since_ns = now;
+    }
+    w.last_ns = now;
+    ++w.resumes;
+    DrySlot& slot = DrySlotFor(device);
+    const u64 run_ns = slot.run_ns.load(std::memory_order_acquire);
+    if (slot.device.load(std::memory_order_acquire) != device) {
+        ++w.not_passed;
+    } else if (run_ns == 0) {
+        ++w.not_run;
+    } else if (run_ns < since_ns) {
+        ++w.before;
+    } else {
+        const size_t kind = (std::min)(static_cast<size_t>(slot.kind.load(std::memory_order_relaxed)),
+                                       static_cast<size_t>(DryKind::Count) - 1);
+        const u64 pass_ns = (std::max)(slot.pass_ns.load(std::memory_order_relaxed), since_ns);
+        const u64 pass_stall =
+            (std::max)(slot.pass_stall.load(std::memory_order_relaxed), stall_at_since);
+        const u64 run_stall = slot.run_stall.load(std::memory_order_relaxed);
+        ++w.count[kind];
+        w.wall_ns[kind] += run_ns > pass_ns ? run_ns - pass_ns : 0;
+        w.stalled_ns[kind] += run_stall > pass_stall ? run_stall - pass_stall : 0;
+    }
+    const double window = static_cast<double>(now - w.since_ns) / 1e9;
+    if (window < 5.0) {
+        return;
+    }
+    static constexpr std::array<const char*, static_cast<size_t>(DryKind::Count)> names{
+        "payload release", "fence-flagged payload", "counter report", "QMD reduction",
+        "QMD max"};
+    std::string kinds;
+    double stalled_all = 0;
+    for (size_t k = 0; k < names.size(); ++k) {
+        if (w.count[k] == 0) {
+            continue;
+        }
+        const double stalled = static_cast<double>(w.stalled_ns[k]) / 1e6 / window;
+        stalled_all += stalled;
+        kinds += fmt::format("{}{} {:.0f}/s (E ahead of the write {:.1f} ms/s, the front "
+                             "stalled in it {:.1f} ms/s)",
+                             kinds.empty() ? "" : "; ", names[k],
+                             static_cast<double>(w.count[k]) / window,
+                             static_cast<double>(w.wall_ns[k]) / 1e6 / window, stalled);
+    }
+    LOG_INFO(HW_GPU,
+             "One follower dry release price (fable_b 19.5 step 3): {:.0f} resumed acquires/s; "
+             "met after the suspension by a release E passed: {}; price (front stalled while "
+             "E was past the release and it was not written) {:.1f} ms/s; no release E passed "
+             "{:.0f}/s, passed but not written {:.0f}/s, written before the suspension "
+             "{:.0f}/s",
+             static_cast<double>(w.resumes) / window, kinds.empty() ? "none" : kinds,
+             stalled_all, static_cast<double>(w.not_passed) / window,
+             static_cast<double>(w.not_run) / window, static_cast<double>(w.before) / window);
+    const u64 last = w.last_ns;
+    w = {};
+    w.since_ns = now;
+    w.last_ns = last;
+}
+
+bool SemOnE() noexcept {
+    const bool on = PostFenceOn() && VideoCore::Nx2Debug::SwitchValue(
+                                         VideoCore::Nx2Debug::g_onef_sem_e,
+                                         "FRITCHII_ONEF_SEM_E") != 0;
+    if (g_sem_e.load(std::memory_order_relaxed) != on) {
+        g_sem_e.store(on, std::memory_order_relaxed);
+    }
+    return on;
+}
+
+void CountFenceDecision(FenceDecision decision) noexcept {
+    g.fence_decisions[static_cast<size_t>(decision)].fetch_add(1, std::memory_order_relaxed);
+}
+
+FenceDecision PostFenceRefusal() noexcept {
+    if (g.post_fence_stopped.load(std::memory_order_relaxed)) {
+        return FenceDecision::Stopped;
+    }
+    if (VideoCore::Nx2Debug::DelayedFences()) {
+        return FenceDecision::Delayed;
+    }
+    return FenceDecision::Off;
+}
+
+void CountSyncTargetSuperset() noexcept {
+    g.sync_target_superset.fetch_add(1, std::memory_order_relaxed);
+}
+
+namespace {
+/// fable_b 19.6's "semaphore order": the last write's place per word (a direct-mapped table; a
+/// collision forgets the older word).
+struct SemOrderSlot {
+    std::atomic<u64> device{~u64{0}};
+    std::atomic<u64> place{};
+};
+std::array<SemOrderSlot, 4096> g_sem_order{};
+} // Anonymous namespace
+
+void NoteSemaphoreOrder(u64 device) noexcept {
+    // E's place is after the packets it pushed (n, then 1); R's the packet it plays (n, then 0):
+    // a packet E pushes comes after E's writes before it and before E's writes after it. The
+    // packet numbers are compared on their low 32 bits, modulo.
+    const bool engine = Detail::t_engine;
+    const u32 number = engine ? static_cast<u32>(g.pushed) : t_play_number;
+    const u64 place = (u64{number} << 1) | (engine ? 1 : 0);
+    SemOrderSlot& slot = g_sem_order[(device >> 2) % g_sem_order.size()];
+    if (slot.device.load(std::memory_order_acquire) == device) {
+        const u64 last = slot.place.load(std::memory_order_relaxed);
+        const s32 ahead = static_cast<s32>(number - static_cast<u32>(last >> 1));
+        if (ahead < 0 || (ahead == 0 && (place & 1) < (last & 1))) [[unlikely]] {
+            thread_local std::string note;
+            note = fmt::format("word {:#x}: {} wrote it at packet {} after {} wrote it at {}",
+                               device, engine ? "E" : "R", number, (last & 1) != 0 ? "E" : "R",
+                               last >> 1);
+            Note(Check::SemaphoreOrder, note.c_str());
+        }
+    }
+    slot.place.store(place, std::memory_order_relaxed);
+    slot.device.store(device, std::memory_order_release);
 }
 
 void StopPostFence(const char* why) noexcept {

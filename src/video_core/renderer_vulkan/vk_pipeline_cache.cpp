@@ -2762,6 +2762,46 @@ void PipelineCache::RefreshGraphicsKey() {
     }
 }
 
+u32 PipelineCache::OneFollowerLookupCheck(bool shaders_clear, bool blending_clear,
+                                          bool vertex_input_clear) {
+    auto& flags = maxwell3d->dirty.flags;
+    const auto saved = flags;
+    u32 differ = 0;
+    if (shaders_clear) {
+        // The programs as RefreshStages reads them now (it then keeps these, the right ones).
+        std::array<u64, 6> fresh{};
+        flags[VideoCommon::Dirty::Shaders] = true;
+        if (RefreshStages(fresh) && fresh != graphics_key.unique_hashes) {
+            differ |= 1;
+        }
+    }
+    if (blending_clear || vertex_input_clear) {
+        FixedPipelineState fresh = graphics_key.state;
+        flags[Dirty::Blending] = true;
+        flags[Dirty::VertexInput] = true;
+        flags[Dirty::ViewportSwizzles] = true;
+        fresh.Refresh(*maxwell3d, dynamic_features);
+        if (blending_clear &&
+            std::memcmp(fresh.attachments.data(), graphics_key.state.attachments.data(),
+                        sizeof(fresh.attachments)) != 0) {
+            differ |= 2;
+        }
+        if (vertex_input_clear &&
+            (std::memcmp(fresh.attributes.data(), graphics_key.state.attributes.data(),
+                         sizeof(fresh.attributes)) != 0 ||
+             std::memcmp(fresh.binding_divisors.data(), graphics_key.state.binding_divisors.data(),
+                         sizeof(fresh.binding_divisors)) != 0)) {
+            differ |= 4;
+        }
+    }
+    flags = saved;
+    if ((differ & 1) != 0 || (shaders_clear && !last_shaders_valid)) {
+        // RefreshStages kept the fresh programs' infos: the next lookup must refresh the key too.
+        flags[VideoCommon::Dirty::Shaders] = true;
+    }
+    return differ;
+}
+
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
     // One follower: the pipeline cache is R's, or E's with rule 3 (then R looks up only inside a
     // lent call: "owner on R" otherwise).

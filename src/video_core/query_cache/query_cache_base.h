@@ -122,6 +122,14 @@ public:
     [[nodiscard]] bool ReportLandsLater(QueryType type) const;
     /// One follower (fable_b 16.2): whether a report of `type` written now makes a pending sync.
     [[nodiscard]] bool ReportMakesPendingSync(QueryType type) const;
+    /// One follower (fable_b 19.4, FRITCHII_ONEF_SEM_E), E at the report's place: a payload
+    /// write to game memory, the waiters and the listeners, as CounterReport's immediate write
+    /// (`completion` false) or a synced fence report's operation (true) does it. The streamers
+    /// (R's) are not touched.
+    void WritePayloadNow(DAddr cpu_addr, GPUVAddr addr, u32 payload, bool has_timestamp,
+                         bool completion);
+    /// R: the streamer's side of a payload write E made, its pending sync for the next fence.
+    void NotePayloadWritten(DAddr cpu_addr, bool has_timestamp, u32 payload, u32 subreport);
 
     /// CounterReport with `addr` already translated (FRITCHII_ONEF_QUERY_OPS: E translates at
     /// its stream place, R writes the report).

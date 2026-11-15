@@ -533,6 +533,15 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_ONEF_POST_FENCE") {
         return &g_onef_post_fence;
     }
+    if (name == "FRITCHII_ONEF_LOOKUP_CHECK") {
+        return &g_onef_lookup_check;
+    }
+    if (name == "FRITCHII_ONEF_DRY_RELEASE") {
+        return &g_onef_dry_release;
+    }
+    if (name == "FRITCHII_ONEF_SEM_E") {
+        return &g_onef_sem_e;
+    }
     if (name == "FRITCHII_ONEF_CLEAR_NODEFER") {
         return &g_onef_clear_nodefer;
     }
