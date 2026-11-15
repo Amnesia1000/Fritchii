@@ -684,6 +684,61 @@ draw registers; no deferred 0xe2c mode; no tool), and a fold case already goes t
 boot): writes by the lean decide, writes left to FrontWriteDecide; compare: writes, differing
 (must be 0).
 
+### FRITCHII_FILL_GEOM_KEEP, _UPDATE_KEEP, FRITCHII_HANDLE_PROG_KEEP, FRITCHII_FILL_BRACKET_LEAN (the "Fill ... " lines)
+
+fable_b 25.2 cuts e to h: the rest of E's fill. Each is live, default 0 = exactly as before (one
+relaxed load and a branch a draw). Values: 1 = on; 2 = on, with the old path run as well and
+compared ("must be 0" in its line); 3 = dry count: the old path only, with the calls the cut
+would skip counted and their time measured (1 call in 64 timed and scaled by 64, so the line's
+ms/s is the cut's ceiling, the memo's own look already subtracted in "net"). One line per cut
+every 10 s (HW_GPU, Info). Test order: 3 first (a cut whose net is under ~3 ms/s at the market is
+not worth turning on), then 2 (must be 0), then 1.
+
+- FRITCHII_FILL_GEOM_KEEP (cut e, "Fill geometry keep"): the vertex and index binds'
+  synchronize (BindHostVertexBuffers, BindHostIndexBuffer) skipped while the slot's memo holds:
+  the range and the dirty generation sum of its tracker managers when a synchronize left it
+  clean, as EDEN_NX2_STORAGE_SYNC_MEMO does for storage binds (a page that gains a CPU or
+  Untracked bit moves the sum; nothing else makes a page dirty). Not with hot pages or CleanWords
+  on (their walks may leave a range dirty). The read log's range is logged as before. Verify: a
+  hit's range holds no CPU or unprotected page and its synchronize uploads nothing. The usage
+  marks stay: their stamp is the packet's, new every draw.
+- FRITCHII_FILL_UPDATE_KEEP (cut f, "Fill update keep"): UpdateIndexBuffer runs at every indexed
+  draw (the draw methods raise its dirty flag) and UpdateVertexBuffer at every dirty slot. The
+  binding they make is a function of the start address and the size (index) or the start and end
+  addresses and the enable (vertex): the translation, the mapped range, then FindBuffer. Kept
+  while those inputs, the page tables (MapSerial, taken before the resolve), the address space,
+  the channel and the set of buffers (binding_epoch, taken after it, so a buffer the resolve made
+  is part of the memo) are unchanged, as EXP18's memos. Not with accurate GPU fences (FindBuffer
+  waits there). The dirty flags and the binds after it are untouched. Verify: the resolve runs
+  and must give the kept binding. At 1 the disabled-stream translation skip count
+  (FRITCHII_BIND_ADDR_MEMO) no longer counts kept slots.
+- FRITCHII_HANDLE_PROG_KEEP (cut g, "Handle program keep"): E's fill (OneFollowerDraw::FillRing,
+  with E's pipeline) of a draw whose pipeline has handle programs: each program evaluation (a
+  single element or a whole table) keeps a record per pipeline, in fill order, of the constant
+  buffer addresses it read through and each word it read (GPU address, size, value). While all of
+  them read the same again, the record's results are pushed instead of evaluating: the program is
+  a pure function of what it reads, and every address it reads is a constant buffer address or
+  comes from earlier reads, all equal, so it would make the same reads. The compare makes the
+  same memory reads as the evaluation (no page flags, no tracker state), so it saves the
+  interpreter (its 1.3 KB of zeroed stack and slots), the repeated storage base reads and the
+  rest; the dry count says how much. Classes: same words, constant buffer rebound, words changed,
+  no record. Verify: a same-words program is evaluated and its results compared.
+- FRITCHII_FILL_BRACKET_LEAN (cut h, "Fill bracket lean"), E's ring fills only:
+  - The trackers' record (only made while the OoT trackers are on): E fills only the slots R can
+    read on that draw, from E's registers: slot 0 only when one of the eight render targets is
+    B10G11R11_FLOAT (TrackOcarinaCamera reads it only when the first color target's view has
+    that format, which only that render target format gives), slots 1 and 2 only for an indexed
+    draw of the actor's vertex program (TrackOcarinaActor). At 1 the others stay unbound; at 2
+    and 3 the whole record is made. At every value the left-out slots are marked in the packet,
+    and R counts reading one ("R read a slot the lean record leaves out", must be 0; at 1 the
+    first one turns the cut off for the session).
+  - Ring B's push: the room check reads ring_b_freed (the back's line, written for every packet
+    it takes) only when the packet does not fit against the last value E read (it only grows),
+    and the link counts the packet and its bytes but not the window counters (packets in ring B
+    after the push, another read of the back's line; GPUMem's window question). Verify: the line
+    is read every time and a fit by the kept value that the real one refuses counts (must be 0).
+  - The fill bracket itself (fable_b 14.4 cut 3) is already lean on E: its brackets leave the
+    shared watch count alone (MemStage::Fill::Open). Nothing more is cut there.
 ### FRITCHII_ACQUIRE_MET_BY (the "Acquire resumes met by" line)
 
 FRITCHII_ACQUIRE_MET_BY (live, default 0 since 2026-11-14 = one relaxed load per resume; 1 = the

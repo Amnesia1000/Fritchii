@@ -322,6 +322,18 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "EDEN_NX2_STORAGE_SYNC_MEMO") {
         return &g_storage_sync_memo;
     }
+    if (name == "FRITCHII_FILL_GEOM_KEEP") {
+        return &g_fill_geom_keep;
+    }
+    if (name == "FRITCHII_FILL_UPDATE_KEEP") {
+        return &g_fill_update_keep;
+    }
+    if (name == "FRITCHII_HANDLE_PROG_KEEP") {
+        return &g_handle_prog_keep;
+    }
+    if (name == "FRITCHII_FILL_BRACKET_LEAN") {
+        return &g_fill_bracket_lean;
+    }
     if (name == "EDEN_NX2_FEED_MEMORY_OVERLAY") {
         return &g_feed_memory_overlay;
     }

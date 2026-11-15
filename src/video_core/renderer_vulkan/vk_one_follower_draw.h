@@ -41,6 +41,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/one_follower.h"
 #include "video_core/renderer_vulkan/vk_mem_stage.h"
+#include "video_core/texture_handle_values.h"
 
 namespace Vulkan {
 
@@ -251,6 +252,20 @@ private:
     std::unordered_map<const void*, HandleMemo> handle_memos;
     void PriceHandleValues(Tegra::Engines::Maxwell3D& engine,
                            std::span<const Shader::Info> infos, const void* pipeline, u64 ticks);
+    /// FRITCHII_HANDLE_PROG_KEEP (fable_b 25.2 cut g): per pipeline, its fill's handle program
+    /// evaluations in fill order with what each read (the pipeline's program hashes name it: a
+    /// pipeline made again at the same address starts over).
+    struct ProgramMemo {
+        std::array<u64, 2> hashes{};
+        std::vector<VideoCommon::HandleProgramRecord> records;
+    };
+    std::unordered_map<const void*, ProgramMemo> program_memos;
+    /// The handle values of a draw whose pipeline has handle programs, with the cut at `mode`
+    /// (FillGraphicsHandleValues' values in its order).
+    void FillHandleValuesKept(Tegra::Engines::Maxwell3D& engine,
+                              std::span<const Shader::Info> infos, const void* pipeline,
+                              const std::array<u64, 2>& hashes, bool null_pointer_handles,
+                              int mode);
     u64 e_draw_seq{};
     u64 unlent_candidates{};
     /// FillRing's last Transient refusal (fable_b 19's dry counter), and whether the fill of the

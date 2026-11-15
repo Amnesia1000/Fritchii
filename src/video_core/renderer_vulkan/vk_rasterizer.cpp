@@ -89,6 +89,7 @@
 #include "video_core/buffer_churn_stats.h"
 #include "video_core/fritchii_delta_path.h"
 #include "video_core/fritchii_draw_kinds.h"
+#include "video_core/fritchii_fill_cuts.h"
 #include "video_core/fritchii_report_runs.h"
 #include "video_core/memory_stage_link.h"
 #include "video_core/texture_handle_values.h"
@@ -7938,6 +7939,10 @@ void RasterizerVulkan::TrackOcarinaCamera(const MemStage::TrackerRecord* record)
     if (record != nullptr) {
         // The draw packet's record (fable_memstage_6b_plan.md 5.1): the same answers, taken at
         // the end of the fill.
+        if (record->lean_skipped != 0) [[unlikely]] {
+            // FRITCHII_FILL_BRACKET_LEAN: R reads slot 0 here (must not be one left out).
+            VideoCommon::FillCuts::NoteTrackerRead(record->lean_skipped, 1);
+        }
         const MemStage::TrackerSlot& slot = record->slots[0];
         if (slot.bound && slot.size >= MemStage::TrackerRecord::CameraBytes && !slot.gpu_modified) {
             sample(slot.address, mem_stage.TrackerBytes(*record, 0));
@@ -8063,6 +8068,10 @@ void RasterizerVulkan::TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool 
         }
     };
     if (record != nullptr) {
+        if (record->lean_skipped != 0) [[unlikely]] {
+            // FRITCHII_FILL_BRACKET_LEAN: R reads slots 1 and 2 here.
+            VideoCommon::FillCuts::NoteTrackerRead(record->lean_skipped, 6);
+        }
         // The draw packet's record (fable_memstage_6b_plan.md 5.1).
         for (size_t i = 1; i < record->slots.size(); ++i) {
             const MemStage::TrackerSlot& slot = record->slots[i];

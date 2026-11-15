@@ -124,6 +124,18 @@ inline std::atomic<int> g_tex_bank_gen{-1};
 inline std::atomic<int> g_storage_sync_scan{-1};
 /// EDEN_NX2_STORAGE_SYNC_MEMO: docs/fritchii/switches.md.
 inline std::atomic<int> g_storage_sync_memo{-1};
+/// FRITCHII_FILL_GEOM_KEEP (live, default 0): fable_b 25.2 cut e, the vertex and index binds'
+/// synchronize skipped while the range's tracker managers stay clean (1 on, 2 verify, 3 dry count).
+inline std::atomic<int> g_fill_geom_keep{-1};
+/// FRITCHII_FILL_UPDATE_KEEP (live, default 0): fable_b 25.2 cut f, the index and vertex bindings
+/// kept while their registers, the mappings and the buffers are unchanged (1 on, 2 verify, 3 dry).
+inline std::atomic<int> g_fill_update_keep{-1};
+/// FRITCHII_HANDLE_PROG_KEEP (live, default 0): fable_b 25.2 cut g, E's handle program results kept
+/// while every word they read is unchanged (1 on, 2 verify, 3 dry count).
+inline std::atomic<int> g_handle_prog_keep{-1};
+/// FRITCHII_FILL_BRACKET_LEAN (live, default 0): fable_b 25.2 cut h, E's tracker record only for the
+/// slots R can read, ring B's push without the window counters (1 on, 2 verify, 3 dry count).
+inline std::atomic<int> g_fill_bracket_lean{-1};
 /// EDEN_NX2_FEED_MEMORY_OVERLAY: docs/fritchii/switches.md.
 inline std::atomic<int> g_feed_memory_overlay{-1};
 /// EDEN_NX2_QMD_3D_PATCH: docs/fritchii/switches.md.
