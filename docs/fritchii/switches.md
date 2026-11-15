@@ -462,6 +462,36 @@ last call of the same macro slot.
 Not counted: the macro's inputs besides its arguments (the data RAM, registers it reads but does
 not write). A skip would need those too.
 
+### FRITCHII_MACRO_SEQ_DRY (the "Macro sequences" line)
+
+FRITCHII_MACRO_SEQ_DRY (live, default 0; counters only, nothing is skipped; fable_b_one_follower
+26.4 lever 1). Prices replaying the front's work between two draws instead of running its
+macros. A run is everything the front's macro body (Maxwell3D::FrontRunMacroFeatures) and the
+command lists do between two draw.end writes (by a macro or the command list). Its key is the
+sequence of macro calls (method and parameter count) and command-list writes (method only),
+hashed, the token lists compared on a hash match. For each run it keeps the arguments of every
+macro call (and the words their MME DMA reads appended: game memory), the registers the macros
+read with their values (the JIT's read callback and the handlers' Read), and the macro writes;
+one run in 16 also keeps the data RAM at its start. Each run is compared with the last run of
+the same sequence.
+
+"Macro sequences (FRITCHII_MACRO_SEQ_DRY, counters only) 10 s" (HW_GPU, Info):
+- runs (draws) a second, tokens a run, the share with command-list writes and how many a run;
+- distinct sequences, and how many (most frequent first) cover 50/90/95/99% of the runs;
+- macro writes a run, the share that were state writes of the value held, the share of
+  executable writes (draws, reports, uploads: always sent);
+- against the last run of the same sequence (share of runs that had one): same arguments; same
+  arguments and register reads (the inputs a replay must match besides the data RAM), and of
+  those how many wrote the same again (less than 100% = an input not tracked, the data RAM);
+  same writes whatever the inputs; writes differing a run;
+- the data RAM at the start, sampled: equal to the newest sampled start of the same sequence,
+  and words differing a compare;
+- the three most frequent sequences: share, first 12 tokens ("e52(6)" = macro 0xe52 with six
+  parameters, "l586" = a command-list write of 0x586), length.
+
+With FRITCHII_E2C_ON_E deferring, the 0xe2c reads append zero words, so their real values are not
+among the inputs counted.
+
 ### FRITCHII_FRONT_RAN_READS
 
 FRITCHII_FRONT_RAN_READS (live, default 0 = exactly as before; the market's "Front 0xe2c misses"

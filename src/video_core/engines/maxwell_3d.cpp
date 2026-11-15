@@ -1845,6 +1845,57 @@ struct Maxwell3D::FrontState {
         std::chrono::steady_clock::time_point since{};
     };
     std::unique_ptr<MacroSameDry> same_dry;
+    /// FRITCHII_MACRO_SEQ_DRY (live, default 0; fable_b 26.4 lever 1, counters only): the
+    /// front's work between two draws as a sequence of macro calls (method and parameter count)
+    /// and command-list writes (method), with what each run read and wrote, compared with the
+    /// last run of the same sequence. Non-null only while the switch is on (FrontRunMacroFeatures
+    /// sets and drops it), so the command-list paths test one pointer.
+    struct MacroSeqDry {
+        struct Run {
+            std::vector<u32> tokens; ///< macro: method | parameter count << 16; list: bit 31
+            std::vector<u32> args;   ///< every macro call's parameters, as called, in order
+            std::vector<u64> reads;  ///< register reads of the macros: register | value << 32
+            std::vector<u64> writes; ///< macro writes: method | value << 32 (FIFO reads too)
+            std::vector<u32> dram;   ///< the data RAM at the run's start (sampled runs only)
+        };
+        // The run going on now.
+        Run cur;
+        u64 hash{0xcbf29ce484222325ULL};
+        u32 unchanged{};  ///< macro writes that were state writes of the value held
+        u32 executable{}; ///< macro writes of executable methods (always sent)
+        u32 direct{};     ///< command-list writes in the run
+        bool draw{};      ///< a draw.end was written (the run ends after this call or write)
+        bool open{};      ///< something was added since the last draw
+        bool sampled{};   ///< cur.dram holds the start's data RAM
+        u32 call_params{}; ///< the parameters the macro call running now was called with
+        /// The last run of each sequence (by hash), cleared past CacheMax sequences.
+        std::unordered_map<u64, Run> cache;
+        static constexpr size_t CacheMax = 8192;
+        static constexpr size_t TokensMax = 1024; ///< longer runs stop growing their key
+        // Per window.
+        std::unordered_map<u64, u64> counts;
+        u64 runs{};
+        u64 tokens{};
+        u64 with_direct{};
+        u64 direct_writes{};
+        u64 writes{};
+        u64 unchanged_writes{};
+        u64 executable_writes{};
+        u64 seen{};          ///< runs whose sequence ran before (in the cache)
+        u64 args_equal{};    ///< and with the same arguments as its last run
+        u64 inputs_equal{};  ///< and the same register reads (registers and values)
+        u64 inputs_same_writes{}; ///< of those, the same writes again
+        u64 writes_equal{};  ///< runs (seen) with the same writes as the last run, any inputs
+        u64 writes_differing{}; ///< writes that differ from the last run (seen runs)
+        u64 dram_compared{};
+        u64 dram_equal{};
+        u64 dram_words_differing{};
+        u64 clears{};
+        u64 sample_tick{};
+        std::chrono::steady_clock::time_point since{};
+    };
+    std::unique_ptr<MacroSeqDry> seq_store;
+    MacroSeqDry* seq_dry{}; ///< seq_store while the switch is on, else null
     /// StateDelta blocks would skip the back's write history and first-write trace
     /// (EDEN_NX2_3D_HISTORY, EDEN_NX2_3D_METHODS): off with them.
     bool delta_allowed{};
@@ -1912,6 +1963,8 @@ struct OotFrontContext {
     std::span<const u32> regs;
     EmitFn& emit;
     const char* error{};
+    /// FRITCHII_MACRO_SEQ_DRY: the register reads, as the JIT's read callback records them.
+    std::vector<u64>* reads{};
 
     [[nodiscard]] u32 Count() const {
         return static_cast<u32>(parameters.size());
@@ -1923,7 +1976,11 @@ struct OotFrontContext {
         return dram;
     }
     [[nodiscard]] u32 Read(u32 method) const {
-        return method < regs.size() ? regs[method] : 0U;
+        const u32 value = method < regs.size() ? regs[method] : 0U;
+        if (reads != nullptr) [[unlikely]] {
+            reads->push_back(method | (u64{value} << 32));
+        }
+        return value;
     }
     [[nodiscard]] bool OcclusionHle() const {
         return false;
@@ -2660,6 +2717,9 @@ void Maxwell3D::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& spl
         return;
     }
     FrontWrite(split, fs, method, argument, is_last_call, false);
+    if (fs.seq_dry != nullptr) [[unlikely]] {
+        FrontMacroSeqDirect(fs, method); // FRITCHII_MACRO_SEQ_DRY
+    }
 }
 
 void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split,
@@ -2675,6 +2735,9 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
             FrontRunMacro(system, split, fs);
         }
         return;
+    }
+    if (fs.seq_dry != nullptr && amount != 0) [[unlikely]] {
+        FrontMacroSeqDirect(fs, method); // FRITCHII_MACRO_SEQ_DRY: one token for the run
     }
     // List guard: each word as FrontWrite notes it (the PR's front notes
     // single writes only; a draw.end here would draw from the stale registers).
@@ -3055,6 +3118,15 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
         FrontMacroSameDryBegin(fs, dry_slot);
         dry = fs.same_dry.get();
     }
+    // FRITCHII_MACRO_SEQ_DRY (live, default 0): counts only, nothing skipped.
+    FrontState::MacroSeqDry* seq = nullptr;
+    if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_macro_seq_dry,
+                                         "FRITCHII_MACRO_SEQ_DRY") != 0) [[unlikely]] {
+        FrontMacroSeqCall(fs, method);
+        seq = fs.seq_dry;
+    } else if (fs.seq_dry != nullptr) [[unlikely]] {
+        fs.seq_dry = nullptr; // Off: the command-list paths stop adding
+    }
     {
         VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
         engine.native_interpreter.active_dram = &native_data_ram;
@@ -3077,6 +3149,9 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
                 [[unlikely]] {
                 FrontResolveE2cMode(split, fs);
             }
+            if (seq != nullptr) [[unlikely]] {
+                seq->cur.reads.push_back(address | (u64{fs.regs[address]} << 32));
+            }
             return fs.regs[address];
         };
         const auto emit = [&](u32 address, u32 value) {
@@ -3097,6 +3172,15 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
                 dry->executable |= executable;
                 dry->reads_memory |= address == 0x157 || address == 0x158;
                 dry->unchanged &= !executable && fs.regs[address] == value;
+            }
+            if (seq != nullptr) [[unlikely]] {
+                seq->cur.writes.push_back(address | (u64{value} << 32));
+                if (execution_mask[address]) {
+                    ++seq->executable;
+                } else if (fs.regs[address] == value) {
+                    ++seq->unchanged;
+                }
+                seq->draw |= address == MAXWELL3D_REG_INDEX(draw.end);
             }
             if (predicate && address == MAXWELL3D_REG_INDEX(render_enable.mode)) {
                 FrontWrite(split, fs, MAXWELL3D_REG_INDEX(render_enable.address_high),
@@ -3174,7 +3258,15 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
             static_assert(sizeof(native_data_ram) == OotMacros::DataRamWords * sizeof(u32));
             OotFrontContext<decltype(emit)> context{fs.parameters, native_data_ram.data(),
                                                     std::span<const u32>{fs.regs}, emit};
+            const size_t seq_reads = seq != nullptr ? seq->cur.reads.size() : 0;
+            if (seq != nullptr) [[unlikely]] {
+                context.reads = &seq->cur.reads;
+            }
             handled = OotMacros::Run(oot, context);
+            if (!handled && seq != nullptr) [[unlikely]] {
+                // Declined before any effect: the JIT runs the call and reads again.
+                seq->cur.reads.resize(seq_reads);
+            }
             if (handled) {
                 ++fs.oot_stats.native;
                 if (context.error != nullptr) [[unlikely]] {
@@ -3235,6 +3327,16 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
     fs.e2c_call = false;
     if (dry != nullptr) [[unlikely]] {
         FrontMacroSameDryEnd(fs, dry_slot);
+    }
+    if (seq != nullptr) [[unlikely]] {
+        // The words its MME DMA reads appended to the FIFO are inputs too (game memory).
+        if (fs.parameters.size() > seq->call_params) {
+            seq->cur.args.insert(seq->cur.args.end(), fs.parameters.begin() + seq->call_params,
+                                 fs.parameters.end());
+        }
+        if (seq->draw) {
+            FrontMacroSeqClose(fs);
+        }
     }
     if (fs.e2c_deferred) [[unlikely]] {
         // A deferred read without its 0x556 write (a failed call): the zero words stand, as
@@ -3384,6 +3486,196 @@ void Maxwell3D::FrontMacroSameDryEnd(FrontState& fs, size_t slot) {
     d.slot_calls.fill(0);
     d.slot_held.fill(0);
     d.since = now;
+}
+
+// FRITCHII_MACRO_SEQ_DRY. A run is what the front does between two draws (a draw.end written by a
+// macro or the command list ends it). Its key is the sequence of macro calls (method and
+// parameter count) and command-list writes (method); hashed (FNV-1a), the token lists compared on
+// a hash match. What the next step would need to replay a run instead of running it: the
+// sequence, its arguments, the registers its macros read (handlers and JIT) and the data RAM.
+void Maxwell3D::FrontMacroSeqCall(FrontState& fs, u32 method) {
+    if (!fs.seq_store) [[unlikely]] {
+        fs.seq_store = std::make_unique<FrontState::MacroSeqDry>();
+    }
+    auto& q = *fs.seq_store;
+    if (fs.seq_dry == nullptr) {
+        // Turned on (again): start clean, the run that was open is not known whole.
+        fs.seq_dry = &q;
+        q.cur.tokens.clear();
+        q.cur.args.clear();
+        q.cur.reads.clear();
+        q.cur.writes.clear();
+        q.hash = 0xcbf29ce484222325ULL;
+        q.unchanged = q.executable = q.direct = 0;
+        q.draw = q.open = q.sampled = false;
+    }
+    if (!q.open) {
+        q.open = true;
+        // One run in 16 keeps the start's data RAM (12 KiB a copy).
+        q.sampled = (++q.sample_tick & 15) == 0;
+        if (q.sampled) {
+            q.cur.dram.assign(native_data_ram.begin(), native_data_ram.end());
+        }
+    }
+    const u32 token = (method & 0xffff) | (std::min<u32>(static_cast<u32>(fs.parameters.size()),
+                                                         0x7fff)
+                                           << 16);
+    if (q.cur.tokens.size() < FrontState::MacroSeqDry::TokensMax) {
+        q.cur.tokens.push_back(token);
+        q.hash = (q.hash ^ token) * 0x100000001b3ULL;
+    }
+    q.cur.args.insert(q.cur.args.end(), fs.parameters.begin(), fs.parameters.end());
+    q.call_params = static_cast<u32>(fs.parameters.size());
+}
+
+void Maxwell3D::FrontMacroSeqDirect(FrontState& fs, u32 method) {
+    auto& q = *fs.seq_dry;
+    q.open = true;
+    const u32 token = 0x80000000U | (method & 0xffff);
+    if (q.cur.tokens.size() < FrontState::MacroSeqDry::TokensMax) {
+        q.cur.tokens.push_back(token);
+        q.hash = (q.hash ^ token) * 0x100000001b3ULL;
+    }
+    ++q.direct;
+    if (method == MAXWELL3D_REG_INDEX(draw.end)) {
+        FrontMacroSeqClose(fs);
+    }
+}
+
+void Maxwell3D::FrontMacroSeqClose(FrontState& fs) {
+    auto& q = *fs.seq_dry;
+    auto& cur = q.cur;
+    ++q.runs;
+    q.tokens += cur.tokens.size();
+    q.with_direct += q.direct != 0 ? 1 : 0;
+    q.direct_writes += q.direct;
+    q.writes += cur.writes.size();
+    q.unchanged_writes += q.unchanged;
+    q.executable_writes += q.executable;
+    ++q.counts[q.hash];
+    if (q.cache.size() >= FrontState::MacroSeqDry::CacheMax && !q.cache.contains(q.hash)) {
+        q.cache.clear();
+        ++q.clears;
+    }
+    auto [it, inserted] = q.cache.try_emplace(q.hash);
+    auto& last = it->second;
+    if (!inserted && last.tokens == cur.tokens) {
+        ++q.seen;
+        const bool args = last.args == cur.args;
+        const bool inputs = args && last.reads == cur.reads;
+        const bool same_writes = last.writes == cur.writes;
+        q.args_equal += args ? 1 : 0;
+        q.inputs_equal += inputs ? 1 : 0;
+        q.inputs_same_writes += inputs && same_writes ? 1 : 0;
+        q.writes_equal += same_writes ? 1 : 0;
+        if (last.writes.size() == cur.writes.size()) {
+            for (size_t i = 0; i < cur.writes.size(); ++i) {
+                q.writes_differing += last.writes[i] != cur.writes[i] ? 1 : 0;
+            }
+        } else {
+            q.writes_differing += (std::max)(last.writes.size(), cur.writes.size());
+        }
+        if (q.sampled && last.dram.size() == cur.dram.size() && !cur.dram.empty()) {
+            u64 differing = 0;
+            for (size_t i = 0; i < cur.dram.size(); ++i) {
+                differing += last.dram[i] != cur.dram[i] ? 1 : 0;
+            }
+            ++q.dram_compared;
+            q.dram_equal += differing == 0 ? 1 : 0;
+            q.dram_words_differing += differing;
+        }
+    } else if (!inserted) {
+        last.dram.clear(); // A hash collision: this sequence takes the slot
+    }
+    std::swap(last.tokens, cur.tokens);
+    std::swap(last.args, cur.args);
+    std::swap(last.reads, cur.reads);
+    std::swap(last.writes, cur.writes);
+    if (q.sampled) {
+        std::swap(last.dram, cur.dram); // the newest sampled start of this sequence
+    }
+    cur.tokens.clear();
+    cur.args.clear();
+    cur.reads.clear();
+    cur.writes.clear();
+    q.hash = 0xcbf29ce484222325ULL;
+    q.unchanged = q.executable = q.direct = 0;
+    q.draw = q.open = q.sampled = false;
+
+    if ((q.runs & 0x3ff) != 0) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (q.since == std::chrono::steady_clock::time_point{}) {
+        q.since = now;
+        return;
+    }
+    const double seconds = std::chrono::duration<double>(now - q.since).count();
+    if (seconds < 10.0) {
+        return;
+    }
+    const auto rate = [seconds](u64 count) { return static_cast<double>(count) / seconds; };
+    const auto share = [](u64 part, u64 whole) {
+        return whole != 0 ? 100.0 * static_cast<double>(part) / static_cast<double>(whole) : 0.0;
+    };
+    // Coverage: how many sequences (most frequent first) cover 50, 90, 95, 99% of the runs.
+    std::vector<std::pair<u64, u64>> sorted(q.counts.begin(), q.counts.end());
+    std::ranges::sort(sorted, [](const auto& a, const auto& b) { return a.second > b.second; });
+    std::array<size_t, 4> cover{};
+    constexpr std::array<double, 4> marks{0.50, 0.90, 0.95, 0.99};
+    u64 sum = 0;
+    size_t mark = 0;
+    for (size_t i = 0; i < sorted.size() && mark < marks.size(); ++i) {
+        sum += sorted[i].second;
+        while (mark < marks.size() &&
+               static_cast<double>(sum) >= marks[mark] * static_cast<double>(q.runs)) {
+            cover[mark++] = i + 1;
+        }
+    }
+    // The three most frequent: share, length, and their first tokens.
+    std::string top;
+    for (size_t i = 0; i < 3 && i < sorted.size(); ++i) {
+        std::string tokens;
+        if (const auto found = q.cache.find(sorted[i].first); found != q.cache.end()) {
+            const auto& list = found->second.tokens;
+            for (size_t t = 0; t < list.size() && t < 12; ++t) {
+                const u32 token = list[t];
+                tokens += (token & 0x80000000U) != 0
+                              ? fmt::format(" l{:x}", token & 0xffff)
+                              : fmt::format(" {:x}({})", token & 0xffff, (token >> 16) & 0x7fff);
+            }
+            tokens += fmt::format("{} ({} tokens)", list.size() > 12 ? " ..." : "", list.size());
+        }
+        top += fmt::format("; #{} {:.1f}%:{}", i + 1, share(sorted[i].second, q.runs), tokens);
+    }
+    LOG_INFO(HW_GPU,
+             "Macro sequences (FRITCHII_MACRO_SEQ_DRY, counters only) {:.0f} s: runs (draws) "
+             "{:.0f}/s, {:.1f} tokens a run, {:.1f}% with command-list writes ({:.1f} a run); "
+             "distinct sequences {}, covering 50/90/95/99% of runs: {}/{}/{}/{}; macro writes "
+             "{:.1f} a run, {:.1f}% unchanged state, {:.1f}% executable; vs the last run of the "
+             "same sequence ({:.1f}% of runs): same arguments {:.1f}%, same arguments and "
+             "register reads {:.1f}% (of them same writes {:.1f}%), same writes {:.1f}%, writes "
+             "differing {:.2f} a run; data RAM at the start (1 run in 16) equal {:.1f}% of {} "
+             "({:.1f} words differing a compare); cache clears {}{}",
+             seconds, rate(q.runs), q.runs ? static_cast<double>(q.tokens) / q.runs : 0.0,
+             share(q.with_direct, q.runs),
+             q.runs ? static_cast<double>(q.direct_writes) / q.runs : 0.0, sorted.size(),
+             cover[0], cover[1], cover[2], cover[3],
+             q.runs ? static_cast<double>(q.writes) / q.runs : 0.0,
+             share(q.unchanged_writes, q.writes), share(q.executable_writes, q.writes),
+             share(q.seen, q.runs), share(q.args_equal, q.seen), share(q.inputs_equal, q.seen),
+             share(q.inputs_same_writes, q.inputs_equal), share(q.writes_equal, q.seen),
+             q.seen ? static_cast<double>(q.writes_differing) / q.seen : 0.0,
+             share(q.dram_equal, q.dram_compared), q.dram_compared,
+             q.dram_compared ? static_cast<double>(q.dram_words_differing) / q.dram_compared
+                             : 0.0,
+             q.clears, top);
+    q.counts.clear();
+    q.runs = q.tokens = q.with_direct = q.direct_writes = q.writes = 0;
+    q.unchanged_writes = q.executable_writes = q.seen = q.args_equal = q.inputs_equal = 0;
+    q.inputs_same_writes = q.writes_equal = q.writes_differing = 0;
+    q.dram_compared = q.dram_equal = q.dram_words_differing = q.clears = 0;
+    q.since = now;
 }
 
 // List draws (nx2_list_draw.h): whether the macro at `start` does nothing

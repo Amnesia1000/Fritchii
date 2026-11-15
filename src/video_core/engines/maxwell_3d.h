@@ -3642,6 +3642,12 @@ private:
     /// begins (compared with the slot's last call) and ends (stored, counted, logged).
     void FrontMacroSameDryBegin(FrontState& state, size_t slot);
     void FrontMacroSameDryEnd(FrontState& state, size_t slot);
+    /// FRITCHII_MACRO_SEQ_DRY (fable_b 26.4 lever 1, counters only): a macro call of `method`
+    /// joins the run since the last draw (sets FrontState::seq_dry); a command-list write of
+    /// `method` joins it (a draw.end closes it); the run ends at a draw (compared, counted).
+    void FrontMacroSeqCall(FrontState& state, u32 method);
+    void FrontMacroSeqDirect(FrontState& state, u32 method);
+    void FrontMacroSeqClose(FrontState& state);
     /// Before the front writes render_enable.mode while it is unknown: what stays unknown.
     void FrontNoteE2cModeWrite(VideoCommon::GpuSplit& split, FrontState& state);
     /// Tells the split a report just sent releases a known payload (GpuSplit::NoteRelease).
