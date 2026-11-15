@@ -192,6 +192,8 @@ inline std::atomic<int> g_memstage_run_spin_us{-1};
 inline std::atomic<int> g_memstage_setup_keep{-1};
 /// FRITCHII_FRONT_RAN_READS: docs/fritchii/switches.md.
 inline std::atomic<int> g_front_ran_reads{-1};
+/// FRITCHII_DISPATCH_WALK_SUMMARY: docs/fritchii/switches.md.
+inline std::atomic<int> g_dispatch_walk_summary{-1};
 /// FRITCHII_ACQUIRE_TABLE_FIRST: docs/fritchii/switches.md.
 inline std::atomic<int> g_acquire_table_first{-1};
 /// FRITCHII_E2C_CENSUS: docs/fritchii/switches.md.

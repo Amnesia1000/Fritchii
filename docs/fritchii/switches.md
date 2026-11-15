@@ -573,6 +573,35 @@ makes a stamp newer). It then counts as the scan's miss (the page's checked coun
 - The stamps start over with each split session (positions start at 0).
 - 2 verifies these reads as the others.
 
+### FRITCHII_DISPATCH_WALK_SUMMARY (the "DMA snapshot EXP10 dispatch walk" line)
+
+FRITCHII_DISPATCH_WALK_SUMMARY (live, default 0 = exactly as before; fable_b2 2.4). With EXP10 a
+macro DMA read's page snapshot asks GpuSplit::DispatchesMayWriteSince whether a native dispatch
+sent since may write the page: it walks E's dispatch records from the newest down to the page's
+cursor. With FRITCHII_ONEF_DISPATCH_RANGES the records are bounded, the page's snapshot is never
+renewed by a drain, and each read walked every record made since its page's last read (about
+8,500 records a second at the market, +33 to +38 ms/s of front macro time).
+- 1: after the dispatches since the snapshot ran (the wait or the Queued answer, unchanged), the
+  dispatch stamps answer first (DispatchStampsMissSince: the newest record position per 64 KB
+  block, hashed, and one for the records that cover everything). No stamp at or after the
+  snapshot over the page's block: Miss, the page's cursor moves to the record count loaded before
+  the stamps, no walk. A stamp there: the walk, as with 0.
+- Exact: E raises a record's stamps before it stores the count past it (release), the front loads
+  the count (acquire) before the stamps, so the stamps cover every record below that count. The
+  walk misses when no record at or after the snapshot overlaps the page; the stamps miss only when
+  no such record touches the page's 64 KB block (collisions only make a stamp newer). So a stamp
+  miss is the walk's miss over the same records, or stricter, and nothing is listed either way.
+- 2 (verify): after a stamp miss the walk runs too and its answer is used; a write it finds over
+  the page (a slot the back reused meanwhile excepted) is a disagreement, logged up to 16 times.
+  Must be 0.
+
+"DMA snapshot EXP10 dispatch walk (FRITCHII_DISPATCH_WALK_SUMMARY=n)" (HW_GPU, Info, with the
+EXP10 line every 5 s), per second: records the walks loaded (counted with the switch off too),
+summary misses (reads answered without a walk), summary refusals by a block stamp and by a wide
+stamp; then the session's verify disagreements (must be 0). Expected with 1 at the market:
+records walked near 0, "skipped by ranges" unchanged, the front macro zone back near 134 ns a
+call.
+
 ### FRITCHII_ACQUIRE_MET_BY (the "Acquire resumes met by" line)
 
 FRITCHII_ACQUIRE_MET_BY (live, default 0 since 2026-11-14 = one relaxed load per resume; 1 = the
