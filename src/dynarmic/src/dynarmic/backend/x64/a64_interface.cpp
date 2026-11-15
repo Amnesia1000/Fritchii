@@ -133,7 +133,7 @@ struct CodeDumpHeader {
 };
 struct CodeDumpRecord {
     u16 kind;          ///< 1 block, 2 prelude (dispatcher, handlers, constant pool)
-    u16 flags;         ///< bit 0: far part present
+    u16 flags;         ///< bit 0: far part present, bit 1: chained behind the block before
     u32 guest_count;   ///< guest instruction words that follow
     u64 descriptor;    ///< location descriptor (pc, fpcr, single step)
     u64 guest_pc;      ///< absolute guest pc
@@ -181,7 +181,7 @@ public:
 
     /// After a block was emitted. `get_code` reads its guest words.
     template<typename GetCode>
-    void Record(const IR::Block& block, CodePtr near_addr, size_t near_size, CodePtr far_addr, size_t far_size, GetCode&& get_code) {
+    void Record(const IR::Block& block, CodePtr near_addr, size_t near_size, CodePtr far_addr, size_t far_size, bool chained, GetCode&& get_code) {
         ++sequence;
         const A64::LocationDescriptor location{block.Location()};
         const u64 pc = location.PC();
@@ -190,7 +190,7 @@ public:
         }
         Pending& p = pending.emplace_back();
         p.record.kind = 1;
-        p.record.flags = far_size != 0 ? 1 : 0;
+        p.record.flags = u16((far_size != 0 ? 1 : 0) | (chained ? 2 : 0));
         p.record.descriptor = location.UniqueHash();
         p.record.guest_pc = pc;
         p.record.guest_offset = s64(pc - conf.image_base);
@@ -323,6 +323,10 @@ public:
             if (jit_state.GetUniqueHash() == jit_state.rsb_location_descriptors[new_rsb_ptr]) {
                 jit_state.rsb_ptr = new_rsb_ptr;
                 return CodePtr(jit_state.rsb_codeptrs[new_rsb_ptr]);
+            }
+            // Fritchii (FRITCHII_JIT_CHAIN=1): chained blocks start unaligned.
+            if (emitter.chain_successors) {
+                return GetCurrentBlock();
             }
             return CodePtr((uintptr_t(GetCurrentBlock()) + 15) & ~uintptr_t(15));
         }();
@@ -560,9 +564,52 @@ private:
         const auto bdesc = emitter.Emit(ir_block);
         if (code_dump.Active()) [[unlikely]] {
             code_dump.Record(ir_block, bdesc.entrypoint, bdesc.size, emitter.last_far_entry,
-                             emitter.last_far_size, get_code);
+                             emitter.last_far_size, false, get_code);
+        }
+        if (emitter.chain_successors) {
+            ChainSuccessors(get_code);
         }
         return bdesc.entrypoint;
+    }
+
+    /// Fritchii (FRITCHII_JIT_CHAIN=1): while the block just emitted ends in a link slot to a
+    /// block not compiled yet, that block is compiled right behind it (the slot becomes a nop).
+    /// Only readable code, never a cache clear in between.
+    template<typename GetCode>
+    void ChainSuccessors(const GetCode& get_code) {
+        constexpr size_t MINIMUM_REMAINING_CODESIZE = 1 * 1024 * 1024;
+        for (int depth = 0; depth < A64EmitX64::ChainDepth(); ++depth) {
+            const auto next = emitter.ChainCandidate();
+            if (!next || emitter.GetBasicBlock(*next)) {
+                return;
+            }
+            const auto next_descriptor = A64::LocationDescriptor{*next};
+            if (next_descriptor.SingleStepping() || !get_code(next_descriptor.PC())) {
+                return;
+            }
+            if (block_of_code.SpaceRemaining() < 2 * MINIMUM_REMAINING_CODESIZE) {
+                return;
+            }
+            block_of_code.EnsureMemoryCommitted(MINIMUM_REMAINING_CODESIZE);
+            ir_block.Reset(next_descriptor);
+            try {
+                A64::Translate(ir_block, next_descriptor, get_code, {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
+                Optimization::Optimize(ir_block, conf, polyfill_options);
+            } catch (const std::exception& error) {
+                ::Common::Log::FmtCrashMessage(__FILE__, __LINE__, __func__,
+                                               "JIT translate of chained {:#x} (core {}) threw: {}",
+                                               next_descriptor.PC(), conf.processor_id, error.what());
+                std::abort();
+            }
+            if (conf.counters) {
+                ++conf.counters->blocks_compiled;
+            }
+            const auto bdesc = emitter.Emit(ir_block, true);
+            if (code_dump.Active()) [[unlikely]] {
+                code_dump.Record(ir_block, bdesc.entrypoint, bdesc.size, emitter.last_far_entry,
+                                 emitter.last_far_size, true, get_code);
+            }
+        }
     }
 
     void PerformRequestedCacheInvalidation(HaltReason hr) {

@@ -49,7 +49,9 @@ public:
 
     /// Emit host machine code for a basic block with intermediate representation `block`.
     /// @note block is modified.
-    BlockDescriptor Emit(IR::Block& block) noexcept;
+    /// Fritchii: `chained` (FRITCHII_JIT_CHAIN=1) emits it right at the current position,
+    /// unaligned, as the block before it links to it there.
+    BlockDescriptor Emit(IR::Block& block, bool chained = false) noexcept;
 
     void ClearCache() override;
 
@@ -195,6 +197,38 @@ public:
     /// The last emitted block's far part (nullptr / 0 when it had none), for the code dump.
     CodePtr last_far_entry = nullptr;
     size_t last_far_size = 0;
+
+    /// Fritchii: FRITCHII_JIT_CHAIN (boot, bits, default 0; Fable A 2.2). Off with cycle counting.
+    /// 4 = compact links: a direct link is one 5-byte jump (to the block, or to a far stub that
+    ///     stores the pc and goes to the dispatcher; a nop when the block follows right behind);
+    ///     a checked link is `cmp halt, 0; jne <far halt stub>; <slot>`. Needs FAR_CODE.
+    /// 2 = halt check only on direct links that go back (target pc <= block start pc), including
+    ///     B/BL links that have none today; indirect branches and returns gain one. Between two
+    ///     checks only forward links run, so a run without a check is bounded.
+    /// 1 = chain: a block's last link target, when not compiled yet, is compiled right behind it
+    ///     (FRITCHII_JIT_CHAIN_DEPTH blocks deep, default 4), so the link becomes a nop; If and
+    ///     CheckBit put the fall-through leaf last. Needs FAR_CODE, implies 4.
+    static int ChainBits();
+    static int ChainDepth();
+    bool compact_links = false;
+    bool backward_halt_checks = false;
+    bool chain_successors = false;
+    /// Far stubs per link target (cleared with the cache): store the pc, then to the dispatcher /
+    /// out of the run (halt).
+    ::Common::unordered_map<u64, CodePtr> link_stubs;
+    ::Common::unordered_map<u64, CodePtr> halt_stubs;
+    CodePtr LinkStub(const IR::LocationDescriptor& target);
+    CodePtr HaltStub(const IR::LocationDescriptor& target);
+    /// A direct link with the Fritchii shapes (compact and/or backward-only check).
+    void EmitFritchiiLink(const IR::LocationDescriptor& target, IR::LocationDescriptor initial_location, bool checked_by_default);
+    /// The block being emitted ends here (its fall-through successor).
+    IR::LocationDescriptor current_end_location{0};
+    /// The last compact slot emitted and where it ends: the block to chain, when it is the last
+    /// thing in the block.
+    std::optional<IR::LocationDescriptor> chain_target;
+    CodePtr chain_slot_end = nullptr;
+    /// The block to compile right behind the last one (chain), if any.
+    std::optional<IR::LocationDescriptor> ChainCandidate() const;
 
     A64::Jit* jit_interface = nullptr;
     void (*memory_read_128)() = nullptr;
