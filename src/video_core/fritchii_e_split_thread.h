@@ -68,8 +68,38 @@ class RasterizerInterface;
 /// give each thread's CPU time per second against its busy time (a spinning thread reads about
 /// 1,000 ms/s: E1 must stay under its busy share + 5%).
 ///
+/// S4, FRITCHII_ESPLIT_CB_ASYNC (live, default 0; with DEPTH > 0): constant buffer words in two
+/// halves. E1 runs the entry itself (the register half: CB_DATA, the shadow RAM, the dirty flags,
+/// a deferred draw the first word issues, the offset advance) and hands the memory half (EXP107's
+/// compare, the bound buffer or CB_DIRECT write, the invalidation, the stream-write guard, the
+/// memory stage's stats) to E2 as a record in ring order with no wait: the words' values and
+/// where they land (CbTarget) by value, several writes to a record. Writes onto texture or shader
+/// pages or E's pools, across a GPU page, on Switch 2 sparse memory, unmapped, too long for a
+/// record, or with the fast draw count or the price timers on, run on E1 in a join instead
+/// (counted by cause). Off (and in S1): E1's own constant buffer writes outside a join (a back
+/// macro's) are joins too. The .cpp's S4 section has the ordering argument. Checks (must be 0):
+/// ESplitCbOrder (E2 applied a cb write out of order), ESplitCbBytes (1 cb write in 64: memory
+/// read back after E2's write differs from the words), ESplitCbGuard (E2's stream-write guard
+/// found tracked pages E1 found clear), ESplitCbRead (E1 read game memory outside a join with cb
+/// writes queued).
+///
 /// FRITCHII_ESPLIT=0: nothing starts; each hand-over site pays one load and a branch (g_thread).
 namespace VideoCommon::ESplit {
+
+/// Where constant buffer words land, by value (Maxwell3D::FillConstantWordsTarget): the memory
+/// half (Maxwell3D::WriteConstantWords) reads only this, so it can run after E1 moved on.
+struct CbTarget {
+    u64 address;  ///< CB_ADDRESS
+    u64 tic;      ///< the texture header pool (EXP107's alias check; with `pools`)
+    u64 tic_size;
+    u64 tsc;      ///< the sampler pool
+    u64 tsc_size;
+    u32 size;     ///< CB_SIZE
+    u32 offset;   ///< the offset before the words
+    bool count_fast_draw; ///< EDEN_NX2_FASTDRAW_COUNT on (its notes read the registers)
+    bool pools;           ///< the pools above are filled (the thread on); else read them then
+    bool may_defer;       ///< nothing but this target is read (no fast draw count, no price timers)
+};
 
 struct View;
 
@@ -80,7 +110,7 @@ enum class Hand : u8 {
     DrawTail, ///< a draw's FillRing, R packet push and TickWork
     Bind,     ///< a constant buffer bind's buffer cache half, by value
     Store,    ///< S2: GpuSplit::StoreConsumed at E2's place
-    CbWrite,  ///< S2: a constant buffer write's memory half, by value (Maxwell3D)
+    CbWords,  ///< S4: constant buffer words' memory half, by value (several writes a record)
     Count,
 };
 
@@ -92,11 +122,11 @@ enum class Join : u8 {
     Idle,      ///< the idle hook and the fence check (E's idle work)
     Push,      ///< S2: E1 lends or pushes to R (R's packet queue has one producer)
     Lockstep,  ///< S2: a hand-over that waits (none in the queued mode)
-    Lookup,    ///< S2: E1's lookup after a write onto shader pages (E2 drained, flushed first)
-    Flush,     ///< S2: the draw's flush, E2 idle (E1 runs it)
-    Tail,      ///< S2: a draw tail that cannot go async (E1 runs it)
-    Seed,      ///< S2: E2's view seeded (first draw, channel switch; E1 seeds it)
-    Guarded,   ///< S2: a constant buffer write onto texture, shader or pool pages (E1 runs it)
+    CbWrite,   ///< S4: a constant buffer write E1 makes itself (not async, or a read-back after)
+    Lookup,    ///< E1's lookup after a write onto shader pages (E2 drained, flushed first)
+    Flush,     ///< the draw's flush in the queued mode, run by E1 (E2 idle or drained)
+    Tail,      ///< a draw tail that cannot go async in the queued mode (E1 runs it)
+    Seed,      ///< E2's view seeded in the queued mode (first draw, channel switch; by E1)
     Count,
 };
 
@@ -104,8 +134,12 @@ enum class Join : u8 {
 inline bool g_thread{};
 /// S2: FRITCHII_ESPLIT_DEPTH > 0 (E1 writes it at a batch's start with E2 drained).
 inline bool g_async{};
+/// S4: FRITCHII_ESPLIT_CB_ASYNC on while async (E1 writes it at a batch's start).
+inline bool g_cb_async{};
 /// 1 on E1, 2 on E2.
 inline thread_local u8 t_role{};
+/// E2 inside an async constant buffer record (OneFollower::GuardStreamWrite asks).
+inline thread_local bool t_async_cb{};
 /// E1 inside a join (it runs E2-owned work itself).
 inline thread_local u32 t_join{};
 
@@ -129,20 +163,12 @@ void ThreadBatch() noexcept;
 [[nodiscard]] inline bool ShouldHand() noexcept {
     return g_thread && t_role == 1 && t_join == 0;
 }
-/// The queued mode: E1 appends E2's work here instead of waiting for it.
-[[nodiscard]] inline bool QueueMemoryWork() noexcept {
-    return g_async && t_role == 1 && t_join == 0;
-}
-/// E2 runs a queued write E1 already checked against the stream write guard (its pages are
-/// neither R's texture or pool pages nor shader pages): GuardStreamWrite returns at once.
-inline thread_local bool t_skip_guard{};
 /// E1 inside its pipeline lookup (LookupScope): the lookup's shader code reads are allowed.
 inline thread_local bool t_lookup{};
-/// A write onto shader pages since E1's last lookup flush (any thread sets it): the next lookup
-/// drains E2 and flushes first (a join), so the lookup reads the new code.
+/// A write onto shader pages since E1's last lookup flush (GuardStreamWrite's hit, any thread):
+/// the next lookup drains E2 and flushes first (a join), so the lookup reads the new code. (S4's
+/// owed rule flushes before the lookup after such work anyway; this is the belt to it.)
 inline std::atomic<bool> g_shader_pending{};
-/// A constant buffer write E1 will run itself (guarded pages; `shader`: shader pages among them).
-void NoteGuardedWrite(bool shader) noexcept;
 
 void BeginLookupImpl() noexcept;
 /// Around E1's pipeline lookup (FillAndPush, rule 3): drains and flushes first when a shader page
@@ -247,12 +273,25 @@ inline void SafePoint() noexcept {
     return !g_async || E2Idle();
 }
 
+/// Where E1 puts a draw's flush (OneFollowerDraw::FillAndPush).
+enum class FlushAt : u8 {
+    Before,  ///< E2 idle: before the lookup, a lockstep hand-over when it has work (today's)
+    Drained, ///< owed with E2 behind: E2 drains, flushes (when it has work), then the lookup
+    Tail,    ///< at the head of the draw's tail on E2, after E1's lookup
+};
+/// S2/S4: a flush is owed (must run before the lookup) after any work that may write game memory
+/// other than queued constant buffer writes (on no shader page, by E1's test): a lockstep
+/// hand-over, a join, E1's push or lend, an E2 lend that held E1. Not owed: Tail when E2 is
+/// behind, or always with FRITCHII_ESPLIT_FLUSH_ASYNC. The lookup reads shader code and the
+/// pipeline cache only, which a not-owed flush cannot change.
+[[nodiscard]] FlushAt FlushPlace() noexcept;
+
 /// E1, S2: a slot for an async hand-over. `packet`: room for OneFollower::PackedDrawRoom().
 struct AsyncSlot {
     void* payload;
     u8* packet;
 };
-inline constexpr std::size_t AsyncPayloadBytes = 320;
+inline constexpr std::size_t AsyncPayloadBytes = 192;
 /// E1: an async draw tail can go now (record ready); waits for depth room, builds the record
 /// (taking the engine's buffer flags) and samples the hash. False: hand it over in lockstep.
 [[nodiscard]] bool BeginAsyncDraw(Tegra::Engines::Maxwell3D& engine, bool list_args,
@@ -263,6 +302,9 @@ void PostAsync(void (*function)(void*)) noexcept;
 [[nodiscard]] void* BeginAsync(Hand hand) noexcept;
 /// E1: a draw tail stayed with E1 (0: no async fit, 3: S1 lockstep), counted.
 void NoteTailStayed(int reason) noexcept;
+/// E2 in the queued mode: E2's view's buffer flags (Maxwell3D::DirtyState::Flags) when `engine` is
+/// the view's, else null (CacheInputs' constructor sends the cache's flag marks there).
+[[nodiscard]] void* E2FlagsFor(const Tegra::Engines::Maxwell3D* engine) noexcept;
 /// E2: the running job is async (its fill reads only the view and keeps the flags there).
 [[nodiscard]] bool FillAsync() noexcept;
 /// E2, async fill: the repack layout raised `flag` (VertexInput) for E1's engine; E1 raises it
@@ -300,6 +342,31 @@ private:
     bool lend;
     bool acted{};
 };
+
+// --- S4: constant buffer words (FRITCHII_ESPLIT_CB_ASYNC) -------------------------------------------
+
+/// Maxwell3D's constant buffer write on E1 outside a join (thread on): queued for E2 or run in a
+/// join; E2's view gets the offset in E1's next record. True: done, the caller only advances the
+/// offset. False (E2, a join, the thread off): the caller writes as today.
+[[nodiscard]] bool CbWriteImpl(Tegra::Engines::Maxwell3D& engine, const CbTarget& target,
+                               const u32* values, u32 bytes, bool block) noexcept;
+[[nodiscard]] inline bool CbWrite(Tegra::Engines::Maxwell3D& engine, const CbTarget& target,
+                                  const u32* values, u32 bytes, bool block) noexcept {
+    if (t_role == 1 && t_join == 0 && g_thread) [[unlikely]] {
+        return CbWriteImpl(engine, target, values, bytes, block);
+    }
+    return false;
+}
+/// GpuSplit::BackLoop: a constant buffer entry E1 runs itself (its writes queued for E2).
+[[nodiscard]] inline bool CbEntryOnE1() noexcept {
+    return g_cb_async && t_role == 1 && t_join == 0;
+}
+/// E1: the open constant buffer record goes to E2 now. Also done before any other hand-over,
+/// drain, join, push or wait of E1's, so nothing E1 or the front does later can pass it.
+void PostCbWrites() noexcept;
+/// E2's stream-write guard found tracked pages in an async constant buffer record
+/// (ESplitCbGuard, must be 0: E1 found them clear when it queued the write).
+void NoteCbGuardHit() noexcept;
 
 // --- E1Touch ---------------------------------------------------------------------------------------
 

@@ -9,6 +9,7 @@
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/fritchii_e_split_thread.h"
 #include "video_core/memory_manager.h"
 
 namespace VideoCommon {
@@ -46,7 +47,17 @@ public:
           root_tables{maxwell3d_ ? &maxwell3d_->root_tables : nullptr},
           draw_state{maxwell3d_ ? &maxwell3d_->draw_manager.draw_state : nullptr},
           flags{maxwell3d_ ? &maxwell3d_->dirty.flags : nullptr}, kepler_compute{kepler_compute_},
-          gpu_memory{gpu_memory_}, draw_indirect{draw_indirect_} {}
+          gpu_memory{gpu_memory_}, draw_indirect{draw_indirect_} {
+        // FRITCHII_ESPLIT's queued mode, on E2: the buffer flags of E1's engine are E2's view's
+        // (fritchii_e_split_thread.h), and E1 writes that engine meanwhile. A mark outside a fill
+        // (the scrub of a deleted buffer's bindings, BufferCache::DeleteBuffer through
+        // CacheInputs::Of) goes to the view's flags then, never to E1's engine.
+        if (ESplit::g_async && maxwell3d_ != nullptr) [[unlikely]] {
+            if (void* const view_flags = ESplit::E2FlagsFor(maxwell3d_)) {
+                flags = static_cast<DirtyFlags*>(view_flags);
+            }
+        }
+    }
 
     /// The inputs from the memory stage's copy of `maxwell3d_` (memstage_shadow.cpp). The engine
     /// itself still answers NativeTuring (fixed when its channel is made).

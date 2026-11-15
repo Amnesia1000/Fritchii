@@ -559,6 +559,10 @@ void VerifyView(const RegisterView& view, const Maxwell3D& engine);
 /// E, at a draw: true once after StreamWriteHits returned true (that draw is lent with
 /// LentReason::StreamWrite). Implemented beside StreamWriteHits.
 [[nodiscard]] bool TakeStreamWriteLend() noexcept;
+/// E (FRITCHII_ESPLIT_CB_ASYNC's E1): true when a game memory write at [address, address + size)
+/// lands on no page the stream-write guard acts on (texture or shader pages, E's pools), so it
+/// can wait in E2's queue. False also when the filters are not set.
+[[nodiscard]] bool StreamPagesClear(DAddr address, u64 size) noexcept;
 
 // --- R's draws (part c: renderer_vulkan/vk_one_follower_draw.cpp, one_follower_draw.cpp) ----------
 
@@ -1027,9 +1031,6 @@ void SetUnionPages(const PageFilter* filter) noexcept;
 /// texture page they are counted (StreamWritesOnTexturePages, informational at every step), and
 /// with R behind (step 4) Check::StreamWrite is counted and E drains R before the write lands.
 void GuardStreamWrite(DAddr address, u64 size) noexcept;
-/// FRITCHII_ESPLIT's queued mode, E1: whether GuardStreamWrite would act on this write (texture,
-/// shader or pool pages); `shader`: shader pages among them. Such writes stay with E1 (a join).
-[[nodiscard]] bool StreamWriteGuarded(DAddr address, u64 size, bool& shader) noexcept;
 /// Writes that landed on texture pages, any step (section 7's run 4 number; not a must-be-0).
 [[nodiscard]] u64 StreamWritesOnTexturePages() noexcept;
 

@@ -2180,18 +2180,18 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   nothing starts; a hand-over site pays one load and a branch.
 - FRITCHII_ESPLIT_DEPTH (live, default 16 = the queued mode; with FRITCHII_ESPLIT=1, step S2;
   0 = S1's lockstep, kept for the checks; capped at 48): E1 never waits per piece of work. It
-  appends records to E2's queue and goes on, up to N draw tails ahead: each constant buffer
-  write's memory half by value (Maxwell3D::CallConstBufferWords: the register half, the dirty
-  flags and the write offset stay on E1; the queued half carries the selection, the offset, the
-  words and the texture/sampler pool ranges), each bind's buffer cache half by value, each draw
-  tail with its record and R's packed packet, the `consumed` stores. E2 drains the queue on its
-  own and sleeps only when it is empty (E1 wakes it only then). E1 waits only at a real join:
-  another E2 entry (reports, sync points, wait for idle, barriers, compute, cache calls, multi
-  writes, a word with a segment: E1 runs it itself once E2 drained), a constant buffer write onto
-  guarded pages (R's texture or pool pages, shader pages: OneFollower::StreamWriteGuarded, E1
-  runs it), the draw's flush when E2 is idle (E1 runs it), a draw tail that cannot go async (E1
-  runs it), a seed of E2's view (first draw, channel switch; E1 seeds it), a lend or push to R, a
-  memory decision, a condition from memory, E's idle work. An async tail needs rule 3's
+  appends records to E2's queue and goes on, up to N draw tails ahead: constant buffer writes'
+  memory halves (S4, FRITCHII_ESPLIT_CB_ASYNC, on by default here: several writes a record, the
+  register half on E1), each bind's buffer cache half by value, each draw tail with its record and
+  R's packed packet, the `consumed` stores. E2 drains the queue on its own and sleeps only when it
+  is empty (E1 wakes it only then). E1 waits only at a real join: another E2 entry (reports, sync
+  points, wait for idle, barriers, compute, cache calls: E1 runs it itself once E2 drained), a
+  constant buffer write S4 keeps on E1 (texture, shader or pool pages and its other causes), the
+  draw's flush when E2 is idle or the flush is owed (S4's FlushPlace; E1 runs it, no round trip),
+  a draw tail that cannot go async (E1 runs it), a seed of E2's view (first draw, channel switch;
+  E1 seeds it), a lend or push to R, a memory decision, a condition from memory, E's idle work.
+  On E2 the buffer cache's flag marks outside a fill (a deleted buffer's scrub through
+  CacheInputs::Of) go to E2's view, never to E1's engine (CacheInputs' constructor). An async tail needs rule 3's
   pipeline, no texel buffers, ring B by value, no memory stage marks ahead, no inline index bytes
   (the GPU profile's price timers are skipped in an async fill, the handle program keep reads the
   view's bindings). E1's lookup reads shader code from game memory: allowed (counted) unless a
@@ -2215,6 +2215,42 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   async draws a second and how far ahead they were posted, E2 lends that held E1 (E2's wait for
   E1 to park, E1's held time), ring B room waits. Step in only after S1's checks read 0. Gate 2:
   DEPTH 0 against N, 2 cycles: max(E1, E2 busy) must drop >= 70% of the dry net.
+- FRITCHII_ESPLIT_CB_ASYNC (live, default 1 = on in the queued mode, 0 = every write a join; with
+  FRITCHII_ESPLIT=1 and FRITCHII_ESPLIT_DEPTH > 0,
+  step S4): 1 = constant buffer words without a wait. E1 runs a 3D constant buffer entry (single
+  words, a words block, a multi write) itself: the register half (CB_DATA through the shadow RAM,
+  the dirty flags, a deferred draw the first word issues, the offset advance). The memory half
+  (EXP107's compare, the bound buffer or CB_DIRECT write, the invalidation, the stream-write
+  guard, the memory stage's stats; Maxwell3D::WriteConstantWords) goes into a record by value
+  (where the words land: CB_ADDRESS, CB_SIZE, the offset, the texture and sampler pools; the
+  words after the shadow RAM), several writes to a record, posted to E2 in ring order before any
+  other hand-over, drain, join, push or wait of E1's, at a batch's end or when 4 KiB are full.
+  A write goes to a join on E1 instead when it lands on texture or shader pages or E's pools (the
+  stream-write guard must act at today's place), crosses a GPU page, is on Switch 2 sparse
+  memory, is unmapped, does not fit a record, or the fast draw count or the price timers are on;
+  also with the switch off (and in S1) for E1's own constant buffer writes outside a join (a back
+  macro's). The words-block verify (FRITCHII_CB_WORDS_BLOCK=2) and EDEN_NX2_PERF_VERIFY's
+  read-back run in a join. E2's view takes the offset from E1's next record. The ordering
+  argument is in fritchii_e_split_thread.cpp ("S4"). A draw's flush is owed (before E1's lookup,
+  E2 drained first when it is behind) when anything but a queued constant buffer write left
+  cached writes since the last one (a lockstep hand-over, a join, E1's push or lend, an E2 lend
+  that held E1: counted with MemoryManager::CachedWriteCount); a flush in an async tail marks E2's
+  buffer flags (the view), not E1's engine. Line every 10 s, "E split thread 10 s: cb words
+  (FRITCHII_ESPLIT_CB_ASYNC=N)": queued writes and records a second, KiB a second, writes in joins
+  by cause; checks (must be 0): ESplitCbOrder (E2 applied a cb write out of E1's order),
+  ESplitCbBytes (1 queued write in 64 read back after E2 wrote it: differs from the words),
+  ESplitCbGuard (E2's stream-write guard found texture or shader pages E1 found clear; R is
+  drained, the next draw's lend is not asked for), ESplitCbRead (E1 read game memory outside a
+  join with cb writes queued; also counted in E1Touch), ESplitAsyncWrite (an async draw tail, bind
+  or store left cached writes: the not-owed flush counts on none); then the draw flushes a second
+  before the lookup, owed and in the tail. Step in after DEPTH N reads its checks 0: CB_ASYNC 0
+  against 1 with DEPTH N, 2 cycles; E1's thread metric (E2 busy and E1 busy) must move by the cb
+  words' share (S0's "constant buffer words" ms/s).
+- FRITCHII_ESPLIT_FLUSH_ASYNC (live, default 0; with FRITCHII_ESPLIT_DEPTH > 0, step S4): 1 = a
+  draw's flush that is not owed (above) goes to the head of the draw's tail on E2 even when E2 is
+  idle, so E1 does not wait for it before the lookup. Exact for the same reason the tail flush
+  with E2 behind is: what it invalidates is on no shader page, and the lookup reads shader code
+  and the pipeline cache only. Counted in the cb words line ("draw flushes").
 - FRITCHII_ESPLIT_PIN (boot, default 0; with FRITCHII_ESPLIT=1, step S3): where E1 and E2 run.
   0 = E1 keeps E's pinned core (PinnedRole::GpuBack), E2 on the performance cores; 1 = E2 on E's
   old core, E1 unpinned on the performance cores; 2 = E's core split by SMT sibling (E2 one
