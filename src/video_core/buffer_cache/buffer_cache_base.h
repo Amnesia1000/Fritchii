@@ -1388,7 +1388,7 @@ private:
 
     /// Experiment, EDEN_NX2_WRITTEN_SSBO_MARK_KIB=<n>: marks at most n KiB of a written Switch 2
     /// storage buffer binding GPU-written. Native pointers carry no size, so a written binding
-    /// spans up to 8 MiB of its mapping and arms read traps and fence downloads over CPU data
+    /// spans up to 16 MiB of its mapping and arms read traps and fence downloads over CPU data
     /// the shader never writes. Writes past the cap are not tracked, so this only measures how
     /// much of the marked range the GPU really writes.
     u32 WrittenStorageMarkSize(u32 size) const {

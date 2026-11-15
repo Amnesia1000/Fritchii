@@ -1338,6 +1338,21 @@ vertex programs join their handle programs. Read once, on first use (PipelineCac
 constructor, after nx2_switches.txt is applied): it changes what shaders translate to, so it
 is not live. Off, translation and binding are exactly what they were before the port.
 
+### FRITCHII_BARE_SSBO_MIB
+
+FRITCHII_BARE_SSBO_MIB=<n> (live, default 16; EDEN_NX2_BARE_SSBO_MIB, CheezyEmu's name, is read
+when it is unset): how far a storage binding of a bare pointer (a Switch 2 program's pointer,
+no size word after it) reaches past the pointer, in MiB, 8 to 1024 (0 or 8 = the old 8 MiB
+cap). Written bindings stop at 16 MiB at most. OoT's light/decal cluster list is mapped about
+9.5 MiB past its pointer: a compute program writes it and the water and the mist over it read
+it, so at 8 MiB the far entries were never written and read zero or old values (stair-stepped
+tiles around Link in water, waterfalls and river mist). Port of CheezyEmu 6aaf9f243f and
+5532ec295e (CheezerWheezer). The first 24 different bindings the old cap cuts are logged
+("Bare compute/graphics storage binding at ...: mapping ..., bound ..."). Cost: read-only
+bindings past 8 MiB synchronize up to twice the range per bind (clean ranges are skipped by
+EDEN_NX2_STORAGE_SYNC_MEMO); a written graphics binding is marked GPU-modified in full; a
+written compute binding only over its proven write extent. Measure 8 vs 16 live.
+
 ### FRITCHII_MEMSTAGE_SPLIT_ALLOC
 
 FRITCHII_MEMSTAGE_SPLIT_ALLOC (boot, default on, =0 off; Fable's ideal pipeline design 2.4,

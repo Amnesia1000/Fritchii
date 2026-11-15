@@ -1081,7 +1081,7 @@ bool MemoryManager::IsMemoryDirty(GPUVAddr gpu_addr, size_t size,
 }
 
 size_t MemoryManager::MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const {
-    // Native storage buffers ask this for up to 8 MiB on each bind, and table pointers for up to
+    // Native storage buffers ask this for up to 16 MiB on each bind, and table pointers for up to
     // 64 MiB, tens of thousands of times a second (13-17% of the GPU back thread walking pages):
     // keep answers per thread until the page table changes. Keyed by address only: an answer
     // for a size holds for any smaller size, as the run length capped at it.

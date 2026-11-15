@@ -458,6 +458,20 @@ inline std::atomic<int> g_esplit_flush_async{-1};
 /// into E2's records, same-value binds in a record dropped; 2 = verify; 3 = dry count
 /// (fritchii_e_split_thread.h).
 inline std::atomic<int> g_esplit_bind_batch{-1};
+/// FRITCHII_BARE_SSBO_MIB (live, default 16; EDEN_NX2_BARE_SSBO_MIB is read when it is unset):
+/// how far a storage binding of a bare pointer (no size word) reaches, in MiB, 8 to 1024. 8 (or
+/// 0) is the old cap. Written bindings stop at 16 at most. docs/fritchii/switches.md.
+inline std::atomic<int> g_bare_ssbo_mib{-1};
+/// The bare pointer reach in bytes (FRITCHII_BARE_SSBO_MIB).
+[[nodiscard]] inline u32 BareStorageReach() {
+    int mib = g_bare_ssbo_mib.load(std::memory_order_relaxed);
+    if (mib < 0) [[unlikely]] {
+        const char* const alias = std::getenv("EDEN_NX2_BARE_SSBO_MIB");
+        mib = SwitchValue(g_bare_ssbo_mib, "FRITCHII_BARE_SSBO_MIB",
+                          alias != nullptr ? std::atoi(alias) : 16);
+    }
+    return static_cast<u32>(mib < 8 ? 8 : (mib > 1024 ? 1024 : mib)) << 20;
+}
 /// EDEN_NX2_LIGHT_TABLE_ARRAYS: docs/fritchii/switches.md.
 [[nodiscard]] inline bool LightTableArrays() {
     static const bool on = EnvSwitch("EDEN_NX2_LIGHT_TABLE_ARRAYS") > 0;

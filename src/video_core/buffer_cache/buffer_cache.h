@@ -1915,8 +1915,9 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
     }
 
     // How much of the binding the dispatch marks GPU-written. A native pointer has no size, so the
-    // binding is up to 8 MiB past it, and marking all of it defers the CPU's later writes to those
-    // pages until the next fence and has fences copy the over-marked range back.
+    // binding is up to 16 MiB past it (FRITCHII_BARE_SSBO_MIB), and marking all of it defers the
+    // CPU's later writes to those pages until the next fence and has fences copy the over-marked
+    // range back.
     u64 mark = binding.size;
     // EDEN_NX2_EXP1=1: mark the whole binding as before (the original A/B).
     if (native_pointer && is_written && binding.size != 0 &&
@@ -5155,7 +5156,7 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
         MemStageStats::Read(MemStageStats::Kind::CStorage, binding.size);
         const bool is_written =
             ((channel_state->written_compute_storage_buffers >> index) & 1) != 0;
-        // A native program's binding is min(layout, 8 MiB) because its pointer has no size, and
+        // A native program's binding is min(layout, 16 MiB) because its pointer has no size, and
         // marking all of it GPU-written defers the CPU's later writes to those pages. Mark only
         // what BindComputeStorageBuffer worked out the dispatch can write; the binding keeps its
         // size so the shader can still read all of it.
@@ -7697,7 +7698,8 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
     }
 
     // The size word after a plain pointer is part of the answer; a read-only native compute
-    // pointer reads it too (a size word past 8 MiB grows the binding). Pool pointers ignore it.
+    // pointer reads it too (a size word past the bare reach grows the binding). Pool pointers
+    // ignore it.
     const bool reads_size_word =
         !(table_pointer && !is_written) && (!native_pointer || (compute && !is_written));
     const u64 next_qword = reads_size_word ? Inputs().ReadGameU64(ssbo_addr + 8) : 0;
@@ -7718,8 +7720,10 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
     };
     constexpr size_t Ways = 4;
     thread_local std::array<std::array<CachedBinding, Ways>, 512> binding_cache{};
-    const u32 flags =
-        (is_written ? 1U : 0U) | (native_pointer ? 2U : 0U) | (table_pointer ? 4U : 0U);
+    // FRITCHII_BARE_SSBO_MIB is live: its reach is part of the answer's key (MiB, from bit 3).
+    const u32 bare_reach = native_pointer ? VideoCore::Nx2Debug::BareStorageReach() : 0;
+    const u32 flags = (is_written ? 1U : 0U) | (native_pointer ? 2U : 0U) |
+                      (table_pointer ? 4U : 0U) | ((bare_reach >> 20) << 3);
     const size_t owner = gpu_memory->GetID() + 1;
     const u64 serial = gpu_memory->MapSerial();
     auto& set = binding_cache[((gpu_addr ^ next_qword ^ flags) * 0x9E3779B97F4A7C15ULL) >> 55];
@@ -7761,7 +7765,37 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
             // parameter (a dimension, stride or texture handle), not an NVN buffer size. Taking it
             // as one bound Fortune's Weave's DLSS input features to 266 bytes and dropped the rest.
             if (native_pointer) {
-                const u32 bare = (std::min)(memory_layout_size, static_cast<u32>(8_MiB));
+                // A bare pointer reaches FRITCHII_BARE_SSBO_MIB (16 MiB by default; 8 before).
+                // OoT's light/decal cluster list is mapped about 9.5 MiB past its pointer: a
+                // compute program writes it, and the water and the mist over it read it. Capped at
+                // 8 MiB the writes past the cap were dropped and the reads past it got zero or old
+                // entries (the console has no bounds there): stair-stepped tiles around Link in
+                // water, waterfalls and river mist. Written bindings stop at 16 MiB at most (a
+                // written graphics binding is marked GPU-modified in full); the object pools mapped
+                // ~83 MiB past their pointers stay cut at the reach.
+                const u32 cap =
+                    is_written ? (std::min)(bare_reach, static_cast<u32>(16_MiB)) : bare_reach;
+                const u32 bare = (std::min)({memory_layout_size, cap, limit});
+                if (memory_layout_size > 8_MiB) {
+                    // The first 24 different bindings the old 8 MiB cap cuts, for the switch's A/B.
+                    static std::atomic<bool> log_full{};
+                    if (!log_full.load(std::memory_order_relaxed)) [[unlikely]] {
+                        static std::mutex log_mutex;
+                        static std::vector<std::pair<GPUVAddr, u32>> logged;
+                        std::scoped_lock lock{log_mutex};
+                        const std::pair entry{gpu_addr, flags};
+                        if (logged.size() < 24 && std::ranges::find(logged, entry) == logged.end()) {
+                            logged.push_back(entry);
+                            log_full.store(logged.size() >= 24, std::memory_order_relaxed);
+                            LOG_INFO(HW_GPU,
+                                     "Bare {} storage binding at {:#x} ({}): mapping {:#x} bytes, "
+                                     "bound {:#x} (FRITCHII_BARE_SSBO_MIB={})",
+                                     compute ? "compute" : "graphics", gpu_addr,
+                                     is_written ? "written" : "read-only", memory_layout_size, bare,
+                                     bare_reach >> 20);
+                        }
+                    }
+                }
                 // Mario Kart World's lighting passes read past 8 MiB from theirs, inside the size
                 // word after the pointer (a ported change reads it): capped at 8 MiB those reads
                 // came back zero and lit land and characters too dark. A read-only compute binding
