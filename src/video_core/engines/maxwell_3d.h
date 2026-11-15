@@ -3624,9 +3624,17 @@ private:
     /// EDEN_NX2_OOT_MACROS, EDEN_NX2_FOLD_INSTANCE and EDEN_NX2_DRAW_PACKET. FrontState's
     /// macro_features picks one; FrontRefreshSwitches sets it from the live switches.
     void FrontRunMacroPlain(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
-    void FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSplit& split,
-                               FrontState& state);
+    /// The features body; Lean (FRITCHII_FRONT_CALL_LEAN) takes the per-call switches kept in the
+    /// front state and the call's words where they are (fable_b 27.2 B).
+    template <bool Lean>
+    void FrontRunMacroFeaturesT(Core::System& system, VideoCommon::GpuSplit& split,
+                                FrontState& state);
     static void FrontRefreshSwitches(FrontState& state);
+    /// FRITCHII_FRONT_CALL_LEAN: FrontRunMacro's choice of body for a lean call; the call's words
+    /// copied into the FIFO vector for a path that needs it there; the 10 s counter line.
+    void FrontRunMacroLean(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
+    static void FrontCallMaterialize(FrontState& state);
+    static void FrontCallLeanReport(FrontState& state);
 public:
     /// Split front: whether the 3D macro `method`, called with `count` parameters that GPU work
     /// wrote, only copies the first into the draw's vertex count (dry runs on copies of its

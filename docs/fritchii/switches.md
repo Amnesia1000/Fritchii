@@ -602,6 +602,29 @@ stamp; then the session's verify disagreements (must be 0). Expected with 1 at t
 records walked near 0, "skipped by ranges" unchanged, the front macro zone back near 134 ns a
 call.
 
+### FRITCHII_FRONT_CALL_LEAN (the "Front call lean" line)
+
+FRITCHII_FRONT_CALL_LEAN (live, default 0 = exactly as before; fable_b 27.2 B, about 30 to 35
+ms/s of the front). Every 3D macro call on the front read ten live switches, MacroTraced, built
+an empty trace string and copied the call's words from the command list into the FIFO vector.
+- 1: the features body takes the switches from the front state. FrontRefreshSwitches reads them
+  where it reads the feature byte: when the switch generation moved, and every 1024 calls. A
+  whole call that arrives in one run (FrontCallMultiMethod) keeps its words in the list: the
+  handlers read them there. The words go into the vector only where a path needs it: the JIT
+  (no handler, or a declined call), 0xe2c (its FIFO read appends six words), EXP53's predicate,
+  EDEN_NX2_MACRO_TRACE, FRITCHII_MACRO_SAME_DRY / SEQ_DRY, FRITCHII_ONEF_DEAD_STORES, the list
+  guard's checked body and the plain body. The trace string is made only for a traced call.
+- Exact: the same switch values (every store of a live switch bumps the generation, which the
+  next call sees before it picks a body) and the same words in the same order; only 0xe2c's
+  handler appends to the FIFO (its 0x158), and it gets the vector.
+- 2: as 1, and every call reads the switches again as before and counts the calls where any
+  differs. Must be 0 (a switch stored between a call's refresh and its reads can count once).
+- Off: one predictable branch in FrontRunMacro and one in FrontCallMultiMethod's macro path.
+
+"Front call lean (FRITCHII_FRONT_CALL_LEAN=n), last 10 s" (HW_GPU, Info): calls through the
+lean body, of them with their words read in the list, of those copied after all; mode 2: calls
+compared and switch differences (must be 0). Judge it by the front's macro zone per call.
+
 ### FRITCHII_ACQUIRE_MET_BY (the "Acquire resumes met by" line)
 
 FRITCHII_ACQUIRE_MET_BY (live, default 0 since 2026-11-14 = one relaxed load per resume; 1 = the

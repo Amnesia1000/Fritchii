@@ -551,6 +551,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_ONEF_FRONT_OPS") {
         return &g_onef_front_ops;
     }
+    if (name == "FRITCHII_FRONT_CALL_LEAN") {
+        return &g_front_call_lean;
+    }
     if (name == "FRITCHII_ONEF_DEAD_STORES") {
         return &g_onef_dead_stores;
     }
