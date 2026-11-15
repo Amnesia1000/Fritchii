@@ -1749,6 +1749,10 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
 - FRITCHII_CPU_ACCURACY (boot env; auto, accurate, unsafe, paranoid, debugging): the CPU accuracy
   the JIT uses this session, for sizing runs (e.g. how much exact float handling costs). The
   stored cpu_accuracy setting is not changed, so nothing of it can be saved to a config.
+- FRITCHII_ONEF_R_SPIN / FRITCHII_ONEF_E_SPIN (live, pauses, default 8192 = as before): how long
+  R (idle) and E (parked or waiting) spin before they sleep on their wake word. Lower values
+  hand the core back sooner (with PIN=2 R's hardware thread is a game core's sibling, fable_b
+  23.3) at the cost of a wake on the next packet.
 - FRITCHII_ONEF_PIN (boot, default 1; 2 = one hardware thread of that core, its SMT sibling
   stays with the guest cores, fable_b 20.7): R gets PinnedRole::GpuMem's physical core (as
   FRITCHII_PIN_GPUMEM=1 gives GPUMem), taken from the guest set. 0 leaves R unpinned.

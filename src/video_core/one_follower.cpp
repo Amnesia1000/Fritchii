@@ -559,11 +559,15 @@ u64 EngineWait(Ready&& ready, EWait kind = EWait::Room, u64 number = 0) {
     };
     const bool timing = Stats::Timing();
     const u64 begin = timing ? Stats::Now() : 0;
+    // FRITCHII_ONEF_E_SPIN (live): pauses before E sleeps (default SpinLimit, as before).
+    const u32 spin_limit = static_cast<u32>((std::max)(
+        0, VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_e_spin,
+                                            "FRITCHII_ONEF_E_SPIN", static_cast<int>(SpinLimit))));
     for (u32 spins = 0;; ++spins) {
         if (ready()) {
             break;
         }
-        if (spins < SpinLimit) {
+        if (spins < spin_limit) {
             Pause();
             continue;
         }
@@ -1122,8 +1126,13 @@ void RenderMain(std::stop_token stop) {
         if (sent == g.read_at && !stop.stop_requested()) {
             const bool timing = Stats::Timing();
             const u64 idle_begin = timing ? Stats::Now() : 0;
+            // FRITCHII_ONEF_R_SPIN (live): pauses before R sleeps (default SpinLimit, as before).
+            const u32 spin_limit = static_cast<u32>((std::max)(
+                0, VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_r_spin,
+                                                    "FRITCHII_ONEF_R_SPIN",
+                                                    static_cast<int>(SpinLimit))));
             for (u32 spins = 0; sent == g.read_at && !stop.stop_requested(); ++spins) {
-                if (spins < SpinLimit) {
+                if (spins < spin_limit) {
                     Pause();
                 } else {
                     g.r_sleeping.store(true, std::memory_order_seq_cst);

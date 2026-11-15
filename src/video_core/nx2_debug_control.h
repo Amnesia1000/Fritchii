@@ -282,6 +282,11 @@ inline std::atomic<int> g_onef_sync_mirror{-1};
 /// FRITCHII_ONEF_POST_FENCE (live, default 0): fable_b 16.3, clean sync points, references and
 /// forced fence releases posted.
 inline std::atomic<int> g_onef_post_fence{-1};
+/// FRITCHII_ONEF_R_SPIN / FRITCHII_ONEF_E_SPIN (live, pauses, default 8192 = as before): how long
+/// R (idle, waiting for packets) and E (parked, waiting) spin before they sleep (fable_b 23.3: R
+/// spins through half its time on a game core's sibling with FRITCHII_ONEF_PIN=2).
+inline std::atomic<int> g_onef_r_spin{-1};
+inline std::atomic<int> g_onef_e_spin{-1};
 /// FRITCHII_ONEF_LOOKUP_CHECK (live, default 0 = off; N = every Nth unlent draw): fable_b 18.4's
 /// "lookup programs", "lookup blend", "lookup vertex input" must-be-0s.
 inline std::atomic<int> g_onef_lookup_check{-1};
