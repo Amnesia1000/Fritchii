@@ -21,6 +21,24 @@ to the page's host memory, only ever forward (wrap-aware), and the poll stores f
 cannot put the page back. Cost: guest increments take the manager's lock before the add instead of
 after it (it was taken right after anyway) plus one host store.
 
+### FRITCHII_SPARSE_RESERVE
+
+Fix, on by default (helper AH, 2026-11-15, partial port of zortos293/Lichii #1413); read once,
+FRITCHII_SPARSE_RESERVE=N keeps N whole 4 MiB sparse blocks ready (default 4, at most 64), 0 = off
+(every block backed by the thread that writes it, as before). BackSparseWrite gives a lazily backed
+region's block memory before a GPU write lands in it, usually on a GPU thread that holds a cache
+lock. Allocating and mapping that memory waits for the kernel's pool and page table locks, and the
+page table lock can be held by a guest thread that needs a core blocked on that same cache lock (a
+three-way deadlock: Mario Kart World hung loading a race; OoT backs its six lazy 300 MB GPU-only
+regions the same way). Now an nx2:GpuBacking kernel thread maps whole blocks ahead (once a lazy
+region exists) and BackSparseWrite takes one under m_region_mutex without a kernel call; a stale
+block goes back to the reserve. When none is ready (or the block is shorter than 4 MiB, a region's
+last), the old path runs and the log says "no reserve memory ready, backed on this thread". Also:
+nx2:gpu 214/215/216 no longer hold m_region_mutex across kernel calls (released regions are taken
+under the lock and freed after it; 214's whole backing, EDEN_NX2_GPU_ONLY_LAZY=0, is allocated
+before it). Unlike zortos, a block with no memory ready never drops or parks its write. Cost: up to
+N x 4 MiB of system pool memory mapped ahead (not committed on the host until written).
+
 ### FRITCHII_WRITE_REMARK
 
 Fix, on by default (helper AH, 2026-11-15, port of zortos293/Lichii #1829); live,
