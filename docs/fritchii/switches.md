@@ -2210,6 +2210,38 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   differ (window, session), checks that walked anyway (older than the chains, long reads), chain
   notes looked at, notes linked and the wide chain's share with its top 3 writers by kind. Off:
   one relaxed load per check, one plain load per note.
+- FRITCHII_FRONT_TRIM_RANGE (live, default 0; helper Z, front trims): GpuSplit::RangeLastWrite
+  (every constant buffer upload word and report, ~2 million a second at the Castle Town market)
+  with FRITCHII_STAMP_READ_PAGES: StampRangedRead's per-page answer (the GPU page's translation
+  and whether a stamp reader ever asked about its device page) comes from a 64-entry table
+  indexed by GPU page instead of the one-entry caches, which miss whenever two pages take turns
+  (upload words and report writes do: a GpuToCpuAddress and an unordered_map lookup each time).
+  An entry is filled only from a fresh, stable translation (no page table change running or
+  started during it) and answers only for the same memory manager, GPU page and queued function
+  position (the one-entry cache's own key), with the map serial and the read-pages table
+  unchanged since (stamp_read_gen: bumped at every page added, table clear and reset): exactly
+  what a fresh lookup gives. Also RangeLastWrite's EDEN_NX2_RANGED_WAITS and
+  EDEN_NX2_FORWARD_READS come from a member filled once from the same statics (a thread-safe
+  static guard per call, two per word, before). 1 = on, 2 = verify (the old lookup runs and
+  answers; a table answer that differs is counted, must be 0, first 16 logged), 3 = dry (the old
+  lookup answers; table hits counted, both timed 1 in 64). Line every 10 s "Front trim range
+  (FRITCHII_FRONT_TRIM_RANGE=N)": pages looked up, answered by the table, fills, verify checks
+  and differences, dry ns per lookup (old, table) and the saving in ms/s (the static guards'
+  share is not in it). Off: one relaxed load per ranged write.
+- FRITCHII_FRONT_TRIM_QMD (live, default 0; helper Z, front trims): the front's QMD scheduler
+  copy (EXP13 2-4, KeplerCompute's FrontQmdMirror) finds its overlays (FindOverlay, AddOverlay's
+  slot) and upload shadows (FindShadow) through compact arrays instead of walking the entries
+  (256 overlays of 288 bytes, 64 shadows of 4 KB: one cache line each, per QMD read, inline QMD
+  and patch; ~1.1% of the front at the market). The arrays hold each overlay's address and
+  position and each shadow's address, kept whatever the switch says (overlay addresses are
+  written only in AddOverlay, positions only through SetOverlayPosition, shadow addresses only
+  in NewShadow); the lookups visit the same slots in the same order with the same tests, a
+  shadow whose address is not within 4 KB below the QMD skipped (it fails the walk's tests:
+  a shadow's filled bytes are at most 4 KB). 1 = on, 2 = verify (both run, the walk answers,
+  differences counted, must be 0, first 16 logged), 3 = dry (the walk answers, both timed 1 in
+  64). Line every 10 s "Front trim QMD (FRITCHII_FRONT_TRIM_QMD=N)": lookups per site with the
+  timed walk and array ns, verify differences, the dry saving in ms/s. Off: one relaxed load per
+  lookup; the arrays cost a store per overlay or shadow change.
 - FRITCHII_NOTED_OVERFLOW (live, default 0; F7, needs FRITCHII_NOTED_FAST 1 to 3): the table's
   overflow answer of the chains ("more noted since than remembered", ~98% of the chain checks at
   the Castle Town market, the front DMA reads' page snapshots) asked again of the chains. While

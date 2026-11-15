@@ -392,6 +392,17 @@ inline std::atomic<int> g_noted_summary{-1};
 /// chains instead of walking every note since: 1 = on, 2 = verify (both run, the walk answers,
 /// differences counted), 3 = dry (both run, counted and timed 1 in 64).
 inline std::atomic<int> g_noted_fast{-1};
+/// FRITCHII_FRONT_TRIM_RANGE (live, default 0; helper Z): GpuSplit::StampRangedRead takes each
+/// ranged write page's answer from a small per-page table instead of the one-entry caches that
+/// miss when pages take turns, and RangeLastWrite reads its environment switches from a member:
+/// 1 = on, 2 = verify (the old lookup answers, differences counted), 3 = dry (counted and timed
+/// 1 in 64).
+inline std::atomic<int> g_front_trim_range{-1};
+/// FRITCHII_FRONT_TRIM_QMD (live, default 0; helper Z): the front's QMD scheduler copy finds its
+/// overlays and upload shadows through compact address arrays instead of walking the large
+/// entries: 1 = on, 2 = verify (both run, the old walk answers, differences counted), 3 = dry
+/// (counted and timed 1 in 64).
+inline std::atomic<int> g_front_trim_qmd{-1};
 /// FRITCHII_NOTED_OVERFLOW (live, default 0; F7, with FRITCHII_NOTED_FAST 1 to 3): the table's
 /// overflow answer of NotedWriteSinceFast asked again of the note chains, which keep the position
 /// of each forgotten link: 1 = on (a chain-proved "no write" answers at FRITCHII_NOTED_FAST=1),
