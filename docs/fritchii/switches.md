@@ -236,6 +236,13 @@ only when the group counted something. Times are time stamp ticks converted with
   word runs counted per word, 3D single, other engine single, multi, call, pairs per pair, state
   delta, draw batch, words blocks per word, engine/wrap) and the "method" zone ms/s each kind
   added (the zone's own estimate: 3D methods are sampled about one in 32).
+- "Price back 3D methods ...", row 4b (fable_b_one_follower 22.3 step 2 and 23): row 4's "3D
+  single" entries by method, the 24 costliest by the "method" zone time each added (the same
+  sampled estimate), with the state writes each found sunk and consumed first (ConsumeSink:
+  the macro's sunk register writes are paid by the next executable method, so a draw method's
+  time holds them, and on E with one follower also the draw's unzoned work: the pipeline
+  lookup, the handle values, the per-draw FlushCaching, the pack and the push). Methods are
+  register indices (draw.end 0x585 and so on).
 - "Price front waits split ...", rows 7 and 8: each wait of the front for the back by site (the
   drain sites of "Front waits for the back by site") and the suspended acquires, split into
   "until the back reached it" and "after". The back stamps each position it stores as consumed;

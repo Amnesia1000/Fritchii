@@ -149,6 +149,27 @@ enum class Entry : u32 {
 inline Group<static_cast<size_t>(Entry::Count)> g_entries;
 
 // ---------------------------------------------------------------------------------------------
+// Row 4b (fable_b_one_follower 22.3 step 2 and 23, the back; dry): the "3D single" entries of row
+// 4 by method. Each costs what Execute ran for it in the "method" zone: its own handler and the
+// state writes sunk before it, which it consumes first (ConsumeSink); `sunk` counts those.
+
+inline constexpr size_t Method3DSlots = 0x1000;
+struct Method3D {
+    std::array<Counter, Method3DSlots> count{};
+    std::array<Counter, Method3DSlots> ticks{};
+    std::array<Counter, Method3DSlots> sunk{};
+};
+inline Method3D g_method3d;
+/// The back, a single 3D method entry: its method, the zone time it added, the sunk writes it
+/// consumed.
+inline void NoteMethod3D(u32 method, u64 ticks, u64 sunk) noexcept {
+    const size_t slot = method < Method3DSlots ? method : Method3DSlots - 1;
+    Add(g_method3d.count[slot], 1);
+    Add(g_method3d.ticks[slot], ticks);
+    Add(g_method3d.sunk[slot], sunk);
+}
+
+// ---------------------------------------------------------------------------------------------
 // Front waits split (rows 7, 8): until the back reached the wait's target, then after (the
 // back's position stores are stamped; the front looks the target up when its wait ends).
 

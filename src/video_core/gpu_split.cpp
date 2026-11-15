@@ -3032,9 +3032,16 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 MemStageShadow::Before(read_position);
             }
             u64 method_before = 0;
+            size_t sink_before = 0;
             if (entry_price) [[unlikely]] {
                 method_before = Nx2Profile::t_data
                                     .exclusive_ns[static_cast<size_t>(Nx2Profile::Zone::Method)];
+                // Row 4b: the state writes a 3D method entry finds sunk (it consumes them first).
+                if (static_cast<Kind>(ring[index] & 0xf) == Kind::Method &&
+                    back_engine != nullptr && back_engine->fast_maxwell3d) {
+                    sink_before = static_cast<Tegra::Engines::Maxwell3D*>(back_engine)
+                                      ->method_sink.size();
+                }
             }
             const size_t size =
                 Execute(&ring[index], std::min<u64>(end - read_position, RingWords - index));
@@ -3043,11 +3050,18 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 if (entry_price) {
                     u32 entries = 1;
                     const FritchiiPrice::Entry kind = entry_kind(head, size, entries);
-                    FritchiiPrice::g_entries.Note(
-                        static_cast<size_t>(kind), entries,
+                    const u64 added =
                         Nx2Profile::t_data
-                                .exclusive_ns[static_cast<size_t>(Nx2Profile::Zone::Method)] -
-                            method_before);
+                            .exclusive_ns[static_cast<size_t>(Nx2Profile::Zone::Method)] -
+                        method_before;
+                    FritchiiPrice::g_entries.Note(static_cast<size_t>(kind), entries, added);
+                    if (kind == FritchiiPrice::Entry::Method3D) {
+                        const size_t sink_after =
+                            static_cast<Tegra::Engines::Maxwell3D*>(back_engine)
+                                ->method_sink.size();
+                        FritchiiPrice::NoteMethod3D(static_cast<u32>((head >> 8) & 0xffff), added,
+                                                    sink_after < sink_before ? sink_before : 0);
+                    }
                 }
                 if (entry_delay) {
                     if (const u32 entries = method_entries(head, size); entries != 0) {

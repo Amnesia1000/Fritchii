@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <string>
+#include <vector>
 
 #include <fmt/format.h>
 
@@ -160,6 +161,7 @@ struct ReportState {
     std::array<u64, 4 * WaitSites> waits{};
     std::array<u64, 5> worker{};
     std::array<u64, 6> record{};
+    std::array<u64, 3 * Method3DSlots> method3d{};
 };
 ReportState g_report;
 
@@ -285,6 +287,44 @@ void MaybeReport() {
                      "Price back ring entries by kind (10 s; entries a second, the \"method\" "
                      "zone's ms/s each kind added): {}",
                      text);
+        }
+    }
+    // Row 4b: the single 3D method entries by method, the costliest 24 (sunk: state writes the
+    // entry consumed before its own handler).
+    {
+        struct Row {
+            u32 method;
+            u64 count;
+            u64 ticks;
+            u64 sunk;
+        };
+        std::vector<Row> rows;
+        u64 total_ticks = 0;
+        u64 total_count = 0;
+        for (size_t i = 0; i < Method3DSlots; ++i) {
+            const u64 count = Delta(g_method3d.count[i], r.method3d[3 * i]);
+            const u64 ticks = Delta(g_method3d.ticks[i], r.method3d[3 * i + 1]);
+            const u64 sunk = Delta(g_method3d.sunk[i], r.method3d[3 * i + 2]);
+            if (count != 0) {
+                rows.push_back({static_cast<u32>(i), count, ticks, sunk});
+                total_ticks += ticks;
+                total_count += count;
+            }
+        }
+        if (!rows.empty()) {
+            std::sort(rows.begin(), rows.end(),
+                      [](const Row& a, const Row& b) { return a.ticks > b.ticks; });
+            std::string text;
+            for (size_t i = 0; i < rows.size() && i < 24; ++i) {
+                text += fmt::format("{}{:#x} {:.0f}/s {:.1f} ms/s sunk {:.0f}/s",
+                                    text.empty() ? "" : "; ", rows[i].method, rate(rows[i].count),
+                                    ms(rows[i].ticks), rate(rows[i].sunk));
+            }
+            LOG_INFO(HW_GPU,
+                     "Price back 3D methods (10 s; single 3D entries by method, {:.0f}/s {:.1f} "
+                     "ms/s in all, costliest first; time = the \"method\" zone it added, sunk = "
+                     "state writes it consumed first): {}",
+                     rate(total_count), ms(total_ticks), text);
         }
     }
     // Rows 7 and 8.
