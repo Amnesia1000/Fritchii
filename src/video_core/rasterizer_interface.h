@@ -85,6 +85,14 @@ public:
     /// Signal disabling of a uniform buffer
     virtual void DisableGraphicsUniformBuffer(size_t stage, u32 index) = 0;
 
+    /// FRITCHII_ESPLIT_BIND_BATCH=2: a hash of what a uniform bind of `stage`, `index` writes
+    /// (the buffer cache's binding and bind memo); 0 where the renderer does not track it.
+    [[nodiscard]] virtual u64 GraphicsUniformBindState(size_t stage, u32 index) const {
+        (void)stage;
+        (void)index;
+        return 0;
+    }
+
     /// Signal a GPU based semaphore as a fence
     virtual void SignalFence(std::function<void()>&& func) = 0;
 

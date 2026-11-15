@@ -732,6 +732,36 @@ public:
         return {binding.device_addr, size};
     }
 
+    /// FRITCHII_ESPLIT_BIND_BATCH=2: a hash of everything a graphics uniform bind of `stage`,
+    /// `index` writes (the binding, its bind memo, its dirty bit), to prove a dropped bind would
+    /// have left it unchanged.
+    [[nodiscard]] u64 UniformBindState(size_t stage, u32 index) const noexcept {
+        if (stage >= NUM_STAGES || index >= NUM_GRAPHICS_UNIFORM_BUFFERS || channel_state == nullptr) {
+            return 0;
+        }
+        const Binding& binding = channel_state->uniform_buffers[stage][index];
+        const UniformBindMemo& memo = uniform_bind_memo[stage][index];
+        u64 hash = 0xcbf29ce484222325ULL;
+        const auto mix = [&hash](u64 value) {
+            hash ^= value + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2);
+        };
+        mix(binding.device_addr);
+        mix(binding.gpu_addr);
+        mix(binding.size);
+        mix(binding.buffer_id.index);
+        mix(binding.segment_first);
+        mix(binding.segment_count);
+        mix(memo.epoch);
+        mix(memo.map_serial);
+        mix(static_cast<u64>(memo.as_id));
+        mix(reinterpret_cast<u64>(memo.channel));
+        mix(memo.gpu_addr);
+        mix(memo.device_addr);
+        mix(memo.size);
+        mix((channel_state->dirty_uniform_buffers[stage] >> index) & 1);
+        return hash;
+    }
+
     [[nodiscard]] std::pair<Buffer*, u32> GetDrawIndirectCount();
 
     [[nodiscard]] std::pair<Buffer*, u32> GetDrawIndirectBuffer();

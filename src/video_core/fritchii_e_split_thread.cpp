@@ -155,14 +155,48 @@ constexpr std::array<const char*, CbJoinCount> CbJoinNames{
     "sparse",    "unmapped",                         "texture, shader pages or pools"};
 /// A record's room for constant buffer writes (each a CbSegment and its words).
 constexpr size_t CbRoom = 4096;
+/// What a record segment is (its first byte).
+enum SegmentKind : u8 { SegmentCbWrite = 0, SegmentBind = 1 };
 struct CbSegment {
-    CbTarget target;
-    u64 seq; ///< E1's running number of the write (ESplitCbOrder)
-    u32 bytes;
+    u8 kind; ///< SegmentCbWrite
     u8 block;
     u8 sample; ///< ESplitCbBytes: read back after the write
+    u8 pad;
+    u32 bytes;
+    CbTarget target;
+    u64 seq; ///< E1's running number of the write (ESplitCbOrder)
 };
 static_assert(sizeof(CbSegment) % 8 == 0 && std::is_trivially_copyable_v<CbSegment>);
+/// FRITCHII_ESPLIT_BIND_BATCH: a constant buffer bind's buffer cache half in a record, by value.
+enum BindFlag : u8 {
+    BindEnabled = 1,   ///< bind (else disable)
+    BindCheckDrop = 2, ///< verify: 1 would have dropped it; E2 hashes the slot around it
+    BindWatch = 4,     ///< verify: E2 checks it left no cached writes
+    BindTime = 8,      ///< E2 times its body (1 in 64)
+};
+struct BindSegment {
+    u8 kind; ///< SegmentBind
+    u8 stage;
+    u8 slot;
+    u8 flags; ///< BindFlag
+    u32 size;
+    u64 address;
+    VideoCore::RasterizerInterface* rasterizer;
+    u64 seq; ///< E1's running number of the packed bind (ESplitBindOrder)
+};
+static_assert(sizeof(BindSegment) % 8 == 0 && std::is_trivially_copyable_v<BindSegment>);
+/// The bind table's size (Maxwell3D: 5 stages, 18 slots; the slot field holds 32).
+constexpr size_t BindStages = 5;
+constexpr size_t BindSlots = 32;
+/// E1's note of a slot's last bind: in the open record (or the dry run), or queued at all.
+struct BindNote {
+    u64 address;
+    const void* rasterizer;
+    u64 stamp; ///< the open record's job number; dry runs: their number | DryStamp; 0 none
+    u32 size;
+    bool enabled;
+};
+constexpr u64 DryStamp = u64{1} << 63;
 /// The record's payload.
 struct CbRecord {
     Maxwell3D* engine;
@@ -240,6 +274,15 @@ struct E1Counts {
     u64 flush_before{};  ///< a draw's flush before the lookup, E2 idle
     u64 flush_drained{}; ///< ... owed, E2 drained first
     u64 flush_tail{};    ///< ... at the head of the draw's tail (after the lookup)
+    // FRITCHII_ESPLIT_BIND_BATCH
+    u64 bind_segments{};    ///< binds packed into records (1, 2)
+    u64 bind_dropped{};     ///< same-value binds dropped (1)
+    u64 bind_same_run{};    ///< same value as the slot's last bind in the open record / dry run
+    u64 bind_same_slot{};   ///< same value as the slot's last bind queued at all (a ceiling)
+    u64 bind_runs{};        ///< dry: runs of consecutive bind jobs
+    u64 mixed_runs{};       ///< dry: runs of consecutive bind and cb record jobs (what 1 makes)
+    u64 bind_records{};     ///< records holding binds (1, 2)
+    u64 bind_only_records{}; ///< ... and no constant buffer write
 };
 struct E2Counts {
     std::atomic<u64> job_ticks{};
@@ -265,6 +308,18 @@ struct E2Counts {
     std::atomic<u64> async_writes{}; ///< ESplitAsyncWrite
     std::atomic<u64> late_checks{};  ///< ESplitLateShader's sampled late flushes
     std::atomic<u64> late_shader{};  ///< ... that invalidated shader pages (must be 0)
+    // E2's job time by kind (every job: RunJob reads the ticks anyway)
+    std::array<std::atomic<u64>, HandCount> hand_ticks{};
+    std::array<std::atomic<u64>, HandCount> hand_jobs{};
+    // FRITCHII_ESPLIT_BIND_BATCH
+    std::atomic<u64> bind_job_body_ticks{}; ///< a bind job's body (1 in 64)
+    std::atomic<u64> bind_job_bodies{};
+    std::atomic<u64> bind_seg_ticks{};      ///< a packed bind's body (1 in 64)
+    std::atomic<u64> bind_seg_bodies{};
+    std::atomic<u64> bind_order{};          ///< ESplitBindOrder
+    std::atomic<u64> bind_drop_checks{};
+    std::atomic<u64> bind_drop_differs{};   ///< ESplitBindDrop
+    std::atomic<u64> bind_writes{};         ///< verify: packed binds with cached writes (a count)
 };
 
 void Bump(std::atomic<u64>& counter, u64 amount = 1) noexcept {
@@ -347,6 +402,15 @@ Maxwell3D* g_cb_engine{};
 u32 g_cb_used{};
 u32 g_cb_segments{};
 u64 g_cb_staged{};
+u32 g_rec_words{}; ///< constant buffer writes in the open record
+u32 g_rec_binds{}; ///< binds in the open record (FRITCHII_ESPLIT_BIND_BATCH)
+// FRITCHII_ESPLIT_BIND_BATCH, E1's
+u64 g_bind_staged{};    ///< packed binds numbered (ESplitBindOrder)
+u64 g_last_bind_seq{};  ///< the job number of the last bind job (dry runs)
+u64 g_last_cb_seq{};    ///< ... of the last record opened
+u64 g_dry_run{};        ///< dry: the current run of bind and cb record jobs
+std::array<std::array<BindNote, BindSlots>, BindStages> g_bind_in_run{};
+std::array<std::array<BindNote, BindSlots>, BindStages> g_bind_last{};
 bool g_flush_owed{true};
 bool g_flush_async{};
 u64 g_join_mark{}; ///< the cached write count at the outer join's start (E2 drained)
@@ -364,6 +428,10 @@ u64 g_e2_cb_seq{};
 u64 g_cb_order_logged{};
 u64 g_cb_bytes_logged{};
 u64 g_cb_guard_logged{};
+u64 g_e2_bind_seq{};
+u64 g_e2_bind_timer{}; ///< E2: bind jobs seen (every 64th body timed)
+u64 g_bind_order_logged{};
+u64 g_bind_drop_logged{};
 std::chrono::nanoseconds g_e2_poll{std::chrono::microseconds{20}};
 
 /// E1 polls up to 200 us for a lockstep hand-over (the work is a few us; a sleep and a wake
@@ -465,7 +533,8 @@ void ReadTouch(const void* caller) {
         }
         NoteTouchImpl(Touch::MemoryRead, caller);
         // S4: with constant buffer writes queued the read may see memory before them.
-        if (g_cb_open != nullptr || g_cb_staged > g.cb_done.load(std::memory_order_acquire)) {
+        if ((g_cb_open != nullptr && g_rec_words != 0) ||
+            g_cb_staged > g.cb_done.load(std::memory_order_acquire)) {
             ++g_e1.cb_reads;
         }
     }
@@ -534,7 +603,16 @@ void RunJob(Job& job) {
     // does still makes a later flush owed.
     const bool watch_writes = job.async && job.info.hand != Hand::CbWords;
     const u64 mark = watch_writes ? WriteMark() : 0;
-    job.function(job.argument);
+    // FRITCHII_ESPLIT_BIND_BATCH's dry count: a bind job's body, 1 in 64 (the rest is the job's
+    // own cost, what packing saves).
+    if (job.info.hand == Hand::Bind && (++g_e2_bind_timer & SampleMask) == 0) [[unlikely]] {
+        const u64 body_start = Profile::Ticks();
+        job.function(job.argument);
+        Bump(g_e2.bind_job_body_ticks, Profile::Ticks() - body_start);
+        Bump(g_e2.bind_job_bodies);
+    } else {
+        job.function(job.argument);
+    }
     if (watch_writes && WriteMark() != mark) [[unlikely]] {
         Bump(g_e2.async_writes);
         g.async_wrote.store(true, std::memory_order_release);
@@ -558,7 +636,13 @@ void RunJob(Job& job) {
         g.draws_done.store(g.draws_done.load(std::memory_order_relaxed) + 1,
                            std::memory_order_release);
     }
-    Bump(g_e2.job_ticks, Profile::Ticks() - start);
+    const u64 ticks = Profile::Ticks() - start;
+    Bump(g_e2.job_ticks, ticks);
+    const size_t hand = static_cast<size_t>(job.info.hand);
+    if (hand < HandCount) {
+        Bump(g_e2.hand_ticks[hand], ticks);
+        Bump(g_e2.hand_jobs[hand]);
+    }
 }
 
 /// E2, S4, 1 write in 64: the memory after E2's write holds the words (what lockstep writes).
@@ -583,13 +667,72 @@ void CheckCbBytes(Maxwell3D& engine, const CbSegment& segment, const u32* values
     }
 }
 
-/// E2, S4: a constant buffer record, its writes in E1's order.
+/// E2, FRITCHII_ESPLIT_BIND_BATCH: a packed bind, as HandBind's job body runs it.
+void RunBindSegment(const u8* at) {
+    BindSegment bind;
+    std::memcpy(&bind, at, sizeof(bind));
+    if (bind.seq != g_e2_bind_seq + 1) [[unlikely]] {
+        Bump(g_e2.bind_order);
+        if (++g_bind_order_logged <= 16) {
+            LOG_ERROR(HW_GPU,
+                      "E split thread: ESplitBindOrder: packed bind {} applied after {} ({} since "
+                      "boot)",
+                      bind.seq, g_e2_bind_seq, g_bind_order_logged);
+        }
+    }
+    g_e2_bind_seq = bind.seq;
+    // A bind job ran outside a cb record (the stream-write guard's exception is for cb writes).
+    t_async_cb = false;
+    auto& rasterizer = *bind.rasterizer;
+    const bool check_drop = (bind.flags & BindCheckDrop) != 0;
+    const u64 before = check_drop ? rasterizer.GraphicsUniformBindState(bind.stage, bind.slot) : 0;
+    const bool watch = (bind.flags & BindWatch) != 0;
+    const u64 mark = watch ? WriteMark() : 0;
+    const bool time = (bind.flags & BindTime) != 0;
+    const u64 start = time ? Profile::Ticks() : 0;
+    if ((bind.flags & BindEnabled) == 0) {
+        rasterizer.DisableGraphicsUniformBuffer(bind.stage, bind.slot);
+    } else {
+        rasterizer.BindGraphicsUniformBuffer(bind.stage, bind.slot, bind.address, bind.size);
+    }
+    if (time) {
+        Bump(g_e2.bind_seg_ticks, Profile::Ticks() - start);
+        Bump(g_e2.bind_seg_bodies);
+    }
+    if (watch && WriteMark() != mark) [[unlikely]] {
+        Bump(g_e2.bind_writes);
+    }
+    if (check_drop) {
+        Bump(g_e2.bind_drop_checks);
+        const u64 after = rasterizer.GraphicsUniformBindState(bind.stage, bind.slot);
+        if (after != before) [[unlikely]] {
+            Bump(g_e2.bind_drop_differs);
+            if (++g_bind_drop_logged <= 16) {
+                LOG_ERROR(HW_GPU,
+                          "E split thread: ESplitBindDrop: bind {} (stage {} slot {} {:#x}+{:#x}) "
+                          "changed its slot although 1 would drop it ({:#x} -> {:#x}, {} since "
+                          "boot)",
+                          bind.seq, bind.stage, bind.slot, bind.address, bind.size, before, after,
+                          g_bind_drop_logged);
+            }
+        }
+    }
+    t_async_cb = true;
+}
+
+/// E2, S4: a constant buffer record, its writes (and FRITCHII_ESPLIT_BIND_BATCH's binds) in E1's
+/// order.
 void RunCbRecord(void* raw) {
     CbRecord record;
     std::memcpy(&record, raw, sizeof(record));
     const u8* at = g.buffers[g_current->seq % Slots].cb.get();
     t_async_cb = true;
     for (u32 i = 0; i < record.segments; ++i) {
+        if (*at == SegmentBind) {
+            RunBindSegment(at);
+            at += sizeof(BindSegment);
+            continue;
+        }
         CbSegment segment;
         std::memcpy(&segment, at, sizeof(segment));
         const auto* const values = reinterpret_cast<const u32*>(at + sizeof(CbSegment));
@@ -964,6 +1107,67 @@ void Report(u64 now) {
              async_writes, TakeCount(g_e2.late_shader), TakeCount(g_e2.late_checks),
              rate(c.queued_shader), g_flush_async ? 1 : 0, g_owed_shader_rule ? 1 : 0,
              rate(c.flush_before), rate(c.flush_drained), rate(c.flush_tail));
+    // E2's job time by kind, and FRITCHII_ESPLIT_BIND_BATCH's counts, cost and checks.
+    {
+        std::array<u64, HandCount> kind_ticks{};
+        std::array<u64, HandCount> kind_jobs{};
+        u64 all_jobs = 0;
+        std::string text;
+        for (size_t i = 0; i < HandCount; ++i) {
+            kind_ticks[i] = TakeCount(g_e2.hand_ticks[i]);
+            kind_jobs[i] = TakeCount(g_e2.hand_jobs[i]);
+            all_jobs += kind_jobs[i];
+            if (kind_jobs[i] != 0) {
+                text += fmt::format("{}{} {:.0f}/s {:.1f} ms/s {:.2f} us", text.empty() ? "" : ", ",
+                                    HandNames[i], rate(kind_jobs[i]), ms(kind_ticks[i]),
+                                    ms(kind_ticks[i]) * 1000.0 * window /
+                                        static_cast<double>(kind_jobs[i]));
+            }
+        }
+        const auto each_us = [&](u64 ticks, u64 count) {
+            return count != 0 ? ms(ticks) * 1000.0 * window / static_cast<double>(count) : 0.0;
+        };
+        LOG_INFO(HW_GPU,
+                 "E split thread 10 s: E2 jobs by kind (RunJob's time, without the queue's done "
+                 "store and wake): {:.0f} jobs/s, {:.2f} us each; {}",
+                 rate(all_jobs), each_us(job_ticks, all_jobs), text.empty() ? "none" : text);
+        const size_t bind = static_cast<size_t>(Hand::Bind);
+        const u64 body_ticks = TakeCount(g_e2.bind_job_body_ticks);
+        const u64 bodies = TakeCount(g_e2.bind_job_bodies);
+        const u64 seg_ticks = TakeCount(g_e2.bind_seg_ticks);
+        const u64 seg_bodies = TakeCount(g_e2.bind_seg_bodies);
+        const u64 binds = c.hands[bind] + c.bind_segments + c.bind_dropped;
+        // Dry: the jobs 1 would save (bind jobs and cb records less the runs, each a record then)
+        // at a bind job's own cost (the job less its body): an estimate of E2's saving.
+        const u64 records = c.hands[static_cast<size_t>(Hand::CbWords)];
+        const u64 saved_jobs = g_bind_batch == 3 && c.hands[bind] + records > c.mixed_runs
+                                   ? c.hands[bind] + records - c.mixed_runs
+                                   : 0;
+        const double job_us = each_us(kind_ticks[bind], kind_jobs[bind]);
+        const double body_us = each_us(body_ticks, bodies);
+        const double saved_ms =
+            rate(saved_jobs) * (std::max)(job_us - body_us, 0.0) / 1000.0;
+        LOG_INFO(HW_GPU,
+                 "E split thread 10 s: binds (FRITCHII_ESPLIT_BIND_BATCH={}): {:.0f}/s; own jobs "
+                 "{:.0f}/s, packed {:.0f}/s in {:.0f} records/s ({:.0f} binds only), dropped "
+                 "{:.0f}/s; same value in the run {:.0f}/s, same value as the slot's last bind "
+                 "{:.0f}/s (any distance: a ceiling, never dropped); dry: bind runs {:.0f}/s "
+                 "({:.2f} binds a run), bind and cb record runs {:.0f}/s, jobs saved {:.0f}/s (est. "
+                 "E2 {:.1f} ms/s); E2: bind job {:.2f} us, "
+                 "its body {:.2f} us (1 in 64), packed bind {:.2f} us (1 in 64); checks (must be "
+                 "0): ESplitBindOrder {}, ESplitBindDrop {} in {} checked; packed binds with cached "
+                 "writes {} (verify; a count: R's concurrent writes show too)",
+                 g_bind_batch, rate(binds), rate(c.hands[bind]), rate(c.bind_segments),
+                 rate(c.bind_records), rate(c.bind_only_records), rate(c.bind_dropped),
+                 rate(c.bind_same_run), rate(c.bind_same_slot), rate(c.bind_runs),
+                 c.bind_runs != 0
+                     ? static_cast<double>(c.hands[bind]) / static_cast<double>(c.bind_runs)
+                     : 0.0,
+                 rate(c.mixed_runs), rate(saved_jobs), saved_ms, job_us, body_us,
+                 each_us(seg_ticks, seg_bodies),
+                 TakeCount(g_e2.bind_order), TakeCount(g_e2.bind_drop_differs),
+                 TakeCount(g_e2.bind_drop_checks), TakeCount(g_e2.bind_writes));
+    }
     // E1's waits by cause (what each join class costs), the pushes by kind, the idle path.
     {
         std::string text;
@@ -1161,6 +1365,25 @@ void ThreadBatch() noexcept {
                  flush_async ? "on: a flush owed nothing goes after the lookup" : "off");
         g_cb_async = cb_async;
         g_flush_async = flush_async;
+    }
+    // FRITCHII_ESPLIT_BIND_BATCH (live): E2 never reads the mode (each packed bind carries its
+    // flags, a bind job is a job either way), so a change needs no drain. The open record is
+    // posted so no record mixes the old mode's binds with the new one's.
+    {
+        const int bind_batch = std::clamp(
+            VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_esplit_bind_batch,
+                                             "FRITCHII_ESPLIT_BIND_BATCH"),
+            0, 3);
+        if (bind_batch != g_bind_batch) [[unlikely]] {
+            PostCbWrites();
+            static constexpr std::array<const char*, 4> Modes{
+                "off: a job per bind", "on: binds packed into records, same-value binds dropped",
+                "verify: packed, nothing dropped, the would-drop binds checked",
+                "dry: a job per bind, counted"};
+            LOG_INFO(HW_GPU, "E split thread: FRITCHII_ESPLIT_BIND_BATCH={} ({})", bind_batch,
+                     Modes[static_cast<size_t>(bind_batch)]);
+            g_bind_batch = bind_batch;
+        }
     }
     if ((++g_batches & 63) == 0) [[unlikely]] {
         const u64 now = Profile::Now();
@@ -1610,8 +1833,152 @@ void AfterEnginePushImpl(bool lend, bool acted) noexcept {
     }
 }
 
+namespace {
+
+/// E1: a new record (constant buffer words and FRITCHII_ESPLIT_BIND_BATCH's binds), its job slot
+/// taken now in ring order, posted by PostCbWrites before any other job, drain, join, push or
+/// wait of E1's. `engine`: the cb writes' engine, null for a record a bind opens (the first cb
+/// write sets it).
+void OpenRecord(Maxwell3D* engine) {
+    Job& job = TakeSlot(false);
+    job.async = true;
+    job.info = HandInfo{.hand = Hand::CbWords};
+    g_cb_open = &job;
+    g_cb_engine = engine;
+    g_cb_used = 0;
+    g_cb_segments = 0;
+    g_rec_words = 0;
+    g_rec_binds = 0;
+    ++g_e1.hands[static_cast<size_t>(Hand::CbWords)];
+    // Dry runs: a record after a bind job continues its run; after anything else it starts one
+    // (two records in a row were split for room or an engine change).
+    if (g_bind_batch == 3 && g_last_bind_seq + 1 != job.seq) {
+        ++g_e1.mixed_runs;
+        ++g_dry_run;
+    }
+    g_last_cb_seq = job.seq;
+}
+
+[[nodiscard]] bool SameBind(const BindNote& note, u64 stamp, const void* rasterizer,
+                            bool enabled, u64 address, u32 size) noexcept {
+    // A disable ignores the address and size (DisableGraphicsUniformBuffer).
+    return note.stamp == stamp && note.rasterizer == rasterizer && note.enabled == enabled &&
+           (!enabled || (note.address == address && note.size == size));
+}
+
+/// E1, FRITCHII_ESPLIT_BIND_BATCH != 0, the queued mode. True: the bind went into the open record
+/// (1, 2) or was dropped (1). False (3, the dry count): the bind job as before.
+///
+/// Why a drop is exact: it needs a bind of the same value to the same slot earlier in the same open
+/// record with no other bind to that slot after it. Everything between the two on E2 is then
+/// segments of that record, run back to back: other binds (other slots) and constant buffer
+/// writes, which write memory and never read or change the bindings (WriteConstantWords goes by
+/// CB_ADDRESS, not by a bound slot). No draw, no channel change (a join: the record goes first),
+/// no buffer cache call in between. So the second bind meets the state the first left: a disable
+/// finds the slot disabled (it returns early); a bind translates the same range to the same
+/// device address (the memo hits or stores the same values, buffer_id stays cleared, no draw
+/// resolved it in between). Only a page table change by the guest between the two segments could
+/// translate differently, and that race has no defined order against E's work on one thread
+/// either. Verify (2) hashes the slot around every would-drop bind (ESplitBindDrop).
+///
+/// Why packing is exact: the segment is appended where the job would have been posted. A record
+/// is posted before any other job of E1's takes a slot (TakeSlot), drain, join, push or wait
+/// (PostCbWrites), so E2 runs every bind in the job order it had as its own job, between the same
+/// cb writes. A bind job reads nothing but its values and moves no per-call state (RunJob's
+/// moves_state is false for it); the record's E2 runs it with t_async_cb cleared, as a job.
+bool BindBatch(int mode, VideoCore::RasterizerInterface& rasterizer, std::size_t stage, u32 slot,
+               bool enabled, u64 address, u32 size) noexcept {
+    if (!g_async) {
+        return false; // lockstep: a hand-over that waits, as before
+    }
+    const bool tracked = stage < BindStages && slot < BindSlots;
+    if (tracked) {
+        BindNote& last = g_bind_last[stage][slot];
+        if (SameBind(last, 1, &rasterizer, enabled, address, size)) {
+            ++g_e1.bind_same_slot;
+        }
+        last = BindNote{address, &rasterizer, 1, size, enabled};
+    }
+    if (mode == 3) {
+        // The job about to be taken is number g_next_seq: TakeSlot only posts the open record,
+        // which keeps the number it took.
+        const u64 seq = g_next_seq;
+        const bool after_bind = g_last_bind_seq + 1 == seq;
+        if (!after_bind) {
+            ++g_e1.bind_runs;
+            if (g_last_cb_seq + 1 != seq) {
+                ++g_e1.mixed_runs;
+                ++g_dry_run;
+            }
+        }
+        g_last_bind_seq = seq;
+        if (tracked) {
+            BindNote& note = g_bind_in_run[stage][slot];
+            const u64 stamp = g_dry_run | DryStamp;
+            if (SameBind(note, stamp, &rasterizer, enabled, address, size)) {
+                ++g_e1.bind_same_run;
+            }
+            note = BindNote{address, &rasterizer, stamp, size, enabled};
+        }
+        return false;
+    }
+    constexpr u32 need = static_cast<u32>(sizeof(BindSegment));
+    if (g_cb_open != nullptr && g_cb_used + need > CbRoom) {
+        PostCbWrites();
+    }
+    bool same = false;
+    if (g_cb_open != nullptr && tracked) {
+        same = SameBind(g_bind_in_run[stage][slot], g_cb_open->seq, &rasterizer, enabled, address,
+                        size);
+    }
+    if (same) {
+        ++g_e1.bind_same_run;
+        if (mode == 1) {
+            ++g_e1.bind_dropped;
+            return true;
+        }
+    }
+    if (g_cb_open == nullptr) {
+        OpenRecord(nullptr);
+    }
+    u8 flags = enabled ? BindEnabled : 0;
+    if (mode == 2) {
+        flags |= BindWatch | (same ? BindCheckDrop : 0);
+    }
+    if (Sample()) {
+        flags |= BindTime;
+    }
+    const BindSegment segment{
+        .kind = SegmentBind,
+        .stage = static_cast<u8>(stage),
+        .slot = static_cast<u8>(slot),
+        .flags = flags,
+        .size = size,
+        .address = address,
+        .rasterizer = &rasterizer,
+        .seq = ++g_bind_staged,
+    };
+    std::memcpy(g.buffers[g_cb_open->seq % Slots].cb.get() + g_cb_used, &segment, need);
+    g_cb_used += need;
+    ++g_cb_segments;
+    ++g_rec_binds;
+    ++g_e1.bind_segments;
+    if (tracked) {
+        g_bind_in_run[stage][slot] = BindNote{address, &rasterizer, g_cb_open->seq, size, enabled};
+    }
+    return true;
+}
+
+} // Anonymous namespace
+
 void HandBind(VideoCore::RasterizerInterface& rasterizer, std::size_t stage, u32 slot,
               bool enabled, u64 address, u32 size) noexcept {
+    // FRITCHII_ESPLIT_BIND_BATCH: off, one load and a branch.
+    if (const int mode = g_bind_batch; mode != 0) [[unlikely]] {
+        if (BindBatch(mode, rasterizer, stage, slot, enabled, address, size)) {
+            return;
+        }
+    }
     struct Bind {
         VideoCore::RasterizerInterface* rasterizer;
         std::size_t stage;
@@ -1726,31 +2093,31 @@ CbJoin CbCause(Maxwell3D& engine, const CbTarget& target, u32 bytes) {
 void QueueCb(Maxwell3D& engine, const CbTarget& target, const u32* values, u32 bytes,
              bool block) {
     const u32 need = static_cast<u32>(sizeof(CbSegment)) + CbPadded(bytes);
-    if (g_cb_open != nullptr && (g_cb_engine != &engine || g_cb_used + need > CbRoom)) {
+    // A record FRITCHII_ESPLIT_BIND_BATCH opened for binds has no engine yet: it takes this one.
+    if (g_cb_open != nullptr &&
+        ((g_cb_engine != nullptr && g_cb_engine != &engine) || g_cb_used + need > CbRoom)) {
         PostCbWrites();
     }
     if (g_cb_open == nullptr) {
-        Job& job = TakeSlot(false);
-        job.async = true;
-        job.info = HandInfo{.hand = Hand::CbWords};
-        g_cb_open = &job;
+        OpenRecord(&engine);
+    } else if (g_cb_engine == nullptr) {
         g_cb_engine = &engine;
-        g_cb_used = 0;
-        g_cb_segments = 0;
-        ++g_e1.hands[static_cast<size_t>(Hand::CbWords)];
     }
     u8* const at = g.buffers[g_cb_open->seq % Slots].cb.get() + g_cb_used;
     const CbSegment segment{
-        .target = target,
-        .seq = ++g_cb_staged,
-        .bytes = bytes,
+        .kind = SegmentCbWrite,
         .block = static_cast<u8>(block ? 1 : 0),
         .sample = static_cast<u8>(Sample() ? 1 : 0),
+        .pad = 0,
+        .bytes = bytes,
+        .target = target,
+        .seq = ++g_cb_staged,
     };
     std::memcpy(at, &segment, sizeof(segment));
     std::memcpy(at + sizeof(segment), values, bytes);
     g_cb_used += need;
     ++g_cb_segments;
+    ++g_rec_words;
     ++g_e1.cb_segments;
     g_e1.cb_bytes += bytes;
 }
@@ -1790,7 +2157,13 @@ void PostCbWrites() noexcept {
     if (g_fill_state.capture != nullptr) {
         g_fill_state.capture(job.fill_state.data(), true);
     }
-    ++g_e1.cb_records;
+    if (g_rec_words != 0) {
+        ++g_e1.cb_records;
+    }
+    if (g_rec_binds != 0) {
+        ++g_e1.bind_records;
+        g_e1.bind_only_records += g_rec_words == 0 ? 1 : 0;
+    }
     Publish(job.seq);
 }
 
