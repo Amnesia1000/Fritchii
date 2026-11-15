@@ -178,6 +178,9 @@ The front's delay tests (live, default 0 = nothing changes; work\fable_stage_lev
   returned. n = 200 is about 48 ms/s.
 - KIND 3 ("C"): once every 64 3D macro calls on the front (Maxwell3D::FrontRunMacro, before the
   call; with the split only). n = 2 is about 78 ms/s.
+- KIND 4 ("P", the front split's FS0, work\FRONT_SPLIT_DESIGN.md 4.3): once every 16 list
+  entries (DmaPusher::Step, an entry with words, before its checks; resumed entries count
+  again). At about 84,000 entries a second n = 8 is about 42 ms/s.
 - FRITCHII_DELAY_BEFORE=1 (the existing switch, which also moves the drain tests) moves kinds 1
   and 2 before their wait: kind 1 spins at the acquire's suspension, kind 2 right before the
   wait begins. The control: after the wait the back has reached what was waited for, so a spin
@@ -2152,6 +2155,53 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   ring batch, a local test per entry, two plain loads per filled draw (and three tests of a local
   it holds), one per lend, bind, root table load, condition, stream write, non-empty sink and
   Vulkan state tracker invalidation; the register write hook shares the key-watch byte.
+  ring batch, a local test per entry, two plain loads per filled draw, one per lend, bind, root
+  table load, condition, stream write and non-empty sink; the register write hook shares the key-watch byte.
+- FRITCHII_FRONT_SPLIT_COUNT (live, default 0; the front split's step FS0,
+  work/FRONT_SPLIT_DESIGN.md 4.3, src/video_core/fritchii_front_split.h): dry, nothing sent
+  changes. 1 = one DmaPusher::Step call in 64 (random pick, scaled by counted / timed) timed by
+  stage with time stamp ticks: parser (Step, re-reads, entry checks, acquires, header decode),
+  3D state (below Maxwell3D::FrontCallMethod / FrontCallMultiMethod, macros included), compute
+  (KeplerCompute's front calls), ring sends (FrontWriteSend's entry, the list's Method / Multi
+  entries; compute's own sends stay in compute); waits for the back (WaitFor, Drain) are taken
+  out of the stage they happened in. Counted: entries, headers, words, suspensions; 2a's joins
+  by cause (an acquire check with engine methods decoded since the last join, a list writer
+  check with a writer note since, a GPU-written list on the list draw / dispatch path, Step's
+  Run) and Step's Defers; the raw ring words 2c would send for 3D and compute (Method 1, Multi
+  2 + words / 2) against the ring words sent; macro DMA reads by answer (0xe2c apart: forwarded,
+  snapshot hit, drained for a noted overlap / writer / new page / report page / no snapshot
+  path, deferred to E); entries copied again by a second refresh before their parse; front time
+  per channel. Line every 10 s "Front split dry: ...". Off: one relaxed load and a compare per
+  Step, one plain load per hooked call (stage boundaries incl. FrontWriteSend, engine calls,
+  writer notes, acquire checks, macro DMA reads, waits).
+- FRITCHII_NOTED_SUMMARY (live, default 0; F4 of work/FRONT_SPLIT_DESIGN.md 2d, the same shape as
+  FRITCHII_DISPATCH_WALK_SUMMARY): GpuSplit::NotedWriteSince (each 0xe2c read check whose page
+  snapshot predates a noted write) answers from page buckets before walking pending_writes. The
+  front keeps the newest note position per page bucket (4,096 by page hash) and one for notes
+  over more than 16 pages or of unknown range, from the moment the switch is first read non-zero
+  (the "floor"); a read since a position at or after the floor whose buckets and wide position
+  are all at or before it has no noted write (exact: every later note set its pages' buckets;
+  collisions only cause walks; the walk's own "table overflowed" answer is only conservative).
+  1 = on (answered checks skip the walk; 1 in 64 checks walk anyway, timed and compared), 2 =
+  verify (the walk runs after every check and answers; NotedSummaryDiffer: buckets said no,
+  walk found an overlapping note, must be 0, first 16 logged), 3 = dry (as 2, read for counts
+  and the timed saving). Line every 10 s "Noted summary (FRITCHII_NOTED_SUMMARY=N)": checks,
+  answered, why the others walked, walk notes the answered checks skip, the timed summary and
+  walk ns and the saving in ms/s, the differences. Also in the "Front split dry" line. Off: one
+  relaxed load per check, one plain load per note.
+- FRITCHII_STEP_LEAN (live, default 0; F6 of work/FRONT_SPLIT_DESIGN.md 2d): 1 = the list writer
+  waits line (MaybeLogListWaits) reads the clock on every 256th call instead of every list
+  entry (its rates are counts over the clock time between lines: unchanged, a line comes at
+  most 255 entries later), and a command list that ran out gives its heap storage (entries past
+  the inline 512, submitted words, offsets, deferred entries) back to the submitter through 8
+  lock-free slots instead of freeing it on the front; the submit's CommandList takes it
+  (emptied, capacity kept). Storage finding no free slot is freed as before; over 16 MiB of
+  words is never kept. Off: one relaxed load per list entry check and per list popped, one call
+  and a relaxed load per list submitted.
+- FRITCHII_ONEF_NULL_FILL (live, default 0; test only, the picture breaks): 1 = E skips
+  FlushCaching, FillRing and PushDraw for every draw it would fill (no packet, R draws nothing;
+  TickWork as after a push). The front-wall probe of work/FRONT_SPLIT_DESIGN.md 4.3. Line every
+  10 s "Null fill (FRITCHII_ONEF_NULL_FILL=1, ...)". Off: one relaxed load per filled draw.
 - FRITCHII_ONEF_TRACE (boot, default 0; fable_b_one_follower 15.5): 1 = the lend trace. One
   72-byte record per lend and per posted op (packet number, site, op kind, posted, E's arrival,
   R's start and end, E's resume, E's work since its previous record, R's busy time on other

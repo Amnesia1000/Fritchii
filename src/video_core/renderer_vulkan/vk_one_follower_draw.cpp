@@ -784,6 +784,13 @@ void OneFollowerDraw::LendDraw(bool is_indexed, u32 instance_count, LentReason r
 
 bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, bool list,
                                   LentReason& reason) {
+    // FRITCHII_ONEF_NULL_FILL=1 (test only, the picture breaks; the front split's front-wall
+    // probe): no flush, fill or push, R draws nothing; TickWork as after a push. Off: one
+    // relaxed load.
+    if (VideoCommon::FrontSplit::NullFill()) [[unlikely]] {
+        rasterizer.gpu.TickWork();
+        return true;
+    }
     // FRITCHII_ESPLIT_COUNT: E2's parts of the draw carved out of E1's (g_state read once).
     namespace ESplit = VideoCommon::ESplit;
     const u8 esplit = ESplit::g_state;

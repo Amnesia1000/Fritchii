@@ -644,6 +644,18 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_BANK_FAST") {
         return &g_bank_fast;
     }
+    if (name == "FRITCHII_FRONT_SPLIT_COUNT") {
+        return &g_front_split_count;
+    }
+    if (name == "FRITCHII_ONEF_NULL_FILL") {
+        return &g_onef_null_fill;
+    }
+    if (name == "FRITCHII_NOTED_SUMMARY") {
+        return &g_noted_summary;
+    }
+    if (name == "FRITCHII_STEP_LEAN") {
+        return &g_step_lean;
+    }
     if (name == "FRITCHII_S4_COUNT") {
         return &g_s4_count;
     }
