@@ -124,6 +124,15 @@ struct Impl {
     u64 query_log_ns{};
     std::atomic<bool> query_ops_logged{};
     std::atomic<u64> guest_write_op{}; ///< GuestWriteOpMark
+    // FRITCHII_ONEF_CARRY_OPS (E counts; the frame-end line reads them): ops carried, the
+    // packets that carried them by kind (draw, lent, op, delta), the ones sent alone by why
+    // (E's consumed store, a drain, no room).
+    std::atomic<u64> carried_ops{};
+    std::array<std::atomic<u64>, 4> carriers{};
+    std::array<std::atomic<u64>, 3> carried_alone{};
+    u64 carried_ops_logged{};
+    std::array<u64, 4> carriers_logged{};
+    std::array<u64, 3> carried_alone_logged{};
     /// Lends E made holding a watched lock (handed to R for the park), the op packets' line.
     std::atomic<u64> lends_holding_lock{};
     u64 lends_holding_lock_logged{};
@@ -211,6 +220,12 @@ thread_local QueryKind t_query_kind{QueryKind::Count};
 /// invalidations) run unless LEAN without the GPU profile.
 bool CountersOn() noexcept {
     return !g.lean || Nx2Profile::Enabled();
+}
+/// FRITCHII_ONEF_CARRY_OPS (live, default 0; fable_b 22.3 step 2): PushOp's `carry` ops ride in
+/// the next packet.
+bool CarryOpsOn() noexcept {
+    return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_carry_ops,
+                                            "FRITCHII_ONEF_CARRY_OPS") != 0;
 }
 
 /// E: SetLendSite's name for the next Lend, consumed by it.
@@ -343,14 +358,105 @@ constexpr std::size_t MaxSpanBytes = sizeof(RegPair) * Maxwell3D::Regs::NUM_REGS
                                      sizeof(BindValue) * MaxBindValues + 64;
 constexpr std::size_t MaxPayloadBytes = 64;
 
+/// FRITCHII_ONEF_CARRY_OPS (fable_b 22.3 step 2): one op E keeps for the next packet, followed by
+/// its payload padded to 8 bytes.
+struct CarryRecord {
+    void (*function)(void*);
+    u32 size;     ///< payload bytes
+    u32 reserved;
+};
+static_assert(sizeof(CarryRecord) == 16);
+/// A carrying packet's last 8 bytes: the records' count and bytes (the trailer excluded).
+struct CarryTrailer {
+    u32 count;
+    u32 bytes;
+};
+static_assert(sizeof(CarryTrailer) == 8);
+/// The most E keeps before it sends them alone: 12 sample reports (16 + 56 bytes each).
+constexpr std::size_t MaxCarryBytes = 1024;
+
+/// E only: the ops kept for the next packet.
+struct Carry {
+    alignas(8) std::array<u8, MaxCarryBytes> bytes{};
+    u32 used{};
+    u32 count{};
+    /// Ring A position of the oldest kept op: the carrying packet's floor (EngineConsumed's
+    /// `positions`), so `played` never passes a kept op before R ran it.
+    u64 floor{~u64{0}};
+    /// Position + 1 of the newest kept op that lands in memory (PushOp's GuestWriteOpMark), 0 none.
+    u64 lands{};
+};
+Carry g_carry;
+
 /// E's packet buffer (fable_b 11.1 item 0): allocated once per thread, written at a cursor, never
 /// resized or cleared on the hot path (the spans' bytes are written before they are sent).
 u8* PackBuffer() {
     thread_local std::unique_ptr<u8[]> buffer;
     if (!buffer) [[unlikely]] {
-        buffer.reset(new u8[sizeof(PacketHeader) + MaxSpanBytes + MaxPayloadBytes]);
+        buffer.reset(new u8[sizeof(PacketHeader) + MaxSpanBytes + MaxPayloadBytes + MaxCarryBytes +
+                            sizeof(CarryTrailer)]);
     }
     return buffer.get();
+}
+
+/// E: puts the kept ops after the packet's body (`body_bytes` after the header; the header's
+/// position is set) and returns the body's new size. `floor` is what Commit records for this
+/// packet's place: the oldest kept op's position when that is earlier.
+std::size_t AppendCarried(PacketHeader& header, u8* buffer, std::size_t body_bytes, u64& floor) {
+    floor = header.position;
+    if (g_carry.count == 0) {
+        return body_bytes;
+    }
+    u8* const at = buffer + sizeof(PacketHeader) + body_bytes;
+    std::memcpy(at, g_carry.bytes.data(), g_carry.used);
+    const CarryTrailer trailer{g_carry.count, g_carry.used};
+    std::memcpy(at + g_carry.used, &trailer, sizeof(trailer));
+    header.flags |= PacketCarried;
+    floor = (std::min)(floor, g_carry.floor);
+    const size_t kind = header.kind == PacketKind::Draw   ? 0
+                        : header.kind == PacketKind::Lent ? 1
+                        : header.kind == PacketKind::Op   ? 2
+                                                          : 3;
+    g.carriers[kind].store(g.carriers[kind].load(std::memory_order_relaxed) + 1,
+                           std::memory_order_relaxed);
+    g.carried_ops.store(g.carried_ops.load(std::memory_order_relaxed) + g_carry.count,
+                        std::memory_order_relaxed);
+    return body_bytes + g_carry.used + sizeof(trailer);
+}
+
+/// E, right after Commit of a packet AppendCarried filled: the kept ops are R's now.
+void CarriedSent() {
+    if (g_carry.count == 0) {
+        return;
+    }
+    if (g_carry.lands != 0) {
+        // As PushOp's own mark, before E's next `consumed` store (seq_cst there).
+        g.guest_write_op.store(g_carry.lands, std::memory_order_release);
+    }
+    g_carry.used = 0;
+    g_carry.count = 0;
+    g_carry.floor = ~u64{0};
+    g_carry.lands = 0;
+}
+
+/// R, at the start of a PacketCarried packet (`packet` = its header): the carried ops, in order.
+void RunCarried(const PacketHeader& header, const u8* packet) {
+    CarryTrailer trailer;
+    std::memcpy(&trailer, packet + header.bytes - sizeof(trailer), sizeof(trailer));
+    const u8* at = packet + header.bytes - sizeof(trailer) - trailer.bytes;
+    for (u32 i = 0; i < trailer.count; ++i) {
+        CarryRecord record;
+        std::memcpy(&record, at, sizeof(record));
+        at += sizeof(record);
+        try {
+            record.function(const_cast<u8*>(at));
+        } catch (...) {
+            if (!g.op_error) {
+                g.op_error = std::current_exception();
+            }
+        }
+        at += (record.size + 7) & ~u32{7};
+    }
 }
 /// E: the draw the next Lend or PackSpans is for (SetNextDraw), consumed by them.
 thread_local DrawValues t_next_draw{};
@@ -743,6 +849,33 @@ void LogQueryKinds() {
     g.lends_holding_lock_logged = g.lends_holding_lock.load(std::memory_order_relaxed);
     g.op_bytes_logged = op_bytes;
     {
+        // FRITCHII_ONEF_CARRY_OPS (fable_b 22.3 step 2): the ops that rode in another packet.
+        const auto rate = [seconds](const std::atomic<u64>& counter, u64& logged) {
+            const u64 now = counter.load(std::memory_order_relaxed);
+            const double value = static_cast<double>(now - logged) / seconds;
+            logged = now;
+            return value;
+        };
+        const double carried = rate(g.carried_ops, g.carried_ops_logged);
+        std::array<double, 4> carriers{};
+        for (size_t i = 0; i < carriers.size(); ++i) {
+            carriers[i] = rate(g.carriers[i], g.carriers_logged[i]);
+        }
+        std::array<double, 3> alone{};
+        for (size_t i = 0; i < alone.size(); ++i) {
+            alone[i] = rate(g.carried_alone[i], g.carried_alone_logged[i]);
+        }
+        if (carried != 0.0 || CarryOpsOn()) {
+            LOG_INFO(HW_GPU,
+                     "One follower carried ops (fable_b 22.3, FRITCHII_ONEF_CARRY_OPS={}) {:.0f} "
+                     "s: {:.0f}/s rode in {:.0f} packets/s: draw {:.0f}, lent {:.0f}, op {:.0f}, "
+                     "alone {:.0f} (at E's consumed store {:.0f}, a drain {:.0f}, no room {:.0f})",
+                     CarryOpsOn() ? 1 : 0, seconds, carried,
+                     carriers[0] + carriers[1] + carriers[2] + carriers[3], carriers[0],
+                     carriers[1], carriers[2], carriers[3], alone[0], alone[1], alone[2]);
+        }
+    }
+    {
         // FRITCHII_ONEF_OP_DISPATCH: where each dispatch went (lent ones by reason), and the
         // posted share. Only while the switch is on (step 4).
         std::array<double, static_cast<size_t>(DispatchCount::Count)> rates{};
@@ -825,6 +958,11 @@ void LogMaybe() {
 /// R: one packet. Returns where its time goes (Stats::RenderTime).
 Stats::RenderTime Play(const PacketHeader& header, const u8* spans) {
     t_play_number = static_cast<u32>(header.number);
+    if ((header.flags & PacketCarried) != 0) {
+        // FRITCHII_ONEF_CARRY_OPS: the ops E kept since its last packet were made before this
+        // packet's own place, so they run first (they read nothing of the view the spans move).
+        RunCarried(header, spans - sizeof(PacketHeader));
+    }
     RegisterView& view = View();
     Maxwell3D* const engine = g.engine.load(std::memory_order_acquire);
     const bool view_on = Step() >= StepLevel::View;
@@ -1378,6 +1516,10 @@ void Start(Core::System& system) {
     g.write = 0;
     g.pushed = 0;
     g.draw_seq = 0;
+    g_carry.used = 0; // E is not running: nothing kept survives a session
+    g_carry.count = 0;
+    g_carry.floor = ~u64{0};
+    g_carry.lands = 0;
     g.sent.store(0, std::memory_order_relaxed);
     g.sent_packets.store(0, std::memory_order_relaxed);
     g.intended.store(0, std::memory_order_relaxed);
@@ -1446,7 +1588,14 @@ void SetNextDraw(u32 kind, bool indexed, bool indirect, u32 instance_arg) noexce
 
 namespace {
 void PushPacked(PacketHeader& header, u8* buffer, std::size_t body_bytes);
+void SendCarriedAlone(size_t why);
 } // Anonymous namespace
+
+void FlushCarried() noexcept {
+    if (g_carry.count != 0 && Detail::t_engine && g.thread.joinable()) {
+        SendCarriedAlone(0);
+    }
+}
 
 void Lend(LentOp op, LentReason reason, void (*function)(void*), void* argument) {
     if (!Detail::t_engine || !g.thread.joinable()) {
@@ -1491,9 +1640,12 @@ void Lend(LentOp op, LentReason reason, void (*function)(void*), void* argument)
     if (op == LentOp::Draw) {
         t_next_draw_set = false;
     }
+    u64 floor = header.position;
+    spans_bytes = AppendCarried(header, buffer, spans_bytes, floor);
     header.bytes = static_cast<u32>(sizeof(PacketHeader) + spans_bytes);
     std::memcpy(buffer, &header, sizeof(header));
-    Commit(buffer, header.bytes, number, header.position, false);
+    Commit(buffer, header.bytes, number, floor, false);
+    CarriedSent();
     if (counting) {
         Stats::Pushed(header, kind, behind);
     }
@@ -1564,7 +1716,7 @@ void Lend(LentOp op, LentReason reason, void (*function)(void*), void* argument)
 }
 
 void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size,
-            bool lands_in_memory, u8 packet_flags) {
+            bool lands_in_memory, u8 packet_flags, bool carry) {
     if (!Detail::t_engine || !g.thread.joinable() || size > MaxPayloadBytes) {
         if (size > MaxPayloadBytes && Detail::t_engine && g.thread.joinable()) [[unlikely]] {
             // An R op run on E: a bug in the op's payload, never silent (its effects are R's).
@@ -1581,6 +1733,27 @@ void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size,
     if (op == LentOp::Query && t_query_kind != QueryKind::Count) {
         g.query_count[static_cast<size_t>(t_query_kind)].fetch_add(1, std::memory_order_relaxed);
         t_query_kind = QueryKind::Count;
+    }
+    if (carry && packet_flags == 0 && CarryOpsOn()) {
+        // FRITCHII_ONEF_CARRY_OPS: kept for the next packet (no spans: the op reads nothing of
+        // R's view, and E's changes since the last packet go with the next one).
+        const std::size_t record_bytes = sizeof(CarryRecord) + ((size + 7) & ~u32{7});
+        if (g_carry.used + record_bytes > MaxCarryBytes) [[unlikely]] {
+            SendCarriedAlone(2);
+        }
+        const u64 position = GpuSplit::Get().BackEntryPosition();
+        const CarryRecord record{function, size, 0};
+        u8* const at = g_carry.bytes.data() + g_carry.used;
+        std::memcpy(at, &record, sizeof(record));
+        std::memcpy(at + sizeof(record), payload, size);
+        g_carry.used += static_cast<u32>(record_bytes);
+        ++g_carry.count;
+        g_carry.floor = (std::min)(g_carry.floor, position);
+        if (lands_in_memory) {
+            g_carry.lands = position + 1;
+        }
+        t_lend_site = nullptr;
+        return;
     }
     u8* const buffer = PackBuffer();
     PacketHeader header{};
@@ -2227,14 +2400,39 @@ void PushPacked(PacketHeader& header, u8* buffer, std::size_t body_bytes) {
     if (header.draw_seq == 0) {
         header.draw_seq = header.kind == PacketKind::Draw ? ++g.draw_seq : g.draw_seq;
     }
+    u64 floor = header.position;
+    body_bytes = AppendCarried(header, buffer, body_bytes, floor);
     header.bytes = static_cast<u32>(sizeof(PacketHeader) + body_bytes);
     const u32 kind = header.kind == PacketKind::Draw ? TakeDrawKind(header) : 0;
     t_next_draw_set = false;
     std::memcpy(buffer, &header, sizeof(header));
-    Commit(buffer, header.bytes, header.number, header.position, true);
+    Commit(buffer, header.bytes, header.number, floor, true);
+    CarriedSent();
     if (counting) {
         Stats::Pushed(header, kind, behind);
     }
+}
+
+/// E: the kept ops as a packet of their own (a Delta with no spans: E's changes since the last
+/// packet stay for the next one). `why`: 0 E's consumed store, 1 a drain, 2 no room.
+void SendCarriedAlone(size_t why) {
+    if (g_carry.count == 0) {
+        return;
+    }
+    g.carried_alone[why].store(g.carried_alone[why].load(std::memory_order_relaxed) + 1,
+                               std::memory_order_relaxed);
+    u8* const buffer = PackBuffer();
+    PacketHeader header{};
+    header.kind = PacketKind::Delta;
+    header.number = ++g.pushed;
+    header.position = GpuSplit::Get().BackEntryPosition();
+    header.draw_seq = g.draw_seq;
+    u64 floor = header.position;
+    const std::size_t body_bytes = AppendCarried(header, buffer, 0, floor);
+    header.bytes = static_cast<u32>(sizeof(PacketHeader) + body_bytes);
+    std::memcpy(buffer, &header, sizeof(header));
+    Commit(buffer, header.bytes, header.number, floor, true);
+    CarriedSent();
 }
 } // Anonymous namespace
 
@@ -2253,6 +2451,9 @@ void Push(PacketHeader& header, std::span<const u8> spans) {
 void Drain() {
     if (!Detail::t_engine) {
         return;
+    }
+    if (g_carry.count != 0 && g.thread.joinable()) {
+        SendCarriedAlone(1); // R plays everything E made, the kept ops too
     }
     const u64 target = g.pushed;
     const u64 waited =

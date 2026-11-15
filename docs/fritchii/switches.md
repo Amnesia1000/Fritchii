@@ -1556,6 +1556,21 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   gpu_memory, kepler_compute) are read by E (RouteDraw, the posted clear's FlushCaching, the
   query and flush tests) and by R (played draws, ops) at their own places, and the view scope
   saves and restores maxwell3d on R; a posted bind needs those split into E's and R's copies.
+- FRITCHII_ONEF_CARRY_OPS (live, default 0; fable_b_one_follower 22.3 step 2, "query reset and
+  report inside the draw packet"; with QUERY_OPS on, step 3+): 1 = the samples counter resets
+  and the posted samples reports (ZPassPixelCount64, about 75,000 of each a second in the
+  market, 1.15 a draw together) are not an op packet each: E keeps them (PushOp's `carry`,
+  payload copied, no spans packed) and the next packet E pushes, of any kind, carries them
+  after its body (PacketCarried, a CarryTrailer last). R runs them first at that packet, in
+  order, before its spans, its draw, its op or its lent call, so the order against every other
+  packet is today's. They read nothing of R's view (the samples streamer reads no register;
+  the transform feedback ones do and stay op packets). E sends what it keeps as a packet of its
+  own (a Delta with no spans) before every `consumed` store (GpuSplit::StoreConsumed, so a
+  kept report's GuestWriteOpMark is set before the front can see E past it), at a drain, and
+  when 1 KiB is kept; a carrying packet's floor (`played`'s clamp) is its oldest kept op's
+  position. Line "One follower carried ops" every 10 s: ops carried a second, the packets that
+  carried them (draw, lent, op, alone), and why alone ones went. Expected (Fable 22.3): 20 to
+  30 ms/s off E, and R's per-packet cost for the same number of packets.
 - FRITCHII_ONEF_TRACE (boot, default 0; fable_b_one_follower 15.5): 1 = the lend trace. One
   72-byte record per lend and per posted op (packet number, site, op kind, posted, E's arrival,
   R's start and end, E's resume, E's work since its previous record, R's busy time on other

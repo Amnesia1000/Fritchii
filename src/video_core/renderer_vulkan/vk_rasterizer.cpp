@@ -5205,6 +5205,9 @@ void RasterizerVulkan::ResetCounter(VideoCommon::QueryType type) {
                 VideoCommon::QueryType type;
             } const op{this, type};
             OneF::SetLendSite("ResetCounter (posted)");
+            // FRITCHII_ONEF_CARRY_OPS (fable_b 22.3 step 2): the samples streamer's reset reads
+            // nothing of R's view, so it may ride in E's next packet (the others read the
+            // transform feedback registers).
             OneF::PushOp(
                 OneF::LentOp::Query,
                 [](void* raw) {
@@ -5212,7 +5215,8 @@ void RasterizerVulkan::ResetCounter(VideoCommon::QueryType type) {
                     std::memcpy(&a, raw, sizeof(a));
                     a.self->ResetCounter(a.type);
                 },
-                &op, sizeof(op));
+                &op, sizeof(op), false, 0,
+                type == VideoCommon::QueryType::ZPassPixelCount64);
             return;
         }
     }
@@ -5401,7 +5405,8 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                         a.self->query_cache.CounterReportAt(a.gpu_addr, a.device, a.type, a.flags,
                                                             a.payload, a.subreport);
                     },
-                    &op, sizeof(op), true);
+                    &op, sizeof(op), true, 0,
+                    type == VideoCommon::QueryType::ZPassPixelCount64); // CARRY_OPS, as the reset
                 return;
             }
         }
