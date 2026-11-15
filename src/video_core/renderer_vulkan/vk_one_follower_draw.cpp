@@ -983,6 +983,9 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
                     if (memory_manager.HasPendingCachedWrites() ||
                         VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) {
                         VideoCommon::ESplit::NoteLateFlush();
+                        // FRITCHII_ESPLIT_OWED's ESplitLateShader (sampled): nothing this flush
+                        // invalidates after E1's lookup is shader code.
+                        VideoCommon::ESplit::CheckLateFlush(&memory_manager);
                         // S4: the flush's buffer marks go to E2's flags (the view, at this draw
                         // after its record), never to E1's engine, which has moved on. No cache
                         // lock around it: the invalidation may be lent, and R takes that lock (R
@@ -1056,6 +1059,7 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
             if (memory_manager.HasPendingCachedWrites() ||
                 VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) {
                 ESplit::NoteLateFlush();
+                ESplit::CheckLateFlush(&memory_manager);
                 memory_manager.FlushCaching();
             }
         }

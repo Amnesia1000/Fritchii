@@ -2345,7 +2345,7 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   idle, so E1 does not wait for it before the lookup. Exact for the same reason the tail flush
   with E2 behind is: what it invalidates is on no shader page, and the lookup reads shader code
   and the pipeline cache only. Counted in the cb words line ("draw flushes").
-- FRITCHII_ESPLIT_ASYNC_KINDS (live, default 7; with FRITCHII_ESPLIT=1 in the queued mode): the
+- FRITCHII_ESPLIT_ASYNC_KINDS (live, default 15; with FRITCHII_ESPLIT=1 in the queued mode): the
   E2 entries that go to E2's queue instead of a join (E2 drained, E1 runs it). Bit 0, memory stage
   cache calls (Call entries tagged StageTag::Cache: fence releases, GPU cache invalidations,
   reference signals, the puller's wait for idle and semaphore releases, the compute list words;
@@ -2357,10 +2357,29 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   Method, Multi and Pairs entry of the compute engine, its sink included, on E2 with the engine by
   value (GpuSplit::ExecuteOnEngine); KeplerCompute and DispatchCompute read no Maxwell3D register
   (the OoT network bypass reads the tonemap target under its lock, recorded on R as today). 3 =
-  compute entries back to joins if an image differs. A change drains E2 first. The thread's lines name the entries that still
+  compute entries back to joins if an image differs. Bit 3, posted ops: OneFollower::PushOp from
+  E1 packs its spans (E1's registers at the op's place) and payload into a packet that E2 commits
+  to R's queue in ring order, as an async draw's packet (no drain; carried ops still drain). A
+  change drains E2 first. The thread's lines name the entries that still
   join, by kind ("entries that join ... top kinds": engine, ring kind, method, or a call's tag and
   function), top 8 with rates. E2Order covers the queue's order. Also: the S4 constant buffer
   path no longer joins on the GPU profile's price timers (they time the memory half on E2).
+- FRITCHII_ESPLIT_IDLE (live, default 1; the queued mode): E1 never drains E2 because its ring
+  ran out. A batch's end (the fence quiet check and the `consumed` store at that place) goes to E2
+  as a record; with no new ring words E1 waits for E2 to go idle or for new words, whichever comes
+  first, and E's idle work then finds E2 idle. 0 = the joins as before (a drain at every batch end
+  and before the idle hook). Line "E1 waiting for E2 by cause (ms/s)": each join class, queue
+  room, draw depth, time held for E2's lends, push joins by kind (lends, posted ops, pushes,
+  drains, carried ops) with counts and ms/s, batch ends posted, idle waits and those ended by new
+  ring words.
+- FRITCHII_ESPLIT_OWED (live, default 1; the queued mode): a draw's flush is owed by shader page
+  writes and E1's own work, not by any cached write during an async job (S4's ESplitAsyncWrite
+  counted R's concurrent writes too; it is a count now). Writes whose destination E1 knows are
+  tested against the shader page filter at the queue (report queries, puller semaphore releases,
+  S4's constant buffer writes); compute uploads count as writes anywhere; any E thread's write on
+  shader pages sets the pending flag: the next lookup drains E2 and flushes first (a lookup join).
+  Must be 0: ESplitLateShader, 1 late flush in 16 tests the ranges it invalidates (after E1's
+  lookup) against shader pages. 0 = S4's rule.
 - FRITCHII_ESPLIT_PIN (boot, default 0; with FRITCHII_ESPLIT=1, step S3): where E1 and E2 run.
   0 = E1 keeps E's pinned core (PinnedRole::GpuBack), E2 on the performance cores; 1 = E2 on E's
   old core, E1 unpinned on the performance cores; 2 = E's core split by SMT sibling (E2 one

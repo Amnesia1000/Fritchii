@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <type_traits>
 
 #include "common/common_types.h"
 
@@ -113,6 +114,7 @@ enum class Hand : u8 {
     CbWords,  ///< S4: constant buffer words' memory half, by value (several writes a record)
     Async,    ///< an E2 entry queued whole (a cache call, a compute engine entry)
     Raster,   ///< a 3D method's rasterizer call, by value (its register half ran on E1)
+    Op,       ///< a posted op E1 packed, committed to R's queue by E2
     Count,
 };
 
@@ -300,6 +302,8 @@ inline constexpr std::size_t AsyncPayloadBytes = 192;
                                   AsyncSlot& slot) noexcept;
 /// E1: posts the slot BeginAsyncDraw (or BeginAsync) gave: `function(payload)` runs on E2.
 void PostAsync(void (*function)(void*)) noexcept;
+/// E1: an async slot with a packet buffer (OneFollower::PackedDrawRoom bytes) in `packet`.
+[[nodiscard]] void* BeginAsyncPacket(Hand hand, u8*& packet) noexcept;
 /// E1: a slot for an async job without a record (a bind by value, a position store).
 [[nodiscard]] void* BeginAsync(Hand hand) noexcept;
 /// E1: a draw tail stayed with E1 (0: no async fit, 3: S1 lockstep), counted.
@@ -323,13 +327,22 @@ void CheckStoreOnE1() noexcept;
 /// OneFollower::Lend, PushOp, Push, Drain, FlushCarried: R's packet queue has one producer and a
 /// lent call may read E's state. E1 (S2): E2 drained first, the buffer flags to the engine; E2 in
 /// a lend (S2): E1 held. `visible`: a fence or query op (E1Visible when E1 makes it).
-[[nodiscard]] bool BeforeEnginePushImpl(bool lend, bool visible) noexcept;
+/// What E1 pushes to R (the push joins are counted and timed by it).
+enum class PushKind : u8 {
+    Lend,    ///< OneFollower::Lend (E parks until R ran the call)
+    Op,      ///< PushOp, a posted op (R runs it later)
+    Push,    ///< OneFollower::Push
+    Drain,   ///< OneFollower::Drain (E waits for R to play everything)
+    Carried, ///< FlushCarried (the kept ops at a `consumed` store)
+    Count,
+};
+[[nodiscard]] bool BeforeEnginePushImpl(bool lend, bool visible, PushKind kind) noexcept;
 void AfterEnginePushImpl(bool lend, bool acted) noexcept;
 class PushGuard {
 public:
-    PushGuard(bool lend_, bool visible) noexcept : lend{lend_} {
+    PushGuard(bool lend_, bool visible, PushKind kind = PushKind::Push) noexcept : lend{lend_} {
         if (g_thread) [[unlikely]] {
-            acted = BeforeEnginePushImpl(lend, visible);
+            acted = BeforeEnginePushImpl(lend, visible, kind);
         }
     }
     ~PushGuard() {
@@ -383,6 +396,9 @@ void NoteCbGuardHit() noexcept;
 ///          tiled_cache_barrier, report_semaphore.query, clear_report_value, sync_info. E1 runs
 ///          the method (register write, dirty flags, the values the handler reads); the one
 ///          rasterizer call it ends in goes to E2 by value (QueueRasterOp).
+///   bit 3, posted ops: OneFollower::PushOp from E1 (an op R runs later, E not parked). E1 packs
+///          the spans (its registers at the op's place) and the payload into a packet, E2
+///          commits it to R's queue in ring order, as an async draw's packet; no drain.
 ///   bit 2, compute engine entries: every Method, Multi and Pairs entry of the compute engine,
 ///          its sink included, on E2 with the engine named by value. KeplerCompute and the
 ///          rasterizer's DispatchCompute read no Maxwell3D register (checked in the code: the
@@ -392,7 +408,8 @@ enum AsyncKindBit : u32 {
     KindCacheCalls = 1,
     KindRasterOps = 2,
     KindCompute = 4,
-    KindsDefault = KindCacheCalls | KindRasterOps | KindCompute,
+    KindPostedOps = 8,
+    KindsDefault = KindCacheCalls | KindRasterOps | KindCompute | KindPostedOps,
 };
 /// E1 writes it at a batch's start, E2 drained.
 inline u32 g_async_kinds{};
@@ -422,6 +439,43 @@ void QueueRasterOpImpl(RasterOp op, VideoCore::RasterizerInterface& rasterizer, 
     }
     return false;
 }
+
+// --- E1's batch end and idle (FRITCHII_ESPLIT_IDLE), the owed flush (FRITCHII_ESPLIT_OWED) -------
+
+/// FRITCHII_ESPLIT_IDLE=1 (default): E1 never drains E2 because its own ring ran out. The batch's
+/// end (the fence quiet check and the `consumed` store at that place) goes to E2 as a record, and
+/// with no new ring words E1 waits for E2 to go idle or for the front to publish, whichever comes
+/// first, before E's idle work (the idle hook, which then finds E2 idle: no wait). Before, each
+/// batch end drained E2 (a join) while the front's new words waited for E1.
+inline bool g_idle_async{};
+[[nodiscard]] inline bool IdleAsync() noexcept {
+    return g_idle_async && g_async && t_role == 1 && t_join == 0;
+}
+bool WaitE2IdleOrImpl(bool (*more)(void*), void* argument) noexcept;
+/// E1 with no ring words: waits until E2 is idle (false) or `more()` (true).
+template <typename More>
+[[nodiscard]] bool WaitE2IdleOr(More&& more) noexcept {
+    return WaitE2IdleOrImpl([](void* raw) { return (*static_cast<std::remove_reference_t<More>*>(raw))(); },
+                            &more);
+}
+
+/// FRITCHII_ESPLIT_OWED=1 (default): an async job's cached writes no longer make the next flush
+/// owed (S4's ESplitAsyncWrite counted any write during the job, R's included, and is a count
+/// now). A late flush can only matter to E1's lookup through shader pages, so: a queued write
+/// whose destination E1 knows is tested against them at the queue (report queries, semaphore
+/// releases; constant buffer writes by S4's own test), a compute upload counts as one, and any
+/// E thread's write that hits them sets g_shader_pending (the next lookup drains and flushes).
+/// ESplitLateShader (must be 0, 1 late flush in 16): the ranges a late flush on E2 invalidates
+/// after E1's lookup land on no shader page.
+inline bool g_owed_shader_rule{};
+/// E1: a queued write to `address` (`size` bytes) through `memory` (Tegra::MemoryManager*).
+void NoteQueuedWrite(const void* memory, u64 address, u64 size) noexcept;
+/// E1: FRITCHII_ESPLIT_IDLE's batch end went to E2 (counted).
+void NoteBatchEnd() noexcept;
+/// E1: a queued job may write game memory anywhere (a compute upload).
+void NoteQueuedWriteAnywhere() noexcept;
+/// E2, before a late flush (after E1's lookup): the sampled check (`memory`: Tegra::MemoryManager*).
+void CheckLateFlush(const void* memory) noexcept;
 
 /// GpuSplit::BackLoop, the queued mode: an entry that joined, by kind (the 10 s line names the
 /// top 8): ring kind, engine (0 3D, 1 compute, 2 other, 3 none), method or call tag, and a

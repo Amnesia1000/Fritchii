@@ -652,6 +652,10 @@ bool TakeStreamWriteLend() noexcept {
     return std::exchange(g_e.stream_hit, false);
 }
 
+bool OnShaderPages(DAddr address, u64 size) noexcept {
+    return g_shader_pages != nullptr && size != 0 && g_shader_pages->Any(address, size);
+}
+
 bool StreamPagesClear(DAddr address, u64 size) noexcept {
     // GuardStreamWrite's test without the act: no page that ever held an image or shader code,
     // not E's pools. No filters: nothing can be shown clear.

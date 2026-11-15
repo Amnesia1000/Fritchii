@@ -41,6 +41,17 @@ public:
         return start_address == 0;
     }
 
+    /// Every range InvalidateAll would hand out, left in place (FRITCHII_ESPLIT's late flush check).
+    template <typename F>
+    void ForEachRange(F&& f) const {
+        if (start_address > 0) {
+            for (auto [address, size] : buffer) {
+                f(address, size);
+            }
+            f(start_address, accumulated_size);
+        }
+    }
+
     template <typename F>
     [[nodiscard]] bool InvalidateAll(F&& f) noexcept {
         if (start_address > 0) {

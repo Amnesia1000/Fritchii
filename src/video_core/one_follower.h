@@ -563,6 +563,9 @@ void VerifyView(const RegisterView& view, const Maxwell3D& engine);
 /// lands on no page the stream-write guard acts on (texture or shader pages, E's pools), so it
 /// can wait in E2's queue. False also when the filters are not set.
 [[nodiscard]] bool StreamPagesClear(DAddr address, u64 size) noexcept;
+/// FRITCHII_ESPLIT: whether [address, address + size) touches a page that held shader code (false
+/// when the filter is not set).
+[[nodiscard]] bool OnShaderPages(DAddr address, u64 size) noexcept;
 
 // --- R's draws (part c: renderer_vulkan/vk_one_follower_draw.cpp, one_follower_draw.cpp) ----------
 

@@ -22,6 +22,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -1666,7 +1667,8 @@ void SendCarriedAlone(size_t why);
 
 void FlushCarried() noexcept {
     if (g_carry.count != 0 && Detail::t_engine && g.thread.joinable()) {
-        const ESplit::PushGuard esplit_push{false, false}; // FRITCHII_ESPLIT S2: one producer
+        // FRITCHII_ESPLIT S2: one producer
+        const ESplit::PushGuard esplit_push{false, false, ESplit::PushKind::Carried};
         SendCarriedAlone(0);
     }
 }
@@ -1682,7 +1684,8 @@ void Lend(LentOp op, LentReason reason, void (*function)(void*), void* argument)
     }
     // FRITCHII_ESPLIT (S2): E1 drains E2 first (one producer, the flags on the engine); a lend
     // of E2's holds E1 at a safe point while R runs it (fritchii_e_split_thread.h).
-    const ESplit::PushGuard esplit_push{true, op == LentOp::Fence || op == LentOp::Query};
+    const ESplit::PushGuard esplit_push{true, op == LentOp::Fence || op == LentOp::Query,
+                                        ESplit::PushKind::Lend};
     // FRITCHII_ESPLIT_COUNT: the whole lend (pack, park, R's run) is the "lend" class.
     const ESplit::LendScope esplit_lend;
     const StepLevel step = Step();
@@ -1811,7 +1814,63 @@ void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size,
         function(const_cast<void*>(payload));
         return;
     }
-    const ESplit::PushGuard esplit_push{false, op == LentOp::Fence || op == LentOp::Query};
+    // FRITCHII_ESPLIT_ASYNC_KINDS bit 3: a posted op from E1 queues. E1 packs the spans (its
+    // registers at the op's place) and the payload; E2 commits the packet in ring order (R's
+    // queue keeps E2 as its one producer), as an async draw's packet. No drain.
+    if (ESplit::QueueKind(ESplit::KindPostedOps) && !(carry && packet_flags == 0 && CarryOpsOn()))
+        [[unlikely]] {
+        if (op == LentOp::Query && t_query_kind != QueryKind::Count) {
+            g.query_count[static_cast<size_t>(t_query_kind)].fetch_add(1,
+                                                                       std::memory_order_relaxed);
+            t_query_kind = QueryKind::Count;
+        }
+        u8* buffer = nullptr;
+        void* const slot = ESplit::BeginAsyncPacket(ESplit::Hand::Op, buffer);
+        struct QueuedOp {
+            PacketHeader header;
+            u8* buffer;
+            const char* trace_site;
+            std::size_t body_bytes;
+            LentOp op;
+            bool lands_in_memory;
+        } job{};
+        job.header.kind = PacketKind::Op;
+        job.header.flags = packet_flags;
+        job.header.op = static_cast<u8>(op);
+        job.header.call = LentCall{function, nullptr};
+        std::size_t spans_bytes = 0;
+        if (Step() >= StepLevel::View) {
+            if (Maxwell3D* const engine = g.engine.load(std::memory_order_acquire)) {
+                spans_bytes = PackSpans(*engine, job.header,
+                                        std::span<u8>{buffer + sizeof(PacketHeader), MaxSpanBytes});
+            }
+        }
+        job.header.reserved2 = static_cast<u32>(spans_bytes);
+        std::memcpy(buffer + sizeof(PacketHeader) + spans_bytes, payload, size);
+        job.buffer = buffer;
+        job.trace_site = std::exchange(t_lend_site, nullptr);
+        job.body_bytes = spans_bytes + ((size + 7) & ~u32{7});
+        job.op = op;
+        job.lands_in_memory = lands_in_memory;
+        static_assert(sizeof(QueuedOp) <= ESplit::AsyncPayloadBytes);
+        static_assert(std::is_trivially_copyable_v<QueuedOp>);
+        std::memcpy(slot, &job, sizeof(job));
+        ESplit::PostAsync([](void* raw) {
+            QueuedOp q;
+            std::memcpy(&q, raw, sizeof(q));
+            PushPacked(q.header, q.buffer, q.body_bytes);
+            if (g_trace) [[unlikely]] {
+                TraceArrive(q.header.number, q.trace_site, q.op, true, Common::Nx2Hitch::NowNs());
+            }
+            if (q.lands_in_memory) {
+                g.guest_write_op.store(q.header.position + 1, std::memory_order_release);
+                g.guest_write_number = q.header.number;
+            }
+        });
+        return;
+    }
+    const ESplit::PushGuard esplit_push{false, op == LentOp::Fence || op == LentOp::Query,
+                                        ESplit::PushKind::Op};
     if (op == LentOp::Query && t_query_kind != QueryKind::Count) {
         g.query_count[static_cast<size_t>(t_query_kind)].fetch_add(1, std::memory_order_relaxed);
         t_query_kind = QueryKind::Count;
@@ -2624,7 +2683,7 @@ void Push(PacketHeader& header, std::span<const u8> spans) {
         t_next_draw_set = false;
         return;
     }
-    const ESplit::PushGuard esplit_push{false, false};
+    const ESplit::PushGuard esplit_push{false, false, ESplit::PushKind::Push};
     u8* const buffer = PackBuffer();
     if (!spans.empty()) {
         std::memcpy(buffer + sizeof(PacketHeader), spans.data(), spans.size());
@@ -2636,7 +2695,7 @@ void Drain() {
     if (!Detail::t_engine) {
         return;
     }
-    const ESplit::PushGuard esplit_push{false, false}; // S2: E2's packets first
+    const ESplit::PushGuard esplit_push{false, false, ESplit::PushKind::Drain}; // E2's first
     if (g_carry.count != 0 && g.thread.joinable()) {
         SendCarriedAlone(1); // R plays everything E made, the kept ops too
     }

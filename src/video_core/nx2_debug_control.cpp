@@ -677,6 +677,12 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_ESPLIT_ASYNC_KINDS") {
         return &g_esplit_async_kinds;
     }
+    if (name == "FRITCHII_ESPLIT_IDLE") {
+        return &g_esplit_idle;
+    }
+    if (name == "FRITCHII_ESPLIT_OWED") {
+        return &g_esplit_owed;
+    }
     if (name == "FRITCHII_ESPLIT_CB_ASYNC") {
         return &g_esplit_cb_async;
     }

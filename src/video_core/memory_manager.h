@@ -337,6 +337,28 @@ public:
         return cached_writes.load(std::memory_order_relaxed);
     }
 
+    /// FRITCHII_ESPLIT (ESplitLateShader): whether a range the next FlushCaching invalidates lands
+    /// where `hit(device address, size)` says (each accumulated range by its first page's
+    /// translation, each constant buffer range as logged). The drawing thread's, read only.
+    template <typename Hit>
+    [[nodiscard]] bool PendingWritesHit(Hit&& hit) const {
+        bool found = false;
+        accumulator.ForEachRange([&](GPUVAddr address, std::size_t size) {
+            if (!found) {
+                if (const std::optional<DAddr> device = GpuToCpuAddress(address)) {
+                    found = hit(*device, static_cast<u64>(size));
+                }
+            }
+        });
+        for (const auto& [device, size] : constant_buffer_writes) {
+            if (found) {
+                break;
+            }
+            found = hit(device, static_cast<u64>(size));
+        }
+        return found;
+    }
+
     /// EXP91: whether cached writes wait for the next FlushCaching (accumulated GPU ranges or
     /// EXP88's constant buffer device ranges). Drawing thread.
     [[nodiscard]] bool HasPendingCachedWrites() const noexcept {

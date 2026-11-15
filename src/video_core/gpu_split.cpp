@@ -32,6 +32,7 @@
 #include "common/thread.h"
 #include "core/core.h"
 #include "video_core/engines/engine_interface.h"
+#include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/fritchii_e_split.h"
 #include "video_core/fritchii_e_split_thread.h"
@@ -3822,6 +3823,18 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             if (ring_on && link.BackRequestPending()) {
                 continue;
             }
+            // FRITCHII_ESPLIT_IDLE (fritchii_e_split_thread.h): E2 still has work; E1 waits for it
+            // to go idle or for new ring words, whichever comes first, instead of draining it in
+            // the idle hook's join. New words: back to the batch, E2 still working.
+            if (available == read_position && ESplit::IdleAsync() && !ESplit::E2Idle()) {
+                if (ESplit::WaitE2IdleOr([&] {
+                        available = limit();
+                        return available != read_position;
+                    })) {
+                    continue;
+                }
+                available = limit();
+            }
             // THREAD=2: not while the stage works (BackEnterHook's handshake).
             if (available == read_position && idle_hook != nullptr && link.BackEnterHook()) {
                 hook_requested.store(false, std::memory_order_seq_cst);
@@ -4088,6 +4101,15 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 if (!cb_on_e1 && kind == Kind::Call && StageTagOf(head) == StageTag::Cache &&
                     ESplit::QueueKind(ESplit::KindCacheCalls)) {
                     const size_t size = PlainEntrySize(head);
+                    // FRITCHII_ESPLIT_OWED: a semaphore release writes its payload at the
+                    // address it carries: on a shader page the next lookup drains first.
+                    if (StageCacheCallOf(head) == StageCacheCall::SemaphoreRelease &&
+                        ESplit::g_owed_shader_rule) {
+                        ESplit::NoteQueuedWrite(
+                            reinterpret_cast<const void*>(
+                                entry[2 + static_cast<size_t>(StageReleaseWord::Memory)]),
+                            entry[2 + static_cast<size_t>(StageReleaseWord::Address)], 16);
+                    }
                     struct CallJob {
                         GpuSplit* self;
                         const u64* entry;
@@ -4106,6 +4128,16 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                     (kind == Kind::Method || kind == Kind::Multi || kind == Kind::Pairs) &&
                     ESplit::QueueKind(ESplit::KindCompute)) {
                     const size_t size = PlainEntrySize(head);
+                    // FRITCHII_ESPLIT_OWED: a compute upload's destination is in E2's registers:
+                    // counted as a write anywhere (the next lookup drains and flushes first).
+                    if (ESplit::g_owed_shader_rule) {
+                        const u32 compute_method = static_cast<u32>((head >> 8) & 0xffff);
+                        using Tegra::Engines::KeplerCompute;
+                        if (compute_method == KEPLER_COMPUTE_REG_INDEX(exec_upload) ||
+                            compute_method == KEPLER_COMPUTE_REG_INDEX(data_upload)) {
+                            ESplit::NoteQueuedWriteAnywhere();
+                        }
+                    }
                     struct EngineJob {
                         GpuSplit* self;
                         Tegra::Engines::EngineInterface* engine;
@@ -4354,6 +4386,26 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             if (!ring_on && link.BackRingStartWanted()) [[unlikely]] {
                 break; // THREAD=2 starts at the loop top
             }
+        }
+        // FRITCHII_ESPLIT_IDLE: the batch's end (the fence quiet check and the `consumed` store
+        // at this place) goes to E2 as a record: no drain. Else E2 drains (a join) and E1 runs it.
+        if (esplit_thread && !ring_on && ESplit::IdleAsync()) [[unlikely]] {
+            if (entry_price) [[unlikely]] {
+                FritchiiPrice::BackReached(read_position);
+            }
+            struct BatchEnd {
+                GpuSplit* self;
+                u64 position;
+            } const end_job{this, read_position};
+            std::memcpy(ESplit::BeginAsync(ESplit::Hand::Store), &end_job, sizeof(end_job));
+            ESplit::PostAsync([](void* raw) {
+                BatchEnd e;
+                std::memcpy(&e, raw, sizeof(e));
+                e.self->CheckFencesQuiet(e.position);
+                e.self->StoreConsumed(e.position);
+            });
+            ESplit::NoteBatchEnd();
+            continue;
         }
         {
             const ESplit::JoinScope esplit_join{ESplit::Join::Idle}; // E's idle work
