@@ -2242,6 +2242,24 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   64). Line every 10 s "Front trim QMD (FRITCHII_FRONT_TRIM_QMD=N)": lookups per site with the
   timed walk and array ns, verify differences, the dry saving in ms/s. Off: one relaxed load per
   lookup; the arrays cost a store per overlay or shadow change.
+- FRITCHII_FRONT_ASYNC_TABLE (live, default 0; helper AA, report table): GpuSplit's async write
+  table (NoteAsyncWrite: every counter report and timed release, written when the host query
+  completes; HasAsyncWrite: RanReadCheck for the 0xe2c conditional render reads, ~48,000/s at the
+  Castle Town market, 3 slots each, and SemaphoreReadableNow) kept per block of 8 neighbouring
+  16-byte slots: a block's 8 positions are one 64-byte line, found through a small open-addressed
+  index by block number with a one-entry memo for notes and one for reads. The old table puts
+  every slot on its own random line (Set 123 + Find 89 samples of v4sample1, ~1.6% of the front).
+  HasAsyncWrite returns the same number for every call: the newest position noted to the slots,
+  0 when none; a slot never noted reads 0 in a block, which adds nothing to a newest, as a
+  missing slot does in the old table. Nothing is erased (as before: only at reset). Switch
+  changes hand the slots from one table to the other on the front at its next note or read.
+  1 = on (the blocks alone), 2 = verify (both kept, the old table answers, every read compared,
+  differences counted, must be 0, first 16 logged), 3 = dry (both kept, the old table answers,
+  notes and reads timed 1 in 64 in both, in turns first). Line every 10 s "Front async table
+  (FRITCHII_FRONT_ASYNC_TABLE=N)": notes and reads per second, blocks and old table size, verify
+  differences, dry ns per note and read in each table and the saving in ms/s. Off: one relaxed
+  load and a member load per note or read. Worst case memory (one slot used per block) 96 bytes
+  a slot against the old table's 32 to 64.
 - FRITCHII_NOTED_OVERFLOW (live, default 0; F7, needs FRITCHII_NOTED_FAST 1 to 3): the table's
   overflow answer of the chains ("more noted since than remembered", ~98% of the chain checks at
   the Castle Town market, the front DMA reads' page snapshots) asked again of the chains. While
