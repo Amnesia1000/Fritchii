@@ -4273,7 +4273,13 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     const bool can_defer_clear = ENABLE_DEFERRED_CLEAR && (!regs.clear_control.use_scissor || clear_covers_render_area) &&
                                  clear_layers.covers_all_layers &&
                                  !scheduler.IsRenderPassActive() &&
-                                 (!use_color || color_full_channels) && ds_deferrable;
+                                 (!use_color || color_full_channels) && ds_deferrable &&
+                                 // FRITCHII_ONEF_CLEAR_NODEFER: diagnostic for the lean darkness
+                                 // (posted clears with unlent array draws), clear at once.
+                                 !(onef_clear_posted &&
+                                   VideoCore::Nx2Debug::SwitchValue(
+                                       VideoCore::Nx2Debug::g_onef_clear_nodefer,
+                                       "FRITCHII_ONEF_CLEAR_NODEFER") != 0);
     if (!can_defer_clear) {
         scheduler.RequestRenderpass(framebuffer);
     }
