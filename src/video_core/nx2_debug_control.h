@@ -392,6 +392,12 @@ inline std::atomic<int> g_noted_summary{-1};
 /// chains instead of walking every note since: 1 = on, 2 = verify (both run, the walk answers,
 /// differences counted), 3 = dry (both run, counted and timed 1 in 64).
 inline std::atomic<int> g_noted_fast{-1};
+/// FRITCHII_NOTED_OVERFLOW (live, default 0; F7, with FRITCHII_NOTED_FAST 1 to 3): the table's
+/// overflow answer of NotedWriteSinceFast asked again of the note chains, which keep the position
+/// of each forgotten link: 1 = on (a chain-proved "no write" answers at FRITCHII_NOTED_FAST=1),
+/// 2 = verify (proved answers checked against the table and a sampled long shadow of notes),
+/// 3 = dry (counted and timed 1 in 64, with the front DMA read checks after the answer).
+inline std::atomic<int> g_noted_overflow{-1};
 /// FRITCHII_STEP_LEAN (live, default 0): F6, the list-wait line's clock read every 256th entry
 /// and the command list storage recycled to the submitter (dma_pusher.h).
 inline std::atomic<int> g_step_lean{-1};

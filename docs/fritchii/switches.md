@@ -2210,6 +2210,29 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   differ (window, session), checks that walked anyway (older than the chains, long reads), chain
   notes looked at, notes linked and the wide chain's share with its top 3 writers by kind. Off:
   one relaxed load per check, one plain load per note.
+- FRITCHII_NOTED_OVERFLOW (live, default 0; F7, needs FRITCHII_NOTED_FAST 1 to 3): the table's
+  overflow answer of the chains ("more noted since than remembered", ~98% of the chain checks at
+  the Castle Town market, the front DMA reads' page snapshots) asked again of the chains. While
+  NOTED_FAST is live each link and head also keeps the position of the note it names, so a chain
+  knows how far back it reaches after the table forgot that note: walking the wide chain and the
+  read's page buckets from their heads (the walk's overlap test on every remembered note), a
+  link to a forgotten note at or before `since` ends the chain clean (positions never rise along
+  a chain). Exact: "no write" means no note sent after `since`, remembered or forgotten,
+  overlaps the read; a forgotten link after `since`, notes from before the chains went live that
+  may be after it, or a read over 16 pages stay a write. 1 = on (a proved answer is "no write" at
+  FRITCHII_NOTED_FAST=1; at 2 and 3 the walk answers), 2 = verify (every proved answer checked
+  against the table, a remembered overlapping note counted, and 1 in 16 against a shadow of the
+  last 65,536 notes, a forgotten overlapping note counted: both must be 0, first 16 logged as
+  NotedOverflowDiffer; "too short" when the shadow does not reach back to the snapshot), 3 = dry
+  (counted, the chain walk timed 1 in 64, and Maxwell3D::FrontDmaRead's ran-reads check after a
+  proved write answer counted and timed 1 in 64 per page check: what 1 would spare). Line every
+  10 s "Noted overflow (FRITCHII_NOTED_OVERFLOW=N)": checks, table overflow, chains prove no write
+  (share), why the rest stay a write (overlap, forgotten note after the snapshot and its wide
+  chain part, older than the chains, long reads), chain notes per overflow, sampled chain cost
+  ms/s and ns each, front DMA reads after a proved answer (ran-reads check served, drained, no
+  check with FRONT_RAN_READS off: a drain), sampled ran-reads check cost ms/s and ns each, verify
+  counts. Off: one relaxed load per overflow answer, one plain load per front DMA read write
+  answer; the note path stores two more words while NOTED_FAST is live.
 - FRITCHII_STEP_LEAN (live, default 0; F6 of work/FRONT_SPLIT_DESIGN.md 2d): 1 = the list writer
   waits line (MaybeLogListWaits) reads the clock on every 256th call instead of every list
   entry (its rates are counts over the clock time between lines: unchanged, a line comes at
