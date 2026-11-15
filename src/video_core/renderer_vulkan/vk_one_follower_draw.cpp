@@ -22,6 +22,7 @@
 //   R tracks its own mode at each condition (NoteCondition) and compares it (BuildCondition), and
 //   drops PacketConditional draws while it is False. Step 5 makes E send those.
 
+#include <algorithm>
 #include <bit>
 #include <cstdlib>
 #include <cstring>
@@ -38,6 +39,7 @@
 #include "common/fritchii_page_flags.h"
 #include "common/scope_exit.h"
 #include "video_core/fritchii_delta_path.h"
+#include "video_core/fritchii_fill_cuts.h"
 #include "video_core/fritchii_price.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
@@ -454,13 +456,26 @@ bool OneFollowerDraw::FillRing(Maxwell3D& engine, GraphicsPipeline* pipeline, bo
     // fable_b 23.1 cut 4, dry (GPU profile on): the fill timed and the draw classed.
     const bool price_handles = VideoCommon::FritchiiPrice::On() && pipeline != nullptr;
     const u64 handle_start = price_handles ? VideoCommon::FritchiiPrice::Ticks() : 0;
-    VideoCommon::FillGraphicsHandleValues(
-        handle_infos, engine.GetMemoryManager(),
-        [&stages](size_t stage) {
-            return VideoCommon::GraphicsHandleCbufs<Cbufs>{stages[stage].const_buffers};
-        },
-        r.device.GetStorageBufferAlignment(), null_pointer_handles,
-        [this](u32 raw) { handle_values.push_back(raw); });
+    // FRITCHII_HANDLE_PROG_KEEP (fable_b 25.2 cut g): a pipeline with handle programs keeps their
+    // results while every word they read is unchanged.
+    const int program_keep =
+        pipeline != nullptr ? VideoCommon::FillCuts::Mode(VideoCommon::FillCuts::Cut::HandleProgKeep)
+                            : 0;
+    if (program_keep != 0 &&
+        std::ranges::any_of(handle_infos, [](const Shader::Info& info) {
+            return !info.handle_programs.empty();
+        })) [[unlikely]] {
+        FillHandleValuesKept(engine, handle_infos, pipeline, facts.hashes, null_pointer_handles,
+                             program_keep);
+    } else {
+        VideoCommon::FillGraphicsHandleValues(
+            handle_infos, engine.GetMemoryManager(),
+            [&stages](size_t stage) {
+                return VideoCommon::GraphicsHandleCbufs<Cbufs>{stages[stage].const_buffers};
+            },
+            r.device.GetStorageBufferAlignment(), null_pointer_handles,
+            [this](u32 raw) { handle_values.push_back(raw); });
+    }
     if (price_handles) [[unlikely]] {
         PriceHandleValues(engine, handle_infos, pipeline,
                           VideoCommon::FritchiiPrice::Ticks() - handle_start);
@@ -484,6 +499,118 @@ bool OneFollowerDraw::FillRing(Maxwell3D& engine, GraphicsPipeline* pipeline, bo
         record.buffer_number = buffer_number;
     }
     return filled;
+}
+
+void OneFollowerDraw::FillHandleValuesKept(Maxwell3D& engine, std::span<const Shader::Info> infos,
+                                           const void* pipeline, const std::array<u64, 2>& hashes,
+                                           bool null_pointer_handles, int mode) {
+    namespace FillCuts = VideoCommon::FillCuts;
+    using Record = VideoCommon::HandleProgramRecord;
+    using Verdict = VideoCommon::HandleProgramVerdict;
+    FillCuts::ProgramStats& stats = FillCuts::g_program;
+    FillCuts::Add(stats.draws);
+    FillCuts::MaybeReport();
+    ProgramMemo& memo = program_memos[pipeline];
+    if (memo.hashes != hashes) {
+        memo.hashes = hashes;
+        memo.records.clear();
+    }
+    auto& memory = engine.GetMemoryManager();
+    const auto& stages = engine.state.shader_stages;
+    using Cbufs = std::remove_cvref_t<decltype(stages[0].const_buffers)>;
+    // The evaluation RawTextureHandle (count 1) or RawTextureHandleTable (a table) makes, through
+    // `mem` and `cbufs`, each value passed to out(raw).
+    const auto evaluate = [](const Shader::Info& info, u32 program, auto& mem, auto& cbufs,
+                             u32 element, u32 count, u64 alignment, auto&& out) {
+        if (count == 1) {
+            out(VideoCommon::EvaluateTextureHandle(info, program, mem, cbufs, alignment, element));
+        } else {
+            VideoCommon::EvaluateTextureHandles(info, program, mem, cbufs, alignment, count,
+                                                [&out](u32, u32 raw) { out(raw); });
+        }
+    };
+    size_t cursor = 0;
+    const auto program = [&](const Shader::Info& info, u32 program_index, const auto& cbufs,
+                             u32 element, u32 count, u64 alignment) {
+        FillCuts::Add(stats.programs);
+        if (cursor >= memo.records.size()) {
+            memo.records.emplace_back();
+        }
+        Record& record = memo.records[cursor++];
+        const std::vector<u32>& code = info.handle_programs[program_index];
+        Verdict verdict = Verdict::First;
+        if (record.valid && record.code == code.data() && record.code_size == code.size() &&
+            record.element == element && record.count == count) {
+            const bool time_check = stats.check_sample.Take();
+            const u64 check_start = time_check ? FillCuts::Ticks() : 0;
+            verdict = VideoCommon::CheckHandleProgramRecord(record, memory, cbufs);
+            if (time_check) [[unlikely]] {
+                FillCuts::Add(stats.check_ticks, FillCuts::Ticks() - check_start);
+            }
+        }
+        switch (verdict) {
+        case Verdict::Same:
+            FillCuts::Add(stats.same);
+            break;
+        case Verdict::Moved:
+            FillCuts::Add(stats.moved);
+            break;
+        case Verdict::Changed:
+            FillCuts::Add(stats.changed);
+            break;
+        case Verdict::First:
+            FillCuts::Add(stats.first);
+            break;
+        }
+        if (verdict == Verdict::Same) {
+            if (mode == FillCuts::On) {
+                // Every read the evaluation makes reads what it read when recorded.
+                handle_values.insert(handle_values.end(), record.results.begin(),
+                                     record.results.end());
+                return;
+            }
+            // 2 and 3: evaluated as before (its time is what 1 removes) and compared.
+            const bool time_hit = stats.hit_sample.Take();
+            const u64 hit_start = time_hit ? FillCuts::Ticks() : 0;
+            const size_t first = handle_values.size();
+            evaluate(info, program_index, memory, cbufs, element, count, alignment,
+                     [this](u32 raw) { handle_values.push_back(raw); });
+            if (time_hit) [[unlikely]] {
+                FillCuts::Add(stats.hit_ticks, FillCuts::Ticks() - hit_start);
+            }
+            FillCuts::Add(stats.compare.checked);
+            const std::span<const u32> now{handle_values.data() + first,
+                                           handle_values.size() - first};
+            if (!std::ranges::equal(now, record.results) && stats.compare.Differ()) [[unlikely]] {
+                LOG_ERROR(Render_Vulkan,
+                          "Handle program keep (FRITCHII_HANDLE_PROG_KEEP={}): program {} element "
+                          "{} count {}: same {} words and {} constant buffer addresses, kept "
+                          "{:#x}, evaluated {:#x}",
+                          mode, program_index, element, count, record.num_reads, record.num_bases,
+                          record.results.empty() ? 0U : record.results[0],
+                          now.empty() ? 0U : now[0]);
+            }
+            return;
+        }
+        // Recorded again: the evaluation reads through the recording memory and addresses.
+        record.Begin(code.data(), code.size(), element, count);
+        VideoCommon::HandleRecordingMemory<std::remove_reference_t<decltype(memory)>> recording{
+            memory, record};
+        VideoCommon::HandleRecordingCbufs<std::remove_cvref_t<decltype(cbufs)>> recording_cbufs{
+            cbufs, record};
+        evaluate(info, program_index, recording, recording_cbufs, element, count, alignment,
+                 [this, &record](u32 raw) {
+                     handle_values.push_back(raw);
+                     record.results.push_back(raw);
+                 });
+    };
+    VideoCommon::FillGraphicsHandleValuesWith(
+        infos, memory,
+        [&stages](size_t stage) {
+            return VideoCommon::GraphicsHandleCbufs<Cbufs>{stages[stage].const_buffers};
+        },
+        rasterizer.device.GetStorageBufferAlignment(), null_pointer_handles,
+        [this](u32 raw) { handle_values.push_back(raw); }, program);
 }
 
 void OneFollowerDraw::PriceHandleValues(Maxwell3D& engine, std::span<const Shader::Info> infos,

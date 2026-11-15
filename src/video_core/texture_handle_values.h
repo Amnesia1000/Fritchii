@@ -12,6 +12,8 @@
 #include <cstdlib>
 #include <span>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
 #include "common/assert.h"
 #include "common/common_types.h"
@@ -185,6 +187,186 @@ void FillGraphicsHandleValues(std::span<const Shader::Info> stage_infos, Memory&
         if (StageReadsHandles(info)) {
             FillStageHandleValues<false>(info, gpu_memory, cbufs_of(stage), storage_alignment,
                                          null_pointer_handles, push);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// FRITCHII_HANDLE_PROG_KEEP (fable_b 25.2 cut g): handle program results kept by their reads.
+
+/// One handle program evaluation of a draw's fill (a single element, or a whole table) and what
+/// it read: each constant buffer address it read through and each word (GPU address and size,
+/// once each) with its value. While all of them read the same again the evaluation gives the
+/// same results: the program is a pure function of what it reads, and every address it reads is
+/// a constant buffer address or comes from earlier reads, all of which are equal, so each read is
+/// the same read (by induction over the program's steps).
+struct HandleProgramRecord {
+    struct Read {
+        GPUVAddr address;
+        u64 value;
+        u32 size;
+    };
+    static constexpr size_t MaxBases = 8;
+    static constexpr size_t MaxReads = 32;
+
+    const u32* code{}; ///< the program's words (with code_size: which program this record is)
+    size_t code_size{};
+    u32 element{}; ///< a single evaluation's element (0 for a table)
+    u32 count{};   ///< results: 1, or the table's element count
+    u32 num_bases{};
+    u32 num_reads{};
+    bool valid{}; ///< false: never recorded, or more reads than a record holds
+    std::array<std::pair<u32, GPUVAddr>, MaxBases> bases{};
+    std::array<Read, MaxReads> reads{};
+    std::vector<u32> results;
+
+    void Begin(const u32* code_, size_t code_size_, u32 element_, u32 count_) {
+        code = code_;
+        code_size = code_size_;
+        element = element_;
+        count = count_;
+        num_bases = 0;
+        num_reads = 0;
+        valid = true;
+        results.clear();
+    }
+    void AddBase(u32 index, GPUVAddr base) {
+        for (u32 i = 0; i < num_bases; ++i) {
+            if (bases[i].first == index) {
+                return;
+            }
+        }
+        if (num_bases == MaxBases) {
+            valid = false;
+            return;
+        }
+        bases[num_bases++] = {index, base};
+    }
+    void AddRead(GPUVAddr address, u32 size, u64 value) {
+        for (u32 i = 0; i < num_reads; ++i) {
+            if (reads[i].address == address && reads[i].size == size) {
+                return;
+            }
+        }
+        if (num_reads == MaxReads) {
+            valid = false;
+            return;
+        }
+        reads[num_reads++] = {address, value, size};
+    }
+};
+
+/// The memory a recording evaluation reads: each Read<T> forwarded and recorded.
+template <typename Memory>
+struct HandleRecordingMemory {
+    Memory& memory;
+    HandleProgramRecord& record;
+
+    template <typename T>
+    [[nodiscard]] T Read(GPUVAddr address) const {
+        const T value = memory.template Read<T>(address);
+        record.AddRead(address, static_cast<u32>(sizeof(T)), static_cast<u64>(value));
+        return value;
+    }
+};
+
+/// The constant buffer addresses a recording evaluation reads through, recorded.
+template <typename Cbufs>
+struct HandleRecordingCbufs {
+    const Cbufs& cbufs;
+    HandleProgramRecord& record;
+
+    GPUVAddr operator()(u32 cbuf) const {
+        const GPUVAddr base = cbufs(cbuf);
+        record.AddBase(cbuf, base);
+        return base;
+    }
+};
+
+enum class HandleProgramVerdict : u8 {
+    Same,    ///< every constant buffer address and word read as recorded: the results hold
+    Moved,   ///< a constant buffer it reads through is bound elsewhere
+    Changed, ///< a word it read holds another value
+    First,   ///< no usable record
+};
+
+/// Reads what `record` read again, through the same memory reads the evaluation makes.
+template <typename Memory, typename Cbufs>
+[[nodiscard]] HandleProgramVerdict CheckHandleProgramRecord(const HandleProgramRecord& record,
+                                                            Memory& gpu_memory,
+                                                            const Cbufs& cbufs) {
+    if (!record.valid) {
+        return HandleProgramVerdict::First;
+    }
+    for (u32 i = 0; i < record.num_bases; ++i) {
+        if (cbufs(record.bases[i].first) != record.bases[i].second) {
+            return HandleProgramVerdict::Moved;
+        }
+    }
+    for (u32 i = 0; i < record.num_reads; ++i) {
+        const HandleProgramRecord::Read& read = record.reads[i];
+        const u64 value = read.size == sizeof(u64)
+                              ? gpu_memory.template Read<u64>(read.address)
+                              : u64{gpu_memory.template Read<u32>(read.address)};
+        if (value != read.value) {
+            return HandleProgramVerdict::Changed;
+        }
+    }
+    return HandleProgramVerdict::Same;
+}
+
+/// FillGraphicsHandleValues with each handle program evaluation handed to
+/// program(info, program_index, cbufs, element, count, alignment), which pushes `count` values:
+/// a single element (count 1, HandleProgramAlignment's alignment, as RawTextureHandle; after its
+/// stats read) or a table (count elements from 0, the storage alignment itself, as
+/// RawTextureHandleTable). Every other value as FillStageHandleValues, in its order.
+template <typename Memory, typename CbufsOf, typename Push, typename Program>
+void FillGraphicsHandleValuesWith(std::span<const Shader::Info> stage_infos, Memory& gpu_memory,
+                                  CbufsOf&& cbufs_of, u64 storage_alignment,
+                                  bool null_pointer_handles, Push&& push, Program&& program) {
+    namespace Stats = MemStageStats;
+    const u64 single_alignment = HandleProgramAlignment(storage_alignment);
+    for (size_t stage = 0; stage < stage_infos.size(); ++stage) {
+        const Shader::Info& info{stage_infos[stage]};
+        if (!StageReadsHandles(info)) {
+            continue;
+        }
+        const auto cbufs = cbufs_of(stage);
+        const auto one = [&](const auto& desc, u32 index) {
+            if (desc.handle_program != ~0U) {
+                Stats::Read(Stats::Kind::HandleProgram, 0);
+                program(info, desc.handle_program, cbufs, index, 1U, single_alignment);
+            } else {
+                push(RawTextureHandle<false>(info, desc, index, gpu_memory, cbufs,
+                                             storage_alignment));
+            }
+        };
+        const auto add = [&](const auto& desc) {
+            for (u32 index = 0; index < desc.count; ++index) {
+                one(desc, index);
+            }
+        };
+        for (const auto& desc : info.texture_buffer_descriptors) {
+            add(desc);
+        }
+        for (const auto& desc : info.image_buffer_descriptors) {
+            add(desc);
+        }
+        for (const auto& desc : info.texture_descriptors) {
+            if (desc.count > 1 && desc.handle_program != ~0U) {
+                program(info, desc.handle_program, cbufs, 0U, desc.count, storage_alignment);
+                continue;
+            }
+            for (u32 index = 0; index < desc.count; ++index) {
+                if (null_pointer_handles && HandleIsStoragePointer(info, desc, index)) {
+                    push(SKIPPED_HANDLE_VALUE);
+                } else {
+                    one(desc, index);
+                }
+            }
+        }
+        for (const auto& desc : info.image_descriptors) {
+            add(desc);
         }
     }
 }

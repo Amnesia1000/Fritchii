@@ -702,6 +702,17 @@ not worth turning on), then 2 (must be 0), then 1.
   on (their walks may leave a range dirty). The read log's range is logged as before. Verify: a
   hit's range holds no CPU or unprotected page and its synchronize uploads nothing. The usage
   marks stay: their stamp is the packet's, new every draw.
+- FRITCHII_HANDLE_PROG_KEEP (cut g, "Handle program keep"): E's fill (OneFollowerDraw::FillRing,
+  with E's pipeline) of a draw whose pipeline has handle programs: each program evaluation (a
+  single element or a whole table) keeps a record per pipeline, in fill order, of the constant
+  buffer addresses it read through and each word it read (GPU address, size, value). While all of
+  them read the same again, the record's results are pushed instead of evaluating: the program is
+  a pure function of what it reads, and every address it reads is a constant buffer address or
+  comes from earlier reads, all equal, so it would make the same reads. The compare makes the
+  same memory reads as the evaluation (no page flags, no tracker state), so it saves the
+  interpreter (its 1.3 KB of zeroed stack and slots), the repeated storage base reads and the
+  rest; the dry count says how much. Classes: same words, constant buffer rebound, words changed,
+  no record. Verify: a same-words program is evaluated and its results compared.
 ### FRITCHII_ACQUIRE_MET_BY (the "Acquire resumes met by" line)
 
 FRITCHII_ACQUIRE_MET_BY (live, default 0 since 2026-11-14 = one relaxed load per resume; 1 = the
