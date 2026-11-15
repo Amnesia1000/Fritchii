@@ -17,6 +17,7 @@
 #include "video_core/nx2_debug_control.h"
 #include "common/alignment.h"
 #include "common/common_funcs.h"
+#include "common/fritchii_bind_skip.h"
 #include "common/common_types.h"
 #include "common/div_ceil.h"
 #include "common/logging.h"
@@ -223,9 +224,17 @@ struct WordManager {
         std::span<u64> cpu_words = Span(Type::CPU);
         std::span<u64> cached_words = Span(Type::CachedCPU);
         std::span<u64> hot_clean_words = Span(Type::HotClean);
+        const bool skip_gens = Common::BindSkip::On();
         IterateWords(dirty_addr - cpu_addr, size, [&](size_t index, u64 mask) {
             if ((cpu_words[index] & mask) != mask) {
                 ++dirty_gen;
+            }
+            if (skip_gens) [[unlikely]] {
+                // FRITCHII_BIND_SKIP: pages gaining their CPU bit or losing a cached write.
+                const u64 changed = (~cpu_words[index] | cached_words[index]) & mask;
+                if (changed != 0) {
+                    Common::BindSkip::NoteTrackerWord(cpu_addr + index * BYTES_PER_WORD, changed);
+                }
             }
             cpu_words[index] |= mask;
             cached_words[index] &= ~mask;
@@ -255,7 +264,19 @@ struct WordManager {
         [[maybe_unused]] std::span<u64> untracked_words = Span(Type::Untracked);
         [[maybe_unused]] std::span<u64> cached_words = Span(Type::CachedCPU);
         CollectedRanges ranges;
+        // FRITCHII_BIND_SKIP: the pages whose CPU, Untracked, cached-write or GPU bit changes.
+        const bool skip_gens = Common::BindSkip::On() &&
+                               (type == Type::CPU || type == Type::CachedCPU || type == Type::GPU);
         IterateWords(dirty_addr - cpu_addr, size, [&](size_t index, u64 mask) {
+            if (skip_gens) [[unlikely]] {
+                u64 changed = (enable ? ~state_words[index] : state_words[index]) & mask;
+                if (type != Type::GPU) {
+                    changed |= (enable ? ~untracked_words[index] : untracked_words[index]) & mask;
+                }
+                if (changed != 0) {
+                    Common::BindSkip::NoteTrackerWord(cpu_addr + index * BYTES_PER_WORD, changed);
+                }
+            }
             if (enable && (type == Type::CPU || type == Type::CachedCPU)) {
                 // A page gains a CPU or an Untracked bit (EDEN_NX2_STORAGE_SYNC_MEMO): a CPU
                 // mark sets both, a cached write the Untracked one. Pages holding them already
@@ -360,9 +381,23 @@ struct WordManager {
                  (pending_pointer - pending_offset) * BYTES_PER_PAGE);
         };
         CollectedRanges ranges;
+        // FRITCHII_BIND_SKIP: the pages a clear takes a CPU, Untracked, cached-write or GPU bit
+        // from (a re-protect at an upload, a download's clear).
+        const bool skip_gens = clear && Common::BindSkip::On() &&
+                               (type == Type::CPU || type == Type::CachedCPU || type == Type::GPU);
         IterateWords(offset, size, [&](size_t index, u64 mask) {
             if (type == Type::GPU)
                 mask &= ~untracked_words[index];
+            if (skip_gens) [[unlikely]] {
+                // A superset of what either walk below clears (the hot one keeps hot pages).
+                u64 changed = state_words[index] & mask;
+                if (type != Type::GPU) {
+                    changed |= (untracked_words[index] | cached_words[index]) & mask;
+                }
+                if (changed != 0) {
+                    Common::BindSkip::NoteTrackerWord(cpu_addr + index * BYTES_PER_WORD, changed);
+                }
+            }
             u64 word;
             if constexpr (hot_pages) {
                 // Only for CPU clears (ForEachModifiedRange's dispatch).
@@ -505,11 +540,17 @@ struct WordManager {
         auto const untracked_words = Span(Type::Untracked);
         auto const cpu_words = Span(Type::CPU);
         CollectedRanges ranges;
+        const bool skip_gens = Common::BindSkip::On();
         for (u64 word_index = 0; word_index < num_words; ++word_index) {
             const u64 cached_bits = cached_words[word_index];
             // The cached pages turn CPU-modified (EDEN_NX2_STORAGE_SYNC_MEMO).
             if (cached_bits != 0) {
                 ++dirty_gen;
+                if (skip_gens) [[unlikely]] {
+                    // FRITCHII_BIND_SKIP: and change state.
+                    Common::BindSkip::NoteTrackerWord(cpu_addr + word_index * BYTES_PER_WORD,
+                                                      cached_bits);
+                }
             }
             CollectChangedRanges(false, word_index, untracked_words[word_index], cached_bits, ranges);
             untracked_words[word_index] |= cached_bits;

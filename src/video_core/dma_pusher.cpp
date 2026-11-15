@@ -575,8 +575,9 @@ bool DmaPusher::Step() {
             VideoCommon::GpuSplit::Get().NoteSync();
         }
         // FRITCHII_S4_COUNT (dry): where this list entry starts in the split's ring (a page
-        // mirror would be brought up to date here), and value 2's samples.
-        if (Common::S4Count::On() && command_resume_offset == 0) [[unlikely]] {
+        // mirror would be brought up to date here), and value 2's samples. Also for
+        // FRITCHII_BIND_SKIP's in-entry step (E's list entry index).
+        if (Common::S4Count::EntryMarks() && command_resume_offset == 0) [[unlikely]] {
             if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
                 VideoCommon::S4Count::FrontEntry(split, system.Host1x().MemoryManager());
             }
