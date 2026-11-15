@@ -20,6 +20,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/oot_network.h"
 #include "video_core/ocarina_upscale.h"
+#include "video_core/upscaler_fallback_log.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_vulkan/blit_image.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
@@ -592,8 +593,15 @@ private:
     } oot_motion;
     std::unique_ptr<class OcarinaUpscaler> oot_live_dlss;
     bool oot_live_failed{};
-    const char* oot_fallback_reason{};
-    u32 oot_fallback_repeats{};
+    /// Why and how long the game's own upscale drew instead (logged when it starts and ends).
+    VideoCommon::UpscalerFallbackLog oot_fallback_log;
+    /// The furthest check this frame's scene draws reached without giving a camera, for the log.
+    struct OcarinaCameraMiss {
+        u64 frame{};
+        u32 rank{};
+        const char* reason{};
+        std::array<f32, 4> values{};
+    } oot_camera_miss;
     /// FRITCHII_DLSS_SCALED: the real sizes last logged (scene, depth, target, output) and the
     /// last colour/depth mismatch, so each new combination is logged once.
     std::array<u32, 8> oot_scaled_logged{};
@@ -605,6 +613,8 @@ private:
     u32 oot_jitter_phases{8}; ///< Halton sequence length for the last FSR frame's scale
     std::optional<u64> oot_4k_scene_frame;
     VkImage oot_4k_guest_present{};
+    /// Frames that show the game's 1440p image although the upscaler made the 4K one.
+    VideoCommon::UpscalerFallbackLog oot_4k_present_log;
     std::optional<u64> oot_effects_frame;
     GPUVAddr oot_effects_address{};
     VkImageView oot_effects_scene{};

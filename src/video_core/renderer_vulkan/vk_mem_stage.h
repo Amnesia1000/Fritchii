@@ -501,6 +501,8 @@ public:
     }
     /// The record of slots 3, 4 and 6 from the cache as it is now (FillDraw; the verify).
     static void FillTrackerRecord(Cache& cache, TrackerRecord& record);
+    /// One tracker slot's binding (slot 3 as the game bound it with FRITCHII_OOT_CAMERA_GUEST).
+    static std::pair<DAddr, u32> TrackerBinding(Cache& cache, u32 index);
     /// The back: the bytes a ring packet's fill copied for tracker slot `slot` (0 to 2) of the
     /// draw it holds, or null (read game memory then).
     [[nodiscard]] const u8* TrackerBytes(const TrackerRecord& record, size_t slot) const noexcept;

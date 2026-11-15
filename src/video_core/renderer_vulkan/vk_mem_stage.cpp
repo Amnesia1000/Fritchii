@@ -212,6 +212,7 @@
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2_runahead.h"
+#include "video_core/ocarina_upscale.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_mem_stage.h"
@@ -1480,8 +1481,9 @@ void MemStage::CopyTrackerBytes(TrackerRecord& record, u64 vertex_program) {
         record.copied[slot] = bytes;
     };
     const TrackerSlot& camera = record.slots[0];
-    if (camera.bound && camera.size >= TrackerRecord::CameraBytes && !camera.gpu_modified) {
-        copy(0, camera.address, TrackerRecord::CameraBytes);
+    const u32 camera_bytes = VideoCommon::OcarinaCameraReadBytes(); // FRITCHII_OOT_CAMERA_GUEST
+    if (camera.bound && camera.size >= camera_bytes && !camera.gpu_modified) {
+        copy(0, camera.address, camera_bytes);
     }
     if (vertex_program != TrackerRecord::ActorShader) {
         return;
@@ -1511,18 +1513,28 @@ const u8* MemStage::TrackerBytes(const TrackerRecord& record, size_t slot) const
     return played_tracker_data.data() + at;
 }
 
+// FRITCHII_OOT_CAMERA_GUEST: the camera's slot 3 as the game bound it (the draw's shader may not
+// read it, or read less than the camera block); the other slots as ForEachBoundBuffer visits them.
+std::pair<DAddr, u32> MemStage::TrackerBinding(Cache& cache_, u32 index) {
+    if (index == 3 && VideoCommon::OcarinaCameraFromGuest()) {
+        return cache_.GuestGraphicsUniform(0, index);
+    }
+    return cache_.BoundGraphicsUniform(0, index);
+}
+
 void MemStage::FillTrackerRecord(Cache& cache_, TrackerRecord& record) {
     for (size_t i = 0; i < record.slots.size(); ++i) {
         const u32 index = TrackerRecord::Slots[i];
-        const auto [address, size] = cache_.BoundGraphicsUniform(0, index);
+        const auto [address, size] = TrackerBinding(cache_, index);
         TrackerSlot& slot = record.slots[i];
         slot.address = address;
         slot.size = size;
         slot.bound = size != 0;
         // The bytes each tracker reads: the camera block of slot 3 (only when it is bound that
         // large), the whole binding of slots 4 and 6.
-        const u64 bytes = index == 3 ? u64{TrackerRecord::CameraBytes} : u64{size};
-        slot.gpu_modified = slot.bound && (index != 3 || size >= TrackerRecord::CameraBytes) &&
+        const u32 camera_bytes = VideoCommon::OcarinaCameraReadBytes();
+        const u64 bytes = index == 3 ? u64{camera_bytes} : u64{size};
+        slot.gpu_modified = slot.bound && (index != 3 || size >= camera_bytes) &&
                             cache_.GpuWrittenHere(address, bytes); // with marks ahead on GPUMem
     }
     record.filled = true;
@@ -1536,13 +1548,14 @@ void MemStage::FillTrackerSlots(Cache& cache_, TrackerRecord& record, u8 slots) 
             continue;
         }
         const u32 index = TrackerRecord::Slots[i];
-        const auto [address, size] = cache_.BoundGraphicsUniform(0, index);
+        const auto [address, size] = TrackerBinding(cache_, index);
         slot.address = address;
         slot.size = size;
         slot.bound = size != 0;
         // As FillTrackerRecord.
-        const u64 bytes = index == 3 ? u64{TrackerRecord::CameraBytes} : u64{size};
-        slot.gpu_modified = slot.bound && (index != 3 || size >= TrackerRecord::CameraBytes) &&
+        const u32 camera_bytes = VideoCommon::OcarinaCameraReadBytes();
+        const u64 bytes = index == 3 ? u64{camera_bytes} : u64{size};
+        slot.gpu_modified = slot.bound && (index != 3 || size >= camera_bytes) &&
                             cache_.GpuWrittenHere(address, bytes);
     }
     record.filled = true;

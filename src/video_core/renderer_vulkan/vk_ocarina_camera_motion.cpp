@@ -19,6 +19,7 @@
 #include "video_core/host_shaders/ocarina_dlss_4k_composite_comp_spv.h"
 #include "video_core/host_shaders/ocarina_dlss_4k_reference_comp_spv.h"
 #include "video_core/host_shaders/ocarina_dlss_bias_comp_spv.h"
+#include "video_core/host_shaders/ocarina_dlss_effects_base_comp_spv.h"
 #include "video_core/host_shaders/ocarina_dlss_effects_comp_spv.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #ifdef EGLANTINE_STREAMLINE
@@ -705,7 +706,11 @@ struct OcarinaUpscaler::Impl {
          VideoCommon::OcarinaUpscaleBackend backend)
         : device{device_}, scheduler{scheduler_}, queue{queue_}, allocator{allocator_}, pool{pool},
           motion_pass{device, scheduler, pool},
-          color_pass{device, scheduler, pool},
+          // FRITCHII_DLSS_SANITIZE=0: the exact copy instead of the clamped input.
+          color_pass{device, scheduler, pool,
+                     VideoCommon::OcarinaDlssSanitize()
+                         ? std::span<const u32>(OCARINA_DLSS_COLOR_COMP_SPV)
+                         : std::span<const u32>(OCARINA_DLSS_EFFECTS_BASE_COMP_SPV)},
           output_pass{device, scheduler, pool, OCARINA_DLSS_OUTPUT_COMP_SPV} {
 #ifdef EGLANTINE_STREAMLINE
         if (backend == VideoCommon::OcarinaUpscaleBackend::Dlss) {
@@ -866,7 +871,7 @@ void OcarinaUpscaler::SaveEffectsBase(VkImageView scene, VkExtent2D extent, u64 
     auto& state = *impl;
     if (!state.effects_base_pass) {
         state.effects_base_pass = std::make_unique<OcarinaEffectsPass<1>>(
-            state.device, state.scheduler, state.pool, OCARINA_DLSS_COLOR_COMP_SPV);
+            state.device, state.scheduler, state.pool, OCARINA_DLSS_EFFECTS_BASE_COMP_SPV);
         state.effects_mark_pass = std::make_unique<OcarinaEffectsPass<2>>(
             state.device, state.scheduler, state.pool, OCARINA_DLSS_EFFECTS_COMP_SPV);
         state.effects_bias_pass = std::make_unique<OcarinaEffectsPass<3>>(
@@ -1108,9 +1113,16 @@ VideoCommon::OcarinaUpscaleBackend ResolveOcarinaUpscaler(const Device& device) 
 #ifdef EGLANTINE_STREAMLINE
     dlss_available = Streamline::IsDlssAvailable();
 #endif
-    const auto backend = VideoCommon::SelectOcarinaUpscaler(
+    auto backend = VideoCommon::SelectOcarinaUpscaler(
         Settings::values.oot_anti_aliasing.GetValue(), Settings::values.nvidia_dlss.GetValue(),
         dlss_available, value ? value : "");
+    // FRITCHII_DLSS_RENDER_SCALE: the patch is applied at boot, before it is known whether DLSS
+    // runs. When it doesn't, FSR 3.1 rebuilds the smaller scene instead of the game stretching
+    // 720p or 1080p itself.
+    if (backend == VideoCommon::OcarinaUpscaleBackend::Native &&
+        Settings::AppliedOcarinaRenderScale() && (value == nullptr || std::string_view{value} != "native")) {
+        backend = VideoCommon::OcarinaUpscaleBackend::Fsr;
+    }
     if (backend == VideoCommon::OcarinaUpscaleBackend::Fsr && !Fsr3Upscaler::IsSupported(device)) {
         return VideoCommon::OcarinaUpscaleBackend::Native;
     }

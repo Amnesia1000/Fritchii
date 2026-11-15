@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <optional>
 #include <thread>
 
 #include "common/assert.h"
@@ -80,6 +81,10 @@ struct BuiltinPatch {
     /// When set, guest state the patch keeps in the module (offset, size): it must lie in BSS.
     size_t state_offset = 0;
     size_t state_size = 0;
+    /// FRITCHII_DLSS_RENDER_SCALE: the DLSS quality whose render scale this patch sets. It needs
+    /// Max Resolution applied (it changes that path), and the renderer reads what was applied
+    /// (Settings::AppliedOcarinaRenderScale).
+    std::optional<Settings::NvidiaDlssQuality> render_scale{};
 };
 
 // Ocarina of Time takes its "dynamic resolution disabled" path, so the 3D renders at full scale
@@ -91,6 +96,36 @@ constexpr std::array MAX_RESOLUTION_RECORDS{
                        .checked = true,
                        .original = 0x360041E8}, // tbz w8, #0, 0x80640c
 };
+
+constexpr std::string_view MAX_RESOLUTION_NAME = "Max Resolution (built-in)";
+
+// DLSS render scales (FRITCHII_DLSS_RENDER_SCALE, ProfessorTee's community patch as ported to
+// Lichii): Max Resolution's fixed-scale path loads 1.0 of 2560x1440 (main+0x806420:
+// mov w9, #0x3f800000), which DLSS takes to 4K. The lower scales give the other modes' render
+// sizes; the emulator's resolution scale stays 1x, so every pass runs at the game's own size.
+constexpr u32 RENDER_SCALE_ONE = 0x52A7F009;                                  // 1.0
+constexpr std::array<u8, 4> RENDER_SCALE_PERFORMANCE{0x09, 0xE8, 0xA7, 0x52}; // 0.75, 1920x1080
+constexpr std::array<u8, 4> RENDER_SCALE_ULTRA{0x09, 0xE0, 0xA7, 0x52};       // 0.5, 1280x720
+constexpr std::array RENDER_PERFORMANCE_RECORDS{
+    BuiltinPatchRecord{.module_offset = 0x806420,
+                       .bytes = RENDER_SCALE_PERFORMANCE,
+                       .checked = true,
+                       .original = RENDER_SCALE_ONE},
+};
+constexpr std::array RENDER_ULTRA_RECORDS{
+    BuiltinPatchRecord{.module_offset = 0x806420,
+                       .bytes = RENDER_SCALE_ULTRA,
+                       .checked = true,
+                       .original = RENDER_SCALE_ONE},
+};
+
+bool OcarinaPerformanceScaleOn() {
+    return Settings::OcarinaDlssRenderScale() == Settings::NvidiaDlssQuality::Performance;
+}
+
+bool OcarinaUltraScaleOn() {
+    return Settings::OcarinaDlssRenderScale() == Settings::NvidiaDlssQuality::UltraPerformance;
+}
 
 // Texture pool patch (a ported community patch): with Max Resolution the
 // render targets outgrow the graphics allocator's initial pool and the Castle Town guard house
@@ -326,7 +361,7 @@ constexpr std::array SHADOW_STEPS_RECORDS{
 
 constexpr std::array BUILTIN_PATCHES{
     BuiltinPatch{
-        .name = "Max Resolution (built-in)",
+        .name = MAX_RESOLUTION_NAME,
         .title_id = 0x0400486024DEC000,
         .module = "main",
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
@@ -399,6 +434,26 @@ constexpr std::array BUILTIN_PATCHES{
         // the town wall 4,000-10,000 -> 30-90 per 600 frames, frames 20.5-26 -> 18.4-18.8 ms,
         // shadows unchanged in the screenshot. FRITCHII_NO_SHADOW_STEPS=1 turns it off.
         .disable_env = "FRITCHII_NO_SHADOW_STEPS",
+    },
+    // FRITCHII_DLSS_RENDER_SCALE: the NVIDIA DLSS quality lowers OoT's render resolution under
+    // Max Resolution (listed in Add-Ons only while it applies).
+    BuiltinPatch{
+        .name = "DLSS Performance render scale (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = RENDER_PERFORMANCE_RECORDS,
+        .setting_enabled = &OcarinaPerformanceScaleOn,
+        .render_scale = Settings::NvidiaDlssQuality::Performance,
+    },
+    BuiltinPatch{
+        .name = "DLSS Ultra Performance render scale (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = RENDER_ULTRA_RECORDS,
+        .setting_enabled = &OcarinaUltraScaleOn,
+        .render_scale = Settings::NvidiaDlssQuality::UltraPerformance,
     },
 };
 
@@ -812,6 +867,9 @@ std::vector<VirtualFile> PatchManager::CollectPatches(const std::vector<VirtualD
 }
 
 std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::string& name) const {
+    if (name == "main") {
+        Settings::SetAppliedOcarinaRenderScale(std::nullopt);
+    }
     if (nso.size() < sizeof(Loader::NSOHeader)) {
         return nso;
     }
@@ -885,6 +943,7 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
 
     const auto disabled = GetDisabledAddons();
     std::vector<std::string_view> replaced;
+    std::vector<std::string_view> applied;
     for (const auto& patch : BUILTIN_PATCHES) {
         if (patch.title_id != title_id || patch.module != name) {
             continue;
@@ -918,6 +977,12 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         if (patch.build_id != build_id) {
             LOG_INFO(Loader, "    - Skipping \"{}\": build id {} is not {}", patch.name, build_id,
                      patch.build_id);
+            continue;
+        }
+        if (patch.render_scale &&
+            std::find(applied.cbegin(), applied.cend(), MAX_RESOLUTION_NAME) == applied.cend()) {
+            LOG_INFO(Loader, "    - Skipping \"{}\": it needs \"{}\"", patch.name,
+                     MAX_RESOLUTION_NAME);
             continue;
         }
         if (patch.state_size != 0 && !InModuleBss(header, patch.state_offset, patch.state_size)) {
@@ -969,6 +1034,10 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
                  patch.records.size(), name);
         if (!patch.replaces.empty()) {
             replaced.push_back(patch.replaces);
+        }
+        applied.push_back(patch.name);
+        if (patch.render_scale) {
+            Settings::SetAppliedOcarinaRenderScale(patch.render_scale);
         }
     }
 

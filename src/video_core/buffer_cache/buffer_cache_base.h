@@ -732,6 +732,17 @@ public:
         return {binding.device_addr, size};
     }
 
+    /// Graphics uniform buffer `index` of `stage` as the game bound it (FRITCHII_OOT_CAMERA_GUEST):
+    /// its device address and bound size whether or not the current shaders use it, not cut to
+    /// what they read; {0, 0} when unbound.
+    [[nodiscard]] std::pair<DAddr, u32> GuestGraphicsUniform(u32 stage, u32 index) const noexcept {
+        const Binding& binding = channel_state->uniform_buffers[stage][index];
+        if (binding.device_addr == 0 || binding.size == 0) {
+            return {0, 0};
+        }
+        return {binding.device_addr, binding.size};
+    }
+
     /// FRITCHII_ESPLIT_BIND_BATCH=2: a hash of everything a graphics uniform bind of `stage`,
     /// `index` writes (the binding, its bind memo, its dirty bit), to prove a dropped bind would
     /// have left it unchanged.

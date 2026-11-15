@@ -107,6 +107,55 @@ NvidiaDlssRuntimeSettings GetNvidiaDlssRuntimeSettings() {
             static_cast<DlssPreset>((options >> 8) & 0xff)};
 }
 
+namespace {
+std::atomic<u32> applied_ocarina_render_scale{};
+}
+
+bool OcarinaDlssRenderScaleSwitch() {
+    static const bool on = [] {
+        const char* const value = std::getenv("FRITCHII_DLSS_RENDER_SCALE");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return on;
+}
+
+std::optional<NvidiaDlssQuality> OcarinaDlssRenderScale() {
+    const auto quality = values.nvidia_dlss_quality.GetValue();
+    const auto aa = values.oot_anti_aliasing.GetValue();
+    // Balanced (0.871) pads its 2276x1280 scene into 2288x1280 targets, which the upscaler does
+    // not take yet: it keeps 2560x1440.
+    if (!OcarinaDlssRenderScaleSwitch() || !values.nvidia_dlss.GetValue() || !IsDockedMode() ||
+        aa == OotAntiAliasing::Fsr3 || aa == OotAntiAliasing::Fsr4 ||
+        (quality != NvidiaDlssQuality::Performance &&
+         quality != NvidiaDlssQuality::UltraPerformance)) {
+        return std::nullopt;
+    }
+    return quality;
+}
+
+void SetAppliedOcarinaRenderScale(std::optional<NvidiaDlssQuality> quality) {
+    applied_ocarina_render_scale.store(quality ? static_cast<u32>(*quality) + 1 : 0,
+                                       std::memory_order_relaxed);
+}
+
+std::optional<NvidiaDlssQuality> AppliedOcarinaRenderScale() {
+    const u32 value = applied_ocarina_render_scale.load(std::memory_order_relaxed);
+    if (value == 0) {
+        return std::nullopt;
+    }
+    return static_cast<NvidiaDlssQuality>(value - 1);
+}
+
+u32 OcarinaRenderHeightFor(std::optional<NvidiaDlssQuality> scale) {
+    if (scale == NvidiaDlssQuality::Performance) {
+        return 1080;
+    }
+    if (scale == NvidiaDlssQuality::UltraPerformance) {
+        return 720;
+    }
+    return 1440;
+}
+
 std::string GetTimeZoneString(TimeZone time_zone) {
     const auto time_zone_index = static_cast<std::size_t>(time_zone);
     ASSERT(time_zone_index < Common::TimeZone::GetTimeZoneStrings().size());
