@@ -425,6 +425,12 @@ inline std::atomic<int> g_esplit_pin{-1};
 /// of joining (fritchii_e_split_thread.h): bit 0 memory stage cache calls, bit 1 the 3D methods
 /// that end in one rasterizer call, bit 2 compute engine entries.
 inline std::atomic<int> g_esplit_async_kinds{-1};
+/// FRITCHII_ESPLIT_IDLE (live, default 1): E1's batch end and idle without draining E2
+/// (fritchii_e_split_thread.h); 0 = joins as before.
+inline std::atomic<int> g_esplit_idle{-1};
+/// FRITCHII_ESPLIT_OWED (live, default 1): a draw's flush is owed by shader page writes and E1's
+/// own work, not by any cached write of an async job (fritchii_e_split_thread.h); 0 = S4's rule.
+inline std::atomic<int> g_esplit_owed{-1};
 /// FRITCHII_ESPLIT_CB_ASYNC (live, default 0; with DEPTH > 0): 1 = constant buffer words' memory
 /// half queued for E2 without a wait (fritchii_e_split_thread.h, S4).
 inline std::atomic<int> g_esplit_cb_async{-1};

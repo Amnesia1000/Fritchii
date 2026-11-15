@@ -142,7 +142,7 @@ constexpr size_t JoinCount = static_cast<size_t>(Join::Count);
 constexpr size_t TouchCount = static_cast<size_t>(Touch::Count);
 constexpr std::array<const char*, HandCount> HandNames{
     "entries", "flushes", "draw tails", "binds", "stores", "cb records", "queued entries",
-    "raster ops"};
+    "raster ops", "posted ops"};
 constexpr std::array<const char*, JoinCount> JoinNames{
     "entries", "decisions", "conditions", "idle",  "pushes", "lockstep",
     "cb writes", "lookups", "flushes",  "tails", "seeds"};
@@ -212,6 +212,14 @@ struct E1Counts {
     std::array<u64, JoinCount> joins{};
     std::array<u64, TouchCount> touches{};
     u64 wait_ticks{}; ///< E1 waiting for E2 (lockstep runs, drains, room)
+    /// The same by cause: each Join, then queue room (slots), then draw depth.
+    std::array<u64, JoinCount + 2> wait_by{};
+    std::array<u64, static_cast<size_t>(PushKind::Count)> pushes{};
+    std::array<u64, static_cast<size_t>(PushKind::Count)> push_wait{};
+    u64 batch_ends{};    ///< FRITCHII_ESPLIT_IDLE: batch ends posted to E2
+    u64 idle_waits{};    ///< ... E1's waits for E2 idle or new words, no join
+    u64 idle_woken{};    ///< ... of which new words came first
+    u64 queued_shader{}; ///< FRITCHII_ESPLIT_OWED: queued writes on shader pages (lookup joins)
     u64 hold_ticks{}; ///< E1 held for E2's lends
     u64 seeds{};
     u64 lost{};
@@ -255,6 +263,8 @@ struct E2Counts {
     std::atomic<u64> cb_differs{};
     std::atomic<u64> cb_guard{};
     std::atomic<u64> async_writes{}; ///< ESplitAsyncWrite
+    std::atomic<u64> late_checks{};  ///< ESplitLateShader's sampled late flushes
+    std::atomic<u64> late_shader{};  ///< ... that invalidated shader pages (must be 0)
 };
 
 void Bump(std::atomic<u64>& counter, u64 amount = 1) noexcept {
@@ -693,6 +703,20 @@ void Publish(u64 seq) {
 }
 
 /// E1 waits for E2 (a safe point: an E2 lend may run meanwhile), then holds if E2 asks.
+/// What E1 waits for now (an index of E1Counts::wait_by): set around each wait's caller.
+constexpr size_t CauseRoom = JoinCount;
+constexpr size_t CauseDepth = JoinCount + 1;
+size_t g_cause = static_cast<size_t>(Join::Lockstep);
+struct CauseScope {
+    explicit CauseScope(size_t cause) noexcept : saved{std::exchange(g_cause, cause)} {}
+    ~CauseScope() {
+        g_cause = saved;
+    }
+    size_t saved;
+};
+/// PushKind of the push whose drain E1 waits for (its own bucket too).
+size_t g_push_kind = 0;
+
 template <typename Ready>
 void E1Wait(Ready&& ready) {
     if (ready()) {
@@ -700,8 +724,13 @@ void E1Wait(Ready&& ready) {
     }
     const Profile::Scope zone{Profile::Zone::ESplitHandOver, Profile::Enabled(), false};
     g.e1_parked.store(true, std::memory_order_seq_cst);
-    g_e1.wait_ticks += WaitFor(ready, g.e1_wake, g.e1_sleeping, g_e1_poll,
+    const u64 waited = WaitFor(ready, g.e1_wake, g.e1_sleeping, g_e1_poll,
                                g_async ? AsyncPollLimit : E1PollLimit);
+    g_e1.wait_ticks += waited;
+    g_e1.wait_by[g_cause] += waited;
+    if (g_cause == static_cast<size_t>(Join::Push)) {
+        g_e1.push_wait[g_push_kind] += waited;
+    }
     g.e1_parked.store(false, std::memory_order_seq_cst);
     if (g_hold.load(std::memory_order_seq_cst) != 0) [[unlikely]] {
         HoldHereImpl();
@@ -731,6 +760,7 @@ void ToView() {
 
 Job& TakeSlot(bool draw_tail) {
     PostCbWrites(); // S4: the open record keeps its place in ring order
+    const CauseScope cause{draw_tail ? CauseDepth : CauseRoom};
     E1Wait([draw_tail] {
         const u64 done = g.done.load(std::memory_order_acquire);
         if (g_next_seq - 1 - done >= Slots - 1) {
@@ -917,13 +947,44 @@ void Report(u64 now) {
              "E split thread 10 s: cb words (FRITCHII_ESPLIT_CB_ASYNC={}): queued writes {:.0f}/s "
              "in {:.0f} records/s ({:.1f} KiB/s), writes in joins {:.0f}/s ({}); checks (must be "
              "0): ESplitCbOrder {}, ESplitCbBytes {} in {} read back (1 write in 64), "
-             "ESplitCbGuard {}, ESplitCbRead {}, ESplitAsyncWrite {}; draw flushes "
-             "(FRITCHII_ESPLIT_FLUSH_ASYNC={}): before the lookup {:.0f}/s, owed (E2 drained "
-             "first) {:.0f}/s, in the tail {:.0f}/s",
+             "ESplitCbGuard {}, ESplitCbRead {}, {} {}, ESplitLateShader {} in {} late flushes "
+             "checked (1 in 16); queued writes on shader pages {:.0f}/s (lookup joins); draw "
+             "flushes (FRITCHII_ESPLIT_FLUSH_ASYNC={}, FRITCHII_ESPLIT_OWED={}): before the "
+             "lookup {:.0f}/s, owed (E2 drained first) {:.0f}/s, in the tail {:.0f}/s",
              g_cb_async ? 1 : 0, rate(c.cb_segments), rate(c.cb_records),
              rate(c.cb_bytes) / 1024.0, rate(cb_joins), cb_join_text, cb_order, cb_differs,
-             cb_checks, cb_guard, c.cb_reads, async_writes, g_flush_async ? 1 : 0,
+             cb_checks, cb_guard, c.cb_reads,
+             g_owed_shader_rule ? "async jobs with cached writes (a count, not a check: R's "
+                                  "concurrent writes included)"
+                                : "ESplitAsyncWrite",
+             async_writes, TakeCount(g_e2.late_shader), TakeCount(g_e2.late_checks),
+             rate(c.queued_shader), g_flush_async ? 1 : 0, g_owed_shader_rule ? 1 : 0,
              rate(c.flush_before), rate(c.flush_drained), rate(c.flush_tail));
+    // E1's waits by cause (what each join class costs), the pushes by kind, the idle path.
+    {
+        std::string text;
+        for (size_t i = 0; i < JoinCount; ++i) {
+            if (c.wait_by[i] != 0) {
+                text += fmt::format("{}{} {:.1f}", text.empty() ? "" : ", ", JoinNames[i],
+                                    ms(c.wait_by[i]));
+            }
+        }
+        text += fmt::format("{}queue room {:.1f}, draw depth {:.1f}", text.empty() ? "" : ", ",
+                            ms(c.wait_by[CauseRoom]), ms(c.wait_by[CauseDepth]));
+        static constexpr std::array<const char*, static_cast<size_t>(PushKind::Count)> PushNames{
+            "lends", "posted ops", "pushes", "drains", "carried ops"};
+        std::string pushes;
+        for (size_t i = 0; i < PushNames.size(); ++i) {
+            pushes += fmt::format("{}{} {:.0f}/s {:.1f} ms/s", i == 0 ? "" : ", ", PushNames[i],
+                                  rate(c.pushes[i]), ms(c.push_wait[i]));
+        }
+        LOG_INFO(HW_GPU,
+                 "E split thread 10 s: E1 waiting for E2 by cause (ms/s): {}; held for E2's "
+                 "lends {:.1f}; push joins by kind: {}; FRITCHII_ESPLIT_IDLE={}: batch ends "
+                 "posted {:.0f}/s, idle waits {:.0f}/s ({:.0f}/s ended by new ring words)",
+                 text, ms(c.hold_ticks), pushes, g_idle_async ? 1 : 0, rate(c.batch_ends),
+                 rate(c.idle_waits), rate(c.idle_woken));
+    }
     // The queued mode: the entries that still join, by kind (the top 8).
     {
         std::array<JoinKindSlot, JoinKindSlots> slots = g_join_kinds;
@@ -1051,21 +1112,26 @@ void ThreadBatch() noexcept {
     if (depth != g_depth) [[unlikely]] {
         SetDepth(depth);
     }
+    g_idle_async = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_esplit_idle,
+                                                    "FRITCHII_ESPLIT_IDLE", 1) != 0;
+    g_owed_shader_rule = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_esplit_owed,
+                                                          "FRITCHII_ESPLIT_OWED", 1) != 0;
     // FRITCHII_ESPLIT_ASYNC_KINDS (live): which E2 entries queue; changed with E2 drained (a
     // compute engine's sink moves with its entries).
     {
         const u32 kinds = static_cast<u32>(VideoCore::Nx2Debug::SwitchValue(
                               VideoCore::Nx2Debug::g_esplit_async_kinds,
                               "FRITCHII_ESPLIT_ASYNC_KINDS", static_cast<int>(KindsDefault))) &
-                          7;
+                          15;
         if (kinds != g_async_kinds) [[unlikely]] {
             WaitDrained();
             LOG_INFO(HW_GPU,
                      "E split thread: FRITCHII_ESPLIT_ASYNC_KINDS={} (cache calls {}, raster ops "
-                     "{}, compute entries {})",
+                     "{}, compute entries {}, posted ops {})",
                      kinds, (kinds & KindCacheCalls) != 0 ? "queued" : "join",
                      (kinds & KindRasterOps) != 0 ? "queued" : "join",
-                     (kinds & KindCompute) != 0 ? "queued" : "join");
+                     (kinds & KindCompute) != 0 ? "queued" : "join",
+                     (kinds & KindPostedOps) != 0 ? "queued" : "join");
             g_async_kinds = kinds;
         }
     }
@@ -1100,6 +1166,7 @@ void ThreadBatch() noexcept {
 }
 
 void Run(const HandInfo& info, void (*function)(void*), void* argument) noexcept {
+    const CauseScope cause{static_cast<size_t>(Join::Lockstep)};
     if (g_async) {
         // A lockstep hand-over in S2: E2 drained, its flags on the engine for the run.
         WaitDrained();
@@ -1204,6 +1271,14 @@ void* BeginAsync(Hand hand) noexcept {
     return job.payload.data();
 }
 
+void* BeginAsyncPacket(Hand hand, u8*& packet) noexcept {
+    void* const payload = BeginAsync(hand);
+    if (payload != nullptr) {
+        packet = g.buffers[g_open->seq % Slots].packet.get();
+    }
+    return payload;
+}
+
 void PostAsync(void (*function)(void*)) noexcept {
     Job& job = *std::exchange(g_open, nullptr);
     job.function = function;
@@ -1262,6 +1337,13 @@ void QueueRasterOpImpl(RasterOp op, VideoCore::RasterizerInterface& rasterizer, 
         RasterOp op;
     } const raster{&rasterizer, address, a, b, c, d, op};
     static_assert(sizeof(Raster) <= AsyncPayloadBytes && std::is_trivially_copyable_v<Raster>);
+    // FRITCHII_ESPLIT_OWED: a report lands at `address` (16 bytes at most): on a shader page the
+    // next lookup drains and flushes first.
+    if (op == RasterOp::Query && g_owed_shader_rule) {
+        if (const Maxwell3D* const engine = OneF::Engine()) {
+            NoteQueuedWrite(&engine->GetMemoryManager(), address, 16);
+        }
+    }
     void* const payload = BeginAsync(Hand::Raster);
     std::memcpy(payload, &raster, sizeof(raster));
     PostAsync([](void* raw) {
@@ -1293,6 +1375,72 @@ void QueueRasterOpImpl(RasterOp op, VideoCore::RasterizerInterface& rasterizer, 
             break;
         }
     });
+}
+
+bool WaitE2IdleOrImpl(bool (*more)(void*), void* argument) noexcept {
+    ++g_e1.idle_waits;
+    bool woken = false;
+    {
+        const CauseScope cause{static_cast<size_t>(Join::Idle)};
+        PostCbWrites();
+        // E2 bumps E1's wake word after each job while E1 sleeps: `more` is asked again then.
+        E1Wait([&] {
+            if (E2Idle()) {
+                return true;
+            }
+            woken = more(argument);
+            return woken;
+        });
+    }
+    if (woken && !E2Idle()) {
+        ++g_e1.idle_woken;
+        return true;
+    }
+    return false;
+}
+
+void NoteBatchEnd() noexcept {
+    ++g_e1.batch_ends;
+}
+
+void NoteQueuedWrite(const void* memory, u64 address, u64 size) noexcept {
+    if (memory == nullptr || size == 0) {
+        return;
+    }
+    const auto& manager = *static_cast<const Tegra::MemoryManager*>(memory);
+    const std::optional<DAddr> device = manager.GpuToCpuAddress(address);
+    if (!device || OneF::OnShaderPages(*device, size)) {
+        NoteQueuedWriteAnywhere();
+    }
+}
+
+void NoteQueuedWriteAnywhere() noexcept {
+    ++g_e1.queued_shader;
+    g_shader_pending.store(true, std::memory_order_relaxed);
+}
+
+void CheckLateFlush(const void* memory) noexcept {
+    static thread_local u32 rng = 0x51ed2701u;
+    rng ^= rng << 13;
+    rng ^= rng >> 17;
+    rng ^= rng << 5;
+    if ((rng & 15) != 0 || memory == nullptr) {
+        return;
+    }
+    const auto& manager = *static_cast<const Tegra::MemoryManager*>(memory);
+    Bump(g_e2.late_checks);
+    if (manager.PendingWritesHit(
+            [](DAddr device, u64 size) { return OneF::OnShaderPages(device, size); }))
+        [[unlikely]] {
+        Bump(g_e2.late_shader);
+        static u64 logged = 0;
+        if (++logged <= 16) {
+            LOG_ERROR(HW_GPU,
+                      "E split thread: ESplitLateShader: a flush after E1's lookup at ring "
+                      "position {:#x} invalidates shader pages ({} since boot)",
+                      t_e2_position, logged);
+        }
+    }
 }
 
 void NoteJoinEntry(u32 kind, u32 engine, u32 method_or_tag, const void* function) noexcept {
@@ -1383,7 +1531,7 @@ void HoldHereImpl() noexcept {
     g_e1.hold_ticks += Profile::Ticks() - start;
 }
 
-bool BeforeEnginePushImpl(bool lend, bool visible) noexcept {
+bool BeforeEnginePushImpl(bool lend, bool visible, PushKind kind) noexcept {
     if (t_role == 1 && t_join == 0) {
         if (visible) [[unlikely]] {
             ++g_e1.visible;
@@ -1395,7 +1543,12 @@ bool BeforeEnginePushImpl(bool lend, bool visible) noexcept {
             }
         }
         if (g_async) {
-            WaitDrained();
+            ++g_e1.pushes[static_cast<size_t>(kind)];
+            {
+                const CauseScope cause{static_cast<size_t>(Join::Push)};
+                g_push_kind = static_cast<size_t>(kind);
+                WaitDrained();
+            }
             ToEngine();
             ++g_e1.joins[static_cast<size_t>(Join::Push)];
             g_push_mark = WriteMark();
@@ -1460,6 +1613,7 @@ void BeginJoin(Join why) noexcept {
     if (t_join++ == 0) {
         ++g_e1.joins[static_cast<size_t>(why)];
         if (g_async) {
+            const CauseScope cause{static_cast<size_t>(why)};
             WaitDrained();
             ToEngine();
         }
@@ -1624,7 +1778,10 @@ FlushAt FlushPlace() noexcept {
     if (!g_async) {
         return FlushAt::Before; // S1: E2 idle at every draw
     }
-    if (g.async_wrote.exchange(false, std::memory_order_acquire)) [[unlikely]] {
+    // FRITCHII_ESPLIT_OWED=1: an async job's cached writes do not make it owed (the shader page
+    // rule covers what a late flush could change for the lookup); 0: S4's rule.
+    if (g.async_wrote.exchange(false, std::memory_order_acquire) && !g_owed_shader_rule)
+        [[unlikely]] {
         g_flush_owed = true;
     }
     if (g_flush_owed) {
