@@ -1850,6 +1850,26 @@ bool SemOnE() noexcept {
     return on;
 }
 
+bool SoftReleaseOnE() noexcept {
+    return g.on && VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_soft_release_e,
+                                                    "FRITCHII_ONEF_SOFT_RELEASE_E") != 0;
+}
+
+bool PostIdleOn() noexcept {
+    return PostFenceOn() && VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_post_idle,
+                                                             "FRITCHII_ONEF_POST_IDLE") != 0;
+}
+
+bool PostFenceReportOn() noexcept {
+    return PostFenceOn() &&
+           VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_post_fence_report,
+                                            "FRITCHII_ONEF_POST_FENCE_REPORT") != 0;
+}
+
+const std::vector<u64>& UnassignedReportPages() noexcept {
+    return g.landing_unassigned;
+}
+
 void CountFenceDecision(FenceDecision decision) noexcept {
     g.fence_decisions[static_cast<size_t>(decision)].fetch_add(1, std::memory_order_relaxed);
 }

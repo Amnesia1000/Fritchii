@@ -284,6 +284,15 @@ inline std::atomic<int> g_onef_dry_release{-1};
 /// FRITCHII_ONEF_SEM_E (live, default 0; with POST_FENCE): fable_b 19.4, 19.6 and 20.3, the
 /// sync point increments, the SignalFence callbacks and the payload writes on E.
 inline std::atomic<int> g_onef_sem_e{-1};
+/// FRITCHII_ONEF_SOFT_RELEASE_E (live, default 0): fable_b 22.3, a non-forced ReleaseFences
+/// (the command list end) is answered on E: with the fencing thread it does nothing.
+inline std::atomic<int> g_onef_soft_release_e{-1};
+/// FRITCHII_ONEF_POST_IDLE (live, default 0; with POST_FENCE): fable_b 22.3, WaitForIdle posted
+/// in 16.2's form.
+inline std::atomic<int> g_onef_post_idle{-1};
+/// FRITCHII_ONEF_POST_FENCE_REPORT (live, default 0; with POST_FENCE): fence-flagged counter
+/// reports posted as the rasterizer's fences are.
+inline std::atomic<int> g_onef_post_fence_report{-1};
 /// FRITCHII_ONEF_CLEAR_NODEFER (live, default 0): diagnostic, a posted clear on R is never
 /// deferred into the next render pass's load op (the lean darkness of 15 Nov).
 inline std::atomic<int> g_onef_clear_nodefer{-1};

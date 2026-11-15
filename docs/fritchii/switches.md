@@ -1513,6 +1513,23 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   with E's commit, lent because POST_FENCE is off, fences delayed, stopped, a sync owed, or
   marks ahead due; and the samples sync targets R did not need because E's mirror was ahead
   (no longer "sync target unused").
+- FRITCHII_ONEF_SOFT_RELEASE_E (live, default 0; fable_b 22.3): a non-forced ReleaseFences
+  (GPU::OnCommandListEnd, about 1,400 a second, the lent "ReleaseFences" site: the forced ones
+  are posted by POST_FENCE) is answered on E: with the fencing thread WaitPendingFences(false)
+  does nothing.
+- FRITCHII_ONEF_POST_IDLE (live, default 0; needs FRITCHII_ONEF_POST_FENCE; fable_b 22.3): a
+  WaitForIdle with no report of another kind owing the query sync is posted: E obtains the
+  buffers for the values R syncs (16.2) and runs SignalOrdering's flush grouping at its place;
+  R records the barrier and syncs into the named buffers.
+- FRITCHII_ONEF_POST_FENCE_REPORT (live, default 0; needs FRITCHII_ONEF_POST_FENCE): a clean
+  fence's counter report (a type with a streamer: its value is R's; EXP33's kept reports and
+  payload reports excepted) is posted as the rasterizer's fences are: E runs the buffer half,
+  obtains the sync buffers (the report's own samples value included) and the gather; R runs
+  CounterReport and its SignalFence. Its page waits for the op (13.0). Counted as query kind
+  "fence report posted". With POST_FENCE on, E also lands the guest reads' downloads over the
+  report pages a posted fence lands, and R's report writes inside a posted fence never wait for
+  the buffer lock: must-be-0 "R read landing" when one still finds a download (landed only with
+  the lock free) or the lock busy (skipped).
 - FRITCHII_ONEF_OP_CLEAR (live, default 0; fable_b_one_follower 13.4 group 3; step 4, view
   tracked): 1 = clears are render ops. E has decided the render enable (DrawManager tests
   ShouldExecute) and runs the clear's FlushCaching; R plays Clear from its view (every clear

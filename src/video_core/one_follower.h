@@ -238,6 +238,10 @@ enum class Check : u8 {
     /// from a later place in the stream (E's place: after the packets it pushed; R's: the
     /// packet it plays). Every writer of a word must have one home.
     SemaphoreOrder,
+    /// fable_b 16.4 (POST_FENCE): R, writing a report inside a posted fence, met a guest read's
+    /// download over it that E did not land before posting, or found the buffer lock busy and
+    /// skipped the landing (R never waits for that lock in a posted op).
+    RenderReadLanding,
     /// FRITCHII_ONEF_UNLENT_RESET (fable_b 19 step 2): a forced-lent draw where E's own indirect
     /// reset test (made before the lend) differs from the test on E's engine inside the lent
     /// call. The switch stops for the session.
@@ -262,7 +266,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Check::Count)> chec
     "build list draw", "played list args", "played kind without path", "sync mirror",
     "sync target missing", "sync target unused", "played dispatch", "played dispatch off view", "lookup programs",
     "lookup blend", "lookup vertex input",
-    "semaphore order", "unlent reset", "view values", "bind seed view",
+    "semaphore order", "R read landing", "unlent reset", "view values", "bind seed view",
 };
 
 // --- The packet (E to R) -----------------------------------------------------------------------------
@@ -669,6 +673,14 @@ void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size,
 [[nodiscard]] bool DryReleaseOn() noexcept;
 /// FRITCHII_ONEF_SEM_E (with POST_FENCE on; refreshes g_sem_e): fable_b 19.4, 19.6, 20.3.
 [[nodiscard]] bool SemOnE() noexcept;
+/// FRITCHII_ONEF_SOFT_RELEASE_E: a non-forced ReleaseFences is answered on E.
+[[nodiscard]] bool SoftReleaseOnE() noexcept;
+/// FRITCHII_ONEF_POST_IDLE (with POST_FENCE on): WaitForIdle posted.
+[[nodiscard]] bool PostIdleOn() noexcept;
+/// FRITCHII_ONEF_POST_FENCE_REPORT (with POST_FENCE on): counter fence reports posted.
+[[nodiscard]] bool PostFenceReportOn() noexcept;
+/// E: the report pages (device >> 12) since the last fence, which the next posted fence lands.
+[[nodiscard]] const std::vector<u64>& UnassignedReportPages() noexcept;
 /// E, at each fence it could post: what it did (dry counts, the fence decisions line).
 enum class FenceDecision : u8 {
     Posted,           ///< posted, nothing for the buffer half
@@ -812,13 +824,14 @@ enum class QueryKind : u8 {
     PayloadRelease,        ///< a payload release (lent; item 4)
     PayloadReleaseOnE,     ///< FRITCHII_ONEF_SEM_E: a payload release E wrote (R notes the sync)
     PayloadFenceOnE,       ///< FRITCHII_ONEF_SEM_E: a fence-flagged payload report E wrote
+    FenceReportPosted,     ///< FRITCHII_ONEF_POST_FENCE_REPORT: a counter fence report posted
     Count,
 };
 inline constexpr std::array<const char*, static_cast<size_t>(QueryKind::Count)> query_kind_names{
     "condition skipped", "condition override", "condition true", "condition false",
     "condition conditional", "condition if equal", "condition if not equal", "reset",
     "plain report", "report on buffer page", "report on buffer page as op", "fence report",
-    "payload release", "payload release on E", "payload fence on E",
+    "payload release", "payload release on E", "payload fence on E", "fence report posted",
 };
 /// fable_b 19 step 2's dry counter: which test made a draw lend with LentReason::Transient, in
 /// the order UnlentBlocker and FillRing (vk_one_follower_draw.cpp) try them. Logged per second
