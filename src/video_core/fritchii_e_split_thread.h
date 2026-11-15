@@ -111,6 +111,8 @@ enum class Hand : u8 {
     Bind,     ///< a constant buffer bind's buffer cache half, by value
     Store,    ///< S2: GpuSplit::StoreConsumed at E2's place
     CbWords,  ///< S4: constant buffer words' memory half, by value (several writes a record)
+    Async,    ///< an E2 entry queued whole (a cache call, a compute engine entry)
+    Raster,   ///< a 3D method's rasterizer call, by value (its register half ran on E1)
     Count,
 };
 
@@ -367,6 +369,62 @@ void PostCbWrites() noexcept;
 /// E2's stream-write guard found tracked pages in an async constant buffer record
 /// (ESplitCbGuard, must be 0: E1 found them clear when it queued the write).
 void NoteCbGuardHit() noexcept;
+
+// --- The queued mode's entry kinds (FRITCHII_ESPLIT_ASYNC_KINDS) ---------------------------------
+
+/// Which E2 entries queue instead of joining (E2 drained, E1 runs them). Each is exact by
+/// construction: E2 runs it in ring order after everything posted before it, and it reads nothing
+/// E1 changes later.
+///   bit 0, cache calls: Call entries tagged StageTag::Cache (fence releases, GPU cache
+///          invalidations, reference signals, the puller's wait for idle and semaphore releases,
+///          the compute list words). The tag says they use only back-side objects and write no
+///          3D state; their payload is in ring A, which frees only at E2's place.
+///   bit 1, raster ops: wait_for_idle, fragment_barrier, invalidate_texture_data_cache,
+///          tiled_cache_barrier, report_semaphore.query, clear_report_value, sync_info. E1 runs
+///          the method (register write, dirty flags, the values the handler reads); the one
+///          rasterizer call it ends in goes to E2 by value (QueueRasterOp).
+///   bit 2, compute engine entries (default off): every Method, Multi and Pairs entry of the
+///          compute engine, its sink included, on E2 with the engine named by value. Its
+///          dispatches' reads of 3D state are not proven absent yet.
+enum AsyncKindBit : u32 {
+    KindCacheCalls = 1,
+    KindRasterOps = 2,
+    KindCompute = 4,
+    KindsDefault = KindCacheCalls | KindRasterOps,
+};
+/// E1 writes it at a batch's start, E2 drained.
+inline u32 g_async_kinds{};
+[[nodiscard]] inline bool QueueKind(u32 bit) noexcept {
+    return g_async && (g_async_kinds & bit) != 0 && t_role == 1 && t_join == 0;
+}
+
+enum class RasterOp : u8 {
+    WaitForIdle,
+    FragmentBarrier,
+    InvalidateTextureDataCache,
+    TiledCacheBarrier,
+    Query,           ///< address, type, flags, payload, subreport
+    ResetCounter,    ///< type
+    SignalSyncPoint, ///< value
+};
+void QueueRasterOpImpl(RasterOp op, VideoCore::RasterizerInterface& rasterizer, u64 address,
+                       u32 a, u32 b, u32 c, u32 d) noexcept;
+/// Maxwell3D, at the rasterizer call a raster-op method ends in: true when it went to E2's queue
+/// (E1 outside a join, bit 1 on); false: the caller calls the rasterizer as before.
+[[nodiscard]] inline bool QueueRasterOp(RasterOp op, VideoCore::RasterizerInterface& rasterizer,
+                                        u64 address = 0, u32 a = 0, u32 b = 0, u32 c = 0,
+                                        u32 d = 0) noexcept {
+    if (QueueKind(KindRasterOps)) [[unlikely]] {
+        QueueRasterOpImpl(op, rasterizer, address, a, b, c, d);
+        return true;
+    }
+    return false;
+}
+
+/// GpuSplit::BackLoop, the queued mode: an entry that joined, by kind (the 10 s line names the
+/// top 8): ring kind, engine (0 3D, 1 compute, 2 other, 3 none), method or call tag, and a
+/// call's function.
+void NoteJoinEntry(u32 kind, u32 engine, u32 method_or_tag, const void* function) noexcept;
 
 // --- E1Touch ---------------------------------------------------------------------------------------
 

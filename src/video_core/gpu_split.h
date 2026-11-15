@@ -1872,6 +1872,12 @@ private:
     void BackWaitForStage(std::stop_token& stop_token, u64 read_position);
     /// Runs the entry at `entry` (of the `words` published before the ring's end), returns its size.
     size_t Execute(const u64* entry, size_t words);
+    /// FRITCHII_ESPLIT_ASYNC_KINDS bit 2, on E2: a Method, Multi or Pairs entry of a non-3D
+    /// `engine` (the compute engine), as Execute runs it with `engine` bound (E1 has moved on to
+    /// other engines). Returns its size.
+    size_t ExecuteOnEngine(Tegra::Engines::EngineInterface* engine, const u64* entry);
+    /// The size Execute takes for a non-3D engine's Method, Multi or Pairs entry, or a Call.
+    [[nodiscard]] static size_t PlainEntrySize(u64 head);
     /// Back, Kind::CbWords: the block's `count` Method words, each run as its own entry would
     /// run (Execute, whose constant buffer gather takes them at once). `verify_address`: the
     /// front's address word (FRITCHII_CB_WORDS_BLOCK=2, VerifyCbWords).

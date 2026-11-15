@@ -787,6 +787,11 @@ void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argume
                     "Maxwell3D::ProcessMethodCall (wait_for_idle)");
             }
         }
+        // FRITCHII_ESPLIT_ASYNC_KINDS bit 1: the rasterizer call goes to E2's queue (E1).
+        if (VideoCommon::ESplit::QueueRasterOp(VideoCommon::ESplit::RasterOp::WaitForIdle,
+                                               *rasterizer)) {
+            return;
+        }
         return rasterizer->WaitForIdle();
     case MAXWELL3D_REG_INDEX(shadow_ram_control):
         shadow_state.shadow_ram_control = static_cast<Regs::ShadowRamControl>(nonshadow_argument);
@@ -863,12 +868,25 @@ void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argume
     case MAXWELL3D_REG_INDEX(inline_data):
         upload_state.ProcessData(argument, is_last_call);
         return;
+    // FRITCHII_ESPLIT_ASYNC_KINDS bit 1: these rasterizer calls go to E2's queue (E1).
     case MAXWELL3D_REG_INDEX(fragment_barrier):
+        if (VideoCommon::ESplit::QueueRasterOp(VideoCommon::ESplit::RasterOp::FragmentBarrier,
+                                               *rasterizer)) {
+            return;
+        }
         return rasterizer->FragmentBarrier();
     case MAXWELL3D_REG_INDEX(invalidate_texture_data_cache):
+        if (VideoCommon::ESplit::QueueRasterOp(
+                VideoCommon::ESplit::RasterOp::InvalidateTextureDataCache, *rasterizer)) {
+            return;
+        }
         // InvalidateGPUCache, then WaitForIdle (RasterizerInterface's default).
         return rasterizer->InvalidateTextureDataCache();
     case MAXWELL3D_REG_INDEX(tiled_cache_barrier):
+        if (VideoCommon::ESplit::QueueRasterOp(VideoCommon::ESplit::RasterOp::TiledCacheBarrier,
+                                               *rasterizer)) {
+            return;
+        }
         return rasterizer->TiledCacheBarrier();
     default:
         draw_manager.ProcessMethodCall(*this, method, argument);
@@ -1123,14 +1141,15 @@ void Maxwell3D::FillConstantWordsTarget(VideoCommon::ESplit::CbTarget& target, u
     target.may_defer = false;
     if (target.pools) [[unlikely]] {
         // FRITCHII_ESPLIT=1: the pools by value (the half may run on E2 later). The fast draw
-        // count's notes read the registers, the price timers E's own state: those writes stay
-        // where the register half runs (a join on E1).
+        // count's notes read the registers: those writes stay where the register half runs (a
+        // join on E1). The price timers (on with the GPU profile) only time the half and add to
+        // their own counters: they run on E2 too, so profiled runs show the real split.
         const FastDrawCountPools pools = FastDrawCountPoolRanges();
         target.tic = pools.tic;
         target.tic_size = pools.tic_size;
         target.tsc = pools.tsc;
         target.tsc_size = pools.tsc_size;
-        target.may_defer = !target.count_fast_draw && !VideoCommon::FritchiiPrice::On();
+        target.may_defer = !target.count_fast_draw;
     }
 }
 
@@ -1412,12 +1431,21 @@ void Maxwell3D::ProcessQueryGet() {
         const u64 bytes = regs.report_semaphore.query.short_query != 0 ? 4 : 16;
         NoteFastDrawCountData(sequence_address, sequence_address + bytes);
     }
+    // FRITCHII_ESPLIT_ASYNC_KINDS bit 1: the query goes to E2's queue with its values (E1).
+    const auto query = [&] {
+        if (VideoCommon::ESplit::QueueRasterOp(VideoCommon::ESplit::RasterOp::Query, *rasterizer,
+                                               sequence_address, static_cast<u32>(query_type),
+                                               static_cast<u32>(flags), payload, subreport)) {
+            return;
+        }
+        rasterizer->Query(sequence_address, query_type, flags, payload, subreport);
+    };
     switch (regs.report_semaphore.query.operation) {
     case Regs::ReportSemaphore::Operation::Release:
         if (regs.report_semaphore.query.short_query != 0) {
             flags |= VideoCommon::QueryPropertiesFlags::IsAFence;
         }
-        rasterizer->Query(sequence_address, query_type, flags, payload, subreport);
+        query();
         break;
     case Regs::ReportSemaphore::Operation::Acquire:
         // TODO(Blinkhawk): Under this operation, the GPU waits for the CPU to write a value that
@@ -1425,7 +1453,7 @@ void Maxwell3D::ProcessQueryGet() {
         UNIMPLEMENTED_MSG("Unimplemented query operation ACQUIRE");
         break;
     case Regs::ReportSemaphore::Operation::ReportOnly:
-        rasterizer->Query(sequence_address, query_type, flags, payload, subreport);
+        query();
         break;
     case Regs::ReportSemaphore::Operation::Trap:
         UNIMPLEMENTED_MSG("Unimplemented query operation TRAP");
@@ -1553,6 +1581,11 @@ void Maxwell3D::ProcessCounterReset() {
             return VideoCommon::QueryType::Payload;
         }
     }();
+    // FRITCHII_ESPLIT_ASYNC_KINDS bit 1: to E2's queue with its value (E1).
+    if (VideoCommon::ESplit::QueueRasterOp(VideoCommon::ESplit::RasterOp::ResetCounter,
+                                           *rasterizer, 0, static_cast<u32>(query_type))) {
+        return;
+    }
     rasterizer->ResetCounter(query_type);
 }
 
@@ -1562,6 +1595,11 @@ void Maxwell3D::ProcessSyncPoint() {
     }
     const u32 sync_point = regs.sync_info.sync_point.Value();
     [[maybe_unused]] const u32 cache_flush = regs.sync_info.clean_l2.Value();
+    // FRITCHII_ESPLIT_ASYNC_KINDS bit 1: to E2's queue with its value (E1).
+    if (VideoCommon::ESplit::QueueRasterOp(VideoCommon::ESplit::RasterOp::SignalSyncPoint,
+                                           *rasterizer, 0, sync_point)) {
+        return;
+    }
     rasterizer->SignalSyncPoint(sync_point);
 }
 

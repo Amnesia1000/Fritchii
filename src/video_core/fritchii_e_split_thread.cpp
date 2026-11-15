@@ -141,7 +141,8 @@ constexpr size_t HandCount = static_cast<size_t>(Hand::Count);
 constexpr size_t JoinCount = static_cast<size_t>(Join::Count);
 constexpr size_t TouchCount = static_cast<size_t>(Touch::Count);
 constexpr std::array<const char*, HandCount> HandNames{
-    "entries", "flushes", "draw tails", "binds", "stores", "cb records"};
+    "entries", "flushes", "draw tails", "binds", "stores", "cb records", "queued entries",
+    "raster ops"};
 constexpr std::array<const char*, JoinCount> JoinNames{
     "entries", "decisions", "conditions", "idle",  "pushes", "lockstep",
     "cb writes", "lookups", "flushes",  "tails", "seeds"};
@@ -150,7 +151,7 @@ constexpr std::array<const char*, JoinCount> JoinNames{
 enum class CbJoin : u8 { Off, Debug, Size, Pages, Sparse, Unmapped, Guarded, Count };
 constexpr size_t CbJoinCount = static_cast<size_t>(CbJoin::Count);
 constexpr std::array<const char*, CbJoinCount> CbJoinNames{
-    "not async", "fast draw count or price timers", "too long", "across a page",
+    "not async", "fast draw count", "too long", "across a page",
     "sparse",    "unmapped",                         "texture, shader pages or pools"};
 /// A record's room for constant buffer writes (each a CbSegment and its words).
 constexpr size_t CbRoom = 4096;
@@ -173,6 +174,20 @@ struct CbRecord {
 }
 constexpr std::array<const char*, TouchCount> TouchNames{"cache lock", "memory read",
                                                          "memory write"};
+
+/// The queued mode's join entries by kind (E1's, per 10 s window): open addressing on the key.
+struct JoinKindSlot {
+    u64 key;         ///< 0: empty
+    u64 count;
+    const void* function;
+    u32 kind;
+    u32 engine;
+    u32 method_or_tag;
+};
+constexpr size_t JoinKindSlots = 256;
+std::array<JoinKindSlot, JoinKindSlots> g_join_kinds{};
+u64 g_join_kinds_lost{};
+constexpr std::array<const char*, 4> EngineNames{"3D", "compute", "other engine", "no engine"};
 
 struct Job {
     void (*function)(void*);
@@ -909,6 +924,40 @@ void Report(u64 now) {
              rate(c.cb_bytes) / 1024.0, rate(cb_joins), cb_join_text, cb_order, cb_differs,
              cb_checks, cb_guard, c.cb_reads, async_writes, g_flush_async ? 1 : 0,
              rate(c.flush_before), rate(c.flush_drained), rate(c.flush_tail));
+    // The queued mode: the entries that still join, by kind (the top 8).
+    {
+        std::array<JoinKindSlot, JoinKindSlots> slots = g_join_kinds;
+        g_join_kinds = {};
+        std::sort(slots.begin(), slots.end(),
+                  [](const JoinKindSlot& a, const JoinKindSlot& b) { return a.count > b.count; });
+        std::string text;
+        u64 total = 0;
+        for (const JoinKindSlot& slot : slots) {
+            total += slot.count;
+        }
+        for (size_t i = 0; i < 8 && slots[i].count != 0; ++i) {
+            const JoinKindSlot& slot = slots[i];
+            static constexpr std::array<const char*, 16> KindNames{
+                "wrap", "engine", "method", "multi", "call", "pairs", "delta", "draw batch",
+                "cb words", "kind 9", "kind 10", "kind 11", "kind 12", "kind 13", "kind 14",
+                "kind 15"};
+            std::string what = fmt::format("{} {}", EngineNames[slot.engine & 3],
+                                           KindNames[slot.kind & 15]);
+            if (slot.function != nullptr) {
+                what += fmt::format(" tag {} {}", slot.method_or_tag, Site(slot.function));
+            } else {
+                what += fmt::format(" {:#x}", slot.method_or_tag);
+            }
+            text += fmt::format("{}{} {:.0f}", i == 0 ? "" : "; ", what, rate(slot.count));
+        }
+        LOG_INFO(HW_GPU,
+                 "E split thread 10 s: entries that join {:.0f}/s (FRITCHII_ESPLIT_ASYNC_KINDS={}), "
+                 "top kinds: {}{}",
+                 rate(total), g_async_kinds, text.empty() ? std::string{"none"} : text,
+                 g_join_kinds_lost != 0 ? fmt::format(" ({} uncounted: table full)",
+                                                      std::exchange(g_join_kinds_lost, 0))
+                                        : std::string{});
+    }
     // S3: each thread's CPU time against its busy time (a spinning wait shows as CPU time).
     const u64 e1_cpu = Common::CurrentThreadCpuTimeNs().value_or(0);
     const u64 e2_cpu = g.e2_cpu_ns.load(std::memory_order_relaxed);
@@ -1001,6 +1050,24 @@ void ThreadBatch() noexcept {
     depth = std::clamp(depth, 0, MaxDepth);
     if (depth != g_depth) [[unlikely]] {
         SetDepth(depth);
+    }
+    // FRITCHII_ESPLIT_ASYNC_KINDS (live): which E2 entries queue; changed with E2 drained (a
+    // compute engine's sink moves with its entries).
+    {
+        const u32 kinds = static_cast<u32>(VideoCore::Nx2Debug::SwitchValue(
+                              VideoCore::Nx2Debug::g_esplit_async_kinds,
+                              "FRITCHII_ESPLIT_ASYNC_KINDS", static_cast<int>(KindsDefault))) &
+                          7;
+        if (kinds != g_async_kinds) [[unlikely]] {
+            WaitDrained();
+            LOG_INFO(HW_GPU,
+                     "E split thread: FRITCHII_ESPLIT_ASYNC_KINDS={} (cache calls {}, raster ops "
+                     "{}, compute entries {})",
+                     kinds, (kinds & KindCacheCalls) != 0 ? "queued" : "join",
+                     (kinds & KindRasterOps) != 0 ? "queued" : "join",
+                     (kinds & KindCompute) != 0 ? "queued" : "join");
+            g_async_kinds = kinds;
+        }
     }
     // S4: async constant buffer words and the draw flush after the lookup (both live, with
     // DEPTH > 0). The open record goes first; nothing else waits on the change.
@@ -1184,6 +1251,68 @@ bool E2ExclusiveBegin() noexcept {
 
 void E2ExclusiveEnd() noexcept {
     ReleaseE1();
+}
+
+void QueueRasterOpImpl(RasterOp op, VideoCore::RasterizerInterface& rasterizer, u64 address,
+                       u32 a, u32 b, u32 c, u32 d) noexcept {
+    struct Raster {
+        VideoCore::RasterizerInterface* rasterizer;
+        u64 address;
+        u32 a, b, c, d;
+        RasterOp op;
+    } const raster{&rasterizer, address, a, b, c, d, op};
+    static_assert(sizeof(Raster) <= AsyncPayloadBytes && std::is_trivially_copyable_v<Raster>);
+    void* const payload = BeginAsync(Hand::Raster);
+    std::memcpy(payload, &raster, sizeof(raster));
+    PostAsync([](void* raw) {
+        Raster r;
+        std::memcpy(&r, raw, sizeof(r));
+        auto& rast = *r.rasterizer;
+        switch (r.op) {
+        case RasterOp::WaitForIdle:
+            rast.WaitForIdle();
+            break;
+        case RasterOp::FragmentBarrier:
+            rast.FragmentBarrier();
+            break;
+        case RasterOp::InvalidateTextureDataCache:
+            rast.InvalidateTextureDataCache();
+            break;
+        case RasterOp::TiledCacheBarrier:
+            rast.TiledCacheBarrier();
+            break;
+        case RasterOp::Query:
+            rast.Query(r.address, static_cast<VideoCommon::QueryType>(r.a),
+                       static_cast<VideoCommon::QueryPropertiesFlags>(r.b), r.c, r.d);
+            break;
+        case RasterOp::ResetCounter:
+            rast.ResetCounter(static_cast<VideoCommon::QueryType>(r.a));
+            break;
+        case RasterOp::SignalSyncPoint:
+            rast.SignalSyncPoint(r.a);
+            break;
+        }
+    });
+}
+
+void NoteJoinEntry(u32 kind, u32 engine, u32 method_or_tag, const void* function) noexcept {
+    const u64 key = function != nullptr
+                        ? reinterpret_cast<u64>(function) ^ (u64{method_or_tag} << 56)
+                        : (u64{1} << 63) | (u64{kind} << 40) | (u64{engine} << 32) | method_or_tag;
+    size_t index = static_cast<size_t>((key * 0x9E3779B97F4A7C15ULL) >> 56) % JoinKindSlots;
+    for (size_t probe = 0; probe < JoinKindSlots; ++probe) {
+        JoinKindSlot& slot = g_join_kinds[index];
+        if (slot.key == key) {
+            ++slot.count;
+            return;
+        }
+        if (slot.key == 0) {
+            slot = {key, 1, function, kind, engine, method_or_tag};
+            return;
+        }
+        index = (index + 1) % JoinKindSlots;
+    }
+    ++g_join_kinds_lost;
 }
 
 void* E2FlagsFor(const Maxwell3D* engine) noexcept {
