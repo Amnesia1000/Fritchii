@@ -348,12 +348,19 @@ if (APPLE)
 elseif(WIN32)
     # compile as a win32 gui application instead of a console application
     target_link_libraries(yuzu PRIVATE Qt6::EntryPointPrivate)
+    # Every thread started without a stack size of its own (std::thread, the driver's own
+    # threads, the pipeline workers on which the Vulkan driver compiles) reserves 16 MiB of
+    # address space instead of the linker's 1 MiB. Only reserved: pages get memory as they are
+    # used. AMD's shader compiler overflowed 1 MiB on a task/mesh pipeline and the process
+    # vanished. In every configuration, as a target option (not the release linker flags).
     if(MSVC)
         target_link_libraries(yuzu PRIVATE version.lib)
         set_target_properties(yuzu PROPERTIES LINK_FLAGS_RELEASE "/SUBSYSTEM:WINDOWS")
+        target_link_options(yuzu PRIVATE "/STACK:16777216")
     elseif(MINGW)
         set_target_properties(yuzu PROPERTIES LINK_FLAGS_RELEASE "-Wl,--subsystem,windows")
         target_link_libraries(yuzu PRIVATE dwmapi)
+        target_link_options(yuzu PRIVATE "LINKER:--stack,16777216")
     endif()
 endif()
 

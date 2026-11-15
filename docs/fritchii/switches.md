@@ -37,6 +37,41 @@ Layers drawn once or now and then, depth-only passes and draws without a depth t
 10 s "Async discard" line counts these skips ("N of them into redrawn targets"); they stay in the
 persistent skipped column too. Only matters with unbuilt pipelines: a warm shader cache sees few.
 
+### FRITCHII_OCCLUSION_VISIBLE
+
+TEST, off by default (helper AN, 2026-11-15, idea from DahBard's Blitchii LICHII_FAKE_OCCLUSION);
+live, not exact. OoT tests objects with two 64-bit sample count reports (type 21, 16 bytes each,
+16 bytes apart: before and after the object's test geometry), and its 0xe2c macro reads the six
+words and writes render_enable.mode = p0, or p0 ^ 1 when the counts differ (p0 = 0: draw when
+samples passed). That read was the front's largest wait (FrontDmaRead, ~16% of the front with its
+drains). With the switch on, nothing is measured:
+- Front (fritchii_occlusion.h, Maxwell3D::FrontRunMacroFeaturesT's emit): the hash-matched 0xe2c
+  call makes no read; its 0x158 write appends six made-up words. Ahead of FRITCHII_E2C_ON_E (no
+  call is deferred while it is on); not with EXP53's predicate. The switch adds bit 16 to the
+  front's macro features, so the features body runs (only it knows the macro's hash).
+- Back (Maxwell3D::ProcessQueryGet): a type 21 report becomes a payload report of a made-up count
+  before anything queues or posts it, so it is written as payload releases are (at once below High
+  accuracy, on E with FRITCHII_ONEF_SEM_E): no host occlusion query, result copy, report
+  registration or fence operation. Sample counter resets (clear_report_value) are dropped
+  (ProcessCounterReset).
+- Render thread (QueryCacheBase::CounterEnable, asked at every draw): the host sample counter stays
+  stopped, so no occlusion query wraps the draws.
+- 1: everything visible. The made-up count grows by 4096 at every report (never 0), so any two
+  reports differ, whoever reads them (the front, the back's macro path with the split off, a CPU
+  read), and the macro's words say "differ": mode p0 ^ 1.
+- 2: every report reads 4096 and the macro's words say "equal": mode p0. Objects drawn on p0 = 0 are
+  skipped. This is what a constant count (Blitchii's 4096) gives OoT's pair test; for comparison.
+- Live: turning it off, the render thread starts the counter again at the next draw and the back
+  makes real reports again; a report pair across the switch reads as different (visible) for that
+  one test. Turning it on, reports already made complete as before. E's one-follower mirror of the
+  counter state may say "started" while R's counter is stopped: the superset side, safe.
+- Log, every 10 s while it works: "Occlusion (FRITCHII_OCCLUSION_VISIBLE=N) last 10 s: X sample
+  reports/s answered without a host query, Y counter resets/s skipped, Z 0xe2c reads/s skipped on
+  the front".
+- Visual risks (1): objects behind walls drawn (more draws, and possibly lens flares, sun glare,
+  light shafts or glow sprites showing through walls and hills if the game tests those); (2):
+  tested objects missing.
+
 ### FRITCHII_SYNCPT_MIRROR
 
 Fix, on by default (helper AH, 2026-11-15, port of zortos293/Lichii #1512); read once when the
