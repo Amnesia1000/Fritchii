@@ -2420,6 +2420,15 @@ void Maxwell3D::FrontReportSameWrites(FrontState& fs) {
 
 void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
                            u32 argument, bool is_last_call, bool from_macro) {
+    FrontWriteDecision decision;
+    if (FrontWriteDecide(split, fs, method, argument, is_last_call, from_macro, decision)) {
+        FrontWriteSend(split, fs, method, argument, is_last_call, from_macro, decision);
+    }
+}
+
+bool Maxwell3D::FrontWriteDecide(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
+                                 u32 argument, bool is_last_call, bool from_macro,
+                                 FrontWriteDecision& decision) {
     namespace Profile = VideoCommon::Nx2Profile;
     if (fs.list_draw_stale != 0) [[unlikely]] {
         FrontNoteListDrawWrite(split, fs, method);
@@ -2446,7 +2455,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
             Profile::Add(Profile::Counter::MethodWrites, 1);
             Profile::Add(Profile::Counter::SameValueWrites, 1);
         }
-        return;
+        return false;
     }
     if (Profile::Enabled()) [[unlikely]] {
         Profile::Add(Profile::Counter::MethodWrites, 1);
@@ -2465,7 +2474,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
                 if (Profile::Enabled()) [[unlikely]] {
                     Profile::Add(Profile::Counter::SameValueWrites, 1);
                 }
-                return;
+                return false;
             }
             fs.regs[method] = value;
             using Effect = VideoCommon::GpuSplit::Effect;
@@ -2475,7 +2484,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
             if (from_macro && !direct) {
                 split.CountBatched(VideoCommon::GpuSplit::Batched::MacroSunk);
             }
-            return;
+            return false;
         }
     }
     if (method == MAXWELL3D_REG_INDEX(shadow_ram_control) && FrontVerifyEnabled()) [[unlikely]] {
@@ -2491,7 +2500,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
             ++fs.exp_same;
             FrontReportSameWrites(fs);
         }
-        return;
+        return false;
     }
     // EXP2, and EXP22 bit 4 (the original's EDEN_NX2_SKIP_SAME_DRAWREG: its same-value vertex_buffer
     // first and count are the loop writes skipped above).
@@ -2504,7 +2513,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
             FrontReportSameWrites(fs);
         }
         split.CountBatched(VideoCommon::GpuSplit::Batched::SameIndexFirst);
-        return;
+        return false;
     }
     // Instance folding (EDEN_NX2_FOLD_INSTANCES): a later instance of an
     // instance loop. The register keeps its value (instance id Subsequent, the same topology)
@@ -2516,7 +2525,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         fs.regs[method] == value && FoldInstancesEnabled()) {
         fs.draw_pending = true;
         split.FoldInstance(&FlushFoldedInstances, this);
-        return;
+        return false;
     }
     // What a constant buffer upload word or a report writes, for the front's macro memory reads.
     const auto [write_begin, write_end] = FrontWriteRange(fs, method, 1);
@@ -2536,7 +2545,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
                 ++fs.exp_same;
                 FrontReportSameWrites(fs);
             }
-            return;
+            return false;
         }
         fs.regs[method] = value;
     } else {
@@ -2587,21 +2596,37 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
     if ((fs.exp22 & 2) != 0 && execution_mask[method] &&
         FrontBatchWrite(split, fs, method, argument, value, is_last_call, from_macro)) {
         fs.sink_pending = false; // Held executable writes: each consumes the sink when sent
-        return;
+        return false;
     }
+    decision.value = value;
+    decision.effect = static_cast<u8>(effect);
+    decision.has_cb_write = cb_write.has_value();
+    decision.cb_write = cb_write.value_or(0);
+    decision.write_begin = write_begin;
+    decision.write_end = write_end;
+    return true;
+}
+
+void Maxwell3D::FrontWriteSend(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
+                               u32 argument, bool is_last_call, bool from_macro,
+                               const FrontWriteDecision& decision) {
+    using Effect = VideoCommon::GpuSplit::Effect;
+    const u32 value = decision.value;
+    const Effect effect = static_cast<Effect>(decision.effect);
+    const GPUVAddr* const cb_write = decision.has_cb_write ? &decision.cb_write : nullptr;
     // FRITCHII_CB_WORDS_BLOCK (live, default 0): a constant buffer data word goes into the open
     // CbWords block as the very Method word its own entry would carry (Direct and last from a
     // macro, as MacroWrite; the command list's last-call bit, as Method), committed and noted at
     // its own position (GpuSplit::CbWord); the notes below are made as for its entry. 2 also
     // sends the address noted for a block's first word, which the back compares.
     int cb_block = 0;
-    if (cb_write) {
+    if (cb_write != nullptr) {
         cb_block = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_cb_words_block,
                                                     "FRITCHII_CB_WORDS_BLOCK");
     }
     if (cb_block != 0) {
         split.CbWord(this, method, argument, from_macro || is_last_call, from_macro, effect,
-                     cb_block == 2 ? &*cb_write : nullptr);
+                     cb_block == 2 ? cb_write : nullptr);
         fs.sink_pending = false; // The back's block consumes the sink first, as each entry did
     } else if (from_macro && (execution_mask[method] || !VideoCommon::GpuSplit::MacroSink())) {
         if (fs.packet_on && IsDrawPacketMethod(method)) [[unlikely]] {
@@ -2630,8 +2655,16 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
             split.CountBatched(VideoCommon::GpuSplit::Batched::MacroSunk);
         }
     }
-    if (cb_write) {
-        split.NoteWrite(memory_manager, *cb_write, sizeof(u32));
+    FrontWriteNotes(split, fs, method, decision);
+}
+
+void Maxwell3D::FrontWriteNotes(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
+                                const FrontWriteDecision& decision) {
+    u32 value = decision.value;
+    const GPUVAddr write_begin = decision.write_begin;
+    const GPUVAddr write_end = decision.write_end;
+    if (decision.has_cb_write) {
+        split.NoteWrite(memory_manager, decision.cb_write, sizeof(u32));
     } else if (method == MAXWELL3D_REG_INDEX(report_semaphore.query)) {
         split.NoteWrite(memory_manager, ReportAddress(fs.regs), ReportBytes);
     }

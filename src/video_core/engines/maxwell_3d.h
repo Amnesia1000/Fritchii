@@ -3576,6 +3576,25 @@ private:
     FrontState& Front(Core::System& system, VideoCommon::GpuSplit& split);
     void FrontWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
                     bool is_last_call, bool from_macro);
+    /// FrontWrite in halves, so the front ops path (FRITCHII_ONEF_FRONT_OPS) shares them:
+    /// FrontWriteDecide applies the write to the front's state and returns whether it is still
+    /// to be sent (false: dropped, or sent already by a path that holds its own block);
+    /// FrontWriteSend sends it, then FrontWriteNotes makes the notes its entry needs.
+    struct FrontWriteDecision {
+        u32 value;           ///< after the shadow RAM
+        u8 effect;           ///< VideoCommon::GpuSplit::Effect of the entry
+        bool has_cb_write;   ///< a constant buffer data word: cb_write is its address
+        GPUVAddr cb_write;
+        GPUVAddr write_begin; ///< FrontWriteRange before the write
+        GPUVAddr write_end;
+    };
+    bool FrontWriteDecide(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
+                          u32 argument, bool is_last_call, bool from_macro,
+                          FrontWriteDecision& decision);
+    void FrontWriteSend(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
+                        bool is_last_call, bool from_macro, const FrontWriteDecision& decision);
+    void FrontWriteNotes(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
+                         const FrontWriteDecision& decision);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
     /// FrontRunMacro's two bodies: v5.7's (no macro switch on) and the one with EXP53,
     /// EDEN_NX2_OOT_MACROS, EDEN_NX2_FOLD_INSTANCE and EDEN_NX2_DRAW_PACKET. FrontState's
