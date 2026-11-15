@@ -210,6 +210,8 @@ inline std::atomic<int> g_dispatch_walk_summary{-1};
 inline std::atomic<int> g_acquire_table_first{-1};
 /// FRITCHII_E2C_CENSUS: docs/fritchii/switches.md.
 inline std::atomic<int> g_e2c_census{-1};
+/// FRITCHII_KILL_RT_POOL: docs/fritchii/switches.md.
+inline std::atomic<int> g_kill_rt_pool{-1};
 /// FRITCHII_E2C_ON_E: docs/fritchii/switches.md.
 inline std::atomic<int> g_e2c_on_e{-1};
 /// FRITCHII_STAMP_READ_PAGES: docs/fritchii/switches.md.
