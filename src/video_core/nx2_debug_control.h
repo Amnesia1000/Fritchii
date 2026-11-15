@@ -437,6 +437,10 @@ inline std::atomic<int> g_esplit_cb_async{-1};
 /// FRITCHII_ESPLIT_FLUSH_ASYNC (live, default 0; with DEPTH > 0): 1 = a draw's flush that is not
 /// owed goes after E1's lookup even with E2 idle (fritchii_e_split_thread.h, FlushPlace).
 inline std::atomic<int> g_esplit_flush_async{-1};
+/// FRITCHII_ESPLIT_BIND_BATCH (live, default 0; the queued mode): 1 = constant buffer binds packed
+/// into E2's records, same-value binds in a record dropped; 2 = verify; 3 = dry count
+/// (fritchii_e_split_thread.h).
+inline std::atomic<int> g_esplit_bind_batch{-1};
 /// EDEN_NX2_LIGHT_TABLE_ARRAYS: docs/fritchii/switches.md.
 [[nodiscard]] inline bool LightTableArrays() {
     static const bool on = EnvSwitch("EDEN_NX2_LIGHT_TABLE_ARRAYS") > 0;

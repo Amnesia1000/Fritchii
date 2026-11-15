@@ -2364,6 +2364,26 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   join, by kind ("entries that join ... top kinds": engine, ring kind, method, or a call's tag and
   function), top 8 with rates. E2Order covers the queue's order. Also: the S4 constant buffer
   path no longer joins on the GPU profile's price timers (they time the memory half on E2).
+- FRITCHII_ESPLIT_BIND_BATCH (live, default 0; the queued mode, FRITCHII_ESPLIT_DEPTH > 0): constant
+  buffer binds (Maxwell3D::ProcessCBBind's buffer cache half) without a job each. 1 = a bind is a
+  32-byte segment in E1's open record (the S4 constant buffer words' record), applied on E2 in
+  record order between the words around it; a record a bind opens takes the engine of its first
+  cb write. A bind of the same value (enabled, address, size; or both disabled) as the slot's last
+  bind earlier in the same open record is dropped: everything between the two on E2 is that
+  record's own segments (other binds, cb writes, which never read the bindings), so the second
+  bind meets the state the first left. 2 = verify: the same packing, nothing dropped; E2 hashes
+  the slot's buffer cache state (binding, bind memo, dirty bit) around each would-drop bind
+  (ESplitBindDrop, must be 0) and counts packed binds with cached writes (a count, not a check:
+  R's concurrent writes show too, as in the async jobs' count). 3 = dry:
+  binds stay one job each; the line counts what 1 would drop and how many records it would make.
+  Must be 0 in 1 and 2: ESplitBindOrder (a packed bind applied out of E1's order). A change posts
+  the open record; E2 never reads the mode, so no drain. Line "binds (FRITCHII_ESPLIT_BIND_BATCH=N)":
+  binds/s, own jobs, packed, records holding binds (bind-only), dropped, same value in the run,
+  same value as the slot's last bind at any distance (a ceiling, never dropped), dry runs (bind
+  runs with binds a run, bind and cb record runs = the records 1 makes), E2's cost of a bind job,
+  its body (1 in 64) and a packed bind (1 in 64), the checks. Line "E2 jobs by kind": E2's RunJob
+  time per job kind (jobs/s, ms/s, us each). Step in: 3, then 2 (checks 0), then 0 against 1, two
+  cycles; judge on E2 busy.
 - FRITCHII_ESPLIT_IDLE (live, default 1; the queued mode): E1 never drains E2 because its ring
   ran out. A batch's end (the fence quiet check and the `consumed` store at that place) goes to E2
   as a record; with no new ring words E1 waits for E2 to go idle or for new words, whichever comes

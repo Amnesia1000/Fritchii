@@ -221,6 +221,17 @@ void HandTo(const HandInfo& info, F& body) noexcept {
     Run(info, [](void* raw) { (*static_cast<F*>(raw))(); }, &body);
 }
 
+/// FRITCHII_ESPLIT_BIND_BATCH (live, default 0; the queued mode): constant buffer binds without a
+/// job each. 1 = a bind goes into E1's open record (the constant buffer words' record, S4) as a
+/// segment, applied on E2 in record order between the words around it; a bind of the same value
+/// as the last bind of its slot earlier in the same open record is dropped. 2 = verify: the same
+/// packing, nothing dropped, the would-drop binds checked on E2 (ESplitBindDrop, must be 0: the
+/// slot's state hash changed across the bind) and packed binds watched for cached writes (a count,
+/// as the async jobs' one: R's concurrent writes show too). 3 = dry: binds stay one job each, the
+/// line counts what 1 would drop and pack. ESplitBindOrder (1 and 2, must be 0): a packed bind
+/// applied out of E1's order. E1 writes it at a batch's start.
+inline int g_bind_batch{};
+
 /// Maxwell3D::ProcessCBBind's buffer cache half, handed over by value (async in S2).
 void HandBind(VideoCore::RasterizerInterface& rasterizer, std::size_t stage, u32 slot,
               bool enabled, u64 address, u32 size) noexcept;
