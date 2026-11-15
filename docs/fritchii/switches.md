@@ -1476,9 +1476,10 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   at an unlent draw's pipeline lookup on E (rule 3), the key parts
   the lookup kept because their flag was clear (the six program hashes with Shaders clear, the
   blend attachments with Blending clear, the vertex attributes and divisors with VertexInput
-  clear) are computed fresh from E's registers and compared: must-be-0 "lookup flags", the note
-  naming the parts. The engine's flags are left as they were, except that a differing program
-  refresh leaves Shaders raised so the next lookup takes the right key.
+  clear) are computed fresh from E's registers, canonicalized as the lookup leaves a native key,
+  and compared: must-be-0s "lookup programs", "lookup blend", "lookup vertex input", one per
+  part. The engine's flags are left as they were, except that a differing program refresh
+  leaves Shaders raised so the next lookup takes the right key.
 - FRITCHII_ONEF_DRY_RELEASE (live, default 0; fable_b 19.5 step 3's price, counting only): E
   stamps each release it passes (payload Query, fence-flagged payload, counter report, QMD
   reduction or max callback) by its word; every GPU semaphore write stamps when it ran; the

@@ -428,14 +428,20 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
             const bool vertex_input_clear = !flags_before[Dirty::VertexInput];
             if (const u32 differ = rasterizer.pipeline_cache.OneFollowerLookupCheck(
                     shaders_clear, blending_clear, vertex_input_clear);
-                differ != 0) {
+                differ != 0) [[unlikely]] {
                 thread_local std::string note;
-                note = fmt::format("unlent draw {}: {}{}{}kept on a clear flag differ from the "
+                note = fmt::format("unlent draw {}: kept on a clear flag, differs from the "
                                    "registers",
-                                   seq, (differ & 1) != 0 ? "programs " : "",
-                                   (differ & 2) != 0 ? "blend " : "",
-                                   (differ & 4) != 0 ? "vertex input " : "");
-                OneF::Note(Check::LookupFlags, note.c_str());
+                                   seq);
+                if ((differ & 1) != 0) {
+                    OneF::Note(Check::LookupPrograms, note.c_str());
+                }
+                if ((differ & 2) != 0) {
+                    OneF::Note(Check::LookupBlend, note.c_str());
+                }
+                if ((differ & 4) != 0) {
+                    OneF::Note(Check::LookupVertexInput, note.c_str());
+                }
             }
         }
         if (pipeline == nullptr) {

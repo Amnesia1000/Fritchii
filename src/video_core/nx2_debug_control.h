@@ -277,7 +277,7 @@ inline std::atomic<int> g_onef_sync_mirror{-1};
 /// forced fence releases posted.
 inline std::atomic<int> g_onef_post_fence{-1};
 /// FRITCHII_ONEF_LOOKUP_CHECK (live, default 0 = off; N = every Nth unlent draw): fable_b 18.4's
-/// "lookup flags" must-be-0.
+/// "lookup programs", "lookup blend", "lookup vertex input" must-be-0s.
 inline std::atomic<int> g_onef_lookup_check{-1};
 /// FRITCHII_ONEF_DRY_RELEASE (live, default 0): fable_b 19.5 step 3's dry price.
 inline std::atomic<int> g_onef_dry_release{-1};
