@@ -801,6 +801,11 @@ void CountSyncMirror(bool engine_bit, bool render_bit) noexcept;
 /// The newest render op that writes game memory on R (a plain report): its ring A entry
 /// position + 1, 0 = none yet. E stores it before it stores a `consumed` past that entry.
 [[nodiscard]] u64 GuestWriteOpMark() noexcept;
+/// E (fable_b 19.5 step 4, FRITCHII_E2C_ON_E): before E reads game memory at its stream place
+/// that a plain report op it pushed may write (the 0xe2c read), waits until R played the newest
+/// such op, the rule the front's E-position waits use (GpuSplit::Reached). True when it waited.
+/// Not on E (one follower off, the single back): false at once, nothing to wait for.
+bool WaitGuestWriteOps() noexcept;
 
 /// FRITCHII_ONEF_INVAL_E (live; fable_b 11.1 item 2; needs FRITCHII_ONEF_E_PIPELINE=1 and step
 /// 4): E runs the draw's invalidation (the buffer half) itself when no range touches a page an

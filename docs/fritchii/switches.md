@@ -361,6 +361,92 @@ answer's same-frame sample counters). Per second:
 - With FRITCHII_FRONT_RAN_READS on, it counts only the misses that switch did not spare (with 2:
   would not spare).
 
+### FRITCHII_E2C_ON_E (the "0xe2c on E" lines)
+
+FRITCHII_E2C_ON_E (live, default 0 = exactly as before; fable_b_one_follower 19.5 step 4,
+fable_front_drains_b 1.4). The 0xe2c occlusion macro (hash 0x3b26ab7eb3fc9863, with a macro
+switch on, as by default) reads six words (two sample counters 16 bytes apart) and writes
+render_enable.mode = p0, or p0 ^ 1 when the counters differ. Its read was the front's largest wait
+(the "macro dma read" drain, about 120 ms/s at the market). With the switch on, where the front
+would wait for the back, the macro gets six zero words instead (so it writes p0) and that write
+goes to E as a call at the same stream place (Maxwell3D::FrontSendE2cCondition). E, there, does
+what the drained read did: with one follower it first waits for R to play the newest report op
+it pushed and the reports a posted fence lands on the bytes (the rule of the front's E-position
+waits), flushes the buffer cache's dirty pages of the read and the listed reports of its bytes
+(EXP73's test), reads the words, and writes the mode the macro's formula makes of them
+(Maxwell3D::BackE2cCondition), the sink first as for a Direct entry.
+- 1: deferred only where the read would wait: a page snapshot miss (the drain), the dispatch
+  check that would wait (asked without the wait; Queued defers), a listed report on the bytes or
+  no snapshot path. The pages of a deferred read get a pending snapshot, current once the back ran
+  the call (GpuSplit::Ran); until then reads of those pages are deferred too.
+- 2: verify. The front reads as before; every call is also evaluated by E, which compares its
+  mode with the front's and writes the front's. "differed" must be 0.
+- 3: every call deferred (no snapshots used). For pricing E's side only.
+- Not with EXP53's predicate, a replaying shadow RAM, EDEN_NX2_MACRO_DMA_DRAIN,
+  EDEN_NX2_CMDPAGE_DIAG or EDEN_NX2_QUERY_DMA_TRACE, and FRITCHII_FRONT_RAN_READS=2's compared
+  reads keep their drain.
+- The front's copy of render_enable.mode (and its shadow word in a tracking mode) holds p0 until
+  the next write of the register (the 0xe2a after the object's draws). A macro reading it, or a
+  replaying write, fetches E's value first ("mode fetched from E", expected 0; none of the
+  transcribed OoT macros reads it). EDEN_NX2_SPLIT_VERIFY takes E's value without a difference.
+
+"0xe2c on E (FRITCHII_E2C_ON_E=n) front 10 s" (HW_GPU, Info), per second: reads deferred
+(snapshot misses, of them on a still pending snapshot; other drained reads; every call with 3),
+pending snapshots found run, calls sent, verify calls; mode fetched from E (expected 0); p0
+differs (must be 0: the macro's write from zero words was not its p0).
+
+"0xe2c on E: E 10 s" (HW_GPU, Info), per second: calls evaluated (and how many gave True), how
+many first waited for R to play its report ops, buffer flushes, report flushes; verify compared
+and differed (must be 0, with the session's total).
+
+Read it with the "Front waits by site" / profile's "macro dma read": it should fall to the
+forwarded and snapshot hits' cost, and E's time grows by its waits for R.
+
+### FRITCHII_STAMP_READ_PAGES (the "Stamp read pages" line)
+
+FRITCHII_STAMP_READ_PAGES (live, default 0 = exactly as before; fable_b_one_follower 21.2 cut 2).
+With the write stamps on, GpuSplit::RangeLastWrite stamps every ranged 3D write (each constant
+buffer upload word, each report) by GPU and by device address (EXP126) for the stamp readers
+(WriteStamp, WriteStampWhy, BytesStamp: the QMD reads, the acquire lagged check, the QMD
+prediction), about 25 ms/s of the front at the market. Those readers ask about few pages.
+- 2: a ranged write's bytes are stamped only on device pages a stamp reader ever asked about.
+  Where it skips, it raises a skip floor (the newest skipped write). A page asked about for the
+  first time takes that floor as its add floor, a stamp over all of its bytes (the reader then
+  waits for every skipped write sent before, once); from then on writes there are stamped. The
+  ranged ring (ForwardRead, WaitForMemoryWriters, the exact scans) is untouched. Exact: a read of
+  a page finds each write sent after the page was first asked about in the tables and each one
+  before in the add floor. The page table is cleared at 65,536 pages (a page asked about again
+  takes the newest skip floor: still exact). Only for writes up to 4 KiB with a translation
+  (the device stamps' own rule: no queued function, not sparse) and EXP126 on; else as before.
+- 1: dry. Everything stamped as before; the pages asked about are kept and the skips counted.
+- Turned off after 2: readers keep taking the add floors (the skip floor stays for the session).
+
+"Stamp read pages (FRITCHII_STAMP_READ_PAGES=n) 10 s" (HW_GPU, Info), per second: ranged writes
+it handled, their pages on pages asked about (stamped), on pages never asked about (skipped, or
+would skip with 1), writes stamped whole as before; pages asked about (and new ones a second),
+reader answers raised by an add floor, table clears.
+
+### FRITCHII_MACRO_SAME_DRY (the "Macro repeats" line)
+
+FRITCHII_MACRO_SAME_DRY (live, default 0; counters only, nothing is skipped; fable_b_one_follower
+21.2 cut 3). Prices skipping a 3D macro call that repeats its slot's last call. Each call of the
+front's macro body (Maxwell3D::FrontRunMacroFeatures, handlers and JIT alike) is compared with the
+last call of the same macro slot.
+
+"Macro repeats (FRITCHII_MACRO_SAME_DRY, counters only) 10 s" (HW_GPU, Info), per second:
+- calls and their writes;
+- same arguments as the slot's last call; of them, that call wrote state only (no executable
+  method: no draw, report, upload); and every register it wrote still holds the value it wrote
+  ("none of its registers written since"; a same-value write in between counts as none); of
+  those, it read memory (an MME DMA read, such as 0xe2c: its result may differ) and, the check of
+  the prediction, this call wrote exactly the same writes again;
+- calls whose every write was a state write of the value the register held, whatever their
+  arguments: the upper bound of what a skip could remove, with their writes;
+- the five macros with the most held repeats: method, held repeats and calls a second.
+
+Not counted: the macro's inputs besides its arguments (the data RAM, registers it reads but does
+not write). A skip would need those too.
+
 ### FRITCHII_FRONT_RAN_READS
 
 FRITCHII_FRONT_RAN_READS (live, default 0 = exactly as before; the market's "Front 0xe2c misses"

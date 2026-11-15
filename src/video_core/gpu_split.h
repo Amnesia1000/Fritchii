@@ -1449,8 +1449,9 @@ public:
         if (!write_stamps) {
             return write_position;
         }
-        return (std::min)((std::max)(StampOf(device, device + size, false, 0),
-                                     StampOf(address, address + size, true, 0)),
+        return (std::min)((std::max)({StampOf(device, device + size, false, 0),
+                                      StampOf(address, address + size, true, 0),
+                                      size != 0 ? StampReadFloor(device, size) : u64{0}}),
                           write_position);
     }
     /// The QMD wait floor counters (fable_qmd_wait_brief piece 1), front only. WriteStampWhy is
@@ -2024,6 +2025,44 @@ private:
     /// Whether ranged writes are stamped by device address now (EXP126 not 0), noting a turn on.
     bool RangedDeviceStamps();
     void StampRangedDevice(const Tegra::MemoryManager& memory, GPUVAddr begin, GPUVAddr end);
+    /// FRITCHII_STAMP_READ_PAGES (live, default 0; fable_b 21.2 cut 2): RangeLastWrite stamps
+    /// (by GPU and device address) only the device pages a stamp reader (WriteStamp,
+    /// WriteStampWhy, BytesStamp) ever asked about; a page first asked about takes the newest
+    /// write whose stamps were skipped as its add floor, a stamp over every byte of it. 1 = dry:
+    /// everything stamped as before, the pages counted. Front only, as the stamp tables.
+    /// Device page -> add floor. Cleared when it grows past StampReadPagesMax (a page asked
+    /// about again then takes the newest skipped write: still exact).
+    mutable std::unordered_map<u64, u64> stamp_read_pages;
+    static constexpr size_t StampReadPagesMax = size_t{1} << 16;
+    /// The last page RangeLastWrite looked up and its answer (a reader adding a page clears it).
+    mutable u64 stamp_read_cache_page{~u64{0}};
+    bool stamp_read_cache_hit{};
+    /// The newest ranged write whose stamps were skipped (0 = none this session).
+    u64 stamp_skip_floor{};
+    struct StampReadStats {
+        u64 writes;        ///< RangeLastWrite calls with stamps on and the switch on
+        u64 pages_read;    ///< their pages on a page asked about: stamped
+        u64 pages_skipped; ///< on a page never asked about: skipped (1: would be)
+        u64 whole;         ///< stamped as before (over 4 KiB, translation unsure, no memory)
+        u64 added;         ///< pages a reader asked about for the first time
+        u64 floors;        ///< reader answers raised by an add floor
+        u64 clears;        ///< the page table cleared at its limit
+        u64 ticks;
+        std::chrono::steady_clock::time_point since;
+    };
+    mutable StampReadStats stamp_read_stats{};
+    /// The switch's value (FRITCHII_STAMP_READ_PAGES).
+    [[nodiscard]] static int StampReadPagesMode();
+    /// RangeLastWrite's stamps with the switch on: per page, stamped where a reader asked about
+    /// it, skipped (2) or only counted (1) where not. False: stamp as before (the caller does).
+    bool StampRangedRead(const Tegra::MemoryManager& memory, GPUVAddr begin, GPUVAddr end,
+                         bool skip);
+    /// Whether a reader asked about device page `page` (cached for runs of one page).
+    bool StampPageRead(u64 page);
+    /// A stamp reader of device bytes [device, device + size): marks their pages asked about and
+    /// returns their add floors (0 with the switch off and nothing ever skipped).
+    [[nodiscard]] u64 StampReadFloor(u64 device, u64 size) const;
+    void MaybeLogStampRead(int mode);
     /// What stands for the ranged overflow when WriteStamp leaves it out: the writes not
     /// stamped by device address, or the overflow itself while device stamps are off.
     [[nodiscard]] u64 FloorlessOverflowTerm() const {

@@ -133,6 +133,8 @@ struct Impl {
     u64 carried_ops_logged{};
     std::array<u64, 4> carriers_logged{};
     std::array<u64, 3> carried_alone_logged{};
+    /// E only: the packet number of that newest op (WaitGuestWriteOps).
+    u64 guest_write_number{};
     /// Lends E made holding a watched lock (handed to R for the park), the op packets' line.
     std::atomic<u64> lends_holding_lock{};
     u64 lends_holding_lock_logged{};
@@ -424,14 +426,18 @@ std::size_t AppendCarried(PacketHeader& header, u8* buffer, std::size_t body_byt
     return body_bytes + g_carry.used + sizeof(trailer);
 }
 
-/// E, right after Commit of a packet AppendCarried filled: the kept ops are R's now.
-void CarriedSent() {
+/// E, right after Commit of a packet AppendCarried filled (`number`, the carrying packet's): the
+/// kept ops are R's now.
+void CarriedSent(u64 number) {
     if (g_carry.count == 0) {
         return;
     }
     if (g_carry.lands != 0) {
         // As PushOp's own mark, before E's next `consumed` store (seq_cst there).
         g.guest_write_op.store(g_carry.lands, std::memory_order_release);
+        // FRITCHII_E2C_ON_E's WaitGuestWriteOps waits for the packet that holds the newest
+        // report op: a carried report rides in this one (as PushOp's own mark sets it).
+        g.guest_write_number = number;
     }
     g_carry.used = 0;
     g_carry.count = 0;
@@ -1646,7 +1652,7 @@ void Lend(LentOp op, LentReason reason, void (*function)(void*), void* argument)
     header.bytes = static_cast<u32>(sizeof(PacketHeader) + spans_bytes);
     std::memcpy(buffer, &header, sizeof(header));
     Commit(buffer, header.bytes, number, floor, false);
-    CarriedSent();
+    CarriedSent(number);
     if (counting) {
         Stats::Pushed(header, kind, behind);
     }
@@ -1781,7 +1787,21 @@ void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size,
         // Before E's next `consumed` store (seq_cst there): a front that sees E past this entry
         // sees this mark too.
         g.guest_write_op.store(header.position + 1, std::memory_order_release);
+        g.guest_write_number = header.number;
     }
+}
+
+bool WaitGuestWriteOps() noexcept {
+    if (!Detail::t_engine) {
+        return false;
+    }
+    const u64 number = g.guest_write_number;
+    if (number == 0 || g.played.load(std::memory_order_acquire) >= number) {
+        return false;
+    }
+    EngineWait([&] { return g.played.load(std::memory_order_acquire) >= number; }, EWait::Drain,
+               number);
+    return true;
 }
 
 bool WaitsE() noexcept {
@@ -2434,7 +2454,7 @@ void PushPacked(PacketHeader& header, u8* buffer, std::size_t body_bytes) {
     t_next_draw_set = false;
     std::memcpy(buffer, &header, sizeof(header));
     Commit(buffer, header.bytes, header.number, floor, true);
-    CarriedSent();
+    CarriedSent(header.number);
     if (counting) {
         Stats::Pushed(header, kind, behind);
     }
@@ -2459,7 +2479,7 @@ void SendCarriedAlone(size_t why) {
     header.bytes = static_cast<u32>(sizeof(PacketHeader) + body_bytes);
     std::memcpy(buffer, &header, sizeof(header));
     Commit(buffer, header.bytes, header.number, floor, true);
-    CarriedSent();
+    CarriedSent(header.number);
 }
 } // Anonymous namespace
 

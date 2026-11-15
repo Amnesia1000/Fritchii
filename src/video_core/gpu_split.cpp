@@ -511,6 +511,9 @@ void GpuSplit::Stop() {
     ranged_device_since = 0;
     stamp_memory = nullptr;
     stamp_page = ~GPUVAddr{0};
+    stamp_read_pages.clear();
+    stamp_read_cache_page = ~u64{0};
+    stamp_skip_floor = 0;
     if (write_stamps) {
         // The next session's positions start at 0 again.
         std::fill_n(block_stamps.get(), BlockStamps, StampSlot{});
@@ -878,14 +881,23 @@ void GpuSplit::RangeLastWrite(GPUVAddr begin, GPUVAddr end, const u32* data, siz
         last_method_write_position = previous_method_write_position;
     }
     if (write_stamps) [[unlikely]] {
-        StampWrite(begin, end, true);
-        if (RangedDeviceStamps()) {
-            if (memory != nullptr) {
-                StampRangedDevice(*memory, begin, end);
-            } else {
-                write_stamp_floor = write_position; // No translation: it may write anything
-                ++floor_stats.device_floors;
+        // FRITCHII_STAMP_READ_PAGES: the stamps only on pages a reader asked about (2), or
+        // counted (1). Needs the device stamps (EXP126) and a translation; else as before.
+        const int read_pages = StampReadPagesMode();
+        if (read_pages == 0 || memory == nullptr || !RangedDeviceStamps() ||
+            !StampRangedRead(*memory, begin, end, read_pages == 2)) {
+            StampWrite(begin, end, true);
+            if (RangedDeviceStamps()) {
+                if (memory != nullptr) {
+                    StampRangedDevice(*memory, begin, end);
+                } else {
+                    write_stamp_floor = write_position; // No translation: it may write anything
+                    ++floor_stats.device_floors;
+                }
             }
+        }
+        if (read_pages != 0) [[unlikely]] {
+            MaybeLogStampRead(read_pages);
         }
     }
     static const bool forward = [] {
@@ -1212,8 +1224,127 @@ u64 GpuSplit::WriteStamp(u64 device, u64 size, GPUVAddr address, u64 skip_tag) c
     if (size != 0) {
         stamp = (std::max)(stamp, StampOf(device, device + size, false, skip_tag));
         stamp = (std::max)(stamp, StampOf(address, address + size, true, skip_tag));
+        stamp = (std::max)(stamp, StampReadFloor(device, size)); // FRITCHII_STAMP_READ_PAGES
     }
     return (std::min)(stamp, write_position);
+}
+
+int GpuSplit::StampReadPagesMode() {
+    return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_stamp_read_pages,
+                                            "FRITCHII_STAMP_READ_PAGES");
+}
+
+bool GpuSplit::StampPageRead(u64 page) {
+    if (page != stamp_read_cache_page) {
+        stamp_read_cache_page = page;
+        stamp_read_cache_hit = stamp_read_pages.contains(page);
+    }
+    return stamp_read_cache_hit;
+}
+
+bool GpuSplit::StampRangedRead(const Tegra::MemoryManager& memory, GPUVAddr begin, GPUVAddr end,
+                               bool skip) {
+    auto& s = stamp_read_stats;
+    ++s.writes;
+    // Over a page, block stamps per page would not be StampWrite's page stamps: as before.
+    if (end - begin > 0x1000) {
+        ++s.whole;
+        return false;
+    }
+    // StampRangedDevice's translation rule: a queued function may remap the range, sparse pages
+    // write through their own backing. Then as before (it floors).
+    if (last_function_position > consumed_cache) {
+        consumed_cache = PlayedNow(std::memory_order_acquire);
+    }
+    const bool sparse = begin < Tegra::g_nx2_sparse_high.load(std::memory_order_relaxed) &&
+                        Tegra::g_nx2_sparse_low.load(std::memory_order_relaxed) < end;
+    if (last_function_position > consumed_cache || sparse) {
+        ++s.whole;
+        return false;
+    }
+    // Per page: the GPU stamp and the device stamp of the bytes in it (StampWrite of the whole
+    // range and StampRangedDevice, split at the page: the same block slots, as the range is under
+    // 16 KiB), or neither where no reader ever asked about the device page.
+    constexpr GPUVAddr page_size = 0x1000;
+    for (GPUVAddr page = begin & ~(page_size - 1); page < end; page += page_size) {
+        if (&memory != stamp_memory || page != stamp_page ||
+            stamp_function != last_function_position) {
+            const std::optional<DAddr> device = memory.GpuToCpuAddress(page);
+            stamp_memory = &memory;
+            stamp_page = page;
+            stamp_function = last_function_position;
+            stamp_mapped = device.has_value();
+            stamp_device = device.value_or(0);
+        }
+        const GPUVAddr from = (std::max)(begin, page);
+        const GPUVAddr to = (std::min)(end, page + page_size);
+        if (!stamp_mapped) {
+            StampWrite(from, to, true); // As before: the GPU stamp only (the back writes nothing)
+            continue;
+        }
+        if (StampPageRead(stamp_device >> 12)) {
+            ++s.pages_read;
+        } else {
+            ++s.pages_skipped;
+            if (skip) {
+                stamp_skip_floor = write_position;
+                continue;
+            }
+        }
+        StampWrite(from, to, true);
+        StampWrite(stamp_device + (from - page), stamp_device + (to - page), false);
+    }
+    ++floor_stats.device_stamped;
+    return true;
+}
+
+u64 GpuSplit::StampReadFloor(u64 device, u64 size) const {
+    if (size == 0 || (stamp_skip_floor == 0 && StampReadPagesMode() == 0)) {
+        return 0;
+    }
+    if (stamp_read_pages.size() >= StampReadPagesMax) {
+        // A page asked about again takes the newest skipped write as its floor: still exact.
+        stamp_read_pages.clear();
+        ++stamp_read_stats.clears;
+    }
+    u64 floor = 0;
+    for (u64 page = device >> 12; page <= (device + size - 1) >> 12; ++page) {
+        const auto [it, inserted] = stamp_read_pages.try_emplace(page, stamp_skip_floor);
+        if (inserted) {
+            ++stamp_read_stats.added;
+            stamp_read_cache_page = ~u64{0};
+        }
+        floor = (std::max)(floor, it->second);
+    }
+    stamp_read_stats.floors += floor != 0 ? 1 : 0;
+    return floor;
+}
+
+void GpuSplit::MaybeLogStampRead(int mode) {
+    auto& s = stamp_read_stats;
+    if ((++s.ticks & 0xffff) != 0) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (s.since == std::chrono::steady_clock::time_point{}) {
+        s.since = now;
+        return;
+    }
+    const double seconds = std::chrono::duration<double>(now - s.since).count();
+    if (seconds < 10.0) {
+        return;
+    }
+    const auto rate = [seconds](u64 count) { return static_cast<double>(count) / seconds; };
+    LOG_INFO(HW_GPU,
+             "Stamp read pages (FRITCHII_STAMP_READ_PAGES={}) {:.0f} s: ranged writes {:.0f}/s, "
+             "their pages on read pages {:.0f}/s (stamped), on never-read pages {:.0f}/s ({}), "
+             "stamped whole as before {:.0f}/s; pages asked about {} (new {:.0f}/s), reader "
+             "answers raised by an add floor {:.0f}/s, table clears {}",
+             mode, seconds, rate(s.writes), rate(s.pages_read), rate(s.pages_skipped),
+             mode == 2 ? "skipped" : "would skip", rate(s.whole), stamp_read_pages.size(),
+             rate(s.added), rate(s.floors), s.clears);
+    s = {};
+    s.since = now;
 }
 
 int GpuSplit::OverflowFloorMode() {
@@ -1243,6 +1374,8 @@ GpuSplit::StampWhy GpuSplit::WriteStampWhy(u64 device, u64 size, GPUVAddr addres
                 page = (std::max)(page, read(page_stamps[StampIndex(key ^ salt, PageStamps)]));
             }
         }
+        // FRITCHII_STAMP_READ_PAGES: the add floors stand for skipped stamps (a page term).
+        page = (std::max)(page, StampReadFloor(device, size));
     }
     const std::array<std::pair<u64, StampTerm>, 9> terms{{
         {block, StampTerm::Block},

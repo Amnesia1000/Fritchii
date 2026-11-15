@@ -55,15 +55,44 @@ inline constexpr std::array<std::string_view, static_cast<size_t>(Opt::Count)> o
     "write_intersections", "sorted_page_batches", "async_pipelines", "unswizzle_workers",
 };
 
+namespace Detail {
+/// Enabled()'s and On()'s answers, each computed at its first use as before, then kept in an
+/// atomic word instead of a function's static: MSVC checks a static's initialization on every
+/// call through a thread-local, which cost the GPU thread 3 to 6 ms/s (fable_b 21.2 cut 4).
+/// 0 = not computed yet; Enabled: 1 off, 2 on; On: bit 31 set, the off mask below it.
+inline std::atomic<unsigned> g_enabled_word{0};
+inline std::atomic<unsigned> g_off_word{0};
+inline constexpr unsigned OffWordReady = 1U << 31;
+static_assert(static_cast<unsigned>(Opt::Count) < 31);
+inline unsigned ComputeOffMask();
+} // namespace Detail
+
 inline bool Enabled() {
-    static const bool enabled = [] {
+    unsigned word = Detail::g_enabled_word.load(std::memory_order_relaxed);
+    if (word == 0) [[unlikely]] {
         const char* value = std::getenv("EDEN_NX2_PERF_OPT");
-        return value == nullptr || value[0] != '0';
-    }();
-    return enabled;
+        unsigned expected = 0;
+        Detail::g_enabled_word.compare_exchange_strong(
+            expected, value == nullptr || value[0] != '0' ? 2U : 1U, std::memory_order_relaxed);
+        word = Detail::g_enabled_word.load(std::memory_order_relaxed);
+    }
+    return word == 2;
 }
 
 inline bool On(Opt opt) {
+    unsigned word = Detail::g_off_word.load(std::memory_order_relaxed);
+    if (word == 0) [[unlikely]] {
+        const unsigned mask = Detail::ComputeOffMask();
+        unsigned expected = 0;
+        Detail::g_off_word.compare_exchange_strong(expected, Detail::OffWordReady | mask,
+                                                   std::memory_order_relaxed);
+        word = Detail::g_off_word.load(std::memory_order_relaxed);
+    }
+    return Enabled() && (word >> static_cast<unsigned>(opt) & 1) == 0;
+}
+
+/// The off mask On() keeps (its first use only; it logs the state line).
+inline unsigned Detail::ComputeOffMask() {
     static const unsigned off = [] {
         const auto bit = [](Opt option) { return 1U << static_cast<unsigned>(option); };
         const auto names = [](const char* variable) {
@@ -108,7 +137,7 @@ inline bool On(Opt opt) {
         LOG_INFO(HW_GPU, "Nx2Perf:{}", state);
         return mask;
     }();
-    return Enabled() && (off >> static_cast<unsigned>(opt) & 1) == 0;
+    return off;
 }
 
 [[nodiscard]] inline bool VerifySwitchSet() {

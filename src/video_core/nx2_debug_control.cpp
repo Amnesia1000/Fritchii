@@ -430,6 +430,15 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_E2C_CENSUS") {
         return &g_e2c_census;
     }
+    if (name == "FRITCHII_E2C_ON_E") {
+        return &g_e2c_on_e;
+    }
+    if (name == "FRITCHII_STAMP_READ_PAGES") {
+        return &g_stamp_read_pages;
+    }
+    if (name == "FRITCHII_MACRO_SAME_DRY") {
+        return &g_macro_same_dry;
+    }
     if (name == "FRITCHII_ACQUIRE_MET_BY") {
         return &g_acquire_met_by;
     }
