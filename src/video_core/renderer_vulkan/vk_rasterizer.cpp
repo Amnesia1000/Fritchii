@@ -419,6 +419,16 @@ void LogMemoryOwners(const Device& device, PipelineCache& pipeline_cache,
              mib(win32_heaps.other_committed), mib(win32_heaps.other_allocated),
              win32_heaps.micros, residual / (s64{1} << 20));
 }
+
+/// An image view's size in GPU memory: the game's size, or the resolution scale's size once the
+/// texture cache scaled the image (OoT's temporal upscale with FRITCHII_DLSS_SCALED).
+VkExtent2D RealExtent(const ImageView& view) {
+    if (!view.IsRescaled()) {
+        return {view.size.width, view.size.height};
+    }
+    const auto& resolution = Settings::values.resolution_info;
+    return {resolution.ScaleUp(view.size.width), resolution.ScaleUp(view.size.height)};
+}
 } // Anonymous namespace
 
 void RasterizerVulkan::ReadMeshEmulationProbe() {
@@ -2902,14 +2912,17 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         const auto scene_id = texture_cache.GetRenderTargets().color_buffer_ids[0];
         if (scene_id) {
             const auto& scene = texture_cache.GetImageView(scene_id);
+            // FRITCHII_DLSS_SCALED: a scaled scene is taken at its scaled size; the mask is
+            // used only when that matches the upscaler's render size (Record checks).
             if (scene.format == VideoCore::Surface::PixelFormat::B10G11R11_FLOAT &&
                 scene.size.width == oot_motion.extent.width &&
-                scene.size.height == oot_motion.extent.height && !scene.IsRescaled() &&
+                scene.size.height == oot_motion.extent.height &&
+                (!scene.IsRescaled() || VideoCommon::OcarinaScaledUpscale()) &&
                 scene.range == VideoCommon::SubresourceRange{}) {
                 oot_effects_scene = scene.Handle(Shader::TextureType::Color2D);
                 oot_effects_address = scene.gpu_addr;
                 oot_effects_frame = render_trace_frame;
-                oot_live_dlss->SaveEffectsBase(oot_effects_scene, oot_motion.extent,
+                oot_live_dlss->SaveEffectsBase(oot_effects_scene, RealExtent(scene),
                                                render_trace_frame);
             }
         }
@@ -7907,6 +7920,16 @@ void RasterizerVulkan::ApplyOcarinaResolution(u64 title_id) {
     if (backend == VideoCommon::OcarinaUpscaleBackend::Native) {
         return;
     }
+    // FRITCHII_DLSS_SCALED: the upscaler takes the scene at the player's scale. The scale is not
+    // touched at all, so the prepared pipelines are built once, at that scale.
+    if (VideoCommon::OcarinaScaledUpscale()) {
+        LOG_INFO(Render_Vulkan,
+                 "Ocarina temporal: resolution scale {}x kept ({} takes the scaled scene, "
+                 "FRITCHII_DLSS_SCALED)",
+                 resolution.up_factor,
+                 backend == VideoCommon::OcarinaUpscaleBackend::Dlss ? "DLSS" : "FSR 3.1");
+        return;
+    }
     LOG_INFO(Render_Vulkan,
              "Ocarina temporal: resolution scale {}x set to 1x for this session ({} does the "
              "upscaling)",
@@ -8021,8 +8044,12 @@ void RasterizerVulkan::UpdateOcarinaJitter() {
         const auto& targets = texture_cache.GetRenderTargets();
         if (targets.depth_buffer_id) {
             const auto& depth = texture_cache.GetImageView(targets.depth_buffer_id);
+            // FRITCHII_DLSS_SCALED: a scaled scene too. The offset is added after the viewport
+            // is scaled, so it stays within half a pixel of the scaled image, the unit the
+            // upscaler reads it in.
             if (depth.size.width == oot_motion.extent.width &&
-                depth.size.height == oot_motion.extent.height && !depth.IsRescaled()) {
+                depth.size.height == oot_motion.extent.height &&
+                (!depth.IsRescaled() || VideoCommon::OcarinaScaledUpscale())) {
                 // Halton (2, 3) with AMD's phase count for the last FSR frame's scale.
                 const u32 index = static_cast<u32>(render_trace_frame % oot_jitter_phases) + 1;
                 want = {Halton(index, 2) - 0.5f, Halton(index, 3) - 0.5f};
@@ -8289,7 +8316,11 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
     }
     auto& depth = texture_cache.GetImageView(images[0].id);
     const auto* backing = depth.BackingImage();
-    if (!backing || depth.IsRescaled() || depth.format != VideoCore::Surface::PixelFormat::D32_FLOAT ||
+    // FRITCHII_DLSS_SCALED: scaled images are taken at their real size (checked below). Off, the
+    // scale is 1x for the session and nothing is scaled.
+    const bool scaled_mode = VideoCommon::OcarinaScaledUpscale();
+    if (!backing || (depth.IsRescaled() && !scaled_mode) ||
+        depth.format != VideoCore::Surface::PixelFormat::D32_FLOAT ||
         depth.range != VideoCommon::SubresourceRange{} || backing->info.num_samples != 1) {
         return fail("unsupported scene depth");
     }
@@ -8311,13 +8342,67 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
                       : target.size.width == extent.width * 4 / 3 &&
                             target.size.height == extent.height * 4 / 3;
     if (!valid_extents || !color.BackingImage() || !target.BackingImage() ||
-        color.IsRescaled() || target.IsRescaled() ||
+        ((color.IsRescaled() || target.IsRescaled()) && !scaled_mode) ||
         color.Samples() != VK_SAMPLE_COUNT_1_BIT || target.Samples() != VK_SAMPLE_COUNT_1_BIT ||
         color.range != VideoCommon::SubresourceRange{} || target.range != VideoCommon::SubresourceRange{} ||
         color.format != PixelFormat::E5B9G9R9_FLOAT || target.format != PixelFormat::B10G11R11_FLOAT ||
         color.size.width != extent.width || color.size.height != extent.height ||
         color.ImageHandle() == target.ImageHandle() || depth.ImageHandle() == target.ImageHandle()) {
         return fail("unexpected upscale images");
+    }
+
+    // The sizes the upscaler works with. At 1x (and with FRITCHII_DLSS_SCALED off) these are the
+    // game's sizes.
+    VkExtent2D render_extent = extent;
+    VkExtent2D target_extent{target.size.width, target.size.height};
+    VkExtent2D output_extent = native_resolution ? extent
+                               : upscale_4k      ? VkExtent2D{3840, 2160}
+                                                 : target_extent;
+    bool use_4k = upscale_4k;
+    if (scaled_mode) {
+        // The scene's colour, depth and the motion made from that depth must share one size;
+        // the target may differ (a compute write keeps it at the game's size).
+        const VkExtent2D color_real = RealExtent(color);
+        const VkExtent2D depth_real = RealExtent(depth);
+        target_extent = RealExtent(target);
+        if (color_real.width != depth_real.width || color_real.height != depth_real.height) {
+            const std::array<u32, 8> mismatch{color_real.width, color_real.height,
+                                              depth_real.width, depth_real.height,
+                                              target_extent.width, target_extent.height, 0, 0};
+            if (std::exchange(oot_scaled_mismatch_logged, mismatch) != mismatch) {
+                LOG_WARNING(Render_Vulkan,
+                            "Ocarina temporal (FRITCHII_DLSS_SCALED): scene colour {}x{} ({}) "
+                            "and depth {}x{} ({}) differ in size; the game's upscale draws",
+                            color_real.width, color_real.height,
+                            color.IsRescaled() ? "scaled" : "game size", depth_real.width,
+                            depth_real.height, depth.IsRescaled() ? "scaled" : "game size");
+            }
+            return fail("scaled colour and depth sizes differ");
+        }
+        // The 4K output reads the target back at 2560x1440 (SaveSceneReference).
+        const auto choice = VideoCommon::SelectOcarinaScaledOutput(
+            {color_real.width, color_real.height}, {target_extent.width, target_extent.height},
+            native_resolution, upscale_4k && !target.IsRescaled());
+        render_extent = color_real;
+        output_extent = {choice.output.width, choice.output.height};
+        use_4k = choice.upscale_4k;
+        const std::array<u32, 8> sizes{render_extent.width, render_extent.height,
+                                       depth_real.width,    depth_real.height,
+                                       target_extent.width, target_extent.height,
+                                       output_extent.width, output_extent.height};
+        if (std::exchange(oot_scaled_logged, sizes) != sizes) {
+            LOG_INFO(Render_Vulkan,
+                     "Ocarina temporal (FRITCHII_DLSS_SCALED, scale {}x): scene {}x{} ({}), "
+                     "game size {}x{}; target {}x{} ({}); upscaler {}x{} -> {}x{}{}",
+                     Settings::values.resolution_info.up_factor, render_extent.width,
+                     render_extent.height, color.IsRescaled() ? "scaled" : "game size",
+                     extent.width, extent.height, target_extent.width, target_extent.height,
+                     target.IsRescaled() ? "scaled" : "game size", render_extent.width,
+                     render_extent.height, output_extent.width, output_extent.height,
+                     use_4k ? ", 4K output"
+                     : output_extent.width > target_extent.width ? ", shrunk into the target"
+                                                                 : "");
+        }
     }
 
     constexpr VkFormat output_format = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
@@ -8334,9 +8419,9 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
     try {
         const auto target_view =
             target.StorageView(Shader::TextureType::Color2D, Shader::ImageFormat::Typeless, false);
-        const auto scene_reference = upscale_4k ? target.Handle(Shader::TextureType::Color2D)
-                                                : VK_NULL_HANDLE;
-        if (!target_view || (upscale_4k && !scene_reference)) {
+        const auto scene_reference = use_4k ? target.Handle(Shader::TextureType::Color2D)
+                                            : VK_NULL_HANDLE;
+        if (!target_view || (use_4k && !scene_reference)) {
             return fail("no upscale target view");
         }
         if (!oot_live_dlss) {
@@ -8344,23 +8429,19 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
                 device, scheduler, descriptor_pool, compute_pass_descriptor_queue, memory_allocator,
                 staging_pool, *oot_backend);
         }
-        const VkExtent2D target_extent{target.size.width, target.size.height};
         // The offset this frame's scene was drawn with (none when no scene draw was offset).
         std::array<f32, 2> jitter{};
         if (oot_jitter_frame == render_trace_frame) {
             jitter = oot_jitter_offset;
         }
-        const VkExtent2D output_extent = native_resolution ? extent
-                                         : upscale_4k      ? VkExtent2D{3840, 2160}
-                                                           : target_extent;
         const bool recorded = oot_live_dlss->Record(color_view, depth.DepthView(), target_view,
-                                                   extent, output_extent, target_extent, oot_motion.current,
+                                                   render_extent, output_extent, target_extent, oot_motion.current,
                                                    oot_motion.previous, mesh, depth.ImageHandle(),
                                                    render_trace_frame, jitter);
         if (!recorded) {
             return fail("temporal upscaler declined the frame");
         }
-        if (upscale_4k) {
+        if (use_4k) {
             oot_live_dlss->SaveSceneReference(scene_reference);
             oot_4k_scene_frame = render_trace_frame;
             oot_4k_guest_present = VK_NULL_HANDLE;
@@ -8368,7 +8449,8 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
         oot_dlss_frame = render_trace_frame;
         // AMD's jitter phase count for FSR: 8 * (output / render width)^2, so 18 for 1440p -> 4K
         // and 8 for native AA.
-        const f32 ratio = static_cast<f32>(output_extent.width) / static_cast<f32>(extent.width);
+        const f32 ratio =
+            static_cast<f32>(output_extent.width) / static_cast<f32>(render_extent.width);
         oot_jitter_phases = std::max(1U, static_cast<u32>(8.0f * ratio * ratio));
         oot_fallback_reason = nullptr;
         return true;
@@ -9135,7 +9217,9 @@ std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
     info.anti_aliased = oot_dlss_frame == render_trace_frame && !oot_live_dlss->EvaluationFailed();
     if (oot_4k_scene_frame == render_trace_frame && info.image &&
         info.image == oot_4k_guest_present && info.image_view &&
-        info.width == 2560 && info.height == 1440 && !scaled &&
+        info.width == 2560 && info.height == 1440 &&
+        // FRITCHII_DLSS_SCALED: the composite samples the game's image by position, any size.
+        (!scaled || VideoCommon::OcarinaScaledUpscale()) &&
         image_view->format == VideoCore::Surface::PixelFormat::A8B8G8R8_UNORM &&
         !oot_live_dlss->EvaluationFailed() && !frame_dump.Capturing()) {
         try {

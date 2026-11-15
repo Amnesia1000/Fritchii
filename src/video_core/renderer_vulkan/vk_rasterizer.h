@@ -594,6 +594,10 @@ private:
     bool oot_live_failed{};
     const char* oot_fallback_reason{};
     u32 oot_fallback_repeats{};
+    /// FRITCHII_DLSS_SCALED: the real sizes last logged (scene, depth, target, output) and the
+    /// last colour/depth mismatch, so each new combination is logged once.
+    std::array<u32, 8> oot_scaled_logged{};
+    std::array<u32, 8> oot_scaled_mismatch_logged{};
     std::optional<u64> oot_dlss_frame;
     std::array<f32, 2> oot_jitter_applied{}; ///< in the viewport state now (render pixels)
     std::array<f32, 2> oot_jitter_offset{};  ///< what oot_jitter_frame's scene draws used
