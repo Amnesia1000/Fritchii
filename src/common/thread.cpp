@@ -750,7 +750,14 @@ void PinCurrentThread(PinnedRole role, int guest_core) {
                 if (it->mask != 0 && (it->mask & ~result.guest) == 0 &&
                     (result.guest & ~it->mask) != 0) {
                     mem_mask = it->mask;
-                    result.guest &= ~it->mask;
+                    // FRITCHII_ONEF_PIN=2 (fable_b 20.7): R on one hardware thread of the core,
+                    // its SMT sibling stays with the guest cores (the whole core cost the game
+                    // about 7% of its path; unpinned, R slowed the GPU side more).
+                    if (pin_render && onef_pin != nullptr && onef_pin[0] == '2' &&
+                        std::popcount(mem_mask) > 1) {
+                        mem_mask = u64{1} << (63 - std::countl_zero(mem_mask));
+                    }
+                    result.guest &= ~mem_mask;
                     break;
                 }
             }

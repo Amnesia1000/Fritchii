@@ -1553,7 +1553,8 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   off, the facts table is not written (E_PIPELINE). The must-be-0 checks that cost nothing stay
   on (owner asserts, stream-write guard, the pre-record hash check and its safety stop,
   descriptor counts, texture read ahead of R). One log line at boot names the configuration.
-- FRITCHII_ONEF_PIN (boot, default 1): R gets PinnedRole::GpuMem's physical core (as
+- FRITCHII_ONEF_PIN (boot, default 1; 2 = one hardware thread of that core, its SMT sibling
+  stays with the guest cores, fable_b 20.7): R gets PinnedRole::GpuMem's physical core (as
   FRITCHII_PIN_GPUMEM=1 gives GPUMem), taken from the guest set. 0 leaves R unpinned.
 - FRITCHII_ONEF_VIEW (live, default 0): 1 = step 2, E packs the register delta, the R-owned dirty
   flags it raised, the draw state, the program hashes and the pools into each packet; R applies
