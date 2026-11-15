@@ -174,6 +174,9 @@ inline void ResetUniformStreamReuse() noexcept {
 /// bound, the caller binds the usual way.
 template <class Runtime>
 [[nodiscard]] bool RebindUniformSlotCopy(Runtime& runtime, size_t stage, u32 index, u32 size) {
+    if constexpr (!StreamUniformReusable<Runtime>) {
+        return false; // a runtime without stream copies (OpenGL): the usual bind
+    } else {
     using Reuse = UniformStreamReuse<typename Runtime::StreamUniformRef>;
     if (size == 0 || stage >= Reuse::NumStages || index >= Reuse::NumSlots) {
         return false;
@@ -191,6 +194,7 @@ template <class Runtime>
     ++reuse.rebinds;
     slot.misses = 0;
     return true;
+    }
 }
 
 /// The serial of the copy the slot names (0: none): FRITCHII_ONEF_UBO_KEEP=1's verify reads it
