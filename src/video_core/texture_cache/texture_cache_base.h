@@ -770,6 +770,7 @@ private:
         Join,
         SlotRetire,
         UnmapSweep,
+        SupersededSweep,
         Count
     };
     DeleteReason delete_reason = DeleteReason::Other;
@@ -1174,6 +1175,22 @@ private:
     /// clear in a later frame. JoinImages puts the chain members it sees on the watch list.
     void WatchColdImage(ImageId image_id);
     void SweepColdImages();
+    /// FRITCHII_SWEEP_SUPERSEDED (live, frames, 0 = off; port of Skitchii 16fb54111d): deletes
+    /// GPU-written images untouched for N frames whose memory a newer image of another shape
+    /// covers, without a download (see the definition).
+    void SweepSuperseded();
+    struct SupersededStats {
+        u64 passes{};        ///< Sweeps that ran
+        u64 looked{};        ///< GPU-written images looked at
+        u64 deleted{};       ///< Deleted
+        u64 deleted_bytes{}; ///< Their device memory
+        u64 kept_busy{};     ///< Superseded but bound or with a download queued
+        u64 sweep_ns{};      ///< Time spent sweeping
+        u64 sampled_after{}; ///< Sampled again at a swept address (a new image made there)
+    } superseded_stats{};
+    /// Addresses the superseded sweep deleted at (emptied at 65,536), and the frame: a texture made
+    /// at one by sampling counts in sampled_after (should stay near 0).
+    std::unordered_map<GPUVAddr, u64> superseded_swept;
     std::vector<std::pair<ImageId, u64>> cold_watch; ///< Image, frame_tick it was put on
     ::Common::unordered_set<ImageId> cold_watch_set;
     u64 cold_deleted{};       ///< Since the last report
