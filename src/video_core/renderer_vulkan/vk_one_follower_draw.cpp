@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -39,6 +40,7 @@
 #include "common/fritchii_page_flags.h"
 #include "common/scope_exit.h"
 #include "video_core/fritchii_delta_path.h"
+#include "video_core/fritchii_e_split.h"
 #include "video_core/fritchii_fill_cuts.h"
 #include "video_core/fritchii_price.h"
 #include "video_core/gpu.h"
@@ -291,6 +293,8 @@ OneF::LentReason OneFollowerDraw::UnlentBlocker(Maxwell3D& engine, bool is_index
         // FRITCHII_ONEF_UNLENT_RESET's must-be-0: E's own test now, the lent draw's on E's engine
         // inside the call (RunLent, Check::UnlentReset).
         if (reset_candidate && OneF::UnlentResetOn()) {
+            // FRITCHII_ESPLIT_COUNT: the test reads the program's code (E1 would wait for E2).
+            VideoCommon::ESplit::NoteStall(VideoCommon::ESplit::StallCause::MemoryDecision);
             verify_reset = ResetCheck{true, RasterizerVulkan::IsNx2IndirectResetOn(
                                                 engine, engine.GetMemoryManager(), false, 1)};
         }
@@ -354,6 +358,10 @@ OneF::LentReason OneFollowerDraw::UnlentBlocker(Maxwell3D& engine, bool is_index
         // (the code read flushes as the lent draw's read would, here) and lends only a real
         // reset; the rest are pushed with PacketNoReset, so R's Draw does not test again. A mesh
         // pipeline is never one (the test's own early out): most points draws in the market.
+        // FRITCHII_ESPLIT_COUNT: the test reads the program's code (E1 would wait for E2).
+        if (OneF::UnlentResetOn()) {
+            VideoCommon::ESplit::NoteStall(VideoCommon::ESplit::StallCause::MemoryDecision);
+        }
         if (!OneF::UnlentResetOn() || RasterizerVulkan::IsNx2IndirectResetOn(
                                           engine, engine.GetMemoryManager(), false, 1)) {
             return transient(TransientTest::IndirectReset);
@@ -424,6 +432,27 @@ bool OneFollowerDraw::FillRing(Maxwell3D& engine, GraphicsPipeline* pipeline, bo
             r.buffer_cache.SetDrawIndirect(nullptr);
         }
     };
+    // FRITCHII_ESPLIT_COUNT >= 2: E1's draw record reaches E2's view here, before the fill reads
+    // anything, and the view is compared with the engine; at 3 the fill reads the view where it
+    // was found equal (the buffer flags stay the engine's: E2 owns them in the split).
+    const bool esplit_records = VideoCommon::ESplit::g_records;
+    const VideoCommon::ESplit::View* esplit_view = nullptr;
+    std::optional<VideoCommon::CacheInputs> esplit_inputs;
+    if (esplit_records) [[unlikely]] {
+        esplit_view = VideoCommon::ESplit::DrawHandOver(engine, list_args);
+        if (esplit_view != nullptr) {
+            esplit_inputs.emplace(r.buffer_cache.StageInputs(
+                esplit_view->regs, esplit_view->state, esplit_view->root_tables,
+                esplit_view->draw_state, engine.dirty.flags,
+                list_args ? &esplit_view->indirect : nullptr));
+            r.buffer_cache.SetInputsOverride(&*esplit_inputs);
+        }
+    }
+    SCOPE_EXIT {
+        if (esplit_view != nullptr) {
+            r.buffer_cache.SetInputsOverride(nullptr);
+        }
+    };
     // The repack layout and the cache's flags, as PrepareDraw's own fill sets them.
     const u32 repack_dirty = r.buffer_cache_runtime.SetVertexRepackLayout(
         r.buffer_cache.Inputs().RepackLayoutRegs(), facts.dynamic_vertex_input);
@@ -432,6 +461,7 @@ bool OneFollowerDraw::FillRing(Maxwell3D& engine, GraphicsPipeline* pipeline, bo
         r.buffer_cache.Inputs().MarkVertexBuffersDirty(repack_dirty);
         // The lent draws read E's engine: raise it there too (R raises its own from the packet).
         engine.dirty.flags[Dirty::VertexInput] = true;
+        VideoCommon::ESplit::NoteBackRaise(); // FRITCHII_ESPLIT_COUNT: an E2 to E1 write
     }
     const MemStage::DrawFacts draw_facts =
         pipeline != nullptr ? pipeline_facts
@@ -448,7 +478,10 @@ bool OneFollowerDraw::FillRing(Maxwell3D& engine, GraphicsPipeline* pipeline, bo
     // The draw's raw handles at E's position (SEAM 3): R's Configure takes them from the packet.
     const bool null_pointer_handles = VideoCore::Nx2Debug::Experiment(21) != 0;
     handle_values.clear();
-    const auto& stages = engine.state.shader_stages;
+    // FRITCHII_ESPLIT_COUNT=3: the bindings from E2's view (FillHandleValuesKept, the handle
+    // program keep, still reads the engine's).
+    const auto& stages =
+        esplit_view != nullptr ? esplit_view->state.shader_stages : engine.state.shader_stages;
     using Cbufs = std::remove_cvref_t<decltype(stages[0].const_buffers)>;
     const std::span<const Shader::Info> handle_infos =
         pipeline != nullptr ? std::span<const Shader::Info>{pipeline_facts.stage_infos, 5}
@@ -506,6 +539,9 @@ bool OneFollowerDraw::FillRing(Maxwell3D& engine, GraphicsPipeline* pipeline, bo
     const bool filled =
         r.mem_stage.FillRingDraw(r.buffer_cache, draw_facts, is_indexed, position, seq, 0, nullptr,
                                  nullptr, &handle_values, null_pointer_handles, list_args);
+    if (esplit_records) [[unlikely]] {
+        VideoCommon::ESplit::AfterFill(engine, esplit_view);
+    }
     if (filled) {
         // For ReportDescriptorMismatch: what this fill used, before the push publishes it.
         FillRecord& record = fill_records[seq % FillRecords];
@@ -748,8 +784,14 @@ void OneFollowerDraw::LendDraw(bool is_indexed, u32 instance_count, LentReason r
 
 bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, bool list,
                                   LentReason& reason) {
-    // Today's PrepareDraw head, E's half: the stream's invalidations before the fill.
-    engine.GetMemoryManager().FlushCaching();
+    // FRITCHII_ESPLIT_COUNT: E2's parts of the draw carved out of E1's (g_state read once).
+    namespace ESplit = VideoCommon::ESplit;
+    const u8 esplit = ESplit::g_state;
+    {
+        // Today's PrepareDraw head, E's half: the stream's invalidations before the fill.
+        const ESplit::Carve flush_carve{ESplit::Class::E2, esplit};
+        engine.GetMemoryManager().FlushCaching();
+    }
     // Rule 3 (FRITCHII_ONEF_E_PIPELINE): E looks the pipeline up itself, at its own position,
     // on its own engine (the pipeline cache never names R's view then). A miss, or a build
     // not ready, is known here: the draw is lent. The lookup consumes pipeline-key flags on
@@ -760,6 +802,7 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
         const auto flags_before = engine.dirty.flags;
         pipeline = rasterizer.pipeline_cache.CurrentGraphicsPipeline();
         engine.dirty.flags |= flags_before;
+        ESplit::NoteLookup(esplit); // E1's lookup: after an E2 shader page write it would wait
         // fable_b 18.4, must be 0 (FRITCHII_ONEF_LOOKUP_CHECK, every Nth unlent draw): the parts
         // the lookup kept on a clear flag, against the same parts fresh.
         if (pipeline != nullptr && OneF::LookupCheckDue()) [[unlikely]] {
@@ -797,6 +840,9 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
     }
     const u64 position = VideoCommon::GpuSplit::Get().BackEntryPosition();
     u64 buffer_number = 0;
+    // The fill, ring B's packet, R's packet (its span packing is E1's, carved in PushDraw) and
+    // TickWork: E2's.
+    const ESplit::Carve fill_carve{ESplit::Class::E2, esplit};
     if (!FillRing(engine, pipeline, is_indexed, position, seq, buffer_number, reason, list)) {
         return false;
     }
@@ -806,6 +852,7 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
                         std::memory_order_relaxed);
     // PrepareDraw's tail, E's half (read-backs wait on E's work).
     rasterizer.gpu.TickWork();
+    ESplit::NoteDrawFilled(esplit);
     return true;
 }
 

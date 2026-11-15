@@ -33,6 +33,7 @@
 #include "core/core.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/fritchii_e_split.h"
 #include "video_core/fritchii_price.h"
 #include "video_core/nx2_fastdraw_count.h"
 #include "video_core/gpu_split.h"
@@ -3045,6 +3046,111 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 return 0;
             }
         };
+        // FRITCHII_ESPLIT_COUNT (fritchii_e_split.h, the E split's dry step): read once a batch;
+        // off, each entry tests this local. The decode classes an entry by kind, engine, method.
+        const int esplit = ESplit::BatchLevel();
+        const auto esplit_decode = [this](u64 head) {
+            using ESplit::Class;
+            using ESplit::EngineKind;
+            using ESplit::JoinCause;
+            using Tegra::Engines::Maxwell3D;
+            ESplit::EntryInfo info{};
+            const auto join = [&info](JoinCause cause) {
+                info.cls = Class::Join;
+                info.cause = cause;
+            };
+            constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+            const Kind kind = static_cast<Kind>(head & 0xf);
+            switch (kind) {
+            case Kind::Wrap:
+            case Kind::Engine:
+                break;
+            case Kind::Pairs:
+            case Kind::StateDelta:
+            case Kind::DrawBatch:
+                // Register writes and the draws they end (whose fills are carved out as E2's).
+                // A compute engine's registers are E2's with the rest of it.
+                if (ESplit::KindOf(back_engine) == EngineKind::Compute) {
+                    info.cls = Class::E2;
+                }
+                break;
+            case Kind::CbWords:
+                info.cls = Class::E2;
+                info.cb_entry = true;
+                info.cb_words = static_cast<u32>(head >> 32);
+                info.sink_first = ESplit::KindOf(back_engine) == EngineKind::Maxwell3D;
+                break;
+            case Kind::Call:
+                switch (StageTagOf(head)) {
+                case StageTag::Cache:
+                    info.cls = Class::E2;
+                    break;
+                case StageTag::Channel:
+                    join(JoinCause::Channel);
+                    break;
+                case StageTag::Level:
+                    join(JoinCause::UntaggedCall); // no tag: unclassified
+                    break;
+                default:
+                    break; // Writes, FinishMacro, DrawLoop, Pass, Ops: register and draw work
+                }
+                break;
+            case Kind::Method:
+            case Kind::Multi: {
+                const EngineKind engine_kind = ESplit::KindOf(back_engine);
+                if (engine_kind == EngineKind::Compute) {
+                    info.cls = Class::E2; // forwarded whole (dispatches, QMD reads, its fences)
+                    break;
+                }
+                const u32 method = static_cast<u32>((head >> 8) & 0xffff);
+                const bool multi = kind == Kind::Multi;
+                // A register store (sunk until the next executed method).
+                const bool store = !multi && ((head & Sink) != 0 ||
+                                              ((head & Direct) == 0 && back_engine != nullptr &&
+                                               !back_engine->execution_mask[method]));
+                if (engine_kind != EngineKind::Maxwell3D) {
+                    if (!store) {
+                        join(JoinCause::OtherEngine); // 2D, DMA, inline-to-memory
+                    }
+                    break;
+                }
+                if (method - cb_data < 16 && (head & Sink) == 0) {
+                    info.cls = Class::E2;
+                    info.cb_entry = true;
+                    info.sink_first = true;
+                    info.cb_words = multi                         ? static_cast<u32>(head >> 32)
+                                    : (head & HasSegment) != 0 ? 1U
+                                                               : 0U; // the run Execute takes
+                    break;
+                }
+                if (store) {
+                    break;
+                }
+                switch (method) {
+                case MAXWELL3D_REG_INDEX(report_semaphore.query):
+                case MAXWELL3D_REG_INDEX(sync_info):
+                case MAXWELL3D_REG_INDEX(clear_report_value):
+                case MAXWELL3D_REG_INDEX(wait_for_idle):
+                case MAXWELL3D_REG_INDEX(invalidate_texture_data_cache):
+                case MAXWELL3D_REG_INDEX(fragment_barrier):
+                case MAXWELL3D_REG_INDEX(tiled_cache_barrier):
+                    if (!multi) {
+                        info.cls = Class::E2; // guest-visible or the caches' order
+                        info.sink_first = true;
+                    }
+                    break;
+                case MAXWELL3D_REG_INDEX(launch_dma):
+                case MAXWELL3D_REG_INDEX(inline_data):
+                    join(JoinCause::Upload);
+                    break;
+                default:
+                    break; // draws, binds' register half, conditions, macros, clears: E1
+                }
+                break;
+            }
+            }
+            return info;
+        };
         while (read_position != available) {
             const size_t index = read_position & RingMask;
             if (ring_prefetch) {
@@ -3098,8 +3204,21 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                                       ->method_sink.size();
                 }
             }
+            if (esplit != 0) [[unlikely]] {
+                const ESplit::EntryInfo info = esplit_decode(ring[index]);
+                // At 2 and 3 E1 applies the sunk register writes before it forwards an E2 entry,
+                // as the split would; Execute consumes the sink first thing for these entries, so
+                // the order and the values stay the same.
+                if (esplit >= 2 && info.sink_first && back_engine != nullptr) {
+                    back_engine->ConsumeSink(*system);
+                }
+                ESplit::BeforeEntry(info);
+            }
             const size_t size =
                 Execute(&ring[index], std::min<u64>(end - read_position, RingWords - index));
+            if (esplit != 0) [[unlikely]] {
+                ESplit::AfterEntry(size);
+            }
             if (entry_hook) [[unlikely]] {
                 const u64 head = ring[index];
                 if (entry_price) {

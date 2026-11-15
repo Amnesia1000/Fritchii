@@ -2374,7 +2374,9 @@ u64 KeyWritesNow() noexcept {
     namespace OneF = VideoCommon::OneFollower;
     const bool tracking = OneF::g_track_writes_always ||
                           OneF::g_track_writes.load(std::memory_order_relaxed);
-    return OneF::g_key_watch && OneF::g_e_pipeline && tracking ? OneF::g_key_writes : ~u64{0};
+    return (OneF::g_write_watch & OneF::WriteWatchKey) != 0 && OneF::g_e_pipeline && tracking
+               ? OneF::g_key_writes
+               : ~u64{0};
 }
 } // Anonymous namespace
 
@@ -2541,8 +2543,10 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineClean(bool patch) {
     // last equalled the registers, so the word compares would pass. Checked after every flag,
     // topology and engine-state test above (they still decide), so no flag is consumed here.
     const int key_keep = miss < 0 ? KeyKeepMode() : 0;
-    if (key_keep != 0 && !VideoCommon::OneFollower::g_key_watch) {
-        VideoCommon::OneFollower::g_key_watch = true; // counted from now; known after a snapshot
+    if (key_keep != 0 &&
+        (VideoCommon::OneFollower::g_write_watch & VideoCommon::OneFollower::WriteWatchKey) == 0) {
+        // Counted from now; known after a snapshot.
+        VideoCommon::OneFollower::g_write_watch |= VideoCommon::OneFollower::WriteWatchKey;
     }
     const bool key_untouched =
         key_keep != 0 && clean.key_seen != ~u64{0} && clean.key_seen == KeyWritesNow();

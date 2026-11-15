@@ -35,6 +35,7 @@
 #include "common/scope_exit.h"
 #include "common/thread.h"
 #include "core/core.h"
+#include "video_core/fritchii_e_split.h"
 #include "video_core/gpu_split.h"
 #include "video_core/gpu_wait_site.h"
 #include "video_core/nx2.h"
@@ -1645,6 +1646,8 @@ void Lend(LentOp op, LentReason reason, void (*function)(void*), void* argument)
         function(argument); // R, another thread, or R not running: in place, as today
         return;
     }
+    // FRITCHII_ESPLIT_COUNT: the whole lend (pack, park, R's run) is the "lend" class.
+    const ESplit::LendScope esplit_lend;
     const StepLevel step = Step();
     const bool timing = Stats::Timing();
     const u64 begin = timing ? Stats::Now() : 0;
@@ -2629,8 +2632,12 @@ void PushDraw(const Maxwell3D& engine, u64 draw_seq, u64 buffer_number, u8 flags
     header.pipeline = pipeline;
     // Packed straight into the packet buffer, after the header: no copy, no allocation.
     u8* const buffer = PackBuffer();
-    const std::size_t bytes =
-        PackSpans(engine, header, std::span<u8>{buffer + sizeof(PacketHeader), MaxSpanBytes});
+    std::size_t bytes;
+    {
+        // FRITCHII_ESPLIT_COUNT: packing R's spans is E1's (the push itself stays E2's).
+        const ESplit::Carve esplit_pack{ESplit::Class::E1};
+        bytes = PackSpans(engine, header, std::span<u8>{buffer + sizeof(PacketHeader), MaxSpanBytes});
+    }
     PushPacked(header, buffer, bytes);
 }
 

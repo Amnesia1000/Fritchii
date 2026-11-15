@@ -2112,6 +2112,36 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   entry, across), why not, sampled ns (decide, skip, the old path of skippable binds, the memo
   upkeep of the others) and the ms/s of E saved, the verify counts. Off: one member test per
   bind, one relaxed load per tracker state change, the switch read once a draw.
+- FRITCHII_ESPLIT_COUNT (live, default 0; the E split's step S0, work/E_SPLIT_DESIGN.md 4.2,
+  src/video_core/fritchii_e_split.h): dry, no thread, no value changed. 1 = every ring entry E
+  runs is classed E1 (registers, draw manager, pipeline lookup, span packing), E2 (constant
+  buffer words, fills, buffer cache, fences, compute, guest-visible work), join (E1 waits for E2
+  to drain and runs it: inline uploads, 2D/DMA/inline-to-memory methods, untagged ring calls,
+  channel switches) or lend; a draw's fill, ring B and R packet push and TickWork, and a bind's
+  buffer cache half, are carved out of their E1 entry as E2, R's span packing and the method
+  sink's register writes (also at the head of an E2 entry) back out as E1, every lend as lend.
+  1 entry in 64 timed (random pick, scaled by 64). Stall points: joins by
+  cause, E1 decisions that read game memory (the indirect reset test), lookups after an E2
+  stream write onto shader pages; conditions from memory counted apart (forwarded, decided on
+  E2). 2 = 1, and the hand-over rehearsed on E: at each E2 entry and each E draw fill E1's
+  record (the W2 register words written since the last record, the constant buffer bindings and
+  root table words changed, the draw state by value) is built into a ring and consumed at once
+  into E2's view, then the view is compared with the engine (W2, and at fills the bindings, the
+  root tables, the draw state, a list draw's indirect parameters and the buffer flags; must be
+  0, the first 16 differences logged with the register index, a difference is taken from the
+  engine so one miss counts once). Build and consume timed 1 in 64 (the hand-over cost). Needs
+  the one follower's write tracking (FRITCHII_ONEF step 2+), else "untracked hand-overs". 3 = 2,
+  and E's fill reads the view (SetInputsOverride, and the handle values' bindings) wherever the
+  compare before it was clean; every input reachable through CacheInputs compared again after
+  the fill (must be 0). Lines every 10 s, "E split count (FRITCHII_ESPLIT_COUNT=N) 10 s:": the
+  classes' ms/s and entries/s; the stall points; the net movable work = E1 - hand-over
+  (estimated at 1: 0.15 us a filled draw + 0.05 us an E2 entry; measured at 2 and 3) - joins x
+  2 us - E1 decisions x 4 us - lends x 1.5 us; at 2 and 3 the records and the view differences;
+  at 3 the fills from the view. Read the classes from 1 (2 and 3 add the rehearsal's work, and
+  move the sink's writes before E2 entries out of the timed entries). S1 bar: net >= 60 ms/s
+  profiled, stall points <= 2,000/s, view differs 0 over a step-in. Off: one relaxed load per
+  ring batch, a local test per entry, two plain loads per filled draw, one per lend, bind, root
+  table load, condition, stream write and non-empty sink; the register write hook shares the key-watch byte.
 - FRITCHII_ONEF_TRACE (boot, default 0; fable_b_one_follower 15.5): 1 = the lend trace. One
   72-byte record per lend and per posted op (packet number, site, op kind, posted, E's arrival,
   R's start and end, E's resume, E's work since its previous record, R's busy time on other

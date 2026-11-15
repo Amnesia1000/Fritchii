@@ -31,6 +31,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/fritchii_draw_kinds.h"
+#include "video_core/fritchii_e_split.h"
 #include "video_core/fritchii_price.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
@@ -448,6 +449,9 @@ size_t Maxwell3D::EstimateIndexBufferSize() {
 
 void Maxwell3D::ConsumeSinkImpl(Core::System& system) {
     const VideoCommon::Nx2Profile::FineScope profile_scope{VideoCommon::Nx2Profile::Zone::Sink};
+    // FRITCHII_ESPLIT_COUNT: applying sunk register writes is E1's, also at the head of an E2
+    // entry (E1 applies them before it forwards the entry).
+    const VideoCommon::ESplit::Carve esplit_sink{VideoCommon::ESplit::Class::E1};
     if (VideoCommon::FritchiiDrawKinds::g_on) [[unlikely]] {
         VideoCommon::FritchiiDrawKinds::NoteWrites(method_sink.size());
     }
@@ -760,6 +764,8 @@ void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argume
         if (root_tables.offset < 256 && root_tables.offset % 4 == 0) {
             root_tables.tables[root_tables.selected][root_tables.offset / 4] = argument;
             root_tables.loaded = true;
+            // FRITCHII_ESPLIT_COUNT >= 2: the word goes in E1's next record.
+            VideoCommon::ESplit::NoteRootWord(root_tables.selected, root_tables.offset / 4);
         }
         root_tables.offset += 4;
         return;
@@ -1443,6 +1449,10 @@ void Maxwell3D::ProcessQueryCondition() {
         break;
     }
     }
+    // FRITCHII_ESPLIT_COUNT: a condition from game memory (E1 forwards the draws, E2 decides).
+    if (operands_read) {
+        VideoCommon::ESplit::NoteCondition();
+    }
     // One follower from step 3 (part c): R's own mode at this place, compared with this one.
     if (VideoCommon::OneFollower::On()) [[unlikely]] {
         VideoCommon::OneFollower::NoteCondition(execute_on);
@@ -1518,9 +1528,13 @@ void Maxwell3D::ProcessCBBind(size_t stage_index) {
     if (VideoCommon::OneFollower::g_track_binds.load(std::memory_order_relaxed)) [[unlikely]] {
         VideoCommon::OneFollower::NoteCbBind(stage_index, bind_data.shader_slot);
     }
+    // FRITCHII_ESPLIT_COUNT >= 2: the binding goes in E1's next record by value.
+    VideoCommon::ESplit::NoteCbBind(stage_index, bind_data.shader_slot);
     if (VideoCommon::MemoryStageLink::BackServed()) [[unlikely]] {
         return; // FRITCHII_MEMSTAGE_THREAD=2: the memory stage bound it on the buffer cache
     }
+    // FRITCHII_ESPLIT_COUNT: the buffer cache half below is E2's (the register half above, E1's).
+    const VideoCommon::ESplit::Carve esplit_cache_half{VideoCommon::ESplit::Class::E2};
 
     const bool is_enabled = bind_data.valid.Value() != 0;
     if (!is_enabled) {
@@ -5202,6 +5216,10 @@ void Maxwell3D::FrontSendE2cCondition(VideoCommon::GpuSplit& split, FrontState& 
 void Maxwell3D::BackE2cCondition(Core::System& system, GPUVAddr source, u32 p0, u32 front_value,
                                  bool verify) {
     namespace OneF = VideoCommon::OneFollower;
+    // FRITCHII_ESPLIT_COUNT: this untagged call is a condition from game memory, E2's (the draws
+    // after it are forwarded, decided on E2).
+    VideoCommon::ESplit::SetEntryClass(VideoCommon::ESplit::Class::E2);
+    VideoCommon::ESplit::NoteCondition();
     auto& stats = g_e2c_back;
     constexpr size_t read_bytes = 6 * sizeof(u32);
     // The drained read (FrontDmaRead's miss path), here at the entry's stream place by the
