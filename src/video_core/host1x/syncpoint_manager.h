@@ -63,6 +63,18 @@ public:
         guest_increment_hook.store(hook, std::memory_order_release);
     }
 
+    /// Called with a syncpoint's new guest value on every guest increment, under the manager's
+    /// lock, before the value is published and before the actions it meets run. Switch 2 clients
+    /// read syncpoint values from a page the nx2:gsv session fills, and an action may wake a
+    /// client that reads that page right away: the page must not be behind the value that
+    /// answered its wait (nn::movie aborts on purpose with 2162-0001 when it is). The mirror
+    /// runs on whichever thread increments: it must be cheap and take no other lock.
+    using GuestMirror = std::function<void(u32 syncpoint_id, u32 value)>;
+    /// Installs `mirror` for `owner` (replacing any other owner's).
+    void SetGuestMirror(const void* owner, GuestMirror mirror);
+    /// Removes the mirror if `owner` installed it. No mirror call runs after this returns.
+    void ClearGuestMirror(const void* owner);
+
     void IncrementHost(u32 syncpoint_id);
 
     void WaitGuest(u32 syncpoint_id, u32 expected_value);
@@ -79,9 +91,10 @@ public:
 
 private:
     /// `timeline_name`: the Nx2Timeline marker of the increment (a literal), with the id.
+    /// `guest`: a guest increment, mirrored first (SetGuestMirror) while a mirror is set.
     void Increment(std::atomic<u32>& syncpoint, std::condition_variable& wait_cv,
                    std::list<RegisteredAction>& action_storage, const char* timeline_name,
-                   u32 syncpoint_id);
+                   u32 syncpoint_id, bool guest = false);
 
     ActionHandle RegisterAction(std::atomic<u32>& syncpoint,
                                 std::list<RegisteredAction>& action_storage, u32 expected_value,
@@ -100,6 +113,9 @@ private:
     std::mutex guard;
     u64 last_action_id{};
     std::atomic<GuestIncrementHook> guest_increment_hook{};
+    GuestMirror guest_mirror;               ///< Under `guard`
+    const void* guest_mirror_owner{};       ///< Under `guard`
+    std::atomic<bool> has_guest_mirror{};   ///< Whether guest_mirror is set (read without `guard`)
     std::atomic<void*> guest_increment_context{};
     std::condition_variable wait_guest_cv;
     std::condition_variable wait_host_cv;

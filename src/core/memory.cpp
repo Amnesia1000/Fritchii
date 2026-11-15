@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <unordered_map>
 #include <algorithm>
@@ -382,9 +383,13 @@ struct Memory::Impl {
         },
         [&](const Common::ProcessAddress current_vaddr, const std::size_t offset, const std::size_t copy_amount, u8* const ptr) {
             if (!unsafe) {
+                const u64 generation = TrackedGeneration();
                 HandleRasterizerWrite(GetInteger(current_vaddr), copy_amount);
+                std::memcpy(ptr, reinterpret_cast<u8 const*>(buffer) + offset, copy_amount);
+                NoteStoredWrite(GetInteger(current_vaddr), copy_amount, generation);
+            } else {
+                std::memcpy(ptr, reinterpret_cast<u8 const*>(buffer) + offset, copy_amount);
             }
-            std::memcpy(ptr, reinterpret_cast<u8 const*>(buffer) + offset, copy_amount);
             VideoCommon::WriteTrack::CloseIfArmed();
             // EXP92: the after-store point (unsafe writes recorded nothing: noted here; also with
             // the bank marks on, whose flag the write ring's Note sets, FRITCHII_BANK_FLAGGED).
@@ -406,8 +411,10 @@ struct Memory::Impl {
             std::memset(ptr, 0, copy_amount);
         },
         [&](const Common::ProcessAddress current_vaddr, const std::size_t offset, const std::size_t copy_amount, u8* const ptr) {
+            const u64 generation = TrackedGeneration();
             HandleRasterizerWrite(GetInteger(current_vaddr), copy_amount);
             std::memset(ptr, 0, copy_amount);
+            NoteStoredWrite(GetInteger(current_vaddr), copy_amount, generation);
             VideoCommon::WriteTrack::CloseIfArmed();
             Common::UniformKeepPages::AfterGuestStore(); // EXP92
         });
@@ -917,10 +924,19 @@ struct Memory::Impl {
     template <typename T>
     inline void Write(Common::ProcessAddress vaddr, const T data) noexcept requires(std::is_trivially_copyable_v<T>) {
         const u64 addr = GetInteger(vaddr);
+        bool rasterizer_write = false;
+        u64 generation = 0;
         if (auto const ptr = GetPointerImpl(addr, [addr, data]() {
             LOG_ERROR(HW_Memory, "Unmapped Write{} @ {:#016x} = {:#016x}", sizeof(T) * 8, addr, u64(data));
-        }, [&](u8* host_ptr) { HandleRasterizerWrite(addr, sizeof(T), host_ptr); }); ptr) [[likely]] {
+        }, [&](u8* host_ptr) {
+            generation = TrackedGeneration();
+            HandleRasterizerWrite(addr, sizeof(T), host_ptr);
+            rasterizer_write = true;
+        }); ptr) [[likely]] {
             std::memcpy(ptr, &data, sizeof(T));
+            if (rasterizer_write) [[unlikely]] {
+                NoteStoredWrite(addr, sizeof(T), generation);
+            }
             VideoCommon::WriteTrack::CloseIfArmed();
             Common::UniformKeepPages::AfterGuestStore(); // EXP92
         }
@@ -928,16 +944,25 @@ struct Memory::Impl {
 
     template <typename T>
     bool WriteExclusive(Common::ProcessAddress vaddr, const T data, const T expected) {
+        bool rasterizer_write = false;
+        u64 generation = 0;
         u8* const ptr = GetPointerImpl(
             GetInteger(vaddr),
             [vaddr, data]() {
                 LOG_ERROR(HW_Memory, "Unmapped WriteExclusive{} @ {:#016x} = {:#016x}",
                           sizeof(T) * 8, GetInteger(vaddr), static_cast<u64>(data));
             },
-            [&](u8* host_ptr) { HandleRasterizerWrite(GetInteger(vaddr), sizeof(T), host_ptr); });
+            [&](u8* host_ptr) {
+                generation = TrackedGeneration();
+                HandleRasterizerWrite(GetInteger(vaddr), sizeof(T), host_ptr);
+                rasterizer_write = true;
+            });
         if (ptr) {
             const bool stored =
                 Common::AtomicCompareAndSwap(reinterpret_cast<T*>(ptr), data, expected);
+            if (stored && rasterizer_write) [[unlikely]] {
+                NoteStoredWrite(GetInteger(vaddr), sizeof(T), generation);
+            }
             VideoCommon::WriteTrack::CloseIfArmed();
             Common::UniformKeepPages::AfterGuestStore(); // EXP92
             return stored;
@@ -946,6 +971,8 @@ struct Memory::Impl {
     }
 
     bool WriteExclusive128(Common::ProcessAddress vaddr, const u128 data, const u128 expected) {
+        bool rasterizer_write = false;
+        u64 generation = 0;
         u8* const ptr = GetPointerImpl(
             GetInteger(vaddr),
             [vaddr, data]() {
@@ -953,11 +980,16 @@ struct Memory::Impl {
                           GetInteger(vaddr), static_cast<u64>(data[1]), static_cast<u64>(data[0]));
             },
             [&](u8* host_ptr) {
+                generation = TrackedGeneration();
                 HandleRasterizerWrite(GetInteger(vaddr), sizeof(u128), host_ptr);
+                rasterizer_write = true;
             });
         if (ptr) {
             const bool stored =
                 Common::AtomicCompareAndSwap(reinterpret_cast<u64*>(ptr), data, expected);
+            if (stored && rasterizer_write) [[unlikely]] {
+                NoteStoredWrite(GetInteger(vaddr), sizeof(u128), generation);
+            }
             VideoCommon::WriteTrack::CloseIfArmed();
             Common::UniformKeepPages::AfterGuestStore(); // EXP92
             return stored;
@@ -1035,6 +1067,59 @@ struct Memory::Impl {
             DisarmReadTraps(v_address, size);
             current_area = system.GPU().OnCPURead(address, size);
         });
+    }
+
+    /// FRITCHII_WRITE_REMARK: read before a write marks its pages (HandleRasterizerWrite), for
+    /// NoteStoredWrite.
+    [[nodiscard]] static u64 TrackedGeneration() noexcept {
+        // Acquire: stays before the mark whatever ordering the mark itself has (free on x86).
+        return Core::g_pages_tracked_generation.load(std::memory_order_acquire);
+    }
+
+    /// FRITCHII_WRITE_REMARK (live, default 1; port of zortos293/Lichii #1829): after a write that
+    /// marked its pages stored its bytes. The mark comes first, so a cache that took the mark in
+    /// between (a gather of the collected writes, an upload that tracks the pages again) could
+    /// read the old bytes and treat them as current: the stored ones then never reached it until
+    /// the page was written again (stale vertex, uniform or texture data). The window is wide when
+    /// the mark waits for a cache mutex the GPU threads hold. If such a take happened since the
+    /// mark began (the generation moved) and a page of the write is still tracked, the write
+    /// marks it again, so the next upload takes the stored bytes.
+    void NoteStoredWrite(VAddr v_address, size_t size, u64 generation) {
+        if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_write_remark,
+                                             "FRITCHII_WRITE_REMARK", 1) == 0) {
+            return;
+        }
+        // Pairs with the take's fence: this store is in the cache's read, or the move is seen.
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (Core::g_pages_tracked_generation.load(std::memory_order_relaxed) == generation) {
+            return;
+        }
+        // The address the store went to: GetPointerImpl drops the upper 16 bits (AArch64 tags).
+        v_address &= 0xffffffffffffULL;
+        const size_t span = (std::max<size_t>)(size, 1);
+        if (!AddressSpaceContains(*current_page_table, v_address, span)) {
+            return;
+        }
+        const u64 first_page = v_address >> YUZU_PAGEBITS;
+        const u64 last_page = (v_address + span - 1) >> YUZU_PAGEBITS;
+        bool tracked = false;
+        for (u64 page = first_page; page <= last_page && !tracked; ++page) {
+            tracked = current_page_table->entries[page].Type() ==
+                      Common::PageType::RasterizerCachedMemory;
+        }
+        if (!tracked) {
+            // Untracked pages are CPU-modified to every cache: the next upload takes the store.
+            return;
+        }
+        static std::atomic<u64> marked_again{};
+        const u64 count = marked_again.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (std::has_single_bit(count) && count <= (u64{1} << 20)) {
+            LOG_INFO(HW_Memory,
+                     "CPU writes marked again after a cache took their marks before the store "
+                     "(FRITCHII_WRITE_REMARK): {}",
+                     count);
+        }
+        HandleRasterizerWrite(v_address, size);
     }
 
     /// `host_ptr`: the store's host pointer when the caller's walk already found it (null: walk).

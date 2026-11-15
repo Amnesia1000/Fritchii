@@ -34,6 +34,14 @@ namespace Memory {
 class Memory;
 }
 
+/// Moved each time a GPU cache takes guest memory's bytes as clean again (pages tracked again by
+/// UpdatePagesCachedCount with a positive delta, collected CPU writes taken by a dirty manager's
+/// Gather). A CPU write marks its pages before it stores its bytes (Core::Memory's Write), so a
+/// cache that takes the marks in between can upload the old bytes and treat them as current; a
+/// write that sees this value move across its store marks its pages again (NoteStoredWrite in
+/// core/memory.cpp, FRITCHII_WRITE_REMARK). Only equality is compared.
+inline std::atomic<u64> g_pages_tracked_generation{};
+
 template <typename DTraits>
 struct DeviceMemoryManagerAllocator;
 
