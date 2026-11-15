@@ -1972,7 +1972,20 @@ struct Maxwell3D::FrontState {
         std::array<u64, static_cast<size_t>(Tegra::OotOps::Op::Count)> old_path{};
         std::array<u64, static_cast<size_t>(Tegra::OotOps::Op::Count)> empty{};
         /// Why a call of the ops' ids stayed on the old path.
-        enum class Reason : u8 { Lanes, Tools, Stopped, Encode, Count };
+        enum class Reason : u8 {
+            Shadow,         ///< shadow RAM not Track / TrackWithFilter
+            Exp22,          ///< EXP22 on (delta blocks, draw batches, held index writes)
+            SameExperiment, ///< EXP2 on
+            Packet,         ///< EDEN_NX2_DRAW_PACKET holds this call's writes
+            ListDrawStale,  ///< the list guard's stale registers
+            E2cUnknown,     ///< render_enable.mode or its shadow word unknown (E2C_ON_E)
+            GuardListReads, ///< the list guard checks this call's reads
+            SinkPairs,      ///< EDEN_NX2_MACRO_SINK without EDEN_NX2_RING_PAIRS
+            Tools,          ///< trace, dry, seq, OoT verify, EXP53 predicate, E2C mode, fold
+            Stopped,        ///< a check mismatch stopped ops
+            Encode,         ///< the handler would decline, or too many instances
+            Count
+        };
         std::array<u64, static_cast<size_t>(Reason::Count)> reasons{};
         u64 entries{};
         u64 writes_sent{};
@@ -3358,15 +3371,11 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
             if (const int ops_mode = VideoCore::Nx2Debug::SwitchValue(
                     VideoCore::Nx2Debug::g_onef_front_ops, "FRITCHII_ONEF_FRONT_OPS");
                 ops_mode != 0 && OotOps::OpOf(oot) != OotOps::Op::None) [[unlikely]] {
-                const bool lanes =
-                    (fs.control == Regs::ShadowRamControl::Track ||
-                     fs.control == Regs::ShadowRamControl::TrackWithFilter) &&
-                    fs.exp22 == 0 && fs.same_experiment == 0 && !fs.packet_on &&
-                    fs.list_draw_stale == 0 && !fs.e2c_mode_unknown && !fs.e2c_shadow_unknown &&
-                    !fs.guard_list_reads &&
-                    (!VideoCommon::GpuSplit::MacroSink() || VideoCommon::GpuSplit::RingPairs()) &&
-                    VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_cb_words_block,
-                                                     "FRITCHII_CB_WORDS_BLOCK") == 0;
+                // FRITCHII_CB_WORDS_BLOCK is no condition: its words are Direct writes in the op
+                // (CbWord sends the same Method word, committed and noted as MacroWrite does), the
+                // op's Reserve closes an open block before it, and E applies a run of the op's
+                // words as ExecuteCbWords does (Execute's CbBatch over the run). With 2 the
+                // front's word addresses go along and E compares them (CheckCbAddress).
                 const bool tools = trace || dry != nullptr || seq != nullptr || oot_verify ||
                                    predicate || e2c_mode != 0 || fold_pending;
                 // fable_b2 1.1 A: 2 or more instances while EDEN_NX2_FOLD_INSTANCES counts
@@ -3374,8 +3383,24 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
                 const u32 max_instances = FoldInstancesEnabled() ? 1U : OotOps::MaxOpInstances;
                 using Reason = FrontState::FrontOpStats::Reason;
                 Reason reason = Reason::Count;
-                if (!lanes) {
-                    reason = Reason::Lanes;
+                if (fs.control != Regs::ShadowRamControl::Track &&
+                    fs.control != Regs::ShadowRamControl::TrackWithFilter) {
+                    reason = Reason::Shadow;
+                } else if (fs.exp22 != 0) {
+                    reason = Reason::Exp22;
+                } else if (fs.same_experiment != 0) {
+                    reason = Reason::SameExperiment;
+                } else if (fs.packet_on) {
+                    reason = Reason::Packet;
+                } else if (fs.list_draw_stale != 0) {
+                    reason = Reason::ListDrawStale;
+                } else if (fs.e2c_mode_unknown || fs.e2c_shadow_unknown) {
+                    reason = Reason::E2cUnknown;
+                } else if (fs.guard_list_reads) {
+                    reason = Reason::GuardListReads;
+                } else if (VideoCommon::GpuSplit::MacroSink() &&
+                           !VideoCommon::GpuSplit::RingPairs()) {
+                    reason = Reason::SinkPairs;
                 } else if (tools) {
                     reason = Reason::Tools;
                 } else if (FrontOpsStopped()) {
@@ -6314,6 +6339,11 @@ void Maxwell3D::FrontOpFinish(VideoCommon::GpuSplit& split, FrontState& fs, bool
     const bool direct = op.mode >= 3;
     // The skipped-write check runs on every op in the check modes, on every 64th otherwise.
     const bool skip_check = check || (++stats.skip_sample & 63) == 0;
+    // FRITCHII_CB_WORDS_BLOCK=2 compares where its words go: the op's words carry the front's
+    // addresses then too.
+    const bool cb_verify = check || VideoCore::Nx2Debug::SwitchValue(
+                                        VideoCore::Nx2Debug::g_cb_words_block,
+                                        "FRITCHII_CB_WORDS_BLOCK") == 2;
     constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
     // Check words: each written register once, with the value the front's copy holds now; then
     // the address the front noted for each sent constant buffer word.
@@ -6321,10 +6351,10 @@ void Maxwell3D::FrontOpFinish(VideoCommon::GpuSplit& split, FrontState& fs, bool
     u32 final_count = 0;
     std::array<u64, OotOps::MaxWrites> cb_addresses;
     u32 cb_count = 0;
-    if (check) [[unlikely]] {
+    if (cb_verify) [[unlikely]] {
         for (u32 i = 0; i < op.count; ++i) {
             const u32 method = op.methods[i];
-            bool seen = false;
+            bool seen = !check;
             for (u32 j = 0; j < final_count && !seen; ++j) {
                 seen = static_cast<u32>(finals[j] & 0xffff) == method;
             }
@@ -6350,7 +6380,7 @@ void Maxwell3D::FrontOpFinish(VideoCommon::GpuSplit& split, FrontState& fs, bool
     const u32 arg_count = op.args.count;
     const size_t arg_words = OotOps::ArgWords(arg_count);
     const size_t words = 2 + OotOps::HeaderWords + arg_words +
-                         (check ? size_t{op.count} + final_count + cb_count : 0);
+                         (check ? size_t{op.count} + final_count : 0) + cb_count;
     const u32 flags = (check ? OotOps::FlagCheck : 0U) | (direct ? OotOps::FlagDirect : 0U) |
                       (skip_check ? OotOps::FlagSkipCheck : 0U) | OotOps::CbAddressFlags(cb_count);
     // No engine entry: the engine is in the payload, the back's selection stays as it is.
@@ -6369,15 +6399,15 @@ void Maxwell3D::FrontOpFinish(VideoCommon::GpuSplit& split, FrontState& fs, bool
                 const u32 high = first + 1 < arg_count ? op.args.a[first + 1] : 0U;
                 args[w] = u64{op.args.a[first]} | (u64{high} << 32);
             }
+            u64* list = args + arg_words;
             if (check) {
-                u64* const list = args + arg_words;
                 for (u32 i = 0; i < op.count; ++i) {
                     list[i] = u64{op.methods[i]} | (u64{op.arguments[i]} << 32);
                 }
                 std::memcpy(list + op.count, finals.data(), size_t{final_count} * sizeof(u64));
-                std::memcpy(list + op.count + final_count, cb_addresses.data(),
-                            size_t{cb_count} * sizeof(u64));
+                list += op.count + final_count;
             }
+            std::memcpy(list, cb_addresses.data(), size_t{cb_count} * sizeof(u64));
         },
         VideoCommon::Nx2FastDrawCount::Neutral() | FrontOpStageFlags());
     ++stats.entries;
@@ -6422,12 +6452,16 @@ void Maxwell3D::FrontOpReport(FrontState& fs, int mode) {
     const auto reason = [&s](Reason r) { return s.reasons[static_cast<size_t>(r)]; };
     LOG_INFO(HW_GPU,
              "Front ops (FRITCHII_ONEF_FRONT_OPS={}): {} op entries, {} writes sent, {} dropped "
-             "on the front; per op sent/sent nothing/old path:{}; old path by reason: lanes {}, "
-             "tools {}, stopped {}, declined or too long {}; {} fallbacks; {} count differences "
-             "(must be 0){}",
-             mode, s.entries, s.writes_sent, s.writes_dropped, per_id, reason(Reason::Lanes),
-             reason(Reason::Tools), reason(Reason::Stopped), reason(Reason::Encode), s.fallbacks,
-             s.count_differ, FrontOpsStopped() ? ", stopped" : "");
+             "on the front; per op sent/sent nothing/old path:{}; old path by reason: shadow {}, "
+             "exp22 {}, same_experiment {}, packet {}, list_draw_stale {}, e2c unknown {}, "
+             "guard_list_reads {}, sink without pairs {}, tools {}, stopped {}, declined or too "
+             "long {}; {} fallbacks; {} count differences (must be 0){}",
+             mode, s.entries, s.writes_sent, s.writes_dropped, per_id, reason(Reason::Shadow),
+             reason(Reason::Exp22), reason(Reason::SameExperiment), reason(Reason::Packet),
+             reason(Reason::ListDrawStale), reason(Reason::E2cUnknown),
+             reason(Reason::GuardListReads), reason(Reason::SinkPairs), reason(Reason::Tools),
+             reason(Reason::Stopped), reason(Reason::Encode), s.fallbacks, s.count_differ,
+             FrontOpsStopped() ? ", stopped" : "");
 }
 
 void Maxwell3D::ApplyFrontOp(const u64* payload) {
@@ -6448,8 +6482,9 @@ void Maxwell3D::ApplyFrontOp(const u64* payload) {
     const u32 writes = OotOps::HeaderWrites(head);
     const u32 finals = OotOps::HeaderChecks(head);
     const u64* const check_words = arg_words + OotOps::ArgWords(arg_count);
-    const u32 cb_count = check ? OotOps::HeaderCbAddresses(head) : 0U;
-    const u64* const cb_addresses = cb_count != 0 ? check_words + writes + finals : nullptr;
+    const u32 cb_count = OotOps::HeaderCbAddresses(head);
+    const u64* const cb_addresses =
+        cb_count != 0 ? check_words + (check ? writes + finals : 0U) : nullptr;
     const u32 skips = (flags & OotOps::FlagSkipCheck) != 0 ? ApplyCheckSkips : 0U;
     // S3 where CallMethod would take its fast routes for every write (what S2 reaches through
     // it). It stays on with the GPU profile (sampled and counted as CallMethod is).
@@ -6460,7 +6495,8 @@ void Maxwell3D::ApplyFrontOp(const u64* payload) {
         self->ApplyFrontOpWrites(system, op, args.data(), sent, pairs, cb_addresses, cb_count,
                                  skips);
     } else if (!check) [[likely]] {
-        self->ApplyFrontOpDirect(system, op, args.data(), sent, pairs, nullptr, 0, skips);
+        self->ApplyFrontOpDirect(system, op, args.data(), sent, pairs, cb_addresses, cb_count,
+                                 skips);
     } else {
         // FRITCHII_ONEF_FRONT_OPS=4: S3 with each Direct write's route and the indexed flag
         // checked. Where the op only stores state (every sent write a state register) and

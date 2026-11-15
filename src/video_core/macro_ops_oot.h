@@ -268,8 +268,9 @@ inline constexpr size_t HeaderWords = 3;
 inline constexpr u32 FlagCheck = 1;   ///< check words follow (FRITCHII_ONEF_FRONT_OPS=2 or 4)
 inline constexpr u32 FlagDirect = 2;  ///< S3: E applies the op directly (=3 or 4)
 inline constexpr u32 FlagSkipCheck = 4; ///< E checks the writes the front skipped (sampled)
-/// Flags bits 8-15: with FlagCheck, how many constant buffer word addresses (the front's, one per
-/// sent Direct data word in order) follow the final register words.
+/// Flags bits 8-15: how many constant buffer word addresses (the front's, one per sent Direct data
+/// word in order) end the payload, after the check words when FlagCheck is set (check modes and
+/// FRITCHII_CB_WORDS_BLOCK=2).
 [[nodiscard]] constexpr u32 CbAddressFlags(u32 count) noexcept {
     return (count & 0xff) << 8;
 }
