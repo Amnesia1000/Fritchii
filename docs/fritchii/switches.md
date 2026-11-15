@@ -2116,8 +2116,11 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   src/video_core/fritchii_e_split.h): dry, no thread, no value changed. 1 = every ring entry E
   runs is classed E1 (registers, draw manager, pipeline lookup, span packing), E2 (constant
   buffer words, fills, buffer cache, fences, compute, guest-visible work), join (E1 waits for E2
-  to drain and runs it: inline uploads, 2D/DMA/inline-to-memory methods, untagged ring calls,
-  channel switches) or lend; a draw's fill, ring B and R packet push and TickWork, and a bind's
+  to drain and runs it: inline uploads, 2D/DMA/inline-to-memory methods, untagged ring calls)
+  or lend. Channel calls are E1's and no join: E2 takes the bind in order (at 2 and 3 a record is
+  handed over at each), binding the bound channel again changes nothing, and a real switch's
+  RasterizerVulkan::BindChannel lends, which parks both stages (counted as a lend; the line
+  splits channel calls into switches and rebinds). A draw's fill, ring B and R packet push and TickWork, and a bind's
   buffer cache half, are carved out of their E1 entry as E2, R's span packing and the method
   sink's register writes (also at the head of an E2 entry) back out as E1, every lend as lend.
   1 entry in 64 timed (random pick, scaled by 64). Stall points: joins by
@@ -2129,7 +2132,13 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   into E2's view, then the view is compared with the engine (W2, and at fills the bindings, the
   root tables, the draw state, a list draw's indirect parameters and the buffer flags; must be
   0, the first 16 differences logged with the register index, a difference is taken from the
-  engine so one miss counts once). Build and consume timed 1 in 64 (the hand-over cost). Needs
+  engine so one miss counts once). A draw record also carries the buffer flag take: the buffer
+  flags raised on the engine since the last record by anything but a recorded register word (the
+  Vulkan state tracker's invalidations, the cache's marks, a lent call's), which in the split E1
+  reads and clears off its engine and E2 raises in its own copy; a line counts them by flag and
+  where VertexBuffers rose (the draw's stream flush, its lookup, its TickWork, E2 entries, joins,
+  lends) and the state tracker's invalidations on the viewed engine by thread (any thread but E
+  or R in a lent call must be 0). Build and consume timed 1 in 64 (the hand-over cost). Needs
   the one follower's write tracking (FRITCHII_ONEF step 2+), else "untracked hand-overs". 3 = 2,
   and E's fill reads the view (SetInputsOverride, and the handle values' bindings) wherever the
   compare before it was clean; every input reachable through CacheInputs compared again after
@@ -2140,8 +2149,9 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   at 3 the fills from the view. Read the classes from 1 (2 and 3 add the rehearsal's work, and
   move the sink's writes before E2 entries out of the timed entries). S1 bar: net >= 60 ms/s
   profiled, stall points <= 2,000/s, view differs 0 over a step-in. Off: one relaxed load per
-  ring batch, a local test per entry, two plain loads per filled draw, one per lend, bind, root
-  table load, condition, stream write and non-empty sink; the register write hook shares the key-watch byte.
+  ring batch, a local test per entry, two plain loads per filled draw (and three tests of a local
+  it holds), one per lend, bind, root table load, condition, stream write, non-empty sink and
+  Vulkan state tracker invalidation; the register write hook shares the key-watch byte.
 - FRITCHII_ESPLIT (boot, default 0; the E split's thread, steps S1 and S2 of
   work/E_SPLIT_DESIGN.md 5, src/video_core/fritchii_e_split_thread.h): 1 = the engine thread E
   becomes two. E1 (the back thread) reads ring A, applies the register entries on the real

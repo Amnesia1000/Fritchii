@@ -815,6 +815,7 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
     } else {
         // Today's PrepareDraw head, E's half: the stream's invalidations before the fill.
         const ESplit::Carve flush_carve{ESplit::Class::E2, esplit};
+        const ESplit::FlagProbe flush_probe{engine, ESplit::FlagSite::StreamFlush, esplit};
         engine.GetMemoryManager().FlushCaching();
     }
     // Rule 3 (FRITCHII_ONEF_E_PIPELINE): E looks the pipeline up itself, at its own position,
@@ -824,6 +825,7 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
     // raised again, so the pack below hands them to R and clears them (rule 1).
     GraphicsPipeline* pipeline = nullptr;
     if (VideoCommon::OneFollower::g_e_pipeline) {
+        const ESplit::FlagProbe lookup_probe{engine, ESplit::FlagSite::Lookup, esplit};
         const auto flags_before = engine.dirty.flags;
         pipeline = rasterizer.pipeline_cache.CurrentGraphicsPipeline();
         engine.dirty.flags |= flags_before;
@@ -900,7 +902,10 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
     counts.pushed.store(counts.pushed.load(std::memory_order_relaxed) + 1,
                         std::memory_order_relaxed);
     // PrepareDraw's tail, E's half (read-backs wait on E's work).
-    rasterizer.gpu.TickWork();
+    {
+        const ESplit::FlagProbe tick_probe{engine, ESplit::FlagSite::TickWork, esplit};
+        rasterizer.gpu.TickWork();
+    }
     ESplit::NoteDrawFilled(esplit);
     return true;
 }

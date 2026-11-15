@@ -25,13 +25,17 @@ class EngineInterface;
 ///     time. 1 entry in 64 is timed
 ///     (time stamp ticks, picked at random, scaled by 64). Counted: the points where E1 would
 ///     stall for E2 (joins by cause, E1 decisions that read game memory, a pipeline lookup after
-///     a stream write onto shader pages), conditions from memory (forwarded, decided on E2).
+///     a stream write onto shader pages), conditions from memory (forwarded, decided on E2),
+///     channel calls (E1's, E2 takes them in order; the ones that switch lend).
 /// 2 = 1, and the hand-over is rehearsed on E's own thread: at each E2 entry and each E fill,
 ///     E1's record (the watched register words written since the last record, the constant
 ///     buffer bindings and root table words changed, the draw state by value) is built into a
 ///     ring and consumed at once into E2's view; the view is compared with the engine (must be
 ///     0; the first 16 differences logged with the register index). Build and consume are timed
-///     1 in 64 (the hand-over cost).
+///     1 in 64 (the hand-over cost). A draw's record also carries the buffer flags raised on the
+///     engine since the last one by any writer but a recorded register word (the take: in the
+///     split E1 reads and clears them on its engine, E2 owns the cleared copy); where the
+///     VertexBuffers flag rose is counted by site.
 /// 3 = 2, and E's draw fill reads the view (BufferCache::SetInputsOverride and the handle values'
 ///     constant buffer bindings) whenever the compare before it found it equal; every input the
 ///     fill can read through CacheInputs is compared again after the fill (must be 0).
@@ -40,8 +44,9 @@ class EngineInterface;
 ///
 /// Off: per ring batch one relaxed load (the switch); per entry a test of a local; per filled
 /// draw two plain loads of g_state (FillAndPush, PushDraw) and one of g_records (FillRing); per
-/// lend, constant buffer bind, root table load, condition, stream write and non-empty method sink
-/// one plain load. The register write hook shares the one follower's key-watch byte (no added
+/// lend, constant buffer bind, root table load, condition, stream write, non-empty method sink and
+/// Vulkan state tracker invalidation one plain load; FillAndPush's three flag probes test a local
+/// it already holds. The register write hook shares the one follower's key-watch byte (no added
 /// load).
 namespace VideoCommon::ESplit {
 
@@ -55,11 +60,15 @@ enum class Class : u8 {
     Count,
 };
 
+/// A channel call (the rasterizer's channel switch) is no join: E1 runs it and E2 takes it in
+/// order as a bind record (EntryInfo::channel). Binding the bound channel again changes nothing
+/// (GPU::Impl::BindChannel reads only its own bound id); a real switch runs RasterizerVulkan::
+/// BindChannel lent, and a lend parks both stages, so E2 is drained to that place by the lend
+/// (counted as a lend, not again as a join).
 enum class JoinCause : u8 {
     Upload,       ///< 3D inline upload (launch_dma, inline_data)
     OtherEngine,  ///< a 2D, DMA or inline-to-memory engine's executed method
     UntaggedCall, ///< a ring call with no memory stage tag (unclassified)
-    Channel,      ///< the rasterizer's channel switch
     Count,
 };
 
@@ -82,6 +91,9 @@ struct EntryInfo {
     /// method, a multi write, a words block): at 2 and 3 E1 applies the sink before the hand-over,
     /// as the split would (the same order: Execute would do it first thing).
     bool sink_first{};
+    /// A channel call (class E1): E2 takes the bind in order (at 2 and 3 a record is handed over
+    /// at it); a lend inside it is a real switch.
+    bool channel{};
 };
 
 inline constexpr u8 StateOn = 1;       ///< FRITCHII_ESPLIT_COUNT >= 1
@@ -226,6 +238,56 @@ inline void NoteCbBind(std::size_t stage, u32 slot) noexcept {
 inline void NoteRootWord(u32 table, u32 index) noexcept {
     if (g_records) [[unlikely]] {
         NoteRootWordImpl(table, index);
+    }
+}
+
+// --- Buffer flag writers outside the records (2 and 3, counted) ------------------------------------
+
+/// Where the engine's VertexBuffers flag rose outside a register record (fritchii_e_split.cpp,
+/// "the buffer flag take").
+enum class FlagSite : u8 {
+    StreamFlush, ///< FillAndPush's FlushCaching (E2's)
+    Lookup,      ///< FillAndPush's pipeline lookup (E1's)
+    TickWork,    ///< the draw's TickWork (E2's: the guest's sync requests)
+    Count,
+};
+
+void NoteFlagRiseImpl(FlagSite site) noexcept;
+
+/// Around a piece of E's draw path at 2 and 3: counts a 0 to 1 edge of the engine's
+/// VertexBuffers flag inside it. `state`: g_state read once by the caller (off: one test).
+class FlagProbe {
+public:
+    FlagProbe(const Maxwell3D& engine_, FlagSite site_, u8 state) noexcept {
+        if (state != 0 && g_records) [[unlikely]] {
+            engine = &engine_;
+            site = site_;
+            before = engine_.dirty.flags[FlagIndex];
+        }
+    }
+    ~FlagProbe() {
+        if (engine != nullptr && !before && engine->dirty.flags[FlagIndex]) [[unlikely]] {
+            NoteFlagRiseImpl(site);
+        }
+    }
+    FlagProbe(const FlagProbe&) = delete;
+    FlagProbe& operator=(const FlagProbe&) = delete;
+
+    static constexpr u32 FlagIndex = 15; ///< VideoCommon::Dirty::VertexBuffers (static_assert'd)
+
+private:
+    const Maxwell3D* engine{};
+    FlagSite site{};
+    bool before{};
+};
+
+/// The Vulkan state tracker raised its invalidation flags on `flags` (any thread): counted by
+/// thread when they are the viewed engine's (E; R in a lent call, E parked; any other thread,
+/// which would race E and must be 0).
+void NoteTrackerInvalidationImpl(const void* flags) noexcept;
+inline void NoteTrackerInvalidation(const void* flags) noexcept {
+    if (g_records) [[unlikely]] {
+        NoteTrackerInvalidationImpl(flags);
     }
 }
 
