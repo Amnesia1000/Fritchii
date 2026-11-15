@@ -414,10 +414,13 @@ public:
         // The reserve's blocks were never handed to the GPU: unmap and free them (a title that
         // opens nx2:gpu again would otherwise keep them mapped in its alias code region).
         for (auto& backing : m_reserve) {
-            if (auto* const process = system.ApplicationProcess(); process != nullptr) {
-                process->GetPageTable().UnmapPageGroup(Common::ProcessAddress{backing.address},
-                                                       *backing.pages,
-                                                       Kernel::KMemoryState::IoMemory);
+            if (auto* const process = system.ApplicationProcess();
+                process != nullptr &&
+                R_FAILED(process->GetPageTable().UnmapPageGroup(
+                    Common::ProcessAddress{backing.address}, *backing.pages,
+                    Kernel::KMemoryState::IoMemory))) {
+                LOG_ERROR(Service, "nx2:gpu could not unmap reserve block {:#x}", backing.address);
+                continue; // still mapped: keep its pages, as FreeBackings does
             }
             backing.pages->Close(system.Kernel());
         }

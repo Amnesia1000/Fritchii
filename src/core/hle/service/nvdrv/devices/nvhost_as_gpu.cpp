@@ -335,6 +335,7 @@ void nvhost_as_gpu::Nx2Sparse(u64 gpu_address, u64 size, bool create) {
             device_address = it->second.second;
             device_size = Common::AlignUp(size, 0x20000);
             nx2_sparse_ranges.erase(it);
+            Nx2ForgetBackedBlocks(gpu_address, size);
         }
         // After the command lists that may still use it. Outside `mutex`, as Nx2Map.
         auto& smmu = system.Host1x().MemoryManager();
@@ -360,6 +361,7 @@ void nvhost_as_gpu::Nx2Sparse(u64 gpu_address, u64 size, bool create) {
             return;
         }
         nx2_sparse_ranges[gpu_address] = {size, device_address};
+        Nx2ForgetBackedBlocks(gpu_address, size); // a new device range: nothing is behind it yet
     }
     // On the GPU thread, as in Nx2Map. Outside `mutex`, as Nx2Map.
     system.GPU().MapInOrder(
@@ -390,8 +392,28 @@ void nvhost_as_gpu::Nx2BackSparse(u64 gpu_address, u64 cpu_address, u64 size) {
     if (size > region_size || gpu_address - start > region_size - size) {
         return;
     }
+    // Already mapped (BackSparse and the replay in Nx2Sparse can both bring the same block).
+    if (const auto backed = nx2_backed_blocks.find(gpu_address);
+        backed != nx2_backed_blocks.end() && backed->second == std::make_pair(cpu_address, size)) {
+        return;
+    }
+    Nx2ForgetBackedBlocks(gpu_address, size);
+    nx2_backed_blocks[gpu_address] = {cpu_address, size};
     system.Host1x().MemoryManager().Map(device_address + (gpu_address - start), cpu_address, size,
                                         session->asid, true);
+}
+
+void nvhost_as_gpu::Nx2ForgetBackedBlocks(u64 gpu_address, u64 size) {
+    auto it = nx2_backed_blocks.lower_bound(gpu_address);
+    if (it != nx2_backed_blocks.begin()) {
+        const auto previous = std::prev(it);
+        if (previous->first + previous->second.second > gpu_address) {
+            it = previous;
+        }
+    }
+    while (it != nx2_backed_blocks.end() && it->first < gpu_address + size) {
+        it = nx2_backed_blocks.erase(it);
+    }
 }
 
 void nvhost_as_gpu::Nx2SparseTile(u64 gpu_address, u64 cpu_address, u64 size) {
@@ -415,6 +437,8 @@ void nvhost_as_gpu::Nx2SparseTile(u64 gpu_address, u64 cpu_address, u64 size) {
         // whose contents are now what the game's memory holds there.
         device = device_address + (gpu_address - start);
         asid = session->asid;
+        // The tile replaces whatever block was behind these pages.
+        Nx2ForgetBackedBlocks(gpu_address, size);
     }
     auto& smmu = system.Host1x().MemoryManager();
     system.GPU().MapInOrder(
