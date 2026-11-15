@@ -4229,11 +4229,21 @@ bool RasterizerVulkan::OneFollowerPostDispatch() {
         !mem_stage.RingRoom() || buffer_cache.MarksAhead()) {
         return lend(Count::NoRing);
     }
+    // E reads the channel's own compute engine, never the rasterizer's `kepler_compute`: R points
+    // that member at its view while it plays a posted dispatch (OneFollowerPlayDispatch), at the
+    // same time as E fills the next one (as `maxwell3d` names R's 3D view on R). Read through the
+    // member, E took a played dispatch's launch description, pools and indirect address into the
+    // next packet: wrong grids, handles and argument buffers (the flashes and GPU stall of
+    // measure\of7-flash-log.txt, once nothing lent kept E and R apart in a compute pass).
+    if (channel_state == nullptr) [[unlikely]] {
+        return lend(Count::Transient);
+    }
+    Tegra::Engines::KeplerCompute& engine = channel_state->kepler_compute;
     const u32 bits = OneF::DispatchPostBits();
     // Bit 4: an indirect dispatch's arguments are read by the GPU only (DispatchIndirect); this
     // path reads them on the CPU nowhere (the frame dump's read is a diagnostic, lent above; the
     // engine's own debug read-back, EDEN_NX2_INDIRECT_GRID=2, ran before this call, on E).
-    const std::optional<GPUVAddr> indirect_address = kepler_compute->GetIndirectComputeAddress();
+    const std::optional<GPUVAddr> indirect_address = engine.GetIndirectComputeAddress();
     if (indirect_address && (bits & OneF::DispatchPostIndirect) == 0) {
         return lend(Count::Indirect);
     }
@@ -4276,7 +4286,7 @@ bool RasterizerVulkan::OneFollowerPostDispatch() {
         hash == DepthReaderShader) {
         return lend_with(Count::Upscaler);
     }
-    const auto& qmd = kepler_compute->launch_description;
+    const auto& qmd = engine.launch_description;
     const std::array<u32, 3> dim{qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z};
     const std::array<u32, 3> max_dim{device.GetMaxComputeWorkGroupCount()};
     if (dim[0] > max_dim[0] || dim[1] > max_dim[1] || dim[2] > max_dim[2]) {
@@ -4284,16 +4294,16 @@ bool RasterizerVulkan::OneFollowerPostDispatch() {
     }
     // The handle values at E's place (Configure takes them from the packet on R).
     const bool null_pointer_handles = VideoCore::Nx2Debug::Experiment(21) != 0;
-    pipeline->MakeHandleValues(*kepler_compute, *gpu_memory, null_pointer_handles,
+    pipeline->MakeHandleValues(engine, *gpu_memory, null_pointer_handles,
                                onef_dispatch_values);
     OneFollowerDispatchView view{};
     std::memcpy(view.launch.data(), &qmd, sizeof(view.launch));
-    const auto& regs = kepler_compute->regs;
+    const auto& regs = engine.regs;
     view.tsc = {regs.tsc.address_high, regs.tsc.address_low, regs.tsc.limit};
     view.tic = {regs.tic.address_high, regs.tic.address_low, regs.tic.limit};
     view.code_loc = {regs.code_loc.address_high, regs.code_loc.address_low};
     view.tex_cb_index = regs.tex_cb_index;
-    view.native = kepler_compute->IsNativeMode() ? 1 : 0;
+    view.native = engine.IsNativeMode() ? 1 : 0;
     view.indirect = indirect_address.value_or(0);
     view.has_indirect = indirect_address ? 1 : 0;
     view.writes_images = writes_images ? 1 : 0;
@@ -4385,6 +4395,39 @@ bool RasterizerVulkan::OneFollowerPostDispatch() {
         OneF::Lend(OneF::LentOp::Dispatch, tail);
     }
     return true;
+}
+
+void RasterizerVulkan::OneFollowerCheckGrids() {
+    namespace OneF = VideoCommon::OneFollower;
+    if (onef_grid_checks.empty()) {
+        return;
+    }
+    const std::array<u32, 3> max_dim{device.GetMaxComputeWorkGroupCount()};
+    std::erase_if(onef_grid_checks, [&](OneFollowerGridCheck& check) {
+        if (!scheduler.IsFree(check.tick)) {
+            return false;
+        }
+        std::array<u32, 3> grid{};
+        std::memcpy(grid.data(), check.ref.mapped_span.data(), sizeof(grid));
+        if (grid[0] > max_dim[0] || grid[1] > max_dim[1] || grid[2] > max_dim[2]) [[unlikely]] {
+            thread_local std::string note;
+            note = fmt::format("{} indirect dispatch of {:016x}: grid {}x{}x{}, limit {}x{}x{}",
+                               check.posted ? "a posted" : "a lent", check.shader, grid[0],
+                               grid[1], grid[2], max_dim[0], max_dim[1], max_dim[2]);
+            if (check.posted) {
+                OneF::Note(OneF::Check::IndirectGridOverLimit, note.c_str());
+                OneF::StopPostDispatch("a posted indirect dispatch's grid over the device limit");
+            } else {
+                OneF::CountDispatch(OneF::DispatchCount::LentGridOverLimit);
+                static std::atomic<u32> logged{};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                    LOG_WARNING(Render_Vulkan, "One follower (dry): {}", note);
+                }
+            }
+        }
+        staging_pool.FreeDeferred(check.ref);
+        return true;
+    });
 }
 
 void RasterizerVulkan::OneFollowerPlayDispatch(ComputePipeline* pipeline, u64 number) {
@@ -5233,8 +5276,46 @@ void RasterizerVulkan::DispatchCompute() {
         scheduler.RequestOutsideRenderPassOperationContext();
         scheduler.NoteComputeWrites();
         scheduler.TraceComputePipeline(pipeline->ShaderHash());
+        // FRITCHII_ONEF_OP_DISPATCH on (one follower, R): the grid words copied on the GPU right
+        // before the dispatch, checked against the device limit once the submission is done
+        // (OneFollowerCheckGrids). Lent ones too: the dry compare.
+        std::optional<StagingBufferRef> grid_copy;
+        if (VideoCommon::OneFollower::On() && VideoCommon::OneFollower::OnRenderThread() &&
+            VideoCommon::OneFollower::DispatchPostBits() != 0) [[unlikely]] {
+            OneFollowerCheckGrids();
+            if (onef_grid_checks.size() < 256) {
+                grid_copy = staging_pool.Request(16, MemoryUsage::Download, true);
+            }
+        }
         scheduler.Record([this, pipeline, indirect_buffer = indirect_ref.buffer,
-                          indirect_offset = indirect_ref.offset](vk::CommandBuffer cmdbuf) {
+                          indirect_offset = indirect_ref.offset,
+                          grid_buffer = grid_copy ? grid_copy->buffer : VkBuffer{},
+                          grid_offset = grid_copy ? grid_copy->offset : VkDeviceSize{}](
+                             vk::CommandBuffer cmdbuf) {
+            if (grid_buffer != VK_NULL_HANDLE) {
+                static constexpr VkMemoryBarrier COPY_READS_WRITES{
+                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+                };
+                static constexpr VkMemoryBarrier HOST_READS_COPY{
+                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+                };
+                cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, COPY_READS_WRITES);
+                const VkBufferCopy copy{
+                    .srcOffset = indirect_offset,
+                    .dstOffset = grid_offset,
+                    .size = 3 * sizeof(u32),
+                };
+                cmdbuf.CopyBuffer(indirect_buffer, grid_buffer, copy);
+                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                                       HOST_READS_COPY);
+            }
             RecordDispatchBarrier(cmdbuf);
             if (!pipeline->IsBound()) {
                 return;
@@ -5243,6 +5324,10 @@ void RasterizerVulkan::DispatchCompute() {
                 cmdbuf.DispatchIndirect(indirect_buffer, indirect_offset);
             });
         });
+        if (grid_copy) {
+            onef_grid_checks.push_back({*grid_copy, scheduler.CurrentTick(),
+                                        pipeline->ShaderHash(), onef_play != nullptr});
+        }
         // A played dispatch's probes and list page copies are E's (a lent tail after the post).
         if (onef_play == nullptr) {
             dispatch_kinds.extent_probes = mem_stage.Ref(MemStage::Site::DispatchAfter, [&] {

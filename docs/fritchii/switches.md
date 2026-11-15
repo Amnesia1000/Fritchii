@@ -1565,6 +1565,15 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
     after `before`, played at the packet's rest after Configure's bind record, as there), the
     packet carries it, E records the 12 bytes for EXP10, R records vkCmdDispatchIndirect. Must
     be 0: "played dispatch indirect" (R's view and the packet disagree on the dispatch).
+    With the switch on, R also copies every indirect dispatch's three grid words on the GPU
+    right before it (a 16-byte download slot) and checks them against the device's workgroup
+    limit once the submission is done: over it on a posted dispatch is the must-be-0
+    "indirect grid over the limit" (seen after the fact; posting stops), on a lent one the dry
+    count "lent indirect grid over the limit (dry)" on the dispatches line (the game's own).
+  Fixed 15 Nov (of7-flash-log, flashes and seconds-long GPU stalls with everything on): E read
+  the rasterizer's `kepler_compute`, which R points at its view while it plays a posted dispatch,
+  so E could fill the next packet with the played dispatch's launch description, pools and
+  indirect address. E now reads the channel's own compute engine.
   So 7 posts everything but the upscaler passes, texel buffers, lookup misses and diagnostics.
   "lent: view not ready" is the window after a channel bind until the next lent packet seeds
   E's tracking and R's view; FRITCHII_ONEF_BIND_SEED=1 seeds inside the lent bind itself and
