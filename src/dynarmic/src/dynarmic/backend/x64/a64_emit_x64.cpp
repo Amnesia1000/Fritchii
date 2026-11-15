@@ -915,7 +915,7 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::PopRSBHint, IR::LocationDescripto
             e.code.mov(dword[e.code.ABI_JIT_PTR + offsetof(A64JitState, rsb_ptr)], eax);
             e.code.cmp(rbx, qword[e.code.ABI_JIT_PTR + offsetof(A64JitState, rsb_location_descriptors) + rax * sizeof(u64)]);
             e.code.jne(e.terminal_handler_fast_dispatch_after_calc);
-            e.code.jmp(qword[e.code.ABI_JIT_PTR + offsetof(A64JitState, rsb_codeptrs) + rax * sizeof(u64)]);
+            e.code.jmp(ptr[e.code.ABI_JIT_PTR + offsetof(A64JitState, rsb_codeptrs) + rax * sizeof(u64)]);
             return true;
         }
         e.code.jmp(e.terminal_handler_pop_rsb_hint);
@@ -946,7 +946,7 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::FastDispatchHint, IR::LocationDes
             e.code.mov(rax, u64(slot));
             e.code.cmp(rbx, qword[rax + offsetof(A64EmitX64::FastDispatchEntry, location_descriptor)]);
             e.code.jne(miss);
-            e.code.jmp(qword[rax + offsetof(A64EmitX64::FastDispatchEntry, code_ptr)]);
+            e.code.jmp(ptr[rax + offsetof(A64EmitX64::FastDispatchEntry, code_ptr)]); // unsized: jmp m64 takes no REX.W (qword fails Xbyak's size check)
             e.code.L(miss);
             e.code.jmp(e.terminal_handler_indirect_slot_miss);
             return true;
