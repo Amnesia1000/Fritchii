@@ -30,6 +30,7 @@
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
+#include "video_core/one_follower.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
@@ -1790,8 +1791,47 @@ void QueryCacheRuntime::SyncValues(std::span<SyncValuesType> values, VkBuffer ba
     // nothing to upload) and only marked the usage; the back copies into those buffers and does
     // not enter the buffer cache (no lock, no bracket: nothing of the cache's is recorded here).
     // A range none of the targets holds is a must-be-0 (PassSyncTarget): today's block then.
+    // One follower (fable_b 16.2): R outside a lent call syncs into the buffers E obtained for
+    // this posted fence and named in it; it never enters the buffer cache (E's, E running). A
+    // range none holds is a must-be-0: not copied, and fences post no more.
+    const bool from_onef = [&] {
+        if (!VideoCommon::OneFollower::OnRenderThread() ||
+            VideoCommon::OneFollower::RenderInLentCall()) [[likely]] {
+            return false;
+        }
+        impl->buffers_to_upload_to.clear();
+        for (const auto& pair : impl->little_cache) {
+            OneFollowerSyncTarget* target = nullptr;
+            if (t_onef_sync_targets != nullptr) {
+                for (auto& candidate : *t_onef_sync_targets) {
+                    if (candidate.begin <= pair.first &&
+                        pair.second <= candidate.begin + candidate.bytes) {
+                        target = &candidate;
+                        break;
+                    }
+                }
+            }
+            if (target == nullptr) [[unlikely]] {
+                thread_local std::string note;
+                note = fmt::format("query values at {:#x}..{:#x} in a posted fence", pair.first,
+                                   pair.second);
+                VideoCommon::OneFollower::Note(VideoCommon::OneFollower::Check::SyncTargetMissing,
+                                               note.c_str());
+                VideoCommon::OneFollower::StopPostFence("a query sync without its target");
+                impl->buffers_to_upload_to.clear();
+                return true;
+            }
+            target->used = true;
+            impl->buffers_to_upload_to.emplace_back(target->buffer,
+                                                    target->offset + (pair.first - target->begin));
+        }
+        return true;
+    }();
+    if (from_onef && impl->buffers_to_upload_to.size() != impl->little_cache.size()) {
+        return; // a missing target: nothing copied (counted above)
+    }
     using Link = VideoCommon::MemoryStageLink;
-    const bool from_record = [&] {
+    const bool from_record = !from_onef && [&] {
         if (!Link::BackServed()) [[likely]] {
             return false;
         }
@@ -1820,7 +1860,7 @@ void QueryCacheRuntime::SyncValues(std::span<SyncValuesType> values, VkBuffer ba
         link.NoteP3BackSync(true);
         return true;
     }();
-    if (!from_record) {
+    if (!from_record && !from_onef) {
         std::scoped_lock lk(impl->buffer_cache.mutex);
         // The ranges' buffers: what they upload is played before the query cache's own copies.
         std::optional<MemStage::FillPlay> seam{std::in_place, impl->buffer_cache.runtime.Seam(),
@@ -1844,9 +1884,11 @@ void QueryCacheRuntime::SyncValues(std::span<SyncValuesType> values, VkBuffer ba
         for (const auto& value : values) {
             impl->buffer_cache.OutdateReadDownloads(value.address, value.size);
         }
-    } else if (VideoCore::g_read_downloads.load(std::memory_order_acquire) != 0) [[unlikely]] {
+    } else if (!from_onef &&
+               VideoCore::g_read_downloads.load(std::memory_order_acquire) != 0) [[unlikely]] {
         // As above, only with a read download pending (the read download lists alone; the
-        // back is the cache's user for them under the lock, as at a fence commit).
+        // back is the cache's user for them under the lock, as at a fence commit). A posted
+        // fence's: E outdated them when it obtained the targets.
         std::scoped_lock lk(impl->buffer_cache.mutex);
         const Link::BackCacheScope back_cache;
         for (const auto& value : values) {

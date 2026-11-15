@@ -1839,7 +1839,8 @@ bool MemStage::PostPendingOp() {
     namespace OneF = VideoCommon::OneFollower;
     static_assert(static_cast<u8>(Site::InlineUpload) == 15 &&
                       static_cast<u8>(Site::Invalidation) == 10 &&
-                      static_cast<u8>(Site::ListWords) == 7 && static_cast<u8>(Site::Dma) == 14,
+                      static_cast<u8>(Site::ListWords) == 7 && static_cast<u8>(Site::Dma) == 14 &&
+                      static_cast<u8>(Site::Query) == 18,
                   "PostOpSite's site numbers");
     if (!OneF::PostOpSite(static_cast<u8>(pending_site))) {
         return false;

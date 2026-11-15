@@ -252,6 +252,13 @@ private:
     /// made with the mirror started, or any other report, since the last lent fence or wait for
     /// idle (R syncs there with E parked).
     bool onef_sync_owed{};
+    /// E (fable_b 16.2): the 16-byte slots whose values R will sync at the next fence: samples
+    /// reports made with the mirror started (cleared at every fence), payload releases (a
+    /// superset kept until a lent fence: memory already holds their value, they are lent).
+    std::vector<u64> onef_sync_samples;
+    std::vector<u64> onef_sync_payloads;
+    /// E: a lent fence: R synced and landed everything before it, E parked.
+    void OneFollowerFenceLent();
     /// R: inside a posted fence (its closing gather ran on E).
     bool onef_fence_posted{};
     /// E: whether a fence op can be posted now, and the post (0 sync point, 1 reference,

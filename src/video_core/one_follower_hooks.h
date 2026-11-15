@@ -63,6 +63,18 @@ inline void RenderOwned(const char* where) noexcept {
 /// yet, or not R): false at once.
 [[nodiscard]] bool WrittenAheadOfRender(u64 address, u64 size) noexcept;
 
+/// fable_b 13.0, with FRITCHII_ONEF_POST_FENCE: a posted fence may run the reports queued
+/// before it at R's place (a folded fence runs their landings at once), while E is ahead. E's
+/// reads of game memory for the buffer cache (uploads, binds, compares) test their pages: a
+/// page with a report a posted fence lands, not yet played by R, waits for R to play it.
+inline std::atomic<bool> g_report_landing_watch{};
+void WaitReportLanding(u64 address, u64 size) noexcept;
+inline void BeforeEngineRead(u64 address, u64 size) noexcept {
+    if (g_report_landing_watch.load(std::memory_order_relaxed) && Detail::t_engine) [[unlikely]] {
+        WaitReportLanding(address, size);
+    }
+}
+
 /// The buffer cache (E's) is used here: counted on R outside a lent call ("owner on R").
 inline void EngineOwned(const char* where) noexcept {
     if (Detail::t_render) [[unlikely]] {
