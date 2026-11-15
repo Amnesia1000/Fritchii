@@ -4555,6 +4555,7 @@ void Maxwell3D::FrontSendE2cCondition(VideoCommon::GpuSplit& split, FrontState& 
                 fs.dma_snapshots[page] = {position, split.WriterRangeCount(),
                                           split.DispatchWriteCount(), {}, position};
                 split.WatchPage(page);
+                VideoCommon::OneFollower::NoteFrontReadPage(page); // fable_b 27.9's count
             }
         }
     }
@@ -5086,6 +5087,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                         fs.dma_snapshots[page] = {split.SentPosition(), split.WriterRangeCount(),
                                                   split.DispatchWriteCount(), {}};
                         split.WatchPage(page);
+                        VideoCommon::OneFollower::NoteFrontReadPage(page); // fable_b 27.9
                     }
                     memory_manager.ReadBlockUnsafe(source, snap_words.data(), read_bytes);
                     if (ran_verify) {

@@ -281,6 +281,10 @@ inline std::atomic<int> g_onef_op_listkeep{-1};
 inline std::atomic<int> g_onef_op_dma{-1};
 /// FRITCHII_ONEF_OP_DISPATCH (live, default 0): fable_b 13.4 group 6, compute dispatches as posted packets.
 inline std::atomic<int> g_onef_op_dispatch{-1};
+/// FRITCHII_ONEF_DISPATCH_RANGES (live, default 0): fable_b 27.9, a posted image-writing dispatch records its images' guest ranges on E (EXP10) instead of "may write anything".
+inline std::atomic<int> g_onef_dispatch_ranges{-1};
+/// FRITCHII_LIST_COPY_SKIP (live, default 0): fable_b 27.9 item 3, a CPU-written list entry skips the "list writers" wait when no queued writer's noted range touches its pages.
+inline std::atomic<int> g_list_copy_skip{-1};
 /// FRITCHII_ONEF_FLUSH_E (live, default 0): fable_b 17.3 (a), a flush E tests clean is not lent.
 inline std::atomic<int> g_onef_flush_e{-1};
 /// FRITCHII_ONEF_SYNC_MIRROR (live, default 0): fable_b 16.2's samples counter mirror, dry.

@@ -303,7 +303,7 @@ struct Jit::Impl final {
 public:
     Impl(Jit* jit, UserConfig conf)
         : conf(conf)
-        , block_of_code(GenRunCodeCallbacks(conf.callbacks, &GetCurrentBlockThunk, this, conf), JitStateInfo{jit_state}, conf.code_cache_size, GenRCP(conf))
+        , block_of_code(GenRunCodeCallbacks(conf.callbacks, &GetCurrentBlockThunk, this, conf), JitStateInfo{jit_state}, conf.code_cache_size, GenRCP(conf), A64EmitX64::PinSetup(conf))
         , emitter(block_of_code, conf, jit)
         , polyfill_options(GenPolyfillOptions(block_of_code))
     {
@@ -336,6 +336,13 @@ public:
         // Fritchii: FRITCHII_JIT_INDIRECT_CACHE's counters, written by this thread's code.
         if (emitter.indirect_cache_mode != 0 && (++runs_since_counter_look & 0x3ff) == 0) [[unlikely]] {
             emitter.LogIndirectCounters();
+        }
+        // Fritchii: FRITCHII_JIT_VERIFY's must-be-0 count, written by this thread's code.
+        if (emitter.pin_verify && (++runs_since_pin_look & 0x3f) == 0) [[unlikely]] {
+            emitter.LogPinMismatches(jit_state.pin_mismatches);
+        }
+        if (emitter.pin_stats && (++runs_since_pin_look & 0x3ff) == 0) [[unlikely]] {
+            emitter.LogPinStats(jit_state.pin_stats);
         }
         return hr;
     }
@@ -652,6 +659,7 @@ private:
     CodeDump code_dump{conf, block_of_code}; // after the code: written out before it goes
     bool is_executing = false;
     u32 runs_since_counter_look = 0;
+    u32 runs_since_pin_look = 0;
     bool invalidate_entire_cache = false;
     boost::icl::interval_set<u64> invalid_cache_ranges;
     std::mutex invalidation_mutex;

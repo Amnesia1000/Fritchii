@@ -80,6 +80,26 @@ public:
                std::ranges::any_of(info.image_buffer_descriptors,
                                    [](const auto& desc) { return desc.is_written; });
     }
+    /// One follower (FRITCHII_ONEF_DISPATCH_RANGES): calls `visit(raw)` for every written image
+    /// element, in Configure's order (WrittenImages' order), from the values MakeHandleValues
+    /// made (one value per image element, the image descriptors' last). False when there are too
+    /// few values for that.
+    template <typename Visit>
+    bool VisitWrittenImageHandles(std::span<const u32> values, Visit&& visit) const {
+        const size_t count = Shader::NumDescriptors(info.image_descriptors);
+        if (values.size() < count) {
+            return false;
+        }
+        size_t at = values.size() - count;
+        for (const auto& desc : info.image_descriptors) {
+            for (u32 element = 0; element < desc.count; ++element, ++at) {
+                if (desc.is_written) {
+                    visit(values[at]);
+                }
+            }
+        }
+        return true;
+    }
     /// One follower (E): whether a written image is byte-addressed (Configure's packed R16
     /// shadow may apply: it throws on unsupported shapes and makes its own resources).
     [[nodiscard]] bool WritesByteAddressedImages() const noexcept {

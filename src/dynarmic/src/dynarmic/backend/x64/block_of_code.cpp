@@ -203,7 +203,7 @@ bool IsUnderRosetta() {
 
 }  // anonymous namespace
 
-BlockOfCode::BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_code_size, std::function<void(BlockOfCode&)> rcp)
+BlockOfCode::BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_code_size, std::function<void(BlockOfCode&)> rcp, PinConfig pins_)
     : Xbyak::CodeGenerator(total_code_size
 #ifdef DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT
         , Xbyak::DontSetProtectRWE
@@ -214,6 +214,7 @@ BlockOfCode::BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_cod
     , constant_pool(*this, CONSTANT_POOL_SIZE)
     , jsi(jsi)
     , cb(std::move(cb))
+    , pins(std::move(pins_))
 {
     EnableWriting();
     EnsureMemoryCommitted(PRELUDE_COMMIT_SIZE);
@@ -390,6 +391,7 @@ void BlockOfCode::GenRunCode(std::function<void(BlockOfCode&)> rcp) {
     // r14 = page table
     // r13 = fastmem pointer
     rcp(*this);
+    LoadPinnedRegisters();  // Fritchii (FRITCHII_JIT_PIN)
 
     cmp(dword[ABI_JIT_PTR + jsi.offsetof_halt_reason], 0);
     jne(return_to_caller_mxcsr_already_exited, T_NEAR);
@@ -410,6 +412,7 @@ void BlockOfCode::GenRunCode(std::function<void(BlockOfCode&)> rcp) {
     }
 
     rcp(*this);
+    LoadPinnedRegisters();  // Fritchii (FRITCHII_JIT_PIN)
 
     cmp(dword[ABI_JIT_PTR + jsi.offsetof_halt_reason], 0);
     jne(return_to_caller_mxcsr_already_exited, T_NEAR);
@@ -419,15 +422,22 @@ void BlockOfCode::GenRunCode(std::function<void(BlockOfCode&)> rcp) {
     jmp(ABI_PARAM2);
 
     // Dispatcher loop
+    // Fritchii (FRITCHII_JIT_PIN): from here the pins are live, calls out store and reload them.
+    // The stores and reloads make the code to the exit longer than a short jump reaches.
+    SetPinCallHook(true);
+    const LabelType exit_jump = pins.regs.empty() ? T_AUTO : T_NEAR;
 
     align();
     return_from_run_code[0] = getCurr<const void*>();
 
+    if (pins.verify) {
+        CheckPinnedRegisters();
+    }
     cmp(dword[ABI_JIT_PTR + jsi.offsetof_halt_reason], 0);
-    jne(return_to_caller);
+    jne(return_to_caller, exit_jump);
     if (cb.enable_cycle_counting) {
         cmp(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], 0);
-        jng(return_to_caller);
+        jng(return_to_caller, exit_jump);
     }
     cb.LookupBlock.EmitCall(*this);
     jmp(ABI_RETURN);
@@ -435,11 +445,14 @@ void BlockOfCode::GenRunCode(std::function<void(BlockOfCode&)> rcp) {
     align();
     return_from_run_code[MXCSR_ALREADY_EXITED] = getCurr<const void*>();
 
+    if (pins.verify) {
+        CheckPinnedRegisters();
+    }
     cmp(dword[ABI_JIT_PTR + jsi.offsetof_halt_reason], 0);
-    jne(return_to_caller_mxcsr_already_exited);
+    jne(return_to_caller_mxcsr_already_exited, exit_jump);
     if (cb.enable_cycle_counting) {
         cmp(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], 0);
-        jng(return_to_caller_mxcsr_already_exited);
+        jng(return_to_caller_mxcsr_already_exited, exit_jump);
     }
     SwitchMxcsrOnEntry();
     cb.LookupBlock.EmitCall(*this);
@@ -455,6 +468,13 @@ void BlockOfCode::GenRunCode(std::function<void(BlockOfCode&)> rcp) {
     return_from_run_code[MXCSR_ALREADY_EXITED | FORCE_RETURN] = getCurr<const void*>();
     L(return_to_caller_mxcsr_already_exited);
 
+    // Fritchii (FRITCHII_JIT_PIN): the guest registers go back to the state block for the caller.
+    if (pins.verify) {
+        CheckPinnedRegisters();
+    }
+    StorePinnedRegisters();
+    SetPinCallHook(false);
+
     if (cb.enable_cycle_counting) {
         cb.AddTicks.EmitCall(*this, [this](RegList param) {
             mov(param[0], qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_to_run)]);
@@ -469,6 +489,48 @@ void BlockOfCode::GenRunCode(std::function<void(BlockOfCode&)> rcp) {
     ret();
 
     PerfMapRegister(run_code, getCurr(), "dynarmic_dispatcher");
+}
+
+void BlockOfCode::PinsBeforeCall() {
+    if (!pin_call_hook) {
+        return;
+    }
+    // FRITCHII_JIT_VERIFY: guest register writes went to the state block too; a store here would
+    // hide a pinned register that something else changed.
+    if (pins.verify) {
+        CheckPinnedRegisters();
+    } else {
+        StorePinnedRegisters();
+    }
+}
+
+void BlockOfCode::PinsAfterCall() {
+    if (pin_call_hook) {
+        LoadPinnedRegisters();
+    }
+}
+
+void BlockOfCode::StorePinnedRegisters() {
+    for (const PinnedRegister& pin : pins.regs) {
+        mov(qword[ABI_JIT_PTR + pin.state_offset], pin.host);
+    }
+}
+
+void BlockOfCode::LoadPinnedRegisters() {
+    for (const PinnedRegister& pin : pins.regs) {
+        mov(pin.host, qword[ABI_JIT_PTR + pin.state_offset]);
+    }
+}
+
+void BlockOfCode::CheckPinnedRegisters() {
+    for (const PinnedRegister& pin : pins.regs) {
+        Xbyak::Label same;
+        cmp(pin.host, qword[ABI_JIT_PTR + pin.state_offset]);
+        je(same);
+        inc(qword[ABI_JIT_PTR + pins.mismatch_offset]);
+        mov(pin.host, qword[ABI_JIT_PTR + pin.state_offset]);
+        L(same);
+    }
 }
 
 void BlockOfCode::SwitchMxcsrOnEntry() {

@@ -19,6 +19,7 @@
 
 #include "dynarmic/backend/block_range_information.h"
 #include "dynarmic/backend/x64/a64_jitstate.h"
+#include "dynarmic/backend/x64/block_of_code.h"
 #include "dynarmic/backend/x64/emit_x64.h"
 #include "dynarmic/backend/x64/reg_alloc.h"
 #include "dynarmic/frontend/A64/a64_location_descriptor.h"
@@ -155,6 +156,36 @@ public:
     static int IndirectCacheMode();
     /// FRITCHII_JIT_NO_FRAME_POINTER (boot): blocks do not set up rbp (Eden 8e14f07a69's frame).
     static bool OmitFramePointer();
+    /// FRITCHII_JIT_FLAG_BRANCH (boot, 0..2): 1 = a block's If terminal branches on the host flags
+    /// when the guest NZCV it tests was made in the block and the flags were not touched since
+    /// (no reload of NZCV, no sahf); 2 = 1, and the CheckBit terminal (cbz, cbnz, tbz, tbnz,
+    /// exclusive stores) branches on a test of the byte A64SetCheckBit stored. 0 = old code.
+    static int FlagBranchMode();
+    /// FRITCHII_JIT_PIN (boot, Windows): 1 = up to two guest registers (FRITCHII_JIT_PIN_REGS, a
+    /// comma list of sp and x0..x30, default "sp,x0") live in rsi and, with
+    /// FRITCHII_JIT_NO_FRAME_POINTER=1, rbp while generated code runs; the state block gets them
+    /// at every call out and at the exit. FRITCHII_JIT_VERIFY=1 adds the self-check (PinConfig).
+    /// Empty = old code. Built before the emitter: BlockOfCode takes it.
+    static PinConfig PinSetup(const A64::UserConfig& conf);
+    /// FRITCHII_JIT_VERIFY's line, at most once a second (from Jit::Run, on the owner thread).
+    void LogPinMismatches(u64 total);
+    /// FRITCHII_JIT_PIN_STATS (boot): 1 = every guest register read and write in generated code
+    /// counts (inc in the state block), logged every 10 s, to choose FRITCHII_JIT_PIN_REGS. Turns
+    /// FRITCHII_JIT_FLAG_BRANCH off (the inc writes the flags).
+    static bool PinStatsMode();
+    void LogPinStats(const std::array<u64, 64>& counts);
+    /// Code emitter (FRITCHII_JIT_PIN_STATS): counts one read or write of guest register `index`.
+    void EmitPinStat(size_t index, bool write) {
+        if (pin_stats) {
+            code.inc(code.qword[code.ABI_JIT_PTR + offsetof(A64JitState, pin_stats) + sizeof(u64) * (index + (write ? 32 : 0))]);
+        }
+    }
+    void EmitPinnedSet(A64EmitContext& ctx, Xbyak::Reg64 host, const Xbyak::Address& addr, Argument& arg);
+    /// The host register guest register `index` (0..30, 31 = SP) is pinned to, if it is.
+    std::optional<Xbyak::Reg64> PinnedHost(size_t index) const {
+        const int idx = pin_host_index[index];
+        return idx < 0 ? std::nullopt : std::optional<Xbyak::Reg64>{Xbyak::Reg64(idx)};
+    }
     /// A free slot, or nullptr when all are taken (the site then uses the shared handler).
     FastDispatchEntry* AllocateIndirectSlot();
     /// Every slot back to the empty entry; `release`: the sites are gone too (ClearCache).
@@ -177,6 +208,19 @@ public:
     /// Set while InvalidateCacheRanges removes blocks (it empties the slots once, after).
     bool indirect_bulk_invalidation = false;
     bool omit_frame_pointer = false;
+    int flag_branch_mode = 0;
+    /// FRITCHII_JIT_PIN: host register index per guest register (31 = SP), -1 = in the state block.
+    std::array<int, 32> pin_host_index;
+    bool pin_verify = false;
+    bool pin_stats = false;
+    std::array<u64, 64> pin_stats_logged{};
+    s64 pin_stats_log_ns = 0;
+    u64 pin_mismatches_logged = 0;
+    s64 pin_log_ns = 0;
+    /// Set by Emit around its EmitTerminal call (FRITCHII_JIT_FLAG_BRANCH): the If terminal's
+    /// guest NZCV / the CheckBit terminal's ZF are in the host flags at the terminal.
+    bool terminal_nzcv_in_host_flags = false;
+    bool terminal_check_bit_in_host_zf = false;
     static constexpr size_t indirect_slot_capacity = size_t{1} << 18; // 4 MiB per JIT
     std::unique_ptr<FastDispatchEntry[]> indirect_slots;
     size_t indirect_slots_used = 0;

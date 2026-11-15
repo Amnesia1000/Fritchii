@@ -1608,6 +1608,36 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   "lent: view not ready" is the window after a channel bind until the next lent packet seeds
   E's tracking and R's view; FRITCHII_ONEF_BIND_SEED=1 seeds inside the lent bind itself and
   closes it (the line prints both switches).
+- FRITCHII_ONEF_DISPATCH_RANGES (live, default 0; fable_b_one_follower 27.9; with
+  FRITCHII_ONEF_OP_DISPATCH): 1 = dispatches record their image writes for EXP10's dispatch
+  checks by range, not as "may write anything" (which made every front DMA / 0xe2c read of a
+  report page drain, about 2,500 a second against 2 in normal mode):
+  - a posted image-writing dispatch: E reads each written image's descriptor at its place (the
+    TIC entry the handle's index names, TextureHeaderIndex, the view header) and records the
+    image's guest range as the texture cache computes it (its address less the base layer,
+    ImageInfo, CalculateGuestSizeInBytes), translated to device memory. Not one mapped device
+    range, a buffer image, or more than 8 written elements: "may write anything", as before.
+  - a lent dispatch: the lent call records on R with E's recording state (GpuSplit's flag is per
+    thread), so the lent path's own block records its images' backing ranges and confirms (the
+    lent upscaler passes were "unconfirmed", about 115 a second).
+  Must be 0: "dispatch image range": R, after it played the dispatch, reads each descriptor E
+  recorded again and compares (and the number of written images, and an image where E saw none);
+  a difference stops the switch for the session. Counted on the dispatches line: "posted images
+  ranged" / "unbounded", "images wider than E's record" (the texture cache's backing image
+  reaches past the descriptor's range: a view into a larger image; the lent path records the
+  larger one; not a fault), and, with OP_DISPATCH alone, "images on a front read page" (every
+  played image-writing dispatch whose backing image touches a page the front's DMA reads took a
+  snapshot of; fable_b 27.9's count first, expected about 0).
+- FRITCHII_LIST_COPY_SKIP (live, default 0; fable_b_one_follower 27.9 item 3; the front, with the
+  split): the "list writers" wait in DmaPusher::Step for a CPU-written entry that begins between
+  methods, kept only because a copy is queued (CopyWritersPending), is skipped when no writer sent
+  and not yet run has a noted range on the entry's pages and none was unbounded
+  (GpuSplit::WritersMayWriteSince per page; MaxwellDMA::FrontNoteLaunch notes each copy's
+  destination). The deferred check on the back at the entry's place runs for every skipped one
+  (EXP105's sampling does not apply to them): a GPU-written entry is the must-be-0 and stops the
+  switch for the session. The "List writer waits" 10 s line counts the waits by reason (inside a
+  method's data, a copy queued), the answer after the wait, whether a queued writer's range was
+  on the entry's pages, the skips, and the must-be-0, with the switch off too.
 - FRITCHII_ONEF_FLUSH_E (live, default 0; fable_b_one_follower 17.3 (a); step 4): 1 = a
   FlushRegion or MustFlushRegion E tests clean is answered on E, not lent: no page of the range
   GPU-written (E marks those when it fills the writes), none a query's or a posted report's,
