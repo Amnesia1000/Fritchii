@@ -258,6 +258,10 @@ inline std::atomic<int> g_unswizzle_in_place{-1};
 inline std::atomic<int> g_keep_blocks{-1};
 /// FRITCHII_STAGING_RING (boot size, live use, default 0): docs/fritchii/switches.md.
 inline std::atomic<int> g_staging_ring{-1};
+/// FRITCHII_HOSTTIMING_SPIN_BUDGET (live, percent, default 0): docs/fritchii/switches.md.
+inline std::atomic<int> g_hosttiming_spin_budget{-1};
+/// FRITCHII_ONEF_RAISE_AFTER_LEND (live, default 0): docs/fritchii/switches.md.
+inline std::atomic<int> g_onef_raise_after_lend{-1};
 /// FRITCHII_ONEF (boot): one follower step 1, the render thread R (one_follower.h).
 inline std::atomic<int> g_onef{-1};
 /// FRITCHII_ONEF_VIEW (live): step 2, needs FRITCHII_ONEF=1.

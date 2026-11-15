@@ -518,6 +518,12 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_STAGING_RING") {
         return &g_staging_ring;
     }
+    if (name == "FRITCHII_HOSTTIMING_SPIN_BUDGET") {
+        return &g_hosttiming_spin_budget;
+    }
+    if (name == "FRITCHII_ONEF_RAISE_AFTER_LEND") {
+        return &g_onef_raise_after_lend;
+    }
     if (name == "FRITCHII_PROTECT_UNLOCKED") {
         return &Common::g_protect_unlocked;
     }

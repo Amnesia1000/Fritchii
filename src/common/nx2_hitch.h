@@ -42,6 +42,8 @@ enum class Cause : u8 {
     RecompileRepeat, ///< the same, for code another core had compiled already (separate JITs)
     WarmCompile,     ///< EDEN_NX2_JIT_WARM: idle cores compiling what another core compiled
     ImageCreate,     ///< Vulkan images created with their memory (MemoryAllocator::CreateImage)
+    TimerSpin,       ///< the timer thread spinning before a guest timer (EDEN_NX2_EXP75)
+    SlowTimerEvent,  ///< timer thread callbacks of 1 ms or more (core_timing.cpp)
     Count,
 };
 
@@ -51,7 +53,8 @@ inline constexpr std::array<const char*, static_cast<size_t>(Cause::Count)> Caus
     "file read throttle", "file reads", "host map",  "host unmap",   "host protect",
     "recompiling new game code (summed over cores)",
     "recompiling code another core had (summed over cores)",
-    "warm compiles on idle cores", "image creates"};
+    "warm compiles on idle cores", "image creates", "timer thread spin",
+    "timer events over 1 ms"};
 
 struct Counters {
     std::array<std::atomic<u64>, static_cast<size_t>(Cause::Count)> ns{};

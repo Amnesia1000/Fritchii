@@ -685,6 +685,62 @@ void RaisePlayed() {
     GpuSplit::Get().RaisePlayed((std::min)(intended, Floor(played, sent_packets)));
 }
 
+/// FRITCHII_ONEF_RAISE_AFTER_LEND: lends after which `played` was short (E's count, logged).
+std::atomic<u64> g_lend_short{};
+std::atomic<u64> g_lend_short_positions{};
+std::atomic<u64> g_lend_short_logged{};
+std::atomic<u64> g_lend_short_log_ns{};
+
+/// E, after a lend's park. R raises `played` after every packet but a lent one, and its raise
+/// before the lent packet stopped at that packet's floor. A lend made after E's last
+/// EngineConsumed (the frame end op when E goes idle) thus left `played` short of what E and R had
+/// both passed, and nobody raised it until E consumed more: the front, waiting on R's position
+/// before it sends more, waited for the hang watchdog's rescue ("a lost raise of `played`", the
+/// 2.5 s freeze in a Castle Town load). Counted always; with the switch on E raises it here.
+void CheckRaiseAfterLend() {
+    std::atomic_thread_fence(std::memory_order_seq_cst); // as RaisePlayed: pairs with R's store
+    const u64 intended = g.intended.load(std::memory_order_acquire);
+    const u64 played = g.played.load(std::memory_order_acquire);
+    const u64 sent_packets = g.sent_packets.load(std::memory_order_acquire);
+    const u64 target = (std::min)(intended, Floor(played, sent_packets));
+    const u64 now_played = GpuSplit::Get().PlayedNow(std::memory_order_acquire);
+    const int mode = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_raise_after_lend,
+                                                      "FRITCHII_ONEF_RAISE_AFTER_LEND");
+    if (target > now_played) {
+        g_lend_short.fetch_add(1, std::memory_order_relaxed);
+        g_lend_short_positions.fetch_add(target - now_played, std::memory_order_relaxed);
+        if (mode != 0) {
+            RaisePlayed();
+        }
+    }
+    const u64 now = Common::Nx2Hitch::NowNs();
+    u64 last = g_lend_short_log_ns.load(std::memory_order_relaxed);
+    if (last == 0) {
+        g_lend_short_log_ns.compare_exchange_strong(last, now, std::memory_order_relaxed);
+        return;
+    }
+    if (now - last < 10'000'000'000ULL ||
+        !g_lend_short_log_ns.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+        return;
+    }
+    const u64 total = g_lend_short.load(std::memory_order_relaxed);
+    const u64 positions = g_lend_short_positions.exchange(0, std::memory_order_relaxed);
+    const u64 count = total - g_lend_short_logged.exchange(total, std::memory_order_relaxed);
+    if (count == 0) {
+        return;
+    }
+    const double seconds = static_cast<double>(now - last) / 1e9;
+    LOG_INFO(HW_GPU,
+             "One follower raise after lend (FRITCHII_ONEF_RAISE_AFTER_LEND={}) {:.0f} s: {:.1f} "
+             "lends/s left `played` short of what E and R had both passed ({:.0f} ring words "
+             "short on average; {}), {} this session",
+             mode, seconds, static_cast<double>(count) / seconds,
+             static_cast<double>(positions) / static_cast<double>(count),
+             mode != 0 ? "raised after the park" : "left to E's next consumed position or the hang "
+                                                   "watchdog",
+             total);
+}
+
 /// E, after a lend's park: its site's count and time.
 void NoteLendSite(LentOp op, u64 ns) {
     const char* const name = std::exchange(t_lend_site, nullptr);
@@ -1770,6 +1826,7 @@ void Lend(LentOp op, LentReason reason, void (*function)(void*), void* argument)
         EngineWait([&] { return g.played.load(std::memory_order_acquire) >= number; },
                    EWait::Park, number);
     }
+    CheckRaiseAfterLend();
     if (g_trace) [[unlikely]] {
         const u64 now = Common::Nx2Hitch::NowNs();
         g_trace_ring[number % TraceSlots].e_resume = now;
