@@ -261,9 +261,11 @@ void A64EmitX64::ClearCache() {
 }
 
 void A64EmitX64::InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges) {
+    // Fritchii: a slot may hold a block just removed; the table entries go one by one (Unpatch),
+    // the slots all go once after (code removal is rare, they refill from the table).
+    indirect_bulk_invalidation = true;
     InvalidateBasicBlocks(block_ranges.InvalidateRanges(ranges));
-    // Fritchii: a slot may hold a block just removed; the table entries went one by one (Unpatch),
-    // the slots all go (code removal is rare, they refill from the table).
+    indirect_bulk_invalidation = false;
     ClearIndirectSlots(false);
 }
 
@@ -1057,6 +1059,12 @@ void A64EmitX64::Unpatch(const IR::LocationDescriptor& location) {
         code.DisableWriting();
         (*fast_dispatch_table_lookup)(location.Value()) = {};
         code.EnableWriting();
+    }
+    // Fritchii (FRITCHII_JIT_INDIRECT_CACHE): a block removed outside a range invalidation (the
+    // fastmem fault handler's recompile, emit_x64_memory.cpp.inc) may sit in a slot; the slots all
+    // go, as the table entry did.
+    if (!indirect_bulk_invalidation) {
+        ClearIndirectSlots(false);
     }
 }
 
