@@ -201,8 +201,25 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             }
         }
     };
+    // FRITCHII_TC_COLLECT_EVICTABLE (live, default 0; zortos #1731): images this pass may not
+    // delete are skipped before they count against its budget. Without it, 10 or 20 old costly
+    // (ASTC) images at the old end of the list used up a normal or high-priority pass, which then
+    // deleted nothing although deletable images sat right behind them.
+    const bool skip_kept = VideoCore::Nx2Debug::SwitchValue(
+                               VideoCore::Nx2Debug::g_tc_collect_evictable,
+                               "FRITCHII_TC_COLLECT_EVICTABLE") != 0;
+    const auto CanEvict = [this, &high_priority_mode, &aggressive_mode,
+                           &evict_old_costly](const Image& image, bool& must_download) {
+        if (True(image.flags & ImageFlagBits::IsDecoding)) {
+            return false;
+        }
+        must_download = IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap);
+        return !((!aggressive_mode && !evict_old_costly &&
+                  True(image.flags & ImageFlagBits::CostlyLoad)) ||
+                 (!high_priority_mode && must_download));
+    };
     const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode,
-                          &evict_old_costly, out_of_memory](ImageId image_id) {
+                          &CanEvict, skip_kept, out_of_memory](ImageId image_id) {
         if (num_iterations == 0) {
             return true;
         }
@@ -210,14 +227,18 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         if (True(image.flags & ImageFlagBits::CollectPending)) {
             return false; // EXP121: already counted as freed
         }
-        --num_iterations;
-        if (True(image.flags & ImageFlagBits::IsDecoding)) {
-            return false;
-        }
-        const bool must_download = IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap);
-        if ((!aggressive_mode && !evict_old_costly && True(image.flags & ImageFlagBits::CostlyLoad)) ||
-            (!high_priority_mode && must_download)) {
-            return false;
+        bool must_download = false;
+        if (skip_kept) {
+            if (!CanEvict(image, must_download)) {
+                ++collect_port_stats.skipped;
+                return false;
+            }
+            --num_iterations;
+        } else {
+            --num_iterations;
+            if (!CanEvict(image, must_download)) {
+                return false;
+            }
         }
         // EXP121 (live, 0 = off): record the download and delete the image at a later frame end,
         // when the GPU has written it out (LandCollectDownloads), instead of waiting here. An
@@ -260,6 +281,18 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             if (True(image.flags & ImageFlagBits::Tracked)) {
                 UntrackImage(image, image_id);
             }
+            // FRITCHII_TC_COLLECT_EVICTABLE: the block's fill stays current between the 60-frame
+            // refreshes, so later passes still find the emptiest blocks.
+            if constexpr (requires(const Image& img) { img.MemoryBlock(); }) {
+                if (skip_kept) {
+                    const auto block = image.MemoryBlock();
+                    const auto it = block.block != 0 ? block_image_bytes.find(block.block)
+                                                     : block_image_bytes.end();
+                    if (it != block_image_bytes.end()) {
+                        it->second -= (std::min)(it->second, block.size);
+                    }
+                }
+            }
             ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
             collect_port_stats.deleted_aggressive += aggressive_mode ? 1 : 0;
             UnregisterImage(image_id);
@@ -283,11 +316,20 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     // used). Among the oldest candidates (8 per image this pass may delete), those in the
     // emptiest blocks go first, so blocks drain and go back to the driver; placement already
     // prefers the fullest blocks (best fit). Images with memory of their own sit in the middle.
-    const auto Collect = [&] {
+    const auto Collect = [&](u64 age) {
         if constexpr (requires(const Image& image) { image.MemoryBlock(); }) {
             std::vector<ImageId> candidates;
             const size_t limit = num_iterations * 8;
-            lru_cache.ForEachItemBelow(frame_tick - ticks_to_destroy, [&](ImageId image_id) {
+            lru_cache.ForEachItemBelow(frame_tick - age, [&](ImageId image_id) {
+                if (skip_kept) {
+                    // FRITCHII_TC_COLLECT_EVICTABLE: only images this pass may delete.
+                    const Image& image = slot_images[image_id];
+                    bool must_download = false;
+                    if (True(image.flags & ImageFlagBits::CollectPending) ||
+                        !CanEvict(image, must_download)) {
+                        return false;
+                    }
+                }
                 candidates.push_back(image_id);
                 return candidates.size() >= limit;
             });
@@ -325,7 +367,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
                 }
             }
         } else {
-            lru_cache.ForEachItemBelow(frame_tick - ticks_to_destroy, Cleanup);
+            lru_cache.ForEachItemBelow(frame_tick - age, Cleanup);
         }
     };
     Configure(false);
@@ -335,13 +377,19 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     }();
     if (high_priority_mode && old_age != 0 && frame_tick > old_age) {
         evict_old_costly = true;
-        lru_cache.ForEachItemBelow(frame_tick - old_age, Cleanup);
+        if (skip_kept) {
+            // FRITCHII_TC_COLLECT_EVICTABLE: old costly images by block fill too, so their
+            // deletes empty blocks as the other passes' do.
+            Collect(old_age);
+        } else {
+            lru_cache.ForEachItemBelow(frame_tick - old_age, Cleanup);
+        }
         evict_old_costly = false;
     }
-    Collect();
+    Collect(ticks_to_destroy);
     if (out_of_memory || total_used_memory >= critical_memory) {
         Configure(true);
-        Collect();
+        Collect(ticks_to_destroy);
     }
 }
 
