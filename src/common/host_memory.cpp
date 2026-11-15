@@ -381,7 +381,27 @@ public:
 
         const GuestMappingInFlight in_flight;
         const Common::Nx2Hitch::Scope timed{Common::Nx2Hitch::Cause::HostProtect, length}; // before the lock
+        // FRITCHII_PROTECT_UNLOCKED (port of zortos293/Lichii #1780): nearly every call protects
+        // a range inside one mapped view, which VirtualProtect changes whole without the lock.
+        // It refuses a range that reaches a placeholder or a second view (one Map or Unmap is
+        // making or taking apart, or a range across views): those take the lock below, which
+        // gives each view of the range the same flags. Map and Unmap hold the lock across their
+        // kernel calls, which slow down when the game maps memory in bulk (zone changes), and
+        // the write-trap protections, thousands a second, queued behind them. Any interleaving
+        // ends as a Protect done wholly before or after the Map or Unmap: a view in place is the
+        // range's final view, a placeholder sends the call to the locked path.
+        const bool unlocked = ProtectUnlocked();
+        if (unlocked) {
+            DWORD old_flags{};
+            if (VirtualProtect(virtual_base + virtual_offset, length, new_flags, &old_flags)) {
+                NoteProtect(true);
+                return;
+            }
+        }
         std::scoped_lock lock{placeholder_mutex};
+        if (unlocked) {
+            NoteProtect(false);
+        }
         auto [it, end] = placeholders.equal_range({virtual_offset, virtual_end});
         while (it != end) {
             const size_t offset = (std::max)(it->lower(), virtual_offset);
@@ -391,6 +411,46 @@ public:
                 LOG_CRITICAL(HW_Memory, "Failed to change virtual memory protect rules");
             }
             ++it;
+        }
+    }
+
+    /// FRITCHII_PROTECT_UNLOCKED's value, read from the environment on first use.
+    static bool ProtectUnlocked() {
+        int value = g_protect_unlocked.load(std::memory_order_relaxed);
+        if (value < 0) [[unlikely]] {
+            const char* const env = std::getenv("FRITCHII_PROTECT_UNLOCKED");
+            int unset = -1;
+            g_protect_unlocked.compare_exchange_strong(
+                unset, env != nullptr ? std::atoi(env) : 0, std::memory_order_relaxed);
+            value = g_protect_unlocked.load(std::memory_order_relaxed);
+        }
+        return value > 0;
+    }
+
+    /// Counts Protect calls done without the lock and ones that fell back to it, and logs both
+    /// every 10 s while the switch is on (the fallbacks are the calls that still wait).
+    static void NoteProtect(bool without_lock) {
+        static std::atomic<u64> fast{};
+        static std::atomic<u64> locked{};
+        static std::atomic<u64> next_report_ns{};
+        (without_lock ? fast : locked).fetch_add(1, std::memory_order_relaxed);
+        const u64 now = Common::Nx2Hitch::NowNs();
+        u64 due = next_report_ns.load(std::memory_order_relaxed);
+        if (now < due) {
+            return;
+        }
+        constexpr u64 Window = u64{10'000'000'000};
+        if (!next_report_ns.compare_exchange_strong(due, now + Window,
+                                                    std::memory_order_relaxed)) {
+            return;
+        }
+        const u64 fast_count = fast.exchange(0, std::memory_order_relaxed);
+        const u64 locked_count = locked.exchange(0, std::memory_order_relaxed);
+        if (due != 0) {
+            LOG_INFO(HW_Memory,
+                     "Host protect in the last 10 s (FRITCHII_PROTECT_UNLOCKED): {} without the "
+                     "lock, {} took the lock (placeholder or several views)",
+                     fast_count, locked_count);
         }
     }
 
