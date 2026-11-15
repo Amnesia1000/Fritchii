@@ -200,6 +200,14 @@ public:
 
     [[nodiscard]] ComputePipeline* CurrentComputePipeline();
 
+    /// One follower (FRITCHII_ONEF_OP_DISPATCH, E with FRITCHII_ONEF_E_PIPELINE): the compute
+    /// lookup when it is a plain hit: the shader known, its entry built before, no rebuild
+    /// pending or due, nothing to create or retire. Then it does what CurrentComputePipeline
+    /// does for a hit (ComputeShader's checks and hooks included, which may throw) and returns
+    /// the pipeline. Anything else returns nullptr having changed nothing: the dispatch is lent
+    /// and the lent call runs CurrentComputePipeline as before.
+    [[nodiscard]] ComputePipeline* OneFollowerComputePipeline();
+
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                            const VideoCore::DiskResourceLoadCallback& callback);
 

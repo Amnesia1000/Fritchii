@@ -410,6 +410,21 @@ public:
     /// Records the "after" copies of the write extent checks of the dispatch just recorded.
     /// Returns how many it recorded.
     u32 RecordComputeExtentProbes();
+    /// One follower (FRITCHII_ONEF_OP_DISPATCH, E, the lock held): whether
+    /// RecordComputeExtentProbes would record anything (a probe without its "after" copy).
+    [[nodiscard]] bool HasUnrecordedExtentProbes() const noexcept {
+        for (const auto& probe : extent_probes) {
+            if (!probe.after) {
+                return true;
+            }
+        }
+        return false;
+    }
+    /// One follower (E, the lock held): writes to command list pages were noted while collecting
+    /// (Nx2CollectListCopies): Nx2CopyListPages would record copies.
+    [[nodiscard]] bool Nx2HasListCopyRequests() const noexcept {
+        return !nx2_list_copy_requests.empty();
+    }
 
     /// write_extent: how far the program's stores reach past the pointer (native programs).
     void BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,

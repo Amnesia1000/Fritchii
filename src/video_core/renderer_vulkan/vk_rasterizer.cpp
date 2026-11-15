@@ -3966,6 +3966,253 @@ void RasterizerVulkan::OneFollowerPostFence(u8 kind, u32 value) {
     VideoCommon::OneFollower::NoteFencePosted(VideoCommon::OneFollower::PushedNow());
 }
 
+// ---------------------------------------------------------------------------------------------
+// Posted dispatches (FRITCHII_ONEF_OP_DISPATCH; fable_b 11.1 item 5, 13.4 group 6)
+//
+// Who does what (the draw's split, section 3, applied to DispatchCompute):
+// - E, in stream order: the stream's invalidations (FlushCaching), the compute lookup (a plain
+//   hit only: PipelineCache::OneFollowerComputePipeline; its OoT hooks run here, on E's engine,
+//   exactly once), the buffer side by value into ring B (MemStage::FillRingDispatch: uniform and
+//   storage binds, uploads, and the GPU-written marks the storage binds make, so later reads and
+//   flushes on E see them in order), the handle values (E reads game memory at its place), what
+//   R reads of the compute engine (the launch description, the pools, the code address, the
+//   native mode: OneFollowerDispatchView), then the dispatch op naming the packet. E goes on.
+// - R, at the op: takes the packet by name and runs DispatchCompute's played path on its view of
+//   the compute engine: the texture side (image views, samplers, descriptors), the pipeline bind
+//   and vkCmdDispatch. It takes no buffer cache lock and calls nothing of the buffer cache.
+// - Stays lent (each counted, DispatchCount): indirect dispatches (their arguments may be read
+//   back), dispatches that write an image (the texture cache's write records are R's and E's
+//   dispatch-write records need them), texel buffers, the OoT upscaler passes and the depth
+//   reader the replacement keys on, a lookup that is not a plain hit (it may build or retire),
+//   diagnostics, and anything while the view is not seeded. A lent dispatch E looked up already
+//   takes E's pipeline into the lent call (no second lookup, no second run of the hooks).
+// - After the post, two buffer-cache tails that record after the dispatch run lent (E parked, R
+//   past the dispatch): the write extent probes' copies and the command list page copies.
+// - The QMD release after the dispatch is the engine's (SignalFence or Query, as before):
+//   nothing here moves it.
+// - Rule 1 / fable_b 18: the dispatch op packs its spans by difference and clears no dirty flag
+//   on E's engine; the compute lookup reads none.
+
+namespace {
+/// What R's played dispatch reads of E's compute engine, by value (ring B, after the values).
+struct OneFollowerDispatchView {
+    std::array<u32, Tegra::Engines::KeplerCompute::LaunchParams::NUM_LAUNCH_PARAMETERS> launch;
+    std::array<u32, 3> tsc; ///< address high, low, limit
+    std::array<u32, 3> tic;
+    std::array<u32, 2> code_loc;
+    u32 tex_cb_index;
+    u32 native;
+};
+static_assert(sizeof(OneFollowerDispatchView) % 8 == 0);
+static_assert(sizeof(Tegra::Engines::KeplerCompute::LaunchParams) ==
+              sizeof(OneFollowerDispatchView::launch));
+} // Anonymous namespace
+
+bool RasterizerVulkan::OneFollowerPostDispatch() {
+    namespace OneF = VideoCommon::OneFollower;
+    using Count = OneF::DispatchCount;
+    bool off = false;
+    const Count blocker = OneF::PostDispatchBlocker(off);
+    if (off) {
+        return false; // the switch is off: today's lend, uncounted
+    }
+    const auto lend = [](Count why) {
+        OneF::CountDispatch(why);
+        return false;
+    };
+    if (blocker != Count::Count) {
+        return lend(blocker);
+    }
+    // Readers of the dispatch on R or of E's state on R, and the stage's own modes.
+    if (onef_draw->Diagnostic() || Common::DkbFrameTrace::Enabled() || InvalidateBeforeUse() ||
+        (MemStage::VerifyBits() & MemStage::VerifyHandles) != 0 ||
+        VideoCommon::MemStageStats::Enabled() ||
+        VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed) ||
+        VideoCommon::MemoryStageLink::RingActive()) {
+        return lend(Count::Diagnostic);
+    }
+    if (!mem_stage.Packets() || !mem_stage.ValuesByValue() || mem_stage.Ticks() == nullptr ||
+        !mem_stage.RingRoom() || buffer_cache.MarksAhead()) {
+        return lend(Count::NoRing);
+    }
+    if (kepler_compute->GetIndirectComputeAddress()) {
+        return lend(Count::Indirect);
+    }
+    // DispatchCompute's head, E's half: the stream's invalidations before the lookup reads.
+    gpu_memory->FlushCaching();
+    // A throw (a rejected program, a replaced pass) leaves DispatchCompute here on E, as a lent
+    // dispatch's exception is rethrown on E.
+    ComputePipeline* const pipeline = pipeline_cache.OneFollowerComputePipeline();
+    if (pipeline == nullptr) {
+        return lend(Count::LookupMiss); // nothing ran: the lent call looks up
+    }
+    // The lookup ran here: a lend from now on takes this pipeline with it.
+    const auto lend_with = [&](Count why) {
+        onef_dispatch_lent_pipeline = pipeline;
+        OneF::CountDispatch(why);
+        return false;
+    };
+    const MemStage::DispatchFacts facts = pipeline->MemFacts();
+    if (facts.has_texel_buffers) {
+        return lend_with(Count::TexelBuffers);
+    }
+    if (pipeline->WritesImages()) {
+        return lend_with(Count::WritesImage);
+    }
+    // DispatchCompute's own OoT upscaler hooks (the replacement, its 3/4-scale pass, the depth
+    // reader TryOcarinaUpscale keys on): R's members decide them, lent.
+    constexpr u64 ThreeQuarterShader = 0xef542df87cacfe9eULL;
+    constexpr u64 DepthReaderShader = 0x1fc7a0423116281fULL;
+    const u64 hash = pipeline->ShaderHash();
+    if (pipeline->CanReplaceOcarinaUpscale() || hash == ComputePipeline::OcarinaFullSizeShader ||
+        hash == ComputePipeline::Ocarina1440pShader || hash == ThreeQuarterShader ||
+        hash == DepthReaderShader) {
+        return lend_with(Count::Upscaler);
+    }
+    const auto& qmd = kepler_compute->launch_description;
+    const std::array<u32, 3> dim{qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z};
+    const std::array<u32, 3> max_dim{device.GetMaxComputeWorkGroupCount()};
+    if (dim[0] > max_dim[0] || dim[1] > max_dim[1] || dim[2] > max_dim[2]) {
+        return lend_with(Count::Dimensions);
+    }
+    // The handle values at E's place (Configure takes them from the packet on R).
+    const bool null_pointer_handles = VideoCore::Nx2Debug::Experiment(21) != 0;
+    pipeline->MakeHandleValues(*kepler_compute, *gpu_memory, null_pointer_handles,
+                               onef_dispatch_values);
+    OneFollowerDispatchView view{};
+    std::memcpy(view.launch.data(), &qmd, sizeof(view.launch));
+    const auto& regs = kepler_compute->regs;
+    view.tsc = {regs.tsc.address_high, regs.tsc.address_low, regs.tsc.limit};
+    view.tic = {regs.tic.address_high, regs.tic.address_low, regs.tic.limit};
+    view.code_loc = {regs.code_loc.address_high, regs.code_loc.address_low};
+    view.tex_cb_index = regs.tex_cb_index;
+    view.native = kepler_compute->IsNativeMode() ? 1 : 0;
+    const u64 position = VideoCommon::GpuSplit::Get().BackEntryPosition();
+    u64 number = 0;
+    bool list_copies = false;
+    bool probes = false;
+    {
+        std::scoped_lock lock{buffer_cache.mutex};
+        SCOPE_EXIT {
+            mem_stage.EndStageFill(); // E's mark, however the fill ended
+        };
+        // As DispatchCompute: writes to command list pages are noted while the binds mark.
+        buffer_cache.Nx2CollectListCopies(true);
+        number = mem_stage.FillRingDispatch(buffer_cache, facts, position, onef_dispatch_values,
+                                            null_pointer_handles, &view, sizeof(view));
+        if (number != 0) {
+            list_copies = buffer_cache.Nx2HasListCopyRequests();
+            probes = buffer_cache.HasUnrecordedExtentProbes();
+        }
+        if (!list_copies) {
+            buffer_cache.Nx2CollectListCopies(false);
+        }
+    }
+    if (number == 0) {
+        return lend_with(Count::FillRefused); // nothing filled: the lent call fills
+    }
+    // EXP10: the dispatch's buffer writes were recorded by the fill's marks on E; it writes no
+    // image and is direct, so nothing else is added (DispatchCompute's block after Configure).
+    if (VideoCommon::GpuSplit::RecordingDispatch()) {
+        VideoCommon::GpuSplit::Get().ConfirmDispatch();
+    }
+    struct Op {
+        RasterizerVulkan* self;
+        ComputePipeline* pipeline;
+        u64 number;
+    } const op{this, pipeline, number};
+    OneF::SetLendSite("DispatchCompute (posted)");
+    OneF::PushOp(
+        OneF::LentOp::Dispatch,
+        [](void* raw) {
+            Op a;
+            std::memcpy(&a, raw, sizeof(a));
+            a.self->OneFollowerPlayDispatch(a.pipeline, a.number);
+        },
+        &op, sizeof(op));
+    OneF::CountDispatch(Count::Posted);
+    if (list_copies || probes) [[unlikely]] {
+        // The buffer cache's records after the dispatch, in DispatchCompute's order (the probes'
+        // "after" copies, then the list page copies and their submit), lent: R has played the
+        // dispatch when it runs them, E parked.
+        OneF::CountDispatch(list_copies ? Count::TailListCopies : Count::TailProbes);
+        if (list_copies && probes) {
+            OneF::CountDispatch(Count::TailProbes);
+        }
+        auto tail = [this, list_copies, probes, hash] {
+            std::scoped_lock lock{buffer_cache.mutex};
+            if (probes) {
+                static_cast<void>(mem_stage.Ref(MemStage::Site::DispatchAfter, [&] {
+                    return buffer_cache.RecordComputeExtentProbes();
+                }));
+            }
+            if (list_copies) {
+                static_cast<void>(SubmitNx2ListCopies(hash)); // on R: runs in place
+            }
+            buffer_cache.Nx2CollectListCopies(false);
+        };
+        OneF::SetLendSite("DispatchCompute (posted, tail)");
+        OneF::Lend(OneF::LentOp::Dispatch, tail);
+    }
+    return true;
+}
+
+void RasterizerVulkan::OneFollowerPlayDispatch(ComputePipeline* pipeline, u64 number) {
+    namespace OneF = VideoCommon::OneFollower;
+    OneFollowerDispatchView view;
+    if (mem_stage.TakeRingDispatch(number, &view, sizeof(view)) == nullptr) {
+        // "ring B pairing" counted: the two sides disagree on the stream. Nothing is held.
+        OneF::StopPostDispatch("a dispatch op found another packet at ring B's head");
+        return;
+    }
+    // However this ends, the packet is played whole: the cache believes its uploads recorded.
+    const MemStage::RestAtEnd rest{mem_stage};
+    if (channel_state == nullptr || gpu_memory == nullptr) [[unlikely]] {
+        OneF::Note(OneF::Check::PlayedDispatch, "a played dispatch with no channel bound");
+        OneF::StopPostDispatch("a played dispatch with no channel bound");
+        return;
+    }
+    // R's view of the compute engine: what the played path reads of it, from E's packet.
+    if (!onef_kepler_view || onef_kepler_view_memory != gpu_memory) {
+        onef_kepler_view = std::make_unique<Tegra::Engines::KeplerCompute>(*gpu_memory);
+        onef_kepler_view_memory = gpu_memory;
+    }
+    Tegra::Engines::KeplerCompute& engine = *onef_kepler_view;
+    std::memcpy(&engine.launch_description, view.launch.data(), sizeof(view.launch));
+    engine.regs.tsc.address_high = view.tsc[0];
+    engine.regs.tsc.address_low = view.tsc[1];
+    engine.regs.tsc.limit = view.tsc[2];
+    engine.regs.tic.address_high = view.tic[0];
+    engine.regs.tic.address_low = view.tic[1];
+    engine.regs.tic.limit = view.tic[2];
+    engine.regs.code_loc.address_high = view.code_loc[0];
+    engine.regs.code_loc.address_low = view.code_loc[1];
+    engine.regs.tex_cb_index = view.tex_cb_index;
+    engine.SetViewNativeMode(view.native != 0);
+    // The R-owned objects that read the compute engine name the view for this dispatch (the
+    // pipeline cache does not look up here: the packet carries E's pipeline).
+    Tegra::Engines::KeplerCompute* const saved_rasterizer = ExchangeKeplerCompute(&engine);
+    Tegra::Engines::KeplerCompute* const saved_texture = texture_cache.ExchangeKeplerCompute(&engine);
+    onef_dispatch_play = pipeline;
+    SCOPE_EXIT {
+        onef_dispatch_play = nullptr;
+        texture_cache.ExchangeKeplerCompute(saved_texture);
+        ExchangeKeplerCompute(saved_rasterizer);
+    };
+    try {
+        DispatchCompute();
+    } catch (const std::exception& error) {
+        // The lent path would throw to E's engine (a skipped dispatch); R cannot.
+        thread_local std::string note;
+        note = fmt::format("a played dispatch threw: {}", error.what());
+        OneF::Note(OneF::Check::PlayedDispatch, note.c_str());
+        OneF::StopPostDispatch("a played dispatch threw");
+    } catch (...) {
+        OneF::Note(OneF::Check::PlayedDispatch, "a played dispatch threw");
+        OneF::StopPostDispatch("a played dispatch threw");
+    }
+}
+
 void RasterizerVulkan::DrawTexture() {
     if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
         OneFollowerMirrorDraw();
@@ -4455,8 +4702,21 @@ void RasterizerVulkan::DispatchCompute() {
     // Off: one load and a branch.
     VideoCommon::GpuSplit::DelayWorkIf(VideoCore::Nx2Debug::g_delay_dispatch_us,
                                        VideoCommon::GpuSplit::DelayTest::Dispatch);
+    // FRITCHII_ONEF_OP_DISPATCH ("Posted dispatches" below): E posts the dispatch, or lends it
+    // with the pipeline it looked up already.
+    // (Not again for a lend run in place, R stopping: its pipeline is set.)
+    if (VideoCommon::OneFollower::ShouldLend() && onef_dispatch_lent_pipeline == nullptr &&
+        OneFollowerPostDispatch()) [[unlikely]] {
+        return;
+    }
     ONEF_LEND(Dispatch, DispatchCompute())
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Compute};
+    // One follower: R plays a posted dispatch (E ran the stream's invalidations, the lookup and
+    // the buffer side; the held ring B packet is the fill), or runs a lent one whose pipeline E
+    // looked up (its hooks ran on E: no second lookup). A played dispatch touches no part of the
+    // buffer cache below (E's, E running): every buffer-side step tests `onef_play`.
+    ComputePipeline* const onef_play = onef_dispatch_play;
+    ComputePipeline* const onef_lent = std::exchange(onef_dispatch_lent_pipeline, nullptr);
     t_in_dispatch = true;
     SCOPE_EXIT {
         t_in_dispatch = false;
@@ -4465,7 +4725,9 @@ void RasterizerVulkan::DispatchCompute() {
         gpu.InvalidateGPUCache();
     }
     FlushWork();
-    gpu_memory->FlushCaching();
+    if (onef_play == nullptr) {
+        gpu_memory->FlushCaching();
+    }
     if (frame_dump.Capturing()) {
         frame_dump.EndPass();
         frame_dump.DrainIfFull();
@@ -4475,6 +4737,12 @@ void RasterizerVulkan::DispatchCompute() {
     }
 
     ComputePipeline* const pipeline{[&] {
+        if (onef_play != nullptr) {
+            return onef_play;
+        }
+        if (onef_lent != nullptr) {
+            return onef_lent;
+        }
         const VideoCommon::Nx2Profile::Scope lookup_scope{
             VideoCommon::Nx2Profile::Zone::ComputeLookup};
         try {
@@ -4508,7 +4776,15 @@ void RasterizerVulkan::DispatchCompute() {
         VideoCommon::MemStageStats::Dispatch();
         VideoCommon::MemStageStats::ComputeProgram(pipeline->ShaderHash());
     }
-    std::scoped_lock lock{texture_cache.mutex, buffer_cache.mutex};
+    // A played dispatch takes only the texture cache's lock: the buffer cache's is E's (R waiting
+    // for it outside a lent call is the "R waits for E's lock" must-be-0).
+    std::unique_lock texture_lock{texture_cache.mutex, std::defer_lock};
+    std::unique_lock buffer_lock{buffer_cache.mutex, std::defer_lock};
+    if (onef_play == nullptr) {
+        std::lock(texture_lock, buffer_lock);
+    } else {
+        texture_lock.lock();
+    }
     // fable_memstage_compute_brief 3 (GPU profile 2): the dispatch by what its fill marks (the
     // cache's lock is held from here to the end), and what else it took.
     struct DispatchKinds {
@@ -4518,9 +4794,9 @@ void RasterizerVulkan::DispatchCompute() {
         bool list_copies{};
         bool extent_probes{};
     } dispatch_kinds;
-    const bool count_dispatch = VideoCommon::Nx2Profile::Fine();
-    const u64 marks_before = buffer_cache.nx2_written_marks;
-    const u64 mark_bytes_before = buffer_cache.nx2_written_mark_bytes;
+    const bool count_dispatch = VideoCommon::Nx2Profile::Fine() && onef_play == nullptr;
+    const u64 marks_before = count_dispatch ? buffer_cache.nx2_written_marks : 0;
+    const u64 mark_bytes_before = count_dispatch ? buffer_cache.nx2_written_mark_bytes : 0;
     SCOPE_EXIT {
         if (!count_dispatch) {
             return;
@@ -4557,10 +4833,14 @@ void RasterizerVulkan::DispatchCompute() {
         }
     };
     std::optional<ByteAddressedShadow> byte_addressed_shadow;
-    mem_stage.BeginDispatch();
-    buffer_cache.Nx2CollectListCopies(true);
+    if (onef_play == nullptr) {
+        mem_stage.BeginDispatch();
+        buffer_cache.Nx2CollectListCopies(true);
+    }
     SCOPE_EXIT {
-        buffer_cache.Nx2CollectListCopies(false);
+        if (onef_play == nullptr) {
+            buffer_cache.Nx2CollectListCopies(false);
+        }
         if (byte_addressed_shadow) {
             texture_cache_runtime.RetireByteAddressedShadow(*byte_addressed_shadow);
         }
@@ -4584,7 +4864,10 @@ void RasterizerVulkan::DispatchCompute() {
     // SEAM = 2 (EXP123): the dispatch's buffer side is filled here, before Configure's texture
     // work; Configure plays it and RestAtEnd what is left, however Configure ends (true, false
     // or an exception: the native R16 shadow checks throw).
-    mem_stage.FillDispatch(buffer_cache, pipeline->MemFacts());
+    // A played dispatch's packet is held already (TakeRingDispatch): E filled it.
+    if (onef_play == nullptr) {
+        mem_stage.FillDispatch(buffer_cache, pipeline->MemFacts());
+    }
     bool configured{};
     {
         const MemStage::RestAtEnd rest{mem_stage};
@@ -4594,10 +4877,18 @@ void RasterizerVulkan::DispatchCompute() {
                                          can_replace || marking_effects ? &deferred_bind : nullptr);
     }
     if (!configured) {
+        if (onef_play != nullptr) [[unlikely]] {
+            // R cannot throw back to E's engine (the lent path's "resources unavailable").
+            VideoCommon::OneFollower::Note(VideoCommon::OneFollower::Check::PlayedDispatch,
+                                           "a played dispatch's Configure returned false");
+            VideoCommon::OneFollower::StopPostDispatch("a played dispatch did not configure");
+            return;
+        }
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute resources unavailable");
         return;
     }
-    if (VideoCommon::GpuSplit::RecordingDispatch()) {
+    // A played dispatch: E confirmed it (it writes no image and is direct).
+    if (onef_play == nullptr && VideoCommon::GpuSplit::RecordingDispatch()) {
         // EXP10: the buffer cache recorded the buffers the dispatch marks written; add its
         // images and the indirect arguments ObtainBuffer drops the GPU-written state of.
         auto& split = VideoCommon::GpuSplit::Get();
@@ -4635,8 +4926,10 @@ void RasterizerVulkan::DispatchCompute() {
             flash_watch.NoteDispatch(pipeline->ShaderHash(), written);
         }
     };
-    TracePendingCpuWrites(true, std::array{pipeline->ShaderHash()});
-    if (frame_dump.CapturingSampled()) {
+    if (onef_play == nullptr) {
+        TracePendingCpuWrites(true, std::array{pipeline->ShaderHash()}); // reads the buffer cache
+    }
+    if (frame_dump.CapturingSampled() && onef_play == nullptr) {
         boost::container::small_vector<FrameDump::Sampled, 16> sampled;
         for (const auto& image : pipeline->SampledImages()) {
             sampled.push_back({5, image.tic, &texture_cache.GetImageView(image.id),
@@ -4758,15 +5051,30 @@ void RasterizerVulkan::DispatchCompute() {
             TextureCacheRuntime::CopyByteAddressedShadow(cmdbuf, *byte_addressed_shadow, true);
         }
     });
-    dispatch_kinds.extent_probes = mem_stage.Ref(MemStage::Site::DispatchAfter, [&] {
-        return buffer_cache.RecordComputeExtentProbes();
-    }) != 0;
+    // A played dispatch's probes and list page copies are E's (a lent tail after the post).
+    if (onef_play == nullptr) {
+        dispatch_kinds.extent_probes = mem_stage.Ref(MemStage::Site::DispatchAfter, [&] {
+            return buffer_cache.RecordComputeExtentProbes();
+        }) != 0;
+    }
     if (can_replace || marking_effects) {
         // The deferred native binding may follow DLSS's command buffer bindings.
-        scheduler.InvalidateState();
+        if (onef_play != nullptr && !onef_draw->OnView()) [[unlikely]] {
+            // Rule 2: off the view the state tracker names E's engine's flags. No replacement
+            // ran here (posted dispatches are no upscaler pass and write no image), so the
+            // invalidation is only conservative: skipped, and posting stops.
+            VideoCommon::OneFollower::Note(
+                VideoCommon::OneFollower::Check::PlayedDispatchNoView,
+                "a played dispatch's state invalidation with R off its view");
+            VideoCommon::OneFollower::StopPostDispatch("a played dispatch off the view");
+        } else {
+            scheduler.InvalidateState();
+        }
     }
     compute_since_count_barrier = true;
-    dispatch_kinds.list_copies = SubmitNx2ListCopies(pipeline->ShaderHash());
+    if (onef_play == nullptr) {
+        dispatch_kinds.list_copies = SubmitNx2ListCopies(pipeline->ShaderHash());
+    }
     dispatch_kinds.recorded = true;
     dispatch_kinds.replaced = replacement != nullptr;
 
@@ -5059,6 +5367,11 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType 
                 VideoCommon::OneFollower::Check::RenderNeedsEngineFlush, note.c_str());
             VideoCommon::OneFollower::DisableUnlend(
                 "an unlent draw's image upload needed E's buffer flush");
+            if (onef_dispatch_play != nullptr) {
+                // The same for a posted dispatch's sampled image (FRITCHII_ONEF_OP_DISPATCH).
+                VideoCommon::OneFollower::StopPostDispatch(
+                    "a played dispatch's image upload needed E's buffer flush");
+            }
             std::scoped_lock lock{texture_cache.mutex};
             texture_cache.WriteMemory(addr, size);
         }

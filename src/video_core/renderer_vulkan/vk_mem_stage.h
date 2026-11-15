@@ -603,8 +603,26 @@ public:
                VideoCommon::MemStageShadow::g_program_code_epoch.load(std::memory_order_acquire);
     }
     [[nodiscard]] const DispatchPacket* HeldDispatch() const noexcept {
-        return held == HeldKind::Dispatch ? &dispatch : nullptr;
+        return held == HeldKind::Dispatch ? (held_ring ? &played_dispatch : &dispatch) : nullptr;
     }
+    /// One follower: the held dispatch came from ring B (R plays a posted dispatch E filled).
+    [[nodiscard]] bool HeldDispatchFromRing() const noexcept {
+        return held == HeldKind::Dispatch && held_ring;
+    }
+
+    // One follower, posted dispatches (FRITCHII_ONEF_OP_DISPATCH; vk_mem_stage.cpp, "Ring B
+    // dispatch packets").
+    /// E: the dispatch's buffer side (FillDispatchHere's calls) filled by value into a ring B
+    /// packet of its own kind, with the handle values E read and `view` (`view_bytes`, a multiple
+    /// of 8: what R's play needs of E's compute engine). Returns the packet's number, the name R
+    /// takes it by; 0 = nothing filled or pushed (the caller lends the dispatch).
+    u64 FillRingDispatch(Cache& cache, const DispatchFacts& facts, u64 position,
+                         const std::vector<u32>& values, bool null_pointer_handles,
+                         const void* view, u32 view_bytes);
+    /// R, at the dispatch's op: takes ring B's packet `number` (13.2 R1: by name) and holds it as
+    /// a filled dispatch (Configure plays it, RestAtEnd ends it); copies its view into `view`.
+    /// Null when ring B's head is not that packet ("ring B pairing"): nothing held.
+    const DispatchPacket* TakeRingDispatch(u64 number, void* view, u32 view_bytes);
 
     /// Plays the held packet up to the end of `span` (the old position of that section).
     void PlayHeld(Span span);
@@ -1046,6 +1064,15 @@ private:
     static constexpr u64 RingBytes = u64{4} << 20;
     /// RingHeader::kind of an op packet (fable_b 13.1): 0 pad, 1 draw.
     static constexpr u8 RingKindOp = 2;
+    /// RingHeader::kind of a posted dispatch (FillRingDispatch): RingHeader, DispatchPacket, the
+    /// entries, the handle values, then the view's bytes (`tracker_bytes` holds their size).
+    static constexpr u8 RingKindDispatch = 3;
+    /// R: the dispatch packet it holds from ring B, and its handle values (E's `dispatch` and
+    /// `dispatch_values` are E's while it fills the next one).
+    DispatchPacket played_dispatch{};
+    std::vector<u32> played_dispatch_values;
+    void PushRingDispatch(const std::vector<u32>& values, bool null_pointer_handles,
+                          const void* view, u32 view_bytes, u64 position);
     static_assert(sizeof(RingHeader) % 8 == 0, "op entries are played in place (8-aligned)");
     std::unique_ptr<u8[]> ring_b;
     // Each thread's control fields on their own cache line (step 7: with the window open both

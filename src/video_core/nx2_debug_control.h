@@ -267,6 +267,8 @@ inline std::atomic<int> g_onef_op_inval{-1};
 inline std::atomic<int> g_onef_op_listkeep{-1};
 /// FRITCHII_ONEF_OP_DMA (live, default 0): fable_b 13.4, buffer-to-buffer DMA copies and clears on E, posted.
 inline std::atomic<int> g_onef_op_dma{-1};
+/// FRITCHII_ONEF_OP_DISPATCH (live, default 0): fable_b 13.4 group 6, compute dispatches as posted packets.
+inline std::atomic<int> g_onef_op_dispatch{-1};
 /// FRITCHII_ONEF_FLUSH_E (live, default 0): fable_b 17.3 (a), a flush E tests clean is not lent.
 inline std::atomic<int> g_onef_flush_e{-1};
 /// FRITCHII_ONEF_SYNC_MIRROR (live, default 0): fable_b 16.2's samples counter mirror, dry.

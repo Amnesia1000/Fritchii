@@ -413,6 +413,17 @@ void ComputePipeline::FillHandleValues(MemStage& seam,
     });
 }
 
+void ComputePipeline::MakeHandleValues(const Tegra::Engines::KeplerCompute& kepler_compute,
+                                       Tegra::MemoryManager& gpu_memory, bool null_pointer_handles,
+                                       std::vector<u32>& values) const {
+    values.clear();
+    const auto& qmd{kepler_compute.launch_description};
+    VideoCommon::FillStageHandleValues<true>(
+        info, gpu_memory, VideoCommon::ComputeHandleCbufs<std::remove_cvref_t<decltype(qmd)>>{qmd},
+        device.GetStorageBufferAlignment(), null_pointer_handles,
+        [&values](u32 raw) { values.push_back(raw); });
+}
+
 bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                                 Tegra::MemoryManager& gpu_memory, Scheduler& scheduler,
                                 BufferCache& buffer_cache, TextureCache& texture_cache,
@@ -426,6 +437,9 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     // (MemStage::FillDispatch); its calls below are skipped and its section played in place.
     MemStage& mem_stage = buffer_cache.runtime.Seam();
     const MemStage::DispatchPacket* const held = mem_stage.HeldDispatch();
+    // One follower: a posted dispatch R plays from ring B (nothing below may touch the buffer
+    // cache then: it is E's, E running ahead).
+    const bool ring_held = held != nullptr && mem_stage.HeldDispatchFromRing();
     namespace Profile = VideoCommon::Nx2Profile;
     if (held == nullptr) {
         const Profile::Scope pointers_scope{Profile::Zone::ComputePointers};
@@ -462,7 +476,8 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     // EXP21 value they were made with; made here when no early fill made them.
     const std::vector<u32>* handle_values{};
     bool packet_null_pointers{};
-    if (mem_stage.ValuesByValue()) {
+    // A ring-held dispatch (one follower) always carries E's values, whatever SEAM reads now.
+    if (mem_stage.ValuesByValue() || ring_held) {
         handle_values = mem_stage.HandleValues(true, packet_null_pointers);
         if (handle_values == nullptr) {
             FillHandleValues(mem_stage, kepler_compute, gpu_memory,
@@ -598,7 +613,8 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     }
     texture_cache.FillImageViews(std::span(views.data(), views.size()), true);
     views_scope.reset();
-    if (auto& trace{GetUpscalerTrace()}; trace.enabled && kepler_compute.IsNativeMode()) {
+    // Not for a ring-held dispatch (one follower): the trace reads the buffer cache, E's.
+    if (auto& trace{GetUpscalerTrace()}; trace.enabled && kepler_compute.IsNativeMode() && !ring_held) {
         const u64 frame{trace.frame.load(std::memory_order_relaxed)};
         if (!trace.armed && frame >= trace.first_frame && info.uses_subgroup_shuffles) {
             trace.armed = true;
@@ -743,7 +759,13 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
             buffer_cache.BindHostComputeBuffers();
         }
     }
-    if (buffer_cache.any_buffer_uploaded) {
+    if (ring_held) {
+        // One follower (FRITCHII_ONEF_OP_DISPATCH): R plays a dispatch E filled. The buffer cache
+        // is E's: its "uploaded" mark came in the packet (FillRingDispatch).
+        if ((held->flags & MemStage::PostCopyBarrier) != 0) {
+            mem_stage.PlayPostCopyBarrier();
+        }
+    } else if (buffer_cache.any_buffer_uploaded) {
         buffer_cache.runtime.PostCopyBarrier();
         buffer_cache.any_buffer_uploaded = false;
     }

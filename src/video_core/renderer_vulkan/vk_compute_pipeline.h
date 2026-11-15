@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <functional>
@@ -64,6 +65,21 @@ public:
     void FillHandleValues(MemStage& seam, const Tegra::Engines::KeplerCompute& kepler_compute,
                           Tegra::MemoryManager& gpu_memory, bool null_pointer_handles,
                           bool in_configure);
+
+    /// One follower (FRITCHII_ONEF_OP_DISPATCH, E): the raw handles FillHandleValues makes, in
+    /// the same order, into `values` (E's own vector; the seam's packet is not touched).
+    void MakeHandleValues(const Tegra::Engines::KeplerCompute& kepler_compute,
+                          Tegra::MemoryManager& gpu_memory, bool null_pointer_handles,
+                          std::vector<u32>& values) const;
+    /// One follower (E): whether the program writes an image (a storage image or an image
+    /// buffer), from its info (WrittenImages is the last Configure's, R's).
+    [[nodiscard]] bool WritesImages() const noexcept {
+        return std::ranges::any_of(info.image_descriptors, [](const auto& desc) {
+                   return desc.is_written;
+               }) ||
+               std::ranges::any_of(info.image_buffer_descriptors,
+                                   [](const auto& desc) { return desc.is_written; });
+    }
 
     static constexpr u64 Ocarina1440pShader = 0x6bd913e1f34e83ebULL;
     /// The same output pass at 1:1, run at 1920x1080 in handheld with the Max Resolution add-on.

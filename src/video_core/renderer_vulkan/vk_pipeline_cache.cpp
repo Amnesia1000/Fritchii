@@ -2970,6 +2970,44 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
                      kepler_compute->regs.code_loc.Address() + qmd.program_start, key);
 }
 
+ComputePipeline* PipelineCache::OneFollowerComputePipeline() {
+    // CurrentComputePipeline's hit path only. Everything that translates, creates, rebuilds or
+    // retires (a retire stamps the scheduler's tick, which posted packets R has not recorded yet
+    // would outlive) is left to the lent call: this returns before any of it is touched.
+    const ShaderInfo* const shader{KnownComputeShader()};
+    if (!shader) {
+        return nullptr;
+    }
+    const auto& qmd{kepler_compute->launch_description};
+    const ComputePipelineCacheKey key{
+        .unique_hash = shader->unique_hash,
+        .shared_memory_size = qmd.shared_alloc,
+        .workgroup_size{qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z},
+    };
+    const auto it{compute_cache.find(key)};
+    if (it == compute_cache.end()) {
+        return nullptr;
+    }
+    ComputePipelineCacheEntry& entry{it->second};
+    if (!entry.pipeline || entry.pending ||
+        (entry.pipeline->IsPrecompiled() && entry.pipeline->BuildFailed())) {
+        return nullptr;
+    }
+    // The stale slot test reads the slots (game memory, E's; ReadPointerSlot keeps the values
+    // in the open dispatch packet). Stale: a rebuild is due, lent (the lent lookup reads again).
+    if (!entry.null_pointer_slots.empty() && entry.rebuilds < MaxComputeRebuilds &&
+        StaleNullPointerSlot(entry)) {
+        return nullptr;
+    }
+    // From here as CurrentComputePipeline: ComputeShader's checks and hooks (they may throw:
+    // the dispatch is then rejected or replaced on E, as a lent one's exception is rethrown on
+    // E), then the entry's use.
+    ComputeShaderKnownChecks(shader);
+    entry.last_use_frame = frame_count;
+    entry.dispatched = true;
+    return entry.pipeline.get();
+}
+
 void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                                       const VideoCore::DiskResourceLoadCallback& callback) {
     // Read here, after nx2_switches.txt, and kept for the draws' lookups.

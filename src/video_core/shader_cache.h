@@ -119,6 +119,14 @@ protected:
     /// @return Pointer to a valid shader, nullptr on error
     const ShaderInfo* ComputeShader();
 
+    /// One follower (FRITCHII_ONEF_OP_DISPATCH, E): the current compute shader when it is known
+    /// already (no translation, no hook, nothing written); nullptr otherwise. Then
+    /// ComputeShaderKnownChecks runs ComputeShader's checks and hooks for it, exactly once.
+    [[nodiscard]] const ShaderInfo* KnownComputeShader() const;
+    /// ComputeShader's work for a shader KnownComputeShader found: the trap guards and the OoT
+    /// network, DLSS contract and game DLSS hooks (they throw as ComputeShader's do).
+    void ComputeShaderKnownChecks(const ShaderInfo* shader);
+
     /// @brief Collect the current graphics environments
     /// @param snapshot Take each environment's snapshot (GraphicsEnvironment::TakeSnapshot)
     /// @return Bytes the snapshots copied
@@ -140,6 +148,10 @@ private:
     /// @param addr Start address of the shader, this doesn't cache for region
     /// @return Pointer to a valid shader, nullptr when nothing is found
     ShaderInfo* TryGet(VAddr addr) const;
+
+    /// ComputeShader's hooks once its shader is known (the OoT network bypass, the DLSS contract
+    /// trace, the game's DLSS): they may throw FireEmblemUpscale::DispatchReplaced.
+    void RunComputeHooks(const ShaderInfo* shader);
 
     /// @brief Register in the cache a given entry
     /// @param data Shader to store in the cache
