@@ -543,6 +543,9 @@ void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size,
 /// FRITCHII_ONEF_OP_CLEAR (live; fable_b 13.4 group 3; step 4, the view tracked): clears as render
 /// ops R plays from its view; E runs the clear's FlushCaching first.
 [[nodiscard]] bool PostClears() noexcept;
+/// FRITCHII_ONEF_FLUSH_E (live; fable_b 17.3 (a); step 4): E answers a flush it tests clean
+/// itself instead of lending it (FlushRegion, MustFlushRegion).
+[[nodiscard]] bool FlushOnEngine() noexcept;
 /// E: the view is tracked and seeded at R (a posted op reads it).
 [[nodiscard]] bool ViewReady() noexcept;
 

@@ -245,6 +245,9 @@ private:
     [[nodiscard]] bool OneFollowerInlineWordsOnEngine(GPUVAddr address, size_t copy_size);
     /// E (FRITCHII_ONEF_GATHER_E): applies a gather's buffer half here; false = lend it.
     [[nodiscard]] bool OneFollowerGatherOnEngine(std::span<const std::pair<DAddr, u64>> ranges);
+    /// E (FRITCHII_ONEF_FLUSH_E, fable_b 17.3 (a)): whether a flush of the range would do
+    /// nothing at R's place, from what E can test exactly.
+    [[nodiscard]] bool OneFollowerFlushClean(DAddr addr, u64 size, VideoCommon::CacheType which);
     /// E: fable_b 12.3 fix 3's price (CountLentFence) at a lent fence.
     void OneFollowerCountFence();
     /// E (FRITCHII_ONEF_COPY_E): runs an inline upload here; false = lend it whole.

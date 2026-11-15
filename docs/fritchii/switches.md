@@ -1421,6 +1421,11 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   engine's buffer-to-buffer copies and clears (AccelerateDMA BufferCopy, BufferClear) run on E
   (the buffer cache is E's, the result E's own), their commands posted as op packets (the Dma
   site); the submit after list page copies is a render op. Copies with an image stay lent.
+- FRITCHII_ONEF_FLUSH_E (live, default 0; fable_b_one_follower 17.3 (a); step 4): 1 = a
+  FlushRegion or MustFlushRegion E tests clean is answered on E, not lent: no page of the range
+  GPU-written (E marks those when it fills the writes), none a query's or a posted report's,
+  and for the texture half none an image was ever on with R caught up (R registers the images
+  of the draws it plays). Anything else is lent as before.
 - FRITCHII_ONEF_OP_CLEAR (live, default 0; fable_b_one_follower 13.4 group 3; step 4, view
   tracked): 1 = clears are render ops. E has decided the render enable (DrawManager tests
   ShouldExecute) and runs the clear's FlushCaching; R plays Clear from its view (every clear

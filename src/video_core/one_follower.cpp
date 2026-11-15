@@ -1534,6 +1534,12 @@ bool InvalOnEngine() noexcept {
     return true;
 }
 
+bool FlushOnEngine() noexcept {
+    return g.on && Step() == StepLevel::Unlend &&
+           VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_flush_e,
+                                            "FRITCHII_ONEF_FLUSH_E") != 0;
+}
+
 bool PostClears() noexcept {
     return g.on && Step() == StepLevel::Unlend &&
            VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_op_clear,

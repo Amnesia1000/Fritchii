@@ -4766,8 +4766,43 @@ void RasterizerVulkan::FlushGpuWrittenCommandListPages(std::span<const DAddr> pa
     buffer_cache.Nx2FlushListPages(pages);
 }
 
+bool RasterizerVulkan::OneFollowerFlushClean(DAddr addr, u64 size,
+                                             VideoCommon::CacheType which) {
+    using VideoCommon::CacheType;
+    if (!VideoCommon::OneFollower::FlushOnEngine()) {
+        return false;
+    }
+    // The buffer half: E marks the GPU-written pages when it fills the writes (before the
+    // packets that record them), so a page never marked has nothing to download, at R's place
+    // or anywhere. The gather before a download only orders the guest's writes ahead of it.
+    if (True(which & CacheType::BufferCache) && Tegra::Nx2MayBeGpuWritten(addr, size)) {
+        return false;
+    }
+    // The query half: R marks its filter at a lent report (E parked), E's own filter takes the
+    // reports it posted.
+    if (True(which & CacheType::QueryCache) &&
+        (query_cache.page_filter.Any(addr, size) ||
+         (onef_report_pages != nullptr && onef_report_pages->Any(addr, size)))) {
+        return false;
+    }
+    // The texture half: R registers images (and marks the filter) when it plays the draws that
+    // render to them, so a miss counts only with R caught up (nothing of E's unplayed, R not
+    // marking now).
+    if (True(which & CacheType::TextureCache) &&
+        (VideoCommon::OneFollower::Behind() != 0 || texture_cache.page_filter.Any(addr, size))) {
+        return false;
+    }
+    return true;
+}
+
 void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
     if (addr == 0 || size == 0) {
+        return;
+    }
+    // FRITCHII_ONEF_FLUSH_E (fable_b 17.3 (a)): a flush E tests clean does nothing at R's place:
+    // not lent at all.
+    if (VideoCommon::OneFollower::ShouldLend() && OneFollowerFlushClean(addr, size, which))
+        [[unlikely]] {
         return;
     }
     ONEF_LEND(ReadBack, FlushRegion(addr, size, which))
@@ -4865,6 +4900,11 @@ void RasterizerVulkan::FinishRead(DAddr addr, u64 size) {
 }
 
 bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
+    // FRITCHII_ONEF_FLUSH_E: clean as FlushRegion tests it: nothing to flush.
+    if (VideoCommon::OneFollower::ShouldLend() && OneFollowerFlushClean(addr, size, which))
+        [[unlikely]] {
+        return false;
+    }
     ONEF_LEND_RESULT(ReadBack, MustFlushRegion(addr, size, which))
     if ((True(which & VideoCommon::CacheType::BufferCache)) && MayBeGpuModified(addr, size)) {
         bool modified = false;
