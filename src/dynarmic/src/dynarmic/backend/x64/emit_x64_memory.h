@@ -15,6 +15,7 @@
 #include "dynarmic/backend/x64/a32_emit_x64.h"
 #include "dynarmic/backend/x64/a64_emit_x64.h"
 #include "dynarmic/backend/x64/exclusive_monitor_friend.h"
+#include "dynarmic/common/fritchii_cheap_barriers.h"
 #include "dynarmic/common/spin_lock_x64.h"
 #include "dynarmic/interface/exclusive_monitor.h"
 #include "dynarmic/ir/acc_type.h"
@@ -246,6 +247,14 @@ template<>
 
 template<std::size_t bitsize>
 const void* EmitReadMemoryMov(BlockOfCode& code, int value_idx, const Xbyak::RegExp& addr, bool ordered) {
+    // FRITCHII_JIT_CHEAP_BARRIERS=1 or 2 (zortos293/Lichii #1327): an x86 load is already ordered
+    // before later loads and stores (acquire), and ordered stores are xchg, which drains the store
+    // buffer, so an ordered or exclusive load of up to 64 bits is a plain mov. The locked xadd took
+    // the cache line exclusively on every core that only read it, and faulted on pages that are not
+    // writable. The 128-bit ordered load keeps lock cmpxchg16b.
+    if (bitsize != 128 && ordered && Fritchii::PlainOrderedLoads()) {
+        ordered = false;
+    }
     if (ordered) {
         if constexpr (bitsize != 128) {
             code.xor_(Xbyak::Reg32(value_idx), Xbyak::Reg32(value_idx));
