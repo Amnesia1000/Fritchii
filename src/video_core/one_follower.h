@@ -191,6 +191,9 @@ enum class Check : u8 {
     /// is, the image takes the range again (it uploads at its next use) and step 4 stops for the
     /// session, so every later draw is lent.
     RenderNeedsEngineFlush,
+    /// FRITCHII_ONEF_SYNC_MIRROR (dry): at a samples report, E's mirror of R's "counter
+    /// started" bit (fable_b 16.2) differs from R's streamer.
+    SyncMirror,
     Count,
 };
 
@@ -200,7 +203,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Check::Count)> chec
     "build descriptors", "build render targets", "stream write", "owner on E", "owner on R",
     "build draw params", "build condition", "render packet missing", "drop not plain",
     "facts stale", "played lookup miss", "texture read ahead of R", "ring B pairing",
-    "R waits for E's lock", "R needs E's buffer flush",
+    "R waits for E's lock", "R needs E's buffer flush", "sync mirror",
 };
 
 // --- The packet (E to R) -----------------------------------------------------------------------------
@@ -546,6 +549,11 @@ void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size,
 /// FRITCHII_ONEF_FLUSH_E (live; fable_b 17.3 (a); step 4): E answers a flush it tests clean
 /// itself instead of lending it (FlushRegion, MustFlushRegion).
 [[nodiscard]] bool FlushOnEngine() noexcept;
+/// FRITCHII_ONEF_SYNC_MIRROR (live; fable_b 16.2, dry): E keeps a mirror of R's samples counter
+/// "started" bit and R compares it at every samples report ("sync mirror", must be 0).
+[[nodiscard]] bool SyncMirrorOn() noexcept;
+/// R, at a samples report: E's bit against R's streamer.
+void CountSyncMirror(bool engine_bit, bool render_bit) noexcept;
 /// E: the view is tracked and seeded at R (a posted op reads it).
 [[nodiscard]] bool ViewReady() noexcept;
 

@@ -143,6 +143,8 @@ struct Impl {
     std::atomic<u64> op_bytes{};
     std::array<u64, static_cast<size_t>(OpCount::Count)> op_logged{};
     u64 op_bytes_logged{};
+    std::array<std::atomic<u64>, 3> mirror_count{}; ///< compared, E set R not, R set E not
+    std::array<u64, 3> mirror_logged{};
     std::atomic<u64> fences_lent{};
     std::atomic<u64> fences_with_flush{};
     std::atomic<u64> gathers_lent{};
@@ -648,6 +650,19 @@ void LogQueryKinds() {
              Posted() ? 1 : 0, seconds, rate(0), rate(1), gathers,
              gathers > 0 ? rate(3) / gathers : 0.0);
     g.posting_logged = posting;
+    if (SyncMirrorOn()) {
+        std::array<double, 3> rates{};
+        for (size_t i = 0; i < rates.size(); ++i) {
+            const u64 count = g.mirror_count[i].load(std::memory_order_relaxed);
+            rates[i] = static_cast<double>(count - g.mirror_logged[i]) / seconds;
+            g.mirror_logged[i] = count;
+        }
+        LOG_INFO(HW_GPU,
+                 "One follower sync mirror (fable_b 16.2, FRITCHII_ONEF_SYNC_MIRROR=1) {:.0f} s: "
+                 "samples reports compared {:.0f}/s, E set and R not {:.0f}/s, R set and E not "
+                 "{:.0f}/s (\"sync mirror\" in the checks line, must be 0)",
+                 seconds, rates[0], rates[1], rates[2]);
+    }
     static constexpr std::array<const char*, static_cast<size_t>(OpCount::Count)> op_names{
         "posted", "lent: a sync in a held fill", "lent: inside a draw fill", "lent: no room",
         "lent: no packet ticks"};
@@ -1532,6 +1547,21 @@ bool InvalOnEngine() noexcept {
         });
     }
     return true;
+}
+
+bool SyncMirrorOn() noexcept {
+    return g.on && VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_sync_mirror,
+                                                    "FRITCHII_ONEF_SYNC_MIRROR") != 0;
+}
+
+void CountSyncMirror(bool engine_bit, bool render_bit) noexcept {
+    g.mirror_count[0].fetch_add(1, std::memory_order_relaxed);
+    if (engine_bit == render_bit) {
+        return;
+    }
+    g.mirror_count[engine_bit ? 1 : 2].fetch_add(1, std::memory_order_relaxed);
+    Note(Check::SyncMirror, engine_bit ? "a samples report: E's mirror started, R's counter not"
+                                       : "a samples report: R's counter started, E's mirror not");
 }
 
 bool FlushOnEngine() noexcept {

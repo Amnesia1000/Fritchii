@@ -649,6 +649,13 @@ void QueryCacheBase<Traits>::BindToChannel(s32 id) {
 }
 
 template <typename Traits>
+bool QueryCacheBase<Traits>::ReportMakesPendingSync(QueryType type) const {
+    const auto index = static_cast<size_t>(type);
+    return index < impl->streamers.size() && impl->streamers[index] != nullptr &&
+           impl->streamers[index]->ReportMakesPendingSync();
+}
+
+template <typename Traits>
 bool QueryCacheBase<Traits>::ReportLandsLater(QueryType type) const {
     const auto index = static_cast<size_t>(type);
     return type != QueryType::Payload && index < impl->streamers.size() &&

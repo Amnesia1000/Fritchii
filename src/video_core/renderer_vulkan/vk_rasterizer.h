@@ -234,6 +234,14 @@ private:
     bool onef_condition_may_be_set{};
     /// R: inside a posted clear (FRITCHII_ONEF_OP_CLEAR): E ran its FlushCaching.
     bool onef_clear_posted{};
+    /// E (FRITCHII_ONEF_SYNC_MIRROR, fable_b 16.2): the mirror of R's samples counter "started"
+    /// bit: set by every draw or clear E issues with the count enabled, cleared by a reset.
+    bool onef_samples_started{};
+    /// E -> R for a lent samples report: E's bit at the report (R compares in the lent call).
+    bool onef_mirror_lent_valid{};
+    bool onef_mirror_lent_bit{};
+    /// E: the mirror's update at a draw or clear (the count enable register, E's engine).
+    void OneFollowerMirrorDraw();
     /// E: FRITCHII_ONEF_GATHER_E's runahead condition (logged once per change).
     [[nodiscard]] bool OneFollowerRunaheadOff(const char* where);
     /// E: the pages of the report ops it pushed (FRITCHII_ONEF_QUERY_OPS), for item 2's test.

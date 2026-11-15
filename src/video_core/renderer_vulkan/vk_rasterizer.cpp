@@ -3002,6 +3002,7 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
     // with the verify or, at step 4, fills ring B and pushes it. Before anything below reads
     // `maxwell3d` (it names R's view while R plays a draw).
     if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
+        OneFollowerMirrorDraw();
         OneFollowerLendDraw(is_indexed, instance_count);
         return;
     }
@@ -3340,6 +3341,7 @@ void RasterizerVulkan::DrawIndirect() {
                                        VideoCommon::GpuSplit::DelayTest::Draw);
     // One follower: indirect and list draws stay lent in this branch (their own UnlendKind bits).
     if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
+        OneFollowerMirrorDraw();
         OneFollowerDrawIndirect();
         return;
     }
@@ -3796,7 +3798,17 @@ void RasterizerVulkan::CollectIndirectTrace() {
     }
 }
 
+void RasterizerVulkan::OneFollowerMirrorDraw() {
+    if (VideoCommon::OneFollower::SyncMirrorOn() &&
+        channel_state->maxwell3d.regs.zpass_pixel_count_enable) {
+        onef_samples_started = true;
+    }
+}
+
 void RasterizerVulkan::DrawTexture() {
+    if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
+        OneFollowerMirrorDraw();
+    }
     ONEF_LEND(Draw, DrawTexture())
 
     SCOPE_EXIT {
@@ -3935,6 +3947,9 @@ bool RasterizerVulkan::ClearVolumeSlices(const Framebuffer* framebuffer, u32 fir
 }
 
 void RasterizerVulkan::Clear(u32 layer_count) {
+    if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
+        OneFollowerMirrorDraw(); // a superset: R starts the count only for a clear it cannot defer
+    }
     // FRITCHII_ONEF_OP_CLEAR (fable_b 13.4 group 3): E has decided ShouldExecute (DrawManager)
     // and runs the clear's one E half, FlushCaching, here; the rest is R's (render targets and
     // clear values are view registers, the texture cache and scheduler R's): a render op, its
@@ -4605,6 +4620,9 @@ void RasterizerVulkan::DispatchCompute() {
 void RasterizerVulkan::ResetCounter(VideoCommon::QueryType type) {
     if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
         namespace OneF = VideoCommon::OneFollower;
+        if (type == VideoCommon::QueryType::ZPassPixelCount64) {
+            onef_samples_started = false; // the mirror (fable_b 16.2)
+        }
         OneF::SetQueryKind(OneF::QueryKind::Reset);
         if (OneF::QueryOps()) {
             // fable_b 11.1 item 1(b): a render op, E not parked (nothing comes back).
@@ -4688,13 +4706,23 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                     VideoCommon::QueryPropertiesFlags flags;
                     u32 payload;
                     u32 subreport;
-                } const op{this, gpu_addr, device, type, flags, payload, subreport};
+                    u8 mirror; ///< 0 off, 1 E's bit clear, 2 set (FRITCHII_ONEF_SYNC_MIRROR)
+                } const op{this,  gpu_addr, device, type, flags, payload, subreport,
+                           static_cast<u8>(
+                               OneF::SyncMirrorOn() &&
+                                       type == VideoCommon::QueryType::ZPassPixelCount64
+                                   ? (onef_samples_started ? 2 : 1)
+                                   : 0)};
                 OneF::SetLendSite("Query (posted)");
                 OneF::PushOp(
                     OneF::LentOp::Query,
                     [](void* raw) {
                         Op a;
                         std::memcpy(&a, raw, sizeof(a));
+                        if (a.mirror != 0) {
+                            VideoCommon::OneFollower::CountSyncMirror(
+                                a.mirror == 2, a.self->query_cache.ReportMakesPendingSync(a.type));
+                        }
                         a.self->query_cache.CounterReportAt(a.gpu_addr, a.device, a.type, a.flags,
                                                             a.payload, a.subreport);
                     },
@@ -4703,7 +4731,17 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
             }
         }
     }
+    if (VideoCommon::OneFollower::ShouldLend() && VideoCommon::OneFollower::SyncMirrorOn() &&
+        type == VideoCommon::QueryType::ZPassPixelCount64) [[unlikely]] {
+        onef_mirror_lent_valid = true; // read by R in the lent call (E parked)
+        onef_mirror_lent_bit = onef_samples_started;
+    }
     ONEF_LEND(Query, Query(gpu_addr, type, flags, payload, subreport))
+    if (onef_mirror_lent_valid && VideoCommon::OneFollower::RenderInLentCall()) [[unlikely]] {
+        onef_mirror_lent_valid = false;
+        VideoCommon::OneFollower::CountSyncMirror(onef_mirror_lent_bit,
+                                                  query_cache.ReportMakesPendingSync(type));
+    }
     query_cache.CounterReport(gpu_addr, type, flags, payload, subreport);
 }
 

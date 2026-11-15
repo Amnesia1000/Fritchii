@@ -1426,6 +1426,13 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   GPU-written (E marks those when it fills the writes), none a query's or a posted report's,
   and for the texture half none an image was ever on with R caught up (R registers the images
   of the draws it plays). Anything else is lent as before.
+- FRITCHII_ONEF_SYNC_MIRROR (live, default 0; fable_b_one_follower 16.2, dry): 1 = E keeps a
+  mirror of R's samples counter "started" bit (set by every draw, indirect draw, draw texture
+  or clear E issues with the count enable register on; cleared by a samples counter reset) and
+  R compares it with its streamer at every samples report, posted or lent: must-be-0 "sync
+  mirror", and a 10 s line with the reports compared and the two kinds of mismatch. It prices
+  the by-value query sync of posted fences: the sync needs this mirror exact. Clears count as a
+  superset (R starts the count only for a clear it cannot defer).
 - FRITCHII_ONEF_OP_CLEAR (live, default 0; fable_b_one_follower 13.4 group 3; step 4, view
   tracked): 1 = clears are render ops. E has decided the render enable (DrawManager tests
   ShouldExecute) and runs the clear's FlushCaching; R plays Clear from its view (every clear
