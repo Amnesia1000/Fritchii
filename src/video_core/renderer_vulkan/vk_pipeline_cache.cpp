@@ -2775,28 +2775,30 @@ u32 PipelineCache::OneFollowerLookupCheck(bool shaders_clear, bool blending_clea
             differ |= 1;
         }
     }
-    if (blending_clear || vertex_input_clear) {
+    const bool canonical = canonical_keys && maxwell3d->GetNativeMacroEngine().native_turing;
+    // fable_b 22.4: the blend as the lookup itself judges it. With dynamic blend state the key's
+    // blend part is never rebuilt (nothing to compare); otherwise the clean lookup keeps a key
+    // whose blend registers make the same state (BlendingMatches, canonical for native keys).
+    if (blending_clear && !dynamic_features.has_extended_dynamic_state_3_blend &&
+        (FixedPipelineState::DualSourceBlend(maxwell3d->regs) !=
+             (graphics_key.state.attachment0_dual_source_blend != 0) ||
+         !graphics_key.state.BlendingMatches(maxwell3d->regs, canonical))) {
+        differ |= 2;
+    }
+    if (vertex_input_clear) {
         FixedPipelineState fresh = graphics_key.state;
         flags[Dirty::Blending] = true;
         flags[Dirty::VertexInput] = true;
         flags[Dirty::ViewportSwizzles] = true;
         fresh.Refresh(*maxwell3d, dynamic_features);
-        // As the lookup leaves the key (RefreshGraphicsKey): native keys are canonical, so a
-        // disabled attachment keeps only its write mask and those past the last target are 0.
-        // Compared raw, nearly every check differed in the blend.
-        if (canonical_keys && maxwell3d->GetNativeMacroEngine().native_turing) {
+        // As the lookup leaves the key (RefreshGraphicsKey): native keys are canonical.
+        if (canonical) {
             CanonicalizeKeyState(fresh, dynamic_features);
         }
-        if (blending_clear &&
-            std::memcmp(fresh.attachments.data(), graphics_key.state.attachments.data(),
-                        sizeof(fresh.attachments)) != 0) {
-            differ |= 2;
-        }
-        if (vertex_input_clear &&
-            (std::memcmp(fresh.attributes.data(), graphics_key.state.attributes.data(),
-                         sizeof(fresh.attributes)) != 0 ||
-             std::memcmp(fresh.binding_divisors.data(), graphics_key.state.binding_divisors.data(),
-                         sizeof(fresh.binding_divisors)) != 0)) {
+        if (std::memcmp(fresh.attributes.data(), graphics_key.state.attributes.data(),
+                        sizeof(fresh.attributes)) != 0 ||
+            std::memcmp(fresh.binding_divisors.data(), graphics_key.state.binding_divisors.data(),
+                        sizeof(fresh.binding_divisors)) != 0) {
             differ |= 4;
         }
     }

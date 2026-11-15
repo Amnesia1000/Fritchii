@@ -274,8 +274,27 @@ private:
         u32 subreport;
         bool has_timestamp;
     };
+    /// FRITCHII_ONEF_POST_FENCE_REPORT: the counter fence report a posted fence of kind 7
+    /// makes on R (its CounterReport, then its SignalFence there).
+    struct OneFollowerFenceReport {
+        GPUVAddr gpu_addr;
+        DAddr device;
+        VideoCommon::QueryType type;
+        VideoCommon::QueryPropertiesFlags flags;
+        u32 payload;
+        u32 subreport;
+        u8 mirror; ///< 0 off, 1 E's samples bit clear, 2 set
+    };
     void OneFollowerPostFence(u8 kind, u32 value, std::function<void()>* e_callback = nullptr,
-                              const OneFollowerPayloadNote* note = nullptr);
+                              const OneFollowerPayloadNote* note = nullptr,
+                              const OneFollowerFenceReport* report = nullptr);
+    /// E, under the buffer lock in a Query seam: the buffers for the values R syncs next (16.2),
+    /// null when none are listed; the samples list is cleared (R syncs them there).
+    [[nodiscard]] std::vector<OneFollowerSyncTarget>* OneFollowerSyncTargetsLocked();
+    /// R, after a posted fence or wait for idle: the unused-target check, then frees them.
+    void OneFollowerCloseTargets(std::vector<OneFollowerSyncTarget>* targets);
+    /// E (FRITCHII_ONEF_POST_IDLE): WaitForIdle posted.
+    void OneFollowerPostIdle();
     /// R: the pages of samples reports made where E's mirror had the counter started and R's
     /// had not (E's superset), for the "sync target unused" check of the next posted fence.
     std::vector<u64> onef_superset_pages;

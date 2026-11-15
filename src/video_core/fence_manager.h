@@ -72,6 +72,10 @@ public:
         if constexpr (!can_async_check) {
             TryReleasePendingFences<false>();
         }
+        // One follower (FRITCHII_ONEF_POST_IDLE): a posted wait for idle's grouping ran on E.
+        if (skip_buffer_half) [[unlikely]] {
+            return;
+        }
         // FRITCHII_MEMSTAGE_PASS (fable_stage_levelpoints 6.5): served, this is a passed entry's
         // flush grouping. MARKS_AHEAD off: GPUMem passed it only with no uncommitted flush (rule
         // C): nothing to group, and the back stays out of the buffer cache; a set note there is a

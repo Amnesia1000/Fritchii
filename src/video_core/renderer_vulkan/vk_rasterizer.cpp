@@ -3888,9 +3888,131 @@ void RasterizerVulkan::OneFollowerFenceLent() {
     VideoCommon::OneFollower::NoteFenceLent();
 }
 
+std::vector<OneFollowerSyncTarget>* RasterizerVulkan::OneFollowerSyncTargetsLocked() {
+    if (onef_sync_samples.empty() && onef_sync_payloads.empty()) {
+        return nullptr;
+    }
+    struct Slot {
+        u64 page;
+        bool payload;
+    };
+    std::vector<Slot> slots;
+    for (const u64 address : onef_sync_samples) {
+        slots.push_back({address & ~u64{Core::DEVICE_PAGEMASK}, false});
+    }
+    for (const u64 address : onef_sync_payloads) {
+        slots.push_back({address & ~u64{Core::DEVICE_PAGEMASK}, true});
+    }
+    std::ranges::sort(slots, [](const Slot& a, const Slot& b) {
+        return a.page != b.page ? a.page < b.page : a.payload < b.payload;
+    });
+    auto* const targets = new std::vector<OneFollowerSyncTarget>;
+    buffer_cache.BufferOperations([&] {
+        targets->clear();
+        for (size_t i = 0; i < slots.size();) {
+            // A run of contiguous pages (R groups its values the same way, by page).
+            const u64 begin = slots[i].page;
+            u64 end = begin + Core::DEVICE_PAGESIZE;
+            bool payload_only = true;
+            for (; i < slots.size() && slots[i].page < end + Core::DEVICE_PAGESIZE &&
+                   slots[i].page >= begin;
+                 ++i) {
+                end = (std::max)(end, slots[i].page + Core::DEVICE_PAGESIZE);
+                payload_only = payload_only && slots[i].payload;
+            }
+            const auto [buffer, offset] = buffer_cache.ObtainCPUBuffer(
+                begin, static_cast<u32>(end - begin),
+                VideoCommon::ObtainBufferSynchronize::FullSynchronize,
+                VideoCommon::ObtainBufferOperation::DoNothing);
+            if (buffer != nullptr) {
+                targets->push_back(
+                    {begin, end - begin, buffer->Handle(), offset, payload_only, false});
+            }
+        }
+    });
+    // As SyncValues does (EXP49): read downloads taken before the copies are not the newest.
+    for (const u64 address : onef_sync_samples) {
+        buffer_cache.OutdateReadDownloads(address, 16);
+    }
+    for (const u64 address : onef_sync_payloads) {
+        buffer_cache.OutdateReadDownloads(address, 16);
+    }
+    onef_sync_samples.clear(); // R syncs them there; payloads stay listed (superset)
+    return targets;
+}
+
+void RasterizerVulkan::OneFollowerCloseTargets(std::vector<OneFollowerSyncTarget>* targets) {
+    if (targets != nullptr) {
+        for (const auto& target : *targets) {
+            if (target.used || target.payload) {
+                continue;
+            }
+            // R's counter was stopped at a report E listed (E's mirror superset): nothing to
+            // sync there, explained.
+            if (std::ranges::any_of(onef_superset_pages, [&](u64 page) {
+                    return page >= target.begin && page < target.begin + target.bytes;
+                })) {
+                VideoCommon::OneFollower::CountSyncTargetSuperset();
+                continue;
+            }
+            thread_local std::string note;
+            note = fmt::format("samples sync target {:#x}+{:#x} not used", target.begin,
+                               target.bytes);
+            VideoCommon::OneFollower::Note(VideoCommon::OneFollower::Check::SyncTargetUnused,
+                                           note.c_str());
+        }
+        delete targets;
+    }
+    onef_superset_pages.clear(); // the samples streamer synced here
+}
+
+void RasterizerVulkan::OneFollowerPostIdle() {
+    namespace OneF = VideoCommon::OneFollower;
+    // fable_b 22.3 / 16.2: E needs nothing back from a wait for idle. Its buffer cache parts are
+    // E's at its place, in the single back's order: the query sync's buffers (NotifyWFI's), then
+    // SignalOrdering's grouping of the flushes. R records the barrier and syncs into the named
+    // buffers, skipping the grouping.
+    std::vector<OneFollowerSyncTarget>* targets = nullptr;
+    const bool syncs = !onef_sync_samples.empty() || !onef_sync_payloads.empty();
+    const bool group = buffer_cache.MayHaveUncommittedFlushes() || buffer_cache.AheadDue();
+    if (syncs || group) {
+        std::scoped_lock lock{buffer_cache.mutex};
+        MemStage::FillPlay seam{mem_stage, MemStage::Site::Query};
+        if (syncs) {
+            targets = OneFollowerSyncTargetsLocked();
+        }
+        if (group) {
+            const VideoCommon::MemoryStageLink::BackCacheScope back_cache;
+            buffer_cache.AccumulateFlushes();
+        }
+    }
+    struct Op {
+        RasterizerVulkan* self;
+        std::vector<OneFollowerSyncTarget>* targets;
+    } const op{this, targets};
+    OneF::SetLendSite("WaitForIdle (posted)");
+    OneF::PushOp(
+        OneF::LentOp::ReadBack,
+        [](void* raw) {
+            Op a;
+            std::memcpy(&a, raw, sizeof(a));
+            auto& self = *a.self;
+            self.fence_manager.skip_buffer_half = true;
+            t_onef_sync_targets = a.targets;
+            SCOPE_EXIT {
+                self.fence_manager.skip_buffer_half = false;
+                t_onef_sync_targets = nullptr;
+                self.OneFollowerCloseTargets(a.targets);
+            };
+            self.WaitForIdle();
+        },
+        &op, sizeof(op));
+}
+
 void RasterizerVulkan::OneFollowerPostFence(u8 kind, u32 value,
                                             std::function<void()>* e_callback,
-                                            const OneFollowerPayloadNote* note) {
+                                            const OneFollowerPayloadNote* note,
+                                            const OneFollowerFenceReport* report) {
     namespace OneF = VideoCommon::OneFollower;
     // fable_b 19.6, E at the fence's place in the single back's order: the commit's buffer half,
     // the query sync's buffers (16.2), the callback, the closing gather; then the op.
@@ -3916,57 +4038,19 @@ void RasterizerVulkan::OneFollowerPostFence(u8 kind, u32 value,
             buffer_cache.RefreshUncommittedFlushesNote();
         }
         if (syncs) {
-            struct Slot {
-                u64 page;
-                bool payload;
-            };
-            std::vector<Slot> slots;
-            for (const u64 address : onef_sync_samples) {
-                slots.push_back({address & ~u64{Core::DEVICE_PAGEMASK}, false});
-            }
-            for (const u64 address : onef_sync_payloads) {
-                slots.push_back({address & ~u64{Core::DEVICE_PAGEMASK}, true});
-            }
-            std::ranges::sort(slots, [](const Slot& a, const Slot& b) {
-                return a.page != b.page ? a.page < b.page : a.payload < b.payload;
-            });
-            targets = new std::vector<OneFollowerSyncTarget>;
-            buffer_cache.BufferOperations([&] {
-                targets->clear();
-                for (size_t i = 0; i < slots.size();) {
-                    // A run of contiguous pages (R groups its values the same way, by page).
-                    const u64 begin = slots[i].page;
-                    u64 end = begin + Core::DEVICE_PAGESIZE;
-                    bool payload_only = true;
-                    for (; i < slots.size() && slots[i].page < end + Core::DEVICE_PAGESIZE &&
-                           slots[i].page >= begin;
-                         ++i) {
-                        end = (std::max)(end, slots[i].page + Core::DEVICE_PAGESIZE);
-                        payload_only = payload_only && slots[i].payload;
-                    }
-                    const auto [buffer, offset] = buffer_cache.ObtainCPUBuffer(
-                        begin, static_cast<u32>(end - begin),
-                        VideoCommon::ObtainBufferSynchronize::FullSynchronize,
-                        VideoCommon::ObtainBufferOperation::DoNothing);
-                    if (buffer != nullptr) {
-                        targets->push_back({begin, end - begin, buffer->Handle(), offset,
-                                            payload_only, false});
-                    }
-                }
-            });
-            // As SyncValues does (EXP49): read downloads taken before the copies are not the
-            // newest.
-            for (const u64 address : onef_sync_samples) {
-                buffer_cache.OutdateReadDownloads(address, 16);
-            }
-            for (const u64 address : onef_sync_payloads) {
-                buffer_cache.OutdateReadDownloads(address, 16);
-            }
-            onef_sync_samples.clear(); // R syncs them at this fence; payloads stay (superset)
+            targets = OneFollowerSyncTargetsLocked();
         }
     }
     OneF::CountFenceDecision(committed ? OneF::FenceDecision::PostedWithCommit
                                        : OneF::FenceDecision::Posted);
+    // fable_b 16.4: the query cache's FinishReads, E's half: the reports this fence lands (those
+    // since the last fence, a counter fence report's own) get the guest reads' downloads over
+    // them landed here, so R writes them without waiting for the buffer lock (FinishRead).
+    if (VideoCore::g_read_downloads.load(std::memory_order_acquire) != 0) [[unlikely]] {
+        for (const u64 page : OneF::UnassignedReportPages()) {
+            buffer_cache.FinishReadDownloads(page << 12, u64{1} << 12);
+        }
+    }
     // 19.6 step 2: the callback, here (FRITCHII_ONEF_SEM_E): a SignalFence's (kind 4), the
     // payload write of a synced fence report (kind 5, after its page's landings), the sync
     // point's host increment (kind 3; its guest increment ran before the commit, as there).
@@ -3990,14 +4074,17 @@ void RasterizerVulkan::OneFollowerPostFence(u8 kind, u32 value,
         u8 kind;
         bool committed;
         OneFollowerPayloadNote note;
+        OneFollowerFenceReport report;
     } const op{this, targets, value, kind, committed,
-               note != nullptr ? *note : OneFollowerPayloadNote{}};
+               note != nullptr ? *note : OneFollowerPayloadNote{},
+               report != nullptr ? *report : OneFollowerFenceReport{}};
     OneF::SetLendSite(kind == 0   ? "SignalSyncPoint (posted)"
                       : kind == 1 ? "SignalReference (posted)"
                       : kind == 2 ? "ReleaseFences (posted)"
                       : kind == 3 ? "SignalSyncPoint (posted, increments on E)"
                       : kind == 4 ? "SignalFence (posted, callback on E)"
-                                  : "payload fence (posted, written on E)");
+                      : kind == 5 ? "payload fence (posted, written on E)"
+                                  : "fence report (posted)");
     OneF::PushOp(
         OneF::LentOp::Fence,
         [](void* raw) {
@@ -4013,29 +4100,7 @@ void RasterizerVulkan::OneFollowerPostFence(u8 kind, u32 value,
                 self.fence_manager.skip_buffer_half = false;
                 self.fence_manager.onef_buffer_committed = false;
                 t_onef_sync_targets = nullptr;
-                if (a.targets != nullptr) {
-                    for (const auto& target : *a.targets) {
-                        if (target.used || target.payload) {
-                            continue;
-                        }
-                        // R's counter was stopped at a report E listed (E's mirror superset):
-                        // nothing to sync there, explained.
-                        if (std::ranges::any_of(self.onef_superset_pages, [&](u64 page) {
-                                return page >= target.begin &&
-                                       page < target.begin + target.bytes;
-                            })) {
-                            VideoCommon::OneFollower::CountSyncTargetSuperset();
-                            continue;
-                        }
-                        thread_local std::string note;
-                        note = fmt::format("samples sync target {:#x}+{:#x} not used",
-                                           target.begin, target.bytes);
-                        VideoCommon::OneFollower::Note(
-                            VideoCommon::OneFollower::Check::SyncTargetUnused, note.c_str());
-                    }
-                    delete a.targets;
-                }
-                self.onef_superset_pages.clear(); // the samples streamer synced at this fence
+                self.OneFollowerCloseTargets(a.targets);
             };
             switch (a.kind) {
             case 0:
@@ -4047,6 +4112,21 @@ void RasterizerVulkan::OneFollowerPostFence(u8 kind, u32 value,
                 // An empty callback (3, 4: E ran the increments or the callback).
                 self.fence_manager.SignalReference();
                 break;
+            case 7: {
+                // FRITCHII_ONEF_POST_FENCE_REPORT: the counter report, then its fence
+                // (SignalFence, here on R), as the lent Query ran them.
+                const OneFollowerFenceReport& r = a.report;
+                if (r.mirror != 0) {
+                    const bool render_bit = self.query_cache.ReportMakesPendingSync(r.type);
+                    VideoCommon::OneFollower::CountSyncMirror(r.mirror == 2, render_bit);
+                    if (r.mirror == 2 && !render_bit) {
+                        self.OneFollowerNoteSuperset(r.device);
+                    }
+                }
+                self.query_cache.CounterReportAt(r.gpu_addr, r.device, r.type, r.flags, r.payload,
+                                                 r.subreport);
+                break;
+            }
             case 5:
                 // E wrote the payload: the streamer's pending sync, then the fence.
                 self.query_cache.NotePayloadWritten(a.note.device, a.note.has_timestamp,
@@ -5350,7 +5430,8 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                 OneF::NoteReportPage(*report_device);
             }
             if (type == VideoCommon::QueryType::ZPassPixelCount64) {
-                if (onef_samples_started && report_device && !fence_report) {
+                if (onef_samples_started && report_device &&
+                    (!fence_report || OneF::PostFenceReportOn())) {
                     onef_sync_samples.push_back(*report_device);
                 }
             } else if (type == VideoCommon::QueryType::Payload) {
@@ -5380,6 +5461,29 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                         True(flags & VideoCommon::QueryPropertiesFlags::HasTimeout)};
                     OneF::CountQueryKind(OneF::QueryKind::PayloadFenceOnE);
                     OneFollowerPostFence(5, 0, nullptr, &note);
+                    return;
+                }
+            }
+            // FRITCHII_ONEF_POST_FENCE_REPORT: a clean fence's counter report (one with a
+            // streamer: its value is R's) is posted as the rasterizer's fences are: E's buffer
+            // half, sync buffers (its own value listed above) and gather here, the report and
+            // its fence on R, its page waiting for the op (13.0). EXP33's kept reports and
+            // payload ones (SEM_E's, or lent: one home) stay as they were.
+            if (type != VideoCommon::QueryType::Payload && OneF::PostFenceReportOn() &&
+                VideoCore::Nx2Debug::Experiment(33) == 0 && query_cache.ReportLandsLater(type)) {
+                if (const std::optional<DAddr> device = gpu_memory->GpuToCpuAddress(gpu_addr);
+                    device && OneFollowerFenceClean()) {
+                    if (onef_report_pages == nullptr) [[unlikely]] {
+                        onef_report_pages = std::make_unique<VideoCommon::PageFilter>();
+                    }
+                    onef_report_pages->Mark(*device, 16); // as a posted plain report (item 2)
+                    const OneFollowerFenceReport report{
+                        gpu_addr, *device, type, flags, payload, subreport,
+                        static_cast<u8>(type == VideoCommon::QueryType::ZPassPixelCount64
+                                            ? (onef_samples_started ? 2 : 1)
+                                            : 0)};
+                    OneF::CountQueryKind(OneF::QueryKind::FenceReportPosted);
+                    OneFollowerPostFence(7, 0, nullptr, nullptr, &report);
                     return;
                 }
             }
@@ -5709,6 +5813,28 @@ void RasterizerVulkan::FlushRegionForRead(DAddr addr, u64 size) {
 }
 
 void RasterizerVulkan::FinishRead(DAddr addr, u64 size) {
+    if (onef_fence_posted && VideoCommon::OneFollower::OnRenderThread() &&
+        !VideoCommon::OneFollower::RenderInLentCall()) [[unlikely]] {
+        // fable_b 16.4: R inside a posted fence (its report landings) never waits for the buffer
+        // lock: E landed the downloads over these reports before posting. One still listed (a
+        // guest read since) is landed only with the lock free (R then waits for the host GPU
+        // alone): must be 0 either way.
+        if (VideoCore::g_read_downloads.load(std::memory_order_acquire) == 0) {
+            return;
+        }
+        if (!buffer_cache.mutex.try_lock()) {
+            VideoCommon::OneFollower::Note(VideoCommon::OneFollower::Check::RenderReadLanding,
+                                           "buffer lock busy, landing skipped");
+            return;
+        }
+        const bool landed = buffer_cache.FinishReadDownloads(addr, size).has_value();
+        buffer_cache.mutex.unlock();
+        if (landed) {
+            VideoCommon::OneFollower::Note(VideoCommon::OneFollower::Check::RenderReadLanding,
+                                           "a read download over a report R writes");
+        }
+        return;
+    }
     buffer_cache.FinishReadDownloads(addr, size);
 }
 
@@ -7068,6 +7194,13 @@ void RasterizerVulkan::SignalReference() {
 }
 
 void RasterizerVulkan::ReleaseFences(bool force) {
+    // FRITCHII_ONEF_SOFT_RELEASE_E (fable_b 22.3): a non-forced release (GPU::OnCommandListEnd,
+    // 1,400 a second, the lent "ReleaseFences" site) only waits for fences without a fencing
+    // thread; with one (Vulkan) WaitPendingFences(false) does nothing, so E answers it.
+    if (!force && VideoCommon::OneFollower::ShouldLend() &&
+        VideoCommon::OneFollower::SoftReleaseOnE()) [[unlikely]] {
+        return;
+    }
     if (VideoCommon::OneFollower::ShouldLend() && force) [[unlikely]] {
         if (OneFollowerFenceClean()) {
             OneFollowerPostFence(2, 0);
@@ -7138,6 +7271,12 @@ void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
 
 void RasterizerVulkan::WaitForIdle() {
     if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
+        // FRITCHII_ONEF_POST_IDLE (fable_b 22.3): nothing comes back to E; posted when no
+        // report of another kind owes the query sync (16.2's form).
+        if (VideoCommon::OneFollower::PostIdleOn() && !onef_sync_owed) {
+            OneFollowerPostIdle();
+            return;
+        }
         // Lent: NotifyWFI syncs what is owed, E parked (it lands nothing: no fence).
         onef_sync_owed = false;
         onef_sync_samples.clear();
