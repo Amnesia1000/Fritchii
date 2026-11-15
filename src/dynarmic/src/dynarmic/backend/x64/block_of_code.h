@@ -43,14 +43,26 @@ struct RunCodeCallbacks {
 struct PinnedRegister {
     Xbyak::Reg64 host;
     u32 state_offset;  ///< of the guest register's qword in the state block (ABI_JIT_PTR)
+    u32 shadow_offset = 0;  ///< FRITCHII_JIT_VERIFY=2: of its write-through copy
+    u64 poison = 0;         ///< FRITCHII_JIT_VERIFY=2: what its own slot holds while pinned
 };
 struct PinConfig {
     std::vector<PinnedRegister> regs;  ///< empty = no pinning, old code
-    /// FRITCHII_JIT_VERIFY: guest register writes also go to the state block, and the dispatcher,
+    /// FRITCHII_JIT_VERIFY (1 or 2): guest register writes also go to a copy, and the dispatcher,
     /// the exit and every call out compare each pinned register with it (a mismatch counts at
-    /// mismatch_offset, a qword in the state block, and the state block's value wins).
+    /// mismatch_offset, a qword in the state block, and the copy's value wins).
+    /// =1: the copy is the guest register's own slot (the state block is always current).
     bool verify = false;
+    /// =2 (`shadow`): the copy is a shadow field; the own slot holds `poison` while the pins are
+    /// live and gets the real value only from the store before a call out and at the exit, as
+    /// without verify. Checkpoints also count a slot that lost its poison (slot_written_offset:
+    /// a call out without the reload after it, or a write from outside), and the reload after a
+    /// call out counts reading the poison back (store_missed_offset: no store before the call)
+    /// and takes the shadow's value.
+    bool shadow = false;
     u32 mismatch_offset = 0;
+    u32 slot_written_offset = 0;
+    u32 store_missed_offset = 0;
 };
 
 class BlockOfCode final : public Xbyak::CodeGenerator {
@@ -136,8 +148,14 @@ public:
     /// Code emitter: state block <- pinned registers / pinned registers <- state block.
     void StorePinnedRegisters();
     void LoadPinnedRegisters();
-    /// Code emitter (FRITCHII_JIT_VERIFY): each pinned register that differs from the state
-    /// block's copy counts one mismatch and takes the state block's value. Writes the flags.
+    /// Code emitter (FRITCHII_JIT_VERIFY=2): right after the entries' load, shadows <- pinned
+    /// registers and the own slots <- poison. Nothing in the other modes.
+    void ShadowPinnedRegisters();
+    /// Code emitter (FRITCHII_JIT_VERIFY=2): the reload after a call out (see PinConfig::shadow).
+    void ReloadPinnedRegistersVerified();
+    /// Code emitter (FRITCHII_JIT_VERIFY): each pinned register that differs from its copy (=1
+    /// the state block, =2 the shadow) counts one mismatch and takes the copy's value; =2 also
+    /// counts an own slot without the poison and poisons it again. Writes the flags.
     void CheckPinnedRegisters();
 
     void ZeroExtendFrom(size_t bitsize, Xbyak::Reg64 reg) {

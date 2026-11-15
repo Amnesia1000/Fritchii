@@ -392,6 +392,7 @@ void BlockOfCode::GenRunCode(std::function<void(BlockOfCode&)> rcp) {
     // r13 = fastmem pointer
     rcp(*this);
     LoadPinnedRegisters();  // Fritchii (FRITCHII_JIT_PIN)
+    ShadowPinnedRegisters();
 
     cmp(dword[ABI_JIT_PTR + jsi.offsetof_halt_reason], 0);
     jne(return_to_caller_mxcsr_already_exited, T_NEAR);
@@ -413,6 +414,7 @@ void BlockOfCode::GenRunCode(std::function<void(BlockOfCode&)> rcp) {
 
     rcp(*this);
     LoadPinnedRegisters();  // Fritchii (FRITCHII_JIT_PIN)
+    ShadowPinnedRegisters();
 
     cmp(dword[ABI_JIT_PTR + jsi.offsetof_halt_reason], 0);
     jne(return_to_caller_mxcsr_already_exited, T_NEAR);
@@ -495,17 +497,25 @@ void BlockOfCode::PinsBeforeCall() {
     if (!pin_call_hook) {
         return;
     }
-    // FRITCHII_JIT_VERIFY: guest register writes went to the state block too; a store here would
-    // hide a pinned register that something else changed.
+    // FRITCHII_JIT_VERIFY=1: guest register writes went to the state block too; a store here
+    // would hide a pinned register that something else changed.
     if (pins.verify) {
         CheckPinnedRegisters();
-    } else {
-        StorePinnedRegisters();
+        if (!pins.shadow) {
+            return;
+        }
     }
+    // =2 stores like the code without verify: the callee sees what the shipping code gives it.
+    StorePinnedRegisters();
 }
 
 void BlockOfCode::PinsAfterCall() {
-    if (pin_call_hook) {
+    if (!pin_call_hook) {
+        return;
+    }
+    if (pins.shadow) {
+        ReloadPinnedRegistersVerified();
+    } else {
         LoadPinnedRegisters();
     }
 }
@@ -524,12 +534,61 @@ void BlockOfCode::LoadPinnedRegisters() {
 
 void BlockOfCode::CheckPinnedRegisters() {
     for (const PinnedRegister& pin : pins.regs) {
+        // FRITCHII_JIT_VERIFY=2 compares with the shadow, =1 with the state block.
+        const u32 copy = pins.shadow ? pin.shadow_offset : pin.state_offset;
         Xbyak::Label same;
-        cmp(pin.host, qword[ABI_JIT_PTR + pin.state_offset]);
+        cmp(pin.host, qword[ABI_JIT_PTR + copy]);
         je(same);
         inc(qword[ABI_JIT_PTR + pins.mismatch_offset]);
-        mov(pin.host, qword[ABI_JIT_PTR + pin.state_offset]);
+        mov(pin.host, qword[ABI_JIT_PTR + copy]);
         L(same);
+        if (pins.shadow) {
+            // The own slot must still hold the poison: the last call out's reload poisoned it
+            // again, and nothing in generated code writes it.
+            Xbyak::Label poisoned, written;
+            cmp(dword[ABI_JIT_PTR + pin.state_offset], u32(pin.poison));
+            jne(written);
+            cmp(dword[ABI_JIT_PTR + pin.state_offset + 4], u32(pin.poison >> 32));
+            je(poisoned);
+            L(written);
+            inc(qword[ABI_JIT_PTR + pins.slot_written_offset]);
+            mov(dword[ABI_JIT_PTR + pin.state_offset], u32(pin.poison));
+            mov(dword[ABI_JIT_PTR + pin.state_offset + 4], u32(pin.poison >> 32));
+            L(poisoned);
+        }
+    }
+}
+
+void BlockOfCode::ShadowPinnedRegisters() {
+    if (!pins.shadow) {
+        return;
+    }
+    for (const PinnedRegister& pin : pins.regs) {
+        mov(qword[ABI_JIT_PTR + pin.shadow_offset], pin.host);
+        mov(dword[ABI_JIT_PTR + pin.state_offset], u32(pin.poison));
+        mov(dword[ABI_JIT_PTR + pin.state_offset + 4], u32(pin.poison >> 32));
+    }
+}
+
+void BlockOfCode::ReloadPinnedRegistersVerified() {
+    // After a call out the flags are dead (the callee wrote them); rax (the return value) and
+    // the other caller-saved registers are not touched.
+    for (const PinnedRegister& pin : pins.regs) {
+        Xbyak::Label fresh;
+        mov(pin.host, qword[ABI_JIT_PTR + pin.state_offset]);
+        // Still the poison: the store before this call did not run, so the callee saw the poison
+        // and the value from before the call is only in the shadow.
+        cmp(dword[ABI_JIT_PTR + pin.state_offset], u32(pin.poison));
+        jne(fresh);
+        cmp(dword[ABI_JIT_PTR + pin.state_offset + 4], u32(pin.poison >> 32));
+        jne(fresh);
+        inc(qword[ABI_JIT_PTR + pins.store_missed_offset]);
+        mov(pin.host, qword[ABI_JIT_PTR + pin.shadow_offset]);
+        L(fresh);
+        // A value the callee wrote (SetRegister) is taken as it is, like LoadPinnedRegisters.
+        mov(qword[ABI_JIT_PTR + pin.shadow_offset], pin.host);
+        mov(dword[ABI_JIT_PTR + pin.state_offset], u32(pin.poison));
+        mov(dword[ABI_JIT_PTR + pin.state_offset + 4], u32(pin.poison >> 32));
     }
 }
 
