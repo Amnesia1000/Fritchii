@@ -56,6 +56,13 @@ class RasterizerInterface;
 /// reads, from the engine on E1 and from the view on E2, 1 draw in 64), E2Refused (an async
 /// fill refused after E1 moved on: the draw is dropped).
 ///
+/// S3, FRITCHII_ESPLIT_PIN (boot, default 0): placement. 0 = E1 keeps E's pinned core, E2 runs
+/// on the performance cores; 1 = E2 on E's old core (PinnedRole::GpuBack's mask), E1 unpinned on
+/// the performance cores; 2 = E's core split by SMT sibling (E2 one hardware thread, E1 the
+/// other); 3 = E2 on E's core, E1 on R's (PinnedRole::GpuMem, FRITCHII_ONEF_PIN's core). The lines
+/// give each thread's CPU time per second against its busy time (a spinning thread reads about
+/// 1,000 ms/s: E1 must stay under its busy share + 5%).
+///
 /// FRITCHII_ESPLIT=0: nothing starts; each hand-over site pays one load and a branch (g_thread).
 namespace VideoCommon::ESplit {
 

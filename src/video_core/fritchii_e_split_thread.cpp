@@ -48,6 +48,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstring>
 #include <memory>
@@ -69,6 +70,7 @@
 #include "common/logging.h"
 #include "common/spin_recursive_mutex.h"
 #include "common/thread.h"
+#include "common/thread_cpu_clock.h"
 #include "core/core.h"
 #include "video_core/back_read_audit.h"
 #include "video_core/fritchii_e_split.h"
@@ -198,6 +200,9 @@ struct Shared {
     std::thread::id e1_id{};
     std::jthread thread;
     std::atomic<bool> e2_ready{};
+    /// S3: E2's hard affinity (0: leave it), and E2's thread CPU time (ns, E2 writes it).
+    u64 e2_mask{};
+    std::atomic<u64> e2_cpu_ns{};
 };
 
 Shared g;
@@ -215,6 +220,8 @@ u64 g_since_ticks{};
 u64 g_touch_logged{};
 u64 g_visible_logged{};
 u64 g_front_logged{};
+u64 g_e1_cpu_last{};
+u64 g_e2_cpu_last{};
 std::chrono::nanoseconds g_e1_poll{std::chrono::microseconds{50}};
 std::chrono::nanoseconds g_hold_poll{std::chrono::microseconds{20}};
 // E2's own
@@ -406,6 +413,9 @@ void E2Main(std::stop_token) {
     if (g.adopt != nullptr) {
         g.adopt(g.adopt_argument); // GpuSplit: OnBackThread
     }
+    if (g.e2_mask != 0) {
+        Common::SetCurrentThreadCpuMask(g.e2_mask); // FRITCHII_ESPLIT_PIN (S3)
+    }
     OneF::MarkEngineHelperThread();
     ThreadMark();
     t_role = 2;
@@ -432,6 +442,10 @@ void E2Main(std::stop_token) {
         RunJob(g.jobs[next % Slots]);
         g.done.store(next, std::memory_order_seq_cst);
         WakeE1();
+        if ((next & 1023) == 0) {
+            g.e2_cpu_ns.store(Common::CurrentThreadCpuTimeNs().value_or(0),
+                              std::memory_order_relaxed);
+        }
         ++next;
         Profile::Report("GPU E2 thread");
     }
@@ -544,6 +558,59 @@ void SetDepth(int depth) {
     g_depth = depth;
 }
 
+int PinMode() noexcept {
+    static const int mode = std::clamp(
+        VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_esplit_pin, "FRITCHII_ESPLIT_PIN"),
+        0, 3);
+    return mode;
+}
+
+/// E1's hard affinity now (group 0), 0 when unknown.
+u64 OwnMask() noexcept {
+#ifdef _WIN32
+    GROUP_AFFINITY affinity{};
+    if (GetThreadGroupAffinity(GetCurrentThread(), &affinity) && affinity.Group == 0) {
+        return static_cast<u64>(affinity.Mask);
+    }
+#endif
+    return 0;
+}
+
+/// S3, E1 before E2 starts: E2's mask; E1 moves where the mode says once E2 runs (Place).
+void PlanPlacement(u64& e1_mask, bool& e1_unpin) {
+    const int mode = PinMode();
+    const u64 back = OwnMask(); // E's pin (PinnedRole::GpuBack), or the process mask unpinned
+    e1_mask = 0;
+    e1_unpin = false;
+    if (mode == 0 || back == 0) {
+        return;
+    }
+    switch (mode) {
+    case 1:
+        g.e2_mask = back;
+        e1_unpin = true;
+        break;
+    case 2:
+        if (std::popcount(back) > 1) {
+            const u64 high = u64{1} << (63 - std::countl_zero(back));
+            g.e2_mask = high;
+            e1_mask = back & ~high;
+        }
+        break;
+    case 3:
+        g.e2_mask = back;
+        break;
+    default:
+        break;
+    }
+    LOG_INFO(HW_GPU, "E split thread: FRITCHII_ESPLIT_PIN={}: E's core {:#x}, E2 {:#x}, E1 {}",
+             mode, back, g.e2_mask,
+             e1_unpin       ? std::string{"unpinned (performance cores)"}
+             : mode == 3    ? std::string{"on R's core (PinnedRole::GpuMem)"}
+             : e1_mask != 0 ? fmt::format("{:#x}", e1_mask)
+                            : std::string{"unchanged"});
+}
+
 void Report(u64 now) {
     const double window = static_cast<double>(now - g_since_ns) / 1e9;
     const double ns_per_tick =
@@ -616,6 +683,19 @@ void Report(u64 now) {
                                 : 0.0,
              rate(holds), ms(hold_spin), ms(c.hold_ticks), rate(room_waits), rate(late_flushes),
              rate(view_fills));
+    // S3: each thread's CPU time against its busy time (a spinning wait shows as CPU time).
+    const u64 e1_cpu = Common::CurrentThreadCpuTimeNs().value_or(0);
+    const u64 e2_cpu = g.e2_cpu_ns.load(std::memory_order_relaxed);
+    const auto cpu_ms = [window](u64 now_ns, u64 last_ns) {
+        return now_ns > last_ns ? static_cast<double>(now_ns - last_ns) / 1e6 / window : 0.0;
+    };
+    LOG_INFO(HW_GPU,
+             "E split thread 10 s: placement FRITCHII_ESPLIT_PIN={}: E1 CPU {:.0f} ms/s (its "
+             "waits for E2 {:.1f}, held {:.1f}), E2 CPU {:.0f} ms/s (busy {:.1f}, waiting {:.1f})",
+             PinMode(), cpu_ms(e1_cpu, g_e1_cpu_last), e1_wait, ms(c.hold_ticks),
+             cpu_ms(e2_cpu, g_e2_cpu_last), e2_busy, ms(e2_wait));
+    g_e1_cpu_last = e1_cpu;
+    g_e2_cpu_last = e2_cpu;
 }
 
 } // Anonymous namespace
@@ -646,8 +726,21 @@ void StartE2(Core::System& system, void (*adopt)(void*), void* adopt_argument) {
     // with its switch).
     BackReadAudit::g_touch_hook = &ReadTouch;
     BackReadAudit::enabled = true;
+    u64 e1_mask = 0;
+    bool e1_unpin = false;
+    PlanPlacement(e1_mask, e1_unpin);
     g.thread = std::jthread{E2Main};
     g.e2_ready.wait(false, std::memory_order_acquire);
+    // S3: E1's place, once E2 runs on its own.
+    if (e1_unpin) {
+        Common::SetCurrentThreadCpuMask(0);
+        Common::SetCurrentThreadToPerformanceCores();
+    } else if (e1_mask != 0) {
+        Common::SetCurrentThreadCpuMask(e1_mask);
+    } else if (PinMode() == 3) {
+        Common::PinCurrentThread(Common::PinnedRole::GpuMem);
+    }
+    g_e1_cpu_last = Common::CurrentThreadCpuTimeNs().value_or(0);
     g_since_ns = Profile::Now();
     g_since_ticks = Profile::Ticks();
     g_thread = true;

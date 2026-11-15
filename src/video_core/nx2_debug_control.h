@@ -395,6 +395,8 @@ inline std::atomic<int> g_esplit_count{-1};
 inline std::atomic<int> g_esplit{-1};
 /// FRITCHII_ESPLIT_DEPTH (live, default 0): E1's lead over E2 in draws; 0 = lockstep (S1).
 inline std::atomic<int> g_esplit_depth{-1};
+/// FRITCHII_ESPLIT_PIN (boot, default 0): where E1 and E2 run (fritchii_e_split_thread.h, S3).
+inline std::atomic<int> g_esplit_pin{-1};
 /// EDEN_NX2_LIGHT_TABLE_ARRAYS: docs/fritchii/switches.md.
 [[nodiscard]] inline bool LightTableArrays() {
     static const bool on = EnvSwitch("EDEN_NX2_LIGHT_TABLE_ARRAYS") > 0;

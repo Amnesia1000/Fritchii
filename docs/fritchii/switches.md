@@ -2202,6 +2202,14 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   async draws a second and how far ahead they were posted, E2 lends that held E1 (E2's wait for
   E1 to park, E1's held time), ring B room waits. Step in only after S1's checks read 0. Gate 2:
   DEPTH 0 against N, 2 cycles: max(E1, E2 busy) must drop >= 70% of the dry net.
+- FRITCHII_ESPLIT_PIN (boot, default 0; with FRITCHII_ESPLIT=1, step S3): where E1 and E2 run.
+  0 = E1 keeps E's pinned core (PinnedRole::GpuBack), E2 on the performance cores; 1 = E2 on E's
+  old core, E1 unpinned on the performance cores; 2 = E's core split by SMT sibling (E2 one
+  hardware thread, E1 the other); 3 = E2 on E's core, E1 on R's core (PinnedRole::GpuMem, where
+  FRITCHII_ONEF_PIN put R). A line at the start names the masks; every 10 s "placement
+  FRITCHII_ESPLIT_PIN=N": E1's and E2's thread CPU time per second against their busy and wait
+  times (a spinning wait reads as CPU time: E1 must stay under its busy share + 5%). Gate 2 on
+  fps with rest < 2.3 CPUs.
 - FRITCHII_ONEF_TRACE (boot, default 0; fable_b_one_follower 15.5): 1 = the lend trace. One
   72-byte record per lend and per posted op (packet number, site, op kind, posted, E's arrival,
   R's start and end, E's resume, E's work since its previous record, R's busy time on other
