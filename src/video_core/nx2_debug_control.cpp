@@ -665,6 +665,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_FRONT_ASYNC_TABLE") {
         return &g_front_async_table;
     }
+    if (name == "FRITCHII_BARE_SSBO_MIB") {
+        return &g_bare_ssbo_mib;
+    }
     if (name == "FRITCHII_NOTED_OVERFLOW") {
         return &g_noted_overflow;
     }

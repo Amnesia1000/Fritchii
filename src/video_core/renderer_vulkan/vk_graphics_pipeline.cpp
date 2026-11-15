@@ -700,6 +700,11 @@ GraphicsPipeline::GraphicsPipeline(
         return info.texture_descriptors.empty() && info.texture_buffer_descriptors.empty() &&
                info.image_descriptors.empty() && info.image_buffer_descriptors.empty();
     });
+    has_handle_table = std::ranges::any_of(stage_infos, [](const Shader::Info& info) {
+        return std::ranges::any_of(info.texture_descriptors, [](const auto& desc) {
+            return desc.count > 1 && desc.handle_program != ~0U;
+        });
+    });
     // EXP87 (the original texture_memo_eligible).
     template_eligible = std::ranges::all_of(stage_infos, [](const Shader::Info& info) {
         return info.texture_buffer_descriptors.empty() && info.image_buffer_descriptors.empty() &&

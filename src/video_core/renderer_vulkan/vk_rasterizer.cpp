@@ -1209,6 +1209,12 @@ GraphicsPipeline* RasterizerVulkan::DeltaPathDecide(bool is_indexed, bool is_ind
     if (!previous->SamplesNothing() || previous->IsMeshPipeline()) {
         return fall(Fallback::Samples);
     }
+    // A handle table (EDEN_NX2_LIGHT_TABLE_ARRAYS) binds a whole array of handles read from a
+    // storage buffer each draw: never a delta draw, also if the cut above is ever widened to
+    // pipelines that sample (a samples-nothing pipeline has none today).
+    if (previous->HasHandleTable()) {
+        return fall(Fallback::Samples);
+    }
     // The texture memos change what Configure does for every draw (the plan: off, or no delta).
     if (VideoCore::Nx2Debug::Experiment(32) != 0 || VideoCore::Nx2Debug::Experiment(87) != 0 ||
         VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_tex_bank_gen,

@@ -5058,12 +5058,16 @@ std::string PipelineCache::KeptStamp(const std::string& prepared_stamp) const {
     // distances; ported noperspective varyings, then their revert), which the sample only sees if it hits one.
     // NX2KEPT5 (v5.6): F32->S32 conversions saturate in range, and the
     // fragment output masks are kept with the infos (Fritchii #29, AMD horizon rainbow).
+    // EDEN_NX2_LIGHT_TABLE_ARRAYS translates the light tables to descriptor arrays: kept pipelines
+    // of the other setting are not this translation (the boot sample only sees that when it hits
+    // a light table shader). Named only when on, so the stamp with it off stays what it was.
     return fmt::format("{}kept NX2KEPT5 cache {} settings {:#x} gpl {} oot {} {:016x} canonical "
-                       "{}\n",
+                       "{}{}\n",
                        prepared_stamp, CACHE_VERSION, SpirvSettingsStamp(),
                        device.IsExtGraphicsPipelineLibrarySupported() ? 1 : 0,
                        oot_visual_workaround ? 1 : 0, visual_workaround_title,
-                       CanonicalKeys() ? 1 : 0);
+                       CanonicalKeys() ? 1 : 0,
+                       host_info.support_handle_table_arrays ? " light-tables 1" : "");
 }
 
 std::shared_ptr<const PrecompiledKept::Index> PipelineCache::KeptIndex() const {

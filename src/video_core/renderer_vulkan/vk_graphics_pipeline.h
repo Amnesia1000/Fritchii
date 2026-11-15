@@ -238,6 +238,13 @@ public:
         return samples_nothing;
     }
 
+    /// A texture array whose handles a handle program reads from a table (one shadow map per
+    /// light, EDEN_NX2_LIGHT_TABLE_ARRAYS). Such a pipeline never takes a delta draw
+    /// (DeltaPathDecide).
+    [[nodiscard]] bool HasHandleTable() const noexcept {
+        return has_handle_table;
+    }
+
     /// Texture handles of the last configured draw whose handle program gave 0.
     u32 ZeroTextureHandles() const noexcept {
         return zero_texture_handles;
@@ -680,6 +687,7 @@ private:
     u32 color_output_mask{};
     bool writes_storage{};
     bool samples_nothing{}; ///< SamplesNothing
+    bool has_handle_table{}; ///< HasHandleTable
     /// The memory stage's facts: the stages Configure prepares (its Spec's), and whether any
     /// stage binds texture or image buffers (the fill then stays in Configure: LateFill).
     u32 spec_stages{};

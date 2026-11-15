@@ -4,6 +4,7 @@
 #include <array>
 #include <initializer_list>
 #include <map>
+#include <span>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -12,6 +13,7 @@
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
 #include "shader_recompiler/host_translate_info.h"
+#include "shader_recompiler/info_serialize.h"
 #include "shader_recompiler/ir_opt/passes.h"
 #include "video_core/shader_handle_program.h"
 
@@ -990,4 +992,51 @@ TEST_CASE("A handle word the translation saw dereferenced is not a handle withou
     CHECK(VideoCommon::HandleIsStoragePointer(info, desc, 0));
     desc.handle_program = 0;
     CHECK_FALSE(VideoCommon::HandleIsStoragePointer(info, desc, 0));
+}
+
+TEST_CASE("Kept infos keep a texture's light table flags without changing the old bytes",
+          "[video_core][texture_handles]") {
+    Shader::TextureDescriptor desc{};
+    desc.is_depth = true;
+    desc.count = 64;
+    desc.handle_program = 0;
+    desc.handle_is_pointer_word = true;
+    desc.is_descriptor_array = true;
+    Shader::Info info;
+    info.texture_descriptors.push_back(desc);
+    std::vector<u8> bytes;
+    Shader::SerializeInfo(info, bytes);
+    std::span<const u8> in{bytes};
+    Shader::Info read;
+    REQUIRE(Shader::DeserializeInfo(in, read));
+    CHECK(in.empty());
+    REQUIRE(read.texture_descriptors.size() == 1);
+    CHECK(read.texture_descriptors[0].is_depth);
+    CHECK(read.texture_descriptors[0].handle_is_pointer_word);
+    CHECK(read.texture_descriptors[0].is_descriptor_array);
+    CHECK(read.texture_descriptors[0].count == 64);
+
+    // Both flags false (EDEN_NX2_LIGHT_TABLE_ARRAYS off): is_depth's byte is 1 as before.
+    Shader::Info plain;
+    desc.handle_is_pointer_word = false;
+    desc.is_descriptor_array = false;
+    plain.texture_descriptors.push_back(desc);
+    std::vector<u8> plain_bytes;
+    Shader::SerializeInfo(plain, plain_bytes);
+    REQUIRE(plain_bytes.size() == bytes.size());
+    size_t differing = 0;
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        if (bytes[i] != plain_bytes[i]) {
+            ++differing;
+            CHECK(plain_bytes[i] == 1);
+            CHECK(bytes[i] == 7);
+        }
+    }
+    CHECK(differing == 1);
+    std::span<const u8> plain_in{plain_bytes};
+    Shader::Info plain_read;
+    REQUIRE(Shader::DeserializeInfo(plain_in, plain_read));
+    CHECK(plain_read.texture_descriptors[0].is_depth);
+    CHECK_FALSE(plain_read.texture_descriptors[0].handle_is_pointer_word);
+    CHECK_FALSE(plain_read.texture_descriptors[0].is_descriptor_array);
 }
