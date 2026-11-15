@@ -1806,6 +1806,8 @@ struct Maxwell3D::FrontState {
     /// EDEN_NX2_EXP22 (the original front state, draw batches and same-value draw
     /// registers), read once per front call like early_same.
     int exp22{};
+    /// The switch generation same_experiment, early_same and exp22 were read at (Front()).
+    u32 experiments_generation{~u32{0}};
     /// StateDelta blocks would skip the back's write history and first-write trace
     /// (EDEN_NX2_3D_HISTORY, EDEN_NX2_3D_METHODS): off with them.
     bool delta_allowed{};
@@ -2090,19 +2092,38 @@ void LogOotSlot(u32 method, u32 start, u64 hash, std::span<const u32> code,
 
 // EDEN_NX2_SPLIT_VERIFY=1: every 4096 front macro calls, wait for the back and compare the
 // front's registers with the back's (logs and resynchronizes differences).
+// Both read at their first use, as before, and kept in an atomic word, not a function's static
+// (MSVC checks a static's initialization through a thread-local on every call: 4.5 and 1.5 ms/s
+// of the front, fable_b 21.2 cut 4). 0 = not read yet.
+std::atomic<u32> g_front_verify_word{0};
 bool FrontVerifyEnabled() {
-    static const bool verify = std::getenv("EDEN_NX2_SPLIT_VERIFY") != nullptr;
-    return verify;
+    u32 word = g_front_verify_word.load(std::memory_order_relaxed);
+    if (word == 0) [[unlikely]] {
+        u32 expected = 0;
+        g_front_verify_word.compare_exchange_strong(
+            expected, std::getenv("EDEN_NX2_SPLIT_VERIFY") != nullptr ? 2U : 1U,
+            std::memory_order_relaxed);
+        word = g_front_verify_word.load(std::memory_order_relaxed);
+    }
+    return word == 2;
 }
 
 // EDEN_NX2_MACRO_TRACE=<method>: the first 8 calls of that macro (with a parameter other than 0),
 // parameters and writes, counted across both FrontRunMacro bodies.
+// The method plus one (0 = not read yet), as FrontVerifyEnabled's word.
+std::atomic<u32> g_macro_traced_word{0};
 u32 MacroTraced() {
-    static const u32 traced = [] {
+    u32 word = g_macro_traced_word.load(std::memory_order_relaxed);
+    if (word == 0) [[unlikely]] {
         const char* value = std::getenv("EDEN_NX2_MACRO_TRACE");
-        return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 16)) : 0U;
-    }();
-    return traced;
+        const u32 traced =
+            value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 16)) : 0U;
+        u32 expected = 0;
+        g_macro_traced_word.compare_exchange_strong(expected, traced + 1,
+                                                    std::memory_order_relaxed);
+        word = g_macro_traced_word.load(std::memory_order_relaxed);
+    }
+    return word - 1;
 }
 u32 g_macro_traced_calls{};
 
@@ -2220,9 +2241,18 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
         executing_macro = 0;
         front_macros = true;
     }
-    front->same_experiment = VideoCore::Nx2Debug::Experiment(2);
-    front->early_same = VideoCore::Nx2Debug::Experiment(14);
-    front->exp22 = VideoCore::Nx2Debug::Experiment(22);
+    // Read again only when a switch or experiment store moved the generation (every store
+    // bumps it): one relaxed load per front call instead of three experiment reads (5.6 ms/s,
+    // fable_b 21.2 cut 4). The generation is loaded before the values, so a store after the
+    // load is seen at the next call, as a store after the three reads was.
+    const u32 generation =
+        VideoCore::Nx2Debug::g_switch_generation.load(std::memory_order_acquire);
+    if (front->experiments_generation != generation) [[unlikely]] {
+        front->experiments_generation = generation;
+        front->same_experiment = VideoCore::Nx2Debug::Experiment(2);
+        front->early_same = VideoCore::Nx2Debug::Experiment(14);
+        front->exp22 = VideoCore::Nx2Debug::Experiment(22);
+    }
     return *front;
 }
 
