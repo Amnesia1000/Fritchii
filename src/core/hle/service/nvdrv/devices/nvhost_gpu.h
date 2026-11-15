@@ -207,6 +207,13 @@ private:
                                bool kickoff = false);
     NvResult SubmitGPFIFOBase2(IoctlSubmitGpfifo& params,
                                std::span<const Tegra::CommandListHeader> commands);
+    /// The submit ioctls as WrapFixedVariable / WrapFixedInlIn run them (same reads, same output
+    /// bytes), with the entries in a reused per-thread buffer instead of a fresh zero-filled
+    /// vector per submit.
+    NvResult SubmitGPFIFOIoctl1(std::span<const u8> input, std::span<u8> output, DeviceFD fd,
+                                bool kickoff);
+    NvResult SubmitGPFIFOIoctl2(std::span<const u8> input, std::span<const u8> inline_input,
+                                std::span<u8> output);
 
     NvResult GetWaitbase(IoctlGetWaitbase& params);
     NvResult ChannelSetTimeout(IoctlChannelSetTimeout& params);

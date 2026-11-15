@@ -4,6 +4,7 @@
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <cstring>
 #include <immintrin.h>
 #include <atomic>
@@ -15,6 +16,7 @@
 #include <vector>
 #include "common/assert.h"
 #include "common/logging.h"
+#include "common/scratch_buffer.h"
 #include "common/nx2_timeline.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_process.h"
@@ -84,7 +86,7 @@ NvResult nvhost_gpu::Ioctl1(DeviceFD fd, Ioctl command, std::span<const u8> inpu
         case 0x3:
             return WrapFixed(this, &nvhost_gpu::ChannelSetTimeout, input, output);
         case 0x8:
-            return WrapFixedVariable(this, &nvhost_gpu::SubmitGPFIFOBase1, input, output, fd, false);
+            return SubmitGPFIFOIoctl1(input, output, fd, false);
         case 0x9:
             return WrapFixed(this, &nvhost_gpu::AllocateObjectContext, input, output);
         case 0xb:
@@ -98,7 +100,7 @@ NvResult nvhost_gpu::Ioctl1(DeviceFD fd, Ioctl command, std::span<const u8> inpu
         case 0x1a:
             return WrapFixed(this, &nvhost_gpu::AllocGPFIFOEx2, input, output, fd);
         case 0x1b:
-            return WrapFixedVariable(this, &nvhost_gpu::SubmitGPFIFOBase1, input, output, fd, true);
+            return SubmitGPFIFOIoctl1(input, output, fd, true);
         case 0x1d:
             return WrapFixed(this, &nvhost_gpu::ChannelSetTimeslice, input, output);
         default:
@@ -129,8 +131,7 @@ NvResult nvhost_gpu::Ioctl2(DeviceFD fd, Ioctl command, std::span<const u8> inpu
     case 'H':
         switch (command.cmd) {
         case 0x1b:
-            return WrapFixedInlIn(this, &nvhost_gpu::SubmitGPFIFOBase2, input, inline_input,
-                                  output);
+            return SubmitGPFIFOIoctl2(input, inline_input, output);
         }
         break;
     }
@@ -602,6 +603,13 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
                 }
                 offset += entry.size;
             }
+            // submitted_words is not zero-filled when sized: the entries copied above wrote
+            // theirs; a deferred entry's words stay zero, as before, until DmaPusher::Push copies
+            // them after the map.
+            for (const u32 index : entries.deferred_entries) {
+                std::memset(entries.submitted_words.data() + entries.submitted_offsets[index], 0,
+                            static_cast<size_t>(entries.command_lists[index].size) * sizeof(u32));
+            }
         }
     }
 
@@ -719,7 +727,9 @@ NvResult nvhost_gpu::SubmitGPFIFOBase1(IoctlSubmitGpfifo& params,
         return NvResult::InvalidSize;
     }
 
-    Tegra::CommandList entries(params.num_entries);
+    // Every entry is written below (copied, or read from guest memory, which zero-fills
+    // unmapped bytes): no zero fill first.
+    Tegra::CommandList entries(params.num_entries, boost::container::default_init);
     if (kickoff) {
         this->GetSessionMemory(fd).ReadBlock(params.address, entries.command_lists.data(),
                                              params.num_entries * sizeof(Tegra::CommandListHeader));
@@ -731,6 +741,60 @@ NvResult nvhost_gpu::SubmitGPFIFOBase1(IoctlSubmitGpfifo& params,
     return SubmitGPFIFOImpl(params, std::move(entries));
 }
 
+namespace {
+/// The submit's entries, reused per thread (WrapGeneric made a zero-filled vector each time).
+Common::ScratchBuffer<Tegra::CommandListHeader>& SubmitEntriesBuffer(std::span<const u8> bytes) {
+    thread_local Common::ScratchBuffer<Tegra::CommandListHeader> buffer;
+    const size_t count = bytes.size() / sizeof(Tegra::CommandListHeader);
+    buffer.resize_destructive(count);
+    if (count > 0) {
+        std::memcpy(buffer.data(), bytes.data(), count * sizeof(Tegra::CommandListHeader));
+    }
+    return buffer;
+}
+} // namespace
+
+NvResult nvhost_gpu::SubmitGPFIFOIoctl1(std::span<const u8> input, std::span<u8> output,
+                                        DeviceFD fd, bool kickoff) {
+    // As WrapGeneric<IoctlSubmitGpfifo, CommandListHeader, Null, Null>.
+    IoctlSubmitGpfifo fixed{};
+    const size_t var_offset = (std::min)(sizeof(IoctlSubmitGpfifo), input.size());
+    if (var_offset > 0) {
+        std::memcpy(&fixed, input.data(), var_offset);
+    }
+    auto& entries = SubmitEntriesBuffer(input.subspan(var_offset));
+    const size_t count = (input.size() - var_offset) / sizeof(Tegra::CommandListHeader);
+    const NvResult result = SubmitGPFIFOBase1(
+        fixed, std::span<Tegra::CommandListHeader>(entries.data(), count), fd, kickoff);
+    if (output.size() > 0) {
+        std::memcpy(output.data(), &fixed, (std::min)(output.size(), sizeof(IoctlSubmitGpfifo)));
+    }
+    if (count > 0 && output.size() > var_offset) {
+        std::memcpy(output.data() + var_offset, entries.data(),
+                    (std::min)(output.size() - var_offset,
+                               count * sizeof(Tegra::CommandListHeader)));
+    }
+    return result;
+}
+
+NvResult nvhost_gpu::SubmitGPFIFOIoctl2(std::span<const u8> input,
+                                        std::span<const u8> inline_input, std::span<u8> output) {
+    // As WrapGeneric<IoctlSubmitGpfifo, Null, CommandListHeader, Null>.
+    IoctlSubmitGpfifo fixed{};
+    const size_t fixed_bytes = (std::min)(sizeof(IoctlSubmitGpfifo), input.size());
+    if (fixed_bytes > 0) {
+        std::memcpy(&fixed, input.data(), fixed_bytes);
+    }
+    auto& entries = SubmitEntriesBuffer(inline_input);
+    const size_t count = inline_input.size() / sizeof(Tegra::CommandListHeader);
+    const NvResult result = SubmitGPFIFOBase2(
+        fixed, std::span<const Tegra::CommandListHeader>(entries.data(), count));
+    if (output.size() > 0) {
+        std::memcpy(output.data(), &fixed, (std::min)(output.size(), sizeof(IoctlSubmitGpfifo)));
+    }
+    return result;
+}
+
 NvResult nvhost_gpu::SubmitGPFIFOBase2(IoctlSubmitGpfifo& params,
                                        std::span<const Tegra::CommandListHeader> commands) {
     if (params.num_entries > commands.size()) {
@@ -738,7 +802,9 @@ NvResult nvhost_gpu::SubmitGPFIFOBase2(IoctlSubmitGpfifo& params,
         return NvResult::InvalidSize;
     }
 
-    Tegra::CommandList entries(params.num_entries);
+    // Every entry is written below (copied, or read from guest memory, which zero-fills
+    // unmapped bytes): no zero fill first.
+    Tegra::CommandList entries(params.num_entries, boost::container::default_init);
     std::memcpy(entries.command_lists.data(), commands.data(),
                 params.num_entries * sizeof(Tegra::CommandListHeader));
     return SubmitGPFIFOImpl(params, std::move(entries));

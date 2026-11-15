@@ -11,6 +11,9 @@
 #include <condition_variable>
 #include <optional>
 #include <span>
+#include <memory>
+#include <type_traits>
+#include <utility>
 #include <vector>
 #include <boost/container/small_vector.hpp>
 #include <deque>
@@ -109,9 +112,31 @@ inline CommandHeader BuildCommandHeader(BufferMethods method, u32 arg_count, Sub
     return result;
 }
 
+/// std::allocator, except that a container's value construction (resize) leaves trivial elements
+/// uninitialized: for buffers whose every element is written right after (no zero fill first).
+template <typename T>
+struct DefaultInitAllocator : std::allocator<T> {
+    template <typename U>
+    struct rebind {
+        using other = DefaultInitAllocator<U>;
+    };
+    using std::allocator<T>::allocator;
+    template <typename U>
+    void construct(U* p) noexcept(std::is_nothrow_default_constructible_v<U>) {
+        ::new (static_cast<void*>(p)) U;
+    }
+    template <typename U, typename... Args>
+    void construct(U* p, Args&&... args) {
+        ::new (static_cast<void*>(p)) U(std::forward<Args>(args)...);
+    }
+};
+
 struct CommandList final {
     CommandList() = default;
     explicit CommandList(std::size_t size) : command_lists(size) {}
+    /// The entries left uninitialized: the caller writes all of them (a submit's copy).
+    CommandList(std::size_t size, boost::container::default_init_t)
+        : command_lists(size, boost::container::default_init) {}
     explicit CommandList(boost::container::small_vector<CommandHeader, 512>&& prefetch_command_list_)
         : prefetch_command_list{std::move(prefetch_command_list_)} {}
 
@@ -121,7 +146,9 @@ struct CommandList final {
     std::vector<u64> submit_hashes;
     /// The entries' words when they were submitted (NX2), each entry's at submitted_offsets[i]:
     /// executed instead of the memory, which the game may already be refilling for a later frame.
-    std::vector<CommandHeader> submitted_words;
+    /// Not zero-filled when sized: the submit copies every entry's words, or zeroes them for an
+    /// entry it defers (nvhost_gpu::SubmitGPFIFOImpl).
+    std::vector<CommandHeader, DefaultInitAllocator<CommandHeader>> submitted_words;
     std::vector<u32> submitted_offsets;
     /// Entries (ascending) not copied when submitted, because a GPU map still queued covers them:
     /// DmaPusher::Push copies them after the map, and until then they read memory.
