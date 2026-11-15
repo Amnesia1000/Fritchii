@@ -151,6 +151,8 @@ public:
     // itself instead of jumping to the shared handler. 0 elsewhere (or without FastDispatch).
     /// Called from the constructor (the boot switch, read once per process).
     static int IndirectCacheMode();
+    /// FRITCHII_JIT_NO_FRAME_POINTER (boot): blocks do not set up rbp (Eden 8e14f07a69's frame).
+    static bool OmitFramePointer();
     /// A free slot, or nullptr when all are taken (the site then uses the shared handler).
     FastDispatchEntry* AllocateIndirectSlot();
     /// Every slot back to the empty entry; `release`: the sites are gone too (ClearCache).
@@ -170,6 +172,7 @@ public:
         IndirectCounterCount,
     };
     int indirect_cache_mode = 0;
+    bool omit_frame_pointer = false;
     static constexpr size_t indirect_slot_capacity = size_t{1} << 18; // 4 MiB per JIT
     std::unique_ptr<FastDispatchEntry[]> indirect_slots;
     size_t indirect_slots_used = 0;

@@ -2599,6 +2599,21 @@ through two shared routines; the indirect one waits on a load from the 16 MiB fa
   hit their site's last target (Fable A 12). Code grows by about 40 bytes per indirect branch site
   (3: also per return site).
 
+### FRITCHII_JIT_NO_FRAME_POINTER
+
+FRITCHII_JIT_NO_FRAME_POINTER (boot, read once per process, default 0 = as before;
+fable_a_gameceiling_answer 12.6). Since Eden 8e14f07a69 every A64 block stores rbp, points it at
+its stack frame and restores it before its terminal: three instructions and 24 bytes per block
+run, about 8% of an average block's bytes.
+- 1: blocks leave rbp as the dispatcher set it. rbp stays out of the register allocator either
+  way (reg_alloc.cpp), so no block reads or writes it.
+- Exact for execution: rbp was only ever a frame pointer for stack walkers. Ours stop at the
+  first JIT frame (nx2_sampler); the Windows unwind data covers the dispatcher's prologue, not the
+  blocks. What changes: external profilers and crash dumps that follow rbp lose the JIT frames.
+- No log line beyond the boot line "FRITCHII_JIT_NO_FRAME_POINTER=1: blocks do not set up rbp".
+- Expected: 0.5 to 1% of the guest cores' busy time (Fable A's estimate). Needs one fresh-launch
+  A/B (boot switch).
+
 ## Numbered experiments (EDEN_NX2_EXPn)
 
 Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP79, live through the debug server:

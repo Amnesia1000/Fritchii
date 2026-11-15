@@ -112,6 +112,17 @@ int A64EmitX64::IndirectCacheMode() {
     return mode;
 }
 
+bool A64EmitX64::OmitFramePointer() {
+    static const bool omit = [] {
+        const bool value = EnvSwitch("FRITCHII_JIT_NO_FRAME_POINTER") != 0;
+        if (value) {
+            LOG_INFO(Core_ARM, "FRITCHII_JIT_NO_FRAME_POINTER=1: blocks do not set up rbp");
+        }
+        return value;
+    }();
+    return omit;
+}
+
 A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_interface)
         : EmitX64(code), conf(conf)
         , fast_dispatch_table_size{size_t{1} << FastDispatchTableBits(fast_dispatch_table_default_bits, fast_dispatch_table_min_bits)}
@@ -120,6 +131,7 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
         , jit_interface{jit_interface} {
     // Fritchii: the per-site caches fall back on the fast dispatch table.
     indirect_cache_mode = conf.HasOptimization(OptimizationFlag::FastDispatch) ? IndirectCacheMode() : 0;
+    omit_frame_pointer = OmitFramePointer();
     if (indirect_cache_mode != 0) {
         indirect_slots.reset(new FastDispatchEntry[indirect_slot_capacity]);
     }
@@ -158,8 +170,12 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) noexcept {
     // Start emitting.
     code.align();
     const auto* const entrypoint = code.getCurr();
-    code.mov(code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)], rbp);
-    code.lea(rbp, code.ptr[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer) - 8]);
+    // Fritchii: FRITCHII_JIT_NO_FRAME_POINTER leaves rbp as the dispatcher set it (no block
+    // allocates rbp either way, reg_alloc.cpp): only stack walkers that follow rbp see a change.
+    if (!omit_frame_pointer) {
+        code.mov(code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)], rbp);
+        code.lea(rbp, code.ptr[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer) - 8]);
+    }
 
     DEBUG_ASSERT(block.GetCondition() == IR::Cond::AL);
     typedef void (EmitX64::*EmitHandlerFn)(EmitContext& context, IR::Inst* inst);
@@ -213,7 +229,9 @@ finish_this_inst:
     reg_alloc.AssertNoMoreUses();
     if (conf.enable_cycle_counting)
         EmitAddCycles(block.CycleCount());
-    code.mov(rbp, code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)]);
+    if (!omit_frame_pointer) {
+        code.mov(rbp, code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)]);
+    }
     EmitTerminal(block.terminal, ctx.Location().SetSingleStepping(false), ctx.IsSingleStep());
     code.int3();
     for (auto& deferred_emit : ctx.deferred_emits)
