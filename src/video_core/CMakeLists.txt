@@ -115,6 +115,8 @@ add_library(video_core STATIC
     fence_manager.h
     fritchii_price.cpp
     fritchii_price.h
+    fritchii_s4_count.cpp
+    fritchii_s4_count.h
     gpu.cpp
     gpu.h
     gpu_timestamp.h

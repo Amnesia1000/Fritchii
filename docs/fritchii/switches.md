@@ -1923,6 +1923,31 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   generation, the lost-store count, the marks gate ready, the page table's size, the inner
   invalidation setting), runs the same four tests first and returns with the same counts.
   Same result. Expected 8 to 10 ms/s on E (56,000 bank binds a second at 246 ns).
+- FRITCHII_S4_COUNT (live, default 0; fable_b2_answers 3.3, fable_b_one_follower 28.5): the S4
+  counter, dry (video_core/fritchii_s4_count.cpp). S4 would serve the fill's uniform binds from
+  a mirror of their pages brought up to date once per list entry. Each graphics uniform bind of
+  the fill (BindHostGraphicsUniformBuffer, before the bank check and the copy) is counted on E:
+  its path and bytes, its 4 KiB pages by class (tracked; untrapped = CPU-modified, guest stores
+  land unseen; stream-written = E's own uploads moved its write generation while it was bound,
+  the driver banks; GPU-written), the list entries E crossed (the front records its ring
+  position at the start of each list entry it parses, GpuSplit::WritePositionNow, without
+  ending the open block), and whether a range's bytes changed between two of its binds inside
+  one entry (ranges up to 16 KiB hashed whole at every bind, larger ones one page in 64 by
+  address, scaled), by cause from per-writer page generations (Common::S4Count: E's writes
+  through WriteRing::Note and MemoryManager::Write are stream uploads, buffer downloads and
+  words written off E are GPU results, other threads' noted writes are emulator writes, no
+  writer seen is a guest store, on a page the tracker held clean at the earlier bind or not).
+  2 = also a sample: at 1 list entry in 256 the front hashes up to 8 ranges E bound lately as
+  a mirror would see them there (guest memory with OverlayQueuedWrites laid over; a range a
+  noted queued upload writes, SplitWriteTracker::LastWriteTo, is "queued", not compared) and E
+  compares at its bind of the same range in that entry. The front cannot sample per bind: which
+  slots a draw reads is the pipeline's, known on E only. Two lines every 10 s, "S4 count
+  (FRITCHII_S4_COUNT=N) 10 s:". S4 pays if the mirror upkeep (MB/s) is well under the bytes the
+  fill reads and compares today, and is exact only if both "MUST BE 0" figures are 0 (changes
+  inside an entry other than stream uploads). With the split off there are no list entries and
+  the second line means nothing. Costs E a hash of each bind's bytes while on (not for a
+  profiled fps run). Off: one relaxed load and a branch per uniform bind, per list entry on the
+  front and per noted write; the switch is read once a draw.
 - FRITCHII_ONEF_TRACE (boot, default 0; fable_b_one_follower 15.5): 1 = the lend trace. One
   72-byte record per lend and per posted op (packet number, site, op kind, posted, E's arrival,
   R's start and end, E's resume, E's work since its previous record, R's busy time on other

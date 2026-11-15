@@ -1850,6 +1850,10 @@ private:
     bool UniformKeepBefore(size_t stage, u32 index, DAddr device_addr, u32 size, bool bank,
                            bool& provable);
     void UniformKeepLog(int mode);
+    /// FRITCHII_S4_COUNT (dry): hands one graphics uniform bind to the S4 counter
+    /// (fritchii_s4_count.h) with the tracker's state of its range and pages.
+    void S4CountBind(size_t stage, u32 index, DAddr device_addr, u32 size, bool stream,
+                     bool bank);
 
     /// FRITCHII_BIND_ADDR_MEMO: the last address translation of each vertex stream, the index
     /// buffer and each graphics uniform slot (Tegra::MemoryManager::GpuToCpuAddressMemo), and the

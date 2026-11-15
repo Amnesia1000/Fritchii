@@ -10,6 +10,7 @@
 
 #include "common/common_types.h"
 #include "common/fritchii_page_flags.h"
+#include "common/fritchii_s4_count.h"
 
 /// Who wrote game memory (FRITCHII_MEMSTAGE_READ_LOG, the memory seam's read log): every write
 /// emulator code makes to game memory, on any thread, after its bytes landed, by device address.
@@ -95,6 +96,10 @@ inline std::atomic<u64> g_quiet{0};
 inline void Note(u64 address, u64 size, const char* via) noexcept {
     if (BankMarks()) [[unlikely]] {
         g_buffer_write_pages.Mark(address, size);
+    }
+    // FRITCHII_S4_COUNT: who wrote the page (stream upload on E, or another thread's write).
+    if (S4Count::On()) [[unlikely]] {
+        S4Count::NoteWrite(address, size);
     }
     if (g_on.load(std::memory_order_relaxed)) [[unlikely]] {
         if (t_quiet) {

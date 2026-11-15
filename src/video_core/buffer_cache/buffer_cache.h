@@ -31,6 +31,7 @@
 #include "video_core/buffer_cache/uniform_stream_reuse.h"
 #include "video_core/buffer_churn_stats.h"
 #include "video_core/churn_counters.h"
+#include "video_core/fritchii_s4_count.h"
 #include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
@@ -1670,6 +1671,8 @@ template <class P>
 void BufferCache<P>::SetUniformBuffersState(const std::array<u32, NUM_STAGES>& mask,
                                             const UniformBufferSizes* sizes) {
     VideoCommon::MemoryStageLink::CheckBackCache("SetUniformBuffersState");
+    // FRITCHII_S4_COUNT: the counter follows its live switch, read once a draw here.
+    VideoCommon::S4Count::Poll();
     if (channel_state->enabled_uniform_buffer_masks == mask &&
         channel_state->uniform_buffer_sizes == sizes) [[likely]] {
         return;
@@ -2184,6 +2187,10 @@ template <class P>
 void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_written,
                                            DAddr device_addr, const u8* data, u64 size) {
     const Common::WriteRing::SiteScope write_site{"buffer download", true};
+    // FRITCHII_S4_COUNT: GPU results landing in game memory.
+    if (Common::S4Count::On()) [[unlikely]] {
+        Common::S4Count::MarkGens(Common::S4Count::Writer::Gpu, device_addr, size);
+    }
     Core::g_buffer_write_pages.Mark(device_addr, size);
     Core::g_watch_write_pages.Mark(device_addr, size);
     if (!cpu_written.Intersects(device_addr, size)) {
@@ -2676,6 +2683,10 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     // would take stay set for the next bind that reads the host buffer.
     const int bank_trims = native_bank_bind ? VideoCore::Nx2Debug::Experiment(26) : 0;
     const bool native_bank = native_bank_bind && !(use_fast_buffer && (bank_trims & 1) != 0);
+    // FRITCHII_S4_COUNT (dry): the bind before anything below reads its bytes.
+    if (Common::S4Count::On()) [[unlikely]] {
+        S4CountBind(stage, index, device_addr, size, use_fast_buffer, native_bank);
+    }
     // EDEN_NX2_MEMSTAGE_STATS: what this bind reads (the stream copies guest memory; the cached
     // path synchronizes the host buffer; the bank check compares the bank's pages).
     if (MemStageStats::Enabled()) [[unlikely]] {
@@ -3034,6 +3045,32 @@ void BufferCache<P>::UniformKeepLog(int mode) {
     stats = UniformKeepStats{};
     stats.stale_session = session;
     stats.since = now;
+}
+
+template <class P>
+void BufferCache<P>::S4CountBind(size_t stage, u32 index, DAddr device_addr, u32 size,
+                                 bool stream, bool bank) {
+    if (size == 0 || device_addr == 0) {
+        return;
+    }
+    VideoCommon::S4Count::BindFacts facts;
+    facts.device_addr = device_addr;
+    facts.size = size;
+    facts.stage = static_cast<u32>(stage);
+    facts.slot = index;
+    facts.stream = stream;
+    facts.bank = bank;
+    facts.cpu_modified = memory_tracker.IsRegionCpuModified(device_addr, size);
+    facts.gpu_modified = memory_tracker.IsRegionGpuModified(device_addr, size);
+    const VideoCommon::S4Count::PageTest cpu_page = [](void* self, u64 page) {
+        return static_cast<BufferCache*>(self)->memory_tracker.IsRegionCpuModified(
+            page, Core::DEVICE_PAGESIZE);
+    };
+    const VideoCommon::S4Count::PageTest gpu_page = [](void* self, u64 page) {
+        return static_cast<BufferCache*>(self)->memory_tracker.IsRegionGpuModified(
+            page, Core::DEVICE_PAGESIZE);
+    };
+    VideoCommon::S4Count::Bind(device_memory, facts, cpu_page, gpu_page, this);
 }
 
 template <class P>

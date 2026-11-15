@@ -55,6 +55,7 @@ add_library(
     fritchii_switch_defaults.cpp
     fritchii_write_ring.h
     fritchii_page_flags.h
+    fritchii_s4_count.h
     dynamic_library.cpp
     dynamic_library.h
     elf.h

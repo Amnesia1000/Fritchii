@@ -13,6 +13,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/fritchii_s4_count.h"
 #include "common/fritchii_write_ring.h"
 #include "common/logging.h"
 #include "common/nx2_uniform_keep_pages.h"
@@ -465,7 +466,8 @@ void MemoryManager::Write(GPUVAddr addr, T data) {
         const bool marks = Common::BankMarks();
         const bool kept = Common::UniformKeepPages::AnyKept();
         const bool ring = Common::WriteRing::g_on.load(std::memory_order_relaxed);
-        if (!marks && !kept && !ring) [[likely]] {
+        const bool s4 = Common::S4Count::On();
+        if (!marks && !kept && !ring && !s4) [[likely]] {
             return;
         }
         const auto address = GpuToCpuAddress(addr);
@@ -474,6 +476,10 @@ void MemoryManager::Write(GPUVAddr addr, T data) {
         }
         if (marks) {
             Common::g_buffer_write_pages.Mark(*address, sizeof(T));
+        }
+        if (s4) {
+            // FRITCHII_S4_COUNT: a stream write on E, a GPU result landing on any other thread.
+            Common::S4Count::NoteGpuWord(*address, sizeof(T));
         }
         if (kept) {
             Common::UniformKeepPages::Note(*address, sizeof(T));
