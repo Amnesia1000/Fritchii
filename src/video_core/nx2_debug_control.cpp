@@ -596,6 +596,12 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_ONEF_KEY_KEEP") {
         return &g_onef_key_keep;
     }
+    if (name == "FRITCHII_ONEF_UBO_KEEP") {
+        return &g_onef_ubo_keep;
+    }
+    if (name == "FRITCHII_BANK_FAST") {
+        return &g_bank_fast;
+    }
     return nullptr;
 }
 

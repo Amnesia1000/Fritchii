@@ -332,6 +332,12 @@ inline std::atomic<int> g_onef_cb_lean{-1};
 /// FRITCHII_ONEF_KEY_KEEP (live, default 0): fable_b 23.1 cut 2, 1 = count the clean lookups
 /// with no watched word written since their snapshot (compare still run), 2 = skip the compare.
 inline std::atomic<int> g_onef_key_keep{-1};
+/// FRITCHII_ONEF_UBO_KEEP (live, default 0): fable_b 25.2 cut a, 1 = count the streamed uniform
+/// binds a keep could skip and verify them, 2 = bind the slot's copy again without the read.
+inline std::atomic<int> g_onef_ubo_keep{-1};
+/// FRITCHII_BANK_FAST (live, default 0): fable_b 25.2 cut b, a settled native bank of a slot the
+/// bank check skips whole is skipped before the check's switch reads and upkeep.
+inline std::atomic<int> g_bank_fast{-1};
 /// EDEN_NX2_LIGHT_TABLE_ARRAYS: docs/fritchii/switches.md.
 [[nodiscard]] inline bool LightTableArrays() {
     static const bool on = EnvSwitch("EDEN_NX2_LIGHT_TABLE_ARRAYS") > 0;

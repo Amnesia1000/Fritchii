@@ -890,6 +890,19 @@ public:
         BankNone,      ///< No reason: EXP9=2 compares these only to verify
         BankReasons,
     };
+    /// FRITCHII_BANK_FAST (fable_b 25.2 cut b): what the last full CheckNativeBankPagesTracked
+    /// decided that does not depend on the bank: the switch generation it read its switches at,
+    /// the lost-store count it saw, its mode, and the slots whose settled banks it skips whole.
+    struct NativeBankFast {
+        u32 generation{};
+        u64 overflows{};
+        u32 skip_slots{};    ///< own (or flagged) slots, no verify, mode 3, the page table on
+        u32 flagged_slots{}; ///< of those, FRITCHII_BANK_FLAGGED's (for its counts)
+        int mode{};
+        bool ready{};
+    } native_bank_fast;
+    u64 native_bank_fast_hits{};
+
     struct NativeBankTrackedStats {
         u64 binds = 0;
         u64 pages_new = 0;
@@ -1813,6 +1826,30 @@ private:
     };
     std::array<std::array<UniformBindMemo, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES>
         uniform_bind_memo{};
+
+    /// FRITCHII_ONEF_UBO_KEEP (fable_b 25.2 cut a): each slot's last streamed bind, its pages'
+    /// write generations (Common::PriceGenSum) and whether the tracker held them clean.
+    struct UniformKeepMemo {
+        DAddr device_addr{};
+        u64 sum{};
+        u32 size{};
+        bool tracked{};
+        bool valid{};
+    };
+    std::array<std::array<UniformKeepMemo, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES>
+        uniform_keep_memo{};
+    struct UniformKeepStats {
+        u64 binds{};     ///< streamed binds looked at
+        u64 provable{};  ///< same range, unflagged, tracked then and now
+        u64 kept{};      ///< bound again without the read and the compare (=2)
+        u64 stale{};     ///< =1: provable, yet the bind found other bytes (must be 0)
+        u64 stale_session{};
+        std::chrono::steady_clock::time_point since{};
+    } uniform_keep_stats;
+    /// The streamed bind's keep test (true: bound again, done) and =1's verify after it.
+    bool UniformKeepBefore(size_t stage, u32 index, DAddr device_addr, u32 size, bool bank,
+                           bool& provable);
+    void UniformKeepLog(int mode);
 
     /// FRITCHII_BIND_ADDR_MEMO: the last address translation of each vertex stream, the index
     /// buffer and each graphics uniform slot (Tegra::MemoryManager::GpuToCpuAddressMemo), and the
