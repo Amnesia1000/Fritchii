@@ -914,7 +914,33 @@ void OneFollowerDraw::SyncFromEngine(Maxwell3D& engine, bool full) {
         // A new channel: the view follows its memory manager (a reference in Maxwell3D). The
         // R-owned objects stop naming the old view first (rule 2).
         LeaveView();
-        view = std::make_unique<Maxwell3D>(engine.GetMemoryManager());
+        const void* const memory = &engine.GetMemoryManager();
+        const bool keep = OneF::BindSeedOn();
+        Maxwell3D* next = nullptr;
+        if (keep) {
+            // FRITCHII_ONEF_BIND_SEED: channels alternate hundreds of times a second; the view a
+            // channel had is seeded in full below, so only its construction is saved.
+            for (const ViewSlot& slot : views) {
+                if (slot.engine == &engine && slot.memory == memory) {
+                    next = slot.view.get();
+                    break;
+                }
+            }
+        }
+        if (next == nullptr) {
+            if (!keep) {
+                views.clear(); // one view, the old one goes (as before the switch)
+            } else {
+                std::erase_if(views, [&](const ViewSlot& slot) { return slot.engine == &engine; });
+                if (views.size() >= 4) {
+                    views.erase(views.begin()); // R named none of them since LeaveView
+                }
+            }
+            auto fresh = std::make_unique<Maxwell3D>(engine.GetMemoryManager());
+            next = fresh.get();
+            views.push_back(ViewSlot{&engine, memory, std::move(fresh)});
+        }
+        view = next;
         view_source = &engine;
         full = true;
     }
@@ -1036,6 +1062,10 @@ void OneFollowerDraw::PlayDraw(const PacketHeader& header) {
         // The view follows another channel than the bound one: E lends after a bind until a lent
         // packet syncs the new channel's view, so this must not happen.
         OneF::Note(Check::RenderPacketMissing, "a played draw with the view of another channel");
+        if (OneF::BindSeedOn()) {
+            OneF::Note(Check::BindSeedView, "a played draw with the view of another channel");
+            OneF::StopBindSeed("a played draw found the view on another channel");
+        }
         DropDraw(header);
         return;
     }
@@ -1078,13 +1108,13 @@ void OneFollowerDraw::EnterView() {
         return;
     }
     auto& r = rasterizer;
-    saved_rasterizer = r.ExchangeMaxwell3D(view.get());
+    saved_rasterizer = r.ExchangeMaxwell3D(view);
     // Rule 3: the pipeline cache is E's then and always reads E's engine.
     if (!VideoCommon::OneFollower::g_e_pipeline) {
-        saved_pipeline = r.pipeline_cache.ExchangeMaxwell3D(view.get());
+        saved_pipeline = r.pipeline_cache.ExchangeMaxwell3D(view);
     }
-    saved_texture = r.texture_cache.ExchangeMaxwell3D(view.get());
-    saved_query = r.query_cache.ExchangeMaxwell3D(view.get());
+    saved_texture = r.texture_cache.ExchangeMaxwell3D(view);
+    saved_query = r.query_cache.ExchangeMaxwell3D(view);
     saved_tracker = r.state_tracker.ExchangeFlags(&view->dirty.flags);
     on_view = true;
 }
@@ -1124,7 +1154,13 @@ void OneFollowerDraw::AfterLent() {
     }
     Maxwell3D& engine = rasterizer.channel_state->maxwell3d;
     if (view_source != &engine) {
-        return; // a channel bind ran: the next lent packet makes the new channel's view
+        // A channel bind ran in this call. Without FRITCHII_ONEF_BIND_SEED the next lent packet
+        // makes the new channel's view (E's tracking waits for that packet's seed). With it
+        // Play re-seeded E's tracking here already (ViewReady): the view follows now, E parked.
+        if (!OneF::ViewReady() || OneF::Step() < StepLevel::Build) {
+            return;
+        }
+        SyncFromEngine(engine, true);
     }
     // Rule 1: after every lent call (not only lent draws) the view takes the engine's flags:
     // what the call consumed is consumed, what it raised (a new command buffer's invalidations)

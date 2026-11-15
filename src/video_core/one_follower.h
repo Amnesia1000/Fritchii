@@ -228,6 +228,9 @@ enum class Check : u8 {
     /// constant buffer binding R's view took by value differs from E's engine. The switch stops
     /// for the session.
     ViewValues,
+    /// FRITCHII_ONEF_BIND_SEED: a played draw found R's view on another channel than the bound
+    /// one (the re-seed inside the lent bind did not hold). The switch stops for the session.
+    BindSeedView,
     Count,
 };
 
@@ -240,6 +243,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Check::Count)> chec
     "R waits for E's lock", "R needs E's buffer flush",
     "build list draw", "played list args", "played kind without path", "sync mirror",
     "sync target missing", "sync target unused", "unlent reset", "view values",
+    "bind seed view",
 };
 
 // --- The packet (E to R) -----------------------------------------------------------------------------
@@ -773,6 +777,13 @@ void StopUnlentValues(const char* why) noexcept;
 /// the switch went off since (the view may be newer than the last lent packet: draws are lent
 /// until the next lent packet).
 [[nodiscard]] u8 EngineValuesMode() noexcept;
+/// FRITCHII_ONEF_BIND_SEED (live; fable_b 19 step 2; step 4): a lent call that binds another
+/// channel (RasterizerVulkan::BindChannel, LentOp::Channel) re-seeds E's tracking and R's views
+/// from the new channel's engine at its end, E still parked: what the next lent packet's seed
+/// did. So the first draw after a bind is not lent ("channel" on the transient lends line). R's
+/// part (c) view engines are kept per channel. Stopped for the session by "bind seed view".
+[[nodiscard]] bool BindSeedOn() noexcept;
+void StopBindSeed(const char* why) noexcept;
 
 /// E, before the Lend or PushOp of a query: its kind (counted with the park's time).
 void SetQueryKind(QueryKind kind) noexcept;
@@ -826,6 +837,10 @@ namespace Detail {
 /// E's write tracking stops (step below 2) or its engine changed: the next lent packet seeds the
 /// view in full. On E, or on R under a lent packet (E parked).
 void ViewTrackingStopped() noexcept;
+/// FRITCHII_ONEF_BIND_SEED, R at the end of a lent call that changed the bound channel (E
+/// parked): E's tracking starts over from `engine` and `view` is seeded from it, as PackSpans'
+/// seed and Play's SeedView do at the next lent packet with PacketSeed.
+void SeedAfterBind(RegisterView& view, const Maxwell3D& engine);
 } // namespace Detail
 
 } // namespace VideoCommon::OneFollower

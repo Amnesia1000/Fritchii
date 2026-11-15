@@ -249,6 +249,21 @@ namespace Detail {
 void ViewTrackingStopped() noexcept {
     g_e.restart.store(true, std::memory_order_release);
 }
+
+void SeedAfterBind(RegisterView& view, const Maxwell3D& engine) {
+    // PackSpans' seed branch (E's side; R stands in for E, which is parked in this lent call),
+    // then Play's SeedView of the generic view.
+    g_e.restart.store(false, std::memory_order_relaxed);
+    g_e.started = true;
+    for (const u16 index : g_e.touched) {
+        g_e.noted.reset(index);
+    }
+    g_e.touched.clear();
+    g_e.after = engine.dirty.flags & Parts().forward;
+    NotePools(engine);
+    ResetValues(engine);
+    SeedView(view, engine);
+}
 } // namespace Detail
 
 bool ViewReady() noexcept {

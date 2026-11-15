@@ -148,6 +148,7 @@ struct Impl {
     std::atomic<bool> post_fence_stopped{};
     std::atomic<bool> unlent_reset_stopped{}; ///< StopUnlentReset
     std::atomic<bool> unlent_values_stopped{}; ///< StopUnlentValues
+    std::atomic<bool> bind_seed_stopped{};     ///< StopBindSeed
     // fable_b 13.0 (E only): pages with a report a posted fence lands, by that fence's packet
     // number; and the report pages since the last fence.
     std::unordered_map<u64, u64> landing_pages;
@@ -802,6 +803,15 @@ Stats::RenderTime Play(const PacketHeader& header, const u8* spans) {
         --t_lent_depth;
         if (around) {
             AfterLentCall(view, *engine);
+        }
+        // FRITCHII_ONEF_BIND_SEED: the call bound another channel (SetEngine), E is still
+        // parked: E's tracking and the views start over from the new engine here, not at the
+        // next lent packet (the draw after a bind was lent only to carry that seed).
+        if (view_on) {
+            Maxwell3D* const bound = g.engine.load(std::memory_order_acquire);
+            if (bound != nullptr && bound != engine && BindSeedOn()) {
+                Detail::SeedAfterBind(view, *bound);
+            }
         }
         if (player != nullptr) {
             player->AfterLent(); // the views take the engine's flags; R is on the view again
@@ -1855,6 +1865,20 @@ void StopUnlentValues(const char* why) noexcept {
     if (!g.unlent_values_stopped.exchange(true, std::memory_order_relaxed)) {
         LOG_CRITICAL(HW_GPU,
                      "One follower: FRITCHII_ONEF_UNLENT_VALUES stops for this session ({})",
+                     why != nullptr ? why : "?");
+    }
+}
+
+bool BindSeedOn() noexcept {
+    return g.on && Step() == StepLevel::Unlend &&
+           VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_bind_seed,
+                                            "FRITCHII_ONEF_BIND_SEED") != 0 &&
+           !g.bind_seed_stopped.load(std::memory_order_relaxed);
+}
+
+void StopBindSeed(const char* why) noexcept {
+    if (!g.bind_seed_stopped.exchange(true, std::memory_order_relaxed)) {
+        LOG_CRITICAL(HW_GPU, "One follower: FRITCHII_ONEF_BIND_SEED stops for this session ({})",
                      why != nullptr ? why : "?");
     }
 }

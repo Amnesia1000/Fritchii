@@ -171,7 +171,15 @@ private:
     RasterizerVulkan& rasterizer;
 
     // R only (E reads the synced_* fields below only after a lent packet released it).
-    std::unique_ptr<Maxwell3D> view;
+    Maxwell3D* view{}; ///< the view engine of the channel R follows (one of `views`)
+    /// The view engines: with FRITCHII_ONEF_BIND_SEED one per channel's engine (and its memory
+    /// manager), kept across binds; without it only the current one, as before.
+    struct ViewSlot {
+        const Maxwell3D* engine{};
+        const void* memory{};
+        std::unique_ptr<Maxwell3D> view;
+    };
+    std::vector<ViewSlot> views;
     const Maxwell3D* view_source{}; ///< the engine the view follows (its channel)
     const PacketHeader* playing{};
     bool nested{};                  ///< inside RunLent's own Draw call

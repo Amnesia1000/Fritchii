@@ -1483,6 +1483,19 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   draws are lent until the next lent packet. Must be 0: "view values", at lent draws and every
   16th other lent packet R compares the view's by-value values with E's engine before taking
   the engine's; a difference stops the switch for the session.
+- FRITCHII_ONEF_BIND_SEED (live, default 0; fable_b_one_follower 19 step 2; step 4): 1 = a lent
+  channel bind (BindChannel, about 800 a second in the market) re-seeds at its own end, E still
+  parked: E's tracking starts over from the new channel's engine (PackSpans' seed), the generic
+  view is seeded from it, and R's part (c) view follows the new channel (SyncFromEngine in full,
+  then R names it again). Before, the view kept the old channel until the next lent packet, so
+  the first draw after every bind was lent only to carry that seed ("channel" on the transient
+  lends line) and paid R's whole backlog. R's view engines are kept per channel (at most 4), so
+  a bind back costs a full copy, not a new engine. Must be 0: "bind seed view" (a played draw
+  found the view on another channel), which stops the switch for the session.
+  The bind itself stays lent: the rasterizer's channel fields (channel_state, maxwell3d,
+  gpu_memory, kepler_compute) are read by E (RouteDraw, the posted clear's FlushCaching, the
+  query and flush tests) and by R (played draws, ops) at their own places, and the view scope
+  saves and restores maxwell3d on R; a posted bind needs those split into E's and R's copies.
 - FRITCHII_ONEF_TRACE (boot, default 0; fable_b_one_follower 15.5): 1 = the lend trace. One
   72-byte record per lend and per posted op (packet number, site, op kind, posted, E's arrival,
   R's start and end, E's resume, E's work since its previous record, R's busy time on other
