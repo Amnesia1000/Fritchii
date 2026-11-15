@@ -224,6 +224,10 @@ enum class Check : u8 {
     /// reset test (made before the lend) differs from the test on E's engine inside the lent
     /// call. The switch stops for the session.
     UnlentReset,
+    /// FRITCHII_ONEF_UNLENT_VALUES: at a lent packet, the engine hint, the macro mode or a
+    /// constant buffer binding R's view took by value differs from E's engine. The switch stops
+    /// for the session.
+    ViewValues,
     Count,
 };
 
@@ -235,13 +239,13 @@ inline constexpr std::array<const char*, static_cast<size_t>(Check::Count)> chec
     "facts stale", "played lookup miss", "texture read ahead of R", "ring B pairing",
     "R waits for E's lock", "R needs E's buffer flush",
     "build list draw", "played list args", "played kind without path", "sync mirror",
-    "sync target missing", "sync target unused", "unlent reset",
+    "sync target missing", "sync target unused", "unlent reset", "view values",
 };
 
 // --- The packet (E to R) -----------------------------------------------------------------------------
 // One ring, one writer (E), one reader (R). Every packet starts with a PacketHeader; its spans
 // follow in this order, each present when its bit is in `spans`, each padded to 8 bytes:
-//   RegPair[delta_count], FlagBits, DrawValues, Programs, Pools.
+//   RegPair[delta_count], FlagBits, DrawValues, Programs, Pools, EngineValues, Binds.
 // The buffer half of a draw is MemStage's DrawPacket in ring B (vk_mem_stage.h), filled by E with
 // FillRingDraw and taken by R with TakeRingDraw; `buffer_number` names it. Ring B keeps its format.
 
@@ -260,6 +264,11 @@ enum SpanBit : u8 {
     SpanDraw = 4,     ///< DrawValues
     SpanPrograms = 8, ///< Programs
     SpanPools = 16,   ///< Pools
+    /// FRITCHII_ONEF_UNLENT_VALUES: EngineValues (sent when they changed since the last packet).
+    SpanEngine = 32,
+    /// FRITCHII_ONEF_UNLENT_VALUES: BindsHeader then BindValue[count], the constant buffer
+    /// bindings E bound since the last packet, with their values at the packet.
+    SpanBinds = 64,
 };
 
 enum PacketFlag : u8 {
@@ -280,6 +289,11 @@ enum PacketFlag : u8 {
     /// engine at its place and the draw is not an indirect reset; R does not test it again
     /// (the test reads the program's code in game memory, which R must not do out of a lend).
     PacketNoReset = 16,
+    /// A lent packet (FRITCHII_ONEF_UNLENT_VALUES): every change of the engine hint, the macro
+    /// mode and the constant buffer bindings since the last lent packet went to R by value, this
+    /// packet's spans included; R may compare its view's values with E's engine before it takes
+    /// the engine's (Check::ViewValues).
+    PacketValues = 32,
 };
 
 /// One changed register word R watches.
@@ -331,6 +345,33 @@ struct Pools {
     u32 tsc_limit;
     u32 reserved;
 };
+
+/// What SyncFromEngine copies at a lent packet besides the bindings, by value (SpanEngine).
+struct EngineValues {
+    u32 engine_state; ///< Maxwell3D::EngineHint
+    u8 native;        ///< the native macro mode (MacroEngine::native_turing)
+    u8 reserved[3];
+};
+static_assert(sizeof(EngineValues) == 8);
+
+/// SpanBinds: the count, then that many BindValue.
+struct BindsHeader {
+    u32 count;
+    u32 reserved;
+};
+/// One constant buffer binding (Maxwell3D::state.shader_stages[stage].const_buffers[slot]).
+struct BindValue {
+    u8 stage;
+    u8 slot;
+    u8 enabled;
+    u8 reserved;
+    u32 size;
+    GPUVAddr address;
+};
+static_assert(sizeof(BindValue) == 16);
+/// Bindings in the engine's state (5 stages of 18): BindValue entries a packet carries at most.
+inline constexpr u32 MaxBindValues =
+    static_cast<u32>(Maxwell3D::Regs::MaxShaderStage * Maxwell3D::Regs::MaxConstBuffers);
 
 /// A lent operation: run on R with E parked. `function(argument)` is E's code, unchanged.
 struct LentCall {
@@ -719,6 +760,19 @@ void CountTransient(TransientTest test, u32 kind) noexcept;
 /// the others are pushed with PacketNoReset. Stopped for the session by "unlent reset".
 [[nodiscard]] bool UnlentResetOn() noexcept;
 void StopUnlentReset(const char* why) noexcept;
+/// FRITCHII_ONEF_UNLENT_VALUES (live; fable_b 19 step 2; step 4): the engine hint, the macro mode
+/// and the constant buffer bindings (what SyncFromEngine copies at a lent packet besides the
+/// registers) go to R's view by value in the packets when they change (SpanEngine, SpanBinds),
+/// so a draw after a change of them is not lent to sync the view. E takes it on at a lent packet
+/// (where R's view takes the engine's values) and gives it up the same way. Stopped for the
+/// session by "view values".
+[[nodiscard]] bool UnlentValuesOn() noexcept;
+void StopUnlentValues(const char* why) noexcept;
+/// E: where FRITCHII_ONEF_UNLENT_VALUES stands for R's view: 0 = off (the values come with lent
+/// packets only), 1 = by value since the last lent packet (every change is in a packet), 2 =
+/// the switch went off since (the view may be newer than the last lent packet: draws are lent
+/// until the next lent packet).
+[[nodiscard]] u8 EngineValuesMode() noexcept;
 
 /// E, before the Lend or PushOp of a query: its kind (counted with the park's time).
 void SetQueryKind(QueryKind kind) noexcept;

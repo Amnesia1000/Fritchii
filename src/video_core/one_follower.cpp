@@ -147,6 +147,7 @@ struct Impl {
     std::array<std::atomic<u64>, 3> mirror_count{}; ///< compared, E set R not, R set E not
     std::atomic<bool> post_fence_stopped{};
     std::atomic<bool> unlent_reset_stopped{}; ///< StopUnlentReset
+    std::atomic<bool> unlent_values_stopped{}; ///< StopUnlentValues
     // fable_b 13.0 (E only): pages with a report a posted fence lands, by that fence's packet
     // number; and the report pages since the last fence.
     std::unordered_map<u64, u64> landing_pages;
@@ -323,11 +324,12 @@ u64 g_lend_sites_log_ns{};
 /// R: the number of the packet it plays (or played last): its place for the page write stamps.
 thread_local u32 t_play_number{};
 constexpr u64 StampSlots = u64{1} << 22;
-/// The most a packet's spans can take (every register word, the flags, the draw, the programs
-/// and the pools), and an op packet's payload after them.
+/// The most a packet's spans can take (every register word, the flags, the draw, the programs,
+/// the pools, the engine values and every binding), and an op packet's payload after them.
 constexpr std::size_t MaxSpanBytes = sizeof(RegPair) * Maxwell3D::Regs::NUM_REGS +
                                      sizeof(FlagBits) + sizeof(DrawValues) + sizeof(Programs) +
-                                     sizeof(Pools) + 64;
+                                     sizeof(Pools) + sizeof(EngineValues) + sizeof(BindsHeader) +
+                                     sizeof(BindValue) * MaxBindValues + 64;
 constexpr std::size_t MaxPayloadBytes = 64;
 
 /// E's packet buffer (fable_b 11.1 item 0): allocated once per thread, written at a cursor, never
@@ -1838,6 +1840,21 @@ bool UnlentResetOn() noexcept {
 void StopUnlentReset(const char* why) noexcept {
     if (!g.unlent_reset_stopped.exchange(true, std::memory_order_relaxed)) {
         LOG_CRITICAL(HW_GPU, "One follower: FRITCHII_ONEF_UNLENT_RESET stops for this session ({})",
+                     why != nullptr ? why : "?");
+    }
+}
+
+bool UnlentValuesOn() noexcept {
+    return g.on && Step() == StepLevel::Unlend &&
+           VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_unlent_values,
+                                            "FRITCHII_ONEF_UNLENT_VALUES") != 0 &&
+           !g.unlent_values_stopped.load(std::memory_order_relaxed);
+}
+
+void StopUnlentValues(const char* why) noexcept {
+    if (!g.unlent_values_stopped.exchange(true, std::memory_order_relaxed)) {
+        LOG_CRITICAL(HW_GPU,
+                     "One follower: FRITCHII_ONEF_UNLENT_VALUES stops for this session ({})",
                      why != nullptr ? why : "?");
     }
 }

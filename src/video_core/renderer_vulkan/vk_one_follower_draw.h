@@ -153,6 +153,11 @@ private:
     void ResyncFlags(const Maxwell3D& engine);
     /// The view takes the spans of one packet.
     void ApplyViewSpans(const PacketHeader& header, const u8* spans);
+    /// FRITCHII_ONEF_UNLENT_VALUES: the view takes a packet's SpanEngine and SpanBinds.
+    void ApplyValueSpans(const PacketHeader& header, const u8* spans);
+    /// At a lent packet with PacketValues (E parked): the view's by-value values against E's
+    /// engine (Check::ViewValues; the switch stops on a difference).
+    void CompareValues(Maxwell3D& engine);
     /// At a lent packet (E parked): the view takes from E's engine what deltas do not carry, or
     /// everything (`full`).
     void SyncFromEngine(Maxwell3D& engine, bool full);

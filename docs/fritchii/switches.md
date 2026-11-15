@@ -1472,6 +1472,17 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   forced-lent verify draws compare E's answer with the test on E's engine inside the lent call:
   must-be-0 "unlent reset", which stops the switch for the session. "indirect reset" on the
   transient lends line is what it removes (the market's mesh draws, about 290 a second, E).
+- FRITCHII_ONEF_UNLENT_VALUES (live, default 0; fable_b_one_follower 19 step 2; step 4): 1 = what
+  R's view took only at lent packets besides the registers (SyncFromEngine: the engine hint
+  engine_state, the native macro mode, the constant buffer bindings state.shader_stages) goes
+  in the packets by value when it changes: SpanEngine (8 bytes) and SpanBinds (each binding
+  ProcessCBBind wrote since the last packet, 16 bytes each), after the pools span. A draw after
+  an HLE macro or a macro mode change is then not lent to sync the view ("engine hint" and
+  "native mode" on the transient lends line). E takes the mode on at a lent packet (R's view
+  takes the engine's values there) and gives it up the same way: after the switch goes off,
+  draws are lent until the next lent packet. Must be 0: "view values", at lent draws and every
+  16th other lent packet R compares the view's by-value values with E's engine before taking
+  the engine's; a difference stops the switch for the session.
 - FRITCHII_ONEF_TRACE (boot, default 0; fable_b_one_follower 15.5): 1 = the lend trace. One
   72-byte record per lend and per posted op (packet number, site, op kind, posted, E's arrival,
   R's start and end, E's resume, E's work since its previous record, R's busy time on other
