@@ -334,6 +334,84 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 // main.cpp: the test switches this launch runs with, grouped by where each came from.
 std::string Nx2SwitchSummary();
 
+#ifdef _WIN32
+// The Windows power plan and power mode (Settings > Power: Best power efficiency, Balanced, Best
+// performance), logged at each game start: the mode changes how fast the cores clock up, so two
+// runs on different modes can differ in fps. powrprof.dll is loaded here, not linked; the mode
+// call (PowerGetEffectiveOverlayScheme) exists from Windows 10 1709 on.
+static std::string WindowsPowerText() {
+    std::string text;
+    if (const HMODULE powrprof = LoadLibraryW(L"powrprof.dll")) {
+        using GetActiveScheme = DWORD(WINAPI*)(HKEY, GUID**);
+        using ReadFriendlyName = DWORD(WINAPI*)(HKEY, const GUID*, const GUID*, const GUID*,
+                                                UCHAR*, DWORD*);
+        using GetOverlay = DWORD(WINAPI*)(GUID*);
+        const auto get_active = reinterpret_cast<GetActiveScheme>(
+            reinterpret_cast<void*>(GetProcAddress(powrprof, "PowerGetActiveScheme")));
+        const auto read_name = reinterpret_cast<ReadFriendlyName>(
+            reinterpret_cast<void*>(GetProcAddress(powrprof, "PowerReadFriendlyName")));
+        const auto get_overlay = reinterpret_cast<GetOverlay>(
+            reinterpret_cast<void*>(GetProcAddress(powrprof, "PowerGetEffectiveOverlayScheme")));
+        GUID* scheme = nullptr;
+        if (get_active != nullptr && get_active(nullptr, &scheme) == ERROR_SUCCESS && scheme) {
+            DWORD size = 0;
+            std::wstring name;
+            if (read_name != nullptr &&
+                read_name(nullptr, scheme, nullptr, nullptr, nullptr, &size) == ERROR_SUCCESS &&
+                size >= sizeof(wchar_t)) {
+                name.resize(size / sizeof(wchar_t));
+                if (read_name(nullptr, scheme, nullptr, nullptr,
+                              reinterpret_cast<UCHAR*>(name.data()), &size) != ERROR_SUCCESS) {
+                    name.clear();
+                }
+            }
+            text += fmt::format("plan {}",
+                                name.empty() ? std::string{"unknown"}
+                                             : QString::fromWCharArray(name.c_str()).toStdString());
+            LocalFree(scheme);
+        }
+        GUID overlay{};
+        if (get_overlay != nullptr && get_overlay(&overlay) == ERROR_SUCCESS) {
+            struct Mode {
+                GUID guid;
+                const char* name;
+            };
+            static constexpr Mode Modes[] = {
+                {{0x961cc777, 0x2547, 0x4f9d, {0x81, 0x74, 0x7d, 0x86, 0x18, 0x1b, 0x8a, 0x7a}},
+                 "best power efficiency"},
+                {{0x00000000, 0x0000, 0x0000, {0, 0, 0, 0, 0, 0, 0, 0}}, "balanced"},
+                {{0x3af9b8d9, 0x7c97, 0x431d, {0xad, 0x78, 0x34, 0xa8, 0xbf, 0xea, 0x43, 0x9f}},
+                 "better performance"},
+                {{0xded574b5, 0x45a0, 0x4f42, {0x87, 0x37, 0x46, 0x34, 0x5c, 0x09, 0xc2, 0x38}},
+                 "best performance"},
+            };
+            std::string mode;
+            for (const Mode& known : Modes) {
+                if (IsEqualGUID(overlay, known.guid)) {
+                    mode = known.name;
+                }
+            }
+            if (mode.empty()) {
+                const auto& d = overlay.Data4;
+                mode = fmt::format("{:08x}-{:04x}-{:04x}-{:02x}{:02x}-"
+                                   "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                                   overlay.Data1, overlay.Data2, overlay.Data3, d[0], d[1], d[2],
+                                   d[3], d[4], d[5], d[6], d[7]);
+            }
+            text += fmt::format("{}mode {}", text.empty() ? "" : ", ", mode);
+        }
+        FreeLibrary(powrprof);
+    }
+    SYSTEM_POWER_STATUS status{};
+    if (GetSystemPowerStatus(&status) && status.BatteryFlag != 128 && status.BatteryFlag != 255) {
+        text += fmt::format("{}{}{}", text.empty() ? "" : ", ",
+                            status.ACLineStatus == 0 ? "on battery" : "plugged in",
+                            status.SystemStatusFlag == 1 ? ", battery saver on" : "");
+    }
+    return text.empty() ? std::string{"unknown"} : text;
+}
+#endif
+
 constexpr int default_mouse_hide_timeout = 2500;
 constexpr int default_input_update_timeout = 1;
 constexpr int EmuThreadStopTimeoutMs = 10'000;
@@ -2377,6 +2455,9 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     } else {
         LOG_INFO(Frontend, "Test switches: none set");
     }
+#ifdef _WIN32
+    LOG_INFO(Frontend, "Power: {}", WindowsPowerText());
+#endif
     const auto gpu_vendor = QtCommon::system->GPU().Renderer().GetDeviceVendor();
     UpdateWindowTitle(title_name, title_version, gpu_vendor);
 
