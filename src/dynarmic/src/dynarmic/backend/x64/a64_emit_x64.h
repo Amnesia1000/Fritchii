@@ -187,6 +187,15 @@ public:
     const void* terminal_handler_pop_rsb_dry = nullptr;   ///< rax = the site's slot
     const void* terminal_handler_indirect_slot_miss = nullptr; ///< rbx = descriptor, rax = slot
 
+    /// Fritchii: FRITCHII_JIT_FAR_CODE (boot, default 0; Fable A 2.1). 1 = a block's slow paths
+    /// (deferred emits) go to a far region at the end of the code space, so the hot bytes of
+    /// blocks sit next to each other. Only with a code cache of 64 MiB or more.
+    static bool FarCodeEnabled();
+    bool far_code = false;
+    /// The last emitted block's far part (nullptr / 0 when it had none), for the code dump.
+    CodePtr last_far_entry = nullptr;
+    size_t last_far_size = 0;
+
     A64::Jit* jit_interface = nullptr;
     void (*memory_read_128)() = nullptr;
     void (*memory_write_128)() = nullptr;

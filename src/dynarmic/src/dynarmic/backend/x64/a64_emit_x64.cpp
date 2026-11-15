@@ -124,6 +124,17 @@ bool A64EmitX64::OmitFramePointer() {
     return omit;
 }
 
+bool A64EmitX64::FarCodeEnabled() {
+    static const bool enabled = [] {
+        const bool value = EnvSwitch("FRITCHII_JIT_FAR_CODE") != 0;
+        if (value) {
+            LOG_INFO(Core_ARM, "FRITCHII_JIT_FAR_CODE=1: slow paths in a far region (3/8 of the code cache)");
+        }
+        return value;
+    }();
+    return enabled;
+}
+
 A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_interface)
         : EmitX64(code), conf(conf)
         , fast_dispatch_table_size{size_t{1} << FastDispatchTableBits(fast_dispatch_table_default_bits, fast_dispatch_table_min_bits)}
@@ -139,6 +150,11 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
     GenMemory128Accessors();
     GenFastmemFallbacks();
     GenTerminalHandlers();
+    // Fritchii (FRITCHII_JIT_FAR_CODE): 5/8 of the space for blocks, 3/8 for their slow paths.
+    if (FarCodeEnabled() && code.GetTotalCodeSize() >= (size_t{64} << 20)) {
+        code.EnableFarCode(code.GetTotalCodeSize() / 8 * 3);
+        far_code = true;
+    }
     code.PreludeComplete();
     ClearFastDispatchTable();
 
@@ -236,10 +252,27 @@ finish_this_inst:
         code.mov(rbp, code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)]);
     }
     EmitTerminal(block.terminal, ctx.Location().SetSingleStepping(false), ctx.IsSingleStep());
-    code.int3();
-    for (auto& deferred_emit : ctx.deferred_emits)
-        deferred_emit();
-    code.int3();
+    last_far_entry = nullptr;
+    last_far_size = 0;
+    if (far_code) {
+        // Fritchii (FRITCHII_JIT_FAR_CODE): the terminal ends in a jump; the slow paths go to the
+        // far region (their jumps from the block are near jumps, their jumps back go to labels
+        // already defined), so the next block follows this one's terminal.
+        if (!ctx.deferred_emits.empty()) {
+            code.SwitchToFarCode();
+            last_far_entry = code.getCurr();
+            for (auto& deferred_emit : ctx.deferred_emits)
+                deferred_emit();
+            code.int3();
+            last_far_size = size_t(code.getCurr() - static_cast<const u8*>(last_far_entry));
+            code.SwitchToNearCode();
+        }
+    } else {
+        code.int3();
+        for (auto& deferred_emit : ctx.deferred_emits)
+            deferred_emit();
+        code.int3();
+    }
 
     const size_t size = size_t(code.getCurr() - entrypoint);
 

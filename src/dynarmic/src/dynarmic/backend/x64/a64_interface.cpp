@@ -267,7 +267,10 @@ public:
         if (emitter.GetBasicBlock(descriptor)) {
             return false;
         }
-        if (block_of_code.SpaceRemaining() < (size_t{256} << 20)) {
+        // Fritchii (FRITCHII_JIT_FAR_CODE): half of the smaller region, as 256 MiB is of 512.
+        const size_t keep_free = block_of_code.HasFarCode() ? block_of_code.SmallestRegionSize() / 2
+                                                            : (size_t{256} << 20);
+        if (block_of_code.SpaceRemaining() < keep_free) {
             return false;
         }
         static_cast<void>(GetBlock(descriptor));

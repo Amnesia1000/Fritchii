@@ -41,6 +41,13 @@ class BlockOfCode final : public Xbyak::CodeGenerator {
 public:
     BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_code_size, std::function<void(BlockOfCode&)> rcp);
     BlockOfCode(const BlockOfCode&) = delete;
+    // Fritchii (FRITCHII_JIT_FAR_CODE): Xbyak's limit is the near region's end while near code is
+    // emitted; the base class frees the whole space.
+    ~BlockOfCode() {
+        if (far_code_begin != 0) {
+            maxSize_ = code_space_size;
+        }
+    }
 
     /// Call when external emitters have finished emitting their preludes.
     void PreludeComplete();
@@ -205,6 +212,7 @@ private:
     size_t far_code_begin = 0;
     size_t far_code_offset = 0;
     size_t near_code_offset = 0;
+    size_t code_space_size = 0; // the whole space (Xbyak's maxSize_ ends at the near region)
     bool in_far_code = false;
 #ifdef _WIN32
     size_t far_committed_size = 0;
