@@ -358,7 +358,9 @@ constexpr std::size_t MaxSpanBytes = sizeof(RegPair) * Maxwell3D::Regs::NUM_REGS
                                      sizeof(FlagBits) + sizeof(DrawValues) + sizeof(Programs) +
                                      sizeof(Pools) + sizeof(EngineValues) + sizeof(BindsHeader) +
                                      sizeof(BindValue) * MaxBindValues + 64;
-constexpr std::size_t MaxPayloadBytes = 64;
+// 128 (2026-11-15): SEM_E's payload fence op (targets, note) is 96 bytes; at 64 it ran on E
+// (PushOp's oversize fallback) and recorded R's Vulkan work from E: a driver crash at boot.
+constexpr std::size_t MaxPayloadBytes = 128;
 
 /// FRITCHII_ONEF_CARRY_OPS (fable_b 22.3 step 2): one op E keeps for the next packet, followed by
 /// its payload padded to 8 bytes.
