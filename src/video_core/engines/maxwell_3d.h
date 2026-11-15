@@ -3625,6 +3625,21 @@ private:
                               const u32* words, u32 count);
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 macro, u32 method,
                       u32 count);
+    /// FRITCHII_E2C_ON_E (fable_b 19.5 step 4, fable_front_drains_b 1.4): the 0xe2c macro's
+    /// render_enable.mode write, sent as a call E runs at its stream place: it reads the six
+    /// words there (the drained read's flushes first) and writes the mode the macro's formula
+    /// makes of them (`p0` its first parameter); with `verify` it compares with `front_value`
+    /// (what the front's drained read made) and writes that.
+    void FrontSendE2cCondition(VideoCommon::GpuSplit& split, FrontState& state, u32 p0,
+                               u32 front_value, bool verify);
+    /// E's half of it (StageCall::E2cCondition).
+    void BackE2cCondition(Core::System& system, GPUVAddr source, u32 p0, u32 front_value,
+                          bool verify);
+    /// The front's copy of render_enable.mode (and its shadow RAM word) is unknown after a
+    /// deferred 0xe2c until written again: fetched from E when something reads it.
+    void FrontResolveE2cMode(VideoCommon::GpuSplit& split, FrontState& state);
+    /// Before the front writes render_enable.mode while it is unknown: what stays unknown.
+    void FrontNoteE2cModeWrite(VideoCommon::GpuSplit& split, FrontState& state);
     /// Tells the split a report just sent releases a known payload (GpuSplit::NoteRelease).
     void FrontNoteRelease(VideoCommon::GpuSplit& split, const FrontState& fs, u32 query) const;
     /// The memory `amount` words of `method` write, if known (constant buffer uploads, reports).

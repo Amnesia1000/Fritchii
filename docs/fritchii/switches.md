@@ -357,6 +357,47 @@ answer's same-frame sample counters). Per second:
 - With FRITCHII_FRONT_RAN_READS on, it counts only the misses that switch did not spare (with 2:
   would not spare).
 
+### FRITCHII_E2C_ON_E (the "0xe2c on E" lines)
+
+FRITCHII_E2C_ON_E (live, default 0 = exactly as before; fable_b_one_follower 19.5 step 4,
+fable_front_drains_b 1.4). The 0xe2c occlusion macro (hash 0x3b26ab7eb3fc9863, with a macro
+switch on, as by default) reads six words (two sample counters 16 bytes apart) and writes
+render_enable.mode = p0, or p0 ^ 1 when the counters differ. Its read was the front's largest wait
+(the "macro dma read" drain, about 120 ms/s at the market). With the switch on, where the front
+would wait for the back, the macro gets six zero words instead (so it writes p0) and that write
+goes to E as a call at the same stream place (Maxwell3D::FrontSendE2cCondition). E, there, does
+what the drained read did: with one follower it first waits for R to play the newest report op
+it pushed and the reports a posted fence lands on the bytes (the rule of the front's E-position
+waits), flushes the buffer cache's dirty pages of the read and the listed reports of its bytes
+(EXP73's test), reads the words, and writes the mode the macro's formula makes of them
+(Maxwell3D::BackE2cCondition), the sink first as for a Direct entry.
+- 1: deferred only where the read would wait: a page snapshot miss (the drain), the dispatch
+  check that would wait (asked without the wait; Queued defers), a listed report on the bytes or
+  no snapshot path. The pages of a deferred read get a pending snapshot, current once the back ran
+  the call (GpuSplit::Ran); until then reads of those pages are deferred too.
+- 2: verify. The front reads as before; every call is also evaluated by E, which compares its
+  mode with the front's and writes the front's. "differed" must be 0.
+- 3: every call deferred (no snapshots used). For pricing E's side only.
+- Not with EXP53's predicate, a replaying shadow RAM, EDEN_NX2_MACRO_DMA_DRAIN,
+  EDEN_NX2_CMDPAGE_DIAG or EDEN_NX2_QUERY_DMA_TRACE, and FRITCHII_FRONT_RAN_READS=2's compared
+  reads keep their drain.
+- The front's copy of render_enable.mode (and its shadow word in a tracking mode) holds p0 until
+  the next write of the register (the 0xe2a after the object's draws). A macro reading it, or a
+  replaying write, fetches E's value first ("mode fetched from E", expected 0; none of the
+  transcribed OoT macros reads it). EDEN_NX2_SPLIT_VERIFY takes E's value without a difference.
+
+"0xe2c on E (FRITCHII_E2C_ON_E=n) front 10 s" (HW_GPU, Info), per second: reads deferred
+(snapshot misses, of them on a still pending snapshot; other drained reads; every call with 3),
+pending snapshots found run, calls sent, verify calls; mode fetched from E (expected 0); p0
+differs (must be 0: the macro's write from zero words was not its p0).
+
+"0xe2c on E: E 10 s" (HW_GPU, Info), per second: calls evaluated (and how many gave True), how
+many first waited for R to play its report ops, buffer flushes, report flushes; verify compared
+and differed (must be 0, with the session's total).
+
+Read it with the "Front waits by site" / profile's "macro dma read": it should fall to the
+forwarded and snapshot hits' cost, and E's time grows by its waits for R.
+
 ### FRITCHII_FRONT_RAN_READS
 
 FRITCHII_FRONT_RAN_READS (live, default 0 = exactly as before; the market's "Front 0xe2c misses"

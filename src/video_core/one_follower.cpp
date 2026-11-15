@@ -124,6 +124,8 @@ struct Impl {
     u64 query_log_ns{};
     std::atomic<bool> query_ops_logged{};
     std::atomic<u64> guest_write_op{}; ///< GuestWriteOpMark
+    /// E only: the packet number of that newest op (WaitGuestWriteOps).
+    u64 guest_write_number{};
     /// Lends E made holding a watched lock (handed to R for the park), the op packets' line.
     std::atomic<u64> lends_holding_lock{};
     u64 lends_holding_lock_logged{};
@@ -1558,7 +1560,21 @@ void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size,
         // Before E's next `consumed` store (seq_cst there): a front that sees E past this entry
         // sees this mark too.
         g.guest_write_op.store(header.position + 1, std::memory_order_release);
+        g.guest_write_number = header.number;
     }
+}
+
+bool WaitGuestWriteOps() noexcept {
+    if (!Detail::t_engine) {
+        return false;
+    }
+    const u64 number = g.guest_write_number;
+    if (number == 0 || g.played.load(std::memory_order_acquire) >= number) {
+        return false;
+    }
+    EngineWait([&] { return g.played.load(std::memory_order_acquire) >= number; }, EWait::Drain,
+               number);
+    return true;
 }
 
 bool WaitsE() noexcept {

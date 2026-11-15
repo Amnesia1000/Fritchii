@@ -108,6 +108,19 @@ struct Maxwell3D::StageCall {
             engine->draw_manager.draw_state.list_keep_id = keep_id;
         }
     };
+    /// FRITCHII_E2C_ON_E: the 0xe2c macro's render_enable.mode write, evaluated by E
+    /// (Maxwell3D::BackE2cCondition). Untagged: the memory stage takes it as a level entry.
+    struct E2cCondition {
+        Maxwell3D* engine;
+        Core::System* system;
+        GPUVAddr source;
+        u32 p0;
+        u32 front_value;
+        u32 verify;
+        void operator()() const {
+            engine->BackE2cCondition(*system, source, p0, front_value, verify != 0);
+        }
+    };
     static constexpr u64 FinishMacroFlags =
         VideoCommon::StageTagBits(VideoCommon::StageTag::FinishMacro);
     static constexpr u64 FoldFirstInstanceFlags =
@@ -1767,6 +1780,21 @@ struct Maxwell3D::FrontState {
     /// 0x3b26ab7eb3fc9863, OotMacros::Id::E2C), handler or JIT: its MME DMA read is counted in
     /// the "Front 0xe2c misses" line (FrontDmaRead).
     bool e2c_call{};
+    /// FRITCHII_E2C_ON_E, set by the emit for this call's 0x158 read: 1 = FrontDmaRead defers the
+    /// read where it would wait for the back, 3 = always (0 = reads as before). `e2c_deferred`:
+    /// it did (six zero words fed to the macro); the 0x556 write then goes to E as a call
+    /// (FrontSendE2cCondition), and the pages of `e2c_source` get a pending snapshot.
+    int e2c_defer{};
+    bool e2c_deferred{};
+    bool e2c_pages{}; ///< e2c_first_page..e2c_last_page are the read's device pages
+    GPUVAddr e2c_source{};
+    u64 e2c_first_page{};
+    u64 e2c_last_page{};
+    /// After a deferred 0xe2c: the front's render_enable.mode, and its shadow RAM word (a
+    /// tracking mode at the write), hold the macro's p0, not E's result, until written again.
+    /// FrontResolveE2cMode fetches them where they are read (counted; expected never).
+    bool e2c_mode_unknown{};
+    bool e2c_shadow_unknown{};
     bool skip_same{}; ///< SkipSameValueWrites() && FrontSkipSame(), read once
     /// The inline upload being sent, when its words land linearly (EDEN_NX2_DMA_WAIT_WRITERS).
     bool upload_known{};
@@ -1823,6 +1851,10 @@ struct Maxwell3D::FrontState {
         /// EXP10 +8: the noted ranges and dispatch writes since that do overlap the page; a
         /// read of bytes none of them overlaps still skips the drain.
         VideoCommon::GpuSplit::ListedWrites listed{};
+        /// FRITCHII_E2C_ON_E: a pending snapshot, made by a deferred 0xe2c read instead of a
+        /// drain: valid from the time the back ran position `pending` (GpuSplit::Ran), which
+        /// is when E did that read's flushes; until then reads of the page miss. 0 = valid.
+        u64 pending{};
     };
     std::unordered_map<u64, DmaSnapshot> dma_snapshots;
 };
@@ -2268,6 +2300,10 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
     if (fs.list_draw_stale != 0) [[unlikely]] {
         FrontNoteListDrawWrite(split, fs, method);
     }
+    if ((fs.e2c_mode_unknown || fs.e2c_shadow_unknown) &&
+        method == MAXWELL3D_REG_INDEX(render_enable.mode)) [[unlikely]] {
+        FrontNoteE2cModeWrite(split, fs);
+    }
     // As ProcessShadowRam does on the back.
     u32 value = argument;
     bool shadow_kept = true;
@@ -2635,6 +2671,10 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
                 fs.control_writes[fs.control_count++ % fs.control_writes.size()] = {
                     argument, static_cast<u32>(fs.control), 3U};
             }
+            if ((fs.e2c_mode_unknown || fs.e2c_shadow_unknown) &&
+                method == MAXWELL3D_REG_INDEX(render_enable.mode)) [[unlikely]] {
+                FrontNoteE2cModeWrite(split, fs);
+            }
             if (tracked()) {
                 fs.shadow[method] = argument;
             } else if (fs.control == Regs::ShadowRamControl::Replay) {
@@ -2788,7 +2828,11 @@ void Maxwell3D::FrontRunMacroPlain(Core::System& system, VideoCommon::GpuSplit& 
         VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
         engine.native_interpreter.active_dram = &native_data_ram;
         const auto parameter_count = fs.parameters.size();
-        const auto read = [&fs](u32 address) {
+        const auto read = [&](u32 address) {
+            if (address == MAXWELL3D_REG_INDEX(render_enable.mode) && fs.e2c_mode_unknown)
+                [[unlikely]] {
+                FrontResolveE2cMode(split, fs); // FRITCHII_E2C_ON_E turned off live since
+            }
             return address < Regs::NUM_REGS ? fs.regs[address] : 0U;
         };
         const auto emit = [&](u32 address, u32 value) {
@@ -2926,6 +2970,15 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
         VideoCommon::GpuSplit::DelayWorkIf(VideoCore::Nx2Debug::g_delay_e2c_us,
                                            VideoCommon::GpuSplit::DelayTest::E2c);
     }
+    // FRITCHII_E2C_ON_E (live, default 0; fable_b 19.5 step 4): 1 = the call's read is deferred
+    // to E where the front would wait for the back, 2 = verify (the front reads as before, E
+    // evaluates every call too and compares), 3 = every call deferred. Not with EXP53's
+    // predicate, and not with a replaying shadow RAM (the write's value is the shadow word then).
+    const int e2c_mode =
+        fs.e2c_call && !predicate && fs.control != Regs::ShadowRamControl::Replay
+            ? VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_e2c_on_e,
+                                               "FRITCHII_E2C_ON_E")
+            : 0;
     {
         VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
         engine.native_interpreter.active_dram = &native_data_ram;
@@ -2943,6 +2996,10 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
                 if (Nx2ListDispatch::GuardMode() == 2) {
                     FrontResolveListDraw(split, fs);
                 }
+            }
+            if (address == MAXWELL3D_REG_INDEX(render_enable.mode) && fs.e2c_mode_unknown)
+                [[unlikely]] {
+                FrontResolveE2cMode(split, fs);
             }
             return fs.regs[address];
         };
@@ -2965,6 +3022,20 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
                 FrontWrite(split, fs, address,
                            static_cast<u32>(Regs::RenderEnable::Mode::IfNotEqual), true, true);
                 return true;
+            }
+            if (e2c_mode != 0 && address == MAXWELL3D_REG_INDEX(render_enable.mode) &&
+                !fs.parameters.empty()) [[unlikely]] {
+                // FRITCHII_E2C_ON_E: deferred, the macro computed its mode from six zero words,
+                // which is p0; verify sends what the front's own read made.
+                if (fs.e2c_deferred) {
+                    fs.e2c_deferred = false;
+                    FrontSendE2cCondition(split, fs, fs.parameters[0], value, false);
+                    return true;
+                }
+                if (e2c_mode == 2) {
+                    FrontSendE2cCondition(split, fs, fs.parameters[0], value, true);
+                    return true;
+                }
             }
             if (fold_pending && address == MAXWELL3D_REG_INDEX(draw.end)) [[unlikely]] {
                 // The loop's first draw.end, the macro's first. Only when the back's draw.begin
@@ -3000,7 +3071,12 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
                                  n + 1);
                     }
                 } else {
+                    fs.e2c_defer = (e2c_mode == 1 || e2c_mode == 3) && address == 0x158 &&
+                                           value == 6
+                                       ? e2c_mode
+                                       : 0;
                     FrontDmaRead(split, fs, method, address, value);
+                    fs.e2c_defer = 0;
                 }
             }
             return true;
@@ -3073,6 +3149,16 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
         }
     }
     fs.e2c_call = false;
+    if (fs.e2c_deferred) [[unlikely]] {
+        // A deferred read without its 0x556 write (a failed call): the zero words stand, as
+        // a short FIFO's would.
+        fs.e2c_deferred = false;
+        fs.e2c_pages = false;
+        static u32 logged{};
+        if (logged++ < 4) {
+            LOG_WARNING(HW_GPU, "FRITCHII_E2C_ON_E: a deferred 0xe2c read without its mode write");
+        }
+    }
     if (fs.packet_on) [[unlikely]] {
         // The call's last packet goes now (it is the pending flush when it holds writes).
         fs.packet_on = false;
@@ -3884,7 +3970,243 @@ void MaybeLogRanReads(int mode) {
     s.session_differed = session;
 }
 
+// FRITCHII_E2C_ON_E (fable_b 19.5 step 4): the "0xe2c on E" lines, front and E, every 10 s.
+// Each side's counters have one writer (the front's here, E's in BackE2cCondition).
+struct E2cFrontStats {
+    u64 deferred_miss{};    ///< deferred where the snapshot missed (the drain it spared)
+    u64 deferred_pending{}; ///< of them, the page's pending snapshot not run yet
+    u64 deferred_other{};   ///< deferred where the drained path would run (listed reports...)
+    u64 deferred_always{};  ///< mode 3: every call
+    u64 promoted{};         ///< pending snapshots found run (hits from then on)
+    u64 sent{};             ///< calls sent (deferred)
+    u64 verify_sent{};      ///< calls sent for verify (mode 2)
+    u64 p0_differs{};       ///< must be 0: the macro's value from zero words was not p0
+    u64 resolved{};         ///< the front's unknown mode fetched from E (expected never)
+    std::chrono::steady_clock::time_point since{};
+};
+E2cFrontStats g_e2c_front;
+
+struct E2cBackStats {
+    u64 evaluated{};
+    u64 true_modes{};
+    u64 waited{};         ///< E waited for R to play the newest report op first
+    u64 buffer_flushes{}; ///< the pages were dirty in the buffer cache
+    u64 report_flushes{}; ///< FlushPending ran (reports listed, or EXP73 = 0)
+    u64 compared{};       ///< verify
+    u64 differed{};       ///< verify, must be 0
+    u64 session_differed{};
+    std::chrono::steady_clock::time_point since{};
+};
+E2cBackStats g_e2c_back;
+
+void MaybeLogE2cFront(int mode) {
+    auto& s = g_e2c_front;
+    const auto now = std::chrono::steady_clock::now();
+    if (s.since == std::chrono::steady_clock::time_point{}) {
+        s.since = now;
+        return;
+    }
+    const double seconds = std::chrono::duration<double>(now - s.since).count();
+    if (seconds < 10.0) {
+        return;
+    }
+    const auto rate = [seconds](u64 count) { return static_cast<double>(count) / seconds; };
+    LOG_INFO(HW_GPU,
+             "0xe2c on E (FRITCHII_E2C_ON_E={}) front {:.0f} s: deferred {:.0f}/s (snapshot "
+             "misses {:.0f}/s, of them on a pending snapshot {:.0f}/s; other drained reads "
+             "{:.0f}/s; every call {:.0f}/s), pending snapshots run {:.0f}/s, calls sent "
+             "{:.0f}/s, verify calls {:.0f}/s; mode fetched from E {} (expected 0), p0 differs "
+             "{} (must be 0)",
+             mode, seconds,
+             rate(s.deferred_miss + s.deferred_other + s.deferred_always), rate(s.deferred_miss),
+             rate(s.deferred_pending), rate(s.deferred_other), rate(s.deferred_always),
+             rate(s.promoted), rate(s.sent), rate(s.verify_sent), s.resolved, s.p0_differs);
+    s = {};
+    s.since = now;
+}
+
 } // Anonymous namespace
+
+void Maxwell3D::FrontSendE2cCondition(VideoCommon::GpuSplit& split, FrontState& fs, u32 p0,
+                                      u32 front_value, bool verify) {
+    constexpr u32 method = MAXWELL3D_REG_INDEX(render_enable.mode);
+    auto& stats = g_e2c_front;
+    // FrontWrite's bookkeeping of this executable write (the list guard, the shadow RAM, the
+    // front's copy, the effect), its MacroWrite replaced by the call. Not with a replaying
+    // shadow RAM (the emit's condition).
+    if (fs.list_draw_stale != 0) [[unlikely]] {
+        FrontNoteListDrawWrite(split, fs, method);
+    }
+    if (fs.e2c_mode_unknown || fs.e2c_shadow_unknown) {
+        FrontNoteE2cModeWrite(split, fs);
+    }
+    const bool tracked = fs.control == Regs::ShadowRamControl::Track ||
+                         fs.control == Regs::ShadowRamControl::TrackWithFilter;
+    if (tracked) {
+        fs.shadow[method] = front_value;
+    }
+    fs.regs[method] = front_value;
+    using Effect = VideoCommon::GpuSplit::Effect;
+    const Effect effect = VideoCommon::SplitWriteTracker::Combine(
+        fs.draw_pending ? Effect::Gpu : Effect::None, FrontMethodEffect(method));
+    const GPUVAddr source = (GPUVAddr{fs.regs[0x154] & 0x1ffffff} << 32) | fs.regs[0x155];
+    split.Defer(StageCall::E2cCondition{this, fs.system, source, p0, front_value, verify ? 1U : 0U},
+                effect, VideoCommon::Nx2FastDrawCount::Neutral());
+    fs.sink_pending = false; // The call consumes the sink first, as the Direct write did
+    if (verify) {
+        ++stats.verify_sent;
+    } else {
+        ++stats.sent;
+        stats.p0_differs += front_value != p0 ? 1 : 0;
+        // E writes the mode it computes: the front's copy holds p0 until written again.
+        fs.e2c_mode_unknown = true;
+        fs.e2c_shadow_unknown = tracked;
+        if (fs.e2c_pages) {
+            // Pending snapshots of the read's pages: current from the time E ran this call (its
+            // flushes are the drained read's). A page whose pending snapshot has not run keeps
+            // it (it becomes current sooner). Counts taken now, at the send, as a drained
+            // snapshot takes them after its drain.
+            const u64 position = split.SentPosition();
+            if (fs.dma_snapshots.size() > 8192) {
+                fs.dma_snapshots.clear();
+            }
+            for (u64 page = fs.e2c_first_page; page <= fs.e2c_last_page; ++page) {
+                const auto it = fs.dma_snapshots.find(page);
+                if (it != fs.dma_snapshots.end() && it->second.pending != 0 &&
+                    !split.Ran(it->second.pending)) {
+                    continue;
+                }
+                fs.dma_snapshots[page] = {position, split.WriterRangeCount(),
+                                          split.DispatchWriteCount(), {}, position};
+                split.WatchPage(page);
+            }
+        }
+    }
+    fs.e2c_pages = false;
+    MaybeLogE2cFront(VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_e2c_on_e,
+                                                      "FRITCHII_E2C_ON_E"));
+}
+
+void Maxwell3D::BackE2cCondition(Core::System& system, GPUVAddr source, u32 p0, u32 front_value,
+                                 bool verify) {
+    namespace OneF = VideoCommon::OneFollower;
+    auto& stats = g_e2c_back;
+    constexpr size_t read_bytes = 6 * sizeof(u32);
+    // The drained read (FrontDmaRead's miss path), here at the entry's stream place by the
+    // thread that owns the caches: everything before it has run on E. With one follower, R
+    // first plays the newest report op E pushed (the rule of the front's E-position waits,
+    // GpuSplit::Reached) and the reports a posted fence lands on these bytes, so the listing
+    // asked below and the words read are R's state at this place. The flushes lend as the
+    // front's split.Run closures did.
+    stats.waited += OneF::WaitGuestWriteOps() ? 1 : 0;
+    const auto device = memory_manager.GpuToCpuAddress(source);
+    if (device && *device >= 12) {
+        OneF::BeforeEngineRead(*device - 12, read_bytes + 12);
+    }
+    const GPUVAddr flush_begin = source & ~GPUVAddr{0xfff};
+    const GPUVAddr flush_end = (source + read_bytes + 0xfff) & ~GPUVAddr{0xfff};
+    const size_t flush_bytes = static_cast<size_t>(flush_end - flush_begin);
+    if (memory_manager.IsMemoryDirty(flush_begin, flush_bytes,
+                                     VideoCommon::CacheType::BufferCache)) {
+        ++stats.buffer_flushes;
+        memory_manager.FlushRegion(flush_begin, flush_bytes, VideoCommon::CacheType::BufferCache);
+    }
+    // EXP73's test, 12 bytes back as the front's (an unknown address flushes, as the plain
+    // drained path did).
+    if (VideoCore::Nx2Debug::Experiment(73) == 0 || !device || *device < 12 ||
+        rasterizer->HasCachedReports(*device - 12, u64{read_bytes} + 12)) {
+        ++stats.report_flushes;
+        VideoCommon::QueryDma::FlushPending(memory_manager, *rasterizer, source, read_bytes);
+    }
+    std::array<u32, 6> words{};
+    memory_manager.ReadBlockUnsafe(source, words.data(), read_bytes);
+    // The macro's formula (macro_hle_oot.h E2C): p0 when the two counters are equal.
+    const u32 differ = (words[0] ^ words[4]) | (words[1] ^ words[5]);
+    const u32 mode = differ != 0 ? (p0 ^ 1) : p0;
+    ++stats.evaluated;
+    stats.true_modes += mode == 1 ? 1 : 0;
+    if (verify) {
+        ++stats.compared;
+        if (mode != front_value) {
+            ++stats.differed;
+            if (stats.session_differed++ < 16) {
+                LOG_WARNING(HW_GPU,
+                            "0xe2c on E (must be 0): read at {:#x} gives mode {} on E, {} on the "
+                            "front (words {:#x} {:#x} / {:#x} {:#x}, p0 {})",
+                            source, mode, front_value, words[0], words[1], words[4], words[5],
+                            p0);
+            }
+        }
+    }
+    // As a Direct entry of the write (GpuSplit::Execute): the sink first, then the method.
+    ConsumeSink(system);
+    CallMethod(system, MAXWELL3D_REG_INDEX(render_enable.mode), verify ? front_value : mode, true);
+    const auto now = std::chrono::steady_clock::now();
+    if (stats.since == std::chrono::steady_clock::time_point{}) {
+        stats.since = now;
+        return;
+    }
+    const double seconds = std::chrono::duration<double>(now - stats.since).count();
+    if (seconds < 10.0) {
+        return;
+    }
+    const auto rate = [seconds](u64 count) { return static_cast<double>(count) / seconds; };
+    LOG_INFO(HW_GPU,
+             "0xe2c on E: E {:.0f} s: evaluated {:.0f}/s ({:.0f}/s True), waited for R's report "
+             "ops {:.0f}/s, buffer flushes {:.0f}/s, report flushes {:.0f}/s; verify {} "
+             "compared, {} differed (must be 0; {} this session)",
+             seconds, rate(stats.evaluated), rate(stats.true_modes), rate(stats.waited),
+             rate(stats.buffer_flushes), rate(stats.report_flushes), stats.compared,
+             stats.differed, stats.session_differed);
+    const u64 session = stats.session_differed;
+    stats = {};
+    stats.since = now;
+    stats.session_differed = session;
+}
+
+void Maxwell3D::FrontResolveE2cMode(VideoCommon::GpuSplit& split, FrontState& fs) {
+    constexpr u32 method = MAXWELL3D_REG_INDEX(render_enable.mode);
+    u32 mode = 0;
+    u32 shadow = 0;
+    split.Run(
+        [this, &mode, &shadow] {
+            mode = regs.reg_array[MAXWELL3D_REG_INDEX(render_enable.mode)];
+            shadow = shadow_state.reg_array[MAXWELL3D_REG_INDEX(render_enable.mode)];
+        },
+        VideoCommon::DrainSite::Other);
+    if (fs.e2c_mode_unknown) {
+        fs.regs[method] = mode;
+    }
+    if (fs.e2c_shadow_unknown) {
+        fs.shadow[method] = shadow;
+    }
+    fs.e2c_mode_unknown = false;
+    fs.e2c_shadow_unknown = false;
+    ++g_e2c_front.resolved;
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+        LOG_INFO(HW_GPU, "0xe2c on E: the front read render_enable.mode while E held it; fetched "
+                         "{} (shadow {})",
+                 mode, shadow);
+    }
+}
+
+void Maxwell3D::FrontNoteE2cModeWrite(VideoCommon::GpuSplit& split, FrontState& fs) {
+    // A write of render_enable.mode makes the front's copy known again; a replaying shadow RAM
+    // writes the shadow word, which must be known first; a tracking one stores the argument.
+    if (fs.control == Regs::ShadowRamControl::Replay) {
+        if (fs.e2c_shadow_unknown) {
+            FrontResolveE2cMode(split, fs);
+        }
+        fs.e2c_mode_unknown = false;
+    } else if (fs.control == Regs::ShadowRamControl::Track ||
+               fs.control == Regs::ShadowRamControl::TrackWithFilter) {
+        fs.e2c_mode_unknown = false;
+        fs.e2c_shadow_unknown = false;
+    } else {
+        fs.e2c_mode_unknown = false;
+    }
+}
 
 void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 macro,
                              u32 method, u32 count) {
@@ -3902,6 +4224,31 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     // EDEN_NX2_DEPTH_CENSUS (fable52_answer_potroom 4b): the occlusion reads of macro 0xe2c.
     namespace ReportCensus = VideoCommon::Nx2ReportCensus;
     const bool census_read = macro == 0xe2c && ReportCensus::Enabled();
+    // FRITCHII_E2C_ON_E (the emit sets fs.e2c_defer for a 0xe2c call's read): instead of waiting
+    // for the back, the macro gets six zero words and its mode write goes to E, which reads the
+    // words at its stream place (FrontSendE2cCondition). `pages`: the read's pages get pending
+    // snapshots (where the snapshot missed).
+    const auto defer_read = [&](bool pages) {
+        fs.parameters.insert(fs.parameters.end(), words, 0U);
+        fs.e2c_deferred = true;
+        fs.e2c_source = source;
+        fs.e2c_pages = false;
+        if (pages && words != 0) {
+            const auto device = memory_manager.GpuToCpuAddress(source);
+            if (device && memory_manager.GpuToCpuAddress(source + read_bytes - 1) ==
+                              *device + read_bytes - 1) {
+                fs.e2c_pages = true;
+                fs.e2c_first_page = *device >> 12;
+                fs.e2c_last_page = (*device + read_bytes - 1) >> 12;
+            }
+        }
+    };
+    if (fs.e2c_defer == 3 && !full_drain && !Tegra::Nx2CmdPageDiag::g_enabled &&
+        !VideoCommon::QueryDma::TraceEnabled()) [[unlikely]] {
+        ++g_e2c_front.deferred_always;
+        defer_read(false);
+        return;
+    }
     const auto flush_if_dirty = [&] {
         if (memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
             split.Run(
@@ -4028,6 +4375,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             };
             bool hit = true;
             bool census_pending = false;
+            bool pending_miss = false;
             for (u64 page = first_page; page <= last_page && hit; ++page) {
                 const auto it = fs.dma_snapshots.find(page);
                 if (it == fs.dma_snapshots.end()) {
@@ -4037,6 +4385,16 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                 }
                 // Compute/copy sent since, unranged writer sent since, noted write.
                 auto& snapshot = it->second;
+                if (snapshot.pending != 0) [[unlikely]] {
+                    // FRITCHII_E2C_ON_E: current once the back ran the deferred read's call.
+                    if (!split.Ran(snapshot.pending)) {
+                        hit = false;
+                        pending_miss = true;
+                        break;
+                    }
+                    snapshot.pending = 0;
+                    ++g_e2c_front.promoted;
+                }
                 const u64 since = snapshot.position;
                 const bool writer_since = split.LastWriterPosition() > since;
                 auto* const listed = byte_ranges ? &snapshot.listed : nullptr;
@@ -4072,9 +4430,11 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                 } else {
                     // Last: the only check that may wait.
                     bool waited = false;
+                    // FRITCHII_E2C_ON_E: a deferrable read does not wait for the dispatches; one
+                    // still queued (Queued) defers it.
                     DispatchCheck check = split.DispatchesMayWriteSince(
-                        since, page << 12, 0x1000, (exp10 & 3) != 2, snapshot.dispatch_writes,
-                        waited, listed);
+                        since, page << 12, 0x1000, (exp10 & 3) != 2 && fs.e2c_defer == 0,
+                        snapshot.dispatch_writes, waited, listed);
                     dispatch_waits += waited ? 1 : 0;
                     // FRITCHII_FRONT_RAN_READS: past the scan's limit every dispatch sent since
                     // has run and recorded its writes (the scan waits for that first, or answers
@@ -4201,6 +4561,14 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                         }
                     }
                 } else {
+                    if (fs.e2c_defer != 0 && !ran_verify) {
+                        // FRITCHII_E2C_ON_E: the drain below is E's read at its place
+                        // (FRITCHII_FRONT_RAN_READS=2's compares keep their drain).
+                        ++g_e2c_front.deferred_miss;
+                        g_e2c_front.deferred_pending += pending_miss ? 1 : 0;
+                        defer_read(true);
+                        return;
+                    }
                     ++misses;
                     if (census_read) [[unlikely]] {
                         census_pending =
@@ -4383,6 +4751,14 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             }
             ++report_reads;
         }
+    }
+    if (fs.e2c_defer != 0 && !full_drain && !Tegra::Nx2CmdPageDiag::g_enabled &&
+        !VideoCommon::QueryDma::TraceEnabled()) {
+        // FRITCHII_E2C_ON_E: the drained path (reports listed over the bytes, or no snapshot
+        // path) as E's read; the page's snapshot, if any, stays as it is.
+        ++g_e2c_front.deferred_other;
+        defer_read(false);
+        return;
     }
     VideoCommon::Nx2Profile::CountDmaRead(macro);
     if (full_drain) {
@@ -4579,6 +4955,17 @@ void Maxwell3D::FrontVerify(VideoCommon::GpuSplit& split, FrontState& fs) {
             LOG_WARNING(HW_GPU, "  front {:#x} (mode {}, path {}) | back {:#x} (mode {}, last {})",
                         f.argument, f.before, f.path, b.argument, b.before, b.path);
         }
+    }
+    // FRITCHII_E2C_ON_E: after a deferred 0xe2c the front holds p0 where E holds the mode it
+    // computed; known again from here, not a difference.
+    constexpr u32 render_mode = MAXWELL3D_REG_INDEX(render_enable.mode);
+    if (fs.e2c_mode_unknown) {
+        fs.regs[render_mode] = expected[render_mode];
+        fs.e2c_mode_unknown = false;
+    }
+    if (fs.e2c_shadow_unknown) {
+        fs.shadow[render_mode] = expected_shadow[render_mode];
+        fs.e2c_shadow_unknown = false;
     }
     for (u32 i = 0; i < Regs::NUM_REGS; ++i) {
         if (fs.regs[i] != expected[i]) {

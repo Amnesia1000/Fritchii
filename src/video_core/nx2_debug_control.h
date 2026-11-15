@@ -196,6 +196,8 @@ inline std::atomic<int> g_front_ran_reads{-1};
 inline std::atomic<int> g_acquire_table_first{-1};
 /// FRITCHII_E2C_CENSUS: docs/fritchii/switches.md.
 inline std::atomic<int> g_e2c_census{-1};
+/// FRITCHII_E2C_ON_E: docs/fritchii/switches.md.
+inline std::atomic<int> g_e2c_on_e{-1};
 /// FRITCHII_ACQUIRE_MET_BY: docs/fritchii/switches.md.
 inline std::atomic<int> g_acquire_met_by{-1};
 /// FRITCHII_GATHER_ONE_LOCK: docs/fritchii/switches.md.
