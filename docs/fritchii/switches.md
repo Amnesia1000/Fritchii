@@ -3774,6 +3774,29 @@ lines and pages per core). Only with a code cache of 64 MiB or more (512 MiB her
   Info) at each full clear: checks the 5/8 : 3/8 split.
 - Expected 1 to 2% of game code time (Fable A, estimate).
 
+### FRITCHII_JIT_CHEAP_BARRIERS
+
+FRITCHII_JIT_CHEAP_BARRIERS (boot, default 0; helper AT, 2026-11-15, port of zortos293/Lichii
+#1327, ProphetWild's commit from #161 by 999sian). x86-64 hosts only. 1 = all of #1327: ordered
+and exclusive loads of up to 64 bits (LDAR, LDAPR, LDAXR, A32 LDA/LDAEX) are a plain mov instead of
+`xor reg,reg; lock xadd [addr],reg`, and DMB *LD / DMB *ST (CRm<1:0> = 01 or 10) emit nothing
+instead of mfence. 2 = only the plain loads, 3 = only the DMB change (to split a problem).
+- Exact on x86-64 (TSO): loads are never reordered with later loads or stores (so every load is
+  an acquire load), stores never with later stores. The one reordering x86 does, a store passing a
+  later load, is still covered: ordered stores (STLR) stay xchg, a full barrier, so STLR then LDAR
+  keeps its order; a full DMB and every DSB keep mfence; 128-bit ordered loads keep lock
+  cmpxchg16b; exclusive stores still lock cmpxchg against the value the exclusive load saved.
+- Side effect: an ordered load no longer faults on a write-protected (GPU-cached) page, so it
+  reads it inline like a plain LDR does instead of taking the slow path. With read traps or
+  reactive flushing on, a page that needs a GPU download has no read access at all and still
+  faults, so the data seen is the same.
+- Upstream (zortos, since 11-11) and Blitchii run it by default. Their numbers: LDAR on a
+  word shared by 4 threads 20.9 -> 1.6 ns; OoT Kokiri 36.5-36.8 -> 38.1-38.8 fps on the source
+  commit author's PC. No log line beyond "FRITCHII_JIT_CHEAP_BARRIERS=N: ..." (Core_ARM, Info) the
+  first time a block with an ordered load or a DMB compiles.
+- Our earlier revert (50d9c09292, the Kokiri slab) came with the rest of #161; the slab's likely
+  cause is #161's GPU parts, see helper_at_answer.md. Check the Kokiri Forest spot with it on.
+
 ### FRITCHII_JIT_CHAIN
 
 FRITCHII_JIT_CHAIN (boot, bits, default 0; Fable A 2.2). Off with cycle counting (single core).
