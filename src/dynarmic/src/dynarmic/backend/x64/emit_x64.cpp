@@ -236,7 +236,14 @@ void EmitX64::EmitGetNZCVFromOp(EmitContext& ctx, IR::Inst* inst) {
     const Xbyak::Reg value = ctx.reg_alloc.UseGpr(code, args[0]).changeBit(bitsize);
     code.test(value, value);
     code.lahf();
-    code.xor_(al, al);
+    if (ctx.track_host_flags) {
+        // Fritchii (FRITCHII_JIT_FLAG_BRANCH): the same eax without touching the flags, so they
+        // stay test's (SF, ZF of the value, CF = OF = 0), which is what this snapshot says.
+        code.mov(al, 0);
+        ctx.HostFlagsHoldNZCV(inst);
+    } else {
+        code.xor_(al, al);
+    }
     ctx.reg_alloc.DefineValue(code, inst, nzcv);
 }
 
@@ -299,6 +306,24 @@ Xbyak::Label EmitX64::EmitCond(IR::Cond cond) {
 
     code.LoadRequiredFlagsForCondFromRax(cond);
 
+    EmitCondJump(cond, pass);
+    return pass;
+}
+
+// Fritchii: FRITCHII_JIT_FLAG_BRANCH. The stored NZCV is the lahf + seto snapshot of these host
+// flags (AH = SF ZF - AF - PF 1 CF, AL = OF), so EmitCond's reload (sahf restores SF, ZF, CF from
+// that AH; cmp al, 0x81 restores OF from that AL) would give them back unchanged. Only the cmc it
+// adds for HI and LS (ARM C sits in CF, ja/jna want it inverted) is needed here.
+Xbyak::Label EmitX64::EmitCondFromHostFlags(IR::Cond cond) {
+    Xbyak::Label pass;
+    if (cond == IR::Cond::HI || cond == IR::Cond::LS) {
+        code.cmc();
+    }
+    EmitCondJump(cond, pass);
+    return pass;
+}
+
+void EmitX64::EmitCondJump(IR::Cond cond, Xbyak::Label& pass) {
     switch (cond) {
     case IR::Cond::EQ:
         code.jz(pass);
@@ -345,7 +370,6 @@ Xbyak::Label EmitX64::EmitCond(IR::Cond cond) {
     default:
         UNREACHABLE();
     }
-    return pass;
 }
 
 EmitX64::BlockDescriptor EmitX64::RegisterBlock(const IR::LocationDescriptor& descriptor, CodePtr entrypoint, size_t size) {

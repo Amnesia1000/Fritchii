@@ -124,6 +124,66 @@ bool A64EmitX64::OmitFramePointer() {
     return omit;
 }
 
+int A64EmitX64::FlagBranchMode() {
+    static const int mode = [] {
+        const int value = EnvSwitch("FRITCHII_JIT_FLAG_BRANCH");
+        if (value < 0 || value > 2) {
+            LOG_WARNING(Core_ARM, "FRITCHII_JIT_FLAG_BRANCH={} is outside 0..2, using 0", value);
+            return 0;
+        }
+        if (value != 0) {
+            LOG_INFO(Core_ARM, "FRITCHII_JIT_FLAG_BRANCH={}: {}", value,
+                     value == 1 ? "conditional branches on host flags"
+                                : "conditional branches and cbz/tbz on host flags");
+        }
+        return value;
+    }();
+    return mode;
+}
+
+namespace {
+
+// Fritchii (FRITCHII_JIT_FLAG_BRANCH): IR instructions whose code (with reg_alloc's moves, spills
+// and fills: mov, movd/movq, movaps/movss/movsd, xchg) never writes the host flags and which do
+// not change the guest NZCV or check bit, so what the flags were recorded to hold stays true
+// across them. Anything else may (an immediate 0 is loaded with xor, host calls, memory accesses,
+// arithmetic), and drops the record.
+bool PreservesHostFlags(const IR::Inst& inst) {
+    // An immediate a store takes as mov m, imm32; an immediate that does not fit is nonzero,
+    // loaded with mov r, imm (LoadImmediate's xor is for 0 only). Checked anyway.
+    const auto plain_store_arg = [&](size_t i) {
+        const IR::Value arg = inst.GetArg(i);
+        if (!arg.IsImmediate()) {
+            return true;
+        }
+        const s64 imm = s64(arg.GetImmediateAsU64());
+        return imm >= -s64(0x80000000) && imm <= s64(0x7FFFFFFF);
+    };
+    switch (inst.GetOpcode()) {
+    case IR::Opcode::Void:
+    case IR::Opcode::Identity:          // no code for a non-immediate (EmitIdentity)
+    case IR::Opcode::GetCarryFromOp:    // pseudo operations, no code
+    case IR::Opcode::GetOverflowFromOp:
+    case IR::Opcode::A64GetW:           // loads from the state block
+    case IR::Opcode::A64GetX:
+    case IR::Opcode::A64GetSP:
+        return true;
+    case IR::Opcode::GetNZCVFromOp:     // no code when its op made it; its own code sets the record
+        return true;
+    case IR::Opcode::A64SetNZCV:        // a store; it updates the record itself
+        return !inst.GetArg(0).IsImmediate();
+    case IR::Opcode::A64SetW:           // stores to the state block
+    case IR::Opcode::A64SetX:
+        return plain_store_arg(1);
+    case IR::Opcode::A64SetSP:
+        return plain_store_arg(0);
+    default:
+        return false;
+    }
+}
+
+}  // namespace
+
 A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_interface)
         : EmitX64(code), conf(conf)
         , fast_dispatch_table_size{size_t{1} << FastDispatchTableBits(fast_dispatch_table_default_bits, fast_dispatch_table_min_bits)}
@@ -133,6 +193,8 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
     // Fritchii: the per-site caches fall back on the fast dispatch table.
     indirect_cache_mode = conf.HasOptimization(OptimizationFlag::FastDispatch) ? IndirectCacheMode() : 0;
     omit_frame_pointer = OmitFramePointer();
+    // Fritchii: the debug output between instructions calls out and clobbers the flags.
+    flag_branch_mode = conf.very_verbose_debugging_output ? 0 : FlagBranchMode();
     if (indirect_cache_mode != 0) {
         indirect_slots.reset(new FastDispatchEntry[indirect_slot_capacity]);
     }
@@ -169,6 +231,10 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) noexcept try {
     }(), any_xmm);
 
     A64EmitContext ctx{conf, reg_alloc, block, shared_labels};
+    // Fritchii: FRITCHII_JIT_FLAG_BRANCH. The block entry's flags are the dispatcher's or the
+    // previous block's, never recorded.
+    const bool track_host_flags = flag_branch_mode != 0;
+    ctx.track_host_flags = track_host_flags;
 
     // Start emitting.
     code.align();
@@ -204,6 +270,7 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) noexcept try {
 
     for (auto& inst : block.instructions) {
         auto const opcode = inst.GetOpcode();
+        ctx.host_flags_set_here = false;
         // Call the relevant Emit* member function.
         switch (opcode) {
 #define OPCODE(name, type, ...) case IR::Opcode::name: goto opcode_branch;
@@ -223,6 +290,11 @@ a64_branch:
         (this->*a64_handlers[size_t(opcode) - std::size(opcode_handlers)])(ctx, &inst);
 finish_this_inst:
         ctx.reg_alloc.EndOfAllocScope();
+        // Fritchii (FRITCHII_JIT_FLAG_BRANCH): an instruction that neither recorded the flags it
+        // left nor is known to leave them alone ends what the record says.
+        if (track_host_flags && !ctx.host_flags_set_here && !PreservesHostFlags(inst)) {
+            ctx.HostFlagsUnknown();
+        }
 #ifndef NDEBUG
         if (conf.very_verbose_debugging_output)
             EmitVerboseDebuggingOutput(reg_alloc);
@@ -235,7 +307,13 @@ finish_this_inst:
     if (!omit_frame_pointer) {
         code.mov(rbp, code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)]);
     }
+    // Fritchii (FRITCHII_JIT_FLAG_BRANCH): between the last instruction and the terminal only the
+    // rbp mov above runs, unless cycle counting's sub (which writes the flags) does.
+    terminal_nzcv_in_host_flags = track_host_flags && !conf.enable_cycle_counting && ctx.guest_nzcv_in_host_flags;
+    terminal_check_bit_in_host_zf = flag_branch_mode >= 2 && !conf.enable_cycle_counting && ctx.check_bit_in_host_zf;
     EmitTerminal(block.terminal, ctx.Location().SetSingleStepping(false), ctx.IsSingleStep());
+    terminal_nzcv_in_host_flags = false;
+    terminal_check_bit_in_host_zf = false;
     code.int3();
     for (auto& deferred_emit : ctx.deferred_emits)
         deferred_emit();
@@ -493,6 +571,12 @@ void A64EmitX64::EmitA64SetCheckBit(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     const Xbyak::Reg8 to_store = ctx.reg_alloc.UseGpr(code, args[0]).cvt8();
     code.mov(code.byte[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, check_bit)], to_store);
+    if (flag_branch_mode >= 2) {
+        // Fritchii (FRITCHII_JIT_FLAG_BRANCH=2): ZF = (stored byte == 0), as the CheckBit
+        // terminal's cmp byte, 0 would find it.
+        code.test(to_store, to_store);
+        ctx.HostFlagsHoldCheckBit();
+    }
 }
 
 void A64EmitX64::EmitA64GetCFlag(A64EmitContext& ctx, IR::Inst* inst) {
@@ -540,6 +624,13 @@ void A64EmitX64::EmitA64SetNZCVRaw(A64EmitContext& ctx, IR::Inst* inst) {
 
 void A64EmitX64::EmitA64SetNZCV(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    // Fritchii (FRITCHII_JIT_FLAG_BRANCH): the guest NZCV becomes this value; it is in the host
+    // flags when they hold this very value's snapshot.
+    if (ctx.track_host_flags) {
+        const IR::Value value = inst->GetArg(0);
+        ctx.guest_nzcv_in_host_flags = !value.IsImmediate() && ctx.host_flags_nzcv != nullptr &&
+                                       value.GetInst() == ctx.host_flags_nzcv;
+    }
     const Xbyak::Reg32 to_store = ctx.reg_alloc.UseScratchGpr(code, args[0]).cvt32();
     code.mov(dword[code.ABI_JIT_PTR + offsetof(A64JitState, cpsr_nzcv)], to_store);
 }
@@ -963,7 +1054,9 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::If terminal, IR::LocationDescript
         e.EmitLeafTerminal(terminal.then_, initial_location, is_single_step);
         break;
     default:
-        Xbyak::Label pass = e.EmitCond(terminal.if_);
+        // Fritchii (FRITCHII_JIT_FLAG_BRANCH): no reload when the host flags hold the NZCV.
+        Xbyak::Label pass = e.terminal_nzcv_in_host_flags ? e.EmitCondFromHostFlags(terminal.if_)
+                                                          : e.EmitCond(terminal.if_);
         e.EmitLeafTerminal(terminal.else_, initial_location, is_single_step);
         e.code.L(pass);
         e.EmitLeafTerminal(terminal.then_, initial_location, is_single_step);
@@ -974,7 +1067,10 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::If terminal, IR::LocationDescript
 
 bool EmitTerminalImpl(A64EmitX64& e, IR::Term::CheckBit terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
     Xbyak::Label fail;
-    e.code.cmp(e.code.byte[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, check_bit)], u8(0));
+    // Fritchii (FRITCHII_JIT_FLAG_BRANCH=2): ZF already says whether the byte is 0.
+    if (!e.terminal_check_bit_in_host_zf) {
+        e.code.cmp(e.code.byte[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, check_bit)], u8(0));
+    }
     e.code.jz(fail);
     e.EmitLeafTerminal(terminal.then_, initial_location, is_single_step);
     e.code.L(fail);

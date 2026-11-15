@@ -153,6 +153,11 @@ public:
     static int IndirectCacheMode();
     /// FRITCHII_JIT_NO_FRAME_POINTER (boot): blocks do not set up rbp (Eden 8e14f07a69's frame).
     static bool OmitFramePointer();
+    /// FRITCHII_JIT_FLAG_BRANCH (boot, 0..2): 1 = a block's If terminal branches on the host flags
+    /// when the guest NZCV it tests was made in the block and the flags were not touched since
+    /// (no reload of NZCV, no sahf); 2 = 1, and the CheckBit terminal (cbz, cbnz, tbz, tbnz,
+    /// exclusive stores) branches on a test of the byte A64SetCheckBit stored. 0 = old code.
+    static int FlagBranchMode();
     /// A free slot, or nullptr when all are taken (the site then uses the shared handler).
     FastDispatchEntry* AllocateIndirectSlot();
     /// Every slot back to the empty entry; `release`: the sites are gone too (ClearCache).
@@ -175,6 +180,11 @@ public:
     /// Set while InvalidateCacheRanges removes blocks (it empties the slots once, after).
     bool indirect_bulk_invalidation = false;
     bool omit_frame_pointer = false;
+    int flag_branch_mode = 0;
+    /// Set by Emit around its EmitTerminal call (FRITCHII_JIT_FLAG_BRANCH): the If terminal's
+    /// guest NZCV / the CheckBit terminal's ZF are in the host flags at the terminal.
+    bool terminal_nzcv_in_host_flags = false;
+    bool terminal_check_bit_in_host_zf = false;
     static constexpr size_t indirect_slot_capacity = size_t{1} << 18; // 4 MiB per JIT
     std::unique_ptr<FastDispatchEntry[]> indirect_slots;
     size_t indirect_slots_used = 0;
