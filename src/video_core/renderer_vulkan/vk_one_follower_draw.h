@@ -136,6 +136,9 @@ private:
     /// E's fill and push of an unlent draw (RouteDraw's and RouteListDraw's common tail). False
     /// with `reason` when it must be lent after all.
     bool FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, bool list, LentReason& reason);
+    /// FRITCHII_ESPLIT_DEPTH > 0: the draw's tail can run on E2 while E1 goes on (S2).
+    [[nodiscard]] bool AsyncTailFits(const Maxwell3D& engine,
+                                     const GraphicsPipeline* pipeline) const;
     /// `list`: a list draw (R runs DrawIndirect, not Draw).
     void LendDraw(bool is_indexed, u32 instance_count, LentReason reason, bool verify,
                   bool list = false);

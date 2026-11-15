@@ -34,6 +34,7 @@
 #include "video_core/back_read_audit.h"
 #include "video_core/buffer_churn_stats.h"
 #include "video_core/fritchii_fill_cuts.h"
+#include "video_core/fritchii_e_split_thread.h"
 #include "video_core/churn_counters.h"
 #include "video_core/fritchii_s4_count.h"
 #include "video_core/gpu_split.h"
@@ -72,7 +73,17 @@ BufferCache<P>::BufferCache(Tegra::MaxwellDeviceMemoryManager& device_memory_, R
     // mutex's release closes the counter a hold opened. Before any other thread sees the cache.
     gpu_modified_ranges.Attach(&gpu_written_mirror.gpu_modified_pages, &gpu_written_mirror.seq);
     read_trapped_ranges.AttachMirror(&gpu_written_mirror.trap_pages, &gpu_written_mirror.seq);
-    mutex.SetReleaseHook(&MirrorSeq::ReleaseHook, &gpu_written_mirror.seq);
+    if (VideoCommon::ESplit::ThreadWanted()) [[unlikely]] {
+        // FRITCHII_ESPLIT=1: E1's holds of this lock count as E1Touch (fritchii_e_split_thread.h).
+        mutex.SetReleaseHook(
+            [](void* seq) {
+                MirrorSeq::ReleaseHook(seq);
+                VideoCommon::ESplit::NoteCacheRelease();
+            },
+            &gpu_written_mirror.seq);
+    } else {
+        mutex.SetReleaseHook(&MirrorSeq::ReleaseHook, &gpu_written_mirror.seq);
+    }
     // Ensure the first slot is used for the null buffer
     void(slot_buffers.insert(runtime, NullBufferParams{}));
     gpu_modified_ranges.Clear();

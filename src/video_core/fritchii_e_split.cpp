@@ -38,6 +38,7 @@
 #include "video_core/engines/engine_interface.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/fritchii_e_split.h"
+#include "video_core/fritchii_e_split_thread.h"
 #include "video_core/gpu_split.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_profile.h"
@@ -224,6 +225,8 @@ u64 g_since_ns{};
 u64 g_since_ticks{};
 u32 g_rng = 0x2545f491u;
 thread_local bool t_back{}; ///< set on E (BatchLevel's thread)
+/// FRITCHII_ESPLIT_DEPTH > 0: BuildInto takes every buffer flag off the engine (E1's take).
+bool g_take_all{};
 
 constexpr size_t RiseE2Entry = static_cast<size_t>(FlagSite::Count);
 constexpr size_t RiseJoin = RiseE2Entry + 1;
@@ -379,6 +382,8 @@ void Seed(const Maxwell3D& engine) {
     ++g_c.seeds;
 }
 
+size_t BuildInto(u8* base, const Maxwell3D& engine, bool draw, bool list_args);
+
 /// E1: the record of everything noted since the last one, into the ring.
 const u8* Build(const Maxwell3D& engine, bool draw, bool list_args) {
     if (g_ring.size() != RingBytes) {
@@ -389,6 +394,12 @@ const u8* Build(const Maxwell3D& engine, bool draw, bool list_args) {
         g_ring_at = 0;
     }
     u8* const base = g_ring.data() + g_ring_at;
+    g_ring_at += BuildInto(base, engine, draw, list_args);
+    return base;
+}
+
+/// The record at `base` (room for MaxRecordBytes); returns its size.
+size_t BuildInto(u8* base, const Maxwell3D& engine, bool draw, bool list_args) {
     RecordHeader header{};
     size_t at = sizeof(RecordHeader);
     const auto& table0 = engine.dirty.tables[0];
@@ -448,7 +459,15 @@ const u8* Build(const Maxwell3D& engine, bool draw, bool list_args) {
         // only in a fill, which a draw record precedes, so raises arriving here instead of when
         // they were made change nothing it reads (they are ORs); a raise by E2's own work (in the
         // split straight into its copy) comes the same way here. FlagSite counts where they rose.
-        const u64 take = PackFlags(engine.dirty.flags) & ~(PackFlags(g_view.flags) | table_bits);
+        // FRITCHII_ESPLIT_DEPTH > 0 (the thread, async): the split's own take. E2's view runs
+        // behind, so E1 takes every buffer flag raised on its engine and clears it there
+        // (ThreadBuildAsync); E2 ORs them into its copy.
+        const u64 take = g_take_all ? PackFlags(engine.dirty.flags)
+                                    : PackFlags(engine.dirty.flags) &
+                                          ~(PackFlags(g_view.flags) | table_bits);
+        if (g_take_all) {
+            const_cast<Maxwell3D&>(engine).dirty.flags &= ~BufferFlags();
+        }
         std::memcpy(base + at, &take, sizeof(take));
         at += sizeof(take);
         header.take = 1;
@@ -485,14 +504,13 @@ const u8* Build(const Maxwell3D& engine, bool draw, bool list_args) {
     header.bytes = static_cast<u32>(at);
     header.position = GpuSplit::Get().BackEntryPosition();
     std::memcpy(base, &header, sizeof(header));
-    g_ring_at += at;
     ++g_c.records[draw ? 1 : 0];
     g_c.record_pairs += header.pairs;
     g_c.record_bytes += at;
     if (draw) {
         g_c.draw_pairs += header.pairs;
     }
-    return base;
+    return at;
 }
 
 /// E2: the record applied to the view. The buffer flags rise as the engine's did for each word
@@ -919,6 +937,17 @@ int BatchLevel() noexcept {
     if (level < 0 || level > 3) {
         level = 0;
     }
+    // FRITCHII_ESPLIT=1 (the thread mode) has its own records and lines: the dry step needs one
+    // thread, so it stays off.
+    if (level != 0 && g_thread) [[unlikely]] {
+        static bool logged = false;
+        if (!std::exchange(logged, true)) {
+            LOG_WARNING(HW_GPU, "E split count: FRITCHII_ESPLIT_COUNT={} ignored, FRITCHII_ESPLIT=1 "
+                                "runs the E2 thread (its own lines, \"E split thread\")",
+                        level);
+        }
+        level = 0;
+    }
     if (level != g_level) [[unlikely]] {
         SetLevel(level);
     }
@@ -1039,8 +1068,9 @@ void EndLend() noexcept {
         PopCarve();
     }
     // R's run left the engine's buffer flags as it used them; both stages are parked in a lend,
-    // so E2 takes them (the registers R wrote come in the next record).
-    if (g_records && g_view.seeded && g_view.engine != nullptr) {
+    // so E2 takes them (the registers R wrote come in the next record). Not a lend E2 makes
+    // while E1 runs ahead (FRITCHII_ESPLIT_DEPTH > 0): E1's engine is past E2's place then.
+    if (g_records && g_view.seeded && g_view.engine != nullptr && !(g_async && OnE2())) {
         const Flags& flags = g_view.engine->dirty.flags;
         if (!g_lend_vb && flags[Dirty::VertexBuffers]) {
             ++g_c.rises[RiseLend];
@@ -1170,6 +1200,202 @@ void AfterFill(const Maxwell3D& engine, const View* used) noexcept {
         ++g_c.after_checks;
         (void)Compare(engine, true, engine.draw_manager.indirect_state.list_words, true);
     }
+}
+
+// --- The thread mode (FRITCHII_ESPLIT=1) ------------------------------------------------------------
+
+namespace {
+/// E1's side of the records in the thread mode: the engine its records follow, and whether a
+/// write went untracked since (the next record is a seed then).
+const Maxwell3D* g_t_engine{};
+bool g_t_lost = true;
+
+/// E2: its view taken from the engine (E1 waits), without touching E1's pending sets.
+void ViewFromEngine(const Maxwell3D& engine) {
+    std::memcpy(&g_view.regs, &engine.regs, sizeof(Regs));
+    g_view.state = engine.state;
+    g_view.root_tables = engine.root_tables;
+    TakeDraw(g_view.draw_state, engine.draw_manager.draw_state);
+    g_view.indirect = engine.draw_manager.indirect_state;
+    g_view.flags = engine.dirty.flags & BufferFlags();
+    g_view.engine = &engine;
+    g_view.seeded = true;
+    g_view_flags.store(&engine.dirty.flags, std::memory_order_relaxed);
+    ++g_c.seeds;
+}
+
+/// FNV-1a over 64-bit lanes, as the hash pair needs it (both sides take the same fields).
+struct Hasher {
+    u64 value = 0xcbf29ce484222325ULL;
+    void Add(u64 lane) noexcept {
+        value = (value ^ lane) * 0x100000001b3ULL;
+    }
+};
+
+u64 HashParts(const Regs& regs, const Maxwell3D::State& state,
+              const Maxwell3D::RootTables& roots, const Maxwell3D::DrawManager::State& draw,
+              const Maxwell3D::DrawManager::IndirectParams* indirect) noexcept {
+    Hasher h;
+    for (const auto& [begin, end] : W2().ranges) {
+        for (u32 i = begin; i < end; ++i) {
+            h.Add(regs.reg_array[i]);
+        }
+    }
+    for (u32 bit = 0; bit < Bindings; ++bit) {
+        const auto& info = state.shader_stages[bit / Slots].const_buffers[bit % Slots];
+        h.Add(info.address);
+        h.Add((u64{info.size} << 1) | (info.enabled ? 1 : 0));
+    }
+    for (u32 bit = 0; bit < RootWords; ++bit) {
+        h.Add(roots.tables[bit / 64][bit % 64]);
+    }
+    h.Add(roots.loaded ? 1 : 0);
+    h.Add(static_cast<u64>(draw.topology));
+    h.Add(static_cast<u64>(draw.draw_mode));
+    h.Add(draw.draw_indexed ? 1 : 0);
+    h.Add(draw.draw_element_count);
+    h.Add(draw.base_index);
+    h.Add(draw.base_instance);
+    h.Add(draw.instance_count);
+    h.Add(draw.drawn_instances);
+    h.Add(draw.list_draw_address);
+    h.Add(draw.list_keep_id);
+    u64 lanes[(sizeof(draw.vertex_buffer) + sizeof(draw.index_buffer) + 7) / 8]{};
+    std::memcpy(lanes, &draw.vertex_buffer, sizeof(draw.vertex_buffer));
+    std::memcpy(reinterpret_cast<u8*>(lanes) + sizeof(draw.vertex_buffer), &draw.index_buffer,
+                sizeof(draw.index_buffer));
+    for (const u64 lane : lanes) {
+        h.Add(lane);
+    }
+    if (indirect != nullptr) {
+        h.Add(indirect->is_byte_count ? 1 : 0);
+        h.Add(indirect->is_indexed ? 1 : 0);
+        h.Add(indirect->include_count ? 1 : 0);
+        h.Add(indirect->count_start_address);
+        h.Add(indirect->indirect_start_address);
+        h.Add(indirect->buffer_size);
+        h.Add(indirect->max_draw_counts);
+        h.Add(indirect->stride);
+        h.Add(indirect->list_words ? 1 : 0);
+        h.Add(indirect->list_keep_id);
+    }
+    return h.value;
+}
+} // Anonymous namespace
+
+void ThreadMark() noexcept {
+    t_back = true;
+}
+
+void ThreadRecordsOn() noexcept {
+    g_records = true;
+    OneF::g_write_watch |= OneF::WriteWatchSplit;
+    if (CacheInputs::g_mark_hook == nullptr) {
+        CacheInputs::g_mark_hook = &OnCacheMark;
+        g_own_mark_hook = true;
+    }
+    g_touched.reserve(NumRegs);
+    ClearPending();
+    g_view.seeded = false;
+    g_t_engine = nullptr;
+    g_t_lost = true;
+}
+
+std::size_t RecordRoom() noexcept {
+    return MaxRecordBytes;
+}
+
+RecordKind ThreadBuild(const Maxwell3D& engine, bool draw, bool list_args, u8* out,
+                       u32& bytes) noexcept {
+    bytes = 0;
+    if (!Tracking()) {
+        ++g_c.untracked;
+        ClearPending();
+        g_t_lost = true;
+        return RecordKind::Lost;
+    }
+    if (g_t_lost || g_t_engine != &engine) {
+        ClearPending();
+        g_t_lost = false;
+        g_t_engine = &engine;
+        return RecordKind::Seed;
+    }
+    bytes = static_cast<u32>(BuildInto(out, engine, draw, list_args));
+    return RecordKind::Record;
+}
+
+u64 ThreadConsume(RecordKind kind, const u8* record, const Maxwell3D& engine, bool compare,
+                  bool draw, bool list_args) noexcept {
+    switch (kind) {
+    case RecordKind::None:
+        return 0;
+    case RecordKind::Lost:
+        g_view.seeded = false;
+        return 0;
+    case RecordKind::Seed:
+        ViewFromEngine(engine);
+        return 0;
+    case RecordKind::Record:
+        break;
+    }
+    if (!g_view.seeded || g_view.engine != &engine) {
+        return 0; // stale until the next seed (E1 sends one after a loss or a channel change)
+    }
+    Consume(record, engine);
+    if (!compare) {
+        return 0;
+    }
+    const u64 before = g_differs_total;
+    ++g_c.compares;
+    (void)Compare(engine, draw, list_args, false);
+    return g_differs_total - before;
+}
+
+void ThreadCbAdvance(u64 words) noexcept {
+    if (g_view.seeded) {
+        g_view.regs.const_buffer.offset += static_cast<u32>(words * sizeof(u32));
+    }
+}
+
+View& ThreadView() noexcept {
+    return g_view;
+}
+
+u64 ThreadAfterDiffers() noexcept {
+    return g_after_total;
+}
+
+bool ThreadRecordReady(const Maxwell3D& engine) noexcept {
+    return Tracking() && !g_t_lost && g_t_engine == &engine;
+}
+
+u32 ThreadBuildAsync(Maxwell3D& engine, bool list_args, u8* out) noexcept {
+    g_take_all = true;
+    const u32 bytes = static_cast<u32>(BuildInto(out, engine, true, list_args));
+    g_take_all = false;
+    return bytes;
+}
+
+void SyncFlagsToEngine(Maxwell3D& engine) noexcept {
+    if (g_view.seeded && g_view.engine == &engine) {
+        engine.dirty.flags = (engine.dirty.flags & ~BufferFlags()) | (g_view.flags & BufferFlags());
+    }
+}
+
+void SyncFlagsToView(const Maxwell3D& engine) noexcept {
+    if (g_view.seeded && g_view.engine == &engine) {
+        g_view.flags = (g_view.flags & ~BufferFlags()) | (engine.dirty.flags & BufferFlags());
+    }
+}
+
+u64 HashEngine(const Maxwell3D& engine, bool list_args) noexcept {
+    return HashParts(engine.regs, engine.state, engine.root_tables, engine.draw_manager.draw_state,
+                     list_args ? &engine.draw_manager.indirect_state : nullptr);
+}
+
+u64 HashView(bool list_args) noexcept {
+    return HashParts(g_view.regs, g_view.state, g_view.root_tables, g_view.draw_state,
+                     list_args ? &g_view.indirect : nullptr);
 }
 
 } // namespace VideoCommon::ESplit

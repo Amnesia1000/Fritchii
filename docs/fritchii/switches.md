@@ -2202,6 +2202,64 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   FlushCaching, FillRing and PushDraw for every draw it would fill (no packet, R draws nothing;
   TickWork as after a push). The front-wall probe of work/FRONT_SPLIT_DESIGN.md 4.3. Line every
   10 s "Null fill (FRITCHII_ONEF_NULL_FILL=1, ...)". Off: one relaxed load per filled draw.
+- FRITCHII_ESPLIT (boot, default 0; the E split's thread, steps S1 and S2 of
+  work/E_SPLIT_DESIGN.md 5, src/video_core/fritchii_e_split_thread.h): 1 = the engine thread E
+  becomes two. E1 (the back thread) reads ring A, applies the register entries on the real
+  engine, looks the pipeline up; E2 ("GPUBackE2", new) runs the E2 entries of the dry classifier
+  (constant buffer words, reports, sync points, wait for idle, cache barriers, compute, the
+  memory stage's cache calls), each draw's flush (before E1's lookup, only when it has work) and
+  tail (FillRing, the R packet's push, TickWork) and each bind's buffer cache half (by value).
+  E2 keeps its own view of what a fill reads, fed by E1's records (FRITCHII_ESPLIT_COUNT=2's
+  records, now across the threads). E1 runs join entries, its memory decisions (the indirect
+  reset test), conditions from memory and E's idle work itself (joins). Needs FRITCHII_ONEF=1
+  (refused with a log line without it); FRITCHII_ESPLIT_COUNT is ignored while it runs.
+  FRITCHII_ESPLIT_DEPTH (live, default 0) = 0 is S1, lockstep: E1 hands each piece over and
+  waits for it, so one thread runs at a time in today's order on today's objects (exact by
+  construction); E's per-call thread state (one follower's draw values, lend site, query kind;
+  the memory stage's fill state) moves with each hand-over and a buffer cache lock E1 holds is
+  handed to E2 for the run. Both sides poll (haltpoll rule: E1 up to 200 us, E2 up to 50 us)
+  and then sleep. Lines every 10 s, "E split thread (FRITCHII_ESPLIT=1, depth D) 10 s:":
+  hand-overs a second by kind, E2 busy (zone "e split job"), E2 waiting ("e split E2 wait"), E1
+  in hand-overs ("e split hand-over") = E2's runs + the hand-over cost (ms/s and us each), joins
+  by kind; then the checks (must be 0): ESplitView (E2's view against the engine after the
+  record, 1 hand-over in 64), ESplitInputs (on those draws, view equal, the fill reads the view
+  and every CacheInputs input is compared after it), E1Touch (E1 released the buffer cache's
+  lock, read game memory through the audited funnel or wrote it, outside a join; the first 16
+  logged with the site), E2Order (E2 ran a hand-over out of order); seeds and untracked
+  hand-overs. Gate 2 shape for S1: E2 busy <= today's E occupied - 0.7 x the dry net. Off:
+  nothing starts; a hand-over site pays one load and a branch.
+- FRITCHII_ESPLIT_DEPTH (live, default 0; with FRITCHII_ESPLIT=1, step S2): N > 0 (1, 4, 16;
+  capped at 48) = async draw tails and binds. E1 posts a draw's tail and goes on, up to N tails
+  ahead of E2; a bind's buffer cache half goes by value. Everything else still waits for E2 to
+  drain (E2 entries and flushes in lockstep, joins, E1's own lends and pushes to R). An async
+  tail needs rule 3's pipeline, no texel buffers, ring B by value, no memory stage marks ahead,
+  no inline index bytes, no price timers, no FRITCHII_HANDLE_PROG_KEEP on a pipeline with handle
+  programs and no seed due; the others go lockstep. Rules: the buffer flags are E2's (E1 takes
+  the ones raised on its engine at each async draw record and clears them, E2 ORs them into its
+  view; wherever E2's work runs on the engine the view's flags are copied there and back); an
+  async fill reads only E2's view; R's draw packet is packed by E1 at the record and pushed by E2
+  after the fill (R's queue keeps one producer); a lend E2 makes holds E1 at its next safe point
+  (each ring entry; every wait for E2 counts) and packs none of E1's registers; the repack
+  layout's VertexInput raise goes to E1's engine at its next draw, join or push; `consumed` is
+  stored by an async job at E2's place, and at a batch's end after the drain; GpuSplit::
+  BackEntryPosition returns the job's position on E2. When the flush has work and E2 is behind,
+  it runs on E2 after E1's lookup (counted: "flushes after E1's lookup"; S0's "lookups after a
+  shader page write" says how often that order could matter). Waits sleep after a 20 us poll.
+  Extra checks in the thread's lines (must be 0): E1Visible (a fence or query op from E1 outside
+  a join), FrontAheadOfE2 (E1 stored `consumed` with E2 behind), ESplitHash (a hash of what the
+  fill reads, from the engine on E1 and from the view on E2, 1 async draw in 64), E2Refused (an
+  async fill refused after E1 moved on: the draw is dropped, R gets the spans as a delta). Also:
+  async draws a second and how far ahead they were posted, E2 lends that held E1 (E2's wait for
+  E1 to park, E1's held time), ring B room waits. Step in only after S1's checks read 0. Gate 2:
+  DEPTH 0 against N, 2 cycles: max(E1, E2 busy) must drop >= 70% of the dry net.
+- FRITCHII_ESPLIT_PIN (boot, default 0; with FRITCHII_ESPLIT=1, step S3): where E1 and E2 run.
+  0 = E1 keeps E's pinned core (PinnedRole::GpuBack), E2 on the performance cores; 1 = E2 on E's
+  old core, E1 unpinned on the performance cores; 2 = E's core split by SMT sibling (E2 one
+  hardware thread, E1 the other); 3 = E2 on E's core, E1 on R's core (PinnedRole::GpuMem, where
+  FRITCHII_ONEF_PIN put R). A line at the start names the masks; every 10 s "placement
+  FRITCHII_ESPLIT_PIN=N": E1's and E2's thread CPU time per second against their busy and wait
+  times (a spinning wait reads as CPU time: E1 must stay under its busy share + 5%). Gate 2 on
+  fps with rest < 2.3 CPUs.
 - FRITCHII_ONEF_TRACE (boot, default 0; fable_b_one_follower 15.5): 1 = the lend trace. One
   72-byte record per lend and per posted op (packet number, site, op kind, posted, E's arrival,
   R's start and end, E's resume, E's work since its previous record, R's busy time on other

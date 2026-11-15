@@ -242,11 +242,17 @@ void Count(std::size_t which, const void* caller, std::size_t bytes, Kind kind) 
 
 bool enabled = false;
 
+namespace {
+/// FRITCHII_BACK_READ_AUDIT itself: the tables count (`enabled` may be on for g_touch_hook alone).
+bool g_counting = false;
+} // Anonymous namespace
+
 void Init() {
     // Not at static initialization: main() applies nx2_switches.txt to the environment later.
     [[maybe_unused]] static const bool once = [] {
-        enabled = ReadSwitch();
-        if (enabled) {
+        g_counting = ReadSwitch();
+        enabled = enabled || g_counting;
+        if (g_counting) {
             LOG_INFO(HW_GPU, "Back read audit: FRITCHII_BACK_READ_AUDIT=1, counting the GPU "
                              "back thread's reads of game memory by call site");
         }
@@ -258,6 +264,12 @@ void Note(const void* caller, std::size_t bytes, Kind kind) noexcept {
     if (t_depth != 0) {
         return;
     }
+    if (g_touch_hook != nullptr) [[unlikely]] {
+        g_touch_hook(caller);
+    }
+    if (!g_counting) {
+        return;
+    }
     if (const int which = TableOfThread(); which >= 0) {
         Count(static_cast<std::size_t>(which), caller, bytes, kind);
     }
@@ -265,6 +277,12 @@ void Note(const void* caller, std::size_t bytes, Kind kind) noexcept {
 
 OuterScope::OuterScope(const void* caller, std::size_t bytes, Kind kind) noexcept {
     if (t_depth++ == 0) {
+        if (g_touch_hook != nullptr) [[unlikely]] {
+            g_touch_hook(caller);
+        }
+        if (!g_counting) {
+            return;
+        }
         if (const int which = TableOfThread(); which >= 0) {
             Count(static_cast<std::size_t>(which), caller, bytes, kind);
         }

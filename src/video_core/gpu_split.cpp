@@ -34,6 +34,7 @@
 #include "video_core/engines/engine_interface.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/fritchii_e_split.h"
+#include "video_core/fritchii_e_split_thread.h"
 #include "video_core/fritchii_price.h"
 #include "video_core/nx2_fastdraw_count.h"
 #include "video_core/gpu_split.h"
@@ -3052,6 +3053,14 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
 #ifdef _WIN32
     g_back_thread_id.store(GetCurrentThreadId(), std::memory_order_relaxed);
 #endif
+    // FRITCHII_ESPLIT=1 (boot; fritchii_e_split_thread.h): this thread becomes E1 and E2 starts,
+    // the back for every check that asks. Off: nothing starts, the loop below is today's.
+    if (ESplit::ThreadWanted()) [[unlikely]] {
+        ESplit::StartE2(*system, [](void*) { on_back_thread = true; }, nullptr);
+    }
+    SCOPE_EXIT {
+        ESplit::StopE2();
+    };
     u64 read_position = 0;
     if (MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
         MemStageShadow::Start();
@@ -3127,11 +3136,15 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 timeline_span.Set(0, {"phase", 1});
                 wait_phase = 1;
                 in_idle_wait = true;
-                idle_hook(idle_argument);
+                {
+                    const ESplit::JoinScope esplit_join{ESplit::Join::Idle}; // E's idle work
+                    idle_hook(idle_argument);
+                }
                 in_idle_wait = false;
                 link.BackLeaveHook();
                 available = limit();
                 if (available == read_position) {
+                    const ESplit::JoinScope esplit_join{ESplit::Join::Idle}; // E's idle work
                     CheckFencesQuiet(read_position);
                 }
             } else if (available == read_position && idle_hook != nullptr && ring_on &&
@@ -3143,7 +3156,10 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 // outside the idle wait), or the back could not sleep while the request stands.
                 hook_requested.store(false, std::memory_order_seq_cst);
                 ForgetFencesQuiet();
-                idle_hook(idle_argument);
+                {
+                    const ESplit::JoinScope esplit_join{ESplit::Join::Idle}; // E's idle work
+                    idle_hook(idle_argument);
+                }
                 link.NoteHookFlush();
                 available = limit();
             }
@@ -3250,6 +3266,11 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         // FRITCHII_ESPLIT_COUNT (fritchii_e_split.h, the E split's dry step): read once a batch;
         // off, each entry tests this local. The decode classes an entry by kind, engine, method.
         const int esplit = ESplit::BatchLevel();
+        // FRITCHII_ESPLIT=1: E2 runs the E2 entries (the decode below says which), E1 runs the
+        // rest and joins itself (fritchii_e_split_thread.h). Not with the memory stage's ring:
+        // its entries are lent or served whole.
+        ESplit::ThreadBatch();
+        const bool esplit_thread = ESplit::g_thread && !ring_on;
         const auto esplit_decode = [this](u64 head) {
             using ESplit::Class;
             using ESplit::EngineKind;
@@ -3354,8 +3375,68 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             }
             return info;
         };
+        // FRITCHII_ESPLIT=1: an E2 entry runs on E2 (E1 applies the sunk register writes first,
+        // as Execute would first thing, and builds the record of E2's view); a join entry runs
+        // here with E2 idle (S1) or drained (S2); an E1 entry runs here and hands its own E2
+        // parts over (a draw's flush and tail, a bind's buffer cache half).
+        const auto esplit_execute = [this](const ESplit::EntryInfo& info, const u64* entry,
+                                           size_t words) -> size_t {
+            if (info.cls == ESplit::Class::E2) {
+                if (info.sink_first && back_engine != nullptr) {
+                    back_engine->ConsumeSink(*system);
+                }
+                struct Work {
+                    GpuSplit* self;
+                    const u64* entry;
+                    size_t words;
+                    size_t size;
+                } work{this, entry, words, 0};
+                const ESplit::HandInfo hand{
+                    .hand = ESplit::Hand::Entry,
+                    .record = true,
+                    .cb_entry = info.cb_entry,
+                    .cb_words = info.cb_words,
+                    .cb_size = &work.size,
+                };
+                ESplit::Run(
+                    hand,
+                    [](void* raw) {
+                        Work& w = *static_cast<Work*>(raw);
+                        w.size = w.self->Execute(w.entry, w.words);
+                    },
+                    &work);
+                return work.size;
+            }
+            const ESplit::JoinScope join{ESplit::Join::Entry, info.cls == ESplit::Class::Join};
+            return Execute(entry, words);
+        };
+        // FRITCHII_ESPLIT_DEPTH > 0: `consumed` is stored at E2's place, by an async job (the
+        // front's waits and ring A's room follow E2). False: store it here.
+        const auto esplit_store = [this, esplit_thread](u64 position) {
+            if (!esplit_thread) {
+                return false;
+            }
+            void* const payload = ESplit::BeginAsync(ESplit::Hand::Store);
+            if (payload == nullptr) {
+                return false;
+            }
+            struct Store {
+                GpuSplit* self;
+                u64 position;
+            } const store{this, position};
+            std::memcpy(payload, &store, sizeof(store));
+            ESplit::PostAsync([](void* raw) {
+                Store s;
+                std::memcpy(&s, raw, sizeof(s));
+                s.self->StoreConsumed(s.position);
+            });
+            return true;
+        };
         while (read_position != available) {
             const size_t index = read_position & RingMask;
+            if (esplit_thread) [[unlikely]] {
+                ESplit::SafePoint(); // S2: E1 holds here while E2 lends
+            }
             if (ring_prefetch) {
                 const u64 ahead = (std::min)(read_position + RingPrefetchWords,
                                              available > 8 ? available - 8 : u64{0});
@@ -3369,6 +3450,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             // EDEN_NX2_RUNAHEAD: chunks of CPU writes due before this entry (nx2_runahead.h).
             if (read_position >= Runahead::g_apply_at.load(std::memory_order_relaxed))
                 [[unlikely]] {
+                const ESplit::JoinScope join{ESplit::Join::Entry}; // game memory writes: E2's
                 Runahead::ApplyDue(read_position);
             }
             // The entries Execute may take with this one (constant buffer words) stop at a level
@@ -3407,8 +3489,12 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                                       ->method_sink.size();
                 }
             }
+            ESplit::EntryInfo esplit_info{};
+            if (esplit != 0 || esplit_thread) [[unlikely]] {
+                esplit_info = esplit_decode(ring[index]);
+            }
             if (esplit != 0) [[unlikely]] {
-                const ESplit::EntryInfo info = esplit_decode(ring[index]);
+                const ESplit::EntryInfo& info = esplit_info;
                 // At 2 and 3 E1 applies the sunk register writes before it forwards an E2 entry,
                 // as the split would; Execute consumes the sink first thing for these entries, so
                 // the order and the values stay the same.
@@ -3417,8 +3503,10 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 }
                 ESplit::BeforeEntry(info);
             }
-            const size_t size =
-                Execute(&ring[index], std::min<u64>(end - read_position, RingWords - index));
+            const size_t entry_words = std::min<u64>(end - read_position, RingWords - index);
+            const size_t size = esplit_thread
+                                    ? esplit_execute(esplit_info, &ring[index], entry_words)
+                                    : Execute(&ring[index], entry_words);
             if (esplit != 0) [[unlikely]] {
                 ESplit::AfterEntry(size);
             }
@@ -3461,7 +3549,10 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 idle_hook != nullptr) [[unlikely]] {
                 hook_requested.store(false, std::memory_order_seq_cst);
                 ForgetFencesQuiet();
-                idle_hook(idle_argument);
+                {
+                    const ESplit::JoinScope esplit_join{ESplit::Join::Idle}; // E's idle work
+                    idle_hook(idle_argument);
+                }
             }
             // Hand ring space back now and then while working through a long batch, and at once
             // when the front waits for this position (WaitForWriters).
@@ -3471,7 +3562,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 if (entry_price) [[unlikely]] {
                     FritchiiPrice::BackReached(read_position);
                 }
-                StoreConsumed(read_position);
+                if (!esplit_store(read_position)) {
+                    StoreConsumed(read_position);
+                }
                 last_store = read_position;
                 if (ring_on) {
                     link.NoteConsumed(read_position);
@@ -3481,10 +3574,14 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 break; // THREAD=2 starts at the loop top
             }
         }
-        CheckFencesQuiet(read_position);
+        {
+            const ESplit::JoinScope esplit_join{ESplit::Join::Idle}; // E's idle work
+            CheckFencesQuiet(read_position);
+        }
         if (entry_price) [[unlikely]] {
             FritchiiPrice::BackReached(read_position);
         }
+        ESplit::CheckStoreOnE1(); // S2: E2 drained by the join above (FrontAheadOfE2)
         StoreConsumed(read_position);
         if (ring_on) {
             link.NoteConsumed(read_position);

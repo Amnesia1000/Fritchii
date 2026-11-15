@@ -533,6 +533,11 @@ public:
     /// OnBack's one-follower route: lends `function` to R with E's seam state installed there and
     /// the buffer cache's lock handed to R (the hand-off's served call, over one follower's lend).
     static void OnRenderImpl(void (*function)(void*), void* argument);
+    /// FRITCHII_ESPLIT (fritchii_e_split_thread.h, ESplit::g_fill_state): E's seam state moved to
+    /// E2 for its run of E's work and back, as OnRenderImpl moves it to R. `as_owner`: the
+    /// calling thread's identity filled in; `keep_identity`: the caller keeps its own.
+    static void ESplitCapture(void* out, bool as_owner);
+    static void ESplitInstall(const void* in, bool keep_identity);
 
     /// The buffer cache's idle work, on its user's thread (hand-off at FRITCHII_MEMSTAGE_THREAD=1).
     template <typename F>
