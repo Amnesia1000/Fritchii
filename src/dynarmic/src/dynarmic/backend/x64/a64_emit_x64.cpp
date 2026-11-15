@@ -9,6 +9,7 @@
 #include "dynarmic/backend/x64/a64_emit_x64.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <fmt/format.h>
 #include <fmt/ostream.h>
@@ -85,7 +86,31 @@ unsigned FastDispatchTableBits(unsigned default_bits, unsigned min_bits) {
     return bits;
 }
 
+// Fritchii: a whole-number boot switch, read once per process.
+int EnvSwitch(const char* name) {
+    const char* text = std::getenv(name);
+    return text == nullptr ? 0 : std::atoi(text);
+}
+
 }  // namespace
+
+int A64EmitX64::IndirectCacheMode() {
+    static const int mode = [] {
+        const int value = EnvSwitch("FRITCHII_JIT_INDIRECT_CACHE");
+        if (value < 0 || value > 3) {
+            LOG_WARNING(Core_ARM, "FRITCHII_JIT_INDIRECT_CACHE={} is outside 0..3, using 0", value);
+            return 0;
+        }
+        if (value != 0) {
+            LOG_INFO(Core_ARM, "FRITCHII_JIT_INDIRECT_CACHE={}: {}", value,
+                     value == 1   ? "dry, per-site last-target counters"
+                     : value == 2 ? "per-site caches at indirect branches"
+                                  : "per-site caches at indirect branches, returns pop inline");
+        }
+        return value;
+    }();
+    return mode;
+}
 
 A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_interface)
         : EmitX64(code), conf(conf)
@@ -93,6 +118,11 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
         , fast_dispatch_table_mask{u32((fast_dispatch_table_size - 1) * sizeof(FastDispatchEntry))}
         , fast_dispatch_table{new FastDispatchEntry[fast_dispatch_table_size]}
         , jit_interface{jit_interface} {
+    // Fritchii: the per-site caches fall back on the fast dispatch table.
+    indirect_cache_mode = conf.HasOptimization(OptimizationFlag::FastDispatch) ? IndirectCacheMode() : 0;
+    if (indirect_cache_mode != 0) {
+        indirect_slots.reset(new FastDispatchEntry[indirect_slot_capacity]);
+    }
     GenMemory128Accessors();
     GenFastmemFallbacks();
     GenTerminalHandlers();
@@ -208,11 +238,83 @@ void A64EmitX64::ClearCache() {
     EmitX64::ClearCache();
     block_ranges.ClearCache();
     ClearFastDispatchTable();
+    ClearIndirectSlots(true);
     fastmem_patch_info.clear();
 }
 
 void A64EmitX64::InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges) {
     InvalidateBasicBlocks(block_ranges.InvalidateRanges(ranges));
+    // Fritchii: a slot may hold a block just removed; the table entries went one by one (Unpatch),
+    // the slots all go (code removal is rare, they refill from the table).
+    ClearIndirectSlots(false);
+}
+
+A64EmitX64::FastDispatchEntry* A64EmitX64::AllocateIndirectSlot() {
+    if (!indirect_slots || indirect_slots_used >= indirect_slot_capacity) {
+        return nullptr;
+    }
+    return &indirect_slots[indirect_slots_used++];
+}
+
+void A64EmitX64::ClearIndirectSlots(bool release) {
+    if (!indirect_slots) {
+        return;
+    }
+    std::fill_n(indirect_slots.get(), indirect_slots_used, FastDispatchEntry{});
+    if (release) {
+        indirect_slots_used = 0;
+    }
+}
+
+void A64EmitX64::EmitCalculateLocationDescriptor() {
+    // This calculation has to match up with A64::LocationDescriptor::UniqueHash
+    code.mov(rdi, qword[code.ABI_JIT_PTR + offsetof(A64JitState, pc)]);
+    code.mov(rcx, A64::LocationDescriptor::pc_mask);
+    code.and_(rcx, rdi);
+    code.mov(ebx, dword[code.ABI_JIT_PTR + offsetof(A64JitState, fpcr)]);
+    code.and_(ebx, A64::LocationDescriptor::fpcr_mask);
+    code.shl(rbx, A64::LocationDescriptor::fpcr_shift);
+    code.or_(rbx, rcx);
+}
+
+void A64EmitX64::LogIndirectCounters() {
+    const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    if (indirect_log_ns == 0) {
+        indirect_log_ns = now;
+        indirect_counters_logged = indirect_counters;
+        return;
+    }
+    if (now - indirect_log_ns < 10'000'000'000LL) {
+        return;
+    }
+    const double seconds = double(now - indirect_log_ns) / 1e9;
+    std::array<u64, IndirectCounterCount> d{};
+    for (size_t i = 0; i < IndirectCounterCount; ++i) {
+        d[i] = indirect_counters[i] - indirect_counters_logged[i];
+    }
+    const auto share = [](u64 part, u64 whole) {
+        return whole == 0 ? 0.0 : 100.0 * double(part) / double(whole);
+    };
+    if (indirect_cache_mode == 1) {
+        LOG_INFO(Core_ARM,
+                 "JIT indirect sites (FRITCHII_JIT_INDIRECT_CACHE=1) core {} {:.1f} s: indirect "
+                 "branches {:.0f}/s, same target as the site's last {:.1f}%; returns {:.0f}/s, same "
+                 "target as the site's last {:.1f}%, return buffer hits {:.1f}%; sites {}",
+                 conf.processor_id, seconds, double(d[IndirectRuns]) / seconds,
+                 share(d[IndirectSameTarget], d[IndirectRuns]), double(d[ReturnRuns]) / seconds,
+                 share(d[ReturnSameTarget], d[ReturnRuns]), share(d[ReturnRsbHits], d[ReturnRuns]),
+                 indirect_slots_used);
+    } else {
+        LOG_INFO(Core_ARM,
+                 "JIT indirect sites (FRITCHII_JIT_INDIRECT_CACHE={}) core {} {:.1f} s: slot misses "
+                 "{:.0f}/s; sites {}",
+                 indirect_cache_mode, conf.processor_id, seconds, double(d[SlotMisses]) / seconds,
+                 indirect_slots_used);
+    }
+    indirect_log_ns = now;
+    indirect_counters_logged = indirect_counters;
 }
 
 void A64EmitX64::ClearFastDispatchTable() {
@@ -225,15 +327,8 @@ void A64EmitX64::GenTerminalHandlers() {
     // PC ends up in rcx, location_descriptor ends up in rbx
     //static_assert(ABI_ALL_CALLEE_SAVE.test(size_t(HostLoc::R12)));
     const auto calculate_location_descriptor = [this] {
-        // This calculation has to match up with A64::LocationDescriptor::UniqueHash
         // TODO: Optimization is available here based on known state of fpcr.
-        code.mov(rdi, qword[code.ABI_JIT_PTR + offsetof(A64JitState, pc)]);
-        code.mov(rcx, A64::LocationDescriptor::pc_mask);
-        code.and_(rcx, rdi);
-        code.mov(ebx, dword[code.ABI_JIT_PTR + offsetof(A64JitState, fpcr)]);
-        code.and_(ebx, A64::LocationDescriptor::fpcr_mask);
-        code.shl(rbx, A64::LocationDescriptor::fpcr_shift);
-        code.or_(rbx, rcx);
+        EmitCalculateLocationDescriptor();
     };
 
     Xbyak::Label fast_dispatch_cache_miss;
@@ -261,6 +356,7 @@ void A64EmitX64::GenTerminalHandlers() {
         terminal_handler_fast_dispatch_hint = code.getCurr<const void*>();
         calculate_location_descriptor();
         code.L(rsb_cache_miss);
+        terminal_handler_fast_dispatch_after_calc = code.getCurr<const void*>();
         code.mov(r8, u64(fast_dispatch_table.get()));
         //code.mov(r12, qword[code.ABI_JIT_PTR + offsetof(A64JitState, pc)]);
         code.mov(r12, rbx);
@@ -289,6 +385,70 @@ void A64EmitX64::GenTerminalHandlers() {
         code.lea(code.ABI_RETURN, code.ptr[code.ABI_PARAM2 + code.ABI_PARAM1]);
         code.ret();
         PerfMapRegister(fast_dispatch_table_lookup, code.getCurr(), "a64_fast_dispatch_table_lookup");
+    }
+
+    // Fritchii: FRITCHII_JIT_INDIRECT_CACHE's shared parts (the sites are in EmitTerminalImpl).
+    // Each ends in the fast dispatch handler right after its descriptor calculation, so what a
+    // site's guest code reaches is decided by the same table and lookup as before.
+    if (indirect_cache_mode == 1) {
+        // Dry, rax = the site's slot: count a target equal to the site's last, then remember it.
+        const auto count_same_target = [this](IndirectCounter runs, IndirectCounter same) {
+            Xbyak::Label differs;
+            code.mov(r8, u64(indirect_counters.data()));
+            code.inc(qword[r8 + runs * sizeof(u64)]);
+            code.cmp(rbx, qword[rax + offsetof(FastDispatchEntry, location_descriptor)]);
+            code.jne(differs);
+            code.inc(qword[r8 + same * sizeof(u64)]);
+            code.L(differs);
+            code.mov(qword[rax + offsetof(FastDispatchEntry, location_descriptor)], rbx);
+        };
+
+        code.align();
+        terminal_handler_indirect_dry = code.getCurr<const void*>();
+        calculate_location_descriptor();
+        count_same_target(IndirectRuns, IndirectSameTarget);
+        code.jmp(terminal_handler_fast_dispatch_after_calc);
+        PerfMapRegister(terminal_handler_indirect_dry, code.getCurr(), "a64_terminal_handler_indirect_dry");
+
+        if (conf.HasOptimization(OptimizationFlag::ReturnStackBuffer)) {
+            // As terminal_handler_pop_rsb_hint, counting its hits (r8 still holds the counters).
+            code.align();
+            terminal_handler_pop_rsb_dry = code.getCurr<const void*>();
+            calculate_location_descriptor();
+            count_same_target(ReturnRuns, ReturnSameTarget);
+            code.mov(eax, dword[code.ABI_JIT_PTR + offsetof(A64JitState, rsb_ptr)]);
+            code.sub(eax, 1);
+            code.and_(eax, u32(A64JitState::RSB_PTR_MASK));
+            code.mov(dword[code.ABI_JIT_PTR + offsetof(A64JitState, rsb_ptr)], eax);
+            code.cmp(rbx, qword[code.ABI_JIT_PTR + offsetof(A64JitState, rsb_location_descriptors) + rax * sizeof(u64)]);
+            code.jne(terminal_handler_fast_dispatch_after_calc);
+            code.inc(qword[r8 + ReturnRsbHits * sizeof(u64)]);
+            code.mov(rax, qword[code.ABI_JIT_PTR + offsetof(A64JitState, rsb_codeptrs) + rax * sizeof(u64)]);
+            code.jmp(rax);
+            PerfMapRegister(terminal_handler_pop_rsb_dry, code.getCurr(), "a64_terminal_handler_pop_rsb_dry");
+        }
+    } else if (indirect_cache_mode >= 2) {
+        // A site's slot did not match (rbx = descriptor, rax = slot): the table entry as the fast
+        // dispatch handler finds it; on a table hit the slot takes it, else the handler's own
+        // miss path (lookup, table refill) runs and the slot is filled at the next miss.
+        code.align();
+        terminal_handler_indirect_slot_miss = code.getCurr<const void*>();
+        code.mov(r8, u64(indirect_counters.data()));
+        code.inc(qword[r8 + SlotMisses * sizeof(u64)]);
+        code.mov(r8, u64(fast_dispatch_table.get()));
+        code.mov(r12, rbx);
+        if (code.HasHostFeature(HostFeature::SSE42)) {
+            code.crc32(r12, r8);
+        }
+        code.and_(r12d, fast_dispatch_table_mask);
+        code.lea(r12, ptr[r8 + r12]);
+        code.cmp(rbx, qword[r12 + offsetof(FastDispatchEntry, location_descriptor)]);
+        code.jne(terminal_handler_fast_dispatch_after_calc);
+        code.mov(rcx, qword[r12 + offsetof(FastDispatchEntry, code_ptr)]);
+        code.mov(qword[rax + offsetof(FastDispatchEntry, location_descriptor)], rbx);
+        code.mov(qword[rax + offsetof(FastDispatchEntry, code_ptr)], rcx);
+        code.jmp(rcx);
+        PerfMapRegister(terminal_handler_indirect_slot_miss, code.getCurr(), "a64_terminal_handler_indirect_slot_miss");
     }
 }
 
@@ -708,6 +868,27 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::LinkBlockFast terminal, IR::Locat
 
 bool EmitTerminalImpl(A64EmitX64& e, IR::Term::PopRSBHint, IR::LocationDescriptor, bool is_single_step) {
     if (e.conf.HasOptimization(OptimizationFlag::ReturnStackBuffer) && !is_single_step) {
+        if (e.indirect_cache_mode == 1 && e.terminal_handler_pop_rsb_dry != nullptr) {
+            // FRITCHII_JIT_INDIRECT_CACHE=1: the dry handler counts this site's targets.
+            if (auto* const slot = e.AllocateIndirectSlot()) {
+                e.code.mov(rax, u64(slot));
+                e.code.jmp(e.terminal_handler_pop_rsb_dry);
+                return true;
+            }
+        } else if (e.indirect_cache_mode == 3) {
+            // FRITCHII_JIT_INDIRECT_CACHE=3: terminal_handler_pop_rsb_hint's instructions here, so
+            // this site's jump has its own prediction; a miss continues in the fast dispatch
+            // handler as the shared one's does.
+            e.EmitCalculateLocationDescriptor();
+            e.code.mov(eax, dword[e.code.ABI_JIT_PTR + offsetof(A64JitState, rsb_ptr)]);
+            e.code.sub(eax, 1);
+            e.code.and_(eax, u32(A64JitState::RSB_PTR_MASK));
+            e.code.mov(dword[e.code.ABI_JIT_PTR + offsetof(A64JitState, rsb_ptr)], eax);
+            e.code.cmp(rbx, qword[e.code.ABI_JIT_PTR + offsetof(A64JitState, rsb_location_descriptors) + rax * sizeof(u64)]);
+            e.code.jne(e.terminal_handler_fast_dispatch_after_calc);
+            e.code.jmp(qword[e.code.ABI_JIT_PTR + offsetof(A64JitState, rsb_codeptrs) + rax * sizeof(u64)]);
+            return true;
+        }
         e.code.jmp(e.terminal_handler_pop_rsb_hint);
     } else {
         e.code.ReturnFromRunCode();
@@ -718,9 +899,31 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::PopRSBHint, IR::LocationDescripto
 bool EmitTerminalImpl(A64EmitX64& e, IR::Term::FastDispatchHint, IR::LocationDescriptor, bool is_single_step) {
     if (!e.conf.HasOptimization(OptimizationFlag::FastDispatch) || is_single_step) {
         e.code.ReturnFromRunCode();
-    } else {
-        e.code.jmp(e.terminal_handler_fast_dispatch_hint);
+        return true;
     }
+    if (e.indirect_cache_mode != 0) {
+        if (auto* const slot = e.AllocateIndirectSlot()) {
+            if (e.indirect_cache_mode == 1) {
+                // FRITCHII_JIT_INDIRECT_CACHE=1: the dry handler counts this site's targets.
+                e.code.mov(rax, u64(slot));
+                e.code.jmp(e.terminal_handler_indirect_dry);
+                return true;
+            }
+            // FRITCHII_JIT_INDIRECT_CACHE>=2: the slot holds a descriptor and the entrypoint the
+            // fast dispatch table had for it (copied on a table hit; every slot is emptied when
+            // any block is removed), so a match jumps where the table would have.
+            Xbyak::Label miss;
+            e.EmitCalculateLocationDescriptor();
+            e.code.mov(rax, u64(slot));
+            e.code.cmp(rbx, qword[rax + offsetof(A64EmitX64::FastDispatchEntry, location_descriptor)]);
+            e.code.jne(miss);
+            e.code.jmp(qword[rax + offsetof(A64EmitX64::FastDispatchEntry, code_ptr)]);
+            e.code.L(miss);
+            e.code.jmp(e.terminal_handler_indirect_slot_miss);
+            return true;
+        }
+    }
+    e.code.jmp(e.terminal_handler_fast_dispatch_hint);
     return true;
 }
 

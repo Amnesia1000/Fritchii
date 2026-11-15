@@ -2570,6 +2570,35 @@ OnCPUWrite, collects the dirty bit, fences for a download landing and sets the c
   stores come in runs over the same block); the dry line says how many do. If the flag takes or
   gathers move the epoch too often the hit share stays low and the switch is not worth it.
 
+### FRITCHII_JIT_INDIRECT_CACHE
+
+FRITCHII_JIT_INDIRECT_CACHE (boot, read once per process, default 0 = exactly as before;
+fable_a_gameceiling_answer 12.2). Every indirect branch (BR, BLR) and return of the game went
+through two shared routines; the indirect one waits on a load from the 16 MiB fast dispatch table
+(2.56% of the guest cores' busy time) and has one host jump for every target.
+- 1 (dry): each indirect branch and return site gets a 16-byte slot (4 MiB pool per JIT) and
+  jumps to dry copies of the shared handlers, which count how often the target equals the site's
+  last one, and for returns how often the return stack buffer served it. Execution is the same.
+- 2: each indirect branch site computes the target's location descriptor itself, compares it
+  with its slot and jumps straight to the slot's block on a match. A miss goes to a shared routine
+  that looks in the fast dispatch table; on a table hit it fills the slot, else the table's own
+  miss path (lookup or compile, table refill) runs as before and the slot fills at the next miss.
+  Each site has its own host jump, so the host's predictor works per site.
+- 3: 2, and each return site pops the return stack buffer itself (the shared handler's
+  instructions at the site, a miss continuing in the fast dispatch handler as before).
+- Why it is exact: a slot only ever holds a descriptor and the entrypoint the fast dispatch
+  table held for it at that moment; every slot is emptied whenever any block is removed (a range
+  invalidation) or the cache is cleared, the two places the table's entries go too. A match
+  therefore jumps where the table would have. Halt checks are unchanged (the shared handler made
+  none either). Sites past the pool's 262,144 slots keep the shared handler.
+- "JIT indirect sites (FRITCHII_JIT_INDIRECT_CACHE=1) core N 10.0 s: indirect branches B/s, same
+  target as the site's last P%; returns R/s, same target as the site's last Q%, return buffer
+  hits H%; sites S" (Core_ARM, Info, per core, every 10 s from Jit::Run). With 2 or 3: "slot
+  misses M/s; sites S".
+- Expected: 1.5 to 2% of the guest cores' busy time if the dry line shows most indirect branches
+  hit their site's last target (Fable A 12). Code grows by about 40 bytes per indirect branch site
+  (3: also per return site).
+
 ## Numbered experiments (EDEN_NX2_EXPn)
 
 Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP79, live through the debug server:

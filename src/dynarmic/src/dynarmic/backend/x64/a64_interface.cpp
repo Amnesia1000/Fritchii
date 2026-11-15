@@ -89,6 +89,10 @@ public:
         const HaltReason hr = block_of_code.RunCode(&jit_state, current_code_ptr);
         PerformRequestedCacheInvalidation(hr);
         is_executing = false;
+        // Fritchii: FRITCHII_JIT_INDIRECT_CACHE's counters, written by this thread's code.
+        if (emitter.indirect_cache_mode != 0 && (++runs_since_counter_look & 0x3ff) == 0) [[unlikely]] {
+            emitter.LogIndirectCounters();
+        }
         return hr;
     }
 
@@ -324,6 +328,7 @@ private:
     A64EmitX64 emitter;
     Optimization::PolyfillOptions polyfill_options;
     bool is_executing = false;
+    u32 runs_since_counter_look = 0;
     bool invalidate_entire_cache = false;
     boost::icl::interval_set<u64> invalid_cache_ranges;
     std::mutex invalidation_mutex;
