@@ -6089,10 +6089,9 @@ struct FrontOpChecks {
 };
 FrontOpChecks g_front_op_checks{};
 
-/// The memory stage's tag for an op entry: Level for now (the stage stops following there, which
-/// is always correct).
+/// The memory stage follows an op entry (StageTag::Ops, memstage_shadow.cpp).
 constexpr u64 FrontOpStageFlags() {
-    return 0;
+    return VideoCommon::StageTagBits(VideoCommon::StageTag::Ops);
 }
 
 void OpBump(std::atomic<u64>& counter) {

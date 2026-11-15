@@ -46,6 +46,10 @@ enum class StageTag : u8 {
     Pass = 5,
     /// Uses the buffer cache or another back-side object; writes no 3D state (memstage_shadow.cpp).
     Cache = 6,
+    /// Maxwell3D::ApplyFrontOp (FRITCHII_ONEF_FRONT_OPS, macro_ops_oot.h): [engine, system,
+    /// header, sent mask, pair mask, arguments two to a word, check words]. The writes are
+    /// OotOps::Expand's; each sent one as a Pairs word (pair mask bit) or a Direct method entry.
+    Ops = 7,
 };
 
 /// StageTag::DrawLoop's kind, in header bits 40-47 (the payloads stay as small as the lambdas

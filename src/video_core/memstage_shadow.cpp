@@ -147,6 +147,7 @@
 #include "video_core/engines/kepler_memory.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_dma.h"
+#include "video_core/macro_ops_oot.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/memory_stage_link.h"
@@ -3300,6 +3301,43 @@ size_t Process(State& s, u64 position, bool executed) {
             }
             break;
         }
+        case StageTag::Ops: {
+            // FRITCHII_ONEF_FRONT_OPS: each sent write followed as the entry it replaces, a
+            // Pairs word as Kind::Pairs follows it (StateWrite), a Direct write as a Direct
+            // Kind::Method (CallMethod), as for StageTag::Writes.
+            namespace OotOps = Tegra::OotOps;
+            Maxwell3D* const engine = As3D(words[0]);
+            cls = Class::Work;
+            s.entry_type = LevelType::Packet3D;
+            if (Copy* const c = Use(s, engine, executed)) {
+                const Nx2Profile::Scope zone{Nx2Profile::Zone::StagePackets,
+                                             s.ring && Nx2Profile::Fine(), false};
+                const u64 header = words[2];
+                const u64 sent = words[3];
+                const u64 pairs = words[4];
+                const u32 arg_count = OotOps::HeaderArgs(header);
+                std::array<u32, OotOps::MaxArgs> args{};
+                for (u32 i = 0; i < arg_count && i < OotOps::MaxArgs; ++i) {
+                    args[i] = OotOps::ArgAt(words + 2 + OotOps::HeaderWords, i);
+                }
+                u32 index = 0;
+                OotOps::Expand(OotOps::HeaderOp(header), args.data(),
+                               [&](u32 method, u32 argument) {
+                                   const u32 i = index++;
+                                   if (((sent >> i) & 1) == 0) {
+                                       return;
+                                   }
+                                   if (((pairs >> i) & 1) != 0) {
+                                       StateWrite(*c, method, argument);
+                                   } else {
+                                       CallMethod(s, *c, method, argument);
+                                   }
+                               });
+            } else if (engine == nullptr) {
+                Unfollow(s, LevelType::Packet3D, 0);
+            }
+            break;
+        }
         case StageTag::FinishMacro: {
             cls = Class::Work;
             if (Copy* const c = Use(s, As3D(words[0]), executed)) {
@@ -3847,6 +3885,7 @@ bool StageExtendsRun(u64 position) {
             return true;
         case StageTag::Channel:
         case StageTag::Writes:
+        case StageTag::Ops:
         case StageTag::FinishMacro:
         case StageTag::DrawLoop:
             return false;
@@ -3943,6 +3982,7 @@ bool StageMayCopy(u64 position) {
     case Kind::Call:
         switch (StageTagOf(head)) {
         case StageTag::Writes:
+        case StageTag::Ops:
         case StageTag::FinishMacro:
         case StageTag::DrawLoop:
             return needs(As3D(entry[2]));
