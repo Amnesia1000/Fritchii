@@ -55,6 +55,11 @@ struct A64JitState {
     u32 rsb_ptr = 0;
     std::array<u64, RSB_SIZE> rsb_location_descriptors;
     std::array<u64, RSB_SIZE> rsb_codeptrs;
+    /// Fritchii (FRITCHII_JIT_VERIFY): pinned registers found different from this block's copy;
+    /// must stay 0. Written by generated code only.
+    u64 pin_mismatches = 0;
+    /// Fritchii (FRITCHII_JIT_PIN_STATS): guest register reads (0..31, 31 = SP), then writes.
+    std::array<u64, 64> pin_stats{};
 
     u32 GetPstate() const {
         return NZCV::FromX64(cpsr_nzcv);

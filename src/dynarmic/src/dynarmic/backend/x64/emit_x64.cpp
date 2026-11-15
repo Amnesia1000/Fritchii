@@ -83,6 +83,7 @@ void EmitX64::EmitCallHostFunction(EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     ctx.reg_alloc.HostCall(code, nullptr, args[1], args[2], args[3]);
     auto target = args[0].GetImmediateU64();
+    code.PinsBeforeCall();  // Fritchii (FRITCHII_JIT_PIN); nothing without pins
     if (IsWithin2G(uintptr_t(code.getCurr()), target)) {
         auto const f = std::bit_cast<void(*)(void)>(target);
         code.call(f);
@@ -90,6 +91,7 @@ void EmitX64::EmitCallHostFunction(EmitContext& ctx, IR::Inst* inst) {
         code.mov(rax, target);
         code.call(rax);
     }
+    code.PinsAfterCall();
 }
 
 void EmitX64::PushRSBHelper(Xbyak::Reg64 loc_desc_reg, Xbyak::Reg64 index_reg, IR::LocationDescriptor target) {
