@@ -5,6 +5,7 @@
 #include <atomic>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cwchar>
 
@@ -145,6 +146,47 @@ void OnAbort(int) {
     }
 }
 
+// FRITCHII_CRASH_FIRST_CHANCE (boot env, default 0; a diagnostic): an exception in host code
+// called from JIT code (a memory callback, an SVC, a soft float helper) unwinds into the JIT's
+// frame, whose unwind data cannot describe it, and the process ends without reaching the filter
+// above. This vectored handler logs the first exceptions whose address is inside a loaded module
+// (JIT code is in none, so its fastmem faults are not logged) before any handler runs, then lets
+// the search go on as before.
+std::atomic<int> first_chance_logged{0};
+
+LONG WINAPI OnFirstChance(EXCEPTION_POINTERS* pointers) {
+    const EXCEPTION_RECORD& record = *pointers->ExceptionRecord;
+    switch (record.ExceptionCode) {
+    case EXCEPTION_ACCESS_VIOLATION:
+    case EXCEPTION_ILLEGAL_INSTRUCTION:
+    case EXCEPTION_PRIV_INSTRUCTION:
+    case EXCEPTION_INT_DIVIDE_BY_ZERO:
+    case EXCEPTION_STACK_OVERFLOW:
+    case EXCEPTION_IN_PAGE_ERROR:
+    case 0xE06D7363: // a C++ throw
+        break;
+    default:
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    HMODULE module{};
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            static_cast<LPCSTR>(record.ExceptionAddress), &module)) {
+        return EXCEPTION_CONTINUE_SEARCH; // JIT code (fastmem faults) or no module
+    }
+    if (first_chance_logged.fetch_add(1, std::memory_order_relaxed) >= 16) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    const CodeAddress at = Locate(record.ExceptionAddress);
+    LOG_CRASH("First-chance exception (FRITCHII_CRASH_FIRST_CHANCE) {:#010x} at {}+{:#x} on thread "
+              "{}, info {:#x} {:#x}, rsp {:#x}",
+              record.ExceptionCode, at.module, at.offset, GetCurrentThreadId(),
+              record.NumberParameters > 0 ? record.ExceptionInformation[0] : 0,
+              record.NumberParameters > 1 ? record.ExceptionInformation[1] : 0,
+              pointers->ContextRecord->Rsp);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 } // Anonymous namespace
 
 void InstallCrashHandler(const std::filesystem::path& dump_directory) {
@@ -160,6 +202,10 @@ void InstallCrashHandler(const std::filesystem::path& dump_directory) {
         GetProcAddress(GetModuleHandleW(L"KernelBase.dll"), "GetThreadDescription")));
     previous_filter = SetUnhandledExceptionFilter(OnUnhandledException);
     std::signal(SIGABRT, OnAbort);
+    if (const char* value = std::getenv("FRITCHII_CRASH_FIRST_CHANCE");
+        value != nullptr && value[0] != '\0' && value[0] != '0') {
+        AddVectoredExceptionHandler(1, OnFirstChance);
+    }
 }
 
 } // namespace Common::Windows
