@@ -146,6 +146,7 @@ struct Impl {
     u64 op_bytes_logged{};
     std::array<std::atomic<u64>, 3> mirror_count{}; ///< compared, E set R not, R set E not
     std::atomic<bool> post_fence_stopped{};
+    u64 lookup_checks{};
     // fable_b 13.0 (E only): pages with a report a posted fence lands, by that fence's packet
     // number; and the report pages since the last fence.
     std::unordered_map<u64, u64> landing_pages;
@@ -1565,6 +1566,12 @@ bool InvalOnEngine() noexcept {
 bool SyncMirrorOn() noexcept {
     return g.on && VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_sync_mirror,
                                                     "FRITCHII_ONEF_SYNC_MIRROR") != 0;
+}
+
+bool LookupCheckDue() noexcept {
+    const int every = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_lookup_check,
+                                                       "FRITCHII_ONEF_LOOKUP_CHECK");
+    return g.on && every > 0 && ++g.lookup_checks % static_cast<u64>(every) == 0;
 }
 
 void StopPostFence(const char* why) noexcept {

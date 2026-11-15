@@ -420,6 +420,24 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
         const auto flags_before = engine.dirty.flags;
         pipeline = rasterizer.pipeline_cache.CurrentGraphicsPipeline();
         engine.dirty.flags |= flags_before;
+        // fable_b 18.4, must be 0 (FRITCHII_ONEF_LOOKUP_CHECK, every Nth unlent draw): the parts
+        // the lookup kept on a clear flag, against the same parts fresh.
+        if (pipeline != nullptr && OneF::LookupCheckDue()) [[unlikely]] {
+            const bool shaders_clear = !flags_before[VideoCommon::Dirty::Shaders];
+            const bool blending_clear = !flags_before[Dirty::Blending];
+            const bool vertex_input_clear = !flags_before[Dirty::VertexInput];
+            if (const u32 differ = rasterizer.pipeline_cache.OneFollowerLookupCheck(
+                    shaders_clear, blending_clear, vertex_input_clear);
+                differ != 0) {
+                thread_local std::string note;
+                note = fmt::format("unlent draw {}: {}{}{}kept on a clear flag differ from the "
+                                   "registers",
+                                   seq, (differ & 1) != 0 ? "programs " : "",
+                                   (differ & 2) != 0 ? "blend " : "",
+                                   (differ & 4) != 0 ? "vertex input " : "");
+                OneF::Note(Check::LookupFlags, note.c_str());
+            }
+        }
         if (pipeline == nullptr) {
             reason = LentReason::PipelineMiss;
             return false;

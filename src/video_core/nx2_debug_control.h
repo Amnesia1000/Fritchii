@@ -274,6 +274,9 @@ inline std::atomic<int> g_onef_sync_mirror{-1};
 /// FRITCHII_ONEF_POST_FENCE (live, default 0): fable_b 16.3, clean sync points, references and
 /// forced fence releases posted.
 inline std::atomic<int> g_onef_post_fence{-1};
+/// FRITCHII_ONEF_LOOKUP_CHECK (live, default 0 = off; N = every Nth unlent draw): fable_b 18.4's
+/// "lookup flags" must-be-0.
+inline std::atomic<int> g_onef_lookup_check{-1};
 /// FRITCHII_ONEF_CLEAR_NODEFER (live, default 0): diagnostic, a posted clear on R is never
 /// deferred into the next render pass's load op (the lean darkness of 15 Nov).
 inline std::atomic<int> g_onef_clear_nodefer{-1};

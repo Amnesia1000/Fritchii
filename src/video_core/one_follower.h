@@ -220,6 +220,11 @@ enum class Check : u8 {
     /// fable_b 16.2: a target E obtained for a samples report that R had no value for (E's
     /// mirror said a sync was owed): its early upload may have cleared a mark serial keeps.
     SyncTargetUnused,
+    /// fable_b 18.4 (FRITCHII_ONEF_LOOKUP_CHECK): at an unlent draw's lookup on E, a part of the
+    /// key the lookup kept because its flag was clear (the programs, the blend, the vertex
+    /// input) differs from the same part computed fresh: a pack or path took the flag before
+    /// E's lookup read it.
+    LookupFlags,
     Count,
 };
 
@@ -231,7 +236,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Check::Count)> chec
     "facts stale", "played lookup miss", "texture read ahead of R", "ring B pairing",
     "R waits for E's lock", "R needs E's buffer flush",
     "build list draw", "played list args", "played kind without path", "sync mirror",
-    "sync target missing", "sync target unused",
+    "sync target missing", "sync target unused", "lookup flags",
 };
 
 // --- The packet (E to R) -----------------------------------------------------------------------------
@@ -591,6 +596,8 @@ void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size,
 /// commit) is posted; E runs the closing gather itself first. Stopped for the session by a "sync
 /// mirror" mismatch of the kind that makes E's test wrong (R started, E not).
 [[nodiscard]] bool PostFenceOn() noexcept;
+/// FRITCHII_ONEF_LOOKUP_CHECK: whether this unlent draw's lookup is checked (every Nth).
+[[nodiscard]] bool LookupCheckDue() noexcept;
 /// Stops FRITCHII_ONEF_POST_FENCE for the session (a must-be-0 of its own fired).
 void StopPostFence(const char* why) noexcept;
 /// E: the packet number of the packet it pushed last.

@@ -1452,6 +1452,13 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   make a fence lent. 13.0: every report's page then waits, in E's buffer cache reads of game
   memory, for the posted fence after it to be played by R (a folded fence lands the queued
   reports at R's place); counted in the op packets line.
+- FRITCHII_ONEF_LOOKUP_CHECK (live, default 0 = off, N = every Nth unlent draw; fable_b 18.4):
+  at an unlent draw's pipeline lookup on E (rule 3), the key parts
+  the lookup kept because their flag was clear (the six program hashes with Shaders clear, the
+  blend attachments with Blending clear, the vertex attributes and divisors with VertexInput
+  clear) are computed fresh from E's registers and compared: must-be-0 "lookup flags", the note
+  naming the parts. The engine's flags are left as they were, except that a differing program
+  refresh leaves Shaders raised so the next lookup takes the right key.
 - FRITCHII_ONEF_OP_CLEAR (live, default 0; fable_b_one_follower 13.4 group 3; step 4, view
   tracked): 1 = clears are render ops. E has decided the render enable (DrawManager tests
   ShouldExecute) and runs the clear's FlushCaching; R plays Clear from its view (every clear
