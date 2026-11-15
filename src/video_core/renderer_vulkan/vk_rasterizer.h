@@ -328,6 +328,11 @@ private:
     /// R, the dispatch op: takes ring B's packet `number` and records the dispatch with
     /// `pipeline` (E's lookup) on R's view of the compute engine.
     void OneFollowerPlayDispatch(ComputePipeline* pipeline, u64 number);
+    /// R, after a played image-writing dispatch (fable_b 27.9): counts its images on pages the
+    /// front reads, and with FRITCHII_ONEF_DISPATCH_RANGES compares the descriptors and ranges E
+    /// recorded (`view`: the packet's OneFollowerDispatchView) with what R bound
+    /// (Check::DispatchImageRange).
+    void OneFollowerCheckPlayedImages(const ComputePipeline& pipeline, const void* view);
     /// E -> R through a lend (E parked): the pipeline E looked up for the lent dispatch (its
     /// hooks ran on E): DispatchCompute on R uses it instead of a second lookup.
     ComputePipeline* onef_dispatch_lent_pipeline{};

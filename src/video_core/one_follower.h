@@ -269,6 +269,10 @@ enum class Check : u8 {
     /// GPU right before it, read once its submission is done) exceed the device's workgroup
     /// count limit. Seen after the fact (the dispatch ran); posting stops.
     IndirectGridOverLimit,
+    /// FRITCHII_ONEF_DISPATCH_RANGES (fable_b 27.9): a played image-writing dispatch binds an
+    /// image other than the one E recorded the range of (the descriptor R reads at its play
+    /// differs from E's, or E had no image where R binds one). The switch stops.
+    DispatchImageRange,
     Count,
 };
 
@@ -285,6 +289,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Check::Count)> chec
     "semaphore order", "R read landing",
     "signal ahead of landing", "unlent reset", "view values", "bind seed view",
     "played dispatch indirect", "played dispatch image", "indirect grid over the limit",
+    "dispatch image range",
 };
 
 // --- The packet (E to R) -----------------------------------------------------------------------------
@@ -780,13 +785,26 @@ enum class DispatchCount : u8 {
     /// lent indirect dispatch whose grid words exceeded the device limit (the dry compare of
     /// IndirectGridOverLimit: the game's own, if not 0)
     LentGridOverLimit,
+    /// FRITCHII_ONEF_DISPATCH_RANGES: a posted image-writing dispatch E recorded with its images'
+    /// ranges (EXP10), not as "may write anything"
+    ImageRanged,
+    /// ... one E still recorded unbounded (an image without one device range, more than 8)
+    ImageUnbounded,
+    /// fable_b 27.9's count (R, every played image-writing dispatch): an image's real guest
+    /// range touches a page the front snapshots for its DMA reads (expected about 0)
+    ImageOnFrontPage,
+    /// R: an image's real range (the texture cache's backing image) reaches past E's record
+    /// (a view into a larger image: the lent path would record more; not a must-be-0)
+    ImageWiderThanRecord,
     Count,
 };
 /// The kinds that count a posted dispatch a second time (not in the line's total).
 [[nodiscard]] constexpr bool DispatchCountIsExtra(DispatchCount kind) noexcept {
     return kind == DispatchCount::TailListCopies || kind == DispatchCount::TailProbes ||
            kind == DispatchCount::PostedImage || kind == DispatchCount::PostedIndirect ||
-           kind == DispatchCount::LentGridOverLimit;
+           kind == DispatchCount::LentGridOverLimit || kind == DispatchCount::ImageRanged ||
+           kind == DispatchCount::ImageUnbounded || kind == DispatchCount::ImageOnFrontPage ||
+           kind == DispatchCount::ImageWiderThanRecord;
 }
 /// FRITCHII_ONEF_OP_DISPATCH's bits (any non-zero value turns the switch on).
 enum DispatchPostBit : u32 {
@@ -803,7 +821,8 @@ inline constexpr std::array<const char*, static_cast<size_t>(DispatchCount::Coun
         "lent: texel buffers", "lent: writes an image", "lent: upscaler", "lent: grid limit",
         "lent: fill refused", "posted + list copies lent", "posted + extent probes lent",
         "lent: byte-addressed image write", "posted writing images", "posted indirect",
-        "lent indirect grid over the limit (dry)",
+        "lent indirect grid over the limit (dry)", "posted images ranged",
+        "posted images unbounded", "images on a front read page", "images wider than E's record",
 };
 /// E: the first reason a dispatch cannot be posted before its lookup, Count when it may be;
 /// DispatchCount::Posted (never returned) is not a reason. Returns Count too when the switch is
@@ -813,6 +832,17 @@ inline constexpr std::array<const char*, static_cast<size_t>(DispatchCount::Coun
 void StopPostDispatch(const char* why) noexcept;
 /// E: counts where a dispatch went.
 void CountDispatch(DispatchCount kind) noexcept;
+/// FRITCHII_ONEF_DISPATCH_RANGES (live, default 0; fable_b 27.9): E records a posted
+/// image-writing dispatch's images by their ranges, from their descriptors, and a lent dispatch
+/// records on R with E's recording state (the lent path's own records, confirmed). False once a
+/// "dispatch image range" stopped it.
+[[nodiscard]] bool DispatchRangesOn() noexcept;
+void StopDispatchRanges(const char* why) noexcept;
+/// The front (Maxwell3D::FrontDmaRead): it took a snapshot of device page `page` (4 KiB), a page
+/// its DMA reads are answered from. Kept with one follower on only; never cleared.
+void NoteFrontReadPage(u64 page) noexcept;
+/// Any thread: whether [address, address + size) touches a page NoteFrontReadPage noted.
+[[nodiscard]] bool FrontReadPagesAny(u64 address, u64 size) noexcept;
 /// E: the packet number of the packet it pushed last.
 [[nodiscard]] u64 PushedNow() noexcept;
 /// fable_b 13.0 (POST_FENCE), E: a report to `device`'s page was made; a fence op with `number`

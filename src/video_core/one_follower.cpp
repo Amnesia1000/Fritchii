@@ -42,6 +42,7 @@
 #include "video_core/one_follower.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/one_follower_stats.h"
+#include "video_core/page_filter.h"
 
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
 #include <intrin.h>
@@ -161,6 +162,9 @@ struct Impl {
     std::array<std::atomic<u64>, static_cast<size_t>(DispatchCount::Count)> dispatch_count{};
     std::array<u64, static_cast<size_t>(DispatchCount::Count)> dispatch_logged{};
     std::atomic<bool> post_dispatch_stopped{};
+    std::atomic<bool> dispatch_ranges_stopped{};
+    /// NoteFrontReadPage's pages (made once, never freed while the process runs: R reads it).
+    std::atomic<PageFilter*> front_read_pages{};
     std::atomic<bool> dispatch_refused_logged{};
     u64 lookup_checks{};
     u64 landing_max{}; ///< E: the newest packet number 13.0 assigned report pages to
@@ -925,9 +929,11 @@ void LogQueryKinds() {
                                           dispatch_count_names[i], rates[i]);
             }
             LOG_INFO(HW_GPU,
-                     "One follower dispatches (FRITCHII_ONEF_OP_DISPATCH={}, BIND_SEED={}; "
-                     "fable_b 13.4 group 6) {:.0f} s: {:.0f}/s, {:.1f}% posted: {}{}",
-                     DispatchPostBits(), BindSeedOn() ? 1 : 0, seconds, total,
+                     "One follower dispatches (FRITCHII_ONEF_OP_DISPATCH={}, BIND_SEED={}, "
+                     "DISPATCH_RANGES={}; fable_b 13.4 group 6) {:.0f} s: {:.0f}/s, {:.1f}% "
+                     "posted: {}{}",
+                     DispatchPostBits(), BindSeedOn() ? 1 : 0, DispatchRangesOn() ? 1 : 0,
+                     seconds, total,
                      total > 0.0 ? 100.0 * rates[0] / total : 0.0, dispatches,
                      g.post_dispatch_stopped.load(std::memory_order_relaxed)
                          ? " (STOPPED for the session: see the checks line)"
@@ -2210,6 +2216,42 @@ void StopPostDispatch(const char* why) noexcept {
                      "dispatch is lent again",
                      why != nullptr ? why : "?");
     }
+}
+
+bool DispatchRangesOn() noexcept {
+    return g.on &&
+           VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_dispatch_ranges,
+                                            "FRITCHII_ONEF_DISPATCH_RANGES") != 0 &&
+           !g.dispatch_ranges_stopped.load(std::memory_order_relaxed);
+}
+
+void StopDispatchRanges(const char* why) noexcept {
+    if (!g.dispatch_ranges_stopped.exchange(true, std::memory_order_relaxed)) {
+        LOG_CRITICAL(HW_GPU,
+                     "One follower: FRITCHII_ONEF_DISPATCH_RANGES stops for this session ({}); "
+                     "image-writing dispatches record \"may write anything\" again",
+                     why != nullptr ? why : "?");
+    }
+}
+
+void NoteFrontReadPage(u64 page) noexcept {
+    if (!g.on) {
+        return;
+    }
+    PageFilter* filter = g.front_read_pages.load(std::memory_order_acquire);
+    if (filter == nullptr) [[unlikely]] {
+        static std::once_flag once;
+        std::call_once(once, [] {
+            g.front_read_pages.store(new PageFilter, std::memory_order_release);
+        });
+        filter = g.front_read_pages.load(std::memory_order_acquire);
+    }
+    filter->Mark(page << 12, u64{1} << 12);
+}
+
+bool FrontReadPagesAny(u64 address, u64 size) noexcept {
+    const PageFilter* const filter = g.front_read_pages.load(std::memory_order_acquire);
+    return filter != nullptr && filter->Any(address, size);
 }
 
 void CountDispatch(DispatchCount kind) noexcept {
