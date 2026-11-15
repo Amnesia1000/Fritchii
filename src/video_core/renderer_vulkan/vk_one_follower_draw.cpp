@@ -35,8 +35,10 @@
 #include <fmt/format.h>
 
 #include "common/dkb_frame_trace.h"
+#include "common/fritchii_page_flags.h"
 #include "common/scope_exit.h"
 #include "video_core/fritchii_delta_path.h"
+#include "video_core/fritchii_price.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
@@ -446,15 +448,23 @@ bool OneFollowerDraw::FillRing(Maxwell3D& engine, GraphicsPipeline* pipeline, bo
     handle_values.clear();
     const auto& stages = engine.state.shader_stages;
     using Cbufs = std::remove_cvref_t<decltype(stages[0].const_buffers)>;
-    VideoCommon::FillGraphicsHandleValues(
+    const std::span<const Shader::Info> handle_infos =
         pipeline != nullptr ? std::span<const Shader::Info>{pipeline_facts.stage_infos, 5}
-                            : std::span<const Shader::Info>{*facts.infos},
-        engine.GetMemoryManager(),
+                            : std::span<const Shader::Info>{*facts.infos};
+    // fable_b 23.1 cut 4, dry (GPU profile on): the fill timed and the draw classed.
+    const bool price_handles = VideoCommon::FritchiiPrice::On() && pipeline != nullptr;
+    const u64 handle_start = price_handles ? VideoCommon::FritchiiPrice::Ticks() : 0;
+    VideoCommon::FillGraphicsHandleValues(
+        handle_infos, engine.GetMemoryManager(),
         [&stages](size_t stage) {
             return VideoCommon::GraphicsHandleCbufs<Cbufs>{stages[stage].const_buffers};
         },
         r.device.GetStorageBufferAlignment(), null_pointer_handles,
         [this](u32 raw) { handle_values.push_back(raw); });
+    if (price_handles) [[unlikely]] {
+        PriceHandleValues(engine, handle_infos, pipeline,
+                          VideoCommon::FritchiiPrice::Ticks() - handle_start);
+    }
     buffer_number = r.mem_stage.NextRingPacketIndex();
     const bool filled =
         r.mem_stage.FillRingDraw(r.buffer_cache, draw_facts, is_indexed, position, seq, 0, nullptr,
@@ -474,6 +484,90 @@ bool OneFollowerDraw::FillRing(Maxwell3D& engine, GraphicsPipeline* pipeline, bo
         record.buffer_number = buffer_number;
     }
     return filled;
+}
+
+void OneFollowerDraw::PriceHandleValues(Maxwell3D& engine, std::span<const Shader::Info> infos,
+                                        const void* pipeline, u64 ticks) {
+    using Verdict = VideoCommon::FritchiiPrice::HandleValues;
+    // The constant buffer words each texture and image descriptor reads (as ConfigureImpl's
+    // price): a key of their addresses, the write generations of their pages, and whether the
+    // buffer cache's tracker holds any of them CPU-modified (a guest store there raises no flag).
+    auto& memory = engine.GetMemoryManager();
+    u64 key = 0xcbf29ce484222325ULL;
+    u64 sum = 0;
+    bool keyed = true;
+    bool cpu_modified = false;
+    const auto add = [&](GPUVAddr begin, u64 bytes) {
+        key = (key ^ begin) * 0x100000001b3ULL;
+        key = (key ^ bytes) * 0x100000001b3ULL;
+        const std::optional<DAddr> device =
+            begin != 0 ? memory.GpuToCpuAddress(begin) : std::nullopt;
+        const u64 part = device ? Common::PriceGenSum(*device, bytes) : ~u64{0};
+        sum = part == ~u64{0} || sum == ~u64{0} ? ~u64{0} : sum + part;
+        if (device && rasterizer.buffer_cache.IsRegionCpuModified(*device, bytes)) {
+            cpu_modified = true;
+        }
+    };
+    for (size_t stage = 0; stage < infos.size() && keyed; ++stage) {
+        const Shader::Info& info = infos[stage];
+        const auto& cbufs = engine.state.shader_stages[stage].const_buffers;
+        const auto base = [&cbufs](u32 index) -> GPUVAddr {
+            return index < cbufs.size() && cbufs[index].enabled ? cbufs[index].address
+                                                                : GPUVAddr{};
+        };
+        const auto range = [&](const auto& desc) {
+            if (desc.handle_program != ~0U) {
+                keyed = false;
+                return;
+            }
+            if (desc.count == 0) {
+                return;
+            }
+            add(base(desc.cbuf_index) + desc.cbuf_offset,
+                (u64{desc.count - 1} << desc.size_shift) + sizeof(u32));
+            if constexpr (requires { desc.has_secondary; }) {
+                if (desc.has_secondary) {
+                    add(base(desc.secondary_cbuf_index) + desc.secondary_cbuf_offset,
+                        sizeof(u32));
+                }
+            }
+        };
+        for (const auto& desc : info.texture_buffer_descriptors) {
+            range(desc);
+        }
+        for (const auto& desc : info.image_buffer_descriptors) {
+            range(desc);
+        }
+        for (const auto& desc : info.texture_descriptors) {
+            range(desc);
+        }
+        for (const auto& desc : info.image_descriptors) {
+            range(desc);
+        }
+    }
+    HandleMemo& memo = handle_memos[pipeline];
+    const bool same_values = memo.valid && memo.values == handle_values;
+    const bool same_range = memo.valid && memo.key == key;
+    const bool unflagged = same_range && sum != ~u64{0} && memo.sum == sum;
+    Verdict verdict;
+    if (!keyed) {
+        verdict = Verdict::Program;
+    } else if (!same_values) {
+        verdict = unflagged && !cpu_modified ? Verdict::KeepWouldDiffer : Verdict::Changed;
+    } else if (!same_range) {
+        verdict = Verdict::SameMoved;
+    } else if (!unflagged) {
+        verdict = Verdict::SameFlagged;
+    } else {
+        verdict = cpu_modified ? Verdict::SameCpuModified : Verdict::SameKeep;
+    }
+    memo.values = handle_values;
+    memo.key = key;
+    memo.sum = sum;
+    // The generations count only once they are on (NoteHandleValues turns them on): a memo
+    // taken before compares nothing.
+    memo.valid = keyed && Common::g_price_gens_on.load(std::memory_order_relaxed);
+    VideoCommon::FritchiiPrice::NoteHandleValues(verdict, ticks);
 }
 
 void OneFollowerDraw::LendDraw(bool is_indexed, u32 instance_count, LentReason reason,

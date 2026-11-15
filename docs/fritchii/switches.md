@@ -236,6 +236,14 @@ only when the group counted something. Times are time stamp ticks converted with
   word runs counted per word, 3D single, other engine single, multi, call, pairs per pair, state
   delta, draw batch, words blocks per word, engine/wrap) and the "method" zone ms/s each kind
   added (the zone's own estimate: 3D methods are sampled about one in 32).
+- "Price handle values (E, unlent draws ...)", row 2b (fable_b_one_follower 23.1 cut 4): each
+  unlent draw's handle values (OneFollowerDraw::FillRing, the fill timed) against the same
+  pipeline's last unlent draw: changed or first; same, unflagged, pages tracked (the cut: same
+  constant buffer ranges, no flag on their pages since, the buffer cache's tracker holds them
+  clean, so a guest store would trap and flag); same, unflagged, a page CPU-modified (a guest
+  store there raises no flag: not provable); same but a page flagged (page grain: another word
+  on the page was written); same values from other ranges; handle program (reads storage, no
+  key); and "unflagged and tracked but changed", must be 0 (a keep would have been stale).
 - "Price back 3D methods ...", row 4b (fable_b_one_follower 22.3 step 2 and 23): row 4's "3D
   single" entries by method, the 24 costliest by the "method" zone time each added (the same
   sampled estimate), with the state writes each found sunk and consumed first (ConsumeSink:

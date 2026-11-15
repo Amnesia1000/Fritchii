@@ -149,6 +149,25 @@ enum class Entry : u32 {
 inline Group<static_cast<size_t>(Entry::Count)> g_entries;
 
 // ---------------------------------------------------------------------------------------------
+// Row 2b (fable_b_one_follower 23.1 cut 4, E; dry): unlent draws by their handle values against
+// the same pipeline's last unlent draw (OneFollowerDraw::FillRing's fill, timed).
+
+enum class HandleValues : u32 {
+    Changed,         ///< other values than the pipeline's last draw (or its first draw)
+    SameKeep,        ///< same values, same ranges, no flag on their pages, pages tracked: the cut
+    SameCpuModified, ///< as SameKeep, but a page is CPU-modified (guest stores raise no flag)
+    SameFlagged,     ///< same values, same ranges, a page flagged since (page, not word, grain)
+    SameMoved,       ///< same values from other ranges (a constant buffer rebound)
+    Program,         ///< a handle program (reads storage): no range key
+    /// Must be 0: same ranges, unflagged, tracked, yet other values (a keep would be stale).
+    KeepWouldDiffer,
+    Count,
+};
+inline Group<static_cast<size_t>(HandleValues::Count)> g_handle_values;
+/// E, at an unlent draw's handle fill (GPU profile on).
+void NoteHandleValues(HandleValues verdict, u64 ticks) noexcept;
+
+// ---------------------------------------------------------------------------------------------
 // Row 4b (fable_b_one_follower 22.3 step 2 and 23, the back; dry): the "3D single" entries of row
 // 4 by method. Each costs what Execute ran for it in the "method" zone: its own handler and the
 // state writes sunk before it, which it consumes first (ConsumeSink); `sunk` counts those.
