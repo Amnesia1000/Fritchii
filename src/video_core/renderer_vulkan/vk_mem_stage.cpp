@@ -2495,6 +2495,9 @@ void MemStage::OnRenderImpl(void (*function)(void*), void* argument) {
         };
         function(argument);
     };
+    // Named by the seam site the play came from (the lends by site line, the lend trace).
+    VideoCommon::OneFollower::SetLendSite(
+        t_site < Site::Count ? SITE_NAMES[static_cast<size_t>(t_site)] : "seam play");
     VideoCommon::OneFollower::Lend(VideoCommon::OneFollower::LentOp::Other, served);
     engine.identity = 0;
     install(engine);
