@@ -181,6 +181,14 @@ Maxwell3D::Maxwell3D(MemoryManager& memory_manager_)
     perf_verify = VideoCommon::Nx2Perf::Verify();
     VideoCommon::Nx2FastDrawCount::Init();
     counts_fast_draw_breaks = true;
+    // FRITCHII_FRONT_LIST_LANE: the state registers FrontWrite only compares, stores and sends.
+    // render_enable.mode has the deferred 0xe2c notes before its test; 0x157 and 0x158 run the
+    // macro DMA reads after it (fable_b 27.3); the puller's range is not the engine's.
+    for (u32 i = 0x40; i < Regs::NUM_REGS; ++i) {
+        front_lane_methods[i] = !execution_mask[i] && !memory_write_mask[i] &&
+                                i != MAXWELL3D_REG_INDEX(render_enable.mode) && i != 0x157 &&
+                                i != 0x158;
+    }
 }
 
 Maxwell3D::~Maxwell3D() {
@@ -1688,6 +1696,25 @@ void Maxwell3D::SetHLEReplacementAttributeType(u32 bank, u32 offset,
     replace_table.emplace(key, name);
 }
 
+/// FRITCHII_FRONT_CALL_LEAN: the switches FrontRunMacroFeatures reads per call, kept in the front
+/// state (ReadFrontCallSwitches).
+struct FrontCallSwitches {
+    int exp53;
+    int oot_mode;
+    int fold_instance;
+    int draw_packet;
+    int e2c_on_e;
+    int same_dry;
+    int seq_dry;
+    int front_ops;
+    int cb_words_block;
+    int dead_stores;
+    int list_lane; ///< FRITCHII_FRONT_LIST_LANE (bit 2: a handler's writes)
+    int op_lean;   ///< FRITCHII_FRONT_OP_LEAN
+    u32 traced;    ///< MacroTraced()
+    bool operator==(const FrontCallSwitches&) const = default;
+};
+
 // Split GPU thread with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2). The front keeps
 // what macros read: the registers as the back thread will hold them when it reaches the same
 // point of the method stream. That is every write the front sends, with the shadow RAM applied,
@@ -1709,6 +1736,40 @@ struct Maxwell3D::FrontState {
     bool macro_features_logged{};
     u32 switches_seen{~u32{0}};
     u32 macro_calls{};
+    /// FRITCHII_FRONT_CALL_LEAN (live, default 0; fable_b 27.2 B): 1 = the features body takes the
+    /// per-call switches from `call_switches` (read by FrontRefreshSwitches when the switch
+    /// generation moves, as macro_features is) and a whole call's words straight from the
+    /// command list (`call_words`, no copy into `parameters`); 2 = the same, and every call also
+    /// reads the switches as before and counts where they differ (must be 0).
+    int call_lean{};
+    FrontCallSwitches call_switches{};
+    /// FRITCHII_FRONT_CALL_LEAN: the running call's words in the command list (FrontCallMultiMethod
+    /// with the whole call in one run), valid until the call returns; empty: `parameters` holds
+    /// them. FrontCallMaterialize copies them into `parameters` where a path needs the vector.
+    std::span<const u32> call_words;
+    struct CallLeanStats {
+        u64 calls{};      ///< calls through the lean body
+        u64 from_list{};  ///< of them, with their words taken from the list (no copy)
+        u64 copied{};     ///< of those, copied after all (a path that needs the vector)
+        u64 compared{};   ///< mode 2: calls whose switches were read again
+        u64 differ{};     ///< mode 2: of them, with a switch value differing (must be 0)
+        u64 ticks{};
+        std::chrono::steady_clock::time_point report{};
+    };
+    CallLeanStats call_lean_stats{};
+    /// FRITCHII_FRONT_LIST_LANE: drops by the lane (command-list words, handler writes) and the
+    /// verify counts (writes checked, lane drops the old path sent: must be 0, sends it missed).
+    struct LaneStats {
+        u64 list_dropped{};
+        u64 macro_dropped{};
+        u64 checked{};
+        u64 differ{};
+        u64 missed{};
+        u64 differ_total{}; ///< since boot
+        u64 ticks{};
+        std::chrono::steady_clock::time_point report{};
+    };
+    LaneStats lane_stats{};
     /// EXP53: per macro, 0 unknown, 1 a render-enable predicate, 2 something else.
     std::vector<u8> predicate_macros;
     u64 predicate_generation{~u64{0}};
@@ -1957,6 +2018,7 @@ struct Maxwell3D::FrontState {
     struct FrontOp {
         Tegra::OotOps::Args args;
         int mode;
+        int lean; ///< FRITCHII_FRONT_OP_LEAN for this call (FrontOpRecord)
         u32 count;
         u64 sent;  ///< bit i: write i is sent (else dropped on the front)
         u64 pairs; ///< bit i: sent as a Pairs word (else as a Direct method entry)
@@ -1982,8 +2044,20 @@ struct Maxwell3D::FrontState {
         u64 count_differ{}; ///< must be 0: recorded writes against the op's expansion
         u64 calls{};
         std::chrono::steady_clock::time_point report{};
+        /// FRITCHII_FRONT_OP_LEAN: writes decided by the lean decide, writes it left to
+        /// FrontWriteDecide (a method it does not cover, the shadow RAM not tracking), writes
+        /// compared (mode 2) and of them differing (must be 0; since boot in `lean_differ_total`).
+        u64 lean_writes{};
+        u64 lean_generic{};
+        u64 lean_checked{};
+        u64 lean_differ{};
+        u64 lean_differ_total{};
     };
     FrontOpStats op_stats{};
+    /// FRITCHII_FRONT_OP_LEAN: per method, what FrontWriteDecide's executable half does with it
+    /// under the op path's conditions (FrontOpKinds, filled when the front starts).
+    enum OpKind : u8 { OpState, OpCbData, OpNoDraw, OpDraw, OpGeneric };
+    std::array<u8, Regs::NUM_REGS> op_kinds{};
     /// FRITCHII_ONEF_DEAD_STORES (fable_b 27.7, count only): the last 0xea0 call's trailing
     /// c[0][0x640] stores, where the ring stood after them and which buffer they went to.
     struct DeadStores {
@@ -2009,16 +2083,33 @@ namespace {
 // ported, its maxwell_3d.cpp OotContext) run in on the
 // split front. Emit is FrontRunMacro's own emit, the one the JIT calls, so every front transform
 // of a macro write (EXP53's predicate, EDEN_NX2_FOLD_INSTANCE, EDEN_NX2_MACRO_TRACE, the MME DMA
-// reads) applies to a handler's writes exactly as to the JIT's.
-template <typename EmitFn>
+// reads) applies to a handler's writes exactly as to the JIT's. `Params`: the load FIFO, the
+// front's vector (0xe2c's read appends to it) or, FRITCHII_FRONT_CALL_LEAN, a call's words where
+// they are for the handlers that never append.
+// FRITCHII_FRONT_LIST_LANE bit 2 (the lean body): a handler's write FrontWrite would drop at its
+// same-value test is dropped before the emit (`Lane`, with `lane` set for the call); bit 4
+// verifies instead: the emit runs and a lane drop the emit sent (a ring commit or a packet
+// write) is counted (must be 0).
+struct OotLane {
+    const Maxwell3D* engine;
+    const VideoCommon::GpuSplit* split;
+    const std::vector<u64>* packet;
+    bool verify;
+    u32 dropped;
+    u32 checked;
+    u32 differ;
+    u32 missed;
+};
+template <typename EmitFn, typename Params = std::vector<u32>&, bool Lane = false>
 struct OotFrontContext {
-    std::vector<u32>& parameters;
+    Params parameters;
     u32* dram;
     std::span<const u32> regs;
     EmitFn& emit;
     const char* error{};
     /// FRITCHII_MACRO_SEQ_DRY: the register reads, as the JIT's read callback records them.
     std::vector<u64>* reads{};
+    OotLane* lane{};
 
     [[nodiscard]] u32 Count() const {
         return static_cast<u32>(parameters.size());
@@ -2044,8 +2135,38 @@ struct OotFrontContext {
         // loop's first draw.begin, checked against the front's copy of it).
     }
     void Emit(u32 method, u32 value) {
+        if constexpr (Lane) {
+            if (lane != nullptr) [[likely]] {
+                if (!lane->verify) [[likely]] {
+                    if (lane->engine->FrontLaneDrops(method, value)) {
+                        ++lane->dropped;
+                        return;
+                    }
+                } else {
+                    EmitChecked(method, value);
+                    return;
+                }
+            }
+        }
         if (!emit(method, value)) [[unlikely]] {
             Fail("method past the macro range");
+        }
+    }
+    void EmitChecked(u32 method, u32 value) {
+        const bool drops = lane->engine->FrontLaneDrops(method, value);
+        const u64 position = lane->split->WritePositionPeek();
+        const size_t held = lane->packet->size();
+        if (!emit(method, value)) [[unlikely]] {
+            Fail("method past the macro range");
+        }
+        const bool sent =
+            lane->split->WritePositionPeek() != position || lane->packet->size() != held;
+        ++lane->checked;
+        if (drops && sent) [[unlikely]] {
+            ++lane->differ;
+        } else if (!drops && !sent && method < Maxwell3D::Regs::NUM_REGS &&
+                   lane->engine->front_lane_methods[method] != 0) {
+            ++lane->missed;
         }
     }
     void EmitRepeated(const std::array<u32, 2>* writes, u32 count, u32 times) {
@@ -2118,6 +2239,18 @@ struct OotRecordContext {
         }
     }
 };
+
+// FRITCHII_FRONT_CALL_LEAN: a traced call's text, made only when a call is traced in the lean
+// body (the old body keeps its string).
+std::string& TraceText(std::string& text) {
+    return text;
+}
+std::string& TraceText(std::unique_ptr<std::string>& text) {
+    if (!text) {
+        text = std::make_unique<std::string>();
+    }
+    return *text;
+}
 
 enum class OotVerdict { Same, Different, Declined, Unverifiable };
 
@@ -2275,6 +2408,27 @@ u32 MacroTraced() {
 }
 u32 g_macro_traced_calls{};
 
+// FRITCHII_FRONT_CALL_LEAN: the same reads, with the same names and defaults, as
+// FrontRunMacroFeatures makes per call.
+FrontCallSwitches ReadFrontCallSwitches() {
+    namespace Debug = VideoCore::Nx2Debug;
+    return FrontCallSwitches{
+        .exp53 = Debug::Experiment(53),
+        .oot_mode = Debug::SwitchValue(Debug::g_oot_macros, "EDEN_NX2_OOT_MACROS", 1),
+        .fold_instance = Debug::SwitchValue(Debug::g_fold_instance, "EDEN_NX2_FOLD_INSTANCE"),
+        .draw_packet = Debug::SwitchValue(Debug::g_draw_packet, "EDEN_NX2_DRAW_PACKET"),
+        .e2c_on_e = Debug::SwitchValue(Debug::g_e2c_on_e, "FRITCHII_E2C_ON_E"),
+        .same_dry = Debug::SwitchValue(Debug::g_macro_same_dry, "FRITCHII_MACRO_SAME_DRY"),
+        .seq_dry = Debug::SwitchValue(Debug::g_macro_seq_dry, "FRITCHII_MACRO_SEQ_DRY"),
+        .front_ops = Debug::SwitchValue(Debug::g_onef_front_ops, "FRITCHII_ONEF_FRONT_OPS"),
+        .cb_words_block = Debug::SwitchValue(Debug::g_cb_words_block, "FRITCHII_CB_WORDS_BLOCK"),
+        .dead_stores = Debug::SwitchValue(Debug::g_onef_dead_stores, "FRITCHII_ONEF_DEAD_STORES"),
+        .list_lane = Debug::SwitchValue(Debug::g_front_list_lane, "FRITCHII_FRONT_LIST_LANE"),
+        .op_lean = Debug::SwitchValue(Debug::g_front_op_lean, "FRITCHII_FRONT_OP_LEAN"),
+        .traced = MacroTraced(),
+    };
+}
+
 // Methods whose execution on the back writes guest memory (inline uploads, reports).
 bool WritesGuestMemory(u32 method) {
     return method == MAXWELL3D_REG_INDEX(launch_dma) ||
@@ -2388,6 +2542,8 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
         macro_params.clear();
         executing_macro = 0;
         front_macros = true;
+        FrontLaneSync(*front);
+        FrontOpKinds(*front);
     }
     // Read again only when a switch or experiment store moved the generation (every store
     // bumps it): one relaxed load per front call instead of three experiment reads (5.6 ms/s,
@@ -2400,8 +2556,107 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
         front->same_experiment = VideoCore::Nx2Debug::Experiment(2);
         front->early_same = VideoCore::Nx2Debug::Experiment(14);
         front->exp22 = VideoCore::Nx2Debug::Experiment(22);
+        FrontLaneSync(*front);
     }
     return *front;
+}
+
+void Maxwell3D::FrontLaneSync(FrontState& fs) {
+    u32 block = 0;
+    if (fs.control != Regs::ShadowRamControl::Track &&
+        fs.control != Regs::ShadowRamControl::TrackWithFilter) {
+        block |= 2; // Passthrough has no shadow word to compare, Replay sends the shadow's
+    }
+    if (!fs.skip_same) {
+        block |= 4;
+    }
+    if (fs.same_experiment != 0) {
+        block |= 8; // EXP2 counts each same-value write
+    }
+    if (fs.list_draw_stale != 0) {
+        block |= 16; // FrontNoteListDrawWrite before the test
+    }
+    if (fs.seq_dry != nullptr) {
+        block |= 32; // FrontMacroSeqDirect after each command-list write
+    }
+    front_lane.regs = fs.regs.data();
+    front_lane.shadow = fs.shadow.data();
+    front_lane.block = block;
+}
+
+bool Maxwell3D::FrontLaneReady() {
+    if (!front) {
+        return false;
+    }
+    // A switch stored since the front read its experiments: FrontCallMethod reads them again
+    // first, so this chunk goes the old way.
+    if (front->experiments_generation !=
+        VideoCore::Nx2Debug::g_switch_generation.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    FrontLaneSync(*front);
+    return front_lane.block == 0;
+}
+
+void Maxwell3D::FrontLaneListDone(u32 dropped, u32 checked, u32 differ, u32 missed) {
+    namespace Profile = VideoCommon::Nx2Profile;
+    if (dropped != 0 && Profile::Enabled()) {
+        // FrontWrite counts each write it drops as a method write and a same-value one.
+        Profile::Add(Profile::Counter::MethodWrites, dropped);
+        Profile::Add(Profile::Counter::SameValueWrites, dropped);
+    }
+    if (!front) {
+        return;
+    }
+    auto& s = front->lane_stats;
+    s.list_dropped += dropped;
+    s.checked += checked;
+    s.differ += differ;
+    s.missed += missed;
+    FrontLaneReport(*front);
+}
+
+void Maxwell3D::FrontLaneMacroDone(FrontState& fs, u32 dropped, u32 checked, u32 differ,
+                                   u32 missed) {
+    namespace Profile = VideoCommon::Nx2Profile;
+    if (dropped != 0 && Profile::Enabled()) {
+        Profile::Add(Profile::Counter::MethodWrites, dropped);
+        Profile::Add(Profile::Counter::SameValueWrites, dropped);
+    }
+    auto& s = fs.lane_stats;
+    s.macro_dropped += dropped;
+    s.checked += checked;
+    s.differ += differ;
+    s.missed += missed;
+}
+
+void Maxwell3D::FrontLaneReport(FrontState& fs) {
+    auto& s = fs.lane_stats;
+    if ((++s.ticks & 0x3ff) != 0) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (s.report == std::chrono::steady_clock::time_point{}) {
+        s.report = now;
+        return;
+    }
+    const double seconds = std::chrono::duration<double>(now - s.report).count();
+    if (seconds < 10.0) {
+        return;
+    }
+    s.differ_total += s.differ;
+    LOG_INFO(HW_GPU,
+             "Front lane (FRITCHII_FRONT_LIST_LANE={}), per second: {:.0f} list writes and {:.0f} "
+             "handler writes dropped where they start; verify: {:.0f} checked, {:.0f} sends the "
+             "lane missed, {} lane drops the old path sent in {:.0f} s ({} since boot, must be 0)",
+             VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_front_list_lane,
+                                              "FRITCHII_FRONT_LIST_LANE"),
+             s.list_dropped / seconds, s.macro_dropped / seconds, s.checked / seconds,
+             s.missed / seconds, s.differ, seconds, s.differ_total);
+    const u64 total = s.differ_total;
+    s = {};
+    s.differ_total = total;
+    s.report = now;
 }
 
 namespace {
@@ -2615,6 +2870,7 @@ NX2_PROFILE_FORCEINLINE bool Maxwell3D::FrontWriteDecide(VideoCommon::GpuSplit& 
             // register, which a later Replay write reads back.
             fs.control = static_cast<Regs::ShadowRamControl>(argument);
             fs.shadow[method] = argument;
+            FrontLaneSync(fs);
             break;
         case MAXWELL3D_REG_INDEX(load_mme.instruction_ptr):
             GetNativeMacroEngine().ClearCode(fs.regs[MAXWELL3D_REG_INDEX(load_mme.instruction_ptr)]);
@@ -2819,6 +3075,16 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         if (fs.executing_macro == 0) {
             fs.executing_macro = method;
         }
+        if (fs.call_lean != 0 && amount == methods_pending && amount != 0 &&
+            fs.parameters.empty()) [[unlikely]] {
+            // FRITCHII_FRONT_CALL_LEAN: the whole call is in this run; its words stay in the
+            // list (they live until this call returns) and the lean body reads them there.
+            fs.call_words = std::span<const u32>{base_start, amount};
+            ++fs.call_lean_stats.from_list;
+            FrontRunMacro(system, split, fs);
+            fs.call_words = {};
+            return;
+        }
         fs.parameters.insert(fs.parameters.end(), base_start, base_start + amount);
         if (amount == methods_pending) {
             FrontRunMacro(system, split, fs);
@@ -2908,6 +3174,7 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
             case MAXWELL3D_REG_INDEX(shadow_ram_control):
                 fs.control = static_cast<Regs::ShadowRamControl>(argument);
                 fs.shadow[method] = argument; // The same word on the back (see FrontWrite)
+                FrontLaneSync(fs);
                 break;
             case MAXWELL3D_REG_INDEX(load_mme.instruction_ptr):
                 GetNativeMacroEngine().ClearCode(value);
@@ -2968,10 +3235,17 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     // the emit 1.4 -> 3.7 ns a write in the 5.7 vs HEAD sampler pair). The features body reads
     // the switches per call as before, so turning one off is exact at once; turning one on
     // bumps g_switch_generation, seen at the next call.
+    // FRITCHII_FRONT_CALL_LEAN as the call's words were taken (FrontCallMultiMethod): the lean
+    // entry also copies them into `parameters` if this refresh turned it off.
+    const bool call_lean = fs.call_lean != 0;
     if (fs.switches_seen !=
             VideoCore::Nx2Debug::g_switch_generation.load(std::memory_order_relaxed) ||
         (++fs.macro_calls & 1023) == 0) [[unlikely]] {
         FrontRefreshSwitches(fs);
+    }
+    if (call_lean) [[unlikely]] {
+        FrontRunMacroLean(system, split, fs);
+        return;
     }
     // List guard (nx2_list_dispatch.h), ahead of both bodies so the plain
     // one stays v5.7's: a data RAM that holds a list dispatch's marker (the compute engine shares
@@ -2980,7 +3254,7 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
         if (FrontListGuard(split, fs)) {
             // The call may read a stale register: the features body checks each read.
             fs.guard_list_reads = true;
-            FrontRunMacroFeatures(system, split, fs);
+            FrontRunMacroFeaturesT<false>(system, split, fs);
             fs.guard_list_reads = false;
             return;
         }
@@ -2989,7 +3263,7 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
         FrontRunMacroPlain(system, split, fs);
         return;
     }
-    FrontRunMacroFeatures(system, split, fs);
+    FrontRunMacroFeaturesT<false>(system, split, fs);
 }
 
 void Maxwell3D::FrontRefreshSwitches(FrontState& fs) {
@@ -3018,7 +3292,78 @@ void Maxwell3D::FrontRefreshSwitches(FrontState& fs) {
                  features, generation, features == 0 ? "plain (v5.7)" : "features");
     }
     fs.macro_features = features;
+    // FRITCHII_FRONT_CALL_LEAN: the per-call switches of the features body, read here once per
+    // generation instead of on every call (fable_b 27.2 B). Every store of a live switch bumps
+    // the generation, so the next call sees it, as it sees macro_features.
+    const int call_lean = Debug::SwitchValue(Debug::g_front_call_lean, "FRITCHII_FRONT_CALL_LEAN");
+    if (call_lean != fs.call_lean) {
+        LOG_INFO(HW_GPU, "Front macro call set-up: FRITCHII_FRONT_CALL_LEAN={} ({})", call_lean,
+                 call_lean == 0   ? "as before"
+                 : call_lean == 2 ? "kept switches and list words, compared every call"
+                                  : "kept switches and list words");
+    }
+    fs.call_lean = call_lean;
+    if (call_lean != 0) {
+        fs.call_switches = ReadFrontCallSwitches();
+    }
     fs.switches_seen = generation;
+}
+
+void Maxwell3D::FrontCallMaterialize(FrontState& fs) {
+    if (fs.call_words.empty()) {
+        return;
+    }
+    fs.parameters.insert(fs.parameters.end(), fs.call_words.begin(), fs.call_words.end());
+    fs.call_words = {};
+    ++fs.call_lean_stats.copied;
+}
+
+void Maxwell3D::FrontRunMacroLean(Core::System& system, VideoCommon::GpuSplit& split,
+                                  FrontState& fs) {
+    // FrontRunMacro's choice of body, as it makes it; the plain body, the guarded one and a lean
+    // switch turned off at this call's refresh take the call's words in `parameters`.
+    if (grid_marker.In(native_data_ram) || fs.list_draw_stale != 0) [[unlikely]] {
+        if (FrontListGuard(split, fs)) {
+            FrontCallMaterialize(fs);
+            fs.guard_list_reads = true;
+            FrontRunMacroFeaturesT<false>(system, split, fs);
+            fs.guard_list_reads = false;
+            return;
+        }
+    }
+    if (fs.macro_features == 0 || fs.call_lean == 0) [[unlikely]] {
+        FrontCallMaterialize(fs);
+        if (fs.macro_features == 0) {
+            FrontRunMacroPlain(system, split, fs);
+        } else {
+            FrontRunMacroFeaturesT<false>(system, split, fs);
+        }
+        return;
+    }
+    FrontRunMacroFeaturesT<true>(system, split, fs);
+}
+
+void Maxwell3D::FrontCallLeanReport(FrontState& fs) {
+    auto& s = fs.call_lean_stats;
+    if ((++s.ticks & 0xffff) != 0) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (s.report == std::chrono::steady_clock::time_point{}) {
+        s.report = now;
+        return;
+    }
+    const double seconds = std::chrono::duration<double>(now - s.report).count();
+    if (seconds < 10.0) {
+        return;
+    }
+    LOG_INFO(HW_GPU,
+             "Front call lean (FRITCHII_FRONT_CALL_LEAN={}), last {:.0f} s: {} calls, {} with their "
+             "words read in the list ({} copied after all); compare: {} calls, {} switch "
+             "differences (must be 0)",
+             fs.call_lean, seconds, s.calls, s.from_list, s.copied, s.compared, s.differ);
+    s = {};
+    s.report = now;
 }
 
 void Maxwell3D::FrontRunMacroPlain(Core::System& system, VideoCommon::GpuSplit& split,
@@ -3099,35 +3444,75 @@ void Maxwell3D::FrontRunMacroPlain(Core::System& system, VideoCommon::GpuSplit& 
     }
 }
 
-void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSplit& split,
-                                      FrontState& fs) {
+template <bool Lean>
+void Maxwell3D::FrontRunMacroFeaturesT(Core::System& system, VideoCommon::GpuSplit& split,
+                                       FrontState& fs) {
     const u32 method = fs.executing_macro;
     fs.executing_macro = 0;
     auto& engine = GetNativeMacroEngine();
     const auto positions = GetNativeMacroPositions();
     const u32 start = positions[((method - MacroRegistersStart) >> 1) % positions.size()];
     VideoCommon::Nx2Profile::CountMethod(method, false);
+    // FRITCHII_FRONT_CALL_LEAN (the Lean body): the switches as FrontRefreshSwitches kept them,
+    // and the call's words where they are (`params`: the list's words, or `parameters`). A path
+    // that needs them in the vector (the JIT, a tool, 0xe2c's FIFO read, EXP53's six words) first
+    // copies them there (`materialize`). The old body reads `parameters` and the switches as
+    // before.
+    [[maybe_unused]] const FrontCallSwitches& sw = fs.call_switches;
+    [[maybe_unused]] std::span<const u32> params;
+    if constexpr (Lean) {
+        params = fs.call_words.empty() ? std::span<const u32>{fs.parameters} : fs.call_words;
+        ++fs.call_lean_stats.calls;
+        if (fs.call_lean == 2) [[unlikely]] {
+            ++fs.call_lean_stats.compared;
+            if (!(ReadFrontCallSwitches() == sw)) {
+                ++fs.call_lean_stats.differ;
+            }
+        }
+    }
+    [[maybe_unused]] const auto materialize = [&] {
+        if constexpr (Lean) {
+            if (!fs.call_words.empty()) {
+                FrontCallMaterialize(fs);
+                params = std::span<const u32>{fs.parameters};
+            }
+        }
+    };
     // EDEN_NX2_MACRO_TRACE=<method>: the first calls of that macro, parameters and writes.
-    const u32 traced = MacroTraced();
+    const u32 traced = Lean ? sw.traced : MacroTraced();
+    if constexpr (Lean) {
+        if (traced != 0 && method == traced) [[unlikely]] {
+            materialize();
+        }
+    }
     const bool trace = traced != 0 && method == traced &&
                        std::ranges::any_of(fs.parameters, [](u32 p) { return p != 0; }) &&
                        g_macro_traced_calls++ < 8;
-    std::string trace_text;
+    // The lean body makes the string only for a traced call.
+    std::conditional_t<Lean, std::unique_ptr<std::string>, std::string> trace_text;
     if (trace) [[unlikely]] {
-        trace_text = fmt::format("3D macro {:#x} start {:#x} params", traced, start);
+        TraceText(trace_text) = fmt::format("3D macro {:#x} start {:#x} params", traced, start);
         for (const u32 p : fs.parameters) {
-            trace_text += fmt::format(" {:x}", p);
+            TraceText(trace_text) += fmt::format(" {:x}", p);
         }
-        trace_text += " writes";
+        TraceText(trace_text) += " writes";
     }
     // EDEN_NX2_EXP53 (live, 0 = off; ported): NVN's conditional
     // render macro reads the six Compare words at an address and sets render_enable.mode from
     // them, which drained the split on every call (our largest front wait, "macro dma read").
     // For such a macro the front skips the read, feeds six zero words and writes the address
     // with mode IfNotEqual: the back evaluates the same condition in order.
-    const bool predicate = VideoCore::Nx2Debug::Experiment(53) != 0 &&
-                           fs.parameters.size() == 3 && fs.parameters[0] == 0 &&
-                           IsPredicateMacro(fs, method);
+    bool predicate;
+    if constexpr (Lean) {
+        predicate = sw.exp53 != 0 && params.size() == 3 && params[0] == 0 &&
+                    IsPredicateMacro(fs, method);
+        if (predicate) [[unlikely]] {
+            materialize(); // its emit appends six words to the FIFO
+        }
+    } else {
+        predicate = VideoCore::Nx2Debug::Experiment(53) != 0 && fs.parameters.size() == 3 &&
+                    fs.parameters[0] == 0 && IsPredicateMacro(fs, method);
+    }
     // The slot's OoT replacement (macro_hle_oot.h, ported):
     // the hash of the code at the slot's start, found again when the code or the
     // start changed, as the original FrontRunMacro does. Each slot is logged once ("OoT macro
@@ -3152,8 +3537,9 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
     // EDEN_NX2_OOT_MACROS (live, 0 = off; 1, the default since 2026-11-12): 1 runs the
     // replacement instead of the JIT, 2 and 3 verify it against the JIT (see nx2_debug_control.h
     // g_oot_macros).
-    const int oot_mode = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_oot_macros,
-                                                          "EDEN_NX2_OOT_MACROS", 1);
+    const int oot_mode = Lean ? sw.oot_mode
+                              : VideoCore::Nx2Debug::SwitchValue(
+                                    VideoCore::Nx2Debug::g_oot_macros, "EDEN_NX2_OOT_MACROS", 1);
     const size_t oot_index = static_cast<size_t>(oot);
     bool oot_verify = false;
     if (oot != OotMacros::Id::None && oot_mode >= 2) [[unlikely]] {
@@ -3167,23 +3553,33 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
     // first draw.end that this instance is the first of a loop, so it is not drawn alone: the
     // loop's deferred draw (instance_count + 1 from the base instance) covers it. Without it
     // instance 0 is drawn twice. The same with the handlers on (they call the emit below).
-    const bool fold_on = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_fold_instance,
-                                                          "EDEN_NX2_FOLD_INSTANCE") != 0;
-    bool fold_pending = fold_on &&
-                        (oot == OotMacros::Id::E52 || oot == OotMacros::Id::EA0) &&
-                        fs.parameters.size() >= 6 && fs.parameters[2] > 1 &&
-                        fs.parameters[2] <= OotMacros::MaxInstances;
+    const bool fold_on = (Lean ? sw.fold_instance
+                               : VideoCore::Nx2Debug::SwitchValue(
+                                     VideoCore::Nx2Debug::g_fold_instance,
+                                     "EDEN_NX2_FOLD_INSTANCE")) != 0;
+    bool fold_pending;
+    if constexpr (Lean) {
+        fold_pending = fold_on && (oot == OotMacros::Id::E52 || oot == OotMacros::Id::EA0) &&
+                       params.size() >= 6 && params[2] > 1 &&
+                       params[2] <= OotMacros::MaxInstances;
+    } else {
+        fold_pending = fold_on && (oot == OotMacros::Id::E52 || oot == OotMacros::Id::EA0) &&
+                       fs.parameters.size() >= 6 && fs.parameters[2] > 1 &&
+                       fs.parameters[2] <= OotMacros::MaxInstances;
+    }
     // EDEN_NX2_DRAW_PACKET (live, 0 = off, the default): a draw macro's Direct draw and state
     // writes go as one ring entry (FrontCapturePacket). Not with the paths that keep their own
     // open blocks or held writes (EXP22, EXP2, EDEN_NX2_MACRO_SINK).
-    fs.packet_mode = IsDrawMacro(oot) ? VideoCore::Nx2Debug::SwitchValue(
-                                            VideoCore::Nx2Debug::g_draw_packet,
-                                            "EDEN_NX2_DRAW_PACKET")
-                                      : 0;
+    fs.packet_mode = !IsDrawMacro(oot) ? 0
+                     : Lean            ? sw.draw_packet
+                                       : VideoCore::Nx2Debug::SwitchValue(
+                                             VideoCore::Nx2Debug::g_draw_packet,
+                                             "EDEN_NX2_DRAW_PACKET");
     fs.packet_on = fs.packet_mode != 0 && fs.exp22 == 0 && fs.same_experiment == 0 &&
                    !VideoCommon::GpuSplit::MacroSink();
     fs.e2c_call = oot == OotMacros::Id::E2C;
     if (fs.e2c_call) {
+        materialize(); // its FIFO read appends six words
         // FRITCHII_DELAY_E2C_US (live, 0 = off): the delay test "W", every call (hits too),
         // before its read, whether the handler or the JIT runs it. Off: one load and a branch.
         VideoCommon::GpuSplit::DelayWorkIf(VideoCore::Nx2Debug::g_delay_e2c_us,
@@ -3194,32 +3590,37 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
     // evaluates every call too and compares), 3 = every call deferred. Not with EXP53's
     // predicate, and not with a replaying shadow RAM (the write's value is the shadow word then).
     const int e2c_mode =
-        fs.e2c_call && !predicate && fs.control != Regs::ShadowRamControl::Replay
-            ? VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_e2c_on_e,
-                                               "FRITCHII_E2C_ON_E")
-            : 0;
+        !(fs.e2c_call && !predicate && fs.control != Regs::ShadowRamControl::Replay) ? 0
+        : Lean ? sw.e2c_on_e
+               : VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_e2c_on_e,
+                                                  "FRITCHII_E2C_ON_E");
     // FRITCHII_MACRO_SAME_DRY (live, default 0): counts only, nothing skipped.
     const size_t dry_slot = ((method - MacroRegistersStart) >> 1) % positions.size();
     FrontState::MacroSameDry* dry = nullptr;
     if (dry_slot < FrontState::MacroSlots &&
-        VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_macro_same_dry,
-                                         "FRITCHII_MACRO_SAME_DRY") != 0) [[unlikely]] {
+        (Lean ? sw.same_dry
+              : VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_macro_same_dry,
+                                                 "FRITCHII_MACRO_SAME_DRY")) != 0) [[unlikely]] {
+        materialize();
         FrontMacroSameDryBegin(fs, dry_slot);
         dry = fs.same_dry.get();
     }
     // FRITCHII_MACRO_SEQ_DRY (live, default 0): counts only, nothing skipped.
     FrontState::MacroSeqDry* seq = nullptr;
-    if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_macro_seq_dry,
-                                         "FRITCHII_MACRO_SEQ_DRY") != 0) [[unlikely]] {
+    if ((Lean ? sw.seq_dry
+              : VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_macro_seq_dry,
+                                                 "FRITCHII_MACRO_SEQ_DRY")) != 0) [[unlikely]] {
+        materialize();
         FrontMacroSeqCall(fs, method);
         seq = fs.seq_dry;
     } else if (fs.seq_dry != nullptr) [[unlikely]] {
         fs.seq_dry = nullptr; // Off: the command-list paths stop adding
+        FrontLaneSync(fs);
     }
     {
         VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
         engine.native_interpreter.active_dram = &native_data_ram;
-        const auto parameter_count = fs.parameters.size();
+        const auto parameter_count = Lean ? params.size() : fs.parameters.size();
         const auto read = [&](u32 address) {
             if (address >= Regs::NUM_REGS) {
                 return 0U;
@@ -3249,7 +3650,7 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
                 fs.oot_jit_writes.push_back(value);
             }
             if (trace) [[unlikely]] {
-                trace_text += fmt::format(" {:x}={:x}", address, value);
+                TraceText(trace_text) += fmt::format(" {:x}={:x}", address, value);
             }
             if (address >= MacroRegistersStart) {
                 return false;
@@ -3355,8 +3756,10 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
             // would take FrontWriteSend's plain lanes (a Direct entry or a Pairs word, no held
             // block or packet, no tool watching the writes), so the sent set and its order are
             // the old path's by construction.
-            if (const int ops_mode = VideoCore::Nx2Debug::SwitchValue(
-                    VideoCore::Nx2Debug::g_onef_front_ops, "FRITCHII_ONEF_FRONT_OPS");
+            if (const int ops_mode = Lean ? sw.front_ops
+                                          : VideoCore::Nx2Debug::SwitchValue(
+                                                VideoCore::Nx2Debug::g_onef_front_ops,
+                                                "FRITCHII_ONEF_FRONT_OPS");
                 ops_mode != 0 && OotOps::OpOf(oot) != OotOps::Op::None) [[unlikely]] {
                 const bool lanes =
                     (fs.control == Regs::ShadowRamControl::Track ||
@@ -3365,8 +3768,9 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
                     fs.list_draw_stale == 0 && !fs.e2c_mode_unknown && !fs.e2c_shadow_unknown &&
                     !fs.guard_list_reads &&
                     (!VideoCommon::GpuSplit::MacroSink() || VideoCommon::GpuSplit::RingPairs()) &&
-                    VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_cb_words_block,
-                                                     "FRITCHII_CB_WORDS_BLOCK") == 0;
+                    (Lean ? sw.cb_words_block
+                          : VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_cb_words_block,
+                                                             "FRITCHII_CB_WORDS_BLOCK")) == 0;
                 const bool tools = trace || dry != nullptr || seq != nullptr || oot_verify ||
                                    predicate || e2c_mode != 0 || fold_pending;
                 // fable_b2 1.1 A: 2 or more instances while EDEN_NX2_FOLD_INSTANCES counts
@@ -3380,8 +3784,9 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
                     reason = Reason::Tools;
                 } else if (FrontOpsStopped()) {
                     reason = Reason::Stopped;
-                } else if (!OotOps::Encode(oot, fs.parameters, native_data_ram.data(),
-                                           fs.op.args, max_instances)) {
+                } else if (!OotOps::Encode(oot,
+                                           Lean ? params : std::span<const u32>{fs.parameters},
+                                           native_data_ram.data(), fs.op.args, max_instances)) {
                     reason = Reason::Encode;
                 }
                 fs.op_active = reason == Reason::Count;
@@ -3391,6 +3796,10 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
                 }
                 if (fs.op_active) {
                     fs.op.mode = ops_mode;
+                    fs.op.lean = Lean ? sw.op_lean
+                                      : VideoCore::Nx2Debug::SwitchValue(
+                                            VideoCore::Nx2Debug::g_front_op_lean,
+                                            "FRITCHII_FRONT_OP_LEAN");
                     fs.op.count = 0;
                     fs.op.sent = 0;
                     fs.op.pairs = 0;
@@ -3404,43 +3813,76 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
             // FRITCHII_ONEF_DEAD_STORES (live, default 0): fable_b 27.7's counter, nothing changes.
             const bool dead_count =
                 oot == OotMacros::Id::EA0 &&
-                VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_dead_stores,
-                                                 "FRITCHII_ONEF_DEAD_STORES") != 0;
+                (Lean ? sw.dead_stores
+                      : VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_dead_stores,
+                                                         "FRITCHII_ONEF_DEAD_STORES")) != 0;
             if (dead_count) [[unlikely]] {
+                materialize();
                 FrontDeadStores(split, fs, false);
             }
-            OotFrontContext<decltype(emit)> context{fs.parameters, native_data_ram.data(),
-                                                    std::span<const u32>{fs.regs}, emit};
-            const size_t seq_reads = seq != nullptr ? seq->cur.reads.size() : 0;
-            if (seq != nullptr) [[unlikely]] {
-                context.reads = &seq->cur.reads;
-            }
-            handled = OotMacros::Run(oot, context);
-            if (fs.op_active) [[unlikely]] {
-                fs.op_active = false; // before the JIT runs a declined call
-                FrontOpFinish(split, fs, handled && context.error == nullptr);
-            }
-            if (dead_count && handled) [[unlikely]] {
-                FrontDeadStores(split, fs, true);
-            }
-            if (!handled && seq != nullptr) [[unlikely]] {
-                // Declined before any effect: the JIT runs the call and reads again.
-                seq->cur.reads.resize(seq_reads);
-            }
-            if (handled) {
-                ++fs.oot_stats.native;
-                if (context.error != nullptr) [[unlikely]] {
-                    engine.native_execution_failed = true;
-                    LOG_ERROR(HW_GPU, "Native MME (split front, OoT macro {:#x}) failed: {}",
-                              method, context.error);
+            const auto run_handler = [&](auto& context) {
+                const size_t seq_reads = seq != nullptr ? seq->cur.reads.size() : 0;
+                if (seq != nullptr) [[unlikely]] {
+                    context.reads = &seq->cur.reads;
+                }
+                const bool ran = OotMacros::Run(oot, context);
+                if (fs.op_active) [[unlikely]] {
+                    fs.op_active = false; // before the JIT runs a declined call
+                    FrontOpFinish(split, fs, ran && context.error == nullptr);
+                }
+                if (dead_count && ran) [[unlikely]] {
+                    FrontDeadStores(split, fs, true);
+                }
+                if (!ran && seq != nullptr) [[unlikely]] {
+                    // Declined before any effect: the JIT runs the call and reads again.
+                    seq->cur.reads.resize(seq_reads);
+                }
+                if (ran) {
+                    ++fs.oot_stats.native;
+                    if (context.error != nullptr) [[unlikely]] {
+                        engine.native_execution_failed = true;
+                        LOG_ERROR(HW_GPU, "Native MME (split front, OoT macro {:#x}) failed: {}",
+                                  method, context.error);
+                    }
+                } else {
+                    ++fs.oot_stats.declined;
+                }
+                return ran;
+            };
+            if constexpr (Lean) {
+                // The handlers but 0xe2c's never append to the FIFO (only its 0x158 does, and
+                // EXP53's predicate): they read the words where they are.
+                if (oot != OotMacros::Id::E2C && !predicate) [[likely]] {
+                    OotFrontContext<decltype(emit), std::span<const u32>, true> context{
+                        params, native_data_ram.data(), std::span<const u32>{fs.regs}, emit};
+                    // FRITCHII_FRONT_LIST_LANE bit 2: not while the emit does more than
+                    // FrontWrite for a lane method (an op recorded, a tool watching the writes).
+                    OotLane lane{this, &split, &fs.packet, (sw.list_lane & 4) != 0, 0, 0, 0, 0};
+                    if ((sw.list_lane & 2) != 0 && !fs.op_active && !trace && dry == nullptr &&
+                        seq == nullptr && !oot_verify) [[unlikely]] {
+                        context.lane = &lane;
+                    }
+                    handled = run_handler(context);
+                    if (context.lane != nullptr) [[unlikely]] {
+                        FrontLaneMacroDone(fs, lane.dropped, lane.checked, lane.differ,
+                                           lane.missed);
+                    }
+                } else {
+                    materialize();
+                    OotFrontContext<decltype(emit)> context{fs.parameters, native_data_ram.data(),
+                                                            std::span<const u32>{fs.regs}, emit};
+                    handled = run_handler(context);
                 }
             } else {
-                ++fs.oot_stats.declined;
+                OotFrontContext<decltype(emit)> context{fs.parameters, native_data_ram.data(),
+                                                        std::span<const u32>{fs.regs}, emit};
+                handled = run_handler(context);
             }
         } else if (oot_mode != 0 && oot == OotMacros::Id::None) {
             ++fs.oot_stats.unmatched;
         }
         if (!handled) {
+            materialize(); // the JIT reads the FIFO from the vector
             if (oot_verify) [[unlikely]] {
                 fs.oot_jit_writes.clear();
                 fs.oot_dram = native_data_ram;
@@ -3538,9 +3980,13 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
         }
     }
     if (trace) [[unlikely]] {
-        LOG_INFO(HW_GPU, "{}", trace_text);
+        LOG_INFO(HW_GPU, "{}", TraceText(trace_text));
     }
     fs.parameters.clear();
+    if constexpr (Lean) {
+        fs.call_words = {};
+        FrontCallLeanReport(fs);
+    }
     if (fs.draw_pending) {
         fs.draw_pending = false;
         split.Defer(StageCall::FinishMacro{this, &system}, VideoCommon::GpuSplit::Effect::Gpu,
@@ -3661,6 +4107,7 @@ void Maxwell3D::FrontMacroSeqCall(FrontState& fs, u32 method) {
     if (fs.seq_dry == nullptr) {
         // Turned on (again): start clean, the run that was open is not known whole.
         fs.seq_dry = &q;
+        FrontLaneSync(fs);
         q.cur.tokens.clear();
         q.cur.args.clear();
         q.cur.reads.clear();
@@ -3923,9 +4370,11 @@ void Maxwell3D::FrontNoteListDrawWrite(VideoCommon::GpuSplit& split, FrontState&
     switch (method) {
     case MAXWELL3D_REG_INDEX(vertex_buffer.count):
         fs.list_draw_stale &= ~1U;
+        FrontLaneSync(fs);
         break;
     case MAXWELL3D_REG_INDEX(vertex_buffer.first):
         fs.list_draw_stale &= ~2U;
+        FrontLaneSync(fs);
         break;
     // The small index draws (index_buffer32_first and the like) draw at once, from their own
     // words: the draw.end after them is still an array draw.
@@ -3957,6 +4406,7 @@ void Maxwell3D::FrontNoteListDrawWrite(VideoCommon::GpuSplit& split, FrontState&
 
 void Maxwell3D::FrontResolveListDraw(VideoCommon::GpuSplit& split, FrontState& fs) {
     const u32 stale = std::exchange(fs.list_draw_stale, 0);
+    FrontLaneSync(fs);
     std::array<u32, 2> words{};
     if (!fs.list_draw_list.Read(words)) {
         Nx2ListDispatch::Count(Nx2ListDispatch::g_guard.failed);
@@ -4006,6 +4456,7 @@ bool Maxwell3D::FrontTakeListDraw(Core::System& system, VideoCommon::GpuSplit& s
     fs.in_list_draw = false;
     // List guard (nx2_list_dispatch.h): the two registers keep their old values from here on.
     fs.list_draw_stale = 3;
+    FrontLaneSync(fs);
     fs.list_draw_list = reader;
     fs.list_draw_indexed = false;
     if (fs.draw_pending) {
@@ -5654,6 +6105,7 @@ void Maxwell3D::FrontVerify(VideoCommon::GpuSplit& split, FrontState& fs) {
                         static_cast<u32>(shadow_state.shadow_ram_control));
         }
         fs.control = shadow_state.shadow_ram_control;
+        FrontLaneSync(fs);
     }
     for (u32 i = 0; i < Regs::NUM_REGS; ++i) {
         if (fs.shadow[i] != expected_shadow[i]) {
@@ -6251,7 +6703,11 @@ void Maxwell3D::FrontOpRecord(VideoCommon::GpuSplit& split, FrontState& fs, u32 
     const u32 i = op.count++;
     op.methods[i] = method;
     op.arguments[i] = argument;
-    if (!FrontWriteDecide(split, fs, method, argument, true, true, op.decisions[i])) {
+    if (op.lean == 0) [[likely]] {
+        if (!FrontWriteDecide(split, fs, method, argument, true, true, op.decisions[i])) {
+            return;
+        }
+    } else if (!FrontOpDecide(split, fs, method, argument, op.decisions[i])) {
         return;
     }
     op.sent |= u64{1} << i;
@@ -6263,6 +6719,172 @@ void Maxwell3D::FrontOpRecord(VideoCommon::GpuSplit& split, FrontState& fs, u32 
         split.CountBatched(VideoCommon::GpuSplit::Batched::MacroSunk);
     }
     fs.sink_pending = false;
+}
+
+void Maxwell3D::FrontOpKinds(FrontState& fs) {
+    constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+    constexpr u32 bind_first = MAXWELL3D_REG_INDEX(bind_groups[0].raw_config);
+    constexpr u32 bind_last = MAXWELL3D_REG_INDEX(bind_groups[4].raw_config);
+    constexpr u32 bind_stride = MAXWELL3D_REG_INDEX(bind_groups[1].raw_config) - bind_first;
+    for (u32 method = 0; method < Regs::NUM_REGS; ++method) {
+        u8 kind = FrontState::OpGeneric;
+        if (!execution_mask[method]) {
+            kind = FrontState::OpState;
+        } else if (method >= cb_data && method < cb_data + 16) {
+            kind = FrontState::OpCbData;
+        } else if (method >= bind_first && method <= bind_last &&
+                   (method - bind_first) % bind_stride == 0) {
+            kind = FrontState::OpNoDraw; // FrontMethodEffect None, outside the draw manager
+        } else if (!FrontHandledOutsideDrawManager(method)) {
+            kind = FrontState::OpDraw;
+        }
+        fs.op_kinds[method] = kind;
+    }
+}
+
+// FRITCHII_FRONT_OP_LEAN (live, default 0; fable_b2 1.4): FrontWriteDecide for a recorded op's
+// write, as the op path's per-call conditions leave it (FrontRunMacroFeaturesT: the shadow RAM
+// tracks, EXP22, EXP2, the draw packet, the CbWords block and the list guard off, no stale list
+// draw registers, no deferred 0xe2c mode, no tool; FrontOpRecord already sent a fold case the
+// old way): the shadow compare and store, the same-value test, the register store and the
+// executable cases of the methods ops write (a draw manager method, a constant buffer word, a
+// bind group's raw_config). Any other method, or a shadow RAM that stopped tracking, takes
+// FrontWriteDecide. `same`: dropped as unchanged (the profile's same-value write).
+NX2_PROFILE_FORCEINLINE bool Maxwell3D::FrontOpDecideLean(FrontState& fs, u32 method, u32 argument,
+                                                           FrontWriteDecision& decision,
+                                                           bool& same) {
+    using Effect = VideoCommon::GpuSplit::Effect;
+    const u8 kind = fs.op_kinds[method];
+    const bool shadow_kept = fs.shadow[method] == argument;
+    fs.shadow[method] = argument;
+    const u32 value = argument;
+    Effect effect = fs.draw_pending ? Effect::Gpu : Effect::None;
+    decision.value = value;
+    decision.has_cb_write = false;
+    decision.cb_write = 0;
+    decision.write_begin = 0;
+    decision.write_end = 0;
+    if (kind == FrontState::OpState) {
+        if (fs.regs[method] == value && shadow_kept && fs.skip_same) {
+            same = true;
+            return false;
+        }
+        fs.regs[method] = value;
+        decision.effect = static_cast<u8>(effect);
+        return true;
+    }
+    if (kind == FrontState::OpDraw) {
+        if (FrontSkipsLoopWrite(fs, method, value, shadow_kept)) {
+            same = true;
+            return false;
+        }
+        fs.regs[method] = value;
+        FrontTrackIndexDraws(fs, method);
+        fs.draw_pending = true;
+        decision.effect = static_cast<u8>(Effect::Gpu);
+        return true;
+    }
+    if (kind == FrontState::OpCbData) {
+        const auto [write_begin, write_end] = FrontWriteRange(fs, method, 1);
+        decision.write_begin = write_begin;
+        decision.write_end = write_end;
+        fs.regs[method] = value;
+        decision.has_cb_write = true;
+        decision.cb_write = ConstBufferWriteAddress(fs.regs);
+        fs.regs[MAXWELL3D_REG_INDEX(const_buffer.offset)] += sizeof(u32);
+        decision.effect = static_cast<u8>(effect);
+        return true;
+    }
+    // OpNoDraw: stored, effect None combined.
+    fs.regs[method] = value;
+    decision.effect = static_cast<u8>(effect);
+    return true;
+}
+
+bool Maxwell3D::FrontOpDecide(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
+                              u32 argument, FrontWriteDecision& decision) {
+    namespace Profile = VideoCommon::Nx2Profile;
+    auto& stats = fs.op_stats;
+    const bool tracked = fs.control == Regs::ShadowRamControl::Track ||
+                         fs.control == Regs::ShadowRamControl::TrackWithFilter;
+    // A later instance's draw.begin FrontWriteDecide may fold (EDEN_NX2_FOLD_INSTANCES, after its
+    // own instance loop tracking) goes there too.
+    const bool fold_case = method == MAXWELL3D_REG_INDEX(draw.begin) &&
+                           ((argument >> 26) & 3) == 1 && FoldInstancesEnabled();
+    if (!tracked || fs.op_kinds[method] == FrontState::OpGeneric || fold_case) [[unlikely]] {
+        ++stats.lean_generic;
+        return FrontWriteDecide(split, fs, method, argument, true, true, decision);
+    }
+    ++stats.lean_writes;
+    if (fs.op.lean != 2) [[likely]] {
+        bool same = false;
+        const bool sent = FrontOpDecideLean(fs, method, argument, decision, same);
+        if (Profile::Enabled()) [[unlikely]] {
+            // As FrontWriteDecide counts: every write, and each one it drops as unchanged.
+            Profile::Add(Profile::Counter::MethodWrites, 1);
+            if (same) {
+                Profile::Add(Profile::Counter::SameValueWrites, 1);
+            }
+        }
+        return sent;
+    }
+    // Mode 2: the lean decide on the touched state, which is then put back, and FrontWriteDecide
+    // from the same state; its answer is taken, and every sent bit, decision field and state the
+    // two left is compared (must be 0).
+    constexpr u32 offset = MAXWELL3D_REG_INDEX(const_buffer.offset);
+    struct Touched {
+        u32 reg;
+        u32 shadow;
+        u32 cb_offset;
+        bool draw_pending;
+        bool other_index_draw;
+        bool instance_loop;
+        bool operator==(const Touched&) const = default;
+    };
+    const auto touched = [&fs, method] {
+        return Touched{fs.regs[method],   fs.shadow[method],      fs.regs[offset],
+                       fs.draw_pending,   fs.other_index_draw,    fs.instance_loop};
+    };
+    const auto restore = [&fs, method](const Touched& t) {
+        fs.regs[offset] = t.cb_offset;
+        fs.regs[method] = t.reg;
+        fs.shadow[method] = t.shadow;
+        fs.draw_pending = t.draw_pending;
+        fs.other_index_draw = t.other_index_draw;
+        fs.instance_loop = t.instance_loop;
+    };
+    const Touched before = touched();
+    FrontWriteDecision lean{};
+    bool same = false;
+    const bool lean_sent = FrontOpDecideLean(fs, method, argument, lean, same);
+    const Touched lean_after = touched();
+    restore(before);
+    const bool sent = FrontWriteDecide(split, fs, method, argument, true, true, decision);
+    const Touched after = touched();
+    ++stats.lean_checked;
+    const bool same_decision =
+        !sent || (lean.value == decision.value && lean.effect == decision.effect &&
+                  lean.has_cb_write == decision.has_cb_write &&
+                  (!decision.has_cb_write || lean.cb_write == decision.cb_write) &&
+                  lean.write_begin == decision.write_begin &&
+                  lean.write_end == decision.write_end);
+    if (lean_sent != sent || !same_decision || !(lean_after == after)) [[unlikely]] {
+        ++stats.lean_differ;
+        ++stats.lean_differ_total;
+        if (stats.lean_differ_total <= 16) {
+            LOG_ERROR(HW_GPU,
+                      "Front op lean (FRITCHII_FRONT_OP_LEAN=2): op {} write {:#x} = {:#x}: lean "
+                      "{} value {:#x} effect {} cb {} {:#x} range {:#x}-{:#x}, generic {} value "
+                      "{:#x} effect {} cb {} {:#x} range {:#x}-{:#x}; state after {}",
+                      OotOps::OpName(fs.op.args.op), method, argument,
+                      lean_sent ? "sends" : "drops", lean.value, lean.effect, lean.has_cb_write,
+                      lean.cb_write, lean.write_begin, lean.write_end,
+                      sent ? "sends" : "drops", decision.value, decision.effect,
+                      decision.has_cb_write, decision.cb_write, decision.write_begin,
+                      decision.write_end, lean_after == after ? "equal" : "differs");
+        }
+    }
+    return sent;
 }
 
 void Maxwell3D::FrontOpFallback(VideoCommon::GpuSplit& split, FrontState& fs) {
@@ -6428,6 +7050,13 @@ void Maxwell3D::FrontOpReport(FrontState& fs, int mode) {
              mode, s.entries, s.writes_sent, s.writes_dropped, per_id, reason(Reason::Lanes),
              reason(Reason::Tools), reason(Reason::Stopped), reason(Reason::Encode), s.fallbacks,
              s.count_differ, FrontOpsStopped() ? ", stopped" : "");
+    if (s.lean_writes != 0 || s.lean_generic != 0) {
+        LOG_INFO(HW_GPU,
+                 "Front op lean (FRITCHII_FRONT_OP_LEAN={}): {} writes by the lean decide, {} left "
+                 "to FrontWriteDecide; compare: {} writes, {} differing ({} since boot, must be 0)",
+                 fs.op.lean, s.lean_writes, s.lean_generic, s.lean_checked, s.lean_differ,
+                 s.lean_differ_total);
+    }
 }
 
 void Maxwell3D::ApplyFrontOp(const u64* payload) {

@@ -602,6 +602,88 @@ stamp; then the session's verify disagreements (must be 0). Expected with 1 at t
 records walked near 0, "skipped by ranges" unchanged, the front macro zone back near 134 ns a
 call.
 
+### FRITCHII_FRONT_CALL_LEAN (the "Front call lean" line)
+
+FRITCHII_FRONT_CALL_LEAN (live, default 0 = exactly as before; fable_b 27.2 B, about 30 to 35
+ms/s of the front). Every 3D macro call on the front read ten live switches, MacroTraced, built
+an empty trace string and copied the call's words from the command list into the FIFO vector.
+- 1: the features body takes the switches from the front state. FrontRefreshSwitches reads them
+  where it reads the feature byte: when the switch generation moved, and every 1024 calls. A
+  whole call that arrives in one run (FrontCallMultiMethod) keeps its words in the list: the
+  handlers read them there. The words go into the vector only where a path needs it: the JIT
+  (no handler, or a declined call), 0xe2c (its FIFO read appends six words), EXP53's predicate,
+  EDEN_NX2_MACRO_TRACE, FRITCHII_MACRO_SAME_DRY / SEQ_DRY, FRITCHII_ONEF_DEAD_STORES, the list
+  guard's checked body and the plain body. The trace string is made only for a traced call.
+- Exact: the same switch values (every store of a live switch bumps the generation, which the
+  next call sees before it picks a body) and the same words in the same order; only 0xe2c's
+  handler appends to the FIFO (its 0x158), and it gets the vector.
+- 2: as 1, and every call reads the switches again as before and counts the calls where any
+  differs. Must be 0 (a switch stored between a call's refresh and its reads can count once).
+- Off: one predictable branch in FrontRunMacro and one in FrontCallMultiMethod's macro path.
+
+"Front call lean (FRITCHII_FRONT_CALL_LEAN=n), last 10 s" (HW_GPU, Info): calls through the
+lean body, of them with their words read in the list, of those copied after all; mode 2: calls
+compared and switch differences (must be 0). Judge it by the front's macro zone per call.
+
+### FRITCHII_FRONT_LIST_LANE (the "Front lane" line)
+
+FRITCHII_FRONT_LIST_LANE (live, default 0 = exactly as before; fable_b 27.3, about 36 ms/s for the
+list words and 42 for the handler writes). 56% of the front's register writes end at
+FrontWrite's same-value exit, after the list parse's CallMethod, FrontCallMethod and Front() or
+the macro emit. The lane makes the same test where the write starts. Bits:
+- 1: command-list words (DmaPusher::ProcessCommands, the incrementing and the inline branch).
+  Decided once per chunk: the switch, the split running with front macros, no semaphore watch,
+  the channel's 3D engine, Maxwell3D::FrontLaneReady (the switch generation the front read its
+  experiments at, and the lane state). Per word: `block == 0 && lane method && shadow == value &&
+  register == value`, then the word is dropped.
+- 2: a handler's writes in the lean macro body (needs FRITCHII_FRONT_CALL_LEAN=1), not while
+  the call records an op (FRITCHII_ONEF_FRONT_OPS) or a tool watches its writes.
+- 4: verify instead of drop for the paths bits 1 and 2 turn on: each write goes the old way and
+  a lane drop the old path sent (a ring commit, or a draw packet write) is counted. Must be 0.
+- Lane methods: not executable, no memory write, not render_enable.mode (the deferred 0xe2c
+  notes come before the test), not 0x157 or 0x158 (the DMA reads run after it), not a puller
+  method.
+- `block` (Maxwell3D::FrontLaneSync, kept where each changes): the front exists, the shadow RAM
+  tracks, same-value skipping is on (EDEN_NX2_SPLIT_SKIP, EDEN_NX2_SKIP_SAME), EXP2 off, no list
+  draw left stale registers, no FRITCHII_MACRO_SEQ_DRY run.
+- Exact: it is FrontWrite's own condition, and with `block` 0 nothing FrontWrite, FrontCallMethod,
+  Front() or CallMethod does before that exit acts on a lane method; a dropped write sent no
+  entry before, so the ring and the memory stage see the same entries. The profile counters
+  (method writes, same value) are added per chunk and per call.
+- Off: one predictable branch per list word (a null engine) and one switch load per chunk.
+
+"Front lane (FRITCHII_FRONT_LIST_LANE=n)" (HW_GPU, Info, every 10 s), per second: list writes and
+handler writes dropped where they start; verify: writes checked, sends the lane missed (writes
+the old path dropped that the lane did not: information), lane drops the old path sent in the
+window and since boot (must be 0). Judge it by (macro + resume pending + push) per draw.
+
+### FRITCHII_FRONT_OP_LEAN (the "Front op lean" line)
+
+FRITCHII_FRONT_OP_LEAN (live, default 0 = exactly as before; fable_b2 1.4, about 60 to 80 ms/s
+for the op ids). Needs FRITCHII_ONEF_FRONT_OPS. Each write of a recorded op still ran the whole
+FrontWriteDecide. The op path takes a call only under its per-call conditions (the shadow RAM
+tracks; EXP22, EXP2, the draw packet, the CbWords block and the list guard off; no stale list
+draw registers; no deferred 0xe2c mode; no tool), and a fold case already goes the old way.
+- 1: FrontOpDecide: the shadow compare and store, the same-value test, the register store and
+  the executable cases of the methods ops write, by a per-method kind filled when the front
+  starts: a state register, a draw manager method (the instance loop skip and tracking, the
+  index draw tracking, draw_pending, effect Gpu), a constant buffer word (its range, its address,
+  the offset step) and a bind group's raw_config (stored, effect unchanged). Any other method, a
+  shadow RAM that stopped tracking, and a Subsequent draw.begin while EDEN_NX2_FOLD_INSTANCES is
+  on take FrontWriteDecide. The profile counts as FrontWriteDecide does.
+- 2 (verify): per write the lean decide runs on the touched state (the register, its shadow word,
+  the constant buffer offset, draw_pending, other_index_draw, instance_loop), the state is put
+  back, FrontWriteDecide runs from it and its answer is used; a difference in the sent bit, the
+  decision (value, effect, constant buffer address, written range) or the state they leave is
+  counted and logged (16 times). Must be 0.
+- No ring or entry change: the op entry, E's apply and the memory stage see the same sent and
+  pair masks and notes.
+- Off: one predictable branch per recorded write, only while FRITCHII_ONEF_FRONT_OPS is on.
+
+"Front op lean (FRITCHII_FRONT_OP_LEAN=n)" (HW_GPU, Info, with the "Front ops" line, counts since
+boot): writes by the lean decide, writes left to FrontWriteDecide; compare: writes, differing
+(must be 0).
+
 ### FRITCHII_ACQUIRE_MET_BY (the "Acquire resumes met by" line)
 
 FRITCHII_ACQUIRE_MET_BY (live, default 0 since 2026-11-14 = one relaxed load per resume; 1 = the

@@ -917,6 +917,70 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
     // "resume pending" for a resumed channel's); "push" keeps the entry's fetch and checks.
     const VideoCommon::Nx2Profile::Scope methods_zone{
         VideoCommon::Nx2Profile::Zone::FrontMethods, VideoCommon::Nx2Profile::Fine(), false};
+    // FRITCHII_FRONT_LIST_LANE bit 1 (live, default 0; fable_b 27.3): a 3D state register word
+    // FrontWrite would drop at its same-value test is dropped here, before CallMethod,
+    // FrontCallMethod and Front(); bit 4 verifies instead (the word goes the old way and a lane
+    // drop that sent a ring entry is counted, must be 0). Decided once per chunk: the switch, the
+    // split with front macros, no semaphore watch, the channel's 3D engine and its lane state
+    // (Maxwell3D::FrontLaneReady); per word the engine's lane test (FrontLaneDrops).
+    Engines::Maxwell3D* lane = nullptr;
+    bool lane_verify = false;
+    u32 lane_dropped = 0;
+    u32 lane_checked = 0;
+    u32 lane_differ = 0;
+    u32 lane_missed = 0;
+    if (const int lane_mode = VideoCore::Nx2Debug::SwitchValue(
+            VideoCore::Nx2Debug::g_front_list_lane, "FRITCHII_FRONT_LIST_LANE");
+        (lane_mode & 1) != 0 && g_semaphore_watch == 0) [[unlikely]] {
+        auto& split = VideoCommon::GpuSplit::Get();
+        if (split.Active() && split.FrontMacros()) {
+            for (size_t sub = 0; sub < subchannels.size(); ++sub) {
+                if (subchannels[sub] == nullptr ||
+                    subchannel_type[sub] != Engines::EngineTypes::Maxwell3D) {
+                    continue;
+                }
+                auto* const maxwell3d = static_cast<Engines::Maxwell3D*>(subchannels[sub]);
+                if (maxwell3d->GetNativeMacroEngine().native_turing &&
+                    maxwell3d->FrontLaneReady()) {
+                    lane = maxwell3d;
+                    lane_verify = (lane_mode & 4) != 0;
+                }
+                break;
+            }
+        }
+    }
+    SCOPE_EXIT {
+        if (lane != nullptr) {
+            lane->FrontLaneListDone(lane_dropped, lane_checked, lane_differ, lane_missed);
+        }
+    };
+    // CallMethod, or the lane's drop for the 3D engine's state register words.
+    const auto call_method = [&](u32 argument) {
+        if (lane != nullptr && subchannels[dma_state.subchannel] == lane &&
+            dma_state.method >= non_puller_methods) {
+            if (!lane_verify) {
+                if (lane->FrontLaneDrops(dma_state.method, argument)) {
+                    ++lane_dropped;
+                    return;
+                }
+            } else {
+                const bool drops = lane->FrontLaneDrops(dma_state.method, argument);
+                const auto& split = VideoCommon::GpuSplit::Get();
+                const u64 position = split.WritePositionPeek();
+                CallMethod(argument);
+                const bool sent = split.WritePositionPeek() != position;
+                ++lane_checked;
+                if (drops && sent) [[unlikely]] {
+                    ++lane_differ;
+                } else if (!drops && !sent && dma_state.method < lane->front_lane_methods.size() &&
+                           lane->front_lane_methods[dma_state.method] != 0) {
+                    ++lane_missed;
+                }
+                return;
+            }
+        }
+        CallMethod(argument);
+    };
     for (size_t index = 0; index < commands.size();) {
         // Data word of methods command
         if (dma_state.method_count && dma_state.non_incrementing) {
@@ -961,7 +1025,7 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
             auto const command_header = commands[index]; //can copy
             dma_state.dma_word_offset = u64((word_offset + index) * sizeof(u32));
             dma_state.is_last_call = dma_state.method_count <= 1;
-            CallMethod(command_header.argument);
+            call_method(command_header.argument);
             dma_state.method += !dma_state.non_incrementing ? 1 : 0;
             dma_state.non_incrementing |= dma_increment_once;
             dma_state.method_count--;
@@ -984,7 +1048,7 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
                 dma_state.method = command_header.method;
                 dma_state.subchannel = command_header.subchannel;
                 dma_state.dma_word_offset = u64(-s64(dma_state.dma_get)); // negate to set address as 0
-                CallMethod(command_header.arg_count);
+                call_method(command_header.arg_count);
                 dma_state.non_incrementing = true;
                 dma_increment_once = false;
                 break;
