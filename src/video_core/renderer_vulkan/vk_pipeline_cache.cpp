@@ -2781,6 +2781,12 @@ u32 PipelineCache::OneFollowerLookupCheck(bool shaders_clear, bool blending_clea
         flags[Dirty::VertexInput] = true;
         flags[Dirty::ViewportSwizzles] = true;
         fresh.Refresh(*maxwell3d, dynamic_features);
+        // As the lookup leaves the key (RefreshGraphicsKey): native keys are canonical, so a
+        // disabled attachment keeps only its write mask and those past the last target are 0.
+        // Compared raw, nearly every check differed in the blend.
+        if (canonical_keys && maxwell3d->GetNativeMacroEngine().native_turing) {
+            CanonicalizeKeyState(fresh, dynamic_features);
+        }
         if (blending_clear &&
             std::memcmp(fresh.attachments.data(), graphics_key.state.attachments.data(),
                         sizeof(fresh.attachments)) != 0) {

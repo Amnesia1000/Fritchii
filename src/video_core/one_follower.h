@@ -228,10 +228,12 @@ enum class Check : u8 {
     /// its state invalidation would have reached E's engine. Skipped there; posting stops.
     PlayedDispatchNoView,
     /// fable_b 18.4 (FRITCHII_ONEF_LOOKUP_CHECK): at an unlent draw's lookup on E, a part of the
-    /// key the lookup kept because its flag was clear (the programs, the blend, the vertex
-    /// input) differs from the same part computed fresh: a pack or path took the flag before
-    /// E's lookup read it.
-    LookupFlags,
+    /// key the lookup kept because its flag was clear differs from the same part computed fresh
+    /// (canonicalized as the lookup does): a pack or path took the flag before E's lookup read
+    /// it. One check per part: the programs, the blend, the vertex input.
+    LookupPrograms,
+    LookupBlend,
+    LookupVertexInput,
     /// fable_b 19.6 (FRITCHII_ONEF_SEM_E): a semaphore write on E or R to a word last written
     /// from a later place in the stream (E's place: after the packets it pushed; R's: the
     /// packet it plays). Every writer of a word must have one home.
@@ -258,7 +260,8 @@ inline constexpr std::array<const char*, static_cast<size_t>(Check::Count)> chec
     "facts stale", "played lookup miss", "texture read ahead of R", "ring B pairing",
     "R waits for E's lock", "R needs E's buffer flush",
     "build list draw", "played list args", "played kind without path", "sync mirror",
-    "sync target missing", "sync target unused", "played dispatch", "played dispatch off view", "lookup flags",
+    "sync target missing", "sync target unused", "played dispatch", "played dispatch off view", "lookup programs",
+    "lookup blend", "lookup vertex input",
     "semaphore order", "unlent reset", "view values", "bind seed view",
 };
 
