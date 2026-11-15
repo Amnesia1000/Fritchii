@@ -109,6 +109,7 @@ add_library(video_core STATIC
     macro.h
     macro_hle_oot.cpp
     macro_hle_oot.h
+    macro_ops_oot.h
     macro_memo.h
     macro_turing.h
     fence_manager.h

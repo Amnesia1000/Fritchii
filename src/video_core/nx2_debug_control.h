@@ -285,6 +285,15 @@ inline std::atomic<int> g_onef_op_dma{-1};
 inline std::atomic<int> g_onef_op_dispatch{-1};
 /// FRITCHII_ONEF_DISPATCH_RANGES (live, default 0): fable_b 27.9, a posted image-writing dispatch records its images' guest ranges on E (EXP10) instead of "may write anything".
 inline std::atomic<int> g_onef_dispatch_ranges{-1};
+/// FRITCHII_ONEF_FRONT_OPS (live, default 0): fable_b 27/28 S2-S3, six hot OoT macros sent as one
+/// op entry each (macro_ops_oot.h): 1 E expands the op, 2 + check, 3 E applies it directly, 4 + check.
+inline std::atomic<int> g_onef_front_ops{-1};
+/// FRITCHII_ONEF_DEAD_STORES (live, default 0): fable_b 27.7, 1 counts the 0xea0 trailing c[0][0x640]
+/// stores the next 0xea0 overwrites with nothing between (count only; dropping them is not built).
+inline std::atomic<int> g_onef_dead_stores{-1};
+/// FRITCHII_ONEF_FILL_COUNT (live, default 0): fable_b 28.5 S4, 1 counts bound constant buffer
+/// ranges whose bytes E reads differ from the front's noted upload words (count only).
+inline std::atomic<int> g_onef_fill_count{-1};
 /// FRITCHII_LIST_COPY_SKIP (live, default 0): fable_b 27.9 item 3, a CPU-written list entry skips the "list writers" wait when no queued writer's noted range touches its pages.
 inline std::atomic<int> g_list_copy_skip{-1};
 /// FRITCHII_ONEF_FLUSH_E (live, default 0): fable_b 17.3 (a), a flush E tests clean is not lent.

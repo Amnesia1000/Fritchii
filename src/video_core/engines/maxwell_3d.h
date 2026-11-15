@@ -3576,6 +3576,49 @@ private:
     FrontState& Front(Core::System& system, VideoCommon::GpuSplit& split);
     void FrontWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
                     bool is_last_call, bool from_macro);
+    /// FrontWrite in halves, so the front ops path (FRITCHII_ONEF_FRONT_OPS) shares them:
+    /// FrontWriteDecide applies the write to the front's state and returns whether it is still
+    /// to be sent (false: dropped, or sent already by a path that holds its own block);
+    /// FrontWriteSend sends it, then FrontWriteNotes makes the notes its entry needs.
+    struct FrontWriteDecision {
+        u32 value;           ///< after the shadow RAM
+        u8 effect;           ///< VideoCommon::GpuSplit::Effect of the entry
+        bool has_cb_write;   ///< a constant buffer data word: cb_write is its address
+        GPUVAddr cb_write;
+        GPUVAddr write_begin; ///< FrontWriteRange before the write
+        GPUVAddr write_end;
+    };
+    bool FrontWriteDecide(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
+                          u32 argument, bool is_last_call, bool from_macro,
+                          FrontWriteDecision& decision);
+    void FrontWriteSend(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
+                        bool is_last_call, bool from_macro, const FrontWriteDecision& decision);
+    void FrontWriteNotes(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
+                         const FrontWriteDecision& decision);
+    /// FRITCHII_ONEF_FRONT_OPS (macro_ops_oot.h): a handler write decided for the call's op; the
+    /// recorded writes sent the old way; the call's op sent (`handled`: the handler ran it whole);
+    /// the coverage line; whether a check mismatch stopped ops for the session.
+    void FrontOpRecord(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument);
+    void FrontOpFallback(VideoCommon::GpuSplit& split, FrontState& state);
+    void FrontOpFinish(VideoCommon::GpuSplit& split, FrontState& state, bool handled);
+    static void FrontOpReport(FrontState& state, int mode);
+    static bool FrontOpsStopped();
+    static void StopFrontOps(const char* why);
+    /// E's half: the op's writes rebuilt and applied as Execute applies the entries they replace
+    /// (S2), or directly (S3), then the check words compared.
+    static void ApplyFrontOp(const u64* payload);
+    void ApplyFrontOpWrites(Core::System& system, u8 op, const u32* args, u64 sent, u64 pairs,
+                            const u64* cb_addresses, u32 cb_address_count, u32 checks);
+    void ApplyFrontOpDirect(Core::System& system, u8 op, const u32* args, u64 sent, u64 pairs,
+                            const u64* cb_addresses, u32 cb_address_count, u32 checks);
+    void CheckFrontOp(u8 op, const u32* args, const u64* checks, u32 writes, u32 finals);
+    /// FRITCHII_ONEF_DEAD_STORES (fable_b 27.7, count only): an 0xea0 call begins (`end`
+    /// false: are the last call's trailing stores dead?) or ended (its stores noted).
+    void FrontDeadStores(VideoCommon::GpuSplit& split, FrontState& state, bool end);
+    /// FRITCHII_ONEF_FILL_COUNT (fable_b 28.5, S4's count): a sampled bind's bytes as the front
+    /// reads them after the bind op, sent for E to compare with the bytes at its bind.
+    void FrontFillCount(VideoCommon::GpuSplit& split, FrontState& state);
+    static void BackFillCount(const u64* payload);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
     /// FrontRunMacro's two bodies: v5.7's (no macro switch on) and the one with EXP53,
     /// EDEN_NX2_OOT_MACROS, EDEN_NX2_FOLD_INSTANCE and EDEN_NX2_DRAW_PACKET. FrontState's
