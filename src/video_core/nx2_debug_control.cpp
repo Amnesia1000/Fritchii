@@ -506,6 +506,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_ASYNC_REDRAWN") {
         return &g_async_redrawn;
     }
+    if (name == "FRITCHII_OCCLUSION_VISIBLE") {
+        return &g_occlusion_visible;
+    }
     if (name == "FRITCHII_PROTECT_UNLOCKED") {
         return &Common::g_protect_unlocked;
     }
