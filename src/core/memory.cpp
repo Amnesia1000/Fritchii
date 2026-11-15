@@ -68,6 +68,18 @@ struct Memory::Impl {
 
     void SetCurrentPageTable(Kernel::KProcess& process) {
         current_page_table = &process.GetPageTable().GetImpl();
+        if (process.IsApplication()) {
+            // FRITCHII_STORE_MEMO: the epoch is armed once, here, if the switch is on now (after
+            // main() applied nx2_switches.txt, before the game's first instruction).
+            static std::once_flag store_memo_arm;
+            std::call_once(store_memo_arm, [] {
+                const char* value = std::getenv("FRITCHII_STORE_MEMO");
+                if (value != nullptr && std::atoi(value) != 0) {
+                    Common::g_store_memo_armed.store(true, std::memory_order_seq_cst);
+                    LOG_INFO(HW_Memory, "FRITCHII_STORE_MEMO={}: store memo armed at boot", value);
+                }
+            });
+        }
 
         if (process.IsApplication() && Settings::IsFastmemEnabled()) {
             current_page_table->fastmem_arena = system.DeviceMemory().buffer.VirtualBasePointer();
@@ -1142,8 +1154,18 @@ struct Memory::Impl {
         // either way). The landing wait is not needed: that path saw no landing published, so
         // every landing published since found its still-collected block and keeps those bytes.
         // Only the uniform keeps' record runs (thread-local, a keep may be made at any time).
-        const int memo_mode = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_store_memo,
-                                                               "FRITCHII_STORE_MEMO");
+        int memo_mode = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_store_memo,
+                                                         "FRITCHII_STORE_MEMO");
+        // Without the epoch armed at boot no memo can be trusted: off for the session.
+        if (memo_mode != 0 && !Common::StoreMemoArmed()) [[unlikely]] {
+            if (static std::atomic_flag logged; !logged.test_and_set(std::memory_order_relaxed)) {
+                LOG_WARNING(HW_Memory,
+                            "FRITCHII_STORE_MEMO={} set after boot: the store memo stays off this "
+                            "session (it needs the switch on when the game starts)",
+                            memo_mode);
+            }
+            memo_mode = 0;
+        }
         StoreMemo& memo = store_memos[core];
         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
             u64 memo_epoch = 0;

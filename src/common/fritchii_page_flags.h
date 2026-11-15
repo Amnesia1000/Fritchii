@@ -79,21 +79,38 @@ inline constexpr u64 StoreMemoActiveMask = 0xffff;
 inline constexpr u64 StoreMemoGatherGen = u64{1} << 16;
 inline constexpr u64 StoreMemoTakeGen = u64{1} << 40;
 
-/// Around a clear of store marks (seq_cst both ways, so a store memo's seq_cst read of the epoch
-/// that comes after the clear in that order also comes after the begin).
+/// Whether the epoch moves at all: FRITCHII_STORE_MEMO non-zero when the application process is
+/// set up (Core::Memory, SetCurrentPageTable, read once, before any guest code ran or any GPU work
+/// was made, so no mark exists yet that a clear could take unannounced). Unarmed, a clear costs
+/// one relaxed load and the memo stays off for the session even if the switch is set live; armed,
+/// every clear moves the epoch from boot on, so no memo is ever kept without them.
+inline std::atomic<bool> g_store_memo_armed{false};
+
+[[nodiscard]] inline bool StoreMemoArmed() noexcept {
+    return g_store_memo_armed.load(std::memory_order_relaxed);
+}
+
+/// Around a clear of store marks while armed (seq_cst both ways, so a store memo's seq_cst read of
+/// the epoch that comes after the clear in that order also comes after the begin).
 class StoreMemoClear {
 public:
-    explicit StoreMemoClear(u64 generation_) noexcept : generation{generation_} {
-        g_store_memo_epoch.fetch_add(1, std::memory_order_seq_cst);
+    explicit StoreMemoClear(u64 generation_) noexcept
+        : generation{generation_}, armed{StoreMemoArmed()} {
+        if (armed) {
+            g_store_memo_epoch.fetch_add(1, std::memory_order_seq_cst);
+        }
     }
     ~StoreMemoClear() {
-        g_store_memo_epoch.fetch_add(generation - 1, std::memory_order_seq_cst);
+        if (armed) {
+            g_store_memo_epoch.fetch_add(generation - 1, std::memory_order_seq_cst);
+        }
     }
     StoreMemoClear(const StoreMemoClear&) = delete;
     StoreMemoClear& operator=(const StoreMemoClear&) = delete;
 
 private:
     u64 generation;
+    bool armed;
 };
 
 /// One bit per device page of the 36-bit device address space (2 MiB), set by writers and taken
@@ -164,7 +181,7 @@ public:
         if ((word.load(std::memory_order_relaxed) & bit) == 0) {
             return false;
         }
-        if (bumps_store_memo) {
+        if (bumps_store_memo && StoreMemoArmed()) {
             // FRITCHII_STORE_MEMO: a guest store's path marks this flag (g_store_memo_epoch).
             const StoreMemoClear clear{StoreMemoTakeGen};
             return (word.fetch_and(~bit, std::memory_order_seq_cst) & bit) != 0;
