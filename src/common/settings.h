@@ -1094,6 +1094,11 @@ void SetAppliedOcarinaRenderScale(std::optional<NvidiaDlssQuality> quality);
 [[nodiscard]] std::optional<NvidiaDlssQuality> AppliedOcarinaRenderScale();
 /// OoT's render height at a quality with the patch (2560x1440 scaled by 1, 0.75 or 0.5).
 [[nodiscard]] u32 OcarinaRenderHeightFor(std::optional<NvidiaDlssQuality> scale);
+/// Whether OoT's built-in Max Resolution patch will apply at the next start (as PatchNSO decides
+/// it: EDEN_NX2_NO_MAX_RES=1 skips it, =0 forces it, else it is off when disabled in Add-Ons).
+/// With it, docked OoT renders a fixed 2560x1440; without it the game's dynamic resolution
+/// (1920x1080 at most in the owner's logs, upscaled to 1440p by its 3/4 pass).
+[[nodiscard]] bool OcarinaMaxResolutionOn();
 
 constexpr u32 MIN_FRAME_GEN_MULTIPLIER = 2;
 constexpr u32 MAX_FRAME_GEN_MULTIPLIER = 4;

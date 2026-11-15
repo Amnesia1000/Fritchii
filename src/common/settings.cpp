@@ -124,7 +124,9 @@ std::optional<NvidiaDlssQuality> OcarinaDlssRenderScale() {
     const auto aa = values.oot_anti_aliasing.GetValue();
     // Balanced (0.871) pads its 2276x1280 scene into 2288x1280 targets, which the upscaler does
     // not take yet: it keeps 2560x1440.
+    // The patch changes Max Resolution's fixed-scale path: without Max Resolution it does nothing.
     if (!OcarinaDlssRenderScaleSwitch() || !values.nvidia_dlss.GetValue() || !IsDockedMode() ||
+        !OcarinaMaxResolutionOn() ||
         aa == OotAntiAliasing::Fsr3 || aa == OotAntiAliasing::Fsr4 ||
         (quality != NvidiaDlssQuality::Performance &&
          quality != NvidiaDlssQuality::UltraPerformance)) {
@@ -144,6 +146,28 @@ std::optional<NvidiaDlssQuality> AppliedOcarinaRenderScale() {
         return std::nullopt;
     }
     return static_cast<NvidiaDlssQuality>(value - 1);
+}
+
+bool OcarinaMaxResolutionOn() {
+    if (const char* const value = std::getenv("EDEN_NX2_NO_MAX_RES"); value != nullptr) {
+        const std::string_view ab{value};
+        if (ab == "1") {
+            return false;
+        }
+        if (ab == "0") {
+            return true;
+        }
+    }
+    const auto it = values.disabled_addons.find(0x0400486024DEC000ULL);
+    if (it == values.disabled_addons.end()) {
+        return true;
+    }
+    for (const auto& name : it->second) {
+        if (name == "Max Resolution (built-in)") {
+            return false;
+        }
+    }
+    return true;
 }
 
 u32 OcarinaRenderHeightFor(std::optional<NvidiaDlssQuality> scale) {

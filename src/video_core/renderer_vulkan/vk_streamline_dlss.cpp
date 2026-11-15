@@ -31,6 +31,7 @@ constexpr VkImageUsageFlags OUTPUT_USAGE = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE
 
 std::atomic<u64> evaluations{};
 std::atomic<u32> last_evaluation{}; ///< Mode, requested mode and preset, a byte each
+std::atomic<u32> last_sizes{};      ///< Render height (low 16 bits) and output height
 
 // slEvaluateFeature returns eWarnOutOfVRAM after it has evaluated DLSS, when the VRAM budget is
 // used up (commonInterface.cpp, slEvaluateFeatureInternal). The output is written; it is a warning.
@@ -508,6 +509,8 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                                   (static_cast<u32>(requested) << 8) |
                                   (static_cast<u32>(preset_setting) << 16),
                               std::memory_order_relaxed);
+        last_sizes.store((in.render_size.height & 0xffff) | (in.upscale_size.height << 16),
+                         std::memory_order_relaxed);
         evaluations.fetch_add(1, std::memory_order_release);
     });
     // DLSS binds its own pipelines and descriptors on the command buffer.
@@ -518,11 +521,14 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
 VideoCore::DlssStatus StreamlineDlssUpscaler::Status() {
     const u64 count = evaluations.load(std::memory_order_acquire);
     const u32 last = last_evaluation.load(std::memory_order_relaxed);
+    const u32 sizes = last_sizes.load(std::memory_order_relaxed);
     return {
         .evaluations = count,
         .mode = static_cast<Settings::NvidiaDlssQuality>(last & 0xff),
         .requested = static_cast<Settings::NvidiaDlssQuality>((last >> 8) & 0xff),
         .preset = static_cast<Settings::DlssPreset>((last >> 16) & 0xff),
+        .render_height = sizes & 0xffff,
+        .output_height = sizes >> 16,
     };
 }
 

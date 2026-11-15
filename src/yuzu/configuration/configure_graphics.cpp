@@ -619,25 +619,37 @@ void ConfigureGraphics::SetupOcarinaUpscalerLabels() {
         connect(oot_aa_combobox, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
                 [this](int) { UpdateOcarinaUpscalerLabels(); });
     }
-    // OoT's sizes in the DLSS quality names. Docked with Max Resolution, OoT renders 2560x1440:
-    // Native (DLAA) smooths it at that size, every other quality makes 4K from it (shown smaller
-    // on a smaller screen). With FRITCHII_DLSS_RENDER_SCALE the game itself renders lower for
-    // Performance and Ultra Performance. In handheld DLSS does not replace OoT's pass, and with
-    // FRITCHII_DLSS_SCALED the sizes follow the resolution scale: the plain names stay.
+    // What DLSS does in OoT, in the quality names (docked; the real sizes go to the status bar
+    // and the log once DLSS runs). Which game pass DLSS replaces decides it:
+    // - Max Resolution on: OoT renders a fixed 2560x1440 and DLSS replaces its 1440p pass.
+    //   Native (DLAA) keeps 1440p, every other quality makes 4K. With FRITCHII_DLSS_RENDER_SCALE
+    //   the game renders 1080p (Performance) or 720p (Ultra Performance) first.
+    // - Max Resolution off: the game's dynamic resolution (1920x1080 at most in the owner's logs).
+    //   DLSS replaces its 3/4 pass, which goes to 1440p: Native (DLAA) keeps the game's size,
+    //   the others make 1440p. The size isn't known before the game runs.
+    // In handheld it depends on the pass the game picks (with Max Resolution, its 1:1 1080p pass,
+    // which only FSR replaces), and with FRITCHII_DLSS_SCALED the sizes follow the resolution
+    // scale: the plain names stay.
     if (dlss_quality_combobox != nullptr && Settings::IsDockedMode() &&
         !VideoCommon::OcarinaScaledUpscale()) {
         const QString arrow = QStringLiteral(" %1 ").arg(QChar(0x2192));
+        const bool max_resolution = Settings::OcarinaMaxResolutionOn();
         for (int row = 0; row < dlss_quality_combobox->count(); ++row) {
             const auto quality =
                 static_cast<Settings::NvidiaDlssQuality>(dlss_quality_combobox->itemData(row).toUInt());
-            const bool scaled = Settings::OcarinaDlssRenderScaleSwitch() &&
-                                (quality == Settings::NvidiaDlssQuality::Performance ||
-                                 quality == Settings::NvidiaDlssQuality::UltraPerformance);
-            const u32 render = Settings::OcarinaRenderHeightFor(
-                scaled ? std::optional{quality} : std::nullopt);
-            const QString sizes = quality == Settings::NvidiaDlssQuality::Native
-                                      ? OcarinaHeightName(render)
-                                      : OcarinaHeightName(render) + arrow + OcarinaHeightName(2160);
+            const bool native = quality == Settings::NvidiaDlssQuality::Native;
+            QString sizes;
+            if (max_resolution) {
+                const bool scaled = Settings::OcarinaDlssRenderScaleSwitch() &&
+                                    (quality == Settings::NvidiaDlssQuality::Performance ||
+                                     quality == Settings::NvidiaDlssQuality::UltraPerformance);
+                const QString render = OcarinaHeightName(Settings::OcarinaRenderHeightFor(
+                    scaled ? std::optional{quality} : std::nullopt));
+                sizes = native ? render : render + arrow + OcarinaHeightName(2160);
+            } else {
+                const QString game_size = tr("game's size");
+                sizes = native ? game_size : game_size + arrow + OcarinaHeightName(1440);
+            }
             dlss_quality_combobox->setItemText(
                 row, QStringLiteral("%1: %2").arg(dlss_quality_combobox->itemText(row), sizes));
         }
