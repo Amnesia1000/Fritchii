@@ -250,6 +250,17 @@ public:
         if (is_executing) {
             return false;
         }
+        // Fritchii (FRITCHII_JIT_HOT_PACK): a whole-cache clear asked for since the last run is
+        // done now, as the next Run would do it first, instead of compiling into the code it
+        // throws away.
+        bool clear_pending = false;
+        {
+            std::unique_lock lock{invalidation_mutex};
+            clear_pending = invalidate_entire_cache;
+        }
+        if (clear_pending) {
+            PerformRequestedCacheInvalidation(HaltReason::CacheInvalidation);
+        }
         const IR::LocationDescriptor descriptor{location};
         if (emitter.GetBasicBlock(descriptor)) {
             return false;

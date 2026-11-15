@@ -80,6 +80,13 @@ public:
         return 0;
     }
 
+    // Fritchii (FRITCHII_JIT_HOT_PACK, a test hook): clears this CPU's code cache and compiles the
+    // hot list (FRITCHII_JIT_HOT_LIST) first, in guest pc order, so the hot code sits together.
+    // Same thread rules as WarmCompile. Returns how many blocks it compiled.
+    virtual std::size_t PackHotCode(const std::atomic<bool>& stop) {
+        return 0;
+    }
+
     // Get the current architecture.
     // This returns AArch64 when PSTATE.nRW == 0 and AArch32 when PSTATE.nRW == 1.
     virtual Architecture GetArchitecture() const = 0;

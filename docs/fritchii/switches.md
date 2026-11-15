@@ -2636,6 +2636,26 @@ soft float calls; 190 samples of 322).
 - Expected: 0.3 to 0.4% of the guest cores' busy time if most calls are "only zero lanes bad"
   (Fable A's guess: a zero in the unused fourth lane of a three-component vector).
 
+### FRITCHII_JIT_HOT_PACK
+
+FRITCHII_JIT_HOT_PACK (live test hook, default 0; fable_a_gameceiling_answer 12.3). Prices the
+13.2% of the guest cores' busy time spent arriving at blocks: is it code layout (instruction
+fetch, instruction TLB)? Needs FRITCHII_JIT_HOT_LIST (boot env) = a text file of "pc fpcr samples"
+lines, e.g. E:\OotRemakeEmulation\work\fable_a_gc\hot-blocks-market.txt (19,332 blocks).
+- Each new non-zero value (set it through the debug server's `switch`, e.g. 1, later 2 for a
+  second round) makes every guest core, at its next idle, clear its own code cache and compile the
+  hot list first, in guest pc order (PrecompileBlock through the warm-compile path, which now does
+  a pending whole-cache clear first instead of compiling into the code it throws away). Everything
+  else compiles again as it runs, after the hot code.
+- "JIT hot pack (FRITCHII_JIT_HOT_PACK=n) core c: cache cleared, K hot blocks gone through in M ms"
+  (Core_ARM, Info). An interrupt stops the compile early (the line says so); the rest compiles
+  lazily.
+- Exact: a cache clear and recompile of the same guest code (as after any code invalidation).
+  Expect a compile stall of a second or so at the moment it runs.
+- The test: market heavy phase, fps before, set the switch, wait for the six lines and about 30 s
+  for the cold code to come back, fps after. Fable A: 1.5% or more means layout matters (then the
+  real work: slow paths out of line, hot code together); nothing means drop that line of work.
+
 ## Numbered experiments (EDEN_NX2_EXPn)
 
 Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP79, live through the debug server:

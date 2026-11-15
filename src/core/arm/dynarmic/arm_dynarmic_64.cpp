@@ -3,12 +3,18 @@
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdlib>
+#include <fstream>
+#include <string>
+#include <utility>
+#include <vector>
 #if defined(_M_X64) || defined(__x86_64__)
 #include <immintrin.h>
 #endif
+#include "common/logging.h"
 #include "common/settings.h"
 #include "common/nx2_hitch.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
@@ -20,6 +26,7 @@
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/nx2_thread_stats.h"
 #include "dynarmic/interface/A64/config.h"
+#include "dynarmic/frontend/A64/a64_location_descriptor.h"
 
 namespace Core {
 
@@ -622,6 +629,46 @@ std::size_t ArmDynarmic64::WarmCompile(std::span<const u64> keys, const std::ato
     Common::Nx2Hitch::t_warming = false;
     m_cb->direct_code_reads = false;
     return done;
+}
+
+namespace {
+/// FRITCHII_JIT_HOT_LIST: a text file of "pc fpcr samples" lines (hex, hex, decimal; Fable A's
+/// work\fable_a_gc\hot-blocks-market.txt), read once: the blocks' location keys in pc order.
+const std::vector<u64>& HotPackKeys() {
+    static const std::vector<u64> keys = [] {
+        std::vector<std::pair<u64, u32>> blocks;
+        if (const char* path = std::getenv("FRITCHII_JIT_HOT_LIST"); path != nullptr) {
+            std::ifstream file{path};
+            std::string pc_text, fpcr_text;
+            u64 samples = 0;
+            while (file >> pc_text >> fpcr_text >> samples) {
+                blocks.emplace_back(std::strtoull(pc_text.c_str(), nullptr, 16),
+                                    static_cast<u32>(std::strtoul(fpcr_text.c_str(), nullptr, 16)));
+            }
+        }
+        std::sort(blocks.begin(), blocks.end());
+        std::vector<u64> result;
+        result.reserve(blocks.size());
+        for (const auto& [pc, fpcr] : blocks) {
+            result.push_back(
+                Dynarmic::A64::LocationDescriptor{pc, Dynarmic::FP::FPCR{fpcr}, false}.UniqueHash());
+        }
+        LOG_INFO(Core_ARM, "FRITCHII_JIT_HOT_LIST: {} hot blocks", result.size());
+        return result;
+    }();
+    return keys;
+}
+} // namespace
+
+std::size_t ArmDynarmic64::PackHotCode(const std::atomic<bool>& stop) {
+    const std::vector<u64>& keys = HotPackKeys();
+    if (keys.empty()) {
+        return 0;
+    }
+    // The clear is performed by the first PrecompileBlock (the JIT runs no code here), so the
+    // hot blocks are the first code in the emptied cache.
+    ClearInstructionCache();
+    return WarmCompile(keys, stop);
 }
 
 void ArmDynarmic64::InvalidateCacheRange(u64 addr, std::size_t size) {
