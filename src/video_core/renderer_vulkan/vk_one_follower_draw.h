@@ -127,11 +127,17 @@ private:
     /// `list`: a list draw (R runs DrawIndirect, not Draw).
     void LendDraw(bool is_indexed, u32 instance_count, LentReason reason, bool verify,
                   bool list = false);
+    /// FRITCHII_ONEF_UNLENT_RESET on a forced-lent draw: E's own indirect reset test.
+    struct ResetCheck {
+        bool decided{}; ///< E ran the test (a candidate, the switch on)
+        bool is_reset{};
+    };
     /// What E's fill would use for a lent draw's programs (looked up on E before the lend).
     struct FactsExpect {
         bool found{};
         std::array<u64, 2> hashes{};
         u64 space{}; ///< the address space E looked the programs up in (id + 1)
+        ResetCheck reset{};
     };
 
     // R.
@@ -215,6 +221,10 @@ private:
     /// draw being routed refused (UnlentBlocker counts its own tests).
     VideoCommon::OneFollower::TransientTest fill_test{};
     bool filled_refused{};
+    /// UnlentBlocker's PacketFlag bits for the draw's packet (PacketNoReset), and its reset test
+    /// for a forced-lent draw (LendDraw hands it to RunLent).
+    u8 push_flags{};
+    ResetCheck verify_reset{};
     MemStage::StagedFacts facts{};
     std::vector<u32> handle_values;
 

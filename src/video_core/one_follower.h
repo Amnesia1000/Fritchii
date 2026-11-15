@@ -220,6 +220,10 @@ enum class Check : u8 {
     /// fable_b 16.2: a target E obtained for a samples report that R had no value for (E's
     /// mirror said a sync was owed): its early upload may have cleared a mark serial keeps.
     SyncTargetUnused,
+    /// FRITCHII_ONEF_UNLENT_RESET (fable_b 19 step 2): a forced-lent draw where E's own indirect
+    /// reset test (made before the lend) differs from the test on E's engine inside the lent
+    /// call. The switch stops for the session.
+    UnlentReset,
     Count,
 };
 
@@ -231,7 +235,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Check::Count)> chec
     "facts stale", "played lookup miss", "texture read ahead of R", "ring B pairing",
     "R waits for E's lock", "R needs E's buffer flush",
     "build list draw", "played list args", "played kind without path", "sync mirror",
-    "sync target missing", "sync target unused",
+    "sync target missing", "sync target unused", "unlent reset",
 };
 
 // --- The packet (E to R) -----------------------------------------------------------------------------
@@ -272,6 +276,10 @@ enum PacketFlag : u8 {
     /// flags go by rule 1, as a draw packet's (PackSpans forwards each set one and clears it on
     /// E's engine), not by difference.
     PacketRenderState = 8,
+    /// A draw packet (FRITCHII_ONEF_UNLENT_RESET): E ran IsNx2IndirectReset's test on its own
+    /// engine at its place and the draw is not an indirect reset; R does not test it again
+    /// (the test reads the program's code in game memory, which R must not do out of a lend).
+    PacketNoReset = 16,
 };
 
 /// One changed register word R watches.
@@ -706,6 +714,11 @@ inline constexpr std::array<const char*, static_cast<size_t>(TransientTest::Coun
     };
 /// E: a draw of UnlendKind `kind` is lent as Transient because of `test`.
 void CountTransient(TransientTest test, u32 kind) noexcept;
+/// FRITCHII_ONEF_UNLENT_RESET (live; fable_b 19 step 2; step 4): a non-indexed single-instance
+/// native draw of points is lent only when E's own IsNx2IndirectReset test says it is one;
+/// the others are pushed with PacketNoReset. Stopped for the session by "unlent reset".
+[[nodiscard]] bool UnlentResetOn() noexcept;
+void StopUnlentReset(const char* why) noexcept;
 
 /// E, before the Lend or PushOp of a query: its kind (counted with the park's time).
 void SetQueryKind(QueryKind kind) noexcept;

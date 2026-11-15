@@ -30,6 +30,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 
 #include <fmt/format.h>
 
@@ -230,7 +231,20 @@ OneF::LentReason OneFollowerDraw::UnlentBlocker(Maxwell3D& engine, bool is_index
     const bool verify = every > 0 && (++unlent_candidates % static_cast<u64>(every)) == 0;
     // Read every draw, so a hit never waits for a later draw (the next draw after it is lent).
     const bool stream_write = OneF::TakeStreamWriteLend();
+    push_flags = 0;
+    verify_reset = {};
+    const auto& draw = engine.draw_manager.draw_state;
+    const bool native = engine.GetNativeMacroEngine().native_turing;
+    // IsNx2IndirectReset's cheap half (Draw's early out; the rest reads the program's code).
+    const bool reset_candidate = kind != OneF::List && !is_indexed && instance_count == 1 &&
+                                 native && draw.topology == Maxwell::PrimitiveTopology::Points;
     if (verify) {
+        // FRITCHII_ONEF_UNLENT_RESET's must-be-0: E's own test now, the lent draw's on E's engine
+        // inside the call (RunLent, Check::UnlentReset).
+        if (reset_candidate && OneF::UnlentResetOn()) {
+            verify_reset = ResetCheck{true, RasterizerVulkan::IsNx2IndirectResetOn(
+                                                engine, engine.GetMemoryManager(), false, 1)};
+        }
         return LentReason::Verify;
     }
     if (stream_write) {
@@ -247,8 +261,6 @@ OneF::LentReason OneFollowerDraw::UnlentBlocker(Maxwell3D& engine, bool is_index
         OneF::CountTransient(test, kind);
         return LentReason::Transient;
     };
-    const auto& draw = engine.draw_manager.draw_state;
-    const bool native = engine.GetNativeMacroEngine().native_turing;
     // The lent packet seeds or syncs the view.
     if (!view_ready || seeded_step != OneF::Step()) {
         return transient(TransientTest::ViewNotSeeded);
@@ -285,9 +297,16 @@ OneF::LentReason OneFollowerDraw::UnlentBlocker(Maxwell3D& engine, bool is_index
     if (first + count > (u64{1} << 24)) {
         return transient(TransientTest::VertexLimit);
     }
-    if (!is_indexed && instance_count == 1 && native &&
-        draw.topology == Maxwell::PrimitiveTopology::Points) {
-        return transient(TransientTest::IndirectReset); // a candidate for IsNx2IndirectReset
+    if (reset_candidate) {
+        // FRITCHII_ONEF_UNLENT_RESET: E runs the whole test at its own place on its own engine
+        // (the code read flushes as the lent draw's read would, here) and lends only a real
+        // reset; the rest are pushed with PacketNoReset, so R's Draw does not test again. A mesh
+        // pipeline is never one (the test's own early out): most points draws in the market.
+        if (!OneF::UnlentResetOn() || RasterizerVulkan::IsNx2IndirectResetOn(
+                                          engine, engine.GetMemoryManager(), false, 1)) {
+            return transient(TransientTest::IndirectReset);
+        }
+        push_flags |= OneF::PacketNoReset;
     }
     return LentReason::Count;
 }
@@ -414,6 +433,9 @@ void OneFollowerDraw::LendDraw(bool is_indexed, u32 instance_count, LentReason r
     // The facts compare (Check::FactsStale): with the verify, the facts table entry E's fill
     // would use for these program registers now, before the lent draw publishes its own.
     FactsExpect expect{};
+    if (verify) {
+        expect.reset = std::exchange(verify_reset, ResetCheck{});
+    }
     // With rule 3 (FRITCHII_ONEF_E_PIPELINE) E fills from the pipeline it looked up and the facts
     // table plays no part: nothing to compare.
     if (verify && !VideoCommon::OneFollower::g_e_pipeline) {
@@ -422,7 +444,9 @@ void OneFollowerDraw::LendDraw(bool is_indexed, u32 instance_count, LentReason r
                                                    program_id);
         MemStage::StagedFacts looked{};
         if (rasterizer.mem_stage.LookupFacts(program_id, looked)) {
-            expect = FactsExpect{true, looked.hashes, program_id.space};
+            expect.found = true;
+            expect.hashes = looked.hashes;
+            expect.space = program_id.space;
         }
     }
     auto body = [this, is_indexed, instance_count, verify, expect, list] {
@@ -461,7 +485,7 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
     if (!FillRing(engine, pipeline, is_indexed, position, seq, buffer_number, reason, list)) {
         return false;
     }
-    OneF::PushDraw(engine, seq, buffer_number, 0, pipeline);
+    OneF::PushDraw(engine, seq, buffer_number, push_flags, pipeline);
     counts.pushed.fetch_add(1, std::memory_order_relaxed);
     // PrepareDraw's tail, E's half (read-backs wait on E's work).
     rasterizer.gpu.TickWork();
@@ -536,6 +560,8 @@ bool OneFollowerDraw::RouteListDraw() {
     OneF::SetNextDraw(OneF::List, false, true, 0);
     LentReason reason;
     filled_refused = false;
+    push_flags = 0;
+    verify_reset = {};
     if (engine.GetNativeMacroEngine().native_turing && engine.regs.IsMeshEnabled() &&
         (mask & OneF::Mesh) == 0) {
         reason = LentReason::KindNotInMask; // a list draw on a mesh pipeline needs both bits
@@ -578,6 +604,16 @@ void OneFollowerDraw::RunLent(bool is_indexed, u32 instance_count, bool verify,
         Compare(engine, OneF::Step() == StepLevel::Build && lent_since_resync == 1);
         if (list) {
             CompareList(engine);
+        }
+    }
+    if (verify && expect.reset.decided) {
+        // FRITCHII_ONEF_UNLENT_RESET: E's test before the lend against the test on E's engine at
+        // the same place (E parked; the rasterizer names E's engine inside a lent call).
+        const bool lent_says = rasterizer.IsNx2IndirectReset(is_indexed, instance_count);
+        if (lent_says != expect.reset.is_reset) [[unlikely]] {
+            OneF::Note(Check::UnlentReset, lent_says ? "E said no indirect reset, the lent draw is one"
+                                                     : "E said indirect reset, the lent draw is not");
+            OneF::StopUnlentReset("E's indirect reset test differs from the lent draw's");
         }
     }
     rasterizer.onef_pipeline_seen = false;

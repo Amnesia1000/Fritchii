@@ -306,6 +306,10 @@ private:
     void CollectIndirectTrace();
     void TraceDrawFailure(std::string_view reason);
     bool IsNx2IndirectReset(bool is_indexed, u32 instance_count);
+    /// The same test on `engine` and `memory` (E's own, at its place: FRITCHII_ONEF_UNLENT_RESET).
+    [[nodiscard]] static bool IsNx2IndirectResetOn(Tegra::Engines::Maxwell3D& engine,
+                                                   Tegra::MemoryManager& memory, bool is_indexed,
+                                                   u32 instance_count);
     /// A compute dispatch was recorded since the last barrier for GPU-counted draws.
     bool compute_since_count_barrier{};
     /// Remembers render target 0 of a draw with one of Ocarina of Time's tonemap shaders.

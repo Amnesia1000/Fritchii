@@ -277,6 +277,15 @@ inline std::atomic<int> g_onef_post_fence{-1};
 /// FRITCHII_ONEF_CLEAR_NODEFER (live, default 0): diagnostic, a posted clear on R is never
 /// deferred into the next render pass's load op (the lean darkness of 15 Nov).
 inline std::atomic<int> g_onef_clear_nodefer{-1};
+/// FRITCHII_ONEF_UNLENT_RESET (live, default 0): fable_b 19 step 2, E runs the indirect reset
+/// test itself and lends only a draw that is one.
+inline std::atomic<int> g_onef_unlent_reset{-1};
+/// FRITCHII_ONEF_UNLENT_VALUES (live, default 0): fable_b 19 step 2, the engine hint, the macro
+/// mode and the constant buffer bindings go to R's view by value when they change.
+inline std::atomic<int> g_onef_unlent_values{-1};
+/// FRITCHII_ONEF_BIND_SEED (live, default 0): fable_b 19 step 2, the lent channel bind re-seeds
+/// R's view and E's tracking inside its own call (no lent draw after a bind).
+inline std::atomic<int> g_onef_bind_seed{-1};
 /// EDEN_NX2_LIGHT_TABLE_ARRAYS: docs/fritchii/switches.md.
 [[nodiscard]] inline bool LightTableArrays() {
     static const bool on = EnvSwitch("EDEN_NX2_LIGHT_TABLE_ARRAYS") > 0;

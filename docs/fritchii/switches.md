@@ -1463,6 +1463,15 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   posted, 114.5 without.
 - FRITCHII_ONEF_CLEAR_NODEFER (live, default 0; diagnostic for that fault): 1 = a posted clear
   on R clears at once instead of becoming the next render pass's load op (deferred clear).
+- FRITCHII_ONEF_UNLENT_RESET (live, default 0; fable_b_one_follower 19 step 2; step 4): 1 = a
+  non-indexed single-instance native draw of points is no longer lent as an indirect-reset
+  candidate. E runs IsNx2IndirectReset's whole test itself at its place on its own engine (a
+  mesh pipeline is never one; otherwise it reads the program's code with ReadBlock, whose flush
+  is lent or answered on E as any E read) and lends only a draw that is a reset. The others are
+  pushed with PacketNoReset and R's Draw skips the test (it would read game memory on R). The
+  forced-lent verify draws compare E's answer with the test on E's engine inside the lent call:
+  must-be-0 "unlent reset", which stops the switch for the session. "indirect reset" on the
+  transient lends line is what it removes (the market's mesh draws, about 290 a second, E).
 - FRITCHII_ONEF_TRACE (boot, default 0; fable_b_one_follower 15.5): 1 = the lend trace. One
   72-byte record per lend and per posted op (packet number, site, op kind, posted, E's arrival,
   R's start and end, E's resume, E's work since its previous record, R's busy time on other

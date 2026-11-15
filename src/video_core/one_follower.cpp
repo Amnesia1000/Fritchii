@@ -146,6 +146,7 @@ struct Impl {
     u64 op_bytes_logged{};
     std::array<std::atomic<u64>, 3> mirror_count{}; ///< compared, E set R not, R set E not
     std::atomic<bool> post_fence_stopped{};
+    std::atomic<bool> unlent_reset_stopped{}; ///< StopUnlentReset
     // fable_b 13.0 (E only): pages with a report a posted fence lands, by that fence's packet
     // number; and the report pages since the last fence.
     std::unordered_map<u64, u64> landing_pages;
@@ -1825,6 +1826,20 @@ void CountTransient(TransientTest test, u32 kind) noexcept {
     const size_t index = (std::min)(static_cast<size_t>(test),
                                     static_cast<size_t>(TransientTest::Count) - 1);
     g.transient[index][Stats::KindSlot(kind)].fetch_add(1, std::memory_order_relaxed);
+}
+
+bool UnlentResetOn() noexcept {
+    return g.on && Step() == StepLevel::Unlend &&
+           VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_unlent_reset,
+                                            "FRITCHII_ONEF_UNLENT_RESET") != 0 &&
+           !g.unlent_reset_stopped.load(std::memory_order_relaxed);
+}
+
+void StopUnlentReset(const char* why) noexcept {
+    if (!g.unlent_reset_stopped.exchange(true, std::memory_order_relaxed)) {
+        LOG_CRITICAL(HW_GPU, "One follower: FRITCHII_ONEF_UNLENT_RESET stops for this session ({})",
+                     why != nullptr ? why : "?");
+    }
 }
 
 void SetQueryKind(QueryKind kind) noexcept {
