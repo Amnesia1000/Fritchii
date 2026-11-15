@@ -143,6 +143,21 @@ public:
     void SetCodePtr(CodePtr code_ptr);
     void EnsurePatchLocationSize(CodePtr begin, size_t size);
 
+    /// Fritchii (FRITCHII_JIT_FAR_CODE): the last `far_size` bytes of the code space become a
+    /// second region for code that rarely runs (slow paths, link stubs), so the blocks' hot
+    /// bytes sit next to each other. Both regions are reset together (ClearCache). Call before
+    /// PreludeComplete. Without it nothing changes.
+    void EnableFarCode(size_t far_size);
+    bool HasFarCode() const { return far_code_begin != 0; }
+    /// Emission continues in the far region (where it last stopped) / back in the near one.
+    void SwitchToFarCode();
+    void SwitchToNearCode();
+    bool InFarCode() const { return in_far_code; }
+    /// Where far code would be emitted next (near code current; nullptr without far code).
+    CodePtr GetFarCodeCurr() const;
+    /// The smaller of the two regions (the whole space without far code).
+    size_t SmallestRegionSize() const;
+
     static const Xbyak::Reg64 ABI_JIT_PTR;
     // ABI registers
 #ifdef _WIN32
@@ -185,6 +200,15 @@ private:
     RunCodeCallbacks cb;
     CodePtr code_begin = nullptr;
     bool prelude_complete = false;
+    // Fritchii (FRITCHII_JIT_FAR_CODE): offsets in the code space. far_code_begin 0 = no far
+    // region. The write position of the region not in use is kept in its *_offset.
+    size_t far_code_begin = 0;
+    size_t far_code_offset = 0;
+    size_t near_code_offset = 0;
+    bool in_far_code = false;
+#ifdef _WIN32
+    size_t far_committed_size = 0;
+#endif
 
     void GenRunCode(std::function<void(BlockOfCode&)> rcp);
 };
