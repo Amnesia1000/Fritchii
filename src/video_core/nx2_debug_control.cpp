@@ -650,6 +650,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_BIND_SKIP") {
         return &g_bind_skip;
     }
+    if (name == "FRITCHII_ESPLIT_COUNT") {
+        return &g_esplit_count;
+    }
     return nullptr;
 }
 

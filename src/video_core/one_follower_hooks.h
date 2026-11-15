@@ -38,7 +38,13 @@ void NoteRegWrite(u32 index) noexcept;
 /// count did not move since its snapshot last equalled the registers.
 inline constexpr u32 KeyWordSlots = 0x1000;
 inline std::array<u64, KeyWordSlots / 64> g_key_words{};
-inline bool g_key_watch{}; ///< set once the switch was seen on: NoteRegWrite counts key writes
+/// NoteRegWrite's extra watchers in one byte, so it pays one load while none is on (written on E,
+/// or R in a lent call with E parked). WriteWatchKey: FRITCHII_ONEF_KEY_KEEP was seen on (key
+/// writes counted from then). WriteWatchSplit: FRITCHII_ESPLIT_COUNT >= 2, the E split's records
+/// take the word (fritchii_e_split.h).
+inline constexpr u8 WriteWatchKey = 1;
+inline constexpr u8 WriteWatchSplit = 2;
+inline u8 g_write_watch{};
 inline u64 g_key_writes{};
 
 /// FRITCHII_ONEF_UNLENT_VALUES (fable_b 19 step 2): Maxwell3D::ProcessCBBind tests this before

@@ -386,6 +386,11 @@ inline std::atomic<int> g_s4_count{-1};
 /// change since the same slot bound it: 1 = within a list entry, 2 = also across entries on
 /// tracked pages, 3 = 2 + verify, 4 = 1 + verify, 5 = dry (decide, count and time only).
 inline std::atomic<int> g_bind_skip{-1};
+/// FRITCHII_ESPLIT_COUNT (live, default 0): the E split's step S0, dry (fritchii_e_split.h):
+/// 1 = classify every ring entry E runs (E1, E2, join, lend), time 1 in 64, count the stalls,
+/// 2 = also build and consume the E1 to E2 records on E and compare E2's view at each hand-over,
+/// 3 = 2, and E's draw fill reads that view (SetInputsOverride) wherever it equals the engine.
+inline std::atomic<int> g_esplit_count{-1};
 /// EDEN_NX2_LIGHT_TABLE_ARRAYS: docs/fritchii/switches.md.
 [[nodiscard]] inline bool LightTableArrays() {
     static const bool on = EnvSwitch("EDEN_NX2_LIGHT_TABLE_ARRAYS") > 0;

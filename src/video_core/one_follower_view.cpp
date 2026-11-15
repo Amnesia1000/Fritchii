@@ -33,6 +33,7 @@
 #include <fmt/format.h>
 
 #include "video_core/dirty_flags.h"
+#include "video_core/fritchii_e_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/one_follower.h"
@@ -219,10 +220,16 @@ void NoteRegWrite(u32 index) noexcept {
     if (!Detail::t_engine && !InLent()) {
         return; // the front's copy, or another thread: not E's engine
     }
-    // FRITCHII_ONEF_KEY_KEEP: every write of a lookup word, before the per-packet dedupe.
-    if (g_key_watch && index < KeyWordSlots &&
-        ((g_key_words[index / 64] >> (index % 64)) & 1) != 0) {
-        ++g_key_writes;
+    if (const u8 watch = g_write_watch; watch != 0) [[unlikely]] {
+        // FRITCHII_ONEF_KEY_KEEP: every write of a lookup word, before the per-packet dedupe.
+        if ((watch & WriteWatchKey) != 0 && index < KeyWordSlots &&
+            ((g_key_words[index / 64] >> (index % 64)) & 1) != 0) {
+            ++g_key_writes;
+        }
+        // FRITCHII_ESPLIT_COUNT >= 2: the word goes in E1's next record (its own dedupe).
+        if ((watch & WriteWatchSplit) != 0) {
+            ESplit::NoteWord(index);
+        }
     }
     if (index >= NumRegs || g_e.noted.test(index)) {
         return;
@@ -565,6 +572,11 @@ bool StreamWriteHits(DAddr address, u64 size) noexcept {
 void GuardStreamWrite(DAddr address, u64 size) noexcept {
     if (!Detail::t_engine || size == 0 || g_texture_pages == nullptr) {
         return;
+    }
+    // FRITCHII_ESPLIT_COUNT: an E2 write onto shader pages opens the window in which E1's next
+    // pipeline lookup would have to wait for it.
+    if (ESplit::g_state != 0) [[unlikely]] {
+        ESplit::NoteStreamWriteImpl(g_shader_pages != nullptr && g_shader_pages->Any(address, size));
     }
     Stats::StreamWriteChecked();
     const DAddr end = address + size;
