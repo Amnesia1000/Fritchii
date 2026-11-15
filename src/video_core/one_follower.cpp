@@ -1551,6 +1551,8 @@ bool PostOpSite(u8 site) noexcept {
         return SwitchValue(g_onef_op_inline, "FRITCHII_ONEF_OP_INLINE") != 0;
     case 10: // MemStage::Site::Invalidation: E's buffer halves (INVAL_E, GATHER_E)
         return SwitchValue(g_onef_op_inval, "FRITCHII_ONEF_OP_INVAL") != 0;
+    case 7: // MemStage::Site::ListWords: Nx2KeepListWords' buffer side
+        return SwitchValue(g_onef_op_listkeep, "FRITCHII_ONEF_OP_LISTKEEP") != 0;
     default:
         return false;
     }

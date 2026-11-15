@@ -515,6 +515,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_ONEF_OP_INVAL") {
         return &g_onef_op_inval;
     }
+    if (name == "FRITCHII_ONEF_OP_LISTKEEP") {
+        return &g_onef_op_listkeep;
+    }
     return nullptr;
 }
 

@@ -263,6 +263,8 @@ inline std::atomic<int> g_onef_op_clear{-1};
 inline std::atomic<int> g_onef_trace{-1};
 /// FRITCHII_ONEF_OP_INVAL (live, default 0): fable_b 13.4, the invalidation site's buffer commands posted as op packets.
 inline std::atomic<int> g_onef_op_inval{-1};
+/// FRITCHII_ONEF_OP_LISTKEEP (live, default 0): fable_b 15.4, kept list words posted (E's buffer side, R's copy as a render op).
+inline std::atomic<int> g_onef_op_listkeep{-1};
 /// EDEN_NX2_LIGHT_TABLE_ARRAYS: docs/fritchii/switches.md.
 [[nodiscard]] inline bool LightTableArrays() {
     static const bool on = EnvSwitch("EDEN_NX2_LIGHT_TABLE_ARRAYS") > 0;

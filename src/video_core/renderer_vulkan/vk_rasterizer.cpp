@@ -3473,6 +3473,46 @@ bool RasterizerVulkan::MemStageQmd(Tegra::MemoryManager& memory, GPUVAddr addres
 // List draws and list dispatches: a copy of the list words at their place in the stream, for the
 // front to read back if it needs their values after all.
 void RasterizerVulkan::Nx2KeepListWords(u64 keep_id, GPUVAddr address, u32 count) {
+    // FRITCHII_ONEF_OP_LISTKEEP (fable_b 15.4): E's half, the buffer (its sync's commands an op
+    // packet), here; R's, the copy into the keep buffer, a render op at the same place. The
+    // front's read of the kept words is lent (Nx2ReadKeptListWords), so R has played the copy.
+    if (VideoCommon::OneFollower::ShouldLend() &&
+        VideoCommon::OneFollower::PostOpSite(static_cast<u8>(MemStage::Site::ListWords)))
+        [[unlikely]] {
+        VkBuffer handle = VK_NULL_HANDLE;
+        u32 offset = 0;
+        {
+            std::scoped_lock lock{buffer_cache.mutex};
+            const auto [buffer, buffer_offset] = mem_stage.Ref(MemStage::Site::ListWords, [&] {
+                return buffer_cache.ObtainBuffer(
+                    address, count * sizeof(u32),
+                    VideoCommon::ObtainBufferSynchronize::FullSynchronize,
+                    VideoCommon::ObtainBufferOperation::DoNothing);
+            });
+            if (buffer == nullptr) {
+                return;
+            }
+            handle = buffer->Handle();
+            offset = buffer_offset;
+        }
+        struct Op {
+            MemPlayer* player;
+            u64 keep_id;
+            VkBuffer handle;
+            u32 offset;
+            u32 count;
+        } const op{&mem_player, keep_id, handle, offset, count};
+        VideoCommon::OneFollower::SetLendSite("Nx2KeepListWords (posted)");
+        VideoCommon::OneFollower::PushOp(
+            VideoCommon::OneFollower::LentOp::Copy,
+            [](void* raw) {
+                Op a;
+                std::memcpy(&a, raw, sizeof(a));
+                a.player->KeepListWords(a.keep_id, a.handle, a.offset, a.count);
+            },
+            &op, sizeof(op));
+        return;
+    }
     ONEF_LEND(Copy, Nx2KeepListWords(keep_id, address, count))
     std::scoped_lock lock{buffer_cache.mutex};
     const auto [buffer, offset] = mem_stage.Ref(MemStage::Site::ListWords, [&] {
@@ -3487,6 +3527,9 @@ void RasterizerVulkan::Nx2KeepListWords(u64 keep_id, GPUVAddr address, u32 count
 }
 
 bool RasterizerVulkan::Nx2ReadKeptListWords(u64 keep_id, std::span<u32> words) {
+    // The player is R's (the keep list and its copies; the wait is R's scheduler): lent, so R
+    // has played every copy before it (FRITCHII_ONEF_OP_LISTKEEP posts them).
+    ONEF_LEND_RESULT(ReadBack, Nx2ReadKeptListWords(keep_id, words))
     return mem_player.ReadKeptListWords(keep_id, words);
 }
 
