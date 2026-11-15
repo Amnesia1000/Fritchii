@@ -2480,7 +2480,9 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
     }
 }
 
-bool Maxwell3D::FrontWriteDecide(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
+// Fritchii: FrontWrite's three halves (front ops share them) are forced inline so the plain
+// FrontWrite path, the front's hottest (~4.6 million writes a second), compiles as one body again.
+NX2_PROFILE_FORCEINLINE bool Maxwell3D::FrontWriteDecide(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
                                  u32 argument, bool is_last_call, bool from_macro,
                                  FrontWriteDecision& decision) {
     namespace Profile = VideoCommon::Nx2Profile;
@@ -2661,7 +2663,7 @@ bool Maxwell3D::FrontWriteDecide(VideoCommon::GpuSplit& split, FrontState& fs, u
     return true;
 }
 
-void Maxwell3D::FrontWriteSend(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
+NX2_PROFILE_FORCEINLINE void Maxwell3D::FrontWriteSend(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
                                u32 argument, bool is_last_call, bool from_macro,
                                const FrontWriteDecision& decision) {
     using Effect = VideoCommon::GpuSplit::Effect;
@@ -2712,7 +2714,7 @@ void Maxwell3D::FrontWriteSend(VideoCommon::GpuSplit& split, FrontState& fs, u32
     FrontWriteNotes(split, fs, method, decision);
 }
 
-void Maxwell3D::FrontWriteNotes(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
+NX2_PROFILE_FORCEINLINE void Maxwell3D::FrontWriteNotes(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
                                 const FrontWriteDecision& decision) {
     u32 value = decision.value;
     const GPUVAddr write_begin = decision.write_begin;
