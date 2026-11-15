@@ -398,6 +398,30 @@ and differed (must be 0, with the session's total).
 Read it with the "Front waits by site" / profile's "macro dma read": it should fall to the
 forwarded and snapshot hits' cost, and E's time grows by its waits for R.
 
+### FRITCHII_STAMP_READ_PAGES (the "Stamp read pages" line)
+
+FRITCHII_STAMP_READ_PAGES (live, default 0 = exactly as before; fable_b_one_follower 21.2 cut 2).
+With the write stamps on, GpuSplit::RangeLastWrite stamps every ranged 3D write (each constant
+buffer upload word, each report) by GPU and by device address (EXP126) for the stamp readers
+(WriteStamp, WriteStampWhy, BytesStamp: the QMD reads, the acquire lagged check, the QMD
+prediction), about 25 ms/s of the front at the market. Those readers ask about few pages.
+- 2: a ranged write's bytes are stamped only on device pages a stamp reader ever asked about.
+  Where it skips, it raises a skip floor (the newest skipped write). A page asked about for the
+  first time takes that floor as its add floor, a stamp over all of its bytes (the reader then
+  waits for every skipped write sent before, once); from then on writes there are stamped. The
+  ranged ring (ForwardRead, WaitForMemoryWriters, the exact scans) is untouched. Exact: a read of
+  a page finds each write sent after the page was first asked about in the tables and each one
+  before in the add floor. The page table is cleared at 65,536 pages (a page asked about again
+  takes the newest skip floor: still exact). Only for writes up to 4 KiB with a translation
+  (the device stamps' own rule: no queued function, not sparse) and EXP126 on; else as before.
+- 1: dry. Everything stamped as before; the pages asked about are kept and the skips counted.
+- Turned off after 2: readers keep taking the add floors (the skip floor stays for the session).
+
+"Stamp read pages (FRITCHII_STAMP_READ_PAGES=n) 10 s" (HW_GPU, Info), per second: ranged writes
+it handled, their pages on pages asked about (stamped), on pages never asked about (skipped, or
+would skip with 1), writes stamped whole as before; pages asked about (and new ones a second),
+reader answers raised by an add floor, table clears.
+
 ### FRITCHII_FRONT_RAN_READS
 
 FRITCHII_FRONT_RAN_READS (live, default 0 = exactly as before; the market's "Front 0xe2c misses"
