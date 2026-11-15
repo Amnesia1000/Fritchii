@@ -1087,7 +1087,10 @@ struct Memory::Impl {
             last_epoch = epoch;
             return;
         }
-        const double seconds = static_cast<double>(now - last) / 1e9;
+        // Integer math only: this runs on a guest core with the guest's MXCSR, whose exception
+        // flags the guest reads back as FPSR (floating point here could set its inexact flag).
+        const u64 ms = (std::max)(u64(now - last) / 1'000'000, u64{1});
+        const auto per_second = [ms](u64 count) { return count * 1000 / ms; };
         const u64 d_stores = stores - last_stores;
         const u64 d_hits = hits - last_hits;
         const u64 d_epoch_misses = epoch_misses - last_epoch_misses;
@@ -1095,16 +1098,12 @@ struct Memory::Impl {
         const u64 gathers = ((epoch >> 16) - (last_epoch >> 16)) & field;
         const u64 takes = ((epoch >> 40) - (last_epoch >> 40)) & field;
         LOG_INFO(HW_Memory,
-                 "Store memo (FRITCHII_STORE_MEMO={}) {:.1f} s: trapped stores {:.0f}/s, {} "
-                 "{:.0f}/s ({:.1f}%), same block but a mark taken since {:.0f}/s; epoch moves: "
-                 "gathers {:.0f}/s, flag takes {:.0f}/s; since boot hits/stores by core {}",
-                 mode, seconds, static_cast<double>(d_stores) / seconds,
-                 mode == 2 ? "served" : "would serve", static_cast<double>(d_hits) / seconds,
-                 d_stores == 0 ? 0.0
-                               : 100.0 * static_cast<double>(d_hits) / static_cast<double>(d_stores),
-                 static_cast<double>(d_epoch_misses) / seconds,
-                 static_cast<double>(gathers) / seconds, static_cast<double>(takes) / seconds,
-                 per_core);
+                 "Store memo (FRITCHII_STORE_MEMO={}) {} ms: trapped stores {}/s, {} {}/s ({}%), "
+                 "same block but a mark taken since {}/s; epoch moves: gathers {}/s, flag takes "
+                 "{}/s; since boot hits/stores by core {}",
+                 mode, ms, per_second(d_stores), mode == 2 ? "served" : "would serve",
+                 per_second(d_hits), d_stores == 0 ? 0 : d_hits * 100 / d_stores,
+                 per_second(d_epoch_misses), per_second(gathers), per_second(takes), per_core);
         last_stores = stores, last_hits = hits, last_epoch_misses = epoch_misses;
         last_epoch = epoch;
     }
