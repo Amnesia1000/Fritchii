@@ -53,6 +53,50 @@ inline int OcarinaDlssJitterMode() {
     return mode;
 }
 
+/// FRITCHII_DLSS_SCALED (boot, 0 = off): with DLSS or FSR picked for OoT, keep the player's
+/// resolution scale instead of setting it to 1x for the session. The upscaler then takes the
+/// scene at the scaled size (2x: four times the pixels, 0.5x: a quarter) and picks its mode from
+/// the real render and output sizes. Off: the scale goes to 1x as before.
+inline bool OcarinaScaledUpscale() {
+    static const bool on = [] {
+        const char* value = std::getenv("FRITCHII_DLSS_SCALED");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return on;
+}
+
+struct OcarinaExtent {
+    unsigned width{};
+    unsigned height{};
+    constexpr bool operator==(const OcarinaExtent&) const = default;
+};
+
+/// What the temporal upscaler writes for one frame with the scene at the resolution scale.
+/// `render`: the scene's real size (the scaled size when the scaler scaled it). `target`: the real
+/// size of the game's upscale target. `native_aa`: the DLSS quality "Native" (the output keeps the
+/// render size). `want_4k`: the 1440p pass with the 4K output. DLSS and FSR only enlarge, so a
+/// scene larger than the target is upscaled to its own size (native AA) and the output pass
+/// shrinks the result into the target: supersampling.
+struct OcarinaScaledOutput {
+    OcarinaExtent output;
+    bool upscale_4k{};
+};
+
+constexpr OcarinaScaledOutput SelectOcarinaScaledOutput(OcarinaExtent render, OcarinaExtent target,
+                                                        bool native_aa, bool want_4k) {
+    const auto fits = [render](OcarinaExtent output) {
+        return render.width <= output.width && render.height <= output.height;
+    };
+    if (native_aa) {
+        return {render, false};
+    }
+    constexpr OcarinaExtent uhd{3840, 2160};
+    if (want_4k && fits(uhd)) {
+        return {uhd, true};
+    }
+    return {fits(target) ? target : render, false};
+}
+
 /// Texture LOD bias added to Ocarina's mipmapped samplers while FSR upscales. AMD recommends
 /// log2(render / output) - 1: -1.58 for docked 1440p -> 4K. With EDEN_NX2_DLSS_JITTER, DLSS gets
 /// NVIDIA's log2(render / output): -0.58.

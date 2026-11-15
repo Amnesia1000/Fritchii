@@ -68,3 +68,30 @@ TEST_CASE("FSR temporal sharpness uses the existing stops slider", "[video_core]
     CHECK(FSR::RcasSharpnessFromStops(3.0f) == 0.0f);
     CHECK(FSR::RcasSharpnessFromStops(-1.0f) == 1.0f);
 }
+
+TEST_CASE("OoT scaled upscale picks an output the upscaler can reach", "[video_core][ocarina]") {
+    using VideoCommon::OcarinaExtent;
+    using VideoCommon::SelectOcarinaScaledOutput;
+    // 1x: as before (the target, the 4K output, the render size for native AA).
+    auto choice = SelectOcarinaScaledOutput({1440, 810}, {1920, 1080}, false, false);
+    CHECK(choice.output == OcarinaExtent{1920, 1080});
+    CHECK_FALSE(choice.upscale_4k);
+    choice = SelectOcarinaScaledOutput({2560, 1440}, {2560, 1440}, false, true);
+    CHECK(choice.output == OcarinaExtent{3840, 2160});
+    CHECK(choice.upscale_4k);
+    CHECK(SelectOcarinaScaledOutput({1440, 810}, {1920, 1080}, true, false).output ==
+          OcarinaExtent{1440, 810});
+    // 0.5x: the target, a bigger step up.
+    CHECK(SelectOcarinaScaledOutput({720, 405}, {1920, 1080}, false, false).output ==
+          OcarinaExtent{1920, 1080});
+    // 2x: the scene is larger than the target, so native AA at the scene's size.
+    CHECK(SelectOcarinaScaledOutput({2880, 1620}, {1920, 1080}, false, false).output ==
+          OcarinaExtent{2880, 1620});
+    // 1440p pass: 1.5x still reaches 4K (native AA there), 2x does not.
+    choice = SelectOcarinaScaledOutput({3840, 2160}, {2560, 1440}, false, true);
+    CHECK(choice.output == OcarinaExtent{3840, 2160});
+    CHECK(choice.upscale_4k);
+    choice = SelectOcarinaScaledOutput({5120, 2880}, {2560, 1440}, false, true);
+    CHECK(choice.output == OcarinaExtent{5120, 2880});
+    CHECK_FALSE(choice.upscale_4k);
+}
