@@ -3030,6 +3030,7 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
     // with the verify or, at step 4, fills ring B and pushes it. Before anything below reads
     // `maxwell3d` (it names R's view while R plays a draw).
     if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
+        OneFollowerMirrorDraw();
         OneFollowerLendDraw(is_indexed, instance_count);
         return;
     }
@@ -3368,6 +3369,7 @@ void RasterizerVulkan::DrawIndirect() {
                                        VideoCommon::GpuSplit::DelayTest::Draw);
     // One follower: indirect and list draws stay lent in this branch (their own UnlendKind bits).
     if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
+        OneFollowerMirrorDraw();
         OneFollowerDrawIndirect();
         return;
     }
@@ -3501,6 +3503,46 @@ bool RasterizerVulkan::MemStageQmd(Tegra::MemoryManager& memory, GPUVAddr addres
 // List draws and list dispatches: a copy of the list words at their place in the stream, for the
 // front to read back if it needs their values after all.
 void RasterizerVulkan::Nx2KeepListWords(u64 keep_id, GPUVAddr address, u32 count) {
+    // FRITCHII_ONEF_OP_LISTKEEP (fable_b 15.4): E's half, the buffer (its sync's commands an op
+    // packet), here; R's, the copy into the keep buffer, a render op at the same place. The
+    // front's read of the kept words is lent (Nx2ReadKeptListWords), so R has played the copy.
+    if (VideoCommon::OneFollower::ShouldLend() &&
+        VideoCommon::OneFollower::PostOpSite(static_cast<u8>(MemStage::Site::ListWords)))
+        [[unlikely]] {
+        VkBuffer handle = VK_NULL_HANDLE;
+        u32 offset = 0;
+        {
+            std::scoped_lock lock{buffer_cache.mutex};
+            const auto [buffer, buffer_offset] = mem_stage.Ref(MemStage::Site::ListWords, [&] {
+                return buffer_cache.ObtainBuffer(
+                    address, count * sizeof(u32),
+                    VideoCommon::ObtainBufferSynchronize::FullSynchronize,
+                    VideoCommon::ObtainBufferOperation::DoNothing);
+            });
+            if (buffer == nullptr) {
+                return;
+            }
+            handle = buffer->Handle();
+            offset = buffer_offset;
+        }
+        struct Op {
+            MemPlayer* player;
+            u64 keep_id;
+            VkBuffer handle;
+            u32 offset;
+            u32 count;
+        } const op{&mem_player, keep_id, handle, offset, count};
+        VideoCommon::OneFollower::SetLendSite("Nx2KeepListWords (posted)");
+        VideoCommon::OneFollower::PushOp(
+            VideoCommon::OneFollower::LentOp::Copy,
+            [](void* raw) {
+                Op a;
+                std::memcpy(&a, raw, sizeof(a));
+                a.player->KeepListWords(a.keep_id, a.handle, a.offset, a.count);
+            },
+            &op, sizeof(op));
+        return;
+    }
     ONEF_LEND(Copy, Nx2KeepListWords(keep_id, address, count))
     std::scoped_lock lock{buffer_cache.mutex};
     const auto [buffer, offset] = mem_stage.Ref(MemStage::Site::ListWords, [&] {
@@ -3515,13 +3557,13 @@ void RasterizerVulkan::Nx2KeepListWords(u64 keep_id, GPUVAddr address, u32 count
 }
 
 bool RasterizerVulkan::Nx2ReadKeptListWords(u64 keep_id, std::span<u32> words) {
-    // One follower (UNLEND's List bit): R records an unlent list draw's kept words when it plays
-    // the draw, after E went on. E reads them at its own place here: R plays every packet first,
-    // so the copy is there as a lent list draw left it (and R writes no keep meanwhile).
-    if (VideoCommon::OneFollower::ShouldLend() && onef_list_keeps_unplayed) [[unlikely]] {
-        onef_list_keeps_unplayed = false;
-        VideoCommon::OneFollower::Drain();
+    // One follower: R's player owns the keep list and its copies (UNLEND's List bit records
+    // an unlent list draw's keeps when R plays it; FRITCHII_ONEF_OP_LISTKEEP posts the copies):
+    // lent, so R has played every packet before the read.
+    if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
+        onef_list_keeps_unplayed = false; // the lend below plays everything first
     }
+    ONEF_LEND_RESULT(ReadBack, Nx2ReadKeptListWords(keep_id, words))
     return mem_player.ReadKeptListWords(keep_id, words);
 }
 
@@ -3791,7 +3833,65 @@ void RasterizerVulkan::CollectIndirectTrace() {
     }
 }
 
+void RasterizerVulkan::OneFollowerMirrorDraw() {
+    if ((VideoCommon::OneFollower::SyncMirrorOn() || VideoCommon::OneFollower::PostFenceOn()) &&
+        channel_state->maxwell3d.regs.zpass_pixel_count_enable) {
+        onef_samples_started = true;
+    }
+}
+
+bool RasterizerVulkan::OneFollowerFenceClean() {
+    // fable_b 16.3: R's fence must not enter the buffer cache. Its three ways in: the commit's
+    // buffer half (nothing to commit: E's own test, R skips the half), the query sync (none owed:
+    // the mirror's test), the closing gather (E runs it before posting, R skips it).
+    return VideoCommon::OneFollower::PostFenceOn() && !onef_sync_owed &&
+           !buffer_cache.MayHaveUncommittedFlushes() && !buffer_cache.AheadDue();
+}
+
+void RasterizerVulkan::OneFollowerPostFence(u8 kind, u32 value) {
+    // The closing gather, E's half at this place (GATHER_E's path, or lent).
+    InvalidateGPUCache();
+    struct Op {
+        RasterizerVulkan* self;
+        u32 value;
+        u8 kind;
+    } const op{this, value, kind};
+    VideoCommon::OneFollower::SetLendSite(kind == 0   ? "SignalSyncPoint (posted)"
+                                          : kind == 1 ? "SignalReference (posted)"
+                                                      : "ReleaseFences (posted)");
+    VideoCommon::OneFollower::PushOp(
+        VideoCommon::OneFollower::LentOp::Fence,
+        [](void* raw) {
+            Op a;
+            std::memcpy(&a, raw, sizeof(a));
+            auto& self = *a.self;
+            self.onef_fence_posted = true;
+            self.fence_manager.skip_buffer_half = true;
+            SCOPE_EXIT {
+                self.onef_fence_posted = false;
+                self.fence_manager.skip_buffer_half = false;
+            };
+            switch (a.kind) {
+            case 0:
+                self.fence_manager.SignalSyncPoint(a.value);
+                break;
+            case 1:
+                self.fence_manager.SignalReference();
+                break;
+            default:
+                // Immediate fences: the callback runs inside SignalFence, so the wait in it ends
+                // at once (PostFenceOn excludes delayed fences, whose wait is the fence thread's).
+                self.fence_manager.WaitPendingFences(true);
+                break;
+            }
+        },
+        &op, sizeof(op));
+}
+
 void RasterizerVulkan::DrawTexture() {
+    if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
+        OneFollowerMirrorDraw();
+    }
     ONEF_LEND(Draw, DrawTexture())
 
     SCOPE_EXIT {
@@ -3930,6 +4030,9 @@ bool RasterizerVulkan::ClearVolumeSlices(const Framebuffer* framebuffer, u32 fir
 }
 
 void RasterizerVulkan::Clear(u32 layer_count) {
+    if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
+        OneFollowerMirrorDraw(); // a superset: R starts the count only for a clear it cannot defer
+    }
     // FRITCHII_ONEF_OP_CLEAR (fable_b 13.4 group 3): E has decided ShouldExecute (DrawManager)
     // and runs the clear's one E half, FlushCaching, here; the rest is R's (render targets and
     // clear values are view registers, the texture cache and scheduler R's): a render op, its
@@ -4600,6 +4703,9 @@ void RasterizerVulkan::DispatchCompute() {
 void RasterizerVulkan::ResetCounter(VideoCommon::QueryType type) {
     if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
         namespace OneF = VideoCommon::OneFollower;
+        if (type == VideoCommon::QueryType::ZPassPixelCount64) {
+            onef_samples_started = false; // the mirror (fable_b 16.2)
+        }
         OneF::SetQueryKind(OneF::QueryKind::Reset);
         if (OneF::QueryOps()) {
             // fable_b 11.1 item 1(b): a render op, E not parked (nothing comes back).
@@ -4637,6 +4743,10 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                              VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) {
     if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
         namespace OneF = VideoCommon::OneFollower;
+        // FRITCHII_ONEF_POST_FENCE: a sync may be owed from here to the next lent fence.
+        if (type != VideoCommon::QueryType::ZPassPixelCount64 || onef_samples_started) {
+            onef_sync_owed = true;
+        }
         if (True(flags & VideoCommon::QueryPropertiesFlags::IsAFence)) {
             OneF::SetQueryKind(OneF::QueryKind::FenceReport); // lent (fable_b item 4)
         } else if (type == VideoCommon::QueryType::Payload) {
@@ -4683,13 +4793,23 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                     VideoCommon::QueryPropertiesFlags flags;
                     u32 payload;
                     u32 subreport;
-                } const op{this, gpu_addr, device, type, flags, payload, subreport};
+                    u8 mirror; ///< 0 off, 1 E's bit clear, 2 set (FRITCHII_ONEF_SYNC_MIRROR)
+                } const op{this,  gpu_addr, device, type, flags, payload, subreport,
+                           static_cast<u8>(
+                               (OneF::SyncMirrorOn() || OneF::PostFenceOn()) &&
+                                       type == VideoCommon::QueryType::ZPassPixelCount64
+                                   ? (onef_samples_started ? 2 : 1)
+                                   : 0)};
                 OneF::SetLendSite("Query (posted)");
                 OneF::PushOp(
                     OneF::LentOp::Query,
                     [](void* raw) {
                         Op a;
                         std::memcpy(&a, raw, sizeof(a));
+                        if (a.mirror != 0) {
+                            VideoCommon::OneFollower::CountSyncMirror(
+                                a.mirror == 2, a.self->query_cache.ReportMakesPendingSync(a.type));
+                        }
                         a.self->query_cache.CounterReportAt(a.gpu_addr, a.device, a.type, a.flags,
                                                             a.payload, a.subreport);
                     },
@@ -4698,7 +4818,18 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
             }
         }
     }
+    if (VideoCommon::OneFollower::ShouldLend() &&
+        (VideoCommon::OneFollower::SyncMirrorOn() || VideoCommon::OneFollower::PostFenceOn()) &&
+        type == VideoCommon::QueryType::ZPassPixelCount64) [[unlikely]] {
+        onef_mirror_lent_valid = true; // read by R in the lent call (E parked)
+        onef_mirror_lent_bit = onef_samples_started;
+    }
     ONEF_LEND(Query, Query(gpu_addr, type, flags, payload, subreport))
+    if (onef_mirror_lent_valid && VideoCommon::OneFollower::RenderInLentCall()) [[unlikely]] {
+        onef_mirror_lent_valid = false;
+        VideoCommon::OneFollower::CountSyncMirror(onef_mirror_lent_bit,
+                                                  query_cache.ReportMakesPendingSync(type));
+    }
     query_cache.CounterReport(gpu_addr, type, flags, payload, subreport);
 }
 
@@ -4761,8 +4892,43 @@ void RasterizerVulkan::FlushGpuWrittenCommandListPages(std::span<const DAddr> pa
     buffer_cache.Nx2FlushListPages(pages);
 }
 
+bool RasterizerVulkan::OneFollowerFlushClean(DAddr addr, u64 size,
+                                             VideoCommon::CacheType which) {
+    using VideoCommon::CacheType;
+    if (!VideoCommon::OneFollower::FlushOnEngine()) {
+        return false;
+    }
+    // The buffer half: E marks the GPU-written pages when it fills the writes (before the
+    // packets that record them), so a page never marked has nothing to download, at R's place
+    // or anywhere. The gather before a download only orders the guest's writes ahead of it.
+    if (True(which & CacheType::BufferCache) && Tegra::Nx2MayBeGpuWritten(addr, size)) {
+        return false;
+    }
+    // The query half: R marks its filter at a lent report (E parked), E's own filter takes the
+    // reports it posted.
+    if (True(which & CacheType::QueryCache) &&
+        (query_cache.page_filter.Any(addr, size) ||
+         (onef_report_pages != nullptr && onef_report_pages->Any(addr, size)))) {
+        return false;
+    }
+    // The texture half: R registers images (and marks the filter) when it plays the draws that
+    // render to them, so a miss counts only with R caught up (nothing of E's unplayed, R not
+    // marking now).
+    if (True(which & CacheType::TextureCache) &&
+        (VideoCommon::OneFollower::Behind() != 0 || texture_cache.page_filter.Any(addr, size))) {
+        return false;
+    }
+    return true;
+}
+
 void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
     if (addr == 0 || size == 0) {
+        return;
+    }
+    // FRITCHII_ONEF_FLUSH_E (fable_b 17.3 (a)): a flush E tests clean does nothing at R's place:
+    // not lent at all.
+    if (VideoCommon::OneFollower::ShouldLend() && OneFollowerFlushClean(addr, size, which))
+        [[unlikely]] {
         return;
     }
     ONEF_LEND(ReadBack, FlushRegion(addr, size, which))
@@ -4860,6 +5026,11 @@ void RasterizerVulkan::FinishRead(DAddr addr, u64 size) {
 }
 
 bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
+    // FRITCHII_ONEF_FLUSH_E: clean as FlushRegion tests it: nothing to flush.
+    if (VideoCommon::OneFollower::ShouldLend() && OneFollowerFlushClean(addr, size, which))
+        [[unlikely]] {
+        return false;
+    }
     ONEF_LEND_RESULT(ReadBack, MustFlushRegion(addr, size, which))
     if ((True(which & VideoCommon::CacheType::BufferCache)) && MayBeGpuModified(addr, size)) {
         bool modified = false;
@@ -6047,6 +6218,9 @@ bool RasterizerVulkan::OneFollowerRunaheadOff(const char* where) {
 }
 
 void RasterizerVulkan::InvalidateGPUCache() {
+    if (onef_fence_posted && VideoCommon::OneFollower::OnRenderThread()) [[unlikely]] {
+        return; // a posted fence's closing gather: E ran it at the fence's place
+    }
     // FRITCHII_ONEF_GATHER_E: the take runs on E (GPU::InvalidateGPUCache, as on the split's back
     // without one follower); OnCacheInvalidations then applies or lends. Runahead keeps the
     // whole gather lent (its boundary state).
@@ -6136,6 +6310,7 @@ void RasterizerVulkan::OneFollowerCountFence() {
 void RasterizerVulkan::SignalFence(std::function<void()>&& func) {
     if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
         OneFollowerCountFence();
+        onef_sync_owed = false; // lent (its callback is the caller's): R syncs, E parked
     }
     ONEF_LEND(Fence, SignalFence(std::move(func)))
     fence_manager.SignalFence(std::move(func));
@@ -6164,6 +6339,11 @@ void RasterizerVulkan::SyncOperationKeepStamp(std::function<void()>&& func) {
 void RasterizerVulkan::SignalSyncPoint(u32 value) {
     if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
         OneFollowerCountFence();
+        if (OneFollowerFenceClean()) {
+            OneFollowerPostFence(0, value);
+            return;
+        }
+        onef_sync_owed = false; // lent: R syncs what is owed, E parked
     }
     ONEF_LEND(Fence, SignalSyncPoint(value))
     fence_manager.SignalSyncPoint(value);
@@ -6172,12 +6352,24 @@ void RasterizerVulkan::SignalSyncPoint(u32 value) {
 void RasterizerVulkan::SignalReference() {
     if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
         OneFollowerCountFence();
+        if (OneFollowerFenceClean()) {
+            OneFollowerPostFence(1, 0);
+            return;
+        }
+        onef_sync_owed = false;
     }
     ONEF_LEND(Fence, SignalReference())
     fence_manager.SignalReference();
 }
 
 void RasterizerVulkan::ReleaseFences(bool force) {
+    if (VideoCommon::OneFollower::ShouldLend() && force) [[unlikely]] {
+        if (OneFollowerFenceClean()) {
+            OneFollowerPostFence(2, 0);
+            return;
+        }
+        onef_sync_owed = false; // a forced release makes a fence: R syncs there
+    }
     ONEF_LEND(Fence, ReleaseFences(force))
     fence_manager.WaitPendingFences(force);
 }
@@ -6240,6 +6432,9 @@ void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
 }
 
 void RasterizerVulkan::WaitForIdle() {
+    if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
+        onef_sync_owed = false; // lent: NotifyWFI syncs what is owed, E parked
+    }
     ONEF_LEND(ReadBack, WaitForIdle())
     // Everything but wait pixel operations. This intentionally includes FRAGMENT_SHADER_BIT because
     // fragment shaders can still write storage buffers.
@@ -7808,14 +8003,28 @@ AccelerateDMA::AccelerateDMA(BufferCache& buffer_cache_, TextureCache& texture_c
     : buffer_cache{buffer_cache_}, texture_cache{texture_cache_}, scheduler{scheduler_} {}
 
 bool AccelerateDMA::BufferClear(GPUVAddr src_address, u64 amount, u32 value) {
-    ONEF_LEND_RESULT(Copy, BufferClear(src_address, amount, value))
+    // FRITCHII_ONEF_OP_DMA: the buffer cache is E's: E runs it, its commands an op packet (the
+    // Dma site posted), the result E's own.
+    const bool onef_on_engine =
+        VideoCommon::OneFollower::ShouldLend() &&
+        VideoCommon::OneFollower::PostOpSite(static_cast<u8>(MemStage::Site::Dma));
+    if (!onef_on_engine) {
+        ONEF_LEND_RESULT(Copy, BufferClear(src_address, amount, value))
+    }
     std::scoped_lock lock{buffer_cache.mutex};
     MemStage::FillPlay seam{buffer_cache.runtime.Seam(), MemStage::Site::Dma};
     return buffer_cache.DMAClear(src_address, amount, value);
 }
 
 bool AccelerateDMA::BufferCopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount) {
-    ONEF_LEND_RESULT(Copy, BufferCopy(src_address, dest_address, amount))
+    // FRITCHII_ONEF_OP_DMA: as BufferClear; the submit after list page copies is R's (a render
+    // op at the same place).
+    const bool onef_on_engine =
+        VideoCommon::OneFollower::ShouldLend() &&
+        VideoCommon::OneFollower::PostOpSite(static_cast<u8>(MemStage::Site::Dma));
+    if (!onef_on_engine) {
+        ONEF_LEND_RESULT(Copy, BufferCopy(src_address, dest_address, amount))
+    }
     std::scoped_lock lock{buffer_cache.mutex};
     MemStage& seam = buffer_cache.runtime.Seam();
     bool copied;
@@ -7828,7 +8037,20 @@ bool AccelerateDMA::BufferCopy(GPUVAddr src_address, GPUVAddr dest_address, u64 
     }
     seam.Play();
     if (list_copied) {
-        scheduler.Flush();
+        if (onef_on_engine) {
+            Scheduler* const target = &scheduler;
+            VideoCommon::OneFollower::SetLendSite("BufferCopy's flush (posted)");
+            VideoCommon::OneFollower::PushOp(
+                VideoCommon::OneFollower::LentOp::Copy,
+                [](void* raw) {
+                    Scheduler* s;
+                    std::memcpy(&s, raw, sizeof(s));
+                    s->Flush();
+                },
+                &target, sizeof(target));
+        } else {
+            scheduler.Flush();
+        }
     }
     buffer_cache.Nx2CollectListCopies(false);
     return copied;

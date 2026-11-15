@@ -515,6 +515,21 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_ONEF_OP_INVAL") {
         return &g_onef_op_inval;
     }
+    if (name == "FRITCHII_ONEF_OP_LISTKEEP") {
+        return &g_onef_op_listkeep;
+    }
+    if (name == "FRITCHII_ONEF_OP_DMA") {
+        return &g_onef_op_dma;
+    }
+    if (name == "FRITCHII_ONEF_FLUSH_E") {
+        return &g_onef_flush_e;
+    }
+    if (name == "FRITCHII_ONEF_SYNC_MIRROR") {
+        return &g_onef_sync_mirror;
+    }
+    if (name == "FRITCHII_ONEF_POST_FENCE") {
+        return &g_onef_post_fence;
+    }
     return nullptr;
 }
 

@@ -120,6 +120,8 @@ public:
     /// fence or flush (a streamer exists), not inside CounterReport (the payload write a type
     /// without a streamer becomes).
     [[nodiscard]] bool ReportLandsLater(QueryType type) const;
+    /// One follower (fable_b 16.2): whether a report of `type` written now makes a pending sync.
+    [[nodiscard]] bool ReportMakesPendingSync(QueryType type) const;
 
     /// CounterReport with `addr` already translated (FRITCHII_ONEF_QUERY_OPS: E translates at
     /// its stream place, R writes the report).

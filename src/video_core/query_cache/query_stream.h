@@ -72,6 +72,12 @@ public:
     virtual size_t WriteCounter(VAddr address, bool has_timestamp, u32 value,
                                 std::optional<u32> subreport = std::nullopt) = 0;
 
+    /// One follower (fable_b 16.2's mirror check): whether a report written now would make a
+    /// pending sync (the samples streamer: a query is running since the last reset).
+    virtual bool ReportMakesPendingSync() const {
+        return false;
+    }
+
     virtual bool HasUnsyncedQueries() const {
         return false;
     }

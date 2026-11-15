@@ -1412,6 +1412,37 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   commands E's own invalidation work records (INVAL_E's draw invalidation, GATHER_E's gathers:
   the Invalidation site) are posted as ring B op packets, as FRITCHII_ONEF_OP_INLINE does for
   inline uploads, instead of a lent seam play (which E made holding the buffer cache's lock).
+- FRITCHII_ONEF_OP_LISTKEEP (live, default 0; fable_b_one_follower 15.4, step 4): 1 = kept
+  list words (Nx2KeepListWords) are posted: E obtains the buffer (its sync's commands an op
+  packet, the ListWords site), R records the copy into the keep buffer as a render op. The
+  front's read of kept words (Nx2ReadKeptListWords) is lent now, so R has played the copies
+  before it (it ran on E before, reading R's player).
+- FRITCHII_ONEF_OP_DMA (live, default 0; fable_b_one_follower 13.4, step 4): 1 = the DMA
+  engine's buffer-to-buffer copies and clears (AccelerateDMA BufferCopy, BufferClear) run on E
+  (the buffer cache is E's, the result E's own), their commands posted as op packets (the Dma
+  site); the submit after list page copies is a render op. Copies with an image stay lent.
+- FRITCHII_ONEF_FLUSH_E (live, default 0; fable_b_one_follower 17.3 (a); step 4): 1 = a
+  FlushRegion or MustFlushRegion E tests clean is answered on E, not lent: no page of the range
+  GPU-written (E marks those when it fills the writes), none a query's or a posted report's,
+  and for the texture half none an image was ever on with R caught up (R registers the images
+  of the draws it plays). Anything else is lent as before.
+- FRITCHII_ONEF_SYNC_MIRROR (live, default 0; fable_b_one_follower 16.2, dry): 1 = E keeps a
+  mirror of R's samples counter "started" bit (set by every draw, indirect draw, draw texture
+  or clear E issues with the count enable register on; cleared by a samples counter reset) and
+  R compares it with its streamer at every samples report, posted or lent: must-be-0 "sync
+  mirror", and a 10 s line with the reports compared and the two kinds of mismatch. It prices
+  the by-value query sync of posted fences: the sync needs this mirror exact. Clears count as a
+  superset (R starts the count only for a clear it cannot defer).
+- FRITCHII_ONEF_POST_FENCE (live, default 0; fable_b_one_follower 16.3; step 4, immediate
+  fences only): 1 = a sync point, a reference or a forced fence release is posted when E finds it
+  clean: no query sync owed (no samples report since the last lent fence or wait for idle while
+  E's mirror had the counter started, and no report of another kind), and nothing for the
+  buffer cache to commit. E runs the fence's closing gather itself first; R runs the fence with
+  its buffer half and closing gather skipped, so it never enters the buffer cache. Fences with
+  a caller's callback (SignalFence) stay lent. A "sync mirror" mismatch with R's counter
+  started and E's mirror not stops it for the session (the test reads the mirror as a
+  superset). With immediate fences the forced release's wait ends inside its own SignalFence
+  (the callback runs there), so posting it changes no landing time.
 - FRITCHII_ONEF_OP_CLEAR (live, default 0; fable_b_one_follower 13.4 group 3; step 4, view
   tracked): 1 = clears are render ops. E has decided the render enable (DrawManager tests
   ShouldExecute) and runs the clear's FlushCaching; R plays Clear from its view (every clear

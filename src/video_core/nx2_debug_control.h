@@ -263,6 +263,17 @@ inline std::atomic<int> g_onef_op_clear{-1};
 inline std::atomic<int> g_onef_trace{-1};
 /// FRITCHII_ONEF_OP_INVAL (live, default 0): fable_b 13.4, the invalidation site's buffer commands posted as op packets.
 inline std::atomic<int> g_onef_op_inval{-1};
+/// FRITCHII_ONEF_OP_LISTKEEP (live, default 0): fable_b 15.4, kept list words posted (E's buffer side, R's copy as a render op).
+inline std::atomic<int> g_onef_op_listkeep{-1};
+/// FRITCHII_ONEF_OP_DMA (live, default 0): fable_b 13.4, buffer-to-buffer DMA copies and clears on E, posted.
+inline std::atomic<int> g_onef_op_dma{-1};
+/// FRITCHII_ONEF_FLUSH_E (live, default 0): fable_b 17.3 (a), a flush E tests clean is not lent.
+inline std::atomic<int> g_onef_flush_e{-1};
+/// FRITCHII_ONEF_SYNC_MIRROR (live, default 0): fable_b 16.2's samples counter mirror, dry.
+inline std::atomic<int> g_onef_sync_mirror{-1};
+/// FRITCHII_ONEF_POST_FENCE (live, default 0): fable_b 16.3, clean sync points, references and
+/// forced fence releases posted.
+inline std::atomic<int> g_onef_post_fence{-1};
 /// EDEN_NX2_LIGHT_TABLE_ARRAYS: docs/fritchii/switches.md.
 [[nodiscard]] inline bool LightTableArrays() {
     static const bool on = EnvSwitch("EDEN_NX2_LIGHT_TABLE_ARRAYS") > 0;

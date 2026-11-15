@@ -211,6 +211,9 @@ enum class Check : u8 {
     /// A played draw of a kind R has no path for after all (a list draw that reads its words on
     /// the CPU, an emulated mesh draw); not recorded, step 4 stops.
     PlayedNoPath,
+    /// FRITCHII_ONEF_SYNC_MIRROR (dry): at a samples report, E's mirror of R's "counter
+    /// started" bit (fable_b 16.2) differs from R's streamer.
+    SyncMirror,
     Count,
 };
 
@@ -221,7 +224,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Check::Count)> chec
     "build draw params", "build condition", "render packet missing", "drop not plain",
     "facts stale", "played lookup miss", "texture read ahead of R", "ring B pairing",
     "R waits for E's lock", "R needs E's buffer flush",
-    "build list draw", "played list args", "played kind without path",
+    "build list draw", "played list args", "played kind without path", "sync mirror",
 };
 
 // --- The packet (E to R) -----------------------------------------------------------------------------
@@ -570,6 +573,19 @@ void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size,
 /// FRITCHII_ONEF_OP_CLEAR (live; fable_b 13.4 group 3; step 4, the view tracked): clears as render
 /// ops R plays from its view; E runs the clear's FlushCaching first.
 [[nodiscard]] bool PostClears() noexcept;
+/// FRITCHII_ONEF_FLUSH_E (live; fable_b 17.3 (a); step 4): E answers a flush it tests clean
+/// itself instead of lending it (FlushRegion, MustFlushRegion).
+[[nodiscard]] bool FlushOnEngine() noexcept;
+/// FRITCHII_ONEF_SYNC_MIRROR (live; fable_b 16.2, dry): E keeps a mirror of R's samples counter
+/// "started" bit and R compares it at every samples report ("sync mirror", must be 0).
+[[nodiscard]] bool SyncMirrorOn() noexcept;
+/// FRITCHII_ONEF_POST_FENCE (live; fable_b 16.3; step 4; immediate fences only): a sync point, a
+/// reference or a forced fence release E finds clean (no query sync owed, no buffer flush to
+/// commit) is posted; E runs the closing gather itself first. Stopped for the session by a "sync
+/// mirror" mismatch of the kind that makes E's test wrong (R started, E not).
+[[nodiscard]] bool PostFenceOn() noexcept;
+/// R, at a samples report: E's bit against R's streamer.
+void CountSyncMirror(bool engine_bit, bool render_bit) noexcept;
 /// E: the view is tracked and seeded at R (a posted op reads it).
 [[nodiscard]] bool ViewReady() noexcept;
 

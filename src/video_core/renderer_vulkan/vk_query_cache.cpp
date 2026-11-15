@@ -450,6 +450,10 @@ public:
         return !pending_flush_queries.empty();
     }
 
+    bool ReportMakesPendingSync() const override {
+        return current_query != nullptr; // WriteCounter's test (after its PauseCounter)
+    }
+
     void PushUnsyncedQueries() override {
         PauseCounter();
         current_bank->Close();
