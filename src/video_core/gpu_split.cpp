@@ -3056,6 +3056,89 @@ void CbBump(std::atomic<u64>& counter, u64 amount = 1) {
 }
 } // Anonymous namespace
 
+size_t GpuSplit::PlainEntrySize(u64 head) {
+    switch (static_cast<Kind>(head & 0xf)) {
+    case Kind::Method:
+        return (head & HasSegment) != 0 ? 2 : 1;
+    case Kind::Multi: {
+        const size_t data = (head & HasSegment) != 0 ? 3 : 2;
+        return data + (static_cast<u32>(head >> 32) + 1) / 2;
+    }
+    case Kind::Pairs:
+        return 1 + static_cast<size_t>(head >> 32);
+    case Kind::Call:
+        return 2 + static_cast<size_t>((head >> 8) & 0xffffff);
+    default:
+        return 0;
+    }
+}
+
+size_t GpuSplit::ExecuteOnEngine(Tegra::Engines::EngineInterface* engine, const u64* entry) {
+    // Execute's cases for an engine other than Maxwell3D (no constant buffer gather), with
+    // `engine` in place of back_engine.
+    const u64 head = entry[0];
+    switch (static_cast<Kind>(head & 0xf)) {
+    case Kind::Method: {
+        const u32 method = static_cast<u32>((head >> 8) & 0xffff);
+        const u32 argument = static_cast<u32>(head >> 32);
+        if (Nx2FastDrawCount::g_on && !engine->counts_fast_draw_breaks) [[unlikely]] {
+            Nx2FastDrawCount::Break(Nx2FastDrawCount::Reason::OtherEngine);
+        }
+        if ((head & Direct) != 0) {
+            Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
+            engine->ConsumeSink(*system);
+            engine->CallMethod(*system, method, argument, true);
+        } else if ((head & Sink) != 0) {
+            engine->method_sink.emplace_back(
+                method | Tegra::Engines::EngineInterface::SplitPlainTag, argument);
+        } else if (!engine->execution_mask[method]) {
+            engine->method_sink.emplace_back(method, argument);
+        } else {
+            Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
+            engine->ConsumeSink(*system);
+            if ((head & HasSegment) != 0) {
+                engine->current_dma_segment = entry[1];
+            }
+            engine->CallMethod(*system, method, argument, (head & IsLast) != 0);
+        }
+        return (head & HasSegment) != 0 ? 2 : 1;
+    }
+    case Kind::Multi: {
+        const u32 method = static_cast<u32>((head >> 8) & 0xffff);
+        const u32 amount = static_cast<u32>(head >> 32);
+        const size_t data = (head & HasSegment) != 0 ? 3 : 2;
+        if (Nx2FastDrawCount::g_on && !engine->counts_fast_draw_breaks) [[unlikely]] {
+            Nx2FastDrawCount::Break(Nx2FastDrawCount::Reason::OtherEngine);
+        }
+        Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
+        engine->ConsumeSink(*system);
+        if ((head & HasSegment) != 0) {
+            engine->current_dma_segment = entry[2];
+        }
+        if ((head & Direct) != 0) {
+            engine->CallMacroWords(*system, method, reinterpret_cast<const u32*>(entry + data),
+                                   amount);
+        } else {
+            engine->CallMultiMethod(*system, method, reinterpret_cast<const u32*>(entry + data),
+                                    amount, static_cast<u32>(entry[1]));
+        }
+        return data + (amount + 1) / 2;
+    }
+    case Kind::Pairs: {
+        const u32 count = static_cast<u32>(head >> 32);
+        if (Nx2FastDrawCount::g_on && !engine->counts_fast_draw_breaks) [[unlikely]] {
+            Nx2FastDrawCount::Break(Nx2FastDrawCount::Reason::OtherEngine);
+        }
+        Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
+        engine->ConsumeSink(*system);
+        engine->ApplyPairs(*system, entry + 1, count);
+        return 1 + size_t{count};
+    }
+    default:
+        return PlainEntrySize(head);
+    }
+}
+
 void GpuSplit::ExecuteCbWords(const u64* words, u32 count, const u64* verify_address) {
     // Must be 0: a word that is not what CbWord writes (a Method word for a constant buffer data
     // register, without a segment or the sink tag), or a block longer than CbWord makes one.
@@ -3684,7 +3767,69 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 // order through Maxwell3D's CbWrite hook, which notes the offset for E2's view, or
                 // a join there). Every other E2 entry is a join: E2 drained, E1 runs it itself.
                 const bool cb_on_e1 = info.cb_entry && info.sink_first && ESplit::CbEntryOnE1();
-                const ESplit::JoinScope join{ESplit::Join::Entry, !cb_on_e1};
+                const u64 head = entry[0];
+                const Kind kind = static_cast<Kind>(head & 0xf);
+                const ESplit::EngineKind engine_kind = ESplit::KindOf(back_engine);
+                // FRITCHII_ESPLIT_ASYNC_KINDS bit 0: a cache-tagged call goes to E2 whole (its
+                // payload stays in ring A until `consumed` passes it, stored at E2's place).
+                if (!cb_on_e1 && kind == Kind::Call && StageTagOf(head) == StageTag::Cache &&
+                    ESplit::QueueKind(ESplit::KindCacheCalls)) {
+                    const size_t size = PlainEntrySize(head);
+                    struct CallJob {
+                        GpuSplit* self;
+                        const u64* entry;
+                        size_t size;
+                    } const job{this, entry, size};
+                    std::memcpy(ESplit::BeginAsync(ESplit::Hand::Async), &job, sizeof(job));
+                    ESplit::PostAsync([](void* raw) {
+                        CallJob j;
+                        std::memcpy(&j, raw, sizeof(j));
+                        (void)j.self->Execute(j.entry, j.size);
+                    });
+                    return size;
+                }
+                // Bit 2: a compute engine entry goes to E2 whole, the engine by value.
+                if (!cb_on_e1 && engine_kind == ESplit::EngineKind::Compute &&
+                    (kind == Kind::Method || kind == Kind::Multi || kind == Kind::Pairs) &&
+                    ESplit::QueueKind(ESplit::KindCompute)) {
+                    const size_t size = PlainEntrySize(head);
+                    struct EngineJob {
+                        GpuSplit* self;
+                        Tegra::Engines::EngineInterface* engine;
+                        const u64* entry;
+                    } const job{this, back_engine, entry};
+                    std::memcpy(ESplit::BeginAsync(ESplit::Hand::Async), &job, sizeof(job));
+                    ESplit::PostAsync([](void* raw) {
+                        EngineJob j;
+                        std::memcpy(&j, raw, sizeof(j));
+                        (void)j.self->ExecuteOnEngine(j.engine, j.entry);
+                    });
+                    return size;
+                }
+                // Bit 1: a 3D method that ends in one rasterizer call runs here; the call goes to
+                // E2 by value (Maxwell3D's QueueRasterOp at the call).
+                using Tegra::Engines::Maxwell3D;
+                const u32 method = static_cast<u32>((head >> 8) & 0xffff);
+                const bool raster_op =
+                    kind == Kind::Method && engine_kind == ESplit::EngineKind::Maxwell3D &&
+                    ESplit::QueueKind(ESplit::KindRasterOps) &&
+                    (method == MAXWELL3D_REG_INDEX(wait_for_idle) ||
+                     method == MAXWELL3D_REG_INDEX(fragment_barrier) ||
+                     method == MAXWELL3D_REG_INDEX(invalidate_texture_data_cache) ||
+                     method == MAXWELL3D_REG_INDEX(tiled_cache_barrier) ||
+                     method == MAXWELL3D_REG_INDEX(report_semaphore.query) ||
+                     method == MAXWELL3D_REG_INDEX(clear_report_value) ||
+                     method == MAXWELL3D_REG_INDEX(sync_info));
+                const bool join_it = !cb_on_e1 && !raster_op;
+                if (join_it) {
+                    ESplit::NoteJoinEntry(static_cast<u32>(kind), static_cast<u32>(engine_kind),
+                                          kind == Kind::Call ? static_cast<u32>(StageTagOf(head))
+                                                             : method,
+                                          kind == Kind::Call
+                                              ? reinterpret_cast<const void*>(entry[1])
+                                              : nullptr);
+                }
+                const ESplit::JoinScope join{ESplit::Join::Entry, join_it};
                 return Execute(entry, words);
             }
             if (info.cls == ESplit::Class::E2) {
@@ -3719,6 +3864,16 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                     },
                     &work);
                 return work.size;
+            }
+            if (info.cls == ESplit::Class::Join && ESplit::g_async) {
+                // The queued mode's join entries by kind (the 10 s line's top 8).
+                const u64 head = entry[0];
+                const Kind kind = static_cast<Kind>(head & 0xf);
+                ESplit::NoteJoinEntry(
+                    static_cast<u32>(kind), static_cast<u32>(ESplit::KindOf(back_engine)),
+                    kind == Kind::Call ? static_cast<u32>(StageTagOf(head))
+                                       : static_cast<u32>((head >> 8) & 0xffff),
+                    kind == Kind::Call ? reinterpret_cast<const void*>(entry[1]) : nullptr);
             }
             const ESplit::JoinScope join{ESplit::Join::Entry, info.cls == ESplit::Class::Join};
             return Execute(entry, words);

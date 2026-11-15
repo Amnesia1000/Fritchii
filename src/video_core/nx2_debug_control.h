@@ -415,6 +415,10 @@ inline std::atomic<int> g_esplit{-1};
 inline std::atomic<int> g_esplit_depth{-1};
 /// FRITCHII_ESPLIT_PIN (boot, default 0): where E1 and E2 run (fritchii_e_split_thread.h, S3).
 inline std::atomic<int> g_esplit_pin{-1};
+/// FRITCHII_ESPLIT_ASYNC_KINDS (live, default 7): the E2 entries the queued mode queues instead
+/// of joining (fritchii_e_split_thread.h): bit 0 memory stage cache calls, bit 1 the 3D methods
+/// that end in one rasterizer call, bit 2 compute engine entries.
+inline std::atomic<int> g_esplit_async_kinds{-1};
 /// FRITCHII_ESPLIT_CB_ASYNC (live, default 0; with DEPTH > 0): 1 = constant buffer words' memory
 /// half queued for E2 without a wait (fritchii_e_split_thread.h, S4).
 inline std::atomic<int> g_esplit_cb_async{-1};
