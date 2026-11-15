@@ -63,9 +63,19 @@ enum class DryKind : u8 {
 void DryNotePass(u64 device, DryKind kind) noexcept;
 /// Any thread, at a GPU write of a semaphore word (Nx2SemaphoreWaiters::OnWrite).
 void DryNoteRun(u64 device) noexcept;
+/// FRITCHII_ONEF_SEM_E on (E keeps it current): semaphore writes run on E; the front's lagged
+/// check waits for E's position on a word whose newest release is a payload one; every write
+/// on E or R is checked against the word's last ("semaphore order", must be 0).
+inline std::atomic<bool> g_sem_e{};
+/// E or R, at a semaphore write: its place against the word's last write's.
+void NoteSemaphoreOrder(u64 device) noexcept;
 inline void NoteSemaphoreWrite(u64 device) noexcept {
     if (g_dry_release.load(std::memory_order_relaxed)) [[unlikely]] {
         DryNoteRun(device);
+    }
+    if (g_sem_e.load(std::memory_order_relaxed) && (Detail::t_engine || Detail::t_render))
+        [[unlikely]] {
+        NoteSemaphoreOrder(device);
     }
 }
 /// The front: the time it was stalled so far (pending sleeps, lagged check waits), ns.

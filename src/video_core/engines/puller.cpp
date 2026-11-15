@@ -1926,9 +1926,20 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
             stats.lagged_checks += repeat ? 0 : 1;
             split.Publish();
             const auto wait_begin = std::chrono::steady_clock::now();
+            // FRITCHII_ONEF_SEM_E (fable_b 19.4): payload releases are written on E (or lent,
+            // E parked until R ran them): a word whose newest release is one waits for E's
+            // position.
+            VideoCommon::DrainSite lagged_site = VideoCommon::DrainSite::LaggedCheck;
+            if (VideoCommon::OneFollower::g_sem_e.load(std::memory_order_relaxed)) [[unlikely]] {
+                if (const auto device =
+                        dma_pusher.memory_manager.GpuToCpuAddress(pending_acquire->address);
+                    device && split.RecordedReleaseKind(*device) !=
+                                  VideoCommon::GpuSplit::ReleaseKind::Other) {
+                    lagged_site = VideoCommon::DrainSite::LaggedCheckEngine;
+                }
+            }
             const VideoCommon::OneFollower::DryStallScope dry_stall;
-            if (split.WaitUntil(pending_acquire->lagged_target,
-                                VideoCommon::DrainSite::LaggedCheck)) {
+            if (split.WaitUntil(pending_acquire->lagged_target, lagged_site)) {
                 ++stats.lagged_waits;
                 stats.lagged_wait_ns += FenceWriterStats::Nanoseconds(
                     wait_begin, std::chrono::steady_clock::now());

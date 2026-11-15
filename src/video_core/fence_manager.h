@@ -102,6 +102,29 @@ public:
     /// One follower (FRITCHII_ONEF_POST_FENCE): set on R around a posted fence, whose buffer
     /// half E owns (and found empty when it posted).
     bool skip_buffer_half{};
+    /// One follower (fable_b 19.6): with skip_buffer_half, E committed the buffer half's
+    /// downloads at the fence's place (their copies in an op packet before it): this fence
+    /// carries them (made, flushed, popped at its release as today).
+    bool onef_buffer_committed{};
+
+    /// One follower (FRITCHII_ONEF_SEM_E, fable_b 20.3), E at the sync point's place, fences not
+    /// delayed: SignalSyncPoint's guest increment (false past the table, as it logs), then the
+    /// host increment its fence's callback runs at once. R then makes an empty fence.
+    bool OneFollowerSyncPointGuest(u32 value) {
+        if (value >= Tegra::Host1x::SyncpointManager::NUM_MAX_SYNCPOINTS) {
+            LOG_ERROR(HW_GPU, "Signal of syncpoint {} past the table, ignored", value);
+            return false;
+        }
+        if (Tegra::g_nx2_render_clock_wanted.load(std::memory_order_relaxed)) {
+            Tegra::Nx2NoteSyncpointSignal(
+                value, static_cast<u32>(syncpoint_manager.GetGuestSyncpointValue(value)) + 1);
+        }
+        syncpoint_manager.IncrementGuest(value);
+        return true;
+    }
+    void OneFollowerSyncPointHost(u32 value) {
+        syncpoint_manager.IncrementHost(value);
+    }
 
     void SyncOperation(std::function<void()>&& func) {
         // Not only the GPU thread queues these (query cache work runs elsewhere too), while
@@ -866,6 +889,10 @@ private:
                 flushes.committed |= BufferFlushes;
             }
             buffer_cache.RefreshUncommittedFlushesNote();
+        }
+        if (skip_buffer_half && onef_buffer_committed) [[unlikely]] {
+            flushes.should_flush = true;
+            flushes.committed |= BufferFlushes;
         }
         return flushes;
     }

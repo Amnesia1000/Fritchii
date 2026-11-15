@@ -147,6 +147,10 @@ struct Impl {
     std::array<std::atomic<u64>, 3> mirror_count{}; ///< compared, E set R not, R set E not
     std::atomic<bool> post_fence_stopped{};
     u64 lookup_checks{};
+    std::array<std::atomic<u64>, static_cast<size_t>(FenceDecision::Count)> fence_decisions{};
+    std::array<u64, static_cast<size_t>(FenceDecision::Count)> fence_decisions_logged{};
+    std::atomic<u64> sync_target_superset{};
+    u64 sync_target_superset_logged{};
     // fable_b 13.0 (E only): pages with a report a posted fence lands, by that fence's packet
     // number; and the report pages since the last fence.
     std::unordered_map<u64, u64> landing_pages;
@@ -659,6 +663,28 @@ void LogQueryKinds() {
              Posted() ? 1 : 0, seconds, rate(0), rate(1), gathers,
              gathers > 0 ? rate(3) / gathers : 0.0);
     g.posting_logged = posting;
+    {
+        static constexpr std::array<const char*, static_cast<size_t>(FenceDecision::Count)>
+            names{"posted",           "posted with E's buffer commit", "lent: POST_FENCE off",
+                  "lent: delayed",    "lent: stopped",                 "lent: sync owed",
+                  "lent: marks ahead due"};
+        std::string text;
+        for (size_t i = 0; i < names.size(); ++i) {
+            const u64 count = g.fence_decisions[i].load(std::memory_order_relaxed);
+            text += fmt::format("{}{} {:.0f}/s", i == 0 ? "" : ", ", names[i],
+                                static_cast<double>(count - g.fence_decisions_logged[i]) /
+                                    seconds);
+            g.fence_decisions_logged[i] = count;
+        }
+        const u64 superset = g.sync_target_superset.load(std::memory_order_relaxed);
+        LOG_INFO(HW_GPU,
+                 "One follower fence decisions (POST_FENCE={}, SEM_E={}) {:.0f} s: {}; samples "
+                 "sync targets R did not need, E's mirror ahead {:.1f}/s",
+                 PostFenceOn() ? 1 : 0, g_sem_e.load(std::memory_order_relaxed) ? 1 : 0, seconds,
+                 text,
+                 static_cast<double>(superset - g.sync_target_superset_logged) / seconds);
+        g.sync_target_superset_logged = superset;
+    }
     if (SyncMirrorOn()) {
         std::array<double, 3> rates{};
         for (size_t i = 0; i < rates.size(); ++i) {
@@ -1719,6 +1745,67 @@ void DryNoteResume(u64 device, u64 since_ns, u64 stall_at_since) noexcept {
     w = {};
     w.since_ns = now;
     w.last_ns = last;
+}
+
+bool SemOnE() noexcept {
+    const bool on = PostFenceOn() && VideoCore::Nx2Debug::SwitchValue(
+                                         VideoCore::Nx2Debug::g_onef_sem_e,
+                                         "FRITCHII_ONEF_SEM_E") != 0;
+    if (g_sem_e.load(std::memory_order_relaxed) != on) {
+        g_sem_e.store(on, std::memory_order_relaxed);
+    }
+    return on;
+}
+
+void CountFenceDecision(FenceDecision decision) noexcept {
+    g.fence_decisions[static_cast<size_t>(decision)].fetch_add(1, std::memory_order_relaxed);
+}
+
+FenceDecision PostFenceRefusal() noexcept {
+    if (g.post_fence_stopped.load(std::memory_order_relaxed)) {
+        return FenceDecision::Stopped;
+    }
+    if (VideoCore::Nx2Debug::DelayedFences()) {
+        return FenceDecision::Delayed;
+    }
+    return FenceDecision::Off;
+}
+
+void CountSyncTargetSuperset() noexcept {
+    g.sync_target_superset.fetch_add(1, std::memory_order_relaxed);
+}
+
+namespace {
+/// fable_b 19.6's "semaphore order": the last write's place per word (a direct-mapped table; a
+/// collision forgets the older word).
+struct SemOrderSlot {
+    std::atomic<u64> device{~u64{0}};
+    std::atomic<u64> place{};
+};
+std::array<SemOrderSlot, 4096> g_sem_order{};
+} // Anonymous namespace
+
+void NoteSemaphoreOrder(u64 device) noexcept {
+    // E's place is after the packets it pushed (n, then 1); R's the packet it plays (n, then 0):
+    // a packet E pushes comes after E's writes before it and before E's writes after it. The
+    // packet numbers are compared on their low 32 bits, modulo.
+    const bool engine = Detail::t_engine;
+    const u32 number = engine ? static_cast<u32>(g.pushed) : t_play_number;
+    const u64 place = (u64{number} << 1) | (engine ? 1 : 0);
+    SemOrderSlot& slot = g_sem_order[(device >> 2) % g_sem_order.size()];
+    if (slot.device.load(std::memory_order_acquire) == device) {
+        const u64 last = slot.place.load(std::memory_order_relaxed);
+        const s32 ahead = static_cast<s32>(number - static_cast<u32>(last >> 1));
+        if (ahead < 0 || (ahead == 0 && (place & 1) < (last & 1))) [[unlikely]] {
+            thread_local std::string note;
+            note = fmt::format("word {:#x}: {} wrote it at packet {} after {} wrote it at {}",
+                               device, engine ? "E" : "R", number, (last & 1) != 0 ? "E" : "R",
+                               last >> 1);
+            Note(Check::SemaphoreOrder, note.c_str());
+        }
+    }
+    slot.place.store(place, std::memory_order_relaxed);
+    slot.device.store(device, std::memory_order_release);
 }
 
 void StopPostFence(const char* why) noexcept {

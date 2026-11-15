@@ -279,6 +279,9 @@ inline std::atomic<int> g_onef_post_fence{-1};
 inline std::atomic<int> g_onef_lookup_check{-1};
 /// FRITCHII_ONEF_DRY_RELEASE (live, default 0): fable_b 19.5 step 3's dry price.
 inline std::atomic<int> g_onef_dry_release{-1};
+/// FRITCHII_ONEF_SEM_E (live, default 0; with POST_FENCE): fable_b 19.4, 19.6 and 20.3, the
+/// sync point increments, the SignalFence callbacks and the payload writes on E.
+inline std::atomic<int> g_onef_sem_e{-1};
 /// FRITCHII_ONEF_CLEAR_NODEFER (live, default 0): diagnostic, a posted clear on R is never
 /// deferred into the next render pass's load op (the lean darkness of 15 Nov).
 inline std::atomic<int> g_onef_clear_nodefer{-1};

@@ -261,10 +261,24 @@ private:
     void OneFollowerFenceLent();
     /// R: inside a posted fence (its closing gather ran on E).
     bool onef_fence_posted{};
-    /// E: whether a fence op can be posted now, and the post (0 sync point, 1 reference,
-    /// 2 forced release).
+    /// E: whether a fence op can be posted now (counted by why not), and the post: 0 sync
+    /// point, 1 reference, 2 forced release; with FRITCHII_ONEF_SEM_E 3 a sync point whose
+    /// increments E made, 4 a SignalFence whose callback E ran (`e_callback`), 5 a
+    /// fence-flagged payload report E wrote (`note`).
     [[nodiscard]] bool OneFollowerFenceClean();
-    void OneFollowerPostFence(u8 kind, u32 value);
+    struct OneFollowerPayloadNote {
+        DAddr device;
+        GPUVAddr gpu_addr;
+        u32 payload;
+        u32 subreport;
+        bool has_timestamp;
+    };
+    void OneFollowerPostFence(u8 kind, u32 value, std::function<void()>* e_callback = nullptr,
+                              const OneFollowerPayloadNote* note = nullptr);
+    /// R: the pages of samples reports made where E's mirror had the counter started and R's
+    /// had not (E's superset), for the "sync target unused" check of the next posted fence.
+    std::vector<u64> onef_superset_pages;
+    void OneFollowerNoteSuperset(DAddr device);
     /// E: FRITCHII_ONEF_GATHER_E's runahead condition (logged once per change).
     [[nodiscard]] bool OneFollowerRunaheadOff(const char* where);
     /// E: the pages of the report ops it pushed (FRITCHII_ONEF_QUERY_OPS), for item 2's test.

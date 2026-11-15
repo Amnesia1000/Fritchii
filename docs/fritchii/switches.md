@@ -1469,6 +1469,28 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   those releases at E's place. Racy per word (a newer pass overwrites an older unwritten one).
   The QMD prediction line's "other writer" count also splits off the resumes met by the
   release recorded for the word: puller payload releases and other payload releases.
+- FRITCHII_ONEF_SEM_E (live, default 0; needs FRITCHII_ONEF_POST_FENCE; fable_b 19.4, 19.6,
+  20.3): the semaphore and sync point writers run at E's place, fences not delayed:
+  - a sync point E posts makes both increments itself (guest, then host after the buffer half)
+    and R makes an empty fence: the game's wait on it ends when E passes it. The frame end
+    stays lent, so E is at most a frame ahead of R;
+  - a SignalFence with a callback (QMD reduction and max releases, the GP sync) runs the
+    callback on E between the buffer half and the gather, then posts the fence empty;
+  - a payload release (not Accurate) is written on E (after its page's landings) and latches
+    its waiters there; R only notes the streamer's pending sync, synced at the next fence into
+    the buffers E obtains (16.2);
+  - a synced fence-flagged payload report (EXP33 off) is a posted fence whose write E makes;
+  - one home: whatever cannot go to E is lent (a fence not clean, Accurate payloads, a report
+    type without a streamer), never posted to R. Must-be-0 "semaphore order": a write on E or
+    R to a word last written from a later stream place;
+  - the front's lagged check on a word whose newest release is a payload one waits for E's
+    position ("lagged check (E)" in the waits by site).
+  With POST_FENCE on, E also runs the commit's buffer half itself when flushes are pending
+  (R's fence carries the downloads), so pending flushes no longer keep a fence lent; marks
+  ahead still due do. The fence decisions line counts every fence E could post: posted, posted
+  with E's commit, lent because POST_FENCE is off, fences delayed, stopped, a sync owed, or
+  marks ahead due; and the samples sync targets R did not need because E's mirror was ahead
+  (no longer "sync target unused").
 - FRITCHII_ONEF_OP_CLEAR (live, default 0; fable_b_one_follower 13.4 group 3; step 4, view
   tracked): 1 = clears are render ops. E has decided the render enable (DrawManager tests
   ShouldExecute) and runs the clear's FlushCaching; R plays Clear from its view (every clear
