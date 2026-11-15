@@ -684,6 +684,24 @@ draw registers; no deferred 0xe2c mode; no tool), and a fold case already goes t
 boot): writes by the lean decide, writes left to FrontWriteDecide; compare: writes, differing
 (must be 0).
 
+### FRITCHII_FILL_GEOM_KEEP, _UPDATE_KEEP, FRITCHII_HANDLE_PROG_KEEP, FRITCHII_FILL_BRACKET_LEAN (the "Fill ... " lines)
+
+fable_b 25.2 cuts e to h: the rest of E's fill. Each is live, default 0 = exactly as before (one
+relaxed load and a branch a draw). Values: 1 = on; 2 = on, with the old path run as well and
+compared ("must be 0" in its line); 3 = dry count: the old path only, with the calls the cut
+would skip counted and their time measured (1 call in 64 timed and scaled by 64, so the line's
+ms/s is the cut's ceiling, the memo's own look already subtracted in "net"). One line per cut
+every 10 s (HW_GPU, Info). Test order: 3 first (a cut whose net is under ~3 ms/s at the market is
+not worth turning on), then 2 (must be 0), then 1.
+
+- FRITCHII_FILL_GEOM_KEEP (cut e, "Fill geometry keep"): the vertex and index binds'
+  synchronize (BindHostVertexBuffers, BindHostIndexBuffer) skipped while the slot's memo holds:
+  the range and the dirty generation sum of its tracker managers when a synchronize left it
+  clean, as EDEN_NX2_STORAGE_SYNC_MEMO does for storage binds (a page that gains a CPU or
+  Untracked bit moves the sum; nothing else makes a page dirty). Not with hot pages or CleanWords
+  on (their walks may leave a range dirty). The read log's range is logged as before. Verify: a
+  hit's range holds no CPU or unprotected page and its synchronize uploads nothing. The usage
+  marks stay: their stamp is the packet's, new every draw.
 ### FRITCHII_ACQUIRE_MET_BY (the "Acquire resumes met by" line)
 
 FRITCHII_ACQUIRE_MET_BY (live, default 0 since 2026-11-14 = one relaxed load per resume; 1 = the

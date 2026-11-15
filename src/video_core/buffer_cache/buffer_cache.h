@@ -30,6 +30,7 @@
 #include "video_core/nx2_debug_control.h"
 #include "video_core/buffer_cache/uniform_stream_reuse.h"
 #include "video_core/buffer_churn_stats.h"
+#include "video_core/fritchii_fill_cuts.h"
 #include "video_core/churn_counters.h"
 #include "video_core/fritchii_s4_count.h"
 #include "video_core/gpu_split.h"
@@ -1611,6 +1612,18 @@ void BufferCache<P>::UpdateComputeBuffers() {
 template <class P>
 void BufferCache<P>::BindHostGeometryBuffers(bool is_indexed) {
     VideoCommon::MemoryStageLink::CheckBackCache("BindHostGeometryBuffers");
+    // FRITCHII_FILL_GEOM_KEEP (fable_b 25.2 cut e): read once a draw. No memo behind the walks
+    // that may leave a range dirty (hot pages, CleanWords), as EDEN_NX2_STORAGE_SYNC_MEMO.
+    geom_keep = VideoCommon::FillCuts::Mode(VideoCommon::FillCuts::Cut::GeomKeep);
+    if (geom_keep != 0) [[unlikely]] {
+        if (HotPagesOn() || Nx2Perf::On(Nx2Perf::Opt::CleanWords)) {
+            geom_keep = 0;
+        }
+        VideoCommon::FillCuts::MaybeReport();
+    }
+    SCOPE_EXIT {
+        geom_keep = 0;
+    };
     if (is_indexed) {
         BindHostIndexBuffer();
     } else if constexpr (!HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT) {
@@ -2377,7 +2390,12 @@ void BufferCache<P>::BindHostIndexBuffer() {
         }
     }
     if (draw_state.inline_index_draw_indexes.empty()) {
-        SynchronizeBuffer(buffer, channel_state->index_buffer.device_addr, size);
+        if (geom_keep != 0) [[unlikely]] {
+            SynchronizeGeometry(buffer, channel_state->index_buffer.device_addr, size,
+                                NUM_VERTEX_BUFFERS);
+        } else {
+            SynchronizeBuffer(buffer, channel_state->index_buffer.device_addr, size);
+        }
     } else {
         if constexpr (USE_MEMORY_MAPS_FOR_UPLOADS) {
             auto upload_staging = runtime.UploadStagingBuffer(size);
@@ -2493,6 +2511,7 @@ void BufferCache<P>::BindHostVertexBuffers() {
         // the ones still bound, so the recorded commands stay the same. Repacked ones are left
         // out: binding one again runs its conversion again.
         const bool full_binds = VideoCommon::MemoryStageLink::FullVertexBinds();
+        const bool geom_memo = geom_keep != 0; // FRITCHII_FILL_GEOM_KEEP
         bool run_dirty = true;
         const auto flush_bindings = [&]() {
             if (bindings.buffers.empty()) {
@@ -2510,7 +2529,11 @@ void BufferCache<P>::BindHostVertexBuffers() {
             Buffer& buffer = slot_buffers[binding.buffer_id];
             TouchBuffer(buffer, binding.buffer_id);
             MemStageStats::Read(MemStageStats::Kind::Vertex, binding.size);
-            SynchronizeBuffer(buffer, binding.device_addr, binding.size);
+            if (geom_memo) [[unlikely]] {
+                SynchronizeGeometry(buffer, binding.device_addr, binding.size, index);
+            } else {
+                SynchronizeBuffer(buffer, binding.device_addr, binding.size);
+            }
             const bool dirty = flags[Dirty::VertexBuffer0 + index];
             if (!dirty && (!full_binds || IsRepackedVertexBuffer(index))) {
                 flush_bindings();
@@ -6589,6 +6612,67 @@ bool BufferCache<P>::SynchronizeStorageMemo(Buffer& buffer, DAddr device_addr, u
             .size = size,
             .gen_sum = gen_after,
         };
+    }
+    return no_upload;
+}
+
+template <class P>
+bool BufferCache<P>::SynchronizeGeometry(Buffer& buffer, DAddr device_addr, u32 size, u32 slot) {
+    namespace FillCuts = VideoCommon::FillCuts;
+    FillCuts::GeomStats& stats = FillCuts::g_geom;
+    StorageSyncMemo& memo = geom_sync_memo[slot];
+    FillCuts::Add(slot == NUM_VERTEX_BUFFERS ? stats.index_syncs : stats.vertex_syncs);
+    const bool time_check = stats.check_sample.Take();
+    const u64 check_start = time_check ? FillCuts::Ticks() : 0;
+    u64 gen_before = 0;
+    const bool tracked = memory_tracker.DirtyGenerationSum(device_addr, size, gen_before);
+    const bool hit = tracked && memo.size == size && memo.device_addr == device_addr &&
+                     memo.gen_sum == gen_before;
+    if (time_check) [[unlikely]] {
+        FillCuts::Add(stats.check_ticks, FillCuts::Ticks() - check_start);
+    }
+    if (hit) {
+        FillCuts::Add(stats.hits);
+        if (geom_keep == FillCuts::On) {
+            // Left clean at this sum, and no page of its managers gained a CPU or Untracked bit
+            // since: the walk would upload nothing and re-protect nothing. The read log's range
+            // is logged as SynchronizeBuffer logs it.
+            MemReadLog::Range(MemReadLog::Kind::Bound, device_addr, size);
+            return true;
+        }
+    }
+    // 2 (verify): a hit's range must hold no CPU or Untracked page (before the walk takes them).
+    const bool dirty_on_hit = hit && geom_keep == FillCuts::Verify &&
+                              memory_tracker.CheckScannedWalk(device_addr, size).walks;
+    const bool time_hit = hit && stats.hit_sample.Take();
+    const u64 hit_start = time_hit ? FillCuts::Ticks() : 0;
+    const bool no_upload = SynchronizeBuffer(buffer, device_addr, size);
+    if (time_hit) [[unlikely]] {
+        FillCuts::Add(stats.hit_ticks, FillCuts::Ticks() - hit_start);
+    }
+    if (hit) {
+        // 2 and 3: a hit's synchronize must upload nothing (and at 2 find no dirty page).
+        FillCuts::Add(stats.compare.checked);
+        if ((!no_upload || dirty_on_hit) && stats.compare.Differ()) [[unlikely]] {
+            LOG_ERROR(HW_GPU,
+                      "Fill geometry keep (FRITCHII_FILL_GEOM_KEEP={}): a memo hit at {:#x}+{:#x} "
+                      "(slot {}) {}",
+                      geom_keep, device_addr, size, slot,
+                      no_upload ? "has CPU or unprotected pages" : "uploaded");
+        }
+    }
+    // The walk clears every CPU and Untracked bit of the range (hot pages are off) and sets
+    // none: with the sum unchanged across it, nothing marked the range during it either.
+    u64 gen_after = 0;
+    if (tracked && memory_tracker.DirtyGenerationSum(device_addr, size, gen_after) &&
+        gen_after == gen_before) {
+        memo = StorageSyncMemo{
+            .device_addr = device_addr,
+            .size = size,
+            .gen_sum = gen_after,
+        };
+    } else {
+        memo.size = 0;
     }
     return no_upload;
 }

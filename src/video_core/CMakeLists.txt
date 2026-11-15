@@ -113,6 +113,7 @@ add_library(video_core STATIC
     macro_memo.h
     macro_turing.h
     fence_manager.h
+    fritchii_fill_cuts.h
     fritchii_price.cpp
     fritchii_price.h
     fritchii_s4_count.cpp

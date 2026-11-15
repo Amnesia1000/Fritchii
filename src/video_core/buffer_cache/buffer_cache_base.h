@@ -1220,6 +1220,12 @@ private:
     /// uploaded).
     bool SynchronizeStorageMemo(Buffer& buffer, DAddr device_addr, u32 size, bool verify);
 
+    /// FRITCHII_FILL_GEOM_KEEP (fable_b 25.2 cut e): SynchronizeBuffer for vertex slot `slot`
+    /// (NUM_VERTEX_BUFFERS: the index buffer), skipped at 1 while the slot's memo holds (the range
+    /// and its tracker managers' dirty generation sum when a synchronize left it clean, as
+    /// EDEN_NX2_STORAGE_SYNC_MEMO); 2 and 3 synchronize anyway and check a hit (must be 0).
+    bool SynchronizeGeometry(Buffer& buffer, DAddr device_addr, u32 size, u32 slot);
+
     void UploadMemory(Buffer& buffer, u64 total_size_bytes, u64 largest_copy,
                       std::span<BufferCopy> copies);
 
@@ -1697,6 +1703,11 @@ private:
     /// EDEN_NX2_STORAGE_SYNC_MEMO=2 totals: hits checked, hits whose range was not clean
     /// (cpu_pages / untracked_pages unused).
     DirtyWalkVerify storage_memo_verify;
+    /// FRITCHII_FILL_GEOM_KEEP while BindHostGeometryBuffers runs (0 otherwise, and when hot pages
+    /// or CleanWords are on: their walks may leave a range dirty, so no memo is made behind them).
+    int geom_keep = 0;
+    /// FRITCHII_FILL_GEOM_KEEP: per vertex slot, then the index buffer.
+    std::array<StorageSyncMemo, NUM_VERTEX_BUFFERS + 1> geom_sync_memo{};
     u64 frame_tick = 0;
 
     /// EXP91 (fable52_answer_uniformkeeps stage 0): counts how many of today's slot rebinds
