@@ -2189,6 +2189,24 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   answered, why the others walked, walk notes the answered checks skip, the timed summary and
   walk ns and the saving in ms/s, the differences. Also in the "Front split dry" line. Off: one
   relaxed load per check, one plain load per note.
+- FRITCHII_NOTED_FAST (live, default 0; replaces the walk FRITCHII_NOTED_SUMMARY could not
+  answer: its one "wide" position was always newer than the read): GpuSplit::NotedWriteSince
+  answers from note chains instead of walking pending_writes (NotedWalk, the front's biggest
+  self-time item at Kakariko, ~74 ms/s). From the moment the switch is first read non-zero (the
+  "floor") every note is linked, newest first, into one chain: its page bucket's (4,096 by page
+  hash) when it lies inside one page, else the wide chain (more than one page, or unknown
+  range). A check looks only at the wide chain and the buckets of the read's pages, each down to
+  `since`, with the walk's own overlap test; the table's overflow ("more noted since than
+  remembered") is one compare. Exact both ways: the answer equals the walk's (None against
+  Overlap / Overflow); a check whose walk would reach a note older than the floor, or a read over
+  16 pages, walks. 1 = on (answered checks skip the walk; 1 in 64 walk anyway, timed and
+  compared), 2 = verify (the walk runs after every check and answers; NotedFastDiffer counts
+  disagreements, must be 0, first 16 logged), 3 = dry (as 2, read for the counts and the timed
+  saving). Line every 10 s "Noted fast (FRITCHII_NOTED_FAST=N)": checks, answered without the
+  walk (of them a write, and the table overflow), walk entries skipped, sampled saving ms/s,
+  differ (window, session), checks that walked anyway (older than the chains, long reads), chain
+  notes looked at, notes linked and the wide chain's share with its top 3 writers by kind. Off:
+  one relaxed load per check, one plain load per note.
 - FRITCHII_STEP_LEAN (live, default 0; F6 of work/FRONT_SPLIT_DESIGN.md 2d): 1 = the list writer
   waits line (MaybeLogListWaits) reads the clock on every 256th call instead of every list
   entry (its rates are counts over the clock time between lines: unchanged, a line comes at
