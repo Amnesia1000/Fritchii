@@ -181,6 +181,14 @@ Maxwell3D::Maxwell3D(MemoryManager& memory_manager_)
     perf_verify = VideoCommon::Nx2Perf::Verify();
     VideoCommon::Nx2FastDrawCount::Init();
     counts_fast_draw_breaks = true;
+    // FRITCHII_FRONT_LIST_LANE: the state registers FrontWrite only compares, stores and sends.
+    // render_enable.mode has the deferred 0xe2c notes before its test; 0x157 and 0x158 run the
+    // macro DMA reads after it (fable_b 27.3); the puller's range is not the engine's.
+    for (u32 i = 0x40; i < Regs::NUM_REGS; ++i) {
+        front_lane_methods[i] = !execution_mask[i] && !memory_write_mask[i] &&
+                                i != MAXWELL3D_REG_INDEX(render_enable.mode) && i != 0x157 &&
+                                i != 0x158;
+    }
 }
 
 Maxwell3D::~Maxwell3D() {
@@ -1701,7 +1709,8 @@ struct FrontCallSwitches {
     int front_ops;
     int cb_words_block;
     int dead_stores;
-    u32 traced; ///< MacroTraced()
+    int list_lane; ///< FRITCHII_FRONT_LIST_LANE (bit 2: a handler's writes)
+    u32 traced;    ///< MacroTraced()
     bool operator==(const FrontCallSwitches&) const = default;
 };
 
@@ -1747,6 +1756,19 @@ struct Maxwell3D::FrontState {
         std::chrono::steady_clock::time_point report{};
     };
     CallLeanStats call_lean_stats{};
+    /// FRITCHII_FRONT_LIST_LANE: drops by the lane (command-list words, handler writes) and the
+    /// verify counts (writes checked, lane drops the old path sent: must be 0, sends it missed).
+    struct LaneStats {
+        u64 list_dropped{};
+        u64 macro_dropped{};
+        u64 checked{};
+        u64 differ{};
+        u64 missed{};
+        u64 differ_total{}; ///< since boot
+        u64 ticks{};
+        std::chrono::steady_clock::time_point report{};
+    };
+    LaneStats lane_stats{};
     /// EXP53: per macro, 0 unknown, 1 a render-enable predicate, 2 something else.
     std::vector<u8> predicate_macros;
     u64 predicate_generation{~u64{0}};
@@ -2050,7 +2072,21 @@ namespace {
 // reads) applies to a handler's writes exactly as to the JIT's. `Params`: the load FIFO, the
 // front's vector (0xe2c's read appends to it) or, FRITCHII_FRONT_CALL_LEAN, a call's words where
 // they are for the handlers that never append.
-template <typename EmitFn, typename Params = std::vector<u32>&>
+// FRITCHII_FRONT_LIST_LANE bit 2 (the lean body): a handler's write FrontWrite would drop at its
+// same-value test is dropped before the emit (`Lane`, with `lane` set for the call); bit 4
+// verifies instead: the emit runs and a lane drop the emit sent (a ring commit or a packet
+// write) is counted (must be 0).
+struct OotLane {
+    const Maxwell3D* engine;
+    const VideoCommon::GpuSplit* split;
+    const std::vector<u64>* packet;
+    bool verify;
+    u32 dropped;
+    u32 checked;
+    u32 differ;
+    u32 missed;
+};
+template <typename EmitFn, typename Params = std::vector<u32>&, bool Lane = false>
 struct OotFrontContext {
     Params parameters;
     u32* dram;
@@ -2059,6 +2095,7 @@ struct OotFrontContext {
     const char* error{};
     /// FRITCHII_MACRO_SEQ_DRY: the register reads, as the JIT's read callback records them.
     std::vector<u64>* reads{};
+    OotLane* lane{};
 
     [[nodiscard]] u32 Count() const {
         return static_cast<u32>(parameters.size());
@@ -2084,8 +2121,38 @@ struct OotFrontContext {
         // loop's first draw.begin, checked against the front's copy of it).
     }
     void Emit(u32 method, u32 value) {
+        if constexpr (Lane) {
+            if (lane != nullptr) [[likely]] {
+                if (!lane->verify) [[likely]] {
+                    if (lane->engine->FrontLaneDrops(method, value)) {
+                        ++lane->dropped;
+                        return;
+                    }
+                } else {
+                    EmitChecked(method, value);
+                    return;
+                }
+            }
+        }
         if (!emit(method, value)) [[unlikely]] {
             Fail("method past the macro range");
+        }
+    }
+    void EmitChecked(u32 method, u32 value) {
+        const bool drops = lane->engine->FrontLaneDrops(method, value);
+        const u64 position = lane->split->WritePositionPeek();
+        const size_t held = lane->packet->size();
+        if (!emit(method, value)) [[unlikely]] {
+            Fail("method past the macro range");
+        }
+        const bool sent =
+            lane->split->WritePositionPeek() != position || lane->packet->size() != held;
+        ++lane->checked;
+        if (drops && sent) [[unlikely]] {
+            ++lane->differ;
+        } else if (!drops && !sent && method < Maxwell3D::Regs::NUM_REGS &&
+                   lane->engine->front_lane_methods[method] != 0) {
+            ++lane->missed;
         }
     }
     void EmitRepeated(const std::array<u32, 2>* writes, u32 count, u32 times) {
@@ -2342,6 +2409,7 @@ FrontCallSwitches ReadFrontCallSwitches() {
         .front_ops = Debug::SwitchValue(Debug::g_onef_front_ops, "FRITCHII_ONEF_FRONT_OPS"),
         .cb_words_block = Debug::SwitchValue(Debug::g_cb_words_block, "FRITCHII_CB_WORDS_BLOCK"),
         .dead_stores = Debug::SwitchValue(Debug::g_onef_dead_stores, "FRITCHII_ONEF_DEAD_STORES"),
+        .list_lane = Debug::SwitchValue(Debug::g_front_list_lane, "FRITCHII_FRONT_LIST_LANE"),
         .traced = MacroTraced(),
     };
 }
@@ -2459,6 +2527,7 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
         macro_params.clear();
         executing_macro = 0;
         front_macros = true;
+        FrontLaneSync(*front);
     }
     // Read again only when a switch or experiment store moved the generation (every store
     // bumps it): one relaxed load per front call instead of three experiment reads (5.6 ms/s,
@@ -2471,8 +2540,107 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
         front->same_experiment = VideoCore::Nx2Debug::Experiment(2);
         front->early_same = VideoCore::Nx2Debug::Experiment(14);
         front->exp22 = VideoCore::Nx2Debug::Experiment(22);
+        FrontLaneSync(*front);
     }
     return *front;
+}
+
+void Maxwell3D::FrontLaneSync(FrontState& fs) {
+    u32 block = 0;
+    if (fs.control != Regs::ShadowRamControl::Track &&
+        fs.control != Regs::ShadowRamControl::TrackWithFilter) {
+        block |= 2; // Passthrough has no shadow word to compare, Replay sends the shadow's
+    }
+    if (!fs.skip_same) {
+        block |= 4;
+    }
+    if (fs.same_experiment != 0) {
+        block |= 8; // EXP2 counts each same-value write
+    }
+    if (fs.list_draw_stale != 0) {
+        block |= 16; // FrontNoteListDrawWrite before the test
+    }
+    if (fs.seq_dry != nullptr) {
+        block |= 32; // FrontMacroSeqDirect after each command-list write
+    }
+    front_lane.regs = fs.regs.data();
+    front_lane.shadow = fs.shadow.data();
+    front_lane.block = block;
+}
+
+bool Maxwell3D::FrontLaneReady() {
+    if (!front) {
+        return false;
+    }
+    // A switch stored since the front read its experiments: FrontCallMethod reads them again
+    // first, so this chunk goes the old way.
+    if (front->experiments_generation !=
+        VideoCore::Nx2Debug::g_switch_generation.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    FrontLaneSync(*front);
+    return front_lane.block == 0;
+}
+
+void Maxwell3D::FrontLaneListDone(u32 dropped, u32 checked, u32 differ, u32 missed) {
+    namespace Profile = VideoCommon::Nx2Profile;
+    if (dropped != 0 && Profile::Enabled()) {
+        // FrontWrite counts each write it drops as a method write and a same-value one.
+        Profile::Add(Profile::Counter::MethodWrites, dropped);
+        Profile::Add(Profile::Counter::SameValueWrites, dropped);
+    }
+    if (!front) {
+        return;
+    }
+    auto& s = front->lane_stats;
+    s.list_dropped += dropped;
+    s.checked += checked;
+    s.differ += differ;
+    s.missed += missed;
+    FrontLaneReport(*front);
+}
+
+void Maxwell3D::FrontLaneMacroDone(FrontState& fs, u32 dropped, u32 checked, u32 differ,
+                                   u32 missed) {
+    namespace Profile = VideoCommon::Nx2Profile;
+    if (dropped != 0 && Profile::Enabled()) {
+        Profile::Add(Profile::Counter::MethodWrites, dropped);
+        Profile::Add(Profile::Counter::SameValueWrites, dropped);
+    }
+    auto& s = fs.lane_stats;
+    s.macro_dropped += dropped;
+    s.checked += checked;
+    s.differ += differ;
+    s.missed += missed;
+}
+
+void Maxwell3D::FrontLaneReport(FrontState& fs) {
+    auto& s = fs.lane_stats;
+    if ((++s.ticks & 0x3ff) != 0) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (s.report == std::chrono::steady_clock::time_point{}) {
+        s.report = now;
+        return;
+    }
+    const double seconds = std::chrono::duration<double>(now - s.report).count();
+    if (seconds < 10.0) {
+        return;
+    }
+    s.differ_total += s.differ;
+    LOG_INFO(HW_GPU,
+             "Front lane (FRITCHII_FRONT_LIST_LANE={}), per second: {:.0f} list writes and {:.0f} "
+             "handler writes dropped where they start; verify: {:.0f} checked, {:.0f} sends the "
+             "lane missed, {} lane drops the old path sent in {:.0f} s ({} since boot, must be 0)",
+             VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_front_list_lane,
+                                              "FRITCHII_FRONT_LIST_LANE"),
+             s.list_dropped / seconds, s.macro_dropped / seconds, s.checked / seconds,
+             s.missed / seconds, s.differ, seconds, s.differ_total);
+    const u64 total = s.differ_total;
+    s = {};
+    s.differ_total = total;
+    s.report = now;
 }
 
 namespace {
@@ -2686,6 +2854,7 @@ NX2_PROFILE_FORCEINLINE bool Maxwell3D::FrontWriteDecide(VideoCommon::GpuSplit& 
             // register, which a later Replay write reads back.
             fs.control = static_cast<Regs::ShadowRamControl>(argument);
             fs.shadow[method] = argument;
+            FrontLaneSync(fs);
             break;
         case MAXWELL3D_REG_INDEX(load_mme.instruction_ptr):
             GetNativeMacroEngine().ClearCode(fs.regs[MAXWELL3D_REG_INDEX(load_mme.instruction_ptr)]);
@@ -2989,6 +3158,7 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
             case MAXWELL3D_REG_INDEX(shadow_ram_control):
                 fs.control = static_cast<Regs::ShadowRamControl>(argument);
                 fs.shadow[method] = argument; // The same word on the back (see FrontWrite)
+                FrontLaneSync(fs);
                 break;
             case MAXWELL3D_REG_INDEX(load_mme.instruction_ptr):
                 GetNativeMacroEngine().ClearCode(value);
@@ -3429,6 +3599,7 @@ void Maxwell3D::FrontRunMacroFeaturesT(Core::System& system, VideoCommon::GpuSpl
         seq = fs.seq_dry;
     } else if (fs.seq_dry != nullptr) [[unlikely]] {
         fs.seq_dry = nullptr; // Off: the command-list paths stop adding
+        FrontLaneSync(fs);
     }
     {
         VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
@@ -3662,9 +3833,20 @@ void Maxwell3D::FrontRunMacroFeaturesT(Core::System& system, VideoCommon::GpuSpl
                 // The handlers but 0xe2c's never append to the FIFO (only its 0x158 does, and
                 // EXP53's predicate): they read the words where they are.
                 if (oot != OotMacros::Id::E2C && !predicate) [[likely]] {
-                    OotFrontContext<decltype(emit), std::span<const u32>> context{
+                    OotFrontContext<decltype(emit), std::span<const u32>, true> context{
                         params, native_data_ram.data(), std::span<const u32>{fs.regs}, emit};
+                    // FRITCHII_FRONT_LIST_LANE bit 2: not while the emit does more than
+                    // FrontWrite for a lane method (an op recorded, a tool watching the writes).
+                    OotLane lane{this, &split, &fs.packet, (sw.list_lane & 4) != 0, 0, 0, 0, 0};
+                    if ((sw.list_lane & 2) != 0 && !fs.op_active && !trace && dry == nullptr &&
+                        seq == nullptr && !oot_verify) [[unlikely]] {
+                        context.lane = &lane;
+                    }
                     handled = run_handler(context);
+                    if (context.lane != nullptr) [[unlikely]] {
+                        FrontLaneMacroDone(fs, lane.dropped, lane.checked, lane.differ,
+                                           lane.missed);
+                    }
                 } else {
                     materialize();
                     OotFrontContext<decltype(emit)> context{fs.parameters, native_data_ram.data(),
@@ -3905,6 +4087,7 @@ void Maxwell3D::FrontMacroSeqCall(FrontState& fs, u32 method) {
     if (fs.seq_dry == nullptr) {
         // Turned on (again): start clean, the run that was open is not known whole.
         fs.seq_dry = &q;
+        FrontLaneSync(fs);
         q.cur.tokens.clear();
         q.cur.args.clear();
         q.cur.reads.clear();
@@ -4167,9 +4350,11 @@ void Maxwell3D::FrontNoteListDrawWrite(VideoCommon::GpuSplit& split, FrontState&
     switch (method) {
     case MAXWELL3D_REG_INDEX(vertex_buffer.count):
         fs.list_draw_stale &= ~1U;
+        FrontLaneSync(fs);
         break;
     case MAXWELL3D_REG_INDEX(vertex_buffer.first):
         fs.list_draw_stale &= ~2U;
+        FrontLaneSync(fs);
         break;
     // The small index draws (index_buffer32_first and the like) draw at once, from their own
     // words: the draw.end after them is still an array draw.
@@ -4201,6 +4386,7 @@ void Maxwell3D::FrontNoteListDrawWrite(VideoCommon::GpuSplit& split, FrontState&
 
 void Maxwell3D::FrontResolveListDraw(VideoCommon::GpuSplit& split, FrontState& fs) {
     const u32 stale = std::exchange(fs.list_draw_stale, 0);
+    FrontLaneSync(fs);
     std::array<u32, 2> words{};
     if (!fs.list_draw_list.Read(words)) {
         Nx2ListDispatch::Count(Nx2ListDispatch::g_guard.failed);
@@ -4250,6 +4436,7 @@ bool Maxwell3D::FrontTakeListDraw(Core::System& system, VideoCommon::GpuSplit& s
     fs.in_list_draw = false;
     // List guard (nx2_list_dispatch.h): the two registers keep their old values from here on.
     fs.list_draw_stale = 3;
+    FrontLaneSync(fs);
     fs.list_draw_list = reader;
     fs.list_draw_indexed = false;
     if (fs.draw_pending) {
@@ -5898,6 +6085,7 @@ void Maxwell3D::FrontVerify(VideoCommon::GpuSplit& split, FrontState& fs) {
                         static_cast<u32>(shadow_state.shadow_ram_control));
         }
         fs.control = shadow_state.shadow_ram_control;
+        FrontLaneSync(fs);
     }
     for (u32 i = 0; i < Regs::NUM_REGS; ++i) {
         if (fs.shadow[i] != expected_shadow[i]) {

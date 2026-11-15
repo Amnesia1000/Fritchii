@@ -3268,6 +3268,33 @@ public:
                          u32 argument, bool is_last_call);
     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                               const u32* base_start, u32 amount, u32 methods_pending);
+    /// FRITCHII_FRONT_LIST_LANE (fable_b 27.3): FrontWrite's same-value exit taken where a write
+    /// starts (a command-list word in DmaPusher::ProcessCommands, a handler's write in the lean
+    /// macro body). `block` is 0 only while nothing FrontWrite does before that exit can act on a
+    /// lane method: the front exists, its shadow RAM tracks, same-value skipping is on, EXP2 is
+    /// off, no list draw left stale registers, no FRITCHII_MACRO_SEQ_DRY run is open
+    /// (FrontLaneSync keeps it, at each place one of them changes).
+    struct FrontLane {
+        u32 block{1};
+        const u32* regs{};
+        const u32* shadow{};
+    };
+    FrontLane front_lane;
+    /// Per method: 1 = a state register the lane may drop (not executable, writes no memory, not
+    /// render_enable.mode, 0x157 or 0x158, not a puller method).
+    std::array<u8, Regs::NUM_REGS> front_lane_methods{};
+    /// Whether FrontWrite would drop `method` = `value` at its first test, unchanged.
+    [[nodiscard]] bool FrontLaneDrops(u32 method, u32 value) const {
+        return front_lane.block == 0 && method < Regs::NUM_REGS &&
+               front_lane_methods[method] != 0 && front_lane.shadow[method] == value &&
+               front_lane.regs[method] == value;
+    }
+    /// Once per command-list chunk: whether the lane can run for it (the switch generation is
+    /// the one the front read its experiments at; `block` recomputed).
+    [[nodiscard]] bool FrontLaneReady();
+    /// After a chunk: its lane counts (drops; verify: writes checked, drops the old path sent,
+    /// which must be 0, and sends the lane would have missed), the profile counters and the line.
+    void FrontLaneListDone(u32 dropped, u32 checked, u32 differ, u32 missed);
     /// List draws (nx2_list_draw.h): the call of macro `method` whose two
     /// parameters are the GPU-written words at `address`. Returns whether the call was sent to
     /// the back without reading them.
@@ -3635,6 +3662,11 @@ private:
     void FrontRunMacroLean(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
     static void FrontCallMaterialize(FrontState& state);
     static void FrontCallLeanReport(FrontState& state);
+    /// FRITCHII_FRONT_LIST_LANE: front_lane from the front state; the counter line.
+    void FrontLaneSync(FrontState& state);
+    void FrontLaneReport(FrontState& state);
+    static void FrontLaneMacroDone(FrontState& state, u32 dropped, u32 checked, u32 differ,
+                                   u32 missed);
 public:
     /// Split front: whether the 3D macro `method`, called with `count` parameters that GPU work
     /// wrote, only copies the first into the draw's vertex count (dry runs on copies of its

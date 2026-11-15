@@ -625,6 +625,38 @@ an empty trace string and copied the call's words from the command list into the
 lean body, of them with their words read in the list, of those copied after all; mode 2: calls
 compared and switch differences (must be 0). Judge it by the front's macro zone per call.
 
+### FRITCHII_FRONT_LIST_LANE (the "Front lane" line)
+
+FRITCHII_FRONT_LIST_LANE (live, default 0 = exactly as before; fable_b 27.3, about 36 ms/s for the
+list words and 42 for the handler writes). 56% of the front's register writes end at
+FrontWrite's same-value exit, after the list parse's CallMethod, FrontCallMethod and Front() or
+the macro emit. The lane makes the same test where the write starts. Bits:
+- 1: command-list words (DmaPusher::ProcessCommands, the incrementing and the inline branch).
+  Decided once per chunk: the switch, the split running with front macros, no semaphore watch,
+  the channel's 3D engine, Maxwell3D::FrontLaneReady (the switch generation the front read its
+  experiments at, and the lane state). Per word: `block == 0 && lane method && shadow == value &&
+  register == value`, then the word is dropped.
+- 2: a handler's writes in the lean macro body (needs FRITCHII_FRONT_CALL_LEAN=1), not while
+  the call records an op (FRITCHII_ONEF_FRONT_OPS) or a tool watches its writes.
+- 4: verify instead of drop for the paths bits 1 and 2 turn on: each write goes the old way and
+  a lane drop the old path sent (a ring commit, or a draw packet write) is counted. Must be 0.
+- Lane methods: not executable, no memory write, not render_enable.mode (the deferred 0xe2c
+  notes come before the test), not 0x157 or 0x158 (the DMA reads run after it), not a puller
+  method.
+- `block` (Maxwell3D::FrontLaneSync, kept where each changes): the front exists, the shadow RAM
+  tracks, same-value skipping is on (EDEN_NX2_SPLIT_SKIP, EDEN_NX2_SKIP_SAME), EXP2 off, no list
+  draw left stale registers, no FRITCHII_MACRO_SEQ_DRY run.
+- Exact: it is FrontWrite's own condition, and with `block` 0 nothing FrontWrite, FrontCallMethod,
+  Front() or CallMethod does before that exit acts on a lane method; a dropped write sent no
+  entry before, so the ring and the memory stage see the same entries. The profile counters
+  (method writes, same value) are added per chunk and per call.
+- Off: one predictable branch per list word (a null engine) and one switch load per chunk.
+
+"Front lane (FRITCHII_FRONT_LIST_LANE=n)" (HW_GPU, Info, every 10 s), per second: list writes and
+handler writes dropped where they start; verify: writes checked, sends the lane missed (writes
+the old path dropped that the lane did not: information), lane drops the old path sent in the
+window and since boot (must be 0). Judge it by (macro + resume pending + push) per draw.
+
 ### FRITCHII_ACQUIRE_MET_BY (the "Acquire resumes met by" line)
 
 FRITCHII_ACQUIRE_MET_BY (live, default 0 since 2026-11-14 = one relaxed load per resume; 1 = the
