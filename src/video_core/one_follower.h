@@ -84,8 +84,14 @@ enum UnlendKind : u32 {
     PlainArrays = 1u << 1,  ///< the same, non-indexed
     InstanceLoop = 1u << 2, ///< a deferred instance loop (DrawDeferred, folded first instance)
     Indirect = 1u << 3,     ///< DrawIndirect (counts and arguments in GPU memory)
-    List = 1u << 4,         ///< list draws (nx2_list_draw.h: two words in GPU memory)
-    Mesh = 1u << 5,         ///< task/mesh pipelines, emulated or native
+    /// List draws (nx2_list_draw.h: two words in GPU memory). E's fill binds the words and puts
+    /// their buffer in ring B's packet (ListArgs); the draw span carries the keep id and the
+    /// address. A list draw on a mesh pipeline needs Mesh too; one that reads its words on the
+    /// CPU stays lent (LentReason::NoPath).
+    List = 1u << 4,
+    /// Task/mesh pipelines, direct draws. Native ones only (VK_EXT_mesh_shader); emulated ones
+    /// stay lent (LentReason::NoPath).
+    Mesh = 1u << 5,
     GpuCount = 1u << 6,     ///< a vertex count GPU work wrote (nx2_indirect_grid.h)
     InlineIndex = 1u << 7,  ///< inline index draws (the indexes live in a vector on E)
     AllKinds = 0xff,
@@ -107,12 +113,16 @@ enum class LentReason : u8 {
     StreamWrite,     ///< the stream-write guard hit since the last packet (Check::StreamWrite)
     Diagnostic,      ///< a frame dump, render trace, probe or capture reads E's state
     Transient,       ///< state R's view cannot carry yet (channel switch pending, view not seeded)
+    /// Its kind's bit is in the mask but this draw needs what R's path cannot do: a list draw
+    /// whose two words are read on the CPU (ListDrawReadsBack), an emulated mesh draw (the
+    /// staging pool and the mesh arenas).
+    NoPath,
     Count,
 };
 
 inline constexpr std::array<const char*, static_cast<size_t>(LentReason::Count)> lent_reason_names{
     "step below 4", "kind not in mask", "pipeline miss", "verify", "stream write", "diagnostic",
-    "transient",
+    "transient", "no R path",
 };
 
 /// Lent operations other than draws (step 5's kinds and the rest): E parks for each.
@@ -191,6 +201,16 @@ enum class Check : u8 {
     /// is, the image takes the range again (it uploads at its next use) and step 4 stops for the
     /// session, so every later draw is lent.
     RenderNeedsEngineFlush,
+    /// Step 4's forced-lent list draws (FRITCHII_ONEF_VERIFY_EVERY): the list values the packet
+    /// carries (keep id, words address) or R's read-back decision on its view differ from E's
+    /// engine's.
+    BuildList,
+    /// A played draw whose ring B packet's list arguments (MemStage::ListArgs) disagree with the
+    /// draw being a list draw on R's view; the draw is not recorded and step 4 stops.
+    PlayedListArgs,
+    /// A played draw of a kind R has no path for after all (a list draw that reads its words on
+    /// the CPU, an emulated mesh draw); not recorded, step 4 stops.
+    PlayedNoPath,
     Count,
 };
 
@@ -201,6 +221,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Check::Count)> chec
     "build draw params", "build condition", "render packet missing", "drop not plain",
     "facts stale", "played lookup miss", "texture read ahead of R", "ring B pairing",
     "R waits for E's lock", "R needs E's buffer flush",
+    "build list draw", "played list args", "played kind without path",
 };
 
 // --- The packet (E to R) -----------------------------------------------------------------------------
@@ -254,6 +275,8 @@ static_assert(sizeof(RegPair) == 8);
 using FlagBits = Maxwell3D::DirtyState::Flags;
 
 /// The draw manager's state for one draw, by value (no inline index vector: those draws stay lent).
+/// A list draw (indirect_state.list_words, inside DrawEnd's list branch) also carries what R's
+/// view needs of the indirect state: DrawEnd sets every other field of it to a constant.
 struct DrawValues {
     Maxwell3D::Regs::PrimitiveTopology topology;
     u32 draw_mode; ///< Maxwell3D::DrawManager::DrawMode
@@ -270,7 +293,11 @@ struct DrawValues {
     u8 draw_indexed; ///< the draw manager's own draw_indexed
     u8 reserved;
     u32 instance_arg; ///< RasterizerVulkan::Draw's instance_count argument
+    u32 list_words;   ///< indirect_state.list_words (1: a list draw)
+    u64 list_keep_id; ///< indirect_state.list_keep_id (0 unless a list draw)
+    GPUVAddr list_address; ///< indirect_state.indirect_start_address (0 unless a list draw)
 };
+static_assert(sizeof(DrawValues) % 8 == 0 && offsetof(DrawValues, list_keep_id) % 8 == 0);
 
 /// The six program hashes RefreshStages gives (ShaderCache::RefreshStages's unique_hashes).
 struct Programs {

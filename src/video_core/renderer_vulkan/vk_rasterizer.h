@@ -234,6 +234,12 @@ private:
     bool onef_condition_may_be_set{};
     /// R: inside a posted clear (FRITCHII_ONEF_OP_CLEAR): E ran its FlushCaching.
     bool onef_clear_posted{};
+    /// E: an unlent list draw with a keep id was pushed since R was last drained: R records its
+    /// kept words when it plays it, so a read of kept words on E drains R first.
+    bool onef_list_keeps_unplayed{};
+    /// DrawListWords' test on `engine` (its draw state and registers): the list draw reads its
+    /// two words on the CPU (one follower: such a list draw stays lent).
+    [[nodiscard]] static bool OneFollowerListOnCpu(const Tegra::Engines::Maxwell3D& engine);
     /// E: FRITCHII_ONEF_GATHER_E's runahead condition (logged once per change).
     [[nodiscard]] bool OneFollowerRunaheadOff(const char* where);
     /// E: the pages of the report ops it pushed (FRITCHII_ONEF_QUERY_OPS), for item 2's test.
