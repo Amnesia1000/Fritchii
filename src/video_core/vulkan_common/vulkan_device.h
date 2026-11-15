@@ -219,6 +219,7 @@ struct VmaBudget;
 namespace Vulkan {
 
 class NsightAftermathTracker;
+class KeptBlocks;
 
 /// Format usage descriptor.
 enum class FormatType { Linear, Optimal, Buffer };
@@ -1192,6 +1193,17 @@ FN_MAX_LIMIT_LIST
         return memory_usage_value.load(std::memory_order_relaxed);
     }
 
+    /// FRITCHII_KEEP_BLOCKS (vulkan_kept_blocks.h): the most the kept blocks may hold, from the
+    /// texture cache's budget check: half the room between the cache's critical use and the
+    /// budget, plus what the live usage leaves under the critical use.
+    void LimitKeptBlocks(u64 budget, u64 critical) const;
+    /// Gives every kept block back now (memory pressure); returns the bytes.
+    u64 ReleaseKeptBlocks() const;
+    /// Once a frame from the texture cache runtime: trims and logs the kept blocks.
+    void TickKeptBlocks() const;
+    /// Bytes the kept blocks hold (counted as free by GetDeviceMemoryUsage).
+    [[nodiscard]] u64 KeptBlockBytes() const noexcept;
+
     /// The buffer allocator's heap budgets: VMA's at FRITCHII_MEMSTAGE_THREAD=0, as its user
     /// published them at 1 (vulkan_device.cpp).
     void BufferHeapBudgets(VmaBudget* budgets) const;
@@ -1538,6 +1550,10 @@ private:
 
     /// Nsight Aftermath GPU crash tracker
     std::unique_ptr<NsightAftermathTracker> nsight_aftermath_tracker;
+
+    /// FRITCHII_KEEP_BLOCKS: VMA's freed device-local blocks (vulkan_kept_blocks.h).
+    void CreateKeptBlocks();
+    std::unique_ptr<KeptBlocks> kept_blocks;
 };
 
 } // namespace Vulkan

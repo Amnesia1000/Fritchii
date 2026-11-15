@@ -33,6 +33,7 @@
 #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_device.h"
+#include "video_core/vulkan_common/vulkan_kept_blocks.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
@@ -486,6 +487,71 @@ void GetHeapBudgets(const Device& device, std::array<VmaBudget, VK_MAX_MEMORY_HE
     }
 }
 
+// FRITCHII_KEEP_BLOCKS: VMA's vkAllocateMemory and vkFreeMemory go through these, so a freed
+// block can be kept and handed back (vulkan_kept_blocks.h). With nothing kept and the switch off
+// they only pass the call on.
+PFN_vkAllocateMemory g_real_allocate_memory{};
+PFN_vkFreeMemory g_real_free_memory{};
+
+u64 NanosecondsSince(std::chrono::steady_clock::time_point start) {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - start)
+                                .count());
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL KeptBlocksAllocateMemory(VkDevice device,
+                                                        const VkMemoryAllocateInfo* allocate_info,
+                                                        const VkAllocationCallbacks* allocator,
+                                                        VkDeviceMemory* memory) {
+    KeptBlocks* const kept = KeptBlocks::Active(device);
+    if (kept == nullptr) {
+        return g_real_allocate_memory(device, allocate_info, allocator, memory);
+    }
+    if (kept->Take(*allocate_info, *memory)) {
+        return VK_SUCCESS;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    VkResult result = g_real_allocate_memory(device, allocate_info, allocator, memory);
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY ||
+        result == VK_ERROR_TOO_MANY_OBJECTS) {
+        // The kept blocks may hold what the driver did not find: they all go, and nothing is
+        // kept until the texture cache sets the limit again.
+        kept->SetLimit(0);
+        if (const u64 released = kept->Release(); released != 0) {
+            const VkResult failed = result;
+            result = g_real_allocate_memory(device, allocate_info, allocator, memory);
+            static std::atomic<u32> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                LOG_WARNING(Render_Vulkan,
+                            "FRITCHII_KEEP_BLOCKS: a {} MiB allocation in memory type {} failed "
+                            "({}); gave back the {} MiB kept and tried again ({})",
+                            allocate_info->allocationSize >> 20, allocate_info->memoryTypeIndex,
+                            static_cast<int>(failed), released >> 20, static_cast<int>(result));
+            }
+        }
+    }
+    if (result == VK_SUCCESS) {
+        kept->CountDriverAllocation(allocate_info->allocationSize, NanosecondsSince(start));
+        kept->Track(*allocate_info, *memory);
+    }
+    return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL KeptBlocksFreeMemory(VkDevice device, VkDeviceMemory memory,
+                                                const VkAllocationCallbacks* allocator) {
+    KeptBlocks* const kept = KeptBlocks::Active(device);
+    if (kept == nullptr) {
+        g_real_free_memory(device, memory, allocator);
+        return;
+    }
+    if (kept->Keep(memory)) {
+        return;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    g_real_free_memory(device, memory, allocator);
+    kept->CountDriverFree(NanosecondsSince(start));
+}
+
 } // Anonymous namespace
 
 void Device::RemoveExtension(bool& extension, const std::string& extension_name) {
@@ -877,6 +943,16 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     VmaVulkanFunctions functions{};
     functions.vkGetInstanceProcAddr = dld.vkGetInstanceProcAddr;
     functions.vkGetDeviceProcAddr = dld.vkGetDeviceProcAddr;
+    // FRITCHII_KEEP_BLOCKS set at boot (any value, 0 included, so a session can toggle it live):
+    // VMA's memory calls go through the kept blocks (CreateKeptBlocks). Unset: VMA calls the
+    // driver directly, as before.
+    if (std::getenv("FRITCHII_KEEP_BLOCKS") != nullptr && dld.vkAllocateMemory != nullptr &&
+        dld.vkFreeMemory != nullptr) {
+        g_real_allocate_memory = dld.vkAllocateMemory;
+        g_real_free_memory = dld.vkFreeMemory;
+        functions.vkAllocateMemory = KeptBlocksAllocateMemory;
+        functions.vkFreeMemory = KeptBlocksFreeMemory;
+    }
     // EDEN_NX2_VMA_NO_PREFER_DEDICATED (boot, default on, 0 = off; ported;
     // with 32 MiB blocks market A/B 2026-11-11: off 41.4/40.3, on 41.5/42.8 fps,
     // same VRAM):
@@ -1000,6 +1076,9 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         // The memory stage counts the calls on it and who makes them (memory_stage_link.cpp).
         VideoCommon::MemoryStageLink::WatchBufferAllocator(buffer_allocator);
     }
+    if (functions.vkAllocateMemory == KeptBlocksAllocateMemory) {
+        CreateKeptBlocks();
+    }
 
     owns_static_pipeline_cache = surface != VkSurfaceKHR{};
     LoadStaticPipelineCache();
@@ -1016,6 +1095,11 @@ Device::~Device() {
 #endif
     SaveStaticPipelineCache();
     ShutdownGPULogging();
+    // FRITCHII_KEEP_BLOCKS: kept blocks go back to the driver, and the blocks VMA frees below go
+    // straight to it.
+    if (kept_blocks) {
+        kept_blocks->Close();
+    }
     // Everything allocated from either allocator (the renderer's caches) is gone by now.
     const std::array<VmaAllocator, 2> owners{allocator, buffer_allocator};
     for (size_t owner = 0; owner < owners.size(); ++owner) {
@@ -1032,6 +1116,107 @@ Device::~Device() {
         vmaDestroyAllocator(buffer_allocator);
     }
     vmaDestroyAllocator(allocator);
+}
+
+void Device::CreateKeptBlocks() {
+    const VkPhysicalDeviceMemoryProperties memory_properties =
+        physical.GetMemoryProperties().memoryProperties;
+    auto kept = std::make_unique<KeptBlocks>(*logical, g_real_allocate_memory, g_real_free_memory,
+                                             memory_properties);
+    // The memory type images take from VMA's default blocks.
+    const VkImageCreateInfo probe_ci{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .extent = {1024, 1024, 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = 0,
+        .pQueueFamilyIndices = nullptr,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    VmaAllocationCreateInfo image_alloc{};
+    image_alloc.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    image_alloc.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    u32 image_type = VK_MAX_MEMORY_TYPES;
+    if (vmaFindMemoryTypeIndexForImageInfo(allocator, &probe_ci, &image_alloc, &image_type) !=
+        VK_SUCCESS) {
+        image_type = VK_MAX_MEMORY_TYPES;
+    }
+    if (is_integrated || !kept->Keeps(image_type)) {
+        // An integrated GPU's device-local memory is system memory, and its types are mostly
+        // host-visible: nothing to keep.
+        LOG_INFO(Render_Vulkan,
+                 "Kept blocks (FRITCHII_KEEP_BLOCKS): off, images take memory type {} which is "
+                 "not kept{}",
+                 image_type, is_integrated ? " (integrated GPU)" : "");
+        return;
+    }
+    kept->Activate();
+    kept_blocks = std::move(kept);
+    // FRITCHII_KEEP_BLOCKS_PREMAKE=1 (boot): the cap's worth of VMA default-size blocks now.
+    const u64 cap = KeptBlocks::SwitchCap();
+    const char* premake = std::getenv("FRITCHII_KEEP_BLOCKS_PREMAKE");
+    u32 made = 0;
+    double ms = 0.0;
+    const VkDeviceSize block_size = [] {
+        const char* value = std::getenv("EDEN_NX2_VMA_BLOCK_MIB");
+        const u64 mib = value != nullptr ? std::strtoull(value, nullptr, 10) : 32;
+        return VkDeviceSize{(mib != 0 ? mib : 16) * 1024u * 1024u};
+    }();
+    if (premake != nullptr && std::atoi(premake) != 0 && cap != 0) {
+        // The flags VMA gives its blocks (VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT).
+        const VkMemoryAllocateFlags flags =
+            extensions.buffer_device_address
+                ? static_cast<VkMemoryAllocateFlags>(VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT)
+                : VkMemoryAllocateFlags{0};
+        const auto start = std::chrono::steady_clock::now();
+        made = kept_blocks->Make(image_type, block_size, static_cast<u32>(cap / block_size),
+                                 flags);
+        ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+                 .count();
+    }
+    LOG_INFO(Render_Vulkan,
+             "Kept blocks (FRITCHII_KEEP_BLOCKS, live): cap {} MiB now (at most 512), memory type "
+             "{}; premade {} blocks of {} MiB in {:.1f} ms (FRITCHII_KEEP_BLOCKS_PREMAKE)",
+             cap >> 20, image_type, made, block_size >> 20, ms);
+}
+
+void Device::LimitKeptBlocks(u64 budget, u64 critical) const {
+    if (!kept_blocks) {
+        return;
+    }
+    // The live usage (the kept blocks counted as free) may fill to the cache's critical use; the
+    // kept blocks get what it leaves under that, plus half of the margin above it, so the
+    // process stays at least half the margin under the budget (Windows lowers the budget as the
+    // card fills).
+    const u64 ceiling = critical < budget ? critical + (budget - critical) / 2 : budget;
+    const u64 live = GetDeviceMemoryUsage();
+    kept_blocks->SetLimit(ceiling > live ? ceiling - live : 0);
+}
+
+u64 Device::ReleaseKeptBlocks() const {
+    if (!kept_blocks) {
+        return 0;
+    }
+    return kept_blocks->Release();
+}
+
+void Device::TickKeptBlocks() const {
+    if (kept_blocks) {
+        kept_blocks->Tick();
+    }
+}
+
+u64 Device::KeptBlockBytes() const noexcept {
+    return kept_blocks ? kept_blocks->KeptBytes() : 0;
 }
 
 VmaPool Device::GetSeparatePool(VmaAllocator owner, SeparatePool kind, u32 memory_type) const {
@@ -2276,7 +2461,12 @@ u64 Device::QueryDeviceMemoryUsage() const {
     }
     u64 result{};
     for (const size_t heap : valid_heap_memory) {
-        result += AllocatedUsage(budget.heapUsage[heap], heap_budgets[heap]);
+        u64 usage = AllocatedUsage(budget.heapUsage[heap], heap_budgets[heap]);
+        if (kept_blocks) {
+            // FRITCHII_KEEP_BLOCKS: kept blocks are free memory to the caches.
+            usage -= (std::min)(usage, kept_blocks->KeptBytes(static_cast<u32>(heap)));
+        }
+        result += usage;
     }
     return result;
 }

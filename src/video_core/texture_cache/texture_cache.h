@@ -812,6 +812,11 @@ void TextureCache<P>::TickFrame() {
                     critical_memory = (std::min)(critical_memory, host_critical);
                     expected_memory = critical_memory - (std::min)(margin, critical_memory / 2);
                     ApplyThresholdOverrides(false);
+                    // FRITCHII_KEEP_BLOCKS: the kept blocks get what the live usage leaves under
+                    // the critical use and half the room above it.
+                    if constexpr (requires { runtime.LimitKeptBlocks(u64{}, u64{}); }) {
+                        runtime.LimitKeptBlocks(budget, critical_memory);
+                    }
                     // Log the first values and real changes (the budget moves by a few MiB all
                     // the time). Compared after the overrides: the value before them is above
                     // the 5/8-of-budget cap on large cards, so every check looked like a change

@@ -202,6 +202,9 @@ public:
 
     u64 GetDeviceMemorySlack() const;
 
+    /// FRITCHII_KEEP_BLOCKS: the kept blocks' limit from the budget check (Device::LimitKeptBlocks).
+    void LimitKeptBlocks(u64 budget, u64 critical) const;
+
     bool CanReportMemoryUsage() const;
 
     /// Images that did not fit the device memory budget so far (see MemoryAllocator).

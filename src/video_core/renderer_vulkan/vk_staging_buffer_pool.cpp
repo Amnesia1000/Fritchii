@@ -4,7 +4,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <utility>
 #include <vector>
 
@@ -130,6 +132,131 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
     ASSERT_MSG(!stream_pointer.empty(), "Stream buffer must be host visible!");
 }
 
+void StagingBufferPool::CreateUploadRing() {
+    // FRITCHII_STAGING_RING (port of DahBard/Blitchii's staging ring, r64): uploads over the
+    // stream buffer's region (8 MiB on a discrete GPU) took a cached staging buffer or a new one,
+    // often a driver allocation written for the first time (page faults); OoT's area loads made
+    // hundreds. Host memory, like the staging buffers it stands in for.
+    const int value = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_staging_ring,
+                                                       "FRITCHII_STAGING_RING");
+    if (value <= 0 || upload_ring) {
+        return;
+    }
+    const u64 mib = value == 1 ? 256 : std::clamp<u64>(static_cast<u64>(value), 16, 1024);
+    const size_t size = static_cast<size_t>(mib) << 20;
+    VkBufferCreateInfo ring_ci{
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .size = size + STREAM_BUFFER_TAIL,
+        // CreateStagingBuffer's usage.
+        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                 VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                 VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                 VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = 0,
+        .pQueueFamilyIndices = nullptr,
+    };
+    if (device.IsExtTransformFeedbackSupported()) {
+        ring_ci.usage |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT;
+    }
+    if (device.IsBufferDeviceAddressSupported()) {
+        ring_ci.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    vk::Buffer buffer;
+    try {
+        buffer = memory_allocator.CreateBuffer(ring_ci, MemoryUsage::Upload);
+    } catch (const vk::Exception& e) {
+        LOG_WARNING(Render_Vulkan, "FRITCHII_STAGING_RING={}: no memory for the ring ({}); off",
+                    value, e.what());
+        return;
+    }
+    if (buffer.Mapped().size() < size || !buffer.IsHostCoherent()) {
+        LOG_WARNING(Render_Vulkan,
+                    "FRITCHII_STAGING_RING={}: the ring's memory is not mapped host-coherent; off",
+                    value);
+        return;
+    }
+    // Every page written once now, so that no upload at a load takes the first-touch faults.
+    std::memset(buffer.Mapped().data(), 0, buffer.Mapped().size());
+    const double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    const u32 memory_type = buffer.Location().memory_type;
+    const VkDeviceAddress address = device.IsBufferDeviceAddressSupported()
+                                        ? device.GetLogical().GetBufferDeviceAddress(*buffer)
+                                        : VkDeviceAddress{};
+    const std::span<u8> mapped = buffer.Mapped();
+    upload_ring.emplace(UploadRing{
+        .buffer = std::move(buffer),
+        .address = address,
+        .mapped = mapped,
+        .regions = StagingRingRegions{size},
+    });
+    LOG_INFO(Render_Vulkan,
+             "Staging ring (FRITCHII_STAGING_RING={}, live: 0 stops its use): {} MiB of host memory "
+             "in memory type {}, {} regions of {} MiB, made and written in {:.1f} ms",
+             value, mib, memory_type, StagingRingRegions::NUM_REGIONS,
+             (size / StagingRingRegions::NUM_REGIONS) >> 20, ms);
+}
+
+std::optional<StagingBufferRef> StagingBufferPool::TryGetRingBuffer(size_t size) {
+    UploadRing& ring = *upload_ring;
+    const auto is_free = [this](u64 stamp) { return clock.IsFree(stamp); };
+    const u64 now = clock.Now();
+    // The last upload's copy is recorded by now at the latest.
+    ring.regions.Restamp(now);
+    const std::optional<size_t> offset = ring.regions.Take(size, now, is_free);
+    if (!offset) {
+        ++ring.refused;
+        if (size <= ring.regions.Size() && ring.regions.LargeUploadInFlight(is_free)) {
+            ++ring.refused_behind_large;
+        }
+        return std::nullopt;
+    }
+    ++ring.uploads;
+    ring.bytes += size;
+    if (size > ring.regions.Size() / 2) {
+        ++ring.large;
+    }
+    return StagingBufferRef{
+        .buffer = *ring.buffer,
+        .device_address = ring.address,
+        .offset = static_cast<VkDeviceSize>(*offset),
+        .mapped_span = ring.mapped.subspan(*offset, size),
+        .usage = MemoryUsage::Upload,
+        .log2_level{},
+        .index{},
+    };
+}
+
+void StagingBufferPool::LogUploadRing() {
+    UploadRing& ring = *upload_ring;
+    const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    if (ring.last_log_ns == 0) {
+        ring.last_log_ns = now;
+        return;
+    }
+    if (now - ring.last_log_ns < 10'000'000'000) {
+        return;
+    }
+    ring.last_log_ns = now;
+    if (ring.uploads + ring.refused + ring.created_after_refusal != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "Staging ring in 10 s (FRITCHII_STAGING_RING={}): {} uploads ({} MiB), {} over "
+                 "half the ring; {} refused ({} while an upload over half the ring was in flight), "
+                 "{} staging buffers made after a refusal",
+                 VideoCore::Nx2Debug::g_staging_ring.load(std::memory_order_relaxed), ring.uploads,
+                 ring.bytes >> 20, ring.large, ring.refused, ring.refused_behind_large,
+                 ring.created_after_refusal);
+    }
+    ring.uploads = ring.bytes = ring.large = 0;
+    ring.refused = ring.refused_behind_large = ring.created_after_refusal = 0;
+}
+
 StagingBufferPool::~StagingBufferPool() = default;
 
 StagingBufferRef StagingBufferPool::Request(size_t size, MemoryUsage usage, bool deferred,
@@ -162,6 +289,9 @@ void StagingBufferPool::TickFrame() {
     ReleaseCache(MemoryUsage::Upload);
     ReleaseCache(MemoryUsage::Download);
     recycler.TickFrame();
+    if (upload_ring) {
+        LogUploadRing();
+    }
 }
 
 StagingBufferRef StagingBufferPool::GetStreamBuffer(
@@ -244,6 +374,14 @@ StagingBufferRef StagingBufferPool::GetStagingBuffer(
     VideoCommon::BufferChurnStats::StagingCaller caller, bool stream_full) {
     if (const std::optional<StagingBufferRef> ref = TryGetReservedBuffer(size, usage, deferred)) {
         return *ref;
+    }
+    // FRITCHII_STAGING_RING: a slice of the ring before a new buffer (live: 0 stops its use).
+    if (upload_ring && usage == MemoryUsage::Upload && !deferred &&
+        VideoCore::Nx2Debug::g_staging_ring.load(std::memory_order_relaxed) > 0) {
+        if (const std::optional<StagingBufferRef> ref = TryGetRingBuffer(size)) {
+            return *ref;
+        }
+        ++upload_ring->created_after_refusal;
     }
     return CreateStagingBuffer(size, usage, deferred, caller, stream_full);
 }
