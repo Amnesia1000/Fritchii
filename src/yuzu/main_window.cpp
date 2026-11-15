@@ -5313,6 +5313,17 @@ void MainWindow::UpdateStatusBar() {
             dlss_status_text += tr(" (%1 DOESN'T FIT)", "The DLSS mode the user chose")
                                     .arg(mode_text(dlss.requested));
         }
+        // Fritchii builds: the real sizes, e.g. "1440p -> 4K" or "1080p" for DLAA.
+        if (FritchiiUi::Enabled() && dlss.render_height != 0 && dlss.output_height != 0) {
+            const auto height = [](u32 lines) {
+                return lines == 2160 ? QStringLiteral("4K") : QStringLiteral("%1p").arg(lines);
+            };
+            dlss_status_text += QStringLiteral("  ") + height(dlss.render_height);
+            if (dlss.output_height != dlss.render_height) {
+                dlss_status_text +=
+                    QStringLiteral(" %1 ").arg(QChar(0x2192)) + height(dlss.output_height);
+            }
+        }
     }
     dlss_evaluations = dlss.evaluations;
     dlss_status_label->setText(dlss_status_text);

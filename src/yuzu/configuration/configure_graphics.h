@@ -26,6 +26,8 @@ class QPushButton;
 class QEvent;
 class QObject;
 class QComboBox;
+class QCheckBox;
+class QLabel;
 class AmdFsr4Panel;
 
 namespace Settings {
@@ -73,6 +75,10 @@ private:
     void UpdateAPILayout();
     void UpdateDeviceSelection(int device);
     void UpdateAmdFsr4Visibility();
+    /// Fritchii builds: OoT's real sizes in the DLSS quality names, and the line under the
+    /// resolution while DLSS or FSR sets OoT's resolution.
+    void SetupOcarinaUpscalerLabels();
+    void UpdateOcarinaUpscalerLabels();
 
     void RetrieveVulkanDevices();
 
@@ -114,4 +120,7 @@ private:
     QComboBox* resolution_combobox;
     QComboBox* oot_aa_combobox{};          ///< The oot_anti_aliasing choice
     AmdFsr4Panel* amd_fsr4_panel{};       ///< Under it while AMD FSR 4 is picked
+    QCheckBox* nvidia_dlss_checkbox{};     ///< The nvidia_dlss setting
+    QComboBox* dlss_quality_combobox{};    ///< The nvidia_dlss_quality choice
+    QLabel* resolution_note{};             ///< Fritchii: under the resolution choice
 };

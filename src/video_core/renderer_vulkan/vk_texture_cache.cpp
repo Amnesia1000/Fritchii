@@ -5185,8 +5185,29 @@ void CustomBorderColorBudget::Release() noexcept {
 f32 TextureCacheRuntime::OcarinaFsrLodBias() {
     if (!ocarina_fsr_lod_bias) {
         const bool ocarina = Settings::GetCurrentProgramID() == 0x0400486024DEC000ULL;
-        ocarina_fsr_lod_bias =
-            ocarina ? VideoCommon::OcarinaFsrLodBias(ResolveOcarinaUpscaler(device)) : 0.0f;
+        const auto backend = ResolveOcarinaUpscaler(device);
+        if (!ocarina) {
+            ocarina_fsr_lod_bias = 0.0f;
+        } else if (const int mode = VideoCommon::OcarinaLodRatioMode(); mode != 0) {
+            // FRITCHII_OOT_LOD_RATIO: from the real sizes, docked (handheld drops the bias). The
+            // scene is 1440p tall, or what the DLSS render scale made it; the output is 4K, or
+            // the scene's own size for DLAA (the quality when the game started).
+            const u32 render_height =
+                Settings::OcarinaRenderHeightFor(Settings::AppliedOcarinaRenderScale());
+            const bool dlaa = backend == VideoCommon::OcarinaUpscaleBackend::Dlss &&
+                              Settings::GetNvidiaDlssRuntimeSettings().quality ==
+                                  Settings::NvidiaDlssQuality::Native;
+            const u32 output_height = dlaa ? render_height : 2160;
+            ocarina_fsr_lod_bias = VideoCommon::OcarinaLodBiasForSizes(
+                backend, render_height, output_height, VideoCommon::OcarinaDlssJitterMode() != 0,
+                mode);
+            LOG_INFO(Render_Vulkan,
+                     "Ocarina texture LOD bias {:.2f} ({} {}p -> {}p, FRITCHII_OOT_LOD_RATIO={})",
+                     *ocarina_fsr_lod_bias, VideoCommon::OcarinaBackendName(backend),
+                     render_height, output_height, mode);
+        } else {
+            ocarina_fsr_lod_bias = VideoCommon::OcarinaFsrLodBias(backend);
+        }
     }
     return *ocarina_fsr_lod_bias;
 }

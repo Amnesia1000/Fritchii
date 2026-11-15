@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <array>
+#include <cmath>
 #include <cstdlib>
 #include <string_view>
 
@@ -11,6 +13,88 @@
 namespace VideoCommon {
 
 enum class OcarinaUpscaleBackend { Native, Fsr, Dlss };
+
+constexpr const char* OcarinaBackendName(OcarinaUpscaleBackend backend) {
+    switch (backend) {
+    case OcarinaUpscaleBackend::Native:
+        return "the game's upscale";
+    case OcarinaUpscaleBackend::Fsr:
+        return "FSR";
+    case OcarinaUpscaleBackend::Dlss:
+        return "NVIDIA DLSS";
+    }
+    return "";
+}
+
+namespace OcarinaSwitch {
+/// A boot switch read once: unset or empty gives `fallback`.
+inline int Read(const char* name, int fallback) {
+    const char* value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' ? std::atoi(value) : fallback;
+}
+} // namespace OcarinaSwitch
+
+/// FRITCHII_DLSS_SANITIZE (boot, 1 = on by default): the upscaler's colour input has NaN and
+/// infinite texels set to 0 and is clamped to [0, 1] (the game's colour is already tonemapped).
+/// DLSS spreads such a texel into a black block: the small black squares around far birds and
+/// particles in Hyrule Field. 0 = the exact copy as before.
+inline bool OcarinaDlssSanitize() {
+    static const bool on = OcarinaSwitch::Read("FRITCHII_DLSS_SANITIZE", 1) != 0;
+    return on;
+}
+
+/// FRITCHII_OOT_CAMERA_GUEST (boot, 0 = off): the camera tracker reads vertex uniform slot 3 as
+/// the game bound it, not as the draw's shader sees it. The shader's view leaves out slots it does
+/// not use and stops at the last byte it reads, so draws that read less than the camera block gave
+/// no camera and the upscaler stepped aside ("no scene camera this frame", e.g. when the camera
+/// turns in the Water Temple). On, only the 0x1c0 bytes up to the end of the previous matrix
+/// are needed.
+inline bool OcarinaCameraFromGuest() {
+    static const bool on = OcarinaSwitch::Read("FRITCHII_OOT_CAMERA_GUEST", 0) != 0;
+    return on;
+}
+/// The camera bytes the tracker needs: through the previous view-projection matrix (0x180 + 64)
+/// with FRITCHII_OOT_CAMERA_GUEST, the whole block as before without it.
+inline constexpr unsigned OcarinaCameraBlockBytes = 0x230;
+inline constexpr unsigned OcarinaCameraNeededBytes = 0x1c0;
+inline unsigned OcarinaCameraReadBytes() {
+    return OcarinaCameraFromGuest() ? OcarinaCameraNeededBytes : OcarinaCameraBlockBytes;
+}
+
+/// FRITCHII_JITTER_EDGE (boot, 1 = on by default): on AMD's drivers the jitter offsets are
+/// Halton (2, 3) in [0, 1) instead of [-0.5, 0.5). AMD clips each viewport to a whole pixel, so a
+/// negative offset dropped the last column and row of every jittered draw on half the frames
+/// (a ripple along the right and bottom edges with FSR). Other drivers are unchanged.
+inline bool OcarinaJitterEdgeFix() {
+    static const bool on = OcarinaSwitch::Read("FRITCHII_JITTER_EDGE", 1) != 0;
+    return on;
+}
+
+/// The camera jitter for a phase (from 1) in render pixels: Halton (2, 3), centred on 0, or in
+/// [0, 1) for drivers that clip the viewport's fractional right and bottom edges.
+inline std::array<float, 2> OcarinaJitter(unsigned index, bool truncated_viewport_edges) {
+    const auto halton = [](unsigned value, unsigned base) {
+        float fraction = 1.0f;
+        float result = 0.0f;
+        while (value > 0) {
+            fraction /= static_cast<float>(base);
+            result += fraction * static_cast<float>(value % base);
+            value /= base;
+        }
+        return result;
+    };
+    const float center = truncated_viewport_edges ? 0.0f : 0.5f;
+    return {halton(index, 2) - center, halton(index, 3) - center};
+}
+
+/// FRITCHII_OOT_LOD_RATIO (boot, 0 = off): the texture LOD bias follows the real render and
+/// output sizes instead of the fixed numbers. 1: FSR log2(render / output) - 1 (AMD), DLSS with
+/// EDEN_NX2_DLSS_JITTER log2(render / output) (NVIDIA). 2: DLSS gets FSR's formula too, so the
+/// same sharpness as FSR (-1.58 for 1440p -> 4K). Off: FSR -1.58, DLSS with jitter -0.58.
+inline int OcarinaLodRatioMode() {
+    static const int mode = OcarinaSwitch::Read("FRITCHII_OOT_LOD_RATIO", 0);
+    return mode;
+}
 
 constexpr OcarinaUpscaleBackend SelectOcarinaUpscaler(bool fsr_enabled, bool dlss_enabled,
                                                     bool dlss_available,
@@ -105,6 +189,25 @@ inline float OcarinaFsrLodBias(OcarinaUpscaleBackend backend) {
         return -1.58f;
     }
     return backend == OcarinaUpscaleBackend::Dlss && OcarinaDlssJitterMode() != 0 ? -0.58f : 0.0f;
+}
+
+/// FRITCHII_OOT_LOD_RATIO: the bias for the real render and output sizes (one side). `mode` 1: AMD's and
+/// NVIDIA's formulas, 2: FSR's for DLSS too. DLSS gets a bias only with its jitter on (without
+/// jitter a sharper mip only shimmers).
+inline float OcarinaLodBiasForSizes(OcarinaUpscaleBackend backend, unsigned render_size,
+                                    unsigned output_size, bool dlss_jitter, int mode) {
+    if (render_size == 0 || output_size == 0 || backend == OcarinaUpscaleBackend::Native) {
+        return 0.0f;
+    }
+    const float ratio = std::log2(static_cast<float>(render_size) /
+                                  static_cast<float>(output_size));
+    if (backend == OcarinaUpscaleBackend::Fsr) {
+        return ratio - 1.0f;
+    }
+    if (!dlss_jitter) {
+        return 0.0f;
+    }
+    return mode >= 2 ? ratio - 1.0f : ratio;
 }
 
 /// Whether a sampler with that bias keeps it for an image: only docked (handheld isn't measured),
