@@ -1052,8 +1052,17 @@ void OneFollowerDraw::SyncFromEngine(Maxwell3D& engine, bool full) {
                 views.clear(); // one view, the old one goes (as before the switch)
             } else {
                 std::erase_if(views, [&](const ViewSlot& slot) { return slot.engine == &engine; });
-                if (views.size() >= 4) {
+                // 32, not 4 (fable_b 25.1, 2026-11-15): with 5+ channels in rotation the oldest
+                // slot was always the next one needed, so every bind built a view (~30 ms/s on R
+                // and E's longest park). A view is a few hundred KiB.
+                if (views.size() >= 32) {
                     views.erase(views.begin()); // R named none of them since LeaveView
+                }
+                static std::atomic<u64> built{};
+                const u64 n = built.fetch_add(1, std::memory_order_relaxed) + 1;
+                if ((n & (n - 1)) == 0) { // 1, 2, 4, 8 ...: a construction storm shows in the log
+                    LOG_INFO(Render_Vulkan, "One follower: R built view {} (channel views kept {})",
+                             n, views.size() + 1);
                 }
             }
             auto fresh = std::make_unique<Maxwell3D>(engine.GetMemoryManager());
