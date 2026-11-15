@@ -2162,6 +2162,21 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   per channel. Line every 10 s "Front split dry: ...". Off: one relaxed load and a compare per
   Step, one plain load per hooked call (stage boundaries incl. FrontWriteSend, engine calls,
   writer notes, acquire checks, macro DMA reads, waits).
+- FRITCHII_NOTED_SUMMARY (live, default 0; F4 of work/FRONT_SPLIT_DESIGN.md 2d, the same shape as
+  FRITCHII_DISPATCH_WALK_SUMMARY): GpuSplit::NotedWriteSince (each 0xe2c read check whose page
+  snapshot predates a noted write) answers from page buckets before walking pending_writes. The
+  front keeps the newest note position per page bucket (4,096 by page hash) and one for notes
+  over more than 16 pages or of unknown range, from the moment the switch is first read non-zero
+  (the "floor"); a read since a position at or after the floor whose buckets and wide position
+  are all at or before it has no noted write (exact: every later note set its pages' buckets;
+  collisions only cause walks; the walk's own "table overflowed" answer is only conservative).
+  1 = on (answered checks skip the walk; 1 in 64 checks walk anyway, timed and compared), 2 =
+  verify (the walk runs after every check and answers; NotedSummaryDiffer: buckets said no,
+  walk found an overlapping note, must be 0, first 16 logged), 3 = dry (as 2, read for counts
+  and the timed saving). Line every 10 s "Noted summary (FRITCHII_NOTED_SUMMARY=N)": checks,
+  answered, why the others walked, walk notes the answered checks skip, the timed summary and
+  walk ns and the saving in ms/s, the differences. Also in the "Front split dry" line. Off: one
+  relaxed load per check, one plain load per note.
 - FRITCHII_ONEF_NULL_FILL (live, default 0; test only, the picture breaks): 1 = E skips
   FlushCaching, FillRing and PushDraw for every draw it would fill (no packet, R draws nothing;
   TickWork as after a push). The front-wall probe of work/FRONT_SPLIT_DESIGN.md 4.3. Line every

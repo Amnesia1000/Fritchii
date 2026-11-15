@@ -487,6 +487,7 @@ void GpuSplit::Stop() {
     last_unranged_position = 0;
     unranged_without_exp120 = 0;
     pending_write_count = 0;
+    noted_summary.live = false; // FRITCHII_NOTED_SUMMARY: positions start again at 0
     writer_range_count = 0;
     last_unbounded_writer_position = 0;
     writer_range_memory = nullptr;
@@ -1769,6 +1770,204 @@ void GpuSplit::DeferFunction(std::function<void()>&& func) {
         delete heap;
     });
     last_function_position = write_position;
+}
+
+// FRITCHII_NOTED_SUMMARY (live, default 0; F4 of work\FRONT_SPLIT_DESIGN.md 2d, the same shape as
+// FRITCHII_DISPATCH_WALK_SUMMARY): each 0xe2c read check walked pending_writes from the newest
+// note down to `since` (37 ms/s sampled). The summary keeps, per page bucket (4,096 by page
+// hash), the position of the newest note over the page, and one "wide" position for notes over
+// more than 16 pages or of unknown range.
+//
+// Exact: the buckets answer "no noted write" only when since >= floor and every bucket of the
+// read's pages and the wide position are at or before `since`. Positions only grow while the
+// session runs (the reset turns the summary off), and every note made after `floor` (the write
+// position when it went live; it stayed live since, or it would have a newer floor) set the
+// buckets of all its pages, or the wide position, to its own position, which is the position
+// the walk compares. So a note after `since` that overlaps the read shares a page with it (an
+// empty note at b counts as over b's page: the walk's overlap test can take it inside the
+// read) and keeps that bucket above `since`. Collisions only make a bucket newer (a walk).
+// The walk can also answer "write" because its table forgot notes (Overflow); the buckets
+// forget none, so their "no" is the exact answer there too (counted apart, not a difference).
+//
+// 1 = on: answered checks skip the walk; 1 in 64 checks walk anyway (timed, and compared).
+// 2 = verify: the walk runs after every check and answers; NotedSummaryDiffer counts "the
+//     buckets said no, the walk found an overlapping note" (must be 0, first 16 logged).
+// 3 = dry: as 2, read for the counts and the timed saving. Line every 10 s "Noted summary".
+void GpuSplit::NoteSummaryWrite(u64 begin, u64 size) {
+    auto& sum = noted_summary;
+    if (VideoCore::Nx2Debug::g_noted_summary.load(std::memory_order_relaxed) <= 0) {
+        sum.live = false; // Switched off: the next turn-on starts a new floor.
+        return;
+    }
+    const u64 position = write_position;
+    if (size == ~u64{0} || begin + size < begin) {
+        sum.wide = position;
+        return;
+    }
+    const u64 first = begin >> 12;
+    const u64 last = (begin + (std::max<u64>)(size, 1) - 1) >> 12;
+    if (last - first >= NotedMaxPages) {
+        sum.wide = position;
+        return;
+    }
+    for (u64 page = first; page <= last; ++page) {
+        sum.buckets[NotedBucket(page)] = position;
+    }
+}
+
+bool GpuSplit::NotedWriteSinceSummary(u64 since, u64 begin, u64 size) const {
+    namespace Debug = VideoCore::Nx2Debug;
+    const int mode = Debug::SwitchValue(Debug::g_noted_summary, "FRITCHII_NOTED_SUMMARY");
+    u64 scanned = 0;
+    if (mode < 1 || mode > 3) {
+        return NotedWalk(since, begin, size, scanned) != NotedWalkResult::None;
+    }
+    auto& sum = noted_summary;
+    if (!sum.live) {
+        // Notes sent so far were never bucketed: only reads since now or later can be answered.
+        sum.buckets.fill(0);
+        sum.wide = 0;
+        sum.floor = write_position;
+        sum.live = true;
+        sum.window_ns = Common::Nx2Hitch::NowNs();
+        sum.window_ticks = Nx2Profile::Ticks();
+        sum.logged = sum.stats;
+    }
+    auto& stats = sum.stats;
+    if ((++stats.checks & 1023) == 0) {
+        LogNotedSummary(mode);
+    }
+    const bool timed = (++sum.calls & 63) == 0;
+    const u64 t0 = timed ? Nx2Profile::Ticks() : 0;
+    enum class Answer : u8 { Miss, Bucket, Wide, Floor, Long };
+    Answer answer = Answer::Miss;
+    if (since < sum.floor) {
+        answer = Answer::Floor;
+    } else if (sum.wide > since) {
+        answer = Answer::Wide;
+    } else {
+        const u64 first = begin >> 12;
+        const u64 last = (begin + (std::max<u64>)(size, 1) - 1) >> 12;
+        if (begin + size < begin || last - first >= NotedMaxPages) {
+            answer = Answer::Long;
+        } else {
+            for (u64 page = first; page <= last; ++page) {
+                if (sum.buckets[NotedBucket(page)] > since) {
+                    answer = Answer::Bucket;
+                    break;
+                }
+            }
+        }
+    }
+    const u64 t1 = timed ? Nx2Profile::Ticks() : 0;
+    switch (answer) {
+    case Answer::Miss:
+        ++stats.answered;
+        break;
+    case Answer::Bucket:
+        ++stats.refused_bucket;
+        break;
+    case Answer::Wide:
+        ++stats.refused_wide;
+        break;
+    case Answer::Floor:
+        ++stats.refused_floor;
+        break;
+    case Answer::Long:
+        ++stats.refused_long;
+        break;
+    }
+    if (answer == Answer::Miss && mode == 1 && !timed) {
+        return false;
+    }
+    const NotedWalkResult walk = NotedWalk(since, begin, size, scanned);
+    const u64 t2 = timed ? Nx2Profile::Ticks() : 0;
+    if (timed) {
+        ++stats.timed;
+        stats.summary_ticks += t1 - t0;
+    }
+    if (answer == Answer::Miss) {
+        stats.avoided_notes += scanned;
+        if (timed) {
+            ++stats.timed_answered;
+            stats.walk_ticks_answered += t2 - t1;
+        }
+        if (walk == NotedWalkResult::Overlap) [[unlikely]] {
+            if (stats.differ++ < 16) {
+                LOG_WARNING(HW_GPU,
+                            "NotedSummaryDiffer (FRITCHII_NOTED_SUMMARY={}, must be 0): the "
+                            "buckets found no note over {:#x}+{:#x} since {} (floor {}, wide {}), "
+                            "the walk found one {} notes back",
+                            mode, begin, size, since, sum.floor, sum.wide, scanned);
+            }
+        } else if (walk == NotedWalkResult::Overflow) {
+            ++stats.overflow_answered;
+        }
+        if (mode == 1) {
+            return walk == NotedWalkResult::Overlap; // a difference takes the walk's answer
+        }
+    }
+    return walk != NotedWalkResult::None;
+}
+
+void GpuSplit::LogNotedSummary(int mode) const {
+    auto& sum = noted_summary;
+    const u64 now = Common::Nx2Hitch::NowNs();
+    if (now - sum.window_ns < 10'000'000'000ULL) {
+        return;
+    }
+    const u64 ticks = Nx2Profile::Ticks();
+    const double window = static_cast<double>(now - sum.window_ns) / 1e9;
+    const double ns_per_tick =
+        static_cast<double>(now - sum.window_ns) /
+        static_cast<double>((std::max)(ticks - sum.window_ticks, u64{1}));
+    const NotedSummaryStats& s = sum.stats;
+    const NotedSummaryStats& l = sum.logged;
+    const auto rate = [window](u64 count) { return static_cast<double>(count) / window; };
+    const u64 checks = s.checks - l.checks;
+    const u64 answered = s.answered - l.answered;
+    const u64 timed = s.timed - l.timed;
+    const u64 timed_answered = s.timed_answered - l.timed_answered;
+    const u64 summary_ticks = s.summary_ticks - l.summary_ticks;
+    const u64 walk_ticks = s.walk_ticks_answered - l.walk_ticks_answered;
+    // At 1 only the timed answered checks walked: their notes scaled to all answered ones.
+    const double avoided =
+        mode == 1 ? (timed_answered != 0 ? static_cast<double>(s.avoided_notes - l.avoided_notes) *
+                                               static_cast<double>(answered) /
+                                               static_cast<double>(timed_answered)
+                                         : 0.0)
+                  : static_cast<double>(s.avoided_notes - l.avoided_notes);
+    const double summary_ns =
+        timed != 0 ? static_cast<double>(summary_ticks) * ns_per_tick / static_cast<double>(timed)
+                   : 0.0;
+    const double walk_ns = timed_answered != 0 ? static_cast<double>(walk_ticks) * ns_per_tick /
+                                                     static_cast<double>(timed_answered)
+                                               : 0.0;
+    // The walks the answered checks skip (would skip, at 2 and 3) minus the summary on every
+    // check, from the timed 1 in 64, scaled to all checks.
+    const double saving_ms =
+        timed != 0 ? (static_cast<double>(walk_ticks) - static_cast<double>(summary_ticks)) *
+                         ns_per_tick * static_cast<double>(checks) / static_cast<double>(timed) /
+                         1e6 / window
+                   : 0.0;
+    LOG_INFO(HW_GPU,
+             "Noted summary (FRITCHII_NOTED_SUMMARY={}) {:.0f} s: checks {:.0f}/s, answered by "
+             "the buckets {:.0f}/s ({:.0f}%; {}); walked: page bucket newer {:.0f}/s, wide note "
+             "{:.0f}/s, read older than the summary {:.0f}/s, read over 16 pages {:.0f}/s; walk "
+             "notes on answered checks {:.0f}/s; timed 1 in 64: summary {:.0f} ns a check, walk "
+             "{:.0f} ns an answered check, saving {:.2f} ms/s; NotedSummaryDiffer {} this "
+             "session (must be 0), walk overflows the buckets answered {}",
+             mode, window, rate(checks), rate(answered),
+             checks != 0 ? static_cast<double>(answered) * 100.0 / static_cast<double>(checks)
+                         : 0.0,
+             mode == 1 ? "walk skipped" : "the walk ran and answered",
+             rate(s.refused_bucket - l.refused_bucket),
+             rate(s.refused_wide - l.refused_wide), rate(s.refused_floor - l.refused_floor),
+             rate(s.refused_long - l.refused_long), avoided / window, summary_ns, walk_ns,
+             saving_ms, s.differ, s.overflow_answered);
+    sum.logged = s;
+    sum.window_ns = now;
+    sum.window_ticks = ticks;
 }
 
 void GpuSplit::NoteWrite(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size) {

@@ -56,6 +56,8 @@ s32 g_entry_channel{};
 u64 g_since_ns{};
 u64 g_since_ticks{};
 u64 g_since_position{};
+/// FRITCHII_NOTED_SUMMARY's totals at the window's start (its part of the line).
+GpuSplit::NotedSummaryStats g_since_noted{};
 u32 g_rand{0x9e3779b9U};
 
 [[nodiscard]] bool Take() noexcept {
@@ -96,6 +98,35 @@ void ResetWindow() noexcept {
     g_since_ns = Nx2Profile::Now();
     g_since_ticks = Ticks();
     g_since_position = SentPosition();
+    g_since_noted = GpuSplit::Get().GetNotedSummaryStats();
+}
+
+/// F4's part of the line: what the noted summary answered in this window.
+std::string NotedSummaryText(double window, double ns_per_tick) {
+    const int mode = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_noted_summary,
+                                                      "FRITCHII_NOTED_SUMMARY");
+    if (mode < 1 || mode > 3) {
+        return fmt::format("noted summary off (FRITCHII_NOTED_SUMMARY={})", mode);
+    }
+    const auto& s = GpuSplit::Get().GetNotedSummaryStats();
+    const auto& l = g_since_noted;
+    const u64 checks = s.checks - l.checks;
+    const u64 answered = s.answered - l.answered;
+    const u64 timed = s.timed - l.timed;
+    // Walks avoided: at 1 the answered checks less the timed ones (they walk); 2 and 3 walk all.
+    const u64 avoided = mode == 1 ? answered - (s.timed_answered - l.timed_answered) : 0;
+    const double saving =
+        timed != 0
+            ? (static_cast<double>(s.walk_ticks_answered - l.walk_ticks_answered) -
+               static_cast<double>(s.summary_ticks - l.summary_ticks)) *
+                  ns_per_tick * static_cast<double>(checks) / static_cast<double>(timed) / 1e6 /
+                  window
+            : 0.0;
+    return fmt::format("noted summary (FRITCHII_NOTED_SUMMARY={}): answered {:.0f}/s of {:.0f}/s "
+                       "checks, walks avoided {:.0f}/s, sampled saving {:.2f} ms/s, differ {}",
+                       mode, static_cast<double>(answered) / window,
+                       static_cast<double>(checks) / window,
+                       static_cast<double>(avoided) / window, saving, s.differ);
 }
 
 void Report(u64 now_ns) {
@@ -182,14 +213,14 @@ void Report(u64 now_ns) {
              "GPU-written list {:.0f}, Step run {:.0f}; Step defers {:.0f}/s (encoded, no "
              "join); engine calls {:.0f}/s; 2c raw ring words {:.0f}/s (today {:.0f}/s); 0xe2c "
              "by answer /s: {}; other macro reads /s: {}; channels ms/s: {}; re-read twice "
-             "{:.0f}/s",
+             "{:.0f}/s; {}",
              parser, state3d, compute, sends, parser + state3d + compute + sends, t.entries,
              c.entries, waits_ms, Nx2Profile::Enabled() ? ", profiled" : "", rate(c.entries),
              rate(c.headers), rate(c.words), rate(c.suspensions), rate(joins),
              join(JoinCause::Acquire), join(JoinCause::WriterCheck), join(JoinCause::GpuList),
              join(JoinCause::StepRun), rate(c.step_defers), rate(c.engine_calls),
              rate(c.raw_ring_words), rate(sent_words), answers(c.e2c), answers(c.other_reads),
-             channels, rate(c.reread_twice));
+             channels, rate(c.reread_twice), NotedSummaryText(window, ns_per_tick));
 }
 
 } // Anonymous namespace

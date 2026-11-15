@@ -1150,23 +1150,63 @@ public:
     }
     /// The noted-write part of MayBeWrittenSince: a NoteMemoryWrite sent after `since` overlaps
     /// [begin, begin + size), or more were noted since than are remembered.
+    /// FRITCHII_NOTED_SUMMARY (live, default 0; F4 of work\FRONT_SPLIT_DESIGN.md 2d): the page
+    /// buckets answer first (NotedWriteSinceSummary). Off: one relaxed load and a branch.
     [[nodiscard]] bool NotedWriteSince(u64 since, u64 begin, u64 size) const {
         if (last_memory_writer_position <= since) {
             return false;
         }
+        if (VideoCore::Nx2Debug::g_noted_summary.load(std::memory_order_relaxed) != 0)
+            [[unlikely]] {
+            return NotedWriteSinceSummary(since, begin, size);
+        }
+        u64 scanned = 0;
+        return NotedWalk(since, begin, size, scanned) != NotedWalkResult::None;
+    }
+    /// The walk of NotedWriteSince, newest note first, down to `since`: Overlap (a note after
+    /// `since` overlaps the bytes), Overflow (none did, but the table ends first: a dropped note
+    /// may), None. `scanned`: the notes looked at.
+    enum class NotedWalkResult : u8 { None, Overlap, Overflow };
+    [[nodiscard]] NotedWalkResult NotedWalk(u64 since, u64 begin, u64 size, u64& scanned) const {
         const u64 end = begin + size;
         const u64 remembered = (std::min<u64>)(pending_write_count, pending_writes.size());
-        for (u64 scanned = 0; scanned < remembered; ++scanned) {
+        for (scanned = 0; scanned < remembered; ++scanned) {
             const PendingWrite& write =
                 pending_writes[(pending_write_count - 1 - scanned) % pending_writes.size()];
             if (write.position <= since) {
-                return false;
+                return NotedWalkResult::None;
             }
             if (write.begin < end && begin < write.end) {
-                return true;
+                ++scanned;
+                return NotedWalkResult::Overlap;
             }
         }
-        return remembered == pending_writes.size();
+        return remembered == pending_writes.size() ? NotedWalkResult::Overflow
+                                                   : NotedWalkResult::None;
+    }
+    /// FRITCHII_NOTED_SUMMARY (F4): checks that reached the walk's place, the ones the buckets
+    /// answered (no noted write: the walk skipped at 1), why the others walked, the walk notes
+    /// the answered checks would skip (2 and 3, and the timed ones at 1), the timed checks (1 in
+    /// 64: the summary and the walk timed apart, in time stamp ticks), and the differences (the
+    /// buckets said no write, the walk found an overlapping note: must be 0) and the walk
+    /// overflows the buckets answered (the table's limit, not a difference). Session totals.
+    struct NotedSummaryStats {
+        u64 checks{};
+        u64 answered{};
+        u64 refused_bucket{};
+        u64 refused_wide{};
+        u64 refused_floor{};
+        u64 refused_long{};
+        u64 avoided_notes{};
+        u64 timed{};
+        u64 timed_answered{};
+        u64 summary_ticks{};
+        u64 walk_ticks_answered{};
+        u64 differ{};
+        u64 overflow_answered{};
+    };
+    [[nodiscard]] const NotedSummaryStats& GetNotedSummaryStats() const {
+        return noted_summary.stats;
     }
     /// FRITCHII_FRONT_RAN_READS (Maxwell3D::FrontDmaRead): whether the back ran every write noted
     /// over [begin, begin + size) after `since`, that is none of them is past `done` (ConsumedNow,
@@ -1262,6 +1302,9 @@ public:
     /// report, a semaphore release). size ~0 means an unknown range.
     void NoteMemoryWrite(u64 begin, u64 size, const char* what = "unknown") {
         FrontSplit::NoteWriterSent(); // FRITCHII_FRONT_SPLIT_COUNT: one plain load off
+        if (noted_summary.live) [[unlikely]] {
+            NoteSummaryWrite(begin, size); // FRITCHII_NOTED_SUMMARY: one plain load off
+        }
         if (write_stamps) [[unlikely]] {
             if (size == ~u64{0}) {
                 unknown_write_position = write_position;
@@ -1280,6 +1323,9 @@ public:
     /// linear inline upload data): reads overlay them instead of waiting.
     void NoteMemoryWriteData(u64 begin, const u32* data, u32 words, const char* what = "known") {
         FrontSplit::NoteWriterSent(); // FRITCHII_FRONT_SPLIT_COUNT: one plain load off
+        if (noted_summary.live && words != 0) [[unlikely]] {
+            NoteSummaryWrite(begin, u64{words} * sizeof(u32)); // FRITCHII_NOTED_SUMMARY
+        }
         if (write_stamps) [[unlikely]] {
             StampWrite(begin, begin + u64{words} * sizeof(u32), false);
         }
@@ -1843,6 +1889,32 @@ private:
     };
     std::array<PendingWrite, 8192> pending_writes{};
     u64 pending_write_count{};
+    /// FRITCHII_NOTED_SUMMARY (F4, front only): the newest note position per page bucket (4,096
+    /// buckets by page hash), and one for notes over more than 16 pages or of unknown range.
+    /// Notes are bucketed only while `live`; `floor` is the position when it went live (notes
+    /// before it were never bucketed). Mutable: the const query turns it on and counts.
+    static constexpr size_t NotedBuckets = 4096;
+    static constexpr u64 NotedMaxPages = 16;
+    struct NotedSummary {
+        bool live{};
+        u32 calls{};
+        u64 floor{};
+        u64 wide{};
+        u64 window_ns{};
+        u64 window_ticks{};
+        NotedSummaryStats stats{};
+        NotedSummaryStats logged{};
+        std::array<u64, NotedBuckets> buckets{};
+    };
+    mutable NotedSummary noted_summary;
+    [[nodiscard]] static size_t NotedBucket(u64 page) {
+        return static_cast<size_t>((page * 0x9e3779b97f4a7c15ULL) >> 52);
+    }
+    /// The note path's half (front, while live): buckets the note [begin, begin + size).
+    void NoteSummaryWrite(u64 begin, u64 size);
+    /// NotedWriteSince with the switch on (any value): modes 1, 2 and 3.
+    [[nodiscard]] bool NotedWriteSinceSummary(u64 since, u64 begin, u64 size) const;
+    void LogNotedSummary(int mode) const;
     /// Compute and copy writes with a known device range (NoteWriterRange), newest last.
     struct WriterRange {
         u64 position;
