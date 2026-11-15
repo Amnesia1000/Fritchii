@@ -437,6 +437,9 @@ enum class RasterOp : u8 {
     ResetCounter,    ///< type
     SignalSyncPoint, ///< value
 };
+/// The renderer's: a samples counter reset (QueryType::ZPassPixelCount64) E1 queues for E2 clears
+/// E1's copy of the one follower's samples mirror at once (RasterizerVulkan::onef_mirror_queued).
+inline void (*g_mirror_reset)(VideoCore::RasterizerInterface* rasterizer) = nullptr;
 void QueueRasterOpImpl(RasterOp op, VideoCore::RasterizerInterface& rasterizer, u64 address,
                        u32 a, u32 b, u32 c, u32 d) noexcept;
 /// Maxwell3D, at the rasterizer call a raster-op method ends in: true when it went to E2's queue

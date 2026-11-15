@@ -1567,6 +1567,12 @@ void QueueRasterOpImpl(RasterOp op, VideoCore::RasterizerInterface& rasterizer, 
         RasterOp op;
     } const raster{&rasterizer, address, a, b, c, d, op};
     static_assert(sizeof(Raster) <= AsyncPayloadBytes && std::is_trivially_copyable_v<Raster>);
+    // The samples mirror: E1's copy follows its queue (the reset clears it on E2 later).
+    if (op == RasterOp::ResetCounter &&
+        a == static_cast<u32>(VideoCommon::QueryType::ZPassPixelCount64) &&
+        g_mirror_reset != nullptr) {
+        g_mirror_reset(&rasterizer);
+    }
     // FRITCHII_ESPLIT_OWED: a report lands at `address` (16 bytes at most): on a shader page the
     // next lookup drains and flushes first.
     if (op == RasterOp::Query && g_owed_shader_rule) {

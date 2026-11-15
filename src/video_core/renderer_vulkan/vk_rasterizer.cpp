@@ -704,6 +704,10 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
     VideoCommon::Runahead::SetHooks(&runahead_hooks);
     // One follower, part c: R's draw player (idle below step 3).
     onef_draw = std::make_unique<OneFollowerDraw>(*this);
+    // FRITCHII_ESPLIT: a samples reset E1 queues for E2 clears E1's copy of the mirror at once.
+    VideoCommon::ESplit::g_mirror_reset = [](VideoCore::RasterizerInterface* rasterizer) {
+        static_cast<RasterizerVulkan*>(rasterizer)->onef_mirror_queued = false;
+    };
     VideoCommon::OneFollower::SetDrawPlayer(onef_draw.get());
 }
 
@@ -3857,7 +3861,26 @@ void RasterizerVulkan::CollectIndirectTrace() {
 void RasterizerVulkan::OneFollowerMirrorDraw() {
     if ((VideoCommon::OneFollower::SyncMirrorOn() || VideoCommon::OneFollower::PostFenceOn()) &&
         channel_state->maxwell3d.regs.zpass_pixel_count_enable) {
+        // FRITCHII_ESPLIT's queued mode: E1 is ahead of the reports and resets E2 still has to
+        // run; setting the bit here would start the mirror before an earlier reset cleared it
+        // (of27b: "R's samples counter ran where E's mirror had it stopped", POST_FENCE stopped
+        // for the session and every fence and wait for idle was lent from then on). The set goes
+        // through E2's queue, once per started run (E1's own copy says whether E2's will be set).
+        if (VideoCommon::ESplit::QueueKind(VideoCommon::ESplit::KindRasterOps)) [[unlikely]] {
+            if (!std::exchange(onef_mirror_queued, true)) {
+                RasterizerVulkan* const self = this;
+                std::memcpy(VideoCommon::ESplit::BeginAsync(VideoCommon::ESplit::Hand::Raster),
+                            &self, sizeof(self));
+                VideoCommon::ESplit::PostAsync([](void* raw) {
+                    RasterizerVulkan* r;
+                    std::memcpy(&r, raw, sizeof(r));
+                    r->onef_samples_started = true;
+                });
+            }
+            return;
+        }
         onef_samples_started = true;
+        onef_mirror_queued = true;
     }
 }
 
@@ -5649,6 +5672,10 @@ void RasterizerVulkan::ResetCounter(VideoCommon::QueryType type) {
         namespace OneF = VideoCommon::OneFollower;
         if (type == VideoCommon::QueryType::ZPassPixelCount64) {
             onef_samples_started = false; // the mirror (fable_b 16.2)
+            // FRITCHII_ESPLIT: E1's copy (on E2 the queue's hook cleared it when E1 queued this).
+            if (!VideoCommon::ESplit::OnE2()) {
+                onef_mirror_queued = false;
+            }
         }
         OneF::SetQueryKind(OneF::QueryKind::Reset);
         if (OneF::QueryOps()) {
