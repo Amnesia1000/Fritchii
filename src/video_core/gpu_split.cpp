@@ -2000,6 +2000,11 @@ void GpuSplit::LogNotedSummary(int mode) const {
 //   note at or before `since`, or a link to a note the table forgot (number < the oldest
 //   remembered), visits every member that is in S. A link always names the chain's previous
 //   note, linked while live, so its slot holds that note while it is remembered.
+// - A chain passes over a note when a newer note of it covers its bytes (begin and end within
+//   the newer one's): every read the walk's test finds overlapping the older note overlaps the
+//   newer one too (nb <= cb < end and begin < ce <= ne), and the newer one is in S whenever the
+//   older one is (newer, so remembered, and its position is not lower). The newest of such a
+//   cover sequence is visited.
 // - A note of S that overlaps the read shares a byte with it (an empty note at b: the walk's
 //   test needs begin < b < end, so b is a byte of the read), so a note inside one page sits in
 //   the bucket of one of the read's pages. Every other note is in the wide chain. The lookup
@@ -2037,7 +2042,20 @@ void GpuSplit::LinkNotedFast(u64 seq) {
             }
         }
     }
-    fast.links[slot] = *head;
+    // A head this note covers (its bytes within this note's) is passed over: every read that
+    // overlaps it overlaps this note, which is newer (in every walk the head is in). Repeated
+    // notes over the same bytes (a report slot each frame, unknown ranges, an upload noted again
+    // by each of its words) keep their chain one note long.
+    u64 link = *head;
+    if (link != 0 && link + PendingWriteSlots > seq + 1) { // the head is still remembered
+        const size_t head_slot = static_cast<size_t>((link - 1) % PendingWriteSlots);
+        const PendingWrite& covered = pending_writes[head_slot];
+        if (write.begin <= covered.begin && covered.end <= write.end) {
+            link = fast.links[head_slot];
+            ++fast.stats.linked_covered;
+        }
+    }
+    fast.links[slot] = link;
     *head = seq + 1;
 }
 
@@ -2228,8 +2246,8 @@ void GpuSplit::LogNotedFast(int mode) const {
              "the walk {:.0f}/s ({:.0f}%; {}; a write {:.0f}/s, of it table overflow {:.0f}/s), "
              "walk entries skipped {:.0f}/s, sampled saving {:.2f} ms/s, differ {} (must be 0, "
              "session {}); walked anyway: older than the chains {:.0f}/s, read over 16 pages "
-             "{:.0f}/s; chain notes looked at {:.0f}/s; notes linked {:.0f}/s, wide chain "
-             "{:.0f}/s (unknown range {:.0f}/s; {})",
+             "{:.0f}/s; chain notes looked at {:.0f}/s; notes linked {:.0f}/s (past a covered "
+             "head {:.0f}/s), wide chain {:.0f}/s (unknown range {:.0f}/s; {})",
              mode, window, rate(checks), rate(answered),
              checks != 0 ? static_cast<double>(answered) * 100.0 / static_cast<double>(checks)
                          : 0.0,
@@ -2237,7 +2255,8 @@ void GpuSplit::LogNotedFast(int mode) const {
              rate(s.answered_yes - l.answered_yes), rate(s.overflow_yes - l.overflow_yes),
              skipped / window, saving_ms, s.differ - l.differ, s.differ,
              rate(s.floor - l.floor), rate(s.long_reads - l.long_reads), touched / window,
-             rate(s.linked - l.linked), rate(s.linked_wide - l.linked_wide),
+             rate(s.linked - l.linked), rate(s.linked_covered - l.linked_covered),
+             rate(s.linked_wide - l.linked_wide),
              rate(s.linked_unknown - l.linked_unknown),
              wide_text.empty() ? std::string{"none"} : wide_text);
     fast.logged = s;

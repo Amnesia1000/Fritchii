@@ -1957,6 +1957,7 @@ private:
         u64 linked{};         ///< notes linked
         u64 linked_wide{};    ///< of them, into the wide chain
         u64 linked_unknown{}; ///< of those, of unknown range
+        u64 linked_covered{}; ///< notes linked past their chain's head (it covers the head)
     };
     static constexpr size_t NotedChains = 4096;
     struct NotedFastKind {
