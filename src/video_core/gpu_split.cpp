@@ -520,6 +520,7 @@ void GpuSplit::Stop() {
     stamp_page = ~GPUVAddr{0};
     stamp_read_pages.clear();
     stamp_read_cache_page = ~u64{0};
+    ++stamp_read_gen; // FRITCHII_FRONT_TRIM_RANGE: positions start over too
     stamp_skip_floor = 0;
     if (write_stamps) {
         // The next session's positions start at 0 again.
@@ -871,12 +872,41 @@ bool GpuSplit::WaitForSyncedWriters(DrainSite site) {
     return WaitFor(std::min({last_writer_position, last_sync_position, write_position}), site);
 }
 
-void GpuSplit::RangeLastWrite(GPUVAddr begin, GPUVAddr end, const u32* data, size_t space,
-                              const Tegra::MemoryManager* memory) {
+int GpuSplit::RangedEnvSwitches() {
     static const bool enabled = [] {
         const char* const value = std::getenv("EDEN_NX2_RANGED_WAITS");
         return value == nullptr || value[0] != '0';
     }();
+    static const bool forward = [] {
+        const char* const value = std::getenv("EDEN_NX2_FORWARD_READS");
+        return value == nullptr || value[0] != '0';
+    }();
+    return (enabled ? 1 : 0) | (forward ? 2 : 0);
+}
+
+int GpuSplit::FrontTrimRangeMode() {
+    return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_front_trim_range,
+                                            "FRITCHII_FRONT_TRIM_RANGE");
+}
+
+void GpuSplit::RangeLastWrite(GPUVAddr begin, GPUVAddr end, const u32* data, size_t space,
+                              const Tegra::MemoryManager* memory) {
+    // FRITCHII_FRONT_TRIM_RANGE: the environment switches from a member (the same statics fill
+    // it once). Off: one relaxed load and a branch, then the statics as before.
+    const int trim = FrontTrimRangeMode();
+    int env;
+    if (trim != 0) [[unlikely]] {
+        if (ranged_env < 0) [[unlikely]] {
+            ranged_env = RangedEnvSwitches();
+        }
+        env = ranged_env;
+        if ((++trim_range.calls & 4095) == 0) [[unlikely]] {
+            LogTrimRange(trim);
+        }
+    } else {
+        env = RangedEnvSwitches();
+    }
+    const bool enabled = (env & 1) != 0;
     // Only the method that was just sent: anything after it keeps its unranged mark.
     if (!enabled || begin >= end || last_memory_write_position != write_position) {
         return;
@@ -892,7 +922,7 @@ void GpuSplit::RangeLastWrite(GPUVAddr begin, GPUVAddr end, const u32* data, siz
         // counted (1). Needs the device stamps (EXP126) and a translation; else as before.
         const int read_pages = StampReadPagesMode();
         if (read_pages == 0 || memory == nullptr || !RangedDeviceStamps() ||
-            !StampRangedRead(*memory, begin, end, read_pages == 2)) {
+            !StampRangedRead(*memory, begin, end, read_pages == 2, trim)) {
             StampWrite(begin, end, true);
             if (RangedDeviceStamps()) {
                 if (memory != nullptr) {
@@ -907,12 +937,8 @@ void GpuSplit::RangeLastWrite(GPUVAddr begin, GPUVAddr end, const u32* data, siz
             MaybeLogStampRead(read_pages);
         }
     }
-    static const bool forward = [] {
-        const char* const value = std::getenv("EDEN_NX2_FORWARD_READS");
-        return value == nullptr || value[0] != '0';
-    }();
-    if (!forward) {
-        data = nullptr;
+    if ((env & 2) == 0) {
+        data = nullptr; // EDEN_NX2_FORWARD_READS=0
     }
     const size_t words = static_cast<size_t>(end - begin) / sizeof(u32);
     // Consecutive uploads continue one range (each word may use another of the 16 data methods).
@@ -1250,7 +1276,7 @@ bool GpuSplit::StampPageRead(u64 page) {
 }
 
 bool GpuSplit::StampRangedRead(const Tegra::MemoryManager& memory, GPUVAddr begin, GPUVAddr end,
-                               bool skip) {
+                               bool skip, int trim) {
     auto& s = stamp_read_stats;
     ++s.writes;
     // Over a page, block stamps per page would not be StampWrite's page stamps: as before.
@@ -1274,22 +1300,98 @@ bool GpuSplit::StampRangedRead(const Tegra::MemoryManager& memory, GPUVAddr begi
     // 16 KiB), or neither where no reader ever asked about the device page.
     constexpr GPUVAddr page_size = 0x1000;
     for (GPUVAddr page = begin & ~(page_size - 1); page < end; page += page_size) {
-        if (&memory != stamp_memory || page != stamp_page ||
-            stamp_function != last_function_position) {
-            const std::optional<DAddr> device = memory.GpuToCpuAddress(page);
-            stamp_memory = &memory;
-            stamp_page = page;
-            stamp_function = last_function_position;
-            stamp_mapped = device.has_value();
-            stamp_device = device.value_or(0);
+        // FRITCHII_FRONT_TRIM_RANGE: the page's answer from the trim table when it holds it.
+        TrimPage* entry = nullptr;
+        bool in_table = false;
+        u64 t0 = 0;
+        bool timed = false;
+        if (trim != 0) [[unlikely]] {
+            timed = trim == 3 && (trim_range.lookups & 63) == 0;
+            t0 = timed ? Nx2Profile::Ticks() : 0;
+            ++trim_range.lookups;
+            entry = &trim_pages[(page >> 12) & (TrimPages - 1)];
+            in_table = entry->memory == &memory && entry->page == page &&
+                       entry->function == last_function_position &&
+                       entry->read_gen == stamp_read_gen && entry->serial == memory.MapSerial();
+            trim_range.answered += in_table ? 1 : 0;
+        }
+        bool mapped;
+        u64 device_page_address;
+        bool read_hit = false;
+        if (trim == 1 && in_table) {
+            mapped = entry->mapped;
+            device_page_address = entry->device;
+            read_hit = entry->read_hit;
+        } else {
+            const u64 t1 = timed ? Nx2Profile::Ticks() : 0;
+            bool translated = false;
+            Tegra::MemoryManager::MapRead map_read{};
+            if (&memory != stamp_memory || page != stamp_page ||
+                stamp_function != last_function_position) {
+                if (trim != 0 && !in_table) [[unlikely]] {
+                    map_read = memory.BeginMapRead();
+                    translated = true;
+                }
+                const std::optional<DAddr> device = memory.GpuToCpuAddress(page);
+                stamp_memory = &memory;
+                stamp_page = page;
+                stamp_function = last_function_position;
+                stamp_mapped = device.has_value();
+                stamp_device = device.value_or(0);
+            }
+            mapped = stamp_mapped;
+            device_page_address = stamp_device;
+            if (mapped) {
+                read_hit = StampPageRead(stamp_device >> 12);
+            }
+            if (trim != 0) [[unlikely]] {
+                if (in_table) {
+                    if (timed) {
+                        // Dry: the old lookup against the table's (t0..t1 is the table's).
+                        trim_range.old_ticks += Nx2Profile::Ticks() - t1;
+                        trim_range.table_ticks += t1 - t0;
+                        ++trim_range.timed;
+                    }
+                    if (trim == 2) {
+                        ++trim_range.checked;
+                        const bool same =
+                            entry->mapped == mapped &&
+                            (!mapped ||
+                             (entry->device == device_page_address && entry->read_hit == read_hit));
+                        if (!same) [[unlikely]] {
+                            ++trim_range.differ;
+                            if (trim_range_differ_total++ < 16) {
+                                LOG_WARNING(
+                                    HW_GPU,
+                                    "Front trim range (FRITCHII_FRONT_TRIM_RANGE=2, must be 0): "
+                                    "GPU page {:#x} table says mapped {} device {:#x} read {}, "
+                                    "the old lookup mapped {} device {:#x} read {}",
+                                    page, entry->mapped, entry->device, entry->read_hit, mapped,
+                                    device_page_address, read_hit);
+                            }
+                        }
+                    }
+                } else if (translated && memory.MapReadStable(map_read)) {
+                    // A fresh, stable translation: kept for this page.
+                    *entry = TrimPage{.memory = &memory,
+                                      .page = page,
+                                      .function = last_function_position,
+                                      .serial = map_read.serial,
+                                      .read_gen = stamp_read_gen,
+                                      .device = mapped ? device_page_address : 0,
+                                      .mapped = mapped,
+                                      .read_hit = mapped && read_hit};
+                    ++trim_range.fills;
+                }
+            }
         }
         const GPUVAddr from = (std::max)(begin, page);
         const GPUVAddr to = (std::min)(end, page + page_size);
-        if (!stamp_mapped) {
+        if (!mapped) {
             StampWrite(from, to, true); // As before: the GPU stamp only (the back writes nothing)
             continue;
         }
-        if (StampPageRead(stamp_device >> 12)) {
+        if (read_hit) {
             ++s.pages_read;
         } else {
             ++s.pages_skipped;
@@ -1299,7 +1401,7 @@ bool GpuSplit::StampRangedRead(const Tegra::MemoryManager& memory, GPUVAddr begi
             }
         }
         StampWrite(from, to, true);
-        StampWrite(stamp_device + (from - page), stamp_device + (to - page), false);
+        StampWrite(device_page_address + (from - page), device_page_address + (to - page), false);
     }
     ++floor_stats.device_stamped;
     return true;
@@ -1312,6 +1414,7 @@ u64 GpuSplit::StampReadFloor(u64 device, u64 size) const {
     if (stamp_read_pages.size() >= StampReadPagesMax) {
         // A page asked about again takes the newest skipped write as its floor: still exact.
         stamp_read_pages.clear();
+        ++stamp_read_gen;
         ++stamp_read_stats.clears;
     }
     u64 floor = 0;
@@ -1320,6 +1423,7 @@ u64 GpuSplit::StampReadFloor(u64 device, u64 size) const {
         if (inserted) {
             ++stamp_read_stats.added;
             stamp_read_cache_page = ~u64{0};
+            ++stamp_read_gen;
         }
         floor = (std::max)(floor, it->second);
     }
@@ -1352,6 +1456,48 @@ void GpuSplit::MaybeLogStampRead(int mode) {
              rate(s.added), rate(s.floors), s.clears);
     s = {};
     s.since = now;
+}
+
+void GpuSplit::LogTrimRange(int mode) {
+    const u64 now = Common::Nx2Hitch::NowNs();
+    const u64 ticks = Nx2Profile::Ticks();
+    if (trim_range_window_ns == 0) {
+        trim_range_window_ns = now;
+        trim_range_window_ticks = ticks;
+        trim_range_logged = trim_range;
+        return;
+    }
+    if (now - trim_range_window_ns < 10'000'000'000ULL) {
+        return;
+    }
+    const double window = static_cast<double>(now - trim_range_window_ns) / 1e9;
+    const double ns_per_tick =
+        static_cast<double>(now - trim_range_window_ns) /
+        static_cast<double>((std::max)(ticks - trim_range_window_ticks, u64{1}));
+    const TrimRangeStats& s = trim_range;
+    const TrimRangeStats& l = trim_range_logged;
+    const auto rate = [window](u64 count) { return static_cast<double>(count) / window; };
+    const u64 timed = s.timed - l.timed;
+    const double old_ns =
+        timed != 0 ? static_cast<double>(s.old_ticks - l.old_ticks) * ns_per_tick / timed : 0.0;
+    const double table_ns =
+        timed != 0 ? static_cast<double>(s.table_ticks - l.table_ticks) * ns_per_tick / timed
+                   : 0.0;
+    // Dry: what taking the table's answers would save, from the timed answered lookups.
+    const double saving_ms =
+        rate(s.answered - l.answered) * (std::max)(old_ns - table_ns, 0.0) / 1e6;
+    LOG_INFO(HW_GPU,
+             "Front trim range (FRITCHII_FRONT_TRIM_RANGE={}) {:.0f} s: ranged write pages looked "
+             "up {:.0f}/s, answered by the table {:.0f}/s ({}), table fills {:.0f}/s; verify: {:.0f} "
+             "checked/s, {} differ (must be 0, {} since boot); dry: old lookup {:.1f} ns, table "
+             "{:.1f} ns ({} timed), saving ~{:.2f} ms/s (the static guards' share not counted)",
+             mode, window, rate(s.lookups - l.lookups), rate(s.answered - l.answered),
+             mode == 1 ? "taken" : "would be", rate(s.fills - l.fills),
+             rate(s.checked - l.checked), s.differ - l.differ, trim_range_differ_total, old_ns,
+             table_ns, timed, saving_ms);
+    trim_range_logged = trim_range;
+    trim_range_window_ns = now;
+    trim_range_window_ticks = ticks;
 }
 
 int GpuSplit::OverflowFloorMode() {

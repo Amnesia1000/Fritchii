@@ -228,7 +228,127 @@ struct FrontQmdMirror {
     u64 session_reads{};
     u32 strikes{};
 
-    const Overlay* FindOverlay(const void* space, GPUVAddr address) const {
+    /// FRITCHII_FRONT_TRIM_QMD (helper Z): each overlay's address and position, and each
+    /// shadow's address, also in compact arrays. A walk of the entries themselves touches one
+    /// cache line per 288-byte overlay (256 of them) or per 4 KB shadow (64) for every QMD read,
+    /// inline QMD and patch; the arrays hold the same values (overlay addresses are written only
+    /// in AddOverlay, positions only through SetOverlayPosition, shadow addresses only in
+    /// NewShadow) whatever the switch says, so the trim can be switched live.
+    std::array<GPUVAddr, MaxOverlays> overlay_addresses{};
+    std::array<u64, MaxOverlays> overlay_positions{};
+    std::array<GPUVAddr, MaxShadows> shadow_addresses{};
+    void SetOverlayPosition(Overlay& overlay, u64 position) {
+        overlay.position = position;
+        overlay_positions[static_cast<size_t>(&overlay - overlays.data())] = position;
+    }
+    enum class TrimSite : u8 { FindOverlay, AddOverlay, FindShadow };
+    struct TrimQmdStats {
+        std::array<u64, 3> calls;  ///< lookups with the trim on, per site
+        std::array<u64, 3> differ; ///< 2: the arrays' answer differs from the walk (must be 0)
+        std::array<u64, 3> timed;  ///< 3: lookups timed (1 in 64)
+        std::array<u64, 3> old_ticks;
+        std::array<u64, 3> trim_ticks;
+    };
+    mutable TrimQmdStats trim_qmd{};
+    mutable TrimQmdStats trim_qmd_logged{};
+    mutable u64 trim_qmd_differ_total{};
+    mutable std::chrono::steady_clock::time_point trim_qmd_since{};
+    mutable u64 trim_qmd_since_ticks{};
+    static int TrimQmdMode() {
+        return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_front_trim_qmd,
+                                                "FRITCHII_FRONT_TRIM_QMD");
+    }
+    /// Runs the arrays' lookup `trimmed` and/or the old walk `walk` for `site` as the switch says
+    /// (1: the arrays'; 2: both, the walk answers, differences counted; 3: the walk, both timed
+    /// 1 in 64). `same` compares two answers.
+    template <typename Trimmed, typename Walk, typename Same>
+    auto TrimLookup(int trim, TrimSite site, Trimmed&& trimmed, Walk&& walk, Same&& same) const {
+        const size_t index = static_cast<size_t>(site);
+        auto& st = trim_qmd;
+        const u64 call = st.calls[index]++;
+        if ((call & 4095) == 0) [[unlikely]] {
+            LogTrimQmd(trim);
+        }
+        if (trim == 1) {
+            return trimmed();
+        }
+        if (trim == 2) {
+            const auto fast = trimmed();
+            const auto old = walk();
+            if (!same(fast, old)) [[unlikely]] {
+                ++st.differ[index];
+                if (trim_qmd_differ_total++ < 16) {
+                    constexpr std::array<const char*, 3> names{"FindOverlay", "AddOverlay",
+                                                               "FindShadow"};
+                    LOG_WARNING(HW_GPU,
+                                "Front trim QMD (FRITCHII_FRONT_TRIM_QMD=2, must be 0): {} found "
+                                "another entry through the compact arrays than the walk",
+                                names[index]);
+                }
+            }
+            return old;
+        }
+        if ((call & 63) == 0) {
+            const u64 t0 = VideoCommon::Nx2Profile::Ticks();
+            const auto old = walk();
+            const u64 t1 = VideoCommon::Nx2Profile::Ticks();
+            (void)trimmed();
+            const u64 t2 = VideoCommon::Nx2Profile::Ticks();
+            ++st.timed[index];
+            st.old_ticks[index] += t1 - t0;
+            st.trim_ticks[index] += t2 - t1;
+            return old;
+        }
+        return walk();
+    }
+    void LogTrimQmd(int trim) const {
+        const auto now = std::chrono::steady_clock::now();
+        const u64 ticks = VideoCommon::Nx2Profile::Ticks();
+        if (trim_qmd_since == std::chrono::steady_clock::time_point{}) {
+            trim_qmd_since = now;
+            trim_qmd_since_ticks = ticks;
+            trim_qmd_logged = trim_qmd;
+            return;
+        }
+        const double window = std::chrono::duration<double>(now - trim_qmd_since).count();
+        if (window < 10.0) {
+            return;
+        }
+        const double ns_per_tick =
+            window * 1e9 / static_cast<double>((std::max)(ticks - trim_qmd_since_ticks, u64{1}));
+        const TrimQmdStats& s = trim_qmd;
+        const TrimQmdStats& l = trim_qmd_logged;
+        std::array<double, 3> calls{};
+        std::array<double, 3> old_ns{};
+        std::array<double, 3> trim_ns{};
+        double saving_ms = 0.0;
+        for (size_t i = 0; i < 3; ++i) {
+            calls[i] = static_cast<double>(s.calls[i] - l.calls[i]) / window;
+            const u64 timed = s.timed[i] - l.timed[i];
+            if (timed != 0) {
+                old_ns[i] = static_cast<double>(s.old_ticks[i] - l.old_ticks[i]) * ns_per_tick /
+                            static_cast<double>(timed);
+                trim_ns[i] = static_cast<double>(s.trim_ticks[i] - l.trim_ticks[i]) *
+                             ns_per_tick / static_cast<double>(timed);
+                saving_ms += calls[i] * (std::max)(old_ns[i] - trim_ns[i], 0.0) / 1e6;
+            }
+        }
+        LOG_INFO(HW_GPU,
+                 "Front trim QMD (FRITCHII_FRONT_TRIM_QMD={}) {:.0f} s, lookups/s (walk ns, arrays "
+                 "ns when timed): find overlay {:.0f} ({:.0f}, {:.0f}), add overlay {:.0f} ({:.0f}, "
+                 "{:.0f}), find shadow {:.0f} ({:.0f}, {:.0f}); verify: {} {} {} differ (must be "
+                 "0, {} since boot); dry saving ~{:.2f} ms/s",
+                 trim, window, calls[0], old_ns[0], trim_ns[0], calls[1], old_ns[1], trim_ns[1],
+                 calls[2], old_ns[2], trim_ns[2], s.differ[0] - l.differ[0],
+                 s.differ[1] - l.differ[1], s.differ[2] - l.differ[2], trim_qmd_differ_total,
+                 saving_ms);
+        trim_qmd_logged = trim_qmd;
+        trim_qmd_since = now;
+        trim_qmd_since_ticks = ticks;
+    }
+
+    /// The live overlay of `address` in `space`, the first in slot order (the walk's answer).
+    const Overlay* FindOverlayWalk(const void* space, GPUVAddr address) const {
         for (const Overlay& overlay : overlays) {
             if (overlay.position != 0 && overlay.address == address && overlay.space == space) {
                 return &overlay;
@@ -236,33 +356,80 @@ struct FrontQmdMirror {
         }
         return nullptr;
     }
+    /// The same through the compact arrays: the same slots in the same order, the same tests.
+    const Overlay* FindOverlayArrays(const void* space, GPUVAddr address) const {
+        for (size_t i = 0; i < MaxOverlays; ++i) {
+            if (overlay_addresses[i] == address && overlay_positions[i] != 0 &&
+                overlays[i].space == space) {
+                return &overlays[i];
+            }
+        }
+        return nullptr;
+    }
+    const Overlay* FindOverlay(const void* space, GPUVAddr address) const {
+        const int trim = TrimQmdMode();
+        if (trim == 0) [[likely]] {
+            return FindOverlayWalk(space, address);
+        }
+        return TrimLookup(
+            trim, TrimSite::FindOverlay, [&] { return FindOverlayArrays(space, address); },
+            [&] { return FindOverlayWalk(space, address); },
+            [](const Overlay* a, const Overlay* b) { return a == b; });
+    }
+
+    /// AddOverlay's slot: the live overlay of the address, else a free slot, else the oldest
+    /// (the first of the lowest position in slot order).
+    size_t OverlaySlotWalk(const void* space, GPUVAddr address) const {
+        if (const Overlay* const found = FindOverlayWalk(space, address)) {
+            return static_cast<size_t>(found - overlays.data());
+        }
+        const Overlay* slot = &overlays[0];
+        for (const Overlay& overlay : overlays) {
+            if (overlay.position < slot->position) {
+                slot = &overlay;
+            }
+        }
+        return static_cast<size_t>(slot - overlays.data());
+    }
+    size_t OverlaySlotArrays(const void* space, GPUVAddr address) const {
+        if (const Overlay* const found = FindOverlayArrays(space, address)) {
+            return static_cast<size_t>(found - overlays.data());
+        }
+        size_t slot = 0;
+        for (size_t i = 0; i < MaxOverlays; ++i) {
+            if (overlay_positions[i] < overlay_positions[slot]) {
+                slot = i;
+            }
+        }
+        return slot;
+    }
 
     void AddOverlay(const void* space, GPUVAddr address, u64 position, const u32* words,
                     bool inline_qmd,
                     VideoCommon::QmdPrediction::Source memory_source =
                         VideoCommon::QmdPrediction::Source::OverlayFromMemoryUnchecked) {
-        Overlay* slot = nullptr;
-        for (Overlay& overlay : overlays) {
-            if (overlay.position != 0 && overlay.address == address && overlay.space == space) {
-                slot = &overlay;
-                break;
-            }
+        const int trim = TrimQmdMode();
+        size_t index;
+        if (trim == 0) [[likely]] {
+            index = OverlaySlotWalk(space, address);
+        } else {
+            index = TrimLookup(
+                trim, TrimSite::AddOverlay, [&] { return OverlaySlotArrays(space, address); },
+                [&] { return OverlaySlotWalk(space, address); },
+                [](size_t a, size_t b) { return a == b; });
         }
-        if (slot == nullptr) {
-            // A free slot, else the oldest.
-            slot = &overlays[0];
-            for (Overlay& overlay : overlays) {
-                if (overlay.position < slot->position) {
-                    slot = &overlay;
-                }
-            }
-            if (slot->position != 0 && slot->inline_qmd) {
-                evicted = (std::max)(evicted, slot->position);
-            }
+        Overlay* const slot = &overlays[index];
+        // Not the address's own live overlay (none was found, or the find step would have taken
+        // this very slot): a free slot or the oldest, replaced.
+        const bool replaced =
+            slot->position == 0 || slot->address != address || slot->space != space;
+        if (replaced && slot->position != 0 && slot->inline_qmd) {
+            evicted = (std::max)(evicted, slot->position);
         }
         slot->space = space;
         slot->address = address;
-        slot->position = position;
+        overlay_addresses[index] = address;
+        SetOverlayPosition(*slot, position);
         slot->inline_qmd = inline_qmd;
         slot->patched = false;
         slot->memory_source = memory_source;
@@ -293,6 +460,7 @@ struct FrontQmdMirror {
         evicted_used = slot->id != 0;
         slot->space = space;
         slot->address = address;
+        shadow_addresses[static_cast<size_t>(slot - shadows.data())] = address;
         slot->size = size;
         slot->filled = 0;
         slot->position = 0;
@@ -317,8 +485,44 @@ struct FrontQmdMirror {
     /// The shadow whose filled bytes hold the 256-byte block at `address` with the newest
     /// position for it; `block` its index there.
     Shadow* FindShadow(const void* space, GPUVAddr address, size_t& block) {
+        const int trim = TrimQmdMode();
+        if (trim == 0) [[likely]] {
+            return FindShadowWalk(space, address, block, false);
+        }
+        struct Found {
+            Shadow* shadow;
+            size_t block;
+        };
+        const Found found = TrimLookup(
+            trim, TrimSite::FindShadow,
+            [&] {
+                size_t at = block;
+                Shadow* const shadow = FindShadowWalk(space, address, at, true);
+                return Found{shadow, at};
+            },
+            [&] {
+                size_t at = block;
+                Shadow* const shadow = FindShadowWalk(space, address, at, false);
+                return Found{shadow, at};
+            },
+            [](const Found& a, const Found& b) {
+                return a.shadow == b.shadow && (a.shadow == nullptr || a.block == b.block);
+            });
+        block = found.block;
+        return found.shadow;
+    }
+    /// FindShadow's walk. `arrays` (FRITCHII_FRONT_TRIM_QMD): a shadow whose compact address is
+    /// not within ShadowBytes below `address` is passed over without touching it; such a shadow
+    /// fails the tests below anyway (they need shadow.address <= address and address + 256 <=
+    /// shadow.address + filled, and filled is at most ShadowBytes: only uploads of up to
+    /// ShadowBytes get a shadow, and FrontPatchOverlays fills it to at most the upload's size).
+    Shadow* FindShadowWalk(const void* space, GPUVAddr address, size_t& block, bool arrays) {
         Shadow* found = nullptr;
-        for (Shadow& shadow : shadows) {
+        for (size_t i = 0; i < MaxShadows; ++i) {
+            if (arrays && address - shadow_addresses[i] >= ShadowBytes) {
+                continue;
+            }
+            Shadow& shadow = shadows[i];
             if (shadow.id == 0 || shadow.space != space || address < shadow.address ||
                 shadow.address + shadow.filled < address + BlockBytes ||
                 (address - shadow.address) % BlockBytes != 0) {
@@ -346,6 +550,7 @@ struct FrontQmdMirror {
         for (Overlay& overlay : overlays) {
             overlay.position = 0;
         }
+        overlay_positions.fill(0);
         for (Shadow& shadow : shadows) {
             shadow.id = 0;
             shadow.position = 0;
@@ -631,7 +836,7 @@ std::array<bool, 2> PatchHolders(VideoCommon::GpuSplit& split, const MemoryManag
             if (overlay.inline_qmd) {
                 mirror.evicted = (std::max)(mirror.evicted, overlay.position);
             }
-            overlay.position = 0;
+            mirror.SetOverlayPosition(overlay, 0);
             continue;
         }
         const GPUVAddr from = (std::max)(first, overlay.address);
@@ -654,7 +859,7 @@ std::array<bool, 2> PatchHolders(VideoCommon::GpuSplit& split, const MemoryManag
         }
         std::memcpy(reinterpret_cast<u8*>(overlay.words.data()) + (from - overlay.address),
                     data + (from - first), to - from);
-        overlay.position = position;
+        mirror.SetOverlayPosition(overlay, position);
         overlay.patched = true;
         note_patched(overlay.address, size);
         if (trial_mode && !superseded) {

@@ -2330,6 +2330,56 @@ private:
     /// The last page RangeLastWrite looked up and its answer (a reader adding a page clears it).
     mutable u64 stamp_read_cache_page{~u64{0}};
     bool stamp_read_cache_hit{};
+    /// Bumped whenever stamp_read_pages changes (a page added, the table cleared, a reset): the
+    /// FRITCHII_FRONT_TRIM_RANGE table below keeps an answer only while it stays the same.
+    mutable u64 stamp_read_gen{1};
+    /// FRITCHII_FRONT_TRIM_RANGE (live, default 0; helper Z): StampRangedRead's per-page answer
+    /// (the GPU page's translation and whether a reader asked about its device page) kept per GPU
+    /// page in a small direct-mapped table. The one-entry caches above miss whenever two pages
+    /// take turns (constant buffer words and report writes do, ~2 million ranged writes a second
+    /// at the market); an entry answers only for the same memory manager, page and queued
+    /// function position as the one-entry cache's key, with the map serial and stamp_read_gen
+    /// unchanged since a stable translation filled it, so it gives what a fresh lookup gives.
+    /// Also RangeLastWrite's two environment switches come from `ranged_env` instead of
+    /// function statics (a thread-safe static guard per call). 1 = on, 2 = verify (the old
+    /// lookup runs and answers, differences counted, must be 0), 3 = dry (counted, the old
+    /// lookup and the table timed 1 in 64).
+    struct TrimPage {
+        const Tegra::MemoryManager* memory;
+        GPUVAddr page;
+        u64 function; ///< last_function_position at the fill
+        u64 serial;   ///< the memory manager's map serial of the stable translation
+        u64 read_gen; ///< stamp_read_gen at the fill
+        u64 device;   ///< The device address of the page (mapped only)
+        bool mapped;
+        bool read_hit; ///< A reader asked about the device page (mapped only)
+    };
+    static constexpr size_t TrimPages = 64;
+    std::array<TrimPage, TrimPages> trim_pages{};
+    /// RangeLastWrite's EDEN_NX2_RANGED_WAITS (bit 0) and EDEN_NX2_FORWARD_READS (bit 1), from
+    /// the same statics the old path reads; -1 until the first call with the trim on.
+    int ranged_env{-1};
+    struct TrimRangeStats {
+        u64 calls;    ///< RangeLastWrite calls with the trim on (the log cadence)
+        u64 lookups;  ///< pages looked up in the table
+        u64 answered; ///< found there (1: taken; 2 and 3: would have been)
+        u64 fills;    ///< entries filled from a stable translation
+        u64 checked;  ///< 2: answers compared with the old lookup
+        u64 differ;   ///< 2: of them, different (must be 0)
+        u64 timed;    ///< 3: answered lookups timed
+        u64 old_ticks;
+        u64 table_ticks;
+    };
+    TrimRangeStats trim_range{};
+    TrimRangeStats trim_range_logged{};
+    u64 trim_range_window_ns{};
+    u64 trim_range_window_ticks{};
+    u64 trim_range_differ_total{};
+    /// The trim's switch value (FRITCHII_FRONT_TRIM_RANGE).
+    [[nodiscard]] static int FrontTrimRangeMode();
+    /// RangeLastWrite's environment switches as above (statics shared by both paths).
+    [[nodiscard]] static int RangedEnvSwitches();
+    void LogTrimRange(int mode);
     /// The newest ranged write whose stamps were skipped (0 = none this session).
     u64 stamp_skip_floor{};
     struct StampReadStats {
@@ -2349,7 +2399,7 @@ private:
     /// RangeLastWrite's stamps with the switch on: per page, stamped where a reader asked about
     /// it, skipped (2) or only counted (1) where not. False: stamp as before (the caller does).
     bool StampRangedRead(const Tegra::MemoryManager& memory, GPUVAddr begin, GPUVAddr end,
-                         bool skip);
+                         bool skip, int trim = 0);
     /// Whether a reader asked about device page `page` (cached for runs of one page).
     bool StampPageRead(u64 page);
     /// A stamp reader of device bytes [device, device + size): marks their pages asked about and
