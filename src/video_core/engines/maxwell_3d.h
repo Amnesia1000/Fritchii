@@ -3638,6 +3638,10 @@ private:
     /// The front's copy of render_enable.mode (and its shadow RAM word) is unknown after a
     /// deferred 0xe2c until written again: fetched from E when something reads it.
     void FrontResolveE2cMode(VideoCommon::GpuSplit& split, FrontState& state);
+    /// FRITCHII_MACRO_SAME_DRY (fable_b 21.2 cut 3, counters only): a macro call of slot `slot`
+    /// begins (compared with the slot's last call) and ends (stored, counted, logged).
+    void FrontMacroSameDryBegin(FrontState& state, size_t slot);
+    void FrontMacroSameDryEnd(FrontState& state, size_t slot);
     /// Before the front writes render_enable.mode while it is unknown: what stays unknown.
     void FrontNoteE2cModeWrite(VideoCommon::GpuSplit& split, FrontState& state);
     /// Tells the split a report just sent releases a known payload (GpuSplit::NoteRelease).

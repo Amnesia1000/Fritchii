@@ -422,6 +422,27 @@ it handled, their pages on pages asked about (stamped), on pages never asked abo
 would skip with 1), writes stamped whole as before; pages asked about (and new ones a second),
 reader answers raised by an add floor, table clears.
 
+### FRITCHII_MACRO_SAME_DRY (the "Macro repeats" line)
+
+FRITCHII_MACRO_SAME_DRY (live, default 0; counters only, nothing is skipped; fable_b_one_follower
+21.2 cut 3). Prices skipping a 3D macro call that repeats its slot's last call. Each call of the
+front's macro body (Maxwell3D::FrontRunMacroFeatures, handlers and JIT alike) is compared with the
+last call of the same macro slot.
+
+"Macro repeats (FRITCHII_MACRO_SAME_DRY, counters only) 10 s" (HW_GPU, Info), per second:
+- calls and their writes;
+- same arguments as the slot's last call; of them, that call wrote state only (no executable
+  method: no draw, report, upload); and every register it wrote still holds the value it wrote
+  ("none of its registers written since"; a same-value write in between counts as none); of
+  those, it read memory (an MME DMA read, such as 0xe2c: its result may differ) and, the check of
+  the prediction, this call wrote exactly the same writes again;
+- calls whose every write was a state write of the value the register held, whatever their
+  arguments: the upper bound of what a skip could remove, with their writes;
+- the five macros with the most held repeats: method, held repeats and calls a second.
+
+Not counted: the macro's inputs besides its arguments (the data RAM, registers it reads but does
+not write). A skip would need those too.
+
 ### FRITCHII_FRONT_RAN_READS
 
 FRITCHII_FRONT_RAN_READS (live, default 0 = exactly as before; the market's "Front 0xe2c misses"

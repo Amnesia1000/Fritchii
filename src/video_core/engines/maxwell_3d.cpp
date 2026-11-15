@@ -1808,6 +1808,39 @@ struct Maxwell3D::FrontState {
     int exp22{};
     /// The switch generation same_experiment, early_same and exp22 were read at (Front()).
     u32 experiments_generation{~u32{0}};
+    /// FRITCHII_MACRO_SAME_DRY (live, default 0; fable_b 21.2 cut 3, counters only): per macro
+    /// slot, the last call's parameters and writes, and how often a call repeats it.
+    struct MacroSameDry {
+        struct Slot {
+            std::vector<u32> params; ///< as called (before MME DMA reads append to the FIFO)
+            std::vector<u64> writes; ///< method | value << 32, in order
+            bool known{};
+            bool executable{};   ///< a write of an executable method (a draw, a report...)
+            bool reads_memory{}; ///< an MME DMA read (0x157, 0x158)
+        };
+        std::array<Slot, MacroSlots> slots{};
+        // The call running now.
+        std::vector<u32> params;
+        std::vector<u64> writes;
+        bool held{}; ///< same arguments, state only, every register it wrote still holds its value
+        bool executable{};
+        bool reads_memory{};
+        bool unchanged{}; ///< every write so far was a state write of the value held
+        // Per window.
+        u64 calls{};
+        u64 same_args{};        ///< the parameters equal to the slot's last call
+        u64 same_state_only{};  ///< and that call wrote state only (no executable method)
+        u64 same_held{};        ///< and each register it wrote still holds its value
+        u64 same_held_memory{}; ///< of those, it read memory (an MME DMA read)
+        u64 same_held_writes{}; ///< of the held ones, this call's writes equal that call's
+        u64 unchanged_calls{};  ///< calls whose every write was a state write of the held value
+        u64 unchanged_writes{}; ///< their writes
+        u64 writes_total{};
+        std::array<u64, MacroSlots> slot_calls{};
+        std::array<u64, MacroSlots> slot_held{};
+        std::chrono::steady_clock::time_point since{};
+    };
+    std::unique_ptr<MacroSameDry> same_dry;
     /// StateDelta blocks would skip the back's write history and first-write trace
     /// (EDEN_NX2_3D_HISTORY, EDEN_NX2_3D_METHODS): off with them.
     bool delta_allowed{};
@@ -3009,6 +3042,15 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
             ? VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_e2c_on_e,
                                                "FRITCHII_E2C_ON_E")
             : 0;
+    // FRITCHII_MACRO_SAME_DRY (live, default 0): counts only, nothing skipped.
+    const size_t dry_slot = ((method - MacroRegistersStart) >> 1) % positions.size();
+    FrontState::MacroSameDry* dry = nullptr;
+    if (dry_slot < FrontState::MacroSlots &&
+        VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_macro_same_dry,
+                                         "FRITCHII_MACRO_SAME_DRY") != 0) [[unlikely]] {
+        FrontMacroSameDryBegin(fs, dry_slot);
+        dry = fs.same_dry.get();
+    }
     {
         VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
         engine.native_interpreter.active_dram = &native_data_ram;
@@ -3043,6 +3085,14 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
             }
             if (address >= MacroRegistersStart) {
                 return false;
+            }
+            if (dry != nullptr) [[unlikely]] {
+                // Before FrontWrite stores it: was it a state write of the value held?
+                dry->writes.push_back(address | (u64{value} << 32));
+                const bool executable = execution_mask[address];
+                dry->executable |= executable;
+                dry->reads_memory |= address == 0x157 || address == 0x158;
+                dry->unchanged &= !executable && fs.regs[address] == value;
             }
             if (predicate && address == MAXWELL3D_REG_INDEX(render_enable.mode)) {
                 FrontWrite(split, fs, MAXWELL3D_REG_INDEX(render_enable.address_high),
@@ -3179,6 +3229,9 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
         }
     }
     fs.e2c_call = false;
+    if (dry != nullptr) [[unlikely]] {
+        FrontMacroSameDryEnd(fs, dry_slot);
+    }
     if (fs.e2c_deferred) [[unlikely]] {
         // A deferred read without its 0x556 write (a failed call): the zero words stand, as
         // a short FIFO's would.
@@ -3230,6 +3283,103 @@ void Maxwell3D::FrontRunMacroFeatures(Core::System& system, VideoCommon::GpuSpli
     if (FrontVerifyEnabled() && (++fs.calls & 4095) == 0) [[unlikely]] {
         FrontVerify(split, fs);
     }
+}
+
+void Maxwell3D::FrontMacroSameDryBegin(FrontState& fs, size_t slot) {
+    if (!fs.same_dry) [[unlikely]] {
+        fs.same_dry = std::make_unique<FrontState::MacroSameDry>();
+    }
+    auto& d = *fs.same_dry;
+    const auto& last = d.slots[slot];
+    d.params.assign(fs.parameters.begin(), fs.parameters.end());
+    d.writes.clear();
+    d.executable = false;
+    d.reads_memory = false;
+    d.unchanged = true;
+    d.held = false;
+    ++d.calls;
+    ++d.slot_calls[slot];
+    // Fable's two tests: the same arguments as the slot's last call, and none of the registers
+    // that call wrote written since (they still hold its values; a same-value write counts as
+    // none). Only for a call that wrote state alone: a draw or a report is never skipped.
+    if (!last.known || last.params != d.params) {
+        return;
+    }
+    ++d.same_args;
+    if (last.executable) {
+        return;
+    }
+    ++d.same_state_only;
+    for (const u64 write : last.writes) {
+        const u32 address = static_cast<u32>(write & 0xffffffff);
+        if (address >= Regs::NUM_REGS || fs.regs[address] != static_cast<u32>(write >> 32)) {
+            return;
+        }
+    }
+    d.held = true;
+    ++d.same_held;
+    ++d.slot_held[slot];
+    d.same_held_memory += last.reads_memory ? 1 : 0;
+}
+
+void Maxwell3D::FrontMacroSameDryEnd(FrontState& fs, size_t slot) {
+    auto& d = *fs.same_dry;
+    auto& last = d.slots[slot];
+    d.writes_total += d.writes.size();
+    if (d.held && d.writes == last.writes) {
+        ++d.same_held_writes; // the prediction held: the same writes again, all already held
+    }
+    if (d.unchanged) {
+        ++d.unchanged_calls;
+        d.unchanged_writes += d.writes.size();
+    }
+    last.known = true;
+    last.executable = d.executable;
+    last.reads_memory = d.reads_memory;
+    std::swap(last.params, d.params);
+    std::swap(last.writes, d.writes);
+    if ((d.calls & 0xfff) != 0) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (d.since == std::chrono::steady_clock::time_point{}) {
+        d.since = now;
+        return;
+    }
+    const double seconds = std::chrono::duration<double>(now - d.since).count();
+    if (seconds < 10.0) {
+        return;
+    }
+    const auto rate = [seconds](u64 count) { return static_cast<double>(count) / seconds; };
+    // The five slots with the most held repeats.
+    std::array<size_t, FrontState::MacroSlots> order{};
+    for (size_t i = 0; i < order.size(); ++i) {
+        order[i] = i;
+    }
+    std::partial_sort(order.begin(), order.begin() + 5, order.end(),
+                      [&d](size_t a, size_t b) { return d.slot_held[a] > d.slot_held[b]; });
+    std::string top;
+    for (size_t i = 0; i < 5 && d.slot_held[order[i]] != 0; ++i) {
+        const size_t s = order[i];
+        top += fmt::format("{} {:#x} {:.0f}/{:.0f}", top.empty() ? "" : ",",
+                           MacroRegistersStart + 2 * s, rate(d.slot_held[s]), rate(d.slot_calls[s]));
+    }
+    LOG_INFO(HW_GPU,
+             "Macro repeats (FRITCHII_MACRO_SAME_DRY, counters only) {:.0f} s: calls {:.0f}/s "
+             "({:.0f} writes/s); same arguments as the slot's last call {:.0f}/s, of them that "
+             "call wrote state only {:.0f}/s, and its registers still hold its values {:.0f}/s "
+             "(of them it read memory {:.0f}/s; wrote the same again {:.0f}/s); calls whose every "
+             "write was a state write of the value held {:.0f}/s ({:.0f} writes/s); held repeats "
+             "by macro (method held/calls a second):{}",
+             seconds, rate(d.calls), rate(d.writes_total), rate(d.same_args),
+             rate(d.same_state_only), rate(d.same_held), rate(d.same_held_memory),
+             rate(d.same_held_writes), rate(d.unchanged_calls), rate(d.unchanged_writes),
+             top.empty() ? std::string{" none"} : top);
+    d.calls = d.same_args = d.same_state_only = d.same_held = d.same_held_memory = 0;
+    d.same_held_writes = d.unchanged_calls = d.unchanged_writes = d.writes_total = 0;
+    d.slot_calls.fill(0);
+    d.slot_held.fill(0);
+    d.since = now;
 }
 
 // List draws (nx2_list_draw.h): whether the macro at `start` does nothing
