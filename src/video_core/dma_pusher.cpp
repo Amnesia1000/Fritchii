@@ -68,6 +68,86 @@ u64 g_last_copy_writer{};
     return !split.Ran(g_last_copy_writer);
 }
 
+// FRITCHII_LIST_COPY_SKIP (live, default 0; fable_b 27.9 item 3) and its counters (always on with
+// the split): an entry that begins between methods waits for the "list writers" only because a
+// copy is queued (the copy engine can copy GPU-written words anywhere). The front notes each
+// copy's destination (MaxwellDMA::FrontNoteLaunch), so a queued writer whose noted range misses
+// the entry's pages cannot have written it: no wait needed. The deferred check on the back at the
+// entry's place stays, for every skipped entry, as the must-be-0.
+struct ListWaitStats {
+    std::array<u64, 2> waits{};         ///< [0] begins inside a method's data, [1] a copy queued
+    std::array<u64, 2> written_after{}; ///< GPU-written by the answer after the wait
+    u64 touched{};                      ///< [1]: a queued writer's noted range (or an unbounded
+                                        ///< one) touched the entry's pages
+    u64 skipped{};                      ///< [1] waits the switch skipped (no range touched)
+    std::chrono::steady_clock::time_point since{};
+    std::array<u64, 2> waits_logged{};
+    std::array<u64, 2> written_logged{};
+    u64 touched_logged{};
+    u64 skipped_logged{};
+};
+ListWaitStats g_list_waits{};
+/// Must be 0: entries the switch let skip that the back then found GPU-written (stops it).
+std::atomic<u64> g_list_skip_missed{};
+std::atomic<bool> g_list_skip_stopped{};
+
+/// Whether writers sent but not run yet may write [address, address + size) of `memory`: a
+/// noted range over it or an unbounded writer (GpuSplit::WritersMayWriteSince, per page; an
+/// unmapped page counts as written). `since` is one before the played position: a range is
+/// noted at its entry's start, which has run only once the played position is past it.
+[[nodiscard]] bool QueuedWritersMayWrite(VideoCommon::GpuSplit& split,
+                                         Tegra::MemoryManager& memory, GPUVAddr address,
+                                         u64 size) {
+    const u64 played = split.ConsumedNow();
+    const u64 since = played != 0 ? played - 1 : 0;
+    constexpr GPUVAddr Page = 0x1000;
+    for (GPUVAddr page = address & ~(Page - 1); page < address + size; page += Page) {
+        const GPUVAddr begin = (std::max)(page, address);
+        const GPUVAddr end = (std::min)(page + Page, address + size);
+        const std::optional<DAddr> device = memory.GpuToCpuAddress(begin);
+        if (!device || split.WritersMayWriteSince(since, *device, end - begin)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void MaybeLogListWaits() {
+    ListWaitStats& s = g_list_waits;
+    const auto now = std::chrono::steady_clock::now();
+    if (s.since.time_since_epoch().count() == 0) {
+        s.since = now;
+        return;
+    }
+    const double seconds = std::chrono::duration<double>(now - s.since).count();
+    if (seconds < 10.0) {
+        return;
+    }
+    s.since = now;
+    const auto rate = [seconds](u64 count, u64& logged) {
+        const double value = static_cast<double>(count - logged) / seconds;
+        logged = count;
+        return value;
+    };
+    const double in_data = rate(s.waits[0], s.waits_logged[0]);
+    const double in_data_written = rate(s.written_after[0], s.written_logged[0]);
+    const double copy = rate(s.waits[1], s.waits_logged[1]);
+    const double copy_written = rate(s.written_after[1], s.written_logged[1]);
+    const double copy_touched = rate(s.touched, s.touched_logged);
+    const double skipped = rate(s.skipped, s.skipped_logged);
+    LOG_INFO(HW_GPU,
+             "List writer waits (fable_b 27.9; FRITCHII_LIST_COPY_SKIP={}{}) {:.0f} s: inside a "
+             "method's data {:.0f}/s (GPU-written after the wait {:.0f}/s); a copy queued "
+             "{:.0f}/s (GPU-written after {:.0f}/s, a queued writer's range on the entry's pages "
+             "{:.0f}/s); skipped, no range on the pages {:.0f}/s; must be 0: skipped entries "
+             "the back found GPU-written {} this session",
+             VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_list_copy_skip,
+                                              "FRITCHII_LIST_COPY_SKIP"),
+             g_list_skip_stopped.load(std::memory_order_relaxed) ? ", STOPPED" : "", seconds,
+             in_data, in_data_written, copy, copy_written, copy_touched, skipped,
+             g_list_skip_missed.load(std::memory_order_relaxed));
+}
+
 // Compute dispatches and DMA copies write the command lists ReadGpuWrittenCommands reads. The
 // register writes that set them up only store a value: marking those too made every list fetch
 // after one wait for all the work queued before it (draws included).
@@ -592,9 +672,26 @@ bool DmaPusher::Step() {
         if (!gpu_written && VideoCommon::GpuSplit::Get().Active()) {
             auto& split = VideoCommon::GpuSplit::Get();
             const bool old_waits = VideoCore::Nx2Debug::Experiment(41) == 1;
-            const bool skip = old_waits ? skip_list_wait
-                                        : skip_list_wait && dma_state.method_count == 0 &&
-                                              !CopyWritersPending(split);
+            const bool copy_queued = CopyWritersPending(split);
+            bool skip = old_waits ? skip_list_wait
+                                  : skip_list_wait && dma_state.method_count == 0 && !copy_queued;
+            // fable_b 27.9 item 3: why it waits ([0] inside a method's data, [1] a copy queued),
+            // and for a copy whether a queued writer's noted range touches the entry's pages.
+            const size_t wait_reason = dma_state.method_count != 0 ? 0 : 1;
+            bool range_touched = false;
+            bool range_skip = false;
+            if (!old_waits && skip_list_wait && !skip && wait_reason == 1) {
+                range_touched = QueuedWritersMayWrite(split, memory_manager, dma_state.dma_get,
+                                                      u64{header.size} * sizeof(u32));
+                if (!range_touched &&
+                    VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_list_copy_skip,
+                                                     "FRITCHII_LIST_COPY_SKIP") != 0 &&
+                    !g_list_skip_stopped.load(std::memory_order_relaxed)) {
+                    skip = true;
+                    range_skip = true;
+                    ++g_list_waits.skipped;
+                }
+            }
             bool checked = skip;
             if (!skip) {
                 if (old_waits ? split.WaitForWriters() : split.WaitForSyncedWriters()) {
@@ -603,11 +700,20 @@ bool DmaPusher::Step() {
                 }
                 // Writers sent after the last sync may still be queued.
                 checked = !gpu_written && !split.Ran(split.LastWriterPosition());
+                if (!old_waits && skip_list_wait) {
+                    ++g_list_waits.waits[wait_reason];
+                    g_list_waits.written_after[wait_reason] += gpu_written ? 1 : 0;
+                    g_list_waits.touched += range_touched ? 1 : 0;
+                }
+            }
+            if (!old_waits && skip_list_wait) {
+                MaybeLogListWaits();
             }
             // EDEN_NX2_EXP105 (live; 0 = every entry as before, N > 1 = 1 in N): this check only
             // reads (IsGpuWrittenCommands) and logs; it never fired in any OoT run of 2026-11-12,
             // and at ~84,000 entries a second it cost ~8 ms/s of the back (fable answer_backthread 9).
-            if (checked) {
+            // A range skip is always checked: it is FRITCHII_LIST_COPY_SKIP's must-be-0.
+            if (checked && !range_skip) {
                 if (const int every = VideoCore::Nx2Debug::Experiment(105); every > 1) {
                     static thread_local u32 list_check_count{};
                     checked = (++list_check_count % static_cast<u32>(every)) == 0;
@@ -615,8 +721,20 @@ bool DmaPusher::Step() {
             }
             if (checked) {
                 split.Defer([this, address = GPUVAddr{dma_state.dma_get},
-                             size = size_t{header.size} * sizeof(u32), skip] {
+                             size = size_t{header.size} * sizeof(u32), skip, range_skip] {
                     if (IsGpuWrittenCommands(address, size)) {
+                        if (range_skip) {
+                            // FRITCHII_LIST_COPY_SKIP's must-be-0: the noted ranges missed a
+                            // writer of this entry. The switch stops for the session.
+                            g_list_skip_missed.fetch_add(1, std::memory_order_relaxed);
+                            if (!g_list_skip_stopped.exchange(true, std::memory_order_relaxed)) {
+                                LOG_CRITICAL(HW_GPU,
+                                             "FRITCHII_LIST_COPY_SKIP stops for this session: "
+                                             "an entry at {:#x} that skipped its wait was "
+                                             "GPU-written by queued work",
+                                             address);
+                            }
+                        }
                         static std::atomic<u32> missed{};
                         const u32 count = ++missed;
                         if (count <= 32 || (count & (count - 1)) == 0) {

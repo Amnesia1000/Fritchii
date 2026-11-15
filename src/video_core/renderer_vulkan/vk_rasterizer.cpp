@@ -81,6 +81,8 @@
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/shader_cache.h"
 #include "video_core/texture_cache/texture_cache_base.h"
+#include "video_core/texture_cache/image_info.h"
+#include "video_core/texture_cache/util.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/memory_manager.h"
@@ -4200,8 +4202,74 @@ struct OneFollowerDispatchView {
     u64 indirect;       ///< the indirect arguments' GPU address (has_indirect)
     u32 has_indirect;   ///< bit 4: an indirect dispatch (the packet's `indirect` is its buffer)
     u32 writes_images;  ///< bit 2: the program writes images (R checks it against Configure)
+    /// FRITCHII_ONEF_DISPATCH_RANGES: E's description of the written image elements, in
+    /// WrittenImages' order: the descriptor it read (R reads it again at its play and compares)
+    /// and the range it recorded for EXP10.
+    static constexpr u32 MaxImageRecords = 8;
+    u32 image_count;  ///< elements described (0: none, or more than MaxImageRecords)
+    u32 image_ranged; ///< 1: E recorded their ranges (else "may write anything")
+    std::array<Tegra::Texture::TICEntry, MaxImageRecords> image_tic;
+    std::array<u64, MaxImageRecords> image_tic_address; ///< 0: no image there (a null view)
+    std::array<u64, MaxImageRecords> image_device;      ///< the recorded device range
+    std::array<u64, MaxImageRecords> image_size;        ///< its size, 0: not one device range
 };
 static_assert(sizeof(OneFollowerDispatchView) % 8 == 0);
+
+/// FRITCHII_ONEF_DISPATCH_RANGES (fable_b 27.9), E: the guest range of the image a written image
+/// handle names, as the texture cache resolves a compute image view (VisitImageView,
+/// CreateImageView): the TIC entry at the handle's index (TextureHeaderIndex, the pool's limit),
+/// its view header, the image's start (its address less the base layer) and its guest size
+/// (ImageInfo, CalculateGuestSizeInBytes). `tic` and `tic_address` get the entry read;
+/// `null_view` is set where the texture cache binds no image (the index past the limit, an
+/// invalid entry): nothing is written there. nullopt otherwise when the range is not one mapped
+/// device range, or the entry is a buffer image: the record stays "may write anything".
+struct WrittenImageRange {
+    u64 device;
+    u64 size;
+};
+std::optional<WrittenImageRange> DescribeWrittenImage(Tegra::MemoryManager& memory,
+                                                      const Tegra::Engines::KeplerCompute& engine,
+                                                      u32 raw, Tegra::Texture::TICEntry& tic,
+                                                      GPUVAddr& tic_address, bool& null_view) {
+    using Tegra::Texture::TICEntry;
+    null_view = false;
+    tic = TICEntry{};
+    tic_address = 0;
+    const bool via_header = engine.launch_description.linked_tsc != 0;
+    const u32 view_index = Tegra::Texture::TexturePair(raw, via_header).first;
+    const u32 limit = engine.regs.tic.limit;
+    const bool native = memory.UsesNativeTiling();
+    const u32 index = Tegra::Texture::TextureHeaderIndex(view_index, limit, native);
+    if (index > limit) {
+        null_view = true;
+        return std::nullopt;
+    }
+    tic_address = engine.regs.tic.Address() + u64{index} * sizeof(TICEntry);
+    if (!memory.IsFullyMappedRange(tic_address, sizeof(TICEntry))) {
+        return std::nullopt;
+    }
+    memory.ReadBlockUnsafe(tic_address, &tic, sizeof(tic));
+    if (!VideoCommon::IsValidEntry(memory, tic)) {
+        null_view = true;
+        return std::nullopt;
+    }
+    const TICEntry config = VideoCommon::TextureViewHeader(tic, native);
+    const VideoCommon::ImageInfo info(config);
+    if (info.type == VideoCommon::ImageType::Buffer) {
+        return std::nullopt;
+    }
+    const u64 layer_offset = u64{config.BaseLayer()} * info.layer_stride;
+    const GPUVAddr image_address = config.Address() - layer_offset;
+    const u64 size = VideoCommon::CalculateGuestSizeInBytes(info);
+    if (size == 0 || !memory.IsContinuousRange(image_address, size)) {
+        return std::nullopt;
+    }
+    const std::optional<DAddr> device = memory.GpuToCpuAddress(image_address);
+    if (!device) {
+        return std::nullopt;
+    }
+    return WrittenImageRange{*device, size};
+}
 static_assert(sizeof(Tegra::Engines::KeplerCompute::LaunchParams) ==
               sizeof(OneFollowerDispatchView::launch));
 } // Anonymous namespace
@@ -4311,6 +4379,35 @@ bool RasterizerVulkan::OneFollowerPostDispatch() {
     view.indirect = indirect_address.value_or(0);
     view.has_indirect = indirect_address ? 1 : 0;
     view.writes_images = writes_images ? 1 : 0;
+    // FRITCHII_ONEF_DISPATCH_RANGES (fable_b 27.9): each written image's range from its
+    // descriptor, at E's place (EXP10 below), and what R compares at its play.
+    bool image_ranged = false;
+    if (writes_images && OneF::DispatchRangesOn()) {
+        u32 count = 0;
+        bool all = true;
+        const bool visited = pipeline->VisitWrittenImageHandles(
+            onef_dispatch_values, [&](u32 raw) {
+                if (count >= OneFollowerDispatchView::MaxImageRecords) {
+                    ++count;
+                    all = false;
+                    return;
+                }
+                const u32 k = count++;
+                GPUVAddr tic_address = 0;
+                bool null_view = false;
+                const auto range = DescribeWrittenImage(*gpu_memory, engine, raw,
+                                                        view.image_tic[k], tic_address, null_view);
+                view.image_tic_address[k] = null_view ? 0 : tic_address;
+                view.image_device[k] = range ? range->device : 0;
+                view.image_size[k] = range ? range->size : 0;
+                all = all && (null_view || range.has_value());
+            });
+        const bool described = visited && count <= OneFollowerDispatchView::MaxImageRecords;
+        view.image_count = described ? count : 0;
+        image_ranged = described && all;
+        view.image_ranged = image_ranged ? 1 : 0;
+        OneF::CountDispatch(image_ranged ? Count::ImageRanged : Count::ImageUnbounded);
+    }
     const u64 position = VideoCommon::GpuSplit::Get().BackEntryPosition();
     u64 number = 0;
     bool list_copies = false;
@@ -4344,7 +4441,15 @@ bool RasterizerVulkan::OneFollowerPostDispatch() {
     // - the indirect arguments ObtainBuffer dropped the GPU-written state of (12 bytes).
     if (VideoCommon::GpuSplit::RecordingDispatch()) {
         auto& split = VideoCommon::GpuSplit::Get();
-        if (writes_images) {
+        if (writes_images && image_ranged) {
+            // FRITCHII_ONEF_DISPATCH_RANGES: what the dispatch can write of each image, the
+            // range of the descriptor it binds (R compares the descriptor at its play).
+            for (u32 k = 0; k < view.image_count; ++k) {
+                if (view.image_size[k] != 0) {
+                    split.RecordDispatchWrite(view.image_device[k], view.image_size[k]);
+                }
+            }
+        } else if (writes_images) {
             split.RecordDispatchUnbounded(VideoCommon::GpuSplit::DispatchUnbounded::Image);
         }
         if (indirect_address) {
@@ -4434,6 +4539,70 @@ void RasterizerVulkan::OneFollowerCheckGrids() {
     });
 }
 
+void RasterizerVulkan::OneFollowerCheckPlayedImages(const ComputePipeline& pipeline,
+                                                    const void* raw_view) {
+    namespace OneF = VideoCommon::OneFollower;
+    using Count = OneF::DispatchCount;
+    const auto& view = *static_cast<const OneFollowerDispatchView*>(raw_view);
+    std::scoped_lock lock{texture_cache.mutex};
+    const auto written = pipeline.WrittenImages();
+    // fable_b 27.9's count, every played image-writing dispatch: the images' real ranges (the
+    // texture cache's backing images, what the lent path records) on a page the front reads.
+    for (const VideoCommon::ImageViewId id : written) {
+        if (!id || id == VideoCommon::NULL_IMAGE_VIEW_ID) {
+            continue;
+        }
+        const ImageView& image_view = texture_cache.GetImageView(id);
+        const Image* const image = image_view.BackingImage();
+        if (image != nullptr && image->cpu_addr_end > image->cpu_addr &&
+            OneF::FrontReadPagesAny(image->cpu_addr, image->cpu_addr_end - image->cpu_addr)) {
+            OneF::CountDispatch(Count::ImageOnFrontPage);
+        }
+    }
+    if (view.image_ranged == 0) {
+        return; // E recorded "may write anything": nothing to compare
+    }
+    const auto fail = [](const char* what) {
+        OneF::Note(OneF::Check::DispatchImageRange, what);
+        OneF::StopDispatchRanges(what);
+    };
+    if (written.size() != view.image_count) {
+        fail("a played dispatch wrote another number of images than E described");
+        return;
+    }
+    for (size_t k = 0; k < written.size(); ++k) {
+        const VideoCommon::ImageViewId id = written[k];
+        const bool bound = id && id != VideoCommon::NULL_IMAGE_VIEW_ID;
+        if (view.image_tic_address[k] == 0) {
+            if (bound) {
+                fail("a played dispatch writes an image where E saw none");
+                return;
+            }
+            continue;
+        }
+        // The descriptor R's texture cache took at this play, read again now (the stream's
+        // writes to the pool are E's; one E made after the push would differ here).
+        Tegra::Texture::TICEntry tic{};
+        gpu_memory->ReadBlockUnsafe(view.image_tic_address[k], &tic, sizeof(tic));
+        if (std::memcmp(&tic, &view.image_tic[k], sizeof(tic)) != 0) {
+            fail("a played dispatch's image descriptor differs from the one E recorded");
+            return;
+        }
+        if (!bound) {
+            continue; // no image made (no memory): it writes nothing
+        }
+        const Image* const image = texture_cache.GetImageView(id).BackingImage();
+        if (image == nullptr || image->cpu_addr_end <= image->cpu_addr) {
+            continue;
+        }
+        const u64 begin = view.image_device[k];
+        const u64 end = begin + view.image_size[k];
+        if (view.image_size[k] == 0 || image->cpu_addr < begin || image->cpu_addr_end > end) {
+            OneF::CountDispatch(Count::ImageWiderThanRecord);
+        }
+    }
+}
+
 void RasterizerVulkan::OneFollowerPlayDispatch(ComputePipeline* pipeline, u64 number) {
     namespace OneF = VideoCommon::OneFollower;
     OneFollowerDispatchView view;
@@ -4481,6 +4650,9 @@ void RasterizerVulkan::OneFollowerPlayDispatch(ComputePipeline* pipeline, u64 nu
     };
     try {
         DispatchCompute();
+        if (view.writes_images != 0) {
+            OneFollowerCheckPlayedImages(*pipeline, &view);
+        }
     } catch (const std::exception& error) {
         // The lent path would throw to E's engine (a skipped dispatch); R cannot.
         thread_local std::string note;
@@ -4989,7 +5161,24 @@ void RasterizerVulkan::DispatchCompute() {
         OneFollowerPostDispatch()) [[unlikely]] {
         return;
     }
-    ONEF_LEND(Dispatch, DispatchCompute())
+    if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
+        // FRITCHII_ONEF_DISPATCH_RANGES (fable_b 27.9): the lent call records on R with E's
+        // recording state (GpuSplit's flag is per thread, E's), so the lent path's own EXP10
+        // block runs and confirms: its images' real ranges instead of "unconfirmed", which
+        // counts as "may write anything". E is parked: R is the records' only writer then.
+        const bool recording = VideoCommon::OneFollower::DispatchRangesOn() &&
+                               VideoCommon::GpuSplit::RecordingDispatch();
+        VideoCommon::OneFollower::SetLendSite(__func__);
+        auto onef_call = [&] {
+            VideoCommon::GpuSplit::AdoptRecordingDispatch(recording);
+            SCOPE_EXIT {
+                VideoCommon::GpuSplit::AdoptRecordingDispatch(false);
+            };
+            DispatchCompute();
+        };
+        VideoCommon::OneFollower::Lend(VideoCommon::OneFollower::LentOp::Dispatch, onef_call);
+        return;
+    }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Compute};
     // One follower: R plays a posted dispatch (E ran the stream's invalidations, the lookup and
     // the buffer side; the held ring B packet is the fill), or runs a lent one whose pipeline E
