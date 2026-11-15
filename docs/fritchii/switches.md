@@ -1756,8 +1756,9 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   The front still runs the handler on its own state: each write is decided by FrontWriteDecide
   (shadow, same-value skip, executable bookkeeping) and recorded, the sent set and its lanes
   (Pairs word or Direct entry) kept as masks, the notes made after the op entry. Only where
-  every write takes those plain lanes: shadow RAM Track, EXP22 / EXP2 / FRITCHII_CB_WORDS_BLOCK /
-  the draw packet off, EDEN_NX2_MACRO_SINK only with EDEN_NX2_RING_PAIRS, no list guard, no
+  every write takes those plain lanes: shadow RAM Track, EXP22 / EXP2 / the draw packet off
+  (FRITCHII_CB_WORDS_BLOCK 1 and 2 are fine: the op's data words are its Direct writes, the op
+  closes an open block, E groups them as the block would; with 2 the addresses are compared), EDEN_NX2_MACRO_SINK only with EDEN_NX2_RING_PAIRS, no list guard, no
   macro trace / dry / verify tool, no EXP53 predicate; the instanced draws only up to 1 instance
   while EDEN_NX2_FOLD_INSTANCES counts later instances (16 otherwise; its held count would go out
   before the op). Anything else, the old
@@ -1779,7 +1780,8 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   differences" on the front's line (recorded writes against the expansion's number). Any
   mismatch stops ops for the session. The front's "Front ops" line (once a second) counts op
   entries, writes sent and dropped, per op sent / sent nothing / old path, the old path by
-  reason (lanes, tools, stopped, declined or too long), fallbacks.
+  reason (shadow, exp22, same_experiment, packet, list_draw_stale, e2c unknown,
+  guard_list_reads, sink without pairs, tools, stopped, declined or too long), fallbacks.
 - FRITCHII_ONEF_DEAD_STORES (live, default 0; fable_b_one_follower 27.7; count only): 1 = the
   "Dead stores" line counts 0xea0 calls whose trailing c[0][0x640] resets (8e3 = 0x640, 8e4 = 0,
   8e5 = 0) the next 0xea0 overwrites with nothing sent between (same ring position, no held
