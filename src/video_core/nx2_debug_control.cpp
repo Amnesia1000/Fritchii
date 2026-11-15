@@ -439,6 +439,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_MACRO_SAME_DRY") {
         return &g_macro_same_dry;
     }
+    if (name == "FRITCHII_MACRO_SEQ_DRY") {
+        return &g_macro_seq_dry;
+    }
     if (name == "FRITCHII_ACQUIRE_MET_BY") {
         return &g_acquire_met_by;
     }

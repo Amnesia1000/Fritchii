@@ -202,6 +202,8 @@ inline std::atomic<int> g_e2c_on_e{-1};
 inline std::atomic<int> g_stamp_read_pages{-1};
 /// FRITCHII_MACRO_SAME_DRY: docs/fritchii/switches.md.
 inline std::atomic<int> g_macro_same_dry{-1};
+/// FRITCHII_MACRO_SEQ_DRY: docs/fritchii/switches.md.
+inline std::atomic<int> g_macro_seq_dry{-1};
 /// FRITCHII_ACQUIRE_MET_BY: docs/fritchii/switches.md.
 inline std::atomic<int> g_acquire_met_by{-1};
 /// FRITCHII_GATHER_ONE_LOCK: docs/fritchii/switches.md.
