@@ -172,6 +172,8 @@ public:
         IndirectCounterCount,
     };
     int indirect_cache_mode = 0;
+    /// Set while InvalidateCacheRanges removes blocks (it empties the slots once, after).
+    bool indirect_bulk_invalidation = false;
     bool omit_frame_pointer = false;
     static constexpr size_t indirect_slot_capacity = size_t{1} << 18; // 4 MiB per JIT
     std::unique_ptr<FastDispatchEntry[]> indirect_slots;
