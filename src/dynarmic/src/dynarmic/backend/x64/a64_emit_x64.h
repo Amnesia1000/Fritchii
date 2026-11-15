@@ -142,6 +142,49 @@ public:
     const void* terminal_handler_pop_rsb_hint = nullptr;
     const void* terminal_handler_fast_dispatch_hint = nullptr;
     FastDispatchEntry& (*fast_dispatch_table_lookup)(u64) = nullptr;
+
+    // Fritchii: FRITCHII_JIT_INDIRECT_CACHE (boot; fable_a_gameceiling_answer 12.2). 1 = dry: each
+    // indirect branch and return site keeps its last target in a slot and the shared handlers
+    // count how often the next target equals it; 2 = each indirect branch site compares the
+    // target with its slot and jumps straight to the cached block (a miss takes the shared
+    // table, which refills the slot); 3 = 2, and each return site pops the return stack buffer
+    // itself instead of jumping to the shared handler. 0 elsewhere (or without FastDispatch).
+    /// Called from the constructor (the boot switch, read once per process).
+    static int IndirectCacheMode();
+    /// FRITCHII_JIT_NO_FRAME_POINTER (boot): blocks do not set up rbp (Eden 8e14f07a69's frame).
+    static bool OmitFramePointer();
+    /// A free slot, or nullptr when all are taken (the site then uses the shared handler).
+    FastDispatchEntry* AllocateIndirectSlot();
+    /// Every slot back to the empty entry; `release`: the sites are gone too (ClearCache).
+    void ClearIndirectSlots(bool release);
+    /// rbx = the location descriptor of the guest pc and fpcr (rdi, rcx clobbered), as the
+    /// shared handlers compute it.
+    void EmitCalculateLocationDescriptor();
+    /// The dry counters' line, at most every 10 s (from Jit::Run, on the owner thread).
+    void LogIndirectCounters();
+    enum IndirectCounter : size_t {
+        IndirectRuns,       ///< =1: indirect branches run through a dry site
+        IndirectSameTarget, ///< of them, same target as the site's last
+        ReturnRuns,         ///< =1: returns run through a dry site
+        ReturnSameTarget,   ///< of them, same target as the site's last
+        ReturnRsbHits,      ///< of them, served by the return stack buffer
+        SlotMisses,         ///< >=2: slot compares that failed (the shared table then)
+        IndirectCounterCount,
+    };
+    int indirect_cache_mode = 0;
+    bool omit_frame_pointer = false;
+    static constexpr size_t indirect_slot_capacity = size_t{1} << 18; // 4 MiB per JIT
+    std::unique_ptr<FastDispatchEntry[]> indirect_slots;
+    size_t indirect_slots_used = 0;
+    std::array<u64, IndirectCounterCount> indirect_counters{};  // written by generated code
+    std::array<u64, IndirectCounterCount> indirect_counters_logged{};
+    s64 indirect_log_ns = 0;
+    /// Inside the fast dispatch handler, right after the descriptor is computed (rbx).
+    const void* terminal_handler_fast_dispatch_after_calc = nullptr;
+    const void* terminal_handler_indirect_dry = nullptr;  ///< rax = the site's slot
+    const void* terminal_handler_pop_rsb_dry = nullptr;   ///< rax = the site's slot
+    const void* terminal_handler_indirect_slot_miss = nullptr; ///< rbx = descriptor, rax = slot
+
     A64::Jit* jit_interface = nullptr;
     void (*memory_read_128)() = nullptr;
     void (*memory_write_128)() = nullptr;

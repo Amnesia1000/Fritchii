@@ -475,6 +475,12 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_BIND_ADDR_MEMO") {
         return &g_bind_addr_memo;
     }
+    if (name == "FRITCHII_STORE_MEMO") {
+        return &g_store_memo;
+    }
+    if (name == "FRITCHII_JIT_HOT_PACK") {
+        return &g_jit_hot_pack;
+    }
     // FRITCHII_ONEF and FRITCHII_ONEF_PIN are boot switches: not live.
     if (name == "FRITCHII_ONEF_VIEW") {
         return &g_onef_view;

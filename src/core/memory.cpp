@@ -68,6 +68,18 @@ struct Memory::Impl {
 
     void SetCurrentPageTable(Kernel::KProcess& process) {
         current_page_table = &process.GetPageTable().GetImpl();
+        if (process.IsApplication()) {
+            // FRITCHII_STORE_MEMO: the epoch is armed once, here, if the switch is on now (after
+            // main() applied nx2_switches.txt, before the game's first instruction).
+            static std::once_flag store_memo_arm;
+            std::call_once(store_memo_arm, [] {
+                const char* value = std::getenv("FRITCHII_STORE_MEMO");
+                if (value != nullptr && std::atoi(value) != 0) {
+                    Common::g_store_memo_armed.store(true, std::memory_order_seq_cst);
+                    LOG_INFO(HW_Memory, "FRITCHII_STORE_MEMO={}: store memo armed at boot", value);
+                }
+            });
+        }
 
         if (process.IsApplication() && Settings::IsFastmemEnabled()) {
             current_page_table->fastmem_arena = system.DeviceMemory().buffer.VirtualBasePointer();
@@ -814,7 +826,12 @@ struct Memory::Impl {
                     return GetPointerFromDebugMemory(vaddr);
                 case Common::PageType::RasterizerCachedMemory: {
                     u8* const host_ptr{GetPointerFromRasterizerCachedMemory(vaddr)};
-                    on_rasterizer();
+                    // A store's handler takes the pointer instead of walking the table again.
+                    if constexpr (std::is_invocable_v<G, u8*>) {
+                        on_rasterizer(host_ptr);
+                    } else {
+                        on_rasterizer();
+                    }
                     return host_ptr;
                 }
                 case Common::PageType::Unmapped: [[unlikely]] {
@@ -902,7 +919,7 @@ struct Memory::Impl {
         const u64 addr = GetInteger(vaddr);
         if (auto const ptr = GetPointerImpl(addr, [addr, data]() {
             LOG_ERROR(HW_Memory, "Unmapped Write{} @ {:#016x} = {:#016x}", sizeof(T) * 8, addr, u64(data));
-        }, [&]() { HandleRasterizerWrite(addr, sizeof(T)); }); ptr) [[likely]] {
+        }, [&](u8* host_ptr) { HandleRasterizerWrite(addr, sizeof(T), host_ptr); }); ptr) [[likely]] {
             std::memcpy(ptr, &data, sizeof(T));
             VideoCommon::WriteTrack::CloseIfArmed();
             Common::UniformKeepPages::AfterGuestStore(); // EXP92
@@ -917,7 +934,7 @@ struct Memory::Impl {
                 LOG_ERROR(HW_Memory, "Unmapped WriteExclusive{} @ {:#016x} = {:#016x}",
                           sizeof(T) * 8, GetInteger(vaddr), static_cast<u64>(data));
             },
-            [&]() { HandleRasterizerWrite(GetInteger(vaddr), sizeof(T)); });
+            [&](u8* host_ptr) { HandleRasterizerWrite(GetInteger(vaddr), sizeof(T), host_ptr); });
         if (ptr) {
             const bool stored =
                 Common::AtomicCompareAndSwap(reinterpret_cast<T*>(ptr), data, expected);
@@ -935,7 +952,9 @@ struct Memory::Impl {
                 LOG_ERROR(HW_Memory, "Unmapped WriteExclusive128 @ {:#016x} = {:#016x}{:016X}",
                           GetInteger(vaddr), static_cast<u64>(data[1]), static_cast<u64>(data[0]));
             },
-            [&]() { HandleRasterizerWrite(GetInteger(vaddr), sizeof(u128)); });
+            [&](u8* host_ptr) {
+                HandleRasterizerWrite(GetInteger(vaddr), sizeof(u128), host_ptr);
+            });
         if (ptr) {
             const bool stored =
                 Common::AtomicCompareAndSwap(reinterpret_cast<u64*>(ptr), data, expected);
@@ -1018,21 +1037,94 @@ struct Memory::Impl {
         });
     }
 
-    void HandleRasterizerWrite(VAddr v_address, size_t size) {
+    /// `host_ptr`: the store's host pointer when the caller's walk already found it (null: walk).
+    void HandleRasterizerWrite(VAddr v_address, size_t size, const u8* host_ptr = nullptr) {
         if (!Kernel::Nx2ThreadStats::g_enabled) {
-            WriteToRasterizer(v_address, size);
+            WriteToRasterizer(v_address, size, host_ptr);
             return;
         }
         auto& timing = system.CoreTiming();
         const u64 start = timing.GetClockTicks();
-        WriteToRasterizer(v_address, size);
+        WriteToRasterizer(v_address, size, host_ptr);
         Kernel::Nx2ThreadStats::CountMemory(Kernel::Nx2ThreadStats::t_run,
                                             timing.GetClockTicks() - start, false);
     }
 
-    void WriteToRasterizer(VAddr v_address, size_t size) {
-        const auto* p = GetPointerImpl(
-            v_address, []() {}, []() {});
+    /// FRITCHII_STORE_MEMO: one per core (the last one also for the threads that are not cores,
+    /// under sys_core_guard as the rest of that core's state). `block`: device address >> 6 of the
+    /// last store whose full path ran with a memo kept, ~0 = none; `epoch`: g_store_memo_epoch
+    /// read before that path. Counters: written by the owner (load and store), read by the log.
+    struct alignas(64) StoreMemo {
+        u64 block{~u64{0}};
+        u64 epoch{};
+        std::atomic<u64> stores{};       ///< trapped stores looked at (each device address)
+        std::atomic<u64> hits{};         ///< of them the memo serves (=1: would serve)
+        std::atomic<u64> epoch_misses{}; ///< same block, but a mark may have been taken since
+    };
+
+    static void CountStoreMemo(std::atomic<u64>& counter) noexcept {
+        counter.store(counter.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    }
+
+    /// The dry counter's line, at most every 10 s, from whichever core gets there.
+    void LogStoreMemo(int mode) {
+        using Clock = std::chrono::steady_clock;
+        static std::atomic<s64> last_ns{0};
+        static std::mutex log_mutex;
+        static u64 last_stores{}, last_hits{}, last_epoch_misses{}, last_epoch{};
+        const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            Clock::now().time_since_epoch())
+                            .count();
+        s64 last = last_ns.load(std::memory_order_relaxed);
+        if (last != 0 && now - last < 10'000'000'000LL) {
+            return;
+        }
+        std::unique_lock lock{log_mutex, std::try_to_lock};
+        if (!lock.owns_lock() || !last_ns.compare_exchange_strong(last, now)) {
+            return;
+        }
+        u64 stores = 0, hits = 0, epoch_misses = 0;
+        std::string per_core;
+        for (size_t i = 0; i < store_memos.size(); ++i) {
+            const u64 core_stores = store_memos[i].stores.load(std::memory_order_relaxed);
+            const u64 core_hits = store_memos[i].hits.load(std::memory_order_relaxed);
+            stores += core_stores;
+            hits += core_hits;
+            epoch_misses += store_memos[i].epoch_misses.load(std::memory_order_relaxed);
+            per_core += fmt::format("{}{}: {}/{}", i == 0 ? "" : ", ", i, core_hits, core_stores);
+        }
+        const u64 epoch = Common::g_store_memo_epoch.load(std::memory_order_relaxed);
+        if (last == 0) { // the first call only starts the window
+            last_stores = stores, last_hits = hits, last_epoch_misses = epoch_misses;
+            last_epoch = epoch;
+            return;
+        }
+        // Integer math only: this runs on a guest core with the guest's MXCSR, whose exception
+        // flags the guest reads back as FPSR (floating point here could set its inexact flag).
+        const u64 ms = (std::max)(u64(now - last) / 1'000'000, u64{1});
+        const auto per_second = [ms](u64 count) { return count * 1000 / ms; };
+        const u64 d_stores = stores - last_stores;
+        const u64 d_hits = hits - last_hits;
+        const u64 d_epoch_misses = epoch_misses - last_epoch_misses;
+        constexpr u64 field = (u64{1} << 24) - 1;
+        const u64 gathers = ((epoch >> 16) - (last_epoch >> 16)) & field;
+        const u64 takes = ((epoch >> 40) - (last_epoch >> 40)) & field;
+        LOG_INFO(HW_Memory,
+                 "Store memo (FRITCHII_STORE_MEMO={}) {} ms: trapped stores {}/s, {} {}/s ({}%), "
+                 "same block but a mark taken since {}/s; epoch moves: gathers {}/s, flag takes "
+                 "{}/s; since boot hits/stores by core {}",
+                 mode, ms, per_second(d_stores), mode == 2 ? "served" : "would serve",
+                 per_second(d_hits), d_stores == 0 ? 0 : d_hits * 100 / d_stores,
+                 per_second(d_epoch_misses), per_second(gathers), per_second(takes), per_core);
+        last_stores = stores, last_hits = hits, last_epoch_misses = epoch_misses;
+        last_epoch = epoch;
+    }
+
+    void WriteToRasterizer(VAddr v_address, size_t size, const u8* host_ptr) {
+        // The same walk the caller made, when it did not pass the pointer.
+        const auto* p = host_ptr != nullptr ? host_ptr
+                                            : GetPointerImpl(
+                                                  v_address, []() {}, []() {});
         constexpr size_t sys_core = Core::Hardware::NUM_CPU_CORES - 1;
         const size_t core = (std::min)(system.GetCurrentHostThreadID(),
                                      sys_core); // any other calls threads go to syscore.
@@ -1052,7 +1144,56 @@ struct Memory::Impl {
                 sys_core_guard.unlock();
             }
         };
+        // FRITCHII_STORE_MEMO (live, default 0; fable_a_gameceiling_answer 12.1): 1 = dry, counts
+        // the stores the memo would serve; 2 = serves them. A store inside the same 64-byte device
+        // block as this core's last full path, with g_store_memo_epoch unchanged since that path
+        // began (no clear began, ended or ran: common/fritchii_page_flags.h), with this core's
+        // write area still on its page and no run-ahead write tracking, finds every mark below
+        // already set: the watch and collected page flags (pages hold the block), the dirty
+        // manager's 64-byte bit (still collected: no gather since), last_address (no OnCPUWrite
+        // either way). The landing wait is not needed: that path saw no landing published, so
+        // every landing published since found its still-collected block and keeps those bytes.
+        // Only the uniform keeps' record runs (thread-local, a keep may be made at any time).
+        int memo_mode = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_store_memo,
+                                                         "FRITCHII_STORE_MEMO");
+        // Without the epoch armed at boot no memo can be trusted: off for the session.
+        if (memo_mode != 0 && !Common::StoreMemoArmed()) [[unlikely]] {
+            if (static std::atomic_flag logged; !logged.test_and_set(std::memory_order_relaxed)) {
+                LOG_WARNING(HW_Memory,
+                            "FRITCHII_STORE_MEMO={} set after boot: the store memo stays off this "
+                            "session (it needs the switch on when the game starts)",
+                            memo_mode);
+            }
+            memo_mode = 0;
+        }
+        StoreMemo& memo = store_memos[core];
         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
+            u64 memo_epoch = 0;
+            bool memo_keepable = false;
+            if (memo_mode != 0) [[unlikely]] {
+                memo_epoch = Common::g_store_memo_epoch.load(std::memory_order_seq_cst);
+                const u64 block = address >> 6;
+                const bool one_block =
+                    address != 0 && size != 0 && ((address + size - 1) >> 6) == block;
+                memo_keepable = one_block && (memo_epoch & Common::StoreMemoActiveMask) == 0;
+                CountStoreMemo(memo.stores);
+                if (one_block && memo.block == block) {
+                    if (memo.epoch == memo_epoch &&
+                        rasterizer_write_areas[core].last_address == (address >> YUZU_PAGEBITS) &&
+                        !VideoCommon::WriteTrack::g_armed.load(std::memory_order_relaxed)) {
+                        CountStoreMemo(memo.hits);
+                        if (memo_mode == 2) {
+                            Common::UniformKeepPages::RecordGuestStore(address, size);
+                            return;
+                        }
+                    } else {
+                        CountStoreMemo(memo.epoch_misses);
+                    }
+                }
+                if ((memo.stores.load(std::memory_order_relaxed) & 0xffff) == 0) [[unlikely]] {
+                    LogStoreMemo(memo_mode);
+                }
+            }
             // EDEN_NX2_TEX_BANK_GEN: every trapped write, before the bytes land (the texture
             // cache's watched pages look again at their next draw for that reason).
             if (address != 0 && size != 0) {
@@ -1104,10 +1245,16 @@ struct Memory::Impl {
             gpu_dirty_managers[core].Collect(address, size);
             // A download writing to guest memory here may have looked at the collected writes
             // before this one: its bytes would land over the ones stored after this returns.
-            VideoCore::DownloadLanding::Await(address, size);
+            const bool no_landing = VideoCore::DownloadLanding::AwaitIdle(address, size);
             // last_address stays on the page after its GPU-written state is gone, so these
             // writes can land on pages the buffer cache holds as clean until the next gather.
             g_collected_write_pages.Mark(address, size);
+            if (memo_mode != 0) [[unlikely]] {
+                // Every mark of this block is set now, none taken since memo_epoch was read
+                // (a clear in between moves the epoch, and the next store misses).
+                memo.block = memo_keepable && no_landing ? address >> 6 : ~u64{0};
+                memo.epoch = memo_epoch;
+            }
         });
     }
 
@@ -1169,6 +1316,7 @@ struct Memory::Impl {
     std::mutex read_trap_mutex;
     std::array<GPUDirtyState, Core::Hardware::NUM_CPU_CORES> rasterizer_write_areas{};
     std::array<Common::ScratchBuffer<u32>, Core::Hardware::NUM_CPU_CORES> scratch_buffers{};
+    std::array<StoreMemo, Core::Hardware::NUM_CPU_CORES> store_memos{};
     std::span<Core::GPUDirtyMemoryManager> gpu_dirty_managers;
     std::mutex sys_core_guard;
 #ifdef __ANDROID__

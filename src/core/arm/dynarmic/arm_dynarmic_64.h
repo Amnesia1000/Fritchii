@@ -105,6 +105,7 @@ public:
     void ClearInstructionCache() override;
     void InvalidateCacheRange(u64 addr, std::size_t size) override;
     std::size_t WarmCompile(std::span<const u64> keys, const std::atomic<bool>& stop) override;
+    std::size_t PackHotCode(const std::atomic<bool>& stop) override;
 
 protected:
     const Kernel::DebugWatchpoint* HaltedWatchpoint() const override;

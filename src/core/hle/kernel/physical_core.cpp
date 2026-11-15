@@ -339,6 +339,34 @@ void PhysicalCore::Idle(KernelCore& kernel) {
     // every 100 ms per core: unbudgeted, the cores never rested while new code poured in at boot
     // and took the host CPU from the GPU thread and shader workers (first load 761 -> 811 ms,
     // hitch time 2.6 -> 3.7 s in the first 100 s; reloads 1.64 -> 1.34 s).
+    // FRITCHII_JIT_HOT_PACK (live test hook, default 0; fable_a_gameceiling_answer 12.3): each new
+    // non-zero value makes every core, at its next idle, clear its code cache and compile Fable
+    // A's hot list (FRITCHII_JIT_HOT_LIST) first in pc order; the rest compiles again as it runs.
+    // Prices the "arriving at a block" share (code layout): compare fps before and after.
+    if (const int pack = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_jit_hot_pack,
+                                                          "FRITCHII_JIT_HOT_PACK");
+        pack != 0 && !m_is_interrupted.load(std::memory_order_acquire)) [[unlikely]] {
+        thread_local int served = 0;
+        if (pack != served) {
+            served = pack;
+            if (KProcess* const process = kernel.ApplicationProcess()) {
+                if (auto* const arm = process->GetArmInterface(m_core_index)) {
+                    const auto start = std::chrono::steady_clock::now();
+                    const std::size_t compiled = arm->PackHotCode(m_is_interrupted);
+                    LOG_INFO(Core_ARM,
+                             "JIT hot pack (FRITCHII_JIT_HOT_PACK={}) core {}: cache cleared, {} hot "
+                             "blocks gone through in {} ms{}",
+                             pack, m_core_index, compiled,
+                             std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - start)
+                                 .count(),
+                             m_is_interrupted.load(std::memory_order_acquire)
+                                 ? " (stopped by an interrupt)"
+                                 : "");
+                }
+            }
+        }
+    }
     if (Common::Nx2Hitch::JitWarmEnabled() && !m_is_interrupted.load(std::memory_order_acquire)) {
         if (KProcess* const process = kernel.ApplicationProcess()) {
             if (auto* const arm = process->GetArmInterface(m_core_index)) {

@@ -74,6 +74,15 @@ public:
         std::scoped_lock gather_lk(gather_guard);
         {
             std::scoped_lock lk(guard);
+            // Nothing collected (front_buffer is always empty here): nothing to take, and no
+            // clear for the store memo to hear of. A Collect landing after this look is the next
+            // gather's, as if this one had run just before it (the exchange below races it the
+            // same way); `current` already holds the empty word NothingCollected relies on.
+            if (!IsValid(current.load(std::memory_order_acquire).address) && back_buffer.empty()) {
+                return;
+            }
+            // FRITCHII_STORE_MEMO: the collected writes are taken here (g_store_memo_epoch).
+            const Common::StoreMemoClear clear{Common::StoreMemoGatherGen};
             TransformAddress t = current.exchange(default_transform, std::memory_order_relaxed);
             front_buffer.swap(back_buffer);
             if (IsValid(t.address)) {

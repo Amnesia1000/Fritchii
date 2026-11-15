@@ -2699,6 +2699,127 @@ the same few pages again and again.
   skips the whole bind; this one only shortens the translation when EXP18's memo misses or is
   off.
 
+### FRITCHII_STORE_MEMO
+
+FRITCHII_STORE_MEMO (boot to arm, then live between 1 and 2; default 0 = exactly as before;
+fable_a_gameceiling_answer 12.1). Non-zero when the game starts arms the memo epoch; set later
+live without that, it stays off for the session (one warning line).
+Guest stores to GPU-tracked pages were 3.6% of the guest cores' busy time at the market: each
+one walks the page table twice and then sets the watch flag, records the store, asks or skips
+OnCPUWrite, collects the dirty bit, fences for a download landing and sets the collected flag.
+- Always (no switch, exact): the store's handler takes the host pointer the store's own walk
+  found instead of walking the page table a second time (Memory::WriteToRasterizer).
+- 1 (dry): each core keeps a one-entry memo of its last full store path and counts the stores it
+  would serve; the full path still runs for every store.
+- 2: a memo hit only records the store for the uniform keeps (thread-local) and returns.
+- A hit needs: the store inside one 64-byte device block, the same block as the core's last full
+  path, the memo epoch (Common::g_store_memo_epoch) unchanged since that path began, the core's
+  write area still on the page, and no run-ahead write tracking armed.
+- Why it is exact: the epoch moves around everything that takes such a mark away (a dirty manager
+  Gather, a Take of the collected or watch page flags): a count of clears running in its low 16
+  bits and a generation raised as each ends, so a memo is only kept when no clear ran at the read,
+  and any clear since changes the value. With it unchanged, every mark the last full path set is
+  still there, and the full path would have found each set (no-ops; last_address on the page
+  means no OnCPUWrite either). The landing wait: the memo is only kept when that path saw no
+  landing published, so every landing published later found the block's collected bit (still
+  collected: no gather) and keeps those bytes. The uniform keeps' record still runs on a hit.
+  Once armed the epoch moves whatever the live value says, so a change between 0, 1 and 2 never
+  trusts an old memo. Unarmed (the default) a clear costs one relaxed load; armed, two atomic
+  adds per flag take that clears a set bit and per gather that takes something (an empty gather
+  returns before its exchange and moves nothing).
+- "Store memo (FRITCHII_STORE_MEMO=n) 10000 ms: trapped stores S/s, would serve (=2: served) H/s
+  (P%), same block but a mark taken since M/s; epoch moves: gathers G/s, flag takes T/s; since
+  boot hits/stores by core ..." (HW_Memory, Info; at most every 10 s while the switch is on).
+- Expected: 1.5 to 2% of the guest cores' busy time if most trapped stores hit (Fable A's guess:
+  stores come in runs over the same block); the dry line says how many do. If the flag takes or
+  gathers move the epoch too often the hit share stays low and the switch is not worth it.
+
+### FRITCHII_JIT_INDIRECT_CACHE
+
+FRITCHII_JIT_INDIRECT_CACHE (boot, read once per process, default 0 = exactly as before;
+fable_a_gameceiling_answer 12.2). Every indirect branch (BR, BLR) and return of the game went
+through two shared routines; the indirect one waits on a load from the 16 MiB fast dispatch table
+(2.56% of the guest cores' busy time) and has one host jump for every target.
+- 1 (dry): each indirect branch and return site gets a 16-byte slot (4 MiB pool per JIT) and
+  jumps to dry copies of the shared handlers, which count how often the target equals the site's
+  last one, and for returns how often the return stack buffer served it. Execution is the same.
+- 2: each indirect branch site computes the target's location descriptor itself, compares it
+  with its slot and jumps straight to the slot's block on a match. A miss goes to a shared routine
+  that looks in the fast dispatch table; on a table hit it fills the slot, else the table's own
+  miss path (lookup or compile, table refill) runs as before and the slot fills at the next miss.
+  Each site has its own host jump, so the host's predictor works per site.
+- 3: 2, and each return site pops the return stack buffer itself (the shared handler's
+  instructions at the site, a miss continuing in the fast dispatch handler as before).
+- Why it is exact: a slot only ever holds a descriptor and the entrypoint the fast dispatch
+  table held for it at that moment; every slot is emptied whenever any block is removed (a range
+  invalidation) or the cache is cleared, the two places the table's entries go too. A match
+  therefore jumps where the table would have. Halt checks are unchanged (the shared handler made
+  none either). Sites past the pool's 262,144 slots keep the shared handler.
+- "JIT indirect sites (FRITCHII_JIT_INDIRECT_CACHE=1) core N 10.0 s: indirect branches B/s, same
+  target as the site's last P%; returns R/s, same target as the site's last Q%, return buffer
+  hits H%; sites S" (Core_ARM, Info, per core, every 10 s from Jit::Run). With 2 or 3: "slot
+  misses M/s; sites S".
+- Expected: 1.5 to 2% of the guest cores' busy time if the dry line shows most indirect branches
+  hit their site's last target (Fable A 12). Code grows by about 40 bytes per indirect branch site
+  (3: also per return site).
+
+### FRITCHII_JIT_NO_FRAME_POINTER
+
+FRITCHII_JIT_NO_FRAME_POINTER (boot, read once per process, default 0 = as before;
+fable_a_gameceiling_answer 12.6). Since Eden 8e14f07a69 every A64 block stores rbp, points it at
+its stack frame and restores it before its terminal: three instructions and 24 bytes per block
+run, about 8% of an average block's bytes.
+- 1: blocks leave rbp as the dispatcher set it. rbp stays out of the register allocator either
+  way (reg_alloc.cpp), so no block reads or writes it.
+- Exact for execution: rbp was only ever a frame pointer for stack walkers. Ours stop at the
+  first JIT frame (nx2_sampler); the Windows unwind data covers the dispatcher's prologue, not the
+  blocks. What changes: external profilers and crash dumps that follow rbp lose the JIT frames.
+- No log line beyond the boot line "FRITCHII_JIT_NO_FRAME_POINTER=1: blocks do not set up rbp".
+- Expected: 0.5 to 1% of the guest cores' busy time (Fable A's estimate). Needs one fresh-launch
+  A/B (boot switch).
+
+### FRITCHII_JIT_RSQRT_ZERO
+
+FRITCHII_JIT_RSQRT_ZERO (boot, read once per process, default 0 = as before;
+fable_a_gameceiling_answer 12.5). The vector reciprocal square root estimate (FRSQRTE, 32 and
+64-bit lanes, AVX hosts) has an inline path, but one lane that is NaN, negative, zero, denormal
+or +infinity sends the whole vector to C++ (0.62% of the guest cores' busy time with the other
+soft float calls; 190 samples of 322).
+- 1: the C++ fallback counts its calls by lane kind (code generation otherwise unchanged).
+- 2: also a vector whose only such lanes are exact +-0 stays inline: the other lanes are computed
+  by the inline path's own instructions (the zero lanes from 1.0), the host's exception flags are
+  saved and put back around that (the C++ estimate raises no host flags), the zero lanes become
+  infinity with the zero's sign, and FPSR.DZC is set, as FPRSqrtEstimate does for a zero. Any
+  other bad lane still takes the C++ call. Not used when FPCR.DZE (the trap) is set.
+- Exact: per lane the same values as FPRSqrtEstimate (the inline path is already trusted to match
+  it for the other lanes), and the same FPSR bits (DZC; nothing from the host's sqrt and divide).
+- "JIT vector rsqrt estimate fallbacks (FRITCHII_JIT_RSQRT_ZERO=n) 10000 ms: calls C/s, only zero
+  lanes bad Z/s (P%); lanes/s: zero, denormal, negative, NaN, +infinity; zero lanes by lane
+  a/b/c/d" (Core_ARM, Info, at most every 10 s, integer math only). At 2 the calls left are the
+  ones it could not serve.
+- Expected: 0.3 to 0.4% of the guest cores' busy time if most calls are "only zero lanes bad"
+  (Fable A's guess: a zero in the unused fourth lane of a three-component vector).
+
+### FRITCHII_JIT_HOT_PACK
+
+FRITCHII_JIT_HOT_PACK (live test hook, default 0; fable_a_gameceiling_answer 12.3). Prices the
+13.2% of the guest cores' busy time spent arriving at blocks: is it code layout (instruction
+fetch, instruction TLB)? Needs FRITCHII_JIT_HOT_LIST (boot env) = a text file of "pc fpcr samples"
+lines, e.g. E:\OotRemakeEmulation\work\fable_a_gc\hot-blocks-market.txt (19,332 blocks).
+- Each new non-zero value (set it through the debug server's `switch`, e.g. 1, later 2 for a
+  second round) makes every guest core, at its next idle, clear its own code cache and compile the
+  hot list first, in guest pc order (PrecompileBlock through the warm-compile path, which now does
+  a pending whole-cache clear first instead of compiling into the code it throws away). Everything
+  else compiles again as it runs, after the hot code.
+- "JIT hot pack (FRITCHII_JIT_HOT_PACK=n) core c: cache cleared, K hot blocks gone through in M ms"
+  (Core_ARM, Info). An interrupt stops the compile early (the line says so); the rest compiles
+  lazily.
+- Exact: a cache clear and recompile of the same guest code (as after any code invalidation).
+  Expect a compile stall of a second or so at the moment it runs.
+- The test: market heavy phase, fps before, set the switch, wait for the six lines and about 30 s
+  for the cold code to come back, fps after. Fable A: 1.5% or more means layout matters (then the
+  real work: slow paths out of line, hot code together); nothing means drop that line of work.
+
 ## Numbered experiments (EDEN_NX2_EXPn)
 
 Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP79, live through the debug server:
