@@ -761,7 +761,71 @@ void CompareSample(EngineState& e, Tegra::MaxwellDeviceMemoryManager& memory,
 void SetMode(int mode) noexcept {
     Common::S4Count::g_mode.store(mode, std::memory_order_relaxed);
     Common::S4Count::g_on.store(mode != 0, std::memory_order_relaxed);
+    if (mode != 0) {
+        Common::S4Count::g_entry_users.fetch_or(Common::S4Count::EntryUserCounter,
+                                                std::memory_order_relaxed);
+    } else {
+        Common::S4Count::g_entry_users.fetch_and(~Common::S4Count::EntryUserCounter,
+                                                 std::memory_order_relaxed);
+    }
     g_epoch.fetch_add(1, std::memory_order_relaxed);
+}
+
+namespace {
+/// FRITCHII_BIND_SKIP's own crossing of the front's entry marks (E alone; the counter's state
+/// above is its own and may be off).
+struct SkipEntryClock {
+    u64 tail{};
+    u64 last_back{};
+    u64 index{1};
+    bool started{};
+};
+SkipEntryClock g_skip_clock;
+} // Anonymous namespace
+
+void SetBindSkipEntries(bool want) noexcept {
+    if (want) {
+        Common::S4Count::g_entry_users.fetch_or(Common::S4Count::EntryUserBindSkip,
+                                                std::memory_order_seq_cst);
+    } else {
+        Common::S4Count::g_entry_users.fetch_and(~Common::S4Count::EntryUserBindSkip,
+                                                 std::memory_order_seq_cst);
+    }
+}
+
+u64 EngineEntryIndex() noexcept {
+    // E only: not R in a lent call, not the memory stage's thread.
+    if (!GpuSplit::OnBackThread() || OneFollower::Detail::t_render) {
+        return 0;
+    }
+    GpuSplit& split = GpuSplit::Get();
+    if (!split.Active()) {
+        return 0;
+    }
+    SkipEntryClock& c = g_skip_clock;
+    const u64 back = split.BackEntryPosition();
+    const u64 head = g_entry_head.load(std::memory_order_acquire);
+    if (!c.started || back < c.last_back) {
+        // First use, or a new split session (its positions start over): marks before now mean
+        // nothing. A new index, so no memo from before matches.
+        c.started = true;
+        c.tail = head;
+        c.index += 2;
+    }
+    c.last_back = back;
+    if (head - c.tail > EntryRingSize) {
+        // Marks overwritten before E crossed them: their entries are crossed all the same.
+        c.index += head - c.tail - EntryRingSize;
+        c.tail = head - EntryRingSize;
+    }
+    while (c.tail < head) {
+        if (g_entries[c.tail % EntryRingSize].position > back) {
+            break;
+        }
+        ++c.tail;
+        ++c.index;
+    }
+    return c.index;
 }
 
 void Bind(Tegra::MaxwellDeviceMemoryManager& memory, const BindFacts& facts, PageTest cpu_page,

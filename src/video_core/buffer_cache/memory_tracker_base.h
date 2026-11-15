@@ -15,6 +15,7 @@
 
 #include "common/alignment.h"
 #include "common/common_types.h"
+#include "common/fritchii_bind_skip.h"
 #include "video_core/buffer_cache/word_manager.h"
 #include "video_core/page_filter.h"
 
@@ -440,6 +441,8 @@ private:
     void CreateRegion(std::size_t page_index) {
         const VAddr base_cpu_addr = page_index << HIGHER_PAGE_BITS;
         top_tier[page_index] = GetNewManager(base_cpu_addr);
+        // FRITCHII_BIND_SKIP: its pages start CPU-modified and untracked, no hook saw it.
+        ::Common::BindSkip::NoteTrackerWide();
     }
 
     Manager* GetNewManager(VAddr base_cpu_address) {

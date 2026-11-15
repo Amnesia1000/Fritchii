@@ -20,6 +20,8 @@
 #include <vector>
 #include <fmt/ranges.h>
 
+#include "common/cityhash.h"
+#include "common/fritchii_bind_skip.h"
 #include "common/fritchii_write_ring.h"
 #include "common/nx2_uniform_keep_pages.h"
 #include "common/range_sets.inc"
@@ -29,6 +31,7 @@
 #include "video_core/buffer_cache/nx2_bytes_equal.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/buffer_cache/uniform_stream_reuse.h"
+#include "video_core/back_read_audit.h"
 #include "video_core/buffer_churn_stats.h"
 #include "video_core/churn_counters.h"
 #include "video_core/fritchii_s4_count.h"
@@ -1673,6 +1676,8 @@ void BufferCache<P>::SetUniformBuffersState(const std::array<u32, NUM_STAGES>& m
     VideoCommon::MemoryStageLink::CheckBackCache("SetUniformBuffersState");
     // FRITCHII_S4_COUNT: the counter follows its live switch, read once a draw here.
     VideoCommon::S4Count::Poll();
+    // FRITCHII_BIND_SKIP: the same, for the uniform bind skip.
+    BindSkipPoll();
     if (channel_state->enabled_uniform_buffer_masks == mask &&
         channel_state->uniform_buffer_sizes == sizes) [[likely]] {
         return;
@@ -2638,6 +2643,21 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         Nx2Profile::AddFine(Nx2Profile::FineCounter::UniformBytes, size);
         return;
     }
+    // FRITCHII_BIND_SKIP (live, default 0): off, one member test.
+    if constexpr (!IS_OPENGL) {
+        if (bind_skip.mode != 0) [[unlikely]] {
+            BindSkipUniform(stage, index, binding_index, needs_bind);
+            return;
+        }
+    }
+    BindHostGraphicsUniformBufferBody<false>(stage, index, binding_index, needs_bind, nullptr);
+}
+
+template <class P>
+template <bool record>
+void BufferCache<P>::BindHostGraphicsUniformBufferBody(size_t stage, u32 index,
+                                                       u32 binding_index, bool needs_bind,
+                                                       [[maybe_unused]] BindSkipOutcome* outcome) {
     const Binding& binding = channel_state->uniform_buffers[stage][index];
     const DAddr device_addr = binding.device_addr;
     const u32 size = (std::min)(binding.size, (*channel_state->uniform_buffer_sizes)[stage][index]);
@@ -2683,6 +2703,11 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     // would take stay set for the next bind that reads the host buffer.
     const int bank_trims = native_bank_bind ? VideoCore::Nx2Debug::Experiment(26) : 0;
     const bool native_bank = native_bank_bind && !(use_fast_buffer && (bank_trims & 1) != 0);
+    if constexpr (record) {
+        // FRITCHII_BIND_SKIP: the path, filled in below (a path the skip cannot stand in for
+        // leaves Kind::None).
+        outcome->bank = native_bank;
+    }
     // FRITCHII_S4_COUNT (dry): the bind before anything below reads its bytes.
     if (Common::S4Count::On()) [[unlikely]] {
         S4CountBind(stage, index, device_addr, size, use_fast_buffer, native_bank);
@@ -2708,8 +2733,14 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     if (native_bank &&
         VideoCommon::Runahead::BackHolds(VideoCommon::Runahead::Hold::BankCompare)) {
         // Held: nothing compared, nothing taken.
+        if constexpr (record) {
+            outcome->held = true;
+        }
     } else if (const int tracked_mode = native_bank ? VideoCore::Nx2Debug::Experiment(9) : 0;
         tracked_mode != 0) {
+        if constexpr (record) {
+            outcome->bank_mode = tracked_mode;
+        }
         CheckNativeBankPagesTracked(device_addr, size, tracked_mode, bank_trims, buffer, stage,
                                     index);
     } else if (native_bank) {
@@ -2923,6 +2954,12 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                             ++uniform_keep_stats.stale_session;
                         }
                     }
+                    if constexpr (record) {
+                        // FRITCHII_BIND_SKIP: the reuse slot holds this bind's bytes now.
+                        if (streamed) {
+                            outcome->kind = BindSkipOutcome::Kind::Stream;
+                        }
+                    }
                 }
                 const u64 rebound =
                     VideoCommon::UniformStreamReuseState<typename Runtime::StreamUniformRef>()
@@ -2944,9 +2981,21 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     Nx2Profile::AddFine(Nx2Profile::FineCounter::UniformCached, 1);
     const Nx2Profile::FineScope classic_scope{Nx2Profile::Zone::UniformClassic};
     // Classic cached path
-    if (SynchronizeBuffer(buffer, device_addr, size)) {
+    const bool synced = SynchronizeBuffer(buffer, device_addr, size);
+    if (synced) {
         ++channel_state->uniform_cache_hits[0];
     }
+    if constexpr (record) {
+        outcome->kind = BindSkipOutcome::Kind::Cached;
+        outcome->synced = synced;
+    }
+    BindUniformCachedTail(stage, index, binding_index, needs_bind, buffer, offset, size);
+}
+
+template <class P>
+void BufferCache<P>::BindUniformCachedTail(size_t stage, [[maybe_unused]] u32 index,
+                                           u32 binding_index, bool needs_bind, Buffer& buffer,
+                                           u32 offset, u32 size) {
     // Skip binding if it's not needed and if the bound buffer is not the fast version
     // This exists to avoid instances where the fast buffer is bound and a GPU write happens
     needs_bind |= HasFastUniformBufferBound(stage, binding_index);
@@ -3071,6 +3120,392 @@ void BufferCache<P>::S4CountBind(size_t stage, u32 index, DAddr device_addr, u32
             page, Core::DEVICE_PAGESIZE);
     };
     VideoCommon::S4Count::Bind(device_memory, facts, cpu_page, gpu_page, this);
+}
+
+template <class P>
+void BufferCache<P>::BindSkipPoll() {
+    if constexpr (IS_OPENGL) {
+        return; // the skip stands in for Vulkan's stream copies only
+    } else {
+        const int value = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_bind_skip,
+                                                           "FRITCHII_BIND_SKIP");
+        const int mode = value >= 1 && value <= 5 ? value : 0;
+        if (mode != bind_skip.mode) [[unlikely]] {
+            BindSkipSetMode(mode);
+        }
+    }
+}
+
+template <class P>
+void BufferCache<P>::BindSkipSetMode(int mode) {
+    BindSkipState& s = bind_skip;
+    const bool was_on = s.mode != 0;
+    s.mode = mode;
+    s.step2 = mode == 2 || mode == 3 || mode == 5;
+    s.verify = mode == 3 || mode == 4;
+    s.dry = mode == 5;
+    // No memo from before is trusted (what a memo holds depends on the value: the hash).
+    ++s.epoch;
+    if (mode != 0 && !was_on) {
+        // The marks the proof stands on: the price generations (they stay on, as their other
+        // users leave them), the bank marks gate, the tracker's hooks, the front's list entry
+        // marks. A writer that loaded a gate shut set no mark: no memo is made for two frames
+        // (every writer's next load sees the gates by then), as the bank check does.
+        Common::g_price_gens_on.store(true, std::memory_order_seq_cst);
+        Common::SetBankMarks(Common::BankMarksBindSkip, true);
+        Common::BindSkip::g_on.store(true, std::memory_order_seq_cst);
+        VideoCommon::S4Count::SetBindSkipEntries(true);
+        s.ready_frame = frame_tick + 2;
+        s.overflows = Common::g_collected_overflows.load(std::memory_order_seq_cst);
+    } else if (mode == 0 && was_on) {
+        Common::SetBankMarks(Common::BankMarksBindSkip, false);
+        Common::BindSkip::g_on.store(false, std::memory_order_seq_cst);
+        VideoCommon::S4Count::SetBindSkipEntries(false);
+    }
+    if (bind_skip_scratch.size() < BindSkipScratchBytes) {
+        bind_skip_scratch.resize(BindSkipScratchBytes);
+    }
+    s.w = BindSkipWindow{};
+    s.w.since = std::chrono::steady_clock::now();
+    s.w.start_ticks = Nx2Profile::Ticks();
+    LOG_INFO(HW_GPU, "Bind skip (FRITCHII_BIND_SKIP={}): {}{}", mode,
+             mode == 0   ? "off"
+             : mode == 5 ? "dry, decides, counts and times only"
+                         : (s.step2 ? "within a list entry and across entries on tracked pages"
+                                    : "within a list entry"),
+             s.verify ? ", verified (the old path runs too)" : "");
+}
+
+template <class P>
+u64 BufferCache<P>::BindSkipHash(DAddr device_addr, u32 size) {
+    // The mapped pages of the range, as the bank check reads them (an unmapped page stands as a
+    // marker of its own).
+    u64 hash = 0x9E3779B97F4A7C15ULL ^ size;
+    DAddr at = device_addr;
+    u64 left = size;
+    while (left != 0) {
+        const u64 chunk =
+            (std::min<u64>)(left, Core::DEVICE_PAGESIZE - (at & Core::DEVICE_PAGEMASK));
+        const u8* const pointer = VideoCommon::BackReadAudit::Unaudited(
+            [&] { return device_memory.template GetPointer<u8>(at); });
+        if (pointer == nullptr) {
+            hash = (hash ^ 0xDEADULL) * 0x9E3779B97F4A7C15ULL;
+        } else {
+            hash = Common::CityHash64WithSeed(reinterpret_cast<const char*>(pointer),
+                                              static_cast<size_t>(chunk), hash);
+        }
+        at += chunk;
+        left -= chunk;
+    }
+    return hash;
+}
+
+template <class P>
+void BufferCache<P>::BindSkipUniform(size_t stage, u32 index, u32 binding_index,
+                                     bool needs_bind) {
+    if constexpr (IS_OPENGL || !VideoCommon::StreamUniformReusable<Runtime>) {
+        BindHostGraphicsUniformBufferBody<false>(stage, index, binding_index, needs_bind, nullptr);
+    } else {
+        using Ref = typename Runtime::StreamUniformRef;
+        using Reuse = VideoCommon::UniformStreamReuse<Ref>;
+        using Kind = typename BindSkipOutcome::Kind;
+        static_assert(Reuse::NumStages == NUM_STAGES &&
+                      Reuse::NumSlots == NUM_GRAPHICS_UNIFORM_BUFFERS);
+        static_assert(Reuse::MaxBytes <= BindSkipScratchBytes);
+        BindSkipState& s = bind_skip;
+        BindSkipWindow& w = s.w;
+        ++w.binds;
+        // One bind in 64 is timed (decide, skip, the upkeep a bind that is not skipped adds).
+        const bool timed = (w.binds & 63) == 0;
+        const u64 start = timed ? Nx2Profile::Ticks() : 0;
+        const Binding& binding = channel_state->uniform_buffers[stage][index];
+        const DAddr device_addr = binding.device_addr;
+        const u32 declared = (*channel_state->uniform_buffer_sizes)[stage][index];
+        const u32 size = (std::min)(binding.size, declared);
+        BindSkipMemo& memo = bind_skip_memo[stage][index];
+        // Every memo ends when a guest store's after-store mark was lost (its bytes landed
+        // without a mark) or while a run-ahead frontier is up (guest memory may hold a later
+        // frame).
+        const bool frontier =
+            VideoCommon::Runahead::g_frontier.load(std::memory_order_relaxed) != 0;
+        const u64 overflows = Common::g_collected_overflows.load(std::memory_order_relaxed);
+        if (overflows != s.overflows || frontier) [[unlikely]] {
+            s.overflows = overflows;
+            ++s.epoch;
+        }
+        const u64 entry = VideoCommon::S4Count::EngineEntryIndex();
+        const u32 switch_generation =
+            VideoCore::Nx2Debug::g_switch_generation.load(std::memory_order_acquire);
+        // A device page mapped anew reads other host memory with no write anyone saw.
+        const u64 translation = device_memory.TranslationGeneration();
+        Reuse& reuse = VideoCommon::UniformStreamReuseState<Ref>();
+        u64 gen = ~u64{0};
+        bool gen_read = false;
+        BindSkipReason reason = BindSkipNoMemo;
+        if (s.broken || frontier) {
+            reason = BindSkipHeld;
+        } else if (memo.epoch != s.epoch || memo.kind == Kind::None) {
+            reason = BindSkipNoMemo;
+        } else if (memo.device_addr != device_addr || memo.size != size ||
+                   memo.declared != declared || memo.buffer_id != binding.buffer_id ||
+                   memo.binding_epoch != binding_epoch || memo.channel != channel_state ||
+                   memo.gpu_memory != gpu_memory || memo.switch_generation != switch_generation ||
+                   memo.skip_cache_size != channel_state->uniform_buffer_skip_cache_size ||
+                   memo.translation != translation) {
+            reason = BindSkipOtherRange;
+        } else {
+            // A report landing on the range is waited for, as a read of it waits (its write
+            // generation shows it then).
+            VideoCommon::OneFollower::BeforeEngineRead(device_addr, size);
+            gen = Common::BindSkip::RangeGen(device_addr, size);
+            gen_read = true;
+            if (gen == ~u64{0} || gen != memo.gen) {
+                reason = BindSkipWritten;
+            } else if (entry != 0 && memo.entry == entry) {
+                reason = BindSkipInEntry;
+            } else if (!memory_tracker.IsRegionSyncClean(device_addr, size)) {
+                // Tracked now with no state change since the memo (the generation) is tracked
+                // all along: guest stores there trap and mark.
+                reason = BindSkipUntracked;
+            } else {
+                reason = s.step2 ? BindSkipAcross : BindSkipStep1Only;
+            }
+            if ((reason == BindSkipInEntry || reason == BindSkipAcross) &&
+                memo.kind == Kind::Stream) {
+                const typename Reuse::Slot& slot = reuse.slots[stage][index];
+                const typename Reuse::Copy& copy = reuse.copies[slot.copy];
+                if (slot.serial == 0 || slot.serial != memo.serial || slot.direct != 0 ||
+                    copy.serial != slot.serial || copy.size != size) {
+                    reason = BindSkipSlotChanged;
+                } else if (copy.tick != runtime.StreamEpoch()) {
+                    // BindSmallUniformReusing fills a new allocation from the copy then (with
+                    // EXP17 it looks for a range copy first): left to it.
+                    reason = BindSkipStreamEpoch;
+                }
+            }
+        }
+        ++w.reasons[reason];
+        const bool would_skip = reason == BindSkipInEntry || reason == BindSkipAcross;
+        // Verify modes check every bind the skip would stand in for; the others one in 1,024.
+        const bool check = would_skip && !s.dry && (s.verify || (++s.samples & 1023) == 0);
+        if (timed) {
+            w.decide_ticks += Nx2Profile::Ticks() - start;
+            ++w.decide_samples;
+        }
+        if (would_skip && !s.dry && !check) {
+            // --- The skip: what the old path does that stays, without its reads ---
+            const u64 skip_start = timed ? Nx2Profile::Ticks() : 0;
+            if (!memo.touch_once || memo.touched_frame != frame_tick) {
+                TouchBuffer(slot_buffers[binding.buffer_id], binding.buffer_id);
+                memo.touched_frame = frame_tick;
+            }
+            if (Common::S4Count::On()) [[unlikely]] {
+                S4CountBind(stage, index, device_addr, size, memo.kind == Kind::Stream,
+                            memo.bank);
+            }
+            if (memo.kind == Kind::Stream) {
+                // BindSmallUniformReusing's own rebind of the slot's copy (same bytes, same
+                // stream epoch), and the stream branch's binding state.
+                typename Reuse::Slot& slot = reuse.slots[stage][index];
+                const typename Reuse::Copy& copy = reuse.copies[slot.copy];
+                channel_state->fast_bound_uniform_buffers[stage] |= 1u << binding_index;
+                channel_state->uniform_buffer_binding_sizes[stage][binding_index] = size;
+                runtime.RebindStreamUniform(copy.ref, size);
+                ++reuse.rebinds;
+                slot.misses = 0;
+                Nx2Profile::AddFine(Nx2Profile::FineCounter::UniformRebinds, 1);
+                ++w.skipped_stream;
+            } else {
+                // The cached path after a synchronize that finds nothing to upload (a hit) and
+                // a bank check that finds nothing changed.
+                Buffer& buffer = slot_buffers[binding.buffer_id];
+                ++channel_state->uniform_cache_hits[0];
+                BindUniformCachedTail(stage, index, binding_index, needs_bind, buffer,
+                                      buffer.Offset(device_addr), size);
+                ++w.skipped_cached;
+                w.skipped_bank += memo.bank ? 1 : 0;
+            }
+            w.skipped_bytes += size;
+            if (timed) {
+                w.skip_ticks += Nx2Profile::Ticks() - skip_start;
+                ++w.skip_samples;
+            }
+            if ((w.binds & 4095) == 0) {
+                BindSkipLog();
+            }
+            return;
+        }
+        // --- The old path, the check around it, and the slot's memo after it ---
+        bool differ = false;
+        if (check) {
+            ++w.checked;
+            if (memo.kind == Kind::Stream) {
+                // What the skip would bind (the slot's copy) against guest memory now.
+                const typename Reuse::Slot& slot = reuse.slots[stage][index];
+                u8* const scratch = bind_skip_scratch.data();
+                VideoCommon::BackReadAudit::Unaudited(
+                    [&] { device_memory.ReadBlockUnsafe(device_addr, scratch, size); });
+                differ = std::memcmp(reuse.Bytes(slot.copy), scratch, size) != 0;
+            } else if (memo.hashed) {
+                differ = BindSkipHash(device_addr, size) != memo.hash;
+            }
+        }
+        u64 upkeep_ticks = 0;
+        // A memo is made when the slot binds its last range again (the first bind of a range
+        // only notes it): slots whose range moves every bind pay no generation read.
+        const bool repeat = memo.device_addr == device_addr && memo.size == size;
+        if (!gen_read && repeat) {
+            // Read before the body reads the range (a write landing after this moves it).
+            const u64 gen_start = timed ? Nx2Profile::Ticks() : 0;
+            gen = Common::BindSkip::RangeGen(device_addr, size);
+            if (timed) {
+                upkeep_ticks += Nx2Profile::Ticks() - gen_start;
+            }
+        }
+        const u64 bank_changes = bind_skip_bank_changes;
+        // The old path's time for binds the skip would stand in for: every check, and in the
+        // dry mode one in 16.
+        const bool time_old = would_skip && (check || (s.dry && (++s.samples & 15) == 0));
+        const u64 old_start = time_old ? Nx2Profile::Ticks() : 0;
+        BindSkipOutcome outcome{};
+        BindHostGraphicsUniformBufferBody<true>(stage, index, binding_index, needs_bind, &outcome);
+        if (time_old) {
+            w.old_ticks += Nx2Profile::Ticks() - old_start;
+            ++w.old_samples;
+        }
+        const bool bank_changed = bind_skip_bank_changes != bank_changes;
+        if (check) {
+            // The path itself changed: an input of the decision moved unseen (counted as differ).
+            differ |= outcome.kind != memo.kind;
+            if (outcome.kind == Kind::Cached && (!outcome.synced || bank_changed)) {
+                ++w.work;
+            }
+            if (differ) [[unlikely]] {
+                ++w.differ;
+                ++s.differ_session;
+                if (s.differ_session <= 16) {
+                    LOG_WARNING(HW_GPU,
+                                "Bind skip: would skip but the bytes differ: stage {} slot {} at "
+                                "{:#x}+{:#x} ({}, {}, path then {} now {})",
+                                stage, index, device_addr, size,
+                                memo.kind == Kind::Stream ? "stream" : "cached",
+                                reason == BindSkipInEntry ? "in its list entry" : "a later entry",
+                                static_cast<int>(memo.kind), static_cast<int>(outcome.kind));
+                }
+                if (!s.verify && !s.broken) {
+                    s.broken = true;
+                    LOG_ERROR(HW_GPU,
+                              "Bind skip (FRITCHII_BIND_SKIP={}): a sampled check found other "
+                              "bytes; no skip for the rest of the session",
+                              s.mode);
+                }
+            }
+        }
+        const u64 record_start = timed ? Nx2Profile::Ticks() : 0;
+        memo.kind = Kind::None;
+        // The plain bank check and EXP9=3 only: EXP9=1 compares each page once a frame for
+        // writers no flag sees, and 2 counts every compare, on purpose.
+        const bool bank_ok = !outcome.bank || outcome.bank_mode == 0 || outcome.bank_mode == 3;
+        if (outcome.kind != Kind::None && binding.buffer_id != NULL_BUFFER_ID &&
+            gen != ~u64{0} && !s.broken && !frontier &&
+            frame_tick >= s.ready_frame && !outcome.held && bank_ok &&
+            (outcome.kind == Kind::Stream || (outcome.synced && !bank_changed))) {
+            const u32 serial = outcome.kind == Kind::Stream
+                                   ? VideoCommon::UniformSlotSerial<Ref>(stage, index)
+                                   : 0;
+            if (outcome.kind != Kind::Stream || serial != 0) {
+                memo.channel = channel_state;
+                memo.gpu_memory = gpu_memory;
+                memo.device_addr = device_addr;
+                memo.gen = gen;
+                memo.entry = entry;
+                memo.binding_epoch = binding_epoch;
+                memo.translation = translation;
+                memo.touched_frame = frame_tick;
+                memo.size = size;
+                memo.declared = declared;
+                memo.serial = serial;
+                memo.skip_cache_size = channel_state->uniform_buffer_skip_cache_size;
+                memo.switch_generation = switch_generation;
+                memo.epoch = s.epoch;
+                memo.buffer_id = binding.buffer_id;
+                memo.kind = outcome.kind;
+                memo.bank = outcome.bank;
+                memo.touch_once = (VideoCore::Nx2Debug::Experiment(18) & 4) != 0;
+                memo.hashed = s.verify && outcome.kind == Kind::Cached;
+                memo.hash = memo.hashed ? BindSkipHash(device_addr, size) : 0;
+            }
+        }
+        memo.device_addr = device_addr;
+        memo.size = size;
+        if (timed) {
+            w.record_ticks += upkeep_ticks + (Nx2Profile::Ticks() - record_start);
+            ++w.record_samples;
+        }
+        if ((w.binds & 4095) == 0) {
+            BindSkipLog();
+        }
+    }
+}
+
+template <class P>
+void BufferCache<P>::BindSkipLog() {
+    BindSkipState& s = bind_skip;
+    BindSkipWindow& w = s.w;
+    const auto now = std::chrono::steady_clock::now();
+    if (w.since == std::chrono::steady_clock::time_point{}) {
+        w.since = now;
+        w.start_ticks = Nx2Profile::Ticks();
+        return;
+    }
+    if (now - w.since < std::chrono::seconds{10}) {
+        return;
+    }
+    const double seconds = std::chrono::duration<double>(now - w.since).count();
+    const u64 ticks = Nx2Profile::Ticks() - w.start_ticks;
+    const double ns_per_tick = ticks != 0 ? seconds * 1e9 / static_cast<double>(ticks) : 0.0;
+    const auto rate = [seconds](u64 count) { return static_cast<double>(count) / seconds; };
+    const auto mean_ns = [ns_per_tick](u64 sum, u64 samples) {
+        return samples != 0 ? static_cast<double>(sum) * ns_per_tick / static_cast<double>(samples)
+                            : 0.0;
+    };
+    const double decide_ns = mean_ns(w.decide_ticks, w.decide_samples);
+    const double skip_ns = mean_ns(w.skip_ticks, w.skip_samples);
+    const double old_ns = mean_ns(w.old_ticks, w.old_samples);
+    const double upkeep_ns = mean_ns(w.record_ticks, w.record_samples);
+    const u64 would = w.reasons[BindSkipInEntry] + w.reasons[BindSkipAcross];
+    const u64 skipped = s.dry ? would : w.skipped_stream + w.skipped_cached;
+    const u64 not_skipped = w.binds - (std::min)(skipped, w.binds);
+    // E's time saved: the skipped binds' old path less the skip, less what every bind's decide
+    // and the other binds' memo upkeep add (the dry mode has no skip time: an upper bound).
+    const double saved_ns = static_cast<double>(skipped) * (old_ns - skip_ns) -
+                            static_cast<double>(w.binds) * decide_ns -
+                            static_cast<double>(not_skipped) * upkeep_ns;
+    LOG_INFO(HW_GPU,
+             "Bind skip (FRITCHII_BIND_SKIP={}) {:.0f} s: binds {:.0f}/s, {} {:.0f}/s (in entry "
+             "{:.0f}, across entries {:.0f}; stream {:.0f}, cached {:.0f}, native banks among "
+             "them {:.0f}), bytes not read {:.1f} MB/s; not skipped: no memo {:.0f}/s, other "
+             "range {:.0f}, written {:.0f}, untrapped page {:.0f}, step 1 only {:.0f}, slot copy "
+             "changed {:.0f}, older stream epoch {:.0f}, held {:.0f}{}; time (1 in 64 sampled): "
+             "decide {:.0f} ns a bind, skip {:.0f} ns, old path of skippable binds {:.0f} ns, "
+             "memo upkeep of other binds {:.0f} ns: about {:.1f} ms/s of E saved{}; verify: "
+             "checked {:.0f}/s, differ {} (must be 0, {} session), old path did work on a "
+             "cached would-skip {:.0f}/s",
+             s.mode, seconds, rate(w.binds), s.dry ? "would skip" : "skipped", rate(skipped),
+             rate(w.reasons[BindSkipInEntry]), rate(w.reasons[BindSkipAcross]),
+             rate(w.skipped_stream), rate(w.skipped_cached), rate(w.skipped_bank),
+             static_cast<double>(w.skipped_bytes) / seconds / (1024.0 * 1024.0),
+             rate(w.reasons[BindSkipNoMemo]), rate(w.reasons[BindSkipOtherRange]),
+             rate(w.reasons[BindSkipWritten]), rate(w.reasons[BindSkipUntracked]),
+             rate(w.reasons[BindSkipStep1Only]), rate(w.reasons[BindSkipSlotChanged]),
+             rate(w.reasons[BindSkipStreamEpoch]), rate(w.reasons[BindSkipHeld]),
+             s.broken ? " (STOPPED: a sampled check found other bytes)" : "", decide_ns,
+             skip_ns, old_ns, upkeep_ns, saved_ns / seconds / 1e6,
+             s.dry ? " (dry: skip time not known, an upper bound)" : "", rate(w.checked),
+             w.differ, s.differ_session, rate(w.work));
+    s.w = BindSkipWindow{};
+    s.w.since = now;
+    s.w.start_ticks = Nx2Profile::Ticks();
 }
 
 template <class P>
@@ -3634,7 +4069,7 @@ void BufferCache<P>::CheckNativeBankPagesTracked(DAddr device_addr, u32 size, in
         native_bank_marks_wanted = want_marks;
         native_bank_marks_ready = false;
         native_bank_marks_since = frame_tick;
-        Common::g_bank_marks.store(want_marks, std::memory_order_seq_cst);
+        Common::SetBankMarks(Common::BankMarksBankCheck, want_marks);
     }
     if (want_marks && !native_bank_marks_ready &&
         frame_tick - native_bank_marks_since >= 2) [[unlikely]] {
@@ -4220,6 +4655,8 @@ template <class P>
 void BufferCache<P>::NoteNativeBankPageChanged(DAddr page, [[maybe_unused]] const u8* words,
                                                [[maybe_unused]] Buffer* upload_to,
                                                [[maybe_unused]] NativeBankUploads& uploads) {
+    // FRITCHII_BIND_SKIP: its verify sees whether a bank check found a change.
+    ++bind_skip_bank_changes;
     if constexpr (USE_MEMORY_MAPS_FOR_UPLOADS) {
         // EDEN_NX2_EXP26 & 4 (the original's UploadNativeBank): copy the page from its
         // snapshot now and leave its tracking alone (marking it CPU-modified costs two

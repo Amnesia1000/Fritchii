@@ -1855,6 +1855,116 @@ private:
     void S4CountBind(size_t stage, u32 index, DAddr device_addr, u32 size, bool stream,
                      bool bank);
 
+    /// FRITCHII_BIND_SKIP (live, default 0; common/fritchii_bind_skip.h): S4-lite. What the
+    /// uniform bind's body did, for the memo of its slot (BindHostGraphicsUniformBufferBody's
+    /// record form; the normal form records nothing).
+    struct BindSkipOutcome {
+        enum class Kind : u8 {
+            None,   ///< not one the skip can stand in for (root table, keeps, mapped copy, ...)
+            Stream, ///< streamed through the reuse slot (BindSmallUniformReusing / UBO_KEEP)
+            Cached, ///< the cached path (and a native bank's check before it)
+        };
+        Kind kind{Kind::None};
+        bool bank{};      ///< a native bank bind (its check ran or skipped itself)
+        bool held{};      ///< the run-ahead hold kept the bank check
+        bool synced{};    ///< cached: SynchronizeBuffer uploaded nothing
+        int bank_mode{};  ///< EXP9 of the bank check that ran (0: the plain one)
+    };
+    /// Each slot's last bind the skip may stand in for: the range, what bound it, and the range's
+    /// write generation read before that bind read anything. The range (device_addr, size) is
+    /// kept for every bind: a memo is made only when a slot binds the same range again, so
+    /// slots whose range moves every bind add no generation read.
+    struct BindSkipMemo {
+        const void* channel{};
+        const void* gpu_memory{};
+        DAddr device_addr{};
+        u64 gen{};
+        u64 entry{};        ///< E's list entry then (0: not on E)
+        u64 binding_epoch{};
+        u64 translation{};  ///< the device memory's translation generation (Map, Unmap)
+        u64 hash{};         ///< verify modes, cached kind: the range's bytes then
+        u64 touched_frame{};
+        u32 size{};
+        u32 declared{};     ///< the shader's size for the slot
+        u32 serial{};       ///< stream kind: the reuse slot's copy serial after the bind
+        u32 skip_cache_size{};
+        u32 switch_generation{};
+        u32 epoch{};
+        BufferId buffer_id{};
+        BindSkipOutcome::Kind kind{BindSkipOutcome::Kind::None};
+        bool bank{};
+        bool hashed{};
+        bool touch_once{};  ///< EXP18 & 4 then: a second touch in a frame does nothing
+    };
+    std::array<std::array<BindSkipMemo, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES>
+        bind_skip_memo{};
+    enum BindSkipReason : size_t {
+        BindSkipInEntry,     ///< skipped: same list entry, nothing wrote the range
+        BindSkipAcross,      ///< skipped: a later entry, pages tracked, nothing wrote the range
+        BindSkipNoMemo,      ///< the slot's last bind left no memo (other path, before ready)
+        BindSkipOtherRange,  ///< another range, buffer, size, channel or switch setting
+        BindSkipWritten,     ///< the range's write generation moved
+        BindSkipUntracked,   ///< a later entry, a page untrapped (CPU-modified or cached)
+        BindSkipStep1Only,   ///< a later entry, tracked, but the switch is 1 or 4
+        BindSkipSlotChanged, ///< stream: the reuse slot's copy is another now
+        BindSkipStreamEpoch, ///< stream: the copy is from an older stream epoch (rebound later)
+        BindSkipHeld,        ///< run-ahead frontier moved, or the skip stopped for the session
+        BindSkipReasonCount,
+    };
+    struct BindSkipWindow {
+        u64 binds{};
+        std::array<u64, BindSkipReasonCount> reasons{};
+        u64 skipped_bytes{};
+        u64 skipped_stream{};
+        u64 skipped_cached{};
+        u64 skipped_bank{};
+        u64 checked{};
+        u64 differ{};
+        u64 work{}; ///< verify, cached kind: the old path uploaded or found a bank page changed
+        u64 decide_ticks{};
+        u64 decide_samples{};
+        u64 skip_ticks{};
+        u64 skip_samples{};
+        u64 old_ticks{};    ///< the old path of binds the skip would have stood in for
+        u64 old_samples{};
+        u64 record_ticks{}; ///< the bookkeeping a bind that is not skipped adds
+        u64 record_samples{};
+        u64 start_ticks{};
+        std::chrono::steady_clock::time_point since{};
+    };
+    struct BindSkipState {
+        int mode{};       ///< the switch's value (0 off)
+        bool step2{};     ///< 2, 3, 5: across list entries too
+        bool verify{};    ///< 3, 4
+        bool dry{};       ///< 5
+        bool broken{};    ///< a sampled check found other bytes: no skip for the session
+        u32 epoch{1};
+        u64 ready_frame{};
+        u64 overflows{};
+        u64 samples{};
+        u64 differ_session{};
+        BindSkipWindow w;
+    } bind_skip;
+    /// Native bank pages the bank check found changed (NoteNativeBankPageChanged), for the verify.
+    u64 bind_skip_bank_changes{};
+    static constexpr size_t BindSkipScratchBytes = 16384;
+    std::vector<u8> bind_skip_scratch;
+    /// Once a draw (SetUniformBuffersState): follows the live switch.
+    void BindSkipPoll();
+    void BindSkipSetMode(int mode);
+    /// The switch's bind: the skip, or the body with its memo and the verify around it.
+    void BindSkipUniform(size_t stage, u32 index, u32 binding_index, bool needs_bind);
+    /// The body of BindHostGraphicsUniformBuffer past the root table's bank (`record`: fills
+    /// `outcome`; false is today's code).
+    template <bool record>
+    void BindHostGraphicsUniformBufferBody(size_t stage, u32 index, u32 binding_index,
+                                           bool needs_bind, BindSkipOutcome* outcome);
+    /// The cached path's bind after SynchronizeBuffer (shared by the body and the skip).
+    void BindUniformCachedTail(size_t stage, u32 index, u32 binding_index, bool needs_bind,
+                               Buffer& buffer, u32 offset, u32 size);
+    [[nodiscard]] u64 BindSkipHash(DAddr device_addr, u32 size);
+    void BindSkipLog();
+
     /// FRITCHII_BIND_ADDR_MEMO: the last address translation of each vertex stream, the index
     /// buffer and each graphics uniform slot (Tegra::MemoryManager::GpuToCpuAddressMemo), and the
     /// counts for the "Bind address memo" line.

@@ -28,6 +28,17 @@ inline std::atomic<int> g_mode{0};
     return g_on.load(std::memory_order_relaxed);
 }
 
+/// Who wants the front's list entry marks (VideoCommon::S4Count::FrontEntry), one bit each: the
+/// counter while on, and FRITCHII_BIND_SKIP (its in-entry step, VideoCommon::S4Count::
+/// SetBindSkipEntries). The front tests this once per list entry.
+inline constexpr u32 EntryUserCounter = 1;
+inline constexpr u32 EntryUserBindSkip = 2;
+inline std::atomic<u32> g_entry_users{0};
+
+[[nodiscard]] inline bool EntryMarks() noexcept {
+    return g_entry_users.load(std::memory_order_relaxed) != 0;
+}
+
 /// Set on the engine thread (E: the thread that runs the stream's methods in order and fills the
 /// draws) by the counter: its writes to game memory are stream uploads (constant buffer words,
 /// inline uploads, the 3D engine's semaphore words), the ones a page mirror would apply in order.

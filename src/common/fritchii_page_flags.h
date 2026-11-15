@@ -208,15 +208,28 @@ inline DevicePageFlags g_buffer_write_pages{true};
 /// writes (the same places as g_buffer_write_pages) and TextureCache::WriteMemory. Only the
 /// texture cache's watched-page harvest takes them (TextureCache::TexBankPageGen).
 inline DevicePageFlags g_watch_write_pages{false, true};
-/// The bank marks' gate: true while FRITCHII_BANK_FLAGGED or FRITCHII_BANK_CENSUS is non-zero
-/// (set by the bank check, BufferCache::CheckNativeBankPagesTracked). Off, each mark below that
-/// the hot rule made unneeded (the write ring's Note, MemoryManager::Write, unsafe and span
-/// stores reaching Note, the after-store re-mark) is one relaxed load and a branch. The bank check
-/// trusts no snapshot from before the gate opened: it drops them all two frames after.
-inline std::atomic<bool> g_bank_marks{false};
+/// The bank marks' gate: open while any of its users wants it, one bit each: FRITCHII_BANK_FLAGGED
+/// or FRITCHII_BANK_CENSUS non-zero (BankMarksBankCheck, set by the bank check,
+/// BufferCache::CheckNativeBankPagesTracked) and FRITCHII_BIND_SKIP non-zero (BankMarksBindSkip,
+/// BufferCache::BindSkipPoll). Off, each mark below that the hot rule made unneeded (the write
+/// ring's Note, MemoryManager::Write, unsafe and span stores reaching Note, the after-store
+/// re-mark) is one relaxed load and a branch. Each user trusts nothing from before the gate
+/// opened for it: two frames after.
+inline constexpr u32 BankMarksBankCheck = 1;
+inline constexpr u32 BankMarksBindSkip = 2;
+inline std::atomic<u32> g_bank_marks{0};
 
 [[nodiscard]] inline bool BankMarks() noexcept {
-    return g_bank_marks.load(std::memory_order_relaxed);
+    return g_bank_marks.load(std::memory_order_relaxed) != 0;
+}
+
+/// Opens (`want`) or closes the gate for one user's bit.
+inline void SetBankMarks(u32 user, bool want) noexcept {
+    if (want) {
+        g_bank_marks.fetch_or(user, std::memory_order_seq_cst);
+    } else {
+        g_bank_marks.fetch_and(~user, std::memory_order_seq_cst);
+    }
 }
 
 /// Guest stores whose ranges the after-store point could not hold (more than a thread records):

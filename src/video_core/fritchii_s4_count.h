@@ -66,7 +66,16 @@ void Bind(Tegra::MaxwellDeviceMemoryManager& memory, const BindFacts& facts, Pag
           PageTest gpu_page, void* context);
 
 /// The front, at the start of each list entry it parses (DmaPusher::Step, not a resumed one):
-/// its ring position, and with value 2 one sample in 256.
+/// its ring position, and with value 2 one sample in 256. Also while FRITCHII_BIND_SKIP wants
+/// the marks (Common::S4Count::EntryMarks).
 void FrontEntry(GpuSplit& split, Tegra::MaxwellDeviceMemoryManager& memory);
+
+/// FRITCHII_BIND_SKIP: the front marks list entries while `want` (or while the counter is on).
+void SetBindSkipEntries(bool want) noexcept;
+
+/// FRITCHII_BIND_SKIP, at a uniform bind: the index of the list entry E's ring position is in
+/// (grows by one per entry E crosses). 0 when not on E (R in a lent call, the memory stage's
+/// thread) or without the split: unknown, no in-entry proof then.
+[[nodiscard]] u64 EngineEntryIndex() noexcept;
 
 } // namespace VideoCommon::S4Count

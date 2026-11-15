@@ -2032,6 +2032,31 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   the second line means nothing. Costs E a hash of each bind's bytes while on (not for a
   profiled fps run). Off: one relaxed load and a branch per uniform bind, per list entry on the
   front and per noted write; the switch is read once a draw.
+- FRITCHII_BIND_SKIP (live, default 0; S4-lite, after FRITCHII_S4_COUNT's market counts): a
+  graphics uniform bind (BindHostGraphicsUniformBuffer) skips the guest read, the compare, the
+  stream copy, the synchronize and the native bank check when the same (stage, slot) last bound
+  the same range (address, size, shader size, buffer, channel, switch generation, skip size)
+  and its bytes provably did not change since. The proof is the range's write generation
+  (common/fritchii_bind_skip.h), read before the earlier bind read anything: the price
+  generations (every mark of the bank check's two page flags: E's stream writes, the buffer
+  cache's writes and downloads, the write ring's Note on any thread, MemoryManager::Write's
+  words, guest stores on tracked pages before and after the store; the switch holds the bank
+  marks gate open) plus the tracker's own generations (every change of a page's CPU,
+  Untracked, cached-write or GPU bit in the word managers, and every new manager). 1 = within
+  one list entry (any page state: guest stores on untrapped pages inside an entry are assumed
+  absent, as the S4 counter measured), 2 = also across entries when the range's pages are
+  tracked now (with no state change since the earlier bind, tracked all along: guest stores
+  there trap and mark), 3 = 2 verified, 4 = 1 verified (the old path runs too; stream: the
+  slot's copy against guest memory, cached: a hash of the range at the earlier bind; must be
+  0), 5 = dry (decide, count and time, never skip). Stream binds skip to the reuse slot's own
+  rebind (same copy serial, same stream epoch); cached ones to the bind after the synchronize
+  (a hit). Not skipped: OpenGL, keeps (EXP92/EXP91), mapped copies, the root table's bank,
+  EXP9=1 or 2 banks, a run-ahead frontier, a lost after-store mark (every memo dropped). Skip
+  modes check one would-skip in 1,024 like the verify and stop for the session at a
+  difference. One line every 10 s, "Bind skip (FRITCHII_BIND_SKIP=N)": binds, skipped (in
+  entry, across), why not, sampled ns (decide, skip, the old path of skippable binds, the memo
+  upkeep of the others) and the ms/s of E saved, the verify counts. Off: one member test per
+  bind, one relaxed load per tracker state change, the switch read once a draw.
 - FRITCHII_ONEF_TRACE (boot, default 0; fable_b_one_follower 15.5): 1 = the lend trace. One
   72-byte record per lend and per posted op (packet number, site, op kind, posted, E's arrival,
   R's start and end, E's resume, E's work since its previous record, R's busy time on other

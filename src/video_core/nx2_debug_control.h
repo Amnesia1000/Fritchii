@@ -369,6 +369,11 @@ inline std::atomic<int> g_bank_fast{-1};
 /// 1 = count the fill's uniform binds by page, list entry and cause of change, 2 = also compare
 /// a sample of ranges at the front's list entry parse with E's bind in that entry.
 inline std::atomic<int> g_s4_count{-1};
+/// FRITCHII_BIND_SKIP (live, default 0): S4-lite (common/fritchii_bind_skip.h), a graphics uniform
+/// bind skips the read, compare, copy and bank check of a range whose bytes provably did not
+/// change since the same slot bound it: 1 = within a list entry, 2 = also across entries on
+/// tracked pages, 3 = 2 + verify, 4 = 1 + verify, 5 = dry (decide, count and time only).
+inline std::atomic<int> g_bind_skip{-1};
 /// EDEN_NX2_LIGHT_TABLE_ARRAYS: docs/fritchii/switches.md.
 [[nodiscard]] inline bool LightTableArrays() {
     static const bool on = EnvSwitch("EDEN_NX2_LIGHT_TABLE_ARRAYS") > 0;
