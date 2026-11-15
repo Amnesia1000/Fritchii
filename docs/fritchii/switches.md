@@ -2400,6 +2400,12 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   shader pages sets the pending flag: the next lookup drains E2 and flushes first (a lookup join).
   Must be 0: ESplitLateShader, 1 late flush in 16 tests the ranges it invalidates (after E1's
   lookup) against shader pages. 0 = S4's rule.
+  In the queued mode a MemoryManager::FlushCaching E1 asks for outside a join (a posted clear's,
+  AccelerateConditionalRendering's skip) goes to E2's queue at its place (the of27a crash: E1
+  cleared the cached-write state E2 was appending to); must be 0: ESplitCachingOwner (that state
+  touched by anything but E2, E1 in a join or R in a lent call). The one follower's samples
+  mirror is set through E2's queue too (a draw on E1 set it before an earlier queued reset ran and
+  stopped FRITCHII_ONEF_POST_FENCE for the session).
 - FRITCHII_ESPLIT_PIN (boot, default 0; with FRITCHII_ESPLIT=1, step S3): where E1 and E2 run.
   0 = E1 keeps E's pinned core (PinnedRole::GpuBack), E2 on the performance cores; 1 = E2 on E's
   old core, E1 unpinned on the performance cores; 2 = E's core split by SMT sibling (E2 one

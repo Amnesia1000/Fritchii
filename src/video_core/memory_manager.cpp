@@ -23,6 +23,7 @@
 #include "memory_manager.h"
 #include "video_core/async_translate.h"
 #include "video_core/back_read_audit.h"
+#include "video_core/fritchii_e_split_thread.h"
 #include "video_core/guest_memory.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cb_path.h"
@@ -978,6 +979,8 @@ void MemoryManager::WriteConstantBufferData(DAddr device_addr, GPUVAddr gpu_addr
     if (size == 0) {
         return;
     }
+    // FRITCHII_ESPLIT's queued mode: the cached-write state is E2's (ESplitCachingOwner).
+    VideoCommon::ESplit::NoteCachingTouch();
     // One follower: as WriteBlockImpl's guard.
     if (VideoCommon::OneFollower::OnEngineThread()) [[unlikely]] {
         VideoCommon::OneFollower::GuardStreamWrite(device_addr, size);
@@ -1460,6 +1463,16 @@ void MemoryManager::GetSubmappedRangeImpl(GPUVAddr gpu_addr, std::size_t size, b
 }
 
 void MemoryManager::FlushCaching() {
+    // FRITCHII_ESPLIT's queued mode: the accumulator and the constant buffer ranges are E2's, which
+    // appends to them while E1 runs ahead. A flush E1 asks for outside a join (a posted clear's,
+    // AccelerateConditionalRendering's skip, about 83k/s at the market) goes to E2's queue at this
+    // place instead: the crash of of27a (E2 reallocating constant_buffer_writes while E1 cleared
+    // it) came from those two.
+    if (VideoCommon::ESplit::QueueFlushHere()) [[unlikely]] {
+        VideoCommon::ESplit::QueueFlushCaching(this);
+        return;
+    }
+    VideoCommon::ESplit::NoteCachingTouch();
     // Flush from the invalidate accumulator
     bool invalidate = accumulator.InvalidateAll([this](GPUVAddr addr, size_t size) {
         GetSubmappedRangeImpl<false>(addr, size, page_stash2);

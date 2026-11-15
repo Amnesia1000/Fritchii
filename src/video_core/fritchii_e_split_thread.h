@@ -437,6 +437,9 @@ enum class RasterOp : u8 {
     ResetCounter,    ///< type
     SignalSyncPoint, ///< value
 };
+/// The renderer's: a samples counter reset (QueryType::ZPassPixelCount64) E1 queues for E2 clears
+/// E1's copy of the one follower's samples mirror at once (RasterizerVulkan::onef_mirror_queued).
+inline void (*g_mirror_reset)(VideoCore::RasterizerInterface* rasterizer) = nullptr;
 void QueueRasterOpImpl(RasterOp op, VideoCore::RasterizerInterface& rasterizer, u64 address,
                        u32 a, u32 b, u32 c, u32 d) noexcept;
 /// Maxwell3D, at the rasterizer call a raster-op method ends in: true when it went to E2's queue
@@ -487,6 +490,22 @@ void NoteBatchEnd() noexcept;
 void NoteQueuedWriteAnywhere() noexcept;
 /// E2, before a late flush (after E1's lookup): the sampled check (`memory`: Tegra::MemoryManager*).
 void CheckLateFlush(const void* memory) noexcept;
+
+/// MemoryManager::FlushCaching on E1 outside a join (queued mode): it goes to E2's queue.
+[[nodiscard]] inline bool QueueFlushHere() noexcept {
+    return g_async && t_role == 1 && t_join == 0;
+}
+/// E1: posts `memory`'s (Tegra::MemoryManager*) FlushCaching for E2 at this place.
+void QueueFlushCaching(void* memory) noexcept;
+void NoteCachingTouchImpl() noexcept;
+/// MemoryManager's cached-write state (the accumulator, the constant buffer ranges) touched here:
+/// in the queued mode only E2, E1 inside a join (E2 drained), or R in a lent call (E parked) may.
+/// Anything else is ESplitCachingOwner (must be 0).
+inline void NoteCachingTouch() noexcept {
+    if (g_async) [[unlikely]] {
+        NoteCachingTouchImpl();
+    }
+}
 
 /// GpuSplit::BackLoop, the queued mode: an entry that joined, by kind (the 10 s line names the
 /// top 8): ring kind, engine (0 3D, 1 compute, 2 other, 3 none), method or call tag, and a

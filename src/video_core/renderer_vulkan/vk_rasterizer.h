@@ -247,6 +247,11 @@ private:
     /// E (FRITCHII_ONEF_SYNC_MIRROR, fable_b 16.2): the mirror of R's samples counter "started"
     /// bit: set by every draw or clear E issues with the count enabled, cleared by a reset.
     bool onef_samples_started{};
+    /// FRITCHII_ESPLIT's queued mode, E1: what onef_samples_started will be on E2 once E2 ran
+    /// everything E1 queued (E1 sets it at a draw or clear with the count on, clears it when it
+    /// queues a samples reset). The mirror itself is E2's then: the reports and resets that read
+    /// and clear it run on E2, so E1's draws set it through E2's queue, in ring order.
+    bool onef_mirror_queued{};
     /// E -> R for a lent samples report: E's bit at the report (R compares in the lent call).
     bool onef_mirror_lent_valid{};
     bool onef_mirror_lent_bit{};

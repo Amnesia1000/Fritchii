@@ -390,6 +390,10 @@ u64 g_since_ticks{};
 u64 g_touch_logged{};
 u64 g_visible_logged{};
 u64 g_front_logged{};
+/// ESplitCachingOwner (any thread, so atomic) and E1's queued flushes.
+std::atomic<u64> g_caching_owner{};
+std::atomic<u64> g_caching_owner_logged{};
+u64 g_queued_flushes{};
 u64 g_e1_cpu_last{};
 u64 g_e2_cpu_last{};
 // S4, E1's: the open constant buffer record, the writes numbered, the flush owed
@@ -1185,9 +1189,12 @@ void Report(u64 now) {
         LOG_INFO(HW_GPU,
                  "E split thread 10 s: E1 waiting for E2 by cause (ms/s): {}; held for E2's "
                  "lends {:.1f}; push joins by kind: {}; FRITCHII_ESPLIT_IDLE={}: batch ends "
-                 "posted {:.0f}/s, idle waits {:.0f}/s ({:.0f}/s ended by new ring words)",
+                 "posted {:.0f}/s, idle waits {:.0f}/s ({:.0f}/s ended by new ring words); E1's "
+                 "flushes queued {:.0f}/s; ESplitCachingOwner (must be 0) {}",
                  text, ms(c.hold_ticks), pushes, g_idle_async ? 1 : 0, rate(c.batch_ends),
-                 rate(c.idle_waits), rate(c.idle_woken));
+                 rate(c.idle_waits), rate(c.idle_woken),
+                 rate(std::exchange(g_queued_flushes, 0)),
+                 g_caching_owner.exchange(0, std::memory_order_relaxed));
     }
     // The queued mode: the entries that still join, by kind (the top 8).
     {
@@ -1560,6 +1567,12 @@ void QueueRasterOpImpl(RasterOp op, VideoCore::RasterizerInterface& rasterizer, 
         RasterOp op;
     } const raster{&rasterizer, address, a, b, c, d, op};
     static_assert(sizeof(Raster) <= AsyncPayloadBytes && std::is_trivially_copyable_v<Raster>);
+    // The samples mirror: E1's copy follows its queue (the reset clears it on E2 later).
+    if (op == RasterOp::ResetCounter &&
+        a == static_cast<u32>(VideoCommon::QueryType::ZPassPixelCount64) &&
+        g_mirror_reset != nullptr) {
+        g_mirror_reset(&rasterizer);
+    }
     // FRITCHII_ESPLIT_OWED: a report lands at `address` (16 bytes at most): on a shader page the
     // next lookup drains and flushes first.
     if (op == RasterOp::Query && g_owed_shader_rule) {
@@ -1620,6 +1633,29 @@ bool WaitE2IdleOrImpl(bool (*more)(void*), void* argument) noexcept {
         return true;
     }
     return false;
+}
+
+void QueueFlushCaching(void* memory) noexcept {
+    ++g_queued_flushes;
+    std::memcpy(BeginAsync(Hand::Flush), &memory, sizeof(memory));
+    PostAsync([](void* raw) {
+        void* m;
+        std::memcpy(&m, raw, sizeof(m));
+        static_cast<Tegra::MemoryManager*>(m)->FlushCaching();
+    });
+}
+
+void NoteCachingTouchImpl() noexcept {
+    if (t_role == 2 || (t_role == 1 && t_join != 0) || OneF::InLent()) {
+        return;
+    }
+    g_caching_owner.fetch_add(1, std::memory_order_relaxed);
+    if (g_caching_owner_logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+        LOG_ERROR(HW_GPU,
+                  "E split thread: ESplitCachingOwner: the memory manager's cached writes touched "
+                  "on {} outside E2, a join or a lent call: {}",
+                  t_role == 1 ? "E1" : "another thread", Stack());
+    }
 }
 
 void NoteBatchEnd() noexcept {
