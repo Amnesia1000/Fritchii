@@ -36,6 +36,7 @@
 #include "common/thread.h"
 #include "core/core.h"
 #include "video_core/fritchii_e_split.h"
+#include "video_core/fritchii_e_split_thread.h"
 #include "video_core/gpu_split.h"
 #include "video_core/gpu_wait_site.h"
 #include "video_core/nx2.h"
@@ -1665,6 +1666,7 @@ void SendCarriedAlone(size_t why);
 
 void FlushCarried() noexcept {
     if (g_carry.count != 0 && Detail::t_engine && g.thread.joinable()) {
+        const ESplit::PushGuard esplit_push{false, false}; // FRITCHII_ESPLIT S2: one producer
         SendCarriedAlone(0);
     }
 }
@@ -1678,6 +1680,9 @@ void Lend(LentOp op, LentReason reason, void (*function)(void*), void* argument)
         function(argument); // R, another thread, or R not running: in place, as today
         return;
     }
+    // FRITCHII_ESPLIT (S2): E1 drains E2 first (one producer, the flags on the engine); a lend
+    // of E2's holds E1 at a safe point while R runs it (fritchii_e_split_thread.h).
+    const ESplit::PushGuard esplit_push{true, op == LentOp::Fence || op == LentOp::Query};
     // FRITCHII_ESPLIT_COUNT: the whole lend (pack, park, R's run) is the "lend" class.
     const ESplit::LendScope esplit_lend;
     const StepLevel step = Step();
@@ -1701,7 +1706,9 @@ void Lend(LentOp op, LentReason reason, void (*function)(void*), void* argument)
     header.draw_seq = op == LentOp::Draw ? ++g.draw_seq : g.draw_seq;
     header.call = LentCall{function, argument};
     const u32 kind = op == LentOp::Draw ? TakeDrawKind(header) : 0;
-    if (step >= StepLevel::View) {
+    // FRITCHII_ESPLIT S2: a lend of E2's while E1 runs ahead packs nothing of E1's (R's view
+    // stays at E2's place; E1's changes go with its next packet).
+    if (step >= StepLevel::View && !(ESplit::g_async && ESplit::OnE2())) {
         if (Maxwell3D* const engine = g.engine.load(std::memory_order_acquire)) {
             // The spans: everything E changed since the last packet, after the header.
             spans_bytes = PackSpans(*engine, header,
@@ -1804,6 +1811,7 @@ void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size,
         function(const_cast<void*>(payload));
         return;
     }
+    const ESplit::PushGuard esplit_push{false, op == LentOp::Fence || op == LentOp::Query};
     if (op == LentOp::Query && t_query_kind != QueryKind::Count) {
         g.query_count[static_cast<size_t>(t_query_kind)].fetch_add(1, std::memory_order_relaxed);
         t_query_kind = QueryKind::Count;
@@ -1836,7 +1844,7 @@ void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size,
     header.op = static_cast<u8>(op);
     header.call = LentCall{function, nullptr};
     std::size_t spans_bytes = 0;
-    if (Step() >= StepLevel::View) {
+    if (Step() >= StepLevel::View && !(ESplit::g_async && ESplit::OnE2())) {
         if (Maxwell3D* const engine = g.engine.load(std::memory_order_acquire)) {
             // E's changes before the op, so R's view is at the op's place when it runs.
             spans_bytes = PackSpans(*engine, header,
@@ -2616,6 +2624,7 @@ void Push(PacketHeader& header, std::span<const u8> spans) {
         t_next_draw_set = false;
         return;
     }
+    const ESplit::PushGuard esplit_push{false, false};
     u8* const buffer = PackBuffer();
     if (!spans.empty()) {
         std::memcpy(buffer + sizeof(PacketHeader), spans.data(), spans.size());
@@ -2627,6 +2636,7 @@ void Drain() {
     if (!Detail::t_engine) {
         return;
     }
+    const ESplit::PushGuard esplit_push{false, false}; // S2: E2's packets first
     if (g_carry.count != 0 && g.thread.joinable()) {
         SendCarriedAlone(1); // R plays everything E made, the kept ops too
     }
@@ -2671,6 +2681,34 @@ void PushDraw(const Maxwell3D& engine, u64 draw_seq, u64 buffer_number, u8 flags
         bytes = PackSpans(engine, header, std::span<u8>{buffer + sizeof(PacketHeader), MaxSpanBytes});
     }
     PushPacked(header, buffer, bytes);
+}
+
+std::size_t PackedDrawRoom() noexcept {
+    return sizeof(PacketHeader) + MaxSpanBytes + MaxPayloadBytes + MaxCarryBytes +
+           sizeof(CarryTrailer);
+}
+
+std::size_t PackDraw(const Maxwell3D& engine, u64 draw_seq, u8 flags, const void* pipeline,
+                     PacketHeader& header, u8* buffer) noexcept {
+    header = PacketHeader{};
+    header.kind = PacketKind::Draw;
+    header.flags = flags;
+    header.draw_seq = draw_seq;
+    header.pipeline = pipeline;
+    if (!Detail::t_engine || !g.thread.joinable()) {
+        return 0;
+    }
+    return PackSpans(engine, header, std::span<u8>{buffer + sizeof(PacketHeader), MaxSpanBytes});
+}
+
+void PushDrawPacked(PacketHeader& header, u8* buffer, std::size_t body_bytes,
+                    u64 buffer_number) noexcept {
+    if (!Detail::t_engine || !g.thread.joinable()) {
+        t_next_draw_set = false;
+        return;
+    }
+    header.buffer_number = buffer_number;
+    PushPacked(header, buffer, body_bytes);
 }
 
 void SetEngine(Maxwell3D* engine) noexcept {

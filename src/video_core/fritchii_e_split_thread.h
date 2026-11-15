@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 
 #include "common/common_types.h"
@@ -47,7 +48,13 @@ class RasterizerInterface;
 /// Measured: E2's busy time (zone "e split job"), E2's wait ("e split E2 wait"), E1's time in
 /// hand-overs ("e split hand-over") and the hand-over cost (E1's wait less E2's run).
 ///
-/// S2, FRITCHII_ESPLIT_DEPTH=N (1, 4, 16): async. See the S2 section of the .cpp.
+/// S2, FRITCHII_ESPLIT_DEPTH=N (1, 4, 16; live): async draw tails and binds. E1 posts them and
+/// goes on, up to N draw tails ahead of E2; everything else still waits (the S2 section of the
+/// .cpp has the rules: who owns the buffer flags, the R packet's packing on E1, the lends, the
+/// positions). Extra checks: E1Visible (a fence or query op made by E1 outside a join),
+/// FrontAheadOfE2 (a `consumed` store on E1 with E2 behind), ESplitHash (a hash of what the fill
+/// reads, from the engine on E1 and from the view on E2, 1 draw in 64), E2Refused (an async
+/// fill refused after E1 moved on: the draw is dropped).
 ///
 /// FRITCHII_ESPLIT=0: nothing starts; each hand-over site pays one load and a branch (g_thread).
 namespace VideoCommon::ESplit {
@@ -129,6 +136,7 @@ void HandBind(VideoCore::RasterizerInterface& rasterizer, std::size_t stage, u32
               bool enabled, u64 address, u32 size) noexcept;
 
 void BeginJoin(Join why) noexcept;
+void EndJoin() noexcept;
 /// E1 runs E2-owned work itself here.
 class JoinScope {
 public:
@@ -140,7 +148,7 @@ public:
     }
     ~JoinScope() {
         if (active) [[unlikely]] {
-            --t_join;
+            EndJoin();
         }
     }
     JoinScope(const JoinScope&) = delete;
@@ -155,6 +163,81 @@ private:
 [[nodiscard]] View* FillView(const Tegra::Engines::Maxwell3D& engine) noexcept;
 /// After that fill (E2, or E1 in a join): the view's buffer flags, the inputs check.
 void FillDone(const Tegra::Engines::Maxwell3D& engine, const View* used) noexcept;
+
+// --- S2 (FRITCHII_ESPLIT_DEPTH > 0) -----------------------------------------------------------------
+
+/// E2's ring position while it runs an async job (GpuSplit::BackEntryPosition on E2).
+inline thread_local u64 t_e2_position{};
+/// E2 asks E1 to hold at its next safe point (an E2 lend: R's lent call may read E1's state).
+inline std::atomic<u32> g_hold{};
+void HoldHereImpl() noexcept;
+/// E1, before each ring entry: holds while E2 lends.
+inline void SafePoint() noexcept {
+    if (g_async) [[unlikely]] {
+        if (g_hold.load(std::memory_order_relaxed) != 0) {
+            HoldHereImpl();
+        }
+    }
+}
+
+/// E1: E2 has run everything posted.
+[[nodiscard]] bool E2Idle() noexcept;
+/// E1: the draw's flush can run before the lookup (lockstep: E2 idle, or S1).
+[[nodiscard]] inline bool FlushBeforeLookup() noexcept {
+    return !g_async || E2Idle();
+}
+
+/// E1, S2: a slot for an async hand-over. `packet`: room for OneFollower::PackedDrawRoom().
+struct AsyncSlot {
+    void* payload;
+    u8* packet;
+};
+inline constexpr std::size_t AsyncPayloadBytes = 192;
+/// E1: an async draw tail can go now (record ready); waits for depth room, builds the record
+/// (taking the engine's buffer flags) and samples the hash. False: hand it over in lockstep.
+[[nodiscard]] bool BeginAsyncDraw(Tegra::Engines::Maxwell3D& engine, bool list_args,
+                                  AsyncSlot& slot) noexcept;
+/// E1: posts the slot BeginAsyncDraw (or BeginAsync) gave: `function(payload)` runs on E2.
+void PostAsync(void (*function)(void*)) noexcept;
+/// E1: a slot for an async job without a record (a bind by value, a position store).
+[[nodiscard]] void* BeginAsync(Hand hand) noexcept;
+/// E2: the running job is async (its fill reads only the view and keeps the flags there).
+[[nodiscard]] bool FillAsync() noexcept;
+/// E2, async fill: the repack layout raised `flag` (VertexInput) for E1's engine; E1 raises it
+/// at its next draw, join, push or lockstep hand-over (ApplyBackRaises).
+void DeferFlag(u32 flag) noexcept;
+void ApplyBackRaises(Tegra::Engines::Maxwell3D& engine) noexcept;
+/// E2, async: a ring B room wait, a flush after E1's lookup, a fill refused (E2Refused).
+void NoteRoomWait() noexcept;
+void NoteLateFlush() noexcept;
+void NoteAsyncRefused() noexcept;
+/// GpuSplit::BackLoop's `consumed` store on E1: FrontAheadOfE2 when E2 is behind.
+void CheckStoreOnE1() noexcept;
+
+/// OneFollower::Lend, PushOp, Push, Drain, FlushCarried: R's packet queue has one producer and a
+/// lent call may read E's state. E1 (S2): E2 drained first, the buffer flags to the engine; E2 in
+/// a lend (S2): E1 held. `visible`: a fence or query op (E1Visible when E1 makes it).
+[[nodiscard]] bool BeforeEnginePushImpl(bool lend, bool visible) noexcept;
+void AfterEnginePushImpl(bool lend, bool acted) noexcept;
+class PushGuard {
+public:
+    PushGuard(bool lend_, bool visible) noexcept : lend{lend_} {
+        if (g_thread) [[unlikely]] {
+            acted = BeforeEnginePushImpl(lend, visible);
+        }
+    }
+    ~PushGuard() {
+        if (acted) [[unlikely]] {
+            AfterEnginePushImpl(lend, acted);
+        }
+    }
+    PushGuard(const PushGuard&) = delete;
+    PushGuard& operator=(const PushGuard&) = delete;
+
+private:
+    bool lend;
+    bool acted{};
+};
 
 // --- E1Touch ---------------------------------------------------------------------------------------
 

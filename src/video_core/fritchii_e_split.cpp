@@ -225,6 +225,8 @@ u64 g_since_ns{};
 u64 g_since_ticks{};
 u32 g_rng = 0x2545f491u;
 thread_local bool t_back{}; ///< set on E (BatchLevel's thread)
+/// FRITCHII_ESPLIT_DEPTH > 0: BuildInto takes every buffer flag off the engine (E1's take).
+bool g_take_all{};
 
 constexpr size_t RiseE2Entry = static_cast<size_t>(FlagSite::Count);
 constexpr size_t RiseJoin = RiseE2Entry + 1;
@@ -457,7 +459,15 @@ size_t BuildInto(u8* base, const Maxwell3D& engine, bool draw, bool list_args) {
         // only in a fill, which a draw record precedes, so raises arriving here instead of when
         // they were made change nothing it reads (they are ORs); a raise by E2's own work (in the
         // split straight into its copy) comes the same way here. FlagSite counts where they rose.
-        const u64 take = PackFlags(engine.dirty.flags) & ~(PackFlags(g_view.flags) | table_bits);
+        // FRITCHII_ESPLIT_DEPTH > 0 (the thread, async): the split's own take. E2's view runs
+        // behind, so E1 takes every buffer flag raised on its engine and clears it there
+        // (ThreadBuildAsync); E2 ORs them into its copy.
+        const u64 take = g_take_all ? PackFlags(engine.dirty.flags)
+                                    : PackFlags(engine.dirty.flags) &
+                                          ~(PackFlags(g_view.flags) | table_bits);
+        if (g_take_all) {
+            const_cast<Maxwell3D&>(engine).dirty.flags &= ~BufferFlags();
+        }
         std::memcpy(base + at, &take, sizeof(take));
         at += sizeof(take);
         header.take = 1;
@@ -1058,8 +1068,9 @@ void EndLend() noexcept {
         PopCarve();
     }
     // R's run left the engine's buffer flags as it used them; both stages are parked in a lend,
-    // so E2 takes them (the registers R wrote come in the next record).
-    if (g_records && g_view.seeded && g_view.engine != nullptr) {
+    // so E2 takes them (the registers R wrote come in the next record). Not a lend E2 makes
+    // while E1 runs ahead (FRITCHII_ESPLIT_DEPTH > 0): E1's engine is past E2's place then.
+    if (g_records && g_view.seeded && g_view.engine != nullptr && !(g_async && OnE2())) {
         const Flags& flags = g_view.engine->dirty.flags;
         if (!g_lend_vb && flags[Dirty::VertexBuffers]) {
             ++g_c.rises[RiseLend];
@@ -1352,6 +1363,29 @@ View& ThreadView() noexcept {
 
 u64 ThreadAfterDiffers() noexcept {
     return g_after_total;
+}
+
+bool ThreadRecordReady(const Maxwell3D& engine) noexcept {
+    return Tracking() && !g_t_lost && g_t_engine == &engine;
+}
+
+u32 ThreadBuildAsync(Maxwell3D& engine, bool list_args, u8* out) noexcept {
+    g_take_all = true;
+    const u32 bytes = static_cast<u32>(BuildInto(out, engine, true, list_args));
+    g_take_all = false;
+    return bytes;
+}
+
+void SyncFlagsToEngine(Maxwell3D& engine) noexcept {
+    if (g_view.seeded && g_view.engine == &engine) {
+        engine.dirty.flags = (engine.dirty.flags & ~BufferFlags()) | (g_view.flags & BufferFlags());
+    }
+}
+
+void SyncFlagsToView(const Maxwell3D& engine) noexcept {
+    if (g_view.seeded && g_view.engine == &engine) {
+        g_view.flags = (g_view.flags & ~BufferFlags()) | (engine.dirty.flags & BufferFlags());
+    }
 }
 
 u64 HashEngine(const Maxwell3D& engine, bool list_args) noexcept {

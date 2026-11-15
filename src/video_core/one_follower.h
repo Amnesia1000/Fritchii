@@ -1059,6 +1059,14 @@ void PutEngineTls(const EngineTls& in) noexcept;
 /// FRITCHII_ESPLIT: this thread (E2) is E too (lends, pushes, the engine thread's checks); the
 /// watchdog and R's contended-lock report name it as E.
 void MarkEngineHelperThread() noexcept;
+/// FRITCHII_ESPLIT_DEPTH > 0: PushDraw in two halves. E1 packs the draw packet's spans at the
+/// draw (its registers are past E2's place by the time E2 pushes), into `buffer` (room for
+/// PackedDrawRoom() bytes); E2 pushes it after its fill with the ring B packet's number.
+[[nodiscard]] std::size_t PackedDrawRoom() noexcept;
+[[nodiscard]] std::size_t PackDraw(const Maxwell3D& engine, u64 draw_seq, u8 flags,
+                                   const void* pipeline, PacketHeader& header, u8* buffer) noexcept;
+void PushDrawPacked(PacketHeader& header, u8* buffer, std::size_t body_bytes,
+                    u64 buffer_number) noexcept;
 
 namespace Detail {
 /// Between one_follower.cpp and one_follower_view.cpp.

@@ -22,6 +22,7 @@
 #include <utility>
 
 #include "common/common_types.h"
+#include "video_core/fritchii_e_split_thread.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/split_write_tracker.h"
@@ -269,6 +270,10 @@ public:
     }
     /// Back: the ring position of the entry being run.
     [[nodiscard]] u64 BackEntryPosition() const {
+        // FRITCHII_ESPLIT_DEPTH > 0: on E2, the entry of the job it runs (E1 is ahead).
+        if (ESplit::g_async && ESplit::t_role == 2) [[unlikely]] {
+            return ESplit::t_e2_position;
+        }
         return back_entry_position;
     }
     /// Called on the back before it sleeps waiting for work (the rasterizer submits deferred work).

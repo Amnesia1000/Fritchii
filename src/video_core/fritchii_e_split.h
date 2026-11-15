@@ -354,5 +354,14 @@ void ThreadCbAdvance(u64 words) noexcept;
 /// E1 from the engine and on E2 from its view after the record (Check::ESplitHash).
 [[nodiscard]] u64 HashEngine(const Maxwell3D& engine, bool list_args) noexcept;
 [[nodiscard]] u64 HashView(bool list_args) noexcept;
+/// E1: the next record of `engine` would be a Record (no seed due, writes tracked).
+[[nodiscard]] bool ThreadRecordReady(const Maxwell3D& engine) noexcept;
+/// E1, FRITCHII_ESPLIT_DEPTH > 0: a draw record whose take is every buffer flag raised on the
+/// engine, cleared there (E2's view runs behind; E2 ORs them in). Needs ThreadRecordReady.
+[[nodiscard]] u32 ThreadBuildAsync(Maxwell3D& engine, bool list_args, u8* out) noexcept;
+/// FRITCHII_ESPLIT_DEPTH > 0, E2 drained: the buffer flags go to the engine from E2's view
+/// before E1 or a lockstep hand-over runs E2's work on the engine, and back after it.
+void SyncFlagsToEngine(Maxwell3D& engine) noexcept;
+void SyncFlagsToView(const Maxwell3D& engine) noexcept;
 
 } // namespace VideoCommon::ESplit

@@ -2178,6 +2178,30 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   logged with the site), E2Order (E2 ran a hand-over out of order); seeds and untracked
   hand-overs. Gate 2 shape for S1: E2 busy <= today's E occupied - 0.7 x the dry net. Off:
   nothing starts; a hand-over site pays one load and a branch.
+- FRITCHII_ESPLIT_DEPTH (live, default 0; with FRITCHII_ESPLIT=1, step S2): N > 0 (1, 4, 16;
+  capped at 48) = async draw tails and binds. E1 posts a draw's tail and goes on, up to N tails
+  ahead of E2; a bind's buffer cache half goes by value. Everything else still waits for E2 to
+  drain (E2 entries and flushes in lockstep, joins, E1's own lends and pushes to R). An async
+  tail needs rule 3's pipeline, no texel buffers, ring B by value, no memory stage marks ahead,
+  no inline index bytes, no price timers, no FRITCHII_HANDLE_PROG_KEEP on a pipeline with handle
+  programs and no seed due; the others go lockstep. Rules: the buffer flags are E2's (E1 takes
+  the ones raised on its engine at each async draw record and clears them, E2 ORs them into its
+  view; wherever E2's work runs on the engine the view's flags are copied there and back); an
+  async fill reads only E2's view; R's draw packet is packed by E1 at the record and pushed by E2
+  after the fill (R's queue keeps one producer); a lend E2 makes holds E1 at its next safe point
+  (each ring entry; every wait for E2 counts) and packs none of E1's registers; the repack
+  layout's VertexInput raise goes to E1's engine at its next draw, join or push; `consumed` is
+  stored by an async job at E2's place, and at a batch's end after the drain; GpuSplit::
+  BackEntryPosition returns the job's position on E2. When the flush has work and E2 is behind,
+  it runs on E2 after E1's lookup (counted: "flushes after E1's lookup"; S0's "lookups after a
+  shader page write" says how often that order could matter). Waits sleep after a 20 us poll.
+  Extra checks in the thread's lines (must be 0): E1Visible (a fence or query op from E1 outside
+  a join), FrontAheadOfE2 (E1 stored `consumed` with E2 behind), ESplitHash (a hash of what the
+  fill reads, from the engine on E1 and from the view on E2, 1 async draw in 64), E2Refused (an
+  async fill refused after E1 moved on: the draw is dropped, R gets the spans as a delta). Also:
+  async draws a second and how far ahead they were posted, E2 lends that held E1 (E2's wait for
+  E1 to park, E1's held time), ring B room waits. Step in only after S1's checks read 0. Gate 2:
+  DEPTH 0 against N, 2 cycles: max(E1, E2 busy) must drop >= 70% of the dry net.
 - FRITCHII_ONEF_TRACE (boot, default 0; fable_b_one_follower 15.5): 1 = the lend trace. One
   72-byte record per lend and per posted op (packet number, site, op kind, posted, E's arrival,
   R's start and end, E's resume, E's work since its previous record, R's busy time on other

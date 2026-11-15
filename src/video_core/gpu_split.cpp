@@ -3209,8 +3209,33 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             const ESplit::JoinScope join{ESplit::Join::Entry, info.cls == ESplit::Class::Join};
             return Execute(entry, words);
         };
+        // FRITCHII_ESPLIT_DEPTH > 0: `consumed` is stored at E2's place, by an async job (the
+        // front's waits and ring A's room follow E2). False: store it here.
+        const auto esplit_store = [this, esplit_thread](u64 position) {
+            if (!esplit_thread) {
+                return false;
+            }
+            void* const payload = ESplit::BeginAsync(ESplit::Hand::Store);
+            if (payload == nullptr) {
+                return false;
+            }
+            struct Store {
+                GpuSplit* self;
+                u64 position;
+            } const store{this, position};
+            std::memcpy(payload, &store, sizeof(store));
+            ESplit::PostAsync([](void* raw) {
+                Store s;
+                std::memcpy(&s, raw, sizeof(s));
+                s.self->StoreConsumed(s.position);
+            });
+            return true;
+        };
         while (read_position != available) {
             const size_t index = read_position & RingMask;
+            if (esplit_thread) [[unlikely]] {
+                ESplit::SafePoint(); // S2: E1 holds here while E2 lends
+            }
             if (ring_prefetch) {
                 const u64 ahead = (std::min)(read_position + RingPrefetchWords,
                                              available > 8 ? available - 8 : u64{0});
@@ -3336,7 +3361,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 if (entry_price) [[unlikely]] {
                     FritchiiPrice::BackReached(read_position);
                 }
-                StoreConsumed(read_position);
+                if (!esplit_store(read_position)) {
+                    StoreConsumed(read_position);
+                }
                 last_store = read_position;
                 if (ring_on) {
                     link.NoteConsumed(read_position);
@@ -3353,6 +3380,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         if (entry_price) [[unlikely]] {
             FritchiiPrice::BackReached(read_position);
         }
+        ESplit::CheckStoreOnE1(); // S2: E2 drained by the join above (FrontAheadOfE2)
         StoreConsumed(read_position);
         if (ring_on) {
             link.NoteConsumed(read_position);

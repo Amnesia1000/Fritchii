@@ -31,6 +31,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <type_traits>
 #include <utility>
 
@@ -412,6 +413,15 @@ bool OneFollowerDraw::FillRing(Maxwell3D& engine, GraphicsPipeline* pipeline, bo
         reason = LentReason::PipelineMiss;
         return false;
     }
+    // FRITCHII_ESPLIT_DEPTH > 0, E2's async fill: E1 moved on, so no lend now; ring B's room comes
+    // back as R plays (its margin holds hundreds of packets: counted, about never).
+    const bool esplit_async = VideoCommon::ESplit::FillAsync();
+    if (esplit_async && !r.mem_stage.RingRoom()) [[unlikely]] {
+        VideoCommon::ESplit::NoteRoomWait();
+        while (!r.mem_stage.RingRoom()) {
+            std::this_thread::yield();
+        }
+    }
     if ((pipeline == nullptr && (facts.has_texel_buffers || facts.infos == nullptr)) ||
         !r.mem_stage.Packets() || !r.mem_stage.ValuesByValue() || !r.mem_stage.RingRoom() ||
         r.buffer_cache.MarksAhead()) {
@@ -431,7 +441,8 @@ bool OneFollowerDraw::FillRing(Maxwell3D& engine, GraphicsPipeline* pipeline, bo
     // DrawListWords sets them around its own fill (the geometry section binds and synchronizes
     // the two words; FillRingDraw takes their buffer after it, as ConfigureDraw would).
     if (list_args) {
-        r.buffer_cache.SetDrawIndirect(&engine.draw_manager.indirect_state);
+        r.buffer_cache.SetDrawIndirect(esplit_async ? &VideoCommon::ESplit::ThreadView().indirect
+                                                    : &engine.draw_manager.indirect_state);
     }
     SCOPE_EXIT {
         if (list_args) {
@@ -453,7 +464,8 @@ bool OneFollowerDraw::FillRing(Maxwell3D& engine, GraphicsPipeline* pipeline, bo
         if (esplit_view != nullptr) {
             esplit_inputs.emplace(r.buffer_cache.StageInputs(
                 esplit_view->regs, esplit_view->state, esplit_view->root_tables,
-                esplit_view->draw_state, engine.dirty.flags,
+                esplit_view->draw_state,
+                esplit_async ? VideoCommon::ESplit::ThreadView().flags : engine.dirty.flags,
                 list_args ? &esplit_view->indirect : nullptr));
             r.buffer_cache.SetInputsOverride(&*esplit_inputs);
         }
@@ -470,7 +482,12 @@ bool OneFollowerDraw::FillRing(Maxwell3D& engine, GraphicsPipeline* pipeline, bo
     if (repack_dirty) {
         r.buffer_cache.Inputs().MarkVertexBuffersDirty(repack_dirty);
         // The lent draws read E's engine: raise it there too (R raises its own from the packet).
-        engine.dirty.flags[Dirty::VertexInput] = true;
+        // FRITCHII_ESPLIT_DEPTH > 0: E1's engine, so E1 raises it (at its next draw or join).
+        if (esplit_async) [[unlikely]] {
+            VideoCommon::ESplit::DeferFlag(Dirty::VertexInput);
+        } else {
+            engine.dirty.flags[Dirty::VertexInput] = true;
+        }
         VideoCommon::ESplit::NoteBackRaise(); // FRITCHII_ESPLIT_COUNT: an E2 to E1 write
     }
     const MemStage::DrawFacts draw_facts =
@@ -534,7 +551,9 @@ bool OneFollowerDraw::FillRing(Maxwell3D& engine, GraphicsPipeline* pipeline, bo
             VideoCommon::FillCuts::Mode(VideoCommon::FillCuts::Cut::BracketLean);
         bracket_lean != 0) [[unlikely]] {
         u8 slots = 0;
-        for (const auto& rt : engine.regs.rt) {
+        const auto& targets =
+            esplit_async ? VideoCommon::ESplit::ThreadView().regs.rt : engine.regs.rt;
+        for (const auto& rt : targets) {
             if (rt.format == Tegra::RenderTargetFormat::B10G11R11_FLOAT) {
                 slots |= 1;
                 break;
@@ -796,6 +815,36 @@ void OneFollowerDraw::LendDraw(bool is_indexed, u32 instance_count, LentReason r
     OneF::Lend(LentOp::Draw, reason, body);
 }
 
+bool OneFollowerDraw::AsyncTailFits(const Maxwell3D& engine,
+                                    const GraphicsPipeline* pipeline) const {
+    // FRITCHII_ESPLIT_DEPTH > 0 (fritchii_e_split_thread.cpp, S2): what an async fill needs, all
+    // known on E1. Anything else goes lockstep.
+    if (!VideoCommon::ESplit::g_async || pipeline == nullptr) {
+        return false; // S1, or no rule 3 pipeline (the facts table's lookup reads the engine)
+    }
+    const MemStage::DrawFacts pipeline_facts = pipeline->MemFacts();
+    if (pipeline_facts.has_texel_buffers || pipeline_facts.stage_infos == nullptr) {
+        return false; // FillRing would refuse (LateFill)
+    }
+    auto& r = rasterizer;
+    if (!r.mem_stage.Packets() || !r.mem_stage.ValuesByValue() || r.buffer_cache.MarksAhead()) {
+        return false;
+    }
+    if (!engine.draw_manager.draw_state.inline_index_draw_indexes.empty() ||
+        VideoCommon::FritchiiPrice::On()) {
+        return false; // the index bytes live on E1; the price timers read the engine
+    }
+    // FRITCHII_HANDLE_PROG_KEEP reads the engine's bindings (FillHandleValuesKept).
+    if (VideoCommon::FillCuts::Mode(VideoCommon::FillCuts::Cut::HandleProgKeep) != 0) {
+        for (u32 stage = 0; stage < 5; ++stage) {
+            if (!pipeline_facts.stage_infos[stage].handle_programs.empty()) {
+                return false;
+            }
+        }
+    }
+    return !VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed);
+}
+
 bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, bool list,
                                   LentReason& reason) {
     // FRITCHII_ESPLIT_COUNT: E2's parts of the draw carved out of E1's (g_state read once).
@@ -803,14 +852,21 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
     const u8 esplit = ESplit::g_state;
     // FRITCHII_ESPLIT=1 (fritchii_e_split_thread.h): here on E1, the flush and the tail run on E2.
     const bool esplit_hand = ESplit::ShouldHand();
+    // S2: E2 is behind; the flush rides at the head of the tail (after E1's lookup).
+    bool esplit_late_flush = false;
     if (esplit_hand) [[unlikely]] {
-        // The flush before the lookup, as below; only when it has something to do (an empty
-        // FlushCaching changes nothing; the memory stage shadow compares even then).
-        auto& memory_manager = engine.GetMemoryManager();
-        if (memory_manager.HasPendingCachedWrites() ||
-            VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) {
-            auto flush = [&memory_manager] { memory_manager.FlushCaching(); };
-            ESplit::HandTo(ESplit::HandInfo{.hand = ESplit::Hand::Flush}, flush);
+        ESplit::ApplyBackRaises(engine); // S2: VertexInput raised by E2's async fills
+        if (ESplit::FlushBeforeLookup()) {
+            // The flush before the lookup, as below; only when it has something to do (an empty
+            // FlushCaching changes nothing; the memory stage shadow compares even then).
+            auto& memory_manager = engine.GetMemoryManager();
+            if (memory_manager.HasPendingCachedWrites() ||
+                VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) {
+                auto flush = [&memory_manager] { memory_manager.FlushCaching(); };
+                ESplit::HandTo(ESplit::HandInfo{.hand = ESplit::Hand::Flush}, flush);
+            }
+        } else {
+            esplit_late_flush = true;
         }
     } else {
         // Today's PrepareDraw head, E's half: the stream's invalidations before the fill.
@@ -866,7 +922,76 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
         }
     }
     const u64 position = VideoCommon::GpuSplit::Get().BackEntryPosition();
+    if (esplit_hand && AsyncTailFits(engine, pipeline)) [[unlikely]] {
+        // FRITCHII_ESPLIT_DEPTH > 0: the tail on E2 while E1 goes on. E1 builds the record
+        // (taking its engine's buffer flags) and packs R's packet now; E2 fills from its view and
+        // pushes the packet after the fill.
+        ESplit::AsyncSlot slot{};
+        if (ESplit::BeginAsyncDraw(engine, list, slot)) {
+            struct AsyncTail {
+                OneFollowerDraw* self;
+                Maxwell3D* engine;
+                GraphicsPipeline* pipeline;
+                u8* packet;
+                u64 position;
+                u64 seq;
+                u64 packet_bytes;
+                OneF::PacketHeader header;
+                bool is_indexed;
+                bool list;
+                bool flush;
+            } tail{this, &engine, pipeline, slot.packet, position, seq, 0, {}, is_indexed, list,
+                   esplit_late_flush};
+            static_assert(sizeof(AsyncTail) <= ESplit::AsyncPayloadBytes);
+            static_assert(std::is_trivially_copyable_v<AsyncTail>);
+            tail.packet_bytes =
+                OneF::PackDraw(engine, seq, push_flags, pipeline, tail.header, slot.packet);
+            std::memcpy(slot.payload, &tail, sizeof(tail));
+            ESplit::PostAsync([](void* raw) {
+                AsyncTail t;
+                std::memcpy(&t, raw, sizeof(t));
+                OneFollowerDraw& self = *t.self;
+                if (t.flush) {
+                    auto& memory_manager = t.engine->GetMemoryManager();
+                    if (memory_manager.HasPendingCachedWrites() ||
+                        VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) {
+                        VideoCommon::ESplit::NoteLateFlush();
+                        memory_manager.FlushCaching();
+                    }
+                }
+                u64 number = 0;
+                LentReason refused{};
+                if (!self.FillRing(*t.engine, t.pipeline, t.is_indexed, t.position, t.seq, number,
+                                   refused, t.list)) {
+                    // E1 moved on: no lend now. R still gets E1's spans (as a delta packet);
+                    // the draw is dropped (E2Refused, must be 0).
+                    VideoCommon::ESplit::NoteAsyncRefused();
+                    t.header.kind = OneF::PacketKind::Delta;
+                    OneF::PushDrawPacked(t.header, t.packet, t.packet_bytes, 0);
+                    return;
+                }
+                OneF::PushDrawPacked(t.header, t.packet, t.packet_bytes, number);
+                self.counts.pushed.store(self.counts.pushed.load(std::memory_order_relaxed) + 1,
+                                         std::memory_order_relaxed);
+                self.rasterizer.gpu.TickWork();
+            });
+            return true;
+        }
+    }
     if (esplit_hand) [[unlikely]] {
+        if (esplit_late_flush) {
+            // E2 was behind at the lookup and this tail goes in lockstep: the flush first (the
+            // hand-over drains E2), as an async tail would run it.
+            auto& memory_manager = engine.GetMemoryManager();
+            auto flush = [&memory_manager] {
+                if (memory_manager.HasPendingCachedWrites() ||
+                    VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) {
+                    VideoCommon::ESplit::NoteLateFlush();
+                    memory_manager.FlushCaching();
+                }
+            };
+            ESplit::HandTo(ESplit::HandInfo{.hand = ESplit::Hand::Flush}, flush);
+        }
         // FRITCHII_ESPLIT=1: the tail below on E2 (the record of its view first), E1 waits.
         bool pushed = false;
         auto tail = [&] {
