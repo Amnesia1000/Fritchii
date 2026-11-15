@@ -1592,6 +1592,9 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   off, the facts table is not written (E_PIPELINE). The must-be-0 checks that cost nothing stay
   on (owner asserts, stream-write guard, the pre-record hash check and its safety stop,
   descriptor counts, texture read ahead of R). One log line at boot names the configuration.
+- FRITCHII_CPU_ACCURACY (boot env; auto, accurate, unsafe, paranoid, debugging): the CPU accuracy
+  the JIT uses this session, for sizing runs (e.g. how much exact float handling costs). The
+  stored cpu_accuracy setting is not changed, so nothing of it can be saved to a config.
 - FRITCHII_ONEF_PIN (boot, default 1; 2 = one hardware thread of that core, its SMT sibling
   stays with the guest cores, fable_b 20.7): R gets PinnedRole::GpuMem's physical core (as
   FRITCHII_PIN_GPUMEM=1 gives GPUMem), taken from the guest set. 0 leaves R unpinned.

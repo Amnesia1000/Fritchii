@@ -1116,6 +1116,10 @@ bool IsGPUFenceBehaviorBalanced();
 bool IsGPUFenceBehaviorAccurate();
 
 bool IsFastmemEnabled();
+/// The CPU accuracy the JIT uses: FRITCHII_CPU_ACCURACY (boot env, a test's sizing run: auto,
+/// accurate, unsafe, paranoid, debugging) when set, else cpu_accuracy. The stored setting is
+/// never changed, so nothing of the override can be saved to a config.
+CpuAccuracy EffectiveCpuAccuracy();
 void SetNceEnabled(bool is_64bit);
 bool IsNceEnabled();
 

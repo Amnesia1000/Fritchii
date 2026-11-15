@@ -203,10 +203,31 @@ bool IsGPUFenceBehaviorAccurate() {
     return values.gpu_fence_behavior.GetValue() == GpuFenceBehavior::Accurate;
 }
 
+CpuAccuracy EffectiveCpuAccuracy() {
+    static const std::optional<CpuAccuracy> forced = []() -> std::optional<CpuAccuracy> {
+        const char* value = std::getenv("FRITCHII_CPU_ACCURACY");
+        if (value == nullptr || value[0] == 0) {
+            return std::nullopt;
+        }
+        const std::string_view name{value};
+        std::optional<CpuAccuracy> result;
+        if (name == "auto") result = CpuAccuracy::Auto;
+        else if (name == "accurate") result = CpuAccuracy::Accurate;
+        else if (name == "unsafe") result = CpuAccuracy::Unsafe;
+        else if (name == "paranoid") result = CpuAccuracy::Paranoid;
+        else if (name == "debugging") result = CpuAccuracy::Debugging;
+        LOG_WARNING(Common, "FRITCHII_CPU_ACCURACY={}: {}", name,
+                    result ? "the JIT uses it this session (the setting is unchanged)"
+                           : "unknown, ignored");
+        return result;
+    }();
+    return forced ? *forced : values.cpu_accuracy.GetValue();
+}
+
 bool IsFastmemEnabled() {
-    if (values.cpu_accuracy.GetValue() == Settings::CpuAccuracy::Debugging)
+    if (EffectiveCpuAccuracy() == Settings::CpuAccuracy::Debugging)
         return bool(values.cpuopt_fastmem);
-    else if (values.cpu_accuracy.GetValue() == CpuAccuracy::Unsafe)
+    else if (EffectiveCpuAccuracy() == CpuAccuracy::Unsafe)
         return bool(values.cpuopt_unsafe_host_mmu);
 #if defined(__linux__) && defined(ARCHITECTURE_arm64)
     // Only 4kb systems support host MMU right now

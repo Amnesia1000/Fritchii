@@ -393,7 +393,7 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         config.code_cache_size = std::uint32_t(8_MiB);
     }
 
-    switch (Settings::values.cpu_accuracy.GetValue()) {
+    switch (Settings::EffectiveCpuAccuracy()) {
     // Debug mode
     case Settings::CpuAccuracy::Debugging:
         if (!Settings::values.cpuopt_page_tables) {
@@ -486,8 +486,8 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
                  enabled ? "skipped" : "kept");
         return enabled;
     }();
-    if (fast_compile && Settings::values.cpu_accuracy.GetValue() != Settings::CpuAccuracy::Debugging &&
-        Settings::values.cpu_accuracy.GetValue() != Settings::CpuAccuracy::Paranoid) {
+    if (fast_compile && Settings::EffectiveCpuAccuracy() != Settings::CpuAccuracy::Debugging &&
+        Settings::EffectiveCpuAccuracy() != Settings::CpuAccuracy::Paranoid) {
         config.optimizations |= Dynarmic::OptimizationFlag::DisableVerification;
     }
     if (Kernel::Nx2ThreadStats::g_enabled && m_core_index < g_jit_counters.size()) {
