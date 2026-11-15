@@ -351,6 +351,9 @@ private:
     struct DiscardStats {
         std::array<u32, 3> skipped{};
         std::array<u32, 3> waited{};
+        /// Skipped lookups FRITCHII_ASYNC_REDRAWN let through (counted in skipped's persistent
+        /// column too; every lookup, repeats included)
+        u32 skipped_redrawn{};
         /// GPU thread time in the translate queue's capped Wait for a draw that waits
         std::chrono::steady_clock::duration queue_wait{};
         std::chrono::nanoseconds held_at_window{}; ///< GraphicsPipeline::HoldTimeTotal then

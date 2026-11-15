@@ -23,6 +23,10 @@ enum class MemoryPermission : u32 {
 };
 DECLARE_ENUM_FLAG_OPERATORS(MemoryPermission)
 
+/// FRITCHII_PROTECT_UNLOCKED (live, default 0; -1 = not read yet): Windows Protect first tries
+/// VirtualProtect on the whole range without the placeholder lock (docs/fritchii/switches.md).
+inline std::atomic<int> g_protect_unlocked{-1};
+
 /**
  * A low level linear memory buffer, which supports multiple mappings
  * Its purpose is to rebuild a given sparse memory layout, including mirrors.

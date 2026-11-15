@@ -8,6 +8,7 @@
 #include <mutex>
 #include <unordered_map>
 
+#include "common/host_memory.h"
 #include "video_core/nx2_debug_control.h"
 
 namespace VideoCore::Nx2Debug {
@@ -501,6 +502,12 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     }
     if (name == "FRITCHII_JIT_HOT_PACK") {
         return &g_jit_hot_pack;
+    }
+    if (name == "FRITCHII_ASYNC_REDRAWN") {
+        return &g_async_redrawn;
+    }
+    if (name == "FRITCHII_PROTECT_UNLOCKED") {
+        return &Common::g_protect_unlocked;
     }
     // FRITCHII_ONEF and FRITCHII_ONEF_PIN are boot switches: not live.
     if (name == "FRITCHII_ONEF_VIEW") {

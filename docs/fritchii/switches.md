@@ -7,6 +7,36 @@ rebuilds nothing.
 
 ## Named switches
 
+### FRITCHII_PROTECT_UNLOCKED
+
+TEST, off by default (helper AK, 2026-11-15, port of zortos293/Lichii #1780 by Reiixan); live,
+FRITCHII_PROTECT_UNLOCKED=1 turns it on (Windows only). HostMemory's Protect (the write traps on
+GPU-cached guest memory, 12,000-28,000 calls a second in OoT) took the placeholder lock before every
+VirtualProtect, and Map/Unmap hold that lock across their kernel calls, which slow from ~10 us to
+~250 us while the game maps memory in bulk (zone changes): protections queued behind them and the
+GPU thread stalled (their test: frames over 100 ms 37 -> 10 on one route). With the switch on,
+Protect first calls VirtualProtect on the whole range without the lock. It refuses a range that
+reaches a placeholder or a second view (a Map/Unmap under way, or a range across views); those take
+the lock and are protected view by view as before. Any interleaving ends as a Protect done wholly
+before or after the Map/Unmap. Log: "Host protect in the last 10 s (FRITCHII_PROTECT_UNLOCKED): N
+without the lock, M took the lock". Measure with the "host protect" time and longest in the Hitch:
+lines around area loads.
+
+### FRITCHII_ASYNC_REDRAWN
+
+TEST, off by default (helper AK, 2026-11-15, port of TheuZCoder's Fritchii fork 2e0cf33368; there
+it is EDEN_NX2_ASYNC_REDRAWN, on unless =0); live, FRITCHII_ASYNC_REDRAWN=1 turns it on. With
+EDEN_NX2_ASYNC_DISCARD=2 a native draw whose pipeline is still building is skipped only when every
+target was fully cleared in this render frame and a recent earlier one. OoT's scene colour is
+covered by the sky or terrain instead of a clear, so it counts as persistent and every new object or
+effect drawn into it waited for its pipeline (Hyrule Field, the first hit on a new enemy). Images now
+count the consecutive render frames they were written in (ImageBase::write_streak); a target not
+cleared but already written in this frame and the 7 before counts as recurring for depth-tested
+colour draws, which then skip while the pipeline builds (the object is missing for a frame or so).
+Layers drawn once or now and then, depth-only passes and draws without a depth test still wait. The
+10 s "Async discard" line counts these skips ("N of them into redrawn targets"); they stay in the
+persistent skipped column too. Only matters with unbuilt pipelines: a warm shader cache sees few.
+
 ### FRITCHII_SYNCPT_MIRROR
 
 Fix, on by default (helper AH, 2026-11-15, port of zortos293/Lichii #1512); read once when the
@@ -5198,6 +5228,12 @@ read by the CPU (sticky per shape for the session: "Render target relocation gua
 nor for rescaled, sparse, converted or CPU-read images, ones with a download queued, bound as
 another target of the clear or in another channel. Logs each shape's first candidate and
 relocation and "Render target relocation (EXP43=n) last 600 frames".
+
+Compute dispatch waits (no switch; helper AK, 2026-11-15, the log line of zortos293/Lichii #995 by
+VirusEx): a dispatch that waits more than 50 ms for its compute pipeline's driver build logs
+"Compute dispatch waited X ms for pipeline <hash>" (every GPU channel waits with it). #995's main
+change, the pointer-slot rebuild compiling on a worker while the old translation keeps running, was
+already in (f253d02aa5, port of #969: ComputePipelineCacheEntry::pending).
 
 ### EXP51
 

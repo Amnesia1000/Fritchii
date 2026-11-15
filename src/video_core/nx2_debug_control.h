@@ -248,6 +248,8 @@ inline std::atomic<int> g_store_memo{-1};
 inline std::atomic<int> g_write_remark{-1};
 /// FRITCHII_JIT_HOT_PACK: docs/fritchii/switches.md.
 inline std::atomic<int> g_jit_hot_pack{-1};
+/// FRITCHII_ASYNC_REDRAWN (live, default 0): docs/fritchii/switches.md.
+inline std::atomic<int> g_async_redrawn{-1};
 /// FRITCHII_ONEF (boot): one follower step 1, the render thread R (one_follower.h).
 inline std::atomic<int> g_onef{-1};
 /// FRITCHII_ONEF_VIEW (live): step 2, needs FRITCHII_ONEF=1.
