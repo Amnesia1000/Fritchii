@@ -886,6 +886,7 @@ void MemoryManager::NoteHostStore(GPUVAddr gpu_addr, std::size_t size) {
 void MemoryManager::WriteBlockCached(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size) {
     WriteBlockImpl(gpu_dest_addr, src_buffer, size, VideoCommon::CacheType::None, true, false);
     accumulator.Add(gpu_dest_addr, size);
+    NoteCachedWrite();
 }
 
 void MemoryManager::WriteBlockStage(GPUVAddr gpu_dest_addr, const void* src_buffer,
@@ -969,6 +970,7 @@ void MemoryManager::WriteWordsCached(GPUVAddr gpu_dest_addr, const u32* words, s
     for (std::size_t i = 0; i < count; ++i) {
         accumulator.Add(gpu_dest_addr + i * sizeof(u32), sizeof(u32));
     }
+    NoteCachedWrite();
 }
 
 void MemoryManager::WriteConstantBufferData(DAddr device_addr, GPUVAddr gpu_addr,
@@ -1012,6 +1014,7 @@ void MemoryManager::WriteConstantBufferData(DAddr device_addr, GPUVAddr gpu_addr
     if (verify) {
         constant_buffer_verify.push_back({gpu_addr, device_addr, size, MapSerial()});
     }
+    NoteCachedWrite();
     if (!constant_buffer_writes.empty()) {
         auto& [last, last_size] = constant_buffer_writes.back();
         if (begin <= last + last_size && last <= end) {

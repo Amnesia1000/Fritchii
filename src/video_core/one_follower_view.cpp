@@ -576,10 +576,36 @@ void GuardStreamWrite(DAddr address, u64 size) noexcept {
     if (!Detail::t_engine || size == 0 || g_texture_pages == nullptr) {
         return;
     }
+    // FRITCHII_ESPLIT, E2 while E1 runs ahead, a write E1 did not check (not an S4 constant
+    // buffer record's: E2ExclusiveBegin skips those): the guard reads E1's pool ranges and may
+    // drain R, so E1 is held at a safe point for it.
+    struct Exclusive {
+        bool held = ESplit::g_async && ESplit::E2ExclusiveBegin();
+        ~Exclusive() {
+            if (held) {
+                ESplit::E2ExclusiveEnd();
+            }
+        }
+    } const esplit_exclusive;
     // FRITCHII_ESPLIT_COUNT: an E2 write onto shader pages opens the window in which E1's next
     // pipeline lookup would have to wait for it.
     if (ESplit::g_state != 0) [[unlikely]] {
         ESplit::NoteStreamWriteImpl(g_shader_pages != nullptr && g_shader_pages->Any(address, size));
+    }
+    // FRITCHII_ESPLIT_CB_ASYNC (S4): E2 writes constant buffer words E1 queued after it found
+    // these pages clear (StreamPagesClear, with E's pools at E1's place: E2 does not read them,
+    // they are E1's). A filter bit set since then is ESplitCbGuard (must be 0): R still plays
+    // everything before the write first, but the next draw's lend (stream_hit, E1's) is not
+    // asked for, E1 routed it already.
+    if (ESplit::t_async_cb) [[unlikely]] {
+        if (g_texture_pages->Any(address, size) ||
+            (g_shader_pages != nullptr && g_shader_pages->Any(address, size))) {
+            ESplit::NoteCbGuardHit();
+            if (Behind() != 0) {
+                Drain();
+            }
+        }
+        return;
     }
     Stats::StreamWriteChecked();
     const DAddr end = address + size;
@@ -601,6 +627,11 @@ void GuardStreamWrite(DAddr address, u64 size) noexcept {
         (g_shader_pages == nullptr || !g_shader_pages->Any(address, size)) && !in_pools()) {
         return;
     }
+    // FRITCHII_ESPLIT: a write onto shader pages: E1's next lookup drains and flushes first.
+    if (ESplit::g_thread && g_shader_pages != nullptr && g_shader_pages->Any(address, size))
+        [[unlikely]] {
+        ESplit::g_shader_pending.store(true, std::memory_order_relaxed);
+    }
     ++g_e.on_texture;
     if (Behind() == 0) {
         return; // R has nothing left that could read the page before this write: today's order
@@ -619,6 +650,24 @@ void GuardStreamWrite(DAddr address, u64 size) noexcept {
 
 bool TakeStreamWriteLend() noexcept {
     return std::exchange(g_e.stream_hit, false);
+}
+
+bool StreamPagesClear(DAddr address, u64 size) noexcept {
+    // GuardStreamWrite's test without the act: no page that ever held an image or shader code,
+    // not E's pools. No filters: nothing can be shown clear.
+    if (g_texture_pages == nullptr || g_shader_pages == nullptr) {
+        return false;
+    }
+    if (g_texture_pages->Any(address, size) || g_shader_pages->Any(address, size)) {
+        return false;
+    }
+    const DAddr end = address + size;
+    for (const auto& [begin, pool_end] : g_e.pools) {
+        if (begin < end && address < pool_end) {
+            return false;
+        }
+    }
+    return true;
 }
 
 u64 StreamWritesOnTexturePages() noexcept {

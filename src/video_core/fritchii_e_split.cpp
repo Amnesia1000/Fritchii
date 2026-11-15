@@ -1376,15 +1376,25 @@ u32 ThreadBuildAsync(Maxwell3D& engine, bool list_args, u8* out) noexcept {
     return bytes;
 }
 
-void SyncFlagsToEngine(Maxwell3D& engine) noexcept {
-    if (g_view.seeded && g_view.engine == &engine) {
-        engine.dirty.flags = (engine.dirty.flags & ~BufferFlags()) | (g_view.flags & BufferFlags());
+// The queued mode's buffer flags (FRITCHII_ESPLIT_DEPTH > 0): between transfers the engine holds
+// only the flags E1's work raised since the last one (they are cleared at each transfer, so a raise
+// after E2's fill cleared its copy is a 0 to 1 edge again), E2's view the whole state. Overwriting
+// the engine with the view (as S2 did first) dropped E1's raises made since the last record: the
+// view then took them from the record's words and held a flag the engine lacked (IndexBuffer,
+// flag 0x30, the step-in of 15 Nov). Both follow the view's own engine: after a channel switch
+// the engine the view left gets its whole state back before the new one is seeded.
+void SyncFlagsToEngine() noexcept {
+    if (g_view.seeded && g_view.engine != nullptr) {
+        Maxwell3D& engine = const_cast<Maxwell3D&>(*g_view.engine);
+        engine.dirty.flags |= g_view.flags & BufferFlags();
     }
 }
 
-void SyncFlagsToView(const Maxwell3D& engine) noexcept {
-    if (g_view.seeded && g_view.engine == &engine) {
+void SyncFlagsToView() noexcept {
+    if (g_view.seeded && g_view.engine != nullptr) {
+        Maxwell3D& engine = const_cast<Maxwell3D&>(*g_view.engine);
         g_view.flags = (g_view.flags & ~BufferFlags()) | (engine.dirty.flags & BufferFlags());
+        engine.dirty.flags &= ~BufferFlags();
     }
 }
 

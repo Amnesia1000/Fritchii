@@ -45,6 +45,10 @@ class GpuSplit;
 struct MemStageShadowAccess;
 }
 
+namespace VideoCommon::ESplit {
+struct CbTarget;
+}
+
 namespace VideoCore {
 class RasterizerInterface;
 }
@@ -3367,7 +3371,18 @@ public:
     /// once per selection and memory map (MemoryManager::WriteConstantBufferData). False, having
     /// done nothing, where the general path has to: the switch is off, the buffer isn't one
     /// mapped device range, or the write lands on Switch 2 sparse memory.
-    bool WriteBoundConstantBuffer(u32 offset, const void* data, u32 bytes);
+    bool WriteBoundConstantBuffer(const VideoCommon::ESplit::CbTarget& target, const void* data,
+                                  u32 bytes);
+    /// Where constant buffer words written now land (CB_ADDRESS, CB_SIZE, the offset before
+    /// them, the texture header and sampler pools, the switches that keep the write here): the
+    /// memory half below reads only this, no register.
+    void FillConstantWordsTarget(VideoCommon::ESplit::CbTarget& target, u32 offset) const;
+    /// The memory half of constant buffer words: `block` = CallConstBufferWords' write (one
+    /// device page, CB_DIRECT), else ProcessCBMultiData's (`bytes` already clipped to the
+    /// buffer). The register half (the offset advance) stays with the caller. FRITCHII_ESPLIT=1
+    /// runs it on E2 from a record (fritchii_e_split_thread.h, S4), later than the register half.
+    void WriteConstantWords(const VideoCommon::ESplit::CbTarget& target, const u32* values,
+                            u32 bytes, bool block);
 
     void ProcessInlineIndexMultiData(u32 method, const u32* start_base, u32 amount);
 
@@ -3405,7 +3420,8 @@ public:
     /// Unchanged where the GPU caches or a guest read download may hold other words there, the
     /// texture header or sampler pools are written (directly or through an alias), or run-ahead
     /// was used this session. Switch off: Changed, without reading memory.
-    ConstantWrite CompareConstantData(GPUVAddr begin, const void* data, u64 bytes);
+    ConstantWrite CompareConstantData(GPUVAddr begin, const void* data, u64 bytes,
+                                      const VideoCommon::ESplit::CbTarget& target);
     /// Counting on: translates the texture header and sampler pools to device memory again if
     /// they or the mappings changed, and publishes them for the writes applied to the caches
     /// (Nx2FastDrawCount::NotePoolWrite). On the thread that runs this engine.

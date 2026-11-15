@@ -415,6 +415,12 @@ inline std::atomic<int> g_esplit{-1};
 inline std::atomic<int> g_esplit_depth{-1};
 /// FRITCHII_ESPLIT_PIN (boot, default 0): where E1 and E2 run (fritchii_e_split_thread.h, S3).
 inline std::atomic<int> g_esplit_pin{-1};
+/// FRITCHII_ESPLIT_CB_ASYNC (live, default 0; with DEPTH > 0): 1 = constant buffer words' memory
+/// half queued for E2 without a wait (fritchii_e_split_thread.h, S4).
+inline std::atomic<int> g_esplit_cb_async{-1};
+/// FRITCHII_ESPLIT_FLUSH_ASYNC (live, default 0; with DEPTH > 0): 1 = a draw's flush that is not
+/// owed goes after E1's lookup even with E2 idle (fritchii_e_split_thread.h, FlushPlace).
+inline std::atomic<int> g_esplit_flush_async{-1};
 /// EDEN_NX2_LIGHT_TABLE_ARRAYS: docs/fritchii/switches.md.
 [[nodiscard]] inline bool LightTableArrays() {
     static const bool on = EnvSwitch("EDEN_NX2_LIGHT_TABLE_ARRAYS") > 0;

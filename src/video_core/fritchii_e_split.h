@@ -359,9 +359,10 @@ void ThreadCbAdvance(u64 words) noexcept;
 /// E1, FRITCHII_ESPLIT_DEPTH > 0: a draw record whose take is every buffer flag raised on the
 /// engine, cleared there (E2's view runs behind; E2 ORs them in). Needs ThreadRecordReady.
 [[nodiscard]] u32 ThreadBuildAsync(Maxwell3D& engine, bool list_args, u8* out) noexcept;
-/// FRITCHII_ESPLIT_DEPTH > 0, E2 drained: the buffer flags go to the engine from E2's view
-/// before E1 or a lockstep hand-over runs E2's work on the engine, and back after it.
-void SyncFlagsToEngine(Maxwell3D& engine) noexcept;
-void SyncFlagsToView(const Maxwell3D& engine) noexcept;
+/// FRITCHII_ESPLIT_DEPTH > 0, E2 drained, on the view's own engine: before E1 runs E2's work on
+/// the engine its flags get the view's ORed in (the engine holds only E1's raises since the last
+/// transfer); after it the view takes the engine's and the engine's are cleared.
+void SyncFlagsToEngine() noexcept;
+void SyncFlagsToView() noexcept;
 
 } // namespace VideoCommon::ESplit
