@@ -509,6 +509,15 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_OCCLUSION_VISIBLE") {
         return &g_occlusion_visible;
     }
+    if (name == "FRITCHII_UNSWIZZLE_IN_PLACE") {
+        return &g_unswizzle_in_place;
+    }
+    if (name == "FRITCHII_KEEP_BLOCKS") {
+        return &g_keep_blocks;
+    }
+    if (name == "FRITCHII_STAGING_RING") {
+        return &g_staging_ring;
+    }
     if (name == "FRITCHII_PROTECT_UNLOCKED") {
         return &Common::g_protect_unlocked;
     }

@@ -72,6 +72,55 @@ drains). With the switch on, nothing is measured:
   light shafts or glow sprites showing through walls and hills if the game tests those); (2):
   tested objects missing.
 
+### FRITCHII_UNSWIZZLE_IN_PLACE
+
+TEST, off by default (helper AO, 2026-11-15, port of tomk134/lichii-custom e8e50e797 via
+DahBard/Blitchii 43321b8db9, d05a021080 and their r54 crash fix d3251a67cf); live,
+FRITCHII_UNSWIZZLE_IN_PLACE=1 turns it on. ExecuteUnswizzlePlan (the chunked upload of 2D images of
+64 MiB or more that aren't converted or GPU-decoded) copied every guest run into a fresh vector
+before untiling it. With the switch on, a run that is contiguous in host memory (MemoryManager::
+GetSpan, which checks the device pages' host continuity, not just the GPU mapping) is untiled
+straight from guest memory; other runs are copied into a grow-only thread-local scratch buffer. The
+main upload path (GpuGuestMemory) already read in place. =2 also untiles every in-place run from a
+copy and compares (exactness check, must be 0; a game write between the two reads could differ).
+Log: "Unswizzle in place in 10 s (FRITCHII_UNSWIZZLE_IN_PLACE=N): R runs read in place (X MiB), C
+copied first (Y MiB); verify V checked, M differ (must be 0)".
+
+### FRITCHII_KEEP_BLOCKS
+
+TEST, off by default (helper AO, 2026-11-15, port of DahBard/Blitchii's device memory reserve, r64
+cccc1ff9fc, capped). Set at boot to enable (any value; then live): 0 = keep nothing, 1 = 256 MiB,
+N = N MiB, at most 512 (no brute-force VRAM). Unset at boot, VMA calls the driver directly as before.
+VMA's device-local blocks it frees (plain blocks only: power-of-two sizes 1-64 MiB, no dedicated
+memory, nothing host-visible) are kept and handed back, without a driver call, to VMA's next
+allocation of the same memory type, size and flags. Area loads at the texture cache's threshold
+evict images (their blocks empty and go back to the driver) and then make new ones; on Blitchii
+vkAllocateMemory took 29-50% of the back thread in OoT's transition frames. Limits: the cap, and
+(texture cache budget check, every 30 frames) what the live usage leaves under the critical use
+plus half the room between the critical use and the budget. Everything goes back when a driver
+allocation fails (then retried), when an image is over VMA's budget (then retried before it counts
+as memory pressure), when images stop fitting (the EXP42 pool's pressure test), and at once when the
+switch goes to 0; over the limit one block a frame goes. The caches count kept blocks as free
+(Device::QueryDeviceMemoryUsage). FRITCHII_KEEP_BLOCKS_PREMAKE=1 (boot) makes the cap's worth of
+VMA default-size blocks at boot. Off on integrated GPUs. Log: "Kept blocks in 10 s
+(FRITCHII_KEEP_BLOCKS cap N MiB, limit L): A driver allocations under VMA (X MiB) in T ms, longest
+M ms; F driver frees in T ms; R blocks reused, K kept, S not kept, G given back; holds H MiB". Note
+the Churn line's device allocations still count reused blocks (VMA's own callback).
+
+### FRITCHII_STAGING_RING
+
+TEST, off by default (helper AO, 2026-11-15, port of DahBard/Blitchii's staging ring, r64). The
+size is read at boot (1 = 256 MiB, N = N MiB, 16-1024; host memory, not VRAM), its use is live (0
+stops it). One host-coherent upload buffer for the texture cache's staging pool, made and written
+once at boot. Uploads too big for the stream buffer's region (8 MiB on a discrete GPU) that find no
+idle cached staging buffer take a slice of the ring before a new staging buffer is made (often a
+driver allocation, then first-touch page faults). Like the stream buffer, the ring has 16 regions,
+each reused once the GPU is past its last stamp; an upload over half the ring needs all of it idle.
+The last upload's regions are stamped again at the next request (its copy may be recorded after the
+request). Log: "Staging ring in 10 s (FRITCHII_STAGING_RING=N): U uploads (X MiB), L over half the
+ring; R refused (B while an upload over half the ring was in flight), C staging buffers made after a
+refusal".
+
 ### FRITCHII_SYNCPT_MIRROR
 
 Fix, on by default (helper AH, 2026-11-15, port of zortos293/Lichii #1512); read once when the

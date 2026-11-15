@@ -2866,6 +2866,10 @@ u64 TextureCacheRuntime::GetDeviceMemorySlack() const {
     return device.GetDeviceMemorySlack();
 }
 
+void TextureCacheRuntime::LimitKeptBlocks(u64 budget, u64 critical) const {
+    device.LimitKeptBlocks(budget, critical);
+}
+
 bool TextureCacheRuntime::CanDownloadMsaa(const VideoCommon::ImageInfo& info) const {
     const VkImageAspectFlags aspect_mask = ImageAspectMask(info.format);
     if ((aspect_mask & VK_IMAGE_ASPECT_COLOR_BIT) != 0) {
@@ -3292,6 +3296,12 @@ void TextureCacheRuntime::TickFrame() {
             pressure != image_pool_seen_pressure || failed != image_pool_seen_failed;
         image_pool_seen_pressure = pressure;
         image_pool_seen_failed = failed;
+        // FRITCHII_KEEP_BLOCKS: kept blocks go before any pooled image, then one is trimmed a
+        // frame while they hold more than the cap and the budget's limit allow.
+        if (short_of_memory) {
+            device.ReleaseKeptBlocks();
+        }
+        device.TickKeptBlocks();
         const int pool_switch = VideoCore::Nx2Debug::Experiment(42);
         if (pool_switch == 0 || short_of_memory) {
             TrimImagePool(0);

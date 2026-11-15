@@ -624,6 +624,8 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
         // The memory stage's thread checks who requests from the cache's own pool.
         split_buffer_staging->MarkCacheSide();
     }
+    // FRITCHII_STAGING_RING: the texture cache's pool (texture uploads at area loads).
+    staging_pool.CreateUploadRing();
     VideoCommon::FritchiiDrawKinds::Init();
     // EDEN_NX2_MEMSTAGE_STATS: stream writes are tested against the texture cache's pages.
     VideoCommon::MemStageStats::SetImagePageFilters(&texture_cache.page_filter,

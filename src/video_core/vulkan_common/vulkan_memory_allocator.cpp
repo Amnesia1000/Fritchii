@@ -461,6 +461,14 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
                           ? TimedVmaCreateImage(device, allocator, ci, first_ci, handle,
                                                 allocation, alloc_info)
                           : vmaCreateImage(allocator, &ci, &first_ci, &handle, &allocation, &alloc_info);
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge && device.KeptBlockBytes() != 0) {
+        // FRITCHII_KEEP_BLOCKS: the kept blocks count against the budget VMA checks; they go
+        // first, and VMA reads the driver's usage again before the retry.
+        if (device.ReleaseKeptBlocks() != 0) {
+            vmaSetCurrentFrameIndex(allocator, 0);
+            result = vmaCreateImage(allocator, &ci, &first_ci, &handle, &allocation, &alloc_info);
+        }
+    }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
         // Over the device memory budget (Switch 2 titles fill 8 GB cards): let the driver page
         // it out rather than failing the draw and aborting.
