@@ -1804,7 +1804,7 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   R (idle) and E (parked or waiting) spin before they sleep on their wake word. Lower values
   hand the core back sooner (with PIN=2 R's hardware thread is a game core's sibling, fable_b
   23.3) at the cost of a wake on the next packet.
-- FRITCHII_ONEF_PIN (boot, default 1; 2 = one hardware thread of that core, its SMT sibling
+- FRITCHII_ONEF_PIN (boot, default 1; 3 = R on the front's idle SMT sibling, fable_b 24; 2 = one hardware thread of that core, its SMT sibling
   stays with the guest cores, fable_b 20.7): R gets PinnedRole::GpuMem's physical core (as
   FRITCHII_PIN_GPUMEM=1 gives GPUMem), taken from the guest set. 0 leaves R unpinned.
 - FRITCHII_ONEF_VIEW (live, default 0): 1 = step 2, E packs the register delta, the R-owned dirty

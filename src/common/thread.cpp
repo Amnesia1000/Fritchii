@@ -745,7 +745,18 @@ void PinCurrentThread(PinnedRole role, int guest_core) {
         const bool pin_render = ((onef != nullptr && onef[0] == '1') ||
                                  (onef_lean != nullptr && onef_lean[0] == '1')) &&
                                 (onef_pin == nullptr || onef_pin[0] != '0');
-        if (((pin_mem != nullptr && pin_mem[0] == '1') || pin_render) && result.guest != 0) {
+        // FRITCHII_ONEF_PIN=3 (fable_b 24): R on the front's idle SMT sibling; the front keeps
+        // one hardware thread of its core and the guest cores keep all of normal's threads.
+        if (pin_render && onef_pin != nullptr && onef_pin[0] == '3' &&
+            std::popcount(result.front) > 1) {
+            mem_mask = u64{1} << (63 - std::countl_zero(result.front));
+            result.front &= ~mem_mask;
+            LOG_INFO(Common,
+                     "Thread pinning: GPURender {:#x} (FRITCHII_ONEF_PIN=3, the front's sibling), "
+                     "front now {:#x}, guest cores {:#x}",
+                     mem_mask, result.front, result.guest);
+        } else if (((pin_mem != nullptr && pin_mem[0] == '1') || pin_render) &&
+                   result.guest != 0) {
             for (auto it = topology.cores.rbegin(); it != topology.cores.rend(); ++it) {
                 if (it->mask != 0 && (it->mask & ~result.guest) == 0 &&
                     (result.guest & ~it->mask) != 0) {
