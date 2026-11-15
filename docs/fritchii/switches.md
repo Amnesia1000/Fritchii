@@ -121,6 +121,37 @@ request). Log: "Staging ring in 10 s (FRITCHII_STAGING_RING=N): U uploads (X MiB
 ring; R refused (B while an upload over half the ring was in flight), C staging buffers made after a
 refusal".
 
+### FRITCHII_HOSTTIMING_SPIN_BUDGET
+
+TEST, off by default (helper AS, 2026-11-15; idea from zortos293/Lichii #1733). Live, a percent of
+the timer thread's time; 0 = no limit (as before). EXP75 (600 us by default) makes the HostTiming
+thread spin the last 600 us before a guest timer. OoT's present poll sleeps 250 us at a time while it
+waits for a frame, so during a long wait (an area load) a timer is always that close and the thread
+spins a whole core (2.3 s of CPU in a 2.5 s Castle Town load freeze, 70-100% of every load hitch).
+With the switch, spins are paid from a budget that grows by N% of the time that passes and holds at
+most 2 ms; with less left than EXP75's window the thread spins only what is left and sleeps on the
+OS timer before that. 20 is #1733's value. Log, every 10 s (always on): "HostTiming in 10 s: spun X
+ms/s before guest timers (S spins, longest L us; EXP75=600 us, FRITCHII_HOSTTIMING_SPIN_BUDGET=N%: C
+cut by it); W OS waits; E events, callbacks M ms/s, longest T us (event name), K of 1 ms or more;
+most in one pass P; J ran 1 ms or more late (worst Z ms, event name)". The hitch line also gets
+"timer thread spin" and "timer events over 1 ms" (callbacks of 1 ms or more), so a hitch where
+HostTiming is busy says whether it spun or ran a slow callback.
+
+### FRITCHII_ONEF_RAISE_AFTER_LEND
+
+TEST, off by default (helper AS, 2026-11-15). Live. R raises `played` after every packet it plays
+except a lent one, and its raise before a lent packet stops at that packet's floor. A lend E makes
+after its last consumed position (the frame end op when E goes idle) then leaves `played` short of
+what E and R have both passed, and nobody raises it until E consumes more. If the front is waiting
+on R's position to send more (a map at an area load), nothing moves until the hang watchdog's 2 s
+rescue: "One follower hang watchdog: a lost raise of `played` (... R with nothing unplayed): raised
+now", the 2.5 s Castle Town load freeze of 2026-11-15. With 1, E raises `played` itself after every
+lend's park (min of its consumed position and R's oldest unplayed packet, as every raise). The check
+is counted with the switch off too. Log, every 10 s when it happened: "One follower raise after lend
+(FRITCHII_ONEF_RAISE_AFTER_LEND=N) 10 s: X lends/s left `played` short of what E and R had both
+passed (W ring words short on average; raised after the park / left to E's next consumed position
+or the hang watchdog), T this session".
+
 ### FRITCHII_SYNCPT_MIRROR
 
 Fix, on by default (helper AH, 2026-11-15, port of zortos293/Lichii #1512); read once when the
