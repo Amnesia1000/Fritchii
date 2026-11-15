@@ -6,6 +6,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -381,4 +382,39 @@ TEST_CASE("NX2 changes made in a defer scope reach listeners after it, in order"
     // Without a scope, Defer runs right away.
     Registry::Defer([&] { recorder.Add("now"); });
     REQUIRE(recorder.Get().back() == "now");
+}
+
+TEST_CASE("NX2 sparse blocks backed before a region is set up are recorded for it",
+          "[video_core][nx2_mapping]") {
+    Service::Nvidia::Devices::Nx2GpuMemoryRegistry registry;
+    registry.CreateSparse(0x100000, 0x1000000);
+    registry.BackSparse(0x100000, 0x5000000, 0x400000);
+    registry.BackSparse(0x500000, 0x6000000, 0x400000);
+    using Back = std::tuple<u64, u64, u64>;
+    REQUIRE(registry.SparseBacksIn(0x100000, 0x1000000) ==
+            std::vector<Back>{{0x100000, 0x5000000, 0x400000}, {0x500000, 0x6000000, 0x400000}});
+
+    // A tile over part of a block decides that range: the block's record goes.
+    registry.MapSparseTile(0x600000, 0x7000000, 0x1000);
+    REQUIRE(registry.SparseBacksIn(0x100000, 0x1000000) ==
+            std::vector<Back>{{0x100000, 0x5000000, 0x400000}});
+
+    // Created again (or destroyed): the old blocks no longer apply.
+    registry.CreateSparse(0x100000, 0x2000000);
+    REQUIRE(registry.SparseBacksIn(0x100000, 0x2000000).empty());
+}
+
+TEST_CASE("NX2 removing a listener does not wait for other owners' later calls",
+          "[video_core][nx2_mapping]") {
+    Service::Nvidia::Devices::Nx2GpuMemoryRegistry registry;
+    int first{};
+    int second{};
+    int calls{};
+    registry.AddListener(&first, [&](u64, u64, u64) { ++calls; }, [](u64, u64) {});
+    registry.AddListener(&second, [&](u64, u64, u64) { ++calls; }, [](u64, u64) {});
+    registry.MapAt(0x1000, 0x1000, 0x1000);
+    registry.RemoveListener(&first);
+    registry.MapAt(0x2000, 0x2000, 0x1000);
+    registry.RemoveListener(&second);
+    REQUIRE(calls == 3);
 }

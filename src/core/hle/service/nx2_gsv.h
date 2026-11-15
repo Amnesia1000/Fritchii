@@ -411,6 +411,17 @@ public:
         if (m_reserve_thread.joinable()) {
             m_reserve_thread.join();
         }
+        // The reserve's blocks were never handed to the GPU: unmap and free them (a title that
+        // opens nx2:gpu again would otherwise keep them mapped in its alias code region).
+        for (auto& backing : m_reserve) {
+            if (auto* const process = system.ApplicationProcess(); process != nullptr) {
+                process->GetPageTable().UnmapPageGroup(Common::ProcessAddress{backing.address},
+                                                       *backing.pages,
+                                                       Kernel::KMemoryState::IoMemory);
+            }
+            backing.pages->Close(system.Kernel());
+        }
+        m_reserve.clear();
         for (auto* event : m_events) {
             if (event != nullptr) {
                 m_context.CloseEvent(event);
@@ -705,6 +716,24 @@ private:
             const Nvidia::Devices::Nx2GpuMemoryRegistry::DeferScope defer; // as in 102
             std::scoped_lock lk{m_region_mutex};
             freed = TakeReleasedRegions();
+            // A region created again at the same start (Mario Kart World walks 300 MB -> 600 MB
+            // -> 1 GB on one address): destroy the old one here first, as 215 would. Left in
+            // place, its blocks stayed registered at start + k * 4 MiB and the GPU back's next
+            // write to block k released them itself (RegisterGpuOnlyBacking), making ordered
+            // registry calls that can wait for a guest thread blocked on the full GPU queue.
+            u64 old_size = 0;
+            if (const auto it = m_sparse_regions.find(start); it != m_sparse_regions.end()) {
+                old_size = it->second.size;
+            } else if (const auto range = m_gpu_only_ranges.find(start);
+                       range != m_gpu_only_ranges.end()) {
+                old_size = range->second;
+            }
+            if (old_size != 0) {
+                LOG_INFO(Service, "nx2:gpu 214 region at {:#x} created again ({:#x} -> {:#x} bytes): "
+                                  "the old one is destroyed first",
+                         start, old_size, size);
+                DestroyRegionLocked(start, start + old_size - 1);
+            }
             if ((w[7] & SparseRegionFlag) == 0) {
                 m_gpu_only_ranges[start] = size; // kept out of 216, however it is backed
             }
@@ -771,6 +800,19 @@ private:
         const Nvidia::Devices::Nx2GpuMemoryRegistry::DeferScope defer; // as in 102
         std::scoped_lock lk{m_region_mutex};
         freed = TakeReleasedRegions();
+        DestroyRegionLocked(first, last);
+        // Behind the unmaps above, outside m_region_mutex.
+        Nvidia::Devices::Nx2GpuMemoryRegistry::Defer([this, slot = w[8]] { SignalAfterGpu(slot); });
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    // 215's work for [first, last] (last inclusive): drops the region's GPU mapping, its tiles and
+    // its backing (all of it, or the blocks a sparse region got as it was written), the backing's
+    // pages once the GPU thread is past it. Needs m_region_mutex and runs on the service thread
+    // inside a DeferScope: the registry calls are ordered and wait for earlier ones, so they must
+    // never run on a GPU thread or under m_region_mutex (they are held back to the scope's end).
+    void DestroyRegionLocked(u64 first, u64 last) {
         if (m_gpu_only_ranges.erase(first) != 0 && last > first) {
             DropGpuOnlyTiles(first, last - first + 1, false);
             m_shared_regions.erase(first);
@@ -787,7 +829,6 @@ private:
             } else {
                 Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Unmap(first, last - first + 1);
             }
-            // The region's backing: all of it, or the blocks a sparse region got as it was written.
             std::shared_ptr<std::atomic<bool>> done;
             for (auto region = m_gpu_only_regions.lower_bound(first);
                  region != m_gpu_only_regions.end() && region->first <= last;) {
@@ -808,10 +849,6 @@ private:
                 region = m_gpu_only_regions.erase(region);
             }
         }
-        // Behind the unmaps above, outside m_region_mutex.
-        Nvidia::Devices::Nx2GpuMemoryRegistry::Defer([this, slot = w[8]] { SignalAfterGpu(slot); });
-        IPC::ResponseBuilder rb{ctx, 2};
-        rb.Push(ResultSuccess);
     }
 
     // Sub 216 (nn::gpu::sdk::ExecuteSparseMapRequests, behind nvnMemoryPoolMapVirtual and NvRm's
@@ -942,14 +979,29 @@ private:
     }
 
     // Records a mapped backing for the region at gpu_address. Needs m_region_mutex.
-    void RegisterGpuOnlyBacking(u64 gpu_address, MappedBacking&& backing) {
+    // `on_gpu_thread`: BackSparseWrite's call, which must make no ordered registry call.
+    void RegisterGpuOnlyBacking(u64 gpu_address, MappedBacking&& backing,
+                                bool on_gpu_thread = false) {
         // A title may create the same region again from the same start with a different size
         // (Mario Kart World walks 300 MB -> 600 MB -> 1 GB on the same address). Overwriting the
         // entry used to drop the previous mapping without undoing it: the backing stayed mapped
         // in the alias code region and its pages never went back to the pool, so the GPU-only
         // total grew without bound (250 MiB -> 6.5 GiB in one session) until the process died.
         // Release the old backing the same way 215 does, i.e. only once the GPU thread is past it.
-        if (const auto it = m_gpu_only_regions.find(gpu_address); it != m_gpu_only_regions.end()) {
+        if (const auto it = m_gpu_only_regions.find(gpu_address);
+            it != m_gpu_only_regions.end() && on_gpu_thread) {
+            // 214 destroys a region created again at the same start first, so a block's address
+            // is never registered twice. If it still is: the ordered registry calls below could
+            // wait for a guest thread that waits for this GPU thread. Keep the old backing mapped
+            // and out of the pool (a leak, logged) rather than risk that.
+            if (static std::atomic_flag logged; !logged.test_and_set(std::memory_order_relaxed)) {
+                LOG_ERROR(Service, "nx2:gpu sparse block {:#x} backed twice; its old backing "
+                                   "({:#x} bytes) is kept",
+                          gpu_address, it->second.size);
+            }
+            m_orphaned_backings.push_back(std::move(it->second));
+            m_gpu_only_regions.erase(it);
+        } else if (it != m_gpu_only_regions.end()) {
             Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Unmap(gpu_address, it->second.size);
             Nvidia::Devices::Nx2GpuMemoryRegistry::Get().ReleaseBacking(it->second.cpu_address,
                                                                         it->second.size);
@@ -958,7 +1010,7 @@ private:
             Nvidia::Devices::Nx2GpuMemoryRegistry::Defer([this, done] {
                 system.GPU().RunInOrder([done] { done->store(true, std::memory_order_release); });
             });
-            m_gpu_only_bytes -= it->second.size;
+            // Counted out by FreeBackings once its pages are freed.
             m_released_regions.push_back({std::move(it->second), done});
             m_gpu_only_regions.erase(it);
         }
@@ -1085,7 +1137,7 @@ private:
                     const u64 block_address = start + block * SparseBlockSize;
                     const u64 address = backing->address;
                     it->second.blocks[block] = BlockBacked;
-                    RegisterGpuOnlyBacking(block_address, std::move(*backing));
+                    RegisterGpuOnlyBacking(block_address, std::move(*backing), true);
                     Nvidia::Devices::Nx2GpuMemoryRegistry::Get().BackSparse(block_address, address,
                                                                             block_size);
                     Tegra::Nx2SparseBlockWritten(start, block);
@@ -1564,6 +1616,8 @@ private:
     u64 m_gpu_only_tile_max{};   ///< Largest such tile, bounds the search
     u64 m_gpu_only_tile_bytes{}; ///< GPU-only region memory the game maps right now
     std::vector<ReleasedRegion> m_released_regions;
+    /// Backings a GPU thread found registered twice (RegisterGpuOnlyBacking): kept, never freed.
+    std::vector<GpuOnlyRegion> m_orphaned_backings;
 
     // Takes the destroyed regions the GPU thread is done with. Needs m_region_mutex; FreeBackings
     // returns their pages to the kernel without it (the GPU threads take m_region_mutex, and the

@@ -188,7 +188,7 @@ void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
     DAddr device_address{};
     bool fresh = false; ///< Mapped to the current pages just now
     std::optional<Core::Asid> asid{};
-    Kernel::KProcess* process_owner{};
+    std::shared_ptr<Kernel::KScopedAutoObject<Kernel::KProcess>> process{};
     {
         std::scoped_lock lock(mutex);
         auto* session = container.GetSession(nx2_session);
@@ -236,7 +236,12 @@ void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
         nx2_device_ranges[{cpu_address, size}] = range;
         Nx2GpuMemoryRegistry::Get().RecordDeviceRange(cpu_address, size, device_address);
         asid = session->asid;
-        process_owner = session->process; // used after the unlock; the session may be gone by then
+        // Opened under `mutex`, while the session (and so its process) is known to be alive: the
+        // queued refresh below runs after the unlock, when the session may be gone.
+        if (!fresh) {
+            process = std::make_shared<Kernel::KScopedAutoObject<Kernel::KProcess>>(
+                system.Kernel(), session->process);
+        }
     }
     // On the GPU thread, like unmaps: a GMMU map takes the texture cache lock, and the callers hold
     // nx2:gpu locks that the GPU thread takes under that lock (sparse blocks backed on write).
@@ -244,9 +249,6 @@ void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
     // has now (Nx2RefreshBacking).
     // Outside `mutex`: MapInOrder waits for the GPU thread, which reaches back into this address
     // space (Nx2BackSparse) and would wait for `mutex`.
-    auto process = fresh ? nullptr
-                         : std::make_shared<Kernel::KScopedAutoObject<Kernel::KProcess>>(
-                               system.Kernel(), process_owner);
     system.GPU().MapInOrder(
         gpu_address, size,
         [gmmu = gmmu.get(), &smmu = system.Host1x().MemoryManager(), process = std::move(process),
@@ -366,6 +368,13 @@ void nvhost_as_gpu::Nx2Sparse(u64 gpu_address, u64 size, bool create) {
         });
     LOG_DEBUG(Service_NVDRV, "Switch 2 sparse region {:#x}+{:#x} -> device {:#x}", gpu_address,
               size, device_address);
+    // Blocks the GPU threads gave memory before this region was set up here (BackSparse reached
+    // this address space after nx2:gpu recorded the region but before this call, or before this
+    // address space's replay): map them now. Later ones find the region in Nx2BackSparse.
+    for (const auto& [block_gpu, block_cpu, block_size] :
+         Nx2GpuMemoryRegistry::Get().SparseBacksIn(gpu_address, size)) {
+        Nx2BackSparse(block_gpu, block_cpu, block_size);
+    }
 }
 
 void nvhost_as_gpu::Nx2BackSparse(u64 gpu_address, u64 cpu_address, u64 size) {

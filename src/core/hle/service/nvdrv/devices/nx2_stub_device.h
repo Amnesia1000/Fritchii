@@ -223,6 +223,7 @@ public:
         {
             std::scoped_lock lk{mutex};
             sparse_regions[gpu_address] = size;
+            EraseSparseBacks(gpu_address, size);
             Collect(notification, &Listeners::sparse, gpu_address, size, true);
             Seal(notification);
         }
@@ -234,6 +235,7 @@ public:
         {
             std::scoped_lock lk{mutex};
             sparse_regions.erase(gpu_address);
+            EraseSparseBacks(gpu_address, size);
             Collect(notification, &Listeners::sparse, gpu_address, size, false);
             Seal(notification);
         }
@@ -244,14 +246,34 @@ public:
     // ticket order and never held back, so the back never waits for a guest thread's turn. The
     // region it backs was created (and its creation delivered) before the guest could submit the
     // work that writes into it.
+    // Also recorded: a listener whose sparse region is not set up yet when this reaches it (its
+    // CreateSparse call still on its way, after the creating thread's unlock, or a new address
+    // space between AddListener and its replay) applies the block when the region is set up
+    // (SparseBacksIn, nvhost_as_gpu::Nx2Sparse).
     void BackSparse(u64 gpu_address, u64 cpu_address, u64 size) {
         Notification notification;
         {
             std::scoped_lock lk{mutex};
-            Collect(notification, &Listeners::back, gpu_address, cpu_address, size);
+            EraseSparseBacks(gpu_address, size);
+            if (cpu_address != 0) {
+                sparse_backs[gpu_address] = {cpu_address, size};
+            }
+            CollectOwned(notification, &Listeners::back, gpu_address, cpu_address, size);
             Count(notification);
         }
         Run(notification, false);
+    }
+
+    /// The blocks BackSparse gave memory inside [gpu_address, +size), as (GPU address, CPU
+    /// address, size), for a listener setting the region up.
+    std::vector<std::tuple<u64, u64, u64>> SparseBacksIn(u64 gpu_address, u64 size) {
+        std::vector<std::tuple<u64, u64, u64>> backs;
+        std::scoped_lock lk{mutex};
+        for (auto it = sparse_backs.lower_bound(gpu_address);
+             it != sparse_backs.end() && it->first - gpu_address < size; ++it) {
+            backs.emplace_back(it->first, it->second.first, it->second.second);
+        }
+        return backs;
     }
 
     // nx2:gpu 216 (sparse map requests): the tile [gpu_address, +size) of a sparse region now
@@ -259,6 +281,11 @@ public:
     // cpu_address 0 it is unmapped and reads zero. The GPU mapping stays as it is; only the
     // region's device pages change, in GPU-thread order.
     void MapSparseTile(u64 gpu_address, u64 cpu_address, u64 size) {
+        {
+            // The tile now decides what the range shows: no recorded block applies there.
+            std::scoped_lock lk{mutex};
+            EraseSparseBacks(gpu_address, size);
+        }
         NotifyListeners(&Listeners::tile, gpu_address, cpu_address, size);
     }
 
@@ -302,15 +329,23 @@ public:
     }
 
     void RemoveListener(const void* owner) {
+        u64 stop{};
         {
             std::scoped_lock lk{mutex};
             listeners.erase(owner);
+            stop = next_ticket; // every ordered call copied for the owner has a ticket before it
         }
-        // The notifications run outside `mutex`: wait for any copied listener call of this owner
-        // (or another) still in flight or waiting for its turn before returning, so the owner's
-        // destructor, which calls this, cannot destroy the object a callback captures.
+        // The notifications run outside `mutex`: wait for the owner's copied calls still in
+        // flight or waiting for their turn before returning, so the owner's destructor, which
+        // calls this, cannot destroy the object a callback captures. Ordered calls copied before
+        // the erase all have tickets before `stop`; unordered ones (BackSparse) are counted per
+        // owner. Calls of other owners made later are not waited for.
         std::unique_lock lk{notify_mutex};
-        notify_cv.wait(lk, [this] { return active_notifications == 0; });
+        notify_cv.wait(lk, [this, owner, stop] {
+            const auto it = unordered_in_flight.find(owner);
+            return delivered_ticket >= stop && (it == unordered_in_flight.end() || it->second == 0);
+        });
+        unordered_in_flight.erase(owner);
     }
 
     // A new emulation session starts: forget the previous game's mappings and device ranges (its
@@ -324,6 +359,7 @@ public:
         std::scoped_lock lk{mutex};
         mappings.clear();
         sparse_regions.clear();
+        sparse_backs.clear();
     }
 
     // Device (SMMU) range of a mapping outside the heap, shared by every address space of one
@@ -469,6 +505,8 @@ private:
     std::mutex mutex;
     std::vector<Mapping> mappings;
     std::map<u64, u64> sparse_regions; ///< GPU address -> size
+    /// Sparse blocks BackSparse gave memory: GPU address -> (CPU address, size)
+    std::map<u64, std::pair<u64, u64>> sparse_backs;
     std::map<const void*, Listeners> listeners;
 
     /// Listener calls copied under `mutex` for one change, made after it is released.
@@ -476,6 +514,8 @@ private:
         Nx2GpuMemoryRegistry* registry{}; ///< Null: Defer work, ordered only within its thread
         u64 ticket{};
         std::vector<std::function<void()>> calls;
+        size_t counted{};                 ///< Calls counted in flight (Count)
+        std::vector<const void*> owners;  ///< Unordered calls' owners (CollectOwned)
     };
 
     /// Listener calls a thread holds back (DeferScope), or makes while it is already making
@@ -501,13 +541,43 @@ private:
         }
     }
 
+    // Needs `mutex`. Collect, also noting each call's owner (for unordered calls, which
+    // RemoveListener counts per owner).
+    template <typename Member, typename... Args>
+    void CollectOwned(Notification& notification, Member member, Args... args) {
+        for (auto& [owner, listener] : listeners) {
+            if (auto& fn = listener.*member) {
+                notification.calls.push_back([fn, args...]() { fn(args...); });
+                notification.owners.push_back(owner);
+            }
+        }
+    }
+
     // Needs `mutex`. Counts the calls as in flight: raised while `mutex` is held, so
-    // RemoveListener (which erases its owner under the same mutex and then waits for the count)
-    // can never observe zero between the copy and this increment.
+    // RemoveListener (which erases its owner under the same mutex and then waits) can never
+    // miss a call copied before the erase.
     void Count(Notification& notification) {
         notification.registry = this;
+        notification.counted = notification.calls.size();
         std::scoped_lock notify_lk{notify_mutex};
-        active_notifications += notification.calls.size();
+        active_notifications += notification.counted;
+        for (const void* owner : notification.owners) {
+            ++unordered_in_flight[owner];
+        }
+    }
+
+    // Needs `mutex`. Drops the recorded sparse blocks overlapping [gpu_address, +size).
+    void EraseSparseBacks(u64 gpu_address, u64 size) {
+        auto it = sparse_backs.lower_bound(gpu_address);
+        if (it != sparse_backs.begin()) {
+            const auto previous = std::prev(it);
+            if (previous->first + previous->second.second > gpu_address) {
+                it = previous;
+            }
+        }
+        while (it != sparse_backs.end() && it->first < gpu_address + size) {
+            it = sparse_backs.erase(it);
+        }
     }
 
     // Needs `mutex`. Counts the calls and orders them after every change made before this one.
@@ -533,43 +603,69 @@ private:
 
     static void FlushThisThread() {
         auto& local = ThisThread();
+        struct DepthGuard {
+            ThreadState& local;
+            ~DepthGuard() {
+                --local.depth;
+            }
+        } depth_guard{local};
         ++local.depth; // listener calls made from these calls queue behind them
-        while (!local.pending.empty()) {
-            Notification notification = std::move(local.pending.front());
-            local.pending.pop_front();
-            if (notification.registry != nullptr) {
-                notification.registry->Run(notification, true);
-            } else {
-                for (auto& call : notification.calls) {
-                    call();
+        try {
+            while (!local.pending.empty()) {
+                Notification notification = std::move(local.pending.front());
+                local.pending.pop_front();
+                if (notification.registry != nullptr) {
+                    notification.registry->Run(notification, true);
+                } else {
+                    for (auto& call : notification.calls) {
+                        call();
+                    }
                 }
             }
+        } catch (...) {
+            // The sealed tickets still pending would never be delivered, and every later ordered
+            // call on every thread (the registry outlives the game) would wait for them forever:
+            // give up their turns without making their calls, then pass the exception on.
+            while (!local.pending.empty()) {
+                Notification notification = std::move(local.pending.front());
+                local.pending.pop_front();
+                if (notification.registry != nullptr) {
+                    notification.registry->Run(notification, true, false);
+                }
+            }
+            throw;
         }
-        --local.depth;
     }
 
-    // Makes the calls, after every earlier ticket's when `ordered`, then gives up the turn and
-    // the in-flight count even if a call throws.
-    void Run(Notification& notification, bool ordered) {
+    // Makes the calls (unless `make_calls` is false: a turn given up), after every earlier
+    // ticket's when `ordered`, then gives up the turn and the in-flight counts even if a call
+    // throws.
+    void Run(Notification& notification, bool ordered, bool make_calls = true) {
         if (ordered) {
             std::unique_lock lk{notify_mutex};
             notify_cv.wait(lk, [&] { return delivered_ticket == notification.ticket; });
         }
         struct Done {
             Nx2GpuMemoryRegistry& self;
-            size_t count;
+            const Notification& notification;
             bool advance;
             ~Done() {
                 {
                     std::scoped_lock lk{self.notify_mutex};
-                    self.active_notifications -= count;
+                    self.active_notifications -= notification.counted;
+                    for (const void* owner : notification.owners) {
+                        --self.unordered_in_flight[owner];
+                    }
                     if (advance) {
                         ++self.delivered_ticket;
                     }
                 }
                 self.notify_cv.notify_all();
             }
-        } done{*this, notification.calls.size(), ordered};
+        } done{*this, notification, ordered};
+        if (!make_calls) {
+            return;
+        }
         for (auto& call : notification.calls) {
             call();
         }
@@ -591,8 +687,10 @@ private:
 
     std::mutex notify_mutex;
     std::condition_variable notify_cv;
-    /// Copied listener calls in flight or waiting for their turn; see RemoveListener.
+    /// Copied listener calls in flight or waiting for their turn.
     size_t active_notifications = 0;
+    /// Unordered calls (BackSparse) in flight per owner; see RemoveListener.
+    std::map<const void*, size_t> unordered_in_flight;
     u64 delivered_ticket = 0; ///< Tickets before it are delivered
 };
 

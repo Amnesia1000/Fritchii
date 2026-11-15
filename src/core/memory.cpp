@@ -1072,7 +1072,8 @@ struct Memory::Impl {
     /// FRITCHII_WRITE_REMARK: read before a write marks its pages (HandleRasterizerWrite), for
     /// NoteStoredWrite.
     [[nodiscard]] static u64 TrackedGeneration() noexcept {
-        return Core::g_pages_tracked_generation.load(std::memory_order_relaxed);
+        // Acquire: stays before the mark whatever ordering the mark itself has (free on x86).
+        return Core::g_pages_tracked_generation.load(std::memory_order_acquire);
     }
 
     /// FRITCHII_WRITE_REMARK (live, default 1; port of zortos293/Lichii #1829): after a write that
