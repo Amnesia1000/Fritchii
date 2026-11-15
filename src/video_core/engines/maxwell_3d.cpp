@@ -5603,11 +5603,25 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                 if (!split.NotedWriteSince(since, *device, read_bytes)) {
                     return false;
                 }
+                // FRITCHII_NOTED_OVERFLOW 2 and 3: a table-overflow write answer the note chains
+                // prove clean. What this read does next (the ran-reads check, timed 1 in 64, or
+                // the drain) is what 1 would spare. Off: one plain load.
+                const bool overflow_no = split.TakeNotedOverflowNo(since, *device);
                 if (ran_mode == 0) {
+                    if (overflow_no) [[unlikely]] {
+                        split.NoteOverflowAfter(false, false, false, 0);
+                    }
                     return true;
                 }
+                const bool after_timed = overflow_no && split.TimeNotedOverflowAfter();
+                const u64 after_t0 = after_timed ? VideoCommon::Nx2Profile::Ticks() : 0;
                 const auto outcome = RanReadCheck(split, *rasterizer, since, *device, read_bytes,
                                                   first_page == last_page);
+                if (overflow_no) [[unlikely]] {
+                    split.NoteOverflowAfter(
+                        true, outcome == RanReadStats::Served, after_timed,
+                        after_timed ? VideoCommon::Nx2Profile::Ticks() - after_t0 : 0);
+                }
                 ++g_ran_reads.outcomes[outcome];
                 if (outcome != RanReadStats::Served) {
                     return true;

@@ -656,6 +656,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_NOTED_FAST") {
         return &g_noted_fast;
     }
+    if (name == "FRITCHII_NOTED_OVERFLOW") {
+        return &g_noted_overflow;
+    }
     if (name == "FRITCHII_STEP_LEAN") {
         return &g_step_lean;
     }

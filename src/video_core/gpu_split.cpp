@@ -2024,11 +2024,15 @@ void GpuSplit::LinkNotedFast(u64 seq) {
     const PendingWrite& write = pending_writes[slot];
     ++fast.stats.linked;
     u64* head = nullptr;
+    u64* head_position = nullptr;
     if (write.end == write.begin ||
         (write.end > write.begin && (write.begin >> 12) == ((write.end - 1) >> 12))) {
-        head = &fast.heads[NotedBucket(write.begin >> 12)];
+        const size_t bucket = NotedBucket(write.begin >> 12);
+        head = &fast.heads[bucket];
+        head_position = &fast.head_positions[bucket];
     } else {
         head = &fast.wide_head;
+        head_position = &fast.wide_head_position;
         ++fast.stats.linked_wide;
         if (write.end == ~u64{0}) {
             ++fast.stats.linked_unknown;
@@ -2047,16 +2051,31 @@ void GpuSplit::LinkNotedFast(u64 seq) {
     // notes over the same bytes (a report slot each frame, unknown ranges, an upload noted again
     // by each of its words) keep their chain one note long.
     u64 link = *head;
+    u64 link_position = *head_position; // FRITCHII_NOTED_OVERFLOW: the linked note's position
     if (link != 0 && link + PendingWriteSlots > seq + 1) { // the head is still remembered
         const size_t head_slot = static_cast<size_t>((link - 1) % PendingWriteSlots);
         const PendingWrite& covered = pending_writes[head_slot];
         if (write.begin <= covered.begin && covered.end <= write.end) {
             link = fast.links[head_slot];
+            link_position = fast.link_positions[head_slot];
             ++fast.stats.linked_covered;
         }
     }
     fast.links[slot] = link;
+    fast.link_positions[slot] = link_position;
     *head = seq + 1;
+    *head_position = write.position;
+    // FRITCHII_NOTED_OVERFLOW=2: verify's shadow holds every note linked since it started.
+    auto& overflow = noted_overflow;
+    if (overflow.shadow_live) [[unlikely]] {
+        if (VideoCore::Nx2Debug::g_noted_overflow.load(std::memory_order_relaxed) != 2 ||
+            overflow.shadow_floor != fast.floor) {
+            overflow.shadow_live = false; // Restarted by the next verify check.
+        } else {
+            overflow.shadow[static_cast<size_t>(seq % NotedShadowSlots)] = {
+                write.begin, write.end, write.position};
+        }
+    }
 }
 
 GpuSplit::NotedFastAnswer GpuSplit::NotedFastLookup(u64 since, u64 begin, u64 size,
@@ -2110,6 +2129,189 @@ GpuSplit::NotedFastAnswer GpuSplit::NotedFastLookup(u64 since, u64 begin, u64 si
     return NotedFastAnswer::No;
 }
 
+// FRITCHII_NOTED_OVERFLOW (live, default 0; F7, needs FRITCHII_NOTED_FAST 1 to 3): at the Castle
+// Town market ~98% of the chain checks (~46,000 a second, the front DMA reads' page snapshots) end
+// in the table's overflow: the snapshot is older than the oldest of the 8,192 remembered notes,
+// so a forgotten note may overlap the read and the answer is "write" without a chain looked at.
+// The ran-reads check after it then serves most of those reads anyway (~36,000 a second).
+//
+// The chains can answer most of them exactly: each link and head also keeps the position of the
+// note it names (link_positions, head_positions), so a chain knows how far back it reaches after
+// the table forgot the note. With the table overflowed every remembered note is after `since`.
+// Walking the wide chain and the read's page buckets from their heads, with the walk's own overlap
+// test on every remembered note:
+// - a remembered note at or before `since` (none, here, but kept as in the lookup), or a link to
+//   a forgotten note (number below the oldest remembered; 0 = none, position 0) whose kept
+//   position is at or before `since`, ends the chain clean: positions never rise along a chain
+//   (they never fall along the table, see NOTED_FAST above), so every older member, remembered or
+//   not, is at or before `since`. A note passed over because a newer one covers its bytes lies
+//   between two members: it is covered by the newer member (visited, or itself proved at or
+//   before `since`), or is older than the older one.
+// - a forgotten link whose kept position is after `since`: unknown, the answer stays "write"
+//   (Forgotten). So does a check where notes made before the chains went live may be after
+//   `since` (the floor note remembered, or `floor_position`, the newest of them, after it), and a
+//   read over 16 pages or wrapping.
+// - every note that can overlap the read sits in one of these chains (as for the lookup above).
+// So No is exact: no note sent after `since`, remembered or forgotten, overlaps the read. The
+// only conservative parts are the Forgotten / Floor / Long answers, which stay a write.
+//
+// 1 = on: a proved answer is "no write" at FRITCHII_NOTED_FAST=1 (at 2 and 3 the walk answers);
+// 2 = verify: every proved answer is checked against the table (the walk: a remembered note
+// overlapping the read, must be 0) and 1 in 16 against the shadow, the last 65,536 notes'
+// ranges (a note the table forgot after `since` overlapping it, must be 0; "too short" when the
+// shadow does not reach back to `since`); 3 = dry: counted, the chain walk timed 1 in 64, and the
+// front DMA read's ran-reads check after a proved answer counted and timed 1 in 64 (what 1 would
+// spare). Line every 10 s "Noted overflow (FRITCHII_NOTED_OVERFLOW=N)".
+GpuSplit::NotedOverflowAnswer GpuSplit::NotedOverflowLookup(u64 since, u64 begin, u64 size,
+                                                            u64& touched) const {
+    const auto& fast = noted_fast;
+    // The caller saw the table full: the oldest remembered note's number.
+    const u64 oldest = pending_write_count - PendingWriteSlots;
+    if (fast.floor > oldest || fast.floor_position > since) {
+        return NotedOverflowAnswer::Floor;
+    }
+    const u64 end = begin + size;
+    if (end < begin) {
+        return NotedOverflowAnswer::Long;
+    }
+    const u64 first = begin >> 12;
+    const u64 last = (begin + (std::max<u64>)(size, 1) - 1) >> 12;
+    if (last - first >= NotedMaxPages) {
+        return NotedOverflowAnswer::Long;
+    }
+    enum class Chain : u8 { Clean, Overlap, Forgotten };
+    const auto walk = [&](u64 link, u64 link_position) {
+        while (link > oldest) {
+            const size_t slot = static_cast<size_t>((link - 1) % PendingWriteSlots);
+            const PendingWrite& write = pending_writes[slot];
+            if (write.position <= since) {
+                return Chain::Clean;
+            }
+            ++touched;
+            if (write.begin < end && begin < write.end) {
+                return Chain::Overlap;
+            }
+            link = fast.links[slot];
+            link_position = fast.link_positions[slot];
+        }
+        // A forgotten note, or none (link 0, position 0).
+        return link_position <= since ? Chain::Clean : Chain::Forgotten;
+    };
+    switch (walk(fast.wide_head, fast.wide_head_position)) {
+    case Chain::Clean:
+        break;
+    case Chain::Overlap:
+        return NotedOverflowAnswer::Overlap;
+    case Chain::Forgotten:
+        return NotedOverflowAnswer::ForgottenWide;
+    }
+    for (u64 page = first; page <= last; ++page) {
+        const size_t bucket = NotedBucket(page);
+        switch (walk(fast.heads[bucket], fast.head_positions[bucket])) {
+        case Chain::Clean:
+            break;
+        case Chain::Overlap:
+            return NotedOverflowAnswer::Overlap;
+        case Chain::Forgotten:
+            return NotedOverflowAnswer::Forgotten;
+        }
+    }
+    return NotedOverflowAnswer::No;
+}
+
+bool GpuSplit::NotedOverflowCheck(int mode, u64 since, u64 begin, u64 size) const {
+    auto& overflow = noted_overflow;
+    auto& s = overflow.stats;
+    if (overflow.window_ns == 0) {
+        overflow.window_ns = Common::Nx2Hitch::NowNs();
+        overflow.window_ticks = Nx2Profile::Ticks();
+        s.checks = noted_fast.stats.checks;
+        overflow.logged = s;
+    }
+    const u32 call = ++overflow.calls;
+    if ((call & 1023) == 0) {
+        LogNotedOverflow(mode);
+    }
+    if (mode == 2 && !overflow.shadow_live) {
+        // Verify's shadow starts with the next note (LinkNotedFast fills it).
+        if (!overflow.shadow) {
+            overflow.shadow = std::make_unique<NotedShadowNote[]>(NotedShadowSlots);
+        }
+        overflow.shadow_live = true;
+        overflow.shadow_start = pending_write_count;
+        overflow.shadow_floor = noted_fast.floor;
+    }
+    const bool timed = (call & 63) == 0;
+    const u64 t0 = timed ? Nx2Profile::Ticks() : 0;
+    u64 touched = 0;
+    const NotedOverflowAnswer answer = NotedOverflowLookup(since, begin, size, touched);
+    if (timed) {
+        ++s.timed;
+        s.chain_ticks += Nx2Profile::Ticks() - t0;
+    }
+    ++s.overflow;
+    s.touched += touched;
+    switch (answer) {
+    case NotedOverflowAnswer::No:
+        ++s.proved_no;
+        if (mode == 2 && (++overflow.verify_calls & 15) == 0) {
+            VerifyNotedOverflowShadow(since, begin, size);
+        }
+        return true;
+    case NotedOverflowAnswer::Overlap:
+        ++s.overlap;
+        break;
+    case NotedOverflowAnswer::ForgottenWide:
+        ++s.forgotten_wide;
+        [[fallthrough]];
+    case NotedOverflowAnswer::Forgotten:
+        ++s.forgotten;
+        break;
+    case NotedOverflowAnswer::Floor:
+        ++s.floor;
+        break;
+    case NotedOverflowAnswer::Long:
+        ++s.long_reads;
+        break;
+    }
+    return false;
+}
+
+void GpuSplit::VerifyNotedOverflowShadow(u64 since, u64 begin, u64 size) const {
+    auto& overflow = noted_overflow;
+    auto& s = overflow.stats;
+    if (!overflow.shadow_live || !overflow.shadow) {
+        return;
+    }
+    ++s.shadow_checked;
+    const u64 count = pending_write_count;
+    const u64 first = (std::max<u64>)(
+        overflow.shadow_start, count > NotedShadowSlots ? count - NotedShadowSlots : 0);
+    const u64 end = begin + size;
+    for (u64 seq = count; seq > first; --seq) {
+        const NotedShadowNote& note = overflow.shadow[static_cast<size_t>((seq - 1) %
+                                                                          NotedShadowSlots)];
+        if (note.position <= since) {
+            return; // Every older note is at or before `since`: checked.
+        }
+        if (note.begin < end && begin < note.end) {
+            ++s.shadow_differ;
+            if (overflow.session_differ++ < 16) {
+                LOG_WARNING(HW_GPU,
+                            "NotedOverflowDiffer (FRITCHII_NOTED_OVERFLOW=2, must be 0): the "
+                            "chains prove no write over {:#x}+{:#x} since {}, the shadow holds "
+                            "note {} ({:#x}..{:#x} at {}) over it (oldest remembered {})",
+                            begin, size, since, seq - 1, note.begin, note.end, note.position,
+                            count - PendingWriteSlots);
+            }
+            return;
+        }
+    }
+    if (first != 0) {
+        ++s.shadow_short; // Notes before the shadow may be after `since`: not checked.
+    }
+}
+
 bool GpuSplit::NotedWriteSinceFast(u64 since, u64 begin, u64 size) const {
     namespace Debug = VideoCore::Nx2Debug;
     const int mode = Debug::SwitchValue(Debug::g_noted_fast, "FRITCHII_NOTED_FAST");
@@ -2126,7 +2328,14 @@ bool GpuSplit::NotedWriteSinceFast(u64 since, u64 begin, u64 size) const {
         // Notes sent so far are in no chain: from here on every note is linked.
         fast.heads.fill(0);
         fast.wide_head = 0;
+        fast.head_positions.fill(0);
+        fast.wide_head_position = 0;
         fast.floor = pending_write_count;
+        fast.floor_position =
+            fast.floor != 0
+                ? pending_writes[static_cast<size_t>((fast.floor - 1) % PendingWriteSlots)].position
+                : 0;
+        noted_overflow.shadow_live = false; // FRITCHII_NOTED_OVERFLOW=2: starts again
         fast.live = true;
         fast.window_ns = Common::Nx2Hitch::NowNs();
         fast.window_ticks = Nx2Profile::Ticks();
@@ -2144,13 +2353,34 @@ bool GpuSplit::NotedWriteSinceFast(u64 since, u64 begin, u64 size) const {
     const u64 t1 = timed ? Nx2Profile::Ticks() : 0;
     const bool answered = answer == NotedFastAnswer::No || answer == NotedFastAnswer::Yes ||
                           answer == NotedFastAnswer::Overflow;
-    const bool fast_write = answer == NotedFastAnswer::Yes || answer == NotedFastAnswer::Overflow;
+    // FRITCHII_NOTED_OVERFLOW (F7): an overflow answer the chains prove clean. Off: one relaxed
+    // load and a branch on overflow answers only.
+    int overflow_mode = 0;
+    bool proved_no = false;
+    if (answer == NotedFastAnswer::Overflow) {
+        overflow_mode = Debug::SwitchValue(Debug::g_noted_overflow, "FRITCHII_NOTED_OVERFLOW");
+        if (overflow_mode >= 1 && overflow_mode <= 3) [[unlikely]] {
+            proved_no = NotedOverflowCheck(overflow_mode, since, begin, size);
+            if (proved_no && overflow_mode != 1) {
+                // 2 and 3: the answer stays a write; the front DMA read asks
+                // TakeNotedOverflowNo after it and counts what it does next.
+                auto& overflow = noted_overflow;
+                overflow.proved = true;
+                overflow.proved_since = since;
+                overflow.proved_begin = begin;
+            }
+        }
+    }
+    // At 1 a proved answer is "no write"; at 2 and 3 it stays the table's "write".
+    const bool fast_write =
+        answer == NotedFastAnswer::Yes ||
+        (answer == NotedFastAnswer::Overflow && !(proved_no && overflow_mode == 1));
     switch (answer) {
     case NotedFastAnswer::No:
     case NotedFastAnswer::Yes:
         break;
     case NotedFastAnswer::Overflow:
-        ++stats.overflow_yes;
+        stats.overflow_yes += fast_write ? 1 : 0; // a proved answer at FRITCHII_NOTED_OVERFLOW=1: no
         break;
     case NotedFastAnswer::Floor:
         ++stats.floor;
@@ -2165,13 +2395,29 @@ bool GpuSplit::NotedWriteSinceFast(u64 since, u64 begin, u64 size) const {
         if (fast_write) {
             ++stats.answered_yes;
         }
-        if (mode == 1 && !timed) {
+        // FRITCHII_NOTED_OVERFLOW=2 checks every proved answer against the table (the walk).
+        if (mode == 1 && !timed && !(proved_no && overflow_mode == 2)) {
             return fast_write;
         }
     }
     const NotedWalkResult walk = NotedWalk(since, begin, size, scanned);
     const u64 t2 = timed ? Nx2Profile::Ticks() : 0;
     const bool walk_write = walk != NotedWalkResult::None;
+    if (proved_no) [[unlikely]] {
+        // The walk sees only the table: its Overflow is no difference, its Overlap is (a
+        // remembered note after `since` over the read, which the chains must have found).
+        auto& overflow = noted_overflow;
+        if (walk == NotedWalkResult::Overlap) {
+            ++overflow.stats.differ;
+            if (overflow.session_differ++ < 16) {
+                LOG_WARNING(HW_GPU,
+                            "NotedOverflowDiffer (FRITCHII_NOTED_OVERFLOW={}, must be 0): the "
+                            "chains prove no write over {:#x}+{:#x} since {}, the table holds an "
+                            "overlapping note (floor {}, notes {})",
+                            overflow_mode, begin, size, since, fast.floor, pending_write_count);
+            }
+        }
+    }
     if (timed) {
         ++stats.timed;
         stats.fast_ticks += t1 - t0;
@@ -2182,7 +2428,8 @@ bool GpuSplit::NotedWriteSinceFast(u64 since, u64 begin, u64 size) const {
         if (timed) {
             stats.walk_ticks += t2 - t1;
         }
-        if (fast_write != walk_write) [[unlikely]] {
+        if (fast_write != walk_write &&
+            !(proved_no && walk == NotedWalkResult::Overflow)) [[unlikely]] {
             if (stats.differ++ < 16) {
                 LOG_WARNING(HW_GPU,
                             "NotedFastDiffer (FRITCHII_NOTED_FAST={}, must be 0): the chains say "
@@ -2263,6 +2510,72 @@ void GpuSplit::LogNotedFast(int mode) const {
     fast.window_ns = now;
     fast.window_ticks = ticks;
     fast.wide_kinds = {};
+}
+
+void GpuSplit::LogNotedOverflow(int mode) const {
+    auto& overflow = noted_overflow;
+    const u64 now = Common::Nx2Hitch::NowNs();
+    if (now - overflow.window_ns < 10'000'000'000ULL) {
+        return;
+    }
+    const u64 ticks = Nx2Profile::Ticks();
+    NotedOverflowStats& s = overflow.stats;
+    s.checks = noted_fast.stats.checks;
+    const NotedOverflowStats& l = overflow.logged;
+    const double window = static_cast<double>(now - overflow.window_ns) / 1e9;
+    if (window < 60.0) { // Longer: the switch was off in between, start a new window.
+        const double ns_per_tick =
+            static_cast<double>(now - overflow.window_ns) /
+            static_cast<double>((std::max)(ticks - overflow.window_ticks, u64{1}));
+        const auto rate = [window](u64 count) { return static_cast<double>(count) / window; };
+        const u64 overflows = s.overflow - l.overflow;
+        const u64 proved = s.proved_no - l.proved_no;
+        const u64 timed = s.timed - l.timed;
+        const u64 checked_after =
+            (s.after_served - l.after_served) + (s.after_drained - l.after_drained);
+        const u64 after_timed = s.after_timed - l.after_timed;
+        // Sampled 1 in 64, scaled to every overflow answer / every checked read.
+        const double chain_ns =
+            timed != 0 ? static_cast<double>(s.chain_ticks - l.chain_ticks) * ns_per_tick /
+                             static_cast<double>(timed)
+                       : 0.0;
+        const double after_ns =
+            after_timed != 0 ? static_cast<double>(s.after_ticks - l.after_ticks) *
+                                   ns_per_tick / static_cast<double>(after_timed)
+                             : 0.0;
+        LOG_INFO(HW_GPU,
+                 "Noted overflow (FRITCHII_NOTED_OVERFLOW={}) {:.0f} s: checks {:.0f}/s, table "
+                 "overflow {:.0f}/s, chains prove no write {:.0f}/s ({:.0f}%{}); still a write: "
+                 "overlap {:.0f}/s, forgotten note after the snapshot {:.0f}/s (wide chain "
+                 "{:.0f}/s), older than the chains {:.0f}/s, read over 16 pages {:.0f}/s; chain "
+                 "notes looked at {:.1f} an overflow, sampled chain cost {:.2f} ms/s ({:.0f} ns "
+                 "each); front DMA reads after a proved answer {:.0f}/s: ran-reads check served "
+                 "{:.0f}/s, drained {:.0f}/s, no check (drain) {:.0f}/s, sampled ran-reads check "
+                 "cost {:.2f} ms/s ({:.0f} ns each); verify: table differ {}, shadow checked {} "
+                 "differ {} too short {} (differ must be 0, session {})",
+                 mode, window, rate(s.checks - l.checks), rate(overflows), rate(proved),
+                 overflows != 0
+                     ? static_cast<double>(proved) * 100.0 / static_cast<double>(overflows)
+                     : 0.0,
+                 mode == 1 ? ", answered no write" : ", still answered a write",
+                 rate(s.overlap - l.overlap), rate(s.forgotten - l.forgotten),
+                 rate(s.forgotten_wide - l.forgotten_wide), rate(s.floor - l.floor),
+                 rate(s.long_reads - l.long_reads),
+                 overflows != 0 ? static_cast<double>(s.touched - l.touched) /
+                                      static_cast<double>(overflows)
+                                : 0.0,
+                 chain_ns * static_cast<double>(overflows) / 1e6 / window, chain_ns,
+                 rate(s.after_reads - l.after_reads), rate(s.after_served - l.after_served),
+                 rate(s.after_drained - l.after_drained),
+                 rate(s.after_unchecked - l.after_unchecked),
+                 after_ns * static_cast<double>(checked_after) / 1e6 / window, after_ns,
+                 s.differ - l.differ, s.shadow_checked - l.shadow_checked,
+                 s.shadow_differ - l.shadow_differ, s.shadow_short - l.shadow_short,
+                 overflow.session_differ);
+    }
+    overflow.logged = s;
+    overflow.window_ns = now;
+    overflow.window_ticks = ticks;
 }
 
 void GpuSplit::NoteWrite(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size) {

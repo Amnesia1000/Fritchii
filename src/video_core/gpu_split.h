@@ -1219,6 +1219,35 @@ public:
     [[nodiscard]] const NotedSummaryStats& GetNotedSummaryStats() const {
         return noted_summary.stats;
     }
+    /// FRITCHII_NOTED_OVERFLOW 2 and 3 (Maxwell3D::FrontDmaRead, after NotedWriteSince answered a
+    /// write): whether that answer was the table's overflow and the chains prove no noted write
+    /// over the read since `since` (the read starting at `begin`). Clears it. Off: one plain load.
+    [[nodiscard]] bool TakeNotedOverflowNo(u64 since, u64 begin) const {
+        auto& overflow = noted_overflow;
+        if (!overflow.proved) {
+            return false;
+        }
+        overflow.proved = false;
+        return overflow.proved_since == since && overflow.proved_begin == begin;
+    }
+    /// The front DMA read's check after such an answer: whether to time it (1 in 64), then what
+    /// it decided. `checked` false: the ran-reads check is off, the read drains.
+    [[nodiscard]] bool TimeNotedOverflowAfter() const {
+        return (++noted_overflow.after_calls & 63) == 0;
+    }
+    void NoteOverflowAfter(bool checked, bool served, bool timed, u64 ticks) const {
+        auto& s = noted_overflow.stats;
+        ++s.after_reads;
+        if (!checked) {
+            ++s.after_unchecked;
+            return;
+        }
+        ++(served ? s.after_served : s.after_drained);
+        if (timed) {
+            ++s.after_timed;
+            s.after_ticks += ticks;
+        }
+    }
     /// FRITCHII_FRONT_RAN_READS (Maxwell3D::FrontDmaRead): whether the back ran every write noted
     /// over [begin, begin + size) after `since`, that is none of them is past `done` (ConsumedNow,
     /// loaded by the caller before it looks at anything else). The table is in ring order, newest
@@ -1982,8 +2011,84 @@ private:
         std::array<NotedFastKind, 8> wide_kinds{}; ///< the wide notes by `what`, this window
         std::array<u64, NotedChains> heads{};
         std::array<u64, PendingWriteSlots> links{};
+        /// FRITCHII_NOTED_OVERFLOW (F7): the position of the note each link and head names (0
+        /// for none), kept while live whatever the switch, so a chain still knows how far back
+        /// it reaches once the table forgot the note. `floor_position`: the newest note before
+        /// the floor (0 when there was none), the newest position no chain holds.
+        u64 floor_position{};
+        u64 wide_head_position{};
+        std::array<u64, NotedChains> head_positions{};
+        std::array<u64, PendingWriteSlots> link_positions{};
     };
     mutable NotedFast noted_fast;
+    /// FRITCHII_NOTED_OVERFLOW (F7, front only): the overflow answers of NotedWriteSinceFast asked
+    /// of the chains, why the others stay a write, the chain cost (1 in 64 timed), and what the
+    /// front DMA read does after the write answer for the reads the chains proved clean
+    /// (NoteOverflowAfter). Window counts; the differences also as a session total.
+    struct NotedOverflowStats {
+        u64 checks{};         ///< NotedWriteSinceFast checks
+        u64 overflow{};       ///< of them, the table's overflow
+        u64 proved_no{};      ///< of those, the chains prove no noted write since
+        u64 overlap{};        ///< a chain note after `since` overlaps the read
+        u64 forgotten{};      ///< a chain reaches a forgotten note after `since`
+        u64 forgotten_wide{}; ///< of them, in the wide chain
+        u64 floor{};          ///< notes before the chains went live may be after `since`
+        u64 long_reads{};     ///< a read over 16 pages (or wrapping)
+        u64 touched{};        ///< chain notes looked at
+        u64 timed{};          ///< 1 in 64 overflow answers: the chain walk timed
+        u64 chain_ticks{};
+        u64 after_reads{};    ///< front DMA reads with a proved-clean overflow answer
+        u64 after_served{};   ///< of them, the ran-reads check served them anyway
+        u64 after_drained{};  ///< of them, the ran-reads check sent them to the drain
+        u64 after_unchecked{}; ///< of them, no ran-reads check (switch off): a drain
+        u64 after_timed{};    ///< 1 in 64 of the checked ones: the ran-reads check timed
+        u64 after_ticks{};
+        u64 differ{};         ///< verify: proved clean, a remembered note overlaps (must be 0)
+        u64 shadow_checked{}; ///< verify: 1 in 16 proved answers checked against the shadow
+        u64 shadow_differ{};  ///< of them, a shadow note after `since` overlaps (must be 0)
+        u64 shadow_short{};   ///< of them, the shadow does not reach back to `since`
+    };
+    /// Verify's shadow (FRITCHII_NOTED_OVERFLOW=2): the last 65,536 notes' ranges and positions,
+    /// eight times the table, so a proved answer can be checked past the notes the table forgot.
+    struct NotedShadowNote {
+        u64 begin;
+        u64 end;
+        u64 position;
+    };
+    static constexpr size_t NotedShadowSlots = 65536;
+    struct NotedOverflow {
+        u32 calls{};
+        u32 after_calls{};
+        u32 verify_calls{};
+        u64 window_ns{};
+        u64 window_ticks{};
+        NotedOverflowStats stats{};
+        NotedOverflowStats logged{};
+        u64 session_differ{};
+        /// The last check the chains proved clean (for TakeNotedOverflowNo).
+        bool proved{};
+        u64 proved_since{};
+        u64 proved_begin{};
+        /// Verify's shadow: filled by LinkNotedFast while the switch is 2; `shadow_start` is the
+        /// first note it holds (it restarts with the chains' floor).
+        std::unique_ptr<NotedShadowNote[]> shadow;
+        bool shadow_live{};
+        u64 shadow_start{};
+        u64 shadow_floor{};
+    };
+    mutable NotedOverflow noted_overflow;
+    enum class NotedOverflowAnswer : u8 { No, Overlap, Forgotten, ForgottenWide, Floor, Long };
+    /// With the table overflowed (its oldest note after `since`): the chains' answer from the
+    /// wide chain and the read's page buckets. No: no note after `since` overlaps the read, the
+    /// forgotten ones included. Every other answer stays a write.
+    [[nodiscard]] NotedOverflowAnswer NotedOverflowLookup(u64 since, u64 begin, u64 size,
+                                                          u64& touched) const;
+    /// NotedWriteSinceFast's overflow answer with the switch at 1 to 3: the lookup, counted and
+    /// timed; true when the chains prove no noted write.
+    [[nodiscard]] bool NotedOverflowCheck(int mode, u64 since, u64 begin, u64 size) const;
+    /// Verify (FRITCHII_NOTED_OVERFLOW=2) of a proved answer against the shadow.
+    void VerifyNotedOverflowShadow(u64 since, u64 begin, u64 size) const;
+    void LogNotedOverflow(int mode) const;
     /// The note path's half (front, while live): links note number `seq` into its chain.
     void LinkNotedFast(u64 seq);
     /// NotedWriteSince with FRITCHII_NOTED_FAST set: modes 1, 2 and 3 (else the summary or the
