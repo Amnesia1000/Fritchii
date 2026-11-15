@@ -4079,9 +4079,16 @@ void RasterizerVulkan::OneFollowerPostFence(u8 kind, u32 value,
 // - R, at the op: takes the packet by name and runs DispatchCompute's played path on its view of
 //   the compute engine: the texture side (image views, samplers, descriptors), the pipeline bind
 //   and vkCmdDispatch. It takes no buffer cache lock and calls nothing of the buffer cache.
-// - Stays lent (each counted, DispatchCount): indirect dispatches (their arguments may be read
-//   back), dispatches that write an image (the texture cache's write records are R's and E's
-//   dispatch-write records need them), texel buffers, the OoT upscaler passes and the depth
+// - Bit 2: dispatches that write images post too. R resolves and records the written images
+//   (the texture cache's state is R's); E records them for EXP10 as "may write anything" at its
+//   place (their guest ranges are the texture cache's), and E's own texture-side tests already
+//   wait for R or lend (FLUSH_E, INVAL_E's page filter, the read-ahead stamps). Written
+//   byte-addressed images (the packed R16 shadow) stay lent.
+// - Bit 4: indirect dispatches post too. The GPU reads their arguments; E obtains the buffer in
+//   its fill (a section after `before`, played at the packet's rest after Configure, as the
+//   lent path's Ref plays it there) and the packet names it.
+// - Stays lent (each counted, DispatchCount): indirect dispatches and image-writing ones while
+//   their bit is off, texel buffers, the OoT upscaler passes and the depth
 //   reader the replacement keys on, a lookup that is not a plain hit (it may build or retire),
 //   diagnostics, and anything while the view is not seeded. A lent dispatch E looked up already
 //   takes E's pipeline into the lent call (no second lookup, no second run of the hooks).
@@ -4101,6 +4108,9 @@ struct OneFollowerDispatchView {
     std::array<u32, 2> code_loc;
     u32 tex_cb_index;
     u32 native;
+    u64 indirect;       ///< the indirect arguments' GPU address (has_indirect)
+    u32 has_indirect;   ///< bit 4: an indirect dispatch (the packet's `indirect` is its buffer)
+    u32 writes_images;  ///< bit 2: the program writes images (R checks it against Configure)
 };
 static_assert(sizeof(OneFollowerDispatchView) % 8 == 0);
 static_assert(sizeof(Tegra::Engines::KeplerCompute::LaunchParams) ==
@@ -4134,7 +4144,12 @@ bool RasterizerVulkan::OneFollowerPostDispatch() {
         !mem_stage.RingRoom() || buffer_cache.MarksAhead()) {
         return lend(Count::NoRing);
     }
-    if (kepler_compute->GetIndirectComputeAddress()) {
+    const u32 bits = OneF::DispatchPostBits();
+    // Bit 4: an indirect dispatch's arguments are read by the GPU only (DispatchIndirect); this
+    // path reads them on the CPU nowhere (the frame dump's read is a diagnostic, lent above; the
+    // engine's own debug read-back, EDEN_NX2_INDIRECT_GRID=2, ran before this call, on E).
+    const std::optional<GPUVAddr> indirect_address = kepler_compute->GetIndirectComputeAddress();
+    if (indirect_address && (bits & OneF::DispatchPostIndirect) == 0) {
         return lend(Count::Indirect);
     }
     // DispatchCompute's head, E's half: the stream's invalidations before the lookup reads.
@@ -4155,8 +4170,16 @@ bool RasterizerVulkan::OneFollowerPostDispatch() {
     if (facts.has_texel_buffers) {
         return lend_with(Count::TexelBuffers);
     }
-    if (pipeline->WritesImages()) {
-        return lend_with(Count::WritesImage);
+    const bool writes_images = pipeline->WritesImages();
+    if (writes_images) {
+        if ((bits & OneF::DispatchPostImages) == 0) {
+            return lend_with(Count::WritesImage);
+        }
+        // The packed R16 surface path (Configure's byte-addressed shadow) can throw and makes its
+        // own resources: lent.
+        if (pipeline->WritesByteAddressedImages()) {
+            return lend_with(Count::ImageShadow);
+        }
     }
     // DispatchCompute's own OoT upscaler hooks (the replacement, its 3/4-scale pass, the depth
     // reader TryOcarinaUpscale keys on): R's members decide them, lent.
@@ -4186,6 +4209,9 @@ bool RasterizerVulkan::OneFollowerPostDispatch() {
     view.code_loc = {regs.code_loc.address_high, regs.code_loc.address_low};
     view.tex_cb_index = regs.tex_cb_index;
     view.native = kepler_compute->IsNativeMode() ? 1 : 0;
+    view.indirect = indirect_address.value_or(0);
+    view.has_indirect = indirect_address ? 1 : 0;
+    view.writes_images = writes_images ? 1 : 0;
     const u64 position = VideoCommon::GpuSplit::Get().BackEntryPosition();
     u64 number = 0;
     bool list_copies = false;
@@ -4198,7 +4224,8 @@ bool RasterizerVulkan::OneFollowerPostDispatch() {
         // As DispatchCompute: writes to command list pages are noted while the binds mark.
         buffer_cache.Nx2CollectListCopies(true);
         number = mem_stage.FillRingDispatch(buffer_cache, facts, position, onef_dispatch_values,
-                                            null_pointer_handles, &view, sizeof(view));
+                                            null_pointer_handles, &view, sizeof(view),
+                                            indirect_address);
         if (number != 0) {
             list_copies = buffer_cache.Nx2HasListCopyRequests();
             probes = buffer_cache.HasUnrecordedExtentProbes();
@@ -4210,10 +4237,23 @@ bool RasterizerVulkan::OneFollowerPostDispatch() {
     if (number == 0) {
         return lend_with(Count::FillRefused); // nothing filled: the lent call fills
     }
-    // EXP10: the dispatch's buffer writes were recorded by the fill's marks on E; it writes no
-    // image and is direct, so nothing else is added (DispatchCompute's block after Configure).
+    // EXP10: the dispatch's buffer writes were recorded by the fill's marks on E. What
+    // DispatchCompute's block after Configure adds, here at E's place:
+    // - its written images: their guest ranges are the texture cache's (R's, later), so E
+    //   records "may write anything" (DispatchUnbounded::Image, the record the lent path makes
+    //   for an image without a guest range): a superset, so a front read across it drains;
+    // - the indirect arguments ObtainBuffer dropped the GPU-written state of (12 bytes).
     if (VideoCommon::GpuSplit::RecordingDispatch()) {
-        VideoCommon::GpuSplit::Get().ConfirmDispatch();
+        auto& split = VideoCommon::GpuSplit::Get();
+        if (writes_images) {
+            split.RecordDispatchUnbounded(VideoCommon::GpuSplit::DispatchUnbounded::Image);
+        }
+        if (indirect_address) {
+            if (const auto device_addr = gpu_memory->GpuToCpuAddress(*indirect_address)) {
+                split.RecordDispatchWrite(*device_addr, 12);
+            }
+        }
+        split.ConfirmDispatch();
     }
     struct Op {
         RasterizerVulkan* self;
@@ -4230,6 +4270,12 @@ bool RasterizerVulkan::OneFollowerPostDispatch() {
         },
         &op, sizeof(op));
     OneF::CountDispatch(Count::Posted);
+    if (writes_images) {
+        OneF::CountDispatch(Count::PostedImage);
+    }
+    if (indirect_address) {
+        OneF::CountDispatch(Count::PostedIndirect);
+    }
     if (list_copies || probes) [[unlikely]] {
         // The buffer cache's records after the dispatch, in DispatchCompute's order (the probes'
         // "after" copies, then the list page copies and their submit), lent: R has played the
@@ -4288,6 +4334,9 @@ void RasterizerVulkan::OneFollowerPlayDispatch(ComputePipeline* pipeline, u64 nu
     engine.regs.code_loc.address_low = view.code_loc[1];
     engine.regs.tex_cb_index = view.tex_cb_index;
     engine.SetViewNativeMode(view.native != 0);
+    engine.SetViewIndirect(view.has_indirect != 0 ? std::optional<GPUVAddr>{view.indirect}
+                                                 : std::nullopt);
+    onef_dispatch_writes_images = view.writes_images != 0;
     // The R-owned objects that read the compute engine name the view for this dispatch (the
     // pipeline cache does not look up here: the packet carries E's pipeline).
     Tegra::Engines::KeplerCompute* const saved_rasterizer = ExchangeKeplerCompute(&engine);
@@ -4945,6 +4994,24 @@ void RasterizerVulkan::DispatchCompute() {
         }
     };
     const auto indirect_address = kepler_compute->GetIndirectComputeAddress();
+    // A played indirect dispatch (bit 4): E obtained the arguments' buffer in its fill, the
+    // packet names it (held until Configure's rest, so taken here). R's view says whether the
+    // dispatch is indirect; the packet must agree.
+    MemStage::BufferRef onef_indirect{};
+    if (onef_play != nullptr) {
+        if (const MemStage::DispatchPacket* const held = mem_stage.HeldDispatch()) {
+            onef_indirect = held->indirect;
+        }
+        if (indirect_address.has_value() != (onef_indirect.buffer != VK_NULL_HANDLE))
+            [[unlikely]] {
+            VideoCommon::OneFollower::Note(
+                VideoCommon::OneFollower::Check::PlayedDispatchIndirect,
+                indirect_address ? "a played indirect dispatch without its arguments' buffer"
+                                 : "a played direct dispatch with an arguments' buffer");
+            VideoCommon::OneFollower::StopPostDispatch("a played dispatch's indirect state");
+            return;
+        }
+    }
     // The full-size 1080p pass is replaced only by FSR (native AA); DLAA through it is untested.
     // So is the 3/4-scale pass seen on Linux RADV (added with the FSR
     // port): DLSS keeps the passes it replaced before it, after the owner saw a softer image.
@@ -4987,6 +5054,17 @@ void RasterizerVulkan::DispatchCompute() {
         return;
     }
     // A played dispatch: E confirmed it (it writes no image and is direct).
+    // A played dispatch writes images exactly when E saw it would (bit 2: E recorded them as
+    // unbounded at its place, and the packed R16 path stays lent).
+    if (onef_play != nullptr &&
+        (byte_addressed_shadow.has_value() ||
+         pipeline->WrittenImages().empty() == onef_dispatch_writes_images)) [[unlikely]] {
+        VideoCommon::OneFollower::Note(VideoCommon::OneFollower::Check::PlayedDispatchImage,
+                                       byte_addressed_shadow
+                                           ? "a played dispatch made the packed R16 shadow"
+                                           : "a played dispatch's image writes against E's");
+        VideoCommon::OneFollower::StopPostDispatch("a played dispatch's image writes");
+    }
     if (onef_play == nullptr && VideoCommon::GpuSplit::RecordingDispatch()) {
         // EXP10: the buffer cache recorded the buffers the dispatch marks written; add its
         // images and the indirect arguments ObtainBuffer drops the GPU-written state of.
@@ -5042,7 +5120,7 @@ void RasterizerVulkan::DispatchCompute() {
     // Earlier writes must be visible to the dispatch, its indirect arguments included
     // (RecordDispatchBarrier, recorded at the start of the dispatch's own command), and what it
     // writes to the next render pass (NoteComputeWrites).
-    if (frame_dump.CapturingSampled()) {
+    if (frame_dump.CapturingSampled() && onef_play == nullptr) {
         std::optional<std::array<u32, 3>> indirect_grid;
         if (indirect_address) {
             indirect_grid = std::array{gpu_memory->Read<u32>(*indirect_address),
@@ -5058,14 +5136,20 @@ void RasterizerVulkan::DispatchCompute() {
         // DispatchIndirect
         static constexpr auto sync_info = VideoCommon::ObtainBufferSynchronize::FullSynchronize;
         const auto post_op = VideoCommon::ObtainBufferOperation::DiscardWrite;
-        const auto [buffer, offset] = mem_stage.Ref(MemStage::Site::DispatchIndirect, [&] {
-            return buffer_cache.ObtainBuffer(*indirect_address, 12, sync_info, post_op);
-        });
+        // A played one: E obtained it in its fill (the packet's `indirect`, its entries played
+        // at the rest after Configure, where this Ref plays them).
+        const MemStage::BufferRef indirect_ref =
+            onef_play != nullptr ? onef_indirect : [&] {
+                const auto [buffer, offset] = mem_stage.Ref(MemStage::Site::DispatchIndirect, [&] {
+                    return buffer_cache.ObtainBuffer(*indirect_address, 12, sync_info, post_op);
+                });
+                return MemStage::BufferRef{buffer->Handle(), offset};
+            }();
         scheduler.RequestOutsideRenderPassOperationContext();
         scheduler.NoteComputeWrites();
         scheduler.TraceComputePipeline(pipeline->ShaderHash());
-        scheduler.Record([this, pipeline, indirect_buffer = buffer->Handle(),
-                          indirect_offset = offset](vk::CommandBuffer cmdbuf) {
+        scheduler.Record([this, pipeline, indirect_buffer = indirect_ref.buffer,
+                          indirect_offset = indirect_ref.offset](vk::CommandBuffer cmdbuf) {
             RecordDispatchBarrier(cmdbuf);
             if (!pipeline->IsBound()) {
                 return;
@@ -5074,11 +5158,16 @@ void RasterizerVulkan::DispatchCompute() {
                 cmdbuf.DispatchIndirect(indirect_buffer, indirect_offset);
             });
         });
-        dispatch_kinds.extent_probes = mem_stage.Ref(MemStage::Site::DispatchAfter, [&] {
-            return buffer_cache.RecordComputeExtentProbes();
-        }) != 0;
+        // A played dispatch's probes and list page copies are E's (a lent tail after the post).
+        if (onef_play == nullptr) {
+            dispatch_kinds.extent_probes = mem_stage.Ref(MemStage::Site::DispatchAfter, [&] {
+                return buffer_cache.RecordComputeExtentProbes();
+            }) != 0;
+        }
         compute_since_count_barrier = true;
-        dispatch_kinds.list_copies = SubmitNx2ListCopies(pipeline->ShaderHash());
+        if (onef_play == nullptr) {
+            dispatch_kinds.list_copies = SubmitNx2ListCopies(pipeline->ShaderHash());
+        }
         dispatch_kinds.recorded = true;
         dispatch_kinds.indirect = true;
         return;

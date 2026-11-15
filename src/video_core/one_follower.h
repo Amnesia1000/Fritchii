@@ -249,6 +249,14 @@ enum class Check : u8 {
     /// FRITCHII_ONEF_BIND_SEED: a played draw found R's view on another channel than the bound
     /// one (the re-seed inside the lent bind did not hold). The switch stops for the session.
     BindSeedView,
+    /// FRITCHII_ONEF_OP_DISPATCH bit 4: R played an indirect dispatch whose packet carries no
+    /// indirect buffer, or a direct one whose packet does (E and R disagree on the dispatch). Not
+    /// recorded; posting stops.
+    PlayedDispatchIndirect,
+    /// FRITCHII_ONEF_OP_DISPATCH bit 2: a played dispatch wrote an image of a byte-addressed
+    /// kind E sends lent (the R16 shadow), or wrote images E did not see in the program's info.
+    /// Posting stops.
+    PlayedDispatchImage,
     Count,
 };
 
@@ -263,6 +271,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Check::Count)> chec
     "sync target missing", "sync target unused", "played dispatch", "played dispatch off view", "lookup programs",
     "lookup blend", "lookup vertex input",
     "semaphore order", "unlent reset", "view values", "bind seed view",
+    "played dispatch indirect", "played dispatch image",
 };
 
 // --- The packet (E to R) -----------------------------------------------------------------------------
@@ -702,26 +711,44 @@ enum class DispatchCount : u8 {
     Posted,
     NeedsEPipeline, ///< lent: FRITCHII_ONEF_E_PIPELINE=0 (R owns the lookup then)
     Stopped,        ///< lent: a must-be-0 stopped posting for the session
-    Transient,      ///< lent: the view not seeded at R yet
+    Transient,      ///< lent: the view not seeded yet: after a channel bind with
+                    ///< FRITCHII_ONEF_BIND_SEED=0 (the seed waits for the next lent packet)
     Diagnostic,     ///< lent: a frame dump, trace, flash watch, verify bits or the stage's ring
     NoRing,         ///< lent: no packets, no values by value, no packet ticks, no room, marks ahead
-    Indirect,       ///< lent: indirect (its arguments may be read back)
+    Indirect,       ///< lent: indirect, bit 4 off
     LookupMiss,     ///< lent: the compute lookup is not a plain hit (R looks up in the lent call)
     TexelBuffers,   ///< lent: texture or image buffers (their binds need the texture cache)
-    WritesImage,    ///< lent: writes an image (the texture cache's write records)
+    WritesImage,    ///< lent: writes an image, bit 2 off
     Upscaler,       ///< lent: an OoT upscaler pass or its depth reader (the replacement's hooks)
     Dimensions,     ///< lent: a grid over the device's limit (the lent path drops it)
     FillRefused,    ///< lent: the seam did not fill it (arena busy, no room at the fill)
     TailListCopies, ///< posted; its command list page copies lent after it
     TailProbes,     ///< posted; its write extent probes' copies lent after it
+    ImageShadow,    ///< lent (bit 2 on): writes a byte-addressed image (the R16 shadow path)
+    PostedImage,    ///< posted (bit 2): writes an image (EXP10: recorded unbounded on E)
+    PostedIndirect, ///< posted (bit 4): indirect, its arguments' buffer obtained by E
     Count,
 };
+/// The kinds that count a posted dispatch a second time (not in the line's total).
+[[nodiscard]] constexpr bool DispatchCountIsExtra(DispatchCount kind) noexcept {
+    return kind == DispatchCount::TailListCopies || kind == DispatchCount::TailProbes ||
+           kind == DispatchCount::PostedImage || kind == DispatchCount::PostedIndirect;
+}
+/// FRITCHII_ONEF_OP_DISPATCH's bits (any non-zero value turns the switch on).
+enum DispatchPostBit : u32 {
+    DispatchPostPlain = 1,    ///< direct dispatches that write no image (any value != 0)
+    DispatchPostImages = 2,   ///< + dispatches that write images (R records the texture side)
+    DispatchPostIndirect = 4, ///< + indirect dispatches (E obtains the arguments' buffer)
+};
+/// E: FRITCHII_ONEF_OP_DISPATCH's value (0 = off).
+[[nodiscard]] u32 DispatchPostBits() noexcept;
 inline constexpr std::array<const char*, static_cast<size_t>(DispatchCount::Count)>
     dispatch_count_names{
         "posted",           "lent: E_PIPELINE off", "lent: stopped",       "lent: view not ready",
         "lent: diagnostic", "lent: no ring",        "lent: indirect",      "lent: lookup miss",
         "lent: texel buffers", "lent: writes an image", "lent: upscaler", "lent: grid limit",
         "lent: fill refused", "posted + list copies lent", "posted + extent probes lent",
+        "lent: byte-addressed image write", "posted writing images", "posted indirect",
 };
 /// E: the first reason a dispatch cannot be posted before its lookup, Count when it may be;
 /// DispatchCount::Posted (never returned) is not a reason. Returns Count too when the switch is

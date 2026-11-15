@@ -310,6 +310,8 @@ private:
     ComputePipeline* onef_dispatch_lent_pipeline{};
     /// R: the posted dispatch DispatchCompute plays now (its pipeline), else null.
     ComputePipeline* onef_dispatch_play{};
+    /// R: E's word that the played dispatch writes images (FRITCHII_ONEF_OP_DISPATCH bit 2).
+    bool onef_dispatch_writes_images{};
     /// R: its view of the bound channel's compute engine for played dispatches (no methods run
     /// on it), made for the memory manager it was made with.
     std::unique_ptr<Tegra::Engines::KeplerCompute> onef_kepler_view;

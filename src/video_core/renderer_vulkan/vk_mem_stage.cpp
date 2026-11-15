@@ -1988,7 +1988,8 @@ void MemStage::PlayRingOp(u64 number) {
 
 u64 MemStage::FillRingDispatch(Cache& cache_, const DispatchFacts& facts, u64 position,
                                const std::vector<u32>& values, bool null_pointer_handles,
-                               const void* view, u32 view_bytes) {
+                               const void* view, u32 view_bytes,
+                               std::optional<GPUVAddr> indirect) {
     const Profile::FineScope fill_zone{Profile::Zone::DispatchFill};
     if (seam_value.load(std::memory_order_relaxed) < 2 || facts.has_texel_buffers || !ticks ||
         !FillSide() || !TwoThreadRing() || (view_bytes & 7) != 0 || !RingRoom()) {
@@ -2058,6 +2059,19 @@ u64 MemStage::FillRingDispatch(Cache& cache_, const DispatchFacts& facts, u64 po
             dispatch.flags |= PostCopyBarrier;
             cache_.any_buffer_uploaded = false;
         }
+        if (indirect) {
+            // DispatchCompute's indirect step (after Configure there, so after the barrier
+            // question too): the arguments synchronized and their GPU-written state dropped, as
+            // its Ref(DispatchIndirect) does. Its entries play at the packet's rest, which on R
+            // follows Configure's bind record, as there.
+            last_entry = ~0U;
+            Fill arguments{*this, Site::DispatchIndirect};
+            const auto [buffer, offset] = cache_.ObtainBuffer(
+                *indirect, 12, VideoCommon::ObtainBufferSynchronize::FullSynchronize,
+                VideoCommon::ObtainBufferOperation::DiscardWrite);
+            dispatch.indirect = BufferRef{buffer->Handle(), offset};
+        }
+        last_entry = ~0U;
         PushRingDispatch(values, null_pointer_handles, view, view_bytes, position);
     }
     if (timed) {

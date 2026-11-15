@@ -616,9 +616,14 @@ public:
     /// packet of its own kind, with the handle values E read and `view` (`view_bytes`, a multiple
     /// of 8: what R's play needs of E's compute engine). Returns the packet's number, the name R
     /// takes it by; 0 = nothing filled or pushed (the caller lends the dispatch).
+    /// `indirect` (FRITCHII_ONEF_OP_DISPATCH bit 4): an indirect dispatch's arguments: after the
+    /// `before` section E obtains their buffer as DispatchCompute does (its entries in a section
+    /// of their own, played at the packet's rest, after Configure) and the packet's `indirect`
+    /// names it.
     u64 FillRingDispatch(Cache& cache, const DispatchFacts& facts, u64 position,
                          const std::vector<u32>& values, bool null_pointer_handles,
-                         const void* view, u32 view_bytes);
+                         const void* view, u32 view_bytes,
+                         std::optional<GPUVAddr> indirect = std::nullopt);
     /// R, at the dispatch's op: takes ring B's packet `number` (13.2 R1: by name) and holds it as
     /// a filled dispatch (Configure plays it, RestAtEnd ends it); copies its view into `view`.
     /// Null when ring B's head is not that packet ("ring B pairing"): nothing held.

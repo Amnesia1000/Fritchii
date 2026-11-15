@@ -1441,6 +1441,29 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   Must be 0: "ring B pairing", "played dispatch" (R's Configure failed or threw), "played
   dispatch off view", "owner on R", "R waits for E's lock"; any of the dispatch ones stops
   posting for the session (logged at Critical). The QMD release after a dispatch is unchanged.
+  The value is a bit mask (any non-zero value posts the plain ones):
+  - +2: dispatches that write images are posted too. R resolves and records the written images
+    (its texture cache marks them, as in the lent path). What E needs of those writes in its own
+    stream: (a) EXP10's dispatch write records, made at E's place: the images' guest ranges are
+    the texture cache's, so E records "may write anything" (DispatchUnbounded::Image, the record
+    the lent path makes for an image without a guest range): a superset, a front DMA read
+    across it drains. (b) Nothing in E's buffer side: image writes make no buffer marks in the
+    lent path either. (c) E's own texture-side tests already wait for R: FLUSH_E's texture half
+    needs R caught up, INVAL_E/GATHER_E lend on a page an image was ever on, and an image R
+    first creates at the dispatch's play after E wrote its pages is the "texture read ahead of
+    R" must-be-0 (its stamps), as for a played draw's render target. Written byte-addressed
+    images (the packed R16 shadow, which can throw) stay lent ("byte-addressed image write").
+    Must be 0: "played dispatch image" (R's image writes differ from what E saw in the program).
+  - +4: indirect dispatches are posted too. Their arguments are read by the GPU only (nothing
+    in DispatchCompute reads them on the CPU but the frame dump, a diagnostic, lent): E obtains
+    their buffer in its fill as DispatchCompute does (FullSynchronize, DiscardWrite; a section
+    after `before`, played at the packet's rest after Configure's bind record, as there), the
+    packet carries it, E records the 12 bytes for EXP10, R records vkCmdDispatchIndirect. Must
+    be 0: "played dispatch indirect" (R's view and the packet disagree on the dispatch).
+  So 7 posts everything but the upscaler passes, texel buffers, lookup misses and diagnostics.
+  "lent: view not ready" is the window after a channel bind until the next lent packet seeds
+  E's tracking and R's view; FRITCHII_ONEF_BIND_SEED=1 seeds inside the lent bind itself and
+  closes it (the line prints both switches).
 - FRITCHII_ONEF_FLUSH_E (live, default 0; fable_b_one_follower 17.3 (a); step 4): 1 = a
   FlushRegion or MustFlushRegion E tests clean is answered on E, not lent: no page of the range
   GPU-written (E marks those when it fills the writes), none a query's or a posted report's,
