@@ -1340,7 +1340,7 @@ void QueueRasterOpImpl(RasterOp op, VideoCore::RasterizerInterface& rasterizer, 
     // FRITCHII_ESPLIT_OWED: a report lands at `address` (16 bytes at most): on a shader page the
     // next lookup drains and flushes first.
     if (op == RasterOp::Query && g_owed_shader_rule) {
-        if (const Maxwell3D* const engine = OneF::Engine()) {
+        if (Maxwell3D* const engine = OneF::Engine()) {
             NoteQueuedWrite(&engine->GetMemoryManager(), address, 16);
         }
     }
