@@ -7813,14 +7813,28 @@ AccelerateDMA::AccelerateDMA(BufferCache& buffer_cache_, TextureCache& texture_c
     : buffer_cache{buffer_cache_}, texture_cache{texture_cache_}, scheduler{scheduler_} {}
 
 bool AccelerateDMA::BufferClear(GPUVAddr src_address, u64 amount, u32 value) {
-    ONEF_LEND_RESULT(Copy, BufferClear(src_address, amount, value))
+    // FRITCHII_ONEF_OP_DMA: the buffer cache is E's: E runs it, its commands an op packet (the
+    // Dma site posted), the result E's own.
+    const bool onef_on_engine =
+        VideoCommon::OneFollower::ShouldLend() &&
+        VideoCommon::OneFollower::PostOpSite(static_cast<u8>(MemStage::Site::Dma));
+    if (!onef_on_engine) {
+        ONEF_LEND_RESULT(Copy, BufferClear(src_address, amount, value))
+    }
     std::scoped_lock lock{buffer_cache.mutex};
     MemStage::FillPlay seam{buffer_cache.runtime.Seam(), MemStage::Site::Dma};
     return buffer_cache.DMAClear(src_address, amount, value);
 }
 
 bool AccelerateDMA::BufferCopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount) {
-    ONEF_LEND_RESULT(Copy, BufferCopy(src_address, dest_address, amount))
+    // FRITCHII_ONEF_OP_DMA: as BufferClear; the submit after list page copies is R's (a render
+    // op at the same place).
+    const bool onef_on_engine =
+        VideoCommon::OneFollower::ShouldLend() &&
+        VideoCommon::OneFollower::PostOpSite(static_cast<u8>(MemStage::Site::Dma));
+    if (!onef_on_engine) {
+        ONEF_LEND_RESULT(Copy, BufferCopy(src_address, dest_address, amount))
+    }
     std::scoped_lock lock{buffer_cache.mutex};
     MemStage& seam = buffer_cache.runtime.Seam();
     bool copied;
@@ -7833,7 +7847,20 @@ bool AccelerateDMA::BufferCopy(GPUVAddr src_address, GPUVAddr dest_address, u64 
     }
     seam.Play();
     if (list_copied) {
-        scheduler.Flush();
+        if (onef_on_engine) {
+            Scheduler* const target = &scheduler;
+            VideoCommon::OneFollower::SetLendSite("BufferCopy's flush (posted)");
+            VideoCommon::OneFollower::PushOp(
+                VideoCommon::OneFollower::LentOp::Copy,
+                [](void* raw) {
+                    Scheduler* s;
+                    std::memcpy(&s, raw, sizeof(s));
+                    s->Flush();
+                },
+                &target, sizeof(target));
+        } else {
+            scheduler.Flush();
+        }
     }
     buffer_cache.Nx2CollectListCopies(false);
     return copied;

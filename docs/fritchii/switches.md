@@ -1417,6 +1417,10 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   packet, the ListWords site), R records the copy into the keep buffer as a render op. The
   front's read of kept words (Nx2ReadKeptListWords) is lent now, so R has played the copies
   before it (it ran on E before, reading R's player).
+- FRITCHII_ONEF_OP_DMA (live, default 0; fable_b_one_follower 13.4, step 4): 1 = the DMA
+  engine's buffer-to-buffer copies and clears (AccelerateDMA BufferCopy, BufferClear) run on E
+  (the buffer cache is E's, the result E's own), their commands posted as op packets (the Dma
+  site); the submit after list page copies is a render op. Copies with an image stay lent.
 - FRITCHII_ONEF_OP_CLEAR (live, default 0; fable_b_one_follower 13.4 group 3; step 4, view
   tracked): 1 = clears are render ops. E has decided the render enable (DrawManager tests
   ShouldExecute) and runs the clear's FlushCaching; R plays Clear from its view (every clear

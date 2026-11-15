@@ -1553,6 +1553,8 @@ bool PostOpSite(u8 site) noexcept {
         return SwitchValue(g_onef_op_inval, "FRITCHII_ONEF_OP_INVAL") != 0;
     case 7: // MemStage::Site::ListWords: Nx2KeepListWords' buffer side
         return SwitchValue(g_onef_op_listkeep, "FRITCHII_ONEF_OP_LISTKEEP") != 0;
+    case 14: // MemStage::Site::Dma: AccelerateDMA's buffer copies and clears on E
+        return SwitchValue(g_onef_op_dma, "FRITCHII_ONEF_OP_DMA") != 0;
     default:
         return false;
     }
