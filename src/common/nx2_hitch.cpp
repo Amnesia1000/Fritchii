@@ -364,6 +364,7 @@ void StallResetGap() {
 namespace {
 
 std::atomic<u64> g_presents{};
+std::atomic<long long> g_longest_gap_us{}; ///< the longest present gap since the last Pulse line
 std::atomic<int> g_pulse_clock{-1}; ///< % Processor Performance over the last second; -1 unknown
 std::atomic<u64> g_pulse_probe_ns{}; ///< the last speed probe; 0 none yet
 std::atomic<u32> g_probe_sink{};     ///< keeps the probe's result alive
@@ -642,6 +643,7 @@ private:
 
         const MachineTimes now = ReadMachineTimes();
         const u64 presents = g_presents.load(std::memory_order_relaxed);
+        const long long longest_gap_us = g_longest_gap_us.exchange(0, std::memory_order_relaxed);
         if (now.ns > last.ns) {
             const double span_100ns = static_cast<double>(now.ns - last.ns) / 100.0;
             const s64 process = static_cast<s64>(now.process_busy_100ns - last.process_busy_100ns);
@@ -659,6 +661,11 @@ private:
             }
             if (values.passive >= 0.0) {
                 extra += fmt::format(", passive limit {:.0f}%", values.passive);
+            }
+            // Last, so readers of the fields before it keep working.
+            if (presents != last_presents) {
+                extra += fmt::format(", longest frame {:.1f} ms",
+                                     static_cast<double>(longest_gap_us) / 1e3);
             }
             LOG_INFO(Render, "Pulse: {} frames, process {:.1f} CPUs, rest of the machine {:.1f} CPUs{}",
                      presents - last_presents, static_cast<double>(process) / span_100ns,
@@ -738,6 +745,10 @@ void OnPresent(long long gap_us) {
         return;
     }
     g_presents.fetch_add(1, std::memory_order_relaxed);
+    // One writer (the present thread); the Pulse thread takes it once a second.
+    if (gap_us > g_longest_gap_us.load(std::memory_order_relaxed)) {
+        g_longest_gap_us.store(gap_us, std::memory_order_relaxed);
+    }
 #ifdef _WIN32
     if (PulseEnabled()) {
         static PulseThread pulse; // started at the first present
