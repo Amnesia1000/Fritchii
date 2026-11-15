@@ -557,6 +557,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_FRONT_LIST_LANE") {
         return &g_front_list_lane;
     }
+    if (name == "FRITCHII_FRONT_OP_LEAN") {
+        return &g_front_op_lean;
+    }
     if (name == "FRITCHII_ONEF_DEAD_STORES") {
         return &g_onef_dead_stores;
     }

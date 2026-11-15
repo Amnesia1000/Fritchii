@@ -3626,6 +3626,14 @@ private:
     /// recorded writes sent the old way; the call's op sent (`handled`: the handler ran it whole);
     /// the coverage line; whether a check mismatch stopped ops for the session.
     void FrontOpRecord(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument);
+    /// FRITCHII_FRONT_OP_LEAN (fable_b2 1.4): an op write's decide with only what the op path's
+    /// per-call conditions leave (FrontOpDecideLean; mode 2 compares it with FrontWriteDecide);
+    /// the per-method kinds it uses, filled when the front starts.
+    bool FrontOpDecide(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
+                       FrontWriteDecision& decision);
+    bool FrontOpDecideLean(FrontState& state, u32 method, u32 argument,
+                           FrontWriteDecision& decision, bool& same);
+    void FrontOpKinds(FrontState& state);
     void FrontOpFallback(VideoCommon::GpuSplit& split, FrontState& state);
     void FrontOpFinish(VideoCommon::GpuSplit& split, FrontState& state, bool handled);
     static void FrontOpReport(FrontState& state, int mode);

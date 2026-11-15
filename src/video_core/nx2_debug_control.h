@@ -295,6 +295,9 @@ inline std::atomic<int> g_front_call_lean{-1};
 /// write starts: bit 1 command-list words, bit 2 handler writes (with FRITCHII_FRONT_CALL_LEAN),
 /// bit 4 verify instead of drop (must-be-0 count).
 inline std::atomic<int> g_front_list_lane{-1};
+/// FRITCHII_FRONT_OP_LEAN (live, default 0): fable_b2 1.4, a lean decide for FRITCHII_ONEF_FRONT_OPS'
+/// recorded writes (2 = + compared with the generic decide, must-be-0 count).
+inline std::atomic<int> g_front_op_lean{-1};
 /// FRITCHII_ONEF_DEAD_STORES (live, default 0): fable_b 27.7, 1 counts the 0xea0 trailing c[0][0x640]
 /// stores the next 0xea0 overwrites with nothing between (count only; dropping them is not built).
 inline std::atomic<int> g_onef_dead_stores{-1};

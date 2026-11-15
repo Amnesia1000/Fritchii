@@ -657,6 +657,33 @@ handler writes dropped where they start; verify: writes checked, sends the lane 
 the old path dropped that the lane did not: information), lane drops the old path sent in the
 window and since boot (must be 0). Judge it by (macro + resume pending + push) per draw.
 
+### FRITCHII_FRONT_OP_LEAN (the "Front op lean" line)
+
+FRITCHII_FRONT_OP_LEAN (live, default 0 = exactly as before; fable_b2 1.4, about 60 to 80 ms/s
+for the op ids). Needs FRITCHII_ONEF_FRONT_OPS. Each write of a recorded op still ran the whole
+FrontWriteDecide. The op path takes a call only under its per-call conditions (the shadow RAM
+tracks; EXP22, EXP2, the draw packet, the CbWords block and the list guard off; no stale list
+draw registers; no deferred 0xe2c mode; no tool), and a fold case already goes the old way.
+- 1: FrontOpDecide: the shadow compare and store, the same-value test, the register store and
+  the executable cases of the methods ops write, by a per-method kind filled when the front
+  starts: a state register, a draw manager method (the instance loop skip and tracking, the
+  index draw tracking, draw_pending, effect Gpu), a constant buffer word (its range, its address,
+  the offset step) and a bind group's raw_config (stored, effect unchanged). Any other method, a
+  shadow RAM that stopped tracking, and a Subsequent draw.begin while EDEN_NX2_FOLD_INSTANCES is
+  on take FrontWriteDecide. The profile counts as FrontWriteDecide does.
+- 2 (verify): per write the lean decide runs on the touched state (the register, its shadow word,
+  the constant buffer offset, draw_pending, other_index_draw, instance_loop), the state is put
+  back, FrontWriteDecide runs from it and its answer is used; a difference in the sent bit, the
+  decision (value, effect, constant buffer address, written range) or the state they leave is
+  counted and logged (16 times). Must be 0.
+- No ring or entry change: the op entry, E's apply and the memory stage see the same sent and
+  pair masks and notes.
+- Off: one predictable branch per recorded write, only while FRITCHII_ONEF_FRONT_OPS is on.
+
+"Front op lean (FRITCHII_FRONT_OP_LEAN=n)" (HW_GPU, Info, with the "Front ops" line, counts since
+boot): writes by the lean decide, writes left to FrontWriteDecide; compare: writes, differing
+(must be 0).
+
 ### FRITCHII_ACQUIRE_MET_BY (the "Acquire resumes met by" line)
 
 FRITCHII_ACQUIRE_MET_BY (live, default 0 since 2026-11-14 = one relaxed load per resume; 1 = the

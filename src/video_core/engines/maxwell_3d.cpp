@@ -1710,6 +1710,7 @@ struct FrontCallSwitches {
     int cb_words_block;
     int dead_stores;
     int list_lane; ///< FRITCHII_FRONT_LIST_LANE (bit 2: a handler's writes)
+    int op_lean;   ///< FRITCHII_FRONT_OP_LEAN
     u32 traced;    ///< MacroTraced()
     bool operator==(const FrontCallSwitches&) const = default;
 };
@@ -2017,6 +2018,7 @@ struct Maxwell3D::FrontState {
     struct FrontOp {
         Tegra::OotOps::Args args;
         int mode;
+        int lean; ///< FRITCHII_FRONT_OP_LEAN for this call (FrontOpRecord)
         u32 count;
         u64 sent;  ///< bit i: write i is sent (else dropped on the front)
         u64 pairs; ///< bit i: sent as a Pairs word (else as a Direct method entry)
@@ -2042,8 +2044,20 @@ struct Maxwell3D::FrontState {
         u64 count_differ{}; ///< must be 0: recorded writes against the op's expansion
         u64 calls{};
         std::chrono::steady_clock::time_point report{};
+        /// FRITCHII_FRONT_OP_LEAN: writes decided by the lean decide, writes it left to
+        /// FrontWriteDecide (a method it does not cover, the shadow RAM not tracking), writes
+        /// compared (mode 2) and of them differing (must be 0; since boot in `lean_differ_total`).
+        u64 lean_writes{};
+        u64 lean_generic{};
+        u64 lean_checked{};
+        u64 lean_differ{};
+        u64 lean_differ_total{};
     };
     FrontOpStats op_stats{};
+    /// FRITCHII_FRONT_OP_LEAN: per method, what FrontWriteDecide's executable half does with it
+    /// under the op path's conditions (FrontOpKinds, filled when the front starts).
+    enum OpKind : u8 { OpState, OpCbData, OpNoDraw, OpDraw, OpGeneric };
+    std::array<u8, Regs::NUM_REGS> op_kinds{};
     /// FRITCHII_ONEF_DEAD_STORES (fable_b 27.7, count only): the last 0xea0 call's trailing
     /// c[0][0x640] stores, where the ring stood after them and which buffer they went to.
     struct DeadStores {
@@ -2410,6 +2424,7 @@ FrontCallSwitches ReadFrontCallSwitches() {
         .cb_words_block = Debug::SwitchValue(Debug::g_cb_words_block, "FRITCHII_CB_WORDS_BLOCK"),
         .dead_stores = Debug::SwitchValue(Debug::g_onef_dead_stores, "FRITCHII_ONEF_DEAD_STORES"),
         .list_lane = Debug::SwitchValue(Debug::g_front_list_lane, "FRITCHII_FRONT_LIST_LANE"),
+        .op_lean = Debug::SwitchValue(Debug::g_front_op_lean, "FRITCHII_FRONT_OP_LEAN"),
         .traced = MacroTraced(),
     };
 }
@@ -2528,6 +2543,7 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
         executing_macro = 0;
         front_macros = true;
         FrontLaneSync(*front);
+        FrontOpKinds(*front);
     }
     // Read again only when a switch or experiment store moved the generation (every store
     // bumps it): one relaxed load per front call instead of three experiment reads (5.6 ms/s,
@@ -3780,6 +3796,10 @@ void Maxwell3D::FrontRunMacroFeaturesT(Core::System& system, VideoCommon::GpuSpl
                 }
                 if (fs.op_active) {
                     fs.op.mode = ops_mode;
+                    fs.op.lean = Lean ? sw.op_lean
+                                      : VideoCore::Nx2Debug::SwitchValue(
+                                            VideoCore::Nx2Debug::g_front_op_lean,
+                                            "FRITCHII_FRONT_OP_LEAN");
                     fs.op.count = 0;
                     fs.op.sent = 0;
                     fs.op.pairs = 0;
@@ -6683,7 +6703,11 @@ void Maxwell3D::FrontOpRecord(VideoCommon::GpuSplit& split, FrontState& fs, u32 
     const u32 i = op.count++;
     op.methods[i] = method;
     op.arguments[i] = argument;
-    if (!FrontWriteDecide(split, fs, method, argument, true, true, op.decisions[i])) {
+    if (op.lean == 0) [[likely]] {
+        if (!FrontWriteDecide(split, fs, method, argument, true, true, op.decisions[i])) {
+            return;
+        }
+    } else if (!FrontOpDecide(split, fs, method, argument, op.decisions[i])) {
         return;
     }
     op.sent |= u64{1} << i;
@@ -6695,6 +6719,172 @@ void Maxwell3D::FrontOpRecord(VideoCommon::GpuSplit& split, FrontState& fs, u32 
         split.CountBatched(VideoCommon::GpuSplit::Batched::MacroSunk);
     }
     fs.sink_pending = false;
+}
+
+void Maxwell3D::FrontOpKinds(FrontState& fs) {
+    constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+    constexpr u32 bind_first = MAXWELL3D_REG_INDEX(bind_groups[0].raw_config);
+    constexpr u32 bind_last = MAXWELL3D_REG_INDEX(bind_groups[4].raw_config);
+    constexpr u32 bind_stride = MAXWELL3D_REG_INDEX(bind_groups[1].raw_config) - bind_first;
+    for (u32 method = 0; method < Regs::NUM_REGS; ++method) {
+        u8 kind = FrontState::OpGeneric;
+        if (!execution_mask[method]) {
+            kind = FrontState::OpState;
+        } else if (method >= cb_data && method < cb_data + 16) {
+            kind = FrontState::OpCbData;
+        } else if (method >= bind_first && method <= bind_last &&
+                   (method - bind_first) % bind_stride == 0) {
+            kind = FrontState::OpNoDraw; // FrontMethodEffect None, outside the draw manager
+        } else if (!FrontHandledOutsideDrawManager(method)) {
+            kind = FrontState::OpDraw;
+        }
+        fs.op_kinds[method] = kind;
+    }
+}
+
+// FRITCHII_FRONT_OP_LEAN (live, default 0; fable_b2 1.4): FrontWriteDecide for a recorded op's
+// write, as the op path's per-call conditions leave it (FrontRunMacroFeaturesT: the shadow RAM
+// tracks, EXP22, EXP2, the draw packet, the CbWords block and the list guard off, no stale list
+// draw registers, no deferred 0xe2c mode, no tool; FrontOpRecord already sent a fold case the
+// old way): the shadow compare and store, the same-value test, the register store and the
+// executable cases of the methods ops write (a draw manager method, a constant buffer word, a
+// bind group's raw_config). Any other method, or a shadow RAM that stopped tracking, takes
+// FrontWriteDecide. `same`: dropped as unchanged (the profile's same-value write).
+NX2_PROFILE_FORCEINLINE bool Maxwell3D::FrontOpDecideLean(FrontState& fs, u32 method, u32 argument,
+                                                           FrontWriteDecision& decision,
+                                                           bool& same) {
+    using Effect = VideoCommon::GpuSplit::Effect;
+    const u8 kind = fs.op_kinds[method];
+    const bool shadow_kept = fs.shadow[method] == argument;
+    fs.shadow[method] = argument;
+    const u32 value = argument;
+    Effect effect = fs.draw_pending ? Effect::Gpu : Effect::None;
+    decision.value = value;
+    decision.has_cb_write = false;
+    decision.cb_write = 0;
+    decision.write_begin = 0;
+    decision.write_end = 0;
+    if (kind == FrontState::OpState) {
+        if (fs.regs[method] == value && shadow_kept && fs.skip_same) {
+            same = true;
+            return false;
+        }
+        fs.regs[method] = value;
+        decision.effect = static_cast<u8>(effect);
+        return true;
+    }
+    if (kind == FrontState::OpDraw) {
+        if (FrontSkipsLoopWrite(fs, method, value, shadow_kept)) {
+            same = true;
+            return false;
+        }
+        fs.regs[method] = value;
+        FrontTrackIndexDraws(fs, method);
+        fs.draw_pending = true;
+        decision.effect = static_cast<u8>(Effect::Gpu);
+        return true;
+    }
+    if (kind == FrontState::OpCbData) {
+        const auto [write_begin, write_end] = FrontWriteRange(fs, method, 1);
+        decision.write_begin = write_begin;
+        decision.write_end = write_end;
+        fs.regs[method] = value;
+        decision.has_cb_write = true;
+        decision.cb_write = ConstBufferWriteAddress(fs.regs);
+        fs.regs[MAXWELL3D_REG_INDEX(const_buffer.offset)] += sizeof(u32);
+        decision.effect = static_cast<u8>(effect);
+        return true;
+    }
+    // OpNoDraw: stored, effect None combined.
+    fs.regs[method] = value;
+    decision.effect = static_cast<u8>(effect);
+    return true;
+}
+
+bool Maxwell3D::FrontOpDecide(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
+                              u32 argument, FrontWriteDecision& decision) {
+    namespace Profile = VideoCommon::Nx2Profile;
+    auto& stats = fs.op_stats;
+    const bool tracked = fs.control == Regs::ShadowRamControl::Track ||
+                         fs.control == Regs::ShadowRamControl::TrackWithFilter;
+    // A later instance's draw.begin FrontWriteDecide may fold (EDEN_NX2_FOLD_INSTANCES, after its
+    // own instance loop tracking) goes there too.
+    const bool fold_case = method == MAXWELL3D_REG_INDEX(draw.begin) &&
+                           ((argument >> 26) & 3) == 1 && FoldInstancesEnabled();
+    if (!tracked || fs.op_kinds[method] == FrontState::OpGeneric || fold_case) [[unlikely]] {
+        ++stats.lean_generic;
+        return FrontWriteDecide(split, fs, method, argument, true, true, decision);
+    }
+    ++stats.lean_writes;
+    if (fs.op.lean != 2) [[likely]] {
+        bool same = false;
+        const bool sent = FrontOpDecideLean(fs, method, argument, decision, same);
+        if (Profile::Enabled()) [[unlikely]] {
+            // As FrontWriteDecide counts: every write, and each one it drops as unchanged.
+            Profile::Add(Profile::Counter::MethodWrites, 1);
+            if (same) {
+                Profile::Add(Profile::Counter::SameValueWrites, 1);
+            }
+        }
+        return sent;
+    }
+    // Mode 2: the lean decide on the touched state, which is then put back, and FrontWriteDecide
+    // from the same state; its answer is taken, and every sent bit, decision field and state the
+    // two left is compared (must be 0).
+    constexpr u32 offset = MAXWELL3D_REG_INDEX(const_buffer.offset);
+    struct Touched {
+        u32 reg;
+        u32 shadow;
+        u32 cb_offset;
+        bool draw_pending;
+        bool other_index_draw;
+        bool instance_loop;
+        bool operator==(const Touched&) const = default;
+    };
+    const auto touched = [&fs, method] {
+        return Touched{fs.regs[method],   fs.shadow[method],      fs.regs[offset],
+                       fs.draw_pending,   fs.other_index_draw,    fs.instance_loop};
+    };
+    const auto restore = [&fs, method](const Touched& t) {
+        fs.regs[offset] = t.cb_offset;
+        fs.regs[method] = t.reg;
+        fs.shadow[method] = t.shadow;
+        fs.draw_pending = t.draw_pending;
+        fs.other_index_draw = t.other_index_draw;
+        fs.instance_loop = t.instance_loop;
+    };
+    const Touched before = touched();
+    FrontWriteDecision lean{};
+    bool same = false;
+    const bool lean_sent = FrontOpDecideLean(fs, method, argument, lean, same);
+    const Touched lean_after = touched();
+    restore(before);
+    const bool sent = FrontWriteDecide(split, fs, method, argument, true, true, decision);
+    const Touched after = touched();
+    ++stats.lean_checked;
+    const bool same_decision =
+        !sent || (lean.value == decision.value && lean.effect == decision.effect &&
+                  lean.has_cb_write == decision.has_cb_write &&
+                  (!decision.has_cb_write || lean.cb_write == decision.cb_write) &&
+                  lean.write_begin == decision.write_begin &&
+                  lean.write_end == decision.write_end);
+    if (lean_sent != sent || !same_decision || !(lean_after == after)) [[unlikely]] {
+        ++stats.lean_differ;
+        ++stats.lean_differ_total;
+        if (stats.lean_differ_total <= 16) {
+            LOG_ERROR(HW_GPU,
+                      "Front op lean (FRITCHII_FRONT_OP_LEAN=2): op {} write {:#x} = {:#x}: lean "
+                      "{} value {:#x} effect {} cb {} {:#x} range {:#x}-{:#x}, generic {} value "
+                      "{:#x} effect {} cb {} {:#x} range {:#x}-{:#x}; state after {}",
+                      OotOps::OpName(fs.op.args.op), method, argument,
+                      lean_sent ? "sends" : "drops", lean.value, lean.effect, lean.has_cb_write,
+                      lean.cb_write, lean.write_begin, lean.write_end,
+                      sent ? "sends" : "drops", decision.value, decision.effect,
+                      decision.has_cb_write, decision.cb_write, decision.write_begin,
+                      decision.write_end, lean_after == after ? "equal" : "differs");
+        }
+    }
+    return sent;
 }
 
 void Maxwell3D::FrontOpFallback(VideoCommon::GpuSplit& split, FrontState& fs) {
@@ -6860,6 +7050,13 @@ void Maxwell3D::FrontOpReport(FrontState& fs, int mode) {
              mode, s.entries, s.writes_sent, s.writes_dropped, per_id, reason(Reason::Lanes),
              reason(Reason::Tools), reason(Reason::Stopped), reason(Reason::Encode), s.fallbacks,
              s.count_differ, FrontOpsStopped() ? ", stopped" : "");
+    if (s.lean_writes != 0 || s.lean_generic != 0) {
+        LOG_INFO(HW_GPU,
+                 "Front op lean (FRITCHII_FRONT_OP_LEAN={}): {} writes by the lean decide, {} left "
+                 "to FrontWriteDecide; compare: {} writes, {} differing ({} since boot, must be 0)",
+                 fs.op.lean, s.lean_writes, s.lean_generic, s.lean_checked, s.lean_differ,
+                 s.lean_differ_total);
+    }
 }
 
 void Maxwell3D::ApplyFrontOp(const u64* payload) {
