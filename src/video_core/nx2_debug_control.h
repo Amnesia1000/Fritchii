@@ -388,6 +388,10 @@ inline std::atomic<int> g_onef_null_fill{-1};
 /// newest note position per page bucket before its walk: 1 = on, 2 = verify (both run, the walk
 /// answers), 3 = dry (both run, counted and timed 1 in 64).
 inline std::atomic<int> g_noted_summary{-1};
+/// FRITCHII_NOTED_FAST (live, default 0): GpuSplit::NotedWriteSince answers from per-page note
+/// chains instead of walking every note since: 1 = on, 2 = verify (both run, the walk answers,
+/// differences counted), 3 = dry (both run, counted and timed 1 in 64).
+inline std::atomic<int> g_noted_fast{-1};
 /// FRITCHII_STEP_LEAN (live, default 0): F6, the list-wait line's clock read every 256th entry
 /// and the command list storage recycled to the submitter (dma_pusher.h).
 inline std::atomic<int> g_step_lean{-1};
