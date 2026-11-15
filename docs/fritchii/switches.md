@@ -1638,6 +1638,47 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   switch for the session. The "List writer waits" 10 s line counts the waits by reason (inside a
   method's data, a copy queued), the answer after the wait, whether a queued writer's range was
   on the entry's pages, the skips, and the must-be-0, with the switch off too.
+- FRITCHII_ONEF_FRONT_OPS (live, default 0; fable_b_one_follower 27/28, stages S2 and S3; the
+  front, with the split and EDEN_NX2_OOT_MACROS=1): seven hot OoT macros (0xe02, 0xe1c, 0xe36,
+  0xea0, 0xe08, 0xe52, 0xe3a; macro_ops_oot.h) go as one ring entry per call, "op + resolved arguments"
+  (the data RAM words the handler read), instead of one entry or Pairs word per register write.
+  The front still runs the handler on its own state: each write is decided by FrontWriteDecide
+  (shadow, same-value skip, executable bookkeeping) and recorded, the sent set and its lanes
+  (Pairs word or Direct entry) kept as masks, the notes made after the op entry. Only where
+  every write takes those plain lanes: shadow RAM Track, EXP22 / EXP2 / FRITCHII_CB_WORDS_BLOCK /
+  the draw packet off, EDEN_NX2_MACRO_SINK only with EDEN_NX2_RING_PAIRS, no list guard, no
+  macro trace / dry / verify tool, no EXP53 predicate; the instanced draws only up to 1 instance
+  while EDEN_NX2_FOLD_INSTANCES counts later instances (16 otherwise; its held count would go out
+  before the op). Anything else, the old
+  path. 1 = E rebuilds the writes and applies the sent ones as Execute applied their entries
+  (S2); 2 = 1 + check; 3 = E calls the leaf each write reaches through CallMethod directly
+  (S3: WriteStateRegister, CallMethodFast, ApplyPairs' store, CallConstBufferWords, by
+  execution_mask, never by op), only where CallMethod would take those fast routes, else S2; it
+  stays on with EDEN_NX2_GPU_PROFILE (one sampled "method" scope, CountRegisterWrite per write);
+  4 = 3 + check. The memory stage follows an
+  op entry write by write (StageTag::Ops).
+  Must be 0 (check modes, "Front ops check" once a second): E's expansion against the front's
+  write list word for word; each written register on E against the front's copy after the call;
+  "front skipped E differs": at each state write the front dropped, E's register and shadow word
+  hold its value (every op in 2 and 4, every 64th in 1 and 3); each constant buffer word's
+  address on E against the front's noted one; with 4, each Direct write's route (CallMethod's
+  fast leaf) and index_buffer.count's indexed flag, and for ops that only store state (no
+  deferred draw, no write tracking, profile off) S2 and S3 applied from the same state compared
+  register, shadow word and dirty flags. Also always: "count
+  differences" on the front's line (recorded writes against the expansion's number). Any
+  mismatch stops ops for the session. The front's "Front ops" line (once a second) counts op
+  entries, writes sent and dropped, per op sent / sent nothing / old path, the old path by
+  reason (lanes, tools, stopped, declined or too long), fallbacks.
+- FRITCHII_ONEF_DEAD_STORES (live, default 0; fable_b_one_follower 27.7; count only): 1 = the
+  "Dead stores" line counts 0xea0 calls whose trailing c[0][0x640] resets (8e3 = 0x640, 8e4 = 0,
+  8e5 = 0) the next 0xea0 overwrites with nothing sent between (same ring position, no held
+  work, same buffer), and of those, the ones uploading the same two words as the call before.
+  Dropping them is not built: front-side guest reads between the calls could see the bytes.
+- FRITCHII_ONEF_FILL_COUNT (live, default 0; fable_b_one_follower 28.5, S4's count; with
+  FRITCHII_ONEF_FRONT_OPS): 1 = every 16th bind op (0xe02, 0xe08) hashes the first 4 KiB of the
+  bound range on the front (raw read, after the op) with whether noted work that may write it is
+  still queued; E hashes the same bytes when it runs the small entry right after the bind. The
+  "Fill count" line: sampled, same, differ with a queued writer, differ with none (expected 0).
 - FRITCHII_ONEF_FLUSH_E (live, default 0; fable_b_one_follower 17.3 (a); step 4): 1 = a
   FlushRegion or MustFlushRegion E tests clean is answered on E, not lent: no page of the range
   GPU-written (E marks those when it fills the writes), none a query's or a posted report's,

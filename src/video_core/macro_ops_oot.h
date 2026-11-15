@@ -3,7 +3,7 @@
 
 #pragma once
 
-// FRITCHII_ONEF_FRONT_OPS (fable_b 27/28, stages S2 and S3): six of OoT's hot 3D macros
+// FRITCHII_ONEF_FRONT_OPS (fable_b 27/28, stages S2 and S3): seven of OoT's hot 3D macros
 // (macro_hle_oot.h) sent as one ring entry each, "op + resolved arguments", instead of one entry
 // (or Pairs word) per register write. The front still runs the handler on its own state (shadow,
 // same-value skip, executable bookkeeping) and records which writes it would have sent; E (and
@@ -12,7 +12,7 @@
 //
 // The arguments carry what the handler read from the data RAM: E has no data RAM of its own (the
 // front's native_data_ram is the macros' while they run there), so Encode reads it on the front
-// before the handler runs (none of the six writes a word another of its own reads use).
+// before the handler runs (none of the seven writes a word its own reads use).
 
 #include <array>
 #include <span>
@@ -30,7 +30,8 @@ enum class Op : u8 {
     EA0 = 4, ///< instanced draw with the c[0][0x640] words: args p0..p5
     E08 = 5, ///< a stage's program: args p2, p3, p4 (sent only when the handler wrote)
     E52 = 6, ///< instanced draw: args p0..p5
-    Count = 7,
+    E3A = 7, ///< a stage's enable: args bits ((p0 >> 4) & 7) << 4, enabled (dram[0x52c] bit p0 & 15)
+    Count = 8,
 };
 
 inline constexpr u32 MaxArgs = 6;
@@ -59,13 +60,15 @@ struct Args {
         return Op::E08;
     case OotMacros::Id::E52:
         return Op::E52;
+    case OotMacros::Id::E3A:
+        return Op::E3A;
     default:
         return Op::None;
     }
 }
 
 [[nodiscard]] constexpr const char* OpName(Op op) noexcept {
-    constexpr const char* names[]{"none", "e02", "e1c", "e36", "ea0", "e08", "e52"};
+    constexpr const char* names[]{"none", "e02", "e1c", "e36", "ea0", "e08", "e52", "e3a"};
     const auto index = static_cast<size_t>(op);
     return index < std::size(names) ? names[index] : "?";
 }
@@ -116,6 +119,15 @@ struct Args {
         out.count = 3;
         out.a = {p[2], p[3], p[4], 0, 0, 0};
         return true;
+    case Op::E3A: {
+        if (n < 1) {
+            return false;
+        }
+        const u32 stage = p[0] & 15;
+        out.count = 2;
+        out.a = {((p[0] >> 4) & 7) << 4, (dram[0x52c] & (1U << stage)) != 0 ? 1U : 0U, 0, 0, 0, 0};
+        return true;
+    }
     case Op::EA0:
     case Op::E52:
         if (n < 6 || p[2] > max_instances || p[2] > MaxOpInstances) {
@@ -190,6 +202,11 @@ inline u32 Expand(Op op, const u32* a, F&& out) {
         emit(0x800 | stage, 1 | stage);
         break;
     }
+    case Op::E3A:
+        if (a[1] != 0) {
+            emit(0x800 | a[0], a[0]);
+        }
+        break;
     case Op::EA0:
     case Op::E52: {
         const bool ea0 = op == Op::EA0;
@@ -250,6 +267,15 @@ inline constexpr size_t HeaderWords = 3;
 /// HeaderFlags bits.
 inline constexpr u32 FlagCheck = 1;   ///< check words follow (FRITCHII_ONEF_FRONT_OPS=2 or 4)
 inline constexpr u32 FlagDirect = 2;  ///< S3: E applies the op directly (=3 or 4)
+inline constexpr u32 FlagSkipCheck = 4; ///< E checks the writes the front skipped (sampled)
+/// Flags bits 8-15: with FlagCheck, how many constant buffer word addresses (the front's, one per
+/// sent Direct data word in order) follow the final register words.
+[[nodiscard]] constexpr u32 CbAddressFlags(u32 count) noexcept {
+    return (count & 0xff) << 8;
+}
+[[nodiscard]] constexpr u32 HeaderCbAddresses(u64 h) noexcept {
+    return static_cast<u32>(h >> 40) & 0xff;
+}
 
 [[nodiscard]] constexpr size_t ArgWords(u32 args) noexcept {
     return (size_t{args} + 1) / 2;

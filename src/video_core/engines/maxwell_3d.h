@@ -3607,8 +3607,10 @@ private:
     /// E's half: the op's writes rebuilt and applied as Execute applies the entries they replace
     /// (S2), or directly (S3), then the check words compared.
     static void ApplyFrontOp(const u64* payload);
-    void ApplyFrontOpWrites(Core::System& system, u8 op, const u32* args, u64 sent, u64 pairs);
-    void ApplyFrontOpDirect(Core::System& system, u8 op, const u32* args, u64 sent, u64 pairs);
+    void ApplyFrontOpWrites(Core::System& system, u8 op, const u32* args, u64 sent, u64 pairs,
+                            const u64* cb_addresses, u32 cb_address_count, u32 checks);
+    void ApplyFrontOpDirect(Core::System& system, u8 op, const u32* args, u64 sent, u64 pairs,
+                            const u64* cb_addresses, u32 cb_address_count, u32 checks);
     void CheckFrontOp(u8 op, const u32* args, const u64* checks, u32 writes, u32 finals);
     /// FRITCHII_ONEF_DEAD_STORES (fable_b 27.7, count only): an 0xea0 call begins (`end`
     /// false: are the last call's trailing stores dead?) or ended (its stores noted).
