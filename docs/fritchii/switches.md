@@ -2614,6 +2614,28 @@ run, about 8% of an average block's bytes.
 - Expected: 0.5 to 1% of the guest cores' busy time (Fable A's estimate). Needs one fresh-launch
   A/B (boot switch).
 
+### FRITCHII_JIT_RSQRT_ZERO
+
+FRITCHII_JIT_RSQRT_ZERO (boot, read once per process, default 0 = as before;
+fable_a_gameceiling_answer 12.5). The vector reciprocal square root estimate (FRSQRTE, 32 and
+64-bit lanes, AVX hosts) has an inline path, but one lane that is NaN, negative, zero, denormal
+or +infinity sends the whole vector to C++ (0.62% of the guest cores' busy time with the other
+soft float calls; 190 samples of 322).
+- 1: the C++ fallback counts its calls by lane kind (code generation otherwise unchanged).
+- 2: also a vector whose only such lanes are exact +-0 stays inline: the other lanes are computed
+  by the inline path's own instructions (the zero lanes from 1.0), the host's exception flags are
+  saved and put back around that (the C++ estimate raises no host flags), the zero lanes become
+  infinity with the zero's sign, and FPSR.DZC is set, as FPRSqrtEstimate does for a zero. Any
+  other bad lane still takes the C++ call. Not used when FPCR.DZE (the trap) is set.
+- Exact: per lane the same values as FPRSqrtEstimate (the inline path is already trusted to match
+  it for the other lanes), and the same FPSR bits (DZC; nothing from the host's sqrt and divide).
+- "JIT vector rsqrt estimate fallbacks (FRITCHII_JIT_RSQRT_ZERO=n) 10000 ms: calls C/s, only zero
+  lanes bad Z/s (P%); lanes/s: zero, denormal, negative, NaN, +infinity; zero lanes by lane
+  a/b/c/d" (Core_ARM, Info, at most every 10 s, integer math only). At 2 the calls left are the
+  ones it could not serve.
+- Expected: 0.3 to 0.4% of the guest cores' busy time if most calls are "only zero lanes bad"
+  (Fable A's guess: a zero in the unused fourth lane of a three-component vector).
+
 ## Numbered experiments (EDEN_NX2_EXPn)
 
 Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP79, live through the debug server:
