@@ -6506,6 +6506,27 @@ int AsyncDiscardMode() {
     return mode;
 }
 
+namespace {
+/// Depth test on (a bound depth buffer alone does not test) and at least one colour target
+/// written: a depth-only pass, or a draw without a depth test (UI, a layer drawn once), waits.
+bool IsDepthTestedColorDraw(const Maxwell& regs) noexcept {
+    if (regs.zeta_enable == 0 || regs.depth_test_enable == 0) {
+        return false;
+    }
+    const u32 count = (std::min)(static_cast<u32>(regs.rt_control.count),
+                                 static_cast<u32>(Maxwell::NumRenderTargets));
+    for (u32 i = 0; i < count; ++i) {
+        const u32 rt_index = regs.rt_control.Map(i);
+        if (rt_index < Maxwell::NumRenderTargets &&
+            regs.rt[rt_index].format != Tegra::RenderTargetFormat::NONE &&
+            regs.color_mask[regs.color_mask_common ? 0 : rt_index].raw != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+} // Anonymous namespace
+
 bool PipelineCache::DrawMayBeSkipped() const {
     // Native draws whose pipeline is still building are skipped instead of waited for (the
     // object is missing for a frame or more rather than the game freezing while the driver
@@ -6530,12 +6551,29 @@ bool PipelineCache::DrawMayBeSkipped() const {
     // Classified in every mode, for the counts (with 1, the persistent column is what today's
     // rule drops for good); it runs per missing pipeline, not per draw.
     const VideoCommon::DrawTargets targets = texture_cache.ClassifyDrawTargets();
-    const bool recurring =
+    bool recurring =
         mode != 2 || !native || targets.kind == VideoCommon::DrawTargetClass::Recurring;
+    // FRITCHII_ASYNC_REDRAWN (live, default 0; port of TheuZCoder's Fritchii fork 2e0cf33368):
+    // depth-tested colour draws into targets the game writes every frame without clearing them
+    // (OoT's scene colour, which the sky or terrain covers instead of a clear) count as recurring
+    // too. Before, each new object or effect drawn there waited for its pipeline: a stall in
+    // Hyrule Field and on the first hit on a new enemy. Layers drawn once or now and then,
+    // depth-only passes and draws without a depth test still wait.
+    bool redrawn = false;
+    if (!recurring && targets.kind_if_redrawn == VideoCommon::DrawTargetClass::Recurring &&
+        VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_async_redrawn,
+                                         "FRITCHII_ASYNC_REDRAWN") > 0 &&
+        IsDepthTestedColorDraw(maxwell3d->regs)) {
+        recurring = true;
+        redrawn = true;
+    }
     const bool skip = CanDiscardPendingDraw(native, maxwell3d->regs.zeta_enable != 0,
                                             draw_state.draw_element_count,
                                             draw_state.draw_element_count, mode != 0, recurring);
     discard_decision = DiscardDecision{.serial = lookup_serial, .skip = skip};
+    if (skip && redrawn) {
+        ++discard_stats.skipped_redrawn;
+    }
     NoteDiscardDecision(skip, targets);
     return skip;
 }
@@ -6588,12 +6626,14 @@ void PipelineCache::ReportAsyncDiscard() {
         const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
         LOG_INFO(Render_Vulkan,
                  "Async discard in the last 10 s (EDEN_NX2_ASYNC_DISCARD={}): lookups of "
-                 "unbuilt pipelines skipped {} recurring, {} first-time, {} persistent; waited "
-                 "{} recurring, {} first-time, {} persistent; {:.1f} ms of draws held for "
-                 "unbuilt pipelines, {:.1f} ms of GPU thread waiting for translations",
-                 AsyncDiscardMode(), skipped[0], skipped[1], skipped[2], waited[0], waited[1],
-                 waited[2], ms(held), ms(stats.queue_wait));
+                 "unbuilt pipelines skipped {} recurring, {} first-time, {} persistent ({} of "
+                 "them into redrawn targets, FRITCHII_ASYNC_REDRAWN); waited {} recurring, {} "
+                 "first-time, {} persistent; {:.1f} ms of draws held for unbuilt pipelines, "
+                 "{:.1f} ms of GPU thread waiting for translations",
+                 AsyncDiscardMode(), skipped[0], skipped[1], skipped[2], stats.skipped_redrawn,
+                 waited[0], waited[1], waited[2], ms(held), ms(stats.queue_wait));
     }
+    stats.skipped_redrawn = 0;
     stats.skipped = {};
     stats.waited = {};
     stats.queue_wait = {};
