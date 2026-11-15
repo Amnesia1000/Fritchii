@@ -383,14 +383,16 @@ void NoteCbGuardHit() noexcept;
 ///          tiled_cache_barrier, report_semaphore.query, clear_report_value, sync_info. E1 runs
 ///          the method (register write, dirty flags, the values the handler reads); the one
 ///          rasterizer call it ends in goes to E2 by value (QueueRasterOp).
-///   bit 2, compute engine entries (default off): every Method, Multi and Pairs entry of the
-///          compute engine, its sink included, on E2 with the engine named by value. Its
-///          dispatches' reads of 3D state are not proven absent yet.
+///   bit 2, compute engine entries: every Method, Multi and Pairs entry of the compute engine,
+///          its sink included, on E2 with the engine named by value. KeplerCompute and the
+///          rasterizer's DispatchCompute read no Maxwell3D register (checked in the code: the
+///          OoT network bypass reads the tonemap target under its own lock, recorded on R as
+///          today); the engine is E2's alone then (E1 touches it only in joins, E2 drained).
 enum AsyncKindBit : u32 {
     KindCacheCalls = 1,
     KindRasterOps = 2,
     KindCompute = 4,
-    KindsDefault = KindCacheCalls | KindRasterOps,
+    KindsDefault = KindCacheCalls | KindRasterOps | KindCompute,
 };
 /// E1 writes it at a batch's start, E2 drained.
 inline u32 g_async_kinds{};

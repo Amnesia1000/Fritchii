@@ -2322,7 +2322,7 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   idle, so E1 does not wait for it before the lookup. Exact for the same reason the tail flush
   with E2 behind is: what it invalidates is on no shader page, and the lookup reads shader code
   and the pipeline cache only. Counted in the cb words line ("draw flushes").
-- FRITCHII_ESPLIT_ASYNC_KINDS (live, default 3; with FRITCHII_ESPLIT=1 in the queued mode): the
+- FRITCHII_ESPLIT_ASYNC_KINDS (live, default 7; with FRITCHII_ESPLIT=1 in the queued mode): the
   E2 entries that go to E2's queue instead of a join (E2 drained, E1 runs it). Bit 0, memory stage
   cache calls (Call entries tagged StageTag::Cache: fence releases, GPU cache invalidations,
   reference signals, the puller's wait for idle and semaphore releases, the compute list words;
@@ -2330,10 +2330,11 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   raster ops: wait_for_idle, fragment_barrier, invalidate_texture_data_cache, tiled_cache_barrier,
   report_semaphore.query, clear_report_value, sync_info run on E1 (register write, dirty flags,
   the values the handler reads) and the one rasterizer call each ends in goes to E2 by value
-  (also when a macro or a pairs block on E1 writes them). Bit 2, compute engine entries (default
-  off): every Method, Multi and Pairs entry of the compute engine, its sink included, on E2 with
-  the engine by value (GpuSplit::ExecuteOnEngine); its dispatches' reads of 3D state are not
-  proven absent yet. A change drains E2 first. The thread's lines name the entries that still
+  (also when a macro or a pairs block on E1 writes them). Bit 2, compute engine entries: every
+  Method, Multi and Pairs entry of the compute engine, its sink included, on E2 with the engine by
+  value (GpuSplit::ExecuteOnEngine); KeplerCompute and DispatchCompute read no Maxwell3D register
+  (the OoT network bypass reads the tonemap target under its lock, recorded on R as today). 3 =
+  compute entries back to joins if an image differs. A change drains E2 first. The thread's lines name the entries that still
   join, by kind ("entries that join ... top kinds": engine, ring kind, method, or a call's tag and
   function), top 8 with rates. E2Order covers the queue's order. Also: the S4 constant buffer
   path no longer joins on the GPU profile's price timers (they time the memory half on E2).
