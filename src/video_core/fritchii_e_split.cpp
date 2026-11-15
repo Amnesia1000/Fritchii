@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <bitset>
 #include <cstring>
@@ -135,6 +136,37 @@ const Flags& BufferFlags() {
     return mask;
 }
 
+// The buffer flags are one run of the flag numbers: VertexBuffers, VertexBuffer0..31, IndexBuffer.
+constexpr u32 FlagFirst = Dirty::VertexBuffers;
+constexpr u32 FlagLast = Dirty::IndexBuffer;
+static_assert(Dirty::VertexBuffer0 == FlagFirst + 1 && Dirty::VertexBuffer31 == FlagFirst + 32 &&
+              FlagLast == FlagFirst + 33);
+static_assert(FlagProbe::FlagIndex == Dirty::VertexBuffers);
+constexpr u64 PackedVertexBuffers = 1;
+constexpr u64 PackedBindings = u64{0xffff'ffff} << 1;
+constexpr u64 PackedIndexBuffer = u64{1} << 33;
+
+/// The buffer flags as 34 bits (bit 0 VertexBuffers, 1..32 VertexBuffer0..31, 33 IndexBuffer).
+[[nodiscard]] u64 PackFlags(const Flags& flags) noexcept {
+    static const Flags low = [] {
+        Flags bits;
+        for (u32 i = 0; i <= FlagLast - FlagFirst; ++i) {
+            bits.set(i);
+        }
+        return bits;
+    }();
+    return ((flags >> FlagFirst) & low).to_ullong();
+}
+
+[[nodiscard]] Flags UnpackFlags(u64 packed) noexcept {
+    return Flags{packed} << FlagFirst;
+}
+
+/// The packed buffer flag a register word's dirty table entry names, 0 for any other flag.
+[[nodiscard]] u64 PackedBit(u8 flag) noexcept {
+    return flag >= FlagFirst && flag <= FlagLast ? u64{1} << (flag - FlagFirst) : 0;
+}
+
 // --- Counters ------------------------------------------------------------------------------------
 
 enum class Diff : u8 { Register, Binding, RootWord, DrawState, Indirect, BufferFlag, Count };
@@ -165,6 +197,16 @@ struct Counts {
     u64 seeds{};
     u64 untracked{};
     u64 flag_syncs{};
+    // The buffer flag take (draw records): records that carried one, and its flags by kind.
+    u64 take_records{};
+    u64 take_vertex_buffers{};
+    u64 take_bindings{}; ///< per-binding flags (bits)
+    u64 take_index_buffer{};
+    /// VertexBuffers 0 to 1 edges by site: FlagSite, then an E2 entry, a join, a lend.
+    std::array<u64, static_cast<size_t>(FlagSite::Count) + 3> rises{};
+    // Channel calls (E1's; E2 takes the bind in order): all, and the ones whose bind lent.
+    u64 channel_calls{};
+    u64 channel_lends{};
     // 3
     u64 view_fills{};
     u64 fallback_differ{};
@@ -182,6 +224,16 @@ u64 g_since_ns{};
 u64 g_since_ticks{};
 u32 g_rng = 0x2545f491u;
 thread_local bool t_back{}; ///< set on E (BatchLevel's thread)
+
+constexpr size_t RiseE2Entry = static_cast<size_t>(FlagSite::Count);
+constexpr size_t RiseJoin = RiseE2Entry + 1;
+constexpr size_t RiseLend = RiseE2Entry + 2;
+/// The viewed engine's flags, for the state tracker hook on any thread (written on E at a seed).
+std::atomic<const void*> g_view_flags{};
+/// Its counts by thread: E, R in a lent call (E parked), any other (unordered with E).
+std::array<std::atomic<u64>, 3> g_tracker_raises{};
+bool g_entry_vb{};   ///< the engine's VertexBuffers before an E2 entry or a join (2 and 3)
+bool g_lend_vb{};    ///< ... before a lend
 
 [[nodiscard]] bool Take() noexcept {
     u32 x = g_rng;
@@ -231,7 +283,8 @@ struct RecordHeader {
     u16 roots;
     u8 draw;
     u8 indirect;
-    u8 reserved[2];
+    u8 take; ///< a draw record: the buffer flag take (one u64) follows the roots
+    u8 reserved;
     u64 position;
 };
 static_assert(sizeof(RecordHeader) % 8 == 0);
@@ -272,8 +325,8 @@ struct DrawPart {
 constexpr size_t RingBytes = size_t{1} << 18;
 constexpr size_t MaxRecordBytes = sizeof(RecordHeader) + NumRegs * sizeof(RecordPair) +
                                   Bindings * sizeof(RecordBind) + RootWords * sizeof(RecordRoot) +
-                                  sizeof(DrawPart) + sizeof(Maxwell3D::DrawManager::IndirectParams) +
-                                  64;
+                                  sizeof(u64) + sizeof(DrawPart) +
+                                  sizeof(Maxwell3D::DrawManager::IndirectParams) + 64;
 static_assert(MaxRecordBytes < RingBytes);
 
 [[nodiscard]] constexpr size_t Padded(size_t bytes) noexcept {
@@ -321,6 +374,7 @@ void Seed(const Maxwell3D& engine) {
     g_view.flags = engine.dirty.flags & BufferFlags();
     g_view.engine = &engine;
     g_view.seeded = true;
+    g_view_flags.store(&engine.dirty.flags, std::memory_order_relaxed);
     ClearPending();
     ++g_c.seeds;
 }
@@ -337,12 +391,16 @@ const u8* Build(const Maxwell3D& engine, bool draw, bool list_args) {
     u8* const base = g_ring.data() + g_ring_at;
     RecordHeader header{};
     size_t at = sizeof(RecordHeader);
+    const auto& table0 = engine.dirty.tables[0];
+    const auto& table1 = engine.dirty.tables[1];
+    u64 table_bits = 0; ///< the buffer flags this record's words raise (Consume raises them)
     for (const u16 index : g_touched) {
         g_noted.reset(index);
         const RecordPair pair{index, engine.regs.reg_array[index]};
         std::memcpy(base + at, &pair, sizeof(pair));
         at += sizeof(pair);
         ++header.pairs;
+        table_bits |= PackedBit(table0[index]) | PackedBit(table1[index]);
     }
     g_touched.clear();
     at = Padded(at);
@@ -377,6 +435,29 @@ const u8* Build(const Maxwell3D& engine, bool draw, bool list_args) {
     g_roots = {};
     at = Padded(at);
     if (draw) {
+        // The buffer flag take. Every buffer flag on the engine is E2's in the split, but writers
+        // other than the register words raise them on E1's side too: the Vulkan state tracker's
+        // invalidations (new command buffer, InvalidateState), a lent call's flags (both views
+        // take the engine's after it), the cache's own marks. In the split E1 takes the raised
+        // ones off its engine at each draw record (read and clear: E2 never writes E1's engine,
+        // its fill clears its own copy) and E2 raises them in its view. Here the engine is one
+        // object, so the take is what the engine holds and the view lacks: between two places
+        // where the view takes the engine's flags whole (a fill, a lend, a seed) nothing but a
+        // fill clears a buffer flag, so that is exactly what was raised (the compare checks it:
+        // a flag the view holds and the engine does not would count). E2 reads the buffer flags
+        // only in a fill, which a draw record precedes, so raises arriving here instead of when
+        // they were made change nothing it reads (they are ORs); a raise by E2's own work (in the
+        // split straight into its copy) comes the same way here. FlagSite counts where they rose.
+        const u64 take = PackFlags(engine.dirty.flags) & ~(PackFlags(g_view.flags) | table_bits);
+        std::memcpy(base + at, &take, sizeof(take));
+        at += sizeof(take);
+        header.take = 1;
+        if (take != 0) {
+            ++g_c.take_records;
+            g_c.take_vertex_buffers += (take & PackedVertexBuffers) != 0 ? 1 : 0;
+            g_c.take_bindings += static_cast<u64>(std::popcount(take & PackedBindings));
+            g_c.take_index_buffer += (take & PackedIndexBuffer) != 0 ? 1 : 0;
+        }
         const auto& state = engine.draw_manager.draw_state;
         DrawPart part{};
         part.vertex_buffer = state.vertex_buffer;
@@ -448,6 +529,14 @@ void Consume(const u8* record, const Maxwell3D& engine) {
         g_view.root_tables.loaded = true;
     }
     at = Padded(at);
+    if (header.take != 0) {
+        u64 take;
+        std::memcpy(&take, record + at, sizeof(take));
+        at += sizeof(take);
+        if (take != 0) {
+            g_view.flags |= UnpackFlags(take);
+        }
+    }
     if (header.draw != 0) {
         DrawPart part;
         std::memcpy(&part, record + at, sizeof(part));
@@ -687,6 +776,10 @@ void SetLevel(int level) {
     }
     ClearPending();
     g_view.seeded = false;
+    g_view_flags.store(nullptr, std::memory_order_relaxed);
+    for (auto& count : g_tracker_raises) {
+        count.store(0, std::memory_order_relaxed);
+    }
     LOG_INFO(HW_GPU,
              "E split count (FRITCHII_ESPLIT_COUNT={}): {} (was {}); W2 {} register words in {} "
              "ranges",
@@ -724,20 +817,23 @@ void Report(u64 now_ns) {
              level, c.timed, profiled ? "on" : "off", e1, rate(c.entries[cls(Class::E1)]), e2,
              rate(c.entries[cls(Class::E2)]), join, rate(c.entries[cls(Class::Join)]), lend,
              rate(c.lends), e1 + e2 + join + lend);
-    const u64 joins = c.joins[0] + c.joins[1] + c.joins[2] + c.joins[3];
+    const u64 joins = c.joins[0] + c.joins[1] + c.joins[2];
     const u64 decisions = c.stalls[0] + c.stalls[1];
     const auto join_rate = [&](JoinCause k) { return rate(c.joins[static_cast<size_t>(k)]); };
     const auto stall_rate = [&](StallCause k) { return rate(c.stalls[static_cast<size_t>(k)]); };
     LOG_INFO(HW_GPU,
              "E split count (FRITCHII_ESPLIT_COUNT={}) 10 s: stall points {:.0f}/s = joins "
-             "{:.0f} (upload {:.0f}, other engine {:.0f}, untagged call {:.0f}, channel {:.0f}) "
-             "+ E1 decisions {:.0f} (game memory reads {:.0f}, lookups after a shader page "
-             "write {:.0f}); conditions from memory {:.0f}/s (forwarded, decided on E2); E2 to "
-             "E1 flag raises {:.0f}/s; draws filled {:.0f}/s",
+             "{:.0f} (upload {:.0f}, other engine {:.0f}, untagged call {:.0f}) + E1 decisions "
+             "{:.0f} (game memory reads {:.0f}, lookups after a shader page write {:.0f}); "
+             "channel calls {:.0f}/s, no join (E1 runs them, E2 takes the bind in order): {:.0f} "
+             "switch (their bind lends, E2 parks in the lend), {:.0f} bind the bound channel "
+             "again; conditions from memory {:.0f}/s (forwarded, decided on E2); E2 to E1 flag "
+             "raises {:.0f}/s; draws filled {:.0f}/s",
              level, rate(joins + decisions), rate(joins), join_rate(JoinCause::Upload),
              join_rate(JoinCause::OtherEngine), join_rate(JoinCause::UntaggedCall),
-             join_rate(JoinCause::Channel), rate(decisions),
-             stall_rate(StallCause::MemoryDecision), stall_rate(StallCause::ShaderWrite),
+             rate(decisions), stall_rate(StallCause::MemoryDecision),
+             stall_rate(StallCause::ShaderWrite), rate(c.channel_calls), rate(c.channel_lends),
+             rate(c.channel_calls - (std::min)(c.channel_lends, c.channel_calls)),
              rate(c.conditions), rate(c.back_raises), rate(c.draws));
     // The hand-over: estimated at 1 (fritchii design 2b: 0.15 us a filled draw, 0.05 us an E2
     // entry), measured at 2 and 3 (build + consume, 1 in 64 hand-overs timed).
@@ -784,6 +880,24 @@ void Report(u64 now_ns) {
                  per(c.draw_pairs, c.records[1]), build, consume, ms(c.compare_ticks), differs,
                  c.compares, c.differs[0], c.differs[1], c.differs[2], c.differs[3], c.differs[4],
                  c.differs[5], g_differs_total, c.seeds, c.untracked, rate(c.flag_syncs));
+        const auto rise = [&](size_t site) { return rate(c.rises[site]); };
+        const auto tracker = [&](size_t who) {
+            return rate(g_tracker_raises[who].exchange(0, std::memory_order_relaxed));
+        };
+        LOG_INFO(HW_GPU,
+                 "E split count (FRITCHII_ESPLIT_COUNT={}) 10 s: buffer flag take (raised on the "
+                 "engine outside the register records, handed over with the draw record) "
+                 "{:.0f}/s draw records: VertexBuffers {:.0f}/s, per-binding flags {:.0f}/s, "
+                 "IndexBuffer {:.0f}/s; VertexBuffers rose (0 to 1) in: the draw's stream flush "
+                 "{:.0f}/s, its pipeline lookup {:.0f}/s, its TickWork {:.0f}/s, E2 entries "
+                 "{:.0f}/s, joins {:.0f}/s, lends {:.0f}/s; state tracker invalidations on the "
+                 "viewed engine: on E {:.0f}/s, R in a lent call {:.0f}/s, other threads {:.0f}/s "
+                 "(must be 0: unordered with E)",
+                 level, rate(c.take_records), rate(c.take_vertex_buffers), rate(c.take_bindings),
+                 rate(c.take_index_buffer), rise(static_cast<size_t>(FlagSite::StreamFlush)),
+                 rise(static_cast<size_t>(FlagSite::Lookup)),
+                 rise(static_cast<size_t>(FlagSite::TickWork)), rise(RiseE2Entry),
+                 rise(RiseJoin), rise(RiseLend), tracker(0), tracker(1), tracker(2));
     }
     if (level >= 3) {
         LOG_INFO(HW_GPU,
@@ -845,10 +959,17 @@ void BeforeEntry(const EntryInfo& info) noexcept {
         ++g_c.joins[static_cast<size_t>(info.cause)];
         g_shader_window = false; // E2 drained
     }
-    // The rehearsal's own work before the timer starts: the entry's time stays its own.
-    if (g_records && info.cls == Class::E2 && g_engine3d != nullptr) {
+    if (info.channel) {
+        ++g_c.channel_calls;
+    }
+    // The rehearsal's own work before the timer starts: the entry's time stays its own. A
+    // channel call is handed over too: E2 takes the bind in order, after the records before it.
+    if (g_records && (info.cls == Class::E2 || info.channel) && g_engine3d != nullptr) {
         (void)HandOver(*g_engine3d, false, false);
     }
+    // Where the engine's VertexBuffers rises outside the records: E2 entries and joins.
+    g_entry_vb = !(g_records && info.cls != Class::E1 && g_view.seeded) ||
+                 g_view.engine->dirty.flags[Dirty::VertexBuffers]; // no edge counted then
     if (Take()) {
         g_state |= StateSampling;
         g_cur = info.cls;
@@ -865,6 +986,10 @@ void AfterEntry(std::size_t size) noexcept {
         ++g_c.timed;
     }
     ++g_c.entries[static_cast<size_t>(g_entry_class)];
+    if (g_records && g_entry.cls != Class::E1 && g_view.seeded && !g_entry_vb &&
+        g_view.engine->dirty.flags[Dirty::VertexBuffers]) {
+        ++g_c.rises[g_entry.cls == Class::Join ? RiseJoin : RiseE2Entry];
+    }
     // E2 runs the constant buffer words itself in the split: its offset advances by them.
     if (g_records && g_entry.cb_entry && g_view.seeded) {
         const u64 words = g_entry.cb_words != 0 ? g_entry.cb_words : size;
@@ -899,7 +1024,12 @@ bool BeginLend() noexcept {
         return false;
     }
     ++g_c.lends;
+    if (g_entry.channel) {
+        ++g_c.channel_lends; // a real switch: RasterizerVulkan::BindChannel lent
+    }
     g_shader_window = false; // E2 drains to the lend's place
+    g_lend_vb = !(g_records && g_view.seeded) ||
+                g_view.engine->dirty.flags[Dirty::VertexBuffers]; // unseeded: no edge counted
     g_lend_pushed = (g_state & StateSampling) != 0 && PushCarve(Class::Lend);
     return true;
 }
@@ -911,7 +1041,11 @@ void EndLend() noexcept {
     // R's run left the engine's buffer flags as it used them; both stages are parked in a lend,
     // so E2 takes them (the registers R wrote come in the next record).
     if (g_records && g_view.seeded && g_view.engine != nullptr) {
-        g_view.flags = (g_view.flags & ~BufferFlags()) | (g_view.engine->dirty.flags & BufferFlags());
+        const Flags& flags = g_view.engine->dirty.flags;
+        if (!g_lend_vb && flags[Dirty::VertexBuffers]) {
+            ++g_c.rises[RiseLend];
+        }
+        g_view.flags = (g_view.flags & ~BufferFlags()) | (flags & BufferFlags());
         ++g_c.flag_syncs;
     }
 }
@@ -951,6 +1085,20 @@ void NoteDrawFilledImpl() noexcept {
     if (t_back) {
         ++g_c.draws;
     }
+}
+
+void NoteFlagRiseImpl(FlagSite site) noexcept {
+    if (t_back) {
+        ++g_c.rises[static_cast<size_t>(site)];
+    }
+}
+
+void NoteTrackerInvalidationImpl(const void* flags) noexcept {
+    if (flags == nullptr || flags != g_view_flags.load(std::memory_order_relaxed)) {
+        return;
+    }
+    const size_t who = t_back ? 0 : OneF::InLent() ? 1 : 2;
+    g_tracker_raises[who].fetch_add(1, std::memory_order_relaxed);
 }
 
 void SetEntryClassImpl(Class cls) noexcept {

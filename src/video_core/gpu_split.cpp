@@ -3086,7 +3086,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                     info.cls = Class::E2;
                     break;
                 case StageTag::Channel:
-                    join(JoinCause::Channel);
+                    // E1's (GPU::Impl's bound id): E2 takes the bind in order; a real switch's
+                    // bind lends, and the lend parks both stages (fritchii_e_split.h).
+                    info.channel = true;
                     break;
                 case StageTag::Level:
                     join(JoinCause::UntaggedCall); // no tag: unclassified

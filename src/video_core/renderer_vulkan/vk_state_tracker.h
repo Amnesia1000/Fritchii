@@ -11,6 +11,7 @@
 #include "common/common_types.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/fritchii_e_split.h"
 #include "video_core/memstage_shadow.h"
 #include "video_core/vulkan_common/vulkan.h"
 
@@ -87,6 +88,7 @@ public:
     void InvalidateCommandBufferState() {
         (*flags) |= invalidation_flags;
         VideoCommon::MemStageShadow::NoteFlagInvalidation();
+        VideoCommon::ESplit::NoteTrackerInvalidation(flags); // FRITCHII_ESPLIT_COUNT >= 2
         current_topology = INVALID_TOPOLOGY;
         current_host_topology = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
         stencil_reset = true;
