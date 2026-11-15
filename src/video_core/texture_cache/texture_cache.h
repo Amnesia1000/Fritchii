@@ -1354,7 +1354,12 @@ void TextureCache<P>::SweepColdImages() {
         const char* value = std::getenv("EDEN_NX2_TC_COLD_GUARDED");
         return value != nullptr && value[0] == '1';
     }();
-    constexpr u32 MaxPerFrame = 16;
+    // FRITCHII_COLD_SWEEP_MAX (live, default 0 = 16): images deleted a frame at most. zortos
+    // #1571 retires up to 512 a frame: in the guard house 7,858 dead targets built up within
+    // seconds there. The cap line below says whether 16 is ever reached here.
+    const int cap_value = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_cold_sweep_max,
+                                                           "FRITCHII_COLD_SWEEP_MAX");
+    const u32 MaxPerFrame = cap_value > 0 ? static_cast<u32>(cap_value) : 16;
     constexpr u64 MaxWatchFrames = 600; // then a watched image that never got BadOverlap leaves
     constexpr ImageFlagBits excluded =
         ImageFlagBits::Sparse | ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
@@ -1484,7 +1489,15 @@ void TextureCache<P>::SweepColdImages() {
         drop();
     }
     cold_deleted += deleted;
+    cold_cap_frames += deleted >= MaxPerFrame ? 1 : 0;
+    if (frame_tick % 600 == 0 && (cold_cap_frames != 0 || cap_value > 0)) {
+        LOG_INFO(HW_GPU,
+                 "Cold sweep cap (FRITCHII_COLD_SWEEP_MAX={}) last 600 frames: {} a frame at "
+                 "most, reached in {} frames, {} watched now",
+                 (std::max)(cap_value, 0), MaxPerFrame, cold_cap_frames, cold_watch.size());
+    }
     if (frame_tick % 600 == 0) {
+        cold_cap_frames = 0;
         LOG_INFO(HW_GPU,
                  "Cold sweep (EDEN_NX2_TC_COLD_FRAMES={}{}) last 600 frames: {} chain images "
                  "deleted ({} of them guarded but superseded, EXP58), {} kept as GPU-written and "

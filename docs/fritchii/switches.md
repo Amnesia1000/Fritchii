@@ -3619,6 +3619,13 @@ at full cache clears and shutdown (host bytes are read when written, so links sh
   16-24 -> 42-51 fps; 2 lost fps standing). Line every 600 frames "Superseded sweep
   (FRITCHII_SWEEP_SUPERSEDED=N)": images and MiB deleted, images looked at, ms spent.
   Skitchii's EDEN_NX2_IMAGE_POOL_MIB is EXP66 here (live, MiB).
+- FRITCHII_COLD_SWEEP_MAX (live, default 0 = 16): the cold sweep's per-frame delete cap
+  (EDEN_NX2_TC_COLD_FRAMES). zortos #1571 (jpkto) and #1285 (Ghostwolf13) delete dead
+  overwritten render targets early, 10 or 8 unused frames, up to 512 or 64 a frame: the guard
+  house built up 7,858 dead targets and 27 GB within seconds there, the market lost the device on
+  8 GB cards. The cold sweep (4 frames, on by default) and EXP64 already do that here, at most 16
+  a frame; this raises the cap. Line every 600 frames "Cold sweep cap (...)" whenever the cap was
+  reached (also with the switch at 0): frames that stopped at the cap, images watched.
 
 ## Numbered experiments (EDEN_NX2_EXPn)
 

@@ -1194,6 +1194,7 @@ private:
     std::vector<std::pair<ImageId, u64>> cold_watch; ///< Image, frame_tick it was put on
     ::Common::unordered_set<ImageId> cold_watch_set;
     u64 cold_deleted{};       ///< Since the last report
+    u64 cold_cap_frames{};    ///< Frames the sweep stopped at its per-frame cap, since the report
     /// Images made since the last cold sweep report, per (format, width), with their heights
     /// (fable52_answer_13 section 6: in the Stalchild fight new render target sizes one pixel
     /// apart, 528x513 to 528x527, kept making images). Logged with the cold sweep line.

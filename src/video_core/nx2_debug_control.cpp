@@ -674,6 +674,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_SWEEP_SUPERSEDED") {
         return &g_sweep_superseded;
     }
+    if (name == "FRITCHII_COLD_SWEEP_MAX") {
+        return &g_cold_sweep_max;
+    }
     if (name == "FRITCHII_NOTED_OVERFLOW") {
         return &g_noted_overflow;
     }

@@ -421,6 +421,9 @@ inline std::atomic<int> g_tc_collect_evictable{-1};
 /// 16fb54111d): GPU-written images untouched for N frames whose memory a newer image of another
 /// shape covers are deleted without a download, checked every min(N, 30) frames.
 inline std::atomic<int> g_sweep_superseded{-1};
+/// FRITCHII_COLD_SWEEP_MAX (live, default 0 = 16; helper AG, the part of zortos #1571 we lack):
+/// how many images the cold sweep deletes a frame at most.
+inline std::atomic<int> g_cold_sweep_max{-1};
 /// FRITCHII_NOTED_OVERFLOW (live, default 0; F7, with FRITCHII_NOTED_FAST 1 to 3): the table's
 /// overflow answer of NotedWriteSinceFast asked again of the note chains, which keep the position
 /// of each forgotten link: 1 = on (a chain-proved "no write" answers at FRITCHII_NOTED_FAST=1),
