@@ -158,6 +158,14 @@ public:
     bool HasFarCode() const { return far_code_begin != 0; }
     /// Offset of the far region in the code space (0 without one).
     size_t FarCodeBegin() const { return far_code_begin; }
+    /// Bytes used in the near region (blocks, after the prelude) and in the far one.
+    size_t NearCodeUsed() const {
+        return (in_far_code ? near_code_offset : size_) -
+               size_t(static_cast<const u8*>(code_begin) - getCode());
+    }
+    size_t FarCodeUsed() const {
+        return far_code_begin == 0 ? 0 : (in_far_code ? size_ : far_code_offset) - far_code_begin;
+    }
     /// Emission continues in the far region (where it last stopped) / back in the near one.
     void SwitchToFarCode();
     void SwitchToNearCode();

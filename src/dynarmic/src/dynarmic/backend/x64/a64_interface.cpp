@@ -628,6 +628,11 @@ private:
                     ++conf.counters->cache_clears;
                 }
                 code_dump.Flush(); // FRITCHII_JIT_DUMP: before the code goes
+                if (block_of_code.HasFarCode()) {
+                    // FRITCHII_JIT_FAR_CODE: how full each region was (the 5/8 : 3/8 split).
+                    LOG_INFO(Core_ARM, "JIT cache clear (FRITCHII_JIT_FAR_CODE) core {}: near {} MiB used, far {} MiB used",
+                             conf.processor_id, block_of_code.NearCodeUsed() >> 20, block_of_code.FarCodeUsed() >> 20);
+                }
                 block_of_code.ClearCache();
                 emitter.ClearCache();
             } else {
