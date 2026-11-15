@@ -691,8 +691,8 @@ void Maxwell3D::NoteFastDrawCountData(GPUVAddr begin, GPUVAddr end, bool unchang
     }
 }
 
-Maxwell3D::ConstantWrite Maxwell3D::CompareConstantData(GPUVAddr begin, const void* data,
-                                                       u64 bytes) {
+Maxwell3D::ConstantWrite Maxwell3D::CompareConstantData(
+    GPUVAddr begin, const void* data, u64 bytes, const VideoCommon::ESplit::CbTarget& target) {
     // EXP107: OoT rewrites ~258k constant buffer blocks a
     // second with the words memory already holds. This runs on the thread that writes them, in
     // order, after everything sent before (the split's back), so memory is what the write lands on.
@@ -726,8 +726,13 @@ Maxwell3D::ConstantWrite Maxwell3D::CompareConstantData(GPUVAddr begin, const vo
         return ConstantWrite::Unchanged;
     }
     // Texture and sampler header writes still take the write (the original never skips them), also
-    // through another GPU address mapping the pools' device memory.
-    const FastDrawCountPools pools = FastDrawCountPoolRanges();
+    // through another GPU address mapping the pools' device memory. The pools as the registers
+    // had them at the words (FillConstantWordsTarget, FRITCHII_ESPLIT=1): E2 may run this after
+    // E1 moved on. Otherwise the registers now, which are those.
+    const FastDrawCountPools pools =
+        target.pools
+            ? FastDrawCountPools{target.tic, target.tic_size, target.tsc, target.tsc_size}
+            : FastDrawCountPoolRanges();
     const GPUVAddr end = begin + bytes;
     if ((begin < pools.tic + pools.tic_size && pools.tic < end) ||
         (begin < pools.tsc + pools.tsc_size && pools.tsc < end)) {
@@ -1053,6 +1058,9 @@ void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods,
         values[i] = replay ? shadow_state.reg_array[methods[i]] : arguments[i];
     }
     if (perf_verify) {
+        // FRITCHII_ESPLIT=1: the read-back below needs the words written, so E1 writes them
+        // itself with E2 drained (a join), not through E2's queue.
+        const VideoCommon::ESplit::JoinScope esplit_join{VideoCommon::ESplit::Join::CbWrite};
         for (u32 i = 0; i < count; ++i) {
             CallMethod(system, methods[i], arguments[i], true);
         }
@@ -1095,11 +1103,67 @@ void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods,
         regs.const_buffer.offset += static_cast<u32>(bytes);
         return;
     }
+    // The memory half from the words' target by value (FRITCHII_ESPLIT=1 on E1: a record E2
+    // runs in ring order, or a join), then the register half: the offset.
+    VideoCommon::ESplit::CbTarget target;
+    FillConstantWordsTarget(target, offset);
+    if (!VideoCommon::ESplit::CbWrite(*this, target, values.data(), static_cast<u32>(bytes),
+                                      true)) {
+        WriteConstantWords(target, values.data(), static_cast<u32>(bytes), true);
+    }
+    regs.const_buffer.offset += static_cast<u32>(bytes);
+}
+
+void Maxwell3D::FillConstantWordsTarget(VideoCommon::ESplit::CbTarget& target, u32 offset) const {
+    target.address = regs.const_buffer.Address();
+    target.size = regs.const_buffer.size;
+    target.offset = offset;
+    target.count_fast_draw = VideoCommon::Nx2FastDrawCount::g_on;
+    target.pools = VideoCommon::ESplit::g_thread;
+    target.may_defer = false;
+    if (target.pools) [[unlikely]] {
+        // FRITCHII_ESPLIT=1: the pools by value (the half may run on E2 later). The fast draw
+        // count's notes read the registers, the price timers E's own state: those writes stay
+        // where the register half runs (a join on E1).
+        const FastDrawCountPools pools = FastDrawCountPoolRanges();
+        target.tic = pools.tic;
+        target.tic_size = pools.tic_size;
+        target.tsc = pools.tsc;
+        target.tsc_size = pools.tsc_size;
+        target.may_defer = !target.count_fast_draw && !VideoCommon::FritchiiPrice::On();
+    }
+}
+
+void Maxwell3D::WriteConstantWords(const VideoCommon::ESplit::CbTarget& target, const u32* values,
+                                   u32 bytes, bool block) {
+    if (!block) {
+        // ProcessCBMultiData's write (its words clipped to the buffer by the caller).
+        const GPUVAddr address = target.address + target.offset;
+        // EDEN_NX2_MEMSTAGE_STATS: constant buffer words, and whether they land on texture pages.
+        if (VideoCommon::MemStageStats::Enabled() && bytes != 0) [[unlikely]] {
+            VideoCommon::MemStageStats::StreamWrite(
+                VideoCommon::MemStageStats::Write::CbWords,
+                memory_manager.GpuToCpuAddress(address).value_or(0), bytes);
+        }
+        // EXP107: as in the block write below.
+        const ConstantWrite compared = bytes != 0
+                                           ? CompareConstantData(address, values, bytes, target)
+                                           : ConstantWrite::Changed;
+        if (target.count_fast_draw && bytes != 0) [[unlikely]] {
+            NoteFastDrawCountData(address, address + bytes, compared != ConstantWrite::Changed);
+        }
+        if (bytes != 0 && compared != ConstantWrite::Skip &&
+            !WriteBoundConstantBuffer(target, values, bytes)) {
+            memory_manager.WriteBlockCached(address, values, bytes);
+        }
+        return;
+    }
+    const u32 count = bytes / static_cast<u32>(sizeof(u32));
     // fable_stage_levelpoints 18.4 row 3 (GPU profile on, the back): the write half's time by run
     // length. Off: the profile's test and a branch.
     const VideoCommon::FritchiiPrice::CbWriteScope price_scope{count};
     const VideoCommon::Nx2Profile::FineScope upload_scope{VideoCommon::Nx2Profile::Zone::CbUpload};
-    const GPUVAddr destination = address + offset;
+    const GPUVAddr destination = target.address + target.offset;
     // EDEN_NX2_MEMSTAGE_STATS: constant buffer words (the slow paths above count each word in
     // ProcessCBMultiData).
     if (VideoCommon::MemStageStats::Enabled()) [[unlikely]] {
@@ -1109,19 +1173,17 @@ void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods,
     }
     // EXP107: words memory holds already, where writing them again changes
     // nothing, are not written (no invalidation either); unchanged ones are neutral for the count.
-    const ConstantWrite compared = CompareConstantData(destination, values.data(), bytes);
-    if (VideoCommon::Nx2FastDrawCount::g_on) [[unlikely]] {
+    const ConstantWrite compared = CompareConstantData(destination, values, bytes, target);
+    if (target.count_fast_draw) [[unlikely]] {
         NoteFastDrawCountData(destination, destination + bytes,
                               compared != ConstantWrite::Changed);
     }
     if (compared == ConstantWrite::Skip) {
-        regs.const_buffer.offset += static_cast<u32>(bytes);
         return;
     }
     // EXP88 & 2: through the bound buffer's device address, the device range logged for
     // FlushCaching, in place of CB_DIRECT's translation and the word-by-word accumulation.
-    if (WriteBoundConstantBuffer(offset, values.data(), static_cast<u32>(bytes))) {
-        regs.const_buffer.offset += static_cast<u32>(bytes);
+    if (WriteBoundConstantBuffer(target, values, bytes)) {
         return;
     }
     // EDEN_NX2_CB_DIRECT (ported, its maxwell_3d.cpp CallConstBufferWords):
@@ -1139,14 +1201,13 @@ void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods,
             ? memory_manager.GetPointer(destination)
             : nullptr;
     if (pointer != nullptr) [[likely]] {
-        std::memcpy(pointer, values.data(), bytes);
+        std::memcpy(pointer, values, bytes);
         for (u32 i = 0; i < count; ++i) {
             memory_manager.AccumulateInvalidation(destination + u64{i} * sizeof(u32), sizeof(u32));
         }
     } else {
-        memory_manager.WriteWordsCached(destination, values.data(), count);
+        memory_manager.WriteWordsCached(destination, values, count);
     }
-    regs.const_buffer.offset += static_cast<u32>(bytes);
 }
 
 void Maxwell3D::CallMethodSlow(Core::System& system, u32 method, u32 method_argument, bool is_last_call) {
@@ -1576,31 +1637,16 @@ void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
         regs.const_buffer.offset += static_cast<u32>(copy_size);
         return;
     }
-    // fable_stage_levelpoints 18.4 row 3: as in CallConstBufferWords (single words and the slow
-    // paths' runs).
-    const VideoCommon::FritchiiPrice::CbWriteScope price_scope{amount};
-    // EDEN_NX2_MEMSTAGE_STATS: constant buffer words, and whether they land on texture pages.
-    if (VideoCommon::MemStageStats::Enabled() && write_size != 0) [[unlikely]] {
-        VideoCommon::MemStageStats::StreamWrite(
-            VideoCommon::MemStageStats::Write::CbWords,
-            memory_manager.GpuToCpuAddress(buffer_address + regs.const_buffer.offset).value_or(0),
-            write_size);
-    }
-    // EXP107: as in CallConstBufferWords.
-    const ConstantWrite compared =
-        write_size != 0
-            ? CompareConstantData(buffer_address + regs.const_buffer.offset, start_base,
-                                  write_size)
-            : ConstantWrite::Changed;
-    if (VideoCommon::Nx2FastDrawCount::g_on && write_size != 0) [[unlikely]] {
-        const GPUVAddr address{buffer_address + regs.const_buffer.offset};
-        NoteFastDrawCountData(address, address + write_size, compared != ConstantWrite::Changed);
-    }
-    if (write_size != 0 && compared != ConstantWrite::Skip &&
-        !WriteBoundConstantBuffer(regs.const_buffer.offset, start_base,
-                                  static_cast<u32>(write_size))) {
-        const GPUVAddr address{buffer_address + regs.const_buffer.offset};
-        memory_manager.WriteBlockCached(address, start_base, write_size);
+    // The memory half from the words' target by value (FRITCHII_ESPLIT=1 on E1: a record E2
+    // runs in ring order, or a join); the clip warning and the offset are the register half.
+    VideoCommon::ESplit::CbTarget target;
+    FillConstantWordsTarget(target, regs.const_buffer.offset);
+    if (!VideoCommon::ESplit::CbWrite(*this, target, start_base, static_cast<u32>(write_size),
+                                      false)) {
+        // fable_stage_levelpoints 18.4 row 3: as in CallConstBufferWords (single words and the
+        // slow paths' runs).
+        const VideoCommon::FritchiiPrice::CbWriteScope price_scope{amount};
+        WriteConstantWords(target, start_base, static_cast<u32>(write_size), false);
     }
     if (write_size != copy_size) {
         static std::atomic<bool> warned{};
@@ -1620,15 +1666,18 @@ void Maxwell3D::ProcessCBData(u32 value) {
     ProcessCBMultiData(&value, 1);
 }
 
-bool Maxwell3D::WriteBoundConstantBuffer(u32 offset, const void* data, u32 bytes) {
+bool Maxwell3D::WriteBoundConstantBuffer(const VideoCommon::ESplit::CbTarget& target,
+                                         const void* data, u32 bytes) {
     namespace CbPath = VideoCommon::Nx2CbPath;
     const int mode = CbPath::Mode();
     if ((mode & CbPath::DirectBit) == 0) {
         return false;
     }
     auto& counters = CbPath::g_counters;
-    const GPUVAddr address = regs.const_buffer.Address();
-    const u32 size = regs.const_buffer.size;
+    // CB_ADDRESS, CB_SIZE and the offset as the registers had them at the words.
+    const GPUVAddr address = target.address;
+    const u32 size = target.size;
+    const u32 offset = target.offset;
     const u64 map_serial = memory_manager.MapSerial();
     BoundConstantBuffer& bound = bound_constant_buffer;
     // One translation per selection (fable52_answer_next70 3.2): the same bytes reach the same

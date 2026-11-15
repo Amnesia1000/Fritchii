@@ -2606,6 +2606,9 @@ void GpuSplit::ExecuteCbWords(const u64* words, u32 count, const u64* verify_add
 
 void GpuSplit::VerifyCbWords(const u64* words, u32 count, u64 front_address) {
     using Tegra::Engines::Maxwell3D;
+    // FRITCHII_ESPLIT=1 on E1 (S4): the memory read-back below needs the words written, so E1
+    // runs the block with E2 drained (a join), not through E2's queue.
+    const ESplit::JoinScope esplit_join{ESplit::Join::CbWrite};
     const auto run_block = [&] {
         for (u32 done = 0; done < count;) {
             done += static_cast<u32>(Execute(words + done, count - done));
@@ -3183,6 +3186,13 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             if (info.cls == ESplit::Class::E2) {
                 if (info.sink_first && back_engine != nullptr) {
                     back_engine->ConsumeSink(*system);
+                }
+                // S4, FRITCHII_ESPLIT_CB_ASYNC: a 3D constant buffer entry runs here, its register
+                // half on E1's engine; each memory half goes to E2's queue in ring order without a
+                // wait (Maxwell3D's CbWrite hook), or into a join. E2's view takes the offset from
+                // E1's next record (no ThreadCbAdvance for these).
+                if (info.cb_entry && info.sink_first && ESplit::CbEntryOnE1()) {
+                    return Execute(entry, words);
                 }
                 struct Work {
                     GpuSplit* self;

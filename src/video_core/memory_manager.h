@@ -327,6 +327,14 @@ public:
     /// (before every draw, dispatch, clear and copy), merged with neighbouring ranges.
     void AccumulateInvalidation(GPUVAddr gpu_addr, std::size_t size) {
         accumulator.Add(gpu_addr, size);
+        NoteCachedWrite();
+    }
+
+    /// FRITCHII_ESPLIT (fritchii_e_split_thread.h, FlushPlace): cached writes added since the
+    /// start, so E1 can tell whether a piece of work left any for the next FlushCaching. One
+    /// writer at a time (the thread that writes game memory for E); read by E1.
+    [[nodiscard]] u64 CachedWriteCount() const noexcept {
+        return cached_writes.load(std::memory_order_relaxed);
     }
 
     /// EXP91: whether cached writes wait for the next FlushCaching (accumulated GPU ranges or
@@ -474,6 +482,12 @@ private:
 
     const size_t unique_identifier;
     VideoCommon::InvalidationAccumulator accumulator;
+    /// CachedWriteCount's counter (a plain load and store: one writer at a time).
+    std::atomic<u64> cached_writes{};
+    void NoteCachedWrite() noexcept {
+        cached_writes.store(cached_writes.load(std::memory_order_relaxed) + 1,
+                            std::memory_order_relaxed);
+    }
     /// EXP88 & 2: device ranges WriteConstantBufferData wrote since the last FlushCaching.
     boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> constant_buffer_writes;
     /// EXP88 & 4: those writes one by one, translated again at FlushCaching.

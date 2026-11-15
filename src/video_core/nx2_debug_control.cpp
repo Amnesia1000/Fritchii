@@ -656,6 +656,12 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_ESPLIT_DEPTH") {
         return &g_esplit_depth;
     }
+    if (name == "FRITCHII_ESPLIT_CB_ASYNC") {
+        return &g_esplit_cb_async;
+    }
+    if (name == "FRITCHII_ESPLIT_FLUSH_ASYNC") {
+        return &g_esplit_flush_async;
+    }
     return nullptr;
 }
 

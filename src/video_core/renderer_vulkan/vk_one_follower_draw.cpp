@@ -856,17 +856,32 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
     bool esplit_late_flush = false;
     if (esplit_hand) [[unlikely]] {
         ESplit::ApplyBackRaises(engine); // S2: VertexInput raised by E2's async fills
-        if (ESplit::FlushBeforeLookup()) {
-            // The flush before the lookup, as below; only when it has something to do (an empty
-            // FlushCaching changes nothing; the memory stage shadow compares even then).
-            auto& memory_manager = engine.GetMemoryManager();
+        auto& memory_manager = engine.GetMemoryManager();
+        switch (ESplit::FlushPlace()) {
+        case ESplit::FlushAt::Before:
+            // E2 idle: the flush before the lookup, as below; only when it has something to do
+            // (an empty FlushCaching changes nothing; the memory stage shadow compares even then).
             if (memory_manager.HasPendingCachedWrites() ||
                 VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) {
                 auto flush = [&memory_manager] { memory_manager.FlushCaching(); };
                 ESplit::HandTo(ESplit::HandInfo{.hand = ESplit::Hand::Flush}, flush);
             }
-        } else {
+            break;
+        case ESplit::FlushAt::Drained: {
+            // S4: owed with E2 behind: E2 drains (the hand-over), then asks for work itself (the
+            // pending writes are E2's while it runs).
+            auto flush = [&memory_manager] {
+                if (memory_manager.HasPendingCachedWrites() ||
+                    VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) {
+                    memory_manager.FlushCaching();
+                }
+            };
+            ESplit::HandTo(ESplit::HandInfo{.hand = ESplit::Hand::Flush}, flush);
+            break;
+        }
+        case ESplit::FlushAt::Tail:
             esplit_late_flush = true;
+            break;
         }
     } else {
         // Today's PrepareDraw head, E's half: the stream's invalidations before the fill.
@@ -956,7 +971,23 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
                     if (memory_manager.HasPendingCachedWrites() ||
                         VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) {
                         VideoCommon::ESplit::NoteLateFlush();
+                        // S4: the flush's buffer marks go to E2's flags (the view, at this draw
+                        // after its record), never to E1's engine, which has moved on. No cache
+                        // lock around it: the invalidation may be lent, and R takes that lock (R
+                        // runs it as E, so it marks the view too).
+                        auto& cache = self.rasterizer.buffer_cache;
+                        VideoCommon::ESplit::View& view = VideoCommon::ESplit::ThreadView();
+                        std::optional<VideoCommon::CacheInputs> inputs;
+                        if (view.seeded && view.engine == t.engine) {
+                            inputs.emplace(cache.StageInputs(view.regs, view.state,
+                                                             view.root_tables, view.draw_state,
+                                                             view.flags));
+                            cache.SetInputsOverride(&*inputs);
+                        }
                         memory_manager.FlushCaching();
+                        if (inputs) {
+                            cache.SetInputsOverride(nullptr);
+                        }
                     }
                 }
                 u64 number = 0;
