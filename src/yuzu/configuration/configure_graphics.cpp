@@ -37,8 +37,10 @@
 #include "yuzu/configuration/configuration_shared.h"
 #include "yuzu/configuration/configure_graphics.h"
 #include "yuzu/configuration/amd_fsr4_panel.h"
+#include "video_core/ocarina_upscale.h"
 #include "yuzu/configuration/nvidia_dlss_panel.h"
 #include "yuzu/configuration/shared_widget.h"
+#include "yuzu/fritchii/fritchii_ui.h"
 
 #ifdef HAS_RESHADE
 #include "yuzu/configuration/configure_post_processing.h"
@@ -223,7 +225,6 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
     std::map<u32, QWidget*> hold_graphics;
     std::vector<QWidget*> hold_api;
     QCheckBox* frame_gen_checkbox = nullptr;
-    QCheckBox* nvidia_dlss_checkbox = nullptr;
 
     for (const auto setting : Settings::values.linkage.by_category[Settings::Category::Renderer]) {
 #ifndef HAS_RESHADE
@@ -263,6 +264,9 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
                                      setting->Id() == Settings::values.nvidia_dlss_preset.Id())) {
             widget->setVisible(nvidia_dlss_checkbox->isChecked());
             connect(nvidia_dlss_checkbox, &QCheckBox::toggled, widget, &QWidget::setVisible);
+        }
+        if (setting->Id() == Settings::values.nvidia_dlss_quality.Id()) {
+            dlss_quality_combobox = widget->combobox;
         }
 
         if (setting->Id() == Settings::values.renderer_backend.Id()) {
@@ -324,7 +328,27 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
         } else if (setting->Id() == Settings::values.resolution_setup.Id()) {
             // Keep track of the resolution combobox to update other UI tabs that need it
             resolution_combobox = widget->combobox;
-            hold_graphics.emplace(setting->Id(), widget);
+            if (FritchiiUi::Enabled()) {
+                // One line under it while DLSS or FSR sets OoT's resolution (the scale goes to
+                // 1x for the session then; RasterizerVulkan::ApplyOcarinaResolution).
+                QWidget* group = new QWidget(this);
+                QVBoxLayout* group_layout = new QVBoxLayout(group);
+                group_layout->setContentsMargins(0, 0, 0, 0);
+                group_layout->setSpacing(2);
+                group_layout->addWidget(widget);
+                resolution_note = new QLabel(group);
+                resolution_note->setObjectName(QStringLiteral("FritchiiSettingsNote"));
+                resolution_note->setWordWrap(true);
+                QFont font = resolution_note->font();
+                font.setPointSizeF(font.pointSizeF() * 1.15);
+                resolution_note->setFont(font);
+                resolution_note->setContentsMargins(0, 2, 0, 6);
+                resolution_note->setVisible(false);
+                group_layout->addWidget(resolution_note);
+                hold_graphics.emplace(setting->Id(), group);
+            } else {
+                hold_graphics.emplace(setting->Id(), widget);
+            }
 #ifdef HAS_RESHADE
         } else if (setting->Id() == Settings::values.post_shader_enabled.Id()) {
             QPushButton* post_shader_button = new QPushButton(tr("Configure Effects..."), widget);
@@ -402,6 +426,8 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
     for (auto widget : hold_api) {
         api_grid_layout->addWidget(widget);
     }
+
+    SetupOcarinaUpscalerLabels();
 
     // Background color is too specific to build into the new system, so we manage it here
     // (3 settings, all collected into a single widget with a QColor to manage on top)
@@ -572,6 +598,69 @@ void ConfigureGraphics::UpdateAmdFsr4Visibility() {
         view->setRowHidden(fsr4_row, !capable && !fsr4_picked);
     }
     amd_fsr4_panel->setVisible(capable && fsr4_picked);
+}
+
+namespace {
+/// "1440p", or "4K" for 2160 lines.
+QString OcarinaHeightName(u32 height) {
+    return height == 2160 ? QStringLiteral("4K") : QStringLiteral("%1p").arg(height);
+}
+} // namespace
+
+void ConfigureGraphics::SetupOcarinaUpscalerLabels() {
+    if (!FritchiiUi::Enabled()) {
+        return;
+    }
+    if (nvidia_dlss_checkbox != nullptr) {
+        connect(nvidia_dlss_checkbox, &QCheckBox::toggled, this,
+                [this](bool) { UpdateOcarinaUpscalerLabels(); });
+    }
+    if (oot_aa_combobox != nullptr) {
+        connect(oot_aa_combobox, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+                [this](int) { UpdateOcarinaUpscalerLabels(); });
+    }
+    // OoT's sizes in the DLSS quality names. Docked with Max Resolution, OoT renders 2560x1440:
+    // Native (DLAA) smooths it at that size, every other quality makes 4K from it (shown smaller
+    // on a smaller screen). With FRITCHII_DLSS_RENDER_SCALE the game itself renders lower for
+    // Performance and Ultra Performance. In handheld DLSS does not replace OoT's pass, and with
+    // FRITCHII_DLSS_SCALED the sizes follow the resolution scale: the plain names stay.
+    if (dlss_quality_combobox != nullptr && Settings::IsDockedMode() &&
+        !VideoCommon::OcarinaScaledUpscale()) {
+        const QString arrow = QStringLiteral(" %1 ").arg(QChar(0x2192));
+        for (int row = 0; row < dlss_quality_combobox->count(); ++row) {
+            const auto quality =
+                static_cast<Settings::NvidiaDlssQuality>(dlss_quality_combobox->itemData(row).toUInt());
+            const bool scaled = Settings::OcarinaDlssRenderScaleSwitch() &&
+                                (quality == Settings::NvidiaDlssQuality::Performance ||
+                                 quality == Settings::NvidiaDlssQuality::UltraPerformance);
+            const u32 render = Settings::OcarinaRenderHeightFor(
+                scaled ? std::optional{quality} : std::nullopt);
+            const QString sizes = quality == Settings::NvidiaDlssQuality::Native
+                                      ? OcarinaHeightName(render)
+                                      : OcarinaHeightName(render) + arrow + OcarinaHeightName(2160);
+            dlss_quality_combobox->setItemText(
+                row, QStringLiteral("%1: %2").arg(dlss_quality_combobox->itemText(row), sizes));
+        }
+    }
+    UpdateOcarinaUpscalerLabels();
+}
+
+void ConfigureGraphics::UpdateOcarinaUpscalerLabels() {
+    if (resolution_note == nullptr) {
+        return;
+    }
+    // An FSR choice for OoT wins over DLSS (VideoCommon::SelectOcarinaUpscaler).
+    bool fsr = false;
+    if (oot_aa_combobox != nullptr && oot_aa_combobox->currentIndex() >= 0) {
+        fsr = VideoCommon::OcarinaFsrChosen(
+            static_cast<Settings::OotAntiAliasing>(oot_aa_combobox->currentData().toUInt()));
+    }
+    const bool dlss = nvidia_dlss_checkbox != nullptr && nvidia_dlss_checkbox->isChecked();
+    resolution_note->setText(
+        fsr ? tr("FSR picks OoT's resolution itself, so this stays at 1x while it's on.")
+            : tr("DLSS picks OoT's resolution itself, so this stays at 1x while it's on."));
+    // FRITCHII_DLSS_SCALED keeps the scale.
+    resolution_note->setVisible((fsr || dlss) && !VideoCommon::OcarinaScaledUpscale());
 }
 
 void ConfigureGraphics::RetrieveVulkanDevices() {
