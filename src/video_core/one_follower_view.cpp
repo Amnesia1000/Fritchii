@@ -34,6 +34,7 @@
 
 #include "video_core/dirty_flags.h"
 #include "video_core/fritchii_e_split.h"
+#include "video_core/fritchii_e_split_thread.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/one_follower.h"
@@ -570,6 +571,8 @@ bool StreamWriteHits(DAddr address, u64 size) noexcept {
 }
 
 void GuardStreamWrite(DAddr address, u64 size) noexcept {
+    // FRITCHII_ESPLIT=1: a game memory write on E1 outside a join (E1Touch, must be 0).
+    ESplit::NoteMemoryWrite();
     if (!Detail::t_engine || size == 0 || g_texture_pages == nullptr) {
         return;
     }

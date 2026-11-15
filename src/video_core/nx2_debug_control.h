@@ -391,6 +391,10 @@ inline std::atomic<int> g_bind_skip{-1};
 /// 2 = also build and consume the E1 to E2 records on E and compare E2's view at each hand-over,
 /// 3 = 2, and E's draw fill reads that view (SetInputsOverride) wherever it equals the engine.
 inline std::atomic<int> g_esplit_count{-1};
+/// FRITCHII_ESPLIT (boot, default 0): 1 = the E split's thread E2 (fritchii_e_split_thread.h).
+inline std::atomic<int> g_esplit{-1};
+/// FRITCHII_ESPLIT_DEPTH (live, default 0): E1's lead over E2 in draws; 0 = lockstep (S1).
+inline std::atomic<int> g_esplit_depth{-1};
 /// EDEN_NX2_LIGHT_TABLE_ARRAYS: docs/fritchii/switches.md.
 [[nodiscard]] inline bool LightTableArrays() {
     static const bool on = EnvSwitch("EDEN_NX2_LIGHT_TABLE_ARRAYS") > 0;

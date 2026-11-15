@@ -2142,6 +2142,32 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   profiled, stall points <= 2,000/s, view differs 0 over a step-in. Off: one relaxed load per
   ring batch, a local test per entry, two plain loads per filled draw, one per lend, bind, root
   table load, condition, stream write and non-empty sink; the register write hook shares the key-watch byte.
+- FRITCHII_ESPLIT (boot, default 0; the E split's thread, steps S1 and S2 of
+  work/E_SPLIT_DESIGN.md 5, src/video_core/fritchii_e_split_thread.h): 1 = the engine thread E
+  becomes two. E1 (the back thread) reads ring A, applies the register entries on the real
+  engine, looks the pipeline up; E2 ("GPUBackE2", new) runs the E2 entries of the dry classifier
+  (constant buffer words, reports, sync points, wait for idle, cache barriers, compute, the
+  memory stage's cache calls), each draw's flush (before E1's lookup, only when it has work) and
+  tail (FillRing, the R packet's push, TickWork) and each bind's buffer cache half (by value).
+  E2 keeps its own view of what a fill reads, fed by E1's records (FRITCHII_ESPLIT_COUNT=2's
+  records, now across the threads). E1 runs join entries, its memory decisions (the indirect
+  reset test), conditions from memory and E's idle work itself (joins). Needs FRITCHII_ONEF=1
+  (refused with a log line without it); FRITCHII_ESPLIT_COUNT is ignored while it runs.
+  FRITCHII_ESPLIT_DEPTH (live, default 0) = 0 is S1, lockstep: E1 hands each piece over and
+  waits for it, so one thread runs at a time in today's order on today's objects (exact by
+  construction); E's per-call thread state (one follower's draw values, lend site, query kind;
+  the memory stage's fill state) moves with each hand-over and a buffer cache lock E1 holds is
+  handed to E2 for the run. Both sides poll (haltpoll rule: E1 up to 200 us, E2 up to 50 us)
+  and then sleep. Lines every 10 s, "E split thread (FRITCHII_ESPLIT=1, depth D) 10 s:":
+  hand-overs a second by kind, E2 busy (zone "e split job"), E2 waiting ("e split E2 wait"), E1
+  in hand-overs ("e split hand-over") = E2's runs + the hand-over cost (ms/s and us each), joins
+  by kind; then the checks (must be 0): ESplitView (E2's view against the engine after the
+  record, 1 hand-over in 64), ESplitInputs (on those draws, view equal, the fill reads the view
+  and every CacheInputs input is compared after it), E1Touch (E1 released the buffer cache's
+  lock, read game memory through the audited funnel or wrote it, outside a join; the first 16
+  logged with the site), E2Order (E2 ran a hand-over out of order); seeds and untracked
+  hand-overs. Gate 2 shape for S1: E2 busy <= today's E occupied - 0.7 x the dry net. Off:
+  nothing starts; a hand-over site pays one load and a branch.
 - FRITCHII_ONEF_TRACE (boot, default 0; fable_b_one_follower 15.5): 1 = the lend trace. One
   72-byte record per lend and per posted op (packet number, site, op kind, posted, E's arrival,
   R's start and end, E's resume, E's work since its previous record, R's busy time on other

@@ -41,6 +41,7 @@
 #include "common/scope_exit.h"
 #include "video_core/fritchii_delta_path.h"
 #include "video_core/fritchii_e_split.h"
+#include "video_core/fritchii_e_split_thread.h"
 #include "video_core/fritchii_fill_cuts.h"
 #include "video_core/fritchii_price.h"
 #include "video_core/gpu.h"
@@ -295,6 +296,8 @@ OneF::LentReason OneFollowerDraw::UnlentBlocker(Maxwell3D& engine, bool is_index
         if (reset_candidate && OneF::UnlentResetOn()) {
             // FRITCHII_ESPLIT_COUNT: the test reads the program's code (E1 would wait for E2).
             VideoCommon::ESplit::NoteStall(VideoCommon::ESplit::StallCause::MemoryDecision);
+            // FRITCHII_ESPLIT=1: E1 reads game memory here, a join.
+            const VideoCommon::ESplit::JoinScope esplit_join{VideoCommon::ESplit::Join::Decision};
             verify_reset = ResetCheck{true, RasterizerVulkan::IsNx2IndirectResetOn(
                                                 engine, engine.GetMemoryManager(), false, 1)};
         }
@@ -362,6 +365,9 @@ OneF::LentReason OneFollowerDraw::UnlentBlocker(Maxwell3D& engine, bool is_index
         if (OneF::UnlentResetOn()) {
             VideoCommon::ESplit::NoteStall(VideoCommon::ESplit::StallCause::MemoryDecision);
         }
+        // FRITCHII_ESPLIT=1: E1 reads game memory in the test, a join.
+        const VideoCommon::ESplit::JoinScope esplit_join{VideoCommon::ESplit::Join::Decision,
+                                                         OneF::UnlentResetOn()};
         if (!OneF::UnlentResetOn() || RasterizerVulkan::IsNx2IndirectResetOn(
                                           engine, engine.GetMemoryManager(), false, 1)) {
             return transient(TransientTest::IndirectReset);
@@ -435,11 +441,15 @@ bool OneFollowerDraw::FillRing(Maxwell3D& engine, GraphicsPipeline* pipeline, bo
     // FRITCHII_ESPLIT_COUNT >= 2: E1's draw record reaches E2's view here, before the fill reads
     // anything, and the view is compared with the engine; at 3 the fill reads the view where it
     // was found equal (the buffer flags stay the engine's: E2 owns them in the split).
-    const bool esplit_records = VideoCommon::ESplit::g_records;
+    // FRITCHII_ESPLIT=1 (the thread): the record reached E2's view at the hand-over; the view
+    // comes from there (S1: on the 1 in 64 draws whose compare found it equal).
+    const bool esplit_thread = VideoCommon::ESplit::g_thread;
+    const bool esplit_records = esplit_thread || VideoCommon::ESplit::g_records;
     const VideoCommon::ESplit::View* esplit_view = nullptr;
     std::optional<VideoCommon::CacheInputs> esplit_inputs;
     if (esplit_records) [[unlikely]] {
-        esplit_view = VideoCommon::ESplit::DrawHandOver(engine, list_args);
+        esplit_view = esplit_thread ? VideoCommon::ESplit::FillView(engine)
+                                    : VideoCommon::ESplit::DrawHandOver(engine, list_args);
         if (esplit_view != nullptr) {
             esplit_inputs.emplace(r.buffer_cache.StageInputs(
                 esplit_view->regs, esplit_view->state, esplit_view->root_tables,
@@ -540,7 +550,11 @@ bool OneFollowerDraw::FillRing(Maxwell3D& engine, GraphicsPipeline* pipeline, bo
         r.mem_stage.FillRingDraw(r.buffer_cache, draw_facts, is_indexed, position, seq, 0, nullptr,
                                  nullptr, &handle_values, null_pointer_handles, list_args);
     if (esplit_records) [[unlikely]] {
-        VideoCommon::ESplit::AfterFill(engine, esplit_view);
+        if (esplit_thread) {
+            VideoCommon::ESplit::FillDone(engine, esplit_view);
+        } else {
+            VideoCommon::ESplit::AfterFill(engine, esplit_view);
+        }
     }
     if (filled) {
         // For ReportDescriptorMismatch: what this fill used, before the push publishes it.
@@ -787,7 +801,18 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
     // FRITCHII_ESPLIT_COUNT: E2's parts of the draw carved out of E1's (g_state read once).
     namespace ESplit = VideoCommon::ESplit;
     const u8 esplit = ESplit::g_state;
-    {
+    // FRITCHII_ESPLIT=1 (fritchii_e_split_thread.h): here on E1, the flush and the tail run on E2.
+    const bool esplit_hand = ESplit::ShouldHand();
+    if (esplit_hand) [[unlikely]] {
+        // The flush before the lookup, as below; only when it has something to do (an empty
+        // FlushCaching changes nothing; the memory stage shadow compares even then).
+        auto& memory_manager = engine.GetMemoryManager();
+        if (memory_manager.HasPendingCachedWrites() ||
+            VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) {
+            auto flush = [&memory_manager] { memory_manager.FlushCaching(); };
+            ESplit::HandTo(ESplit::HandInfo{.hand = ESplit::Hand::Flush}, flush);
+        }
+    } else {
         // Today's PrepareDraw head, E's half: the stream's invalidations before the fill.
         const ESplit::Carve flush_carve{ESplit::Class::E2, esplit};
         engine.GetMemoryManager().FlushCaching();
@@ -839,6 +864,30 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
         }
     }
     const u64 position = VideoCommon::GpuSplit::Get().BackEntryPosition();
+    if (esplit_hand) [[unlikely]] {
+        // FRITCHII_ESPLIT=1: the tail below on E2 (the record of its view first), E1 waits.
+        bool pushed = false;
+        auto tail = [&] {
+            u64 number = 0;
+            if (!FillRing(engine, pipeline, is_indexed, position, seq, number, reason, list)) {
+                return;
+            }
+            OneF::PushDraw(engine, seq, number, push_flags, pipeline);
+            counts.pushed.store(counts.pushed.load(std::memory_order_relaxed) + 1,
+                                std::memory_order_relaxed);
+            rasterizer.gpu.TickWork();
+            pushed = true;
+        };
+        auto& cache_mutex = rasterizer.buffer_cache.mutex;
+        ESplit::HandTo(ESplit::HandInfo{.hand = ESplit::Hand::DrawTail,
+                                        .record = true,
+                                        .draw = true,
+                                        .list_args = list,
+                                        .held = cache_mutex.IsHeldByCurrentThread() ? &cache_mutex
+                                                                                    : nullptr},
+                       tail);
+        return pushed;
+    }
     u64 buffer_number = 0;
     // The fill, ring B's packet, R's packet (its span packing is E1's, carved in PushDraw) and
     // TickWork: E2's.

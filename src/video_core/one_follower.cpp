@@ -203,6 +203,7 @@ struct Impl {
     std::atomic<u64> r_progress{};    ///< packets and pads R finished
     std::atomic<u64> rescued{};       ///< wakes the watchdog gave
     std::atomic<std::thread::id> e_thread{};
+    std::atomic<std::thread::id> e2_thread{}; ///< FRITCHII_ESPLIT: E2, E's second thread
     std::atomic<std::thread::id> r_thread{};
     std::array<std::pair<const char*, const Common::SpinRecursiveMutex*>, 4> locks{};
     std::atomic<u32> lock_count{};
@@ -1098,7 +1099,9 @@ Stats::RenderTime Play(const PacketHeader& header, const u8* spans) {
 /// the deadlock of 12 Nov had R in a draw packet waiting for the buffer cache's lock while E
 /// was parked in a lend holding it.
 bool RenderContended(std::thread::id holder, bool first) {
-    if (!first || holder != g.e_thread.load(std::memory_order_relaxed) || t_lent_depth != 0) {
+    const bool holder_is_e = holder == g.e_thread.load(std::memory_order_relaxed) ||
+                             holder == g.e2_thread.load(std::memory_order_relaxed);
+    if (!first || !holder_is_e || t_lent_depth != 0) {
         return false;
     }
     std::string stack;
@@ -1231,6 +1234,9 @@ std::string ThreadName(std::thread::id id) {
     }
     if (id == g.e_thread.load(std::memory_order_relaxed)) {
         return "GPUBack (E)";
+    }
+    if (id == g.e2_thread.load(std::memory_order_relaxed)) {
+        return "GPUBackE2 (E's second thread)";
     }
     if (id == g.r_thread.load(std::memory_order_relaxed)) {
         return "GPURender (R)";
@@ -1540,6 +1546,32 @@ void MarkEngineThread() noexcept {
         Detail::t_engine = true;
         g.e_thread.store(std::this_thread::get_id(), std::memory_order_relaxed);
     }
+}
+
+void MarkEngineHelperThread() noexcept {
+    if (g.on) {
+        Detail::t_engine = true;
+        g.e2_thread.store(std::this_thread::get_id(), std::memory_order_relaxed);
+    }
+}
+
+void TakeEngineTls(EngineTls& out) noexcept {
+    out.next_draw = t_next_draw;
+    out.next_draw_set = t_next_draw_set;
+    out.query_kind = t_query_kind;
+    out.lend_site = t_lend_site;
+    out.e_last = t_e_last;
+    t_next_draw_set = false;
+    t_query_kind = QueryKind::Count;
+    t_lend_site = nullptr;
+}
+
+void PutEngineTls(const EngineTls& in) noexcept {
+    t_next_draw = in.next_draw;
+    t_next_draw_set = in.next_draw_set;
+    t_query_kind = in.query_kind;
+    t_lend_site = in.lend_site;
+    t_e_last = in.e_last;
 }
 
 void Start(Core::System& system) {

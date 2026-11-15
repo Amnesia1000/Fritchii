@@ -47,6 +47,12 @@ enum class Kind : u8 {
 /// Set once at boot from FRITCHII_BACK_READ_AUDIT (Init). The only thing a read checks while off.
 extern bool enabled;
 
+/// FRITCHII_ESPLIT=1 (fritchii_e_split_thread.h): every audited read's caller, outside the
+/// audit's own nesting, also goes here; set (with `enabled`) before the back runs. The audit's
+/// tables still count only with its own switch.
+using TouchHook = void (*)(const void* caller);
+inline TouchHook g_touch_hook = nullptr;
+
 /// Reads FRITCHII_BACK_READ_AUDIT the first time (MemoryManager's constructor calls it, after
 /// main() applied nx2_switches.txt); later calls do nothing.
 void Init();

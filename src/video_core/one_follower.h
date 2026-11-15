@@ -1043,6 +1043,23 @@ void AfterLentCall(RegisterView& view, Maxwell3D& engine);
 /// the shared flags; their raises were packed before it).
 void NoteEngineFlags(const Maxwell3D& engine) noexcept;
 
+/// FRITCHII_ESPLIT (fritchii_e_split_thread.h): E's per-call state on its thread (the draw
+/// SetNextDraw described, the query kind and lend site of the next lend, the trace's last record
+/// end). E2 runs pieces of E's work; the state moves with each one (TakeEngineTls clears the
+/// caller's copy, PutEngineTls installs one), so every call sees what it would on one thread.
+struct EngineTls {
+    DrawValues next_draw;
+    bool next_draw_set;
+    QueryKind query_kind;
+    const char* lend_site;
+    u64 e_last;
+};
+void TakeEngineTls(EngineTls& out) noexcept;
+void PutEngineTls(const EngineTls& in) noexcept;
+/// FRITCHII_ESPLIT: this thread (E2) is E too (lends, pushes, the engine thread's checks); the
+/// watchdog and R's contended-lock report name it as E.
+void MarkEngineHelperThread() noexcept;
+
 namespace Detail {
 /// Between one_follower.cpp and one_follower_view.cpp.
 /// The draw SetNextDraw described, or null (E; PackSpans's draw span).

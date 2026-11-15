@@ -32,6 +32,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/fritchii_draw_kinds.h"
 #include "video_core/fritchii_e_split.h"
+#include "video_core/fritchii_e_split_thread.h"
 #include "video_core/fritchii_price.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
@@ -1393,6 +1394,10 @@ void Maxwell3D::ProcessQueryCondition() {
         VideoCommon::MemStageStats::Condition(false, execute_on);
     };
     const GPUVAddr condition_address{regs.render_enable.Address()};
+    // FRITCHII_ESPLIT=1: a condition from game memory (its flush and its read) is a join.
+    const VideoCommon::ESplit::JoinScope esplit_join{
+        VideoCommon::ESplit::Join::Condition,
+        regs.render_enable.mode >= Regs::RenderEnable::Mode::Conditional};
     if (VideoCore::Nx2Debug::Experiment(53) != 0 &&
         regs.render_enable.mode >= Regs::RenderEnable::Mode::Conditional) {
         // EXP53: the front left the Compare words to this thread. Report words wait in the query
@@ -1537,6 +1542,12 @@ void Maxwell3D::ProcessCBBind(size_t stage_index) {
     const VideoCommon::ESplit::Carve esplit_cache_half{VideoCommon::ESplit::Class::E2};
 
     const bool is_enabled = bind_data.valid.Value() != 0;
+    // FRITCHII_ESPLIT=1 (fritchii_e_split_thread.h): the buffer cache half goes to E2 by value.
+    if (VideoCommon::ESplit::ShouldHand()) [[unlikely]] {
+        VideoCommon::ESplit::HandBind(*rasterizer, stage_index, bind_data.shader_slot, is_enabled,
+                                      regs.const_buffer.Address(), regs.const_buffer.size);
+        return;
+    }
     if (!is_enabled) {
         rasterizer->DisableGraphicsUniformBuffer(stage_index, bind_data.shader_slot);
         return;

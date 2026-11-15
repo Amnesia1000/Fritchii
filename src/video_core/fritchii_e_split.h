@@ -138,7 +138,8 @@ void EndLend() noexcept;
 class LendScope {
 public:
     LendScope() noexcept {
-        if (g_state != 0) [[unlikely]] {
+        // g_records: also the thread mode's (FRITCHII_ESPLIT=1), for the buffer flags after it.
+        if (g_state != 0 || g_records) [[unlikely]] {
             active = BeginLend();
         }
     }
@@ -252,5 +253,44 @@ struct View {
 /// After that fill: the view takes the buffer flags the fill left; with `used` (3) every input
 /// the fill can read is compared again.
 void AfterFill(const Maxwell3D& engine, const View* used) noexcept;
+
+// --- The thread mode (FRITCHII_ESPLIT=1, fritchii_e_split_thread.h): the records cross threads ---
+
+/// What a hand-over carries for E2's view.
+enum class RecordKind : u8 {
+    None,   ///< nothing (a hand-over that reads no view: a flush, a bind by value)
+    Record, ///< E1's record: the words, bindings, root words (and draw state) since the last one
+    Seed,   ///< E2 takes its view from the engine (first hand-over, channel change); E1 waits
+    Lost,   ///< E1's writes went untracked: the view is stale until the next seed
+};
+
+/// E1 and E2: the record hooks take this thread's writes, as on E (t_back).
+void ThreadMark() noexcept;
+/// E1, once, before E2 runs anything: the records' E1 side on for good (the register words
+/// through OneFollower::g_write_watch, the bindings, the root words, CacheInputs' flag marks).
+void ThreadRecordsOn() noexcept;
+/// E1: the record of everything noted since the last one, written at `out` (room for
+/// RecordRoom() bytes); returns its kind and, for Record, its size in `bytes`.
+[[nodiscard]] RecordKind ThreadBuild(const Maxwell3D& engine, bool draw, bool list_args, u8* out,
+                                     u32& bytes) noexcept;
+/// The most a record takes.
+[[nodiscard]] std::size_t RecordRoom() noexcept;
+/// E2 (or E1 inside a join): the record applied (or the view seeded from the engine: E1 waits
+/// for a seed). With `compare` (the engine is at E2's place: lockstep), the view is compared with
+/// the engine as at FRITCHII_ESPLIT_COUNT=2; returns the differences found (each logged among the
+/// first 16 since boot, "E split view").
+u64 ThreadConsume(RecordKind kind, const u8* record, const Maxwell3D& engine, bool compare,
+                  bool draw, bool list_args) noexcept;
+/// E2, after running a constant buffer entry: its view's write offset advances by the words.
+void ThreadCbAdvance(u64 words) noexcept;
+/// E2's view (E2, or E1 inside a join with E2 drained). `seeded` false: not usable.
+[[nodiscard]] View& ThreadView() noexcept;
+/// After-fill input differences since boot (AfterFill's count with a view that was read).
+[[nodiscard]] u64 ThreadAfterDiffers() noexcept;
+/// FRITCHII_ESPLIT_DEPTH > 0: a hash of what a draw's fill reads (W2 words, bindings, root
+/// tables, the draw state, a list draw's indirect parameters; no buffer flags, E2's own), on
+/// E1 from the engine and on E2 from its view after the record (Check::ESplitHash).
+[[nodiscard]] u64 HashEngine(const Maxwell3D& engine, bool list_args) noexcept;
+[[nodiscard]] u64 HashView(bool list_args) noexcept;
 
 } // namespace VideoCommon::ESplit

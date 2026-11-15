@@ -178,6 +178,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 
 #include <boost/container/small_vector.hpp>
@@ -204,6 +205,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/memory_stage_link.h"
+#include "video_core/fritchii_e_split_thread.h"
 #include "video_core/fritchii_fill_cuts.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_fastdraw_count.h"
@@ -2896,6 +2898,63 @@ void MemStage::OnRenderImpl(void (*function)(void*), void* argument) {
     engine.identity = 0;
     install(engine);
 }
+
+namespace {
+/// FRITCHII_ESPLIT: what OnRenderImpl's State moves, as plain bytes in the hand-over's job.
+struct ESplitState {
+    uintptr_t identity;
+    void* log;   ///< MemStage::ReadLog*
+    void* reads; ///< std::vector<MemStage::ReadRange>*
+    u64 stamp;
+    u32 fill_depth;
+    u32 play_depth;
+    u8 site; ///< MemStage::Site
+    bool fill_lean;
+    bool holding;
+    bool stamp_stage;
+};
+static_assert(sizeof(ESplitState) <= VideoCommon::ESplit::FillStateBytes);
+static_assert(std::is_trivially_copyable_v<ESplitState>);
+} // Anonymous namespace
+
+void MemStage::ESplitCapture(void* out, bool as_owner) {
+    const ESplitState state{
+        .identity = as_owner ? ThisThread() : t_identity,
+        .log = t_log,
+        .reads = t_reads,
+        .stamp = SeamTicks::CurrentStamp(),
+        .fill_depth = t_fill_depth,
+        .play_depth = t_play_depth,
+        .site = static_cast<u8>(t_site),
+        .fill_lean = t_fill_lean,
+        .holding = t_holding,
+        .stamp_stage = SeamTicks::CurrentStampStage(),
+    };
+    std::memcpy(out, &state, sizeof(state));
+}
+
+void MemStage::ESplitInstall(const void* in, bool keep_identity) {
+    ESplitState state;
+    std::memcpy(&state, in, sizeof(state));
+    if (!keep_identity) {
+        t_identity = state.identity;
+    }
+    t_log = static_cast<ReadLog*>(state.log);
+    t_reads = static_cast<std::vector<ReadRange>*>(state.reads);
+    t_fill_depth = state.fill_depth;
+    t_fill_lean = state.fill_lean;
+    t_play_depth = state.play_depth;
+    t_site = static_cast<Site>(state.site);
+    t_holding = state.holding;
+    SeamTicks::SetStamp(state.stamp, state.stamp_stage);
+}
+
+namespace {
+[[maybe_unused]] const bool g_esplit_fill_state = [] {
+    VideoCommon::ESplit::g_fill_state = {&MemStage::ESplitCapture, &MemStage::ESplitInstall};
+    return true;
+}();
+} // Anonymous namespace
 
 void MemStage::CacheIdleImpl(void (*function)(void*), void* argument) {
     if (Link::RingActive()) {

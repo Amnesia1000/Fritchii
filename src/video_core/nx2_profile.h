@@ -152,6 +152,10 @@ enum class Zone : u32 {
     Publish,      ///< The split's publishes (GpuSplit::Publish; the wakes out)
     PublishWake,  ///< Of publish: a wake of the sleeping back or GPUMem (notify)
     OnefParked,   ///< One follower: E parked in a lend (it waits for R to play the call)
+    // FRITCHII_ESPLIT=1 (fritchii_e_split_thread.h):
+    ESplitJob,      ///< E2 runs a piece of E's work E1 handed over
+    ESplitWait,     ///< E2 waits for work
+    ESplitHandOver, ///< E1 hands work to E2 and waits for it, or for E2's room (S2)
     Count,
 };
 
@@ -181,6 +185,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "setup window", "setup program", "setup level tests", "setup lock", "setup inputs",
     "setup handle values", "fill ranges", "fill bind setup", "fill geometry", "fill stage buffers",
     "fill packet", "front methods", "publish", "publish wake", "parked in lends",
+    "e split job", "e split E2 wait", "e split hand-over",
 };
 static_assert(zone_names.back() != nullptr, "a zone without a name");
 
