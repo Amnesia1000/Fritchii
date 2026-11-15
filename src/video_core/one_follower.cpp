@@ -146,6 +146,11 @@ struct Impl {
     u64 op_bytes_logged{};
     std::array<std::atomic<u64>, 3> mirror_count{}; ///< compared, E set R not, R set E not
     std::atomic<bool> post_fence_stopped{};
+    // FRITCHII_ONEF_OP_DISPATCH (E counts; the frame-end line reads them).
+    std::array<std::atomic<u64>, static_cast<size_t>(DispatchCount::Count)> dispatch_count{};
+    std::array<u64, static_cast<size_t>(DispatchCount::Count)> dispatch_logged{};
+    std::atomic<bool> post_dispatch_stopped{};
+    std::atomic<bool> dispatch_refused_logged{};
     // fable_b 13.0 (E only): pages with a report a posted fence lands, by that fence's packet
     // number; and the report pages since the last fence.
     std::unordered_map<u64, u64> landing_pages;
@@ -699,6 +704,37 @@ void LogQueryKinds() {
     g.landing_waits_logged = g.landing_waits.load(std::memory_order_relaxed);
     g.lends_holding_lock_logged = g.lends_holding_lock.load(std::memory_order_relaxed);
     g.op_bytes_logged = op_bytes;
+    {
+        // FRITCHII_ONEF_OP_DISPATCH: where each dispatch went (lent ones by reason), and the
+        // posted share. Only while the switch is on (step 4).
+        std::array<double, static_cast<size_t>(DispatchCount::Count)> rates{};
+        double total = 0.0;
+        bool any = false;
+        for (size_t i = 0; i < rates.size(); ++i) {
+            const u64 count = g.dispatch_count[i].load(std::memory_order_relaxed);
+            rates[i] = static_cast<double>(count - g.dispatch_logged[i]) / seconds;
+            g.dispatch_logged[i] = count;
+            any = any || rates[i] > 0.0;
+            const auto kind = static_cast<DispatchCount>(i);
+            if (kind != DispatchCount::TailListCopies && kind != DispatchCount::TailProbes) {
+                total += rates[i]; // the tails are posted dispatches counted once more
+            }
+        }
+        if (any) {
+            std::string dispatches;
+            for (size_t i = 0; i < rates.size(); ++i) {
+                dispatches += fmt::format("{}{} {:.0f}/s", i == 0 ? "" : ", ",
+                                          dispatch_count_names[i], rates[i]);
+            }
+            LOG_INFO(HW_GPU,
+                     "One follower dispatches (FRITCHII_ONEF_OP_DISPATCH, fable_b 13.4 group 6) "
+                     "{:.0f} s: {:.0f}/s, {:.1f}% posted: {}{}",
+                     seconds, total, total > 0.0 ? 100.0 * rates[0] / total : 0.0, dispatches,
+                     g.post_dispatch_stopped.load(std::memory_order_relaxed)
+                         ? " (STOPPED for the session: see the checks line)"
+                         : "");
+        }
+    }
     LOG_INFO(HW_GPU,
              "One follower queries by kind (FRITCHII_ONEF_QUERY_OPS={}) {:.0f} s: {}; acquire "
              "latches this session by R {}, E {}, other threads {}",
@@ -1572,6 +1608,44 @@ void StopPostFence(const char* why) noexcept {
         LOG_CRITICAL(HW_GPU, "One follower: FRITCHII_ONEF_POST_FENCE stops for this session ({})",
                      why != nullptr ? why : "?");
     }
+}
+
+DispatchCount PostDispatchBlocker(bool& off) noexcept {
+    using namespace VideoCore::Nx2Debug;
+    off = !g.on || Step() != StepLevel::Unlend ||
+          SwitchValue(g_onef_op_dispatch, "FRITCHII_ONEF_OP_DISPATCH") == 0;
+    if (off) {
+        return DispatchCount::Count;
+    }
+    if (!g_e_pipeline) {
+        // The compute lookup and its OoT hooks run on E (rule 3's reasoning, compute side): with
+        // R owning the pipeline cache E may not look up.
+        if (!g.dispatch_refused_logged.exchange(true, std::memory_order_relaxed)) {
+            LOG_WARNING(HW_GPU, "One follower: FRITCHII_ONEF_OP_DISPATCH=1 needs "
+                                "FRITCHII_ONEF_E_PIPELINE=1 (boot); every dispatch stays lent");
+        }
+        return DispatchCount::NeedsEPipeline;
+    }
+    if (g.post_dispatch_stopped.load(std::memory_order_relaxed)) {
+        return DispatchCount::Stopped;
+    }
+    if (!ViewReady()) {
+        return DispatchCount::Transient;
+    }
+    return DispatchCount::Count;
+}
+
+void StopPostDispatch(const char* why) noexcept {
+    if (!g.post_dispatch_stopped.exchange(true, std::memory_order_relaxed)) {
+        LOG_CRITICAL(HW_GPU,
+                     "One follower: FRITCHII_ONEF_OP_DISPATCH stops for this session ({}); every "
+                     "dispatch is lent again",
+                     why != nullptr ? why : "?");
+    }
+}
+
+void CountDispatch(DispatchCount kind) noexcept {
+    g.dispatch_count[static_cast<size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
 }
 
 u64 PushedNow() noexcept {

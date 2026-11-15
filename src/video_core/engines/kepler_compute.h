@@ -272,6 +272,10 @@ public:
     }
 
     bool IsNativeMode() const { return native_mode; }
+    /// One follower (FRITCHII_ONEF_OP_DISPATCH): R's view of a channel's compute engine, which
+    /// runs no method, takes E's native mode by value for a played dispatch (nothing else of
+    /// SetNativeMacroMode applies to a view).
+    void SetViewNativeMode(bool native) noexcept { native_mode = native; }
     bool ProcessGameDlss(u64 program_id, u64 native_key);
     /// Ocarina of Time with anti-aliasing at No sharpening (oot_network.h): true when this
     /// dispatch of the game's network is skipped, or its output pass replaced by a copy of the

@@ -328,6 +328,35 @@ const ShaderInfo* ShaderCache::ComputeShader() {
             throw;
         }
     }
+    RunComputeHooks(shader);
+    return shader;
+}
+
+const ShaderInfo* ShaderCache::KnownComputeShader() const {
+    const GPUVAddr program_base{kepler_compute->regs.code_loc.Address()};
+    const auto& qmd{kepler_compute->launch_description};
+    const std::optional<VAddr> cpu_shader_addr{
+        gpu_memory->GpuToCpuAddress(program_base + qmd.program_start)};
+    if (!cpu_shader_addr) {
+        return nullptr; // ComputeShader logs it (the dispatch is lent)
+    }
+    return TryGet(*cpu_shader_addr);
+}
+
+void ShaderCache::ComputeShaderKnownChecks(const ShaderInfo* shader) {
+    // As ComputeShader's branch for a shader TryGet found.
+    if (shader->lowered_native &&
+        !Shader::Ampere::VerifyTrapGuards(shader->lowered_native->trap_prefix,
+                                         [&](u32 bank, u32 offset) {
+                                             return ReadNativeGuardConstant(
+                                                 *kepler_compute, *gpu_memory, bank, offset);
+                                         })) {
+        throw Shader::Ampere::TrapGuardError{};
+    }
+    RunComputeHooks(shader);
+}
+
+void ShaderCache::RunComputeHooks(const ShaderInfo* shader) {
     // Check both warm and cold shader paths, before selecting a disk-cached pipeline.
     // EDEN_NX2_DLSS_REPLACEMENT=native retains the native network for comparisons.
     if (kepler_compute->IsNativeMode() && shader->lowered_native &&
@@ -343,7 +372,6 @@ const ShaderInfo* ShaderCache::ComputeShader() {
         kepler_compute->ProcessGameDlss(program_id, shader->lowered_native->native_program_key)) {
         throw FireEmblemUpscale::DispatchReplaced{};
     }
-    return shader;
 }
 
 void ShaderCache::RethrowIfRejected(VAddr addr) {

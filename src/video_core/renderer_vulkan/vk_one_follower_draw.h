@@ -91,6 +91,15 @@ public:
         return playing;
     }
 
+    /// E: a diagnostic reads the work on R (frame dump, render trace, flash watch; set by R).
+    [[nodiscard]] bool Diagnostic() const noexcept {
+        return diagnostic.load(std::memory_order_relaxed) || env_traces;
+    }
+    /// R: the R-owned objects name the view now (rule 2), so a state invalidation lands there.
+    [[nodiscard]] bool OnView() const noexcept {
+        return on_view;
+    }
+
     /// Played, dropped (0xe2c False) and verified draws since boot (part d's lines).
     struct Counts {
         std::atomic<u64> played{};

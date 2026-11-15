@@ -67,6 +67,14 @@ public:
         maxwell3d = engine;
         return previous;
     }
+    /// One follower (FRITCHII_ONEF_OP_DISPATCH): the compute engine, swapped for R's view of it
+    /// while R plays a posted dispatch and back after. Returns the one it had.
+    Tegra::Engines::KeplerCompute* ExchangeKeplerCompute(
+        Tegra::Engines::KeplerCompute* engine) noexcept {
+        Tegra::Engines::KeplerCompute* const previous = kepler_compute;
+        kepler_compute = engine;
+        return previous;
+    }
 
     Tegra::MemoryManager* GetFromID(size_t id) const {
         std::unique_lock<std::mutex> lk(config_mutex);

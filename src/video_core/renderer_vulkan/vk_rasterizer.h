@@ -54,6 +54,7 @@ namespace Tegra {
 
 namespace Engines {
 class Maxwell3D;
+class KeplerCompute;
 }
 
 } // namespace Tegra
@@ -281,6 +282,26 @@ private:
     [[nodiscard]] bool OneFollowerFlushClean(DAddr addr, u64 size, VideoCommon::CacheType which);
     /// E: fable_b 12.3 fix 3's price (CountLentFence) at a lent fence.
     void OneFollowerCountFence();
+
+    // FRITCHII_ONEF_OP_DISPATCH (vk_rasterizer.cpp, "Posted dispatches").
+    /// E, DispatchCompute's first step with the switch on: true = done here (posted, or the
+    /// lookup's hooks threw, which propagates as a lent dispatch's exception would). False = lend
+    /// it; `onef_dispatch_lent_pipeline` is set when E looked the pipeline up already.
+    [[nodiscard]] bool OneFollowerPostDispatch();
+    /// R, the dispatch op: takes ring B's packet `number` and records the dispatch with
+    /// `pipeline` (E's lookup) on R's view of the compute engine.
+    void OneFollowerPlayDispatch(ComputePipeline* pipeline, u64 number);
+    /// E -> R through a lend (E parked): the pipeline E looked up for the lent dispatch (its
+    /// hooks ran on E): DispatchCompute on R uses it instead of a second lookup.
+    ComputePipeline* onef_dispatch_lent_pipeline{};
+    /// R: the posted dispatch DispatchCompute plays now (its pipeline), else null.
+    ComputePipeline* onef_dispatch_play{};
+    /// R: its view of the bound channel's compute engine for played dispatches (no methods run
+    /// on it), made for the memory manager it was made with.
+    std::unique_ptr<Tegra::Engines::KeplerCompute> onef_kepler_view;
+    Tegra::MemoryManager* onef_kepler_view_memory{};
+    /// E: the handle values of the dispatch it fills.
+    std::vector<u32> onef_dispatch_values;
     /// E (FRITCHII_ONEF_COPY_E): runs an inline upload here; false = lend it whole.
     [[nodiscard]] bool OneFollowerInlineOnEngine(GPUVAddr address, size_t copy_size,
                                                  std::span<const u8> memory);

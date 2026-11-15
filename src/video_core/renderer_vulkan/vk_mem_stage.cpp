@@ -913,18 +913,29 @@ void MemStage::CloseHandleValues(bool dispatch_side, bool null_pointer_handles,
 
 const std::vector<u32>* MemStage::HandleValues(bool dispatch_side,
                                                bool& null_pointer_handles) const noexcept {
-    const u32 flags =
-        dispatch_side ? dispatch.flags : (held_ring ? played_draw.flags : draw.flags);
+    // One follower: a dispatch R holds from ring B has its values in its own copy.
+    const bool ring_dispatch = dispatch_side && HeldDispatchFromRing();
+    const u32 flags = ring_dispatch ? played_dispatch.flags
+                      : dispatch_side ? dispatch.flags
+                                      : (held_ring ? played_draw.flags : draw.flags);
     if ((flags & HandleValuesFilled) == 0) {
         return nullptr;
     }
     null_pointer_handles = (flags & HandleNullPointers) != 0;
-    return dispatch_side ? &dispatch_values : &draw_values;
+    return ring_dispatch ? &played_dispatch_values
+           : dispatch_side ? &dispatch_values
+                           : &draw_values;
 }
 
 void MemStage::LookedAtHandleValues(bool dispatch_side, size_t taken) {
-    u32& flags = dispatch_side ? dispatch.flags : (held_ring ? played_draw.flags : draw.flags);
-    const size_t count = (dispatch_side ? dispatch_values : draw_values).size();
+    const bool ring_dispatch = dispatch_side && HeldDispatchFromRing();
+    u32& flags = ring_dispatch ? played_dispatch.flags
+                 : dispatch_side ? dispatch.flags
+                                 : (held_ring ? played_draw.flags : draw.flags);
+    const size_t count = (ring_dispatch   ? played_dispatch_values
+                          : dispatch_side ? dispatch_values
+                                          : draw_values)
+                             .size();
     if (taken == 0 && count != 0) {
         // The back skipped its handle loop (a TEX_BANK_GEN hit): retired as skipped.
         return;
@@ -1962,6 +1973,242 @@ void MemStage::PlayRingOp(u64 number) {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Ring B dispatch packets (one follower, FRITCHII_ONEF_OP_DISPATCH; fable_b 13.4 group 6)
+//
+// E fills a posted dispatch's buffer side as FillDispatchHere does for a held one, with the fill
+// side's rules of a ring draw (FillRingDraw): its number is E's mark from the moment it exists
+// (BeginStagePacket), a sync inside the fill goes to R with E's fill state (OnRenderImpl), the
+// cache's "uploaded" mark goes in the packet (PostCopyBarrier), and the packet goes to ring B
+// whole: RingHeader (kind RingKindDispatch), DispatchPacket, the entries, the handle values, the
+// view's bytes. E then pushes the dispatch op naming its number. R, at the op, takes it by name
+// (TakeRingDispatch) into the held arena and plays it as a held dispatch: Configure's PlayHeld of
+// `before`, RestAtEnd for the rest. Neither side touches the other's packet: E fills `dispatch`
+// and `dispatch_values`, R plays `played_dispatch` and `played_dispatch_values`.
+
+u64 MemStage::FillRingDispatch(Cache& cache_, const DispatchFacts& facts, u64 position,
+                               const std::vector<u32>& values, bool null_pointer_handles,
+                               const void* view, u32 view_bytes) {
+    const Profile::FineScope fill_zone{Profile::Zone::DispatchFill};
+    if (seam_value.load(std::memory_order_relaxed) < 2 || facts.has_texel_buffers || !ticks ||
+        !FillSide() || !TwoThreadRing() || (view_bytes & 7) != 0 || !RingRoom()) {
+        return 0;
+    }
+    if (!ClaimHeld()) {
+        Bump(counters.unheld);
+        return 0;
+    }
+    const bool timed = Profile::Enabled();
+    const u64 start = timed ? NowNs() : 0;
+    Bump(counters.dispatches);
+    Bump(counters.held_dispatches);
+    // The packet the QMD read opened (SEAM 3) is this dispatch's, as BeginDispatch adopts it;
+    // its number is replaced by E's ring mark.
+    RetireDispatchValues();
+    dispatch = DispatchPacket{};
+    dispatch_open = false;
+    dispatch.number = ticks->BeginStagePacket();
+    if (stage_fill_from == 0) {
+        stage_fill_from = dispatch.number;
+    }
+    SeamTicks::SetStamp(dispatch.number, true);
+    dispatch.flags |= Held;
+    const bool form = player.guest_descriptor_queue.FormFor(facts.uses_descriptor_buffer);
+    fill_hashes = {facts.shader_hash, 0};
+    fill_held_form = form;
+    fill_form = form ? 1 : 0;
+    filling_held = true;
+    filling_kind = HeldKind::Dispatch;
+    t_holding = true;
+    t_reads = nullptr; // no texture write check, no read log for ring packets (Ring B above)
+    // As FillRingDraw: EndHeldFill reads ring_pushed; a sync E's fill lends hands R the lock.
+    ring_fill = true;
+    ring_pushed = false;
+    lent_mutex = cache_.mutex.IsHeldByCurrentThread() ? &cache_.mutex : nullptr;
+    SCOPE_EXIT {
+        ring_fill = false;
+        lent_mutex = nullptr;
+    };
+    const HeldFillEnd fill_end{*this};
+    UpdateUnplayed();
+    {
+        // FillDispatchHere's calls, in ComputePipeline::Configure's order.
+        Fill whole{*this, Site::Dispatch};
+        cache_.SetComputeUniformBufferState(facts.uniform_mask, facts.uniform_sizes);
+        cache_.UnbindComputeStorageBuffers();
+        cache_.SetComputeShaderHash(facts.shader_hash);
+        size_t ssbo_index = 0;
+        for (const auto& desc : facts.info->storage_buffers_descriptors) {
+            ASSERT(desc.count == 1);
+            cache_.BindComputeStorageBuffer(ssbo_index, desc.cbuf_index, desc.cbuf_offset,
+                                            desc.is_written, desc.indirect_offset,
+                                            desc.write_extent);
+            ++ssbo_index;
+        }
+        cache_.UnbindComputeTextureBuffers();
+        last_entry = ~0U;
+        {
+            Fill before{*this, Site::DispatchBefore};
+            cache_.UpdateComputeBuffers();
+            cache_.BindHostComputeBuffers();
+        }
+        last_entry = ~0U;
+        // Configure's question to the cache after the section, answered here.
+        if (cache_.any_buffer_uploaded) {
+            dispatch.flags |= PostCopyBarrier;
+            cache_.any_buffer_uploaded = false;
+        }
+        PushRingDispatch(values, null_pointer_handles, view, view_bytes, position);
+    }
+    if (timed) {
+        Bump(counters.fill_ns, NowNs() - start);
+    }
+    return ring_pushed ? dispatch.number : 0;
+}
+
+void MemStage::PushRingDispatch(const std::vector<u32>& values, bool null_pointer_handles,
+                                const void* view, u32 view_bytes, u64 position) {
+    const u32 entries = arena.Size();
+    const u32 value_count = static_cast<u32>(values.size());
+    const u64 bytes = Align8(static_cast<u32>(sizeof(RingHeader) + sizeof(DispatchPacket) +
+                                              entries + value_count * sizeof(u32) + view_bytes));
+    u64 index = ring_b_write % RingBytes;
+    if (index + bytes > RingBytes) {
+        // Packets never wrap (as PushRingDraw).
+        if (RingBytes - index >= sizeof(RingHeader)) {
+            RingHeader pad{};
+            pad.bytes = static_cast<u32>(RingBytes - index);
+            pad.kind = 0;
+            std::memcpy(ring_b.get() + index, &pad, sizeof(pad));
+        }
+        ring_b_write += RingBytes - index;
+        index = 0;
+    }
+    if (ring_b_write + bytes - ring_b_freed.load(std::memory_order_acquire) > RingBytes)
+        [[unlikely]] {
+        Link::Note(Link::Check::RingFull, "a dispatch packet past ring B's room");
+    }
+    // The values as the packet's own (R's HandleValues reads them from played_dispatch).
+    dispatch.flags &=
+        ~(HandleValuesFilled | HandleNullPointers | HandleValuesLooked | HandleValuesRetired);
+    dispatch.flags |= HandleValuesFilled | (null_pointer_handles ? HandleNullPointers : 0U);
+    dispatch.handle_values = Span{0, value_count};
+    Bump(value_counters.fills[1]);
+    Bump(value_counters.values[1], value_count);
+    RingHeader header{};
+    header.bytes = static_cast<u32>(bytes);
+    header.kind = RingKindDispatch;
+    header.flags = fill_held_form ? 1 : 0;
+    header.part = static_cast<u16>(Site::Dispatch);
+    header.position = position;
+    header.number = dispatch.number;
+    header.seq = 0; // a dispatch takes no draw number (R takes it by `number`, R1)
+    header.held_cursor = play_cursor;
+    header.entry_bytes = entries;
+    header.hashes = fill_hashes;
+    header.value_count = value_count;
+    header.value_flags = 1U | (null_pointer_handles ? 2U : 0U);
+    header.tracker_bytes = view_bytes;
+    u8* const out = ring_b.get() + index;
+    u8* cursor = out;
+    std::memcpy(cursor, &header, sizeof(header));
+    cursor += sizeof(header);
+    std::memcpy(cursor, &dispatch, sizeof(DispatchPacket));
+    cursor += sizeof(DispatchPacket);
+    if (entries != 0) {
+        std::memcpy(cursor, arena.At(0), entries);
+        cursor += entries;
+    }
+    if (value_count != 0) {
+        std::memcpy(cursor, values.data(), value_count * sizeof(u32));
+        cursor += value_count * sizeof(u32);
+    }
+    if (view_bytes != 0) {
+        std::memcpy(cursor, view, view_bytes);
+    }
+    // 13.2 R2: the packet is in ring B before the op that names it.
+    ring_b_write += bytes;
+    ring_b_sent.store(ring_b_write, std::memory_order_release);
+    // E's mark goes only after the packet is in ring B (a close reads the mark first).
+    stage_fill_from = 0;
+    SeamTicks::SetStamp(0, true);
+    const u64 sent = ring_packets_sent.load(std::memory_order_relaxed) + 1;
+    ring_packets_sent.store(sent, std::memory_order_seq_cst);
+    // As TakeHeld: the arena is done with; the next fill starts on an empty one.
+    arena.Reset();
+    play_cursor = 0;
+    last_entry = ~0U;
+    if (pending) {
+        pending = false;
+        SeamHook::g_watch.fetch_sub(1, std::memory_order_relaxed);
+    }
+    ring_pushed = true;
+    t_holding = false;
+    dispatch.flags |= HandleValuesRetired; // E's copy: its values went with the packet
+    UpdateUnplayed();
+}
+
+const MemStage::DispatchPacket* MemStage::TakeRingDispatch(u64 number, void* view,
+                                                          u32 view_bytes) {
+    // 13.2 R4: a held packet's rest first (E's calls' order is the record order).
+    PlayRest();
+    const RingHeader* const header = PeekRing();
+    if (header == nullptr || header->kind != RingKindDispatch || header->number != number ||
+        header->tracker_bytes != view_bytes || (header->value_flags & 1) == 0) [[unlikely]] {
+        thread_local std::string note;
+        note = fmt::format("dispatch op {}: ring B's head is {}", number,
+                           header == nullptr ? std::string{"empty"}
+                                             : fmt::format("kind {} number {} view bytes {}",
+                                                           header->kind, header->number,
+                                                           header->tracker_bytes));
+        VideoCommon::OneFollower::Note(VideoCommon::OneFollower::Check::RingPairing,
+                                       note.c_str());
+        return nullptr;
+    }
+    const RingHeader taken = *header;
+    const u8* cursor = reinterpret_cast<const u8*>(header) + sizeof(RingHeader);
+    std::memcpy(&played_dispatch, cursor, sizeof(DispatchPacket));
+    cursor += sizeof(DispatchPacket);
+    held_arena.Reset();
+    if (taken.entry_bytes != 0) {
+        const u32 at = held_arena.Reserve(taken.entry_bytes);
+        std::memcpy(held_arena.At(at), cursor, taken.entry_bytes);
+        cursor += taken.entry_bytes;
+    }
+    const auto* const values = reinterpret_cast<const u32*>(cursor);
+    played_dispatch_values.assign(values, values + taken.value_count);
+    cursor += size_t{taken.value_count} * sizeof(u32);
+    if (view_bytes != 0) {
+        std::memcpy(view, cursor, view_bytes);
+    }
+    played_dispatch.flags &=
+        ~(HandleValuesFilled | HandleNullPointers | HandleValuesLooked | HandleValuesRetired);
+    played_dispatch.flags |=
+        HandleValuesFilled | ((taken.value_flags & 2) != 0 ? HandleNullPointers : 0U);
+    played_dispatch.handle_values = Span{0, taken.value_count};
+    held_cursor = taken.held_cursor;
+    held_form = (taken.flags & 1) != 0;
+    held_hashes = taken.hashes;
+    // Stamps per thread: R stamps with the packet it plays.
+    SeamTicks::SetStamp(number, false);
+    ring_b_read += taken.bytes;
+    ring_b_freed.store(ring_b_read, std::memory_order_seq_cst);
+    held_packet_index = ring_packets_done.fetch_add(1, std::memory_order_seq_cst) + 1;
+    held_marks = false; // E refuses a dispatch while marks run ahead
+    Link::Get().NoteRingFreed();
+    held = HeldKind::Dispatch;
+    held_ring = true;
+    held_reads.clear();
+    held_flush_seen = false;
+    held_log_pending = false;
+    t_holding = true;
+    VideoCommon::MemReadLog::g_held.store(true, std::memory_order_relaxed);
+    SeamHook::g_watch.fetch_add(1, std::memory_order_relaxed);
+    held_from = number;
+    UpdateUnplayed();
+    return &played_dispatch;
+}
+
 const MemStage::RingHeader* MemStage::PeekRing() {
     for (;;) {
         const u64 sent = ring_b_sent.load(std::memory_order_acquire);
@@ -2092,10 +2339,13 @@ const MemStage::DrawPacket* MemStage::TakeRingDraw(u64 seq, u64 back_position, u
                                                    bool verify) {
     for (;;) {
         const RingHeader* const header = PeekRing();
-        if (header != nullptr && header->kind == RingKindOp) [[unlikely]] {
-            // 13.2 R1: an op packet is taken by its BufferOp only.
+        if (header != nullptr && (header->kind == RingKindOp || header->kind == RingKindDispatch))
+            [[unlikely]] {
+            // 13.2 R1: an op packet is taken by its BufferOp only, a dispatch packet by its op.
             VideoCommon::OneFollower::Note(VideoCommon::OneFollower::Check::RingPairing,
-                                           "a draw found an op packet at ring B's head");
+                                           header->kind == RingKindOp
+                                               ? "a draw found an op packet at ring B's head"
+                                               : "a draw found a dispatch packet at ring B's head");
             return nullptr;
         }
         if (header == nullptr || header->seq > seq) {
@@ -2547,7 +2797,8 @@ void MemStage::PlayHeldTo(u32 end, bool rest) {
     if (rest) {
         // Configure returned before playing every section (false, or a path without the play).
         Bump(counters.rest_plays);
-        (held == HeldKind::Draw ? (held_ring ? played_draw.flags : draw.flags) : dispatch.flags) |=
+        (held == HeldKind::Draw ? (held_ring ? played_draw.flags : draw.flags)
+                                : (held_ring ? played_dispatch.flags : dispatch.flags)) |=
             RestPlayed;
     }
     PlayDepth depth;
@@ -2616,7 +2867,10 @@ void MemStage::NoteHeldFlush(SeamHook::Use use, const std::source_location& loca
                     "Memory seam (5.5): a {}{} between the fill and the PlayRest of {} {}: {}:{} {}",
                     UseName(use), t_play_depth != 0 ? " (in a sync)" : "",
                     is_draw ? "draw" : "dispatch",
-                    ring ? played_draw.number : is_draw ? draw.number : dispatch.number,
+                    ring              ? played_draw.number
+                    : is_draw         ? draw.number
+                    : HeldDispatchFromRing() ? played_dispatch.number
+                                             : dispatch.number,
                     location.file_name(), location.line(), location.function_name());
     }
 }

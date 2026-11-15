@@ -1421,6 +1421,26 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   engine's buffer-to-buffer copies and clears (AccelerateDMA BufferCopy, BufferClear) run on E
   (the buffer cache is E's, the result E's own), their commands posted as op packets (the Dma
   site); the submit after list page copies is a render op. Copies with an image stay lent.
+- FRITCHII_ONEF_OP_DISPATCH (live, default 0; fable_b_one_follower 11.1 item 5, 13.4 group 6;
+  step 4, needs FRITCHII_ONEF_E_PIPELINE=1 from boot, else it logs once and every dispatch stays
+  lent): 1 = compute dispatches as posted packets. E runs the stream's invalidations, the compute
+  pipeline lookup when it is a plain hit (the shader known, its entry built, no rebuild pending
+  or due; the OoT network, DLSS and trap guard hooks then run on E, once), the buffer side by
+  value into a ring B packet of its own kind (3: uniform and storage binds, uploads, the
+  GPU-written marks the storage binds make), the handle values, and what R reads of the compute
+  engine (launch description, pools, code address, native mode); then it pushes a dispatch op and
+  goes on. R takes the packet by name and records the dispatch on its view of the compute engine
+  (image views, samplers, descriptors, pipeline bind, vkCmdDispatch), with only the texture
+  cache's lock. Stays lent, counted by reason on the "One follower dispatches" 10 s line (with
+  the posted share): indirect dispatches, dispatches that write an image, texel buffers, the OoT
+  upscaler passes and the depth reader, a lookup that is not a plain hit (the lent call looks up;
+  a lent dispatch E looked up takes E's pipeline, no second lookup), diagnostics (frame dump,
+  traces, flash watch, the handle verify, the stage's shadow or ring, memstage stats), no ring
+  room or values by value, the view not seeded. A posted dispatch whose fill noted command list
+  page writes or write extent probes lends those records after it ("posted + ... lent").
+  Must be 0: "ring B pairing", "played dispatch" (R's Configure failed or threw), "played
+  dispatch off view", "owner on R", "R waits for E's lock"; any of the dispatch ones stops
+  posting for the session (logged at Critical). The QMD release after a dispatch is unchanged.
 - FRITCHII_ONEF_FLUSH_E (live, default 0; fable_b_one_follower 17.3 (a); step 4): 1 = a
   FlushRegion or MustFlushRegion E tests clean is answered on E, not lent: no page of the range
   GPU-written (E marks those when it fills the writes), none a query's or a posted report's,

@@ -129,7 +129,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(LentReason::Count)>
 enum class LentOp : u8 {
     Draw,         ///< a draw (its reason: LentReason)
     Clear,        ///< RasterizerVulkan::Clear
-    Dispatch,     ///< DispatchCompute (its recording; the fill stays E's)
+    Dispatch,     ///< DispatchCompute (lent, or posted with FRITCHII_ONEF_OP_DISPATCH)
     Query,        ///< Query, ResetCounter, report and counter work
     Fence,        ///< SignalFence, SyncOperation*, SignalSyncPoint, SignalReference, ReleaseFences
     ReadBack,     ///< FlushRegion*, FinishRead, GetFlushArea, WaitForIdle, TickWork's texture half
@@ -220,6 +220,13 @@ enum class Check : u8 {
     /// fable_b 16.2: a target E obtained for a samples report that R had no value for (E's
     /// mirror said a sync was owed): its early upload may have cleared a mark serial keeps.
     SyncTargetUnused,
+    /// FRITCHII_ONEF_OP_DISPATCH: R could not record a posted dispatch as the lent path would
+    /// (Configure returned false, an exception, the view's channel gone): the dispatch is not
+    /// recorded (its buffer side is played) and dispatches post no more this session.
+    PlayedDispatch,
+    /// FRITCHII_ONEF_OP_DISPATCH: R played a dispatch while not on its register view (rule 2):
+    /// its state invalidation would have reached E's engine. Skipped there; posting stops.
+    PlayedDispatchNoView,
     Count,
 };
 
@@ -231,7 +238,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Check::Count)> chec
     "facts stale", "played lookup miss", "texture read ahead of R", "ring B pairing",
     "R waits for E's lock", "R needs E's buffer flush",
     "build list draw", "played list args", "played kind without path", "sync mirror",
-    "sync target missing", "sync target unused",
+    "sync target missing", "sync target unused", "played dispatch", "played dispatch off view",
 };
 
 // --- The packet (E to R) -----------------------------------------------------------------------------
@@ -593,6 +600,49 @@ void PushOp(LentOp op, void (*function)(void*), const void* payload, u32 size,
 [[nodiscard]] bool PostFenceOn() noexcept;
 /// Stops FRITCHII_ONEF_POST_FENCE for the session (a must-be-0 of its own fired).
 void StopPostFence(const char* why) noexcept;
+
+/// FRITCHII_ONEF_OP_DISPATCH (live, default 0; fable_b 11.1 item 5, 13.4 group 6; step 4, needs
+/// FRITCHII_ONEF_E_PIPELINE=1): compute dispatches as posted packets. E looks the compute
+/// pipeline up (a plain hit only), fills the buffer side into ring B by value (uniform and
+/// storage binds, uploads, the written marks), reads the handle values, and pushes a dispatch op;
+/// R takes the ring B packet by name and records the dispatch (pipeline, image views,
+/// descriptors, vkCmdDispatch) while E goes on. Everything else stays lent, counted by reason.
+/// Where each dispatch went (the "One follower dispatches" line). A dispatch counts one: the
+/// first that applies, in this order. The two Tail kinds count posted dispatches that also lent
+/// a part after the post.
+enum class DispatchCount : u8 {
+    Posted,
+    NeedsEPipeline, ///< lent: FRITCHII_ONEF_E_PIPELINE=0 (R owns the lookup then)
+    Stopped,        ///< lent: a must-be-0 stopped posting for the session
+    Transient,      ///< lent: the view not seeded at R yet
+    Diagnostic,     ///< lent: a frame dump, trace, flash watch, verify bits or the stage's ring
+    NoRing,         ///< lent: no packets, no values by value, no packet ticks, no room, marks ahead
+    Indirect,       ///< lent: indirect (its arguments may be read back)
+    LookupMiss,     ///< lent: the compute lookup is not a plain hit (R looks up in the lent call)
+    TexelBuffers,   ///< lent: texture or image buffers (their binds need the texture cache)
+    WritesImage,    ///< lent: writes an image (the texture cache's write records)
+    Upscaler,       ///< lent: an OoT upscaler pass or its depth reader (the replacement's hooks)
+    Dimensions,     ///< lent: a grid over the device's limit (the lent path drops it)
+    FillRefused,    ///< lent: the seam did not fill it (arena busy, no room at the fill)
+    TailListCopies, ///< posted; its command list page copies lent after it
+    TailProbes,     ///< posted; its write extent probes' copies lent after it
+    Count,
+};
+inline constexpr std::array<const char*, static_cast<size_t>(DispatchCount::Count)>
+    dispatch_count_names{
+        "posted",           "lent: E_PIPELINE off", "lent: stopped",       "lent: view not ready",
+        "lent: diagnostic", "lent: no ring",        "lent: indirect",      "lent: lookup miss",
+        "lent: texel buffers", "lent: writes an image", "lent: upscaler", "lent: grid limit",
+        "lent: fill refused", "posted + list copies lent", "posted + extent probes lent",
+};
+/// E: the first reason a dispatch cannot be posted before its lookup, Count when it may be;
+/// DispatchCount::Posted (never returned) is not a reason. Returns Count too when the switch is
+/// off or the step is below 4 with `off` set: nothing is counted then.
+[[nodiscard]] DispatchCount PostDispatchBlocker(bool& off) noexcept;
+/// Stops FRITCHII_ONEF_OP_DISPATCH for the session (a must-be-0 of its own fired). Any thread.
+void StopPostDispatch(const char* why) noexcept;
+/// E: counts where a dispatch went.
+void CountDispatch(DispatchCount kind) noexcept;
 /// E: the packet number of the packet it pushed last.
 [[nodiscard]] u64 PushedNow() noexcept;
 /// fable_b 13.0 (POST_FENCE), E: a report to `device`'s page was made; a fence op with `number`
