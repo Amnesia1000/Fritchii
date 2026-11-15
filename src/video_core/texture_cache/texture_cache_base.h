@@ -770,6 +770,7 @@ private:
         Join,
         SlotRetire,
         UnmapSweep,
+        SupersededSweep,
         Count
     };
     DeleteReason delete_reason = DeleteReason::Other;
@@ -1174,9 +1175,26 @@ private:
     /// clear in a later frame. JoinImages puts the chain members it sees on the watch list.
     void WatchColdImage(ImageId image_id);
     void SweepColdImages();
+    /// FRITCHII_SWEEP_SUPERSEDED (live, frames, 0 = off; port of Skitchii 16fb54111d): deletes
+    /// GPU-written images untouched for N frames whose memory a newer image of another shape
+    /// covers, without a download (see the definition).
+    void SweepSuperseded();
+    struct SupersededStats {
+        u64 passes{};        ///< Sweeps that ran
+        u64 looked{};        ///< GPU-written images looked at
+        u64 deleted{};       ///< Deleted
+        u64 deleted_bytes{}; ///< Their device memory
+        u64 kept_busy{};     ///< Superseded but bound or with a download queued
+        u64 sweep_ns{};      ///< Time spent sweeping
+        u64 sampled_after{}; ///< Sampled again at a swept address (a new image made there)
+    } superseded_stats{};
+    /// Addresses the superseded sweep deleted at (emptied at 65,536), and the frame: a texture made
+    /// at one by sampling counts in sampled_after (should stay near 0).
+    std::unordered_map<GPUVAddr, u64> superseded_swept;
     std::vector<std::pair<ImageId, u64>> cold_watch; ///< Image, frame_tick it was put on
     ::Common::unordered_set<ImageId> cold_watch_set;
     u64 cold_deleted{};       ///< Since the last report
+    u64 cold_cap_frames{};    ///< Frames the sweep stopped at its per-frame cap, since the report
     /// Images made since the last cold sweep report, per (format, width), with their heights
     /// (fable52_answer_13 section 6: in the Stalchild fight new render target sizes one pixel
     /// apart, 528x513 to 528x527, kept making images). Logged with the cold sweep line.
@@ -1484,6 +1502,16 @@ private:
         u64 waits, made, landed, dropped_used, dropped_written, dropped_deleted, fallback_cap,
             fallback_oom, mismatches, land_frames;
     } collect_stats{};
+
+    /// FRITCHII_TC_COLLECT_OVER and FRITCHII_TC_COLLECT_EVICTABLE, since the last report.
+    struct CollectPortStats {
+        u64 over_passes{}; ///< Aggressive passes past the critical memory
+        u64 over_extra{};  ///< Deletes those passes were allowed on top of 40
+        u64 over_young{};  ///< Of them, 1 GiB or more over (images unused for 3 frames go)
+        u64 over_peak{};   ///< Most bytes over the critical memory
+        u64 deleted_aggressive{}; ///< Images deleted while past the critical memory
+        u64 skipped{};     ///< EVICTABLE: images skipped before they used the pass's budget
+    } collect_port_stats{};
 
     /// Bytes of images per device memory block, for the collector (refreshed every 60 frames).
     std::unordered_map<u64, u64> block_image_bytes;

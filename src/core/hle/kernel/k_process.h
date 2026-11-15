@@ -274,6 +274,11 @@ public:
         return m_code_address;
     }
 
+    /// Size of the code image that starts at GetEntryPoint (FRITCHII_JIT_BLOCK_LIST).
+    size_t GetCodeSize() const {
+        return m_code_size;
+    }
+
     void SetArgPointer(KProcessAddress addr) {
         m_arg_pointer = addr;
     }

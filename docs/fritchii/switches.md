@@ -3618,6 +3618,60 @@ at full cache clears and shutdown (host bytes are read when written, so links sh
   changes every launch: match blocks across launches by the offset.
 - "FRITCHII_JIT_DUMP: core c writes <file> (image base 0x...)" (Core_ARM, Info).
 
+### Texture cache churn ports (helper AG)
+
+- FRITCHII_TC_COLLECT_OVER (live, default 0; port of zortos #1306 by adamuremek): past the
+  critical memory the collector's aggressive pass may delete one more image per 2 MiB over it
+  (up to 1,024 on top of 40), and from 1 GiB over it also takes images unused for 3 frames
+  instead of 10. Breaking pots in OoT's Hyrule Castle makes ~55 images a frame (about 25 new
+  384x384 D32 shadow maps at moving addresses); at 40 deletes a frame the cache grew until
+  device memory ran out and the AMD driver crashed. Does nothing below the critical memory.
+  Line every 600 frames "Collector ports (...)": passes past critical, deletes allowed, passes
+  1 GiB+ over, peak MiB over, images deleted past critical.
+- FRITCHII_TC_COLLECT_EVICTABLE (live, default 0; port of zortos #1731 by moonzzeyy): the
+  collector checks whether it may delete an image in this pass (decoding, costly outside the
+  aggressive or old pass, needs a download outside high priority, already queued by EXP121)
+  before it counts it against the pass's budget, and its candidate walk leaves such images out.
+  Without it, 10 or 20 old costly (ASTC) images at the old end of the list used the whole budget
+  and the pass deleted nothing. Also: the old costly pass (EDEN_NX2_TC_OLD_AGE) goes through the
+  block-fill sort, and every delete takes its bytes off its block's fill. Same line as above:
+  images skipped.
+- FRITCHII_SWEEP_SUPERSEDED (live, frames, default 0 = off; port of Skitchii 16fb54111d by nup):
+  a GPU-written image untouched for N frames whose memory a newer image of another shape (used
+  since) covers is deleted without a download, checked every min(N, 30) frames, as EXP58 does
+  for the cold sweep's chain images after 60 frames. Not bound images, ones with a download
+  queued, sparse or decoding ones. Skitchii runs 3 (Castle Town guard house at 3440x1440: ~20
+  targets moved a frame while the camera turns, driver usage 13-15 GB on a 12 GB card; orbit
+  16-24 -> 42-51 fps; 2 lost fps standing). Line every 600 frames "Superseded sweep
+  (FRITCHII_SWEEP_SUPERSEDED=N)": images and MiB deleted, images looked at, ms spent.
+  Skitchii's EDEN_NX2_IMAGE_POOL_MIB is EXP66 here (live, MiB).
+- FRITCHII_COLD_SWEEP_MAX (live, default 0 = 16): the cold sweep's per-frame delete cap
+  (EDEN_NX2_TC_COLD_FRAMES). zortos #1571 (jpkto) and #1285 (Ghostwolf13) delete dead
+  overwritten render targets early, 10 or 8 unused frames, up to 512 or 64 a frame: the guard
+  house built up 7,858 dead targets and 27 GB within seconds there, the market lost the device on
+  8 GB cards. The cold sweep (4 frames, on by default) and EXP64 already do that here, at most 16
+  a frame; this raises the cap. Line every 600 frames "Cold sweep cap (...)" whenever the cap was
+  reached (also with the switch at 0): frames that stopped at the cap, images watched.
+
+### FRITCHII_JIT_BLOCK_LIST (the "JIT block list" lines)
+
+Boot, default 0 (helper AG, port of the idea of zortos #1225 by ne1i). Every block the CPU
+recompiler compiles because the game ran it (not warm compiles), inside the application's code
+image, is recorded relative to the image in `<cache dir>/jit/<program id>-<build id>.blocks`
+(64-byte header naming the image, then append-only chunks of entries, each with a checksum; a
+torn tail is cut off at the next launch; at most 2M entries, 8 bytes each). A writer thread
+appends new blocks every 10 s and at shutdown. With 1 the next launch hands the list, in the
+order it was first compiled, to EDEN_NX2_JIT_WARM's idle compiles once nothing another core
+compiled is waiting, so every core compiles it ahead within the same budget (20 ms of every
+100 ms per idle core; precompiles stop with half the code space left, 256 MiB, or half the
+smaller region with FRITCHII_JIT_FAR_CODE, so the cache is never thrown away for them). 2 = record only (build the list; the A side of an A/B). Warm-up needs
+EDEN_NX2_JIT_WARM=1 (on by default), several cores, a 64-bit game and no debugger. OoT: after a
+save load one 721 ms frame then ~20 frames of 40-450 ms on zortos' build, a first-time code path
+compiling 700-7,763 blocks in one frame. Lines: "JIT block list (FRITCHII_JIT_BLOCK_LIST=N): K
+blocks loaded from ..." at boot; every 10 s with new blocks "... new blocks written, listed;
+warm-up handed out a/b/c/d of K loaded" (per core). The hitch line's warm compile time shows
+what the warm-up costs.
+
 ## Numbered experiments (EDEN_NX2_EXPn)
 
 Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP79, live through the debug server:

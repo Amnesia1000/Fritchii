@@ -177,9 +177,49 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         }();
         ticks_to_destroy = (std::max)(ticks_to_destroy, min_age);
         num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : 10);
+        // FRITCHII_TC_COLLECT_OVER (live, default 0): past the critical memory, 40 deletes a
+        // frame is not enough where the game makes more images than that. Breaking pots in
+        // OoT's Hyrule Castle makes ~55 a frame (about 25 new 384x384 D32 shadow maps and the
+        // frame's targets, at addresses that move every frame), none replacing an older one: the
+        // cache grew ~15 images a frame until device memory ran out and the driver crashed on
+        // the next image (zortos #1306, RX 9070 XT). So one more delete per 2 MiB over the
+        // critical memory (up to 1,024 more), and from 1 GiB over, images unused for 3 frames go
+        // too instead of 10.
+        if (aggressive_mode && total_used_memory > critical_memory &&
+            VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_tc_collect_over,
+                                             "FRITCHII_TC_COLLECT_OVER") != 0) {
+            const u64 over = total_used_memory - critical_memory;
+            const size_t extra = static_cast<size_t>((std::min)(over / 2_MiB, u64{1024}));
+            num_iterations += extra;
+            auto& stats = collect_port_stats;
+            ++stats.over_passes;
+            stats.over_extra += extra;
+            stats.over_peak = (std::max)(stats.over_peak, over);
+            if (over >= 1_GiB) {
+                ticks_to_destroy = (std::max)(min_age, u64{3});
+                ++stats.over_young;
+            }
+        }
+    };
+    // FRITCHII_TC_COLLECT_EVICTABLE (live, default 0; zortos #1731): images this pass may not
+    // delete are skipped before they count against its budget. Without it, 10 or 20 old costly
+    // (ASTC) images at the old end of the list used up a normal or high-priority pass, which then
+    // deleted nothing although deletable images sat right behind them.
+    const bool skip_kept = VideoCore::Nx2Debug::SwitchValue(
+                               VideoCore::Nx2Debug::g_tc_collect_evictable,
+                               "FRITCHII_TC_COLLECT_EVICTABLE") != 0;
+    const auto CanEvict = [this, &high_priority_mode, &aggressive_mode,
+                           &evict_old_costly](const Image& image, bool& must_download) {
+        if (True(image.flags & ImageFlagBits::IsDecoding)) {
+            return false;
+        }
+        must_download = IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap);
+        return !((!aggressive_mode && !evict_old_costly &&
+                  True(image.flags & ImageFlagBits::CostlyLoad)) ||
+                 (!high_priority_mode && must_download));
     };
     const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode,
-                          &evict_old_costly, out_of_memory](ImageId image_id) {
+                          &CanEvict, skip_kept, out_of_memory](ImageId image_id) {
         if (num_iterations == 0) {
             return true;
         }
@@ -187,14 +227,18 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         if (True(image.flags & ImageFlagBits::CollectPending)) {
             return false; // EXP121: already counted as freed
         }
-        --num_iterations;
-        if (True(image.flags & ImageFlagBits::IsDecoding)) {
-            return false;
-        }
-        const bool must_download = IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap);
-        if ((!aggressive_mode && !evict_old_costly && True(image.flags & ImageFlagBits::CostlyLoad)) ||
-            (!high_priority_mode && must_download)) {
-            return false;
+        bool must_download = false;
+        if (skip_kept) {
+            if (!CanEvict(image, must_download)) {
+                ++collect_port_stats.skipped;
+                return false;
+            }
+            --num_iterations;
+        } else {
+            --num_iterations;
+            if (!CanEvict(image, must_download)) {
+                return false;
+            }
         }
         // EXP121 (live, 0 = off): record the download and delete the image at a later frame end,
         // when the GPU has written it out (LandCollectDownloads), instead of waiting here. An
@@ -237,7 +281,20 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             if (True(image.flags & ImageFlagBits::Tracked)) {
                 UntrackImage(image, image_id);
             }
+            // FRITCHII_TC_COLLECT_EVICTABLE: the block's fill stays current between the 60-frame
+            // refreshes, so later passes still find the emptiest blocks.
+            if constexpr (requires(const Image& img) { img.MemoryBlock(); }) {
+                if (skip_kept) {
+                    const auto block = image.MemoryBlock();
+                    const auto it = block.block != 0 ? block_image_bytes.find(block.block)
+                                                     : block_image_bytes.end();
+                    if (it != block_image_bytes.end()) {
+                        it->second -= (std::min)(it->second, block.size);
+                    }
+                }
+            }
             ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
+            collect_port_stats.deleted_aggressive += aggressive_mode ? 1 : 0;
             UnregisterImage(image_id);
             DeleteImage(image_id, image.scale_tick > frame_tick + 5);
         }
@@ -259,11 +316,20 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     // used). Among the oldest candidates (8 per image this pass may delete), those in the
     // emptiest blocks go first, so blocks drain and go back to the driver; placement already
     // prefers the fullest blocks (best fit). Images with memory of their own sit in the middle.
-    const auto Collect = [&] {
+    const auto Collect = [&](u64 age) {
         if constexpr (requires(const Image& image) { image.MemoryBlock(); }) {
             std::vector<ImageId> candidates;
             const size_t limit = num_iterations * 8;
-            lru_cache.ForEachItemBelow(frame_tick - ticks_to_destroy, [&](ImageId image_id) {
+            lru_cache.ForEachItemBelow(frame_tick - age, [&](ImageId image_id) {
+                if (skip_kept) {
+                    // FRITCHII_TC_COLLECT_EVICTABLE: only images this pass may delete.
+                    const Image& image = slot_images[image_id];
+                    bool must_download = false;
+                    if (True(image.flags & ImageFlagBits::CollectPending) ||
+                        !CanEvict(image, must_download)) {
+                        return false;
+                    }
+                }
                 candidates.push_back(image_id);
                 return candidates.size() >= limit;
             });
@@ -301,7 +367,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
                 }
             }
         } else {
-            lru_cache.ForEachItemBelow(frame_tick - ticks_to_destroy, Cleanup);
+            lru_cache.ForEachItemBelow(frame_tick - age, Cleanup);
         }
     };
     Configure(false);
@@ -311,13 +377,19 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     }();
     if (high_priority_mode && old_age != 0 && frame_tick > old_age) {
         evict_old_costly = true;
-        lru_cache.ForEachItemBelow(frame_tick - old_age, Cleanup);
+        if (skip_kept) {
+            // FRITCHII_TC_COLLECT_EVICTABLE: old costly images by block fill too, so their
+            // deletes empty blocks as the other passes' do.
+            Collect(old_age);
+        } else {
+            lru_cache.ForEachItemBelow(frame_tick - old_age, Cleanup);
+        }
         evict_old_costly = false;
     }
-    Collect();
+    Collect(ticks_to_destroy);
     if (out_of_memory || total_used_memory >= critical_memory) {
         Configure(true);
-        Collect();
+        Collect(ticks_to_destroy);
     }
 }
 
@@ -947,6 +1019,24 @@ void TextureCache<P>::TickFrame() {
         }
         s = {};
     }
+    // FRITCHII_TC_COLLECT_OVER and FRITCHII_TC_COLLECT_EVICTABLE: what they did, every 600 frames.
+    if (frame_tick % 600 == 0) {
+        auto& s = collect_port_stats;
+        const int over = VideoCore::Nx2Debug::g_tc_collect_over.load(std::memory_order_relaxed);
+        const int evictable =
+            VideoCore::Nx2Debug::g_tc_collect_evictable.load(std::memory_order_relaxed);
+        if (over > 0 || evictable > 0) {
+            LOG_INFO(HW_GPU,
+                     "Collector ports (FRITCHII_TC_COLLECT_OVER={} FRITCHII_TC_COLLECT_EVICTABLE={}) "
+                     "last 600 frames: {} passes past critical (+{} deletes allowed, {} at 1 GiB+ "
+                     "over, peak {} MiB over), {} images deleted past critical; {} skipped as not "
+                     "deletable; device memory {} MiB (critical {} MiB)",
+                     (std::max)(over, 0), (std::max)(evictable, 0), s.over_passes, s.over_extra,
+                     s.over_young, s.over_peak >> 20, s.deleted_aggressive, s.skipped,
+                     total_used_memory >> 20, critical_memory >> 20);
+        }
+        s = {};
+    }
     unmap_stats.held_byte_frames += unmapped_live_bytes;
     unmap_stats.held_peak = (std::max)(unmap_stats.held_peak, unmapped_live_bytes);
     if (frame_tick % 600 == 0) {
@@ -956,6 +1046,7 @@ void TextureCache<P>::TickFrame() {
         unmap_stats = {};
     }
     SweepUnmapped();
+    SweepSuperseded();
     SweepColdImages();
     // An image that could not be made at all: the driver is out of memory whatever the counts
     // say, so collect as at the critical threshold.
@@ -1163,6 +1254,96 @@ bool TextureCache<P>::ColdSuperseded(ImageId image_id, const ImageBase& image) {
 }
 
 template <class P>
+void TextureCache<P>::SweepSuperseded() {
+    // FRITCHII_SWEEP_SUPERSEDED=N (live, frames, 0 = off; 1 = 60): a GPU-written image untouched
+    // for N frames whose memory a newer image of another shape (touched since) also covers: the
+    // game reused that memory for another layout, so nothing reads the old contents (a CPU read
+    // there goes to the newer image). EXP58 does this for the cold sweep's chain images after 60
+    // frames; this looks at every GPU-written image, every min(N, 30) frames. Skitchii runs 3:
+    // OoT's Castle Town guard house at 3440x1440 moves ~20 render targets a frame while the
+    // camera turns, and 60 frames of dead copies took driver usage to 13-15 GB on a 12 GB card
+    // (orbit 16-24 -> 42-51 fps; 2 lost fps standing). Deleted without a download, as the
+    // collector would, so their VkImages go back to the EXP42 pool in time for the next set.
+    const int value = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_sweep_superseded,
+                                                       "FRITCHII_SWEEP_SUPERSEDED");
+    auto& s = superseded_stats;
+    if (frame_tick % 600 == 0 && (value > 0 || s.passes != 0)) {
+        LOG_INFO(HW_GPU,
+                 "Superseded sweep (FRITCHII_SWEEP_SUPERSEDED={}) last 600 frames: {} passes, {} "
+                 "GPU-written images looked at, {} deleted ({} MiB), {} kept as bound or "
+                 "downloading, {:.2f} ms spent; {} sampled again where one was deleted",
+                 (std::max)(value, 0), s.passes, s.looked, s.deleted, s.deleted_bytes >> 20,
+                 s.kept_busy, static_cast<double>(s.sweep_ns) / 1e6, s.sampled_after);
+        s = {};
+        if (value <= 0) {
+            superseded_swept.clear();
+        }
+    }
+    if (value <= 0) {
+        return;
+    }
+    const u64 frames = value == 1 ? u64{60} : static_cast<u64>(value);
+    if (frame_tick < frames || frame_tick % (std::min)(frames, u64{30}) != 0) {
+        return;
+    }
+    const DeleteReasonScope delete_reason_scope{*this, DeleteReason::SupersededSweep};
+    const auto start = std::chrono::steady_clock::now();
+    constexpr ImageFlagBits excluded =
+        ImageFlagBits::Sparse | ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
+        ImageFlagBits::UnwrittenSparse | ImageFlagBits::Unbacked | ImageFlagBits::IsDecoding |
+        ImageFlagBits::AsynchronousDecode | ImageFlagBits::Remapped |
+        ImageFlagBits::CollectPending;
+    std::vector<ImageId> dead;
+    lru_cache.ForEachItemBelow(frame_tick - frames, [&](ImageId image_id) {
+        const Image& image = slot_images[image_id];
+        if (False(image.flags & ImageFlagBits::GpuModified) ||
+            False(image.flags & ImageFlagBits::Registered) || True(image.flags & excluded)) {
+            return false;
+        }
+        ++s.looked;
+        if (ColdSuperseded(image_id, image)) {
+            dead.push_back(image_id);
+        }
+        return false;
+    });
+    const auto queued = [](ImageId image_id, const auto& downloads) {
+        return std::ranges::any_of(downloads, [image_id](const auto& download) {
+            return download.is_swizzle && download.object_id == image_id;
+        });
+    };
+    const auto bound = [this](const ImageBase& image) {
+        return std::ranges::any_of(image.image_view_ids, [this](ImageViewId view) {
+            return render_targets.depth_buffer_id == view ||
+                   std::ranges::find(render_targets.color_buffer_ids, view) !=
+                       render_targets.color_buffer_ids.end();
+        });
+    };
+    for (const ImageId image_id : dead) {
+        Image& image = slot_images[image_id];
+        if (bound(image) || queued(image_id, uncommitted_downloads) ||
+            std::ranges::any_of(committed_downloads,
+                                [&](const auto& downloads) { return queued(image_id, downloads); })) {
+            ++s.kept_busy;
+            continue;
+        }
+        s.deleted_bytes += ImageMemoryBytes(image);
+        if (superseded_swept.size() >= 65536) {
+            superseded_swept.clear(); // the oldest are the least likely to be read again
+        }
+        superseded_swept[image.gpu_addr] = frame_tick;
+        MarkStale(image); // before UntrackImage (see MarkStale)
+        if (True(image.flags & ImageFlagBits::Tracked)) {
+            UntrackImage(image, image_id);
+        }
+        UnregisterImage(image_id);
+        DeleteImage(image_id);
+        ++s.deleted;
+    }
+    ++s.passes;
+    s.sweep_ns += NsSince(start);
+}
+
+template <class P>
 void TextureCache<P>::SweepColdImages() {
     const DeleteReasonScope delete_reason_scope{*this, DeleteReason::ColdSweep};
     const u64 cold_frames = TcColdFrames();
@@ -1173,7 +1354,12 @@ void TextureCache<P>::SweepColdImages() {
         const char* value = std::getenv("EDEN_NX2_TC_COLD_GUARDED");
         return value != nullptr && value[0] == '1';
     }();
-    constexpr u32 MaxPerFrame = 16;
+    // FRITCHII_COLD_SWEEP_MAX (live, default 0 = 16): images deleted a frame at most. zortos
+    // #1571 retires up to 512 a frame: in the guard house 7,858 dead targets built up within
+    // seconds there. The cap line below says whether 16 is ever reached here.
+    const int cap_value = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_cold_sweep_max,
+                                                           "FRITCHII_COLD_SWEEP_MAX");
+    const u32 MaxPerFrame = cap_value > 0 ? static_cast<u32>(cap_value) : 16;
     constexpr u64 MaxWatchFrames = 600; // then a watched image that never got BadOverlap leaves
     constexpr ImageFlagBits excluded =
         ImageFlagBits::Sparse | ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
@@ -1303,7 +1489,15 @@ void TextureCache<P>::SweepColdImages() {
         drop();
     }
     cold_deleted += deleted;
+    cold_cap_frames += deleted >= MaxPerFrame ? 1 : 0;
+    if (frame_tick % 600 == 0 && (cold_cap_frames != 0 || cap_value > 0)) {
+        LOG_INFO(HW_GPU,
+                 "Cold sweep cap (FRITCHII_COLD_SWEEP_MAX={}) last 600 frames: {} a frame at "
+                 "most, reached in {} frames, {} watched now",
+                 (std::max)(cap_value, 0), MaxPerFrame, cold_cap_frames, cold_watch.size());
+    }
     if (frame_tick % 600 == 0) {
+        cold_cap_frames = 0;
         LOG_INFO(HW_GPU,
                  "Cold sweep (EDEN_NX2_TC_COLD_FRAMES={}{}) last 600 frames: {} chain images "
                  "deleted ({} of them guarded but superseded, EXP58), {} kept as GPU-written and "
@@ -2655,7 +2849,7 @@ void TextureCache<P>::LogUnmapStats() {
     };
     const auto others = [&](const auto& counts) {
         return at(counts, DeleteReason::Other) + at(counts, DeleteReason::ColdSweep) +
-               at(counts, DeleteReason::SlotRetire);
+               at(counts, DeleteReason::SlotRetire) + at(counts, DeleteReason::SupersededSweep);
     };
     const u64 collector_unused = at(s.died_unused, DeleteReason::GarbageCollect);
     const double per_death = collector_unused != 0 ? static_cast<double>(collector_unused) : 1.0;
@@ -4017,6 +4211,15 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config) {
                 nx2_swept_shapes.erase(swept);
             }
         }
+        // FRITCHII_SWEEP_SUPERSEDED: a texture made where the sweep deleted an image means the
+        // game read that memory again (its contents came from guest memory, not the GPU's).
+        if (image_id && !superseded_swept.empty()) [[unlikely]] {
+            if (const auto swept = superseded_swept.find(image_gpu_addr);
+                swept != superseded_swept.end()) {
+                ++superseded_stats.sampled_after;
+                superseded_swept.erase(swept);
+            }
+        }
         if (image_id) {
             NoteNewSampledImage(image_id, image_gpu_addr);
             if ((VideoCore::Nx2Debug::Experiment(76) & 4) != 0) [[unlikely]] {
@@ -4664,9 +4867,11 @@ void TextureCache<P>::NoteNewSampledImage(ImageId image_id, GPUVAddr gpu_addr) {
              "New sampled images (EDEN_NX2_IMAGE_HASH_LOG) last 10 s: {} made, {} with bytes made "
              "before ({} KiB); {} different so far; most made:{}",
              made, made_again, bytes_again >> 10, seen.size(), text.empty() ? " none twice" : text);
-    // Reason order: other, garbage collect, cold sweep, unmap, join, slot retire, unmap sweep.
+    // Reason order: other, garbage collect, cold sweep, unmap, join, slot retire, unmap sweep,
+    // superseded sweep.
     static constexpr std::array<const char*, static_cast<size_t>(DeleteReason::Count)> names{
-        "other", "garbage collect", "cold sweep", "unmap", "join", "slot retire", "unmap sweep"};
+        "other",       "garbage collect", "cold sweep", "unmap", "join", "slot retire",
+        "unmap sweep", "superseded sweep"};
     std::string deletes;
     std::string remade;
     for (size_t r = 0; r < names.size(); ++r) {

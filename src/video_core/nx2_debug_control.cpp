@@ -668,6 +668,18 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_BARE_SSBO_MIB") {
         return &g_bare_ssbo_mib;
     }
+    if (name == "FRITCHII_TC_COLLECT_OVER") {
+        return &g_tc_collect_over;
+    }
+    if (name == "FRITCHII_TC_COLLECT_EVICTABLE") {
+        return &g_tc_collect_evictable;
+    }
+    if (name == "FRITCHII_SWEEP_SUPERSEDED") {
+        return &g_sweep_superseded;
+    }
+    if (name == "FRITCHII_COLD_SWEEP_MAX") {
+        return &g_cold_sweep_max;
+    }
     if (name == "FRITCHII_NOTED_OVERFLOW") {
         return &g_noted_overflow;
     }

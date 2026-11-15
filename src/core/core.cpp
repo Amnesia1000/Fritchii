@@ -11,7 +11,10 @@
 #include "common/cpu_features.h"
 #include "audio_core/audio_core.h"
 #include "common/fs/fs.h"
+#include "common/fs/path_util.h"
+#include "common/fritchii_jit_list.h"
 #include "common/logging.h"
+#include "common/nx2_hitch.h"
 #include "common/nx2_sampler.h"
 #include "common/adpf.h"
 #include "common/settings.h"
@@ -457,6 +460,19 @@ struct System::Impl {
         // Make the process created be the application
         kernel.SetApplicationProcess(process->GetHandle());
 
+        // FRITCHII_JIT_BLOCK_LIST (boot): the title's block list, before the cores start. Its
+        // warm-up runs through EDEN_NX2_JIT_WARM's idle compiles (64-bit dynarmic only, several
+        // cores, no debugger); recording alone needs only the recompiler.
+        if (Common::FritchiiJitList::Mode() != 0 && process->GetHandle()->Is64Bit() &&
+            !system.DebuggerEnabled() &&
+            (Common::FritchiiJitList::Mode() != 1 ||
+             (kernel.IsMulticore() && Common::Nx2Hitch::JitWarmEnabled()))) {
+            Kernel::KProcess* const kprocess = process->GetHandle();
+            Common::FritchiiJitList::Begin(
+                params.program_id, build_id, GetInteger(kprocess->GetEntryPoint()),
+                kprocess->GetCodeSize(), Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir));
+        }
+
         // Set up the rest of the system.
         SystemResultStatus init_result{SetupForApplicationProcess(system, emu_window)};
         if (init_result != SystemResultStatus::Success) {
@@ -534,6 +550,7 @@ struct System::Impl {
 
     void ShutdownMainProcess() {
         debug_service.reset();
+        Common::FritchiiJitList::End(); // FRITCHII_JIT_BLOCK_LIST: writes what is left
         // Waits for a call in progress (it opens the RomFS, a quick step).
         VideoCommon::Nx2Precompile::SetGameFiles(0, {});
         SetShuttingDown(true);
