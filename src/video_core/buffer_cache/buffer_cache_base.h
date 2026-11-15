@@ -1151,6 +1151,15 @@ private:
 
     void UpdateVertexBuffer(u32 index);
 
+    /// FRITCHII_FILL_UPDATE_KEEP (fable_b 25.2 cut f): resolve() (the translation and the buffer
+    /// lookup UpdateIndexBuffer or UpdateVertexBuffer make), or the binding it gave last time for
+    /// `slot` (a vertex slot; NUM_VERTEX_BUFFERS for the index buffer) while the inputs
+    /// (`begin`, `extent`, `enable`), the mappings, the address space, the channel and the set of
+    /// buffers (binding_epoch) are unchanged. 2 and 3 resolve anyway and compare.
+    template <typename Resolve>
+    Binding KeepGeometryBinding(u32 slot, GPUVAddr begin, u64 extent, u32 enable,
+                                Resolve&& resolve);
+
     void UpdateDrawIndirect();
 
     void UpdateUniformBuffers(size_t stage);
@@ -1708,6 +1717,21 @@ private:
     int geom_keep = 0;
     /// FRITCHII_FILL_GEOM_KEEP: per vertex slot, then the index buffer.
     std::array<StorageSyncMemo, NUM_VERTEX_BUFFERS + 1> geom_sync_memo{};
+    /// FRITCHII_FILL_UPDATE_KEEP while UpdateGraphicsBuffers runs (0 otherwise, and with accurate
+    /// GPU fences: FindBuffer waits for writes there).
+    int update_keep = 0;
+    /// FRITCHII_FILL_UPDATE_KEEP: what a slot's binding was resolved from, and the binding.
+    struct GeomUpdateMemo {
+        u64 epoch{}; ///< binding_epoch after the resolve; 0 never matches
+        u64 map_serial{};
+        size_t as_id{};
+        const void* channel{};
+        GPUVAddr begin{};
+        u64 extent{}; ///< vertex: the end address; index: the size from count, first and format
+        u32 enable{};
+        Binding binding{};
+    };
+    std::array<GeomUpdateMemo, NUM_VERTEX_BUFFERS + 1> geom_update_memo{};
     u64 frame_tick = 0;
 
     /// EXP91 (fable52_answer_uniformkeeps stage 0): counts how many of today's slot rebinds

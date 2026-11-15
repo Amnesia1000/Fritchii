@@ -702,6 +702,16 @@ not worth turning on), then 2 (must be 0), then 1.
   on (their walks may leave a range dirty). The read log's range is logged as before. Verify: a
   hit's range holds no CPU or unprotected page and its synchronize uploads nothing. The usage
   marks stay: their stamp is the packet's, new every draw.
+- FRITCHII_FILL_UPDATE_KEEP (cut f, "Fill update keep"): UpdateIndexBuffer runs at every indexed
+  draw (the draw methods raise its dirty flag) and UpdateVertexBuffer at every dirty slot. The
+  binding they make is a function of the start address and the size (index) or the start and end
+  addresses and the enable (vertex): the translation, the mapped range, then FindBuffer. Kept
+  while those inputs, the page tables (MapSerial, taken before the resolve), the address space,
+  the channel and the set of buffers (binding_epoch, taken after it, so a buffer the resolve made
+  is part of the memo) are unchanged, as EXP18's memos. Not with accurate GPU fences (FindBuffer
+  waits there). The dirty flags and the binds after it are untouched. Verify: the resolve runs
+  and must give the kept binding. At 1 the disabled-stream translation skip count
+  (FRITCHII_BIND_ADDR_MEMO) no longer counts kept slots.
 - FRITCHII_HANDLE_PROG_KEEP (cut g, "Handle program keep"): E's fill (OneFollowerDraw::FillRing,
   with E's pipeline) of a draw whose pipeline has handle programs: each program evaluation (a
   single element or a whole table) keeps a record per pipeline, in fill order, of the constant
