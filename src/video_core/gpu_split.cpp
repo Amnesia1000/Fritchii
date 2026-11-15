@@ -508,6 +508,7 @@ void GpuSplit::Stop() {
     dispatch_wide_stamp.store(0, std::memory_order_relaxed);
     back_entry_position = 0;
     async_writes.clear();
+    async_blocks.Release(); // FRITCHII_FRONT_ASYNC_TABLE: positions start over too
     last_sync_position = 0;
     last_memory_write_position = 0;
     previous_memory_write_position = 0;
@@ -1498,6 +1499,200 @@ void GpuSplit::LogTrimRange(int mode) {
     trim_range_logged = trim_range;
     trim_range_window_ns = now;
     trim_range_window_ticks = ticks;
+}
+
+// FRITCHII_FRONT_ASYNC_TABLE: values other than 0, 2 and 3 mean on.
+static int AsyncTableModeOf(int value) {
+    return value == 2 || value == 3 ? value : (value != 0 ? 1 : 0);
+}
+
+void GpuSplit::SyncAsyncTables(int mode) {
+    if (mode == async_table_mode) {
+        return;
+    }
+    // 0 keeps async_writes alone, 1 async_blocks alone, 2 and 3 both. A table the new value
+    // needs and the old one did not keep is filled from the other: the same slots and positions
+    // (async_blocks hands over only its non-zero positions: a 0 adds nothing to a newest either).
+    const bool had_old = async_table_mode != 1;
+    const bool had_blocks = async_table_mode != 0;
+    const bool needs_old = mode != 1;
+    const bool needs_blocks = mode != 0;
+    if (needs_blocks && !had_blocks) {
+        async_blocks.Release();
+        async_writes.ForEach(
+            [this](u64 slot, u64 position) { async_blocks.Set(slot, position); });
+        ++async_stats.handovers;
+    }
+    if (needs_old && !had_old) {
+        async_writes.clear();
+        async_blocks.ForEach(
+            [this](u64 slot, u64 position) { async_writes.Set(slot, position); });
+        ++async_stats.handovers;
+    }
+    if (!needs_old) {
+        async_writes.Release();
+    }
+    if (!needs_blocks) {
+        async_blocks.Release();
+    }
+    async_table_mode = mode;
+}
+
+void GpuSplit::NoteAsyncWriteSwitched(u64 begin, u64 size) {
+    const int mode = AsyncTableModeOf(FrontAsyncTableMode());
+    SyncAsyncTables(mode);
+    const u64 first = begin >> 4;
+    const u64 last = (begin + size - 1) >> 4;
+    const auto note_old = [&] {
+        for (u64 slot = first; slot <= last; ++slot) {
+            async_writes.Set(slot, write_position);
+        }
+    };
+    const auto note_new = [&] {
+        for (u64 slot = first; slot <= last; ++slot) {
+            async_blocks.Set(slot, write_position);
+        }
+    };
+    if (mode == 0) {
+        note_old(); // Just switched off: as before from here on.
+        return;
+    }
+    ++async_stats.notes;
+    if ((++async_stats.calls & 4095) == 0) [[unlikely]] {
+        LogAsyncTable(mode);
+    }
+    if (mode == 1) {
+        note_new();
+        return;
+    }
+    if (mode == 3 && (async_stats.notes & 63) == 0) {
+        // Dry: both timed, in turns first and second (the second may find warmer lines).
+        const bool old_first = (async_stats.timed_notes & 1) == 0;
+        const u64 t0 = Nx2Profile::Ticks();
+        if (old_first) {
+            note_old();
+        } else {
+            note_new();
+        }
+        const u64 t1 = Nx2Profile::Ticks();
+        if (old_first) {
+            note_new();
+        } else {
+            note_old();
+        }
+        const u64 t2 = Nx2Profile::Ticks();
+        async_stats.note_old_ticks += old_first ? t1 - t0 : t2 - t1;
+        async_stats.note_new_ticks += old_first ? t2 - t1 : t1 - t0;
+        ++async_stats.timed_notes;
+        return;
+    }
+    note_old();
+    note_new();
+}
+
+u64 GpuSplit::HasAsyncWriteSwitched(u64 begin, u64 size) {
+    const int mode = AsyncTableModeOf(FrontAsyncTableMode());
+    SyncAsyncTables(mode);
+    if (mode == 0) {
+        return OldAsyncNewest(begin, size); // Just switched off: as before from here on.
+    }
+    ++async_stats.finds;
+    if ((++async_stats.calls & 4095) == 0) [[unlikely]] {
+        LogAsyncTable(mode);
+    }
+    // The same slots as OldAsyncNewest walks: begin >> 4 to (begin + size - 1) >> 4.
+    const u64 first = begin >> 4;
+    const u64 last = (begin + size - 1) >> 4;
+    if (mode == 1) {
+        return async_blocks.Newest(first, last);
+    }
+    u64 old_answer = 0;
+    u64 new_answer = 0;
+    if (mode == 3 && (async_stats.finds & 63) == 0) {
+        const bool old_first = (async_stats.timed_finds & 1) == 0;
+        const u64 t0 = Nx2Profile::Ticks();
+        if (old_first) {
+            old_answer = OldAsyncNewest(begin, size);
+        } else {
+            new_answer = async_blocks.Newest(first, last);
+        }
+        const u64 t1 = Nx2Profile::Ticks();
+        if (old_first) {
+            new_answer = async_blocks.Newest(first, last);
+        } else {
+            old_answer = OldAsyncNewest(begin, size);
+        }
+        const u64 t2 = Nx2Profile::Ticks();
+        async_stats.find_old_ticks += old_first ? t1 - t0 : t2 - t1;
+        async_stats.find_new_ticks += old_first ? t2 - t1 : t1 - t0;
+        ++async_stats.timed_finds;
+    } else {
+        old_answer = OldAsyncNewest(begin, size);
+        new_answer = async_blocks.Newest(first, last);
+    }
+    // 2 and 3: the old table answers; 2 counts the answers that differ.
+    if (mode == 2) {
+        ++async_stats.checked;
+        if (new_answer != old_answer) [[unlikely]] {
+            ++async_stats.differ;
+            if (async_differ_total++ < 16) {
+                LOG_WARNING(HW_GPU,
+                            "Front async table (FRITCHII_FRONT_ASYNC_TABLE=2, must be 0): bytes "
+                            "{:#x}+{:#x} newest note {} in the old table, {} in the blocks "
+                            "(back at {})",
+                            begin, size, old_answer, new_answer, ConsumedNow());
+            }
+        }
+    }
+    return old_answer;
+}
+
+void GpuSplit::LogAsyncTable(int mode) {
+    const u64 now = Common::Nx2Hitch::NowNs();
+    const u64 ticks = Nx2Profile::Ticks();
+    if (async_window_ns == 0) {
+        async_window_ns = now;
+        async_window_ticks = ticks;
+        async_logged = async_stats;
+        return;
+    }
+    if (now - async_window_ns < 10'000'000'000ULL) {
+        return;
+    }
+    const double window = static_cast<double>(now - async_window_ns) / 1e9;
+    const double ns_per_tick = static_cast<double>(now - async_window_ns) /
+                               static_cast<double>((std::max)(ticks - async_window_ticks, u64{1}));
+    const AsyncTableStats& s = async_stats;
+    const AsyncTableStats& l = async_logged;
+    const auto rate = [window](u64 count) { return static_cast<double>(count) / window; };
+    const auto ns = [ns_per_tick](u64 sum, u64 count) {
+        return count != 0 ? static_cast<double>(sum) * ns_per_tick / static_cast<double>(count)
+                          : 0.0;
+    };
+    const u64 timed_notes = s.timed_notes - l.timed_notes;
+    const u64 timed_finds = s.timed_finds - l.timed_finds;
+    const double note_old = ns(s.note_old_ticks - l.note_old_ticks, timed_notes);
+    const double note_new = ns(s.note_new_ticks - l.note_new_ticks, timed_notes);
+    const double find_old = ns(s.find_old_ticks - l.find_old_ticks, timed_finds);
+    const double find_new = ns(s.find_new_ticks - l.find_new_ticks, timed_finds);
+    // Dry: what the blocks alone would save (negative when they cost more), from the timed calls.
+    const double saving_ms = (rate(s.notes - l.notes) * (note_old - note_new) +
+                              rate(s.finds - l.finds) * (find_old - find_new)) /
+                             1e6;
+    LOG_INFO(HW_GPU,
+             "Front async table (FRITCHII_FRONT_ASYNC_TABLE={}) {:.0f} s: notes {:.0f}/s, reads "
+             "{:.0f}/s; blocks {} ({} KiB), old table {} slots in {} entries ({} KiB); "
+             "handovers {}; verify: {:.0f} checked/s, {} differ (must be 0, {} since boot); dry: "
+             "note old {:.1f} ns, blocks {:.1f} ns ({} timed), read old {:.1f} ns, blocks "
+             "{:.1f} ns ({} timed), saving ~{:.2f} ms/s",
+             mode, window, rate(s.notes - l.notes), rate(s.finds - l.finds), async_blocks.Blocks(),
+             async_blocks.Blocks() * 96 / 1024, async_writes.Size(), async_writes.Capacity(),
+             async_writes.Capacity() * 16 / 1024, s.handovers - l.handovers,
+             rate(s.checked - l.checked), s.differ - l.differ, async_differ_total, note_old,
+             note_new, timed_notes, find_old, find_new, timed_finds, saving_ms);
+    async_logged = async_stats;
+    async_window_ns = now;
+    async_window_ticks = ticks;
 }
 
 int GpuSplit::OverflowFloorMode() {

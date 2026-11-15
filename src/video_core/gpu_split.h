@@ -1406,22 +1406,21 @@ public:
     /// Front: a write that lands when a host query completes or a fence signals (counter
     /// reports, timed releases), not when the back runs it (Tegra::Nx2AsyncReportsSettled).
     void NoteAsyncWrite(u64 begin, u64 size) {
+        // FRITCHII_FRONT_ASYNC_TABLE: off, one relaxed load, one member load and a branch.
+        if ((FrontAsyncTableMode() | async_table_mode) != 0) [[unlikely]] {
+            NoteAsyncWriteSwitched(begin, size);
+            return;
+        }
         for (u64 slot = begin >> 4; slot <= (begin + size - 1) >> 4; ++slot) {
             async_writes.Set(slot, write_position);
         }
     }
     /// Front: the ring position of the newest async write noted to these bytes, or 0.
-    [[nodiscard]] u64 HasAsyncWrite(u64 begin, u64 size) const {
-        u64 newest = 0;
-        if (async_writes.empty()) {
-            return newest;
+    [[nodiscard]] u64 HasAsyncWrite(u64 begin, u64 size) {
+        if ((FrontAsyncTableMode() | async_table_mode) != 0) [[unlikely]] {
+            return HasAsyncWriteSwitched(begin, size); // FRITCHII_FRONT_ASYNC_TABLE
         }
-        for (u64 slot = begin >> 4; slot <= (begin + size - 1) >> 4; ++slot) {
-            if (const u64* const position = async_writes.Find(slot)) {
-                newest = (std::max)(newest, *position);
-            }
-        }
-        return newest;
+        return OldAsyncNewest(begin, size);
     }
 
     /// A host-level wait was just sent (a syncpoint acquire, a host WFI, a GP entry with its sync
@@ -1794,6 +1793,27 @@ private:
                 }
             }
         }
+        /// FRITCHII_FRONT_ASYNC_TABLE: every slot and its position (switch changes copy them).
+        template <typename Func>
+        void ForEach(Func&& func) const {
+            for (const Entry& entry : entries) {
+                if (entry.key != EmptyKey) {
+                    func(entry.key, entry.position);
+                }
+            }
+        }
+        /// Empties the table and frees its memory (the block table holds the slots instead).
+        void Release() {
+            std::vector<Entry>().swap(entries);
+            mask = 0;
+            count = 0;
+        }
+        [[nodiscard]] size_t Size() const {
+            return count;
+        }
+        [[nodiscard]] size_t Capacity() const {
+            return entries.size();
+        }
 
     private:
         /// Slots are device addresses >> 4: never all ones.
@@ -1822,6 +1842,200 @@ private:
         size_t count{};
     };
     AsyncWriteTable async_writes; ///< Front: 16-byte slot -> ring position
+
+    /// FRITCHII_FRONT_ASYNC_TABLE (live, default 0; helper AA): async_writes kept per block of 8
+    /// neighbouring slots (128 bytes of guest memory). A block's 8 positions fill one 64-byte line,
+    /// so the reports the game writes next to each other land in one line instead of one random
+    /// line each, and a reader's 3 slots (the 0xe2c read: 15 bytes before + 24) are one or two
+    /// lines. A small open-addressed index maps the block number to the block, and a one-entry
+    /// memo per side (notes, reads) skips the index for runs within one block. A slot never noted
+    /// reads 0, which is what a missing slot gives HasAsyncWrite (a newest of 0): the answers
+    /// are the same as async_writes', slot for slot. Never erased, as async_writes (only at
+    /// Reset or when the switch hands the slots back).
+    class AsyncBlockTable {
+    public:
+        static constexpr u32 SlotsPerBlock = 8;
+        [[nodiscard]] bool Empty() const {
+            return count == 0;
+        }
+        /// Empties the table and frees its memory.
+        void Release() {
+            std::vector<Index>().swap(index);
+            std::vector<Block>().swap(blocks);
+            mask = 0;
+            count = 0;
+            set_memo_key = EmptyKey;
+            find_memo_key = EmptyKey;
+        }
+        void Set(u64 slot, u64 position) {
+            const u64 key = slot / SlotsPerBlock;
+            if (key != set_memo_key) {
+                set_memo_block = Insert(key);
+                set_memo_key = key;
+            }
+            blocks[set_memo_block].positions[slot % SlotsPerBlock] = position;
+        }
+        /// The newest position noted to slots [first, last], or 0.
+        [[nodiscard]] u64 Newest(u64 first, u64 last) {
+            u64 newest = 0;
+            if (count == 0 || first > last) {
+                return newest;
+            }
+            const u64 first_key = first / SlotsPerBlock;
+            const u64 last_key = last / SlotsPerBlock;
+            for (u64 key = first_key;; ++key) {
+                if (const Block* const block = Lookup(key)) {
+                    const u32 from = key == first_key ? static_cast<u32>(first % SlotsPerBlock) : 0;
+                    const u32 to =
+                        key == last_key ? static_cast<u32>(last % SlotsPerBlock) : SlotsPerBlock - 1;
+                    for (u32 i = from; i <= to; ++i) {
+                        newest = (std::max)(newest, block->positions[i]);
+                    }
+                }
+                if (key == last_key) {
+                    break;
+                }
+            }
+            return newest;
+        }
+        /// Every slot of every block and its position (0 where never noted).
+        template <typename Func>
+        void ForEach(Func&& func) const {
+            for (const Index& entry : index) {
+                if (entry.key == EmptyKey) {
+                    continue;
+                }
+                const Block& block = blocks[entry.block];
+                for (u32 i = 0; i < SlotsPerBlock; ++i) {
+                    if (block.positions[i] != 0) {
+                        func(entry.key * SlotsPerBlock + i, block.positions[i]);
+                    }
+                }
+            }
+        }
+        [[nodiscard]] size_t Blocks() const {
+            return count;
+        }
+
+    private:
+        /// Block numbers are slots / 8: never all ones.
+        static constexpr u64 EmptyKey = ~u64{0};
+        struct alignas(64) Block {
+            std::array<u64, SlotsPerBlock> positions{};
+        };
+        struct Index {
+            u64 key;
+            u64 block;
+        };
+        [[nodiscard]] static size_t Hash(u64 key) {
+            const u64 mixed = key * 0x9e3779b97f4a7c15ULL;
+            return static_cast<size_t>(mixed ^ (mixed >> 29));
+        }
+        /// The block of `key`, made (all slots 0) when new.
+        size_t Insert(u64 key) {
+            if ((count + 1) * 2 > index.size()) [[unlikely]] {
+                Grow();
+            }
+            for (size_t i = Hash(key) & mask;; i = (i + 1) & mask) {
+                Index& entry = index[i];
+                if (entry.key == key) {
+                    return static_cast<size_t>(entry.block);
+                }
+                if (entry.key == EmptyKey) {
+                    entry = {key, blocks.size()};
+                    blocks.emplace_back();
+                    ++count;
+                    return static_cast<size_t>(entry.block);
+                }
+            }
+        }
+        [[nodiscard]] const Block* Lookup(u64 key) {
+            if (key == find_memo_key) {
+                return &blocks[find_memo_block];
+            }
+            for (size_t i = Hash(key) & mask;; i = (i + 1) & mask) {
+                const Index& entry = index[i];
+                if (entry.key == key) {
+                    find_memo_key = key;
+                    find_memo_block = static_cast<size_t>(entry.block);
+                    return &blocks[find_memo_block];
+                }
+                if (entry.key == EmptyKey) {
+                    return nullptr;
+                }
+            }
+        }
+        void Grow() {
+            std::vector<Index> old = std::move(index);
+            index.assign(old.empty() ? size_t{256} : old.size() * 2, Index{EmptyKey, 0});
+            mask = index.size() - 1;
+            for (const Index& entry : old) {
+                if (entry.key == EmptyKey) {
+                    continue;
+                }
+                for (size_t i = Hash(entry.key) & mask;; i = (i + 1) & mask) {
+                    if (index[i].key == EmptyKey) {
+                        index[i] = entry;
+                        break;
+                    }
+                }
+            }
+        }
+        std::vector<Index> index;
+        std::vector<Block> blocks; ///< In the order they were made; never moved between slots
+        size_t mask{};
+        size_t count{};
+        // Memos: block numbers stay valid (blocks are only appended, until Release).
+        u64 set_memo_key{EmptyKey};
+        size_t set_memo_block{};
+        u64 find_memo_key{EmptyKey};
+        size_t find_memo_block{};
+    };
+    AsyncBlockTable async_blocks; ///< Front, FRITCHII_FRONT_ASYNC_TABLE 1 to 3
+    /// The FRITCHII_FRONT_ASYNC_TABLE value the tables are kept for (front only): 0 async_writes
+    /// alone, 1 async_blocks alone, 2 and 3 both.
+    int async_table_mode{};
+    struct AsyncTableStats {
+        u64 calls;       ///< switched calls (the log cadence)
+        u64 notes;       ///< NoteAsyncWrite calls
+        u64 finds;       ///< HasAsyncWrite calls
+        u64 checked;     ///< 2: answers compared
+        u64 differ;      ///< 2: of them, different (must be 0)
+        u64 timed_notes; ///< 3: notes timed in both tables
+        u64 note_old_ticks;
+        u64 note_new_ticks;
+        u64 timed_finds; ///< 3: reads timed in both tables
+        u64 find_old_ticks;
+        u64 find_new_ticks;
+        u64 handovers; ///< switch changes that copied the slots between the tables
+    };
+    AsyncTableStats async_stats{};
+    AsyncTableStats async_logged{};
+    u64 async_window_ns{};
+    u64 async_window_ticks{};
+    u64 async_differ_total{};
+    [[nodiscard]] static int FrontAsyncTableMode() {
+        return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_front_async_table,
+                                                "FRITCHII_FRONT_ASYNC_TABLE");
+    }
+    /// HasAsyncWrite from async_writes, as before the switch.
+    [[nodiscard]] u64 OldAsyncNewest(u64 begin, u64 size) const {
+        u64 newest = 0;
+        if (async_writes.empty()) {
+            return newest;
+        }
+        for (u64 slot = begin >> 4; slot <= (begin + size - 1) >> 4; ++slot) {
+            if (const u64* const position = async_writes.Find(slot)) {
+                newest = (std::max)(newest, *position);
+            }
+        }
+        return newest;
+    }
+    /// Keeps the tables the switch value `mode` needs, copying the slots over when it changed.
+    void SyncAsyncTables(int mode);
+    void NoteAsyncWriteSwitched(u64 begin, u64 size);
+    [[nodiscard]] u64 HasAsyncWriteSwitched(u64 begin, u64 size);
+    void LogAsyncTable(int mode);
 
     static constexpr size_t RingWords = size_t{1} << 20; // 8 MiB
     static constexpr size_t RingMask = RingWords - 1;

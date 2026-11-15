@@ -403,6 +403,12 @@ inline std::atomic<int> g_front_trim_range{-1};
 /// entries: 1 = on, 2 = verify (both run, the old walk answers, differences counted), 3 = dry
 /// (counted and timed 1 in 64).
 inline std::atomic<int> g_front_trim_qmd{-1};
+/// FRITCHII_FRONT_ASYNC_TABLE (live, default 0; helper AA): GpuSplit's async write table
+/// (counter reports and timed releases, read by RanReadCheck and SemaphoreReadableNow) kept per
+/// block of 8 neighbouring 16-byte slots, one cache line each, instead of one random line per
+/// slot: 1 = on, 2 = verify (both kept, the old table answers, differences counted), 3 = dry
+/// (both kept, counted and timed 1 in 64).
+inline std::atomic<int> g_front_async_table{-1};
 /// FRITCHII_NOTED_OVERFLOW (live, default 0; F7, with FRITCHII_NOTED_FAST 1 to 3): the table's
 /// overflow answer of NotedWriteSinceFast asked again of the note chains, which keep the position
 /// of each forgotten link: 1 = on (a chain-proved "no write" answers at FRITCHII_NOTED_FAST=1),
