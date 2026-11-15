@@ -3595,6 +3595,24 @@ private:
                         bool is_last_call, bool from_macro, const FrontWriteDecision& decision);
     void FrontWriteNotes(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
                          const FrontWriteDecision& decision);
+    /// FRITCHII_ONEF_FRONT_OPS (macro_ops_oot.h): a handler write decided for the call's op; the
+    /// recorded writes sent the old way; the call's op sent (`handled`: the handler ran it whole);
+    /// the coverage line; whether a check mismatch stopped ops for the session.
+    void FrontOpRecord(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument);
+    void FrontOpFallback(VideoCommon::GpuSplit& split, FrontState& state);
+    void FrontOpFinish(VideoCommon::GpuSplit& split, FrontState& state, bool handled);
+    static void FrontOpReport(FrontState& state, int mode);
+    static bool FrontOpsStopped();
+    static void StopFrontOps(const char* why);
+    /// E's half: the op's writes rebuilt and applied as Execute applies the entries they replace
+    /// (S2), or directly (S3), then the check words compared.
+    static void ApplyFrontOp(const u64* payload);
+    void ApplyFrontOpWrites(Core::System& system, u8 op, const u32* args, u64 sent, u64 pairs);
+    void ApplyFrontOpDirect(Core::System& system, u8 op, const u32* args, u64 sent, u64 pairs);
+    void CheckFrontOp(u8 op, const u32* args, const u64* checks, u32 writes, u32 finals);
+    /// FRITCHII_ONEF_DEAD_STORES (fable_b 27.7, count only): an 0xea0 call begins (`end`
+    /// false: are the last call's trailing stores dead?) or ended (its stores noted).
+    void FrontDeadStores(VideoCommon::GpuSplit& split, FrontState& state, bool end);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
     /// FrontRunMacro's two bodies: v5.7's (no macro switch on) and the one with EXP53,
     /// EDEN_NX2_OOT_MACROS, EDEN_NX2_FOLD_INSTANCE and EDEN_NX2_DRAW_PACKET. FrontState's

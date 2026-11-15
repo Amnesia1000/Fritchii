@@ -545,6 +545,15 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_ONEF_DISPATCH_RANGES") {
         return &g_onef_dispatch_ranges;
     }
+    if (name == "FRITCHII_ONEF_FRONT_OPS") {
+        return &g_onef_front_ops;
+    }
+    if (name == "FRITCHII_ONEF_DEAD_STORES") {
+        return &g_onef_dead_stores;
+    }
+    if (name == "FRITCHII_ONEF_FILL_COUNT") {
+        return &g_onef_fill_count;
+    }
     if (name == "FRITCHII_LIST_COPY_SKIP") {
         return &g_list_copy_skip;
     }

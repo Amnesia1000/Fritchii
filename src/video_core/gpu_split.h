@@ -1100,6 +1100,15 @@ public:
         cb_header = nullptr;
         return write_position;
     }
+    /// The ring position of everything sent so far, read without ending the open CbWords block
+    /// (counters only: FRITCHII_ONEF_DEAD_STORES). Work held back as the pending flush is not in
+    /// it yet (PendingFlushHeld).
+    [[nodiscard]] u64 WritePositionPeek() const {
+        return write_position;
+    }
+    [[nodiscard]] bool PendingFlushHeld() const {
+        return pending_flush != nullptr;
+    }
     /// the last compute/copy and unranged writer positions.
     [[nodiscard]] u64 LastWriterPosition() const {
         return last_writer_position;
