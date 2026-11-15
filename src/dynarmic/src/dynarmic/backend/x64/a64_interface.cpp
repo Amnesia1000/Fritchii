@@ -14,6 +14,9 @@
 #include <exception>
 #include <memory>
 #include <mutex>
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 
 #include <boost/icl/interval_set.hpp>
 #include "common/assert.h"
@@ -292,6 +295,35 @@ private:
 
 } // namespace
 
+/// Fritchii: FRITCHII_JIT_HALT_LATENCY (boot, default 0). 1 = each core times a halt request
+/// from another thread (HaltExecution: interrupts, cache invalidations) to the JIT's return from
+/// Run, and logs every 10 s: halts, p50, p99, longest (with the pc it stopped at), and "over
+/// 1 ms: N (must be 0)". It bounds how long a halt can wait for a check, which
+/// FRITCHII_JIT_CHAIN bit 2 makes rarer (Fable A 9.4). Requests the core makes itself from a
+/// callback (svc, aborts) are not timed: a CheckHalt follows them at once.
+/// Off: one predictable branch in HaltExecution and Run, no change to generated code.
+static bool HaltLatencyMode() {
+    static const bool on = [] {
+        const char* text = std::getenv("FRITCHII_JIT_HALT_LATENCY");
+        const bool value = text != nullptr && std::atoi(text) == 1;
+        if (value) {
+            LOG_INFO(Core_ARM, "FRITCHII_JIT_HALT_LATENCY=1: halt request to JIT return timed per core, "
+                               "line every 10 s");
+        }
+        return value;
+    }();
+    return on;
+}
+
+/// The JIT whose Run this thread is inside (FRITCHII_JIT_HALT_LATENCY only).
+static thread_local const void* t_running_jit = nullptr;
+
+static s64 SteadyNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
 static Optimization::PolyfillOptions GenPolyfillOptions(const BlockOfCode& code) {
     return Optimization::PolyfillOptions{
         .sha256 = !code.HasHostFeature(HostFeature::SHA),
@@ -308,6 +340,14 @@ public:
         , polyfill_options(GenPolyfillOptions(block_of_code))
     {
         ASSERT(conf.page_table_address_space_bits >= 12 && conf.page_table_address_space_bits <= 64);
+        // Fritchii (FRITCHII_JIT_VERIFY=2): the guest registers whose slots hold a poison while
+        // generated code runs.
+        if (block_of_code.Pins().shadow) {
+            for (const PinnedRegister& pin : block_of_code.Pins().regs) {
+                pin_poison_mask |= u64(1) << (pin.poison & 31);
+            }
+        }
+        halt_latency = HaltLatencyMode();
     }
 
     ~Impl() = default;
@@ -330,7 +370,22 @@ public:
             }
             return CodePtr((uintptr_t(GetCurrentBlock()) + 15) & ~uintptr_t(15));
         }();
+        // Fritchii (FRITCHII_JIT_HALT_LATENCY): a request from before this point either set a
+        // halt bit (the entry returns at once) or was served; only later ones are timed.
+        s64 run_start_ns = 0;
+        if (halt_latency) [[unlikely]] {
+            t_running_jit = this;
+            run_start_ns = SteadyNs();
+            halt_request_ns.store(0, std::memory_order_relaxed);
+        }
         const HaltReason hr = block_of_code.RunCode(&jit_state, current_code_ptr);
+        if (halt_latency) [[unlikely]] {
+            t_running_jit = nullptr;
+            NoteHaltLatency(run_start_ns);
+        }
+        if (pin_poison_mask != 0) [[unlikely]] {
+            CheckPinsAfterExit();
+        }
         PerformRequestedCacheInvalidation(hr);
         is_executing = false;
         // Fritchii: FRITCHII_JIT_INDIRECT_CACHE's counters, written by this thread's code.
@@ -339,7 +394,11 @@ public:
         }
         // Fritchii: FRITCHII_JIT_VERIFY's must-be-0 count, written by this thread's code.
         if (emitter.pin_verify && (++runs_since_pin_look & 0x3f) == 0) [[unlikely]] {
-            emitter.LogPinMismatches(jit_state.pin_mismatches);
+            if (emitter.pin_shadow) {
+                emitter.LogPinChecks(jit_state, pin_poison_reads.load(std::memory_order_relaxed), pin_exit_poison);
+            } else {
+                emitter.LogPinMismatches(jit_state.pin_mismatches);
+            }
         }
         if (emitter.pin_stats && (++runs_since_pin_look & 0x3ff) == 0) [[unlikely]] {
             emitter.LogPinStats(jit_state.pin_stats);
@@ -352,6 +411,9 @@ public:
         PerformRequestedCacheInvalidation(static_cast<HaltReason>(Atomic::Load(&jit_state.halt_reason)));
         is_executing = true;
         const HaltReason hr = block_of_code.StepCode(&jit_state, GetCurrentSingleStep());
+        if (pin_poison_mask != 0) [[unlikely]] {
+            CheckPinsAfterExit();  // Fritchii (FRITCHII_JIT_VERIFY=2)
+        }
         PerformRequestedCacheInvalidation(hr);
         is_executing = false;
         return hr;
@@ -377,6 +439,12 @@ public:
     }
 
     void HaltExecution(HaltReason hr) {
+        // Fritchii (FRITCHII_JIT_HALT_LATENCY): the earliest request from another thread not yet
+        // served is timed; stamped before the bit, so a return that saw the bit finds the stamp.
+        if (halt_latency && t_running_jit != this) [[unlikely]] {
+            s64 expected = 0;
+            halt_request_ns.compare_exchange_strong(expected, SteadyNs(), std::memory_order_relaxed);
+        }
         Atomic::Or(&jit_state.halt_reason, static_cast<u32>(hr));
     }
 
@@ -385,7 +453,7 @@ public:
     }
 
     u64 GetSP() const {
-        return jit_state.sp;
+        return CheckPoisonRead(31, jit_state.sp);
     }
 
     void SetSP(u64 value) {
@@ -403,7 +471,7 @@ public:
     u64 GetRegister(size_t index) const {
         if (index == 31)
             return GetSP();
-        return jit_state.reg.at(index);
+        return CheckPoisonRead(index, jit_state.reg.at(index));
     }
 
     void SetRegister(size_t index, u64 value) {
@@ -413,6 +481,11 @@ public:
     }
 
     std::array<u64, 31> GetRegisters() const {
+        if (pin_poison_mask != 0) [[unlikely]] {
+            for (size_t i = 0; i < 31; ++i) {
+                CheckPoisonRead(i, jit_state.reg[i]);
+            }
+        }
         return jit_state.reg;
     }
 
@@ -650,6 +723,101 @@ private:
         }
     }
 
+    /// Fritchii (FRITCHII_JIT_VERIFY=2): a C++ read of a pinned register that returns its poison
+    /// means it read the slot while the pins were live and no store had run (a call out that
+    /// bypassed the pin hook, or a read from another thread while the core runs). Counted
+    /// (must be 0), the first few logged; the value is left as it is, so it shows in a crash.
+    u64 CheckPoisonRead(size_t index, u64 value) const {
+        if ((pin_poison_mask >> index) & 1) [[unlikely]] {
+            if (value == A64JitState::PinPoison(index)) {
+                const u64 count = pin_poison_reads.fetch_add(1, std::memory_order_relaxed);
+                if (count < 8) {
+                    LOG_ERROR(Core_ARM, "JIT pin check (FRITCHII_JIT_VERIFY=2) core {}: C++ read the poison of {} "
+                                        "(pc {:#x}, executing {}): a call out without the pin store",
+                              conf.processor_id, index == 31 ? std::string("sp") : fmt::format("x{}", index),
+                              jit_state.pc, is_executing);
+                }
+            }
+        }
+        return value;
+    }
+
+    /// Fritchii (FRITCHII_JIT_VERIFY=2): after the JIT returned every pinned slot must hold the
+    /// real value (the exit's store). A poison here means a way out without it: counted
+    /// (must be 0) and repaired from the shadow, which holds the value.
+    void CheckPinsAfterExit() {
+        const auto& regs = block_of_code.Pins().regs;
+        for (size_t k = 0; k < regs.size(); ++k) {
+            const size_t index = size_t(regs[k].poison & 31);
+            u64& slot = index == 31 ? jit_state.sp : jit_state.reg[index];
+            if (slot == regs[k].poison) [[unlikely]] {
+                if (pin_exit_poison++ < 8) {
+                    LOG_ERROR(Core_ARM, "JIT pin check (FRITCHII_JIT_VERIFY=2) core {}: {} still poisoned after the "
+                                        "JIT returned (pc {:#x}): a way out without the pin store",
+                              conf.processor_id, index == 31 ? std::string("sp") : fmt::format("x{}", index),
+                              jit_state.pc);
+                }
+                slot = jit_state.pin_shadow[k];
+            }
+        }
+    }
+
+    /// Fritchii (FRITCHII_JIT_HALT_LATENCY): the time from the earliest halt request of this run
+    /// to the return; a run that returned without one (none came, or it came before the run and
+    /// its bit made the entry return at once) has no sample.
+    void NoteHaltLatency(s64 run_start_ns) {
+        const s64 requested = halt_request_ns.exchange(0, std::memory_order_relaxed);
+        const s64 now = SteadyNs();
+        if (requested != 0) {
+            const s64 waited = now - (std::max)(requested, run_start_ns);
+            const u64 us = waited <= 0 ? 0 : u64(waited) / 1000;
+            size_t bucket = 0;  // [2^(b-1), 2^b) us, bucket 0 = under 1 us
+            while (bucket + 1 < halt_buckets.size() && (u64(1) << bucket) <= us) {
+                ++bucket;
+            }
+            ++halt_buckets[bucket];
+            ++halt_count;
+            if (waited > 1'000'000) {
+                ++halt_over_1ms;
+                ++halt_over_1ms_total;
+            }
+            if (waited > halt_longest_ns) {
+                halt_longest_ns = waited;
+                halt_longest_pc = jit_state.pc;
+            }
+        }
+        if (halt_log_ns == 0) {
+            halt_log_ns = now;
+            return;
+        }
+        if (now - halt_log_ns < 10'000'000'000LL) {
+            return;
+        }
+        // Percentiles as the upper edge of the bucket they fall in.
+        const auto percentile = [&](u64 part) -> u64 {
+            const u64 rank = (halt_count * part + 99) / 100;
+            u64 seen = 0;
+            for (size_t b = 0; b < halt_buckets.size(); ++b) {
+                seen += halt_buckets[b];
+                if (seen >= rank && rank != 0) {
+                    return u64(1) << b;
+                }
+            }
+            return 0;
+        };
+        LOG_INFO(Core_ARM, "JIT halt latency (FRITCHII_JIT_HALT_LATENCY=1) core {} {:.1f} s: {} halts from other threads, "
+                           "p50 under {} us, p99 under {} us, longest {} us (pc {:#x}), over 1 ms: {} (must be 0), "
+                           "{} since boot",
+                 conf.processor_id, double(now - halt_log_ns) / 1e9, halt_count, percentile(50), percentile(99),
+                 halt_longest_ns / 1000, halt_longest_pc, halt_over_1ms, halt_over_1ms_total);
+        halt_buckets.fill(0);
+        halt_count = 0;
+        halt_over_1ms = 0;
+        halt_longest_ns = 0;
+        halt_longest_pc = 0;
+        halt_log_ns = now;
+    }
+
     IR::Block ir_block = {LocationDescriptor(0, FP::FPCR(0), false)};
     const UserConfig conf;
     A64JitState jit_state;
@@ -660,6 +828,22 @@ private:
     bool is_executing = false;
     u32 runs_since_counter_look = 0;
     u32 runs_since_pin_look = 0;
+    /// Fritchii (FRITCHII_JIT_VERIFY=2): bit i = guest register i (31 = SP) is pinned and
+    /// poisoned while generated code runs; 0 in every other mode.
+    u64 pin_poison_mask = 0;
+    mutable std::atomic<u64> pin_poison_reads{0};
+    u64 pin_exit_poison = 0;
+    /// Fritchii (FRITCHII_JIT_HALT_LATENCY): the stamp is written by any thread, the rest by
+    /// the owner thread in Run.
+    bool halt_latency = false;
+    std::atomic<s64> halt_request_ns{0};
+    std::array<u64, 24> halt_buckets{};
+    u64 halt_count = 0;
+    u64 halt_over_1ms = 0;
+    u64 halt_over_1ms_total = 0;
+    s64 halt_longest_ns = 0;
+    u64 halt_longest_pc = 0;
+    s64 halt_log_ns = 0;
     bool invalidate_entire_cache = false;
     boost::icl::interval_set<u64> invalid_cache_ranges;
     std::mutex invalidation_mutex;

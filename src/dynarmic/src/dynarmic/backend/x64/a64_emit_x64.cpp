@@ -242,12 +242,31 @@ PinConfig A64EmitX64::PinSetup(const A64::UserConfig& conf) {
         LOG_WARNING(Core_ARM, "FRITCHII_JIT_PIN=1: no usable register in FRITCHII_JIT_PIN_REGS, off");
         return pins;
     }
-    pins.verify = EnvSwitch("FRITCHII_JIT_VERIFY") == 1;
+    const int verify = EnvSwitch("FRITCHII_JIT_VERIFY");
+    pins.verify = verify == 1 || verify == 2;
     pins.mismatch_offset = u32(offsetof(A64JitState, pin_mismatches));
+    // FRITCHII_JIT_VERIFY=2: a shadow per pin and a poison per own slot (PinConfig::shadow).
+    if (verify == 2) {
+        static_assert(A64JitState::max_pins >= 2);
+        pins.shadow = true;
+        pins.slot_written_offset = u32(offsetof(A64JitState, pin_slot_written));
+        pins.store_missed_offset = u32(offsetof(A64JitState, pin_store_missed));
+        for (size_t k = 0; k < pins.regs.size(); ++k) {
+            PinnedRegister& pin = pins.regs[k];
+            const size_t index = pin.state_offset == offsetof(A64JitState, sp)
+                                     ? 31
+                                     : (pin.state_offset - offsetof(A64JitState, reg)) / sizeof(u64);
+            pin.shadow_offset = u32(offsetof(A64JitState, pin_shadow) + sizeof(u64) * k);
+            pin.poison = A64JitState::PinPoison(index);
+        }
+    }
     static const bool logged = [&] {
         LOG_INFO(Core_ARM, "FRITCHII_JIT_PIN=1: {}{}{}", names,
                  OmitFramePointer() ? "" : " (rbp needs FRITCHII_JIT_NO_FRAME_POINTER=1)",
-                 pins.verify ? "; FRITCHII_JIT_VERIFY=1: writes also go to the state block, checked at calls and exits" : "");
+                 pins.shadow   ? "; FRITCHII_JIT_VERIFY=2: writes go to a shadow, the own slots hold a poison, "
+                                 "every pinned read and every call out and exit checked"
+                 : pins.verify ? "; FRITCHII_JIT_VERIFY=1: writes also go to the state block, checked at calls and exits"
+                               : "");
         return true;
     }();
     (void)logged;
@@ -307,6 +326,24 @@ void A64EmitX64::LogPinStats(const std::array<u64, 64>& counts) {
              conf.processor_id, seconds, double(all) / seconds / 1e6, line);
     pin_stats_log_ns = now;
     pin_stats_logged = counts;
+}
+
+void A64EmitX64::LogPinChecks(const A64JitState& state, u64 poison_reads, u64 exit_poison) {
+    const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    if (pin_log_ns != 0 && now - pin_log_ns < 1'000'000'000LL) {
+        return;
+    }
+    const u64 bad = state.pin_mismatches + state.pin_read_mismatches + state.pin_slot_written +
+                    state.pin_store_missed + poison_reads + exit_poison;
+    LOG_INFO(Core_ARM, "JIT pin check (FRITCHII_JIT_VERIFY=2) core {}: {} new, {} total (must be 0); "
+                       "read mismatches {}, checkpoint mismatches {}, slot written {}, store missed {}, "
+                       "C++ poison reads {}, exit poison {}; reads checked {}",
+             conf.processor_id, bad - pin_checks_logged, bad, state.pin_read_mismatches, state.pin_mismatches,
+             state.pin_slot_written, state.pin_store_missed, poison_reads, exit_poison, state.pin_reads_checked);
+    pin_log_ns = now;
+    pin_checks_logged = bad;
 }
 
 void A64EmitX64::LogPinMismatches(u64 total) {
@@ -394,6 +431,12 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
         pin_host_index[index] = pin.host.getIdx();
     }
     pin_verify = code.Pins().verify;
+    pin_shadow = code.Pins().shadow;  // FRITCHII_JIT_VERIFY=2
+    if (pin_shadow) {
+        for (const PinnedRegister& pin : code.Pins().regs) {
+            pin_shadow_offset[size_t(pin.poison & 31)] = pin.shadow_offset;  // low half = register
+        }
+    }
     code.SetPinCallHook(true);
     GenMemory128Accessors();
     GenFastmemFallbacks();
@@ -968,6 +1011,7 @@ void A64EmitX64::EmitA64GetW(A64EmitContext& ctx, IR::Inst* inst) {
 
     // Fritchii (FRITCHII_JIT_PIN): a pinned register's value is its host register's.
     if (const auto host = PinnedHost(size_t(reg))) {
+        EmitPinnedReadCheck(ctx, size_t(reg), *host);
         code.mov(result, host->cvt32());
         ctx.reg_alloc.DefineValue(code, inst, result);
         return;
@@ -982,6 +1026,7 @@ void A64EmitX64::EmitA64GetX(A64EmitContext& ctx, IR::Inst* inst) {
     const Xbyak::Reg64 result = ctx.reg_alloc.ScratchGpr(code);
 
     if (const auto host = PinnedHost(size_t(reg))) {  // Fritchii (FRITCHII_JIT_PIN)
+        EmitPinnedReadCheck(ctx, size_t(reg), *host);
         code.mov(result, *host);
         ctx.reg_alloc.DefineValue(code, inst, result);
         return;
@@ -1021,6 +1066,7 @@ void A64EmitX64::EmitA64GetSP(A64EmitContext& ctx, IR::Inst* inst) {
     EmitPinStat(31, false);  // Fritchii (FRITCHII_JIT_PIN_STATS)
     const Xbyak::Reg64 result = ctx.reg_alloc.ScratchGpr(code);
     if (const auto host = PinnedHost(31)) {  // Fritchii (FRITCHII_JIT_PIN)
+        EmitPinnedReadCheck(ctx, 31, *host);
         code.mov(result, *host);
         ctx.reg_alloc.DefineValue(code, inst, result);
         return;
@@ -1053,18 +1099,18 @@ void A64EmitX64::EmitA64SetW(A64EmitContext& ctx, IR::Inst* inst) {
     const auto addr = qword[code.ABI_JIT_PTR + offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg)];
     // Fritchii (FRITCHII_JIT_PIN): the host register takes the value the qword store would
     // have (an imm32 sign extends in both, a register's low half zero extends); with
-    // FRITCHII_JIT_VERIFY the state block gets it too.
+    // FRITCHII_JIT_VERIFY its copy gets it too (=1 the state block, =2 the shadow).
     if (const auto host = PinnedHost(size_t(reg))) {
         if (args[1].FitsInImmediateS32()) {
             code.mov(*host, u64(s64(args[1].GetImmediateS32())));
             if (pin_verify) {
-                code.mov(addr, args[1].GetImmediateS32());
+                code.mov(PinnedCopy(size_t(reg), addr), args[1].GetImmediateS32());
             }
         } else {
             const Xbyak::Reg64 to_store = ctx.reg_alloc.UseGpr(code, args[1]);
             code.mov(host->cvt32(), to_store.cvt32());
             if (pin_verify) {
-                code.mov(addr, *host);
+                code.mov(PinnedCopy(size_t(reg), addr), *host);
             }
         }
         return;
@@ -1085,7 +1131,7 @@ void A64EmitX64::EmitA64SetX(A64EmitContext& ctx, IR::Inst* inst) {
     EmitPinStat(size_t(reg), true);  // Fritchii (FRITCHII_JIT_PIN_STATS)
     const auto addr = qword[code.ABI_JIT_PTR + offsetof(A64JitState, reg) + sizeof(u64) * static_cast<size_t>(reg)];
     if (const auto host = PinnedHost(size_t(reg))) {  // Fritchii (FRITCHII_JIT_PIN)
-        EmitPinnedSet(ctx, *host, addr, args[1]);
+        EmitPinnedSet(ctx, size_t(reg), *host, addr, args[1]);
         return;
     }
     if (args[1].FitsInImmediateS32()) {
@@ -1100,9 +1146,9 @@ void A64EmitX64::EmitA64SetX(A64EmitContext& ctx, IR::Inst* inst) {
 }
 
 // Fritchii (FRITCHII_JIT_PIN): SetX/SetSP of a pinned register. The host register takes the
-// value the qword store would have (an imm32 sign extends in both); with FRITCHII_JIT_VERIFY the
-// state block gets it too.
-void A64EmitX64::EmitPinnedSet(A64EmitContext& ctx, Xbyak::Reg64 host, const Xbyak::Address& addr, Argument& arg) {
+// value the qword store would have (an imm32 sign extends in both); with FRITCHII_JIT_VERIFY its
+// copy gets it too (=1 the state block, =2 the shadow).
+void A64EmitX64::EmitPinnedSet(A64EmitContext& ctx, size_t index, Xbyak::Reg64 host, const Xbyak::Address& addr, Argument& arg) {
     if (arg.FitsInImmediateS32()) {
         code.mov(host, u64(s64(arg.GetImmediateS32())));
     } else if (arg.IsInXmm(ctx.reg_alloc)) {
@@ -1111,7 +1157,31 @@ void A64EmitX64::EmitPinnedSet(A64EmitContext& ctx, Xbyak::Reg64 host, const Xby
         code.mov(host, ctx.reg_alloc.UseGpr(code, arg));
     }
     if (pin_verify) {
-        code.mov(addr, host);
+        code.mov(PinnedCopy(index, addr), host);
+    }
+}
+
+// Fritchii (FRITCHII_JIT_VERIFY=2): every pinned read compares the host register with the
+// shadow, so a host register changed behind the JIT's back is caught where it is used, also when
+// a pinned write follows before the next checkpoint. GetW/GetX/GetSP keep the host flags
+// (PreservesHostFlags), so while FRITCHII_JIT_FLAG_BRANCH tracks them the check saves them.
+void A64EmitX64::EmitPinnedReadCheck(A64EmitContext& ctx, size_t index, Xbyak::Reg64 host) {
+    if (!pin_shadow) {
+        return;
+    }
+    const auto shadow = code.qword[code.ABI_JIT_PTR + pin_shadow_offset[index]];
+    if (ctx.track_host_flags) {
+        code.pushfq();
+    }
+    Xbyak::Label same;
+    code.cmp(host, shadow);
+    code.je(same);
+    code.inc(code.qword[code.ABI_JIT_PTR + offsetof(A64JitState, pin_read_mismatches)]);
+    code.mov(host, shadow);
+    code.L(same);
+    code.inc(code.qword[code.ABI_JIT_PTR + offsetof(A64JitState, pin_reads_checked)]);
+    if (ctx.track_host_flags) {
+        code.popfq();
     }
 }
 
@@ -1152,7 +1222,7 @@ void A64EmitX64::EmitA64SetSP(A64EmitContext& ctx, IR::Inst* inst) {
     EmitPinStat(31, true);  // Fritchii (FRITCHII_JIT_PIN_STATS)
     const auto addr = qword[code.ABI_JIT_PTR + offsetof(A64JitState, sp)];
     if (const auto host = PinnedHost(31)) {  // Fritchii (FRITCHII_JIT_PIN)
-        EmitPinnedSet(ctx, *host, addr, args[0]);
+        EmitPinnedSet(ctx, 31, *host, addr, args[0]);
         return;
     }
     if (args[0].FitsInImmediateS32()) {

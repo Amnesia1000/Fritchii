@@ -164,11 +164,17 @@ public:
     /// FRITCHII_JIT_PIN (boot, Windows): 1 = up to two guest registers (FRITCHII_JIT_PIN_REGS, a
     /// comma list of sp and x0..x30, default "sp,x0") live in rsi and, with
     /// FRITCHII_JIT_NO_FRAME_POINTER=1, rbp while generated code runs; the state block gets them
-    /// at every call out and at the exit. FRITCHII_JIT_VERIFY=1 adds the self-check (PinConfig).
+    /// at every call out and at the exit. FRITCHII_JIT_VERIFY=1 adds the self-check (PinConfig);
+    /// FRITCHII_JIT_VERIFY=2 the shadow and poison check (PinConfig::shadow), which also
+    /// compares every pinned read with the shadow.
     /// Empty = old code. Built before the emitter: BlockOfCode takes it.
     static PinConfig PinSetup(const A64::UserConfig& conf);
     /// FRITCHII_JIT_VERIFY's line, at most once a second (from Jit::Run, on the owner thread).
     void LogPinMismatches(u64 total);
+    /// FRITCHII_JIT_VERIFY=2's line, at most once a second (from Jit::Run, on the owner thread):
+    /// the state block's counters and the C++ side's (poison reads by the accessors, poison
+    /// found in a slot after the JIT returned).
+    void LogPinChecks(const A64JitState& state, u64 poison_reads, u64 exit_poison);
     /// FRITCHII_JIT_PIN_STATS (boot): 1 = every guest register read and write in generated code
     /// counts (inc in the state block), logged every 10 s, to choose FRITCHII_JIT_PIN_REGS. Turns
     /// FRITCHII_JIT_FLAG_BRANCH off (the inc writes the flags).
@@ -180,7 +186,14 @@ public:
             code.inc(code.qword[code.ABI_JIT_PTR + offsetof(A64JitState, pin_stats) + sizeof(u64) * (index + (write ? 32 : 0))]);
         }
     }
-    void EmitPinnedSet(A64EmitContext& ctx, Xbyak::Reg64 host, const Xbyak::Address& addr, Argument& arg);
+    void EmitPinnedSet(A64EmitContext& ctx, size_t index, Xbyak::Reg64 host, const Xbyak::Address& addr, Argument& arg);
+    /// FRITCHII_JIT_VERIFY: where a pinned write's copy goes (=2 its shadow, =1 its own slot).
+    Xbyak::Address PinnedCopy(size_t index, const Xbyak::Address& own_slot) const {
+        return pin_shadow ? code.qword[code.ABI_JIT_PTR + pin_shadow_offset[index]] : own_slot;
+    }
+    /// Code emitter (FRITCHII_JIT_VERIFY=2): a pinned read compares its host register with the
+    /// shadow (a mismatch counts and the shadow wins). Keeps the host flags.
+    void EmitPinnedReadCheck(A64EmitContext& ctx, size_t index, Xbyak::Reg64 host);
     /// The host register guest register `index` (0..30, 31 = SP) is pinned to, if it is.
     std::optional<Xbyak::Reg64> PinnedHost(size_t index) const {
         const int idx = pin_host_index[index];
@@ -211,7 +224,10 @@ public:
     int flag_branch_mode = 0;
     /// FRITCHII_JIT_PIN: host register index per guest register (31 = SP), -1 = in the state block.
     std::array<int, 32> pin_host_index;
-    bool pin_verify = false;
+    bool pin_verify = false;  ///< FRITCHII_JIT_VERIFY=1 or 2
+    bool pin_shadow = false;  ///< FRITCHII_JIT_VERIFY=2
+    std::array<u32, 32> pin_shadow_offset{};  ///< per guest register (31 = SP), =2 only
+    u64 pin_checks_logged = 0;
     bool pin_stats = false;
     std::array<u64, 64> pin_stats_logged{};
     s64 pin_stats_log_ns = 0;
