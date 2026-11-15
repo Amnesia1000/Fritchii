@@ -3942,7 +3942,7 @@ std::vector<OneFollowerSyncTarget>* RasterizerVulkan::OneFollowerSyncTargetsLock
     for (const u64 address : onef_sync_payloads) {
         buffer_cache.OutdateReadDownloads(address, 16);
     }
-    onef_sync_samples.clear(); // R syncs them there; payloads stay listed (superset)
+    onef_sync_samples.clear(); // R syncs them there; payloads stay listed until a wait for idle
     return targets;
 }
 
@@ -3985,6 +3985,8 @@ void RasterizerVulkan::OneFollowerPostIdle() {
         MemStage::FillPlay seam{mem_stage, MemStage::Site::Query};
         if (syncs) {
             targets = OneFollowerSyncTargetsLocked();
+            // The payload streamer syncs only in NotifyWFI (its SyncWrites): all of them here.
+            onef_sync_payloads.clear();
         }
         if (group) {
             const VideoCommon::MemoryStageLink::BackCacheScope back_cache;
@@ -3995,6 +3997,7 @@ void RasterizerVulkan::OneFollowerPostIdle() {
         RasterizerVulkan* self;
         std::vector<OneFollowerSyncTarget>* targets;
     } const op{this, targets};
+    static_assert(sizeof(Op) <= OneF::MaxOpPayloadBytes, "an op over the payload limit");
     OneF::SetLendSite("WaitForIdle (posted)");
     OneF::PushOp(
         OneF::LentOp::ReadBack,
@@ -4083,6 +4086,7 @@ void RasterizerVulkan::OneFollowerPostFence(u8 kind, u32 value,
     } const op{this, targets, value, kind, committed,
                note != nullptr ? *note : OneFollowerPayloadNote{},
                report != nullptr ? *report : OneFollowerFenceReport{}};
+    static_assert(sizeof(Op) <= OneF::MaxOpPayloadBytes, "a fence op over the payload limit");
     OneF::SetLendSite(kind == 0   ? "SignalSyncPoint (posted)"
                       : kind == 1 ? "SignalReference (posted)"
                       : kind == 2 ? "ReleaseFences (posted)"
@@ -5554,6 +5558,7 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                         *device, gpu_addr, payload, subreport,
                         True(flags & VideoCommon::QueryPropertiesFlags::HasTimeout)};
                     OneF::CountQueryKind(OneF::QueryKind::PayloadFenceOnE);
+                    OneF::NoteEngineSignal("a fence-flagged payload write");
                     OneFollowerPostFence(5, 0, nullptr, &note);
                     return;
                 }
@@ -5596,6 +5601,7 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                 const bool has_timestamp =
                     True(flags & VideoCommon::QueryPropertiesFlags::HasTimeout);
                 OneF::BeforeEngineRead(*device, 16);
+                OneF::NoteEngineSignal("a payload release");
                 query_cache.WritePayloadNow(*device, gpu_addr, payload, has_timestamp, false);
                 struct Op {
                     RasterizerVulkan* self;
@@ -5605,6 +5611,8 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                     bool has_timestamp;
                 } const op{this, *device, payload, subreport, has_timestamp};
                 OneF::SetQueryKind(OneF::QueryKind::PayloadReleaseOnE);
+                static_assert(sizeof(Op) <= OneF::MaxOpPayloadBytes,
+                              "an op over the payload limit");
                 OneF::SetLendSite("payload release (written on E)");
                 OneF::PushOp(
                     OneF::LentOp::Query,
@@ -7240,6 +7248,7 @@ void RasterizerVulkan::SignalFence(std::function<void()>&& func) {
         // inside SignalFence (a QMD reduction or max release, the GP sync): E runs it at the
         // fence's place and posts the fence with an empty one.
         if (VideoCommon::OneFollower::SemOnE() && OneFollowerFenceClean()) {
+            VideoCommon::OneFollower::NoteEngineSignal("a SignalFence callback");
             OneFollowerPostFence(4, 0, &func);
             return;
         }
@@ -7279,6 +7288,7 @@ void RasterizerVulkan::SignalSyncPoint(u32 value) {
             // passes it. Bound: the frame end stays lent (E parks there until R played the
             // frame), so E is at most a frame ahead of R.
             if (VideoCommon::OneFollower::SemOnE()) {
+                VideoCommon::OneFollower::NoteEngineSignal("a sync point increment");
                 if (fence_manager.OneFollowerSyncPointGuest(value)) {
                     OneFollowerPostFence(3, value);
                 }
@@ -7385,14 +7395,34 @@ void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
 void RasterizerVulkan::WaitForIdle() {
     if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
         // FRITCHII_ONEF_POST_IDLE (fable_b 22.3): nothing comes back to E; posted when no
-        // report of another kind owes the query sync (16.2's form).
-        if (VideoCommon::OneFollower::PostIdleOn() && !onef_sync_owed) {
-            OneFollowerPostIdle();
-            return;
+        // report of another kind owes the query sync (16.2's form). Posted with R behind, the
+        // image flashed dark (stepflash, 8 Nov 15): the lent form also kept R caught up with E
+        // 5,900 times a second. 1 posts only with R caught up (the lent form's order exactly;
+        // E only stops waiting for the wait for idle itself); 2 also with R behind but no
+        // posted fence with report landings unplayed (13.0), to test that dependency.
+        namespace OneF = VideoCommon::OneFollower;
+        if (const int mode = OneF::PostIdleOn(); mode != 0) {
+            if (onef_sync_owed) {
+                OneF::CountIdleDecision(OneF::IdleDecision::LentSyncOwed);
+            } else if (OneF::RenderCaughtUp()) {
+                OneF::CountIdleDecision(OneF::IdleDecision::PostedCaughtUp);
+                OneFollowerPostIdle();
+                return;
+            } else if (mode == 1) {
+                OneF::CountIdleDecision(OneF::IdleDecision::LentBehind);
+            } else if (OneF::LandingOutstanding()) {
+                OneF::CountIdleDecision(OneF::IdleDecision::LentLanding);
+            } else {
+                OneF::CountIdleDecision(OneF::IdleDecision::PostedBehind);
+                OneFollowerPostIdle();
+                return;
+            }
         }
-        // Lent: NotifyWFI syncs what is owed, E parked (it lands nothing: no fence).
+        // Lent: NotifyWFI syncs what is owed, E parked (it lands nothing: no fence); the
+        // payload streamer syncs all of its own there.
         onef_sync_owed = false;
         onef_sync_samples.clear();
+        onef_sync_payloads.clear();
     }
     ONEF_LEND(ReadBack, WaitForIdle())
     // Everything but wait pixel operations. This intentionally includes FRAGMENT_SHADER_BIT because

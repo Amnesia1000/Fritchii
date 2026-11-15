@@ -303,7 +303,7 @@ inline std::atomic<int> g_onef_sem_e{-1};
 /// (the command list end) is answered on E: with the fencing thread it does nothing.
 inline std::atomic<int> g_onef_soft_release_e{-1};
 /// FRITCHII_ONEF_POST_IDLE (live, default 0; with POST_FENCE): fable_b 22.3, WaitForIdle posted
-/// in 16.2's form.
+/// in 16.2's form: 1 only with R caught up, 2 also with R behind but no report landing due.
 inline std::atomic<int> g_onef_post_idle{-1};
 /// FRITCHII_ONEF_POST_FENCE_REPORT (live, default 0; with POST_FENCE): fence-flagged counter
 /// reports posted as the rasterizer's fences are.

@@ -1657,7 +1657,15 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
 - FRITCHII_ONEF_POST_IDLE (live, default 0; needs FRITCHII_ONEF_POST_FENCE; fable_b 22.3): a
   WaitForIdle with no report of another kind owing the query sync is posted: E obtains the
   buffers for the values R syncs (16.2) and runs SignalOrdering's flush grouping at its place;
-  R records the barrier and syncs into the named buffers.
+  R records the barrier and syncs into the named buffers. 1 = only with R caught up (R played
+  every packet E pushed: the lent form's order, E just does not wait for the wait for idle
+  itself); 2 = also with R behind when no posted fence with report landings is unplayed (a
+  test: posting with R behind flashed the image dark in the market, the lent form kept R
+  caught up 5,900 times a second). The fence decisions line counts each wait for idle: posted
+  with R caught up or behind, lent because R was behind, a landing was due, or a sync owed.
+  Must-be-0 "signal ahead of landing" (SEM_E): E made a game-visible signal (sync point
+  increment, callback, payload write) while R had not played a posted fence that lands
+  reports E queued before it.
 - FRITCHII_ONEF_POST_FENCE_REPORT (live, default 0; needs FRITCHII_ONEF_POST_FENCE): a clean
   fence's counter report (a type with a streamer: its value is R's; EXP33's kept reports and
   payload reports excepted) is posted as the rasterizer's fences are: E runs the buffer half,
