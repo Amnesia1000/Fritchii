@@ -167,6 +167,48 @@ inline void ResetUniformStreamReuse() noexcept {
     }
 }
 
+/// FRITCHII_ONEF_UBO_KEEP (fable_b 25.2 cut a): binds the (stage, cbuf `index`) slot's last
+/// stream copy again without reading or comparing guest memory, when that copy is still the
+/// slot's, `size` bytes, and made in the current stream epoch (as BindSmallUniformReusing's own
+/// rebind requires). The caller has proved the guest bytes equal the copy's. False: nothing
+/// bound, the caller binds the usual way.
+template <class Runtime>
+[[nodiscard]] bool RebindUniformSlotCopy(Runtime& runtime, size_t stage, u32 index, u32 size) {
+    using Reuse = UniformStreamReuse<typename Runtime::StreamUniformRef>;
+    if (size == 0 || stage >= Reuse::NumStages || index >= Reuse::NumSlots) {
+        return false;
+    }
+    Reuse& reuse = UniformStreamReuseState<typename Runtime::StreamUniformRef>();
+    typename Reuse::Slot& slot = reuse.slots[stage][index];
+    if (slot.serial == 0 || slot.direct != 0) {
+        return false;
+    }
+    const typename Reuse::Copy& copy = reuse.copies[slot.copy];
+    if (copy.serial != slot.serial || copy.size != size || copy.tick != runtime.StreamEpoch()) {
+        return false;
+    }
+    runtime.RebindStreamUniform(copy.ref, size);
+    ++reuse.rebinds;
+    slot.misses = 0;
+    return true;
+}
+
+/// The serial of the copy the slot names (0: none): FRITCHII_ONEF_UBO_KEEP=1's verify reads it
+/// before and after a bind (a new serial means the bind found other bytes).
+template <class Ref>
+[[nodiscard]] u32 UniformSlotSerial(size_t stage, u32 index) noexcept {
+    using Reuse = UniformStreamReuse<Ref>;
+    if (stage >= Reuse::NumStages || index >= Reuse::NumSlots) {
+        return 0;
+    }
+    const Reuse& reuse = UniformStreamReuseState<Ref>();
+    const typename Reuse::Slot& slot = reuse.slots[stage][index];
+    // A slot in its direct run (EXP115) drops its copy at its next bind: nothing to check.
+    return slot.serial != 0 && slot.direct == 0 && reuse.copies[slot.copy].serial == slot.serial
+               ? slot.serial
+               : 0;
+}
+
 /// Binds the small uniform buffer at `device_addr` for (stage, cbuf `index`) through the stream
 /// buffer, binding an earlier allocation again when it holds the same bytes and was made in the
 /// current command buffer: the slot's previous copy or, with `range_reuse` (EDEN_NX2_EXP17,

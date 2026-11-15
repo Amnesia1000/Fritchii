@@ -2893,9 +2893,25 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                         stage, index, binding_index, device_addr, size,
                         VideoCore::Nx2Debug::Experiment(17) != 0);
                 } else {
-                    streamed = VideoCommon::BindSmallUniformReusing(
-                        runtime, device_memory, stage, index, binding_index, device_addr, size,
-                        VideoCore::Nx2Debug::Experiment(17) != 0);
+                    // FRITCHII_ONEF_UBO_KEEP (fable_b 25.2 cut a): the price line's cut class
+                    // bound again whole; =1 verifies the proof against the compare.
+                    bool provable = false;
+                    streamed = UniformKeepBefore(stage, index, device_addr, size,
+                                                 native_bank_bind, provable);
+                    if (!streamed) {
+                        using Ref = typename Runtime::StreamUniformRef;
+                        const u32 serial_before =
+                            provable ? VideoCommon::UniformSlotSerial<Ref>(stage, index) : 0;
+                        streamed = VideoCommon::BindSmallUniformReusing(
+                            runtime, device_memory, stage, index, binding_index, device_addr,
+                            size, VideoCore::Nx2Debug::Experiment(17) != 0);
+                        if (provable && serial_before != 0 &&
+                            VideoCommon::UniformSlotSerial<Ref>(stage, index) != serial_before)
+                            [[unlikely]] {
+                            ++uniform_keep_stats.stale;
+                            ++uniform_keep_stats.stale_session;
+                        }
+                    }
                 }
                 const u64 rebound =
                     VideoCommon::UniformStreamReuseState<typename Runtime::StreamUniformRef>()
@@ -2944,6 +2960,80 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         runtime.BindUniformBuffer(buffer, offset, size);
     }
     channel_state->fast_bound_uniform_buffers[stage] &= ~(1u << binding_index);
+}
+
+template <class P>
+bool BufferCache<P>::UniformKeepBefore(size_t stage, u32 index, DAddr device_addr, u32 size,
+                                       bool bank, bool& provable) {
+    provable = false;
+    const int mode = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_ubo_keep,
+                                                      "FRITCHII_ONEF_UBO_KEEP");
+    if (mode == 0) [[likely]] {
+        return false;
+    }
+    // The write generations count only while they are on: from the first keep test.
+    if (!Common::g_price_gens_on.load(std::memory_order_relaxed)) [[unlikely]] {
+        Common::g_price_gens_on.store(true, std::memory_order_relaxed);
+    }
+    UniformKeepStats& stats = uniform_keep_stats;
+    ++stats.binds;
+    UniformKeepLog(mode);
+    // Every writer of these bytes raises a generation on their pages: our constant buffer words
+    // and every buffer cache write (g_buffer_write_pages, always), the guest's stores on pages
+    // the tracker holds clean (they trap: g_collected_write_pages, again after the bytes landed
+    // while the bank marks are on). A CPU-modified page lets guest stores through unseen, a
+    // GPU-modified range never streams, a native bank bind or a run-ahead frontier keeps its own
+    // rules: no proof then.
+    const bool usable = !bank && Common::BankMarks() &&
+                        VideoCommon::Runahead::g_frontier.load(std::memory_order_relaxed) == 0;
+    const u64 sum = usable ? Common::PriceGenSum(device_addr, size) : ~u64{0};
+    const bool tracked = usable && !memory_tracker.IsRegionCpuModified(device_addr, size);
+    UniformKeepMemo& memo = uniform_keep_memo[stage][index];
+    provable = memo.valid && memo.tracked && tracked && memo.device_addr == device_addr &&
+               memo.size == size && sum != ~u64{0} && memo.sum == sum;
+    memo = UniformKeepMemo{device_addr, sum, size, tracked, usable && sum != ~u64{0}};
+    if (!provable) {
+        return false;
+    }
+    ++stats.provable;
+    if (mode < 2) {
+        return false; // =1: the usual bind runs and its result is checked
+    }
+    if (!VideoCommon::RebindUniformSlotCopy(runtime, stage, index, size)) {
+        return false; // the copy is not this epoch's (or not the slot's): the usual bind
+    }
+    ++stats.kept;
+    return true;
+}
+
+template <class P>
+void BufferCache<P>::UniformKeepLog(int mode) {
+    UniformKeepStats& stats = uniform_keep_stats;
+    if ((stats.binds & 4095) != 0) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (stats.since == std::chrono::steady_clock::time_point{}) {
+        stats.since = now;
+        return;
+    }
+    if (now - stats.since < std::chrono::seconds{10}) {
+        return;
+    }
+    const double seconds = std::chrono::duration<double>(now - stats.since).count();
+    LOG_INFO(HW_GPU,
+             "Uniform keep (fable_b 25.2 cut a, FRITCHII_ONEF_UBO_KEEP={}) {:.0f} s: streamed "
+             "binds {:.0f}/s, provable (same range, unflagged, pages tracked) {:.0f}/s, bound "
+             "again without the read {:.0f}/s; provable but other bytes {:.0f}/s (must be 0; {} "
+             "this session)",
+             mode, seconds, static_cast<double>(stats.binds) / seconds,
+             static_cast<double>(stats.provable) / seconds,
+             static_cast<double>(stats.kept) / seconds, static_cast<double>(stats.stale) / seconds,
+             stats.stale_session);
+    const u64 session = stats.stale_session;
+    stats = UniformKeepStats{};
+    stats.stale_session = session;
+    stats.since = now;
 }
 
 template <class P>

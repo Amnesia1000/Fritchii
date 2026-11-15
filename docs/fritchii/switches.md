@@ -1769,6 +1769,22 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   E goes through ProcessDirtyRegisters or ApplyDeltaWrites, which note it (the "view words"
   must-be-0 checks the same notes). Expected 20 to 25 ms/s on E where most lookups find the
   words untouched; run =1 first and read the count.
+- FRITCHII_ONEF_UBO_KEEP (live, default 0; fable_b_one_follower 25.2 cut a): the streamed
+  small uniform binds (BindHostGraphicsUniformBuffer's stream path, BindSmallUniformReusing).
+  Each slot keeps its last streamed bind's device range, its pages' write generations
+  (Common::PriceGenSum, switched on from the first test) and whether the buffer cache's tracker
+  held them clean. A bind is provable when it is the same range, the generations did not move,
+  and the pages were tracked then and are now: every writer raises a generation (constant
+  buffer words and every buffer cache write through g_buffer_write_pages, the guest's trapped
+  stores through g_collected_write_pages and again after the bytes land, with the bank marks
+  on), a CPU-modified page would let guest stores through unseen, a GPU-modified range never
+  streams. Not on native bank binds, behind a run-ahead frontier or with the bank marks off.
+  1 = count and verify: the usual bind still runs, and one that then finds other bytes (a new
+  copy serial) is counted, must be 0. 2 = a provable bind binds the slot's stream copy again
+  (RebindUniformSlotCopy: still the slot's, the same size, the current stream epoch) without
+  the guest read, the compare or the reuse function; otherwise the usual bind. Line "Uniform
+  keep" every 10 s. Expected 20 to 25 ms/s on E (the price line's cut class, 182,600 binds a
+  second in of10).
 - FRITCHII_ONEF_TRACE (boot, default 0; fable_b_one_follower 15.5): 1 = the lend trace. One
   72-byte record per lend and per posted op (packet number, site, op kind, posted, E's arrival,
   R's start and end, E's resume, E's work since its previous record, R's busy time on other

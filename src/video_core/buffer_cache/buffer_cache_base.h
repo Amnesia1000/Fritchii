@@ -1814,6 +1814,30 @@ private:
     std::array<std::array<UniformBindMemo, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES>
         uniform_bind_memo{};
 
+    /// FRITCHII_ONEF_UBO_KEEP (fable_b 25.2 cut a): each slot's last streamed bind, its pages'
+    /// write generations (Common::PriceGenSum) and whether the tracker held them clean.
+    struct UniformKeepMemo {
+        DAddr device_addr{};
+        u64 sum{};
+        u32 size{};
+        bool tracked{};
+        bool valid{};
+    };
+    std::array<std::array<UniformKeepMemo, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES>
+        uniform_keep_memo{};
+    struct UniformKeepStats {
+        u64 binds{};     ///< streamed binds looked at
+        u64 provable{};  ///< same range, unflagged, tracked then and now
+        u64 kept{};      ///< bound again without the read and the compare (=2)
+        u64 stale{};     ///< =1: provable, yet the bind found other bytes (must be 0)
+        u64 stale_session{};
+        std::chrono::steady_clock::time_point since{};
+    } uniform_keep_stats;
+    /// The streamed bind's keep test (true: bound again, done) and =1's verify after it.
+    bool UniformKeepBefore(size_t stage, u32 index, DAddr device_addr, u32 size, bool bank,
+                           bool& provable);
+    void UniformKeepLog(int mode);
+
     /// FRITCHII_BIND_ADDR_MEMO: the last address translation of each vertex stream, the index
     /// buffer and each graphics uniform slot (Tegra::MemoryManager::GpuToCpuAddressMemo), and the
     /// counts for the "Bind address memo" line.
