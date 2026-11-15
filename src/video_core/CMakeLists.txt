@@ -116,6 +116,8 @@ add_library(video_core STATIC
     fritchii_e_split.cpp
     fritchii_e_split.h
     fritchii_fill_cuts.h
+    fritchii_front_split.cpp
+    fritchii_front_split.h
     fritchii_price.cpp
     fritchii_price.h
     fritchii_s4_count.cpp

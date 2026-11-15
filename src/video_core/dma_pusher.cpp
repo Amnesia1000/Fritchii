@@ -35,6 +35,7 @@
 #include "video_core/engines/kepler_memory.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_dma.h"
+#include "video_core/fritchii_front_split.h"
 #include "video_core/fritchii_s4_count.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
@@ -508,6 +509,10 @@ bool DmaPusher::Step() {
     if (!ib_enable || dma_pushbuffer.empty()) {
         return false;
     }
+    // FRITCHII_FRONT_SPLIT_COUNT (dry, fritchii_front_split.h): counts this call and times 1 in
+    // 64 by stage. Off: one relaxed load and a compare.
+    namespace FrontSplit = VideoCommon::FrontSplit;
+    const FrontSplit::EntryScope front_split_entry{channel_state.bind_id};
     const u64 suspensions_before = suspensions.load(std::memory_order_relaxed);
     if (!puller.ResumeAcquire(*this)) {
         return false;
@@ -528,11 +533,19 @@ bool DmaPusher::Step() {
         if ((VideoCore::Nx2Debug::Experiment(39) & 2) != 0) {
             first_entry = dma_pushbuffer_subindex + (command_resume_offset != 0 ? 1 : 0);
         }
+        // FRITCHII_FRONT_SPLIT_COUNT: entries not parsed yet that an earlier refresh (or Push's)
+        // already copied once (the front list's from where its parse is).
+        size_t unparsed = dma_pushbuffer_subindex + (command_resume_offset != 0 ? 1 : 0);
         for (CommandList& list : dma_pushbuffer) {
             if (!list.submitted_offsets.empty()) {
-                RefreshSnapshot(list, now, first_entry);
+                if (FrontSplit::g_state != 0 && list.refreshes != 0 &&
+                    list.command_lists.size() > unparsed) [[unlikely]] {
+                    FrontSplit::NoteRereadTwice(list.command_lists.size() - unparsed);
+                }
+                RefreshSnapshot(list, now, first_entry); // counts list.refreshes
             }
             first_entry = 0;
+            unparsed = 0;
         }
     }
 
@@ -552,6 +565,7 @@ bool DmaPusher::Step() {
         command_resume_offset +=
             ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         if (puller.HasPendingAcquire()) {
+            FrontSplit::NoteSuspension();
             return false;
         }
         command_resume_offset = 0;
@@ -571,6 +585,9 @@ bool DmaPusher::Step() {
     }
 
     if (header.size > 0) {
+        // FRITCHII_DELAY_FRONT_KIND=4 ("P", FS0): once every 16 list entries, before their
+        // checks. Off: one relaxed load and a branch.
+        VideoCommon::GpuSplit::DelayFrontIf(VideoCommon::GpuSplit::FrontDelayKind::Entries);
         if (header.sync && g_nx2_ampere.load(std::memory_order_relaxed)) {
             VideoCommon::GpuSplit::Get().NoteSync();
         }
@@ -610,6 +627,7 @@ bool DmaPusher::Step() {
                 auto* const engine_state = subchannels[dma_state.subchannel];
                 if (split.Active()) {
                     // The caches behind IsMemoryDirty belong to the split's back thread.
+                    FrontSplit::StepDefer();
                     split.Defer(
                         [engine_state, memory = &memory_manager,
                          address = GPUVAddr{dma_state.dma_get}, bytes = words * sizeof(u32)] {
@@ -681,6 +699,7 @@ bool DmaPusher::Step() {
         }();
         if (!gpu_written && VideoCommon::GpuSplit::Get().Active()) {
             auto& split = VideoCommon::GpuSplit::Get();
+            FrontSplit::WriterCheck(); // FRITCHII_FRONT_SPLIT_COUNT: 2a's join before them
             const bool old_waits = VideoCore::Nx2Debug::Experiment(41) == 1;
             const bool copy_queued = CopyWritersPending(split);
             bool skip = old_waits ? skip_list_wait
@@ -730,6 +749,7 @@ bool DmaPusher::Step() {
                 }
             }
             if (checked) {
+                FrontSplit::StepDefer();
                 split.Defer([this, address = GPUVAddr{dma_state.dma_get},
                              size = size_t{header.size} * sizeof(u32), skip, range_skip] {
                     if (IsGpuWrittenCommands(address, size)) {
@@ -777,6 +797,11 @@ bool DmaPusher::Step() {
             gpu_written,
             use_safe && memory_manager.IsMemoryDirty(dma_state.dma_get,
                                                      header.size * sizeof(u32)));
+        // FRITCHII_FRONT_SPLIT_COUNT: a GPU-written list goes down the list draw / dispatch
+        // path below, which may ask the macro state (2a's join).
+        if (gpu_written && !submitted && !use_safe && FrontSplit::g_state != 0) [[unlikely]] {
+            FrontSplit::GpuListCheck();
+        }
         if (submitted) {
             const std::span<const CommandHeader> commands{
                 command_list.submitted_words.data() +
@@ -858,6 +883,7 @@ bool DmaPusher::Step() {
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         }
         if (puller.HasPendingAcquire()) {
+            FrontSplit::NoteSuspension();
             return false;
         }
         command_resume_offset = 0;
@@ -887,6 +913,7 @@ bool DmaPusher::Step() {
     }
 
     if (signal_sync) {
+        FrontSplit::StepRun();
         VideoCommon::GpuSplit::Get().Run([this] {
             rasterizer->SignalFence([this]() {
                 std::scoped_lock lk(sync_mutex);
@@ -982,6 +1009,8 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
         }
         CallMethod(argument);
     };
+    // FRITCHII_FRONT_SPLIT_COUNT: the headers decoded (2a's chunks), passed on at the returns.
+    u64 headers = 0;
     for (size_t index = 0; index < commands.size();) {
         // Data word of methods command
         if (dma_state.method_count && dma_state.non_incrementing) {
@@ -1034,6 +1063,7 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
         } else {
             auto const command_header = commands[index]; //can copy
             // No command active - this is the first word of a new one
+            ++headers;
             switch (command_header.mode) {
             case SubmissionMode::Increasing:
                 SetState(command_header);
@@ -1064,9 +1094,11 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
             index++;
         }
         if (puller.HasPendingAcquire()) {
+            VideoCommon::FrontSplit::NoteParsed(headers, index);
             return index;
         }
     }
+    VideoCommon::FrontSplit::NoteParsed(headers, commands.size());
     return commands.size();
 }
 
@@ -1179,12 +1211,20 @@ void DmaPusher::CallMethod(u32 argument) {
             }
         };
         if (split.Active()) {
+            namespace FrontSplit = VideoCommon::FrontSplit;
             const GPUVAddr segment = dma_state.dma_get + dma_state.dma_word_offset;
+            // FRITCHII_FRONT_SPLIT_COUNT: in 2a's queue; 2c would send 3D and compute methods
+            // raw (a Method entry, one ring word).
+            FrontSplit::NoteEngineCall(engine_type == Engines::EngineTypes::Maxwell3D ||
+                                               engine_type == Engines::EngineTypes::KeplerCompute
+                                           ? 1U
+                                           : 0U);
             if (split.FrontMacros()) {
                 const auto type = subchannel_type[dma_state.subchannel];
                 if (type == Engines::EngineTypes::Maxwell3D) {
                     auto* const maxwell3d = static_cast<Engines::Maxwell3D*>(subchannel);
                     if (maxwell3d->GetNativeMacroEngine().native_turing) {
+                        const FrontSplit::StageScope stage{FrontSplit::Stage::State3D};
                         maxwell3d->FrontCallMethod(system, split, dma_state.method, argument,
                                                    dma_state.is_last_call);
                         return;
@@ -1192,6 +1232,7 @@ void DmaPusher::CallMethod(u32 argument) {
                 } else if (type == Engines::EngineTypes::KeplerCompute) {
                     auto* const compute = static_cast<Engines::KeplerCompute*>(subchannel);
                     if (compute->FrontRunsMacros()) {
+                        const FrontSplit::StageScope stage{FrontSplit::Stage::Compute};
                         compute->FrontCallMethod(system, split, dma_state.method, argument,
                                                  dma_state.is_last_call, &segment);
                         classified = true;
@@ -1199,8 +1240,11 @@ void DmaPusher::CallMethod(u32 argument) {
                     }
                 }
             }
-            split.Method(subchannel, dma_state.method, argument, dma_state.is_last_call,
-                         WantsSegment() ? &segment : nullptr, effect);
+            {
+                const FrontSplit::StageScope stage{FrontSplit::Stage::RingSend};
+                split.Method(subchannel, dma_state.method, argument, dma_state.is_last_call,
+                             WantsSegment() ? &segment : nullptr, effect);
+            }
             if (engine_type == Engines::EngineTypes::MaxwellDMA) {
                 static_cast<Engines::MaxwellDMA*>(subchannel)->FrontMethod(
                     split, dma_state.method, &argument, 1);
@@ -1261,12 +1305,20 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
             }
         };
         if (split.Active()) {
+            namespace FrontSplit = VideoCommon::FrontSplit;
             const GPUVAddr segment = dma_state.dma_get + dma_state.dma_word_offset;
+            // FRITCHII_FRONT_SPLIT_COUNT: in 2a's queue; 2c would send 3D and compute runs raw
+            // (a Multi entry: two words, then the run two words to a ring word).
+            FrontSplit::NoteEngineCall(engine_type == Engines::EngineTypes::Maxwell3D ||
+                                               engine_type == Engines::EngineTypes::KeplerCompute
+                                           ? 2U + (num_methods + 1U) / 2U
+                                           : 0U);
             if (split.FrontMacros()) {
                 const auto type = subchannel_type[dma_state.subchannel];
                 if (type == Engines::EngineTypes::Maxwell3D) {
                     auto* const maxwell3d = static_cast<Engines::Maxwell3D*>(subchannel);
                     if (maxwell3d->GetNativeMacroEngine().native_turing) {
+                        const FrontSplit::StageScope stage{FrontSplit::Stage::State3D};
                         maxwell3d->FrontCallMultiMethod(system, split, dma_state.method, base_start,
                                                         num_methods, dma_state.method_count);
                         return;
@@ -1274,6 +1326,7 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
                 } else if (type == Engines::EngineTypes::KeplerCompute) {
                     auto* const compute = static_cast<Engines::KeplerCompute*>(subchannel);
                     if (compute->FrontRunsMacros()) {
+                        const FrontSplit::StageScope stage{FrontSplit::Stage::Compute};
                         compute->FrontCallMultiMethod(system, split, dma_state.method, base_start,
                                                       num_methods, dma_state.method_count, &segment);
                         classified = true;
@@ -1281,8 +1334,12 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
                     }
                 }
             }
-            split.MultiMethod(subchannel, dma_state.method, base_start, num_methods,
-                              dma_state.method_count, WantsSegment() ? &segment : nullptr, effect);
+            {
+                const FrontSplit::StageScope stage{FrontSplit::Stage::RingSend};
+                split.MultiMethod(subchannel, dma_state.method, base_start, num_methods,
+                                  dma_state.method_count, WantsSegment() ? &segment : nullptr,
+                                  effect);
+            }
             if (engine_type == Engines::EngineTypes::MaxwellDMA) {
                 static_cast<Engines::MaxwellDMA*>(subchannel)->FrontMethod(
                     split, dma_state.method, base_start, num_methods);
@@ -1299,6 +1356,9 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
 
 void DmaPusher::RefreshSnapshot(CommandList& list, u64 now, size_t first_entry) {
     list.snapshot_suspensions = now;
+    if (VideoCommon::FrontSplit::g_state != 0) [[unlikely]] {
+        ++list.refreshes; // FRITCHII_FRONT_SPLIT_COUNT's "re-read twice" (Step)
+    }
     for (size_t i = first_entry; i < list.command_lists.size() && i < list.submitted_offsets.size();
          ++i) {
         const CommandListHeader& entry = list.command_lists[i];

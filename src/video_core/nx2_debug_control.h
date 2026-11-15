@@ -377,6 +377,20 @@ inline std::atomic<int> g_onef_ubo_keep{-1};
 /// FRITCHII_BANK_FAST (live, default 0): fable_b 25.2 cut b, a settled native bank of a slot the
 /// bank check skips whole is skipped before the check's switch reads and upkeep.
 inline std::atomic<int> g_bank_fast{-1};
+/// FRITCHII_FRONT_SPLIT_COUNT (live, default 0): the front split's step FS0, dry
+/// (fritchii_front_split.h): 1 = stage timers 1 in 64 list entries, the 2a/2c counts, the 0xe2c
+/// answers, front time per channel.
+inline std::atomic<int> g_front_split_count{-1};
+/// FRITCHII_ONEF_NULL_FILL (live, default 0; test only, the picture breaks): 1 = E skips the
+/// flush, the fill and the push of every draw it would fill (FrontSplit::NullFill).
+inline std::atomic<int> g_onef_null_fill{-1};
+/// FRITCHII_NOTED_SUMMARY (live, default 0): F4, GpuSplit::NotedWriteSince answers from the
+/// newest note position per page bucket before its walk: 1 = on, 2 = verify (both run, the walk
+/// answers), 3 = dry (both run, counted and timed 1 in 64).
+inline std::atomic<int> g_noted_summary{-1};
+/// FRITCHII_STEP_LEAN (live, default 0): F6, the list-wait line's clock read every 256th entry
+/// and the command list storage recycled to the submitter (dma_pusher.h).
+inline std::atomic<int> g_step_lean{-1};
 /// FRITCHII_S4_COUNT (live, default 0): fable_b2 3.3's S4 counter, dry (fritchii_s4_count.h):
 /// 1 = count the fill's uniform binds by page, list entry and cause of change, 2 = also compare
 /// a sample of ranges at the front's list entry parse with E's bind in that entry.

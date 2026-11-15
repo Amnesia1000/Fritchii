@@ -157,6 +157,8 @@ struct CommandList final {
     /// that waited behind one, reads memory instead: games write the commands it runs before they
     /// release the acquire.
     u64 snapshot_suspensions = 0;
+    /// FRITCHII_FRONT_SPLIT_COUNT: refreshes of the words so far (counted only while on).
+    u32 refreshes = 0;
 };
 
 /// FNV-1a over pushbuffer words (EDEN_NX2_PB_CHECK).

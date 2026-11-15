@@ -159,6 +159,7 @@ std::string DelayTestText(SiteWaitStats& stats, double window) {
 }
 
 void NoteSiteWait(DrainSite site, u64 behind, u64 ns) {
+    FrontSplit::NoteWait(ns); // FRITCHII_FRONT_SPLIT_COUNT: out of the timed entry's stage
     auto& stats = g_site_waits;
     const auto i = static_cast<size_t>(site);
     ++stats.count[i];
@@ -371,9 +372,10 @@ void GpuSplit::DelayFront(FrontDelayKind kind, bool before) {
             static_cast<int>(kind)) {
         return;
     }
-    if (kind == FrontDelayKind::Macros) {
+    if (kind == FrontDelayKind::Macros || kind == FrontDelayKind::Entries) {
+        // Kind 3: 1 call in 64; kind 4 (FS0, the front split's per-entry site): 1 in 16.
         static thread_local u32 calls{};
-        if ((++calls & 63) != 0) {
+        if ((++calls & (kind == FrontDelayKind::Macros ? 63U : 15U)) != 0) {
             return;
         }
     } else if (before != (Debug::SwitchValue(Debug::g_delay_before, "FRITCHII_DELAY_BEFORE") > 0)) {

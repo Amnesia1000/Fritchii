@@ -23,6 +23,7 @@
 
 #include "common/common_types.h"
 #include "video_core/engines/engine_interface.h"
+#include "video_core/fritchii_front_split.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/split_write_tracker.h"
 
@@ -619,6 +620,7 @@ public:
     /// `classified`: the engine's front noted what that work writes (NoteWriterRange,
     /// NoteUnboundedWriter, NoteDispatchWriter); otherwise it may write anything.
     void NoteWriter(bool classified = false) {
+        FrontSplit::NoteWriterSent(); // FRITCHII_FRONT_SPLIT_COUNT: one plain load off
         last_writer_position = write_position;
         if (!classified) {
             NoteUnboundedWriter(WriterKind::Other);
@@ -996,6 +998,7 @@ public:
         AcquireMet = 1,   ///< "A": a suspended acquire resumes (Puller::ResumeAcquire)
         DispatchWait = 2, ///< "Q": a macro read's wait behind a dispatch (DispatchesMayWriteSince)
         Macros = 3,       ///< "C": once every 64 3D macro calls (Maxwell3D::FrontRunMacro)
+        Entries = 4,      ///< "P": once every 16 list entries, before their checks (DmaPusher::Step)
     };
     /// At a FRITCHII_DELAY_FRONT_KIND site: one relaxed load and a branch while
     /// FRITCHII_DELAY_FRONT_US is 0. Kinds 1 and 2 are called on both sides of their wait
@@ -1258,6 +1261,7 @@ public:
     /// Work that writes the device range [begin, begin + size) was just sent (an inline upload, a
     /// report, a semaphore release). size ~0 means an unknown range.
     void NoteMemoryWrite(u64 begin, u64 size, const char* what = "unknown") {
+        FrontSplit::NoteWriterSent(); // FRITCHII_FRONT_SPLIT_COUNT: one plain load off
         if (write_stamps) [[unlikely]] {
             if (size == ~u64{0}) {
                 unknown_write_position = write_position;
@@ -1275,6 +1279,7 @@ public:
     /// As NoteMemoryWrite, for a write whose words the front knows (a fence release payload,
     /// linear inline upload data): reads overlay them instead of waiting.
     void NoteMemoryWriteData(u64 begin, const u32* data, u32 words, const char* what = "known") {
+        FrontSplit::NoteWriterSent(); // FRITCHII_FRONT_SPLIT_COUNT: one plain load off
         if (write_stamps) [[unlikely]] {
             StampWrite(begin, begin + u64{words} * sizeof(u32), false);
         }

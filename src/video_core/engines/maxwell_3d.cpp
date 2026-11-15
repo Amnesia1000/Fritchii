@@ -2963,6 +2963,9 @@ NX2_PROFILE_FORCEINLINE void Maxwell3D::FrontWriteSend(VideoCommon::GpuSplit& sp
         cb_block = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_cb_words_block,
                                                     "FRITCHII_CB_WORDS_BLOCK");
     }
+    // FRITCHII_FRONT_SPLIT_COUNT: the ring entry's time, up to the notes (3D state). Off: one
+    // plain load and a branch.
+    VideoCommon::FrontSplit::StageScope send_stage{VideoCommon::FrontSplit::Stage::RingSend};
     if (cb_block != 0) {
         split.CbWord(this, method, argument, from_macro || is_last_call, from_macro, effect,
                      cb_block == 2 ? cb_write : nullptr);
@@ -2994,6 +2997,7 @@ NX2_PROFILE_FORCEINLINE void Maxwell3D::FrontWriteSend(VideoCommon::GpuSplit& sp
             split.CountBatched(VideoCommon::GpuSplit::Batched::MacroSunk);
         }
     }
+    send_stage.Close();
     FrontWriteNotes(split, fs, method, decision);
 }
 
@@ -3229,7 +3233,11 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
             }
         }
     }
-    split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr, effect);
+    {
+        const VideoCommon::FrontSplit::StageScope send_stage{
+            VideoCommon::FrontSplit::Stage::RingSend}; // FRITCHII_FRONT_SPLIT_COUNT
+        split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr, effect);
+    }
     fs.sink_pending = false; // The back consumes the sink before a run
     if (write_end != 0) {
         // Uploaded words, unless the shadow RAM replays other values for them on the back.
@@ -5358,7 +5366,10 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     // for the back, the macro gets six zero words and its mode write goes to E, which reads the
     // words at its stream place (FrontSendE2cCondition). `pages`: the read's pages get pending
     // snapshots (where the snapshot missed).
+    namespace FrontSplit = VideoCommon::FrontSplit;
+    const bool e2c_read = macro == 0xe2c;
     const auto defer_read = [&](bool pages) {
+        FrontSplit::NoteDmaRead(FrontSplit::DmaAnswer::Deferred, e2c_read); // FS0 count
         fs.parameters.insert(fs.parameters.end(), words, 0U);
         fs.e2c_deferred = true;
         fs.e2c_source = source;
@@ -5397,6 +5408,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         forwarded.resize(words);
         if (split.ForwardRead(memory_manager.GetID() + 1, source, words, forwarded.data())) {
             VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadsForwarded, 1);
+            FrontSplit::NoteDmaRead(FrontSplit::DmaAnswer::Forwarded, e2c_read);
             if (census_read) [[unlikely]] {
                 ReportCensus::NoteE2cRead(forwarded.data(), words,
                                           ReportCensus::E2cPath::Forwarded, false);
@@ -5430,6 +5442,8 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             VideoCommon::DrainSite::MacroDmaFlush,
             VideoCommon::Nx2FastDrawCount::Neutral());
     };
+    // FRITCHII_FRONT_SPLIT_COUNT: the answer of a read that reaches the drained path below.
+    FrontSplit::DmaAnswer drained_answer = FrontSplit::DmaAnswer::Drained;
     if (snapshot_mode >= 9 && !full_drain && !Tegra::Nx2CmdPageDiag::g_enabled &&
         method == 0x158 && words != 0) {
         const auto device = memory_manager.GpuToCpuAddress(source);
@@ -5506,6 +5520,11 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             bool hit = true;
             bool census_pending = false;
             bool pending_miss = false;
+            // FRITCHII_FRONT_SPLIT_COUNT: the miss reason this read adds (its answer).
+            std::array<u64, 4> split_reasons{};
+            if (FrontSplit::g_state != 0) [[unlikely]] {
+                split_reasons = miss_reasons;
+            }
             for (u64 page = first_page; page <= last_page && hit; ++page) {
                 const auto it = fs.dma_snapshots.find(page);
                 if (it == fs.dma_snapshots.end()) {
@@ -5663,6 +5682,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                 snap_words.resize(words);
                 if (hit) {
                     ++hits;
+                    FrontSplit::NoteDmaRead(FrontSplit::DmaAnswer::SnapshotHit, e2c_read);
                     if (ran_passed || scan_passed) {
                         ++g_ran_reads.served[spared];
                     }
@@ -5700,6 +5720,14 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                         return;
                     }
                     ++misses;
+                    if (FrontSplit::g_state != 0) [[unlikely]] {
+                        using Answer = FrontSplit::DmaAnswer;
+                        const Answer answer =
+                            pending_miss || miss_reasons[0] != split_reasons[0] ? Answer::NewPage
+                            : miss_reasons[3] != split_reasons[3]               ? Answer::NotedOverlap
+                                                                                : Answer::Writer;
+                        FrontSplit::NoteDmaRead(answer, e2c_read);
+                    }
                     if (census_read) [[unlikely]] {
                         census_pending =
                             rasterizer->HasCachedReports(*device - 12, u64{read_bytes} + 12);
@@ -5914,6 +5942,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                 return;
             }
             ++report_reads;
+            drained_answer = FrontSplit::DmaAnswer::ReportPage;
         }
     }
     if (fs.e2c_defer != 0 && !full_drain && !Tegra::Nx2CmdPageDiag::g_enabled &&
@@ -5924,6 +5953,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         defer_read(false);
         return;
     }
+    FrontSplit::NoteDmaRead(drained_answer, e2c_read);
     VideoCommon::Nx2Profile::CountDmaRead(macro);
     if (full_drain) {
         split.Drain(VideoCommon::DrainSite::MacroDmaRead);

@@ -23,6 +23,7 @@
 #include <optional>
 
 #include "video_core/nx2_profile.h"
+#include "video_core/fritchii_front_split.h"
 #include "video_core/fritchii_price.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dma_pusher.h"
@@ -1825,6 +1826,7 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     if (!pending_acquire) {
         return true;
     }
+    VideoCommon::FrontSplit::AcquireCheck(); // FRITCHII_FRONT_SPLIT_COUNT (as the first check)
     VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquirePolls, 1);
     // Fast path (EDEN_NX2_SEM_FAST), as for the first check in ProcessSemaphoreTriggerMethod:
     // when the word is current without draining the back, answer from it. Ocarina of Time polls
@@ -2357,6 +2359,9 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         if (trivial && op == GpuSemaphoreOperation::AcquireGequal && acquire.value == 0) {
             return;
         }
+        // FRITCHII_FRONT_SPLIT_COUNT: this check reads the front's records of what was sent
+        // (2a's join when engine methods are still in its queue). Off: one plain load.
+        VideoCommon::FrontSplit::AcquireCheck();
         u32 word{};
         u64 read_done = 0;
         const bool readable = SemaphoreReadableNow(dma_pusher, acquire.address, word, &read_done);
