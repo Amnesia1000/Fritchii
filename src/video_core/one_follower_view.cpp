@@ -219,6 +219,11 @@ void NoteRegWrite(u32 index) noexcept {
     if (!Detail::t_engine && !InLent()) {
         return; // the front's copy, or another thread: not E's engine
     }
+    // FRITCHII_ONEF_KEY_KEEP: every write of a lookup word, before the per-packet dedupe.
+    if (g_key_watch && index < KeyWordSlots &&
+        ((g_key_words[index / 64] >> (index % 64)) & 1) != 0) {
+        ++g_key_writes;
+    }
     if (index >= NumRegs || g_e.noted.test(index)) {
         return;
     }
@@ -250,6 +255,7 @@ void NoteFlagRaised(u8 flag) noexcept {
 namespace Detail {
 void ViewTrackingStopped() noexcept {
     g_e.restart.store(true, std::memory_order_release);
+    ++g_key_writes; // FRITCHII_ONEF_KEY_KEEP: writes from now on may go unseen
 }
 
 void SeedAfterBind(RegisterView& view, const Maxwell3D& engine) {

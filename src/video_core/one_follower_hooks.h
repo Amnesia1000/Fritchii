@@ -6,6 +6,7 @@
 // One follower (one_follower.h), part (b): the engine side's write tracking, in a header of its
 // own so maxwell_3d.h can include it (one_follower.h includes maxwell_3d.h).
 
+#include <array>
 #include <atomic>
 
 #include "common/common_types.h"
@@ -29,6 +30,16 @@ inline bool g_e_pipeline{};
 /// Register word `index` of the engine was written on E (one_follower_view.cpp). Words written on
 /// another thread (the front's own copy) are not E's and are ignored there.
 void NoteRegWrite(u32 index) noexcept;
+
+/// FRITCHII_ONEF_KEY_KEEP (fable_b 23.1 cut 2): the clean pipeline lookup's watched register
+/// words (PipelineCache::BuildCleanWatch sets them), and the count of their writes NoteRegWrite
+/// saw on E (or R in a lent call), every write, not only a packet's first. Bumped too when the
+/// write tracking stops (writes then go unseen). E's lookup keeps its register compare when the
+/// count did not move since its snapshot last equalled the registers.
+inline constexpr u32 KeyWordSlots = 0x1000;
+inline std::array<u64, KeyWordSlots / 64> g_key_words{};
+inline bool g_key_watch{}; ///< set once the switch was seen on: NoteRegWrite counts key writes
+inline u64 g_key_writes{};
 
 /// FRITCHII_ONEF_UNLENT_VALUES (fable_b 19 step 2): Maxwell3D::ProcessCBBind tests this before
 /// NoteCbBind; set on E while the constant buffer bindings go to R's view by value.

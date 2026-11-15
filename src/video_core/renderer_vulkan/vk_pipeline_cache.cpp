@@ -2327,6 +2327,25 @@ void PipelineCache::BuildCleanWatch(bool patch, bool blend_by_value, bool patch_
         blend_words += range.count;
     }
     clean.blend_snapshot.assign(blend_words, 0);
+    // FRITCHII_ONEF_KEY_KEEP: every word the compares read, for NoteRegWrite's count. The
+    // snapshots are new (zeros): nothing is known until the next one is taken.
+    {
+        namespace OneF = VideoCommon::OneFollower;
+        OneF::g_key_words.fill(0);
+        const auto mark = [](const std::vector<CleanLookup::Range>& list) {
+            for (const CleanLookup::Range& range : list) {
+                for (u32 word = range.first; word < range.first + range.count; ++word) {
+                    if (word < OneF::KeyWordSlots) {
+                        OneF::g_key_words[word / 64] |= u64{1} << (word % 64);
+                    }
+                }
+            }
+        };
+        mark(clean.ranges);
+        mark(clean.xfb_ranges);
+        mark(clean.blend_ranges);
+        clean.key_seen = ~u64{0};
+    }
     clean.built = true;
     clean.patch = patch;
     clean.patch_vertex = patch_vertex;
@@ -2339,6 +2358,25 @@ void PipelineCache::BuildCleanWatch(bool patch, bool blend_by_value, bool patch_
                                           blend_words)
                             : std::string{});
 }
+
+namespace {
+/// FRITCHII_ONEF_KEY_KEEP (live, default 0; fable_b 23.1 cut 2): 1 = count the clean lookups
+/// whose watched words were not written since their snapshots last equalled the registers, and
+/// still compare (a failed compare among them is a must-be-0); 2 = those keep the compare out.
+int KeyKeepMode() noexcept {
+    return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_onef_key_keep,
+                                            "FRITCHII_ONEF_KEY_KEEP");
+}
+/// The key write count when it says something: E owns the lookup (rule 3, so the lookup reads
+/// E's engine, whose writes NoteRegWrite sees), the writes are tracked now, the count is on.
+/// ~0 otherwise.
+u64 KeyWritesNow() noexcept {
+    namespace OneF = VideoCommon::OneFollower;
+    const bool tracking = OneF::g_track_writes_always ||
+                          OneF::g_track_writes.load(std::memory_order_relaxed);
+    return OneF::g_key_watch && OneF::g_e_pipeline && tracking ? OneF::g_key_writes : ~u64{0};
+}
+} // Anonymous namespace
 
 bool PipelineCache::CleanBlendUnchanged() const {
     const u32* const words = maxwell3d->regs.reg_array.data();
@@ -2397,6 +2435,7 @@ void PipelineCache::TakeCleanSnapshot() {
         }
     }
     TakeCleanBlendSnapshot(); // No ranges unless blend_by_value
+    clean.key_seen = KeyWritesNow(); // FRITCHII_ONEF_KEY_KEEP: the snapshots are the registers
     clean.hashes = graphics_key.unique_hashes;
     clean.maxwell3d = maxwell3d;
     clean.topology = maxwell3d->draw_manager.draw_state.topology;
@@ -2497,8 +2536,29 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineClean(bool patch) {
             : clean.engine_state != maxwell3d->engine_state                 ? 3
                                                                             : 4;
         ++clean.other_parts[part];
-    } else if (!CleanInputsUnchanged()) {
+    }
+    // FRITCHII_ONEF_KEY_KEEP (fable_b 23.1 cut 2): no watched word written since the snapshots
+    // last equalled the registers, so the word compares would pass. Checked after every flag,
+    // topology and engine-state test above (they still decide), so no flag is consumed here.
+    const int key_keep = miss < 0 ? KeyKeepMode() : 0;
+    if (key_keep != 0 && !VideoCommon::OneFollower::g_key_watch) {
+        VideoCommon::OneFollower::g_key_watch = true; // counted from now; known after a snapshot
+    }
+    const bool key_untouched =
+        key_keep != 0 && clean.key_seen != ~u64{0} && clean.key_seen == KeyWritesNow();
+    const bool key_skip = key_untouched && key_keep >= 2;
+    if (key_untouched) {
+        ++clean.key_untouched;
+    }
+    if (miss < 0 && !key_skip && !CleanInputsUnchanged()) {
         miss = 4;
+        if (key_untouched) {
+            ++clean.key_failed; // must be 0: a watched word changed without NoteRegWrite
+            ++clean.key_failed_session;
+        }
+    }
+    if (key_skip) {
+        ++clean.key_skipped;
     }
     bool patch_blend_value = false;
     // Only reached with EXP52 on: miss 1 catches a change of programs otherwise.
@@ -2506,7 +2566,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineClean(bool patch) {
     if (miss < 0) {
         ++clean.hits;
         if (by_value) {
-            if (!CleanBlendUnchanged()) {
+            if (!key_skip && !CleanBlendUnchanged()) {
                 const Maxwell& regs = maxwell3d->regs;
                 const bool canonical =
                     canonical_keys && maxwell3d->GetNativeMacroEngine().native_turing;
@@ -2526,6 +2586,11 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineClean(bool patch) {
                 // As RefreshBlending: the key's attachments are what the registers make.
                 flags[Dirty::Blending] = false;
             }
+        }
+        // FRITCHII_ONEF_KEY_KEEP: the word compares passed (or were known to), so the snapshots
+        // are the registers; a blend patch retakes its snapshot below and is learned next time.
+        if (!patch_blend_value) {
+            clean.key_seen = KeyWritesNow();
         }
     } else {
         ++clean.misses;
@@ -2561,6 +2626,18 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineClean(bool patch) {
                      per_second(clean.other_parts[0]), per_second(clean.other_parts[1]),
                      per_second(clean.other_parts[2]), per_second(clean.other_parts[3]),
                      per_second(clean.other_parts[4]), per_second(reasons[4]));
+            if (KeyKeepMode() != 0 || clean.key_untouched != 0) {
+                LOG_INFO(Render_Vulkan,
+                         "Lookup key words (fable_b 23.1 cut 2, FRITCHII_ONEF_KEY_KEEP={}) per "
+                         "second: untouched since the snapshot {}, compare kept out {}, untouched "
+                         "but the compare failed {} (must be 0; {} this session)",
+                         KeyKeepMode(), per_second(clean.key_untouched),
+                         per_second(clean.key_skipped), per_second(clean.key_failed),
+                         clean.key_failed_session);
+            }
+            clean.key_untouched = 0;
+            clean.key_skipped = 0;
+            clean.key_failed = 0;
             clean.other_parts = {};
             clean.last_log = now;
             clean.hits = 0;

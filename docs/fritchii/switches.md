@@ -1728,6 +1728,22 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   (FRITCHII_ONEF_UNION_FILTER's, always kept) and the texture and shader filters only on a hit.
   Exact: the union holds every bit of both. Small: about 2 to 5 ms/s unprofiled together. The
   bind's translation memos already exist as switches (EXP18 & 1, FRITCHII_BIND_ADDR_MEMO).
+- FRITCHII_ONEF_KEY_KEEP (live, default 0; fable_b_one_follower 23.1 cut 2; with
+  FRITCHII_ONEF_E_PIPELINE and the write tracking on, step 2+, LEAN): the clean pipeline lookup
+  (EXP19 / EDEN_NX2_PIPELINE_CLEAN) compares the key's watched register words with its snapshot
+  at every lookup (CleanInputsUnchanged, and the blend words with EXP50), about 45% of the
+  lookup. NoteRegWrite now counts every write of those words on E (or R in a lent call), before
+  its per-packet dedupe, into OneFollower::g_key_writes (the words: OneFollower::g_key_words,
+  set by BuildCleanWatch; the count also moves when the tracking stops). The lookup keeps the
+  count each time its snapshots equal the registers (a hit, or a new snapshot). 1 = count the
+  lookups that reach the compare with the count unmoved, and still compare: "Lookup key words
+  ... untouched since the snapshot N, compare kept out 0, untouched but the compare failed 0
+  (must be 0)" every 10 s next to the EDEN_NX2_PIPELINE_CLEAN line. 2 = those skip the
+  compares. Every flag, topology and engine-state test before the compare still runs, so no
+  flag leaves E's engine before its reader (section 18). Exact because every register write on
+  E goes through ProcessDirtyRegisters or ApplyDeltaWrites, which note it (the "view words"
+  must-be-0 checks the same notes). Expected 20 to 25 ms/s on E where most lookups find the
+  words untouched; run =1 first and read the count.
 - FRITCHII_ONEF_TRACE (boot, default 0; fable_b_one_follower 15.5): 1 = the lend trace. One
   72-byte record per lend and per posted op (packet number, site, op kind, posted, E's arrival,
   R's start and end, E's resume, E's work since its previous record, R's busy time on other
