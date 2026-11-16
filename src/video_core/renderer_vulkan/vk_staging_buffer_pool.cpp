@@ -271,15 +271,14 @@ StagingBufferRef StagingBufferPool::Request(size_t size, MemoryUsage usage, bool
 }
 
 void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
-    auto& entries = GetCache(ref.usage)[ref.log2_level].entries;
-    const auto is_this_one = [&ref](const StagingBuffer& entry) {
-        return entry.index == ref.index;
-    };
-    auto it = std::find_if(entries.begin(), entries.end(), is_this_one);
-    ASSERT(it != entries.end());
-    ASSERT(it->deferred);
-    it->tick = clock.Now();
-    it->deferred = false;
+    StagingBuffers& cache_level = GetCache(ref.usage)[ref.log2_level];
+    auto node = cache_level.deferred.extract(ref.index);
+    ASSERT(!node.empty());
+    if (node.empty()) {
+        return;
+    }
+    node.mapped().tick = clock.Now();
+    cache_level.entries.push_back(std::move(node.mapped()));
 }
 
 void StagingBufferPool::TickFrame() {
@@ -392,7 +391,7 @@ std::optional<StagingBufferRef> StagingBufferPool::TryGetReservedBuffer(size_t s
     StagingBuffers& cache_level = GetCache(usage)[Common::Log2Ceil(size)];
 
     const auto is_free = [this](const StagingBuffer& entry) {
-        return !entry.deferred && clock.IsFree(entry.tick);
+        return clock.IsFree(entry.tick);
     };
     auto& entries = cache_level.entries;
     const auto hint_it = entries.begin() + cache_level.iterate_index;
@@ -403,11 +402,22 @@ std::optional<StagingBufferRef> StagingBufferPool::TryGetReservedBuffer(size_t s
             return std::nullopt;
         }
     }
-    cache_level.iterate_index = std::distance(entries.begin(), it) + 1;
-    it->tick = deferred ? (std::numeric_limits<u64>::max)() : clock.Now();
-    ASSERT(!it->deferred);
-    it->deferred = deferred;
-    return it->Ref();
+    const size_t position = static_cast<size_t>(std::distance(entries.begin(), it));
+    const StagingBufferRef ref = it->Ref();
+    if (!deferred) {
+        cache_level.iterate_index = position + 1;
+        it->tick = clock.Now();
+        return ref;
+    }
+    // A deferred buffer leaves the entries until FreeDeferred; the last entry takes its place,
+    // so the next lookup starts there.
+    cache_level.iterate_index = position;
+    cache_level.deferred.emplace(it->index, std::move(*it));
+    if (it != entries.end() - 1) {
+        *it = std::move(entries.back());
+    }
+    entries.pop_back();
+    return ref;
 }
 
 StagingBufferRef StagingBufferPool::CreateStagingBuffer(
@@ -455,7 +465,7 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(
                 for (StagingBuffers& level : *cache) {
                     const size_t before = level.entries.size();
                     std::erase_if(level.entries, [this](const StagingBuffer& entry) {
-                        return !entry.deferred && clock.IsFree(entry.tick);
+                        return clock.IsFree(entry.tick);
                     });
                     freed += before - level.entries.size();
                     level.iterate_index = 0;
@@ -480,17 +490,23 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(
         device.IsBufferDeviceAddressSupported()
             ? device.GetLogical().GetBufferDeviceAddress(*buffer)
             : VkDeviceAddress{};
-    StagingBuffer& entry = GetCache(usage)[log2_size].entries.emplace_back(StagingBuffer{
+    StagingBuffer entry{
         .buffer = std::move(buffer),
         .device_address = buffer_address,
         .mapped_span = mapped_span,
         .usage = usage,
         .log2_level = log2_size,
         .index = unique_ids++,
-        .tick = deferred ? (std::numeric_limits<u64>::max)() : clock.Now(),
-        .deferred = deferred,
-    });
-    return entry.Ref();
+        .tick = clock.Now(),
+    };
+    const StagingBufferRef ref = entry.Ref();
+    StagingBuffers& cache_level = GetCache(usage)[log2_size];
+    if (deferred) {
+        cache_level.deferred.emplace(entry.index, std::move(entry));
+    } else {
+        cache_level.entries.push_back(std::move(entry));
+    }
+    return ref;
 }
 
 StagingBufferPool::StagingBuffersCache& StagingBufferPool::GetCache(MemoryUsage usage) {
@@ -511,8 +527,9 @@ u64 StagingBufferPool::CachedBytes(MemoryUsage usage) {
     u64 bytes{};
     const StagingBuffersCache& cache = GetCache(usage);
     for (size_t level = 0; level < NUM_LEVELS; ++level) {
-        if (!cache[level].entries.empty()) {
-            bytes += u64{cache[level].entries.size()} << level;
+        const size_t count = cache[level].entries.size() + cache[level].deferred.size();
+        if (count != 0) {
+            bytes += u64{count} << level;
         }
     }
     return bytes;
@@ -558,7 +575,8 @@ void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
         Retire(entry);
         return true;
     };
-    const size_t begin_offset = staging.delete_index;
+    // Deferred checkouts take entries out of the vector since the last sweep.
+    const size_t begin_offset = (std::min)(staging.delete_index, old_size);
     const size_t end_offset = (std::min)(begin_offset + deletions_per_tick, old_size);
     const auto begin = entries.begin() + begin_offset;
     const auto end = entries.begin() + end_offset;
