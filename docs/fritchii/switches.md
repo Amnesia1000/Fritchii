@@ -407,7 +407,7 @@ hitch score at the market and night market.
 
 ### FRITCHII_DEPTH_POOL_RETRY
 
-TEST, off by default (helper BF, 2026-11-16). Live: 1 = a depth target that does not fit
+On by default since 2026-11-16 (helper BJ; =0 turns it off; made by helper BF). Live: 1 = a depth target that does not fit
 EDEN_NX2_DEPTH_POOL's 64 MiB blocks is made the normal way (within the budget) before anything
 counts as memory pressure. Why: OoT's 12288x12288 D16 sun shadow map (288 MiB) never fits the pool,
 so it went down the over-budget path with VRAM to spare: "is over the memory budget; allocating it
