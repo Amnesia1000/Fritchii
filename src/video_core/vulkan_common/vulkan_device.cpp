@@ -40,7 +40,11 @@
 #include "video_core/nx2_perf.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
-#include "video_core/one_follower.h"
+// Only this declaration: one_follower.h pulls in nvdata.h, whose enum names (BadValue, ...) the
+// X11 headers vulkan.h includes on Linux define as macros.
+namespace VideoCommon::OneFollower {
+void NoteAmdProprietaryDriver() noexcept;
+}
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/vulkan_common/streamline.h"
 #endif
