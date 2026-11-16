@@ -777,6 +777,21 @@ most in one pass P; J ran 1 ms or more late (worst Z ms, event name)". The hitch
 "timer thread spin" and "timer events over 1 ms" (callbacks of 1 ms or more), so a hitch where
 HostTiming is busy says whether it spun or ran a slow callback.
 
+### FRITCHII_HOSTTIMING_PRIORITY
+
+TEST, off by default (helper CG, 2026-11-16). Live. 0 = the HostTiming thread at highest (as
+before), 1 = time critical, the priority the guest cores and the GPU threads already run at. The
+timer thread answers guest sleeps and timeouts (KHardwareTimer) and the syncpoint polls the game's
+GPU waits end on (nx2:gsv:SyncptPoll, SyncptPollNow). In market logs of 2026-11-16 (b10, b8),
+10 s windows where other processes took 2.5+ CPUs had 400-900 callbacks run 1 ms or more late
+(worst 8-14 ms, mostly SyncptPoll) and single callbacks of 4-9 ms of wall time, against 0-150
+late in quiet windows; per window, late callbacks and fps correlate at -0.4 to -0.6. Only the
+thread's OS priority changes, applied by the thread itself at its next pass (one relaxed load a
+pass while off); a line "HostTiming priority (FRITCHII_HOSTTIMING_PRIORITY=n): ..." says when.
+The "HostTiming in 10 s" line ends with "FRITCHII_HOSTTIMING_PRIORITY=n". Judge it on that
+line's "ran 1 ms or more late" and "longest" (expected: the busy windows' counts drop toward the
+quiet ones'), then on fps.
+
 ### FRITCHII_ONEF_RAISE_AFTER_LEND
 
 TEST, off by default (helper AS, 2026-11-15). Live. R raises `played` after every packet it plays
@@ -3212,6 +3227,20 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   (emptied, capacity kept). Storage finding no free slot is freed as before; over 16 MiB of
   words is never kept. Off: one relaxed load per list entry check and per list popped, one call
   and a relaxed load per list submitted.
+- FRITCHII_REFRESH_LEAN (live, default 0; helper CG, 2026-11-16): the command words a list
+  refresh copies again from memory (DmaPusher::RefreshSnapshot after a channel resumes from a
+  semaphore acquire, RefreshDeferredEntries after a GPU map). Old: ReadBlockUnsafe per entry,
+  which translates the entry's page every time (GPU page table, then device to host); the v4
+  sample had RefreshSnapshot at 3.7% of the front, 0.9% of it in that translation. 1 = each
+  4 KiB GPU page is translated once per refresh (the entries of a list mostly sit side by side)
+  and each entry copied from that host pointer plus its offset, which is what ReadBlockUnsafe's
+  own one-page path reads; a page without a host pointer (unmapped, sparse without memory,
+  outside the address space) sends the entry the old way. Off while the back read audit runs.
+  2 = verify: the cached copy into a scratch buffer, then the old copy into the list (the words
+  used stay the old path's), every byte compared. Line every 10 s while on: "Refresh lean
+  (FRITCHII_REFRESH_LEAN=n) 10 s: refreshes R/s, entries E/s, K KiB/s; pages translated T/s,
+  reused U/s, entries the old way O/s; verify: C entries compared/s, D differ (must be 0, S this
+  session)". The saving is about U x 20-30 ns a second. Off: one relaxed load per refresh.
 - FRITCHII_ONEF_NULL_FILL (live, default 0; test only, the picture breaks): 1 = E skips
   FlushCaching, FillRing and PushDraw for every draw it would fill (no packet, R draws nothing;
   TickWork as after a push). The front-wall probe of work/FRONT_SPLIT_DESIGN.md 4.3. Line every

@@ -63,6 +63,32 @@ int SpinBudgetPercent() {
 }
 constexpr s64 SpinBurstNs = 2'000'000;
 
+/// FRITCHII_HOSTTIMING_PRIORITY (live, default 0 = highest, as before): 1 = the timer thread runs
+/// time critical, the priority of the guest cores and the GPU threads. At highest it is one step
+/// below them and below DWM and audio threads: in market windows where other processes took 2.5+
+/// CPUs, 400-900 timer callbacks every 10 s ran 1 ms or more late (guest sleeps, timeouts and the
+/// syncpoint polls the game's GPU waits are answered by) and single callbacks took 4-9 ms of wall
+/// time, most likely the thread off the CPU. Only the thread's OS priority changes.
+int TimerPriorityMode() {
+    return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_hosttiming_priority,
+                                            "FRITCHII_HOSTTIMING_PRIORITY");
+}
+
+/// On the timer thread: applies FRITCHII_HOSTTIMING_PRIORITY when it changed. Off: one relaxed
+/// load and a compare per pass.
+void ApplyTimerPriority() {
+    static thread_local int applied = 0; // The thread starts at highest (Initialize)
+    const int wanted = TimerPriorityMode();
+    if (wanted == applied) [[likely]] {
+        return;
+    }
+    Common::SetCurrentThreadPriority(wanted == 1 ? Common::ThreadPriority::Critical
+                                                 : Common::ThreadPriority::VeryHigh);
+    LOG_INFO(Core_Timing, "HostTiming priority (FRITCHII_HOSTTIMING_PRIORITY={}): {}", wanted,
+             wanted == 1 ? "time critical" : "highest");
+    applied = wanted;
+}
+
 /// What the timer thread did, logged every 10 s from it ("HostTiming in 10 s"). The spins and the
 /// callbacks of 1 ms or more also go to the hitch line, so a hitch where HostTiming is busy says
 /// which of the two it was. Thread local: Advance also runs on the CPU thread in single core mode.
@@ -129,14 +155,16 @@ void MaybeLogTimerStats(s64 now) {
              "HostTiming in {:.0f} s: spun {:.1f} ms/s before guest timers ({} spins, longest {} us; "
              "EXP75={} us, FRITCHII_HOSTTIMING_SPIN_BUDGET={}%: {} cut by it); {} OS waits; {} "
              "events, callbacks {:.1f} ms/s, longest {} us ({}), {} of 1 ms or more; most in one "
-             "pass {}; {} ran 1 ms or more late (worst {:.1f} ms, {})",
+             "pass {}; {} ran 1 ms or more late (worst {:.1f} ms, {}); "
+             "FRITCHII_HOSTTIMING_PRIORITY={}",
              seconds, static_cast<double>(s.spin_ns) / 1e6 / seconds, s.spins,
              s.longest_spin / 1000, TimerSpinNs() / 1000, SpinBudgetPercent(), s.budget_cuts,
              s.waits, s.events, static_cast<double>(s.callback_ns) / 1e6 / seconds,
              s.longest_callback / 1000,
              s.longest_callback_name.empty() ? "none" : s.longest_callback_name.c_str(),
              s.slow_callbacks, s.most_in_pass, s.late_1ms, static_cast<double>(s.worst_late) / 1e6,
-             s.worst_late_name.empty() ? "none" : s.worst_late_name.c_str());
+             s.worst_late_name.empty() ? "none" : s.worst_late_name.c_str(),
+             TimerPriorityMode());
     s = TimerStats{};
     s.window_start = now;
 }
@@ -272,6 +300,7 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
             while (!stop_token.stop_requested()) {
                 while (!paused && !stop_token.stop_requested()) {
                     paused_set = false;
+                    ApplyTimerPriority();
                     if (auto const next_time = Advance(); next_time) {
                         const s64 now_ns = GetGlobalTimeNs().count();
                         MaybeLogTimerStats(now_ns);

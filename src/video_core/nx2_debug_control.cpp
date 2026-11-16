@@ -564,6 +564,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_HOSTTIMING_SPIN_BUDGET") {
         return &g_hosttiming_spin_budget;
     }
+    if (name == "FRITCHII_HOSTTIMING_PRIORITY") {
+        return &g_hosttiming_priority;
+    }
     if (name == "FRITCHII_GPU_PRIORITY") {
         return &g_gpu_priority;
     }
@@ -771,6 +774,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     }
     if (name == "FRITCHII_STEP_LEAN") {
         return &g_step_lean;
+    }
+    if (name == "FRITCHII_REFRESH_LEAN") {
+        return &g_refresh_lean;
     }
     if (name == "FRITCHII_S4_COUNT") {
         return &g_s4_count;
