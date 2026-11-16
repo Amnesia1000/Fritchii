@@ -7,6 +7,44 @@ rebuilds nothing.
 
 ## Named switches
 
+### FRITCHII_GPU_PRIORITY, FRITCHII_THREAD_QOS, FRITCHII_FOCUS_GRAB, FRITCHII_QUEUE_PRIORITY
+
+TEST, off by default (helper BN, 2026-11-16): the game loses 5+ fps while its window is not
+focused, which also skews every automated test (they run unfocused). What is already ruled out:
+every GPU thread, CPU core and timer thread runs at THREAD_PRIORITY_TIME_CRITICAL (15, the top of
+the normal range), so Windows' foreground CPU boosts can't raise them; EXP111 (process priority
+class) measured no gain on 2026-11-12; the process already opts out of power throttling and timer
+throttling at start (common/windows/timer_resolution.cpp); nothing in Fritchii's own code changes
+with focus except "Pause when not in focus" and "Mute audio when in background". Left for a
+focused window: the GPU scheduler's treatment of the foreground process, the QoS level Windows
+gives threads (High in focus, Medium visible, Low covered or minimized; processes playing audio
+count as High, and tests mute the game), and how the present is shown (independent flip vs DWM
+composition). Code: common/windows/fritchii_focus.cpp, video_core/fritchii_focus.h (called once a
+frame from RasterizerVulkan::TickFrame). Windows only; nothing system-wide is read or changed.
+
+- FRITCHII_GPU_PRIORITY (live): the process's GPU scheduling priority class
+  (D3DKMTSetProcessSchedulingPriorityClass). 0 = the class the process had at start (normal),
+  1 = above normal, 2 = high. Realtime is not offered (needs extra privileges, has hung NVIDIA
+  drivers). Log on every change: "FRITCHII_GPU_PRIORITY=N: GPU scheduling class C asked (was W at
+  start), status 0x..., now C2" (status 0 = taken; anything else = Windows refused).
+- FRITCHII_THREAD_QOS (live): 1 = the process opt-out of power throttling is set again and every
+  thread that asked for High priority or above (Common::SetCurrentThreadPriority) is tagged High
+  QoS on its own (SetThreadInformation ThreadPowerThrottling, EXECUTION_SPEED in the control mask,
+  clear in the state mask); threads starting later are tagged as they start. 0 = those threads go
+  back to system-managed QoS (the process opt-out stays, as before). Log: "FRITCHII_THREAD_QOS=N:
+  T of H hot threads tagged High QoS".
+- FRITCHII_FOCUS_GRAB (live): 1 = the game's largest visible window takes the foreground (from a
+  short thread of its own; attaches to the foreground thread's input for the hand-over); 0 = the
+  window that had the foreground gets it back. For a focused vs unfocused toggle in one session.
+  It moves the owner's focus: only while nobody types. Log: "FRITCHII_FOCUS_GRAB=N: taking the
+  foreground done / refused by Windows".
+- FRITCHII_QUEUE_PRIORITY (boot): 1 = the Vulkan queues ask for high global priority
+  (VK_KHR_global_priority, else VK_EXT_global_priority), 2 = realtime. A refusal (not permitted,
+  no extension) makes the device as before; the log says which happened.
+- Always on, Windows: "Focus: game window focused/unfocused (GPU scheduling class C)", logged
+  when it changes (checked once a second), so any log can be split into focused and unfocused
+  stretches, and shows whether Windows itself moves the GPU class with the focus.
+
 ### FRITCHII_HANG_REPORT_S
 
 ON by default at 5 in every build (helper BB, 2026-11-16, after helper AW's boot hang: 0 frames
