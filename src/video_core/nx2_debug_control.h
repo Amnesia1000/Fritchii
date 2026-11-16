@@ -286,6 +286,8 @@ inline std::atomic<int> g_keep_blocks{-1};
 inline std::atomic<int> g_staging_ring{-1};
 /// FRITCHII_HOSTTIMING_SPIN_BUDGET (live, percent, default 0): docs/fritchii/switches.md.
 inline std::atomic<int> g_hosttiming_spin_budget{-1};
+/// FRITCHII_HOSTTIMING_PRIORITY (live, default 0): docs/fritchii/switches.md (core_timing.cpp).
+inline std::atomic<int> g_hosttiming_priority{-1};
 /// FRITCHII_GPU_PRIORITY (live, default 0): docs/fritchii/switches.md (fritchii_focus.h).
 inline std::atomic<int> g_gpu_priority{-1};
 /// FRITCHII_THREAD_QOS (live, default 0): docs/fritchii/switches.md (fritchii_focus.h).
@@ -492,6 +494,9 @@ inline std::atomic<int> g_noted_overflow{-1};
 /// FRITCHII_STEP_LEAN (live, default 0): F6, the list-wait line's clock read every 256th entry
 /// and the command list storage recycled to the submitter (dma_pusher.h).
 inline std::atomic<int> g_step_lean{-1};
+/// FRITCHII_REFRESH_LEAN (live, default 0): a list refresh translates each command page once
+/// (1), 2 = verify (dma_pusher.cpp, docs/fritchii/switches.md).
+inline std::atomic<int> g_refresh_lean{-1};
 /// FRITCHII_S4_COUNT (live, default 0): fable_b2 3.3's S4 counter, dry (fritchii_s4_count.h):
 /// 1 = count the fill's uniform binds by page, list entry and cause of change, 2 = also compare
 /// a sample of ranges at the front's list entry parse with E's bind in that entry.
