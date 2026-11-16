@@ -3950,13 +3950,14 @@ void Image::UploadMemory(const StagingBufferRef& map, std::span<const BufferImag
     UploadMemory(map.buffer, map.offset, copies);
 }
 
-void Image::ClearToZero() {
+void Image::ClearToZero(bool current) {
     // As UploadMemory: the upload it stands in for leaves no resolve shadow behind.
     if (ENABLE_MSAA_RESOLVE_CONSUME && runtime != nullptr) {
         runtime->InvalidateResolveShadow(Handle());
     }
     scheduler->RequestOutsideRenderPassOperationContext();
-    const VkImage vk_image = *original_image;
+    // current: the image in use (the scaled one when rescaled), for FRITCHII_STALE_ZERO.
+    const VkImage vk_image = current ? Handle() : *original_image;
     const VkImageAspectFlags vk_aspect_mask = aspect_mask;
     const bool was_initialized = std::exchange(initialized, true);
     scheduler->Record([vk_image, vk_aspect_mask, was_initialized](vk::CommandBuffer cmdbuf) {

@@ -814,6 +814,42 @@ guest, checked in T ms), cleared on the GPU; D had data (Y MiB looked at before 
 byte, T2 ms); S not checked (3D slices)", a "Zero upload:" line for each of the first 40 zero
 images of 4 MiB or more, and "zero checks of texture uploads" in the hitch line.
 
+### FRITCHII_STALE_ZERO
+
+On by default (helper CV, 2026-11-16, dialogue text corruption, zortos293/Lichii #1310). Live. An
+image made where a GPU-written image was dropped without a write-back skips its upload (the stale
+skip, EXP78 / EDEN_NX2_TC_SKIP_STALE): the guest bytes there are older than the GPU's writes. It
+started undefined, which in practice is whatever its device memory held last: with the EXP42 pool,
+another deleted target's texels (other text, symbols, noise). With 1 it is cleared to zero in every
+level and layer instead (uncompressed, unconverted, single-sample images; others stay undefined).
+Still not the GPU's data (that was dropped; see FRITCHII_LOST_WRITEBACK), but transparent black
+instead of another image, and it no longer changes between re-creations. Cost: one transfer clear
+per skipped upload, which replaced a full upload. 0 = undefined as before.
+
+### FRITCHII_LOST_WRITEBACK
+
+TEST, off by default (helper CV, 2026-11-16; zortos293/Lichii #1501's idea). Live. 1 = a
+GPU-written image that was read in a later frame than written (sampled, or drawn over without a
+clear: the relocation guard's GuardSampled/GuardLoaded, e.g. OoT's dialogue box text target) is
+written back to guest memory when the collector takes it, also when it is a bad overlap (which the
+collector used to drop without a download), and the cold sweep, EXP58's superseded deletes,
+FRITCHII_SWEEP_SUPERSEDED and EXP64's slot retire leave such images to the collector. A write-back
+is skipped when a newer write-back (recent ring of 256) owns some of its bytes; a queued (EXP121)
+write-back of a bad overlap that an overlap wrote over meanwhile is deleted without landing, as
+before. 2 = every GPU-written image (a cause test: much more downloading). Log: the "Lost contents"
+line's write-backs and "kept by the sweeps".
+
+Lost contents counter (always on, needs the stale page marks, i.e. EXP78 on, the default): every
+10 s with anything to say, "Lost contents in 10 s (FRITCHII_STALE_ZERO=Z, FRITCHII_LOST_WRITEBACK=W):
+images made over memory whose GPU data was dropped: S upload skipped (C cleared to zero), U uploaded
+stale guest bytes; O overwritten whole first; SAMPLED with lost contents: N (A not drawn into, B
+drawn over; K KiB; G were read in a later frame before the drop) by drop: collector, cold sweep,
+superseded sweep, slot retire, join, relocation, unmap/unmap sweep, other, not recorded; write-backs
+X (Y skipped under newer), kept by the sweeps Z". SAMPLED is the number that shows on screen: an
+image sampled before anything overwrote it whole. The first 40 get a "Lost contents sampled:" line
+with the image (format, size, address) and the drop that left its memory stale (path, the dropped
+image's format, size and address, frames since, its guard bits).
+
 ### FRITCHII_HOSTTIMING_SPIN_BUDGET
 
 TEST, off by default (helper AS, 2026-11-15; idea from zortos293/Lichii #1733). Live, a percent of

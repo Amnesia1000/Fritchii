@@ -749,7 +749,9 @@ public:
     /// FRITCHII_ZERO_UPLOAD: what uploading all-zero guest bytes writes (zero in every level and
     /// layer), as a GPU clear, with the barriers of an upload. Single-sample, uncompressed images
     /// not scaled (the texture cache checks).
-    void ClearToZero();
+    /// current: clears the image in use instead (the scaled one when rescaled;
+    /// FRITCHII_STALE_ZERO).
+    void ClearToZero(bool current = false);
 
     void DownloadMemory(VkBuffer buffer, size_t offset,
                         std::span<const VideoCommon::BufferImageCopy> copies);
