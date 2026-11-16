@@ -336,6 +336,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_FILL_BRACKET_LEAN") {
         return &g_fill_bracket_lean;
     }
+    if (name == "FRITCHII_REPORT_WAIT") {
+        return &g_report_wait;
+    }
     if (name == "EDEN_NX2_FEED_MEMORY_OVERLAY") {
         return &g_feed_memory_overlay;
     }
