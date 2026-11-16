@@ -197,6 +197,15 @@ inline void AddLockWait(u64 ns) {
 /// Moves up to `max` queued keys for `core` into `out` (cleared first); returns how many.
 size_t TakeWarmKeys(u32 core, std::vector<u64>& out, size_t max);
 
+/// FRITCHII_JIT_WARM_CORES (boot, default 0 = every core; docs/fritchii/switches.md): bit N set =
+/// guest core N takes part in the warm-up (EDEN_NX2_JIT_WARM's queues and the
+/// FRITCHII_JIT_BLOCK_LIST preload). Each core's recompiler keeps its own code and block tables,
+/// so every core warmed holds a copy of every block any core ran.
+[[nodiscard]] u32 JitWarmCoreMask();
+
+/// Blocks compiled per core so far, warm and on demand, for the memory census.
+[[nodiscard]] std::string JitCompileCensus();
+
 /// From Common::SetCurrentThreadName: the thread's CPU time goes in the hitch line under `name`.
 void RegisterThread(const char* name);
 

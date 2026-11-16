@@ -220,6 +220,8 @@ inline std::atomic<int> g_kill_rt_pool{-1};
 inline std::atomic<int> g_depth_pool_big{-1};
 /// FRITCHII_HANG_REPORT_S: docs/fritchii/switches.md (default 5).
 inline std::atomic<int> g_hang_report_s{-1};
+/// FRITCHII_RAM_PREBUILT_KEEP: docs/fritchii/switches.md.
+inline std::atomic<int> g_ram_prebuilt_keep{-1};
 /// FRITCHII_E2C_ON_E: docs/fritchii/switches.md.
 inline std::atomic<int> g_e2c_on_e{-1};
 /// FRITCHII_STAMP_READ_PAGES: docs/fritchii/switches.md.

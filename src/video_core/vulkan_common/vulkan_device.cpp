@@ -10,8 +10,10 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <optional>
 #include <thread>
+#include <unordered_map>
 #include "common/container/unordered_map.h"
 #include "common/container/unordered_set.h"
 #include <utility>
@@ -23,6 +25,7 @@
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/literals.h"
+#include "common/memory_detect.h"
 #include <ranges>
 #include "common/settings.h"
 #include "common/settings_enums.h"
@@ -493,6 +496,56 @@ void GetHeapBudgets(const Device& device, std::array<VmaBudget, VK_MAX_MEMORY_HE
 PFN_vkAllocateMemory g_real_allocate_memory{};
 PFN_vkFreeMemory g_real_free_memory{};
 
+// FRITCHII_MEM_CENSUS (boot): VMA's maps of host-visible memory are tagged "VMA host maps" in the
+// memory census, so their resident pages are told apart from the driver's other memory. Off: VMA
+// calls the driver directly.
+PFN_vkMapMemory g_real_map_memory{};
+PFN_vkUnmapMemory g_real_unmap_memory{};
+std::mutex g_census_map_mutex;
+std::unordered_map<VkDeviceMemory, std::pair<VkDeviceSize, void*>> g_census_maps;
+
+void CensusNoteAllocation(VkDeviceMemory memory, VkDeviceSize size) {
+    std::scoped_lock lock{g_census_map_mutex};
+    g_census_maps[memory] = {size, nullptr};
+}
+
+void CensusForgetAllocation(VkDeviceMemory memory) {
+    std::scoped_lock lock{g_census_map_mutex};
+    if (const auto it = g_census_maps.find(memory); it != g_census_maps.end()) {
+        if (it->second.second != nullptr) {
+            Common::MemCensus::Untag(it->second.second);
+        }
+        g_census_maps.erase(it);
+    }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL CensusMapMemory(VkDevice device, VkDeviceMemory memory,
+                                               VkDeviceSize offset, VkDeviceSize size,
+                                               VkMemoryMapFlags flags, void** data) {
+    const VkResult result = g_real_map_memory(device, memory, offset, size, flags, data);
+    if (result == VK_SUCCESS && data != nullptr && *data != nullptr) {
+        std::scoped_lock lock{g_census_map_mutex};
+        auto& entry = g_census_maps[memory];
+        const VkDeviceSize bytes =
+            size != VK_WHOLE_SIZE ? size : (entry.first > offset ? entry.first - offset : 0);
+        entry.second = *data;
+        Common::MemCensus::Tag("VMA host maps", *data, bytes);
+    }
+    return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL CensusUnmapMemory(VkDevice device, VkDeviceMemory memory) {
+    {
+        std::scoped_lock lock{g_census_map_mutex};
+        if (const auto it = g_census_maps.find(memory); it != g_census_maps.end() &&
+                                                         it->second.second != nullptr) {
+            Common::MemCensus::Untag(it->second.second);
+            it->second.second = nullptr;
+        }
+    }
+    g_real_unmap_memory(device, memory);
+}
+
 u64 NanosecondsSince(std::chrono::steady_clock::time_point start) {
     return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now() - start)
@@ -953,6 +1006,14 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         functions.vkAllocateMemory = KeptBlocksAllocateMemory;
         functions.vkFreeMemory = KeptBlocksFreeMemory;
     }
+    const bool census_maps = Common::MemCensus::Mode() != 0 && dld.vkMapMemory != nullptr &&
+                             dld.vkUnmapMemory != nullptr;
+    if (census_maps) {
+        g_real_map_memory = dld.vkMapMemory;
+        g_real_unmap_memory = dld.vkUnmapMemory;
+        functions.vkMapMemory = CensusMapMemory;
+        functions.vkUnmapMemory = CensusUnmapMemory;
+    }
     // EDEN_NX2_VMA_NO_PREFER_DEDICATED (boot, default on, 0 = off; ported;
     // with 32 MiB blocks market A/B 2026-11-11: off 41.4/40.3, on 41.5/42.8 fps,
     // same VRAM):
@@ -1019,12 +1080,20 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     }
     // Counts the allocator's vkAllocateMemory / vkFreeMemory calls (blocks and dedicated
     // memory) for the "Churn (600 frames)" line.
+    // With FRITCHII_MEM_CENSUS they also note each memory's size for the census's map tags.
     static const VmaDeviceMemoryCallbacks churn_callbacks{
-        .pfnAllocate = [](VmaAllocator, uint32_t, VkDeviceMemory, VkDeviceSize, void*) {
+        .pfnAllocate = [](VmaAllocator, uint32_t, VkDeviceMemory memory, VkDeviceSize size,
+                          void*) {
             VideoCommon::Churn::Add(VideoCommon::Churn::DeviceAllocations);
+            if (g_real_map_memory != nullptr) {
+                CensusNoteAllocation(memory, size);
+            }
         },
-        .pfnFree = [](VmaAllocator, uint32_t, VkDeviceMemory, VkDeviceSize, void*) {
+        .pfnFree = [](VmaAllocator, uint32_t, VkDeviceMemory memory, VkDeviceSize, void*) {
             VideoCommon::Churn::Add(VideoCommon::Churn::DeviceFrees);
+            if (g_real_map_memory != nullptr) {
+                CensusForgetAllocation(memory);
+            }
         },
         .pUserData = nullptr,
     };

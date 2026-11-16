@@ -461,6 +461,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_HANG_REPORT_S") {
         return &g_hang_report_s;
     }
+    if (name == "FRITCHII_RAM_PREBUILT_KEEP") {
+        return &g_ram_prebuilt_keep;
+    }
     if (name == "FRITCHII_E2C_ON_E") {
         return &g_e2c_on_e;
     }
