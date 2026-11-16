@@ -284,6 +284,8 @@ inline std::atomic<int> g_unswizzle_in_place{-1};
 inline std::atomic<int> g_keep_blocks{-1};
 /// FRITCHII_STAGING_RING (boot size, live use, default 0): docs/fritchii/switches.md.
 inline std::atomic<int> g_staging_ring{-1};
+/// FRITCHII_ZERO_UPLOAD (live, default 0): docs/fritchii/switches.md.
+inline std::atomic<int> g_zero_upload{-1};
 /// FRITCHII_HOSTTIMING_SPIN_BUDGET (live, percent, default 0): docs/fritchii/switches.md.
 inline std::atomic<int> g_hosttiming_spin_budget{-1};
 /// FRITCHII_GPU_PRIORITY (live, default 0): docs/fritchii/switches.md (fritchii_focus.h).

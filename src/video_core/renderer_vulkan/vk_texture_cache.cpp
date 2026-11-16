@@ -3950,6 +3950,77 @@ void Image::UploadMemory(const StagingBufferRef& map, std::span<const BufferImag
     UploadMemory(map.buffer, map.offset, copies);
 }
 
+void Image::ClearToZero() {
+    // As UploadMemory: the upload it stands in for leaves no resolve shadow behind.
+    if (ENABLE_MSAA_RESOLVE_CONSUME && runtime != nullptr) {
+        runtime->InvalidateResolveShadow(Handle());
+    }
+    scheduler->RequestOutsideRenderPassOperationContext();
+    const VkImage vk_image = *original_image;
+    const VkImageAspectFlags vk_aspect_mask = aspect_mask;
+    const bool was_initialized = std::exchange(initialized, true);
+    scheduler->Record([vk_image, vk_aspect_mask, was_initialized](vk::CommandBuffer cmdbuf) {
+        // CopyBufferToImage's barriers, over every level and layer (the upload's copies cover
+        // all of them).
+        static constexpr VkAccessFlags WRITE_ACCESS_FLAGS =
+            VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        static constexpr VkAccessFlags READ_ACCESS_FLAGS =
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+        const VkImageSubresourceRange range{
+            .aspectMask = vk_aspect_mask,
+            .baseMipLevel = 0,
+            .levelCount = VK_REMAINING_MIP_LEVELS,
+            .baseArrayLayer = 0,
+            .layerCount = VK_REMAINING_ARRAY_LAYERS,
+        };
+        const VkImageMemoryBarrier to_transfer{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = WRITE_ACCESS_FLAGS,
+            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .oldLayout = was_initialized ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = vk_image,
+            .subresourceRange = range,
+        };
+        const VkImageMemoryBarrier to_general{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = WRITE_ACCESS_FLAGS | READ_ACCESS_FLAGS,
+            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = vk_image,
+            .subresourceRange = range,
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                                   VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, to_transfer);
+        if ((vk_aspect_mask & VK_IMAGE_ASPECT_COLOR_BIT) != 0) {
+            // All bytes zero: 0 in every numeric format (float, norm, int, sRGB, packed).
+            cmdbuf.ClearColorImage(vk_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                   VkClearColorValue{}, range);
+        } else {
+            // Depth 0.0 and stencil 0: all bytes zero in every depth and stencil format.
+            cmdbuf.ClearDepthStencilImage(vk_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                          VkClearDepthStencilValue{.depth = 0.0f, .stencil = 0},
+                                          range);
+        }
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                   VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                               0, to_general);
+    });
+}
+
 void Image::DownloadMemory(VkBuffer buffer, size_t offset,
                            std::span<const VideoCommon::BufferImageCopy> copies) {
     std::array buffer_handles{

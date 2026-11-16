@@ -746,6 +746,11 @@ public:
     void UploadMemory(const StagingBufferRef& map,
                       std::span<const VideoCommon::BufferImageCopy> copies);
 
+    /// FRITCHII_ZERO_UPLOAD: what uploading all-zero guest bytes writes (zero in every level and
+    /// layer), as a GPU clear, with the barriers of an upload. Single-sample, uncompressed images
+    /// not scaled (the texture cache checks).
+    void ClearToZero();
+
     void DownloadMemory(VkBuffer buffer, size_t offset,
                         std::span<const VideoCommon::BufferImageCopy> copies);
 

@@ -825,6 +825,7 @@ void TextureCache<P>::TickFrame() {
             scratch->release();
         }
     }
+    LogZeroUploads();
     // EXP121: before the usage is read below, so landed images leave the queued bytes.
     if (!collect_downloads.empty()) {
         LandCollectDownloads();
@@ -4093,7 +4094,9 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     // Page faults of the whole process meanwhile: ~256 per MiB when the guest memory was paged
     // out (cold-hinted) or the staging memory is new.
     const u64 faults_begin = upload_trace ? Common::GetProcessPageFaults() : 0;
-    if (!UploadInChunks(image)) {
+    if (TryZeroUpload(image)) {
+        // FRITCHII_ZERO_UPLOAD: cleared on the GPU, what the upload of these bytes writes.
+    } else if (!UploadInChunks(image)) {
         auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
         if (upload_trace) [[unlikely]] {
             staging_end = std::chrono::steady_clock::now();
@@ -4150,6 +4153,143 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
             uploaded_ranges.emplace_back(image.cpu_addr, image.guest_size_bytes);
         }
     }
+}
+
+/// FRITCHII_ZERO_UPLOAD: bytes looked at until the first non-zero one (all of them when zero).
+[[nodiscard]] inline size_t ZeroPrefixBytes(std::span<const u8> bytes) noexcept {
+    const u8* const data = bytes.data();
+    const size_t size = bytes.size();
+    // 4 KiB at a time: OR-ing words vectorizes; a block with data stops the walk.
+    constexpr size_t Block = 4096;
+    size_t offset = 0;
+    for (; offset + Block <= size; offset += Block) {
+        u64 bits = 0;
+        for (size_t i = 0; i < Block; i += sizeof(u64)) {
+            u64 word;
+            std::memcpy(&word, data + offset + i, sizeof(word));
+            bits |= word;
+        }
+        if (bits != 0) {
+            return offset;
+        }
+    }
+    for (; offset < size; ++offset) {
+        if (data[offset] != 0) {
+            return offset;
+        }
+    }
+    return size;
+}
+
+template <class P>
+bool TextureCache<P>::TryZeroUpload(Image& image) {
+    const int mode = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_zero_upload,
+                                                      "FRITCHII_ZERO_UPLOAD");
+    if (mode <= 0) {
+        return false;
+    }
+    if constexpr (!requires { image.ClearToZero(); }) {
+        return false;
+    } else {
+        // Only where zero guest bytes upload as zero texels in every level and layer and the
+        // upload covers the whole host image: plain (not converted, not GPU-decoded), uncompressed
+        // single-sample images whose host image is the guest image (not scaled, padded or
+        // sparse), not a buffer.
+        constexpr ImageFlagBits excluded =
+            ImageFlagBits::AcceleratedUpload | ImageFlagBits::Converted |
+            ImageFlagBits::Sparse | ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
+            ImageFlagBits::Unbacked | ImageFlagBits::TrimmedLevels |
+            ImageFlagBits::AsynchronousDecode | ImageFlagBits::IsDecoding |
+            ImageFlagBits::ZeroFilled | ImageFlagBits::UnwrittenSparse | ImageFlagBits::Rescaled |
+            ImageFlagBits::HostPadded | ImageFlagBits::ScaleLimited;
+        constexpr u64 MinBytes = 256_KiB;
+        if (True(image.flags & excluded) || image.info.type == ImageType::Buffer ||
+            image.info.num_samples != 1 || image.host_level_offset != 0 ||
+            image.guest_size_bytes < MinBytes ||
+            VideoCore::Surface::DefaultBlockWidth(image.info.format) != 1 ||
+            VideoCore::Surface::DefaultBlockHeight(image.info.format) != 1) {
+            return false;
+        }
+        // A slice of a deep block-linear 3D texture spans 16x its texels in guest memory: looking
+        // at all of it costs more than the upload's own read.
+        if (u64{image.guest_size_bytes} > 2 * u64{image.unswizzled_size_bytes}) {
+            ++zero_upload.sparse_skipped;
+            return false;
+        }
+        const u64 start = Common::Nx2Hitch::NowNs();
+        // The bytes the upload would read (GpuGuestMemory, unmapped pages as zeros), in pieces so
+        // a range that is not contiguous copies at most one piece.
+        constexpr size_t Piece = 4_MiB;
+        const size_t total = image.guest_size_bytes;
+        size_t looked = 0;
+        bool zero = true;
+        for (size_t offset = 0; offset < total; offset += Piece) {
+            const size_t size = (std::min)(Piece, total - offset);
+            Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead> bytes(
+                *gpu_memory, image.gpu_addr + offset, size, &swizzle_data_buffer);
+            const size_t prefix = ZeroPrefixBytes(std::span<const u8>(bytes.data(), size));
+            looked += prefix;
+            if (prefix != size) {
+                zero = false;
+                break;
+            }
+        }
+        const u64 ns = Common::Nx2Hitch::NowNs() - start;
+        Common::Nx2Hitch::Add(Common::Nx2Hitch::Cause::ZeroUpload, ns, looked);
+        if (!zero) {
+            ++zero_upload.data_images;
+            zero_upload.data_bytes += looked;
+            zero_upload.data_ns += ns;
+            return false;
+        }
+        ++zero_upload.zero_images;
+        zero_upload.zero_bytes += total;
+        zero_upload.zero_ns += ns;
+        if (total >= 4_MiB && zero_upload.logged < 40) {
+            ++zero_upload.logged;
+            LOG_INFO(HW_GPU,
+                     "Zero upload (FRITCHII_ZERO_UPLOAD={}): format {} type {} {}x{}x{} levels {} "
+                     "layers {} at {:#x}, {} KiB guest all zero, {} (checked in {:.2f} ms)",
+                     mode, static_cast<u32>(image.info.format), static_cast<u32>(image.info.type),
+                     image.info.size.width, image.info.size.height, image.info.size.depth,
+                     image.info.resources.levels, image.info.resources.layers, image.gpu_addr,
+                     total >> 10, mode == 1 ? "cleared on the GPU" : "uploaded (count only)",
+                     static_cast<double>(ns) / 1e6);
+        }
+        if (mode != 1) {
+            return false; // 2: count only, the upload runs as before
+        }
+        image.ClearToZero();
+        return true;
+    }
+}
+
+template <class P>
+void TextureCache<P>::LogZeroUploads() {
+    ZeroUploadStats& s = zero_upload;
+    const s64 now = static_cast<s64>(Common::Nx2Hitch::NowNs());
+    if (s.last_log_ns == 0) {
+        s.last_log_ns = now;
+        return;
+    }
+    if (now - s.last_log_ns < 10'000'000'000) {
+        return;
+    }
+    s.last_log_ns = now;
+    if (s.zero_images + s.data_images + s.sparse_skipped != 0) {
+        const int mode = VideoCore::Nx2Debug::g_zero_upload.load(std::memory_order_relaxed);
+        LOG_INFO(HW_GPU,
+                 "Zero uploads in 10 s (FRITCHII_ZERO_UPLOAD={}): {} uploads all zero ({} MiB "
+                 "guest, checked in {:.1f} ms), {}; {} had data ({} MiB looked at before the first "
+                 "non-zero byte, {:.1f} ms); {} not checked (3D slices, guest footprint over 2x)",
+                 mode, s.zero_images, s.zero_bytes >> 20, static_cast<double>(s.zero_ns) / 1e6,
+                 mode == 1 ? "cleared on the GPU" : "uploaded as before (count only)",
+                 s.data_images, s.data_bytes >> 20, static_cast<double>(s.data_ns) / 1e6,
+                 s.sparse_skipped);
+    }
+    s.zero_images = s.zero_bytes = s.zero_ns = 0;
+    s.data_images = s.data_bytes = s.data_ns = 0;
+    s.sparse_skipped = 0;
 }
 
 template <class P>

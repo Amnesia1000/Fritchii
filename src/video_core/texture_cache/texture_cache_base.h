@@ -205,6 +205,14 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     /// Splits large 2D image uploads into smaller chunks, avoiding multi-hundred MiB staging buffers.
     bool UploadInChunks(Image& image);
 
+    /// FRITCHII_ZERO_UPLOAD (live, default 0): a whole upload whose guest bytes are all zero
+    /// becomes a GPU clear to zero (no staging buffer, no untiling, no copy). True when the
+    /// image was cleared (mode 1); mode 2 only counts.
+    bool TryZeroUpload(Image& image);
+
+    /// The 10 s line of FRITCHII_ZERO_UPLOAD (TickFrame).
+    void LogZeroUploads();
+
     /// Large layered images whose refresh can decode only the layers written since the last one.
     [[nodiscard]] bool UploadsByLayer(const ImageBase& image) const noexcept;
 
@@ -1436,6 +1444,19 @@ private:
     u64 tc_stale_skips{};        ///< Uploads skipped (last 600 frames)
     u64 tc_stale_skip_bytes{};
     u64 tc_stale_gpu_written{};  ///< Stale but buffer-written pages: uploaded after all
+
+    /// FRITCHII_ZERO_UPLOAD counters (the 10 s line).
+    struct ZeroUploadStats {
+        u64 zero_images{};     ///< All zero (cleared in mode 1, counted in mode 2)
+        u64 zero_bytes{};      ///< Their guest bytes
+        u64 zero_ns{};         ///< Their checks
+        u64 data_images{};     ///< Checked, not all zero: uploaded as before
+        u64 data_bytes{};      ///< Bytes looked at before the first non-zero one
+        u64 data_ns{};
+        u64 sparse_skipped{};  ///< Eligible but sparse in guest memory (footprint over 2x)
+        s64 last_log_ns{};
+        u32 logged{};          ///< Per-image lines so far (the first 40 of 4 MiB or more)
+    } zero_upload;
 
     /// The CPU address an image at gpu_addr is keyed by: its backing, or a fixed stand-in.
     [[nodiscard]] std::optional<DAddr> ImageCpuAddress(GPUVAddr gpu_addr, size_t size) const;
