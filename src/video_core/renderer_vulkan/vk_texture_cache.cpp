@@ -5310,25 +5310,40 @@ f32 TextureCacheRuntime::OcarinaFsrLodBias() {
             // FSR 4 takes the scene without camera jitter: a sharper mip would only shimmer.
             ocarina_fsr_lod_bias = 0.0f;
             LOG_INFO(Render_Vulkan, "Ocarina texture LOD bias 0 (FSR 4 without camera jitter)");
-        } else if (const int mode = VideoCommon::OcarinaLodRatioMode(); mode != 0) {
-            // FRITCHII_OOT_LOD_RATIO: from the real sizes, docked (handheld drops the bias). The
-            // scene is 1440p tall, or what the DLSS render scale made it; the output is 4K, or
-            // the scene's own size for DLAA (the quality when the game started).
-            const u32 render_height =
-                Settings::OcarinaRenderHeightFor(Settings::AppliedOcarinaRenderScale());
+        } else {
+            // From the sizes, docked (handheld drops the bias). Max Resolution: the scene is
+            // 1440p tall, or what the DLSS render scale made it, and the output 4K. Without it
+            // the game's dynamic scene (1080p at most) goes to 1440p. DLAA (the quality when the
+            // game started) keeps the scene's size. FRITCHII_DLSS_SCALED: the scaled scene, and
+            // a scene above the output is upscaled to its own size (supersampling).
+            const bool max_resolution = Settings::OcarinaMaxResolutionOn();
+            u32 render_height =
+                max_resolution
+                    ? Settings::OcarinaRenderHeightFor(Settings::AppliedOcarinaRenderScale())
+                    : 1080;
+            const auto& resolution = Settings::values.resolution_info;
+            if (VideoCommon::OcarinaScaledUpscale() && resolution.active) {
+                render_height = static_cast<u32>(
+                    static_cast<f32>(render_height) * resolution.up_factor + 0.5f);
+            }
             const bool dlaa = backend == VideoCommon::OcarinaUpscaleBackend::Dlss &&
                               Settings::GetNvidiaDlssRuntimeSettings().quality ==
                                   Settings::NvidiaDlssQuality::Native;
-            const u32 output_height = dlaa ? render_height : 2160;
-            ocarina_fsr_lod_bias = VideoCommon::OcarinaLodBiasForSizes(
-                backend, render_height, output_height, VideoCommon::OcarinaDlssJitterMode() != 0,
-                mode);
+            const u32 output_height =
+                dlaa ? render_height : std::max(render_height, max_resolution ? 2160U : 1440U);
+            const bool dlss_jitter =
+                VideoCommon::OcarinaDlssJitterOn(Settings::values.oot_dlss_jitter.GetValue());
+            const int mode = VideoCommon::OcarinaLodRatioMode();
+            const auto choice = Settings::values.oot_texture_sharpness.GetValue();
+            ocarina_fsr_lod_bias = VideoCommon::OcarinaTextureLodBias(
+                backend, render_height, output_height, dlss_jitter, mode, choice,
+                Settings::values.oot_lod_bias_custom.GetValue());
             LOG_INFO(Render_Vulkan,
-                     "Ocarina texture LOD bias {:.2f} ({} {}p -> {}p, FRITCHII_OOT_LOD_RATIO={})",
+                     "Ocarina texture LOD bias {:.2f} ({} {}p -> {}p, texture sharpness {}, "
+                     "DLSS jitter {}, FRITCHII_OOT_LOD_RATIO={})",
                      *ocarina_fsr_lod_bias, VideoCommon::OcarinaBackendName(backend),
-                     render_height, output_height, mode);
-        } else {
-            ocarina_fsr_lod_bias = VideoCommon::OcarinaFsrLodBias(backend);
+                     render_height, output_height, Settings::CanonicalizeEnum(choice),
+                     dlss_jitter ? "on" : "off", mode);
         }
     }
     return *ocarina_fsr_lod_bias;

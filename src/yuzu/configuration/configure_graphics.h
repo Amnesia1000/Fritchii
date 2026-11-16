@@ -89,6 +89,9 @@ private:
     void SetupUpscalerChoice(std::map<u32, QWidget*>& hold_graphics);
     void UpdateUpscalerChoice();
     void ApplyUpscalerChoice(int index);
+    /// OoT's "DLSS jitter" row only while DLSS upscales OoT, the LOD bias row only with Custom
+    /// texture sharpness. `rows`: the built setting rows by setting id.
+    void SetupOcarinaTextureRows(const std::map<u32, QWidget*>& rows);
 
     void RetrieveVulkanDevices();
 

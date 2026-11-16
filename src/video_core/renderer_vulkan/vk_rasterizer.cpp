@@ -7963,6 +7963,12 @@ bool RasterizerVulkan::OcarinaTemporalEnabled() const {
                           Fsr4Upscaler::RunsUnjittered(device);
     const bool fsr4_wanted = *oot_backend == VideoCommon::OcarinaUpscaleBackend::Fsr &&
                              Fsr4Upscaler::IsWanted(device);
+    oot_dlss_jitter = VideoCommon::OcarinaDlssJitterOn(Settings::values.oot_dlss_jitter.GetValue());
+    if (*oot_backend == VideoCommon::OcarinaUpscaleBackend::Dlss) {
+        LOG_INFO(Render_Vulkan, "Ocarina temporal: DLSS jitter {} ({})",
+                 oot_dlss_jitter ? "on" : "off",
+                 VideoCommon::OcarinaDlssJitterOverride() >= 0 ? "EDEN_NX2_DLSS_JITTER" : "setting");
+    }
     // Which upscaler OoT got and from what (2026-11-11: a player with DLSS on and Streamline
     // loaded had no DLSS in 10 minutes, and the log couldn't say why).
     LOG_INFO(Render_Vulkan,
@@ -8155,12 +8161,11 @@ void RasterizerVulkan::UpdateOcarinaJitter() {
     // half-size passes and full-screen passes (which keep the depth bound without using it, as
     // a ported change found, some with depth writes on: with the test off nothing writes depth) stay put.
     const auto& regs = maxwell3d->regs;
-    // FSR, and DLSS with EDEN_NX2_DLSS_JITTER (it is made for jittered input too).
-    // FSR 4 goes without it unless FRITCHII_FSR4_JITTER (oot_fsr4_unjittered).
+    // FSR (FSR 4 without it unless FRITCHII_FSR4_JITTER: oot_fsr4_unjittered), and DLSS with
+    // its jitter on (the "DLSS jitter" setting, on by default, or EDEN_NX2_DLSS_JITTER).
     const bool jittered_backend =
         (oot_backend == VideoCommon::OcarinaUpscaleBackend::Fsr && !oot_fsr4_unjittered) ||
-        (oot_backend == VideoCommon::OcarinaUpscaleBackend::Dlss &&
-         VideoCommon::OcarinaDlssJitterMode() != 0);
+        (oot_backend == VideoCommon::OcarinaUpscaleBackend::Dlss && oot_dlss_jitter);
     if (jittered_backend && oot_motion.extent.width != 0 &&
         oot_dlss_frame && *oot_dlss_frame + 1 >= render_trace_frame && regs.depth_test_enable) {
         const auto& targets = texture_cache.GetRenderTargets();
