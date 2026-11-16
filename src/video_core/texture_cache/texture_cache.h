@@ -4122,6 +4122,18 @@ std::vector<u32> TextureCache<P>::BindSparseLayers(Image& image, std::span<const
 template <class P>
 void TextureCache<P>::UploadLayers(Image& image, std::span<const u32> layers) {
     if constexpr (requires { &Runtime::AccelerateImageUploadLayers; }) {
+        // At most 32 MiB of layers per staging buffer, as UploadInChunks: all of a sparse array's
+        // bound layers at once took a 128 MiB one that an 8 GB laptop had no memory for.
+        constexpr u64 ChunkBytes = 32_MiB;
+        const size_t chunk_layers = static_cast<size_t>(
+            (std::max<u64>)(1, ChunkBytes / (std::max<u64>)(image.info.layer_stride, 1)));
+        if (layers.size() > chunk_layers) {
+            for (size_t first = 0; first < layers.size(); first += chunk_layers) {
+                UploadLayers(image, layers.subspan(first, (std::min)(chunk_layers,
+                                                                     layers.size() - first)));
+            }
+            return;
+        }
         if (False(image.flags & ImageFlagBits::AcceleratedUpload)) {
             // Plain formats: each layer unswizzled on its own into its layer of the image.
             ImageInfo layer_info = image.info;
@@ -4413,6 +4425,17 @@ template <class P>
 bool TextureCache<P>::ImageCanRescale(ImageBase& image) {
     if (!image.info.rescaleable) {
         return false;
+    }
+    if constexpr (requires { runtime.GetMaxScaledExtent(); }) {
+        // FRITCHII_SCALED_EXTENT_CAP: past the device's limits the scaled image is invalid. OoT's
+        // 12288x12288 sun shadow map is 18432 wide at 1.5x and 24576 at 2x, over AMD's 16384,
+        // and drawing into it hangs the GPU (device loss entering Castle Town on AMD).
+        if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_scaled_extent_cap,
+                                             "FRITCHII_SCALED_EXTENT_CAP") != 0 &&
+            !ScaledImageFits(image.info, Settings::values.resolution_info,
+                             runtime.GetMaxScaledExtent())) {
+            return false;
+        }
     }
     if (Settings::values.resolution_info.downscale && !image.info.downscaleable) {
         return false;

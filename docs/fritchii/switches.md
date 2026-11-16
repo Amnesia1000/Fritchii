@@ -150,6 +150,54 @@ pages instead of at the end. What is trimmed stays the same; the unlock calls ar
 in more batches. Expected: the peak working set ~2 GB lower (no RAM is freed: the pages were RAM
 already; but Windows and the owner's tools stop seeing a 14.6 GB process). Judge: "Memory:" peak and
 "Zero-page pass" lines (same MiB trimmed, similar ms), hitch score unchanged.
+### FRITCHII_FORMATLESS_13
+
+TEST, off by default (helper BH, 2026-11-16, port of zortos293/Lichii #1874 by KevinLny, open
+there). Boot. 0 = as before. 1 = typeless storage image reads count as supported on a Vulkan 1.3
+instance even when the device's shaderStorageImageReadWithoutFormat feature is false. Only devices
+without that feature change (Intel on Windows; NVIDIA and AMD already have it, so nothing changes
+there). Why: on Intel Iris Xe (Windows driver 101.7092) every typeless image read became a constant
+0 and the scene rendered black (Pokopia; log line "Typeless image read not supported by host").
+The driver reports formatless reads per format through format features 2. Check: an Intel Windows
+tester with the switch at 1, the warning gone and the scene drawn.
+
+### FRITCHII_DEVICE_FAULT
+
+On by default (helper BH, 2026-11-16, port of the device fault part of zortos293/Lichii #512).
+Boot. When the driver offers VK_EXT_device_fault, Fritchii enables it (vendor binary dumps off)
+and a device loss logs what the driver knows: "Device fault: <description> (N addresses, M vendor
+records)", each fault address with its kind (invalid read/write/execute, instruction pointer) and
+range, and the vendor fault codes. A driver without it logs "Device fault info: not supported by
+the driver". Only the loss report reads it; nothing is drawn differently. FRITCHII_DEVICE_FAULT=0
+leaves the extension off, as before. Why: two AMD testers hit device losses with no clue in the log.
+
+### FRITCHII_SCALED_EXTENT_CAP
+
+TEST, off by default (helper BH, 2026-11-16, port of zortos293/Lichii #1890 by zortos293, still
+open there). Live, for images made after the change. 0 = as before. 1 = the texture cache leaves
+an image unscaled when its scaled width or height would pass the device's 2D image or framebuffer
+limit (the smallest of the three; 16384 on AMD and RADV, 32768 on NVIDIA). Rescaling is decided
+per render target set, so that whole pass stays native while the rest of the frame scales. Why:
+OoT's sun shadow map is a 12288x12288 D16 depth target; at 1.5x it is 18432 wide and at 2x
+24576, past AMD's 16384, and drawing into it hangs the GPU: device loss entering Castle Town at
+1.5x/2x on AMD (zortos #1885: semaphore waits for 2 s, then "Device loss occurred" with no fault
+address). NVIDIA keeps scaling that map at 2x, so on NVIDIA the switch changes nothing at those
+scales. Check: an AMD tester at 1.5x enters Castle Town with the switch at 1.
+
+### FRITCHII_OOT_BYPASS_SAMPLED
+
+TEST, off by default (helper BH, 2026-11-16, port of zortos293/Lichii #1875 by zortos293). Live;
+only matters with Ocarina of Time anti-aliasing at No sharpening (or the forced bypass on GPUs
+that can't build the network). 0 = as before: the copy that replaces the network's output pass
+takes render target 0 of the latest draw with one of three known tonemap shaders. 1 = it copies
+the image the output pass itself samples (cb0 + 0xc0, B10G11R11 or its E5B9G9R9 view), and a
+skipped prepass that no replacement followed runs the network again. Why: the game has a fourth
+tonemap shader (96d6efdbfe52605c, seen in adult Zora's Domain, Lon Lon Ranch and Kakariko houses),
+and there the copy kept an old image: the 3D view froze while the HUD and audio went on, until the
+camera turned (zortos #1688, RADV and NVIDIA). Their tester confirmed the fix. Log: "anti-aliasing
+network bypassed from the sampled image" once, and "the network's output pass was not replaced;
+running the network" once if a frame ended with another output program. Check: No sharpening in
+Zora's Domain facing King Zora, the view must follow the camera.
 
 ### FRITCHII_PROTECT_UNLOCKED
 

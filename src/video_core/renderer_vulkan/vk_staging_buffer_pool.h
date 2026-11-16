@@ -8,6 +8,7 @@
 #include <climits>
 #include <optional>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 #include "common/common_types.h"
@@ -102,7 +103,6 @@ private:
         u32 log2_level;
         u64 index;
         u64 tick = 0;
-        bool deferred{};
 
         StagingBufferRef Ref() const noexcept {
             return {
@@ -119,6 +119,9 @@ private:
 
     struct StagingBuffers {
         std::vector<StagingBuffer> entries;
+        // Buffers handed out deferred, by index, until FreeDeferred gives them back: kept out of
+        // entries so lookups and FreeDeferred don't scan them.
+        std::unordered_map<u64, StagingBuffer> deferred;
         size_t delete_index = 0;
         size_t iterate_index = 0;
     };
