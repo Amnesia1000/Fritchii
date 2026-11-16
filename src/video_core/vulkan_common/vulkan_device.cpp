@@ -40,6 +40,7 @@
 #include "video_core/nx2_perf.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
+#include "video_core/one_follower.h"
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/vulkan_common/streamline.h"
 #endif
@@ -697,6 +698,11 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     const bool is_amd = is_amd_driver || is_radv;
 
     const bool is_intel_windows = driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS;
+    if (driver_id == VK_DRIVER_ID_AMD_PROPRIETARY) {
+        // The one follower's AMD safe default reads it at the split's start (later, on the GPU
+        // thread).
+        VideoCommon::OneFollower::NoteAmdProprietaryDriver();
+    }
 
     const bool is_nvidia = driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY;
     const bool is_mvk = driver_id == VK_DRIVER_ID_MOLTENVK;

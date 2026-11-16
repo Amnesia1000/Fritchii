@@ -4569,6 +4569,33 @@ void RasterizerVulkan::OneFollowerCheckGrids() {
         }
         std::array<u32, 3> grid{};
         std::memcpy(grid.data(), check.ref.mapped_span.data(), sizeof(grid));
+        if (check.audit) [[unlikely]] {
+            // FRITCHII_GRID_AUDIT: every indirect grid, counted; the first 16 bad ones and then
+            // every 256th logged.
+            static u64 audited{};
+            static u64 bad{};
+            ++audited;
+            const bool over = grid[0] > max_dim[0] || grid[1] > max_dim[1] || grid[2] > max_dim[2];
+            const bool high = grid[1] > 0xffff || grid[2] > 0xffff;
+            if (over || high) {
+                ++bad;
+                if (bad <= 16 || bad % 256 == 0) {
+                    LOG_WARNING(Render_Vulkan,
+                                "Dispatch grid audit: indirect dispatch of {:016x} ran grid "
+                                "{}x{}x{} ({}{}), limit {}x{}x{}; {} bad of {} audited",
+                                check.shader, grid[0], grid[1], grid[2],
+                                over ? "over the device limit" : "",
+                                high ? (over ? ", y/z past 16 bits" : "y/z past 16 bits") : "",
+                                max_dim[0], max_dim[1], max_dim[2], bad, audited);
+                }
+            } else if ((audited & (audited - 1)) == 0 && audited >= 1024) {
+                LOG_INFO(Render_Vulkan,
+                         "Dispatch grid audit: {} indirect grids audited, {} bad (last {}x{}x{})",
+                         audited, bad, grid[0], grid[1], grid[2]);
+            }
+            staging_pool.FreeDeferred(check.ref);
+            return true;
+        }
         if (grid[0] > max_dim[0] || grid[1] > max_dim[1] || grid[2] > max_dim[2]) [[unlikely]] {
             thread_local std::string note;
             note = fmt::format("{} indirect dispatch of {:016x}: grid {}x{}x{}, limit {}x{}x{}",
@@ -5525,9 +5552,20 @@ void RasterizerVulkan::DispatchCompute() {
         // FRITCHII_ONEF_OP_DISPATCH on (one follower, R): the grid words copied on the GPU right
         // before the dispatch, checked against the device limit once the submission is done
         // (OneFollowerCheckGrids). Lent ones too: the dry compare.
+        // FRITCHII_GRID_AUDIT (boot, default 0): the same copy and check for every indirect
+        // dispatch, one follower or not. The grid comes from GPU memory (list dispatches, GPU-sized
+        // grids), so the host never sees it before vkCmdDispatchIndirect: a grid past the device
+        // limit, or y/z above the 16 bits the console's QMD reads, is logged after the fact. A
+        // diagnostic for the AMD device losses: costs a copy and two barriers per indirect dispatch.
+        static const bool grid_audit = [] {
+            const char* value = std::getenv("FRITCHII_GRID_AUDIT");
+            return value != nullptr && value[0] == '1';
+        }();
         std::optional<StagingBufferRef> grid_copy;
-        if (VideoCommon::OneFollower::On() && VideoCommon::OneFollower::OnRenderThread() &&
-            VideoCommon::OneFollower::DispatchPostBits() != 0) [[unlikely]] {
+        const bool onef_grid = VideoCommon::OneFollower::On() &&
+                               VideoCommon::OneFollower::OnRenderThread() &&
+                               VideoCommon::OneFollower::DispatchPostBits() != 0;
+        if (onef_grid || grid_audit) [[unlikely]] {
             OneFollowerCheckGrids();
             if (onef_grid_checks.size() < 256) {
                 grid_copy = staging_pool.Request(16, MemoryUsage::Download, true);
@@ -5572,7 +5610,8 @@ void RasterizerVulkan::DispatchCompute() {
         });
         if (grid_copy) {
             onef_grid_checks.push_back({*grid_copy, scheduler.CurrentTick(),
-                                        pipeline->ShaderHash(), onef_play != nullptr});
+                                        pipeline->ShaderHash(), onef_play != nullptr,
+                                        !onef_grid});
         }
         // A played dispatch's probes and list page copies are E's (a lent tail after the post).
         if (onef_play == nullptr) {
@@ -5591,6 +5630,17 @@ void RasterizerVulkan::DispatchCompute() {
     const std::array<u32, 3> dim{qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z};
     const std::array<u32, 3> max_dim{device.GetMaxComputeWorkGroupCount()};
     if (dim[0] > max_dim[0] || dim[1] > max_dim[1] || dim[2] > max_dim[2]) {
+        // Never recorded (a grid past maxComputeWorkGroupCount is undefined in Vulkan); counted,
+        // the first 8 and then every 256th logged.
+        static std::atomic<u32> skipped{};
+        const u32 n = skipped.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 8 || n % 256 == 0) {
+            LOG_WARNING(Render_Vulkan,
+                        "Dispatch grid over the device limit, skipped: {}x{}x{} of {:016x}, limit "
+                        "{}x{}x{} ({} so far)",
+                        dim[0], dim[1], dim[2], pipeline->ShaderHash(), max_dim[0], max_dim[1],
+                        max_dim[2], n);
+        }
         return;
     }
     scheduler.RequestOutsideRenderPassOperationContext();

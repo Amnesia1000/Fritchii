@@ -1517,12 +1517,36 @@ const DrawValues* NextDraw() noexcept {
 }
 } // namespace Detail
 
+namespace {
+std::atomic<bool> g_amd_proprietary{};
+} // Anonymous namespace
+
+void NoteAmdProprietaryDriver() noexcept {
+    g_amd_proprietary.store(true, std::memory_order_relaxed);
+}
+
 void ReadSwitches() {
     if (g.read) {
         return; // boot switches: the first session's values stick
     }
     g.read = true;
     using namespace VideoCore::Nx2Debug;
+    // AMD safe default (2026-11-16): the desktop RX 7900 XT lost the device in game with the one
+    // follower on and ran clean with every FRITCHII_ONEF_* line out (EXP123=1 both times). Never
+    // run on AMD before, no AMD gate in it. Off on AMD's proprietary driver until that loss is
+    // found; FRITCHII_ONEF_AMD=1 keeps it on (tests). RADV and other vendors unchanged.
+    if (g_amd_proprietary.load(std::memory_order_relaxed)) {
+        const char* const keep = std::getenv("FRITCHII_ONEF_AMD");
+        const bool wanted = (std::getenv("FRITCHII_ONEF_LEAN") != nullptr &&
+                             std::getenv("FRITCHII_ONEF_LEAN")[0] == '1') ||
+                            (std::getenv("FRITCHII_ONEF") != nullptr &&
+                             std::getenv("FRITCHII_ONEF")[0] == '1');
+        if (wanted && (keep == nullptr || keep[0] != '1')) {
+            LOG_WARNING(HW_GPU, "One follower: off on AMD's proprietary driver (device losses on "
+                                "an RX 7900 XT with it on); FRITCHII_ONEF_AMD=1 keeps it on");
+            return; // g.on and g.lean stay false: every FRITCHII_ONEF_* switch reads as off
+        }
+    }
     g.lean = SwitchValue(g_onef_lean, "FRITCHII_ONEF_LEAN") == 1;
     // Before E starts (ReadSwitches runs ahead of the back thread): LEAN is always at step 2 or
     // more once it runs, and tracking from boot only marks words the first seed then covers.

@@ -418,6 +418,23 @@ for minutes on small cards. Log: "Depth image WxH (format F) did not fit the dep
 without it (FRITCHII_DEPTH_POOL_RETRY, N so far)". Judge: the two warnings above are gone at the
 market after load; nothing else changes (placement only).
 
+### FRITCHII_GRID_AUDIT
+
+TEST tool, off by default (helper BJ, 2026-11-16). Boot: 1 = every indirect compute dispatch (list
+dispatches, GPU-sized grids) copies the 3 grid words it ran with to host memory, and once that
+submission is done they are checked: "Dispatch grid audit: indirect dispatch of S ran grid XxYxZ
+(over the device limit / y/z past 16 bits) ... N bad of M audited". The host never sees these
+grids before vkCmdDispatchIndirect, so this is the only way to learn whether a bad grid reaches
+the GPU (AMD device losses). Costs a copy and two barriers per indirect dispatch: a diagnostic, not
+for fps runs. Must be 0 bad; any line names the shader to clamp on the GPU next.
+
+### FRITCHII_ONEF_AMD
+
+Boot, off by default (helper BJ, 2026-11-16). On AMD's proprietary Vulkan driver the one follower
+(FRITCHII_ONEF / FRITCHII_ONEF_LEAN) stays off: the desktop RX 7900 XT lost the device in game with
+it on and ran clean with every FRITCHII_ONEF_* line out. Log once: "One follower: off on AMD's
+proprietary driver ...". 1 = keep it on there (tests). RADV, NVIDIA and Intel unchanged.
+
 ### FRITCHII_VRAM_REPORT
 
 TEST tool, off by default (helper BF, 2026-11-16). Live: 1 = every 30 frames the main device-local
