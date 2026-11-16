@@ -7,6 +7,21 @@ rebuilds nothing.
 
 ## Named switches
 
+### FRITCHII_OOT_BYPASS_SAMPLED
+
+TEST, off by default (helper BH, 2026-11-16, port of zortos293/Lichii #1875 by zortos293). Live;
+only matters with Ocarina of Time anti-aliasing at No sharpening (or the forced bypass on GPUs
+that can't build the network). 0 = as before: the copy that replaces the network's output pass
+takes render target 0 of the latest draw with one of three known tonemap shaders. 1 = it copies
+the image the output pass itself samples (cb0 + 0xc0, B10G11R11 or its E5B9G9R9 view), and a
+skipped prepass that no replacement followed runs the network again. Why: the game has a fourth
+tonemap shader (96d6efdbfe52605c, seen in adult Zora's Domain, Lon Lon Ranch and Kakariko houses),
+and there the copy kept an old image: the 3D view froze while the HUD and audio went on, until the
+camera turned (zortos #1688, RADV and NVIDIA). Their tester confirmed the fix. Log: "anti-aliasing
+network bypassed from the sampled image" once, and "the network's output pass was not replaced;
+running the network" once if a frame ended with another output program. Check: No sharpening in
+Zora's Domain facing King Zora, the view must follow the camera.
+
 ### FRITCHII_PROTECT_UNLOCKED
 
 TEST, off by default (helper AK, 2026-11-15, port of zortos293/Lichii #1780 by Reiixan); live,
