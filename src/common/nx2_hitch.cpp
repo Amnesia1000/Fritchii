@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -386,8 +387,17 @@ std::string StallSnapshotLine(long long gap_us) {
     std::string ticks;
     {
         std::scoped_lock lock{g_stall_reporter_mutex};
-        ticks = g_stall_reporter != nullptr ? g_stall_reporter(g_stall_reporter_owner)
-                                            : std::string{"no renderer"};
+        // A diagnostic never takes the game down: the reporter reads the card's timeline
+        // semaphore, which throws when the driver refuses (2026-11-16: a hang report during the
+        // Kakariko boot killed the process on the pulse thread).
+        try {
+            ticks = g_stall_reporter != nullptr ? g_stall_reporter(g_stall_reporter_owner)
+                                                : std::string{"no renderer"};
+        } catch (const std::exception& e) {
+            ticks = fmt::format("unavailable ({})", e.what());
+        } catch (...) {
+            ticks = "unavailable";
+        }
     }
     return fmt::format("Stall snapshot: {:.1f} ms between presents; now: {}; longest in the gap: "
                        "{}; present thread {} (longest acquire to present in the gap {:.1f} ms); "
@@ -475,7 +485,13 @@ void HangTick() {
                  StallOn() ? StallSnapshotLine(gap_us)
                            : std::string{"no stall snapshot (EDEN_NX2_STALL_SNAPSHOT=0)"});
     if (g_hang_hooks.report != nullptr) {
-        g_hang_hooks.report(g_hang_hooks.context);
+        try { // read only diagnostics: never let them end the process
+            g_hang_hooks.report(g_hang_hooks.context);
+        } catch (const std::exception& e) {
+            LOG_CRITICAL(Render, "Hang report: the renderer's part failed ({})", e.what());
+        } catch (...) {
+            LOG_CRITICAL(Render, "Hang report: the renderer's part failed");
+        }
     }
     lock.unlock();
     LogThreadStacks("Hang report", 0);
