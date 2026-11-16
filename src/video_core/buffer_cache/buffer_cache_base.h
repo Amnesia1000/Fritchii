@@ -318,6 +318,15 @@ public:
     /// CPU writes collected but not yet applied (SetPendingCpuWrites).
     [[nodiscard]] Common::RangeSet<DAddr> PendingCpuWriteRanges();
 
+    /// FRITCHII_FENCE_COPY_UNLOCKED: PendingCpuWriteRanges' writes that overlap [begin, end)
+    /// into `out` (cleared first), for questions inside that range only. True if any.
+    bool PendingCpuWritesIn(DAddr begin, DAddr end, Common::RangeSet<DAddr>& out);
+
+    /// FRITCHII_FENCE_COPY_UNLOCKED: WriteDownloadedMemory without the lock (inside a landing
+    /// published by DownloadLanding::PublishUnlocked), its page marks after the bytes.
+    void WriteDownloadedMemoryUnlocked(const Common::RangeSet<DAddr>* cpu_written,
+                                       DAddr device_addr, const u8* data, u64 size);
+
     /// Writes downloaded bytes to guest memory, except over `cpu_written`. Callers take
     /// `cpu_written` inside a VideoCore::DownloadLanding over the bytes and write in it: the CPU
     /// writes collected after it store their bytes once the landing has ended.
@@ -505,6 +514,14 @@ public:
     /// Pop asynchronous downloads
     void PopAsyncFlushes();
     void PopAsyncBuffers();
+
+    /// FRITCHII_FENCE_COPY_UNLOCKED (helper CQ; common/fritchii_lock_census.h): `pops` of
+    /// PopAsyncFlushes for the fencing thread, called without `mutex`. Each pop reads what it
+    /// writes under the lock, lets it go to copy a landing's bytes into guest memory, and takes
+    /// it back to clear the GPU-modified state and mark the download landed (why the result is
+    /// the locked pop's: work/helper_cq_answer.md). `mode` 2 compares guest memory with the
+    /// download after each copy. Fencing thread only.
+    void PopAsyncBuffersUnlocked(size_t pops, int mode, Common::LockCensus::FenceCopyBatch& batch);
 
     /// EDEN_NX2_FENCE_RELEASE_STATS (`mutex` held): what the next PopAsyncFlushes copies to guest
     /// memory (EXP49's read downloads it also lands are not included).
@@ -1593,6 +1610,27 @@ private:
     std::deque<Common::RangeSet<DAddr>> pending_download_ranges;
     PendingCpuWrites pending_cpu_writes;
     std::optional<Async_Buffer> current_buffer;
+
+    /// FRITCHII_FENCE_COPY_UNLOCKED (PopAsyncBuffersUnlocked): the fencing thread's own scratch,
+    /// touched by it alone (with or without the lock).
+    struct UnlockedPiece {
+        DAddr addr;
+        u64 size;
+        const u8* data; ///< In the download's staging memory
+    };
+    std::vector<UnlockedPiece> unlocked_pieces;
+    Common::RangeSet<DAddr> unlocked_cpu_written;
+    Common::RangeSet<DAddr> unlocked_parts;
+    Common::RangeSet<DAddr> unlocked_verify_cpu;
+    Common::RangeSet<DAddr> unlocked_verify_parts;
+    std::vector<u8> unlocked_verify_bytes;
+    std::vector<Common::RangeSet<DAddr>> unlocked_trash_ranges;
+    std::vector<boost::container::small_vector<BufferCopy, 4>> unlocked_trash_copies;
+    void PopOneUnlocked(std::unique_lock<Common::SpinRecursiveMutex>& lock, int mode,
+                        Common::LockCensus::FenceCopyBatch& batch, u64& held_since);
+    void VerifyUnlockedLanding(DAddr landing_begin, DAddr landing_end,
+                               const Common::RangeSet<DAddr>& live,
+                               Common::LockCensus::FenceCopyBatch& batch);
 
     /// EDEN_NX2_EXP49: a DownloadMemoryForRead, its copies, and what is left of them to do once
     /// the host GPU has run them.

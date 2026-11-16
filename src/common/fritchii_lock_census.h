@@ -75,4 +75,53 @@ int ReadFenceYieldE();
 void NoteFencePops(int mode, std::uint64_t pops, std::uint64_t chances, bool last_waited,
                    std::uint64_t yield_ns);
 
+// FRITCHII_FENCE_COPY_UNLOCKED (live, default 0; helper CQ, Kakariko): the fencing thread's buffer
+// pops copy the downloaded bytes into game memory without the buffer cache's lock
+// (BufferCache::PopAsyncBuffersUnlocked; work\helper_cq_answer.md has the ordering argument).
+// Under the lock: the landing, the collected CPU writes and the ranges to write; then the copy
+// alone outside it; then, under the lock again, the GPU-modified ranges cleared and the fence's
+// download marked landed. 1 = on; 2 = on and verify: after each copy, under the lock, the game
+// memory is compared with what the locked pop would have written (mismatches must be 0).
+// Line "Fence copy unlocked" every 10 s from the fencing thread. Not with
+// EDEN_NX2_FENCE_RELEASE_STATS (that path is left as it was).
+inline std::atomic<int> g_fence_copy_unlocked{-1};
+
+/// Reads FRITCHII_FENCE_COPY_UNLOCKED from the environment the first time.
+int ReadFenceCopyUnlocked();
+
+[[nodiscard]] inline int FenceCopyUnlocked() {
+    const int mode = g_fence_copy_unlocked.load(std::memory_order_relaxed);
+    return mode >= 0 ? mode : ReadFenceCopyUnlocked();
+}
+
+/// FRITCHII_FENCE_COPY_UNLOCKED's line: once the switch was on, E's (GPUBack's) contended cache
+/// lock waits that began with the fencing thread holding the lock are timed here
+/// (SpinRecursiveMutex::LockContended), with the switch at 0 too, so both arms of a toggle get
+/// the number.
+inline std::atomic<bool> g_fence_copy_watch{false};
+inline std::atomic<std::thread::id> g_fence_thread{};
+inline std::atomic<std::uint64_t> g_back_behind_fence_ns{0};
+inline std::atomic<std::uint64_t> g_back_behind_fence_waits{0};
+
+/// One batch of the fencing thread's buffer pops, for the line.
+struct FenceCopyBatch {
+    int mode = 0;
+    std::uint64_t pops = 0;
+    std::uint64_t groups_unlocked = 0;  ///< landings copied outside the lock
+    std::uint64_t groups_locked = 0;    ///< small landings copied under it, as before
+    std::uint64_t pieces = 0;           ///< copies made outside the lock
+    std::uint64_t bytes = 0;            ///< their bytes
+    std::uint64_t unlocked_ns = 0;      ///< outside the lock (copies, marks)
+    std::uint64_t relock_ns = 0;        ///< waiting to take the lock back
+    std::uint64_t held_ns = 0;          ///< holding it
+    std::uint64_t holder_waits = 0;     ///< lock holders that waited for a copy outside the lock
+    std::uint64_t holder_wait_ns = 0;
+    std::uint64_t verify_bytes = 0;     ///< 2: bytes compared
+    std::uint64_t verify_bad_bytes = 0; ///< 2: bytes that differ (must be 0)
+    std::uint64_t verify_bad_pieces = 0;
+};
+
+/// The fencing thread, after each batch (any mode once the switch was on): the line.
+void NoteFenceCopy(const FenceCopyBatch& batch);
+
 } // namespace Common::LockCensus

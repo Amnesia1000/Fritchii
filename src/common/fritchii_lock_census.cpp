@@ -389,6 +389,77 @@ void NoteFencePops(int mode, std::uint64_t pops, std::uint64_t chances, bool las
     since = now;
 }
 
+int ReadFenceCopyUnlocked() {
+    const char* const value = std::getenv("FRITCHII_FENCE_COPY_UNLOCKED");
+    if (value != nullptr) {
+        // Set at all (0 too): the line runs from the start, for both arms of a toggle.
+        g_fence_copy_watch.store(true, std::memory_order_relaxed);
+    }
+    int unset = -1;
+    g_fence_copy_unlocked.compare_exchange_strong(
+        unset, value != nullptr ? (std::max)(0, std::atoi(value)) : 0, std::memory_order_relaxed);
+    return g_fence_copy_unlocked.load(std::memory_order_relaxed);
+}
+
+void NoteFenceCopy(const FenceCopyBatch& batch) {
+    // The fencing thread only: plain totals.
+    static FenceCopyBatch totals{};
+    static std::uint64_t batches = 0;
+    static auto since = Clock::now();
+    ++batches;
+    totals.pops += batch.pops;
+    totals.groups_unlocked += batch.groups_unlocked;
+    totals.groups_locked += batch.groups_locked;
+    totals.pieces += batch.pieces;
+    totals.bytes += batch.bytes;
+    totals.unlocked_ns += batch.unlocked_ns;
+    totals.relock_ns += batch.relock_ns;
+    totals.held_ns += batch.held_ns;
+    totals.holder_waits += batch.holder_waits;
+    totals.holder_wait_ns += batch.holder_wait_ns;
+    totals.verify_bytes += batch.verify_bytes;
+    totals.verify_bad_bytes += batch.verify_bad_bytes;
+    totals.verify_bad_pieces += batch.verify_bad_pieces;
+    const auto now = Clock::now();
+    const double seconds = std::chrono::duration<double>(now - since).count();
+    if (seconds < 10.0) {
+        return;
+    }
+    const auto per_s = [seconds](std::uint64_t value) {
+        return static_cast<double>(value) / seconds;
+    };
+    const auto ms_s = [seconds](std::uint64_t ns) {
+        return static_cast<double>(ns) / 1e6 / seconds;
+    };
+    const std::uint64_t behind_ns = g_back_behind_fence_ns.exchange(0, std::memory_order_relaxed);
+    const std::uint64_t behind = g_back_behind_fence_waits.exchange(0, std::memory_order_relaxed);
+    std::string verify;
+    if (batch.mode == 2) {
+        verify = fmt::format("; verify: {:.0f} KB/s compared, {} bytes differ in {} copies "
+                             "(must be 0)",
+                             per_s(totals.verify_bytes) / 1024.0, totals.verify_bad_bytes,
+                             totals.verify_bad_pieces);
+    }
+    LOG_INFO(HW_GPU,
+             "Fence copy unlocked (FRITCHII_FENCE_COPY_UNLOCKED={}) {:.0f} s: pop batches "
+             "{:.0f}/s, pops {:.0f}/s; landings copied outside the lock {:.0f}/s, small ones "
+             "under it {:.0f}/s; copies {:.0f}/s, {:.2f} MB/s, {:.2f} ms/s out of the lock; "
+             "fencing thread held the buffer lock {:.2f} ms/s, waited to take it back {:.2f} "
+             "ms/s; lock holders waited for a copy {:.0f}/s, {:.3f} ms/s; E's cache lock waits "
+             "behind the fencing thread {:.2f} ms/s ({:.0f}/s, {:.1f} us each){}",
+             batch.mode, seconds, per_s(batches), per_s(totals.pops),
+             per_s(totals.groups_unlocked), per_s(totals.groups_locked), per_s(totals.pieces),
+             per_s(totals.bytes) / 1e6, ms_s(totals.unlocked_ns), ms_s(totals.held_ns),
+             ms_s(totals.relock_ns), per_s(totals.holder_waits), ms_s(totals.holder_wait_ns),
+             ms_s(behind_ns), per_s(behind),
+             behind != 0 ? static_cast<double>(behind_ns) / 1e3 / static_cast<double>(behind)
+                         : 0.0,
+             verify);
+    totals = FenceCopyBatch{};
+    batches = 0;
+    since = now;
+}
+
 void NameThread(const char* name) {
     const std::scoped_lock lock{g_threads_mutex};
     ThreadInfo& info = InfoLocked(std::this_thread::get_id());

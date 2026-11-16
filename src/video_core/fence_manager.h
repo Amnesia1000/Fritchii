@@ -466,6 +466,9 @@ private:
         Common::SetCurrentThreadName("GPUFencingThread");
         Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
         Common::SetCurrentThreadToPerformanceCores();
+        // FRITCHII_FENCE_COPY_UNLOCKED's line: E's lock waits behind this thread.
+        Common::LockCensus::g_fence_thread.store(std::this_thread::get_id(),
+                                                 std::memory_order_relaxed);
 
         // Every fence the host GPU has already passed is released together: Switch 2 titles
         // signal thousands a second and the host GPU completes them in bursts, so each cache's
@@ -646,9 +649,25 @@ private:
                             buffer_cache.Nx2DescribeNextPop(landing);
                         },
                         [this] { buffer_cache.PopAsyncFlushes(); });
+                } else if (const int copy_unlocked = Common::LockCensus::FenceCopyUnlocked();
+                           copy_unlocked != 0) {
+                    // FRITCHII_FENCE_COPY_UNLOCKED (helper CQ): the same pops in the same order,
+                    // each landing's copy out of the lock (BufferCache::PopAsyncBuffersUnlocked).
+                    Common::LockCensus::g_fence_copy_watch.store(true, std::memory_order_relaxed);
+                    Common::LockCensus::FenceCopyBatch copy_batch{};
+                    copy_batch.mode = copy_unlocked;
+                    buffer_cache.PopAsyncBuffersUnlocked(buffer_pops, copy_unlocked, copy_batch);
+                    Common::LockCensus::NoteFenceCopy(copy_batch);
                 } else {
                     pop_all(buffer_cache.mutex, buffer_pops,
                             [this] { buffer_cache.PopAsyncFlushes(); });
+                    // Once the switch was on, its line goes on at 0 (E's waits for both arms).
+                    if (Common::LockCensus::g_fence_copy_watch.load(std::memory_order_relaxed))
+                        [[unlikely]] {
+                        Common::LockCensus::FenceCopyBatch copy_batch{};
+                        copy_batch.pops = buffer_pops;
+                        Common::LockCensus::NoteFenceCopy(copy_batch);
+                    }
                 }
             }
             // Queries and operations keep their per-fence order.
