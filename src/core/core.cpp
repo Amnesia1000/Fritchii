@@ -1227,6 +1227,9 @@ void System::NotifyApplicationChanged(u64 program_id) {
 
 void System::ApplySettings() {
     impl->RefreshTime(*this);
+    // FRITCHII_JIT_INLINE_CNTPCT: a changed CPU clock or core speed sync sends counter reads back
+    // to the host call.
+    Core::Timing::RefreshInlineCntpct();
 
     if (IsPoweredOn()) {
         Renderer().RefreshBaseSettings();

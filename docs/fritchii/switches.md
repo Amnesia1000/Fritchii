@@ -235,8 +235,9 @@ leaves the extension off, as before. Why: two AMD testers hit device losses with
 
 ### FRITCHII_SCALED_EXTENT_CAP
 
-TEST, off by default (helper BH, 2026-11-16, port of zortos293/Lichii #1890 by zortos293, still
-open there). Live, for images made after the change. 0 = as before. 1 = the texture cache leaves
+On by default since 2026-11-16 (helper BR; helper BH ported it off, port of zortos293/Lichii
+#1890 by zortos293, still open there). Live, for images made after the change. 0 = as before
+(the A/B and kill switch). 1 (default) = the texture cache leaves
 an image unscaled when its scaled width or height would pass the device's 2D image or framebuffer
 limit (the smallest of the three; 16384 on AMD and RADV, 32768 on NVIDIA). Rescaling is decided
 per render target set, so that whole pass stays native while the rest of the frame scales. Why:
@@ -245,6 +246,15 @@ OoT's sun shadow map is a 12288x12288 D16 depth target; at 1.5x it is 18432 wide
 1.5x/2x on AMD (zortos #1885: semaphore waits for 2 s, then "Device loss occurred" with no fault
 address). NVIDIA keeps scaling that map at 2x, so on NVIDIA the switch changes nothing at those
 scales. Check: an AMD tester at 1.5x enters Castle Town with the switch at 1.
+- Why on by default: it only changes an image whose scaled size is past the device's own
+  limits, which is invalid Vulkan on every driver (no driver has to accept it). At 1x, 1.25x on
+  every card and up to 2x on NVIDIA nothing changes. A scale that does not enlarge images (1x and
+  the downscales) is never refused (idea from bakemono's handoff: without that guard a 0.75x
+  downscale on an 8192-limit device would leave the image native, bigger than scaled).
+- Checked before the cached IsRescalable answer, so changing the scale in game is covered.
+- Log: "Image WxH (format F, N samples) stays at native size: scaled it would be ..., past the
+  device's limit of L (FRITCHII_SCALED_EXTENT_CAP)" (HW_GPU, Info), once per image. At 1.5x/2x on
+  AMD, expect it once for the 12288x12288 D16 sun shadow map.
 
 ### FRITCHII_OOT_BYPASS_SAMPLED
 
@@ -4330,6 +4340,49 @@ instead of mfence. 2 = only the plain loads, 3 = only the DMB change (to split a
   first time a block with an ordered load or a DMB compiles.
 - Our earlier revert (50d9c09292, the Kokiri slab) came with the rest of #161; the slab's likely
   cause is #161's GPU parts, see helper_at_answer.md. Check the Kokiri Forest spot with it on.
+
+### FRITCHII_JIT_INLINE_CNTPCT
+
+FRITCHII_JIT_INLINE_CNTPCT (boot, default 0; helper BR, 2026-11-16, idea from bakemono's handoff
+and Blitchii). x86-64 hosts with the TSC wall clock only (multicore). 1 = a guest CNTPCT_EL0 read
+is computed in the block (`lfence; rdtsc; lfence`, times the wall clock's factor, high 64 bits)
+instead of a host call that saves every live register and goes through CoreTiming::GetClockTicks.
+- Same value, bit for bit: it is WallClock::GetCNTPCT's own sum. The factor is read from memory
+  at every read, and it is 0 while GetClockTicks would differ (CPU clock not Normal, core speed
+  sync, EDEN_NX2_GUEST_THREAD_STATS), so those reads take the host call through a thunk that
+  keeps every register. System::ApplySettings recomputes it, so a CPU clock changed in game goes
+  back to the host call at once.
+- The polling pause is kept: two reads closer than ~1.7 us pause twice, using the same "last read"
+  as the host callback. EDEN_NX2_CNTPCT_PAUSE=0 turns it off inline too.
+- Off by itself when the wall clock is not the TSC (Coffee Lake and older Intel without a crystal
+  frequency: "FRITCHII_JIT_INLINE_CNTPCT: off, the wall clock is not the TSC"), and with guest
+  thread stats on (they count reads in the host callback).
+- Log: "FRITCHII_JIT_INLINE_CNTPCT: guest counter reads computed in the JIT ..." (Core_Timing,
+  Info) once.
+- Expected: less guest-core CPU time per counter read (OoT's waits poll the counter millions of
+  times a second); fps only where the guest cores limit. Blitchii measured it only bundled with
+  the cheap barriers (guest core 4: 750-828 -> 703 ms/s, same fps, GPU-bound laptop).
+- Test: toggle needs a fresh launch (boot switch): market, 2 launches each, compare the guest
+  cores' ms/s and fps; check game speed (cutscene audio sync, Dynamic FPS step) stays the same.
+
+### FRITCHII_HWWAIT
+
+FRITCHII_HWWAIT (boot, default 0; helper BR, 2026-11-16, idea from bakemono's handoff). x86-64
+only, and only where CPUID says the CPU has the instruction and the wall clock is the TSC.
+1 = UMWAIT on Intel CPUs with WAITPKG (Alder Lake and newer client parts, Tremont/Gracemont);
+2 = also MWAITX on AMD (MONITORX). Anything else, or a CPU without it, is today's code.
+- Site: the GPU front's wait for the back (GpuSplit::Backoff, every split drain). Its first phase,
+  16384 PAUSEs, becomes 256 hardware waits of 64 PAUSEs' time each (PAUSE length measured at boot),
+  so the phase lasts as long as before; a store to the position the wait reads first ends it at
+  once. The yield / FrontSleep phase after it is unchanged. UMWAIT uses C0.1 (the fast wake).
+- Not a CPU-time cut in Task Manager (the OS counts the wait as running, like PAUSE); the gain, if
+  any, is power headroom for the busy cores on power-limited laptops, and the SMT sibling gets the
+  core while it waits. Unmeasured: keep it off unless a fixed-power A/B shows no fps or 1% low loss
+  (NoteSiteWait ms/s must not rise).
+- The guest cores' idle poll already has a hardware wait: EXP79 (Common::WaitForFlag, C0.2, MWAITX
+  on AMD, adaptive window). HostTiming's pre-event spin and the Vulkan worker spin are not covered.
+- Log: "FRITCHII_HWWAIT=N: spin waits use UMWAIT (C0.1) | MWAITX | off, this CPU has no usable
+  hardware wait (CPU: WAITPKG yes/no, MONITORX yes/no, TSC clock yes/no)" (Common, Info) once.
 
 ### FRITCHII_JIT_CHAIN
 

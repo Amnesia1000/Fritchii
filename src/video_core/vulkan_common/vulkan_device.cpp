@@ -2759,6 +2759,50 @@ bool Device::MainHeapUsage(u64& usage, u64& budget_bytes) const {
     return true;
 }
 
+void Device::LogMemoryHeaps() const {
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+    budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+    const auto mem_info =
+        physical.GetMemoryProperties(extensions.memory_budget ? &budget : nullptr);
+    const auto& properties = mem_info.memoryProperties;
+    for (u32 heap = 0; heap < properties.memoryHeapCount; ++heap) {
+        const VkMemoryHeap& entry = properties.memoryHeaps[heap];
+        const bool local = (entry.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0;
+        const std::string state =
+            extensions.memory_budget
+                ? fmt::format("driver budget {} MiB, usage {} MiB", budget.heapBudget[heap] >> 20,
+                              budget.heapUsage[heap] >> 20)
+                : std::string{"no budget (no VK_EXT_memory_budget)"};
+        LOG_INFO(Render_Vulkan, "Memory heap {}: {} MiB, {}{}, {}", heap, entry.size >> 20,
+                 local ? "device-local" : "host", heap == main_heap ? " (main heap, images)" : "",
+                 state);
+    }
+    std::string types;
+    for (u32 type = 0; type < properties.memoryTypeCount; ++type) {
+        const VkMemoryPropertyFlags flags = properties.memoryTypes[type].propertyFlags;
+        std::string kind;
+        if ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0) {
+            kind += "local ";
+        }
+        if ((flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
+            kind += "visible ";
+        }
+        if ((flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0) {
+            kind += "coherent ";
+        }
+        if ((flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0) {
+            kind += "cached ";
+        }
+        if (!kind.empty()) {
+            kind.pop_back();
+        }
+        fmt::format_to(std::back_inserter(types), "{}{} heap {} ({})", type == 0 ? "" : "; ",
+                       type, properties.memoryTypes[type].heapIndex,
+                       kind.empty() ? "none" : kind);
+    }
+    LOG_INFO(Render_Vulkan, "Memory types: {}", types);
+}
+
 u64 Device::GetDeviceMemoryBudget() const {
     if (!extensions.memory_budget) {
         return 0;

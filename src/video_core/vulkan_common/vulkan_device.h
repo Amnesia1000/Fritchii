@@ -1237,6 +1237,15 @@ FN_MAX_LIMIT_LIST
     /// at most the EDEN_NX2_VRAM_LIMIT_MIB limit. False without VK_EXT_memory_budget.
     bool MainHeapUsage(u64& usage, u64& budget) const;
 
+    /// The largest device-local heap, where images live.
+    size_t GetMainHeap() const {
+        return main_heap;
+    }
+
+    /// Boot: one line per memory heap (size, kind, the driver's budget and usage) and one line
+    /// with every memory type (flags and heap).
+    void LogMemoryHeaps() const;
+
     u32 GetSetsPerPool() const {
         return sets_per_pool;
     }

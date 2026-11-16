@@ -362,6 +362,8 @@ public:
     RenderPassCache& render_pass_cache;
     DescriptorPool& descriptor_pool;
     ComputePassDescriptorQueue& compute_pass_descriptor_queue;
+    /// GetMaxScaledExtent, read once from the device's limits.
+    u32 max_scaled_extent{};
 
     /// FSR 3.1 in place of a DLSS evaluation (TemporalUpscale), created on first use.
     bool UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageView& input_color,

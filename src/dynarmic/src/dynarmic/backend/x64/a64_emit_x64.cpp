@@ -586,6 +586,7 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
     code.SetPinCallHook(true);
     GenMemory128Accessors();
     GenFastmemFallbacks();
+    GenCntpctFallback();
     GenTerminalHandlers();
     // Fritchii (FRITCHII_JIT_FAR_CODE): 5/8 of the space for blocks, 3/8 for their slow paths.
     if (FarCodeEnabled() && code.GetTotalCodeSize() >= (size_t{64} << 20)) {
@@ -1530,7 +1531,60 @@ void A64EmitX64::EmitA64GetCNTFRQ(A64EmitContext& ctx, IR::Inst* inst) {
     ctx.reg_alloc.DefineValue(code, inst, result);
 }
 
+void A64EmitX64::GenCntpctFallback() {
+    if (!conf.wall_clock_cntpct || conf.inline_cntpct_factor == nullptr) {
+        return;
+    }
+    code.align();
+    cntpct_fallback = code.getCurr();
+    ABI_PushCallerSaveRegistersAndAdjustStackExcept(code, HostLoc::RDX);
+    Devirtualize<&A64::UserCallbacks::GetCNTPCT>(conf.callbacks).EmitCall(code);
+    code.mov(rdx, rax);
+    ABI_PopCallerSaveRegistersAndAdjustStackExcept(code, HostLoc::RDX);
+    code.ret();
+    PerfMapRegister(cntpct_fallback, code.getCurr(), "a64_cntpct_fallback");
+}
+
 void A64EmitX64::EmitA64GetCNTPCT(A64EmitContext& ctx, IR::Inst* inst) {
+    if (cntpct_fallback != nullptr) {
+        // FRITCHII_JIT_INLINE_CNTPCT: WallClock::GetCNTPCT inline, bit for bit:
+        // MultiplyHigh(FencedRDTSC(), factor). The factor is read here at run time, so a
+        // changed CPU clock or core speed sync (factor 0) takes the host call again.
+        ctx.reg_alloc.ScratchGpr(code, HostLoc::RAX);
+        const Xbyak::Reg64 result = ctx.reg_alloc.ScratchGpr(code, HostLoc::RDX);
+        const Xbyak::Reg64 tmp = ctx.reg_alloc.ScratchGpr(code);
+        Xbyak::Label fallback;
+        Xbyak::Label done;
+        code.lfence();
+        code.rdtsc();
+        code.lfence();
+        code.shl(rdx, 32);
+        code.or_(rax, rdx);
+        code.mov(tmp, reinterpret_cast<u64>(conf.inline_cntpct_factor));
+        code.mov(tmp, qword[tmp]);
+        code.test(tmp, tmp);
+        code.jz(fallback, code.T_NEAR);
+        code.mul(tmp);  // rdx:rax = tsc * factor; the counter is rdx
+        if (conf.inline_cntpct_last != nullptr) {
+            // The host callback's polling pause: two reads within spin_ticks pause twice.
+            Xbyak::Label no_pause;
+            code.mov(tmp, reinterpret_cast<u64>(conf.inline_cntpct_last));
+            code.mov(rax, rdx);
+            code.sub(rax, qword[tmp]);
+            code.cmp(rax, static_cast<u32>(conf.inline_cntpct_spin_ticks & 0x7fffffff));
+            code.jae(no_pause);
+            code.pause();
+            code.pause();
+            code.L(no_pause);
+            code.mov(qword[tmp], rdx);
+        }
+        code.jmp(done, code.T_NEAR);
+        code.L(fallback);
+        code.call(cntpct_fallback);
+        code.L(done);
+        ctx.reg_alloc.DefineValue(code, inst, result);
+        return;
+    }
     ctx.reg_alloc.HostCall(code, inst);
     if (!conf.wall_clock_cntpct) {
         code.UpdateTicks();

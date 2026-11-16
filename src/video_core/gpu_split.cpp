@@ -2017,7 +2017,20 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
 }
 
 void GpuSplit::Backoff(u32 spins, u64 target, bool on_engine) {
-    if (spins < 16384) {
+    if (const int hardware_wait = Common::HardwareWaitMode(); hardware_wait != 0) [[unlikely]] {
+        // FRITCHII_HWWAIT: the pause phase as 256 hardware waits of 64 pauses' time each (the
+        // same wall time), on the position the wait reads first; a store to it ends the wait.
+        // A wait that turns on the other position ends at its time limit, like 64 pauses.
+        if (spins < 16384 / 64) {
+            static const u32 slice = Common::PauseCycles() * 64;
+            const std::atomic<u64>& word = on_engine || !two_positions ? consumed : played;
+            const u64 seen = word.load(std::memory_order_acquire);
+            if (seen < target) {
+                Common::HardwareWaitWhileEqual(word, seen, slice);
+            }
+            return;
+        }
+    } else if (spins < 16384) {
         Pause();
         return;
     }

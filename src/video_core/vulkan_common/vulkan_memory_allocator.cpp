@@ -665,6 +665,45 @@ void NoteKillPoolMiss(bool too_big) {
     }
 }
 
+/// The first refusals of a session get the heaps in full: which heap was short, by how much, and
+/// whether VMA follows the driver's budget ("over the memory budget" with 1.1 GB used could not
+/// be explained from the log).
+constexpr u32 RefusalDetailEvents = 4;
+
+/// Every heap's driver usage and budget and VMA's blocks and allocations in it, in MiB.
+std::string HeapBudgetsText(VmaAllocator allocator) {
+    const VkPhysicalDeviceMemoryProperties* properties{};
+    vmaGetMemoryProperties(allocator, &properties);
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets{};
+    vmaGetHeapBudgets(allocator, budgets.data());
+    std::string text;
+    for (u32 heap = 0; heap < properties->memoryHeapCount; ++heap) {
+        const VmaBudget& budget = budgets[heap];
+        fmt::format_to(std::back_inserter(text),
+                       "{}heap {} ({}, {} MiB): usage {} of budget {}, VMA blocks {}, allocations {}",
+                       heap == 0 ? "" : "; ", heap,
+                       (properties->memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0
+                           ? "local"
+                           : "host",
+                       properties->memoryHeaps[heap].size >> 20, budget.usage >> 20,
+                       budget.budget >> 20, budget.statistics.blockBytes >> 20,
+                       budget.statistics.allocationBytes >> 20);
+    }
+    return text;
+}
+
+/// "type T (heap H, flags F)" of an allocation that was made.
+std::string PlacementText(VmaAllocator allocator, u32 memory_type) {
+    const VkPhysicalDeviceMemoryProperties* properties{};
+    vmaGetMemoryProperties(allocator, &properties);
+    if (memory_type >= properties->memoryTypeCount) {
+        return fmt::format("type {}", memory_type);
+    }
+    const VkMemoryType& type = properties->memoryTypes[memory_type];
+    return fmt::format("type {} (heap {}, flags {:#x})", memory_type, type.heapIndex,
+                       static_cast<u32>(type.propertyFlags));
+}
+
 } // Anonymous namespace
 
 bool MemoryAllocator::ImageTimingEnabled() noexcept {
@@ -796,10 +835,29 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
                         ci.extent.width, ci.extent.height, ci.extent.depth, ci.mipLevels,
                         ci.arrayLayers, static_cast<u32>(ci.format));
         }
+        static std::atomic<u32> detailed{};
+        const bool detail = detailed.fetch_add(1, std::memory_order_relaxed) < RefusalDetailEvents;
+        if (detail) {
+            const char* const first_try = kill_pooled                       ? "the colour target pool"
+                                          : first_ci.pool != VK_NULL_HANDLE ? "the depth attachment pool"
+                                                                            : "the default heaps";
+            LOG_WARNING(Render_Vulkan,
+                        "  refused: {} memory, first try in {}, VMA follows the driver budget: "
+                        "{}; {}",
+                        dedicated ? "dedicated" : "block", first_try,
+                        device.CanReportMemoryUsage() ? "yes" : "no (no VK_EXT_memory_budget)",
+                        HeapBudgetsText(allocator));
+        }
         pressure_events.fetch_add(1, std::memory_order_relaxed);
         VmaAllocationCreateInfo relaxed = alloc_ci;
         relaxed.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
         result = vmaCreateImage(allocator, &ci, &relaxed, &handle, &allocation, &alloc_info);
+        if (detail) {
+            LOG_WARNING(Render_Vulkan, "  without the budget check: {}",
+                        result == VK_SUCCESS
+                            ? "placed in " + PlacementText(allocator, alloc_info.memoryType)
+                            : fmt::format("failed ({})", static_cast<int>(result)));
+        }
     }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
         // Still out of device memory: a real image in host memory (slow, but valid) beats one
@@ -813,9 +871,10 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
         if (result == VK_SUCCESS && host_logged++ < 16) {
             LOG_WARNING(Render_Vulkan,
                         "Image {}x{}x{} ({} levels, {} layers, format {}) is out of device memory; "
-                        "placed in host memory",
+                        "placed in host memory, {}",
                         ci.extent.width, ci.extent.height, ci.extent.depth, ci.mipLevels,
-                        ci.arrayLayers, static_cast<u32>(ci.format));
+                        ci.arrayLayers, static_cast<u32>(ci.format),
+                        PlacementText(allocator, alloc_info.memoryType));
         }
     }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
@@ -1009,6 +1068,14 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
             LOG_WARNING(Render_Vulkan,
                         "Buffer of {} KiB (usage {}) over the memory budget: {}", ci.size >> 10,
                         static_cast<u32>(usage), result == VK_SUCCESS ? "made anyway" : "failed");
+            static std::atomic<u32> detailed{};
+            if (detailed.fetch_add(1, std::memory_order_relaxed) < RefusalDetailEvents) {
+                LOG_WARNING(Render_Vulkan, "  {}; {}",
+                            result == VK_SUCCESS
+                                ? "placed in " + PlacementText(allocator, alloc_info.memoryType)
+                                : std::string{"not placed"},
+                            HeapBudgetsText(allocator));
+            }
         }
         vk::Check(result);
     }
