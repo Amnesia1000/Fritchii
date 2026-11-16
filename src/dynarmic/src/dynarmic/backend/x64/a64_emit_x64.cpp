@@ -13,7 +13,9 @@
 #include <exception>
 #include <cctype>
 #include <cstdlib>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <fmt/format.h>
 #include <fmt/ostream.h>
@@ -115,6 +117,47 @@ int A64EmitX64::IndirectCacheMode() {
         return value;
     }();
     return mode;
+}
+
+namespace {
+bool SharedFastmemMarksEnabled() {
+    static const bool enabled = [] {
+        const bool value = EnvSwitch("FRITCHII_JIT_SHARED_FASTMEM_MARKS") != 0;
+        if (value) {
+            LOG_INFO(Core_ARM, "FRITCHII_JIT_SHARED_FASTMEM_MARKS=1: fastmem fault marks shared by every core's JIT");
+        }
+        return value;
+    }();
+    return enabled;
+}
+}  // namespace
+
+std::shared_ptr<SharedFastmemMarks> SharedFastmemMarksFor(const void* fastmem_arena) {
+    if (fastmem_arena == nullptr || !SharedFastmemMarksEnabled()) {
+        return nullptr;
+    }
+    // One set per arena while any JIT on it lives; a later process on the same arena (a game
+    // started again) gets a new one.
+    static std::mutex registry_mutex;
+    static std::unordered_map<const void*, std::weak_ptr<SharedFastmemMarks>> registry;
+    std::scoped_lock lock{registry_mutex};
+    std::weak_ptr<SharedFastmemMarks>& entry = registry[fastmem_arena];
+    if (auto shared = entry.lock()) {
+        return shared;
+    }
+    auto shared = std::make_shared<SharedFastmemMarks>();
+    entry = shared;
+    return shared;
+}
+
+void NoteSharedFastmemMarkUsed(SharedFastmemMarks& shared, unsigned core) {
+    const std::uint64_t used = shared.used_from_other.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((used & (used - 1)) == 0) {
+        LOG_INFO(Core_ARM,
+                 "JIT shared fastmem marks (FRITCHII_JIT_SHARED_FASTMEM_MARKS): {} accesses compiled "
+                 "without fastmem from another core's fault ({} marks; this one on core {})",
+                 used, shared.faults.load(std::memory_order_relaxed), core);
+    }
 }
 
 bool A64EmitX64::OmitFramePointer() {
@@ -411,6 +454,10 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
         , jit_interface{jit_interface} {
     // Fritchii: the per-site caches fall back on the fast dispatch table.
     indirect_cache_mode = conf.HasOptimization(OptimizationFlag::FastDispatch) ? IndirectCacheMode() : 0;
+    // Fritchii (FRITCHII_JIT_SHARED_FASTMEM_MARKS): one marker set per process (fastmem arena).
+    if (conf.fastmem_pointer) {
+        shared_fastmem_marks = SharedFastmemMarksFor(reinterpret_cast<const void*>(*conf.fastmem_pointer));
+    }
     omit_frame_pointer = OmitFramePointer();
     // Fritchii: the debug output between instructions calls out and clobbers the flags.
     flag_branch_mode = conf.very_verbose_debugging_output ? 0 : FlagBranchMode();

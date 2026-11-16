@@ -427,6 +427,24 @@ GPUBack and GPUMem start later). The new causes, shown only when they happened:
 Cost: a cached flag test per compile, staging buffer and upload when off; two clock reads each when
 on. Exact (counting only).
 
+### FRITCHII_JIT_SHARED_FASTMEM_MARKS
+
+TEST, boot, default 0 (helper BO, 2026-11-16; the idea of zortos293/Lichii #1861, which does it on
+the arm64 backend). 1 = the CPU recompiler's fastmem fault marks (an access that faulted on a
+write-protected or read-trapped page is compiled again without fastmem) are one set per process
+instead of one per core. An access that faulted on one core is then compiled without fastmem by
+the other cores the next time they compile that block (on-demand compiles, warm compiles, blocks
+compiled again after a drop or a cache clear), instead of faulting and recompiling there too.
+Blocks another core already compiled with fastmem still fault once each, as before.
+- Exact: a mark only sends that one access to the page table path, never changes a result.
+- Cost: a shared lock around one set lookup per memory access while a block compiles (not while
+  code runs); none when off.
+- Log: "FRITCHII_JIT_SHARED_FASTMEM_MARKS=1: ..." at boot; "JIT shared fastmem marks ...: N
+  accesses compiled without fastmem from another core's fault (M marks ...)" at N = 1, 2, 4, 8 ...
+- Judge with FRITCHII_HITCH_SPLIT=1: "game code dropped by fastmem faults" (blocks) and the
+  "dropped since" recompile time should fall; the hitch score must not rise. Up to 5/6 of the
+  fastmem recompiles of blocks compiled after the first fault (6 cores). Fresh A/B (boot).
+
 ### FRITCHII_JIT_CACHE_MIB
 
 TEST, boot, default 0 = 512 MiB (helper BA, 2026-11-16). 512-1536: the CPU recompiler's code cache
