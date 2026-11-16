@@ -501,12 +501,22 @@ PFN_vkFreeMemory g_real_free_memory{};
 // calls the driver directly.
 PFN_vkMapMemory g_real_map_memory{};
 PFN_vkUnmapMemory g_real_unmap_memory{};
+struct CensusMemory {
+    VkDeviceSize first{};  ///< Size
+    void* second{};        ///< Where VMA mapped it (null: not mapped)
+    bool device_local{};
+    bool host_visible{};
+};
 std::mutex g_census_map_mutex;
-std::unordered_map<VkDeviceMemory, std::pair<VkDeviceSize, void*>> g_census_maps;
+std::unordered_map<VkDeviceMemory, CensusMemory> g_census_maps;
 
-void CensusNoteAllocation(VkDeviceMemory memory, VkDeviceSize size) {
+void CensusNoteAllocation(VmaAllocator allocator, uint32_t type, VkDeviceMemory memory,
+                          VkDeviceSize size) {
+    VkMemoryPropertyFlags flags{};
+    vmaGetMemoryTypeProperties(allocator, type, &flags);
     std::scoped_lock lock{g_census_map_mutex};
-    g_census_maps[memory] = {size, nullptr};
+    g_census_maps[memory] = {size, nullptr, (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0,
+                             (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0};
 }
 
 void CensusForgetAllocation(VkDeviceMemory memory) {
@@ -517,6 +527,21 @@ void CensusForgetAllocation(VkDeviceMemory memory) {
         }
         g_census_maps.erase(it);
     }
+}
+
+/// The census's size matches: sizes of VMA's live device memory of one kind. 16-64 MiB private
+/// allocations (315, 8.4 GB committed, 1.35 GB resident at the market, 2026-11-16) looked like
+/// the driver's copies of device-local memory (VMA's 32 MiB blocks and dedicated images).
+std::vector<u64> CensusMemorySizes(bool device_local_only) {
+    std::vector<u64> sizes;
+    std::scoped_lock lock{g_census_map_mutex};
+    for (const auto& [memory, entry] : g_census_maps) {
+        if (device_local_only ? (entry.device_local && !entry.host_visible)
+                              : (entry.host_visible && entry.second == nullptr)) {
+            sizes.push_back(entry.first);
+        }
+    }
+    return sizes;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL CensusMapMemory(VkDevice device, VkDeviceMemory memory,
@@ -1032,6 +1057,10 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         g_real_unmap_memory = dld.vkUnmapMemory;
         functions.vkMapMemory = CensusMapMemory;
         functions.vkUnmapMemory = CensusUnmapMemory;
+        Common::MemCensus::SetSizeSource("device-local memory (driver copy?)",
+                                         [] { return CensusMemorySizes(true); });
+        Common::MemCensus::SetSizeSource("host-visible memory not mapped",
+                                         [] { return CensusMemorySizes(false); });
     }
     // EDEN_NX2_VMA_NO_PREFER_DEDICATED (boot, default on, 0 = off; ported;
     // with 32 MiB blocks market A/B 2026-11-11: off 41.4/40.3, on 41.5/42.8 fps,
@@ -1101,11 +1130,11 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     // memory) for the "Churn (600 frames)" line.
     // With FRITCHII_MEM_CENSUS they also note each memory's size for the census's map tags.
     static const VmaDeviceMemoryCallbacks churn_callbacks{
-        .pfnAllocate = [](VmaAllocator, uint32_t, VkDeviceMemory memory, VkDeviceSize size,
-                          void*) {
+        .pfnAllocate = [](VmaAllocator allocator, uint32_t type, VkDeviceMemory memory,
+                          VkDeviceSize size, void*) {
             VideoCommon::Churn::Add(VideoCommon::Churn::DeviceAllocations);
             if (g_real_map_memory != nullptr) {
-                CensusNoteAllocation(memory, size);
+                CensusNoteAllocation(allocator, type, memory, size);
             }
         },
         .pfnFree = [](VmaAllocator, uint32_t, VkDeviceMemory memory, VkDeviceSize, void*) {

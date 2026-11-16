@@ -5,6 +5,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "common/common_types.h"
 
@@ -60,6 +61,11 @@ HeapUsage SampleHeapUsage();
 /// The last SampleHeapUsage result (zeros before the first).
 [[nodiscard]] HeapUsage LastHeapUsage();
 
+/// Committed memory of zeros that takes RAM only where it is touched (VirtualAlloc, anonymous
+/// mmap); null on failure. For big tables mostly left zero.
+[[nodiscard]] void* AllocateZeroPages(u64 bytes);
+void FreeZeroPages(void* memory, u64 bytes);
+
 /// FRITCHII_MEM_CENSUS (boot, default 0; docs/fritchii/switches.md): every 30 s, and whenever the
 /// working set climbs 512 MiB past the last census (a load peak), walks this process's address
 /// space (VirtualQuery and one working set query on Windows, /proc/self/smaps on Linux) and logs
@@ -75,6 +81,11 @@ void Tag(const char* name, const void* base, u64 size);
 void Untag(const void* base);
 /// Text the census adds to its log (guest residency, JIT compiles); called on the census thread.
 void SetGuestSampler(std::function<std::string()> sampler);
+/// Sizes of memory some library allocates where the census can't see its address (the driver's
+/// copies of Vulkan device memory): private allocations of the same size (64 KiB granules) are
+/// counted under `label` ("size match"). `label` must be a string literal. Called on the census
+/// thread; null removes it.
+void SetSizeSource(const char* label, std::function<std::vector<u64>()> source);
 /// Starts the census thread when Mode() is not 0 (once per Start/Stop pair).
 void Start();
 /// Stops and joins it (before what the sampler reads goes away).

@@ -81,6 +81,33 @@ KiB per pipeline: the 0.45 MB in the memory lines is an estimate). Costs: the re
 holds the working set lock while it runs (a Hitch line shows it as "memory sample"); read the fps
 with the switch off.
 
+Added 2026-11-16 (helper BE, after the first census run, b4-census-market-log): the first line also
+names the Windows heaps' further segments ("heap segments CRT a/b (n), other heaps"; read from the
+segment header, signature 0xffeeffee: the CRT heap grows in segments up to 1 GiB reservations,
+which the first run listed as the two ~1 GiB "rw" regions), "heap big blocks" (heap blocks over
+~508 KiB, each in an allocation of its own: read from its size header; the 8 largest are listed in
+the private line), and "size matches": private allocations whose size (64 KiB granules) equals a
+live VMA memory object's, under "device-local memory (driver copy?)" and "host-visible memory not
+mapped" (the 315 private 16-64 MiB reservations of the first run, 8.4 GB committed, looked like the
+driver's own copies of device-local memory: VMA's 32 MiB blocks and dedicated images). New tags:
+"guest thread stacks" (the guest threads' fiber stacks, 2 MiB each), "GPU page entries" and "GPU big
+page entries" (Tegra::MemoryManager's tables per GPU address space). 4 = as 1, and once, at the
+first census, a walk of every block of the CRT heap ("CRT heap walk": busy blocks by power-of-two
+size, and the 16 exact sizes holding the most bytes, so owners can be told apart by block size).
+The walk holds the CRT heap's lock: every thread that allocates waits for it (~0.3-1 s); one
+hitch, early in the run.
+
+### FRITCHII_RAM_GPU_ENTRIES
+
+TEST, off by default (helper BE, 2026-11-16). Boot. Each GPU address space (Tegra::MemoryManager)
+keeps its small-page entry words, 2 bits per 4 KiB page: 64 MiB for a 40-bit space, made as a
+zero-filled std::vector, so all of it was resident (the first census run: two 64 MiB allocations,
+64/64 MiB). With 1 the words come from zero pages the host fills in only where they are touched
+(VirtualAlloc, anonymous mmap; the vector if that fails). Same contents, same accesses. Expected:
+~60 MiB less resident per address space (~120 MiB at the market, two spaces), minus the few MiB
+of pages the game's GPU mappings touch. Judge: the census tag "GPU page entries" (resident) and
+the private working set; nothing else changes.
+
 ### FRITCHII_JIT_WARM_CORES
 
 TEST, off by default (helper BE, 2026-11-16). Boot, a core mask (hex with 0x, e.g. 0x3 = cores 0
