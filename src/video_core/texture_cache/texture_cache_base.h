@@ -53,6 +53,7 @@
 #include "video_core/texture_cache/image_base.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view_base.h"
+#include "video_core/texture_cache/lost_contents.h"
 #include "video_core/texture_cache/render_targets.h"
 #include "video_core/texture_cache/types.h"
 #include "video_core/textures/texture.h"
@@ -1444,6 +1445,80 @@ private:
     u64 tc_stale_skips{};        ///< Uploads skipped (last 600 frames)
     u64 tc_stale_skip_bytes{};
     u64 tc_stale_gpu_written{};  ///< Stale but buffer-written pages: uploaded after all
+    /// Some page of [addr, addr + size) is marked stale.
+    [[nodiscard]] bool IsAnyStale(DAddr addr, size_t size) const;
+
+    /// Lost contents (the dialogue text corruption, zortos293/Lichii #1310): an image made where
+    /// a GPU-written image was dropped without a write-back starts with bytes that are not the
+    /// GPU's: undefined device memory (the stale skip; with the EXP42 pool, another image's
+    /// texels) or guest bytes older than the GPU's writes. Harmless when the game overwrites it
+    /// whole; corruption on screen when it is sampled first. Counted per image at its first
+    /// sampled use, with the drop that left the memory stale.
+    enum LostBits : u8 {
+        LostSkipped = 1,  ///< Upload skipped as all stale (undefined unless FRITCHII_STALE_ZERO)
+        LostUploaded = 2, ///< Uploaded guest bytes some of which a dropped image left stale
+        LostZeroed = 4,   ///< FRITCHII_STALE_ZERO cleared it instead of leaving it undefined
+        LostDrawn = 8,    ///< Drawn into since without a clear of the whole image
+    };
+    /// The last GPU-written images dropped without a write-back (MarkStale), for attribution.
+    struct StaleDrop {
+        DAddr cpu_addr;
+        u64 size;
+        GPUVAddr gpu_addr;
+        u64 frame;
+        u32 format;
+        u32 width;
+        u32 height;
+        u8 reason;   ///< DeleteReason, or LostReasonRelocate
+        u8 guard;    ///< The image's relocation_guard_noted
+    };
+    static constexpr u8 LostReasonRelocate = 0x40;
+    static constexpr size_t StaleDropRing = 1024;
+    std::array<StaleDrop, StaleDropRing> stale_drops{};
+    size_t stale_drop_next{};
+    size_t stale_drop_count{};
+    bool marking_relocation{};
+    struct LostContentStats {
+        u64 made_skipped{};      ///< Images whose upload the stale skip dropped
+        u64 made_zeroed{};       ///< Of them, cleared to zero (FRITCHII_STALE_ZERO)
+        u64 made_uploaded{};     ///< Images uploaded over stale pages (some or all)
+        u64 overwritten{};       ///< Cleared whole before any sampled use: harmless
+        u64 sampled_undrawn{};   ///< Sampled before anything drew into them
+        u64 sampled_drawn{};     ///< Sampled after draws that did not clear them whole
+        u64 sampled_bytes{};
+        std::array<u64, 10> sampled_by_reason{}; ///< DeleteReason (8 = relocation, 9 = unknown)
+        u64 sampled_guarded{};   ///< Of the sampled: the dropped image had been read in a later frame
+        u64 writebacks{};        ///< FRITCHII_LOST_WRITEBACK: bad overlaps written back
+        u64 writeback_skipped_newer{}; ///< Not written back: a newer write-back owns its bytes
+        u64 sweeps_kept{};       ///< FRITCHII_LOST_WRITEBACK: kept by the sweeps for the collector
+        u64 logged{};
+        u64 last_log_ns{};
+    } lost_stats;
+    /// The drop that left [addr, addr + size) stale, newest first (nullptr: none recorded).
+    [[nodiscard]] const StaleDrop* FindStaleDrop(DAddr addr, size_t size) const;
+    void RecordStaleDrop(const ImageBase& image);
+    /// FRITCHII_STALE_ZERO: clears an image whose upload the stale skip dropped to zero (every
+    /// level and layer) instead of leaving it undefined; false where it cannot (then undefined).
+    bool ClearLostToZero(Image& image);
+    /// PrepareImage: counts a lost-contents image's first sampled use (or its whole overwrite).
+    void NoteLostContents(ImageBase& image, bool is_modification, bool invalidate);
+    /// The 10 s "Lost contents" line (TickFrame), when anything happened.
+    void LogLostContents();
+    /// FRITCHII_LOST_WRITEBACK: a GPU-written image read in a later frame than it was written
+    /// (the dialogue text target), so dropping its contents can show on screen.
+    [[nodiscard]] bool KeepLostContents(const ImageBase& image) const;
+    /// Recent collector write-backs (device range, the image's modification_tick): an older
+    /// image's write-back must not land over a newer one's bytes.
+    struct RecentWriteback {
+        DAddr cpu_addr;
+        u64 size;
+        u64 modification;
+    };
+    static constexpr size_t RecentWritebackRing = 256;
+    std::array<RecentWriteback, RecentWritebackRing> recent_writebacks{};
+    size_t recent_writeback_next{};
+    void NoteWriteback(const ImageBase& image);
+    [[nodiscard]] bool NewerWritebackOver(const ImageBase& image) const;
 
     /// FRITCHII_ZERO_UPLOAD counters (the 10 s line).
     struct ZeroUploadStats {
@@ -1574,6 +1649,7 @@ private:
         u64 staging_bytes;
         u64 memory_bytes;      ///< device memory counted as freed while queued
         bool cpu_modified;     ///< the image was CpuModified then (a CPU write since drops it)
+        bool bad_overlap;      ///< FRITCHII_LOST_WRITEBACK: refused landings delete it as before
     };
     std::deque<CollectDownload> collect_downloads;
     u64 collect_download_staging{};

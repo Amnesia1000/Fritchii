@@ -216,6 +216,18 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             return false;
         }
         must_download = IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap);
+        // FRITCHII_LOST_WRITEBACK (zortos293/Lichii #1501's idea): a bad overlap whose contents
+        // the game reads in later frames is written back, as any other GPU-written image, unless
+        // a newer write-back owns some of its bytes. Dropped, the next image there started with
+        // other memory's bytes (the dialogue text corruption, #1310).
+        if (!must_download && True(image.flags & ImageFlagBits::BadOverlap) &&
+            IsDownloadable(image) && KeepLostContents(image)) {
+            if (NewerWritebackOver(image)) {
+                ++lost_stats.writeback_skipped_newer;
+            } else {
+                must_download = true;
+            }
+        }
         return !((!aggressive_mode && !evict_old_costly &&
                   True(image.flags & ImageFlagBits::CostlyLoad)) ||
                  (!high_priority_mode && must_download));
@@ -290,6 +302,8 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
                 DropCollectDownloadsIn(image.cpu_addr, image.guest_size_bytes);
                 SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);
                 ++gc_download_deletes;
+                NoteWriteback(image); // FRITCHII_LOST_WRITEBACK's order check
+                lost_stats.writebacks += True(image.flags & ImageFlagBits::BadOverlap) ? 1 : 0;
                 unmap_stats.downloads += image.unmapped_tick != 0 ? 1 : 0;
                 // Guest memory holds the GPU's data now (DeleteImage must not mark it stale).
                 image.flags &= ~ImageFlagBits::GpuModified;
@@ -446,6 +460,7 @@ bool TextureCache<P>::QueueCollectDownload(ImageId image_id) {
             .staging_bytes = staging_bytes,
             .memory_bytes = memory_bytes,
             .cpu_modified = True(image.flags & ImageFlagBits::CpuModified),
+            .bad_overlap = True(image.flags & ImageFlagBits::BadOverlap),
         });
         image.flags |= ImageFlagBits::CollectPending;
         collect_download_staging += staging_bytes;
@@ -549,6 +564,22 @@ void TextureCache<P>::LandCollectDownloads() {
                 }
                 written = true;
                 ++collect_stats.dropped_under;
+                if (entry.bad_overlap) {
+                    // FRITCHII_LOST_WRITEBACK: newer bytes in its memory now; deleted without the
+                    // write-back, as the collector deleted bad overlaps before (queued again, it
+                    // would download every pass).
+                    const ImageId image_id = entry.image_id;
+                    DropCollectDownload(i);
+                    ++collect_stats.dropped_written;
+                    MarkStale(image); // before UntrackImage (see MarkStale)
+                    if (True(image.flags & ImageFlagBits::Tracked)) {
+                        UntrackImage(image, image_id);
+                    }
+                    ++gc_deletes;
+                    UnregisterImage(image_id);
+                    DeleteImage(image_id, image.scale_tick > frame_tick + 5);
+                    continue;
+                }
             }
             if (written) {
                 DropCollectDownload(i);
@@ -579,6 +610,8 @@ void TextureCache<P>::LandCollectDownloads() {
             SwizzleImage(*gpu_memory, image.gpu_addr, image.info, entry.copies,
                          entry.map.mapped_span, swizzle_data_buffer);
             ++collect_stats.landed;
+            NoteWriteback(image); // FRITCHII_LOST_WRITEBACK's order check
+            lost_stats.writebacks += entry.bad_overlap ? 1 : 0;
             collect_stats.landed_under += landed_under ? 1 : 0;
             collect_stats.land_frames += frame_tick - entry.frame;
             unmap_stats.downloads += image.unmapped_tick != 0 ? 1 : 0;
@@ -607,6 +640,9 @@ void TextureCache<P>::UpdateStaleTracking(u64 run_begin, u64 run_pages, s32 delt
 
 template <class P>
 void TextureCache<P>::MarkStale(const ImageBase& image) {
+    if (True(image.flags & ImageFlagBits::GpuModified)) {
+        RecordStaleDrop(image); // the lost contents counter's attribution
+    }
     if (!TcSkipStale() || False(image.flags & ImageFlagBits::GpuModified) ||
         True(image.flags & (ImageFlagBits::Sparse | ImageFlagBits::Unbacked)) ||
         image.guest_size_bytes == 0) {
@@ -734,6 +770,199 @@ bool TextureCache<P>::IsAllStale(DAddr addr, size_t size) const {
 }
 
 template <class P>
+bool TextureCache<P>::IsAnyStale(DAddr addr, size_t size) const {
+    if (stale_page_count == 0 || size == 0) {
+        return false;
+    }
+    const u64 first = addr >> STALE_PAGE_BITS;
+    const u64 end = (std::min<u64>)((addr + size + (u64{1} << STALE_PAGE_BITS) - 1) >>
+                                        STALE_PAGE_BITS,
+                                    stale_bits.size() * 64);
+    for (u64 page = first; page < end;) {
+        const u64 word = stale_bits[page / 64];
+        if (page % 64 == 0 && page + 64 <= end) {
+            if (word != 0) {
+                return true;
+            }
+            page += 64;
+            continue;
+        }
+        if (((word >> (page % 64)) & 1) != 0) {
+            return true;
+        }
+        ++page;
+    }
+    return false;
+}
+
+template <class P>
+void TextureCache<P>::RecordStaleDrop(const ImageBase& image) {
+    if (image.guest_size_bytes == 0 || True(image.flags & ImageFlagBits::Sparse)) {
+        return;
+    }
+    // DeleteImage marks again what its caller just marked: one entry per drop.
+    if (stale_drop_count != 0) {
+        const StaleDrop& last = stale_drops[(stale_drop_next + StaleDropRing - 1) % StaleDropRing];
+        if (last.cpu_addr == image.cpu_addr && last.size == image.guest_size_bytes &&
+            last.frame == frame_tick) {
+            return;
+        }
+    }
+    stale_drops[stale_drop_next] = StaleDrop{
+        .cpu_addr = image.cpu_addr,
+        .size = image.guest_size_bytes,
+        .gpu_addr = image.gpu_addr,
+        .frame = frame_tick,
+        .format = static_cast<u32>(image.info.format),
+        .width = image.info.size.width,
+        .height = image.info.size.height,
+        .reason = marking_relocation ? LostReasonRelocate : static_cast<u8>(delete_reason),
+        .guard = image.relocation_guard_noted,
+    };
+    stale_drop_next = (stale_drop_next + 1) % StaleDropRing;
+    stale_drop_count = (std::min)(stale_drop_count + 1, StaleDropRing);
+}
+
+template <class P>
+auto TextureCache<P>::FindStaleDrop(DAddr addr, size_t size) const -> const StaleDrop* {
+    // A join copied its overlaps into the new image before deleting them: another drop there,
+    // if any, is the one that lost data.
+    const StaleDrop* join = nullptr;
+    for (size_t i = 0; i < stale_drop_count; ++i) {
+        const StaleDrop& drop =
+            stale_drops[(stale_drop_next + StaleDropRing - 1 - i) % StaleDropRing];
+        if (drop.cpu_addr < addr + size && addr < drop.cpu_addr + drop.size) {
+            if (drop.reason != static_cast<u8>(DeleteReason::Join)) {
+                return &drop;
+            }
+            join = join != nullptr ? join : &drop;
+        }
+    }
+    return join;
+}
+
+template <class P>
+void TextureCache<P>::NoteLostContents(ImageBase& image, bool is_modification, bool invalidate) {
+    LostContentStats& s = lost_stats;
+    if (invalidate) {
+        // Overwritten whole (a full clear, a copy over all of it): nothing lost shows.
+        ++s.overwritten;
+        image.lost_contents = 0;
+        return;
+    }
+    if (is_modification) {
+        image.lost_contents |= LostDrawn;
+        return;
+    }
+    const u8 bits = image.lost_contents;
+    image.lost_contents = 0; // counted once
+    ++((bits & LostDrawn) != 0 ? s.sampled_drawn : s.sampled_undrawn);
+    s.sampled_bytes += image.guest_size_bytes;
+    const StaleDrop* const drop = FindStaleDrop(image.cpu_addr, image.guest_size_bytes);
+    const size_t reason = drop == nullptr                         ? 9
+                          : drop->reason == LostReasonRelocate     ? 8
+                          : (std::min<size_t>)(drop->reason, 7);
+    ++s.sampled_by_reason[reason];
+    if (drop != nullptr && (drop->guard & (GuardSampled | GuardLoaded)) != 0) {
+        ++s.sampled_guarded;
+    }
+    if (s.logged < 40) {
+        ++s.logged;
+        static constexpr std::array<const char*, 10> names{
+            "other",       "garbage collect", "cold sweep",       "unmap",      "join",
+            "slot retire", "unmap sweep",     "superseded sweep", "relocation", "not recorded"};
+        LOG_WARNING(HW_GPU,
+                    "Lost contents sampled: format {} {}x{} levels {} at {:#x} ({} KiB), {}{}{}; "
+                    "the memory's GPU data was dropped by: {} (format {} {}x{} at {:#x}, {} "
+                    "frames ago, guard {:#x})",
+                    static_cast<u32>(image.info.format), image.info.size.width,
+                    image.info.size.height, image.info.resources.levels, image.gpu_addr,
+                    image.guest_size_bytes >> 10,
+                    (bits & LostSkipped) != 0 ? "upload skipped as stale" : "stale guest bytes uploaded",
+                    (bits & LostZeroed) != 0 ? ", cleared to zero" : "",
+                    (bits & LostDrawn) != 0 ? ", drawn into without a full clear" : ", not drawn into",
+                    names[reason], drop ? drop->format : 0u, drop ? drop->width : 0u,
+                    drop ? drop->height : 0u, drop ? drop->gpu_addr : GPUVAddr{0},
+                    drop ? frame_tick - drop->frame : 0, drop ? drop->guard : u8{0});
+    }
+}
+
+template <class P>
+void TextureCache<P>::LogLostContents() {
+    LostContentStats& s = lost_stats;
+    const u64 now = Common::Nx2Hitch::NowNs();
+    if (s.last_log_ns == 0) {
+        s.last_log_ns = now;
+        return;
+    }
+    if (now - s.last_log_ns < 10'000'000'000) {
+        return;
+    }
+    s.last_log_ns = now;
+    const u64 sampled = s.sampled_undrawn + s.sampled_drawn;
+    if (s.made_skipped + s.made_uploaded + sampled + s.writebacks + s.sweeps_kept != 0) {
+        const auto& r = s.sampled_by_reason;
+        LOG_INFO(HW_GPU,
+                 "Lost contents in 10 s (FRITCHII_STALE_ZERO={}, FRITCHII_LOST_WRITEBACK={}): "
+                 "images made over memory whose GPU data was dropped: {} upload skipped ({} "
+                 "cleared to zero), {} uploaded stale guest bytes; {} overwritten whole first; "
+                 "SAMPLED with lost contents: {} ({} not drawn into, {} drawn over; {} KiB; {} "
+                 "were read in a later frame before the drop) by drop: collector {}, cold sweep "
+                 "{}, superseded sweep {}, slot retire {}, join {}, relocation {}, unmap {}/{}, "
+                 "other {}, not recorded {}; write-backs {} ({} skipped under newer), kept by "
+                 "the sweeps {}",
+                 VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_stale_zero,
+                                                  "FRITCHII_STALE_ZERO", 1),
+                 VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_lost_writeback,
+                                                  "FRITCHII_LOST_WRITEBACK"),
+                 s.made_skipped, s.made_zeroed, s.made_uploaded, s.overwritten, sampled,
+                 s.sampled_undrawn, s.sampled_drawn, s.sampled_bytes >> 10, s.sampled_guarded,
+                 r[1], r[2], r[7], r[5], r[4], r[8], r[3], r[6], r[0], r[9], s.writebacks,
+                 s.writeback_skipped_newer, s.sweeps_kept);
+    }
+    const u64 last = s.last_log_ns;
+    const u64 logged = s.logged;
+    s = {};
+    s.last_log_ns = last;
+    s.logged = logged;
+}
+
+template <class P>
+bool TextureCache<P>::KeepLostContents(const ImageBase& image) const {
+    const int mode = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_lost_writeback,
+                                                      "FRITCHII_LOST_WRITEBACK");
+    if (mode <= 0 || False(image.flags & ImageFlagBits::GpuModified)) {
+        return false;
+    }
+    // 1: read in a later frame than written (sampled, or drawn over without a clear): contents
+    // the game keeps, as the dialogue box text target. 2: every GPU-written image (a test of the
+    // cause; downloads everything the collector and the sweeps would drop).
+    return mode >= 2 || (image.relocation_guard_noted & (GuardSampled | GuardLoaded)) != 0;
+}
+
+template <class P>
+void TextureCache<P>::NoteWriteback(const ImageBase& image) {
+    recent_writebacks[recent_writeback_next] = RecentWriteback{
+        .cpu_addr = image.cpu_addr,
+        .size = image.guest_size_bytes,
+        .modification = image.modification_tick,
+    };
+    recent_writeback_next = (recent_writeback_next + 1) % RecentWritebackRing;
+}
+
+template <class P>
+bool TextureCache<P>::NewerWritebackOver(const ImageBase& image) const {
+    for (const RecentWriteback& w : recent_writebacks) {
+        if (w.size != 0 && w.modification > image.modification_tick &&
+            w.cpu_addr < image.cpu_addr + image.guest_size_bytes &&
+            image.cpu_addr < w.cpu_addr + w.size) {
+            return true;
+        }
+    }
+    return false;
+}
+
+template <class P>
 u64 TextureCache<P>::UncountedDeviceBytes() const {
     // The same subtractions TickFrame makes from the driver's usage.
     u64 bytes = std::accumulate(sentenced_image_bytes.begin(), sentenced_image_bytes.end(),
@@ -826,6 +1055,7 @@ void TextureCache<P>::TickFrame() {
         }
     }
     LogZeroUploads();
+    LogLostContents();
     // EXP121: before the usage is read below, so landed images leave the queued bytes.
     if (!collect_downloads.empty()) {
         LandCollectDownloads();
@@ -1547,6 +1777,10 @@ void TextureCache<P>::SweepSuperseded() {
             ++s.kept_busy;
             continue;
         }
+        if (KeepLostContents(image)) { // FRITCHII_LOST_WRITEBACK: the collector writes it back
+            ++lost_stats.sweeps_kept;
+            continue;
+        }
         s.deleted_bytes += ImageMemoryBytes(image);
         if (superseded_swept.size() >= 65536) {
             superseded_swept.clear(); // the oldest are the least likely to be read again
@@ -1739,6 +1973,13 @@ void TextureCache<P>::SweepColdImages() {
                 break;
             }
             ++index; // FRITCHII_COVERED_RETIRE: the rest still get their coverage checks
+            continue;
+        }
+        // FRITCHII_LOST_WRITEBACK: contents a later frame reads go to the collector, which
+        // writes them back.
+        if (KeepLostContents(image)) {
+            ++lost_stats.sweeps_kept;
+            drop();
             continue;
         }
         // As the collector deletes an image it does not download.
@@ -4010,10 +4251,25 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         if (!Tegra::Nx2MayBeGpuWritten(image.cpu_addr, image.guest_size_bytes)) {
             ++tc_stale_skips;
             tc_stale_skip_bytes += image.guest_size_bytes;
-            runtime.TransitionImageLayout(image);
+            ++lost_stats.made_skipped;
+            image.lost_contents = LostSkipped;
+            // FRITCHII_STALE_ZERO (live, default 1): zero instead of undefined. A new image's
+            // memory often held another image (the EXP42 pool hands out deleted targets'
+            // VkImages): where the game samples before drawing it whole, that image's texels
+            // showed (other text over a dialogue box, zortos293/Lichii #1310).
+            if (ClearLostToZero(image)) {
+                ++lost_stats.made_zeroed;
+                image.lost_contents |= LostZeroed;
+            } else {
+                runtime.TransitionImageLayout(image);
+            }
             return;
         }
         ++tc_stale_gpu_written;
+    } else if (stale_page_count != 0 && IsAnyStale(image.cpu_addr, image.guest_size_bytes)) {
+        // The upload below brings guest bytes older than the dropped image's GPU writes.
+        ++lost_stats.made_uploaded;
+        image.lost_contents = LostUploaded;
     }
 
     if (True(image.flags & ImageFlagBits::SparseLayers)) {
@@ -4260,6 +4516,31 @@ bool TextureCache<P>::TryZeroUpload(Image& image) {
             return false; // 2: count only, the upload runs as before
         }
         image.ClearToZero();
+        return true;
+    }
+}
+
+template <class P>
+bool TextureCache<P>::ClearLostToZero(Image& image) {
+    if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_stale_zero, "FRITCHII_STALE_ZERO",
+                                         1) <= 0) {
+        return false;
+    }
+    if constexpr (!requires { image.ClearToZero(true); }) {
+        return false;
+    } else {
+        // Formats a transfer clear can write (uncompressed, not converted), single-sample.
+        constexpr ImageFlagBits excluded =
+            ImageFlagBits::Converted | ImageFlagBits::Sparse | ImageFlagBits::SparseLayers |
+            ImageFlagBits::SparseTiles | ImageFlagBits::Unbacked |
+            ImageFlagBits::AsynchronousDecode | ImageFlagBits::IsDecoding;
+        if (True(image.flags & excluded) || image.info.type == ImageType::Buffer ||
+            image.info.num_samples != 1 ||
+            VideoCore::Surface::DefaultBlockWidth(image.info.format) != 1 ||
+            VideoCore::Surface::DefaultBlockHeight(image.info.format) != 1) {
+            return false;
+        }
+        image.ClearToZero(true); // the image in use, scaled or not
         return true;
     }
 }
@@ -7260,7 +7541,9 @@ template <class P>
 void TextureCache<P>::RelocateImage(ImageId image_id, GPUVAddr gpu_addr, DAddr cpu_addr) {
     Image& image = slot_images[image_id];
     // 1. The GPU's data at the old address is lost, as when the collector deletes the image.
+    marking_relocation = true; // the lost contents counter's attribution
     MarkStale(image); // before UntrackImage (see MarkStale)
+    marking_relocation = false;
     if (True(image.flags & ImageFlagBits::Tracked)) {
         UntrackImage(image, image_id);
     }
@@ -7308,6 +7591,7 @@ void TextureCache<P>::RelocateImage(ImageId image_id, GPUVAddr gpu_addr, DAddr c
     image.last_write_frame = ~u64{0};
     image.write_streak = 0;
     image.relocation_guard_noted = 0;
+    image.lost_contents = 0;
     // A new target to the asynchronous shaders' skip rule too: its draws wait until it was
     // cleared at this address in two render frames (ClassifyDrawTargets).
     image.last_clear_frame = ~u64{0};
@@ -7552,6 +7836,10 @@ u32 TextureCache<P>::RetireSlotPredecessors(const ImageInfo& new_info, GPUVAddr 
         if (old.info.forced_flushed || old.info.dma_downloaded ||
             ((guard | old.relocation_guard_noted) & read_later) != 0) {
             ++slot_kept_guard;
+            continue;
+        }
+        if (KeepLostContents(old)) { // FRITCHII_LOST_WRITEBACK: the collector writes it back
+            ++lost_stats.sweeps_kept;
             continue;
         }
         if (bound(old) || queued(overlap_id, uncommitted_downloads) ||
@@ -7942,6 +8230,9 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
         if (!image.aliased_images.empty()) {
             SynchronizeAliases(image_id);
         }
+    }
+    if (image.lost_contents != 0) [[unlikely]] {
+        NoteLostContents(image, is_modification, invalidate);
     }
     if (is_modification) {
         if constexpr (requires { &Image::BackTilesWhole; }) {

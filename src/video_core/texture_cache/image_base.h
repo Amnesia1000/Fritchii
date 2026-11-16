@@ -165,6 +165,9 @@ struct ImageBase {
     /// overlap in JoinImages), and the frame its coverage was last checked.
     u64 covered_overlap_frame = 0;
     u64 covered_check_frame = 0;
+    /// Made where a GPU-written image was dropped without a write-back (TextureCache's lost
+    /// contents counter): bits of TextureCache::LostBits, 0 once counted or overwritten whole.
+    u8 lost_contents = 0;
 
     /// Unmapped images (TextureCache::UnmapGPUMemory): the frame + 1 at which an unmap of its GPU
     /// memory flagged it Remapped (0 = none did, or it was found again since) and its device

@@ -12,6 +12,7 @@
 #include "common/host_memory.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/small_card.h"
+#include "video_core/texture_cache/lost_contents.h"
 
 namespace VideoCore::Nx2Debug {
 namespace {
@@ -578,6 +579,12 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     }
     if (name == "FRITCHII_ZERO_UPLOAD") {
         return &g_zero_upload;
+    }
+    if (name == "FRITCHII_STALE_ZERO") {
+        return &g_stale_zero;
+    }
+    if (name == "FRITCHII_LOST_WRITEBACK") {
+        return &g_lost_writeback;
     }
     if (name == "FRITCHII_HOSTTIMING_SPIN_BUDGET") {
         return &g_hosttiming_spin_budget;
