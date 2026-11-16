@@ -505,6 +505,27 @@ public:
     /// held ~17 of them and evicted 1,150-1,400 images a 600 frames in Castle Town (2026-11-10).
     static constexpr u64 ImagePoolMaxBytesDedicated = u64{1536} << 20;
     [[nodiscard]] static u64 ImagePoolCap();
+    /// ImagePoolCap, lowered to the room under the device budget with FRITCHII_VRAM_POOL_FIT.
+    [[nodiscard]] u64 FittedPoolCap() const {
+        return (std::min)(ImagePoolCap(), pool_fit_cap);
+    }
+    /// FRITCHII_VRAM_POOL_FIT: recomputes pool_fit_cap from the budget and the usage.
+    void UpdatePoolFitCap();
+    u64 pool_fit_cap{~u64{0}};  ///< ~0 while FRITCHII_VRAM_POOL_FIT is off
+    u64 pool_fit_lowest{~u64{0}}; ///< the lowest fitted cap since the last report
+    u64 pool_fit_budget{};
+    u64 pool_fit_others{};
+    u32 pool_fit_frames{};
+    /// FRITCHII_VRAM_REPORT: samples (every 30 frames) since the last report line.
+    void SampleVramReport();
+    u32 vram_report_frames{};
+    u32 vram_report_samples{};
+    u32 vram_report_over{};
+    u64 vram_report_peak_usage{};
+    u64 vram_report_peak_over{};
+    u64 vram_report_last_budget{};
+    u32 vram_report_seen_pressure{};
+    u32 vram_report_seen_failed{};
     static constexpr u64 ImagePoolMaxFrames = 180;
     std::deque<PooledImage> image_pool;
     u64 image_pool_bytes{};

@@ -748,8 +748,12 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
                           : vmaCreateImage(allocator, &ci, &first_ci, &handle, &allocation, &alloc_info);
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge && first_ci.pool != VK_NULL_HANDLE &&
         !kill_pooled &&
-        VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_depth_pool_big,
-                                         "FRITCHII_DEPTH_POOL_BIG") > 0) {
+        (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_depth_pool_big,
+                                          "FRITCHII_DEPTH_POOL_BIG") > 0 ||
+         VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_depth_pool_retry,
+                                          "FRITCHII_DEPTH_POOL_RETRY") != 0)) {
+        // Same fix from two helpers (BA: FRITCHII_DEPTH_POOL_BIG, BF: FRITCHII_DEPTH_POOL_RETRY);
+        // either switch turns it on.
         // FRITCHII_DEPTH_POOL_BIG: VMA refuses anything larger than a custom pool's block
         // (64 MiB) with VK_ERROR_OUT_OF_DEVICE_MEMORY before it looks at the budget, so a large
         // depth target (OoT, every Castle Town load: 12288x12288 D16, 288 MiB) read as "over
