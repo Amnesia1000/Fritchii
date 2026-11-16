@@ -597,6 +597,10 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_PROTECT_UNLOCKED") {
         return &Common::g_protect_unlocked;
     }
+    if (name == "FRITCHII_ZERO_TRIM_CHUNK") {
+        // Lives in common (the zero-page pass); -1 until the first pass reads it.
+        return &Common::g_zero_trim_chunk;
+    }
     // FRITCHII_ONEF and FRITCHII_ONEF_PIN are boot switches: not live.
     if (name == "FRITCHII_ONEF_VIEW") {
         return &g_onef_view;
