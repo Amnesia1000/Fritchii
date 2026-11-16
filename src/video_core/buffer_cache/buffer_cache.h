@@ -5418,6 +5418,8 @@ void BufferCache<P>::BindHostComputeUniformBuffers() {
 
 template <class P>
 void BufferCache<P>::BindHostComputeStorageBuffers() {
+    // The unmapped device read lines' context (a few dispatches a frame: two stores each).
+    const Common::WriteRing::ReadSiteScope read_site{"compute storage bind"};
     u32 binding_index = 0;
     // EDEN_NX2_GPU_PROFILE: bytes bound against bytes uploaded (the compute bindings line).
     const bool profile = Nx2Profile::Enabled();
@@ -5550,6 +5552,7 @@ void BufferCache<P>::ProbeExtentTail(u32 index, const Binding& binding) {
         // other reasons: they are left out.
         probe.guest.resize(span);
         VideoCommon::OneFollower::BeforeEngineRead(tail, span);
+        const Common::WriteRing::ReadSiteScope read_site{"extent probe"};
         device_memory.ReadBlockUnsafe(tail, probe.guest.data(), span);
         const auto skip = [&](DAddr begin, DAddr end) {
             begin = (std::max)(begin, tail);
@@ -7516,6 +7519,7 @@ template <class P>
 void BufferCache<P>::UploadMemory(Buffer& buffer, u64 total_size_bytes, u64 largest_copy,
                                   std::span<BufferCopy> copies) {
     MemStageStats::Uploaded(copies.size(), total_size_bytes);
+    const Common::WriteRing::ReadSiteScope read_site{"buffer upload"};
     // FRITCHII_BANK_CENSUS: the pages these copies read from guest memory (the bank check's next
     // compare of each takes the mark).
     if (Core::DevicePageFlags* const census_uploads =
@@ -8012,6 +8016,7 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
         GPUVAddr gpu_addr;
         u64 next_qword;
         u64 serial;
+        u64 backing; ///< FRITCHII_BARE_SSBO_CLAMP: the device backing's generation, else 0
         u32 flags;
         Binding binding;
     };
@@ -8019,15 +8024,23 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
     thread_local std::array<std::array<CachedBinding, Ways>, 512> binding_cache{};
     // FRITCHII_BARE_SSBO_MIB is live: its reach is part of the answer's key (MiB, from bit 3).
     const u32 bare_reach = native_pointer ? VideoCore::Nx2Debug::BareStorageReach() : 0;
+    // FRITCHII_BARE_SSBO_CLAMP (live, default 0): a bare binding stops at the first device page
+    // with no host backing; the answer then also holds only until the backing changes (bit 31).
+    const bool bare_clamp =
+        native_pointer && VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_bare_ssbo_clamp,
+                                                           "FRITCHII_BARE_SSBO_CLAMP") != 0;
     const u32 flags = (is_written ? 1U : 0U) | (native_pointer ? 2U : 0U) |
-                      (table_pointer ? 4U : 0U) | ((bare_reach >> 20) << 3);
+                      (table_pointer ? 4U : 0U) | ((bare_reach >> 20) << 3) |
+                      (bare_clamp ? 1U << 31 : 0U);
     const size_t owner = gpu_memory->GetID() + 1;
     const u64 serial = gpu_memory->MapSerial();
+    const u64 backing = bare_clamp ? device_memory.TranslationGeneration() : 0;
     auto& set = binding_cache[((gpu_addr ^ next_qword ^ flags) * 0x9E3779B97F4A7C15ULL) >> 55];
     for (size_t way = 0; way < Ways; ++way) {
         const CachedBinding& cached = set[way];
         if (cached.owner == owner && cached.gpu_addr == gpu_addr &&
-            cached.next_qword == next_qword && cached.flags == flags && cached.serial == serial) {
+            cached.next_qword == next_qword && cached.flags == flags && cached.serial == serial &&
+            cached.backing == backing) {
             const Binding hit = cached.binding;
             std::rotate(set.begin(), set.begin() + way, set.begin() + way + 1);
             if (compute) {
@@ -8113,6 +8126,26 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
             // a written one isn't split into separate ranges without sparse sources.
             size = static_cast<u32>(gpu_memory->MaxContinuousRange(gpu_addr, size));
         }
+        // FRITCHII_BARE_SSBO_CLAMP: stop at the first device page with no host backing (read as
+        // zeros: the AMD tester's market load read 16 MiB of them at one bare compute window,
+        // test 4 §5b); none backed at the start is the null binding (size 0 below).
+        if (bare_clamp && size != 0) {
+            if (const std::optional<DAddr> start = gpu_memory->GpuToCpuAddress(gpu_addr)) {
+                const size_t backed = device_memory.BackedPrefix(*start, size);
+                if (backed < size) {
+                    static std::atomic<u32> logged{};
+                    if (logged.fetch_add(1, std::memory_order_relaxed) < 24) [[unlikely]] {
+                        LOG_WARNING(HW_GPU,
+                                    "Bare {} storage binding at {:#x} (device {:#x}, {}): {:#x} "
+                                    "bytes, host-backed {:#x}: {} (FRITCHII_BARE_SSBO_CLAMP=1)",
+                                    compute ? "compute" : "graphics", gpu_addr, *start,
+                                    is_written ? "written" : "read-only", size, backed,
+                                    backed == 0 ? "null binding" : "clamped");
+                    }
+                    size = static_cast<u32>(backed);
+                }
+            }
+        }
 
         // Alignment only applies to the offset of the buffer
         const u32 alignment = runtime.GetStorageBufferAlignment();
@@ -8143,7 +8176,7 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
         };
     }();
     std::rotate(set.begin(), set.end() - 1, set.end());
-    set[0] = {owner, gpu_addr, next_qword, serial, flags, binding};
+    set[0] = {owner, gpu_addr, next_qword, serial, backing, flags, binding};
     return binding;
 }
 
@@ -8175,6 +8208,7 @@ std::span<const u8> BufferCache<P>::ImmediateBufferWithData(DAddr device_addr, s
         return std::span(base_pointer, size);
     } else {
         const std::span<u8> span = ImmediateBuffer(size);
+        const Common::WriteRing::ReadSiteScope read_site{"immediate buffer"};
         device_memory.ReadBlockUnsafe(device_addr, span.data(), size);
         return span;
     }

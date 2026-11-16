@@ -694,8 +694,14 @@ bool GpuSplit::SiteOnEngine(DrainSite site) noexcept {
 
 bool GpuSplit::UsesEngine(DrainSite site) const {
     // LaggedCheckEngine is chosen by FRITCHII_ONEF_SEM_E itself, not WAITS_E.
-    return two_positions && SiteOnEngine(site) &&
-           (site == DrainSite::LaggedCheckEngine || OneFollower::WaitsE());
+    // FRITCHII_ONEF_WAITS_R (live, default 0) overrides both: R's played position.
+    if (!two_positions || !SiteOnEngine(site)) {
+        return false;
+    }
+    if (site == DrainSite::LaggedCheckEngine) {
+        return !OneFollower::WaitsR();
+    }
+    return OneFollower::WaitsE(); // false with WAITS_R on
 }
 
 bool GpuSplit::Reached(u64 target, bool on_engine, std::memory_order order) const {
