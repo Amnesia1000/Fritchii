@@ -315,6 +315,17 @@ void SetObjectName(const DeviceDispatch* dld, VkDevice device, T handle, VkObjec
 
 } // Anonymous namespace
 
+void NoteNullTarget(const char* command, const std::source_location& site) noexcept {
+    static std::atomic<u64> skipped{};
+    const u64 count = skipped.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (count <= 16 || count % 1024 == 0) {
+        LOG_CRITICAL(Render_Vulkan,
+                     "Null GPU target: {} (it would reach device address 0 and lose the device); "
+                     "at {}:{} ({}); {} so far",
+                     command, site.file_name(), site.line(), site.function_name(), count);
+    }
+}
+
 bool Load(InstanceDispatch& dld) noexcept {
 #define X(name) Proc(dld.name, dld, #name)
     return X(vkCreateInstance) && X(vkEnumerateInstanceExtensionProperties) &&

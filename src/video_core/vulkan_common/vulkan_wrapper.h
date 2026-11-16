@@ -10,6 +10,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <source_location>
 #include <span>
 #include <type_traits>
 #include <utility>
@@ -28,6 +29,13 @@ VK_DEFINE_HANDLE(VmaAllocator)
 VK_DEFINE_HANDLE(VmaAllocation)
 
 namespace Vulkan::vk {
+
+/// A transfer, query copy or indirect command was handed VK_NULL_HANDLE as its buffer and was
+/// not recorded. A null buffer there is never valid: with nullDescriptor on (NVIDIA, AMD) the
+/// buffer cache's null buffer has no VkBuffer, and the driver turns the null handle into device
+/// address 0 (a GPU page fault at 0x0, then a device loss). Counts every skip and logs the first
+/// ones with the recording site; cold.
+void NoteNullTarget(const char* command, const std::source_location& site) noexcept;
 
 /**
  * Span for Vulkan arrays.
@@ -1369,13 +1377,24 @@ public:
                               first_instance);
     }
 
-    void DrawIndirect(VkBuffer src_buffer, VkDeviceSize src_offset, u32 draw_count,
-                      u32 stride) const noexcept {
+    void DrawIndirect(VkBuffer src_buffer, VkDeviceSize src_offset, u32 draw_count, u32 stride,
+                      const std::source_location site =
+                          std::source_location::current()) const noexcept {
+        if (src_buffer == VK_NULL_HANDLE) [[unlikely]] {
+            NoteNullTarget("vkCmdDrawIndirect on a null buffer, skipped", site);
+            return;
+        }
         dld->vkCmdDrawIndirect(handle, src_buffer, src_offset, draw_count, stride);
     }
 
     void DrawIndexedIndirect(VkBuffer src_buffer, VkDeviceSize src_offset, u32 draw_count,
-                             u32 stride) const noexcept {
+                             u32 stride,
+                             const std::source_location site =
+                                 std::source_location::current()) const noexcept {
+        if (src_buffer == VK_NULL_HANDLE) [[unlikely]] {
+            NoteNullTarget("vkCmdDrawIndexedIndirect on a null buffer, skipped", site);
+            return;
+        }
         dld->vkCmdDrawIndexedIndirect(handle, src_buffer, src_offset, draw_count, stride);
     }
 
@@ -1389,14 +1408,26 @@ public:
     }
 
     void DrawIndirectCount(VkBuffer src_buffer, VkDeviceSize src_offset, VkBuffer count_buffer,
-                           VkDeviceSize count_offset, u32 draw_count, u32 stride) const noexcept {
+                           VkDeviceSize count_offset, u32 draw_count, u32 stride,
+                           const std::source_location site =
+                               std::source_location::current()) const noexcept {
+        if (src_buffer == VK_NULL_HANDLE || count_buffer == VK_NULL_HANDLE) [[unlikely]] {
+            NoteNullTarget("vkCmdDrawIndirectCount on a null buffer, skipped", site);
+            return;
+        }
         dld->vkCmdDrawIndirectCount(handle, src_buffer, src_offset, count_buffer, count_offset,
                                     draw_count, stride);
     }
 
     void DrawIndexedIndirectCount(VkBuffer src_buffer, VkDeviceSize src_offset,
                                   VkBuffer count_buffer, VkDeviceSize count_offset, u32 draw_count,
-                                  u32 stride) const noexcept {
+                                  u32 stride,
+                                  const std::source_location site =
+                                      std::source_location::current()) const noexcept {
+        if (src_buffer == VK_NULL_HANDLE || count_buffer == VK_NULL_HANDLE) [[unlikely]] {
+            NoteNullTarget("vkCmdDrawIndexedIndirectCount on a null buffer, skipped", site);
+            return;
+        }
         dld->vkCmdDrawIndexedIndirectCount(handle, src_buffer, src_offset, count_buffer,
                                            count_offset, draw_count, stride);
     }
@@ -1443,7 +1474,13 @@ public:
         dld->vkCmdDispatch(handle, x, y, z);
     }
 
-    void DispatchIndirect(VkBuffer indirect_buffer, VkDeviceSize offset) const noexcept {
+    void DispatchIndirect(VkBuffer indirect_buffer, VkDeviceSize offset,
+                          const std::source_location site =
+                              std::source_location::current()) const noexcept {
+        if (indirect_buffer == VK_NULL_HANDLE) [[unlikely]] {
+            NoteNullTarget("vkCmdDispatchIndirect on a null buffer, skipped", site);
+            return;
+        }
         dld->vkCmdDispatchIndirect(handle, indirect_buffer, offset);
     }
 
@@ -1559,13 +1596,27 @@ public:
     }
 
     void CopyBufferToImage(VkBuffer src_buffer, VkImage dst_image, VkImageLayout dst_image_layout,
-                           Span<VkBufferImageCopy> regions) const noexcept {
+                           Span<VkBufferImageCopy> regions,
+                           const std::source_location site =
+                               std::source_location::current()) const noexcept {
+        if (src_buffer == VK_NULL_HANDLE) [[unlikely]] {
+            NoteNullTarget("vkCmdCopyBufferToImage on a null buffer, skipped", site);
+            return;
+        }
         dld->vkCmdCopyBufferToImage(handle, src_buffer, dst_image, dst_image_layout, regions.size(),
                                     regions.data());
     }
 
-    void CopyBuffer(VkBuffer src_buffer, VkBuffer dst_buffer,
-                    Span<VkBufferCopy> regions) const noexcept {
+    void CopyBuffer(VkBuffer src_buffer, VkBuffer dst_buffer, Span<VkBufferCopy> regions,
+                    const std::source_location site =
+                        std::source_location::current()) const noexcept {
+        if (src_buffer == VK_NULL_HANDLE || dst_buffer == VK_NULL_HANDLE) [[unlikely]] {
+            NoteNullTarget(dst_buffer == VK_NULL_HANDLE
+                               ? "vkCmdCopyBuffer into a null buffer, skipped"
+                               : "vkCmdCopyBuffer from a null buffer, skipped",
+                           site);
+            return;
+        }
         dld->vkCmdCopyBuffer(handle, src_buffer, dst_buffer, regions.size(), regions.data());
     }
 
@@ -1576,20 +1627,37 @@ public:
     }
 
     void CopyImageToBuffer(VkImage src_image, VkImageLayout src_layout, VkBuffer dst_buffer,
-                           Span<VkBufferImageCopy> regions) const noexcept {
+                           Span<VkBufferImageCopy> regions,
+                           const std::source_location site =
+                               std::source_location::current()) const noexcept {
+        if (dst_buffer == VK_NULL_HANDLE) [[unlikely]] {
+            NoteNullTarget("vkCmdCopyImageToBuffer on a null buffer, skipped", site);
+            return;
+        }
         dld->vkCmdCopyImageToBuffer(handle, src_image, src_layout, dst_buffer, regions.size(),
                                     regions.data());
     }
 
     void CopyQueryPoolResults(VkQueryPool query_pool, u32 first_query, u32 query_count,
                               VkBuffer dst_buffer, VkDeviceSize dst_offset, VkDeviceSize stride,
-                              VkQueryResultFlags flags) const noexcept {
+                              VkQueryResultFlags flags,
+                              const std::source_location site =
+                                  std::source_location::current()) const noexcept {
+        if (dst_buffer == VK_NULL_HANDLE) [[unlikely]] {
+            NoteNullTarget("vkCmdCopyQueryPoolResults on a null buffer, skipped", site);
+            return;
+        }
         dld->vkCmdCopyQueryPoolResults(handle, query_pool, first_query, query_count, dst_buffer,
                                        dst_offset, stride, flags);
     }
 
-    void FillBuffer(VkBuffer dst_buffer, VkDeviceSize dst_offset, VkDeviceSize size,
-                    u32 data) const noexcept {
+    void FillBuffer(VkBuffer dst_buffer, VkDeviceSize dst_offset, VkDeviceSize size, u32 data,
+                    const std::source_location site =
+                        std::source_location::current()) const noexcept {
+        if (dst_buffer == VK_NULL_HANDLE) [[unlikely]] {
+            NoteNullTarget("vkCmdFillBuffer on a null buffer, skipped", site);
+            return;
+        }
         dld->vkCmdFillBuffer(handle, dst_buffer, dst_offset, size, data);
     }
 
@@ -1791,7 +1859,17 @@ public:
 
     void BindTransformFeedbackBuffersEXT(u32 first, u32 count, const VkBuffer* buffers,
                                          const VkDeviceSize* offsets,
-                                         const VkDeviceSize* sizes) const noexcept {
+                                         const VkDeviceSize* sizes,
+                                         const std::source_location site =
+                                             std::source_location::current()) const noexcept {
+        for (u32 i = 0; i < count; ++i) {
+            if (buffers[i] == VK_NULL_HANDLE) [[unlikely]] {
+                // The runtime binds its own null buffer instead; a null here is a stale handle.
+                NoteNullTarget("vkCmdBindTransformFeedbackBuffersEXT on a null buffer, skipped",
+                               site);
+                return;
+            }
+        }
         dld->vkCmdBindTransformFeedbackBuffersEXT(handle, first, count, buffers, offsets, sizes);
     }
 
