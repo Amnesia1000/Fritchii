@@ -1663,6 +1663,7 @@ void MainWindow::RestoreUIState() {
 
     ui->action_Show_Performance_Overlay->setChecked(
         UISettings::values.show_perf_overlay.GetValue());
+    ui->action_Show_Frame_Times->setChecked(UISettings::values.perf_overlay_times.GetValue());
     if (perf_overlay)
         perf_overlay->setVisible(ui->action_Show_Performance_Overlay->isChecked());
     Debugger::ToggleConsole();
@@ -1808,6 +1809,9 @@ void MainWindow::ConnectMenuEvents() {
     connect_menu(ui->action_Show_Filter_Bar, &MainWindow::OnToggleFilterBar);
     connect_menu(ui->action_Show_Status_Bar, &MainWindow::OnToggleStatusBar);
     connect_menu(ui->action_Show_Performance_Overlay, &MainWindow::OnTogglePerfOverlay);
+    // The overlays read the setting with their next update (about once a second).
+    connect(ui->action_Show_Frame_Times, &QAction::toggled, this,
+            [](bool checked) { UISettings::values.perf_overlay_times = checked; });
 #ifdef HAS_RESHADE
     connect_menu(ui->action_Post_Processing_Shaders, &MainWindow::OnPostProcessingShaders);
 #else

@@ -46,6 +46,8 @@ add_library(
     dkb_cpu_trace.h
     jit_symbols.cpp
     jit_symbols.h
+    frame_budget.cpp
+    frame_budget.h
     nx2_hitch.cpp
     nx2_hitch.h
     nx2_sampler.cpp
