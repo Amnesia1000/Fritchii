@@ -11,6 +11,7 @@
 #include <cstring>
 #include <cwchar>
 #include <exception>
+#include <string>
 
 #include <windows.h>
 
@@ -483,6 +484,50 @@ void InstallCrashHandler(const std::filesystem::path& dump_directory) {
         value != nullptr && value[0] != '\0' && value[0] != '0') {
         AddVectoredExceptionHandler(1, OnFirstChance);
     }
+}
+
+std::string WriteHangDump(const std::filesystem::path& directory) {
+    static std::atomic<int> written_count{0};
+    const int number = written_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (number > 3) {
+        return "not written: three hang dumps already this session";
+    }
+    // Not a crash: loading dbghelp here is safe (the crash handler resolves it at install, when
+    // it is installed at all).
+    MiniDumpWriteDumpFn writer = write_dump;
+    if (writer == nullptr) {
+        if (const HMODULE dbghelp = LoadLibraryW(L"dbghelp.dll")) {
+            writer = reinterpret_cast<MiniDumpWriteDumpFn>(
+                reinterpret_cast<void*>(GetProcAddress(dbghelp, "MiniDumpWriteDump")));
+        }
+    }
+    if (writer == nullptr) {
+        return "not written: dbghelp.dll or MiniDumpWriteDump not found";
+    }
+    const std::filesystem::path path =
+        directory / ("fritchii_hang_" + std::to_string(GetCurrentProcessId()) + "_" +
+                     std::to_string(number) + ".dmp");
+    const HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                    FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return "not written: could not create " + path.string() + " (error " +
+               std::to_string(GetLastError()) + ")";
+    }
+    // Stacks of every thread (MiniDumpNormal), plus their times and start addresses and the
+    // modules unloaded before: a few MiB, no game memory.
+    const auto type =
+        static_cast<MINIDUMP_TYPE>(MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules);
+    const BOOL written = writer(GetCurrentProcess(), GetCurrentProcessId(), file, type, nullptr,
+                                nullptr, nullptr);
+    const DWORD error = written ? 0 : GetLastError();
+    LARGE_INTEGER size{};
+    GetFileSizeEx(file, &size);
+    CloseHandle(file);
+    if (!written) {
+        DeleteFileW(path.c_str());
+        return "failed (error " + std::to_string(error) + ")";
+    }
+    return "written: " + path.string() + " (" + std::to_string(size.QuadPart >> 10) + " KiB)";
 }
 
 void GuaranteeStackForCrashReport() {

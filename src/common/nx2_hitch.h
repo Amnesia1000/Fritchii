@@ -155,6 +155,28 @@ void RegisterThread(const char* name);
 /// From the game's present, one thread: `gap_us` since its previous present.
 void OnPresent(long long gap_us);
 
+// Hang report (2026-11-16, helper AW's boot hang: 0 frames from 17 s on, every thread idle, and
+// nothing in the log said what the game waited on). Once a second (the Pulse thread, or a small
+// "FritchiiHangWatch" thread where the Pulse does not run) it checks for presents. After
+// FRITCHII_HANG_REPORT_S seconds (live, default 5, 0 = off) without one while the game runs (the
+// hooks below say so: powered on, not paused, not stalled), it logs one "Hang report:" block at
+// Critical: the stall snapshot as a present would log it, then the emulator's side through
+// `report` (GPU acquires and syncpoint waits, the GPU split / one follower state, service calls
+// in flight, the game's threads in kernel waits). FRITCHII_HANG_DUMP=1 (boot) adds a minidump
+// next to the log (Windows). One report per freeze: the next present re-arms it. Read only.
+struct HangHooks {
+    /// The report's threshold in seconds while the game runs, 0 while it does not (or the
+    /// switch is 0). Called once a second under the hooks' lock.
+    int (*armed_seconds)(void* context){};
+    /// Logs the emulator's side of the report. Under the hooks' lock; must not block for long.
+    void (*report)(void* context){};
+    void* context{};
+};
+/// Installs the hooks (a session's start).
+void SetHangHooks(const HangHooks& hooks);
+/// Removes them if `context` installed them; no hook call runs after this returns.
+void ClearHangHooks(const void* context);
+
 // Stall snapshot (fable52_answer_stall2 section 2): on by default since 2026-11-14,
 // EDEN_NX2_STALL_SNAPSHOT=0 turns it off (read as each thread is named, so nx2_switches.txt applies). A present gap of 100 ms or more then logs one
 // "Stall snapshot:" line after its Hitch line: for the GPU back, GPU front, Vulkan worker, GPU
