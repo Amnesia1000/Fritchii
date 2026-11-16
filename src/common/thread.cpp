@@ -18,6 +18,7 @@
 #include "common/adpf.h"
 #include "common/error.h"
 #include "common/event_wait.h"
+#include "common/fritchii_lock_census.h"
 #include "common/fritchii_write_ring.h"
 #include "common/logging.h"
 #include "common/nx2_sample_profile.h"
@@ -678,6 +679,7 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
 void SetCurrentThreadName(const char* name) {
     Nx2SampleProfile::OnThreadNamed(name);
     Nx2Hitch::RegisterThread(name);
+    LockCensus::NameThread(name);
     FrameBudget::RegisterThread(name);
     WriteRing::NameThread(name);
 #ifdef _MSC_VER

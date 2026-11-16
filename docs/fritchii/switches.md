@@ -1716,6 +1716,64 @@ waits (two clock reads a wait, ~30 a second), so 0 and 1 windows compare directl
 Risk to watch: the #215 family (white flashes on leaves and walls, a read that returned before
 its report landed). Verify first; the flash watch in the 1 windows.
 
+### FRITCHII_LOCK_CENSUS (the "Lock census" lines)
+
+Helper CP (work\helper_cp_answer.md). Live, default 0. Who holds a cache lock when a thread has
+to wait for it. The drain sites line already times the waits per role ("cache lock waits: ... GPU
+back 18 ms/s (2,900/s)" at Kakariko); this names the holder. Only the two cache locks (the
+buffer cache's and the texture cache's SpinRecursiveMutex) and only contended waits are seen
+(common/fritchii_lock_census.cpp).
+
+- 0 = off: one relaxed load in the contended path, nothing on an uncontended lock.
+- 1 = every contended wait counted by waiter thread, holder thread (the owner when the wait
+  starts, by its thread name) and lock. "Lock census (FRITCHII_LOCK_CENSUS=1) 10 s, contended
+  cache lock waits, waiter <- holder (lock): GPUBack <- GPUFencingThread (buffer cache) x ms/s
+  (n/s, y us each); ..." (top 12 pairs), plus the waits whose holder had let go before the
+  waiter looked.
+- 2 = as 1, plus the holder's stack for GPUBack's (E's) waits: the holder is paused (at most 40
+  a second, 20-50 us each, added to that one wait), its stack read if it still holds the lock,
+  then resumed. Second line "Lock census holder stacks": where the holders were (thread and
+  first 5 functions, % of the stacks and E's wait in those waits) and the functions on their
+  stacks (% of stacks). The first report loads the exe's symbols (DbgHelp, the .pdb next to the
+  exe) on the census thread: a few seconds and a few hundred MiB. Windows only.
+- 3 = as 2, for every waiter.
+
+Run 2 for one short session (60 s is plenty); it perturbs E by at most ~1-2 ms/s.
+
+### FRITCHII_FENCE_YIELD_E (the "Fence yield to E" line)
+
+Helper CP. Live, default 0. The fencing thread releases fences in batches and lands each
+batch's buffer downloads (PopAsyncFlushes) and image downloads with the cache lock held for the
+whole batch (FenceManager::ReleaseThreadFunc's pop_all). E takes the buffer cache's lock at every
+draw fill and counter report (~330,000 a second at Kakariko), so a pop under way stops E.
+
+- 0 = as before.
+- 1 = while E (GPUBack) waits for the lock it marks it (SpinRecursiveMutex::BackWaiting); between
+  two pops of a batch the fencing thread then lets the lock go, waits until E has taken it (E's
+  mark gone, at most 50 us) and takes it back for the next pop. The same pops in the same order,
+  each whole under the lock, as EXP74's hand-back, which only lets go after a time; between two
+  pops any other thread could already take the lock. The batch's operations and query pops run
+  after all its pops, as before.
+- 3 = dry: E marks, the fencing thread only counts the chances.
+- "Fence yield to E (FRITCHII_FENCE_YIELD_E=n)" every 10 s from the fencing thread: pop batches
+  and pops a second; the pops E waited behind with pops left (the cut's chances: yielded at 1,
+  counted at 3); E waiting at the batch's last pop (out of the cut's reach: a single pop, or the
+  last one); the time handed to E.
+- Not on the EDEN_NX2_FENCE_RELEASE_STATS path (that one is left as it was).
+
+Read with FRITCHII_LOCK_CENSUS=1: only worth turning on if the census names the fencing thread
+as E's holder and the dry line shows chances at a good share of E's waits.
+
+### EDEN_NX2_GPU_PROFILE=2: E's draw method zones (helper CP)
+
+E's draw method outside the fill (0x585's "method" share, ~1.1 us a draw at Kakariko, 218 ms/s
+profiled) is split into fine zones on E: "draw route" (UnlentBlocker), "draw flush caching"
+(FlushCaching before the fill), "pipeline lookup" (E's CurrentGraphicsPipeline, rule 3),
+"draw fill setup" (FillRing's own work: facts, room tests, the buffer cache lock, the repack
+layout, the record), "draw handle values" (the raw handle values read), "draw push" (R's
+packet packed and pushed), "tick work" (TickWork after the push). Exclusive times as all zones;
+"memory fill" and its fine zones stay nested inside "draw fill setup". Profile 2 only.
+
 ### FRITCHII_ACQUIRE_MET_BY (the "Acquire resumes met by" line)
 
 FRITCHII_ACQUIRE_MET_BY (live, default 0 since 2026-11-14 = one relaxed load per resume; 1 = the

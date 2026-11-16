@@ -20,6 +20,7 @@
 #include <queue>
 
 #include "common/common_types.h"
+#include "common/fritchii_lock_census.h"
 #include "common/logging.h"
 #include "common/nx2_timeline.h"
 #include "common/settings.h"
@@ -544,11 +545,37 @@ private:
             // under the lock the thread lets it go between two pops, so the back can take it;
             // the same pops in the same order, each whole under the lock.
             const int hand_back_us = VideoCore::Nx2Debug::Experiment(74);
-            const auto pop_all = [hand_back_us](auto& mutex, size_t pops, auto&& pop) {
+            // FRITCHII_FENCE_YIELD_E (helper CP, common/fritchii_lock_census.h): between two
+            // pops, the lock goes to E if E waits for it (1), or that chance is counted (3).
+            const int yield_e = Common::LockCensus::FenceYieldE();
+            const auto pop_all = [hand_back_us, yield_e](auto& mutex, size_t pops, auto&& pop) {
                 std::unique_lock lock{mutex};
                 auto held_since = std::chrono::steady_clock::now();
+                u64 chances = 0;
+                u64 yield_ns = 0;
                 for (size_t i = 0; i < pops; ++i) {
                     pop();
+                    if (yield_e != 0 && i + 1 < pops && mutex.BackWaiting()) [[unlikely]] {
+                        ++chances;
+                        if (yield_e == 1) {
+                            // E spins for the lock: it takes it at the unlock. Taken back once E
+                            // has it (its mark is gone) or after 50 us; the next pop then waits
+                            // for E's hold to end, as E waited for the pops before.
+                            const auto yield_start = std::chrono::steady_clock::now();
+                            lock.unlock();
+                            while (mutex.BackWaiting() &&
+                                   std::chrono::steady_clock::now() - yield_start <
+                                       std::chrono::microseconds{50}) {
+                            }
+                            lock.lock();
+                            held_since = std::chrono::steady_clock::now();
+                            yield_ns += static_cast<u64>(
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    held_since - yield_start)
+                                    .count());
+                            continue;
+                        }
+                    }
                     if (hand_back_us > 0 && i + 1 < pops) {
                         const auto now = std::chrono::steady_clock::now();
                         if (now - held_since >= std::chrono::microseconds{hand_back_us}) {
@@ -558,6 +585,10 @@ private:
                             held_since = std::chrono::steady_clock::now();
                         }
                     }
+                }
+                if (yield_e != 0) [[unlikely]] {
+                    Common::LockCensus::NoteFencePops(yield_e, pops, chances, mutex.BackWaiting(),
+                                                      yield_ns);
                 }
             };
             // pop_all with the stats: each pop described and timed, the mutex's waits and holds.

@@ -8,6 +8,7 @@
 #include <mutex>
 #include <unordered_map>
 
+#include "common/fritchii_lock_census.h"
 #include "common/host_memory.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/small_card.h"
@@ -338,6 +339,13 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     }
     if (name == "FRITCHII_REPORT_WAIT") {
         return &g_report_wait;
+    }
+    if (name == "FRITCHII_LOCK_CENSUS") {
+        // Lives in common (the cache locks' contended path); -1 until its first read.
+        return &Common::LockCensus::g_mode;
+    }
+    if (name == "FRITCHII_FENCE_YIELD_E") {
+        return &Common::LockCensus::g_fence_yield_e;
     }
     if (name == "EDEN_NX2_FEED_MEMORY_OVERLAY") {
         return &g_feed_memory_overlay;
