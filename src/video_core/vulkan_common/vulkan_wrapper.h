@@ -387,6 +387,10 @@ bool Load(InstanceDispatch&) noexcept;
 /// @return True on success, false on error.
 bool Load(VkInstance, InstanceDispatch&) noexcept;
 
+/// FRITCHII_RAM_VK_HOST_ALLOC (boot, default 0; docs/fritchii/switches.md): the allocation
+/// callbacks the instance and the device are created and destroyed with, or null when off.
+[[nodiscard]] const VkAllocationCallbacks* HostAllocator() noexcept;
+
 void Destroy(VkInstance, const InstanceDispatch&) noexcept;
 void Destroy(VkDevice, const InstanceDispatch&) noexcept;
 
