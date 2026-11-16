@@ -193,6 +193,20 @@ public:
     /// to be done.
     [[nodiscard]] bool IsFreeNow(u64 tick);
 
+    /// FRITCHII_READ_RUNS=2 (counter only), on any thread: the scheduler tick `stamp` is recorded
+    /// in (the open one when it is not published yet), the scheduler's current tick, and the host
+    /// GPU's completed tick (refreshed).
+    struct ReadTicks {
+        u64 write;
+        u64 current;
+        u64 known;
+    };
+    [[nodiscard]] ReadTicks ReadWriterTicks(u64 stamp);
+
+    /// FRITCHII_READ_RUNS=2 (counter only), on any thread: false when scheduler tick `tick` is not
+    /// submitted (nothing done: no flush is asked for); else waits until the host GPU ran it.
+    bool WaitTickIfSubmitted(u64 tick);
+
     u64 GetDeviceLocalMemory() const;
 
     u64 GetDeviceMemoryUsage() const;

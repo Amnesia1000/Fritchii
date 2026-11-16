@@ -575,6 +575,16 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
             ReadRunStats::FindWriter(device_addr, size, device_addr_start_aligned,
                                      device_addr_end_aligned);
             ReadRunStats::WriterAnswer& writer = ReadRunStats::t_writer_answer;
+            if constexpr (!IS_OPENGL) {
+                // FRITCHII_READ_RUNS=2: where the host GPU is with the newest write over the
+                // read's pages ("Read writer ticks").
+                if (ReadRunStats::g_writer_ticks && writer.area_found) {
+                    const auto ticks = runtime.ReadWriterTicks(writer.area_mark.stamp);
+                    writer.write_tick = ticks.write;
+                    writer.read_tick = ticks.current;
+                    writer.known_tick = ticks.known;
+                }
+            }
             writer.compared =
                 static_cast<u32>((std::min<u64>)(size, ReadRunStats::CompareBytes));
             VideoCommon::OneFollower::BeforeEngineRead(device_addr, writer.compared);
@@ -987,9 +997,21 @@ std::optional<u64> BufferCache<P>::FinishReadDownloads(DAddr device_addr, u64 si
         if (!runtime.IsFree(*tick)) {
             lock.unlock();
             const u64 wait_start = VideoCore::AsyncReadback::Now();
+            // FRITCHII_READ_RUNS=2 (counter only): the reader's wait, first until its writer's
+            // submission ran. The "on the host GPU" figure keeps both parts.
+            u64 writer_ns = 0;
+            if (ReadRunStats::g_writer_ticks && VideoCore::AsyncReadback::t_reading) [[unlikely]] {
+                writer_ns = WaitReadWriter();
+                VideoCore::AsyncReadback::Add(VideoCore::AsyncReadback::g_counters.on_card_ns,
+                                              writer_ns);
+            }
             runtime.WaitForHostRead(*tick);
             waited = (std::max)(VideoCore::AsyncReadback::Now() - wait_start, u64{1});
             VideoCore::AsyncReadback::CountHostWait(waited);
+            if (ReadRunStats::t_writer_answer.cut) [[unlikely]] {
+                ReadRunStats::t_writer_answer.rest_wait_ns =
+                    waited > writer_ns ? waited - writer_ns : 0;
+            }
             lock.lock();
         }
         WriteReadDownloads(*tick);
@@ -1389,7 +1411,7 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
         gpu_modified_ranges.Add(pair.first, pair.second);
         // FRITCHII_READ_RUNS: a GPU copy of GPU-written bytes is a write mark too (writer Other).
         if (ReadRunStats::g_enabled) [[unlikely]] {
-            ReadRunStats::NoteWrite(pair.first, pair.second);
+            ReadRunStats::NoteWrite(pair.first, pair.second, ReadWriteStamp());
         }
         if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
             Nx2NoteListWrite(buffer_b, pair.first, pair.second);
@@ -6079,7 +6101,7 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
     }
     // FRITCHII_READ_RUNS: the write mark, with the writer its bind set (the "Read writer" lines).
     if (ReadRunStats::g_enabled) [[unlikely]] {
-        ReadRunStats::NoteWrite(device_addr, size);
+        ReadRunStats::NoteWrite(device_addr, size, ReadWriteStamp());
     }
     if constexpr (!IS_OPENGL) {
         if (needs_sync) {
@@ -6184,7 +6206,7 @@ bool BufferCache<P>::MarkWrittenAhead(BufferId buffer_id, DAddr device_addr, u32
         nx2_written_mark_bytes += size;
     }
     if (ReadRunStats::g_enabled) [[unlikely]] {
-        ReadRunStats::NoteWrite(device_addr, size);
+        ReadRunStats::NoteWrite(device_addr, size, ReadWriteStamp());
     }
     if constexpr (!IS_OPENGL) {
         if (needs_sync) {

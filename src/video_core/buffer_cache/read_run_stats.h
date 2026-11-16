@@ -36,11 +36,23 @@
 // draw's stage and binding); at a read, GetFlushArea takes the newest mark over the read's bytes
 // (FindWriter) and OnCPURead counts it per writer (NoteWriter). The "Read runs for B1" line
 // sums what the GPU writes into the runs read in the last 16 frames.
+// FRITCHII_READ_RUNS=2 adds the "Read writer ticks" line (helper_cu_answer.md): per read kind,
+// the newest write mark over the read's pages (the bytes its download takes), where the host GPU
+// was with that write's submission when the read asked (not submitted, submitted and not run,
+// run), how many submissions the read's own tick is behind it, and, for every read that waits
+// for the host GPU, the wait cut at the writer's tick: first until the writer's submission ran,
+// then the rest. Same timeline, so the total wait is what it was; only the cut is new.
 namespace VideoCommon::ReadRunStats {
 
 inline const bool g_enabled = [] {
     const char* value = std::getenv("FRITCHII_READ_RUNS");
     return value != nullptr && value[0] != '\0' && value[0] != '0';
+}();
+
+/// FRITCHII_READ_RUNS=2: the write marks carry their stamp and reads cut their host waits there.
+inline const bool g_writer_ticks = [] {
+    const char* value = std::getenv("FRITCHII_READ_RUNS");
+    return value != nullptr && value[0] == '2';
 }();
 
 /// Pages the run is counted up to (one more than the histogram's last bucket).
@@ -145,6 +157,7 @@ struct WriteMark {
     u64 end{};
     u64 time_ns{};
     u64 dispatch{}; ///< g_dispatches when it was made
+    u64 stamp{};    ///< the buffer cache's clock stamp then (g_writer_ticks, else 0)
     Writer writer{};
 };
 
@@ -178,7 +191,8 @@ inline Ring& GetRing() {
 }
 
 /// BufferCache::MarkWrittenBuffer (the thread that binds: the back, or the memory stage).
-inline void NoteWrite(u64 begin, u64 size) {
+/// `stamp`: the runtime's CurrentTick for the write (g_writer_ticks), else 0.
+inline void NoteWrite(u64 begin, u64 size, u64 stamp = 0) {
     if (size == 0) {
         return;
     }
@@ -187,6 +201,7 @@ inline void NoteWrite(u64 begin, u64 size) {
                          .end = end,
                          .time_ns = NowNs(),
                          .dispatch = g_dispatches.load(std::memory_order_relaxed),
+                         .stamp = stamp,
                          .writer = t_writer};
     const bool compute = mark.writer.kind == WriterKind::ComputeStorage ||
                          mark.writer.kind == WriterKind::ComputeTexture;
@@ -226,6 +241,16 @@ struct WriterAnswer {
     u64 run_end{};
     u32 compared{}; ///< bytes in `before` (0: not taken)
     std::array<u8, CompareBytes> before{};
+    // FRITCHII_READ_RUNS=2 ("Read writer ticks"): the newest mark over the read's pages, the
+    // bytes its download takes (GetFlushArea fills the ticks, the waits fill the cut).
+    bool area_found{};
+    WriteMark area_mark{};
+    u64 write_tick{};     ///< the scheduler tick the area mark's stamp is recorded in
+    u64 read_tick{};      ///< the scheduler's current tick when the read asked
+    u64 known_tick{};     ///< the host GPU's completed tick then (refreshed)
+    bool cut{};           ///< a host wait was cut at the writer's tick
+    u64 writer_wait_ns{}; ///< until the writer's submission ran
+    u64 rest_wait_ns{};   ///< then until the read's download (or fence download) was there
 };
 inline thread_local WriterAnswer t_writer_answer{};
 
@@ -242,6 +267,10 @@ inline void FindWriter(u64 address, u64 size, u64 page_begin, u64 page_end) {
     const u64 n = (std::min<u64>)(r.count, RingSize);
     for (u64 i = 0; i < n; ++i) {
         const WriteMark& mark = r.marks[(r.count - 1 - i) % RingSize];
+        if (!a.area_found && mark.begin < page_end && page_begin < mark.end) {
+            a.area_found = true;
+            a.area_mark = mark;
+        }
         if (mark.begin < end && address < mark.end) {
             a.found = true;
             a.page_only = false;
@@ -305,9 +334,26 @@ struct Counts {
     u64 writer_differed{};
 };
 
+/// The "Read writer ticks" line (g_writer_ticks), per Kind; reset after each line.
+struct TickCounts {
+    u64 reads[3]{};      ///< asked, with a mark over the read's pages in the ring
+    u64 no_mark[3]{};    ///< asked, none in the ring (written before its window)
+    u64 state[3][3]{};   ///< the writer's submission at the read: not submitted, submitted, run
+    u64 behind[3][5]{};  ///< submissions from the writer's to the read's: 0, 1-2, 3-5, 6-10, more
+    u64 behind_sum[3]{};
+    u64 unrun_sum[3]{};  ///< submitted after the writer's and not run when the read asked
+    u64 kinds[3][5]{};   ///< [Kind][WriterKind] of the mark
+    u64 wait_ns[3]{};    ///< the reads' whole wait (as the other lines count it)
+    u64 cuts[3]{};       ///< host waits cut at the writer's tick
+    u64 writer_ns[3]{};  ///< of them, until the writer's submission ran
+    u64 rest_ns[3]{};    ///< then until the download was there
+    u64 rest_max_ns[3]{};
+};
+
 struct State {
     std::mutex mutex;
     Counts counts;
+    TickCounts ticks;
     /// The "Read writer" lines: reads whose bytes a mark in the ring covers, by its writer.
     std::unordered_map<Writer, WriterStats, WriterHash> writers;
     u64 previous_page{std::numeric_limits<u64>::max()};
@@ -431,6 +477,36 @@ inline void NoteWriter(Kind kind, u64 wait_ns, const WriterAnswer& a, const u8* 
     const u64 age_ns = a.found && a.read_ns > a.mark.time_ns ? a.read_ns - a.mark.time_ns : 0;
     State& s = Get();
     std::scoped_lock lock{s.mutex};
+    if (g_writer_ticks && a.asked) {
+        TickCounts& t = s.ticks;
+        const size_t k = static_cast<size_t>(kind);
+        t.wait_ns[k] += wait_ns;
+        if (!a.area_found) {
+            ++t.no_mark[k];
+        } else {
+            ++t.reads[k];
+            const size_t state = a.write_tick >= a.read_tick    ? 0
+                                 : a.write_tick <= a.known_tick ? 2
+                                                                : 1;
+            ++t.state[k][state];
+            const u64 behind = a.read_tick > a.write_tick ? a.read_tick - a.write_tick : 0;
+            ++t.behind[k][behind == 0    ? 0
+                          : behind <= 2  ? 1
+                          : behind <= 5  ? 2
+                          : behind <= 10 ? 3
+                                         : 4];
+            t.behind_sum[k] += behind;
+            const u64 floor = (std::max)(a.write_tick, a.known_tick);
+            t.unrun_sum[k] += a.read_tick > floor + 1 ? a.read_tick - floor - 1 : 0;
+            ++t.kinds[k][static_cast<size_t>(a.area_mark.writer.kind)];
+            if (a.cut) {
+                ++t.cuts[k];
+                t.writer_ns[k] += a.writer_wait_ns;
+                t.rest_ns[k] += a.rest_wait_ns;
+                t.rest_max_ns[k] = (std::max)(t.rest_max_ns[k], a.rest_wait_ns);
+            }
+        }
+    }
     Counts& c = s.counts;
     if (!a.asked) {
         ++c.writer_not_asked;
@@ -605,6 +681,48 @@ inline void LogWriters(State& s, double frames) {
     s.writers.clear();
 }
 
+/// Log: the "Read writer ticks" lines, one per read kind that had reads (s.mutex held).
+inline void LogTicks(State& s, double frames) {
+    TickCounts& t = s.ticks;
+    static constexpr const char* KindNames[3] = {"flushed (new download)", "read download on its way",
+                                                 "fence download"};
+    for (size_t k = 0; k < 3; ++k) {
+        const u64 reads = t.reads[k];
+        if (reads == 0 && t.no_mark[k] == 0) {
+            continue;
+        }
+        const auto per_read = [reads](u64 value) {
+            return reads != 0 ? static_cast<double>(value) / static_cast<double>(reads) : 0.0;
+        };
+        const auto ms_per_cut = [&](u64 ns) {
+            return t.cuts[k] != 0 ? static_cast<double>(ns) / 1e6 / static_cast<double>(t.cuts[k])
+                                  : 0.0;
+        };
+        LOG_INFO(HW_GPU,
+                 "Read writer ticks (FRITCHII_READ_RUNS=2) last 600 frames, {}: {} reads with a "
+                 "write mark over their pages, {} without one in the ring | the mark's writer: "
+                 "dispatch storage {}, dispatch texture {}, draw storage {}, draw texture {}, "
+                 "other (copy, query, transform feedback) {} | its submission when the read "
+                 "asked: not submitted {}, submitted not run {}, run {} | the read's tick is "
+                 "{:.1f} submissions after the writer's (0: {}, 1-2: {}, 3-5: {}, 6-10: {}, more: "
+                 "{}), {:.1f} of them submitted and not run | waited {:.2f} ms a frame | host "
+                 "waits cut at the writer's tick {}: until the writer ran {:.3f} ms each, then "
+                 "until the download was there {:.3f} ms each (longest {:.2f})",
+                 KindNames[k], reads, t.no_mark[k],
+                 t.kinds[k][static_cast<size_t>(WriterKind::ComputeStorage)],
+                 t.kinds[k][static_cast<size_t>(WriterKind::ComputeTexture)],
+                 t.kinds[k][static_cast<size_t>(WriterKind::DrawStorage)],
+                 t.kinds[k][static_cast<size_t>(WriterKind::DrawTexture)],
+                 t.kinds[k][static_cast<size_t>(WriterKind::Other)], t.state[k][0], t.state[k][1],
+                 t.state[k][2], per_read(t.behind_sum[k]), t.behind[k][0], t.behind[k][1],
+                 t.behind[k][2], t.behind[k][3], t.behind[k][4], per_read(t.unrun_sum[k]),
+                 static_cast<double>(t.wait_ns[k]) / 1e6 / frames, t.cuts[k],
+                 ms_per_cut(t.writer_ns[k]), ms_per_cut(t.rest_ns[k]),
+                 static_cast<double>(t.rest_max_ns[k]) / 1e6);
+    }
+    t = TickCounts{};
+}
+
 /// BufferCache::TickFrame, every 600 frames (after advancing g_frame).
 inline void Log(int run_flush_mode) {
     State& s = Get();
@@ -667,6 +785,9 @@ inline void Log(int run_flush_mode) {
              c.sizes[3], c.sizes[4], ms_frame(B), ms_read(B), ms_frame(P), ms_read(P),
              ms_frame(U), ms_read(U), c.modified_differs);
     LogWriters(s, Frames);
+    if (g_writer_ticks) {
+        LogTicks(s, Frames);
+    }
     c = Counts{};
 }
 
