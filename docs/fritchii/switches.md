@@ -288,6 +288,24 @@ pages instead of at the end. What is trimmed stays the same; the unlock calls ar
 in more batches. Expected: the peak working set ~2 GB lower (no RAM is freed: the pages were RAM
 already; but Windows and the owner's tools stop seeing a 14.6 GB process). Judge: "Memory:" peak and
 "Zero-page pass" lines (same MiB trimmed, similar ms), hitch score unchanged.
+
+### FRITCHII_ZERO_TRIM_CHUNK
+
+TEST, off by default (helper CR, 2026-11-16). Live (debug server `switch`), Windows; read once at
+the start of each zero-page pass. The first big pass after the first area load (~530 MiB trimmed,
+~88 s after boot, ~48 s into play) takes each run of zero pages out of the working set with one
+VirtualUnlock call, and its longest runs take 30-46 ms. A guest VirtualProtect (the GPU cache's
+write traps) that lands in that call waits for it: host protect longest 21.6, 19.1 and 45.7 ms in
+the market, Castle Town and night market hitches of 62, 53 and 71 ms (b18-reg logs, the only long
+frames of steady play there, and the frame behind their 0.1% low). 0 = as before. 1 = a run goes
+in calls of at most 256 pages (1 MiB); N >= 2 = N pages a call. The same pages leave the working
+set and their contents are untouched (no verify mode: nothing differs). The pass lines ("Trimmed
+... MiB of all-zero guest pages" / "Zero-page pass") end with the mode, the unlock calls and the
+longest one, and the guest map/protect calls made while the pass unlocked and the longest one (the
+number to judge, with either value). Expected with 1: longest call ~1 ms, longest guest call a few
+ms at most, no Hitch: line at the pass. Test: fresh launches (the big pass comes once), market pin,
+with the flash watcher on (where it shows) and --noflash.
+
 ### FRITCHII_FORMATLESS_13
 
 TEST, off by default (helper BH, 2026-11-16, port of zortos293/Lichii #1874 by KevinLny, open
