@@ -131,6 +131,59 @@ try, K of them got memory of their own". Read the worst create's kind first: "co
 is what the pool removes; "depth in a block" points at EDEN_NX2_DEPTH_POOL_MIN_BLOCKS; "other in a
 block" at FRITCHII_KEEP_BLOCKS.
 
+### FRITCHII_DEPTH_POOL_BIG
+
+TEST, off by default (helper BA, 2026-11-16; the Castle Town load cluster). Live: 0 = as before,
+1 = a depth image the depth pool (EDEN_NX2_DEPTH_POOL, 64 MiB blocks) refuses is tried on the
+normal heap with VMA's budget check before it counts as "over the memory budget". Why: VMA refuses
+anything larger than a custom pool's block with VK_ERROR_OUT_OF_DEVICE_MEMORY before it looks at
+the budget, and every Castle Town load makes a 12288x12288 D16 depth target (288 MiB) right in the
+longest frame (raise-*-log.txt, 2026-11-16: "Image 12288x12288x1 ... format 124 is over the memory
+budget; allocating it anyway", then "Out of device memory: keeping 512 MiB more free"). That is a
+false pressure event: the texture cache keeps 512 MiB more free from then on (thresholds drop on
+cards where the budget binds, so 8 GB cards evict and upload again mid-load) and the image was
+placed with no budget check at all. Exact: only where the memory comes from. Log (first 8): "Depth
+image WxHxL (format F) refused by the depth pool, outside it: placed within the budget
+(FRITCHII_DEPTH_POOL_BIG, N so far)". How to judge: with 1 the "over the memory budget" and "Out of
+device memory" warnings are gone from the load; the hitch score should not move on a 16 GB card
+with EDEN_NX2_TC_CEILING_MIB set (the ceiling binds there), so this is a correctness fix first.
+
+### FRITCHII_HITCH_SPLIT
+
+Diagnostic, boot, default 0 (helper BA, 2026-11-16). 1 = the hitch line gets six more causes and
+the GPU threads' CPU time. Why: in the Castle Town load cluster 1.4-1.9 s of "recompiling code
+another core had" sat in gaps where the GPU threads were idle (the game waited on the recompiler),
+the 730-780 ms gap had the back busy 300-400 ms outside any span with 600k page faults, and the GPU
+threads never showed in "busiest threads" (only the first 48 named threads were measured; GPU,
+GPUBack and GPUMem start later). The new causes, shown only when they happened:
+- "recompiling code this core had compiled before (dropped since)": split out of "code another core
+  had". Large = blocks are dropped and compiled again (invalidations, fastmem faults); small with a
+  large "another core had" = the warm-up never reached those blocks on this core.
+- "game code dropped by invalidations (blocks)": blocks removed by range invalidations (kernel code
+  memory changes, instruction cache maintenance); count = blocks, time = the removal.
+- "game code dropped by fastmem faults (blocks)": blocks dropped to be compiled again without
+  fastmem for one access (guest writes to pages the GPU caches protect), once per access and core.
+- "warm compiles refused (code cache full)": precompiles refused because the code cache keeps its
+  free half; plus one line per core the first time: "JIT warm compiles refused from now on
+  (FRITCHII_HITCH_SPLIT) core c: code cache keeps K MiB free, near N MiB used, far F MiB used".
+  Refusals mean FRITCHII_JIT_CACHE_MIB is worth a test.
+- "staging buffers made" (MiB = their sizes) and "texture uploads (CPU side)" (MiB = mapped sizes;
+  includes the untiling and the first writes into new staging memory, so its page faults).
+- busiest threads: GPU, GPUBack, GPUMem and GPUBackE2 are measured even past the first 48 threads.
+Cost: a cached flag test per compile, staging buffer and upload when off; two clock reads each when
+on. Exact (counting only).
+
+### FRITCHII_JIT_CACHE_MIB
+
+TEST, boot, default 0 = 512 MiB (helper BA, 2026-11-16). 512-1536: the CPU recompiler's code cache
+per core in MiB. Why: precompiles (EDEN_NX2_JIT_WARM, FRITCHII_JIT_BLOCK_LIST's 649k-block warm-up)
+stop while half the cache (half the smaller region with FRITCHII_JIT_FAR_CODE: 96 MiB of 512) is
+free, so blocks the warm-up never reached are compiled at the area load, by each core that runs
+them. Exact: the same code, more room. Memory is committed only as code is written (up to the size
+per core, 4-6 cores). Log: "FRITCHII_JIT_CACHE_MIB=N: code cache of N MiB per core". Only worth a
+test when FRITCHII_HITCH_SPLIT=1 shows "warm compiles refused" before the load; judge by the load
+cluster's hitch score and its "another core had" time, fresh launches (boot setting).
+
 ### FRITCHII_STAGING_RING
 
 TEST, off by default (helper AO, 2026-11-15, port of DahBard/Blitchii's staging ring, r64). The

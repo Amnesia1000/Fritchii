@@ -392,6 +392,23 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     config.code_cache_size = std::uint32_t(512_MiB);
 #endif
 
+    // FRITCHII_JIT_CACHE_MIB (boot, default 0 = 512 MiB; 512-1536): a larger code cache per core.
+    // Precompiles (EDEN_NX2_JIT_WARM, FRITCHII_JIT_BLOCK_LIST) stop while half the space (half
+    // the smaller region with FRITCHII_JIT_FAR_CODE) is free, so a block list larger than that
+    // is compiled at area loads instead, by every core. Memory is committed as code is written.
+    if (const char* value = std::getenv("FRITCHII_JIT_CACHE_MIB"); value != nullptr) {
+        const unsigned long mib = std::strtoul(value, nullptr, 10);
+        if (mib >= 512 && mib <= 1536) {
+            config.code_cache_size = static_cast<std::uint32_t>(mib) << 20;
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                LOG_INFO(Core_ARM, "FRITCHII_JIT_CACHE_MIB={}: code cache of {} MiB per core", mib,
+                         mib);
+            }
+        }
+    }
+
     // Allow memory fault handling to work
     if (m_system.DebuggerEnabled()) {
         config.check_halt_on_memory_access = true;
