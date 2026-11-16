@@ -17,7 +17,8 @@
 // prunes its cache when other programs fill theirs.
 //
 // FRITCHII_PIPELINE_BINARY (boot, nx2_switches.txt):
-//   0 (default) off: the extension isn't enabled, nothing changes;
+//   0 off: the extension isn't enabled, nothing changes (the default, except on AMD's Windows
+//     driver where 1 is);
 //   1 load and save: pipelines are built from stored binaries, new ones are saved;
 //   2 load only: stored binaries are used, nothing new is saved;
 //   3 verify: as 1, and every 16th pipeline built from binaries is also compiled the normal way
@@ -25,6 +26,9 @@
 // FRITCHII_PIPELINE_BINARY_MAX_MB (boot): the file stops growing past this many MiB (6144).
 // FRITCHII_PIPELINE_BINARY_HARVEST=0 (boot): a pipeline the driver's own cache still holds is
 // compiled with capture like any other, instead of being taken from that cache.
+// FRITCHII_PIPELINE_BINARY_SHARED_MB (boot, 64): a binary several pipelines name (the same driver
+// key; NVIDIA gives every pipeline one 2 MiB binary) is made once and kept for the session, up to
+// this many MiB; 0 makes each pipeline's binaries for it alone.
 //
 // One file per game: <shader dir>/<title id>/pipeline_binaries.fritchii.bin, named by the device
 // and driver (vendor, device, driver id, driver version, pipeline cache UUID). A file of another
@@ -37,8 +41,12 @@ class Device;
 
 namespace PipelineBinary {
 
-/// FRITCHII_PIPELINE_BINARY: 0..3 (anything else is 0). Read once.
+/// FRITCHII_PIPELINE_BINARY: 0..3 when set (read once), else the default ChooseDefault picked.
 [[nodiscard]] int SwitchValue();
+
+/// The default when FRITCHII_PIPELINE_BINARY isn't set: 1 on AMD's Windows driver, else 0.
+/// Called by the device before it decides to enable the extension.
+void ChooseDefault(u32 vendor_id);
 
 /// Opens this game's store (LoadDiskResources). Nothing happens unless the device enabled
 /// VK_KHR_pipeline_binary (FRITCHII_PIPELINE_BINARY and the driver's support).

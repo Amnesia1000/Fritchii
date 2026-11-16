@@ -1824,7 +1824,9 @@ bool Device::GetSuitability(bool requires_swapchain) {
     }
 
     // VK_KHR_pipeline_binary (FRITCHII_PIPELINE_BINARY, vk_pipeline_binary.h): enabled only with
-    // the switch on. Its properties are read and logged whenever the driver offers it.
+    // the switch on (on by default for AMD's Windows driver). Its properties are read and logged
+    // whenever the driver offers it.
+    PipelineBinary::ChooseDefault(properties.properties.vendorID);
     pipeline_binary_offered = supported_extensions.contains(VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
     pipeline_binary_requested = pipeline_binary_offered && PipelineBinary::SwitchValue() != 0 &&
                                 supported_extensions.contains(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
@@ -2608,7 +2610,7 @@ void Device::RemoveUnsuitableExtensions() {
             pipeline_binary_features.pipelineBinaries = VK_FALSE;
         } else if (pipeline_binary_properties.pipelineBinaryPrefersInternalCache) {
             LOG_INFO(Render_Vulkan, "FRITCHII_PIPELINE_BINARY: the driver prefers its own cache; "
-                                    "the store runs anyway (switch set)");
+                                    "the store runs anyway");
         }
         pipeline_binary_enabled = usable;
     }

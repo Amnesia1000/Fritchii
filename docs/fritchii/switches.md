@@ -327,9 +327,10 @@ range, and the vendor fault codes. A driver without it logs "Device fault info: 
 the driver". Only the loss report reads it; nothing is drawn differently. FRITCHII_DEVICE_FAULT=0
 leaves the extension off, as before. Why: two AMD testers hit device losses with no clue in the log.
 
-### FRITCHII_PIPELINE_BINARY, FRITCHII_PIPELINE_BINARY_MAX_MB, FRITCHII_PIPELINE_BINARY_HARVEST
+### FRITCHII_PIPELINE_BINARY, FRITCHII_PIPELINE_BINARY_MAX_MB, FRITCHII_PIPELINE_BINARY_HARVEST, FRITCHII_PIPELINE_BINARY_SHARED_MB
 
-Off by default (helper CE, 2026-11-16). Boot. Fritchii keeps the compiled pipelines itself through
+Off by default, except 1 on AMD's Windows driver (helper CE, 2026-11-16; AMD default helper CW).
+Boot. Fritchii keeps the compiled pipelines itself through
 VK_KHR_pipeline_binary instead of trusting the driver's cache: 1 load and save, 2 load only, 3 load,
 save and verify (every 16th pipeline built from the store is also compiled normally and the driver's
 binary keys compared). The store is <shader dir>/<title id>/pipeline_binaries.fritchii.bin (+ .idx),
@@ -343,7 +344,18 @@ A device loss in a session that used the store starts it over at the next boot. 
 libraries (EDEN_NX2_GPL) are left to the driver: only whole pipelines go through the store. Log:
 "Pipeline binaries (...)" at boot, "Pipeline binaries so far/after the preparation/at exit: N hits
 (ms each), M misses (ms each, K taken from the driver's cache), ~S s of compiles saved ...".
-RAM cost (batch 14, 2026-11-16, RTX 4080, castletown 90 s): working set 10.7 -> 16.0 GB with =1 (620-931 pipelines stored, ~1.4 MiB each, 880-1293 MiB file); the driver's three 1 GiB arenas did not shrink. Not for 16 GB PCs as it is: find what holds the 5 GB first.
+RAM cost (batch 14, 2026-11-16, RTX 4080, castletown 90 s): working set 10.7 -> 16.0 GB with =1 (620-931 pipelines stored, ~1.4 MiB each, 880-1293 MiB file); the driver's three 1 GiB arenas did not shrink.
+What held it (helper CW): NVIDIA gives every pipeline one 2048 KiB binary with the same key, besides
+its own 4-110 KiB ones (97% of every entry). Each pipeline built from binaries got its own copy of
+that blob in the driver's arenas (two extra 2 GiB and one extra 1 GiB arena in the census, 2,369
+pipelines x ~2.2 MiB). FRITCHII_PIPELINE_BINARY_SHARED_MB (64; 0 = as before) makes a binary that a
+second pipeline names once and keeps it for the session, so every later pipeline names the same
+handle (from the store, from the driver's cache or from a capture). Log every 10 s and at exit:
+"Pipeline binaries RAM: store index X MiB, blobs held Y MiB (peak P), queued for the file Q MiB,
+binaries alive N (K kept shared, S MiB, R reuses), captured data unreleased M". AMD's binaries are
+~35 KB per pipeline (no shared blob seen), so its cost is the index (~7 MiB for 120k) plus the
+writer queue (256 MiB cap, only while saving). The file still holds the blob in every entry (same
+format): ~4,400 NVIDIA pipelines fit the 6 GiB cap.
 Why: AMD's Windows driver keeps ~30% of the 120k prepared pipelines and compiles the rest again at first use
 (0.2-1.1 s each, the 1 s stalls); NVIDIA on Linux prunes its cache.
 
