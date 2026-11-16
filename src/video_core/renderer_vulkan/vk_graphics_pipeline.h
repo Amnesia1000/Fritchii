@@ -135,6 +135,8 @@ struct MeshEmulationSetup {
     u32 max_primitives{}; ///< primitives per mesh workgroup
     /// Vertices per primitive: 3 triangles, 2 lines, 1 points (the draw's topology).
     u32 primitive_vertices{3};
+    /// Generic location carrying the mesh program's PrimitiveId to the pixel program, ~0 if none
+    u32 primitive_id_location{~0U};
     // With a task program (stage 0, the mesh program at mesh_stage): its payload buffer and the
     // distribution pass's offsets and arguments (Shader::RuntimeInfo), and that pass's shader.
     bool has_task{};
