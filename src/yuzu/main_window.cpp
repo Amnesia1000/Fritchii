@@ -188,6 +188,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "video_core/gpu.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
+#include "video_core/small_card.h"
 
 #include <SDL3/SDL.h>
 
@@ -5537,8 +5538,14 @@ void MainWindow::UpdateStatusBar() {
 
     const auto res_info = Settings::values.resolution_info;
     const auto res_scale = res_info.up_factor;
-    res_scale_label->setText(
-        tr("Scale: %1x", "%1 is the resolution scaling factor").arg(res_scale));
+    QString res_scale_text =
+        tr("Scale: %1x", "%1 is the resolution scaling factor").arg(res_scale);
+    // Fritchii's small card profile turned a larger scale down to 1x for this session.
+    if (const float refused = VideoCore::SmallCard::RefusedScale(); refused > 0.0f) {
+        res_scale_text += tr(" (%1x DOESN'T FIT)", "A resolution scale too big for the video memory")
+                              .arg(refused);
+    }
+    res_scale_label->setText(res_scale_text);
 
     if (Settings::SpeedLimitEnabled()) {
         emu_speed_label->setText(tr("Speed: %1% / %2%")

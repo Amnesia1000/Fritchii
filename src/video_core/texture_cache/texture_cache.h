@@ -37,6 +37,7 @@
 #include "video_core/memory_stage_link.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_fastdraw_count.h"
+#include "video_core/small_card.h"
 #include "video_core/texture_cache/host_memory_limit.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/texture_cache/conversion.h"
@@ -675,6 +676,21 @@ bool TextureCache<P>::IsAllStale(DAddr addr, size_t size) const {
 }
 
 template <class P>
+u64 TextureCache<P>::UncountedDeviceBytes() const {
+    // The same subtractions TickFrame makes from the driver's usage.
+    u64 bytes = std::accumulate(sentenced_image_bytes.begin(), sentenced_image_bytes.end(),
+                                gpu_sentenced_bytes) +
+                collect_download_memory;
+    if constexpr (requires { runtime.PendingImageFreeBytes(); }) {
+        bytes += runtime.PendingImageFreeBytes();
+    }
+    if constexpr (requires { runtime.PooledImageBytes(); }) {
+        bytes += runtime.PooledImageBytes();
+    }
+    return bytes;
+}
+
+template <class P>
 void TextureCache<P>::ApplyThresholdOverrides(bool log) {
     // Past what a frame needs, more device memory only keeps the textures of earlier scenes
     // (title 1 filled 6.7 GB of an 8 GB card and draws its races in ~5 GB), so collect from
@@ -693,6 +709,11 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
         // a 24 ms texture stall every ~3 s. Keep 2.5 GiB of the budget for everything else instead.
         if (budget >= 10_GiB) {
             max_critical = (std::max)(max_critical, budget - 2560_MiB);
+        } else if (budget > 2_GiB && VideoCore::SmallCard::On(VideoCore::SmallCard::Fit)) {
+            // FRITCHII_SMALL_CARD (part Fit): the budget check in TickFrame subtracts everything
+            // the usage leaves out, so its result needs no fixed cap; the cap only kept textures
+            // from the room the uncounted image pool and in-flight frees then took.
+            max_critical = (std::max)(max_critical, budget - SmallCardMargin(budget));
         } else if (budget > 4_GiB &&
                    VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_vram_critical_fit,
                                                     "FRITCHII_VRAM_CRITICAL_FIT") != 0) {
@@ -781,7 +802,19 @@ void TextureCache<P>::TickFrame() {
                     const u32 events = runtime.MemoryPressureEvents();
                     if (events != seen_pressure_events) {
                         seen_pressure_events = events;
-                        pressure_margin = (std::min)(pressure_margin + 512_MiB, 3_GiB);
+                        // FRITCHII_SMALL_CARD (part Fit): at most 1/8 of the budget. An RTX
+                        // 2080 (budget ~7 GiB) loading Castle Town had ~60 refused images in
+                        // 0.5 s: the margin climbed to 3 GiB, critical fell to ~3.6 GiB and the
+                        // collector evicted and downloaded the scene it was drawing (read-backs
+                        // of 50-120 ms for seconds). Fit already keeps the uncounted memory out.
+                        u64 pressure_cap = 3_GiB;
+                        if (VideoCore::SmallCard::On(VideoCore::SmallCard::Fit)) {
+                            if constexpr (requires { runtime.GetDeviceMemoryBudget(); }) {
+                                pressure_cap = (std::max)(runtime.GetDeviceMemoryBudget() / 8,
+                                                          u64{512_MiB});
+                            }
+                        }
+                        pressure_margin = (std::min)(pressure_margin + 512_MiB, pressure_cap);
                         pressure_quiet_frames = 0;
                         budget_check_frames = 0; // thresholds are recomputed below
                         LOG_WARNING(HW_GPU, "Out of device memory: keeping {} MiB more free",
@@ -809,8 +842,29 @@ void TextureCache<P>::TickFrame() {
                                            ? slack
                                            : slack_margin - (std::min)(slack_margin - slack, 16_MiB);
                     }
-                    critical_memory =
-                        budget - (std::min)(margin + pressure_margin + slack_margin, budget / 2);
+                    // FRITCHII_SMALL_CARD (part Fit): what the usage leaves out (the image pool,
+                    // deleted images still in flight, collector downloads) is memory the driver
+                    // counts. Kept out of the thresholds, the cache filled to critical and those
+                    // went on top: up to ~1.2 GiB past the 1/8 margin at the market (pool 1 GiB),
+                    // over the budget of an 8 GB card at 1440p and of every 6 GB card. Reserved
+                    // like the slack: at once when it grows, 16 MiB a check when it shrinks.
+                    // The margin then only covers growth between checks and the budget
+                    // shrinking: 1/16 of the budget, at most 512 MiB.
+                    u64 critical_margin = margin;
+                    if (VideoCore::SmallCard::On(VideoCore::SmallCard::Fit)) {
+                        const u64 held = UncountedDeviceBytes();
+                        held_margin = held >= held_margin
+                                          ? held
+                                          : held_margin - (std::min)(held_margin - held, 16_MiB);
+                        critical_margin = SmallCardMargin(budget) + held_margin;
+                        pressure_margin = (std::min)(
+                            pressure_margin, (std::max)(budget / 8, u64{512_MiB}));
+                    } else {
+                        held_margin = 0;
+                    }
+                    critical_memory = budget - (std::min)(critical_margin + pressure_margin +
+                                                              slack_margin,
+                                                          budget / 2);
                     // Ported fix: the device's budget is not all the room there is.
                     // Windows charges device memory to the system's commit limit, so the cache
                     // may also hold no more than the device memory in use plus the commit still
@@ -844,8 +898,12 @@ void TextureCache<P>::TickFrame() {
                                  expected_memory >> 20, critical_memory >> 20,
                                  minimum_memory >> 20);
                         LOG_INFO(HW_GPU,
-                                 "Memory margins: base {} MiB, out of memory {} MiB, block slack {} MiB",
-                                 margin >> 20, pressure_margin >> 20, slack_margin >> 20);
+                                 "Memory margins: base {} MiB, out of memory {} MiB, block slack {} "
+                                 "MiB, uncounted {} MiB (small card profile {})",
+                                 (critical_margin - held_margin) >> 20, pressure_margin >> 20,
+                                 slack_margin >> 20, held_margin >> 20,
+                                 VideoCore::SmallCard::On(VideoCore::SmallCard::Fit) ? "on"
+                                                                                     : "off");
                         if (commit_room) {
                             LOG_INFO(HW_GPU, "Host memory: {} MiB of commit left, {}",
                                      *commit_room >> 20,
