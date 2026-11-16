@@ -1634,6 +1634,110 @@ void PlacePrecompileThread(bool full) {
     }
 }
 
+int ReadSwitch(const char* name) {
+    const char* value = std::getenv(name);
+    return value != nullptr && *value != '\0' ? std::atoi(value) : 0;
+}
+
+// FRITCHII_PREP_ORDER (boot, default 0): 1 = the preparation takes the records recent sessions
+// drew first (the used list, newest first), then those of the disk cache, then the compute
+// records (a missed compute pointer state stalls ~4 s; they sit at the end of the file), then the
+// rest in file order (recorded pipelines, then predicted ones). The file carries no hit counts:
+// recorded pipelines already come first in it (build_precompiled.py). An Arc B580 prepared only
+// the first 4,732 of 120,461 records in a session (2026-11-16).
+int PrepOrderMode() {
+    static const int mode = ReadSwitch("FRITCHII_PREP_ORDER");
+    return mode;
+}
+
+// FRITCHII_PREP_THROTTLE (boot, default 0): beside the game (not at full speed, not paused),
+// 1 = the preparation parks for 3 s after a frame over 50 ms or a draw held for an unbuilt
+// pipeline, so the runtime builds get the driver's compiler; 2 = as 1, and half the threads
+// (at least one), and on Intel one thread instead of none.
+int PrepThrottleMode() {
+    static const int mode = ReadSwitch("FRITCHII_PREP_THROTTLE");
+    return mode;
+}
+
+// Until when (steady clock, ns) the throttled preparation stays parked; set by TickFrame.
+std::atomic<s64> prep_quiet_until{0};
+
+s64 SteadyNanoseconds(std::chrono::steady_clock::time_point time) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(time.time_since_epoch()).count();
+}
+
+void NotePrepFrame(std::chrono::steady_clock::time_point now,
+                   std::chrono::steady_clock::duration frame_time,
+                   std::chrono::nanoseconds held) {
+    if (PrepThrottleMode() == 0) {
+        return;
+    }
+    if (frame_time > std::chrono::milliseconds{50} || held > std::chrono::nanoseconds{0}) {
+        prep_quiet_until.store(SteadyNanoseconds(now + std::chrono::seconds{3}),
+                               std::memory_order_relaxed);
+    }
+}
+
+bool PrepShouldYield() {
+    return SteadyNanoseconds(std::chrono::steady_clock::now()) <
+           prep_quiet_until.load(std::memory_order_relaxed);
+}
+
+std::string DurationText(double seconds) {
+    if (seconds < 60.0) {
+        return "under a minute";
+    }
+    const long minutes = static_cast<long>(seconds / 60.0 + 0.5);
+    if (minutes < 60) {
+        return fmt::format("{} min", minutes);
+    }
+    return fmt::format("{} h {} min", minutes / 60, minutes % 60);
+}
+
+// precompiled_order.fork-v<N>.bin: the order a FRITCHII_PREP_ORDER preparation takes the records
+// in, so its checkpoint (a position in that order) resumes the same order.
+constexpr u32 PrepOrderMagic = 0x314F5046; // "FPO1"
+
+std::vector<u32> LoadPrepOrder(const std::filesystem::path& path, const std::string& stamp,
+                               size_t total) {
+    std::ifstream in(path, std::ios::binary);
+    u32 magic{}, count{}, stamp_size{};
+    if (!in.read(reinterpret_cast<char*>(&magic), sizeof(magic)) || magic != PrepOrderMagic ||
+        !in.read(reinterpret_cast<char*>(&count), sizeof(count)) || count != total ||
+        !in.read(reinterpret_cast<char*>(&stamp_size), sizeof(stamp_size)) ||
+        stamp_size != stamp.size()) {
+        return {};
+    }
+    std::string saved(stamp_size, '\0');
+    std::vector<u32> order(total);
+    if (!in.read(saved.data(), stamp_size) || saved != stamp ||
+        !in.read(reinterpret_cast<char*>(order.data()),
+                 static_cast<std::streamsize>(total * sizeof(u32)))) {
+        return {};
+    }
+    std::vector<u8> seen(total, 0);
+    for (const u32 index : order) {
+        if (index >= total || seen[index]) {
+            return {};
+        }
+        seen[index] = 1;
+    }
+    return order;
+}
+
+void SavePrepOrder(const std::filesystem::path& path, const std::string& stamp,
+                   std::span<const u32> order) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    const u32 count = static_cast<u32>(order.size());
+    const u32 stamp_size = static_cast<u32>(stamp.size());
+    out.write(reinterpret_cast<const char*>(&PrepOrderMagic), sizeof(PrepOrderMagic));
+    out.write(reinterpret_cast<const char*>(&count), sizeof(count));
+    out.write(reinterpret_cast<const char*>(&stamp_size), sizeof(stamp_size));
+    out.write(stamp.data(), stamp_size);
+    out.write(reinterpret_cast<const char*>(order.data()),
+              static_cast<std::streamsize>(order.size() * sizeof(u32)));
+}
+
 // EDEN_NX2_PRELOAD_ALL_PIPELINES=1 builds every cached pipeline at boot, as before.
 bool PreloadAllPipelines() {
     static const bool all = [] {
@@ -4558,6 +4662,7 @@ void PipelineCache::StartPrecompiled(u64 title_id, const std::filesystem::path& 
     }
     // Taken here, before the GPU thread starts adding to it.
     precompile_disk_keys = std::make_shared<const std::unordered_set<u64>>(disk_pipelines);
+    precompile_used_keys = std::make_shared<const std::unordered_map<u64, u8>>(used_pipelines);
     // Pending until the first preparation ends (or there is nothing to prepare); set before the
     // thread starts so a frontend asking right after loading sees it.
     shader_notify.SetPrecompilePending(true);
@@ -4705,6 +4810,14 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     // The environment index and where each record starts; records are read again when built.
     std::vector<std::pair<u64, u64>> env_index;
     std::vector<u64> record_offsets;
+    // FRITCHII_PREP_ORDER: each record's rank (lower first): the used list's age, then the disk
+    // cache, compute, the rest.
+    const int order_mode = PrepOrderMode();
+    constexpr u8 RankDisk = 32;
+    constexpr u8 RankCompute = 33;
+    constexpr u8 RankRest = 34;
+    std::vector<u8> record_rank;
+    const auto used_keys = precompile_used_keys;
     try {
         std::ifstream in(path, std::ios::binary);
         in.exceptions(std::ifstream::failbit);
@@ -4754,8 +4867,32 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                 LOG_ERROR(Render_Vulkan, "Precompiled pipeline file {} is damaged", path_text);
                 return;
             }
-            in.seekg(compute ? sizeof(ComputePipelineCacheKey) : sizeof(GraphicsPipelineCacheKey),
-                     std::ios::cur);
+            if (order_mode == 0) {
+                in.seekg(compute ? sizeof(ComputePipelineCacheKey)
+                                 : sizeof(GraphicsPipelineCacheKey),
+                         std::ios::cur);
+                continue;
+            }
+            if (compute) {
+                in.seekg(sizeof(ComputePipelineCacheKey), std::ios::cur);
+                record_rank.push_back(RankCompute);
+                continue;
+            }
+            GraphicsPipelineCacheKey key{};
+            in.read(reinterpret_cast<char*>(&key), sizeof(key));
+            RecordedKeyForThisDevice(key);
+            const u64 hash = key.Hash();
+            u8 rank = RankRest;
+            if (used_keys) {
+                if (const auto used = used_keys->find(hash); used != used_keys->end()) {
+                    rank = (std::min)(used->second, static_cast<u8>(RankDisk - 1));
+                }
+            }
+            if (rank == RankRest && precompile_disk_keys &&
+                precompile_disk_keys->contains(hash)) {
+                rank = RankDisk;
+            }
+            record_rank.push_back(rank);
         }
     } catch (const std::ios_base::failure& e) {
         LOG_ERROR(Render_Vulkan, "Cannot read precompiled pipelines: {}", e.what());
@@ -4771,6 +4908,9 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         CapLegacyAmdBuildThreads(device, VideoCommon::Nx2Precompile::Threads());
     size_t start_index = 0;
     u32 restarts = 0;
+    // The checkpoint is a position in the order the records are taken in: the file's order, or
+    // with FRITCHII_PREP_ORDER the one saved beside it (a third number, 1, in the progress file).
+    u32 saved_order_mode = 0;
     if (!force) {
         std::ifstream progress_file(progress_path, std::ios::binary);
         std::string line;
@@ -4780,6 +4920,22 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
             (progress_file >> next >> count)) {
             start_index = std::min(next, total);
             restarts = count + 1;
+            if (!(progress_file >> saved_order_mode)) {
+                saved_order_mode = 0;
+            }
+        }
+    }
+    const auto order_path =
+        base_dir / fmt::format("precompiled_order.fork-v{}.bin", CACHE_VERSION);
+    std::vector<u32> saved_order;
+    if (start_index > 0 && saved_order_mode != 0) {
+        saved_order = LoadPrepOrder(order_path, stamp, total);
+        if (saved_order.empty()) {
+            LOG_INFO(Render_Vulkan, "Precompiled pipelines: the order of the checkpoint at {} is "
+                                    "gone, starting from the first record",
+                     start_index);
+            start_index = 0;
+            restarts = 0;
         }
     }
     if (restarts >= 2) {
@@ -4842,13 +4998,64 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
             }
         }
     }
+    // The order: positions before the checkpoint as the earlier run took them, then the rest by
+    // rank (FRITCHII_PREP_ORDER) or as the earlier run would have. Empty: the file's order.
+    std::vector<u32> order;
+    if (!record_rank.empty() || !saved_order.empty()) {
+        order.reserve(total);
+        std::vector<u8> taken(total, 0);
+        for (size_t position = 0; position < start_index; ++position) {
+            const u32 index =
+                saved_order.empty() ? static_cast<u32>(position) : saved_order[position];
+            order.push_back(index);
+            taken[index] = 1;
+        }
+        if (record_rank.size() == total) {
+            std::vector<u32> rest;
+            rest.reserve(total - start_index);
+            for (u32 index = 0; index < total; ++index) {
+                if (!taken[index]) {
+                    rest.push_back(index);
+                }
+            }
+            std::ranges::stable_sort(rest, [&](u32 lhs, u32 rhs) {
+                return record_rank[lhs] < record_rank[rhs];
+            });
+            order.insert(order.end(), rest.begin(), rest.end());
+            std::array<size_t, 4> counts{};
+            for (const u32 index : rest) {
+                const u8 rank = record_rank[index];
+                ++counts[rank < RankDisk ? 0 : rank - RankDisk + 1];
+            }
+            LOG_INFO(Render_Vulkan,
+                     "Precompiled pipelines in order of likely use (FRITCHII_PREP_ORDER=1): {} "
+                     "the used list holds ({} keys in it), {} the disk cache holds, {} compute, "
+                     "then {} in file order; {} taken before the checkpoint",
+                     counts[0], used_keys ? used_keys->size() : 0, counts[1], counts[2], counts[3],
+                     start_index);
+        } else {
+            for (size_t position = start_index; position < total; ++position) {
+                order.push_back(saved_order[position]);
+            }
+        }
+        bool identity = true;
+        for (size_t position = 0; position < total && identity; ++position) {
+            identity = order[position] == position;
+        }
+        if (identity) {
+            order.clear();
+        } else {
+            SavePrepOrder(order_path, stamp, order);
+        }
+    }
+    const u32 order_saved = order.empty() ? 0 : 1;
     const auto write_progress = [&](size_t next, u32 count) {
         if (keeping) {
             // The kept entries of every record before the checkpoint are on disk first.
             writer.Flush();
         }
         std::ofstream progress_file(progress_path, std::ios::binary | std::ios::trunc);
-        progress_file << stamp << next << ' ' << count << '\n';
+        progress_file << stamp << next << ' ' << count << ' ' << order_saved << '\n';
     };
     write_progress(start_index, restarts);
 
@@ -4874,15 +5081,22 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         std::atomic<size_t> compute_programs_proven{};
         std::atomic<size_t> graphics_storage{};
         std::atomic<size_t> graphics_storage_proven{};
-        size_t low_water{};              ///< first record not finished yet (under mutex)
+        size_t low_water{};              ///< first position not finished yet (under mutex)
         size_t checkpoint{};
-        std::vector<u8> done;
+        std::vector<u8> done;            ///< By position in the order
         WarmProgressThrottle throttle;
+        /// The minute's rate and time left (under mutex): since when, finished then.
+        std::chrono::steady_clock::time_point rate_since{};
+        size_t rate_finished{};
+        /// FRITCHII_PREP_THROTTLE: ms worker 0 stayed parked for frame spikes.
+        std::atomic<u64> yielded_ms{};
     } state;
     state.done.assign(total, 0);
     state.next = start_index;
     state.finished = start_index;
     state.low_water = state.checkpoint = start_index;
+    state.rate_since = std::chrono::steady_clock::now();
+    state.rate_finished = start_index;
     // A pipeline the driver finds in its cache builds in a few ms here (translation included);
     // a compile takes tens to hundreds.
     constexpr auto FastBuild = std::chrono::milliseconds{20};
@@ -4902,23 +5116,57 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         return value != nullptr && value[0] == '1';
     }();
     const bool hold_beside_game = IntelDriverCache(device) && !while_playing;
+    // FRITCHII_PREP_THROTTLE=2: fewer threads beside the game, and on Intel one instead of none.
+    const int throttle_mode = PrepThrottleMode();
     const auto allowed_threads = [&](bool full) -> size_t {
         if (full) {
             return full_threads;
         }
-        return hold_beside_game && !shader_notify.WarmMayBuild() ? 0 : threads;
+        if (shader_notify.WarmMayBuild()) {
+            return threads;
+        }
+        if (hold_beside_game) {
+            return throttle_mode >= 2 ? 1 : 0;
+        }
+        return throttle_mode >= 2 ? (std::max<size_t>)(1, threads / 2) : threads;
     };
-    const auto complete = [&](size_t index) {
+    const auto complete = [&](size_t position) {
         const size_t finished = state.finished.fetch_add(1) + 1;
         {
             std::scoped_lock lock{state.mutex};
-            state.done[index] = 1;
+            state.done[position] = 1;
             while (state.low_water < total && state.done[state.low_water]) {
                 ++state.low_water;
             }
             if (state.low_water >= state.checkpoint + 512) {
                 state.checkpoint = state.low_water;
                 write_progress(state.low_water, 0);
+            }
+            // Once a minute: the rate and the time left at it (a slow driver's preparation can
+            // take hours; the log said nothing until 5,000 were done).
+            const auto now = std::chrono::steady_clock::now();
+            const double window =
+                std::chrono::duration<double>(now - state.rate_since).count();
+            if (window >= 60.0) {
+                const double rate =
+                    static_cast<double>(finished - state.rate_finished) / window;
+                const bool full = shader_notify.PrecompileFullSpeed();
+                const bool asked = !full && shader_notify.WarmMayBuild();
+                LOG_INFO(Render_Vulkan,
+                         "Precompiled pipelines: {} of {} ({:.1f}%), {:.1f} a second in the last "
+                         "{:.0f} s ({}, {} threads, {:.0f} s parked for frame spikes); {} left at "
+                         "this rate",
+                         finished, total, 100.0 * static_cast<double>(finished) / total, rate,
+                         window,
+                         full    ? "full speed"
+                         : asked ? "paused or Prepare Shaders Now"
+                                 : "beside the game",
+                         allowed_threads(full),
+                         static_cast<double>(state.yielded_ms.exchange(0)) / 1000.0,
+                         rate > 0.0 ? DurationText(static_cast<double>(total - finished) / rate)
+                                    : std::string{"no estimate"});
+                state.rate_since = now;
+                state.rate_finished = finished;
             }
         }
         if (state.throttle.Due()) {
@@ -4960,14 +5208,28 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                 std::this_thread::sleep_for(std::chrono::milliseconds{100});
                 continue;
             }
+            // FRITCHII_PREP_THROTTLE: beside the game, parked for 3 s after a frame spike or a
+            // draw held for an unbuilt pipeline (the game's own builds need the compiler then).
+            if (throttle_mode != 0 && !full && !shader_notify.WarmMayBuild() &&
+                PrepShouldYield()) {
+                if (state.next.load() >= total) {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds{100});
+                if (worker == 0) {
+                    state.yielded_ms += 100;
+                }
+                continue;
+            }
             if (placed_full != full) {
                 PlacePrecompileThread(full);
                 placed_full = full;
             }
-            const size_t index = state.next.fetch_add(1);
-            if (index >= total) {
+            const size_t position = state.next.fetch_add(1);
+            if (position >= total) {
                 break;
             }
+            const size_t index = order.empty() ? position : order[position];
             bool ok = false;
             bool skipped = false;
             const auto build_begin = std::chrono::steady_clock::now();
@@ -5115,13 +5377,14 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                     ++state.fast;
                 }
             }
-            complete(index);
+            complete(position);
         }
     };
     LOG_INFO(Render_Vulkan,
              "Preparing {} precompiled pipelines from {}, from record {}, on {} idle threads ({} "
-             "at full speed)",
-             total, path_text, start_index, threads, full_threads);
+             "at full speed), FRITCHII_PREP_ORDER={} FRITCHII_PREP_THROTTLE={}",
+             total, path_text, start_index, threads, full_threads, order.empty() ? 0 : 1,
+             throttle_mode);
     shader_notify.SetWarmProgress(3, start_index, total);
     if (callback) {
         callback(VideoCore::LoadCallbackStage::Build, start_index, total);
@@ -5147,6 +5410,13 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
              state.built.load(), state.fast.load(), FastBuild.count(), state.failed.load(),
              state.known.load() + state.other_device.load(), state.known.load(),
              state.other_device.load(), total - reached, seconds);
+    if (reached < total && reached > start_index && seconds > 0.0) {
+        const double rate = static_cast<double>(reached - start_index) / seconds;
+        LOG_INFO(Render_Vulkan,
+                 "Precompiled pipelines: {:.1f} a second over this run (held and parked time "
+                 "included), the {} left take about {} more at that rate",
+                 rate, total - reached, DurationText(static_cast<double>(total - reached) / rate));
+    }
     LogDriverCacheFolder(device, "after the preparation");
     PipelineBinary::LogCounts("after the preparation");
     if (state.other_device.load() != 0) {
@@ -6445,6 +6715,7 @@ void ReportWorstFrame() {
         if (frame.time > worst.time) {
             worst = frame;
         }
+        NotePrepFrame(now, frame.time, frame.held);
     }
     last_tick = now;
     last_held = held_total;
