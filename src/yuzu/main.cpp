@@ -38,6 +38,7 @@
 
 #include "main_window.h"
 #include "fritchii/fritchii_ui.h"
+#include "util/profiling_mode.h"
 #ifdef ENABLE_UPDATE_CHECKER
 #include "updater/update_dialog.h"
 #endif
@@ -292,11 +293,28 @@ static void LoadNx2Switches(const char* argv0) {
         take(std::move(file), 1);
     }
 
+    // Profiling mode (Help > Profiling Mode): its switches fill in what the files and the
+    // environment leave unset; they beat only a built-in value.
+    std::string profiling_applied;
+    if (ProfilingMode::OnAtLaunch()) {
+        for (const auto& [name, value] : ProfilingMode::Switches()) {
+            const auto it = origin.find(name);
+            if ((it == origin.end() || it->second == 3) && !from_environment.contains(name)) {
+                entries.insert_or_assign(name, value);
+                origin.insert_or_assign(name, 4);
+                profiling_applied +=
+                    fmt::format("{}{}={}", profiling_applied.empty() ? "" : ", ", name, value);
+            }
+        }
+    }
+    ProfilingMode::SetApplied(std::move(profiling_applied));
+
     // "environment: A=1; user nx2_switches.txt: B=2; nx2_switches.txt next to the exe: C=1;
-    // built in: D=1, E=0". Anything else under these prefixes (a typo, a retired name) shows
-    // too, so it can be spotted.
+    // built in: D=1, E=0; profiling mode: F=1". Anything else under these prefixes (a typo, a
+    // retired name) shows too, so it can be spotted.
     constexpr const char* SourceNames[] = {"environment", "user nx2_switches.txt",
-                                           "nx2_switches.txt next to the exe", "built in"};
+                                           "nx2_switches.txt next to the exe", "built in",
+                                           "profiling mode"};
     std::vector<std::string> groups(std::size(SourceNames));
     const auto add = [&groups](int source, const std::string& name, const std::string& value) {
         groups[source] += fmt::format("{}{}={}", groups[source].empty() ? "" : ", ", name, value);
@@ -334,6 +352,9 @@ int main(int argc, char* argv[]) {
     // Before the switches are added to the environment, which a restart must not inherit.
     Updater::PrepareLaunch();
 #endif
+    // Profiling mode's saved setting and the clean environment for its restart, before the
+    // switches are added.
+    ProfilingMode::ReadAtLaunch();
     LoadNx2Switches(argv[0]);
     // Fritchii: NVIDIA's driver shader cache must hold OoT's ~120,000 prepared pipelines. Its size
     // is a Control Panel setting newer drivers no longer show ("Shader Cache Size"); the driver
