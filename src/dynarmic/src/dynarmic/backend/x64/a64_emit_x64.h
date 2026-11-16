@@ -73,6 +73,7 @@ public:
     void ClearFastDispatchTable();
     void GenMemory128Accessors();
     void GenFastmemFallbacks();
+    void GenCntpctFallback();
     void GenTerminalHandlers();
 
     // Microinstruction emitters
@@ -143,6 +144,8 @@ public:
     ::Common::unordered_set<DoNotFastmemMarker> do_not_fastmem;
     boost::container::stable_vector<Xbyak::Label> shared_labels;
     const void* terminal_handler_pop_rsb_hint = nullptr;
+    /// FRITCHII_JIT_INLINE_CNTPCT: calls GetCNTPCT, result in rdx, every other register kept.
+    const void* cntpct_fallback = nullptr;
     const void* terminal_handler_fast_dispatch_hint = nullptr;
     FastDispatchEntry& (*fast_dispatch_table_lookup)(u64) = nullptr;
 

@@ -22,6 +22,7 @@
 #include "common/thread.h"
 #include "core/core_timing.h"
 #include "core/hardware_properties.h"
+#include "core/hle/kernel/nx2_thread_stats.h"
 #include "video_core/nx2_debug_control.h"
 
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
@@ -157,6 +158,44 @@ constexpr u32 CpuClockTargetMhz(Settings::CpuClock clock) {
     default:
         return CPU_CLOCK_BASE_MHZ;
     }
+}
+
+std::atomic<u64> g_inline_cntpct_factor{};
+static_assert(sizeof(std::atomic<u64>) == sizeof(u64) && std::atomic<u64>::is_always_lock_free);
+
+bool InlineCntpctEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("FRITCHII_JIT_INLINE_CNTPCT");
+        if (value == nullptr || value[0] == '\0' || value[0] == '0') {
+            return false;
+        }
+#if defined(ARCHITECTURE_x86_64)
+        if (!Common::g_wall_clock.IsNative()) {
+            LOG_INFO(Core_Timing, "FRITCHII_JIT_INLINE_CNTPCT: off, the wall clock is not the TSC "
+                                  "(counter reads stay host calls)");
+            return false;
+        }
+        LOG_INFO(Core_Timing, "FRITCHII_JIT_INLINE_CNTPCT: guest counter reads computed in the "
+                              "JIT (host call while the CPU clock is not Normal, core speed sync "
+                              "or guest thread stats are on)");
+        return true;
+#else
+        return false;
+#endif
+    }();
+    return enabled;
+}
+
+void RefreshInlineCntpct() {
+    u64 factor = 0;
+#if defined(ARCHITECTURE_x86_64)
+    if (InlineCntpctEnabled() &&
+        CpuClockTargetMhz(Settings::values.cpu_clock.GetValue()) == CPU_CLOCK_BASE_MHZ &&
+        !Settings::values.sync_core_speed.GetValue() && !Kernel::Nx2ThreadStats::g_enabled) {
+        factor = Common::g_wall_clock.cntpct_rdtsc_factor.load(std::memory_order_relaxed);
+    }
+#endif
+    g_inline_cntpct_factor.store(factor, std::memory_order_relaxed);
 }
 
 std::shared_ptr<EventType> CreateEvent(std::string name, TimedCallback&& callback) {

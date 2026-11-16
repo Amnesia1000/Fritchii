@@ -4318,6 +4318,30 @@ instead of mfence. 2 = only the plain loads, 3 = only the DMB change (to split a
 - Our earlier revert (50d9c09292, the Kokiri slab) came with the rest of #161; the slab's likely
   cause is #161's GPU parts, see helper_at_answer.md. Check the Kokiri Forest spot with it on.
 
+### FRITCHII_JIT_INLINE_CNTPCT
+
+FRITCHII_JIT_INLINE_CNTPCT (boot, default 0; helper BR, 2026-11-16, idea from bakemono's handoff
+and Blitchii). x86-64 hosts with the TSC wall clock only (multicore). 1 = a guest CNTPCT_EL0 read
+is computed in the block (`lfence; rdtsc; lfence`, times the wall clock's factor, high 64 bits)
+instead of a host call that saves every live register and goes through CoreTiming::GetClockTicks.
+- Same value, bit for bit: it is WallClock::GetCNTPCT's own sum. The factor is read from memory
+  at every read, and it is 0 while GetClockTicks would differ (CPU clock not Normal, core speed
+  sync, EDEN_NX2_GUEST_THREAD_STATS), so those reads take the host call through a thunk that
+  keeps every register. System::ApplySettings recomputes it, so a CPU clock changed in game goes
+  back to the host call at once.
+- The polling pause is kept: two reads closer than ~1.7 us pause twice, using the same "last read"
+  as the host callback. EDEN_NX2_CNTPCT_PAUSE=0 turns it off inline too.
+- Off by itself when the wall clock is not the TSC (Coffee Lake and older Intel without a crystal
+  frequency: "FRITCHII_JIT_INLINE_CNTPCT: off, the wall clock is not the TSC"), and with guest
+  thread stats on (they count reads in the host callback).
+- Log: "FRITCHII_JIT_INLINE_CNTPCT: guest counter reads computed in the JIT ..." (Core_Timing,
+  Info) once.
+- Expected: less guest-core CPU time per counter read (OoT's waits poll the counter millions of
+  times a second); fps only where the guest cores limit. Blitchii measured it only bundled with
+  the cheap barriers (guest core 4: 750-828 -> 703 ms/s, same fps, GPU-bound laptop).
+- Test: toggle needs a fresh launch (boot switch): market, 2 launches each, compare the guest
+  cores' ms/s and fps; check game speed (cutscene audio sync, Dynamic FPS step) stays the same.
+
 ### FRITCHII_JIT_CHAIN
 
 FRITCHII_JIT_CHAIN (boot, bits, default 0; Fable A 2.2). Off with cycle counting (single core).

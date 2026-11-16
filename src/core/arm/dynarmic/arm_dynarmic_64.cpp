@@ -268,18 +268,24 @@ u64 DynarmicCallbacks64::GetTicksRemaining() {
     return std::max<s64>(m_parent.m_system.CoreTiming().downcount, 0);
 }
 
-u64 DynarmicCallbacks64::GetCNTPCT() {
-    const u64 ticks = m_parent.m_system.CoreTiming().GetClockTicks();
-    // Guest code that waits by polling the counter (title 1's main thread reads it ~17 million
-    // times a second while waiting for the GPU) keeps a host core busy at full speed, and the
-    // GPU thread is often on the other half of that SMT core. Two reads within ~1.7 us of each
-    // other are such a loop: pause, which hands the core's resources to the sibling thread for a
-    // moment. The guest sees the same counter. EDEN_NX2_CNTPCT_PAUSE=0 turns it off.
+namespace {
+// Guest code that waits by polling the counter (title 1's main thread reads it ~17 million
+// times a second while waiting for the GPU) keeps a host core busy at full speed, and the
+// GPU thread is often on the other half of that SMT core. Two reads within ~1.7 us of each
+// other are such a loop: pause, which hands the core's resources to the sibling thread for a
+// moment. The guest sees the same counter. EDEN_NX2_CNTPCT_PAUSE=0 turns it off.
+bool CntpctPauseOn() {
     static const bool pause_spins = [] {
         const char* value = std::getenv("EDEN_NX2_CNTPCT_PAUSE");
         return value == nullptr || value[0] != '0';
     }();
-    if (pause_spins && ticks - m_last_cntpct < m_spin_ticks) {
+    return pause_spins;
+}
+} // Anonymous namespace
+
+u64 DynarmicCallbacks64::GetCNTPCT() {
+    const u64 ticks = m_parent.m_system.CoreTiming().GetClockTicks();
+    if (CntpctPauseOn() && ticks - m_last_cntpct < m_spin_ticks) {
 #if defined(_M_X64) || defined(__x86_64__)
         _mm_pause();
         _mm_pause();
@@ -384,6 +390,19 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     // Timing
     config.wall_clock_cntpct = m_uses_wall_clock;
     config.enable_cycle_counting = !m_uses_wall_clock;
+#if defined(ARCHITECTURE_x86_64)
+    // FRITCHII_JIT_INLINE_CNTPCT (boot, default 0): counter reads in the block, not a host call
+    // (same value; the polling pause kept). Not with guest thread stats, which count reads in
+    // GetCNTPCT.
+    if (m_uses_wall_clock && page_table != nullptr && Core::Timing::InlineCntpctEnabled() &&
+        !Kernel::Nx2ThreadStats::g_enabled) {
+        Core::Timing::RefreshInlineCntpct();
+        config.inline_cntpct_factor =
+            reinterpret_cast<const std::uint64_t*>(&Core::Timing::g_inline_cntpct_factor);
+        config.inline_cntpct_last = CntpctPauseOn() ? &m_cb->m_last_cntpct : nullptr;
+        config.inline_cntpct_spin_ticks = static_cast<std::uint32_t>(m_cb->m_spin_ticks);
+    }
+#endif
 
     // Code cache size
 #if defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
