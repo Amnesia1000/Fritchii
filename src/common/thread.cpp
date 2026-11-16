@@ -32,6 +32,7 @@
 #elif defined(_WIN32)
 #include <windows.h>
 #include "common/string_util.h"
+#include "common/windows/fritchii_focus.h"
 #include "common/windows/timer_resolution.h"
 #else
 #if defined(__FreeBSD__)
@@ -628,6 +629,10 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
         }
     }();
     SetThreadPriority(GetCurrentThread(), windows_priority);
+    // FRITCHII_THREAD_QOS tags these later (docs/fritchii/switches.md).
+    if (new_priority >= ThreadPriority::High) {
+        Windows::FritchiiFocus::RegisterHotThread();
+    }
 #elif defined(__HAIKU__)
     // TODO: We have priorities for 3D rendering applications - may help lavapipe?
     int priority = [&]() {

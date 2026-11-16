@@ -284,6 +284,12 @@ inline std::atomic<int> g_keep_blocks{-1};
 inline std::atomic<int> g_staging_ring{-1};
 /// FRITCHII_HOSTTIMING_SPIN_BUDGET (live, percent, default 0): docs/fritchii/switches.md.
 inline std::atomic<int> g_hosttiming_spin_budget{-1};
+/// FRITCHII_GPU_PRIORITY (live, default 0): docs/fritchii/switches.md (fritchii_focus.h).
+inline std::atomic<int> g_gpu_priority{-1};
+/// FRITCHII_THREAD_QOS (live, default 0): docs/fritchii/switches.md (fritchii_focus.h).
+inline std::atomic<int> g_thread_qos{-1};
+/// FRITCHII_FOCUS_GRAB (live, default 0): docs/fritchii/switches.md (fritchii_focus.h).
+inline std::atomic<int> g_focus_grab{-1};
 /// FRITCHII_ONEF_RAISE_AFTER_LEND (live, default 0): docs/fritchii/switches.md.
 inline std::atomic<int> g_onef_raise_after_lend{-1};
 /// FRITCHII_ONEF (boot): one follower step 1, the render thread R (one_follower.h).

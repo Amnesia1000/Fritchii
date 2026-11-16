@@ -90,6 +90,7 @@
 #include "video_core/fritchii_delta_path.h"
 #include "video_core/fritchii_draw_kinds.h"
 #include "video_core/fritchii_fill_cuts.h"
+#include "video_core/fritchii_focus.h"
 #include "video_core/fritchii_report_runs.h"
 #include "video_core/memory_stage_link.h"
 #include "video_core/texture_handle_values.h"
@@ -8659,6 +8660,8 @@ void RasterizerVulkan::TickFrame() {
             applied = wanted;
         }
     }
+    // FRITCHII_GPU_PRIORITY, FRITCHII_THREAD_QOS, FRITCHII_FOCUS_GRAB and the "Focus:" line.
+    VideoCommon::FritchiiFocus::Tick();
 #endif
     NoteDrawReuseProbeFrame();
     // The OoT trackers read the draw packet's record (fable_memstage_6b_plan.md 5.1): the fill

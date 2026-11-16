@@ -557,6 +557,15 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_HOSTTIMING_SPIN_BUDGET") {
         return &g_hosttiming_spin_budget;
     }
+    if (name == "FRITCHII_GPU_PRIORITY") {
+        return &g_gpu_priority;
+    }
+    if (name == "FRITCHII_THREAD_QOS") {
+        return &g_thread_qos;
+    }
+    if (name == "FRITCHII_FOCUS_GRAB") {
+        return &g_focus_grab;
+    }
     if (name == "FRITCHII_ONEF_RAISE_AFTER_LEND") {
         return &g_onef_raise_after_lend;
     }

@@ -1023,7 +1023,61 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     if (device_float16 && WantsAmdFsr4(driver_id)) {
         features.shader_float16_int8.shaderFloat16 = VK_TRUE;
     }
-    logical = vk::Device::Create(physical, queue_cis, ExtensionListForVulkan(loaded_extensions), first_next, dld);
+    // FRITCHII_QUEUE_PRIORITY (boot, default 0; helper BN, 2026-11-16, docs/fritchii/switches.md):
+    // 1 = the device's queues ask for high global priority (VK_KHR/EXT_global_priority), 2 =
+    // realtime. The driver may refuse (not permitted, or no support): the device is then made as
+    // before, and the log says so.
+    std::vector<VkDeviceQueueCreateInfo> priority_queue_cis(queue_cis.begin(), queue_cis.end());
+    VkDeviceQueueGlobalPriorityCreateInfoKHR queue_global_priority{
+        .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR,
+        .pNext = nullptr,
+        .globalPriority = VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR,
+    };
+    const char* global_priority_extension = nullptr;
+    if (const char* queue_priority = std::getenv("FRITCHII_QUEUE_PRIORITY");
+        queue_priority != nullptr && std::atoi(queue_priority) > 0) {
+        if (std::atoi(queue_priority) >= 2) {
+            queue_global_priority.globalPriority = VK_QUEUE_GLOBAL_PRIORITY_REALTIME_KHR;
+        }
+        if (supported_extensions.contains(VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME)) {
+            global_priority_extension = VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME;
+        } else if (supported_extensions.contains(VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME)) {
+            global_priority_extension = VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME;
+        } else {
+            LOG_INFO(Render_Vulkan, "FRITCHII_QUEUE_PRIORITY: the driver has no global priority "
+                                    "extension, queues keep the default priority");
+        }
+        if (global_priority_extension != nullptr &&
+            !loaded_extensions.contains(global_priority_extension)) {
+            loaded_extensions.insert(global_priority_extension);
+            for (auto& ci : priority_queue_cis) {
+                ci.pNext = &queue_global_priority;
+            }
+        } else {
+            global_priority_extension = nullptr;
+        }
+    }
+    if (global_priority_extension != nullptr) {
+        try {
+            logical = vk::Device::Create(physical, priority_queue_cis,
+                                         ExtensionListForVulkan(loaded_extensions), first_next, dld);
+            LOG_INFO(Render_Vulkan, "FRITCHII_QUEUE_PRIORITY: queues made with {} global priority ({})",
+                     queue_global_priority.globalPriority == VK_QUEUE_GLOBAL_PRIORITY_REALTIME_KHR
+                         ? "realtime"
+                         : "high",
+                     global_priority_extension);
+        } catch (const vk::Exception& exception) {
+            LOG_WARNING(Render_Vulkan,
+                        "FRITCHII_QUEUE_PRIORITY: the driver refused the global priority ({}), "
+                        "device made with the default priority",
+                        exception.what());
+            loaded_extensions.erase(std::string{global_priority_extension});
+            global_priority_extension = nullptr;
+        }
+    }
+    if (global_priority_extension == nullptr) {
+        logical = vk::Device::Create(physical, queue_cis, ExtensionListForVulkan(loaded_extensions), first_next, dld);
+    }
 
     graphics_queue = logical.GetQueue(graphics_family);
     present_queue = logical.GetQueue(present_family);
