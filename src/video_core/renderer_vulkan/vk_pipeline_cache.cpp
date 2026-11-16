@@ -237,6 +237,28 @@ void PruneUnreadGeometryOutputs(Shader::IR::Program& geometry, const Shader::IR:
     }
 }
 
+/// FRITCHII_AMD_NOPERSPECTIVE=1 on an AMD driver (see MakeRuntimeInfo). Read once, after
+/// nx2_switches.txt was applied (the first pipeline build).
+bool AmdNoPerspectiveFix(const Vulkan::Device& device) {
+    static const bool on = [&device] {
+        const char* const value = std::getenv("FRITCHII_AMD_NOPERSPECTIVE");
+        const VkDriverId driver = device.GetDriverID();
+        const bool amd = driver == VK_DRIVER_ID_AMD_PROPRIETARY ||
+                         driver == VK_DRIVER_ID_AMD_OPEN_SOURCE ||
+                         driver == VK_DRIVER_ID_MESA_RADV;
+        const bool enabled = amd && value != nullptr && value[0] == '1';
+        if (amd) {
+            LOG_INFO(Render_Vulkan,
+                     "FRITCHII_AMD_NOPERSPECTIVE={}: noperspective varyings {} (red flash fix "
+                     "for water on AMD)",
+                     enabled ? 1 : 0,
+                     enabled ? "interpolated perspective-correct" : "left native");
+        }
+        return enabled;
+    }();
+    return on;
+}
+
 Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> programs,
                                     const GraphicsPipelineCacheKey& key,
                                     const Shader::IR::Program& program,
@@ -402,6 +424,43 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
     }
     info.force_early_z = key.state.early_z != 0;
     info.y_negate = key.state.y_negate != 0;
+    // FRITCHII_AMD_NOPERSPECTIVE=1 (off by default, AMD drivers only): noperspective varyings
+    // written times Position.w and read perspective-correct times FragCoord.w (port of
+    // zortos293/Lichii#820, reverted for every GPU in 9b30eec8ca after white fog at the Hyrule
+    // Field drawbridge on an RTX 4080). OoT's water volumes write a screen-space coordinate as a
+    // noperspective varying; AMD's driver interpolates it wrongly when a primitive is clipped close
+    // to the camera, and an exp2 overflows to the R11G11B10 maximum: red flashes (CheezyEmu
+    // re-applied it on AMD for that). Transform feedback would capture the scaled values, a
+    // passthrough geometry shader doesn't scale the outputs it writes itself, and indexed attribute
+    // reads in the fragment stage don't undo the scaling, so all three keep native noperspective.
+    if (AmdNoPerspectiveFix(device)) {
+        const bool geometry_passthrough{key.unique_hashes[4] != 0 &&
+                                        programs[4].is_geometry_passthrough};
+        if (key.unique_hashes[5] != 0 && !geometry_passthrough && key.state.xfb_enabled == 0 &&
+            !programs[5].info.loads_indexed_attributes) {
+            const bool has_tess{key.unique_hashes[3] != 0};
+            const bool last_pre_raster{
+                (stage == Shader::Stage::VertexB && !has_tess && !has_geometry) ||
+                (stage == Shader::Stage::TessellationEval && !has_geometry) ||
+                (stage == Shader::Stage::Geometry && has_geometry)};
+            if (stage == Shader::Stage::Fragment) {
+                info.scaled_noperspective_inputs =
+                    previous_program &&
+                    (previous_program->stage == Shader::Stage::VertexB ||
+                     previous_program->stage == Shader::Stage::TessellationEval ||
+                     previous_program->stage == Shader::Stage::Geometry);
+            }
+            if (last_pre_raster) {
+                const auto& fragment_info{programs[5].info};
+                for (size_t index = 0; index < 32; ++index) {
+                    if (fragment_info.interpolation[index] ==
+                        Shader::Interpolation::NoPerspective) {
+                        info.noperspective_outputs.set(index);
+                    }
+                }
+            }
+        }
+    }
     return info;
 }
 
@@ -3913,6 +3972,10 @@ u64 SpirvSettingsStamp() {
             << 17;
     bits |= static_cast<u64>(Settings::values.fix_bloom_effects.GetValue() ? 1 : 0) << 18;
     bits |= static_cast<u64>(Settings::values.renderer_debug.GetValue() ? 1 : 0) << 19;
+    // FRITCHII_AMD_NOPERSPECTIVE=1 changes the SPIR-V of every stage pair with a noperspective
+    // varying (MakeRuntimeInfo), so kept modules of the other form are not used.
+    const char* const noperspective = std::getenv("FRITCHII_AMD_NOPERSPECTIVE");
+    bits |= static_cast<u64>(noperspective != nullptr && noperspective[0] == '1' ? 1 : 0) << 20;
     return bits;
 }
 
