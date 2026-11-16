@@ -5366,8 +5366,10 @@ f32 TextureCacheRuntime::OcarinaFsrLodBias() {
             const bool dlaa = backend == VideoCommon::OcarinaUpscaleBackend::Dlss &&
                               Settings::GetNvidiaDlssRuntimeSettings().quality ==
                                   Settings::NvidiaDlssQuality::Native;
+            // FRITCHII_FSR_OUTPUT: FSR draws the game's own 1440p picture, not a 4K one.
+            const bool output_4k = max_resolution && !OcarinaFsrOutputsGameSize(backend);
             const u32 output_height =
-                dlaa ? render_height : std::max(render_height, max_resolution ? 2160U : 1440U);
+                dlaa ? render_height : std::max(render_height, output_4k ? 2160U : 1440U);
             const bool dlss_jitter =
                 VideoCommon::OcarinaDlssJitterOn(Settings::values.oot_dlss_jitter.GetValue());
             const int mode = VideoCommon::OcarinaLodRatioMode();

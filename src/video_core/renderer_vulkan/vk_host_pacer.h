@@ -126,4 +126,7 @@ private:
     double interval_sum_ms{}, interval_max_ms{}, hold_sum_ms{}, latency_sum_ms{};
 };
 
+/// The primary display's height in pixels (its current mode), 0 when unknown.
+[[nodiscard]] u32 PrimaryDisplayHeight();
+
 } // namespace Vulkan
