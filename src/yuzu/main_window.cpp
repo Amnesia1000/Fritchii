@@ -5549,12 +5549,16 @@ void MainWindow::SetOotHighRefresh(bool on) {
         case Settings::OotRefreshCap::Hz165:
             hz = 165;
             break;
+        case Settings::OotRefreshCap::Unlimited:
+            hz = -1;
+            break;
         case Settings::OotRefreshCap::Display:
         default:
             break;
         }
-        text = hz != 0 ? tr("High refresh: on (%1 FPS cap)").arg(hz)
-                       : tr("High refresh: on (monitor refresh cap)");
+        text = hz > 0   ? tr("High refresh: on (%1 FPS cap)").arg(hz)
+               : hz < 0 ? tr("High refresh: on (no cap)")
+                        : tr("High refresh: on (monitor refresh cap)");
         break;
     }
     case FileSys::OotHighRefreshSwitch::DisabledInAddOns:
