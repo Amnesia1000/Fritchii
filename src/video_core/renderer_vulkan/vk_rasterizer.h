@@ -364,6 +364,7 @@ private:
         u64 tick;
         u64 shader;
         bool posted;
+        bool audit; ///< FRITCHII_GRID_AUDIT's copy (not the one follower's)
     };
     std::vector<OneFollowerGridCheck> onef_grid_checks;
     /// R: checks the copies whose submission is done; the others wait for a later call.

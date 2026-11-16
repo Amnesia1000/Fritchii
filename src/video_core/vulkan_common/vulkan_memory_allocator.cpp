@@ -751,9 +751,12 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
         (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_depth_pool_big,
                                           "FRITCHII_DEPTH_POOL_BIG") > 0 ||
          VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_depth_pool_retry,
-                                          "FRITCHII_DEPTH_POOL_RETRY") != 0)) {
+                                          "FRITCHII_DEPTH_POOL_RETRY", 1) != 0)) {
         // Same fix from two helpers (BA: FRITCHII_DEPTH_POOL_BIG, BF: FRITCHII_DEPTH_POOL_RETRY);
-        // either switch turns it on.
+        // either switch turns it on. On by default since 2026-11-16 (FRITCHII_DEPTH_POOL_RETRY=0
+        // turns it off): only where the image is placed changes. Without it every OoT area load
+        // logged a false "over the memory budget" (RX 9070 XT, 16 GB, 1.1 GB used) and the false
+        // pressure event emptied the image pool and cut the cache's thresholds by 512 MiB.
         // FRITCHII_DEPTH_POOL_BIG: VMA refuses anything larger than a custom pool's block
         // (64 MiB) with VK_ERROR_OUT_OF_DEVICE_MEMORY before it looks at the budget, so a large
         // depth target (OoT, every Castle Town load: 12288x12288 D16, 288 MiB) read as "over

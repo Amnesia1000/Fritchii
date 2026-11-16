@@ -484,6 +484,9 @@ enum class FlagOwner : u8 { E, R, Both };
 
 /// Reads the switches (GpuSplit::MaybeStart, before the back thread exists). Boot ones stick.
 void ReadSwitches();
+/// The Vulkan device names its driver (Device's constructor, before ReadSwitches): on AMD's
+/// proprietary driver the one follower stays off unless FRITCHII_ONEF_AMD=1.
+void NoteAmdProprietaryDriver() noexcept;
 /// FRITCHII_ONEF=1 at boot (R exists).
 [[nodiscard]] bool On() noexcept;
 /// The effective step after nesting (StepLevel), refreshed at frame ends and lent packets.
