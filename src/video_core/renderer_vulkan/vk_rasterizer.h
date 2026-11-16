@@ -581,6 +581,8 @@ private:
     u32 draw_counter = 0;
     std::optional<u64> oot_camera_sample_frame;
     mutable std::optional<VideoCommon::OcarinaUpscaleBackend> oot_backend;
+    /// AMD FSR 4 takes OoT's scene without camera jitter (Fsr4Upscaler::RunsUnjittered).
+    mutable bool oot_fsr4_unjittered{};
     bool oot_resolution_checked{};
     struct OcarinaMotionTrace {
         const Tegra::MemoryManager* camera_channel{};
