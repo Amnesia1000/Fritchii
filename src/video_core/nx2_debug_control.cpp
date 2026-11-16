@@ -440,6 +440,12 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_DISPATCH_WALK_SUMMARY") {
         return &g_dispatch_walk_summary;
     }
+    if (name == "FRITCHII_DISPATCH_WAIT_CENSUS") {
+        return &g_dispatch_wait_census;
+    }
+    if (name == "FRITCHII_LAGGED_DEFER") {
+        return &g_lagged_defer;
+    }
     if (name == "FRITCHII_ACQUIRE_TABLE_FIRST") {
         return &g_acquire_table_first;
     }

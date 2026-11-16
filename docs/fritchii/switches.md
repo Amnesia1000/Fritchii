@@ -822,6 +822,67 @@ stamp; then the session's verify disagreements (must be 0). Expected with 1 at t
 records walked near 0, "skipped by ranges" unchanged, the front macro zone back near 134 ns a
 call.
 
+### FRITCHII_LAGGED_DEFER (the "Lagged check defer" line)
+
+FRITCHII_LAGGED_DEFER (live, default 0 = exactly as before; helper BD). With EXP12=5/6 a channel
+suspended on a semaphore acquire gets a "lagged check" every 1 ms (Puller::CanResumeAcquire): the
+front waits until the back ran what was sent at the previous check (DrainSite::LaggedCheck, or
+LaggedCheckEngine with FRITCHII_ONEF_SEM_E), then reads the latch and the word again. At the
+heavy market that wait is ~50 a second, ~1.2 ms each, ~14,000 ring words behind (55-60 ms/s of
+front time, the second biggest front wait), and while it waits the front decodes nothing: not
+the other channels, not new command lists.
+- 1: when the back is short of the check's target, the check is put off: what was sent is
+  published, the poll answers "not met yet" and the front goes on with other channels and new
+  command lists. The first poll that finds the back at the target runs the check unchanged (no
+  wait left). When the front would otherwise sleep (no command list queued, every channel
+  suspended), it waits for the smallest target put off right there (LaggedDefer::WaitBeforeSleep,
+  gpu_thread.cpp) and polls again: the wait it would have made, now with nothing else to do.
+- Exact: the same checks decide the resume, in the same order within the channel; a check runs
+  only once the back reached its target, as before. Only how other channels' work interleaves
+  with the suspended channel moves, which the 1 ms timer already made timing-dependent; the
+  acquire still resumes only when met. No hang: the work sent is published at each put-off poll,
+  and the front waits for the target before any sleep.
+- Why: the front is the wall at the market (fps follows its time); a wait that blocks other work
+  for 1.2 ms is front time the frame pays for whenever there is other work to do.
+
+"Lagged check defer (FRITCHII_LAGGED_DEFER=n)" (HW_GPU, Info, every 10 s while it acts), per
+second: polls that put their check off (and how many acquires), checks run later with the back
+there (each is a wait saved), waits made where the front would sleep (and their ms/s: the part
+of the old wait that had nothing to overlap).
+How to judge: a profile_toggle 0/1 in one session (pin market, --cycles=2 --warmup=20). On the
+front: "Front waits for the back by site" lagged check ms/s must drop (the waits made where the
+front would sleep stay in that line, the defer line gives them apart; the drop is the part that
+overlapped other work), and the front per draw (macro + resume pending) must not rise. Then fps (cycles=4) only if the front
+wait drops: a keeper when fps rises; drop if the "checks run later" count is near 0 (the waits
+had nothing to overlap).
+
+### FRITCHII_DISPATCH_WAIT_CENSUS (the "Dispatch wait census" line)
+
+FRITCHII_DISPATCH_WAIT_CENSUS (live, default 0 = nothing counted; helper BD). A dry count, no
+behaviour change. A macro DMA read (0xe2c's occlusion report reads, mostly) whose page snapshot
+passed every other check waits for the native dispatches sent since the snapshot
+(DrainSite::DispatchWait, "macro dma dispatch": ~250 a second, ~68 ms/s at the market, the
+biggest front wait), because what a dispatch writes is only known once E ran it (E records its
+write marks). At the market none of those dispatches ever wrote a page read (the EXP10 line's
+dispatch overlaps stay 0), so the wait is pure latency. Removing it needs the front to bound
+what the queued dispatches write (their QMD, the shader's storage buffer descriptors, the
+pointer words in their constant buffers, image descriptors). This census says how much of the
+wait each level of such a bound would answer, before anyone builds it.
+- 1: each such wait that really waited is classified, once the dispatches it waited for ran, by
+  their records (the ones E appended for positions from E's position when the wait began):
+  buffers only (storage/texel buffer write marks: a front bound of the SSBO writes answers it),
+  buffers + QMD releases (the front predicts those already), with indirect arguments (list
+  dispatches, GPU-sized grids), with an image (a bound needs the image descriptors too),
+  anything / records lost (unbounded or past the record ring), no record. E tags each record
+  with its kind (DispatchWriteKind) whatever the switch says.
+
+"Dispatch wait census (FRITCHII_DISPATCH_WAIT_CENSUS=1)" (HW_GPU, Info, every 10 s of waits), per
+second and ms/s per class, the records per wait, and the waits whose dispatches did write the
+page read (expected 0, as the EXP10 line says).
+How to judge (Gate 1 for the front dispatch bound): the ms/s of "buffers only" + "buffers + QMD
+releases" is the ceiling of an SSBO-only bound; add "with an image" for a bound that also reads
+image descriptors. Build the bound only if the first is >= 10 ms/s on the front.
+
 ### FRITCHII_FRONT_CALL_LEAN (the "Front call lean" line)
 
 FRITCHII_FRONT_CALL_LEAN (live, default 0 = exactly as before; fable_b 27.2 B, about 30 to 35
