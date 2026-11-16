@@ -31,6 +31,7 @@
 #include "video_core/back_read_audit.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_perf.h"
+#include "video_core/rasterizer_download_area.h"
 
 namespace Core {
 
@@ -337,6 +338,10 @@ void DeviceMemoryManager<Traits>::Unmap(DAddr address, size_t size) {
     size_t start_page_d = address >> Memory::YUZU_PAGEBITS;
     size_t num_pages = Common::AlignUp(size, Memory::YUZU_PAGESIZE) >> Memory::YUZU_PAGEBITS;
     device_inter->InvalidateRegion(address, size);
+    // FRITCHII_FENCE_COPY_UNLOCKED: a fence download the fencing thread is writing here without
+    // the buffer cache's lock ends before the backing is erased (with the lock held for the whole
+    // pop, the invalidation above waited for it).
+    VideoCore::DownloadLanding::AwaitUnlockedFenced(address, size);
     // EXP92: as in Map, before the backing is erased (and before EXP89's release).
     UnwatchUniformKeepPages(address, size);
     // EXP89: the pages the caches just dropped may linger; the uncache needs their guest

@@ -154,11 +154,24 @@ private:
         if (back_mark) [[unlikely]] {
             back_waiters.fetch_add(1, std::memory_order_relaxed);
         }
+        // FRITCHII_FENCE_COPY_UNLOCKED's line: E's waits that began behind the fencing thread.
+        const bool fence_watch = Nx2Hitch::t_role == Nx2Hitch::Role::GpuBack &&
+                                 LockCensus::g_fence_copy_watch.load(std::memory_order_relaxed);
+        std::thread::id holder_at_start{};
+        if (fence_watch) [[unlikely]] {
+            holder_at_start = owner.load(std::memory_order_relaxed);
+        }
         LockContendedUntimed();
         if (back_mark) [[unlikely]] {
             back_waiters.fetch_sub(1, std::memory_order_relaxed);
         }
         const std::uint64_t waited = Nx2Hitch::NowNs() - begin;
+        if (fence_watch && holder_at_start != std::thread::id{} &&
+            holder_at_start == LockCensus::g_fence_thread.load(std::memory_order_relaxed))
+            [[unlikely]] {
+            LockCensus::g_back_behind_fence_ns.fetch_add(waited, std::memory_order_relaxed);
+            LockCensus::g_back_behind_fence_waits.fetch_add(1, std::memory_order_relaxed);
+        }
         Nx2Hitch::AddLockWait(waited);
         if (census > 0) [[unlikely]] {
             LockCensus::EndWait(token, waited);

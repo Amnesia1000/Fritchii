@@ -1764,6 +1764,36 @@ draw fill and counter report (~330,000 a second at Kakariko), so a pop under way
 Read with FRITCHII_LOCK_CENSUS=1: only worth turning on if the census names the fencing thread
 as E's holder and the dry line shows chances at a good share of E's waits.
 
+### FRITCHII_FENCE_COPY_UNLOCKED (the "Fence copy unlocked" line)
+
+Helper CQ. Live, default 0. At Kakariko E waited ~17 ms/s behind the fencing thread, which held
+the buffer cache's lock while it copied finished buffer downloads into game memory
+(PopAsyncBuffers: the copies, the set of collected CPU writes, the frees). With it, each pop
+(BufferCache::PopAsyncBuffersUnlocked) does under the lock what reads the cache's state: the
+landing, the collected CPU writes over the landing's range only, the ranges the fence still
+writes. It lets the lock go for the copy (marks after the bytes), takes it back, clears the
+GPU-modified state where the fence still writes and marks the download landed. The ordering
+argument is in work/helper_cq_answer.md. Landings under 512 bytes are copied under the lock as
+before.
+
+While such a copy is under way: another landing waits for it (one landing at a time, as before);
+ClearFenceDownloads waits if it overlaps (a writer that takes ranges from the fence downloads
+writes newer bytes next); a device unmap waits if it overlaps.
+
+- 0 = as before.
+- 1 = on.
+- 2 = on and verify: every landing copied outside the lock, then compared under the lock (in a
+  landing of its own) with what the locked pop would have written. Must be 0.
+- "Fence copy unlocked (FRITCHII_FENCE_COPY_UNLOCKED=n)" every 10 s from the fencing thread: pop
+  batches and pops a second; landings copied outside the lock and small ones under it; copies,
+  MB/s and ms/s out of the lock; the fencing thread's hold of the buffer lock and its wait to take
+  it back (1 and 2 only); lock holders that waited for a copy; E's cache lock waits that began
+  behind the fencing thread (ms/s, count, us each); at 2 the verify counts. Once the switch is set
+  (in the environment, or turned on live) the line runs at 0 too, so both arms of a toggle have
+  E's number.
+- Not on the EDEN_NX2_FENCE_RELEASE_STATS path; EXP74 and FRITCHII_FENCE_YIELD_E do nothing while
+  it is on (the lock is let go at every landing anyway).
+
 ### EDEN_NX2_GPU_PROFILE=2: E's draw method zones (helper CP)
 
 E's draw method outside the fill (0x585's "method" share, ~1.1 us a draw at Kakariko, 218 ms/s

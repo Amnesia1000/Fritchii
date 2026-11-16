@@ -347,6 +347,10 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_FENCE_YIELD_E") {
         return &Common::LockCensus::g_fence_yield_e;
     }
+    if (name == "FRITCHII_FENCE_COPY_UNLOCKED") {
+        // Lives in common (the census line's E waits); -1 until its first read.
+        return &Common::LockCensus::g_fence_copy_unlocked;
+    }
     if (name == "EDEN_NX2_FEED_MEMORY_OVERLAY") {
         return &g_feed_memory_overlay;
     }

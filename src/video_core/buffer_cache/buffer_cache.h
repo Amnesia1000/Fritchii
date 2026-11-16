@@ -1311,6 +1311,13 @@ void BufferCache<P>::ClearReplacedDownload(DAddr device_addr, u64 size) {
 
 template <class P>
 void BufferCache<P>::ClearFenceDownloads(DAddr device_addr, u64 size) {
+    // FRITCHII_FENCE_COPY_UNLOCKED: the fencing thread may be copying a fence download here
+    // without the lock (PopAsyncBuffersUnlocked), from ranges it read before this takes them
+    // away. The caller writes newer bytes here next (a synchronous download, a GPU-side write
+    // after PrepareRegionWrite), or a guest write is collected here (its bytes store after any
+    // landing over them): the copy lands first, as when the pop held the lock throughout. One
+    // acquire load while no such copy is under way.
+    VideoCore::DownloadLanding::AwaitUnlocked(device_addr, size);
     PromoteAhead(); // FRITCHII_MEMSTAGE_MARKS_AHEAD: a reader of the real sets
     for (auto& ranges : pending_download_ranges) {
         ranges.Subtract(device_addr, size);
@@ -2344,6 +2351,274 @@ void BufferCache<P>::PopAsyncBuffers() {
     {
         // EXP72: in guest memory now (the copies above wrote it).
         std::scoped_lock lock{fence_landed_mutex};
+        fence_downloads_landed.fetch_add(1, std::memory_order_release);
+    }
+    fence_landed_cv.notify_all();
+}
+
+template <class P>
+bool BufferCache<P>::PendingCpuWritesIn(DAddr begin, DAddr end, Common::RangeSet<DAddr>& out) {
+    out.Clear();
+    if (!pending_cpu_writes) {
+        return false;
+    }
+    // Only the writes over [begin, end): the callers ask about ranges inside it alone, so the
+    // answers are PendingCpuWriteRanges' (without building a set of every collected write).
+    struct Filter {
+        DAddr begin;
+        DAddr end;
+        Common::RangeSet<DAddr>* out;
+        bool any;
+    } filter{begin, end, &out, false};
+    pending_cpu_writes([filter_ptr = &filter](DAddr address, size_t size) {
+        if (size != 0 && address < filter_ptr->end && address + size > filter_ptr->begin) {
+            filter_ptr->out->Add(address, size);
+            filter_ptr->any = true;
+        }
+    });
+    return filter.any;
+}
+
+template <class P>
+void BufferCache<P>::WriteDownloadedMemoryUnlocked(const Common::RangeSet<DAddr>* cpu_written,
+                                                   DAddr device_addr, const u8* data, u64 size) {
+    const Common::WriteRing::SiteScope write_site{"buffer download", true};
+    if (cpu_written == nullptr || !cpu_written->Intersects(device_addr, size)) {
+        device_memory.WriteBlockUnsafe(device_addr, data, size);
+    } else {
+        unlocked_parts.Clear();
+        unlocked_parts.Add(device_addr, size);
+        cpu_written->ForEachInRange(device_addr, size, [this](DAddr start, DAddr end) {
+            unlocked_parts.Subtract(start, end - start);
+        });
+        unlocked_parts.ForEach([&](DAddr start, DAddr end) {
+            device_memory.WriteBlockUnsafe(start, data + (start - device_addr), end - start);
+        });
+    }
+    // WriteDownloadedMemory's marks, after the bytes landed: it marks first, which holds only
+    // under the lock (the native bank check takes g_buffer_write_pages under it). A mark taken
+    // between a mark and the bytes would leave the bytes unseen; after, a look before the mark
+    // sees the page as before this fence (as a draw before the pop did), the next one sees it.
+    if (Common::S4Count::On()) [[unlikely]] {
+        Common::S4Count::MarkGens(Common::S4Count::Writer::Gpu, device_addr, size);
+    }
+    Core::g_buffer_write_pages.Mark(device_addr, size);
+    Core::g_watch_write_pages.Mark(device_addr, size);
+}
+
+template <class P>
+void BufferCache<P>::VerifyUnlockedLanding(DAddr landing_begin, DAddr landing_end,
+                                           const Common::RangeSet<DAddr>& live,
+                                           Common::LockCensus::FenceCopyBatch& batch) {
+    // Under the lock, in a landing of its own: guest CPU writes collected from here on store
+    // their bytes after the compare. What the locked pop would have written: the pieces' bytes
+    // where the fence still writes (`live`), except over the CPU writes it found collected then
+    // (unlocked_cpu_written) and those collected since (they store after the copy: newer).
+    static std::atomic<u32> logged{};
+    const VideoCore::DownloadLanding landing{landing_begin, landing_end};
+    PendingCpuWritesIn(landing_begin, landing_end, unlocked_verify_cpu);
+    for (const UnlockedPiece& piece : unlocked_pieces) {
+        bool bad_piece = false;
+        live.ForEachInRange(piece.addr, piece.size, [&](DAddr start, DAddr end) {
+            unlocked_verify_parts.Clear();
+            unlocked_verify_parts.Add(start, end - start);
+            const auto cut = [this](DAddr lower, DAddr upper) {
+                unlocked_verify_parts.Subtract(lower, upper - lower);
+            };
+            unlocked_cpu_written.ForEachInRange(start, end - start, cut);
+            unlocked_verify_cpu.ForEachInRange(start, end - start, cut);
+            unlocked_verify_parts.ForEach([&](DAddr lower, DAddr upper) {
+                const u64 bytes = upper - lower;
+                if (unlocked_verify_bytes.size() < bytes) {
+                    unlocked_verify_bytes.resize(bytes);
+                }
+                device_memory.ReadBlockUnsafe(lower, unlocked_verify_bytes.data(), bytes);
+                const u8* const expected = piece.data + (lower - piece.addr);
+                batch.verify_bytes += bytes;
+                if (std::memcmp(unlocked_verify_bytes.data(), expected, bytes) == 0) [[likely]] {
+                    return;
+                }
+                u64 differ = 0;
+                u64 first_differ = bytes;
+                for (u64 i = 0; i < bytes; ++i) {
+                    if (unlocked_verify_bytes[i] != expected[i]) {
+                        ++differ;
+                        first_differ = (std::min)(first_differ, i);
+                    }
+                }
+                batch.verify_bad_bytes += differ;
+                bad_piece = true;
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                    LOG_ERROR(HW_GPU,
+                              "Fence copy unlocked verify: {} of {} bytes at {:#x} differ from "
+                              "the fence's download (first at {:#x}; copy {:#x}+{:#x})",
+                              differ, bytes, lower, lower + first_differ, piece.addr,
+                              piece.size);
+                }
+            });
+        });
+        if (bad_piece) {
+            ++batch.verify_bad_pieces;
+        }
+    }
+}
+
+template <class P>
+void BufferCache<P>::PopAsyncBuffersUnlocked(size_t pops, int mode,
+                                             Common::LockCensus::FenceCopyBatch& batch) {
+    // The popped lists are moved aside and freed after the lock is let go; room made now, out
+    // of the lock.
+    if (unlocked_trash_ranges.capacity() < pops) {
+        unlocked_trash_ranges.reserve((std::max)(pops, size_t{64}));
+    }
+    if (unlocked_trash_copies.capacity() < pops) {
+        unlocked_trash_copies.reserve((std::max)(pops, size_t{64}));
+    }
+    std::unique_lock lock{mutex};
+    u64 held_since = Common::Nx2Hitch::NowNs();
+    for (size_t i = 0; i < pops; ++i) {
+        PopOneUnlocked(lock, mode, batch, held_since);
+    }
+    batch.held_ns += Common::Nx2Hitch::NowNs() - held_since;
+    lock.unlock();
+    unlocked_trash_ranges.clear();
+    unlocked_trash_copies.clear();
+    batch.pops += pops;
+    VideoCore::DownloadLanding::TakeUnlockedWaits(batch.holder_waits, batch.holder_wait_ns);
+}
+
+template <class P>
+void BufferCache<P>::PopOneUnlocked(std::unique_lock<Common::SpinRecursiveMutex>& lock, int mode,
+                                    Common::LockCensus::FenceCopyBatch& batch, u64& held_since) {
+    // PopAsyncBuffers with each landing's copy out of the lock. Held on entry and on return.
+    PromoteAhead(); // FRITCHII_MEMSTAGE_MARKS_AHEAD: a reader of the real sets
+    const Common::WriteRing::SiteScope write_site{"buffer download landing (PopAsyncBuffers)", true};
+    if constexpr (!IS_OPENGL) {
+        if (!read_downloads.empty()) [[unlikely]] {
+            (void)runtime.IsFreeNow(read_downloads.front().tick);
+            WriteCompletedReadDownloads();
+        }
+    }
+    if (async_buffers.empty()) {
+        return;
+    }
+    if (!async_buffers.front().has_value()) {
+        async_buffers.pop_front();
+        return;
+    }
+    // References to the fronts stay good while the lock is let go: only this thread pops these
+    // deques, and a push at the back moves no element. They are read under the lock only; the
+    // copy outside it uses unlocked_pieces alone.
+    auto& downloads = pending_downloads.front();
+    auto& async_buffer = async_buffers.front();
+    u8* base = async_buffer->mapped_span.data();
+    const size_t base_offset = async_buffer->offset;
+    std::vector<std::pair<u64, u64>> stats_landed;
+    // Below this many bytes a landing is copied under the lock as before: letting the lock go
+    // and taking it back costs more than such a copy (and E may take it in between). The
+    // verify mode copies every landing outside the lock.
+    constexpr u64 UnlockedMinBytes = 512;
+    size_t first = 0;
+    while (first < downloads.size()) {
+        // PopAsyncBuffers' landings: copies within a page of each other together.
+        DAddr landing_begin = static_cast<DAddr>(downloads[first].src_offset);
+        DAddr landing_end = landing_begin + downloads[first].size;
+        size_t last = first + 1;
+        for (; last < downloads.size(); ++last) {
+            const DAddr begin = static_cast<DAddr>(downloads[last].src_offset);
+            const DAddr end = begin + downloads[last].size;
+            if (end + Core::DEVICE_PAGESIZE < landing_begin ||
+                begin > landing_end + Core::DEVICE_PAGESIZE) {
+                break;
+            }
+            landing_begin = (std::min)(landing_begin, begin);
+            landing_end = (std::max)(landing_end, end);
+        }
+        // What the fence still writes (PopAsyncBuffers' ForEachInRange), read under the lock: a
+        // writer that takes a range away later waits for the copy (ClearFenceDownloads).
+        const Common::RangeSet<DAddr>& ranges = pending_download_ranges.front();
+        unlocked_pieces.clear();
+        u64 bytes = 0;
+        for (size_t index = first; index < last; ++index) {
+            const auto& copy = downloads[index];
+            const DAddr device_addr = static_cast<DAddr>(copy.src_offset);
+            const u8* const read_mapped_memory = base + (copy.dst_offset - base_offset);
+            ranges.ForEachInRange(device_addr, copy.size, [&](DAddr start, DAddr end) {
+                unlocked_pieces.push_back(
+                    UnlockedPiece{start, end - start, read_mapped_memory + (start - device_addr)});
+                bytes += end - start;
+            });
+        }
+        if (unlocked_pieces.empty()) {
+            // Nothing left to write (PopAsyncBuffers' landing writes nothing either).
+            first = last;
+            continue;
+        }
+        if (bytes < UnlockedMinBytes && mode != 2) {
+            const VideoCore::DownloadLanding landing{landing_begin, landing_end};
+            PendingCpuWritesIn(landing_begin, landing_end, unlocked_cpu_written);
+            for (const UnlockedPiece& piece : unlocked_pieces) {
+                WriteDownloadedMemory(unlocked_cpu_written, piece.addr, piece.data, piece.size);
+                gpu_modified_ranges.Subtract(piece.addr, piece.size);
+                if (DownloadReadStats::g_enabled) [[unlikely]] {
+                    stats_landed.emplace_back(piece.addr, piece.addr + piece.size);
+                }
+            }
+            ++batch.groups_locked;
+            first = last;
+            continue;
+        }
+        // The landing and the collected CPU writes under the lock, in PopAsyncBuffers' order
+        // (published, then looked at): a write collected later stores its bytes once the landing
+        // ended, which is after the copy.
+        VideoCore::DownloadLanding::PublishUnlocked(landing_begin, landing_end);
+        const bool any_cpu = PendingCpuWritesIn(landing_begin, landing_end, unlocked_cpu_written);
+        const u64 unlock_at = Common::Nx2Hitch::NowNs();
+        batch.held_ns += unlock_at - held_since;
+        lock.unlock();
+        for (const UnlockedPiece& piece : unlocked_pieces) {
+            WriteDownloadedMemoryUnlocked(any_cpu ? &unlocked_cpu_written : nullptr, piece.addr,
+                                          piece.data, piece.size);
+        }
+        VideoCore::DownloadLanding::EndUnlocked();
+        const u64 relock_at = Common::Nx2Hitch::NowNs();
+        batch.unlocked_ns += relock_at - unlock_at;
+        lock.lock();
+        held_since = Common::Nx2Hitch::NowNs();
+        batch.relock_ns += held_since - relock_at;
+        ++batch.groups_unlocked;
+        batch.pieces += unlocked_pieces.size();
+        batch.bytes += bytes;
+        // In guest memory now. The GPU-modified state goes where the fence still writes: a range
+        // taken away meanwhile was taken by a newer write, which set its own state (a GPU write
+        // keeps the range GPU-modified, a CPU write or a synchronous download cleared it).
+        PromoteAhead(); // a reader of the real sets
+        const Common::RangeSet<DAddr>& live = pending_download_ranges.front();
+        if (mode == 2) [[unlikely]] {
+            VerifyUnlockedLanding(landing_begin, landing_end, live, batch);
+        }
+        for (const UnlockedPiece& piece : unlocked_pieces) {
+            live.ForEachInRange(piece.addr, piece.size, [&](DAddr start, DAddr end) {
+                gpu_modified_ranges.Subtract(start, end - start);
+                if (DownloadReadStats::g_enabled) [[unlikely]] {
+                    stats_landed.emplace_back(start, end);
+                }
+            });
+        }
+        first = last;
+    }
+    if (DownloadReadStats::g_enabled) [[unlikely]] {
+        DownloadReadStats::Landed(stats_landed);
+    }
+    async_buffers_death_ring.emplace_back(*async_buffer);
+    async_buffers.pop_front();
+    unlocked_trash_copies.emplace_back(std::move(pending_downloads.front()));
+    pending_downloads.pop_front();
+    unlocked_trash_ranges.emplace_back(std::move(pending_download_ranges.front()));
+    pending_download_ranges.pop_front();
+    {
+        // EXP72: in guest memory now (the copies above wrote it).
+        std::scoped_lock landed_lock{fence_landed_mutex};
         fence_downloads_landed.fetch_add(1, std::memory_order_release);
     }
     fence_landed_cv.notify_all();
