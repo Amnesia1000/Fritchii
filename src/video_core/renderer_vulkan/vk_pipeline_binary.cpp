@@ -242,8 +242,73 @@ bool HarvestSwitch() {
     return value == nullptr || *value != '0';
 }
 
+/// FRITCHII_PIPELINE_BINARY_SHARED_MB (boot, default 64): binaries several pipelines name (the
+/// same driver key) are made once and kept for the session, up to this many MiB of their data;
+/// 0 makes each pipeline's binaries for it alone, as before.
+u64 SharedBudgetSwitch() {
+    if (const char* value = std::getenv("FRITCHII_PIPELINE_BINARY_SHARED_MB"); value && *value) {
+        return std::strtoull(value, nullptr, 10) << 20;
+    }
+    return 64ULL << 20;
+}
+
 double Ms(u64 ns) {
     return static_cast<double>(ns) / 1e6;
+}
+
+double MiB(u64 bytes) {
+    return static_cast<double>(bytes) / static_cast<double>(1ULL << 20);
+}
+
+// RAM the store's work holds right now (the "Pipeline binaries RAM" line)
+std::atomic<s64> g_binaries_alive{};     ///< VkPipelineBinaryKHR handles not destroyed yet
+std::atomic<s64> g_captured_unreleased{}; ///< Capturing pipelines whose data isn't released yet
+std::atomic<u64> g_held_bytes{};          ///< Entry bytes in our vectors (reads, decodes, writes)
+std::atomic<u64> g_held_peak{};
+
+/// Counts bytes in g_held_bytes while it lives
+class Held {
+public:
+    Held() = default;
+    explicit Held(u64 bytes_) {
+        Add(bytes_);
+    }
+    ~Held() {
+        Release();
+    }
+    Held(const Held&) = delete;
+    Held& operator=(const Held&) = delete;
+
+    void Add(u64 more) {
+        bytes += more;
+        const u64 now = g_held_bytes.fetch_add(more, std::memory_order_relaxed) + more;
+        u64 peak = g_held_peak.load(std::memory_order_relaxed);
+        while (now > peak &&
+               !g_held_peak.compare_exchange_weak(peak, now, std::memory_order_relaxed)) {
+        }
+    }
+
+    void Release() {
+        g_held_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+        bytes = 0;
+    }
+
+private:
+    u64 bytes{};
+};
+
+u64 EntryBytes(const std::vector<Binary>& binaries) {
+    u64 bytes = 0;
+    for (const Binary& binary : binaries) {
+        bytes += binary.key.size() + binary.data.size();
+    }
+    return bytes;
+}
+
+void NoteCreated(std::span<const VkPipelineBinaryKHR> binaries) {
+    const auto made = std::ranges::count_if(
+        binaries, [](VkPipelineBinaryKHR binary) { return binary != VK_NULL_HANDLE; });
+    g_binaries_alive.fetch_add(static_cast<s64>(made), std::memory_order_relaxed);
 }
 
 /// The file and its index; any thread looks up, rejects and queues entries, the writer thread
@@ -267,15 +332,34 @@ public:
         u64 verified_same{};
         u64 verified_other{};
         u64 file_bytes{};
+        u64 index_bytes{};  ///< The index's RAM (map nodes and buckets, estimated)
+        u64 queued_bytes{}; ///< Entries waiting for the writer
+        u64 kept{};         ///< Shared binaries kept for the session
+        u64 kept_bytes{};
+        u64 reuses{};       ///< Pipelines' binaries given from the kept ones
     };
 
-    Store(std::filesystem::path dir, const Identity& identity_, int mode_, u64 max_bytes_)
+    Store(std::filesystem::path dir, const Identity& identity_, int mode_, u64 max_bytes_,
+          const vk::DeviceDispatch& dld_, VkDevice device_)
         : file{dir / FileName}, index_file{dir / IndexName}, lost_file{dir / LostName},
-          identity{identity_}, mode{mode_}, max_bytes{max_bytes_} {}
+          identity{identity_}, mode{mode_}, max_bytes{max_bytes_},
+          shared_budget{SharedBudgetSwitch()}, dld{dld_}, device{device_} {}
 
+    /// Runs when the last build holding the store is done: no kept binary is in use.
     ~Store() {
         Close();
+        for (const auto& [hash, kept_binary] : kept) {
+            dld.vkDestroyPipelineBinaryKHR(device, kept_binary.handle, nullptr);
+            g_binaries_alive.fetch_sub(1, std::memory_order_relaxed);
+        }
     }
+
+    /// A kept binary with this driver key, or null. Valid while the caller holds the store.
+    VkPipelineBinaryKHR SharedFind(std::span<const u8> key);
+
+    /// Offers a binary just made for a pipeline. True when the store keeps it (it names a key
+    /// seen in an earlier pipeline too): the caller must not destroy it then.
+    bool SharedOffer(std::span<const u8> key, VkPipelineBinaryKHR handle, u64 bytes);
 
     Store(const Store&) = delete;
     Store& operator=(const Store&) = delete;
@@ -420,7 +504,71 @@ private:
     std::atomic<u64> verified_other{};
     std::atomic<u32> verify_counter{};
     std::atomic<bool> used_any{};
+
+    // Shared binaries: NVIDIA's driver gives every pipeline one 2 MiB binary with the same key
+    // (besides its own small ones), and a pipeline built from a binary made for it alone kept
+    // its own copy: +5 GB at Castle Town. Made once and named by every pipeline instead.
+    struct Kept {
+        std::vector<u8> key;
+        VkPipelineBinaryKHR handle{};
+        u64 bytes{};
+    };
+    static constexpr size_t MaxSightings = 1U << 18;
+    const u64 shared_budget;
+    const vk::DeviceDispatch& dld;
+    const VkDevice device;
+    mutable std::mutex shared_mutex;
+    std::unordered_map<u64, u32> sightings; ///< Binary key hash -> pipelines that made it
+    std::unordered_map<u64, Kept> kept;
+    u64 kept_bytes{};
+    std::atomic<u64> reuses{};
 };
+
+u64 BinaryKeyHash(std::span<const u8> key) {
+    return Common::CityHash64(reinterpret_cast<const char*>(key.data()), key.size());
+}
+
+VkPipelineBinaryKHR Store::SharedFind(std::span<const u8> key) {
+    if (shared_budget == 0) {
+        return VK_NULL_HANDLE;
+    }
+    const u64 hash = BinaryKeyHash(key);
+    std::scoped_lock lock{shared_mutex};
+    const auto it = kept.find(hash);
+    if (it == kept.end() || !std::ranges::equal(it->second.key, key)) {
+        return VK_NULL_HANDLE;
+    }
+    reuses.fetch_add(1, std::memory_order_relaxed);
+    return it->second.handle;
+}
+
+bool Store::SharedOffer(std::span<const u8> key, VkPipelineBinaryKHR handle, u64 bytes) {
+    if (shared_budget == 0 || handle == VK_NULL_HANDLE) {
+        return false;
+    }
+    const u64 hash = BinaryKeyHash(key);
+    std::scoped_lock lock{shared_mutex};
+    if (kept.contains(hash)) {
+        return false; // Another build kept one meanwhile (or another key under the same hash)
+    }
+    auto it = sightings.find(hash);
+    if (it == sightings.end()) {
+        if (sightings.size() >= MaxSightings) {
+            return false;
+        }
+        sightings.emplace(hash, 1U);
+        return false;
+    }
+    if (kept_bytes + bytes > shared_budget) {
+        return false;
+    }
+    sightings.erase(it);
+    kept.emplace(hash, Kept{.key = std::vector<u8>(key.begin(), key.end()),
+                            .handle = handle,
+                            .bytes = bytes});
+    kept_bytes += bytes;
+    return true;
+}
 
 bool Store::StartOver(std::string_view why) {
     if (!why.empty()) {
@@ -653,6 +801,7 @@ std::optional<Entry> Store::Find(u64 key) {
     if (record.empty()) {
         return damaged_entry();
     }
+    Held held{record.size()};
     u32 magic{}, size{};
     u64 stored_key{}, hash{};
     std::memcpy(&magic, record.data(), 4);
@@ -670,6 +819,7 @@ std::optional<Entry> Store::Find(u64 key) {
     const std::span<const u8> stored_body = payload.subspan(8);
     std::optional<Entry> entry;
     if ((flags & FlagZstd) != 0) {
+        held.Add(body_size);
         const auto body = Common::Compression::TryDecompressDataZSTD(stored_body, body_size);
         if (body && body->size() == body_size) {
             entry = DecodeEntry(*body);
@@ -756,13 +906,16 @@ void Store::WriterLoop() {
             jobs.pop_front();
         }
         const std::vector<u8> body = EncodeEntry(job.entry);
+        Held held{body.size()};
         std::vector<u8> compressed =
             Common::Compression::CompressDataZSTD(body.data(), body.size(), ZstdLevel);
+        held.Add(compressed.size());
         const bool use_zstd = !compressed.empty() && compressed.size() < body.size();
         const std::span<const u8> stored = use_zstd ? std::span<const u8>{compressed}
                                                     : std::span<const u8>{body};
         std::vector<u8> record;
         record.reserve(RecordHeaderSize + 8 + stored.size());
+        held.Add(RecordHeaderSize + 8 + stored.size());
         const u32 payload_size = static_cast<u32>(8 + stored.size());
         Put(record, RecordMagic);
         Put(record, payload_size);
@@ -952,9 +1105,24 @@ Store::Counts Store::GetCounts() const {
         .verified_same = verified_same.load(std::memory_order_relaxed),
         .verified_other = verified_other.load(std::memory_order_relaxed),
     };
-    std::scoped_lock lock{mutex};
-    counts.file_bytes = file_bytes;
+    {
+        std::scoped_lock lock{mutex};
+        counts.file_bytes = file_bytes;
+        counts.queued_bytes = queued_bytes;
+        // A node holds the key and entry plus two links; one bucket pointer each
+        counts.index_bytes = index.size() * (sizeof(std::pair<const u64, IndexEntry>) +
+                                             2 * sizeof(void*)) +
+                             index.bucket_count() * sizeof(void*);
+    }
+    std::scoped_lock lock{shared_mutex};
+    counts.index_bytes += sightings.size() * (sizeof(std::pair<const u64, u32>) +
+                                              2 * sizeof(void*)) +
+                          sightings.bucket_count() * sizeof(void*);
+    counts.kept = kept.size();
+    counts.kept_bytes = kept_bytes;
+    counts.reuses = reuses.load(std::memory_order_relaxed);
     return counts;
+
 }
 
 // The open store, shared with the pipeline builds that use it
@@ -1020,7 +1188,26 @@ void DestroyBinaries(const vk::DeviceDispatch& dld, VkDevice device,
     for (const VkPipelineBinaryKHR binary : binaries) {
         if (binary != VK_NULL_HANDLE) {
             dld.vkDestroyPipelineBinaryKHR(device, binary, nullptr);
+            g_binaries_alive.fetch_sub(1, std::memory_order_relaxed);
         }
+    }
+}
+
+/// Binaries just made for one pipeline: those the store keeps (shared with other pipelines,
+/// `keys` given) stay, the rest are destroyed.
+void OfferOrDestroy(const vk::DeviceDispatch& dld, VkDevice device, Store* store,
+                    std::span<const VkPipelineBinaryKHR> binaries,
+                    const std::vector<Binary>* keys) {
+    for (size_t i = 0; i < binaries.size(); ++i) {
+        const VkPipelineBinaryKHR binary = binaries[i];
+        if (binary == VK_NULL_HANDLE) {
+            continue;
+        }
+        if (store && keys && i < keys->size() &&
+            store->SharedOffer((*keys)[i].key, binary, (*keys)[i].data.size())) {
+            continue;
+        }
+        DestroyBinaries(dld, device, std::span{&binary, 1});
     }
 }
 
@@ -1048,7 +1235,9 @@ std::vector<VkPipelineBinaryKHR> MakeBinaries(const vk::DeviceDispatch& dld, VkD
     }
     std::vector<VkPipelineBinaryKHR> binaries(handles.pipelineBinaryCount, VK_NULL_HANDLE);
     handles.pPipelineBinaries = binaries.data();
-    if (dld.vkCreatePipelineBinariesKHR(device, &binary_ci, nullptr, &handles) != VK_SUCCESS) {
+    const VkResult result = dld.vkCreatePipelineBinariesKHR(device, &binary_ci, nullptr, &handles);
+    NoteCreated(binaries);
+    if (result != VK_SUCCESS) {
         DestroyBinaries(dld, device, binaries);
         return {};
     }
@@ -1109,15 +1298,27 @@ VkPipeline CreateWithBinaries(const vk::DeviceDispatch& dld, VkDevice device, co
     return pipeline;
 }
 
-/// The pipeline built from a stored entry's binaries, or null when the driver refuses them
+/// The pipeline built from a stored entry's binaries, or null when the driver refuses them.
+/// Binaries the store keeps (shared by many pipelines) are named, not made again.
 template <typename CreateInfo>
-VkPipeline CreateFromEntry(const vk::DeviceDispatch& dld, VkDevice device, const Entry& stored,
-                           const CreateInfo& ci) {
-    const u32 count = static_cast<u32>(stored.binaries.size());
+VkPipeline CreateFromEntry(const vk::DeviceDispatch& dld, VkDevice device, Store& store,
+                           const Entry& stored, const CreateInfo& ci) {
+    std::vector<VkPipelineBinaryKHR> binaries(stored.binaries.size(), VK_NULL_HANDLE);
+    std::vector<u32> fresh; ///< Indices made here
+    for (u32 i = 0; i < stored.binaries.size(); ++i) {
+        binaries[i] = store.SharedFind(stored.binaries[i].key);
+        if (binaries[i] == VK_NULL_HANDLE) {
+            fresh.push_back(i);
+        }
+    }
+    if (fresh.empty()) {
+        return CreateWithBinaries(dld, device, ci, binaries);
+    }
+    const u32 count = static_cast<u32>(fresh.size());
     std::vector<VkPipelineBinaryKeyKHR> keys(count);
     std::vector<VkPipelineBinaryDataKHR> data(count);
     for (u32 i = 0; i < count; ++i) {
-        const Binary& binary = stored.binaries[i];
+        const Binary& binary = stored.binaries[fresh[i]];
         keys[i] = VkPipelineBinaryKeyKHR{.sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR,
                                          .pNext = nullptr,
                                          .keySize = static_cast<u32>(binary.key.size()),
@@ -1138,27 +1339,42 @@ VkPipeline CreateFromEntry(const vk::DeviceDispatch& dld, VkDevice device, const
         .pipeline = VK_NULL_HANDLE,
         .pPipelineCreateInfo = nullptr,
     };
-    std::vector<VkPipelineBinaryKHR> binaries(count, VK_NULL_HANDLE);
+    std::vector<VkPipelineBinaryKHR> made(count, VK_NULL_HANDLE);
     VkPipelineBinaryHandlesInfoKHR handles{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_HANDLES_INFO_KHR,
         .pNext = nullptr,
         .pipelineBinaryCount = count,
-        .pPipelineBinaries = binaries.data(),
+        .pPipelineBinaries = made.data(),
     };
+    const VkResult result = dld.vkCreatePipelineBinariesKHR(device, &binary_ci, nullptr, &handles);
+    NoteCreated(made);
     VkPipeline pipeline = VK_NULL_HANDLE;
-    if (dld.vkCreatePipelineBinariesKHR(device, &binary_ci, nullptr, &handles) == VK_SUCCESS &&
-        handles.pipelineBinaryCount == count) {
+    if (result == VK_SUCCESS && handles.pipelineBinaryCount == count) {
+        for (u32 i = 0; i < count; ++i) {
+            binaries[fresh[i]] = made[i];
+        }
         pipeline = CreateWithBinaries(dld, device, ci, binaries);
     }
-    DestroyBinaries(dld, device, binaries);
+    if (pipeline == VK_NULL_HANDLE) {
+        DestroyBinaries(dld, device, made);
+        return VK_NULL_HANDLE;
+    }
+    // Kept only from a pipeline the driver built from them
+    for (u32 i = 0; i < count; ++i) {
+        const Binary& binary = stored.binaries[fresh[i]];
+        if (!store.SharedOffer(binary.key, made[i], binary.data.size())) {
+            DestroyBinaries(dld, device, std::span{&made[i], 1});
+        }
+    }
     return pipeline;
 }
 
 /// A pipeline compiled with VK_PIPELINE_CREATE_2_CAPTURE_DATA_BIT_KHR, and its binaries when the
-/// driver gives them. The pipeline is null when the build failed.
+/// driver gives them. The pipeline is null when the build failed. `share`: the store offered the
+/// binaries made from it (null for the verify compile).
 template <typename CreateInfo>
 std::pair<VkPipeline, std::optional<std::vector<Binary>>> CompileAndCapture(
-    const vk::DeviceDispatch& dld, VkDevice device, const CreateInfo& ci) {
+    const vk::DeviceDispatch& dld, VkDevice device, const CreateInfo& ci, Store* share) {
     const VkPipelineCreateFlags2CreateInfoKHR capture_flags{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR,
         .pNext = ci.pNext,
@@ -1175,11 +1391,13 @@ std::pair<VkPipeline, std::optional<std::vector<Binary>>> CompileAndCapture(
         }
         return {VK_NULL_HANDLE, std::nullopt};
     }
+    g_captured_unreleased.fetch_add(1, std::memory_order_relaxed);
     std::optional<std::vector<Binary>> captured;
     const std::vector<VkPipelineBinaryKHR> binaries = MakeBinaries(dld, device, pipeline, nullptr);
     if (!binaries.empty()) {
         captured = ReadBinaries(dld, device, binaries);
-        DestroyBinaries(dld, device, binaries);
+        // Binaries stay valid without the pipeline's captured data (or the pipeline)
+        OfferOrDestroy(dld, device, share, binaries, captured ? &*captured : nullptr);
     }
     const VkReleaseCapturedPipelineDataInfoKHR release{
         .sType = VK_STRUCTURE_TYPE_RELEASE_CAPTURED_PIPELINE_DATA_INFO_KHR,
@@ -1187,6 +1405,7 @@ std::pair<VkPipeline, std::optional<std::vector<Binary>>> CompileAndCapture(
         .pipeline = pipeline,
     };
     dld.vkReleaseCapturedPipelineDataKHR(device, &release, nullptr);
+    g_captured_unreleased.fetch_sub(1, std::memory_order_relaxed);
     return {pipeline, std::move(captured)};
 }
 
@@ -1238,13 +1457,14 @@ vk::Pipeline Create(const Device& device, const CreateInfo& ci, VkPipelineCache 
     const u64 key = IndexKey(kind, *driver_key);
     const auto begin = Clock::now();
     if (const std::optional<Entry> stored = store->Find(key)) {
+        const Held held{stored->pipeline_key.size() + EntryBytes(stored->binaries)};
         if (stored->pipeline_key == *driver_key) {
-            if (const VkPipeline pipeline = CreateFromEntry(dld, handle, *stored, ci)) {
+            if (const VkPipeline pipeline = CreateFromEntry(dld, handle, *store, *stored, ci)) {
                 store->Hit(NsSince(begin));
                 if (store->ShouldVerify()) {
                     // Compiled the normal way too: the driver's binaries of it must be the ones
                     // stored (the same keys).
-                    auto [check, captured] = CompileAndCapture(dld, handle, ci);
+                    auto [check, captured] = CompileAndCapture(dld, handle, ci, nullptr);
                     if (check != VK_NULL_HANDLE) {
                         const bool same = captured && SameKeys(*captured, stored->binaries);
                         store->Verified(same);
@@ -1271,17 +1491,29 @@ vk::Pipeline Create(const Device& device, const CreateInfo& ci, VkPipelineCache 
     }
     if (device.PipelineBinaryProperties().pipelineBinaryInternalCache && HarvestSwitch()) {
         // The driver's own cache may still hold it: taken from there, no compile.
-        const std::vector<VkPipelineBinaryKHR> binaries =
+        std::vector<VkPipelineBinaryKHR> binaries =
             MakeBinaries(dld, handle, VK_NULL_HANDLE, &key_info);
         if (!binaries.empty()) {
-            const VkPipeline pipeline = CreateWithBinaries(dld, handle, ci, binaries);
-            std::optional<std::vector<Binary>> read;
-            if (pipeline != VK_NULL_HANDLE) {
-                read = ReadBinaries(dld, handle, binaries);
+            // Read first: a binary the store keeps already is named instead of the one just
+            // made (the same key: the same binary).
+            std::optional<std::vector<Binary>> read = ReadBinaries(dld, handle, binaries);
+            Held held{read ? EntryBytes(*read) : 0};
+            std::vector<VkPipelineBinaryKHR> fresh = binaries;
+            if (read) {
+                for (size_t i = 0; i < binaries.size(); ++i) {
+                    if (const VkPipelineBinaryKHR kept = store->SharedFind((*read)[i].key)) {
+                        DestroyBinaries(dld, handle, std::span{&fresh[i], 1});
+                        fresh[i] = VK_NULL_HANDLE;
+                        binaries[i] = kept;
+                    }
+                }
             }
-            DestroyBinaries(dld, handle, binaries);
+            const VkPipeline pipeline = CreateWithBinaries(dld, handle, ci, binaries);
+            OfferOrDestroy(dld, handle, pipeline != VK_NULL_HANDLE ? store.get() : nullptr, fresh,
+                           read ? &*read : nullptr);
             if (pipeline != VK_NULL_HANDLE) {
                 if (read) {
+                    held.Release();
                     store->Save(key, kind,
                                 Entry{.pipeline_key = std::move(*driver_key),
                                       .binaries = std::move(*read)});
@@ -1292,7 +1524,7 @@ vk::Pipeline Create(const Device& device, const CreateInfo& ci, VkPipelineCache 
             }
         }
     }
-    auto [pipeline, captured] = CompileAndCapture(dld, handle, ci);
+    auto [pipeline, captured] = CompileAndCapture(dld, handle, ci, store.get());
     if (pipeline == VK_NULL_HANDLE) {
         // Built as without the store, which reports its own errors
         vk::Pipeline normal = CreateNormally(logical, ci, cache);
@@ -1326,19 +1558,53 @@ void LogStoreCounts(const Store& store, std::string_view when) {
                  ? fmt::format("; verify: {} same, {} different", c.verified_same,
                                c.verified_other)
                  : std::string{});
+    LOG_INFO(Render_Vulkan,
+             "Pipeline binaries RAM: store index {:.1f} MiB, blobs held {:.1f} MiB (peak {:.1f}), "
+             "queued for the file {:.1f} MiB, binaries alive {} ({} kept shared, {:.1f} MiB, {} "
+             "reuses), captured data unreleased {}",
+             MiB(c.index_bytes), MiB(g_held_bytes.load(std::memory_order_relaxed)),
+             MiB(g_held_peak.load(std::memory_order_relaxed)), MiB(c.queued_bytes),
+             g_binaries_alive.load(std::memory_order_relaxed), c.kept, MiB(c.kept_bytes),
+             c.reuses, g_captured_unreleased.load(std::memory_order_relaxed));
 }
 
 } // Anonymous namespace
 
-int SwitchValue() {
+namespace {
+std::atomic<int> g_default_value{0};
+
+/// FRITCHII_PIPELINE_BINARY as set (0..3), or -1 when unset or not one of those
+int SetValue() {
     static const int value = [] {
         const char* text = std::getenv("FRITCHII_PIPELINE_BINARY");
         if (text == nullptr || text[0] < '0' || text[0] > '3' || text[1] != '\0') {
-            return 0;
+            return -1;
         }
         return text[0] - '0';
     }();
     return value;
+}
+} // Anonymous namespace
+
+int SwitchValue() {
+    const int value = SetValue();
+    return value >= 0 ? value : g_default_value.load(std::memory_order_relaxed);
+}
+
+void ChooseDefault(u32 vendor_id) {
+    // On Windows AMD's Vulkan driver is the proprietary one: it keeps only part of the prepared
+    // pipelines and compiles the rest again at first use. Elsewhere the driver's cache is kept.
+#ifdef _WIN32
+    constexpr bool windows = true;
+#else
+    constexpr bool windows = false;
+#endif
+    const int value = windows && vendor_id == 0x1002 ? 1 : 0;
+    g_default_value.store(value, std::memory_order_relaxed);
+    if (value != 0 && SetValue() < 0) {
+        LOG_INFO(Render_Vulkan, "FRITCHII_PIPELINE_BINARY: on by default for AMD's Windows driver "
+                                "(=0 turns it off)");
+    }
 }
 
 void Open(const Device& device, const std::filesystem::path& title_dir) {
@@ -1365,7 +1631,8 @@ void Open(const Device& device, const std::filesystem::path& title_dir) {
     // No global key (vkGetPipelineKeyKHR without a create info): one NVIDIA driver overwrites a
     // register its caller keeps there. The ids above name the driver, and each entry is checked
     // against the driver's key of its own create info.
-    auto store = std::make_shared<Store>(title_dir, identity, SwitchValue(), MaxBytesSwitch());
+    auto store = std::make_shared<Store>(title_dir, identity, SwitchValue(), MaxBytesSwitch(), dld,
+                                         *device.GetLogical());
     if (!store->Open()) {
         return;
     }
