@@ -237,6 +237,28 @@ void PruneUnreadGeometryOutputs(Shader::IR::Program& geometry, const Shader::IR:
     }
 }
 
+/// FRITCHII_AMD_NOPERSPECTIVE=1 on an AMD driver (see MakeRuntimeInfo). Read once, after
+/// nx2_switches.txt was applied (the first pipeline build).
+bool AmdNoPerspectiveFix(const Vulkan::Device& device) {
+    static const bool on = [&device] {
+        const char* const value = std::getenv("FRITCHII_AMD_NOPERSPECTIVE");
+        const VkDriverId driver = device.GetDriverID();
+        const bool amd = driver == VK_DRIVER_ID_AMD_PROPRIETARY ||
+                         driver == VK_DRIVER_ID_AMD_OPEN_SOURCE ||
+                         driver == VK_DRIVER_ID_MESA_RADV;
+        const bool enabled = amd && value != nullptr && value[0] == '1';
+        if (amd) {
+            LOG_INFO(Render_Vulkan,
+                     "FRITCHII_AMD_NOPERSPECTIVE={}: noperspective varyings {} (red flash fix "
+                     "for water on AMD)",
+                     enabled ? 1 : 0,
+                     enabled ? "interpolated perspective-correct" : "left native");
+        }
+        return enabled;
+    }();
+    return on;
+}
+
 Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> programs,
                                     const GraphicsPipelineCacheKey& key,
                                     const Shader::IR::Program& program,
@@ -402,6 +424,43 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
     }
     info.force_early_z = key.state.early_z != 0;
     info.y_negate = key.state.y_negate != 0;
+    // FRITCHII_AMD_NOPERSPECTIVE=1 (off by default, AMD drivers only): noperspective varyings
+    // written times Position.w and read perspective-correct times FragCoord.w (port of
+    // zortos293/Lichii#820, reverted for every GPU in 9b30eec8ca after white fog at the Hyrule
+    // Field drawbridge on an RTX 4080). OoT's water volumes write a screen-space coordinate as a
+    // noperspective varying; AMD's driver interpolates it wrongly when a primitive is clipped close
+    // to the camera, and an exp2 overflows to the R11G11B10 maximum: red flashes (CheezyEmu
+    // re-applied it on AMD for that). Transform feedback would capture the scaled values, a
+    // passthrough geometry shader doesn't scale the outputs it writes itself, and indexed attribute
+    // reads in the fragment stage don't undo the scaling, so all three keep native noperspective.
+    if (AmdNoPerspectiveFix(device)) {
+        const bool geometry_passthrough{key.unique_hashes[4] != 0 &&
+                                        programs[4].is_geometry_passthrough};
+        if (key.unique_hashes[5] != 0 && !geometry_passthrough && key.state.xfb_enabled == 0 &&
+            !programs[5].info.loads_indexed_attributes) {
+            const bool has_tess{key.unique_hashes[3] != 0};
+            const bool last_pre_raster{
+                (stage == Shader::Stage::VertexB && !has_tess && !has_geometry) ||
+                (stage == Shader::Stage::TessellationEval && !has_geometry) ||
+                (stage == Shader::Stage::Geometry && has_geometry)};
+            if (stage == Shader::Stage::Fragment) {
+                info.scaled_noperspective_inputs =
+                    previous_program &&
+                    (previous_program->stage == Shader::Stage::VertexB ||
+                     previous_program->stage == Shader::Stage::TessellationEval ||
+                     previous_program->stage == Shader::Stage::Geometry);
+            }
+            if (last_pre_raster) {
+                const auto& fragment_info{programs[5].info};
+                for (size_t index = 0; index < 32; ++index) {
+                    if (fragment_info.interpolation[index] ==
+                        Shader::Interpolation::NoPerspective) {
+                        info.noperspective_outputs.set(index);
+                    }
+                }
+            }
+        }
+    }
     return info;
 }
 
@@ -3913,6 +3972,10 @@ u64 SpirvSettingsStamp() {
             << 17;
     bits |= static_cast<u64>(Settings::values.fix_bloom_effects.GetValue() ? 1 : 0) << 18;
     bits |= static_cast<u64>(Settings::values.renderer_debug.GetValue() ? 1 : 0) << 19;
+    // FRITCHII_AMD_NOPERSPECTIVE=1 changes the SPIR-V of every stage pair with a noperspective
+    // varying (MakeRuntimeInfo), so kept modules of the other form are not used.
+    const char* const noperspective = std::getenv("FRITCHII_AMD_NOPERSPECTIVE");
+    bits |= static_cast<u64>(noperspective != nullptr && noperspective[0] == '1' ? 1 : 0) << 20;
     return bits;
 }
 
@@ -7024,7 +7087,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             std::span{stages.data(), num_stages}, host_info);
     }
     // Mesh emulation without VK_EXT_mesh_shader (prototype): a mesh program, after an optional
-    // task program, drawing triangles without per-primitive outputs, before a pixel program only.
+    // task program, drawing triangles, lines or points without per-primitive outputs, before a
+    // pixel program only.
     std::optional<MeshEmulationSetup> mesh_emulation;
     size_t mesh_index{};
     if (mesh_unsupported) {
@@ -7040,15 +7104,40 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         bool eligible{mesh_index != 0 && (mesh_index == 1 || has_task) &&
                       layer_source_program == nullptr};
         const Shader::IR::Program& mesh{programs[mesh_index]};
-        eligible = eligible && mesh.mesh.topology == 4 && mesh.mesh.primitive_lines.empty() &&
-                   !mesh.mesh.vertex_lines.empty() && mesh.mesh.max_vertices != 0 &&
-                   mesh.mesh.max_primitives != 0;
-        for (size_t index = 1; index < Maxwell::MaxShaderProgram && eligible; ++index) {
-            const bool emulated{index == mesh_index || (has_task && index == 1)};
-            eligible = emulated || key.unique_hashes[index] == 0 ||
-                       programs[index].stage == Shader::Stage::Fragment;
-        }
+        // Points (OoT's Zora's Domain draws two point-list mesh programs every frame, 32 points
+        // per workgroup with their own size) and lines are drawn as point and line lists.
+        const char* refused{nullptr};
         if (!eligible) {
+            refused = mesh_index == 0 ? "no mesh program"
+                      : layer_source_program != nullptr ? "layer emulation"
+                                                        : "mesh program after a non-task stage";
+        } else if (mesh.mesh.topology != 0 && mesh.mesh.topology != 1 &&
+                   mesh.mesh.topology != 4) {
+            refused = "output topology";
+        } else if (!mesh.mesh.primitive_lines.empty()) {
+            refused = "per-primitive outputs";
+        } else if (mesh.mesh.vertex_lines.empty() || mesh.mesh.max_vertices == 0 ||
+                   mesh.mesh.max_primitives == 0) {
+            refused = "empty output";
+        }
+        for (size_t index = 1; index < Maxwell::MaxShaderProgram && refused == nullptr; ++index) {
+            const bool emulated{index == mesh_index || (has_task && index == 1)};
+            if (!emulated && key.unique_hashes[index] != 0 &&
+                programs[index].stage != Shader::Stage::Fragment) {
+                refused = "a stage besides task, mesh and pixel";
+            }
+        }
+        if (refused != nullptr) {
+            // Its draws are dropped (the rasterizer's "mesh draws dropped" count): say why, for
+            // the first 32 refusals.
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+                LOG_WARNING(Render_Vulkan,
+                            "Mesh emulation refused for {}: {} (topology {}, primitive lines {})",
+                            PipelineShaders(key), refused,
+                            mesh_index != 0 ? mesh.mesh.topology : 0U,
+                            mesh_index != 0 ? mesh.mesh.primitive_lines.size() : size_t{0});
+            }
             return nullptr;
         }
         // The output buffer's binding follows every program's. The task and mesh programs
@@ -7132,6 +7221,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         mesh_emulation->block_words = Shader::Backend::SPIRV::MeshEmulationBlockWords(mesh.mesh);
         mesh_emulation->max_primitives = mesh.mesh.max_primitives;
+        mesh_emulation->primitive_vertices = mesh.mesh.PrimitiveVertices();
         mesh_emulation->max_vertices = mesh.mesh.max_vertices;
         mesh_emulation->vertex_lines = static_cast<u32>(mesh.mesh.vertex_lines.size());
         for (u32 line = 0; line < mesh.mesh.vertex_lines.size(); ++line) {
@@ -7156,11 +7246,15 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 }
             }
             LOG_INFO(Render_Vulkan,
-                     "Mesh emulation #{}: pipeline {:016x}, {} vertices x {} lines, {} triangles "
+                     "Mesh emulation #{}: pipeline {:016x}, {} vertices x {} lines, {} {} "
                      "per workgroup, output binding {}, task {} (payload {} words), input "
                      "reads:{}",
                      count, hash, mesh.mesh.max_vertices, mesh.mesh.vertex_lines.size(),
-                     mesh.mesh.max_primitives, output_binding, has_task,
+                     mesh.mesh.max_primitives,
+                     mesh.mesh.topology == 0   ? "points"
+                     : mesh.mesh.topology == 1 ? "lines"
+                                               : "triangles",
+                     output_binding, has_task,
                      mesh_emulation->payload_stride, reads.empty() ? " none" : reads);
         }
     }
@@ -7293,7 +7387,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 mesh_emulation->vertex_spirv = Shader::Backend::SPIRV::EmitMeshEmulationVertex(
                     profile, program.mesh, mesh_emulation->output_binding,
                     mesh_emulation->has_task ? mesh_emulation->args_binding : ~0U,
-                    runtime_info.convert_depth_mode && !profile.support_native_ndc);
+                    runtime_info.convert_depth_mode && !profile.support_native_ndc,
+                    runtime_info.fixed_state_point_size.value_or(1.0f));
             }
         }
         ConvertLegacyToGeneric(program, runtime_info);
