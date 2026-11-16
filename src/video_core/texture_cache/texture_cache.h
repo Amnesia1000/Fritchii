@@ -216,18 +216,6 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             return false;
         }
         must_download = IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap);
-        // FRITCHII_LOST_WRITEBACK (zortos293/Lichii #1501's idea): a bad overlap whose contents
-        // the game reads in later frames is written back, as any other GPU-written image, unless
-        // a newer write-back owns some of its bytes. Dropped, the next image there started with
-        // other memory's bytes (the dialogue text corruption, #1310).
-        if (!must_download && True(image.flags & ImageFlagBits::BadOverlap) &&
-            IsDownloadable(image) && KeepLostContents(image)) {
-            if (NewerWritebackOver(image)) {
-                ++lost_stats.writeback_skipped_newer;
-            } else {
-                must_download = true;
-            }
-        }
         return !((!aggressive_mode && !evict_old_costly &&
                   True(image.flags & ImageFlagBits::CostlyLoad)) ||
                  (!high_priority_mode && must_download));
@@ -275,6 +263,21 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         // when the GPU has written it out (LandCollectDownloads), instead of waiting here. An
         // allocation that failed needs the memory now, so it still waits.
         bool queued = false;
+        // FRITCHII_LOST_WRITEBACK (default 1; zortos293/Lichii #1501's idea): a GPU-written bad
+        // overlap is written back before it goes, through the same queue; it was dropped, and the
+        // next image there showed other memory (the dialogue text corruption, #1310). An
+        // allocation that failed needs the memory now: dropped as before.
+        if (!must_download && !out_of_memory && True(image.flags & ImageFlagBits::BadOverlap)) {
+            switch (QueueLostWriteback(image_id, image, LostPathCollector)) {
+            case LostWriteback::Queued:
+                queued = true;
+                break;
+            case LostWriteback::Keep:
+                return false;
+            case LostWriteback::Drop:
+                break;
+            }
+        }
         if (must_download && VideoCore::Nx2Debug::Experiment(121) != 0) {
             if (out_of_memory) {
                 ++collect_stats.fallback_oom;
@@ -303,7 +306,6 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
                 SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);
                 ++gc_download_deletes;
                 NoteWriteback(image); // FRITCHII_LOST_WRITEBACK's order check
-                lost_stats.writebacks += True(image.flags & ImageFlagBits::BadOverlap) ? 1 : 0;
                 unmap_stats.downloads += image.unmapped_tick != 0 ? 1 : 0;
                 // Guest memory holds the GPU's data now (DeleteImage must not mark it stale).
                 image.flags &= ~ImageFlagBits::GpuModified;
@@ -460,7 +462,7 @@ bool TextureCache<P>::QueueCollectDownload(ImageId image_id) {
             .staging_bytes = staging_bytes,
             .memory_bytes = memory_bytes,
             .cpu_modified = True(image.flags & ImageFlagBits::CpuModified),
-            .bad_overlap = True(image.flags & ImageFlagBits::BadOverlap),
+            .lost_path = 0,
         });
         image.flags |= ImageFlagBits::CollectPending;
         collect_download_staging += staging_bytes;
@@ -530,7 +532,9 @@ void TextureCache<P>::LandCollectDownloads() {
                 // guest memory, its own download lands over ours later, and one that lands first
                 // drops ours (DropCollectDownloadsIn), so landing ours is what the waiting path
                 // does. Dropped, the image stayed and the next pass queued it again.
-                const bool land_under = VideoCore::Nx2Debug::SwitchValue(
+                // FRITCHII_LOST_WRITEBACK's entries always land under such overlaps.
+                const bool land_under = entry.lost_path != 0 ||
+                                        VideoCore::Nx2Debug::SwitchValue(
                                             VideoCore::Nx2Debug::g_collect_land_under,
                                             "FRITCHII_COLLECT_LAND_UNDER") > 0;
                 const ImageId self = entry.image_id;
@@ -548,7 +552,10 @@ void TextureCache<P>::LandCollectDownloads() {
                                          overlap_written = true;
                                      });
             }
-            if (overlap_written) {
+            // FRITCHII_LOST_WRITEBACK: a newer write-back landed over some of its bytes since.
+            const bool newer_landed = entry.lost_path != 0 && !written && !overlap_written &&
+                                      runtime.IsFree(entry.tick) && NewerWritebackOver(image);
+            if (overlap_written || newer_landed) {
                 // FRITCHII_COVERED_RETIRE: newer GPU writes cover all of it, so nothing of it is
                 // left to land: deleted now instead of kept for the next pass to queue again.
                 if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_covered_retire,
@@ -564,11 +571,11 @@ void TextureCache<P>::LandCollectDownloads() {
                 }
                 written = true;
                 ++collect_stats.dropped_under;
-                if (entry.bad_overlap) {
+                if (entry.lost_path != 0) {
                     // FRITCHII_LOST_WRITEBACK: newer bytes in its memory now; deleted without the
-                    // write-back, as the collector deleted bad overlaps before (queued again, it
-                    // would download every pass).
+                    // write-back, as before (queued again, it would download every pass).
                     const ImageId image_id = entry.image_id;
+                    ++lost_stats.wb_refused[entry.lost_path];
                     DropCollectDownload(i);
                     ++collect_stats.dropped_written;
                     MarkStale(image); // before UntrackImage (see MarkStale)
@@ -611,7 +618,10 @@ void TextureCache<P>::LandCollectDownloads() {
                          entry.map.mapped_span, swizzle_data_buffer);
             ++collect_stats.landed;
             NoteWriteback(image); // FRITCHII_LOST_WRITEBACK's order check
-            lost_stats.writebacks += entry.bad_overlap ? 1 : 0;
+            if (entry.lost_path != 0) {
+                ++lost_stats.wb_landed[entry.lost_path];
+                lost_stats.wb_landed_bytes[entry.lost_path] += image.guest_size_bytes;
+            }
             collect_stats.landed_under += landed_under ? 1 : 0;
             collect_stats.land_frames += frame_tick - entry.frame;
             unmap_stats.downloads += image.unmapped_tick != 0 ? 1 : 0;
@@ -818,6 +828,7 @@ void TextureCache<P>::RecordStaleDrop(const ImageBase& image) {
         .height = image.info.size.height,
         .reason = marking_relocation ? LostReasonRelocate : static_cast<u8>(delete_reason),
         .guard = image.relocation_guard_noted,
+        .shape_key = RelocationShapeKey(image.info),
     };
     stale_drop_next = (stale_drop_next + 1) % StaleDropRing;
     stale_drop_count = (std::min)(stale_drop_count + 1, StaleDropRing);
@@ -866,6 +877,15 @@ void TextureCache<P>::NoteLostContents(ImageBase& image, bool is_modification, b
     if (drop != nullptr && (drop->guard & (GuardSampled | GuardLoaded)) != 0) {
         ++s.sampled_guarded;
     }
+    // A relocation moved the image away while its old address was still read: that shape and
+    // address never relocate again (as the sampled guard does when it sees the read in time).
+    if (drop != nullptr && reason == 8 &&
+        VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_lost_writeback,
+                                         "FRITCHII_LOST_WRITEBACK", 1) > 0) {
+        relocation_guarded_addresses[drop->gpu_addr] |= GuardSampled;
+        relocation_shapes[drop->shape_key].guard |= GuardSampled;
+        ++s.relocation_guards;
+    }
     if (s.logged < 40) {
         ++s.logged;
         static constexpr std::array<const char*, 10> names{
@@ -900,8 +920,23 @@ void TextureCache<P>::LogLostContents() {
     }
     s.last_log_ns = now;
     const u64 sampled = s.sampled_undrawn + s.sampled_drawn;
-    if (s.made_skipped + s.made_uploaded + sampled + s.writebacks + s.sweeps_kept != 0) {
+    u64 wb_any = 0;
+    for (size_t i = 0; i < LostPathCount; ++i) {
+        wb_any += s.wb_queued[i] + s.wb_landed[i] + s.wb_refused[i] + s.wb_kept[i] +
+                  s.wb_over_cap[i];
+    }
+    if (s.made_skipped + s.made_uploaded + sampled + wb_any != 0) {
         const auto& r = s.sampled_by_reason;
+        // queued/landed (MiB) refused R kept K over cap C, per path.
+        std::string wb;
+        static constexpr std::array<const char*, LostPathCount> paths{
+            "", "collector", "cold sweep", "superseded sweep", "slot retire"};
+        for (size_t i = 1; i < LostPathCount; ++i) {
+            wb += fmt::format("{}{} {}/{} ({:.1f} MiB) refused {} kept {} over cap {}",
+                              i == 1 ? "" : "; ", paths[i], s.wb_queued[i], s.wb_landed[i],
+                              static_cast<double>(s.wb_landed_bytes[i]) / (1024.0 * 1024.0),
+                              s.wb_refused[i], s.wb_kept[i], s.wb_over_cap[i]);
+        }
         LOG_INFO(HW_GPU,
                  "Lost contents in 10 s (FRITCHII_STALE_ZERO={}, FRITCHII_LOST_WRITEBACK={}): "
                  "images made over memory whose GPU data was dropped: {} upload skipped ({} "
@@ -909,16 +944,15 @@ void TextureCache<P>::LogLostContents() {
                  "SAMPLED with lost contents: {} ({} not drawn into, {} drawn over; {} KiB; {} "
                  "were read in a later frame before the drop) by drop: collector {}, cold sweep "
                  "{}, superseded sweep {}, slot retire {}, join {}, relocation {}, unmap {}/{}, "
-                 "other {}, not recorded {}; write-backs {} ({} skipped under newer), kept by "
-                 "the sweeps {}",
+                 "other {}, not recorded {}; relocation guards {}; write-backs queued/landed: {}",
                  VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_stale_zero,
                                                   "FRITCHII_STALE_ZERO", 1),
                  VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_lost_writeback,
-                                                  "FRITCHII_LOST_WRITEBACK"),
+                                                  "FRITCHII_LOST_WRITEBACK", 1),
                  s.made_skipped, s.made_zeroed, s.made_uploaded, s.overwritten, sampled,
                  s.sampled_undrawn, s.sampled_drawn, s.sampled_bytes >> 10, s.sampled_guarded,
-                 r[1], r[2], r[7], r[5], r[4], r[8], r[3], r[6], r[0], r[9], s.writebacks,
-                 s.writeback_skipped_newer, s.sweeps_kept);
+                 r[1], r[2], r[7], r[5], r[4], r[8], r[3], r[6], r[0], r[9], s.relocation_guards,
+                 wb);
     }
     const u64 last = s.last_log_ns;
     const u64 logged = s.logged;
@@ -928,16 +962,36 @@ void TextureCache<P>::LogLostContents() {
 }
 
 template <class P>
-bool TextureCache<P>::KeepLostContents(const ImageBase& image) const {
+auto TextureCache<P>::QueueLostWriteback(ImageId image_id, Image& image, u8 path)
+    -> LostWriteback {
+    // 1 (default): every image; N > 1: only images up to N KiB (larger ones dropped as before).
     const int mode = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_lost_writeback,
-                                                      "FRITCHII_LOST_WRITEBACK");
-    if (mode <= 0 || False(image.flags & ImageFlagBits::GpuModified)) {
-        return false;
+                                                      "FRITCHII_LOST_WRITEBACK", 1);
+    if (mode <= 0 || False(image.flags & ImageFlagBits::GpuModified) ||
+        True(image.flags & ImageFlagBits::CollectPending) || !IsDownloadable(image)) {
+        return LostWriteback::Drop;
     }
-    // 1: read in a later frame than written (sampled, or drawn over without a clear): contents
-    // the game keeps, as the dialogue box text target. 2: every GPU-written image (a test of the
-    // cause; downloads everything the collector and the sweeps would drop).
-    return mode >= 2 || (image.relocation_guard_noted & (GuardSampled | GuardLoaded)) != 0;
+    if constexpr (!requires { runtime.CurrentTick(); }) {
+        return LostWriteback::Drop; // no queue (OpenGL)
+    } else {
+        LostContentStats& s = lost_stats;
+        if (mode > 1 && image.guest_size_bytes > u64{static_cast<u32>(mode)} * 1024) {
+            ++s.wb_over_cap[path];
+            return LostWriteback::Drop;
+        }
+        // Bytes a newer image already wrote back: landing this one would put older bytes there.
+        if (NewerWritebackOver(image)) {
+            ++s.wb_refused[path];
+            return LostWriteback::Drop;
+        }
+        if (!QueueCollectDownload(image_id)) {
+            ++s.wb_kept[path];
+            return LostWriteback::Keep;
+        }
+        collect_downloads.back().lost_path = path;
+        ++s.wb_queued[path];
+        return LostWriteback::Queued;
+    }
 }
 
 template <class P>
@@ -1777,8 +1831,11 @@ void TextureCache<P>::SweepSuperseded() {
             ++s.kept_busy;
             continue;
         }
-        if (KeepLostContents(image)) { // FRITCHII_LOST_WRITEBACK: the collector writes it back
-            ++lost_stats.sweeps_kept;
+        // FRITCHII_LOST_WRITEBACK: written back first (the landing deletes it), or kept for a
+        // later pass while the queue is full.
+        const LostWriteback writeback = QueueLostWriteback(image_id, image, LostPathSuperseded);
+        if (writeback == LostWriteback::Keep) {
+            ++s.kept_busy;
             continue;
         }
         s.deleted_bytes += ImageMemoryBytes(image);
@@ -1786,6 +1843,10 @@ void TextureCache<P>::SweepSuperseded() {
             superseded_swept.clear(); // the oldest are the least likely to be read again
         }
         superseded_swept[image.gpu_addr] = frame_tick;
+        if (writeback == LostWriteback::Queued) {
+            ++s.deleted;
+            continue;
+        }
         MarkStale(image); // before UntrackImage (see MarkStale)
         if (True(image.flags & ImageFlagBits::Tracked)) {
             UntrackImage(image, image_id);
@@ -1820,7 +1881,7 @@ void TextureCache<P>::SweepColdImages() {
         ImageFlagBits::Sparse | ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
         ImageFlagBits::UnwrittenSparse | ImageFlagBits::Unbacked | ImageFlagBits::Converted |
         ImageFlagBits::AsynchronousDecode | ImageFlagBits::IsDecoding | ImageFlagBits::Remapped |
-        ImageFlagBits::CostlyLoad;
+        ImageFlagBits::CostlyLoad | ImageFlagBits::CollectPending;
     const auto queued = [](ImageId image_id, const auto& downloads) {
         return std::ranges::any_of(downloads, [image_id](const auto& download) {
             return download.is_swizzle && download.object_id == image_id;
@@ -1975,12 +2036,20 @@ void TextureCache<P>::SweepColdImages() {
             ++index; // FRITCHII_COVERED_RETIRE: the rest still get their coverage checks
             continue;
         }
-        // FRITCHII_LOST_WRITEBACK: contents a later frame reads go to the collector, which
-        // writes them back.
-        if (KeepLostContents(image)) {
-            ++lost_stats.sweeps_kept;
-            drop();
+        // FRITCHII_LOST_WRITEBACK (default 1): written back to guest memory first, and deleted
+        // when that lands. Dropped, an image made there later (the dialogue box's text read
+        // again after the UI was hidden: OoT draws it once) had no contents (#1310).
+        switch (QueueLostWriteback(image_id, image, LostPathCold)) {
+        case LostWriteback::Queued:
+            ++deleted;
+            cold_superseded += superseded ? 1 : 0;
+            drop(); // the landing deletes it; used again first, it stays
             continue;
+        case LostWriteback::Keep:
+            ++index; // the queue is full: a later frame
+            continue;
+        case LostWriteback::Drop:
+            break;
         }
         // As the collector deletes an image it does not download.
         MarkStale(image); // before UntrackImage (see MarkStale)
@@ -7838,10 +7907,6 @@ u32 TextureCache<P>::RetireSlotPredecessors(const ImageInfo& new_info, GPUVAddr 
             ++slot_kept_guard;
             continue;
         }
-        if (KeepLostContents(old)) { // FRITCHII_LOST_WRITEBACK: the collector writes it back
-            ++lost_stats.sweeps_kept;
-            continue;
-        }
         if (bound(old) || queued(overlap_id, uncommitted_downloads) ||
             std::ranges::any_of(committed_downloads, [&](const auto& downloads) {
                 return queued(overlap_id, downloads);
@@ -7852,6 +7917,15 @@ u32 TextureCache<P>::RetireSlotPredecessors(const ImageInfo& new_info, GPUVAddr 
         retire.push_back(overlap_id);
     }
     slot_clears += seen ? 1 : 0;
+    // FRITCHII_LOST_WRITEBACK (default 1): written back first, deleted when that lands; until then
+    // it stays a bad overlap of the new image (so it leaves the retire list), as one the queue
+    // has no room for.
+    retire.erase(std::remove_if(retire.begin(), retire.end(),
+                                [this](ImageId old_id) {
+                                    return QueueLostWriteback(old_id, slot_images[old_id],
+                                                              LostPathSlot) != LostWriteback::Drop;
+                                }),
+                 retire.end());
     for (const ImageId old_id : retire) {
         // As EXP43=1 and the cold sweep delete one (no download: the contents have no reader).
         Image& old = slot_images[old_id];
