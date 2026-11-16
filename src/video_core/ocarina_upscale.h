@@ -43,6 +43,23 @@ inline bool OcarinaDlssSanitize() {
     return on;
 }
 
+/// FRITCHII_FSR4_JITTER (boot, 0 = off): AMD FSR 4 gets the camera jitter and texture LOD bias
+/// FSR 3.1 uses. Off, FSR 4 takes the scene as the game draws it, without jitter or bias, as in
+/// CheezyEmu, whose FSR 4 AMD testers report as working well (RX 9070 XT). FSR 3.1 and DLSS
+/// are unchanged.
+inline bool OcarinaFsr4Jitter() {
+    static const bool on = OcarinaSwitch::Read("FRITCHII_FSR4_JITTER", 0) != 0;
+    return on;
+}
+
+/// FRITCHII_FSR4_LINEAR (boot, 0 = off): AMD FSR 4 is told the colour is linear, as before.
+/// Off, it is told the colour is perceptual (gamma encoded), which OoT's tonemapped colour is
+/// (CheezyEmu's FSR 4 setup).
+inline bool OcarinaFsr4LinearColor() {
+    static const bool on = OcarinaSwitch::Read("FRITCHII_FSR4_LINEAR", 0) != 0;
+    return on;
+}
+
 /// FRITCHII_OOT_CAMERA_GUEST (boot, 0 = off): the camera tracker reads vertex uniform slot 3 as
 /// the game bound it, not as the draw's shader sees it. The shader's view leaves out slots it does
 /// not use and stops at the last byte it reads, so draws that read less than the camera block gave

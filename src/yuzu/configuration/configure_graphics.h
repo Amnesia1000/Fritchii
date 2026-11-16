@@ -7,6 +7,7 @@
 #pragma once
 
 #include <functional>
+#include <map>
 #include <memory>
 #include <type_traits>
 #include <typeindex>
@@ -28,6 +29,7 @@ class QObject;
 class QComboBox;
 class QCheckBox;
 class QLabel;
+class QVBoxLayout;
 class AmdFsr4Panel;
 
 namespace Settings {
@@ -80,6 +82,13 @@ private:
     /// resolution while DLSS or FSR sets OoT's resolution.
     void SetupOcarinaUpscalerLabels();
     void UpdateOcarinaUpscalerLabels();
+    /// Fritchii builds, global settings: one "Upscaler" choice under the resolution (Game, No
+    /// sharpening, FSR 3.1, FSR 4, DLSS) that sets OoT's anti-aliasing and the DLSS checkbox,
+    /// whose own rows are hidden; AMD's and NVIDIA's download panels and the DLSS options sit
+    /// under it.
+    void SetupUpscalerChoice(std::map<u32, QWidget*>& hold_graphics);
+    void UpdateUpscalerChoice();
+    void ApplyUpscalerChoice(int index);
 
     void RetrieveVulkanDevices();
 
@@ -125,4 +134,8 @@ private:
     QWidget* nvidia_dlss_group{};          ///< The DLSS checkbox and NVIDIA's panel under it
     QComboBox* dlss_quality_combobox{};    ///< The nvidia_dlss_quality choice
     QLabel* resolution_note{};             ///< Fritchii: under the resolution choice
+    QVBoxLayout* resolution_group_layout{}; ///< Fritchii: the resolution choice and what's under it
+    QWidget* oot_aa_widget{};              ///< The oot_anti_aliasing row
+    QWidget* nvidia_dlss_widget{};         ///< The nvidia_dlss checkbox row
+    QComboBox* upscaler_combobox{};        ///< Fritchii: the "Upscaler" choice
 };

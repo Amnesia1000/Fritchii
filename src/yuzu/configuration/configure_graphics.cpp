@@ -334,6 +334,7 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
                 // 1x for the session then; RasterizerVulkan::ApplyOcarinaResolution).
                 QWidget* group = new QWidget(this);
                 QVBoxLayout* group_layout = new QVBoxLayout(group);
+                resolution_group_layout = group_layout;
                 group_layout->setContentsMargins(0, 0, 0, 0);
                 group_layout->setSpacing(2);
                 group_layout->addWidget(widget);
@@ -370,6 +371,7 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
 #ifdef EGLANTINE_STREAMLINE
         } else if (setting->Id() == Settings::values.nvidia_dlss.Id()) {
             nvidia_dlss_checkbox = widget->checkbox;
+            nvidia_dlss_widget = widget;
             // NVIDIA's files and a download button under the checkbox.
             QWidget* group = new QWidget(this);
             QVBoxLayout* group_layout = new QVBoxLayout(group);
@@ -393,6 +395,7 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
             group_layout->setSpacing(2);
             group_layout->addWidget(widget);
             oot_aa_combobox = widget->combobox;
+            oot_aa_widget = widget;
             amd_fsr4_panel = new AmdFsr4Panel(group);
             group_layout->addWidget(amd_fsr4_panel);
             connect(oot_aa_combobox, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
@@ -405,6 +408,8 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
             hold_graphics.emplace(setting->Id(), widget);
         }
     }
+
+    SetupUpscalerChoice(hold_graphics);
 
     for (const auto& [id, widget] : hold_graphics) {
         graphics_layout.addWidget(widget);
@@ -591,6 +596,7 @@ void ConfigureGraphics::UpdateDlssVisibility() {
                         device >= 0 && static_cast<size_t>(device) < records.size() &&
                         records[device].nvidia;
     nvidia_dlss_group->setVisible(nvidia || nvidia_dlss_checkbox->isChecked());
+    UpdateUpscalerChoice();
 }
 
 void ConfigureGraphics::UpdateAmdFsr4Visibility() {
@@ -615,6 +621,124 @@ void ConfigureGraphics::UpdateAmdFsr4Visibility() {
         view->setRowHidden(fsr4_row, !capable && !fsr4_picked);
     }
     amd_fsr4_panel->setVisible(capable && fsr4_picked);
+    UpdateUpscalerChoice();
+}
+
+namespace {
+/// The "Upscaler" row for DLSS, which is the nvidia_dlss checkbox, not an OotAntiAliasing value.
+constexpr u32 UPSCALER_DLSS = 0x100;
+} // namespace
+
+void ConfigureGraphics::SetupUpscalerChoice(std::map<u32, QWidget*>& hold_graphics) {
+    // Per-game settings keep the separate rows: each has its own "use global" button.
+    if (!FritchiiUi::Enabled() || !Settings::IsConfiguringGlobal() || oot_aa_combobox == nullptr ||
+        oot_aa_widget == nullptr || resolution_group_layout == nullptr) {
+        return;
+    }
+    QWidget* row = new QWidget(this);
+    QHBoxLayout* row_layout = new QHBoxLayout(row);
+    row_layout->setContentsMargins(0, 0, 0, 0);
+    QLabel* label = new QLabel(tr("Upscaler:"), row);
+    label->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    upscaler_combobox = new QComboBox(row);
+    upscaler_combobox->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    upscaler_combobox->setToolTip(
+        tr("Ocarina of Time only.\nGame: the game's own anti-aliasing.\nFSR 3.1: AMD's upscaler, "
+           "any GPU.\nFSR 4: AMD's newer upscaler, Radeon RX 6000 and newer.\nDLSS: NVIDIA's "
+           "upscaler, GeForce RTX.\nTakes effect when the game starts."));
+    using Aa = Settings::OotAntiAliasing;
+    upscaler_combobox->addItem(tr("Game"), static_cast<u32>(Aa::Game));
+    upscaler_combobox->addItem(tr("Game, no sharpening"), static_cast<u32>(Aa::NoSharpening));
+    upscaler_combobox->addItem(tr("FSR 3.1"), static_cast<u32>(Aa::Fsr3));
+    upscaler_combobox->addItem(tr("FSR 4"), static_cast<u32>(Aa::Fsr4));
+    if (nvidia_dlss_checkbox != nullptr) {
+        upscaler_combobox->addItem(tr("DLSS"), UPSCALER_DLSS);
+    }
+    row_layout->addWidget(label, 1);
+    row_layout->addWidget(upscaler_combobox, 1);
+    resolution_group_layout->addWidget(row);
+
+    // The old rows' widgets keep the settings (and save them); only the choice above shows.
+    oot_aa_widget->setVisible(false);
+    if (nvidia_dlss_widget != nullptr) {
+        nvidia_dlss_widget->setVisible(false);
+    }
+    // AMD's and NVIDIA's download panels and the DLSS options move under the choice.
+    for (const u32 id : {Settings::values.oot_anti_aliasing.Id(), Settings::values.nvidia_dlss.Id(),
+                         Settings::values.nvidia_dlss_quality.Id(),
+                         Settings::values.nvidia_dlss_preset.Id()}) {
+        if (const auto it = hold_graphics.find(id); it != hold_graphics.end()) {
+            resolution_group_layout->addWidget(it->second);
+            hold_graphics.erase(it);
+        }
+    }
+
+    connect(upscaler_combobox, QOverload<int>::of(&QComboBox::activated), this,
+            [this](int index) { ApplyUpscalerChoice(index); });
+    connect(oot_aa_combobox, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+            [this](int) { UpdateUpscalerChoice(); });
+    if (nvidia_dlss_checkbox != nullptr) {
+        connect(nvidia_dlss_checkbox, &QCheckBox::toggled, this,
+                [this](bool) { UpdateUpscalerChoice(); });
+    }
+    UpdateUpscalerChoice();
+}
+
+void ConfigureGraphics::ApplyUpscalerChoice(int index) {
+    if (upscaler_combobox == nullptr || index < 0) {
+        return;
+    }
+    using Aa = Settings::OotAntiAliasing;
+    const u32 choice = upscaler_combobox->itemData(index).toUInt();
+    const auto current = static_cast<Aa>(oot_aa_combobox->currentData().toUInt());
+    const bool dlss = choice == UPSCALER_DLSS;
+    // DLSS keeps Game or No sharpening under it (an FSR choice would win over DLSS).
+    const Aa aa = dlss ? (VideoCommon::OcarinaFsrChosen(current) ? Aa::Game : current)
+                       : static_cast<Aa>(choice);
+    const int aa_row = oot_aa_combobox->findData(static_cast<u32>(aa));
+    if (aa_row >= 0) {
+        oot_aa_combobox->setCurrentIndex(aa_row);
+    }
+    if (nvidia_dlss_checkbox != nullptr) {
+        nvidia_dlss_checkbox->setChecked(dlss);
+    }
+    UpdateUpscalerChoice();
+}
+
+void ConfigureGraphics::UpdateUpscalerChoice() {
+    if (upscaler_combobox == nullptr || oot_aa_combobox == nullptr) {
+        return;
+    }
+    using Aa = Settings::OotAntiAliasing;
+    const auto aa = static_cast<Aa>(oot_aa_combobox->currentData().toUInt());
+    const bool dlss_on = nvidia_dlss_checkbox != nullptr && nvidia_dlss_checkbox->isChecked();
+    // What runs: an FSR choice wins over DLSS (VideoCommon::SelectOcarinaUpscaler).
+    const u32 shown =
+        !VideoCommon::OcarinaFsrChosen(aa) && dlss_on ? UPSCALER_DLSS : static_cast<u32>(aa);
+    const int shown_row = upscaler_combobox->findData(shown);
+    if (shown_row >= 0 && upscaler_combobox->currentIndex() != shown_row) {
+        upscaler_combobox->setCurrentIndex(shown_row);
+    }
+    // FSR 4 and DLSS only where they run, like the rows they stand for; a saved choice stays.
+    const int device = vulkan_device_combobox ? vulkan_device_combobox->currentIndex() : -1;
+    const bool vulkan = GetCurrentGraphicsBackend() == Settings::RendererBackend::Vulkan &&
+                        device >= 0 && static_cast<size_t>(device) < records.size();
+#ifdef _WIN32
+    const bool fsr4_capable = vulkan && records[device].fsr4_capable;
+#else
+    constexpr bool fsr4_capable = false;
+#endif
+    const bool nvidia = vulkan && records[device].nvidia;
+    if (auto* view = qobject_cast<QListView*>(upscaler_combobox->view())) {
+        const int fsr4_row = upscaler_combobox->findData(static_cast<u32>(Aa::Fsr4));
+        if (fsr4_row >= 0) {
+            view->setRowHidden(fsr4_row, !fsr4_capable && shown_row != fsr4_row);
+        }
+        const int dlss_row = upscaler_combobox->findData(UPSCALER_DLSS);
+        if (dlss_row >= 0) {
+            view->setRowHidden(dlss_row, !nvidia && shown_row != dlss_row);
+        }
+    }
 }
 
 namespace {

@@ -43,6 +43,7 @@
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_ocarina_camera_motion.h"
+#include "video_core/renderer_vulkan/vk_fsr4_upscaler.h"
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
@@ -5304,6 +5305,11 @@ f32 TextureCacheRuntime::OcarinaFsrLodBias() {
         const auto backend = ResolveOcarinaUpscaler(device);
         if (!ocarina) {
             ocarina_fsr_lod_bias = 0.0f;
+        } else if (backend == VideoCommon::OcarinaUpscaleBackend::Fsr &&
+                   Fsr4Upscaler::RunsUnjittered(device)) {
+            // FSR 4 takes the scene without camera jitter: a sharper mip would only shimmer.
+            ocarina_fsr_lod_bias = 0.0f;
+            LOG_INFO(Render_Vulkan, "Ocarina texture LOD bias 0 (FSR 4 without camera jitter)");
         } else if (const int mode = VideoCommon::OcarinaLodRatioMode(); mode != 0) {
             // FRITCHII_OOT_LOD_RATIO: from the real sizes, docked (handheld drops the bias). The
             // scene is 1440p tall, or what the DLSS render scale made it; the output is 4K, or
