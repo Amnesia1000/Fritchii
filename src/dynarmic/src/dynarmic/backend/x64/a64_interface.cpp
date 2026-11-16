@@ -593,6 +593,19 @@ public:
         const size_t keep_free = block_of_code.HasFarCode() ? block_of_code.SmallestRegionSize() / 2
                                                             : (size_t{256} << 20);
         if (block_of_code.SpaceRemaining() < keep_free) {
+            // Fritchii (FRITCHII_HITCH_SPLIT): the warm-up stops here; the blocks it skips are
+            // compiled while the game waits, by every core that runs them.
+            if (::Common::Nx2Hitch::SplitEnabled()) {
+                ::Common::Nx2Hitch::AddCount(::Common::Nx2Hitch::Cause::WarmRefusedSpace, 0, 1);
+                if (!warm_refusal_logged) {
+                    warm_refusal_logged = true;
+                    LOG_INFO(Core_ARM,
+                             "JIT warm compiles refused from now on (FRITCHII_HITCH_SPLIT) core {}: "
+                             "code cache keeps {} MiB free, near {} MiB used, far {} MiB used",
+                             conf.processor_id, keep_free >> 20, block_of_code.NearCodeUsed() >> 20,
+                             block_of_code.FarCodeUsed() >> 20);
+                }
+            }
             return false;
         }
         static_cast<void>(GetBlock(descriptor));
@@ -845,6 +858,7 @@ private:
     u64 halt_longest_pc = 0;
     s64 halt_log_ns = 0;
     bool invalidate_entire_cache = false;
+    bool warm_refusal_logged = false; ///< Fritchii (FRITCHII_HITCH_SPLIT): logged once per core
     boost::icl::interval_set<u64> invalid_cache_ranges;
     std::mutex invalidation_mutex;
 };

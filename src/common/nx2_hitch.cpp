@@ -44,7 +44,10 @@ long long ThresholdUs() {
     return threshold;
 }
 constexpr size_t Causes = static_cast<size_t>(Cause::Count);
-constexpr size_t MaxThreads = 48;
+constexpr size_t MaxThreads = 56;
+/// Threads registered in name order; the last MaxThreads - FirstThreads places are kept for the
+/// GPU threads with FRITCHII_HITCH_SPLIT=1 (they start after the first 48 and were never shown).
+constexpr size_t FirstThreads = 48;
 
 struct ThreadEntry {
     char name[32]{};
@@ -166,6 +169,14 @@ u8 g_cores_seen{};
 std::array<std::vector<u64>, 8> g_warm_queues;
 } // Anonymous namespace
 
+bool SplitEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("FRITCHII_HITCH_SPLIT");
+        return value != nullptr && std::atoi(value) > 0;
+    }();
+    return enabled;
+}
+
 bool JitWarmEnabled() {
     static const bool enabled = [] {
         const char* const value = std::getenv("EDEN_NX2_JIT_WARM");
@@ -183,6 +194,8 @@ Cause CompileCause(u64 key, u32 core) {
     g_cores_seen |= bit;
     u8& mask = g_compiled_on[key];
     const bool repeat = (mask & ~bit) != 0;
+    // FRITCHII_HITCH_SPLIT: this core compiled the block before, so it was dropped since.
+    const bool own = (mask & bit) != 0;
     mask |= bit;
     if (t_warming) {
         return Cause::WarmCompile;
@@ -196,6 +209,9 @@ Cause CompileCause(u64 key, u32 core) {
                 g_warm_queues[other].push_back(key);
             }
         }
+    }
+    if (own && SplitEnabled()) {
+        return Cause::RecompileDropped;
     }
     return repeat ? Cause::RecompileRepeat : Cause::Recompile;
 }
@@ -719,7 +735,9 @@ void RegisterThread(const char* name) {
 #ifdef _WIN32
     std::scoped_lock lock{g_thread_mutex};
     const size_t index = g_thread_count.load(std::memory_order_relaxed);
-    if (index >= MaxThreads) {
+    const bool gpu_thread = t_role == Role::GpuFront || t_role == Role::GpuBack ||
+                            t_role == Role::GpuMem || view == "GPUBackE2";
+    if (index >= (gpu_thread && SplitEnabled() ? MaxThreads : FirstThreads)) {
         return;
     }
     HANDLE handle{};

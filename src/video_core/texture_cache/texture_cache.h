@@ -46,6 +46,7 @@
 #include "video_core/nx2.h"
 #include "video_core/churn_counters.h"
 #include "video_core/nx2_profile.h"
+#include "common/nx2_hitch.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/nx2_report_census.h"
 #include "video_core/one_follower_hooks.h"
@@ -3802,6 +3803,9 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         if (upload_trace) [[unlikely]] {
             staging_end = std::chrono::steady_clock::now();
         }
+        // FRITCHII_HITCH_SPLIT: the CPU side of texture uploads in the hitch line.
+        const Common::Nx2Hitch::SplitScope hitch_timed{Common::Nx2Hitch::Cause::TextureUpload,
+                                                       MapSizeBytes(image)};
         UploadImageContents(image, staging);
         runtime.InsertUploadMemoryBarrier();
     }
