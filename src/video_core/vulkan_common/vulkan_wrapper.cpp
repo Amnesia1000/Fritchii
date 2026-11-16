@@ -104,6 +104,7 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkCmdBlitImage);
     X(vkCmdClearAttachments);
     X(vkCmdClearColorImage);
+    X(vkCmdClearDepthStencilImage);
     X(vkCmdCopyBuffer);
     X(vkCmdCopyBufferToImage);
     X(vkCmdCopyImage);

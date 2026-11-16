@@ -701,6 +701,24 @@ request). Log: "Staging ring in 10 s (FRITCHII_STAGING_RING=N): U uploads (X MiB
 ring; R refused (B while an upload over half the ring was in flight), C staging buffers made after a
 refusal".
 
+### FRITCHII_ZERO_UPLOAD
+
+TEST, off by default (helper CJ, 2026-11-16, Castle Town load burst). Live. 1 = a whole texture
+upload whose guest bytes are all zero becomes a GPU clear to zero; 2 = count only (the check runs,
+the upload runs as before). Exact: zero bytes untile to zero texels, and the clear writes zero in
+every level and layer, as the upload's copies do. Only plain uncompressed single-sample images of
+256 KiB or more whose host image is the guest image (not converted, GPU-decoded, sparse, scaled,
+padded, or with trimmed levels); a slice of a deep 3D texture (guest footprint over 2x its texels)
+is not checked. The check reads the bytes the upload would read and stops at the first non-zero
+4 KiB. Why: every Castle Town load made a 12288x12288 D16 target whose 288 MiB of never-written
+guest memory was uploaded (102 ms on the front, 9 new 32 MiB staging buffers, 132k page faults),
+plus fresh render targets uploaded from zero memory. The clear saves the staging buffers, their
+first-touch faults, the untiling and the GPU copy; the read of the guest pages stays (their own
+faults included). Log: "Zero uploads in 10 s (FRITCHII_ZERO_UPLOAD=N): Z uploads all zero (X MiB
+guest, checked in T ms), cleared on the GPU; D had data (Y MiB looked at before the first non-zero
+byte, T2 ms); S not checked (3D slices)", a "Zero upload:" line for each of the first 40 zero
+images of 4 MiB or more, and "zero checks of texture uploads" in the hitch line.
+
 ### FRITCHII_HOSTTIMING_SPIN_BUDGET
 
 TEST, off by default (helper AS, 2026-11-15; idea from zortos293/Lichii #1733). Live, a percent of

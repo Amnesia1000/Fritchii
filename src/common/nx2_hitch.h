@@ -51,6 +51,7 @@ enum class Cause : u8 {
     WarmRefusedSpace, ///< warm compiles refused: the code cache kept its free half (count only)
     StagingCreate,    ///< new staging buffers (StagingBufferPool::CreateStagingBuffer), bytes
     TextureUpload,    ///< TextureCache::UploadImageContents (read, untile, staging write), bytes
+    ZeroUpload,       ///< FRITCHII_ZERO_UPLOAD: the zero check of an upload, bytes looked at
     Count,
 };
 
@@ -65,7 +66,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Cause::Count)> Caus
     "recompiling code this core had compiled before (dropped since)",
     "game code dropped by invalidations (blocks)", "game code dropped by fastmem faults (blocks)",
     "warm compiles refused (code cache full)", "staging buffers made",
-    "texture uploads (CPU side)"};
+    "texture uploads (CPU side)", "zero checks of texture uploads"};
 
 struct Counters {
     std::array<std::atomic<u64>, static_cast<size_t>(Cause::Count)> ns{};
