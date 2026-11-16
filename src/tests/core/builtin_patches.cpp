@@ -640,6 +640,89 @@ TEST_CASE("Pickup counter built-in hooks the indicator's cut in both modes", "[p
     }
 }
 
+TEST_CASE("High refresh fixes built-in hooks its sites in both modes", "[patch_manager]") {
+    constexpr std::string_view Fixes = "High refresh fixes (built-in)";
+    constexpr size_t Code = sizeof(Loader::NSOHeader);
+    struct Hook {
+        size_t offset;
+        u32 original;
+        u32 branch;
+    };
+    // The game's word at each hook and the branch to its stub.
+    constexpr std::array Hooks{
+        Hook{0x415300, 0xD503237F, 0x14E0C428}, // sound job entry: pacibsp -> b 0x3c463a0
+        Hook{0x415334, 0xBD401100, 0x14E0C43F}, // its step load -> b 0x3c46430
+    };
+    // Each stub's first and last word.
+    struct Stub {
+        size_t offset;
+        size_t size;
+        u32 first;
+        u32 last;
+    };
+    constexpr std::array Stubs{
+        Stub{0x3C463A0, 0x88, 0xA9BF47F0, 0xD65F03C0}, // sound gate: stp x16, x17 ... ret
+        Stub{0x3C46430, 0x38, 0xBD401100, 0x171F3BB5}, // sound feed: ldr s0 ... b 0x415338
+    };
+    constexpr u32 GateCallWord = 0xB94CC610; // ldr w16, [x16, #0xcc4] (the frame step's call)
+    const auto word_at = [](const std::vector<u8>& nso, size_t offset) {
+        u32 word;
+        std::memcpy(&word, nso.data() + offset, sizeof(word));
+        return word;
+    };
+    struct RestoreSetting {
+        ~RestoreSetting() {
+            Settings::values.oot_high_refresh.SetValue(false);
+        }
+    } restore;
+
+    PatchManagerTestContext context;
+    auto nso = MakeOcarinaMain();
+    for (const Hook& hook : Hooks) {
+        std::memcpy(nso.data() + Code + hook.offset, &hook.original, sizeof(u32));
+    }
+    const auto applied = [&](const std::vector<u8>& patched) {
+        return std::ranges::all_of(Hooks,
+                                   [&](const Hook& hook) {
+                                       return word_at(patched, Code + hook.offset) == hook.branch;
+                                   }) &&
+               std::ranges::all_of(Stubs, [&](const Stub& stub) {
+                   return word_at(patched, Code + stub.offset) == stub.first &&
+                          word_at(patched, Code + stub.offset + stub.size - 4) == stub.last;
+               });
+    };
+
+    SECTION("Dark's mode and the high refresh mode both get it, gated on the call word") {
+        Settings::values.oot_high_refresh.SetValue(false);
+        const auto dark = context.Manager().PatchNSO(nso, "main");
+        REQUIRE(applied(dark));
+        REQUIRE(word_at(dark, Code + Stubs[0].offset + 8) == GateCallWord);
+        Settings::values.oot_high_refresh.SetValue(true);
+        REQUIRE(applied(context.Manager().PatchNSO(nso, "main")));
+    }
+
+    SECTION("Another word at a hook, a stub word in use, or off in Add-Ons: skipped whole") {
+        SECTION("first hook") {
+            std::memcpy(nso.data() + Code + Hooks.front().offset, &NopInstruction, sizeof(u32));
+        }
+        SECTION("last hook") {
+            std::memcpy(nso.data() + Code + Hooks.back().offset, &NopInstruction, sizeof(u32));
+        }
+        SECTION("stub") {
+            nso[Code + Stubs.back().offset + Stubs.back().size - 4] = 1;
+        }
+        SECTION("Add-Ons") {
+            Settings::values.disabled_addons[OcarinaTitleId] = {std::string{Fixes}};
+        }
+        const auto patched = context.Manager().PatchNSO(nso, "main");
+        Settings::values.disabled_addons.erase(OcarinaTitleId);
+        for (const Hook& hook : Hooks) {
+            REQUIRE(word_at(patched, Code + hook.offset) == word_at(nso, Code + hook.offset));
+        }
+        REQUIRE(word_at(patched, Code + Stubs.front().offset) == 0);
+    }
+}
+
 TEST_CASE("Dark's standalone Dynamic FPS mod is skipped and hidden for the built-in",
           "[patch_manager]") {
     constexpr std::string_view DynamicFps = "Dynamic FPS by Dark (built-in)";

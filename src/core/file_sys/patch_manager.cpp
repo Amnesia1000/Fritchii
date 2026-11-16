@@ -363,6 +363,122 @@ constexpr auto PICKUP_COUNTER_RECORDS = [] {
 }();
 constexpr std::string_view PICKUP_COUNTER_NAME = "Pickup counter at any frame rate (built-in)";
 
+// High refresh fixes (ported findings, 2026-11-16): game code that counts frames, or cuts the step
+// to whole units, goes wrong once the high refresh mode's step drops below 1.0 above 60 fps. Each
+// hook is a branch to a stub in the free padding on the page of Dark's routine (from
+// main+0x3C463A0: after the Hyrule Cheat Menu's main+0x3C46280..0x3C46398, before the pickup stub
+// at main+0x3C46B00). Like the pickup counter, every stub first reads the frame step's call word
+// (main+0x6E6CC4) and changes nothing unless it is HIGH_REFRESH_CALL: otherwise it runs the game's
+// own instruction and branches back, so Dark's mode is unchanged and Ctrl+U's live switch is
+// followed. The gate (32 bytes, x16/x17 saved on the stack):
+//   stp x16, x17, [sp, #-16]! ; adrp x16, 0x6e6000 ; ldr w16, [x16, #0xcc4] ;
+//   mov w17, #0x804f ; movk w17, #0x94d5, lsl #16 ; cmp w16, w17 ; ldp x16, x17, [sp], #16 ;
+//   b.ne <the game's own instruction>
+// The stubs keep every register but NZCV, which is dead at each hook (the next flag use sets it
+// first). The game's timer is T = [main+0x4E94B20] (the step at T+0x10, step / 60 at T+0x18).
+// State: BSS after the pickup slots, main+0x4E9FF00 (the BSS of this main runs to main+0x4EA0000;
+// the game's own variables end below main+0x4E9B000). Assembled with llvm-mc and ld.lld.
+struct OotFixHook {
+    size_t offset;
+    std::array<u8, 4> bytes;
+    u32 original;
+};
+struct OotFixStub {
+    size_t offset;
+    std::span<const u8> bytes;
+};
+constexpr size_t HR_FIX_CAVE_START = 0x3C463A0;
+constexpr size_t HR_FIX_STATE_OFFSET = 0x4E9FF00;
+
+// Sound at 60 Hz: the sound engine counts its fades, delays and ramps in whole 60 fps steps per
+// update. Below a whole step some sounds are never released when an area unloads; they fill the
+// voice budget, and after a few loading zones most new sounds and the music stop until a restart.
+// The sound manager job (main+0x415300, phase in w2: 0 reads the step and updates the engine, 1
+// follows) enters through SOUND_GATE: in phase 0 a step of 1 or more runs it as before, a smaller
+// one is added to an accumulator (state +0) and the job runs only once a whole step has built up
+// (the rest kept), else returns; phase 1 follows that frame's choice (flag at state +4). The job's
+// step load (main+0x415334) goes through SOUND_FEED, max(step, 1.0), so the engine always gets
+// whole steps and sound keeps real time.
+//   gate ; x16 = state ; cbnz w2, other ; s16 = step ; s17 = 1.0 ; step >= 1: every
+//   s18 = [x16] + step ; s18 < 1: wait ; [x16] = s18 - 1 ; every: [x16 + 4] = 1 ; b run
+//   wait: [x16] = s18 ; [x16 + 4] = 0 ; ret ; other: [x16 + 4] == 0: ret
+//   run: pacibsp ; b 0x415304
+// SOUND_FEED: ldr s0, [x8, #0x10] ; gate ; q16 saved ; fmaxnm s0, s0, 1.0 ; b 0x415338
+constexpr std::array<u8, 136> SOUND_GATE{
+    0xF0, 0x47, 0xBF, 0xA9, 0x10, 0x55, 0xFE, 0x90, 0x10, 0xC6, 0x4C, 0xB9,
+    0xF1, 0x09, 0x90, 0x52, 0xB1, 0x9A, 0xB2, 0x72, 0x1F, 0x02, 0x11, 0x6B,
+    0xF0, 0x47, 0xC1, 0xA8, 0x01, 0x03, 0x00, 0x54, 0xD0, 0x92, 0x00, 0xB0,
+    0x10, 0x02, 0x3C, 0x91, 0x62, 0x02, 0x00, 0x35, 0x69, 0x92, 0x00, 0xD0,
+    0x29, 0x91, 0x45, 0xF9, 0x30, 0x11, 0x40, 0xBD, 0x11, 0x10, 0x2E, 0x1E,
+    0x00, 0x22, 0x31, 0x1E, 0xEA, 0x00, 0x00, 0x54, 0x12, 0x02, 0x40, 0xBD,
+    0x52, 0x2A, 0x30, 0x1E, 0x40, 0x22, 0x31, 0x1E, 0xCB, 0x00, 0x00, 0x54,
+    0x52, 0x3A, 0x31, 0x1E, 0x12, 0x02, 0x00, 0xBD, 0x29, 0x00, 0x80, 0x52,
+    0x09, 0x06, 0x00, 0xB9, 0x06, 0x00, 0x00, 0x14, 0x12, 0x02, 0x00, 0xBD,
+    0x1F, 0x06, 0x00, 0xB9, 0xC0, 0x03, 0x5F, 0xD6, 0x09, 0x06, 0x40, 0xB9,
+    0x69, 0x00, 0x00, 0x34, 0x7F, 0x23, 0x03, 0xD5, 0xB9, 0x3B, 0x1F, 0x17, // b 0x415304
+    0xC0, 0x03, 0x5F, 0xD6,
+};
+constexpr std::array<u8, 56> SOUND_FEED{
+    0x00, 0x11, 0x40, 0xBD, 0xF0, 0x47, 0xBF, 0xA9, 0x10, 0x55, 0xFE, 0x90,
+    0x10, 0xC6, 0x4C, 0xB9, 0xF1, 0x09, 0x90, 0x52, 0xB1, 0x9A, 0xB2, 0x72,
+    0x1F, 0x02, 0x11, 0x6B, 0xF0, 0x47, 0xC1, 0xA8, 0xA1, 0x00, 0x00, 0x54,
+    0xF0, 0x0F, 0x9F, 0x3C, 0x10, 0x10, 0x2E, 0x1E, 0x00, 0x68, 0x30, 0x1E,
+    0xF0, 0x07, 0xC1, 0x3C, 0xB5, 0x3B, 0x1F, 0x17, // b 0x415338
+};
+
+// The hooks (each checked to hold the game's word), then the stubs in address order.
+constexpr std::array HR_FIX_HOOKS{
+    OotFixHook{0x415300, {0x28, 0xC4, 0xE0, 0x14}, 0xD503237F}, // pacibsp -> b 0x3c463a0
+    OotFixHook{0x415334, {0x3F, 0xC4, 0xE0, 0x14}, 0xBD401100}, // ldr s0, [x8, #0x10] -> b 0x3c46430
+};
+constexpr std::array HR_FIX_STUBS{
+    OotFixStub{0x3C463A0, SOUND_GATE},
+    OotFixStub{0x3C46430, SOUND_FEED},
+};
+constexpr size_t HR_FIX_STATE_SIZE = 8;
+// The stubs in order, in free padding between the Hyrule Cheat Menu and the pickup stub; their
+// state after the pickup slots, inside the BSS.
+static_assert([] {
+    size_t end = HR_FIX_CAVE_START;
+    for (const OotFixStub& stub : HR_FIX_STUBS) {
+        if (stub.offset < end || stub.offset % 4 != 0 || stub.bytes.size() % 4 != 0) {
+            return false;
+        }
+        end = stub.offset + stub.bytes.size();
+    }
+    return HR_FIX_CAVE_START >= 0x3C46398 && end <= PICKUP_STUB_OFFSET;
+}());
+static_assert(HR_FIX_STATE_OFFSET >= PICKUP_STATE_OFFSET + PICKUP_STATE_SIZE &&
+              HR_FIX_STATE_OFFSET + HR_FIX_STATE_SIZE <= 0x4EA0000);
+// The hooks over the game's words, then every stub word, each checked to be zero.
+constexpr size_t HR_FIX_RECORD_COUNT = HR_FIX_HOOKS.size() + [] {
+    size_t words = 0;
+    for (const OotFixStub& stub : HR_FIX_STUBS) {
+        words += stub.bytes.size() / 4;
+    }
+    return words;
+}();
+constexpr auto HR_FIX_RECORDS = [] {
+    std::array<BuiltinPatchRecord, HR_FIX_RECORD_COUNT> records{};
+    size_t i = 0;
+    for (const OotFixHook& hook : HR_FIX_HOOKS) {
+        records[i++] = BuiltinPatchRecord{.module_offset = hook.offset,
+                                          .bytes = hook.bytes,
+                                          .checked = true,
+                                          .original = hook.original};
+    }
+    for (const OotFixStub& stub : HR_FIX_STUBS) {
+        for (size_t offset = 0; offset < stub.bytes.size(); offset += 4) {
+            records[i++] = BuiltinPatchRecord{.module_offset = stub.offset + offset,
+                                              .bytes = stub.bytes.subspan(offset, 4),
+                                              .checked = true,
+                                              .original = 0};
+        }
+    }
+    return records;
+}();
+constexpr std::string_view HR_FIX_NAME = "High refresh fixes (built-in)";
+
 bool HighRefreshSettingOn() {
     // Tests boot either way without touching the player's config: EDEN_NX2_OOT_HIGH_REFRESH=0/1.
     if (const char* const value = std::getenv("EDEN_NX2_OOT_HIGH_REFRESH"); value && *value) {
@@ -484,6 +600,17 @@ constexpr std::array BUILTIN_PATCHES{
         .records = PICKUP_COUNTER_RECORDS,
         .state_offset = PICKUP_STATE_OFFSET,
         .state_size = PICKUP_STATE_SIZE,
+    },
+    // In both modes too, for the same reason: each stub changes nothing unless the frame step
+    // calls the high refresh routine.
+    BuiltinPatch{
+        .name = HR_FIX_NAME,
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = HR_FIX_RECORDS,
+        .state_offset = HR_FIX_STATE_OFFSET,
+        .state_size = HR_FIX_STATE_SIZE,
     },
     BuiltinPatch{
         .name = "Occlusion Off (built-in, EDEN_NX2_OCCLUSION_OFF=1)",
