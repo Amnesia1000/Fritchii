@@ -1328,7 +1328,8 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                 if (VideoCommon::GpuSplit::RecordingDispatch()) {
                     // A payload release writes up to a report's 16 bytes, at a later fence.
                     if (const auto device = memory_manager.GpuToCpuAddress(address)) {
-                        split.RecordDispatchWrite(*device, 16);
+                        split.RecordDispatchWrite(
+                            *device, 16, VideoCommon::GpuSplit::DispatchWriteKind::Release);
                     }
                 }
                 // FRITCHII_ONEF_DRY_RELEASE (fable_b 19.5 step 3): E passes a callback release.

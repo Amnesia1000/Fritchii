@@ -4491,7 +4491,8 @@ bool RasterizerVulkan::OneFollowerPostDispatch() {
             // range of the descriptor it binds (R compares the descriptor at its play).
             for (u32 k = 0; k < view.image_count; ++k) {
                 if (view.image_size[k] != 0) {
-                    split.RecordDispatchWrite(view.image_device[k], view.image_size[k]);
+                    split.RecordDispatchWrite(view.image_device[k], view.image_size[k],
+                                               VideoCommon::GpuSplit::DispatchWriteKind::Image);
                 }
             }
         } else if (writes_images) {
@@ -4499,7 +4500,8 @@ bool RasterizerVulkan::OneFollowerPostDispatch() {
         }
         if (indirect_address) {
             if (const auto device_addr = gpu_memory->GpuToCpuAddress(*indirect_address)) {
-                split.RecordDispatchWrite(*device_addr, 12);
+                split.RecordDispatchWrite(*device_addr, 12,
+                                          VideoCommon::GpuSplit::DispatchWriteKind::Indirect);
             }
         }
         split.ConfirmDispatch();
@@ -5442,14 +5444,16 @@ void RasterizerVulkan::DispatchCompute() {
                 continue;
             }
             if (image->cpu_addr_end > image->cpu_addr) {
-                split.RecordDispatchWrite(image->cpu_addr, image->cpu_addr_end - image->cpu_addr);
+                split.RecordDispatchWrite(image->cpu_addr, image->cpu_addr_end - image->cpu_addr,
+                                          VideoCommon::GpuSplit::DispatchWriteKind::Image);
             } else {
                 split.RecordDispatchUnbounded(VideoCommon::GpuSplit::DispatchUnbounded::Image);
             }
         }
         if (const auto indirect = kepler_compute->GetIndirectComputeAddress()) {
             if (const auto device_addr = gpu_memory->GpuToCpuAddress(*indirect)) {
-                split.RecordDispatchWrite(*device_addr, 12);
+                split.RecordDispatchWrite(*device_addr, 12,
+                                          VideoCommon::GpuSplit::DispatchWriteKind::Indirect);
             }
         }
         split.ConfirmDispatch();

@@ -206,6 +206,10 @@ inline std::atomic<int> g_memstage_setup_keep{-1};
 inline std::atomic<int> g_front_ran_reads{-1};
 /// FRITCHII_DISPATCH_WALK_SUMMARY: docs/fritchii/switches.md.
 inline std::atomic<int> g_dispatch_walk_summary{-1};
+/// FRITCHII_DISPATCH_WAIT_CENSUS: docs/fritchii/switches.md.
+inline std::atomic<int> g_dispatch_wait_census{-1};
+/// FRITCHII_LAGGED_DEFER: docs/fritchii/switches.md.
+inline std::atomic<int> g_lagged_defer{-1};
 /// FRITCHII_ACQUIRE_TABLE_FIRST: docs/fritchii/switches.md.
 inline std::atomic<int> g_acquire_table_first{-1};
 /// FRITCHII_E2C_CENSUS: docs/fritchii/switches.md.
