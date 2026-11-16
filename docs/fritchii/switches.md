@@ -7,6 +7,31 @@ rebuilds nothing.
 
 ## Named switches
 
+### Profiling mode (Help > Profiling Mode)
+
+For testers who send us a log (helper BP, 2026-11-16). Help > Profiling Mode (both the Fritchii
+and the classic UI), then Restart Now: Fritchii starts again with the switches below; play, then
+Help > Export Log and send the zip. Saved in qt-config.ini as [UI] profiling_mode (main.cpp reads
+it there before the settings load). The switches are read once per process, so turning it on or
+off asks to restart Fritchii (a running game closes: save first); the restart gets the launch
+environment, not the switches this process added. While it is on:
+- the switches: EDEN_NX2_GPU_PROFILE=1, FRITCHII_MEM_CENSUS=3, FRITCHII_HITCH_SPLIT=1,
+  EDEN_NX2_HITCH_MS=40, FRITCHII_VRAM_REPORT=1, EDEN_NX2_IMAGE_ALLOC_TIMING=1, EDEN_NX2_TC_LOG=1
+  (util/profiling_mode.cpp). A value from the environment or an nx2_switches.txt wins; profiling
+  mode only beats a built-in value. MEM_CENSUS is 3, not 1: 1 also queries the working set, which
+  holds its lock 150-270 ms every 30 s (a stutter). HITCH_MS is 40, not 33: with OoT at 30 FPS
+  every frame is 33.3 ms and would log a Hitch line.
+- the log: "Test switches: ...; profiling mode: ..." and "Profiling mode ON: A=1, ..." at each game
+  start; system-info.txt in the export says "Profiling mode: on (...)" or "off".
+- a red "PROFILING MODE ON  Turn it off in Help" banner at the top centre of the game, in a window
+  and in fullscreen (a frameless tool window above the Vulkan surface, like the in-game controls;
+  it steps below them while they show, hides while Fritchii is in the background or a dialog is
+  open, and ignores the mouse); "[PROFILING]" in front of the window title; a red "PROFILING ON"
+  label in the status bar.
+Cost: small. The GPU profile times its zones with the CPU's time stamp counter (~150,000 zones a
+second on the GPU thread); the rest are counters, a driver memory query per 30 frames and a few
+log lines every 10 s. Expect about 1-3% fps (not measured yet); read fps records with it off.
+
 ### FRITCHII_HANG_REPORT_S
 
 ON by default at 5 in every build (helper BB, 2026-11-16, after helper AW's boot hang: 0 frames

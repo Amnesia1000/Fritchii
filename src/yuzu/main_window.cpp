@@ -66,6 +66,7 @@
 #include "util/clickable_label.h"
 #include "util/controller_navigation.h"
 #include "util/export_log.h"
+#include "util/profiling_mode.h"
 #include "fritchii/fritchii_ui.h"
 #include "fritchii/perf_overlay.h"
 #include "util/overlay_dialog.h"
@@ -515,6 +516,7 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     ConnectMenuEvents();
     ConnectWidgetEvents();
     SetUpFritchiiUi();
+    SetUpProfilingMode();
 
     QtCommon::SetupHID();
     controller_dialog->refreshConfiguration();
@@ -2455,6 +2457,11 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     } else {
         LOG_INFO(Frontend, "Test switches: none set");
     }
+    if (ProfilingMode::Active()) {
+        const std::string& applied = ProfilingMode::Applied();
+        LOG_INFO(Frontend, "Profiling mode ON: {}",
+                 applied.empty() ? std::string{"no switches added (all set elsewhere)"} : applied);
+    }
 #ifdef _WIN32
     LOG_INFO(Frontend, "Power: {}", WindowsPowerText());
 #endif
@@ -4393,6 +4400,57 @@ void MainWindow::OnExportLog() {
     ExportLog::Export(this, vk_device_records);
 }
 
+void MainWindow::SetUpProfilingMode() {
+    // Help > Profiling Mode (both looks), first in the menu: turn it on, play, Export Log.
+    auto* action = new QAction(tr("Profiling Mode"), this);
+    action->setCheckable(true);
+    action->setChecked(UISettings::values.profiling_mode.GetValue());
+    QAction* first = ui->menu_Help->actions().value(0);
+    ui->menu_Help->insertAction(first, action);
+    if (!FritchiiUi::Enabled()) {
+        ui->menu_Help->insertSeparator(first);
+    }
+    connect(action, &QAction::toggled, this, [this](bool on) {
+        UISettings::values.profiling_mode = on;
+        config->SaveAllValues();
+        // Its switches are read once per process: only a new start of Fritchii changes them.
+        if (on == ProfilingMode::Active()) {
+            return;
+        }
+        QString text = on ? tr("Restart Fritchii to turn profiling mode on.")
+                          : tr("Restart Fritchii to turn profiling mode off.");
+        if (emulation_running || boot_in_progress) {
+            text += QStringLiteral("\n\n") + tr("Save your game first.");
+        }
+        if (on) {
+            text += QStringLiteral("\n\n") + tr("Then play as usual and send us Help > Export Log.");
+        }
+        QMessageBox box(QMessageBox::Question, tr("Profiling Mode"), text, QMessageBox::NoButton,
+                        this);
+        QPushButton* restart = box.addButton(tr("Restart Now"), QMessageBox::AcceptRole);
+        box.addButton(tr("Later"), QMessageBox::RejectRole);
+        box.setDefaultButton(restart);
+        box.exec();
+        if (box.clickedButton() == restart) {
+            ProfilingMode::RestartFritchii(*this, [this] { return close_pending || !isVisible(); });
+        }
+    });
+
+    if (!ProfilingMode::Active()) {
+        return;
+    }
+    // On in this start: a red label in the status bar and the banner on the game.
+    auto* label = new QLabel(tr("PROFILING ON"), this);
+    label->setStyleSheet(QStringLiteral("QLabel { background: #d31f2f; color: white; "
+                                        "font-weight: bold; padding: 2px 10px; "
+                                        "border-radius: 4px; }"));
+    statusBar()->insertPermanentWidget(0, label);
+    auto* banner =
+        new ProfilingMode::Banner(this, [this] { return static_cast<QWidget*>(render_window); });
+    connect(this, &MainWindow::EmulationStarting, banner, [banner] { banner->Start(); });
+    connect(this, &MainWindow::EmulationStopping, banner, [banner] { banner->Stop(); });
+}
+
 void MainWindow::ShowErrorWithExportLog(const QString& title, const QString& text) {
     if (!FritchiiUi::Enabled()) {
         QMessageBox::critical(this, title, text);
@@ -5306,7 +5364,9 @@ void MainWindow::UpdateWindowTitle(std::string_view title_name, std::string_view
 
     const auto override_title =
         fmt::format(fmt::runtime(std::string(Common::g_title_bar_format_idle)), build_id);
-    const auto window_title = override_title.empty() ? yuzu_title : override_title;
+    // Profiling mode: the title says so too (taskbar, window list).
+    const auto window_title = fmt::format("{}{}", ProfilingMode::Active() ? "[PROFILING] " : "",
+                                          override_title.empty() ? yuzu_title : override_title);
 
     if (title_name.empty()) {
         setWindowTitle(QString::fromStdString(window_title));

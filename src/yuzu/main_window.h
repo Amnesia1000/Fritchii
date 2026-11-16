@@ -417,6 +417,9 @@ private slots:
     void ShowErrorWithExportLog(const QString& title, const QString& text);
     /// The Fritchii look (fritchii/main_window_fritchii.cpp); nothing in other builds.
     void SetUpFritchiiUi();
+    /// Help > Profiling Mode and, while it is on, its banner and status bar label
+    /// (util/profiling_mode).
+    void SetUpProfilingMode();
     void OnVerifyInstalledContents();
     void OnInstallFirmware();
     void OnInstallFirmwareFromZIP();

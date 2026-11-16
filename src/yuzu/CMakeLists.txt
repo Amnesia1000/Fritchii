@@ -226,6 +226,8 @@ add_executable(yuzu
     fritchii/whats_new.h
     util/export_log.cpp
     util/export_log.h
+    util/profiling_mode.cpp
+    util/profiling_mode.h
     util/limitable_input_dialog.cpp
     util/limitable_input_dialog.h
     util/overlay_dialog.cpp
