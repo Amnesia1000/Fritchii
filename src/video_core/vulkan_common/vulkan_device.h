@@ -671,7 +671,15 @@ FN_MAX_LIMIT_LIST
 
     /// Returns true if formatless image load is supported.
     bool IsFormatlessImageLoadSupported() const {
-        return features.features.shaderStorageImageReadWithoutFormat;
+        // FRITCHII_FORMATLESS_13 (boot, default 0): Vulkan 1.3 allows formatless reads per format
+        // even when the global feature is false (Intel on Windows, where every typeless image
+        // read became a constant 0 and scenes rendered black). Off, as before.
+        static const bool formatless_13 = [] {
+            const char* value = std::getenv("FRITCHII_FORMATLESS_13");
+            return value != nullptr && std::atoi(value) != 0;
+        }();
+        return features.features.shaderStorageImageReadWithoutFormat ||
+               (formatless_13 && instance_version >= VK_API_VERSION_1_3);
     }
 
     /// Returns true if storage images of the extended formats (e.g. R16F, RG16F, R8) are supported.

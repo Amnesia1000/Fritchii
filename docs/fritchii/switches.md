@@ -7,6 +7,27 @@ rebuilds nothing.
 
 ## Named switches
 
+### FRITCHII_FORMATLESS_13
+
+TEST, off by default (helper BH, 2026-11-16, port of zortos293/Lichii #1874 by KevinLny, open
+there). Boot. 0 = as before. 1 = typeless storage image reads count as supported on a Vulkan 1.3
+instance even when the device's shaderStorageImageReadWithoutFormat feature is false. Only devices
+without that feature change (Intel on Windows; NVIDIA and AMD already have it, so nothing changes
+there). Why: on Intel Iris Xe (Windows driver 101.7092) every typeless image read became a constant
+0 and the scene rendered black (Pokopia; log line "Typeless image read not supported by host").
+The driver reports formatless reads per format through format features 2. Check: an Intel Windows
+tester with the switch at 1, the warning gone and the scene drawn.
+
+### FRITCHII_DEVICE_FAULT
+
+On by default (helper BH, 2026-11-16, port of the device fault part of zortos293/Lichii #512).
+Boot. When the driver offers VK_EXT_device_fault, Fritchii enables it (vendor binary dumps off)
+and a device loss logs what the driver knows: "Device fault: <description> (N addresses, M vendor
+records)", each fault address with its kind (invalid read/write/execute, instruction pointer) and
+range, and the vendor fault codes. A driver without it logs "Device fault info: not supported by
+the driver". Only the loss report reads it; nothing is drawn differently. FRITCHII_DEVICE_FAULT=0
+leaves the extension off, as before. Why: two AMD testers hit device losses with no clue in the log.
+
 ### FRITCHII_SCALED_EXTENT_CAP
 
 TEST, off by default (helper BH, 2026-11-16, port of zortos293/Lichii #1890 by zortos293, still
