@@ -262,6 +262,8 @@ std::mutex g_tag_mutex;
 std::vector<TagEntry> g_tags;             ///< Sorted by base
 std::function<std::string()> g_sampler;   ///< Under g_tag_mutex
 std::vector<std::pair<const char*, std::function<std::vector<u64>()>>> g_size_sources; ///< Same
+std::mutex g_reporter_mutex; ///< Held while the reporters run, so RemoveReporter waits for them
+std::vector<std::pair<const void*, std::function<std::string()>>> g_reporters; ///< Under it
 std::mutex g_thread_mutex;
 std::jthread g_thread;
 
@@ -976,6 +978,14 @@ void Census(int mode, const char* reason) {
     if (sampler) {
         extra += "; " + sampler();
     }
+    {
+        std::scoped_lock lock{g_reporter_mutex};
+        for (const auto& [key, reporter] : g_reporters) {
+            if (std::string text = reporter(); !text.empty()) {
+                extra += "; " + text;
+            }
+        }
+    }
     if (!result.heap_text.empty()) {
         extra += "; heaps (committed/allocated MiB, or the CRT heap walk): " + result.heap_text;
     }
@@ -1080,6 +1090,48 @@ void SetSizeSource(const char* label, std::function<std::vector<u64>()> source) 
     if (source) {
         g_size_sources.emplace_back(label, std::move(source));
     }
+}
+
+void AddReporter(const void* key, std::function<std::string()> reporter) {
+    if (Mode() == 0 || key == nullptr || !reporter) {
+        return;
+    }
+    std::scoped_lock lock{g_reporter_mutex};
+    std::erase_if(g_reporters, [key](const auto& entry) { return entry.first == key; });
+    g_reporters.emplace_back(key, std::move(reporter));
+}
+
+void RemoveReporter(const void* key) {
+    if (Mode() == 0) {
+        return;
+    }
+    std::scoped_lock lock{g_reporter_mutex};
+    std::erase_if(g_reporters, [key](const auto& entry) { return entry.first == key; });
+}
+
+std::vector<u8> ResidentPages(const void* base, u64 bytes) {
+    const size_t count = static_cast<size_t>((bytes + 4095) / 4096);
+    std::vector<u8> resident(count, 1);
+#ifdef _WIN32
+    constexpr size_t Batch = size_t{1} << 16;
+    std::vector<PSAPI_WORKING_SET_EX_INFORMATION> info((std::min)(count, Batch));
+    const auto first = reinterpret_cast<uintptr_t>(base) & ~uintptr_t{0xfff};
+    for (size_t done = 0; done < count; done += Batch) {
+        const size_t n = (std::min)(Batch, count - done);
+        for (size_t i = 0; i < n; ++i) {
+            info[i] = {};
+            info[i].VirtualAddress = reinterpret_cast<void*>(first + (done + i) * 4096);
+        }
+        if (!K32QueryWorkingSetEx(GetCurrentProcess(), info.data(),
+                                  static_cast<DWORD>(n * sizeof(info[0])))) {
+            continue; // left as resident
+        }
+        for (size_t i = 0; i < n; ++i) {
+            resident[done + i] = info[i].VirtualAttributes.Valid ? 1 : 0;
+        }
+    }
+#endif
+    return resident;
 }
 
 void Start() {
