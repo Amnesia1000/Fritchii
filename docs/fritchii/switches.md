@@ -325,6 +325,7 @@ A device loss in a session that used the store starts it over at the next boot. 
 libraries (EDEN_NX2_GPL) are left to the driver: only whole pipelines go through the store. Log:
 "Pipeline binaries (...)" at boot, "Pipeline binaries so far/after the preparation/at exit: N hits
 (ms each), M misses (ms each, K taken from the driver's cache), ~S s of compiles saved ...".
+RAM cost (batch 14, 2026-11-16, RTX 4080, castletown 90 s): working set 10.7 -> 16.0 GB with =1 (620-931 pipelines stored, ~1.4 MiB each, 880-1293 MiB file); the driver's three 1 GiB arenas did not shrink. Not for 16 GB PCs as it is: find what holds the 5 GB first.
 Why: AMD's Windows driver keeps ~30% of the 120k prepared pipelines and compiles the rest again at first use
 (0.2-1.1 s each, the 1 s stalls); NVIDIA on Linux prunes its cache.
 
