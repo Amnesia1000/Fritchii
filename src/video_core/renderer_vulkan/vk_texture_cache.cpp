@@ -34,6 +34,7 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/small_card.h"
 #include "video_core/render_trace.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 
@@ -3191,6 +3192,31 @@ void TextureCacheRuntime::SampleVramReport() {
              staging_buffer_pool.CachedBytes(MemoryUsage::DeviceLocal) >> 20,
              staging_buffer_pool.StreamBufferBytes() >> 20, pressure - vram_report_seen_pressure,
              failed - vram_report_seen_failed);
+    // Where the main heap's usage sits: each allocator's blocks against what is allocated in
+    // them (their difference is the block slack), and what the driver holds outside both
+    // (pipelines, descriptor and command memory, the swapchain, its own reservations).
+    {
+        const size_t heap = device.GetMainHeap();
+        std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> main_budgets{};
+        vmaGetHeapBudgets(device.GetAllocator(), main_budgets.data());
+        std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> buffer_budgets{};
+        if (device.HasSplitAllocators()) {
+            device.BufferHeapBudgets(buffer_budgets.data());
+        }
+        const VmaStatistics& images = main_budgets[heap].statistics;
+        const VmaStatistics& buffers = buffer_budgets[heap].statistics;
+        const u64 blocks = images.blockBytes + buffers.blockBytes;
+        LOG_INFO(Render_Vulkan,
+                 "VRAM split (FRITCHII_VRAM_REPORT): main allocator blocks {} MiB ({} MiB "
+                 "allocated, {} allocations), buffer allocator blocks {} MiB ({} MiB allocated, "
+                 "{} allocations), outside the allocators {} MiB; small card profile {} "
+                 "(FRITCHII_SMALL_CARD={}, parts {:#x})",
+                 images.blockBytes >> 20, images.allocationBytes >> 20, images.allocationCount,
+                 buffers.blockBytes >> 20, buffers.allocationBytes >> 20,
+                 buffers.allocationCount, (usage - (std::min)(usage, blocks)) >> 20,
+                 VideoCore::SmallCard::Active() ? "on" : "off", VideoCore::SmallCard::Mode(),
+                 VideoCore::SmallCard::Parts());
+    }
     vram_report_samples = vram_report_over = 0;
     vram_report_peak_usage = vram_report_peak_over = 0;
     vram_report_seen_pressure = pressure;
@@ -3397,6 +3423,17 @@ void TextureCacheRuntime::TickFrame() {
             pool_fit_frames = 0;
         } else if (pool_fit_frames++ % 30 == 0) {
             UpdatePoolFitCap();
+        }
+        // FRITCHII_SMALL_CARD (part Pool): the pool held 850-1000 MiB of deleted render targets at
+        // the market (EXP66 = 1024), a seventh of an 8 GB card's budget and a fifth of a 6 GB
+        // one's. On a small card it gets 1/16 of the budget (~450 MiB on 8 GB, ~340 on 6 GB, at
+        // least 256), trimmed oldest first as before; the cache's part Fit counts what it holds.
+        if (!VideoCore::SmallCard::On(VideoCore::SmallCard::Pool)) {
+            small_pool_cap = ~u64{0};
+            small_pool_frames = 0;
+        } else if (small_pool_frames++ % 30 == 0) {
+            const u64 budget = device.GetDeviceMemoryBudget();
+            small_pool_cap = budget != 0 ? (std::max)(budget / 16, u64{256} << 20) : ~u64{0};
         }
         SampleVramReport();
         const int pool_switch = VideoCore::Nx2Debug::Experiment(42);

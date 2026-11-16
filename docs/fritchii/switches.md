@@ -493,6 +493,41 @@ them. Exact: the same code, more room. Memory is committed only as code is writt
 per core, 4-6 cores). Log: "FRITCHII_JIT_CACHE_MIB=N: code cache of N MiB per core". Only worth a
 test when FRITCHII_HITCH_SPLIT=1 shows "warm compiles refused" before the load; judge by the load
 cluster's hitch score and its "another core had" time, fresh launches (boot setting).
+### FRITCHII_SMALL_CARD, FRITCHII_SMALL_CARD_PARTS, FRITCHII_SMALL_CARD_BUFFER_BLOCK_MIB
+
+TEST, off by default (helper BY, 2026-11-16). FRITCHII_SMALL_CARD (live): 0 off, 1 on, 2 auto = on
+when the main device-local heap is under 9 GiB or its budget at boot under 7.5 GiB (8 GB and 6 GB
+cards; never integrated GPUs; a simulated card's limit counts). The small card profile: an 8 GB
+card should stop overflowing in real play (RTX 2080 at 1440p: 7.9 GB of a 6.7-7.2 GB budget, 32
+pressure events, read-backs stalling for seconds; RTX 3070 Ti 6850 of 7181) and a 6 GB card should
+fit at 1x, with nothing reserved for show. Big cards never turn it on in auto mode.
+FRITCHII_SMALL_CARD_PARTS (boot, bit mask, default 0xF) picks the parts:
+- 0x1 fit (live): the texture cache's critical threshold = budget less 1/16 of it (at most 512
+  MiB; was 1/8, at most 1 GiB) less the out-of-memory margin, the block slack and what the cache's
+  usage leaves out: the image pool, deleted images still in flight, collector downloads, frees
+  queued for the free thread ("uncounted", reserved at once when it grows, 16 MiB a check when it
+  shrinks). No fixed 5 GiB cap. The out-of-memory margin stops at 1/8 of the budget instead of 3
+  GiB (the RTX 2080's Castle Town load drove it to 3 GiB: critical ~3.6 GiB, the collector evicted
+  the scene it drew). Expected stays 1/8 of the budget under critical.
+- 0x2 pool (live): EXP42's image pool cap = 1/16 of the budget, at least 256 MiB (~450 MiB on 8 GB,
+  ~340 on 6 GB) instead of EXP66's 1 GiB.
+- 0x4 buffer blocks (boot): the buffer allocator's VMA blocks are 16 MiB instead of 32
+  (FRITCHII_SMALL_CARD_BUFFER_BLOCK_MIB, 4-256, tries others), so buffers over 8 MiB get exact
+  memory. At the market the buffer allocator held ~1.4 GiB of blocks for ~0.7 GiB of buffers (8 GB
+  and 6 GB simulations): most of the block slack.
+- 0x8 refuse scale (boot): a resolution scale over 1x runs at 1x for the session (the setting
+  stays); the status bar reads "Scale: 1x (2x DOESN'T FIT)". Log: "Small card profile: resolution
+  scale ... does not fit".
+- 0x10 stream (boot, not in the default): stream buffer 64 MiB instead of 128.
+Logs: at boot "Small card profile (FRITCHII_SMALL_CARD=N): main heap H MiB, budget B MiB, a small /
+not a small card; profile on/off (parts ...)"; the thresholds' "Memory margins" line adds
+"uncounted U MiB (small card profile on/off)"; with FRITCHII_VRAM_REPORT=1 a second line "VRAM split
+(FRITCHII_VRAM_REPORT): main allocator blocks / allocated, buffer allocator blocks / allocated,
+outside the allocators MiB; small card profile ...". Judge under EDEN_NX2_VRAM_LIMIT_MIB=8192 / 6144
++ FRITCHII_VRAM_SIM_OTHERS=1 (work\helper_by_answer.md): "over the budget" samples 0, fps and 1% lows
+not lower; with no limit on a 16 GB card, FRITCHII_SMALL_CARD=2 must log "not a small card" and
+change nothing.
+
 ### FRITCHII_VRAM_POOL_FIT
 
 TEST, off by default (helper BF, 2026-11-16; 8 GB cards). Live: 1 = EXP42's image pool (pooled

@@ -167,6 +167,9 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 pressure_margin{};        ///< Extra room under the budget after images did not fit
     u64 pressure_quiet_frames{};  ///< Frames since the last such image
     u64 slack_margin{};           ///< Extra room for allocator block space the driver counts as used
+    /// FRITCHII_SMALL_CARD (part Fit): room for the device memory the usage leaves out
+    /// (UncountedDeviceBytes), smoothed like slack_margin; 0 while the part is off.
+    u64 held_margin{};
     u64 astc_opaque_images{};
     u64 astc_alpha_images{};
     std::vector<u8> astc_scan_buffer;
@@ -1372,6 +1375,16 @@ private:
 
     /// Applies EDEN_NX2_TC_EXPECTED_MIB / EDEN_NX2_TC_CRITICAL_MIB and logs the thresholds.
     void ApplyThresholdOverrides(bool log = true);
+
+    /// FRITCHII_SMALL_CARD (part Fit): device memory the driver counts that TickFrame leaves out
+    /// of total_used_memory (deleted images still in flight, collector downloads, frees handed to
+    /// the free thread, the image pool).
+    [[nodiscard]] u64 UncountedDeviceBytes() const;
+    /// FRITCHII_SMALL_CARD (part Fit): the thresholds' margin under the budget, 1/16 of it and at
+    /// most 512 MiB (1/8 and 1 GiB without the profile).
+    [[nodiscard]] static u64 SmallCardMargin(u64 budget) noexcept {
+        return (std::min)(budget / 16, u64{512} << 20);
+    }
 
     /// A GPU-written image dropped without being written back leaves its
     /// guest memory stale (the GPU's data is gone). Its whole pages are marked here and kept
