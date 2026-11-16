@@ -72,6 +72,7 @@
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_cooperative_hmma_test.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
+#include "video_core/renderer_vulkan/vk_pipeline_binary.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/texture_cache/formatter.h"
 #include "video_core/renderer_vulkan/vk_pipeline_translate_queue.h"
@@ -2128,6 +2129,7 @@ PipelineCache::~PipelineCache() {
     Common::NoteShutdownProgress();
     // The caches are written before anything slow is torn down, so a teardown cut short still
     // leaves them on disk.
+    PipelineBinary::Close("at exit");
     SaveUsedPipelines();
     if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
@@ -3379,6 +3381,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         LOG_ERROR(Common_Filesystem, "Failed to create pipeline cache directories");
         return;
     }
+    // Fritchii's own store of compiled pipelines (FRITCHII_PIPELINE_BINARY), before anything of
+    // this game is built: the boot rebuilds and the preparation build through it.
+    PipelineBinary::Open(device, base_dir);
     // This fork's files: its records carry task/mesh state other builds of the same cache version
     // cannot read, and their loader deletes a file it fails to read. The shared files of earlier
     // builds are copied once.
@@ -4662,9 +4667,11 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     // recompiler, pipeline creation and the precompile step (CMakeModules/Nx2ShaderStamp.cmake).
     const auto stamp_path =
         base_dir / fmt::format("precompiled_prepared.fork-v{}.txt", CACHE_VERSION);
-    const std::string stamp = fmt::format("{} {} {:#x} shaders-{} {}\n", file_size, modified,
+    // With the pipeline binary store saving, its file id too: a new (or started over) store is
+    // filled by one more preparation (FRITCHII_PIPELINE_BINARY).
+    const std::string stamp = fmt::format("{} {} {:#x} shaders-{} {}{}\n", file_size, modified,
                                           device.GetDriverVersion(), NX2_SHADER_STAMP,
-                                          device.GetModelName());
+                                          device.GetModelName(), PipelineBinary::StampSuffix());
     // EDEN_NX2_PRECOMPILED_FAST: the preparation keeps each pipeline's infos and SPIR-V too
     // (vk_precompiled_kept.h), for this release, its settings and GPU. Whether this build
     // translates them the same is checked on a sample at boot (CheckKeptSample), not stamped.
@@ -5141,6 +5148,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
              state.known.load() + state.other_device.load(), state.known.load(),
              state.other_device.load(), total - reached, seconds);
     LogDriverCacheFolder(device, "after the preparation");
+    PipelineBinary::LogCounts("after the preparation");
     if (state.other_device.load() != 0) {
         // Which dynamic states made records "for another device" (recorded on a GPU that has
         // them dynamic and this one static, or the reverse): AMD players skipped most of the
@@ -6051,6 +6059,7 @@ void PipelineCache::ReportPrecompiled() {
     const u64 bytes = bytes_total - stats.bytes_at_window;
     const u32 built = precompiled_worker_builds.exchange(0, std::memory_order_relaxed);
     ReportKeptDriverCompiles();
+    PipelineBinary::ReportPeriodic();
     if (stats.graphics + stats.compute + stats.failed + stats.not_precompiled + built != 0 ||
         !stats.misses.empty()) {
         const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };

@@ -34,6 +34,7 @@
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/small_card.h"
+#include "video_core/renderer_vulkan/vk_pipeline_binary.h"
 #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -1566,6 +1567,7 @@ VkFormat Device::GetSupportedFormat(VkFormat wanted_format, VkFormatFeatureFlags
 
 void Device::ReportLoss() const {
     LOG_CRITICAL(Render_Vulkan, "Device loss occurred!");
+    PipelineBinary::NoteDeviceLoss();
     ReportDeviceFault();
 
     // Wait for the log to flush and for Nsight Aftermath to dump the results
@@ -1821,6 +1823,15 @@ bool Device::GetSuitability(bool requires_swapchain) {
         graphics_pipeline_library_requested = false;
     }
 
+    // VK_KHR_pipeline_binary (FRITCHII_PIPELINE_BINARY, vk_pipeline_binary.h): enabled only with
+    // the switch on. Its properties are read and logged whenever the driver offers it.
+    pipeline_binary_offered = supported_extensions.contains(VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
+    pipeline_binary_requested = pipeline_binary_offered && PipelineBinary::SwitchValue() != 0 &&
+                                supported_extensions.contains(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+    if (pipeline_binary_requested) {
+        loaded_extensions.insert(VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
+    }
+
     extensions.depth_stencil_resolve =
         extensions.depth_stencil_resolve &&
         (instance_version >= VK_API_VERSION_1_2 || extensions.create_renderpass2);
@@ -1937,6 +1948,12 @@ bool Device::GetSuitability(bool requires_swapchain) {
         graphics_pipeline_library_features.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT;
         SetNext(next, graphics_pipeline_library_features);
+    }
+    // In the chain the device is created with: only when the extension is enabled.
+    if (pipeline_binary_requested) {
+        pipeline_binary_features.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR;
+        SetNext(next, pipeline_binary_features);
     }
 
     // VK_EXT_device_fault: what the driver knows about a device loss (ReportLoss). Only the
@@ -2062,6 +2079,11 @@ bool Device::GetSuitability(bool requires_swapchain) {
         properties.graphics_pipeline_library.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT;
         SetNext(next, properties.graphics_pipeline_library);
+    }
+    if (pipeline_binary_offered) {
+        pipeline_binary_properties.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_PROPERTIES_KHR;
+        SetNext(next, pipeline_binary_properties);
     }
 
     // Perform the property fetch.
@@ -2564,6 +2586,32 @@ void Device::RemoveUnsuitableExtensions() {
     extensions.maintenance5 = features.maintenance5.maintenance5;
     RemoveExtensionFeatureIfUnsuitable(extensions.maintenance5, features.maintenance5,
                                        VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+
+    // VK_KHR_pipeline_binary (FRITCHII_PIPELINE_BINARY): needs maintenance5 (the capture flag
+    // is a VkPipelineCreateFlags2 bit).
+    if (pipeline_binary_offered) {
+        const auto& binary = pipeline_binary_properties;
+        LOG_INFO(Render_Vulkan,
+                 "VK_KHR_pipeline_binary: internal cache {}, internal cache control {}, prefers "
+                 "internal cache {}, precompiled internal cache {}, compressed data {}",
+                 binary.pipelineBinaryInternalCache, binary.pipelineBinaryInternalCacheControl,
+                 binary.pipelineBinaryPrefersInternalCache,
+                 binary.pipelineBinaryPrecompiledInternalCache,
+                 binary.pipelineBinaryCompressedData);
+    }
+    if (pipeline_binary_requested) {
+        const bool usable = pipeline_binary_features.pipelineBinaries && extensions.maintenance5;
+        if (!usable) {
+            LOG_WARNING(Render_Vulkan, "FRITCHII_PIPELINE_BINARY: the driver has no usable "
+                                       "pipeline binaries (feature or maintenance5 missing), off");
+            loaded_extensions.erase(VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
+            pipeline_binary_features.pipelineBinaries = VK_FALSE;
+        } else if (pipeline_binary_properties.pipelineBinaryPrefersInternalCache) {
+            LOG_INFO(Render_Vulkan, "FRITCHII_PIPELINE_BINARY: the driver prefers its own cache; "
+                                    "the store runs anyway (switch set)");
+        }
+        pipeline_binary_enabled = usable;
+    }
 
     // VK_EXT_shader_float8, only for AMD FSR 4: its RDNA 4 network runs in FP8 and drew a black
     // picture without the feature on the device (found by CheezerWheezer).
