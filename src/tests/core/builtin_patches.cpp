@@ -666,6 +666,14 @@ TEST_CASE("High refresh fixes built-in hooks its sites in both modes", "[patch_m
         Hook{0x2F5328C, 0x7100053F, 0x7100053F},
         Hook{0x2F53290, 0x1A9FC529, 0x1A9FC529},
         Hook{0x53F914, 0x1100077A, 0x14DC1B27}, // ambient wave phase -> b 0x3c465b0
+        Hook{0x13A06C, 0x1E212000, 0x1E212000}, // fcmp s0, s1 (kept)
+        Hook{0x13A070, 0x5400196C, 0x14EC3168}, // ground velocity b.gt -> b 0x3c46610
+        Hook{0x13D70C, 0x1E212000, 0x1E212000},
+        Hook{0x13D710, 0x54001E2C, 0x14EC23D0}, // -> b 0x3c46650
+        Hook{0x389AC28, 0x1E212000, 0x1E212000},
+        Hook{0x389AC2C, 0x540017CC, 0x140EAE99}, // -> b 0x3c46690
+        Hook{0x261EB18, 0x1E210801, 0x14589EEE}, // turn speed fmul -> b 0x3c466d0
+        Hook{0x261EB1C, 0x1E280800, 0x1E280800}, // the second fmul (kept)
     };
     // Each stub's first and last word.
     struct Stub {
@@ -681,6 +689,10 @@ TEST_CASE("High refresh fixes built-in hooks its sites in both modes", "[patch_m
         Stub{0x3C46500, 0x50, 0xA9BF47F0, 0x17D933B2}, // playback ... b 0x3293414
         Stub{0x3C46550, 0x60, 0xA9BF47F0, 0x17CC3330}, // countdown ... b 0x2f5326c
         Stub{0x3C465B0, 0x60, 0xA9BF47F0, 0x1723E4C3}, // ambient ... b 0x53f918
+        Stub{0x3C46610, 0x38, 0x5400004C, 0x1713CF56}, // ground a: b.gt +8 ... b 0x13a39c
+        Stub{0x3C46650, 0x38, 0x5400004C, 0x1713DD14}, // ground b ... b 0x13dad4
+        Stub{0x3C46690, 0x38, 0x5400004C, 0x17F15218}, // ground c ... b 0x389af24
+        Stub{0x3C466D0, 0x48, 0xA9BF47F0, 0x17A76103}, // turn speed ... b 0x261eb20
     };
     constexpr u32 GateCallWord = 0xB94CC610; // ldr w16, [x16, #0xcc4] (the frame step's call)
     const auto word_at = [](const std::vector<u8>& nso, size_t offset) {
