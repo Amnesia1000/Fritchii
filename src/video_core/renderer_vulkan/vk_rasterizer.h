@@ -581,6 +581,7 @@ private:
     u32 draw_counter = 0;
     std::optional<u64> oot_camera_sample_frame;
     mutable std::optional<VideoCommon::OcarinaUpscaleBackend> oot_backend;
+    mutable bool oot_dlss_jitter{}; ///< DLSS gets the camera jitter (set with oot_backend)
     bool oot_resolution_checked{};
     struct OcarinaMotionTrace {
         const Tegra::MemoryManager* camera_channel{};

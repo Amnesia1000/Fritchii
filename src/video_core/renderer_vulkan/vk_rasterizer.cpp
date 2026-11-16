@@ -7957,6 +7957,12 @@ bool RasterizerVulkan::OcarinaTemporalEnabled() const {
         return *oot_backend != VideoCommon::OcarinaUpscaleBackend::Native;
     }
     oot_backend = ResolveOcarinaUpscaler(device);
+    oot_dlss_jitter = VideoCommon::OcarinaDlssJitterOn(Settings::values.oot_dlss_jitter.GetValue());
+    if (*oot_backend == VideoCommon::OcarinaUpscaleBackend::Dlss) {
+        LOG_INFO(Render_Vulkan, "Ocarina temporal: DLSS jitter {} ({})",
+                 oot_dlss_jitter ? "on" : "off",
+                 VideoCommon::OcarinaDlssJitterOverride() >= 0 ? "EDEN_NX2_DLSS_JITTER" : "setting");
+    }
     // Which upscaler OoT got and from what (2026-11-11: a player with DLSS on and Streamline
     // loaded had no DLSS in 10 minutes, and the log couldn't say why).
     LOG_INFO(Render_Vulkan,
@@ -8147,11 +8153,11 @@ void RasterizerVulkan::UpdateOcarinaJitter() {
     // half-size passes and full-screen passes (which keep the depth bound without using it, as
     // a ported change found, some with depth writes on: with the test off nothing writes depth) stay put.
     const auto& regs = maxwell3d->regs;
-    // FSR, and DLSS with EDEN_NX2_DLSS_JITTER (it is made for jittered input too).
+    // FSR, and DLSS with its jitter on (the "DLSS jitter" setting, on by default, or
+    // EDEN_NX2_DLSS_JITTER): it is made for jittered input too.
     const bool jittered_backend =
         oot_backend == VideoCommon::OcarinaUpscaleBackend::Fsr ||
-        (oot_backend == VideoCommon::OcarinaUpscaleBackend::Dlss &&
-         VideoCommon::OcarinaDlssJitterMode() != 0);
+        (oot_backend == VideoCommon::OcarinaUpscaleBackend::Dlss && oot_dlss_jitter);
     if (jittered_backend && oot_motion.extent.width != 0 &&
         oot_dlss_frame && *oot_dlss_frame + 1 >= render_trace_frame && regs.depth_test_enable) {
         const auto& targets = texture_cache.GetRenderTargets();

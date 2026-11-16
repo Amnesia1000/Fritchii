@@ -7,6 +7,7 @@
 #pragma once
 
 #include <functional>
+#include <map>
 #include <memory>
 #include <type_traits>
 #include <typeindex>
@@ -80,6 +81,9 @@ private:
     /// resolution while DLSS or FSR sets OoT's resolution.
     void SetupOcarinaUpscalerLabels();
     void UpdateOcarinaUpscalerLabels();
+    /// OoT's "DLSS jitter" row only while DLSS upscales OoT, the LOD bias row only with Custom
+    /// texture sharpness. `rows`: the built setting rows by setting id.
+    void SetupOcarinaTextureRows(const std::map<u32, QWidget*>& rows);
 
     void RetrieveVulkanDevices();
 

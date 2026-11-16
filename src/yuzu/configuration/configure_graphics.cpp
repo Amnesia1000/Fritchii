@@ -10,6 +10,7 @@
 #include <QCheckBox>
 #include <QColorDialog>
 #include <QComboBox>
+#include <QDoubleSpinBox>
 #include <QIcon>
 #include <QLabel>
 #include <QLineEdit>
@@ -240,6 +241,9 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
             setting->Id() == Settings::values.nvidia_dlss_preset.Id()) {
             continue;
         }
+        if (setting->Id() == Settings::values.oot_dlss_jitter.Id()) {
+            continue;
+        }
 #endif
 
         ConfigurationShared::Widget* widget = [&]() {
@@ -430,6 +434,7 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
     }
 
     SetupOcarinaUpscalerLabels();
+    SetupOcarinaTextureRows(hold_graphics);
 
     // Background color is too specific to build into the new system, so we manage it here
     // (3 settings, all collected into a single widget with a QColor to manage on top)
@@ -690,6 +695,53 @@ void ConfigureGraphics::UpdateOcarinaUpscalerLabels() {
             : tr("DLSS picks OoT's resolution itself, so this stays at 1x while it's on."));
     // FRITCHII_DLSS_SCALED keeps the scale.
     resolution_note->setVisible((fsr || dlss) && !VideoCommon::OcarinaScaledUpscale());
+}
+
+void ConfigureGraphics::SetupOcarinaTextureRows(const std::map<u32, QWidget*>& rows) {
+    const auto find = [&rows](u32 id) -> ConfigurationShared::Widget* {
+        const auto it = rows.find(id);
+        return it == rows.end() ? nullptr
+                                : qobject_cast<ConfigurationShared::Widget*>(it->second);
+    };
+    // "DLSS jitter": only while DLSS would upscale OoT (its checkbox on and no FSR choice, which
+    // wins over DLSS). Per game the DLSS checkbox isn't shown: its global value counts.
+    if (ConfigurationShared::Widget* const jitter = find(Settings::values.oot_dlss_jitter.Id())) {
+        const auto update = [this, jitter] {
+            const bool dlss = nvidia_dlss_checkbox != nullptr
+                                  ? nvidia_dlss_checkbox->isChecked()
+                                  : Settings::values.nvidia_dlss.GetValue();
+            bool fsr = false;
+            if (oot_aa_combobox != nullptr && oot_aa_combobox->currentIndex() >= 0) {
+                fsr = VideoCommon::OcarinaFsrChosen(static_cast<Settings::OotAntiAliasing>(
+                    oot_aa_combobox->currentData().toUInt()));
+            }
+            jitter->setVisible(dlss && !fsr);
+        };
+        if (nvidia_dlss_checkbox != nullptr) {
+            connect(nvidia_dlss_checkbox, &QCheckBox::toggled, jitter, update);
+        }
+        if (oot_aa_combobox != nullptr) {
+            connect(oot_aa_combobox, QOverload<int>::of(&QComboBox::currentIndexChanged), jitter,
+                    update);
+        }
+        update();
+    }
+    // The LOD bias value only with Custom, in steps of 0.05.
+    ConfigurationShared::Widget* const custom = find(Settings::values.oot_lod_bias_custom.Id());
+    if (custom != nullptr && custom->double_spinbox != nullptr) {
+        custom->double_spinbox->setSingleStep(0.05);
+    }
+    ConfigurationShared::Widget* const sharpness =
+        find(Settings::values.oot_texture_sharpness.Id());
+    if (custom != nullptr && sharpness != nullptr && sharpness->combobox != nullptr) {
+        QComboBox* const combobox = sharpness->combobox;
+        const auto update = [combobox, custom] {
+            custom->setVisible(combobox->currentData().toUInt() ==
+                               static_cast<u32>(Settings::OotTextureSharpness::Custom));
+        };
+        connect(combobox, QOverload<int>::of(&QComboBox::currentIndexChanged), custom, update);
+        update();
+    }
 }
 
 void ConfigureGraphics::RetrieveVulkanDevices() {
