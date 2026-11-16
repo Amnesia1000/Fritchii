@@ -120,8 +120,10 @@ struct ShaderPools {
 struct ComputePipelineCacheEntry {
     std::unique_ptr<ComputePipeline> pipeline;
     std::string failure;
-    /// Constant buffer slots that were null pointers at translation (see NullStoragePointerSlots)
-    std::vector<std::pair<u32, u32>> null_pointer_slots;
+    /// Pointer slots left unbound at translation: null or unmapped plain slots and pointer-table
+    /// entries (see UnboundStoragePointerSlots). One that later holds a mapped address makes the
+    /// translation stale (CurrentComputePipeline rebuilds it).
+    std::vector<Shader::StoragePointerSlot> unbound_pointer_slots;
     /// Constant buffer slots bound as storage buffer pointers (see MappedStoragePointerKeys)
     std::vector<u64> mapped_pointers;
     u32 rebuilds{};
@@ -490,7 +492,18 @@ private:
         std::vector<std::vector<VideoCommon::FileEnvironment>>& records,
         PipelineStatistics* statistics);
 
-    [[nodiscard]] bool StaleNullPointerSlot(const ComputePipelineCacheEntry& entry) const;
+    /// Whether a slot the entry's translation left unbound (unbound_pointer_slots) now holds a
+    /// mapped address; a table entry is followed through its slot's buffer. The first such slot
+    /// and its address are stored in `filled` and `address` when given.
+    [[nodiscard]] bool StaleUnboundPointerSlot(const ComputePipelineCacheEntry& entry,
+                                               Shader::StoragePointerSlot* filled = nullptr,
+                                               GPUVAddr* address = nullptr) const;
+
+    /// Logs once per translation a dispatched native compute program's slots left unbound, with
+    /// its shader hash and where the translation came from (players' logs then name a culling
+    /// program that misses a list slot).
+    void NoteUnboundPointerSlots(const ComputePipelineCacheKey& key,
+                                 const ComputePipelineCacheEntry& entry, bool is_new);
 
     /// Translates the current compute program, binding the pointers in keep_pointers whatever
     /// their slots hold now (see GenericEnvironment::KeepStoragePointers)
@@ -677,6 +690,8 @@ private:
     ::Common::unordered_map<ComputePipelineCacheKey, EvictedCompute> evicted_compute;
     size_t compute_evicted_total{};       ///< EXP51 evictions this session
     size_t compute_rebuilt_after_evict{}; ///< Evicted compute programs dispatched again
+    u64 compute_slot_rebuilds{};          ///< Rebuilds because an unbound slot filled (session)
+    u32 compute_unbound_logged{};         ///< NoteUnboundPointerSlots lines this session
     ::Common::unordered_map<GraphicsPipelineCacheKey, std::unique_ptr<GraphicsPipeline>> graphics_cache;
 
     ShaderPools main_pools;

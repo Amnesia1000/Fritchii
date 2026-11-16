@@ -5229,7 +5229,7 @@ pay for those reads and are counted. The handle values are not part of 2b's earl
 pipeline's Configure fills them at the top of its handle work ("filled in Configure"). The QMD: the
 native QMD scheduler's 256-byte read goes through the dispatch packet (MemStage::Qmd), which
 opens there; the error path's 512-byte read stays direct. Null pointer slots: the compute
-pipeline lookup's pointer read (StaleNullPointerSlot) goes through the open dispatch packet too
+pipeline lookup's pointer read (StaleUnboundPointerSlot) goes through the open dispatch packet too
 (MemStage::ReadPointerSlot). With 3 the stats line adds "memory seam by value": draws and
 dispatches with values a second (values each, how many filled in Configure, how many the back
 skipped and their values), QMDs a second (and reads that ran no dispatch), null pointer slots,

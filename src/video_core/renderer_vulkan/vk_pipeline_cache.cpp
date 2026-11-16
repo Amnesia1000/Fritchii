@@ -2980,11 +2980,31 @@ void OrderComputeTranslations(std::vector<Candidate>& candidates, PointerKeys&& 
     }
     candidates = std::move(ordered);
 }
+
+/// "c4[0xd0]", with "[0x18]" after it for a pointer-table entry.
+std::string FormatPointerSlot(const Shader::StoragePointerSlot& slot) {
+    std::string text = fmt::format("c{}[{:#x}]", slot.index, slot.offset);
+    if (slot.indirect) {
+        text += fmt::format("[{:#x}]", *slot.indirect);
+    }
+    return text;
+}
 } // Anonymous namespace
 
-bool PipelineCache::StaleNullPointerSlot(const ComputePipelineCacheEntry& entry) const {
+bool PipelineCache::StaleUnboundPointerSlot(const ComputePipelineCacheEntry& entry,
+                                            Shader::StoragePointerSlot* filled,
+                                            GPUVAddr* filled_address) const {
     const auto& qmd{kepler_compute->launch_description};
-    for (const auto& [index, offset] : entry.null_pointer_slots) {
+    const auto mapped = [this](GPUVAddr address) {
+        return address != 0 && gpu_memory->IsWithinGPUAddressRange(address) &&
+               gpu_memory->IsFullyMappedRange(address, 1);
+    };
+    // The memory seam (EXP123 >= 3): the slot's value is kept in the dispatch packet, which
+    // opens here or at the QMD read (vk_mem_stage.cpp).
+    MemStage& seam{buffer_cache.runtime.Seam()};
+    for (const Shader::StoragePointerSlot& unbound : entry.unbound_pointer_slots) {
+        const u32 index = unbound.index;
+        const u32 offset = unbound.offset;
         if (index >= qmd.const_buffer_config.size() ||
             ((qmd.const_buffer_enable_mask >> index) & 1) == 0) {
             continue;
@@ -2997,21 +3017,58 @@ bool PipelineCache::StaleNullPointerSlot(const ComputePipelineCacheEntry& entry)
         if (!gpu_memory->IsFullyMappedRange(slot, sizeof(u64))) {
             continue;
         }
-        // The memory seam (EXP123 >= 3): the slot's value is kept in the dispatch packet, which
-        // opens here or at the QMD read (vk_mem_stage.cpp).
-        MemStage& seam{buffer_cache.runtime.Seam()};
-        const GPUVAddr address{seam.ValuesByValue() ? seam.ReadPointerSlot(*gpu_memory, slot)
-                                                    : gpu_memory->Read<u64>(slot)};
-        if (address != 0 && gpu_memory->IsWithinGPUAddressRange(address) &&
-            gpu_memory->IsFullyMappedRange(address, 1)) {
-            LOG_INFO(Render_Vulkan,
-                     "Rebuilding compute program {:#x}: c{}[{:#x}] was null at translation and "
-                     "now points to {:#x}",
-                     kepler_compute->regs.code_loc.Address() + qmd.program_start, index, offset, address);
+        GPUVAddr address{seam.ValuesByValue() ? seam.ReadPointerSlot(*gpu_memory, slot)
+                                              : gpu_memory->Read<u64>(slot)};
+        if (unbound.indirect) {
+            // A pointer-table entry: the table must be mapped before its entry can be read. Read
+            // directly, as the translation reads it (IsCbufIndirectStorageBufferPointer).
+            const u32 indirect = *unbound.indirect;
+            if (!mapped(address) ||
+                !gpu_memory->IsFullyMappedRange(address + indirect, sizeof(u64))) {
+                continue;
+            }
+            address = gpu_memory->Read<u64>(address + indirect);
+        }
+        if (mapped(address)) {
+            if (filled) {
+                *filled = unbound;
+            }
+            if (filled_address) {
+                *filled_address = address;
+            }
             return true;
         }
     }
     return false;
+}
+
+void PipelineCache::NoteUnboundPointerSlots(const ComputePipelineCacheKey& key,
+                                            const ComputePipelineCacheEntry& entry, bool is_new) {
+    // About a hundred native compute programs are dispatched in a session; the cap only guards
+    // against a game that keeps making new ones.
+    constexpr u32 MaxLines = 256;
+    if (compute_unbound_logged >= MaxLines) {
+        return;
+    }
+    ++compute_unbound_logged;
+    std::string slots;
+    for (const Shader::StoragePointerSlot& slot : entry.unbound_pointer_slots) {
+        slots += ' ';
+        slots += FormatPointerSlot(slot);
+    }
+    const char* source = "cache record";
+    if (entry.pipeline && entry.pipeline->IsPrecompiled()) {
+        source = "prepared";
+    } else if (entry.rebuilds != 0) {
+        source = "rebuilt";
+    } else if (is_new) {
+        source = "translated now";
+    }
+    LOG_INFO(Render_Vulkan,
+             "Compute {:016x} ({}, rebuild {} of {}): {} pointers bound, left unbound:{}{}",
+             key.unique_hash, source, entry.rebuilds, MaxComputeRebuilds,
+             entry.mapped_pointers.size(), slots,
+             compute_unbound_logged == MaxLines ? " (last such line this session)" : "");
 }
 
 ComputePipeline* PipelineCache::CurrentComputePipeline() {
@@ -3028,6 +3085,8 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
     };
     const auto [pair, is_new]{compute_cache.try_emplace(key)};
     auto& entry{pair->second};
+    Shader::StoragePointerSlot filled_slot{};
+    GPUVAddr filled_address{};
     if (is_new) {
         if (const auto evicted = evicted_compute.find(key); evicted != evicted_compute.end()) {
             // EXP51 evicted it: translated binding the pointers it bound, from the driver's
@@ -3066,11 +3125,21 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
         retired_compute_pipelines.emplace_back(scheduler.CurrentTick(), std::move(entry.pipeline));
         entry = CreateComputePipeline(key, shader, entry.mapped_pointers);
         entry.rebuilds = rebuilds;
-    } else if (!entry.null_pointer_slots.empty() && entry.rebuilds < MaxComputeRebuilds &&
-               StaleNullPointerSlot(entry)) {
-        // The translation dropped accesses through a pointer that was null back then. Which slots
-        // the game fills depends on the area, so the new one keeps binding every pointer this one
-        // binds, null now or not: a null pointer binds nothing.
+    } else if (!entry.unbound_pointer_slots.empty() && entry.rebuilds < MaxComputeRebuilds &&
+               StaleUnboundPointerSlot(entry, &filled_slot, &filled_address)) {
+        // The translation dropped accesses through a pointer that was unbound back then (null,
+        // unmapped, or a pointer-table entry). Which slots the game fills depends on the area and
+        // the moment (OoT's foliage culling during a sword swing), so the new one keeps binding
+        // every pointer this one binds, null now or not: a null pointer binds nothing.
+        ++compute_slot_rebuilds;
+        LOG_INFO(Render_Vulkan,
+                 "Compute rebuilt: slot filled after capture: program {:#x} ({:016x}, {}) {} was "
+                 "unbound at translation and now points to {:#x}; rebuild {} of {}, {} this "
+                 "session",
+                 kepler_compute->regs.code_loc.Address() + qmd.program_start, key.unique_hash,
+                 entry.pipeline && entry.pipeline->IsPrecompiled() ? "prepared" : "translated",
+                 FormatPointerSlot(filled_slot), filled_address, entry.rebuilds + 1,
+                 MaxComputeRebuilds, compute_slot_rebuilds);
         auto rebuilt{CreateComputePipeline(key, shader, entry.mapped_pointers)};
         if (rebuilt.pipeline) {
             rebuilt.rebuilds = entry.rebuilds + 1;
@@ -3092,6 +3161,9 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
                         key.unique_hash, rebuilt.failure);
             entry.rebuilds = MaxComputeRebuilds;
         }
+    }
+    if (!entry.dispatched && !entry.unbound_pointer_slots.empty()) {
+        NoteUnboundPointerSlots(key, entry, is_new);
     }
     entry.last_use_frame = frame_count;
     entry.dispatched = true;
@@ -3124,8 +3196,10 @@ ComputePipeline* PipelineCache::OneFollowerComputePipeline() {
     }
     // The stale slot test reads the slots (game memory, E's; ReadPointerSlot keeps the values
     // in the open dispatch packet). Stale: a rebuild is due, lent (the lent lookup reads again).
-    if (!entry.null_pointer_slots.empty() && entry.rebuilds < MaxComputeRebuilds &&
-        StaleNullPointerSlot(entry)) {
+    // A first dispatch with unbound slots is lent too, once, for its log line.
+    if (!entry.unbound_pointer_slots.empty() &&
+        (!entry.dispatched ||
+         (entry.rebuilds < MaxComputeRebuilds && StaleUnboundPointerSlot(entry)))) {
         return nullptr;
     }
     // From here as CurrentComputePipeline: ComputeShader's checks and hooks (they may throw:
@@ -5709,8 +5783,9 @@ ComputePipelineCacheEntry PipelineCache::CreatePrecompiledComputePipeline(
             descriptor_buffer_ring, &workers, nullptr, &shader_notify, *info, vk::ShaderModule{},
             key.unique_hash, std::move(make_module)),
         // The live environment answered the same questions, as the translation would have.
-        .null_pointer_slots = env.IsNativeProgram() ? env.NullStoragePointerSlots()
-                                                    : std::vector<std::pair<u32, u32>>{},
+        .unbound_pointer_slots = env.IsNativeProgram()
+                                     ? env.UnboundStoragePointerSlots()
+                                     : std::vector<Shader::StoragePointerSlot>{},
         .mapped_pointers =
             env.IsNativeProgram() ? env.MappedStoragePointerKeys() : std::vector<u64>{},
     };
@@ -8061,8 +8136,9 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
                 descriptor_buffer_ring, thread_worker, statistics,
                 warm ? nullptr : &shader_notify, info,
                 std::move(spv_module), key.unique_hash),
-            .null_pointer_slots = env.IsNativeProgram() ? env.NullStoragePointerSlots()
-                                                        : std::vector<std::pair<u32, u32>>{},
+            .unbound_pointer_slots = env.IsNativeProgram()
+                                         ? env.UnboundStoragePointerSlots()
+                                         : std::vector<Shader::StoragePointerSlot>{},
             .mapped_pointers =
                 env.IsNativeProgram() ? env.MappedStoragePointerKeys() : std::vector<u64>{}};
 
