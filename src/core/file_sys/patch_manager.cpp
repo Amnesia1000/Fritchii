@@ -859,6 +859,7 @@ constexpr std::array BUILTIN_PATCHES{
         .module = "main",
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = HR_FIX_RECORDS,
+        .disable_env = "FRITCHII_NO_HR_FIXES", // =1 skips it (A/B runs, a fix that misbehaves)
         .state_offset = HR_FIX_STATE_OFFSET,
         .state_size = HR_FIX_STATE_SIZE,
     },
