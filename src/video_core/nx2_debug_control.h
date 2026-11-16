@@ -136,6 +136,10 @@ inline std::atomic<int> g_handle_prog_keep{-1};
 /// FRITCHII_FILL_BRACKET_LEAN (live, default 0): fable_b 25.2 cut h, E's tracker record only for the
 /// slots R can read, ring B's push without the window counters (1 on, 2 verify, 3 dry count).
 inline std::atomic<int> g_fill_bracket_lean{-1};
+/// FRITCHII_REPORT_WAIT (live, default 0 = EXP30 decides, as before): a macro read's wait for
+/// pending query reports (FlushQueryResults). 1 = wait for those reports only (EXP30's wait),
+/// 2 = verify: that wait, then the old one, the words read after each compared (must be 0).
+inline std::atomic<int> g_report_wait{-1};
 /// EDEN_NX2_FEED_MEMORY_OVERLAY: docs/fritchii/switches.md.
 inline std::atomic<int> g_feed_memory_overlay{-1};
 /// EDEN_NX2_QMD_3D_PATCH: docs/fritchii/switches.md.

@@ -13,6 +13,7 @@
 #include <thread>
 #include <cmath>
 #include <condition_variable>
+#include <cstring>
 #include <memory>
 #include <limits>
 #include <cstdio>
@@ -98,6 +99,7 @@
 #include "video_core/memstage_shadow.h"
 #include "video_core/memstage_shadow_engine.h"
 #include "video_core/memstage_stats.h"
+#include "video_core/fritchii_report_wait.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cb_path.h"
 #include "video_core/nx2_debug_control.h"
@@ -7662,7 +7664,81 @@ void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
     // GPU profile zone "query DMA wait": these waits per second and their ms per second, either
     // way below (the A/B measure for EXP30).
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::QueryDmaWait};
-    if (VideoCore::Nx2Debug::Experiment(30) != 0) {
+    // FRITCHII_REPORT_WAIT (live, default 0; fritchii_report_wait.h): 0 = EXP30 decides (as
+    // before), 1 = the lean wait below, 2 = verify (the lean wait, then the old one, the words
+    // compared). Every value times the wait for the "Report waits" line.
+    namespace ReportWait = VideoCommon::ReportWait;
+    int report_wait = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_report_wait,
+                                                       "FRITCHII_REPORT_WAIT");
+    if (report_wait < 0 || report_wait > 2) {
+        report_wait = 0;
+    }
+    ReportWait::MaybeReport(report_wait);
+    const u64 wait_start = ReportWait::NowNs();
+    // From 12 bytes before the read: a 16-byte report (value, then timestamp) starting there
+    // still has words in it, and its slot is the one before the read's.
+    const DAddr wait_begin = addr >= 12 ? addr - 12 : DAddr{0};
+    const u64 wait_bytes = addr + size - wait_begin;
+    // Below High GPU accuracy a fence runs its own callback at once, so wait for an operation
+    // queued behind the pending report writes instead. On the split's back the fence's
+    // submission may be deferred, and the fencing thread would wait for this thread to submit it.
+    const auto old_wait = [&] {
+        std::mutex wait_mutex;
+        std::condition_variable wait_cv;
+        bool written{};
+        fence_manager.SyncOperation([&] {
+            std::scoped_lock lock{wait_mutex};
+            written = true;
+            wait_cv.notify_all();
+        });
+        fence_manager.SignalFence([] {});
+        scheduler.FlushDeferred();
+        std::unique_lock lock{wait_mutex};
+        wait_cv.wait(lock, [&written] { return written; });
+    };
+    if (report_wait == 2) [[unlikely]] {
+        // Verify: the lean wait (polled, so a range that never settles is counted and handed to
+        // the old wait instead of hanging), the words, the old wait, the words again.
+        fence_manager.SignalFence([] {});
+        scheduler.FlushDeferred();
+        constexpr u64 lean_limit_ns = 200'000'000;
+        bool settled = true;
+        while (!Tegra::Nx2AsyncReportsSettled(wait_begin, wait_bytes)) {
+            if (ReportWait::NowNs() - wait_start > lean_limit_ns) {
+                settled = false;
+                break;
+            }
+            std::this_thread::yield();
+        }
+        const u64 lean_end = ReportWait::NowNs();
+        // The read FlushPending serves is one page at most.
+        const size_t bytes = static_cast<size_t>((std::min<u64>)(size, 0x1000));
+        std::array<u8, 0x1000> lean_words;
+        std::array<u8, 0x1000> old_words;
+        device_memory.ReadBlockUnsafe(addr, lean_words.data(), bytes);
+        old_wait();
+        const u64 old_end = ReportWait::NowNs();
+        device_memory.ReadBlockUnsafe(addr, old_words.data(), bytes);
+        const bool differs =
+            !settled || std::memcmp(lean_words.data(), old_words.data(), bytes) != 0;
+        if (ReportWait::NoteVerify(lean_end - wait_start, old_end - wait_start, differs))
+            [[unlikely]] {
+            size_t first = 0;
+            while (first + 1 < bytes && lean_words[first] == old_words[first]) {
+                ++first;
+            }
+            LOG_ERROR(HW_GPU,
+                      "Report waits (FRITCHII_REPORT_WAIT=2, must be 0): the read of {} bytes at "
+                      "{:#x} {} after the lean wait ({:.2f} ms); first different byte {} ({:#x} "
+                      "after the lean wait, {:#x} after the old one)",
+                      bytes, addr, settled ? "changed" : "did not settle in 200 ms",
+                      static_cast<double>(lean_end - wait_start) / 1e6, first, lean_words[first],
+                      old_words[first]);
+        }
+        ReportWait::NoteWait(old_end - wait_start, true);
+        return;
+    }
+    if (report_wait == 1 || VideoCore::Nx2Debug::Experiment(30) != 0) {
         // EXP30: the fence carries the reports still waiting for one; on
         // the split's back its submission may be deferred, and the fencing thread would wait
         // for this thread to submit it. Then wait for the reports themselves, not for an
@@ -7670,28 +7746,16 @@ void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
         // time while walking) cannot write them.
         fence_manager.SignalFence([] {});
         scheduler.FlushDeferred();
-        // From 12 bytes before the read: a 16-byte report (value, then timestamp) starting there
-        // still has words in it, and its slot is the one before the read's.
-        const DAddr wait_begin = addr >= 12 ? addr - 12 : DAddr{0};
-        VideoCommon::BackWaitScope wait_scope{"RasterizerVulkan::FlushQueryResults (own reports)"};
-        Tegra::Nx2WaitAsyncReportsSettled(wait_begin, addr + size - wait_begin);
+        {
+            VideoCommon::BackWaitScope wait_scope{
+                "RasterizerVulkan::FlushQueryResults (own reports)"};
+            Tegra::Nx2WaitAsyncReportsSettled(wait_begin, wait_bytes);
+        }
+        ReportWait::NoteWait(ReportWait::NowNs() - wait_start, true);
         return;
     }
-    // Below High GPU accuracy a fence runs its own callback at once, so wait for an operation
-    // queued behind the pending report writes instead. On the split's back the fence's
-    // submission may be deferred, and the fencing thread would wait for this thread to submit it.
-    std::mutex wait_mutex;
-    std::condition_variable wait_cv;
-    bool written{};
-    fence_manager.SyncOperation([&] {
-        std::scoped_lock lock{wait_mutex};
-        written = true;
-        wait_cv.notify_all();
-    });
-    fence_manager.SignalFence([] {});
-    scheduler.FlushDeferred();
-    std::unique_lock lock{wait_mutex};
-    wait_cv.wait(lock, [&written] { return written; });
+    old_wait();
+    ReportWait::NoteWait(ReportWait::NowNs() - wait_start, false);
 }
 
 void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,

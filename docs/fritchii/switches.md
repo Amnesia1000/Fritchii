@@ -1686,6 +1686,36 @@ not worth turning on), then 2 (must be 0), then 1.
     is read every time and a fit by the kept value that the real one refuses counts (must be 0).
   - The fill bracket itself (fable_b 14.4 cut 3) is already lean on E: its brackets leave the
     shared watch count alone (MemStage::Fill::Open). Nothing more is cut there.
+### FRITCHII_REPORT_WAIT (the "Report waits" line)
+
+Helper CN (work\helper_cn_answer.md). Live, default 0. The wait a macro DMA read of report
+memory makes for query results the host GPU still owes (RasterizerVulkan::FlushQueryResults,
+reached through QueryDma::FlushPending from FrontDmaRead: the front's "macro dma flush" site).
+With one follower it is lent: R waits, E is parked, the front is stopped, so every millisecond of
+it is lost on all three threads. Kakariko (unprofiled): 25 to 30 waits a second of ~1.8 ms,
+~48 ms/s; the market ~11 a second, ~28 ms/s.
+
+- 0 = as before: EXP30 decides (EXP30 off = the old wait: an operation queued behind a new
+  fence, i.e. every piece of GPU work sent so far, including what was sent after the reports).
+- 1 = the lean wait (what EXP30=1 does): a fence for the reports that still wait for one, then
+  Tegra::Nx2WaitAsyncReportsSettled over the read's range (from 12 bytes before it). Every
+  counter report is issued and completed through those slot counters (QueryCacheBase::
+  CounterReport: run entries and fence operations alike), so a settled range holds the words
+  the old wait would leave there. A slot shared with another address only waits longer.
+- 2 = verify: the lean wait (polled; a range that has not settled after 200 ms counts as a
+  difference and goes on to the old wait instead of hanging), the read's words, then the old
+  wait, the words again. "words changed in the old wait's rest" must be 0; the first 16 are
+  logged as errors. Both waits are timed: "lean ... ms/s" against "old wait ... ms/s" is the
+  saving 1 gives, measured in one session.
+
+"Report waits (FRITCHII_REPORT_WAIT=n)" (HW_GPU, Info): every 10 s, and at the first wait after
+the switch changes (so profile_toggle windows hold one value each), when there were waits:
+waits/s, ms/s, us each, longest, lean waits/s; with 2 the verify numbers. Every value times its
+waits (two clock reads a wait, ~30 a second), so 0 and 1 windows compare directly.
+
+Risk to watch: the #215 family (white flashes on leaves and walls, a read that returned before
+its report landed). Verify first; the flash watch in the 1 windows.
+
 ### FRITCHII_ACQUIRE_MET_BY (the "Acquire resumes met by" line)
 
 FRITCHII_ACQUIRE_MET_BY (live, default 0 since 2026-11-14 = one relaxed load per resume; 1 = the
