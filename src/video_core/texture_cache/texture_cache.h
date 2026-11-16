@@ -31,6 +31,7 @@
 #include "video_core/buffer_cache/mem_read_log.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dirty_flags.h"
+#include "video_core/early_compute.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
@@ -8111,6 +8112,19 @@ void TextureCache<P>::CountGpuModified(ImageBase& image) noexcept {
 }
 
 template <class P>
+bool TextureCache<P>::EarlyImageWritePending(ImageViewId id) noexcept {
+    if constexpr (requires { runtime.IsFree(u64{}); }) {
+        const ImageViewBase& view = slot_image_views[id];
+        if (!view.image_id) {
+            return false;
+        }
+        const ImageBase& image = slot_images[view.image_id];
+        return image.early_write_tick != 0 && !runtime.IsFree(image.early_write_tick);
+    }
+    return false;
+}
+
+template <class P>
 void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
     image.flags |= ImageFlagBits::GpuModified;
     CountGpuModified(image); // EXP100
@@ -8118,6 +8132,11 @@ void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
     image.nx2_content_hash_lo = 0;
     image.nx2_content_hash_hi = 0;
     image.modification_tick = ++modification_tick;
+    if constexpr (requires { runtime.CurrentTick(); }) {
+        if (VideoCommon::EarlyCompute::g_early) [[unlikely]] {
+            image.early_write_tick = runtime.CurrentTick();
+        }
+    }
     const u64 render_frame = RenderFrame();
     image.write_streak = NextWriteStreak(image.last_write_frame, image.write_streak, render_frame);
     image.last_write_frame = render_frame;

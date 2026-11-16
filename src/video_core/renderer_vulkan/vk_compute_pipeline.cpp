@@ -25,6 +25,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
+#include "video_core/early_compute.h"
 #include "video_core/memstage_stats.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_profile.h"
@@ -621,6 +622,21 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     }
     texture_cache.FillImageViews(std::span(views.data(), views.size()), true);
     views_scope.reset();
+    // FRITCHII_EARLY_COMPUTE (dry): a feeder's sampled and storage images, and whether one has a
+    // GPU write the host GPU has not run (the buffers are judged where they are bound).
+    if (VideoCommon::EarlyCompute::g_early &&
+        VideoCommon::EarlyCompute::IsFeeder(shader_hash)) [[unlikely]] {
+        const size_t first_image = Shader::NumDescriptors(info.texture_buffer_descriptors) +
+                                   Shader::NumDescriptors(info.image_buffer_descriptors);
+        bool pending = false;
+        for (size_t i = first_image; i < views.size() && !pending; ++i) {
+            pending = texture_cache.EarlyImageWritePending(views[i].id);
+        }
+        const bool writes_images = std::ranges::any_of(
+            info.image_descriptors, [](const auto& desc) { return desc.is_written; });
+        VideoCommon::EarlyCompute::NoteImages(shader_hash, views.size() > first_image, pending,
+                                              writes_images);
+    }
     // Not for a ring-held dispatch (one follower): the trace reads the buffer cache, E's.
     if (auto& trace{GetUpscalerTrace()}; trace.enabled && kepler_compute.IsNativeMode() && !ring_held) {
         const u64 frame{trace.frame.load(std::memory_order_relaxed)};

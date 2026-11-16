@@ -968,6 +968,25 @@ void BufferCache<P>::RecordReadDownload(std::span<const std::pair<DAddr, u64>> r
             });
         }
         download.staging = staging;
+        // FRITCHII_READ_SIDE_COPY (dry): where the newest write over these bytes is.
+        if (EarlyCompute::g_side_copy) [[unlikely]] {
+            boost::container::small_vector<std::pair<DAddr, u64>, 8> copied;
+            for (const BufferCopy& copy : download.copies) {
+                copied.emplace_back(copy.src_offset, copy.size);
+            }
+            u64 stamp = 0;
+            if (!ReadRunStats::NewestMarkOver(copied, stamp)) {
+                EarlyCompute::NoteSideDownload(EarlyCompute::SideWriter::NoMark);
+            } else {
+                // Before the submit below: the current tick is the one it closes.
+                const auto ticks = runtime.ReadWriterTicks(stamp);
+                download.side_eligible = ticks.write < ticks.current;
+                download.side_tick = ticks.write;
+                EarlyCompute::NoteSideDownload(download.side_eligible
+                                                   ? EarlyCompute::SideWriter::Submitted
+                                                   : EarlyCompute::SideWriter::Open);
+            }
+        }
         // Submitted now, not waited for: the reading thread waits (FinishReadDownloads).
         download.tick = runtime.SubmitForHostRead();
         read_downloads.push_back(std::move(download));
@@ -985,9 +1004,13 @@ std::optional<u64> BufferCache<P>::FinishReadDownloads(DAddr device_addr, u64 si
         std::unique_lock lock{mutex};
         // The newest one over the range: those before it are written first.
         std::optional<u64> tick;
+        bool side_eligible = false;
+        u64 side_tick = 0;
         for (const ReadDownload& download : read_downloads) {
             if (download.write_ranges.Intersects(device_addr, size)) {
                 tick = download.tick;
+                side_eligible = download.side_eligible;
+                side_tick = download.side_tick;
             }
         }
         if (!tick) {
@@ -999,8 +1022,17 @@ std::optional<u64> BufferCache<P>::FinishReadDownloads(DAddr device_addr, u64 si
             const u64 wait_start = VideoCore::AsyncReadback::Now();
             // FRITCHII_READ_RUNS=2 (counter only): the reader's wait, first until its writer's
             // submission ran. The "on the host GPU" figure keeps both parts.
+            // FRITCHII_READ_SIDE_COPY (dry): an eligible download's wait is cut at the newest
+            // write over all its bytes instead (RecordReadDownload), the side copy's own wait.
             u64 writer_ns = 0;
-            if (ReadRunStats::g_writer_ticks && VideoCore::AsyncReadback::t_reading) [[unlikely]] {
+            const bool side_cut = side_eligible && EarlyCompute::g_side_copy &&
+                                  VideoCore::AsyncReadback::t_reading;
+            if (side_cut) [[unlikely]] {
+                writer_ns = WaitReadWriter(side_tick);
+                VideoCore::AsyncReadback::Add(VideoCore::AsyncReadback::g_counters.on_card_ns,
+                                              writer_ns);
+            } else if (ReadRunStats::g_writer_ticks && VideoCore::AsyncReadback::t_reading)
+                [[unlikely]] {
                 writer_ns = WaitReadWriter();
                 VideoCore::AsyncReadback::Add(VideoCore::AsyncReadback::g_counters.on_card_ns,
                                               writer_ns);
@@ -1011,6 +1043,10 @@ std::optional<u64> BufferCache<P>::FinishReadDownloads(DAddr device_addr, u64 si
             if (ReadRunStats::t_writer_answer.cut) [[unlikely]] {
                 ReadRunStats::t_writer_answer.rest_wait_ns =
                     waited > writer_ns ? waited - writer_ns : 0;
+                if (side_cut) {
+                    EarlyCompute::NoteSideCut(writer_ns,
+                                              ReadRunStats::t_writer_answer.rest_wait_ns);
+                }
             }
             lock.lock();
         }
@@ -1722,6 +1758,16 @@ void BufferCache<P>::BindHostComputeBuffers() {
     if (ReadRunStats::g_enabled) [[unlikely]] {
         ReadRunStats::g_dispatches.fetch_add(1, std::memory_order_relaxed);
     }
+    // FRITCHII_EARLY_COMPUTE (dry): could this feeder dispatch run at once on a second queue?
+    // Judged before its own binds; its write marks carry the verdict to the reads.
+    if constexpr (!IS_OPENGL) {
+        if (EarlyCompute::g_early && EarlyCompute::IsFeeder(compute_shader_hash)) [[unlikely]] {
+            JudgeEarlyCompute();
+        }
+    }
+    SCOPE_EXIT {
+        EarlyCompute::t_verdict = EarlyCompute::Verdict::NotJudged;
+    };
     BindHostComputeUniformBuffers();
     if (channel_state->enabled_compute_storage_buffers != 0) {
         BindHostComputeStorageBuffers();
@@ -1729,9 +1775,68 @@ void BufferCache<P>::BindHostComputeBuffers() {
     if (channel_state->enabled_compute_texture_buffers != 0) {
         BindHostComputeTextureBuffers();
     }
+    if (EarlyCompute::t_verdict != EarlyCompute::Verdict::NotJudged) [[unlikely]] {
+        EarlyCompute::NoteJudged(EarlyCompute::t_verdict, any_buffer_uploaded);
+    }
     if (any_buffer_uploaded) {
         runtime.PostCopyBarrier();
         any_buffer_uploaded = false;
+    }
+}
+
+template <class P>
+void BufferCache<P>::JudgeEarlyCompute() {
+    if constexpr (!IS_OPENGL) {
+        // Every bound range, and those the dispatch writes.
+        boost::container::small_vector<std::pair<DAddr, DAddr>, 24> bound;
+        boost::container::small_vector<std::pair<DAddr, DAddr>, 8> written;
+        const auto add = [&](const Binding& binding, bool is_written) {
+            if (binding.segment_count != 0) {
+                for (u32 i = 0; i < binding.segment_count &&
+                                binding.segment_first + i < compute_segments.size();
+                     ++i) {
+                    const MultiRangeSegment& segment = compute_segments[binding.segment_first + i];
+                    bound.emplace_back(segment.device_addr, segment.device_addr + segment.size);
+                    if (is_written) {
+                        written.emplace_back(segment.device_addr,
+                                             segment.device_addr + segment.size);
+                    }
+                }
+                return;
+            }
+            if (binding.size == 0 || binding.device_addr == 0) {
+                return;
+            }
+            bound.emplace_back(binding.device_addr, binding.device_addr + binding.size);
+            if (is_written) {
+                written.emplace_back(binding.device_addr, binding.device_addr + binding.size);
+            }
+        };
+        ForEachEnabledBit(channel_state->enabled_compute_uniform_buffer_mask, [&](u32 index) {
+            add(channel_state->compute_uniform_buffers[index], false);
+        });
+        ForEachEnabledBit(channel_state->enabled_compute_storage_buffers, [&](u32 index) {
+            add(channel_state->compute_storage_buffers[index],
+                ((channel_state->written_compute_storage_buffers >> index) & 1) != 0);
+        });
+        ForEachEnabledBit(channel_state->enabled_compute_texture_buffers, [&](u32 index) {
+            add(channel_state->compute_texture_buffers[index],
+                ((channel_state->written_compute_texture_buffers >> index) & 1) != 0);
+        });
+        (void)runtime.ReadWriterTicks(0); // refreshes the host GPU's known tick
+        const auto is_free = [this](u64 stamp) { return runtime.IsFree(stamp); };
+        EarlyCompute::Verdict verdict = EarlyCompute::Verdict::Qualifies;
+        if (ReadRunStats::AnyPendingMark(bound, is_free)) {
+            verdict = EarlyCompute::Verdict::PendingWrite;
+        } else {
+            for (const auto& [begin, end] : written) {
+                if (EarlyCompute::PendingUse(begin, end, is_free)) {
+                    verdict = EarlyCompute::Verdict::PendingUse;
+                    break;
+                }
+            }
+        }
+        EarlyCompute::t_verdict = verdict;
     }
 }
 
