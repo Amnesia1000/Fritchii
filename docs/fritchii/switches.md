@@ -291,6 +291,11 @@ Layers drawn once or now and then, depth-only passes and draws without a depth t
 10 s "Async discard" line counts these skips ("N of them into redrawn targets"); they stay in the
 persistent skipped column too. Only matters with unbuilt pipelines: a warm shader cache sees few.
 
+On by default on AMD's Windows driver (helper BM, 2026-11-16): there a pipeline missing from the
+driver's cache takes 0.2-1.1 s to compile, and an RX 7900 XT session held 76 s of draws for unbuilt
+pipelines, a ~1 s freeze whenever something new showed up (tester log t1858). The boot log says so
+once; FRITCHII_ASYNC_REDRAWN=0 waits as before. Other GPUs keep 0.
+
 ### FRITCHII_OCCLUSION_VISIBLE
 
 TEST, off by default (helper AN, 2026-11-15, idea from DahBard's Blitchii LICHII_FAKE_OCCLUSION);

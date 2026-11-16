@@ -684,6 +684,9 @@ void LogDriverCacheFolder(const Device& device, std::string_view when) {
     u64 files = 0;
     u64 bytes = 0;
     std::filesystem::file_time_type newest{};
+    // The three biggest files: AMD keeps each program's pipelines in its own archive (.parc), so
+    // the emulator's one shows whether the preparation (gigabytes) is in there at all.
+    std::array<std::pair<u64, std::filesystem::path>, 3> biggest{};
     for (std::filesystem::recursive_directory_iterator it{folder, ec}, end; !ec && it != end;
          it.increment(ec)) {
         std::error_code entry_ec;
@@ -691,15 +694,29 @@ void LogDriverCacheFolder(const Device& device, std::string_view when) {
             continue;
         }
         ++files;
-        bytes += it->file_size(entry_ec);
+        const u64 size = it->file_size(entry_ec);
+        bytes += size;
         newest = (std::max)(newest, it->last_write_time(entry_ec));
+        if (size > biggest.back().first) {
+            biggest.back() = {size, it->path().filename()};
+            std::ranges::sort(biggest, std::greater{}, &std::pair<u64, std::filesystem::path>::first);
+        }
+    }
+    std::string largest;
+    for (const auto& [size, name] : biggest) {
+        if (size != 0) {
+            largest += fmt::format("{}{} {} MiB", largest.empty() ? "" : ", ", name.string(),
+                                   size >> 20);
+        }
     }
     const auto age = std::chrono::duration_cast<std::chrono::seconds>(
         std::filesystem::file_time_type::clock::now() - newest);
     const char* const amd_path = std::getenv("AMD_VK_PIPELINE_CACHE_PATH");
     LOG_INFO(Render_Vulkan,
-             "Driver cache folder {} ({}): {} files, {} MiB, newest written {} s ago{}{}",
+             "Driver cache folder {} ({}): {} files, {} MiB, newest written {} s ago; biggest: "
+             "{}{}{}",
              folder.string(), when, files, bytes >> 20, files != 0 ? age.count() : -1,
+             largest.empty() ? "none" : largest,
              amd_path != nullptr ? "; AMD_VK_PIPELINE_CACHE_PATH=" : "",
              amd_path != nullptr ? amd_path : "");
 #endif
@@ -5840,6 +5857,39 @@ void PipelineCache::CheckPrecompiledBuilds() {
     }
 }
 
+void PipelineCache::ReportKeptDriverCompiles() {
+    // Every prepared pipeline should be a driver cache hit (a few ms). Ones the driver compiles
+    // again mean its cache lost or never kept the preparation: on an RX 7900 XT 60%+ of them took
+    // 0.2-1.1 s and draws waiting for them froze the game for a second (tester log t1858), while
+    // the driver's cache folder never got near the preparation's size.
+    const auto taken = GraphicsPipeline::TakeKeptBuildStats();
+    if (taken.builds == 0) {
+        return;
+    }
+    kept_compiles_session.builds += taken.builds;
+    kept_compiles_session.slow += taken.slow;
+    const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
+    LOG_INFO(Render_Vulkan,
+             "Driver compiles of prepared pipelines in the last 10 s: {} built from kept SPIR-V, {} "
+             "took over {} ms (compiled again, not in the driver's cache) for {:.0f} ms, longest "
+             "{:.0f} ms; this session {} of {} compiled again",
+             taken.builds, taken.slow, GraphicsPipeline::KeptBuildSlow.count(), ms(taken.slow_time),
+             ms(taken.longest), kept_compiles_session.slow, kept_compiles_session.builds);
+    if (!kept_compiles_session.warned && kept_compiles_session.builds >= 100 &&
+        kept_compiles_session.slow * 2 >= kept_compiles_session.builds) {
+        kept_compiles_session.warned = true;
+        LOG_WARNING(Render_Vulkan,
+                    "The driver's cache does not hold the precompiled pipelines: {} of {} prepared "
+                    "pipelines were compiled again, each a stall where a draw waits for it. {}",
+                    kept_compiles_session.slow, kept_compiles_session.builds,
+                    device.GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY
+                        ? "AMD: check Adrenalin > Gaming > Graphics > Shader Cache is on (not Off) "
+                          "and never use Reset Shader Cache; the folder sizes in the Driver cache "
+                          "folder lines show what the driver kept"
+                        : "NVIDIA: set Shader Cache Size to Unlimited in the NVIDIA Control Panel");
+    }
+}
+
 void PipelineCache::ReportPrecompiled() {
     if (PrecompiledFastMode() == 0) {
         return;
@@ -5857,6 +5907,7 @@ void PipelineCache::ReportPrecompiled() {
     const u64 bytes_total = PrecompiledKept::BytesRead().load(std::memory_order_relaxed);
     const u64 bytes = bytes_total - stats.bytes_at_window;
     const u32 built = precompiled_worker_builds.exchange(0, std::memory_order_relaxed);
+    ReportKeptDriverCompiles();
     if (stats.graphics + stats.compute + stats.failed + stats.not_precompiled + built != 0 ||
         !stats.misses.empty()) {
         const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
@@ -6663,6 +6714,21 @@ bool IsDepthTestedColorDraw(const Maxwell& regs) noexcept {
 }
 } // Anonymous namespace
 
+int PipelineCache::AsyncRedrawnDefault() const {
+    // FRITCHII_ASYNC_REDRAWN's value when unset: 1 on AMD's Windows driver (see DrawMayBeSkipped).
+    static const int value = [this] {
+        const bool amd = device.GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY;
+        if (amd && std::getenv("FRITCHII_ASYNC_REDRAWN") == nullptr) {
+            LOG_INFO(Render_Vulkan, "FRITCHII_ASYNC_REDRAWN=1 by default on AMD's driver: new "
+                                    "objects drawn into the scene skip a frame or more while "
+                                    "their pipeline compiles instead of freezing the game "
+                                    "(FRITCHII_ASYNC_REDRAWN=0 waits)");
+        }
+        return amd ? 1 : 0;
+    }();
+    return value;
+}
+
 bool PipelineCache::DrawMayBeSkipped() const {
     // Native draws whose pipeline is still building are skipped instead of waited for (the
     // object is missing for a frame or more rather than the game freezing while the driver
@@ -6695,10 +6761,15 @@ bool PipelineCache::DrawMayBeSkipped() const {
     // too. Before, each new object or effect drawn there waited for its pipeline: a stall in
     // Hyrule Field and on the first hit on a new enemy. Layers drawn once or now and then,
     // depth-only passes and draws without a depth test still wait.
+    //
+    // On by default on AMD's Windows driver: there a pipeline the driver cache lacks takes
+    // 0.2-1.1 s to compile (NVIDIA: tens of ms), and an RX 7900 XT session held 76 s of draws
+    // for unbuilt pipelines, the game freezing ~1 s whenever something new showed up (tester
+    // log t1858). The object is missing for that time instead. FRITCHII_ASYNC_REDRAWN=0 waits.
     bool redrawn = false;
     if (!recurring && targets.kind_if_redrawn == VideoCommon::DrawTargetClass::Recurring &&
         VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_async_redrawn,
-                                         "FRITCHII_ASYNC_REDRAWN") > 0 &&
+                                         "FRITCHII_ASYNC_REDRAWN", AsyncRedrawnDefault()) > 0 &&
         IsDepthTestedColorDraw(maxwell3d->regs)) {
         recurring = true;
         redrawn = true;

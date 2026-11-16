@@ -336,6 +336,8 @@ private:
     /// EDEN_NX2_ASYNC_DISCARD=2 only into recurring render targets). The one test BuiltPipeline
     /// and the translate queue both ask, answered once per lookup.
     [[nodiscard]] bool DrawMayBeSkipped() const;
+    /// FRITCHII_ASYNC_REDRAWN when unset: 1 on AMD's Windows driver, else 0.
+    [[nodiscard]] int AsyncRedrawnDefault() const;
     /// Counts CurrentGraphicsPipeline calls, so DrawMayBeSkipped classifies the targets once per
     /// lookup however often a lookup asks.
     u64 lookup_serial{};
@@ -443,6 +445,13 @@ private:
     void CheckPrecompiledBuilds();
     /// TickFrame: the fast path's counts of the last 10 s.
     void ReportPrecompiled();
+    /// ReportPrecompiled: how many prepared pipelines the driver compiled again (cache misses).
+    void ReportKeptDriverCompiles();
+    struct {
+        u64 builds{};
+        u64 slow{};
+        bool warned{};
+    } kept_compiles_session;
     /// Publishes the kept file's index for the GPU thread (`kept`, or a finished `part` the
     /// preparation could not rename over it); false when there is none for `stamp`. With
     /// `check` (a file another build may have written) it is published only when

@@ -272,7 +272,7 @@ inline std::atomic<int> g_store_memo{-1};
 inline std::atomic<int> g_write_remark{-1};
 /// FRITCHII_JIT_HOT_PACK: docs/fritchii/switches.md.
 inline std::atomic<int> g_jit_hot_pack{-1};
-/// FRITCHII_ASYNC_REDRAWN (live, default 0): docs/fritchii/switches.md.
+/// FRITCHII_ASYNC_REDRAWN (live, default 0, 1 on AMD's Windows driver): docs/fritchii/switches.md.
 inline std::atomic<int> g_async_redrawn{-1};
 /// FRITCHII_OCCLUSION_VISIBLE (live, default 0): docs/fritchii/switches.md.
 inline std::atomic<int> g_occlusion_visible{-1};
