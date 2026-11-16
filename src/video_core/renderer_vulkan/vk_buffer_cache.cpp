@@ -23,6 +23,7 @@
 #include "video_core/renderer_vulkan/vertex_repack.h"
 
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
+#include "video_core/early_compute.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
@@ -133,6 +134,10 @@ Buffer::Buffer(BufferCacheRuntime& runtime, DAddr cpu_addr_, u64 size_bytes_,
 void Buffer::MarkUsage(u64 offset, u64 size) noexcept {
     tracker.Track(offset, size);
     last_usage_tick = clock->Now();
+    // FRITCHII_EARLY_COMPUTE (dry): every use, for the write-after-read test.
+    if (VideoCommon::EarlyCompute::g_early) [[unlikely]] {
+        VideoCommon::EarlyCompute::NoteUse(CpuAddr() + offset, size, last_usage_tick);
+    }
 }
 
 VkBufferView Buffer::View(u32 offset, u32 size, VideoCore::Surface::PixelFormat format) {

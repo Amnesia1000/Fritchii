@@ -5650,7 +5650,34 @@ at the writer's tick: the reader first waits for the writer's submission alone (
 submitted; no flush is asked for), then the rest as before. Same timeline, so the wait's total is
 unchanged; "then until the download was there" is what a copy ordered right after the writer
 (async kind) or a faster landing (fence kind) could save. The EXP49 "on the host GPU" figure
-keeps both parts. One semaphore refresh more per read.
+keeps both parts. One semaphore refresh more per read. FRITCHII_READ_RUNS (and the two switches
+below) are read at their first test, so nx2_switches.txt sets them (before, only a real
+environment variable did: the static initializer ran before main() applied the file).
+
+### FRITCHII_EARLY_COMPUTE
+
+FRITCHII_EARLY_COMPUTE=1 (read at first use, dry count, default 0; early_compute.h,
+helper_cu_answer.md Round 2): turns FRITCHII_READ_RUNS=2 on and asks, for every dispatch of a
+program whose writes the guest reads back (learned from the reads' writers), whether it could run
+at once on a second queue: its bound buffer ranges (uniform, storage with multi-range segments,
+texture buffers; BufferCache::JudgeEarlyCompute before its own binds) have no unrun GPU write
+mark over them (RAW, WAW) and the ranges it writes have no unrun use (WAR; every
+Buffer::MarkUsage goes into a 65,536-entry use ring). Its write marks keep the verdict; each
+read of those bytes adds its "until the writer ran" time to the saving of its writer's verdict.
+Images are judged in ComputePipeline::Configure (the back or R): a sampled or storage image whose
+last GPU write (TextureCache::MarkModification's scheduler tick) is not run. Lines every 600
+frames: "Early compute" (verdicts, images, reads by verdict, predicted saving in ms a frame) and
+up to 6 "Early compute feeder" lines. 2 (verify) and 3 (on) are designed, not built: they count
+as 1. Off: a relaxed load at each bind and buffer use.
+
+### FRITCHII_READ_SIDE_COPY
+
+FRITCHII_READ_SIDE_COPY=1 (read at first use, dry count, default 0): turns FRITCHII_READ_RUNS=2
+on; at each new read download (EXP49 RecordReadDownload) the newest write mark over all the
+copied bytes gives that write's scheduler tick: eligible when it is already submitted (a copy on
+a second queue could wait for it alone), else in the chunk the download closes (today's path is
+as good). An eligible download's reader wait is cut at that tick; the part after it is the
+saving. "Read side copy" line every 600 frames. 2 (verify) and 3 (on) are designed, not built.
 
 The GPU-written ranges are what the cache marks: for a dispatch or draw that is the bound
 writable buffer range (cut only by the native store bound, or by EDEN_NX2_WRITTEN_SSBO_MARK_KIB,

@@ -150,6 +150,8 @@ struct ImageBase {
     VAddr cpu_addr_end = 0;
 
     u64 modification_tick = 0;
+    /// FRITCHII_EARLY_COMPUTE (dry): the scheduler tick of its last GPU write (MarkModification).
+    u64 early_write_tick = 0;
     size_t lru_index = SIZE_MAX;
     /// The frame tick of the last LRU touch (TextureCache::TouchImageLru, EDEN_NX2_EXP90); reset
     /// when the image gets a new LRU node.

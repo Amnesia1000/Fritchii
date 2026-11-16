@@ -462,6 +462,10 @@ public:
 
     [[nodiscard]] bool IsRescaling(const ImageViewBase& image_view) const noexcept;
 
+    /// FRITCHII_EARLY_COMPUTE (dry): whether the view's image has a GPU write the host GPU has
+    /// not run yet (its MarkModification tick; with the switch on only).
+    [[nodiscard]] bool EarlyImageWritePending(ImageViewId id) noexcept;
+
     /// Create channel state.
     void CreateChannel(Tegra::Control::ChannelState& channel) final override;
 

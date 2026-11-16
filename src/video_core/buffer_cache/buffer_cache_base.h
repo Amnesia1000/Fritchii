@@ -393,6 +393,9 @@ public:
 
     void BindHostComputeBuffers();
 
+    /// FRITCHII_EARLY_COMPUTE (dry): sets EarlyCompute::t_verdict for the dispatch being bound.
+    void JudgeEarlyCompute();
+
     void SetUniformBuffersState(const std::array<u32, NUM_STAGES>& mask,
                                 const UniformBufferSizes* sizes);
 
@@ -1619,14 +1622,15 @@ public:
     /// the submission of the newest write over the read's pages (GetFlushArea found it) and
     /// returns how long. The read's own wait follows on the same timeline, so the total is
     /// unchanged. Only a submitted tick is waited for (no flush is asked for here); 0 = no cut.
-    u64 WaitReadWriter() {
+    /// `side_tick` (FRITCHII_READ_SIDE_COPY): this scheduler tick instead of the area mark's.
+    u64 WaitReadWriter(std::optional<u64> side_tick = std::nullopt) {
         if constexpr (!IS_OPENGL) {
             ReadRunStats::WriterAnswer& a = ReadRunStats::t_writer_answer;
-            if (!ReadRunStats::g_writer_ticks || !a.area_found || a.cut) {
+            if (!ReadRunStats::g_writer_ticks || a.cut || (!side_tick && !a.area_found)) {
                 return 0;
             }
             const u64 start = ReadRunStats::NowNs();
-            if (!runtime.WaitTickIfSubmitted(a.write_tick)) {
+            if (!runtime.WaitTickIfSubmitted(side_tick ? *side_tick : a.write_tick)) {
                 return 0;
             }
             a.cut = true;
@@ -1688,6 +1692,10 @@ private:
         /// No longer GPU-modified once written: a newer GPU write (OutdateReadDownloads) or value
         /// in guest memory takes its bytes out.
         Common::RangeSet<DAddr> clean_ranges;
+        /// FRITCHII_READ_SIDE_COPY (dry): the newest write over the copied bytes was in an
+        /// already submitted scheduler tick, `side_tick`: a side copy could wait for it alone.
+        bool side_eligible{};
+        u64 side_tick{};
     };
     /// Oldest first, and written to guest memory in that order: none lands over newer bytes.
     std::deque<ReadDownload> read_downloads;

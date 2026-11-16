@@ -20,6 +20,7 @@
 
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "video_core/early_compute.h"
 
 // FRITCHII_READ_RUNS=1 (diagnostic, read once; fable52_answer_fountain 4): the guest reads of
 // GPU-written memory that go to the back or wait for a download (GPU::OnCPURead past its
@@ -44,16 +45,44 @@
 // then the rest. Same timeline, so the total wait is what it was; only the cut is new.
 namespace VideoCommon::ReadRunStats {
 
-inline const bool g_enabled = [] {
+/// A boot switch read at its first test, not by a static initializer: those run before main()
+/// applies nx2_switches.txt, so the file's value was never seen (only a real environment
+/// variable was). Constant-initialized; the first tests may race, they read the same value.
+class FirstUseSwitch {
+public:
+    using Reader = bool (*)();
+    constexpr explicit FirstUseSwitch(Reader reader_) noexcept : reader{reader_} {}
+
+    operator bool() const noexcept {
+        int value = state.load(std::memory_order_relaxed);
+        if (value < 0) [[unlikely]] {
+            value = reader() ? 1 : 0;
+            state.store(value, std::memory_order_relaxed);
+        }
+        return value != 0;
+    }
+
+private:
+    Reader reader;
+    mutable std::atomic<int> state{-1};
+};
+
+inline bool ReadRunsValue(bool writer_ticks) {
+    // FRITCHII_EARLY_COMPUTE and FRITCHII_READ_SIDE_COPY count on this ring and its stamps.
+    if (EarlyCompute::g_early || EarlyCompute::g_side_copy) {
+        return true;
+    }
     const char* value = std::getenv("FRITCHII_READ_RUNS");
-    return value != nullptr && value[0] != '\0' && value[0] != '0';
-}();
+    if (value == nullptr || value[0] == '\0' || value[0] == '0') {
+        return false;
+    }
+    return !writer_ticks || value[0] == '2';
+}
+
+inline FirstUseSwitch g_enabled{[] { return ReadRunsValue(false); }};
 
 /// FRITCHII_READ_RUNS=2: the write marks carry their stamp and reads cut their host waits there.
-inline const bool g_writer_ticks = [] {
-    const char* value = std::getenv("FRITCHII_READ_RUNS");
-    return value != nullptr && value[0] == '2';
-}();
+inline FirstUseSwitch g_writer_ticks{[] { return ReadRunsValue(true); }};
 
 /// Pages the run is counted up to (one more than the histogram's last bucket).
 inline constexpr u64 RunCountPages = 65;
@@ -159,6 +188,8 @@ struct WriteMark {
     u64 dispatch{}; ///< g_dispatches when it was made
     u64 stamp{};    ///< the buffer cache's clock stamp then (g_writer_ticks, else 0)
     Writer writer{};
+    /// FRITCHII_EARLY_COMPUTE: the writing dispatch's buffer verdict at its bind
+    EarlyCompute::Verdict verdict{EarlyCompute::Verdict::NotJudged};
 };
 
 /// Marks kept (the "Read writers" line says how many a frame, so how many frames this covers).
@@ -202,7 +233,8 @@ inline void NoteWrite(u64 begin, u64 size, u64 stamp = 0) {
                          .time_ns = NowNs(),
                          .dispatch = g_dispatches.load(std::memory_order_relaxed),
                          .stamp = stamp,
-                         .writer = t_writer};
+                         .writer = t_writer,
+                         .verdict = EarlyCompute::t_verdict};
     const bool compute = mark.writer.kind == WriterKind::ComputeStorage ||
                          mark.writer.kind == WriterKind::ComputeTexture;
     Ring& r = GetRing();
@@ -253,6 +285,47 @@ struct WriterAnswer {
     u64 rest_wait_ns{};   ///< then until the read's download (or fence download) was there
 };
 inline thread_local WriterAnswer t_writer_answer{};
+
+/// FRITCHII_EARLY_COMPUTE: whether an unrun write mark overlaps one of `ranges` ({begin, end}),
+/// newest first, stopping at the first run one (stamps grow with the ring, near enough for a
+/// count). `is_free(stamp)`: the buffer cache clock's test.
+template <typename Ranges, typename IsFree>
+[[nodiscard]] bool AnyPendingMark(const Ranges& ranges, IsFree&& is_free) {
+    Ring& r = GetRing();
+    std::scoped_lock lock{r.mutex};
+    const u64 n = (std::min<u64>)(r.count, RingSize);
+    for (u64 i = 0; i < n; ++i) {
+        const WriteMark& mark = r.marks[(r.count - 1 - i) % RingSize];
+        if (is_free(mark.stamp)) {
+            return false;
+        }
+        for (const auto& [begin, end] : ranges) {
+            if (mark.begin < end && begin < mark.end) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// FRITCHII_READ_SIDE_COPY: the stamp of the newest write mark over any of `ranges`
+/// ({begin, size}); false when none is in the ring.
+template <typename Ranges>
+[[nodiscard]] bool NewestMarkOver(const Ranges& ranges, u64& stamp) {
+    Ring& r = GetRing();
+    std::scoped_lock lock{r.mutex};
+    const u64 n = (std::min<u64>)(r.count, RingSize);
+    for (u64 i = 0; i < n; ++i) {
+        const WriteMark& mark = r.marks[(r.count - 1 - i) % RingSize];
+        for (const auto& [begin, size] : ranges) {
+            if (mark.begin < begin + size && begin < mark.end) {
+                stamp = mark.stamp;
+                return true;
+            }
+        }
+    }
+    return false;
+}
 
 /// GetFlushArea: the newest mark over [address, address + size), else note one on its pages.
 inline void FindWriter(u64 address, u64 size, u64 page_begin, u64 page_end) {
@@ -475,6 +548,16 @@ inline void NoteWriter(Kind kind, u64 wait_ns, const WriterAnswer& a, const u8* 
     const bool compared = a.compared != 0 && after != nullptr;
     const bool differed = compared && std::memcmp(a.before.data(), after, a.compared) != 0;
     const u64 age_ns = a.found && a.read_ns > a.mark.time_ns ? a.read_ns - a.mark.time_ns : 0;
+    // FRITCHII_EARLY_COMPUTE: the programs whose writes are read back, and each read by its
+    // writer's verdict, with what running that writer early would have saved this read.
+    if (EarlyCompute::g_early && a.asked && a.area_found) [[unlikely]] {
+        if (a.area_mark.writer.kind == WriterKind::ComputeStorage ||
+            a.area_mark.writer.kind == WriterKind::ComputeTexture) {
+            EarlyCompute::LearnFeeder(a.area_mark.writer.program);
+        }
+        EarlyCompute::NoteRead(static_cast<size_t>(kind), a.area_mark.verdict, a.cut,
+                               a.writer_wait_ns);
+    }
     State& s = Get();
     std::scoped_lock lock{s.mutex};
     if (g_writer_ticks && a.asked) {
@@ -787,6 +870,9 @@ inline void Log(int run_flush_mode) {
     LogWriters(s, Frames);
     if (g_writer_ticks) {
         LogTicks(s, Frames);
+    }
+    if (EarlyCompute::g_early || EarlyCompute::g_side_copy) {
+        EarlyCompute::Log(Frames);
     }
     c = Counts{};
 }
