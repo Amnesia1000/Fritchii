@@ -7,6 +7,7 @@
 #include <psapi.h>
 // clang-format on
 #else
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/types.h>
 #if defined(__APPLE__) || defined(__FreeBSD__)
@@ -20,15 +21,18 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <stop_token>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -220,6 +224,29 @@ std::optional<u64> GetSystemCommitRoom() {
     return std::nullopt;
 }
 
+void* AllocateZeroPages(u64 bytes) {
+#ifdef _WIN32
+    return VirtualAlloc(nullptr, static_cast<SIZE_T>(bytes), MEM_RESERVE | MEM_COMMIT,
+                        PAGE_READWRITE);
+#else
+    void* const memory = mmap(nullptr, static_cast<size_t>(bytes), PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return memory == MAP_FAILED ? nullptr : memory;
+#endif
+}
+
+void FreeZeroPages(void* memory, u64 bytes) {
+    if (memory == nullptr) {
+        return;
+    }
+#ifdef _WIN32
+    static_cast<void>(bytes);
+    VirtualFree(memory, 0, MEM_RELEASE);
+#else
+    munmap(memory, static_cast<size_t>(bytes));
+#endif
+}
+
 // FRITCHII_MEM_CENSUS (memory_detect.h): who holds the working set. The "Memory owners" line left
 // ~3.7 GB of the private working set unattributed at the Castle Town market (2026-11-16); this
 // walks the address space instead of estimating.
@@ -234,6 +261,7 @@ struct TagEntry {
 std::mutex g_tag_mutex;
 std::vector<TagEntry> g_tags;             ///< Sorted by base
 std::function<std::string()> g_sampler;   ///< Under g_tag_mutex
+std::vector<std::pair<const char*, std::function<std::vector<u64>()>>> g_size_sources; ///< Same
 std::mutex g_thread_mutex;
 std::jthread g_thread;
 
@@ -260,6 +288,10 @@ struct Allocation {
 /// Everything a census found, the same on every host.
 struct Result {
     std::map<std::string, Amount> tagged;
+    std::map<std::string, Amount> matched; ///< SetSizeSource matches
+    std::vector<Allocation> big_blocks;    ///< Heap blocks with an allocation of their own
+    Amount crt_segments;                   ///< Further segments of the CRT heap
+    Amount other_segments;                 ///< Further segments of the other heaps
     std::vector<Allocation> images;
     std::vector<Allocation> mapped;
     std::vector<Allocation> exec;
@@ -361,6 +393,40 @@ std::string ProtectText(u32 protect) {
 #endif
 }
 
+/// SetSizeSource's sizes, in 64 KiB granules, taken one by one as allocations match them.
+struct SizeMatcher {
+    std::vector<std::pair<std::string, std::multiset<u64>>> sources;
+
+    static u64 Granules(u64 bytes) {
+        return (bytes + 0xffff) >> 16;
+    }
+    void Load() {
+        std::vector<std::pair<const char*, std::function<std::vector<u64>()>>> copy;
+        {
+            std::scoped_lock lock{g_tag_mutex};
+            copy = g_size_sources;
+        }
+        for (auto& [label, source] : copy) {
+            std::multiset<u64> sizes;
+            for (const u64 size : source()) {
+                sizes.insert(Granules(size));
+            }
+            sources.emplace_back(label, std::move(sizes));
+        }
+    }
+    /// The label of the source an allocation of `span` reserved bytes matches (taking that size).
+    const std::string* Take(u64 span) {
+        const u64 granules = Granules(span);
+        for (auto& [label, sizes] : sources) {
+            if (const auto it = sizes.find(granules); it != sizes.end()) {
+                sizes.erase(it);
+                return &label;
+            }
+        }
+        return nullptr;
+    }
+};
+
 #ifdef _WIN32
 std::string Utf8Of(const wchar_t* text) {
     const int length = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
@@ -397,6 +463,76 @@ std::vector<uintptr_t> WorkingSetPages() {
     }
     std::sort(pages.begin(), pages.end());
     return pages;
+}
+
+/// FRITCHII_MEM_CENSUS=4, once: the CRT heap's busy blocks by size, to tell owners apart by their
+/// block sizes (a hash map's nodes, a JIT table's entries, pipeline objects). HeapWalk under
+/// HeapLock: every thread that allocates waits for the whole walk (~0.3-1 s for ~3 GB). Nothing is
+/// allocated from the heap while it is locked: the tables are made before.
+std::string CrtHeapHistogram(HANDLE heap) {
+    constexpr size_t Slots = 8192; // exact sizes, open addressing
+    struct Slot {
+        u64 size{};
+        u64 count{};
+    };
+    std::vector<Slot> slots(Slots);
+    std::array<u64, 40> bucket_count{};
+    std::array<u64, 40> bucket_bytes{};
+    u64 blocks = 0;
+    u64 bytes = 0;
+    u64 overflow = 0;
+    const auto start = std::chrono::steady_clock::now();
+    if (!HeapLock(heap)) {
+        return "CRT heap walk: HeapLock failed";
+    }
+    PROCESS_HEAP_ENTRY entry{};
+    while (HeapWalk(heap, &entry)) {
+        if ((entry.wFlags & PROCESS_HEAP_ENTRY_BUSY) == 0) {
+            continue;
+        }
+        const u64 size = entry.cbData;
+        ++blocks;
+        bytes += size;
+        const size_t bucket = (std::min<size_t>)(size == 0 ? 0 : 64 - std::countl_zero(size), 39);
+        ++bucket_count[bucket];
+        bucket_bytes[bucket] += size;
+        size_t index = static_cast<size_t>((size * 0x9e3779b97f4a7c15ULL) >> 51) % Slots;
+        size_t probes = 0;
+        while (slots[index].count != 0 && slots[index].size != size && probes < 64) {
+            index = (index + 1) % Slots;
+            ++probes;
+        }
+        if (slots[index].count == 0 || slots[index].size == size) {
+            slots[index].size = size;
+            ++slots[index].count;
+        } else {
+            ++overflow;
+        }
+    }
+    HeapUnlock(heap);
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - start)
+                        .count();
+    std::string text = fmt::format("CRT heap walk ({} ms): {} busy blocks, {} MiB; by size "
+                                   "(blocks/MiB):",
+                                   ms, blocks, MiBOf(bytes));
+    for (size_t i = 0; i < bucket_count.size(); ++i) {
+        if (bucket_count[i] != 0) {
+            text += fmt::format(" <{} {}/{}", u64{1} << i, bucket_count[i], MiBOf(bucket_bytes[i]));
+        }
+    }
+    std::sort(slots.begin(), slots.end(), [](const Slot& a, const Slot& b) {
+        return a.size * a.count > b.size * b.count;
+    });
+    text += "; top exact sizes (bytes x blocks = MiB):";
+    for (size_t i = 0; i < 16 && slots[i].count != 0; ++i) {
+        text += fmt::format(" {}x{}={}", slots[i].size, slots[i].count,
+                            MiBOf(slots[i].size * slots[i].count));
+    }
+    if (overflow != 0) {
+        text += fmt::format(" ({} blocks of sizes not tabled)", overflow);
+    }
+    return text;
 }
 
 void Walk(int mode, Result& result) {
@@ -439,11 +575,15 @@ void Walk(int mode, Result& result) {
     }
     std::sort(heaps.begin(), heaps.end());
 
+    SizeMatcher matcher;
+    matcher.Load();
+
     struct Current {
         Allocation allocation;
         DWORD type{};
         bool exec{};
         bool guard{};
+        bool first_rw{}; ///< Its first page is committed read/write (a heap header can be read)
         u64 largest_region{};
     };
     Current current{};
@@ -497,6 +637,46 @@ void Walk(int mode, Result& result) {
             ++result.stacks.count;
             return;
         }
+        // Windows heaps keep their memory in allocations of their own past the first segment:
+        // further segments (the CRT heap's grow to 1 GiB reservations) start with a segment header
+        // (signature 0xffeeffee at +0x10, the heap at +0x28), and blocks over ~508 KiB get one
+        // each, starting with their size: CommitSize at +0x20, ReserveSize at +0x28 (x64 layout).
+        // Read with ReadProcessMemory: an allocation freed since the walk saw it fails the read
+        // instead of faulting.
+        if (current.first_rw) {
+            struct Header {
+                u64 words[6];
+            } header{};
+            SIZE_T read = 0;
+            if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(a.base),
+                                  &header, sizeof(header), &read) &&
+                read == sizeof(header)) {
+                const u32 signature = static_cast<u32>(header.words[2]);
+                const u64 heap = header.words[5];
+                if (signature == 0xffeeffee &&
+                    std::binary_search(heaps.begin(), heaps.end(), static_cast<uintptr_t>(heap))) {
+                    (heap == crt_heap ? result.crt_segments : result.other_segments)
+                        .Add(a.committed, a.resident);
+                    ++(heap == crt_heap ? result.crt_segments : result.other_segments).count;
+                    return;
+                }
+                const u64 commit = header.words[4];
+                const u64 reserve = header.words[5];
+                constexpr u64 Slack = 0x10000;
+                if (commit != 0 && commit <= reserve && reserve <= a.span + Slack &&
+                    reserve + Slack >= a.span && commit <= a.committed + Slack &&
+                    commit + Slack >= a.committed) {
+                    result.big_blocks.push_back(std::move(a));
+                    return;
+                }
+            }
+        }
+        if (const std::string* label = matcher.Take(a.span)) {
+            Amount& matched = result.matched[*label];
+            matched.Add(a.committed, a.resident);
+            ++matched.count;
+            return;
+        }
         Amount& bucket = result.buckets[BucketOf(a.span)];
         bucket.Add(a.committed, a.resident);
         ++bucket.count;
@@ -541,6 +721,10 @@ void Walk(int mode, Result& result) {
         if ((mbi.Protect & Executable) != 0) {
             current.exec = true;
         }
+        if (begin == allocation_base && (mbi.Protect & 0xff) == PAGE_READWRITE &&
+            (mbi.Protect & PAGE_GUARD) == 0) {
+            current.first_rw = true;
+        }
         if (mbi.RegionSize > current.largest_region) {
             current.largest_region = mbi.RegionSize;
             current.allocation.protect = mbi.Protect;
@@ -575,6 +759,11 @@ void Walk(int mode, Result& result) {
         for (size_t i = 0; i < rows.size() && i < 12; ++i) {
             result.heap_text += (i == 0 ? "" : ", ") + rows[i].second;
         }
+    }
+    static bool histogram_done = false;
+    if (mode == 4 && !histogram_done) {
+        histogram_done = true;
+        result.heap_text = CrtHeapHistogram(reinterpret_cast<HANDLE>(crt_heap));
     }
 }
 #elif defined(__linux__)
@@ -724,9 +913,17 @@ void Census(int mode, const char* reason) {
     const Amount mapped = Sum(result.mapped);
     const Amount exec = Sum(result.exec);
     const Amount other = Sum(result.other);
+    const Amount big_blocks = Sum(result.big_blocks);
     u64 attributed = images.resident + mapped.resident + exec.resident + other.resident +
-                     result.heaps.resident + result.stacks.resident;
+                     result.heaps.resident + result.stacks.resident + big_blocks.resident +
+                     result.crt_segments.resident + result.other_segments.resident;
     for (const auto& [name, amount] : result.tagged) {
+        attributed += amount.resident;
+    }
+    std::string matched;
+    for (const auto& [name, amount] : result.matched) {
+        matched += fmt::format("{}{} {}/{} ({})", matched.empty() ? "" : ", ", name,
+                               MiBOf(amount.committed), MiBOf(amount.resident), amount.count);
         attributed += amount.resident;
     }
     LOG_INFO(HW_Memory,
@@ -734,8 +931,9 @@ void Census(int mode, const char* reason) {
              "query {} ms, {} MiB of pages); working set {} MiB (peak {}), private {}, private "
              "commit {} (peak {}), reserved {} GiB; committed/resident MiB: {}; images {}/{} ({}); "
              "mapped other {}/{} ({}); exec private {}/{} ({} allocations); heaps {}/{} ({} first "
-             "segments, CRT {}/{}); stacks {}/{} ({}); other private {}/{} ({} allocations); "
-             "resident not in any of them {}",
+             "segments, CRT {}/{}); heap segments CRT {}/{} ({}), other heaps {}/{} ({}); heap "
+             "big blocks {}/{} ({}); size matches: {}; stacks {}/{} ({}); other private {}/{} ({} "
+             "allocations); resident not in any of them {}",
              reason, mode, result.regions, result.walk_ms, result.query_ms,
              MiBOf(result.ws_pages * 4096), MiBOf(usage.working_set),
              MiBOf(usage.peak_working_set), MiBOf(usage.private_working_set),
@@ -745,7 +943,11 @@ void Census(int mode, const char* reason) {
              mapped.count, MiBOf(exec.committed), MiBOf(exec.resident), exec.count,
              MiBOf(result.heaps.committed), MiBOf(result.heaps.resident), result.heaps.count,
              MiBOf(result.crt_heap.committed), MiBOf(result.crt_heap.resident),
-             MiBOf(result.stacks.committed), MiBOf(result.stacks.resident), result.stacks.count,
+             MiBOf(result.crt_segments.committed), MiBOf(result.crt_segments.resident),
+             result.crt_segments.count, MiBOf(result.other_segments.committed),
+             MiBOf(result.other_segments.resident), result.other_segments.count,
+             MiBOf(big_blocks.committed), MiBOf(big_blocks.resident), big_blocks.count,
+             matched.empty() ? "none" : matched, MiBOf(result.stacks.committed), MiBOf(result.stacks.resident), result.stacks.count,
              MiBOf(other.committed), MiBOf(other.resident), other.count,
              static_cast<s64>(result.ws_pages * 4096 - (std::min)(result.ws_pages * 4096, attributed)) >> 20);
     std::vector<Allocation> merged_images = MergeByName(result.images);
@@ -762,8 +964,9 @@ void Census(int mode, const char* reason) {
     }
     LOG_INFO(HW_Memory,
              "Memory census ({}) private: exec (JIT code caches, driver code) {}; other by "
-             "reservation size {}; largest other: {}",
-             reason, Top(result.exec, 10, true), buckets, Top(result.other, 10, true));
+             "reservation size {}; largest other: {}; largest heap big blocks: {}",
+             reason, Top(result.exec, 10, true), buckets, Top(result.other, 10, true),
+             Top(result.big_blocks, 8, true));
     std::string extra = Nx2Hitch::JitCompileCensus();
     std::function<std::string()> sampler;
     {
@@ -774,7 +977,7 @@ void Census(int mode, const char* reason) {
         extra += "; " + sampler();
     }
     if (!result.heap_text.empty()) {
-        extra += "; heaps committed/allocated MiB: " + result.heap_text;
+        extra += "; heaps (committed/allocated MiB, or the CRT heap walk): " + result.heap_text;
     }
     LOG_INFO(HW_Memory, "Memory census ({}) more: {}", reason, extra);
 }
@@ -867,6 +1070,16 @@ void Untag(const void* base) {
 void SetGuestSampler(std::function<std::string()> sampler) {
     std::scoped_lock lock{g_tag_mutex};
     g_sampler = std::move(sampler);
+}
+
+void SetSizeSource(const char* label, std::function<std::vector<u64>()> source) {
+    std::scoped_lock lock{g_tag_mutex};
+    std::erase_if(g_size_sources, [label](const auto& entry) {
+        return std::string_view{entry.first} == label;
+    });
+    if (source) {
+        g_size_sources.emplace_back(label, std::move(source));
+    }
 }
 
 void Start() {
