@@ -306,6 +306,19 @@ driver's cache takes 0.2-1.1 s to compile, and an RX 7900 XT session held 76 s o
 pipelines, a ~1 s freeze whenever something new showed up (tester log t1858). The boot log says so
 once; FRITCHII_ASYNC_REDRAWN=0 waits as before. Other GPUs keep 0.
 
+Also turns on by itself, on any driver, once the session shows the driver compiling prepared
+pipelines again (helper BV, 2026-11-16): a Linux NVIDIA tester (RTX 4070 SUPER, 615.71) saw ~650 of
+1,128 prepared builds take over 20 ms, up to 2.5 s, 18 s of draws held in one boot (log t0419). The
+rule, checked every 10 s with the "Driver compiles of prepared pipelines" line: 16 or more prepared
+pipelines over 20 ms that are a quarter or more of the prepared builds, or 3 or more over 250 ms.
+Where the driver cache holds the preparation (NVIDIA on Windows) prepared builds take 2-10 ms and it
+never triggers. Decided once per boot, no time limit. Log: "Prepared pipelines are compiled again by
+this driver (n so far, longest t ms): new objects pop in instead of waiting (FRITCHII_ASYNC_REDRAWN
+auto)". A value in the environment (nx2_switches.txt) or set live wins; storing -1 live gives it back
+to the default and the auto rule. Only prepared (kept SPIR-V) builds count now; runtime pipelines a
+worker emits are new to every driver and no longer mix into the count. Compute dispatches still wait
+for their pipeline (skipping one would lose its results).
+
 ### FRITCHII_OCCLUSION_VISIBLE
 
 TEST, off by default (helper AN, 2026-11-15, idea from DahBard's Blitchii LICHII_FAKE_OCCLUSION);

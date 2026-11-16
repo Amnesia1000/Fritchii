@@ -714,17 +714,20 @@ namespace {
 // only kept every pipeline the title ever built in host memory (title 1: a 245 MB file, ~0.35 GB
 // of RAM for the session) and copied it whole at each save, which stalled frames; pipelines built
 // no slower without it.
-/// The driver's own disk cache folder (NVIDIA's GLCache, AMD's VkCache) on Windows: files, size
-/// and the newest write, so a "shaders build again" report shows whether the driver kept what the
-/// preparation built (fable52_answer_3: an AMD player's cache kept ~44% and nothing after a
-/// restart). Logged at boot, after a preparation and at exit.
+/// The driver's own disk cache folder (NVIDIA's GLCache, AMD's VkCache on Windows; NVIDIA's
+/// GLCache on Linux): files, size and the newest write, so a "shaders build again" report shows
+/// whether the driver kept what the preparation built (fable52_answer_3: an AMD player's cache
+/// kept ~44% and nothing after a restart). Logged at boot, after a preparation and at exit.
 void LogDriverCacheFolder(const Device& device, std::string_view when) {
+#if defined(_WIN32) || defined(__linux__)
+    std::filesystem::path folder;
+    std::string settings;
 #ifdef _WIN32
     const char* const local = std::getenv("LOCALAPPDATA");
     if (local == nullptr) {
         return;
     }
-    std::filesystem::path folder{local};
+    folder = local;
     switch (device.GetDriverID()) {
     case VK_DRIVER_ID_NVIDIA_PROPRIETARY:
         folder /= "NVIDIA/GLCache";
@@ -735,9 +738,34 @@ void LogDriverCacheFolder(const Device& device, std::string_view when) {
     default:
         return;
     }
+#else
+    // NVIDIA on Linux: __GL_SHADER_DISK_CACHE_PATH, else $XDG_CACHE_HOME/nvidia/GLCache, else
+    // ~/.cache/nvidia/GLCache (the driver's README). An AppImage keeps the player's HOME and
+    // XDG_CACHE_HOME (unless a portable .home folder sits next to it), so the folder persists.
+    // The size and cleanup variables main() sets for Fritchii are logged with it: a Linux NVIDIA
+    // tester's driver compiled ~650 of 1,128 prepared pipelines again (log t0419).
+    if (device.GetDriverID() != VK_DRIVER_ID_NVIDIA_PROPRIETARY) {
+        return;
+    }
+    if (const char* const path = std::getenv("__GL_SHADER_DISK_CACHE_PATH")) {
+        folder = path;
+    } else if (const char* const xdg = std::getenv("XDG_CACHE_HOME"); xdg && *xdg == '/') {
+        folder = std::filesystem::path{xdg} / "nvidia/GLCache";
+    } else if (const char* const home = std::getenv("HOME")) {
+        folder = std::filesystem::path{home} / ".cache/nvidia/GLCache";
+    } else {
+        return;
+    }
+    for (const char* const name : {"__GL_SHADER_DISK_CACHE", "__GL_SHADER_DISK_CACHE_SIZE",
+                                   "__GL_SHADER_DISK_CACHE_SKIP_CLEANUP"}) {
+        const char* const value = std::getenv(name);
+        settings += fmt::format("; {}={}", name, value != nullptr ? value : "(unset)");
+    }
+#endif
     std::error_code ec;
     if (!std::filesystem::is_directory(folder, ec)) {
-        LOG_INFO(Render_Vulkan, "Driver cache folder {} ({}): not there", folder.string(), when);
+        LOG_INFO(Render_Vulkan, "Driver cache folder {} ({}): not there{}", folder.string(), when,
+                 settings);
         return;
     }
     u64 files = 0;
@@ -773,11 +801,11 @@ void LogDriverCacheFolder(const Device& device, std::string_view when) {
     const char* const amd_path = std::getenv("AMD_VK_PIPELINE_CACHE_PATH");
     LOG_INFO(Render_Vulkan,
              "Driver cache folder {} ({}): {} files, {} MiB, newest written {} s ago; biggest: "
-             "{}{}{}",
+             "{}{}{}{}",
              folder.string(), when, files, bytes >> 20, files != 0 ? age.count() : -1,
              largest.empty() ? "none" : largest,
              amd_path != nullptr ? "; AMD_VK_PIPELINE_CACHE_PATH=" : "",
-             amd_path != nullptr ? amd_path : "");
+             amd_path != nullptr ? amd_path : "", settings);
 #endif
 }
 
@@ -5746,6 +5774,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreatePrecompiledGraphicsPipeli
         };
     GraphicsPipeline::LibraryParams library_params{
         .library_cache = libraries ? &graphics_libraries : nullptr,
+        .prepared = true,
     };
     auto pipeline = std::make_unique<GraphicsPipeline>(
         scheduler, buffer_cache, texture_cache, PlayPipelineCache(), &shader_notify, device,
@@ -5931,6 +5960,8 @@ void PipelineCache::ReportKeptDriverCompiles() {
     }
     kept_compiles_session.builds += taken.builds;
     kept_compiles_session.slow += taken.slow;
+    kept_compiles_session.long_builds += taken.long_builds;
+    kept_compiles_session.longest = (std::max)(kept_compiles_session.longest, taken.longest);
     const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
     LOG_INFO(Render_Vulkan,
              "Driver compiles of prepared pipelines in the last 10 s: {} built from kept SPIR-V, {} "
@@ -5949,8 +5980,57 @@ void PipelineCache::ReportKeptDriverCompiles() {
                         ? "AMD: check Adrenalin > Gaming > Graphics > Shader Cache is on (not Off) "
                           "and never use Reset Shader Cache; the folder sizes in the Driver cache "
                           "folder lines show what the driver kept"
+#ifdef _WIN32
                         : "NVIDIA: set Shader Cache Size to Unlimited in the NVIDIA Control Panel");
+#else
+                        : "NVIDIA on Linux: the Driver cache folder line shows the folder and its "
+                          "__GL_SHADER_DISK_CACHE variables; keep space free on its disk");
+#endif
     }
+    MaybeAutoAsyncRedrawn();
+}
+
+void PipelineCache::MaybeAutoAsyncRedrawn() {
+    // FRITCHII_ASYNC_REDRAWN on for the session once the driver shows it compiles prepared
+    // pipelines again, on any driver: AMD's on Windows (0.2-1.1 s each, tester log t1858) and
+    // NVIDIA's on Linux too (RTX 4070 SUPER, 615.71: ~650 of 1,128 prepared builds over 20 ms,
+    // up to 2.5 s, 18 s of draws held in one boot; log t0419). Where the driver cache holds the
+    // preparation (NVIDIA on Windows, the same Linux PC in its other boots) prepared builds take
+    // 2-10 ms and none of this triggers, so draws keep waiting there as before.
+    //   - 16 or more compiled again (over KeptBuildSlow, 20 ms) and they are a quarter or more
+    //     of the prepared builds: a cache that lost part of the preparation. A cache hit slowed
+    //     down by busy cores stays far under 20 ms nearly always, and a few odd ones never reach
+    //     both the count and the share.
+    //   - Or 3 or more over KeptBuildLong (250 ms): each one is a visible freeze for the draws
+    //     waiting on it, whatever the share.
+    // No time limit: a driver can drop its entries at any point of a session. Decided once.
+    auto& session = kept_compiles_session;
+    if (session.auto_checked) {
+        return;
+    }
+    const bool many_missed = session.slow >= 16 && session.slow * 4 >= session.builds;
+    const bool long_ones = session.long_builds >= 3;
+    if (!many_missed && !long_ones) {
+        return;
+    }
+    session.auto_checked = true;
+    const auto longest_ms = std::chrono::duration<double, std::milli>(session.longest).count();
+    if (VideoCore::Nx2Debug::g_async_redrawn.load(std::memory_order_relaxed) >= 0 ||
+        std::getenv("FRITCHII_ASYNC_REDRAWN") != nullptr) {
+        LOG_INFO(Render_Vulkan,
+                 "Prepared pipelines are compiled again by this driver ({} so far, longest {:.0f} "
+                 "ms); FRITCHII_ASYNC_REDRAWN is set, so it stays at {}",
+                 session.slow, longest_ms, AsyncRedrawnOn() ? 1 : 0);
+        return;
+    }
+    if (AsyncRedrawnDefault() > 0) {
+        return; // Already on by default (AMD's Windows driver).
+    }
+    async_redrawn_auto.store(true, std::memory_order_relaxed);
+    LOG_INFO(Render_Vulkan,
+             "Prepared pipelines are compiled again by this driver ({} so far, longest {:.0f} ms): "
+             "new objects pop in instead of waiting (FRITCHII_ASYNC_REDRAWN auto)",
+             session.slow, longest_ms);
 }
 
 void PipelineCache::ReportPrecompiled() {
@@ -6777,6 +6857,31 @@ bool IsDepthTestedColorDraw(const Maxwell& regs) noexcept {
 }
 } // Anonymous namespace
 
+bool PipelineCache::AsyncRedrawnOn() const {
+    // Set live (the debug server's switch stores 0 or 1) or in the environment: that value.
+    // Unset (-1) stays unset, so the default can still turn on during the session
+    // (MaybeAutoAsyncRedrawn); storing -1 live hands it back to the default.
+    using VideoCore::Nx2Debug::g_async_redrawn;
+    static const bool from_environment = [] {
+        if (std::getenv("FRITCHII_ASYNC_REDRAWN") == nullptr) {
+            return false;
+        }
+        int unset = -1;
+        if (g_async_redrawn.compare_exchange_strong(
+                unset, VideoCore::Nx2Debug::EnvSwitch("FRITCHII_ASYNC_REDRAWN"),
+                std::memory_order_relaxed)) {
+            VideoCore::Nx2Debug::BumpSwitchGeneration();
+        }
+        return true;
+    }();
+    static_cast<void>(from_environment);
+    const int value = g_async_redrawn.load(std::memory_order_relaxed);
+    if (value >= 0) {
+        return value > 0;
+    }
+    return AsyncRedrawnDefault() > 0 || async_redrawn_auto.load(std::memory_order_relaxed);
+}
+
 int PipelineCache::AsyncRedrawnDefault() const {
     // FRITCHII_ASYNC_REDRAWN's value when unset: 1 on AMD's Windows driver (see DrawMayBeSkipped).
     static const int value = [this] {
@@ -6829,11 +6934,11 @@ bool PipelineCache::DrawMayBeSkipped() const {
     // 0.2-1.1 s to compile (NVIDIA: tens of ms), and an RX 7900 XT session held 76 s of draws
     // for unbuilt pipelines, the game freezing ~1 s whenever something new showed up (tester
     // log t1858). The object is missing for that time instead. FRITCHII_ASYNC_REDRAWN=0 waits.
+    // Also on for the session on any driver once it compiles prepared pipelines again
+    // (MaybeAutoAsyncRedrawn).
     bool redrawn = false;
     if (!recurring && targets.kind_if_redrawn == VideoCommon::DrawTargetClass::Recurring &&
-        VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_async_redrawn,
-                                         "FRITCHII_ASYNC_REDRAWN", AsyncRedrawnDefault()) > 0 &&
-        IsDepthTestedColorDraw(maxwell3d->regs)) {
+        AsyncRedrawnOn() && IsDepthTestedColorDraw(maxwell3d->regs)) {
         recurring = true;
         redrawn = true;
     }
