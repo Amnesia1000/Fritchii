@@ -1460,6 +1460,12 @@ private:
         LostZeroed = 4,   ///< FRITCHII_STALE_ZERO cleared it instead of leaving it undefined
         LostDrawn = 8,    ///< Drawn into since without a clear of the whole image
     };
+    /// FRITCHII_LOST_WRITEBACK's drop paths (CollectDownload::lost_path).
+    static constexpr u8 LostPathCollector = 1; ///< The collector's bad overlaps
+    static constexpr u8 LostPathCold = 2;      ///< The cold sweep (EXP58's superseded deletes too)
+    static constexpr u8 LostPathSuperseded = 3; ///< FRITCHII_SWEEP_SUPERSEDED
+    static constexpr u8 LostPathSlot = 4;      ///< EXP64's slot retire
+    static constexpr size_t LostPathCount = 5;
     /// The last GPU-written images dropped without a write-back (MarkStale), for attribution.
     struct StaleDrop {
         DAddr cpu_addr;
@@ -1471,6 +1477,7 @@ private:
         u32 height;
         u8 reason;   ///< DeleteReason, or LostReasonRelocate
         u8 guard;    ///< The image's relocation_guard_noted
+        u64 shape_key; ///< RelocationShapeKey (a relocation's loss guards the shape)
     };
     static constexpr u8 LostReasonRelocate = 0x40;
     static constexpr size_t StaleDropRing = 1024;
@@ -1488,9 +1495,16 @@ private:
         u64 sampled_bytes{};
         std::array<u64, 10> sampled_by_reason{}; ///< DeleteReason (8 = relocation, 9 = unknown)
         u64 sampled_guarded{};   ///< Of the sampled: the dropped image had been read in a later frame
-        u64 writebacks{};        ///< FRITCHII_LOST_WRITEBACK: bad overlaps written back
-        u64 writeback_skipped_newer{}; ///< Not written back: a newer write-back owns its bytes
-        u64 sweeps_kept{};       ///< FRITCHII_LOST_WRITEBACK: kept by the sweeps for the collector
+        u64 relocation_guards{}; ///< Shapes guarded from relocation after a loss it caused
+        /// FRITCHII_LOST_WRITEBACK, by LostPath: queued, landed (and bytes), refused (a newer
+        /// write-back or a since-downloaded overlap owns bytes: deleted as before), kept for a
+        /// later pass (queue full), over the size cap (deleted as before).
+        std::array<u64, LostPathCount> wb_queued{};
+        std::array<u64, LostPathCount> wb_landed{};
+        std::array<u64, LostPathCount> wb_landed_bytes{};
+        std::array<u64, LostPathCount> wb_refused{};
+        std::array<u64, LostPathCount> wb_kept{};
+        std::array<u64, LostPathCount> wb_over_cap{};
         u64 logged{};
         u64 last_log_ns{};
     } lost_stats;
@@ -1504,9 +1518,14 @@ private:
     void NoteLostContents(ImageBase& image, bool is_modification, bool invalidate);
     /// The 10 s "Lost contents" line (TickFrame), when anything happened.
     void LogLostContents();
-    /// FRITCHII_LOST_WRITEBACK: a GPU-written image read in a later frame than it was written
-    /// (the dialogue text target), so dropping its contents can show on screen.
-    [[nodiscard]] bool KeepLostContents(const ImageBase& image) const;
+    /// FRITCHII_LOST_WRITEBACK (live, default 1): a GPU-written image a drop path is about to
+    /// delete is written back to guest memory first, on the collector's queue (EXP121's): the
+    /// landing deletes it and clears its stale marks, so an image made there later uploads the
+    /// GPU's pixels. Queued: the caller leaves it to the landing. Keep: no room in the queue,
+    /// the caller keeps it for a later pass. Drop: delete as before (switch off, nothing GPU-only
+    /// in it, over the size cap, a newer write-back owns some of its bytes, no queue).
+    enum class LostWriteback : u8 { Drop, Queued, Keep };
+    LostWriteback QueueLostWriteback(ImageId image_id, Image& image, u8 path);
     /// Recent collector write-backs (device range, the image's modification_tick): an older
     /// image's write-back must not land over a newer one's bytes.
     struct RecentWriteback {
@@ -1649,7 +1668,7 @@ private:
         u64 staging_bytes;
         u64 memory_bytes;      ///< device memory counted as freed while queued
         bool cpu_modified;     ///< the image was CpuModified then (a CPU write since drops it)
-        bool bad_overlap;      ///< FRITCHII_LOST_WRITEBACK: refused landings delete it as before
+        u8 lost_path;          ///< FRITCHII_LOST_WRITEBACK's drop path (0 = the collector's own)
     };
     std::deque<CollectDownload> collect_downloads;
     u64 collect_download_staging{};

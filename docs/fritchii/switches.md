@@ -828,26 +828,35 @@ per skipped upload, which replaced a full upload. 0 = undefined as before.
 
 ### FRITCHII_LOST_WRITEBACK
 
-TEST, off by default (helper CV, 2026-11-16; zortos293/Lichii #1501's idea). Live. 1 = a
-GPU-written image that was read in a later frame than written (sampled, or drawn over without a
-clear: the relocation guard's GuardSampled/GuardLoaded, e.g. OoT's dialogue box text target) is
-written back to guest memory when the collector takes it, also when it is a bad overlap (which the
-collector used to drop without a download), and the cold sweep, EXP58's superseded deletes,
-FRITCHII_SWEEP_SUPERSEDED and EXP64's slot retire leave such images to the collector. A write-back
-is skipped when a newer write-back (recent ring of 256) owns some of its bytes; a queued (EXP121)
-write-back of a bad overlap that an overlap wrote over meanwhile is deleted without landing, as
-before. 2 = every GPU-written image (a cause test: much more downloading). Log: the "Lost contents"
-line's write-backs and "kept by the sweeps".
+On by default (helper CV, 2026-11-16, round 2; zortos293/Lichii #1501's idea). Live. A correctness
+fix: a GPU-written image that the cold sweep (EXP58's superseded deletes included),
+FRITCHII_SWEEP_SUPERSEDED, EXP64's slot retire or the collector (bad overlaps) is about to delete
+is written back to guest memory first, on the collector's download queue (EXP121's): the landing
+deletes it and clears its stale marks, so an image made there later uploads the GPU's pixels
+instead of skipping the upload (the stale skip) and showing nothing or other memory. The owner's
+gallery session (build 21): OoT draws each dialogue/choice button's text once into a 1136x120 target
+and samples it as 1133x120; hidden UI (left stick) left it untouched for 4 frames, the cold sweep
+dropped it, and on unhide the text was junk (FRITCHII_STALE_ZERO=0) or blank (=1).
+Used again before the landing (bound, sampled, drawn), the image simply stays. With no room in the
+queue (64 entries, 256 MiB) the image is kept for a later pass. Deleted as before: images the CPU
+wrote since (nothing GPU-only in them), allocation failures, a newer write-back over some of its
+bytes (recent ring of 256), or an overlap downloaded since its queueing (refused). Relocation
+(EXP43) is not written back (the image moves, ~10 a frame while the camera moves); instead a loss
+the counter blames on a relocation guards that shape and address from relocating again.
+1 = every image; N > 1 = only images up to N KiB (a cost cap for A/B: 1024 covers the text
+targets); 0 = off (drops as before). Cost: one GPU copy plus a CPU swizzle per written-back image,
+on the GPU thread at the landing; the "Lost contents" line gives MiB per path.
 
 Lost contents counter (always on, needs the stale page marks, i.e. EXP78 on, the default): every
 10 s with anything to say, "Lost contents in 10 s (FRITCHII_STALE_ZERO=Z, FRITCHII_LOST_WRITEBACK=W):
 images made over memory whose GPU data was dropped: S upload skipped (C cleared to zero), U uploaded
 stale guest bytes; O overwritten whole first; SAMPLED with lost contents: N (A not drawn into, B
 drawn over; K KiB; G were read in a later frame before the drop) by drop: collector, cold sweep,
-superseded sweep, slot retire, join, relocation, unmap/unmap sweep, other, not recorded; write-backs
-X (Y skipped under newer), kept by the sweeps Z". SAMPLED is the number that shows on screen: an
-image sampled before anything overwrote it whole. The first 40 get a "Lost contents sampled:" line
-with the image (format, size, address) and the drop that left its memory stale (path, the dropped
+superseded sweep, slot retire, join, relocation, unmap/unmap sweep, other, not recorded; relocation
+guards R; write-backs queued/landed: collector Q/L (M MiB) refused F kept K over cap C; cold sweep
+...; superseded sweep ...; slot retire ...". SAMPLED is the number that shows on screen: an image
+sampled before anything overwrote it whole. The first 40 get a "Lost contents sampled:" line with
+the image (format, size, address) and the drop that left its memory stale (path, the dropped
 image's format, size and address, frames since, its guard bits).
 
 ### FRITCHII_HOSTTIMING_SPIN_BUDGET
