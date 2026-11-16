@@ -5769,7 +5769,13 @@ reached the writer's tick, with a host-read barrier, signalling its own timeline
 submission with a tick after the writer's waits for that value until the side semaphore reports
 it (MasterSemaphore::RequireSide: never one up to the writer's, which the copy itself waits for).
 The download's main tick (its SubmitForHostRead) is such a submission, so a landing that waited
-for it finds the side copy done too.
+for it finds the side copy done too. Two rules keep the queues from waiting on each other (build
+26 hung without the first, helper_cu_answer.md Round 4): the main ticks the side submissions wait
+for never go down (a later copy whose writer is older waits for the previous copy's tick: the side
+queue runs in order), and a side copy is made only once its tick was given to vkQueueSubmit, not
+only to the worker (else the main queue copies it). "Read side queue" line: main submissions that
+waited, waits for a side value never submitted (must be 0, dropped and logged), refusals, raised
+waits, host waits over 2 s (must be 0; each logged every 2 s with both queues' ticks).
 - 2: both copies, the main one into the download's staging and the side one into a second staging
   buffer. The reader waits for the side copy, then the main one; the landing compares the two
   byte for byte ("copies differ", must be 0, each one an error line) and lands the main bytes.

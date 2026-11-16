@@ -51,8 +51,20 @@ SideQueue::~SideQueue() {
     master.SetSideSemaphore(nullptr);
 }
 
-u64 SideQueue::Submit(u64 main_tick, std::span<const Copy> copies) {
+u64 SideQueue::Submit(u64 main_tick_, std::span<const Copy> copies) {
     std::scoped_lock lock{mutex};
+    // Never lower than the previous submission's: in order on this queue, see the header.
+    u64 main_tick = main_tick_;
+    if (main_tick < last_main_tick) {
+        main_tick = last_main_tick;
+        raised.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (main_tick > master.QueueSubmittedTick()) {
+        // Handed to the worker but not to the queue: the caller copies on the main queue.
+        not_queued.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    last_main_tick = main_tick;
     Slot& slot = slots[next_slot];
     if (slot.value != 0 && !IsDone(slot.value)) {
         Wait(slot.value);
@@ -113,7 +125,7 @@ u64 SideQueue::Submit(u64 main_tick, std::span<const Copy> copies) {
     next_slot = (next_slot + 1) % slots.size();
     // Every main submission after `main_tick` waits for it until the side semaphore reports it
     // (none up to it does: the copy waits for those).
-    master.RequireSide(value, main_tick);
+    master.RequireSide(value, main_tick, value);
     return value;
 }
 
@@ -134,9 +146,29 @@ void SideQueue::Wait(u64 value) {
     if (IsDone(value)) {
         return;
     }
-    while (!semaphore.Wait(value)) {
+    // In 2 s steps: a side value that does not come is logged (with the main queue's state)
+    // instead of blocking without a word.
+    constexpr u64 Step = 2'000'000'000ULL;
+    for (u32 steps = 0; !semaphore.Wait(value, Step); ++steps) {
+        if (steps == 0) {
+            slow_waits.fetch_add(1, std::memory_order_relaxed);
+        }
+        master.Refresh();
+        LOG_ERROR(Render_Vulkan,
+                  "FRITCHII_READ_SIDE_COPY: side value {} not done after {} s (side reports {}, "
+                  "newest asked {}; its main tick wait {}, main known {}, main current {})",
+                  value, (steps + 1) * 2, semaphore.GetCounter(), next_value - 1, last_main_tick,
+                  master.KnownGpuTick(), master.CurrentTick());
     }
     (void)IsDone(value);
+}
+
+SideQueue::Stats SideQueue::TakeStats() {
+    return Stats{
+        .raised = raised.exchange(0, std::memory_order_relaxed),
+        .slow_waits = slow_waits.exchange(0, std::memory_order_relaxed),
+        .not_queued = not_queued.exchange(0, std::memory_order_relaxed),
+    };
 }
 
 } // namespace Vulkan
