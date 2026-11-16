@@ -3133,6 +3133,255 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
     return CurrentGraphicsPipelineSlowPath();
 }
 
+namespace {
+/// FRITCHII_OCCL_LEAN: a pipeline named in its log lines (vertex/pixel program hashes).
+std::string OcclShaders(const GraphicsPipelineCacheKey& key) {
+    return fmt::format("vertex {:016x} pixel {:016x}", key.unique_hashes[1], key.unique_hashes[5]);
+}
+
+/// FRITCHII_OCCL_LEAN: why `pipeline`'s pixel program must stay for a draw that writes no
+/// colour (Lean: it cannot change depth, stencil, the counted samples or memory). Fixed per
+/// pipeline: the key and the programs' infos never change.
+VideoCommon::OcclLean::PipelineClass ClassifyOcclPipeline(const GraphicsPipeline& pipeline) {
+    using VideoCommon::OcclLean::PipelineClass;
+    const GraphicsPipelineCacheKey& key = pipeline.Key();
+    if (key.unique_hashes[5] == 0) {
+        return PipelineClass::NoPixel;
+    }
+    const auto& infos = pipeline.StageInfos();
+    if (pipeline.IsEmulatedMesh() ||
+        std::ranges::any_of(infos, [](const Shader::Info& info) {
+            return info.is_mesh || info.is_task;
+        })) {
+        return PipelineClass::Mesh;
+    }
+    // The alpha test is emulated in the pixel program (MakeRuntimeInfo); dual source blending
+    // names the pixel program's second output.
+    if (key.state.alpha_test_func.Value() !=
+            FixedPipelineState::PackComparisonOp(Maxwell::ComparisonOp::Always_GL) ||
+        key.state.attachment0_dual_source_blend != 0) {
+        return PipelineClass::KeyState;
+    }
+    const Shader::Info& pixel = infos[infos.size() - 1];
+    if (pixel.uses_demote_to_helper_invocation) {
+        return PipelineClass::Discards;
+    }
+    if (pixel.stores_frag_depth || pixel.stores_sample_mask) {
+        return PipelineClass::DepthOrMask;
+    }
+    const bool writes_storage = std::ranges::any_of(
+        pixel.storage_buffers_descriptors, [](const auto& desc) { return desc.is_written; });
+    const bool writes_images =
+        std::ranges::any_of(pixel.image_descriptors,
+                            [](const auto& desc) { return desc.is_written; }) ||
+        std::ranges::any_of(pixel.image_buffer_descriptors,
+                            [](const auto& desc) { return desc.is_written; });
+    const bool atomics =
+        pixel.uses_global_increment || pixel.uses_global_decrement ||
+        pixel.uses_shared_increment || pixel.uses_shared_decrement || pixel.uses_atomic_f32_add ||
+        pixel.uses_atomic_f16x2_add || pixel.uses_atomic_f16x2_min ||
+        pixel.uses_atomic_f16x2_max || pixel.uses_atomic_f32x2_add ||
+        pixel.uses_atomic_f32x2_min || pixel.uses_atomic_f32x2_max || pixel.uses_atomic_s32_min ||
+        pixel.uses_atomic_s32_max || pixel.uses_int64_bit_atomics || pixel.uses_atomic_image_u32;
+    if (writes_storage || writes_images || atomics || pixel.stores_global_memory ||
+        pixel.uses_typeless_image_writes) {
+        return PipelineClass::Stores;
+    }
+    return PipelineClass::Lean;
+}
+
+/// FRITCHII_OCCL_LEAN: what E's fill and R's configure take from stages 0 to 3 (vertex side),
+/// equal in `full` and its sibling. A difference (a translation that fit texture arrays or
+/// storage pointers otherwise) refuses the sibling: only a pixel-less copy of the same vertex
+/// side is the cut.
+bool OcclVertexSideSame(const GraphicsPipeline& full, const GraphicsPipeline& sibling) {
+    const auto a = full.MemFacts();
+    const auto b = sibling.MemFacts();
+    if ((a.stages & 0xFU) != b.stages || a.has_texel_buffers != b.has_texel_buffers ||
+        a.uses_descriptor_buffer != b.uses_descriptor_buffer || a.hashes[0] != b.hashes[0] ||
+        full.HasDynamicVertexInput() != sibling.HasDynamicVertexInput()) {
+        return false;
+    }
+    const auto& full_infos = full.StageInfos();
+    const auto& sibling_infos = sibling.StageInfos();
+    for (size_t stage = 0; stage + 1 < full_infos.size(); ++stage) {
+        if ((*a.uniform_masks)[stage] != (*b.uniform_masks)[stage] ||
+            (*a.uniform_sizes)[stage] != (*b.uniform_sizes)[stage]) {
+            return false;
+        }
+        const Shader::Info& x = full_infos[stage];
+        const Shader::Info& y = sibling_infos[stage];
+        if (x.storage_buffers_descriptors.size() != y.storage_buffers_descriptors.size() ||
+            Shader::NumDescriptors(x.texture_descriptors) !=
+                Shader::NumDescriptors(y.texture_descriptors) ||
+            Shader::NumDescriptors(x.image_descriptors) !=
+                Shader::NumDescriptors(y.image_descriptors) ||
+            Shader::NumDescriptors(x.texture_buffer_descriptors) !=
+                Shader::NumDescriptors(y.texture_buffer_descriptors) ||
+            Shader::NumDescriptors(x.image_buffer_descriptors) !=
+                Shader::NumDescriptors(y.image_buffer_descriptors) ||
+            x.handle_programs != y.handle_programs ||
+            x.constant_buffer_mask != y.constant_buffer_mask) {
+            return false;
+        }
+        for (size_t i = 0; i < x.storage_buffers_descriptors.size(); ++i) {
+            const auto& p = x.storage_buffers_descriptors[i];
+            const auto& q = y.storage_buffers_descriptors[i];
+            if (p.cbuf_index != q.cbuf_index || p.cbuf_offset != q.cbuf_offset ||
+                p.is_written != q.is_written || p.indirect_offset != q.indirect_offset) {
+                return false;
+            }
+        }
+        for (size_t i = 0; i < x.texture_descriptors.size(); ++i) {
+            const auto& p = x.texture_descriptors[i];
+            const auto& q = y.texture_descriptors[i];
+            if (p.cbuf_index != q.cbuf_index || p.cbuf_offset != q.cbuf_offset ||
+                p.count != q.count || p.handle_program != q.handle_program ||
+                p.type != q.type) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+} // Anonymous namespace
+
+GraphicsPipeline* PipelineCache::OcclLeanPipeline(GraphicsPipeline* full, const Maxwell& regs,
+                                                  int mode, VideoCommon::OcclLean::DrawNote& note) {
+    namespace OcclLean = VideoCommon::OcclLean;
+    using OcclLean::PipelineClass;
+    OcclLean::Stats& stats = OcclLean::g_stats;
+    OcclLean::MaybeReport(mode);
+    OcclLean::Add(stats.draws);
+    const OcclLean::RegsVerdict verdict = OcclLean::ClassifyRegs(regs);
+    if (verdict.counting) {
+        OcclLean::Add(stats.counting);
+    }
+    if (!verdict.colour_off) {
+        return full;
+    }
+    OcclLean::Add(stats.colour_off);
+    if (verdict.counting) {
+        OcclLean::Add(stats.tests);
+    }
+    if (verdict.refused) {
+        OcclLean::Add(stats.regs_refused);
+        return full;
+    }
+    if (full->occl_class == 0) {
+        full->occl_class = static_cast<u8>(static_cast<u8>(ClassifyOcclPipeline(*full)) + 1);
+    }
+    const auto pipeline_class = static_cast<PipelineClass>(full->occl_class - 1);
+    if (pipeline_class != PipelineClass::Lean) {
+        OcclLean::Add(stats.by_class[static_cast<size_t>(pipeline_class)]);
+        return full;
+    }
+    // What the sibling leaves out: the pixel stage's uniform buffers, storage binds and texture
+    // handle values (E), its textures and images (R).
+    OcclLean::Add(stats.by_class[static_cast<size_t>(PipelineClass::Lean)]);
+    const Shader::Info& pixel = full->StageInfos().back();
+    OcclLean::Add(stats.pixel_uniforms,
+                  static_cast<u64>(std::popcount((*full->MemFacts().uniform_masks)[4])));
+    OcclLean::Add(stats.pixel_textures, Shader::NumDescriptors(pixel.texture_descriptors) +
+                                            Shader::NumDescriptors(pixel.image_descriptors));
+    OcclLean::Add(stats.pixel_storage, pixel.storage_buffers_descriptors.size());
+    OcclLean::Add(stats.pixel_programs, pixel.handle_programs.size());
+    if (stats.last_lean_full == full) {
+        OcclLean::Add(stats.same_pipeline);
+    }
+    stats.last_lean_full = full;
+    note.timed = (++stats.sample & 15U) == 0;
+    if (mode == OcclLean::Dry) {
+        return full;
+    }
+    GraphicsPipeline* sibling = full->occl_sibling;
+    if (sibling == nullptr) {
+        sibling = FindOrMakeOcclSibling(*full);
+        if (sibling == nullptr) {
+            OcclLean::Add(stats.not_ready);
+            return full;
+        }
+        OcclLean::Add(stats.compared);
+        if (!OcclVertexSideSame(*full, *sibling)) {
+            OcclLean::Add(stats.differ);
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                LOG_WARNING(Render_Vulkan,
+                            "Occlusion lean (FRITCHII_OCCL_LEAN): the pixel-less pipeline of {} "
+                            "has another vertex side; the full one keeps drawing",
+                            OcclShaders(full->Key()));
+            }
+            full->occl_class = static_cast<u8>(static_cast<u8>(PipelineClass::VertexDiffers) + 1);
+            return full;
+        }
+        full->occl_sibling = sibling;
+    }
+    if (sibling->Failed()) [[unlikely]] {
+        OcclLean::Add(stats.failed);
+        full->occl_sibling = nullptr;
+        full->occl_class = static_cast<u8>(static_cast<u8>(PipelineClass::Failed) + 1);
+        return full;
+    }
+    if (!sibling->IsBuilt()) {
+        OcclLean::Add(stats.not_ready);
+        return full;
+    }
+    sibling->MarkUsed(frame_count); // the full one is marked by the lookup
+    if (mode != OcclLean::On) {
+        OcclLean::Add(stats.ready_unused); // verify: the full pipeline still draws
+        return full;
+    }
+    OcclLean::Add(stats.lean);
+    note.lean = true;
+    return sibling;
+}
+
+GraphicsPipeline* PipelineCache::FindOrMakeOcclSibling(GraphicsPipeline& full) {
+    namespace OcclLean = VideoCommon::OcclLean;
+    OcclLean::Stats& stats = OcclLean::g_stats;
+    GraphicsPipelineCacheKey key = full.Key();
+    key.unique_hashes[5] = 0;
+    if (const auto it = graphics_cache.find(key); it != graphics_cache.end()) {
+        if (it->second) {
+            OcclLean::Add(stats.found);
+        }
+        return it->second.get(); // null while its translation is queued: later
+    }
+    // The environments come from the registers of this draw (shader_infos from the lookup that
+    // gave `full`): only while the current key names full's programs.
+    if (graphics_key.unique_hashes != full.Key().unique_hashes || occl_made_frame == frame_count) {
+        return nullptr;
+    }
+    occl_made_frame = frame_count; // one translation on E a frame
+    const u64 start = OcclLean::NowNs();
+    const GraphicsPipelineCacheKey saved = graphics_key;
+    std::unique_ptr<GraphicsPipeline> made;
+    {
+        graphics_key = key;
+        SCOPE_EXIT {
+            graphics_key = saved;
+        };
+        try {
+            made = CreateGraphicsPipeline(nullptr, false);
+        } catch (const std::exception& exception) {
+            LOG_ERROR(Render_Vulkan, "Occlusion lean (FRITCHII_OCCL_LEAN): {}: {}",
+                      OcclShaders(key), exception.what());
+            made.reset();
+        }
+    }
+    OcclLean::Add(stats.made_ns, OcclLean::NowNs() - start);
+    if (!made) {
+        OcclLean::Add(stats.failed);
+        full.occl_class =
+            static_cast<u8>(static_cast<u8>(OcclLean::PipelineClass::Failed) + 1);
+        return nullptr;
+    }
+    OcclLean::Add(stats.made);
+    GraphicsPipeline* const pointer = made.get();
+    graphics_cache.emplace(key, std::move(made));
+    return pointer;
+}
+
 ComputePipeline* ComputePipelineCacheEntry::Get(bool native, GPUVAddr address,
                                                 const ComputePipelineCacheKey& key) const {
     if (!pipeline && native) {
@@ -8197,7 +8446,7 @@ void PipelineCache::WarnKeptPointer(size_t program, u64 slot) const {
 }
 
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
-    const VideoCommon::EvictedPointerSlots::Slots* keep_pointers) {
+    const VideoCommon::EvictedPointerSlots::Slots* keep_pointers, bool store) {
     const auto begin = std::chrono::steady_clock::now();
     t_runtime_build = true;
     t_build_split = {};
@@ -8240,7 +8489,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     ShaderPools& pools = emit_pools ? *emit_pools : main_pools;
     auto pipeline{CreateGraphicsPipeline(pools, graphics_key, environments.Span(), nullptr, true,
                                          std::move(emit_pools), std::move(reservation))};
-    if (!pipeline || pipeline_cache_filename.empty()) {
+    if (!pipeline || pipeline_cache_filename.empty() || !store) {
         return pipeline;
     }
     StoreRuntimeGraphicsPipeline(graphics_key, environments.envs);

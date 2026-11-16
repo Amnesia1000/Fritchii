@@ -140,6 +140,10 @@ inline std::atomic<int> g_fill_bracket_lean{-1};
 /// pending query reports (FlushQueryResults). 1 = wait for those reports only (EXP30's wait),
 /// 2 = verify: that wait, then the old one, the words read after each compared (must be 0).
 inline std::atomic<int> g_report_wait{-1};
+/// FRITCHII_OCCL_LEAN (live, default 0; fritchii_occl_lean.h): a draw that writes no colour takes
+/// its pipeline without the pixel program when that program can change nothing else (1 on,
+/// 2 verify: siblings made and compared, the full pipeline draws, 3 dry: census and timer only).
+inline std::atomic<int> g_occl_lean{-1};
 /// EDEN_NX2_FEED_MEMORY_OVERLAY: docs/fritchii/switches.md.
 inline std::atomic<int> g_feed_memory_overlay{-1};
 /// EDEN_NX2_QMD_3D_PATCH: docs/fritchii/switches.md.

@@ -118,6 +118,7 @@ add_library(video_core STATIC
     fritchii_e_split_thread.cpp
     fritchii_e_split_thread.h
     fritchii_fill_cuts.h
+    fritchii_occl_lean.h
     fritchii_front_split.cpp
     fritchii_front_split.h
     fritchii_focus.h

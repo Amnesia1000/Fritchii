@@ -32,6 +32,7 @@
 #include "shader_recompiler/object_pool.h"
 #include "shader_recompiler/profile.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/fritchii_occl_lean.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
@@ -155,6 +156,13 @@ public:
     ~PipelineCache();
 
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline();
+
+    /// FRITCHII_OCCL_LEAN (helper CS, fritchii_occl_lean.h; E, right after CurrentGraphicsPipeline
+    /// gave `full` for the draw of `regs`): the same pipeline without its pixel program when the
+    /// draw writes no colour and that program can change nothing else, once made and built; else
+    /// `full`. `mode` is the switch (1 to 3); `note` says whether the draw is timed and lean.
+    [[nodiscard]] GraphicsPipeline* OcclLeanPipeline(GraphicsPipeline* full, const Maxwell& regs,
+                                                     int mode, VideoCommon::OcclLean::DrawNote& note);
 
     /// One follower (fable_b 18.4, E, right after a lookup): the key parts the lookup kept
     /// because their flag was clear, computed fresh from the registers and compared: bit 0 the
@@ -383,8 +391,17 @@ private:
 
     /// With `keep_pointers`, the slots an evicted pipeline of this key bound stay storage buffer
     /// pointers whatever they hold now (ported).
+    /// `store`: false keeps it out of the disk cache (FRITCHII_OCCL_LEAN's siblings).
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline(
-        const VideoCommon::EvictedPointerSlots::Slots* keep_pointers = nullptr);
+        const VideoCommon::EvictedPointerSlots::Slots* keep_pointers = nullptr,
+        bool store = true);
+
+    /// FRITCHII_OCCL_LEAN: `full`'s key without the pixel program, found in graphics_cache or
+    /// translated now (one a frame) from the draw's environments; null when not available yet.
+    /// Sets full.occl_class to Failed when it cannot be made.
+    GraphicsPipeline* FindOrMakeOcclSibling(GraphicsPipeline& full);
+    /// FRITCHII_OCCL_LEAN: frame_count of the last sibling translation (one a frame).
+    u64 occl_made_frame{~u64{0}};
 
     /// The pointer slots kept for the current key (evicted_pointer_slots), null when none
     [[nodiscard]] const VideoCommon::EvictedPointerSlots::Slots* KeptPointers() const;

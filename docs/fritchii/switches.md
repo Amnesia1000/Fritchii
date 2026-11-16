@@ -1812,6 +1812,51 @@ writes newer bytes next); a device unmap waits if it overlaps.
 - Not on the EDEN_NX2_FENCE_RELEASE_STATS path; EXP74 and FRITCHII_FENCE_YIELD_E do nothing while
   it is on (the lock is let go at every landing anyway).
 
+### FRITCHII_OCCL_LEAN (the "Occlusion lean" line)
+
+Helper CS (work\helper_cs_answer.md). Live, default 0. Needs one follower with E's pipeline
+lookup (FRITCHII_ONEF_E_PIPELINE=1, the default under FRITCHII_ONEF_LEAN); does nothing else.
+
+Kakariko sends ~2,570 occlusion test draws a frame (sample counting on, every colour write off)
+of ~3,420, and E fills each in full. For a draw that writes no colour, the pixel program can only
+change depth, stencil, the counted samples or memory through a discard, a depth or sample mask
+write, a store or atomic, or its alpha (alpha to coverage, the alpha test emulated in it). When it
+has none of them, E swaps the pipeline it looked up for the same key with the pixel program hash 0
+(the pipeline a draw with the pixel program disabled gets). E's fill then has no pixel stage (no
+pixel uniform buffers, storage binds or texture handle values) and R binds no pixel textures;
+depth, stencil and the samples counted are the same (Vulkan runs the per-fragment tests and the
+query count on the rasterized coverage and interpolated depth with no fragment shader).
+
+- 0 = off (one relaxed load a draw).
+- 1 = on. A draw is taken when: no render target with a format has a colour mask bit on (by
+  target index and by rt_control slot, both readings), alpha to coverage off, the alpha test off
+  or Always (registers), and the pipeline (classed once): has a pixel program, no task/mesh, key
+  alpha test Always, no dual source blending, and a pixel program without demote, depth or
+  sample mask writes, storage/image/global writes or atomics. The pixel-less pipeline
+  ("sibling") is translated on E from the draw's own environments, at most one a frame, kept
+  out of the disk cache, and used only when built and its vertex side (stages 0-3: uniform masks
+  and sizes, storage, texture, image and texel descriptors, handle programs, the vertex program)
+  equals the full pipeline's. A difference refuses that pipeline for the session.
+- 2 = verify: as 1, but the full pipeline still draws (picture unchanged); the siblings are made
+  and compared. "differs" must be 0 for the cut to cover everything it counts.
+- 3 = dry: the census and the timer only, no sibling made.
+
+"Occlusion lean (FRITCHII_OCCL_LEAN=n)" (HW_GPU, Info) every 10 s and at a switch change (a gap
+of half a second ends a 1 window, so 0/1 toggles keep one value a line): E draws, counting,
+colour off and test draws a second; colour off but alpha to coverage or alpha test; draws the
+cut can take (and how often the same pipeline as the previous one), with the pixel uniform
+buffers, textures, storage buffers and handle programs each one skips; draws kept full by reason
+(no pixel program, discard, depth or sample mask, stores, mesh, alpha test or dual source key,
+vertex side differs, failed); drawn lean a second, sibling not ready, verify ready; siblings made
+(and E's ms translating them), found, failed, compared, differs; E's fill and push time of a
+timed draw (1 in 16 of the takeable ones), lean vs full. Use 3/1 for the thread metric (both
+timed), 0/1 for fps.
+
+Costs: the register test (~30-50 ns) on every E draw while on; a sibling translation on E (a few
+ms, once per pipeline a session) when a takeable pipeline first shows up, at most one a frame.
+Lent draws keep R's own lookup (full pipeline). Not compatible with the one-follower build
+compares (step 3 BuildPipeline would see the sibling); FRITCHII_ONEF_LEAN=1 turns those off.
+
 ### EDEN_NX2_GPU_PROFILE=2: E's draw method zones (helper CP)
 
 E's draw method outside the fill (0x585's "method" share, ~1.1 us a draw at Kakariko, 218 ms/s
