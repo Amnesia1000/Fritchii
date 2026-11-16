@@ -1142,6 +1142,88 @@ bool WaitForFlag(const std::atomic<bool>& flag, std::chrono::steady_clock::time_
     return flag.load(std::memory_order_acquire);
 }
 
+int HardwareWaitMode() {
+    static const int mode = [] {
+        const char* text = std::getenv("FRITCHII_HWWAIT");
+        const int requested = text == nullptr ? 0 : std::atoi(text);
+        if (requested <= 0) {
+            return 0;
+        }
+        int result = 0;
+#ifdef ARCHITECTURE_x86_64
+        const auto& caps = Common::g_cpu_caps;
+        if (Common::g_wall_clock.IsNative()) {
+            if (caps.waitpkg) {
+                result = 1;
+            } else if (requested >= 2 && caps.monitorx) {
+                result = 2;
+            }
+        }
+        LOG_INFO(Common, "FRITCHII_HWWAIT={}: {} (CPU: WAITPKG {}, MONITORX {}, TSC clock {})",
+                 requested,
+                 result == 1   ? "spin waits use UMWAIT (C0.1)"
+                 : result == 2 ? "spin waits use MWAITX"
+                               : "off, this CPU has no usable hardware wait",
+                 caps.waitpkg ? "yes" : "no", caps.monitorx ? "yes" : "no",
+                 Common::g_wall_clock.IsNative() ? "yes" : "no");
+#else
+        LOG_INFO(Common, "FRITCHII_HWWAIT={}: off, x86-64 only", requested);
+#endif
+        return result;
+    }();
+    return mode;
+}
+
+#if defined(ARCHITECTURE_x86_64) && defined(__clang__)
+__attribute__((target("waitpkg,mwaitx")))
+#endif
+void HardwareWaitWhileEqual(const std::atomic<u64>& word, u64 seen, u32 cycles) {
+#ifdef ARCHITECTURE_x86_64
+    const int mode = HardwareWaitMode();
+    if (mode == 0 || cycles == 0) {
+        return;
+    }
+    auto* const line = const_cast<std::atomic<u64>*>(std::addressof(word));
+    if (mode == 1) {
+        _umonitor(line);
+    } else {
+        _mm_monitorx(line, 0, 0);
+    }
+    if (word.load(std::memory_order_acquire) != seen) {
+        return;
+    }
+    if (mode == 1) {
+        // Control bit 0 set: C0.1, the faster wake (Event::WaitFor uses C0.2). Absolute deadline.
+        _umwait(1, Common::X64::FencedRDTSC() + cycles);
+    } else {
+        _mm_mwaitx(1 << 1, 0u, cycles);
+    }
+#else
+    (void)word;
+    (void)seen;
+    (void)cycles;
+#endif
+}
+
+u32 PauseCycles() {
+    static const u32 cycles = [] {
+#ifdef ARCHITECTURE_x86_64
+        u64 best = ~u64{0};
+        for (int run = 0; run < 3; ++run) {
+            const u64 start = Common::X64::FencedRDTSC();
+            for (int i = 0; i < 1024; ++i) {
+                _mm_pause();
+            }
+            best = (std::min)(best, Common::X64::FencedRDTSC() - start);
+        }
+        return static_cast<u32>((std::max<u64>)(best / 1024, 1));
+#else
+        return 1U;
+#endif
+    }();
+    return cycles;
+}
+
 #ifdef _WIN32
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002

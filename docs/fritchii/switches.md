@@ -4342,6 +4342,25 @@ instead of a host call that saves every live register and goes through CoreTimin
 - Test: toggle needs a fresh launch (boot switch): market, 2 launches each, compare the guest
   cores' ms/s and fps; check game speed (cutscene audio sync, Dynamic FPS step) stays the same.
 
+### FRITCHII_HWWAIT
+
+FRITCHII_HWWAIT (boot, default 0; helper BR, 2026-11-16, idea from bakemono's handoff). x86-64
+only, and only where CPUID says the CPU has the instruction and the wall clock is the TSC.
+1 = UMWAIT on Intel CPUs with WAITPKG (Alder Lake and newer client parts, Tremont/Gracemont);
+2 = also MWAITX on AMD (MONITORX). Anything else, or a CPU without it, is today's code.
+- Site: the GPU front's wait for the back (GpuSplit::Backoff, every split drain). Its first phase,
+  16384 PAUSEs, becomes 256 hardware waits of 64 PAUSEs' time each (PAUSE length measured at boot),
+  so the phase lasts as long as before; a store to the position the wait reads first ends it at
+  once. The yield / FrontSleep phase after it is unchanged. UMWAIT uses C0.1 (the fast wake).
+- Not a CPU-time cut in Task Manager (the OS counts the wait as running, like PAUSE); the gain, if
+  any, is power headroom for the busy cores on power-limited laptops, and the SMT sibling gets the
+  core while it waits. Unmeasured: keep it off unless a fixed-power A/B shows no fps or 1% low loss
+  (NoteSiteWait ms/s must not rise).
+- The guest cores' idle poll already has a hardware wait: EXP79 (Common::WaitForFlag, C0.2, MWAITX
+  on AMD, adaptive window). HostTiming's pre-event spin and the Vulkan worker spin are not covered.
+- Log: "FRITCHII_HWWAIT=N: spin waits use UMWAIT (C0.1) | MWAITX | off, this CPU has no usable
+  hardware wait (CPU: WAITPKG yes/no, MONITORX yes/no, TSC clock yes/no)" (Common, Info) once.
+
 ### FRITCHII_JIT_CHAIN
 
 FRITCHII_JIT_CHAIN (boot, bits, default 0; Fable A 2.2). Off with cycle counting (single core).
