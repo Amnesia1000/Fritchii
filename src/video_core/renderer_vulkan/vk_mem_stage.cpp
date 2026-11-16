@@ -137,8 +137,9 @@
 //     scheduler's read) goes through Qmd(), which opens the dispatch packet, reads into it and
 //     returns it. BeginDispatch adopts the open packet. The error path's 512-byte read stays a
 //     direct read.
-//   Null pointer slots: the compute pipeline lookup (PipelineCache::StaleNullPointerSlot) reads a
-//     pointer from a QMD constant buffer before the dispatch's fill can run; it reads through
+//   Unbound pointer slots: the compute pipeline lookup (PipelineCache::StaleUnboundPointerSlot)
+//     reads a pointer from a QMD constant buffer (and a pointer-table entry through it) before the
+//     dispatch's fill can run; it reads through
 //     ReadPointerSlot(), which keeps the value in the open dispatch packet (null_slot_values).
 // The handle values live in their own arrays beside the entry arena (draw_values,
 // dispatch_values), not in it: the arena is played as an entry stream. packet.handle_values spans
