@@ -131,6 +131,86 @@ try, K of them got memory of their own". Read the worst create's kind first: "co
 is what the pool removes; "depth in a block" points at EDEN_NX2_DEPTH_POOL_MIN_BLOCKS; "other in a
 block" at FRITCHII_KEEP_BLOCKS.
 
+### FRITCHII_VRAM_POOL_FIT
+
+TEST, off by default (helper BF, 2026-11-16; 8 GB cards). Live: 1 = EXP42's image pool (pooled
+VkImages of deleted render targets, built-in cap EXP66 = 1 GiB) holds at most the room the rest of
+the process leaves under the driver's budget less the texture cache's margin (1/8 of the budget, at
+most 1 GiB), re-read every 30 frames. Why: the texture cache counts pooled images as free memory,
+so its thresholds leave the pool out. Next to a full cache the pool pushed small cards past the
+budget (6 GB card: critical ~4.2 GiB + 1 GiB of pool > a ~5 GiB budget), where Windows moves memory
+to system RAM (the 16-24 fps cliff) or an image fails and the whole pool is dropped at once. Saves
+0 on a 16 GB card (cap stays 1 GiB: ~7.7 GiB of room at the market), up to the whole 1 GiB on 6-8
+GB cards when the cache is full. Log, every 600 frames while it is on: "Image pool fit
+(FRITCHII_VRAM_POOL_FIT) last 600 frames: cap C MiB now (lowest L MiB, built-in B MiB); budget X
+MiB, the rest of the process R MiB". Judge with FRITCHII_VRAM_REPORT=1 under
+EDEN_NX2_VRAM_LIMIT_MIB=8192 / 6144 + FRITCHII_VRAM_SIM_OTHERS=1: "over the budget" samples go to 0,
+fps and 1% lows not lower, the pool line's "taken" count tells what the smaller pool costs.
+
+### FRITCHII_VRAM_CRITICAL_FIT
+
+TEST, off by default (helper BF, 2026-11-16; use with FRITCHII_VRAM_POOL_FIT). Live (read at the
+texture cache's budget check, every 30 frames): for budgets between 4 and 10 GiB the collector's
+critical threshold may reach the budget less the margin (1/8, at most 1 GiB) less 512 MiB, instead
+of the fixed 5 GiB (MaxCriticalMemory). Why: an 8 GB card (budget ~7.1 GiB with Windows and other
+programs) collected from 5 GiB on while OoT's market sits at ~5.1-5.3 GiB in the cache's view on a
+16 GB card, so it evicted and re-made textures (ASTC re-transcodes, downloads with a GPU wait) with
+~2 GiB of budget left to the pool and margins. 8 GB card: critical 5120 -> ~5700 MiB, expected 4352
+-> ~4940 MiB (+580 MiB for textures). 6 GB cards and 10 GiB+ budgets: no change. Judge at
+EDEN_NX2_VRAM_LIMIT_MIB=8192 + FRITCHII_VRAM_SIM_OTHERS=1 with EDEN_NX2_TC_LOG=1: the collector
+line's deletes (costly, downloaded) and uploads drop, "over the budget" stays 0, fps / 1% lows /
+hitch score at the market and night market.
+
+### FRITCHII_DEPTH_POOL_RETRY
+
+TEST, off by default (helper BF, 2026-11-16). Live: 1 = a depth target that does not fit
+EDEN_NX2_DEPTH_POOL's 64 MiB blocks is made the normal way (within the budget) before anything
+counts as memory pressure. Why: OoT's 12288x12288 D16 sun shadow map (288 MiB) never fits the pool,
+so it went down the over-budget path with VRAM to spare: "is over the memory budget; allocating it
+anyway" and "Out of device memory: keeping 512 MiB more free" on a 16 GB card at 1.5 GB used
+(prof-market-log 41.0 s, also in the 8 GB run). Each such false event empties the image pool (up to
+1 GiB of render targets to re-make), releases the kept blocks and lowers the thresholds by 512 MiB
+for minutes on small cards. Log: "Depth image WxH (format F) did not fit the depth pool; made
+without it (FRITCHII_DEPTH_POOL_RETRY, N so far)". Judge: the two warnings above are gone at the
+market after load; nothing else changes (placement only).
+
+### FRITCHII_VRAM_REPORT
+
+TEST tool, off by default (helper BF, 2026-11-16). Live: 1 = every 30 frames the main device-local
+heap's usage against its budget as the driver reports them (all process memory there, unused
+block space included; the budget at most the simulated limit), one line every 600 frames: "VRAM
+fit (FRITCHII_VRAM_REPORT) last 600 frames: main heap U of B MiB budget now, peak P MiB; over the
+budget in O of S samples (most M MiB over); image pool, kept blocks, block slack, staging upload /
+download / device, stream MiB; memory pressure events, failed images". Over the budget is where a
+real card starts moving memory to system RAM: on an 8 GB card that is the fps cliff. One driver
+memory query per 30 frames.
+
+### FRITCHII_VRAM_SIM_OTHERS
+
+TEST, off by default (helper BF, 2026-11-16; boot, with EDEN_NX2_VRAM_LIMIT_MIB). 1 = the simulated
+card's limit becomes the limit less what Windows and the other programs hold on the real card,
+measured once at boot (heap size less the driver's budget; 16 GB card: 16376 - 15297 = ~1.1 GiB).
+Why: EDEN_NX2_VRAM_LIMIT_MIB=8192 alone gave the simulated card a budget of the whole 8 GiB, but a
+real 8 GB card next to the same desktop has ~7.1 GiB: the thresholds, VMA's budget and its heap
+limit then sat ~1 GiB too high. VMA fails past the limit where a real card would spill into system
+memory; images then go to host memory, as slow as the spill, so fps cliffs show up too. Log:
+"FRITCHII_VRAM_SIM_OTHERS: others hold N MiB of this card's H MiB heap; the simulated card's limit
+and budget are L MiB". The result depends on what else runs (OBS, browser): read the log line.
+Known gaps: each of the two VMA allocators (images, buffers) gets the limit on its own, and driver
+memory outside VMA (DLSS, pipelines, swapchain) counts in the budget but not in VMA's hard limit.
+
+### FRITCHII_AMD_OVERALLOCATE
+
+TEST, off by default (helper BF, 2026-11-16; boot; port of zortos293/Lichii #1335 via
+Frizti/Fritchii #61). 1 = on AMD's own drivers (AMD proprietary / AMD open source, not RADV) with
+VK_AMD_memory_overallocation_behavior, device memory may be overallocated: allocations past a full
+heap spill into system memory instead of failing. Why: upstream traced 27 failing sessions (24 AMD,
+mostly 8 GB cards in OoT) to failed device-local allocations with host memory free. Fritchii
+already retries out-of-budget images and then places them in host memory, so this mostly removes
+those fallbacks' "placed in host memory" / failed image lines. Log: "FRITCHII_AMD_OVERALLOCATE:
+VK_AMD_memory_overallocation_behavior on". Judge on an AMD 8 GB card only (no effect elsewhere):
+fewer "Out of device memory" and failed-image lines, no crash at full VRAM.
+
 ### FRITCHII_STAGING_RING
 
 TEST, off by default (helper AO, 2026-11-15, port of DahBard/Blitchii's staging ring, r64). The

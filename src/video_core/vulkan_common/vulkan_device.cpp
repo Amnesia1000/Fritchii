@@ -654,6 +654,25 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         first_next = &diagnostics_nv;
     }
 
+    // FRITCHII_AMD_OVERALLOCATE (boot, default 0; port of zortos293/Lichii #1335 via Frizti/Fritchii
+    // #61): AMD's own Windows driver fails device-local allocations once the heap is full unless
+    // overallocation is allowed, which lets them spill into system memory as other drivers do.
+    // 27 failing sessions upstream, 24 on AMD, mostly 8 GB cards running OoT.
+    VkDeviceMemoryOverallocationCreateInfoAMD overallocation_amd{
+        .sType = VK_STRUCTURE_TYPE_DEVICE_MEMORY_OVERALLOCATION_CREATE_INFO_AMD,
+        .pNext = first_next,
+        .overallocationBehavior = VK_MEMORY_OVERALLOCATION_BEHAVIOR_ALLOWED_AMD,
+    };
+    if (const char* overallocate = std::getenv("FRITCHII_AMD_OVERALLOCATE");
+        overallocate != nullptr && overallocate[0] != '\0' && overallocate[0] != '0' &&
+        is_amd_driver &&
+        supported_extensions.contains(VK_AMD_MEMORY_OVERALLOCATION_BEHAVIOR_EXTENSION_NAME)) {
+        loaded_extensions.insert(VK_AMD_MEMORY_OVERALLOCATION_BEHAVIOR_EXTENSION_NAME);
+        first_next = &overallocation_amd;
+        LOG_INFO(Render_Vulkan, "FRITCHII_AMD_OVERALLOCATE: VK_AMD_memory_overallocation_behavior "
+                                "on, device memory may overflow into system memory");
+    }
+
     is_blit_depth24_stencil8_supported = TestDepthStencilBlits(VK_FORMAT_D24_UNORM_S8_UINT);
     is_blit_depth32_stencil8_supported = TestDepthStencilBlits(VK_FORMAT_D32_SFLOAT_S8_UINT);
     is_optimal_astc_supported = ComputeIsOptimalAstcSupported();
@@ -2481,6 +2500,21 @@ u64 Device::GetDeviceMemorySlack() const {
     return statistics.blockBytes - (std::min)(statistics.blockBytes, statistics.allocationBytes);
 }
 
+bool Device::MainHeapUsage(u64& usage, u64& budget_bytes) const {
+    if (!extensions.memory_budget) {
+        return false;
+    }
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+    budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+    physical.GetMemoryProperties(&budget);
+    usage = budget.heapUsage[main_heap];
+    budget_bytes = budget.heapBudget[main_heap];
+    if (heap_size_limit != 0) {
+        budget_bytes = (std::min)(budget_bytes, heap_size_limit);
+    }
+    return true;
+}
+
 u64 Device::GetDeviceMemoryBudget() const {
     if (!extensions.memory_budget) {
         return 0;
@@ -2536,6 +2570,36 @@ void Device::CollectPhysicalMemoryInfo() {
             LOG_WARNING(Render_Vulkan, "EDEN_NX2_VRAM_LIMIT_MIB={} is not a size in MiB, ignored",
                         value);
         }
+    }
+    // FRITCHII_VRAM_SIM_OTHERS (boot, default 0; with EDEN_NX2_VRAM_LIMIT_MIB): the limit alone
+    // gives the simulated card a budget of the whole limit, but a real card's budget is its heap
+    // less what Windows and the other programs hold (16 GB card: 16376 MiB heap, 15297 budget).
+    // An 8 GB card on the same desktop has the same others, so its budget is ~7.1 GiB, not 8.
+    // With the switch the limit becomes the limit less those others, measured here once: the
+    // budget, the texture cache's thresholds and VMA's heap limit then sit where a real card's
+    // budget would. VMA fails past it, where a real card would spill into system memory; images
+    // then go to host memory, which is as slow as the spill.
+    if (const char* sim = std::getenv("FRITCHII_VRAM_SIM_OTHERS");
+        sim != nullptr && sim[0] != '\0' && sim[0] != '0' && heap_size_limit != 0 &&
+        extensions.memory_budget && !is_integrated) {
+        size_t largest = 0;
+        for (size_t heap = 0; heap < num_properties; ++heap) {
+            const VkMemoryHeap& candidate = mem_properties.memoryHeaps[heap];
+            if ((candidate.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0 &&
+                ((mem_properties.memoryHeaps[largest].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) ==
+                     0 ||
+                 candidate.size > mem_properties.memoryHeaps[largest].size)) {
+                largest = heap;
+            }
+        }
+        const u64 heap_size = mem_properties.memoryHeaps[largest].size;
+        const u64 others = heap_size - (std::min)(heap_size, u64{budget.heapBudget[largest]});
+        const u64 limited = heap_size_limit - (std::min)(others, heap_size_limit / 2);
+        LOG_INFO(Render_Vulkan,
+                 "FRITCHII_VRAM_SIM_OTHERS: others hold {} MiB of this card's {} MiB heap; the "
+                 "simulated card's limit and budget are {} MiB (EDEN_NX2_VRAM_LIMIT_MIB {})",
+                 others >> 20, heap_size >> 20, limited >> 20, heap_size_limit >> 20);
+        heap_size_limit = limited;
     }
     const auto limit = [this](u64 size) {
         return heap_size_limit != 0 ? (std::min)(size, heap_size_limit) : size;

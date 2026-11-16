@@ -212,6 +212,14 @@ inline std::atomic<int> g_acquire_table_first{-1};
 inline std::atomic<int> g_e2c_census{-1};
 /// FRITCHII_KILL_RT_POOL: docs/fritchii/switches.md.
 inline std::atomic<int> g_kill_rt_pool{-1};
+/// FRITCHII_DEPTH_POOL_RETRY: docs/fritchii/switches.md.
+inline std::atomic<int> g_depth_pool_retry{-1};
+/// FRITCHII_VRAM_POOL_FIT: docs/fritchii/switches.md.
+inline std::atomic<int> g_vram_pool_fit{-1};
+/// FRITCHII_VRAM_CRITICAL_FIT: docs/fritchii/switches.md.
+inline std::atomic<int> g_vram_critical_fit{-1};
+/// FRITCHII_VRAM_REPORT: docs/fritchii/switches.md.
+inline std::atomic<int> g_vram_report{-1};
 /// FRITCHII_E2C_ON_E: docs/fritchii/switches.md.
 inline std::atomic<int> g_e2c_on_e{-1};
 /// FRITCHII_STAMP_READ_PAGES: docs/fritchii/switches.md.

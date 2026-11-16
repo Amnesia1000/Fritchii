@@ -692,6 +692,17 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
         // a 24 ms texture stall every ~3 s. Keep 2.5 GiB of the budget for everything else instead.
         if (budget >= 10_GiB) {
             max_critical = (std::max)(max_critical, budget - 2560_MiB);
+        } else if (budget > 4_GiB &&
+                   VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_vram_critical_fit,
+                                                    "FRITCHII_VRAM_CRITICAL_FIT") != 0) {
+            // FRITCHII_VRAM_CRITICAL_FIT (live, default 0; with FRITCHII_VRAM_POOL_FIT): an 8 GB
+            // card (budget ~7.1 GiB with Windows and other programs) stopped at the fixed 5 GiB
+            // and its last ~2 GiB of budget went to the image pool and margins while OoT's market
+            // (~5.1-5.3 GiB in the cache's view on a 16 GB card) evicted and re-made textures.
+            // Here the cap is the budget less the cache's margin (1/8 of it, at most 1 GiB) and
+            // 512 MiB for deleted images still in flight; the fitted pool yields the rest.
+            const u64 margin = (std::min)(budget / 8, u64{1_GiB});
+            max_critical = (std::max)(max_critical, budget - margin - 512_MiB);
         }
     }
     critical_memory = (std::min)(critical_memory, max_critical);

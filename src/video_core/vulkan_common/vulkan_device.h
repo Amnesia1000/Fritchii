@@ -1220,6 +1220,11 @@ FN_MAX_LIMIT_LIST
     /// yet the driver does: with the heap at its budget it is not available to new images.
     u64 GetDeviceMemorySlack() const;
 
+    /// FRITCHII_VRAM_REPORT: the main device-local heap's usage and budget as the driver reports
+    /// them (all of this process's memory in it, the unused part of blocks included), the budget
+    /// at most the EDEN_NX2_VRAM_LIMIT_MIB limit. False without VK_EXT_memory_budget.
+    bool MainHeapUsage(u64& usage, u64& budget) const;
+
     u32 GetSetsPerPool() const {
         return sets_per_pool;
     }

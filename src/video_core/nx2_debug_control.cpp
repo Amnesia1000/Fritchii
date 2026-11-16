@@ -449,6 +449,18 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_KILL_RT_POOL") {
         return &g_kill_rt_pool;
     }
+    if (name == "FRITCHII_DEPTH_POOL_RETRY") {
+        return &g_depth_pool_retry;
+    }
+    if (name == "FRITCHII_VRAM_POOL_FIT") {
+        return &g_vram_pool_fit;
+    }
+    if (name == "FRITCHII_VRAM_CRITICAL_FIT") {
+        return &g_vram_critical_fit;
+    }
+    if (name == "FRITCHII_VRAM_REPORT") {
+        return &g_vram_report;
+    }
     if (name == "FRITCHII_E2C_ON_E") {
         return &g_e2c_on_e;
     }

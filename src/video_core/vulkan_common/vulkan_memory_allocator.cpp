@@ -746,6 +746,26 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
                           ? TimedVmaCreateImage(device, allocator, ci, first_ci, handle,
                                                 allocation, alloc_info)
                           : vmaCreateImage(allocator, &ci, &first_ci, &handle, &allocation, &alloc_info);
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge && first_ci.pool != VK_NULL_HANDLE &&
+        VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_depth_pool_retry,
+                                         "FRITCHII_DEPTH_POOL_RETRY") != 0) {
+        // FRITCHII_DEPTH_POOL_RETRY (live, default 0): a depth target larger than the depth pool's
+        // 64 MiB blocks never fits it (OoT's 12288x12288 D16 sun shadow map, 288 MiB). Without
+        // the retry it went down the over-budget path below with VRAM to spare: a memory pressure
+        // event that empties the image pool, releases the kept blocks and makes the texture cache
+        // keep 512 MiB more free ("Out of device memory" on a 16 GB card at 1.5 GB used). It tries
+        // the normal way, within the budget, before anything counts as pressure.
+        result = vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+        static std::atomic<u32> retried{0};
+        const u32 count = retried.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (count <= 4 || (count & (count - 1)) == 0) {
+            LOG_INFO(Render_Vulkan,
+                     "Depth image {}x{} (format {}) did not fit the depth pool; {} without it "
+                     "(FRITCHII_DEPTH_POOL_RETRY, {} so far)",
+                     ci.extent.width, ci.extent.height, static_cast<u32>(ci.format),
+                     result == VK_SUCCESS ? "made" : "out of budget", count);
+        }
+    }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge && device.KeptBlockBytes() != 0) {
         // FRITCHII_KEEP_BLOCKS: the kept blocks count against the budget VMA checks; they go
         // first, and VMA reads the driver's usage again before the retry.
