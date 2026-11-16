@@ -6026,6 +6026,11 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
     auto& pipeline{pair->second};
     if (is_new) {
         ReportNewPipelineKey(graphics_key);
+        // FRITCHII_RAM_PREBUILT_KEEP: a boot build destroyed unused is translated again here.
+        if (!evicted_unused_prebuilt.empty() &&
+            evicted_unused_prebuilt.erase(graphics_key.Hash()) != 0) {
+            ++prebuilt_evicted_needed;
+        }
         pipeline = TakeBackgroundPipeline(graphics_key);
         // A key evicted earlier (EvictUnusedPipelines) is translated binding the storage buffer
         // pointers it bound, whatever their slots hold now: one null or unmapped around an area
@@ -6238,8 +6243,29 @@ void PipelineCache::TickFrame() {
     if (device.IsExtGraphicsPipelineLibrarySupported()) {
         graphics_libraries.Report();
     }
+    // FRITCHII_MEM_CENSUS: what destroying a batch of evicted pipelines gives back, to price a
+    // pipeline's driver memory (the 0.45 MB the memory lines use is an estimate).
+    const bool price_frees = Common::MemCensus::Mode() != 0 && evicted_pipelines.size() >= 32 &&
+                             scheduler.IsFree(evicted_pipelines[31].first);
+    const Common::ProcessMemoryUsage before_frees =
+        price_frees ? Common::GetProcessMemoryUsage() : Common::ProcessMemoryUsage{};
+    size_t freed_pipelines = 0;
     while (!evicted_pipelines.empty() && scheduler.IsFree(evicted_pipelines.front().first)) {
         evicted_pipelines.pop_front();
+        ++freed_pipelines;
+    }
+    if (price_frees) {
+        const Common::ProcessMemoryUsage after = Common::GetProcessMemoryUsage();
+        const auto delta = [](u64 from, u64 to) {
+            return static_cast<double>(static_cast<s64>(from) - static_cast<s64>(to)) / 1024.0;
+        };
+        LOG_INFO(Render_Vulkan,
+                 "Pipeline frees (FRITCHII_MEM_CENSUS): {} graphics pipelines destroyed, private "
+                 "commit -{:.0f} KiB ({:.0f} KiB each), working set -{:.0f} KiB",
+                 freed_pipelines, delta(before_frees.private_bytes, after.private_bytes),
+                 delta(before_frees.private_bytes, after.private_bytes) /
+                     static_cast<double>((std::max)(freed_pipelines, size_t{1})),
+                 delta(before_frees.working_set, after.working_set));
     }
     // A retired translation's build may still be queued on the pipeline workers: destroying it
     // now would wait for that build, or run it here on the GPU thread.
@@ -6273,10 +6299,12 @@ PipelineCache::MemoryOwnerCounts PipelineCache::MemoryOwners() {
     for (const auto& [key, pipeline] : graphics_cache) {
         if (pipeline != nullptr && pipeline->IsBuilt()) {
             ++counts.graphics_built;
+            counts.graphics_never_used += pipeline->WasUsed() ? 0 : 1;
         }
     }
     for (const auto& [key, entry] : compute_cache) {
         counts.compute += entry.pipeline != nullptr ? 1 : 0;
+        counts.compute_never_dispatched += entry.pipeline != nullptr && !entry.dispatched ? 1 : 0;
         counts.compute += entry.pending != nullptr && entry.pending->pipeline != nullptr ? 1 : 0;
     }
     counts.awaiting_destruction = evicted_pipelines.size() + retired_translations.size() +
@@ -6334,7 +6362,15 @@ void PipelineCache::EvictUnusedPipelines() {
     // Past it only the excess goes, least recently used first (ported), so
     // crossing it doesn't drop every stale pipeline at once.
     const size_t evict_above = EvictAbovePipelines();
-    if (graphics_cache.size() <= evict_above) {
+    // FRITCHII_RAM_PREBUILT_KEEP (live, default 0 = off): boot-built pipelines no draw has used,
+    // unused for EvictAfterFrames, are destroyed past this many kept, also below evict_above
+    // (16 GB PCs: ~2,280, which the market's ~1,800 never reached). 16 GB of RAM is the target:
+    // each holds ~0.3-0.45 MB of driver memory. One needed again later is translated anew
+    // (counted below as "needed again").
+    const int keep_switch = VideoCore::Nx2Debug::SwitchValue(
+        VideoCore::Nx2Debug::g_ram_prebuilt_keep, "FRITCHII_RAM_PREBUILT_KEEP");
+    const bool over = graphics_cache.size() > evict_above;
+    if (!over && keep_switch <= 0) {
         return;
     }
     const u64 cutoff = frame_count - EvictAfterFrames;
@@ -6343,31 +6379,52 @@ void PipelineCache::EvictUnusedPipelines() {
     // again on the GPU thread when it reaches that content. Past the budget (~0.9 GB of driver
     // memory) they go like the rest, so a large cache can't hold their memory all session.
     constexpr size_t MaxUnusedPrebuiltPipelines = 2000;
+    const size_t unused_budget =
+        keep_switch > 0 ? (std::min)(static_cast<size_t>(keep_switch), MaxUnusedPrebuiltPipelines)
+                        : MaxUnusedPrebuiltPipelines;
     size_t kept_prebuilt = 0;
+    size_t unused_candidates = 0;
     std::vector<std::pair<u64, GraphicsPipelineCacheKey>> candidates;
     for (const auto& [key, pipeline] : graphics_cache) {
         if (pipeline == nullptr || pipeline.get() == current_pipeline || !pipeline->IsBuilt() ||
             pipeline->LastUse() >= cutoff) {
             continue;
         }
-        if (!pipeline->WasUsed() && kept_prebuilt < MaxUnusedPrebuiltPipelines) {
-            ++kept_prebuilt;
+        if (!pipeline->WasUsed()) {
+            if (kept_prebuilt < unused_budget) {
+                ++kept_prebuilt;
+                continue;
+            }
+            // With the switch on they go first (sort key 0), whatever their build frame.
+            ++unused_candidates;
+            candidates.emplace_back(keep_switch > 0 ? 0 : pipeline->LastUse(), key);
             continue;
         }
-        candidates.emplace_back(pipeline->LastUse(), key);
+        if (over) {
+            candidates.emplace_back(pipeline->LastUse(), key);
+        }
     }
-    const size_t evicted = VideoCommon::GraphicsPipelinesToEvict(graphics_cache.size(),
-                                                                 candidates.size(), evict_above);
+    size_t evicted = over ? VideoCommon::GraphicsPipelinesToEvict(graphics_cache.size(),
+                                                                  candidates.size(), evict_above)
+                          : 0;
+    if (keep_switch > 0) {
+        evicted = (std::max)(evicted, unused_candidates);
+    }
     if (evicted == 0) {
         return;
     }
     std::nth_element(candidates.begin(), candidates.begin() + (evicted - 1), candidates.end(),
                      [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
     const u64 tick = scheduler.CurrentTick();
+    size_t evicted_unused = 0;
     for (size_t i = 0; i < evicted; ++i) {
         const auto it = graphics_cache.find(candidates[i].second);
         if (used_this_session.erase(it->second.get()) != 0) {
             used_and_evicted.insert(it->first.Hash());
+        }
+        if (keep_switch > 0 && !it->second->WasUsed()) {
+            evicted_unused_prebuilt.insert(it->first.Hash());
+            ++evicted_unused;
         }
         evicted_pointer_slots.Remember(it->first.Hash(), it->second->MappedPointers());
         evicted_pipelines.emplace_back(tick, std::move(it->second));
@@ -6378,8 +6435,12 @@ void PipelineCache::EvictUnusedPipelines() {
             pipeline->ClearTransitions();
         }
     }
-    LOG_INFO(Render_Vulkan, "Evicted {} graphics pipelines unused for {} frames, {} left", evicted,
-             EvictAfterFrames, graphics_cache.size());
+    prebuilt_evicted_total += evicted_unused;
+    LOG_INFO(Render_Vulkan,
+             "Evicted {} graphics pipelines unused for {} frames, {} left; {} of them boot builds "
+             "no draw used (FRITCHII_RAM_PREBUILT_KEEP={}: {} this session, {} needed again)",
+             evicted, EvictAfterFrames, graphics_cache.size(), evicted_unused, keep_switch,
+             prebuilt_evicted_total, prebuilt_evicted_needed);
 }
 
 void PipelineCache::EvictUnusedComputePipelines(int mode) {

@@ -398,8 +398,9 @@ void LogMemoryOwners(const Device& device, PipelineCache& pipeline_cache,
     LOG_INFO(Render_Vulkan,
              "Memory owners: working set {} = private {} + shared {}, private commit {}; guest "
              "{} committed, resident {} backing + {} views - {} both = {} (views map {}, "
-             "sampled in {} us); pipelines {} graphics built of {} + {} compute, {} awaiting "
-             "destruction, ~{} at 0.45 MB each, pipeline cache data {}; VMA host {} used of {} "
+             "sampled in {} us); pipelines {} graphics built of {} ({} never used) + {} compute "
+             "({} never dispatched), {} awaiting destruction, ~{} at 0.45 MB each, pipeline cache "
+             "data {}; VMA host {} used of {} "
              "({} in blocks), device-local {} of {}; staging upload {} download {} device {} "
              "stream {}; heaps CRT {} committed ({} allocated), {} others {} committed ({} "
              "allocated, {} us); residual {} (MiB)",
@@ -408,7 +409,8 @@ void LogMemoryOwners(const Device& device, PipelineCache& pipeline_cache,
              mib(process.private_bytes), mib(commit.committed_bytes),
              mib(resident.backing_bytes), mib(resident.view_bytes), mib(resident.both_bytes),
              mib(guest_unique), mib(resident.view_mapped_bytes), resident.micros,
-             pipelines.graphics_built, pipelines.graphics_entries, pipelines.compute,
+             pipelines.graphics_built, pipelines.graphics_entries, pipelines.graphics_never_used,
+             pipelines.compute, pipelines.compute_never_dispatched,
              pipelines.awaiting_destruction, mib(pipeline_estimate),
              mib(pipelines.cache_data_bytes), mib(heaps.host_usage), mib(heaps.host_budget),
              mib(heaps.host_blocks), mib(heaps.local_usage), mib(heaps.local_budget),

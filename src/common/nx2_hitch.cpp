@@ -164,7 +164,33 @@ std::mutex g_compile_mutex;
 std::unordered_map<u64, u8> g_compiled_on; ///< key -> mask of the cores that compiled it
 u8 g_cores_seen{};
 std::array<std::vector<u64>, 8> g_warm_queues;
+// Blocks each core compiled, warm and on demand (FRITCHII_MEM_CENSUS reads them).
+std::array<std::atomic<u64>, 8> g_warm_compiles{};
+std::array<std::atomic<u64>, 8> g_demand_compiles{};
 } // Anonymous namespace
+
+u32 JitWarmCoreMask() {
+    static const u32 mask = [] {
+        const char* const value = std::getenv("FRITCHII_JIT_WARM_CORES");
+        const u32 set = value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 0)) : 0;
+        return set != 0 ? (set & 0xff) : 0xffU;
+    }();
+    return mask;
+}
+
+std::string JitCompileCensus() {
+    std::string text = fmt::format("JIT blocks compiled per core, warm/on demand (warm cores mask "
+                                   "{:#x}):",
+                                   JitWarmCoreMask());
+    for (u32 core = 0; core < 8; ++core) {
+        const u64 warm = g_warm_compiles[core].load(std::memory_order_relaxed);
+        const u64 demand = g_demand_compiles[core].load(std::memory_order_relaxed);
+        if (warm != 0 || demand != 0) {
+            text += fmt::format(" core {} {}/{}", core, warm, demand);
+        }
+    }
+    return text;
+}
 
 bool JitWarmEnabled() {
     static const bool enabled = [] {
@@ -179,6 +205,8 @@ Cause CompileCause(u64 key, u32 core) {
         FritchiiJitList::Note(key); // FRITCHII_JIT_BLOCK_LIST: one relaxed load when off
     }
     const u8 bit = static_cast<u8>(1U << (core & 7));
+    (t_warming ? g_warm_compiles : g_demand_compiles)[core & 7].fetch_add(
+        1, std::memory_order_relaxed);
     std::scoped_lock lock{g_compile_mutex};
     g_cores_seen |= bit;
     u8& mask = g_compiled_on[key];
@@ -188,11 +216,13 @@ Cause CompileCause(u64 key, u32 core) {
         return Cause::WarmCompile;
     }
     // Single-stepping blocks (bit 57 of an A64 LocationDescriptor) are never worth warming.
+    // FRITCHII_JIT_WARM_CORES: only the cores in the mask get the copies.
     if (JitWarmEnabled() && ((key >> 57) & 1) == 0) {
+        const u32 warm_cores = JitWarmCoreMask();
         for (u32 other = 0; other < 8; ++other) {
             const u8 other_bit = static_cast<u8>(1U << other);
-            if ((g_cores_seen & other_bit) != 0 && (mask & other_bit) == 0 &&
-                g_warm_queues[other].size() < 400'000) {
+            if ((warm_cores & other_bit) != 0 && (g_cores_seen & other_bit) != 0 &&
+                (mask & other_bit) == 0 && g_warm_queues[other].size() < 400'000) {
                 g_warm_queues[other].push_back(key);
             }
         }
@@ -202,6 +232,10 @@ Cause CompileCause(u64 key, u32 core) {
 
 size_t TakeWarmKeys(u32 core, std::vector<u64>& out, size_t max) {
     out.clear();
+    // FRITCHII_JIT_WARM_CORES: a core outside the mask compiles only what it runs.
+    if ((JitWarmCoreMask() & (1U << (core & 7))) == 0) {
+        return 0;
+    }
     std::unique_lock lock{g_compile_mutex};
     auto& queue = g_warm_queues[core & 7];
     const u8 bit = static_cast<u8>(1U << (core & 7));

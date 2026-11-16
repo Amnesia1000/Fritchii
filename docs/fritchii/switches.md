@@ -7,6 +7,77 @@ rebuilds nothing.
 
 ## Named switches
 
+### FRITCHII_MEM_CENSUS
+
+MEASURE, off by default (helper BE, 2026-11-16; the 16 GB RAM / 8 GB card goal). Boot. Why: the
+"Memory owners" line left ~3.7 GB of the private working set unattributed at the Castle Town market
+(working set 11.8 GB steady, 14.6 GB peak). With the switch on, a thread at low priority wakes
+every second; every 30 s, and whenever the working set is the highest yet and 512 MiB above the
+last census (at most every 5 s: load peaks), it walks the whole address space (VirtualQuery; one
+QueryWorkingSet for residency, the same query the zero-page pass makes, ~150-270 ms of kernel time;
+on Linux /proc/self/smaps) and logs four "Memory census (30 s|peak)" lines, committed/resident MiB:
+1) the totals: guest backing and guest views (tagged by DeviceMemory), VMA host maps (VMA's
+vkMapMemory calls, tagged while the switch is on), census scratch (its own page list), images,
+other mapped files, executable private memory (the JIT code caches: one 512 MiB reservation per
+core; driver code too), heaps (first segments of each Win32 heap; the CRT heap apart), thread
+stacks, other private memory, and "resident not in any of them" (should be ~0);
+2) images by name (nvoglv64, nvgpucomp64, Qt, ...); 3) other mapped files by name; 4) the exec
+allocations and the other private memory by reservation size (<64 KiB, 64 KiB-1 MiB, 1-16, 16-64,
+64-256, 256 MiB+) with the 10 largest allocations: base, reservation MiB, committed/resident,
+protection; 5) "more": JIT blocks compiled per core (warm/on demand), the sampled guest residency
+(backing + views - both = guest RAM: a guest page read through both addresses is counted twice in
+the working set but is one page of RAM), and with 2 every heap's summary. Values: 1 = committed
+and resident; 2 = also HeapSummary of every heap (locks each heap for its walk: ~250 ms on a 2.5 GB
+CRT heap, game threads that allocate freeze meanwhile; only for a memory hunt); 3 = committed only
+(no working set query). Also with the switch on: "Pipeline frees (FRITCHII_MEM_CENSUS)" when 32 or
+more evicted graphics pipelines are destroyed at once (private commit and working set given back,
+KiB per pipeline: the 0.45 MB in the memory lines is an estimate). Costs: the residency query
+holds the working set lock while it runs (a Hitch line shows it as "memory sample"); read the fps
+with the switch off.
+
+### FRITCHII_JIT_WARM_CORES
+
+TEST, off by default (helper BE, 2026-11-16). Boot, a core mask (hex with 0x, e.g. 0x3 = cores 0
+and 1); 0 or unset = every core, as before. Each guest core has its own recompiler with its own
+code cache and block tables. EDEN_NX2_JIT_WARM copies every block one core compiles to every other
+core, and FRITCHII_JIT_BLOCK_LIST=1 hands every core the whole list (OoT: 765,194 blocks, "warm-up
+handed out 765194/765194/765194/765194"), so each core holds the code of every block any core ever
+ran. Cores outside the mask take no part in either: they compile only what they run. Expected
+saving: the census's exec private (code) and part of the CRT heap (block tables) for each core left
+out; measure the per-core exec rows first (FRITCHII_MEM_CENSUS=1): if each core holds ~400 MiB of
+code + tables, leaving two cores out saves ~800 MiB. Risk: a core left out compiles on demand the
+first time it runs a block (the hitch the warm-up removed). Judge by the census's "JIT blocks
+compiled per core, warm/on demand" (the on-demand count of the cores left out after the load),
+"Recompile" in the Hitch lines, and the hitch score; pick the mask from the census (the cores with
+few on-demand compiles in a normal run are the ones to leave out).
+
+### FRITCHII_RAM_PREBUILT_KEEP
+
+TEST, off by default (helper BE, 2026-11-16). Live: N > 0 = graphics pipelines built at boot from
+the disk cache that no draw has used, unused for 9,000 frames, are destroyed past N kept (at most
+2,000, the old budget), also while the cache is under the eviction threshold (16 GB PCs ~2,280:
+the market's ~1,800 built never reached it, so nothing was ever evicted there). With the switch on
+they also go first when the cache is over the threshold. Why: each holds an estimated 0.3-0.45 MB
+of driver memory (NVIDIA). The "Memory owners" line now says how many built pipelines no draw used
+("N never used") and how many compute pipelines no dispatch used (EXP51=2 already evicts those).
+Expected saving: (never used - N) x ~0.3-0.45 MB, e.g. 1,000 unused at N = 200: ~250-350 MiB.
+Cost: one destroyed and needed later (the player reaches that content) is translated and built
+again on the GPU thread (~10 ms, or skipped draws with async shaders). Log: the eviction line adds
+"N of them boot builds no draw used (FRITCHII_RAM_PREBUILT_KEEP=K: T this session, A needed
+again)"; A must stay near 0 in a normal route, and the hitch score must not move.
+
+### FRITCHII_ZERO_TRIM_BATCH
+
+TEST, off by default (helper BE, 2026-11-16). Boot, Windows. The zero-page pass reads, through the
+backing, every resident guest view page whose backing page is not in the working set, which puts
+that backing page in the working set until the pass ends: the same RAM page counted twice. The
+market's working set peaks (12.2, 14.1 and 14.6 GB at 28, 40 and ~64 s, prof-market-log) each fall
+inside a pass, ~2 GB over the steady 12.4 GB. With 1 those pages leave the working set every 4,096
+pages instead of at the end. What is trimmed stays the same; the unlock calls are the same count
+in more batches. Expected: the peak working set ~2 GB lower (no RAM is freed: the pages were RAM
+already; but Windows and the owner's tools stop seeing a 14.6 GB process). Judge: "Memory:" peak and
+"Zero-page pass" lines (same MiB trimmed, similar ms), hitch score unchanged.
+
 ### FRITCHII_PROTECT_UNLOCKED
 
 TEST, off by default (helper AK, 2026-11-15, port of zortos293/Lichii #1780 by Reiixan); live,

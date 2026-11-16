@@ -197,8 +197,10 @@ public:
     /// What the "Memory owners" log line counts here (GPU thread).
     struct MemoryOwnerCounts {
         size_t graphics_built{};       ///< Built graphics pipelines (each holds driver memory)
+        size_t graphics_never_used{};  ///< Of them, boot builds no draw has used yet
         size_t graphics_entries{};     ///< graphics_cache entries, unbuilt ones included
         size_t compute{};              ///< Compute pipelines, pending rebuilds included
+        size_t compute_never_dispatched{}; ///< Of them, boot builds no dispatch has used yet
         size_t awaiting_destruction{}; ///< Evicted or retired, destroyed once the GPU is done
         u64 cache_data_bytes{};        ///< vkGetPipelineCacheData's size, at most a minute old
     };
@@ -651,6 +653,11 @@ private:
     std::deque<std::pair<u64, std::unique_ptr<GraphicsPipeline>>> retired_translations; ///< (tick, pipeline)
     void RetireTranslatedPipeline(std::unique_ptr<GraphicsPipeline> pipeline);
     std::unordered_set<u64> used_and_evicted; ///< Key hashes of pipelines used this session, evicted since
+    /// FRITCHII_RAM_PREBUILT_KEEP: key hashes of boot builds destroyed before any draw used them,
+    /// and how many went that way / were asked for again (translated anew) this session.
+    std::unordered_set<u64> evicted_unused_prebuilt;
+    u64 prebuilt_evicted_total{};
+    u64 prebuilt_evicted_needed{};
     /// The pointer slots of evicted graphics pipelines, for their next translation (ported).
     /// Forgotten once a pipeline of the key is made again.
     VideoCommon::EvictedPointerSlots evicted_pointer_slots;
