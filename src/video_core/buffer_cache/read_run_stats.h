@@ -69,7 +69,7 @@ private:
 
 inline bool ReadRunsValue(bool writer_ticks) {
     // FRITCHII_EARLY_COMPUTE and FRITCHII_READ_SIDE_COPY count on this ring and its stamps.
-    if (EarlyCompute::g_early || EarlyCompute::g_side_copy) {
+    if (EarlyCompute::g_early || EarlyCompute::g_side_copy || EarlyCompute::g_submit_times) {
         return true;
     }
     const char* value = std::getenv("FRITCHII_READ_RUNS");
@@ -283,6 +283,15 @@ struct WriterAnswer {
     bool cut{};           ///< a host wait was cut at the writer's tick
     u64 writer_wait_ns{}; ///< until the writer's submission ran
     u64 rest_wait_ns{};   ///< then until the read's download (or fence download) was there
+    // FRITCHII_SUBMIT_TIMES: the submissions from the one after the known tick to the writer's,
+    // on the GPU (measured once the writer ran).
+    u64 cut_tick{}; ///< the scheduler tick the wait was cut at
+    u32 ahead_submissions{};
+    u32 ahead_resolved{};
+    u64 ahead_busy_ns{};
+    u64 ahead_gap_ns{};
+    u64 ahead_overlap_ns{};
+    u64 ahead_span_ns{};
 };
 inline thread_local WriterAnswer t_writer_answer{};
 
@@ -421,6 +430,15 @@ struct TickCounts {
     u64 writer_ns[3]{};  ///< of them, until the writer's submission ran
     u64 rest_ns[3]{};    ///< then until the download was there
     u64 rest_max_ns[3]{};
+    // FRITCHII_SUBMIT_TIMES, over the cut reads that had submissions measured.
+    u64 ahead_reads[3]{};
+    u64 ahead_submissions[3]{};
+    u64 ahead_resolved[3]{};
+    u64 ahead_busy_ns[3]{};
+    u64 ahead_gap_ns[3]{};
+    u64 ahead_overlap_ns[3]{};
+    u64 ahead_span_ns[3]{};
+    u64 ahead_writer_ns[3]{}; ///< those reads' "until the writer ran", to set against the above
 };
 
 struct State {
@@ -587,6 +605,16 @@ inline void NoteWriter(Kind kind, u64 wait_ns, const WriterAnswer& a, const u8* 
                 t.writer_ns[k] += a.writer_wait_ns;
                 t.rest_ns[k] += a.rest_wait_ns;
                 t.rest_max_ns[k] = (std::max)(t.rest_max_ns[k], a.rest_wait_ns);
+                if (a.ahead_resolved != 0) {
+                    ++t.ahead_reads[k];
+                    t.ahead_submissions[k] += a.ahead_submissions;
+                    t.ahead_resolved[k] += a.ahead_resolved;
+                    t.ahead_busy_ns[k] += a.ahead_busy_ns;
+                    t.ahead_gap_ns[k] += a.ahead_gap_ns;
+                    t.ahead_overlap_ns[k] += a.ahead_overlap_ns;
+                    t.ahead_span_ns[k] += a.ahead_span_ns;
+                    t.ahead_writer_ns[k] += a.writer_wait_ns;
+                }
             }
         }
     }
@@ -802,6 +830,22 @@ inline void LogTicks(State& s, double frames) {
                  static_cast<double>(t.wait_ns[k]) / 1e6 / frames, t.cuts[k],
                  ms_per_cut(t.writer_ns[k]), ms_per_cut(t.rest_ns[k]),
                  static_cast<double>(t.rest_max_ns[k]) / 1e6);
+        if (t.ahead_reads[k] != 0) {
+            const double n = static_cast<double>(t.ahead_reads[k]);
+            const auto ms = [n](u64 ns) { return static_cast<double>(ns) / 1e6 / n; };
+            LOG_INFO(HW_GPU,
+                     "Read writer run-up (FRITCHII_SUBMIT_TIMES) last 600 frames, {}: {} cut reads "
+                     "measured | per read: {:.1f} submissions from the one after the known tick "
+                     "to the writer's ({:.1f} with both GPU timestamps), on the GPU busy {:.3f} "
+                     "ms, gaps between them {:.3f} ms, overlaps {:.3f} ms, first start to the "
+                     "writer's end {:.3f} ms | the same reads waited {:.3f} ms until the writer "
+                     "ran",
+                     KindNames[k], t.ahead_reads[k],
+                     static_cast<double>(t.ahead_submissions[k]) / n,
+                     static_cast<double>(t.ahead_resolved[k]) / n, ms(t.ahead_busy_ns[k]),
+                     ms(t.ahead_gap_ns[k]), ms(t.ahead_overlap_ns[k]), ms(t.ahead_span_ns[k]),
+                     ms(t.ahead_writer_ns[k]));
+        }
     }
     t = TickCounts{};
 }

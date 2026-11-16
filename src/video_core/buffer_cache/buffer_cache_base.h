@@ -1596,6 +1596,7 @@ public:
                     std::chrono::steady_clock::now() - start)
                     .count());
             ReadRunStats::t_writer_answer.rest_wait_ns = total > writer_ns ? total - writer_ns : 0;
+            MeasureRunUp();
         }
         fence_waits.fetch_add(1, std::memory_order_relaxed);
         fence_wait_ns.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1622,6 +1623,25 @@ public:
     /// the submission of the newest write over the read's pages (GetFlushArea found it) and
     /// returns how long. The read's own wait follows on the same timeline, so the total is
     /// unchanged. Only a submitted tick is waited for (no flush is asked for here); 0 = no cut.
+    /// FRITCHII_SUBMIT_TIMES (diagnostic), on the reading thread after its whole wait (so the
+    /// look-ups add nothing to the wait's parts): what the card ran from the submission after the
+    /// one known done at the read to the writer's, from the per-submission GPU timestamps.
+    void MeasureRunUp() {
+        if constexpr (!IS_OPENGL) {
+            ReadRunStats::WriterAnswer& a = ReadRunStats::t_writer_answer;
+            if (!EarlyCompute::g_submit_times || !a.cut || a.cut_tick == 0) {
+                return;
+            }
+            const auto ahead = runtime.MeasureSubmissions(a.known_tick + 1, a.cut_tick);
+            a.ahead_submissions = ahead.submissions;
+            a.ahead_resolved = ahead.resolved;
+            a.ahead_busy_ns = ahead.busy_ns;
+            a.ahead_gap_ns = ahead.gap_ns;
+            a.ahead_overlap_ns = ahead.overlap_ns;
+            a.ahead_span_ns = ahead.span_ns;
+        }
+    }
+
     /// `side_tick` (FRITCHII_READ_SIDE_COPY): this scheduler tick instead of the area mark's.
     u64 WaitReadWriter(std::optional<u64> side_tick = std::nullopt) {
         if constexpr (!IS_OPENGL) {
@@ -1635,6 +1655,7 @@ public:
             }
             a.cut = true;
             a.writer_wait_ns = ReadRunStats::NowNs() - start;
+            a.cut_tick = side_tick ? *side_tick : a.write_tick;
             return a.writer_wait_ns;
         }
         return 0;
@@ -1696,9 +1717,19 @@ private:
         /// already submitted scheduler tick, `side_tick`: a side copy could wait for it alone.
         bool side_eligible{};
         u64 side_tick{};
+        /// FRITCHII_READ_SIDE_COPY >= 2: the side copy's value (0: none). With 2 (verify) its
+        /// bytes go to `verify_staging`, compared with `staging` at the landing; with 3 they are
+        /// the download (no main-queue copy was recorded).
+        u64 side_value{};
+        bool side_verify{};
+        Async_Buffer verify_staging{};
+        u64 id{}; ///< numbered from 1, to find it again after a wait without the lock
     };
     /// Oldest first, and written to guest memory in that order: none lands over newer bytes.
     std::deque<ReadDownload> read_downloads;
+    /// Writes one read download to guest memory (WriteReadDownloads' body, and the side copy's
+    /// landing out of order: read downloads never overlap, see RecordReadDownload's gaps).
+    void LandReadDownload(ReadDownload& download);
     /// All the read downloads' clean_ranges (they don't overlap): GPU-modified bytes already on
     /// their way, which later reads wait for rather than download again.
     Common::RangeSet<DAddr> read_download_ranges;
@@ -1790,6 +1821,7 @@ private:
     void LogMarksAhead();
 
     std::deque<Async_Buffer> async_buffers_death_ring;
+    u64 read_download_ids{}; ///< ReadDownload::id
 
     size_t immediate_buffer_capacity = 0;
     Common::ScratchBuffer<u8> immediate_buffer_alloc;

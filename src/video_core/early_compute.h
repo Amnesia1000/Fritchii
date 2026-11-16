@@ -15,11 +15,12 @@
 #include "common/common_types.h"
 #include "common/logging.h"
 
-// Two answers to the read-back waits of a fight (work\helper_cu_answer.md, Round 2). Both are dry
-// counters for now: nothing is recorded, submitted or waited for differently.
+// Two answers to the read-back waits of a fight (work\helper_cu_answer.md, Rounds 2 and 3).
+// Early compute stays a dry count (Round 3: chained inputs rule it out); the side copy has its
+// verify and on modes.
 //
-// FRITCHII_EARLY_COMPUTE (read at first use, default 0; 1 = dry count; 2 and 3, verify and on,
-// are designed, not built, and count as 1): a dispatch whose output the guest CPU reads back (its
+// FRITCHII_EARLY_COMPUTE (read at first use, default 0; 1 = dry count; 2 and 3 not built, they
+// count as 1): a dispatch whose output the guest CPU reads back (its
 // program learned from the reads' writers, FRITCHII_READ_RUNS' ring) could run on a second queue
 // at once instead of behind the ~10 submissions the host GPU has not run yet, if nothing pending
 // on the main queue touches its bound ranges: no unrun GPU write over any of them (read after
@@ -32,9 +33,11 @@
 // not run yet. The buffer verdict and the image verdict are counted apart (with dispatches
 // posted, the two run on different threads); the line says both.
 //
-// FRITCHII_READ_SIDE_COPY (read at first use, default 0; 1 = dry count; 2 and 3 designed, not
-// built): a read's new download (EXP49) copied on a second queue that waits only for the newest
-// write over the copied bytes. At RecordReadDownload the newest write mark over every copied
+// FRITCHII_READ_SIDE_COPY (read at first use, default 0; 1 = dry count; 2 = verify, 3 = on; the
+// side queue itself needs the value at boot, Device::WantsSideQueue): a read's new download
+// (EXP49) copied on a second queue (vk_side_queue.h) that waits only for the newest write over
+// the copied bytes. 2 records both copies, lands the main one and compares (must be 0); 3 records
+// the side copy alone and its reader lands it as soon as it is there. At RecordReadDownload the newest write mark over every copied
 // range gives that write's scheduler tick: eligible when that tick is submitted already (a write
 // in the open chunk keeps today's path). The reader's wait is cut at it: the part after it is the
 // saving (less the side copy's own run).
@@ -77,6 +80,8 @@ private:
 
 inline FirstUseMode g_early{[] { return ReadMode("FRITCHII_EARLY_COMPUTE"); }};
 inline FirstUseMode g_side_copy{[] { return ReadMode("FRITCHII_READ_SIDE_COPY"); }};
+/// FRITCHII_SUBMIT_TIMES (vk_submit_times.h): GPU timestamps per submission, for the cuts.
+inline FirstUseMode g_submit_times{[] { return ReadMode("FRITCHII_SUBMIT_TIMES"); }};
 
 /// The buffer verdict of a dispatch, kept in its write marks.
 enum class Verdict : u8 {
@@ -202,6 +207,20 @@ struct Counts {
     u64 side_writer_ns{};    ///< until the writer's submission ran
     u64 side_saving_ns{};    ///< then until the download was there
     u64 side_saving_max_ns{};
+    // FRITCHII_READ_SIDE_COPY >= 2.
+    u64 side_submits{};        ///< side copies submitted
+    u64 side_submit_failed{};  ///< failed (the main copy was recorded instead)
+    u64 verify_downloads{};    ///< =2: downloads compared at the landing
+    u64 verify_copies{};
+    u64 verify_differing{};    ///< must be 0
+    u64 verify_bytes{};
+    u64 verify_waits{};        ///< =2: readers that waited for both copies
+    u64 verify_side_ns{};      ///< until the side copy was there
+    u64 verify_main_ns{};      ///< until the main copy was there (today's wait)
+    u64 landed{};              ///< =3: reads landed from the side copy alone
+    u64 landed_waits{};
+    u64 landed_ns{};
+    u64 landed_max_ns{};
 };
 
 inline Counts& Get() {
@@ -259,6 +278,50 @@ inline void NoteSideCut(u64 writer_ns, u64 rest_ns) {
     c.side_writer_ns += writer_ns;
     c.side_saving_ns += rest_ns;
     c.side_saving_max_ns = (std::max)(c.side_saving_max_ns, rest_ns);
+}
+
+/// BufferCache::RecordReadDownload: a side copy submitted (or failed).
+inline void NoteSideSubmit(bool submitted) {
+    Counts& c = Get();
+    std::scoped_lock lock{c.mutex};
+    ++(submitted ? c.side_submits : c.side_submit_failed);
+}
+
+/// BufferCache::LandReadDownload (=2): the side copy's bytes against the main copy's.
+inline void NoteSideVerify(u64 copies, u64 differing, u64 bytes) {
+    Counts& c = Get();
+    std::scoped_lock lock{c.mutex};
+    ++c.verify_downloads;
+    c.verify_copies += copies;
+    c.verify_differing += differing;
+    c.verify_bytes += bytes;
+    if (differing != 0) {
+        LOG_ERROR(HW_GPU, "Read side copy (FRITCHII_READ_SIDE_COPY=2): {} of {} copies differ "
+                          "from the main queue's (must be 0)",
+                  differing, copies);
+    }
+}
+
+/// BufferCache::FinishReadDownloads (=2): a reader's wait for the side copy, then for both.
+inline void NoteSideVerifyWait(u64 side_ns, u64 total_ns) {
+    Counts& c = Get();
+    std::scoped_lock lock{c.mutex};
+    ++c.verify_waits;
+    c.verify_side_ns += side_ns;
+    c.verify_main_ns += total_ns;
+}
+
+/// BufferCache::FinishReadDownloads (=3): a read landed from its side copy (`ns` waited, 0: it
+/// was there).
+inline void NoteSideLanded(u64 ns) {
+    Counts& c = Get();
+    std::scoped_lock lock{c.mutex};
+    ++c.landed;
+    if (ns != 0) {
+        ++c.landed_waits;
+        c.landed_ns += ns;
+        c.landed_max_ns = (std::max)(c.landed_max_ns, ns);
+    }
 }
 
 /// ReadRunStats::Log, every 600 frames.
@@ -328,6 +391,23 @@ inline void Log(double frames) {
                            : 0.0,
                  static_cast<double>(c.side_saving_max_ns) / 1e6,
                  static_cast<double>(c.side_saving_ns) / 1e6 / frames);
+        if (g_side_copy.Get() >= 2) {
+            const auto per = [](u64 ns, u64 n) {
+                return n != 0 ? static_cast<double>(ns) / 1e6 / static_cast<double>(n) : 0.0;
+            };
+            LOG_INFO(HW_GPU,
+                     "Read side copy (FRITCHII_READ_SIDE_COPY={}) last 600 frames: {} side copies "
+                     "submitted, {} failed | verify: {} downloads compared ({} copies, {} KiB), {} "
+                     "copies differ (must be 0); {} readers waited for both: side copy there "
+                     "after {:.3f} ms, main copy after {:.3f} ms | on: {} reads landed from the "
+                     "side copy, {} waited {:.3f} ms each (longest {:.2f}), {:.2f} ms a frame",
+                     g_side_copy.Get(), c.side_submits, c.side_submit_failed, c.verify_downloads,
+                     c.verify_copies, c.verify_bytes >> 10, c.verify_differing, c.verify_waits,
+                     per(c.verify_side_ns, c.verify_waits), per(c.verify_main_ns, c.verify_waits),
+                     c.landed, c.landed_waits, per(c.landed_ns, c.landed_waits),
+                     static_cast<double>(c.landed_max_ns) / 1e6,
+                     static_cast<double>(c.landed_ns) / 1e6 / frames);
+        }
     }
     std::fill(std::begin(c.judged), std::end(c.judged), 0);
     c.uploads = 0;
@@ -339,6 +419,10 @@ inline void Log(double frames) {
     c.images.clear();
     c.side_downloads = c.side_eligible = c.side_open = c.side_no_mark = 0;
     c.side_cuts = c.side_writer_ns = c.side_saving_ns = c.side_saving_max_ns = 0;
+    c.side_submits = c.side_submit_failed = 0;
+    c.verify_downloads = c.verify_copies = c.verify_differing = c.verify_bytes = 0;
+    c.verify_waits = c.verify_side_ns = c.verify_main_ns = 0;
+    c.landed = c.landed_waits = c.landed_ns = c.landed_max_ns = 0;
 }
 
 } // namespace VideoCommon::EarlyCompute

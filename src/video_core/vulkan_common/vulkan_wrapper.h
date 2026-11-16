@@ -1108,6 +1108,7 @@ public:
                                        DeviceDispatch& dispatch);
 
     [[nodiscard]] Queue GetQueue(u32 family_index) const noexcept;
+    [[nodiscard]] Queue GetQueue(u32 family_index, u32 queue_index) const noexcept;
 
     [[nodiscard]] BufferView CreateBufferView(const VkBufferViewCreateInfo& ci) const;
 

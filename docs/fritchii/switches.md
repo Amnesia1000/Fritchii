@@ -5760,7 +5760,35 @@ on; at each new read download (EXP49 RecordReadDownload) the newest write mark o
 copied bytes gives that write's scheduler tick: eligible when it is already submitted (a copy on
 a second queue could wait for it alone), else in the chunk the download closes (today's path is
 as good). An eligible download's reader wait is cut at that tick; the part after it is the
-saving. "Read side copy" line every 600 frames. 2 (verify) and 3 (on) are designed, not built.
+saving. "Read side copy" line every 600 frames.
+
+2 (verify) and 3 (on) need the value at boot: the device is then made with a second queue of the
+graphics family (Device::WantsSideQueue; a family of one queue logs it and counts dry). An
+eligible download's copy is recorded on that queue (vk_side_queue.h), after the master timeline
+reached the writer's tick, with a host-read barrier, signalling its own timeline value; every main
+submission with a tick after the writer's waits for that value until the side semaphore reports
+it (MasterSemaphore::RequireSide: never one up to the writer's, which the copy itself waits for).
+The download's main tick (its SubmitForHostRead) is such a submission, so a landing that waited
+for it finds the side copy done too.
+- 2: both copies, the main one into the download's staging and the side one into a second staging
+  buffer. The reader waits for the side copy, then the main one; the landing compares the two
+  byte for byte ("copies differ", must be 0, each one an error line) and lands the main bytes.
+  The line gives when each was there.
+- 3: the side copy alone. The reader waits for the side value only and lands that download at
+  once, out of order (read downloads never overlap: RecordReadDownload copies only the gaps),
+  when no other download covers the read's range; any other landing waits for the main tick as
+  before. Off (0 or 1): nothing changes, one load per read download.
+
+### FRITCHII_SUBMIT_TIMES
+
+FRITCHII_SUBMIT_TIMES=1 (read at first use, diagnostic, default 0; vk_submit_times.h): turns
+FRITCHII_READ_RUNS=2 on; a GPU timestamp at the top of every main submission's upload command
+buffer and at the bottom of its command buffer (4,096 slots). After each read's whole wait, the
+submissions from the one after the tick known done at the read to the writer's (at most 64, the
+newest) are looked up: their GPU busy time, the gaps between one's end and the next one's start,
+and overlaps. "Read writer run-up" line per read kind every 600 frames, next to "Read writer
+ticks", with the same reads' "until the writer ran". Costs two timestamps and a query reset per
+submission and up to 64 query reads per cut read.
 
 The GPU-written ranges are what the cache marks: for a dispatch or draw that is the bound
 writable buffer range (cut only by the native store bound, or by EDEN_NX2_WRITTEN_SSBO_MARK_KIB,
