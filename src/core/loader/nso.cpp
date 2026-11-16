@@ -106,7 +106,14 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
             return a.size < b.size;
         })->size);
         for (std::size_t i = 0; i < nso_header.segments.size(); ++i) {
-            nso_file.Read(compressed_data.data(), nso_header.segments_compressed_size[i], nso_header.segments[i].offset);
+            // A short read would leave the previous segment's bytes in the buffer, as below.
+            if (nso_file.Read(compressed_data.data(), nso_header.segments_compressed_size[i],
+                              nso_header.segments[i].offset) !=
+                nso_header.segments_compressed_size[i]) {
+                LOG_ERROR(Loader, "{}: segment {} is past the end of the file", nso_file.GetName(),
+                          i);
+                return std::nullopt;
+            }
             if (nso_header.IsSegmentCompressed(i)) {
                 if (nso_header.IsZBICCompressed()) {
                     // ZBIC compression
@@ -123,7 +130,13 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
                         compressed_data.data(),
                         nso_header.segments_compressed_size[i]
                     );
-                    ASSERT(r == int(nso_header.segments[i].size));
+                    // A segment that does not decompress to its size would boot with the previous
+                    // segment's bytes in its place, and hang without presenting.
+                    if (r != int(nso_header.segments[i].size)) {
+                        LOG_ERROR(Loader, "{}: segment {} decompressed to {} of {:#x} bytes",
+                                  nso_file.GetName(), i, r, nso_header.segments[i].size);
+                        return std::nullopt;
+                    }
                 }
 
                 std::memcpy(
