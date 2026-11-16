@@ -753,6 +753,12 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_COLD_SWEEP_MAX") {
         return &g_cold_sweep_max;
     }
+    if (name == "FRITCHII_COVERED_RETIRE") {
+        return &g_covered_retire;
+    }
+    if (name == "FRITCHII_COLLECT_LAND_UNDER") {
+        return &g_collect_land_under;
+    }
     if (name == "FRITCHII_NOTED_OVERFLOW") {
         return &g_noted_overflow;
     }

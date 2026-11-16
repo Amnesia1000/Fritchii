@@ -4499,6 +4499,28 @@ at full cache clears and shutdown (host bytes are read when written, so links sh
   a frame; this raises the cap. Line every 600 frames "Cold sweep cap (...)" whenever the cap was
   reached (also with the switch at 0): frames that stopped at the cap, images watched.
 
+### Pot room VRAM (helper CC)
+
+- FRITCHII_COVERED_RETIRE (live, frames, default 0 = off): a GPU-written render target whose whole
+  memory newer GPU writes cover (images written after its last write and touched no earlier than
+  it last was) is deleted without a download once untouched for N frames. Checked once after each
+  new image comes to overlap it: by the cold sweep (its own caps, 64 checks and 64 deletes a
+  frame, guarded shapes too), by the collector (no download for such an image), and when an
+  EXP121 download it queued is dropped for a newer overlap. Owner's pot room log (build 9): ~30
+  targets a frame made at bump-allocated addresses (6,964 384x384 D32 in 600 frames), 20-300 dead
+  ones under each new clear, kept until EXP58's 60 frames; device-local 9.2 -> 12.4 GB. Line every
+  600 frames "Covered retire (...)": checks and ms, deletes by sweep / collector / landing, MiB,
+  kept as busy, cap frames, and textures sampled again at a retired address (must stay near 0;
+  the first 20 get a "Covered retire: ... sampled N frames after" warning).
+- FRITCHII_COLLECT_LAND_UNDER (live, default 0): an EXP121 collector download still lands when the
+  overlap the GPU wrote since is still GPU-only (its bytes are not in guest memory; its own
+  download lands over ours later, and one that lands first drops ours). Before, such downloads
+  were dropped and the image kept, so the next pass queued it again: 5,028 queued and 4,956
+  "written again" in 600 frames in the pot room. The collector line now splits "written again"
+  into newer overlap / CPU write and counts landings under a GPU-only overlap.
+- Bug fix (always on): an EXP121 download no longer lands over a CPU write made to its image after
+  it was queued (counted in the collector line as "by the CPU").
+
 ### FRITCHII_JIT_BLOCK_LIST (the "JIT block list" lines)
 
 Boot, default 0 (helper AG, port of the idea of zortos #1225 by ne1i). Every block the CPU
