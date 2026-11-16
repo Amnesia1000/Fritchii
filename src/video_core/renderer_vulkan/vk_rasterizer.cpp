@@ -8404,7 +8404,9 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
     const bool native_resolution =
         oot_backend == VideoCommon::OcarinaUpscaleBackend::Dlss &&
         Settings::GetNvidiaDlssRuntimeSettings().quality == Settings::NvidiaDlssQuality::Native;
-    const bool upscale_4k = pass_1440p && !native_resolution;
+    // FRITCHII_FSR_OUTPUT: FSR may draw the game's own 1440p picture instead of a 4K one.
+    const bool upscale_4k =
+        pass_1440p && !native_resolution && !OcarinaFsrOutputsGameSize(*oot_backend);
     const auto read_tic = [this](u32 index) -> std::optional<Tegra::Texture::TICEntry> {
         const auto& table = kepler_compute->regs.tic;
         using Entry = Tegra::Texture::TICEntry;

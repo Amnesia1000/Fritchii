@@ -178,6 +178,17 @@ std::optional<DisplayRefresh> DisplayRefreshQuery::Query([[maybe_unused]] void* 
     return std::nullopt;
 }
 
+u32 PrimaryDisplayHeight() {
+#ifdef _WIN32
+    DEVMODEW mode{};
+    mode.dmSize = sizeof(mode);
+    if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode) && mode.dmPelsHeight > 0) {
+        return static_cast<u32>(mode.dmPelsHeight);
+    }
+#endif
+    return 0;
+}
+
 void HostPacer::NoteQueued(Clock::time_point queued) {
     if (last_queued) {
         // A load screen's or a stall's gap would take seconds to forget: clamp each sample.
