@@ -487,6 +487,8 @@ void ReadSwitches();
 /// The Vulkan device names its driver (Device's constructor, before ReadSwitches): on AMD's
 /// proprietary driver the one follower stays off unless FRITCHII_ONEF_AMD=1.
 void NoteAmdProprietaryDriver() noexcept;
+/// True once the Vulkan device said it runs AMD's proprietary driver (AMD safe defaults read it).
+[[nodiscard]] bool IsAmdProprietaryDriver() noexcept;
 /// FRITCHII_ONEF=1 at boot (R exists).
 [[nodiscard]] bool On() noexcept;
 /// The effective step after nesting (StepLevel), refreshed at frame ends and lent packets.

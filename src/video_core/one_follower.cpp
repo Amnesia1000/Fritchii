@@ -1525,6 +1525,10 @@ void NoteAmdProprietaryDriver() noexcept {
     g_amd_proprietary.store(true, std::memory_order_relaxed);
 }
 
+bool IsAmdProprietaryDriver() noexcept {
+    return g_amd_proprietary.load(std::memory_order_relaxed);
+}
+
 void ReadSwitches() {
     if (g.read) {
         return; // boot switches: the first session's values stick

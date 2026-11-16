@@ -3962,6 +3962,24 @@ void MemStage::Note(SeamHook::Use use, const std::source_location& location, boo
 
 void MemStage::TickFrame() {
     int value = VideoCore::Nx2Debug::Experiment(123);
+    // AMD safe default (2026-11-16): SEAM 3 lost the device on an RX 7900 XT and an RX 9070 XT at
+    // the title screen (the ASTC decoder's submit inside a held fill); SEAM 1 ran clean on both.
+    // Held to 1 on AMD's proprietary driver; FRITCHII_SEAM_AMD=1 keeps the asked level (tests).
+    if (value >= 2 && VideoCommon::OneFollower::IsAmdProprietaryDriver()) [[unlikely]] {
+        static const bool keep = [] {
+            const char* const v = std::getenv("FRITCHII_SEAM_AMD");
+            return v != nullptr && v[0] == '1';
+        }();
+        if (!keep) {
+            static bool logged = false;
+            if (!std::exchange(logged, true)) {
+                LOG_WARNING(Render_Vulkan, "Memory seam: EXP123={} held to 1 on AMD's proprietary "
+                                           "driver (device losses with 3); FRITCHII_SEAM_AMD=1 keeps it",
+                            value);
+            }
+            value = 1;
+        }
+    }
     if (value >= 2 && !ticks) [[unlikely]] {
         // The early fill needs packet ticks (the header comment): run SEAM 1.
         Bump(counters.seam_clamped);
