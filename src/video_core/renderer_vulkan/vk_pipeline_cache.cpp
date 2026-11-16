@@ -7024,7 +7024,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             std::span{stages.data(), num_stages}, host_info);
     }
     // Mesh emulation without VK_EXT_mesh_shader (prototype): a mesh program, after an optional
-    // task program, drawing triangles without per-primitive outputs, before a pixel program only.
+    // task program, drawing triangles, lines or points without per-primitive outputs, before a
+    // pixel program only.
     std::optional<MeshEmulationSetup> mesh_emulation;
     size_t mesh_index{};
     if (mesh_unsupported) {
@@ -7040,15 +7041,40 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         bool eligible{mesh_index != 0 && (mesh_index == 1 || has_task) &&
                       layer_source_program == nullptr};
         const Shader::IR::Program& mesh{programs[mesh_index]};
-        eligible = eligible && mesh.mesh.topology == 4 && mesh.mesh.primitive_lines.empty() &&
-                   !mesh.mesh.vertex_lines.empty() && mesh.mesh.max_vertices != 0 &&
-                   mesh.mesh.max_primitives != 0;
-        for (size_t index = 1; index < Maxwell::MaxShaderProgram && eligible; ++index) {
-            const bool emulated{index == mesh_index || (has_task && index == 1)};
-            eligible = emulated || key.unique_hashes[index] == 0 ||
-                       programs[index].stage == Shader::Stage::Fragment;
-        }
+        // Points (OoT's Zora's Domain draws two point-list mesh programs every frame, 32 points
+        // per workgroup with their own size) and lines are drawn as point and line lists.
+        const char* refused{nullptr};
         if (!eligible) {
+            refused = mesh_index == 0 ? "no mesh program"
+                      : layer_source_program != nullptr ? "layer emulation"
+                                                        : "mesh program after a non-task stage";
+        } else if (mesh.mesh.topology != 0 && mesh.mesh.topology != 1 &&
+                   mesh.mesh.topology != 4) {
+            refused = "output topology";
+        } else if (!mesh.mesh.primitive_lines.empty()) {
+            refused = "per-primitive outputs";
+        } else if (mesh.mesh.vertex_lines.empty() || mesh.mesh.max_vertices == 0 ||
+                   mesh.mesh.max_primitives == 0) {
+            refused = "empty output";
+        }
+        for (size_t index = 1; index < Maxwell::MaxShaderProgram && refused == nullptr; ++index) {
+            const bool emulated{index == mesh_index || (has_task && index == 1)};
+            if (!emulated && key.unique_hashes[index] != 0 &&
+                programs[index].stage != Shader::Stage::Fragment) {
+                refused = "a stage besides task, mesh and pixel";
+            }
+        }
+        if (refused != nullptr) {
+            // Its draws are dropped (the rasterizer's "mesh draws dropped" count): say why, for
+            // the first 32 refusals.
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+                LOG_WARNING(Render_Vulkan,
+                            "Mesh emulation refused for {}: {} (topology {}, primitive lines {})",
+                            PipelineShaders(key), refused,
+                            mesh_index != 0 ? mesh.mesh.topology : 0U,
+                            mesh_index != 0 ? mesh.mesh.primitive_lines.size() : size_t{0});
+            }
             return nullptr;
         }
         // The output buffer's binding follows every program's. The task and mesh programs
@@ -7132,6 +7158,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         mesh_emulation->block_words = Shader::Backend::SPIRV::MeshEmulationBlockWords(mesh.mesh);
         mesh_emulation->max_primitives = mesh.mesh.max_primitives;
+        mesh_emulation->primitive_vertices = mesh.mesh.PrimitiveVertices();
         mesh_emulation->max_vertices = mesh.mesh.max_vertices;
         mesh_emulation->vertex_lines = static_cast<u32>(mesh.mesh.vertex_lines.size());
         for (u32 line = 0; line < mesh.mesh.vertex_lines.size(); ++line) {
@@ -7156,11 +7183,15 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 }
             }
             LOG_INFO(Render_Vulkan,
-                     "Mesh emulation #{}: pipeline {:016x}, {} vertices x {} lines, {} triangles "
+                     "Mesh emulation #{}: pipeline {:016x}, {} vertices x {} lines, {} {} "
                      "per workgroup, output binding {}, task {} (payload {} words), input "
                      "reads:{}",
                      count, hash, mesh.mesh.max_vertices, mesh.mesh.vertex_lines.size(),
-                     mesh.mesh.max_primitives, output_binding, has_task,
+                     mesh.mesh.max_primitives,
+                     mesh.mesh.topology == 0   ? "points"
+                     : mesh.mesh.topology == 1 ? "lines"
+                                               : "triangles",
+                     output_binding, has_task,
                      mesh_emulation->payload_stride, reads.empty() ? " none" : reads);
         }
     }
@@ -7293,7 +7324,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 mesh_emulation->vertex_spirv = Shader::Backend::SPIRV::EmitMeshEmulationVertex(
                     profile, program.mesh, mesh_emulation->output_binding,
                     mesh_emulation->has_task ? mesh_emulation->args_binding : ~0U,
-                    runtime_info.convert_depth_mode && !profile.support_native_ndc);
+                    runtime_info.convert_depth_mode && !profile.support_native_ndc,
+                    runtime_info.fixed_state_point_size.value_or(1.0f));
             }
         }
         ConvertLegacyToGeneric(program, runtime_info);
