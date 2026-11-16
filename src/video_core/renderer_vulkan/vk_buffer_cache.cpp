@@ -694,6 +694,63 @@ BufferCacheRuntime::ReadTicks BufferCacheRuntime::ReadWriterTicks(u64 stamp) {
     };
 }
 
+BufferCacheRuntime::AheadTimes BufferCacheRuntime::MeasureSubmissions(u64 first, u64 last) {
+    const SubmitTimes::Span span =
+        scheduler.GetSubmitTimes().Measure(first, last, scheduler.GetMasterSemaphore());
+    return AheadTimes{
+        .submissions = span.submissions,
+        .resolved = span.resolved,
+        .busy_ns = span.busy_ns,
+        .gap_ns = span.gap_ns,
+        .overlap_ns = span.overlap_ns,
+        .span_ns = span.span_ns,
+    };
+}
+
+bool BufferCacheRuntime::SideCopyReady() {
+    if (!device.HasSideQueue() || !device.HasTimelineSemaphore()) {
+        return false;
+    }
+    std::call_once(side_queue_once, [this] {
+        try {
+            side_queue = std::make_unique<SideQueue>(device, scheduler.GetMasterSemaphore());
+        } catch (const vk::Exception& error) {
+            LOG_ERROR(Render_Vulkan, "FRITCHII_READ_SIDE_COPY: no side queue ({})", error.what());
+        }
+    });
+    return side_queue != nullptr;
+}
+
+u64 BufferCacheRuntime::SideCopy(u64 main_tick, std::span<const SideCopyRegion> regions) {
+    if (!SideCopyReady()) {
+        return 0;
+    }
+    boost::container::small_vector<SideQueue::Copy, 8> copies;
+    for (const SideCopyRegion& region : regions) {
+        copies.push_back(SideQueue::Copy{
+            .src = region.src,
+            .dst = region.dst,
+            .region =
+                VkBufferCopy{
+                    .srcOffset = region.src_offset,
+                    .dstOffset = region.dst_offset,
+                    .size = region.size,
+                },
+        });
+    }
+    return side_queue->Submit(main_tick, copies);
+}
+
+bool BufferCacheRuntime::SideDone(u64 value) {
+    return side_queue == nullptr || side_queue->IsDone(value);
+}
+
+void BufferCacheRuntime::WaitSide(u64 value) {
+    if (side_queue != nullptr) {
+        side_queue->Wait(value);
+    }
+}
+
 bool BufferCacheRuntime::WaitTickIfSubmitted(u64 tick) {
     if (!scheduler.IsSubmitted(tick)) {
         return false;

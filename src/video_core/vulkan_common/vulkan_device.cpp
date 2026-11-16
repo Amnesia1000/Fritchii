@@ -1099,6 +1099,13 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
 
     graphics_queue = logical.GetQueue(graphics_family);
     present_queue = logical.GetQueue(present_family);
+    if (WantsSideQueue()) {
+        side_queue = logical.GetQueue(graphics_family, 1);
+        has_side_queue = true;
+        LOG_INFO(Render_Vulkan, "FRITCHII_READ_SIDE_COPY: side queue made (graphics family {}, "
+                                "queue 1)",
+                 graphics_family);
+    }
 
 #ifdef EGLANTINE_STREAMLINE
     if (streamline_extensions) {
@@ -3073,8 +3080,27 @@ void Device::CollectToolingInfo() {
 #endif
 }
 
+bool Device::WantsSideQueue() const {
+    // Read where the device is made: after main() applied nx2_switches.txt.
+    static const bool wanted = [this] {
+        const char* value = std::getenv("FRITCHII_READ_SIDE_COPY");
+        if (value == nullptr || value[0] < '2' || value[0] > '9') {
+            return false;
+        }
+        const auto families = physical.GetQueueFamilyProperties();
+        if (graphics_family >= families.size() || families[graphics_family].queueCount < 2) {
+            LOG_WARNING(Render_Vulkan, "FRITCHII_READ_SIDE_COPY: the graphics family has one "
+                                       "queue, no side queue (the side copy counts dry)");
+            return false;
+        }
+        return true;
+    }();
+    return wanted;
+}
+
 std::vector<VkDeviceQueueCreateInfo> Device::GetDeviceQueueCreateInfos() const {
     static constexpr float QUEUE_PRIORITY = 1.0f;
+    static constexpr std::array<float, 2> QUEUE_PRIORITIES{1.0f, 1.0f};
 
     ::Common::unordered_set<u32> unique_queue_families{graphics_family, present_family};
     std::vector<VkDeviceQueueCreateInfo> queue_cis;
@@ -3090,6 +3116,11 @@ std::vector<VkDeviceQueueCreateInfo> Device::GetDeviceQueueCreateInfos() const {
             .pQueuePriorities = nullptr,
         });
         ci.pQueuePriorities = &QUEUE_PRIORITY;
+        // FRITCHII_READ_SIDE_COPY >= 2: the side queue is the graphics family's second.
+        if (queue_family == graphics_family && WantsSideQueue()) {
+            ci.queueCount = 2;
+            ci.pQueuePriorities = QUEUE_PRIORITIES.data();
+        }
     }
 
     return queue_cis;

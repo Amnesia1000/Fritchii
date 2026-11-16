@@ -337,6 +337,19 @@ public:
         return present_queue;
     }
 
+    /// FRITCHII_READ_SIDE_COPY >= 2 (boot): a second queue of the graphics family (its index 1),
+    /// for read downloads that wait only for their writer. Null without one.
+    vk::Queue GetSideQueue() const {
+        return side_queue;
+    }
+    bool HasSideQueue() const {
+        return has_side_queue;
+    }
+
+    /// Whether the device is made with the side queue (the switch, and a graphics family of two
+    /// queues or more). Decided once, before the device is made.
+    bool WantsSideQueue() const;
+
     /// Returns main graphics queue family index.
     u32 GetGraphicsFamily() const {
         return graphics_family;
@@ -1481,6 +1494,8 @@ private:
     vk::Device logical;          ///< Logical device.
     vk::Queue graphics_queue;    ///< Main graphics queue.
     vk::Queue present_queue;     ///< Main present queue.
+    vk::Queue side_queue;        ///< FRITCHII_READ_SIDE_COPY >= 2: graphics family, index 1.
+    bool has_side_queue{};
     vk::PipelineCache static_pipeline_cache;
     bool owns_static_pipeline_cache{};
     u32 instance_version{};      ///< Vulkan instance version.

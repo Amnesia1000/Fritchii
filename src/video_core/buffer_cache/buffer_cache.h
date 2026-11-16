@@ -953,32 +953,21 @@ void BufferCache<P>::RecordReadDownload(std::span<const std::pair<DAddr, u64>> r
         if (copies.empty()) {
             return;
         }
-        auto staging = runtime.DownloadStagingBuffer(total_size_bytes, true);
-        for (Copy& entry : copies) {
-            Buffer& buffer = slot_buffers[entry.buffer_id];
-            entry.copy.dst_offset += staging.offset;
-            buffer.MarkUsage(entry.copy.src_offset, entry.copy.size);
-            // Mapped buffers too: the GPU thread's later work may write them before the copy is
-            // read.
-            runtime.CopyBuffer(staging.buffer, buffer, std::span{&entry.copy, 1}, true);
-            download.copies.push_back(BufferCopy{
-                .src_offset = buffer.CpuAddr() + entry.copy.src_offset,
-                .dst_offset = entry.copy.dst_offset,
-                .size = entry.copy.size,
-            });
-        }
-        download.staging = staging;
-        // FRITCHII_READ_SIDE_COPY (dry): where the newest write over these bytes is.
-        if (EarlyCompute::g_side_copy) [[unlikely]] {
+        download.id = ++read_download_ids;
+        // FRITCHII_READ_SIDE_COPY: where the newest write over these bytes is (before anything
+        // is recorded: the current tick is the one the submit below closes).
+        const int side_mode = EarlyCompute::g_side_copy.Get();
+        if (side_mode != 0) [[unlikely]] {
             boost::container::small_vector<std::pair<DAddr, u64>, 8> copied;
-            for (const BufferCopy& copy : download.copies) {
-                copied.emplace_back(copy.src_offset, copy.size);
+            for (const Copy& entry : copies) {
+                copied.emplace_back(slot_buffers[entry.buffer_id].CpuAddr() +
+                                        entry.copy.src_offset,
+                                    entry.copy.size);
             }
             u64 stamp = 0;
             if (!ReadRunStats::NewestMarkOver(copied, stamp)) {
                 EarlyCompute::NoteSideDownload(EarlyCompute::SideWriter::NoMark);
             } else {
-                // Before the submit below: the current tick is the one it closes.
                 const auto ticks = runtime.ReadWriterTicks(stamp);
                 download.side_eligible = ticks.write < ticks.current;
                 download.side_tick = ticks.write;
@@ -986,6 +975,63 @@ void BufferCache<P>::RecordReadDownload(std::span<const std::pair<DAddr, u64>> r
                                                    ? EarlyCompute::SideWriter::Submitted
                                                    : EarlyCompute::SideWriter::Open);
             }
+        }
+        // >= 2: the copy on the side queue too (2, into a second staging buffer, compared at the
+        // landing) or instead (3). Only for a writer already submitted (eligible).
+        const bool side_copy =
+            side_mode >= 2 && download.side_eligible && runtime.SideCopyReady();
+        const bool main_copy = !side_copy || side_mode == 2;
+        auto staging = runtime.DownloadStagingBuffer(total_size_bytes, true);
+        boost::container::small_vector<typename Runtime::SideCopyRegion, 8> side_regions;
+        std::optional<Async_Buffer> verify_staging;
+        if (side_copy && side_mode == 2) {
+            verify_staging = runtime.DownloadStagingBuffer(total_size_bytes, true);
+        }
+        for (Copy& entry : copies) {
+            Buffer& buffer = slot_buffers[entry.buffer_id];
+            const u64 relative_dst = entry.copy.dst_offset;
+            entry.copy.dst_offset += staging.offset;
+            buffer.MarkUsage(entry.copy.src_offset, entry.copy.size);
+            if (main_copy) {
+                // Mapped buffers too: the GPU thread's later work may write them before the
+                // copy is read.
+                runtime.CopyBuffer(staging.buffer, buffer, std::span{&entry.copy, 1}, true);
+            }
+            if (side_copy) {
+                const Async_Buffer& target = verify_staging ? *verify_staging : staging;
+                side_regions.push_back({
+                    .src = buffer.Handle(),
+                    .dst = target.buffer,
+                    .src_offset = entry.copy.src_offset,
+                    .dst_offset = target.offset + relative_dst,
+                    .size = entry.copy.size,
+                });
+            }
+            download.copies.push_back(BufferCopy{
+                .src_offset = buffer.CpuAddr() + entry.copy.src_offset,
+                .dst_offset = entry.copy.dst_offset,
+                .size = entry.copy.size,
+            });
+        }
+        download.staging = staging;
+        if (side_copy) {
+            download.side_value = runtime.SideCopy(download.side_tick, side_regions);
+            if (download.side_value == 0 && !main_copy) {
+                // The side submit failed: the main copies after all.
+                for (const Copy& entry : copies) {
+                    runtime.CopyBuffer(staging.buffer, slot_buffers[entry.buffer_id],
+                                       std::span{&entry.copy, 1}, true);
+                }
+            }
+            if (verify_staging) {
+                if (download.side_value != 0) {
+                    download.side_verify = true;
+                    download.verify_staging = *verify_staging;
+                } else {
+                    async_buffers_death_ring.push_back(*verify_staging);
+                }
+            }
+            EarlyCompute::NoteSideSubmit(download.side_value != 0);
         }
         // Submitted now, not waited for: the reading thread waits (FinishReadDownloads).
         download.tick = runtime.SubmitForHostRead();
@@ -1006,27 +1052,70 @@ std::optional<u64> BufferCache<P>::FinishReadDownloads(DAddr device_addr, u64 si
         std::optional<u64> tick;
         bool side_eligible = false;
         u64 side_tick = 0;
+        u64 side_value = 0;
+        bool side_verify = false;
+        u64 download_id = 0;
+        u32 downloads_over = 0;
         for (const ReadDownload& download : read_downloads) {
             if (download.write_ranges.Intersects(device_addr, size)) {
                 tick = download.tick;
                 side_eligible = download.side_eligible;
                 side_tick = download.side_tick;
+                side_value = download.side_value;
+                side_verify = download.side_verify;
+                download_id = download.id;
+                ++downloads_over;
             }
         }
         if (!tick) {
             return std::nullopt;
         }
+        const bool reading = VideoCore::AsyncReadback::t_reading;
+        // FRITCHII_READ_SIDE_COPY=3: the download is the side copy alone. Its reader waits for
+        // that copy only and lands it at once, out of order (read downloads never overlap), when
+        // no other download covers the range. Anyone else waits for the main tick as before:
+        // its submission waited for the side copy.
+        if (side_value != 0 && !side_verify && reading && downloads_over == 1) [[unlikely]] {
+            u64 waited = 0;
+            if (!runtime.SideDone(side_value)) {
+                lock.unlock();
+                const u64 wait_start = VideoCore::AsyncReadback::Now();
+                runtime.WaitSide(side_value);
+                waited = (std::max)(VideoCore::AsyncReadback::Now() - wait_start, u64{1});
+                VideoCore::AsyncReadback::CountHostWait(waited);
+                VideoCore::AsyncReadback::Add(VideoCore::AsyncReadback::g_counters.on_card_ns,
+                                              waited);
+                lock.lock();
+            }
+            EarlyCompute::NoteSideLanded(waited);
+            for (auto it = read_downloads.begin(); it != read_downloads.end(); ++it) {
+                if (it->id == download_id) {
+                    LandReadDownload(*it);
+                    read_downloads.erase(it);
+                    VideoCore::g_read_downloads.fetch_sub(1, std::memory_order_release);
+                    break;
+                }
+            }
+            return waited;
+        }
         u64 waited = 0;
         if (!runtime.IsFree(*tick)) {
             lock.unlock();
             const u64 wait_start = VideoCore::AsyncReadback::Now();
+            // FRITCHII_READ_SIDE_COPY=2 (verify): the side copy's own wait first, then the main
+            // copy's as before (both land, and are compared, at the landing).
+            u64 side_ns = 0;
+            if (side_verify && reading) [[unlikely]] {
+                runtime.WaitSide(side_value);
+                side_ns = (std::max)(VideoCore::AsyncReadback::Now() - wait_start, u64{1});
+            }
             // FRITCHII_READ_RUNS=2 (counter only): the reader's wait, first until its writer's
             // submission ran. The "on the host GPU" figure keeps both parts.
             // FRITCHII_READ_SIDE_COPY (dry): an eligible download's wait is cut at the newest
             // write over all its bytes instead (RecordReadDownload), the side copy's own wait.
             u64 writer_ns = 0;
-            const bool side_cut = side_eligible && EarlyCompute::g_side_copy &&
-                                  VideoCore::AsyncReadback::t_reading;
+            const bool side_cut = side_eligible && EarlyCompute::g_side_copy && reading &&
+                                  side_ns == 0;
             if (side_cut) [[unlikely]] {
                 writer_ns = WaitReadWriter(side_tick);
                 VideoCore::AsyncReadback::Add(VideoCore::AsyncReadback::g_counters.on_card_ns,
@@ -1047,6 +1136,10 @@ std::optional<u64> BufferCache<P>::FinishReadDownloads(DAddr device_addr, u64 si
                     EarlyCompute::NoteSideCut(writer_ns,
                                               ReadRunStats::t_writer_answer.rest_wait_ns);
                 }
+                MeasureRunUp();
+            }
+            if (side_ns != 0) [[unlikely]] {
+                EarlyCompute::NoteSideVerifyWait(side_ns, waited);
             }
             lock.lock();
         }
@@ -1092,7 +1185,37 @@ void BufferCache<P>::WriteReadDownloads(u64 tick) {
     const Common::WriteRing::SiteScope write_site{"buffer read download (WriteReadDownloads)", true};
     if constexpr (!IS_OPENGL) {
         while (!read_downloads.empty() && read_downloads.front().tick <= tick) {
-            ReadDownload& download = read_downloads.front();
+            LandReadDownload(read_downloads.front());
+            read_downloads.pop_front();
+            VideoCore::g_read_downloads.fetch_sub(1, std::memory_order_release);
+        }
+    }
+}
+
+template <class P>
+void BufferCache<P>::LandReadDownload(ReadDownload& download) {
+    if constexpr (!IS_OPENGL) {
+        {
+            // FRITCHII_READ_SIDE_COPY=2: the side copy's bytes against the main copy's. The main
+            // tick is done here or the side value was waited for: every main submission after
+            // the side submit waited for it, so both are in.
+            if (download.side_verify) [[unlikely]] {
+                runtime.WaitSide(download.side_value);
+                u64 bytes = 0;
+                u64 differing = 0;
+                const u8* const main_base = download.staging.mapped_span.data();
+                const u8* const side_base = download.verify_staging.mapped_span.data();
+                for (const BufferCopy& copy : download.copies) {
+                    const u64 relative = copy.dst_offset - download.staging.offset;
+                    bytes += copy.size;
+                    if (std::memcmp(main_base + relative, side_base + relative, copy.size) != 0) {
+                        ++differing;
+                    }
+                }
+                EarlyCompute::NoteSideVerify(download.copies.size(), differing, bytes);
+                async_buffers_death_ring.push_back(download.verify_staging);
+                download.side_verify = false;
+            }
             // Guest memory this writes. The guest CPU writes collected from now on store their
             // bytes once this download is in guest memory.
             DAddr landing_begin = ~DAddr{0};
@@ -1138,8 +1261,6 @@ void BufferCache<P>::WriteReadDownloads(u64 tick) {
             });
             // Freed by the GPU thread (TickFrame).
             async_buffers_death_ring.push_back(download.staging);
-            read_downloads.pop_front();
-            VideoCore::g_read_downloads.fetch_sub(1, std::memory_order_release);
         }
     }
 }

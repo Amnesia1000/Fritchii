@@ -318,8 +318,12 @@ add_library(video_core STATIC
     renderer_vulkan/vk_shader_util.h
     renderer_vulkan/vk_staging_buffer_pool.cpp
     renderer_vulkan/vk_staging_buffer_pool.h
+    renderer_vulkan/vk_side_queue.cpp
+    renderer_vulkan/vk_side_queue.h
     renderer_vulkan/vk_state_tracker.cpp
     renderer_vulkan/vk_state_tracker.h
+    renderer_vulkan/vk_submit_times.cpp
+    renderer_vulkan/vk_submit_times.h
     renderer_vulkan/vk_swapchain.cpp
     renderer_vulkan/vk_swapchain.h
     renderer_vulkan/vk_texture_cache.cpp

@@ -839,6 +839,10 @@ void Scheduler::AllocateWorkerCommandBuffer() {
     if (trace_query_pool && !trace_gpu_failed) {
         TraceGpuSubmission();
     }
+    // FRITCHII_SUBMIT_TIMES (diagnostic): the next submission's start stamp. Off: one load.
+    if (SubmitTimes::Enabled()) [[unlikely]] {
+        submit_times.Begin(device, current_upload_cmdbuf);
+    }
     // Performance overlay time rows (common/frame_budget.h); off: one relaxed load.
     if ((budget_pending != 0 || Common::FrameBudget::Wanted()) && !budget_failed) [[unlikely]] {
         BudgetGpuSubmission();
@@ -1210,6 +1214,7 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         if (trace_query_pool) {
             trace_work = {};
         }
+        submit_times.End(cmdbuf, signal_value); // FRITCHII_SUBMIT_TIMES; nothing when off
         const auto end_start = std::chrono::steady_clock::now();
         cmdbuf.End();
         const auto end_done = std::chrono::steady_clock::now();

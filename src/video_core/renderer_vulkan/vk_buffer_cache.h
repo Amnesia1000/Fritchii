@@ -24,6 +24,7 @@
 #include "video_core/surface.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
+#include "video_core/renderer_vulkan/vk_side_queue.h"
 
 namespace Vulkan {
 
@@ -206,6 +207,36 @@ public:
     /// FRITCHII_READ_RUNS=2 (counter only), on any thread: false when scheduler tick `tick` is not
     /// submitted (nothing done: no flush is asked for); else waits until the host GPU ran it.
     bool WaitTickIfSubmitted(u64 tick);
+
+    /// FRITCHII_SUBMIT_TIMES (diagnostic), on any thread: the GPU's start and end of the
+    /// scheduler ticks [first, last] (those it ran), as busy time and gaps.
+    struct AheadTimes {
+        u32 submissions;
+        u32 resolved;
+        u64 busy_ns;
+        u64 gap_ns;
+        u64 overlap_ns;
+        u64 span_ns;
+    };
+    [[nodiscard]] AheadTimes MeasureSubmissions(u64 first, u64 last);
+
+    /// FRITCHII_READ_SIDE_COPY >= 2 (vk_side_queue.h): whether the side queue is there (made on
+    /// the first ask; the device must have been made with it).
+    [[nodiscard]] bool SideCopyReady();
+
+    /// One region of a side copy: from a buffer cache buffer into a download staging buffer.
+    struct SideCopyRegion {
+        VkBuffer src;
+        VkBuffer dst;
+        u64 src_offset;
+        u64 dst_offset;
+        u64 size;
+    };
+    /// Submits `regions` on the side queue after the main queue ran scheduler tick `main_tick`;
+    /// returns the side value (0: not submitted). Every later main submission waits for it.
+    [[nodiscard]] u64 SideCopy(u64 main_tick, std::span<const SideCopyRegion> regions);
+    [[nodiscard]] bool SideDone(u64 value);
+    void WaitSide(u64 value);
 
     u64 GetDeviceLocalMemory() const;
 
@@ -397,6 +428,10 @@ private:
     GuestDescriptorQueue& guest_descriptor_queue;
     MemStage& mem_stage;
     SeamClock& clock;
+
+    /// FRITCHII_READ_SIDE_COPY >= 2: made on the first SideCopyReady.
+    std::unique_ptr<SideQueue> side_queue;
+    std::once_flag side_queue_once;
 
     std::shared_ptr<QuadArrayIndexBuffer> quad_array_index_buffer;
     std::shared_ptr<QuadStripIndexBuffer> quad_strip_index_buffer;
