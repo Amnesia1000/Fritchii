@@ -149,6 +149,7 @@ private:
     AmdFsr4Panel* amd_fsr4_panel{};       ///< Under it while AMD FSR 4 is picked
     QCheckBox* nvidia_dlss_checkbox{};     ///< The nvidia_dlss setting
     QWidget* nvidia_dlss_group{};          ///< The DLSS checkbox and NVIDIA's panel under it
+    std::vector<QWidget*> dlss_rows;       ///< DLSS quality/model/jitter/game's own DLSS rows
     QComboBox* dlss_quality_combobox{};    ///< The nvidia_dlss_quality choice
     QWidget* resolution_widget{};          ///< The resolution_setup row
     QVBoxLayout* resolution_group_layout{}; ///< Fritchii: the resolution choice and what's under it

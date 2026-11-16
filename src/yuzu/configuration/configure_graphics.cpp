@@ -283,6 +283,12 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
             dlss_quality_widget = widget;
         }
         all_rows.emplace(setting->Id(), widget);
+        if (setting->Id() == Settings::values.nvidia_dlss_quality.Id() ||
+            setting->Id() == Settings::values.nvidia_dlss_preset.Id() ||
+            setting->Id() == Settings::values.game_dlss_network.Id() ||
+            setting->Id() == Settings::values.oot_dlss_jitter.Id()) {
+            dlss_rows.push_back(widget);
+        }
 
         if (setting->Id() == Settings::values.renderer_backend.Id()) {
             // Add the renderer combobox now so it's at the top
@@ -619,7 +625,14 @@ void ConfigureGraphics::UpdateDlssVisibility() {
     const bool nvidia = GetCurrentGraphicsBackend() == Settings::RendererBackend::Vulkan &&
                         device >= 0 && static_cast<size_t>(device) < records.size() &&
                         records[device].nvidia;
-    nvidia_dlss_group->setVisible(nvidia || nvidia_dlss_checkbox->isChecked());
+    // Not NVIDIA: every DLSS row goes, a saved "on" included (2026-11-16: an RX 7900 XT's game
+    // settings still showed DLSS quality and model; DLSS can't run there, the value does nothing).
+    nvidia_dlss_group->setVisible(nvidia);
+    if (!nvidia) {
+        for (QWidget* const row : dlss_rows) {
+            row->setVisible(false);
+        }
+    }
     UpdateUpscalerChoice();
 }
 
