@@ -9656,6 +9656,20 @@ bool AccelerateDMA::DmaBufferImageCopy(const Tegra::DMA::ImageCopy& copy_info,
     const auto [buffer, offset] = buffer_cache.runtime.Seam().Ref(MemStage::Site::ImageCopy, [&] {
         return buffer_cache.ObtainBuffer(buffer_operand.address, buffer_size, sync_info, post_op);
     });
+    if (buffer->Handle() == VK_NULL_HANDLE) [[unlikely]] {
+        // The buffer operand is unmapped (ObtainBuffer's null buffer, which has no VkBuffer with
+        // nullDescriptor on): a GPU copy would use device address 0. The engine's own copy does
+        // it through guest memory instead, which skips the unmapped pages.
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_WARNING(Render_Vulkan,
+                        "DMA {} at unmapped GPU address {:#x} ({} bytes): left to the engine's "
+                        "copy (no GPU copy into the null buffer)",
+                        IS_IMAGE_UPLOAD ? "buffer to image" : "image to buffer",
+                        buffer_operand.address, buffer_size);
+        }
+        return false;
+    }
 
     const auto [image, copy] = texture_cache.DmaBufferImageCopy(
         copy_info, buffer_operand, image_operand, image_id, IS_IMAGE_UPLOAD);
