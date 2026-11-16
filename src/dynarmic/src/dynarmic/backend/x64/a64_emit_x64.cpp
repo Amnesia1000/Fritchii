@@ -9,7 +9,9 @@
 #include "dynarmic/backend/x64/a64_emit_x64.h"
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
+#include <cstring>
 #include <exception>
 #include <cctype>
 #include <cstdlib>
@@ -32,6 +34,7 @@
 #include "dynarmic/backend/x64/block_of_code.h"
 #include "dynarmic/backend/x64/devirtualize.h"
 #include "dynarmic/backend/x64/emit_x64.h"
+#include "dynarmic/backend/x64/exclusive_monitor_friend.h"
 #include "dynarmic/backend/x64/nzcv_util.h"
 #include "dynarmic/backend/x64/perf_map.h"
 #include "dynarmic/backend/x64/stack_layout.h"
@@ -158,6 +161,79 @@ void NoteSharedFastmemMarkUsed(SharedFastmemMarks& shared, unsigned core) {
                  "without fastmem from another core's fault ({} marks; this one on core {})",
                  used, shared.faults.load(std::memory_order_relaxed), core);
     }
+}
+
+int A64EmitX64::StateRefsMode() {
+    static const int mode = [] {
+        const int value = EnvSwitch("FRITCHII_JIT_STATE_REFS");
+        if (value < 0 || value > 2) {
+            LOG_WARNING(Core_ARM, "FRITCHII_JIT_STATE_REFS={} is outside 0..2, using 0", value);
+            return 0;
+        }
+        if (value != 0) {
+            LOG_INFO(Core_ARM, "FRITCHII_JIT_STATE_REFS={}: per-core addresses read through the state register{}", value,
+                     value == 2 ? ", blocks scanned for any left (must be 0)" : "");
+        }
+        return value;
+    }();
+    return mode;
+}
+
+StateRefConfig A64EmitX64::StateRefSetup(const A64::UserConfig& conf, const void* jit) {
+    StateRefConfig refs;
+    refs.mode = StateRefsMode();
+    if (refs.mode == 0) {
+        return refs;
+    }
+    refs.base_offset = u32(offsetof(A64JitState, core_refs));
+    const auto set = [&refs](CoreRef which, u64 value) { refs.values[size_t(which)] = value; };
+    set(CoreRef::Callbacks, u64(reinterpret_cast<uintptr_t>(conf.callbacks)));
+    set(CoreRef::Jit, u64(reinterpret_cast<uintptr_t>(jit)));
+    set(CoreRef::Tpidr, u64(reinterpret_cast<uintptr_t>(conf.tpidr_el0)));
+    set(CoreRef::Tpidrro, u64(reinterpret_cast<uintptr_t>(conf.tpidrro_el0)));
+    if (conf.global_monitor != nullptr && conf.processor_id < GetExclusiveMonitorProcessorCount(conf.global_monitor)) {
+        set(CoreRef::MonitorAddress, std::bit_cast<u64>(GetExclusiveMonitorAddressPointer(conf.global_monitor, conf.processor_id)));
+        set(CoreRef::MonitorValue, std::bit_cast<u64>(GetExclusiveMonitorValuePointer(conf.global_monitor, conf.processor_id)));
+    }
+    // Conf, FastDispatchTable, IndirectSlots and IndirectCounters: the emitter's constructor.
+    return refs;
+}
+
+void A64EmitX64::AddStateRefScanRange(const void* begin, size_t size, const char* name) {
+    if (state_refs == 2 && begin != nullptr && size != 0) {
+        state_ref_ranges.push_back(StateRefScanRange{u64(reinterpret_cast<uintptr_t>(begin)), u64(size), name});
+    }
+}
+
+size_t A64EmitX64::ScanStateRefs(const u8* begin, size_t size, u64 pc, const char* what) {
+    size_t hits = 0;
+    for (size_t i = 0; i + sizeof(u64) <= size; ++i) {
+        u64 value;
+        std::memcpy(&value, begin + i, sizeof(value));
+        for (const StateRefScanRange& range : state_ref_ranges) {
+            if (value - range.begin >= range.size) {
+                continue;
+            }
+            ++hits;
+            if (state_ref_hits_logged < 8) {
+                ++state_ref_hits_logged;
+                LOG_WARNING(Core_ARM,
+                            "JIT state refs (FRITCHII_JIT_STATE_REFS=2) core {}: {} {:#x} +{:#x} holds {:#x} = {} +{:#x} "
+                            "(bytes before: {:02x} {:02x})",
+                            conf.processor_id, what, pc, i, value, range.name, value - range.begin,
+                            i >= 2 ? begin[i - 2] : 0, i >= 1 ? begin[i - 1] : 0);
+            }
+            break;
+        }
+    }
+    return hits;
+}
+
+void A64EmitX64::LogStateRefs(const char* when) {
+    LOG_INFO(Core_ARM,
+             "JIT state refs (FRITCHII_JIT_STATE_REFS=2) core {} {}: {} per-core constants left in {} blocks "
+             "of {} scanned (must be 0); prelude {}",
+             conf.processor_id, when, state_ref_hits, state_ref_hit_blocks, state_ref_blocks, state_ref_prelude_hits);
 }
 
 bool A64EmitX64::OmitFramePointer() {
@@ -469,6 +545,28 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
     if (indirect_cache_mode != 0) {
         indirect_slots.reset(new FastDispatchEntry[indirect_slot_capacity]);
     }
+    // Fritchii (FRITCHII_JIT_STATE_REFS): the per-core addresses this emitter owns, before any
+    // code that uses them; Jit::Impl copies them all into the state block.
+    state_refs = code.StateRefsMode();
+    if (state_refs != 0) {
+        code.SetCoreRef(CoreRef::Conf, u64(reinterpret_cast<uintptr_t>(&this->conf)));
+        code.SetCoreRef(CoreRef::FastDispatchTable, u64(reinterpret_cast<uintptr_t>(fast_dispatch_table.get())));
+        code.SetCoreRef(CoreRef::IndirectSlots, u64(reinterpret_cast<uintptr_t>(indirect_slots.get())));
+        code.SetCoreRef(CoreRef::IndirectCounters, u64(reinterpret_cast<uintptr_t>(indirect_counters.data())));
+    }
+    if (state_refs == 2) {
+        // The scan's targets: this core's objects (Jit::Impl adds the JIT object, which holds
+        // the state block, the code object and this emitter).
+        AddStateRefScanRange(conf.callbacks, sizeof(void*), "callbacks");
+        AddStateRefScanRange(conf.tpidr_el0, sizeof(u64), "tpidr_el0");
+        AddStateRefScanRange(conf.tpidrro_el0, sizeof(u64), "tpidrro_el0");
+        const StateRefConfig& refs = code.StateRefs();
+        AddStateRefScanRange(reinterpret_cast<const void*>(refs.values[size_t(CoreRef::MonitorAddress)]), sizeof(u64), "own monitor address");
+        AddStateRefScanRange(reinterpret_cast<const void*>(refs.values[size_t(CoreRef::MonitorValue)]), 16, "own monitor value");
+        AddStateRefScanRange(this, sizeof(*this), "emitter");
+        AddStateRefScanRange(fast_dispatch_table.get(), fast_dispatch_table_size * sizeof(FastDispatchEntry), "fast dispatch table");
+        AddStateRefScanRange(indirect_slots.get(), indirect_slots ? indirect_slot_capacity * sizeof(FastDispatchEntry) : 0, "indirect slots");
+    }
     // Fritchii (FRITCHII_JIT_PIN): BlockOfCode holds the pins; everything emitted from here runs
     // with them loaded (the exception handler's code, emitted by the base, does not).
     pin_host_index.fill(-1);
@@ -521,7 +619,11 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
     }
 }
 
-A64EmitX64::~A64EmitX64() = default;
+A64EmitX64::~A64EmitX64() {
+    if (state_refs == 2 && state_ref_blocks != 0) {
+        LogStateRefs("at the end");
+    }
+}
 
 // Fritchii: a throw here (an Xbyak error) used to end the process without a word: it is called
 // from generated code (the dispatcher's block lookup), whose frames the unwinder cannot cross.
@@ -664,6 +766,29 @@ finish_this_inst:
     block_ranges.AddRange(range, descriptor);
 
     auto bdesc = RegisterBlock(descriptor, entrypoint, size);
+    if (state_refs == 2) [[unlikely]] {
+        // Fritchii (FRITCHII_JIT_STATE_REFS=2): what of this core the block's bytes still hold.
+        if (!state_ref_prelude_scanned) {
+            state_ref_prelude_scanned = true;
+            const u8* const prelude = code.getCode();
+            state_ref_prelude_hits = ScanStateRefs(prelude, size_t(static_cast<const u8*>(code.GetCodeBegin()) - prelude), 0, "prelude");
+        }
+        size_t hits = ScanStateRefs(static_cast<const u8*>(entrypoint), size, descriptor.PC(), "block");
+        if (last_far_size != 0) {
+            hits += ScanStateRefs(static_cast<const u8*>(last_far_entry), last_far_size, descriptor.PC(), "far part of block");
+        }
+        ++state_ref_blocks;
+        if (hits != 0) {
+            ++state_ref_hit_blocks;
+            state_ref_hits += hits;
+        }
+        if (state_ref_blocks >= state_ref_next_log || (hits != 0 && state_ref_hit_blocks == 1)) {
+            LogStateRefs("so far");
+            while (state_ref_next_log <= state_ref_blocks) {
+                state_ref_next_log *= 2;
+            }
+        }
+    }
     code.DisableWriting();
     shared_labels.clear();
     return bdesc;
@@ -893,7 +1018,7 @@ void A64EmitX64::GenTerminalHandlers() {
         calculate_location_descriptor();
         code.L(rsb_cache_miss);
         terminal_handler_fast_dispatch_after_calc = code.getCurr<const void*>();
-        code.mov(r8, u64(fast_dispatch_table.get()));
+        code.MovCoreRef(r8, CoreRef::FastDispatchTable, u64(fast_dispatch_table.get()));
         //code.mov(r12, qword[code.ABI_JIT_PTR + offsetof(A64JitState, pc)]);
         code.mov(r12, rbx);
         if (code.HasHostFeature(HostFeature::SSE42)) {
@@ -912,15 +1037,26 @@ void A64EmitX64::GenTerminalHandlers() {
         PerfMapRegister(terminal_handler_fast_dispatch_hint, code.getCurr(), "a64_terminal_handler_fast_dispatch_hint");
 
         code.align();
-        fast_dispatch_table_lookup = code.getCurr<FastDispatchEntry& (*)(u64)>();
-        code.mov(code.ABI_PARAM2, u64(fast_dispatch_table.get()));
+        // Fritchii (FRITCHII_JIT_STATE_REFS): called from C++ (no state register): the table
+        // comes as the second argument instead of an immediate.
+        if (state_refs != 0) {
+            fast_dispatch_table_lookup_in = code.getCurr<FastDispatchEntry& (*)(u64, FastDispatchEntry*)>();
+        } else {
+            fast_dispatch_table_lookup = code.getCurr<FastDispatchEntry& (*)(u64)>();
+            code.mov(code.ABI_PARAM2, u64(fast_dispatch_table.get()));
+        }
+        const void* const lookup_begin = code.getCurr<const void*>();
         if (code.HasHostFeature(HostFeature::SSE42)) {
             code.crc32(code.ABI_PARAM1, code.ABI_PARAM2);
         }
         code.and_(code.ABI_PARAM1.cvt32(), fast_dispatch_table_mask);
         code.lea(code.ABI_RETURN, code.ptr[code.ABI_PARAM2 + code.ABI_PARAM1]);
         code.ret();
-        PerfMapRegister(fast_dispatch_table_lookup, code.getCurr(), "a64_fast_dispatch_table_lookup");
+        if (state_refs != 0) {
+            PerfMapRegister(lookup_begin, code.getCurr(), "a64_fast_dispatch_table_lookup");
+        } else {
+            PerfMapRegister(fast_dispatch_table_lookup, code.getCurr(), "a64_fast_dispatch_table_lookup");
+        }
     }
 
     // Fritchii: FRITCHII_JIT_INDIRECT_CACHE's shared parts (the sites are in EmitTerminalImpl).
@@ -930,7 +1066,7 @@ void A64EmitX64::GenTerminalHandlers() {
         // Dry, rax = the site's slot: count a target equal to the site's last, then remember it.
         const auto count_same_target = [this](IndirectCounter runs, IndirectCounter same) {
             Xbyak::Label differs;
-            code.mov(r8, u64(indirect_counters.data()));
+            code.MovCoreRef(r8, CoreRef::IndirectCounters, u64(indirect_counters.data()));
             code.inc(qword[r8 + runs * sizeof(u64)]);
             code.cmp(rbx, qword[rax + offsetof(FastDispatchEntry, location_descriptor)]);
             code.jne(differs);
@@ -969,9 +1105,9 @@ void A64EmitX64::GenTerminalHandlers() {
         // miss path (lookup, table refill) runs and the slot is filled at the next miss.
         code.align();
         terminal_handler_indirect_slot_miss = code.getCurr<const void*>();
-        code.mov(r8, u64(indirect_counters.data()));
+        code.MovCoreRef(r8, CoreRef::IndirectCounters, u64(indirect_counters.data()));
         code.inc(qword[r8 + SlotMisses * sizeof(u64)]);
-        code.mov(r8, u64(fast_dispatch_table.get()));
+        code.MovCoreRef(r8, CoreRef::FastDispatchTable, u64(fast_dispatch_table.get()));
         code.mov(r12, rbx);
         if (code.HasHostFeature(HostFeature::SSE42)) {
             code.crc32(r12, r8);
@@ -1417,7 +1553,7 @@ void A64EmitX64::EmitA64GetDCZID(A64EmitContext& ctx, IR::Inst* inst) {
 void A64EmitX64::EmitA64GetTPIDR(A64EmitContext& ctx, IR::Inst* inst) {
     const Xbyak::Reg64 result = ctx.reg_alloc.ScratchGpr(code);
     if (conf.tpidr_el0) {
-        code.mov(result, u64(conf.tpidr_el0));
+        code.MovCoreRef(result, CoreRef::Tpidr, u64(conf.tpidr_el0));
         code.mov(result, qword[result]);
     } else {
         code.xor_(result.cvt32(), result.cvt32());
@@ -1428,7 +1564,7 @@ void A64EmitX64::EmitA64GetTPIDR(A64EmitContext& ctx, IR::Inst* inst) {
 void A64EmitX64::EmitA64GetTPIDRRO(A64EmitContext& ctx, IR::Inst* inst) {
     const Xbyak::Reg64 result = ctx.reg_alloc.ScratchGpr(code);
     if (conf.tpidrro_el0) {
-        code.mov(result, u64(conf.tpidrro_el0));
+        code.MovCoreRef(result, CoreRef::Tpidrro, u64(conf.tpidrro_el0));
         code.mov(result, qword[result]);
     } else {
         code.xor_(result.cvt32(), result.cvt32());
@@ -1441,7 +1577,7 @@ void A64EmitX64::EmitA64SetTPIDR(A64EmitContext& ctx, IR::Inst* inst) {
     const Xbyak::Reg64 value = ctx.reg_alloc.UseGpr(code, args[0]);
     const Xbyak::Reg64 addr = ctx.reg_alloc.ScratchGpr(code);
     if (conf.tpidr_el0) {
-        code.mov(addr, u64(conf.tpidr_el0));
+        code.MovCoreRef(addr, CoreRef::Tpidr, u64(conf.tpidr_el0));
         code.mov(qword[addr], value);
     }
 }
@@ -1535,7 +1671,7 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::PopRSBHint, IR::LocationDescripto
         if (e.indirect_cache_mode == 1 && e.terminal_handler_pop_rsb_dry != nullptr) {
             // FRITCHII_JIT_INDIRECT_CACHE=1: the dry handler counts this site's targets.
             if (auto* const slot = e.AllocateIndirectSlot()) {
-                e.code.mov(rax, u64(slot));
+                e.EmitIndirectSlotAddress(rax, slot);
                 e.code.jmp(e.terminal_handler_pop_rsb_dry);
                 return true;
             }
@@ -1574,7 +1710,7 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::FastDispatchHint, IR::LocationDes
         if (auto* const slot = e.AllocateIndirectSlot()) {
             if (e.indirect_cache_mode == 1) {
                 // FRITCHII_JIT_INDIRECT_CACHE=1: the dry handler counts this site's targets.
-                e.code.mov(rax, u64(slot));
+                e.EmitIndirectSlotAddress(rax, slot);
                 e.code.jmp(e.terminal_handler_indirect_dry);
                 return true;
             }
@@ -1583,6 +1719,19 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::FastDispatchHint, IR::LocationDes
             // any block is removed), so a match jumps where the table would have.
             Xbyak::Label miss;
             e.EmitCalculateLocationDescriptor();
+            if (e.state_refs != 0) {
+                // Fritchii (FRITCHII_JIT_STATE_REFS): the slot array from the state block, the
+                // slot's offset in the instructions (one load more than the immediate's mov).
+                const u32 disp = e.IndirectSlotOffset(slot);
+                e.code.mov(rax, qword[e.code.ABI_JIT_PTR + e.code.CoreRefOffset(CoreRef::IndirectSlots)]);
+                e.code.cmp(rbx, qword[rax + disp + offsetof(A64EmitX64::FastDispatchEntry, location_descriptor)]);
+                e.code.jne(miss);
+                e.code.jmp(ptr[rax + disp + offsetof(A64EmitX64::FastDispatchEntry, code_ptr)]);
+                e.code.L(miss);
+                e.code.lea(rax, ptr[rax + disp]);
+                e.code.jmp(e.terminal_handler_indirect_slot_miss);
+                return true;
+            }
             e.code.mov(rax, u64(slot));
             e.code.cmp(rbx, qword[rax + offsetof(A64EmitX64::FastDispatchEntry, location_descriptor)]);
             e.code.jne(miss);
@@ -1747,7 +1896,11 @@ void A64EmitX64::Unpatch(const IR::LocationDescriptor& location) {
     EmitX64::Unpatch(location);
     if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
         code.DisableWriting();
-        (*fast_dispatch_table_lookup)(location.Value()) = {};
+        if (fast_dispatch_table_lookup_in != nullptr) {
+            (*fast_dispatch_table_lookup_in)(location.Value(), fast_dispatch_table.get()) = {};
+        } else {
+            (*fast_dispatch_table_lookup)(location.Value()) = {};
+        }
         code.EnableWriting();
     }
     // Fritchii (FRITCHII_JIT_INDIRECT_CACHE): a block removed outside a range invalidation (the

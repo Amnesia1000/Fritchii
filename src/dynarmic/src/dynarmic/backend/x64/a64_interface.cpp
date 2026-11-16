@@ -335,7 +335,8 @@ struct Jit::Impl final {
 public:
     Impl(Jit* jit, UserConfig conf)
         : conf(conf)
-        , block_of_code(GenRunCodeCallbacks(conf.callbacks, &GetCurrentBlockThunk, this, conf), JitStateInfo{jit_state}, conf.code_cache_size, GenRCP(conf), A64EmitX64::PinSetup(conf))
+        , block_of_code(GenRunCodeCallbacks(conf.callbacks, &GetCurrentBlockThunk, this, conf), JitStateInfo{jit_state}, conf.code_cache_size, GenRCP(conf), A64EmitX64::PinSetup(conf),
+                        A64EmitX64::StateRefSetup(conf, this))
         , emitter(block_of_code, conf, jit)
         , polyfill_options(GenPolyfillOptions(block_of_code))
     {
@@ -348,6 +349,15 @@ public:
             }
         }
         halt_latency = HaltLatencyMode();
+        // Fritchii (FRITCHII_JIT_STATE_REFS): the per-core addresses generated code reads from
+        // the state block (all 0 with the switch off, then nothing reads them).
+        static_assert(size_t(CoreRef::Count) <= A64JitState::core_ref_count);
+        for (size_t i = 0; i < size_t(CoreRef::Count); ++i) {
+            jit_state.core_refs[i] = block_of_code.StateRefs().values[i];
+        }
+        // FRITCHII_JIT_STATE_REFS=2: the scan also looks for this object (state block, code
+        // object, emitter).
+        emitter.AddStateRefScanRange(this, sizeof(*this), "JIT object");
     }
 
     ~Impl() = default;
@@ -435,7 +445,9 @@ public:
 
     void Reset() {
         ASSERT(!is_executing);
+        const auto core_refs = jit_state.core_refs; // Fritchii (FRITCHII_JIT_STATE_REFS)
         jit_state = {};
+        jit_state.core_refs = core_refs;
     }
 
     void HaltExecution(HaltReason hr) {
