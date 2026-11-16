@@ -235,8 +235,9 @@ leaves the extension off, as before. Why: two AMD testers hit device losses with
 
 ### FRITCHII_SCALED_EXTENT_CAP
 
-TEST, off by default (helper BH, 2026-11-16, port of zortos293/Lichii #1890 by zortos293, still
-open there). Live, for images made after the change. 0 = as before. 1 = the texture cache leaves
+On by default since 2026-11-16 (helper BR; helper BH ported it off, port of zortos293/Lichii
+#1890 by zortos293, still open there). Live, for images made after the change. 0 = as before
+(the A/B and kill switch). 1 (default) = the texture cache leaves
 an image unscaled when its scaled width or height would pass the device's 2D image or framebuffer
 limit (the smallest of the three; 16384 on AMD and RADV, 32768 on NVIDIA). Rescaling is decided
 per render target set, so that whole pass stays native while the rest of the frame scales. Why:
@@ -245,6 +246,15 @@ OoT's sun shadow map is a 12288x12288 D16 depth target; at 1.5x it is 18432 wide
 1.5x/2x on AMD (zortos #1885: semaphore waits for 2 s, then "Device loss occurred" with no fault
 address). NVIDIA keeps scaling that map at 2x, so on NVIDIA the switch changes nothing at those
 scales. Check: an AMD tester at 1.5x enters Castle Town with the switch at 1.
+- Why on by default: it only changes an image whose scaled size is past the device's own
+  limits, which is invalid Vulkan on every driver (no driver has to accept it). At 1x, 1.25x on
+  every card and up to 2x on NVIDIA nothing changes. A scale that does not enlarge images (1x and
+  the downscales) is never refused (idea from bakemono's handoff: without that guard a 0.75x
+  downscale on an 8192-limit device would leave the image native, bigger than scaled).
+- Checked before the cached IsRescalable answer, so changing the scale in game is covered.
+- Log: "Image WxH (format F, N samples) stays at native size: scaled it would be ..., past the
+  device's limit of L (FRITCHII_SCALED_EXTENT_CAP)" (HW_GPU, Info), once per image. At 1.5x/2x on
+  AMD, expect it once for the 12288x12288 D16 sun shadow map.
 
 ### FRITCHII_OOT_BYPASS_SAMPLED
 

@@ -1649,6 +1649,11 @@ void SwizzleImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const Ima
 
 bool ScaledImageFits(const ImageInfo& info, const Settings::ResolutionScalingInfo& resolution,
                      u32 max_extent) noexcept {
+    // A scale that does not enlarge the image (1x, 0.5x, 0.75x) always fits: refusing it would
+    // leave the image at its native size, larger than the scaled one.
+    if (resolution.up_scale <= (1U << resolution.down_shift)) {
+        return true;
+    }
     const auto [samples_x, samples_y] = SamplesLog2(info.num_samples);
     const u32 width = resolution.ScaleUp(info.size.width) >> samples_x;
     const u32 height =

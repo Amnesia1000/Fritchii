@@ -1315,6 +1315,9 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
       compute_pass_descriptor_queue{compute_pass_descriptor_queue_},
       resolution{Settings::values.resolution_info},
       image_free_queue{device_.IsAllocatorThreadSafe()} {
+    max_scaled_extent = (std::min)({device.GetMaxImageDimension2D(),
+                                    device.GetMaxFramebufferWidth(),
+                                    device.GetMaxFramebufferHeight()});
     // Before anything below reads astc_recompression (passes, view formats).
     UseBc3ForSwitch2OnSmallCards(device);
     // Huge ASTC arrays always decode on the GPU (IsHugeAstcArray), whatever the decode setting.
@@ -2867,8 +2870,7 @@ u64 TextureCacheRuntime::GetDeviceMemorySlack() const {
 }
 
 u32 TextureCacheRuntime::GetMaxScaledExtent() const noexcept {
-    return (std::min)({device.GetMaxImageDimension2D(), device.GetMaxFramebufferWidth(),
-                       device.GetMaxFramebufferHeight()});
+    return max_scaled_extent;
 }
 
 void TextureCacheRuntime::LimitKeptBlocks(u64 budget, u64 critical) const {

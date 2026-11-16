@@ -4427,13 +4427,26 @@ bool TextureCache<P>::ImageCanRescale(ImageBase& image) {
         return false;
     }
     if constexpr (requires { runtime.GetMaxScaledExtent(); }) {
-        // FRITCHII_SCALED_EXTENT_CAP: past the device's limits the scaled image is invalid. OoT's
-        // 12288x12288 sun shadow map is 18432 wide at 1.5x and 24576 at 2x, over AMD's 16384,
-        // and drawing into it hangs the GPU (device loss entering Castle Town on AMD).
+        // FRITCHII_SCALED_EXTENT_CAP (default 1): past the device's limits the scaled image is
+        // invalid. OoT's 12288x12288 sun shadow map is 18432 wide at 1.5x and 24576 at 2x, over
+        // AMD's 16384, and drawing into it hangs the GPU (device loss entering Castle Town on
+        // AMD). Before the cached IsRescalable answer, so a scale changed in game is checked too.
         if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_scaled_extent_cap,
-                                             "FRITCHII_SCALED_EXTENT_CAP") != 0 &&
+                                             "FRITCHII_SCALED_EXTENT_CAP", 1) != 0 &&
             !ScaledImageFits(image.info, Settings::values.resolution_info,
                              runtime.GetMaxScaledExtent())) {
+            if (False(image.flags & ImageFlagBits::ScaleLimited)) {
+                image.flags |= ImageFlagBits::ScaleLimited;
+                LOG_INFO(HW_GPU,
+                         "Image {}x{} (format {}, {} samples) stays at native size: scaled it "
+                         "would be {}x{}, past the device's limit of {} "
+                         "(FRITCHII_SCALED_EXTENT_CAP)",
+                         image.info.size.width, image.info.size.height,
+                         static_cast<u32>(image.info.format), image.info.num_samples,
+                         Settings::values.resolution_info.ScaleUp(image.info.size.width),
+                         Settings::values.resolution_info.ScaleUp(image.info.size.height),
+                         runtime.GetMaxScaledExtent());
+            }
             return false;
         }
     }
