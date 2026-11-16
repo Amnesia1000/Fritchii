@@ -621,6 +621,9 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
       fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache, device, scheduler),
       frame_dump(device, memory_allocator, scheduler),
       flash_watch(device, memory_allocator, scheduler) {
+    // FRITCHII_LOCK_CENSUS: the two cache locks by name (before any other thread uses them).
+    buffer_cache.mutex.SetCensusName("buffer cache");
+    texture_cache.mutex.SetCensusName("texture cache");
     scheduler.SetQueryCache(query_cache);
     // The memory seam's read log asks this cache's tracker.
     mem_stage.Attach(buffer_cache);

@@ -54,6 +54,8 @@ add_library(
     nx2_hitch.h
     nx2_sampler.cpp
     nx2_sampler.h
+    fritchii_lock_census.cpp
+    fritchii_lock_census.h
     nx2_gpu_write_listener.h
     nx2_uniform_keep_pages.h
     fritchii_switch_defaults.cpp
