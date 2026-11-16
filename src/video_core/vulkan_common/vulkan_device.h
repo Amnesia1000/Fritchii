@@ -1612,4 +1612,28 @@ private:
     std::unique_ptr<KeptBlocks> kept_blocks;
 };
 
+/// What the graphics card pick looks at for one Vulkan physical device.
+struct PhysicalDeviceSummary {
+    std::string name;     ///< VkPhysicalDeviceProperties::deviceName
+    VkPhysicalDeviceType type{};
+    u64 local_memory{};   ///< Largest device-local heap, in bytes
+};
+
+/// The card a game runs on, and why (for the log).
+struct PhysicalDevicePick {
+    size_t index{};
+    std::string_view reason;
+};
+
+std::vector<PhysicalDeviceSummary> SummarizePhysicalDevices(
+    const vk::InstanceDispatch& dld, std::span<const VkPhysicalDevice> devices);
+
+/// Fritchii's graphics card pick. A saved name (vulkan_device_name) is the player's choice and
+/// is found again by name when the device order changes. Without one, a saved index other than
+/// 0 is an earlier choice too; index 0 is the default, and there the discrete card with the most
+/// device-local memory wins over an integrated GPU (a 5600G + Arc B580 PC landed on the 5600G's
+/// iGPU). A saved card that is gone falls back to the same automatic pick.
+PhysicalDevicePick PickPhysicalDevice(std::span<const PhysicalDeviceSummary> devices,
+                                      u32 saved_index, std::string_view saved_name);
+
 } // namespace Vulkan

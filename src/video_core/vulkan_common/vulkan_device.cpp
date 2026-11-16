@@ -3159,4 +3159,76 @@ void Device::ShutdownGPULogging() {
     }
 }
 
+std::vector<PhysicalDeviceSummary> SummarizePhysicalDevices(
+    const vk::InstanceDispatch& dld, std::span<const VkPhysicalDevice> devices) {
+    std::vector<PhysicalDeviceSummary> summaries;
+    summaries.reserve(devices.size());
+    for (const VkPhysicalDevice handle : devices) {
+        const vk::PhysicalDevice physical(handle, dld);
+        const VkPhysicalDeviceProperties properties = physical.GetProperties();
+        PhysicalDeviceSummary summary;
+        summary.name = properties.deviceName;
+        summary.type = properties.deviceType;
+        const VkPhysicalDeviceMemoryProperties memory = physical.GetMemoryProperties().memoryProperties;
+        for (u32 heap = 0; heap < memory.memoryHeapCount; ++heap) {
+            if ((memory.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) {
+                summary.local_memory = (std::max)(summary.local_memory,
+                                                  u64{memory.memoryHeaps[heap].size});
+            }
+        }
+        summaries.push_back(std::move(summary));
+    }
+    return summaries;
+}
+
+PhysicalDevicePick PickPhysicalDevice(std::span<const PhysicalDeviceSummary> devices,
+                                      u32 saved_index, std::string_view saved_name) {
+    if (devices.empty()) {
+        return {0, "no device"};
+    }
+    if (!saved_name.empty()) {
+        // The saved index first: two cards of the same model keep the one picked.
+        if (saved_index < devices.size() && devices[saved_index].name == saved_name) {
+            return {saved_index, "the saved choice"};
+        }
+        for (size_t i = 0; i < devices.size(); ++i) {
+            if (devices[i].name == saved_name) {
+                return {i, "the saved choice, found by name (the device order changed)"};
+            }
+        }
+    } else if (saved_index != 0 && saved_index < devices.size()) {
+        return {saved_index, "the saved choice (index, from before names were saved)"};
+    }
+    // Automatic: a discrete card before an integrated GPU, then the most device-local memory.
+    // Index 0 stays when nothing beats it, so single-GPU PCs never change.
+    const auto rank = [](VkPhysicalDeviceType type) {
+        switch (type) {
+        case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
+            return 3;
+        case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:
+            return 2;
+        case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:
+            return 1;
+        default:
+            return 0;
+        }
+    };
+    size_t best = 0;
+    for (size_t i = 1; i < devices.size(); ++i) {
+        const int candidate = rank(devices[i].type);
+        const int current = rank(devices[best].type);
+        if (candidate > current ||
+            (candidate == current && devices[i].local_memory > devices[best].local_memory)) {
+            best = i;
+        }
+    }
+    if (!saved_name.empty()) {
+        return {best, "automatic (the saved card is not in this PC any more)"};
+    }
+    if (saved_index >= devices.size()) {
+        return {best, "automatic (the saved index is past the device list)"};
+    }
+    return {best, "automatic (discrete card with the most video memory first)"};
+}
+
 } // namespace Vulkan

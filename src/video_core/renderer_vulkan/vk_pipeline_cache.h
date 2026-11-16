@@ -637,6 +637,9 @@ private:
     /// disk_pipelines as boot left it: the preparation skips those keys (read off the GPU
     /// thread, which keeps adding to disk_pipelines).
     std::shared_ptr<const std::unordered_set<u64>> precompile_disk_keys;
+    /// used_pipelines as boot left it (key hash -> sessions since last used), for
+    /// FRITCHII_PREP_ORDER: the preparation takes what recent sessions drew first.
+    std::shared_ptr<const std::unordered_map<u64, u8>> precompile_used_keys;
 
     /// The pipeline cache warm-up builds go through: none by default, so the tens of thousands
     /// of warm-up programs stay in the driver's disk cache and out of vulkan_pipelines.bin (which
