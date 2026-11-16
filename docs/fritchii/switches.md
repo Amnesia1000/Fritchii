@@ -5579,6 +5579,19 @@ preemptive answer). Every 600 frames these lines:
   Costs with it on: a lock and a ring slot per write mark ("marks a frame"), a scan of up
   to 16,384 marks and a 64-byte copy per read; off: one test of a constant at each site.
 
+FRITCHII_READ_RUNS=2 (helper_cu_answer.md): all of the above, plus each write mark carries the
+runtime's stamp (CurrentTick) and one "Read writer ticks" line per read kind every 600 frames:
+the newest mark over the read's pages (the bytes its download takes) and its writer kind; where
+that write's submission was when the read asked (not submitted, submitted and not run, run, from
+BufferCacheRuntime::ReadWriterTicks: TickOf the stamp, the current tick, the refreshed known
+tick); how many submissions the read's tick is after the writer's and how many of those had not
+run; and every reader host wait (FinishReadDownloads for EXP49, WaitFenceDownload for EXP72) cut
+at the writer's tick: the reader first waits for the writer's submission alone (only if it is
+submitted; no flush is asked for), then the rest as before. Same timeline, so the wait's total is
+unchanged; "then until the download was there" is what a copy ordered right after the writer
+(async kind) or a faster landing (fence kind) could save. The EXP49 "on the host GPU" figure
+keeps both parts. One semaphore refresh more per read.
+
 The GPU-written ranges are what the cache marks: for a dispatch or draw that is the bound
 writable buffer range (cut only by the native store bound, or by EDEN_NX2_WRITTEN_SSBO_MARK_KIB,
 which must be unset for this), not only the bytes the shader stored. So "page only" is as exact

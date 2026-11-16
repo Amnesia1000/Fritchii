@@ -1578,11 +1578,22 @@ public:
     /// behind everything since (11-17 fences at the night market). No cache lock held.
     bool WaitFenceDownload(u64 sequence, std::chrono::milliseconds timeout) {
         const auto start = std::chrono::steady_clock::now();
+        // FRITCHII_READ_RUNS=2: first the writer's submission alone (counter only).
+        const u64 writer_ns =
+            fence_downloads_landed.load(std::memory_order_acquire) < sequence ? WaitReadWriter()
+                                                                               : 0;
         std::unique_lock lock{fence_landed_mutex};
         const bool done = fence_landed_cv.wait_for(lock, timeout, [&] {
             return fence_downloads_landed.load(std::memory_order_acquire) >= sequence;
         });
         lock.unlock();
+        if (ReadRunStats::t_writer_answer.cut) [[unlikely]] {
+            const u64 total = static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - start)
+                    .count());
+            ReadRunStats::t_writer_answer.rest_wait_ns = total > writer_ns ? total - writer_ns : 0;
+        }
         fence_waits.fetch_add(1, std::memory_order_relaxed);
         fence_wait_ns.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                      std::chrono::steady_clock::now() - start)
@@ -1592,6 +1603,37 @@ public:
             fence_wait_timeouts.fetch_add(1, std::memory_order_relaxed);
         }
         return done;
+    }
+
+    /// FRITCHII_READ_RUNS=2 (counter only): the stamp a write mark carries.
+    [[nodiscard]] u64 ReadWriteStamp() {
+        if constexpr (!IS_OPENGL) {
+            if (ReadRunStats::g_writer_ticks) [[unlikely]] {
+                return runtime.CurrentTick();
+            }
+        }
+        return 0;
+    }
+
+    /// FRITCHII_READ_RUNS=2 (counter only), on the reading thread before its host wait: waits for
+    /// the submission of the newest write over the read's pages (GetFlushArea found it) and
+    /// returns how long. The read's own wait follows on the same timeline, so the total is
+    /// unchanged. Only a submitted tick is waited for (no flush is asked for here); 0 = no cut.
+    u64 WaitReadWriter() {
+        if constexpr (!IS_OPENGL) {
+            ReadRunStats::WriterAnswer& a = ReadRunStats::t_writer_answer;
+            if (!ReadRunStats::g_writer_ticks || !a.area_found || a.cut) {
+                return 0;
+            }
+            const u64 start = ReadRunStats::NowNs();
+            if (!runtime.WaitTickIfSubmitted(a.write_tick)) {
+                return 0;
+            }
+            a.cut = true;
+            a.writer_wait_ns = ReadRunStats::NowNs() - start;
+            return a.writer_wait_ns;
+        }
+        return 0;
     }
 
 private:

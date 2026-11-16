@@ -679,6 +679,27 @@ void BufferCacheRuntime::WaitForHostRead(u64 stamp) {
     AsyncReadback::Add(AsyncReadback::g_counters.on_card_ns, AsyncReadback::Now() - submitted);
 }
 
+BufferCacheRuntime::ReadTicks BufferCacheRuntime::ReadWriterTicks(u64 stamp) {
+    auto& master = scheduler.GetMasterSemaphore();
+    master.Refresh();
+    return ReadTicks{
+        .write = clock.TickOf(stamp),
+        .current = master.CurrentTick(),
+        .known = master.KnownGpuTick(),
+    };
+}
+
+bool BufferCacheRuntime::WaitTickIfSubmitted(u64 tick) {
+    if (!scheduler.IsSubmitted(tick)) {
+        return false;
+    }
+    auto& master = scheduler.GetMasterSemaphore();
+    if (!master.IsFree(tick)) {
+        master.Wait(tick);
+    }
+    return true;
+}
+
 bool BufferCacheRuntime::IsFreeNow(u64 stamp) {
     if (clock.IsFree(stamp)) {
         return true;
