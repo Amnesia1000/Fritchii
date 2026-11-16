@@ -143,8 +143,9 @@ void MasterSemaphore::Wait(u64 tick) {
     Refresh();
 }
 
-void MasterSemaphore::RequireSide(u64 value, u64 after_tick) {
+void MasterSemaphore::RequireSide(u64 value, u64 after_tick, u64 submitted) {
     std::scoped_lock lock{side_mutex};
+    side_submitted = (std::max)(side_submitted, submitted);
     side_waits.push_back(SideWait{value, after_tick});
     side_pending.store(side_waits.size(), std::memory_order_release);
 }
@@ -167,8 +168,18 @@ u64 MasterSemaphore::SideWaitValue(u64 host_tick, VkSemaphore& side_handle) {
             value = (std::max)(value, wait.value);
         }
     }
+    if (value > side_submitted) [[unlikely]] {
+        // Must be 0: nothing would ever signal it.
+        side_unsubmitted.fetch_add(1, std::memory_order_relaxed);
+        LOG_ERROR(Render_Vulkan,
+                  "FRITCHII_READ_SIDE_COPY: main tick {} would wait for side value {}, newest "
+                  "submitted {}: wait dropped (must be 0)",
+                  host_tick, value, side_submitted);
+        value = side_submitted > side_reported ? side_submitted : 0;
+    }
     if (value != 0) {
         side_handle = **side;
+        side_main_waits.fetch_add(1, std::memory_order_relaxed);
     }
     return value;
 }
@@ -181,6 +192,9 @@ VkResult MasterSemaphore::SubmitQueue(vk::CommandBuffer& cmdbuf, vk::CommandBuff
                                         host_tick)
                   : SubmitQueueFence(cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore,
                                      host_tick);
+    if (result == VK_SUCCESS) {
+        queue_submitted_tick.store(host_tick, std::memory_order_release);
+    }
     if (result == VK_SUCCESS && Common::Nx2Hitch::StallOn()) [[unlikely]] {
         stall_submitted_ns.store(Common::Nx2Hitch::NowNs(), std::memory_order_relaxed);
         stall_submitted_tick.store(host_tick, std::memory_order_release);

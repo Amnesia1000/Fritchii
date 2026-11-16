@@ -745,6 +745,20 @@ bool BufferCacheRuntime::SideDone(u64 value) {
     return side_queue == nullptr || side_queue->IsDone(value);
 }
 
+BufferCacheRuntime::SideQueueStats BufferCacheRuntime::TakeSideQueueStats() {
+    SideQueueStats stats{};
+    if (side_queue != nullptr) {
+        const SideQueue::Stats side = side_queue->TakeStats();
+        stats.raised = side.raised;
+        stats.slow_waits = side.slow_waits;
+        stats.not_queued = side.not_queued;
+    }
+    const MasterSemaphore::SideStats main = scheduler.GetMasterSemaphore().TakeSideStats();
+    stats.main_waits = main.waits;
+    stats.unsubmitted = main.unsubmitted;
+    return stats;
+}
+
 void BufferCacheRuntime::WaitSide(u64 value) {
     if (side_queue != nullptr) {
         side_queue->Wait(value);

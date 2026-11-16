@@ -256,6 +256,13 @@ void BufferCache<P>::TickFrame() {
         ReadRunStats::g_frame.fetch_add(1, std::memory_order_relaxed);
         ReadRunStats::FrameTick();
         if (frame_tick % 600 == 0) {
+            if constexpr (!IS_OPENGL) {
+                if (EarlyCompute::g_side_copy.Get() >= 2) {
+                    const auto queue = runtime.TakeSideQueueStats();
+                    EarlyCompute::NoteQueueStats(queue.raised, queue.slow_waits, queue.not_queued,
+                                                 queue.main_waits, queue.unsubmitted);
+                }
+            }
             ReadRunStats::Log(VideoCore::Nx2Debug::Experiment(112));
         }
     }

@@ -221,6 +221,12 @@ struct Counts {
     u64 landed_waits{};
     u64 landed_ns{};
     u64 landed_max_ns{};
+    // The queues (BufferCache::TickFrame, from the runtime, before the line).
+    u64 queue_raised{};       ///< side waits raised to keep their main ticks in order
+    u64 queue_slow_waits{};   ///< host waits for a side value of 2 s or more
+    u64 queue_not_queued{};   ///< refused: the writer's tick not given to vkQueueSubmit yet
+    u64 queue_main_waits{};   ///< main submissions that waited for a side value
+    u64 queue_unsubmitted{};  ///< must be 0: a main wait for a side value never submitted
 };
 
 inline Counts& Get() {
@@ -324,6 +330,18 @@ inline void NoteSideLanded(u64 ns) {
     }
 }
 
+/// BufferCache::TickFrame, right before the line: the queues' counts since the last line.
+inline void NoteQueueStats(u64 raised, u64 slow_waits, u64 not_queued, u64 main_waits,
+                           u64 unsubmitted) {
+    Counts& c = Get();
+    std::scoped_lock lock{c.mutex};
+    c.queue_raised += raised;
+    c.queue_slow_waits += slow_waits;
+    c.queue_not_queued += not_queued;
+    c.queue_main_waits += main_waits;
+    c.queue_unsubmitted += unsubmitted;
+}
+
 /// ReadRunStats::Log, every 600 frames.
 inline void Log(double frames) {
     Counts& c = Get();
@@ -407,6 +425,14 @@ inline void Log(double frames) {
                      c.landed, c.landed_waits, per(c.landed_ns, c.landed_waits),
                      static_cast<double>(c.landed_max_ns) / 1e6,
                      static_cast<double>(c.landed_ns) / 1e6 / frames);
+            LOG_INFO(HW_GPU,
+                     "Read side queue (FRITCHII_READ_SIDE_COPY={}) last 600 frames: main "
+                     "submissions that waited for a side copy {}, waits for a side value never "
+                     "submitted {} (must be 0, dropped) | side copies refused, writer's tick not "
+                     "given to the queue yet {} (copied on the main queue) | side waits raised to "
+                     "keep the order {} | host waits for a side value over 2 s {} (must be 0)",
+                     g_side_copy.Get(), c.queue_main_waits, c.queue_unsubmitted,
+                     c.queue_not_queued, c.queue_raised, c.queue_slow_waits);
         }
     }
     std::fill(std::begin(c.judged), std::end(c.judged), 0);
@@ -423,6 +449,8 @@ inline void Log(double frames) {
     c.verify_downloads = c.verify_copies = c.verify_differing = c.verify_bytes = 0;
     c.verify_waits = c.verify_side_ns = c.verify_main_ns = 0;
     c.landed = c.landed_waits = c.landed_ns = c.landed_max_ns = 0;
+    c.queue_raised = c.queue_slow_waits = c.queue_not_queued = 0;
+    c.queue_main_waits = c.queue_unsubmitted = 0;
 }
 
 } // namespace VideoCommon::EarlyCompute

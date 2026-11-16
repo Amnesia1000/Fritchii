@@ -237,6 +237,16 @@ public:
     [[nodiscard]] u64 SideCopy(u64 main_tick, std::span<const SideCopyRegion> regions);
     [[nodiscard]] bool SideDone(u64 value);
     void WaitSide(u64 value);
+    /// FRITCHII_READ_SIDE_COPY: the side queue's and the main queue's counts since the last call
+    /// (raised waits, slow host waits, main submissions that waited, must-be-0 unsubmitted).
+    struct SideQueueStats {
+        u64 raised;
+        u64 slow_waits;
+        u64 not_queued;
+        u64 main_waits;
+        u64 unsubmitted;
+    };
+    [[nodiscard]] SideQueueStats TakeSideQueueStats();
 
     u64 GetDeviceLocalMemory() const;
 
