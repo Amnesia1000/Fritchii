@@ -212,6 +212,40 @@ resident. Expected: what the census reports as "all zero" (guest) and "without a
 (GPU), if the tables filled by maps that were unmapped since. Nothing to judge but the census rows
 and that nothing breaks (a wrong discard would show as garbage GPU reads or guest crashes at once).
 
+Added 2026-11-16 (helper CM, b12 Castle Town runs): with the page tables tagged (guest 22 MiB, GPU
+12), the 1 GiB rw regions are still there, so they are not page tables. Region A exists at 2 s (28
+MiB, before the Vulkan device), fills to 1021 by 12.5 s during the boot pipeline builds; B appears
+by 12.5 s and grows to ~900 while the background prebuild runs (done at ~17.8 s), then barely moves;
+a third appears at the area load (~45 s). They fill one after another like an allocator's arenas.
+Nothing in our code reserves 1 GiB, and they carry no heap segment header. New census line "owner
+hints" (any mode but 3): for the 4 biggest unnamed allocations (32 MiB or more resident) and for
+the 16-64 MiB reservations together, up to 512 resident pages are read and counted: non-zero words
+per page, words pointing into the allocation itself (allocator free lists), and words pointing into
+each loaded image (vtables and callbacks: the driver's objects point into nvoglv64.dll or
+nvgpucomp64.dll, ours into the exe), plus the first six words of the allocation. Read-only, a few
+ms per census.
+
+### FRITCHII_RAM_VK_HOST_ALLOC
+
+TEST, off by default (helper CM, 2026-11-16). Boot. The Vulkan instance and device are created
+(and destroyed) with allocation callbacks, so the driver's host allocations come from a heap of
+our own (HeapCreate, low-fragmentation) instead of the driver's own reservations. Their children
+(pipelines, descriptor pools, command pools...) are still created with null callbacks, which
+drivers serve from the parent's allocator; nothing else changes, the game sees the same. Every
+block is counted. Why: the census's two to three 1 GiB arenas (~1.75 GB resident at Castle Town)
+fill during pipeline builds, like a driver allocator that keeps what it once used. If they are
+the driver's, they move into our heap ("other heaps" in census line 1), the census names them,
+and what the driver frees goes back to the heap (and from there to Windows) instead of staying
+resident. Expected: between 0 (the driver ignores the callbacks for children, or uses all it
+holds) and several hundred MiB; FRITCHII_RAM_PREBUILT_KEEP + EXP51=2 freed only ~170 MiB for
+2,300 destroyed pipelines, which fits a driver arena that keeps freed memory. Census "more" line
+(FRITCHII_MEM_CENSUS on): "Vulkan host allocations (FRITCHII_RAM_VK_HOST_ALLOC=1, ...): L MiB
+live in N blocks (peak P), by scope command / object / cache / device / instance; the driver's own
+(notified) M MiB; F failed, X foreign frees". Object scope near 0 = the driver does not route
+pipelines through the device's callbacks (then the switch only names device memory). F and X
+must be 0. Risk: a driver bug with callbacks (rare; Mesa and NVIDIA both support them); a small
+cost per driver allocation (one heap call, as the driver's own). Logged once when on.
+
 ### FRITCHII_JIT_WARM_CORES
 
 TEST, off by default (helper BE, 2026-11-16). Boot, a core mask (hex with 0x, e.g. 0x3 = cores 0

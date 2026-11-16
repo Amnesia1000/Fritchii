@@ -308,6 +308,7 @@ struct Result {
     u32 walk_ms{};
     u32 query_ms{};
     std::string heap_text;
+    std::string hint_text; ///< Owner hints of the biggest unnamed allocations (Windows)
 };
 
 constexpr std::array<const char*, 6> BucketNames{"<64 KiB",  "64 KiB-1 MiB", "1-16 MiB",
@@ -537,6 +538,146 @@ std::string CrtHeapHistogram(HANDLE heap) {
     return text;
 }
 
+/// Owner hints: what the biggest unnamed allocations point at. Objects with a vtable or a
+/// callback hold pointers into the image whose code made them (the driver's objects into
+/// nvoglv64.dll / nvgpucomp64.dll, ours into the exe), and allocator free lists point into their
+/// own allocation. Reads up to 512 resident pages of each (ReadProcessMemory, so a page freed
+/// meanwhile fails the read instead of faulting), never a page that is not in the working set.
+std::string OwnerHints(const Result& result, const std::vector<uintptr_t>& pages) {
+    if (pages.empty()) {
+        return {};
+    }
+    struct Range {
+        uintptr_t begin;
+        uintptr_t end;
+        const std::string* name;
+    };
+    std::vector<Range> images;
+    for (const Allocation& a : result.images) {
+        images.push_back({a.base, a.base + a.span, &a.name});
+    }
+    std::sort(images.begin(), images.end(),
+              [](const Range& a, const Range& b) { return a.begin < b.begin; });
+    struct Group {
+        std::string label;
+        std::vector<std::pair<uintptr_t, uintptr_t>> ranges;
+        u64 resident{};
+    };
+    std::vector<Group> groups;
+    std::vector<const Allocation*> big;
+    Group bucket{"16-64 MiB reservations", {}, 0};
+    for (const Allocation& a : result.other) {
+        if (a.resident >= (u64{32} << 20)) {
+            big.push_back(&a);
+        } else if (BucketOf(a.span) == 3) {
+            bucket.ranges.emplace_back(a.base, a.base + a.span);
+            bucket.resident += a.resident;
+        }
+    }
+    std::sort(big.begin(), big.end(),
+              [](const Allocation* a, const Allocation* b) { return a->resident > b->resident; });
+    for (size_t i = 0; i < big.size() && i < 4; ++i) {
+        groups.push_back({fmt::format("{:x} span {}", big[i]->base, MiBOf(big[i]->span)),
+                          {{big[i]->base, big[i]->base + big[i]->span}},
+                          big[i]->resident});
+    }
+    if (bucket.resident >= (u64{32} << 20)) {
+        groups.push_back(std::move(bucket));
+    }
+    const auto image_of = [&images](u64 value) -> const std::string* {
+        auto it = std::upper_bound(images.begin(), images.end(), value,
+                                   [](u64 v, const Range& r) { return v < r.begin; });
+        if (it == images.begin()) {
+            return nullptr;
+        }
+        --it;
+        return value < it->end ? it->name : nullptr;
+    };
+    std::string text;
+    std::array<u64, 512> words{};
+    for (const Group& group : groups) {
+        std::vector<uintptr_t> sample;
+        for (const auto& [begin, end] : group.ranges) {
+            const auto low = std::lower_bound(pages.begin(), pages.end(), begin);
+            const auto high = std::lower_bound(low, pages.end(), end);
+            sample.insert(sample.end(), low, high);
+        }
+        if (sample.empty()) {
+            continue;
+        }
+        const size_t step = (std::max)(size_t{1}, sample.size() / 512);
+        std::map<const std::string*, u64> hits;
+        u64 read_pages = 0;
+        u64 zero_pages = 0;
+        u64 nonzero = 0;
+        u64 inside = 0;
+        for (size_t i = 0; i < sample.size(); i += step) {
+            SIZE_T read = 0;
+            if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(sample[i]),
+                                   words.data(), sizeof(words), &read) ||
+                read != sizeof(words)) {
+                continue;
+            }
+            ++read_pages;
+            bool any = false;
+            for (const u64 word : words) {
+                if (word == 0) {
+                    continue;
+                }
+                any = true;
+                ++nonzero;
+                bool own = false;
+                for (const auto& [begin, end] : group.ranges) {
+                    if (word >= begin && word < end) {
+                        own = true;
+                        break;
+                    }
+                }
+                if (own) {
+                    ++inside;
+                } else if (const std::string* name = image_of(word)) {
+                    ++hits[name];
+                }
+            }
+            zero_pages += any ? 0 : 1;
+        }
+        if (read_pages == 0) {
+            continue;
+        }
+        std::vector<std::pair<u64, const std::string*>> ranked;
+        for (const auto& [name, count] : hits) {
+            ranked.emplace_back(count, name);
+        }
+        std::sort(ranked.begin(), ranked.end(),
+                  [](const auto& a, const auto& b) { return a.first > b.first; });
+        std::string top;
+        for (size_t i = 0; i < ranked.size() && i < 4; ++i) {
+            top += fmt::format("{}{} {:.1f}", i == 0 ? "" : ", ", *ranked[i].second,
+                               static_cast<double>(ranked[i].first) /
+                                   static_cast<double>(read_pages));
+        }
+        std::array<u64, 6> head{};
+        SIZE_T head_read = 0;
+        std::string head_text = "unreadable";
+        if (ReadProcessMemory(GetCurrentProcess(),
+                              reinterpret_cast<const void*>(group.ranges.front().first),
+                              head.data(), sizeof(head), &head_read) &&
+            head_read == sizeof(head)) {
+            head_text = fmt::format("{:x} {:x} {:x} {:x} {:x} {:x}", head[0], head[1], head[2],
+                                    head[3], head[4], head[5]);
+        }
+        text += fmt::format(
+            "{}{} ({} resident, {} allocations): {} pages read, {} all zero; per page {:.0f} "
+            "non-zero words, {:.1f} into itself, into images {}; first words {}",
+            text.empty() ? "" : "; ", group.label, MiBOf(group.resident), group.ranges.size(),
+            read_pages, zero_pages,
+            static_cast<double>(nonzero) / static_cast<double>(read_pages),
+            static_cast<double>(inside) / static_cast<double>(read_pages),
+            top.empty() ? "none" : top, head_text);
+    }
+    return text;
+}
+
 void Walk(int mode, Result& result) {
     const auto start = std::chrono::steady_clock::now();
     std::vector<uintptr_t> pages;
@@ -740,6 +881,7 @@ void Walk(int mode, Result& result) {
     result.walk_ms = static_cast<u32>(std::chrono::duration_cast<std::chrono::milliseconds>(
                                           std::chrono::steady_clock::now() - start)
                                           .count());
+    result.hint_text = OwnerHints(result, pages);
 
     if (mode == 2) {
         // Locks each heap for its summary (EDEN_NX2_MEM_HEAPS measured ~250 ms for a 2.5 GB CRT
@@ -969,6 +1111,9 @@ void Census(int mode, const char* reason) {
              "reservation size {}; largest other: {}; largest heap big blocks: {}",
              reason, Top(result.exec, 10, true), buckets, Top(result.other, 10, true),
              Top(result.big_blocks, 8, true));
+    if (!result.hint_text.empty()) {
+        LOG_INFO(HW_Memory, "Memory census ({}) owner hints: {}", reason, result.hint_text);
+    }
     std::string extra = Nx2Hitch::JitCompileCensus();
     std::function<std::string()> sampler;
     {
