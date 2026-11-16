@@ -31,6 +31,8 @@ add_library(
     bit_field.h
     bit_util.h
     bounded_threadsafe_queue.h
+    build_stamp.cpp
+    build_stamp.h
     cityhash.cpp
     cityhash.h
     common_funcs.h

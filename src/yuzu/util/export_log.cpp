@@ -37,6 +37,7 @@
 #include "common/logging.h"
 #include "common/memory_detect.h"
 #include "common/scm_rev.h"
+#include "common/build_stamp.h"
 #include "common/settings.h"
 #include "qt_common/config/uisettings.h"
 #include "qt_common/qt_common.h"
@@ -184,6 +185,9 @@ QString SystemSummary(const std::vector<VkDeviceInfo::Record>& vk_device_records
                                               .arg(QString::fromUtf8(Common::g_build_fullname),
                                                    QString::fromUtf8(Common::g_build_date),
                                                    QString::fromUtf8(Common::g_compiler_id)));
+    if (const auto stamp = Common::BuildStamp(); !stamp.empty()) {
+        text += Line(QStringLiteral("Build hash"), QString::fromStdString(stamp));
+    }
     text += Line(QStringLiteral("Tuned settings revision"),
                  QStringLiteral("%1 (applied: %2)")
                      .arg(Settings::Frizti::Revision)

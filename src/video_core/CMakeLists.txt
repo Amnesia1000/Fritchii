@@ -394,6 +394,8 @@ add_library(video_core STATIC
     texture_cache/samples_helper.h
     texture_cache/texture_cache.cpp
     texture_cache/texture_cache.h
+    test_watermark.cpp
+    test_watermark.h
     texture_cache/texture_cache_base.h
     texture_cache/types.h
     texture_cache/util.cpp
