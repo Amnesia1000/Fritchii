@@ -27,6 +27,18 @@ std::optional<AxxEmitX64::DoNotFastmemMarker> AxxEmitX64::ShouldFastmem(AxxEmitC
     if (do_not_fastmem.count(marker) > 0) {
         return std::nullopt;
     }
+    // Fritchii (FRITCHII_JIT_SHARED_FASTMEM_MARKS): an access that faulted on another core.
+    if (shared_fastmem_marks) {
+        bool marked = false;
+        {
+            std::shared_lock lock{shared_fastmem_marks->mutex};
+            marked = shared_fastmem_marks->marks.count(marker) > 0;
+        }
+        if (marked) {
+            NoteSharedFastmemMarkUsed(*shared_fastmem_marks, unsigned(conf.processor_id));
+            return std::nullopt;
+        }
+    }
     return marker;
 }
 
@@ -73,6 +85,15 @@ FakeCall AxxEmitX64::FastmemCallback(u64 rip_) {
         if (iter->recompile) {
             const DoNotFastmemMarker marker{iter->location, static_cast<unsigned>(iter->inst_name)};
             do_not_fastmem.insert(marker);
+            if (shared_fastmem_marks) {
+                // Fritchii (FRITCHII_JIT_SHARED_FASTMEM_MARKS): the other cores compile this
+                // access without fastmem from now on (their blocks already compiled still fault
+                // once each, as before).
+                std::unique_lock lock{shared_fastmem_marks->mutex};
+                if (shared_fastmem_marks->marks.insert(marker).second) {
+                    shared_fastmem_marks->faults.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
             InvalidateBasicBlocks({std::get<0>(marker)});
             if (::Common::Nx2Hitch::SplitEnabled()) {
                 // Fritchii (FRITCHII_HITCH_SPLIT): a block dropped to be compiled again without
