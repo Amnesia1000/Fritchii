@@ -187,9 +187,11 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         // the next image (zortos #1306, RX 9070 XT). So one more delete per 2 MiB over the
         // critical memory (up to 1,024 more), and from 1 GiB over, images unused for 3 frames go
         // too instead of 10.
+        // FRITCHII_VRAM_BUDGET_MODE: also while the budget is short (budget_pressure).
         if (aggressive_mode && total_used_memory > critical_memory &&
-            VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_tc_collect_over,
-                                             "FRITCHII_TC_COLLECT_OVER") != 0) {
+            (budget_pressure ||
+             VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_tc_collect_over,
+                                              "FRITCHII_TC_COLLECT_OVER") != 0)) {
             const u64 over = total_used_memory - critical_memory;
             const size_t extra = static_cast<size_t>((std::min)(over / 2_MiB, u64{1024}));
             num_iterations += extra;
@@ -1093,9 +1095,309 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
             *target = std::strtoull(value, nullptr, 10) << 20;
         }
     }
+    // FRITCHII_VRAM_BUDGET_MODE: these are the base thresholds; the live budget cap only ever
+    // lowers them, and goes when the room under the budget is back.
+    base_expected_memory = expected_memory;
+    base_critical_memory = critical_memory;
+    base_minimum_memory = minimum_memory;
+    ApplyBudgetCap();
     if (log) {
         LOG_INFO(HW_GPU, "Texture cache thresholds: expected {} MiB, critical {} MiB, minimum {} MiB",
                  expected_memory >> 20, critical_memory >> 20, minimum_memory >> 20);
+    }
+}
+
+template <class P>
+void TextureCache<P>::ApplyBudgetCap() {
+    if (base_critical_memory == 0) {
+        return;
+    }
+    critical_memory = base_critical_memory;
+    expected_memory = base_expected_memory;
+    minimum_memory = base_minimum_memory;
+    if (budget_cap >= critical_memory) {
+        return;
+    }
+    // The cap keeps the base thresholds' distance (1.5 GiB with Fritchii's ceiling) between
+    // expected and critical, at least 256 MiB and at most half the cap.
+    const u64 gap = base_critical_memory - (std::min)(base_critical_memory, base_expected_memory);
+    critical_memory = budget_cap;
+    expected_memory = (std::min)(
+        expected_memory,
+        critical_memory - (std::min)(critical_memory / 2, (std::max)(gap, u64{256_MiB})));
+    minimum_memory =
+        (std::min)(minimum_memory, expected_memory - (std::min)(expected_memory, u64{1_GiB}));
+}
+
+template <class P>
+void TextureCache<P>::BudgetControl() {
+    // FRITCHII_VRAM_BUDGET_MODE (live; 0 fixed, 1 vk = default, 2 os). The thresholds above follow
+    // the budget only as far as Fritchii's ceiling (EDEN_NX2_TC_CEILING_MIB, 7680) and the 5/8 cap
+    // allow, and they count the cache's view of the usage: the image pool, deleted images still in
+    // flight, the unused space in the allocators' blocks and whatever the driver holds outside
+    // them are left out. A 16 GB RX 9070 XT at 4K (zortos tester, 2026-11-16) kept the cache's
+    // critical at 7,680 MiB while the driver's count for the process reached the budget, the
+    // driver lowered the budget to it and moved ~10 GB to system RAM (freezes of 15-16 s; a 1365^2
+    // image create took 11.9 s). With a 5-7 GiB hog on the card the budget fell to ~11.6 GB and
+    // nothing followed it.
+    //
+    // Here the driver's own count of the main heap (all of this process's memory in it) is held
+    // under the budget less a headroom: once a second, past it the cache's critical memory comes
+    // down by the excess (at most 1 GiB a second, never under half the budget), with room again it
+    // goes back up (256 MiB a second) until the base thresholds rule again. While the cap binds
+    // (budget_pressure) the collector deletes past critical as with FRITCHII_TC_COLLECT_OVER, the
+    // image pool fits the room (FRITCHII_VRAM_POOL_FIT), kept blocks go back, and images made past
+    // critical first delete clean idle ones (FRITCHII_TC_CRITICAL_ENFORCE). Nothing changes while
+    // the usage stays under the budget less the headroom: an RTX 4080 at 1080p sits ~7 GB under it.
+    // os also counts what other processes hold on the adapter (PDH, sampled on a thread of its
+    // own): Windows' budget for the process in front assumes it can push the others out, which a
+    // program that keeps using its memory defeats (the tester's VRAM hog).
+    if constexpr (requires(u64 value) { runtime.MainHeapNumbers(value, value, value); }) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - budget_control_time < std::chrono::seconds{1}) {
+            return;
+        }
+        budget_control_time = now;
+        const int mode = VideoCore::Nx2Debug::VramBudgetMode();
+        u64 size{};
+        u64 usage{};
+        u64 vk_budget{};
+        if (!runtime.MainHeapNumbers(size, usage, vk_budget) || vk_budget == 0) {
+            return;
+        }
+        BudgetSeen& seen = budget_seen;
+        seen.heap_size = size;
+        seen.usage = usage;
+        seen.vk_budget = vk_budget;
+        seen.os_budget = 0;
+        seen.others = 0;
+        u64 budget = vk_budget;
+        if (mode == 2) {
+            if (const std::optional<u64> others = runtime.OtherProcessesVideoMemory()) {
+                seen.others = *others;
+                seen.os_budget = size - (std::min)(size, *others);
+                budget = (std::min)(budget, seen.os_budget);
+            }
+        }
+        const int headroom_mib = VideoCore::Nx2Debug::SwitchValue(
+            VideoCore::Nx2Debug::g_vram_headroom_mib, "FRITCHII_VRAM_HEADROOM_MIB", 0);
+        // Auto: 1/16 of the budget, 256 MiB to 1 GiB (~950 MiB on a 16 GB card, ~450 on 8 GB).
+        const u64 headroom = headroom_mib > 0
+                                 ? u64{static_cast<u32>(headroom_mib)} << 20
+                                 : std::clamp(budget / 16, u64{256_MiB}, u64{1_GiB});
+        const u64 target = budget - (std::min)(budget, headroom);
+        seen.budget = budget;
+        seen.headroom = headroom;
+        seen.peak_usage = (std::max)(seen.peak_usage, usage);
+        seen.lowest_budget = (std::min)(seen.lowest_budget, budget);
+        seen.over_seconds += usage > target ? 1 : 0;
+        seen.spill_seconds += usage > budget ? 1 : 0;
+        if (mode != seen.mode) {
+            LOG_INFO(HW_GPU,
+                     "VRAM budget control: FRITCHII_VRAM_BUDGET_MODE={} (0 fixed, 1 vk, 2 os), "
+                     "headroom {} MiB; main heap {} MiB, driver budget {} MiB, usage {} MiB",
+                     mode, headroom >> 20, size >> 20, vk_budget >> 20, usage >> 20);
+            seen.mode = mode;
+        }
+        const bool was_pressure = budget_pressure;
+        const u64 old_cap = budget_cap;
+        if (mode == 0) {
+            budget_cap = ~0ULL;
+        } else if (usage > target) {
+            const u64 over = usage - target;
+            const u64 from = (std::min)(budget_cap, total_used_memory);
+            budget_cap = (std::max)(from - (std::min)(from, (std::min)(over, u64{1_GiB})),
+                                    budget / 2);
+        } else if (budget_cap != ~0ULL) {
+            // A dead band of half the headroom, so the cap does not chase the usage up and down.
+            const u64 room = target - usage;
+            if (room > headroom / 2) {
+                budget_cap += (std::min)(room - headroom / 2, u64{256_MiB});
+            }
+        }
+        if (budget_cap >= base_critical_memory) {
+            budget_cap = ~0ULL;
+        }
+        // The pressure also holds while the usage is past the target with the cap at its floor
+        // or above the base (a 16 GB card: half the budget is over Fritchii's 7,680 MiB ceiling,
+        // so the 4K session's spill came with the cache already past a critical it could not
+        // hold): the collector's extra deletes, the fitted pool and the evictions before creates
+        // then act on the base thresholds. It ends half a headroom under the target.
+        const bool over_target = mode != 0 && usage > target;
+        const bool well_under = usage + headroom / 2 <= target;
+        budget_pressure =
+            budget_cap != ~0ULL || over_target || (budget_pressure && mode != 0 && !well_under);
+        if constexpr (requires { runtime.SetBudgetPressure(true); }) {
+            runtime.SetBudgetPressure(budget_pressure);
+        }
+        ApplyBudgetCap();
+        const u64 change = budget_cap > old_cap ? budget_cap - old_cap : old_cap - budget_cap;
+        if (budget_pressure != was_pressure ||
+            (budget_cap != ~0ULL && old_cap != ~0ULL && change >= 256_MiB) ||
+            ((budget_cap == ~0ULL) != (old_cap == ~0ULL))) {
+            LOG_INFO(HW_GPU,
+                     "VRAM budget control ({}): driver usage {} MiB of budget {} MiB (vk {} MiB, "
+                     "os {} MiB, other processes {} MiB), headroom {} MiB: {}; texture cache "
+                     "{} MiB, expected {} MiB, critical {} MiB (base {} MiB)",
+                     mode == 2 ? "os" : (mode == 1 ? "vk" : "fixed"), usage >> 20, budget >> 20,
+                     vk_budget >> 20, seen.os_budget >> 20, seen.others >> 20, headroom >> 20,
+                     !budget_pressure ? "pressure off, cap off"
+                     : budget_cap == ~0ULL
+                         ? "pressure on, no cap under the base thresholds"
+                         : (old_cap == ~0ULL ? "pressure on, cap on" : "pressure on, cap moved"),
+                     total_used_memory >> 20, expected_memory >> 20, critical_memory >> 20,
+                     base_critical_memory >> 20);
+        }
+    }
+}
+
+template <class P>
+void TextureCache<P>::EnforceCriticalAtCreate(u64 incoming) {
+    // FRITCHII_TC_CRITICAL_ENFORCE (live; 0 off, 1 = default: while the budget cap binds, 2: past
+    // critical at any time). The collector runs once a frame and deletes a bounded number of
+    // images; an area load makes dozens in one frame, each on top of a card already at its budget
+    // (the 11.9 s image create above was the driver making room). Before such an image is made,
+    // clean images (no GPU writes, so no download and no wait) idle for 10+ frames are deleted
+    // until the cache is back under critical with room for it: at most 32 a pass and 256 a frame,
+    // looking at most 512 of the oldest. Images used in the last 10 frames are never taken (what
+    // the draw being set up prepared was touched in this frame), nor bound render targets.
+    // Deleting here is what a join does in the middle of a lookup already (has_deleted_images:
+    // every caller of InsertImage looks up again or gives up the operation).
+    const int enforce = VideoCore::Nx2Debug::SwitchValue(
+        VideoCore::Nx2Debug::g_tc_critical_enforce, "FRITCHII_TC_CRITICAL_ENFORCE", 1);
+    if (enforce <= 0 || (enforce == 1 && !budget_pressure) ||
+        total_used_memory + incoming <= critical_memory) [[likely]] {
+        return;
+    }
+    static const u64 min_age = [] {
+        const char* value = std::getenv("EDEN_NX2_TC_MIN_AGE");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
+    }();
+    const u64 idle_frames = (std::max)(u64{10}, min_age);
+    constexpr u32 MaxPerFrame = 256;
+    constexpr size_t MaxPerPass = 32;
+    constexpr size_t MaxLooked = 512;
+    if (create_enforce_frame != frame_tick) {
+        create_enforce_frame = frame_tick;
+        create_enforce_frame_deletes = 0;
+    }
+    auto& stats = create_enforce_stats;
+    if (create_enforce_frame_deletes >= MaxPerFrame) {
+        ++stats.capped;
+        return;
+    }
+    if (frame_tick <= idle_frames) {
+        return;
+    }
+    ++stats.passes;
+    // Render targets bound now are kept whatever their age: RescaleRenderTargets binds a target it
+    // found and keeps its id while it looks up the next one (which may get here), and touches
+    // them only after.
+    std::array<ImageId, NUM_RT + 1> bound{};
+    const auto bound_image = [this](ImageViewId view_id) {
+        return view_id != NULL_IMAGE_VIEW_ID && view_id != ImageViewId{}
+                   ? slot_image_views[view_id].image_id
+                   : ImageId{};
+    };
+    for (size_t index = 0; index < NUM_RT; ++index) {
+        bound[index] = bound_image(render_targets.color_buffer_ids[index]);
+    }
+    bound[NUM_RT] = bound_image(render_targets.depth_buffer_id);
+    auto& candidates = create_enforce_candidates;
+    candidates.clear();
+    size_t looked = 0;
+    lru_cache.ForEachItemBelow(frame_tick - idle_frames, [&](ImageId image_id) {
+        const Image& image = slot_images[image_id];
+        if (False(image.flags & (ImageFlagBits::IsDecoding | ImageFlagBits::CollectPending |
+                                 ImageFlagBits::GpuModified | ImageFlagBits::BadOverlap)) &&
+            std::ranges::find(bound, image_id) == bound.end()) {
+            candidates.push_back(image_id);
+        }
+        return candidates.size() >= MaxPerPass || ++looked >= MaxLooked;
+    });
+    const DeleteReasonScope delete_reason_scope{*this, DeleteReason::GarbageCollect};
+    for (const ImageId image_id : candidates) {
+        if (total_used_memory + incoming <= critical_memory ||
+            create_enforce_frame_deletes >= MaxPerFrame) {
+            break;
+        }
+        auto& image = slot_images[image_id];
+        const u64 before = total_used_memory;
+        MarkStale(image); // before UntrackImage (see MarkStale)
+        if (True(image.flags & ImageFlagBits::Tracked)) {
+            UntrackImage(image, image_id);
+        }
+        ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
+        UnregisterImage(image_id);
+        DeleteImage(image_id, image.scale_tick > frame_tick + 5);
+        ++stats.deleted;
+        ++create_enforce_frame_deletes;
+        stats.freed += before - (std::min)(before, total_used_memory);
+    }
+    if (total_used_memory + incoming > critical_memory) {
+        ++stats.short_of;
+    }
+}
+
+template <class P>
+void TextureCache<P>::LogVramOwners() {
+    // FRITCHII_VRAM_OWNERS (live, seconds between lines, default 10, 0 = off): who holds device
+    // memory, next to the budget. A walk of the live images (a few thousand) every 10 s.
+    if constexpr (requires { runtime.VramOwnersText(u64{}, u64{}); }) {
+        const int seconds = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_vram_owners,
+                                                             "FRITCHII_VRAM_OWNERS", 10);
+        if (seconds <= 0) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (vram_owners_time == std::chrono::steady_clock::time_point{}) {
+            vram_owners_time = now;
+            return;
+        }
+        if (now - vram_owners_time < std::chrono::seconds{seconds}) {
+            return;
+        }
+        vram_owners_time = now;
+        u64 image_bytes{};
+        u64 gpu_written_bytes{};
+        size_t images{};
+        size_t unbacked{};
+        for (const auto [image_id, image] : slot_images) {
+            ++images;
+            if (True(image->flags & ImageFlagBits::Unbacked)) {
+                ++unbacked;
+                continue;
+            }
+            const u64 bytes = ImageMemoryBytes(*image);
+            image_bytes += bytes;
+            if (True(image->flags & ImageFlagBits::GpuModified)) {
+                gpu_written_bytes += bytes;
+            }
+        }
+        const u64 deleted = std::accumulate(sentenced_image_bytes.begin(),
+                                            sentenced_image_bytes.end(), gpu_sentenced_bytes);
+        BudgetSeen& seen = budget_seen;
+        auto& enforce = create_enforce_stats;
+        LOG_INFO(HW_GPU,
+                 "VRAM owners: {}; texture cache {} images ({} MiB GPU-written, {} unbacked), "
+                 "its view {} MiB, expected {} MiB, critical {} MiB (base {} MiB{}); budget mode {} "
+                 "(0 fixed, 1 vk, 2 os), budget {} MiB (vk {} MiB, os {} MiB, other processes {} "
+                 "MiB), headroom {} MiB, last {} s: peak usage {} MiB, lowest budget {} MiB, {} s "
+                 "over budget less headroom, {} s over the budget; evictions before creates {} "
+                 "passes, {} images, {} MiB, {} short, {} at the frame cap",
+                 runtime.VramOwnersText(image_bytes, deleted), images, gpu_written_bytes >> 20,
+                 unbacked, total_used_memory >> 20, expected_memory >> 20, critical_memory >> 20,
+                 base_critical_memory >> 20, budget_pressure ? ", budget cap on" : "",
+                 seen.mode, seen.budget >> 20, seen.vk_budget >> 20, seen.os_budget >> 20,
+                 seen.others >> 20, seen.headroom >> 20, seconds, seen.peak_usage >> 20,
+                 seen.lowest_budget == ~0ULL ? 0 : seen.lowest_budget >> 20, seen.over_seconds,
+                 seen.spill_seconds, enforce.passes, enforce.deleted, enforce.freed >> 20,
+                 enforce.short_of, enforce.capped);
+        seen.peak_usage = 0;
+        seen.lowest_budget = ~0ULL;
+        seen.over_seconds = 0;
+        seen.spill_seconds = 0;
+        enforce = {};
     }
 }
 
@@ -1324,6 +1626,10 @@ void TextureCache<P>::TickFrame() {
             total_used_memory -= (std::min)(total_used_memory, runtime.PooledImageBytes());
         }
     }
+    // FRITCHII_VRAM_BUDGET_MODE / FRITCHII_VRAM_OWNERS: once a second / every 10 s, with the
+    // usage just read (the collector below already sees a moved cap).
+    BudgetControl();
+    LogVramOwners();
     // EDEN_NX2_MEM_TRACE=1 (ported): every 2 s, what the cache holds next to
     // what the process and the driver report (memory climbs).
     static const bool mem_trace = std::getenv("EDEN_NX2_MEM_TRACE") != nullptr;
@@ -5522,7 +5828,11 @@ std::optional<DAddr> TextureCache<P>::ImageCpuAddress(GPUVAddr gpu_addr, size_t 
 template <class P>
 ImageId TextureCache<P>::InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
                                      RelaxedOptions options) {
-    std::optional<DAddr> cpu_addr = ImageCpuAddress(gpu_addr, CalculateGuestSizeInBytes(info));
+    // FRITCHII_TC_CRITICAL_ENFORCE: room first when the cache is past critical and the budget is
+    // short (the guest size stands in for the host image's).
+    const auto guest_size = CalculateGuestSizeInBytes(info);
+    EnforceCriticalAtCreate(guest_size);
+    std::optional<DAddr> cpu_addr = ImageCpuAddress(gpu_addr, guest_size);
     if (!cpu_addr) {
         const DAddr fake_addr = ~(1ULL << 40ULL) + virtual_invalid_space;
         virtual_invalid_space += Common::AlignUp(CalculateGuestSizeInBytes(info), 32);

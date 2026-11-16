@@ -768,6 +768,60 @@ download / device, stream MiB; memory pressure events, failed images". Over the 
 real card starts moving memory to system RAM: on an 8 GB card that is the fps cliff. One driver
 memory query per 30 frames.
 
+### FRITCHII_VRAM_BUDGET_MODE
+
+On by default as vk (helper CX, 2026-11-16; zortos tester report test 4, VRAM). Live: where the
+texture cache's live budget cap comes from. fixed (0) = today's thresholds only; vk (1, default) =
+the driver's budget for the process (VK_EXT_memory_budget); os (2) = the same, but at most the main
+heap less what the other processes hold on the adapter (PDH's GPU Adapter Memory less GPU Process
+Memory, sampled once a second on a low priority thread of its own, started on first use). The
+environment takes the name or the number, the debug server's `switch` the number. Once a second the
+driver's count of the main heap for the whole process (pool, frees in flight, block slack and the
+driver's own memory included) is held under the budget less FRITCHII_VRAM_HEADROOM_MIB: past it the
+cache's critical memory comes down by the excess (at most 1 GiB a second, never under half the
+budget; expected keeps its distance), with room again it goes back up 256 MiB a second (dead band
+half the headroom) until the base thresholds rule again. While the usage is past the target or the
+cap binds ("pressure"): the collector deletes past critical as with FRITCHII_TC_COLLECT_OVER, the
+image pool fits the room as with FRITCHII_VRAM_POOL_FIT, kept blocks go back, and
+FRITCHII_TC_CRITICAL_ENFORCE=1 acts. Why: the thresholds followed the budget only below Fritchii's
+7,680 MiB ceiling and in the cache's view of the usage; a 16 GB RX 9070 XT at 4K reached the budget
+with the cache at 7-10 GB, the driver lowered the budget and moved ~10 GB to system RAM (two 15-16 s
+freezes); a 5-7 GiB VRAM hog dropped the budget to ~11.6 GB and nothing followed. Costs nothing
+while the usage stays under the target (RTX 4080 at 1080p: ~7 GB under it). Log: "VRAM budget
+control (vk|os): driver usage U MiB of budget B MiB (vk, os, other processes), headroom H MiB:
+pressure on|off, cap on|moved|off; texture cache T MiB, expected, critical (base)". Under
+EDEN_NX2_VRAM_LIMIT_MIB + FRITCHII_VRAM_SIM_OTHERS use vk: os would count the other programs twice.
+
+### FRITCHII_VRAM_HEADROOM_MIB
+
+Default 0 = auto (helper CX, 2026-11-16). Live: the margin under the budget where
+FRITCHII_VRAM_BUDGET_MODE starts shrinking the caches. Auto: 1/16 of the budget, 256 MiB to 1 GiB
+(~950 MiB on a 16 GB card, ~450 MiB on an 8 GB one).
+
+### FRITCHII_TC_CRITICAL_ENFORCE
+
+Default 1 (helper CX, 2026-11-16). Live: before an image is made with the texture cache past its
+critical memory, clean images (no GPU writes: no download, no wait) idle for 10+ frames and not
+bound as render targets are deleted until the cache is back under critical with room for the new
+one (at most 32 a pass, 256 a frame, the 512 oldest looked at). 0 = off; 1 = only while
+FRITCHII_VRAM_BUDGET_MODE reports pressure; 2 = whenever past critical. Why: the collector runs once
+a frame with a bounded number of deletes; an area load makes dozens of images in one frame on a card
+already at its budget (a 1365^2 image create took 11.9 s while the driver made room). Counted in the
+FRITCHII_VRAM_OWNERS line: "evictions before creates P passes, N images, M MiB, S short, C at the
+frame cap".
+
+### FRITCHII_VRAM_OWNERS
+
+On by default every 10 s (helper CX, 2026-11-16). Live: seconds between lines, 0 = off. One line
+with who holds device memory next to the budget: "VRAM owners: main heap U of B MiB budget (S MiB
+heap): texture cache images, deleted images still allocated, image pool, frees in flight, buffers
+and the rest (buffer allocator), unused space in allocator blocks, kept blocks, outside the
+allocators (the driver's: pipelines, descriptors, swapchain, its own); staging pool (any heap);
+texture cache N images (GPU-written, unbacked), its view, expected, critical (base, budget cap on);
+budget mode, budget (vk, os, other processes), headroom, last 10 s: peak usage, lowest budget,
+seconds over budget less headroom, seconds over the budget; evictions before creates". Costs a walk
+of the live images every 10 s.
+
 ### FRITCHII_VRAM_SIM_OTHERS
 
 TEST, off by default (helper BF, 2026-11-16; boot, with EDEN_NX2_VRAM_LIMIT_MIB). 1 = the simulated

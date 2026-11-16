@@ -5,6 +5,8 @@
 #include <windows.h>
 #include <sysinfoapi.h>
 #include <psapi.h>
+#include <pdh.h>
+#include <pdhmsg.h>
 // clang-format on
 #else
 #include <sys/mman.h>
@@ -21,6 +23,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <condition_variable>
@@ -222,6 +225,146 @@ std::optional<u64> GetSystemCommitRoom() {
     }
 #endif
     return std::nullopt;
+}
+
+#ifdef _WIN32
+namespace {
+/// FRITCHII_VRAM_BUDGET_MODE=os: the last sample of the OS's dedicated video memory counters.
+struct AdapterVideoMemorySample {
+    std::atomic<u64> adapter{};
+    std::atomic<u64> process{};
+    std::atomic<s64> time_ms{}; ///< steady clock ms of the last good sample, 0 before it
+};
+AdapterVideoMemorySample g_adapter_video_memory;
+
+s64 SteadyMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+std::string LowerAscii(const wchar_t* text) {
+    std::string out;
+    for (; text != nullptr && *text != L'\0'; ++text) {
+        const wchar_t c = *text;
+        out.push_back(c < 128 ? static_cast<char>(c >= L'A' && c <= L'Z' ? c - L'A' + L'a' : c)
+                              : '?');
+    }
+    return out;
+}
+
+/// Sums a wildcard counter's instances whose names contain `luid` (and start with `prefix`).
+std::optional<u64> SumInstances(PDH_HCOUNTER counter, const std::string& luid,
+                                const std::string& prefix, std::vector<u8>& scratch) {
+    DWORD bytes = 0;
+    DWORD count = 0;
+    PDH_STATUS status =
+        PdhGetFormattedCounterArrayW(counter, PDH_FMT_LARGE, &bytes, &count, nullptr);
+    if (status != static_cast<PDH_STATUS>(PDH_MORE_DATA) || bytes == 0) {
+        return std::nullopt;
+    }
+    scratch.resize(bytes);
+    auto* const items = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_W*>(scratch.data());
+    status = PdhGetFormattedCounterArrayW(counter, PDH_FMT_LARGE, &bytes, &count, items);
+    if (status != ERROR_SUCCESS) {
+        return std::nullopt;
+    }
+    u64 sum = 0;
+    bool found = false;
+    for (DWORD i = 0; i < count; ++i) {
+        const std::string name = LowerAscii(items[i].szName);
+        if (name.find(luid) == std::string::npos ||
+            (!prefix.empty() && name.rfind(prefix, 0) != 0)) {
+            continue;
+        }
+        if (items[i].FmtValue.CStatus == PDH_CSTATUS_VALID_DATA ||
+            items[i].FmtValue.CStatus == PDH_CSTATUS_NEW_DATA) {
+            sum += static_cast<u64>((std::max)(items[i].FmtValue.largeValue, LONGLONG{0}));
+            found = true;
+        }
+    }
+    return found ? std::optional<u64>{sum} : std::nullopt;
+}
+
+void AdapterVideoMemoryLoop(u32 luid_low, s32 luid_high) {
+    Common::SetCurrentThreadName("Fritchii:VramOS");
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+    PDH_HQUERY query{};
+    if (PdhOpenQueryW(nullptr, 0, &query) != ERROR_SUCCESS) {
+        LOG_WARNING(Common_Memory, "FRITCHII_VRAM_BUDGET_MODE=os: no PDH query; vk budget only");
+        return;
+    }
+    PDH_HCOUNTER adapter_counter{};
+    PDH_HCOUNTER process_counter{};
+    const bool have_adapter =
+        PdhAddEnglishCounterW(query, L"\\GPU Adapter Memory(*)\\Dedicated Usage", 0,
+                              &adapter_counter) == ERROR_SUCCESS;
+    const bool have_process =
+        PdhAddEnglishCounterW(query, L"\\GPU Process Memory(*)\\Dedicated Usage", 0,
+                              &process_counter) == ERROR_SUCCESS;
+    if (!have_adapter || !have_process) {
+        LOG_WARNING(Common_Memory,
+                    "FRITCHII_VRAM_BUDGET_MODE=os: the GPU memory counters are missing "
+                    "(adapter {}, process {}); vk budget only",
+                    have_adapter, have_process);
+        PdhCloseQuery(query);
+        return;
+    }
+    // Instance names: "luid_0x00000000_0x0000D1E3_phys_0" and "pid_1234_luid_..._phys_0".
+    const std::string luid =
+        fmt::format("luid_0x{:08x}_0x{:08x}", static_cast<u32>(luid_high), luid_low);
+    const std::string pid = fmt::format("pid_{}_", GetCurrentProcessId());
+    std::vector<u8> scratch;
+    bool logged = false;
+    u32 misses = 0;
+    for (;;) {
+        if (PdhCollectQueryData(query) == ERROR_SUCCESS) {
+            const auto adapter = SumInstances(adapter_counter, luid, {}, scratch);
+            const auto process = SumInstances(process_counter, luid, pid, scratch);
+            if (adapter && process) {
+                g_adapter_video_memory.adapter.store(*adapter, std::memory_order_relaxed);
+                g_adapter_video_memory.process.store(*process, std::memory_order_relaxed);
+                g_adapter_video_memory.time_ms.store(SteadyMs(), std::memory_order_release);
+                if (!logged) {
+                    logged = true;
+                    LOG_INFO(Common_Memory,
+                             "FRITCHII_VRAM_BUDGET_MODE=os: adapter {} dedicated use {} MiB (all "
+                             "processes), this process {} MiB",
+                             luid, *adapter >> 20, *process >> 20);
+                }
+            } else if (++misses == 5 && !logged) {
+                LOG_WARNING(Common_Memory,
+                            "FRITCHII_VRAM_BUDGET_MODE=os: no counter instance for {} (adapter "
+                            "{}, process {}); vk budget only",
+                            luid, adapter.has_value(), process.has_value());
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::seconds{1});
+    }
+}
+} // Anonymous namespace
+#endif
+
+std::optional<AdapterVideoMemory> GetAdapterVideoMemory(u32 luid_low, s32 luid_high) {
+#ifdef _WIN32
+    static std::once_flag started;
+    std::call_once(started, [luid_low, luid_high] {
+        // Detached: it only sleeps and reads counters, and lives as long as the process.
+        std::thread(AdapterVideoMemoryLoop, luid_low, luid_high).detach();
+    });
+    const s64 time = g_adapter_video_memory.time_ms.load(std::memory_order_acquire);
+    if (time == 0 || SteadyMs() - time > 5000) {
+        return std::nullopt;
+    }
+    return AdapterVideoMemory{
+        .adapter_dedicated = g_adapter_video_memory.adapter.load(std::memory_order_relaxed),
+        .process_dedicated = g_adapter_video_memory.process.load(std::memory_order_relaxed),
+    };
+#else
+    static_cast<void>(luid_low);
+    static_cast<void>(luid_high);
+    return std::nullopt;
+#endif
 }
 
 void* AllocateZeroPages(u64 bytes) {
