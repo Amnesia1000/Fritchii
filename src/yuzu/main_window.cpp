@@ -149,6 +149,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "common/scm_rev.h"
 #include "common/scope_exit.h"
 #include "common/string_util.h"
+#include "common/thread.h"
 
 #ifdef ARCHITECTURE_x86_64
 #include "common/cpu_features.h"
@@ -2464,6 +2465,7 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     }
 #ifdef _WIN32
     LOG_INFO(Frontend, "Power: {}", WindowsPowerText());
+    Common::LogCpuPlacement();
 #endif
     const auto gpu_vendor = QtCommon::system->GPU().Renderer().GetDeviceVendor();
     UpdateWindowTitle(title_name, title_version, gpu_vendor);

@@ -194,4 +194,9 @@ void HardwareWaitWhileEqual(const std::atomic<u64>& word, u64 seen, u32 cycles);
 /// TSC cycles one PAUSE takes on this CPU (measured once; 1 where there is no TSC).
 [[nodiscard]] u32 PauseCycles();
 
+/// Windows: one "CPU placement:" line with the CPU's performance, efficiency and low-power
+/// efficiency logical processors (by efficiency class and last-level cache) and what the hybrid
+/// placement does with them. Logging only; nothing elsewhere.
+void LogCpuPlacement();
+
 } // namespace Common

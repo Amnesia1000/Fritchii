@@ -1205,6 +1205,85 @@ void HardwareWaitWhileEqual(const std::atomic<u64>& word, u64 seen, u32 cycles) 
 #endif
 }
 
+void LogCpuPlacement() {
+#ifdef _WIN32
+    using PFN_GetSystemCpuSetInformation = BOOL(WINAPI*)(PSYSTEM_CPU_SET_INFORMATION, ULONG,
+                                                         PULONG, HANDLE, ULONG);
+    const auto get = reinterpret_cast<PFN_GetSystemCpuSetInformation>(reinterpret_cast<void*>(
+        GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetSystemCpuSetInformation")));
+    ULONG length = 0;
+    if (get == nullptr) {
+        LOG_INFO(Common, "CPU placement: no CPU set information on this Windows");
+        return;
+    }
+    get(nullptr, 0, &length, GetCurrentProcess(), 0);
+    std::vector<u8> buffer(length);
+    if (length == 0 || !get(reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buffer.data()), length,
+                            &length, GetCurrentProcess(), 0)) {
+        LOG_INFO(Common, "CPU placement: no CPU set information on this Windows");
+        return;
+    }
+    struct Set {
+        u8 efficiency_class;
+        u32 cache; ///< (group << 8) | last-level cache index
+    };
+    std::vector<Set> sets;
+    u8 best = 0;
+    for (ULONG offset = 0; offset + sizeof(SYSTEM_CPU_SET_INFORMATION) <= length;) {
+        const auto* info =
+            reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
+        if (info->Size == 0) {
+            break;
+        }
+        if (info->Type == CpuSetInformation) {
+            sets.push_back({info->CpuSet.EfficiencyClass,
+                            (u32{info->CpuSet.Group} << 8) | info->CpuSet.LastLevelCacheIndex});
+            best = (std::max)(best, static_cast<u8>(info->CpuSet.EfficiencyClass));
+        }
+        offset += info->Size;
+    }
+    std::vector<u32> top_caches;
+    for (const Set& set : sets) {
+        if (set.efficiency_class == best &&
+            std::find(top_caches.begin(), top_caches.end(), set.cache) == top_caches.end()) {
+            top_caches.push_back(set.cache);
+        }
+    }
+    size_t performance = 0;
+    size_t efficiency = 0;
+    size_t low_power = 0;
+    for (const Set& set : sets) {
+        if (set.efficiency_class == best) {
+            ++performance;
+        } else if (std::find(top_caches.begin(), top_caches.end(), set.cache) !=
+                   top_caches.end()) {
+            ++efficiency;
+        } else {
+            ++low_power; // shares no last-level cache with the performance cores
+        }
+    }
+    if (efficiency == 0) {
+        // Only an island of slower cores, no efficiency cores beside the performance ones:
+        // those are the efficiency cores.
+        efficiency = low_power;
+        low_power = 0;
+    }
+    const WindowsCpuSets& placement = CpuSets();
+    const char* hybrid_env = std::getenv("EDEN_HYBRID_CORES");
+    const bool forced_off = hybrid_env != nullptr && std::strtol(hybrid_env, nullptr, 10) == 0;
+    LOG_INFO(Common,
+             "CPU placement: {} logical processors, {} performance / {} efficiency / {} low-power "
+             "efficiency (efficiency class and last-level cache); hybrid placement {}",
+             sets.size(), performance, efficiency, low_power,
+             placement.hybrid ? fmt::format("on: time-critical threads on the {} performance, "
+                                            "background work on the {} others",
+                                            placement.performance.size(),
+                                            placement.efficiency.size())
+             : forced_off     ? std::string{"off (EDEN_HYBRID_CORES=0)"}
+                              : std::string{"off (not a hybrid CPU)"});
+#endif
+}
+
 u32 PauseCycles() {
     static const u32 cycles = [] {
 #ifdef ARCHITECTURE_x86_64
