@@ -675,6 +675,8 @@ TEST_CASE("High refresh fixes built-in hooks its sites in both modes", "[patch_m
         Hook{0x261EB18, 0x1E210801, 0x14589EEE}, // turn speed fmul -> b 0x3c466d0
         Hook{0x261EB1C, 0x1E280800, 0x1E280800}, // the second fmul (kept)
         Hook{0x3B5C7C8, 0x11000508, 0x1403A7D6}, // movie frame count -> b 0x3c46720
+        Hook{0x3296B08, 0x1E390008, 0x1426BF22}, // Scarecrow's Song, held -> b 0x3c46790
+        Hook{0x32926C8, 0x1E390008, 0x1426D046}, // Scarecrow's Song, last note -> b 0x3c467e0
     };
     // Each stub's first and last word.
     struct Stub {
@@ -695,6 +697,8 @@ TEST_CASE("High refresh fixes built-in hooks its sites in both modes", "[patch_m
         Stub{0x3C46690, 0x38, 0x5400004C, 0x17F15218}, // ground c ... b 0x389af24
         Stub{0x3C466D0, 0x48, 0xA9BF47F0, 0x17A76103}, // turn speed ... b 0x261eb20
         Stub{0x3C46720, 0x64, 0xA9BF47F0, 0x17FC5813}, // movie ... b 0x3b5c7cc
+        Stub{0x3C46790, 0x50, 0xA9BF47F0, 0x17D940CC}, // Scarecrow held ... b 0x3296b0c
+        Stub{0x3C467E0, 0x50, 0xA9BF47F0, 0x17D92FA8}, // Scarecrow last ... b 0x32926cc
     };
     constexpr u32 GateCallWord = 0xB94CC610; // ldr w16, [x16, #0xcc4] (the frame step's call)
     const auto word_at = [](const std::vector<u8>& nso, size_t offset) {
