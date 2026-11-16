@@ -1237,6 +1237,46 @@ bool CanonicalKeys() {
     return enabled;
 }
 
+/// FRITCHII_MESH_KEY_VERTEX_INPUT=1 (read on first use): native task/mesh keys keep the vertex
+/// input the registers hold, as before. Off by default: see ClearVertexInput.
+bool MeshKeysDropVertexInput() {
+    static const bool drop = [] {
+        const char* value = std::getenv("FRITCHII_MESH_KEY_VERTEX_INPUT");
+        return value == nullptr || value[0] == '0';
+    }();
+    return drop;
+}
+
+/// A native task/mesh pipeline is built without vertex input state, yet Refresh keys the vertex
+/// input the last vertex draw left in the registers (attribute types with dynamic vertex input;
+/// attributes, divisors and strides without it). Without dynamic vertex input that split the
+/// same task, mesh and pixel programs into one key per leftover vertex format, each a driver
+/// compile the draw waits for (an idea from zortos293/Lichii#2012). Draws and the loader clear it
+/// for those keys. Only without dynamic vertex input: with it the key's only hashed vertex input
+/// is the attribute types, which a task/mesh key already holds none of (the programs' attribute
+/// mask is empty), so those keys and their lookup are unchanged.
+void ClearVertexInput(FixedPipelineState& state) noexcept {
+    state.attribute_types = 0; // enabled_divisors too
+    for (auto& attribute : state.attributes) {
+        attribute.raw = 0;
+    }
+    state.binding_divisors.fill(0);
+    state.vertex_strides.fill(0);
+}
+
+/// Whether a cached record's programs are a native task/mesh pipeline's (drawn while
+/// Maxwell3D::Regs::IsMeshEnabled: the first program is the task or mesh program).
+bool IsNativeMeshRecord(std::span<const FileEnvironment> envs) {
+    if (envs.empty()) {
+        return false;
+    }
+    const Shader::Stage first = envs.front().ShaderStage();
+    return (first == Shader::Stage::Task || first == Shader::Stage::Mesh) &&
+           std::ranges::all_of(envs, [](const FileEnvironment& env) {
+               return env.IsNativeProgram();
+           });
+}
+
 /// EDEN_NX2_PRECOMPILED_FAST (off by default, read on first use): 0 off; 1
 /// the precompiled preparation (EDEN_NX2_PRECOMPILE) keeps each pipeline's shader infos and
 /// SPIR-V, and a draw of a precompiled pipeline whose recorded answers hold is created from them
@@ -1340,6 +1380,10 @@ std::optional<std::string> ReadPipelineRecordKey(std::ifstream& file, std::strea
     file.read(reinterpret_cast<char*>(&key), sizeof(key));
     if (key.state.dynamic_vertex_input != 0) {
         MaskKeyedAttributeTypes(key, envs);
+    }
+    if (key.state.dynamic_vertex_input == 0 && MeshKeysDropVertexInput() &&
+        IsNativeMeshRecord(envs)) {
+        ClearVertexInput(key.state);
     }
     // Loading puts every record under this driver (see load_graphics): a pipeline cached by
     // another driver is the same pipeline.
@@ -2864,6 +2908,12 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineClean(bool patch) {
             clean.miss_reasons = {};
         }
     }
+    if (clean.pipeline != nullptr && mesh_vertex_input_cleared &&
+        (patch_blending || patch_vertex_input || patch_blend_value || programs_only)) {
+        // The patches edit a task/mesh key, which holds no vertex input (RefreshGraphicsKey):
+        // new programs may read the registers' one, so the key is refreshed instead.
+        clean.pipeline = nullptr;
+    }
     if (clean.pipeline != nullptr) {
         const bool patching = patch_blending || patch_vertex_input || patch_blend_value;
         if (!patching && !programs_only) {
@@ -3032,6 +3082,31 @@ GraphicsPipeline* PipelineCache::NextGraphicsPipeline() {
 }
 
 void PipelineCache::RefreshGraphicsKey() {
+    if (mesh_vertex_input_cleared) {
+        // The registers' vertex input, which the last (task/mesh) key did not keep: Refresh
+        // rewrites it only under a raised Dirty::VertexInput.
+        mesh_vertex_input_cleared = false;
+        graphics_key.state.attribute_types = mesh_vertex_input_saved.attribute_types;
+        graphics_key.state.attributes = mesh_vertex_input_saved.attributes;
+        graphics_key.state.binding_divisors = mesh_vertex_input_saved.binding_divisors;
+        graphics_key.state.vertex_strides = mesh_vertex_input_saved.vertex_strides;
+    }
+    RefreshGraphicsKeyState();
+    if (!dynamic_features.has_dynamic_vertex_input && MeshKeysDropVertexInput() &&
+        maxwell3d->GetNativeMacroEngine().native_turing && maxwell3d->regs.IsMeshEnabled()) {
+        // ClearVertexInput, kept aside for the next Refresh.
+        mesh_vertex_input_saved = {
+            .attribute_types = graphics_key.state.attribute_types,
+            .attributes = graphics_key.state.attributes,
+            .binding_divisors = graphics_key.state.binding_divisors,
+            .vertex_strides = graphics_key.state.vertex_strides,
+        };
+        ClearVertexInput(graphics_key.state);
+        mesh_vertex_input_cleared = true;
+    }
+}
+
+void PipelineCache::RefreshGraphicsKeyState() {
     if (!dynamic_features.has_dynamic_vertex_input) {
         graphics_key.state.Refresh(*maxwell3d, dynamic_features);
     } else {
@@ -3085,6 +3160,9 @@ u32 PipelineCache::OneFollowerLookupCheck(bool shaders_clear, bool blending_clea
         // As the lookup leaves the key (RefreshGraphicsKey): native keys are canonical.
         if (canonical) {
             CanonicalizeKeyState(fresh, dynamic_features);
+        }
+        if (mesh_vertex_input_cleared) {
+            ClearVertexInput(fresh); // As RefreshGraphicsKey keys a task/mesh draw
         }
         if (std::memcmp(fresh.attributes.data(), graphics_key.state.attributes.data(),
                         sizeof(fresh.attributes)) != 0 ||
@@ -3811,6 +3889,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     std::unordered_set<u64> native_pipelines;
     size_t foreign_records = 0;
     size_t canonical_rekeyed = 0; ///< EDEN_NX2_CANONICAL_KEYS=1: records whose key hash changed
+    size_t mesh_rekeyed = 0;      ///< Native task/mesh records keyed without their vertex input
 
     if (use_vulkan_pipeline_cache) {
         vulkan_pipeline_cache_filename =
@@ -3987,6 +4066,24 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             }
         }
 
+        // Native task/mesh records are looked up without vertex input, as draws key them now
+        // (ClearVertexInput). Records stored with a leftover vertex format share one key and are
+        // tried newest first; the used-list age moves to it as above.
+        if (key.state.dynamic_vertex_input == 0 && MeshKeysDropVertexInput() &&
+            IsNativeMeshRecord(envs)) {
+            const u64 stored_hash = key.Hash();
+            ClearVertexInput(key.state);
+            if (const u64 hash = key.Hash(); hash != stored_hash) {
+                ++mesh_rekeyed;
+                if (const auto used = used_pipelines.find(stored_hash);
+                    used != used_pipelines.end()) {
+                    const u8 age = used->second;
+                    const auto [entry, inserted] = used_pipelines.try_emplace(hash, age);
+                    entry->second = (std::min)(entry->second, age);
+                }
+            }
+        }
+
         // EDEN_NX2_CANONICAL_KEYS=1: native records are looked up as draws key them now. Records
         // stored before (or while the switch was off) are rekeyed here and their used-list age
         // moves to the canonical key, as for the masking above; records stored with it on are
@@ -4124,6 +4221,12 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                  "EDEN_NX2_CANONICAL_KEYS: {} cached graphics pipeline records loaded under a new "
                  "(canonical) key",
                  canonical_rekeyed);
+    }
+    if (mesh_rekeyed != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "{} cached task/mesh pipeline records loaded under a key without vertex input "
+                 "(FRITCHII_MESH_KEY_VERTEX_INPUT=1 keeps it)",
+                 mesh_rekeyed);
     }
     if (PreloadAllPipelines() && queued_graphics > 10000) {
         LOG_WARNING(Render_Vulkan,

@@ -264,8 +264,11 @@ private:
     KeyHashStats key_hash_stats;
 
     /// FixedPipelineState::Refresh of graphics_key, keeping only the vertex attribute types the
-    /// bound programs read (see VideoCommon::KeyedAttributeTypes).
+    /// bound programs read (see VideoCommon::KeyedAttributeTypes), and no vertex input for a
+    /// native task/mesh draw (ClearVertexInput, FRITCHII_MESH_KEY_VERTEX_INPUT).
     void RefreshGraphicsKey();
+    /// RefreshGraphicsKey without the task/mesh part.
+    void RefreshGraphicsKeyState();
 
     /// EDEN_NX2_PIPELINE_CLEAN / EDEN_NX2_EXP19: CurrentGraphicsPipeline without
     /// FixedPipelineState::Refresh nor the key comparison while nothing Refresh reads changed
@@ -689,6 +692,17 @@ private:
 
     GraphicsPipelineCacheKey graphics_key{};
     u64 vertex_attribute_types{}; ///< graphics_key's attribute types before the programs' mask
+    /// The vertex input part of a key (RefreshGraphicsKey).
+    struct KeyVertexInput {
+        u64 attribute_types;
+        std::array<FixedPipelineState::VertexAttribute, Maxwell::NumVertexAttributes> attributes;
+        std::array<u32, Maxwell::NumVertexArrays> binding_divisors;
+        std::array<u16, Maxwell::NumVertexArrays> vertex_strides;
+    };
+    /// graphics_key is a native task/mesh key without its vertex input (the registers' is in
+    /// mesh_vertex_input_saved, put back before the next Refresh).
+    bool mesh_vertex_input_cleared{};
+    KeyVertexInput mesh_vertex_input_saved{};
     GraphicsPipeline* current_pipeline{};
 
     /// EDEN_NX2_GPL: shader libraries shared by the graphics pipelines. Declared before the
