@@ -44,6 +44,7 @@
 #include "video_core/fritchii_e_split.h"
 #include "video_core/fritchii_e_split_thread.h"
 #include "video_core/fritchii_fill_cuts.h"
+#include "video_core/fritchii_occl_lean.h"
 #include "video_core/fritchii_price.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
@@ -956,6 +957,16 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
             return false;
         }
     }
+    // FRITCHII_OCCL_LEAN (helper CS, fritchii_occl_lean.h): a draw that writes no colour takes
+    // the same pipeline without its pixel program when that program can change nothing else; the
+    // fill below then has no pixel stage and R binds no pixel textures. Off: one relaxed load.
+    VideoCommon::OcclLean::DrawNote occl_note{};
+    if (pipeline != nullptr) {
+        if (const int occl_mode = VideoCommon::OcclLean::Mode(); occl_mode != 0) [[unlikely]] {
+            pipeline = rasterizer.pipeline_cache.OcclLeanPipeline(pipeline, engine.regs,
+                                                                  occl_mode, occl_note);
+        }
+    }
     const u64 position = VideoCommon::GpuSplit::Get().BackEntryPosition();
     if (esplit_hand && AsyncTailFits(engine, pipeline)) [[unlikely]] {
         // FRITCHII_ESPLIT_DEPTH > 0: the tail on E2 while E1 goes on. E1 builds the record
@@ -1076,6 +1087,8 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
     // The fill, ring B's packet, R's packet (its span packing is E1's, carved in PushDraw) and
     // TickWork: E2's.
     const ESplit::Carve fill_carve{ESplit::Class::E2, esplit};
+    // FRITCHII_OCCL_LEAN's timer (1 in 16 of the draws the cut can take): the fill and the push.
+    const u64 occl_start = occl_note.timed ? VideoCommon::OcclLean::NowNs() : 0;
     {
         // Helper CP: FillRing's own work; the handle values and the fill ("memory fill" and
         // its fine zones) are nested zones of their own.
@@ -1088,6 +1101,9 @@ bool OneFollowerDraw::FillAndPush(Maxwell3D& engine, bool is_indexed, u64 seq, b
     {
         const Profile::FineScope push_zone{Profile::Zone::DrawPush}; // helper CP
         OneF::PushDraw(engine, seq, buffer_number, push_flags, pipeline);
+    }
+    if (occl_note.timed) [[unlikely]] {
+        VideoCommon::OcclLean::NoteFill(occl_note, VideoCommon::OcclLean::NowNs() - occl_start);
     }
     // E is its only writer: a relaxed load and store, no locked instruction per draw.
     counts.pushed.store(counts.pushed.load(std::memory_order_relaxed) + 1,

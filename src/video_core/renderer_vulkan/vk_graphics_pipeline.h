@@ -477,7 +477,14 @@ public:
         transition_keys.clear();
         transition_hashes.clear();
         transitions.clear();
+        occl_sibling = nullptr; // FRITCHII_OCCL_LEAN: found again by key
     }
+
+    /// FRITCHII_OCCL_LEAN (fritchii_occl_lean.h; the pipeline cache's, E only): 0 not classed
+    /// yet, else OcclLean::PipelineClass + 1; and the same key without the pixel program once
+    /// found or made (cleared with the transitions, as the cache may evict it).
+    u8 occl_class{};
+    GraphicsPipeline* occl_sibling{};
 
     [[nodiscard]] bool IsBuilt() const noexcept {
         return build->IsBuilt();
