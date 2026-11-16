@@ -186,6 +186,19 @@ PresentManager::PresentManager(const vk::Instance& instance_,
     present_wait_enabled = use_present_thread && device.IsKhrPresentWaitSupported();
     LOG_INFO(Render_Vulkan, "Host pacing: present wait {}",
              present_wait_enabled ? "supported" : "unavailable, frames are not paced");
+    // What the driver offers for a pacer later (probe only, nothing uses them): AMD's Windows
+    // driver has no present wait; a present_wait2 there would let the host pacer run.
+    {
+        const auto& extensions = device.GetAvailableExtensions();
+        const auto has = [&extensions](std::string_view name) {
+            return extensions.contains(name) ? "yes" : "no";
+        };
+        LOG_INFO(Render_Vulkan,
+                 "Host pacing: driver offers VK_KHR_present_wait {}, VK_KHR_present_wait2 {}, "
+                 "VK_KHR_present_id2 {}, VK_AMD_anti_lag {}",
+                 has(VK_KHR_PRESENT_WAIT_EXTENSION_NAME), has("VK_KHR_present_wait2"),
+                 has("VK_KHR_present_id2"), has("VK_AMD_anti_lag"));
+    }
     if (present_wait_enabled) {
         present_wait_thread =
             std::jthread([this](std::stop_token token) { PresentWaitThread(token); });
