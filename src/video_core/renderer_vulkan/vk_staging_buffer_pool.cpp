@@ -17,6 +17,7 @@
 #include "common/bit_util.h"
 #include "common/common_types.h"
 #include "common/literals.h"
+#include "common/nx2_hitch.h"
 #include "common/nx2_timeline.h"
 #include "video_core/buffer_churn_stats.h"
 #include "video_core/churn_counters.h"
@@ -414,6 +415,10 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(
     size_t size, MemoryUsage usage, bool deferred,
     VideoCommon::BufferChurnStats::StagingCaller caller, bool stream_full) {
     auto const log2_size = Common::Log2Ceil<u32>(u32(size));
+    // FRITCHII_HITCH_SPLIT: new staging buffers in the hitch line (their first writes, the page
+    // faults of new memory, land in "texture uploads" for texture staging).
+    const Common::Nx2Hitch::SplitScope hitch_timed{Common::Nx2Hitch::Cause::StagingCreate,
+                                                   u64{1} << log2_size};
     // EDEN_NX2_MEMSTAGE_STATS: no free staging buffer of this size (any user).
     VideoCommon::MemStageStats::StagingCreated(u64{1} << log2_size);
     // EDEN_NX2_BUFFER_CHURN_STATS: the same, by caller.

@@ -74,6 +74,11 @@ FakeCall AxxEmitX64::FastmemCallback(u64 rip_) {
             const DoNotFastmemMarker marker{iter->location, static_cast<unsigned>(iter->inst_name)};
             do_not_fastmem.insert(marker);
             InvalidateBasicBlocks({std::get<0>(marker)});
+            if (::Common::Nx2Hitch::SplitEnabled()) {
+                // Fritchii (FRITCHII_HITCH_SPLIT): a block dropped to be compiled again without
+                // fastmem for this access (once per access and core).
+                ::Common::Nx2Hitch::AddCount(::Common::Nx2Hitch::Cause::CodeDropFastmem, 0, 1);
+            }
         }
         return result;
     }

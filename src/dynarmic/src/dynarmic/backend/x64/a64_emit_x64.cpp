@@ -20,6 +20,7 @@
 #include "common/assert.h"
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "common/nx2_hitch.h"
 #include "dynarmic/ir/terminal.h"
 #include "dynarmic/mcl/integer_of_size.hpp"
 #include <boost/container/static_vector.hpp>
@@ -720,7 +721,19 @@ void A64EmitX64::InvalidateCacheRanges(const boost::icl::interval_set<u64>& rang
     // Fritchii: a slot may hold a block just removed; the table entries go one by one (Unpatch),
     // the slots all go once after (code removal is rare, they refill from the table).
     indirect_bulk_invalidation = true;
-    InvalidateBasicBlocks(block_ranges.InvalidateRanges(ranges));
+    if (::Common::Nx2Hitch::SplitEnabled()) {
+        // Fritchii (FRITCHII_HITCH_SPLIT): how much game code the invalidation drops, and when.
+        const u64 begin = ::Common::Nx2Hitch::NowNs();
+        const auto dropped = block_ranges.InvalidateRanges(ranges);
+        const u64 blocks = dropped.size();
+        InvalidateBasicBlocks(dropped);
+        if (blocks != 0) {
+            ::Common::Nx2Hitch::AddCount(::Common::Nx2Hitch::Cause::CodeDropRange,
+                                         ::Common::Nx2Hitch::NowNs() - begin, blocks);
+        }
+    } else {
+        InvalidateBasicBlocks(block_ranges.InvalidateRanges(ranges));
+    }
     indirect_bulk_invalidation = false;
     ClearIndirectSlots(false);
 }

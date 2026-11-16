@@ -746,6 +746,30 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
                           ? TimedVmaCreateImage(device, allocator, ci, first_ci, handle,
                                                 allocation, alloc_info)
                           : vmaCreateImage(allocator, &ci, &first_ci, &handle, &allocation, &alloc_info);
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge && first_ci.pool != VK_NULL_HANDLE &&
+        !kill_pooled &&
+        VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_depth_pool_big,
+                                         "FRITCHII_DEPTH_POOL_BIG") > 0) {
+        // FRITCHII_DEPTH_POOL_BIG: VMA refuses anything larger than a custom pool's block
+        // (64 MiB) with VK_ERROR_OUT_OF_DEVICE_MEMORY before it looks at the budget, so a large
+        // depth target (OoT, every Castle Town load: 12288x12288 D16, 288 MiB) read as "over
+        // the memory budget": a false pressure event (+512 MiB kept free) and a placement
+        // without the budget check. Such an image tries the normal heap first, budget kept.
+        result = ImageTimingEnabled()
+                     ? TimedVmaCreateImage(device, allocator, ci, alloc_ci, handle, allocation,
+                                           alloc_info)
+                     : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+        static std::atomic<u32> placed{};
+        if (const u32 n = placed.fetch_add(1, std::memory_order_relaxed); n < 8) {
+            LOG_INFO(Render_Vulkan,
+                     "Depth image {}x{}x{} (format {}) refused by the depth pool, outside it: {} "
+                     "(FRITCHII_DEPTH_POOL_BIG, {} so far)",
+                     ci.extent.width, ci.extent.height, ci.arrayLayers,
+                     static_cast<u32>(ci.format),
+                     result == VK_SUCCESS ? "placed within the budget" : "over the budget too",
+                     n + 1);
+        }
+    }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge && device.KeptBlockBytes() != 0) {
         // FRITCHII_KEEP_BLOCKS: the kept blocks count against the budget VMA checks; they go
         // first, and VMA reads the driver's usage again before the retry.

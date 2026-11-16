@@ -44,6 +44,13 @@ enum class Cause : u8 {
     ImageCreate,     ///< Vulkan images created with their memory (MemoryAllocator::CreateImage)
     TimerSpin,       ///< the timer thread spinning before a guest timer (EDEN_NX2_EXP75)
     SlowTimerEvent,  ///< timer thread callbacks of 1 ms or more (core_timing.cpp)
+    // FRITCHII_HITCH_SPLIT=1 (boot) only; never counted with it off:
+    RecompileDropped, ///< RecompileRepeat on a core that had compiled the block itself (dropped)
+    CodeDropRange,    ///< blocks dropped by range invalidations (count = blocks, time = the drop)
+    CodeDropFastmem,  ///< blocks dropped by fastmem faults to be recompiled (count = blocks)
+    WarmRefusedSpace, ///< warm compiles refused: the code cache kept its free half (count only)
+    StagingCreate,    ///< new staging buffers (StagingBufferPool::CreateStagingBuffer), bytes
+    TextureUpload,    ///< TextureCache::UploadImageContents (read, untile, staging write), bytes
     Count,
 };
 
@@ -54,7 +61,11 @@ inline constexpr std::array<const char*, static_cast<size_t>(Cause::Count)> Caus
     "recompiling new game code (summed over cores)",
     "recompiling code another core had (summed over cores)",
     "warm compiles on idle cores", "image creates", "timer thread spin",
-    "timer events over 1 ms"};
+    "timer events over 1 ms",
+    "recompiling code this core had compiled before (dropped since)",
+    "game code dropped by invalidations (blocks)", "game code dropped by fastmem faults (blocks)",
+    "warm compiles refused (code cache full)", "staging buffers made",
+    "texture uploads (CPU side)"};
 
 struct Counters {
     std::array<std::atomic<u64>, static_cast<size_t>(Cause::Count)> ns{};
@@ -87,6 +98,24 @@ inline void Add(Cause cause, u64 ns, u64 amount = 0) {
     }
 }
 
+/// `n` events of `cause` that took `ns` together (count-only causes pass ns 0).
+inline void AddCount(Cause cause, u64 ns, u64 n) {
+    const auto i = static_cast<size_t>(cause);
+    g_counters.ns[i].fetch_add(ns, std::memory_order_relaxed);
+    g_counters.count[i].fetch_add(n, std::memory_order_relaxed);
+    u64 longest = g_counters.longest[i].load(std::memory_order_relaxed);
+    while (ns > longest &&
+           !g_counters.longest[i].compare_exchange_weak(longest, ns, std::memory_order_relaxed)) {
+    }
+}
+
+/// FRITCHII_HITCH_SPLIT (boot, default 0; helper BA, the area-load hitches): 1 = the hitch line
+/// also splits recompiles of code a core had itself (dropped since) from code only other cores
+/// had, counts game code dropped by invalidations and fastmem faults and warm compiles the full
+/// code cache refused, times new staging buffers and texture uploads, and gives the GPU threads
+/// (GPU, GPUBack, GPUMem, GPUBackE2) a place in the busiest threads even past the first 48.
+[[nodiscard]] bool SplitEnabled();
+
 /// Times its scope as `cause`.
 class Scope {
 public:
@@ -97,6 +126,25 @@ public:
     }
     Scope(const Scope&) = delete;
     Scope& operator=(const Scope&) = delete;
+
+private:
+    Cause cause;
+    u64 amount;
+    u64 begin;
+};
+
+/// Times its scope as `cause` only with FRITCHII_HITCH_SPLIT=1 (one cached flag test when off).
+class SplitScope {
+public:
+    explicit SplitScope(Cause cause_, u64 amount_ = 0)
+        : cause{cause_}, amount{amount_}, begin{SplitEnabled() ? NowNs() : 0} {}
+    ~SplitScope() {
+        if (begin != 0) {
+            Add(cause, NowNs() - begin, amount);
+        }
+    }
+    SplitScope(const SplitScope&) = delete;
+    SplitScope& operator=(const SplitScope&) = delete;
 
 private:
     Cause cause;
