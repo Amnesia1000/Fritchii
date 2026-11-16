@@ -677,6 +677,10 @@ TEST_CASE("High refresh fixes built-in hooks its sites in both modes", "[patch_m
         Hook{0x3B5C7C8, 0x11000508, 0x1403A7D6}, // movie frame count -> b 0x3c46720
         Hook{0x3296B08, 0x1E390008, 0x1426BF22}, // Scarecrow's Song, held -> b 0x3c46790
         Hook{0x32926C8, 0x1E390008, 0x1426D046}, // Scarecrow's Song, last note -> b 0x3c467e0
+        Hook{0x14632C, 0xBD466D00, 0x14EC0141}, // cloth time step loads -> b 0x3c46830
+        Hook{0x2AB804, 0x1E270100, 0x14E66C23}, // -> b 0x3c46890
+        Hook{0x2C207A4, 0xBD466D00, 0x14409853}, // -> b 0x3c468f0
+        Hook{0x2C2208C, 0xBD466D02, 0x14409231}, // -> b 0x3c46950
     };
     // Each stub's first and last word.
     struct Stub {
@@ -699,6 +703,10 @@ TEST_CASE("High refresh fixes built-in hooks its sites in both modes", "[patch_m
         Stub{0x3C46720, 0x64, 0xA9BF47F0, 0x17FC5813}, // movie ... b 0x3b5c7cc
         Stub{0x3C46790, 0x50, 0xA9BF47F0, 0x17D940CC}, // Scarecrow held ... b 0x3296b0c
         Stub{0x3C467E0, 0x50, 0xA9BF47F0, 0x17D92FA8}, // Scarecrow last ... b 0x32926cc
+        Stub{0x3C46830, 0x5C, 0xA9BF47F0, 0x1713FEAA}, // cloth a ... b 0x146330
+        Stub{0x3C46890, 0x5C, 0xA9BF47F0, 0x171993C8}, // cloth b ... b 0x2ab808
+        Stub{0x3C468F0, 0x5C, 0xA9BF47F0, 0x17BF6798}, // cloth c ... b 0x2c207a8
+        Stub{0x3C46950, 0x5C, 0xA9BF47F0, 0x17BF6DBA}, // cloth d ... b 0x2c22090
     };
     constexpr u32 GateCallWord = 0xB94CC610; // ldr w16, [x16, #0xcc4] (the frame step's call)
     const auto word_at = [](const std::vector<u8>& nso, size_t offset) {
