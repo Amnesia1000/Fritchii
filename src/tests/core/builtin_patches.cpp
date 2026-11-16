@@ -652,6 +652,20 @@ TEST_CASE("High refresh fixes built-in hooks its sites in both modes", "[patch_m
     constexpr std::array Hooks{
         Hook{0x415300, 0xD503237F, 0x14E0C428}, // sound job entry: pacibsp -> b 0x3c463a0
         Hook{0x415334, 0xBD401100, 0x14E0C43F}, // its step load -> b 0x3c46430
+        Hook{0x3293410, 0x1E390008, 0x1426CC3C}, // ocarina playback tick -> b 0x3c46500
+        Hook{0x2F53268, 0x5EA1B900, 0x1433CCBA}, // step rate countdown -> b 0x3c46550
+        // the words that stub skips: checked, kept
+        Hook{0x2F5326C, 0x1E380109, 0x1E380109},
+        Hook{0x2F53270, 0x5E21D800, 0x5E21D800},
+        Hook{0x2F53274, 0x1E203900, 0x1E203900},
+        Hook{0x2F53278, 0x1E302000, 0x1E302000},
+        Hook{0x2F5327C, 0x540017AA, 0x540017AA},
+        Hook{0x2F53280, 0x1E312000, 0x1E312000},
+        Hook{0x2F53284, 0x54001809, 0x54001809},
+        Hook{0x2F53288, 0xB9409B0A, 0xB9409B0A},
+        Hook{0x2F5328C, 0x7100053F, 0x7100053F},
+        Hook{0x2F53290, 0x1A9FC529, 0x1A9FC529},
+        Hook{0x53F914, 0x1100077A, 0x14DC1B27}, // ambient wave phase -> b 0x3c465b0
     };
     // Each stub's first and last word.
     struct Stub {
@@ -663,6 +677,10 @@ TEST_CASE("High refresh fixes built-in hooks its sites in both modes", "[patch_m
     constexpr std::array Stubs{
         Stub{0x3C463A0, 0x88, 0xA9BF47F0, 0xD65F03C0}, // sound gate: stp x16, x17 ... ret
         Stub{0x3C46430, 0x38, 0xBD401100, 0x171F3BB5}, // sound feed: ldr s0 ... b 0x415338
+        Stub{0x3C46470, 0x88, 0xADBF07E0, 0xD65F03C0}, // step ticks: stp q0, q1 ... ret
+        Stub{0x3C46500, 0x50, 0xA9BF47F0, 0x17D933B2}, // playback ... b 0x3293414
+        Stub{0x3C46550, 0x60, 0xA9BF47F0, 0x17CC3330}, // countdown ... b 0x2f5326c
+        Stub{0x3C465B0, 0x60, 0xA9BF47F0, 0x1723E4C3}, // ambient ... b 0x53f918
     };
     constexpr u32 GateCallWord = 0xB94CC610; // ldr w16, [x16, #0xcc4] (the frame step's call)
     const auto word_at = [](const std::vector<u8>& nso, size_t offset) {
@@ -707,6 +725,9 @@ TEST_CASE("High refresh fixes built-in hooks its sites in both modes", "[patch_m
         }
         SECTION("last hook") {
             std::memcpy(nso.data() + Code + Hooks.back().offset, &NopInstruction, sizeof(u32));
+        }
+        SECTION("a word the countdown stub skips") {
+            std::memcpy(nso.data() + Code + 0x2F53290, &NopInstruction, sizeof(u32));
         }
         SECTION("stub") {
             nso[Code + Stubs.back().offset + Stubs.back().size - 4] = 1;
