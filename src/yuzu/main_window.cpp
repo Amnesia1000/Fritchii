@@ -12,6 +12,7 @@
 #include "common/fs/path_util.h"
 #include "common/game_presets.h"
 #include "common/shutdown_progress.h"
+#include "common/shutdown_watch.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "frontend_common/settings_generator.h"
@@ -786,6 +787,7 @@ void MainWindow::AskOotFrameRate() {
 }
 
 MainWindow::~MainWindow() {
+    Common::ShutdownWatch::Exiting("main window destructor: waiting for the NUP task");
     if (nup_cancel) {
         nup_cancel->store(true);
     }
@@ -795,6 +797,7 @@ MainWindow::~MainWindow() {
 #endif
 
     // will get automatically deleted otherwise
+    Common::ShutdownWatch::Exiting("main window destructor: render window");
     if (render_window->parent() == nullptr) {
         delete render_window;
     }
@@ -803,6 +806,7 @@ MainWindow::~MainWindow() {
     ::close(sig_interrupt_fds[0]);
     ::close(sig_interrupt_fds[1]);
 #endif
+    Common::ShutdownWatch::Exiting("main window members (input subsystem, game list, widgets)");
 }
 
 void MainWindow::AmiiboSettingsShowDialog(const Core::Frontend::CabinetParameters& parameters,
@@ -2525,6 +2529,7 @@ bool MainWindow::OnShutdownBegin() {
     QtCommon::system->SetShuttingDown(true);
     status_bar_update_timer.stop();
     LOG_INFO(Frontend, "Shutdown requested; waiting for emulation thread");
+    Common::ShutdownWatch::Begin("frontend: game exit requested, waiting for the emulation thread");
     discord_rpc->Pause();
 
     RequestGameExit();
@@ -2565,6 +2570,7 @@ void MainWindow::OnShutdownBeginDialog() {
 void MainWindow::OnEmulationStopTimeExpired() {
     if (QtCommon::emu_thread) {
         QtCommon::emu_thread->ForceStop();
+        Common::ShutdownWatch::Step("frontend: emulation thread force-stopped, waiting for it");
         emu_force_stop_clock.start();
         shutdown_progress_seen = Common::ShutdownProgress();
         emu_terminate_timer.setSingleShot(true);
@@ -2600,6 +2606,7 @@ void MainWindow::OnEmulationStopTimeout() {
 void MainWindow::TerminateEmulationThread() {
     if (QtCommon::emu_thread && QtCommon::emu_thread->isRunning()) {
         LOG_ERROR(Frontend, "Emulation thread failed to stop, terminating it");
+        Common::ShutdownWatch::Step("frontend: terminating the emulation thread");
         QtCommon::emu_thread->terminate();
         QtCommon::emu_thread->wait();
     }
@@ -2614,11 +2621,13 @@ void MainWindow::OnEmulationStopped() {
     }
     shutdown_timer.stop();
     emu_terminate_timer.stop();
+    Common::ShutdownWatch::Step("frontend: emulation thread ended, joining it");
     if (QtCommon::emu_thread) {
         QtCommon::emu_thread->disconnect();
         QtCommon::emu_thread->wait();
         QtCommon::emu_thread.reset();
     }
+    Common::ShutdownWatch::Step("frontend: emulation cleanup (window, input devices)");
 
     if (shutdown_dialog) {
         shutdown_dialog->deleteLater();
@@ -2693,7 +2702,11 @@ void MainWindow::OnEmulationStopped() {
         QTimer::singleShot(0, this, &MainWindow::OfferPendingUpdate);
     }
 #endif
+    if (!close_pending) {
+        Common::ShutdownWatch::End(); // the stop is done, the app stays open
+    }
     if (close_pending) {
+        Common::ShutdownWatch::Step("frontend: emulation cleaned up, window close queued");
         QTimer::singleShot(0, this, &QWidget::close);
     } else if (!boot_in_progress) {
         game_list->SetScanEnabled(true);
@@ -5975,6 +5988,8 @@ void MainWindow::closeEvent(QCloseEvent* event) {
         return;
     }
     LOG_INFO(Frontend, "Closing frontend after emulation cleanup");
+    // Watched from here on also when no game ran (Begin arms it, or names the step).
+    Common::ShutdownWatch::Begin("frontend close: saving settings");
 
     UpdateUISettings();
     game_list->SaveInterfaceLayout();
@@ -5982,6 +5997,7 @@ void MainWindow::closeEvent(QCloseEvent* event) {
     hotkey_registry.SaveHotkeys();
 
     // Unload controllers early
+    Common::ShutdownWatch::Step("frontend close: unloading controllers");
     controller_dialog->UnloadController();
     game_list->UnloadController();
 
@@ -5989,11 +6005,16 @@ void MainWindow::closeEvent(QCloseEvent* event) {
     if (QtCommon::emu_thread != nullptr)
         ShutdownGame();
 
+    Common::ShutdownWatch::Step("frontend close: closing the render window");
     render_window->close();
+    Common::ShutdownWatch::Step("frontend close: multiplayer");
     multiplayer_state->Close();
+    Common::ShutdownWatch::Step("frontend close: unloading input devices");
     QtCommon::system->HIDCore().UnloadInputDevices();
+    Common::ShutdownWatch::Step("frontend close: network shutdown");
     Network::Shutdown();
 
+    Common::ShutdownWatch::Exiting("frontend close done: Qt closes the window and ends its loop");
     QWidget::closeEvent(event);
 }
 

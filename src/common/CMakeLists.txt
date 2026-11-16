@@ -120,6 +120,8 @@ add_library(
     scm_rev.h
     scope_exit.h
     shutdown_progress.h
+    shutdown_watch.cpp
+    shutdown_watch.h
     spin_recursive_mutex.h
     scratch_buffer.h
     settings.cpp
