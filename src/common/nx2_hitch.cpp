@@ -16,6 +16,7 @@
 
 #include "common/cpu_features.h"
 #include "common/fritchii_jit_list.h"
+#include "common/fs/path_util.h"
 #include "common/host_memory.h"
 #include "common/logging.h"
 #include "common/nx2_hitch.h"
@@ -27,6 +28,8 @@
 #include <pdh.h>
 #include <pdhmsg.h>
 #include <psapi.h>
+
+#include "common/windows/crash_handler.h"
 #endif
 
 namespace Common::Nx2Hitch {
@@ -366,7 +369,128 @@ void StallResetGap() {
     g_stall_acquire_longest.store(0, std::memory_order_relaxed);
 }
 
+// Hang report (nx2_hitch.h). Presents are counted here whatever EDEN_NX2_HITCH_LOG says.
+std::atomic<u64> g_hang_presents{};
+std::atomic<u64> g_hang_last_present_ns{};
+std::mutex g_hang_mutex;
+HangHooks g_hang_hooks{}; ///< Under g_hang_mutex
+
+// FRITCHII_HANG_DUMP=1 (boot, default 0): the report also writes a minidump (Windows).
+bool HangDumpEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("FRITCHII_HANG_DUMP");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+/// Once a second, from the Pulse thread or the hang watch thread (one of them, never both).
+void HangTick() {
+    static u64 last_presents = ~u64{0};
+    static u64 counting_since = 0; ///< NowNs from which the frameless time counts
+    static bool reported = false;
+    const u64 now = NowNs();
+    const u64 presents = g_hang_presents.load(std::memory_order_relaxed);
+    if (presents != last_presents) {
+        if (reported) {
+            LOG_CRITICAL(Render, "Hang report: frames again after {:.1f} s without one (re-armed)",
+                         static_cast<double>(now - counting_since) / 1e9);
+            reported = false;
+        }
+        last_presents = presents;
+        counting_since = g_hang_last_present_ns.load(std::memory_order_relaxed);
+        return;
+    }
+    std::unique_lock lock{g_hang_mutex};
+    const int seconds =
+        g_hang_hooks.armed_seconds != nullptr ? g_hang_hooks.armed_seconds(g_hang_hooks.context) : 0;
+    if (seconds <= 0) {
+        // Paused, stalled, stopped or switched off: the time without frames counts from here.
+        counting_since = now;
+        return;
+    }
+    if (reported || now - counting_since < static_cast<u64>(seconds) * 1'000'000'000ULL) {
+        return;
+    }
+    reported = true;
+    const u64 last_present = g_hang_last_present_ns.load(std::memory_order_relaxed);
+    const long long gap_us =
+        last_present != 0 ? static_cast<long long>((now - last_present) / 1000) : 0;
+    LOG_CRITICAL(Render,
+                 "Hang report: no frame for {:.1f} s while the game runs ({:.1f} s since the last "
+                 "present, {} presents this process; FRITCHII_HANG_REPORT_S={}, 0 turns it off). "
+                 "One report per freeze, read only; the next frame re-arms it",
+                 static_cast<double>(now - counting_since) / 1e9,
+                 static_cast<double>(gap_us) / 1e6, presents, seconds);
+    LOG_CRITICAL(Render, "Hang report: {}",
+                 StallOn() ? StallSnapshotLine(gap_us)
+                           : std::string{"no stall snapshot (EDEN_NX2_STALL_SNAPSHOT=0)"});
+    if (g_hang_hooks.report != nullptr) {
+        g_hang_hooks.report(g_hang_hooks.context);
+    }
+    lock.unlock();
+    if (HangDumpEnabled()) {
+#ifdef _WIN32
+        LOG_CRITICAL(Render, "Hang report: minidump (FRITCHII_HANG_DUMP=1) {}",
+                     Common::Windows::WriteHangDump(
+                         Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir)));
+#else
+        LOG_CRITICAL(Render, "Hang report: no minidump on this system (FRITCHII_HANG_DUMP=1 is "
+                             "Windows only); attach a debugger or use gcore for one");
+#endif
+    }
+}
+
+/// The once-a-second hang check where the Pulse thread does not run (FRITCHII_PULSE=0,
+/// EDEN_NX2_HITCH_LOG=0, or not Windows).
+class HangWatchThread {
+public:
+    HangWatchThread() : thread{[this] { Run(); }} {}
+
+    ~HangWatchThread() {
+        {
+            std::scoped_lock lock{mutex};
+            stop = true;
+        }
+        cv.notify_all();
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+
+    HangWatchThread(const HangWatchThread&) = delete;
+    HangWatchThread& operator=(const HangWatchThread&) = delete;
+
+private:
+    void Run() {
+        Common::SetCurrentThreadName("FritchiiHangWatch");
+        std::unique_lock lock{mutex};
+        while (!cv.wait_for(lock, std::chrono::seconds{1}, [this] { return stop; })) {
+            lock.unlock();
+            HangTick();
+            lock.lock();
+        }
+    }
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool stop{};
+    std::thread thread; ///< last: the members above exist before it runs
+};
+
 } // Anonymous namespace
+
+void SetHangHooks(const HangHooks& hooks) {
+    std::scoped_lock lock{g_hang_mutex};
+    g_hang_hooks = hooks;
+}
+
+void ClearHangHooks(const void* context) {
+    std::scoped_lock lock{g_hang_mutex};
+    if (g_hang_hooks.context == context) {
+        g_hang_hooks = {};
+    }
+}
 
 // Machine pulse (fable52_answer_dips section 4c): tells "the machine got slower" (another program,
 // a power or heat clock drop, a contended cache or memory bus) apart from the emulator's own work.
@@ -690,6 +814,7 @@ private:
         }
         last = now;
         last_presents = presents;
+        HangTick();
     }
 
     std::mutex mutex;
@@ -699,6 +824,17 @@ private:
 };
 
 #endif // _WIN32
+
+/// Where the hang check runs: on the Pulse thread when it runs, else on its own small thread.
+bool StartHangWatch() {
+#ifdef _WIN32
+    if (Enabled() && PulseEnabled()) {
+        return true; // PulseThread::Sample calls HangTick
+    }
+#endif
+    static HangWatchThread watch;
+    return true;
+}
 
 } // Anonymous namespace
 
@@ -755,6 +891,9 @@ void RegisterThread(const char* name) {
 }
 
 void OnPresent(long long gap_us) {
+    g_hang_last_present_ns.store(NowNs(), std::memory_order_relaxed);
+    g_hang_presents.fetch_add(1, std::memory_order_relaxed);
+    [[maybe_unused]] static const bool hang_watch = StartHangWatch();
     static Snapshot last = Take();
     static u64 window_start_ns = NowNs();
     static int lines_in_window = 0;

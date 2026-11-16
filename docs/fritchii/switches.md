@@ -7,6 +7,53 @@ rebuilds nothing.
 
 ## Named switches
 
+### FRITCHII_HANG_REPORT_S
+
+ON by default at 5 in every build (helper BB, 2026-11-16, after helper AW's boot hang: 0 frames
+from 17 s on, every GPU thread idle, CPU 0.1, and nothing in the log said what the game waited
+on). Live, a number of seconds; 0 turns it off. Once a second (on the Pulse thread, or on a small
+"FritchiiHangWatch" thread where the Pulse does not run: FRITCHII_PULSE=0, EDEN_NX2_HITCH_LOG=0,
+Linux) the emulator looks at the game's presents. When none came for that many seconds while the
+game runs (powered on, not shutting down, not paused, not stalled by the frontend, no GDB stub),
+it logs one "Hang report:" block at Critical, then nothing more until a frame comes ("Hang report:
+frames again after N s without one (re-armed)"). Pausing stops the count; it starts again from
+zero on resume. Before the first present (the boot logo) nothing is watched. Everything it reads
+is read without changing or waking anything, and every lock it needs is only tried (it says "lock
+held for 200 ms" rather than wait). Lines, in order:
+1. "no frame for N s while the game runs (S s since the last present, P presents ...)".
+2. The stall snapshot (EDEN_NX2_STALL_SNAPSHOT) as a 100 ms present gap would log it: the span
+   each GPU thread is in now and for how long, the longest span in the gap, the present thread,
+   the master semaphore's ticks.
+3. "channels suspended on an acquire: yes/no; acquires waiting (N): device ADDR OP VALUE, word
+   now W, for T s" for every semaphore acquire a channel (or the memory stage) is suspended on.
+4. "syncpoint waits": each syncpoint something waits on, its guest and host values, the values its
+   registered actions wait for (nx2:syncpt's armed slot waits, the decoder's and the present's
+   fences) and any thread blocked in WaitGuest/WaitHost.
+5. "GPU split: front ..." (the one follower watchdog's front line: the front's wait site, target,
+   for how long, published/consumed/played) and, with FRITCHII_ONEF on, "one follower step ...;
+   positions ...; E ...; R ...; locks ...".
+6. "service calls in flight": every HLE service call not finished, as service, command, handler
+   name, "waiting for the service's lock" or "in its handler", and for how long.
+7. "game threads in kernel waits": the game's threads in a kernel wait, longest first: thread id,
+   priority, core, what (a mutex at ADDR, condition variable key, WaitForAddress ADDR,
+   WaitSynchronization on an object type, an IPC reply, SleepThread) and for how long.
+8. With FRITCHII_HANG_DUMP=1, the minidump's path.
+Cost while frames come: one clock read and one add per present, a few relaxed stores per service
+call and per guest wait. A long loading screen without presents, or a game waiting on a frontend
+dialog, can also trigger it: once, harmlessly.
+
+### FRITCHII_HANG_DUMP
+
+Off by default (helper BB, 2026-11-16). Boot; FRITCHII_HANG_DUMP=1 makes the hang report
+(FRITCHII_HANG_REPORT_S) also write a minidump of the process: every host thread's stack, thread
+times and start addresses, the modules (MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules, a
+few MiB, no game memory) to fritchii_hang_<pid>_<n>.dmp in the log folder, at most three a
+session. The game keeps running (dbghelp suspends the other threads for the write). A host thread
+blocked on a host lock (a service handler, the GPU threads) shows its whole stack there; a game
+thread blocked in a kernel wait is a parked fiber, whose stack is not in the dump: the report's
+"game threads in kernel waits" line covers those. dbghelp.dll is loaded at run time. Windows only:
+elsewhere the report says so in one line.
+
 ### FRITCHII_PROTECT_UNLOCKED
 
 TEST, off by default (helper AK, 2026-11-15, port of zortos293/Lichii #1780 by Reiixan); live,

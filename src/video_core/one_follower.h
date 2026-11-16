@@ -630,6 +630,11 @@ void MarkEngineThread() noexcept;
 void Start(Core::System& system);
 void Stop();
 
+/// The hang report (FRITCHII_HANG_REPORT_S, no frame for that long while the game runs): logs
+/// the front's wait and, with the one follower running, the watchdog's state line (positions,
+/// E and R, watched locks). Read only, from any thread: wakes and changes nothing.
+void ReportHangState();
+
 /// The hang watchdog (always on with FRITCHII_ONEF=1, one wake a second): a lock whose holder it
 /// names when E or R stop making progress (the rasterizer registers the buffer and texture
 /// caches' mutexes). Up to four; `name` must outlive the session.
