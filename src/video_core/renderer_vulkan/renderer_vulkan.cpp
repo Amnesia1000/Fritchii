@@ -188,9 +188,25 @@ try
 #endif
 {
 
-    if (Settings::values.renderer_force_max_clock.GetValue() && device.ShouldBoostClocks()) {
-        turbo_mode.emplace(instance, dld);
-        scheduler.RegisterOnSubmit([this] { turbo_mode->QueueSubmitted(); });
+    // Force maximum clocks (off by default): a second device keeps the GPU busy. Its device
+    // failing to start skips it instead of failing the whole renderer ("Vulkan initialization
+    // error" and no boot).
+    if (!Settings::values.renderer_force_max_clock.GetValue()) {
+        LOG_INFO(Render_Vulkan, "Force maximum clocks: off");
+    } else if (!device.ShouldBoostClocks()) {
+        LOG_INFO(Render_Vulkan, "Force maximum clocks: skipped (driver not on the list, Steam "
+                                "Deck, or a debugging tool attached)");
+    } else {
+        try {
+            turbo_mode.emplace(instance, dld);
+            scheduler.RegisterOnSubmit([this] { turbo_mode->QueueSubmitted(); });
+            LOG_INFO(Render_Vulkan, "Force maximum clocks: running (costs power; not for laptops "
+                                    "on battery)");
+        } catch (const std::exception& exception) {
+            turbo_mode.reset();
+            LOG_WARNING(Render_Vulkan, "Force maximum clocks: skipped (its device failed: {})",
+                        exception.what());
+        }
     }
 
 #ifdef HAS_RESHADE
