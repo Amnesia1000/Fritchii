@@ -376,8 +376,13 @@ constexpr std::string_view PICKUP_COUNTER_NAME = "Pickup counter at any frame ra
 //   b.ne <the game's own instruction>
 // The stubs keep every register but NZCV, which is dead at each hook (the next flag use sets it
 // first). The game's timer is T = [main+0x4E94B20] (the step at T+0x10, step / 60 at T+0x18).
-// State: BSS after the pickup slots, main+0x4E9FF00 (the BSS of this main runs to main+0x4EA0000;
-// the game's own variables end below main+0x4E9B000). Assembled with llvm-mc and ld.lld.
+// State: BSS at main+0x4E9EE00, on a page of its own below the pickup slots (the BSS of this main
+// runs to main+0x4EA0000; the game's own variables end below main+0x4E9B000). Not after the pickup
+// slots (main+0x4E9FF00, until 2026-11-16): tomvita's cheats for this build keep flags at
+// main+0x4E9FF80..0x4E9FF94 and 0x4E9FFA0..0x4E9FFB0, inside the step slots (zortos293/Lichii#1981
+// found it; no mod or cheat it surveyed writes main+0x4E9EE00..0x4E9EF10). Assembled with llvm-mc
+// and ld.lld; the state's adrp/add pairs (SOUND_GATE +0x20, STEP_TICKS +0x4 and +0x2C) re-encoded
+// by script.
 struct OotFixHook {
     size_t offset;
     std::array<u8, 4> bytes;
@@ -388,7 +393,7 @@ struct OotFixStub {
     std::span<const u8> bytes;
 };
 constexpr size_t HR_FIX_CAVE_START = 0x3C463A0;
-constexpr size_t HR_FIX_STATE_OFFSET = 0x4E9FF00;
+constexpr size_t HR_FIX_STATE_OFFSET = 0x4E9EE00;
 
 // Sound at 60 Hz: the sound engine counts its fades, delays and ramps in whole 60 fps steps per
 // update. Below a whole step some sounds are never released when an area unloads; they fill the
@@ -407,8 +412,8 @@ constexpr size_t HR_FIX_STATE_OFFSET = 0x4E9FF00;
 constexpr std::array<u8, 136> SOUND_GATE{
     0xF0, 0x47, 0xBF, 0xA9, 0x10, 0x55, 0xFE, 0x90, 0x10, 0xC6, 0x4C, 0xB9,
     0xF1, 0x09, 0x90, 0x52, 0xB1, 0x9A, 0xB2, 0x72, 0x1F, 0x02, 0x11, 0x6B,
-    0xF0, 0x47, 0xC1, 0xA8, 0x01, 0x03, 0x00, 0x54, 0xD0, 0x92, 0x00, 0xB0,
-    0x10, 0x02, 0x3C, 0x91, 0x62, 0x02, 0x00, 0x35, 0x69, 0x92, 0x00, 0xD0,
+    0xF0, 0x47, 0xC1, 0xA8, 0x01, 0x03, 0x00, 0x54, 0xD0, 0x92, 0x00, 0x90,
+    0x10, 0x02, 0x38, 0x91, 0x62, 0x02, 0x00, 0x35, 0x69, 0x92, 0x00, 0xD0,
     0x29, 0x91, 0x45, 0xF9, 0x30, 0x11, 0x40, 0xBD, 0x11, 0x10, 0x2E, 0x1E,
     0x00, 0x22, 0x31, 0x1E, 0xEA, 0x00, 0x00, 0x54, 0x12, 0x02, 0x40, 0xBD,
     0x52, 0x2A, 0x30, 0x1E, 0x40, 0x22, 0x31, 0x1E, 0xCB, 0x00, 0x00, 0x54,
@@ -433,7 +438,7 @@ constexpr std::array<u8, 56> SOUND_FEED{
 // so both run fast. Each takes whole ticks of the step from STEP_TICKS instead, which keeps the
 // rest per counter. (The pickup counter, the fourth such counter, has its own built-in.)
 // STEP_TICKS: x13 = the counter's address, s0 = step -> w13 = whole ticks; uses x14-x16 and
-// NZCV, keeps q0/q1. 15 slots of {u64 address, f32 rest, pad} at state +0x10 (to main+0x4EA0000)
+// NZCV, keeps q0/q1. 15 slots of {u64 address, f32 rest, pad} at state +0x10 (to main+0x4E9EF00)
 // and a u32 replacement index at state +8; a new or replaced slot returns max(trunc(step), 1).
 //   find x13's slot (an empty one is taken) ; none: take [index], index = (index + 1) % 15
 //   new: key = x13, rest = 0, w13 = max(fcvtzs(s0), 1) ; hit: rest += s0, w13 = trunc, rest -= w13
@@ -444,11 +449,11 @@ constexpr std::array<u8, 56> SOUND_FEED{
 //   ambient: x13 = x28 + x1 * 4, s0 = [T + 0x10] ; w26 = w27 + ticks ; s0 = [x0, #0x18] ;
 //            b 0x53f918
 constexpr std::array<u8, 136> STEP_TICKS{
-    0xE0, 0x07, 0xBF, 0xAD, 0xCE, 0x92, 0x00, 0xB0, 0xCE, 0x41, 0x3C, 0x91,
+    0xE0, 0x07, 0xBF, 0xAD, 0xCE, 0x92, 0x00, 0x90, 0xCE, 0x41, 0x38, 0x91,
     0xEF, 0x01, 0x80, 0x52, 0xD0, 0x01, 0x40, 0xF9, 0x1F, 0x02, 0x0D, 0xEB,
     0x80, 0x02, 0x00, 0x54, 0xB0, 0x01, 0x00, 0xB4, 0xCE, 0x41, 0x00, 0x91,
-    0xEF, 0x05, 0x00, 0x71, 0x41, 0xFF, 0xFF, 0x54, 0xCE, 0x92, 0x00, 0xB0,
-    0xCE, 0x21, 0x3C, 0x91, 0xD0, 0x01, 0x40, 0xB9, 0x0F, 0x06, 0x00, 0x11,
+    0xEF, 0x05, 0x00, 0x71, 0x41, 0xFF, 0xFF, 0x54, 0xCE, 0x92, 0x00, 0x90,
+    0xCE, 0x21, 0x38, 0x91, 0xD0, 0x01, 0x40, 0xB9, 0x0F, 0x06, 0x00, 0x11,
     0xFF, 0x3D, 0x00, 0x71, 0xEF, 0x31, 0x9F, 0x1A, 0xCF, 0x01, 0x00, 0xB9,
     0xCE, 0x21, 0x00, 0x91, 0xCE, 0x11, 0x10, 0x8B, 0xCD, 0x01, 0x00, 0xF9,
     0xDF, 0x09, 0x00, 0xB9, 0x0D, 0x00, 0x38, 0x1E, 0xBF, 0x05, 0x00, 0x71,
@@ -687,7 +692,8 @@ constexpr std::array HR_FIX_STUBS{
 // The sound accumulator and flag at +0, the step slots' index at +8, the 15 slots from +0x10.
 constexpr size_t HR_FIX_STATE_SIZE = 0x100;
 // The stubs in order, in free padding between the Hyrule Cheat Menu and the pickup stub; their
-// state after the pickup slots, inside the BSS.
+// state inside the BSS, clear of Dark's timer state, the ripple and pickup slots and the cheats'
+// flags from main+0x4E9FF80.
 static_assert([] {
     size_t end = HR_FIX_CAVE_START;
     for (const OotFixStub& stub : HR_FIX_STUBS) {
@@ -698,8 +704,9 @@ static_assert([] {
     }
     return HR_FIX_CAVE_START >= 0x3C46398 && end <= PICKUP_STUB_OFFSET;
 }());
-static_assert(HR_FIX_STATE_OFFSET >= PICKUP_STATE_OFFSET + PICKUP_STATE_SIZE &&
-              HR_FIX_STATE_OFFSET + HR_FIX_STATE_SIZE <= 0x4EA0000);
+static_assert(HR_FIX_STATE_OFFSET >= 0x4E9B000 &&
+              HR_FIX_STATE_OFFSET + HR_FIX_STATE_SIZE <= HIGH_REFRESH_STATE_OFFSET &&
+              HR_FIX_STATE_OFFSET + HR_FIX_STATE_SIZE <= PICKUP_STATE_OFFSET);
 // The hooks over the game's words, then every stub word, each checked to be zero.
 constexpr size_t HR_FIX_RECORD_COUNT = HR_FIX_HOOKS.size() + [] {
     size_t words = 0;
