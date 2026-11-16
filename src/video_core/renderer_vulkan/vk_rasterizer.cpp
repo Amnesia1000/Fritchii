@@ -2337,6 +2337,12 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
 
     const auto report_failure = [&](std::string_view reason) {
         TraceDrawFailure(reason);
+        // One follower (FRITCHII_ONEF_MIRROR_STOP=2): E's samples mirror counted this draw, R's
+        // counter does not start for it (CounterEnable is past the skip).
+        if (VideoCommon::OneFollower::On() && maxwell3d->regs.zpass_pixel_count_enable)
+            [[unlikely]] {
+            VideoCommon::OneFollower::NoteSkippedSamplesDraw();
+        }
         static std::set<std::tuple<u64, u64, std::string_view>> seen;
         const auto& regs = maxwell3d->regs;
         const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
@@ -4109,6 +4115,13 @@ void RasterizerVulkan::OneFollowerPostFence(u8 kind, u32 value,
     }
     OneF::CountFenceDecision(committed ? OneF::FenceDecision::PostedWithCommit
                                        : OneF::FenceDecision::Posted);
+    // FRITCHII_ONEF_SIGNAL_ON_R: a fence-flagged payload is written by R in the op below, at its
+    // played place; its page is one this fence lands (NoteFencePosted below), E's reads of it wait.
+    const bool note_on_r = note != nullptr && OneF::SignalOnR();
+    if (note_on_r) {
+        OneF::CountSignalOnR();
+        OneF::NoteReportPage(note->device);
+    }
     // fable_b 16.4: the query cache's FinishReads, E's half: the reports this fence lands (those
     // since the last fence, a counter fence report's own) get the guest reads' downloads over
     // them landed here, so R writes them without waiting for the buffer lock (FinishRead).
@@ -4123,7 +4136,7 @@ void RasterizerVulkan::OneFollowerPostFence(u8 kind, u32 value,
     if (e_callback != nullptr) {
         (*e_callback)();
     }
-    if (note != nullptr) {
+    if (note != nullptr && !note_on_r) {
         OneF::BeforeEngineRead(note->device, 16);
         query_cache.WritePayloadNow(note->device, note->gpu_addr, note->payload,
                                     note->has_timestamp, true);
@@ -4139,9 +4152,10 @@ void RasterizerVulkan::OneFollowerPostFence(u8 kind, u32 value,
         u32 value;
         u8 kind;
         bool committed;
+        bool note_on_r; ///< kind 5: R writes the payload (FRITCHII_ONEF_SIGNAL_ON_R)
         OneFollowerPayloadNote note;
         OneFollowerFenceReport report;
-    } const op{this, targets, value, kind, committed,
+    } const op{this, targets, value, kind, committed, note_on_r,
                note != nullptr ? *note : OneFollowerPayloadNote{},
                report != nullptr ? *report : OneFollowerFenceReport{}};
     static_assert(sizeof(Op) <= OneF::MaxOpPayloadBytes, "a fence op over the payload limit");
@@ -4150,7 +4164,8 @@ void RasterizerVulkan::OneFollowerPostFence(u8 kind, u32 value,
                       : kind == 2 ? "ReleaseFences (posted)"
                       : kind == 3 ? "SignalSyncPoint (posted, increments on E)"
                       : kind == 4 ? "SignalFence (posted, callback on E)"
-                      : kind == 5 ? "payload fence (posted, written on E)"
+                      : kind == 5 ? (note_on_r ? "payload fence (posted, written on R)"
+                                               : "payload fence (posted, written on E)")
                                   : "fence report (posted)");
     OneF::PushOp(
         OneF::LentOp::Fence,
@@ -4195,7 +4210,12 @@ void RasterizerVulkan::OneFollowerPostFence(u8 kind, u32 value,
                 break;
             }
             case 5:
-                // E wrote the payload: the streamer's pending sync, then the fence.
+                // E wrote the payload (or R here, SIGNAL_ON_R): the streamer's pending sync,
+                // then the fence.
+                if (a.note_on_r) {
+                    self.query_cache.WritePayloadNow(a.note.device, a.note.gpu_addr,
+                                                     a.note.payload, a.note.has_timestamp, true);
+                }
                 self.query_cache.NotePayloadWritten(a.note.device, a.note.has_timestamp,
                                                     a.note.payload, a.note.subreport);
                 self.fence_manager.SignalReference();
@@ -4207,7 +4227,7 @@ void RasterizerVulkan::OneFollowerPostFence(u8 kind, u32 value,
                 break;
             }
         },
-        &op, sizeof(op));
+        &op, sizeof(op), note_on_r);
     // fable_b 13.0: the reports since the last fence may land at this one, at R's place.
     OneF::NoteFencePosted(OneF::PushedNow());
 }
@@ -5873,7 +5893,9 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                         *device, gpu_addr, payload, subreport,
                         True(flags & VideoCommon::QueryPropertiesFlags::HasTimeout)};
                     OneF::CountQueryKind(OneF::QueryKind::PayloadFenceOnE);
-                    OneF::NoteEngineSignal("a fence-flagged payload write");
+                    if (!OneF::SignalOnR()) { // else R writes it (OneFollowerPostFence)
+                        OneF::NoteEngineSignal("a fence-flagged payload write");
+                    }
                     OneFollowerPostFence(5, 0, nullptr, &note);
                     return;
                 }
@@ -5912,6 +5934,46 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                 OneF::SemOnE() && !VideoCore::Nx2Debug::AccuratePart(1)
                     ? gpu_memory->GpuToCpuAddress(gpu_addr)
                     : std::nullopt;
+            if (device && OneF::SignalOnR()) {
+                // FRITCHII_ONEF_SIGNAL_ON_R (AMD tester, test 4 §5c): the same write at R's
+                // played place. E goes on (a posted op, not a lend); the guest sees the release
+                // only once R recorded everything before it, as with one GPU thread. The front's
+                // E-position waits wait for the op (lands_in_memory), E's reads of the page too
+                // (NoteReportLandsAtLastPush). R plays in order: no earlier landing to wait for.
+                const bool has_timestamp =
+                    True(flags & VideoCommon::QueryPropertiesFlags::HasTimeout);
+                if (VideoCore::g_read_downloads.load(std::memory_order_acquire) != 0)
+                    [[unlikely]] {
+                    // As OneFollowerPostFence does for its landing pages (fable_b 16.4).
+                    buffer_cache.FinishReadDownloads(*device & ~u64{0xfff}, u64{1} << 12);
+                }
+                struct Op {
+                    RasterizerVulkan* self;
+                    DAddr device;
+                    GPUVAddr gpu_addr;
+                    u32 payload;
+                    u32 subreport;
+                    bool has_timestamp;
+                } const op{this, *device, gpu_addr, payload, subreport, has_timestamp};
+                OneF::CountSignalOnR();
+                OneF::SetQueryKind(OneF::QueryKind::PayloadReleaseOnR);
+                static_assert(sizeof(Op) <= OneF::MaxOpPayloadBytes,
+                              "an op over the payload limit");
+                OneF::SetLendSite("payload release (written on R, SIGNAL_ON_R)");
+                OneF::PushOp(
+                    OneF::LentOp::Query,
+                    [](void* raw) {
+                        Op a;
+                        std::memcpy(&a, raw, sizeof(a));
+                        a.self->query_cache.WritePayloadNow(a.device, a.gpu_addr, a.payload,
+                                                            a.has_timestamp, false);
+                        a.self->query_cache.NotePayloadWritten(a.device, a.has_timestamp,
+                                                               a.payload, a.subreport);
+                    },
+                    &op, sizeof(op), true);
+                OneF::NoteReportLandsAtLastPush(*device);
+                return;
+            }
             if (device) {
                 const bool has_timestamp =
                     True(flags & VideoCommon::QueryPropertiesFlags::HasTimeout);
@@ -7562,7 +7624,10 @@ void RasterizerVulkan::SignalFence(std::function<void()>&& func) {
         // FRITCHII_ONEF_SEM_E (fable_b 19.6): with fences not delayed the callback runs at once
         // inside SignalFence (a QMD reduction or max release, the GP sync): E runs it at the
         // fence's place and posts the fence with an empty one.
-        if (VideoCommon::OneFollower::SemOnE() && OneFollowerFenceClean()) {
+        // FRITCHII_ONEF_SIGNAL_ON_R: the callback writes game memory the guest acts on; it runs
+        // on R at R's place, which (the callback may touch E's caches) means lent.
+        if (VideoCommon::OneFollower::SemOnE() && !VideoCommon::OneFollower::SignalOnR() &&
+            OneFollowerFenceClean()) {
             VideoCommon::OneFollower::NoteEngineSignal("a SignalFence callback");
             OneFollowerPostFence(4, 0, &func);
             return;
@@ -7602,7 +7667,10 @@ void RasterizerVulkan::SignalSyncPoint(u32 value) {
             // place; R makes an empty fence. The game's wait on the sync point then ends when E
             // passes it. Bound: the frame end stays lent (E parks there until R played the
             // frame), so E is at most a frame ahead of R.
-            if (VideoCommon::OneFollower::SemOnE()) {
+            // FRITCHII_ONEF_SIGNAL_ON_R: R increments both at its played place (kind 0 below).
+            if (VideoCommon::OneFollower::SemOnE() && VideoCommon::OneFollower::SignalOnR()) {
+                VideoCommon::OneFollower::CountSignalOnR();
+            } else if (VideoCommon::OneFollower::SemOnE()) {
                 VideoCommon::OneFollower::NoteEngineSignal("a sync point increment");
                 if (fence_manager.OneFollowerSyncPointGuest(value)) {
                     OneFollowerPostFence(3, value);

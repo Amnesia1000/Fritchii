@@ -726,6 +726,15 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_ONEF_POST_FENCE_REPORT") {
         return &g_onef_post_fence_report;
     }
+    if (name == "FRITCHII_ONEF_SIGNAL_ON_R") {
+        return &g_onef_signal_on_r;
+    }
+    if (name == "FRITCHII_ONEF_WAITS_R") {
+        return &g_onef_waits_r;
+    }
+    if (name == "FRITCHII_ONEF_MIRROR_STOP") {
+        return &g_onef_mirror_stop;
+    }
     if (name == "FRITCHII_ONEF_CLEAR_NODEFER") {
         return &g_onef_clear_nodefer;
     }
@@ -779,6 +788,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     }
     if (name == "FRITCHII_BARE_SSBO_MIB") {
         return &g_bare_ssbo_mib;
+    }
+    if (name == "FRITCHII_BARE_SSBO_CLAMP") {
+        return &g_bare_ssbo_clamp;
     }
     if (name == "FRITCHII_TC_COLLECT_OVER") {
         return &g_tc_collect_over;

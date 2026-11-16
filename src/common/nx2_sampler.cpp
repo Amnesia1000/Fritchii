@@ -123,8 +123,7 @@ std::vector<Target> FindThreads(const std::vector<std::string>& patterns) {
 
 // Walks a suspended thread's stack from its context. Nothing here may allocate: the thread
 // could be paused holding the heap lock.
-unsigned Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames) {
-    unsigned depth = 0;
+void WalkUnguarded(CONTEXT& context, std::array<DWORD64, MaxDepth>& frames, unsigned& depth) {
     while (depth < MaxDepth && context.Rip != 0) {
         frames[depth++] = context.Rip;
         DWORD64 image_base{};
@@ -144,6 +143,23 @@ unsigned Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames) {
         RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, function, &context,
                          &handler_data, &establisher_frame, nullptr);
     }
+}
+
+// A guest core stopped in JIT code (or a thread in driver code) can leave the unwinder a garbage
+// return address and stack pointer: it then faulted inside ntdll on the DebugServer thread and
+// took the emulator down (the AMD tester's `sample` with threads "CPUCore_0,...,CPUCore_5",
+// access violation 0xc0000005). Keep the frames found up to the fault instead, as the sample
+// profile's walker does (nx2_sample_profile.cpp).
+unsigned Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames) {
+    unsigned depth = 0;
+#ifdef _MSC_VER
+    __try {
+        WalkUnguarded(context, frames, depth);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+#else
+    WalkUnguarded(context, frames, depth);
+#endif
     return depth;
 }
 

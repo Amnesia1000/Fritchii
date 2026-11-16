@@ -2549,6 +2549,17 @@ bindings past 8 MiB synchronize up to twice the range per bind (clean ranges are
 EDEN_NX2_STORAGE_SYNC_MEMO); a written graphics binding is marked GPU-modified in full; a
 written compute binding only over its proven write extent. Measure 8 vs 16 live.
 
+FRITCHII_BARE_SSBO_CLAMP=1 (live, default 0): a bare pointer's binding stops at the first device
+page with no host backing (pages the unmapped device read lines report "read as zeros"); none
+backed at its start makes it the null binding. The answer then also holds only until the device
+backing changes. The first 24 are logged ("Bare compute storage binding at ...: host-backed ...:
+clamped / null binding"). Not exact for written bindings (writes past the end are dropped, and
+reads past it are robust-access values instead of the zeros the host buffer held): a test for
+the AMD tester's market load, which read a 16 MiB bare compute window of unbacked pages
+(0x1aeaf4000) on every load. The unmapped device read lines now name the read's site and context
+("buffer upload in compute storage bind", "extent probe", "immediate buffer") and its caller
+(exe+offset, for the PDB or map).
+
 ### FRITCHII_MEMSTAGE_SPLIT_ALLOC
 
 FRITCHII_MEMSTAGE_SPLIT_ALLOC (boot, default on, =0 off; Fable's ideal pipeline design 2.4,
@@ -3133,6 +3144,24 @@ this order in one session: FRITCHII_ONEF=1 at boot, then VIEW, BUILD, UNLEND liv
   with E's commit, lent because POST_FENCE is off, fences delayed, stopped, a sync owed, or
   marks ahead due; and the samples sync targets R did not need because E's mirror was ahead
   (no longer "sync target unused").
+- FRITCHII_ONEF_SIGNAL_ON_R (live, default 0; with FRITCHII_ONEF_SEM_E): SEM_E's
+  game-visible signals happen at R's played place, not E's (AMD tester, test 4 §5c: POST_FENCE
+  plus SEM_E lost the device at the market fountain load on an RX 9070 XT, POST_FENCE alone did
+  not). A payload release is a posted op (E goes on) whose write R makes when it plays it; the
+  front's E-position waits wait for it (a guest-writing op) and E's reads of its page wait until
+  R played it. A synced fence-flagged payload is written by R inside its posted fence. A sync
+  point is posted as without SEM_E (R increments both). A SignalFence with a callback is lent
+  (the callback may touch E's caches). The fence decisions line gives SIGNAL_ON_R and "signals
+  made on R for E" per second.
+- FRITCHII_ONEF_WAITS_R (live, default 0): every front wait ends at R's played position: it
+  overrides FRITCHII_ONEF_WAITS_E (a preset turns it on) and SEM_E's lagged acquire check
+  ("lagged check (E)"). The same as WAITS_E=0 with SEM_E's lagged check on R.
+- FRITCHII_ONEF_MIRROR_STOP (live, default 0): the must-be-0 "sync mirror: a samples report: E's
+  mirror started, R's counter not" (R skipped a draw E's mirror counted: no pipeline, configure
+  failed). 1 = FRITCHII_ONEF_POST_FENCE stops for the session, as the opposite case does
+  (logged at Critical); 2 = counted as explained, no note, when R skipped a draw with the samples
+  count on since its last samples report ("E's mirror ahead after a skipped draw" in the fence
+  decisions line). The superset itself is harmless: E lists a sync R then does not need.
 - FRITCHII_ONEF_SOFT_RELEASE_E (live, default 0; fable_b 22.3): a non-forced ReleaseFences
   (GPU::OnCommandListEnd, about 1,400 a second, the lent "ReleaseFences" site: the forced ones
   are posted by POST_FENCE) is answered on E: with the fencing thread WaitPendingFences(false)

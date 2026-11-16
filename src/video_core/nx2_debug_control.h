@@ -407,6 +407,21 @@ inline std::atomic<int> g_onef_post_idle{-1};
 /// FRITCHII_ONEF_POST_FENCE_REPORT (live, default 0; with POST_FENCE): fence-flagged counter
 /// reports posted as the rasterizer's fences are.
 inline std::atomic<int> g_onef_post_fence_report{-1};
+/// FRITCHII_ONEF_SIGNAL_ON_R (live, default 0; with SEM_E): the guest-visible signals SEM_E
+/// would make at E's place happen at R's played place instead: a payload release is a posted op
+/// R writes when it plays it (E goes on), a fence-flagged payload is written by R in its posted
+/// fence, a sync point is signalled by R (posted fence kind 0), a SignalFence callback is lent.
+/// The guest then never sees work done that R has not recorded yet (AMD tester, test 4 §5c).
+inline std::atomic<int> g_onef_signal_on_r{-1};
+/// FRITCHII_ONEF_WAITS_R (live, default 0): the front's waits that FRITCHII_ONEF_WAITS_E (and
+/// SEM_E's lagged acquire check) end at E's position end at R's played position instead; the
+/// same as WAITS_E=0 plus SEM_E's lagged check on R, as one override over a preset.
+inline std::atomic<int> g_onef_waits_r{-1};
+/// FRITCHII_ONEF_MIRROR_STOP (live, default 0): "a samples report: E's mirror started, R's
+/// counter not" (R skipped a draw E's mirror counted). 1 = stop POST_FENCE for the session, as
+/// the opposite case does; 2 = when R skipped a draw with the samples count on since the last
+/// samples report, counted as explained (no must-be-0 note; E's mirror is a superset there).
+inline std::atomic<int> g_onef_mirror_stop{-1};
 /// FRITCHII_ONEF_CLEAR_NODEFER (live, default 0): diagnostic, a posted clear on R is never
 /// deferred into the next render pass's load op (the lean darkness of 15 Nov).
 inline std::atomic<int> g_onef_clear_nodefer{-1};
@@ -551,6 +566,11 @@ inline std::atomic<int> g_esplit_bind_batch{-1};
 /// how far a storage binding of a bare pointer (no size word) reaches, in MiB, 8 to 1024. 8 (or
 /// 0) is the old cap. Written bindings stop at 16 at most. docs/fritchii/switches.md.
 inline std::atomic<int> g_bare_ssbo_mib{-1};
+/// FRITCHII_BARE_SSBO_CLAMP (live, default 0): a bare pointer's storage binding stops at the
+/// first device page with no host backing (read as zeros today); one with none at its start is
+/// the null binding. Not exact for written bindings (writes past the end are dropped, reads past
+/// it are robust-access values, not the zeros the host buffer held), hence off by default.
+inline std::atomic<int> g_bare_ssbo_clamp{-1};
 /// The bare pointer reach in bytes (FRITCHII_BARE_SSBO_MIB).
 [[nodiscard]] inline u32 BareStorageReach() {
     int mib = g_bare_ssbo_mib.load(std::memory_order_relaxed);
