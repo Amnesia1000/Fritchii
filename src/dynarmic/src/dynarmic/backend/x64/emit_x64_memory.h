@@ -420,6 +420,25 @@ void EmitExclusiveTestAndClear(BlockOfCode& code, const UserConfig& conf, Xbyak:
 
     code.mov(tmp, 0xDEAD'DEAD'DEAD'DEAD);
     const size_t processor_count = GetExclusiveMonitorProcessorCount(conf.global_monitor);
+    if (code.StateRefsMode() != 0) {
+        // Fritchii (FRITCHII_JIT_STATE_REFS): the same code on every core. Every reservation on
+        // the address is cleared, this core's too, as ExclusiveMonitor::CheckAndClear does: its
+        // own was just found equal to vaddr, and with exclusive_state 0 nothing reads it before
+        // the next exclusive load sets it again. Addressed from the monitor's lock (the same
+        // immediate on every core).
+        const u64 base = std::bit_cast<u64>(GetExclusiveMonitorLockPointer(conf.global_monitor));
+        code.mov(pointer, base);
+        for (size_t processor_index = 0; processor_index < processor_count; processor_index++) {
+            const s64 disp = s64(std::bit_cast<u64>(GetExclusiveMonitorAddressPointer(conf.global_monitor, processor_index)) - base);
+            ASSERT(disp >= -0x80000000LL && disp <= 0x7FFFFFFFLL);
+            Xbyak::Label ok;
+            code.cmp(qword[pointer + s32(disp)], vaddr);
+            code.jne(ok, code.T_NEAR);
+            code.mov(qword[pointer + s32(disp)], tmp);
+            code.L(ok);
+        }
+        return;
+    }
     for (size_t processor_index = 0; processor_index < processor_count; processor_index++) {
         if (processor_index == conf.processor_id) {
             continue;

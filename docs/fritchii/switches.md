@@ -450,6 +450,29 @@ Blocks another core already compiled with fastmem still fault once each, as befo
   "dropped since" recompile time should fall; the hitch score must not rise. Up to 5/6 of the
   fastmem recompiles of blocks compiled after the first fault (6 cores). Fresh A/B (boot).
 
+### FRITCHII_JIT_STATE_REFS
+
+TEST, boot, default 0 (helper BQ, 2026-11-16; stage 0 of helper BO's one code cache for all cores,
+helper_bo_answer.md). 1 = every per-core address the CPU recompiler used to write into a block as
+an immediate is read through the state register (r15) instead: the callbacks object (SVC,
+exceptions, cache ops, ISB, counter reads, memory slow paths, 128-bit and exclusive fallbacks), the
+JIT (the dispatcher's block lookup), the config (exclusive accesses through the monitor in C++),
+the TPIDR register addresses, this core's exclusive monitor slots, the fast dispatch table and
+FRITCHII_JIT_INDIRECT_CACHE's slots and counters. A block's bytes then no longer depend on the core
+that compiled it; caches stay per core. The inline exclusive store clears every reservation on its
+address (this core's too, as the monitor's C++ path does), addressed from the monitor's lock.
+2 = 1, and every block (near and far part) and the prelude are scanned for any 8 bytes that point
+into this core's objects (JIT object with its state block and emitter, callbacks, TPIDR, own monitor
+slot, fast dispatch table, indirect slots). Cost of 1: one load per call out (rare), a load instead
+of an immediate at TPIDR reads/writes and exclusive accesses, and one load more per indirect branch
+with FRITCHII_JIT_INDIRECT_CACHE=2/3 (the slot array, then the slot's offset in the cmp and jmp).
+- Log: "FRITCHII_JIT_STATE_REFS=N: ..." at boot. With 2: "JIT state refs (FRITCHII_JIT_STATE_REFS=2)
+  core C so far: N per-core constants left in M blocks of B scanned (must be 0); prelude P" at 256,
+  512, 1024 ... blocks, at the first block with one, and at the end; the first 8 hits get their
+  own line (block pc, offset, value, what it points into, the 2 bytes before it = the opcode).
+- Judge: =2 at market and castletown must say 0 (stage 1 needs it); then fresh A/B 0/1/1/0 (boot)
+  at the market for fps, plus the hitch score. Exact: the same values, read from the state block.
+
 ### FRITCHII_JIT_CACHE_MIB
 
 TEST, boot, default 0 = 512 MiB (helper BA, 2026-11-16). 512-1536: the CPU recompiler's code cache
