@@ -86,6 +86,14 @@ void SetGuestSampler(std::function<std::string()> sampler);
 /// counted under `label` ("size match"). `label` must be a string literal. Called on the census
 /// thread; null removes it.
 void SetSizeSource(const char* label, std::function<std::vector<u64>()> source);
+/// More text for the census's "more" line from an owner of a big table (`key` is the owner; one
+/// reporter per key). Called on the census thread under a lock that RemoveReporter also takes,
+/// so the owner can remove it in its destructor and the call is never running past that.
+void AddReporter(const void* key, std::function<std::string()> reporter);
+void RemoveReporter(const void* key);
+/// For reporters: which 4 KiB pages of [base, base + bytes) are in the working set (1 per page;
+/// all 1 where the query is not available). Never touches the pages.
+[[nodiscard]] std::vector<u8> ResidentPages(const void* base, u64 bytes);
 /// Starts the census thread when Mode() is not 0 (once per Start/Stop pair).
 void Start();
 /// Stops and joins it (before what the sampler reads goes away).

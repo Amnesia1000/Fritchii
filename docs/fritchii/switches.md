@@ -159,6 +159,19 @@ size, and the 16 exact sizes holding the most bytes, so owners can be told apart
 The walk holds the CRT heap's lock: every thread that allocates waits for it (~0.3-1 s); one
 hitch, early in the run.
 
+Added 2026-11-16 (helper CI, after the CENSUS=4 run b5-census4-log): the two ~1 GiB rw regions are
+not CRT heap segments (the heap segment check found 64 segments, 833 MiB; the heap walk at 2 s saw
+638 MiB busy). They are page tables: one existed at 2 s (27 MiB, 539 at 7.3 s, 1022 at 12.6 s, before
+the GPU address space was made at 8.1 s), the other appeared after the GPU address space ("small
+pages up to 0xc000000000") and grew with play (319 -> 986). New tags: "guest page table" (each
+process's, 8 bytes per 4 KiB page, 1 GiB for 39 bits), "GPU page table" (the small-page table, 4
+bytes per page, 1 GiB for 40 bits), "GPU big page table", "SMMU address map", "SMMU page entries".
+The "more" line adds a row per table: reserved, committed, resident, and how much of the resident
+part is all zero (guest) or has no mapped page (GPU): what FRITCHII_RAM_PT_TRIM or _LAZY can give
+back. "Page table commit (n): <table> by <caller> committed K KiB of entries for a..b" lines log
+every call that commits 1 MiB or more of a table at once (the first 64, then every 64th): they name
+the caller that filled it (protect, walk, mark debug, mark cached, map; the GPU table's maps).
+
 ### FRITCHII_RAM_GPU_ENTRIES
 
 TEST, off by default (helper BE, 2026-11-16). Boot. Each GPU address space (Tegra::MemoryManager)
@@ -169,6 +182,35 @@ zero-filled std::vector, so all of it was resident (the first census run: two 64
 ~60 MiB less resident per address space (~120 MiB at the market, two spaces), minus the few MiB
 of pages the game's GPU mappings touch. Judge: the census tag "GPU page entries" (resident) and
 the private working set; nothing else changes.
+
+### FRITCHII_RAM_PT_LAZY
+
+TEST, off by default (helper CI, 2026-11-16). Boot. The guest page table is a 1 GiB reservation
+(8 bytes per 4 KiB page of a 39-bit address space), committed a page at a time. Walks that only
+read it (page protection, block reads and writes, cache operations, the debug and cached marks)
+committed every table page of their whole range first, so a walk over unmapped address space left
+zero pages in RAM. The census run at the market (b5) showed a 1 GiB private region 1022 MiB
+committed / 871 resident by 12.6 s, while the guest had mapped only ~10 GB (~20 MiB of entries);
+it was already 539 MiB at 7.3 s with 96 MiB of guest views. With 1 these walks read through the
+committed bits instead (an uncommitted page is unmapped: same result) and commit nothing. Maps
+still commit what they map. Expected: up to ~850 MiB less resident (and committed) if the walks are
+what committed it; the census's "Page table commit" lines say which caller did ("protect", "walk",
+"mark debug", "mark cached", "map").
+
+### FRITCHII_RAM_PT_TRIM
+
+TEST, off by default (helper CI, 2026-11-16). Boot. Unmaps give back the RAM of page table pages
+they leave without a mapped entry: the guest page table's 4 KiB pages that hold only zeros after
+the unmap, and the GPU small-page table's pages (1,024 entries, 4 MiB of GPU address space) with no
+mapped page left. MEM_RESET + VirtualUnlock (madvise DONTNEED on Linux): still committed, no page
+file write, a zero page reads zero again, and the GPU entries are read only for mapped pages. Done
+under the lock every map of that table takes (the kernel page table lock, page_table_lock), so no
+map lands between the check and the discard. The GPU small-page table is a 1 GiB reservation (4
+bytes per 4 KiB page of 40 bits; Switch 2 asks for small pages up to 768 GiB) committed 64 KiB per
+64 MiB of address space a map reaches and never decommitted; b5 had it at 986 committed / 859
+resident. Expected: what the census reports as "all zero" (guest) and "without a mapped page"
+(GPU), if the tables filled by maps that were unmapped since. Nothing to judge but the census rows
+and that nothing breaks (a wrong discard would show as garbage GPU reads or guest crashes at once).
 
 ### FRITCHII_JIT_WARM_CORES
 

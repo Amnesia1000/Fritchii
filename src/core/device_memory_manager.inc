@@ -213,6 +213,9 @@ DeviceMemoryManager<Traits>::DeviceMemoryManager(const DeviceMemory& device_memo
 {
     impl = std::make_unique<DeviceMemoryManagerAllocator<Traits>>();
     cached_pages = std::make_unique<CachedPages>();
+    // FRITCHII_MEM_CENSUS (no-ops when off)
+    compressed_device_addr.SetCensusName("SMMU address map");
+    tracked_entries.SetCensusName("SMMU page entries");
 }
 
 template <typename Traits>
