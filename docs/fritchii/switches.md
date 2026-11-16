@@ -483,6 +483,36 @@ with FRITCHII_JIT_INDIRECT_CACHE=2/3 (the slot array, then the slot's offset in 
 - Judge: =2 at market and castletown must say 0 (stage 1 needs it); then fresh A/B 0/1/1/0 (boot)
   at the market for fps, plus the hitch score. Exact: the same values, read from the state block.
 
+### FRITCHII_JIT_SHARED
+
+TEST, boot, default 0 (helper BX, 2026-11-16; stage 1 of helper BO's one code cache for all cores,
+helper_bx_answer.md). 1 = every guest core of a process runs one CPU recompiler code cache: one
+code space, one block map, one emitter, blocks compiled once under a lock (one compiler at a time)
+and linked for all cores. Each core keeps its state block, run loop, fast dispatch table, return
+stack buffer, FRITCHII_JIT_INDIRECT_CACHE slots and counters. Needs FRITCHII_JIT_STATE_REFS=1 and
+compact links (FRITCHII_JIT_CHAIN=4/5/6/7 or 1 with FRITCHII_JIT_FAR_CODE=1); without them, with the
+debugger, cycle counting or 32-bit games each core keeps its own cache (a warning says why).
+Lock-free: running code, links (patched by one aligned 4-byte store of a jump's rel32, or an 8-byte
+store of the return stack push's immediate), the per-core dispatch table and the shared map's
+lookup. Removed blocks (code changed or unmapped, fastmem recompiles) keep their code until a
+whole-cache clear; each core drops them from its own tables at its next entry. A whole-cache clear
+(cache full with 32 MiB left, or a guest IC IALLU) halts every core and runs once all are out of
+generated code. Not with FRITCHII_JIT_HOT_PACK (each core's pack would clear the shared cache).
+FRITCHII_JIT_DUMP records blocks on the core that compiled them. FRITCHII_JIT_STATE_REFS=2 scans
+shared blocks for every core's objects. 2 = 1 plus checks: 1 in 64 lock-free lookups compared with
+the map under the lock, and the state block's own objects checked at 1 in 64 entries (both must be 0).
+Also fixes FRITCHII_JIT_INLINE_CNTPCT's per-core address under FRITCHII_JIT_STATE_REFS (read through
+the state register now, so stage 0's scan covers it).
+- Log: "FRITCHII_JIT_SHARED=N: ..." at boot, "JIT shared code (FRITCHII_JIT_SHARED=N) core C made/joined
+  the process's code cache" per core, then every 10 s: "JIT shared code (FRITCHII_JIT_SHARED=N) T s: B
+  blocks compiled once (+b); blocks by cores that looked them up 1:a 2:b ...; first lookups of a block
+  another core had L (+l); compile lock: W waits, X ms waited (+x), Y found compiled by the core waited
+  for; removals R, whole-cache clears C; near/far MiB used, map K keys; patch shape errors P (must be
+  0)" (=2 adds "checks, mismatches (must be 0)").
+- Judge: boot =1 at market and castletown (with STATE_REFS=1 and the test set), RAM census (exec
+  memory should drop by about 5 cores' code), hitch score fresh 0/1/1/0, fps A/B, a 10-minute run.
+  Exact: the same blocks, compiled once.
+
 ### FRITCHII_JIT_CACHE_MIB
 
 TEST, boot, default 0 = 512 MiB (helper BA, 2026-11-16). 512-1536: the CPU recompiler's code cache
