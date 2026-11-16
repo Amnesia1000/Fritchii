@@ -881,7 +881,7 @@ void TextureCache<P>::NoteLostContents(ImageBase& image, bool is_modification, b
     // address never relocate again (as the sampled guard does when it sees the read in time).
     if (drop != nullptr && reason == 8 &&
         VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_lost_writeback,
-                                         "FRITCHII_LOST_WRITEBACK", 1) > 0) {
+                                         "FRITCHII_LOST_WRITEBACK", 1024) > 0) {
         relocation_guarded_addresses[drop->gpu_addr] |= GuardSampled;
         relocation_shapes[drop->shape_key].guard |= GuardSampled;
         ++s.relocation_guards;
@@ -948,7 +948,7 @@ void TextureCache<P>::LogLostContents() {
                  VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_stale_zero,
                                                   "FRITCHII_STALE_ZERO", 1),
                  VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_lost_writeback,
-                                                  "FRITCHII_LOST_WRITEBACK", 1),
+                                                  "FRITCHII_LOST_WRITEBACK", 1024),
                  s.made_skipped, s.made_zeroed, s.made_uploaded, s.overwritten, sampled,
                  s.sampled_undrawn, s.sampled_drawn, s.sampled_bytes >> 10, s.sampled_guarded,
                  r[1], r[2], r[7], r[5], r[4], r[8], r[3], r[6], r[0], r[9], s.relocation_guards,
@@ -966,7 +966,7 @@ auto TextureCache<P>::QueueLostWriteback(ImageId image_id, Image& image, u8 path
     -> LostWriteback {
     // 1 (default): every image; N > 1: only images up to N KiB (larger ones dropped as before).
     const int mode = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_lost_writeback,
-                                                      "FRITCHII_LOST_WRITEBACK", 1);
+                                                      "FRITCHII_LOST_WRITEBACK", 1024);
     if (mode <= 0 || False(image.flags & ImageFlagBits::GpuModified) ||
         True(image.flags & ImageFlagBits::CollectPending) || !IsDownloadable(image)) {
         return LostWriteback::Drop;

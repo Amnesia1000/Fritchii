@@ -840,7 +840,10 @@ per skipped upload, which replaced a full upload. 0 = undefined as before.
 
 ### FRITCHII_LOST_WRITEBACK
 
-On by default (helper CV, 2026-11-16, round 2; zortos293/Lichii #1501's idea). Live. A correctness
+On by default at 1024 (images up to 1 MiB; helper CV, 2026-11-16, round 2; zortos293/Lichii #1501's
+idea). The default was 1 (every size) for one build: the market toggle 0/1 measured 72.1 -> 68.9 fps,
+1% 54.1 -> 42.6, up to 6.1 GiB written back per 10 s (big targets the cold sweep drops); 0/1024 measured
+73.2 / 73.6, 1% 54.8 / 56.3, and still covers the text targets (~0.5 MiB). Live. A correctness
 fix: a GPU-written image that the cold sweep (EXP58's superseded deletes included),
 FRITCHII_SWEEP_SUPERSEDED, EXP64's slot retire or the collector (bad overlaps) is about to delete
 is written back to guest memory first, on the collector's download queue (EXP121's): the landing
