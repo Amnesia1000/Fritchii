@@ -2866,6 +2866,11 @@ u64 TextureCacheRuntime::GetDeviceMemorySlack() const {
     return device.GetDeviceMemorySlack();
 }
 
+u32 TextureCacheRuntime::GetMaxScaledExtent() const noexcept {
+    return (std::min)({device.GetMaxImageDimension2D(), device.GetMaxFramebufferWidth(),
+                       device.GetMaxFramebufferHeight()});
+}
+
 void TextureCacheRuntime::LimitKeptBlocks(u64 budget, u64 critical) const {
     device.LimitKeptBlocks(budget, critical);
 }

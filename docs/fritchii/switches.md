@@ -7,6 +7,19 @@ rebuilds nothing.
 
 ## Named switches
 
+### FRITCHII_SCALED_EXTENT_CAP
+
+TEST, off by default (helper BH, 2026-11-16, port of zortos293/Lichii #1890 by zortos293, still
+open there). Live, for images made after the change. 0 = as before. 1 = the texture cache leaves
+an image unscaled when its scaled width or height would pass the device's 2D image or framebuffer
+limit (the smallest of the three; 16384 on AMD and RADV, 32768 on NVIDIA). Rescaling is decided
+per render target set, so that whole pass stays native while the rest of the frame scales. Why:
+OoT's sun shadow map is a 12288x12288 D16 depth target; at 1.5x it is 18432 wide and at 2x
+24576, past AMD's 16384, and drawing into it hangs the GPU: device loss entering Castle Town at
+1.5x/2x on AMD (zortos #1885: semaphore waits for 2 s, then "Device loss occurred" with no fault
+address). NVIDIA keeps scaling that map at 2x, so on NVIDIA the switch changes nothing at those
+scales. Check: an AMD tester at 1.5x enters Castle Town with the switch at 1.
+
 ### FRITCHII_OOT_BYPASS_SAMPLED
 
 TEST, off by default (helper BH, 2026-11-16, port of zortos293/Lichii #1875 by zortos293). Live;

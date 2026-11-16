@@ -228,6 +228,8 @@ inline std::atomic<int> g_gather_one_lock{-1};
 inline std::atomic<int> g_gather_empty_test{-1};
 /// FRITCHII_OOT_BYPASS_SAMPLED: docs/fritchii/switches.md.
 inline std::atomic<int> g_oot_bypass_sampled{-1};
+/// FRITCHII_SCALED_EXTENT_CAP: docs/fritchii/switches.md.
+inline std::atomic<int> g_scaled_extent_cap{-1};
 /// FRITCHII_FENCE_COMMIT_FAST: docs/fritchii/switches.md.
 inline std::atomic<int> g_fence_commit_fast{-1};
 /// FRITCHII_PIPELINE_KEY_HASH: docs/fritchii/switches.md.

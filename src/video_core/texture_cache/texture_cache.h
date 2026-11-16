@@ -4371,6 +4371,17 @@ bool TextureCache<P>::ImageCanRescale(ImageBase& image) {
     if (!image.info.rescaleable) {
         return false;
     }
+    if constexpr (requires { runtime.GetMaxScaledExtent(); }) {
+        // FRITCHII_SCALED_EXTENT_CAP: past the device's limits the scaled image is invalid. OoT's
+        // 12288x12288 sun shadow map is 18432 wide at 1.5x and 24576 at 2x, over AMD's 16384,
+        // and drawing into it hangs the GPU (device loss entering Castle Town on AMD).
+        if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_scaled_extent_cap,
+                                             "FRITCHII_SCALED_EXTENT_CAP") != 0 &&
+            !ScaledImageFits(image.info, Settings::values.resolution_info,
+                             runtime.GetMaxScaledExtent())) {
+            return false;
+        }
+    }
     if (Settings::values.resolution_info.downscale && !image.info.downscaleable) {
         return false;
     }
