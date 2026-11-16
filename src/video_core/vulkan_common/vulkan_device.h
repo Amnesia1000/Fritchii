@@ -1258,6 +1258,14 @@ FN_MAX_LIMIT_LIST
     /// at most the EDEN_NX2_VRAM_LIMIT_MIB limit. False without VK_EXT_memory_budget.
     bool MainHeapUsage(u64& usage, u64& budget) const;
 
+    /// FRITCHII_VRAM_BUDGET_MODE: MainHeapUsage plus the main heap's size (at most the
+    /// EDEN_NX2_VRAM_LIMIT_MIB limit). False without VK_EXT_memory_budget.
+    bool MainHeapNumbers(u64& size, u64& usage, u64& budget) const;
+
+    /// FRITCHII_VRAM_BUDGET_MODE=os: the adapter's LUID, to find its OS counters. False when the
+    /// driver gives none.
+    bool GetDeviceLuid(u32& low, s32& high) const;
+
     /// The largest device-local heap, where images live.
     size_t GetMainHeap() const {
         return main_heap;

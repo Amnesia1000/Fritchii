@@ -238,6 +238,43 @@ inline std::atomic<int> g_vram_pool_fit{-1};
 inline std::atomic<int> g_vram_critical_fit{-1};
 /// FRITCHII_VRAM_REPORT: docs/fritchii/switches.md.
 inline std::atomic<int> g_vram_report{-1};
+/// FRITCHII_VRAM_BUDGET_MODE: docs/fritchii/switches.md. 0 fixed, 1 vk, 2 os.
+inline std::atomic<int> g_vram_budget_mode{-1};
+/// FRITCHII_VRAM_BUDGET_MODE (live, default vk): where the texture cache's live budget cap comes
+/// from. The environment takes a name (fixed, vk, os) or its number; the debug server's `switch`
+/// takes the number.
+[[nodiscard]] inline int VramBudgetMode() {
+    int current = g_vram_budget_mode.load(std::memory_order_relaxed);
+    if (current < 0) [[unlikely]] {
+        int initial = 1;
+        if (const char* value = std::getenv("FRITCHII_VRAM_BUDGET_MODE"); value != nullptr) {
+            const std::string_view text{value};
+            if (text == "fixed" || text == "off") {
+                initial = 0;
+            } else if (text == "vk") {
+                initial = 1;
+            } else if (text == "os") {
+                initial = 2;
+            } else {
+                initial = std::atoi(value);
+            }
+            initial = initial < 0 ? 0 : (initial > 2 ? 2 : initial);
+        }
+        int unset = -1;
+        if (g_vram_budget_mode.compare_exchange_strong(unset, initial,
+                                                       std::memory_order_relaxed)) {
+            BumpSwitchGeneration();
+        }
+        current = g_vram_budget_mode.load(std::memory_order_relaxed);
+    }
+    return current;
+}
+/// FRITCHII_VRAM_HEADROOM_MIB: docs/fritchii/switches.md (0 = auto).
+inline std::atomic<int> g_vram_headroom_mib{-1};
+/// FRITCHII_TC_CRITICAL_ENFORCE: docs/fritchii/switches.md.
+inline std::atomic<int> g_tc_critical_enforce{-1};
+/// FRITCHII_VRAM_OWNERS: docs/fritchii/switches.md (seconds between lines, 0 = off).
+inline std::atomic<int> g_vram_owners{-1};
 /// FRITCHII_E2C_ON_E: docs/fritchii/switches.md.
 inline std::atomic<int> g_e2c_on_e{-1};
 /// FRITCHII_STAMP_READ_PAGES: docs/fritchii/switches.md.

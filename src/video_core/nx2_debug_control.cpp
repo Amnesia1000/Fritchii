@@ -496,6 +496,18 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_VRAM_REPORT") {
         return &g_vram_report;
     }
+    if (name == "FRITCHII_VRAM_BUDGET_MODE") {
+        return &g_vram_budget_mode;
+    }
+    if (name == "FRITCHII_VRAM_HEADROOM_MIB") {
+        return &g_vram_headroom_mib;
+    }
+    if (name == "FRITCHII_TC_CRITICAL_ENFORCE") {
+        return &g_tc_critical_enforce;
+    }
+    if (name == "FRITCHII_VRAM_OWNERS") {
+        return &g_vram_owners;
+    }
     if (name == "FRITCHII_SMALL_CARD") {
         return &SmallCard::g_small_card;
     }

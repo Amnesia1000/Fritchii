@@ -24,6 +24,7 @@
 #include "common/div_ceil.h"
 #include "common/nx2_timeline.h"
 #include "common/literals.h"
+#include "common/memory_detect.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "shader_recompiler/byte_addressed_image.h"
@@ -2879,6 +2880,69 @@ void TextureCacheRuntime::LimitKeptBlocks(u64 budget, u64 critical) const {
     device.LimitKeptBlocks(budget, critical);
 }
 
+bool TextureCacheRuntime::MainHeapNumbers(u64& size, u64& usage, u64& budget) const {
+    return device.MainHeapNumbers(size, usage, budget);
+}
+
+std::optional<u64> TextureCacheRuntime::OtherProcessesVideoMemory() const {
+    if (luid_state == 0) {
+        luid_state = device.GetDeviceLuid(luid_low, luid_high) ? 1 : 2;
+    }
+    if (luid_state != 1) {
+        return std::nullopt;
+    }
+    const auto sample = Common::GetAdapterVideoMemory(luid_low, luid_high);
+    if (!sample) {
+        return std::nullopt;
+    }
+    return sample->adapter_dedicated -
+           (std::min)(sample->adapter_dedicated, sample->process_dedicated);
+}
+
+std::string TextureCacheRuntime::VramOwnersText(u64 texture_image_bytes, u64 deleted_bytes) {
+    // FRITCHII_VRAM_OWNERS: who holds the main device-local heap. Images are made by the main
+    // allocator; buffers by the buffer allocator when it is split off (else by the main one too).
+    u64 size{};
+    u64 usage{};
+    u64 budget{};
+    device.MainHeapNumbers(size, usage, budget);
+    const size_t heap = device.GetMainHeap();
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> main_budgets{};
+    vmaGetHeapBudgets(device.GetAllocator(), main_budgets.data());
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> buffer_budgets{};
+    if (device.HasSplitAllocators()) {
+        device.BufferHeapBudgets(buffer_budgets.data());
+    }
+    const VmaStatistics& images = main_budgets[heap].statistics;
+    const VmaStatistics& buffers = buffer_budgets[heap].statistics;
+    const u64 blocks = images.blockBytes + buffers.blockBytes;
+    const u64 allocated = images.allocationBytes + buffers.allocationBytes;
+    const u64 pool = image_pool_bytes;
+    const u64 frees = PendingImageFreeBytes();
+    // The image allocations the texture cache does not name are mostly in the main allocator;
+    // what is left of both allocators' allocations is the buffers (buffer cache, stream and
+    // device-local staging buffers) and the rest.
+    const u64 named = texture_image_bytes + deleted_bytes + pool + frees;
+    const u64 rest = allocated - (std::min)(allocated, named);
+    const u64 staging = staging_buffer_pool.CachedBytes(MemoryUsage::Upload) +
+                        staging_buffer_pool.CachedBytes(MemoryUsage::Download) +
+                        staging_buffer_pool.CachedBytes(MemoryUsage::DeviceLocal) +
+                        staging_buffer_pool.StreamBufferBytes();
+    // Kept blocks (FRITCHII_KEEP_BLOCKS) are memory VMA gave back that is kept from the driver.
+    const u64 kept = device.KeptBlockBytes();
+    const u64 held = blocks + kept;
+    return fmt::format(
+        "main heap {} of {} MiB budget ({} MiB heap): texture cache images {} MiB, deleted images "
+        "still allocated {} MiB, image pool {} MiB, frees in flight {} MiB, buffers and the rest "
+        "{} MiB (buffer allocator {} MiB in {} allocations), unused space in allocator blocks {} "
+        "MiB, kept blocks {} MiB, outside the allocators {} MiB (the driver's: pipelines, "
+        "descriptors, swapchain, its own); staging pool {} MiB (any heap)",
+        usage >> 20, budget >> 20, size >> 20, texture_image_bytes >> 20, deleted_bytes >> 20,
+        pool >> 20, frees >> 20, rest >> 20, buffers.allocationBytes >> 20,
+        buffers.allocationCount, (blocks - (std::min)(blocks, allocated)) >> 20, kept >> 20,
+        (usage - (std::min)(usage, held)) >> 20, staging >> 20);
+}
+
 bool TextureCacheRuntime::CanDownloadMsaa(const VideoCommon::ImageInfo& info) const {
     const VkImageAspectFlags aspect_mask = ImageAspectMask(info.format);
     if ((aspect_mask & VK_IMAGE_ASPECT_COLOR_BIT) != 0) {
@@ -3412,13 +3476,17 @@ void TextureCacheRuntime::TickFrame() {
         image_pool_seen_failed = failed;
         // FRITCHII_KEEP_BLOCKS: kept blocks go before any pooled image, then one is trimmed a
         // frame while they hold more than the cap and the budget's limit allow.
-        if (short_of_memory) {
+        // FRITCHII_VRAM_BUDGET_MODE: while the texture cache's live budget cap binds, kept blocks
+        // are memory the driver counts against a budget that is already short.
+        if (short_of_memory || budget_pressure) {
             device.ReleaseKeptBlocks();
         }
         device.TickKeptBlocks();
         // FRITCHII_VRAM_POOL_FIT (live, default 0): the pool's cap follows the room under the
-        // budget, re-read every 30 frames.
-        if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_vram_pool_fit,
+        // budget, re-read every 30 frames. Also while the budget cap binds (budget_pressure):
+        // deleted images went to the pool, so its memory stayed counted, and the cap went on down.
+        if (!budget_pressure &&
+            VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_vram_pool_fit,
                                              "FRITCHII_VRAM_POOL_FIT") == 0) {
             pool_fit_cap = ~u64{0};
             pool_fit_frames = 0;

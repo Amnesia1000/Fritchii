@@ -201,7 +201,8 @@ if(WIN32)
         windows/fritchii_focus.h
         windows/timer_resolution.cpp
         windows/timer_resolution.h)
-    # pdh: the machine pulse's clock and thermal counters (nx2_hitch.cpp)
+    # pdh: the machine pulse's clock and thermal counters (nx2_hitch.cpp) and the GPU memory
+    # counters of FRITCHII_VRAM_BUDGET_MODE=os (memory_detect.cpp)
     target_link_libraries(common PRIVATE ntdll pdh)
 endif()
 

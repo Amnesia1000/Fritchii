@@ -32,6 +32,17 @@ struct MemoryInfo {
 /// Ported.
 [[nodiscard]] std::optional<u64> GetSystemCommitRoom();
 
+/// FRITCHII_VRAM_BUDGET_MODE=os: the OS's count of dedicated video memory in use on one adapter
+/// (by every process) and this process's part of it.
+struct AdapterVideoMemory {
+    u64 adapter_dedicated{};
+    u64 process_dedicated{};
+};
+/// The last sample (taken once a second on a low priority thread of its own, PDH's GPU Adapter
+/// Memory and GPU Process Memory counters; the first call starts it) for the adapter with this
+/// LUID. No value before the first sample, when it is older than 5 s, and off Windows.
+[[nodiscard]] std::optional<AdapterVideoMemory> GetAdapterVideoMemory(u32 luid_low, s32 luid_high);
+
 struct ProcessMemoryUsage {
     u64 working_set{};
     u64 peak_working_set{};

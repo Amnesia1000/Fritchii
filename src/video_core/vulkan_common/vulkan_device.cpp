@@ -8,6 +8,7 @@
 #include <bitset>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -2835,6 +2836,38 @@ bool Device::MainHeapUsage(u64& usage, u64& budget_bytes) const {
     if (heap_size_limit != 0) {
         budget_bytes = (std::min)(budget_bytes, heap_size_limit);
     }
+    return true;
+}
+
+bool Device::MainHeapNumbers(u64& size, u64& usage, u64& budget_bytes) const {
+    if (!extensions.memory_budget) {
+        return false;
+    }
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+    budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+    const auto mem_info = physical.GetMemoryProperties(&budget);
+    size = mem_info.memoryProperties.memoryHeaps[main_heap].size;
+    usage = budget.heapUsage[main_heap];
+    budget_bytes = budget.heapBudget[main_heap];
+    if (heap_size_limit != 0) {
+        size = (std::min)(size, heap_size_limit);
+        budget_bytes = (std::min)(budget_bytes, heap_size_limit);
+    }
+    return true;
+}
+
+bool Device::GetDeviceLuid(u32& low, s32& high) const {
+    VkPhysicalDeviceIDProperties id{};
+    id.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+    VkPhysicalDeviceProperties2 properties{};
+    properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    properties.pNext = &id;
+    physical.GetProperties2(properties);
+    if (!id.deviceLUIDValid) {
+        return false;
+    }
+    std::memcpy(&low, id.deviceLUID, sizeof(low));
+    std::memcpy(&high, id.deviceLUID + sizeof(low), sizeof(high));
     return true;
 }
 

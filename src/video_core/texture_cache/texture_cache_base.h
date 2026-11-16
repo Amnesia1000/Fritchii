@@ -171,6 +171,41 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     /// FRITCHII_SMALL_CARD (part Fit): room for the device memory the usage leaves out
     /// (UncountedDeviceBytes), smoothed like slack_margin; 0 while the part is off.
     u64 held_margin{};
+    /// FRITCHII_VRAM_BUDGET_MODE: the thresholds as ApplyThresholdOverrides left them, before
+    /// the live budget cap (budget_cap, ~0 while it does not bind) lowers them.
+    u64 base_expected_memory{};
+    u64 base_critical_memory{};
+    u64 base_minimum_memory{};
+    u64 budget_cap{~0ULL};
+    bool budget_pressure{}; ///< budget_cap binds: the driver's usage passed the budget less headroom
+    std::chrono::steady_clock::time_point budget_control_time{};
+    /// What BudgetControl saw last, for the owners line.
+    struct BudgetSeen {
+        int mode{-1};
+        u64 heap_size{};
+        u64 usage{};
+        u64 vk_budget{};
+        u64 os_budget{}; ///< 0 without an OS sample
+        u64 others{};    ///< other processes' dedicated video memory (OS counters)
+        u64 budget{};    ///< the one in use
+        u64 headroom{};
+        u64 peak_usage{};       ///< since the last owners line
+        u64 lowest_budget{~0ULL}; ///< since the last owners line
+        u32 over_seconds{};     ///< samples over budget less headroom since the last owners line
+        u32 spill_seconds{};    ///< samples over the budget itself since the last owners line
+    } budget_seen;
+    /// FRITCHII_TC_CRITICAL_ENFORCE: evictions made before creating an image.
+    struct CreateEnforceStats {
+        u64 passes{};
+        u64 deleted{};
+        u64 freed{};
+        u64 capped{};  ///< passes refused by the per-frame cap
+        u64 short_of{}; ///< passes that ended still over critical
+    } create_enforce_stats;
+    u64 create_enforce_frame{~0ULL};
+    u32 create_enforce_frame_deletes{};
+    std::vector<ImageId> create_enforce_candidates;
+    std::chrono::steady_clock::time_point vram_owners_time{};
     u64 astc_opaque_images{};
     u64 astc_alpha_images{};
     std::vector<u8> astc_scan_buffer;
@@ -1404,6 +1439,18 @@ private:
 
     /// Applies EDEN_NX2_TC_EXPECTED_MIB / EDEN_NX2_TC_CRITICAL_MIB and logs the thresholds.
     void ApplyThresholdOverrides(bool log = true);
+
+    /// FRITCHII_VRAM_BUDGET_MODE: the base thresholds lowered to budget_cap (no-op at ~0).
+    void ApplyBudgetCap();
+    /// FRITCHII_VRAM_BUDGET_MODE (live): once a second, the driver's usage of the main heap
+    /// against the budget (vk: the driver's; os: also the heap less what other processes hold)
+    /// less FRITCHII_VRAM_HEADROOM_MIB; past it the cap comes down, with room it goes back up.
+    void BudgetControl();
+    /// FRITCHII_TC_CRITICAL_ENFORCE (live): before an image of about `incoming` bytes is made
+    /// past the critical memory, clean images idle 10+ frames are deleted (no downloads).
+    void EnforceCriticalAtCreate(u64 incoming);
+    /// FRITCHII_VRAM_OWNERS (live, seconds, default 10): one line with who holds device memory.
+    void LogVramOwners();
 
     /// FRITCHII_SMALL_CARD (part Fit): device memory the driver counts that TickFrame leaves out
     /// of total_used_memory (deleted images still in flight, collector downloads, frees handed to
