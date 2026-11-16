@@ -362,6 +362,16 @@ public:
         return properties.properties.deviceID;
     }
 
+    /// Returns the PCI vendor ID of the physical device.
+    u32 GetVendorID() const {
+        return properties.properties.vendorID;
+    }
+
+    /// Returns the pipeline cache UUID (it names the driver build that compiles pipelines).
+    std::span<const u8> GetPipelineCacheUUID() const {
+        return properties.properties.pipelineCacheUUID;
+    }
+
     /// Returns the device name.
     std::string_view GetModelName() const {
         return properties.properties.deviceName;
@@ -810,6 +820,17 @@ FN_MAX_LIMIT_LIST
     /// Whether presents can carry ids and be waited on until shown (the host frame pacer).
     bool IsKhrPresentWaitSupported() const {
         return extensions.present_id && extensions.present_wait;
+    }
+
+    /// FRITCHII_PIPELINE_BINARY is on and the device has VK_KHR_pipeline_binary (with
+    /// maintenance5): Fritchii keeps the compiled pipelines itself (vk_pipeline_binary.h).
+    bool IsKhrPipelineBinaryEnabled() const {
+        return pipeline_binary_enabled;
+    }
+
+    /// The driver's VK_KHR_pipeline_binary properties (zero when it doesn't offer it).
+    const VkPhysicalDevicePipelineBinaryPropertiesKHR& PipelineBinaryProperties() const {
+        return pipeline_binary_properties;
     }
 
     /// EDEN_NX2_GPL=1 and the device has VK_EXT_graphics_pipeline_library with fast linking:
@@ -1519,6 +1540,14 @@ private:
     bool graphics_pipeline_library_requested{};
     VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT graphics_pipeline_library_features{};
     bool graphics_pipeline_library_enabled{};
+
+    /// FRITCHII_PIPELINE_BINARY: kept out of the extension tables like EDEN_NX2_GPL, so a run
+    /// without the switch creates the device exactly as before.
+    bool pipeline_binary_offered{};
+    bool pipeline_binary_requested{};
+    VkPhysicalDevicePipelineBinaryFeaturesKHR pipeline_binary_features{};
+    VkPhysicalDevicePipelineBinaryPropertiesKHR pipeline_binary_properties{};
+    bool pipeline_binary_enabled{};
 
     VkPhysicalDeviceFeatures2 features2{};
     VkPhysicalDeviceFaultFeaturesEXT device_fault_features{};

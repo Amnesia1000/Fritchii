@@ -321,6 +321,12 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkDestroyImage vkDestroyImage{};
     PFN_vkDestroyImageView vkDestroyImageView{};
     PFN_vkDestroyPipeline vkDestroyPipeline{};
+    // VK_KHR_pipeline_binary (FRITCHII_PIPELINE_BINARY, vk_pipeline_binary.h)
+    PFN_vkCreatePipelineBinariesKHR vkCreatePipelineBinariesKHR{};
+    PFN_vkDestroyPipelineBinaryKHR vkDestroyPipelineBinaryKHR{};
+    PFN_vkGetPipelineBinaryDataKHR vkGetPipelineBinaryDataKHR{};
+    PFN_vkGetPipelineKeyKHR vkGetPipelineKeyKHR{};
+    PFN_vkReleaseCapturedPipelineDataKHR vkReleaseCapturedPipelineDataKHR{};
     PFN_vkDestroyPipelineCache vkDestroyPipelineCache{};
     PFN_vkDestroyPipelineLayout vkDestroyPipelineLayout{};
     PFN_vkDestroyQueryPool vkDestroyQueryPool{};

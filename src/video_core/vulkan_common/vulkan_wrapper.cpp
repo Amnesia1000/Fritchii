@@ -206,6 +206,11 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkDestroyImage);
     X(vkDestroyImageView);
     X(vkDestroyPipeline);
+    X(vkCreatePipelineBinariesKHR);
+    X(vkDestroyPipelineBinaryKHR);
+    X(vkGetPipelineBinaryDataKHR);
+    X(vkGetPipelineKeyKHR);
+    X(vkReleaseCapturedPipelineDataKHR);
     X(vkDestroyPipelineCache);
     X(vkDestroyPipelineLayout);
     X(vkDestroyQueryPool);

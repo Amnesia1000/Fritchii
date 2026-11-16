@@ -233,6 +233,25 @@ range, and the vendor fault codes. A driver without it logs "Device fault info: 
 the driver". Only the loss report reads it; nothing is drawn differently. FRITCHII_DEVICE_FAULT=0
 leaves the extension off, as before. Why: two AMD testers hit device losses with no clue in the log.
 
+### FRITCHII_PIPELINE_BINARY, FRITCHII_PIPELINE_BINARY_MAX_MB, FRITCHII_PIPELINE_BINARY_HARVEST
+
+Off by default (helper CE, 2026-11-16). Boot. Fritchii keeps the compiled pipelines itself through
+VK_KHR_pipeline_binary instead of trusting the driver's cache: 1 load and save, 2 load only, 3 load,
+save and verify (every 16th pipeline built from the store is also compiled normally and the driver's
+binary keys compared). The store is <shader dir>/<title id>/pipeline_binaries.fritchii.bin (+ .idx),
+one per GPU and driver (vendor, device, driver id, driver version, pipeline cache UUID); another GPU
+or driver starts it over. Entries are found by the driver's key of each create info
+(vkGetPipelineKeyKHR), checked by hash when read, zstd-compressed. A saving store adds its id to the
+Prepare Shaders stamp, so the first boot with it (or after it starts over) prepares once more and
+fills it. FRITCHII_PIPELINE_BINARY_MAX_MB (6144) caps the file; FRITCHII_PIPELINE_BINARY_HARVEST=0
+stops taking pipelines the driver's own cache still holds (otherwise taken from there, no compile).
+A device loss in a session that used the store starts it over at the next boot. Graphics pipeline
+libraries (EDEN_NX2_GPL) are left to the driver: only whole pipelines go through the store. Log:
+"Pipeline binaries (...)" at boot, "Pipeline binaries so far/after the preparation/at exit: N hits
+(ms each), M misses (ms each, K taken from the driver's cache), ~S s of compiles saved ...".
+Why: AMD's Windows driver keeps ~30% of the 120k prepared pipelines and compiles the rest again at first use
+(0.2-1.1 s each, the 1 s stalls); NVIDIA on Linux prunes its cache.
+
 ### FRITCHII_SCALED_EXTENT_CAP
 
 On by default since 2026-11-16 (helper BR; helper BH ported it off, port of zortos293/Lichii

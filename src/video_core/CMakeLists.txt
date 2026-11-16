@@ -286,6 +286,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_mem_stage_shadow.h
     renderer_vulkan/vk_one_follower_draw.cpp
     renderer_vulkan/vk_one_follower_draw.h
+    renderer_vulkan/vk_pipeline_binary.cpp
+    renderer_vulkan/vk_pipeline_binary.h
     renderer_vulkan/vk_pipeline_cache.cpp
     renderer_vulkan/vk_pipeline_cache.h
     renderer_vulkan/vk_pipeline_translate_queue.cpp
