@@ -713,6 +713,53 @@ outside the allocators MiB; small card profile ...". Judge under EDEN_NX2_VRAM_L
 not lower; with no limit on a 16 GB card, FRITCHII_SMALL_CARD=2 must log "not a small card" and
 change nothing.
 
+### FRITCHII_IMAGE_DEVICE_LOCAL
+
+TEST, off by default (helper DQ, 2026-11-17; port of a low-VRAM fork's fix). Boot: 0 off, 1 on, 2
+dry. Discrete GPUs only (integrated: logged and ignored). An image's first try in the default heaps
+is "within the budget, prefer device memory" with nothing required, so once the device heap is over
+its budget VMA moves on to a host memory type still within its budget and succeeds silently: the
+image lives in system RAM, the GPU samples it over PCIe (the other fork measured 9.4 GB of images
+there in the market, 150 ms frames), and the texture cache never sees pressure because the device
+heap's usage does not count it. =1: the tries within the budget in the default heaps (the plain
+first try, the depth pool refusal retry, the kept-blocks retry) require DEVICE_LOCAL; custom pools
+keep their own memory type. A full device heap then refuses the image: that is a pressure event
+like any refused image (with the native thresholds the texture cache keeps 512 MiB more free, "Out
+of device memory: keeping N MiB more free"; the budget control and FRITCHII_TC_CRITICAL_ENFORCE
+work as before), and
+the old fallbacks place it as before (without the budget check, device memory first; host memory
+only when the device really is out). =2: placement unchanged, only counts. Logs: at boot
+"FRITCHII_IMAGE_DEVICE_LOCAL=N: ..."; then "Image device-local (FRITCHII_IMAGE_DEVICE_LOCAL=N,
+event): first tries refused R, of those placed over budget in device memory D; host memory images
+H (M MiB), by the first try F" each time R or H reaches a power of two, then every 1024. With =2, F
+is the silent spill =1 removes. Test: 8 GB simulation (EDEN_NX2_VRAM_LIMIT_MIB=8192 +
+FRITCHII_VRAM_SIM_OTHERS=1) at the market, first =2 (is F above 0 at all?), then =1 vs 0 fresh
+(boot switch): host images and hitch lines down, pressure events up, fps and 1% lows not lower.
+On a 16 GB card without a limit both modes must log nothing after boot.
+
+### FRITCHII_BUFFER_POOL_BLOCK_MB
+
+TEST, off by default (helper DQ, 2026-11-17; port of a low-VRAM fork's change). Boot: 0 = 16 MiB
+blocks (as before); n = n MiB blocks (1-64) for the buffer cache's device-local VMA pool
+(Device::SeparatePool::DeviceBuffers, both allocators when they are split), and buffers over half
+a block take the default blocks. The other fork uses 4 (2 MiB cut-off): buffer cache buffers live
+a few per 16 MiB block, and a block stays while any of them does, mostly empty. Not the same as
+FRITCHII_SMALL_CARD_BUFFER_BLOCK_MIB (the buffer allocator's default blocks). Log at boot:
+"FRITCHII_BUFFER_POOL_BLOCK_MB: device buffer pool blocks N MiB, buffers over K KiB take the
+default blocks". Judge by the "buffer pool" slack in FRITCHII_VRAM_OWNERS / FRITCHII_VRAM_REPORT
+and the Churn line's device allocations (smaller blocks = more vkAllocateMemory calls), fresh
+launches.
+
+### FRITCHII_BC1_KEEPS_ALPHA
+
+Off by default (helper DQ, 2026-11-17; port of a low-VRAM fork's fix). Boot: 1 on. Only does
+something when the player picked ASTC recompression BC1 (our default is BC3) on a GPU without
+native ASTC: BC1 for every ASTC image turns alpha into a 1-bit cutout (dark faces and banding in
+OoT). With 1 the session runs the BC3 path instead, whose opaque scan already sends the fully
+opaque images to BC1 (EDEN_NX2_ASTC_BC1, on by default) and keeps the others in BC3. Log at boot:
+"FRITCHII_BC1_KEEPS_ALPHA: ASTC recompression BC1 runs the BC3 path ...". A candidate for default 1:
+it changes nothing for a player on BC3 or Uncompressed.
+
 ### FRITCHII_VRAM_POOL_FIT
 
 TEST, off by default (helper BF, 2026-11-16; 8 GB cards). Live: 1 = EXP42's image pool (pooled

@@ -921,6 +921,84 @@ std::string PlacementText(VmaAllocator allocator, u32 memory_type) {
                        static_cast<u32>(type.propertyFlags));
 }
 
+/// FRITCHII_IMAGE_DEVICE_LOCAL (boot, default 0; discrete GPUs only, 0 on integrated ones).
+/// Over the budget, the first try in the default heaps (WITHIN_BUDGET, no required flags) lets VMA
+/// move on to a host memory type that is still within its budget: the image silently lives in
+/// system RAM, the GPU samples it over PCIe (another fork measured 9.4 GB of images there in the
+/// market, 150 ms frames), and since the device heap's usage does not count it the texture cache
+/// never sees pressure. 1 = that first try requires device-local memory, so a full device heap
+/// refuses it and the refusal is a pressure event (the collector keeps more free); the fallbacks
+/// below then place it as before (over the budget in device memory, host memory only when the
+/// device really is out). 2 = dry: placement unchanged, counts the images the first try put
+/// outside device-local memory.
+int ImageDeviceLocalMode(const Device& device) {
+    static const int mode = [&device] {
+        const char* value = std::getenv("FRITCHII_IMAGE_DEVICE_LOCAL");
+        const int parsed = value != nullptr ? std::atoi(value) : 0;
+        if (parsed != 1 && parsed != 2) {
+            return 0;
+        }
+        if (device.IsIntegrated()) {
+            LOG_INFO(Render_Vulkan, "FRITCHII_IMAGE_DEVICE_LOCAL={}: integrated GPU, ignored",
+                     parsed);
+            return 0;
+        }
+        LOG_INFO(Render_Vulkan, "FRITCHII_IMAGE_DEVICE_LOCAL={}: {}", parsed,
+                 parsed == 1 ? "images require device-local memory on the first try"
+                             : "dry, counting images the first try puts in host memory");
+        return parsed;
+    }();
+    return mode;
+}
+
+/// FRITCHII_IMAGE_DEVICE_LOCAL's counters, logged when a count reaches a power of two and then
+/// every 1024.
+std::atomic<u64> g_local_refused{};    ///< =1: first tries the device-local requirement refused
+std::atomic<u64> g_local_over_budget{}; ///< =1: of those, placed in device memory over budget
+std::atomic<u64> g_host_images{};      ///< images placed outside device-local memory
+std::atomic<u64> g_host_bytes{};
+std::atomic<u64> g_host_first_try{};   ///< of those, by the first try (the silent spill)
+
+bool LogThisCount(u64 count) {
+    return count != 0 && ((count & (count - 1)) == 0 || count % 1024 == 0);
+}
+
+void LogDeviceLocalCounters(int mode, const char* event) {
+    LOG_INFO(Render_Vulkan,
+             "Image device-local (FRITCHII_IMAGE_DEVICE_LOCAL={}, {}): first tries refused {}, "
+             "of those placed over budget in device memory {}; host memory images {} ({} MiB), "
+             "by the first try {}",
+             mode, event, g_local_refused.load(std::memory_order_relaxed),
+             g_local_over_budget.load(std::memory_order_relaxed),
+             g_host_images.load(std::memory_order_relaxed),
+             g_host_bytes.load(std::memory_order_relaxed) >> 20,
+             g_host_first_try.load(std::memory_order_relaxed));
+}
+
+/// Counts where an image made under FRITCHII_IMAGE_DEVICE_LOCAL landed.
+void NoteDeviceLocalPlacement(VmaAllocator allocator, int mode, bool refused_first,
+                              bool first_try, const VmaAllocationInfo& alloc_info) {
+    const VkPhysicalDeviceMemoryProperties* properties{};
+    vmaGetMemoryProperties(allocator, &properties);
+    const bool local = alloc_info.memoryType < properties->memoryTypeCount &&
+                       (properties->memoryTypes[alloc_info.memoryType].propertyFlags &
+                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+    if (local) {
+        if (refused_first) {
+            g_local_over_budget.fetch_add(1, std::memory_order_relaxed);
+        }
+        return;
+    }
+    g_host_bytes.fetch_add(alloc_info.size, std::memory_order_relaxed);
+    if (first_try) {
+        g_host_first_try.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (LogThisCount(g_host_images.fetch_add(1, std::memory_order_relaxed) + 1)) {
+        LogDeviceLocalCounters(mode, first_try ? "host image by the first try"
+                                               : "host image by a fallback");
+    }
+}
+
 } // Anonymous namespace
 
 bool MemoryAllocator::ImageTimingEnabled() noexcept {
@@ -979,8 +1057,16 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
         }
     }
     const bool huge = IsTooLargeToBack(texels, bytes);
+    // FRITCHII_IMAGE_DEVICE_LOCAL=1: tries within the budget in the default heaps require
+    // device-local memory (custom pools have their own memory type and ignore it); the
+    // fallbacks without the budget check below take alloc_ci as before.
+    const int device_local_mode = ImageDeviceLocalMode(device);
+    VmaAllocationCreateInfo local_ci = alloc_ci;
+    if (device_local_mode == 1) {
+        local_ci.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    }
     // EDEN_NX2_DEPTH_POOL: the first attempt only; the fallbacks below take any memory.
-    VmaAllocationCreateInfo first_ci = alloc_ci;
+    VmaAllocationCreateInfo first_ci = local_ci;
     if (!dedicated && (ci.usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0) {
         first_ci.pool = DepthAttachmentPool(allocator, ci, alloc_ci);
     }
@@ -1012,6 +1098,8 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
                           ? TimedVmaCreateImage(device, allocator, ci, first_ci, handle,
                                                 allocation, alloc_info)
                           : vmaCreateImage(allocator, &ci, &first_ci, &handle, &allocation, &alloc_info);
+    // FRITCHII_IMAGE_DEVICE_LOCAL: placed by the first try (=2 counts host placements of it).
+    bool first_try_placed = result == VK_SUCCESS && !kill_pooled && !fit_placed;
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge && first_ci.pool != VK_NULL_HANDLE &&
         !kill_pooled &&
         (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_depth_pool_big,
@@ -1029,9 +1117,11 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
         // the memory budget": a false pressure event (+512 MiB kept free) and a placement
         // without the budget check. Such an image tries the normal heap first, budget kept.
         result = ImageTimingEnabled()
-                     ? TimedVmaCreateImage(device, allocator, ci, alloc_ci, handle, allocation,
+                     ? TimedVmaCreateImage(device, allocator, ci, local_ci, handle, allocation,
                                            alloc_info)
-                     : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+                     : vmaCreateImage(allocator, &ci, &local_ci, &handle, &allocation, &alloc_info);
+        // The default heaps' first try for an image the depth pool refused.
+        first_try_placed = result == VK_SUCCESS;
         static std::atomic<u32> placed{};
         if (const u32 n = placed.fetch_add(1, std::memory_order_relaxed); n < 8) {
             LOG_INFO(Render_Vulkan,
@@ -1049,11 +1139,21 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
         if (device.ReleaseKeptBlocks() != 0) {
             vmaSetCurrentFrameIndex(allocator, 0);
             result = vmaCreateImage(allocator, &ci, &first_ci, &handle, &allocation, &alloc_info);
+            first_try_placed = result == VK_SUCCESS;
         }
     }
+    bool refused_first = false;
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
         // Over the device memory budget (Switch 2 titles fill 8 GB cards): let the driver page
         // it out rather than failing the draw and aborting.
+        if (device_local_mode == 1) {
+            // FRITCHII_IMAGE_DEVICE_LOCAL=1: the device heap is full; this pressure event is
+            // what makes the texture cache keep more free.
+            refused_first = true;
+            if (LogThisCount(g_local_refused.fetch_add(1, std::memory_order_relaxed) + 1)) {
+                LogDeviceLocalCounters(device_local_mode, "first try refused");
+            }
+        }
         static u32 logged{};
         if (logged++ < 32) {
             LOG_WARNING(Render_Vulkan,
@@ -1067,7 +1167,9 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
         if (detail) {
             const char* const first_try = kill_pooled                       ? "the colour target pool"
                                           : first_ci.pool != VK_NULL_HANDLE ? "the depth attachment pool"
-                                                                            : "the default heaps";
+                                          : device_local_mode == 1
+                                              ? "the default heaps, device-local required"
+                                              : "the default heaps";
             LOG_WARNING(Render_Vulkan,
                         "  refused: {} memory, first try in {}, VMA follows the driver budget: "
                         "{}; {}",
@@ -1137,6 +1239,11 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
                       ci.arrayLayers, static_cast<u32>(ci.format), static_cast<int>(result));
         }
         return result;
+    }
+
+    if (device_local_mode != 0) {
+        NoteDeviceLocalPlacement(allocator, device_local_mode, refused_first, first_try_placed,
+                                 alloc_info);
     }
 
     // Log GPU memory allocation for images
@@ -1229,8 +1336,9 @@ bool MemoryAllocator::CreateBufferInSeparatePool(const VkBufferCreateInfo& ci, M
                                                  VkBuffer& handle, VmaAllocation& allocation,
                                                  VmaAllocationInfo& alloc_info) const {
     // The buffer cache's buffers, churned by its collector: in a pool of their own (see
-    // Device::SeparatePool). Anything over half a block takes the default blocks (dedicated).
-    if (usage != MemoryUsage::DeviceLocal || ci.size > Device::SeparatePoolBlockSize / 2) {
+    // Device::SeparatePool). Anything over half a block takes the default blocks (dedicated);
+    // the block size is FRITCHII_BUFFER_POOL_BLOCK_MB's.
+    if (usage != MemoryUsage::DeviceLocal || ci.size > Device::DeviceBufferBlockSize() / 2) {
         return false;
     }
     u32 memory_type{};
