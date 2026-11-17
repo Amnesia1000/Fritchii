@@ -70,9 +70,10 @@ private:
     mutable std::atomic<int> state{-1};
 };
 
-// FRITCHII_STORE_FOOTPRINT (read at first use, default 0; 3 = dry, helper_dl_answer.md item 1;
-// 1 and 2 are not built and count as 3): every native written storage binding's write mark
-// carries its program's store footprint (Shader::StorageStoreFootprint: the residues modulo a
+// FRITCHII_STORE_FOOTPRINT (read at first use, default 0; helper_dl_answer.md item 1): any value
+// at boot arms it (this switch); the live value picks 0, 1, 2 or 3 (store_footprint_live.h). 3 at
+// boot also turns the read ring on for the dry count below: every native written storage
+// binding's write mark carries its program's store footprint (the residues modulo a
 // record stride its stores can land on, made at translation, so EDEN_NX2_PRECOMPILED_FAST=0).
 // Each read that goes to the back is classed by the footprint of the newest mark over its bytes:
 // inside it, outside it with no older mark in the ring still covering the bytes (it would be
@@ -90,7 +91,9 @@ inline bool ReadRunsValue(bool writer_ticks) {
     // FRITCHII_EXTENT_CBUF=3 (dry) counts its reads on the ring too ("Extent cbuf" lines), and
     // FRITCHII_EXTENT_CENSUS ranks program bindings by their read-back waits.
     if (!writer_ticks) {
-        if (g_store_footprint) {
+        // FRITCHII_STORE_FOOTPRINT: the dry count's ring only for 3 at boot (1 and 2 at boot arm
+        // the live switch without it)
+        if (g_store_footprint.Get() == 3) {
             return true;
         }
         const char* cbuf = std::getenv("FRITCHII_EXTENT_CBUF");

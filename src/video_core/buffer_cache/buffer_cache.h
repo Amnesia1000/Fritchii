@@ -258,6 +258,10 @@ void BufferCache<P>::TickFrame() {
     if (!extent_census.empty()) [[unlikely]] {
         LogExtentCensus();
     }
+    // FRITCHII_STORE_FOOTPRINT (armed): the live line every 10 s
+    if (footprint_following) [[unlikely]] {
+        StoreFootprintLive::MaybeLog(footprint_shadow.NumEntries());
+    }
     if (ReadRunStats::g_enabled) [[unlikely]] {
         ReadRunStats::g_frame.fetch_add(1, std::memory_order_relaxed);
         ReadRunStats::FrameTick();
@@ -629,6 +633,22 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
         }
     }
     const bool preflushable = memory_tracker.IsRegionPreflushable(device_addr, size);
+    // FRITCHII_STORE_FOOTPRINT=1/2 (live once armed): every GPU-modified byte of the read is held
+    // only by marks whose store footprints exclude it, so no GPU write since those bytes were
+    // last clean touched them and guest memory holds them. Answered without a wait; nothing else
+    // changes (FootprintAnswersRead re-arms the pages' traps). The core may keep only the read's
+    // own bytes as its read area.
+    if (footprint_following && !preflushable) [[unlikely]] {
+        const int live = StoreFootprintLive::Mode();
+        if ((live == 1 || live == 2) &&
+            FootprintAnswersRead(device_addr, size, device_addr_start_aligned,
+                                 device_addr_end_aligned, live)) {
+            area->start_address = device_addr;
+            area->end_address = device_addr + size;
+            area->preemtive = true;
+            return area;
+        }
+    }
     // EDEN_NX2_EXP49: all of the area's GPU-modified bytes on their way for an earlier read. No
     // new copies: the read waits for those (in_flight), or finds them landed.
     if (!read_downloads.empty() &&
@@ -2423,16 +2443,17 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
             }
             // FRITCHII_STORE_FOOTPRINT=3 (dry): the binding's store footprint for its write marks,
             // counted from the pointer (a binding of several device ranges has none).
-            if (ReadRunStats::g_store_footprint && binding.segment_count == 0) [[unlikely]] {
-                static constexpr Shader::StorageStoreFootprint NoFootprint{};
-                const GPUVAddr pointer = read_pointer();
-                const u64 pad = pointer >= binding.gpu_addr ? pointer - binding.gpu_addr : 0;
-                footprint_dry[ssbo_index] = ReadRunStats::FootprintRef{
-                    .id = ReadRunStats::InternFootprint(
-                        compute_shader_hash, static_cast<u32>(ssbo_index),
-                        extra != nullptr ? extra->footprint : NoFootprint),
-                    .base = binding.device_addr + pad,
-                };
+            // FRITCHII_STORE_FOOTPRINT armed (any value at boot): the live shadow follows
+            // gpu_modified_ranges from the first such bind on, and the marks carry the same
+            // footprint (BindHostComputeStorageBuffers).
+            if (ReadRunStats::g_store_footprint) [[unlikely]] {
+                if (!footprint_following) {
+                    footprint_shadow.Start(gpu_modified_ranges);
+                    gpu_modified_ranges.SetFollower(&footprint_shadow);
+                    footprint_following = true;
+                }
+                NoteBindFootprint(ssbo_index, binding, write_extent, extra, block, grid,
+                                  read_pointer());
             }
             if (census != 0 || cbuf_mode != 0) [[unlikely]] {
                 // Every native written binding (the census ranks them by read-back waits too)
@@ -2524,6 +2545,137 @@ std::optional<u64> BufferCache<P>::ResolveCbufExtent(const Shader::StorageCbufEx
         Shader::ResolveStorageCbufExtent(extent, block, grid, values, guard_values);
     outcome = bytes ? CbufOutcome::Resolved : CbufOutcome::Unresolved;
     return bytes;
+}
+
+template <class P>
+void BufferCache<P>::NoteBindFootprint(size_t ssbo_index, const Binding& binding,
+                                       const Shader::StorageWriteExtent& write_extent,
+                                       const Shader::StorageWriteExtra* extra,
+                                       const std::array<u32, 3>& block,
+                                       const std::optional<std::array<u32, 3>>& grid,
+                                       GPUVAddr pointer) {
+    namespace Live = StoreFootprintLive;
+    Live::Stats& stats = Live::GetStats();
+    if (binding.segment_count != 0 || binding.size == 0) {
+        Live::Bump(stats.bind_none);
+        return;
+    }
+    static constexpr Shader::StorageStoreFootprint NoFootprint{};
+    const Shader::StorageStoreFootprint& recorded =
+        extra != nullptr ? extra->footprint : NoFootprint;
+    const u64 pad = pointer >= binding.gpu_addr ? pointer - binding.gpu_addr : 0;
+    const u32 binding_index = static_cast<u32>(ssbo_index);
+    u32 id = 0;
+    if (!recorded.Valid() || recorded.covers_all || recorded.PowerOfTwo()) {
+        // A power-of-two modulus holds whatever the 32-bit offsets do; none claims nothing
+        id = ReadRunStats::InternFootprint(compute_shader_hash, binding_index, recorded);
+        Live::Bump(recorded.Valid() && !recorded.covers_all ? stats.bind_full : stats.bind_none);
+    } else {
+        // Another modulus holds only while pointer + offset doesn't wrap 32 bits. Offsets made
+        // from the ids alone are below the plain store extent at these dims: then no store that
+        // lands in the binding wrapped (one below the pointer by more than the pad lands past
+        // 4 GiB - 16 MiB, outside it).
+        const std::optional<u64> plain = Shader::ResolveStorageWriteExtent(write_extent, block, grid);
+        if (recorded.ids_only && plain && pad + *plain <= (u64{1} << 32)) {
+            id = ReadRunStats::InternFootprint(compute_shader_hash, binding_index, recorded);
+            Live::Bump(stats.bind_full);
+        } else {
+            id = ReadRunStats::InternFootprint(compute_shader_hash, binding_index | 0x80000000U,
+                                               Shader::ReduceStoreFootprint(recorded));
+            Live::Bump(stats.bind_reduced);
+        }
+    }
+    footprint_dry[ssbo_index] = ReadRunStats::FootprintRef{
+        .id = id,
+        .base = binding.device_addr + pad,
+    };
+}
+
+template <class P>
+bool BufferCache<P>::FootprintAnswersRead(DAddr device_addr, u64 size, DAddr page_begin,
+                                          DAddr page_end, int live) {
+    namespace Live = StoreFootprintLive;
+    Live::Stats& stats = Live::GetStats();
+    Live::Bump(stats.asked);
+    switch (footprint_shadow.Check(device_addr, size, gpu_modified_ranges)) {
+    case Live::Answer::NotModified:
+        Live::Bump(stats.not_modified);
+        return false;
+    case Live::Answer::Unclaimed:
+        Live::Bump(stats.unclaimed);
+        return false;
+    case Live::Answer::Inside:
+        Live::Bump(stats.inside);
+        return false;
+    case Live::Answer::Outside:
+        break;
+    }
+    if (live == 2 && ++footprint_skip_count % Live::VerifyEvery == 0) {
+        // Waits as before; its bytes now are compared with the landed ones (GPU::OnCPURead)
+        std::array<u8, 64> bytes{};
+        const u32 compared = static_cast<u32>((std::min<u64>)(size, bytes.size()));
+        VideoCommon::OneFollower::BeforeEngineRead(device_addr, compared);
+        device_memory.ReadBlockUnsafe(device_addr, bytes.data(), compared);
+        Live::AddVerify(device_addr, compared, bytes.data());
+        return false;
+    }
+    // The core took this read's page traps (it keeps the pages readable until a GPU write arms
+    // them again), but the pages still hold GPU-modified bytes this read did not need: arm them
+    // now so the next read of one traps and is asked here as before.
+    read_trapped_ranges.Subtract(page_begin, page_end - page_begin);
+    ArmReadTraps(page_begin, page_end - page_begin);
+    Live::Bump(stats.rearmed, (page_end - page_begin) >> Core::DEVICE_PAGEBITS);
+    Live::Bump(stats.skipped);
+    return true;
+}
+
+template <class P>
+void BufferCache<P>::FootprintCheckLanding(const Common::RangeSet<DAddr>* cpu_written,
+                                           DAddr device_addr, const u8* data, u64 size) {
+    namespace Live = StoreFootprintLive;
+    if (!footprint_shadow.AnyClaimed(device_addr, size)) {
+        return;
+    }
+    Live::Stats& stats = Live::GetStats();
+    const u64 checked = (std::min<u64>)(size, Live::LandingCheckBytes);
+    std::array<u8, 4096> guest{};
+    u64 differed = 0;
+    u64 first_differed = 0;
+    for (u64 offset = 0; offset < checked; offset += guest.size()) {
+        const u64 chunk = (std::min<u64>)(guest.size(), checked - offset);
+        device_memory.ReadBlockUnsafe(device_addr + offset, guest.data(), chunk);
+        if (std::memcmp(guest.data(), data + offset, chunk) == 0) {
+            continue;
+        }
+        for (u64 i = 0; i < chunk; ++i) {
+            if (guest[i] == data[offset + i]) {
+                continue;
+            }
+            const DAddr address = device_addr + offset + i;
+            if (cpu_written != nullptr && cpu_written->Intersects(address, 1)) {
+                continue; // newer guest bytes: the landing leaves them
+            }
+            if (footprint_shadow.ClaimedOutside(address)) {
+                if (differed == 0) {
+                    first_differed = address;
+                }
+                ++differed;
+            }
+        }
+    }
+    Live::Bump(stats.landings_checked);
+    Live::Bump(stats.landing_bytes_checked, checked);
+    if (differed != 0) {
+        const u64 count = stats.landings_differed.fetch_add(1, std::memory_order_relaxed) + 1;
+        Live::Bump(stats.landing_bytes_differed, differed);
+        if (count <= 16) {
+            LOG_ERROR(HW_GPU,
+                      "Store footprint (FRITCHII_STORE_FOOTPRINT=2): a download landing at {:#x} "
+                      "+{:#x} would overwrite {} guest bytes outside every footprint over them, "
+                      "first at {:#x} (must be 0)",
+                      device_addr, size, differed, first_differed);
+        }
+    }
 }
 
 template <class P>
@@ -3122,6 +3274,10 @@ void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_wr
     if (LandingCheckMode() != 0) [[unlikely]] {
         LandingCheckNoteLanded(device_addr, size);
     }
+    // FRITCHII_STORE_FOOTPRINT=2: would this landing overwrite guest bytes no footprint writes?
+    if (footprint_following && StoreFootprintLive::Mode() == 2) [[unlikely]] {
+        FootprintCheckLanding(&cpu_written, device_addr, data, size);
+    }
     if (!cpu_written.Intersects(device_addr, size)) {
         device_memory.WriteBlockUnsafe(device_addr, data, size);
         return;
@@ -3681,6 +3837,13 @@ void BufferCache<P>::PopOneUnlocked(std::unique_lock<Common::SpinRecursiveMutex>
         const bool any_cpu = PendingCpuWritesIn(landing_begin, landing_end, unlocked_cpu_written);
         if (landing_snapshot != nullptr) [[unlikely]] {
             check_pieces();
+        }
+        // FRITCHII_STORE_FOOTPRINT=2: the unlocked landing's pieces, checked under the lock
+        if (footprint_following && StoreFootprintLive::Mode() == 2) [[unlikely]] {
+            for (const UnlockedPiece& piece : unlocked_pieces) {
+                FootprintCheckLanding(any_cpu ? &unlocked_cpu_written : nullptr, piece.addr,
+                                      piece.data, piece.size);
+            }
         }
         const u64 unlock_at = Common::Nx2Hitch::NowNs();
         batch.held_ns += unlock_at - held_since;
@@ -6584,9 +6747,14 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
         const u32 mark =
             is_written ? static_cast<u32>(std::min<u64>(capped_size, write_mark_limit)) : 0;
         if (mark != 0) {
+            // FRITCHII_STORE_FOOTPRINT (armed): the mark carries the binding's footprint
+            if (footprint_following) [[unlikely]] {
+                mark_footprint = footprint_dry[index];
+            }
             // Only the cap leaves writes past the mark; the native mark bounds them.
             MarkWrittenBuffer(binding.buffer_id, binding.device_addr, mark, true,
                               capped_size < size && capped_size <= write_mark_limit);
+            mark_footprint = {};
         }
 
         if constexpr (NEEDS_BIND_STORAGE_INDEX) {
@@ -7219,7 +7387,13 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
     OutdateReadDownloads(device_addr, size);
     memory_tracker.MarkRegionAsGpuModified(device_addr, size);
     MarkVertexBuffersStale(device_addr, size);
-    gpu_modified_ranges.Add(device_addr, size);
+    if (mark_footprint.id != 0) [[unlikely]] {
+        // FRITCHII_STORE_FOOTPRINT: who made these bytes GPU-modified (the shadow first)
+        footprint_shadow.AddClaimed(mark_footprint.id, mark_footprint.base, device_addr, size);
+        gpu_modified_ranges.Add(device_addr, size, true);
+    } else {
+        gpu_modified_ranges.Add(device_addr, size);
+    }
     const bool ampere = Tegra::g_nx2_ampere.load(std::memory_order_relaxed);
     if (ampere) {
         // Before QueueFenceDownload arms read traps: guest reads skip the buffer cache's lock on
@@ -7331,6 +7505,7 @@ bool BufferCache<P>::MarkWrittenAhead(BufferId buffer_id, DAddr device_addr, u32
         .size = size,
         .capped = capped,
         .ampere = ampere,
+        .footprint = mark_footprint,
     });
     ahead_ranges.Add(device_addr, size);
     AheadBump(ahead_stats.pushed);
@@ -7374,7 +7549,14 @@ void BufferCache<P>::PromoteAheadSlow(bool by_back) {
         // e again (the block comment above): THREAD 0 has the bit set after anything before the
         // write in stream order.
         memory_tracker.MarkRegionAsGpuModified(write.addr, write.size);
-        gpu_modified_ranges.Add(write.addr, write.size);
+        if (write.footprint.id != 0) [[unlikely]] {
+            // FRITCHII_STORE_FOOTPRINT: who made these bytes GPU-modified (the shadow first)
+            footprint_shadow.AddClaimed(write.footprint.id, write.footprint.base, write.addr,
+                                        write.size);
+            gpu_modified_ranges.Add(write.addr, write.size, true);
+        } else {
+            gpu_modified_ranges.Add(write.addr, write.size);
+        }
         // h ran at the fill, before this arms the read traps.
         QueueFenceDownload(write.addr, write.size);
         if (write.ampere) {

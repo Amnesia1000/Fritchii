@@ -438,3 +438,24 @@ TEST_CASE("A record stride that is not a power of two keeps its residues",
     CHECK(Shader::StoreFootprintHits(footprint, 0x330 * 5 + 0x48, 1));
     CHECK(Shader::StoreFootprintHits(footprint, -0x330 + 0x40, 4));
 }
+
+TEST_CASE("A footprint reduces to its modulus' power-of-two part", "[shader][storage_extent]") {
+    // 0x110-byte records, stores at +0x80..+0x8b and +0x108..+0x10b: modulo 0x10 they cover
+    // +0x0..+0xb, so a read at +0x10 (residue 0) is inside and +0xc is still outside
+    const std::array<Shader::StoreCongruence, 2> stores{{
+        {.c = 0x80, .m = 0x110, .size = 12},
+        {.c = 0x108, .m = 0x110, .size = 4},
+    }};
+    const Shader::StorageStoreFootprint footprint{
+        Shader::MakeStoreFootprint(stores.data(), stores.size(), true)};
+    REQUIRE(footprint.modulus == 0x110);
+    const Shader::StorageStoreFootprint reduced{Shader::ReduceStoreFootprint(footprint)};
+    REQUIRE(reduced.Valid());
+    CHECK(reduced.modulus == 0x10);
+    CHECK(reduced.PowerOfTwo());
+    REQUIRE(reduced.num_intervals == 1);
+    CHECK(reduced.intervals[0].begin == 0);
+    CHECK(reduced.intervals[0].end == 0xc);
+    CHECK(Shader::StoreFootprintHits(reduced, 0x110 * 3 + 0x10, 4));
+    CHECK_FALSE(Shader::StoreFootprintHits(reduced, 0x10c, 4));
+}
