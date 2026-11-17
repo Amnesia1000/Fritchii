@@ -349,6 +349,9 @@ inline std::atomic<int> g_hosttiming_priority{-1};
 inline std::atomic<int> g_gpu_priority{-1};
 /// FRITCHII_THREAD_QOS (live, default 0): docs/fritchii/switches.md (fritchii_focus.h).
 inline std::atomic<int> g_thread_qos{-1};
+/// FRITCHII_GPU_SIBLINGS_FREE (live, default 0): docs/fritchii/switches.md (common/thread.cpp,
+/// KeepOffGpuCores).
+inline std::atomic<int> g_gpu_siblings_free{-1};
 /// FRITCHII_FOCUS_GRAB (live, default 0): docs/fritchii/switches.md (fritchii_focus.h).
 inline std::atomic<int> g_focus_grab{-1};
 /// FRITCHII_ONEF_RAISE_AFTER_LEND (live, default 0): docs/fritchii/switches.md.

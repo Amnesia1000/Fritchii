@@ -6,6 +6,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <chrono>
@@ -14,6 +15,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <fmt/format.h>
 
 #include "common/adpf.h"
 #include "common/error.h"
@@ -575,6 +578,26 @@ std::vector<KAFFINITY> GroupZeroMasks(LOGICAL_PROCESSOR_RELATIONSHIP relation) {
 /// Logical processors PinCurrentThread gave the GPU front and back threads.
 std::atomic<u64> pinned_gpu_mask{};
 
+/// FRITCHII_SIBLING_CENSUS: each pinned GPU role's mask and a handle to its thread (the first
+/// thread pinned to the role), for the census's per-core split.
+struct PinnedThread {
+    std::atomic<u64> mask{};
+    std::atomic<HANDLE> handle{};
+};
+std::array<PinnedThread, 4> pinned_threads{}; ///< by PinnedRole (GuestCore unused)
+
+bool SiblingCensusOn() {
+    static const bool on = [] {
+        const char* const value = std::getenv("FRITCHII_SIBLING_CENSUS");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return on;
+}
+
+/// FRITCHII_SIBLING_CENSUS: notes by thread and logical processor (group 0).
+std::array<std::array<std::atomic<u32>, 64>, static_cast<size_t>(Common::CensusThread::Count)>
+    census_notes{};
+
 Common::ThreadPinning::Topology ReadPinningTopology() {
     Common::ThreadPinning::Topology topology;
     DWORD length = 0;
@@ -831,6 +854,15 @@ void PinCurrentThread(PinnedRole role, int guest_core) {
             LOG_WARNING(Common, "Could not pin thread: {}", GetLastErrorMsg());
         } else if (role != PinnedRole::GuestCore) {
             pinned_gpu_mask.fetch_or(mask, std::memory_order_relaxed);
+            // FRITCHII_SIBLING_CENSUS: the role's thread CPU time, read by the Pulse thread.
+            PinnedThread& pinned = pinned_threads[static_cast<size_t>(role)];
+            HANDLE handle{};
+            if (SiblingCensusOn() && pinned.handle.load(std::memory_order_relaxed) == nullptr &&
+                DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
+                                &handle, THREAD_QUERY_LIMITED_INFORMATION, FALSE, 0)) {
+                pinned.mask.store(mask, std::memory_order_relaxed);
+                pinned.handle.store(handle, std::memory_order_release);
+            }
         }
     }
 #else
@@ -881,6 +913,200 @@ void SetCurrentThreadCpuMask(u64 mask) {
     SetThreadAffinityMask(GetCurrentThread(), static_cast<DWORD_PTR>(mask));
 #else
     static_cast<void>(mask);
+#endif
+}
+
+void NoteCensusCpu(CensusThread who) {
+#ifdef _WIN32
+    if (!SiblingCensusOn()) {
+        return;
+    }
+    PROCESSOR_NUMBER processor{};
+    GetCurrentProcessorNumberEx(&processor);
+    if (processor.Group == 0 && processor.Number < 64) {
+        census_notes[static_cast<size_t>(who)][processor.Number].fetch_add(
+            1, std::memory_order_relaxed);
+    }
+#else
+    static_cast<void>(who);
+#endif
+}
+
+void KeepOffGpuCores(int& applied) {
+#if defined(_WIN32) && defined(ARCHITECTURE_x86_64)
+    const int wanted = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_gpu_siblings_free,
+                                                        "FRITCHII_GPU_SIBLINGS_FREE") != 0
+                           ? 1
+                           : 0;
+    if (wanted == applied) [[likely]] {
+        return;
+    }
+    if (wanted != 0) {
+        // Nothing pinned yet (the GPU threads pin as they start): look again next time.
+        const u64 mask = BackgroundWorkCpuMask();
+        if (mask == 0) {
+            return;
+        }
+        SetCurrentThreadCpuMask(mask);
+    } else {
+        SetCurrentThreadCpuMask(0);
+    }
+    applied = wanted;
+#else
+    static_cast<void>(applied);
+#endif
+}
+
+std::string GpuCoreCensusText() {
+#ifdef _WIN32
+    if (!SiblingCensusOn()) {
+        return {};
+    }
+    // Per logical processor busy time (kernel - idle + user, 100 ns units; kernel holds idle,
+    // DPCs and interrupts) from NtQuerySystemInformation(SystemProcessorPerformanceInformation).
+    struct ProcessorTimes {
+        LARGE_INTEGER idle;
+        LARGE_INTEGER kernel;
+        LARGE_INTEGER user;
+        LARGE_INTEGER reserved[2];
+        ULONG interrupts;
+    };
+    using QueryFn = LONG(WINAPI*)(ULONG, PVOID, ULONG, PULONG);
+    static const auto query = reinterpret_cast<QueryFn>(reinterpret_cast<void*>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation")));
+    if (query == nullptr) {
+        return {};
+    }
+    constexpr ULONG SystemProcessorPerformanceInformation = 8;
+    std::array<ProcessorTimes, 64> times{};
+    ULONG length = 0;
+    if (query(SystemProcessorPerformanceInformation, times.data(),
+              static_cast<ULONG>(sizeof(times)), &length) < 0) {
+        return {};
+    }
+    const size_t processors = (std::min<size_t>)(length / sizeof(ProcessorTimes), times.size());
+    // The physical core around each role's mask (R's mask is one logical processor of its core).
+    static const std::vector<KAFFINITY> cores = GroupZeroMasks(RelationProcessorCore);
+    const auto core_of = [&](u64 mask) {
+        u64 core = 0;
+        for (const KAFFINITY c : cores) {
+            if ((static_cast<u64>(c) & mask) != 0) {
+                core |= static_cast<u64>(c);
+            }
+        }
+        return core;
+    };
+    const auto thread_cpu_100ns = [](HANDLE handle) -> u64 {
+        FILETIME created{}, exited{}, kernel{}, user{};
+        if (handle == nullptr || !GetThreadTimes(handle, &created, &exited, &kernel, &user)) {
+            return 0;
+        }
+        const auto value = [](const FILETIME& t) {
+            return (static_cast<u64>(t.dwHighDateTime) << 32) | t.dwLowDateTime;
+        };
+        return value(kernel) + value(user);
+    };
+
+    struct Last {
+        u64 ns{};
+        std::array<u64, 64> busy{};
+        std::array<u64, 4> thread_cpu{};
+        std::array<std::array<u32, 64>, static_cast<size_t>(CensusThread::Count)> notes{};
+    };
+    static Last last;
+    const u64 now_ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                            std::chrono::steady_clock::now().time_since_epoch())
+                                            .count());
+    std::array<u64, 64> busy{};
+    for (size_t i = 0; i < processors; ++i) {
+        busy[i] = static_cast<u64>(times[i].kernel.QuadPart - times[i].idle.QuadPart +
+                                   times[i].user.QuadPart);
+    }
+    std::array<u64, 4> thread_cpu{};
+    for (size_t role = 0; role < pinned_threads.size(); ++role) {
+        thread_cpu[role] = thread_cpu_100ns(pinned_threads[role].handle.load(std::memory_order_acquire));
+    }
+    std::array<std::array<u32, 64>, static_cast<size_t>(CensusThread::Count)> notes{};
+    for (size_t who = 0; who < notes.size(); ++who) {
+        for (size_t i = 0; i < 64; ++i) {
+            notes[who][i] = census_notes[who][i].load(std::memory_order_relaxed);
+        }
+    }
+    const bool first = last.ns == 0;
+    const double span_ms = static_cast<double>(now_ns - last.ns) / 1e6;
+    std::string text;
+    if (!first && span_ms > 0.0) {
+        // ms of CPU per second of wall time.
+        const auto per_s = [&](u64 delta_100ns) {
+            return static_cast<double>(delta_100ns) / 1e4 / span_ms * 1000.0;
+        };
+        static constexpr std::array<const char*, 4> role_names{"front", "back", "", "R"};
+        static constexpr std::array<const char*, 4> thread_names{"GPU", "GPUBack", "",
+                                                                 "GPURender/GPUMem"};
+        static constexpr std::array<const char*, static_cast<size_t>(CensusThread::Count)>
+            who_names{"VulkanWorker", "GPUFencingThread", "VulkanPresent"};
+        text = "; GPU cores (FRITCHII_SIBLING_CENSUS):";
+        std::array<u64, 4> role_core{};
+        for (size_t role = 0; role < pinned_threads.size(); ++role) {
+            const u64 mask = pinned_threads[role].mask.load(std::memory_order_relaxed);
+            if (role == static_cast<size_t>(PinnedRole::GuestCore) || mask == 0) {
+                continue;
+            }
+            const u64 core = core_of(mask);
+            role_core[role] = core;
+            u64 core_busy = 0;
+            for (size_t i = 0; i < processors; ++i) {
+                if ((core >> i) & 1) {
+                    core_busy += busy[i] - last.busy[i];
+                }
+            }
+            const u64 own = thread_cpu[role] - last.thread_cpu[role];
+            text += fmt::format(" {} core {:#x} busy {:.0f}, {} {:.0f}, others {:.0f} ms/s;",
+                                role_names[role], core, per_s(core_busy), thread_names[role],
+                                per_s(own), per_s(core_busy > own ? core_busy - own : 0));
+        }
+        // Where the noted threads ran: their notes on each role's core, of all their notes.
+        for (size_t who = 0; who < notes.size(); ++who) {
+            u64 all = 0;
+            std::array<u64, 4> on_role{};
+            for (size_t i = 0; i < 64; ++i) {
+                const u64 delta = notes[who][i] - last.notes[who][i];
+                all += delta;
+                for (size_t role = 0; role < role_core.size(); ++role) {
+                    if ((role_core[role] >> i) & 1) {
+                        on_role[role] += delta;
+                    }
+                }
+            }
+            if (all == 0) {
+                continue;
+            }
+            const auto share = [&](PinnedRole role) {
+                return 100.0 * static_cast<double>(on_role[static_cast<size_t>(role)]) /
+                       static_cast<double>(all);
+            };
+            text += fmt::format(" {} {:.0f}/s on front/back/R cores {:.0f}/{:.0f}/{:.0f}%;",
+                                who_names[who], static_cast<double>(all) * 1000.0 / span_ms,
+                                share(PinnedRole::GpuFront), share(PinnedRole::GpuBack),
+                                share(PinnedRole::GpuMem));
+        }
+        text += fmt::format(" FRITCHII_GPU_SIBLINGS_FREE={}",
+#ifdef ARCHITECTURE_x86_64
+                            VideoCore::Nx2Debug::SwitchValue(
+                                VideoCore::Nx2Debug::g_gpu_siblings_free,
+                                "FRITCHII_GPU_SIBLINGS_FREE")
+#else
+                            0
+#endif
+        );
+    }
+    last.ns = now_ns;
+    last.busy = busy;
+    last.thread_cpu = thread_cpu;
+    last.notes = notes;
+    return text;
+#else
+    return {};
 #endif
 }
 

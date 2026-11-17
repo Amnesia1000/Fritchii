@@ -495,7 +495,10 @@ private:
             pending_flushes.pop_front();
             pending_query_pops.pop_front();
         };
+        int siblings_free_applied = 0; ///< FRITCHII_GPU_SIBLINGS_FREE as this thread applied it
         while (!stop_token.stop_requested()) {
+            // FRITCHII_GPU_SIBLINGS_FREE (live): off the GPU threads' cores before the wait.
+            Common::KeepOffGpuCores(siblings_free_applied);
             {
                 std::unique_lock lock(guard);
                 // Work the GPU thread runs inline (FoldStubbedFence) goes before any fence
@@ -513,6 +516,8 @@ private:
                 take_front();
                 fence_thread_busy = true;
             }
+            // FRITCHII_SIBLING_CENSUS (dry): where this thread woke up to work.
+            Common::NoteCensusCpu(Common::CensusThread::Fencing);
             if (!batch.front().fence->IsStubbed()) {
                 // The host GPU reaching the fence's submission.
                 Common::Nx2Timeline::Span wait_span{"fence: wait for fence"};

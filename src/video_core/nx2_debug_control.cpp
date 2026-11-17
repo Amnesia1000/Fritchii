@@ -625,6 +625,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_THREAD_QOS") {
         return &g_thread_qos;
     }
+    if (name == "FRITCHII_GPU_SIBLINGS_FREE") {
+        return &g_gpu_siblings_free;
+    }
     if (name == "FRITCHII_FOCUS_GRAB") {
         return &g_focus_grab;
     }
