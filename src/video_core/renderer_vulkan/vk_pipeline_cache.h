@@ -347,8 +347,34 @@ private:
     /// EDEN_NX2_ASYNC_DISCARD=2 only into recurring render targets). The one test BuiltPipeline
     /// and the translate queue both ask, answered once per lookup.
     [[nodiscard]] bool DrawMayBeSkipped() const;
-    /// FRITCHII_ASYNC_REDRAWN when unset: 1 on AMD's Windows driver, else 0.
+    /// FRITCHII_ASYNC_REDRAWN when unset: 1 on AMD's and Intel's Windows drivers, else 0.
     [[nodiscard]] int AsyncRedrawnDefault() const;
+    /// FRITCHII_ASYNC_REDRAWN_DEPTH (boot): depth pre-pass draws into redrawn targets count as
+    /// recurring too. 1 by default on Intel's Windows driver.
+    [[nodiscard]] int AsyncRedrawnDepthMode() const;
+    /// FRITCHII_PIPELINE_WAIT_BUDGET (boot): ms a frame that depth-tested draws may wait for
+    /// unbuilt pipelines together before they are skipped. 50 by default on Intel's Windows
+    /// driver, 0 (off) elsewhere.
+    [[nodiscard]] std::chrono::milliseconds PipelineWaitBudget() const;
+    /// FRITCHII_PIPELINE_WAIT_BUDGET: whether a draw DrawMayBeSkipped keeps waiting for `pipeline`
+    /// is skipped instead (after waiting what is left of the frame's budget). GPU thread.
+    [[nodiscard]] bool WaitBudgetSkips(const GraphicsPipeline& pipeline) const;
+    struct WaitBudgetState {
+        u64 frame{~u64{0}};
+        std::chrono::nanoseconds used{};
+        /// Pipelines whose budget wait ran out: skipped at once until built (cleared every 10 s;
+        /// a stale address costs at most a skip of an unbuilt pipeline, never a wrong draw).
+        std::unordered_set<const GraphicsPipeline*> timed_out;
+        /// 10 s counts: built within the wait, skipped by class of target (index:
+        /// DrawTargetClass), of them at once (already timed out or budget spent)
+        u32 waited_built{};
+        std::array<u32, 3> skipped{};
+        u32 skipped_at_once{};
+        std::chrono::nanoseconds wait_time{};
+        std::chrono::nanoseconds longest_frame{};
+        u32 listed{};
+    };
+    mutable WaitBudgetState wait_budget;
     /// FRITCHII_ASYNC_REDRAWN's value: set live or in the environment, else AsyncRedrawnDefault
     /// or async_redrawn_auto.
     [[nodiscard]] bool AsyncRedrawnOn() const;
@@ -361,6 +387,8 @@ private:
     struct DiscardDecision {
         u64 serial{~u64{0}};
         bool skip{};
+        /// The draw's targets as DrawMayBeSkipped classified them (FRITCHII_PIPELINE_WAIT_BUDGET)
+        VideoCommon::DrawTargets targets{};
     };
     mutable DiscardDecision discard_decision;
     /// Counts one decision for the 10 s line, and lists a persistent target the first time a
@@ -377,6 +405,8 @@ private:
         /// Skipped lookups FRITCHII_ASYNC_REDRAWN let through (counted in skipped's persistent
         /// column too; every lookup, repeats included)
         u32 skipped_redrawn{};
+        /// Of them, depth pre-pass draws (FRITCHII_ASYNC_REDRAWN_DEPTH)
+        u32 skipped_redrawn_depth{};
         /// GPU thread time in the translate queue's capped Wait for a draw that waits
         std::chrono::steady_clock::duration queue_wait{};
         std::chrono::nanoseconds held_at_window{}; ///< GraphicsPipeline::HoldTimeTotal then

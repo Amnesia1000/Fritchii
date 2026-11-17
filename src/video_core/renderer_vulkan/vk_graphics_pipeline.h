@@ -490,6 +490,12 @@ public:
         return build->IsBuilt();
     }
 
+    /// FRITCHII_PIPELINE_WAIT_BUDGET: waits at most `timeout` for the build (never building it
+    /// on the calling thread). True once built.
+    [[nodiscard]] bool WaitBuiltFor(std::chrono::nanoseconds timeout) const {
+        return build->WaitFor(timeout);
+    }
+
     /// The programs' shader info, by stage (EDEN_NX2_FASTDRAW_COUNT reads the handle words).
     [[nodiscard]] const std::array<Shader::Info, NUM_STAGES>& StageInfos() const noexcept {
         return stage_infos;

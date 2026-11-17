@@ -1689,8 +1689,23 @@ int ReadSwitch(const char* name) {
 // rest in file order (recorded pipelines, then predicted ones). The file carries no hit counts:
 // recorded pipelines already come first in it (build_precompiled.py). An Arc B580 prepared only
 // the first 4,732 of 120,461 records in a session (2026-11-16).
-int PrepOrderMode() {
-    static const int mode = ReadSwitch("FRITCHII_PREP_ORDER");
+// 1 by default on Intel's Windows driver (helper CZ): there the preparation runs only on the
+// Preparing shaders screen (~18 a second on a 6-core CPU), so what it covers first is what play
+// hits; FRITCHII_PREP_ORDER=0 keeps the file's order there too.
+int PrepOrderMode(const Device& device) {
+    static const int mode = [&device] {
+        const char* value = std::getenv("FRITCHII_PREP_ORDER");
+        if (value != nullptr && *value != '\0') {
+            return std::atoi(value);
+        }
+        const bool intel = device.GetDriverID() == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS;
+        if (intel) {
+            LOG_INFO(Render_Vulkan, "FRITCHII_PREP_ORDER=1 by default on Intel's driver: the "
+                                    "shader preparation takes recently used pipelines first "
+                                    "(FRITCHII_PREP_ORDER=0 keeps the file's order)");
+        }
+        return intel ? 1 : 0;
+    }();
     return mode;
 }
 
@@ -5164,7 +5179,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     std::vector<u64> record_offsets;
     // FRITCHII_PREP_ORDER: each record's rank (lower first): the used list's age, then the disk
     // cache, compute, the rest.
-    const int order_mode = PrepOrderMode();
+    const int order_mode = PrepOrderMode(device);
     constexpr u8 RankDisk = 32;
     constexpr u8 RankCompute = 33;
     constexpr u8 RankRest = 34;
@@ -7447,8 +7462,81 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const
     const bool discard = DrawMayBeSkipped();
     if (discard) {
         NoteSkippedLookup();
+        return nullptr;
     }
-    return discard ? nullptr : pipeline;
+    if (WaitBudgetSkips(*pipeline)) {
+        // LastLookupSkipped: the draw is skipped for an unbuilt pipeline, as above.
+        discard_decision.skip = true;
+        NoteSkippedLookup();
+        return nullptr;
+    }
+    return pipeline;
+}
+
+bool PipelineCache::WaitBudgetSkips(const GraphicsPipeline& pipeline) const {
+    // FRITCHII_PIPELINE_WAIT_BUDGET (helper CZ, tester log t0815): a draw EDEN_NX2_ASYNC_DISCARD=2
+    // keeps waiting for its unbuilt pipeline (first-time or persistent target) waits here, on
+    // the GPU thread, at most what is left of the frame's budget; built by then, it draws as
+    // before, else it is skipped until the pipeline is built (the build goes on). On an Arc B580
+    // a new pipeline took ~1 s of Intel's compiler and one ~11 s, and the frame held all of it:
+    // two freezes of 11-13 s, 54 waits into a 1280x720 depth target and new targets. Driver
+    // cache hits (a few ms) still make it into their frame.
+    //   Waits as before: draws without a depth test (text, UI, chat bubbles, full-screen passes,
+    // layers drawn once without depth), draws counting samples for a query, and every draw with
+    // EDEN_NX2_ASYNC_DISCARD=0. A depth-tested draw into a layer the game renders once (a probe)
+    // can be missing from it for good; the first 16 such targets are listed.
+    const auto budget = PipelineWaitBudget();
+    if (budget.count() == 0 || AsyncDiscardMode() == 0) {
+        return false;
+    }
+    const auto& regs = maxwell3d->regs;
+    if (regs.zeta_enable == 0 || regs.depth_test_enable == 0 || regs.zpass_pixel_count_enable != 0) {
+        return false;
+    }
+    auto& state = wait_budget;
+    if (state.frame != frame_count) {
+        state.frame = frame_count;
+        state.used = {};
+    }
+    const auto& targets = discard_decision.targets;
+    const size_t kind = static_cast<size_t>(targets.kind);
+    const auto skip = [&](bool at_once) {
+        ++state.skipped[kind];
+        if (at_once) {
+            ++state.skipped_at_once;
+        }
+        if (targets.kind == VideoCommon::DrawTargetClass::Persistent && state.listed < 16 &&
+            !at_once) {
+            ++state.listed;
+            LOG_INFO(Render_Vulkan,
+                     "Wait budget: draw into persistent target {:#x} {}x{} {} skipped for its "
+                     "pipeline {:016x} (FRITCHII_PIPELINE_WAIT_BUDGET; {} of 16 listed)",
+                     targets.gpu_addr, targets.width, targets.height, targets.format,
+                     graphics_key.Hash(), state.listed);
+        }
+        return true;
+    };
+    if (state.timed_out.contains(&pipeline)) {
+        return skip(true);
+    }
+    const auto left = std::chrono::duration_cast<std::chrono::nanoseconds>(budget) - state.used;
+    if (left.count() <= 0) {
+        state.timed_out.insert(&pipeline);
+        return skip(true);
+    }
+    const auto begin = std::chrono::steady_clock::now();
+    const bool built = pipeline.WaitBuiltFor(left);
+    const auto waited = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - begin);
+    state.used += waited;
+    state.wait_time += waited;
+    state.longest_frame = (std::max)(state.longest_frame, state.used);
+    if (built) {
+        ++state.waited_built;
+        return false;
+    }
+    state.timed_out.insert(&pipeline);
+    return skip(false);
 }
 
 int AsyncDiscardMode() {
@@ -7491,6 +7579,14 @@ bool IsDepthTestedColorDraw(const Maxwell& regs) noexcept {
     }
     return false;
 }
+
+/// FRITCHII_ASYNC_REDRAWN_DEPTH: a depth pre-pass draw (depth test and depth write on, no colour
+/// target written, not counting samples for a query).
+bool IsDepthOnlyPrepassDraw(const Maxwell& regs) noexcept {
+    return regs.zeta_enable != 0 && regs.depth_test_enable != 0 &&
+           regs.depth_write_enabled != 0 && regs.zpass_pixel_count_enable == 0 &&
+           !IsDepthTestedColorDraw(regs);
+}
 } // Anonymous namespace
 
 bool PipelineCache::AsyncRedrawnOn() const {
@@ -7519,16 +7615,58 @@ bool PipelineCache::AsyncRedrawnOn() const {
 }
 
 int PipelineCache::AsyncRedrawnDefault() const {
-    // FRITCHII_ASYNC_REDRAWN's value when unset: 1 on AMD's Windows driver (see DrawMayBeSkipped).
+    // FRITCHII_ASYNC_REDRAWN's value when unset: 1 on AMD's and Intel's Windows drivers (see
+    // DrawMayBeSkipped). Intel's compiler is the slowest: an Arc B580 (101.9150) held 11.9 s and
+    // 11.2 s of draws for runtime pipelines, one of them ~11 s alone (tester log t0815).
     static const int value = [this] {
         const bool amd = device.GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY;
-        if (amd && std::getenv("FRITCHII_ASYNC_REDRAWN") == nullptr) {
-            LOG_INFO(Render_Vulkan, "FRITCHII_ASYNC_REDRAWN=1 by default on AMD's driver: new "
+        const bool intel = device.GetDriverID() == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS;
+        if ((amd || intel) && std::getenv("FRITCHII_ASYNC_REDRAWN") == nullptr) {
+            LOG_INFO(Render_Vulkan, "FRITCHII_ASYNC_REDRAWN=1 by default on {}'s driver: new "
                                     "objects drawn into the scene skip a frame or more while "
                                     "their pipeline compiles instead of freezing the game "
-                                    "(FRITCHII_ASYNC_REDRAWN=0 waits)");
+                                    "(FRITCHII_ASYNC_REDRAWN=0 waits)",
+                     amd ? "AMD" : "Intel");
         }
-        return amd ? 1 : 0;
+        return amd || intel ? 1 : 0;
+    }();
+    return value;
+}
+
+int PipelineCache::AsyncRedrawnDepthMode() const {
+    // FRITCHII_ASYNC_REDRAWN_DEPTH (boot): 1 = with FRITCHII_ASYNC_REDRAWN on, depth-tested draws
+    // that write no colour (a depth pre-pass) into targets redrawn every frame count as recurring
+    // too. Default 1 on Intel's Windows driver, 0 elsewhere. A skipped one is missing from the
+    // depth for a frame or more; a colour pass that tests against it then draws the object late
+    // too (pop-in), never wrong. Shadow maps and layers drawn once are never redrawn targets.
+    static const int value = [this] {
+        const char* env = std::getenv("FRITCHII_ASYNC_REDRAWN_DEPTH");
+        if (env != nullptr && *env != '\0') {
+            return std::atoi(env);
+        }
+        return device.GetDriverID() == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS ? 1 : 0;
+    }();
+    return value;
+}
+
+std::chrono::milliseconds PipelineCache::PipelineWaitBudget() const {
+    // FRITCHII_PIPELINE_WAIT_BUDGET (boot, ms): see BuiltPipeline. Default 50 on Intel's Windows
+    // driver, 0 (off) elsewhere.
+    static const std::chrono::milliseconds value = [this] {
+        const char* env = std::getenv("FRITCHII_PIPELINE_WAIT_BUDGET");
+        int ms = device.GetDriverID() == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS ? 50 : 0;
+        if (env != nullptr && *env != '\0') {
+            ms = (std::max)(std::atoi(env), 0);
+        }
+        if (ms > 0) {
+            LOG_INFO(Render_Vulkan,
+                     "FRITCHII_PIPELINE_WAIT_BUDGET={}: depth-tested draws that would wait for an "
+                     "unbuilt pipeline wait at most {} ms a frame together, then are skipped until "
+                     "it is built; draws without a depth test (text, UI, full-screen passes) still "
+                     "wait",
+                     ms, ms);
+        }
+        return std::chrono::milliseconds{ms};
     }();
     return value;
 }
@@ -7572,18 +7710,30 @@ bool PipelineCache::DrawMayBeSkipped() const {
     // log t1858). The object is missing for that time instead. FRITCHII_ASYNC_REDRAWN=0 waits.
     // Also on for the session on any driver once it compiles prepared pipelines again
     // (MaybeAutoAsyncRedrawn).
+    // FRITCHII_ASYNC_REDRAWN_DEPTH (default on Intel's Windows driver): depth pre-pass draws
+    // into such targets too.
     bool redrawn = false;
+    bool redrawn_depth = false;
     if (!recurring && targets.kind_if_redrawn == VideoCommon::DrawTargetClass::Recurring &&
-        AsyncRedrawnOn() && IsDepthTestedColorDraw(maxwell3d->regs)) {
-        recurring = true;
-        redrawn = true;
+        AsyncRedrawnOn()) {
+        if (IsDepthTestedColorDraw(maxwell3d->regs)) {
+            recurring = true;
+            redrawn = true;
+        } else if (AsyncRedrawnDepthMode() > 0 && IsDepthOnlyPrepassDraw(maxwell3d->regs)) {
+            recurring = true;
+            redrawn = true;
+            redrawn_depth = true;
+        }
     }
     const bool skip = CanDiscardPendingDraw(native, maxwell3d->regs.zeta_enable != 0,
                                             draw_state.draw_element_count,
                                             draw_state.draw_element_count, mode != 0, recurring);
-    discard_decision = DiscardDecision{.serial = lookup_serial, .skip = skip};
+    discard_decision = DiscardDecision{.serial = lookup_serial, .skip = skip, .targets = targets};
     if (skip && redrawn) {
         ++discard_stats.skipped_redrawn;
+        if (redrawn_depth) {
+            ++discard_stats.skipped_redrawn_depth;
+        }
     }
     NoteDiscardDecision(skip, targets);
     return skip;
@@ -7643,8 +7793,35 @@ void PipelineCache::ReportAsyncDiscard() {
                  "{:.1f} ms of GPU thread waiting for translations",
                  AsyncDiscardMode(), skipped[0], skipped[1], skipped[2], stats.skipped_redrawn,
                  waited[0], waited[1], waited[2], ms(held), ms(stats.queue_wait));
+        if (stats.skipped_redrawn_depth != 0) {
+            LOG_INFO(Render_Vulkan,
+                     "Async discard: {} of the redrawn-target skips were depth pre-pass draws "
+                     "(FRITCHII_ASYNC_REDRAWN_DEPTH)",
+                     stats.skipped_redrawn_depth);
+        }
     }
+    auto& budget = wait_budget;
+    const u32 budget_skips = budget.skipped[0] + budget.skipped[1] + budget.skipped[2];
+    if (budget.waited_built + budget_skips != 0) {
+        const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
+        LOG_INFO(Render_Vulkan,
+                 "Wait budget in the last 10 s (FRITCHII_PIPELINE_WAIT_BUDGET={}): {} draws got "
+                 "their pipeline within the budget, {} skipped after it ({} first-time, {} "
+                 "persistent, {} recurring; {} at once: pipeline already timed out or budget "
+                 "spent); {:.1f} ms waited, most in one frame {:.1f} ms (the waited column above "
+                 "counts these lookups too)",
+                 PipelineWaitBudget().count(), budget.waited_built, budget_skips,
+                 budget.skipped[1], budget.skipped[2], budget.skipped[0], budget.skipped_at_once,
+                 ms(budget.wait_time), ms(budget.longest_frame));
+    }
+    budget.waited_built = 0;
+    budget.skipped = {};
+    budget.skipped_at_once = 0;
+    budget.wait_time = {};
+    budget.longest_frame = {};
+    budget.timed_out.clear();
     stats.skipped_redrawn = 0;
+    stats.skipped_redrawn_depth = 0;
     stats.skipped = {};
     stats.waited = {};
     stats.queue_wait = {};
