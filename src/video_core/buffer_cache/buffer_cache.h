@@ -2429,6 +2429,10 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
         normalized_copies.push_back(second_copy);
     }
     runtime.PostCopyBarrier();
+    if (LandingCheckMode() != 0) [[unlikely]] {
+        LandingCheckCommit(std::span<const BufferCopy>(normalized_copies.data(),
+                                                       normalized_copies.size()));
+    }
     pending_downloads.emplace_back(std::move(normalized_copies));
     pending_download_ranges.emplace_back(std::move(download_ranges));
     async_buffers.emplace_back(download_staging);
@@ -2497,6 +2501,9 @@ void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_wr
     }
     Core::g_buffer_write_pages.Mark(device_addr, size);
     Core::g_watch_write_pages.Mark(device_addr, size);
+    if (LandingCheckMode() != 0) [[unlikely]] {
+        LandingCheckNoteLanded(device_addr, size);
+    }
     if (!cpu_written.Intersects(device_addr, size)) {
         device_memory.WriteBlockUnsafe(device_addr, data, size);
         return;
@@ -2509,6 +2516,186 @@ void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_wr
     parts.ForEach([&](DAddr start, DAddr end) {
         device_memory.WriteBlockUnsafe(start, data + (start - device_addr), end - start);
     });
+}
+
+template <class P>
+int BufferCache<P>::LandingCheckMode() {
+    static const int mode = [] {
+        const char* const value = std::getenv("FRITCHII_LANDING_CHECK");
+        const int parsed = value != nullptr ? std::atoi(value) : 0;
+        if (parsed != 0) {
+            LOG_INFO(HW_GPU,
+                     "Landing check (FRITCHII_LANDING_CHECK={}): fence downloads compare the guest "
+                     "bytes they land over with the bytes at their commit{}",
+                     parsed, parsed == 2 ? "; bytes the guest changed since are kept" : "");
+        }
+        return parsed;
+    }();
+    return mode;
+}
+
+template <class P>
+void BufferCache<P>::LandingCheckCommit(std::span<const BufferCopy> copies) {
+    LandingSnapshot snapshot;
+    snapshot.committed_ns = Common::Nx2Hitch::NowNs();
+    {
+        std::scoped_lock lock{landing_check_mutex};
+        snapshot.landing_seq = landing_check_seq;
+    }
+    u64 total = 0;
+    snapshot.copy_offsets.reserve(copies.size());
+    for (const BufferCopy& copy : copies) {
+        snapshot.copy_offsets.push_back(total);
+        total += copy.size;
+    }
+    snapshot.bytes.resize(total);
+    for (size_t index = 0; index < copies.size(); ++index) {
+        device_memory.ReadBlockUnsafe(static_cast<DAddr>(copies[index].src_offset),
+                                      snapshot.bytes.data() + snapshot.copy_offsets[index],
+                                      copies[index].size);
+    }
+    landing_snapshots.push_back(std::move(snapshot));
+}
+
+template <class P>
+void BufferCache<P>::LandingCheckPop(bool begin) {
+    std::scoped_lock lock{landing_check_mutex};
+    if (begin) {
+        t_landing_check_pop_seq = ++landing_check_seq;
+        return;
+    }
+    t_landing_check_pop_seq = 0;
+    if (landing_check_pages.size() > 65536) {
+        // Only landings after the oldest pending commit matter (the popped snapshot is gone).
+        const u64 oldest = !landing_snapshots.empty() ? landing_snapshots.front().landing_seq
+                                                      : landing_check_seq;
+        std::erase_if(landing_check_pages, [oldest](const auto& entry) {
+            return entry.second <= oldest;
+        });
+    }
+}
+
+template <class P>
+void BufferCache<P>::LandingCheckNoteLanded(DAddr device_addr, u64 size) {
+    if (size == 0) {
+        return;
+    }
+    std::scoped_lock lock{landing_check_mutex};
+    const u64 seq =
+        t_landing_check_pop_seq != 0 ? t_landing_check_pop_seq : ++landing_check_seq;
+    for (u64 page = device_addr >> Core::DEVICE_PAGEBITS;
+         page <= (device_addr + size - 1) >> Core::DEVICE_PAGEBITS; ++page) {
+        landing_check_pages[page] = seq;
+    }
+}
+
+template <class P>
+void BufferCache<P>::LandingCheckPiece(const LandingSnapshot& snapshot, const BufferCopy& copy,
+                                       size_t index, DAddr start, u8* data, u64 size,
+                                       const Common::RangeSet<DAddr>* cpu_written) {
+    const int mode = LandingCheckMode();
+    const DAddr copy_addr = static_cast<DAddr>(copy.src_offset);
+    if (size == 0 || index >= snapshot.copy_offsets.size() || start < copy_addr ||
+        start + size > copy_addr + copy.size) {
+        return;
+    }
+    const u8* const old = snapshot.bytes.data() + snapshot.copy_offsets[index] + (start - copy_addr);
+    std::vector<u8> now(size);
+    device_memory.ReadBlockUnsafe(start, now.data(), size);
+    // Collected CPU writes: the landing leaves those bytes alone. Treated as unchanged.
+    if (cpu_written != nullptr && cpu_written->Intersects(start, size)) {
+        cpu_written->ForEachInRange(start, size, [&](DAddr lower, DAddr upper) {
+            for (DAddr address = (std::max)(lower, start); address < (std::min)(upper, start + size);
+                 ++address) {
+                now[address - start] = old[address - start];
+            }
+        });
+    }
+    u64 changed = 0;
+    u64 skipped = 0;
+    u64 first_changed = ~u64{0};
+    std::array<u8, 8> first_now{}, first_old{}, first_landing{};
+    {
+        std::scoped_lock lock{landing_check_mutex};
+        u64 i = 0;
+        while (i < size) {
+            const u64 page = (start + i) >> Core::DEVICE_PAGEBITS;
+            const u64 page_end =
+                (std::min)(size, ((page + 1) << Core::DEVICE_PAGEBITS) - start);
+            const auto it = landing_check_pages.find(page);
+            // A landing (or read download) after the commit wrote this page: its bytes changed
+            // by a download, not by the guest.
+            const bool landed_since = it != landing_check_pages.end() &&
+                                      it->second > snapshot.landing_seq &&
+                                      it->second != t_landing_check_pop_seq;
+            for (; i < page_end; ++i) {
+                if (now[i] == old[i] || now[i] == data[i]) {
+                    continue;
+                }
+                if (landed_since) {
+                    ++skipped;
+                    continue;
+                }
+                if (first_changed == ~u64{0}) {
+                    first_changed = i;
+                    for (u64 b = 0; b < 8 && i + b < size; ++b) {
+                        first_now[b] = now[i + b];
+                        first_old[b] = old[i + b];
+                        first_landing[b] = data[i + b];
+                    }
+                }
+                ++changed;
+                if (mode == 2) {
+                    data[i] = now[i]; // the landing writes the guest's own byte back
+                }
+            }
+        }
+    }
+    auto& totals = landing_check_totals;
+    ++totals.landings;
+    totals.bytes += size;
+    totals.skipped_bytes += skipped;
+    if (changed != 0) {
+        ++totals.changed_landings;
+        totals.changed_bytes += changed;
+        if (mode == 2) {
+            totals.kept_bytes += changed;
+        }
+        static std::atomic<u64> logged{};
+        if (const u64 n = logged.fetch_add(1, std::memory_order_relaxed); n < 32 || n % 1000 == 0) {
+            const auto hex = [](const std::array<u8, 8>& bytes) {
+                u64 value = 0;
+                std::memcpy(&value, bytes.data(), sizeof(value));
+                return value;
+            };
+            LOG_CRITICAL(
+                HW_GPU,
+                "Landing check: a fence download lands over bytes the guest changed since its copy "
+                "was taken (must not happen): device [{:#x}, {:#x}), {} of {} bytes changed, "
+                "first at +{:#x}: guest now {:#018x}, at the commit {:#018x}, the landing "
+                "{:#018x} (little-endian words); {:.1f} ms after the commit, {} fences pending; "
+                "{} (#{})",
+                start, start + size, changed, size, first_changed, hex(first_now), hex(first_old),
+                hex(first_landing),
+                static_cast<double>(Common::Nx2Hitch::NowNs() - snapshot.committed_ns) / 1e6,
+                pending_downloads.size(),
+                mode == 2 ? "kept the guest's bytes" : "landed anyway (FRITCHII_LANDING_CHECK=2 keeps them)",
+                n + 1);
+        }
+    }
+    const u64 now_ns = Common::Nx2Hitch::NowNs();
+    if (now_ns - totals.last_log_ns >= 10'000'000'000ULL) {
+        if (totals.last_log_ns != 0) {
+            LOG_INFO(HW_GPU,
+                     "Landing check (FRITCHII_LANDING_CHECK={}) 10 s: {} landings, {} KiB checked; "
+                     "changed by the guest since the copy: {} landings, {} bytes (must be 0; {} "
+                     "kept); {} bytes on pages a later download wrote (skipped)",
+                     mode, totals.landings, totals.bytes >> 10, totals.changed_landings,
+                     totals.changed_bytes, totals.kept_bytes, totals.skipped_bytes);
+        }
+        totals = LandingCheckTotals{};
+        totals.last_log_ns = now_ns;
+    }
 }
 
 template <class P>
@@ -2536,6 +2723,13 @@ void BufferCache<P>::PopAsyncBuffers() {
     auto& async_buffer = async_buffers.front();
     u8* base = async_buffer->mapped_span.data();
     const size_t base_offset = async_buffer->offset;
+    // FRITCHII_LANDING_CHECK: this fence's snapshot (taken at its commit).
+    const LandingSnapshot* const landing_snapshot =
+        LandingCheckMode() != 0 && !landing_snapshots.empty() ? &landing_snapshots.front()
+                                                              : nullptr;
+    if (landing_snapshot != nullptr) [[unlikely]] {
+        LandingCheckPop(true);
+    }
     // F2 counter (EDEN_NX2_DOWNLOAD_READ_STATS): the ranges this fence writes to guest memory.
     std::vector<std::pair<u64, u64>> stats_landed;
     // Landed per copy (copies within a page of each other together), each inside a
@@ -2581,6 +2775,12 @@ void BufferCache<P>::PopAsyncBuffers() {
                 if (time_parts) [[unlikely]] {
                     part_start = FenceReleaseStats::Clock::now();
                 }
+                if (landing_snapshot != nullptr) [[unlikely]] {
+                    // The staging bytes are ours (mode 2 patches the guest's changes in).
+                    LandingCheckPiece(*landing_snapshot, copy, index, start,
+                                      const_cast<u8*>(&read_mapped_memory[start - device_addr]),
+                                      end - start, &cpu_written);
+                }
                 WriteDownloadedMemory(cpu_written, start, &read_mapped_memory[start - device_addr],
                                       end - start);
                 if (time_parts) [[unlikely]] {
@@ -2603,6 +2803,10 @@ void BufferCache<P>::PopAsyncBuffers() {
     async_buffers.pop_front();
     pending_downloads.pop_front();
     pending_download_ranges.pop_front();
+    if (LandingCheckMode() != 0 && !landing_snapshots.empty()) [[unlikely]] {
+        landing_snapshots.pop_front();
+        LandingCheckPop(false);
+    }
     {
         // EXP72: in guest memory now (the copies above wrote it).
         std::scoped_lock lock{fence_landed_mutex};
@@ -2638,6 +2842,9 @@ template <class P>
 void BufferCache<P>::WriteDownloadedMemoryUnlocked(const Common::RangeSet<DAddr>* cpu_written,
                                                    DAddr device_addr, const u8* data, u64 size) {
     const Common::WriteRing::SiteScope write_site{"buffer download", true};
+    if (LandingCheckMode() != 0) [[unlikely]] {
+        LandingCheckNoteLanded(device_addr, size);
+    }
     if (cpu_written == nullptr || !cpu_written->Intersects(device_addr, size)) {
         device_memory.WriteBlockUnsafe(device_addr, data, size);
     } else {
@@ -2769,6 +2976,13 @@ void BufferCache<P>::PopOneUnlocked(std::unique_lock<Common::SpinRecursiveMutex>
     u8* base = async_buffer->mapped_span.data();
     const size_t base_offset = async_buffer->offset;
     std::vector<std::pair<u64, u64>> stats_landed;
+    // FRITCHII_LANDING_CHECK: this fence's snapshot (checked under the lock, before each copy).
+    const LandingSnapshot* const landing_snapshot =
+        LandingCheckMode() != 0 && !landing_snapshots.empty() ? &landing_snapshots.front()
+                                                              : nullptr;
+    if (landing_snapshot != nullptr) [[unlikely]] {
+        LandingCheckPop(true);
+    }
     // Below this many bytes a landing is copied under the lock as before: letting the lock go
     // and taking it back costs more than such a copy (and E may take it in between). The
     // verify mode copies every landing outside the lock.
@@ -2793,12 +3007,16 @@ void BufferCache<P>::PopOneUnlocked(std::unique_lock<Common::SpinRecursiveMutex>
         // writer that takes a range away later waits for the copy (ClearFenceDownloads).
         const Common::RangeSet<DAddr>& ranges = pending_download_ranges.front();
         unlocked_pieces.clear();
+        landing_check_piece_copies.clear();
         u64 bytes = 0;
         for (size_t index = first; index < last; ++index) {
             const auto& copy = downloads[index];
             const DAddr device_addr = static_cast<DAddr>(copy.src_offset);
             const u8* const read_mapped_memory = base + (copy.dst_offset - base_offset);
             ranges.ForEachInRange(device_addr, copy.size, [&](DAddr start, DAddr end) {
+                if (landing_snapshot != nullptr) [[unlikely]] {
+                    landing_check_piece_copies.push_back(index);
+                }
                 unlocked_pieces.push_back(
                     UnlockedPiece{start, end - start, read_mapped_memory + (start - device_addr)});
                 bytes += end - start;
@@ -2809,9 +3027,24 @@ void BufferCache<P>::PopOneUnlocked(std::unique_lock<Common::SpinRecursiveMutex>
             first = last;
             continue;
         }
+        // FRITCHII_LANDING_CHECK: each piece, once the collected CPU writes are known.
+        const auto check_pieces = [&] {
+            for (size_t piece = 0;
+                 piece < unlocked_pieces.size() && piece < landing_check_piece_copies.size();
+                 ++piece) {
+                const size_t index = landing_check_piece_copies[piece];
+                LandingCheckPiece(*landing_snapshot, downloads[index], index,
+                                  unlocked_pieces[piece].addr,
+                                  const_cast<u8*>(unlocked_pieces[piece].data),
+                                  unlocked_pieces[piece].size, &unlocked_cpu_written);
+            }
+        };
         if (bytes < UnlockedMinBytes && mode != 2) {
             const VideoCore::DownloadLanding landing{landing_begin, landing_end};
             PendingCpuWritesIn(landing_begin, landing_end, unlocked_cpu_written);
+            if (landing_snapshot != nullptr) [[unlikely]] {
+                check_pieces();
+            }
             for (const UnlockedPiece& piece : unlocked_pieces) {
                 WriteDownloadedMemory(unlocked_cpu_written, piece.addr, piece.data, piece.size);
                 gpu_modified_ranges.Subtract(piece.addr, piece.size);
@@ -2828,6 +3061,9 @@ void BufferCache<P>::PopOneUnlocked(std::unique_lock<Common::SpinRecursiveMutex>
         // ended, which is after the copy.
         VideoCore::DownloadLanding::PublishUnlocked(landing_begin, landing_end);
         const bool any_cpu = PendingCpuWritesIn(landing_begin, landing_end, unlocked_cpu_written);
+        if (landing_snapshot != nullptr) [[unlikely]] {
+            check_pieces();
+        }
         const u64 unlock_at = Common::Nx2Hitch::NowNs();
         batch.held_ns += unlock_at - held_since;
         lock.unlock();
@@ -2871,6 +3107,10 @@ void BufferCache<P>::PopOneUnlocked(std::unique_lock<Common::SpinRecursiveMutex>
     pending_downloads.pop_front();
     unlocked_trash_ranges.emplace_back(std::move(pending_download_ranges.front()));
     pending_download_ranges.pop_front();
+    if (LandingCheckMode() != 0 && !landing_snapshots.empty()) [[unlikely]] {
+        landing_snapshots.pop_front();
+        LandingCheckPop(false);
+    }
     {
         // EXP72: in guest memory now (the copies above wrote it).
         std::scoped_lock landed_lock{fence_landed_mutex};

@@ -38,6 +38,7 @@
 #include "common/memory_detect.h"
 #include "shader_recompiler/exception.h"
 #include "common/logging.h"
+#include "common/nx2_hitch.h"
 #include "common/nx2_uniform_keep_pages.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -4141,8 +4142,49 @@ void RasterizerVulkan::OneFollowerPostFence(u8 kind, u32 value,
         query_cache.WritePayloadNow(note->device, note->gpu_addr, note->payload,
                                     note->has_timestamp, true);
     }
+    // FRITCHII_ONEF_SEM_E_LANDED (Damage's Jabu-Jabu freezes, 2026-11-17): the host increment
+    // ends the game's wait on the sync point, and the game may then free and reuse memory the
+    // fence's downloads still land in (R's fence release, later): an old landing over the game's
+    // new objects. 1: the increment moves to R's fence (after its landings) while committed
+    // buffer downloads are pending; 2: always (as with FRITCHII_ONEF_SEM_E=0, the guest increment
+    // stays on E). 0 (default): on E as before.
+    bool host_on_r = false;
     if (kind == 3) {
-        fence_manager.OneFollowerSyncPointHost(value);
+        static const int landed_mode = [] {
+            const char* const switch_value = std::getenv("FRITCHII_ONEF_SEM_E_LANDED");
+            return switch_value != nullptr ? std::atoi(switch_value) : 0;
+        }();
+        if (landed_mode >= 2) {
+            host_on_r = true;
+        } else if (landed_mode == 1) {
+            if (committed) {
+                host_on_r = true;
+            } else {
+                std::scoped_lock lock{buffer_cache.mutex};
+                host_on_r = buffer_cache.HasPendingDownloads();
+            }
+        }
+        if (landed_mode != 0) {
+            static std::atomic<u64> on_e{};
+            static std::atomic<u64> on_r{};
+            static std::atomic<u64> last_log_ns{};
+            (host_on_r ? on_r : on_e).fetch_add(1, std::memory_order_relaxed);
+            const u64 now_ns = Common::Nx2Hitch::NowNs();
+            u64 last = last_log_ns.load(std::memory_order_relaxed);
+            if (now_ns - last >= 10'000'000'000ULL &&
+                last_log_ns.compare_exchange_strong(last, now_ns, std::memory_order_relaxed)) {
+                if (last != 0) {
+                    LOG_INFO(Render_Vulkan,
+                             "Sync point increments (FRITCHII_ONEF_SEM_E_LANDED={}) 10 s: {} on E, "
+                             "{} moved to R's fence (downloads still to land)",
+                             landed_mode, on_e.exchange(0, std::memory_order_relaxed),
+                             on_r.exchange(0, std::memory_order_relaxed));
+                }
+            }
+        }
+        if (!host_on_r) {
+            fence_manager.OneFollowerSyncPointHost(value);
+        }
     }
     // The closing gather, E's half at this place (GATHER_E's path, or lent).
     InvalidateGPUCache();
@@ -4153,9 +4195,10 @@ void RasterizerVulkan::OneFollowerPostFence(u8 kind, u32 value,
         u8 kind;
         bool committed;
         bool note_on_r; ///< kind 5: R writes the payload (FRITCHII_ONEF_SIGNAL_ON_R)
+        bool host_on_r; ///< kind 3: R's fence runs the host increment (FRITCHII_ONEF_SEM_E_LANDED)
         OneFollowerPayloadNote note;
         OneFollowerFenceReport report;
-    } const op{this, targets, value, kind, committed, note_on_r,
+    } const op{this, targets, value, kind, committed, note_on_r, host_on_r,
                note != nullptr ? *note : OneFollowerPayloadNote{},
                report != nullptr ? *report : OneFollowerFenceReport{}};
     static_assert(sizeof(Op) <= OneF::MaxOpPayloadBytes, "a fence op over the payload limit");
@@ -4188,8 +4231,20 @@ void RasterizerVulkan::OneFollowerPostFence(u8 kind, u32 value,
             case 0:
                 self.fence_manager.SignalSyncPoint(a.value);
                 break;
-            case 1:
             case 3:
+                if (a.host_on_r) {
+                    // FRITCHII_ONEF_SEM_E_LANDED: the host increment at this fence's release,
+                    // after its downloads (and every earlier fence's) landed.
+                    auto* const fences = &self.fence_manager;
+                    const u32 syncpoint = a.value;
+                    std::function<void()> increment(
+                        [fences, syncpoint] { fences->OneFollowerSyncPointHost(syncpoint); });
+                    self.fence_manager.SignalFence(std::move(increment));
+                    break;
+                }
+                self.fence_manager.SignalReference();
+                break;
+            case 1:
             case 4:
                 // An empty callback (3, 4: E ran the increments or the callback).
                 self.fence_manager.SignalReference();
