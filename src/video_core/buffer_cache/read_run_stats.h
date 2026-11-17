@@ -72,6 +72,13 @@ inline bool ReadRunsValue(bool writer_ticks) {
     if (EarlyCompute::g_early || EarlyCompute::g_side_copy || EarlyCompute::g_submit_times) {
         return true;
     }
+    // FRITCHII_EXTENT_CBUF=3 (dry) counts its reads on the ring too ("Extent cbuf" lines).
+    if (!writer_ticks) {
+        const char* cbuf = std::getenv("FRITCHII_EXTENT_CBUF");
+        if (cbuf != nullptr && cbuf[0] == '3') {
+            return true;
+        }
+    }
     const char* value = std::getenv("FRITCHII_READ_RUNS");
     if (value == nullptr || value[0] == '\0' || value[0] == '0') {
         return false;
@@ -190,6 +197,23 @@ struct WriteMark {
     Writer writer{};
     /// FRITCHII_EARLY_COMPUTE: the writing dispatch's buffer verdict at its bind
     EarlyCompute::Verdict verdict{EarlyCompute::Verdict::NotJudged};
+    /// FRITCHII_EXTENT_CBUF=3 (dry): where the store extent proven with constant buffer words
+    /// would have ended the mark (t_proven_end), 0 when the dispatch had no such proof
+    u64 proven_end{};
+};
+
+/// FRITCHII_EXTENT_CBUF=3: set with t_writer while a dispatch's storage binding marks
+/// (BufferCache::BindHostComputeStorageBuffers), 0 otherwise.
+inline thread_local u64 t_proven_end = 0;
+
+/// FRITCHII_EXTENT_CBUF=3: a read whose newest mark over its bytes had a cbuf proof.
+enum class DryRead : u8 {
+    None,         ///< no such mark (or the read's newest mark had no proof)
+    Inside,       ///< the read's bytes touch the proven part of the mark
+    Freed,        ///< past the proof, and no older mark in the ring covers them (the proven
+                  ///< part only, for marks with a proof)
+    CoveredSame,  ///< past the proof, an older mark of the same writer still covers them
+    CoveredOther, ///< past the proof, an older mark of another writer covers them
 };
 
 /// Marks kept (the "Read writers" line says how many a frame, so how many frames this covers).
@@ -234,7 +258,8 @@ inline void NoteWrite(u64 begin, u64 size, u64 stamp = 0) {
                          .dispatch = g_dispatches.load(std::memory_order_relaxed),
                          .stamp = stamp,
                          .writer = t_writer,
-                         .verdict = EarlyCompute::t_verdict};
+                         .verdict = EarlyCompute::t_verdict,
+                         .proven_end = t_proven_end};
     const bool compute = mark.writer.kind == WriterKind::ComputeStorage ||
                          mark.writer.kind == WriterKind::ComputeTexture;
     Ring& r = GetRing();
@@ -292,6 +317,8 @@ struct WriterAnswer {
     u64 ahead_gap_ns{};
     u64 ahead_overlap_ns{};
     u64 ahead_span_ns{};
+    // FRITCHII_EXTENT_CBUF=3 (FindWriter): the read against the cbuf proof of its newest mark.
+    DryRead dry{DryRead::None};
 };
 inline thread_local WriterAnswer t_writer_answer{};
 
@@ -336,6 +363,27 @@ template <typename Ranges>
     return false;
 }
 
+/// FRITCHII_EXTENT_CBUF=3 (r.mutex held): the read [address, end) against marks[newest - i]
+/// (the newest over it, with a cbuf proof): inside its proven part, or past it and then whether
+/// an older mark in the ring still covers the bytes once every mark with a proof is cut there.
+[[nodiscard]] inline DryRead ClassifyDryRead(const Ring& r, u64 i, u64 address, u64 end) {
+    const auto effective_end = [](const WriteMark& mark) {
+        return mark.proven_end != 0 ? (std::min)(mark.end, mark.proven_end) : mark.end;
+    };
+    const WriteMark& newest = r.marks[(r.count - 1 - i) % RingSize];
+    if (newest.begin < end && address < effective_end(newest)) {
+        return DryRead::Inside;
+    }
+    const u64 n = (std::min<u64>)(r.count, RingSize);
+    for (u64 j = i + 1; j < n; ++j) {
+        const WriteMark& mark = r.marks[(r.count - 1 - j) % RingSize];
+        if (mark.begin < end && address < effective_end(mark)) {
+            return mark.writer == newest.writer ? DryRead::CoveredSame : DryRead::CoveredOther;
+        }
+    }
+    return DryRead::Freed;
+}
+
 /// GetFlushArea: the newest mark over [address, address + size), else note one on its pages.
 inline void FindWriter(u64 address, u64 size, u64 page_begin, u64 page_end) {
     WriterAnswer& a = t_writer_answer;
@@ -358,6 +406,9 @@ inline void FindWriter(u64 address, u64 size, u64 page_begin, u64 page_end) {
             a.page_only = false;
             a.mark = mark;
             a.dispatches_after = dispatches - mark.dispatch;
+            if (mark.proven_end != 0) [[unlikely]] {
+                a.dry = ClassifyDryRead(r, i, address, end);
+            }
             return;
         }
         if (!a.page_only && mark.begin < page_end && page_begin < mark.end) {
@@ -441,10 +492,24 @@ struct TickCounts {
     u64 ahead_writer_ns[3]{}; ///< those reads' "until the writer ran", to set against the above
 };
 
+/// FRITCHII_EXTENT_CBUF=3: per writer with a cbuf proof, the reads its marks sent to the back
+/// (taken by the "Extent cbuf" lines every 10 s, BufferCache::LogExtentCensus).
+struct DryStats {
+    u64 reads[5]{};   ///< [DryRead]
+    u64 wait_ns[5]{}; ///< [DryRead]
+    /// Must be 0: Freed reads whose compared bytes changed when the wait landed (the GPU did
+    /// write them: the proof would have served stale bytes).
+    u64 freed_compared{};
+    u64 freed_differed{};
+    u64 inside_compared{};
+    u64 inside_differed{};
+};
+
 struct State {
     std::mutex mutex;
     Counts counts;
     TickCounts ticks;
+    std::unordered_map<Writer, DryStats, WriterHash> dry;
     /// The "Read writer" lines: reads whose bytes a mark in the ring covers, by its writer.
     std::unordered_map<Writer, WriterStats, WriterHash> writers;
     u64 previous_page{std::numeric_limits<u64>::max()};
@@ -627,6 +692,19 @@ inline void NoteWriter(Kind kind, u64 wait_ns, const WriterAnswer& a, const u8* 
         ++(a.page_only ? c.writer_page_only : c.writer_none);
         return;
     }
+    if (a.dry != DryRead::None) [[unlikely]] {
+        DryStats& d = s.dry[a.mark.writer];
+        const size_t dry = static_cast<size_t>(a.dry);
+        ++d.reads[dry];
+        d.wait_ns[dry] += wait_ns;
+        if (a.dry == DryRead::Freed) {
+            d.freed_compared += compared ? 1 : 0;
+            d.freed_differed += differed ? 1 : 0;
+        } else if (a.dry == DryRead::Inside) {
+            d.inside_compared += compared ? 1 : 0;
+            d.inside_differed += differed ? 1 : 0;
+        }
+    }
     const size_t k = static_cast<size_t>(kind);
     ++c.writer_ages[k][age_ns < 1'000'000 ? 0 : age_ns < 1'500'000 ? 1 : 2];
     c.writer_compared += compared ? 1 : 0;
@@ -657,6 +735,15 @@ inline void NoteWriter(Kind kind, u64 wait_ns, const WriterAnswer& a, const u8* 
     w.compared += compared ? 1 : 0;
     w.differed += differed ? 1 : 0;
     w.dispatches_after += a.dispatches_after;
+}
+
+/// FRITCHII_EXTENT_CBUF=3: the per-writer dry read counts since the last call.
+[[nodiscard]] inline std::unordered_map<Writer, DryStats, WriterHash> TakeDry() {
+    State& s = Get();
+    std::scoped_lock lock{s.mutex};
+    std::unordered_map<Writer, DryStats, WriterHash> taken;
+    taken.swap(s.dry);
+    return taken;
 }
 
 /// BufferCache::TickFrame, once a frame (after advancing g_frame): drops the runs not read for

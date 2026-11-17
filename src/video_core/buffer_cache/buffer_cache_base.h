@@ -14,6 +14,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -439,9 +440,12 @@ public:
     }
 
     /// write_extent: how far the program's stores reach past the pointer (native programs).
+    /// extra: FRITCHII_EXTENT_CENSUS and FRITCHII_EXTENT_CBUF (Shader::Info::storage_write_extras,
+    /// null when the program has none).
     void BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
                                   bool is_written, u32 indirect_offset = ~0U,
-                                  const Shader::StorageWriteExtent& write_extent = {});
+                                  const Shader::StorageWriteExtent& write_extent = {},
+                                  const Shader::StorageWriteExtra* extra = nullptr);
 
     void UnbindComputeTextureBuffers();
 
@@ -1489,6 +1493,59 @@ private:
 
     void CheckExtentProbes();
     void ProbeExtentTail(u32 index, const Binding& binding);
+
+    /// FRITCHII_EXTENT_CENSUS (live): why native compute bindings are marked in full, per program
+    /// and binding; FRITCHII_EXTENT_CBUF (live): the store extents proven with constant buffer
+    /// words (=1 marks by them, =3 only counts). One line each every 10 s (LogExtentCensus).
+    enum class FullMarkWhy : u8 {
+        Analysis,     ///< the store analysis left the extent unknown (ExtentUnknownWhy says why)
+        IndirectGrid, ///< proven, but the dispatch is indirect (its group count is the GPU's)
+        GuardOrDims,  ///< proven, but the 16-bit guard fails (or a block size is 0) at these dims
+        Distrusted,   ///< an extent check caught the program writing past its proof
+        Checking,     ///< marked in full while a dispatch at new dims is checked
+        WholeBinding, ///< the proof covers the whole binding
+        Count,
+    };
+    enum class CbufOutcome : u8 {
+        None,       ///< no cbuf extent, or FRITCHII_EXTENT_CBUF off
+        Resolved,   ///< the words were read and the bound holds
+        Fallback,   ///< a word's page is GPU-written (guest memory may be stale): full mark
+        Unresolved, ///< a word not readable, the guard fails, or an indirect grid
+    };
+    struct ExtentCensusEntry {
+        u64 full_dispatches{};
+        u64 full_bytes{};
+        std::array<u64, static_cast<size_t>(FullMarkWhy::Count)> whys{};
+        Shader::ExtentUnknownWhy analysis{};
+        u32 pointer_cbuf_index{};
+        u32 pointer_cbuf_offset{};
+        u64 binding_bytes{}; ///< the latest binding's size
+        Shader::StorageCbufExtent cbuf_extent{};
+        // FRITCHII_EXTENT_CBUF
+        u64 cbuf_resolved{};
+        u64 cbuf_fallback{};
+        u64 cbuf_unresolved{};
+        u64 cbuf_proven_bytes{};  ///< summed over the resolved dispatches
+        u64 cbuf_binding_bytes{}; ///< the same dispatches' binding sizes
+        u64 cbuf_marked{};        ///< =1: dispatches marked by the cbuf proof
+    };
+    std::map<std::pair<u64, u32>, ExtentCensusEntry> extent_census;
+    std::chrono::steady_clock::time_point extent_census_start{};
+    u64 extent_census_frames{};
+    /// FRITCHII_EXTENT_CBUF=3: per storage binding of the dispatch being bound, the bytes from the
+    /// binding's start its cbuf proof would mark (0: none); BindHostComputeStorageBuffers hands it
+    /// to the read ring's write marks (ReadRunStats::t_proven_end).
+    std::array<u32, NUM_STORAGE_BUFFERS> cbuf_dry_proven{};
+
+    std::optional<u64> ResolveCbufExtent(const Shader::StorageCbufExtent& extent,
+                                         const std::array<u32, 3>& block,
+                                         const std::optional<std::array<u32, 3>>& grid,
+                                         CbufOutcome& outcome);
+    void NoteExtentCensus(u32 ssbo_index, const Binding& binding, u32 cbuf_index, u32 cbuf_offset,
+                          u64 mark, FullMarkWhy why, const Shader::ExtentUnknownWhy& write_unknown,
+                          const Shader::StorageCbufExtent& cbuf_extent, CbufOutcome cbuf_outcome,
+                          u64 cbuf_proven, bool cbuf_marked);
+    void LogExtentCensus();
 
     /// Whether a GPU write to this range is copied back at the next fence. Ranges the guest CPU
     /// has read (Preflushable, set by the first reactive flush) always are: later reads skip the
