@@ -216,38 +216,48 @@ bool JitWarmEnabled() {
 }
 
 Cause CompileCause(u64 key, u32 core) {
-    if (!t_warming) {
-        FritchiiJitList::Note(key); // FRITCHII_JIT_BLOCK_LIST: one relaxed load when off
-    }
     const u8 bit = static_cast<u8>(1U << (core & 7));
     (t_warming ? g_warm_compiles : g_demand_compiles)[core & 7].fetch_add(
         1, std::memory_order_relaxed);
-    std::scoped_lock lock{g_compile_mutex};
-    g_cores_seen |= bit;
-    u8& mask = g_compiled_on[key];
-    const bool repeat = (mask & ~bit) != 0;
-    // FRITCHII_HITCH_SPLIT: this core compiled the block before, so it was dropped since.
-    const bool own = (mask & bit) != 0;
-    mask |= bit;
-    if (t_warming) {
-        return Cause::WarmCompile;
-    }
-    // Single-stepping blocks (bit 57 of an A64 LocationDescriptor) are never worth warming.
-    // FRITCHII_JIT_WARM_CORES: only the cores in the mask get the copies.
-    if (JitWarmEnabled() && ((key >> 57) & 1) == 0) {
-        const u32 warm_cores = JitWarmCoreMask();
-        for (u32 other = 0; other < 8; ++other) {
-            const u8 other_bit = static_cast<u8>(1U << other);
-            if ((warm_cores & other_bit) != 0 && (g_cores_seen & other_bit) != 0 &&
-                (mask & other_bit) == 0 && g_warm_queues[other].size() < 400'000) {
-                g_warm_queues[other].push_back(key);
+    bool repeat = false;
+    bool own = false;
+    {
+        std::scoped_lock lock{g_compile_mutex};
+        g_cores_seen |= bit;
+        u8& mask = g_compiled_on[key];
+        repeat = (mask & ~bit) != 0;
+        // FRITCHII_HITCH_SPLIT: this core compiled the block before, so it was dropped since.
+        own = (mask & bit) != 0;
+        mask |= bit;
+        if (t_warming) {
+            return Cause::WarmCompile;
+        }
+        // Single-stepping blocks (bit 57 of an A64 LocationDescriptor) are never worth warming.
+        // FRITCHII_JIT_WARM_CORES: only the cores in the mask get the copies.
+        if (JitWarmEnabled() && ((key >> 57) & 1) == 0) {
+            const u32 warm_cores = JitWarmCoreMask();
+            for (u32 other = 0; other < 8; ++other) {
+                const u8 other_bit = static_cast<u8>(1U << other);
+                if ((warm_cores & other_bit) != 0 && (g_cores_seen & other_bit) != 0 &&
+                    (mask & other_bit) == 0 && g_warm_queues[other].size() < 400'000) {
+                    g_warm_queues[other].push_back(key);
+                }
             }
         }
     }
+    // FRITCHII_JIT_BLOCK_LIST: one relaxed load when off. Outside the compile lock (the list's
+    // lock is never taken under it, see TakeWarmKeys).
+    const FritchiiJitList::Seen seen = FritchiiJitList::Note(key, repeat || own);
     if (own && SplitEnabled()) {
         return Cause::RecompileDropped;
     }
-    return repeat ? Cause::RecompileRepeat : Cause::Recompile;
+    if (repeat) {
+        return Cause::RecompileRepeat;
+    }
+    // FRITCHII_HITCH_SPLIT: a listed block the warm-up had not compiled yet gets its own name;
+    // "recompiling new game code" is then only code the list never had.
+    return seen == FritchiiJitList::Seen::Listed && SplitEnabled() ? Cause::RecompileListed
+                                                                    : Cause::Recompile;
 }
 
 size_t TakeWarmKeys(u32 core, std::vector<u64>& out, size_t max) {
