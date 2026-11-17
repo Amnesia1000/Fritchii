@@ -750,6 +750,16 @@ default blocks". Judge by the "buffer pool" slack in FRITCHII_VRAM_OWNERS / FRIT
 and the Churn line's device allocations (smaller blocks = more vkAllocateMemory calls), fresh
 launches.
 
+### FRITCHII_BC1_KEEPS_ALPHA
+
+Off by default (helper DQ, 2026-11-17; port of a low-VRAM fork's fix). Boot: 1 on. Only does
+something when the player picked ASTC recompression BC1 (our default is BC3) on a GPU without
+native ASTC: BC1 for every ASTC image turns alpha into a 1-bit cutout (dark faces and banding in
+OoT). With 1 the session runs the BC3 path instead, whose opaque scan already sends the fully
+opaque images to BC1 (EDEN_NX2_ASTC_BC1, on by default) and keeps the others in BC3. Log at boot:
+"FRITCHII_BC1_KEEPS_ALPHA: ASTC recompression BC1 runs the BC3 path ...". A candidate for default 1:
+it changes nothing for a player on BC3 or Uncompressed.
+
 ### FRITCHII_VRAM_POOL_FIT
 
 TEST, off by default (helper BF, 2026-11-16; 8 GB cards). Live: 1 = EXP42's image pool (pooled

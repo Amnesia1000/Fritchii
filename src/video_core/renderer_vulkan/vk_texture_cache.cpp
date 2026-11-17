@@ -1304,6 +1304,21 @@ void UseBc3ForSwitch2OnSmallCards(const Device& device) {
                 memory >> 20);
     Settings::SetAstcRecompressionOverride(Settings::AstcRecompression::Bc3);
 }
+
+// FRITCHII_BC1_KEEPS_ALPHA (boot, default 0; 1 on): BC1 for every ASTC image turns alpha into a
+// 1-bit cutout (punch-through, black texels where the alpha holds mask data: dark faces and
+// banding in OoT). The BC3 path already sends the images its opaque scan clears to BC1 and keeps
+// the others in BC3, so with the switch on the BC1 setting runs that path for this session.
+void UseOpaqueScanForBc1(const Device& device) {
+    const char* value = std::getenv("FRITCHII_BC1_KEEPS_ALPHA");
+    if (value == nullptr || value[0] != '1' || device.IsOptimalAstcSupported() ||
+        Settings::GetAstcRecompression() != Settings::AstcRecompression::Bc1) {
+        return;
+    }
+    LOG_INFO(Render_Vulkan, "FRITCHII_BC1_KEEPS_ALPHA: ASTC recompression BC1 runs the BC3 path "
+                            "(opaque textures BC1, textures with alpha BC3) for this session");
+    Settings::SetAstcRecompressionOverride(Settings::AstcRecompression::Bc3);
+}
 } // Anonymous namespace
 
 TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& scheduler_,
@@ -1324,6 +1339,7 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
                                     device.GetMaxFramebufferHeight()});
     // Before anything below reads astc_recompression (passes, view formats).
     UseBc3ForSwitch2OnSmallCards(device);
+    UseOpaqueScanForBc1(device);
     // Huge ASTC arrays always decode on the GPU (IsHugeAstcArray), whatever the decode setting.
     if (Settings::values.accelerate_astc.GetValue() == Settings::AstcDecodeMode::Gpu ||
         !device.IsOptimalAstcSupported()) {
