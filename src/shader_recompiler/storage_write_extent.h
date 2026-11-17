@@ -507,6 +507,34 @@ struct StoreCongruence {
     return result;
 }
 
+/// FRITCHII_STORE_FOOTPRINT: the footprint modulo the modulus' largest power-of-two divisor (a
+/// congruence modulo m holds modulo any divisor of m, and modulo a power of two whatever the 32-bit
+/// offset does). The live switch uses it when it can't rule out a wrap at the bind.
+[[nodiscard]] constexpr StorageStoreFootprint ReduceStoreFootprint(
+    const StorageStoreFootprint& footprint) {
+    if (!footprint.Valid() || footprint.PowerOfTwo()) {
+        return footprint;
+    }
+    u64 modulus = 1;
+    while ((footprint.modulus & modulus) == 0) {
+        modulus <<= 1;
+    }
+    std::array<StoreCongruence, StorageStoreFootprint::MaxIntervals> stores{};
+    size_t count = 0;
+    for (size_t i = 0; i < footprint.num_intervals && i < stores.size(); ++i) {
+        const u64 length = footprint.intervals[i].end - footprint.intervals[i].begin;
+        stores[count++] = StoreCongruence{
+            .c = static_cast<s64>(footprint.intervals[i].begin),
+            .m = modulus,
+            .size = static_cast<u32>(length > 0xffffffffULL ? 0xffffffffULL : length),
+        };
+    }
+    StorageStoreFootprint result = MakeStoreFootprint(stores.data(), count, footprint.ids_only);
+    result.stores = footprint.stores;
+    result.widened = result.widened || footprint.widened;
+    return result;
+}
+
 /// FRITCHII_STORE_FOOTPRINT: whether any of the bytes [offset, offset + size) past the pointer
 /// (offset may be negative: below the pointer) can be a store byte of the footprint.
 [[nodiscard]] constexpr bool StoreFootprintHits(const StorageStoreFootprint& footprint, s64 offset,

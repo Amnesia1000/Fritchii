@@ -1170,9 +1170,40 @@ cbuf extent; extent unknown U dispatches/s, X/s of them with no reason recorded"
 
 ### FRITCHII_STORE_FOOTPRINT
 
-TEST, off by default (helper DM, 2026-11-17; design: helper_dl_answer.md item 1). Boot (read at
-first use; it turns the read ring on like FRITCHII_READ_RUNS=1, whose 600-frame lines show up too).
-=3 dry; 1 and 2 are not built and count as 3. Waiting and marking are unchanged. At translation
+TEST, off by default (helper DM, 2026-11-17; design: helper_dl_answer.md item 1; live modes:
+helper_dm_answer.md round 2). Arm at boot, then live:
+- Arm: any non-zero value at boot (read at the first native written dispatch). Armed, the buffer
+  cache keeps a shadow of gpu_modified_ranges (store_footprint_live.h FootprintShadow, told about
+  every Add, Subtract and Clear of the set): `unclaimed` = bytes some mark without a footprint made
+  GPU-modified since they were last clean; one entry per footprint (program binding + pointer
+  phase) = bytes its marks made GPU-modified. Only 3 at boot turns the read ring on (the dry lines
+  below, and FRITCHII_READ_RUNS=1's); 1 or 2 at boot arm without the ring. Not armed: nothing
+  changes, whatever the live value.
+- Live (debug-server switch FRITCHII_STORE_FOOTPRINT, read at each guest read; starts at the boot
+  value): 0 = as before; 1 = a guest read whose GPU-modified bytes are all held only by entries
+  whose footprints exclude them (none unclaimed) is answered from guest memory at once: no GPU
+  write since those bytes were last clean touches them. Nothing else changes (sets, downloads,
+  fences as before the read); the read's pages get their read traps back (the core took them for
+  this read) so a later read of a GPU-written byte there still traps; the core may keep only the
+  read's own bytes as its read area. 2 = as 1, plus every 16th such read waits as before and
+  compares its bytes before the wait with after the landing (must be 0: "would have differed"),
+  plus every locked download landing compares what it writes over claimed-outside bytes with guest
+  memory (first 256 KiB of each landing; must be 0). 3 = dry count only (needs 3 at boot).
+- A/B in one session: boot 1 (or 2), then live 1 <-> 0 (no ring on either side); or boot 3 and
+  live 1 <-> 3 (ring on both sides, the dry lines too).
+- Footprints with a modulus that isn't a power of two (0x110, 0x120 records) are used as they are
+  only when every store offset comes from the ids alone and the plain store extent at the
+  dispatch's dims keeps pointer offset + extent within 4 GiB (no 32-bit wrap); otherwise the bind
+  uses the footprint modulo the modulus' power-of-two part (counted "reduced").
+- Line every 10 s while armed: "Store footprint live (FRITCHII_STORE_FOOTPRINT=M, armed) last S s:
+  reads asked A | answered from guest memory N (n a frame) | waited as before: inside a footprint,
+  a byte no footprint claims, own bytes not GPU-modified | read trap pages armed again | binds:
+  footprint, reduced to its power-of-two part (wrap not ruled out), none | shadow entries | =2
+  verify: sampled, compared, would have differed (must be 0) | =2 landings: checked (KiB), would
+  overwrite guest bytes outside a footprint (bytes, must be 0)". Errors for each must-be-0 hit (16
+  at most each).
+Dry part (3; waiting and marking unchanged; the marks carry the same footprint the live part
+uses). At translation
 every written storage buffer gets a store footprint (Shader::StorageStoreFootprint, kept with the
 extras: not stored with the info, so boot with EDEN_NX2_PRECOMPILED_FAST=0): each store's offset
 from the pointer word is followed as an exact congruence c + k*m (ExactCongruence in
@@ -1200,8 +1231,9 @@ moduli, ids only), without: <reasons>", then the top 8 writers by wait ms: "Stor
 its footprint / without one), no footprint (each with ms a frame) | must be 0: ... | read offsets
 mod the modulus: +0x10 (n), ... | footprint: modulus 0x100, stored bytes +0x20..+0x2f ... | S
 stores, ids only / with loaded/cbuf/loop multiples". The outside ms a frame is the ceiling of a live
-mode for that writer. Cost off: one atomic load per native written binding, one per read to the back
-while the ring is on.
+mode for that writer. Cost off (not armed): one atomic load per native written binding, a bool test
+per guest read of GPU-modified pages and per marked binding, a null test per change of
+gpu_modified_ranges.
 
 ### FRITCHII_FEEDER_LANE
 

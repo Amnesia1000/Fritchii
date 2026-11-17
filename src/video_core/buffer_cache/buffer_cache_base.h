@@ -47,6 +47,7 @@
 #include "video_core/buffer_cache/gpu_written_mirror.h"
 #include "video_core/buffer_cache/read_run_stats.h"
 #include "video_core/buffer_cache/read_trap_tracker.h"
+#include "video_core/buffer_cache/store_footprint_live.h"
 #include "video_core/buffer_cache/virtual_range_cache.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/delayed_destruction_ring.h"
@@ -1555,6 +1556,29 @@ private:
     /// binding's start its loads and atomics can reach (its proven read extent), ~0: unknown
     /// (the whole binding). JudgeEarlyCompute narrows the feeder's inputs with it.
     std::array<u64, NUM_STORAGE_BUFFERS> lane_read_end{};
+    /// FRITCHII_STORE_FOOTPRINT (armed: non-zero at boot): who made gpu_modified_ranges' bytes
+    /// GPU-modified (it follows the set from the first armed bind on), the footprint of the mark
+    /// MarkWrittenBuffer is making (BindHostComputeStorageBuffers sets it around the call), and
+    /// =2's sampling count.
+    StoreFootprintLive::FootprintShadow footprint_shadow;
+    bool footprint_following{};
+    ReadRunStats::FootprintRef mark_footprint{};
+    u32 footprint_skip_count{};
+    /// GetFlushArea, live 1 or 2: answers the read from guest memory when the shadow says no mark
+    /// since its GPU-modified bytes were last clean writes them (re-arming its pages' traps).
+    bool FootprintAnswersRead(DAddr device_addr, u64 size, DAddr page_begin, DAddr page_end,
+                              int live);
+    /// BindComputeStorageBuffer (armed): the binding's footprint for its marks (footprint_dry):
+    /// as recorded, or reduced to its power-of-two part when its modulus isn't one and a 32-bit
+    /// wrap of the stores' offsets isn't ruled out at these dims.
+    void NoteBindFootprint(size_t ssbo_index, const Binding& binding,
+                           const Shader::StorageWriteExtent& write_extent,
+                           const Shader::StorageWriteExtra* extra,
+                           const std::array<u32, 3>& block,
+                           const std::optional<std::array<u32, 3>>& grid, GPUVAddr pointer);
+    /// =2: a download landing's bytes over claimed-outside places against guest memory.
+    void FootprintCheckLanding(const Common::RangeSet<DAddr>* cpu_written, DAddr device_addr,
+                               const u8* data, u64 size);
 
     std::optional<u64> ResolveCbufExtent(const Shader::StorageCbufExtent& extent,
                                          const std::array<u32, 3>& block,
@@ -1889,6 +1913,8 @@ private:
         u32 size;
         bool capped;
         bool ampere;
+        /// FRITCHII_STORE_FOOTPRINT: the mark's footprint (id 0: none), claimed at the promotion
+        ReadRunStats::FootprintRef footprint{};
     };
     static constexpr size_t AheadBound = 4096;
     /// In fill order (= packet order), under `mutex`.
