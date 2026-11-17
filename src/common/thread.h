@@ -13,6 +13,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <mutex>
+#include <string>
 #include <thread>
 #include "common/common_types.h"
 #include "common/polyfill_thread.h"
@@ -148,6 +149,26 @@ void PinCurrentThread(PinnedRole role, int guest_core = -1);
 [[nodiscard]] u64 BackgroundWorkCpuMask();
 /// Windows: hard affinity to `mask` (group 0), or with 0 to every CPU the process may use.
 void SetCurrentThreadCpuMask(u64 mask);
+
+// GPU core siblings (helper DE, 2026-11-17). The pinned GPU threads own a whole physical core each
+// (front 0xc, back 0x30 on a 7800X3D) but use one of its two logical processors; the other one is
+// in no thread's mask, so it is often the only idle logical processor and unpinned busy threads
+// (VulkanWorker ~400 ms/s at Critical priority, GPUFencingThread, VulkanPresent) land on it and
+// share the GPU thread's core.
+/// The unpinned threads that note where they run for FRITCHII_SIBLING_CENSUS.
+enum class CensusThread : u32 { VulkanWorker, Fencing, Present, Count };
+/// FRITCHII_SIBLING_CENSUS=1 (boot, default 0; a dry counter, changes nothing): notes the logical
+/// processor the calling thread runs on (one call per unit of work). A flag test when off.
+void NoteCensusCpu(CensusThread who);
+/// FRITCHII_SIBLING_CENSUS=1: once a second (the Pulse thread), what ran on each pinned GPU
+/// thread's physical core besides that thread (ms/s) and where the noted threads ran. Empty when
+/// off or nothing is pinned.
+[[nodiscard]] std::string GpuCoreCensusText();
+/// FRITCHII_GPU_SIBLINGS_FREE (live, default 0): 1 = the calling thread keeps off the pinned GPU
+/// threads' cores (BackgroundWorkCpuMask); back to 0 = every CPU the process may use. `applied` is
+/// the caller's own record of what it applied (start with 0: nothing changes while the switch is
+/// 0). Called once per unit of work; one relaxed load when nothing changed.
+void KeepOffGpuCores(int& applied);
 /// THREAD_PRIORITY_IDLE on Windows, ThreadPriority::Low elsewhere.
 void SetCurrentThreadIdlePriority();
 void SetCurrentThreadToEfficiencyCores();

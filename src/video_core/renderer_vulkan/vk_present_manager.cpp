@@ -425,7 +425,10 @@ void PresentManager::PresentThread(std::stop_token token) {
     Common::SetCurrentThreadName("VulkanPresent");
     Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
     Common::SetCurrentThreadToPerformanceCores();
+    int siblings_free_applied = 0; ///< FRITCHII_GPU_SIBLINGS_FREE as this thread applied it
     while (!token.stop_requested()) {
+        // FRITCHII_GPU_SIBLINGS_FREE (live): off the GPU threads' cores before the wait.
+        Common::KeepOffGpuCores(siblings_free_applied);
         std::unique_lock lock{queue_mutex};
         // Wait for presentation frames
         {
@@ -433,6 +436,8 @@ void PresentManager::PresentThread(std::stop_token token) {
             frame_cv.wait(lock, token, [this] { return !present_queue.empty(); });
         }
         if (!token.stop_requested()) {
+            // FRITCHII_SIBLING_CENSUS (dry): where this thread woke up to present.
+            Common::NoteCensusCpu(Common::CensusThread::Present);
             bool held = false;
             if (present_wait_enabled) {
                 // Only this thread pops the queue: the frame stays at its front, and WaitPresent

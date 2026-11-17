@@ -1017,6 +1017,36 @@ sampled before anything overwrote it whole. The first 40 get a "Lost contents sa
 the image (format, size, address) and the drop that left its memory stale (path, the dropped
 image's format, size and address, frames since, its guard bits).
 
+### FRITCHII_SIBLING_CENSUS, FRITCHII_GPU_SIBLINGS_FREE
+
+TEST, off by default (helper DE, 2026-11-17). The pinned GPU threads own a whole physical core each
+(front 0xc, back 0x30 on a 7800X3D) and use one of its two logical processors. The other one is in
+no thread's mask, so it is often the only idle logical processor, and unpinned busy threads
+(VulkanWorker ~400 ms/s at Critical priority, GPUFencingThread, VulkanPresent) land on it and share
+the GPU thread's core.
+
+- FRITCHII_SIBLING_CENSUS=1 (boot, a dry counter, changes nothing): the Pulse line (once a second)
+  ends with "; GPU cores (FRITCHII_SIBLING_CENSUS): front core 0xc busy B, GPU T, others O ms/s; back
+  core 0x30 busy B, GPUBack T, others O ms/s; R core ... ; VulkanWorker N/s on front/back/R cores
+  a/b/c%; GPUFencingThread ...; VulkanPresent ...; FRITCHII_GPU_SIBLINGS_FREE=V". busy = both logical
+  processors of the core (NtQuerySystemInformation, DPCs and interrupts included), T = the pinned
+  thread's own CPU time, others = what else ran on the core. The noted threads count where they woke
+  up for each unit of work (a worker chunk, a fence batch, a present).
+- FRITCHII_GPU_SIBLINGS_FREE (live, default 0): 1 = VulkanWorker, GPUFencingThread and VulkanPresent
+  keep off the pinned GPU threads' cores (BackgroundWorkCpuMask, as HostTiming's spin and the
+  pipeline workers already do); back to 0 = every CPU the process may use. Applied by each thread at
+  its next unit of work. Judge it on the back's and front's ms/s and us a draw (2 cycles), then fps.
+
+### FRITCHII_FRAME_END_TIMES
+
+TEST, off by default (helper DE, 2026-11-17). Boot, a dry timer that changes nothing. Where
+RasterizerVulkan::TickFrame's time goes (with one follower it runs on R in a lend while E is parked:
+"TickFrame (frame end)" in the lends line, 5 ms/s at Kakariko, 7-31 ms/s at the market). Line every
+10 s: "Frame end times (FRITCHII_FRAME_END_TIMES=1) 10 s: N calls/s (P% on GPURender), T ms/s, U us
+each, longest L us; by part ms/s: head, pipeline cache, descriptor queues, fence manager, staging,
+texture cache, memory seam, buffer cache (E's)". Everything but the buffer cache part is what a
+posted frame end could take off E's parked time.
+
 ### FRITCHII_HOSTTIMING_SPIN_BUDGET
 
 TEST, off by default (helper AS, 2026-11-15; idea from zortos293/Lichii #1733). Live, a percent of

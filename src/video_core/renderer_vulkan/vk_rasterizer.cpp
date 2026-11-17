@@ -8896,8 +8896,106 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
 
 void NoteDrawReuseProbeFrame(); // vk_graphics_pipeline.cpp
 
+namespace {
+/// FRITCHII_FRAME_END_TIMES=1 (boot, default 0; helper DE, a dry timer that changes nothing):
+/// where TickFrame's time goes, by part, with the thread that ran it (R in one follower's lend,
+/// while E is parked: the "TickFrame (frame end)" lend, 5 ms/s at Kakariko, 7-31 ms/s at the
+/// market). The E-owned part (buffer cache) is what a posted frame end would still run in order
+/// on E; the rest is the posting ceiling. One line every 10 s.
+class FrameEndTimes {
+public:
+    enum Part : size_t {
+        Head,     ///< focus, stats, debug requests, frame dump, upscaler trace, protect sweep
+        Pipeline, ///< pipeline_cache.TickFrame
+        Queues,   ///< descriptor queues and ring
+        Fences,   ///< fence_manager.TickFrame
+        Staging,  ///< staging pools
+        Textures, ///< texture cache lock + TickFrame
+        MemStage, ///< mem_stage.TickFrame
+        Buffers,  ///< buffer cache lock + TickFrame (E's cache)
+        Count,
+    };
+
+    static bool On() {
+        static const bool on = [] {
+            const char* const value = std::getenv("FRITCHII_FRAME_END_TIMES");
+            return value != nullptr && value[0] != '\0' && value[0] != '0';
+        }();
+        return on;
+    }
+
+    void Begin() {
+        mark = Now();
+        begin = mark;
+    }
+
+    void End(Part part) {
+        const u64 now = Now();
+        ns[part] += now - mark;
+        mark = now;
+    }
+
+    void Finish(bool on_render_thread) {
+        const u64 total = mark - begin;
+        ++calls;
+        calls_on_r += on_render_thread ? 1 : 0;
+        total_ns += total;
+        longest_ns = (std::max)(longest_ns, total);
+        if (window_start == 0) {
+            window_start = mark;
+            return;
+        }
+        const u64 span = mark - window_start;
+        if (span < 10'000'000'000ULL) {
+            return;
+        }
+        static constexpr std::array<const char*, Count> names{
+            "head", "pipeline cache", "descriptor queues", "fence manager", "staging",
+            "texture cache", "memory seam", "buffer cache (E's)"};
+        const double seconds = static_cast<double>(span) / 1e9;
+        std::string parts;
+        for (size_t i = 0; i < Count; ++i) {
+            parts += fmt::format("{}{} {:.2f}", i == 0 ? "" : ", ", names[i],
+                                 static_cast<double>(ns[i]) / 1e6 / seconds);
+        }
+        LOG_INFO(Render_Vulkan,
+                 "Frame end times (FRITCHII_FRAME_END_TIMES=1) 10 s: {:.1f} calls/s ({:.0f}% on "
+                 "GPURender), {:.2f} ms/s, {:.0f} us each, longest {:.0f} us; by part ms/s: {}",
+                 static_cast<double>(calls) / seconds,
+                 calls != 0 ? 100.0 * static_cast<double>(calls_on_r) / calls : 0.0,
+                 static_cast<double>(total_ns) / 1e6 / seconds,
+                 calls != 0 ? static_cast<double>(total_ns) / 1e3 / calls : 0.0,
+                 static_cast<double>(longest_ns) / 1e3, parts);
+        ns = {};
+        calls = calls_on_r = total_ns = longest_ns = 0;
+        window_start = mark;
+    }
+
+private:
+    static u64 Now() {
+        return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count());
+    }
+
+    std::array<u64, Count> ns{};
+    u64 mark{};
+    u64 begin{};
+    u64 window_start{};
+    u64 calls{};
+    u64 calls_on_r{};
+    u64 total_ns{};
+    u64 longest_ns{};
+};
+FrameEndTimes g_frame_end_times; ///< only TickFrame touches it (one thread at a time: R or E)
+} // Anonymous namespace
+
 void RasterizerVulkan::TickFrame() {
     ONEF_LEND(FrameEnd, TickFrame())
+    const bool frame_end_times = FrameEndTimes::On();
+    if (frame_end_times) [[unlikely]] {
+        g_frame_end_times.Begin();
+    }
 #ifdef _WIN32
     // EXP111 (live; 0 = Windows' default, 1 = above normal, 2 = high): the process priority
     // class. The owner sees more fps with the window focused: Windows boosts the foreground
@@ -9051,25 +9149,42 @@ void RasterizerVulkan::TickFrame() {
         device_memory.UpdatePagesCachedCount(page_address, Core::DEVICE_PAGESIZE, delta);
     });
     device_memory.ReleaseLingering();
+    // FRITCHII_FRAME_END_TIMES: the parts' boundaries (nothing when off).
+    const auto part_done = [frame_end_times](FrameEndTimes::Part part) {
+        if (frame_end_times) [[unlikely]] {
+            g_frame_end_times.End(part);
+        }
+    };
+    part_done(FrameEndTimes::Head);
     pipeline_cache.TickFrame();
+    part_done(FrameEndTimes::Pipeline);
     guest_descriptor_queue.TickFrame();
     compute_pass_descriptor_queue.TickFrame();
     descriptor_buffer_ring.TickFrame();
+    part_done(FrameEndTimes::Queues);
     fence_manager.TickFrame();
+    part_done(FrameEndTimes::Fences);
     staging_pool.TickFrame();
     if (split_buffer_staging) {
         split_buffer_staging->TickFrame();
     }
+    part_done(FrameEndTimes::Staging);
     {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.TickFrame();
     }
+    part_done(FrameEndTimes::Textures);
     // SEAM (EXP123) is read here, once a frame, with nothing pending.
     mem_stage.TickFrame();
+    part_done(FrameEndTimes::MemStage);
     {
         std::scoped_lock lock{buffer_cache.mutex};
         MemStage::FillPlay seam{mem_stage, MemStage::Site::Frame};
         buffer_cache.TickFrame();
+    }
+    if (frame_end_times) [[unlikely]] {
+        g_frame_end_times.End(FrameEndTimes::Buffers);
+        g_frame_end_times.Finish(VideoCommon::OneFollower::OnRenderThread());
     }
 }
 

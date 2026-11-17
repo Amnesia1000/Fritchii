@@ -733,6 +733,7 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
         return true;
     }};
 
+    int siblings_free_applied = 0; ///< FRITCHII_GPU_SIBLINGS_FREE as this thread applied it
     while (!stop_token.stop_requested()) {
         std::unique_ptr<CommandChunk> work;
 
@@ -780,6 +781,11 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
             // the queue lock goes out of scope. This allows us to force execution
             // to complete in the next step.
             void(std::exchange(lk, std::unique_lock{execution_mutex}));
+
+            // FRITCHII_SIBLING_CENSUS (dry) and FRITCHII_GPU_SIBLINGS_FREE (live, off the GPU
+            // threads' cores): one flag test and one relaxed load while both are off.
+            Common::NoteCensusCpu(Common::CensusThread::VulkanWorker);
+            Common::KeepOffGpuCores(siblings_free_applied);
 
             // Perform the work, tracking whether the chunk was a submission
             // before executing.

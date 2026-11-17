@@ -948,6 +948,9 @@ private:
                 extra += fmt::format(", longest frame {:.1f} ms",
                                      static_cast<double>(longest_gap_us) / 1e3);
             }
+            // FRITCHII_SIBLING_CENSUS=1 (helper DE): what shared the GPU threads' cores this
+            // second, after everything above ("; GPU cores ..."); empty when off.
+            extra += Common::GpuCoreCensusText();
             LOG_INFO(Render, "Pulse: {} frames, process {:.1f} CPUs, rest of the machine {:.1f} CPUs{}",
                      presents - last_presents, static_cast<double>(process) / span_100ns,
                      static_cast<double>((std::max)(system - process, s64{0})) / span_100ns,
