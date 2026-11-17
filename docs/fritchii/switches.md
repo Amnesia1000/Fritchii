@@ -1168,6 +1168,73 @@ changed at landing X of Y compared (inside: ...)". The freed ms a frame is the c
 that program. With no binding to try: "Extent cbuf (...) last S s: no native written binding had a
 cbuf extent; extent unknown U dispatches/s, X/s of them with no reason recorded".
 
+### FRITCHII_STORE_FOOTPRINT
+
+TEST, off by default (helper DM, 2026-11-17; design: helper_dl_answer.md item 1). Boot (read at
+first use; it turns the read ring on like FRITCHII_READ_RUNS=1, whose 600-frame lines show up too).
+=3 dry; 1 and 2 are not built and count as 3. Waiting and marking are unchanged. At translation
+every written storage buffer gets a store footprint (Shader::StorageStoreFootprint, kept with the
+extras: not stored with the info, so boot with EDEN_NX2_PRECOMPILED_FAST=0): each store's offset
+from the pointer word is followed as an exact congruence c + k*m (ExactCongruence in
+global_memory_to_storage_buffer_pass.cpp). Adds, subtractions, products and shifts by constants keep
+it; an unknown value (loaded from memory, a cbuf word, a loop counter, an id) is "anything", and
+times a stride K it is a multiple of K; and/or/xor/shift right/bit fields keep the known low bits;
+select, phi and min/max join both sides. The modulus is the gcd over the buffer's stores, the
+footprint the set of byte residues they hit (up to 8 intervals, gaps filled past that). A modulus
+that is not a power of two (0x330 records) holds only while the 32-bit offset doesn't wrap: the
+landing check below catches it. No footprint when a store stays global, the pointer is picked at
+run time, the program stores to global memory, or a store's address doesn't add the pointer once.
+At bind, every native written binding (one device range) carries its footprint and the pointer's
+device address into its write marks. A read that goes to the back is classed by the newest mark
+over its bytes: inside its footprint; outside it with no older mark in the ring covering the bytes
+(would be answered from guest memory); outside it but under an older mark (inside that one's
+footprint / without one); or a newest mark without a footprint. Must be 0: outside reads whose own
+bytes (up to 64) changed between before the wait and the landing. Lines every 10 s: "Store
+footprint (FRITCHII_STORE_FOOTPRINT=3, dry) last S s: R reads to the back with a write mark over
+their bytes, waited W ms a frame | outside ... (would be answered from guest memory) O (ms a frame)
+| inside I | outside, but an older mark covers them: inside its footprint / without a footprint |
+newest mark without a footprint N | must be 0: outside reads whose bytes changed at landing X of Y
+compared (inside: ...) | program bindings bound B: with a footprint F (claim nothing, power-of-two
+moduli, ids only), without: <reasons>", then the top 8 writers by wait ms: "Store footprint i/n:
+<writer kind> program <hash> binding <b> | waited W ms a frame | outside, inside, covered (inside
+its footprint / without one), no footprint (each with ms a frame) | must be 0: ... | read offsets
+mod the modulus: +0x10 (n), ... | footprint: modulus 0x100, stored bytes +0x20..+0x2f ... | S
+stores, ids only / with loaded/cbuf/loop multiples". The outside ms a frame is the ceiling of a live
+mode for that writer. Cost off: one atomic load per native written binding, one per read to the back
+while the ring is on.
+
+### FRITCHII_FEEDER_LANE
+
+TEST, off by default (helper DM, 2026-11-17; design: helper_dl_answer.md item 2). Boot (read at
+first use). =1 dry; 2-9 are not built and count as 1. Turns FRITCHII_EARLY_COMPUTE=1's dry count,
+its rings and FRITCHII_READ_RUNS=2's write stamps on (their lines show up too). Would a feeder
+dispatch (a program whose writes the guest reads back) on a second lane, started after its real
+dependencies, finish sooner than on the main queue? At each feeder's bind JudgeEarlyCompute also
+works out D, the newest unrun main-queue work it depends on: the newest unrun write mark over its
+inputs (uniform and texture buffers whole; a native storage binding up to its proven read extent,
+Shader::Info::storage_read_extents, plus its write mark when written; the whole binding when the
+read extent is unknown), the newest unrun use of the ranges it writes (write after read), and its
+own chunk when its bind uploads CPU data (D_copy leaves the upload out: the lane would take the
+copy too). A mark or use of an earlier judged feeder gives that feeder's D, not its tick (chains
+stay on the lane in order). If either ring wrapped before a run entry, D is its own chunk ("ring
+wrapped", not eligible). Images are not in D (a compute-family lane can't take them; counted per
+program). The marks carry D; a read whose pages' newest mark is such a feeder's waits for D_copy,
+then D, then the writer (older ticks of the same queue: the total wait is unchanged). "Predicted
+saving" = from D having run until the writer ran, for reads whose D tick is before the writer's
+(eligible). Lines every 10 s: "Feeder lane (FRITCHII_FEEDER_LANE=1, dry) last S s: P feeder
+programs, J dispatches judged (... uploaded; storage bindings narrowed to a proven read extent k of
+n) | D at the bind: nothing unrun, draw-written buffer, earlier dispatch on the main queue, earlier
+feeder on the lane, copy/query/other, unrun use of its written range, its own upload, ring wrapped
+| reads that waited for them R (W ms a frame), cut at the writer's tick C | eligible E = f% of the
+cut reads | predicted saving X ms a frame (x a read), with the upload on the lane too Y ms a frame |
+D not submitted when waited U | must be 0: D after the writer Z", then the top 6 feeders by wait:
+"Feeder lane i/n: program <hash> | reads waited, cut | eligible share f, predicted saving (and with
+the upload on the lane) | D set by (cut reads): <kinds as above> | D k submissions before the
+writer | binds (uploaded, read extents) | images (not in D): configured, with images, an image's
+last write unrun | D not submitted, must be 0: D after the writer". Uses noted while the bind
+uploads keep D without the upload (a small under-count of chains that upload). Cost off: one atomic
+load per native storage binding.
+
 ### FRITCHII_HOSTTIMING_OFF_GPU
 
 TEST, off by default (helper DE, 2026-11-17). Live. 0 (as before): the timer thread's spin goes to

@@ -8,6 +8,7 @@
 #include <bit>
 #include <deque>
 #include <map>
+#include <numeric>
 #include <optional>
 #include <tuple>
 #include <unordered_map>
@@ -2212,6 +2213,389 @@ private:
     ExtentUnknownWhy why{};
 };
 
+/// FRITCHII_STORE_FOOTPRINT: what is known of a 32-bit value as an exact congruence,
+///
+///   value = base * pointer word + c + k * m   for some integer k
+///
+/// with m == 0 meaning exactly base * pointer + c. Unlike IdBound (an upper bound), every step
+/// keeps the value's exact residue: an unknown value (loaded from memory, a constant buffer word,
+/// a loop counter) is (0, 1), and times a constant stride K it becomes (0, K), so a record index
+/// loaded from memory still says which bytes of a K-byte record a store can hit. Moduli that are
+/// not powers of two hold while products don't wrap 32 bits (StorageStoreFootprint says which).
+/// c is a residue in [0, m), or for m == 0 the value as a signed 32-bit number (an immediate
+/// 0xfffffff0 is -16, as a subtraction meant it).
+struct ExactCongruence {
+    s64 c{};
+    u64 m{1};
+    u32 base{};
+    /// Every unknown multiple came from invocation or workgroup ids (DL's exact index bound)
+    bool ids_only{true};
+};
+
+class StoreFootprintAnalysis {
+public:
+    explicit StoreFootprintAnalysis(StorageBufferAddr buffer_) : buffer{buffer_} {}
+
+    /// One store or atomic to the buffer
+    void AddStore(IR::Inst& inst) {
+        if (why != StoreFootprintWhy::Recorded) {
+            return;
+        }
+        const std::optional<LowAddrInfo> addr{TrackLowAddress(&inst)};
+        if (!addr) {
+            why = StoreFootprintWhy::AddressNotTracked;
+            return;
+        }
+        const ExactCongruence value{Evaluate(addr->value, 0)};
+        if (value.base != 1) {
+            why = StoreFootprintWhy::NoPointerTerm;
+            return;
+        }
+        // The immediate offset is added to the low word in 32 bits like the rest
+        const ExactCongruence offset{
+            Sum(ExactCongruence{.c = value.c, .m = value.m, .ids_only = value.ids_only},
+                Constant(static_cast<u32>(addr->imm_offset)))};
+        // An exact offset's c is signed (below the pointer when negative)
+        stores.push_back(StoreCongruence{
+            .c = offset.c,
+            .m = offset.m,
+            .size = AccessSize(inst.GetOpcode()),
+        });
+        ids_only &= value.ids_only;
+    }
+
+    [[nodiscard]] StorageStoreFootprint Result() const {
+        if (why != StoreFootprintWhy::Recorded) {
+            StorageStoreFootprint none{};
+            none.why = why;
+            return none;
+        }
+        return MakeStoreFootprint(stores.data(), stores.size(), ids_only);
+    }
+
+private:
+    static constexpr u64 Exact = u64{1} << 32;
+    static constexpr u32 MAX_DEPTH = 256;
+
+    static u64 Gcd(u64 a, u64 b) {
+        return std::gcd(a, b);
+    }
+
+    /// The signed 32-bit number with value's low 32 bits
+    static s64 Signed32(s64 value) {
+        return static_cast<s64>(static_cast<s32>(static_cast<u32>(static_cast<u64>(value))));
+    }
+
+    /// value mod m in [0, m) (m != 0, at most 2^32)
+    static u64 Residue(s64 value, u64 m) {
+        const s64 r{value % static_cast<s64>(m)};
+        return static_cast<u64>(r < 0 ? r + static_cast<s64>(m) : r);
+    }
+
+    /// m capped to a divisor of itself no larger than 2^32 (2^32 itself: exact), c reduced
+    static ExactCongruence Normalize(ExactCongruence value) {
+        if (value.m > Exact) {
+            const u32 shift{static_cast<u32>((std::min)(std::countr_zero(value.m), 32))};
+            value.m = u64{1} << shift;
+        }
+        if (value.m == Exact) {
+            value.m = 0;
+        }
+        value.c = value.m == 0 ? Signed32(value.c) : static_cast<s64>(Residue(value.c, value.m));
+        return value;
+    }
+
+    static ExactCongruence Any(bool ids_only) {
+        return ExactCongruence{.c = 0, .m = 1, .base = 0, .ids_only = ids_only};
+    }
+
+    static ExactCongruence Constant(u32 value) {
+        return ExactCongruence{.c = static_cast<s64>(static_cast<s32>(value)), .m = 0};
+    }
+
+    /// |c| (a representative's size, for a product's modulus)
+    static u64 Magnitude(s64 c) {
+        return c < 0 ? static_cast<u64>(-c) : static_cast<u64>(c);
+    }
+
+    /// A product's modulus, or a power-of-two divisor of it when it doesn't fit 64 bits
+    static u64 Product(u64 a, u64 b) {
+        if (a == 0 || b == 0) {
+            return 0;
+        }
+        if (a > ~u64{0} / b) {
+            return u64{1} << (std::min)(std::countr_zero(a) + std::countr_zero(b), 32);
+        }
+        return a * b;
+    }
+
+    static ExactCongruence Sum(const ExactCongruence& a, const ExactCongruence& b) {
+        if (a.base + b.base > 1) {
+            return Any(false);
+        }
+        return Normalize(ExactCongruence{.c = a.c + b.c,
+                                         .m = Gcd(a.m, b.m),
+                                         .base = a.base + b.base,
+                                         .ids_only = a.ids_only && b.ids_only});
+    }
+
+    static ExactCongruence Difference(const ExactCongruence& a, const ExactCongruence& b) {
+        if (b.base > a.base) {
+            return Any(false);
+        }
+        // |c| is below 2^32 on both sides: no overflow
+        return Normalize(ExactCongruence{.c = a.c - b.c,
+                                         .m = Gcd(a.m, b.m),
+                                         .base = a.base - b.base,
+                                         .ids_only = a.ids_only && b.ids_only});
+    }
+
+    static ExactCongruence Product(const ExactCongruence& a, const ExactCongruence& b) {
+        if (a.base != 0 || b.base != 0) {
+            return Any(false);
+        }
+        // (a.c + i a.m)(b.c + j b.m) = a.c b.c + i a.m b.c + j b.m a.c + i j a.m b.m
+        const u64 m{Gcd(Gcd(Product(a.m, Magnitude(b.c)), Product(b.m, Magnitude(a.c))),
+                        Product(a.m, b.m))};
+        const bool ids_only{a.ids_only && b.ids_only};
+        if (m == 0) {
+            // Both exact: the 32-bit product
+            const u32 product{static_cast<u32>(static_cast<u64>(a.c)) *
+                              static_cast<u32>(static_cast<u64>(b.c))};
+            return Normalize(ExactCongruence{.c = static_cast<s64>(product), .m = 0,
+                                             .ids_only = ids_only});
+        }
+        const u64 capped{Normalize(ExactCongruence{.m = m}).m};
+        if (capped == 0) {
+            const u32 product{static_cast<u32>(static_cast<u64>(a.c)) *
+                              static_cast<u32>(static_cast<u64>(b.c))};
+            return Normalize(ExactCongruence{.c = static_cast<s64>(product), .m = 0,
+                                             .ids_only = ids_only});
+        }
+        // Residues below 2^32: the product fits 64 bits
+        const u64 product{(Residue(a.c, capped) * Residue(b.c, capped)) % capped};
+        return Normalize(ExactCongruence{.c = static_cast<s64>(product), .m = capped,
+                                         .ids_only = ids_only});
+    }
+
+    /// Either value (a select, a phi, a min or max)
+    static ExactCongruence Join(const ExactCongruence& a, const ExactCongruence& b) {
+        if (a.base != b.base) {
+            return Any(false);
+        }
+        const u64 diff{Magnitude(a.c - b.c)};
+        return Normalize(ExactCongruence{.c = a.c,
+                                         .m = Gcd(Gcd(a.m, b.m), diff),
+                                         .base = a.base,
+                                         .ids_only = a.ids_only && b.ids_only});
+    }
+
+    /// The low bits a value's congruence fixes (32: all)
+    static u32 KnownBits(const ExactCongruence& value) {
+        return value.m == 0 ? 32U
+                            : static_cast<u32>((std::min)(std::countr_zero(value.m), 32));
+    }
+
+    /// A value from its bits: bit(i) gives {known, value}; the known prefix becomes the modulus
+    template <typename BitOf>
+    static ExactCongruence FromBits(BitOf&& bit_of, bool ids_only) {
+        u64 bits{};
+        u32 known{};
+        for (; known < 32; ++known) {
+            const auto [is_known, value] = bit_of(known);
+            if (!is_known) {
+                break;
+            }
+            bits |= u64{value ? 1U : 0U} << known;
+        }
+        return Normalize(ExactCongruence{.c = static_cast<s64>(bits),
+                                         .m = known >= 32 ? 0 : (u64{1} << known),
+                                         .ids_only = ids_only});
+    }
+
+    /// Bit `bit` of the value, when its congruence fixes it (an exact value's two's complement
+    /// bits, a residue's low bits below the modulus' power of two)
+    static std::pair<bool, bool> BitOf(const ExactCongruence& value, u32 bit) {
+        if (bit >= KnownBits(value)) {
+            return {false, false};
+        }
+        return {true, ((static_cast<u64>(value.c) >> bit) & 1) != 0};
+    }
+
+    ExactCongruence Evaluate(const IR::Value& value, u32 depth) {
+        if (value.IsImmediate()) {
+            if (value.Type() != IR::Type::U32) {
+                return Any(false);
+            }
+            return Constant(value.U32());
+        }
+        if (depth > MAX_DEPTH) {
+            return Any(false);
+        }
+        const IR::Inst* const inst{value.InstRecursive()};
+        if (const auto it{memo.find(inst)}; it != memo.end()) {
+            return it->second;
+        }
+        if (!active.insert(inst).second) {
+            // A cycle (a loop-carried value): anything. Values computed from it while it is open
+            // are bounded through this "anything", so they stay exact congruences.
+            return Any(false);
+        }
+        const ExactCongruence result{EvaluateInst(*inst, depth)};
+        active.erase(inst);
+        memo.emplace(inst, result);
+        return result;
+    }
+
+    ExactCongruence EvaluateInst(const IR::Inst& inst, u32 depth) {
+        if (const std::optional<StorageBufferAddr> word{CbufWord(&inst)}) {
+            if (*word == buffer) {
+                return ExactCongruence{.c = 0, .m = 0, .base = 1};
+            }
+            return Any(false);
+        }
+        const auto arg{[&](size_t index) { return Evaluate(inst.Arg(index), depth + 1); }};
+        const auto imm{[&](size_t index) -> std::optional<u32> {
+            if (!inst.Arg(index).IsImmediate()) {
+                return std::nullopt;
+            }
+            return inst.Arg(index).U32();
+        }};
+        switch (inst.GetOpcode()) {
+        case IR::Opcode::CompositeExtractU32x3: {
+            if (inst.Arg(0).IsImmediate()) {
+                return Any(false);
+            }
+            const IR::Opcode vector{inst.Arg(0).InstRecursive()->GetOpcode()};
+            return Any(vector == IR::Opcode::LocalInvocationId ||
+                       vector == IR::Opcode::WorkgroupId);
+        }
+        case IR::Opcode::IAdd32:
+            return Sum(arg(0), arg(1));
+        case IR::Opcode::ISub32:
+            return Difference(arg(0), arg(1));
+        case IR::Opcode::INeg32:
+            return Difference(Constant(0), arg(0));
+        case IR::Opcode::IMul32:
+            return Product(arg(0), arg(1));
+        case IR::Opcode::ShiftLeftLogical32: {
+            const std::optional<u32> shift{imm(1)};
+            if (!shift) {
+                return Any(false);
+            }
+            if (*shift >= 32) {
+                return Constant(0);
+            }
+            return Product(arg(0), Constant(u32{1} << *shift));
+        }
+        case IR::Opcode::ShiftRightLogical32: {
+            const std::optional<u32> shift{imm(1)};
+            const ExactCongruence source{arg(0)};
+            if (!shift || source.base != 0) {
+                return Any(false);
+            }
+            const u32 s{*shift};
+            return FromBits(
+                [&](u32 bit) -> std::pair<bool, bool> {
+                    return bit + s < 32 ? BitOf(source, bit + s) : std::pair{true, false};
+                },
+                source.ids_only);
+        }
+        case IR::Opcode::BitwiseAnd32:
+        case IR::Opcode::BitwiseOr32:
+        case IR::Opcode::BitwiseXor32: {
+            const ExactCongruence lhs{arg(0)};
+            const ExactCongruence rhs{arg(1)};
+            if (lhs.base != 0 || rhs.base != 0) {
+                return Any(false);
+            }
+            const IR::Opcode opcode{inst.GetOpcode()};
+            return FromBits(
+                [&](u32 bit) -> std::pair<bool, bool> {
+                    const auto [lk, lv] = BitOf(lhs, bit);
+                    const auto [rk, rv] = BitOf(rhs, bit);
+                    if (opcode == IR::Opcode::BitwiseAnd32) {
+                        if ((lk && !lv) || (rk && !rv)) {
+                            return {true, false};
+                        }
+                        return {lk && rk, lv && rv};
+                    }
+                    if (opcode == IR::Opcode::BitwiseOr32) {
+                        if ((lk && lv) || (rk && rv)) {
+                            return {true, true};
+                        }
+                        return {lk && rk, false};
+                    }
+                    return {lk && rk, lv != rv};
+                },
+                lhs.ids_only && rhs.ids_only);
+        }
+        case IR::Opcode::BitFieldUExtract: {
+            const std::optional<u32> offset{imm(1)};
+            const std::optional<u32> count{imm(2)};
+            const ExactCongruence source{arg(0)};
+            if (!offset || !count || *offset >= 32 || *count == 0 || *count > 32 ||
+                source.base != 0) {
+                return Any(false);
+            }
+            const u32 off{*offset};
+            const u32 bits{*count};
+            return FromBits(
+                [&](u32 bit) -> std::pair<bool, bool> {
+                    if (bit >= bits || off + bit >= 32) {
+                        return {true, false};
+                    }
+                    return BitOf(source, off + bit);
+                },
+                source.ids_only);
+        }
+        case IR::Opcode::BitFieldInsert: {
+            const std::optional<u32> offset{imm(2)};
+            const std::optional<u32> count{imm(3)};
+            const ExactCongruence base_value{arg(0)};
+            const ExactCongruence insert{arg(1)};
+            if (!offset || !count || *offset >= 32 || base_value.base != 0 || insert.base != 0) {
+                return Any(false);
+            }
+            const u32 off{*offset};
+            const u32 bits{*count};
+            return FromBits(
+                [&](u32 bit) -> std::pair<bool, bool> {
+                    if (bit >= off && bit - off < bits) {
+                        return BitOf(insert, bit - off);
+                    }
+                    return BitOf(base_value, bit);
+                },
+                base_value.ids_only && insert.ids_only);
+        }
+        case IR::Opcode::SelectU32:
+            return Join(arg(1), arg(2));
+        case IR::Opcode::UMin32:
+        case IR::Opcode::UMax32:
+        case IR::Opcode::SMin32:
+        case IR::Opcode::SMax32:
+            return Join(arg(0), arg(1));
+        case IR::Opcode::Phi: {
+            std::optional<ExactCongruence> result;
+            for (size_t index = 0; index < inst.NumArgs(); ++index) {
+                const ExactCongruence incoming{arg(index)};
+                result = result ? Join(*result, incoming) : incoming;
+            }
+            return result ? *result : Any(false);
+        }
+        default:
+            return Any(false);
+        }
+    }
+
+    StorageBufferAddr buffer;
+    std::unordered_map<const IR::Inst*, ExactCongruence> memo;
+    std::unordered_set<const IR::Inst*> active;
+    std::vector<StoreCongruence> stores;
+    bool ids_only{true};
+    StoreFootprintWhy why{StoreFootprintWhy::Recorded};
+};
+
 /// Returns the offset in indices (not bytes) for an equivalent storage instruction
 IR::U32 StorageOffset(IR::Block& block, IR::Inst& inst, StorageBufferAddr buffer, u32 alignment) {
     IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(inst)};
@@ -2405,7 +2789,21 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
     // with constant buffer words, for the buffers whose extent stayed unknown
     std::map<StorageBufferAddr, ExtentUnknownWhy> unknown_whys;
     std::map<StorageBufferAddr, StorageCbufExtent> cbuf_extents;
+    // FRITCHII_STORE_FOOTPRINT: the residues each written buffer's stores can land on
+    std::map<StorageBufferAddr, StorageStoreFootprint> footprints;
     if (!info.untracked_writes) {
+        std::map<StorageBufferAddr, StoreFootprintAnalysis> footprint_analyses;
+        for (const StorageInst& storage_inst : info.to_replace) {
+            if (!IsGlobalMemoryWrite(*storage_inst.inst) ||
+                info.unbounded_writes.contains(storage_inst.storage_buffer)) {
+                continue;
+            }
+            footprint_analyses.try_emplace(storage_inst.storage_buffer, storage_inst.storage_buffer)
+                .first->second.AddStore(*storage_inst.inst);
+        }
+        for (const auto& [storage_buffer, analysis] : footprint_analyses) {
+            footprints.emplace(storage_buffer, analysis.Result());
+        }
         std::map<StorageBufferAddr, StoreExtentAnalysis> analyses;
         for (const StorageInst& storage_inst : info.to_replace) {
             if (!IsGlobalMemoryWrite(*storage_inst.inst) ||
@@ -2488,12 +2886,25 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
     }
     std::vector<StorageWriteExtra> extras;
     bool any_unknown{};
+    bool any_written{};
     for (const StorageBufferAddr& storage_buffer : info.set) {
         const bool is_written{info.writes.contains(storage_buffer)};
         const auto extent{extents.find(storage_buffer)};
         ExtentUnknownWhy write_unknown{};
         StorageCbufExtent cbuf_extent{};
+        StorageStoreFootprint footprint{};
         if (is_written) {
+            any_written = true;
+            if (info.untracked_writes) {
+                footprint.why = StoreFootprintWhy::UntrackedWrites;
+            } else if (info.unbounded_writes.contains(storage_buffer)) {
+                footprint.why = StoreFootprintWhy::RuntimeRouted;
+            } else if (const auto found{footprints.find(storage_buffer)};
+                       found != footprints.end()) {
+                footprint = found->second;
+            } else {
+                footprint.why = StoreFootprintWhy::NoStores;
+            }
             if (info.untracked_writes) {
                 write_unknown.kind = ExtentUnknown::UntrackedWrites;
             } else if (info.unbounded_writes.contains(storage_buffer)) {
@@ -2520,11 +2931,14 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
             .write_extent = is_written && extent != extents.end() ? extent->second
                                                                   : StorageWriteExtent{},
         });
-        extras.push_back({.write_unknown = write_unknown, .cbuf_extent = cbuf_extent});
+        extras.push_back({.write_unknown = write_unknown,
+                          .cbuf_extent = cbuf_extent,
+                          .footprint = footprint});
         any_unknown |= is_written && write_unknown.kind != ExtentUnknown::Known;
     }
-    if (any_unknown) {
-        // Kept only for programs with something to report (Info::storage_write_extras)
+    if (any_unknown || any_written) {
+        // Kept only for programs with something to report (Info::storage_write_extras; every
+        // written buffer has a FRITCHII_STORE_FOOTPRINT entry)
         auto& out{program.info.storage_write_extras};
         out.resize(program.info.storage_buffers_descriptors.size() - extras.size());
         out.insert(out.end(), extras.begin(), extras.end());
@@ -2615,6 +3029,9 @@ std::vector<u32> JoinStorageInfo(Info& base, Info& source, size_t limit) {
                         }
                         extra.cbuf_extent = merged_cbuf;
                     }
+                    // FRITCHII_STORE_FOOTPRINT: not merged (graphics halves only)
+                    extra.footprint = StorageStoreFootprint{};
+                    extra.footprint.why = StoreFootprintWhy::Joined;
                 } else {
                     it->write_extent = desc.write_extent;
                     extra = source_extra;

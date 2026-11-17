@@ -10,7 +10,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -20,6 +22,7 @@
 
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "shader_recompiler/storage_write_extent.h"
 #include "video_core/early_compute.h"
 
 // FRITCHII_READ_RUNS=1 (diagnostic, read once; fable52_answer_fountain 4): the guest reads of
@@ -67,14 +70,29 @@ private:
     mutable std::atomic<int> state{-1};
 };
 
+// FRITCHII_STORE_FOOTPRINT (read at first use, default 0; 3 = dry, helper_dl_answer.md item 1;
+// 1 and 2 are not built and count as 3): every native written storage binding's write mark
+// carries its program's store footprint (Shader::StorageStoreFootprint: the residues modulo a
+// record stride its stores can land on, made at translation, so EDEN_NX2_PRECOMPILED_FAST=0).
+// Each read that goes to the back is classed by the footprint of the newest mark over its bytes:
+// inside it, outside it with no older mark in the ring still covering the bytes (it would be
+// answered from guest memory), outside it but under an older mark, or a mark without a
+// footprint. Waiting and marking are unchanged. Lines every 10 s: "Store footprint".
+inline EarlyCompute::FirstUseMode g_store_footprint{
+    [] { return EarlyCompute::ReadMode("FRITCHII_STORE_FOOTPRINT"); }};
+
 inline bool ReadRunsValue(bool writer_ticks) {
-    // FRITCHII_EARLY_COMPUTE and FRITCHII_READ_SIDE_COPY count on this ring and its stamps.
+    // FRITCHII_EARLY_COMPUTE and FRITCHII_READ_SIDE_COPY count on this ring and its stamps
+    // (FRITCHII_FEEDER_LANE turns FRITCHII_EARLY_COMPUTE on).
     if (EarlyCompute::g_early || EarlyCompute::g_side_copy || EarlyCompute::g_submit_times) {
         return true;
     }
     // FRITCHII_EXTENT_CBUF=3 (dry) counts its reads on the ring too ("Extent cbuf" lines), and
     // FRITCHII_EXTENT_CENSUS ranks program bindings by their read-back waits.
     if (!writer_ticks) {
+        if (g_store_footprint) {
+            return true;
+        }
         const char* cbuf = std::getenv("FRITCHII_EXTENT_CBUF");
         if (cbuf != nullptr && cbuf[0] == '3') {
             return true;
@@ -205,11 +223,104 @@ struct WriteMark {
     /// FRITCHII_EXTENT_CBUF=3 (dry): where the store extent proven with constant buffer words
     /// would have ended the mark (t_proven_end), 0 when the dispatch had no such proof
     u64 proven_end{};
+    /// FRITCHII_STORE_FOOTPRINT: the binding's footprint (an id of the footprint table, 0: none
+    /// recorded) and the device address its offsets count from (the pointer word's)
+    u32 footprint_id{};
+    u64 footprint_base{};
+    /// FRITCHII_FEEDER_LANE: the writing feeder's D (judged ones)
+    EarlyCompute::Lane lane{};
 };
 
 /// FRITCHII_EXTENT_CBUF=3: set with t_writer while a dispatch's storage binding marks
 /// (BufferCache::BindHostComputeStorageBuffers), 0 otherwise.
 inline thread_local u64 t_proven_end = 0;
+
+/// FRITCHII_STORE_FOOTPRINT: set with t_writer while a dispatch's native storage binding marks.
+struct FootprintRef {
+    u32 id{};
+    u64 base{};
+};
+inline thread_local FootprintRef t_footprint{};
+
+/// FRITCHII_STORE_FOOTPRINT: the footprints of the program bindings seen, by id (from 1). Entries
+/// never move nor change once published, so readers look them up without the lock.
+struct FootprintTable {
+    static constexpr u32 Capacity = 8192;
+    std::mutex mutex;
+    std::unordered_map<u64, u32> ids; ///< (program hash, binding) -> id
+    std::unique_ptr<Shader::StorageStoreFootprint[]> entries{
+        std::make_unique<Shader::StorageStoreFootprint[]>(Capacity)};
+    std::unique_ptr<u64[]> programs{std::make_unique<u64[]>(Capacity)};
+    std::atomic<u32> count{1}; ///< id 0 is "none"
+};
+
+inline FootprintTable& GetFootprints() {
+    static FootprintTable table;
+    return table;
+}
+
+[[nodiscard]] inline u64 FootprintKey(u64 program, u32 binding) {
+    return program ^ (u64{binding} * 0x9e3779b97f4a7c15ULL);
+}
+
+/// BufferCache::BindComputeStorageBuffer (=3): the id of a program binding's footprint, added
+/// the first time (0 when the table is full).
+[[nodiscard]] inline u32 InternFootprint(u64 program, u32 binding,
+                                         const Shader::StorageStoreFootprint& footprint) {
+    FootprintTable& t = GetFootprints();
+    std::scoped_lock lock{t.mutex};
+    const u64 key = FootprintKey(program, binding);
+    if (const auto it = t.ids.find(key); it != t.ids.end()) {
+        return it->second;
+    }
+    const u32 id = t.count.load(std::memory_order_relaxed);
+    if (id >= FootprintTable::Capacity) {
+        return 0;
+    }
+    t.entries[id] = footprint;
+    t.programs[id] = program;
+    t.count.store(id + 1, std::memory_order_release);
+    t.ids.emplace(key, id);
+    return id;
+}
+
+/// The footprint of `id`, or null for 0 (or an id not published).
+[[nodiscard]] inline const Shader::StorageStoreFootprint* FootprintOf(u32 id) {
+    FootprintTable& t = GetFootprints();
+    if (id == 0 || id >= t.count.load(std::memory_order_acquire)) {
+        return nullptr;
+    }
+    return &t.entries[id];
+}
+
+/// The footprint of a program binding (null when none was recorded at a bind).
+[[nodiscard]] inline const Shader::StorageStoreFootprint* FootprintOf(u64 program, u32 binding) {
+    FootprintTable& t = GetFootprints();
+    u32 id = 0;
+    {
+        std::scoped_lock lock{t.mutex};
+        const auto it = t.ids.find(FootprintKey(program, binding));
+        if (it == t.ids.end()) {
+            return nullptr;
+        }
+        id = it->second;
+    }
+    return FootprintOf(id);
+}
+
+/// FRITCHII_STORE_FOOTPRINT: how a read that goes to the back stands to the footprint of the
+/// newest mark over its bytes.
+enum class FootRead : u8 {
+    None,               ///< not classed (the switch off, or no mark over the read's bytes)
+    NoFootprint,        ///< the newest mark has no footprint (or no valid one)
+    Inside,             ///< the read's bytes touch the newest mark's footprint
+    Outside,            ///< outside it, and no older mark in the ring covers them: guest memory
+                        ///< would answer
+    CoveredInside,      ///< outside it, but an older mark's footprint covers them
+    CoveredNoFootprint, ///< outside it, but an older mark without a footprint covers them
+    Count,
+};
+inline constexpr size_t FootReads = static_cast<size_t>(FootRead::Count);
 
 /// FRITCHII_EXTENT_CBUF=3: a read whose newest mark over its bytes had a cbuf proof.
 enum class DryRead : u8 {
@@ -264,7 +375,10 @@ inline void NoteWrite(u64 begin, u64 size, u64 stamp = 0) {
                          .stamp = stamp,
                          .writer = t_writer,
                          .verdict = EarlyCompute::t_verdict,
-                         .proven_end = t_proven_end};
+                         .proven_end = t_proven_end,
+                         .footprint_id = t_footprint.id,
+                         .footprint_base = t_footprint.base,
+                         .lane = EarlyCompute::t_lane};
     const bool compute = mark.writer.kind == WriterKind::ComputeStorage ||
                          mark.writer.kind == WriterKind::ComputeTexture;
     Ring& r = GetRing();
@@ -324,6 +438,17 @@ struct WriterAnswer {
     u64 ahead_span_ns{};
     // FRITCHII_EXTENT_CBUF=3 (FindWriter): the read against the cbuf proof of its newest mark.
     DryRead dry{DryRead::None};
+    // FRITCHII_STORE_FOOTPRINT (FindWriter): the read against its newest mark's footprint, and
+    // the read's first byte past that mark's pointer modulo the footprint's modulus.
+    FootRead foot{FootRead::None};
+    u64 foot_residue{};
+    // FRITCHII_FEEDER_LANE: the area mark's D as scheduler ticks (GetFlushArea; 0: nothing
+    // unrun), and when the reader saw them run (WaitReadWriter, from its wait's start).
+    u64 lane_tick{};
+    u64 lane_copy_tick{};
+    u64 lane_ns{};
+    u64 lane_copy_ns{};
+    bool lane_unsubmitted{};
 };
 inline thread_local WriterAnswer t_writer_answer{};
 
@@ -366,6 +491,103 @@ template <typename Ranges>
         }
     }
     return false;
+}
+
+/// FRITCHII_FEEDER_LANE: the newest unrun write mark over any of `ranges` ({begin, end}), newest
+/// first until the first run one: its stamp, or a judged feeder's own D.
+template <typename Ranges, typename IsFree>
+[[nodiscard]] EarlyCompute::LaneDep NewestPendingMark(const Ranges& ranges, IsFree&& is_free) {
+    EarlyCompute::LaneDep dep{};
+    Ring& r = GetRing();
+    std::scoped_lock lock{r.mutex};
+    const u64 n = (std::min<u64>)(r.count, RingSize);
+    for (u64 i = 0; i < n; ++i) {
+        const WriteMark& mark = r.marks[(r.count - 1 - i) % RingSize];
+        if (is_free(mark.stamp)) {
+            return dep;
+        }
+        for (const auto& [begin, end] : ranges) {
+            if (mark.begin < end && begin < mark.end) {
+                EarlyCompute::LaneKind kind = EarlyCompute::LaneKind::Other;
+                switch (mark.writer.kind) {
+                case WriterKind::DrawStorage:
+                case WriterKind::DrawTexture:
+                    kind = EarlyCompute::LaneKind::DrawBuffer;
+                    break;
+                case WriterKind::ComputeStorage:
+                case WriterKind::ComputeTexture:
+                    kind = EarlyCompute::LaneKind::ComputeMain;
+                    break;
+                case WriterKind::Other:
+                    break;
+                }
+                dep.Add(mark.stamp, mark.lane, kind);
+                break;
+            }
+        }
+    }
+    dep.incomplete = n == RingSize;
+    return dep;
+}
+
+/// FRITCHII_FEEDER_LANE: after a judged feeder's binds uploaded CPU data, its marks' D is its
+/// own chunk (`stamp`); D_copy stays.
+inline void PatchLaneUpload(u64 dispatch, u64 program, u64 stamp) {
+    Ring& r = GetRing();
+    std::scoped_lock lock{r.mutex};
+    const u64 n = (std::min<u64>)(r.count, 256);
+    for (u64 i = 0; i < n; ++i) {
+        WriteMark& mark = r.marks[(r.count - 1 - i) % RingSize];
+        if (mark.dispatch == dispatch && mark.writer.program == program && mark.lane.judged) {
+            mark.lane.d = (std::max)(mark.lane.d, stamp);
+            mark.lane.kind = EarlyCompute::LaneKind::Upload;
+        }
+    }
+}
+
+/// FRITCHII_STORE_FOOTPRINT: whether `mark`'s footprint can hold any of the read's bytes in the
+/// mark ([address, end) clipped to it); nullopt when the mark has no valid footprint.
+[[nodiscard]] inline std::optional<bool> FootprintHits(const WriteMark& mark, u64 address,
+                                                       u64 end) {
+    const Shader::StorageStoreFootprint* footprint = FootprintOf(mark.footprint_id);
+    if (footprint == nullptr || !footprint->Valid()) {
+        return std::nullopt;
+    }
+    const u64 lower = (std::max)(address, mark.begin);
+    const u64 upper = (std::min)(end, mark.end);
+    if (lower >= upper) {
+        return false;
+    }
+    const s64 offset = static_cast<s64>(lower - mark.footprint_base);
+    return Shader::StoreFootprintHits(*footprint, offset, upper - lower);
+}
+
+/// FRITCHII_STORE_FOOTPRINT (r.mutex held): the read [address, end) against marks[newest - i]
+/// (the newest over it), then the older marks over it while it stays outside the footprints.
+[[nodiscard]] inline FootRead ClassifyFootprint(const Ring& r, u64 i, u64 address, u64 end) {
+    const WriteMark& newest = r.marks[(r.count - 1 - i) % RingSize];
+    const std::optional<bool> hits = FootprintHits(newest, address, end);
+    if (!hits) {
+        return FootRead::NoFootprint;
+    }
+    if (*hits) {
+        return FootRead::Inside;
+    }
+    const u64 n = (std::min<u64>)(r.count, RingSize);
+    for (u64 j = i + 1; j < n; ++j) {
+        const WriteMark& mark = r.marks[(r.count - 1 - j) % RingSize];
+        if (!(mark.begin < end && address < mark.end)) {
+            continue;
+        }
+        const std::optional<bool> older = FootprintHits(mark, address, end);
+        if (!older) {
+            return FootRead::CoveredNoFootprint;
+        }
+        if (*older) {
+            return FootRead::CoveredInside;
+        }
+    }
+    return FootRead::Outside;
 }
 
 /// FRITCHII_EXTENT_CBUF=3 (r.mutex held): the read [address, end) against marks[newest - i]
@@ -413,6 +635,17 @@ inline void FindWriter(u64 address, u64 size, u64 page_begin, u64 page_end) {
             a.dispatches_after = dispatches - mark.dispatch;
             if (mark.proven_end != 0) [[unlikely]] {
                 a.dry = ClassifyDryRead(r, i, address, end);
+            }
+            if (g_store_footprint) [[unlikely]] {
+                a.foot = ClassifyFootprint(r, i, address, end);
+                if (const auto* footprint = FootprintOf(mark.footprint_id);
+                    footprint != nullptr && footprint->Valid()) {
+                    const u64 lower = (std::max)(address, mark.begin);
+                    const s64 offset = static_cast<s64>(lower - mark.footprint_base);
+                    const s64 modulus = static_cast<s64>(footprint->modulus);
+                    const s64 residue = offset % modulus;
+                    a.foot_residue = static_cast<u64>(residue < 0 ? residue + modulus : residue);
+                }
             }
             return;
         }
@@ -518,10 +751,26 @@ struct WaitStats {
 };
 inline std::atomic<bool> g_wait_census{false};
 
+/// FRITCHII_STORE_FOOTPRINT: per writer (the newest mark's over the read's bytes), the reads to
+/// the back by FootRead (taken by the "Store footprint" lines every 10 s).
+struct FootStats {
+    u64 reads[FootReads]{};
+    u64 wait_ns[FootReads]{};
+    /// Must be 0: Outside reads whose compared bytes changed when the wait landed (the GPU did
+    /// write them: guest memory would have answered stale bytes)
+    u64 outside_compared{};
+    u64 outside_differed{};
+    u64 inside_compared{};
+    u64 inside_differed{};
+    /// The read's first byte past the mark's pointer, modulo the footprint's modulus: reads
+    std::unordered_map<u64, u64> residues; ///< capped at 32
+};
+
 struct State {
     std::mutex mutex;
     Counts counts;
     TickCounts ticks;
+    std::unordered_map<Writer, FootStats, WriterHash> foot;
     std::unordered_map<Writer, DryStats, WriterHash> dry;
     std::unordered_map<Writer, WaitStats, WriterHash> waits;
     /// The "Read writer" lines: reads whose bytes a mark in the ring covers, by its writer.
@@ -654,6 +903,22 @@ inline void NoteWriter(Kind kind, u64 wait_ns, const WriterAnswer& a, const u8* 
         }
         EarlyCompute::NoteRead(static_cast<size_t>(kind), a.area_mark.verdict, a.cut,
                                a.writer_wait_ns);
+        // FRITCHII_FEEDER_LANE: what the area mark's feeder would have saved on the lane
+        if (EarlyCompute::g_lane && a.area_mark.lane.judged) {
+            EarlyCompute::NoteLaneRead(a.area_mark.writer.program,
+                                       EarlyCompute::LaneRead{
+                                           .wait_ns = wait_ns,
+                                           .cut = a.cut,
+                                           .writer_ns = a.writer_wait_ns,
+                                           .write_tick = a.write_tick,
+                                           .lane_tick = a.lane_tick,
+                                           .lane_ns = a.lane_ns,
+                                           .copy_tick = a.lane_copy_tick,
+                                           .copy_ns = a.lane_copy_ns,
+                                           .unsubmitted = a.lane_unsubmitted,
+                                           .kind = a.area_mark.lane.kind,
+                                       });
+        }
     }
     State& s = Get();
     std::scoped_lock lock{s.mutex};
@@ -710,6 +975,26 @@ inline void NoteWriter(Kind kind, u64 wait_ns, const WriterAnswer& a, const u8* 
         WaitStats& waited = s.waits[a.mark.writer];
         ++waited.reads;
         waited.wait_ns += wait_ns;
+    }
+    if (a.foot != FootRead::None) [[unlikely]] {
+        FootStats& f = s.foot[a.mark.writer];
+        const size_t foot = static_cast<size_t>(a.foot);
+        ++f.reads[foot];
+        f.wait_ns[foot] += wait_ns;
+        if (a.foot == FootRead::Outside) {
+            f.outside_compared += compared ? 1 : 0;
+            f.outside_differed += differed ? 1 : 0;
+        } else if (a.foot == FootRead::Inside) {
+            f.inside_compared += compared ? 1 : 0;
+            f.inside_differed += differed ? 1 : 0;
+        }
+        if (a.foot != FootRead::NoFootprint) {
+            if (const auto it = f.residues.find(a.foot_residue); it != f.residues.end()) {
+                ++it->second;
+            } else if (f.residues.size() < 32) {
+                f.residues.emplace(a.foot_residue, 1);
+            }
+        }
     }
     if (a.dry != DryRead::None) [[unlikely]] {
         DryStats& d = s.dry[a.mark.writer];
@@ -963,6 +1248,193 @@ inline void LogTicks(State& s, double frames) {
         }
     }
     t = TickCounts{};
+}
+
+/// FRITCHII_STORE_FOOTPRINT: a footprint as text: the modulus and the stored residues.
+[[nodiscard]] inline std::string FootprintText(const Shader::StorageStoreFootprint& f) {
+    if (!f.Valid()) {
+        return fmt::format("none ({})", Shader::StoreFootprintWhyName(f.why));
+    }
+    std::string text;
+    if (f.modulus == (u64{1} << 32)) {
+        text = "exact offsets";
+    } else {
+        text = fmt::format("modulus {:#x}{}", f.modulus,
+                           f.PowerOfTwo() ? "" : " (not a power of two: holds while the 32-bit "
+                                                 "offset doesn't wrap)");
+    }
+    text += f.covers_all ? ", stores cover every residue (claims nothing):" : ", stored bytes";
+    for (size_t i = 0; i < f.num_intervals && !f.covers_all; ++i) {
+        text += fmt::format(" +{:#x}..+{:#x}", f.intervals[i].begin, f.intervals[i].end - 1);
+    }
+    text += fmt::format(" | {} stores, {}{}", f.stores,
+                        f.ids_only ? "ids only" : "with loaded/cbuf/loop multiples",
+                        f.widened ? ", gaps filled" : "");
+    return text;
+}
+
+/// FRITCHII_STORE_FOOTPRINT: the "Store footprint" lines (LogDry, every 10 s).
+inline void LogFootprint(double frames, double seconds) {
+    std::unordered_map<Writer, FootStats, WriterHash> foot;
+    {
+        State& s = Get();
+        std::scoped_lock lock{s.mutex};
+        foot.swap(s.foot);
+    }
+    const auto ms_frame = [frames](u64 ns) { return static_cast<double>(ns) / 1e6 / frames; };
+    FootStats total{};
+    for (const auto& [writer, f] : foot) {
+        for (size_t k = 0; k < FootReads; ++k) {
+            total.reads[k] += f.reads[k];
+            total.wait_ns[k] += f.wait_ns[k];
+        }
+        total.outside_compared += f.outside_compared;
+        total.outside_differed += f.outside_differed;
+        total.inside_compared += f.inside_compared;
+        total.inside_differed += f.inside_differed;
+    }
+    u64 reads = 0;
+    u64 wait_ns = 0;
+    for (size_t k = 0; k < FootReads; ++k) {
+        reads += total.reads[k];
+        wait_ns += total.wait_ns[k];
+    }
+    // The footprints recorded at binds so far (the whole session)
+    u32 recorded = 0, valid = 0, claims_nothing = 0, power_of_two = 0, ids_only = 0;
+    std::array<u32, 16> whys{};
+    {
+        FootprintTable& t = GetFootprints();
+        const u32 count = t.count.load(std::memory_order_acquire);
+        for (u32 id = 1; id < count; ++id) {
+            const Shader::StorageStoreFootprint& f = t.entries[id];
+            ++recorded;
+            if (!f.Valid()) {
+                ++whys[static_cast<size_t>(f.why) & 15];
+                continue;
+            }
+            ++valid;
+            claims_nothing += f.covers_all ? 1 : 0;
+            power_of_two += f.PowerOfTwo() ? 1 : 0;
+            ids_only += f.ids_only ? 1 : 0;
+        }
+    }
+    using Why = Shader::StoreFootprintWhy;
+    const auto why_count = [&](Why why) { return whys[static_cast<size_t>(why)]; };
+    constexpr auto O = static_cast<size_t>(FootRead::Outside);
+    constexpr auto I = static_cast<size_t>(FootRead::Inside);
+    constexpr auto CI = static_cast<size_t>(FootRead::CoveredInside);
+    constexpr auto CN = static_cast<size_t>(FootRead::CoveredNoFootprint);
+    constexpr auto N = static_cast<size_t>(FootRead::NoFootprint);
+    LOG_INFO(HW_GPU,
+             "Store footprint (FRITCHII_STORE_FOOTPRINT={}, dry) last {:.0f} s: {} reads to the "
+             "back with a write mark over their bytes, waited {:.2f} ms a frame | outside the "
+             "newest mark's footprint and no older mark covers them (would be answered from guest "
+             "memory) {} ({:.2f} ms a frame) | inside the footprint {} ({:.2f}) | outside, but an "
+             "older mark covers them: inside its footprint {} ({:.2f}), without a footprint {} "
+             "({:.2f}) | newest mark without a footprint {} ({:.2f}) | must be 0: outside reads "
+             "whose bytes changed at landing {} of {} compared (inside: {} of {}) | program "
+             "bindings bound {}: with a footprint {} ({} claim nothing, {} power-of-two moduli, {} "
+             "ids only), without: not recorded {}, a store stays global {}, pointer picked at run "
+             "time {}, global stores {}, address not split {}, no single pointer term {}, no "
+             "stores {}",
+             g_store_footprint.Get(), seconds, reads, ms_frame(wait_ns), total.reads[O],
+             ms_frame(total.wait_ns[O]), total.reads[I], ms_frame(total.wait_ns[I]),
+             total.reads[CI], ms_frame(total.wait_ns[CI]), total.reads[CN],
+             ms_frame(total.wait_ns[CN]), total.reads[N], ms_frame(total.wait_ns[N]),
+             total.outside_differed, total.outside_compared, total.inside_differed,
+             total.inside_compared, recorded, valid, claims_nothing, power_of_two, ids_only,
+             why_count(Why::NotRecorded), why_count(Why::UntrackedWrites),
+             why_count(Why::RuntimeRouted), why_count(Why::GlobalStore),
+             why_count(Why::AddressNotTracked), why_count(Why::NoPointerTerm),
+             why_count(Why::NoStores));
+    std::vector<std::pair<const Writer*, const FootStats*>> order;
+    order.reserve(foot.size());
+    for (const auto& [writer, f] : foot) {
+        order.emplace_back(&writer, &f);
+    }
+    const auto total_wait = [](const FootStats& f) {
+        u64 ns = 0;
+        for (size_t k = 0; k < FootReads; ++k) {
+            ns += f.wait_ns[k];
+        }
+        return ns;
+    };
+    const size_t shown = (std::min<size_t>)(8, order.size());
+    std::partial_sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(shown),
+                      order.end(), [&](const auto& a, const auto& b) {
+                          return total_wait(*a.second) > total_wait(*b.second);
+                      });
+    for (size_t i = 0; i < shown; ++i) {
+        const Writer& writer = *order[i].first;
+        const FootStats& f = *order[i].second;
+        std::string footprint = "no footprint recorded at a bind (not a native written binding)";
+        if (writer.kind == WriterKind::ComputeStorage) {
+            if (const auto* recorded_footprint = FootprintOf(writer.program, writer.binding)) {
+                footprint = FootprintText(*recorded_footprint);
+            }
+        }
+        // The most common read residues
+        std::vector<std::pair<u64, u64>> residues(f.residues.begin(), f.residues.end());
+        const size_t top = (std::min<size_t>)(4, residues.size());
+        std::partial_sort(residues.begin(), residues.begin() + static_cast<std::ptrdiff_t>(top),
+                          residues.end(),
+                          [](const auto& a, const auto& b) { return a.second > b.second; });
+        std::string read_residues;
+        for (size_t j = 0; j < top; ++j) {
+            read_residues += fmt::format("{}+{:#x} ({})", j == 0 ? "" : ", ", residues[j].first,
+                                         residues[j].second);
+        }
+        if (read_residues.empty()) {
+            read_residues = "-";
+        }
+        const bool draw =
+            writer.kind == WriterKind::DrawStorage || writer.kind == WriterKind::DrawTexture;
+        const std::string binding = draw ? fmt::format("stage {} binding {}", writer.binding / 64,
+                                                       writer.binding % 64)
+                                         : fmt::format("binding {}", writer.binding);
+        LOG_INFO(HW_GPU,
+                 "Store footprint {}/{}: {} program {:016x} {} | waited {:.2f} ms a frame | "
+                 "outside {} ({:.2f} ms a frame), inside {} ({:.2f}), covered by an older mark: "
+                 "inside its footprint {} ({:.2f}) / without one {} ({:.2f}), no footprint {} "
+                 "({:.2f}) | must be 0: outside reads changed at landing {} of {} (inside {} of "
+                 "{}) | read offsets mod the modulus: {} | footprint: {}",
+                 i + 1, shown, WriterKindName(writer.kind), writer.program, binding,
+                 ms_frame(total_wait(f)), f.reads[O], ms_frame(f.wait_ns[O]), f.reads[I],
+                 ms_frame(f.wait_ns[I]), f.reads[CI], ms_frame(f.wait_ns[CI]), f.reads[CN],
+                 ms_frame(f.wait_ns[CN]), f.reads[N], ms_frame(f.wait_ns[N]),
+                 f.outside_differed, f.outside_compared, f.inside_differed, f.inside_compared,
+                 read_residues, footprint);
+    }
+}
+
+/// BufferCache::TickFrame, every frame while the ring is on: the 10 s lines of the dry switches
+/// FRITCHII_STORE_FOOTPRINT and FRITCHII_FEEDER_LANE (nothing while both are off).
+inline void LogDry() {
+    if (!g_store_footprint && !EarlyCompute::g_lane) {
+        return;
+    }
+    static std::chrono::steady_clock::time_point start{};
+    static u64 start_frame = 0;
+    const auto now = std::chrono::steady_clock::now();
+    const u64 frame = g_frame.load(std::memory_order_relaxed);
+    if (start == std::chrono::steady_clock::time_point{}) {
+        start = now;
+        start_frame = frame;
+        return;
+    }
+    const double seconds = std::chrono::duration<double>(now - start).count();
+    if (seconds < 10.0) {
+        return;
+    }
+    const double frames = static_cast<double>((std::max<u64>)(frame - start_frame, 1));
+    start = now;
+    start_frame = frame;
+    if (g_store_footprint) {
+        LogFootprint(frames, seconds);
+    }
+    if (EarlyCompute::g_lane) {
+        EarlyCompute::LogLane(frames, seconds);
+    }
 }
 
 /// BufferCache::TickFrame, every 600 frames (after advancing g_frame).

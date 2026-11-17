@@ -396,6 +396,11 @@ public:
 
     /// FRITCHII_EARLY_COMPUTE (dry): sets EarlyCompute::t_verdict for the dispatch being bound.
     void JudgeEarlyCompute();
+    /// FRITCHII_FEEDER_LANE (dry): sets EarlyCompute::t_lane (D) for the feeder being bound.
+    template <typename IsFree>
+    void JudgeFeederLane(IsFree&& is_free);
+    /// FRITCHII_FEEDER_LANE (dry): after a judged feeder's binds (its upload, the counts).
+    void NoteFeederLaneBound();
 
     void SetUniformBuffersState(const std::array<u32, NUM_STAGES>& mask,
                                 const UniformBufferSizes* sizes);
@@ -440,12 +445,14 @@ public:
     }
 
     /// write_extent: how far the program's stores reach past the pointer (native programs).
-    /// extra: FRITCHII_EXTENT_CENSUS and FRITCHII_EXTENT_CBUF (Shader::Info::storage_write_extras,
-    /// null when the program has none).
+    /// extra: FRITCHII_EXTENT_CENSUS, FRITCHII_EXTENT_CBUF and FRITCHII_STORE_FOOTPRINT
+    /// (Shader::Info::storage_write_extras, null when the program has none).
+    /// read_extent: FRITCHII_FEEDER_LANE (Shader::Info::storage_read_extents, null when none).
     void BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
                                   bool is_written, u32 indirect_offset = ~0U,
                                   const Shader::StorageWriteExtent& write_extent = {},
-                                  const Shader::StorageWriteExtra* extra = nullptr);
+                                  const Shader::StorageWriteExtra* extra = nullptr,
+                                  const Shader::StorageWriteExtent* read_extent = nullptr);
 
     void UnbindComputeTextureBuffers();
 
@@ -1540,6 +1547,14 @@ private:
     /// binding's start its cbuf proof would mark (0: none); BindHostComputeStorageBuffers hands it
     /// to the read ring's write marks (ReadRunStats::t_proven_end).
     std::array<u32, NUM_STORAGE_BUFFERS> cbuf_dry_proven{};
+    /// FRITCHII_STORE_FOOTPRINT: per storage binding of the dispatch being bound, its footprint
+    /// (an id of ReadRunStats' footprint table, 0: none) and the pointer's device address;
+    /// BindHostComputeStorageBuffers hands it to the write marks (ReadRunStats::t_footprint).
+    std::array<ReadRunStats::FootprintRef, NUM_STORAGE_BUFFERS> footprint_dry{};
+    /// FRITCHII_FEEDER_LANE: per storage binding of the dispatch being bound, the bytes from the
+    /// binding's start its loads and atomics can reach (its proven read extent), ~0: unknown
+    /// (the whole binding). JudgeEarlyCompute narrows the feeder's inputs with it.
+    std::array<u64, NUM_STORAGE_BUFFERS> lane_read_end{};
 
     std::optional<u64> ResolveCbufExtent(const Shader::StorageCbufExtent& extent,
                                          const std::array<u32, 3>& block,
@@ -1718,6 +1733,22 @@ public:
                 return 0;
             }
             const u64 start = ReadRunStats::NowNs();
+            // FRITCHII_FEEDER_LANE (dry): first the feeder's D (and D with its upload on the lane),
+            // older ticks of the same queue, so the reader's whole wait is what it was.
+            if (EarlyCompute::g_lane && !side_tick && a.area_mark.lane.judged) [[unlikely]] {
+                const auto wait_for = [&](u64 tick, u64& ns) {
+                    if (tick == 0 || tick >= a.write_tick) {
+                        return;
+                    }
+                    if (!runtime.WaitTickIfSubmitted(tick)) {
+                        a.lane_unsubmitted = true;
+                        return;
+                    }
+                    ns = ReadRunStats::NowNs() - start;
+                };
+                wait_for(a.lane_copy_tick, a.lane_copy_ns);
+                wait_for(a.lane_tick, a.lane_ns);
+            }
             if (!runtime.WaitTickIfSubmitted(side_tick ? *side_tick : a.write_tick)) {
                 return 0;
             }

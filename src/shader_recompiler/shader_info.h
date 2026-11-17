@@ -184,13 +184,16 @@ struct StorageBufferDescriptor {
     auto operator<=>(const StorageBufferDescriptor&) const = default;
 };
 
-/// FRITCHII_EXTENT_CENSUS / FRITCHII_EXTENT_CBUF: what the store analysis found for a written
-/// storage buffer whose write_extent is unknown (Info::storage_write_extras).
+/// FRITCHII_EXTENT_CENSUS / FRITCHII_EXTENT_CBUF / FRITCHII_STORE_FOOTPRINT: what the store
+/// analysis found for a written storage buffer (Info::storage_write_extras).
 struct StorageWriteExtra {
     /// Why write_extent is unknown (Known when proven)
     ExtentUnknownWhy write_unknown{};
     /// The store extent with constant buffer words in it (unbounded when none was found)
     StorageCbufExtent cbuf_extent{};
+    /// FRITCHII_STORE_FOOTPRINT: the bytes its stores can land on, as residues (none unless
+    /// written and every store's offset is the pointer plus a known congruence)
+    StorageStoreFootprint footprint{};
 };
 
 struct TextureBufferDescriptor {
@@ -425,6 +428,8 @@ struct Info {
     /// other than the descriptors' means none. Not stored with the info (info_serialize.cpp): empty
     /// for an info from the precompiled cache.
     std::vector<StorageWriteExtra> storage_write_extras;
+    // (FRITCHII_STORE_FOOTPRINT keeps its footprints in the extras too: they are there for every
+    // program with a written storage buffer now.)
     TextureBufferDescriptors texture_buffer_descriptors;
     ImageBufferDescriptors image_buffer_descriptors;
     TextureDescriptors texture_descriptors;
@@ -450,6 +455,16 @@ u32 NumDescriptors(const Descriptors& descriptors) {
     return info.storage_write_extras.size() == info.storage_buffers_descriptors.size() &&
                    index < info.storage_write_extras.size()
                ? &info.storage_write_extras[index]
+               : nullptr;
+}
+
+/// FRITCHII_FEEDER_LANE: storage descriptor `index`'s read extent (its loads and atomics), or null
+/// when the info has none.
+[[nodiscard]] inline const StorageWriteExtent* StorageReadExtentOf(const Info& info,
+                                                                   size_t index) {
+    return info.storage_read_extents.size() == info.storage_buffers_descriptors.size() &&
+                   index < info.storage_read_extents.size()
+               ? &info.storage_read_extents[index]
                : nullptr;
 }
 

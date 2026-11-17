@@ -261,6 +261,8 @@ void BufferCache<P>::TickFrame() {
     if (ReadRunStats::g_enabled) [[unlikely]] {
         ReadRunStats::g_frame.fetch_add(1, std::memory_order_relaxed);
         ReadRunStats::FrameTick();
+        // FRITCHII_STORE_FOOTPRINT / FRITCHII_FEEDER_LANE: their 10 s lines
+        ReadRunStats::LogDry();
         if (frame_tick % 600 == 0) {
             if constexpr (!IS_OPENGL) {
                 if (EarlyCompute::g_side_copy.Get() >= 2) {
@@ -596,6 +598,14 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
                     writer.write_tick = ticks.write;
                     writer.read_tick = ticks.current;
                     writer.known_tick = ticks.known;
+                    // FRITCHII_FEEDER_LANE: the writing feeder's D as ticks (0: nothing unrun)
+                    const EarlyCompute::Lane& lane = writer.area_mark.lane;
+                    if (EarlyCompute::g_lane && lane.judged) [[unlikely]] {
+                        writer.lane_tick =
+                            lane.d != 0 ? runtime.ReadWriterTicks(lane.d).write : 0;
+                        writer.lane_copy_tick =
+                            lane.d_copy != 0 ? runtime.ReadWriterTicks(lane.d_copy).write : 0;
+                    }
                 }
             }
             writer.compared =
@@ -1911,10 +1921,39 @@ void BufferCache<P>::BindHostComputeBuffers() {
     }
     if (EarlyCompute::t_verdict != EarlyCompute::Verdict::NotJudged) [[unlikely]] {
         EarlyCompute::NoteJudged(EarlyCompute::t_verdict, any_buffer_uploaded);
+        if (EarlyCompute::t_lane.judged) {
+            NoteFeederLaneBound();
+            EarlyCompute::t_lane = {};
+        }
     }
     if (any_buffer_uploaded) {
         runtime.PostCopyBarrier();
         any_buffer_uploaded = false;
+    }
+}
+
+template <class P>
+void BufferCache<P>::NoteFeederLaneBound() {
+    // FRITCHII_FEEDER_LANE (dry): a bind that uploaded CPU data puts D in its own chunk (the
+    // copy is recorded right before the dispatch); D_copy is what the lane would wait for if it
+    // took the copy too.
+    if constexpr (!IS_OPENGL) {
+        EarlyCompute::Lane& lane = EarlyCompute::t_lane;
+        if (any_buffer_uploaded && lane.kind != EarlyCompute::LaneKind::Wrapped) {
+            lane.d = (std::max)(lane.d, runtime.CurrentTick());
+            lane.kind = EarlyCompute::LaneKind::Upload;
+            ReadRunStats::PatchLaneUpload(
+                ReadRunStats::g_dispatches.load(std::memory_order_relaxed), compute_shader_hash,
+                lane.d);
+        }
+        u32 storage_bindings = 0;
+        u32 read_extents = 0;
+        ForEachEnabledBit(channel_state->enabled_compute_storage_buffers, [&](u32 index) {
+            ++storage_bindings;
+            read_extents += lane_read_end[index] != ~u64{0} ? 1 : 0;
+        });
+        EarlyCompute::NoteLaneJudged(compute_shader_hash, lane, any_buffer_uploaded,
+                                     storage_bindings, read_extents);
     }
 }
 
@@ -1971,6 +2010,89 @@ void BufferCache<P>::JudgeEarlyCompute() {
             }
         }
         EarlyCompute::t_verdict = verdict;
+        if (EarlyCompute::g_lane) {
+            JudgeFeederLane(is_free);
+        }
+    }
+}
+
+template <class P>
+template <typename IsFree>
+void BufferCache<P>::JudgeFeederLane(IsFree&& is_free) {
+    if constexpr (!IS_OPENGL) {
+        // FRITCHII_FEEDER_LANE (dry): D, the newest unrun main-queue work this feeder really
+        // depends on. Its inputs: uniform and texture buffers whole; a native storage binding's
+        // reads up to its proven read extent (else the whole binding) plus, when written, its
+        // write mark (write after write). Its outputs (write after read): the write marks.
+        boost::container::small_vector<std::pair<DAddr, DAddr>, 24> inputs;
+        boost::container::small_vector<std::pair<DAddr, DAddr>, 8> outputs;
+        const auto add_whole = [&](const Binding& binding, bool is_written) {
+            if (binding.segment_count != 0) {
+                for (u32 i = 0; i < binding.segment_count &&
+                                binding.segment_first + i < compute_segments.size();
+                     ++i) {
+                    const MultiRangeSegment& segment = compute_segments[binding.segment_first + i];
+                    inputs.emplace_back(segment.device_addr, segment.device_addr + segment.size);
+                    if (is_written) {
+                        outputs.emplace_back(segment.device_addr,
+                                             segment.device_addr + segment.size);
+                    }
+                }
+                return;
+            }
+            if (binding.size == 0 || binding.device_addr == 0) {
+                return;
+            }
+            inputs.emplace_back(binding.device_addr, binding.device_addr + binding.size);
+            if (is_written) {
+                outputs.emplace_back(binding.device_addr, binding.device_addr + binding.size);
+            }
+        };
+        ForEachEnabledBit(channel_state->enabled_compute_uniform_buffer_mask, [&](u32 index) {
+            add_whole(channel_state->compute_uniform_buffers[index], false);
+        });
+        ForEachEnabledBit(channel_state->enabled_compute_storage_buffers, [&](u32 index) {
+            const Binding& binding = channel_state->compute_storage_buffers[index];
+            const bool is_written =
+                ((channel_state->written_compute_storage_buffers >> index) & 1) != 0;
+            if (binding.segment_count != 0 || binding.size == 0 || binding.device_addr == 0) {
+                add_whole(binding, is_written);
+                return;
+            }
+            const bool native =
+                ((channel_state->native_compute_storage_buffers >> index) & 1) != 0;
+            const u64 read_end = (std::min<u64>)(lane_read_end[index], binding.size);
+            const u64 write_end =
+                native ? (std::min<u64>)(channel_state->compute_storage_write_marks[index],
+                                         binding.size)
+                       : binding.size;
+            if (read_end != 0) {
+                inputs.emplace_back(binding.device_addr, binding.device_addr + read_end);
+            }
+            if (is_written && write_end != 0) {
+                inputs.emplace_back(binding.device_addr, binding.device_addr + write_end);
+                outputs.emplace_back(binding.device_addr, binding.device_addr + write_end);
+            }
+        });
+        ForEachEnabledBit(channel_state->enabled_compute_texture_buffers, [&](u32 index) {
+            add_whole(channel_state->compute_texture_buffers[index],
+                      ((channel_state->written_compute_texture_buffers >> index) & 1) != 0);
+        });
+        EarlyCompute::LaneDep dep = ReadRunStats::NewestPendingMark(inputs, is_free);
+        dep.Merge(EarlyCompute::NewestPendingUse(outputs, is_free));
+        EarlyCompute::Lane lane{
+            .d = dep.d,
+            .d_copy = dep.d_copy,
+            .kind = dep.d != 0 ? dep.kind : EarlyCompute::LaneKind::None,
+            .copy_kind = dep.d_copy != 0 ? dep.copy_kind : EarlyCompute::LaneKind::None,
+            .judged = true,
+        };
+        if (dep.incomplete) {
+            // Not every dependency is known: its own chunk
+            lane.d = lane.d_copy = runtime.CurrentTick();
+            lane.kind = lane.copy_kind = EarlyCompute::LaneKind::Wrapped;
+        }
+        EarlyCompute::t_lane = lane;
     }
 }
 
@@ -2117,6 +2239,8 @@ void BufferCache<P>::UnbindComputeStorageBuffers() {
         request.active = false;
     }
     cbuf_dry_proven.fill(0);
+    footprint_dry.fill({});
+    lane_read_end.fill(~u64{0});
     channel_state->native_compute_storage_buffers = 0;
     channel_state->image_compute_texture_buffers = 0;
 }
@@ -2125,7 +2249,8 @@ template <class P>
 void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
                                               bool is_written, u32 indirect_offset,
                                               const Shader::StorageWriteExtent& write_extent,
-                                              const Shader::StorageWriteExtra* extra) {
+                                              const Shader::StorageWriteExtra* extra,
+                                              const Shader::StorageWriteExtent* read_extent) {
     if (ssbo_index >= channel_state->compute_storage_buffers.size()) [[unlikely]] {
         LOG_ERROR(HW_GPU, "Storage buffer index {} exceeds maximum storage buffer count",
                   ssbo_index);
@@ -2296,6 +2421,19 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
                     cbuf_dry_proven[ssbo_index] = static_cast<u32>(cbuf_proven);
                 }
             }
+            // FRITCHII_STORE_FOOTPRINT=3 (dry): the binding's store footprint for its write marks,
+            // counted from the pointer (a binding of several device ranges has none).
+            if (ReadRunStats::g_store_footprint && binding.segment_count == 0) [[unlikely]] {
+                static constexpr Shader::StorageStoreFootprint NoFootprint{};
+                const GPUVAddr pointer = read_pointer();
+                const u64 pad = pointer >= binding.gpu_addr ? pointer - binding.gpu_addr : 0;
+                footprint_dry[ssbo_index] = ReadRunStats::FootprintRef{
+                    .id = ReadRunStats::InternFootprint(
+                        compute_shader_hash, static_cast<u32>(ssbo_index),
+                        extra != nullptr ? extra->footprint : NoFootprint),
+                    .base = binding.device_addr + pad,
+                };
+            }
             if (census != 0 || cbuf_mode != 0) [[unlikely]] {
                 // Every native written binding (the census ranks them by read-back waits too)
                 NoteExtentCensus(static_cast<u32>(ssbo_index), binding, cbuf_index, cbuf_offset,
@@ -2317,6 +2455,28 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
         }
     }
     channel_state->compute_storage_write_marks[ssbo_index] = static_cast<u32>(mark);
+    // FRITCHII_FEEDER_LANE (dry): how far a native binding's loads and atomics reach, for the
+    // feeder's D (JudgeEarlyCompute). Unknown (the whole binding) without a proven read extent.
+    if constexpr (!IS_OPENGL) {
+        if (EarlyCompute::g_lane && native_pointer && read_extent != nullptr &&
+            read_extent->bounded && binding.size != 0 && binding.segment_count == 0)
+            [[unlikely]] {
+            const auto& qmd = launch_desc;
+            const std::array<u32, 3> block{qmd.block_dim_x.Value(), qmd.block_dim_y.Value(),
+                                           qmd.block_dim_z.Value()};
+            std::optional<std::array<u32, 3>> grid;
+            if (!Inputs().IndirectComputeAddress()) {
+                grid = std::array<u32, 3>{qmd.grid_dim_x.Value(), qmd.grid_dim_y.Value(),
+                                          qmd.grid_dim_z.Value()};
+            }
+            if (const std::optional<u64> bytes =
+                    Shader::ResolveStorageWriteExtent(*read_extent, block, grid)) {
+                const GPUVAddr pointer = Inputs().ReadGameU64(ssbo_addr);
+                const u64 pad = pointer >= binding.gpu_addr ? pointer - binding.gpu_addr : 0;
+                lane_read_end[ssbo_index] = std::min<u64>(binding.size, pad + *bytes);
+            }
+        }
+    }
 }
 
 template <class P>
@@ -6371,6 +6531,7 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
         if (ReadRunStats::g_enabled) [[unlikely]] {
             ReadRunStats::t_writer = {};
             ReadRunStats::t_proven_end = 0;
+            ReadRunStats::t_footprint = {};
         }
     };
     ForEachEnabledBit(channel_state->enabled_compute_storage_buffers, [&](u32 index) {
@@ -6382,6 +6543,8 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
             // FRITCHII_EXTENT_CBUF=3: where the cbuf proof would have ended this binding's mark
             ReadRunStats::t_proven_end =
                 cbuf_dry_proven[index] != 0 ? binding.device_addr + cbuf_dry_proven[index] : 0;
+            // FRITCHII_STORE_FOOTPRINT=3: this binding's footprint (none: id 0)
+            ReadRunStats::t_footprint = footprint_dry[index];
         }
         if (profile) {
             Nx2Profile::Add(Nx2Profile::Counter::ComputeStorageBindings, 1);

@@ -364,3 +364,77 @@ TEST_CASE("A constant buffer read at a computed offset leaves the cbuf extent un
     CHECK(extra.write_unknown.kind == Shader::ExtentUnknown::DynamicCbuf);
     CHECK_FALSE(extra.cbuf_extent.ids.bounded);
 }
+
+TEST_CASE("Record stores keep a footprint modulo the record stride", "[shader][storage_extent]") {
+    // A record picked by a constant buffer word, stride 0x100: stores at +0x20..+0x2f and
+    // +0x40..+0x43, never +0x10
+    KernelProgram fixture;
+    IR::IREmitter ir{fixture.entry};
+    const IR::U32 record{ir.IMul(Word(ir, 0x1a0), ir.Imm32(0x100))};
+    ir.WriteGlobal128(Address(ir, 0x170, ir.IAdd(record, ir.Imm32(0x20))),
+                      ir.CompositeConstruct(ir.Imm32(0), ir.Imm32(0), ir.Imm32(0), ir.Imm32(0)));
+    ir.WriteGlobal32(Address(ir, 0x170, ir.IAdd(record, ir.Imm32(0x40))), ir.Imm32(0));
+    const Shader::StorageStoreFootprint& footprint{fixture.Extra(0x170).footprint};
+    REQUIRE(footprint.Valid());
+    CHECK(footprint.modulus == 0x100);
+    CHECK_FALSE(footprint.ids_only);
+    CHECK_FALSE(footprint.covers_all);
+    REQUIRE(footprint.num_intervals == 2);
+    CHECK(footprint.intervals[0].begin == 0x20);
+    CHECK(footprint.intervals[0].end == 0x30);
+    CHECK(footprint.intervals[1].begin == 0x40);
+    CHECK(footprint.intervals[1].end == 0x44);
+    CHECK_FALSE(Shader::StoreFootprintHits(footprint, 0x310, 8));
+    CHECK(Shader::StoreFootprintHits(footprint, 0x32c, 8));
+    CHECK(Shader::StoreFootprintHits(footprint, 0x543, 1));
+    CHECK_FALSE(Shader::StoreFootprintHits(footprint, -0xf0, 4)); // +0x10 of the record before
+}
+
+TEST_CASE("Stores a lane apart cover every residue", "[shader][storage_extent]") {
+    KernelProgram fixture;
+    IR::IREmitter ir{fixture.entry};
+    const IR::U32 lane{ir.ShiftLeftLogical(ir.LocalInvocationIdX(), ir.Imm32(2))};
+    ir.WriteGlobal32(Address(ir, 0x170, lane), ir.Imm32(0));
+    const Shader::StorageStoreFootprint& footprint{fixture.Extra(0x170).footprint};
+    REQUIRE(footprint.Valid());
+    CHECK(footprint.modulus == 4);
+    CHECK(footprint.ids_only);
+    CHECK(footprint.covers_all);
+    CHECK(Shader::StoreFootprintHits(footprint, 0x10, 1));
+}
+
+TEST_CASE("Constant stores have an exact footprint", "[shader][storage_extent]") {
+    KernelProgram fixture;
+    IR::IREmitter ir{fixture.entry};
+    ir.WriteGlobal32(Address(ir, 0x170, ir.Imm32(0x40)), ir.Imm32(1));
+    ir.WriteGlobal32(Address(ir, 0x170, ir.Imm32(0xfffffff0)), ir.Imm32(1)); // 16 bytes below
+    const Shader::StorageStoreFootprint& footprint{fixture.Extra(0x170).footprint};
+    REQUIRE(footprint.Valid());
+    CHECK(footprint.modulus == (u64{1} << 32));
+    CHECK(Shader::StoreFootprintHits(footprint, 0x40, 4));
+    CHECK_FALSE(Shader::StoreFootprintHits(footprint, 0x44, 4));
+    CHECK(Shader::StoreFootprintHits(footprint, -0x10, 4));
+    CHECK_FALSE(Shader::StoreFootprintHits(footprint, -0x20, 4));
+}
+
+TEST_CASE("A record stride that is not a power of two keeps its residues",
+          "[shader][storage_extent]") {
+    // 0x330-byte records picked by a loaded index: stores at +0x40 and (two records on) +0x48
+    const std::array<Shader::StoreCongruence, 2> stores{{
+        {.c = 0x40, .m = 0x330, .size = 4},
+        {.c = -0x330 + 0x48, .m = 0x660, .size = 4},
+    }};
+    const Shader::StorageStoreFootprint footprint{
+        Shader::MakeStoreFootprint(stores.data(), stores.size(), false)};
+    REQUIRE(footprint.Valid());
+    CHECK(footprint.modulus == 0x330);
+    CHECK_FALSE(footprint.PowerOfTwo());
+    REQUIRE(footprint.num_intervals == 2);
+    CHECK(footprint.intervals[0].begin == 0x40);
+    CHECK(footprint.intervals[0].end == 0x44);
+    CHECK(footprint.intervals[1].begin == 0x48);
+    CHECK(footprint.intervals[1].end == 0x4c);
+    CHECK_FALSE(Shader::StoreFootprintHits(footprint, 0x330 * 5 + 0x10, 8));
+    CHECK(Shader::StoreFootprintHits(footprint, 0x330 * 5 + 0x48, 1));
+    CHECK(Shader::StoreFootprintHits(footprint, -0x330 + 0x40, 4));
+}

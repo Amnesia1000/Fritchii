@@ -1648,7 +1648,8 @@ const MemStage::DispatchPacket* MemStage::FillDispatchHere(Cache& cache_,
             cache_.BindComputeStorageBuffer(
                 ssbo_index, desc.cbuf_index, desc.cbuf_offset, desc.is_written,
                 desc.indirect_offset, desc.write_extent,
-                Shader::StorageWriteExtraOf(*facts.info, ssbo_index));
+                Shader::StorageWriteExtraOf(*facts.info, ssbo_index),
+                Shader::StorageReadExtentOf(*facts.info, ssbo_index));
             ++ssbo_index;
         }
         cache_.UnbindComputeTextureBuffers();
@@ -2190,7 +2191,8 @@ u64 MemStage::FillRingDispatch(Cache& cache_, const DispatchFacts& facts, u64 po
             cache_.BindComputeStorageBuffer(
                 ssbo_index, desc.cbuf_index, desc.cbuf_offset, desc.is_written,
                 desc.indirect_offset, desc.write_extent,
-                Shader::StorageWriteExtraOf(*facts.info, ssbo_index));
+                Shader::StorageWriteExtraOf(*facts.info, ssbo_index),
+                Shader::StorageReadExtentOf(*facts.info, ssbo_index));
             ++ssbo_index;
         }
         cache_.UnbindComputeTextureBuffers();

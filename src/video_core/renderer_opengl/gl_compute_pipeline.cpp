@@ -91,7 +91,8 @@ void ComputePipeline::Configure() {
                                               desc.is_written, desc.indirect_offset,
 
                                               desc.write_extent,
-                                              Shader::StorageWriteExtraOf(info, ssbo_index));
+                                              Shader::StorageWriteExtraOf(info, ssbo_index),
+                                              Shader::StorageReadExtentOf(info, ssbo_index));
         ++ssbo_index;
     }
     texture_cache.SynchronizeDescriptors(true);
