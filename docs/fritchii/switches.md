@@ -713,6 +713,30 @@ outside the allocators MiB; small card profile ...". Judge under EDEN_NX2_VRAM_L
 not lower; with no limit on a 16 GB card, FRITCHII_SMALL_CARD=2 must log "not a small card" and
 change nothing.
 
+### FRITCHII_IMAGE_DEVICE_LOCAL
+
+TEST, off by default (helper DQ, 2026-11-17; port of a low-VRAM fork's fix). Boot: 0 off, 1 on, 2
+dry. Discrete GPUs only (integrated: logged and ignored). An image's first try in the default heaps
+is "within the budget, prefer device memory" with nothing required, so once the device heap is over
+its budget VMA moves on to a host memory type still within its budget and succeeds silently: the
+image lives in system RAM, the GPU samples it over PCIe (the other fork measured 9.4 GB of images
+there in the market, 150 ms frames), and the texture cache never sees pressure because the device
+heap's usage does not count it. =1: the tries within the budget in the default heaps (the plain
+first try, the depth pool refusal retry, the kept-blocks retry) require DEVICE_LOCAL; custom pools
+keep their own memory type. A full device heap then refuses the image: that is a pressure event
+like any refused image (with the native thresholds the texture cache keeps 512 MiB more free, "Out
+of device memory: keeping N MiB more free"; the budget control and FRITCHII_TC_CRITICAL_ENFORCE
+work as before), and
+the old fallbacks place it as before (without the budget check, device memory first; host memory
+only when the device really is out). =2: placement unchanged, only counts. Logs: at boot
+"FRITCHII_IMAGE_DEVICE_LOCAL=N: ..."; then "Image device-local (FRITCHII_IMAGE_DEVICE_LOCAL=N,
+event): first tries refused R, of those placed over budget in device memory D; host memory images
+H (M MiB), by the first try F" each time R or H reaches a power of two, then every 1024. With =2, F
+is the silent spill =1 removes. Test: 8 GB simulation (EDEN_NX2_VRAM_LIMIT_MIB=8192 +
+FRITCHII_VRAM_SIM_OTHERS=1) at the market, first =2 (is F above 0 at all?), then =1 vs 0 fresh
+(boot switch): host images and hitch lines down, pressure events up, fps and 1% lows not lower.
+On a 16 GB card without a limit both modes must log nothing after boot.
+
 ### FRITCHII_VRAM_POOL_FIT
 
 TEST, off by default (helper BF, 2026-11-16; 8 GB cards). Live: 1 = EXP42's image pool (pooled
