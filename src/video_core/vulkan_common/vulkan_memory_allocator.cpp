@@ -368,7 +368,7 @@ struct DepthPoolEntry {
     VmaAllocator owner;
     u32 type;
     VmaPool pool;
-    bool small; ///< FRITCHII_DEPTH_POOL_FIT's pool for small depth targets
+    bool is_small; ///< FRITCHII_DEPTH_POOL_FIT's pool for small depth targets
 };
 static std::mutex g_depth_pool_mutex;
 static std::vector<DepthPoolEntry> g_depth_pools;
@@ -386,7 +386,7 @@ static VkDeviceSize SmallDepthBlockBytes() {
 
 /// The depth pool (or with `small` FRITCHII_DEPTH_POOL_FIT's small one) of a memory type, made on
 /// first use.
-static VmaPool DepthPoolOfType(VmaAllocator allocator, u32 type, bool small);
+static VmaPool DepthPoolOfType(VmaAllocator allocator, u32 type, bool is_small);
 
 static VmaPool DepthAttachmentPool(VmaAllocator allocator, const VkImageCreateInfo &ci,
                                    const VmaAllocationCreateInfo &alloc_ci) {
@@ -407,11 +407,11 @@ static VmaPool DepthAttachmentPool(VmaAllocator allocator, const VkImageCreateIn
     return DepthPoolOfType(allocator, type, false);
 }
 
-static VmaPool DepthPoolOfType(VmaAllocator allocator, u32 type, bool small) {
+static VmaPool DepthPoolOfType(VmaAllocator allocator, u32 type, bool is_small) {
     auto& pools = g_depth_pools;
     std::scoped_lock lock{g_depth_pool_mutex};
     for (const DepthPoolEntry& entry : pools) {
-        if (entry.owner == allocator && entry.type == type && entry.small == small) {
+        if (entry.owner == allocator && entry.type == type && entry.is_small == is_small) {
             return entry.pool;
         }
     }
@@ -426,8 +426,8 @@ static VmaPool DepthPoolOfType(VmaAllocator allocator, u32 type, bool small) {
     const VmaPoolCreateInfo pool_ci{
         .memoryTypeIndex = type,
         .flags = 0,
-        .blockSize = small ? SmallDepthBlockBytes() : 64_MiB,
-        .minBlockCount = small ? 0U : min_blocks,
+        .blockSize = is_small ? SmallDepthBlockBytes() : 64_MiB,
+        .minBlockCount = is_small ? 0U : min_blocks,
         .maxBlockCount = 0,
         .priority = 0.f,
         .minAllocationAlignment = 0,
@@ -438,11 +438,11 @@ static VmaPool DepthPoolOfType(VmaAllocator allocator, u32 type, bool small) {
         return VK_NULL_HANDLE;
     }
     // Named, so VMA's detailed map (FRITCHII_VRAM_HOLES) tells the pools apart.
-    vmaSetPoolName(allocator, pool, small ? "depth small" : "depth");
+    vmaSetPoolName(allocator, pool, is_small ? "depth small" : "depth");
     LOG_INFO(Render_Vulkan, "Depth attachment pool (EDEN_NX2_DEPTH_POOL{}) for memory type {}: {} MiB "
-             "blocks", small ? ", FRITCHII_DEPTH_POOL_FIT small" : "", type,
+             "blocks", is_small ? ", FRITCHII_DEPTH_POOL_FIT small" : "", type,
              pool_ci.blockSize >> 20);
-    pools.push_back({allocator, type, pool, small});
+    pools.push_back({allocator, type, pool, is_small});
     return pool;
 }
 
@@ -837,12 +837,12 @@ bool TryDepthFit(const Device& device, VmaAllocator allocator, const VkImageCrea
     }
     VmaPool pool = large_pool;
     VkDeviceSize block = 64_MiB;
-    bool small = false;
+    bool is_small = false;
     if ((mode & 2) != 0 && size <= SmallDepthBlockBytes() / 4) {
         if (const VmaPool small_pool = DepthPoolOfType(allocator, type, true)) {
             pool = small_pool;
             block = SmallDepthBlockBytes();
-            small = true;
+            is_small = true;
         }
     }
     if (size > block) {
@@ -873,7 +873,7 @@ bool TryDepthFit(const Device& device, VmaAllocator allocator, const VkImageCrea
         vk::g_image_padding_bytes.fetch_add(padding, std::memory_order_relaxed);
     }
     g_fit_placed.fetch_add(1, std::memory_order_relaxed);
-    if (small) {
+    if (is_small) {
         g_fit_small.fetch_add(1, std::memory_order_relaxed);
     }
     handle = image;
@@ -1665,7 +1665,7 @@ std::vector<NamedPool> PoolsOf(const Device& device, VmaAllocator owner) {
         for (const DepthPoolEntry& entry : g_depth_pools) {
             if (entry.owner == owner) {
                 pools.push_back(
-                    {entry.pool, entry.type, entry.small ? "small depth pool" : "depth pool"});
+                    {entry.pool, entry.type, entry.is_small ? "small depth pool" : "depth pool"});
             }
         }
     }
