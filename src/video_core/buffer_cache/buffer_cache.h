@@ -4120,6 +4120,57 @@ bool BufferCache<P>::IsRegionGpuModified(DAddr addr, size_t size) {
 }
 
 template <class P>
+template <typename Func>
+bool BufferCache<P>::ForEachComputeWriteMark(Func&& func) const {
+    // As BindHostComputeStorageBuffers marks: min(the cap, the native write mark).
+    bool bounded = true;
+    ForEachEnabledBit(channel_state->enabled_compute_storage_buffers &
+                          channel_state->written_compute_storage_buffers,
+                      [&](u32 index) {
+                          const Binding& binding = channel_state->compute_storage_buffers[index];
+                          if (binding.device_addr == 0 || binding.size == 0) {
+                              return; // a null binding: nothing marked
+                          }
+                          const bool native =
+                              ((channel_state->native_compute_storage_buffers >> index) & 1) != 0;
+                          const u64 limit = channel_state->compute_storage_write_marks[index];
+                          const u64 capped = WrittenStorageMarkSize(binding.size);
+                          if (!native || binding.segment_count != 0 || limit >= binding.size ||
+                              (capped < binding.size && capped <= limit)) {
+                              bounded = false;
+                              return;
+                          }
+                          if (limit != 0) {
+                              func(binding.device_addr, limit);
+                          }
+                      });
+    return bounded;
+}
+
+template <class P>
+auto BufferCache<P>::ComputeSkipRangeFacts(DAddr addr, u64 size) -> SkipRangeFacts {
+    PromoteAhead();
+    SkipRangeFacts facts{};
+    const DAddr end = addr + size;
+    u64 covered = 0;
+    ForEachGpuWrittenHere(addr, size, [&](DAddr lower, DAddr upper) {
+        const DAddr begin = (std::max)(lower, addr);
+        const DAddr stop = (std::min)(upper, end);
+        if (begin < stop) {
+            covered += stop - begin;
+        }
+    });
+    facts.all_gpu_written = covered >= size;
+    facts.cpu_modified = memory_tracker.IsRegionCpuModified(addr, size);
+    const DAddr page_begin = Common::AlignDown(addr, Core::DEVICE_PAGESIZE);
+    const u64 page_size = Common::AlignUp(end, Core::DEVICE_PAGESIZE) - page_begin;
+    facts.read_back = memory_tracker.IsRegionPreflushable(page_begin, page_size) ||
+                      cpu_read_ranges.Intersects(page_begin, page_size) ||
+                      read_download_ranges.Intersects(page_begin, page_size);
+    return facts;
+}
+
+template <class P>
 bool BufferCache<P>::IsRegionRegistered(DAddr addr, size_t size) {
     const DAddr end_addr = addr + size;
     const u64 page_end = Common::DivCeil(end_addr, CACHING_PAGESIZE);

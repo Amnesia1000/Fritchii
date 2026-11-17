@@ -821,6 +821,9 @@ enum class DispatchCount : u8 {
     /// R: an image's real range (the texture cache's backing image) reaches past E's record
     /// (a view into a larger image: the lent path would record more; not a must-be-0)
     ImageWiderThanRecord,
+    /// lent: FRITCHII_ASYNC_COMPUTE_SKIP on and the pipeline not built yet (the lent call
+    /// decides to skip or wait before anything is marked)
+    Unbuilt,
     Count,
 };
 /// The kinds that count a posted dispatch a second time (not in the line's total).
@@ -848,6 +851,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(DispatchCount::Coun
         "lent: byte-addressed image write", "posted writing images", "posted indirect",
         "lent indirect grid over the limit (dry)", "posted images ranged",
         "posted images unbounded", "images on a front read page", "images wider than E's record",
+        "lent: unbuilt pipeline (FRITCHII_ASYNC_COMPUTE_SKIP)",
 };
 /// E: the first reason a dispatch cannot be posted before its lookup, Count when it may be;
 /// DispatchCount::Posted (never returned) is not a reason. Returns Count too when the switch is

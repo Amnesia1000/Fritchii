@@ -508,6 +508,18 @@ public:
     /// not run yet (its MarkModification tick; with the switch on only).
     [[nodiscard]] bool EarlyImageWritePending(ImageViewId id) noexcept;
 
+    /// FRITCHII_ASYNC_COMPUTE_SKIP (renderer_vulkan/vk_async_compute_skip.h), the lock held:
+    /// what the images on [addr, addr + size) hold, for a written storage image there.
+    enum class SkipImageState : u8 {
+        Redrawn,     ///< one image covers the range; every image there holds GPU writes only,
+                     ///< written in each of the last REDRAWN_WRITE_FRAMES render frames (up to
+                     ///< this one or the one before)
+        NoImage,     ///< no image covers the range (the dispatch would make one)
+        NoGpuData,   ///< an image there is not GPU-modified, or has CPU writes to upload
+        NotRedrawn,  ///< an image there was not written in every one of those frames
+    };
+    [[nodiscard]] SkipImageState ComputeSkipImageState(DAddr addr, u64 size);
+
     /// Create channel state.
     void CreateChannel(Tegra::Control::ChannelState& channel) final override;
 
