@@ -2399,6 +2399,25 @@ before invalidating it, 16 = fences wait for the GPU work before them.
 EDEN_NX2_HOST_PACE: the host frame pacer (vk_host_pacer.h). 1 = on (default), 0 = only
 measure how long each frame was shown.
 
+### FRITCHII_PACE_FIX
+
+FRITCHII_PACE_FIX (live, default 0; bits): fixes for the capped 60 FPS judder at 120 Hz (~1.5% of
+frames shown 3 refreshes, 25 ms; capped 1% low 40). The pacer's lead (how long before the
+intended refresh a held frame is presented) adapts +0.5 ms per miss and -0.01 ms per hit, which
+settles where ~2% of frames miss by design; every miss is a 25 ms frame and moves the schedule a
+refresh later (the backlog that the catch-up and EXP70's drops then clear).
+- 1 = present early: hold a frame only until just after the refresh before its intended one
+  (lead = a refresh minus a guard of 15% of a refresh, 1-3 ms, raised 0.25 ms whenever a frame
+  shows a refresh early). The frame is still shown at the same refresh (no extra input lag), but
+  the copy and the compositor get ~7 ms instead of ~3. The catch-up looks at when the frame
+  reached the present thread instead of when the thread woke.
+- 2 = copy before the hold: the present thread copies the frame to the swapchain image and
+  submits that before the hold and holds only vkQueuePresentKHR, so the copy's GPU time and
+  the submit lock are out of the lead.
+The "Host pacing" line ends with the proof: "misses: catch-up / woke late / slow copy / after
+present (time left at present)", "copy to present" mean/max, "game late" (frames that reached
+the present thread after their refresh) and "early" (shown a refresh early).
+
 ### EDEN_NX2_ARB_SPIN
 
 EDEN_NX2_ARB_SPIN (ported; off by default here, the original uses 8): microseconds a

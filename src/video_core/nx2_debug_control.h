@@ -360,6 +360,9 @@ inline std::atomic<int> g_gpu_siblings_free{-1};
 inline std::atomic<int> g_focus_grab{-1};
 /// FRITCHII_ONEF_RAISE_AFTER_LEND (live, default 0): docs/fritchii/switches.md.
 inline std::atomic<int> g_onef_raise_after_lend{-1};
+/// FRITCHII_PACE_FIX (live, default 0): docs/fritchii/switches.md (vk_host_pacer.cpp,
+/// vk_present_manager.cpp).
+inline std::atomic<int> g_pace_fix{-1};
 /// FRITCHII_ONEF (boot): one follower step 1, the render thread R (one_follower.h).
 inline std::atomic<int> g_onef{-1};
 /// FRITCHII_ONEF_VIEW (live): step 2, needs FRITCHII_ONEF=1.

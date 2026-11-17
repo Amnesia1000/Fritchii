@@ -52,6 +52,20 @@ bool CanBlitToSwapchain(const vk::PhysicalDevice& physical_device, VkFormat form
     return (props.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT);
 }
 
+/// The host pacer's hold: sleeps until a millisecond before `target`, then yields until it.
+void HoldUntil(std::chrono::steady_clock::time_point target, const std::stop_token* token) {
+    using Clock = std::chrono::steady_clock;
+    for (auto now = Clock::now(); now < target && !(token != nullptr && token->stop_requested());
+         now = Clock::now()) {
+        const auto left = target - now;
+        if (left > std::chrono::microseconds{1500}) {
+            std::this_thread::sleep_for(left - std::chrono::microseconds{1000});
+        } else {
+            std::this_thread::yield();
+        }
+    }
+}
+
 [[nodiscard]] VkImageSubresourceLayers MakeImageSubresourceLayers() {
     return VkImageSubresourceLayers{
         .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
@@ -506,6 +520,7 @@ void PresentManager::PresentThread(std::stop_token token) {
 
 bool PresentManager::PaceFrame(Frame* frame, std::stop_token token) {
     using Clock = std::chrono::steady_clock;
+    deferred_hold.reset();
     pacer.NoteQueued(frame->queued_at);
     const VkPresentModeKHR mode = swapchain.PresentMode();
     // Mailbox with a game faster than the display (Ocarina of Time's high refresh rate above the
@@ -573,15 +588,8 @@ bool PresentManager::PaceFrame(Frame* frame, std::stop_token token) {
             return false;
         }
         Common::Nx2Timeline::Span span{"present: host pacing hold"};
-        for (auto now = start; now < target && !token.stop_requested(); now = Clock::now()) {
-            const auto left = target - now;
-            if (left > std::chrono::microseconds{1500}) {
-                std::this_thread::sleep_for(left - std::chrono::microseconds{1000});
-            } else {
-                std::this_thread::yield();
-            }
-        }
-        pacer.NoteHold(Clock::now() - start);
+        HoldUntil(target, &token);
+        pacer.NoteHold(start, Clock::now());
         return true;
     }
     VideoCommon::Nx2Perf::g_host_phase_ns.store(-1, std::memory_order_relaxed);
@@ -589,16 +597,15 @@ bool PresentManager::PaceFrame(Frame* frame, std::stop_token token) {
     if (target <= start) {
         return false;
     }
-    Common::Nx2Timeline::Span span{"present: host pacing hold"};
-    for (auto now = start; now < target && !token.stop_requested(); now = Clock::now()) {
-        const auto left = target - now;
-        if (left > std::chrono::microseconds{1500}) {
-            std::this_thread::sleep_for(left - std::chrono::microseconds{1000});
-        } else {
-            std::this_thread::yield();
-        }
+    if ((pacer.Fix() & 2) != 0) {
+        // FRITCHII_PACE_FIX 2: CopyToSwapchainImpl copies and submits first and holds only the
+        // present, so the copy's GPU time and the submit lock are not taken from the lead.
+        deferred_hold = DeferredHold{start, target};
+        return true;
     }
-    pacer.NoteHold(Clock::now() - start);
+    Common::Nx2Timeline::Span span{"present: host pacing hold"};
+    HoldUntil(target, &token);
+    pacer.NoteHold(start, Clock::now());
     return true;
 }
 
@@ -921,6 +928,17 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
             vk::Check(result);
             break;
         }
+    }
+
+    // FRITCHII_PACE_FIX 2: the host pacer's hold, now that the copy is on the GPU.
+    if (deferred_hold) {
+        const DeferredHold hold = *deferred_hold;
+        deferred_hold.reset();
+        {
+            Common::Nx2Timeline::Span span{"present: host pacing hold"};
+            HoldUntil(hold.target, nullptr);
+        }
+        pacer.NoteHold(hold.start, std::chrono::steady_clock::now());
     }
 
     // Present
