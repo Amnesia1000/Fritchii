@@ -737,6 +737,19 @@ FRITCHII_VRAM_SIM_OTHERS=1) at the market, first =2 (is F above 0 at all?), then
 (boot switch): host images and hitch lines down, pressure events up, fps and 1% lows not lower.
 On a 16 GB card without a limit both modes must log nothing after boot.
 
+### FRITCHII_BUFFER_POOL_BLOCK_MB
+
+TEST, off by default (helper DQ, 2026-11-17; port of a low-VRAM fork's change). Boot: 0 = 16 MiB
+blocks (as before); n = n MiB blocks (1-64) for the buffer cache's device-local VMA pool
+(Device::SeparatePool::DeviceBuffers, both allocators when they are split), and buffers over half
+a block take the default blocks. The other fork uses 4 (2 MiB cut-off): buffer cache buffers live
+a few per 16 MiB block, and a block stays while any of them does, mostly empty. Not the same as
+FRITCHII_SMALL_CARD_BUFFER_BLOCK_MIB (the buffer allocator's default blocks). Log at boot:
+"FRITCHII_BUFFER_POOL_BLOCK_MB: device buffer pool blocks N MiB, buffers over K KiB take the
+default blocks". Judge by the "buffer pool" slack in FRITCHII_VRAM_OWNERS / FRITCHII_VRAM_REPORT
+and the Churn line's device allocations (smaller blocks = more vkAllocateMemory calls), fresh
+launches.
+
 ### FRITCHII_VRAM_POOL_FIT
 
 TEST, off by default (helper BF, 2026-11-16; 8 GB cards). Live: 1 = EXP42's image pool (pooled

@@ -303,6 +303,10 @@ public:
         DeviceBuffers,
     };
     static constexpr VkDeviceSize SeparatePoolBlockSize = 16ULL << 20;
+    /// Block size of the DeviceBuffers pools; allocations over half of it take the default
+    /// blocks. FRITCHII_BUFFER_POOL_BLOCK_MB (boot, default 0 = SeparatePoolBlockSize): buffer
+    /// cache buffers live a few per block, so 16 MiB blocks can stay pinned mostly empty.
+    static VkDeviceSize DeviceBufferBlockSize() noexcept;
 
     /// The pool of that kind for a memory type in `owner` (GetAllocator or GetBufferAllocator),
     /// created on first use (null if that failed).

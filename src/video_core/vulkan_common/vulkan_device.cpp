@@ -1434,6 +1434,30 @@ u64 Device::KeptBlockBytes() const noexcept {
     return kept_blocks ? kept_blocks->KeptBytes() : 0;
 }
 
+VkDeviceSize Device::DeviceBufferBlockSize() noexcept {
+    // FRITCHII_BUFFER_POOL_BLOCK_MB=<n> (boot, default 0 = 16 MiB): n MiB blocks (1..64) for the
+    // buffer cache's device-local pool, buffers over half a block take the default blocks.
+    // 4 = small blocks with a 2 MiB cut-off: a 16 MiB block holds a few buffers and stays
+    // pinned while any of them lives, mostly empty ("buffer pool" slack in VRAM_OWNERS).
+    static const VkDeviceSize size = [] {
+        const char* value = std::getenv("FRITCHII_BUFFER_POOL_BLOCK_MB");
+        if (value == nullptr || value[0] == '\0') {
+            return SeparatePoolBlockSize;
+        }
+        const long mib = std::strtol(value, nullptr, 10);
+        if (mib <= 0) {
+            return SeparatePoolBlockSize;
+        }
+        const VkDeviceSize clamped = static_cast<VkDeviceSize>((std::min)(mib, 64L)) << 20;
+        LOG_INFO(Render_Vulkan,
+                 "FRITCHII_BUFFER_POOL_BLOCK_MB: device buffer pool blocks {} MiB, buffers over "
+                 "{} KiB take the default blocks",
+                 clamped >> 20, (clamped / 2) >> 10);
+        return clamped;
+    }();
+    return size;
+}
+
 VmaPool Device::GetSeparatePool(VmaAllocator owner, SeparatePool kind, u32 memory_type) const {
     std::scoped_lock lk{separate_pools_mutex};
     // Each allocator has its own pools: a pool belongs to the allocator that made it.
@@ -1444,7 +1468,8 @@ VmaPool Device::GetSeparatePool(VmaAllocator owner, SeparatePool kind, u32 memor
         const VmaPoolCreateInfo ci{
             .memoryTypeIndex = memory_type,
             .flags = 0,
-            .blockSize = SeparatePoolBlockSize,
+            .blockSize = kind == SeparatePool::DeviceBuffers ? DeviceBufferBlockSize()
+                                                             : SeparatePoolBlockSize,
             .minBlockCount = 0,
             .maxBlockCount = 0,
             .priority = 0.f,
