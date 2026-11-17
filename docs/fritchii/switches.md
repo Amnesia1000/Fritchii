@@ -317,6 +317,26 @@ there). Why: on Intel Iris Xe (Windows driver 101.7092) every typeless image rea
 The driver reports formatless reads per format through format features 2. Check: an Intel Windows
 tester with the switch at 1, the warning gone and the scene drawn.
 
+### FRITCHII_TEST_MARK
+
+Boot. Only for stamped test copies (video_core/test_watermark.cpp); plain builds have no mark,
+create nothing for it and never log it. How the on-screen test mark is drawn:
+- 1 (default; any value other than 0 and 3): Vulkan draws the mark as one textured quad over its
+  bounding box. Its pixels (shadow, text, transparent elsewhere) go into a small float texture,
+  uploaded only when they change (a new layout or window size; moving to the next spot every
+  minute only moves the quad), sampled 1:1 with nearest filtering and blended "over", so colours
+  and position are the same as with 3.
+- 3: as before, two vkCmdClearAttachments calls inside the present render pass with one rect per
+  block (~370 rects). For an A/B: on an AMD RX 9070 XT at 4K this cost ~10 ms (up to ~17 ms) of
+  GPU time in the present submission every frame; NVIDIA barely noticed.
+- 0: no on-screen mark. Only the drawing is skipped: the stamp stays in the exe and the log's
+  "Build hash:" line is unchanged.
+
+OpenGL draws the mark with scissored clears for 1 and 3 and skips it for 0. The log says once,
+on the first frame with a mark, which way is used: "Test mark: one textured draw
+(FRITCHII_TEST_MARK=1)", "Test mark: two clears (FRITCHII_TEST_MARK=3)", "Test mark: off
+(FRITCHII_TEST_MARK=0)" or "Test mark: clears (OpenGL) (...)".
+
 ### FRITCHII_DEVICE_FAULT
 
 On by default (helper BH, 2026-11-16, port of the device fault part of zortos293/Lichii #512).
