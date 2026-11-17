@@ -84,11 +84,6 @@ ComputePipeline::ComputePipeline(const Device& device, TextureCache& texture_cac
 void ComputePipeline::Configure() {
     buffer_cache.SetComputeUniformBufferState(info.constant_buffer_mask, &uniform_buffer_sizes);
     buffer_cache.UnbindComputeStorageBuffers();
-    // FRITCHII_EXTENT_CENSUS / FRITCHII_EXTENT_CBUF: one per descriptor, or none
-    const std::span<const Shader::StorageWriteExtra> extras{
-        info.storage_write_extras.size() == info.storage_buffers_descriptors.size()
-            ? std::span<const Shader::StorageWriteExtra>{info.storage_write_extras}
-            : std::span<const Shader::StorageWriteExtra>{}};
     size_t ssbo_index{};
     for (const auto& desc : info.storage_buffers_descriptors) {
         ASSERT(desc.count == 1);
@@ -96,8 +91,7 @@ void ComputePipeline::Configure() {
                                               desc.is_written, desc.indirect_offset,
 
                                               desc.write_extent,
-                                              ssbo_index < extras.size() ? &extras[ssbo_index]
-                                                                         : nullptr);
+                                              Shader::StorageWriteExtraOf(info, ssbo_index));
         ++ssbo_index;
     }
     texture_cache.SynchronizeDescriptors(true);

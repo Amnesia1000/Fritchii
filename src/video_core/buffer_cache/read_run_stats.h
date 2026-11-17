@@ -72,10 +72,15 @@ inline bool ReadRunsValue(bool writer_ticks) {
     if (EarlyCompute::g_early || EarlyCompute::g_side_copy || EarlyCompute::g_submit_times) {
         return true;
     }
-    // FRITCHII_EXTENT_CBUF=3 (dry) counts its reads on the ring too ("Extent cbuf" lines).
+    // FRITCHII_EXTENT_CBUF=3 (dry) counts its reads on the ring too ("Extent cbuf" lines), and
+    // FRITCHII_EXTENT_CENSUS ranks program bindings by their read-back waits.
     if (!writer_ticks) {
         const char* cbuf = std::getenv("FRITCHII_EXTENT_CBUF");
         if (cbuf != nullptr && cbuf[0] == '3') {
+            return true;
+        }
+        const char* census = std::getenv("FRITCHII_EXTENT_CENSUS");
+        if (census != nullptr && census[0] != '\0' && census[0] != '0') {
             return true;
         }
     }
@@ -505,11 +510,20 @@ struct DryStats {
     u64 inside_differed{};
 };
 
+/// FRITCHII_EXTENT_CENSUS: per writer, the reads its newest marks sent to the back (taken by
+/// the "Extent census" lines every 10 s while g_wait_census is set).
+struct WaitStats {
+    u64 reads{};
+    u64 wait_ns{};
+};
+inline std::atomic<bool> g_wait_census{false};
+
 struct State {
     std::mutex mutex;
     Counts counts;
     TickCounts ticks;
     std::unordered_map<Writer, DryStats, WriterHash> dry;
+    std::unordered_map<Writer, WaitStats, WriterHash> waits;
     /// The "Read writer" lines: reads whose bytes a mark in the ring covers, by its writer.
     std::unordered_map<Writer, WriterStats, WriterHash> writers;
     u64 previous_page{std::numeric_limits<u64>::max()};
@@ -692,6 +706,11 @@ inline void NoteWriter(Kind kind, u64 wait_ns, const WriterAnswer& a, const u8* 
         ++(a.page_only ? c.writer_page_only : c.writer_none);
         return;
     }
+    if (g_wait_census.load(std::memory_order_relaxed)) [[unlikely]] {
+        WaitStats& waited = s.waits[a.mark.writer];
+        ++waited.reads;
+        waited.wait_ns += wait_ns;
+    }
     if (a.dry != DryRead::None) [[unlikely]] {
         DryStats& d = s.dry[a.mark.writer];
         const size_t dry = static_cast<size_t>(a.dry);
@@ -735,6 +754,15 @@ inline void NoteWriter(Kind kind, u64 wait_ns, const WriterAnswer& a, const u8* 
     w.compared += compared ? 1 : 0;
     w.differed += differed ? 1 : 0;
     w.dispatches_after += a.dispatches_after;
+}
+
+/// FRITCHII_EXTENT_CENSUS: the per-writer read-back waits since the last call.
+[[nodiscard]] inline std::unordered_map<Writer, WaitStats, WriterHash> TakeWaits() {
+    State& s = Get();
+    std::scoped_lock lock{s.mutex};
+    std::unordered_map<Writer, WaitStats, WriterHash> taken;
+    taken.swap(s.waits);
+    return taken;
 }
 
 /// FRITCHII_EXTENT_CBUF=3: the per-writer dry read counts since the last call.

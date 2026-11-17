@@ -1513,6 +1513,10 @@ private:
         Unresolved, ///< a word not readable, the guard fails, or an indirect grid
     };
     struct ExtentCensusEntry {
+        u64 dispatches{};          ///< every bind of it while the census or the cbuf switch is on
+        u64 marked_bytes{};        ///< what they marked
+        u64 unknown_dispatches{};  ///< with the store extent unknown
+        u64 no_extra_dispatches{}; ///< of them, with no Shader::StorageWriteExtra (no reason)
         u64 full_dispatches{};
         u64 full_bytes{};
         std::array<u64, static_cast<size_t>(FullMarkWhy::Count)> whys{};
@@ -1544,7 +1548,8 @@ private:
     void NoteExtentCensus(u32 ssbo_index, const Binding& binding, u32 cbuf_index, u32 cbuf_offset,
                           u64 mark, FullMarkWhy why, const Shader::ExtentUnknownWhy& write_unknown,
                           const Shader::StorageCbufExtent& cbuf_extent, CbufOutcome cbuf_outcome,
-                          u64 cbuf_proven, bool cbuf_marked);
+                          u64 cbuf_proven, bool cbuf_marked, bool extent_unknown,
+                          bool has_extra);
     void LogExtentCensus();
 
     /// Whether a GPU write to this range is copied back at the next fence. Ranges the guest CPU

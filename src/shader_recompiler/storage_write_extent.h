@@ -128,7 +128,7 @@ struct ExtentUnknownWhy {
 [[nodiscard]] constexpr const char* ExtentUnknownName(ExtentUnknown kind) {
     switch (kind) {
     case ExtentUnknown::Unrecorded:
-        return "not recorded (info from the precompiled cache)";
+        return "not recorded (no extra: a precompiled-cache info, or a bind path without it)";
     case ExtentUnknown::Known:
         return "proven";
     case ExtentUnknown::OtherCbufWord:

@@ -1121,13 +1121,18 @@ only. A native compute program's storage pointer has no size, so a dispatch whos
 unknown marks the whole FRITCHII_BARE_SSBO_MIB window (16 MiB) GPU-written. The store analysis
 (StoreExtentAnalysis) now keeps its first exit per buffer (Shader::ExtentUnknownWhy, not stored
 with the info: programs from the precompiled cache have "not recorded", so boot with
-EDEN_NX2_PRECOMPILED_FAST=0 for the reasons). Every 10 s: "Extent census (FRITCHII_EXTENT_CENSUS)
-last S s: N native written bindings marked in full a second (M MiB/s) over B program bindings; U
-of those dispatches have no reason recorded ...", then for the top 8 program bindings by bytes
-marked "Extent census i/n: program <hash> binding <ssbo> (pointer cX[0xY]) | D full-marked
-dispatches/s, M MiB marked/s (K KiB each) | why unknown: <reason> | full mark because: unknown,
-indirect grid, 16-bit guard or dims, distrusted, checking new dims, proof covers the binding |
-cbuf extent: <terms or none>". Reasons: "index from a constant buffer word cI[0xO]" (which word),
+EDEN_NX2_PRECOMPILED_FAST=0 for the reasons). Set at boot it also turns the read ring on
+(FRITCHII_READ_RUNS=1's) to rank by read-back waits; live it only ranks by bytes. Every 10 s:
+"Extent census (FRITCHII_EXTENT_CENSUS) last S s: N native written bindings a second, F of them
+marked in full (M MiB/s) over B program bindings; extent unknown U/s, X/s of those with no reason
+recorded (must be 0 with EDEN_NX2_PRECOMPILED_FAST=0) | read-back waits W ms a frame over K
+writers", then the top 8 writers by read-back wait ms a frame ("Extent census read-back i/n: ...",
+any writer: a bare native binding gets the full line below, others a short line naming their kind),
+then the top 8 others by bytes marked in full ("Extent census marked i/n: ..."). Full line:
+"program <hash> binding <ssbo> (pointer cX[0xY]) | read-back R reads, W ms a frame | D
+dispatches/s, F full-marked/s, M MiB marked/s (K KiB binding) | why unknown: <reason> | full mark
+because: unknown, indirect grid, 16-bit guard or dims, distrusted, checking new dims, proof covers
+the binding | cbuf extent: <terms or none>". Reasons: "index from a constant buffer word cI[0xO]" (which word),
 "index loaded from memory (<opcode>)", "loop-carried index", "index from an atomic", "signed or
 64-bit math (<opcode>)", "variable times variable", "instruction not bounded (<opcode>)", "a store
 stays global", "pointer picked at run time", and the analysis' other exits by name. "cbuf extent"
@@ -1160,7 +1165,8 @@ unresolved U, marked by the proof (=1) L | proven K KiB of B KiB on average | re
 its marks (=3): inside the proof I (ms a frame), would be freed R (ms a frame), past the proof but
 under an older mark of the same writer / another writer | must be 0: freed reads whose bytes
 changed at landing X of Y compared (inside: ...)". The freed ms a frame is the ceiling of =1 for
-that program.
+that program. With no binding to try: "Extent cbuf (...) last S s: no native written binding had a
+cbuf extent; extent unknown U dispatches/s, X/s of them with no reason recorded".
 
 ### FRITCHII_HOSTTIMING_OFF_GPU
 

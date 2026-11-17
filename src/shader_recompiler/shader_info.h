@@ -443,6 +443,16 @@ u32 NumDescriptors(const Descriptors& descriptors) {
     return num;
 }
 
+/// FRITCHII_EXTENT_CENSUS / FRITCHII_EXTENT_CBUF: storage descriptor `index`'s extra, or null
+/// when the info has none (every BindComputeStorageBuffer caller passes this).
+[[nodiscard]] inline const StorageWriteExtra* StorageWriteExtraOf(const Info& info,
+                                                                  size_t index) {
+    return info.storage_write_extras.size() == info.storage_buffers_descriptors.size() &&
+                   index < info.storage_write_extras.size()
+               ? &info.storage_write_extras[index]
+               : nullptr;
+}
+
 
 /// Operations of a handle program, a stack machine over 32-bit words. Operands follow the
 /// operation code in the program; values are popped right operand first.
