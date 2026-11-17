@@ -622,6 +622,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_HOSTTIMING_PRIORITY") {
         return &g_hosttiming_priority;
     }
+    if (name == "FRITCHII_HOSTTIMING_OFF_GPU") {
+        return &g_hosttiming_off_gpu;
+    }
     if (name == "FRITCHII_GPU_PRIORITY") {
         return &g_gpu_priority;
     }

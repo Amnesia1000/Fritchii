@@ -347,6 +347,8 @@ inline std::atomic<int> g_zero_upload{-1};
 inline std::atomic<int> g_hosttiming_spin_budget{-1};
 /// FRITCHII_HOSTTIMING_PRIORITY (live, default 0): docs/fritchii/switches.md (core_timing.cpp).
 inline std::atomic<int> g_hosttiming_priority{-1};
+/// FRITCHII_HOSTTIMING_OFF_GPU (live, default 0): docs/fritchii/switches.md (core_timing.cpp).
+inline std::atomic<int> g_hosttiming_off_gpu{-1};
 /// FRITCHII_GPU_PRIORITY (live, default 0): docs/fritchii/switches.md (fritchii_focus.h).
 inline std::atomic<int> g_gpu_priority{-1};
 /// FRITCHII_THREAD_QOS (live, default 0): docs/fritchii/switches.md (fritchii_focus.h).

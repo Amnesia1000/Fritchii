@@ -368,6 +368,19 @@ public:
             NoteMethodWrite(engine, method);
         }
     }
+    /// FRITCHII_CB_MERGE: 0 off, 1 dry count, 2 verify (joined, with the front's address before
+    /// each joined run, compared on E), 3 on (joined).
+    [[nodiscard]] static int CbMergeMode() {
+        return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_cb_merge,
+                                                "FRITCHII_CB_MERGE");
+    }
+    /// FRITCHII_CB_MERGE >= 2 (front, Maxwell3D::FrontWriteSend): a constant buffer size,
+    /// address or offset register write that would have ended the open CbWords block (as a
+    /// PairWrite) goes into the block instead, as a Sink-tagged Method word the back applies as
+    /// that Pairs entry would (ConsumeSink, ApplyPairs). False (nothing sent): the caller sends
+    /// it as before. Only while the block is the ring's last entry, not with the memory stage's
+    /// ring or the E split (their readers take every block word as a constant buffer word).
+    bool CbJoinPair(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument, int mode);
     /// FRITCHII_CB_WORDS_BLOCK (Maxwell3D::FrontWrite): a 3D constant buffer data word, as the
     /// Method word Method (`direct` false) or MacroWrite (`direct` true) would send it, appended
     /// to the open CbWords block or opening one. The block is open only until anything else is
@@ -379,8 +392,11 @@ public:
     /// entry ends, so a position inside the block counts as run exactly when the whole block ran.
     /// `verify_address` (FRITCHII_CB_WORDS_BLOCK=2): the front's address of the word, kept for a
     /// new block's first word, which the back compares with its registers.
+    /// `merge_address` (FRITCHII_CB_MERGE=2): the front's address of the word, marked before it
+    /// when it starts a joined run (cb_merge_mark_next); 0 otherwise.
     void CbWord(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument, bool is_last,
-                bool direct, Effect effect, const GPUVAddr* verify_address) {
+                bool direct, Effect effect, const GPUVAddr* verify_address,
+                GPUVAddr merge_address = 0) {
         const u64 word = static_cast<u64>(Kind::Method) | (is_last ? IsLast : 0) |
                          (direct ? Direct : 0) | (u64{method & 0xffff} << 8) |
                          (u64{argument} << 32);
@@ -391,6 +407,30 @@ public:
                 cb_count < MaxCbWords && verify == cb_verify &&
                 write_position + 1 - consumed_cache <= RingWords) [[likely]] {
                 if (write_position == cb_end) [[likely]] {
+                    if (cb_merge_mark_next) [[unlikely]] {
+                        // FRITCHII_CB_MERGE=2: the marker, the front's address, then the word,
+                        // committed together (a publish between would strand the marker).
+                        cb_merge_mark_next = false;
+                        if (merge_address != 0 && index + 2 < RingWords &&
+                            cb_count + 3 <= MaxCbWords &&
+                            write_position + 3 - consumed_cache <= RingWords) {
+                            ring[index] = static_cast<u64>(Kind::Method) | Sink |
+                                          (u64{CbMarkMethod} << 8);
+                            ring[index + 1] = merge_address;
+                            ring[index + 2] = word;
+                            cb_count += 3;
+                            *cb_header = (*cb_header & 0xffff'ffffULL) | (u64{cb_count} << 32);
+                            ++cb_stats.words;
+                            ++cb_join.marks;
+                            Commit(3, effect);
+                            cb_end = write_position;
+                            if (engine->memory_write_mask[method]) {
+                                NoteMethodWrite(engine, method);
+                            }
+                            return;
+                        }
+                        ++cb_join.marks_skipped;
+                    }
                     ring[index] = word;
                     ++cb_count;
                     *cb_header = (*cb_header & 0xffff'ffffULL) | (u64{cb_count} << 32);
@@ -408,7 +448,8 @@ public:
                 ++cb_stats.full;
             }
         }
-        // FRITCHII_CB_MERGE=1 (dry): what split this block from the previous one.
+        // FRITCHII_CB_MERGE=1/2 (dry count): what split this block from the previous one.
+        cb_merge_mark_next = false;
         if (CbMergeOn()) [[unlikely]] {
             NoteCbMergeGap(engine);
         }
@@ -1780,6 +1821,8 @@ private:
     static constexpr u64 Direct = 1 << 6; ///< Method: call it even if not executable (macros)
     static constexpr u64 Sink = 1 << 7;   ///< Method: into the method sink, tagged (SinkMethod)
     static constexpr u64 CbVerify = 1 << 4; ///< CbWords: FRITCHII_CB_WORDS_BLOCK=2, word 1 held
+    /// CbWords: FRITCHII_CB_MERGE >= 2 joined register writes (and marks) into the block.
+    static constexpr u64 CbJoined = 1 << 5;
     /// The most words a CbWords block holds: one back gather (Execute, CallConstBufferWords).
     static constexpr u32 MaxCbWords = 64;
 
@@ -2743,10 +2786,39 @@ private:
     u64 cb_merge_last_gap_samples{};
     u64 cb_merge_last_gap_ticks{};
     void NoteCbMergeGap(Tegra::Engines::EngineInterface* engine);
+    /// The dry counters and timers run at 1 (the count) and 2 (verify), not at 3.
     [[nodiscard]] static bool CbMergeOn() {
-        return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_cb_merge,
-                                                "FRITCHII_CB_MERGE") != 0;
+        const int mode = CbMergeMode();
+        return mode == 1 || mode == 2;
     }
+    /// Back, a CbWords block with CbJoined: runs of constant buffer words as ExecuteCbWords
+    /// runs them, joined register writes as their Pairs entries, mode-2 address marks checked.
+    void ExecuteCbJoined(const u64* words, u32 count);
+    /// FRITCHII_CB_MERGE=2: the front's address of the next joined run (its first word), as
+    /// a marker word (Sink, method CbMarkMethod) and the address word, before that word.
+    static constexpr u32 CbMarkMethod = 0xffff;
+    bool cb_merge_mark_next{}; ///< front: the next appended word starts a joined run
+    /// FRITCHII_CB_MERGE >= 2 counts (front: joined writes, refused, marks; back: blocks, writes,
+    /// runs checked, differ (must be 0), bad words (must be 0)).
+    struct CbJoinFront {
+        u64 joined;
+        u64 refused;
+        u64 marks;
+        u64 marks_skipped;
+    };
+    CbJoinFront cb_join{};
+    struct CbJoinBack {
+        std::atomic<u64> blocks;
+        std::atomic<u64> writes;
+        std::atomic<u64> checked;
+        std::atomic<u64> differ;
+        std::atomic<u64> bad;
+    };
+    alignas(128) CbJoinBack cb_join_back{};
+    u64 cb_join_last_blocks{};
+    u64 cb_join_last_writes{};
+    /// The 3D engine the back last ran a CbWords block on (the dry timer's Pairs test).
+    Tegra::Engines::EngineInterface* cb_merge_back_3d{};
     /// Held-back front work (SetPendingFlush).
     PendingFlush pending_flush{};
     void* pending_flush_argument{};

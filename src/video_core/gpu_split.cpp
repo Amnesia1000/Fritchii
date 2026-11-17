@@ -3810,8 +3810,7 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
         // FRITCHII_CB_MERGE=1 (dry): a block of only constant buffer offset/address/size writes
         // (what splits two CbWords blocks), timed 1 in 16.
         u64 gap_start = 0;
-        if (CbMergeOn() &&
-            dynamic_cast<Tegra::Engines::Maxwell3D*>(engine) != nullptr) [[unlikely]] {
+        if (engine == cb_merge_back_3d && CbMergeOn()) [[unlikely]] {
             using Tegra::Engines::Maxwell3D;
             constexpr u32 cb_size = MAXWELL3D_REG_INDEX(const_buffer.size);
             constexpr u32 cb_offset = MAXWELL3D_REG_INDEX(const_buffer.offset);
@@ -3859,7 +3858,13 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
         const u32 count = static_cast<u32>(head >> 32);
         const bool verify = (head & CbVerify) != 0;
         const size_t first = verify ? 2 : 1;
-        // FRITCHII_CB_MERGE=1 (dry): the block's time by its size, 1 in 16.
+        cb_merge_back_3d = back_engine; // only the 3D engine sends blocks
+        // FRITCHII_CB_MERGE >= 2: a block with joined register writes (never with CbVerify).
+        if ((head & CbJoined) != 0) {
+            ExecuteCbJoined(entry + first, count);
+            return first + size_t{count};
+        }
+        // FRITCHII_CB_MERGE=1/2 (dry): the block's time by its size, 1 in 16.
         u64 block_start = 0;
         if (CbMergeOn()) [[unlikely]] {
             if (cb_merge_sample_left == 0) {
@@ -4132,6 +4137,103 @@ void GpuSplit::VerifyCbWords(const u64* words, u32 count, u64 front_address) {
     }
 }
 
+bool GpuSplit::CbJoinPair(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument,
+                          int mode) {
+    const size_t index = write_position & RingMask;
+    if (cb_header == nullptr || cb_verify || pending_flush != nullptr || engine != front_engine ||
+        write_position != cb_end || index == 0 || cb_count >= MaxCbWords ||
+        write_position + 1 - consumed_cache > RingWords) {
+        return false; // no open block at the ring's end: sent as before (not counted)
+    }
+    if (MemoryStageLink::RingActive() || ESplit::g_records || ESplit::ThreadWanted()) {
+        ++cb_join.refused;
+        return false;
+    }
+    ring[index] = static_cast<u64>(Kind::Method) | Sink | (u64{method & 0xffff} << 8) |
+                  (u64{argument} << 32);
+    ++cb_count;
+    *cb_header = (*cb_header & 0xffff'ffffULL) | CbJoined | (u64{cb_count} << 32);
+    ++cb_join.joined;
+    CountBatched(Batched::Pairs);
+    // Mode 2: the next word (the joined run's first) carries the front's address before it.
+    cb_merge_mark_next = mode == 2;
+    Commit(1, Effect::None); // A publish here ends the block (Publish)
+    cb_end = write_position;
+    return true;
+}
+
+void GpuSplit::ExecuteCbJoined(const u64* words, u32 count) {
+    using Tegra::Engines::Maxwell3D;
+    constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+    constexpr u32 cb_size = MAXWELL3D_REG_INDEX(const_buffer.size);
+    constexpr u32 cb_offset = MAXWELL3D_REG_INDEX(const_buffer.offset);
+    CbBump(cb_back.blocks);
+    CbBump(cb_join_back.blocks);
+    const auto is_data = [&](u64 word) {
+        return static_cast<Kind>(word & 0xf) == Kind::Method &&
+               (word & (HasSegment | Sink)) == 0 &&
+               static_cast<u32>((word >> 8) & 0xffff) - cb_data < 16;
+    };
+    for (u32 i = 0; i < count;) {
+        const u64 word = words[i];
+        if (is_data(word)) {
+            // A run of constant buffer words, as ExecuteCbWords runs a block of them.
+            u32 end = i + 1;
+            while (end < count && is_data(words[end])) {
+                ++end;
+            }
+            CbBump(cb_back.words, end - i);
+            for (u32 done = i; done < end;) {
+                done += static_cast<u32>(Execute(words + done, end - done));
+            }
+            i = end;
+            continue;
+        }
+        const u32 method = static_cast<u32>((word >> 8) & 0xffff);
+        const bool tagged = static_cast<Kind>(word & 0xf) == Kind::Method && (word & Sink) != 0 &&
+                            (word & HasSegment) == 0;
+        if (tagged && method == CbMarkMethod && i + 1 < count) {
+            // FRITCHII_CB_MERGE=2: where the next run's first word goes on the back (the sink
+            // first, as that word does) against the front's address for it.
+            back_engine->ConsumeSink(*system);
+            if (auto* const maxwell3d = dynamic_cast<Maxwell3D*>(back_engine)) {
+                const auto& regs = maxwell3d->regs;
+                const GPUVAddr back_address =
+                    regs.const_buffer.Address() + regs.const_buffer.offset;
+                CbBump(cb_join_back.checked);
+                if (back_address != words[i + 1]) {
+                    CbBump(cb_join_back.differ);
+                    static std::atomic<u32> logged{};
+                    if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                        LOG_ERROR(HW_GPU,
+                                  "CB merge (FRITCHII_CB_MERGE=2): a joined run goes to {:#x} on "
+                                  "the back, the front noted {:#x}",
+                                  back_address, words[i + 1]);
+                    }
+                }
+            }
+            i += 2;
+            continue;
+        }
+        if (tagged && method >= cb_size && method <= cb_offset) {
+            // A joined register write, as its own Pairs entry ran it.
+            const u64 pair = u64{method} | (word & 0xffff'ffff'0000'0000ULL);
+            CbBump(cb_join_back.writes);
+            back_engine->ConsumeSink(*system);
+            back_engine->ApplyPairs(*system, &pair, 1);
+            ++i;
+            continue;
+        }
+        // Must be 0: nothing else is joined. Run it as its own entry would, if it is one.
+        CbBump(cb_join_back.bad);
+        CbBump(cb_back.bad);
+        if (static_cast<Kind>(word & 0xf) == Kind::Method && (word & HasSegment) == 0) {
+            Execute(words + i, 1);
+        }
+        ++i;
+    }
+}
+
 void GpuSplit::NoteCbMergeGap(Tegra::Engines::EngineInterface* engine) {
     // FRITCHII_CB_MERGE=1 (dry): the ring words since the previous CbWords block's last word
     // (cb_end; the front's own, not yet overwritten: at most 32 looked at). Joinable when they
@@ -4301,6 +4403,26 @@ void GpuSplit::ReportCbWords() {
                  block_ns[2], block_ns[3], gap_rate, gap_ns, fixed_ns,
                  joinable * fixed_ns / 1e6, joinable * (fixed_ns + gap_ns) / 1e6);
         cb_merge = {};
+    }
+    // FRITCHII_CB_MERGE >= 2: what was joined, and the verify counts (must be 0).
+    if (const int merge_mode = CbMergeMode(); merge_mode >= 2 || cb_join.joined != 0) {
+        const u64 blocks = back(cb_join_back.blocks);
+        const u64 writes = back(cb_join_back.writes);
+        LOG_INFO(HW_GPU,
+                 "CB merge (FRITCHII_CB_MERGE={}) {:.0f} s: front joined writes {:.0f}/s, refused "
+                 "(memory stage ring or E split) {:.0f}/s, run marks {:.0f}/s (not marked: at the "
+                 "ring's end or block full {:.0f}/s); E: joined blocks {:.0f}/s, joined writes "
+                 "{:.0f}/s; session: runs checked {}, must be 0: differ {}, bad words {}",
+                 merge_mode, seconds, static_cast<double>(cb_join.joined) / seconds,
+                 static_cast<double>(cb_join.refused) / seconds,
+                 static_cast<double>(cb_join.marks) / seconds,
+                 static_cast<double>(cb_join.marks_skipped) / seconds,
+                 static_cast<double>(blocks - cb_join_last_blocks) / seconds,
+                 static_cast<double>(writes - cb_join_last_writes) / seconds,
+                 back(cb_join_back.checked), back(cb_join_back.differ), back(cb_join_back.bad));
+        cb_join = {};
+        cb_join_last_blocks = blocks;
+        cb_join_last_writes = writes;
     }
     cb_merge_ticks_at = ticks_now;
     cb_merge_clock_at = now;
