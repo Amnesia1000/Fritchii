@@ -1135,6 +1135,19 @@ to the page's host memory, only ever forward (wrap-aware), and the poll stores f
 cannot put the page back. Cost: guest increments take the manager's lock before the add instead of
 after it (it was taken right after anyway) plus one host store.
 
+### FRITCHII_SYNCPT_REARM_NOTIFY
+
+Fix, on by default (helper DF, 2026-11-17, port of zortos293/Lichii #2052); read once,
+FRITCHII_SYNCPT_REARM_NOTIFY=0 turns it off. The nx2:gsv syncpoint poll signalled the client's
+notify event only when an armed bit changed. A client that wakes, finds its threshold not reached
+and rearms leaves its armed bit as it was, so its next wake-up had to come from another syncpoint's
+bit changing or from its own timeout (zortos's reported one-second OoT pause). Now the poll keeps
+its own snapshot of every value (the page itself is already current through
+FRITCHII_SYNCPT_MIRROR, so it shows no change) and also signals when an armed syncpoint's value
+moved since the previous poll. The log says "nx2:gsv rearmed syncpoint waits notified" at 1, 2, 4,
+8... polls that only this answered. Cost: a 192-entry compare per poll (500 us, or EXP37's
+poll-now), and a client wake-up per such poll.
+
 ### FRITCHII_SPARSE_RESERVE
 
 Fix, on by default (helper AH, 2026-11-15, partial port of zortos293/Lichii #1413); read once,
