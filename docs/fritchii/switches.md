@@ -459,7 +459,67 @@ this driver (n so far, longest t ms): new objects pop in instead of waiting (FRI
 auto)". A value in the environment (nx2_switches.txt) or set live wins; storing -1 live gives it back
 to the default and the auto rule. Only prepared (kept SPIR-V) builds count now; runtime pipelines a
 worker emits are new to every driver and no longer mix into the count. Compute dispatches still wait
-for their pipeline (skipping one would lose its results).
+for their pipeline (skipping one would lose its results), unless FRITCHII_ASYNC_COMPUTE_SKIP below
+is on.
+
+### FRITCHII_ASYNC_COMPUTE_SKIP, FRITCHII_ASYNC_COMPUTE_SKIP_DELAY_MS
+
+TEST, off by default (helper DU, 2026-11-17; idea and rules from zortos293/Lichii #2104, 75fb0b527e,
+ffd0ebe246 and ce937db2d0, by zortos293). Live. A native dispatch whose compute pipeline is not built
+yet records a wait on the Vulkan worker, and every GPU channel waits behind it: 0.6-5.5 s freezes on
+cold shader caches, 21-55 s per session in tester logs t0357, t0419 and t1858 (grep "Compute dispatch
+waited N ms for pipeline X"; the "Worst frame" line does not see them). Runtime-translated compute
+programs (the sword-swing foliage culling variant 59c1699f529e7c08 and friends) are not covered by
+Prepare Shaders.
+
+- 0: waits as before.
+- 1: such a dispatch is skipped while its pipeline builds, as if the guest had not run it this frame,
+  when all four guards hold; otherwise it waits as before. On the first skip the build is handed to
+  a spare thread ("VkComputeKick"), since the pipeline workers are first in, first out. Within
+  FRITCHII_PIPELINE_WAIT_BUDGET (shared with the draws; 0 except on Intel) it waits for the build
+  first.
+- 2: dry. Every dispatch waits; the line counts what 1 would skip.
+
+The guards, all on what the dispatch would mark written (its native storage write marks and the
+guest ranges of its written storage images):
+- G1, GPU data: every byte holds GPU writes (gpu_modified_ranges, full coverage) and no CPU write
+  waits for upload; images: every image there GpuModified, not CpuModified, one covering the range.
+- G2, every frame: each buffer range (exact address and size) was written by a dispatch in each of
+  the last 8 frames; images by ImageBase::write_streak (as FRITCHII_ASYNC_REDRAWN). A pass the game
+  runs once (a LUT at a scene change, a pool init) never qualifies. A range the same pipeline
+  skipped in the frame before keeps qualifying (a skip writes nothing, so the streak it passed is
+  kept, never extended).
+- G3, no read-back: no page Preflushable, in cpu_read_ranges or a read download, and no guest read
+  ever seen on its pages (GetFlushArea, sticky for the session). Feeders whose results the game
+  logic reads (collision, the c0[0x150] binding writers) always wait.
+- G4, shape: native, direct (no indirect grid), no texel buffers, no global stores, no packed R16
+  image, not an OoT upscaler or effects pass, no frame dump, and known write extents: a 16 MiB
+  (unproven) or capped mark, several device ranges or an image without one device range waits.
+
+The decision comes before the dispatch's fill (MemStage::FillDispatch) and, with the one follower,
+before E posts it (an unbuilt pipeline's dispatch is lent: "lent: unbuilt pipeline"), so a skipped
+dispatch leaves no marks, uploads, image changes or EXP10 records (it confirms an empty record). Its
+QMD releases and semaphores are the engine's (KeplerCompute, after DispatchCompute returns) and still
+happen. A dispatch that runs takes Configure's own path instead of the seam's fill.
+
+What the player sees for the length of a compile (not one frame): per-frame compute outputs stay as
+last written (foliage culled for an older view, particles or poses frozen), or what a skipped append
+pass draws is missing; the frame after the build ends is right again.
+
+Log, every 10 s while anything happened: "Async compute skip (FRITCHII_ASYNC_COMPUTE_SKIP=n) in the
+last 10 s: x dispatches/s skipped, y/s would skip (dry), p new programs, t ms of waits avoided;
+unbuilt dispatches that waited: a shape, b unknown extent, c read back, d no GPU data, e not every
+frame; must be 0: s programs still skipping 10 s after their first skip, r guest reads of skipped
+output". Once per program (first 64): "pipeline X is still building, its dispatches are skipped" and
+"pipeline X skipped N dispatches over T ms (frames f-g), ran at frame h; W ms of wait avoided" (the
+wait avoided runs from the first skip to the build's end).
+
+FRITCHII_ASYNC_COMPUTE_SKIP_DELAY_MS (boot, ms, default 0; test only): every compute program counts as
+unbuilt for that long after its first dispatch, to test the skip on a PC with warm caches (2000 =
+a cold compile for each). Its pipelines are built, so there is no budget wait; the log says it is on.
+Test: one session at a pinned save, mode 2 first (no visual change, read the refusal split), then
+mode 1 with the delay; screenshot at 1 s and 10 s, compare the 10 s shot with mode 0; both must-be-0
+counts 0.
 
 ### FRITCHII_OCCLUSION_VISIBLE
 

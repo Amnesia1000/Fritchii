@@ -7539,6 +7539,31 @@ bool PipelineCache::WaitBudgetSkips(const GraphicsPipeline& pipeline) const {
     return skip(false);
 }
 
+bool PipelineCache::WaitComputeWithinBudget(ComputePipeline& pipeline) {
+    // The draws' frame budget (WaitBudgetSkips): a dispatch the driver compiles in a few ms
+    // still runs in its frame. The build was kicked to a spare thread first.
+    const auto budget = PipelineWaitBudget();
+    if (budget.count() == 0) {
+        return false;
+    }
+    auto& state = wait_budget;
+    if (state.frame != frame_count) {
+        state.frame = frame_count;
+        state.used = {};
+    }
+    const auto left = std::chrono::duration_cast<std::chrono::nanoseconds>(budget) - state.used;
+    if (left.count() <= 0) {
+        return false;
+    }
+    const auto begin = std::chrono::steady_clock::now();
+    const bool built = pipeline.WaitBuiltFor(left);
+    const auto waited = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - begin);
+    state.used += waited;
+    state.longest_frame = (std::max)(state.longest_frame, state.used);
+    return built;
+}
+
 int AsyncDiscardMode() {
     // Read on first use (the first missing pipeline), after nx2_switches.txt was applied.
     static const int mode = [] {
