@@ -1093,6 +1093,27 @@ report-landing pages (POST_FENCE, OneFollower::ReportLandingClear) call the rang
 reports in F/s; E's landing pages clear for C/s (ms/s), R found reports in X/s of them (must be 0
 to skip on it; total since boot); ceiling (clear, nothing found) Y ms/s". Gate 1: Y >= 5 and X = 0.
 
+### FRITCHII_QUERY_LEND_DRY
+
+TEST, off by default (helper DE, 2026-11-17, round 5). Live, a dry timer that changes nothing.
+kaksample2 (unprofiled CPU sample, Kakariko): E parked ~23 ms/s in Query lends. Per lent Query on
+E: why it was lent (which rule kept it from the posted paths: fence payload with SEM_E's path off
+or not clean, fence counter report with POST_FENCE_REPORT off, of a type that lands at once, or
+not clean, plain payload release, plain report, report on a registered buffer page), E's parked
+time, and whether the report's page is one the front's DMA reads snapshot (FrontReadPagesAny; a
+posted report there is read stale by the front unless the front also waits for R). Line every 10
+s: "Query lends (FRITCHII_QUERY_LEND_DRY=1) S s: N/s, E parked T ms/s by why lent; <why> n/s t ms/s
+(front read page f/s); ...". Gate 1 per kind: t >= 5 ms/s; f must be 0 for that kind to be posted
+without a front wait.
+
+Round 5 also adds to EDEN_NX2_PROTECT_STATS=1 (boot) a line "Page protection on GPUBack (E, 5 s,
+per second): protect N calls T ms, unprotect ...; protects of a page E unprotected 0-1 frames
+before R calls T ms, with their unprotects ~P ms": E's share of the protect/unprotect cycle and
+EXP89=1's (lingering protection, live) ceiling on E. EXP89 changes nothing the guest reads (page
+contents are never touched; a guest store to a lingering page traps and goes through the
+handler, then the page is released at the frame's sweep): its cost is in the Store memo line's
+trapped stores, and "left after unmap" must stay 0.
+
 ### FRITCHII_HOSTTIMING_OFF_GPU
 
 TEST, off by default (helper DE, 2026-11-17). Live. 0 (as before): the timer thread's spin goes to

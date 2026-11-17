@@ -628,6 +628,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_QUERY_FLUSH_DRY") {
         return &g_query_flush_dry;
     }
+    if (name == "FRITCHII_QUERY_LEND_DRY") {
+        return &g_query_lend_dry;
+    }
     if (name == "FRITCHII_GPU_PRIORITY") {
         return &g_gpu_priority;
     }
