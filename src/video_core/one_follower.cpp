@@ -2557,6 +2557,30 @@ void NoteFenceLent() noexcept {
     g_report_landing_watch.store(false, std::memory_order_relaxed);
 }
 
+bool ReportLandingClear(u64 address, u64 size) noexcept {
+    if (size == 0) {
+        return true;
+    }
+    const u64 first = address >> 12;
+    const u64 last = (address + size - 1) >> 12;
+    for (const u64 page : g.landing_unassigned) {
+        if (page >= first && page <= last) {
+            return false;
+        }
+    }
+    if (g.landing_pages.empty()) {
+        return true;
+    }
+    const u64 played = g.played.load(std::memory_order_acquire);
+    for (u64 page = first; page <= last; ++page) {
+        const auto it = g.landing_pages.find(page);
+        if (it != g.landing_pages.end() && played < it->second) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void WaitReportLanding(u64 address, u64 size) noexcept {
     if (size == 0 || g.landing_pages.empty()) {
         g_report_landing_watch.store(!g.landing_pages.empty(), std::memory_order_relaxed);

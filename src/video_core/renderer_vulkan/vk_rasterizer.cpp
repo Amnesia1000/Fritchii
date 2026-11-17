@@ -7782,11 +7782,103 @@ u64 RasterizerVulkan::FenceWorkEpoch() const {
     return fence_manager.FenceWorkEpoch();
 }
 
+namespace {
+/// FRITCHII_QUERY_FLUSH_DRY=1 (live, default 0; helper DE, a dry timer that changes nothing).
+/// kaksample2 (Kakariko, unprofiled CPU sample): E parked ~30 ms/s in FlushQueryResults lends
+/// (the front's report DMA flush runs, QueryDma::FlushPending) while the report waits line shows
+/// R finding something to wait for under 1 time a second; the profile's lends line does not list
+/// these lends at all. Per lend: E's parked time, whether R's query cache had reports in the
+/// range (SemiFlushRegion), and whether E's own report-landing pages call the range clear
+/// (OneFollower::ReportLandingClear). The lever would skip the lend where E can prove R has
+/// nothing; "clear but R found" must be 0 for E's pages to be that proof. Only E touches it.
+struct QueryFlushDry {
+    static bool On() {
+        return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_query_flush_dry,
+                                                "FRITCHII_QUERY_FLUSH_DRY") != 0;
+    }
+    static u64 Now() {
+        return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count());
+    }
+    void Note(bool clear, bool found, u64 parked_ns, u64 now) {
+        ++lends;
+        parked += parked_ns;
+        if (found) {
+            ++found_count;
+            found_parked += parked_ns;
+        }
+        if (clear) {
+            ++clear_count;
+            clear_parked += parked_ns;
+            if (found) {
+                ++clear_found;
+            } else {
+                ceiling += parked_ns;
+            }
+        }
+        if (since == 0) {
+            since = now;
+            return;
+        }
+        if (now - since < 10'000'000'000ULL) {
+            return;
+        }
+        const double seconds = static_cast<double>(now - since) / 1e9;
+        const auto rate = [&](u64 count) { return static_cast<double>(count) / seconds; };
+        const auto ms = [&](u64 ns) { return static_cast<double>(ns) / 1e6 / seconds; };
+        LOG_INFO(Render_Vulkan,
+                 "Query flush lends (FRITCHII_QUERY_FLUSH_DRY=1) {:.0f} s: {:.0f}/s, E parked "
+                 "{:.1f} ms/s ({:.0f} us each); R found reports in {:.0f}/s ({:.1f} ms/s); E's "
+                 "landing pages clear for {:.0f}/s ({:.1f} ms/s), R found reports in {:.0f}/s of "
+                 "them (must be 0 to skip on it; {} since boot); ceiling (clear, nothing found) "
+                 "{:.1f} ms/s",
+                 seconds, rate(lends), ms(parked),
+                 lends != 0 ? static_cast<double>(parked) / 1e3 / static_cast<double>(lends) : 0.0,
+                 rate(found_count), ms(found_parked), rate(clear_count), ms(clear_parked),
+                 rate(clear_found), clear_found_total + clear_found, ms(ceiling));
+        clear_found_total += clear_found;
+        const u64 total = clear_found_total;
+        *this = {};
+        clear_found_total = total;
+        since = now;
+    }
+    u64 since{};
+    u64 lends{};
+    u64 parked{};
+    u64 found_count{};
+    u64 found_parked{};
+    u64 clear_count{};
+    u64 clear_parked{};
+    u64 clear_found{};
+    u64 ceiling{};
+    u64 clear_found_total{};
+};
+QueryFlushDry g_query_flush_timer;
+/// R writes it in the lent call (SemiFlushRegion found reports); E reads it after the lend.
+std::atomic<bool> g_query_flush_found{};
+} // Anonymous namespace
+
 void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
+    if (VideoCommon::OneFollower::ShouldLend() && QueryFlushDry::On()) [[unlikely]] {
+        // FRITCHII_QUERY_FLUSH_DRY: the same lend as ONEF_LEND below, timed and classified.
+        const DAddr begin = addr >= 12 ? addr - 12 : DAddr{0};
+        const bool clear = VideoCommon::OneFollower::ReportLandingClear(begin, addr + size - begin);
+        g_query_flush_found.store(false, std::memory_order_relaxed);
+        const u64 start = QueryFlushDry::Now();
+        VideoCommon::OneFollower::SetLendSite(__func__);
+        auto onef_call = [&] { FlushQueryResults(addr, size); };
+        VideoCommon::OneFollower::Lend(VideoCommon::OneFollower::LentOp::ReadBack, onef_call);
+        const u64 now = QueryFlushDry::Now();
+        g_query_flush_timer.Note(clear, g_query_flush_found.load(std::memory_order_acquire),
+                               now - start, now);
+        return;
+    }
     ONEF_LEND(ReadBack, FlushQueryResults(addr, size))
     if (addr == 0 || size == 0 || !query_cache.SemiFlushRegion(addr, size)) {
         return;
     }
+    g_query_flush_found.store(true, std::memory_order_release);
     // GPU profile zone "query DMA wait": these waits per second and their ms per second, either
     // way below (the A/B measure for EXP30).
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::QueryDmaWait};
