@@ -7269,3 +7269,33 @@ compile time of =2 with less of its runtime cost (=2 measured ~1.7 fps lower at 
 fights); idea from tasarren/Lichii (compute compile 1.5-1.75 s -> 0.26-0.52 s on their path).
 Not measured on Fritchii yet. Changing it changes the SPIR-V, so the driver compiles those shaders
 again once.
+
+## OoT built-in patches (not switches)
+
+### Water ripples at any frame rate (built-in)
+
+On by default, in both frame step modes (Dark's Dynamic FPS and the high refresh mode); Add-Ons can
+turn it off. A port of Blitchii PR #1180 (480e01394 and its review follow-up), found and verified
+live by a tester (2026-11-17: a Hyrule Castle water room at a pinned step of 0.5, ripples jumping on
+camera turns with the earlier patch, steady with this one, the per-object rest within +-0.5).
+
+The water renderer (main+0x472E0) runs `iterations * trunc(step)` ripple passes a frame
+(iterations = 6, `fcvtzs w9, s0` at main+0x475F8, `mul w8, w8, w9` at main+0x4760C). Below a step
+of 1 (above 60 fps; the step is relative to 60 Hz) some or all frames run no pass, and the grid
+that follows Link still moves, so the surface jumps. The earlier Fritchii patch (an accumulator at
+main+0x3C46E90 returning `trunc(step + rest)`) kept the average rate but at a step of 0.5 still
+ran 0 and 6 passes in turn.
+
+Now: main+0x475F8 is `bl 0x3c46f20`, main+0x4760C is `nop`, and the 148-byte routine at
+main+0x3C46F20..0x3C46FB4 adds `iterations * step` to a rest kept per water object (x21), returns
+w8 = the rounded passes, at least 1 while the step is above 0 (0 while paused), and keeps
+`total - passes`, never below -0.5. At a step of 0.5: 3 passes every frame. The rests live in 8
+slots of {u64 object, f32 rest} at main+0x4E9FE20, the next slot to take at main+0x4E9FEA0 (the
+high refresh state is main+0x4E9FE00..0x4E9FEB0 now; +0x10 held the old accumulator's index and
+is unused). The routine clobbers x9-x12, s0-s2, the flags and x30; checked against the game's
+code: the function saves x30 in its prologue and none of those is read after the call before it
+is written. The old accumulator's spot (main+0x3C46E8C..0x3C46F10) is free again.
+
+Ctrl+U switches only the call word while the ripples are on. With the ripple built-in off,
+switching Dark's mode back restores both words and clears the routine; it waits while a guest
+thread stands in a routine or between the two water words.
