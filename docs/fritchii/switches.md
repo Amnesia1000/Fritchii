@@ -460,7 +460,7 @@ auto)". A value in the environment (nx2_switches.txt) or set live wins; storing 
 to the default and the auto rule. Only prepared (kept SPIR-V) builds count now; runtime pipelines a
 worker emits are new to every driver and no longer mix into the count. Compute dispatches still wait
 for their pipeline (skipping one would lose its results), unless FRITCHII_ASYNC_COMPUTE_SKIP below
-is on.
+is on; FRITCHII_COMPUTE_FAST_FIRST below makes that wait shorter.
 
 ### FRITCHII_ASYNC_COMPUTE_SKIP, FRITCHII_ASYNC_COMPUTE_SKIP_DELAY_MS
 
@@ -537,6 +537,50 @@ unbuilt pipeline") in every mode while the delay is set. The pipelines are built
 budget wait. Test: one session at a pinned save, mode 2 first (no visual change, read the refusal
 split), then mode 1 with the delay; screenshot at 1 s and 10 s, compare the 10 s shot with mode 0;
 both must-be-0 counts 0.
+
+### FRITCHII_COMPUTE_FAST_FIRST
+
+Live, default 0. A dispatch whose compute pipeline is still building waits for it on the Vulkan
+worker, and every channel waits behind it: 0.6-5.5 s freezes on cold caches, many of them by
+programs whose output the guest reads back, so FRITCHII_ASYNC_COMPUTE_SKIP refuses them. With 1,
+that dispatch gets an unoptimized build of the same pipeline at once
+(VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT; same SPIR-V, layout and descriptors, so the same
+results, only more GPU time), and dispatches use it while the optimized build runs on its pipeline
+worker. Before its next bind after that build ends, the scheduler worker swaps the optimized
+pipeline in; the unoptimized one is freed once the GPU passed the tick it was swapped out at. The
+unoptimized build is never stored (no binary store, no pipeline cache), so the next session still
+gets the optimized one from the caches.
+
+- Only pipelines built at run time on a worker. Boot, warm-up and preparation builds, and the
+  programs always built unoptimized (BuildsUnoptimized), keep their path. Prepared (precompiled)
+  pipelines are included: their module is made by whichever build needs it first.
+- If the optimized build ends first, the unoptimized one is thrown away unused. If the unoptimized
+  build fails, the dispatch takes the optimized build as without the switch.
+- The one follower's posted dispatches, lent ones and FRITCHII_ASYNC_COMPUTE_SKIP all see the
+  unoptimized pipeline as built (IsBuilt, BuiltAt). The skip's kick makes the unoptimized build, so
+  a skip lasts only that long.
+- 2 (test): every program built at run time takes the path, waited for or not (its worker builds the
+  unoptimized pipeline first, then the optimized one, then the swap). Exercises the whole path on a
+  PC with warm caches; the compile times are only real on a cold driver cache.
+- Log: "Compute dispatch waited N ms for pipeline X (an unoptimized build, FRITCHII_COMPUTE_FAST_FIRST)";
+  per program (first 64 lines) "built unoptimized in A ms" and "optimized in B ms (unoptimized: A
+  ms)"; every 10 s while anything happened "Compute fast-first (FRITCHII_COMPUTE_FAST_FIRST=n) in the
+  last 10 s: f unoptimized builds served dispatches (x ms, y ms each), b beaten by the optimized
+  build, e failed; o optimized builds followed (g failed), those programs p ms unoptimized vs q ms
+  optimized; s swapped in; now w waiting for their optimized build, d built and not dispatched since;
+  must be 0: u programs unoptimized over 30 s (t since boot)". A must-be-0 hit also logs a warning
+  with the program. An optimized build that fails is logged and the program keeps the unoptimized
+  pipeline.
+- The optimized build waits its turn in the pipeline workers' queue (first in, first out). A busy
+  queue shows as w, and over 30 s as the must-be-0 count.
+
+### FRITCHII_COMPUTE_PREBUILD_FIRST
+
+Boot, default 1 (0 = as before). The boot build of the disk cache queues its compute records before
+its graphics records. The same builds on the same workers, only in another order. The boot waits for
+all of them before the game starts either way, so a dispatch never waits for a program the disk cache
+recorded in an earlier session (runtime-translated compute programs are recorded, as are prepared
+ones the game used); this only makes the compute records end earlier within the boot.
 
 ### FRITCHII_OCCLUSION_VISIBLE
 
