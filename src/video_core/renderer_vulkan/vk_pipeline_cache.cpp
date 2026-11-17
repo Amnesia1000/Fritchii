@@ -7640,20 +7640,18 @@ bool PipelineCache::AsyncRedrawnOn() const {
 }
 
 int PipelineCache::AsyncRedrawnDefault() const {
-    // FRITCHII_ASYNC_REDRAWN's value when unset: 1 on AMD's and Intel's Windows drivers (see
+    // FRITCHII_ASYNC_REDRAWN's value when unset: 1 on every driver since 2026-11-18 (owner: a
+    // briefly late object beats a freeze; RTX 4080 market toggle 0/1 x4: 70.1 / 71.3 fps, 1% low
+    // 50.0 / 51.9, no cost). It was 1 on AMD's and Intel's Windows drivers first (see
     // DrawMayBeSkipped). Intel's compiler is the slowest: an Arc B580 (101.9150) held 11.9 s and
     // 11.2 s of draws for runtime pipelines, one of them ~11 s alone (tester log t0815).
-    static const int value = [this] {
-        const bool amd = device.GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY;
-        const bool intel = device.GetDriverID() == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS;
-        if ((amd || intel) && std::getenv("FRITCHII_ASYNC_REDRAWN") == nullptr) {
-            LOG_INFO(Render_Vulkan, "FRITCHII_ASYNC_REDRAWN=1 by default on {}'s driver: new "
-                                    "objects drawn into the scene skip a frame or more while "
-                                    "their pipeline compiles instead of freezing the game "
-                                    "(FRITCHII_ASYNC_REDRAWN=0 waits)",
-                     amd ? "AMD" : "Intel");
+    static const int value = [] {
+        if (std::getenv("FRITCHII_ASYNC_REDRAWN") == nullptr) {
+            LOG_INFO(Render_Vulkan, "FRITCHII_ASYNC_REDRAWN=1 by default: new objects drawn into "
+                                    "the scene skip a frame or more while their pipeline compiles "
+                                    "instead of freezing the game (FRITCHII_ASYNC_REDRAWN=0 waits)");
         }
-        return amd || intel ? 1 : 0;
+        return 1;
     }();
     return value;
 }
