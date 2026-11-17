@@ -100,16 +100,17 @@ inline bool ReadRunsValue(bool writer_ticks) {
         if (cbuf != nullptr && cbuf[0] == '3') {
             return true;
         }
-        // FRITCHII_EXTENT_SHARED=3: the same dry count for the extents proven through shared
-        // memory slots
-        const char* shared = std::getenv("FRITCHII_EXTENT_SHARED");
-        if (shared != nullptr && shared[0] == '3') {
-            return true;
-        }
         const char* census = std::getenv("FRITCHII_EXTENT_CENSUS");
         if (census != nullptr && census[0] != '\0' && census[0] != '0') {
             return true;
         }
+    }
+    // FRITCHII_EXTENT_SHARED=3: the same dry count for the extents proven through shared memory
+    // slots, with the write marks' ticks too (as FRITCHII_READ_RUNS=2, counter only): a read past
+    // the proof is timed until the newest mark the proof leaves over its bytes ran
+    const char* shared = std::getenv("FRITCHII_EXTENT_SHARED");
+    if (shared != nullptr && shared[0] == '3') {
+        return true;
     }
     const char* value = std::getenv("FRITCHII_READ_RUNS");
     if (value == nullptr || value[0] == '\0' || value[0] == '0') {
@@ -447,6 +448,16 @@ struct WriterAnswer {
     u64 ahead_span_ns{};
     // FRITCHII_EXTENT_CBUF=3 (FindWriter): the read against the cbuf proof of its newest mark.
     DryRead dry{DryRead::None};
+    // FRITCHII_EXTENT_CBUF / _SHARED =3, a read past the proof under an older mark (Covered*):
+    // that mark, the newest over the read's bytes once every mark with a proof is cut at it, so
+    // the one the read would wait for with the proofs (FindWriter). With the write ticks
+    // (FRITCHII_EXTENT_SHARED=3 or FRITCHII_READ_RUNS=2 at boot) GetFlushArea fills its tick and
+    // WaitReadWriter the time from the host wait's start until it ran (timed).
+    bool dry_cover_found{};
+    WriteMark dry_cover{};
+    u64 dry_cover_tick{};
+    u64 dry_cover_ns{};
+    bool dry_cover_timed{};
     // FRITCHII_STORE_FOOTPRINT (FindWriter): the read against its newest mark's footprint, and
     // the read's first byte past that mark's pointer modulo the footprint's modulus.
     FootRead foot{FootRead::None};
@@ -601,8 +612,11 @@ inline void PatchLaneUpload(u64 dispatch, u64 program, u64 stamp) {
 
 /// FRITCHII_EXTENT_CBUF=3 (r.mutex held): the read [address, end) against marks[newest - i]
 /// (the newest over it, with a cbuf proof): inside its proven part, or past it and then whether
-/// an older mark in the ring still covers the bytes once every mark with a proof is cut there.
-[[nodiscard]] inline DryRead ClassifyDryRead(const Ring& r, u64 i, u64 address, u64 end) {
+/// an older mark in the ring still covers the bytes once every mark with a proof is cut there
+/// (that mark in `cover`).
+[[nodiscard]] inline DryRead ClassifyDryRead(const Ring& r, u64 i, u64 address, u64 end,
+                                             const WriteMark*& cover) {
+    cover = nullptr;
     const auto effective_end = [](const WriteMark& mark) {
         return mark.proven_end != 0 ? (std::min)(mark.end, mark.proven_end) : mark.end;
     };
@@ -614,6 +628,7 @@ inline void PatchLaneUpload(u64 dispatch, u64 program, u64 stamp) {
     for (u64 j = i + 1; j < n; ++j) {
         const WriteMark& mark = r.marks[(r.count - 1 - j) % RingSize];
         if (mark.begin < end && address < effective_end(mark)) {
+            cover = &mark;
             return mark.writer == newest.writer ? DryRead::CoveredSame : DryRead::CoveredOther;
         }
     }
@@ -643,7 +658,12 @@ inline void FindWriter(u64 address, u64 size, u64 page_begin, u64 page_end) {
             a.mark = mark;
             a.dispatches_after = dispatches - mark.dispatch;
             if (mark.proven_end != 0) [[unlikely]] {
-                a.dry = ClassifyDryRead(r, i, address, end);
+                const WriteMark* cover = nullptr;
+                a.dry = ClassifyDryRead(r, i, address, end, cover);
+                if (cover != nullptr) {
+                    a.dry_cover_found = true;
+                    a.dry_cover = *cover;
+                }
             }
             if (g_store_footprint) [[unlikely]] {
                 a.foot = ClassifyFootprint(r, i, address, end);
@@ -750,6 +770,21 @@ struct DryStats {
     u64 freed_differed{};
     u64 inside_compared{};
     u64 inside_differed{};
+    /// The marks the proof leaves over the Covered reads' bytes, by their writer (capped at 64
+    /// writers): what those reads would still wait for
+    struct Cover {
+        u64 reads{};
+        u64 wait_ns{};      ///< the reads' whole waits, as waited
+        u64 timed{};        ///< of them, timed until the cover ran
+        u64 timed_wait_ns{}; ///< the timed ones' whole waits
+        u64 predicted_ns{}; ///< the timed ones' waits had they ended when the cover ran
+    };
+    std::unordered_map<Writer, Cover, WriterHash> covers;
+    /// Every read's wait with the proof: Inside as waited, Freed 0 (no mark left over its
+    /// bytes), Covered until the cover ran when timed, else as waited
+    u64 proof_wait_ns{};
+    u64 covered_timed{};
+    u64 covered_untimed{};
 };
 
 /// FRITCHII_EXTENT_CENSUS: per writer, the reads its newest marks sent to the back (taken by
@@ -1016,6 +1051,33 @@ inline void NoteWriter(Kind kind, u64 wait_ns, const WriterAnswer& a, const u8* 
         } else if (a.dry == DryRead::Inside) {
             d.inside_compared += compared ? 1 : 0;
             d.inside_differed += differed ? 1 : 0;
+            d.proof_wait_ns += wait_ns;
+        } else if (a.dry_cover_found) {
+            // Covered: with the proof the read's host wait would have ended when the cover ran
+            // (the rest of its wait, before the host wait, stays)
+            const u64 host = a.writer_wait_ns + a.rest_wait_ns;
+            const bool timed = a.cut && a.dry_cover_timed && host != 0;
+            const u64 predicted =
+                timed ? wait_ns - (std::min)(wait_ns, host) + (std::min)(a.dry_cover_ns, host)
+                      : wait_ns;
+            d.proof_wait_ns += predicted;
+            ++(timed ? d.covered_timed : d.covered_untimed);
+            auto it = d.covers.find(a.dry_cover.writer);
+            if (it == d.covers.end() && d.covers.size() < 64) {
+                it = d.covers.emplace(a.dry_cover.writer, DryStats::Cover{}).first;
+            }
+            if (it != d.covers.end()) {
+                DryStats::Cover& cover = it->second;
+                ++cover.reads;
+                cover.wait_ns += wait_ns;
+                if (timed) {
+                    ++cover.timed;
+                    cover.timed_wait_ns += wait_ns;
+                    cover.predicted_ns += predicted;
+                }
+            }
+        } else {
+            d.proof_wait_ns += wait_ns;
         }
     }
     const size_t k = static_cast<size_t>(kind);
