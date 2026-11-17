@@ -7126,4 +7126,12 @@ storage buffer are emitted. 1 (default): inlined at every call site (+2.6 fps wa
 an RTX 4080, 2026-11). 0: DontInline everywhere (NVIDIA compiles big compute shaders in a fraction of
 the time: up to 7.6 s each inlined). 2: DontInline for compute programs only, graphics inlined
 (player report 2026-11-18, 5.8.4: a 7.6 s freeze mid-combat on an RTX 3070 when the driver had not cached a
-compute shader). Changing it changes the SPIR-V, so the driver compiles those shaders again once.
+compute shader). 3: compute programs only, graphics as with 1: the search for the storage buffer
+that holds the address is one DontInline function per program (same comparisons and order as the
+helpers, returns the buffer index and base or not found), and the load/store/atomic helpers stay
+inlinable: each access calls the search once and then switches on the returned index to do the
+access on that buffer; an address no buffer holds gets the same fallback as before. Aims at the
+compile time of =2 with less of its runtime cost (=2 measured ~1.7 fps lower at the market, ~0 in
+fights); idea from tasarren/Lichii (compute compile 1.5-1.75 s -> 0.26-0.52 s on their path).
+Not measured on Fritchii yet. Changing it changes the SPIR-V, so the driver compiles those shaders
+again once.
