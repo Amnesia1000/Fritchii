@@ -238,4 +238,14 @@ namespace Vulkan {
     /// allocator's user may call it.
     u64 TrimEmptyBlocks(const Device& device, VmaAllocator owner, u32 heap);
 
+    /// FRITCHII_DEPTH_POOL_FIT: what it placed and the padding its live images hold; empty while
+    /// it is off and placed nothing.
+    [[nodiscard]] std::string DepthFitText();
+
+    /// FRITCHII_VRAM_HOLES: per block vector of `owner` on `heap` (default blocks per memory type,
+    /// each named pool), the holes and the allocations by size, and what holds the blocks that
+    /// are at least half free (kind, size, age). Builds VMA's detailed map: several ms with
+    /// thousands of allocations, so only on request; only the allocator's user may call it.
+    [[nodiscard]] std::string VramHolesText(VmaAllocator owner, u32 heap);
+
 } // namespace Vulkan

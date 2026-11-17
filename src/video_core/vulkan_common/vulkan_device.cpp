@@ -1453,6 +1453,9 @@ VmaPool Device::GetSeparatePool(VmaAllocator owner, SeparatePool kind, u32 memor
         };
         if (vmaCreatePool(owner, &ci, &pool) != VK_SUCCESS) {
             pool = VK_NULL_HANDLE;
+        } else {
+            // Named, so VMA's detailed map (FRITCHII_VRAM_HOLES) tells the pools apart.
+            vmaSetPoolName(owner, pool, kind == SeparatePool::SparsePages ? "sparse" : "buffer");
         }
     }
     return pool;
