@@ -1515,7 +1515,7 @@ private:
         Count,
     };
     enum class CbufOutcome : u8 {
-        None,       ///< no cbuf extent, or FRITCHII_EXTENT_CBUF off
+        None,       ///< no cbuf extent, or its switch (FRITCHII_EXTENT_CBUF or _SHARED) off
         Resolved,   ///< the words were read and the bound holds
         Fallback,   ///< a word's page is GPU-written (guest memory may be stale): full mark
         Unresolved, ///< a word not readable, the guard fails, or an indirect grid
@@ -1540,6 +1540,10 @@ private:
         u64 cbuf_proven_bytes{};  ///< summed over the resolved dispatches
         u64 cbuf_binding_bytes{}; ///< the same dispatches' binding sizes
         u64 cbuf_marked{};        ///< =1: dispatches marked by the cbuf proof
+        /// FRITCHII_EXTENT_SHARED: Known when cbuf_extent came through shared memory slots
+        /// (cbuf_extent.via_shared; the counts above then follow FRITCHII_EXTENT_SHARED), else
+        /// why that failed (Unrecorded: not tried)
+        Shader::ExtentUnknownWhy shared_why{};
     };
     std::map<std::pair<u64, u32>, ExtentCensusEntry> extent_census;
     std::chrono::steady_clock::time_point extent_census_start{};
@@ -1588,7 +1592,7 @@ private:
                           u64 mark, FullMarkWhy why, const Shader::ExtentUnknownWhy& write_unknown,
                           const Shader::StorageCbufExtent& cbuf_extent, CbufOutcome cbuf_outcome,
                           u64 cbuf_proven, bool cbuf_marked, bool extent_unknown,
-                          bool has_extra);
+                          bool has_extra, const Shader::ExtentUnknownWhy& shared_why);
     void LogExtentCensus();
 
     /// Whether a GPU write to this range is copied back at the next fence. Ranges the guest CPU

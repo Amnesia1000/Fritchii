@@ -194,6 +194,10 @@ struct StorageWriteExtra {
     /// FRITCHII_STORE_FOOTPRINT: the bytes its stores can land on, as residues (none unless
     /// written and every store's offset is the pointer plus a known congruence)
     StorageStoreFootprint footprint{};
+    /// FRITCHII_EXTENT_SHARED: Known when cbuf_extent was proven by following offsets through
+    /// shared memory slots (cbuf_extent.via_shared), else why that try failed (Unrecorded: not
+    /// tried, the plain or cbuf extent already held or no shared load was involved)
+    ExtentUnknownWhy shared_why{};
 };
 
 struct TextureBufferDescriptor {

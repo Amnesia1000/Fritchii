@@ -114,6 +114,11 @@ enum class ExtentUnknown : u8 {
     UntrackedWrites,   ///< a store of the program stays global (routed by address at run time)
     RuntimeRouted,     ///< the store picks one of several pointers at run time
     GlobalStore,       ///< a driver buffer the program's global stores may land anywhere in
+    // FRITCHII_EXTENT_SHARED (StorageWriteExtra::shared_why): why an offset loaded from shared
+    // memory was not followed to the value stored there
+    SharedNotPrivate,   ///< a shared write or atomic is not in its invocation's own slot (opcode)
+    SharedPartialWrite, ///< another width's write or an atomic overlaps the loaded word (opcode)
+    SharedNotDominated, ///< no store of the loaded word runs before the load on every path
 };
 
 struct ExtentUnknownWhy {
@@ -163,6 +168,12 @@ struct ExtentUnknownWhy {
         return "pointer picked at run time";
     case ExtentUnknown::GlobalStore:
         return "driver buffer with global stores";
+    case ExtentUnknown::SharedNotPrivate:
+        return "shared memory not one slot per invocation";
+    case ExtentUnknown::SharedPartialWrite:
+        return "loaded shared word also written another way";
+    case ExtentUnknown::SharedNotDominated:
+        return "loaded shared word not stored before the load";
     }
     return "?";
 }
@@ -185,10 +196,15 @@ inline constexpr size_t MaxExtentTerms = 4;
 /// and the guard (when ids.guarded) is ids' guard bound plus the guard terms the same way. The
 /// words are read at bind time, like the pointer word. Not stored with the info: an info from the
 /// precompiled cache has an unbounded one.
+///
+/// FRITCHII_EXTENT_SHARED: via_shared marks an extent proven only by following offsets an
+/// invocation parked in its own shared memory slot to the values it stored there (the switch,
+/// not FRITCHII_EXTENT_CBUF, decides whether it is used).
 struct StorageCbufExtent {
     StorageWriteExtent ids{};
     u8 num_terms{};
     u8 num_guard_terms{};
+    bool via_shared{};
     std::array<StorageExtentTerm, MaxExtentTerms> terms{};
     std::array<StorageExtentTerm, MaxExtentTerms> guard_terms{};
 
@@ -307,6 +323,7 @@ constexpr void MergeStorageCbufExtent(StorageCbufExtent& base, const StorageCbuf
         base = StorageCbufExtent{};
         return;
     }
+    base.via_shared = base.via_shared || other.via_shared;
     for (size_t i = 0; i < other.num_terms; ++i) {
         if (!MergeExtentTerm(base.terms, base.num_terms, other.terms[i])) {
             base = StorageCbufExtent{};

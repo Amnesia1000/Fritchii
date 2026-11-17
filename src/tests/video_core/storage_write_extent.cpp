@@ -439,6 +439,119 @@ TEST_CASE("A record stride that is not a power of two keeps its residues",
     CHECK(Shader::StoreFootprintHits(footprint, -0x330 + 0x40, 4));
 }
 
+namespace {
+/// (tid.y * 64 + tid.x) * 0x14 through a native IMAD lowered to 16-bit halves: each invocation's
+/// own 20-byte shared memory slot, as the flower program 989e109982cb409b computes it
+IR::U32 SharedSlot(IR::IREmitter& ir) {
+    const IR::U32 linear{ir.IAdd(ir.ShiftLeftLogical(ir.LocalInvocationIdY(), ir.Imm32(6)),
+                                 ir.LocalInvocationIdX())};
+    const IR::U32 low_half{ir.BitFieldExtract(linear, ir.Imm32(0), ir.Imm32(16), false)};
+    const IR::U32 high_half{ir.BitFieldExtract(linear, ir.Imm32(16), ir.Imm32(16), false)};
+    return ir.IAdd(ir.IMul(low_half, ir.Imm32(0x14)),
+                   ir.ShiftLeftLogical(ir.IMul(high_half, ir.Imm32(0x14)), ir.Imm32(16)));
+}
+
+/// 0x140 * (64 * ctaid.x + tid.x): the invocation's 320-byte record
+IR::U32 FlowerRecord(IR::IREmitter& ir) {
+    const IR::U32 global{ir.IAdd(ir.ShiftLeftLogical(ir.WorkgroupIdX(), ir.Imm32(6)),
+                                 ir.LocalInvocationIdX())};
+    return ir.IMul(global, ir.Imm32(0x140));
+}
+} // Anonymous namespace
+
+TEST_CASE("Record offsets parked in an invocation's shared slot are followed to their stores",
+          "[shader][storage_extent]") {
+    // 989e109982cb409b: each invocation spills two offsets into its record to its own shared
+    // slot, reloads them later and stores through them
+    KernelProgram fixture;
+    fixture.program.shared_memory_size = 64 * 0x14;
+    IR::IREmitter ir{fixture.entry};
+    const IR::U32 slot{SharedSlot(ir)};
+    const IR::U32 record{FlowerRecord(ir)};
+    ir.WriteShared(32, ir.IAdd(slot, ir.Imm32(8)), ir.IAdd(record, ir.Imm32(0xb0)));
+    ir.WriteShared(32, slot, ir.IAdd(record, ir.Imm32(0xa0)));
+    ir.WriteShared(32, ir.IAdd(slot, ir.Imm32(4)), ir.Imm32(0x3f800000)); // a spilled float
+    ir.WriteGlobal32(Address(ir, 0x160, ir.IAdd(record, ir.Imm32(0x134))), ir.Imm32(0));
+    const IR::U32 first{ir.LoadShared(32, false, slot)};
+    const IR::U32 second{ir.LoadShared(32, false, ir.IAdd(slot, ir.Imm32(8)))};
+    ir.WriteGlobal64(Address(ir, 0x160, first), ir.CompositeConstruct(ir.Imm32(0), ir.Imm32(0)));
+    ir.WriteGlobal32(Address(ir, 0x160, ir.IAdd(second, ir.Imm32(8))), ir.Imm32(0));
+    const auto& descriptor{fixture.Run(0x160)};
+    REQUIRE(descriptor.is_written);
+    // The plain extent stays what it was (default behaviour and the precompiled cache unchanged)
+    CHECK_FALSE(descriptor.write_extent.bounded);
+    const Shader::StorageWriteExtra& extra{fixture.Extra(0x160)};
+    CHECK(extra.write_unknown.kind == Shader::ExtentUnknown::LoadedFromMemory);
+    CHECK(extra.shared_why.kind == Shader::ExtentUnknown::Known);
+    const Shader::StorageCbufExtent& cbuf{extra.cbuf_extent};
+    REQUIRE(cbuf.ids.bounded);
+    CHECK(cbuf.via_shared);
+    CHECK(cbuf.num_terms == 0);
+    CHECK(cbuf.ids.const_end == 0x138);
+    CHECK(cbuf.ids.local_stride == std::array<u32, 3>{0x140, 0, 0});
+    CHECK(cbuf.ids.group_stride == std::array<u32, 3>{0x5000, 0, 0});
+    const std::array<u32, Shader::MaxExtentTerms> none{};
+    // 20 KiB a workgroup: 0x5000 * gx - 8
+    CHECK(Shader::ResolveStorageCbufExtent(cbuf, {64, 1, 1}, std::array<u32, 3>{6, 1, 1}, none,
+                                           none) == 0x5000 * 6 - 8);
+    CHECK_FALSE(Shader::ResolveStorageCbufExtent(cbuf, {64, 1, 1}, std::nullopt, none, none));
+    // The footprint sees through the slot too: record residues only
+    const Shader::StorageStoreFootprint& footprint{extra.footprint};
+    REQUIRE(footprint.Valid());
+    CHECK(footprint.modulus == 0x140);
+    CHECK(footprint.ids_only);
+    CHECK_FALSE(Shader::StoreFootprintHits(footprint, 0x140 * 3 + 0x10, 0x10));
+    CHECK(Shader::StoreFootprintHits(footprint, 0x140 * 3 + 0xa4, 4));
+}
+
+TEST_CASE("A shared slot that is not the invocation's own is not followed",
+          "[shader][storage_extent]") {
+    KernelProgram fixture;
+    fixture.program.shared_memory_size = 64 * 0x14;
+    IR::IREmitter ir{fixture.entry};
+    const int variant = GENERATE(0, 1, 2, 3);
+    const IR::U32 record{FlowerRecord(ir)};
+    IR::U32 slot{SharedSlot(ir)};
+    Shader::ExtentUnknown expected{};
+    switch (variant) {
+    case 0:
+        // One slot for the whole workgroup: another invocation's store may be the one loaded
+        slot = ir.Imm32(0x40);
+        expected = Shader::ExtentUnknown::SharedNotPrivate;
+        break;
+    case 1:
+        // 4-byte steps between slots of 12 bytes: neighbours overlap
+        slot = ir.ShiftLeftLogical(ir.LocalInvocationIdX(), ir.Imm32(2));
+        ir.WriteShared(32, ir.IAdd(slot, ir.Imm32(8)), ir.Imm32(0));
+        expected = Shader::ExtentUnknown::SharedNotPrivate;
+        break;
+    case 2:
+        // An atomic on the loaded word
+        static_cast<void>(ir.SharedAtomicIAdd(slot, ir.Imm32(1)));
+        expected = Shader::ExtentUnknown::SharedPartialWrite;
+        break;
+    default:
+        expected = Shader::ExtentUnknown::SharedNotDominated;
+        break;
+    }
+    if (variant == 3) {
+        // Loaded before anything is stored to it
+        const IR::U32 early{ir.LoadShared(32, false, slot)};
+        ir.WriteShared(32, slot, ir.IAdd(record, ir.Imm32(0xa0)));
+        ir.WriteGlobal32(Address(ir, 0x160, early), ir.Imm32(0));
+    } else {
+        ir.WriteShared(32, slot, ir.IAdd(record, ir.Imm32(0xa0)));
+        const IR::U32 loaded{ir.LoadShared(32, false, slot)};
+        ir.WriteGlobal32(Address(ir, 0x160, loaded), ir.Imm32(0));
+    }
+    const auto& descriptor{fixture.Run(0x160)};
+    CHECK_FALSE(descriptor.write_extent.bounded);
+    const Shader::StorageWriteExtra& extra{fixture.Extra(0x160)};
+    CHECK_FALSE(extra.cbuf_extent.ids.bounded);
+    CHECK_FALSE(extra.cbuf_extent.via_shared);
+    CHECK(extra.shared_why.kind == expected);
+}
+
 TEST_CASE("A footprint reduces to its modulus' power-of-two part", "[shader][storage_extent]") {
     // 0x110-byte records, stores at +0x80..+0x8b and +0x108..+0x10b: modulo 0x10 they cover
     // +0x0..+0xb, so a read at +0x10 (residue 0) is inside and +0xc is still outside
