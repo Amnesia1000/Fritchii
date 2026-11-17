@@ -7,10 +7,12 @@
 #include <array>
 #include <bit>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <string_view>
 #include <tuple>
 #include <unordered_set>
 #include <type_traits>
@@ -362,8 +364,29 @@ VkResult TimedVmaCreateImage(const Device &device, VmaAllocator allocator,
 // readies the memory for depth on each bind, which memory that held depth before may skip. The
 // pools live as long as the VMA allocator (never destroyed: images may outlive this object).
 // At file scope so the owners line's slack split and FRITCHII_VRAM_TRIM can walk them.
+struct DepthPoolEntry {
+    VmaAllocator owner;
+    u32 type;
+    VmaPool pool;
+    bool small; ///< FRITCHII_DEPTH_POOL_FIT's pool for small depth targets
+};
 static std::mutex g_depth_pool_mutex;
-static std::vector<std::tuple<VmaAllocator, u32, VmaPool>> g_depth_pools;
+static std::vector<DepthPoolEntry> g_depth_pools;
+
+/// FRITCHII_DEPTH_POOL_FIT's small depth pool: its block size (FRITCHII_DEPTH_POOL_SMALL_BLOCK_MIB,
+/// boot, default 16, 4-64) and the largest padded allocation it takes (a quarter of a block).
+static VkDeviceSize SmallDepthBlockBytes() {
+    static const VkDeviceSize bytes = [] {
+        const char* value = std::getenv("FRITCHII_DEPTH_POOL_SMALL_BLOCK_MIB");
+        const unsigned long mib = value != nullptr ? std::strtoul(value, nullptr, 10) : 16UL;
+        return VkDeviceSize{(std::clamp)(mib, 4UL, 64UL)} << 20;
+    }();
+    return bytes;
+}
+
+/// The depth pool (or with `small` FRITCHII_DEPTH_POOL_FIT's small one) of a memory type, made on
+/// first use.
+static VmaPool DepthPoolOfType(VmaAllocator allocator, u32 type, bool small);
 
 static VmaPool DepthAttachmentPool(VmaAllocator allocator, const VkImageCreateInfo &ci,
                                    const VmaAllocationCreateInfo &alloc_ci) {
@@ -381,11 +404,15 @@ static VmaPool DepthAttachmentPool(VmaAllocator allocator, const VkImageCreateIn
     if (vmaFindMemoryTypeIndexForImageInfo(allocator, &ci, &alloc_ci, &type) != VK_SUCCESS) {
         return VK_NULL_HANDLE;
     }
+    return DepthPoolOfType(allocator, type, false);
+}
+
+static VmaPool DepthPoolOfType(VmaAllocator allocator, u32 type, bool small) {
     auto& pools = g_depth_pools;
     std::scoped_lock lock{g_depth_pool_mutex};
-    for (const auto &[owner, pool_type, pool] : pools) {
-        if (owner == allocator && pool_type == type) {
-            return pool;
+    for (const DepthPoolEntry& entry : pools) {
+        if (entry.owner == allocator && entry.type == type && entry.small == small) {
+            return entry.pool;
         }
     }
     using namespace Common::Literals;
@@ -399,8 +426,8 @@ static VmaPool DepthAttachmentPool(VmaAllocator allocator, const VkImageCreateIn
     const VmaPoolCreateInfo pool_ci{
         .memoryTypeIndex = type,
         .flags = 0,
-        .blockSize = 64_MiB,
-        .minBlockCount = min_blocks,
+        .blockSize = small ? SmallDepthBlockBytes() : 64_MiB,
+        .minBlockCount = small ? 0U : min_blocks,
         .maxBlockCount = 0,
         .priority = 0.f,
         .minAllocationAlignment = 0,
@@ -410,8 +437,12 @@ static VmaPool DepthAttachmentPool(VmaAllocator allocator, const VkImageCreateIn
     if (vmaCreatePool(allocator, &pool_ci, &pool) != VK_SUCCESS) {
         return VK_NULL_HANDLE;
     }
-    LOG_INFO(Render_Vulkan, "Depth attachment pool (EDEN_NX2_DEPTH_POOL) for memory type {}", type);
-    pools.emplace_back(allocator, type, pool);
+    // Named, so VMA's detailed map (FRITCHII_VRAM_HOLES) tells the pools apart.
+    vmaSetPoolName(allocator, pool, small ? "depth small" : "depth");
+    LOG_INFO(Render_Vulkan, "Depth attachment pool (EDEN_NX2_DEPTH_POOL{}) for memory type {}: {} MiB "
+             "blocks", small ? ", FRITCHII_DEPTH_POOL_FIT small" : "", type,
+             pool_ci.blockSize >> 20);
+    pools.push_back({allocator, type, pool, small});
     return pool;
 }
 
@@ -487,6 +518,7 @@ VmaPool ColourAttachmentPool(VmaAllocator allocator, const VkImageCreateInfo& ci
     if (vmaCreatePool(allocator, &pool_ci, &pool) != VK_SUCCESS) {
         return VK_NULL_HANDLE;
     }
+    vmaSetPoolName(allocator, pool, "colour");
     LOG_INFO(Render_Vulkan,
              "Colour target pool (FRITCHII_KILL_RT_POOL) for memory type {}: 64 MiB blocks, {} kept",
              type, min_blocks);
@@ -682,6 +714,174 @@ void NoteKillPoolMiss(bool too_big) {
     }
 }
 
+static_assert(sizeof(void*) == 8, "image allocation user data needs 64-bit pointers");
+
+/// When an image allocation is made, in 100 ms steps since the first (vk::ImageUserDataTag).
+u64 ImageStamp() {
+    static const auto start = std::chrono::steady_clock::now();
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - start)
+                        .count();
+    return static_cast<u64>(ms / 100) & 0xFFFF'FFFFULL;
+}
+
+/// VMA user data of an image allocation: tag, padding (256-byte units, a multiple of 256 given)
+/// and the stamp. VMA never reads it (no USER_DATA_COPY_STRING).
+void* ImageUserData(u64 padding) {
+    return reinterpret_cast<void*>(static_cast<uintptr_t>(
+        vk::ImageUserDataTag | (((padding >> 8) & 0x7FFF'FFFFULL) << 32) | ImageStamp()));
+}
+
+// FRITCHII_DEPTH_POOL_FIT (live, default 0; bits): how depth targets are placed in the depth
+// pool (EDEN_NX2_DEPTH_POOL). The market's depth pool held 1152-1280 MiB in 18-20 blocks of
+// 64 MiB with 529-727 MiB of it in 76-177 holes (batch 29): OoT makes depth targets sized by
+// screen bounds (per-NPC D32 targets, shadow cascades) next to large long-lived ones, so the hole
+// a freed target leaves rarely fits the next one exactly, and a small long-lived target pins a
+// whole 64 MiB block.
+//  1 = size classes: the allocation is rounded up to a class, four per power of two (at most a
+//      quarter more, ~1/8 on average), so a freed target's hole fits the next target of its class.
+//      The padding is counted in the owners line ("depth fit padding").
+//  2 = small depth targets (at most a quarter of FRITCHII_DEPTH_POOL_SMALL_BLOCK_MIB, default
+//      16 MiB blocks, so up to 4 MiB) go to a depth pool of their own: they no longer fill holes
+//      large targets need, and one that lives long pins a 16 MiB block instead of 64.
+//  3 = both. Only where the memory sits changes; the images and their contents are the same.
+int DepthFitMode() {
+    return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_depth_pool_fit,
+                                            "FRITCHII_DEPTH_POOL_FIT");
+}
+
+/// Size class: up to the next quarter of the power of two below `size` (at least 4 KiB steps),
+/// then up to the alignment.
+VkDeviceSize DepthFitClass(VkDeviceSize size, VkDeviceSize alignment) {
+    const VkDeviceSize power = std::bit_floor(size);
+    const VkDeviceSize step = (std::max)(power / 4, VkDeviceSize{4096});
+    const VkDeviceSize rounded = Common::AlignUp(size, static_cast<size_t>(step));
+    return alignment > 1 ? Common::AlignUp(rounded, static_cast<size_t>(alignment)) : rounded;
+}
+
+std::atomic<u64> g_fit_placed{};    ///< FRITCHII_DEPTH_POOL_FIT: images it placed
+std::atomic<u64> g_fit_small{};     ///< ... of them in the small depth pool
+std::atomic<u64> g_fit_fallbacks{}; ///< images it handed back to the old path
+
+/// Whether the driver requires the image in memory of its own (then no pool may take it).
+bool RequiresDedicated(const Device& device, VkImage image) {
+    static std::mutex mutex;
+    static VkDevice cached_device{};
+    static PFN_vkGetImageMemoryRequirements2 requirements2{};
+    const VkDevice logical = *device.GetLogical();
+    PFN_vkGetImageMemoryRequirements2 function{};
+    {
+        std::scoped_lock lock{mutex};
+        if (cached_device != logical) {
+            cached_device = logical;
+            requirements2 = reinterpret_cast<PFN_vkGetImageMemoryRequirements2>(
+                device.GetDispatchLoader().vkGetDeviceProcAddr(logical,
+                                                               "vkGetImageMemoryRequirements2"));
+        }
+        function = requirements2;
+    }
+    if (function == nullptr) {
+        return false;
+    }
+    VkMemoryDedicatedRequirements dedicated{};
+    dedicated.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS;
+    VkMemoryRequirements2 out{};
+    out.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2;
+    out.pNext = &dedicated;
+    VkImageMemoryRequirementsInfo2 info{};
+    info.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2;
+    info.image = image;
+    function(logical, &info, &out);
+    return dedicated.requiresDedicatedAllocation != VK_FALSE;
+}
+
+/// FRITCHII_DEPTH_POOL_FIT: vkCreateImage, the (rounded) memory from the depth pool or the small
+/// one, then the bind. False with nothing left behind when it does not take the image: the caller
+/// goes the old way (the depth pool through vmaCreateImage, then the fallbacks).
+bool TryDepthFit(const Device& device, VmaAllocator allocator, const VkImageCreateInfo& ci,
+                 const VmaAllocationCreateInfo& alloc_ci, VmaPool large_pool, int mode,
+                 VkImage& handle, VmaAllocation& allocation, VmaAllocationInfo& alloc_info) {
+    using namespace Common::Literals;
+    // The depth pool's memory type (found once per image by the caller's DepthAttachmentPool).
+    u32 type = VK_MAX_MEMORY_TYPES;
+    {
+        std::scoped_lock lock{g_depth_pool_mutex};
+        for (const DepthPoolEntry& entry : g_depth_pools) {
+            if (entry.pool == large_pool) {
+                type = entry.type;
+            }
+        }
+    }
+    if (large_pool == VK_NULL_HANDLE || type == VK_MAX_MEMORY_TYPES) {
+        return false;
+    }
+    const auto& dld = device.GetDispatchLoader();
+    const VkDevice logical = *device.GetLogical();
+    VkImage image{};
+    if (dld.vkCreateImage(logical, &ci, nullptr, &image) != VK_SUCCESS) {
+        return false;
+    }
+    const auto give_up = [&] {
+        dld.vkDestroyImage(logical, image, nullptr);
+        g_fit_fallbacks.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    };
+    VkMemoryRequirements requirements{};
+    dld.vkGetImageMemoryRequirements(logical, image, &requirements);
+    if (RequiresDedicated(device, image)) {
+        return give_up();
+    }
+    VkDeviceSize size = requirements.size;
+    if ((mode & 1) != 0) {
+        size = DepthFitClass(size, requirements.alignment);
+    }
+    VmaPool pool = large_pool;
+    VkDeviceSize block = 64_MiB;
+    bool small = false;
+    if ((mode & 2) != 0 && size <= SmallDepthBlockBytes() / 4) {
+        if (const VmaPool small_pool = DepthPoolOfType(allocator, type, true)) {
+            pool = small_pool;
+            block = SmallDepthBlockBytes();
+            small = true;
+        }
+    }
+    if (size > block) {
+        if (requirements.size > block) {
+            return give_up(); // larger than a pool block: VMA refuses it there anyway
+        }
+        size = requirements.size;
+    }
+    const u64 padding = ((size - requirements.size) >> 8) << 8;
+    VmaAllocationCreateInfo pool_ci = alloc_ci;
+    pool_ci.flags &= ~VmaAllocationCreateFlags{VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT};
+    pool_ci.usage = VMA_MEMORY_USAGE_UNKNOWN;
+    pool_ci.memoryTypeBits = 0;
+    pool_ci.pool = pool;
+    pool_ci.pUserData = ImageUserData(padding);
+    VkMemoryRequirements padded = requirements;
+    padded.size = size;
+    VmaAllocation pooled{};
+    VmaAllocationInfo pooled_info{};
+    if (vmaAllocateMemory(allocator, &padded, &pool_ci, &pooled, &pooled_info) != VK_SUCCESS) {
+        return give_up();
+    }
+    if (vmaBindImageMemory(allocator, pooled, image) != VK_SUCCESS) {
+        vmaFreeMemory(allocator, pooled);
+        return give_up();
+    }
+    if (padding != 0) {
+        vk::g_image_padding_bytes.fetch_add(padding, std::memory_order_relaxed);
+    }
+    g_fit_placed.fetch_add(1, std::memory_order_relaxed);
+    if (small) {
+        g_fit_small.fetch_add(1, std::memory_order_relaxed);
+    }
+    handle = image;
+    allocation = pooled;
+    alloc_info = pooled_info;
+    return true;
+}
+
 /// The first refusals of a session get the heaps in full: which heap was short, by how much, and
 /// whether VMA follows the driver's budget ("over the memory budget" with 1.1 GB used could not
 /// be explained from the log).
@@ -758,7 +958,8 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
             .preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
             .memoryTypeBits = 0,
             .pool = VK_NULL_HANDLE,
-            .pUserData = nullptr,
+            // Tag and stamp (vk::ImageUserDataTag): FRITCHII_VRAM_HOLES reads the age.
+            .pUserData = ImageUserData(0),
             .priority = 0.f,
     };
 
@@ -796,7 +997,16 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
             NoteKillPoolMiss(too_big);
         }
     }
-    VkResult result = kill_pooled ? VK_SUCCESS
+    // FRITCHII_DEPTH_POOL_FIT: depth targets the depth pool takes, rounded to a size class or in
+    // the small depth pool; anything it does not take goes the old way below.
+    bool fit_placed = false;
+    if (!kill_pooled && !huge && first_ci.pool != VK_NULL_HANDLE) {
+        if (const int fit = DepthFitMode(); fit != 0) {
+            fit_placed = TryDepthFit(device, allocator, ci, alloc_ci, first_ci.pool, fit, handle,
+                                     allocation, alloc_info);
+        }
+    }
+    VkResult result = kill_pooled || fit_placed ? VK_SUCCESS
                       : huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
                       : ImageTimingEnabled()
                           ? TimedVmaCreateImage(device, allocator, ci, first_ci, handle,
@@ -1452,9 +1662,10 @@ std::vector<NamedPool> PoolsOf(const Device& device, VmaAllocator owner) {
     std::vector<NamedPool> pools;
     {
         std::scoped_lock lock{g_depth_pool_mutex};
-        for (const auto& [pool_owner, type, pool] : g_depth_pools) {
-            if (pool_owner == owner) {
-                pools.push_back({pool, type, "depth pool"});
+        for (const DepthPoolEntry& entry : g_depth_pools) {
+            if (entry.owner == owner) {
+                pools.push_back(
+                    {entry.pool, entry.type, entry.small ? "small depth pool" : "depth pool"});
             }
         }
     }
@@ -1581,6 +1792,297 @@ u64 TrimEmptyBlocks(const Device& device, VmaAllocator owner, u32 heap) {
     const u64 had = before[heap].statistics.blockBytes;
     const u64 has = after[heap].statistics.blockBytes;
     return had > has ? had - has : 0;
+}
+
+std::string DepthFitText() {
+    const int mode = DepthFitMode();
+    const u64 placed = g_fit_placed.load(std::memory_order_relaxed);
+    if (mode == 0 && placed == 0) {
+        return {};
+    }
+    return fmt::format("depth fit (FRITCHII_DEPTH_POOL_FIT={}): {} placed ({} in the small pool), "
+                       "{} handed back, padding of live images {} MiB",
+                       mode, placed, g_fit_small.load(std::memory_order_relaxed),
+                       g_fit_fallbacks.load(std::memory_order_relaxed),
+                       vk::g_image_padding_bytes.load(std::memory_order_relaxed) >> 20);
+}
+
+namespace {
+
+/// FRITCHII_VRAM_HOLES: size classes of the histograms.
+constexpr std::array<u64, 5> HoleClassLimits{u64{64} << 10, u64{256} << 10, u64{1} << 20,
+                                             u64{4} << 20, u64{16} << 20};
+constexpr std::array<const char*, 6> HoleClassNames{"<64K", "<256K", "<1M",
+                                                    "<4M",  "<16M",  ">=16M"};
+
+size_t HoleClass(u64 size) {
+    size_t index = 0;
+    while (index < HoleClassLimits.size() && size >= HoleClassLimits[index]) {
+        ++index;
+    }
+    return index;
+}
+
+/// One block vector's numbers (a memory type's default blocks, or a named pool).
+struct HoleStats {
+    std::string label;
+    u64 blocks{};
+    u64 block_bytes{};
+    std::array<u64, 6> holes{};
+    std::array<u64, 6> hole_bytes{};
+    std::array<u64, 6> sizes{}; ///< all allocations by size
+    std::array<u64, 6> size_bytes{};
+    u64 sparse_blocks{}; ///< blocks at least half free
+    u64 sparse_block_bytes{};
+    u64 pinners{}; ///< allocations in those blocks
+    u64 pinner_bytes{};
+    std::array<u64, 4> pinner_kinds{}; ///< depth, colour, other image, buffer or untyped
+    std::array<u64, 4> pinner_kind_bytes{};
+    std::array<u64, 6> pinner_sizes{};
+    std::array<u64, 5> pinner_ages{}; ///< <10 s, <1 min, <5 min, older, untagged
+};
+
+struct SubAllocation {
+    bool free{};
+    bool image{};
+    u64 size{};
+    u64 usage{};
+    u64 data{};
+};
+
+std::string Histogram(const std::array<u64, 6>& counts, const std::array<u64, 6>& bytes) {
+    std::string text;
+    for (size_t i = 0; i < counts.size(); ++i) {
+        if (counts[i] == 0) {
+            continue;
+        }
+        fmt::format_to(std::back_inserter(text), "{}{} {}/{} MiB", text.empty() ? "" : ", ",
+                       HoleClassNames[i], counts[i], bytes[i] >> 20);
+    }
+    return text.empty() ? std::string{"none"} : text;
+}
+
+bool IsJsonSpace(char c) {
+    return c == ' ' || c == '\n' || c == '\r' || c == '\t';
+}
+
+/// A JSON string starting at text[start] (the opening quote); `end` is set past the closing one.
+std::string ReadJsonString(std::string_view text, size_t start, size_t& end) {
+    std::string out;
+    size_t j = start + 1;
+    while (j < text.size() && text[j] != '"') {
+        if (text[j] == '\\' && j + 1 < text.size()) {
+            ++j;
+        }
+        out.push_back(text[j]);
+        ++j;
+    }
+    end = j + 1;
+    return out;
+}
+
+} // Anonymous namespace
+
+std::string VramHolesText(VmaAllocator owner, u32 heap) {
+    const VkPhysicalDeviceMemoryProperties* properties{};
+    vmaGetMemoryProperties(owner, &properties);
+    char* json = nullptr;
+    vmaBuildStatsString(owner, &json, VK_TRUE);
+    if (json == nullptr) {
+        return "no map";
+    }
+    const std::string_view text{json};
+    const u64 now = ImageStamp();
+    std::vector<HoleStats> vectors;
+    size_t current = SIZE_MAX; ///< index in `vectors`
+    bool custom = false;
+    bool dedicated = false;
+    bool on_heap = false;
+    u32 type = 0;
+    u64 block_size = 0;
+    bool in_block = false;
+    std::vector<SubAllocation> block;
+    SubAllocation pending{};
+    bool has_pending = false;
+    const auto vector_for = [&](const std::string& label) {
+        for (size_t index = 0; index < vectors.size(); ++index) {
+            if (vectors[index].label == label) {
+                return index;
+            }
+        }
+        vectors.push_back(HoleStats{});
+        vectors.back().label = label;
+        return vectors.size() - 1;
+    };
+    const auto flush_pending = [&] {
+        if (has_pending && in_block && !dedicated && on_heap && current != SIZE_MAX) {
+            block.push_back(pending);
+        }
+        has_pending = false;
+        pending = {};
+    };
+    const auto flush_block = [&] {
+        flush_pending();
+        if (in_block && on_heap && current != SIZE_MAX && block_size != 0) {
+            HoleStats& stats = vectors[current];
+            ++stats.blocks;
+            stats.block_bytes += block_size;
+            u64 free_bytes = 0;
+            for (const SubAllocation& sub : block) {
+                const size_t size_class = HoleClass(sub.size);
+                if (sub.free) {
+                    free_bytes += sub.size;
+                    ++stats.holes[size_class];
+                    stats.hole_bytes[size_class] += sub.size;
+                } else {
+                    ++stats.sizes[size_class];
+                    stats.size_bytes[size_class] += sub.size;
+                }
+            }
+            if (free_bytes * 2 >= block_size) {
+                ++stats.sparse_blocks;
+                stats.sparse_block_bytes += block_size;
+                for (const SubAllocation& sub : block) {
+                    if (sub.free) {
+                        continue;
+                    }
+                    ++stats.pinners;
+                    stats.pinner_bytes += sub.size;
+                    ++stats.pinner_sizes[HoleClass(sub.size)];
+                    size_t kind = 3;
+                    if (sub.image) {
+                        kind = (sub.usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0 ? 0
+                               : (sub.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) != 0       ? 1
+                                                                                              : 2;
+                    }
+                    ++stats.pinner_kinds[kind];
+                    stats.pinner_kind_bytes[kind] += sub.size;
+                    size_t age = 4;
+                    if ((sub.data & vk::ImageUserDataTag) != 0) {
+                        const u64 stamp = sub.data & 0xFFFF'FFFFULL;
+                        const u64 seconds = (now >= stamp ? now - stamp : 0) / 10;
+                        age = seconds < 10 ? 0 : seconds < 60 ? 1 : seconds < 300 ? 2 : 3;
+                    }
+                    ++stats.pinner_ages[age];
+                }
+            }
+        }
+        block.clear();
+        in_block = false;
+        block_size = 0;
+    };
+    // VMA's JSON (VmaJsonWriter): "Key": value pairs in a fixed order, so a scan for keys is
+    // enough: DefaultPools / CustomPools, "Type N" per memory type, "Name" per custom pool,
+    // "TotalBytes" per block, then its suballocations ("Offset", "Type", "Size", "Usage",
+    // "CustomData"), then the vector's "DedicatedAllocations" (left out: no unused space).
+    size_t i = 0;
+    while (true) {
+        const size_t quote = text.find('"', i);
+        if (quote == std::string_view::npos) {
+            break;
+        }
+        size_t after = 0;
+        const std::string key = ReadJsonString(text, quote, after);
+        size_t j = after;
+        while (j < text.size() && IsJsonSpace(text[j])) {
+            ++j;
+        }
+        if (j >= text.size() || text[j] != ':') {
+            i = after;
+            continue;
+        }
+        ++j;
+        while (j < text.size() && IsJsonSpace(text[j])) {
+            ++j;
+        }
+        std::string string_value;
+        u64 number = 0;
+        bool is_string = false;
+        bool is_number = false;
+        if (j < text.size() && text[j] == '"') {
+            string_value = ReadJsonString(text, j, i);
+            is_string = true;
+        } else if (j < text.size() && text[j] >= '0' && text[j] <= '9') {
+            size_t k = j;
+            while (k < text.size() && text[k] >= '0' && text[k] <= '9') {
+                number = number * 10 + static_cast<u64>(text[k] - '0');
+                ++k;
+            }
+            is_number = true;
+            i = k;
+        } else {
+            i = j + 1; // an object or an array opens, or a literal
+        }
+        if (key == "DefaultPools" || key == "CustomPools") {
+            flush_block();
+            custom = key == "CustomPools";
+            current = SIZE_MAX;
+        } else if (key.starts_with("Type ") && !is_string && !is_number) {
+            flush_block();
+            type = static_cast<u32>(std::strtoul(key.c_str() + 5, nullptr, 10));
+            on_heap = type < properties->memoryTypeCount &&
+                      properties->memoryTypes[type].heapIndex == heap;
+            dedicated = false;
+            current = custom ? SIZE_MAX : vector_for(fmt::format("default (type {})", type));
+        } else if (key == "Name" && is_string && custom) {
+            flush_block();
+            const size_t dash = string_value.find(" - ");
+            const std::string name =
+                dash != std::string::npos ? string_value.substr(dash + 3) : "unnamed pool";
+            current = vector_for(fmt::format("{} (type {})", name, type));
+            dedicated = false;
+        } else if (key == "Blocks") {
+            flush_block();
+            dedicated = false;
+        } else if (key == "DedicatedAllocations") {
+            flush_block();
+            dedicated = true;
+        } else if (key == "TotalBytes" && is_number) {
+            flush_block();
+            if (!dedicated) {
+                in_block = true;
+                block_size = number;
+            }
+        } else if (key == "Offset" && is_number) {
+            flush_pending();
+            has_pending = true;
+        } else if (key == "Type" && is_string && has_pending) {
+            pending.free = string_value == "FREE";
+            pending.image = string_value.starts_with("IMAGE");
+        } else if (key == "Size" && is_number && has_pending) {
+            pending.size = number;
+        } else if (key == "Usage" && is_number && has_pending) {
+            pending.usage = number;
+        } else if (key == "CustomData" && is_string && has_pending) {
+            pending.data = std::strtoull(string_value.c_str(), nullptr, 16);
+        }
+    }
+    flush_block();
+    vmaFreeStatsString(owner, json);
+    std::string out;
+    for (const HoleStats& stats : vectors) {
+        if (stats.blocks == 0) {
+            continue;
+        }
+        fmt::format_to(
+            std::back_inserter(out),
+            "{}{}: {} blocks {} MiB; holes {}; allocations {}; blocks at least half free {} ({} "
+            "MiB) held by {} allocations {} MiB: depth {}/{} MiB, colour {}/{} MiB, other images "
+            "{}/{} MiB, buffers and untyped {}/{} MiB; their sizes <64K {}, <256K {}, <1M {}, "
+            "<4M {}, <16M {}, >=16M {}; their ages <10 s {}, <1 min {}, <5 min {}, older {}, "
+            "unknown {}",
+            out.empty() ? "" : " | ", stats.label, stats.blocks, stats.block_bytes >> 20,
+            Histogram(stats.holes, stats.hole_bytes), Histogram(stats.sizes, stats.size_bytes),
+            stats.sparse_blocks, stats.sparse_block_bytes >> 20, stats.pinners,
+            stats.pinner_bytes >> 20, stats.pinner_kinds[0], stats.pinner_kind_bytes[0] >> 20,
+            stats.pinner_kinds[1], stats.pinner_kind_bytes[1] >> 20, stats.pinner_kinds[2],
+            stats.pinner_kind_bytes[2] >> 20, stats.pinner_kinds[3],
+            stats.pinner_kind_bytes[3] >> 20, stats.pinner_sizes[0], stats.pinner_sizes[1],
+            stats.pinner_sizes[2], stats.pinner_sizes[3], stats.pinner_sizes[4],
+            stats.pinner_sizes[5], stats.pinner_ages[0], stats.pinner_ages[1],
+            stats.pinner_ages[2], stats.pinner_ages[3], stats.pinner_ages[4]);
+    }
+    return out.empty() ? std::string{"no blocks on the heap"} : out;
 }
 
 } // namespace Vulkan

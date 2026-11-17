@@ -2943,6 +2943,18 @@ std::string TextureCacheRuntime::VramOwnersText(u64 texture_image_bytes, u64 del
                                          static_cast<u32>(heap))
                      : std::string{"; buffer allocator not walked (the memory stage holds it)"};
     }
+    // FRITCHII_DEPTH_POOL_FIT: its padding is allocated to VMA but holds nothing.
+    if (const std::string fit = DepthFitText(); !fit.empty()) {
+        slack += "; " + fit;
+    }
+    // FRITCHII_VRAM_HOLES (live, default 0): what the holes are and what holds the half-empty
+    // blocks, for the main allocator (images, depth pools). Builds VMA's detailed map: ms of
+    // work every owners line, so a diagnostic only.
+    if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_vram_holes,
+                                         "FRITCHII_VRAM_HOLES") != 0) {
+        slack += "; holes (FRITCHII_VRAM_HOLES) main allocator: " +
+                 VramHolesText(device.GetAllocator(), static_cast<u32>(heap));
+    }
     return fmt::format(
         "main heap {} of {} MiB budget ({} MiB heap): texture cache images {} MiB, deleted images "
         "still allocated {} MiB, image pool {} MiB, frees in flight {} MiB, buffers and the rest "

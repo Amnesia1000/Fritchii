@@ -744,6 +744,19 @@ void Image::SetObjectNameEXT(const char* name) const {
 
 void Image::Release() const noexcept {
     if (handle) {
+        // FRITCHII_DEPTH_POOL_FIT: only read while padded images may exist.
+        if (allocation != nullptr &&
+            g_image_padding_bytes.load(std::memory_order_relaxed) != 0) [[unlikely]] {
+            VmaAllocationInfo info{};
+            vmaGetAllocationInfo(allocator, allocation, &info);
+            const u64 data = static_cast<u64>(reinterpret_cast<uintptr_t>(info.pUserData));
+            if ((data & ImageUserDataTag) != 0) {
+                const u64 padding = ((data >> 32) & 0x7FFF'FFFFULL) << 8;
+                if (padding != 0) {
+                    g_image_padding_bytes.fetch_sub(padding, std::memory_order_relaxed);
+                }
+            }
+        }
         vmaDestroyImage(allocator, handle, allocation);
     }
 }

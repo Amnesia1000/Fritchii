@@ -6,6 +6,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <exception>
 #include <limits>
 #include <memory>
@@ -705,6 +706,14 @@ public:
         return *dld;
     }
 };
+
+/// Image allocations' VMA user data (MemoryAllocator::AllocateImage): bit 63 set, bits 32-62 the
+/// padding FRITCHII_DEPTH_POOL_FIT added to the allocation in 256-byte units, bits 0-31 when it
+/// was made, in 100 ms steps since the first image (FRITCHII_VRAM_HOLES reads the age).
+inline constexpr u64 ImageUserDataTag = u64{1} << 63;
+/// FRITCHII_DEPTH_POOL_FIT: the padding of the live images, so the owners line can count it as
+/// unused (the allocator counts it as allocated). Image::Release takes it off.
+inline std::atomic<u64> g_image_padding_bytes{0};
 
 class Image {
 public:

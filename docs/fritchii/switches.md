@@ -864,6 +864,44 @@ empty blocks (main allocator M MiB, buffer allocator N MiB); session S MiB in K 
 8 trims, then at most every 10 s). Test: FRITCHII_VRAM_TRIM=40 on the 16 GB card makes it act at
 the market (usage ~7.5 of ~15.3 GiB).
 
+### FRITCHII_DEPTH_POOL_FIT, FRITCHII_DEPTH_POOL_SMALL_BLOCK_MIB
+
+TEST, off by default (helper DC round 2, 2026-11-17). FRITCHII_DEPTH_POOL_FIT (live, bits): how
+depth targets are placed in the depth pool (EDEN_NX2_DEPTH_POOL). Why: batch 29 at the market had
+the depth pool at 1152-1280 MiB in 18-20 blocks of 64 MiB with 529-727 MiB of it in 76-177 holes
+(largest 33-62 MiB): OoT makes depth targets sized by screen bounds (per-NPC D32 targets, shadow
+cascades) next to large long-lived ones, so a freed target's hole rarely fits the next one, and a
+small long-lived target pins a whole 64 MiB block.
+- 1 = size classes: the allocation is rounded up to one of four classes per power of two (at most
+  a quarter more, ~1/8 on average), so the hole a freed target leaves fits the next target of its
+  class. The padding counts as allocated to VMA; the owners line shows it ("depth fit ... padding
+  of live images P MiB"): compare slack + padding, not slack alone.
+- 2 = small depth targets (rounded size at most a quarter of FRITCHII_DEPTH_POOL_SMALL_BLOCK_MIB,
+  boot, default 16, 4-64) go to a depth pool of their own with blocks of that size: they no longer
+  fill holes large targets need, and a long-lived small one pins 16 MiB instead of 64. The owners
+  line's split shows it as "small depth pool".
+- 3 = both.
+Images made before a change stay where they are. A depth image the driver requires in memory of
+its own, or larger than a pool block, goes the old way ("handed back" in the owners line). Only
+where the memory sits changes; the image, its contents and its layouts are the same. Cost: none
+expected (the same requirement queries VMA makes); the small pool makes a 16 MiB block more often
+early on (a driver allocation each), so read Hitch lines and EDEN_NX2_IMAGE_ALLOC_TIMING.
+
+### FRITCHII_VRAM_HOLES
+
+Diagnostic, off by default (helper DC round 2, 2026-11-17). Live: 1 = every owners line
+(FRITCHII_VRAM_OWNERS) ends in "holes (FRITCHII_VRAM_HOLES) main allocator: <vector>: N blocks M
+MiB; holes <64K a/b MiB, <256K ..., ...; allocations by the same classes; blocks at least half
+free K (S MiB) held by A allocations B MiB: depth, colour, other images, buffers and untyped; their
+sizes ...; their ages <10 s, <1 min, <5 min, older, unknown" for each block vector of the main
+allocator on the main heap ("default (type T)", "depth (type T)", "depth small", "colour",
+"sparse", "buffer"). The half-free blocks' allocations are what keeps unused memory from going
+back: their kind, size and age say which images to move or separate. Ages come from a stamp every
+image allocation carries in its VMA user data. Images placed by FRITCHII_DEPTH_POOL_FIT or the
+colour pool count as "untyped" (made with vmaAllocateMemory); their pool label says what they are.
+Cost: builds VMA's detailed map (JSON of every allocation) each line: several ms on the GPU back
+thread every 10 s. Only for measuring.
+
 ### FRITCHII_VRAM_PACK
 
 Helper DC, 2026-11-17. Live: 0 off, 1 on, 2 auto (default: on with the small card profile on).

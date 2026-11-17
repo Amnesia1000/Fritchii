@@ -514,6 +514,12 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_VRAM_TRIM") {
         return &g_vram_trim;
     }
+    if (name == "FRITCHII_DEPTH_POOL_FIT") {
+        return &g_depth_pool_fit;
+    }
+    if (name == "FRITCHII_VRAM_HOLES") {
+        return &g_vram_holes;
+    }
     if (name == "FRITCHII_SMALL_CARD") {
         return &SmallCard::g_small_card;
     }
