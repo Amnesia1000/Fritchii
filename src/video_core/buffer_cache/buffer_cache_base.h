@@ -485,6 +485,12 @@ public:
     /// Return true when there are uncommitted buffers to be downloaded
     [[nodiscard]] bool HasUncommittedFlushes() const noexcept;
 
+    /// Committed fence downloads not landed in guest memory yet (under the lock).
+    /// FRITCHII_ONEF_SEM_E_LANDED: a sync point's host increment then waits for them.
+    [[nodiscard]] bool HasPendingDownloads() const noexcept {
+        return !pending_downloads.empty();
+    }
+
     /// FRITCHII_FENCE_COMMIT_FAST: false only when HasUncommittedFlushes was false at the last
     /// refresh (under the lock) and no fence download was queued since (QueueFenceDownload
     /// raises it, under the lock). Any thread, no lock.
@@ -1675,6 +1681,53 @@ private:
     /// fence pops. A write to a range after a download was taken removes it from that download
     /// (and every other pending one): its bytes are older than the write.
     std::deque<Common::RangeSet<DAddr>> pending_download_ranges;
+
+    /// FRITCHII_LANDING_CHECK (boot; 0 off, 1 count and log, 2 also keep the guest's bytes):
+    /// at each fence download's commit the guest bytes under its copies; at its landing, the bytes
+    /// the guest changed since then (a write no tracking saw) that the landing would overwrite.
+    /// Damage's Jabu-Jabu freezes (2026-11-17): game objects read as null or float bits
+    /// (0xbf7fffff..., 0x80000000...) right after area loads, the game's assert, then a stopped
+    /// thread; with FRITCHII_ONEF_SEM_E the game's sync point wait ends before the fence's
+    /// downloads land, so memory it frees and reuses after the wait can take an old landing.
+    struct LandingSnapshot {
+        u64 committed_ns{};
+        u64 landing_seq{};            ///< landing_check_seq at the commit
+        std::vector<u64> copy_offsets; ///< Each copy's bytes in `bytes`
+        std::vector<u8> bytes;
+    };
+    std::deque<LandingSnapshot> landing_snapshots; ///< One per pending_downloads entry, when on
+    /// Pages a landing wrote, with landing_check_seq then: a later landing on them is skipped by
+    /// the check (the bytes changed by a download, not by the guest). Under landing_check_mutex.
+    std::unordered_map<u64, u64> landing_check_pages;
+    u64 landing_check_seq{}; ///< Under landing_check_mutex
+    std::mutex landing_check_mutex;
+    struct LandingCheckTotals {
+        u64 landings{};
+        u64 bytes{};
+        u64 changed_landings{};
+        u64 changed_bytes{};
+        u64 kept_bytes{};
+        u64 skipped_bytes{}; ///< On pages an earlier landing wrote after the commit
+        u64 last_log_ns{};
+    } landing_check_totals; ///< The landing thread's (under the buffer cache lock)
+    /// The fence pop in progress on this thread (its landing_check_seq), 0: none.
+    static inline thread_local u64 t_landing_check_pop_seq = 0;
+    /// FRITCHII_LANDING_CHECK's mode, read once.
+    static int LandingCheckMode();
+    /// A fence pop with a download begins (`begin`) or ends on this thread.
+    void LandingCheckPop(bool begin);
+    /// The snapshot of the fence download just committed (`copies`, device addresses).
+    void LandingCheckCommit(std::span<const BufferCopy> copies);
+    /// Before `index`'s copy lands [start, start + size) from `data` (the staging bytes, which
+    /// mode 2 patches with the guest's changed bytes). Under the buffer cache lock.
+    /// `cpu_written`: collected CPU writes the landing leaves alone (not counted).
+    void LandingCheckPiece(const LandingSnapshot& snapshot, const BufferCopy& copy, size_t index,
+                           DAddr start, u8* data, u64 size,
+                           const Common::RangeSet<DAddr>* cpu_written);
+    /// PopOneUnlocked: each unlocked_pieces entry's copy index (with the check on).
+    std::vector<size_t> landing_check_piece_copies;
+    /// Notes the pages a download landing wrote (any landing path).
+    void LandingCheckNoteLanded(DAddr device_addr, u64 size);
     PendingCpuWrites pending_cpu_writes;
     std::optional<Async_Buffer> current_buffer;
 

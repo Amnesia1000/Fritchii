@@ -223,7 +223,9 @@ void OnPresent(long long gap_us);
 // in flight, the game's threads in kernel waits), then every thread's stack (Windows x64,
 // module+offset). FRITCHII_HANG_DUMP=1 (boot) adds a minidump next to the log (Windows). One
 // report per freeze: the next present re-arms it. Read only (threads are suspended only for the
-// moment their registers are read).
+// moment their registers are read). A boot or shutdown (SetHangHooks, ClearHangHooks) starts the
+// count over; until the session's first present the threshold is FRITCHII_HANG_BOOT_S (live,
+// default 60), as the first frame comes 16-19 s into a boot.
 struct HangHooks {
     /// The report's threshold in seconds while the game runs, 0 while it does not (or the
     /// switch is 0). Called once a second under the hooks' lock.

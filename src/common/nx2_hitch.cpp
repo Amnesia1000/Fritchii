@@ -418,6 +418,20 @@ std::atomic<u64> g_hang_presents{};
 std::atomic<u64> g_hang_last_present_ns{};
 std::mutex g_hang_mutex;
 HangHooks g_hang_hooks{}; ///< Under g_hang_mutex
+/// Bumped by SetHangHooks and ClearHangHooks (a boot, a shutdown): HangTick starts over, so the
+/// frameless time never counts from the previous session's last present (Damage's log
+/// 2026-11-17: five false reports 4-5 s into boots, "27.8 s / 150.2 s since the last present").
+std::atomic<u64> g_hang_session{};
+/// NowNs at the newest SetHangHooks: presents before it belong to an earlier session.
+std::atomic<u64> g_hang_session_start_ns{};
+
+// FRITCHII_HANG_BOOT_S (live, default 60, 0 = the normal threshold): the threshold until the
+// session's first present. Booting takes 16-19 s to the first frame on a fast PC (shaders,
+// JIT warm-up), so the normal 5 s would report every boot; a boot that hangs still reports.
+int HangBootSeconds() {
+    const char* const value = std::getenv("FRITCHII_HANG_BOOT_S");
+    return value != nullptr ? (std::max)(std::atoi(value), 0) : 60;
+}
 
 // FRITCHII_HANG_DUMP=1 (boot, default 0): the report also writes a minidump (Windows).
 bool HangDumpEnabled() {
@@ -448,8 +462,19 @@ void HangTick() {
     static u64 last_presents = ~u64{0};
     static u64 counting_since = 0; ///< NowNs from which the frameless time counts
     static bool reported = false;
+    static u64 session = ~u64{0};
+    static u64 session_presents = 0; ///< g_hang_presents when the session began
     const u64 now = NowNs();
     const u64 presents = g_hang_presents.load(std::memory_order_relaxed);
+    if (const u64 current = g_hang_session.load(std::memory_order_acquire); current != session) {
+        // A boot or a shutdown: start over, without the "frames again" line.
+        session = current;
+        session_presents = presents;
+        last_presents = presents;
+        counting_since = now;
+        reported = false;
+        return;
+    }
     if (presents != last_presents) {
         if (reported) {
             LOG_CRITICAL(Render, "Hang report: frames again after {:.1f} s without one (re-armed)",
@@ -461,26 +486,36 @@ void HangTick() {
         return;
     }
     std::unique_lock lock{g_hang_mutex};
-    const int seconds =
+    const int armed =
         g_hang_hooks.armed_seconds != nullptr ? g_hang_hooks.armed_seconds(g_hang_hooks.context) : 0;
-    if (seconds <= 0) {
+    if (armed <= 0) {
         // Paused, stalled, stopped or switched off: the time without frames counts from here.
         counting_since = now;
         return;
     }
+    // Before the session's first present: the boot threshold.
+    const bool first_frame_seen = presents != session_presents;
+    const int seconds = first_frame_seen ? armed : (std::max)(armed, HangBootSeconds());
     if (reported || now - counting_since < static_cast<u64>(seconds) * 1'000'000'000ULL) {
         return;
     }
     reported = true;
     const u64 last_present = g_hang_last_present_ns.load(std::memory_order_relaxed);
+    const bool present_this_session =
+        last_present != 0 && last_present >= g_hang_session_start_ns.load(std::memory_order_relaxed);
     const long long gap_us =
-        last_present != 0 ? static_cast<long long>((now - last_present) / 1000) : 0;
+        present_this_session ? static_cast<long long>((now - last_present) / 1000) : 0;
     LOG_CRITICAL(Render,
-                 "Hang report: no frame for {:.1f} s while the game runs ({:.1f} s since the last "
-                 "present, {} presents this process; FRITCHII_HANG_REPORT_S={}, 0 turns it off). "
-                 "One report per freeze, read only; the next frame re-arms it",
+                 "Hang report: no frame for {:.1f} s while the game runs ({}, {} presents this "
+                 "process; FRITCHII_HANG_REPORT_S={}, 0 turns it off; FRITCHII_HANG_BOOT_S={} "
+                 "before the session's first frame). One report per freeze, read only; the next "
+                 "frame re-arms it",
                  static_cast<double>(now - counting_since) / 1e9,
-                 static_cast<double>(gap_us) / 1e6, presents, seconds);
+                 present_this_session
+                     ? fmt::format("{:.1f} s since the last present",
+                                   static_cast<double>(gap_us) / 1e6)
+                     : std::string{"no present yet this session"},
+                 presents, armed, HangBootSeconds());
     LOG_CRITICAL(Render, "Hang report: {}",
                  StallOn() ? StallSnapshotLine(gap_us)
                            : std::string{"no stall snapshot (EDEN_NX2_STALL_SNAPSHOT=0)"});
@@ -549,6 +584,8 @@ private:
 void SetHangHooks(const HangHooks& hooks) {
     std::scoped_lock lock{g_hang_mutex};
     g_hang_hooks = hooks;
+    g_hang_session_start_ns.store(NowNs(), std::memory_order_relaxed);
+    g_hang_session.fetch_add(1, std::memory_order_release);
 }
 
 void ClearHangHooks(const void* context) {
@@ -556,6 +593,7 @@ void ClearHangHooks(const void* context) {
     if (g_hang_hooks.context == context) {
         g_hang_hooks = {};
     }
+    g_hang_session.fetch_add(1, std::memory_order_release);
 }
 
 void LogThreadReport(const char* prefix, bool shutdown, unsigned long main_thread_id) {

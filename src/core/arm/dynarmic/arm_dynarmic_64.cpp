@@ -56,8 +56,26 @@ u64 DynarmicCallbacks64::MemoryRead(u64 vaddr, size_t size) {
     // With memory aborts ignored the guest keeps running on zeros: say where it read from.
     if (auto& unmapped = Core::Memory::UnmappedReadFlag(); unmapped != 0) {
         unmapped = 0;
+        // 32 lines a burst (reads a second or more after the previous one start a new burst),
+        // and the first 32 bursts each get a guest backtrace from the core's thread once the JIT
+        // returns (the pc here is the block's, the backtrace the real call chain). Damage's
+        // Jabu-Jabu log (2026-11-17) spent the old 32-a-process budget on the first of three
+        // null-object bursts, at area loads; the third ended in the game's crash.
         static std::atomic<u32> logged{};
-        if (logged.fetch_add(1) < 32) {
+        static std::atomic<u64> last_ns{};
+        static std::atomic<u32> bursts{};
+        const u64 now_ns = Common::Nx2Hitch::NowNs();
+        if (now_ns - last_ns.exchange(now_ns, std::memory_order_relaxed) > 1'000'000'000ULL) {
+            logged.store(0, std::memory_order_relaxed);
+            const u32 burst = bursts.fetch_add(1, std::memory_order_relaxed) + 1;
+            LOG_ERROR(Core_ARM, "Unmapped read burst #{} begins (guest pointer from zeros or "
+                                "wrong data; ignore_memory_aborts keeps the game running)",
+                      burst);
+            if (burst <= 32) {
+                m_parent.RequestBacktrace(nullptr, "unmapped read burst");
+            }
+        }
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
             LOG_ERROR(Core_ARM, "Unmapped read {:#x} ({} bytes) at pc {:#x} lr {:#x} sp {:#x}", vaddr, size,
                       m_parent.m_jit->GetPC(), m_parent.m_jit->GetRegister(30), m_parent.m_jit->GetSP());
         }
