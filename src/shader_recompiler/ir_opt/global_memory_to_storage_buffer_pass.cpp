@@ -1554,17 +1554,29 @@ bool IsGlobalMemoryRead(const IR::Inst& inst) {
 /// An upper bound of an unsigned 32-bit value for every invocation of a dispatch:
 /// c + sum(coef[i] * id[i]) over gl_LocalInvocationID.xyz (0-2) and gl_WorkGroupID.xyz (3-5),
 /// plus `base` times the storage buffer's pointer word. All coefficients are non-negative, so the
-/// bound is largest at the largest ids.
+/// bound is largest at the largest ids. FRITCHII_EXTENT_CBUF's analysis (terms mode) also adds
+/// constant buffer words times a non-negative coefficient (their values are read at bind time).
 struct IdBound {
+    struct Term {
+        u32 index{};
+        u32 offset{};
+        u64 coef{};
+    };
     s64 c{};
     std::array<u64, 6> coef{};
     u32 base{};
+    u32 num_terms{};
+    std::array<Term, MaxExtentTerms> terms{};
 
     bool IsConstant() const {
-        return base == 0 && std::ranges::all_of(coef, [](u64 value) { return value == 0; });
+        return base == 0 && num_terms == 0 &&
+               std::ranges::all_of(coef, [](u64 value) { return value == 0; });
     }
     bool HasGroupTerms() const {
         return coef[3] != 0 || coef[4] != 0 || coef[5] != 0;
+    }
+    bool HasTerms() const {
+        return num_terms != 0;
     }
 };
 
@@ -1572,20 +1584,38 @@ struct IdBound {
 /// can land relative to its pointer word. Anything not provably affine in the invocation and
 /// workgroup ids with constant non-negative strides (a value loaded from memory or read from
 /// another constant buffer word, a loop-carried index, a signed or 64-bit computation) leaves the
-/// extent unknown.
+/// extent unknown, and the first such exit is kept (FRITCHII_EXTENT_CENSUS, Why()). In terms mode
+/// (FRITCHII_EXTENT_CBUF) another constant buffer word read at an immediate offset is a term of
+/// the bound instead.
 class StoreExtentAnalysis {
 public:
-    explicit StoreExtentAnalysis(StorageBufferAddr buffer_, const std::array<u32, 3>& workgroup_)
-        : buffer{buffer_}, workgroup{workgroup_} {}
+    explicit StoreExtentAnalysis(StorageBufferAddr buffer_, const std::array<u32, 3>& workgroup_,
+                                 bool terms_ = false)
+        : buffer{buffer_}, workgroup{workgroup_}, terms_mode{terms_} {}
 
     /// Extent of one access, merged into `extent`
     void AddAccess(IR::Inst& inst, StorageWriteExtent& extent) {
-        const std::optional<StorageWriteExtent> store{StoreExtent(inst)};
-        if (!store) {
+        const std::optional<StorageCbufExtent> store{StoreExtent(inst)};
+        if (!store || store->num_terms != 0 || store->num_guard_terms != 0) {
             extent = StorageWriteExtent{};
             return;
         }
-        MergeStorageWriteExtent(extent, *store);
+        MergeStorageWriteExtent(extent, store->ids);
+    }
+
+    /// Terms mode: extent of one access with its constant buffer terms, merged into `extent`
+    void AddAccess(IR::Inst& inst, StorageCbufExtent& extent) {
+        const std::optional<StorageCbufExtent> store{StoreExtent(inst)};
+        if (!store) {
+            extent = StorageCbufExtent{};
+            return;
+        }
+        MergeStorageCbufExtent(extent, *store);
+    }
+
+    /// Why the first access that failed did (Unrecorded while none did)
+    const ExtentUnknownWhy& Why() const {
+        return why;
     }
 
 private:
@@ -1593,45 +1623,131 @@ private:
     static constexpr u64 COEF_LIMIT = u64{1} << 32;
     static constexpr u32 MAX_DEPTH = 256;
 
-    std::optional<StorageWriteExtent> StoreExtent(IR::Inst& inst) {
+    struct Memo {
+        std::optional<IdBound> result;
+        ExtentUnknownWhy why;
+    };
+
+    /// Notes the reason of the current evaluation's first exit
+    void Fail(const ExtentUnknownWhy& reason) {
+        if (failure.kind == ExtentUnknown::Unrecorded) {
+            failure = reason;
+        }
+    }
+    void Fail(ExtentUnknown kind, const IR::Inst* inst = nullptr) {
+        Fail(ExtentUnknownWhy{
+            .kind = kind,
+            .opcode = inst != nullptr ? static_cast<u16>(inst->GetOpcode()) : u16{0},
+        });
+    }
+
+    std::optional<StorageCbufExtent> StoreExtent(IR::Inst& inst) {
+        failure = {};
+        std::optional<StorageCbufExtent> result{StoreExtentOf(inst)};
+        if (!result && why.kind == ExtentUnknown::Unrecorded) {
+            why = failure.kind != ExtentUnknown::Unrecorded
+                      ? failure
+                      : ExtentUnknownWhy{.kind = ExtentUnknown::OtherOp,
+                                         .opcode = static_cast<u16>(inst.GetOpcode())};
+        }
+        return result;
+    }
+
+    std::optional<StorageCbufExtent> StoreExtentOf(IR::Inst& inst) {
         const std::optional<LowAddrInfo> addr{TrackLowAddress(&inst)};
         if (!addr) {
+            Fail(ExtentUnknown::AddressNotTracked, &inst);
             return std::nullopt;
         }
         const std::optional<IdBound> low{Evaluate(addr->value, 0)};
-        if (!low || low->base != 1 || guard_failed) {
+        if (!low) {
+            return std::nullopt;
+        }
+        if (low->base != 1) {
+            Fail(ExtentUnknown::NoPointerTerm, &inst);
+            return std::nullopt;
+        }
+        if (guard_failed) {
+            Fail(ExtentUnknown::GuardFailed, &inst);
             return std::nullopt;
         }
         const s64 end{low->c + addr->imm_offset + AccessSize(inst.GetOpcode())};
         if (end > s64{0xffffffff}) {
+            Fail(ExtentUnknown::TooLarge, &inst);
             return std::nullopt;
         }
-        StorageWriteExtent result{
+        StorageCbufExtent result{};
+        result.ids = StorageWriteExtent{
             .bounded = true,
             .const_end = static_cast<u32>((std::max)(end, s64{0})),
         };
         for (size_t i = 0; i < 3; ++i) {
             if (low->coef[i] >= COEF_LIMIT || low->coef[i + 3] >= COEF_LIMIT) {
+                Fail(ExtentUnknown::TooLarge, &inst);
                 return std::nullopt;
             }
-            result.local_stride[i] = static_cast<u32>(low->coef[i]);
-            result.group_stride[i] = static_cast<u32>(low->coef[i + 3]);
+            result.ids.local_stride[i] = static_cast<u32>(low->coef[i]);
+            result.ids.group_stride[i] = static_cast<u32>(low->coef[i + 3]);
+        }
+        if (!CopyTerms(*low, result.terms, result.num_terms)) {
+            Fail(ExtentUnknown::TooLarge, &inst);
+            return std::nullopt;
         }
         if (guard) {
             if (guard->c > s64{0xffff}) {
+                Fail(ExtentUnknown::GuardFailed, &inst);
                 return std::nullopt;
             }
-            result.guarded = true;
-            result.guard_const = static_cast<u32>((std::max)(guard->c, s64{0}));
+            result.ids.guarded = true;
+            result.ids.guard_const = static_cast<u32>((std::max)(guard->c, s64{0}));
             for (size_t i = 0; i < 3; ++i) {
                 if (guard->coef[i] > 0xffff || guard->coef[i + 3] > 0xffff) {
+                    Fail(ExtentUnknown::GuardFailed, &inst);
                     return std::nullopt;
                 }
-                result.guard_local_stride[i] = static_cast<u32>(guard->coef[i]);
-                result.guard_group_stride[i] = static_cast<u32>(guard->coef[i + 3]);
+                result.ids.guard_local_stride[i] = static_cast<u32>(guard->coef[i]);
+                result.ids.guard_group_stride[i] = static_cast<u32>(guard->coef[i + 3]);
+            }
+            if (!CopyTerms(*guard, result.guard_terms, result.num_guard_terms)) {
+                Fail(ExtentUnknown::GuardFailed, &inst);
+                return std::nullopt;
             }
         }
         return result;
+    }
+
+    static bool CopyTerms(const IdBound& value, std::array<StorageExtentTerm, MaxExtentTerms>& out,
+                          u8& count) {
+        count = 0;
+        for (u32 i = 0; i < value.num_terms; ++i) {
+            if (value.terms[i].coef >= COEF_LIMIT) {
+                return false;
+            }
+            out[count++] = StorageExtentTerm{
+                .cbuf_index = value.terms[i].index,
+                .cbuf_offset = value.terms[i].offset,
+                .coef = static_cast<u32>(value.terms[i].coef),
+            };
+        }
+        return true;
+    }
+
+    /// Adds `term` to `into`'s terms: the sum, or with `max` the larger coefficient for a word
+    /// already there. False when they do not fit.
+    static bool AddTerm(IdBound& into, const IdBound::Term& term, bool max) {
+        for (u32 i = 0; i < into.num_terms; ++i) {
+            IdBound::Term& existing = into.terms[i];
+            if (existing.index == term.index && existing.offset == term.offset) {
+                existing.coef =
+                    max ? (std::max)(existing.coef, term.coef) : existing.coef + term.coef;
+                return true;
+            }
+        }
+        if (into.num_terms >= MaxExtentTerms) {
+            return false;
+        }
+        into.terms[into.num_terms++] = term;
+        return true;
     }
 
     static std::optional<IdBound> Checked(IdBound value) {
@@ -1640,6 +1756,11 @@ private:
         }
         for (const u64 coef : value.coef) {
             if (coef >= COEF_LIMIT) {
+                return std::nullopt;
+            }
+        }
+        for (u32 i = 0; i < value.num_terms; ++i) {
+            if (value.terms[i].coef >= COEF_LIMIT) {
                 return std::nullopt;
             }
         }
@@ -1655,10 +1776,17 @@ private:
         for (size_t i = 0; i < result.coef.size(); ++i) {
             result.coef[i] = lhs.coef[i] + rhs.coef[i];
         }
+        result.num_terms = lhs.num_terms;
+        result.terms = lhs.terms;
+        for (u32 i = 0; i < rhs.num_terms; ++i) {
+            if (!AddTerm(result, rhs.terms[i], false)) {
+                return std::nullopt;
+            }
+        }
         return Checked(result);
     }
 
-    /// Component-wise maximum: a bound of either value (ids are non-negative)
+    /// Component-wise maximum: a bound of either value (ids and words are non-negative)
     static std::optional<IdBound> Max(const IdBound& lhs, const IdBound& rhs) {
         if (lhs.base != rhs.base) {
             return std::nullopt;
@@ -1666,6 +1794,13 @@ private:
         IdBound result{.c = (std::max)(lhs.c, rhs.c), .base = lhs.base};
         for (size_t i = 0; i < result.coef.size(); ++i) {
             result.coef[i] = (std::max)(lhs.coef[i], rhs.coef[i]);
+        }
+        result.num_terms = lhs.num_terms;
+        result.terms = lhs.terms;
+        for (u32 i = 0; i < rhs.num_terms; ++i) {
+            if (!AddTerm(result, rhs.terms[i], true)) {
+                return std::nullopt;
+            }
         }
         return result;
     }
@@ -1680,6 +1815,15 @@ private:
                 return std::nullopt;
             }
             result.coef[i] = value.coef[i] * factor;
+        }
+        result.num_terms = value.num_terms;
+        for (u32 i = 0; i < value.num_terms; ++i) {
+            const u64 coef{value.terms[i].coef};
+            if (coef != 0 && factor > (COEF_LIMIT - 1) / coef) {
+                return std::nullopt;
+            }
+            result.terms[i] = value.terms[i];
+            result.terms[i].coef = coef * factor;
         }
         if (value.c > 0 && factor > static_cast<u64>(CONST_LIMIT / value.c)) {
             return std::nullopt;
@@ -1697,13 +1841,18 @@ private:
         for (size_t i = 0; i < result.coef.size(); ++i) {
             result.coef[i] = up(value.coef[i]);
         }
+        result.num_terms = value.num_terms;
+        for (u32 i = 0; i < value.num_terms; ++i) {
+            result.terms[i] = value.terms[i];
+            result.terms[i].coef = up(value.terms[i].coef);
+        }
         return result;
     }
 
     /// The value's bound when only its local-id terms vary (the workgroup size is fixed), or
-    /// nullopt when it has workgroup terms or the pointer
+    /// nullopt when it has workgroup terms, constant buffer words or the pointer
     std::optional<u64> StaticMax(const IdBound& value) const {
-        if (value.base != 0 || value.HasGroupTerms() || value.c < 0) {
+        if (value.base != 0 || value.HasGroupTerms() || value.HasTerms() || value.c < 0) {
             return std::nullopt;
         }
         u64 total{static_cast<u64>(value.c)};
@@ -1736,11 +1885,13 @@ private:
 
     std::optional<IdBound> BitFieldExtract(const IR::Inst& inst, u32 depth) {
         if (!inst.Arg(1).IsImmediate() || !inst.Arg(2).IsImmediate()) {
+            Fail(ExtentUnknown::OtherOp, &inst);
             return std::nullopt;
         }
         const u32 offset{inst.Arg(1).U32()};
         const u32 count{inst.Arg(2).U32()};
         if (offset >= 32 || count == 0 || count > 32) {
+            Fail(ExtentUnknown::OtherOp, &inst);
             return std::nullopt;
         }
         if (inst.Arg(0).IsImmediate()) {
@@ -1758,6 +1909,10 @@ private:
                 return Constant(0);
             }
         }
+        if (terms_mode && source->HasTerms() && offset < 16 && field_max) {
+            // A field of a constant buffer word: its width bounds it without the word
+            return field_max;
+        }
         if (offset == 0) {
             // A low field is at most the whole value
             return source;
@@ -1774,24 +1929,92 @@ private:
     std::optional<IdBound> Evaluate(const IR::Value& value, u32 depth) {
         if (value.IsImmediate()) {
             if (value.Type() != IR::Type::U32) {
+                Fail(ExtentUnknown::SignedOr64Bit);
                 return std::nullopt;
             }
             return Constant(static_cast<s64>(static_cast<s32>(value.U32())));
         }
         if (depth > MAX_DEPTH) {
+            Fail(ExtentUnknown::TooDeep);
             return std::nullopt;
         }
         const IR::Inst* const inst{value.InstRecursive()};
         if (const auto it{memo.find(inst)}; it != memo.end()) {
-            return it->second;
+            if (!it->second.result) {
+                Fail(it->second.why);
+            }
+            return it->second.result;
         }
         if (!active.insert(inst).second) {
             // A cycle: a loop-carried value
+            Fail(ExtentUnknown::LoopCarried, inst);
             return std::nullopt;
         }
+        // The reason of this instruction's own exit (a failure its operands' evaluation noted
+        // but the instruction got past is dropped)
+        const ExtentUnknownWhy outer{failure};
+        failure = {};
         const std::optional<IdBound> result{EvaluateInst(*inst, depth)};
+        ExtentUnknownWhy mine{};
+        if (!result) {
+            mine = failure.kind != ExtentUnknown::Unrecorded ? failure : Classify(*inst);
+        }
         active.erase(inst);
-        memo.emplace(inst, result);
+        memo.emplace(inst, Memo{result, mine});
+        failure = outer;
+        if (!result) {
+            Fail(mine);
+        }
+        return result;
+    }
+
+    /// The reason an instruction with no other noted reason is not bounded
+    static ExtentUnknownWhy Classify(const IR::Inst& inst) {
+        const IR::Opcode opcode{inst.GetOpcode()};
+        const ExtentUnknownWhy why_of{[&] {
+            switch (opcode) {
+            case IR::Opcode::IAdd32:
+            case IR::Opcode::ShiftLeftLogical32:
+            case IR::Opcode::ShiftRightLogical32:
+            case IR::Opcode::BitwiseOr32:
+            case IR::Opcode::BitwiseXor32:
+            case IR::Opcode::UMax32:
+            case IR::Opcode::BitFieldInsert:
+                // Handled, and failed on its limits (a large constant or stride, or the pointer
+                // where it can't be)
+                return ExtentUnknownWhy{.kind = ExtentUnknown::TooLarge};
+            case IR::Opcode::SelectU32:
+            case IR::Opcode::Phi:
+                // Max: one side adds the pointer and the other not
+                return ExtentUnknownWhy{.kind = ExtentUnknown::NoPointerTerm};
+            default:
+                break;
+            }
+            const std::string_view name{IR::NameOf(opcode)};
+            const auto has = [&](std::string_view part) {
+                return name.find(part) != std::string_view::npos;
+            };
+            if (name.starts_with("GetCbuf")) {
+                return ExtentUnknownWhy{.kind = ExtentUnknown::DynamicCbuf};
+            }
+            if (has("Atomic")) {
+                return ExtentUnknownWhy{.kind = ExtentUnknown::AtomicResult};
+            }
+            if (name.starts_with("Load") || name.starts_with("Image") || has("Fetch")) {
+                return ExtentUnknownWhy{.kind = ExtentUnknown::LoadedFromMemory};
+            }
+            if (has("64") || has("Arithmetic") || name.starts_with("SConvert") ||
+                name.starts_with("SMin") || name.starts_with("SMax") || name.starts_with("SDiv") ||
+                name.starts_with("SClamp") || name.starts_with("INeg") ||
+                name.starts_with("IAbs") || name.starts_with("BitFieldSExtract") ||
+                name.starts_with("ConvertU32") || name.starts_with("ConvertS32") ||
+                name.starts_with("UConvert")) {
+                return ExtentUnknownWhy{.kind = ExtentUnknown::SignedOr64Bit};
+            }
+            return ExtentUnknownWhy{.kind = ExtentUnknown::OtherOp};
+        }()};
+        ExtentUnknownWhy result{why_of};
+        result.opcode = static_cast<u16>(opcode);
         return result;
     }
 
@@ -1800,6 +2023,16 @@ private:
             if (*word == buffer) {
                 return IdBound{.base = 1};
             }
+            if (terms_mode) {
+                IdBound term{.num_terms = 1};
+                term.terms[0] =
+                    IdBound::Term{.index = word->index, .offset = word->offset, .coef = 1};
+                return term;
+            }
+            Fail(ExtentUnknownWhy{.kind = ExtentUnknown::OtherCbufWord,
+                                  .opcode = static_cast<u16>(inst.GetOpcode()),
+                                  .cbuf_index = word->index,
+                                  .cbuf_offset = word->offset});
             return std::nullopt;
         }
         const auto arg{[&](size_t index) { return Evaluate(inst.Arg(index), depth + 1); }};
@@ -1808,7 +2041,8 @@ private:
             if (inst.Arg(0).IsImmediate() || !inst.Arg(1).IsImmediate() || inst.Arg(1).U32() > 2) {
                 return std::nullopt;
             }
-            const IR::Opcode vector{inst.Arg(0).InstRecursive()->GetOpcode()};
+            const IR::Inst* const vector_inst{inst.Arg(0).InstRecursive()};
+            const IR::Opcode vector{vector_inst->GetOpcode()};
             const u32 element{inst.Arg(1).U32()};
             IdBound result;
             if (vector == IR::Opcode::LocalInvocationId) {
@@ -1816,6 +2050,7 @@ private:
             } else if (vector == IR::Opcode::WorkgroupId) {
                 result.coef[3 + element] = 1;
             } else {
+                Fail(Classify(*vector_inst));
                 return std::nullopt;
             }
             return result;
@@ -1828,7 +2063,11 @@ private:
         case IR::Opcode::ISub32: {
             const auto lhs{arg(0)};
             const auto rhs{lhs ? arg(1) : std::nullopt};
-            if (!lhs || !rhs || !rhs->IsConstant()) {
+            if (!lhs || !rhs) {
+                return std::nullopt;
+            }
+            if (!rhs->IsConstant()) {
+                Fail(ExtentUnknown::VariableProduct, &inst);
                 return std::nullopt;
             }
             return Sum(*lhs, IdBound{.c = -rhs->c});
@@ -1845,10 +2084,12 @@ private:
             if (lhs->IsConstant() && lhs->c >= 0) {
                 return Scale(*rhs, static_cast<u64>(lhs->c));
             }
+            Fail(ExtentUnknown::VariableProduct, &inst);
             return std::nullopt;
         }
         case IR::Opcode::ShiftLeftLogical32: {
             if (!inst.Arg(1).IsImmediate() || inst.Arg(1).U32() >= 32) {
+                Fail(ExtentUnknown::VariableProduct, &inst);
                 return std::nullopt;
             }
             const auto lhs{arg(0)};
@@ -1856,6 +2097,7 @@ private:
         }
         case IR::Opcode::ShiftRightLogical32: {
             if (!inst.Arg(1).IsImmediate()) {
+                Fail(ExtentUnknown::VariableProduct, &inst);
                 return std::nullopt;
             }
             const auto lhs{arg(0)};
@@ -1871,6 +2113,14 @@ private:
             for (const auto* side : {&rhs, &lhs}) {
                 if (usable(*side) && (*side)->IsConstant() && (*side)->c <= 0xffffff) {
                     return *side;
+                }
+            }
+            if (terms_mode) {
+                // A side without constant buffer words first
+                for (const auto* side : {&lhs, &rhs}) {
+                    if (usable(*side) && !(*side)->HasTerms()) {
+                        return *side;
+                    }
                 }
             }
             for (const auto* side : {&lhs, &rhs}) {
@@ -1894,6 +2144,13 @@ private:
         case IR::Opcode::UMin32: {
             const auto lhs{arg(0)};
             const auto rhs{arg(1)};
+            if (terms_mode) {
+                for (const auto* side : {&rhs, &lhs}) {
+                    if (*side && (*side)->base == 0 && (*side)->c >= 0 && !(*side)->HasTerms()) {
+                        return *side;
+                    }
+                }
+            }
             for (const auto* side : {&rhs, &lhs}) {
                 if (*side && (*side)->base == 0 && (*side)->c >= 0) {
                     return *side;
@@ -1907,6 +2164,7 @@ private:
             // (base & ~mask) | ((insert << offset) & mask) <= base + (insert << offset)
             if (!inst.Arg(2).IsImmediate() || !inst.Arg(3).IsImmediate() ||
                 inst.Arg(2).U32() >= 32) {
+                Fail(ExtentUnknown::OtherOp, &inst);
                 return std::nullopt;
             }
             const auto base_value{arg(0)};
@@ -1944,10 +2202,14 @@ private:
 
     StorageBufferAddr buffer;
     std::array<u32, 3> workgroup;
-    std::unordered_map<const IR::Inst*, std::optional<IdBound>> memo;
+    bool terms_mode{};
+    std::unordered_map<const IR::Inst*, Memo> memo;
     std::unordered_set<const IR::Inst*> active;
     std::optional<IdBound> guard;
     bool guard_failed{};
+    /// The current access' first exit, and the first failed access' (FRITCHII_EXTENT_CENSUS)
+    ExtentUnknownWhy failure{};
+    ExtentUnknownWhy why{};
 };
 
 /// Returns the offset in indices (not bytes) for an equivalent storage instruction
@@ -2139,6 +2401,10 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
     program.info.native_global_bounds |= info.native_runtime_bounds;
     // Store extents, before the accesses are rebased (the analysis reads the guest addresses)
     std::map<StorageBufferAddr, StorageWriteExtent> extents;
+    // FRITCHII_EXTENT_CENSUS: why an extent stayed unknown; FRITCHII_EXTENT_CBUF: the extents
+    // with constant buffer words, for the buffers whose extent stayed unknown
+    std::map<StorageBufferAddr, ExtentUnknownWhy> unknown_whys;
+    std::map<StorageBufferAddr, StorageCbufExtent> cbuf_extents;
     if (!info.untracked_writes) {
         std::map<StorageBufferAddr, StoreExtentAnalysis> analyses;
         for (const StorageInst& storage_inst : info.to_replace) {
@@ -2157,6 +2423,34 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
                 extents.emplace(storage_inst.storage_buffer, StorageWriteExtent{.bounded = true});
             }
             analysis->second.AddAccess(*storage_inst.inst, extents[storage_inst.storage_buffer]);
+        }
+        for (const auto& [storage_buffer, analysis] : analyses) {
+            unknown_whys.emplace(storage_buffer, analysis.Why());
+        }
+        // FRITCHII_EXTENT_CBUF: the buffers left unknown, again with constant buffer words as
+        // terms (its own analyses: the plain extents above stay exactly what they were)
+        std::map<StorageBufferAddr, StoreExtentAnalysis> term_analyses;
+        for (const StorageInst& storage_inst : info.to_replace) {
+            if (!IsGlobalMemoryWrite(*storage_inst.inst) ||
+                info.unbounded_writes.contains(storage_inst.storage_buffer)) {
+                continue;
+            }
+            const auto plain{extents.find(storage_inst.storage_buffer)};
+            if (plain == extents.end() || plain->second.bounded) {
+                continue;
+            }
+            auto analysis{term_analyses.find(storage_inst.storage_buffer)};
+            if (analysis == term_analyses.end()) {
+                analysis = term_analyses
+                               .emplace(storage_inst.storage_buffer,
+                                        StoreExtentAnalysis{storage_inst.storage_buffer,
+                                                            program.workgroup_size, true})
+                               .first;
+                cbuf_extents.emplace(storage_inst.storage_buffer,
+                                     StorageCbufExtent{.ids = StorageWriteExtent{.bounded = true}});
+            }
+            analysis->second.AddAccess(*storage_inst.inst,
+                                       cbuf_extents[storage_inst.storage_buffer]);
         }
     }
     // Read extents of the loads and atomics. An access left global is routed by address at run
@@ -2192,9 +2486,31 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
         program.info.storage_read_extents.push_back(
             read_extent != read_extents.end() ? read_extent->second : StorageWriteExtent{});
     }
+    std::vector<StorageWriteExtra> extras;
+    bool any_unknown{};
     for (const StorageBufferAddr& storage_buffer : info.set) {
         const bool is_written{info.writes.contains(storage_buffer)};
         const auto extent{extents.find(storage_buffer)};
+        ExtentUnknownWhy write_unknown{};
+        StorageCbufExtent cbuf_extent{};
+        if (is_written) {
+            if (info.untracked_writes) {
+                write_unknown.kind = ExtentUnknown::UntrackedWrites;
+            } else if (info.unbounded_writes.contains(storage_buffer)) {
+                write_unknown.kind = ExtentUnknown::RuntimeRouted;
+            } else if (extent != extents.end() && extent->second.bounded) {
+                write_unknown.kind = ExtentUnknown::Known;
+            } else if (const auto why{unknown_whys.find(storage_buffer)};
+                       why != unknown_whys.end()) {
+                write_unknown = why->second;
+            } else {
+                // Written, but no store of it was rebased on it: they stay global
+                write_unknown.kind = ExtentUnknown::UntrackedWrites;
+            }
+            if (const auto cbuf{cbuf_extents.find(storage_buffer)}; cbuf != cbuf_extents.end()) {
+                cbuf_extent = cbuf->second;
+            }
+        }
         program.info.storage_buffers_descriptors.push_back({
             .cbuf_index = storage_buffer.index,
             .cbuf_offset = storage_buffer.offset,
@@ -2204,6 +2520,14 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
             .write_extent = is_written && extent != extents.end() ? extent->second
                                                                   : StorageWriteExtent{},
         });
+        extras.push_back({.write_unknown = write_unknown, .cbuf_extent = cbuf_extent});
+        any_unknown |= is_written && write_unknown.kind != ExtentUnknown::Known;
+    }
+    if (any_unknown) {
+        // Kept only for programs with something to report (Info::storage_write_extras)
+        auto& out{program.info.storage_write_extras};
+        out.resize(program.info.storage_buffers_descriptors.size() - extras.size());
+        out.insert(out.end(), extras.begin(), extras.end());
     }
     for (const StorageInst& storage_inst : info.to_replace) {
         const StorageBufferAddr storage_buffer{storage_inst.storage_buffer};
@@ -2241,10 +2565,22 @@ std::vector<u32> JoinStorageInfo(Info& base, Info& source, size_t limit) {
     auto& descriptors = base.storage_buffers_descriptors;
     std::vector<u32> bindings;
     auto& read_extents = base.storage_read_extents;
+    // FRITCHII_EXTENT_CENSUS / FRITCHII_EXTENT_CBUF: the extras follow the descriptors while
+    // joining (dropped again when neither half had any)
+    const bool any_extras{!base.storage_write_extras.empty() ||
+                          !source.storage_write_extras.empty()};
+    auto& extras = base.storage_write_extras;
+    if (extras.size() != descriptors.size()) {
+        extras.assign(descriptors.size(), StorageWriteExtra{});
+    }
+    const bool source_extras{source.storage_write_extras.size() ==
+                             source.storage_buffers_descriptors.size()};
     for (size_t index = 0; index < source.storage_buffers_descriptors.size(); ++index) {
         auto& desc{source.storage_buffers_descriptors[index]};
         const StorageWriteExtent source_read{reads_known ? source.storage_read_extents[index]
                                                          : StorageWriteExtent{}};
+        const StorageWriteExtra source_extra{source_extras ? source.storage_write_extras[index]
+                                                           : StorageWriteExtra{}};
         auto it{std::ranges::find_if(descriptors, [&desc](const auto& existing) {
             return desc.cbuf_index == existing.cbuf_index &&
                    desc.cbuf_offset == existing.cbuf_offset && desc.count == existing.count &&
@@ -2256,10 +2592,32 @@ std::vector<u32> JoinStorageInfo(Info& base, Info& source, size_t limit) {
                 MergeStorageWriteExtent(read_extents[existing], source_read);
             }
             if (desc.is_written) {
+                StorageWriteExtra& extra{
+                    extras[static_cast<size_t>(std::distance(descriptors.begin(), it))]};
                 if (it->is_written) {
+                    // FRITCHII_EXTENT_CENSUS / FRITCHII_EXTENT_CBUF: the half that left it
+                    // unknown names why; the cbuf extents widen like the plain ones (a half's
+                    // proven plain extent is a cbuf extent without terms)
+                    const auto as_cbuf{[](const StorageBufferDescriptor& d,
+                                          const StorageWriteExtra& e) {
+                        return d.write_extent.bounded ? StorageCbufExtent{.ids = d.write_extent}
+                                                      : e.cbuf_extent;
+                    }};
+                    StorageCbufExtent merged_cbuf{as_cbuf(*it, extra)};
+                    MergeStorageCbufExtent(merged_cbuf, as_cbuf(desc, source_extra));
+                    const bool was_bounded{it->write_extent.bounded};
                     MergeStorageWriteExtent(it->write_extent, desc.write_extent);
+                    if (it->write_extent.bounded) {
+                        extra.cbuf_extent = StorageCbufExtent{};
+                    } else {
+                        if (was_bounded) {
+                            extra.write_unknown = source_extra.write_unknown;
+                        }
+                        extra.cbuf_extent = merged_cbuf;
+                    }
                 } else {
                     it->write_extent = desc.write_extent;
+                    extra = source_extra;
                 }
             }
             it->is_written |= desc.is_written;
@@ -2272,12 +2630,16 @@ std::vector<u32> JoinStorageInfo(Info& base, Info& source, size_t limit) {
         }
         bindings.push_back(static_cast<u32>(descriptors.size()));
         descriptors.push_back(desc);
+        extras.push_back(source_extra);
         if (reads_known) {
             read_extents.push_back(source_read);
         }
     }
     if (!reads_known) {
         read_extents.assign(descriptors.size(), StorageWriteExtent{});
+    }
+    if (!any_extras) {
+        extras.clear();
     }
     return bindings;
 }

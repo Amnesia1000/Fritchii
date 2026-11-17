@@ -184,6 +184,15 @@ struct StorageBufferDescriptor {
     auto operator<=>(const StorageBufferDescriptor&) const = default;
 };
 
+/// FRITCHII_EXTENT_CENSUS / FRITCHII_EXTENT_CBUF: what the store analysis found for a written
+/// storage buffer whose write_extent is unknown (Info::storage_write_extras).
+struct StorageWriteExtra {
+    /// Why write_extent is unknown (Known when proven)
+    ExtentUnknownWhy write_unknown{};
+    /// The store extent with constant buffer words in it (unbounded when none was found)
+    StorageCbufExtent cbuf_extent{};
+};
+
 struct TextureBufferDescriptor {
     bool has_secondary;
     u32 cbuf_index;
@@ -411,6 +420,11 @@ struct Info {
     /// One per storage_buffers_descriptors entry, same order: how far the program's loads and
     /// atomics reach past the pointer. A size other than the descriptors' means unknown.
     std::vector<StorageWriteExtent> storage_read_extents;
+    /// FRITCHII_EXTENT_CENSUS / FRITCHII_EXTENT_CBUF: one per storage_buffers_descriptors entry,
+    /// same order, or empty (no written buffer with an unknown extent, or not recorded). A size
+    /// other than the descriptors' means none. Not stored with the info (info_serialize.cpp): empty
+    /// for an info from the precompiled cache.
+    std::vector<StorageWriteExtra> storage_write_extras;
     TextureBufferDescriptors texture_buffer_descriptors;
     ImageBufferDescriptors image_buffer_descriptors;
     TextureDescriptors texture_descriptors;

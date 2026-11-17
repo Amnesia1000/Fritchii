@@ -25,6 +25,7 @@
 #include "common/fritchii_write_ring.h"
 #include "common/nx2_uniform_keep_pages.h"
 #include "common/range_sets.inc"
+#include "shader_recompiler/frontend/ir/opcodes.h"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/buffer_cache/mem_read_log.h"
 #include "video_core/buffer_cache/multi_range_refresh.h"
@@ -251,6 +252,10 @@ void BufferCache<P>::TickFrame() {
     }
     if (DownloadReadStats::g_enabled && frame_tick % 600 == 0) [[unlikely]] {
         DownloadReadStats::Log();
+    }
+    // FRITCHII_EXTENT_CENSUS / FRITCHII_EXTENT_CBUF: the 10 s lines (empty while both are off)
+    if (!extent_census.empty()) [[unlikely]] {
+        LogExtentCensus();
     }
     if (ReadRunStats::g_enabled) [[unlikely]] {
         ReadRunStats::g_frame.fetch_add(1, std::memory_order_relaxed);
@@ -2110,6 +2115,7 @@ void BufferCache<P>::UnbindComputeStorageBuffers() {
     for (ExtentProbeRequest& request : extent_probe_requests) {
         request.active = false;
     }
+    cbuf_dry_proven.fill(0);
     channel_state->native_compute_storage_buffers = 0;
     channel_state->image_compute_texture_buffers = 0;
 }
@@ -2117,7 +2123,8 @@ void BufferCache<P>::UnbindComputeStorageBuffers() {
 template <class P>
 void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
                                               bool is_written, u32 indirect_offset,
-                                              const Shader::StorageWriteExtent& write_extent) {
+                                              const Shader::StorageWriteExtent& write_extent,
+                                              const Shader::StorageWriteExtra* extra) {
     if (ssbo_index >= channel_state->compute_storage_buffers.size()) [[unlikely]] {
         LOG_ERROR(HW_GPU, "Storage buffer index {} exceeds maximum storage buffer count",
                   ssbo_index);
@@ -2194,13 +2201,63 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
                 grid = std::array<u32, 3>{qmd.grid_dim_x.Value(), qmd.grid_dim_y.Value(),
                                           qmd.grid_dim_z.Value()};
             }
-            if (const auto extent = Shader::ResolveStorageWriteExtent(write_extent, block, grid)) {
-                // The extent counts from the pointer, the binding from the pointer aligned down.
-                const GPUVAddr pointer = Inputs().ReadGameU64(ssbo_addr);
-                MemReadLog::Value(MemReadLog::Kind::ComputePointer, gpu_memory, ssbo_addr, pointer);
+            std::optional<u64> extent =
+                Shader::ResolveStorageWriteExtent(write_extent, block, grid);
+            static constexpr Shader::StorageWriteExtra NoExtra{};
+            // The census names the analysis' reason only where the extent is unknown.
+            const Shader::ExtentUnknownWhy write_unknown =
+                write_extent.bounded
+                    ? Shader::ExtentUnknownWhy{.kind = Shader::ExtentUnknown::Known}
+                    : (extra != nullptr ? *extra : NoExtra).write_unknown;
+            const Shader::StorageCbufExtent& cbuf_extent =
+                (extra != nullptr ? *extra : NoExtra).cbuf_extent;
+            // FRITCHII_EXTENT_CENSUS / FRITCHII_EXTENT_CBUF (live, default 0): off, one load each.
+            const int census = VideoCore::Nx2Debug::SwitchValue(
+                VideoCore::Nx2Debug::g_extent_census, "FRITCHII_EXTENT_CENSUS", 0);
+            const int cbuf_mode = VideoCore::Nx2Debug::SwitchValue(
+                VideoCore::Nx2Debug::g_extent_cbuf, "FRITCHII_EXTENT_CBUF", 0);
+            FullMarkWhy full_why = FullMarkWhy::Analysis;
+            if (!extent && write_extent.bounded) {
+                full_why = grid ? FullMarkWhy::GuardOrDims : FullMarkWhy::IndirectGrid;
+            }
+            // FRITCHII_EXTENT_CBUF: a store extent with constant buffer words, its words read
+            // now like the pointer word. =1 marks by it (through the ExtentTrust checks below),
+            // =3 only counts what it would free.
+            CbufOutcome cbuf_outcome = CbufOutcome::None;
+            std::optional<u64> cbuf_bytes;
+            if (!extent && (cbuf_mode == 1 || cbuf_mode == 3) && cbuf_extent.ids.bounded)
+                [[unlikely]] {
+                cbuf_bytes = ResolveCbufExtent(cbuf_extent, block, grid, cbuf_outcome);
+            }
+            // Only with the ExtentTrust checks (they need Vulkan and EXP45 off).
+            const bool cbuf_marks = !IS_OPENGL && cbuf_mode == 1 && cbuf_bytes.has_value() &&
+                                    VideoCore::Nx2Debug::Experiment(45) == 0;
+            if (cbuf_marks) {
+                extent = cbuf_bytes;
+            }
+            // The pointer word, read once (the extent counts from the pointer, the binding from
+            // the pointer aligned down).
+            std::optional<GPUVAddr> pointer_word;
+            const auto read_pointer = [&]() -> GPUVAddr {
+                if (!pointer_word) {
+                    pointer_word = Inputs().ReadGameU64(ssbo_addr);
+                    MemReadLog::Value(MemReadLog::Kind::ComputePointer, gpu_memory, ssbo_addr,
+                                      *pointer_word);
+                }
+                return *pointer_word;
+            };
+            u64 cbuf_proven = 0;
+            if (extent) {
+                const GPUVAddr pointer = read_pointer();
                 const u64 pad = pointer >= binding.gpu_addr ? pointer - binding.gpu_addr : 0;
                 const u64 proven = std::min<u64>(binding.size, pad + *extent);
                 mark = proven;
+                if (cbuf_marks) {
+                    cbuf_proven = proven;
+                }
+                if (proven >= binding.size) {
+                    full_why = FullMarkWhy::WholeBinding;
+                }
                 // Not yet checked at these dims, or caught writing past it: mark in full (see
                 // ExtentTrust), and check this dispatch.
                 if (!IS_OPENGL && proven < binding.size &&
@@ -2215,6 +2272,8 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
                     if (trust.distrusted || bigger) {
                         mark = binding.size;
                         ++extent_full_marks;
+                        full_why =
+                            trust.distrusted ? FullMarkWhy::Distrusted : FullMarkWhy::Checking;
                         if (!trust.distrusted && !trust.probe_pending) {
                             extent_probe_requests[ssbo_index] = ExtentProbeRequest{
                                 .active = true,
@@ -2227,6 +2286,20 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
                         }
                     }
                 }
+            } else if (cbuf_mode == 3 && cbuf_bytes) [[unlikely]] {
+                // Dry: the full mark stays; the read ring learns where the proof would end it.
+                const GPUVAddr pointer = read_pointer();
+                const u64 pad = pointer >= binding.gpu_addr ? pointer - binding.gpu_addr : 0;
+                cbuf_proven = std::min<u64>(binding.size, pad + *cbuf_bytes);
+                if (cbuf_proven < binding.size) {
+                    cbuf_dry_proven[ssbo_index] = static_cast<u32>(cbuf_proven);
+                }
+            }
+            if ((census != 0 || cbuf_outcome != CbufOutcome::None) &&
+                (mark >= binding.size || cbuf_outcome != CbufOutcome::None)) [[unlikely]] {
+                NoteExtentCensus(static_cast<u32>(ssbo_index), binding, cbuf_index, cbuf_offset,
+                                 mark, full_why, write_unknown, cbuf_extent, cbuf_outcome,
+                                 cbuf_proven, cbuf_marks && mark < binding.size);
             }
             break;
         }
@@ -2238,6 +2311,290 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
         }
     }
     channel_state->compute_storage_write_marks[ssbo_index] = static_cast<u32>(mark);
+}
+
+template <class P>
+std::optional<u64> BufferCache<P>::ResolveCbufExtent(const Shader::StorageCbufExtent& extent,
+                                                     const std::array<u32, 3>& block,
+                                                     const std::optional<std::array<u32, 3>>& grid,
+                                                     CbufOutcome& outcome) {
+    // FRITCHII_EXTENT_CBUF: each term's word as the dispatch's uniform upload reads it (game
+    // memory at bind). A word on a GPU-written page may be stale in game memory: full mark.
+    const auto& launch_desc = Inputs().LaunchDescription();
+    const auto& cbufs = launch_desc.const_buffer_config;
+    const auto read_word = [&](const Shader::StorageExtentTerm& term, u32& value) {
+        if (term.cbuf_index >= cbufs.size() ||
+            ((launch_desc.const_buffer_enable_mask >> term.cbuf_index) & 1) == 0) {
+            outcome = CbufOutcome::Unresolved;
+            return false;
+        }
+        const GPUVAddr address = cbufs[term.cbuf_index].Address() + term.cbuf_offset;
+        const std::optional<DAddr> device = gpu_memory->GpuToCpuAddress(address);
+        if (!device) {
+            outcome = CbufOutcome::Unresolved;
+            return false;
+        }
+        const DAddr page = Common::AlignDown(*device, Core::DEVICE_PAGESIZE);
+        if (GpuWrittenHere(page, Core::DEVICE_PAGESIZE)) {
+            outcome = CbufOutcome::Fallback;
+            return false;
+        }
+        value = Inputs().ReadGameU32(address);
+        return true;
+    };
+    std::array<u32, Shader::MaxExtentTerms> values{};
+    std::array<u32, Shader::MaxExtentTerms> guard_values{};
+    for (size_t i = 0; i < extent.num_terms && i < Shader::MaxExtentTerms; ++i) {
+        if (!read_word(extent.terms[i], values[i])) {
+            return std::nullopt;
+        }
+    }
+    for (size_t i = 0; i < extent.num_guard_terms && i < Shader::MaxExtentTerms; ++i) {
+        if (!read_word(extent.guard_terms[i], guard_values[i])) {
+            return std::nullopt;
+        }
+    }
+    const std::optional<u64> bytes =
+        Shader::ResolveStorageCbufExtent(extent, block, grid, values, guard_values);
+    outcome = bytes ? CbufOutcome::Resolved : CbufOutcome::Unresolved;
+    return bytes;
+}
+
+template <class P>
+void BufferCache<P>::NoteExtentCensus(u32 ssbo_index, const Binding& binding, u32 cbuf_index,
+                                      u32 cbuf_offset, u64 mark, FullMarkWhy why,
+                                      const Shader::ExtentUnknownWhy& write_unknown,
+                                      const Shader::StorageCbufExtent& cbuf_extent,
+                                      CbufOutcome cbuf_outcome, u64 cbuf_proven,
+                                      bool cbuf_marked) {
+    if (extent_census.empty() && extent_census_frames == 0) {
+        extent_census_start = std::chrono::steady_clock::now();
+    }
+    ExtentCensusEntry& entry = extent_census[{compute_shader_hash, ssbo_index}];
+    entry.analysis = write_unknown;
+    entry.pointer_cbuf_index = cbuf_index;
+    entry.pointer_cbuf_offset = cbuf_offset;
+    entry.binding_bytes = binding.size;
+    entry.cbuf_extent = cbuf_extent;
+    if (mark >= binding.size) {
+        ++entry.full_dispatches;
+        entry.full_bytes += binding.size;
+        ++entry.whys[static_cast<size_t>(why)];
+    }
+    switch (cbuf_outcome) {
+    case CbufOutcome::Resolved:
+        ++entry.cbuf_resolved;
+        entry.cbuf_proven_bytes += cbuf_proven;
+        entry.cbuf_binding_bytes += binding.size;
+        break;
+    case CbufOutcome::Fallback:
+        ++entry.cbuf_fallback;
+        break;
+    case CbufOutcome::Unresolved:
+        ++entry.cbuf_unresolved;
+        break;
+    case CbufOutcome::None:
+        break;
+    }
+    entry.cbuf_marked += cbuf_marked ? 1 : 0;
+}
+
+template <class P>
+void BufferCache<P>::LogExtentCensus() {
+    // TickFrame, every frame while FRITCHII_EXTENT_CENSUS or FRITCHII_EXTENT_CBUF is on: the
+    // lines every 10 s.
+    if (extent_census.empty()) {
+        extent_census_frames = 0;
+        return;
+    }
+    ++extent_census_frames;
+    const auto now = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(now - extent_census_start).count();
+    if (seconds < 10.0) {
+        return;
+    }
+    const int census = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_extent_census,
+                                                        "FRITCHII_EXTENT_CENSUS", 0);
+    const int cbuf_mode = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_extent_cbuf,
+                                                           "FRITCHII_EXTENT_CBUF", 0);
+    const double frames = static_cast<double>((std::max<u64>)(extent_census_frames, 1));
+    const auto opcode_name = [](u16 opcode) {
+        return std::string{Shader::IR::NameOf(static_cast<Shader::IR::Opcode>(opcode))};
+    };
+    const auto why_text = [&](const Shader::ExtentUnknownWhy& why) {
+        std::string text{Shader::ExtentUnknownName(why.kind)};
+        switch (why.kind) {
+        case Shader::ExtentUnknown::OtherCbufWord:
+            text += fmt::format(" c{}[{:#x}]", why.cbuf_index, why.cbuf_offset);
+            break;
+        case Shader::ExtentUnknown::DynamicCbuf:
+        case Shader::ExtentUnknown::LoadedFromMemory:
+        case Shader::ExtentUnknown::AtomicResult:
+        case Shader::ExtentUnknown::SignedOr64Bit:
+        case Shader::ExtentUnknown::VariableProduct:
+        case Shader::ExtentUnknown::OtherOp:
+        case Shader::ExtentUnknown::LoopCarried:
+        case Shader::ExtentUnknown::AddressNotTracked:
+        case Shader::ExtentUnknown::NoPointerTerm:
+        case Shader::ExtentUnknown::TooLarge:
+        case Shader::ExtentUnknown::GuardFailed:
+            if (why.opcode != 0) {
+                text += fmt::format(" ({})", opcode_name(why.opcode));
+            }
+            break;
+        default:
+            break;
+        }
+        return text;
+    };
+    const auto terms_text = [](const Shader::StorageCbufExtent& extent) -> std::string {
+        if (!extent.ids.bounded) {
+            return "none";
+        }
+        std::string text;
+        for (size_t i = 0; i < extent.num_terms; ++i) {
+            text += fmt::format("{}c{}[{:#x}] x{:#x}", i == 0 ? "" : " + ",
+                                extent.terms[i].cbuf_index, extent.terms[i].cbuf_offset,
+                                extent.terms[i].coef);
+        }
+        if (extent.num_guard_terms != 0) {
+            text += " (16-bit guard on";
+            for (size_t i = 0; i < extent.num_guard_terms; ++i) {
+                text += fmt::format(" c{}[{:#x}] x{}", extent.guard_terms[i].cbuf_index,
+                                    extent.guard_terms[i].cbuf_offset,
+                                    extent.guard_terms[i].coef);
+            }
+            text += ")";
+        }
+        return text.empty() ? std::string{"no words (proven without them)"} : text;
+    };
+    using Entry = std::pair<const std::pair<u64, u32>*, const ExtentCensusEntry*>;
+    constexpr size_t Top = 8;
+    if (census != 0) {
+        std::vector<Entry> order;
+        u64 dispatches = 0;
+        u64 bytes = 0;
+        u64 unrecorded = 0;
+        for (const auto& [key, entry] : extent_census) {
+            if (entry.full_dispatches == 0) {
+                continue;
+            }
+            order.emplace_back(&key, &entry);
+            dispatches += entry.full_dispatches;
+            bytes += entry.full_bytes;
+            if (entry.analysis.kind == Shader::ExtentUnknown::Unrecorded) {
+                unrecorded += entry.full_dispatches;
+            }
+        }
+        const size_t shown = (std::min)(Top, order.size());
+        std::partial_sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(shown),
+                          order.end(), [](const Entry& a, const Entry& b) {
+                              return a.second->full_bytes > b.second->full_bytes;
+                          });
+        LOG_INFO(HW_GPU,
+                 "Extent census (FRITCHII_EXTENT_CENSUS) last {:.1f} s: {:.0f} native written "
+                 "bindings marked in full a second ({:.0f} MiB/s) over {} program bindings; {} "
+                 "of those dispatches have no reason recorded (infos from the precompiled cache: "
+                 "boot with EDEN_NX2_PRECOMPILED_FAST=0)",
+                 seconds, static_cast<double>(dispatches) / seconds,
+                 static_cast<double>(bytes) / 1048576.0 / seconds, order.size(), unrecorded);
+        for (size_t i = 0; i < shown; ++i) {
+            const auto& [key, entry] = order[i];
+            const auto& w = entry->whys;
+            LOG_INFO(HW_GPU,
+                     "Extent census {}/{}: program {:016x} binding {} (pointer c{}[{:#x}]) | "
+                     "{:.1f} full-marked dispatches/s, {:.1f} MiB marked/s ({} KiB each) | why "
+                     "unknown: {} | full mark because: unknown {}, indirect grid {}, 16-bit "
+                     "guard or dims {}, distrusted {}, checking new dims {}, proof covers the "
+                     "binding {} | cbuf extent: {}",
+                     i + 1, shown, key->first, key->second, entry->pointer_cbuf_index,
+                     entry->pointer_cbuf_offset,
+                     static_cast<double>(entry->full_dispatches) / seconds,
+                     static_cast<double>(entry->full_bytes) / 1048576.0 / seconds,
+                     entry->binding_bytes >> 10, why_text(entry->analysis),
+                     w[static_cast<size_t>(FullMarkWhy::Analysis)],
+                     w[static_cast<size_t>(FullMarkWhy::IndirectGrid)],
+                     w[static_cast<size_t>(FullMarkWhy::GuardOrDims)],
+                     w[static_cast<size_t>(FullMarkWhy::Distrusted)],
+                     w[static_cast<size_t>(FullMarkWhy::Checking)],
+                     w[static_cast<size_t>(FullMarkWhy::WholeBinding)],
+                     terms_text(entry->cbuf_extent));
+        }
+    }
+    if (cbuf_mode == 1 || cbuf_mode == 3) {
+        // The dry read counts (=3: the read ring's marks carry the proof's end)
+        auto dry = ReadRunStats::TakeDry();
+        std::vector<Entry> order;
+        for (const auto& [key, entry] : extent_census) {
+            if (entry.cbuf_resolved + entry.cbuf_fallback + entry.cbuf_unresolved != 0) {
+                order.emplace_back(&key, &entry);
+            }
+        }
+        const auto dry_of = [&](const std::pair<u64, u32>& key) -> const ReadRunStats::DryStats* {
+            const ReadRunStats::Writer writer{.program = key.first,
+                                              .binding = key.second,
+                                              .kind = ReadRunStats::WriterKind::ComputeStorage};
+            const auto it = dry.find(writer);
+            return it != dry.end() ? &it->second : nullptr;
+        };
+        const auto weight = [&](const Entry& e) {
+            const ReadRunStats::DryStats* d = dry_of(*e.first);
+            u64 wait = 0;
+            if (d != nullptr) {
+                for (const u64 ns : d->wait_ns) {
+                    wait += ns;
+                }
+            }
+            return std::pair<u64, u64>{wait, e.second->cbuf_resolved};
+        };
+        const size_t shown = (std::min)(Top, order.size());
+        std::partial_sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(shown),
+                          order.end(),
+                          [&](const Entry& a, const Entry& b) { return weight(a) > weight(b); });
+        for (size_t i = 0; i < shown; ++i) {
+            const auto& [key, entry] = order[i];
+            const ReadRunStats::DryStats none{};
+            const ReadRunStats::DryStats* found = dry_of(*key);
+            const ReadRunStats::DryStats& d = found != nullptr ? *found : none;
+            using DR = ReadRunStats::DryRead;
+            const auto reads = [&](DR kind) { return d.reads[static_cast<size_t>(kind)]; };
+            const auto ms_frame = [&](DR kind) {
+                return static_cast<double>(d.wait_ns[static_cast<size_t>(kind)]) / 1e6 / frames;
+            };
+            const double kib_proven =
+                entry->cbuf_resolved != 0
+                    ? static_cast<double>(entry->cbuf_proven_bytes) / 1024.0 /
+                          static_cast<double>(entry->cbuf_resolved)
+                    : 0.0;
+            const double kib_binding =
+                entry->cbuf_resolved != 0
+                    ? static_cast<double>(entry->cbuf_binding_bytes) / 1024.0 /
+                          static_cast<double>(entry->cbuf_resolved)
+                    : 0.0;
+            LOG_INFO(HW_GPU,
+                     "Extent cbuf (FRITCHII_EXTENT_CBUF={}) {}/{} last {:.1f} s: program {:016x} "
+                     "binding {} | cbuf extent {} | dispatches/s: proof {:.1f}, fallback (word on "
+                     "a GPU-written page) {:.1f}, unresolved {:.1f}, marked by the proof (=1) "
+                     "{:.1f} | proven {:.1f} KiB of {:.1f} KiB on average | reads to the back by "
+                     "its marks (=3): inside the proof {} ({:.2f} ms a frame), would be freed {} "
+                     "({:.2f} ms a frame), past the proof but under an older mark of the same "
+                     "writer {} / another writer {} ({:.2f} / {:.2f} ms a frame) | must be 0: "
+                     "freed reads whose bytes changed at landing {} of {} compared (inside: {} of "
+                     "{})",
+                     cbuf_mode, i + 1, shown, seconds, key->first, key->second,
+                     terms_text(entry->cbuf_extent),
+                     static_cast<double>(entry->cbuf_resolved) / seconds,
+                     static_cast<double>(entry->cbuf_fallback) / seconds,
+                     static_cast<double>(entry->cbuf_unresolved) / seconds,
+                     static_cast<double>(entry->cbuf_marked) / seconds, kib_proven, kib_binding,
+                     reads(DR::Inside), ms_frame(DR::Inside), reads(DR::Freed),
+                     ms_frame(DR::Freed), reads(DR::CoveredSame), reads(DR::CoveredOther),
+                     ms_frame(DR::CoveredSame), ms_frame(DR::CoveredOther), d.freed_differed,
+                     d.freed_compared, d.inside_differed, d.inside_compared);
+        }
+    }
+    extent_census.clear();
+    extent_census_frames = 0;
 }
 
 template <class P>
@@ -5912,6 +6269,7 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
         storage_sync_scan = 0;
         if (ReadRunStats::g_enabled) [[unlikely]] {
             ReadRunStats::t_writer = {};
+            ReadRunStats::t_proven_end = 0;
         }
     };
     ForEachEnabledBit(channel_state->enabled_compute_storage_buffers, [&](u32 index) {
@@ -5920,6 +6278,9 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
             ReadRunStats::t_writer = {.program = compute_shader_hash,
                                       .binding = index,
                                       .kind = ReadRunStats::WriterKind::ComputeStorage};
+            // FRITCHII_EXTENT_CBUF=3: where the cbuf proof would have ended this binding's mark
+            ReadRunStats::t_proven_end =
+                cbuf_dry_proven[index] != 0 ? binding.device_addr + cbuf_dry_proven[index] : 0;
         }
         if (profile) {
             Nx2Profile::Add(Nx2Profile::Counter::ComputeStorageBindings, 1);

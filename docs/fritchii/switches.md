@@ -1114,6 +1114,54 @@ contents are never touched; a guest store to a lingering page traps and goes thr
 handler, then the page is released at the frame's sweep): its cost is in the Store memo line's
 trapped stores, and "left after unmap" must stay 0.
 
+### FRITCHII_EXTENT_CENSUS
+
+TEST, off by default (helper DK, 2026-11-17; design: helper DJ, flower read-back dip). Live, log
+only. A native compute program's storage pointer has no size, so a dispatch whose store extent is
+unknown marks the whole FRITCHII_BARE_SSBO_MIB window (16 MiB) GPU-written. The store analysis
+(StoreExtentAnalysis) now keeps its first exit per buffer (Shader::ExtentUnknownWhy, not stored
+with the info: programs from the precompiled cache have "not recorded", so boot with
+EDEN_NX2_PRECOMPILED_FAST=0 for the reasons). Every 10 s: "Extent census (FRITCHII_EXTENT_CENSUS)
+last S s: N native written bindings marked in full a second (M MiB/s) over B program bindings; U
+of those dispatches have no reason recorded ...", then for the top 8 program bindings by bytes
+marked "Extent census i/n: program <hash> binding <ssbo> (pointer cX[0xY]) | D full-marked
+dispatches/s, M MiB marked/s (K KiB each) | why unknown: <reason> | full mark because: unknown,
+indirect grid, 16-bit guard or dims, distrusted, checking new dims, proof covers the binding |
+cbuf extent: <terms or none>". Reasons: "index from a constant buffer word cI[0xO]" (which word),
+"index loaded from memory (<opcode>)", "loop-carried index", "index from an atomic", "signed or
+64-bit math (<opcode>)", "variable times variable", "instruction not bounded (<opcode>)", "a store
+stays global", "pointer picked at run time", and the analysis' other exits by name. "cbuf extent"
+is what FRITCHII_EXTENT_CBUF would use (each word with its stride). Cost off: two atomic loads per
+native written binding.
+
+### FRITCHII_EXTENT_CBUF
+
+TEST, off by default (helper DK, 2026-11-17; design: helper_dj_answer.md fix 1). Live for the
+marks; =3's read counts need it at boot (the read ring turns on at its first use, as
+FRITCHII_READ_RUNS=1 does, and logs its own lines too). For written native buffers whose store
+extent is unknown, a second store analysis (terms mode, translation only, plain extents unchanged)
+takes constant buffer words read at an immediate offset as terms: offset <= ids bound + sum(stride
+x word). At bind the words are read from game memory like the pointer word; a word on a GPU-written
+page is "fallback" (full mark, as today); a 16-bit guard past 2^16 or an indirect grid is
+"unresolved". Not stored with the info: boot with EDEN_NX2_PRECOMPILED_FAST=0.
+- =3 dry: marks stay full; each write mark carries where the proof would end it. Reads that go to
+  the back are sorted by their newest mark: inside the proof, would be freed (past it and no older
+  mark in the ring covers the bytes, marks with a proof cut at their proof), or past it but under an
+  older mark (same writer / another). Must be 0: "freed reads whose bytes changed at landing" (the
+  read's own bytes, before the wait against after it: a change means the GPU wrote there and the
+  proof would have served stale bytes).
+- =1 live: the proof becomes the mark through the ExtentTrust checks (each program marked in full
+  and checked at new dims, distrusted for the session on a write past it: "Compute write extent too
+  small" in the log, "distrusted" in the census). Must be 0 there, then the flash watch and the
+  white-leaves spot.
+Line every 10 s per top program binding: "Extent cbuf (FRITCHII_EXTENT_CBUF=M) i/n last S s:
+program <hash> binding <ssbo> | cbuf extent <terms> | dispatches/s: proof P, fallback F,
+unresolved U, marked by the proof (=1) L | proven K KiB of B KiB on average | reads to the back by
+its marks (=3): inside the proof I (ms a frame), would be freed R (ms a frame), past the proof but
+under an older mark of the same writer / another writer | must be 0: freed reads whose bytes
+changed at landing X of Y compared (inside: ...)". The freed ms a frame is the ceiling of =1 for
+that program.
+
 ### FRITCHII_HOSTTIMING_OFF_GPU
 
 TEST, off by default (helper DE, 2026-11-17). Live. 0 (as before): the timer thread's spin goes to

@@ -83,6 +83,15 @@ struct KernelProgram {
         return program.info
             .storage_read_extents[static_cast<size_t>(&descriptor - descriptors.data())];
     }
+
+    /// FRITCHII_EXTENT_CENSUS / FRITCHII_EXTENT_CBUF: the extra of the buffer at c0[offset]
+    const Shader::StorageWriteExtra& Extra(u32 offset) {
+        const auto& descriptor{Run(offset)};
+        const auto& descriptors{program.info.storage_buffers_descriptors};
+        REQUIRE(program.info.storage_write_extras.size() == descriptors.size());
+        return program.info
+            .storage_write_extras[static_cast<size_t>(&descriptor - descriptors.data())];
+    }
 };
 
 IR::U32 Word(IR::IREmitter& ir, u32 offset) {
@@ -311,4 +320,47 @@ TEST_CASE("Store extents merge to cover both", "[shader][storage_extent]") {
     CHECK(lhs.group_stride == std::array<u32, 3>{0, 32, 0});
     Shader::MergeStorageWriteExtent(lhs, StorageWriteExtent{});
     CHECK_FALSE(lhs.bounded);
+}
+
+TEST_CASE("An index from a constant buffer word is a cbuf extent term",
+          "[shader][storage_extent]") {
+    // c0[0x1a0] * 0x100 + tid.x * 4: an object's record, picked by a uniform
+    KernelProgram fixture;
+    IR::IREmitter ir{fixture.entry};
+    const IR::U32 record{ir.IMul(Word(ir, 0x1a0), ir.Imm32(0x100))};
+    const IR::U32 lane{ir.ShiftLeftLogical(ir.LocalInvocationIdX(), ir.Imm32(2))};
+    ir.WriteGlobal32(Address(ir, 0x170, ir.IAdd(record, lane)), ir.Imm32(0));
+    const auto& descriptor{fixture.Run(0x170)};
+    CHECK_FALSE(descriptor.write_extent.bounded);
+    const Shader::StorageWriteExtra& extra{fixture.Extra(0x170)};
+    CHECK(extra.write_unknown.kind == Shader::ExtentUnknown::OtherCbufWord);
+    CHECK(extra.write_unknown.cbuf_index == 0);
+    CHECK(extra.write_unknown.cbuf_offset == 0x1a0);
+    const Shader::StorageCbufExtent& cbuf{extra.cbuf_extent};
+    REQUIRE(cbuf.ids.bounded);
+    REQUIRE(cbuf.num_terms == 1);
+    CHECK(cbuf.num_guard_terms == 0);
+    CHECK(cbuf.terms[0].cbuf_index == 0);
+    CHECK(cbuf.terms[0].cbuf_offset == 0x1a0);
+    CHECK(cbuf.terms[0].coef == 0x100);
+    CHECK(cbuf.ids.const_end == 4);
+    CHECK(cbuf.ids.local_stride == std::array<u32, 3>{4, 0, 0});
+    const std::array<u32, Shader::MaxExtentTerms> values{3, 0, 0, 0};
+    const std::array<u32, Shader::MaxExtentTerms> no_guard{};
+    CHECK(Shader::ResolveStorageCbufExtent(cbuf, {64, 1, 1}, std::array<u32, 3>{1, 1, 1}, values,
+                                           no_guard) == 4 + 4 * 63 + 3 * 0x100);
+}
+
+TEST_CASE("A constant buffer read at a computed offset leaves the cbuf extent unknown",
+          "[shader][storage_extent]") {
+    KernelProgram fixture;
+    IR::IREmitter ir{fixture.entry};
+    const IR::U32 lane{ir.ShiftLeftLogical(ir.LocalInvocationIdX(), ir.Imm32(2))};
+    const IR::U32 index{ir.GetCbuf(ir.Imm32(0), lane)};
+    ir.WriteGlobal32(Address(ir, 0x170, ir.ShiftLeftLogical(index, ir.Imm32(2))), ir.Imm32(0));
+    const auto& descriptor{fixture.Run(0x170)};
+    CHECK_FALSE(descriptor.write_extent.bounded);
+    const Shader::StorageWriteExtra& extra{fixture.Extra(0x170)};
+    CHECK(extra.write_unknown.kind == Shader::ExtentUnknown::DynamicCbuf);
+    CHECK_FALSE(extra.cbuf_extent.ids.bounded);
 }
