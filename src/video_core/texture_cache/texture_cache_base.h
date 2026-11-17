@@ -179,6 +179,13 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 budget_cap{~0ULL};
     bool budget_pressure{}; ///< budget_cap binds: the driver's usage passed the budget less headroom
     std::chrono::steady_clock::time_point budget_control_time{};
+    /// FRITCHII_SCALE_DEPTH_MAX: depth images kept native (each counted once).
+    struct DepthNativeStats {
+        u32 window{}; ///< since the last 10 s line
+        u64 total{};
+        std::chrono::steady_clock::time_point last_log{};
+    };
+    DepthNativeStats depth_native_stats;
     /// What BudgetControl saw last, for the owners line.
     struct BudgetSeen {
         int mode{-1};

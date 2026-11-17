@@ -1413,6 +1413,20 @@ void TextureCache<P>::TickFrame() {
     }
     LogZeroUploads();
     LogLostContents();
+    if (depth_native_stats.window != 0) {
+        // FRITCHII_SCALE_DEPTH_MAX: depth images kept native, at most one line per 10 s.
+        const auto now = std::chrono::steady_clock::now();
+        if (now - depth_native_stats.last_log >= std::chrono::seconds{10}) {
+            LOG_INFO(HW_GPU,
+                     "Scale depth max (FRITCHII_SCALE_DEPTH_MAX={}): {} depth images kept at "
+                     "native size in the last 10 s, {} this session",
+                     VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_scale_depth_max,
+                                                      "FRITCHII_SCALE_DEPTH_MAX", 8192),
+                     depth_native_stats.window, depth_native_stats.total);
+            depth_native_stats.window = 0;
+            depth_native_stats.last_log = now;
+        }
+    }
     // EXP121: before the usage is read below, so landed images leave the queued bytes.
     if (!collect_downloads.empty()) {
         LandCollectDownloads();
@@ -5508,6 +5522,35 @@ bool TextureCache<P>::ImageCanRescale(ImageBase& image) {
             }
             return false;
         }
+    }
+    // FRITCHII_SCALE_DEPTH_MAX (default 8192, 0 off): a depth/stencil image whose scaled width or
+    // height would pass N stays at native size. OoT's 12288x12288 D16 sun shadow map (288 MiB
+    // native, made on every Castle Town load) is 648 MiB at 1.5x and 1.15 GiB at 2x on NVIDIA
+    // (32768 limit, so the extent cap above keeps scaling it), and 450 MiB at 1.25x on AMD.
+    // A shadow map that size gains nothing visible from scaling; its memory is what tips a card
+    // over the budget. Same native path as the extent cap: the render target set of that pass
+    // stays native, samplers, copies and blits handle a native image next to scaled ones as for
+    // any image that is not rescaleable. Like the cap, checked before the cached answer.
+    if (const int depth_max = VideoCore::Nx2Debug::SwitchValue(
+            VideoCore::Nx2Debug::g_scale_depth_max, "FRITCHII_SCALE_DEPTH_MAX", 8192);
+        depth_max > 0 && GetFormatType(image.info.format) != SurfaceType::ColorTexture &&
+        !ScaledImageFits(image.info, Settings::values.resolution_info,
+                         static_cast<u32>(depth_max))) {
+        if (False(image.flags & ImageFlagBits::DepthNative)) {
+            image.flags |= ImageFlagBits::DepthNative;
+            ++depth_native_stats.window;
+            if (const u64 n = ++depth_native_stats.total; n <= 16) {
+                LOG_INFO(HW_GPU,
+                         "Depth image {}x{} (format {}, {} samples) stays at native size: scaled "
+                         "it would be {}x{}, past {} (FRITCHII_SCALE_DEPTH_MAX, {} so far)",
+                         image.info.size.width, image.info.size.height,
+                         static_cast<u32>(image.info.format), image.info.num_samples,
+                         Settings::values.resolution_info.ScaleUp(image.info.size.width),
+                         Settings::values.resolution_info.ScaleUp(image.info.size.height),
+                         depth_max, n);
+            }
+        }
+        return false;
     }
     if (Settings::values.resolution_info.downscale && !image.info.downscaleable) {
         return false;
