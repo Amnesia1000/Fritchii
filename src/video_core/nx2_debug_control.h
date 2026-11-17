@@ -351,6 +351,8 @@ inline std::atomic<int> g_hosttiming_priority{-1};
 inline std::atomic<int> g_hosttiming_off_gpu{-1};
 /// FRITCHII_QUERY_FLUSH_DRY (live, default 0): docs/fritchii/switches.md (vk_rasterizer.cpp).
 inline std::atomic<int> g_query_flush_dry{-1};
+/// FRITCHII_QUERY_LEND_DRY (live, default 0): docs/fritchii/switches.md (vk_rasterizer.cpp).
+inline std::atomic<int> g_query_lend_dry{-1};
 /// FRITCHII_GPU_PRIORITY (live, default 0): docs/fritchii/switches.md (fritchii_focus.h).
 inline std::atomic<int> g_gpu_priority{-1};
 /// FRITCHII_THREAD_QOS (live, default 0): docs/fritchii/switches.md (fritchii_focus.h).

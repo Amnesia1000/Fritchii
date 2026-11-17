@@ -5887,10 +5887,95 @@ void RasterizerVulkan::ResetCounter(VideoCommon::QueryType type) {
     }
 }
 
+namespace {
+/// FRITCHII_QUERY_LEND_DRY=1 (live, default 0; helper DE round 5, a dry timer that changes
+/// nothing). kaksample2: E parked ~23 ms/s in Query lends. Per lent Query: why it was lent (the
+/// rule that kept it from the posted paths), E's parked time, and whether its report page is one
+/// the front's DMA reads snapshot (FrontReadPagesAny: a posted report there would be read stale
+/// by the front unless it waited for R; must be 0 for a kind to be posted as is).
+struct QueryLendDry {
+    enum Why : u8 {
+        Other,
+        FencePayloadRule,     ///< fence payload: SEM_E's path off (not synced, EXP33, SEM_E off)
+        FencePayloadNotClean, ///< fence payload: no device address or the fence not clean
+        FenceCounterSwitch,   ///< fence counter report: POST_FENCE_REPORT off or EXP33
+        FenceCounterAtOnce,   ///< fence counter report of a type that lands at once
+        FenceCounterNotClean, ///< fence counter report: no device address or not clean
+        PayloadRelease,       ///< plain payload release lent
+        PlainReport,          ///< plain report (no streamer under SEM_E, or QUERY_OPS off)
+        BufferPage,           ///< plain report on a registered buffer page
+        Count,
+    };
+    static constexpr std::array<const char*, Count> names{
+        "other",
+        "fence payload: SEM_E path off",
+        "fence payload: not clean",
+        "fence counter: switch off",
+        "fence counter: lands at once",
+        "fence counter: not clean",
+        "payload release",
+        "plain report",
+        "report on buffer page"};
+    static bool On() {
+        return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_query_lend_dry,
+                                                "FRITCHII_QUERY_LEND_DRY") != 0;
+    }
+    static u64 Now() {
+        return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count());
+    }
+    void Note(u8 why, bool front_page, u64 parked_ns, u64 now) {
+        const size_t i = why < Count ? why : Other;
+        ++count[i];
+        parked[i] += parked_ns;
+        front[i] += front_page ? 1 : 0;
+        if (since == 0) {
+            since = now;
+            return;
+        }
+        if (now - since < 10'000'000'000ULL) {
+            return;
+        }
+        const double seconds = static_cast<double>(now - since) / 1e9;
+        std::string text;
+        u64 all = 0;
+        u64 all_ns = 0;
+        for (size_t k = 0; k < Count; ++k) {
+            all += count[k];
+            all_ns += parked[k];
+            if (count[k] == 0) {
+                continue;
+            }
+            text += fmt::format("; {} {:.0f}/s {:.1f} ms/s (front read page {:.0f}/s)", names[k],
+                                static_cast<double>(count[k]) / seconds,
+                                static_cast<double>(parked[k]) / 1e6 / seconds,
+                                static_cast<double>(front[k]) / seconds);
+        }
+        LOG_INFO(Render_Vulkan,
+                 "Query lends (FRITCHII_QUERY_LEND_DRY=1) {:.0f} s: {:.0f}/s, E parked {:.1f} ms/s "
+                 "by why lent{}",
+                 seconds, static_cast<double>(all) / seconds,
+                 static_cast<double>(all_ns) / 1e6 / seconds, text);
+        count = {};
+        parked = {};
+        front = {};
+        since = now;
+    }
+    u64 since{};
+    std::array<u64, Count> count{};
+    std::array<u64, Count> parked{};
+    std::array<u64, Count> front{};
+};
+QueryLendDry g_query_lend_timer;    ///< E only
+thread_local u8 t_query_lend_why{}; ///< E: why this Query is lent (set where its kind is)
+} // Anonymous namespace
+
 void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                              VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) {
     if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
         namespace OneF = VideoCommon::OneFollower;
+        t_query_lend_why = QueryLendDry::Other;
         // FRITCHII_ONEF_DRY_RELEASE (fable_b 19.5 step 3): E passes this release.
         if (OneF::DryReleaseOn()) [[unlikely]] {
             if (const std::optional<DAddr> device = gpu_memory->GpuToCpuAddress(gpu_addr)) {
@@ -5980,6 +6065,20 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
             }
             OneFollowerFenceLent(); // its fence (R's, E parked) syncs and lands all before it
             OneF::SetQueryKind(OneF::QueryKind::FenceReport); // lent (fable_b item 4)
+            if (QueryLendDry::On()) [[unlikely]] {
+                const bool exp33 = VideoCore::Nx2Debug::Experiment(33) != 0;
+                if (type == VideoCommon::QueryType::Payload) {
+                    t_query_lend_why = synced && !exp33 && OneF::SemOnE()
+                                           ? QueryLendDry::FencePayloadNotClean
+                                           : QueryLendDry::FencePayloadRule;
+                } else if (!OneF::PostFenceReportOn() || exp33) {
+                    t_query_lend_why = QueryLendDry::FenceCounterSwitch;
+                } else if (!query_cache.ReportLandsLater(type)) {
+                    t_query_lend_why = QueryLendDry::FenceCounterAtOnce;
+                } else {
+                    t_query_lend_why = QueryLendDry::FenceCounterNotClean;
+                }
+            }
         } else if (type == VideoCommon::QueryType::Payload) {
             // FRITCHII_ONEF_SEM_E (fable_b 19.4): a payload release CounterReport writes at once
             // (not Accurate) is written here, at E's place (after its page's landings), and
@@ -6058,12 +6157,15 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                 return;
             }
             OneF::SetQueryKind(OneF::QueryKind::PayloadRelease); // lent (fable_b item 4)
+            t_query_lend_why = QueryLendDry::PayloadRelease;
         } else if (OneF::SemOnE() && !query_cache.ReportLandsLater(type)) {
             // FRITCHII_ONEF_SEM_E: a type without a streamer becomes a payload write inside
             // CounterReport: lent, so every payload write is E's or lent (one home).
             OneF::SetQueryKind(OneF::QueryKind::PlainReport);
+            t_query_lend_why = QueryLendDry::PlainReport;
         } else if (!OneF::QueryOps()) {
             OneF::SetQueryKind(OneF::QueryKind::PlainReport);
+            t_query_lend_why = QueryLendDry::PlainReport;
         } else {
             // fable_b 11.1 item 1(c): a plain report is a render op, translated here at E's
             // stream place. Guard: a target the buffer cache has registered stays lent (E's
@@ -6085,6 +6187,7 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
             if (registered && !buffer_page_op) {
                 // A lend reason, not a must-be-0: OoT's reports often land in buffers.
                 OneF::SetQueryKind(OneF::QueryKind::ReportOnBufferPage);
+                t_query_lend_why = QueryLendDry::BufferPage;
             } else {
                 OneF::SetQueryKind(buffer_page_op ? OneF::QueryKind::BufferPageOp
                                                   : OneF::QueryKind::PlainReport);
@@ -6140,6 +6243,19 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
         type == VideoCommon::QueryType::ZPassPixelCount64) [[unlikely]] {
         onef_mirror_lent_valid = true; // read by R in the lent call (E parked)
         onef_mirror_lent_bit = onef_samples_started;
+    }
+    if (VideoCommon::OneFollower::ShouldLend() && QueryLendDry::On()) [[unlikely]] {
+        // FRITCHII_QUERY_LEND_DRY: the same lend as ONEF_LEND below, timed and classified.
+        const auto device = gpu_memory->GpuToCpuAddress(gpu_addr);
+        const bool front_page = device && VideoCommon::OneFollower::FrontReadPagesAny(*device, 16);
+        const u8 why = t_query_lend_why;
+        const u64 start = QueryLendDry::Now();
+        VideoCommon::OneFollower::SetLendSite(__func__);
+        auto onef_call = [&] { Query(gpu_addr, type, flags, payload, subreport); };
+        VideoCommon::OneFollower::Lend(VideoCommon::OneFollower::LentOp::Query, onef_call);
+        const u64 now = QueryLendDry::Now();
+        g_query_lend_timer.Note(why, front_page, now - start, now);
+        return;
     }
     ONEF_LEND(Query, Query(gpu_addr, type, flags, payload, subreport))
     if (onef_mirror_lent_valid && VideoCommon::OneFollower::RenderInLentCall()) [[unlikely]] {
