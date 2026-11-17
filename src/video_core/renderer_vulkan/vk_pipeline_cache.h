@@ -218,6 +218,11 @@ public:
 
     [[nodiscard]] ComputePipeline* CurrentComputePipeline();
 
+    /// FRITCHII_ASYNC_COMPUTE_SKIP: waits for `pipeline` at most what is left of this frame's
+    /// FRITCHII_PIPELINE_WAIT_BUDGET (shared with the draws; 0 = no wait). True when built by
+    /// then. GPU thread.
+    [[nodiscard]] bool WaitComputeWithinBudget(ComputePipeline& pipeline);
+
     /// One follower (FRITCHII_ONEF_OP_DISPATCH, E with FRITCHII_ONEF_E_PIPELINE): the compute
     /// lookup when it is a plain hit: the shader known, its entry built before, no rebuild
     /// pending or due, nothing to create or retire. Then it does what CurrentComputePipeline

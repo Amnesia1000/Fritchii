@@ -4464,6 +4464,14 @@ bool RasterizerVulkan::OneFollowerPostDispatch() {
         OneF::CountDispatch(why);
         return false;
     };
+    // FRITCHII_ASYNC_COMPUTE_SKIP: an unbuilt pipeline's dispatch is decided in the lent call
+    // (DispatchCompute's SkipUnbuiltDispatch), before anything is filled or marked here.
+    if (AsyncComputeSkip::Mode() != 0) [[unlikely]] {
+        if (async_compute_skip.CountsUnbuilt(*pipeline)) {
+            return lend_with(Count::Unbuilt);
+        }
+        async_compute_skip.NoteRan(*pipeline);
+    }
     const MemStage::DispatchFacts facts = pipeline->MemFacts();
     if (facts.has_texel_buffers) {
         return lend_with(Count::TexelBuffers);
@@ -4556,6 +4564,15 @@ bool RasterizerVulkan::OneFollowerPostDispatch() {
         if (number != 0) {
             list_copies = buffer_cache.Nx2HasListCopyRequests();
             probes = buffer_cache.HasUnrecordedExtentProbes();
+            // FRITCHII_ASYNC_COMPUTE_SKIP: its written ranges' streaks, stamped in R's frame
+            // when R plays the packet (OneFollowerPlayDispatch).
+            if (AsyncComputeSkip::Mode() != 0) [[unlikely]] {
+                boost::container::small_vector<AsyncComputeSkip::Range, 8> writes;
+                static_cast<void>(CollectComputeWrites(writes));
+                if (!writes.empty()) {
+                    async_compute_skip.QueueWrites(number, writes);
+                }
+            }
         }
         if (!list_copies) {
             buffer_cache.Nx2CollectListCopies(false);
@@ -4773,6 +4790,7 @@ void RasterizerVulkan::OneFollowerPlayDispatch(ComputePipeline* pipeline, u64 nu
     }
     // However this ends, the packet is played whole: the cache believes its uploads recorded.
     const MemStage::RestAtEnd rest{mem_stage};
+    async_compute_skip.PlayedWrites(number); // FRITCHII_ASYNC_COMPUTE_SKIP's streaks (E's fill)
     if (channel_state == nullptr || gpu_memory == nullptr) [[unlikely]] {
         OneF::Note(OneF::Check::PlayedDispatch, "a played dispatch with no channel bound");
         OneF::StopPostDispatch("a played dispatch with no channel bound");
@@ -5309,6 +5327,116 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     }
 }
 
+bool RasterizerVulkan::CollectComputeWrites(
+    boost::container::small_vector<AsyncComputeSkip::Range, 8>& ranges) {
+    ranges.clear();
+    return buffer_cache.ForEachComputeWriteMark([&](DAddr addr, u64 size) {
+        ranges.push_back({addr, size, AsyncComputeSkip::Kind::Buffer});
+    });
+}
+
+bool RasterizerVulkan::SkipUnbuiltDispatch(ComputePipeline& pipeline, bool indirect,
+                                           bool special_pass) {
+    // FRITCHII_ASYNC_COMPUTE_SKIP (vk_async_compute_skip.h; idea and rules from
+    // zortos293/Lichii #2104 by zortos293). Both caches' locks are held, nothing of this
+    // dispatch is filled yet. The guards in order: G4 (shape, then extents), G3, G1, G2.
+    using Skip = AsyncComputeSkip;
+    const int mode = Skip::Mode();
+    const auto run = [&](Skip::Refusal why) {
+        async_compute_skip.NoteRefusal(why);
+        return false;
+    };
+    const MemStage::DispatchFacts facts = pipeline.MemFacts();
+    // G4: a plain native direct dispatch. Global stores have no binding to judge; texel buffers
+    // bind through image views (made by the texture cache); the packed R16 path makes its own
+    // shadow; the OoT upscaler and effects passes have hooks of their own.
+    if (!kepler_compute->IsNativeMode() || indirect || special_pass || frame_dump.Capturing() ||
+        facts.has_texel_buffers || facts.info->stores_global_memory ||
+        pipeline.WritesByteAddressedImages()) {
+        return run(Skip::Refusal::Shape); // Configure binds as always
+    }
+    // Configure's pointer binds, ahead (they resolve the written ranges and mark nothing). From
+    // here a dispatch that runs keeps them: Configure does not bind again.
+    pipeline.BindStoragePointers(buffer_cache);
+    const auto run_bound = [&](Skip::Refusal why) {
+        pipeline.UsePreboundPointers();
+        return run(why);
+    };
+    boost::container::small_vector<Skip::Range, 8> ranges;
+    bool bounded = CollectComputeWrites(ranges);
+    if (bounded && pipeline.WritesImages()) {
+        // The written images' guest ranges from their descriptors, as E records them for EXP10
+        // (DescribeWrittenImage): read, nothing made.
+        thread_local std::vector<u32> values;
+        pipeline.MakeHandleValues(*kepler_compute, *gpu_memory,
+                                  VideoCore::Nx2Debug::Experiment(21) != 0, values);
+        const bool visited = pipeline.VisitWrittenImageHandles(values, [&](u32 raw) {
+            Tegra::Texture::TICEntry tic{};
+            GPUVAddr tic_address{};
+            bool null_view{};
+            const auto range =
+                DescribeWrittenImage(*gpu_memory, *kepler_compute, raw, tic, tic_address, null_view);
+            if (range) {
+                ranges.push_back({range->device, range->size, Skip::Kind::Image});
+            } else if (!null_view) {
+                bounded = false; // not one device range, or a buffer image
+            }
+        });
+        bounded = bounded && visited;
+    }
+    if (!bounded) {
+        return run_bound(Skip::Refusal::Extent);
+    }
+    for (const Skip::Range& range : ranges) {
+        // G3: never a page the guest reads back (this file's sticky reads, and the buffer
+        // cache's Preflushable marks, CPU-read ranges and read downloads).
+        const auto buffer_facts = buffer_cache.ComputeSkipRangeFacts(range.addr, range.size);
+        if (buffer_facts.read_back || async_compute_skip.GuestReadSeen(range)) {
+            return run_bound(Skip::Refusal::ReadBack);
+        }
+        if (range.kind == Skip::Kind::Buffer) {
+            // G1: every byte GPU-written, no CPU write to upload. G2: every frame.
+            if (!buffer_facts.all_gpu_written || buffer_facts.cpu_modified) {
+                return run_bound(Skip::Refusal::NoHistory);
+            }
+            if (!async_compute_skip.BufferStreakHolds(pipeline, range)) {
+                return run_bound(Skip::Refusal::NotEveryFrame);
+            }
+            continue;
+        }
+        using State = TextureCache::SkipImageState;
+        switch (texture_cache.ComputeSkipImageState(range.addr, range.size)) {
+        case State::Redrawn:
+            break;
+        case State::NoImage:
+        case State::NoGpuData:
+            return run_bound(Skip::Refusal::NoHistory);
+        case State::NotRedrawn:
+            if (!async_compute_skip.ChainHolds(pipeline, range)) {
+                return run_bound(Skip::Refusal::NotEveryFrame);
+            }
+            break;
+        }
+    }
+    if (mode == 2) {
+        // Dry: it waits as before; counted as a skip mode 1 would make.
+        async_compute_skip.NoteSkip(pipeline, ranges, true);
+        pipeline.UsePreboundPointers();
+        return false;
+    }
+    // A pipeline really building (not the test delay's) starts on a spare thread now, and may
+    // still make it within what is left of the frame's wait budget.
+    if (!pipeline.IsBuilt()) {
+        async_compute_skip.Kick(pipeline);
+        if (pipeline_cache.WaitComputeWithinBudget(pipeline)) {
+            pipeline.UsePreboundPointers();
+            return false;
+        }
+    }
+    async_compute_skip.NoteSkip(pipeline, ranges, false);
+    return true;
+}
+
 void RasterizerVulkan::DispatchCompute() {
     // FRITCHII_DELAY_DISPATCH_US (live, 0 = off): the delay test "K", on the back thread only.
     // Off: one load and a branch.
@@ -5512,7 +5640,34 @@ void RasterizerVulkan::DispatchCompute() {
     // work; Configure plays it and RestAtEnd what is left, however Configure ends (true, false
     // or an exception: the native R16 shadow checks throw).
     // A played dispatch's packet is held already (TakeRingDispatch): E filled it.
-    if (onef_play == nullptr) {
+    // FRITCHII_ASYNC_COMPUTE_SKIP (vk_async_compute_skip.h): a pipeline still building is decided
+    // here, before the fill marks or uploads anything. Skipped, the dispatch returns as if the
+    // guest had not run it; its QMD releases are the engine's (KeplerCompute, after this call)
+    // and still happen. Run, it takes Configure's own path (no fill: the decision bound its
+    // storage pointers already, or Configure binds them) and waits for the build as before.
+    bool unbuilt_decided = false;
+    if (onef_play == nullptr && AsyncComputeSkip::Mode() != 0) [[unlikely]] {
+        if (async_compute_skip.CountsUnbuilt(*pipeline)) {
+            unbuilt_decided = true;
+            constexpr u64 DepthReaderShader = 0x1fc7a0423116281fULL;
+            const u64 hash = pipeline->ShaderHash();
+            const bool special_pass =
+                can_replace || pipeline->CanReplaceOcarinaUpscale() ||
+                hash == ComputePipeline::OcarinaFullSizeShader ||
+                hash == ComputePipeline::Ocarina1440pShader || hash == ThreeQuarterShader ||
+                hash == DepthReaderShader || (marking_effects && pipeline->WritesImages());
+            if (SkipUnbuiltDispatch(*pipeline, indirect_address.has_value(), special_pass)) {
+                // EXP10: the dispatch writes nothing.
+                if (VideoCommon::GpuSplit::RecordingDispatch()) {
+                    VideoCommon::GpuSplit::Get().ConfirmDispatch();
+                }
+                return;
+            }
+        } else {
+            async_compute_skip.NoteRan(*pipeline);
+        }
+    }
+    if (onef_play == nullptr && !unbuilt_decided) {
         mem_stage.FillDispatch(buffer_cache, pipeline->MemFacts());
     }
     bool configured{};
@@ -5534,6 +5689,15 @@ void RasterizerVulkan::DispatchCompute() {
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute resources unavailable");
         return;
     }
+    // FRITCHII_ASYNC_COMPUTE_SKIP: the written ranges' streaks (G2), for a dispatch recorded
+    // here; a played one's came from E's fill (QueueWrites).
+    const auto note_write_streaks = [&] {
+        if (onef_play == nullptr && AsyncComputeSkip::Mode() != 0) [[unlikely]] {
+            boost::container::small_vector<AsyncComputeSkip::Range, 8> writes;
+            static_cast<void>(CollectComputeWrites(writes));
+            async_compute_skip.NoteWrites(writes);
+        }
+    };
     // A played dispatch: E confirmed it (it writes no image and is direct).
     // A played dispatch writes images exactly when E saw it would (bit 2: E recorded them as
     // unbounded at its place, and the packed R16 path stays lent).
@@ -5707,6 +5871,7 @@ void RasterizerVulkan::DispatchCompute() {
         }
         dispatch_kinds.recorded = true;
         dispatch_kinds.indirect = true;
+        note_write_streaks();
         return;
     }
     const std::array<u32, 3> dim{qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z};
@@ -5725,6 +5890,7 @@ void RasterizerVulkan::DispatchCompute() {
         }
         return;
     }
+    note_write_streaks();
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.NoteComputeWrites();
     // The upscaler's evaluation or the effects mark may be recorded next, before the dispatch:
@@ -6714,6 +6880,11 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
                            texture_cache.sparse_page_filter.Any(addr, size);
     const bool image_ever = texture_cache.page_filter.Any(addr, size);
     const bool gpu_written = MayBeGpuModified(page_begin, page_end - page_begin);
+    // FRITCHII_ASYNC_COMPUTE_SKIP: guest reads of pages the GPU wrote or an image was on never
+    // see a skipped dispatch's output (sticky; must-be-0 count when one does).
+    if ((image_ever || gpu_written) && AsyncComputeSkip::Mode() != 0) [[unlikely]] {
+        async_compute_skip.NoteGuestRead(addr, size);
+    }
     // EDEN_NX2_EXP36=1 turns this off (live), for the washed-out scene hunt.
     if (VideoCore::Nx2Debug::Experiment(36) == 0 && !(by_count ? image_now : image_ever) &&
         !gpu_written) {
@@ -9200,6 +9371,7 @@ FrameEndTimes g_frame_end_times; ///< only TickFrame touches it (one thread at a
 
 void RasterizerVulkan::TickFrame() {
     ONEF_LEND(FrameEnd, TickFrame())
+    async_compute_skip.TickFrame(); // FRITCHII_ASYNC_COMPUTE_SKIP's frame clock and 10 s line
     const bool frame_end_times = FrameEndTimes::On();
     if (frame_end_times) [[unlikely]] {
         g_frame_end_times.Begin();

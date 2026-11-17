@@ -608,6 +608,23 @@ public:
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(DAddr addr, size_t size);
 
+    // --- FRITCHII_ASYNC_COMPUTE_SKIP (renderer_vulkan/vk_async_compute_skip.h), the lock held ---
+
+    /// After the compute storage pointer binds, before UpdateComputeBuffers: calls
+    /// `func(device_addr, size)` for every range BindHostComputeStorageBuffers would mark
+    /// GPU-written. False when a written binding's writes are not bounded by its mark: not a
+    /// native pointer, a mark as large as the binding (no proven write extent, the 16 MiB mark),
+    /// a mark the EDEN_NX2_WRITTEN_SSBO_MARK_KIB cap shortened, or several device ranges.
+    template <typename Func>
+    [[nodiscard]] bool ForEachComputeWriteMark(Func&& func) const;
+    struct SkipRangeFacts {
+        bool all_gpu_written{}; ///< every byte held in gpu_modified_ranges (as GPUMem sees it)
+        bool cpu_modified{};    ///< a byte the guest CPU wrote that is not uploaded yet
+        bool read_back{};       ///< a page Preflushable, read by the CPU after a GPU write, or
+                                ///< on its way back in a read download
+    };
+    [[nodiscard]] SkipRangeFacts ComputeSkipRangeFacts(DAddr addr, u64 size);
+
     // --- FRITCHII_MEMSTAGE_MARKS_AHEAD (memory stage compute, part 1): GPU-written marks made
     // ahead of the back. The real sets (gpu_modified_ranges, the fence and read downloads) stay
     // "as of the back"; a writing fill on GPUMem puts its marks on a list keyed by ring B's

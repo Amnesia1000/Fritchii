@@ -8168,6 +8168,39 @@ bool TextureCache<P>::EarlyImageWritePending(ImageViewId id) noexcept {
 }
 
 template <class P>
+auto TextureCache<P>::ComputeSkipImageState(DAddr addr, u64 size) -> SkipImageState {
+    const u64 render_frame = RenderFrame();
+    const DAddr end = addr + size;
+    bool covered = false;
+    SkipImageState state = SkipImageState::Redrawn;
+    ForEachImageInRegion(addr, size, [&](ImageId, ImageBase& image) {
+        if (state != SkipImageState::Redrawn) {
+            return;
+        }
+        if (False(image.flags & ImageFlagBits::GpuModified) ||
+            True(image.flags & ImageFlagBits::CpuModified)) {
+            state = SkipImageState::NoGpuData;
+            return;
+        }
+        // Written in this frame and the 7 before, or in the last frame and the 7 before that.
+        const bool streak_now =
+            IsRedrawnTarget(image.last_write_frame, image.write_streak, render_frame);
+        const bool streak_before = render_frame != 0 &&
+                                   IsRedrawnTarget(image.last_write_frame, image.write_streak,
+                                                   render_frame - 1);
+        if (!streak_now && !streak_before) {
+            state = SkipImageState::NotRedrawn;
+            return;
+        }
+        covered = covered || (image.cpu_addr <= addr && end <= image.cpu_addr_end);
+    });
+    if (state == SkipImageState::Redrawn && !covered) {
+        return SkipImageState::NoImage;
+    }
+    return state;
+}
+
+template <class P>
 void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
     image.flags |= ImageFlagBits::GpuModified;
     CountGpuModified(image); // EXP100
