@@ -2854,7 +2854,9 @@ private:
             if (!lhs || !rhs) {
                 return std::nullopt;
             }
-            if (!rhs->IsConstant()) {
+            // A constant IdBound is an upper bound, not the value: x - (v & 0xff) is at most x, not
+            // x - 0xff. Only an immediate subtrahend is its own value (helper DT, 2026-11-19).
+            if (!rhs->IsConstant() || !inst.Arg(1).Resolve().IsImmediate()) {
                 Fail(ExtentUnknown::VariableProduct, &inst);
                 return std::nullopt;
             }
