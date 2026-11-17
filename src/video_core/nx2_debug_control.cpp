@@ -640,6 +640,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_ONEF_RAISE_AFTER_LEND") {
         return &g_onef_raise_after_lend;
     }
+    if (name == "FRITCHII_PACE_FIX") {
+        return &g_pace_fix;
+    }
     if (name == "FRITCHII_PROTECT_UNLOCKED") {
         return &Common::g_protect_unlocked;
     }
