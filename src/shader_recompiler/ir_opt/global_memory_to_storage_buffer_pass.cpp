@@ -10,6 +10,7 @@
 #include <map>
 #include <numeric>
 #include <optional>
+#include <span>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -1989,6 +1990,286 @@ private:
     std::optional<Dominance> dominance;
 };
 
+/// FRITCHII_EXTENT_GUARD: the branch conditions every path to a store passes, as path facts. An
+/// append list's store sits behind `if (index < capacity)` (or an early exit when it is not), so
+/// its index is bounded on the store's path although nothing bounds the index itself (an atomic's
+/// result). The facts come from the structured control flow's conditional edges (If: header to
+/// body when the condition holds, to the merge when not; Break and Repeat alike), each checked
+/// against the header's two successors. An edge H -> T gives its condition to a block S when T
+/// dominates S and every other predecessor of T is dominated by T (a loop's back edge): then
+/// every path to S entered T last from outside through H -> T, so the condition held when H
+/// evaluated it. The condition splits into atoms (any boolean instruction, with its value)
+/// through ConditionRef, LogicalNot, LogicalAnd (true) and LogicalOr (false).
+///
+/// Two uses, both exact for an invocation that runs the store:
+///  - a bound: `x < K` (unsigned) bounds x by K - 1 when x is defined in a block of no cycle (it
+///    has one value in the invocation, the one the branch compared) and K is bounded (an
+///    immediate, a constant buffer word, ...). Signed compares and `x + c < K` with c > 0 (it may
+///    wrap) refuse; `x - d < K` bounds x by K - 1 + d (a wrap makes the compare fail).
+///  - an edge never taken: a phi's incoming edge needs an atom with the other value than a path
+///    fact of the store. When that atom is invariant (defined in a block of no cycle, or a compare
+///    of such values, immediates and constant buffer words), it has one value in the invocation,
+///    so the store's path and that edge never meet in one invocation: the incoming is dropped
+///    (predicated moves into the store's address, `@!P mov; @!P st`).
+class GuardFacts {
+public:
+    /// A boolean instruction and the value it has on every path through an edge
+    struct Atom {
+        const IR::Inst* inst{};
+        bool value{};
+    };
+
+    explicit GuardFacts(const IR::Program& program) : dominance{program} {
+        const IR::AbstractSyntaxList& list{program.syntax_list};
+        for (size_t index = 0; index < list.size(); ++index) {
+            const IR::AbstractSyntaxNode& node{list[index]};
+            const IR::Block* const header{
+                index > 0 && list[index - 1].type == IR::AbstractSyntaxNode::Type::Block
+                    ? list[index - 1].data.block
+                    : nullptr};
+            switch (node.type) {
+            case IR::AbstractSyntaxNode::Type::If:
+                AddBranch(header, node.data.if_node.body, node.data.if_node.merge,
+                          node.data.if_node.cond);
+                break;
+            case IR::AbstractSyntaxNode::Type::Break:
+                AddBranch(header, node.data.break_node.merge, node.data.break_node.skip,
+                          node.data.break_node.cond);
+                break;
+            case IR::AbstractSyntaxNode::Type::Repeat:
+                AddBranch(header, node.data.repeat.loop_header, node.data.repeat.merge,
+                          node.data.repeat.cond);
+                break;
+            default:
+                break;
+            }
+        }
+        // Census: the values some branch compares (a guard that may not dominate a store)
+        std::vector<Atom> atoms;
+        for (const Edge& edge : edges) {
+            atoms.clear();
+            Implied(edge.cond, edge.value, atoms, 0);
+            for (const Atom& atom : atoms) {
+                for (size_t arg = 0; arg < 2 && arg < atom.inst->NumArgs(); ++arg) {
+                    const IR::Value operand{atom.inst->Arg(arg).Resolve()};
+                    if (operand.IsImmediate()) {
+                        continue;
+                    }
+                    const IR::Inst* const compared_inst{operand.InstRecursive()};
+                    compared.insert(compared_inst);
+                    const IR::Opcode opcode{compared_inst->GetOpcode()};
+                    if (opcode == IR::Opcode::IAdd32 || opcode == IR::Opcode::ISub32) {
+                        for (size_t term = 0; term < 2; ++term) {
+                            const IR::Value inner{compared_inst->Arg(term).Resolve()};
+                            if (!inner.IsImmediate()) {
+                                compared.insert(inner.InstRecursive());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The atoms every path to the store passed with their value
+    const std::vector<Atom>& FactsAt(const IR::Inst& store) {
+        static const std::vector<Atom> none;
+        const IR::Block* const block{dominance.BlockOf(&store)};
+        if (block == nullptr) {
+            return none;
+        }
+        const auto [it, inserted]{facts.try_emplace(block)};
+        if (inserted) {
+            for (const Edge& edge : edges) {
+                if (EdgeDominates(edge, block)) {
+                    Implied(edge.cond, edge.value, it->second, 0);
+                }
+            }
+        }
+        return it->second;
+    }
+
+    /// Whether the edge from -> to is never taken in an invocation that holds `path` (an atom it
+    /// needs is invariant and has the other value there)
+    bool Excluded(const IR::Block* from, const IR::Block* to, const std::vector<Atom>& path) {
+        if (path.empty()) {
+            return false;
+        }
+        std::vector<Atom> needed;
+        for (const Edge& edge : edges) {
+            if (edge.from != from || edge.to != to) {
+                continue;
+            }
+            needed.clear();
+            Implied(edge.cond, edge.value, needed, 0);
+            for (const Atom& atom : needed) {
+                for (const Atom& fact : path) {
+                    if (fact.inst == atom.inst && fact.value != atom.value &&
+                        Invariant(*atom.inst)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Whether an instruction may run more than once in an invocation (its block is on a cycle,
+    /// or not known)
+    bool InLoop(const IR::Inst& inst) {
+        const IR::Block* const block{dominance.BlockOf(&inst)};
+        return block == nullptr || InCycle(block);
+    }
+
+    /// Whether some branch of the program compares the value (FRITCHII_EXTENT_CENSUS)
+    bool Compared(const IR::Inst& inst) const {
+        return compared.contains(&inst);
+    }
+
+    const IR::Block* BlockOf(const IR::Inst& inst) const {
+        return dominance.BlockOf(&inst);
+    }
+
+private:
+    struct Edge {
+        const IR::Block* from{};
+        const IR::Block* to{};
+        IR::U1 cond;
+        bool value{};
+    };
+
+    /// A conditional branch of `header`: to on_true when cond holds, else to on_false
+    void AddBranch(const IR::Block* header, const IR::Block* on_true, const IR::Block* on_false,
+                   const IR::U1& cond) {
+        if (header == nullptr || on_true == nullptr || on_false == nullptr || on_true == on_false ||
+            cond.IsImmediate()) {
+            return;
+        }
+        const std::span<IR::Block* const> successors{header->ImmSuccessors()};
+        if (successors.size() != 2 || successors[0] != on_true || successors[1] != on_false) {
+            // Not the shape the structured control flow builds: no facts from it
+            return;
+        }
+        edges.push_back(Edge{.from = header, .to = on_true, .cond = cond, .value = true});
+        edges.push_back(Edge{.from = header, .to = on_false, .cond = cond, .value = false});
+    }
+
+    /// The atoms `cond` == `value` implies
+    static void Implied(const IR::Value& cond, bool value, std::vector<Atom>& out, u32 depth) {
+        const IR::Value resolved{cond.Resolve()};
+        if (resolved.IsImmediate() || depth > 16) {
+            return;
+        }
+        const IR::Inst* const inst{resolved.InstRecursive()};
+        switch (inst->GetOpcode()) {
+        case IR::Opcode::ConditionRef:
+            Implied(inst->Arg(0), value, out, depth + 1);
+            return;
+        case IR::Opcode::LogicalNot:
+            Implied(inst->Arg(0), !value, out, depth + 1);
+            return;
+        case IR::Opcode::LogicalAnd:
+            if (value) {
+                Implied(inst->Arg(0), true, out, depth + 1);
+                Implied(inst->Arg(1), true, out, depth + 1);
+            }
+            return;
+        case IR::Opcode::LogicalOr:
+            if (!value) {
+                Implied(inst->Arg(0), false, out, depth + 1);
+                Implied(inst->Arg(1), false, out, depth + 1);
+            }
+            return;
+        default:
+            out.push_back(Atom{.inst = inst, .value = value});
+            return;
+        }
+    }
+
+    /// Whether every path to `block` goes through the edge last when it enters edge.to
+    bool EdgeDominates(const Edge& edge, const IR::Block* block) const {
+        if (!dominance.BlockDominates(edge.to, block)) {
+            return false;
+        }
+        for (const IR::Block* const predecessor : edge.to->ImmPredecessors()) {
+            if (predecessor != edge.from && !dominance.BlockDominates(edge.to, predecessor)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Whether a path leads from the block back to itself
+    bool InCycle(const IR::Block* block) {
+        if (const auto it{cyclic.find(block)}; it != cyclic.end()) {
+            return it->second;
+        }
+        bool found{};
+        std::unordered_set<const IR::Block*> seen;
+        std::vector<const IR::Block*> stack(block->ImmSuccessors().begin(),
+                                            block->ImmSuccessors().end());
+        while (!stack.empty() && !found) {
+            const IR::Block* const current{stack.back()};
+            stack.pop_back();
+            if (current == block) {
+                found = true;
+                break;
+            }
+            if (!seen.insert(current).second) {
+                continue;
+            }
+            for (const IR::Block* const next : current->ImmSuccessors()) {
+                stack.push_back(next);
+            }
+        }
+        cyclic.emplace(block, found);
+        return found;
+    }
+
+    /// Whether a boolean has one value in an invocation
+    bool Invariant(const IR::Inst& atom) {
+        if (!InLoop(atom)) {
+            return true;
+        }
+        switch (atom.GetOpcode()) {
+        case IR::Opcode::SLessThan:
+        case IR::Opcode::ULessThan:
+        case IR::Opcode::IEqual:
+        case IR::Opcode::SLessThanEqual:
+        case IR::Opcode::ULessThanEqual:
+        case IR::Opcode::SGreaterThan:
+        case IR::Opcode::UGreaterThan:
+        case IR::Opcode::INotEqual:
+        case IR::Opcode::SGreaterThanEqual:
+        case IR::Opcode::UGreaterThanEqual:
+            break;
+        default:
+            return false;
+        }
+        // A compare in a loop of values that each have one value
+        for (size_t arg = 0; arg < atom.NumArgs(); ++arg) {
+            const IR::Value operand{atom.Arg(arg).Resolve()};
+            if (operand.IsImmediate()) {
+                continue;
+            }
+            const IR::Inst* const inst{operand.InstRecursive()};
+            if (CbufWord(inst)) {
+                continue;
+            }
+            if (InLoop(*inst)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    Dominance dominance;
+    std::vector<Edge> edges;
+    std::unordered_set<const IR::Inst*> compared;
+    std::unordered_map<const IR::Block*, std::vector<Atom>> facts;
+    std::unordered_map<const IR::Block*, bool> cyclic;
+};
+
 /// An upper bound of an unsigned 32-bit value for every invocation of a dispatch:
 /// c + sum(coef[i] * id[i]) over gl_LocalInvocationID.xyz (0-2) and gl_WorkGroupID.xyz (3-5),
 /// plus `base` times the storage buffer's pointer word. All coefficients are non-negative, so the
@@ -2026,11 +2307,28 @@ struct IdBound {
 /// (FRITCHII_EXTENT_CBUF) another constant buffer word read at an immediate offset is a term of
 /// the bound instead. With `shared` (FRITCHII_EXTENT_SHARED) a 32-bit load from a private shared
 /// memory slot is bounded by the values its invocation stored there (SharedSlots).
+///
+/// With `guards` (FRITCHII_EXTENT_GUARD, terms mode) also, each exact for an invocation that runs
+/// the store being analysed:
+///  - a value no rule bounds is bounded by the path facts of the store (GuardFacts: the store
+///    only runs when `x < K` held), and a phi drops the incoming edges such an invocation never
+///    takes;
+///  - a subgroup shuffle is bounded by its operand's bound at the workgroup's largest local ids
+///    (any lane of the workgroup may be the source; group ids and constant buffer words are the
+///    same in all of them). The operand is evaluated without the path facts: the source lane may
+///    not run the store. A shuffle from an inactive lane is undefined, as in the guest program
+///    (an append list broadcasts from the lane that did the atomic);
+///  - a bit count of a 32-bit value is at most 32;
+///  - word - v (also v negated plus word) is at most the constant buffer word when the word is at
+///    least v's largest value, a floor the dispatch checks at bind time (a clamp
+///    min(old, capacity - count)).
 class StoreExtentAnalysis {
 public:
     explicit StoreExtentAnalysis(StorageBufferAddr buffer_, const std::array<u32, 3>& workgroup_,
-                                 bool terms_ = false, SharedSlots* shared_ = nullptr)
-        : buffer{buffer_}, workgroup{workgroup_}, terms_mode{terms_}, shared{shared_} {}
+                                 bool terms_ = false, SharedSlots* shared_ = nullptr,
+                                 GuardFacts* guards_ = nullptr)
+        : buffer{buffer_}, workgroup{workgroup_}, terms_mode{terms_}, shared{shared_},
+          guards{guards_} {}
 
     /// FRITCHII_EXTENT_SHARED: whether a load from shared memory was followed to its stores
     bool Forwarded() const {
@@ -2040,7 +2338,8 @@ public:
     /// Extent of one access, merged into `extent`
     void AddAccess(IR::Inst& inst, StorageWriteExtent& extent) {
         const std::optional<StorageCbufExtent> store{StoreExtent(inst)};
-        if (!store || store->num_terms != 0 || store->num_guard_terms != 0) {
+        if (!store || store->num_terms != 0 || store->num_guard_terms != 0 ||
+            store->num_floors != 0) {
             extent = StorageWriteExtent{};
             return;
         }
@@ -2103,6 +2402,15 @@ private:
             Fail(ExtentUnknown::AddressNotTracked, &inst);
             return std::nullopt;
         }
+        if (guards != nullptr) {
+            // FRITCHII_EXTENT_GUARD: this store's path facts; results evaluated under another
+            // store's facts may not hold here
+            const std::vector<GuardFacts::Atom>* const now{&guards->FactsAt(inst)};
+            if (now != path_facts) {
+                memo.clear();
+                path_facts = now;
+            }
+        }
         const std::optional<IdBound> low{Evaluate(addr->value, 0)};
         if (!low) {
             return std::nullopt;
@@ -2121,6 +2429,13 @@ private:
             return std::nullopt;
         }
         StorageCbufExtent result{};
+        if (floors.size() > MaxExtentFloors) {
+            Fail(ExtentUnknown::TooLarge, &inst);
+            return std::nullopt;
+        }
+        for (const StorageExtentFloor& floor : floors) {
+            result.floors[result.num_floors++] = floor;
+        }
         result.ids = StorageWriteExtent{
             .bounded = true,
             .const_end = static_cast<u32>((std::max)(end, s64{0})),
@@ -2383,7 +2698,9 @@ private:
             return std::nullopt;
         }
         const IR::Inst* const inst{value.InstRecursive()};
-        if (const auto it{memo.find(inst)}; it != memo.end()) {
+        // FRITCHII_EXTENT_GUARD: results without the path facts hold under any of them
+        auto& results{guards != nullptr && facts_off ? memo_no_facts : memo};
+        if (const auto it{results.find(inst)}; it != results.end()) {
             if (!it->second.result) {
                 Fail(it->second.why);
             }
@@ -2398,13 +2715,23 @@ private:
         // but the instruction got past is dropped)
         const ExtentUnknownWhy outer{failure};
         failure = {};
-        const std::optional<IdBound> result{EvaluateInst(*inst, depth)};
+        std::optional<IdBound> result{EvaluateInst(*inst, depth)};
         ExtentUnknownWhy mine{};
         if (!result) {
             mine = failure.kind != ExtentUnknown::Unrecorded ? failure : Classify(*inst);
+            if (guards != nullptr && !facts_off) {
+                // FRITCHII_EXTENT_GUARD: a branch on the store's path may bound it
+                ExtentUnknownWhy refusal{};
+                result = PathBound(*inst, depth, refusal);
+                if (result) {
+                    mine = {};
+                } else if (refusal.kind != ExtentUnknown::Unrecorded) {
+                    mine = refusal;
+                }
+            }
         }
         active.erase(inst);
-        memo.emplace(inst, Memo{result, mine});
+        results.emplace(inst, Memo{result, mine});
         failure = outer;
         if (!result) {
             Fail(mine);
@@ -2500,11 +2827,28 @@ private:
             return result;
         }
         case IR::Opcode::IAdd32: {
+            if (guards != nullptr) {
+                // FRITCHII_EXTENT_GUARD: word + (-v) is word - v (a native IADD with a negated
+                // operand)
+                for (size_t side = 0; side < 2; ++side) {
+                    const IR::Value operand{inst.Arg(side).Resolve()};
+                    if (!operand.IsImmediate() &&
+                        operand.InstRecursive()->GetOpcode() == IR::Opcode::INeg32) {
+                        return Difference(inst, inst.Arg(1 - side),
+                                          operand.InstRecursive()->Arg(0), depth);
+                    }
+                }
+            }
             const auto lhs{arg(0)};
             const auto rhs{lhs ? arg(1) : std::nullopt};
             return lhs && rhs ? Sum(*lhs, *rhs) : std::nullopt;
         }
         case IR::Opcode::ISub32: {
+            if (guards != nullptr && !inst.Arg(1).Resolve().IsImmediate()) {
+                // FRITCHII_EXTENT_GUARD: a constant bound of the subtrahend (a bit count, a
+                // masked value) is not its value; x - v is bounded through the floor instead
+                return Difference(inst, inst.Arg(0), inst.Arg(1), depth);
+            }
             const auto lhs{arg(0)};
             const auto rhs{lhs ? arg(1) : std::nullopt};
             if (!lhs || !rhs) {
@@ -2626,8 +2970,17 @@ private:
             return lhs && rhs ? Max(*lhs, *rhs) : std::nullopt;
         }
         case IR::Opcode::Phi: {
+            // FRITCHII_EXTENT_GUARD: the incoming edges an invocation running the store never
+            // takes are left out
+            const IR::Block* const phi_block{
+                guards != nullptr && !facts_off && path_facts != nullptr ? guards->BlockOf(inst)
+                                                                         : nullptr};
             std::optional<IdBound> result;
             for (size_t index = 0; index < inst.NumArgs(); ++index) {
+                if (phi_block != nullptr &&
+                    guards->Excluded(inst.PhiBlock(index), phi_block, *path_facts)) {
+                    continue;
+                }
                 const auto incoming{arg(index)};
                 if (!incoming) {
                     return std::nullopt;
@@ -2663,9 +3016,251 @@ private:
             forwarded = true;
             return result;
         }
+        case IR::Opcode::ShuffleIndex:
+        case IR::Opcode::ShuffleUp:
+        case IR::Opcode::ShuffleDown:
+        case IR::Opcode::ShuffleButterfly: {
+            if (guards == nullptr) {
+                return std::nullopt;
+            }
+            // FRITCHII_EXTENT_GUARD: another lane's value. Its bound at the largest local ids
+            // covers every lane of the workgroup; the path facts are this invocation's only.
+            const bool was_off{facts_off};
+            facts_off = true;
+            const auto value{arg(0)};
+            facts_off = was_off;
+            if (!value || value->base != 0) {
+                return std::nullopt;
+            }
+            IdBound result{*value};
+            for (size_t i = 0; i < 3; ++i) {
+                if (result.coef[i] == 0) {
+                    continue;
+                }
+                if (workgroup[i] == 0) {
+                    return std::nullopt;
+                }
+                result.c += static_cast<s64>(result.coef[i] * (workgroup[i] - 1));
+                result.coef[i] = 0;
+            }
+            return Checked(result);
+        }
+        case IR::Opcode::BitCount32:
+            if (guards == nullptr) {
+                return std::nullopt;
+            }
+            // FRITCHII_EXTENT_GUARD: the set bits of a 32-bit value
+            return Constant(32);
         default:
             return std::nullopt;
         }
+    }
+
+    /// FRITCHII_EXTENT_GUARD: word - v is at most word while word >= v. v's largest value is
+    /// checked against an immediate here, and against a constant buffer word at bind time (a
+    /// floor of the extent).
+    std::optional<IdBound> Difference(const IR::Inst& inst, const IR::Value& word,
+                                      const IR::Value& subtracted, u32 depth) {
+        const std::optional<IdBound> amount{Evaluate(subtracted, depth + 1)};
+        if (!amount) {
+            return std::nullopt;
+        }
+        const std::optional<u64> largest{StaticMax(*amount)};
+        if (!largest || *largest > 0xffffffff) {
+            Fail(ExtentUnknown::VariableProduct, &inst);
+            return std::nullopt;
+        }
+        const IR::Value resolved{word.Resolve()};
+        if (resolved.IsImmediate()) {
+            if (resolved.Type() != IR::Type::U32 || *largest > resolved.U32()) {
+                Fail(ExtentUnknown::VariableProduct, &inst);
+                return std::nullopt;
+            }
+            return Constant(static_cast<s64>(resolved.U32()));
+        }
+        const std::optional<StorageBufferAddr> address{CbufWord(resolved.InstRecursive())};
+        if (!address || *address == buffer) {
+            Fail(ExtentUnknown::VariableProduct, &inst);
+            return std::nullopt;
+        }
+        const u32 min{static_cast<u32>(*largest)};
+        const auto existing{std::ranges::find_if(floors, [&](const StorageExtentFloor& floor) {
+            return floor.cbuf_index == address->index && floor.cbuf_offset == address->offset;
+        })};
+        if (existing != floors.end()) {
+            existing->min = (std::max)(existing->min, min);
+        } else {
+            // More than MaxExtentFloors fails the store (StoreExtentOf)
+            floors.push_back(StorageExtentFloor{
+                .cbuf_index = address->index, .cbuf_offset = address->offset, .min = min});
+        }
+        IdBound term{.num_terms = 1};
+        term.terms[0] = IdBound::Term{.index = address->index, .offset = address->offset, .coef = 1};
+        return term;
+    }
+
+    /// FRITCHII_EXTENT_GUARD: `small <= big - (strict ? 1 : 0)` as unsigned (or signed) values
+    struct Relation {
+        IR::Value small;
+        IR::Value big;
+        bool strict{};
+        bool is_signed{};
+    };
+
+    /// The relations a compare with a known value states
+    static void Relations(const GuardFacts::Atom& atom,
+                         boost::container::small_vector<Relation, 2>& out) {
+        const IR::Inst& compare{*atom.inst};
+        if (compare.NumArgs() != 2 || compare.Arg(0).Type() != IR::Type::U32 ||
+            compare.Arg(1).Type() != IR::Type::U32) {
+            return;
+        }
+        const IR::Value a{compare.Arg(0)};
+        const IR::Value b{compare.Arg(1)};
+        const bool holds{atom.value};
+        const auto add = [&](const IR::Value& small, const IR::Value& big, bool strict,
+                             bool is_signed) {
+            out.push_back(Relation{.small = small, .big = big, .strict = strict,
+                                   .is_signed = is_signed});
+        };
+        switch (compare.GetOpcode()) {
+        case IR::Opcode::ULessThan:
+        case IR::Opcode::SLessThan: {
+            const bool is_signed{compare.GetOpcode() == IR::Opcode::SLessThan};
+            holds ? add(a, b, true, is_signed) : add(b, a, false, is_signed);
+            return;
+        }
+        case IR::Opcode::ULessThanEqual:
+        case IR::Opcode::SLessThanEqual: {
+            const bool is_signed{compare.GetOpcode() == IR::Opcode::SLessThanEqual};
+            holds ? add(a, b, false, is_signed) : add(b, a, true, is_signed);
+            return;
+        }
+        case IR::Opcode::UGreaterThan:
+        case IR::Opcode::SGreaterThan: {
+            const bool is_signed{compare.GetOpcode() == IR::Opcode::SGreaterThan};
+            holds ? add(b, a, true, is_signed) : add(a, b, false, is_signed);
+            return;
+        }
+        case IR::Opcode::UGreaterThanEqual:
+        case IR::Opcode::SGreaterThanEqual: {
+            const bool is_signed{compare.GetOpcode() == IR::Opcode::SGreaterThanEqual};
+            holds ? add(b, a, false, is_signed) : add(a, b, true, is_signed);
+            return;
+        }
+        case IR::Opcode::IEqual:
+        case IR::Opcode::INotEqual:
+            if (holds == (compare.GetOpcode() == IR::Opcode::IEqual)) {
+                add(a, b, false, false);
+                add(b, a, false, false);
+            }
+            return;
+        default:
+            return;
+        }
+    }
+
+    /// FRITCHII_EXTENT_GUARD: a bound of `inst` from the store's path facts, or why none holds
+    std::optional<IdBound> PathBound(const IR::Inst& inst, u32 depth, ExtentUnknownWhy& refusal) {
+        if (path_facts == nullptr) {
+            return std::nullopt;
+        }
+        const ExtentUnknownWhy saved{failure};
+        const auto refuse = [&](ExtentUnknown kind, const IR::Inst& at) {
+            if (refusal.kind == ExtentUnknown::Unrecorded) {
+                refusal = ExtentUnknownWhy{.kind = kind,
+                                           .opcode = static_cast<u16>(at.GetOpcode())};
+            }
+        };
+        std::optional<IdBound> best;
+        boost::container::small_vector<Relation, 2> relations;
+        for (const GuardFacts::Atom& atom : *path_facts) {
+            relations.clear();
+            Relations(atom, relations);
+            for (const Relation& relation : relations) {
+                const IR::Value small{relation.small.Resolve()};
+                if (small.IsImmediate()) {
+                    continue;
+                }
+                // The compared value is inst, or inst - d (slack d): a wrap below zero makes it
+                // huge and fails the compare, so inst <= limit + d. inst + c (c > 0) or plus a
+                // variable may wrap past 2^32 and pass: no bound.
+                const IR::Inst* const compared{small.InstRecursive()};
+                s64 slack{};
+                if (compared != &inst) {
+                    const IR::Opcode opcode{compared->GetOpcode()};
+                    if (opcode != IR::Opcode::IAdd32 && opcode != IR::Opcode::ISub32) {
+                        continue;
+                    }
+                    const size_t sides{opcode == IR::Opcode::ISub32 ? 1U : 2U};
+                    size_t side{sides};
+                    for (size_t i = 0; i < sides; ++i) {
+                        const IR::Value operand{compared->Arg(i).Resolve()};
+                        if (!operand.IsImmediate() && operand.InstRecursive() == &inst) {
+                            side = i;
+                            break;
+                        }
+                    }
+                    if (side == sides) {
+                        continue;
+                    }
+                    const IR::Value other{compared->Arg(1 - side).Resolve()};
+                    if (!other.IsImmediate() || other.Type() != IR::Type::U32) {
+                        refuse(ExtentUnknown::GuardWraps, *compared);
+                        continue;
+                    }
+                    const u32 immediate{other.U32()};
+                    if (opcode == IR::Opcode::ISub32) {
+                        slack = static_cast<s64>(immediate);
+                    } else if (static_cast<s32>(immediate) <= 0) {
+                        slack = -static_cast<s64>(static_cast<s32>(immediate));
+                    } else {
+                        refuse(ExtentUnknown::GuardWraps, *compared);
+                        continue;
+                    }
+                }
+                if (relation.is_signed) {
+                    // A negative value passes a signed `x < K`
+                    refuse(ExtentUnknown::GuardSigned, *atom.inst);
+                    continue;
+                }
+                if (guards->InLoop(inst)) {
+                    // Another iteration's value may not be the one compared
+                    refuse(ExtentUnknown::GuardInLoop, inst);
+                    continue;
+                }
+                std::optional<IdBound> limit;
+                const IR::Value big{relation.big.Resolve()};
+                if (big.IsImmediate()) {
+                    if (big.Type() == IR::Type::U32) {
+                        limit = Constant(static_cast<s64>(big.U32()));
+                    }
+                } else {
+                    limit = Evaluate(big, depth + 1);
+                }
+                failure = saved;
+                if (!limit || limit->base != 0) {
+                    refuse(ExtentUnknown::GuardLimitUnknown,
+                           big.IsImmediate() ? *atom.inst : *big.InstRecursive());
+                    continue;
+                }
+                IdBound bound{*limit};
+                bound.c += slack - (relation.strict ? 1 : 0);
+                if (bound.IsConstant() && bound.c < 0) {
+                    // `x < 0`: the store never runs
+                    bound.c = 0;
+                }
+                const std::optional<IdBound> checked{Checked(bound)};
+                if (checked && (!best || (best->HasTerms() && !checked->HasTerms()))) {
+                    best = checked;
+                }
+            }
+        }
+        failure = saved;
+        if (!best && refusal.kind == ExtentUnknown::Unrecorded && guards->Compared(inst)) {
+            refuse(ExtentUnknown::GuardNotDominating, inst);
+        }
+        return best;
     }
 
     StorageBufferAddr buffer;
@@ -2680,6 +3275,14 @@ private:
     /// The current access' first exit, and the first failed access' (FRITCHII_EXTENT_CENSUS)
     ExtentUnknownWhy failure{};
     ExtentUnknownWhy why{};
+    /// FRITCHII_EXTENT_GUARD: the program's path facts, the current store's, whether they are
+    /// set aside (a shuffle's operand: another lane's value), the results evaluated without them
+    /// (kept across stores) and the words the bounds need at least a value in
+    GuardFacts* guards{};
+    const std::vector<GuardFacts::Atom>* path_facts{};
+    bool facts_off{};
+    std::unordered_map<const IR::Inst*, Memo> memo_no_facts;
+    std::vector<StorageExtentFloor> floors;
 };
 
 /// FRITCHII_STORE_FOOTPRINT: what is known of a 32-bit value as an exact congruence,
@@ -3283,6 +3886,9 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
     // FRITCHII_EXTENT_SHARED: why following offsets through shared memory slots failed (Known:
     // the cbuf extent is proven that way)
     std::map<StorageBufferAddr, ExtentUnknownWhy> shared_whys;
+    // FRITCHII_EXTENT_GUARD: why the path facts did not bound a buffer's stores (Known: the cbuf
+    // extent is proven that way)
+    std::map<StorageBufferAddr, ExtentUnknownWhy> guard_whys;
     if (!info.untracked_writes) {
         // FRITCHII_EXTENT_SHARED / FRITCHII_STORE_FOOTPRINT: the private shared memory slots,
         // proven on the first load the analyses follow
@@ -3390,6 +3996,49 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
                 }
             }
         }
+        // FRITCHII_EXTENT_GUARD: the buffers still unknown, again with the branch conditions on
+        // each store's path, subgroup broadcasts, bit counts and clamps (GuardFacts; its own
+        // analyses: the plain, cbuf and shared extents above stay exactly what they were; one
+        // proven this way is marked via_guard, which the switch gates)
+        std::optional<GuardFacts> guard_facts;
+        std::map<StorageBufferAddr, StoreExtentAnalysis> guard_analyses;
+        std::map<StorageBufferAddr, StorageCbufExtent> guard_extents;
+        for (const StorageInst& storage_inst : info.to_replace) {
+            if (!IsGlobalMemoryWrite(*storage_inst.inst) ||
+                info.unbounded_writes.contains(storage_inst.storage_buffer)) {
+                continue;
+            }
+            const auto cbuf{cbuf_extents.find(storage_inst.storage_buffer)};
+            if (cbuf == cbuf_extents.end() || cbuf->second.ids.bounded) {
+                continue;
+            }
+            if (!guard_facts) {
+                guard_facts.emplace(program);
+            }
+            auto analysis{guard_analyses.find(storage_inst.storage_buffer)};
+            if (analysis == guard_analyses.end()) {
+                analysis = guard_analyses
+                               .emplace(storage_inst.storage_buffer,
+                                        StoreExtentAnalysis{storage_inst.storage_buffer,
+                                                            program.workgroup_size, true, nullptr,
+                                                            &*guard_facts})
+                               .first;
+                guard_extents.emplace(storage_inst.storage_buffer,
+                                      StorageCbufExtent{.ids = StorageWriteExtent{.bounded = true}});
+            }
+            analysis->second.AddAccess(*storage_inst.inst,
+                                       guard_extents[storage_inst.storage_buffer]);
+        }
+        for (const auto& [storage_buffer, analysis] : guard_analyses) {
+            StorageCbufExtent& extent{guard_extents[storage_buffer]};
+            if (extent.ids.bounded) {
+                extent.via_guard = true;
+                cbuf_extents[storage_buffer] = extent;
+                guard_whys.emplace(storage_buffer, ExtentUnknownWhy{.kind = ExtentUnknown::Known});
+            } else {
+                guard_whys.emplace(storage_buffer, analysis.Why());
+            }
+        }
     }
     // Read extents of the loads and atomics. An access left global is routed by address at run
     // time into any bound buffer at any offset, so with one left no read extent is known.
@@ -3434,9 +4083,13 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
         StorageCbufExtent cbuf_extent{};
         StorageStoreFootprint footprint{};
         ExtentUnknownWhy shared_why{};
+        ExtentUnknownWhy guard_why{};
         if (is_written) {
             if (const auto why{shared_whys.find(storage_buffer)}; why != shared_whys.end()) {
                 shared_why = why->second;
+            }
+            if (const auto why{guard_whys.find(storage_buffer)}; why != guard_whys.end()) {
+                guard_why = why->second;
             }
             any_written = true;
             if (info.untracked_writes) {
@@ -3478,7 +4131,8 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
         extras.push_back({.write_unknown = write_unknown,
                           .cbuf_extent = cbuf_extent,
                           .footprint = footprint,
-                          .shared_why = shared_why});
+                          .shared_why = shared_why,
+                          .guard_why = guard_why});
         any_unknown |= is_written && write_unknown.kind != ExtentUnknown::Known;
     }
     if (any_unknown || any_written) {

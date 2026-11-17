@@ -364,6 +364,9 @@ inline std::atomic<int> g_extent_cbuf{-1};
 /// FRITCHII_EXTENT_SHARED (live, default 0; =3's read counts need it at boot): docs/fritchii/
 /// switches.md (buffer_cache.h, read_run_stats.h).
 inline std::atomic<int> g_extent_shared{-1};
+/// FRITCHII_EXTENT_GUARD (live, default 0; =3's read counts need it at boot): docs/fritchii/
+/// switches.md (buffer_cache.h, read_run_stats.h).
+inline std::atomic<int> g_extent_guard{-1};
 /// FRITCHII_STORE_FOOTPRINT (live 0/1/2/3 once armed: non-zero at boot; default 0): docs/fritchii/
 /// switches.md (store_footprint_live.h, buffer_cache.h).
 inline std::atomic<int> g_store_footprint_live{-1};

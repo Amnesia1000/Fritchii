@@ -82,6 +82,32 @@ public:
         return false;
     }
 
+    /// The block holding an instruction (nullptr: not known to it)
+    [[nodiscard]] const IR::Block* BlockOf(const IR::Inst* inst) const {
+        const auto it{blocks.find(inst)};
+        return it != blocks.end() ? it->second : nullptr;
+    }
+
+    /// Whether every path to `use` passes through `def` (a block dominates itself; false for a
+    /// block not known to it)
+    [[nodiscard]] bool BlockDominates(const IR::Block* def, const IR::Block* use) const {
+        const auto def_number{numbers.find(def)};
+        const auto use_number{numbers.find(use)};
+        if (def_number == numbers.end() || use_number == numbers.end()) {
+            return false;
+        }
+        const size_t target{def_number->second};
+        for (size_t number = use_number->second;;) {
+            if (number == target) {
+                return true;
+            }
+            if (idom[number] == NONE || idom[number] == number) {
+                return false;
+            }
+            number = idom[number];
+        }
+    }
+
 private:
     static constexpr size_t NONE{~size_t{0}};
     const IR::BlockList& order;

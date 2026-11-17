@@ -198,6 +198,10 @@ struct StorageWriteExtra {
     /// shared memory slots (cbuf_extent.via_shared), else why that try failed (Unrecorded: not
     /// tried, the plain or cbuf extent already held or no shared load was involved)
     ExtentUnknownWhy shared_why{};
+    /// FRITCHII_EXTENT_GUARD: Known when cbuf_extent was proven with the branch conditions on the
+    /// stores' paths (cbuf_extent.via_guard), else why that try failed (Unrecorded: not tried,
+    /// an earlier extent already held)
+    ExtentUnknownWhy guard_why{};
 };
 
 struct TextureBufferDescriptor {

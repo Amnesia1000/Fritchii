@@ -643,6 +643,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_EXTENT_SHARED") {
         return &g_extent_shared;
     }
+    if (name == "FRITCHII_EXTENT_GUARD") {
+        return &g_extent_guard;
+    }
     if (name == "FRITCHII_STORE_FOOTPRINT") {
         return &g_store_footprint_live;
     }

@@ -119,6 +119,13 @@ enum class ExtentUnknown : u8 {
     SharedNotPrivate,   ///< a shared write or atomic is not in its invocation's own slot (opcode)
     SharedPartialWrite, ///< another width's write or an atomic overlaps the loaded word (opcode)
     SharedNotDominated, ///< no store of the loaded word runs before the load on every path
+    // FRITCHII_EXTENT_GUARD (StorageWriteExtra::guard_why): why an index was not bounded by the
+    // branch conditions every path to its store passes
+    GuardNotDominating, ///< a branch compares the index, but the store is reachable around it
+    GuardSigned,        ///< the guard is a signed compare: the index may be negative (opcode)
+    GuardWraps,         ///< the guard is on the index plus a value that may wrap 32 bits (opcode)
+    GuardLimitUnknown,  ///< the guard's limit is not bounded (loaded from memory...) (opcode)
+    GuardInLoop,        ///< the guarded index is redefined in a loop (opcode)
 };
 
 struct ExtentUnknownWhy {
@@ -174,6 +181,16 @@ struct ExtentUnknownWhy {
         return "loaded shared word also written another way";
     case ExtentUnknown::SharedNotDominated:
         return "loaded shared word not stored before the load";
+    case ExtentUnknown::GuardNotDominating:
+        return "a branch compares the index but the store is reachable around it";
+    case ExtentUnknown::GuardSigned:
+        return "signed guard on a possibly negative index";
+    case ExtentUnknown::GuardWraps:
+        return "guard on the index plus a value that may wrap";
+    case ExtentUnknown::GuardLimitUnknown:
+        return "guard limit not bounded";
+    case ExtentUnknown::GuardInLoop:
+        return "guarded index redefined in a loop";
     }
     return "?";
 }
@@ -188,6 +205,18 @@ struct StorageExtentTerm {
 };
 inline constexpr size_t MaxExtentTerms = 4;
 
+/// FRITCHII_EXTENT_GUARD: a constant buffer word the bound needs to be at least `min` (an index
+/// clamped to word - count, which only holds while the subtraction does not wrap). Read at bind
+/// time like the terms; a smaller word leaves the extent unknown.
+struct StorageExtentFloor {
+    u32 cbuf_index{};
+    u32 cbuf_offset{};
+    u32 min{};
+
+    auto operator<=>(const StorageExtentFloor&) const = default;
+};
+inline constexpr size_t MaxExtentFloors = 4;
+
 /// FRITCHII_EXTENT_CBUF: a store extent whose offsets may also add constant buffer words (an
 /// object index read from a uniform times a stride). Every store ends at or below
 ///
@@ -200,6 +229,10 @@ inline constexpr size_t MaxExtentTerms = 4;
 /// FRITCHII_EXTENT_SHARED: via_shared marks an extent proven only by following offsets an
 /// invocation parked in its own shared memory slot to the values it stored there (the switch,
 /// not FRITCHII_EXTENT_CBUF, decides whether it is used).
+///
+/// FRITCHII_EXTENT_GUARD: via_guard marks an extent proven only with the branch conditions on the
+/// stores' paths (an append index under `if (index < capacity)`), subgroup broadcasts and bit
+/// counts, and floors (each word at least its min); the switch, not FRITCHII_EXTENT_CBUF, decides.
 struct StorageCbufExtent {
     StorageWriteExtent ids{};
     u8 num_terms{};
@@ -207,18 +240,29 @@ struct StorageCbufExtent {
     bool via_shared{};
     std::array<StorageExtentTerm, MaxExtentTerms> terms{};
     std::array<StorageExtentTerm, MaxExtentTerms> guard_terms{};
+    bool via_guard{};
+    u8 num_floors{};
+    std::array<StorageExtentFloor, MaxExtentFloors> floors{};
 
     auto operator<=>(const StorageCbufExtent&) const = default;
 };
 
 /// Bytes a dispatch's stores can reach past the pointer with the terms' word values (`values`
-/// for terms, `guard_values` for guard_terms, in order), or nullopt when unknown.
+/// for terms, `guard_values` for guard_terms, `floor_values` for floors, in order), or nullopt
+/// when unknown.
 [[nodiscard]] constexpr std::optional<u64> ResolveStorageCbufExtent(
     const StorageCbufExtent& extent, const std::array<u32, 3>& block,
     const std::optional<std::array<u32, 3>>& grid, const std::array<u32, MaxExtentTerms>& values,
-    const std::array<u32, MaxExtentTerms>& guard_values) {
+    const std::array<u32, MaxExtentTerms>& guard_values,
+    const std::array<u32, MaxExtentFloors>& floor_values = {}) {
     if (!extent.ids.bounded) {
         return std::nullopt;
+    }
+    for (size_t i = 0; i < extent.num_floors && i < MaxExtentFloors; ++i) {
+        // The clamp's subtraction would wrap: the index is not bounded by the word
+        if (floor_values[i] < extent.floors[i].min) {
+            return std::nullopt;
+        }
     }
     constexpr u64 limit = u64{1} << 62;
     if (extent.ids.guarded) {
@@ -324,6 +368,27 @@ constexpr void MergeStorageCbufExtent(StorageCbufExtent& base, const StorageCbuf
         return;
     }
     base.via_shared = base.via_shared || other.via_shared;
+    base.via_guard = base.via_guard || other.via_guard;
+    for (size_t i = 0; i < other.num_floors && i < MaxExtentFloors; ++i) {
+        // Every floor of either stays needed (the larger min for a word on both)
+        const StorageExtentFloor& floor = other.floors[i];
+        bool merged = false;
+        for (size_t j = 0; j < base.num_floors; ++j) {
+            if (base.floors[j].cbuf_index == floor.cbuf_index &&
+                base.floors[j].cbuf_offset == floor.cbuf_offset) {
+                base.floors[j].min = (std::max)(base.floors[j].min, floor.min);
+                merged = true;
+                break;
+            }
+        }
+        if (!merged) {
+            if (base.num_floors >= MaxExtentFloors) {
+                base = StorageCbufExtent{};
+                return;
+            }
+            base.floors[base.num_floors++] = floor;
+        }
+    }
     for (size_t i = 0; i < other.num_terms; ++i) {
         if (!MergeExtentTerm(base.terms, base.num_terms, other.terms[i])) {
             base = StorageCbufExtent{};

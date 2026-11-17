@@ -254,7 +254,7 @@ void BufferCache<P>::TickFrame() {
     if (DownloadReadStats::g_enabled && frame_tick % 600 == 0) [[unlikely]] {
         DownloadReadStats::Log();
     }
-    // FRITCHII_EXTENT_CENSUS / _CBUF / _SHARED: the 10 s lines (empty while all are off)
+    // FRITCHII_EXTENT_CENSUS / _CBUF / _SHARED / _GUARD: the 10 s lines (empty while all are off)
     if (!extent_census.empty()) [[unlikely]] {
         LogExtentCensus();
     }
@@ -2373,7 +2373,13 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
             // it, not FRITCHII_EXTENT_CBUF, decides about those.
             const int shared_switch = VideoCore::Nx2Debug::SwitchValue(
                 VideoCore::Nx2Debug::g_extent_shared, "FRITCHII_EXTENT_SHARED", 0);
-            const int cbuf_mode = cbuf_extent.via_shared ? shared_switch : cbuf_switch;
+            // FRITCHII_EXTENT_GUARD (live, default 0): the same for a cbuf extent proven with the
+            // branch conditions on the stores' paths (via_guard).
+            const int guard_switch = VideoCore::Nx2Debug::SwitchValue(
+                VideoCore::Nx2Debug::g_extent_guard, "FRITCHII_EXTENT_GUARD", 0);
+            const int cbuf_mode = cbuf_extent.via_guard    ? guard_switch
+                                  : cbuf_extent.via_shared ? shared_switch
+                                                           : cbuf_switch;
             FullMarkWhy full_why = FullMarkWhy::Analysis;
             if (!extent && write_extent.bounded) {
                 full_why = grid ? FullMarkWhy::GuardOrDims : FullMarkWhy::IndirectGrid;
@@ -2467,13 +2473,15 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
                 NoteBindFootprint(ssbo_index, binding, write_extent, extra, block, grid,
                                   read_pointer());
             }
-            if (census != 0 || cbuf_switch != 0 || shared_switch != 0) [[unlikely]] {
+            if (census != 0 || cbuf_switch != 0 || shared_switch != 0 || guard_switch != 0)
+                [[unlikely]] {
                 // Every native written binding (the census ranks them by read-back waits too)
                 NoteExtentCensus(static_cast<u32>(ssbo_index), binding, cbuf_index, cbuf_offset,
                                  mark, full_why, write_unknown, cbuf_extent, cbuf_outcome,
                                  cbuf_proven, cbuf_marks && mark < binding.size,
                                  !write_extent.bounded, extra != nullptr,
-                                 (extra != nullptr ? *extra : NoExtra).shared_why);
+                                 (extra != nullptr ? *extra : NoExtra).shared_why,
+                                 (extra != nullptr ? *extra : NoExtra).guard_why);
                 if (census != 0 &&
                     !ReadRunStats::g_wait_census.load(std::memory_order_relaxed)) {
                     ReadRunStats::g_wait_census.store(true, std::memory_order_relaxed);
@@ -2554,8 +2562,17 @@ std::optional<u64> BufferCache<P>::ResolveCbufExtent(const Shader::StorageCbufEx
             return std::nullopt;
         }
     }
-    const std::optional<u64> bytes =
-        Shader::ResolveStorageCbufExtent(extent, block, grid, values, guard_values);
+    // FRITCHII_EXTENT_GUARD: the words a clamp needs at least a value in, read the same way
+    std::array<u32, Shader::MaxExtentFloors> floor_values{};
+    for (size_t i = 0; i < extent.num_floors && i < Shader::MaxExtentFloors; ++i) {
+        const Shader::StorageExtentTerm word{.cbuf_index = extent.floors[i].cbuf_index,
+                                             .cbuf_offset = extent.floors[i].cbuf_offset};
+        if (!read_word(word, floor_values[i])) {
+            return std::nullopt;
+        }
+    }
+    const std::optional<u64> bytes = Shader::ResolveStorageCbufExtent(
+        extent, block, grid, values, guard_values, floor_values);
     outcome = bytes ? CbufOutcome::Resolved : CbufOutcome::Unresolved;
     return bytes;
 }
@@ -2698,13 +2715,15 @@ void BufferCache<P>::NoteExtentCensus(u32 ssbo_index, const Binding& binding, u3
                                       const Shader::StorageCbufExtent& cbuf_extent,
                                       CbufOutcome cbuf_outcome, u64 cbuf_proven,
                                       bool cbuf_marked, bool extent_unknown, bool has_extra,
-                                      const Shader::ExtentUnknownWhy& shared_why) {
+                                      const Shader::ExtentUnknownWhy& shared_why,
+                                      const Shader::ExtentUnknownWhy& guard_why) {
     if (extent_census.empty() && extent_census_frames == 0) {
         extent_census_start = std::chrono::steady_clock::now();
     }
     ExtentCensusEntry& entry = extent_census[{compute_shader_hash, ssbo_index}];
     entry.analysis = write_unknown;
     entry.shared_why = shared_why;
+    entry.guard_why = guard_why;
     entry.pointer_cbuf_index = cbuf_index;
     entry.pointer_cbuf_offset = cbuf_offset;
     entry.binding_bytes = binding.size;
@@ -2740,8 +2759,8 @@ void BufferCache<P>::NoteExtentCensus(u32 ssbo_index, const Binding& binding, u3
 
 template <class P>
 void BufferCache<P>::LogExtentCensus() {
-    // TickFrame, every frame while FRITCHII_EXTENT_CENSUS, FRITCHII_EXTENT_CBUF or
-    // FRITCHII_EXTENT_SHARED is on: the lines every 10 s.
+    // TickFrame, every frame while FRITCHII_EXTENT_CENSUS, FRITCHII_EXTENT_CBUF,
+    // FRITCHII_EXTENT_SHARED or FRITCHII_EXTENT_GUARD is on: the lines every 10 s.
     if (extent_census.empty()) {
         extent_census_frames = 0;
         return;
@@ -2758,6 +2777,17 @@ void BufferCache<P>::LogExtentCensus() {
                                                            "FRITCHII_EXTENT_CBUF", 0);
     const int shared_mode = VideoCore::Nx2Debug::SwitchValue(
         VideoCore::Nx2Debug::g_extent_shared, "FRITCHII_EXTENT_SHARED", 0);
+    const int guard_mode = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_extent_guard,
+                                                            "FRITCHII_EXTENT_GUARD", 0);
+    // Which switch decides about a cbuf extent: 0 FRITCHII_EXTENT_CBUF, 1 _SHARED (via_shared),
+    // 2 _GUARD (via_guard)
+    const auto proof_kind = [](const Shader::StorageCbufExtent& extent) -> size_t {
+        return extent.via_guard ? 2 : extent.via_shared ? 1 : 0;
+    };
+    static constexpr std::array<const char*, 3> proof_word{"cbuf", "shared", "guard"};
+    static constexpr std::array<const char*, 3> proof_switch{
+        "FRITCHII_EXTENT_CBUF", "FRITCHII_EXTENT_SHARED", "FRITCHII_EXTENT_GUARD"};
+    const std::array<int, 3> proof_mode{cbuf_mode, shared_mode, guard_mode};
     const double frames = static_cast<double>((std::max<u64>)(extent_census_frames, 1));
     const auto opcode_name = [](u16 opcode) {
         return std::string{Shader::IR::NameOf(static_cast<Shader::IR::Opcode>(opcode))};
@@ -2782,6 +2812,11 @@ void BufferCache<P>::LogExtentCensus() {
         case Shader::ExtentUnknown::SharedNotPrivate:
         case Shader::ExtentUnknown::SharedPartialWrite:
         case Shader::ExtentUnknown::SharedNotDominated:
+        case Shader::ExtentUnknown::GuardNotDominating:
+        case Shader::ExtentUnknown::GuardSigned:
+        case Shader::ExtentUnknown::GuardWraps:
+        case Shader::ExtentUnknown::GuardLimitUnknown:
+        case Shader::ExtentUnknown::GuardInLoop:
             if (why.opcode != 0) {
                 text += fmt::format(" ({})", opcode_name(why.opcode));
             }
@@ -2810,7 +2845,33 @@ void BufferCache<P>::LogExtentCensus() {
             }
             text += ")";
         }
+        if (extent.num_floors != 0) {
+            // FRITCHII_EXTENT_GUARD: the clamps' words, each at least its min at bind
+            text += text.empty() ? "(needs" : " (needs";
+            for (size_t i = 0; i < extent.num_floors; ++i) {
+                text += fmt::format("{} c{}[{:#x}] >= {:#x}", i == 0 ? "" : ",",
+                                    extent.floors[i].cbuf_index, extent.floors[i].cbuf_offset,
+                                    extent.floors[i].min);
+            }
+            text += ")";
+        }
         return text.empty() ? std::string{"no words (proven without them)"} : text;
+    };
+    // FRITCHII_EXTENT_GUARD: the extent proven with the stores' path facts, or why not
+    const auto guard_text = [&](const ExtentCensusEntry& entry) -> std::string {
+        if (entry.cbuf_extent.via_guard && entry.cbuf_extent.ids.bounded) {
+            const Shader::StorageWriteExtent& ids = entry.cbuf_extent.ids;
+            return fmt::format("end {:#x} + local {:#x}/{:#x}/{:#x} + group {:#x}/{:#x}/{:#x}{} + "
+                               "words: {}",
+                               ids.const_end, ids.local_stride[0], ids.local_stride[1],
+                               ids.local_stride[2], ids.group_stride[0], ids.group_stride[1],
+                               ids.group_stride[2], ids.guarded ? " (16-bit guard)" : "",
+                               terms_text(entry.cbuf_extent));
+        }
+        if (entry.guard_why.kind == Shader::ExtentUnknown::Unrecorded) {
+            return "not tried";
+        }
+        return "refused: " + why_text(entry.guard_why);
     };
     // FRITCHII_EXTENT_SHARED: the extent proven through shared memory slots, or why not
     const auto shared_text = [&](const ExtentCensusEntry& entry) -> std::string {
@@ -2886,7 +2947,7 @@ void BufferCache<P>::LogExtentCensus() {
                      "full-marked/s, {:.1f} MiB marked/s ({} KiB binding) | why unknown: {} | "
                      "full mark because: unknown {}, indirect grid {}, 16-bit guard or dims {}, "
                      "distrusted {}, checking new dims {}, proof covers the binding {} | cbuf "
-                     "extent: {} | shared extent: {}",
+                     "extent: {} | shared extent: {} | guard extent: {}",
                      rank, i + 1, n, key.first, key.second, entry.pointer_cbuf_index,
                      entry.pointer_cbuf_offset, waited != nullptr ? waited->reads : 0,
                      waited != nullptr ? static_cast<double>(waited->wait_ns) / 1e6 / frames : 0.0,
@@ -2900,9 +2961,10 @@ void BufferCache<P>::LogExtentCensus() {
                      w[static_cast<size_t>(FullMarkWhy::Distrusted)],
                      w[static_cast<size_t>(FullMarkWhy::Checking)],
                      w[static_cast<size_t>(FullMarkWhy::WholeBinding)],
-                     entry.cbuf_extent.via_shared ? std::string{"none (see shared extent)"}
-                                                  : terms_text(entry.cbuf_extent),
-                     shared_text(entry));
+                     entry.cbuf_extent.via_guard    ? std::string{"none (see guard extent)"}
+                     : entry.cbuf_extent.via_shared ? std::string{"none (see shared extent)"}
+                                                    : terms_text(entry.cbuf_extent),
+                     shared_text(entry), guard_text(entry));
         };
         // 1. The writers the guest waited for most, whatever they are (the ones that matter)
         std::vector<std::pair<const ReadRunStats::Writer*, const ReadRunStats::WaitStats*>>
@@ -2959,32 +3021,50 @@ void BufferCache<P>::LogExtentCensus() {
     }
     const bool cbuf_on = cbuf_mode == 1 || cbuf_mode == 3;
     const bool shared_on = shared_mode == 1 || shared_mode == 3;
-    if (cbuf_on || shared_on) {
+    const bool guard_on = guard_mode == 1 || guard_mode == 3;
+    if (cbuf_on || shared_on || guard_on) {
         // The dry read counts (=3: the read ring's marks carry the proof's end). The extents
-        // proven through shared memory slots (FRITCHII_EXTENT_SHARED) have their own lines.
+        // proven through shared memory slots (FRITCHII_EXTENT_SHARED) and with the stores' path
+        // facts (FRITCHII_EXTENT_GUARD) have their own lines.
         auto dry = ReadRunStats::TakeDry();
         std::vector<Entry> order;
-        size_t cbuf_entries = 0;
-        size_t shared_entries = 0;
+        std::array<size_t, 3> proof_entries{};
         for (const auto& [key, entry] : extent_census) {
             if (entry.cbuf_resolved + entry.cbuf_fallback + entry.cbuf_unresolved != 0) {
                 order.emplace_back(&key, &entry);
-                ++(entry.cbuf_extent.via_shared ? shared_entries : cbuf_entries);
+                ++proof_entries[proof_kind(entry.cbuf_extent)];
             }
         }
-        if ((cbuf_on && cbuf_entries == 0) || (shared_on && shared_entries == 0)) {
+        const size_t cbuf_entries = proof_entries[0];
+        const size_t shared_entries = proof_entries[1];
+        const size_t guard_entries = proof_entries[2];
+        if ((cbuf_on && cbuf_entries == 0) || (shared_on && shared_entries == 0) ||
+            (guard_on && guard_entries == 0)) {
             // Say so rather than stay silent: no binding had such an extent to try
             u64 unknown = 0;
             u64 no_extra = 0;
             u64 shared_refused = 0;
+            u64 guard_refused = 0;
+            const auto refused = [](const Shader::ExtentUnknownWhy& why) {
+                return why.kind != Shader::ExtentUnknown::Unrecorded &&
+                       why.kind != Shader::ExtentUnknown::Known;
+            };
             for (const auto& [key, entry] : extent_census) {
                 unknown += entry.unknown_dispatches;
                 no_extra += entry.no_extra_dispatches;
-                const auto kind = entry.shared_why.kind;
-                shared_refused += kind != Shader::ExtentUnknown::Unrecorded &&
-                                          kind != Shader::ExtentUnknown::Known
-                                      ? entry.dispatches
-                                      : 0;
+                shared_refused += refused(entry.shared_why) ? entry.dispatches : 0;
+                guard_refused += refused(entry.guard_why) ? entry.dispatches : 0;
+            }
+            if (guard_on && guard_entries == 0) {
+                LOG_INFO(HW_GPU,
+                         "Extent guard (FRITCHII_EXTENT_GUARD={}) last {:.1f} s: no native "
+                         "written binding had an extent proven with its stores' path facts; "
+                         "refused {:.0f} dispatches/s (the census' guard extent says why); "
+                         "extent unknown {:.0f} dispatches/s, {:.0f}/s of them with no reason "
+                         "recorded (run with EDEN_NX2_PRECOMPILED_FAST=0)",
+                         guard_mode, seconds, static_cast<double>(guard_refused) / seconds,
+                         static_cast<double>(unknown) / seconds,
+                         static_cast<double>(no_extra) / seconds);
             }
             if (cbuf_on && cbuf_entries == 0) {
                 LOG_INFO(HW_GPU,
@@ -3047,7 +3127,10 @@ void BufferCache<P>::LogExtentCensus() {
                     ? static_cast<double>(entry->cbuf_binding_bytes) / 1024.0 /
                           static_cast<double>(entry->cbuf_resolved)
                     : 0.0;
-            const bool via_shared = entry->cbuf_extent.via_shared;
+            const size_t kind = proof_kind(entry->cbuf_extent);
+            const std::string proof_text = kind == 2   ? guard_text(*entry)
+                                           : kind == 1 ? shared_text(*entry)
+                                                       : terms_text(entry->cbuf_extent);
             LOG_INFO(HW_GPU,
                      "Extent {} ({}={}) {}/{} last {:.1f} s: program {:016x} "
                      "binding {} | {} extent {} | dispatches/s: proof {:.1f}, fallback (word on "
@@ -3058,11 +3141,8 @@ void BufferCache<P>::LogExtentCensus() {
                      "writer {} / another writer {} ({:.2f} / {:.2f} ms a frame) | must be 0: "
                      "freed reads whose bytes changed at landing {} of {} compared (inside: {} of "
                      "{})",
-                     via_shared ? "shared" : "cbuf",
-                     via_shared ? "FRITCHII_EXTENT_SHARED" : "FRITCHII_EXTENT_CBUF",
-                     via_shared ? shared_mode : cbuf_mode, i + 1, shown, seconds, key->first,
-                     key->second, via_shared ? "shared" : "cbuf",
-                     via_shared ? shared_text(*entry) : terms_text(entry->cbuf_extent),
+                     proof_word[kind], proof_switch[kind], proof_mode[kind], i + 1, shown,
+                     seconds, key->first, key->second, proof_word[kind], proof_text,
                      static_cast<double>(entry->cbuf_resolved) / seconds,
                      static_cast<double>(entry->cbuf_fallback) / seconds,
                      static_cast<double>(entry->cbuf_unresolved) / seconds,
@@ -3072,7 +3152,7 @@ void BufferCache<P>::LogExtentCensus() {
                      ms_frame(DR::CoveredSame), ms_frame(DR::CoveredOther), d.freed_differed,
                      d.freed_compared, d.inside_differed, d.inside_compared);
             // The reads past the proof under an older mark: whose marks they would still wait
-            // for, and how long (timed with the write ticks: FRITCHII_EXTENT_SHARED=3 or
+            // for, and how long (timed with the write ticks: FRITCHII_EXTENT_SHARED=3, _GUARD=3 or
             // FRITCHII_READ_RUNS=2 at boot)
             u64 all_wait = 0;
             for (const u64 ns : d.wait_ns) {
@@ -3128,9 +3208,7 @@ void BufferCache<P>::LogExtentCensus() {
                      "frame instead of {:.2f} (freed reads as 0, covered reads until their cover "
                      "ran: timed {}, untimed {} kept as waited; the timed ones {:.2f} instead of "
                      "{:.2f}) | covered by {} writers: {}",
-                     via_shared ? "shared" : "cbuf",
-                     via_shared ? "FRITCHII_EXTENT_SHARED" : "FRITCHII_EXTENT_CBUF",
-                     via_shared ? shared_mode : cbuf_mode, i + 1, shown,
+                     proof_word[kind], proof_switch[kind], proof_mode[kind], i + 1, shown,
                      static_cast<double>(d.proof_wait_ns) / 1e6 / frames,
                      static_cast<double>(all_wait) / 1e6 / frames, d.covered_timed,
                      d.covered_untimed, static_cast<double>(timed_predicted) / 1e6 / frames,

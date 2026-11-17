@@ -572,3 +572,225 @@ TEST_CASE("A footprint reduces to its modulus' power-of-two part", "[shader][sto
     CHECK(Shader::StoreFootprintHits(reduced, 0x110 * 3 + 0x10, 4));
     CHECK_FALSE(Shader::StoreFootprintHits(reduced, 0x10c, 4));
 }
+
+namespace {
+/// FRITCHII_EXTENT_GUARD: a program of a header (entry), `if (cond) { body }` and a merge, as the
+/// structured control flow builds it
+struct BranchProgram : KernelProgram {
+    IR::Block body{pool};
+    IR::Block merge{pool};
+
+    /// Links the blocks once the header and the body are filled in
+    void Link(const IR::U1& cond) {
+        entry.AddBranch(&body);
+        entry.AddBranch(&merge);
+        body.AddBranch(&merge);
+        program.blocks = {&entry, &body, &merge};
+        program.post_order_blocks = {&merge, &body, &entry};
+        auto& list{program.syntax_list};
+        list.emplace_back().type = IR::AbstractSyntaxNode::Type::Block;
+        list.back().data.block = &entry;
+        auto& if_node{list.emplace_back()};
+        if_node.type = IR::AbstractSyntaxNode::Type::If;
+        if_node.data.if_node.cond = cond;
+        if_node.data.if_node.body = &body;
+        if_node.data.if_node.merge = &merge;
+        list.emplace_back().type = IR::AbstractSyntaxNode::Type::Block;
+        list.back().data.block = &body;
+        list.emplace_back().type = IR::AbstractSyntaxNode::Type::EndIf;
+        list.back().data.end_if.merge = &merge;
+        list.emplace_back().type = IR::AbstractSyntaxNode::Type::Block;
+        list.back().data.block = &merge;
+        list.emplace_back().type = IR::AbstractSyntaxNode::Type::Return;
+    }
+};
+
+/// A GPU append list's slot: the leader's atomic on the counter at c0[0x180] broadcast to the
+/// subgroup, plus the lane's place among the active lanes
+IR::U32 AppendIndex(IR::IREmitter& ir) {
+    const IR::U32 ballot{ir.SubgroupBallot(ir.Imm1(true))};
+    const IR::U32 old{ir.GlobalAtomicIAdd(Address(ir, 0x180, ir.Imm32(0)), ir.BitCount(ballot))};
+    const IR::U32 first{ir.ShuffleIndex(old, ir.Imm32(0), ir.Imm32(31), ir.Imm32(0))};
+    return ir.IAdd(first, ir.BitCount(ir.BitwiseAnd(ballot, ir.SubgroupLtMask())));
+}
+} // Anonymous namespace
+
+TEST_CASE("An append index under a capacity guard is bounded by the capacity",
+          "[shader][storage_extent]") {
+    // 5ea74e193837ae71's lists: `if (!(index >= cap)) store [list + index * 4]`, the capacity
+    // an immediate or a constant buffer word
+    const bool cbuf_cap = GENERATE(false, true);
+    BranchProgram fixture;
+    IR::IREmitter ir{fixture.entry};
+    const IR::U32 index{AppendIndex(ir)};
+    const IR::U32 cap{cbuf_cap ? Word(ir, 0x1a0) : ir.Imm32(0x400)};
+    const IR::U1 full{ir.IGreaterThanEqual(index, cap, false)};
+    const IR::U1 cond{ir.ConditionRef(ir.LogicalNot(full))};
+    IR::IREmitter body{fixture.body};
+    body.WriteGlobal32(Address(body, 0x170, body.ShiftLeftLogical(index, body.Imm32(2))),
+                       body.Imm32(0));
+    fixture.Link(cond);
+    const auto& descriptor{fixture.Run(0x170)};
+    REQUIRE(descriptor.is_written);
+    // The plain extent stays unknown (defaults and the precompiled cache unchanged)
+    CHECK_FALSE(descriptor.write_extent.bounded);
+    const Shader::StorageWriteExtra& extra{fixture.Extra(0x170)};
+    CHECK(extra.write_unknown.kind != Shader::ExtentUnknown::Known);
+    CHECK(extra.guard_why.kind == Shader::ExtentUnknown::Known);
+    const Shader::StorageCbufExtent& extent{extra.cbuf_extent};
+    REQUIRE(extent.ids.bounded);
+    CHECK(extent.via_guard);
+    CHECK_FALSE(extent.via_shared);
+    CHECK(extent.num_floors == 0);
+    CHECK(extent.ids.local_stride == std::array<u32, 3>{});
+    CHECK(extent.ids.group_stride == std::array<u32, 3>{});
+    const std::array<u32, Shader::MaxExtentTerms> none{};
+    if (cbuf_cap) {
+        // index <= c0[0x1a0] - 1: 4 * c0[0x1a0] bytes
+        REQUIRE(extent.num_terms == 1);
+        CHECK(extent.terms[0].cbuf_offset == 0x1a0);
+        CHECK(extent.terms[0].coef == 4);
+        CHECK(extent.ids.const_end == 0);
+        const std::array<u32, Shader::MaxExtentTerms> values{0x100, 0, 0, 0};
+        CHECK(Shader::ResolveStorageCbufExtent(extent, {64, 1, 1}, std::nullopt, values, none) ==
+              0x400);
+    } else {
+        CHECK(extent.num_terms == 0);
+        CHECK(extent.ids.const_end == 0x1000);
+        CHECK(Shader::ResolveStorageCbufExtent(extent, {64, 1, 1}, std::nullopt, none, none) ==
+              0x1000);
+    }
+}
+
+TEST_CASE("An append index clamped to the room left is bounded by the capacity word",
+          "[shader][storage_extent]") {
+    // a107e12b6771be48: old = min(atomic, c0[0x78] - count), broadcast, plus the lane's place;
+    // the subtraction as ISub or as a negated IADD operand
+    const bool negated = GENERATE(false, true);
+    KernelProgram fixture;
+    IR::IREmitter ir{fixture.entry};
+    const IR::U32 ballot{ir.SubgroupBallot(ir.Imm1(true))};
+    const IR::U32 count{ir.BitCount(ballot)};
+    const IR::U32 old{ir.GlobalAtomicIAdd(Address(ir, 0x180, ir.Imm32(0)), count)};
+    const IR::U32 room{negated ? IR::U32{ir.IAdd(IR::U32{ir.INeg(count)}, Word(ir, 0x78))}
+                               : IR::U32{ir.ISub(Word(ir, 0x78), count)}};
+    const IR::U32 first{
+        ir.ShuffleIndex(ir.UMin(old, room), ir.Imm32(0), ir.Imm32(31), ir.Imm32(0))};
+    const IR::U32 index{ir.IAdd(first, ir.BitCount(ir.BitwiseAnd(ballot, ir.SubgroupLtMask())))};
+    ir.WriteGlobal32(Address(ir, 0x170, ir.ShiftLeftLogical(index, ir.Imm32(2))), ir.Imm32(0));
+    CHECK_FALSE(fixture.Run(0x170).write_extent.bounded);
+    const Shader::StorageWriteExtra& extra{fixture.Extra(0x170)};
+    CHECK(extra.guard_why.kind == Shader::ExtentUnknown::Known);
+    const Shader::StorageCbufExtent& extent{extra.cbuf_extent};
+    REQUIRE(extent.ids.bounded);
+    CHECK(extent.via_guard);
+    // index <= c0[0x78] + 32 (a bit count): 4 * c0[0x78] + 0x84 bytes, while c0[0x78] >= 32
+    REQUIRE(extent.num_terms == 1);
+    CHECK(extent.terms[0].cbuf_offset == 0x78);
+    CHECK(extent.terms[0].coef == 4);
+    CHECK(extent.ids.const_end == 0x84);
+    REQUIRE(extent.num_floors == 1);
+    CHECK(extent.floors[0].cbuf_offset == 0x78);
+    CHECK(extent.floors[0].min == 32);
+    const std::array<u32, Shader::MaxExtentTerms> values{0x100, 0, 0, 0};
+    const std::array<u32, Shader::MaxExtentTerms> none{};
+    CHECK(Shader::ResolveStorageCbufExtent(extent, {64, 1, 1}, std::nullopt, values, none,
+                                           std::array<u32, Shader::MaxExtentFloors>{0x100}) ==
+          0x484);
+    // A capacity below the largest count: the clamp's subtraction may wrap
+    CHECK_FALSE(Shader::ResolveStorageCbufExtent(extent, {64, 1, 1}, std::nullopt, values, none,
+                                                 std::array<u32, Shader::MaxExtentFloors>{16}));
+}
+
+TEST_CASE("Predicated moves into a guarded store's address follow its guard",
+          "[shader][storage_extent]") {
+    // `@!P mov off, index * 4 + 0x60; @!P st [list + off]`: the phi before the store also takes
+    // off's old value (an unbounded one here) from the edge where P held, which an invocation
+    // storing under !P never takes
+    BranchProgram fixture;
+    IR::Block second_body{fixture.pool};
+    IR::Block second_merge{fixture.pool};
+    IR::IREmitter ir{fixture.entry};
+    const IR::U32 index{AppendIndex(ir)};
+    const IR::U32 stale{ir.LoadGlobal32(Address(ir, 0x190, ir.Imm32(0)))};
+    const IR::U1 full{ir.IGreaterThanEqual(index, ir.Imm32(0x400), false)};
+    const IR::U1 first_cond{ir.ConditionRef(ir.LogicalNot(full))};
+    IR::IREmitter body{fixture.body};
+    const IR::U32 moved{body.IAdd(body.ShiftLeftLogical(index, body.Imm32(2)), body.Imm32(0x60))};
+    // The first merge is the second branch's header
+    IR::Inst* const phi{&*fixture.merge.PrependNewInst(fixture.merge.begin(), IR::Opcode::Phi)};
+    phi->SetFlags(IR::Type::U32);
+    phi->AddPhiOperand(&fixture.entry, stale);
+    phi->AddPhiOperand(&fixture.body, moved);
+    IR::IREmitter header{fixture.merge};
+    const IR::U1 second_cond{header.ConditionRef(header.LogicalNot(full))};
+    IR::IREmitter store{second_body};
+    store.WriteGlobal32(Address(store, 0x170, IR::U32{IR::Value{phi}}), store.Imm32(0));
+    fixture.Link(first_cond);
+    fixture.merge.AddBranch(&second_body);
+    fixture.merge.AddBranch(&second_merge);
+    second_body.AddBranch(&second_merge);
+    fixture.program.blocks = {&fixture.entry, &fixture.body, &fixture.merge, &second_body,
+                              &second_merge};
+    fixture.program.post_order_blocks = {&second_merge, &second_body, &fixture.merge,
+                                         &fixture.body, &fixture.entry};
+    auto& list{fixture.program.syntax_list};
+    list.pop_back(); // the Return: the second branch follows
+    auto& if_node{list.emplace_back()};
+    if_node.type = IR::AbstractSyntaxNode::Type::If;
+    if_node.data.if_node.cond = second_cond;
+    if_node.data.if_node.body = &second_body;
+    if_node.data.if_node.merge = &second_merge;
+    list.emplace_back().type = IR::AbstractSyntaxNode::Type::Block;
+    list.back().data.block = &second_body;
+    list.emplace_back().type = IR::AbstractSyntaxNode::Type::EndIf;
+    list.back().data.end_if.merge = &second_merge;
+    list.emplace_back().type = IR::AbstractSyntaxNode::Type::Block;
+    list.back().data.block = &second_merge;
+    list.emplace_back().type = IR::AbstractSyntaxNode::Type::Return;
+    const Shader::StorageWriteExtra& extra{fixture.Extra(0x170)};
+    CHECK(extra.guard_why.kind == Shader::ExtentUnknown::Known);
+    const Shader::StorageCbufExtent& extent{extra.cbuf_extent};
+    REQUIRE(extent.ids.bounded);
+    CHECK(extent.via_guard);
+    CHECK(extent.num_terms == 0);
+    CHECK(extent.ids.const_end == 0x3ff * 4 + 0x60 + 4);
+}
+
+TEST_CASE("A guard that does not hold on the store's path bounds nothing",
+          "[shader][storage_extent]") {
+    // 0: the store after the merge, reachable around the guard; 1: a signed compare (a negative
+    // index passes it); 2: the guard on another value than the index
+    const int variant = GENERATE(0, 1, 2);
+    BranchProgram fixture;
+    IR::IREmitter ir{fixture.entry};
+    const IR::U32 index{AppendIndex(ir)};
+    IR::U1 inside{};
+    Shader::ExtentUnknown expected{};
+    switch (variant) {
+    case 0:
+        inside = ir.ILessThan(index, ir.Imm32(0x400), false);
+        expected = Shader::ExtentUnknown::GuardNotDominating;
+        break;
+    case 1:
+        inside = ir.ILessThan(index, ir.Imm32(0x400), true);
+        expected = Shader::ExtentUnknown::GuardSigned;
+        break;
+    default: {
+        const IR::U32 other{ir.GlobalAtomicIAdd(Address(ir, 0x180, ir.Imm32(4)), ir.Imm32(1))};
+        inside = ir.ILessThan(other, ir.Imm32(0x400), false);
+        expected = Shader::ExtentUnknown::AtomicResult;
+        break;
+    }
+    }
+    const IR::U1 cond{ir.ConditionRef(inside)};
+    IR::IREmitter store{variant == 0 ? fixture.merge : fixture.body};
+    store.WriteGlobal32(Address(store, 0x170, store.ShiftLeftLogical(index, store.Imm32(2))),
+                        store.Imm32(0));
+    fixture.Link(cond);
+    CHECK_FALSE(fixture.Run(0x170).write_extent.bounded);
+    const Shader::StorageWriteExtra& extra{fixture.Extra(0x170)};
+    CHECK_FALSE(extra.cbuf_extent.ids.bounded);
+    CHECK_FALSE(extra.cbuf_extent.via_guard);
+    CHECK(extra.guard_why.kind == expected);
+}
