@@ -408,6 +408,10 @@ public:
                 ++cb_stats.full;
             }
         }
+        // FRITCHII_CB_MERGE=1 (dry): what split this block from the previous one.
+        if (CbMergeOn()) [[unlikely]] {
+            NoteCbMergeGap(engine);
+        }
         SelectEngine(engine);
         const size_t head = verify ? 2 : 1;
         u64* const entry = Reserve(head + 1);
@@ -2705,6 +2709,44 @@ private:
     std::chrono::steady_clock::time_point cb_since{};
     CbFrontStats cb_reported{};
     u64 cb_reported_overflows{};
+    /// FRITCHII_CB_MERGE=1 (dry, helper DE): when a CbWords block opens, what sits in the ring
+    /// since the previous block's last word (NoteCbMergeGap). Front only, reset by ReportCbWords.
+    struct CbMergeFront {
+        u64 opens;     ///< blocks opened with a previous block on the same engine
+        u64 offset;    ///< only constant buffer offset writes between: one entry could hold both
+        u64 rebind;    ///< offset plus address or size writes between
+        u64 publish;   ///< nothing between (a publish or a sent-position read ended the block)
+        u64 blocked;   ///< anything else between
+        u64 gap_pairs; ///< offset/address/size writes in the joinable gaps
+    };
+    CbMergeFront cb_merge{};
+    /// The engine of the last CbWords block (the gap test needs the same engine).
+    Tegra::Engines::EngineInterface* cb_last_engine{};
+    /// The back's sampled timing for the same report (one writer, read relaxed): blocks by
+    /// size (1, 2, 3-4, 5+ words) and the Pairs entries that hold only constant buffer offset,
+    /// address or size writes, sampled 1 in 16, in time stamp counter ticks.
+    struct CbMergeBack {
+        std::array<std::atomic<u64>, 4> block_samples;
+        std::array<std::atomic<u64>, 4> block_ticks;
+        std::atomic<u64> gap_entries;
+        std::atomic<u64> gap_samples;
+        std::atomic<u64> gap_ticks;
+    };
+    alignas(128) CbMergeBack cb_merge_back{};
+    u32 cb_merge_sample_left{}; ///< back only
+    /// ReportCbWords' last time stamp counter and clock pair (ticks to ns) and back totals.
+    u64 cb_merge_ticks_at{};
+    std::chrono::steady_clock::time_point cb_merge_clock_at{};
+    std::array<u64, 4> cb_merge_last_samples{};
+    std::array<u64, 4> cb_merge_last_ticks{};
+    u64 cb_merge_last_gap_entries{};
+    u64 cb_merge_last_gap_samples{};
+    u64 cb_merge_last_gap_ticks{};
+    void NoteCbMergeGap(Tegra::Engines::EngineInterface* engine);
+    [[nodiscard]] static bool CbMergeOn() {
+        return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_cb_merge,
+                                                "FRITCHII_CB_MERGE") != 0;
+    }
     /// Held-back front work (SetPendingFlush).
     PendingFlush pending_flush{};
     void* pending_flush_argument{};

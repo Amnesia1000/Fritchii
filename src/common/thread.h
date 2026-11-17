@@ -160,14 +160,19 @@ enum class CensusThread : u32 { VulkanWorker, Fencing, Present, Count };
 /// FRITCHII_SIBLING_CENSUS=1 (boot, default 0; a dry counter, changes nothing): notes the logical
 /// processor the calling thread runs on (one call per unit of work). A flag test when off.
 void NoteCensusCpu(CensusThread who);
-/// FRITCHII_SIBLING_CENSUS=1: once a second (the Pulse thread), what ran on each pinned GPU
-/// thread's physical core besides that thread (ms/s) and where the noted threads ran. Empty when
-/// off or nothing is pinned.
-[[nodiscard]] std::string GpuCoreCensusText();
-/// FRITCHII_GPU_SIBLINGS_FREE (live, default 0): 1 = the calling thread keeps off the pinned GPU
-/// threads' cores (BackgroundWorkCpuMask); back to 0 = every CPU the process may use. `applied` is
-/// the caller's own record of what it applied (start with 0: nothing changes while the switch is
-/// 0). Called once per unit of work; one relaxed load when nothing changed.
+/// Once a second, on the Pulse thread. FRITCHII_GPU_SIBLINGS_FREE=2: every other thread of the
+/// process nobody placed (still on the whole process mask: driver threads, audio, VSync...) is
+/// kept off the pinned GPU threads' cores too; another value gives them their masks back.
+/// FRITCHII_SIBLING_CENSUS=1: returns what ran on each pinned GPU thread's physical core besides
+/// that thread (ms/s, DPC + interrupt time apart), this process's busiest threads allowed onto
+/// it by name, and where the noted threads ran. Empty when the census is off.
+[[nodiscard]] std::string GpuCoreTick();
+/// FRITCHII_GPU_SIBLINGS_FREE (live, default 0): 1 or 2 = the calling thread keeps off the pinned
+/// GPU threads' cores (BackgroundWorkCpuMask); back to 0 = every CPU the process may use. Refused
+/// (logged once, nothing changes) when that would leave fewer than MinAutoGuestProcessors + 2
+/// fast logical processors (6-core CPUs with SMT, 8 cores without SMT). `applied` is the caller's
+/// own record (start with 0: nothing changes while the switch is 0). Called once per unit of
+/// work; one relaxed load when nothing changed.
 void KeepOffGpuCores(int& applied);
 /// THREAD_PRIORITY_IDLE on Windows, ThreadPriority::Low elsewhere.
 void SetCurrentThreadIdlePriority();

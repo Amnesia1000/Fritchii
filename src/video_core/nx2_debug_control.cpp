@@ -562,6 +562,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_CB_WORDS_BLOCK") {
         return &g_cb_words_block;
     }
+    if (name == "FRITCHII_CB_MERGE") {
+        return &g_cb_merge;
+    }
     if (name == "FRITCHII_BANK_CENSUS") {
         return &g_bank_census;
     }
