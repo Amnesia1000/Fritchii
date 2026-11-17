@@ -112,6 +112,11 @@ inline bool ReadRunsValue(bool writer_ticks) {
     if (shared != nullptr && shared[0] == '3') {
         return true;
     }
+    // FRITCHII_EXTENT_GUARD=3: the same for the extents proven with the stores' path facts
+    const char* guard = std::getenv("FRITCHII_EXTENT_GUARD");
+    if (guard != nullptr && guard[0] == '3') {
+        return true;
+    }
     const char* value = std::getenv("FRITCHII_READ_RUNS");
     if (value == nullptr || value[0] == '\0' || value[0] == '0') {
         return false;

@@ -1180,7 +1180,8 @@ then the top 8 others by bytes marked in full ("Extent census marked i/n: ...").
 dispatches/s, F full-marked/s, M MiB marked/s (K KiB binding) | why unknown: <reason> | full mark
 because: unknown, indirect grid, 16-bit guard or dims, distrusted, checking new dims, proof covers
 the binding | cbuf extent: <terms or none> | shared extent: <FRITCHII_EXTENT_SHARED's proof, not
-tried or refused: reason>". Reasons: "index from a constant buffer word cI[0xO]" (which word),
+tried or refused: reason> | guard extent: <FRITCHII_EXTENT_GUARD's proof, not tried or refused:
+reason>". Reasons: "index from a constant buffer word cI[0xO]" (which word),
 "index loaded from memory (<opcode>)", "loop-carried index", "index from an atomic", "signed or
 64-bit math (<opcode>)", "variable times variable", "instruction not bounded (<opcode>)", "a store
 stays global", "pointer picked at run time", and the analysis' other exits by name. "cbuf extent"
@@ -1266,6 +1267,51 @@ is the newest mark still over the read's bytes once marks with a proof are cut a
 "would wait" ends the read's host wait when that mark's submission ran (an older tick of the same
 queue, timed on the reading thread before its own wait). With FRITCHII_EXTENT_CBUF=3 alone the
 covers are named but untimed unless FRITCHII_READ_RUNS=2 is on at boot.
+
+### FRITCHII_EXTENT_GUARD
+
+TEST, off by default (helper DT, 2026-11-17; design: helper_do_answer.md round 2, the 8 covering
+writers of the flower reads). Live for the marks; =3's read counts need it at boot (as
+FRITCHII_EXTENT_SHARED=3, write ticks included). GPU append lists (ballot, popc, the leader's
+atomic on a counter, a shuffle broadcasting the old count, index = old + the lane's place) store
+behind a capacity check (`if (index < cap) store [list + index * 4]`, or an early exit), so the
+index has no bound of its own ("index from an atomic", "instruction not bounded (ShuffleIndex)")
+and the dispatch marked the whole 16 MiB window. For written native buffers whose plain, cbuf and
+shared extents all stayed unknown, a fourth store analysis (terms mode, translation only, the
+other extents unchanged; GuardFacts in global_memory_to_storage_buffer_pass.cpp) adds:
+- path facts: the structured control flow's conditional edges (If, Break, Repeat, each checked
+  against its header's two successors). An edge H -> T holds for a store when T dominates the
+  store's block and every other predecessor of T is dominated by T, so every path to the store
+  entered T through H -> T and the condition held there. `x < K`, `x <= K`, `K > x`, `!(x >= K)`,
+  `x == K` (unsigned) bound x by K - 1 (or K) when x is defined outside every loop (one value per
+  invocation, the one compared) and K is bounded (an immediate, a constant buffer word read at
+  bind time, ...). `x - d < K` bounds x by K - 1 + d (a wrap makes the compare fail). Refused:
+  signed compares ("signed guard on a possibly negative index"), `x + c < K` with c > 0 or a
+  variable ("guard on the index plus a value that may wrap"), a limit loaded from memory ("guard
+  limit not bounded (LoadGlobal32)"), x defined in a loop ("guarded index redefined in a loop"),
+  a compare whose edge does not cover the store ("a branch compares the index but the store is
+  reachable around it");
+- phi pruning: a phi's incoming edge that needs an atom (a compare, ...) to have the other value
+  than one of the store's path facts is dropped when that atom has one value per invocation
+  (predicated `@!P mov` before `@!P st`: the old register value never reaches the store);
+- a subgroup shuffle is bounded by its operand's bound at the largest local ids (operand evaluated
+  without the path facts: the source lane may not run the store; a shuffle from an inactive lane
+  is undefined, as in the guest program); a bit count is at most 32;
+- clamps: word - v (also -v + word) is at most the constant buffer word while the word is at least
+  v's largest value (a floor, checked at bind: below it the extent is unknown), as in
+  min(atomic, capacity - count).
+The result is a cbuf extent flagged via_guard: this switch, not FRITCHII_EXTENT_CBUF, decides
+whether it is used. Not stored with the info: boot with EDEN_NX2_PRECOMPILED_FAST=0.
+- =3 dry, =1 live: as FRITCHII_EXTENT_SHARED (ExtentTrust checks for =1, must be 0: "Compute write
+  extent too small", "distrusted" in the census, "freed reads whose bytes changed at landing").
+Lines every 10 s per top program binding: "Extent guard (FRITCHII_EXTENT_GUARD=M) i/n last S s:
+program <hash> binding <ssbo> | guard extent end E + local X/Y/Z + group X/Y/Z + words: <terms>
+(needs cI[0xO] >= min) | ..." (the rest as the "Extent cbuf" line, then the "with the proof" line).
+With none to try: "Extent guard (...) last S s: no native written binding had an extent proven
+with its stores' path facts; refused R dispatches/s (the census' guard extent says why); ...".
+The census lines end in "| guard extent: <proof>", "not tried" or "refused: <reason>".
+Test block (nx2_switches.txt): EDEN_NX2_PRECOMPILED_FAST=0, FRITCHII_EXTENT_CENSUS=1,
+FRITCHII_EXTENT_SHARED=3, FRITCHII_EXTENT_GUARD=3 at boot (flower save, a few cuts).
 
 ### FRITCHII_STORE_FOOTPRINT
 
