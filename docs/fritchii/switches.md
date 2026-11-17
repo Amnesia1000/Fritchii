@@ -1255,6 +1255,17 @@ tried" or "refused: <reason>". 989e's expected proof: end 0x138 + local 0x140 + 
 0x5000 x grid_x - 8 bytes past the pointer (20 KiB a workgroup) instead of 16 MiB.
 Test block (nx2_switches.txt): EDEN_NX2_PRECOMPILED_FAST=0, FRITCHII_EXTENT_CENSUS=1,
 FRITCHII_EXTENT_SHARED=3 at boot (flower save, a few cuts), then live 0/1 with profile_toggle.
+=3 at boot also turns on the write marks' ticks (FRITCHII_READ_RUNS=2's, counter only: a read's
+host wait is split at older ticks, the total stays). For the reads past a proof but under an older
+mark, each such "Extent shared"/"Extent cbuf" line is followed by "Extent ... i/n with the proof:
+its reads would wait X ms a frame instead of Y (freed reads as 0, covered reads until their cover
+ran: timed T, untimed U kept as waited; the timed ones A instead of B) | covered by N writers:
+<kind> <program> binding <b>: R reads, W ms a frame, timed T would wait A ms a frame instead of B
+(why unknown: <census reason>, F full-marked/s, pointer cI[0xO])" for the top 4 covers. The cover
+is the newest mark still over the read's bytes once marks with a proof are cut at their proof;
+"would wait" ends the read's host wait when that mark's submission ran (an older tick of the same
+queue, timed on the reading thread before its own wait). With FRITCHII_EXTENT_CBUF=3 alone the
+covers are named but untimed unless FRITCHII_READ_RUNS=2 is on at boot.
 
 ### FRITCHII_STORE_FOOTPRINT
 

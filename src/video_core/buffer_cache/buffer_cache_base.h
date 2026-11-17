@@ -1761,21 +1761,40 @@ public:
                 return 0;
             }
             const u64 start = ReadRunStats::NowNs();
-            // FRITCHII_FEEDER_LANE (dry): first the feeder's D (and D with its upload on the lane),
-            // older ticks of the same queue, so the reader's whole wait is what it was.
+            // Older ticks of the same queue first, oldest first, so the reader's whole wait is
+            // what it was: FRITCHII_FEEDER_LANE (dry) the feeder's D (and D with its upload on
+            // the lane); FRITCHII_EXTENT_CBUF / _SHARED =3 the mark the proof leaves over the
+            // read's bytes (dry_cover).
+            struct Step {
+                u64 tick;
+                u64* ns;
+                bool* unsubmitted;
+            };
+            std::array<Step, 3> steps{};
+            size_t num_steps = 0;
+            bool cover_unsubmitted = false;
             if (EarlyCompute::g_lane && !side_tick && a.area_mark.lane.judged) [[unlikely]] {
-                const auto wait_for = [&](u64 tick, u64& ns) {
-                    if (tick == 0 || tick >= a.write_tick) {
-                        return;
-                    }
-                    if (!runtime.WaitTickIfSubmitted(tick)) {
-                        a.lane_unsubmitted = true;
-                        return;
-                    }
-                    ns = ReadRunStats::NowNs() - start;
-                };
-                wait_for(a.lane_copy_tick, a.lane_copy_ns);
-                wait_for(a.lane_tick, a.lane_ns);
+                steps[num_steps++] = {a.lane_copy_tick, &a.lane_copy_ns, &a.lane_unsubmitted};
+                steps[num_steps++] = {a.lane_tick, &a.lane_ns, &a.lane_unsubmitted};
+            }
+            if (!side_tick && a.dry_cover_found && a.dry_cover_tick != 0) [[unlikely]] {
+                steps[num_steps++] = {a.dry_cover_tick, &a.dry_cover_ns, &cover_unsubmitted};
+            }
+            std::sort(steps.begin(), steps.begin() + num_steps,
+                      [](const Step& lhs, const Step& rhs) { return lhs.tick < rhs.tick; });
+            for (size_t i = 0; i < num_steps; ++i) {
+                const Step& step = steps[i];
+                if (step.tick == 0 || step.tick >= a.write_tick) {
+                    continue;
+                }
+                if (!runtime.WaitTickIfSubmitted(step.tick)) {
+                    *step.unsubmitted = true;
+                    continue;
+                }
+                *step.ns = ReadRunStats::NowNs() - start;
+                if (step.ns == &a.dry_cover_ns) {
+                    a.dry_cover_timed = true;
+                }
             }
             if (!runtime.WaitTickIfSubmitted(side_tick ? *side_tick : a.write_tick)) {
                 return 0;
@@ -1783,6 +1802,12 @@ public:
             a.cut = true;
             a.writer_wait_ns = ReadRunStats::NowNs() - start;
             a.cut_tick = side_tick ? *side_tick : a.write_tick;
+            // The cover in the area mark's submission (or later: not before it): it ran with it
+            if (!side_tick && a.dry_cover_found && a.dry_cover_tick >= a.write_tick &&
+                !cover_unsubmitted) [[unlikely]] {
+                a.dry_cover_ns = a.writer_wait_ns;
+                a.dry_cover_timed = true;
+            }
             return a.writer_wait_ns;
         }
         return 0;

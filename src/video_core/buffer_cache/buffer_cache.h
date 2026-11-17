@@ -602,6 +602,12 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
                     writer.write_tick = ticks.write;
                     writer.read_tick = ticks.current;
                     writer.known_tick = ticks.known;
+                    // FRITCHII_EXTENT_CBUF / _SHARED =3: the tick of the mark the proof leaves
+                    // over the read's bytes (WaitReadWriter times it)
+                    if (writer.dry_cover_found && writer.dry_cover.stamp != 0) [[unlikely]] {
+                        writer.dry_cover_tick =
+                            runtime.ReadWriterTicks(writer.dry_cover.stamp).write;
+                    }
                     // FRITCHII_FEEDER_LANE: the writing feeder's D as ticks (0: nothing unrun)
                     const EarlyCompute::Lane& lane = writer.area_mark.lane;
                     if (EarlyCompute::g_lane && lane.judged) [[unlikely]] {
@@ -3065,6 +3071,71 @@ void BufferCache<P>::LogExtentCensus() {
                      ms_frame(DR::Freed), reads(DR::CoveredSame), reads(DR::CoveredOther),
                      ms_frame(DR::CoveredSame), ms_frame(DR::CoveredOther), d.freed_differed,
                      d.freed_compared, d.inside_differed, d.inside_compared);
+            // The reads past the proof under an older mark: whose marks they would still wait
+            // for, and how long (timed with the write ticks: FRITCHII_EXTENT_SHARED=3 or
+            // FRITCHII_READ_RUNS=2 at boot)
+            u64 all_wait = 0;
+            for (const u64 ns : d.wait_ns) {
+                all_wait += ns;
+            }
+            u64 timed_wait = 0;
+            u64 timed_predicted = 0;
+            std::vector<std::pair<const ReadRunStats::Writer*, const ReadRunStats::DryStats::Cover*>>
+                covers;
+            for (const auto& [writer, cover] : d.covers) {
+                covers.emplace_back(&writer, &cover);
+                timed_wait += cover.timed_wait_ns;
+                timed_predicted += cover.predicted_ns;
+            }
+            constexpr size_t TopCovers = 4;
+            const size_t covers_shown = (std::min)(TopCovers, covers.size());
+            std::partial_sort(covers.begin(),
+                              covers.begin() + static_cast<std::ptrdiff_t>(covers_shown),
+                              covers.end(), [](const auto& a, const auto& b) {
+                                  return a.second->wait_ns > b.second->wait_ns;
+                              });
+            std::string covered_by;
+            for (size_t c = 0; c < covers_shown; ++c) {
+                const ReadRunStats::Writer& writer = *covers[c].first;
+                const ReadRunStats::DryStats::Cover& cover = *covers[c].second;
+                std::string why = "not in the census (not a bare native written binding)";
+                if (writer.kind == ReadRunStats::WriterKind::ComputeStorage) {
+                    if (const auto it = extent_census.find({writer.program, writer.binding});
+                        it != extent_census.end()) {
+                        why = fmt::format("{}, {:.1f} full-marked/s, pointer c{}[{:#x}]",
+                                          why_text(it->second.analysis),
+                                          static_cast<double>(it->second.full_dispatches) /
+                                              seconds,
+                                          it->second.pointer_cbuf_index,
+                                          it->second.pointer_cbuf_offset);
+                    }
+                }
+                const bool draw = writer.kind == ReadRunStats::WriterKind::DrawStorage ||
+                                  writer.kind == ReadRunStats::WriterKind::DrawTexture;
+                covered_by += fmt::format(
+                    "{}{} {:016x} {} {}: {} reads, {:.2f} ms a frame, timed {} would wait {:.2f} "
+                    "ms a frame instead of {:.2f} (why unknown: {})",
+                    c == 0 ? "" : "; ", ReadRunStats::WriterKindName(writer.kind),
+                    writer.program, draw ? "stage/binding" : "binding",
+                    draw ? fmt::format("{}/{}", writer.binding / 64, writer.binding % 64)
+                         : fmt::format("{}", writer.binding),
+                    cover.reads, static_cast<double>(cover.wait_ns) / 1e6 / frames, cover.timed,
+                    static_cast<double>(cover.predicted_ns) / 1e6 / frames,
+                    static_cast<double>(cover.timed_wait_ns) / 1e6 / frames, why);
+            }
+            LOG_INFO(HW_GPU,
+                     "Extent {} ({}={}) {}/{} with the proof: its reads would wait {:.2f} ms a "
+                     "frame instead of {:.2f} (freed reads as 0, covered reads until their cover "
+                     "ran: timed {}, untimed {} kept as waited; the timed ones {:.2f} instead of "
+                     "{:.2f}) | covered by {} writers: {}",
+                     via_shared ? "shared" : "cbuf",
+                     via_shared ? "FRITCHII_EXTENT_SHARED" : "FRITCHII_EXTENT_CBUF",
+                     via_shared ? shared_mode : cbuf_mode, i + 1, shown,
+                     static_cast<double>(d.proof_wait_ns) / 1e6 / frames,
+                     static_cast<double>(all_wait) / 1e6 / frames, d.covered_timed,
+                     d.covered_untimed, static_cast<double>(timed_predicted) / 1e6 / frames,
+                     static_cast<double>(timed_wait) / 1e6 / frames, covers.size(),
+                     covered_by.empty() ? std::string{"none"} : covered_by);
         }
     }
     extent_census.clear();
