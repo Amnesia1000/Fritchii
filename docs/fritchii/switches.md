@@ -382,6 +382,22 @@ scales. Check: an AMD tester at 1.5x enters Castle Town with the switch at 1.
   device's limit of L (FRITCHII_SCALED_EXTENT_CAP)" (HW_GPU, Info), once per image. At 1.5x/2x on
   AMD, expect it once for the 12288x12288 D16 sun shadow map.
 
+### FRITCHII_SCALE_DEPTH_MAX
+
+On by default (helper DA, 2026-11-17), value 8192; 0 = as before (the A/B and kill switch). Live,
+read whenever a render target set is checked for scaling. A depth/stencil image (any format that
+is not a colour format) whose scaled width or height would pass N stays at native size, on the
+same path as FRITCHII_SCALED_EXTENT_CAP (that pass's render target set stays native, the rest of
+the frame scales). Why: OoT's 12288x12288 D16 sun shadow map (288 MiB, made on every Castle Town
+load) costs 648 MiB at 1.5x and 1.15 GiB at 2x on NVIDIA, where the extent cap (32768) lets it
+scale, and 450 MiB at 1.25x on AMD; a shadow map that size gains nothing visible from scaling.
+Only scales that enlarge images are affected: at 1x and the downscales nothing changes. Main
+scene depth (1920x1080 or 2560x1440 native) stays far under 8192 up to 3x.
+- Log: "Depth image WxH (format F, N samples) stays at native size: scaled it would be ..., past
+  N (FRITCHII_SCALE_DEPTH_MAX, k so far)" (HW_GPU, Info), first 16 images; then "Scale depth max
+  (FRITCHII_SCALE_DEPTH_MAX=N): x depth images kept at native size in the last 10 s, y this
+  session" at most every 10 s while new ones appear.
+
 ### FRITCHII_OOT_BYPASS_SAMPLED
 
 TEST, off by default (helper BH, 2026-11-16, port of zortos293/Lichii #1875 by zortos293). Live;
