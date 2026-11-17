@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <deque>
+#include <set>
 #include <memory>
 #include <numeric>
 #include <stdexcept>
@@ -2295,11 +2296,16 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
                     cbuf_dry_proven[ssbo_index] = static_cast<u32>(cbuf_proven);
                 }
             }
-            if ((census != 0 || cbuf_outcome != CbufOutcome::None) &&
-                (mark >= binding.size || cbuf_outcome != CbufOutcome::None)) [[unlikely]] {
+            if (census != 0 || cbuf_mode != 0) [[unlikely]] {
+                // Every native written binding (the census ranks them by read-back waits too)
                 NoteExtentCensus(static_cast<u32>(ssbo_index), binding, cbuf_index, cbuf_offset,
                                  mark, full_why, write_unknown, cbuf_extent, cbuf_outcome,
-                                 cbuf_proven, cbuf_marks && mark < binding.size);
+                                 cbuf_proven, cbuf_marks && mark < binding.size,
+                                 !write_extent.bounded, extra != nullptr);
+                if (census != 0 &&
+                    !ReadRunStats::g_wait_census.load(std::memory_order_relaxed)) {
+                    ReadRunStats::g_wait_census.store(true, std::memory_order_relaxed);
+                }
             }
             break;
         }
@@ -2366,7 +2372,7 @@ void BufferCache<P>::NoteExtentCensus(u32 ssbo_index, const Binding& binding, u3
                                       const Shader::ExtentUnknownWhy& write_unknown,
                                       const Shader::StorageCbufExtent& cbuf_extent,
                                       CbufOutcome cbuf_outcome, u64 cbuf_proven,
-                                      bool cbuf_marked) {
+                                      bool cbuf_marked, bool extent_unknown, bool has_extra) {
     if (extent_census.empty() && extent_census_frames == 0) {
         extent_census_start = std::chrono::steady_clock::now();
     }
@@ -2376,6 +2382,12 @@ void BufferCache<P>::NoteExtentCensus(u32 ssbo_index, const Binding& binding, u3
     entry.pointer_cbuf_offset = cbuf_offset;
     entry.binding_bytes = binding.size;
     entry.cbuf_extent = cbuf_extent;
+    ++entry.dispatches;
+    entry.marked_bytes += (std::min<u64>)(mark, binding.size);
+    if (extent_unknown) {
+        ++entry.unknown_dispatches;
+        entry.no_extra_dispatches += has_extra ? 0 : 1;
+    }
     if (mark >= binding.size) {
         ++entry.full_dispatches;
         entry.full_bytes += binding.size;
@@ -2470,20 +2482,120 @@ void BufferCache<P>::LogExtentCensus() {
     };
     using Entry = std::pair<const std::pair<u64, u32>*, const ExtentCensusEntry*>;
     constexpr size_t Top = 8;
-    if (census != 0) {
-        std::vector<Entry> order;
+    if (census == 0) {
+        ReadRunStats::g_wait_census.store(false, std::memory_order_relaxed);
+    } else {
+        // Read-back waits by writer (the read ring: FRITCHII_EXTENT_CENSUS or
+        // FRITCHII_EXTENT_CBUF=3 at boot, or FRITCHII_READ_RUNS)
+        const auto waits = ReadRunStats::TakeWaits();
+        const auto wait_of =
+            [&](const std::pair<u64, u32>& key) -> const ReadRunStats::WaitStats* {
+            const ReadRunStats::Writer writer{.program = key.first,
+                                              .binding = key.second,
+                                              .kind = ReadRunStats::WriterKind::ComputeStorage};
+            const auto it = waits.find(writer);
+            return it != waits.end() ? &it->second : nullptr;
+        };
         u64 dispatches = 0;
-        u64 bytes = 0;
-        u64 unrecorded = 0;
+        u64 full_dispatches = 0;
+        u64 full_bytes = 0;
+        u64 unknown = 0;
+        u64 no_extra = 0;
+        u64 full_bindings = 0;
         for (const auto& [key, entry] : extent_census) {
-            if (entry.full_dispatches == 0) {
-                continue;
+            dispatches += entry.dispatches;
+            full_dispatches += entry.full_dispatches;
+            full_bytes += entry.full_bytes;
+            unknown += entry.unknown_dispatches;
+            no_extra += entry.no_extra_dispatches;
+            full_bindings += entry.full_dispatches != 0 ? 1 : 0;
+        }
+        u64 wait_ns = 0;
+        for (const auto& [writer, stats] : waits) {
+            wait_ns += stats.wait_ns;
+        }
+        LOG_INFO(HW_GPU,
+                 "Extent census (FRITCHII_EXTENT_CENSUS) last {:.1f} s: {:.0f} native written "
+                 "bindings a second, {:.0f} of them marked in full ({:.0f} MiB/s) over {} program "
+                 "bindings; extent unknown {:.0f}/s, {:.0f}/s of those with no reason recorded "
+                 "(must be 0 with EDEN_NX2_PRECOMPILED_FAST=0) | read-back waits {:.2f} ms a frame "
+                 "over {} writers{}",
+                 seconds, static_cast<double>(dispatches) / seconds,
+                 static_cast<double>(full_dispatches) / seconds,
+                 static_cast<double>(full_bytes) / 1048576.0 / seconds, full_bindings,
+                 static_cast<double>(unknown) / seconds, static_cast<double>(no_extra) / seconds,
+                 static_cast<double>(wait_ns) / 1e6 / frames, waits.size(),
+                 ReadRunStats::g_enabled ? ""
+                                         : " (read ring off: FRITCHII_EXTENT_CENSUS at boot)");
+        const auto log_entry = [&](const char* rank, size_t i, size_t n,
+                                   const std::pair<u64, u32>& key,
+                                   const ExtentCensusEntry& entry) {
+            const ReadRunStats::WaitStats* waited = wait_of(key);
+            const auto& w = entry.whys;
+            LOG_INFO(HW_GPU,
+                     "Extent census {} {}/{}: program {:016x} binding {} (pointer c{}[{:#x}]) | "
+                     "read-back {} reads, {:.2f} ms a frame | {:.1f} dispatches/s, {:.1f} "
+                     "full-marked/s, {:.1f} MiB marked/s ({} KiB binding) | why unknown: {} | "
+                     "full mark because: unknown {}, indirect grid {}, 16-bit guard or dims {}, "
+                     "distrusted {}, checking new dims {}, proof covers the binding {} | cbuf "
+                     "extent: {}",
+                     rank, i + 1, n, key.first, key.second, entry.pointer_cbuf_index,
+                     entry.pointer_cbuf_offset, waited != nullptr ? waited->reads : 0,
+                     waited != nullptr ? static_cast<double>(waited->wait_ns) / 1e6 / frames : 0.0,
+                     static_cast<double>(entry.dispatches) / seconds,
+                     static_cast<double>(entry.full_dispatches) / seconds,
+                     static_cast<double>(entry.marked_bytes) / 1048576.0 / seconds,
+                     entry.binding_bytes >> 10, why_text(entry.analysis),
+                     w[static_cast<size_t>(FullMarkWhy::Analysis)],
+                     w[static_cast<size_t>(FullMarkWhy::IndirectGrid)],
+                     w[static_cast<size_t>(FullMarkWhy::GuardOrDims)],
+                     w[static_cast<size_t>(FullMarkWhy::Distrusted)],
+                     w[static_cast<size_t>(FullMarkWhy::Checking)],
+                     w[static_cast<size_t>(FullMarkWhy::WholeBinding)],
+                     terms_text(entry.cbuf_extent));
+        };
+        // 1. The writers the guest waited for most, whatever they are (the ones that matter)
+        std::vector<std::pair<const ReadRunStats::Writer*, const ReadRunStats::WaitStats*>>
+            by_wait;
+        for (const auto& [writer, stats] : waits) {
+            by_wait.emplace_back(&writer, &stats);
+        }
+        const size_t wait_shown = (std::min)(Top, by_wait.size());
+        std::partial_sort(by_wait.begin(),
+                          by_wait.begin() + static_cast<std::ptrdiff_t>(wait_shown), by_wait.end(),
+                          [](const auto& a, const auto& b) {
+                              return a.second->wait_ns > b.second->wait_ns;
+                          });
+        std::set<std::pair<u64, u32>> shown_keys;
+        for (size_t i = 0; i < wait_shown; ++i) {
+            const ReadRunStats::Writer& writer = *by_wait[i].first;
+            const ReadRunStats::WaitStats& stats = *by_wait[i].second;
+            const std::pair<u64, u32> key{writer.program, writer.binding};
+            if (writer.kind == ReadRunStats::WriterKind::ComputeStorage) {
+                if (const auto it = extent_census.find(key); it != extent_census.end()) {
+                    log_entry("read-back", i, wait_shown, key, it->second);
+                    shown_keys.insert(key);
+                    continue;
+                }
             }
-            order.emplace_back(&key, &entry);
-            dispatches += entry.full_dispatches;
-            bytes += entry.full_bytes;
-            if (entry.analysis.kind == Shader::ExtentUnknown::Unrecorded) {
-                unrecorded += entry.full_dispatches;
+            const bool draw = writer.kind == ReadRunStats::WriterKind::DrawStorage ||
+                              writer.kind == ReadRunStats::WriterKind::DrawTexture;
+            LOG_INFO(HW_GPU,
+                     "Extent census read-back {}/{}: {} program {:016x} {} {} | read-back {} "
+                     "reads, {:.2f} ms a frame | no bare native written binding of it bound in "
+                     "this window (a sized buffer, a texture buffer, a draw or a copy): no store "
+                     "extent applies",
+                     i + 1, wait_shown, ReadRunStats::WriterKindName(writer.kind), writer.program,
+                     draw ? "stage/binding" : "binding",
+                     draw ? fmt::format("{}/{}", writer.binding / 64, writer.binding % 64)
+                          : fmt::format("{}", writer.binding),
+                     stats.reads, static_cast<double>(stats.wait_ns) / 1e6 / frames);
+        }
+        // 2. The bindings marked in full the most, not shown above
+        std::vector<Entry> order;
+        for (const auto& [key, entry] : extent_census) {
+            if (entry.full_dispatches != 0 && !shown_keys.contains(key)) {
+                order.emplace_back(&key, &entry);
             }
         }
         const size_t shown = (std::min)(Top, order.size());
@@ -2491,34 +2603,8 @@ void BufferCache<P>::LogExtentCensus() {
                           order.end(), [](const Entry& a, const Entry& b) {
                               return a.second->full_bytes > b.second->full_bytes;
                           });
-        LOG_INFO(HW_GPU,
-                 "Extent census (FRITCHII_EXTENT_CENSUS) last {:.1f} s: {:.0f} native written "
-                 "bindings marked in full a second ({:.0f} MiB/s) over {} program bindings; {} "
-                 "of those dispatches have no reason recorded (infos from the precompiled cache: "
-                 "boot with EDEN_NX2_PRECOMPILED_FAST=0)",
-                 seconds, static_cast<double>(dispatches) / seconds,
-                 static_cast<double>(bytes) / 1048576.0 / seconds, order.size(), unrecorded);
         for (size_t i = 0; i < shown; ++i) {
-            const auto& [key, entry] = order[i];
-            const auto& w = entry->whys;
-            LOG_INFO(HW_GPU,
-                     "Extent census {}/{}: program {:016x} binding {} (pointer c{}[{:#x}]) | "
-                     "{:.1f} full-marked dispatches/s, {:.1f} MiB marked/s ({} KiB each) | why "
-                     "unknown: {} | full mark because: unknown {}, indirect grid {}, 16-bit "
-                     "guard or dims {}, distrusted {}, checking new dims {}, proof covers the "
-                     "binding {} | cbuf extent: {}",
-                     i + 1, shown, key->first, key->second, entry->pointer_cbuf_index,
-                     entry->pointer_cbuf_offset,
-                     static_cast<double>(entry->full_dispatches) / seconds,
-                     static_cast<double>(entry->full_bytes) / 1048576.0 / seconds,
-                     entry->binding_bytes >> 10, why_text(entry->analysis),
-                     w[static_cast<size_t>(FullMarkWhy::Analysis)],
-                     w[static_cast<size_t>(FullMarkWhy::IndirectGrid)],
-                     w[static_cast<size_t>(FullMarkWhy::GuardOrDims)],
-                     w[static_cast<size_t>(FullMarkWhy::Distrusted)],
-                     w[static_cast<size_t>(FullMarkWhy::Checking)],
-                     w[static_cast<size_t>(FullMarkWhy::WholeBinding)],
-                     terms_text(entry->cbuf_extent));
+            log_entry("marked", i, shown, *order[i].first, *order[i].second);
         }
     }
     if (cbuf_mode == 1 || cbuf_mode == 3) {
@@ -2529,6 +2615,21 @@ void BufferCache<P>::LogExtentCensus() {
             if (entry.cbuf_resolved + entry.cbuf_fallback + entry.cbuf_unresolved != 0) {
                 order.emplace_back(&key, &entry);
             }
+        }
+        if (order.empty()) {
+            // Say so rather than stay silent: no binding had a cbuf extent to try
+            u64 unknown = 0;
+            u64 no_extra = 0;
+            for (const auto& [key, entry] : extent_census) {
+                unknown += entry.unknown_dispatches;
+                no_extra += entry.no_extra_dispatches;
+            }
+            LOG_INFO(HW_GPU,
+                     "Extent cbuf (FRITCHII_EXTENT_CBUF={}) last {:.1f} s: no native written "
+                     "binding had a cbuf extent; extent unknown {:.0f} dispatches/s, {:.0f}/s of "
+                     "them with no reason recorded (no Shader::StorageWriteExtra)",
+                     cbuf_mode, seconds, static_cast<double>(unknown) / seconds,
+                     static_cast<double>(no_extra) / seconds);
         }
         const auto dry_of = [&](const std::pair<u64, u32>& key) -> const ReadRunStats::DryStats* {
             const ReadRunStats::Writer writer{.program = key.first,
