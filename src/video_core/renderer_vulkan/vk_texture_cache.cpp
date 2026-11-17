@@ -32,6 +32,7 @@
 
 #include "video_core/fsr.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
+#include "video_core/memory_stage_link.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_profile.h"
@@ -2931,16 +2932,28 @@ std::string TextureCacheRuntime::VramOwnersText(u64 texture_image_bytes, u64 del
     // Kept blocks (FRITCHII_KEEP_BLOCKS) are memory VMA gave back that is kept from the driver.
     const u64 kept = device.KeptBlockBytes();
     const u64 held = blocks + kept;
+    // Where the unused space in the blocks lies, per allocator and pool (a walk of every block,
+    // every 10 s). The buffer allocator only on its user's thread (memory stage spec 5.3).
+    std::string slack = "main allocator " + VramSlackText(device, device.GetAllocator(),
+                                                          static_cast<u32>(heap));
+    if (device.HasSplitAllocators()) {
+        slack += VideoCommon::MemoryStageLink::IsCacheUser()
+                     ? "; buffer allocator " +
+                           VramSlackText(device, device.GetBufferAllocator(),
+                                         static_cast<u32>(heap))
+                     : std::string{"; buffer allocator not walked (the memory stage holds it)"};
+    }
     return fmt::format(
         "main heap {} of {} MiB budget ({} MiB heap): texture cache images {} MiB, deleted images "
         "still allocated {} MiB, image pool {} MiB, frees in flight {} MiB, buffers and the rest "
         "{} MiB (buffer allocator {} MiB in {} allocations), unused space in allocator blocks {} "
         "MiB, kept blocks {} MiB, outside the allocators {} MiB (the driver's: pipelines, "
-        "descriptors, swapchain, its own); staging pool {} MiB (any heap)",
+        "descriptors, swapchain, its own); staging pool {} MiB (any heap); block slack by pool: "
+        "{}",
         usage >> 20, budget >> 20, size >> 20, texture_image_bytes >> 20, deleted_bytes >> 20,
         pool >> 20, frees >> 20, rest >> 20, buffers.allocationBytes >> 20,
         buffers.allocationCount, (blocks - (std::min)(blocks, allocated)) >> 20, kept >> 20,
-        (usage - (std::min)(usage, held)) >> 20, staging >> 20);
+        (usage - (std::min)(usage, held)) >> 20, staging >> 20, slack);
 }
 
 bool TextureCacheRuntime::CanDownloadMsaa(const VideoCommon::ImageInfo& info) const {
@@ -3288,6 +3301,59 @@ void TextureCacheRuntime::SampleVramReport() {
     vram_report_seen_failed = failed;
 }
 
+void TextureCacheRuntime::TickVramTrim() {
+    // FRITCHII_VRAM_TRIM (live, default 1 = auto: 90 with the small card profile on, else off;
+    // 0 off; 2-100 = percent of the budget, on any card): every 60 frames, while the main heap's
+    // usage is at or above that share of its budget, each allocator gives back the empty block
+    // VMA keeps in each block vector (each memory type's default blocks and the depth, colour,
+    // sparse and buffer pools: up to 32-64 MiB each). VMA frees them by itself only once the
+    // usage passed the budget, when Windows may already be moving memory to system RAM. The
+    // memory held nothing; the cost is a driver allocation if that vector needs a block again.
+    if (vram_trim_frames++ % 60 != 0) {
+        return;
+    }
+    const int value = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_vram_trim,
+                                                       "FRITCHII_VRAM_TRIM", 1);
+    u64 percent = 0;
+    if (value == 1) {
+        percent = VideoCore::SmallCard::Active() ? 90 : 0;
+    } else if (value >= 2) {
+        percent = (std::min)(static_cast<u64>(value), u64{100});
+    }
+    if (percent == 0) {
+        return;
+    }
+    u64 usage{};
+    u64 budget{};
+    if (!device.MainHeapUsage(usage, budget) || budget == 0 || usage * 100 < budget * percent) {
+        return;
+    }
+    const u32 heap = static_cast<u32>(device.GetMainHeap());
+    const u64 main = TrimEmptyBlocks(device, device.GetAllocator(), heap);
+    u64 buffers = 0;
+    // The buffer allocator only on its user's thread (memory stage spec 5.3); at
+    // FRITCHII_MEMSTAGE_THREAD=1 it is trimmed when the back holds it at this point.
+    if (device.HasSplitAllocators() && VideoCommon::MemoryStageLink::IsCacheUser()) {
+        buffers = TrimEmptyBlocks(device, device.GetBufferAllocator(), heap);
+    }
+    if (main + buffers == 0) {
+        return;
+    }
+    ++vram_trim_events;
+    vram_trim_bytes += main + buffers;
+    const auto now = std::chrono::steady_clock::now();
+    if (vram_trim_events > 8 && now - vram_trim_logged < std::chrono::seconds{10}) {
+        return;
+    }
+    vram_trim_logged = now;
+    LOG_INFO(Render_Vulkan,
+             "VRAM trim (FRITCHII_VRAM_TRIM at {}% of the budget): main heap {} of {} MiB, gave "
+             "back {} MiB of empty blocks (main allocator {} MiB, buffer allocator {} MiB); "
+             "session {} MiB in {} trims",
+             percent, usage >> 20, budget >> 20, (main + buffers) >> 20, main >> 20,
+             buffers >> 20, vram_trim_bytes >> 20, vram_trim_events);
+}
+
 void TextureCacheRuntime::DropPooledImage(vk::Image image, u64 bytes) {
     // EDEN_NX2_EXP99 (live, 0 = off; fable52_answer_chicken 1): an evicted pool image is
     // destroyed on the image free thread instead of here, on the GPU back thread at the frame's
@@ -3505,6 +3571,7 @@ void TextureCacheRuntime::TickFrame() {
             small_pool_cap = budget != 0 ? (std::max)(budget / 16, u64{256} << 20) : ~u64{0};
         }
         SampleVramReport();
+        TickVramTrim();
         const int pool_switch = VideoCore::Nx2Debug::Experiment(42);
         if (pool_switch == 0 || short_of_memory) {
             TrimImagePool(0);

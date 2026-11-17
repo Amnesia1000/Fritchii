@@ -275,6 +275,10 @@ inline std::atomic<int> g_vram_headroom_mib{-1};
 inline std::atomic<int> g_tc_critical_enforce{-1};
 /// FRITCHII_VRAM_OWNERS: docs/fritchii/switches.md (seconds between lines, 0 = off).
 inline std::atomic<int> g_vram_owners{-1};
+/// FRITCHII_VRAM_PACK: docs/fritchii/switches.md (0 off, 1 on, 2 auto = with the small card).
+inline std::atomic<int> g_vram_pack{-1};
+/// FRITCHII_VRAM_TRIM: docs/fritchii/switches.md (0 off, 1 auto, 2-100 percent of the budget).
+inline std::atomic<int> g_vram_trim{-1};
 /// FRITCHII_E2C_ON_E: docs/fritchii/switches.md.
 inline std::atomic<int> g_e2c_on_e{-1};
 /// FRITCHII_STAMP_READ_PAGES: docs/fritchii/switches.md.
