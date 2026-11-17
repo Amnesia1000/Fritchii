@@ -13,6 +13,7 @@
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include <boost/container/flat_set.hpp>
 #include <boost/container/small_vector.hpp>
@@ -25,6 +26,7 @@
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
 #include "shader_recompiler/frontend/ir/value.h"
 #include "shader_recompiler/host_translate_info.h"
+#include "shader_recompiler/ir_opt/dominance.h"
 #include "shader_recompiler/ir_opt/passes.h"
 #include "shader_recompiler/storage_write_extent.h"
 
@@ -1552,6 +1554,441 @@ bool IsGlobalMemoryRead(const IR::Inst& inst) {
     }
 }
 
+/// FRITCHII_EXTENT_SHARED: whether a compute program keeps one private shared memory slot per
+/// invocation, and which stores a load of a slot word reads back. A program can park values it
+/// computed (a record offset made from its ids) in shared memory and load them again later; the
+/// store analyses follow such a load to the values stored when
+///
+///  - every shared write and atomic of the program has an exact address
+///      c.x * tid.x + c.y * tid.y + c.z * tid.z + k
+///    (tid = gl_LocalInvocationID; ExactLocal: no 32-bit wrap anywhere for any invocation) with
+///    the same coefficients c, all non-negative multiples of 4, and those slots never overlap:
+///    with each access widened to whole 32-bit words (the backend may write a byte or a half as
+///    its word) and `span` the bytes from the lowest to the highest one, the dimensions of more
+///    than one invocation sorted by coefficient each step past everything the smaller ones reach:
+///      c1 >= span, c2 >= c1 * (w1 - 1) + span, c3 >= c1 * (w1 - 1) + c2 * (w2 - 1) + span
+///    and the last byte stays inside the program's shared memory. Then only the invocation itself
+///    writes its slot's bytes (no barrier is needed: an invocation sees its own writes in order);
+///  - the load has the same coefficients and reads one whole word that only 32-bit writes of
+///    exactly that word write, and one of them runs before the load on every path to it.
+///
+/// The loaded value is then the newest of those stores' values on the invocation's own path, so
+/// a bound or congruence of each of the stored values (every dynamic instance of each) holds for
+/// it. Anything else follows nothing.
+class SharedSlots {
+public:
+    explicit SharedSlots(const IR::Program& program_) : program{program_} {}
+
+    struct Forward {
+        /// Known when the load reads back `stores`, else why not
+        ExtentUnknownWhy why{};
+        boost::container::small_vector<const IR::Inst*, 4> stores;
+    };
+
+    /// Whether the program loads a 32-bit shared word (the only load followed)
+    bool AnyLoad() {
+        if (!scanned) {
+            Scan();
+        }
+        return any_load;
+    }
+
+    /// The stores a LoadSharedU32 reads back, or why they are not known
+    Forward Resolve(const IR::Inst& load) {
+        if (!scanned) {
+            Scan();
+        }
+        Forward result;
+        if (proof.kind != ExtentUnknown::Known) {
+            result.why = proof;
+            return result;
+        }
+        const auto fail = [&](ExtentUnknown kind, const IR::Inst& at) {
+            result.why = ExtentUnknownWhy{.kind = kind,
+                                          .opcode = static_cast<u16>(at.GetOpcode())};
+            result.stores.clear();
+            return result;
+        };
+        const std::optional<Affine> address{ExactLocal(load.Arg(0), 0)};
+        if (!address || address->c != coefficients) {
+            // Not its own slot (or not exact): another invocation's bytes need a barrier
+            return fail(ExtentUnknown::SharedNotPrivate, load);
+        }
+        const s64 begin{address->k};
+        if (begin % 4 != 0) {
+            return fail(ExtentUnknown::SharedPartialWrite, load);
+        }
+        for (const Access& access : writes) {
+            if (access.word_end <= begin || begin + 4 <= access.word_begin) {
+                continue;
+            }
+            if (access.inst->GetOpcode() != IR::Opcode::WriteSharedU32 || access.k != begin) {
+                return fail(ExtentUnknown::SharedPartialWrite, *access.inst);
+            }
+            result.stores.push_back(access.inst);
+        }
+        if (result.stores.empty()) {
+            return fail(ExtentUnknown::SharedNotDominated, load);
+        }
+        if (!dominance) {
+            dominance.emplace(program);
+        }
+        const bool dominated{std::ranges::any_of(result.stores, [&](const IR::Inst* store) {
+            return dominance->Dominates(store, &load);
+        })};
+        if (!dominated) {
+            return fail(ExtentUnknown::SharedNotDominated, load);
+        }
+        result.why = ExtentUnknownWhy{.kind = ExtentUnknown::Known};
+        return result;
+    }
+
+private:
+    static constexpr s64 LIMIT = s64{1} << 40;
+    static constexpr s64 U32_END = s64{1} << 32;
+    static constexpr u32 MAX_DEPTH = 64;
+    static constexpr u32 MAX_WORKGROUP = 0x10000;
+
+    /// c . tid + k, exactly the unsigned 32-bit value for every invocation of the workgroup (a
+    /// constant: k is its value as a signed 32-bit number)
+    struct Affine {
+        std::array<s64, 3> c{};
+        s64 k{};
+
+        bool IsConstant() const {
+            return c[0] == 0 && c[1] == 0 && c[2] == 0;
+        }
+    };
+
+    struct Access {
+        const IR::Inst* inst{};
+        s64 k{};
+        s64 word_begin{};
+        s64 word_end{};
+    };
+
+    static s64 Signed32(s64 value) {
+        return static_cast<s64>(static_cast<s32>(static_cast<u32>(static_cast<u64>(value))));
+    }
+
+    /// Bytes a shared write or atomic writes (0: not one)
+    static u32 WriteSize(IR::Opcode opcode) {
+        switch (opcode) {
+        case IR::Opcode::WriteSharedU8:
+            return 1;
+        case IR::Opcode::WriteSharedU16:
+            return 2;
+        case IR::Opcode::WriteSharedU32:
+            return 4;
+        case IR::Opcode::WriteSharedU64:
+            return 8;
+        case IR::Opcode::WriteSharedU128:
+            return 16;
+        case IR::Opcode::SharedAtomicExchange64:
+        case IR::Opcode::SharedAtomicExchange32x2:
+            return 8;
+        default:
+            break;
+        }
+        const std::string_view name{IR::NameOf(opcode)};
+        if (name.starts_with("SharedAtomic")) {
+            // A 64-bit or paired atomic not listed above: as wide as the widest
+            return name.find("64") != std::string_view::npos ||
+                           name.find("32x2") != std::string_view::npos
+                       ? 8U
+                       : 4U;
+        }
+        if (name.starts_with("WriteShared")) {
+            return 16; // a store width not listed above: the widest
+        }
+        return 0;
+    }
+
+    /// The smallest and largest value over the workgroup's invocations
+    std::pair<s64, s64> Range(const Affine& value) const {
+        s64 low{value.k};
+        s64 high{value.k};
+        for (size_t i = 0; i < 3; ++i) {
+            // Scan refuses workgroups past MAX_WORKGROUP (and |c| <= LIMIT): no overflow
+            const u32 size{(std::min)(program.workgroup_size[i], MAX_WORKGROUP)};
+            const s64 span{value.c[i] * static_cast<s64>(size > 0 ? size - 1 : 0)};
+            (span < 0 ? low : high) += span;
+        }
+        return {low, high};
+    }
+
+    /// A non-constant result that is exact: in [0, 2^32) for every invocation, small terms
+    std::optional<Affine> Exact(Affine value) const {
+        if (value.IsConstant()) {
+            value.k = Signed32(value.k);
+            return value;
+        }
+        if (value.k > LIMIT || value.k < -LIMIT) {
+            return std::nullopt;
+        }
+        for (const s64 c : value.c) {
+            if (c > LIMIT || c < -LIMIT) {
+                return std::nullopt;
+            }
+        }
+        const auto [low, high] = Range(value);
+        if (low < 0 || high >= U32_END) {
+            return std::nullopt;
+        }
+        return value;
+    }
+
+    std::optional<Affine> Scale(const Affine& value, s64 factor) const {
+        if (value.IsConstant()) {
+            // The 32-bit product (both are 32-bit numbers)
+            const u32 product{static_cast<u32>(static_cast<u64>(value.k)) *
+                              static_cast<u32>(static_cast<u64>(factor))};
+            return Affine{.k = Signed32(static_cast<s64>(product))};
+        }
+        const auto magnitude{[](s64 x) { return x < 0 ? -x : x; }};
+        const s64 scale{magnitude(factor)};
+        const auto fits{[&](s64 x) { return scale == 0 || magnitude(x) <= LIMIT / scale; }};
+        if (!fits(value.k) || !std::ranges::all_of(value.c, fits)) {
+            return std::nullopt;
+        }
+        Affine result{.k = value.k * factor};
+        for (size_t i = 0; i < 3; ++i) {
+            result.c[i] = value.c[i] * factor;
+        }
+        return Exact(result);
+    }
+
+    std::optional<Affine> ExactLocal(const IR::Value& value, u32 depth) {
+        if (value.IsImmediate()) {
+            if (value.Type() != IR::Type::U32) {
+                return std::nullopt;
+            }
+            return Affine{.k = static_cast<s64>(static_cast<s32>(value.U32()))};
+        }
+        if (depth > MAX_DEPTH) {
+            return std::nullopt;
+        }
+        const IR::Inst* const inst{value.InstRecursive()};
+        if (const auto it{memo.find(inst)}; it != memo.end()) {
+            return it->second;
+        }
+        const std::optional<Affine> result{ExactLocalInst(*inst, depth)};
+        memo.emplace(inst, result);
+        return result;
+    }
+
+    std::optional<Affine> ExactLocalInst(const IR::Inst& inst, u32 depth) {
+        const auto arg{[&](size_t index) { return ExactLocal(inst.Arg(index), depth + 1); }};
+        const auto imm{[&](size_t index) -> std::optional<u32> {
+            if (!inst.Arg(index).IsImmediate()) {
+                return std::nullopt;
+            }
+            return inst.Arg(index).U32();
+        }};
+        switch (inst.GetOpcode()) {
+        case IR::Opcode::CompositeExtractU32x3: {
+            if (inst.Arg(0).IsImmediate() || !inst.Arg(1).IsImmediate() ||
+                inst.Arg(1).U32() > 2 ||
+                inst.Arg(0).InstRecursive()->GetOpcode() != IR::Opcode::LocalInvocationId) {
+                return std::nullopt;
+            }
+            Affine result;
+            const u32 element{inst.Arg(1).U32()};
+            // A dimension of one invocation: its id is 0
+            result.c[element] = program.workgroup_size[element] > 1 ? 1 : 0;
+            return result;
+        }
+        case IR::Opcode::IAdd32:
+        case IR::Opcode::ISub32: {
+            const auto lhs{arg(0)};
+            const auto rhs{lhs ? arg(1) : std::nullopt};
+            if (!lhs || !rhs) {
+                return std::nullopt;
+            }
+            const s64 sign{inst.GetOpcode() == IR::Opcode::IAdd32 ? 1 : -1};
+            Affine result{.k = lhs->k + sign * rhs->k};
+            for (size_t i = 0; i < 3; ++i) {
+                result.c[i] = lhs->c[i] + sign * rhs->c[i];
+            }
+            return Exact(result);
+        }
+        case IR::Opcode::IMul32: {
+            const auto lhs{arg(0)};
+            const auto rhs{lhs ? arg(1) : std::nullopt};
+            if (!lhs || !rhs) {
+                return std::nullopt;
+            }
+            if (rhs->IsConstant()) {
+                return Scale(*lhs, rhs->k);
+            }
+            if (lhs->IsConstant()) {
+                return Scale(*rhs, lhs->k);
+            }
+            return std::nullopt;
+        }
+        case IR::Opcode::ShiftLeftLogical32: {
+            const std::optional<u32> shift{imm(1)};
+            const auto lhs{shift && *shift < 32 ? arg(0) : std::nullopt};
+            return lhs ? Scale(*lhs, s64{1} << *shift) : std::nullopt;
+        }
+        case IR::Opcode::BitFieldUExtract: {
+            const std::optional<u32> offset{imm(1)};
+            const std::optional<u32> count{imm(2)};
+            const auto source{offset && count && *offset < 32 && *count != 0 && *count <= 32
+                                  ? arg(0)
+                                  : std::nullopt};
+            if (!source) {
+                return std::nullopt;
+            }
+            if (source->IsConstant()) {
+                const u64 bits{static_cast<u32>(static_cast<u64>(source->k))};
+                const u64 field{(bits >> *offset) & ((u64{1} << *count) - 1)};
+                return Exact(Affine{.k = static_cast<s64>(field)});
+            }
+            const s64 high{Range(*source).second};
+            if (*offset == 0 && high < (s64{1} << *count)) {
+                return source; // the whole value
+            }
+            if ((high >> *offset) == 0) {
+                return Affine{}; // above every bit it has (a lowered multiplication's high half)
+            }
+            return std::nullopt;
+        }
+        case IR::Opcode::BitFieldInsert: {
+            const std::optional<u32> offset{imm(2)};
+            const std::optional<u32> count{imm(3)};
+            if (!offset || !count || *count == 0 || *offset + *count > 32) {
+                return std::nullopt;
+            }
+            const auto base{arg(0)};
+            const auto insert{base ? arg(1) : std::nullopt};
+            if (!base || !insert) {
+                return std::nullopt;
+            }
+            // A constant as its unsigned value (Exact keeps constants signed)
+            const auto as_unsigned{[](Affine v) {
+                if (v.IsConstant()) {
+                    v.k = static_cast<s64>(static_cast<u32>(static_cast<u64>(v.k)));
+                }
+                return v;
+            }};
+            const Affine low{as_unsigned(*base)};
+            const Affine field{as_unsigned(*insert)};
+            const auto fits{[&](const Affine& v, u32 bits) {
+                const auto [lowest, highest] = Range(v);
+                return lowest >= 0 && highest < (s64{1} << bits);
+            }};
+            // The base below the field and the inserted value inside it: a sum
+            if (!fits(low, *offset) || !fits(field, *count)) {
+                return std::nullopt;
+            }
+            Affine result{.c = low.c, .k = low.k + (field.k << *offset)};
+            for (size_t i = 0; i < 3; ++i) {
+                result.c[i] += field.c[i] << *offset;
+            }
+            return Exact(result);
+        }
+        case IR::Opcode::BitwiseAnd32: {
+            // A mask of low bits over a value inside them
+            for (const size_t side : {size_t{1}, size_t{0}}) {
+                const std::optional<u32> mask{imm(side)};
+                if (!mask || (u64{*mask} & (u64{*mask} + 1)) != 0) {
+                    continue;
+                }
+                const auto other{arg(1 - side)};
+                if (other && !other->IsConstant() && Range(*other).second <= s64{*mask}) {
+                    return other;
+                }
+            }
+            return std::nullopt;
+        }
+        default:
+            return std::nullopt;
+        }
+    }
+
+    /// The proof over every shared write and atomic of the program (once)
+    void Scan() {
+        scanned = true;
+        proof = ExtentUnknownWhy{.kind = ExtentUnknown::Known};
+        if (std::ranges::any_of(program.workgroup_size,
+                                [](u32 size) { return size == 0 || size > MAX_WORKGROUP; })) {
+            proof = ExtentUnknownWhy{.kind = ExtentUnknown::SharedNotPrivate};
+        }
+        bool have_coefficients{};
+        s64 lowest{};
+        s64 highest{};
+        for (const IR::Block* const block : program.post_order_blocks) {
+            for (const IR::Inst& inst : block->Instructions()) {
+                const IR::Opcode opcode{inst.GetOpcode()};
+                any_load |= opcode == IR::Opcode::LoadSharedU32;
+                const u32 size{WriteSize(opcode)};
+                if (size == 0 || proof.kind != ExtentUnknown::Known) {
+                    continue;
+                }
+                const auto refuse{[&] {
+                    proof = ExtentUnknownWhy{.kind = ExtentUnknown::SharedNotPrivate,
+                                             .opcode = static_cast<u16>(opcode)};
+                }};
+                const std::optional<Affine> address{ExactLocal(inst.Arg(0), 0)};
+                if (!address || address->k < 0 ||
+                    std::ranges::any_of(address->c, [](s64 c) { return c < 0 || c % 4 != 0; })) {
+                    refuse();
+                    continue;
+                }
+                if (!have_coefficients) {
+                    coefficients = address->c;
+                    have_coefficients = true;
+                } else if (address->c != coefficients) {
+                    refuse();
+                    continue;
+                }
+                const Access access{
+                    .inst = &inst,
+                    .k = address->k,
+                    .word_begin = address->k & ~s64{3},
+                    .word_end = (address->k + size + 3) & ~s64{3},
+                };
+                lowest = writes.empty() ? access.word_begin : (std::min)(lowest, access.word_begin);
+                highest = writes.empty() ? access.word_end : (std::max)(highest, access.word_end);
+                writes.push_back(access);
+            }
+        }
+        if (proof.kind != ExtentUnknown::Known || writes.empty()) {
+            return;
+        }
+        // The slots one invocation apart in each dimension never overlap (mixed radix), and the
+        // last invocation's slot ends inside the shared memory
+        const s64 span{highest - lowest};
+        std::array<size_t, 3> dims{0, 1, 2};
+        std::ranges::sort(dims, [&](size_t a, size_t b) { return coefficients[a] < coefficients[b]; });
+        s64 reach{};
+        for (const size_t dim : dims) {
+            const s64 size{static_cast<s64>(program.workgroup_size[dim])};
+            if (size <= 1) {
+                continue;
+            }
+            if (coefficients[dim] < reach + span) {
+                proof = ExtentUnknownWhy{.kind = ExtentUnknown::SharedNotPrivate};
+                return;
+            }
+            reach += coefficients[dim] * (size - 1);
+        }
+        if (highest + reach > static_cast<s64>(program.shared_memory_size)) {
+            proof = ExtentUnknownWhy{.kind = ExtentUnknown::SharedNotPrivate};
+        }
+    }
+
+    const IR::Program& program;
+    bool scanned{};
+    bool any_load{};
+    ExtentUnknownWhy proof{};
+    std::array<s64, 3> coefficients{};
+    std::vector<Access> writes;
+    std::unordered_map<const IR::Inst*, std::optional<Affine>> memo;
+    std::optional<Dominance> dominance;
+};
+
 /// An upper bound of an unsigned 32-bit value for every invocation of a dispatch:
 /// c + sum(coef[i] * id[i]) over gl_LocalInvocationID.xyz (0-2) and gl_WorkGroupID.xyz (3-5),
 /// plus `base` times the storage buffer's pointer word. All coefficients are non-negative, so the
@@ -1587,12 +2024,18 @@ struct IdBound {
 /// another constant buffer word, a loop-carried index, a signed or 64-bit computation) leaves the
 /// extent unknown, and the first such exit is kept (FRITCHII_EXTENT_CENSUS, Why()). In terms mode
 /// (FRITCHII_EXTENT_CBUF) another constant buffer word read at an immediate offset is a term of
-/// the bound instead.
+/// the bound instead. With `shared` (FRITCHII_EXTENT_SHARED) a 32-bit load from a private shared
+/// memory slot is bounded by the values its invocation stored there (SharedSlots).
 class StoreExtentAnalysis {
 public:
     explicit StoreExtentAnalysis(StorageBufferAddr buffer_, const std::array<u32, 3>& workgroup_,
-                                 bool terms_ = false)
-        : buffer{buffer_}, workgroup{workgroup_}, terms_mode{terms_} {}
+                                 bool terms_ = false, SharedSlots* shared_ = nullptr)
+        : buffer{buffer_}, workgroup{workgroup_}, terms_mode{terms_}, shared{shared_} {}
+
+    /// FRITCHII_EXTENT_SHARED: whether a load from shared memory was followed to its stores
+    bool Forwarded() const {
+        return forwarded;
+    }
 
     /// Extent of one access, merged into `extent`
     void AddAccess(IR::Inst& inst, StorageWriteExtent& extent) {
@@ -2196,6 +2639,30 @@ private:
             }
             return result;
         }
+        case IR::Opcode::LoadSharedU32: {
+            if (shared == nullptr) {
+                return std::nullopt; // loaded from memory
+            }
+            // The newest of its invocation's stores to the word: at most the largest of them
+            const SharedSlots::Forward forward{shared->Resolve(inst)};
+            if (forward.why.kind != ExtentUnknown::Known) {
+                Fail(forward.why);
+                return std::nullopt;
+            }
+            std::optional<IdBound> result;
+            for (const IR::Inst* const store : forward.stores) {
+                const auto stored{Evaluate(store->Arg(1), depth + 1)};
+                if (!stored) {
+                    return std::nullopt;
+                }
+                result = result ? Max(*result, *stored) : stored;
+                if (!result) {
+                    return std::nullopt;
+                }
+            }
+            forwarded = true;
+            return result;
+        }
         default:
             return std::nullopt;
         }
@@ -2204,6 +2671,8 @@ private:
     StorageBufferAddr buffer;
     std::array<u32, 3> workgroup;
     bool terms_mode{};
+    SharedSlots* shared{};
+    bool forwarded{};
     std::unordered_map<const IR::Inst*, Memo> memo;
     std::unordered_set<const IR::Inst*> active;
     std::optional<IdBound> guard;
@@ -2234,7 +2703,10 @@ struct ExactCongruence {
 
 class StoreFootprintAnalysis {
 public:
-    explicit StoreFootprintAnalysis(StorageBufferAddr buffer_) : buffer{buffer_} {}
+    /// With `shared` (FRITCHII_EXTENT_SHARED's SharedSlots) a 32-bit load from a private shared
+    /// memory slot is congruent like the values its invocation stored there
+    explicit StoreFootprintAnalysis(StorageBufferAddr buffer_, SharedSlots* shared_ = nullptr)
+        : buffer{buffer_}, shared{shared_} {}
 
     /// One store or atomic to the buffer
     void AddStore(IR::Inst& inst) {
@@ -2583,12 +3055,29 @@ private:
             }
             return result ? *result : Any(false);
         }
+        case IR::Opcode::LoadSharedU32: {
+            if (shared == nullptr) {
+                return Any(false);
+            }
+            // The newest of its invocation's stores to the word: congruent like each of them
+            const SharedSlots::Forward forward{shared->Resolve(inst)};
+            if (forward.why.kind != ExtentUnknown::Known) {
+                return Any(false);
+            }
+            std::optional<ExactCongruence> result;
+            for (const IR::Inst* const store : forward.stores) {
+                const ExactCongruence stored{Evaluate(store->Arg(1), depth + 1)};
+                result = result ? Join(*result, stored) : stored;
+            }
+            return result ? *result : Any(false);
+        }
         default:
             return Any(false);
         }
     }
 
     StorageBufferAddr buffer;
+    SharedSlots* shared{};
     std::unordered_map<const IR::Inst*, ExactCongruence> memo;
     std::unordered_set<const IR::Inst*> active;
     std::vector<StoreCongruence> stores;
@@ -2791,14 +3280,22 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
     std::map<StorageBufferAddr, StorageCbufExtent> cbuf_extents;
     // FRITCHII_STORE_FOOTPRINT: the residues each written buffer's stores can land on
     std::map<StorageBufferAddr, StorageStoreFootprint> footprints;
+    // FRITCHII_EXTENT_SHARED: why following offsets through shared memory slots failed (Known:
+    // the cbuf extent is proven that way)
+    std::map<StorageBufferAddr, ExtentUnknownWhy> shared_whys;
     if (!info.untracked_writes) {
+        // FRITCHII_EXTENT_SHARED / FRITCHII_STORE_FOOTPRINT: the private shared memory slots,
+        // proven on the first load the analyses follow
+        SharedSlots shared_slots{program};
         std::map<StorageBufferAddr, StoreFootprintAnalysis> footprint_analyses;
         for (const StorageInst& storage_inst : info.to_replace) {
             if (!IsGlobalMemoryWrite(*storage_inst.inst) ||
                 info.unbounded_writes.contains(storage_inst.storage_buffer)) {
                 continue;
             }
-            footprint_analyses.try_emplace(storage_inst.storage_buffer, storage_inst.storage_buffer)
+            footprint_analyses
+                .try_emplace(storage_inst.storage_buffer, storage_inst.storage_buffer,
+                             &shared_slots)
                 .first->second.AddStore(*storage_inst.inst);
         }
         for (const auto& [storage_buffer, analysis] : footprint_analyses) {
@@ -2850,6 +3347,49 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
             analysis->second.AddAccess(*storage_inst.inst,
                                        cbuf_extents[storage_inst.storage_buffer]);
         }
+        // FRITCHII_EXTENT_SHARED: the buffers still unknown, again following 32-bit loads from
+        // private shared memory slots to the values stored there (its own analyses: the plain
+        // and cbuf extents above stay exactly what they were; one proven only this way is marked
+        // via_shared, which the switch gates)
+        if (shared_slots.AnyLoad()) {
+            std::map<StorageBufferAddr, StoreExtentAnalysis> shared_analyses;
+            std::map<StorageBufferAddr, StorageCbufExtent> shared_extents;
+            for (const StorageInst& storage_inst : info.to_replace) {
+                if (!IsGlobalMemoryWrite(*storage_inst.inst) ||
+                    info.unbounded_writes.contains(storage_inst.storage_buffer)) {
+                    continue;
+                }
+                const auto cbuf{cbuf_extents.find(storage_inst.storage_buffer)};
+                if (cbuf == cbuf_extents.end() || cbuf->second.ids.bounded) {
+                    continue;
+                }
+                auto analysis{shared_analyses.find(storage_inst.storage_buffer)};
+                if (analysis == shared_analyses.end()) {
+                    analysis = shared_analyses
+                                   .emplace(storage_inst.storage_buffer,
+                                            StoreExtentAnalysis{storage_inst.storage_buffer,
+                                                                program.workgroup_size, true,
+                                                                &shared_slots})
+                                   .first;
+                    shared_extents.emplace(
+                        storage_inst.storage_buffer,
+                        StorageCbufExtent{.ids = StorageWriteExtent{.bounded = true}});
+                }
+                analysis->second.AddAccess(*storage_inst.inst,
+                                           shared_extents[storage_inst.storage_buffer]);
+            }
+            for (const auto& [storage_buffer, analysis] : shared_analyses) {
+                StorageCbufExtent& extent{shared_extents[storage_buffer]};
+                if (extent.ids.bounded && analysis.Forwarded()) {
+                    extent.via_shared = true;
+                    cbuf_extents[storage_buffer] = extent;
+                    shared_whys.emplace(storage_buffer,
+                                        ExtentUnknownWhy{.kind = ExtentUnknown::Known});
+                } else if (!extent.ids.bounded) {
+                    shared_whys.emplace(storage_buffer, analysis.Why());
+                }
+            }
+        }
     }
     // Read extents of the loads and atomics. An access left global is routed by address at run
     // time into any bound buffer at any offset, so with one left no read extent is known.
@@ -2893,7 +3433,11 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
         ExtentUnknownWhy write_unknown{};
         StorageCbufExtent cbuf_extent{};
         StorageStoreFootprint footprint{};
+        ExtentUnknownWhy shared_why{};
         if (is_written) {
+            if (const auto why{shared_whys.find(storage_buffer)}; why != shared_whys.end()) {
+                shared_why = why->second;
+            }
             any_written = true;
             if (info.untracked_writes) {
                 footprint.why = StoreFootprintWhy::UntrackedWrites;
@@ -2933,7 +3477,8 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
         });
         extras.push_back({.write_unknown = write_unknown,
                           .cbuf_extent = cbuf_extent,
-                          .footprint = footprint});
+                          .footprint = footprint,
+                          .shared_why = shared_why});
         any_unknown |= is_written && write_unknown.kind != ExtentUnknown::Known;
     }
     if (any_unknown || any_written) {

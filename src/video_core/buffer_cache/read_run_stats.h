@@ -100,6 +100,12 @@ inline bool ReadRunsValue(bool writer_ticks) {
         if (cbuf != nullptr && cbuf[0] == '3') {
             return true;
         }
+        // FRITCHII_EXTENT_SHARED=3: the same dry count for the extents proven through shared
+        // memory slots
+        const char* shared = std::getenv("FRITCHII_EXTENT_SHARED");
+        if (shared != nullptr && shared[0] == '3') {
+            return true;
+        }
         const char* census = std::getenv("FRITCHII_EXTENT_CENSUS");
         if (census != nullptr && census[0] != '\0' && census[0] != '0') {
             return true;

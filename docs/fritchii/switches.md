@@ -1132,7 +1132,8 @@ then the top 8 others by bytes marked in full ("Extent census marked i/n: ...").
 "program <hash> binding <ssbo> (pointer cX[0xY]) | read-back R reads, W ms a frame | D
 dispatches/s, F full-marked/s, M MiB marked/s (K KiB binding) | why unknown: <reason> | full mark
 because: unknown, indirect grid, 16-bit guard or dims, distrusted, checking new dims, proof covers
-the binding | cbuf extent: <terms or none>". Reasons: "index from a constant buffer word cI[0xO]" (which word),
+the binding | cbuf extent: <terms or none> | shared extent: <FRITCHII_EXTENT_SHARED's proof, not
+tried or refused: reason>". Reasons: "index from a constant buffer word cI[0xO]" (which word),
 "index loaded from memory (<opcode>)", "loop-carried index", "index from an atomic", "signed or
 64-bit math (<opcode>)", "variable times variable", "instruction not bounded (<opcode>)", "a store
 stays global", "pointer picked at run time", and the analysis' other exits by name. "cbuf extent"
@@ -1167,6 +1168,46 @@ under an older mark of the same writer / another writer | must be 0: freed reads
 changed at landing X of Y compared (inside: ...)". The freed ms a frame is the ceiling of =1 for
 that program. With no binding to try: "Extent cbuf (...) last S s: no native written binding had a
 cbuf extent; extent unknown U dispatches/s, X/s of them with no reason recorded".
+
+### FRITCHII_EXTENT_SHARED
+
+TEST, off by default (helper DO, 2026-11-17; design: helper_dn_answer.md section 3, the flower
+writer 989e109982cb409b). Live for the marks; =3's read counts need it at boot (as
+FRITCHII_EXTENT_CBUF=3). Some programs park an offset they computed from their ids (a record
+offset) in their own shared memory slot and load it back before storing through it; the store
+analysis saw "index loaded from memory (LoadSharedU32)" and the dispatch marked the whole 16 MiB
+window. For written native buffers whose plain and cbuf extents both stayed unknown, a third store
+analysis (translation only, plain and cbuf extents unchanged) follows such a load to the values
+stored there, when (SharedSlots, global_memory_to_storage_buffer_pass.cpp):
+- every shared write and atomic of the program has an exact address c . tid + k (no 32-bit wrap
+  for any invocation), all with the same non-negative coefficients (multiples of 4), and the slots
+  never overlap: widened to whole words, with `span` from the lowest to the highest byte, the
+  dimensions of more than one invocation sorted by coefficient each step past what the smaller ones
+  reach (c1 >= span, c2 >= c1 (w1 - 1) + span, ...) and the last slot ends inside the program's
+  shared memory. Else "shared memory not one slot per invocation";
+- the load (32-bit) has the same coefficients, and only 32-bit stores of exactly that word write
+  it (else "loaded shared word also written another way": another width or an atomic), one of
+  them before the load on every path (else "loaded shared word not stored before the load").
+Then the loaded value is the newest of those stores' values on the invocation's own path (no other
+invocation writes the slot, an invocation sees its own writes in order), so it is bounded by the
+largest of them. The result is a cbuf extent flagged via_shared: this switch, not
+FRITCHII_EXTENT_CBUF, decides whether it is used. Not stored with the info: boot with
+EDEN_NX2_PRECOMPILED_FAST=0. FRITCHII_STORE_FOOTPRINT's footprints follow the same loads (always:
+the footprint is only used under that switch).
+- =3 dry: as FRITCHII_EXTENT_CBUF=3 (marks stay full, the read ring counts the reads the proof
+  would free). Must be 0: "freed reads whose bytes changed at landing".
+- =1 live: the proof becomes the mark through the ExtentTrust checks (new dims marked in full and
+  checked, a write past the proof distrusts the program: "Compute write extent too small" in the
+  log, "distrusted" in the census). Must be 0 there; then the flash watch and the flower spot.
+Lines every 10 s per top program binding: "Extent shared (FRITCHII_EXTENT_SHARED=M) i/n last S s:
+program <hash> binding <ssbo> | shared extent ids only (end E + local X/Y/Z + group X/Y/Z) | ..."
+(the rest as the "Extent cbuf" line). With none to try: "Extent shared (...) last S s: no native
+written binding had an extent proven through shared memory slots; refused R dispatches/s (the
+census' shared extent says why); ...". The census lines end in "| shared extent: <proof>", "not
+tried" or "refused: <reason>". 989e's expected proof: end 0x138 + local 0x140 + group 0x5000, so
+0x5000 x grid_x - 8 bytes past the pointer (20 KiB a workgroup) instead of 16 MiB.
+Test block (nx2_switches.txt): EDEN_NX2_PRECOMPILED_FAST=0, FRITCHII_EXTENT_CENSUS=1,
+FRITCHII_EXTENT_SHARED=3 at boot (flower save, a few cuts), then live 0/1 with profile_toggle.
 
 ### FRITCHII_STORE_FOOTPRINT
 
