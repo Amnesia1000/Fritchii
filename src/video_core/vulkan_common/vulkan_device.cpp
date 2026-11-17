@@ -1458,6 +1458,21 @@ VmaPool Device::GetSeparatePool(VmaAllocator owner, SeparatePool kind, u32 memor
     return pool;
 }
 
+VmaPool Device::PeekSeparatePool(VmaAllocator owner, SeparatePool kind, u32 memory_type) const {
+    if (memory_type >= VK_MAX_MEMORY_TYPES) {
+        return VK_NULL_HANDLE;
+    }
+    std::scoped_lock lk{separate_pools_mutex};
+    // Only `owner`'s own pools: with one allocator (no split) the buffer slot is never used.
+    if (owner == allocator) {
+        return separate_pools[0][static_cast<u32>(kind)][memory_type];
+    }
+    if (buffer_allocator != nullptr && owner == buffer_allocator) {
+        return separate_pools[1][static_cast<u32>(kind)][memory_type];
+    }
+    return VK_NULL_HANDLE;
+}
+
 void Device::LoadStaticPipelineCache() {
     const auto create = [this](size_t size, const void* data) {
         static_pipeline_cache = logical.CreatePipelineCache({

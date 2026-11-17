@@ -838,6 +838,41 @@ budget mode, budget (vk, os, other processes), headroom, last 10 s: peak usage, 
 seconds over budget less headroom, seconds over the budget; evictions before creates". Costs a walk
 of the live images every 10 s.
 
+Since helper DC (2026-11-17) the staging part ends in "block slack by pool: main allocator default
+D MiB (B MiB in N memory objects, H holes, largest on the heap L MiB), depth pool (type T) ...,
+colour pool ..., sparse pool ..., buffer pool ...; buffer allocator default ..., buffer pool ...":
+the unused space of each allocator's block vectors on the main heap (a pool shows only once it has
+blocks). "default" is each memory type's own blocks plus dedicated allocations (which add no unused
+space). A pool whose largest hole equals its block size (64 MiB depth/colour, 16 MiB sparse/buffer)
+holds an empty block. The buffer allocator is walked only when the back is its user ("not walked
+(the memory stage holds it)" otherwise). Costs one walk of every block (VMA's statistics) of each
+allocator every 10 s.
+
+### FRITCHII_VRAM_TRIM
+
+Helper DC, 2026-11-17. Live: 0 off, 1 auto (default: 90 with the small card profile on, otherwise
+off), 2-100 = percent of the budget, on any card. Every 60 frames, while the main heap's usage is
+at or above that share of its budget, each allocator gives back the empty block VMA keeps in each
+block vector (each memory type's default blocks, the depth, colour, sparse and buffer pools; up to
+32-64 MiB each). VMA keeps one empty block per vector and frees it itself only once the usage is
+past the budget, when Windows may already move memory to system RAM. How: a 256-byte allocation in
+the fullest block with room (NEVER_ALLOCATE, best fit), freed at once: VMA then deletes the last,
+empty block (VmaBlockVector::Free). Memory that held nothing; the cost is a driver allocation when
+that vector needs a block again. The buffer allocator is trimmed only when the back is its user.
+Log: "VRAM trim (FRITCHII_VRAM_TRIM at P% of the budget): main heap U of B MiB, gave back X MiB of
+empty blocks (main allocator M MiB, buffer allocator N MiB); session S MiB in K trims" (the first
+8 trims, then at most every 10 s). Test: FRITCHII_VRAM_TRIM=40 on the 16 GB card makes it act at
+the market (usage ~7.5 of ~15.3 GiB).
+
+### FRITCHII_VRAM_PACK
+
+Helper DC, 2026-11-17. Live: 0 off, 1 on, 2 auto (default: on with the small card profile on).
+Buffers (both allocators, the separate buffer pool included) and memory commits take the
+best-fitting hole of a block (VMA's MIN_MEMORY strategy, which images always use) instead of VMA's
+default, which cuts them from a hole of the next larger size class and so splits the big holes the
+next large buffer needs. Only the place in a block changes; the search is CPU time (no new device
+memory). Read the owners line's "buffer allocator default / buffer pool" slack with 0 and 1.
+
 ### FRITCHII_VRAM_SIM_OTHERS
 
 TEST, off by default (helper BF, 2026-11-16; boot, with EDEN_NX2_VRAM_LIMIT_MIB). 1 = the simulated

@@ -561,6 +561,12 @@ public:
     u64 vram_report_last_budget{};
     u32 vram_report_seen_pressure{};
     u32 vram_report_seen_failed{};
+    /// FRITCHII_VRAM_TRIM: every 60 frames near the budget, the allocators' empty blocks go.
+    void TickVramTrim();
+    u32 vram_trim_frames{};
+    u32 vram_trim_events{};  ///< trims that gave memory back, this session
+    u64 vram_trim_bytes{};   ///< what they gave back, this session
+    std::chrono::steady_clock::time_point vram_trim_logged{};
     static constexpr u64 ImagePoolMaxFrames = 180;
     std::deque<PooledImage> image_pool;
     u64 image_pool_bytes{};

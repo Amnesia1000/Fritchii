@@ -308,6 +308,9 @@ public:
     /// created on first use (null if that failed).
     VmaPool GetSeparatePool(VmaAllocator owner, SeparatePool kind, u32 memory_type) const;
 
+    /// That pool if it was made already, else null (never makes one).
+    VmaPool PeekSeparatePool(VmaAllocator owner, SeparatePool kind, u32 memory_type) const;
+
     /// Returns the logical device.
     const vk::Device& GetLogical() const {
         return logical;

@@ -45,6 +45,7 @@
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "common/settings.h"
+#include "video_core/small_card.h"
 
 namespace Vulkan {
 namespace {
@@ -104,6 +105,19 @@ namespace {
                 return VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
         }
         return VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    }
+
+    // FRITCHII_VRAM_PACK (live, default 2 = auto: on with the small card profile; 0 off, 1 on):
+    // buffers and commits take the best-fitting hole in a block (VMA's MIN_MEMORY strategy, as
+    // images always do) instead of VMA's default, which cuts them from a hole of the next larger
+    // size class and so leaves the big holes split for the next large buffer. Only where in a
+    // block VMA places them changes; the search is CPU time only (no new device memory).
+    [[nodiscard]] VmaAllocationCreateFlags PackStrategy() {
+        const int value = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_vram_pack,
+                                                           "FRITCHII_VRAM_PACK", 2);
+        const bool on = value == 1 || (value == 2 && VideoCore::SmallCard::Active());
+        return on ? VmaAllocationCreateFlags{VMA_ALLOCATION_CREATE_STRATEGY_MIN_MEMORY_BIT}
+                  : VmaAllocationCreateFlags{0};
     }
 } // namespace
 
@@ -347,6 +361,10 @@ VkResult TimedVmaCreateImage(const Device &device, VmaAllocator allocator,
 // took 1.35 ms on average against 0.11 ms for colour targets (IMAGE_ALLOC_TIMING): the driver
 // readies the memory for depth on each bind, which memory that held depth before may skip. The
 // pools live as long as the VMA allocator (never destroyed: images may outlive this object).
+// At file scope so the owners line's slack split and FRITCHII_VRAM_TRIM can walk them.
+static std::mutex g_depth_pool_mutex;
+static std::vector<std::tuple<VmaAllocator, u32, VmaPool>> g_depth_pools;
+
 static VmaPool DepthAttachmentPool(VmaAllocator allocator, const VkImageCreateInfo &ci,
                                    const VmaAllocationCreateInfo &alloc_ci) {
     // On by default since 2026-11-12: depth targets no longer each get their own fresh memory (the
@@ -363,9 +381,8 @@ static VmaPool DepthAttachmentPool(VmaAllocator allocator, const VkImageCreateIn
     if (vmaFindMemoryTypeIndexForImageInfo(allocator, &ci, &alloc_ci, &type) != VK_SUCCESS) {
         return VK_NULL_HANDLE;
     }
-    static std::mutex mutex;
-    static std::vector<std::tuple<VmaAllocator, u32, VmaPool>> pools;
-    std::scoped_lock lock{mutex};
+    auto& pools = g_depth_pools;
+    std::scoped_lock lock{g_depth_pool_mutex};
     for (const auto &[owner, pool_type, pool] : pools) {
         if (owner == allocator && pool_type == type) {
             return pool;
@@ -1038,7 +1055,8 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
         && device.GetDriverID() == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA)
         ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : 0;
     const VmaAllocationCreateInfo alloc_ci = {
-        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | MemoryUsageVmaFlags(usage),
+        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | MemoryUsageVmaFlags(usage) |
+                 PackStrategy(),
         .usage = MemoryUsageVma(usage),
         .requiredFlags = 0,
         .preferredFlags = MemoryUsagePreferredVmaFlags(usage) | anv_flags,
@@ -1120,7 +1138,8 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
         memory_type_bits = 0u;
     }
     const VmaAllocationCreateInfo alloc_ci = {
-        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | MemoryUsageVmaFlags(usage),
+        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | MemoryUsageVmaFlags(usage) |
+                 PackStrategy(),
         .usage = MemoryUsageVma(usage),
         .requiredFlags = 0,
         .preferredFlags = MemoryUsagePreferredVmaFlags(usage) | anv_flags,
@@ -1160,7 +1179,7 @@ MemoryCommit MemoryAllocator::Commit(const VkMemoryRequirements &reqs, MemoryUsa
     const VideoCommon::MemoryStageLink::AllocatorOp allocator_op{allocator};
     const auto vma_usage = MemoryUsageVma(usage);
     VmaAllocationCreateInfo ci{};
-    ci.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | MemoryUsageVmaFlags(usage);
+    ci.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | MemoryUsageVmaFlags(usage) | PackStrategy();
     ci.usage = vma_usage;
     ci.memoryTypeBits = reqs.memoryTypeBits & valid_memory_types;
     ci.requiredFlags = 0;
@@ -1195,7 +1214,7 @@ MemoryCommit MemoryAllocator::Commit(const vk::Buffer &buffer, MemoryUsage usage
     const auto vma_usage = MemoryUsageVma(usage);
 
     VmaAllocationCreateInfo ci{};
-    ci.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | MemoryUsageVmaFlags(usage);
+    ci.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | MemoryUsageVmaFlags(usage) | PackStrategy();
     ci.usage = vma_usage;
     ci.requiredFlags = 0;
     ci.preferredFlags = MemoryUsagePreferredVmaFlags(usage);
@@ -1416,6 +1435,152 @@ void LogMemoryStatistics(const Device& device) {
                      budgets[heap].statistics.allocationBytes >> 20);
         }
     }
+}
+
+namespace {
+
+/// A custom VMA pool of one allocator, with its memory type and a name for the log.
+struct NamedPool {
+    VmaPool pool;
+    u32 type;
+    const char* name;
+};
+
+/// Every custom pool `owner` has: the depth attachment pools (EDEN_NX2_DEPTH_POOL), the colour
+/// target pools (FRITCHII_KILL_RT_POOL) and the device's separate pools (sparse pages, buffers).
+std::vector<NamedPool> PoolsOf(const Device& device, VmaAllocator owner) {
+    std::vector<NamedPool> pools;
+    {
+        std::scoped_lock lock{g_depth_pool_mutex};
+        for (const auto& [pool_owner, type, pool] : g_depth_pools) {
+            if (pool_owner == owner) {
+                pools.push_back({pool, type, "depth pool"});
+            }
+        }
+    }
+    {
+        std::scoped_lock lock{g_kill_pool_mutex};
+        for (const KillPoolEntry& entry : g_kill_pools) {
+            if (entry.owner == owner) {
+                pools.push_back({entry.pool, entry.type, "colour pool"});
+            }
+        }
+    }
+    for (u32 type = 0; type < VK_MAX_MEMORY_TYPES; ++type) {
+        if (const VmaPool pool =
+                device.PeekSeparatePool(owner, Device::SeparatePool::SparsePages, type)) {
+            pools.push_back({pool, type, "sparse pool"});
+        }
+        if (const VmaPool pool =
+                device.PeekSeparatePool(owner, Device::SeparatePool::DeviceBuffers, type)) {
+            pools.push_back({pool, type, "buffer pool"});
+        }
+    }
+    return pools;
+}
+
+/// FRITCHII_VRAM_TRIM: a 256-byte allocation in an existing block of the vector (the pool, or
+/// the memory type's default blocks), freed at once. VMA keeps one empty block per vector; it
+/// deletes the last (emptiest) block on a free when that block is empty and another free left
+/// the vector with an empty block before (VmaBlockVector::Free). NEVER_ALLOCATE: no new memory
+/// if no block has room. Best fit, so the probe lands in the fullest block with room (VMA tries
+/// blocks fullest first), never in the empty one while another has 256 bytes.
+void ProbeEmptyBlock(VmaAllocator owner, VmaPool pool, u32 type) {
+    const VkMemoryRequirements requirements{
+        .size = 256,
+        .alignment = 256,
+        .memoryTypeBits = 1U << type,
+    };
+    VmaAllocationCreateInfo ci{};
+    ci.flags = VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT |
+               VMA_ALLOCATION_CREATE_STRATEGY_MIN_MEMORY_BIT;
+    ci.usage = VMA_MEMORY_USAGE_UNKNOWN;
+    ci.memoryTypeBits = 1U << type;
+    ci.pool = pool;
+    VmaAllocation probe{};
+    if (vmaAllocateMemory(owner, &requirements, &ci, &probe, nullptr) == VK_SUCCESS) {
+        vmaFreeMemory(owner, probe);
+    }
+}
+
+} // Anonymous namespace
+
+std::string VramSlackText(const Device& device, VmaAllocator owner, u32 heap) {
+    const VkPhysicalDeviceMemoryProperties* properties{};
+    vmaGetMemoryProperties(owner, &properties);
+    if (heap >= properties->memoryHeapCount) {
+        return "none";
+    }
+    VmaTotalStatistics total{};
+    vmaCalculateStatistics(owner, &total);
+    const VmaDetailedStatistics& all = total.memoryHeap[heap];
+    u64 pool_block_bytes = 0;
+    u64 pool_allocation_bytes = 0;
+    u64 pool_holes = 0;
+    u32 pool_blocks = 0;
+    std::string pools;
+    for (const NamedPool& named : PoolsOf(device, owner)) {
+        if (named.type >= properties->memoryTypeCount ||
+            properties->memoryTypes[named.type].heapIndex != heap) {
+            continue;
+        }
+        VmaDetailedStatistics stats{};
+        vmaCalculatePoolStatistics(owner, named.pool, &stats);
+        const VmaStatistics& s = stats.statistics;
+        pool_block_bytes += s.blockBytes;
+        pool_allocation_bytes += s.allocationBytes;
+        pool_holes += stats.unusedRangeCount;
+        pool_blocks += s.blockCount;
+        if (s.blockCount == 0) {
+            continue;
+        }
+        fmt::format_to(std::back_inserter(pools),
+                       ", {} (type {}) {} MiB ({} MiB in {} blocks, {} holes, largest {} MiB)",
+                       named.name, named.type,
+                       (s.blockBytes - (std::min)(s.blockBytes, s.allocationBytes)) >> 20,
+                       s.blockBytes >> 20, s.blockCount, stats.unusedRangeCount,
+                       stats.unusedRangeSizeMax >> 20);
+    }
+    // The memory types' own blocks and their dedicated allocations (a dedicated allocation is a
+    // memory object of its own size: it adds no unused space).
+    const u64 blocks = all.statistics.blockBytes - (std::min)(all.statistics.blockBytes,
+                                                              pool_block_bytes);
+    const u64 used = all.statistics.allocationBytes -
+                     (std::min)(all.statistics.allocationBytes, pool_allocation_bytes);
+    const u32 objects = all.statistics.blockCount - (std::min)(all.statistics.blockCount,
+                                                               pool_blocks);
+    return fmt::format("default {} MiB ({} MiB in {} memory objects, {} holes, largest on the "
+                       "heap {} MiB){}",
+                       (blocks - (std::min)(blocks, used)) >> 20, blocks >> 20, objects,
+                       all.unusedRangeCount - (std::min<u64>)(all.unusedRangeCount, pool_holes),
+                       all.unusedRangeSizeMax >> 20, pools);
+}
+
+u64 TrimEmptyBlocks(const Device& device, VmaAllocator owner, u32 heap) {
+    const VideoCommon::MemoryStageLink::AllocatorOp allocator_op{owner};
+    const VkPhysicalDeviceMemoryProperties* properties{};
+    vmaGetMemoryProperties(owner, &properties);
+    if (heap >= properties->memoryHeapCount) {
+        return 0;
+    }
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> before{};
+    vmaGetHeapBudgets(owner, before.data());
+    for (u32 type = 0; type < properties->memoryTypeCount; ++type) {
+        if (properties->memoryTypes[type].heapIndex == heap) {
+            ProbeEmptyBlock(owner, VK_NULL_HANDLE, type);
+        }
+    }
+    for (const NamedPool& named : PoolsOf(device, owner)) {
+        if (named.type < properties->memoryTypeCount &&
+            properties->memoryTypes[named.type].heapIndex == heap) {
+            ProbeEmptyBlock(owner, named.pool, named.type);
+        }
+    }
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> after{};
+    vmaGetHeapBudgets(owner, after.data());
+    const u64 had = before[heap].statistics.blockBytes;
+    const u64 has = after[heap].statistics.blockBytes;
+    return had > has ? had - has : 0;
 }
 
 } // namespace Vulkan
