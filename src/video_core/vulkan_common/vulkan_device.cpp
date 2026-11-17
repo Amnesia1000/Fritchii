@@ -1822,12 +1822,21 @@ bool Device::GetSuitability(bool requires_swapchain) {
         return Settings::values.use_graphics_pipeline_library.GetValue() &&
                (vendor == 0x10DE || vendor == 0x1002);
     }();
-    if (graphics_pipeline_library_requested &&
+    const bool gpl_offered =
         supported_extensions.contains(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME) &&
-        supported_extensions.contains(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME)) {
+        supported_extensions.contains(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+    if (graphics_pipeline_library_requested && gpl_offered) {
         loaded_extensions.insert(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
         loaded_extensions.insert(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
     } else {
+        // Says whether the driver offers them at all (an Arc B580 log could not tell, helper
+        // CZ); fast linking is read only once requested, then logged below.
+        LOG_INFO(Render_Vulkan,
+                 "Nx2Perf gpl: shader libraries {} (the driver {} VK_EXT_graphics_pipeline_library; "
+                 "EDEN_NX2_GPL=1 requests them on any GPU)",
+                 graphics_pipeline_library_requested ? "requested but unavailable"
+                                                     : "not requested",
+                 gpl_offered ? "offers" : "does not offer");
         graphics_pipeline_library_requested = false;
     }
 
