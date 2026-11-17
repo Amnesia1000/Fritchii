@@ -7037,5 +7037,5 @@ Boot (shader translation). How the SPIR-V helper functions that route global mem
 storage buffer are emitted. 1 (default): inlined at every call site (+2.6 fps walking Hyrule Field on
 an RTX 4080, 2026-11). 0: DontInline everywhere (NVIDIA compiles big compute shaders in a fraction of
 the time: up to 7.6 s each inlined). 2: DontInline for compute programs only, graphics inlined
-(tester report 2026-11-18: a 7.6 s freeze mid-combat on an RTX 3070 when the driver had not cached a
+(player report 2026-11-18, 5.8.4: a 7.6 s freeze mid-combat on an RTX 3070 when the driver had not cached a
 compute shader). Changing it changes the SPIR-V, so the driver compiles those shaders again once.

@@ -980,7 +980,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
     // DontInline only with EDEN_NX2_SPIRV_INLINE_GLOBALS=0: it builds those shaders faster, but
     // cost ~2.6 fps walking through Hyrule Field on an RTX 4080 (fresh launches, 55.2/55.3 vs
     // 57.9/57.8 inlined), and a shader is built once before the driver's cache has it.
-    // =2 (tester report 2026-11-18, RTX 3070: a 7.6 s freeze mid-combat on a compute shader the
+    // =2 (player report 2026-11-18, RTX 3070 on 5.8.4: a 7.6 s freeze mid-combat on a compute shader the
     // driver had not cached): DontInline for compute programs only, graphics stays inlined.
     static const int inline_mode = [] {
         const char* value = std::getenv("EDEN_NX2_SPIRV_INLINE_GLOBALS");
