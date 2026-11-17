@@ -309,6 +309,8 @@ inline std::atomic<int> g_fence_commit_fast{-1};
 inline std::atomic<int> g_pipeline_key_hash{-1};
 /// FRITCHII_CB_WORDS_BLOCK: docs/fritchii/switches.md.
 inline std::atomic<int> g_cb_words_block{-1};
+/// FRITCHII_CB_MERGE (live, default 0; 1 = dry count): docs/fritchii/switches.md.
+inline std::atomic<int> g_cb_merge{-1};
 /// FRITCHII_BANK_CENSUS: docs/fritchii/switches.md.
 inline std::atomic<int> g_bank_census{-1};
 /// FRITCHII_BANK_FLAGGED: docs/fritchii/switches.md.

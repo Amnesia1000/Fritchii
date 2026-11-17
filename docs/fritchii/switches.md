@@ -1036,6 +1036,34 @@ the GPU thread's core.
   keep off the pinned GPU threads' cores (BackgroundWorkCpuMask, as HostTiming's spin and the
   pipeline workers already do); back to 0 = every CPU the process may use. Applied by each thread at
   its next unit of work. Judge it on the back's and front's ms/s and us a draw (2 cycles), then fps.
+  2 (round 2) = 1, and once a second the Pulse thread also moves every other thread of the process
+  that nobody placed (still on the whole process mask: driver threads, audio, VSync, image frees,
+  the Pulse thread...) to the same mask; the pinned GPU threads, anything with a narrower mask
+  (guest cores, E2) and the threads that place themselves (HostTiming, VkPipelinePrebuild,
+  VkPrecompile, the three above) are left alone. Back to 0 or 1 gives the moved threads their old
+  mask (unless something changed it since). Needs the Pulse thread (on by default). 1 and 2 are
+  refused (one log line, nothing changes) when the mask would leave fewer than 8 fast logical
+  processors (MinAutoGuestProcessors + 2): a 7800X3D keeps 11 (on), a 6-core with SMT 7 (off), 8
+  cores without SMT 5 (off).
+- Round 2 census: each core also shows "(DPC+ISR D)" (that core's DPC and interrupt time, part of
+  others) and ", own threads allowed there T ms/s in N: name a, name b, name c": the process's
+  busiest threads whose mask lets them onto the core's free hardware thread (named by their
+  description, else "tid N module.dll" from their start routine). Windows does not say where a
+  thread ran without a kernel trace, so these are the candidates, not a split. The pinned threads
+  are read by thread id, the latest thread pinned to a role (round 1 read the first: R showed 0).
+
+### FRITCHII_CB_MERGE
+
+TEST, off by default (helper DE, 2026-11-17). Live, 1 = dry count (changes nothing). The game
+writes constant buffer data as an offset write plus 1-4 words, so FRITCHII_CB_WORDS_BLOCK's blocks
+hold ~1.9 words: ~1M blocks a second, each run by E on its own. When a block opens, the front looks
+at the ring words since the previous block (at most 32): joinable when they are only constant buffer
+offset (or address/size) writes. E times 1 block in 16 by size and the offset-only Pairs entries.
+Line every ~10 s after the CB words block line: "CB merge (FRITCHII_CB_MERGE=1, dry) S s: blocks
+opened after a block N/s: joinable J/s (offset only, with address/size; W writes between), nothing
+between, blocked by other entries; E: blocks of 1/2/3-4/5+ words a/b/c/d ns, offset-only pair
+entries P/s at G ns; fixed part a block F ns; E saving if joined L to H ms/s". F = 2a - b (the
+per-block cost a merged entry would pay once), L = J x F, H = J x (F + G). Gate 1 needs L >= 5 ms/s.
 
 ### FRITCHII_FRAME_END_TIMES
 

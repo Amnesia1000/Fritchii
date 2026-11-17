@@ -3651,6 +3651,13 @@ u64 GpuSplit::SettleWrites() {
     return consumed_cache;
 }
 
+namespace {
+/// A counter with one writer (the back): a plain load and store.
+void CbBump(std::atomic<u64>& counter, u64 amount = 1) {
+    counter.store(counter.load(std::memory_order_relaxed) + amount, std::memory_order_relaxed);
+}
+} // Anonymous namespace
+
 size_t GpuSplit::Execute(const u64* entry, size_t words) {
     const u64 head = entry[0];
     switch (static_cast<Kind>(head & 0xf)) {
@@ -3800,8 +3807,35 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
             Nx2FastDrawCount::Break(Nx2FastDrawCount::Reason::OtherEngine);
         }
         Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
+        // FRITCHII_CB_MERGE=1 (dry): a block of only constant buffer offset/address/size writes
+        // (what splits two CbWords blocks), timed 1 in 16.
+        u64 gap_start = 0;
+        if (CbMergeOn() &&
+            dynamic_cast<Tegra::Engines::Maxwell3D*>(engine) != nullptr) [[unlikely]] {
+            using Tegra::Engines::Maxwell3D;
+            constexpr u32 cb_size = MAXWELL3D_REG_INDEX(const_buffer.size);
+            constexpr u32 cb_offset = MAXWELL3D_REG_INDEX(const_buffer.offset);
+            bool cb_only = count != 0;
+            for (u32 i = 0; i < count && cb_only; ++i) {
+                const u32 method = static_cast<u32>(entry[1 + i] & 0xffff);
+                cb_only = method >= cb_size && method <= cb_offset;
+            }
+            if (cb_only) {
+                CbBump(cb_merge_back.gap_entries);
+                if (cb_merge_sample_left == 0) {
+                    cb_merge_sample_left = 15;
+                    gap_start = Nx2Profile::Ticks();
+                } else {
+                    --cb_merge_sample_left;
+                }
+            }
+        }
         engine->ConsumeSink(*system);
         engine->ApplyPairs(*system, entry + 1, count);
+        if (gap_start != 0) [[unlikely]] {
+            CbBump(cb_merge_back.gap_samples);
+            CbBump(cb_merge_back.gap_ticks, Nx2Profile::Ticks() - gap_start);
+        }
         return 1 + size_t{count};
     }
     case Kind::StateDelta: {
@@ -3825,19 +3859,27 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
         const u32 count = static_cast<u32>(head >> 32);
         const bool verify = (head & CbVerify) != 0;
         const size_t first = verify ? 2 : 1;
+        // FRITCHII_CB_MERGE=1 (dry): the block's time by its size, 1 in 16.
+        u64 block_start = 0;
+        if (CbMergeOn()) [[unlikely]] {
+            if (cb_merge_sample_left == 0) {
+                cb_merge_sample_left = 15;
+                block_start = Nx2Profile::Ticks();
+            } else {
+                --cb_merge_sample_left;
+            }
+        }
         ExecuteCbWords(entry + first, count, verify ? entry + 1 : nullptr);
+        if (block_start != 0) [[unlikely]] {
+            const size_t bucket = count <= 1 ? 0 : count == 2 ? 1 : count <= 4 ? 2 : 3;
+            CbBump(cb_merge_back.block_samples[bucket]);
+            CbBump(cb_merge_back.block_ticks[bucket], Nx2Profile::Ticks() - block_start);
+        }
         return first + size_t{count};
     }
     }
     return 1;
 }
-
-namespace {
-/// A counter with one writer (the back): a plain load and store.
-void CbBump(std::atomic<u64>& counter, u64 amount = 1) {
-    counter.store(counter.load(std::memory_order_relaxed) + amount, std::memory_order_relaxed);
-}
-} // Anonymous namespace
 
 size_t GpuSplit::PlainEntrySize(u64 head) {
     switch (static_cast<Kind>(head & 0xf)) {
@@ -4090,10 +4132,81 @@ void GpuSplit::VerifyCbWords(const u64* words, u32 count, u64 front_address) {
     }
 }
 
+void GpuSplit::NoteCbMergeGap(Tegra::Engines::EngineInterface* engine) {
+    // FRITCHII_CB_MERGE=1 (dry): the ring words since the previous CbWords block's last word
+    // (cb_end; the front's own, not yet overwritten: at most 32 looked at). Joinable when they
+    // are only 3D constant buffer offset (and address/size) register writes: one entry could
+    // carry both blocks with their offsets.
+    using Tegra::Engines::Maxwell3D;
+    constexpr u32 cb_size = MAXWELL3D_REG_INDEX(const_buffer.size);
+    constexpr u32 cb_offset = MAXWELL3D_REG_INDEX(const_buffer.offset);
+    const bool same_engine = cb_last_engine == engine;
+    cb_last_engine = engine;
+    if (!same_engine || cb_end == 0 || engine != front_engine) {
+        return;
+    }
+    ++cb_merge.opens;
+    if (write_position < cb_end) {
+        ++cb_merge.blocked;
+        return;
+    }
+    const u64 gap = write_position - cb_end;
+    if (gap == 0) {
+        ++cb_merge.publish;
+        return;
+    }
+    if (gap > 32) {
+        ++cb_merge.blocked;
+        return;
+    }
+    bool rebind = false;
+    u64 pairs = 0;
+    const auto cb_register = [&](u32 method) {
+        if (method < cb_size || method > cb_offset) {
+            return false;
+        }
+        rebind |= method != cb_offset;
+        ++pairs;
+        return true;
+    };
+    for (u64 at = cb_end; at < write_position;) {
+        const u64 head = ring[at & RingMask];
+        u64 size = 0;
+        bool ok = false;
+        switch (static_cast<Kind>(head & 0xf)) {
+        case Kind::Pairs: {
+            const u32 count = static_cast<u32>(head >> 32);
+            size = 1 + u64{count};
+            ok = count != 0 && at + size <= write_position;
+            for (u32 i = 0; i < count && ok; ++i) {
+                ok = cb_register(static_cast<u32>(ring[(at + 1 + i) & RingMask] & 0xffff));
+            }
+            break;
+        }
+        case Kind::Method:
+            size = (head & HasSegment) != 0 ? 2 : 1;
+            ok = at + size <= write_position &&
+                 cb_register(static_cast<u32>((head >> 8) & 0xffff));
+            break;
+        default:
+            break;
+        }
+        if (!ok) {
+            ++cb_merge.blocked;
+            return;
+        }
+        at += size;
+    }
+    ++(rebind ? cb_merge.rebind : cb_merge.offset);
+    cb_merge.gap_pairs += pairs;
+}
+
 void GpuSplit::ReportCbWords() {
     const auto now = std::chrono::steady_clock::now();
     if (cb_since == std::chrono::steady_clock::time_point{}) {
         cb_since = now;
+        cb_merge_ticks_at = Nx2Profile::Ticks(); // FRITCHII_CB_MERGE's tick clock
+        cb_merge_clock_at = now;
         cb_reported = cb_stats;
         cb_reported_overflows = ranged_overflow_count;
         return;
@@ -4129,6 +4242,68 @@ void GpuSplit::ReportCbWords() {
                  back(cb_back.applied_twice), back(cb_back.apply_differ),
                  back(cb_back.apply_skipped));
     }
+    // FRITCHII_CB_MERGE=1 (dry): how many block pairs one entry could carry and what E would save.
+    // A merged entry still writes every word and offset, so the saving is the per-block fixed
+    // part (2 x a 1-word block - a 2-word block, from the sampled times) and, at most, the
+    // separating offset entry's own time.
+    const u64 ticks_now = Nx2Profile::Ticks();
+    if (CbMergeOn() || cb_merge.opens != 0) {
+        double ns_per_tick = 0.0;
+        if (cb_merge_ticks_at != 0 && ticks_now > cb_merge_ticks_at) {
+            ns_per_tick = std::chrono::duration<double, std::nano>(now - cb_merge_clock_at).count() /
+                          static_cast<double>(ticks_now - cb_merge_ticks_at);
+        }
+        std::array<double, 4> block_ns{};
+        std::array<u64, 4> block_counts{};
+        for (size_t i = 0; i < 4; ++i) {
+            const u64 samples = back(cb_merge_back.block_samples[i]);
+            const u64 ticks = back(cb_merge_back.block_ticks[i]);
+            block_counts[i] = samples - cb_merge_last_samples[i];
+            block_ns[i] = block_counts[i] != 0
+                              ? static_cast<double>(ticks - cb_merge_last_ticks[i]) * ns_per_tick /
+                                    static_cast<double>(block_counts[i])
+                              : 0.0;
+            cb_merge_last_samples[i] = samples;
+            cb_merge_last_ticks[i] = ticks;
+        }
+        const u64 gap_entries = back(cb_merge_back.gap_entries);
+        const u64 gap_samples = back(cb_merge_back.gap_samples);
+        const u64 gap_ticks = back(cb_merge_back.gap_ticks);
+        const u64 gap_sampled = gap_samples - cb_merge_last_gap_samples;
+        const double gap_ns = gap_sampled != 0
+                                  ? static_cast<double>(gap_ticks - cb_merge_last_gap_ticks) *
+                                        ns_per_tick / static_cast<double>(gap_sampled)
+                                  : 0.0;
+        const double gap_rate =
+            static_cast<double>(gap_entries - cb_merge_last_gap_entries) / seconds;
+        cb_merge_last_gap_entries = gap_entries;
+        cb_merge_last_gap_samples = gap_samples;
+        cb_merge_last_gap_ticks = gap_ticks;
+        const double fixed_ns = (std::max)(0.0, 2.0 * block_ns[0] - block_ns[1]);
+        const double joinable = static_cast<double>(cb_merge.offset + cb_merge.rebind) / seconds;
+        LOG_INFO(HW_GPU,
+                 "CB merge (FRITCHII_CB_MERGE=1, dry) {:.0f} s: blocks opened after a block "
+                 "{:.0f}/s: joinable {:.0f}/s (offset only {:.0f}, with address/size {:.0f}; "
+                 "{:.2f} writes between), nothing between {:.0f}/s, blocked by other entries "
+                 "{:.0f}/s; E, sampled 1 in 16: blocks of 1/2/3-4/5+ words {:.0f}/{:.0f}/{:.0f}/"
+                 "{:.0f} ns, offset-only pair entries {:.0f}/s at {:.0f} ns; fixed part a block "
+                 "{:.0f} ns; E saving if joined {:.1f} to {:.1f} ms/s",
+                 seconds,
+                 static_cast<double>(cb_merge.opens) / seconds, joinable,
+                 static_cast<double>(cb_merge.offset) / seconds,
+                 static_cast<double>(cb_merge.rebind) / seconds,
+                 cb_merge.offset + cb_merge.rebind != 0
+                     ? static_cast<double>(cb_merge.gap_pairs) /
+                           static_cast<double>(cb_merge.offset + cb_merge.rebind)
+                     : 0.0,
+                 static_cast<double>(cb_merge.publish) / seconds,
+                 static_cast<double>(cb_merge.blocked) / seconds, block_ns[0], block_ns[1],
+                 block_ns[2], block_ns[3], gap_rate, gap_ns, fixed_ns,
+                 joinable * fixed_ns / 1e6, joinable * (fixed_ns + gap_ns) / 1e6);
+        cb_merge = {};
+    }
+    cb_merge_ticks_at = ticks_now;
+    cb_merge_clock_at = now;
     cb_since = now;
     cb_reported = cb_stats;
     cb_reported_overflows = ranged_overflow_count;
