@@ -1080,6 +1080,19 @@ Line every ~10 s: "CB merge (FRITCHII_CB_MERGE=N) S s: front joined writes J/s, 
 marks M/s (not marked K/s); E: joined blocks B/s, joined writes W/s; session: runs checked C, must
 be 0: differ D, bad words X". Judge on E's ms/s ("method" and "cb upload") and us a draw.
 
+### FRITCHII_QUERY_FLUSH_DRY
+
+TEST, off by default (helper DE, 2026-11-17). Live, a dry timer that changes nothing. The front's
+report DMA flush (QueryDma::FlushPending in a split Run, the 0xe2c path) lends
+RasterizerVulkan::FlushQueryResults to R: E parks until R reaches it and asks its query cache
+(SemiFlushRegion). kaksample2 (unprofiled CPU sample, Kakariko): ~30 ms/s of E parked there,
+while R finds reports to wait for under once a second; the profile's lends line misses these.
+Per lend: E's parked time, whether R found reports in the range, and whether E's own
+report-landing pages (POST_FENCE, OneFollower::ReportLandingClear) call the range clear. Line every
+10 s: "Query flush lends (FRITCHII_QUERY_FLUSH_DRY=1) S s: N/s, E parked T ms/s (U us each); R found
+reports in F/s; E's landing pages clear for C/s (ms/s), R found reports in X/s of them (must be 0
+to skip on it; total since boot); ceiling (clear, nothing found) Y ms/s". Gate 1: Y >= 5 and X = 0.
+
 ### FRITCHII_HOSTTIMING_OFF_GPU
 
 TEST, off by default (helper DE, 2026-11-17). Live. 0 (as before): the timer thread's spin goes to
