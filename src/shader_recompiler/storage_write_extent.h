@@ -321,4 +321,228 @@ constexpr void MergeStorageCbufExtent(StorageCbufExtent& base, const StorageCbuf
     }
 }
 
+/// FRITCHII_STORE_FOOTPRINT: why a written storage buffer has no store footprint.
+enum class StoreFootprintWhy : u8 {
+    NotRecorded,       ///< nothing recorded (an info from the precompiled cache, or not written)
+    Recorded,          ///< it has one
+    UntrackedWrites,   ///< a store of the program stays global (routed by address at run time)
+    RuntimeRouted,     ///< the store picks one of several pointers at run time
+    GlobalStore,       ///< a driver buffer the program's global stores may land anywhere in
+    AddressNotTracked, ///< a store's 64-bit address is not split into pointer + low word
+    NoPointerTerm,     ///< a store's low word does not add the pointer word exactly once
+    NoStores,          ///< written, but no store of it was rebased on it
+    Joined,            ///< both halves of a joined program write it
+};
+
+[[nodiscard]] constexpr const char* StoreFootprintWhyName(StoreFootprintWhy why) {
+    switch (why) {
+    case StoreFootprintWhy::NotRecorded:
+        return "not recorded (a precompiled-cache info: run with EDEN_NX2_PRECOMPILED_FAST=0)";
+    case StoreFootprintWhy::Recorded:
+        return "recorded";
+    case StoreFootprintWhy::UntrackedWrites:
+        return "a store stays global";
+    case StoreFootprintWhy::RuntimeRouted:
+        return "pointer picked at run time";
+    case StoreFootprintWhy::GlobalStore:
+        return "the program stores to global memory";
+    case StoreFootprintWhy::AddressNotTracked:
+        return "address not split into pointer + low word";
+    case StoreFootprintWhy::NoPointerTerm:
+        return "low word does not add the pointer once";
+    case StoreFootprintWhy::NoStores:
+        return "no store rebased on it";
+    case StoreFootprintWhy::Joined:
+        return "written by both halves of a joined program";
+    }
+    return "?";
+}
+
+/// FRITCHII_STORE_FOOTPRINT: the bytes a program's stores and atomics to one storage buffer can
+/// land on, relative to the pointer word. Every store's offset is exactly
+///
+///   c + (a sum of multiples of `modulus`)
+///
+/// where the multiples are invocation or workgroup ids, values loaded from memory, loop counters
+/// or constant buffer words times a stride (ExactCongruence in the pass). So each store byte's
+/// offset mod `modulus` falls in one of `intervals` ([begin, end) inside [0, modulus), sorted and
+/// apart). A modulus of 2^32 is an exact set of offsets (constant stores only). A modulus that is
+/// not a power of two holds only while the 32-bit offset does not wrap (pointer + offset stays
+/// inside 4 GiB), which the dry count checks at landing. Over-approximated (gaps filled) past
+/// MaxIntervals pieces.
+struct StorageStoreFootprint {
+    static constexpr size_t MaxIntervals = 8;
+    struct Interval {
+        u64 begin{};
+        u64 end{};
+    };
+    u64 modulus{}; ///< 0: no footprint (see why)
+    StoreFootprintWhy why{StoreFootprintWhy::NotRecorded};
+    u8 num_intervals{};
+    /// Every multiple came from invocation and workgroup ids (no loaded or constant buffer value)
+    bool ids_only{};
+    /// The intervals cover every residue: the footprint claims nothing
+    bool covers_all{};
+    /// Gaps were filled to fit MaxIntervals
+    bool widened{};
+    u16 stores{}; ///< stores and atomics merged
+    std::array<Interval, MaxIntervals> intervals{};
+
+    [[nodiscard]] constexpr bool Valid() const {
+        return modulus != 0;
+    }
+    [[nodiscard]] constexpr bool PowerOfTwo() const {
+        return modulus != 0 && (modulus & (modulus - 1)) == 0;
+    }
+};
+
+/// One store for MakeStoreFootprint: offset == c (mod m), m == 0 for an exact offset (c is then
+/// the signed 32-bit offset: negative lands below the pointer).
+struct StoreCongruence {
+    s64 c{};
+    u64 m{};
+    u32 size{};
+};
+
+/// FRITCHII_STORE_FOOTPRINT: a footprint from every store of a buffer (an empty list: no
+/// stores). The modulus is the gcd of the stores' moduli (2^32 when every store is exact).
+[[nodiscard]] constexpr StorageStoreFootprint MakeStoreFootprint(const StoreCongruence* stores,
+                                                                 size_t count, bool ids_only) {
+    StorageStoreFootprint result{};
+    if (count == 0) {
+        result.why = StoreFootprintWhy::NoStores;
+        return result;
+    }
+    constexpr u64 Exact = u64{1} << 32;
+    const auto gcd = [](u64 a, u64 b) {
+        while (b != 0) {
+            const u64 t = a % b;
+            a = b;
+            b = t;
+        }
+        return a;
+    };
+    u64 modulus = 0;
+    for (size_t i = 0; i < count; ++i) {
+        modulus = gcd(modulus, stores[i].m);
+    }
+    if (modulus == 0 || modulus > Exact) {
+        modulus = Exact;
+    }
+    result.modulus = modulus;
+    result.why = StoreFootprintWhy::Recorded;
+    result.ids_only = ids_only;
+    result.stores = static_cast<u16>(count > 0xffff ? 0xffff : count);
+    // Pieces, at most two per store (one that wraps past the modulus is split), sorted and merged
+    // whenever the array fills up
+    constexpr size_t MaxPieces = 64;
+    std::array<StorageStoreFootprint::Interval, MaxPieces> pieces{};
+    size_t num_pieces = 0;
+    // Sort (insertion sort: constexpr and small), merge touching pieces, then fill the smallest
+    // gaps down to `limit` pieces (a wider footprint is still a footprint)
+    const auto compact = [&](size_t limit) {
+        for (size_t i = 1; i < num_pieces; ++i) {
+            const auto piece = pieces[i];
+            size_t j = i;
+            while (j > 0 && pieces[j - 1].begin > piece.begin) {
+                pieces[j] = pieces[j - 1];
+                --j;
+            }
+            pieces[j] = piece;
+        }
+        size_t merged = 0;
+        for (size_t i = 0; i < num_pieces; ++i) {
+            if (merged != 0 && pieces[i].begin <= pieces[merged - 1].end) {
+                pieces[merged - 1].end = (std::max)(pieces[merged - 1].end, pieces[i].end);
+            } else {
+                pieces[merged++] = pieces[i];
+            }
+        }
+        while (merged > limit) {
+            size_t smallest = 1;
+            for (size_t i = 2; i < merged; ++i) {
+                if (pieces[i].begin - pieces[i - 1].end <
+                    pieces[smallest].begin - pieces[smallest - 1].end) {
+                    smallest = i;
+                }
+            }
+            pieces[smallest - 1].end = pieces[smallest].end;
+            for (size_t i = smallest; i + 1 < merged; ++i) {
+                pieces[i] = pieces[i + 1];
+            }
+            --merged;
+            result.widened = true;
+        }
+        num_pieces = merged;
+    };
+    for (size_t i = 0; i < count; ++i) {
+        const u64 size = stores[i].size;
+        if (size >= modulus) {
+            result.covers_all = true;
+            result.num_intervals = 1;
+            result.intervals[0] = {0, modulus};
+            return result;
+        }
+        if (num_pieces + 2 > MaxPieces) {
+            compact(MaxPieces / 2);
+        }
+        const s64 residue = stores[i].c % static_cast<s64>(modulus);
+        const u64 begin = static_cast<u64>(residue < 0 ? residue + static_cast<s64>(modulus)
+                                                       : residue);
+        const u64 end = begin + size;
+        if (end <= modulus) {
+            pieces[num_pieces++] = {begin, end};
+        } else {
+            pieces[num_pieces++] = {begin, modulus};
+            pieces[num_pieces++] = {0, end - modulus};
+        }
+    }
+    compact(StorageStoreFootprint::MaxIntervals);
+    const size_t merged = num_pieces;
+    result.num_intervals = static_cast<u8>(merged);
+    for (size_t i = 0; i < merged; ++i) {
+        result.intervals[i] = pieces[i];
+    }
+    result.covers_all = merged == 1 && pieces[0].begin == 0 && pieces[0].end == modulus;
+    return result;
+}
+
+/// FRITCHII_STORE_FOOTPRINT: whether any of the bytes [offset, offset + size) past the pointer
+/// (offset may be negative: below the pointer) can be a store byte of the footprint.
+[[nodiscard]] constexpr bool StoreFootprintHits(const StorageStoreFootprint& footprint, s64 offset,
+                                                u64 size) {
+    if (!footprint.Valid() || footprint.covers_all) {
+        return true;
+    }
+    if (size == 0) {
+        return false;
+    }
+    const u64 modulus = footprint.modulus;
+    if (size >= modulus) {
+        return true;
+    }
+    u64 begin;
+    if (footprint.PowerOfTwo()) {
+        // Two's complement: the same residue as the 32-bit offset the shader computes
+        begin = static_cast<u64>(offset) & (modulus - 1);
+    } else {
+        const s64 m = static_cast<s64>(modulus);
+        const s64 r = offset % m;
+        begin = static_cast<u64>(r < 0 ? r + m : r);
+    }
+    const u64 end = begin + size;
+    const auto overlaps = [&](u64 lower, u64 upper) {
+        for (size_t i = 0; i < footprint.num_intervals; ++i) {
+            if (footprint.intervals[i].begin < upper && lower < footprint.intervals[i].end) {
+                return true;
+            }
+        }
+        return false;
+    };
+    if (end <= modulus) {
+        return overlaps(begin, end);
+    }
+    return overlaps(begin, modulus) || overlaps(0, end - modulus);
+}
+
 } // namespace Shader

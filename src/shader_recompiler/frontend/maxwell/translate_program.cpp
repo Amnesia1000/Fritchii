@@ -127,6 +127,13 @@ void AddNVNStorageBuffers(IR::Program& program, const HostTranslateInfo& host_in
     if ((global_stores || !extras.empty()) && extras.size() != descs.size()) {
         extras.assign(descs.size(), StorageWriteExtra{});
     }
+    if (global_stores) {
+        // FRITCHII_STORE_FOOTPRINT: a global store may land in any written buffer
+        for (StorageWriteExtra& extra : extras) {
+            extra.footprint = StorageStoreFootprint{};
+            extra.footprint.why = StoreFootprintWhy::GlobalStore;
+        }
+    }
     for (u32 index = 0; index < num_buffers; ++index) {
         if (!program.info.nvn_buffer_used[index]) {
             continue;

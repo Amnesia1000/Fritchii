@@ -462,7 +462,8 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                                                   desc.is_written, desc.indirect_offset,
 
                                                   desc.write_extent,
-                                                  Shader::StorageWriteExtraOf(info, ssbo_index));
+                                                  Shader::StorageWriteExtraOf(info, ssbo_index),
+                                                  Shader::StorageReadExtentOf(info, ssbo_index));
             ++ssbo_index;
         }
     }

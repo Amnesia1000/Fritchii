@@ -78,7 +78,25 @@ private:
     mutable std::atomic<int> state{-1};
 };
 
-inline FirstUseMode g_early{[] { return ReadMode("FRITCHII_EARLY_COMPUTE"); }};
+// FRITCHII_FEEDER_LANE (read at first use, default 0; 1 = dry; helper_dl_answer.md item 2): would
+// a feeder dispatch on a second (async compute) lane, started right after its real
+// dependencies, finish sooner than on the main queue? At each feeder's bind (JudgeEarlyCompute)
+// D is the newest unrun main-queue work it really depends on: the newest unrun write mark over
+// its bound ranges (storage bindings narrowed to their read extent plus their write mark when the
+// read extent is proven, else the whole binding), the newest unrun use of the ranges it writes
+// (WAR), and its own upload's chunk when the bind uploads. A mark or use of an earlier judged
+// feeder gives that feeder's own D, not its tick (compute chains stay on the lane, in order).
+// When either ring has wrapped past the known tick, D is the feeder's own chunk. The write
+// marks carry D; at a read that waits for such a writer the reader waits for D first, then the
+// writer (same timeline, the total wait is unchanged): "after D until the writer ran" is the
+// predicted saving. Images are not part of D (counted apart: a compute-family lane can't take
+// them). Turns FRITCHII_EARLY_COMPUTE's dry count, its rings and FRITCHII_READ_RUNS=2's stamps on.
+// =2..9 are not built (they count as 1). Lines every 10 s: "Feeder lane".
+inline FirstUseMode g_lane{[] { return ReadMode("FRITCHII_FEEDER_LANE"); }};
+inline FirstUseMode g_early{[] {
+    const int early = ReadMode("FRITCHII_EARLY_COMPUTE");
+    return early != 0 ? early : (g_lane ? 1 : 0);
+}};
 inline FirstUseMode g_side_copy{[] { return ReadMode("FRITCHII_READ_SIDE_COPY"); }};
 /// FRITCHII_SUBMIT_TIMES (vk_submit_times.h): GPU timestamps per submission, for the cuts.
 inline FirstUseMode g_submit_times{[] { return ReadMode("FRITCHII_SUBMIT_TIMES"); }};
@@ -95,12 +113,64 @@ enum class Verdict : u8 {
 /// Set around a dispatch's binds (BindHostComputeBuffers), read by its write marks.
 inline thread_local Verdict t_verdict{Verdict::NotJudged};
 
+/// FRITCHII_FEEDER_LANE: what set a feeder's D.
+enum class LaneKind : u8 {
+    None,        ///< nothing unrun it depends on: the lane could start it at once
+    DrawBuffer,  ///< an unrun draw's storage or texture buffer write over its inputs
+    ComputeMain, ///< an unrun earlier dispatch (not a judged feeder) on the main queue
+    ComputeLane, ///< an earlier judged feeder: its own D (it would be on the lane too)
+    Other,       ///< an unrun copy, query, transform feedback or indirect write
+    Use,         ///< an unrun use of a range it writes (WAR)
+    Upload,      ///< its own bind uploaded CPU data in its chunk
+    Wrapped,     ///< a ring wrapped past the known tick: its own chunk (not eligible)
+    Count,
+};
+
+[[nodiscard]] inline const char* LaneKindName(LaneKind kind) {
+    switch (kind) {
+    case LaneKind::None:
+        return "nothing unrun";
+    case LaneKind::DrawBuffer:
+        return "draw-written buffer";
+    case LaneKind::ComputeMain:
+        return "earlier dispatch on the main queue";
+    case LaneKind::ComputeLane:
+        return "earlier feeder on the lane";
+    case LaneKind::Other:
+        return "copy/query/other";
+    case LaneKind::Use:
+        return "unrun use of its written range (WAR)";
+    case LaneKind::Upload:
+        return "its own upload";
+    case LaneKind::Wrapped:
+        return "ring wrapped";
+    case LaneKind::Count:
+        break;
+    }
+    return "?";
+}
+
+/// FRITCHII_FEEDER_LANE: a judged feeder's D, kept in its write marks and uses. `d` counts its
+/// own upload; `d_copy` is D if the lane took the upload copy too. Stamps of the buffer cache's
+/// clock (0: nothing unrun).
+struct Lane {
+    u64 d{};
+    u64 d_copy{};
+    LaneKind kind{LaneKind::None};
+    LaneKind copy_kind{LaneKind::None};
+    bool judged{};
+};
+
+/// Set around a judged feeder's binds (BindHostComputeBuffers), read by its marks and uses.
+inline thread_local Lane t_lane{};
+
 // ---- Uses: every bound buffer range (Buffer::MarkUsage), for the write-after-read test.
 
 struct Use {
     u64 begin{};
     u64 end{};
     u64 stamp{}; ///< the buffer cache clock's stamp of the use
+    Lane lane{}; ///< FRITCHII_FEEDER_LANE: the using feeder's D (judged ones)
 };
 
 inline constexpr size_t UseRingSize = 65536;
@@ -126,8 +196,69 @@ inline void NoteUse(u64 begin, u64 size, u64 stamp) {
     if (r.uses.empty()) {
         r.uses.resize(UseRingSize);
     }
-    r.uses[r.count % UseRingSize] = Use{begin, begin + size, stamp};
+    r.uses[r.count % UseRingSize] = Use{begin, begin + size, stamp, t_lane};
     ++r.count;
+}
+
+/// FRITCHII_FEEDER_LANE: the newest dependency in a ring scan (a write mark's or a use's), for
+/// D with its own upload and D with the copy on the lane.
+struct LaneDep {
+    u64 d{};
+    u64 d_copy{};
+    LaneKind kind{LaneKind::None};
+    LaneKind copy_kind{LaneKind::None};
+    bool incomplete{}; ///< the ring wrapped before a run entry: not every dependency is known
+
+    /// One unrun entry over the ranges: its stamp, or a judged feeder's own D
+    void Add(u64 stamp, const Lane& lane, LaneKind main_kind) {
+        const u64 strict = lane.judged ? lane.d : stamp;
+        const u64 copy = lane.judged ? lane.d_copy : stamp;
+        const LaneKind kind_of = lane.judged ? LaneKind::ComputeLane : main_kind;
+        if (strict > d) {
+            d = strict;
+            kind = kind_of;
+        }
+        if (copy > d_copy) {
+            d_copy = copy;
+            copy_kind = kind_of;
+        }
+    }
+
+    void Merge(const LaneDep& other) {
+        if (other.d > d) {
+            d = other.d;
+            kind = other.kind;
+        }
+        if (other.d_copy > d_copy) {
+            d_copy = other.d_copy;
+            copy_kind = other.copy_kind;
+        }
+        incomplete |= other.incomplete;
+    }
+};
+
+/// FRITCHII_FEEDER_LANE: the newest unrun use over any of `ranges` ({begin, end}), newest first,
+/// stopping at the first run one.
+template <typename Ranges, typename IsFree>
+[[nodiscard]] LaneDep NewestPendingUse(const Ranges& ranges, IsFree&& is_free) {
+    LaneDep dep{};
+    UseRing& r = GetUseRing();
+    std::scoped_lock lock{r.mutex};
+    const u64 n = (std::min<u64>)(r.count, UseRingSize);
+    for (u64 i = 0; i < n; ++i) {
+        const Use& use = r.uses[(r.count - 1 - i) % UseRingSize];
+        if (is_free(use.stamp)) {
+            return dep;
+        }
+        for (const auto& [begin, end] : ranges) {
+            if (use.begin < end && begin < use.end) {
+                dep.Add(use.stamp, use.lane, LaneKind::Use);
+                break;
+            }
+        }
+    }
+    dep.incomplete = n == UseRingSize;
+    return dep;
 }
 
 /// Whether an unrun use overlaps [begin, end): newest first, stopping at the first run one
@@ -177,6 +308,101 @@ inline void LearnFeeder(u64 program) {
     }
     std::scoped_lock lock{f.mutex};
     return f.programs.contains(program);
+}
+
+// ---- FRITCHII_FEEDER_LANE counts per feeder program, logged every 10 s (ReadRunStats::LogDry).
+
+inline constexpr size_t LaneKinds = static_cast<size_t>(LaneKind::Count);
+
+struct LaneProgram {
+    // Binds (JudgeEarlyCompute and after the binds)
+    u64 judged{};
+    u64 bind_kinds[LaneKinds]{}; ///< what set D (with its own upload) at the bind
+    u64 uploads{};               ///< binds that uploaded CPU data
+    u64 storage_bindings{};      ///< storage bindings of those binds
+    u64 read_extents{};          ///< of them narrowed to a proven read extent
+    // Images (ComputePipeline::Configure): not part of D
+    u64 configured{};
+    u64 with_images{};
+    u64 image_pending{}; ///< an image's last GPU write unrun at the configure
+    // Reads that waited for a write of one of its judged dispatches (the area mark's)
+    u64 reads{};
+    u64 wait_ns{};
+    u64 cut{};             ///< the wait was cut at the writer's tick (writer submitted)
+    u64 eligible{};        ///< of them, D's tick before the writer's
+    u64 saving_ns{};       ///< of those, from D having run until the writer ran
+    u64 copy_eligible{};   ///< the same with D_copy (the lane takes the upload too)
+    u64 copy_saving_ns{};
+    u64 read_kinds[LaneKinds]{}; ///< what set D, over the cut reads
+    u64 behind_sum{};      ///< eligible: submissions from D's to the writer's
+    u64 d_after_writer{};  ///< must be 0: D's tick past the writer's
+    u64 d_unsubmitted{};   ///< D not submitted when waited for (no saving counted)
+};
+
+struct LaneStats {
+    std::mutex mutex;
+    std::unordered_map<u64, LaneProgram> programs;
+};
+
+inline LaneStats& GetLaneStats() {
+    static LaneStats stats;
+    return stats;
+}
+
+/// BufferCache::BindHostComputeBuffers, after a judged feeder's binds.
+inline void NoteLaneJudged(u64 program, const Lane& lane, bool uploaded, u32 storage_bindings,
+                           u32 read_extents) {
+    LaneStats& s = GetLaneStats();
+    std::scoped_lock lock{s.mutex};
+    LaneProgram& p = s.programs[program];
+    ++p.judged;
+    ++p.bind_kinds[static_cast<size_t>(lane.kind)];
+    p.uploads += uploaded ? 1 : 0;
+    p.storage_bindings += storage_bindings;
+    p.read_extents += read_extents;
+}
+
+/// One read that waited for a judged feeder's write (ReadRunStats::NoteWriter).
+struct LaneRead {
+    u64 wait_ns{};
+    bool cut{};
+    u64 writer_ns{};    ///< from the wait's start until the writer ran
+    u64 write_tick{};
+    u64 lane_tick{};    ///< D's tick (0: nothing unrun at the bind)
+    u64 lane_ns{};      ///< from the wait's start until D ran (0: D had run)
+    u64 copy_tick{};
+    u64 copy_ns{};
+    bool unsubmitted{}; ///< D (or D_copy) was not submitted when waited for
+    LaneKind kind{};
+};
+
+inline void NoteLaneRead(u64 program, const LaneRead& read) {
+    LaneStats& s = GetLaneStats();
+    std::scoped_lock lock{s.mutex};
+    LaneProgram& p = s.programs[program];
+    ++p.reads;
+    p.wait_ns += read.wait_ns;
+    if (read.lane_tick > read.write_tick || read.copy_tick > read.write_tick) {
+        ++p.d_after_writer;
+    }
+    if (!read.cut) {
+        return;
+    }
+    ++p.cut;
+    ++p.read_kinds[static_cast<size_t>(read.kind)];
+    if (read.unsubmitted) {
+        ++p.d_unsubmitted;
+        return;
+    }
+    if (read.lane_tick < read.write_tick) {
+        ++p.eligible;
+        p.saving_ns += read.writer_ns > read.lane_ns ? read.writer_ns - read.lane_ns : 0;
+        p.behind_sum += read.write_tick - read.lane_tick;
+    }
+    if (read.copy_tick < read.write_tick) {
+        ++p.copy_eligible;
+        p.copy_saving_ns += read.writer_ns > read.copy_ns ? read.writer_ns - read.copy_ns : 0;
+    }
 }
 
 // ---- Counts, logged with FRITCHII_READ_RUNS' lines every 600 frames.
@@ -256,13 +482,115 @@ inline void NoteRead(size_t kind, Verdict verdict, bool cut, u64 writer_wait_ns)
 
 /// ComputePipeline::Configure, for a feeder program.
 inline void NoteImages(u64 program, bool with_images, bool pending, bool writes_images) {
-    Counts& c = Get();
-    std::scoped_lock lock{c.mutex};
-    ProgramImages& p = c.images[program];
-    ++p.dispatches;
-    p.with_images += with_images ? 1 : 0;
-    p.image_pending += pending ? 1 : 0;
-    p.writes_images += writes_images ? 1 : 0;
+    {
+        Counts& c = Get();
+        std::scoped_lock lock{c.mutex};
+        ProgramImages& p = c.images[program];
+        ++p.dispatches;
+        p.with_images += with_images ? 1 : 0;
+        p.image_pending += pending ? 1 : 0;
+        p.writes_images += writes_images ? 1 : 0;
+    }
+    if (g_lane) [[unlikely]] {
+        LaneStats& s = GetLaneStats();
+        std::scoped_lock lock{s.mutex};
+        LaneProgram& p = s.programs[program];
+        ++p.configured;
+        p.with_images += with_images ? 1 : 0;
+        p.image_pending += pending ? 1 : 0;
+    }
+}
+
+/// FRITCHII_FEEDER_LANE: the "Feeder lane" lines (every 10 s, ReadRunStats::LogDry): a header,
+/// then the feeders with the longest read-back waits.
+inline void LogLane(double frames, double seconds) {
+    LaneStats& s = GetLaneStats();
+    std::unordered_map<u64, LaneProgram> programs;
+    {
+        std::scoped_lock lock{s.mutex};
+        programs.swap(s.programs);
+    }
+    const auto ms_frame = [frames](u64 ns) { return static_cast<double>(ns) / 1e6 / frames; };
+    const auto ms_each = [](u64 ns, u64 n) {
+        return n != 0 ? static_cast<double>(ns) / 1e6 / static_cast<double>(n) : 0.0;
+    };
+    const auto share = [](u64 part, u64 whole) {
+        return whole != 0 ? 100.0 * static_cast<double>(part) / static_cast<double>(whole) : 0.0;
+    };
+    LaneProgram total{};
+    for (const auto& [program, p] : programs) {
+        total.judged += p.judged;
+        total.reads += p.reads;
+        total.wait_ns += p.wait_ns;
+        total.cut += p.cut;
+        total.eligible += p.eligible;
+        total.saving_ns += p.saving_ns;
+        total.copy_eligible += p.copy_eligible;
+        total.copy_saving_ns += p.copy_saving_ns;
+        total.d_after_writer += p.d_after_writer;
+        total.d_unsubmitted += p.d_unsubmitted;
+        total.uploads += p.uploads;
+        total.storage_bindings += p.storage_bindings;
+        total.read_extents += p.read_extents;
+        for (size_t k = 0; k < LaneKinds; ++k) {
+            total.bind_kinds[k] += p.bind_kinds[k];
+        }
+    }
+    LOG_INFO(HW_GPU,
+             "Feeder lane (FRITCHII_FEEDER_LANE={}, dry) last {:.0f} s: {} feeder programs, {} "
+             "dispatches judged ({:.0f} a frame; {} uploaded; storage bindings narrowed to a "
+             "proven read extent {} of {}) | D at the bind: nothing unrun {}, draw-written buffer "
+             "{}, earlier dispatch on the main queue {}, earlier feeder on the lane {}, "
+             "copy/query/other {}, unrun use of its written range {}, its own upload {}, ring "
+             "wrapped {} | reads that waited for them {} ({:.2f} ms a frame), cut at the writer's "
+             "tick {} | eligible (D before the writer's submission) {} = {:.0f}% of the cut "
+             "reads | predicted saving {:.2f} ms a frame ({:.3f} a read), with the upload on the "
+             "lane too {:.2f} ms a frame ({} eligible) | D not submitted when waited {} | must "
+             "be 0: D after the writer {}",
+             g_lane.Get(), seconds, programs.size(), total.judged,
+             static_cast<double>(total.judged) / frames, total.uploads, total.read_extents,
+             total.storage_bindings, total.bind_kinds[0], total.bind_kinds[1],
+             total.bind_kinds[2], total.bind_kinds[3], total.bind_kinds[4], total.bind_kinds[5],
+             total.bind_kinds[6], total.bind_kinds[7], total.reads, ms_frame(total.wait_ns),
+             total.cut, total.eligible, share(total.eligible, total.cut),
+             ms_frame(total.saving_ns), ms_each(total.saving_ns, total.eligible),
+             ms_frame(total.copy_saving_ns), total.copy_eligible, total.d_unsubmitted,
+             total.d_after_writer);
+    std::vector<std::pair<u64, const LaneProgram*>> order;
+    order.reserve(programs.size());
+    for (const auto& [program, p] : programs) {
+        if (p.reads != 0) {
+            order.emplace_back(program, &p);
+        }
+    }
+    const size_t shown = (std::min<size_t>)(6, order.size());
+    std::partial_sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(shown),
+                      order.end(), [](const auto& a, const auto& b) {
+                          return a.second->wait_ns > b.second->wait_ns;
+                      });
+    for (size_t i = 0; i < shown; ++i) {
+        const LaneProgram& p = *order[i].second;
+        LOG_INFO(HW_GPU,
+                 "Feeder lane {}/{}: program {:016x} | reads waited {} ({:.2f} ms a frame), cut "
+                 "{} | eligible share f {:.0f}% ({} of the cut reads), predicted saving {:.2f} ms "
+                 "a frame ({:.3f} a read), with the upload on the lane {:.2f} ms a frame | D set "
+                 "by (cut reads): nothing unrun {}, draw-written buffer {}, earlier dispatch on "
+                 "the main queue {}, earlier feeder on the lane {}, copy/query/other {}, unrun use "
+                 "of its written range {}, its own upload {}, ring wrapped {} | D {:.1f} "
+                 "submissions before the writer | binds {} (uploaded {}, read extents {} of {}) | "
+                 "images (not in D): configured {}, with images {}, an image's last write unrun {} "
+                 "| D not submitted {}, must be 0: D after the writer {}",
+                 i + 1, shown, order[i].first, p.reads, ms_frame(p.wait_ns), p.cut,
+                 share(p.eligible, p.cut), p.eligible, ms_frame(p.saving_ns),
+                 ms_each(p.saving_ns, p.eligible), ms_frame(p.copy_saving_ns), p.read_kinds[0],
+                 p.read_kinds[1], p.read_kinds[2], p.read_kinds[3], p.read_kinds[4],
+                 p.read_kinds[5], p.read_kinds[6], p.read_kinds[7],
+                 p.eligible != 0
+                     ? static_cast<double>(p.behind_sum) / static_cast<double>(p.eligible)
+                     : 0.0,
+                 p.judged, p.uploads, p.read_extents, p.storage_bindings, p.configured,
+                 p.with_images, p.image_pending, p.d_unsubmitted, p.d_after_writer);
+    }
 }
 
 /// BufferCache::RecordReadDownload: what the newest write over a new download's bytes was.
