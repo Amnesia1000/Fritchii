@@ -980,11 +980,15 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
     // DontInline only with EDEN_NX2_SPIRV_INLINE_GLOBALS=0: it builds those shaders faster, but
     // cost ~2.6 fps walking through Hyrule Field on an RTX 4080 (fresh launches, 55.2/55.3 vs
     // 57.9/57.8 inlined), and a shader is built once before the driver's cache has it.
-    static const spv::FunctionControlMask function_control = [] {
+    // =2 (tester report 2026-11-18, RTX 3070: a 7.6 s freeze mid-combat on a compute shader the
+    // driver had not cached): DontInline for compute programs only, graphics stays inlined.
+    static const int inline_mode = [] {
         const char* value = std::getenv("EDEN_NX2_SPIRV_INLINE_GLOBALS");
-        return value != nullptr && value[0] == '0' ? spv::FunctionControlMask::DontInline
-                                                   : spv::FunctionControlMask::MaskNone;
+        return value == nullptr ? 1 : value[0] == '0' ? 0 : value[0] == '2' ? 2 : 1;
     }();
+    const bool dont_inline = inline_mode == 0 || (inline_mode == 2 && stage == Stage::Compute);
+    const spv::FunctionControlMask function_control =
+        dont_inline ? spv::FunctionControlMask::DontInline : spv::FunctionControlMask::MaskNone;
     const Id zero{u32_zero_value};
     const auto define_body{[&](DefPtr ssbo_member, Id addr, Id element_pointer, u32 shift,
                                auto&& callback) {

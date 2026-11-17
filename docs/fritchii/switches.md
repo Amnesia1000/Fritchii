@@ -7030,3 +7030,12 @@ src/common/fritchii_switch_defaults.cpp); each section below still says how it w
 FRITCHII_GATHER_ONE_LOCK=1, FRITCHII_GATHER_EMPTY_TEST=1, FRITCHII_FENCE_COMMIT_FAST=1, FRITCHII_FRONT_RAN_READS=1,
 FRITCHII_VERTEX_INPUT_COMPACT=1, FRITCHII_BIND_ADDR_MEMO=1, FRITCHII_WORKER_SPIN=80, FRITCHII_CB_WORDS_BLOCK=1,
 EDEN_NX2_EXP52=1, EDEN_NX2_EXP55=1. Combined toggle at the market (one session): 62.7 -> 64.1 fps, 1% low 44.4 -> 45.5.
+
+### EDEN_NX2_SPIRV_INLINE_GLOBALS
+
+Boot (shader translation). How the SPIR-V helper functions that route global memory accesses to a
+storage buffer are emitted. 1 (default): inlined at every call site (+2.6 fps walking Hyrule Field on
+an RTX 4080, 2026-11). 0: DontInline everywhere (NVIDIA compiles big compute shaders in a fraction of
+the time: up to 7.6 s each inlined). 2: DontInline for compute programs only, graphics inlined
+(tester report 2026-11-18: a 7.6 s freeze mid-combat on an RTX 3070 when the driver had not cached a
+compute shader). Changing it changes the SPIR-V, so the driver compiles those shaders again once.
