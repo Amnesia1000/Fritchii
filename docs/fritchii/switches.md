@@ -1065,6 +1065,33 @@ between, blocked by other entries; E: blocks of 1/2/3-4/5+ words a/b/c/d ns, off
 entries P/s at G ns; fixed part a block F ns; E saving if joined L to H ms/s". F = 2a - b (the
 per-block cost a merged entry would pay once), L = J x F, H = J x (F + G). Gate 1 needs L >= 5 ms/s.
 
+Round 3 (the lever itself): 2 = verify, 3 = on. A constant buffer size/address/offset register
+write that would go as a Pairs entry right after an open CbWords block (the block still the ring's
+last entry, same engine, no CB_WORDS_BLOCK=2) goes into the block instead, as a Sink-tagged Method
+word; the block's header gets CbJoined. E runs a joined block as runs of constant buffer words
+(exactly as ExecuteCbWords runs them) and each joined write as its Pairs entry ran (ConsumeSink,
+ApplyPairs), in ring order. Same words, same values, same order, same registers: only the entry
+boundaries move. 2 also puts a marker and the front's address of each joined run's first word in
+the block; E compares it with where that word goes on its registers (const_buffer address +
+offset after the joined writes): "differ" must stay 0, as must "bad words" (anything else in a
+joined block). Not joined (sent as before) while the memory stage's ring or the E split runs:
+their readers take every block word as a constant buffer word. At 3 the dry counters stay off.
+Line every ~10 s: "CB merge (FRITCHII_CB_MERGE=N) S s: front joined writes J/s, refused R/s, run
+marks M/s (not marked K/s); E: joined blocks B/s, joined writes W/s; session: runs checked C, must
+be 0: differ D, bad words X". Judge on E's ms/s ("method" and "cb upload") and us a draw.
+
+### FRITCHII_HOSTTIMING_OFF_GPU
+
+TEST, off by default (helper DE, 2026-11-17). Live. 0 (as before): the timer thread's spin goes to
+BackgroundWorkCpuMask at the first spin after any GPU thread pinned, and never again; the GPU
+threads pin one after another at boot, so a spin between the front's pin and the back's leaves it
+allowed on the back's core (b37 census: HostTiming 295-496 ms/s allowed on E's core 0x30). 1: every
+logical processor except the physical cores (both hardware threads) of the pinned front, back and
+R, placed again whenever another GPU thread pins; refused (one log line) when that would leave
+fewer than MinAutoGuestProcessors + 2 fast logical processors (7800X3D: 10 left, on; 6 cores with
+SMT, 8 cores without: off). Back to 0 restores 0's placement. Each placement logs "HostTiming placed
+(why): mask M, GPU threads' cores G, running on processor P" (0's first placement too).
+
 ### FRITCHII_FRAME_END_TIMES
 
 TEST, off by default (helper DE, 2026-11-17). Boot, a dry timer that changes nothing. Where

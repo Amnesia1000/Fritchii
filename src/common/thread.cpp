@@ -588,6 +588,7 @@ struct PinnedThread {
     std::atomic<u32> tid{};
 };
 std::array<PinnedThread, 4> pinned_threads{}; ///< by PinnedRole (GuestCore unused)
+std::atomic<u32> pin_generation{}; ///< PinGeneration
 
 bool SiblingCensusOn() {
     static const bool on = [] {
@@ -861,6 +862,7 @@ void PinCurrentThread(PinnedRole role, int guest_core) {
             PinnedThread& pinned = pinned_threads[static_cast<size_t>(role)];
             pinned.mask.store(mask, std::memory_order_relaxed);
             pinned.tid.store(static_cast<u32>(GetCurrentThreadId()), std::memory_order_release);
+            pin_generation.fetch_add(1, std::memory_order_release);
         }
     }
 #else
@@ -1235,6 +1237,66 @@ u32 SweepOffGpuCores(int mode, u64& kept_off) {
 
 } // Anonymous namespace
 #endif
+
+u32 PinGeneration() {
+#ifdef _WIN32
+    return pin_generation.load(std::memory_order_acquire);
+#else
+    return 0;
+#endif
+}
+
+int CurrentProcessorNumber() {
+#ifdef _WIN32
+    PROCESSOR_NUMBER processor{};
+    GetCurrentProcessorNumberEx(&processor);
+    return processor.Number;
+#else
+    return -1;
+#endif
+}
+
+u64 HostTimingOffGpuMask(u64& gpu_cores) {
+    gpu_cores = 0;
+#if defined(_WIN32) && defined(_WIN64)
+    static const std::vector<KAFFINITY> cores = GroupZeroMasks(RelationProcessorCore);
+    for (size_t role = 0; role < pinned_threads.size(); ++role) {
+        const u64 mask = pinned_threads[role].mask.load(std::memory_order_relaxed);
+        if (role == static_cast<size_t>(PinnedRole::GuestCore) || mask == 0) {
+            continue;
+        }
+        for (const KAFFINITY core : cores) {
+            if ((static_cast<u64>(core) & mask) != 0) {
+                gpu_cores |= static_cast<u64>(core);
+            }
+        }
+    }
+    if (gpu_cores == 0) {
+        return 0;
+    }
+    DWORD_PTR process{};
+    DWORD_PTR system{};
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &process, &system)) {
+        return 0;
+    }
+    const u64 mask = static_cast<u64>(process) & ~gpu_cores;
+    const int left = std::popcount(mask & FastestProcessors());
+    const int needed = static_cast<int>(ThreadPinning::MinAutoGuestProcessors) + 2;
+    if (left < needed) {
+        static std::atomic<bool> logged{};
+        if (!logged.exchange(true, std::memory_order_relaxed)) {
+            LOG_INFO(Common,
+                     "FRITCHII_HOSTTIMING_OFF_GPU: off on this CPU: {} fast logical processors "
+                     "left beside the GPU threads' cores {:#x}, {} needed",
+                     left, gpu_cores, needed);
+        }
+        return 0;
+    }
+    return mask;
+#else
+    return 0;
+#endif
+}
 
 void KeepOffGpuCores(int& applied) {
 #if defined(_WIN32) && defined(_WIN64) && defined(ARCHITECTURE_x86_64)

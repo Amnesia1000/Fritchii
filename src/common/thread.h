@@ -174,6 +174,17 @@ void NoteCensusCpu(CensusThread who);
 /// own record (start with 0: nothing changes while the switch is 0). Called once per unit of
 /// work; one relaxed load when nothing changed.
 void KeepOffGpuCores(int& applied);
+/// Bumped each time a GPU role thread pins (front, back, R/GPUMem): placements that depend on
+/// the pinned set look again when it moved (one relaxed load).
+[[nodiscard]] u32 PinGeneration();
+/// The logical processor (group 0 number) the calling thread runs on; -1 where unknown.
+[[nodiscard]] int CurrentProcessorNumber();
+/// FRITCHII_HOSTTIMING_OFF_GPU (live, default 0; core_timing.cpp): the mask HostTiming's spin
+/// runs on with 1: every logical processor of the process except the physical cores (both
+/// hardware threads) of the pinned GPU threads (front, back, R/GPUMem). 0 while none is pinned,
+/// or when that would leave fewer than MinAutoGuestProcessors + 2 fast logical processors
+/// (refused, logged once). `gpu_cores` gets the excluded cores.
+[[nodiscard]] u64 HostTimingOffGpuMask(u64& gpu_cores);
 /// THREAD_PRIORITY_IDLE on Windows, ThreadPriority::Low elsewhere.
 void SetCurrentThreadIdlePriority();
 void SetCurrentThreadToEfficiencyCores();
