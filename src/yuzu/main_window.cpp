@@ -1687,6 +1687,7 @@ void MainWindow::OnAppFocusStateChanged(Qt::ApplicationState state) {
         if (QtCommon::emu_thread->IsRunning() &&
             (state & (Qt::ApplicationHidden | Qt::ApplicationInactive))) {
             auto_paused = true;
+            LOG_INFO(Frontend, "Pausing: the window lost focus (Pause when in background is on)");
             OnPauseGame();
         } else if (!QtCommon::emu_thread->IsRunning() && auto_paused &&
                    (state & Qt::ApplicationActive)) {
@@ -2031,6 +2032,7 @@ void MainWindow::OnPrepareForSleep(bool prepare_sleep) {
     if (prepare_sleep) {
         if (QtCommon::emu_thread->IsRunning()) {
             auto_paused = true;
+            LOG_INFO(Frontend, "Pausing: the PC is going to sleep");
             OnPauseGame();
         }
     } else {
@@ -3566,6 +3568,7 @@ void MainWindow::OnPauseGame() {
 void MainWindow::OnPauseContinueGame() {
     if (emulation_running) {
         if (QtCommon::emu_thread->IsRunning()) {
+            LOG_INFO(Frontend, "Pausing: the Pause action (menu, hotkey or button)");
             OnPauseGame();
         } else {
             OnStartGame();
@@ -5218,7 +5221,14 @@ void MainWindow::OnCaptureScreenshot() {
         return;
 
 #ifdef _WIN32
-    if (UISettings::values.enable_screenshot_save_as) {
+    // The Save as dialog pauses the game. In fullscreen it can open behind the game, which then
+    // looks frozen until the player finds it (2026-11-18): save straight to the folder there.
+    const bool fullscreen = isFullScreen() || (render_window && render_window->isFullScreen());
+    if (UISettings::values.enable_screenshot_save_as && fullscreen) {
+        LOG_INFO(Frontend, "Screenshot saved without the Save as dialog (fullscreen)");
+    }
+    if (UISettings::values.enable_screenshot_save_as && !fullscreen) {
+        LOG_INFO(Frontend, "Pausing: the screenshot Save as dialog");
         OnPauseGame();
         filename = QFileDialog::getSaveFileName(this, tr("Capture Screenshot"), filename,
                                                 tr("PNG Image (*.png)"));

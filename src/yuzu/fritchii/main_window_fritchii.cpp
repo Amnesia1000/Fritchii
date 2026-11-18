@@ -156,7 +156,11 @@ void MainWindow::SetUpFritchiiUi() {
     // "Preparing shaders" before the game starts when its precompiled pipelines need preparing.
     auto* gate = new FritchiiUi::PrecompileGate(
         this, statusBar(),
-        {.pause = [this] { OnPauseGame(); },
+        {.pause =
+             [this] {
+                 LOG_INFO(Frontend, "Pausing: shader preparation");
+                 OnPauseGame();
+             },
          .resume = [this] { OnStartGame(); },
          .game_name = [] {
              return QtCommon::system &&
