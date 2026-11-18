@@ -258,6 +258,9 @@ void Init(QWidget* root) {
     if (const auto stamp = Common::BuildStamp(); !stamp.empty()) {
         LOG_INFO(Frontend, "Build hash: {}", stamp);
     }
+    if (const auto& tag = Common::BuildTag(); !tag.empty()) {
+        LOG_INFO(Frontend, "Build tag: {}", tag);
+    }
     LogRuntimes();
 #ifdef ARCHITECTURE_x86_64
     const auto& caps = Common::g_cpu_caps;

@@ -147,6 +147,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "common/fs/fs.h"
 #include "common/logging.h"
 #include "common/memory_detect.h"
+#include "common/build_stamp.h"
 #include "common/scm_rev.h"
 #include "common/scope_exit.h"
 #include "common/string_util.h"
@@ -5380,7 +5381,7 @@ void MainWindow::UpdateWindowTitle(std::string_view title_name, std::string_view
     static const std::string build_id = std::string{Common::g_build_id};
     static const std::string yuzu_title =
         fmt::format("{} | {} | {}", std::string{Common::g_build_name},
-                    std::string{Common::g_build_label}, std::string{Common::g_compiler_id});
+                    Common::BuildLabelWithTag(), std::string{Common::g_compiler_id});
 
     const auto override_title =
         fmt::format(fmt::runtime(std::string(Common::g_title_bar_format_idle)), build_id);
