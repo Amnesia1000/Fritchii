@@ -632,7 +632,7 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(OotRefreshCap, Hz120, tr("120 FPS")),
                               PAIR(OotRefreshCap, Hz144, tr("144 FPS")),
                               PAIR(OotRefreshCap, Hz165, tr("165 FPS")),
-                              PAIR(OotRefreshCap, Unlimited, tr("Unlimited")),
+                              PAIR(OotRefreshCap, Unlimited, tr("Unlimited (can crash with VSync off)")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::OotTextureSharpness>::Index(),
                           {

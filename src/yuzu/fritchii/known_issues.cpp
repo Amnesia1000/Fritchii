@@ -46,6 +46,9 @@ std::vector<Item> Items(const std::vector<VkDeviceInfo::Record>& records) {
     std::vector<Item> items{
         {QObject::tr("Killing enemies"),
          QObject::tr("Short hitches can still happen (fewer than before).")},
+        {QObject::tr("Unlimited fps with VSync off"),
+         QObject::tr("The game can crash right after a loading screen. Keep an fps cap, or "
+                     "VSync on.")},
         {QObject::tr("Switching items fast"),
          QObject::tr("The screen can flash black for a moment, then it's back.")},
         {QObject::tr("Cutting lots of flowers"),
