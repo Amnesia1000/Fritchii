@@ -58,7 +58,7 @@ public:
     /// FRITCHII_OCCL_FLAG (fritchii_occl_flag.h): the open query slot's flag address for a draw
     /// drawn with a flag pipeline (0: no flag area), and a counted draw drawn without one.
     u64 OcclFlagAddress();
-    void NoteOtherCountedDraw();
+    void NoteOtherCountedDraw(bool blocks = true);
     bool OcclFlagReady();
     void SetNextFlagDraw(bool flag);
 

@@ -3521,6 +3521,7 @@ GraphicsPipeline* PipelineCache::OcclFlagPipeline(GraphicsPipeline* pipeline,
     if (pipeline->occl_flag_parent != nullptr) {
         pipeline = pipeline->occl_flag_parent; // a kept flag variant: decide again
     }
+    OcclFlag::t_census = OcclFlag::Census::Unknown;
     if (OcclFlag::Mode() == OcclFlag::Off || !device.IsOcclFlagDeviceAddressEnabled()) {
         return pipeline;
     }
@@ -3530,19 +3531,61 @@ GraphicsPipeline* PipelineCache::OcclFlagPipeline(GraphicsPipeline* pipeline,
     if (!verdict.counting) {
         return pipeline;
     }
-    if (!verdict.colour_off || verdict.refused) {
-        OcclFlag::Add(stats.refused_regs);
-        return pipeline;
-    }
     if (pipeline->occl_class == 0) {
         pipeline->occl_class =
             static_cast<u8>(static_cast<u8>(ClassifyOcclPipeline(*pipeline)) + 1);
     }
-    if (static_cast<PipelineClass>(pipeline->occl_class - 1) != PipelineClass::Lean ||
-        pipeline->IsMeshPipeline() || pipeline->occl_flag_state == 2) {
+    const auto pipeline_class = static_cast<PipelineClass>(pipeline->occl_class - 1);
+    using OcclFlag::Census;
+    if (verdict.refused) {
+        OcclFlag::t_census = Census::RegsRefused;
+        OcclFlag::Add(stats.refused_regs);
+        return pipeline;
+    }
+    if (!verdict.colour_off) {
+        // Census: what a flag store in the draw's own pixel program would need.
+        switch (pipeline->IsMeshPipeline() ? PipelineClass::Mesh : pipeline_class) {
+        case PipelineClass::Lean: {
+            OcclFlag::t_census = Census::ColourLean;
+            static std::unordered_set<const GraphicsPipeline*> seen;
+            static s64 seen_window{};
+            if (const s64 window = stats.window_start.load(std::memory_order_relaxed);
+                window != seen_window) {
+                seen.clear();
+                seen_window = window;
+            }
+            if (seen.insert(pipeline).second) {
+                OcclFlag::Add(stats.colour_lean_pipelines);
+            }
+            break;
+        }
+        case PipelineClass::Discards:
+            OcclFlag::t_census = Census::ColourDiscards;
+            break;
+        case PipelineClass::KeyState:
+            OcclFlag::t_census = Census::ColourKeyState;
+            break;
+        case PipelineClass::DepthOrMask:
+            OcclFlag::t_census = Census::ColourDepthOrMask;
+            break;
+        case PipelineClass::Stores:
+            OcclFlag::t_census = Census::ColourStores;
+            break;
+        default:
+            OcclFlag::t_census = Census::ColourOther;
+            break;
+        }
+        OcclFlag::Add(stats.refused_regs);
+        return pipeline;
+    }
+    if (pipeline_class != PipelineClass::Lean || pipeline->IsMeshPipeline() ||
+        pipeline->occl_flag_state == 2) {
+        OcclFlag::t_census =
+            pipeline->occl_flag_state == 2 ? Census::Failed : Census::OffNotLean;
         OcclFlag::Add(stats.not_lean);
         return pipeline;
     }
+    OcclFlag::t_census = Census::NotReady;
     GraphicsPipeline* flag = pipeline->occl_flag.get();
     if (flag == nullptr && !allow_make) {
         OcclFlag::Add(stats.not_ready);
@@ -3556,6 +3599,7 @@ GraphicsPipeline* PipelineCache::OcclFlagPipeline(GraphicsPipeline* pipeline,
         }
     }
     if (flag->Failed()) [[unlikely]] {
+        OcclFlag::t_census = Census::Failed;
         OcclFlag::Add(stats.failed);
         pipeline->occl_flag_state = 2;
         return pipeline;
@@ -3564,6 +3608,7 @@ GraphicsPipeline* PipelineCache::OcclFlagPipeline(GraphicsPipeline* pipeline,
         OcclFlag::Add(stats.not_ready);
         return pipeline;
     }
+    OcclFlag::t_census = Census::Flag;
     flag->MarkUsed(frame_count); // the pipeline itself is marked by the lookup
     return flag;
 }

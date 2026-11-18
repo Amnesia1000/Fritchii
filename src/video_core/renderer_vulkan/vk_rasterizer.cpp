@@ -2899,6 +2899,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         query_cache_runtime.SetNextFlagDraw(false);
         // FRITCHII_OCCL_FLAG: a flag variant stores into the open query's slot (push constant
         // bytes 40 to 47, unused otherwise); other counted draws mark their slot as mixed.
+        // Census: the class the pipeline lookup gave this draw (Unknown: no lookup).
+        const auto census = std::exchange(VideoCommon::OcclFlag::t_census,
+                                          VideoCommon::OcclFlag::Census::Unknown);
         if (pipeline->occl_flag_parent != nullptr) {
             const u64 address = query_cache_runtime.OcclFlagAddress();
             scheduler.Record([layout = pipeline->Layout(), address](vk::CommandBuffer cmdbuf) {
@@ -2907,9 +2910,12 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             });
             VideoCommon::OcclFlag::Add(VideoCommon::OcclFlag::g_stats.flag_draws);
         } else if (maxwell3d->regs.zpass_pixel_count_enable != 0) {
-            query_cache_runtime.NoteOtherCountedDraw(); // nothing without the flag area
+            query_cache_runtime.NoteOtherCountedDraw(
+                VideoCommon::OcclFlag::Blocks(census)); // nothing without the flag area
             if (VideoCommon::OcclFlag::Mode() != VideoCommon::OcclFlag::Off) [[unlikely]] {
                 VideoCommon::OcclFlag::Add(VideoCommon::OcclFlag::g_stats.other_counted);
+                VideoCommon::OcclFlag::Add(
+                    VideoCommon::OcclFlag::g_stats.census[static_cast<size_t>(census)]);
             }
         }
     }

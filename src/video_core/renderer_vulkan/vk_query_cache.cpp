@@ -213,13 +213,14 @@ public:
 
     /// FRITCHII_OCCL_FLAG: a counted draw drawn without a flag pipeline (its slot's reports are
     /// "mixed" and not compared).
-    void NoteOtherCountedDraw() {
+    void NoteOtherCountedDraw(bool blocks = true) {
         if (flag_map.load(std::memory_order_relaxed) == nullptr || !has_started ||
             current_bank_id >= FLAG_BANKS) {
             return;
         }
+        // 8 (census): a draw that keeps the host query even with colour Lean flag stores.
         flag_marks[current_bank_id * SamplesQueryBank::BANK_SIZE + current_bank_slot].fetch_or(
-            2, std::memory_order_relaxed);
+            blocks ? 10 : 2, std::memory_order_relaxed);
     }
 
     void StartCounter() override {
@@ -268,6 +269,17 @@ public:
             return;
         }
         if (!std::exchange(current_flag_slot, false)) {
+            // Census: what the query slot's counted draws were.
+            if (flag_map.load(std::memory_order_relaxed) != nullptr &&
+                current_bank_id < FLAG_BANKS) {
+                auto& g = VideoCommon::OcclFlag::g_stats;
+                const u8 marks =
+                    flag_marks[current_bank_id * SamplesQueryBank::BANK_SIZE + current_bank_slot]
+                        .load(std::memory_order_relaxed);
+                VideoCommon::OcclFlag::Add((marks & 8) != 0   ? g.qslot_blocked
+                                           : (marks & 3) != 0 ? g.qslot_injectable
+                                                              : g.qslot_empty);
+            }
             scheduler.Record([query_pool = current_query_pool,
                               query_index = current_bank_slot](vk::CommandBuffer cmdbuf) {
                 cmdbuf.EndQuery(query_pool, static_cast<u32>(query_index));
@@ -2201,8 +2213,8 @@ u64 QueryCacheRuntime::OcclFlagAddress() {
     return impl->sample_streamer.OcclFlagAddress();
 }
 
-void QueryCacheRuntime::NoteOtherCountedDraw() {
-    impl->sample_streamer.NoteOtherCountedDraw();
+void QueryCacheRuntime::NoteOtherCountedDraw(bool blocks) {
+    impl->sample_streamer.NoteOtherCountedDraw(blocks);
 }
 
 bool QueryCacheRuntime::OcclFlagReady() {

@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <string>
 
 #include "common/common_types.h"
 #include "common/logging.h"
@@ -39,7 +40,41 @@ enum Value : int { Off = 0, On = 1, Verify = 2 };
     return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
+/// Census (with the flag lines): why a counted draw has no flag pipeline. Set by
+/// PipelineCache::OcclFlagPipeline on the recording thread, read by the draw that follows.
+enum class Census : u8 {
+    Unknown,      ///< not decided for this draw (counted as blocking)
+    Flag,         ///< drawn with a flag pipeline
+    NotReady,     ///< Lean, its flag pipeline not built yet (becomes a flag draw)
+    ColourLean,   ///< colour on, pixel program in the Lean class: a flag store could go into it
+    ColourDiscards,
+    ColourKeyState,
+    ColourDepthOrMask,
+    ColourStores,
+    ColourOther,  ///< colour on: no pixel program, mesh, or other
+    RegsRefused,  ///< alpha test or alpha to coverage in the registers
+    OffNotLean,   ///< colour off, pixel program not Lean
+    Failed,
+    Count,
+};
+inline constexpr const char* CensusNames[] = {
+    "unknown", "flag", "not ready", "colour Lean", "colour discards", "colour key state",
+    "colour depth/mask", "colour stores", "colour other", "alpha test/coverage", "off not Lean",
+    "failed"};
+inline thread_local Census t_census{};
+
+/// A draw of this census class keeps its window's host query even with flag stores added to
+/// colour-writing Lean pixel programs.
+[[nodiscard]] inline bool Blocks(Census c) noexcept {
+    return c != Census::Flag && c != Census::NotReady && c != Census::ColourLean;
+}
+
 struct Stats {
+    std::atomic<u64> census[static_cast<size_t>(Census::Count)]{};
+    std::atomic<u64> colour_lean_pipelines{}; ///< distinct pipelines of colour Lean draws
+    std::atomic<u64> qslot_injectable{}; ///< query slots whose draws were all flag or colour Lean
+    std::atomic<u64> qslot_blocked{};    ///< query slots with a blocking draw
+    std::atomic<u64> qslot_empty{};      ///< query slots with no counted draw marked
     std::atomic<u64> flag_draws{};     ///< counted draws drawn with a flag pipeline
     std::atomic<u64> other_counted{};  ///< counted draws drawn without one
     std::atomic<u64> not_lean{};       ///< colour off and counting, but not the Lean class
@@ -101,6 +136,16 @@ inline void MaybeLog() {
              Mode(), flag_draws, other, not_lean, refused, not_ready, made, failed, no_slot,
              compared, agree, q0_f1, q1_f0, g.disagree_total.load(std::memory_order_relaxed),
              mixed, no_flag, reused, flag_slots, query_slots);
+    std::string census;
+    for (size_t i = 0; i < static_cast<size_t>(Census::Count); ++i) {
+        census += fmt::format("{}{} {:.0f}", i == 0 ? "" : ", ", CensusNames[i], take(g.census[i]));
+    }
+    LOG_INFO(Render_Vulkan,
+             "Occlusion flag census per second: counted draws by class: {}; colour Lean "
+             "pipelines {:.0f} distinct; query slots closed: {:.0f} all flag or colour Lean, "
+             "{:.0f} blocked, {:.0f} no draw marked",
+             census, take(g.colour_lean_pipelines), take(g.qslot_injectable),
+             take(g.qslot_blocked), take(g.qslot_empty));
 }
 
 } // namespace VideoCommon::OcclFlag
