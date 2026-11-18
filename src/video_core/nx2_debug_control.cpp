@@ -358,6 +358,15 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "EDEN_NX2_FEED_MEMORY_OVERLAY") {
         return &g_feed_memory_overlay;
     }
+    if (name == "FRITCHII_FEED_REARM") {
+        return &g_feed_rearm;
+    }
+    if (name == "FRITCHII_TEST_FEED_OFF") {
+        return &g_test_feed_off;
+    }
+    if (name == "FRITCHII_TEST_SPLIT_RESTART") {
+        return &g_test_split_restart;
+    }
     if (name == "EDEN_NX2_QMD_3D_PATCH") {
         return &g_qmd_3d_patch;
     }
