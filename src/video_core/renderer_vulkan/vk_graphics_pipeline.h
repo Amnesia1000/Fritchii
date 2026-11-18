@@ -494,6 +494,12 @@ public:
     std::unique_ptr<GraphicsPipeline> occl_flag;
     GraphicsPipeline* occl_flag_parent{};
     u8 occl_flag_state{};
+    /// FRITCHII_OCCL_FLAG: the colour flag variant, for colour-writing draws (the same key with
+    /// the guest pixel program translated with RuntimeInfo::occl_flag_store). One pipeline can
+    /// draw with colour on and off (dynamic write masks), so it has a slot of its own.
+    /// occl_flag_colour_state: 0 not tried, 1 made, 2 refused for good.
+    std::unique_ptr<GraphicsPipeline> occl_flag_colour;
+    u8 occl_flag_colour_state{};
 
     /// FRITCHII_OCCL_FLAG: the layout the flag slot address is pushed with.
     [[nodiscard]] VkPipelineLayout Layout() const noexcept {

@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -658,6 +659,20 @@ vk::ShaderModule EmitShaderModule(const Device& device, const Shader::Profile& p
                                  u128* spirv_hash = nullptr) {
     const auto code =
         EmitPipelineShader(profile, runtime_info, program, binding, shader_hash, reference);
+    if (runtime_info.occl_flag_store) [[unlikely]] {
+        // FRITCHII_OCCL_FLAG_DUMP=<folder>: the first 64 colour flag pixel programs as .spv
+        // files (for spirv-val).
+        static std::atomic<int> dumped{};
+        if (const char* folder = std::getenv("FRITCHII_OCCL_FLAG_DUMP");
+            folder != nullptr && folder[0] != '\0' && dumped.fetch_add(1) < 64) {
+            const std::string path =
+                fmt::format("{}/occl_colour_{:016x}.spv", folder, shader_hash);
+            if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
+                std::fwrite(code.data(), sizeof(u32), code.size(), file);
+                std::fclose(file);
+            }
+        }
+    }
     return BuildStageModule(device, code, shader_hash, stage_index, spirv_hash);
 }
 
@@ -3680,7 +3695,31 @@ GraphicsPipeline* PipelineCache::OcclLeanPipeline(GraphicsPipeline* full, const 
 // FRITCHII_OCCL_FLAG: set on the thread making a flag variant, for its CreateGraphicsPipeline
 // (no libraries, the host flag module in place of the pixel program's). Thread local: other
 // threads translate pipelines at the same time.
-thread_local bool t_occl_flag_build{};
+thread_local u8 t_occl_flag_build{};
+constexpr u8 OCCL_FLAG_BUILD_HOST = 1;   ///< the host flag pixel program (colour off)
+constexpr u8 OCCL_FLAG_BUILD_COLOUR = 2; ///< the guest pixel program with the flag store
+
+/// FRITCHII_OCCL_FLAG: why `pipeline`'s guest pixel program (Lean class: no discard, depth or
+/// sample mask writes, stores) cannot take the flag store with early fragment tests for a
+/// colour-writing draw, or Flag when it can: no subgroup or helper operations (early tests
+/// change which lanes are active), no quad operations (helper lanes in them are not
+/// guaranteed), no alpha to coverage in the key (coverage would change after the tests).
+VideoCommon::OcclFlag::Census OcclFlagColourVerdict(const GraphicsPipeline& pipeline) {
+    using VideoCommon::OcclFlag::Census;
+    const auto& infos = pipeline.StageInfos();
+    const Shader::Info& pixel = infos[infos.size() - 1];
+    if (pipeline.Key().state.alpha_to_coverage_enabled != 0) {
+        return Census::ColourA2C;
+    }
+    if (pixel.uses_subgroup_vote || pixel.uses_subgroup_mask || pixel.uses_subgroup_shuffles ||
+        pixel.uses_subgroup_invocation_id || pixel.uses_is_helper_invocation) {
+        return Census::ColourSubgroup;
+    }
+    if (pixel.uses_quad_shuffles || pixel.uses_fswzadd) {
+        return Census::ColourQuad;
+    }
+    return Census::Flag;
+}
 
 GraphicsPipeline* PipelineCache::OcclFlagPipeline(GraphicsPipeline* pipeline,
                                                   const Maxwell& regs, bool allow_make) {
@@ -3716,9 +3755,37 @@ GraphicsPipeline* PipelineCache::OcclFlagPipeline(GraphicsPipeline* pipeline,
     }
     if (!verdict.colour_off) {
         // Census: what a flag store in the draw's own pixel program would need.
+        const Census colour_verdict = pipeline_class == PipelineClass::Lean &&
+                                              !pipeline->IsMeshPipeline()
+                                          ? OcclFlagColourVerdict(*pipeline)
+                                          : Census::Unknown;
+        if (colour_verdict == Census::Flag && pipeline->occl_flag_colour_state != 2 &&
+            OcclFlag::ColourAllowed() && device.IsShaderInt64Supported()) {
+            GraphicsPipeline* colour = pipeline->occl_flag_colour.get();
+            if (colour == nullptr && allow_make) {
+                colour = FindOrMakeOcclFlag(*pipeline, true);
+            }
+            if (colour != nullptr && colour->Failed()) [[unlikely]] {
+                pipeline->occl_flag_colour_state = 2;
+                OcclFlag::Add(stats.failed);
+                colour = nullptr;
+            }
+            if (colour != nullptr && colour->IsBuilt()) {
+                OcclFlag::t_census = Census::Flag;
+                OcclFlag::Add(stats.colour_flag_draws);
+                colour->MarkUsed(frame_count);
+                return colour;
+            }
+            if (pipeline->occl_flag_colour_state != 2) {
+                OcclFlag::t_census = Census::NotReady;
+                OcclFlag::Add(stats.not_ready);
+                return pipeline;
+            }
+        }
         switch (pipeline->IsMeshPipeline() ? PipelineClass::Mesh : pipeline_class) {
         case PipelineClass::Lean: {
-            OcclFlag::t_census = Census::ColourLean;
+            OcclFlag::t_census =
+                colour_verdict == Census::Flag ? Census::ColourLean : colour_verdict;
             static std::unordered_set<const GraphicsPipeline*> seen;
             static s64 seen_window{};
             if (const s64 window = stats.window_start.load(std::memory_order_relaxed);
@@ -3752,8 +3819,28 @@ GraphicsPipeline* PipelineCache::OcclFlagPipeline(GraphicsPipeline* pipeline,
     }
     if (pipeline_class != PipelineClass::Lean || pipeline->IsMeshPipeline() ||
         pipeline->occl_flag_state == 2) {
-        OcclFlag::t_census =
-            pipeline->occl_flag_state == 2 ? Census::Failed : Census::OffNotLean;
+        switch (pipeline->occl_flag_state == 2 ? PipelineClass::Failed
+                : pipeline->IsMeshPipeline()     ? PipelineClass::Mesh
+                                                 : pipeline_class) {
+        case PipelineClass::Failed:
+            OcclFlag::t_census = Census::Failed;
+            break;
+        case PipelineClass::Discards:
+            OcclFlag::t_census = Census::OffDiscards;
+            break;
+        case PipelineClass::KeyState:
+            OcclFlag::t_census = Census::OffKeyState;
+            break;
+        case PipelineClass::DepthOrMask:
+            OcclFlag::t_census = Census::OffDepthOrMask;
+            break;
+        case PipelineClass::Stores:
+            OcclFlag::t_census = Census::OffStores;
+            break;
+        default:
+            OcclFlag::t_census = Census::OffOther;
+            break;
+        }
         OcclFlag::Add(stats.not_lean);
         return pipeline;
     }
@@ -3785,7 +3872,7 @@ GraphicsPipeline* PipelineCache::OcclFlagPipeline(GraphicsPipeline* pipeline,
     return flag;
 }
 
-GraphicsPipeline* PipelineCache::FindOrMakeOcclFlag(GraphicsPipeline& full) {
+GraphicsPipeline* PipelineCache::FindOrMakeOcclFlag(GraphicsPipeline& full, bool colour) {
     namespace OcclFlag = VideoCommon::OcclFlag;
     // The environments come from the registers of this draw: only while the current key names
     // full's programs. One translation a frame, shared with the lean siblings.
@@ -3797,10 +3884,10 @@ GraphicsPipeline* PipelineCache::FindOrMakeOcclFlag(GraphicsPipeline& full) {
     std::unique_ptr<GraphicsPipeline> made;
     {
         graphics_key = full.Key();
-        t_occl_flag_build = true;
+        t_occl_flag_build = colour ? OCCL_FLAG_BUILD_COLOUR : OCCL_FLAG_BUILD_HOST;
         SCOPE_EXIT {
             graphics_key = saved;
-            t_occl_flag_build = false;
+            t_occl_flag_build = 0;
         };
         try {
             made = CreateGraphicsPipeline(nullptr, false);
@@ -3812,11 +3899,16 @@ GraphicsPipeline* PipelineCache::FindOrMakeOcclFlag(GraphicsPipeline& full) {
     }
     if (!made) {
         OcclFlag::Add(OcclFlag::g_stats.failed);
-        full.occl_flag_state = 2;
+        (colour ? full.occl_flag_colour_state : full.occl_flag_state) = 2;
         return nullptr;
     }
-    OcclFlag::Add(OcclFlag::g_stats.made);
+    OcclFlag::Add(colour ? OcclFlag::g_stats.colour_made : OcclFlag::g_stats.made);
     made->occl_flag_parent = &full;
+    if (colour) {
+        full.occl_flag_colour = std::move(made);
+        full.occl_flag_colour_state = 1;
+        return full.occl_flag_colour.get();
+    }
     full.occl_flag = std::move(made);
     full.occl_flag_state = 1;
     return full.occl_flag.get();
@@ -9019,7 +9111,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     // image counts do not fit the split rescaling bits.
     const bool use_libraries = [&] {
         if (t_occl_flag_build) {
-            return false; // FRITCHII_OCCL_FLAG: a whole pipeline with the host flag module
+            return false; // FRITCHII_OCCL_FLAG: a whole pipeline (a flag variant)
         }
         if (!device.IsExtGraphicsPipelineLibrarySupported() || key.state.xfb_enabled != 0) {
             return false;
@@ -9076,6 +9168,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         infos[stage_index] = &program.info;
 
         auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
+        if (t_occl_flag_build == OCCL_FLAG_BUILD_COLOUR &&
+            program.stage == Shader::Stage::Fragment) {
+            runtime_info.occl_flag_store = true; // FRITCHII_OCCL_FLAG: the colour flag variant
+        }
         if (mesh_emulation && (program.stage == Shader::Stage::Mesh ||
                                program.stage == Shader::Stage::Task)) {
             runtime_info.mesh_as_compute = true;
@@ -9179,7 +9275,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     }
     // FRITCHII_OCCL_FLAG: the flag variant's pixel stage is the host flag program (the guest
     // pixel program was translated for its infos, which the variant keeps).
-    const bool occl_flag_variant = t_occl_flag_build && key.unique_hashes[5] != 0;
+    const bool occl_flag_variant =
+        t_occl_flag_build == OCCL_FLAG_BUILD_HOST && key.unique_hashes[5] != 0;
     if (occl_flag_variant && !emit_pools && !(record && record->translate_only)) {
         modules[4] = BuildShader(device, VULKAN_OCCL_FLAG_FRAG_SPV);
     }

@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <iterator>
 #include <string>
 
 #include "common/common_types.h"
@@ -26,12 +27,23 @@
 /// flag area. A window with other counted draws splits into flag and query slots (summed).
 namespace VideoCommon::OcclFlag {
 
-enum Value : int { Off = 0, On = 1, Verify = 2 };
+/// 3 (TEST): on without the colour flag variants (only colour-off draws take flag pipelines),
+/// to measure what the colour variants add.
+enum Value : int { Off = 0, On = 1, Verify = 2, OnColourOff = 3 };
+
+[[nodiscard]] inline int RawMode() noexcept {
+    return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_occl_flag,
+                                            "FRITCHII_OCCL_FLAG");
+}
 
 [[nodiscard]] inline int Mode() noexcept {
-    const int value = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_occl_flag,
-                                                       "FRITCHII_OCCL_FLAG");
-    return value == Verify ? Verify : value == On ? On : Off;
+    const int value = RawMode();
+    return value == Verify ? Verify : (value == On || value == OnColourOff) ? On : Off;
+}
+
+/// Colour-writing counted draws may take the colour flag variant (not with =3).
+[[nodiscard]] inline bool ColourAllowed() noexcept {
+    return RawMode() != OnColourOff;
 }
 
 /// Read once at device creation: whether to keep the buffer device address feature.
@@ -46,27 +58,37 @@ enum class Census : u8 {
     Unknown,      ///< not decided for this draw (counted as blocking)
     Flag,         ///< drawn with a flag pipeline
     NotReady,     ///< Lean, its flag pipeline not built yet (becomes a flag draw)
-    ColourLean,   ///< colour on, pixel program in the Lean class: a flag store could go into it
+    ColourLean,   ///< colour on, Lean pixel program, no colour variant (=3, or no int64)
+    ColourQuad,   ///< colour on, Lean, but quad shuffles or FSWZADD (not taken: early tests)
+    ColourSubgroup, ///< colour on, Lean, but subgroup votes, masks, shuffles or helper reads
+    ColourA2C,    ///< colour on, Lean, alpha to coverage in the key
     ColourDiscards,
     ColourKeyState,
     ColourDepthOrMask,
     ColourStores,
     ColourOther,  ///< colour on: no pixel program, mesh, or other
     RegsRefused,  ///< alpha test or alpha to coverage in the registers
-    OffNotLean,   ///< colour off, pixel program not Lean
+    OffDiscards,  ///< colour off, the pixel program discards
+    OffKeyState,  ///< colour off, alpha test or dual source in the key
+    OffDepthOrMask,
+    OffStores,
+    OffOther,     ///< colour off: mesh or other
     Failed,
     Count,
 };
 inline constexpr const char* CensusNames[] = {
-    "unknown", "flag", "not ready", "colour Lean", "colour discards", "colour key state",
-    "colour depth/mask", "colour stores", "colour other", "alpha test/coverage", "off not Lean",
-    "failed"};
+    "unknown", "flag", "not ready", "colour Lean", "colour Lean quad", "colour Lean subgroup",
+    "colour Lean A2C", "colour discards", "colour key state", "colour depth/mask",
+    "colour stores", "colour other", "alpha test/coverage", "off discards", "off key state",
+    "off depth/mask", "off stores", "off other", "failed"};
+static_assert(std::size(CensusNames) == static_cast<size_t>(Census::Count));
 inline thread_local Census t_census{};
 
 /// A draw of this census class keeps its window's host query even with flag stores added to
 /// colour-writing Lean pixel programs.
 [[nodiscard]] inline bool Blocks(Census c) noexcept {
-    return c != Census::Flag && c != Census::NotReady && c != Census::ColourLean;
+    return c != Census::Flag && c != Census::NotReady && c != Census::ColourLean &&
+           c != Census::ColourQuad && c != Census::ColourSubgroup && c != Census::ColourA2C;
 }
 
 struct Stats {
@@ -81,6 +103,8 @@ struct Stats {
     std::atomic<u64> refused_regs{};   ///< colour on, alpha test or alpha to coverage
     std::atomic<u64> not_ready{};      ///< the flag pipeline is not made or built yet
     std::atomic<u64> made{};           ///< flag pipelines made
+    std::atomic<u64> colour_made{};    ///< colour flag pipelines made (guest pixel program)
+    std::atomic<u64> colour_flag_draws{}; ///< counted colour-writing draws with a flag pipeline
     std::atomic<u64> failed{};         ///< flag pipelines that failed to translate
     std::atomic<u64> no_slot{};        ///< flag draws with no open query (stored to the sink)
     std::atomic<u64> compared{};       ///< reports whose counted draws were all flag draws
@@ -125,17 +149,19 @@ inline void MaybeLog() {
                  no_slot = take(g.no_slot), compared = take(g.compared), agree = take(g.agree),
                  q0_f1 = take(g.q0_f1), q1_f0 = take(g.q1_f0), mixed = take(g.mixed),
                  no_flag = take(g.no_flag), reused = take(g.reused),
-                 flag_slots = take(g.flag_slots), query_slots = take(g.query_slots);
+                 flag_slots = take(g.flag_slots), query_slots = take(g.query_slots),
+                 colour_flag_draws = take(g.colour_flag_draws), colour_made = take(g.colour_made);
     LOG_INFO(Render_Vulkan,
              "Occlusion flags (FRITCHII_OCCL_FLAG={}) per second: counted draws {:.0f} with a "
              "flag pipeline, {:.0f} without (not Lean {:.0f}, regs refused {:.0f}, not ready "
              "{:.0f}); flag pipelines made {:.0f}, failed {:.0f}; flag draws with no open query "
              "{:.0f}; reports compared {:.0f}: agree {:.0f}, query 0 flag 1 {:.0f}, query 1 flag 0 "
              "{:.0f} (must be 0; {} since boot); mixed {:.0f}, no flag {:.0f}, bank reused {:.0f}; "
-             "slots opened: {:.0f} flag (no host query), {:.0f} with a host query",
+             "slots opened: {:.0f} flag (no host query), {:.0f} with a host query; colour flag "
+             "draws {:.0f}, colour flag pipelines made {:.0f}",
              Mode(), flag_draws, other, not_lean, refused, not_ready, made, failed, no_slot,
              compared, agree, q0_f1, q1_f0, g.disagree_total.load(std::memory_order_relaxed),
-             mixed, no_flag, reused, flag_slots, query_slots);
+             mixed, no_flag, reused, flag_slots, query_slots, colour_flag_draws, colour_made);
     std::string census;
     for (size_t i = 0; i < static_cast<size_t>(Census::Count); ++i) {
         census += fmt::format("{}{} {:.0f}", i == 0 ? "" : ", ", CensusNames[i], take(g.census[i]));
