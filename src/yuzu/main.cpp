@@ -265,6 +265,12 @@ constexpr std::pair<const char*, const char*> BuiltinSwitches[] = {
     // skipped for that frame when its guards prove nothing reads the output. Works only while a
     // pipeline builds (no cost with warm caches); cold A/B 11-18: 0 skipped, must-be-0 counts 0.
     {"FRITCHII_ASYNC_COMPUTE_SKIP", "1"},
+    // Pot room (guard house): moving makes per-object shadow depth images every frame. A
+    // GPU-written target whose memory newer GPU writes fully cover, untouched for 4 frames, is
+    // retired; queued collector downloads still land under a GPU-only overlap. 11-14 owner run:
+    // peak VRAM 12.45 -> 9.1 GB. It was only in the play build, so v6.0 shipped without it.
+    {"FRITCHII_COVERED_RETIRE", "4"},
+    {"FRITCHII_COLLECT_LAND_UNDER", "1"},
 #ifdef _WIN32
     // Tested on Windows only (the Linux test builds ran without them).
     {"FRITCHII_JIT_PIN", "1"},            {"FRITCHII_JIT_PIN_REGS", "x8,x0"},

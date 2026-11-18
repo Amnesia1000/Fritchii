@@ -5520,9 +5520,6 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config) {
                 if ((shape.guard & GuardSampled) == 0) {
                     shape.guard |= GuardSampled;
                     ++nx2_sweep_guards;
-                    if (RelocationMemory::Enabled()) {
-                        RelocationMemory::Note(swept->second, GuardSampled);
-                    }
                 }
                 relocation_guarded_addresses[image_gpu_addr] |= GuardSampled;
                 nx2_swept_shapes.erase(swept);
@@ -8681,9 +8678,6 @@ void TextureCache<P>::NoteRelocationGuard(ImageBase& image, RelocationGuard reas
         return;
     }
     shape.guard |= reason;
-    if (RelocationMemory::Enabled()) {
-        RelocationMemory::Note(RelocationShapeKey(image.info), static_cast<u8>(reason));
-    }
     // Each shape's first trip of each reason (a handful per session).
     LOG_INFO(HW_GPU,
              "Render target relocation guard (EXP43): format {} {}x{} now never relocates: {} "
