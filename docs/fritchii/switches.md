@@ -2715,8 +2715,11 @@ and stencil and stores 4096 into the 64-bit slot of the open query window, at a 
 address pushed at push constant offset 40 (bytes 40 to 47 are otherwise unused). The variant is
 owned by its pipeline (never in the cache or on disk), made one a frame (shared with the lean
 siblings' budget), and used once built; until then the draw keeps its pipeline and a real query.
-The flag area is host-visible memory, one u64 per slot for the first 1,024 banks plus a sink,
-cleared when a bank is reserved.
+The flag area is device-local memory (not host visible when the device has such a type, so the
+small BAR heap is left alone), one u64 per slot for the first 1,024 banks plus a sink, cleared
+with a fill in the upload command buffer when a bank is reserved. Each sync copies the synced
+slots, and the slots of the running window it carries over, into a host-visible mirror (cached
+memory preferred) that the fencing thread reads.
 
 - 0: off (a relaxed load per draw; counted draws also touch the streamer's mark, which returns at
   once without the flag area).
@@ -2730,8 +2733,9 @@ cleared when a bank is reserved.
   draw; any other counted draw (colour on, not Lean, texture draws, draw clears) closes it and
   opens a query slot, and later flag draws stay in that query slot (the host query counts them
   exactly), so a window gains at most one slot per segment (the window's value is the sum of its
-  slots, as for a window across submissions). The result copies (GPU) take flag runs from the flag area and query runs from the
-  pool; the fencing thread reads flag runs from the flag area and calls vkGetQueryPoolResults on
+  slots, as for a window across submissions). The result copies (GPU) take flag runs from the
+  flag area and query runs from the pool; the fencing thread reads flag runs from the mirror and
+  calls vkGetQueryPoolResults on
   query runs only, so nothing waits on a query that never ran. A fragment-write to
   transfer/host-read barrier runs at each sync while the flag area exists.
 
@@ -2739,7 +2743,13 @@ Log every 10 s: "Occlusion flags (FRITCHII_OCCL_FLAG=N) per second: counted draw
 pipeline, O without (not Lean L, regs refused R, not ready Y); flag pipelines made M, failed X;
 flag draws with no open query S; reports compared C: agree A, query 0 flag 1 D1, query 1 flag 0
 D2 (must be 0; T since boot); mixed X, no flag N, bank reused B; slots opened: FS flag (no host
-query), QS with a host query".
+query), QS with a host query". A second line, "Occlusion flag census per second", counts the
+counted draws without a flag pipeline by reason (colour Lean: colour on, pixel program in the Lean
+class; colour discards / key state / depth or mask / stores / other; alpha test or coverage; off
+not Lean: colour off, pixel program not Lean), the distinct colour Lean pipelines in the window,
+and the query slots closed with only flag or colour Lean draws ("all flag or colour Lean": they
+would need no host query if colour Lean draws stored flags too) vs with another counted draw
+("blocked"). With the switch at 0 the census counters are not touched.
 
 Measured (RX 9070 XT over OCuLink x4, ReBAR off, Core Ultra 7 255H; OoT market fountain,
 1440p -> FSR 4 4K; live toggles in one session, three rounds, screenshots each window):
@@ -2748,6 +2758,13 @@ Measured (RX 9070 XT over OCuLink x4, ReBAR off, Core Ultra 7 255H; OoT market f
   under 3 GiB/s of PCIe copies; frame time -1.5 ms idle (about +8% fps); picture correct by day,
   dusk and night. About 46% of the query slots become flag slots; the rest are windows with
   counted draws that write colour (about 51,000 a second at the market), which keep real queries.
+- Flag area moved to device-local memory (2026-11-18, three rounds over two sessions): verify about
+  146,000 reports, 0 disagreements, bank reused 0; GPU busy -2.2 ms idle, -1.9 ms under PCIe load;
+  frame time -1.7 ms idle. Within run-to-run noise of the host-memory area.
+- Census at the market fountain (mode 1): about 67,000 slots a second, 45% flag slots. Of the
+  ~37,000 query slots, ~22,000 hold only flag and colour Lean draws (~44,000 colour Lean draws a
+  second from ~28 pipelines); the rest are blocked by colour draws that discard (~12,000 a
+  second) and colour-off draws outside the Lean class (~18,000 a second).
 
 Risks and limits: a flag variant writes no colour by construction; a draw whose regs or pipeline
 fall outside the Lean class keeps its query. The GPU-side value of a window with several slots goes
