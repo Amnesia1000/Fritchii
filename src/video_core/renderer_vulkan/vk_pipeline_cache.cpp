@@ -1465,7 +1465,7 @@ void MergeCompatiblePipelineCaches(const std::filesystem::path& base_dir,
                                    const std::filesystem::path& own_used) {
     constexpr std::array<char, 8> PipelineCacheMagic{'y', 'u', 'z', 'u', 'c', 'a', 'c', 'h'};
     // 55: same records, keys masked as ours already are.
-    constexpr std::array<u32, 3> CompatibleVersions{55, 54, 53};
+    constexpr auto CompatibleVersions = VideoCommon::VulkanCompatibleSharedVersions;
     struct Candidate {
         std::filesystem::path cache;
         std::filesystem::path used;
