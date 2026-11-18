@@ -208,6 +208,8 @@ add_executable(yuzu
     util/clickable_label.h
     util/controller_navigation.cpp
     util/controller_navigation.h
+    fritchii/cache_cleanup.cpp
+    fritchii/cache_cleanup.h
     fritchii/fritchii.qrc
     fritchii/fritchii_ui.cpp
     fritchii/fritchii_ui.h

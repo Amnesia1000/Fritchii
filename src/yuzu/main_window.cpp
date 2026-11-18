@@ -68,6 +68,7 @@
 #include "util/controller_navigation.h"
 #include "util/export_log.h"
 #include "util/profiling_mode.h"
+#include "fritchii/cache_cleanup.h"
 #include "fritchii/fritchii_ui.h"
 #include "fritchii/perf_overlay.h"
 #include "fritchii/switches_window.h"
@@ -654,6 +655,12 @@ MainWindow::MainWindow(bool has_broken_vulkan)
                 QString::fromStdString(hbl_path),
                 LibraryAppletParameters(0x010000000000100Dull, Service::AM::AppletId::QLaunch));
         }
+    }
+
+    // Once per major version, before a game boots: clear the old shader caches? (Not when started
+    // with a game: the next plain launch asks.)
+    if (!launched_with_game && FritchiiCacheCleanup::OfferOnce(this)) {
+        OnSaveConfig();
     }
 
     // The first launch asks for Ocarina of Time's frame rate (not when started with a game,
