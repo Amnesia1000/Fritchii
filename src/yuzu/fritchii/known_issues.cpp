@@ -66,6 +66,11 @@ std::vector<Item> Items(const std::vector<VkDeviceInfo::Record>& records) {
     items.push_back({QObject::tr("Weaker PCs and Steam Deck"),
                      QObject::tr("Keep Max Resolution off and pick a lower Resolution in "
                                  "Graphics, like 810p.")});
+    // A tester's 16 GB PC (test 10): free RAM fell to 0.5 GB and Windows paging froze the game
+    // for up to 12 s (OoT's own memory is ~10 GB, Fritchii's ~2.7 GB more).
+    items.push_back({QObject::tr("16 GB of RAM"),
+                     QObject::tr("Close your browser and other programs while playing. When memory "
+                                 "runs out, the game freezes for seconds.")});
     // Compute-written images go back to the game's size at every dispatch, so a lower scale only
     // shrinks the plain draws (2026-11-18; the game's own render scale fixes it, 6.1 waitlist).
     items.push_back({QObject::tr("Lower resolutions"),
