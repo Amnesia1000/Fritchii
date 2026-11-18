@@ -343,6 +343,9 @@ public:
     u32 occl_flag_member_index{};
     Id occl_flag_u64{};
     Id occl_flag_slot_pointer{};
+    /// The store, a function of its own: its branch must not split main's first block (the
+    /// deferred phis name their predecessors by the IR blocks' labels).
+    Id occl_flag_store_function{};
 
     /// FRITCHII_OCCL_FLAG: this module stores the occlusion flag (fragment, Vulkan).
     [[nodiscard]] bool UsesOcclFlagStore() const {

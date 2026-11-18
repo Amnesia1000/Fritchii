@@ -1469,21 +1469,44 @@ void EmitContext::DefineOcclFlag() {
     occl_flag_u64 = TypeInt(64, false);
     // The slot: a uvec2 behind a physical storage buffer pointer (no struct: see the header).
     occl_flag_slot_pointer = TypePointer(spv::StorageClass::PhysicalStorageBuffer, U32[2]);
-    if (Sirit::ValidId(occl_flag_push_constant)) {
-        return; // a member of the rescaling or render area block
+    if (!Sirit::ValidId(occl_flag_push_constant)) {
+        // No rescaling or render area block: one of its own.
+        const Id push_constant_struct{TypeStruct(occl_flag_u64)};
+        Decorate(push_constant_struct, spv::Decoration::Block);
+        Name(push_constant_struct, "OcclFlagInfo");
+        MemberDecorate(push_constant_struct, 0, spv::Decoration::Offset, OCCL_FLAG_PUSH_OFFSET);
+        MemberName(push_constant_struct, 0, "occl_flag_slot");
+        occl_flag_member_index = 0;
+        const Id pointer_type{TypePointer(spv::StorageClass::PushConstant, push_constant_struct)};
+        occl_flag_push_constant =
+            AddGlobalVariable(pointer_type, spv::StorageClass::PushConstant);
+        Name(occl_flag_push_constant, "occl_flag_push_constants");
+        if (profile.supported_spirv >= 0x00010400) {
+            interfaces.push_back(occl_flag_push_constant);
+        }
     }
-    const Id push_constant_struct{TypeStruct(occl_flag_u64)};
-    Decorate(push_constant_struct, spv::Decoration::Block);
-    Name(push_constant_struct, "OcclFlagInfo");
-    MemberDecorate(push_constant_struct, 0, spv::Decoration::Offset, OCCL_FLAG_PUSH_OFFSET);
-    MemberName(push_constant_struct, 0, "occl_flag_slot");
-    occl_flag_member_index = 0;
-    const Id pointer_type{TypePointer(spv::StorageClass::PushConstant, push_constant_struct)};
-    occl_flag_push_constant = AddGlobalVariable(pointer_type, spv::StorageClass::PushConstant);
-    Name(occl_flag_push_constant, "occl_flag_push_constants");
-    if (profile.supported_spirv >= 0x00010400) {
-        interfaces.push_back(occl_flag_push_constant);
-    }
+    // void occl_flag_store(): the slot gets uvec2(4096, 0) while it still reads 0 (a large
+    // draw's fragments would otherwise all write the same 8 bytes; a stale 0 only repeats it).
+    occl_flag_store_function =
+        OpFunction(void_id, spv::FunctionControlMask::MaskNone, TypeFunction(void_id));
+    AddLabel();
+    const Id push_pointer{TypePointer(spv::StorageClass::PushConstant, occl_flag_u64)};
+    const Id address{OpLoad(occl_flag_u64, OpAccessChain(push_pointer, occl_flag_push_constant,
+                                                         Const(occl_flag_member_index)))};
+    const Id slot{OpConvertUToPtr(occl_flag_slot_pointer, address)};
+    const Id current{OpLoad(U32[2], slot, spv::MemoryAccessMask::Aligned, 8u)};
+    const Id unset{OpIEqual(U1, OpCompositeExtract(U32[1], current, 0u), u32_zero_value)};
+    const Id store_label{OpLabel()};
+    const Id merge_label{OpLabel()};
+    OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+    OpBranchConditional(unset, store_label, merge_label);
+    AddLabel(store_label);
+    OpStore(slot, Const(4096u, 0u), spv::MemoryAccessMask::Aligned, 8u);
+    OpBranch(merge_label);
+    AddLabel(merge_label);
+    OpReturn();
+    OpFunctionEnd();
+    Name(occl_flag_store_function, "occl_flag_store");
 }
 
 void EmitContext::DefineRenderArea(const Info& info) {

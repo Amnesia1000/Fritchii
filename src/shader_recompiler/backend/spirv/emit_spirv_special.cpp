@@ -140,13 +140,7 @@ void EmitPrologue(EmitContext& ctx) {
     if (ctx.UsesOcclFlagStore()) {
         // FRITCHII_OCCL_FLAG: with early fragment tests this runs only for fragments that passed
         // depth and stencil (helpers do not store): "any sample passed" for the open query.
-        const Id push_pointer{
-            ctx.TypePointer(spv::StorageClass::PushConstant, ctx.occl_flag_u64)};
-        const Id address{ctx.OpLoad(
-            ctx.occl_flag_u64, ctx.OpAccessChain(push_pointer, ctx.occl_flag_push_constant,
-                                                 ctx.Const(ctx.occl_flag_member_index)))};
-        const Id slot{ctx.OpConvertUToPtr(ctx.occl_flag_slot_pointer, address)};
-        ctx.OpStore(slot, ctx.Const(4096u, 0u), spv::MemoryAccessMask::Aligned, 8u);
+        ctx.OpFunctionCall(ctx.void_id, ctx.occl_flag_store_function);
     }
     if (ctx.stage == Stage::Fragment && ctx.runtime_info.dual_source_blend) {
         // Initialize dual-source blending outputs - prevents MoltenVK crash.
