@@ -3505,8 +3505,13 @@ GraphicsPipeline* PipelineCache::OcclLeanPipeline(GraphicsPipeline* full, const 
     return sibling;
 }
 
+// FRITCHII_OCCL_FLAG: set on the thread making a flag variant, for its CreateGraphicsPipeline
+// (no libraries, the host flag module in place of the pixel program's). Thread local: other
+// threads translate pipelines at the same time.
+thread_local bool t_occl_flag_build{};
+
 GraphicsPipeline* PipelineCache::OcclFlagPipeline(GraphicsPipeline* pipeline,
-                                                  const Maxwell& regs) {
+                                                  const Maxwell& regs, bool allow_make) {
     namespace OcclFlag = VideoCommon::OcclFlag;
     namespace OcclLean = VideoCommon::OcclLean;
     using OcclLean::PipelineClass;
@@ -3539,6 +3544,10 @@ GraphicsPipeline* PipelineCache::OcclFlagPipeline(GraphicsPipeline* pipeline,
         return pipeline;
     }
     GraphicsPipeline* flag = pipeline->occl_flag.get();
+    if (flag == nullptr && !allow_make) {
+        OcclFlag::Add(stats.not_ready);
+        return pipeline;
+    }
     if (flag == nullptr) {
         flag = FindOrMakeOcclFlag(*pipeline);
         if (flag == nullptr) {
@@ -3571,10 +3580,10 @@ GraphicsPipeline* PipelineCache::FindOrMakeOcclFlag(GraphicsPipeline& full) {
     std::unique_ptr<GraphicsPipeline> made;
     {
         graphics_key = full.Key();
-        occl_flag_build = true;
+        t_occl_flag_build = true;
         SCOPE_EXIT {
             graphics_key = saved;
-            occl_flag_build = false;
+            t_occl_flag_build = false;
         };
         try {
             made = CreateGraphicsPipeline(nullptr, false);
@@ -8503,7 +8512,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     // pipelines, transform feedback, a static rasterizer discard, and stages whose texture or
     // image counts do not fit the split rescaling bits.
     const bool use_libraries = [&] {
-        if (occl_flag_build) {
+        if (t_occl_flag_build) {
             return false; // FRITCHII_OCCL_FLAG: a whole pipeline with the host flag module
         }
         if (!device.IsExtGraphicsPipelineLibrarySupported() || key.state.xfb_enabled != 0) {
@@ -8664,7 +8673,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     }
     // FRITCHII_OCCL_FLAG: the flag variant's pixel stage is the host flag program (the guest
     // pixel program was translated for its infos, which the variant keeps).
-    const bool occl_flag_variant = occl_flag_build;
+    const bool occl_flag_variant = t_occl_flag_build && key.unique_hashes[5] != 0;
     if (occl_flag_variant && !emit_pools && !(record && record->translate_only)) {
         modules[4] = BuildShader(device, VULKAN_OCCL_FLAG_FRAG_SPV);
     }

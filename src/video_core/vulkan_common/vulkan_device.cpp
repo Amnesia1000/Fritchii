@@ -1025,6 +1025,7 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     } else
 #endif
     if (!extensions.descriptor_buffer && VideoCommon::OcclFlag::WantedAtBoot() &&
+        instance_version >= VK_API_VERSION_1_2 &&
         features.buffer_device_address.bufferDeviceAddress) {
         // FRITCHII_OCCL_FLAG: the flag pipelines store through buffer device addresses. As for
         // DLSS above, the feature stays enabled while the emulator's own buffers and VMA stay

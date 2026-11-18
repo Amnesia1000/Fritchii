@@ -52,6 +52,7 @@ struct Stats {
     std::atomic<u64> q1_f0{};          ///< the query counted samples, no flag (must be 0)
     std::atomic<u64> mixed{};          ///< reports with flag and other counted draws
     std::atomic<u64> no_flag{};        ///< reports with no flag draw
+    std::atomic<u64> reused{};         ///< reports whose banks were reserved again before the compare
     std::atomic<u64> disagree_total{}; ///< since boot (q0_f1 + q1_f0)
     std::atomic<s64> window_start{};
 };
@@ -84,16 +85,16 @@ inline void MaybeLog() {
                  not_ready = take(g.not_ready), made = take(g.made), failed = take(g.failed),
                  no_slot = take(g.no_slot), compared = take(g.compared), agree = take(g.agree),
                  q0_f1 = take(g.q0_f1), q1_f0 = take(g.q1_f0), mixed = take(g.mixed),
-                 no_flag = take(g.no_flag);
+                 no_flag = take(g.no_flag), reused = take(g.reused);
     LOG_INFO(Render_Vulkan,
              "Occlusion flags (FRITCHII_OCCL_FLAG={}) per second: counted draws {:.0f} with a "
              "flag pipeline, {:.0f} without (not Lean {:.0f}, regs refused {:.0f}, not ready "
              "{:.0f}); flag pipelines made {:.0f}, failed {:.0f}; flag draws with no open query "
              "{:.0f}; reports compared {:.0f}: agree {:.0f}, query 0 flag 1 {:.0f}, query 1 flag 0 "
-             "{:.0f} (must be 0; {} since boot); mixed {:.0f}, no flag {:.0f}",
+             "{:.0f} (must be 0; {} since boot); mixed {:.0f}, no flag {:.0f}, bank reused {:.0f}",
              Mode(), flag_draws, other, not_lean, refused, not_ready, made, failed, no_slot,
              compared, agree, q0_f1, q1_f0, g.disagree_total.load(std::memory_order_relaxed),
-             mixed, no_flag);
+             mixed, no_flag, reused);
 }
 
 } // namespace VideoCommon::OcclFlag

@@ -170,7 +170,7 @@ public:
     /// made and built; else `pipeline`. A flag variant passed in (a kept pipeline) is first
     /// turned back into its own pipeline, so a flag variant never draws another draw.
     [[nodiscard]] GraphicsPipeline* OcclFlagPipeline(GraphicsPipeline* pipeline,
-                                                     const Maxwell& regs);
+                                                     const Maxwell& regs, bool allow_make);
 
     /// One follower (fable_b 18.4, E, right after a lookup): the key parts the lookup kept
     /// because their flag was clear, computed fresh from the registers and compared: bit 0 the
@@ -450,9 +450,6 @@ private:
     /// lean siblings) from the draw's environments; null when not available yet. Sets
     /// full.occl_flag_state to 2 when it cannot be made.
     GraphicsPipeline* FindOrMakeOcclFlag(GraphicsPipeline& full);
-    /// FRITCHII_OCCL_FLAG: set while CreateGraphicsPipeline makes a flag variant (no libraries,
-    /// the host flag module in place of the pixel program's).
-    bool occl_flag_build{};
     /// FRITCHII_OCCL_LEAN: frame_count of the last sibling translation (one a frame).
     u64 occl_made_frame{~u64{0}};
 

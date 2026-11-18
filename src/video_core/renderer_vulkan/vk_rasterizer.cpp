@@ -2374,13 +2374,20 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     const size_t onef_entries_before = onef_lookup ? pipeline_cache.GraphicsEntries() : 0;
     // FRITCHII_OCCL_FLAG (fritchii_occl_flag.h): with one follower off, an occlusion test draw
     // may take its pipeline's flag variant; a kept flag variant is decided again.
-    const auto occl_flag = [&](GraphicsPipeline* chosen) -> GraphicsPipeline* {
-        return onef_play == nullptr ? pipeline_cache.OcclFlagPipeline(chosen, maxwell3d->regs)
-                                    : chosen;
+    const auto occl_flag = [&](GraphicsPipeline* chosen, bool allow_make) -> GraphicsPipeline* {
+        if (chosen != nullptr && chosen->occl_flag_parent != nullptr) {
+            chosen = chosen->occl_flag_parent; // a kept flag variant: decided again
+        }
+        if (onef_play != nullptr || chosen == nullptr ||
+            VideoCommon::OcclFlag::Mode() == VideoCommon::OcclFlag::Off ||
+            !query_cache_runtime.OcclFlagReady()) {
+            return chosen;
+        }
+        return pipeline_cache.OcclFlagPipeline(chosen, maxwell3d->regs, allow_make);
     };
     GraphicsPipeline* const pipeline{[&]() -> GraphicsPipeline* {
         if (delta_pipeline != nullptr) {
-            return occl_flag(delta_pipeline); // EXP118: kept, no lookup
+            return occl_flag(delta_pipeline, false); // EXP118: kept, no lookup (locks held)
         }
         if (onef_play != nullptr && onef_play->pipeline != nullptr) {
             // Rule 3 (FRITCHII_ONEF_E_PIPELINE): E looked this draw's pipeline up at its own
@@ -2389,7 +2396,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                 static_cast<const GraphicsPipeline*>(onef_play->pipeline));
         }
         Profile::Scope scope{Profile::Zone::PipelineLookup};
-        return occl_flag(pipeline_cache.CurrentGraphicsPipeline());
+        return occl_flag(pipeline_cache.CurrentGraphicsPipeline(), true);
     }()};
     if (onef_lookup &&
         (!pipeline || pipeline_cache.GraphicsEntries() > onef_entries_before)) [[unlikely]] {
@@ -2888,10 +2895,11 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                                      &address);
             });
             VideoCommon::OcclFlag::Add(VideoCommon::OcclFlag::g_stats.flag_draws);
-        } else if (maxwell3d->regs.zpass_pixel_count_enable != 0 &&
-                   VideoCommon::OcclFlag::Mode() != VideoCommon::OcclFlag::Off) [[unlikely]] {
-            query_cache_runtime.NoteOtherCountedDraw();
-            VideoCommon::OcclFlag::Add(VideoCommon::OcclFlag::g_stats.other_counted);
+        } else if (maxwell3d->regs.zpass_pixel_count_enable != 0) {
+            query_cache_runtime.NoteOtherCountedDraw(); // nothing without the flag area
+            if (VideoCommon::OcclFlag::Mode() != VideoCommon::OcclFlag::Off) [[unlikely]] {
+                VideoCommon::OcclFlag::Add(VideoCommon::OcclFlag::g_stats.other_counted);
+            }
         }
     }
     const std::optional<u32> probe =
@@ -4889,6 +4897,9 @@ void RasterizerVulkan::DrawTexture() {
 
     query_cache.NotifySegment(true);
     query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);
+    if (maxwell3d->regs.zpass_pixel_count_enable != 0) {
+        query_cache_runtime.NoteOtherCountedDraw(); // FRITCHII_OCCL_FLAG: not a flag draw
+    }
     const auto& draw_texture_state = maxwell3d->draw_manager.draw_texture_state;
     const auto& sampler = texture_cache.GetSampler(draw_texture_state.src_sampler, false);
     const auto& texture = texture_cache.GetImageView(draw_texture_state.src_texture);
@@ -5268,6 +5279,9 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     // would begin it outside the pass and end it inside the next draw's pass.
     query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
                               !can_defer_clear && regs.zpass_pixel_count_enable);
+    if (maxwell3d->regs.zpass_pixel_count_enable != 0) {
+        query_cache_runtime.NoteOtherCountedDraw(); // FRITCHII_OCCL_FLAG: not a flag draw
+    }
     UpdateViewportsState(regs);
 
     const u32 color_attachment = regs.clear_surface.RT;
