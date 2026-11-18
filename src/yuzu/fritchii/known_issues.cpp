@@ -63,6 +63,12 @@ std::vector<Item> Items(const std::vector<VkDeviceInfo::Record>& records) {
     items.push_back({QObject::tr("Weaker PCs and Steam Deck"),
                      QObject::tr("Keep Max Resolution off and pick a lower Resolution in "
                                  "Graphics, like 810p.")});
+    // Compute-written images go back to the game's size at every dispatch, so a lower scale only
+    // shrinks the plain draws (2026-11-18; the game's own render scale fixes it, 6.1 waitlist).
+    items.push_back({QObject::tr("Lower resolutions"),
+                     QObject::tr("Going below 1080p gives less fps than you'd expect, because part "
+                                 "of OoT's drawing stays at full size. A v6.x update will fix "
+                                 "it.")});
     if (IntelCpu()) {
         items.push_back({QObject::tr("Intel 12th-14th gen and Core Ultra"),
                          QObject::tr("If fps is about half what it should be, add "
@@ -99,7 +105,7 @@ QLabel* Label(const QString& text, const char* object_name) {
 
 void ShowImpl(QWidget* parent, const std::vector<VkDeviceInfo::Record>& records, bool first) {
     const auto items = Items(records);
-    const QString title = QObject::tr("Good to know");
+    const QString title = QObject::tr("Good to know: very important, please read");
     const QString footer = QObject::tr("Anything else: Help > Export Log, then send it to us.");
 
     if (!FritchiiUi::Enabled()) {
@@ -122,7 +128,7 @@ void ShowImpl(QWidget* parent, const std::vector<VkDeviceInfo::Record>& records,
 
     ReadFirstDialog dialog(parent);
     dialog.setObjectName(QStringLiteral("FritchiiKnownIssues"));
-    dialog.setWindowTitle(QStringLiteral("Fritchii"));
+    dialog.setWindowTitle(QObject::tr("Fritchii: very important, please read"));
     dialog.setWindowFlag(Qt::WindowContextHelpButtonHint, false);
     dialog.setMinimumWidth(640);
     auto* layout = new QVBoxLayout(&dialog);
