@@ -4144,7 +4144,7 @@ void RasterizerVulkan::OneFollowerPostFence(u8 kind, u32 value,
         query_cache.WritePayloadNow(note->device, note->gpu_addr, note->payload,
                                     note->has_timestamp, true);
     }
-    // FRITCHII_ONEF_SEM_E_LANDED (Damage's Jabu-Jabu freezes, 2026-11-17): the host increment
+    // FRITCHII_ONEF_SEM_E_LANDED (a tester's Jabu-Jabu freezes, 2026-11-17): the host increment
     // ends the game's wait on the sync point, and the game may then free and reuse memory the
     // fence's downloads still land in (R's fence release, later): an old landing over the game's
     // new objects. 1: the increment moves to R's fence (after its landings) while committed
