@@ -803,7 +803,7 @@ void ConfigureGraphics::SetupUpscalerChoice(std::map<u32, QWidget*>& hold_graphi
     const bool picture_menu = Settings::IsDockedMode() && !VideoCommon::OcarinaScaledUpscale();
     if (picture_menu) {
         output_combobox = new QComboBox;
-        output_row = make_row(tr("Resolution:"), output_combobox);
+        output_row = make_row(tr("Upscale to:"), output_combobox);
         output_row->setToolTip(tr("The picture size FSR or DLSS makes.\nBigger is sharper, "
                                   "smaller runs faster."));
         output_row->setVisible(false);
@@ -833,6 +833,13 @@ void ConfigureGraphics::SetupUpscalerChoice(std::map<u32, QWidget*>& hold_graphi
         quality_row->setToolTip(tr("Left: the size the game draws. Right: the size you see.\n"
                                    "A smaller left number runs faster but looks softer."));
         quality_row->setVisible(false);
+        // v6: upscalers always start from the game's own picture (owner 2026-11-18: "make it
+        // clear ... you need upscaler OFF to go below 1080p"). Same size as the rows, not a
+        // small grey hint.
+        upscale_note = new QLabel(this);
+        upscale_note->setWordWrap(true);
+        upscale_note->setVisible(false);
+        resolution_group_layout->addWidget(upscale_note);
     }
 
     // The old rows' widgets keep the settings (and save them); only the choice above shows.
@@ -1242,6 +1249,9 @@ void ConfigureGraphics::UpdatePictureMenu() {
     resolution_widget->setVisible(!upscaling);
     output_row->setVisible(upscaling);
     quality_row->setVisible(upscaling);
+    if (upscale_note != nullptr) {
+        upscale_note->setVisible(upscaling);
+    }
     // Its choice sits in "Quality" (the checkbox's toggle shows the row: hide it again).
     if (dlss_quality_widget != nullptr) {
         dlss_quality_widget->setVisible(false);
@@ -1261,6 +1271,16 @@ void ConfigureGraphics::UpdatePictureMenu() {
     }
     const int current = CurrentPictureChoice();
     const PictureChoice& picked = PictureChoices()[current];
+    if (upscale_note != nullptr) {
+        // The game's own size, whatever is picked: up to 1080p, or 1440p with Max Resolution.
+        const bool max_resolution = picked.max_resolution;
+        upscale_note->setText(
+            tr("%1 upscales from the game's own %2.\nBelow 1080p: set Upscaler to Off, then pick "
+               "a Resolution.")
+                .arg(upscaler_combobox != nullptr ? upscaler_combobox->currentText()
+                                                  : tr("The upscaler"),
+                     max_resolution ? tr("1440p") : tr("1080p")));
+    }
 
     const QSignalBlocker block_output(output_combobox);
     const QSignalBlocker block_quality(quality_combobox);

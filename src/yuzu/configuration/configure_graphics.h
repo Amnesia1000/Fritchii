@@ -168,6 +168,7 @@ private:
     QWidget* quality_row{};                ///< "Quality": input -> output
     QComboBox* quality_combobox{};
     QLabel* quality_fixed_label{};         ///< In place of the choice when there is one
+    QLabel* upscale_note{};                ///< Where an upscaler starts from, and how to go lower
     QWidget* texture_sharpness_widget{};
     QComboBox* texture_sharpness_combobox{};
     QWidget* lod_custom_widget{};
