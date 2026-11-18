@@ -185,6 +185,9 @@ public:
         if (flag_buffer != VK_NULL_HANDLE) {
             device.GetDispatchLoader().vkDestroyBuffer(*device.GetLogical(), flag_buffer, nullptr);
         }
+        if (flag_mirror != VK_NULL_HANDLE) {
+            device.GetDispatchLoader().vkDestroyBuffer(*device.GetLogical(), flag_mirror, nullptr);
+        }
     }
 
     /// FRITCHII_OCCL_FLAG (fritchii_occl_flag.h; the recording thread, right after CounterEnable
@@ -401,6 +404,18 @@ public:
             auto& resolve_buffer = buffers[resolve_buffer_index];
             VkQueryPool query_pool = bank->GetInnerPool();
             scheduler.RequestOutsideRenderPassOperationContext();
+            // FRITCHII_OCCL_FLAG: the range's device slots into the host mirror (the fencing
+            // thread reads it once the fence signals; Barriers(false) makes it visible).
+            if (flags != nullptr && bank_id < FLAG_BANKS) {
+                scheduler.Record([src = flag_buffer, dst = flag_mirror,
+                                  offset = (bank_id * SamplesQueryBank::BANK_SIZE + start) *
+                                           SamplesQueryBank::QUERY_SIZE,
+                                  size = amount * SamplesQueryBank::QUERY_SIZE](
+                                     vk::CommandBuffer cmdbuf) {
+                    const VkBufferCopy copy{.srcOffset = offset, .dstOffset = offset, .size = size};
+                    cmdbuf.CopyBuffer(src, dst, copy);
+                });
+            }
             // FRITCHII_OCCL_FLAG=1: flag runs copied from the flag area, query runs from the pool
             // (never a slot no query ran in).
             bool has_flag_slots = false;
@@ -713,8 +728,10 @@ private:
     /// (read by the fencing thread); made at the first flag draw.
     static constexpr size_t FLAG_BANKS = 1024;
     static constexpr size_t FLAG_SINK_SLOT = FLAG_BANKS * SamplesQueryBank::BANK_SIZE;
-    VkBuffer flag_buffer{};
+    VkBuffer flag_buffer{};          ///< device-local flag slots (the stores land here)
     vk::DeviceMemory flag_memory;
+    VkBuffer flag_mirror{};          ///< host-visible copy of synced slots (the fencing thread reads)
+    vk::DeviceMemory flag_mirror_memory;
     std::atomic<u8*> flag_map{}; ///< published last, with release (the fencing thread reads it)
     u64 flag_address{};
     bool flag_tried{};
@@ -744,6 +761,84 @@ private:
         return sum;
     }
 
+    /// FRITCHII_OCCL_FLAG: a buffer for the flag area: device-local (preferably not host
+    /// visible, so the small BAR heap is left alone) with a device address, or host-visible
+    /// coherent system memory (cached when there is such a type) for the mirror.
+    bool MakeFlagBuffer(VkDeviceSize size, VkBufferUsageFlags usage, bool host, VkBuffer& buffer,
+                        vk::DeviceMemory& memory) {
+        const auto& dld = device.GetDispatchLoader();
+        const VkDevice dev = *device.GetLogical();
+        const VkBufferCreateInfo buffer_ci{
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .size = size,
+            .usage = usage,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .queueFamilyIndexCount = 0,
+            .pQueueFamilyIndices = nullptr,
+        };
+        if (dld.vkCreateBuffer(dev, &buffer_ci, nullptr, &buffer) != VK_SUCCESS) {
+            buffer = VK_NULL_HANDLE;
+            LOG_ERROR(Render_Vulkan, "Occlusion flags (FRITCHII_OCCL_FLAG): no buffer");
+            return false;
+        }
+        const VkMemoryRequirements requirements =
+            device.GetLogical().GetBufferMemoryRequirements(buffer);
+        const auto props = device.GetPhysical().GetMemoryProperties().memoryProperties;
+        const VkMemoryPropertyFlags wanted =
+            host ? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+                 : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        // Preferred first: host -> cached, not device local; device -> not host visible.
+        const VkMemoryPropertyFlags preferred =
+            host ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : VkMemoryPropertyFlags{0};
+        const VkMemoryPropertyFlags avoided =
+            host ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+        u32 type = ~0U;
+        for (u32 pass = 0; pass < 3 && type == ~0U; ++pass) {
+            for (u32 i = 0; i < props.memoryTypeCount; ++i) {
+                const VkMemoryPropertyFlags f = props.memoryTypes[i].propertyFlags;
+                if ((requirements.memoryTypeBits & (1U << i)) == 0 || (f & wanted) != wanted) {
+                    continue;
+                }
+                if ((pass == 0 && ((f & preferred) != preferred || (f & avoided) != 0)) ||
+                    (pass == 1 && (f & avoided) != 0)) {
+                    continue;
+                }
+                type = i;
+                break;
+            }
+        }
+        if (type == ~0U) {
+            LOG_ERROR(Render_Vulkan, "Occlusion flags (FRITCHII_OCCL_FLAG): no memory type");
+            return false;
+        }
+        const VkMemoryAllocateFlagsInfo flags_info{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+            .pNext = nullptr,
+            .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT,
+            .deviceMask = 0,
+        };
+        try {
+            memory = device.GetLogical().AllocateMemory(VkMemoryAllocateInfo{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                .pNext = host ? nullptr : &flags_info,
+                .allocationSize = requirements.size,
+                .memoryTypeIndex = type,
+            });
+        } catch (const vk::Exception& exception) {
+            LOG_ERROR(Render_Vulkan, "Occlusion flags (FRITCHII_OCCL_FLAG): {}", exception.what());
+            return false;
+        }
+        if (dld.vkBindBufferMemory(dev, buffer, *memory, 0) != VK_SUCCESS) {
+            LOG_ERROR(Render_Vulkan, "Occlusion flags (FRITCHII_OCCL_FLAG): bind failed");
+            return false;
+        }
+        LOG_INFO(Render_Vulkan, "Occlusion flags (FRITCHII_OCCL_FLAG): {} buffer in memory type {}",
+                 host ? "mirror" : "flag", type);
+        return true;
+    }
+
     bool EnsureFlagArea() {
         if (flag_map.load(std::memory_order_relaxed) != nullptr) {
             return true;
@@ -765,65 +860,21 @@ private:
             return false;
         }
         flag_tried = true;
-        const auto& dld = device.GetDispatchLoader();
-        const VkDevice dev = *device.GetLogical();
         const VkDeviceSize size = (FLAG_SINK_SLOT + 1) * SamplesQueryBank::QUERY_SIZE;
-        const VkBufferCreateInfo buffer_ci{
-            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-            .pNext = nullptr,
-            .flags = 0,
-            .size = size,
-            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                     VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-            .queueFamilyIndexCount = 0,
-            .pQueueFamilyIndices = nullptr,
-        };
-        if (dld.vkCreateBuffer(dev, &buffer_ci, nullptr, &flag_buffer) != VK_SUCCESS) {
-            flag_buffer = VK_NULL_HANDLE;
-            LOG_ERROR(Render_Vulkan, "Occlusion flags (FRITCHII_OCCL_FLAG): no flag buffer");
+        // The slots in device-local memory (the pixel stores stay off PCIe), and a host-visible
+        // mirror the syncs copy the synced slots into for the fencing thread.
+        if (!MakeFlagBuffer(size,
+                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                            false, flag_buffer, flag_memory) ||
+            !MakeFlagBuffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, flag_mirror,
+                            flag_mirror_memory)) {
             return false;
         }
-        const VkMemoryRequirements requirements =
-            device.GetLogical().GetBufferMemoryRequirements(flag_buffer);
-        const auto props = device.GetPhysical().GetMemoryProperties().memoryProperties;
-        constexpr VkMemoryPropertyFlags wanted =
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-        u32 type = ~0U;
-        for (u32 pass = 0; pass < 2 && type == ~0U; ++pass) {
-            for (u32 i = 0; i < props.memoryTypeCount; ++i) {
-                const VkMemoryPropertyFlags f = props.memoryTypes[i].propertyFlags;
-                // First pass: system memory (not device local), as the fencing thread reads it.
-                if ((requirements.memoryTypeBits & (1U << i)) != 0 && (f & wanted) == wanted &&
-                    (pass == 1 || (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0)) {
-                    type = i;
-                    break;
-                }
-            }
-        }
-        if (type == ~0U) {
-            LOG_ERROR(Render_Vulkan, "Occlusion flags (FRITCHII_OCCL_FLAG): no memory type");
-            return false;
-        }
-        const VkMemoryAllocateFlagsInfo flags_info{
-            .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
-            .pNext = nullptr,
-            .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT,
-            .deviceMask = 0,
-        };
         u8* map = nullptr;
         try {
-            flag_memory = device.GetLogical().AllocateMemory(VkMemoryAllocateInfo{
-                .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-                .pNext = &flags_info,
-                .allocationSize = requirements.size,
-                .memoryTypeIndex = type,
-            });
-            if (dld.vkBindBufferMemory(dev, flag_buffer, *flag_memory, 0) != VK_SUCCESS) {
-                LOG_ERROR(Render_Vulkan, "Occlusion flags (FRITCHII_OCCL_FLAG): bind failed");
-                return false;
-            }
-            map = flag_memory.Map(0, VK_WHOLE_SIZE);
+            map = flag_mirror_memory.Map(0, VK_WHOLE_SIZE);
         } catch (const vk::Exception& exception) {
             LOG_ERROR(Render_Vulkan, "Occlusion flags (FRITCHII_OCCL_FLAG): {}", exception.what());
             return false;
@@ -835,10 +886,15 @@ private:
         }
         flag_marks = std::make_unique<std::atomic<u8>[]>(FLAG_SINK_SLOT + 1);
         std::memset(map, 0, size);
+        // The device slots start at 0: filled ahead of the submission's work (upload buffer).
+        scheduler.RecordWithUploadBuffer(
+            [buffer = flag_buffer, size](vk::CommandBuffer, vk::CommandBuffer upload) {
+                upload.FillBuffer(buffer, 0, size, 0);
+            });
         LOG_INFO(Render_Vulkan,
-                 "Occlusion flags (FRITCHII_OCCL_FLAG): {} KiB of flag slots for {} banks, "
-                 "memory type {}, device address {:#x}",
-                 size >> 10, FLAG_BANKS, type, flag_address);
+                 "Occlusion flags (FRITCHII_OCCL_FLAG): {} KiB of flag slots for {} banks in device "
+                 "memory, mirrored to host memory; device address {:#x}",
+                 size >> 10, FLAG_BANKS, flag_address);
         flag_map.store(map, std::memory_order_release); // last: the area is complete
         return true;
     }
@@ -960,8 +1016,14 @@ private:
             map != nullptr && current_bank_id < FLAG_BANKS) {
             bank_epoch[current_bank_id].fetch_add(1, std::memory_order_acq_rel);
             const size_t first = current_bank_id * SamplesQueryBank::BANK_SIZE;
-            std::memset(map + first * SamplesQueryBank::QUERY_SIZE, 0,
-                        SamplesQueryBank::BANK_SIZE * SamplesQueryBank::QUERY_SIZE);
+            // The device slots: filled ahead of the submission's work (upload buffer). The bank
+            // is dead, so the GPU is done with them; the mirror is rewritten by the syncs.
+            scheduler.RecordWithUploadBuffer(
+                [buffer = flag_buffer, offset = first * SamplesQueryBank::QUERY_SIZE](
+                    vk::CommandBuffer, vk::CommandBuffer upload) {
+                    upload.FillBuffer(buffer, offset,
+                                      SamplesQueryBank::BANK_SIZE * SamplesQueryBank::QUERY_SIZE, 0);
+                });
             for (size_t i = 0; i < SamplesQueryBank::BANK_SIZE; ++i) {
                 flag_marks[first + i].store(0, std::memory_order_relaxed);
             }
