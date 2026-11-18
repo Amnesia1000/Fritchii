@@ -997,8 +997,10 @@ void ConfigureGraphics::SetupOcarinaUpscalerLabels() {
                 const bool scaled = Settings::OcarinaDlssRenderScaleSwitch() &&
                                     (quality == Settings::NvidiaDlssQuality::Performance ||
                                      quality == Settings::NvidiaDlssQuality::UltraPerformance);
-                const QString render = HeightName(Settings::OcarinaRenderHeightFor(
-                    scaled ? std::optional{quality} : std::nullopt));
+                const QString render = HeightName(
+                    !scaled ? 1440U
+                    : quality == Settings::NvidiaDlssQuality::Performance ? 1080U
+                                                                          : 720U);
                 sizes = native ? render : render + arrow + HeightName(2160);
             } else {
                 const QString game_size = tr("game's size");

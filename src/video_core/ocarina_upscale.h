@@ -186,6 +186,10 @@ constexpr OcarinaOutputSetting ResolveOcarinaUpscaleOutput(unsigned requested,
 struct OcarinaPassOutput {
     bool native_aa{};
     unsigned big_height{};
+    /// An output between a lowered scene (oot_render_height) and the game's 1440p picture
+    /// (720p -> 1080p): the upscaler makes that size and the output pass stretches it into the
+    /// game's target. 0 = none.
+    unsigned small_height{};
     constexpr bool operator==(const OcarinaPassOutput&) const = default;
 };
 
@@ -196,7 +200,9 @@ struct OcarinaPassOutput {
 /// only). DLSS and FSR only enlarge, by up to 3x a side (FSR 3.1's range, DLSS Ultra
 /// Performance), so an output at or below the scene is native AA at the scene's size (the
 /// window's scaling takes it down), and one more than 3x the scene drops to the largest offered
-/// height within 3x.
+/// height within 3x. With a lowered scene (scene_height below 1440: oot_render_height) an output
+/// below 1440p is made at its own size (small_height) or, at most the scene, as native AA; with
+/// the game's 1440p scene the outputs up to 1440p stay the game's target, as before.
 constexpr OcarinaPassOutput PlanOcarinaPassOutput(unsigned output, bool pass_1440p,
                                                   unsigned scene_height, bool dlss_native,
                                                   bool fsr_game_size) {
@@ -209,6 +215,12 @@ constexpr OcarinaPassOutput PlanOcarinaPassOutput(unsigned output, bool pass_144
     if (!pass_1440p) {
         // The 3/4 pass: its target is 4/3 of the scene (1440p at most).
         return {output <= 1080, 0};
+    }
+    if (output < 1440 && scene_height < 1440) {
+        if (output <= scene_height) {
+            return {true, 0};
+        }
+        return {false, 0, output};
     }
     if (output <= 1440) {
         return {false, 0};
