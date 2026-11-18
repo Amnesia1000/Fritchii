@@ -278,8 +278,9 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
 
         if (nvidia_dlss_checkbox && (setting->Id() == Settings::values.nvidia_dlss_quality.Id() ||
                                      setting->Id() == Settings::values.nvidia_dlss_preset.Id())) {
-            widget->setVisible(nvidia_dlss_checkbox->isChecked());
-            connect(nvidia_dlss_checkbox, &QCheckBox::toggled, widget, &QWidget::setVisible);
+            widget->setVisible(DlssOn());
+            connect(nvidia_dlss_checkbox, &QCheckBox::toggled, widget,
+                    [this, widget](bool) { widget->setVisible(DlssOn()); });
         }
         if (setting->Id() == Settings::values.nvidia_dlss_quality.Id()) {
             dlss_quality_combobox = widget->combobox;
@@ -608,17 +609,42 @@ void ConfigureGraphics::UpdateAPILayout() {
     UpdateDlssVisibility();
 }
 
+namespace {
+/// The "Upscaler" row for DLSS, which is the nvidia_dlss checkbox, not an OotAntiAliasing value.
+constexpr u32 UPSCALER_DLSS = 0x100;
+} // namespace
+
+bool ConfigureGraphics::DlssDevice() const {
+    const int device = vulkan_device_combobox ? vulkan_device_combobox->currentIndex() : -1;
+    if (device < 0) {
+        // Per game there is no device list: the global choice's card.
+        const auto global = static_cast<size_t>(Settings::values.vulkan_device.GetValue(true));
+        return global < records.size() && records[global].nvidia;
+    }
+    return GetCurrentGraphicsBackend() == Settings::RendererBackend::Vulkan &&
+           static_cast<size_t>(device) < records.size() && records[device].nvidia;
+}
+
+bool ConfigureGraphics::DlssOn() const {
+    const bool checked = nvidia_dlss_checkbox != nullptr ? nvidia_dlss_checkbox->isChecked()
+                                                         : Settings::values.nvidia_dlss.GetValue();
+    return checked && DlssDevice();
+}
+
 void ConfigureGraphics::UpdateDlssVisibility() {
     if (nvidia_dlss_group == nullptr || nvidia_dlss_checkbox == nullptr) {
         return;
     }
     // DLSS runs only on NVIDIA GPUs: the option is hidden for any other GPU (AMD and Intel
-    // players saw it and could turn it on for nothing). A saved choice stays visible so it can be
-    // turned off; the game falls back to FSR 3.1 or its own upscaler meanwhile.
-    const int device = vulkan_device_combobox ? vulkan_device_combobox->currentIndex() : -1;
-    const bool nvidia = GetCurrentGraphicsBackend() == Settings::RendererBackend::Vulkan &&
-                        device >= 0 && static_cast<size_t>(device) < records.size() &&
-                        records[device].nvidia;
+    // players saw it and could turn it on for nothing). The game falls back to FSR 3.1 or its own
+    // upscaler meanwhile.
+    const bool nvidia = DlssDevice();
+    // The upscaler list's DLSS entry too (2026-11-18: AMD players still saw "DLSS" there).
+    if (upscaler_combobox != nullptr) {
+        if (auto* const list = qobject_cast<QListView*>(upscaler_combobox->view())) {
+            list->setRowHidden(upscaler_combobox->findData(UPSCALER_DLSS), !nvidia);
+        }
+    }
     // Not NVIDIA: every DLSS row goes, a saved "on" included (2026-11-16: an RX 7900 XT's game
     // settings still showed DLSS quality and model; DLSS can't run there, the value does nothing).
     nvidia_dlss_group->setVisible(nvidia);
@@ -656,8 +682,6 @@ void ConfigureGraphics::UpdateAmdFsr4Visibility() {
 }
 
 namespace {
-/// The "Upscaler" row for DLSS, which is the nvidia_dlss checkbox, not an OotAntiAliasing value.
-constexpr u32 UPSCALER_DLSS = 0x100;
 
 /// What a picture choice asks DLSS for: an upscale (the quality the player had, or Automatic),
 /// Native (DLAA), or the FRITCHII_DLSS_RENDER_SCALE qualities.
@@ -858,7 +882,7 @@ void ConfigureGraphics::UpdateUpscalerChoice() {
     }
     using Aa = Settings::OotAntiAliasing;
     const auto aa = static_cast<Aa>(oot_aa_combobox->currentData().toUInt());
-    const bool dlss_on = nvidia_dlss_checkbox != nullptr && nvidia_dlss_checkbox->isChecked();
+    const bool dlss_on = DlssOn();
     // What runs: an FSR choice wins over DLSS (VideoCommon::SelectOcarinaUpscaler).
     const u32 shown =
         !VideoCommon::OcarinaFsrChosen(aa) && dlss_on ? UPSCALER_DLSS : static_cast<u32>(aa);
@@ -950,8 +974,7 @@ void ConfigureGraphics::UpdateOcarinaUpscalerLabels() {
             static_cast<Settings::OotAntiAliasing>(oot_aa_combobox->currentData().toUInt()));
     }
     // Per game the DLSS checkbox isn't shown: its global value counts.
-    const bool dlss = nvidia_dlss_checkbox != nullptr ? nvidia_dlss_checkbox->isChecked()
-                                                      : Settings::values.nvidia_dlss.GetValue();
+    const bool dlss = DlssOn();
     // While DLSS or FSR runs, OoT's scale goes to 1x for the session
     // (RasterizerVulkan::ApplyOcarinaResolution; FRITCHII_DLSS_SCALED keeps it). The picture menu
     // hides this row then; elsewhere (handheld, per game) the tooltip says it.
@@ -973,9 +996,7 @@ void ConfigureGraphics::SetupOcarinaTextureRows(const std::map<u32, QWidget*>& r
     // wins over DLSS). Per game the DLSS checkbox isn't shown: its global value counts.
     if (ConfigurationShared::Widget* const jitter = find(Settings::values.oot_dlss_jitter.Id())) {
         const auto update = [this, jitter] {
-            const bool dlss = nvidia_dlss_checkbox != nullptr
-                                  ? nvidia_dlss_checkbox->isChecked()
-                                  : Settings::values.nvidia_dlss.GetValue();
+            const bool dlss = DlssOn();
             bool fsr = false;
             if (oot_aa_combobox != nullptr && oot_aa_combobox->currentIndex() >= 0) {
                 fsr = VideoCommon::OcarinaFsrChosen(static_cast<Settings::OotAntiAliasing>(
@@ -1018,7 +1039,7 @@ std::vector<int> ConfigureGraphics::PictureChoicesNow() const {
     // What runs: an FSR choice wins over DLSS (VideoCommon::SelectOcarinaUpscaler).
     const bool fsr = VideoCommon::OcarinaFsrChosen(
         static_cast<Settings::OotAntiAliasing>(oot_aa_combobox->currentData().toUInt()));
-    const bool dlss = !fsr && nvidia_dlss_checkbox != nullptr && nvidia_dlss_checkbox->isChecked();
+    const bool dlss = !fsr && DlssOn();
     if (!fsr && !dlss) {
         return choices;
     }
@@ -1330,7 +1351,7 @@ void ConfigureGraphics::SetupPlainNames(const std::map<u32, QWidget*>& rows) {
                                             ? HeightName(docked)
                                             : tr("up to %1").arg(HeightName(docked));
             resolution_combobox->setItemText(
-                row, tr("%1  (%2 handheld)").arg(docked_text, HeightName(handheld)));
+                row, tr("%1 (Handheld %2)").arg(docked_text, HeightName(handheld)));
         }
     }
     UpdateOcarinaUpscalerLabels();
