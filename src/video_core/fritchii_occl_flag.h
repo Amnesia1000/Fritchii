@@ -29,7 +29,9 @@ namespace VideoCommon::OcclFlag {
 
 /// 3 (TEST): on without the colour flag variants (only colour-off draws take flag pipelines),
 /// to measure what the colour variants add.
-enum Value : int { Off = 0, On = 1, Verify = 2, OnColourOff = 3 };
+/// 4 (COST PROBE, wrong picture possible): as 3, and colour-off draws whose pixel program
+/// discards take the host flag variant too (no discard, no query): what their queries cost.
+enum Value : int { Off = 0, On = 1, Verify = 2, OnColourOff = 3, ProbeDiscards = 4 };
 
 [[nodiscard]] inline int RawMode() noexcept {
     return VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_occl_flag,
@@ -38,12 +40,15 @@ enum Value : int { Off = 0, On = 1, Verify = 2, OnColourOff = 3 };
 
 [[nodiscard]] inline int Mode() noexcept {
     const int value = RawMode();
-    return value == Verify ? Verify : (value == On || value == OnColourOff) ? On : Off;
+    return value == Verify                                                     ? Verify
+           : (value == On || value == OnColourOff || value == ProbeDiscards) ? On
+                                                                               : Off;
 }
 
 /// Colour-writing counted draws may take the colour flag variant (not with =3).
 [[nodiscard]] inline bool ColourAllowed() noexcept {
-    return RawMode() != OnColourOff;
+    const int value = RawMode();
+    return value == On || value == Verify;
 }
 
 /// Read once at device creation: whether to keep the buffer device address feature.
@@ -63,12 +68,14 @@ enum class Census : u8 {
     ColourSubgroup, ///< colour on, Lean, but subgroup votes, masks, shuffles or helper reads
     ColourA2C,    ///< colour on, Lean, alpha to coverage in the key
     ColourDiscards,
+    ColourDiscardsNoWrites, ///< discards, otherwise Lean, no depth or stencil writes this draw
     ColourKeyState,
     ColourDepthOrMask,
     ColourStores,
     ColourOther,  ///< colour on: no pixel program, mesh, or other
     RegsRefused,  ///< alpha test or alpha to coverage in the registers
     OffDiscards,  ///< colour off, the pixel program discards
+    OffDiscardsNoWrites, ///< as above, otherwise Lean, no depth or stencil writes this draw
     OffKeyState,  ///< colour off, alpha test or dual source in the key
     OffDepthOrMask,
     OffStores,
@@ -78,9 +85,10 @@ enum class Census : u8 {
 };
 inline constexpr const char* CensusNames[] = {
     "unknown", "flag", "not ready", "colour Lean", "colour Lean quad", "colour Lean subgroup",
-    "colour Lean A2C", "colour discards", "colour key state", "colour depth/mask",
-    "colour stores", "colour other", "alpha test/coverage", "off discards", "off key state",
-    "off depth/mask", "off stores", "off other", "failed"};
+    "colour Lean A2C", "colour discards", "colour discards no writes", "colour key state",
+    "colour depth/mask", "colour stores", "colour other", "alpha test/coverage", "off discards",
+    "off discards no writes", "off key state", "off depth/mask", "off stores", "off other",
+    "failed"};
 static_assert(std::size(CensusNames) == static_cast<size_t>(Census::Count));
 inline thread_local Census t_census{};
 

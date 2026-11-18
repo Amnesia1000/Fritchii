@@ -3704,6 +3704,42 @@ constexpr u8 OCCL_FLAG_BUILD_COLOUR = 2; ///< the guest pixel program with the f
 /// colour-writing draw, or Flag when it can: no subgroup or helper operations (early tests
 /// change which lanes are active), no quad operations (helper lanes in them are not
 /// guaranteed), no alpha to coverage in the key (coverage would change after the tests).
+/// FRITCHII_OCCL_FLAG census: a discarding pixel program that is otherwise Lean (no depth or
+/// sample mask writes, stores, subgroup/quad/helper operations, alpha to coverage), drawn with
+/// no depth or stencil writes: early fragment tests and a flag store after the discards would
+/// count exactly what the query counts.
+bool OcclFlagDiscardsNoWrites(const GraphicsPipeline& pipeline,
+                              const Tegra::Engines::Maxwell3D::Regs& regs) {
+    const auto& infos = pipeline.StageInfos();
+    const Shader::Info& pixel = infos[infos.size() - 1];
+    const bool writes_storage = std::ranges::any_of(
+        pixel.storage_buffers_descriptors, [](const auto& desc) { return desc.is_written; });
+    const bool writes_images =
+        std::ranges::any_of(pixel.image_descriptors,
+                            [](const auto& desc) { return desc.is_written; }) ||
+        std::ranges::any_of(pixel.image_buffer_descriptors,
+                            [](const auto& desc) { return desc.is_written; });
+    if (pixel.stores_frag_depth || pixel.stores_sample_mask || writes_storage || writes_images ||
+        pixel.stores_global_memory || pixel.uses_typeless_image_writes ||
+        pixel.uses_global_increment || pixel.uses_global_decrement ||
+        pixel.uses_shared_increment || pixel.uses_shared_decrement || pixel.uses_atomic_f32_add ||
+        pixel.uses_int64_bit_atomics || pixel.uses_atomic_image_u32 || pixel.uses_atomic_s32_min ||
+        pixel.uses_atomic_s32_max) {
+        return false;
+    }
+    if (pixel.uses_subgroup_vote || pixel.uses_subgroup_mask || pixel.uses_subgroup_shuffles ||
+        pixel.uses_subgroup_invocation_id || pixel.uses_is_helper_invocation ||
+        pixel.uses_quad_shuffles || pixel.uses_fswzadd ||
+        pipeline.Key().state.alpha_to_coverage_enabled != 0) {
+        return false;
+    }
+    const bool stencil_writes =
+        regs.stencil_enable != 0 &&
+        (regs.stencil_front_mask != 0 ||
+         (regs.stencil_two_side_enable != 0 && regs.stencil_back_mask != 0));
+    return regs.depth_write_enabled == 0 && !stencil_writes;
+}
+
 VideoCommon::OcclFlag::Census OcclFlagColourVerdict(const GraphicsPipeline& pipeline) {
     using VideoCommon::OcclFlag::Census;
     const auto& infos = pipeline.StageInfos();
@@ -3799,7 +3835,9 @@ GraphicsPipeline* PipelineCache::OcclFlagPipeline(GraphicsPipeline* pipeline,
             break;
         }
         case PipelineClass::Discards:
-            OcclFlag::t_census = Census::ColourDiscards;
+            OcclFlag::t_census = OcclFlagDiscardsNoWrites(*pipeline, regs)
+                                     ? Census::ColourDiscardsNoWrites
+                                     : Census::ColourDiscards;
             break;
         case PipelineClass::KeyState:
             OcclFlag::t_census = Census::ColourKeyState;
@@ -3817,8 +3855,10 @@ GraphicsPipeline* PipelineCache::OcclFlagPipeline(GraphicsPipeline* pipeline,
         OcclFlag::Add(stats.refused_regs);
         return pipeline;
     }
-    if (pipeline_class != PipelineClass::Lean || pipeline->IsMeshPipeline() ||
-        pipeline->occl_flag_state == 2) {
+    const bool probe_discards = OcclFlag::RawMode() == OcclFlag::ProbeDiscards &&
+                                pipeline_class == PipelineClass::Discards;
+    if ((pipeline_class != PipelineClass::Lean && !probe_discards) ||
+        pipeline->IsMeshPipeline() || pipeline->occl_flag_state == 2) {
         switch (pipeline->occl_flag_state == 2 ? PipelineClass::Failed
                 : pipeline->IsMeshPipeline()     ? PipelineClass::Mesh
                                                  : pipeline_class) {
@@ -3826,7 +3866,9 @@ GraphicsPipeline* PipelineCache::OcclFlagPipeline(GraphicsPipeline* pipeline,
             OcclFlag::t_census = Census::Failed;
             break;
         case PipelineClass::Discards:
-            OcclFlag::t_census = Census::OffDiscards;
+            OcclFlag::t_census = OcclFlagDiscardsNoWrites(*pipeline, regs)
+                                     ? Census::OffDiscardsNoWrites
+                                     : Census::OffDiscards;
             break;
         case PipelineClass::KeyState:
             OcclFlag::t_census = Census::OffKeyState;
