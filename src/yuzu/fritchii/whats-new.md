@@ -26,18 +26,13 @@ Fritchii's tuned settings are applied once more with this update; you can change
 ### Performance
 
 Uncapped on our test PC (Ryzen 7 7800X3D + RTX 4080, 1440p). With the 60 fps cap on you see a flat 60; the uncapped number is the headroom you have left. Around 70 uncapped is what holds a smooth 60.
-<!-- TBC: refresh this table with the release candidate's numbers (after the PGO retrain). -->
+<!-- Measured on the release candidate's code, 2026-11-18: market = PGO v10 A/B (fresh launches, last 60 s of 90), Zora's River = build 70 regression, pot room = builds 66-70. -->
 
 | Spot | v6.0 uncapped |
 |---|---|
-| Castle Town market (day, heaviest view) | ~78 fps |
-| Castle Town market (night) | ~86 fps |
-| Stalchild fight | ~91 fps |
-| Zora's River | ~86 fps |
-| Kakariko | ~69 fps |
-| Pot room (guard house) | ~97 fps |
-| Great Fairy fountain | ~102 fps |
-| Shooting gallery | ~116 fps |
+| Castle Town market (day, heaviest view) | ~74 fps |
+| Zora's River | ~91 fps |
+| Pot room (guard house) | ~92 fps |
 
 For comparison: on v5.8 the market ran 50 to 60 and rarely hit 60.
 
