@@ -580,6 +580,7 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
          }});
     translations->insert({Settings::EnumMetadata<Settings::ScalingFilter>::Index(),
                           {
+                              PAIR(ScalingFilter, Auto, tr("Auto (recommended)")),
                               PAIR(ScalingFilter, NearestNeighbor, tr("Nearest Neighbor")),
                               PAIR(ScalingFilter, Bilinear, tr("Bilinear")),
                               PAIR(ScalingFilter, Bicubic, tr("Bicubic")),

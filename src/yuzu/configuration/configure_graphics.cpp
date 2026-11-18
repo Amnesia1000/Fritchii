@@ -1401,8 +1401,8 @@ void ConfigureGraphics::SetupPlainNames(const std::map<u32, QWidget*>& rows) {
     set(values.vsync_mode.Id(), tr("VSync:"),
         tr("Stops the picture from tearing.\nOff has the least lag but the picture can tear."));
     set(values.scaling_filter.Id(), tr("Window filter:"),
-        tr("How the picture is stretched to fit your window or screen.\nSharper filters can "
-           "look grainy."));
+        tr("How the picture is fitted to your window or screen.\nAuto: Area when the picture is "
+           "bigger than your screen, ScaleForce when it is smaller."));
     set(values.game_dlss_network.Id(), tr("Use the game's own DLSS"),
         tr("Switch 2 games with DLSS use the game's own upscaler instead of FSR 3.1.\nCan be slow "
            "on older cards."));
@@ -1458,8 +1458,17 @@ void ConfigureGraphics::SetupPlainNames(const std::map<u32, QWidget*>& rows) {
             const QString docked_text = max_resolution
                                             ? HeightName(docked)
                                             : tr("up to %1").arg(HeightName(docked));
+            // Without Max Resolution both are 1080p at 1x: one number, not the same one twice.
             resolution_combobox->setItemText(
-                row, tr("%1 (Handheld %2)").arg(docked_text, HeightName(handheld)));
+                row, docked == handheld
+                         ? docked_text
+                         : tr("%1 (Handheld %2)").arg(docked_text, HeightName(handheld)));
+            // 360p to 8K (owner 2026-11-18); a scale outside it stays only while it is the
+            // current one, so nobody's setting vanishes.
+            if (auto* view = qobject_cast<QListView*>(resolution_combobox->view())) {
+                view->setRowHidden(row, (docked < 360 || docked > 4320) &&
+                                            row != resolution_combobox->currentIndex());
+            }
         }
     }
     UpdateOcarinaUpscalerLabels();
