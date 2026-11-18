@@ -260,6 +260,11 @@ constexpr std::pair<const char*, const char*> BuiltinSwitches[] = {
     {"FRITCHII_ONEF_CARRY_OPS", "1"},     {"FRITCHII_ONEF_KEY_KEEP", "2"},
     {"FRITCHII_ONEF_CB_LEAN", "3"},       {"FRITCHII_ONEF_DISPATCH_RANGES", "1"},
     {"FRITCHII_ONEF_POST_IDLE", "2"},     {"FRITCHII_ONEF_RAISE_AFTER_LEND", "1"},
+    // zortos293/Lichii #2104 (owner 2026-11-18: keep zortos's proven stutter fixes even where
+    // our tests show no difference): a native dispatch whose compute pipeline isn't built yet is
+    // skipped for that frame when its guards prove nothing reads the output. Works only while a
+    // pipeline builds (no cost with warm caches); cold A/B 11-18: 0 skipped, must-be-0 counts 0.
+    {"FRITCHII_ASYNC_COMPUTE_SKIP", "1"},
 #ifdef _WIN32
     // Tested on Windows only (the Linux test builds ran without them).
     {"FRITCHII_JIT_PIN", "1"},            {"FRITCHII_JIT_PIN_REGS", "x8,x0"},
