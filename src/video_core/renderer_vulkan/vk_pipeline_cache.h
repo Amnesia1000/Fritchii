@@ -164,6 +164,14 @@ public:
     [[nodiscard]] GraphicsPipeline* OcclLeanPipeline(GraphicsPipeline* full, const Maxwell& regs,
                                                      int mode, VideoCommon::OcclLean::DrawNote& note);
 
+    /// FRITCHII_OCCL_FLAG (fritchii_occl_flag.h; the recording thread, right after the draw's
+    /// pipeline is known, one follower off): for a counted draw that writes no colour and whose
+    /// pixel program can change nothing (OCCL_LEAN's Lean class), `pipeline`'s flag variant once
+    /// made and built; else `pipeline`. A flag variant passed in (a kept pipeline) is first
+    /// turned back into its own pipeline, so a flag variant never draws another draw.
+    [[nodiscard]] GraphicsPipeline* OcclFlagPipeline(GraphicsPipeline* pipeline,
+                                                     const Maxwell& regs);
+
     /// One follower (fable_b 18.4, E, right after a lookup): the key parts the lookup kept
     /// because their flag was clear, computed fresh from the registers and compared: bit 0 the
     /// programs (with `shaders_clear`), 1 the blend (`blending_clear`), 2 the vertex input
@@ -438,6 +446,13 @@ private:
     /// translated now (one a frame) from the draw's environments; null when not available yet.
     /// Sets full.occl_class to Failed when it cannot be made.
     GraphicsPipeline* FindOrMakeOcclSibling(GraphicsPipeline& full);
+    /// FRITCHII_OCCL_FLAG: full's flag variant, translated now (one a frame, shared with the
+    /// lean siblings) from the draw's environments; null when not available yet. Sets
+    /// full.occl_flag_state to 2 when it cannot be made.
+    GraphicsPipeline* FindOrMakeOcclFlag(GraphicsPipeline& full);
+    /// FRITCHII_OCCL_FLAG: set while CreateGraphicsPipeline makes a flag variant (no libraries,
+    /// the host flag module in place of the pixel program's).
+    bool occl_flag_build{};
     /// FRITCHII_OCCL_LEAN: frame_count of the last sibling translation (one a frame).
     u64 occl_made_frame{~u64{0}};
 

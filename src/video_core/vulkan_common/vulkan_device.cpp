@@ -15,6 +15,7 @@
 #include <optional>
 #include <thread>
 #include <unordered_map>
+#include "video_core/fritchii_occl_flag.h"
 #include "common/container/unordered_map.h"
 #include "common/container/unordered_set.h"
 #include <utility>
@@ -1023,7 +1024,14 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         extensions.buffer_device_address = false;
     } else
 #endif
-    if (!extensions.descriptor_buffer) {
+    if (!extensions.descriptor_buffer && VideoCommon::OcclFlag::WantedAtBoot() &&
+        features.buffer_device_address.bufferDeviceAddress) {
+        // FRITCHII_OCCL_FLAG: the flag pipelines store through buffer device addresses. As for
+        // DLSS above, the feature stays enabled while the emulator's own buffers and VMA stay
+        // as they are without descriptor buffers.
+        extensions.buffer_device_address = false;
+        occl_flag_device_address = true;
+    } else if (!extensions.descriptor_buffer) {
         RemoveExtensionFeature(extensions.buffer_device_address, features.buffer_device_address,
                                VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
     }

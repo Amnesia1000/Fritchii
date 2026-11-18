@@ -27,6 +27,8 @@
 #include <deque>
 #include <numeric>
 #include <streambuf>
+#include "video_core/host_shaders/vulkan_occl_flag_frag_spv.h"
+#include "video_core/fritchii_occl_flag.h"
 #include "common/cityhash.h"
 #include "common/polyfill_thread.h"
 #include "common/scm_rev.h"
@@ -3501,6 +3503,97 @@ GraphicsPipeline* PipelineCache::OcclLeanPipeline(GraphicsPipeline* full, const 
     OcclLean::Add(stats.lean);
     note.lean = true;
     return sibling;
+}
+
+GraphicsPipeline* PipelineCache::OcclFlagPipeline(GraphicsPipeline* pipeline,
+                                                  const Maxwell& regs) {
+    namespace OcclFlag = VideoCommon::OcclFlag;
+    namespace OcclLean = VideoCommon::OcclLean;
+    using OcclLean::PipelineClass;
+    if (pipeline == nullptr) {
+        return pipeline;
+    }
+    if (pipeline->occl_flag_parent != nullptr) {
+        pipeline = pipeline->occl_flag_parent; // a kept flag variant: decide again
+    }
+    if (OcclFlag::Mode() == OcclFlag::Off || !device.IsOcclFlagDeviceAddressEnabled()) {
+        return pipeline;
+    }
+    OcclFlag::Stats& stats = OcclFlag::g_stats;
+    OcclFlag::MaybeLog();
+    const OcclLean::RegsVerdict verdict = OcclLean::ClassifyRegs(regs);
+    if (!verdict.counting) {
+        return pipeline;
+    }
+    if (!verdict.colour_off || verdict.refused) {
+        OcclFlag::Add(stats.refused_regs);
+        return pipeline;
+    }
+    if (pipeline->occl_class == 0) {
+        pipeline->occl_class =
+            static_cast<u8>(static_cast<u8>(ClassifyOcclPipeline(*pipeline)) + 1);
+    }
+    if (static_cast<PipelineClass>(pipeline->occl_class - 1) != PipelineClass::Lean ||
+        pipeline->IsMeshPipeline() || pipeline->occl_flag_state == 2) {
+        OcclFlag::Add(stats.not_lean);
+        return pipeline;
+    }
+    GraphicsPipeline* flag = pipeline->occl_flag.get();
+    if (flag == nullptr) {
+        flag = FindOrMakeOcclFlag(*pipeline);
+        if (flag == nullptr) {
+            OcclFlag::Add(stats.not_ready);
+            return pipeline;
+        }
+    }
+    if (flag->Failed()) [[unlikely]] {
+        OcclFlag::Add(stats.failed);
+        pipeline->occl_flag_state = 2;
+        return pipeline;
+    }
+    if (!flag->IsBuilt()) {
+        OcclFlag::Add(stats.not_ready);
+        return pipeline;
+    }
+    flag->MarkUsed(frame_count); // the pipeline itself is marked by the lookup
+    return flag;
+}
+
+GraphicsPipeline* PipelineCache::FindOrMakeOcclFlag(GraphicsPipeline& full) {
+    namespace OcclFlag = VideoCommon::OcclFlag;
+    // The environments come from the registers of this draw: only while the current key names
+    // full's programs. One translation a frame, shared with the lean siblings.
+    if (graphics_key.unique_hashes != full.Key().unique_hashes || occl_made_frame == frame_count) {
+        return nullptr;
+    }
+    occl_made_frame = frame_count;
+    const GraphicsPipelineCacheKey saved = graphics_key;
+    std::unique_ptr<GraphicsPipeline> made;
+    {
+        graphics_key = full.Key();
+        occl_flag_build = true;
+        SCOPE_EXIT {
+            graphics_key = saved;
+            occl_flag_build = false;
+        };
+        try {
+            made = CreateGraphicsPipeline(nullptr, false);
+        } catch (const std::exception& exception) {
+            LOG_ERROR(Render_Vulkan, "Occlusion flags (FRITCHII_OCCL_FLAG): {}: {}",
+                      OcclShaders(full.Key()), exception.what());
+            made.reset();
+        }
+    }
+    if (!made) {
+        OcclFlag::Add(OcclFlag::g_stats.failed);
+        full.occl_flag_state = 2;
+        return nullptr;
+    }
+    OcclFlag::Add(OcclFlag::g_stats.made);
+    made->occl_flag_parent = &full;
+    full.occl_flag = std::move(made);
+    full.occl_flag_state = 1;
+    return full.occl_flag.get();
 }
 
 GraphicsPipeline* PipelineCache::FindOrMakeOcclSibling(GraphicsPipeline& full) {
@@ -8410,6 +8503,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     // pipelines, transform feedback, a static rasterizer discard, and stages whose texture or
     // image counts do not fit the split rescaling bits.
     const bool use_libraries = [&] {
+        if (occl_flag_build) {
+            return false; // FRITCHII_OCCL_FLAG: a whole pipeline with the host flag module
+        }
         if (!device.IsExtGraphicsPipelineLibrarySupported() || key.state.xfb_enabled != 0) {
             return false;
         }
@@ -8566,6 +8662,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         previous_stage = &program;
     }
+    // FRITCHII_OCCL_FLAG: the flag variant's pixel stage is the host flag program (the guest
+    // pixel program was translated for its infos, which the variant keeps).
+    const bool occl_flag_variant = occl_flag_build;
+    if (occl_flag_variant && !emit_pools && !(record && record->translate_only)) {
+        modules[4] = BuildShader(device, VULKAN_OCCL_FLAG_FRAG_SPV);
+    }
     if (record) {
         record->complete = true;
         record->mesh_emulated = mesh_emulation.has_value();
@@ -8587,7 +8689,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 infos[stage] = &job->programs[stage + 1].info;
             }
         }
-        emit_stages = [this, job = std::move(job), hashes = key.unique_hashes, use_libraries](
+        emit_stages = [this, job = std::move(job), hashes = key.unique_hashes, use_libraries,
+                       occl_flag_variant](
                           std::array<u128, Maxwell::MaxShaderStage>& stage_hashes) mutable {
             const auto begin = std::chrono::steady_clock::now();
             std::array<vk::ShaderModule, Maxwell::MaxShaderStage> stage_modules;
@@ -8605,6 +8708,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                         stage_binding, hashes[stage + 1], stage, job->reference_spirv[stage],
                         use_libraries ? &stage_hashes[stage] : nullptr);
                 }
+            }
+            if (occl_flag_variant) {
+                stage_modules[4] = BuildShader(device, VULKAN_OCCL_FLAG_FRAG_SPV);
             }
             auto job_pools = std::move(job->pools);
             job.reset();
