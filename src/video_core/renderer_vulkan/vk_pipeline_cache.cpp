@@ -5232,9 +5232,18 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         base_dir / fmt::format("precompiled_prepared.fork-v{}.txt", CACHE_VERSION);
     // With the pipeline binary store saving, its file id too: a new (or started over) store is
     // filled by one more preparation (FRITCHII_PIPELINE_BINARY).
-    const std::string stamp = fmt::format("{} {} {:#x} shaders-{} {}{}\n", file_size, modified,
+    // The resolution scale changes the pipelines (rescaled shaders: built at another scale they
+    // all miss the driver cache), so a scale other than 1x is part of the stamp and a change
+    // prepares again (2026-11-18: 0.75x for low-end PCs). The scale in effect, after OoT's
+    // upscalers set it to 1x (ApplyOcarinaResolution); at 1x the stamp is what it always was.
+    const auto& scale = Settings::values.resolution_info;
+    const std::string scale_part =
+        scale.active ? fmt::format(" scale {}/{}", scale.up_scale, 1U << scale.down_shift)
+                     : std::string{};
+    const std::string stamp = fmt::format("{} {} {:#x} shaders-{} {}{}{}\n", file_size, modified,
                                           device.GetDriverVersion(), NX2_SHADER_STAMP,
-                                          device.GetModelName(), PipelineBinary::StampSuffix());
+                                          device.GetModelName(), PipelineBinary::StampSuffix(),
+                                          scale_part);
     // EDEN_NX2_PRECOMPILED_FAST: the preparation keeps each pipeline's infos and SPIR-V too
     // (vk_precompiled_kept.h), for this release, its settings and GPU. Whether this build
     // translates them the same is checked on a sample at boot (CheckKeptSample), not stamped.
