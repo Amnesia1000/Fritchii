@@ -61,7 +61,8 @@ std::vector<Item> Items(const std::vector<VkDeviceInfo::Record>& records) {
                      QObject::tr("A mod that changes the same game code as Fritchii can turn off "
                                  "high refresh. Ctrl+U tells you which one.")});
     items.push_back({QObject::tr("Weaker PCs and Steam Deck"),
-                     QObject::tr("Keep Max Resolution off and try 0.75x.")});
+                     QObject::tr("Keep Max Resolution off and pick a lower Resolution in "
+                                 "Graphics, like 810p.")});
     if (IntelCpu()) {
         items.push_back({QObject::tr("Intel 12th-14th gen and Core Ultra"),
                          QObject::tr("If fps is about half what it should be, add "
