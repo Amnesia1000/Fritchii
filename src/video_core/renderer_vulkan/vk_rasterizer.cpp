@@ -2884,8 +2884,14 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         const Profile::FineScope queries_scope{Profile::Zone::DrawQueries};
         query_cache.NotifySegment(true);
         HandleTransformFeedback();
+        // FRITCHII_OCCL_FLAG=1: a flag draw opens (or keeps) a slot with no host query.
+        const bool flag_draw = pipeline->occl_flag_parent != nullptr;
+        if (flag_draw && VideoCommon::OcclFlag::Mode() == VideoCommon::OcclFlag::On) {
+            query_cache_runtime.SetNextFlagDraw(true);
+        }
         query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
                                   maxwell3d->regs.zpass_pixel_count_enable);
+        query_cache_runtime.SetNextFlagDraw(false);
         // FRITCHII_OCCL_FLAG: a flag variant stores into the open query's slot (push constant
         // bytes 40 to 47, unused otherwise); other counted draws mark their slot as mixed.
         if (pipeline->occl_flag_parent != nullptr) {

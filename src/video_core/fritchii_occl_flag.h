@@ -20,7 +20,9 @@
 /// 0 off. 2 verify: the host queries stay and decide everything; at each report the fencing
 /// thread compares "the query counted samples" with "a flag was stored" for the reports whose
 /// counted draws were all flag draws. The disagreements must be 0. One line every 10 s.
-/// 1 (flags in place of the queries) is not built yet.
+/// 1 on: a query window whose counted draws are all flag draws runs no host query; its slots
+/// are flag slots, whose values the result copies (GPU) and reads (fencing thread) take from the
+/// flag area. A window with other counted draws splits into flag and query slots (summed).
 namespace VideoCommon::OcclFlag {
 
 enum Value : int { Off = 0, On = 1, Verify = 2 };
@@ -28,7 +30,7 @@ enum Value : int { Off = 0, On = 1, Verify = 2 };
 [[nodiscard]] inline int Mode() noexcept {
     const int value = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_occl_flag,
                                                        "FRITCHII_OCCL_FLAG");
-    return value == Verify ? Verify : Off;
+    return value == Verify ? Verify : value == On ? On : Off;
 }
 
 /// Read once at device creation: whether to keep the buffer device address feature.
@@ -53,6 +55,8 @@ struct Stats {
     std::atomic<u64> mixed{};          ///< reports with flag and other counted draws
     std::atomic<u64> no_flag{};        ///< reports with no flag draw
     std::atomic<u64> reused{};         ///< reports whose banks were reserved again before the compare
+    std::atomic<u64> flag_slots{};     ///< slots opened as flag slots (no host query; mode 1)
+    std::atomic<u64> query_slots{};    ///< slots opened with a host query
     std::atomic<u64> disagree_total{}; ///< since boot (q0_f1 + q1_f0)
     std::atomic<s64> window_start{};
 };
@@ -85,16 +89,18 @@ inline void MaybeLog() {
                  not_ready = take(g.not_ready), made = take(g.made), failed = take(g.failed),
                  no_slot = take(g.no_slot), compared = take(g.compared), agree = take(g.agree),
                  q0_f1 = take(g.q0_f1), q1_f0 = take(g.q1_f0), mixed = take(g.mixed),
-                 no_flag = take(g.no_flag), reused = take(g.reused);
+                 no_flag = take(g.no_flag), reused = take(g.reused),
+                 flag_slots = take(g.flag_slots), query_slots = take(g.query_slots);
     LOG_INFO(Render_Vulkan,
              "Occlusion flags (FRITCHII_OCCL_FLAG={}) per second: counted draws {:.0f} with a "
              "flag pipeline, {:.0f} without (not Lean {:.0f}, regs refused {:.0f}, not ready "
              "{:.0f}); flag pipelines made {:.0f}, failed {:.0f}; flag draws with no open query "
              "{:.0f}; reports compared {:.0f}: agree {:.0f}, query 0 flag 1 {:.0f}, query 1 flag 0 "
-             "{:.0f} (must be 0; {} since boot); mixed {:.0f}, no flag {:.0f}, bank reused {:.0f}",
+             "{:.0f} (must be 0; {} since boot); mixed {:.0f}, no flag {:.0f}, bank reused {:.0f}; "
+             "slots opened: {:.0f} flag (no host query), {:.0f} with a host query",
              Mode(), flag_draws, other, not_lean, refused, not_ready, made, failed, no_slot,
              compared, agree, q0_f1, q1_f0, g.disagree_total.load(std::memory_order_relaxed),
-             mixed, no_flag, reused);
+             mixed, no_flag, reused, flag_slots, query_slots);
 }
 
 } // namespace VideoCommon::OcclFlag

@@ -60,6 +60,7 @@ public:
     u64 OcclFlagAddress();
     void NoteOtherCountedDraw();
     bool OcclFlagReady();
+    void SetNextFlagDraw(bool flag);
 
     void EndHostConditionalRendering();
 
