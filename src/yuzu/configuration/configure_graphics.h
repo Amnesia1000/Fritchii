@@ -174,4 +174,6 @@ private:
     bool max_resolution_choice{true};      ///< OoT's Max Resolution add-on, saved on Apply
     bool max_resolution_saved{true};       ///< ...as it was when the page opened
     bool max_resolution_when_off{true};    ///< Its value when the upscaler goes back to off
+    u32 upscale_output_choice{};           ///< oot_upscale_output, saved on Apply (0 = Auto)
+    u32 upscale_output_saved{};            ///< ...as it was when the page opened
 };

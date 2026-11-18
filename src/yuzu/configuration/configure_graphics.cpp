@@ -695,6 +695,11 @@ enum class PictureKind : u8 { Upscaled, Native, Performance, UltraPerformance };
 ///   one choice.
 /// - Max Resolution off: the game's dynamic resolution (1920x1080 at most) and its 3/4 pass to
 ///   1440p, which the upscaler replaces: 1440p out, or the game's size with DLSS Native.
+/// - oot_upscale_output (2026-11-18, the owner: many output resolutions, like the list without
+///   an upscaler): the 1440p pass also makes 1800p, 2880p or 8K (up to 3x a side, FSR 3.1's
+///   and DLSS Ultra Performance's limit), and FSR runs at 1x like DLSS Native (1440p, or the
+///   game's size without Max Resolution). DLSS and FSR only enlarge: no output below the input.
+///   The first eight choices keep Auto, so they save what they saved before.
 struct PictureChoice {
     bool dlss;
     u32 output;          ///< Height the upscaler makes
@@ -703,21 +708,39 @@ struct PictureChoice {
     u32 input;           ///< Height the game draws
     bool up_to;          ///< The game's dynamic resolution: at most `input`
     bool render_scale;   ///< Only with FRITCHII_DLSS_RENDER_SCALE
+    u32 output_setting;  ///< oot_upscale_output it saves (0 = Auto), or KEEP_OUTPUT
 };
 
-constexpr std::array<PictureChoice, 8> PICTURE_CHOICES{{
-    {true, 2160, true, PictureKind::Upscaled, 1440, false, false},
-    {true, 2160, true, PictureKind::Performance, 1080, false, true},
-    {true, 2160, true, PictureKind::UltraPerformance, 720, false, true},
-    {true, 1440, true, PictureKind::Native, 1440, false, false},
-    {true, 1440, false, PictureKind::Upscaled, 1080, true, false},
-    {true, 1080, false, PictureKind::Native, 1080, true, false},
-    {false, 2160, true, PictureKind::Upscaled, 1440, false, false},
-    {false, 1440, false, PictureKind::Upscaled, 1080, true, false},
+/// DLSS Native keeps the scene's size whatever oot_upscale_output says: it leaves the value.
+constexpr u32 KEEP_OUTPUT = 0xffffffff;
+
+constexpr std::array<PictureChoice, 16> PICTURE_CHOICES{{
+    {true, 2160, true, PictureKind::Upscaled, 1440, false, false, 0},
+    {true, 2160, true, PictureKind::Performance, 1080, false, true, 0},
+    {true, 2160, true, PictureKind::UltraPerformance, 720, false, true, 0},
+    {true, 1440, true, PictureKind::Native, 1440, false, false, KEEP_OUTPUT},
+    {true, 1440, false, PictureKind::Upscaled, 1080, true, false, 0},
+    {true, 1080, false, PictureKind::Native, 1080, true, false, KEEP_OUTPUT},
+    {false, 2160, true, PictureKind::Upscaled, 1440, false, false, 0},
+    {false, 1440, false, PictureKind::Upscaled, 1080, true, false, 0},
+    // The outputs added with oot_upscale_output.
+    {true, 1800, true, PictureKind::Upscaled, 1440, false, false, 1800},
+    {true, 2880, true, PictureKind::Upscaled, 1440, false, false, 2880},
+    {true, 4320, true, PictureKind::Upscaled, 1440, false, false, 4320},
+    {false, 1800, true, PictureKind::Upscaled, 1440, false, false, 1800},
+    {false, 2880, true, PictureKind::Upscaled, 1440, false, false, 2880},
+    {false, 4320, true, PictureKind::Upscaled, 1440, false, false, 4320},
+    {false, 1440, true, PictureKind::Native, 1440, false, false, 1440},
+    {false, 1080, false, PictureKind::Native, 1080, true, false, 1080},
 }};
 
-const std::array<PictureChoice, 8>& PictureChoices() {
+const std::array<PictureChoice, 16>& PictureChoices() {
     return PICTURE_CHOICES;
+}
+
+/// Whether `choice` saves `setting` (a DLSS Native choice goes with any).
+constexpr bool SavesOutput(const PictureChoice& choice, u32 setting) {
+    return choice.output_setting == KEEP_OUTPUT || choice.output_setting == setting;
 }
 
 /// Of `choices`, the one with that output, of the same kind as `from` (native or not) if any.
@@ -1043,14 +1066,23 @@ std::vector<int> ConfigureGraphics::PictureChoicesNow() const {
     if (!fsr && !dlss) {
         return choices;
     }
-    // The add-on applies when the game starts: while it runs, only the choices that keep it
-    // (the DLSS quality applies live).
+    // The add-on and the output size apply when the game starts: while it runs, only the
+    // choices that keep them (the DLSS quality applies live).
     const bool running = system.IsPoweredOn();
+    // Outputs above 4K only where the game would take them (VideoCommon::OcarinaUpscaleOutputFits:
+    // the card's largest device-local heap; the renderer checks again).
+    const int device = vulkan_device_combobox ? vulkan_device_combobox->currentIndex() : -1;
+    const auto record =
+        device >= 0 ? static_cast<size_t>(device)
+                    : static_cast<size_t>(Settings::values.vulkan_device.GetValue(true));
+    const u64 vram = record < records.size() ? records[record].local_memory : 0;
     for (int index = 0; index < static_cast<int>(PictureChoices().size()); ++index) {
         const PictureChoice& choice = PictureChoices()[index];
         if (choice.dlss != dlss ||
             (choice.render_scale && !Settings::OcarinaDlssRenderScaleSwitch()) ||
-            (running && choice.max_resolution != max_resolution_saved)) {
+            !VideoCommon::OcarinaUpscaleOutputFits(choice.output, vram) ||
+            (running && (choice.max_resolution != max_resolution_saved ||
+                         !SavesOutput(choice, upscale_output_saved)))) {
             continue;
         }
         choices.push_back(index);
@@ -1080,10 +1112,19 @@ int ConfigureGraphics::CurrentPictureChoice() const {
             kind = PictureKind::UltraPerformance;
         }
     }
-    for (const int choice : choices) {
-        if (PictureChoices()[choice].max_resolution == max_resolution_choice &&
-            PictureChoices()[choice].kind == kind) {
-            return choice;
+    // FSR runs at 1x (its Native) when the output is at most the game's size.
+    if (!PictureChoices()[choices.front()].dlss && upscale_output_choice != 0 &&
+        upscale_output_choice <= (max_resolution_choice ? 1440U : 1080U)) {
+        kind = PictureKind::Native;
+    }
+    // The choice that saves this output setting, else one of the same kind (a value set by hand).
+    for (const bool exact : {true, false}) {
+        for (const int choice : choices) {
+            const PictureChoice& entry = PictureChoices()[choice];
+            if (entry.max_resolution == max_resolution_choice && entry.kind == kind &&
+                (!exact || SavesOutput(entry, upscale_output_choice))) {
+                return choice;
+            }
         }
     }
     return choices.front();
@@ -1095,6 +1136,9 @@ void ConfigureGraphics::ApplyPictureChoice(int index) {
     }
     const PictureChoice& choice = PictureChoices()[index];
     max_resolution_choice = choice.max_resolution;
+    if (choice.output_setting != KEEP_OUTPUT) {
+        upscale_output_choice = choice.output_setting;
+    }
     if (choice.dlss && dlss_quality_combobox != nullptr) {
         using Quality = Settings::NvidiaDlssQuality;
         const auto current = static_cast<Quality>(dlss_quality_combobox->currentData().toUInt());
@@ -1146,6 +1190,12 @@ void ConfigureGraphics::SetupPictureMenu(const std::map<u32, QWidget*>& rows) {
 
     max_resolution_saved = FritchiiMaxResolution::Saved();
     max_resolution_choice = max_resolution_saved;
+    // Not one of the offered heights: Auto, as the game takes it.
+    upscale_output_saved = Settings::values.oot_upscale_output.GetValue();
+    if (!VideoCommon::OcarinaUpscaleOutputKnown(upscale_output_saved)) {
+        upscale_output_saved = 0;
+    }
+    upscale_output_choice = upscale_output_saved;
     // Turning the upscaler off brings the add-on back as it was with the game's own upscale, or
     // on (the game's full 1440p) when the page opened with an upscaler.
     max_resolution_when_off = PictureChoicesNow().empty() ? max_resolution_saved : true;
@@ -1172,6 +1222,12 @@ void ConfigureGraphics::SetupPictureMenu(const std::map<u32, QWidget*>& rows) {
     }
     // Saved with the other add-ons by the global config (Config::SaveDisabledAddOnValues).
     apply_funcs.push_back([this](bool) { FritchiiMaxResolution::Save(max_resolution_choice); });
+    apply_funcs.push_back([this](bool) {
+        // Only a change is written: a value set by hand stays until a choice is made.
+        if (upscale_output_choice != upscale_output_saved) {
+            Settings::values.oot_upscale_output.SetValue(upscale_output_choice);
+        }
+    });
     UpdatePictureMenu();
 }
 
@@ -1209,11 +1265,17 @@ void ConfigureGraphics::UpdatePictureMenu() {
     const QSignalBlocker block_output(output_combobox);
     const QSignalBlocker block_quality(quality_combobox);
     output_combobox->clear();
+    // Smallest first, like the resolution list without an upscaler.
+    std::vector<u32> outputs;
     for (const int choice : choices) {
         const u32 output = PictureChoices()[choice].output;
-        if (output_combobox->findData(output) < 0) {
-            output_combobox->addItem(HeightName(output), output);
+        if (std::ranges::find(outputs, output) == outputs.end()) {
+            outputs.push_back(output);
         }
+    }
+    std::ranges::sort(outputs);
+    for (const u32 output : outputs) {
+        output_combobox->addItem(HeightName(output), output);
     }
     output_combobox->setCurrentIndex(output_combobox->findData(picked.output));
 
@@ -1226,7 +1288,9 @@ void ConfigureGraphics::UpdatePictureMenu() {
     };
     const auto name = [&sizes](const PictureChoice& choice) {
         if (!choice.dlss) {
-            return sizes(choice);
+            // FSR at 1x: anti-aliasing only, like DLSS Native.
+            return choice.kind == PictureKind::Native ? tr("Native: %1").arg(sizes(choice))
+                                                      : sizes(choice);
         }
         switch (choice.kind) {
         case PictureKind::Native:
