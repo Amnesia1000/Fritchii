@@ -167,6 +167,12 @@ QListWidget#selectorList::item:selected { background: #2b2640; color: #ececf1; }
 QLabel#FritchiiDialogTitle { font-size: 24px; font-weight: 500; color: #ececf1; }
 QTextBrowser#FritchiiNotes { background: transparent; border: none; font-size: 15px; }
 
+/* Switches window (fritchii/switches_window.cpp) */
+QLabel#FritchiiSwitchesSection { font-size: 16px; font-weight: 600; color: #ececf1; }
+QTextEdit#FritchiiSwitchesInUse { background: #141417; color: #c9c9d3; }
+QLabel#FritchiiSwitchesProblems { color: #f87171; font-size: 15px; }
+QLabel#FritchiiSwitchesSaved { color: #a78bfa; font-size: 15px; }
+
 /* Preparing shaders (fritchii/precompile_gate.cpp) */
 QDialog#FritchiiPrepare { background: #111113; }
 QLabel#FritchiiLead { font-size: 16px; color: #c9c9d3; }

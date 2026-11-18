@@ -222,6 +222,8 @@ add_executable(yuzu
     fritchii/precompile_gate.h
     fritchii/saves_window.cpp
     fritchii/saves_window.h
+    fritchii/switches_window.cpp
+    fritchii/switches_window.h
     fritchii/whats_new.cpp
     fritchii/whats_new.h
     util/export_log.cpp

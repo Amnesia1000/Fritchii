@@ -70,6 +70,7 @@
 #include "util/profiling_mode.h"
 #include "fritchii/fritchii_ui.h"
 #include "fritchii/perf_overlay.h"
+#include "fritchii/switches_window.h"
 #include "util/overlay_dialog.h"
 
 #include "multiplayer/state.h"
@@ -521,6 +522,7 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     ConnectWidgetEvents();
     SetUpFritchiiUi();
     SetUpProfilingMode();
+    SetUpSwitchesWindow();
 
     QtCommon::SetupHID();
     controller_dialog->refreshConfiguration();
@@ -4473,6 +4475,21 @@ void MainWindow::SetUpProfilingMode() {
         new ProfilingMode::Banner(this, [this] { return static_cast<QWidget*>(render_window); });
     connect(this, &MainWindow::EmulationStarting, banner, [banner] { banner->Start(); });
     connect(this, &MainWindow::EmulationStopping, banner, [banner] { banner->Stop(); });
+}
+
+void MainWindow::SetUpSwitchesWindow() {
+    // Both looks. The switches are read once at launch: the window saves the player's file and
+    // can restart Fritchii with its launch environment, so the restart doesn't inherit this
+    // process's file switches as environment ones (those would beat the file from then on).
+    ui->menu_Tools->addSeparator();
+    QAction* action = ui->menu_Tools->addAction(tr("S&witches..."));
+    connect(action, &QAction::triggered, this, [this] {
+        const bool restart = FritchiiUi::ShowSwitchesWindow(
+            this, [this] { return emulation_running || boot_in_progress; });
+        if (restart && !emulation_running && !boot_in_progress) {
+            ProfilingMode::RestartFritchii(*this, [this] { return close_pending || !isVisible(); });
+        }
+    });
 }
 
 void MainWindow::ShowErrorWithExportLog(const QString& title, const QString& text) {
