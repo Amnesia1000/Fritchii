@@ -15,6 +15,9 @@
 #include "common/logging.h"
 #ifdef _WIN32
 #include "common/windows/crash_handler.h"
+#ifdef __linux__
+#include "common/linux/crash_handler.h"
+#endif
 #endif
 #include "common/scm_rev.h"
 #include "common/build_stamp.h"
@@ -245,6 +248,8 @@ void Init(QWidget* root) {
     Common::Log::Start();
 #ifdef _WIN32
     Common::Windows::InstallCrashHandler(Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir));
+#elif defined(__linux__)
+    Common::Linux::InstallCrashHandler();
 #endif
 
     Network::Init();
