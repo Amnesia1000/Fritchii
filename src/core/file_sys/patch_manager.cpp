@@ -1165,7 +1165,164 @@ bool IsBuiltinDynamicFpsMod(u64 title_id, const VirtualDir& mod) {
     }
     return false;
 }
+
+// What a mod folder holds, as Add-Ons lists it ("IPS, LayeredFS"); empty when nothing loads.
+std::string ModTypes(const VirtualDir& mod) {
+    std::string types;
+    const auto exefs_dir = FindSubdirectoryCaseless(mod, "exefs");
+    if (IsDirValidAndNonEmpty(exefs_dir)) {
+        bool ips = false;
+        bool ipswitch = false;
+        bool layeredfs = false;
+        for (const auto& file : exefs_dir->GetFiles()) {
+            if (file->GetExtension() == "ips") {
+                ips = true;
+            } else if (file->GetExtension() == "pchtxt") {
+                ipswitch = true;
+            } else if (std::find(EXEFS_FILE_NAMES.begin(), EXEFS_FILE_NAMES.end(),
+                                 file->GetName()) != EXEFS_FILE_NAMES.end()) {
+                layeredfs = true;
+            }
+        }
+        if (ips)
+            AppendCommaIfNotEmpty(types, "IPS");
+        if (ipswitch)
+            AppendCommaIfNotEmpty(types, "IPSwitch");
+        if (layeredfs)
+            AppendCommaIfNotEmpty(types, "LayeredExeFS");
+    }
+    if (IsDirValidAndNonEmpty(FindSubdirectoryCaseless(mod, "romfs")) ||
+        IsDirValidAndNonEmpty(FindSubdirectoryCaseless(mod, "romfslite")))
+        AppendCommaIfNotEmpty(types, "LayeredFS");
+    if (IsDirValidAndNonEmpty(FindSubdirectoryCaseless(mod, "romfs_ext")))
+        AppendCommaIfNotEmpty(types, "ExtLayeredFS");
+    if (IsDirValidAndNonEmpty(FindSubdirectoryCaseless(mod, "cheats")))
+        AppendCommaIfNotEmpty(types, "Cheats");
+    return types;
+}
+
+// The same for the SD card's atmosphere/contents/<title> folder, listed as one add-on "SDMC".
+std::string SdmcModTypes(const VirtualDir& sdmc_mod_dir) {
+    std::string types;
+    if (IsDirValidAndNonEmpty(FindSubdirectoryCaseless(sdmc_mod_dir, "exefs")))
+        AppendCommaIfNotEmpty(types, "LayeredExeFS");
+    if (IsDirValidAndNonEmpty(FindSubdirectoryCaseless(sdmc_mod_dir, "romfs")) ||
+        IsDirValidAndNonEmpty(FindSubdirectoryCaseless(sdmc_mod_dir, "romfslite")))
+        AppendCommaIfNotEmpty(types, "LayeredFS");
+    if (IsDirValidAndNonEmpty(FindSubdirectoryCaseless(sdmc_mod_dir, "romfs_ext")))
+        AppendCommaIfNotEmpty(types, "ExtLayeredFS");
+    return types;
+}
+
+std::mutex addons_mutex;
+std::function<void(u64)> new_mods_callback;
+
+// New mods start disabled: a mod (a folder or cheat_ file in load/<title>/, or the SD card's
+// folder) Fritchii has not seen for this title before goes on the disabled list, and both lists
+// are saved at once. Seen mods keep the player's choice. Updates, DLC and the built-ins are
+// never touched (Max Resolution's default is set once in the config, frontend_common/config.cpp).
+void DisableNewModsFor(u64 title_id, const VirtualDir& mod_dir, const VirtualDir& sdmc_mod_dir) {
+    if (title_id == 0) {
+        return;
+    }
+    std::vector<std::string> seen;
+    {
+        std::scoped_lock lock{addons_mutex};
+        if (!Settings::values.seen_addons_tracking) {
+            return;
+        }
+        if (const auto it = Settings::values.seen_addons.find(title_id);
+            it != Settings::values.seen_addons.end()) {
+            seen = it->second;
+        }
+    }
+    const auto is_seen = [&](const std::string& name) {
+        return std::find(seen.begin(), seen.end(), name) != seen.end();
+    };
+    // File reads outside the lock. `keep`: seen, state left as is (Dark's own Dynamic FPS, which
+    // the built-in replaces while that is on: if the player turns the built-in off, theirs runs).
+    std::vector<std::string> fresh;
+    std::vector<std::string> keep;
+    if (mod_dir != nullptr) {
+        for (const auto& file : mod_dir->GetFiles()) {
+            if (auto name = file->GetName(); name.starts_with("cheat_") && !is_seen(name)) {
+                fresh.push_back(std::move(name));
+            }
+        }
+        for (const auto& mod : mod_dir->GetSubdirectories()) {
+            auto name = mod->GetName();
+            if (is_seen(name) || ModTypes(mod).empty()) {
+                continue;
+            }
+            (IsBuiltinDynamicFpsMod(title_id, mod) ? keep : fresh).push_back(std::move(name));
+        }
+    }
+    if (sdmc_mod_dir != nullptr && !is_seen("SDMC") && !SdmcModTypes(sdmc_mod_dir).empty()) {
+        fresh.emplace_back("SDMC");
+    }
+    if (fresh.empty() && keep.empty()) {
+        return;
+    }
+
+    std::vector<std::string> disabled_now;
+    std::function<void(u64)> callback;
+    {
+        std::scoped_lock lock{addons_mutex};
+        callback = new_mods_callback;
+        auto& seen_list = Settings::values.seen_addons[title_id];
+        auto& disabled = Settings::values.disabled_addons[title_id];
+        const auto add = [](std::vector<std::string>& list, const std::string& name) {
+            if (std::find(list.begin(), list.end(), name) != list.end()) {
+                return false;
+            }
+            list.push_back(name);
+            return true;
+        };
+        for (const auto& name : keep) {
+            add(seen_list, name);
+        }
+        for (const auto& name : fresh) {
+            if (add(seen_list, name) && add(disabled, name)) {
+                disabled_now.push_back(name);
+            }
+        }
+    }
+    for (const auto& name : disabled_now) {
+        LOG_INFO(Loader,
+                 "Mods: new mod {} for {:016X} starts disabled; enable it in the game's Add-Ons",
+                 name, title_id);
+    }
+    // Saved even when only `keep` changed, so the seen list survives a crash.
+    if (callback) {
+        callback(title_id);
+    }
+}
 } // Anonymous namespace
+
+void PatchManager::SetNewModsCallback(std::function<void(u64 title_id)> callback) {
+    std::scoped_lock lock{addons_mutex};
+    new_mods_callback = std::move(callback);
+}
+
+std::unique_lock<std::mutex> PatchManager::LockAddOns() {
+    return std::unique_lock{addons_mutex};
+}
+
+void PatchManager::DisableNewMods() const {
+    {
+        std::scoped_lock lock{addons_mutex};
+        if (!Settings::values.seen_addons_tracking) {
+            return;
+        }
+    }
+    DisableNewModsFor(title_id, fs_controller.GetModificationLoadRoot(title_id),
+                      fs_controller.GetSDMCModificationLoadRoot(title_id));
+    if (parent_title_id) {
+        DisableNewModsFor(*parent_title_id,
+                          fs_controller.GetModificationLoadRoot(*parent_title_id),
+                          fs_controller.GetSDMCModificationLoadRoot(*parent_title_id));
+    }
+}
 
 PatchManager::PatchManager(u64 title_id_,
                            const Service::FileSystem::FileSystemController& fs_controller_,
@@ -1192,6 +1349,8 @@ VirtualDir PatchManager::GetModificationLoadRoot(bool sdmc) const {
 }
 
 std::vector<std::string> PatchManager::GetDisabledAddons() const {
+    DisableNewMods();
+    const auto lock = LockAddOns();
     auto disabled = Settings::values.disabled_addons[title_id];
     if (parent_title_id) {
         const auto& shared = Settings::values.disabled_addons[*parent_title_id];
@@ -1855,7 +2014,11 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {
     }
 
     std::vector<Patch> out;
-    const auto& disabled = Settings::values.disabled_addons[title_id];
+    DisableNewMods();
+    const auto disabled = [this] {
+        const auto lock = LockAddOns();
+        return Settings::values.disabled_addons[title_id];
+    }();
 
     // Game Updates
     const auto update_tid = GetUpdateTitleID(title_id);
@@ -2055,40 +2218,7 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {
             if (IsBuiltinDynamicFpsMod(title_id, mod)) {
                 continue;
             }
-            std::string types;
-
-            const auto exefs_dir = FindSubdirectoryCaseless(mod, "exefs");
-            if (IsDirValidAndNonEmpty(exefs_dir)) {
-                bool ips = false;
-                bool ipswitch = false;
-                bool layeredfs = false;
-
-                for (const auto& file : exefs_dir->GetFiles()) {
-                    if (file->GetExtension() == "ips") {
-                        ips = true;
-                    } else if (file->GetExtension() == "pchtxt") {
-                        ipswitch = true;
-                    } else if (std::find(EXEFS_FILE_NAMES.begin(), EXEFS_FILE_NAMES.end(),
-                                         file->GetName()) != EXEFS_FILE_NAMES.end()) {
-                        layeredfs = true;
-                                         }
-                }
-
-                if (ips)
-                    AppendCommaIfNotEmpty(types, "IPS");
-                if (ipswitch)
-                    AppendCommaIfNotEmpty(types, "IPSwitch");
-                if (layeredfs)
-                    AppendCommaIfNotEmpty(types, "LayeredExeFS");
-            }
-            if (IsDirValidAndNonEmpty(FindSubdirectoryCaseless(mod, "romfs")) ||
-                IsDirValidAndNonEmpty(FindSubdirectoryCaseless(mod, "romfslite")))
-                AppendCommaIfNotEmpty(types, "LayeredFS");
-            if (IsDirValidAndNonEmpty(FindSubdirectoryCaseless(mod, "romfs_ext")))
-                AppendCommaIfNotEmpty(types, "ExtLayeredFS");
-            if (IsDirValidAndNonEmpty(FindSubdirectoryCaseless(mod, "cheats")))
-                AppendCommaIfNotEmpty(types, "Cheats");
-
+            auto types = ModTypes(mod);
             if (types.empty())
                 continue;
 
@@ -2107,15 +2237,7 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {
     // SDMC mod directory (RomFS LayeredFS)
     const auto sdmc_mod_dir = fs_controller.GetSDMCModificationLoadRoot(title_id);
     if (sdmc_mod_dir != nullptr) {
-        std::string types;
-        if (IsDirValidAndNonEmpty(FindSubdirectoryCaseless(sdmc_mod_dir, "exefs")))
-            AppendCommaIfNotEmpty(types, "LayeredExeFS");
-        if (IsDirValidAndNonEmpty(FindSubdirectoryCaseless(sdmc_mod_dir, "romfs")) ||
-            IsDirValidAndNonEmpty(FindSubdirectoryCaseless(sdmc_mod_dir, "romfslite")))
-            AppendCommaIfNotEmpty(types, "LayeredFS");
-        if (IsDirValidAndNonEmpty(FindSubdirectoryCaseless(sdmc_mod_dir, "romfs_ext")))
-            AppendCommaIfNotEmpty(types, "ExtLayeredFS");
-
+        auto types = SdmcModTypes(sdmc_mod_dir);
         if (!types.empty()) {
             const auto mod_disabled =
                 std::find(disabled.begin(), disabled.end(), "SDMC") != disabled.end();

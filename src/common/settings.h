@@ -1082,6 +1082,10 @@ struct Values {
 
     // Add-Ons
     std::map<u64, std::vector<std::string>> disabled_addons;
+    // Add-on names Fritchii has seen per title (config [SeenAddOns]). While tracking, a mod not
+    // in here is new and starts disabled (FileSys::PatchManager); a seen one keeps its state.
+    std::map<u64, std::vector<std::string>> seen_addons;
+    bool seen_addons_tracking = false;
 
     // Per-game overrides
     bool use_squashed_iterated_blend;
