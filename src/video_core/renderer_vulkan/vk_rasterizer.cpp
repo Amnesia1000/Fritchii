@@ -623,6 +623,8 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
       frame_dump(device, memory_allocator, scheduler),
       flash_watch(device, memory_allocator, scheduler) {
     // FRITCHII_LOCK_CENSUS: the two cache locks by name (before any other thread uses them).
+    // A new session: OoT's picture is published again when its upscaler is picked.
+    VideoCommon::ClearOcarinaPicture();
     buffer_cache.mutex.SetCensusName("buffer cache");
     texture_cache.mutex.SetCensusName("texture cache");
     scheduler.SetQueryCache(query_cache);
@@ -8583,6 +8585,10 @@ bool RasterizerVulkan::OcarinaTemporalEnabled() const {
         !Fsr3Upscaler::IsSupported(device)) {
         LOG_WARNING(Render_Vulkan, "Ocarina FSR 3.1 unsupported on this device; using native upscale");
     }
+    if (*oot_backend == VideoCommon::OcarinaUpscaleBackend::Native) {
+        // No upscaler: the status bar names the resolution setting's size.
+        VideoCommon::PublishOcarinaPicture(1, 0, false, 0);
+    }
     if (*oot_backend != VideoCommon::OcarinaUpscaleBackend::Native) {
         // The output size for the session (oot_upscale_output), and why.
         u64 vram = 0;
@@ -8597,6 +8603,16 @@ bool RasterizerVulkan::OcarinaTemporalEnabled() const {
         const u32 shown = plan.big_height != 0 ? plan.big_height
                           : plan.native_aa     ? 1080U
                                                : 1440U;
+        // The status bar: what runs, from what to what (DLSS Native keeps the game's size).
+        const bool dlss_backend = *oot_backend == VideoCommon::OcarinaUpscaleBackend::Dlss;
+        const u32 picture_backend =
+            dlss_backend ? 4U
+            : Settings::values.oot_anti_aliasing.GetValue() == Settings::OotAntiAliasing::Fsr4
+                ? 3U
+                : 2U;
+        const u32 input_height = max_resolution ? 1440U : 1080U;
+        VideoCommon::PublishOcarinaPicture(picture_backend, input_height, !max_resolution,
+                                           plan.native_aa ? input_height : shown);
         LOG_INFO(Render_Vulkan,
                  "Ocarina temporal: output {}x{} with Max Resolution {} (oot_upscale_output={}: "
                  "{}; {} MiB video memory{}{}){}",

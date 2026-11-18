@@ -4,13 +4,52 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cmath>
+#include <cstdint>
+#include <optional>
 #include <cstdlib>
 #include <string_view>
 
 #include "common/settings_enums.h"
 
 namespace VideoCommon {
+
+/// OoT's picture this session, for the status bar: the upscaler that really runs and its sizes.
+/// The rasterizer publishes it once when it picks OoT's upscaler (the "Ocarina temporal: output"
+/// log line); empty before that and outside OoT. Backend: 1 the game's own, 2 FSR 3.1, 3 FSR 4,
+/// 4 DLSS. A 0 output means no upscaler (the resolution setting applies).
+struct OcarinaPicture {
+    std::uint32_t backend;
+    std::uint32_t input_height;
+    bool input_up_to; ///< The game's dynamic resolution (Max Resolution off): at most input_height
+    std::uint32_t output_height;
+};
+
+inline std::atomic<std::uint64_t> g_ocarina_picture{0};
+
+inline void PublishOcarinaPicture(std::uint32_t backend, std::uint32_t input_height, bool up_to,
+                                  std::uint32_t output_height) {
+    g_ocarina_picture.store((std::uint64_t{1} << 63) | (std::uint64_t{backend & 0xff} << 48) |
+                                (std::uint64_t{up_to} << 47) |
+                                (std::uint64_t{input_height & 0xffff} << 16) |
+                                std::uint64_t{output_height & 0xffff},
+                            std::memory_order_relaxed);
+}
+
+inline void ClearOcarinaPicture() {
+    g_ocarina_picture.store(0, std::memory_order_relaxed);
+}
+
+[[nodiscard]] inline std::optional<OcarinaPicture> ReadOcarinaPicture() {
+    const std::uint64_t value = g_ocarina_picture.load(std::memory_order_relaxed);
+    if ((value >> 63) == 0) {
+        return std::nullopt;
+    }
+    return OcarinaPicture{static_cast<std::uint32_t>((value >> 48) & 0xff),
+                          static_cast<std::uint32_t>((value >> 16) & 0xffff),
+                          ((value >> 47) & 1) != 0, static_cast<std::uint32_t>(value & 0xffff)};
+}
 
 enum class OcarinaUpscaleBackend { Native, Fsr, Dlss };
 

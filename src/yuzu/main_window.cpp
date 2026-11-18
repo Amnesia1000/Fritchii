@@ -191,6 +191,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 
 // Video Core //
 #include "video_core/gpu.h"
+#include "video_core/ocarina_upscale.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
 #include "video_core/small_card.h"
@@ -5691,6 +5692,43 @@ void MainWindow::UpdateStatusBar() {
     const auto res_scale = res_info.up_factor;
     QString res_scale_text =
         tr("Scale: %1x", "%1 is the resolution scaling factor").arg(res_scale);
+    // Fritchii, OoT: the picture as it really is (owner 2026-11-18: "Scale: 1x" said nothing while
+    // DLSS or FSR ran): "1440p -> 4K · DLSS", "up to 1080p -> 1440p · FSR 3.1", or the
+    // resolution itself without an upscaler. Published by the rasterizer once it picked OoT's
+    // upscaler, so a DLSS that isn't available never shows as running.
+    if (FritchiiUi::Enabled() &&
+        QtCommon::system->GetApplicationProcessProgramID() == 0x0400486024DEC000ULL) {
+        const auto height = [](u32 lines) {
+            return lines == 2160   ? QStringLiteral("4K")
+                   : lines == 4320 ? QStringLiteral("8K")
+                                   : QStringLiteral("%1p").arg(lines);
+        };
+        if (const auto picture = VideoCommon::ReadOcarinaPicture()) {
+            const QString arrow = QStringLiteral(" %1 ").arg(QChar(0x2192));
+            const QString dot = QStringLiteral(" %1 ").arg(QChar(0x00B7));
+            if (picture->backend >= 2 && picture->output_height != 0) {
+                const QString name = picture->backend == 4   ? QStringLiteral("DLSS")
+                                     : picture->backend == 3 ? QStringLiteral("FSR 4")
+                                                             : QStringLiteral("FSR 3.1");
+                const QString input = picture->input_up_to
+                                          ? tr("up to %1").arg(height(picture->input_height))
+                                          : height(picture->input_height);
+                res_scale_text =
+                    picture->output_height == picture->input_height
+                        ? QString(input + dot + tr("%1 Native").arg(name))
+                        : QString(input + arrow + height(picture->output_height) + dot + name);
+            } else {
+                // No upscaler: the resolution setting's size, docked or handheld.
+                const bool docked = Settings::IsDockedMode();
+                const bool max_resolution = Settings::OcarinaMaxResolutionOn();
+                const u32 base = docked ? (max_resolution ? 1440U : 1080U) : 1080U;
+                const u32 lines =
+                    static_cast<u32>(base * res_info.up_scale) >> res_info.down_shift;
+                res_scale_text = docked && !max_resolution ? tr("up to %1").arg(height(lines))
+                                                           : height(lines);
+            }
+        }
+    }
     // Fritchii's small card profile turned a larger scale down to 1x for this session.
     if (const float refused = VideoCore::SmallCard::RefusedScale(); refused > 0.0f) {
         res_scale_text += tr(" (%1x DOESN'T FIT)", "A resolution scale too big for the video memory")
