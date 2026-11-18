@@ -1274,9 +1274,33 @@ void ConfigureGraphics::UpdatePictureMenu() {
         }
     }
     std::ranges::sort(outputs);
+    // Outputs above 1440p build on Max Resolution's fixed 1440p picture: picking one turns it on
+    // (ApplyPictureChoice). Said in the row (owner 2026-11-18: "make it clear that max resolution
+    // is required for higher resolutions").
+    const auto needs_max_resolution = [&choices](u32 output) {
+        bool any = false;
+        for (const int choice : choices) {
+            if (PictureChoices()[choice].output == output) {
+                any = true;
+                if (!PictureChoices()[choice].max_resolution) {
+                    return false;
+                }
+            }
+        }
+        return any;
+    };
     for (const u32 output : outputs) {
-        output_combobox->addItem(HeightName(output), output);
+        const QString name = HeightName(output);
+        output_combobox->addItem(!max_resolution_choice && needs_max_resolution(output)
+                                     ? tr("%1 (turns Max Resolution on)").arg(name)
+                                     : name,
+                                 output);
     }
+    // While the game runs, Max Resolution can't change: those rows are hidden then.
+    output_row->setToolTip(system.IsPoweredOn() && !max_resolution_saved
+                               ? tr("4K and higher need Max Resolution: close the game to pick "
+                                    "them.")
+                               : QString{});
     output_combobox->setCurrentIndex(output_combobox->findData(picked.output));
 
     const QString arrow = QStringLiteral(" %1 ").arg(QChar(0x2192));

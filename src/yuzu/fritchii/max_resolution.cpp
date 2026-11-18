@@ -151,7 +151,7 @@ bool AskToTurnOn(QWidget* parent, const QString& card_line) {
     const QString title = QObject::tr("Max Resolution");
     const QStringList on_lines{
         QObject::tr("Sharper (1440p)"),
-        QObject::tr("Needed for 4K with DLSS"),
+        QObject::tr("Needed for 4K and higher with DLSS or FSR"),
         QObject::tr("Needs about an RTX 3070 / RX 6800 or better (8 GB+)"),
     };
     const QStringList off_lines{
@@ -163,7 +163,7 @@ bool AskToTurnOn(QWidget* parent, const QString& card_line) {
 
     if (!FritchiiUi::Enabled()) {
         // The same words as the two sides of the Fritchii window, as two sentences.
-        QString text = QObject::tr("On: sharper (1440p), needed for 4K with DLSS. Needs about an "
+        QString text = QObject::tr("On: sharper (1440p), needed for 4K and higher with DLSS or FSR. Needs about an "
                                    "RTX 3070 / RX 6800 or better (8 GB+).") +
                        QStringLiteral("\n") +
                        QObject::tr("Off: like the Switch 2 (up to 1080p), more fps on weaker PCs.");
