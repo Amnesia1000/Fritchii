@@ -586,7 +586,13 @@ private:
         if (flag_map.load(std::memory_order_relaxed) != nullptr) {
             return true;
         }
-        if (flag_tried || !device.IsOcclFlagDeviceAddressEnabled()) {
+        if (flag_tried) {
+            return false;
+        }
+        if (!device.IsOcclFlagDeviceAddressEnabled()) {
+            flag_tried = true;
+            LOG_WARNING(Render_Vulkan, "Occlusion flags (FRITCHII_OCCL_FLAG): the device has no "
+                                       "buffer device address for the flag area");
             return false;
         }
         flag_tried = true;
