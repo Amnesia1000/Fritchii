@@ -1221,6 +1221,29 @@ the counter blames on a relocation guards that shape and address from relocating
 targets); 0 = off (drops as before). Cost: one GPU copy plus a CPU swizzle per written-back image,
 on the GPU thread at the landing; the "Lost contents" line gives MiB per path.
 
+### FRITCHII_LOST_KEEP
+
+On by default (helper EK, 2026-11-18; a tester's one-frame black flash while swapping items fast,
+RX 7900 XT, up to 26 "SAMPLED with lost contents" per 10 s). Live. 0 = the old behavior. Three
+parts, all about GPU-written images dropped without their data reaching guest memory:
+1. Refused write-backs no longer blank newer bytes. OoT draws R8 HUD masks of several sizes at one
+address; the newest one's write-back landed first, the older one's was refused (it would land
+older bytes) and its drop then marked every page stale, the newer write-back's too. The next image
+there skipped its upload and was cleared to zero (the counter blamed "cold sweep, 448x97, 3 frames
+ago" for a 128x126). MarkStale now leaves pages a newer write-back (ring of 256) holds unmarked.
+2. An image the CPU wrote whole since its last GPU write is not marked stale and not written back:
+its GPU data was void already (its next use would have uploaded the guest bytes), so marking it
+skipped the CPU's bytes and a write-back would have landed older bytes over them.
+3. Memory the game read after a loss is learned (ring of 128 ranges, the sampled image's range), and
+a later drop of a GPU-written image over it is written back whatever its size (over
+FRITCHII_LOST_WRITEBACK's 1 MiB cap: OoT's 960x540 post chain, the exposure buffers). Images read
+in a later frame than their write (the relocation guard bits) get the same, from half the budget.
+Budget: N MiB/s of guest bytes, at most a second's worth saved (1 = 32 MiB/s, ~1/20 of what
+FRITCHII_LOST_WRITEBACK=1 wrote back in the market, where it cost 3 fps); past it they are dropped
+as before (counted "over budget"), so device memory stays where it was on 8 GB cards. Cost: the
+learned/guarded write-backs (one GPU copy + one CPU swizzle each at the landing, GPU thread), a
+ring scan per GPU-written image drop.
+
 Lost contents counter (always on, needs the stale page marks, i.e. EXP78 on, the default): every
 10 s with anything to say, "Lost contents in 10 s (FRITCHII_STALE_ZERO=Z, FRITCHII_LOST_WRITEBACK=W):
 images made over memory whose GPU data was dropped: S upload skipped (C cleared to zero), U uploaded
@@ -1231,7 +1254,14 @@ guards R; write-backs queued/landed: collector Q/L (M MiB) refused F kept K over
 ...; superseded sweep ...; slot retire ...". SAMPLED is the number that shows on screen: an image
 sampled before anything overwrote it whole. The first 40 get a "Lost contents sampled:" line with
 the image (format, size, address) and the drop that left its memory stale (path, the dropped
-image's format, size and address, frames since, its guard bits).
+image's format, size and address, frames since, its guard bits, why no write-back saved it); after
+those, 2 per 10 s window. FRITCHII_LOST_KEEP adds to each path "(written back all the same: learned
+L, guarded G; over budget B)" and at the end "FRITCHII_LOST_KEEP=K: sampled ones' drops without a
+write-back because: no write-back on that path, over cap, refused, not downloadable, off, over
+budget, refused at landing; learned ranges, pages kept from stale under newer write-backs,
+CPU-written images not marked stale (not written back)". With it on, SAMPLED "not drawn into" and
+the over cap / refused / over budget reasons should stay near 0; what is left on "no write-back on
+that path" (joins, unmaps, relocation) is the next lead.
 
 ### FRITCHII_SIBLING_CENSUS, FRITCHII_GPU_SIBLINGS_FREE
 

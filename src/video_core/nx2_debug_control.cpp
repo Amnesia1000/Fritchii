@@ -628,6 +628,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_LOST_WRITEBACK") {
         return &g_lost_writeback;
     }
+    if (name == "FRITCHII_LOST_KEEP") {
+        return &g_lost_keep;
+    }
     if (name == "FRITCHII_HOSTTIMING_SPIN_BUDGET") {
         return &g_hosttiming_spin_budget;
     }
