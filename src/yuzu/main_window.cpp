@@ -69,6 +69,7 @@
 #include "util/export_log.h"
 #include "util/profiling_mode.h"
 #include "fritchii/cache_cleanup.h"
+#include "fritchii/known_issues.h"
 #include "fritchii/max_resolution.h"
 #include "fritchii/fritchii_ui.h"
 #include "fritchii/perf_overlay.h"
@@ -683,6 +684,11 @@ MainWindow::MainWindow(bool has_broken_vulkan)
 
     // Then, once per major version: Max Resolution on or off, with this PC's card in the question.
     if (!launched_with_game && FritchiiMaxResolution::OfferOnce(this, vk_device_records)) {
+        OnSaveConfig();
+    }
+
+    // Then, once per major version: the common things players will still run into.
+    if (!launched_with_game && FritchiiKnownIssues::ShowOnce(this, vk_device_records)) {
         OnSaveConfig();
     }
 
@@ -4587,6 +4593,12 @@ void MainWindow::SetUpProfilingMode() {
 }
 
 void MainWindow::SetUpSwitchesWindow() {
+    // Help > Known Issues: "Good to know" again (it shows once per version on its own).
+    QAction* const known = new QAction(tr("Known Issues"), this);
+    ui->menu_Help->insertAction(ui->action_About, known);
+    connect(known, &QAction::triggered, this,
+            [this] { FritchiiKnownIssues::Show(this, vk_device_records); });
+
     // Both looks. The switches are read once at launch: the window saves the player's file and
     // can restart Fritchii with its launch environment, so the restart doesn't inherit this
     // process's file switches as environment ones (those would beat the file from then on).
