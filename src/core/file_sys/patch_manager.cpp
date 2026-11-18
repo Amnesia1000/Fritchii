@@ -364,6 +364,9 @@ constexpr auto WATER_RIPPLE_RECORDS = [] {
 constexpr std::string_view WATER_RIPPLE_NAME = "Water ripples at any frame rate (built-in)";
 constexpr std::string_view DYNAMIC_FPS_NAME = "Dynamic FPS by Dark (built-in)";
 constexpr std::string_view HIGH_REFRESH_NAME = "High refresh rate (built-in, experimental)";
+// The mod that took the high refresh patch's place at the last boot (OotHighRefreshBlockedBy).
+std::mutex g_high_refresh_blocked_mutex;
+std::string g_high_refresh_blocked_by;
 
 // Pickup counter above 60 fps: the number shown above Link after a pickup (rupees, sticks...)
 // counts toward the wallet in the indicator's update (main+0xA67E50): shown (+0x360) moves toward
@@ -1453,7 +1456,40 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
     const auto patches = CollectPatches(patch_dirs, build_id);
 
     auto out = nso;
+    // Which mod wrote over a built-in patch's bytes: the skip line and Ctrl+U name it. Only the
+    // built-in records' bytes are compared before and after each mod (a few KiB, not the module).
+    std::map<size_t, std::string> builtin_owner;
+    const auto builtin_bytes = [&] {
+        std::vector<std::pair<size_t, std::vector<u8>>> bytes;
+        for (const auto& patch : BUILTIN_PATCHES) {
+            if (patch.title_id != title_id || patch.module != name) {
+                continue;
+            }
+            for (const BuiltinPatchRecord& record : patch.records) {
+                const size_t offset = sizeof(Loader::NSOHeader) + record.module_offset;
+                if (out.size() >= offset + record.bytes.size()) {
+                    bytes.emplace_back(record.module_offset,
+                                       std::vector<u8>(out.begin() + offset,
+                                                       out.begin() + offset + record.bytes.size()));
+                }
+            }
+        }
+        return bytes;
+    };
+    const auto note_owner = [&](const std::vector<std::pair<size_t, std::vector<u8>>>& before,
+                                const std::string& mod) {
+        for (const auto& [module_offset, old_bytes] : before) {
+            const size_t offset = sizeof(Loader::NSOHeader) + module_offset;
+            if (out.size() >= offset + old_bytes.size() &&
+                !std::equal(old_bytes.begin(), old_bytes.end(), out.begin() + offset)) {
+                builtin_owner.try_emplace(module_offset, mod);
+            }
+        }
+    };
     for (const auto& patch_file : patches) {
+        const std::string mod_name =
+            patch_file->GetContainingDirectory()->GetParentDirectory()->GetName();
+        const auto before = builtin_bytes();
         if (patch_file->GetExtension() == "ips") {
             LOG_INFO(Loader, "    - Applying IPS patch from mod \"{}\"",
                      patch_file->GetContainingDirectory()->GetParentDirectory()->GetName());
@@ -1468,6 +1504,11 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
             if (patched != nullptr)
                 out = patched->ReadAllBytes();
         }
+        note_owner(before, mod_name);
+    }
+    if (title_id == 0x0400486024DEC000ULL && name == "main") {
+        std::scoped_lock lock{g_high_refresh_blocked_mutex};
+        g_high_refresh_blocked_by.clear();
     }
 
     const auto disabled = GetDisabledAddons();
@@ -1544,10 +1585,17 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
             }
             if (!std::equal(nso.begin() + offset, nso.begin() + offset + record.bytes.size(),
                             out.begin() + offset)) {
+                const auto owner = builtin_owner.find(record.module_offset);
+                const std::string mod =
+                    owner != builtin_owner.end() ? owner->second : std::string{"a user mod"};
                 LOG_INFO(Loader,
-                         "    - Skipping \"{}\": a user mod already patched {}+{:#x}, the mod's "
-                         "patch is used",
-                         patch.name, name, record.module_offset);
+                         "    - Skipping \"{}\": the mod \"{}\" already patched {}+{:#x}, the "
+                         "mod's patch is used",
+                         patch.name, mod, name, record.module_offset);
+                if (patch.name == HIGH_REFRESH_NAME) {
+                    std::scoped_lock lock{g_high_refresh_blocked_mutex};
+                    g_high_refresh_blocked_by = mod;
+                }
                 apply = false;
                 break;
             }
@@ -2519,6 +2567,11 @@ OotHighRefreshSwitch SwitchOotHighRefreshStalled(Kernel::KProcess& process, u64 
 }
 
 } // Anonymous namespace
+
+std::string OotHighRefreshBlockedBy() {
+    std::scoped_lock lock{g_high_refresh_blocked_mutex};
+    return g_high_refresh_blocked_by;
+}
 
 OotHighRefreshSwitch SwitchOotHighRefreshLive(Core::System& system, bool on) {
     constexpr u64 OcarinaOfTime = 0x0400486024DEC000ULL;

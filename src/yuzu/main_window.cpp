@@ -5767,6 +5767,15 @@ void MainWindow::SetOotHighRefresh(bool on) {
         text = tr("High refresh: busy, try again");
         break;
     case FileSys::OotHighRefreshSwitch::UnknownCode:
+        // A mod that writes over the same game code wins over the built-in: name it.
+        if (const auto mod = FileSys::OotHighRefreshBlockedBy(); !mod.empty()) {
+            text = tr("High refresh can't turn on: the mod \"%1\" changes the same game code. "
+                      "Turn the mod off in Add-Ons to use it.")
+                       .arg(QString::fromStdString(mod));
+            statusBar()->showMessage(text, 10000);
+            SetFPSSuffix();
+            return;
+        }
         text = tr("High refresh: can't switch, a mod or Add-Ons changed that code");
         break;
     case FileSys::OotHighRefreshSwitch::NotRunning:

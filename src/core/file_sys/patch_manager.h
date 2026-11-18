@@ -180,6 +180,11 @@ enum class OotHighRefreshLayout {
 /// in the module's BSS, [bss_start, bss_end) in module offsets.
 [[nodiscard]] bool OotHighRefreshStateInBss(u64 bss_start, u64 bss_end);
 
+/// The user mod whose patch took the high refresh patch's place in OoT's main at the last boot
+/// (it wrote over the same code), or empty. Ctrl+U names it (2026-11-18: a player's practice mod
+/// used the same free code space and the key silently did nothing).
+[[nodiscard]] std::string OotHighRefreshBlockedBy();
+
 enum class OotHighRefreshSwitch {
     Switched,         ///< in that mode now (or already was)
     NotRunning,       ///< no Ocarina of Time main that can switch (other game, its BSS differs)
