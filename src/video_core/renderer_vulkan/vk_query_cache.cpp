@@ -416,17 +416,8 @@ public:
             auto& resolve_buffer = buffers[resolve_buffer_index];
             VkQueryPool query_pool = bank->GetInnerPool();
             scheduler.RequestOutsideRenderPassOperationContext();
-            // FRITCHII_OCCL_FLAG: the range's device slots into the host mirror (the fencing
-            // thread reads it once the fence signals; Barriers(false) makes it visible).
-            if (flags != nullptr && bank_id < FLAG_BANKS) {
-                scheduler.Record([src = flag_buffer, dst = flag_mirror,
-                                  offset = (bank_id * SamplesQueryBank::BANK_SIZE + start) *
-                                           SamplesQueryBank::QUERY_SIZE,
-                                  size = amount * SamplesQueryBank::QUERY_SIZE](
-                                     vk::CommandBuffer cmdbuf) {
-                    const VkBufferCopy copy{.srcOffset = offset, .dstOffset = offset, .size = size};
-                    cmdbuf.CopyBuffer(src, dst, copy);
-                });
+            if (flags != nullptr) {
+                CopyFlagsToMirror(bank_id, start, amount);
             }
             // FRITCHII_OCCL_FLAG=1: flag runs copied from the flag area, query runs from the pool
             // (never a slot no query ran in).
@@ -773,6 +764,22 @@ private:
         return sum;
     }
 
+    /// FRITCHII_OCCL_FLAG: a synced range's device slots into the host mirror (the fencing
+    /// thread reads it once the fence signals; the sync's Barriers(false) makes it visible).
+    /// Outside a render pass, after the sync's flag barrier.
+    void CopyFlagsToMirror(size_t bank_id, size_t start, size_t amount) {
+        if (bank_id >= FLAG_BANKS || amount == 0) {
+            return;
+        }
+        scheduler.Record([src = flag_buffer, dst = flag_mirror,
+                          offset = (bank_id * SamplesQueryBank::BANK_SIZE + start) *
+                                   SamplesQueryBank::QUERY_SIZE,
+                          size = amount * SamplesQueryBank::QUERY_SIZE](vk::CommandBuffer cmdbuf) {
+            const VkBufferCopy copy{.srcOffset = offset, .dstOffset = offset, .size = size};
+            cmdbuf.CopyBuffer(src, dst, copy);
+        });
+    }
+
     /// FRITCHII_OCCL_FLAG: a buffer for the flag area: device-local (preferably not host
     /// visible, so the small BAR heap is left alone) with a device address, or host-visible
     /// coherent system memory (cached when there is such a type) for the mirror.
@@ -801,20 +808,24 @@ private:
         const VkMemoryPropertyFlags wanted =
             host ? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
                  : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-        // Preferred first: host -> cached, not device local; device -> not host visible.
+        // Passes: preferred and not avoided, preferred, not avoided, any. Host (the mirror, read
+        // by the CPU): cached, not device local (a unified-memory device still gets a cached
+        // type). Device: not host visible (leaves the small BAR heap alone).
         const VkMemoryPropertyFlags preferred =
             host ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : VkMemoryPropertyFlags{0};
         const VkMemoryPropertyFlags avoided =
             host ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
         u32 type = ~0U;
-        for (u32 pass = 0; pass < 3 && type == ~0U; ++pass) {
+        for (u32 pass = 0; pass < 4 && type == ~0U; ++pass) {
             for (u32 i = 0; i < props.memoryTypeCount; ++i) {
                 const VkMemoryPropertyFlags f = props.memoryTypes[i].propertyFlags;
                 if ((requirements.memoryTypeBits & (1U << i)) == 0 || (f & wanted) != wanted) {
                     continue;
                 }
-                if ((pass == 0 && ((f & preferred) != preferred || (f & avoided) != 0)) ||
-                    (pass == 1 && (f & avoided) != 0)) {
+                const bool has_preferred = (f & preferred) == preferred;
+                const bool has_avoided = (f & avoided) != 0;
+                if ((pass == 0 && (!has_preferred || has_avoided)) ||
+                    (pass == 1 && !has_preferred) || (pass == 2 && has_avoided)) {
                     continue;
                 }
                 type = i;
@@ -1116,6 +1127,15 @@ private:
         ApplyBankOp(new_query, [](SamplesQueryBank* bank, size_t start, size_t amount) {
             bank->AddReference(amount);
         });
+        // FRITCHII_OCCL_FLAG: the running window can reach past every pending report (counted
+        // draws after the last one): its slots into the mirror as well, before Barriers(false).
+        if (flag_map.load(std::memory_order_relaxed) != nullptr) {
+            scheduler.RequestOutsideRenderPassOperationContext();
+            ApplyBankOp(new_query, [this](SamplesQueryBank* bank, size_t start, size_t amount) {
+                CopyFlagsToMirror(bank->GetIndex(), start, amount);
+            });
+            new_query->flag_epoch = EpochSum(*new_query);
+        }
         pending_flush_queries.push_back(index);
         std::function<void()> func([this, index] {
             auto* query = GetQuery(index);

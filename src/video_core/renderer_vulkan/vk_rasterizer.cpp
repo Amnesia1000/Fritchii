@@ -2374,6 +2374,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     const size_t onef_entries_before = onef_lookup ? pipeline_cache.GraphicsEntries() : 0;
     // FRITCHII_OCCL_FLAG (fritchii_occl_flag.h): with one follower off, an occlusion test draw
     // may take its pipeline's flag variant; a kept flag variant is decided again.
+    VideoCommon::OcclFlag::t_census = VideoCommon::OcclFlag::Census::Unknown;
     const auto occl_flag = [&](GraphicsPipeline* chosen, bool allow_make) -> GraphicsPipeline* {
         if (chosen != nullptr && chosen->occl_flag_parent != nullptr) {
             chosen = chosen->occl_flag_parent; // a kept flag variant: decided again

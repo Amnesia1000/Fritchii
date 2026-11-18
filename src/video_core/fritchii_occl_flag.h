@@ -142,9 +142,11 @@ inline void MaybeLog() {
     }
     LOG_INFO(Render_Vulkan,
              "Occlusion flag census per second: counted draws by class: {}; colour Lean "
-             "pipelines {:.0f} distinct; query slots closed: {:.0f} all flag or colour Lean, "
+             "pipelines {} distinct in the window; query slots closed: {:.0f} all flag or "
+             "colour Lean, "
              "{:.0f} blocked, {:.0f} no draw marked",
-             census, take(g.colour_lean_pipelines), take(g.qslot_injectable),
+             census, g.colour_lean_pipelines.exchange(0, std::memory_order_relaxed),
+             take(g.qslot_injectable),
              take(g.qslot_blocked), take(g.qslot_empty));
 }
 
