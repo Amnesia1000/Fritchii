@@ -478,6 +478,17 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     Common::FS::CreateEdenPaths();
     this->config = std::make_unique<QtConfig>();
     MigrateFriztiSettings();
+    // New mods start disabled: saved at once (from the GUI thread), so a crash keeps it.
+    FileSys::PatchManager::SetNewModsCallback([this](u64 title_id) {
+        QMetaObject::invokeMethod(
+            this,
+            [this, title_id] {
+                Common::FS::RemoveFile(Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) /
+                                       "game_list" / fmt::format("{:016X}.pv.txt", title_id));
+                config->SaveAddOnValues();
+            },
+            Qt::QueuedConnection);
+    });
 
     Common::Log::Filter filter;
     filter.ParseFilterString(Settings::values.log_filter.GetValue());
@@ -876,6 +887,7 @@ void MainWindow::AskOotFrameRate() {
 }
 
 MainWindow::~MainWindow() {
+    FileSys::PatchManager::SetNewModsCallback(nullptr);
     Common::ShutdownWatch::Exiting("main window destructor: waiting for the NUP task");
     if (nup_cancel) {
         nup_cancel->store(true);

@@ -6,8 +6,10 @@
 #pragma once
 
 #include <array>
+#include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -111,9 +113,16 @@ public:
     /// @brief Gets NACP metadata (accounting for any patches or updates)
     [[nodiscard]] static PatchManager::Metadata GetMetadataFromBaseOrUpdate(Core::System& system, u64 application_id) noexcept;
 
+    /// New mods start disabled (Settings::values.seen_addons). `callback` runs, on the thread
+    /// that listed them, after a title's new mods were added to the disabled list: save it.
+    static void SetNewModsCallback(std::function<void(u64 title_id)> callback);
+    /// Held while the disabled and seen lists change here; hold it to read them elsewhere.
+    [[nodiscard]] static std::unique_lock<std::mutex> LockAddOns();
+
 private:
     [[nodiscard]] VirtualDir GetModificationLoadRoot(bool sdmc = false) const;
     [[nodiscard]] std::vector<std::string> GetDisabledAddons() const;
+    void DisableNewMods() const;
     void ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) const;
     [[nodiscard]] std::vector<VirtualFile> CollectPatches(const std::vector<VirtualDir>& patch_dirs,
                                                           const std::string& build_id) const;
