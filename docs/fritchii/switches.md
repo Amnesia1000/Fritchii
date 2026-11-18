@@ -630,6 +630,40 @@ all of them before the game starts either way, so a dispatch never waits for a p
 recorded in an earlier session (runtime-translated compute programs are recorded, as are prepared
 ones the game used); this only makes the compute records end earlier within the boot.
 
+### FRITCHII_PREP_COMPUTE_FIRST, FRITCHII_PREP_COMPUTE_CHECK
+
+Why: a compute dispatch can't be skipped while its pipeline compiles, so a compute pipeline the
+driver has to compile in play is a freeze (0.5 to 5 s for OoT's big ones). Tester logs (11-16 to
+11-18): 105 dispatch waits (115 s) on prepared compute pipelines the driver had not kept, and 28
+(50 s) on compute states the preparation lacks. The precompiled file holds its 4,088 compute records
+at its very end, so a driver cache at its size cap (NVIDIA's default ~1 GiB) drops them, and a player
+who presses Play now gets them last.
+
+- `FRITCHII_PREP_COMPUTE_FIRST` (boot, default 1; 0 = as before): the preparation takes every compute
+  record first, in any FRITCHII_PREP_ORDER mode (the used list's ages then rank after compute). Same
+  records and builds, only the order changes, so the preparation takes no longer. A checkpoint of an
+  older build resumes: positions before it as they were, the rest compute first. Logs "Precompiled
+  pipelines in order (...): N compute first, ..." and, once the last compute record ends,
+  "Precompiled compute: all N compute records done T s into the preparation (...)".
+- `FRITCHII_PREP_COMPUTE_CHECK` (boot, default 1; 0 = off; 2 = test). When the stamp says "already
+  prepared", the 6 biggest of 48 sampled kept compute pipelines are built the way a dispatch builds
+  them (kept info and SPIR-V, same layout, flags and program hash) and timed. A driver cache hit takes
+  2-10 ms; half or more over 40 ms means the driver's cache lost the prepared compute pipelines (new
+  exe name, driver update, cleared or full cache). Then the compute records alone are prepared again
+  before play (the Preparing shaders screen shows "n / 4,088"; Play now works as usual). No stamp,
+  checkpoint or kept file is written by that pass. `precompiled_compute_pass.fork-v54.txt` counts the
+  passes per stamp; after 2 the check only warns (a full cache drops them again). 2 = the compute pass
+  runs at every boot (to time it, or to fill a cold driver cache on purpose).
+- Logs: "Prepared compute check: the 6 biggest of 48 sampled kept compute pipelines built in a, b, ...
+  ms (k over 40 ms, T ms in all): the driver's cache holds/lost ...", then "Preparing 4088
+  precompiled pipelines from ... (its compute records only)" and "Precompiled compute pass finished".
+- Run time, every 10 s while any compute pipeline is built in play: "Compute pipelines built at run
+  time in the last 10 s: P from prepared SPIR-V (c compiled by the driver, x ms), T translated now (c
+  compiled, x ms), longest compile L ms; this session N prepared ones compiled again (must be 0 after a
+  finished preparation) for S s, M translated ones compiled for S s". The first 64 driver compiles get
+  a line each: "Compute pipeline H compiled by the driver at run time in N ms (prepared, not in the
+  driver's cache | translated now: a state the preparation lacks)".
+
 ### FRITCHII_OCCLUSION_VISIBLE
 
 TEST, off by default (helper AN, 2026-11-15, idea from DahBard's Blitchii LICHII_FAKE_OCCLUSION);

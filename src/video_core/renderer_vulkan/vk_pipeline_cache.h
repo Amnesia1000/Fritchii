@@ -529,6 +529,11 @@ private:
     /// spread over the index) translated again from their recorded environments with this build
     /// and its settings, and compared with the kept SPIR-V and infos. True when all are equal.
     bool CheckKeptSample(const PrecompiledKept::Index& index, std::string_view file_name);
+    /// FRITCHII_PREP_COMPUTE_CHECK: builds a few of the biggest kept compute pipelines the way a
+    /// dispatch builds them (kept info and SPIR-V, same layout and flags) and times them. True
+    /// when most took over the miss threshold: the driver's cache lost the prepared compute
+    /// pipelines. `summary` gets the log text.
+    bool PreparedComputeLost(const PrecompiledKept::Index& index, std::string& summary);
     [[nodiscard]] std::shared_ptr<const PrecompiledKept::Index> KeptIndex() const;
     /// What a kept file must have been written for, beyond the prepared stamp (which holds the
     /// release, driver and GPU): the cache version, the settings SPIR-V depends on, the library
