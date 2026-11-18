@@ -69,6 +69,7 @@
 #include "util/export_log.h"
 #include "util/profiling_mode.h"
 #include "fritchii/cache_cleanup.h"
+#include "fritchii/max_resolution.h"
 #include "fritchii/fritchii_ui.h"
 #include "fritchii/perf_overlay.h"
 #include "fritchii/switches_window.h"
@@ -636,6 +637,12 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     // to prevent the UI from blowing up.
     UpdateUITheme();
 
+    // v6 turns OoT's Max Resolution add-on off once for everyone, before a game from the command
+    // line boots with it; the question whether to turn it back on comes on a plain launch.
+    if (FritchiiMaxResolution::SwitchOffOnce()) {
+        OnSaveConfig();
+    }
+
     if (QStringList args = QApplication::arguments(); args.size() >= 2) {
         QList<QByteArray> qba{};
         for (auto const& e : args)
@@ -671,6 +678,11 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     // Once per major version, before a game boots: clear the old shader caches? (Not when started
     // with a game: the next plain launch asks.)
     if (!launched_with_game && FritchiiCacheCleanup::OfferOnce(this)) {
+        OnSaveConfig();
+    }
+
+    // Then, once per major version: Max Resolution on or off, with this PC's card in the question.
+    if (!launched_with_game && FritchiiMaxResolution::OfferOnce(this, vk_device_records)) {
         OnSaveConfig();
     }
 

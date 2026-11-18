@@ -49,6 +49,7 @@
 #include "yuzu/configuration/nvidia_dlss_panel.h"
 #include "yuzu/configuration/shared_widget.h"
 #include "yuzu/fritchii/fritchii_ui.h"
+#include "yuzu/fritchii/max_resolution.h"
 
 #ifdef HAS_RESHADE
 #include "yuzu/configuration/configure_post_processing.h"
@@ -724,34 +725,6 @@ QString HeightName(u32 height) {
     return QStringLiteral("%1p").arg(height);
 }
 
-constexpr u64 OCARINA_TITLE_ID = 0x0400486024DEC000ULL;
-constexpr const char* MAX_RESOLUTION_ADDON = "Max Resolution (built-in)";
-
-/// The Max Resolution add-on as saved (on unless disabled in Add-Ons), without the
-/// EDEN_NX2_NO_MAX_RES test override Settings::OcarinaMaxResolutionOn reads.
-bool MaxResolutionSaved() {
-    const auto it = Settings::values.disabled_addons.find(OCARINA_TITLE_ID);
-    return it == Settings::values.disabled_addons.end() ||
-           std::find(it->second.begin(), it->second.end(), MAX_RESOLUTION_ADDON) ==
-               it->second.end();
-}
-
-/// Turns the add-on on or off as the game's Add-Ons page does.
-void SaveMaxResolution(bool on) {
-    if (on == MaxResolutionSaved()) {
-        return;
-    }
-    auto& disabled = Settings::values.disabled_addons[OCARINA_TITLE_ID];
-    if (on) {
-        std::erase(disabled, std::string{MAX_RESOLUTION_ADDON});
-    } else {
-        disabled.emplace_back(MAX_RESOLUTION_ADDON);
-        std::sort(disabled.begin(), disabled.end());
-    }
-    // The game list caches the add-ons it shows (ConfigurePerGameAddons::ApplyConfiguration).
-    Common::FS::RemoveFile(Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) / "game_list" /
-                           fmt::format("{:016X}.pv.txt", OCARINA_TITLE_ID));
-}
 } // namespace
 
 void ConfigureGraphics::SetupUpscalerChoice(std::map<u32, QWidget*>& hold_graphics) {
@@ -1150,7 +1123,7 @@ void ConfigureGraphics::SetupPictureMenu(const std::map<u32, QWidget*>& rows) {
         texture_sharpness_combobox = row->combobox;
     }
 
-    max_resolution_saved = MaxResolutionSaved();
+    max_resolution_saved = FritchiiMaxResolution::Saved();
     max_resolution_choice = max_resolution_saved;
     // Turning the upscaler off brings the add-on back as it was with the game's own upscale, or
     // on (the game's full 1440p) when the page opened with an upscaler.
@@ -1177,7 +1150,7 @@ void ConfigureGraphics::SetupPictureMenu(const std::map<u32, QWidget*>& rows) {
                 this, [this](int) { UpdatePictureMenu(); });
     }
     // Saved with the other add-ons by the global config (Config::SaveDisabledAddOnValues).
-    apply_funcs.push_back([this](bool) { SaveMaxResolution(max_resolution_choice); });
+    apply_funcs.push_back([this](bool) { FritchiiMaxResolution::Save(max_resolution_choice); });
     UpdatePictureMenu();
 }
 
@@ -1345,7 +1318,7 @@ void ConfigureGraphics::SetupPlainNames(const std::map<u32, QWidget*>& rows) {
     // (2026-11-18: no "1440p" anywhere, and the 0.75x row for weak PCs read "810p").
     if (resolution_combobox != nullptr) {
         using Res = Settings::ResolutionSetup;
-        const bool max_resolution = MaxResolutionSaved();
+        const bool max_resolution = FritchiiMaxResolution::Saved();
         const u32 docked_base = max_resolution ? 1440 : 1080;
         for (int row = 0; row < resolution_combobox->count(); ++row) {
             const auto setup = static_cast<Res>(resolution_combobox->itemData(row).toUInt());
