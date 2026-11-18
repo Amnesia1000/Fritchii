@@ -3292,6 +3292,40 @@ on and no unbounded writer was queued over the QMD (GpuSplit::QueuedGuestWriters
 back verifies every release either way (QmdPrediction::Verify). 0 = refused as before. EXP127 = 2
 adds sources under this switch (EXP127).
 
+### FRITCHII_FEED_REARM
+
+FRITCHII_FEED_REARM (live, default 1): the EXP13=3/4 feed that turned itself off comes back on
+after 10 s with no new divergence (a bound violation, payload mismatch, unpredicted back release,
+phantom record: each one while off starts the 10 s again), when the audit says nothing it met
+was wrong: no acquire judged wrongly met since the turn-off, none named by the scans at the
+turn-off or since, every decision made before it judged, no violated bound still being re-read.
+The words a turn-off named stay out of the feed for the split session. Off for good: the third
+turn-off in a split session, lost events, more than 64 words kept out, a scan naming an acquire
+(for the split session); an acquire the audit judges wrongly met (for the run: it also turns the
+feed off). A new split session (the game booted again) starts with the feed on. Lines: "feed
+(EXP13=3/4) off (n of 3 this split session)", "back on (FRITCHII_FEED_REARM=1)", "stays off
+for the ...", and every 5 s after a turn-off "feed re-arm (FRITCHII_FEED_REARM=1)". 0 = off for
+the rest of the run, as before (an EXP13 change still turns it back on).
+
+Not this switch: a new split session's ring positions start at 0, and the predictor's horizon
+(QmdPrediction::Settle) now starts over with them (QmdPrediction::StartSplitSession). Kept, it
+stopped every back release from waiting for its record until the new ring passed the old one,
+so the first one that ran before its record turned the feed off minutes after a game reboot.
+
+### FRITCHII_TEST_FEED_OFF
+
+FRITCHII_TEST_FEED_OFF (live, default 0, test only): every N seconds of feed on, the feed turns
+itself off as for an unpredicted back release of no word ("test: FRITCHII_TEST_FEED_OFF=N, no
+real release"), to see FRITCHII_FEED_REARM bring it back (and stay off after the third).
+
+### FRITCHII_TEST_SPLIT_RESTART
+
+FRITCHII_TEST_SPLIT_RESTART (live, default 0, test only): every N seconds of a GPU thread split
+session, the GPU thread drains and stops the split (the stop an accuracy change takes mid-game)
+and the next loop starts a new session, ring positions from 0, as a game reboot does. For the
+predictor's session start (QmdPrediction::StartSplitSession). Line: "GPU thread split: stopped
+for FRITCHII_TEST_SPLIT_RESTART".
+
 ### EDEN_NX2_QMD_3D_PATCH
 
 EDEN_NX2_QMD_3D_PATCH (live, default 0; fable_answer_pair_2 3.1): a 3D inline upload over a
