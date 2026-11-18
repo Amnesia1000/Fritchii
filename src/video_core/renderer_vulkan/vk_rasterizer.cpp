@@ -8596,13 +8596,18 @@ bool RasterizerVulkan::OcarinaTemporalEnabled() const {
         oot_output_height = output.height;
         const bool max_resolution = Settings::OcarinaMaxResolutionOn();
         const bool fsr_game_size = OcarinaFsrOutputsGameSize(*oot_backend);
+        // The game's scene: 1440p with Max Resolution, or what oot_render_height made it; the
+        // game's dynamic size (1080p at most) without it.
+        const auto render_height = Settings::AppliedOcarinaRenderHeight();
+        const u32 input_height =
+            max_resolution ? Settings::OcarinaRenderHeightFor(render_height) : 1080U;
         const auto plan = VideoCommon::PlanOcarinaPassOutput(
-            output.height, max_resolution,
-            Settings::OcarinaRenderHeightFor(Settings::AppliedOcarinaRenderScale()), false,
+            output.height, max_resolution, Settings::OcarinaRenderHeightFor(render_height), false,
             fsr_game_size);
-        const u32 shown = plan.big_height != 0 ? plan.big_height
-                          : plan.native_aa     ? 1080U
-                                               : 1440U;
+        const u32 shown = plan.big_height != 0   ? plan.big_height
+                          : plan.small_height != 0 ? plan.small_height
+                          : plan.native_aa         ? input_height
+                                                   : 1440U;
         // The status bar: what runs, from what to what (DLSS Native keeps the game's size).
         const bool dlss_backend = *oot_backend == VideoCommon::OcarinaUpscaleBackend::Dlss;
         const u32 picture_backend =
@@ -8610,7 +8615,6 @@ bool RasterizerVulkan::OcarinaTemporalEnabled() const {
             : Settings::values.oot_anti_aliasing.GetValue() == Settings::OotAntiAliasing::Fsr4
                 ? 3U
                 : 2U;
-        const u32 input_height = max_resolution ? 1440U : 1080U;
         oot_picture_backend = picture_backend;
         oot_picture_input = input_height;
         oot_picture_up_to = !max_resolution;
@@ -8627,6 +8631,15 @@ bool RasterizerVulkan::OcarinaTemporalEnabled() const {
                  *oot_backend == VideoCommon::OcarinaUpscaleBackend::Dlss
                      ? "; DLSS Native keeps the scene's size"
                      : "");
+        if (render_height) {
+            LOG_INFO(Render_Vulkan,
+                     "Ocarina temporal: the game draws its scene at {}x{} (oot_render_height={}, "
+                     "built-in render patch), {} makes {}p",
+                     VideoCommon::OcarinaOutputWidth(*render_height), *render_height,
+                     Settings::values.oot_render_height.GetValue(),
+                     VideoCommon::OcarinaBackendName(*oot_backend),
+                     plan.native_aa ? input_height : shown);
+        }
     }
     return *oot_backend != VideoCommon::OcarinaUpscaleBackend::Native;
 }
@@ -9024,15 +9037,15 @@ void RasterizerVulkan::ReadOcarinaActor(OcarinaActorMesh& mesh) {
 bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool replace) {
     constexpr u64 depth_reader = 0x1fc7a0423116281fULL;
     const u64 upscale_hash = pipeline.ShaderHash();
-    // FRITCHII_DLSS_RENDER_SCALE: the scale the game started with (whatever quality is chosen
-    // since): its scene is smaller than 2560x1440 and still upscaled to it, by the scaled 1440p
-    // passes (Ultra Performance) or the 3/4 pass (Performance, 1920x1080).
-    const auto render_scale = Settings::AppliedOcarinaRenderScale();
+    // oot_render_height: the height the game started with (the built-in render patch): its
+    // scene is smaller than 2560x1440 and still upscaled to it, by the scaled 1440p passes
+    // (1280x720) or the 3/4 pass (1920x1080).
+    const auto render_height = Settings::AppliedOcarinaRenderHeight();
     const bool scaled_1440p_pass =
-        render_scale && (upscale_hash == ComputePipeline::Ocarina1440pScaledShader ||
-                         upscale_hash == ComputePipeline::Ocarina1440pScaledFieldShader ||
-                         (upscale_hash == ComputePipeline::OcarinaThreeQuarterShader &&
-                          render_scale == Settings::NvidiaDlssQuality::Performance));
+        render_height && (upscale_hash == ComputePipeline::Ocarina1440pScaledShader ||
+                          upscale_hash == ComputePipeline::Ocarina1440pScaledFieldShader ||
+                          (upscale_hash == ComputePipeline::OcarinaThreeQuarterShader &&
+                           *render_height == 1080));
     const bool pass_1440p =
         replace && (upscale_hash == ComputePipeline::Ocarina1440pShader || scaled_1440p_pass);
     if ((!replace && upscale_hash != depth_reader) || !OcarinaTemporalEnabled()) {
@@ -9054,7 +9067,7 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
     // the 3/4 pass; FRITCHII_FSR_OUTPUT may make FSR draw the game's own 1440p picture). Above
     // 1440p the output is composited with the game's interface when presented ("4K" below).
     const auto output_plan = VideoCommon::PlanOcarinaPassOutput(
-        oot_output_height, pass_1440p, Settings::OcarinaRenderHeightFor(render_scale),
+        oot_output_height, pass_1440p, Settings::OcarinaRenderHeightFor(render_height),
         native_resolution, OcarinaFsrOutputsGameSize(*oot_backend));
     const bool upscale_4k = output_plan.big_height != 0;
     const VkExtent2D big_extent{VideoCommon::OcarinaOutputWidth(output_plan.big_height),
@@ -9162,10 +9175,10 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
     using VideoCore::Surface::PixelFormat;
     const auto extent = oot_motion.extent;
     const bool native_size = upscale_hash == ComputePipeline::OcarinaFullSizeShader;
-    // The render-scale passes take the 16:9 scene the patch gave (1920x1080 or 1280x720).
-    const u32 render_height = Settings::OcarinaRenderHeightFor(render_scale);
+    // The render-height passes take the 16:9 scene the patch gave (1920x1080, 1280x720, ...).
+    const u32 scene_height = Settings::OcarinaRenderHeightFor(render_height);
     const bool scene_1440p_or_scaled =
-        scaled_1440p_pass ? extent.height == render_height && extent.width == render_height * 16 / 9
+        scaled_1440p_pass ? extent.height == scene_height && extent.width == scene_height * 16 / 9
                           : extent.width == 2560 && extent.height == 1440;
     const bool valid_extents =
         pass_1440p ? scene_1440p_or_scaled && target.size.width == 2560 &&
@@ -9187,9 +9200,14 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
     // game's sizes.
     VkExtent2D render_extent = extent;
     VkExtent2D target_extent{target.size.width, target.size.height};
-    VkExtent2D output_extent = output_plan.native_aa ? extent
-                               : upscale_4k          ? big_extent
-                                                     : target_extent;
+    // A small output (720p -> 1080p) is stretched into the game's 1440p target by the output
+    // pass (OcarinaUpscaler::Record samples it linearly when the sizes differ).
+    const VkExtent2D small_extent{VideoCommon::OcarinaOutputWidth(output_plan.small_height),
+                                  output_plan.small_height};
+    VkExtent2D output_extent = output_plan.native_aa         ? extent
+                               : upscale_4k                  ? big_extent
+                               : output_plan.small_height != 0 ? small_extent
+                                                             : target_extent;
     bool use_4k = upscale_4k;
     if (scaled_mode) {
         // The scene's colour, depth and the motion made from that depth must share one size;

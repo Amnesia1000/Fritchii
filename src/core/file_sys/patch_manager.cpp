@@ -81,10 +81,10 @@ struct BuiltinPatch {
     /// When set, guest state the patch keeps in the module (offset, size): it must lie in BSS.
     size_t state_offset = 0;
     size_t state_size = 0;
-    /// FRITCHII_DLSS_RENDER_SCALE: the DLSS quality whose render scale this patch sets. It needs
-    /// Max Resolution applied (it changes that path), and the renderer reads what was applied
-    /// (Settings::AppliedOcarinaRenderScale).
-    std::optional<Settings::NvidiaDlssQuality> render_scale{};
+    /// OoT's render height this patch sets (oot_render_height, Settings::OcarinaRenderHeight). It
+    /// needs Max Resolution applied (it changes that path), and the renderer reads what was
+    /// applied (Settings::AppliedOcarinaRenderHeight). 0 = not a render-height patch.
+    u32 render_height = 0;
 };
 
 // Ocarina of Time takes its "dynamic resolution disabled" path, so the 3D renders at full scale
@@ -99,32 +99,70 @@ constexpr std::array MAX_RESOLUTION_RECORDS{
 
 constexpr std::string_view MAX_RESOLUTION_NAME = "Max Resolution (built-in)";
 
-// DLSS render scales (FRITCHII_DLSS_RENDER_SCALE, ProfessorTee's community patch as ported to
-// Lichii): Max Resolution's fixed-scale path loads 1.0 of 2560x1440 (main+0x806420:
-// mov w9, #0x3f800000), which DLSS takes to 4K. The lower scales give the other modes' render
-// sizes; the emulator's resolution scale stays 1x, so every pass runs at the game's own size.
-constexpr u32 RENDER_SCALE_ONE = 0x52A7F009;                                  // 1.0
-constexpr std::array<u8, 4> RENDER_SCALE_PERFORMANCE{0x09, 0xE8, 0xA7, 0x52}; // 0.75, 1920x1080
-constexpr std::array<u8, 4> RENDER_SCALE_ULTRA{0x09, 0xE0, 0xA7, 0x52};       // 0.5, 1280x720
-constexpr std::array RENDER_PERFORMANCE_RECORDS{
-    BuiltinPatchRecord{.module_offset = 0x806420,
-                       .bytes = RENDER_SCALE_PERFORMANCE,
-                       .checked = true,
-                       .original = RENDER_SCALE_ONE},
-};
-constexpr std::array RENDER_ULTRA_RECORDS{
-    BuiltinPatchRecord{.module_offset = 0x806420,
-                       .bytes = RENDER_SCALE_ULTRA,
-                       .checked = true,
-                       .original = RENDER_SCALE_ONE},
-};
-
-bool OcarinaPerformanceScaleOn() {
-    return Settings::OcarinaDlssRenderScale() == Settings::NvidiaDlssQuality::Performance;
+// OoT's render heights (oot_render_height; before, FRITCHII_DLSS_RENDER_SCALE's DLSS qualities:
+// ProfessorTee's community patch as ported to Lichii): Max Resolution's fixed-scale path loads
+// 1.0 of 2560x1440 (main+0x806420: mov w9, #0x3f800000, the float's top 16 bits). Lower scales
+// make the game draw a smaller scene that DLSS or FSR enlarge; the emulator's resolution scale
+// stays 1x, so every pass of the game, its compute passes too, runs at the game's own size.
+constexpr u32 RENDER_SCALE_ONE = 0x52A7F009; // 1.0
+// mov w9, #imm16, lsl #16 with the scale's top 16 bits (each scale below is exact in them).
+constexpr std::array<u8, 4> RenderScaleBytes(u32 float_top) {
+    const u32 instruction = 0x52A00009U | (float_top << 5);
+    return {static_cast<u8>(instruction), static_cast<u8>(instruction >> 8),
+            static_cast<u8>(instruction >> 16), static_cast<u8>(instruction >> 24)};
 }
-
-bool OcarinaUltraScaleOn() {
-    return Settings::OcarinaDlssRenderScale() == Settings::NvidiaDlssQuality::UltraPerformance;
+constexpr std::array<u8, 4> RENDER_SCALE_720 = RenderScaleBytes(0x3F00);  // 0.5, 1280x720
+constexpr std::array<u8, 4> RENDER_SCALE_810 = RenderScaleBytes(0x3F10);  // 0.5625, 1440x810
+constexpr std::array<u8, 4> RENDER_SCALE_900 = RenderScaleBytes(0x3F20);  // 0.625, 1600x900
+constexpr std::array<u8, 4> RENDER_SCALE_1080 = RenderScaleBytes(0x3F40); // 0.75, 1920x1080
+constexpr std::array<u8, 4> RENDER_SCALE_1260 = RenderScaleBytes(0x3F60); // 0.875, 2240x1260
+static_assert(RenderScaleBytes(0x3F80) == std::array<u8, 4>{0x09, 0xF0, 0xA7, 0x52});
+static_assert(RENDER_SCALE_1080 == std::array<u8, 4>{0x09, 0xE8, 0xA7, 0x52});
+static_assert(RENDER_SCALE_720 == std::array<u8, 4>{0x09, 0xE0, 0xA7, 0x52});
+constexpr std::array RENDER_720_RECORDS{
+    BuiltinPatchRecord{.module_offset = 0x806420,
+                       .bytes = RENDER_SCALE_720,
+                       .checked = true,
+                       .original = RENDER_SCALE_ONE},
+};
+bool OcarinaRender720On() {
+    return Settings::OcarinaRenderHeight() == u32{720};
+}
+constexpr std::array RENDER_810_RECORDS{
+    BuiltinPatchRecord{.module_offset = 0x806420,
+                       .bytes = RENDER_SCALE_810,
+                       .checked = true,
+                       .original = RENDER_SCALE_ONE},
+};
+bool OcarinaRender810On() {
+    return Settings::OcarinaRenderHeight() == u32{810};
+}
+constexpr std::array RENDER_900_RECORDS{
+    BuiltinPatchRecord{.module_offset = 0x806420,
+                       .bytes = RENDER_SCALE_900,
+                       .checked = true,
+                       .original = RENDER_SCALE_ONE},
+};
+bool OcarinaRender900On() {
+    return Settings::OcarinaRenderHeight() == u32{900};
+}
+constexpr std::array RENDER_1080_RECORDS{
+    BuiltinPatchRecord{.module_offset = 0x806420,
+                       .bytes = RENDER_SCALE_1080,
+                       .checked = true,
+                       .original = RENDER_SCALE_ONE},
+};
+bool OcarinaRender1080On() {
+    return Settings::OcarinaRenderHeight() == u32{1080};
+}
+constexpr std::array RENDER_1260_RECORDS{
+    BuiltinPatchRecord{.module_offset = 0x806420,
+                       .bytes = RENDER_SCALE_1260,
+                       .checked = true,
+                       .original = RENDER_SCALE_ONE},
+};
+bool OcarinaRender1260On() {
+    return Settings::OcarinaRenderHeight() == u32{1260};
 }
 
 // Texture pool patch (a ported community patch): with Max Resolution the
@@ -967,25 +1005,52 @@ constexpr std::array BUILTIN_PATCHES{
         // shadows unchanged in the screenshot. FRITCHII_NO_SHADOW_STEPS=1 turns it off.
         .disable_env = "FRITCHII_NO_SHADOW_STEPS",
     },
-    // FRITCHII_DLSS_RENDER_SCALE: the NVIDIA DLSS quality lowers OoT's render resolution under
-    // Max Resolution (listed in Add-Ons only while it applies).
+    // OoT's render height (oot_render_height, Settings::OcarinaRenderHeight) under Max
+    // Resolution with DLSS or FSR (listed in Add-Ons only while it applies).
     BuiltinPatch{
-        .name = "DLSS Performance render scale (built-in)",
+        .name = "720p render (built-in)",
         .title_id = 0x0400486024DEC000,
         .module = "main",
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
-        .records = RENDER_PERFORMANCE_RECORDS,
-        .setting_enabled = &OcarinaPerformanceScaleOn,
-        .render_scale = Settings::NvidiaDlssQuality::Performance,
+        .records = RENDER_720_RECORDS,
+        .setting_enabled = &OcarinaRender720On,
+        .render_height = 720,
     },
     BuiltinPatch{
-        .name = "DLSS Ultra Performance render scale (built-in)",
+        .name = "810p render (built-in)",
         .title_id = 0x0400486024DEC000,
         .module = "main",
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
-        .records = RENDER_ULTRA_RECORDS,
-        .setting_enabled = &OcarinaUltraScaleOn,
-        .render_scale = Settings::NvidiaDlssQuality::UltraPerformance,
+        .records = RENDER_810_RECORDS,
+        .setting_enabled = &OcarinaRender810On,
+        .render_height = 810,
+    },
+    BuiltinPatch{
+        .name = "900p render (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = RENDER_900_RECORDS,
+        .setting_enabled = &OcarinaRender900On,
+        .render_height = 900,
+    },
+    BuiltinPatch{
+        .name = "1080p render (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = RENDER_1080_RECORDS,
+        .setting_enabled = &OcarinaRender1080On,
+        .render_height = 1080,
+    },
+    BuiltinPatch{
+        .name = "1260p render (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = RENDER_1260_RECORDS,
+        .setting_enabled = &OcarinaRender1260On,
+        .render_height = 1260,
     },
 };
 
@@ -1559,7 +1624,7 @@ std::vector<VirtualFile> PatchManager::CollectPatches(const std::vector<VirtualD
 
 std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::string& name) const {
     if (name == "main") {
-        Settings::SetAppliedOcarinaRenderScale(std::nullopt);
+        Settings::SetAppliedOcarinaRenderHeight(std::nullopt);
     }
     if (nso.size() < sizeof(Loader::NSOHeader)) {
         return nso;
@@ -1708,7 +1773,7 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
                      patch.build_id);
             continue;
         }
-        if (patch.render_scale &&
+        if (patch.render_height != 0 &&
             std::find(applied.cbegin(), applied.cend(), MAX_RESOLUTION_NAME) == applied.cend()) {
             LOG_INFO(Loader, "    - Skipping \"{}\": it needs \"{}\"", patch.name,
                      MAX_RESOLUTION_NAME);
@@ -1772,8 +1837,8 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
             replaced.push_back(patch.replaces);
         }
         applied.push_back(patch.name);
-        if (patch.render_scale) {
-            Settings::SetAppliedOcarinaRenderScale(patch.render_scale);
+        if (patch.render_height != 0) {
+            Settings::SetAppliedOcarinaRenderHeight(patch.render_height);
         }
     }
 
