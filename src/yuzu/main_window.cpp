@@ -5637,7 +5637,9 @@ void MainWindow::UpdateStatusBar() {
         // Fritchii builds: the real sizes, e.g. "1440p -> 4K" or "1080p" for DLAA.
         if (FritchiiUi::Enabled() && dlss.render_height != 0 && dlss.output_height != 0) {
             const auto height = [](u32 lines) {
-                return lines == 2160 ? QStringLiteral("4K") : QStringLiteral("%1p").arg(lines);
+                return lines == 2160   ? QStringLiteral("4K")
+                       : lines == 4320 ? QStringLiteral("8K")
+                                       : QStringLiteral("%1p").arg(lines);
             };
             dlss_status_text += QStringLiteral("  ") + height(dlss.render_height);
             if (dlss.output_height != dlss.render_height) {
