@@ -2885,8 +2885,13 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         query_cache.NotifySegment(true);
         HandleTransformFeedback();
         // FRITCHII_OCCL_FLAG=1: a flag draw opens (or keeps) a slot with no host query.
+        // A flag slot reports 4096 when any sample passed, not the count: only for Ocarina of
+        // Time, whose occlusion tests ask "any sample" (0xe2c compares a pair, one of them 0),
+        // and not when the counts are asked to be precise (accurate part 2).
         const bool flag_draw = pipeline->occl_flag_parent != nullptr;
-        if (flag_draw && VideoCommon::OcclFlag::Mode() == VideoCommon::OcclFlag::On) {
+        if (flag_draw && VideoCommon::OcclFlag::Mode() == VideoCommon::OcclFlag::On &&
+            Settings::GetCurrentProgramID() == 0x0400486024DEC000ULL &&
+            !VideoCore::Nx2Debug::AccuratePart(2)) {
             query_cache_runtime.SetNextFlagDraw(true);
         }
         query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,

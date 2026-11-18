@@ -225,7 +225,11 @@ public:
         // is the sum of its slots, as for a window across submissions).
         const bool want_flag = std::exchange(next_flag_draw, false);
         if (has_started) {
-            if (current_flag_slot == want_flag) {
+            // Only a flag slot is closed for the other kind: a flag draw in an open query slot
+            // is counted exactly by that query (its store lands in a slot no one reads), so a
+            // window gains at most one slot per segment, as few as possible for the multi-slot
+            // paths (prefix scan, the EXP16 limit).
+            if (!current_flag_slot || want_flag) {
                 return;
             }
             PauseCounter();
@@ -747,6 +751,13 @@ private:
         if (flag_tried) {
             return false;
         }
+        const auto driver = device.GetDriverID();
+        if (driver == VK_DRIVER_ID_QUALCOMM_PROPRIETARY || driver == VK_DRIVER_ID_ARM_PROPRIETARY ||
+            driver == VK_DRIVER_ID_MESA_TURNIP) {
+            // Their sync returns before the flag barrier (PresyncWrites): no flag area.
+            flag_tried = true;
+            return false;
+        }
         if (!device.IsOcclFlagDeviceAddressEnabled()) {
             flag_tried = true;
             LOG_WARNING(Render_Vulkan, "Occlusion flags (FRITCHII_OCCL_FLAG): the device has no "
@@ -869,7 +880,9 @@ private:
             OcclFlag::Add(stats.no_flag);
             return;
         }
-        if ((marks & 2) != 0) {
+        if ((marks & 6) != 0) {
+            // Other counted draws, or flag slots (mode 1 before a live switch to 2: their value
+            // is the flag itself): not comparable.
             OcclFlag::Add(stats.mixed);
             return;
         }
