@@ -711,6 +711,51 @@ void RecordFriztiWrite(const Config& written) {
     }
     SaveFriztiRecord(record);
 }
+
+// Before Ocarina's per-game settings move to the main ones: custom/<id>.ini.before-v6, kept if
+// one is there already. False when the copy failed (then nothing moves this time).
+bool BackUpOcarinaConfig() {
+    const auto custom = Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir) / "custom";
+    const auto backup = custom / (OcarinaConfigName() + ".ini.before-v6");
+    if (Common::FS::Exists(backup)) {
+        return true;
+    }
+    std::error_code error;
+    std::filesystem::copy_file(custom / (OcarinaConfigName() + ".ini"), backup, error);
+    if (error) {
+        LOG_WARNING(Frontend, "Settings: could not back up OoT's own settings to {}: {}",
+                    Common::FS::PathToUTF8String(backup), error.message());
+        return false;
+    }
+    return true;
+}
+
+// One short note when OoT's own settings moved to the main ones. `moved`: setting ids (or ~0u for
+// the controls) and labels.
+void ShowOotSettingsMoved(QWidget* parent, const std::vector<std::pair<u32, std::string>>& moved) {
+    const auto names = ConfigurationShared::InitializeTranslations(parent);
+    QStringList lines;
+    for (const auto& [id, label] : moved) {
+        QString name = QString::fromStdString(label);
+        if (id == ~0u) {
+            name = MainWindow::tr("Controls");
+        } else if (const auto it = names->find(id); it != names->end() && !it->second.first.isEmpty()) {
+            name = it->second.first.trimmed();
+            if (name.endsWith(QLatin1Char(':'))) {
+                name.chop(1);
+            }
+        }
+        if (!lines.contains(name)) {
+            lines.append(name);
+        }
+    }
+    auto* box = new QMessageBox(QMessageBox::Information, MainWindow::tr("Settings"),
+                                MainWindow::tr("OoT's own settings are now your main settings."),
+                                QMessageBox::Ok, parent);
+    box->setInformativeText(lines.join(QLatin1Char('\n')));
+    box->setAttribute(Qt::WA_DeleteOnClose);
+    box->open();
+}
 } // namespace
 
 // Frizti builds change the defaults Ocarina of Time needs, but a default only reaches a config
@@ -735,11 +780,37 @@ void MainWindow::MigrateFriztiSettings() {
 
     // Ocarina's per-game config, loaded as a game boot does.
     std::map<std::string, std::string> per_game;
+    bool folded = false;
+    std::vector<std::pair<u32, std::string>> moved;
     if (Common::FS::Exists(Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir) / "custom" /
                            (OcarinaConfigName() + ".ini"))) {
+        // Fritchii keeps one place for OoT's settings (Configure): once, each per-game value
+        // becomes the main one, which is what the player saw in game. Backed up first.
+        folded = !record.oot_folded && BackUpOcarinaConfig();
         QtConfig game_config(OcarinaConfigName(), Config::ConfigType::PerGameConfig);
         auto game_changes = Frizti::ReconcilePerGame(tuned, record, full);
-        if (!game_changes.empty()) {
+        if (folded) {
+            std::vector<Settings::BasicSetting*> all;
+            for (const auto& [category, list] : Settings::values.linkage.by_category) {
+                all.insert(all.end(), list.begin(), list.end());
+            }
+            for (const auto& move : Frizti::FoldPerGame(all)) {
+                LOG_INFO(Frontend, "Settings: OoT's own {}={} moved to the main settings (was {})",
+                         move.setting->GetLabel(), move.to, move.from);
+                moved.emplace_back(move.setting->Id(), move.setting->GetLabel());
+            }
+            for (const auto& change : Frizti::FoldPerGamePlayers(Settings::values)) {
+                LOG_INFO(Frontend, "Settings: OoT's own {}={} moved to the main settings (was {})",
+                         change.label, change.to, change.from);
+                moved.emplace_back(~0u, change.label);
+            }
+            for (auto& change : Frizti::FixDockedController(Settings::values)) {
+                changes.push_back(std::move(change));
+            }
+            // A player without a per-game profile writes nothing, so the old profile lines go.
+            game_config.ClearControlPlayerValues();
+        }
+        if (!game_changes.empty() || folded) {
             game_config.SaveAllValues();
         }
         per_game = Frizti::PerGameValues(tuned);
@@ -752,11 +823,15 @@ void MainWindow::MigrateFriztiSettings() {
 
     // A newer Frizti build's revision is kept.
     const u32 revision = (std::max)(applied, Frizti::Revision);
-    if (!changes.empty() || Settings::values.frizti_settings_revision.GetValue() != revision) {
+    if (!changes.empty() || folded ||
+        Settings::values.frizti_settings_revision.GetValue() != revision) {
         Settings::values.frizti_settings_revision.SetValue(revision);
         config->SaveAllValues();
     }
     record.revision = revision;
+    if (folded) {
+        record.oot_folded = true;
+    }
     record.global = Frizti::GlobalValues(tuned);
     record.per_game = std::move(per_game);
     SaveFriztiRecord(record);
@@ -768,6 +843,9 @@ void MainWindow::MigrateFriztiSettings() {
     } else if (!changes.empty()) {
         LOG_INFO(Frontend, "Frizti settings changed by another build, restored: {}",
                  Frizti::FormatChanges(changes));
+    }
+    if (!moved.empty()) {
+        QTimer::singleShot(0, this, [this, moved] { ShowOotSettingsMoved(this, moved); });
     }
 }
 
