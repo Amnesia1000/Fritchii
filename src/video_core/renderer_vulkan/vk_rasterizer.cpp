@@ -8611,8 +8611,12 @@ bool RasterizerVulkan::OcarinaTemporalEnabled() const {
                 ? 3U
                 : 2U;
         const u32 input_height = max_resolution ? 1440U : 1080U;
+        oot_picture_backend = picture_backend;
+        oot_picture_input = input_height;
+        oot_picture_up_to = !max_resolution;
+        oot_picture_output = plan.native_aa ? input_height : shown;
         VideoCommon::PublishOcarinaPicture(picture_backend, input_height, !max_resolution,
-                                           plan.native_aa ? input_height : shown);
+                                           oot_picture_output);
         LOG_INFO(Render_Vulkan,
                  "Ocarina temporal: output {}x{} with Max Resolution {} (oot_upscale_output={}: "
                  "{}; {} MiB video memory{}{}){}",
@@ -9037,6 +9041,15 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
     const bool native_resolution =
         oot_backend == VideoCommon::OcarinaUpscaleBackend::Dlss &&
         Settings::GetNvidiaDlssRuntimeSettings().quality == Settings::NvidiaDlssQuality::Native;
+    // The DLSS quality changes in game (to or from DLAA): the status bar follows (2026-11-18: it
+    // still said "up to 1080p -> 1440p" after a switch to DLAA 1080p).
+    if (replace && oot_picture_backend == 4U && oot_picture_native != int{native_resolution}) {
+        oot_picture_native = int{native_resolution};
+        VideoCommon::PublishOcarinaPicture(oot_picture_backend, oot_picture_input,
+                                           oot_picture_up_to,
+                                           native_resolution ? oot_picture_input
+                                                             : oot_picture_output);
+    }
     // The output size: oot_upscale_output (Auto: 4K from the 1440p pass, the target's size from
     // the 3/4 pass; FRITCHII_FSR_OUTPUT may make FSR draw the game's own 1440p picture). Above
     // 1440p the output is composited with the game's interface when presented ("4K" below).
