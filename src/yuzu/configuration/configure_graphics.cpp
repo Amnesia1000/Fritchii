@@ -22,6 +22,8 @@
 #include <QListView>
 #include <QPixmap>
 #include <QPushButton>
+#include <QScopeGuard>
+#include <QScreen>
 #include <QSlider>
 #include <QStringLiteral>
 #include <QtCore/qobjectdefs.h>
@@ -416,6 +418,22 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
             group_layout->addWidget(amd_fsr4_panel);
             connect(oot_aa_combobox, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
                     [this](int) { UpdateAmdFsr4Visibility(); });
+            hold_graphics.emplace(setting->Id(), group);
+        } else if (setting->Id() == Settings::values.scaling_filter.Id() &&
+                   widget->combobox != nullptr && FritchiiUi::Enabled()) {
+            // The filter's pros and cons and the one that suits this picture on this screen,
+            // under the choice (owner 2026-11-18: settings as easy to understand as possible).
+            QWidget* group = new QWidget(this);
+            QVBoxLayout* group_layout = new QVBoxLayout(group);
+            group_layout->setContentsMargins(0, 0, 0, 0);
+            group_layout->setSpacing(2);
+            group_layout->addWidget(widget);
+            scaling_filter_combobox = widget->combobox;
+            filter_note = new QLabel(group);
+            filter_note->setWordWrap(true);
+            group_layout->addWidget(filter_note);
+            connect(scaling_filter_combobox, QOverload<int>::of(&QComboBox::currentIndexChanged),
+                    this, [this](int) { UpdateWindowFilterNote(); });
             hold_graphics.emplace(setting->Id(), group);
         } else {
             hold_graphics.emplace(setting->Id(), widget);
@@ -1239,6 +1257,8 @@ void ConfigureGraphics::SetupPictureMenu(const std::map<u32, QWidget*>& rows) {
 }
 
 void ConfigureGraphics::UpdatePictureMenu() {
+    // The window filter's advice follows the picture (it reads the rows set below).
+    const auto filter_note_update = qScopeGuard([this] { UpdateWindowFilterNote(); });
     if (output_row == nullptr || quality_row == nullptr || resolution_widget == nullptr) {
         return;
     }
@@ -1364,6 +1384,123 @@ void ConfigureGraphics::UpdatePictureMenu() {
     output_combobox->setEnabled(output_combobox->count() > 1);
 }
 
+namespace {
+/// One line each: what the window filter does well, then what it does badly.
+QString FilterProsCons(Settings::ScalingFilter filter) {
+    using F = Settings::ScalingFilter;
+    switch (filter) {
+    case F::Area:
+        return ConfigureGraphics::tr("Cleanest when the picture is bigger than your screen. A bit "
+                                     "soft when stretching a smaller one.");
+    case F::ScaleForce:
+        return ConfigureGraphics::tr("Clean, sharp edges when stretching a smaller picture. "
+                                     "Shimmers when shrinking a bigger one.");
+    case F::Fsr:
+        return ConfigureGraphics::tr("Sharpest when stretching a smaller picture, can look "
+                                     "over-sharpened. Shimmers when shrinking.");
+    case F::Fsr3:
+        return ConfigureGraphics::tr("Like FSR 1 with softer sharpening. Shimmers when "
+                                     "shrinking.");
+    case F::Bicubic:
+    case F::ZeroTangent:
+        return ConfigureGraphics::tr("Balanced and sharp when stretching. Shimmers when "
+                                     "shrinking.");
+    case F::Mitchell:
+        return ConfigureGraphics::tr("Smooth with few halos. A little soft.");
+    case F::BSpline:
+        return ConfigureGraphics::tr("Very smooth. Blurry.");
+    case F::Lanczos:
+        return ConfigureGraphics::tr("Very sharp. Halos around bright edges, shimmers when "
+                                     "shrinking.");
+    case F::Spline1:
+        return ConfigureGraphics::tr("Sharp and light. Shimmers when shrinking.");
+    case F::Gaussian:
+        return ConfigureGraphics::tr("Very soft and never shimmers. Blurry.");
+    case F::Bilinear:
+        return ConfigureGraphics::tr("The cheapest. Soft, and shimmers when shrinking.");
+    case F::NearestNeighbor:
+        return ConfigureGraphics::tr("Crisp pixels at exactly 2x or 3x. Blocky otherwise.");
+    case F::Mmpx:
+        return ConfigureGraphics::tr("Made for pixel-art games, not OoT.");
+    case F::Sgsr:
+    case F::SgsrEdge:
+        return ConfigureGraphics::tr("A phone upscaler for Snapdragon chips, not tuned for PCs.");
+    case F::Auto:
+        break;
+    }
+    return {};
+}
+} // Anonymous namespace
+
+void ConfigureGraphics::UpdateWindowFilterNote() {
+    if (filter_note == nullptr || scaling_filter_combobox == nullptr ||
+        scaling_filter_combobox->currentIndex() < 0) {
+        return;
+    }
+    using F = Settings::ScalingFilter;
+    const auto& filters =
+        combobox_translations.at(Settings::EnumMetadata<F>::Index());
+    const auto row = static_cast<size_t>(scaling_filter_combobox->currentIndex());
+    if (row >= filters.size()) {
+        filter_note->clear();
+        return;
+    }
+    const auto filter = static_cast<F>(filters[row].first);
+
+    // The picture OoT shows: the upscaler's output, else the resolution's height.
+    u32 picture = 0;
+    if (!PictureChoicesNow().empty()) {
+        picture = PictureChoices()[CurrentPictureChoice()].output;
+    } else if (resolution_combobox != nullptr && resolution_combobox->currentIndex() >= 0) {
+        Settings::ResolutionScalingInfo info{};
+        Settings::TranslateResolutionInfo(
+            static_cast<Settings::ResolutionSetup>(
+                resolution_combobox->currentData().toUInt()),
+            info);
+        const u32 base = Settings::IsDockedMode() && max_resolution_choice ? 1440U : 1080U;
+        picture = base * info.up_scale >> info.down_shift;
+    }
+    const QScreen* const screen = window() != nullptr ? window()->screen() : nullptr;
+    const u32 screen_height =
+        screen != nullptr ? static_cast<u32>(qRound(screen->size().height() *
+                                                    screen->devicePixelRatio()))
+                          : 0;
+
+    // Bigger or smaller by more than 5%, as the Auto filter decides (present.h).
+    const bool known = picture != 0 && screen_height != 0;
+    const bool bigger = known && picture * 20 > screen_height * 21;
+    const bool smaller = known && picture * 21 < screen_height * 20;
+    const F best = bigger ? F::Area : F::ScaleForce;
+    QString advice;
+    if (bigger) {
+        advice = tr("Your picture (%1) is bigger than your screen (%2): Area looks best.")
+                     .arg(HeightName(picture), HeightName(screen_height));
+    } else if (smaller) {
+        advice = tr("Your picture (%1) is smaller than your screen (%2): ScaleForce looks best, "
+                    "FSR 1 is sharper.")
+                     .arg(HeightName(picture), HeightName(screen_height));
+    } else if (known) {
+        advice = tr("Your picture matches your screen (%1): every filter looks the same.")
+                     .arg(HeightName(screen_height));
+    }
+
+    QString text;
+    if (filter == F::Auto) {
+        text = known ? tr("Auto uses %1 for you now, and switches by itself.")
+                           .arg(bigger ? tr("Area") : tr("ScaleForce"))
+                     : tr("Area when the picture is bigger than your screen, ScaleForce when it "
+                          "is smaller.");
+    } else {
+        text = FilterProsCons(filter);
+    }
+    if (!advice.isEmpty() && (filter == F::Auto || filter == best || !(bigger || smaller))) {
+        text += QStringLiteral("\n") + advice;
+    } else if (!advice.isEmpty()) {
+        text += QStringLiteral("\n") + advice + QStringLiteral(" ") + tr("Or pick Auto.");
+    }
+    filter_note->setText(text);
+}
+
 void ConfigureGraphics::SetupPlainNames(const std::map<u32, QWidget*>& rows) {
     if (!FritchiiUi::Enabled()) {
         return;
@@ -1472,6 +1609,11 @@ void ConfigureGraphics::SetupPlainNames(const std::map<u32, QWidget*>& rows) {
         }
     }
     UpdateOcarinaUpscalerLabels();
+    if (resolution_combobox != nullptr) {
+        connect(resolution_combobox, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+                [this](int) { UpdateWindowFilterNote(); });
+    }
+    UpdateWindowFilterNote();
 }
 
 void ConfigureGraphics::RetrieveVulkanDevices() {
