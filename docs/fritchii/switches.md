@@ -846,40 +846,58 @@ with FRITCHII_JIT_INDIRECT_CACHE=2/3 (the slot array, then the slot's offset in 
 TEST, boot, default 0 (helper FH, 2026-11-19). OoT's zstd decodes run on the host's libzstd
 instead of the game's own zstd 1.4 translated by the JIT. Bit 0 (1) = the resource loaders'
 whole-buffer decode (zstd's decompressMultiFrame inlined at main+0xEB380, the ARes_Loading
-threads); bit 1 (2) = the stream decode wrapper at main+0xF5C80 (ParallelDecompThread, the game's
-buffer-less stream decode); 3 = both. Meant for area loads and streaming (loading screens, load
-hitches); idle in steady play.
-- How: the JIT compiles `brk #0xF7A0`/`#0xF7A1` in place of the function's first word, a
-  `pacibsp` (MemoryReadCode, also for warm and block-list compiles; guest memory unchanged). The
-  breakpoint calls core/arm/dynarmic/host_routines.cpp inside the block, which answers the call
-  (x0 the result, PC = x30) or declines it (PC = entry + 4: the pacibsp is a no-op, so the game's
-  code runs as before). Each site goes in only for main build E0F3CCFA... with all 16 first words
-  as expected ("Host zstd: main+0x... answered on the host" or "... does not match"); never with
-  the debugger on. A call costs one callback and a dispatcher lookup, nothing next to a decode.
+threads); bit 1 (2) = the stream decode (the game's buffer-less stream wrapper at main+0xF5C80,
+ParallelDecompThread); bit 2 (4) = the stream decode in verify mode (see below); 3 = both on the
+host. Meant for area loads and streaming (loading screens, load hitches); idle in steady play.
+- How: the JIT compiles a `brk #0xF7A0+n` in place of one word of the game's code (MemoryReadCode,
+  also for warm and block-list compiles; guest memory unchanged). The breakpoint calls
+  core/arm/dynarmic/host_routines.cpp inside the block, which answers the call or declines it
+  (the replaced word's effect, then the next word). A call costs one callback and a dispatcher
+  lookup, nothing next to a decode. Each site goes in only for main build E0F3CCFA... when its
+  checked words match ("Host zstd: main+0x... (...) hooked" or "... does not match"); never with
+  the debugger on.
+  - Whole-buffer: the BRK replaces the function's first word (a `pacibsp`, a no-op: declining
+    goes on at +4); answered with x0 = the result, PC = x30. Its callers set up a static context
+    in place right before each call and read only the result.
+  - Stream: two sites. The entry (main+0xF5C80, a `pacibsp`) is never answered: it only notes a
+    new frame (state 1) and ends any host stream of an object that starts or ends a frame. The
+    game's code then runs its own frame set-up (header, the static context in the object's
+    workspace, the dictionary, state 2), so the game's context is always one the game made.
+    The loop site (main+0xF5CD0, `cmp w23, #1`, reached from the set-up and from a frame under
+    way) takes a frame from its first byte when the set-up just ran, and answers through the
+    function's own epilogue (main+0xF6084: x19..x30 and the stack restored, w0 returned).
+    Declining sets the flags of that `cmp` and goes on at +4. A frame that began in the game's
+    code stays there; a host frame stays on the host.
 - Exact: the same results as the game's decoder (content size, or zstd's error code; the stream's
-  state, output, room, bytes-to-come and context fields as the game writes them; -1, -2, -3 as
-  the game returns them). The game's DDict is used through a libzstd DDict made from a copy of its
+  state, output, room and bytes-to-come fields as the game writes them; -1, -2, -3 as the game
+  returns them). The game's DDict is used through a libzstd DDict made from a copy of its
   content, kept while the game's DDict (address, content, size, ID, entropy tables) is unchanged
   and taken only when libzstd gives it the game's dictID. Output goes through Memory::WriteBlock,
   so pages the GPU caches track are marked as the game's stores would mark them.
+- Verify mode (4, or 5 with whole-buffer decodes on the host): every stream frame the host could
+  take is decoded on the host into a shadow (no guest write), the game's code decodes it for
+  real, and the next call's entry compares the object's state, output pointer, room and
+  bytes-to-come and the chunk's output bytes with the shadow. Mismatches are logged (the first
+  16, "Host zstd verify mismatch #n ...") and counted in the log line: must be 0.
 - Differences, none for a valid frame: on a decode error the game's output buffer is not written
   (the game's decoder leaves part of it; its callers only test the result); bytes past the
-  content are left as they were (both decoders' fast copies may leave leftovers there); a broken
-  frame may fail with another error code where the game's would (corrupt input only).
+  content are left as they were (both decoders' fast copies may leave leftovers there); the
+  game's staging buffer is not used (only this function reads it); a broken frame may fail with
+  another error code where the game's would (corrupt input only).
 - Left to the game's code (logged once each): a raw dictionary, the magicless format, a
-  dictionary libzstd does not take as the game's, a misaligned workspace, a stream that started
-  as the game's code (it stays there to its end), over 256 MiB in / 512 MiB out, 64 host streams
-  or 1 GiB of stream buffers in use, staged bytes left in the stream object from an earlier
-  frame, host memory running out.
+  dictionary libzstd does not take as the game's, over 256 MiB in / 512 MiB out (whole-buffer) or
+  512 MiB of content / a 64 MiB chunk (stream), 64 host streams or 1 GiB of stream buffers in
+  use, staged bytes left in the stream object from an earlier frame, host memory running out.
 - Cost: a stream keeps a host copy of its frame's content (the window later blocks copy from)
   until it ends; the decoding core is not preemptible while a call runs ("longest call" in the
   log line: a chunk or file of a few MiB is a few ms).
 - Log: "FRITCHII_HOST_ZSTD=n: ..." at boot, the site lines, "Host zstd ... taken" per dictionary,
   and every 10 s while decodes ran: "Host zstd (FRITCHII_HOST_ZSTD=n) whole-buffer|stream: N calls
   on the host, X MiB out in Y ms (longest call Z ms), E errors as the game's, D left to the game's
-  code".
-- Judge: loading screen time and load hitches on the same route, 0 against 3 (boot switch, fresh
-  launches); the picture after each load must be the same.
+  code, verify: C chunks compared, M mismatches in all (must be 0)".
+- Judge: first 5 (verify, must be 0 mismatches), then loading screen time and load hitches on the
+  same route, 0 against 3 (boot switch, fresh launches); the picture after each load must be the
+  same.
 
 ### FRITCHII_JIT_SHARED
 
