@@ -363,6 +363,8 @@ inline std::atomic<int> g_unswizzle_in_place{-1};
 inline std::atomic<int> g_keep_blocks{-1};
 /// FRITCHII_STAGING_RING (boot size, live use, default 0): docs/fritchii/switches.md.
 inline std::atomic<int> g_staging_ring{-1};
+/// FRITCHII_LINK_STATS (live, default 0): docs/fritchii/switches.md.
+inline std::atomic<int> g_link_stats{-1};
 /// FRITCHII_ZERO_UPLOAD (live, default 0): docs/fritchii/switches.md.
 inline std::atomic<int> g_zero_upload{-1};
 /// FRITCHII_HOSTTIMING_SPIN_BUDGET (live, percent, default 0): docs/fritchii/switches.md.

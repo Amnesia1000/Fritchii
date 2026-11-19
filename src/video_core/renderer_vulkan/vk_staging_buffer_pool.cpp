@@ -22,6 +22,7 @@
 #include "video_core/buffer_churn_stats.h"
 #include "video_core/churn_counters.h"
 #include "video_core/gpu_split.h"
+#include "video_core/link_stats.h"
 #include "video_core/memory_stage_link.h"
 #include "video_core/memstage_stats.h"
 #include "video_core/nx2_debug_control.h"
@@ -101,12 +102,43 @@ size_t GetStreamBufferSize(const Device& device) {
     }
     return (std::min)(Common::AlignUp(size, MAX_ALIGNMENT), MAX_STREAM_BUFFER_SIZE);
 }
+
+/// FRITCHII_SIM_BAR_MIB (boot, unset = off, 0 = no room at all): the stream buffers get only this
+/// much device memory the CPU can write; one that doesn't fit lands in host memory, as it does when
+/// the real window is full. The pools ask one after the other while the rasterizer is made.
+[[nodiscard]] bool SimBarFits(VkDeviceSize bytes) {
+    static s64 left = [] {
+        const char* const value = std::getenv("FRITCHII_SIM_BAR_MIB");
+        return value != nullptr ? s64{std::atoi(value)} << 20 : s64{-1};
+    }();
+    if (left < 0) {
+        return true;
+    }
+    if (static_cast<VkDeviceSize>(left) < bytes) {
+        return false;
+    }
+    left -= static_cast<s64>(bytes);
+    return true;
+}
+
+[[nodiscard]] const char* StreamRoleName(StagingBufferPool::StreamRole role) {
+    switch (role) {
+    case StagingBufferPool::StreamRole::Transfers:
+        return "texture and query uploads";
+    case StagingBufferPool::StreamRole::Buffers:
+        return "uniforms and buffer uploads";
+    case StagingBufferPool::StreamRole::Everything:
+        break;
+    }
+    return "all uploads";
+}
 } // Anonymous namespace
 
 // stream_divisor: FRITCHII_MEMSTAGE_SPLIT_ALLOC makes two pools (the buffer cache's and the
 // back's), which split one stream buffer's size between them instead of each taking all of it.
 StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& memory_allocator_,
-                                     Scheduler& scheduler_, u32 stream_divisor)
+                                     Scheduler& scheduler_, u32 stream_divisor,
+                                     StreamRole stream_role)
     : device{device_}, memory_allocator{memory_allocator_}, clock{scheduler_},
       recycler{scheduler_},
       stream_buffer_size{Common::AlignDown(
@@ -129,7 +161,26 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
     if (device.IsBufferDeviceAddressSupported()) {
         stream_ci.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     }
-    stream_buffer = memory_allocator.CreateBuffer(stream_ci, MemoryUsage::Stream);
+    const bool sim_bar_fits = SimBarFits(stream_ci.size);
+    stream_buffer = memory_allocator.CreateBuffer(
+        stream_ci, sim_bar_fits ? MemoryUsage::Stream : MemoryUsage::Upload);
+    {
+        // Where it landed decides who pays for its bytes on a slow link: in device memory the CPU
+        // while writing, in host memory the GPU while reading. It lands in host memory without a
+        // word when the small window is full, so the log says.
+        const auto properties = device.GetPhysical().GetMemoryProperties().memoryProperties;
+        const u32 type = stream_buffer.Location().memory_type;
+        const u32 heap = properties.memoryTypes[type].heapIndex;
+        stream_in_device_memory =
+            (properties.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+        crosses_link = !device.IsIntegrated();
+        LOG_INFO(Render_Vulkan,
+                 "Stream buffer for {}: {} MiB in memory type {} (heap {}, {} MiB), {}{}",
+                 StreamRoleName(stream_role), stream_ci.size >> 20, type, heap,
+                 properties.memoryHeaps[heap].size >> 20,
+                 stream_in_device_memory ? "device memory" : "host memory",
+                 sim_bar_fits ? "" : " (FRITCHII_SIM_BAR_MIB: no room left)");
+    }
     if (device.HasDebuggingToolAttached()) {
         stream_buffer.SetObjectNameEXT("Stream Buffer");
     }
@@ -269,6 +320,31 @@ StagingBufferPool::~StagingBufferPool() = default;
 
 StagingBufferRef StagingBufferPool::Request(size_t size, MemoryUsage usage, bool deferred,
                                             VideoCommon::BufferChurnStats::StagingCaller caller) {
+    StagingBufferRef ref = RequestBuffer(size, usage, deferred, caller);
+    if (VideoCommon::LinkStats::On()) [[unlikely]] {
+        NoteLink(ref, size, usage, caller);
+    }
+    return ref;
+}
+
+void StagingBufferPool::NoteLink(const StagingBufferRef& ref, size_t size, MemoryUsage usage,
+                                 VideoCommon::BufferChurnStats::StagingCaller caller) const {
+    using Path = VideoCommon::LinkStats::Path;
+    if (!crosses_link || usage == MemoryUsage::DeviceLocal) {
+        return;
+    }
+    Path path = Path::GpuReadsHost;
+    if (usage == MemoryUsage::Download) {
+        path = Path::GpuWritesHost;
+    } else if (ref.buffer == *stream_buffer && stream_in_device_memory) {
+        path = Path::CpuWritesDevice;
+    }
+    VideoCommon::LinkStats::Note(path, caller, size);
+}
+
+StagingBufferRef StagingBufferPool::RequestBuffer(
+    size_t size, MemoryUsage usage, bool deferred,
+    VideoCommon::BufferChurnStats::StagingCaller caller) {
     if (cache_side) {
         VideoCommon::MemoryStageLink::CheckCacheUser(VideoCommon::MemoryStageLink::Check::StagingUser);
     }
@@ -307,6 +383,9 @@ StagingBufferRef StagingBufferPool::GetStreamBuffer(
                          (std::min)(Region(iterator + size) + 1, NUM_SYNCS))) {
         // EDEN_NX2_MEMSTAGE_STATS: the stream ring is busy (the memory stage's join 3).
         VideoCommon::MemStageStats::StreamFull();
+        if (VideoCommon::LinkStats::On()) [[unlikely]] {
+            VideoCommon::LinkStats::NoteStreamFull();
+        }
         // Memory stage step 7: on GPUMem with the window open the busy regions may be stamped
         // with packets not played yet; they are never waited for, a new buffer is taken (counted).
         VideoCommon::MemoryStageLink::NoteStagingFallback();
@@ -343,6 +422,9 @@ StagingBufferRef StagingBufferPool::GetStreamBuffer(
 
         if (AreRegionsActive(0, Region(size) + 1)) {
             VideoCommon::MemStageStats::StreamFull();
+            if (VideoCommon::LinkStats::On()) [[unlikely]] {
+                VideoCommon::LinkStats::NoteStreamFull();
+            }
             VideoCommon::MemoryStageLink::NoteStagingFallback();
             // Avoid waiting for the previous usages to be free
             return GetStagingBuffer(size, MemoryUsage::Upload, false, caller, true);

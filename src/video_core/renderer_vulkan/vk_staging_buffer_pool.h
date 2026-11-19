@@ -38,9 +38,17 @@ class StagingBufferPool {
 public:
     static constexpr size_t NUM_SYNCS = 16;
 
+    /// What this pool's stream buffer carries, for its boot log line.
+    enum class StreamRole {
+        Everything, ///< one pool for everything (no split allocators)
+        Transfers,  ///< the texture cache's and the back's uploads: only ever copied from
+        Buffers,    ///< the buffer cache's: uniforms the shaders read straight from it, uploads
+    };
+
     /// `stream_divisor`: the stream buffer is its usual size divided by this.
     explicit StagingBufferPool(const Device& device, MemoryAllocator& memory_allocator,
-                               Scheduler& scheduler, u32 stream_divisor = 1);
+                               Scheduler& scheduler, u32 stream_divisor = 1,
+                               StreamRole stream_role = StreamRole::Everything);
     ~StagingBufferPool();
 
     /// `caller`: who asks, counted when a buffer has to be created (EDEN_NX2_BUFFER_CHURN_STATS).
@@ -133,6 +141,13 @@ private:
     static constexpr size_t NUM_LEVELS = sizeof(size_t) * CHAR_BIT;
     using StagingBuffersCache = std::array<StagingBuffers, NUM_LEVELS>;
 
+    /// Request without the link accounting.
+    StagingBufferRef RequestBuffer(size_t size, MemoryUsage usage, bool deferred,
+                                   VideoCommon::BufferChurnStats::StagingCaller caller);
+    /// FRITCHII_LINK_STATS / FRITCHII_SIM_LINK: how this request's bytes cross the link.
+    void NoteLink(const StagingBufferRef& ref, size_t size, MemoryUsage usage,
+                  VideoCommon::BufferChurnStats::StagingCaller caller) const;
+
     StagingBufferRef GetStreamBuffer(size_t size,
                                      VideoCommon::BufferChurnStats::StagingCaller caller);
 
@@ -186,6 +201,8 @@ private:
     BufferRecycler recycler;
 
     vk::Buffer stream_buffer;
+    bool stream_in_device_memory{}; ///< the CPU's writes into it cross the link
+    bool crosses_link{};            ///< a discrete GPU: host and device memory are apart
     VkDeviceAddress stream_buffer_address{};
     std::span<u8> stream_pointer;
     VkDeviceSize stream_buffer_size;

@@ -30,6 +30,7 @@
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
+#include "video_core/link_stats.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 #include "video_core/one_follower.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
@@ -96,6 +97,9 @@ public:
     }
 
     void Sync(size_t start, size_t size) {
+        if (VideoCommon::LinkStats::On()) [[unlikely]] {
+            VideoCommon::LinkStats::NoteQueryResults(size);
+        }
         const auto& dev = device.GetLogical();
         const VkResult query_result = dev.GetQueryResults(
             *query_pool, static_cast<u32>(start), static_cast<u32>(size), sizeof(u64) * size,
