@@ -1322,8 +1322,8 @@ void MainWindow::InitializeWidgets() {
     shader_warm_label = new QLabel();
     shader_warm_label->setToolTip(
         tr("Shaders prepared ahead of time so the game stutters less when it first uses them.\n"
-           "It never slows the game down: it builds while the game is paused, or right away "
-           "from Emulation > Prepare Shaders Now."));
+           "It builds while the game is paused. Emulation > Prepare Shaders Now builds right "
+           "away, and the game can slow down until it's done."));
     shader_building_label = new QLabel();
     shader_building_label->setToolTip(tr("The amount of shaders currently being built"));
     res_scale_label = new QLabel();

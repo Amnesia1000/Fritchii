@@ -129,11 +129,14 @@ bool OcarinaRenderStepsSwitch() {
 }
 
 bool OcarinaRenderHeightOffered(u32 height) {
+    // The heights every player gets. To release one (540 and 360 are next), add it here: the
+    // picture menu, its "Below ..." line and the render patch all follow this list.
     // 1280x720, 1920x1080 and 2560x1440 are the sizes the game is known to draw exactly. The
     // others are exact scales too (0.25, 0.375, 0.5625, 0.625, 0.875), but the game may round
     // its scene to a padded target as it does at 0.871 (2276x1280 in 2288x1280), which the
     // upscaler does not take: only with FRITCHII_OOT_RENDER_STEPS until a run shows their sizes.
-    if (height == 720 || height == 1080 || height == 1440) {
+    constexpr std::array<u32, 3> released{720, 1080, 1440};
+    if (std::find(released.begin(), released.end(), height) != released.end()) {
         return true;
     }
     return OcarinaRenderStepsSwitch() &&

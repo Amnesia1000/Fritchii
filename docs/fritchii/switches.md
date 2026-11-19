@@ -5938,7 +5938,8 @@ TEST, off by default (boot). 1 = the picture menu's Resolution (and oot_render_h
 0.625, 0.875 of 2560x1440), docked, Max Resolution on, DLSS or FSR picked. Off, those heights are
 ignored and the game draws 1440p. They stay behind the switch until a run shows the game draws
 them exactly: a line "no scene camera this frame: the camera's extent isn't the target's" means
-the game padded the size and its own upscale draws instead.
+the game padded the size and its own upscale draws instead. To release a height to everyone, add
+it to the list in `OcarinaRenderHeightOffered` (settings.cpp): the menu follows.
 
 Below 720p the output is at most 3x the scene: Auto is 1080p (not 4K), 540p can go to 1440p with
 FSR, 360p makes 1080p only. DLSS gets 1080p only, its exact modes (540p Performance, 360p Ultra
