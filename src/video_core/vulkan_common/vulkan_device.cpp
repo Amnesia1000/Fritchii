@@ -1023,6 +1023,10 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         RemoveExtensionFeature(extensions.descriptor_buffer, features.descriptor_buffer,
                                VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
     }
+    // FRITCHII_OCCL_FLAG: the session's value (a switch, else the Occlusion speed-up setting),
+    // read once per game boot.
+    const bool occl_flag_wanted = VideoCommon::OcclFlag::ReadAtBoot(
+        VideoCommon::OcclFlag::FromSetting(Settings::values.occlusion_speedup.GetValue()));
 #ifdef EGLANTINE_STREAMLINE
     // NVIDIA's DLSS needs buffer device addresses: keep the feature enabled for
     // it, but leave the emulator's own buffers as they are without descriptor buffers.
@@ -1032,7 +1036,7 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         extensions.buffer_device_address = false;
     } else
 #endif
-    if (!extensions.descriptor_buffer && VideoCommon::OcclFlag::WantedAtBoot() &&
+    if (!extensions.descriptor_buffer && occl_flag_wanted &&
         instance_version >= VK_API_VERSION_1_2 &&
         features.buffer_device_address.bufferDeviceAddress) {
         // FRITCHII_OCCL_FLAG: the flag pipelines store through buffer device addresses. As for
@@ -1046,7 +1050,7 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     }
     // FRITCHII_OCCL_FLAG: whichever branch ran, the feature is still enabled when it was not
     // removed (the DLSS branch keeps it too).
-    if (VideoCommon::OcclFlag::WantedAtBoot()) {
+    if (occl_flag_wanted) {
         occl_flag_device_address = instance_version >= VK_API_VERSION_1_2 &&
                                    features.buffer_device_address.bufferDeviceAddress != 0;
         LOG_INFO(Render_Vulkan,

@@ -173,6 +173,9 @@ ENUM(HybridCpuPlacement, Automatic, PinGpu);
 // Ocarina of Time's frame rate cap with its high refresh rate mode on (Settings oot_high_refresh).
 // New values go at the end: saved configs store the index.
 ENUM(OotRefreshCap, Display, Hz90, Hz120, Hz144, Hz165, Unlimited);
+// Occlusion tests without host queries in Ocarina of Time (Settings occlusion_speedup,
+// FRITCHII_OCCL_FLAG). New values go at the end: saved configs store the index.
+ENUM(OcclusionSpeedup, Off, Standard, Full);
 // Ocarina of Time's texture LOD bias while DLSS or FSR upscales (Settings oot_texture_sharpness).
 ENUM(OotTextureSharpness, Auto, Sharper, Custom);
 

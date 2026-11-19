@@ -449,7 +449,8 @@ private:
     /// FRITCHII_OCCL_FLAG: full's flag variant, translated now (one a frame, shared with the
     /// lean siblings) from the draw's environments; null when not available yet. Sets
     /// full.occl_flag_state to 2 when it cannot be made.
-    GraphicsPipeline* FindOrMakeOcclFlag(GraphicsPipeline& full);
+    /// `kind`: 1 host flag program, 2 colour, 3 pre-pass (GraphicsPipeline::occl_flag_kind).
+    GraphicsPipeline* FindOrMakeOcclFlag(GraphicsPipeline& full, u8 kind = 1);
     /// FRITCHII_OCCL_LEAN: frame_count of the last sibling translation (one a frame).
     u64 occl_made_frame{~u64{0}};
 

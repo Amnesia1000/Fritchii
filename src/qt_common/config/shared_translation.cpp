@@ -339,6 +339,9 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Caps Ocarina of Time at 30 FPS. The game keeps its normal speed. Takes effect at "
               "once; the 60 FPS / 30 FPS button in the status bar switches it too."));
     INSERT(Settings, oot_high_refresh, QString(), QString());
+    INSERT(Settings, occlusion_speedup, tr("OoT occlusion speed-up:"),
+           tr("Lets OoT skip slow GPU checks for hidden things.\nFull skips more and can give more "
+              "fps on AMD cards.\nTakes effect when the game starts."));
     INSERT(Settings, oot_high_refresh_cap, tr("OoT: high refresh rate (experimental)"),
            tr("Lets Ocarina of Time run above 60 FPS, up to the chosen cap, at its normal speed. "
               "Untested in much of the game: timers, cutscenes or minigames may run off. Takes "
@@ -635,6 +638,12 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(OotAntiAliasing, NoSharpening, tr("No sharpening")),
                               PAIR(OotAntiAliasing, Fsr3, tr("AMD FSR 3.1")),
                               PAIR(OotAntiAliasing, Fsr4, tr("AMD FSR 4")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::OcclusionSpeedup>::Index(),
+                          {
+                              PAIR(OcclusionSpeedup, Off, tr("Off")),
+                              PAIR(OcclusionSpeedup, Standard, tr("Standard")),
+                              PAIR(OcclusionSpeedup, Full, tr("Full")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::OotRefreshCap>::Index(),
                           {
