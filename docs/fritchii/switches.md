@@ -843,7 +843,7 @@ with FRITCHII_JIT_INDIRECT_CACHE=2/3 (the slot array, then the slot's offset in 
 
 ### FRITCHII_HOST_ZSTD
 
-TEST, boot, default 0 (helper FH, 2026-11-19). OoT's zstd decodes run on the host's libzstd
+Boot, built in at 3 since 6.2 (helper FH, 2026-11-19; 0 turns it off). OoT's zstd decodes run on the host's libzstd
 instead of the game's own zstd 1.4 translated by the JIT. Bit 0 (1) = the resource loaders'
 whole-buffer decode (zstd's decompressMultiFrame inlined at main+0xEB380, the ARes_Loading
 threads); bit 1 (2) = the stream decode (the game's buffer-less stream wrapper at main+0xF5C80,
