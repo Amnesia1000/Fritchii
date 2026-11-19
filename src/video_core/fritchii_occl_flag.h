@@ -27,23 +27,17 @@
 /// flag area. A window with other counted draws splits into flag and query slots (summed).
 namespace VideoCommon::OcclFlag {
 
-/// 3 (TEST): on without the colour flag variants (only colour-off draws take flag pipelines),
-/// to measure what the colour variants add.
-/// 4 (COST PROBE, wrong picture possible): as 3, and colour-off draws whose pixel program
-/// discards take the host flag variant too (no discard, no query): what their queries cost.
-/// 5 (TEST): as 3 (no colour variants), with the pre-pass for discarding draws (1 and 2 have it
-/// too), to measure what the pre-pass adds.
+/// 1 on: flag variants for colour-off Lean draws, colour flag variants, the pre-pass for
+/// discarding colour-off draws and the colour pre-pass. 2 verify: the same flag stores, the host
+/// queries still decide (and are compared). The A/B values (each as 1 without one part, the
+/// picture stays exact): 3 colour-off flag variants only (no colour variants, no pre-passes),
+/// 5 as 3 with the discard pre-pass, 8 as 1 without the colour pre-pass. Other values are off.
 enum Value : int {
     Off = 0,
     On = 1,
     Verify = 2,
     OnColourOff = 3,
-    ProbeDiscards = 4,
     OnPrepassOnly = 5,
-    /// 6 (COST PROBE, the picture can change): as 1, and colour Lean draws with subgroup
-    /// operations take the colour flag variant too (early tests can change their results).
-    ProbeSubgroup = 6,
-    /// 8 (TEST): as 1 without the colour pre-pass, to measure what it adds.
     OnNoColourPrepass = 8,
 };
 
@@ -55,8 +49,8 @@ enum Value : int {
 [[nodiscard]] inline int Mode() noexcept {
     const int value = RawMode();
     return value == Verify                                                     ? Verify
-           : (value == On || value == OnColourOff || value == ProbeDiscards ||
-              value == OnPrepassOnly || value == ProbeSubgroup || value == OnNoColourPrepass)
+           : (value == On || value == OnColourOff || value == OnPrepassOnly ||
+              value == OnNoColourPrepass)
                ? On
                : Off;
 }
@@ -64,15 +58,14 @@ enum Value : int {
 /// Counted colour-off draws whose program discards may take the flag pre-pass (1, 2, 5).
 [[nodiscard]] inline bool PrepassAllowed() noexcept {
     const int value = RawMode();
-    return value == On || value == Verify || value == OnPrepassOnly || value == ProbeSubgroup ||
+    return value == On || value == Verify || value == OnPrepassOnly ||
            value == OnNoColourPrepass;
 }
 
 /// Colour-writing counted draws may take the colour flag variant (not with =3).
 [[nodiscard]] inline bool ColourAllowed() noexcept {
     const int value = RawMode();
-    return value == On || value == Verify || value == ProbeSubgroup ||
-           value == OnNoColourPrepass;
+    return value == On || value == Verify || value == OnNoColourPrepass;
 }
 
 /// Colour Lean draws the colour variant cannot take (subgroup or quad operations) may take the

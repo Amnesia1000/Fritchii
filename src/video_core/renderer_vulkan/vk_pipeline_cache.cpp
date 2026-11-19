@@ -3937,10 +3937,7 @@ GraphicsPipeline* PipelineCache::OcclFlagPipeline(GraphicsPipeline* pipeline,
             OcclFlag::Add(stats.sg_invocation_id, pixel.uses_subgroup_invocation_id ? 1 : 0);
             OcclFlag::Add(stats.sg_helper, pixel.uses_is_helper_invocation ? 1 : 0);
         }
-        const bool probe_subgroup = colour_verdict == Census::ColourSubgroup &&
-                                    OcclFlag::RawMode() == OcclFlag::ProbeSubgroup;
-        if ((colour_verdict == Census::Flag || probe_subgroup) &&
-            pipeline->occl_flag_colour_state != 2 &&
+        if (colour_verdict == Census::Flag && pipeline->occl_flag_colour_state != 2 &&
             OcclFlag::ColourAllowed() && device.IsShaderInt64Supported()) {
             GraphicsPipeline* colour = pipeline->occl_flag_colour.get();
             if (colour == nullptr && allow_make) {
@@ -4055,10 +4052,8 @@ GraphicsPipeline* PipelineCache::OcclFlagPipeline(GraphicsPipeline* pipeline,
             return pipeline;
         }
     }
-    const bool probe_discards = OcclFlag::RawMode() == OcclFlag::ProbeDiscards &&
-                                pipeline_class == PipelineClass::Discards;
-    if ((pipeline_class != PipelineClass::Lean && !probe_discards) ||
-        pipeline->IsMeshPipeline() || pipeline->occl_flag_state == 2) {
+    if (pipeline_class != PipelineClass::Lean || pipeline->IsMeshPipeline() ||
+        pipeline->occl_flag_state == 2) {
         switch (pipeline->occl_flag_state == 2 ? PipelineClass::Failed
                 : pipeline->IsMeshPipeline()     ? PipelineClass::Mesh
                                                  : pipeline_class) {

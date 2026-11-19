@@ -2871,9 +2871,57 @@ Measured (RX 9070 XT over OCuLink x4, ReBAR off, Core Ultra 7 255H; OoT market f
 Risks and limits: a flag variant writes no colour by construction; a draw whose regs or pipeline
 fall outside the Lean class keeps its query. The GPU-side value of a window with several slots goes
 through the existing prefix scan, as windows split by a render pass already do; OoT's 0xe2c
-reads the CPU-written value. No flag area on Qualcomm, ARM or Turnip drivers. The flag area lives in system memory (fragment
-stores cross PCIe; the counts above include that). Not tested on NVIDIA or Intel, nor with one
-follower on. Not with the memory-stage ring (facts are the parent's key, but not checked).
+reads the CPU-written value. No flag area on Qualcomm, ARM or Turnip drivers. The flag area is in
+device-local memory (see above). Not tested on NVIDIA or Intel, nor with one follower on. Not with
+the memory-stage ring (facts are the parent's key, but not checked).
+
+#### Colour variants and pre-passes (2026-11-18, part of =1 and =2)
+
+Mode 1 and verify also cover counted draws that keep their queries otherwise:
+- Colour flag variant: a colour-writing draw whose pixel program is Lean and uses no subgroup,
+  quad or helper operations (and no alpha to coverage) draws with its guest pixel program
+  translated with RuntimeInfo::occl_flag_store: early fragment tests and, at the start of main,
+  the flag store through the buffer device address in push constant bytes 40..47 (a u64 member of
+  the program's rescaling or render area block, or a block of its own; PhysicalStorageBuffer64,
+  Int64; the store is in a function of its own and runs only while the slot reads 0). Programs
+  without the option are byte-identical. Needs shaderInt64.
+- Discard pre-pass: a counted colour-off draw whose pixel program discards (otherwise Lean, no
+  subgroup/quad/helper operations) is drawn twice: first a variant (the guest pixel program with
+  early fragment tests and the flag store at the end of main, after the discards:
+  RuntimeInfo::occl_flag_store_at_end) with depth writes off, then the draw itself with its own
+  pipeline bound again (GraphicsPipeline::ConfigureAfterOcclPrepass: the variant's descriptors
+  and push constants for this draw). The pre-pass tests the depth before the draw; with a
+  monotonic compare "some sample passed and was not discarded" is the same.
+- Colour pre-pass: a counted colour draw whose pixel program is Lean but uses subgroup or quad
+  operations is drawn first with the host flag program, colour and depth writes off (with
+  extended dynamic state 3 blending the dynamic masks are cleared; without it, dyna_state 2, a
+  host variant whose key has every attachment's writes off), then as it is.
+- Both pre-passes only where the draw can be recorded twice and nothing in it can differ: not for
+  indirect or list draws, the delta path or draw counting, frame dump probes; not with stencil
+  writes, depth bounds, transform feedback, stores in any stage, mandated early Z (discard
+  pre-pass), EQUAL, or NOTEQUAL with depth writes; dynamic depth writes needed. A variant whose
+  translation's descriptors differ from its pipeline's is refused. In mode 1 a host query
+  already open in the window counts the real draw (no pre-pass); verify ends the open query
+  around the pre-pass so it compares the pre-pass flag with the real draw's count.
+- Test values (exact picture, for A/B): 3 colour-off flag variants only, 5 as 3 with the discard
+  pre-pass, 8 as 1 without the colour pre-pass.
+
+Logs: the flag line adds "colour flag draws, colour flag pipelines made; pre-pass draws (between
+host queries, skipped: a host query open), made, refused at the draw, refused for their
+descriptors, real draws lost (must be 0); colour pre-pass draws". The census line adds the
+discarding draws' writes and the subgroup operations of colour Lean draws refused for them.
+
+Test switches (development): FRITCHII_OCCL_FLAG_DUMP=<folder> writes the first 64 colour or
+pre-pass flag pixel programs; FRITCHII_SPIRV_DUMP_DISCARD=<folder> the first 200 discarding
+programs emitted; FRITCHII_TEST_KILL_FALLBACK=1 translates new programs with the backend's
+no-demote path (OpKill). Hang reports keep 64 GPU breadcrumbs (was 8).
+
+Measured (same rig, alternating rounds): verify about 235,000-360,000 reports with the
+pre-passes, 0 disagreements, no real draws lost; host query slots ~36,000 -> ~14,500 a second;
+=1 vs =3 frame time -0.6 to -1.0 ms. One GPU hang (device lost) under PCIe load in about 50
+loaded windows with the pre-passes, not reproduced since (22 min playtest and ~30 more windows
+clean); cause unknown. Flag variants are not in the disk cache: each session translates them again
+on the GPU thread (one a frame) and the driver compiles them on the workers.
 
 ### EDEN_NX2_GPU_PROFILE=2: E's draw method zones (helper CP)
 
