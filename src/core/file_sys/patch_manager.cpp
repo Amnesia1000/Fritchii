@@ -565,7 +565,7 @@ constexpr std::array<u8, 56> SOUND_FEED{
     0x10, 0xC6, 0x4C, 0xB9, 0xF1, 0x09, 0x90, 0x52, 0xB1, 0x9A, 0xB2, 0x72,
     0x1F, 0x02, 0x11, 0x6B, 0xF0, 0x47, 0xC1, 0xA8, 0xA1, 0x00, 0x00, 0x54,
     0xF0, 0x0F, 0x9F, 0x3C, 0x10, 0x10, 0x2E, 0x1E, 0x00, 0x68, 0x30, 0x1E,
-    0xF0, 0x07, 0xC1, 0x3C, 0xB5, 0x3B, 0x1F, 0x17, // b 0x415338
+    0xF0, 0x07, 0xC1, 0x3C, 0x50, 0xE4, 0x6C, 0x17, // b 0x177f5a4 (HR_SOUND_COUNT, then 0x415338)
 };
 
 // Step counters: three counters cut the step or count frames. The ocarina playback tick adds
@@ -885,6 +885,56 @@ constexpr std::array<u8, 68> HR_HORSE_STUB{
     0x8E, 0xD0, 0xBF, 0x17, 0x96, 0xD0, 0xBF, 0x17,
 };
 
+// Song notes: after a song is played, its playback (main+0x3292AF0) goes on to the next note on
+// each update it finds the note flag set (f_832b7b50's result, w0), a word the sound engine sets
+// when the melody reaches a note and clears on its next run. SOUND_GATE runs the sound job at
+// 60 Hz above 60 fps, so the playback found the flag set on two or three updates in a row and
+// showed that many notes at once, ahead of the music. The same holds for the ocarina's other
+// melody playback (main+0x3292DC0). HR_SOUND_COUNT counts the sound job's runs (SOUND_FEED's way
+// back now goes through it, in both modes); each playback keeps the count at its last set read,
+// and a flag read set again before another run reads clear. Only in the high refresh mode; at
+// 60 fps and below the job runs every frame, so every once-a-frame read sees a new count and the
+// game's value. The two tbz w0, #0 after the calls (main+0x3292C88, 0x3292ED4) go to small stubs
+// that save x16/x17 and call HR_SONG_CUE with the playback's slot (0 or 4) in w17.
+//   stub: save ; w17 = slot ; bl HR_SONG_CUE ; restore ; tbz w0, #0, clear ; b set ; clear: b ...
+//   HR_SONG_CUE: w0 clear or call word not ours: ret ; runs = [state + 8] ; old = [state + w17] ;
+//                [state + w17] = runs ; old == runs: w0 = 0 ; ret (x14, x15 saved)
+//   HR_SOUND_COUNT: save x16, x17 ; [state + 8] += 1 ; restore ; b 0x415338
+// HR_SONG_B_STUB and HR_SOUND_COUNT sit in two of the 28-byte gaps between the game's functions
+// (main+0x177F364, 0x177F5A4), past the ones mods are known to claim (to main+0x177D1C0).
+constexpr std::array<u8, 28> HR_SONG_A_STUB{
+    0xF0, 0x47, 0xBF, 0xA9, 0x11, 0x00, 0x80, 0x52, 0x73, 0x01, 0x00, 0x94,
+    0xF0, 0x47, 0xC1, 0xA8, 0x40, 0x00, 0x00, 0x36, 0xA6, 0x30, 0xD9, 0x17,
+    0xA7, 0x30, 0xD9, 0x17,
+};
+constexpr std::array<u8, 28> HR_SONG_B_STUB{
+    0xF0, 0x47, 0xBF, 0xA9, 0x91, 0x00, 0x80, 0x52, 0x12, 0x1F, 0x93, 0x94,
+    0xF0, 0x47, 0xC1, 0xA8, 0x40, 0x00, 0x00, 0x36, 0xD8, 0x4E, 0x6C, 0x14,
+    0x32, 0x4F, 0x6C, 0x14,
+};
+constexpr std::array<u8, 72> HR_SONG_CUE{
+    0xEE, 0x3F, 0xBF, 0xA9, 0xE0, 0x01, 0x00, 0x36, 0x0E, 0x55, 0xFE, 0x90,
+    0xCE, 0xC5, 0x4C, 0xB9, 0xEF, 0x09, 0x90, 0x52, 0xAF, 0x9A, 0xB2, 0x72,
+    0xDF, 0x01, 0x0F, 0x6B, 0x21, 0x01, 0x00, 0x54, 0xD0, 0x92, 0x00, 0x90,
+    0x10, 0x42, 0x3E, 0x91, 0x0E, 0x0A, 0x40, 0xB9, 0x0F, 0x6A, 0x71, 0xB8,
+    0x0E, 0x6A, 0x31, 0xB8, 0xFF, 0x01, 0x0E, 0x6B, 0x41, 0x00, 0x00, 0x54,
+    0xE0, 0x03, 0x1F, 0x2A, 0xEE, 0x3F, 0xC1, 0xA8, 0xC0, 0x03, 0x5F, 0xD6,
+};
+constexpr std::array<u8, 28> HR_SOUND_COUNT{
+    0xF0, 0x47, 0xBF, 0xA9, 0xF0, 0xB8, 0x01, 0xF0, 0x11, 0x9A, 0x4F, 0xB9,
+    0x31, 0x06, 0x00, 0x11, 0x11, 0x9A, 0x0F, 0xB9, 0xF0, 0x47, 0xC1, 0xA8,
+    0x5F, 0x57, 0xB2, 0x17,
+};
+constexpr size_t HR_SONG_STATE_OFFSET = HR_FIX_STATE_OFFSET + 0x190; // u32 A, u32 B, u32 runs
+static_assert(AdrpTarget(0x3C46FB4 + 0x20, InstructionAt(HR_SONG_CUE, 0x20)) +
+                  AddImmediate(InstructionAt(HR_SONG_CUE, 0x24)) ==
+              HR_SONG_STATE_OFFSET);
+static_assert(AdrpTarget(0x177F5A4 + 0x4, InstructionAt(HR_SOUND_COUNT, 0x4)) +
+                  ((InstructionAt(HR_SOUND_COUNT, 0x8) >> 10) & 0xFFF) * 4 ==
+              HR_SONG_STATE_OFFSET + 8);
+static_assert(InstructionAt(SOUND_FEED, 0x34) == EncodeBl(0x3C46464, 0x177F5A4) - 0x80000000U &&
+              InstructionAt(HR_SOUND_COUNT, 0x18) == EncodeBl(0x177F5BC, 0x415338) - 0x80000000U);
+
 // The hooks (each checked to hold the game's word), then the stubs in address order.
 constexpr std::array HR_FIX_HOOKS{
     OotFixHook{0x415300, {0x28, 0xC4, 0xE0, 0x14}, 0xD503237F}, // pacibsp -> b 0x3c463a0
@@ -930,6 +980,10 @@ constexpr std::array HR_FIX_HOOKS{
                "FRITCHII_NO_HR_SOLVER"},
     OotFixHook{0x2C3AE20, {0x64, 0x2F, 0x40, 0x14}, 0x54000145, // b.pl 0x2c3ae48 -> b 0x3c46bb0
                "FRITCHII_NO_HR_HORSE"},
+    OotFixHook{0x3292C88, {0x56, 0xCF, 0x26, 0x14}, 0x36000060, // tbz w0, #0 -> b 0x3c469e0
+               "FRITCHII_NO_HR_SONG"},
+    OotFixHook{0x3292ED4, {0x24, 0xB1, 0x93, 0x17}, 0x36000B80, // tbz w0, #0 -> b 0x177f364
+               "FRITCHII_NO_HR_SONG"},
 };
 constexpr std::array HR_FIX_STUBS{
     OotFixStub{0x3C463A0, SOUND_GATE},
@@ -952,16 +1006,35 @@ constexpr std::array HR_FIX_STUBS{
     OotFixStub{0x3C469B0, HR_TIME_STUB},
     OotFixStub{0x3C469C4, HR_WEB_STUB},
     OotFixStub{0x3C469D8, HR_SOLVER_CONSTANTS},
+    OotFixStub{0x3C469E0, HR_SONG_A_STUB},
     OotFixStub{0x3C46AAC, HR_SOLVER},
 };
+// Stubs in the gaps between the game's functions (the free 28-byte ones past main+0x177D1C0).
+constexpr std::array HR_FIX_SLOT_STUBS{
+    OotFixStub{0x177F364, HR_SONG_B_STUB},
+    OotFixStub{0x177F5A4, HR_SOUND_COUNT},
+};
+static_assert([] {
+    size_t end = 0x177D1C0;
+    for (const OotFixStub& stub : HR_FIX_SLOT_STUBS) {
+        if (stub.offset < end || stub.offset % 4 != 0 || stub.bytes.size() > 28 ||
+            stub.offset + stub.bytes.size() > 0x177F6A8) {
+            return false;
+        }
+        end = stub.offset + stub.bytes.size();
+    }
+    return true;
+}());
 // Stubs past the pickup stub, also in address order.
 constexpr std::array HR_FIX_LATE_STUBS{
     OotFixStub{0x3C46BB0, HR_HORSE_STUB},
     OotFixStub{HR_WHOLE_OFFSET, HR_WHOLE},
+    OotFixStub{0x3C46FB4, HR_SONG_CUE},
 };
 // The sound accumulator and flag at +0, the step slots' index at +8, the 15 slots from +0x10, and
-// from +0x100 HR_WHOLE's 8 slots and its next-slot word.
-constexpr size_t HR_FIX_STATE_SIZE = 0x190;
+// from +0x100 HR_WHOLE's 8 slots and its next-slot word, from +0x190 the song notes' two slots and
+// the sound job's run count.
+constexpr size_t HR_FIX_STATE_SIZE = 0x1A0;
 // The stubs in order, in free padding between the Hyrule Cheat Menu and the pickup stub; their
 // state inside the BSS, clear of Dark's timer state, the ripple and pickup slots and the cheats'
 // flags from main+0x4E9FF80. Known cheats write their own code to main+0x3C46A00..0x3C46AAC and
@@ -1008,7 +1081,8 @@ static_assert([] {
 static_assert(HR_FIX_STATE_OFFSET >= 0x4E9B000 &&
               HR_FIX_STATE_OFFSET + HR_FIX_STATE_SIZE <= HIGH_REFRESH_STATE_OFFSET &&
               HR_FIX_STATE_OFFSET + HR_FIX_STATE_SIZE <= PICKUP_STATE_OFFSET &&
-              HR_WHOLE_SLOTS_OFFSET + 0x84 <= HR_FIX_STATE_OFFSET + HR_FIX_STATE_SIZE);
+              HR_WHOLE_SLOTS_OFFSET + 0x84 <= HR_SONG_STATE_OFFSET &&
+              HR_SONG_STATE_OFFSET + 0xC <= HR_FIX_STATE_OFFSET + HR_FIX_STATE_SIZE);
 // Stub words with a second form a test switch puts back: the stub's word applies unless the switch
 // is 1, the old word only while it is 1.
 struct OotFixVariant {
@@ -1042,6 +1116,9 @@ constexpr size_t HR_FIX_RECORD_COUNT = HR_FIX_HOOKS.size() + HR_FIX_VARIANTS.siz
     for (const OotFixStub& stub : HR_FIX_LATE_STUBS) {
         words += stub.bytes.size() / 4;
     }
+    for (const OotFixStub& stub : HR_FIX_SLOT_STUBS) {
+        words += stub.bytes.size() / 4;
+    }
     return words;
 }();
 constexpr auto HR_FIX_RECORDS = [] {
@@ -1073,6 +1150,7 @@ constexpr auto HR_FIX_RECORDS = [] {
     };
     add_stubs(HR_FIX_STUBS);
     add_stubs(HR_FIX_LATE_STUBS);
+    add_stubs(HR_FIX_SLOT_STUBS);
     for (const OotFixVariant& variant : HR_FIX_VARIANTS) {
         records[i++] = BuiltinPatchRecord{.module_offset = variant.offset,
                                           .bytes = variant.old_bytes,

@@ -772,6 +772,8 @@ TEST_CASE("High refresh fixes built-in hooks its sites in both modes", "[patch_m
         Hook{0x38AEBF4, 0x1E380001, 0x940E5FAE}, // solver steps -> bl 0x3c46aac
         Hook{0x38AFD20, 0x1E380001, 0x940E5B63}, // solver steps -> bl 0x3c46aac
         Hook{0x2C3AE20, 0x54000145, 0x14402F64}, // Epona's jump b.pl -> b 0x3c46bb0
+        Hook{0x3292C88, 0x36000060, 0x1426CF56}, // song notes, playback -> b 0x3c469e0
+        Hook{0x3292ED4, 0x36000B80, 0x1793B124}, // song notes, the other playback -> b 0x177f364
     };
     // Each stub's first and last word.
     struct Stub {
@@ -782,7 +784,7 @@ TEST_CASE("High refresh fixes built-in hooks its sites in both modes", "[patch_m
     };
     constexpr std::array Stubs{
         Stub{0x3C463A0, 0x88, 0xA9BF47F0, 0xD65F03C0}, // sound gate: stp x16, x17 ... ret
-        Stub{0x3C46430, 0x38, 0xBD401100, 0x171F3BB5}, // sound feed: ldr s0 ... b 0x415338
+        Stub{0x3C46430, 0x38, 0xBD401100, 0x176CE450}, // sound feed: ldr s0 ... b 0x177f5a4 (run count)
         Stub{0x3C46470, 0x88, 0xADBF07E0, 0xD65F03C0}, // step ticks: stp q0, q1 ... ret
         Stub{0x3C46500, 0x50, 0xA9BF47F0, 0x17D933B2}, // playback ... b 0x3293414
         Stub{0x3C46550, 0x60, 0xA9BF47F0, 0x17CC3330}, // countdown ... b 0x2f5326c
@@ -801,9 +803,13 @@ TEST_CASE("High refresh fixes built-in hooks its sites in both modes", "[patch_m
         Stub{0x3C469B0, 0x14, 0x9100F26D, 0x171E1D81}, // time of day: add x13 ... b 0x3cdfc4
         Stub{0x3C469C4, 0x14, 0x9123E26D, 0x1727B0CC}, // Deku Tree web: add x13 ... b 0x632d04
         Stub{0x3C469D8, 0x8, 0x3A83126F, 0x3DCCCCCD},  // the solver's constants
+        Stub{0x3C469E0, 0x1C, 0xA9BF47F0, 0x17D930A7}, // song notes a ... b 0x3292c94
         Stub{0x3C46AAC, 0x50, 0x1E380001, 0xD65F03C0}, // solver: fcvtzs w1, s0 ... ret
         Stub{0x3C46BB0, 0x44, 0x54000205, 0x17BFD096}, // Epona: b.pl ... b 0x2c3ae48
         Stub{0x3C46E8C, 0x84, 0x1E38000C, 0xD65F03C0}, // whole units: fcvtzs w12, s0 ... ret
+        Stub{0x3C46FB4, 0x48, 0xA9BF3FEE, 0xD65F03C0}, // song cue: stp x14, x15 ... ret
+        Stub{0x177F364, 0x1C, 0xA9BF47F0, 0x146C4F32}, // song notes b ... b 0x3293044
+        Stub{0x177F5A4, 0x1C, 0xA9BF47F0, 0x17B2575F}, // sound job runs ... b 0x415338
     };
     // The hooks a test switch can leave out, one at a time.
     struct Switched {
