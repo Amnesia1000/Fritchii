@@ -5992,6 +5992,13 @@ void RasterizerVulkan::DispatchCompute() {
             oot_effects_frame.reset();
         }
     }
+    // Below 720p the game's upscale pass is none of the known ones: found here, replaced from
+    // its next dispatch on. Without a render height: one relaxed load.
+    if (const auto render_height = Settings::AppliedOcarinaRenderHeight();
+        render_height && *render_height < 720 && !can_replace && !indirect_address)
+        [[unlikely]] {
+        NoteLowSceneUpscale(*pipeline, *render_height);
+    }
     const auto* const replacement =
         can_replace && !byte_addressed_shadow && TryOcarinaUpscale(*pipeline, true)
             ? oot_live_dlss.get()
@@ -9086,6 +9093,41 @@ void RasterizerVulkan::ReadOcarinaActor(OcarinaActorMesh& mesh) {
     mesh = {std::move(vertices), std::move(indices), now.origin, before.origin, now.bones, before.bones};
 }
 
+void RasterizerVulkan::NoteLowSceneUpscale(ComputePipeline& pipeline, u32 height) {
+    if (pipeline.LearnedOcarinaUpscale() || !OcarinaTemporalEnabled()) {
+        return;
+    }
+    const auto written = pipeline.WrittenImages();
+    if (written.size() != 1 || !written[0]) {
+        return;
+    }
+    const auto& target = texture_cache.GetImageView(written[0]);
+    if (target.size.width != 2560 || target.size.height != 1440 ||
+        target.format != VideoCore::Surface::PixelFormat::B10G11R11_FLOAT) {
+        return;
+    }
+    if (!pipeline.HasOcarinaUpscaleShape()) {
+        static std::array<u64, 8> logged{};
+        const u64 hash = pipeline.ShaderHash();
+        if (std::ranges::find(logged, hash) == logged.end()) {
+            if (const auto slot = std::ranges::find(logged, 0ULL); slot != logged.end()) {
+                *slot = hash;
+                LOG_INFO(Render_Vulkan,
+                         "Ocarina temporal: pass {:016x} writes the game's 1440p target at render "
+                         "height {}, but doesn't look like an upscale pass",
+                         hash, height);
+            }
+        }
+        return;
+    }
+    if (pipeline.LearnOcarinaUpscale()) {
+        LOG_INFO(Render_Vulkan,
+                 "Ocarina temporal: pass {:016x} upscales the {}p scene to the game's 1440p "
+                 "target; {} takes it from its next dispatch",
+                 pipeline.ShaderHash(), height, VideoCommon::OcarinaBackendName(*oot_backend));
+    }
+}
+
 /// Track the scene depth on its reader dispatch, or try to replace a recognized upscale dispatch.
 bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool replace) {
     constexpr u64 depth_reader = 0x1fc7a0423116281fULL;
@@ -9097,6 +9139,7 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
     const bool scaled_1440p_pass =
         render_height && (upscale_hash == ComputePipeline::Ocarina1440pScaledShader ||
                           upscale_hash == ComputePipeline::Ocarina1440pScaledFieldShader ||
+                          pipeline.LearnedOcarinaUpscale() ||
                           (upscale_hash == ComputePipeline::OcarinaThreeQuarterShader &&
                            *render_height == 1080));
     const bool pass_1440p =
