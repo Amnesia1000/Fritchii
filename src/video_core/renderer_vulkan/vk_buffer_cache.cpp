@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <unordered_map>
 #include <cstring>
@@ -118,7 +119,10 @@ vk::Buffer CreateBuffer(const Device& device, const MemoryAllocator& memory_allo
 /// A guest buffer the draw being set up can't go on without. With no memory for it (low VRAM, or
 /// an integrated GPU's share of the RAM), the staging pool gives back what the GPU is done with,
 /// then the buffer goes over the budget: slower than fitting, but the exception would end the
-/// emulator on the GPU thread.
+/// emulator on the GPU thread. At most three creates and no wait, and the result is a real buffer
+/// or the exception, never an empty one. The staging pool is emptied at most once a second: while
+/// the budget stays full every new buffer lands here, and emptying it each time would only make
+/// the next uploads build their staging buffers again.
 vk::Buffer CreateGuestBuffer(const Device& device, const MemoryAllocator& memory_allocator,
                              StagingBufferPool& staging_pool, u64 size,
                              VkDeviceSize sparse_alignment) {
@@ -129,21 +133,36 @@ vk::Buffer CreateGuestBuffer(const Device& device, const MemoryAllocator& memory
             throw;
         }
     }
-    const size_t freed = staging_pool.ReleaseIdleBuffers();
-    static std::atomic<u32> logged{};
-    if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
-        LOG_WARNING(Render_Vulkan,
-                    "No memory for a guest buffer of {} KiB; freed {} idle staging buffers",
-                    size >> 10, freed);
-    }
-    try {
-        return CreateBuffer(device, memory_allocator, size, sparse_alignment);
-    } catch (const vk::Exception& exception) {
-        if (!IsOutOfMemory(exception)) {
-            throw;
+    using Clock = std::chrono::steady_clock;
+    static std::atomic<s64> last_release_ms{-1000};
+    const s64 now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           Clock::now().time_since_epoch())
+                           .count();
+    s64 last_ms = last_release_ms.load(std::memory_order_relaxed);
+    if (now_ms - last_ms >= 1000 &&
+        last_release_ms.compare_exchange_strong(last_ms, now_ms, std::memory_order_relaxed)) {
+        const size_t freed = staging_pool.ReleaseIdleBuffers();
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+            LOG_WARNING(Render_Vulkan,
+                        "No memory for a guest buffer of {} KiB; freed {} idle staging buffers",
+                        size >> 10, freed);
+        }
+        try {
+            return CreateBuffer(device, memory_allocator, size, sparse_alignment);
+        } catch (const vk::Exception& exception) {
+            if (!IsOutOfMemory(exception)) {
+                throw;
+            }
         }
     }
-    return CreateBuffer(device, memory_allocator, size, sparse_alignment, false);
+    try {
+        return CreateBuffer(device, memory_allocator, size, sparse_alignment, false);
+    } catch (const vk::Exception& exception) {
+        LOG_CRITICAL(Render_Vulkan, "No memory for a guest buffer of {} KiB, even over the budget: {}",
+                     size >> 10, exception.what());
+        throw;
+    }
 }
 } // Anonymous namespace
 
