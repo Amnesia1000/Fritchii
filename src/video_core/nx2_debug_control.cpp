@@ -503,6 +503,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_VRAM_POOL_FIT") {
         return &g_vram_pool_fit;
     }
+    if (name == "FRITCHII_VRAM_POOL_FLOOR") {
+        return &g_vram_pool_floor;
+    }
     if (name == "FRITCHII_VRAM_CRITICAL_FIT") {
         return &g_vram_critical_fit;
     }
@@ -517,6 +520,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     }
     if (name == "FRITCHII_TC_CRITICAL_ENFORCE") {
         return &g_tc_critical_enforce;
+    }
+    if (name == "FRITCHII_TC_THRASH_GUARD") {
+        return &g_tc_thrash_guard;
     }
     if (name == "FRITCHII_VRAM_OWNERS") {
         return &g_vram_owners;

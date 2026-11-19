@@ -246,6 +246,8 @@ inline std::atomic<int> g_ram_prebuilt_keep{-1};
 inline std::atomic<int> g_depth_pool_retry{-1};
 /// FRITCHII_VRAM_POOL_FIT: docs/fritchii/switches.md.
 inline std::atomic<int> g_vram_pool_fit{-1};
+/// FRITCHII_VRAM_POOL_FLOOR: docs/fritchii/switches.md (0 off, 1 on).
+inline std::atomic<int> g_vram_pool_floor{-1};
 /// FRITCHII_VRAM_CRITICAL_FIT: docs/fritchii/switches.md.
 inline std::atomic<int> g_vram_critical_fit{-1};
 /// FRITCHII_VRAM_REPORT: docs/fritchii/switches.md.
@@ -285,6 +287,8 @@ inline std::atomic<int> g_vram_budget_mode{-1};
 inline std::atomic<int> g_vram_headroom_mib{-1};
 /// FRITCHII_TC_CRITICAL_ENFORCE: docs/fritchii/switches.md.
 inline std::atomic<int> g_tc_critical_enforce{-1};
+/// FRITCHII_TC_THRASH_GUARD: docs/fritchii/switches.md (0 off, 1 on, 2 counts only).
+inline std::atomic<int> g_tc_thrash_guard{-1};
 /// FRITCHII_VRAM_OWNERS: docs/fritchii/switches.md (seconds between lines, 0 = off).
 inline std::atomic<int> g_vram_owners{-1};
 /// FRITCHII_VRAM_PACK: docs/fritchii/switches.md (0 off, 1 on, 2 auto = with the small card).
