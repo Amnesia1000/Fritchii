@@ -400,6 +400,8 @@ public:
     std::optional<f32> ocarina_fsr_lod_bias;
     /// Set when the Ocarina upscaler fails during the session: samplers drop the bias again.
     bool ocarina_fsr_failed{};
+    /// The first sampler made, lent to samplers the driver refuses (Sampler::Emplace).
+    std::atomic<VkSampler> spare_sampler{VK_NULL_HANDLE};
     /// The game DLSS network's health check (ProbeGameDlssOutput), created on first use.
     std::unique_ptr<DlssNetworkProbe> dlss_network_probe;
     std::optional<std::chrono::steady_clock::time_point> fsr3_last_evaluation;
@@ -1149,7 +1151,7 @@ public:
     explicit Sampler(TextureCacheRuntime&, const Tegra::Texture::TSCEntry&);
 
     [[nodiscard]] VkSampler Handle() const noexcept {
-        return *variants.front().sampler;
+        return variants.front().Get();
     }
 
     [[nodiscard]] VkSampler HandleFor(const ImageView& image_view, bool is_depth);
@@ -1190,6 +1192,11 @@ private:
     struct Variant {
         VariantKey key;
         vk::Sampler sampler;
+        VkSampler borrowed{}; ///< Another sampler's, when the driver refused this one
+
+        [[nodiscard]] VkSampler Get() const noexcept {
+            return borrowed != VK_NULL_HANDLE ? borrowed : *sampler;
+        }
     };
 
     static constexpr size_t MAX_VARIANTS = 32;
@@ -1203,6 +1210,7 @@ private:
 
     const Device* device_ptr{nullptr};
     const bool* ocarina_fsr_failed{}; ///< TextureCacheRuntime::ocarina_fsr_failed
+    std::atomic<VkSampler>* spare_sampler{}; ///< TextureCacheRuntime::spare_sampler
     Tegra::Texture::TSCEntry descriptor{};
     VkSamplerCreateInfo base_ci{};
     VkSamplerReductionModeEXT reduction_mode{VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE_EXT};

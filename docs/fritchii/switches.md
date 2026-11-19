@@ -881,6 +881,26 @@ them. Exact: the same code, more room. Memory is committed only as code is writt
 per core, 4-6 cores). Log: "FRITCHII_JIT_CACHE_MIB=N: code cache of N MiB per core". Only worth a
 test when FRITCHII_HITCH_SPLIT=1 shows "warm compiles refused" before the load; judge by the load
 cluster's hitch score and its "another core had" time, fresh launches (boot setting).
+### FRITCHII_TEST_COMMIT_REFUSE
+
+Boot, Windows, TEST, default 0. Windows' commit limit is RAM plus the page files. A commit refused
+there (error 1455) used to end the game: guest memory then faulted, a refused `operator new` was an
+uncaught std::bad_alloc. Guest memory, page tables and `operator new` now try again every 50 ms for
+up to 5 s (a system-managed page file grows meanwhile, the texture cache gives memory back), then
+log "Out of memory" and fail as before; the crash report says the limit was hit. `operator new`
+only waits with under 4 GiB of commit left, so a bad size still fails at once. Nothing changes
+until a refusal happens. `<ms>` refuses every commit for that long from the first one on and starts
+one impossible allocation: under 5000 the log shows "refused" and "went through"; above it, "Out of
+memory" and then the game going on once the window ends (or the crash report's line).
+
+### FRITCHII_TEST_SAMPLER_LIMIT
+
+Boot, TEST, default 0. Drivers limit how many samplers exist (about 4,000 on NVIDIA) and the texture
+cache never frees one; past the limit the game used to end. A refused sampler now borrows this
+sampler's first variant or the first sampler made, and the log says "The driver refused a sampler"
+(8 times at most). `<n>` makes the driver's refusal happen after n samplers: the game must keep
+running, with some textures filtered or wrapped wrongly.
+
 ### FRITCHII_TEST_DEVICE_LOSS
 
 TEST, off by default (live, debug server only). 1 = the next queue submission goes through the
@@ -6178,6 +6198,40 @@ dual-source bit are compared with the key's: equal keeps the pipeline without a 
 different patches only the blend part of the key. Reads the registers, so the ported change's writes
 without the flag are still caught. Logs "saved by the blend value check" and why the other
 lookups refreshed in "EDEN_NX2_PIPELINE_CLEAN per second". Off by default, not measured yet.
+
+### FRITCHII_INTEL_PCACHE_FETCH
+
+Boot, default 1 on Intel's Windows driver (no effect elsewhere); 0 = saves during play as on other
+drivers. That driver can fault inside vkGetPipelineCacheData while other threads build pipelines
+with the same cache, and the game closes with no message. Our VkPipelineCache file is then only
+read back from the driver with no build running: at exit and between titles. A crash loses what
+this session added to our file only; Intel's own disk cache still has it. No effect on speed or
+picture. Check on an Intel GPU: play 10 minutes with new pipelines, no "Vulkan driver pipelines
+cached at" in play, one at exit, and the next boot logs "Loaded Vulkan driver pipeline cache".
+
+### FRITCHII_DLSS_LOW_VRAM_CNN
+
+Boot, default 0. DLSS's default model is now "Automatic": K, as before. With this at 1 Automatic
+draws with NVIDIA's CNN preset E on cards under 7 GiB of video memory (reported on an RTX 3050 6 GB
+at 1080p Performance: 1.55 ms less GPU time, 27 MB less memory than K). A player who picks K, or any
+model, keeps it. The status bar and the log name the model that draws. Off by default because E has
+not been judged in OoT, and because Streamline 2.14 marks it deprecated: a DLSS file without it
+falls back to NVIDIA's default, M or L, the slower models that drew thin lines in Fire Emblem. E
+can also ghost more on grass and thin objects than K, mostly at Performance and Ultra Performance.
+Test on any RTX card: `EDEN_NX2_VRAM_LIMIT_MIB=6144` + this at 1 (the log says "the Automatic model
+is the CNN preset E"; the status bar says E), Performance and Ultra Performance, against K at the
+market, in tall grass and at thin fences; compare GPU busy time. `EDEN_NX2_DLSS_PRESET=E` forces it.
+
+### FRITCHII_PCACHE_SAVE
+
+Boot, default 1; 0 = every save as before. Only where our VkPipelineCache file is in use (not
+NVIDIA's or AMD's Windows drivers by default). The file is written only when the driver's data
+changed size since it was read or last written: a boot whose pipelines were all in the cache
+counted as many builds as one that made them and wrote the whole file again. A save during play
+also waits until free RAM is at least twice the cache plus 4 GiB, because it copies the whole
+cache into memory and the file cache and pushes the game's pages out; the exit save always runs.
+Check: boot twice with no new pipelines; the second boot logs no "Vulkan driver pipelines cached
+at" before play and the file's date stays.
 
 ### FRITCHII_PIPELINE_KEY_HASH
 

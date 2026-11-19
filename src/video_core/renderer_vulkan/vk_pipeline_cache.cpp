@@ -914,6 +914,30 @@ bool AppCacheBesideDriver(const Device& device) {
     return AmdAppCache(device) || IntelDriverCache(device);
 }
 
+/// FRITCHII_INTEL_PCACHE_FETCH (boot, default 1; 0 = as on other drivers): Intel's Windows driver
+/// can fault in vkGetPipelineCacheData while other threads build with that cache, closing the game
+/// without a message. Pipeline builds cannot be paused from here, so on that driver the data is
+/// only fetched once none run: at exit and between titles. Its own disk cache keeps what a crash
+/// would lose from our file.
+bool IntelFetchesCacheWhenIdle(const Device& device) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("FRITCHII_INTEL_PCACHE_FETCH");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled && IntelDriverCache(device);
+}
+
+/// FRITCHII_PCACHE_SAVE (boot, default 1; 0 = every save as before): our VkPipelineCache file is
+/// written only when the driver's data changed size since it was read or written, and in play
+/// only with room in RAM for it.
+bool LeanPipelineCacheSaves() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("FRITCHII_PCACHE_SAVE");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
 bool DriverCachesPipelines(const Device& device) {
     switch (device.GetDriverID()) {
     case VK_DRIVER_ID_NVIDIA_PROPRIETARY:
@@ -4185,6 +4209,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         background_slots.store(0, std::memory_order_relaxed);
         serialization_thread.WaitForRequests();
         if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
+            if (IntelFetchesCacheWhenIdle(device)) {
+                workers.WaitForRequests();
+            }
             SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
                                          CACHE_VERSION);
         }
@@ -7439,6 +7466,17 @@ void PipelineCache::QueueVulkanPipelineCacheFlush() {
     if (flush_in_flight.load(std::memory_order_acquire)) {
         return;
     }
+    if (LeanPipelineCacheSaves()) {
+        // A save reads the whole cache into new memory and then into the file cache, which pushes
+        // the game's pages out when RAM is short. Put off: the next try is an interval away, and
+        // the exit save still writes everything.
+        const u64 free_ram = Common::GetProcessMemoryUsage().available_physical;
+        const u64 wanted = u64{last_cache_size.load(std::memory_order_relaxed)} * 2 + (u64{4} << 30);
+        if (free_ram != 0 && free_ram < wanted) {
+            last_flush = now;
+            return;
+        }
+    }
     pipelines_since_flush = 0;
     last_flush = now;
     QueueVulkanPipelineCacheSave(false);
@@ -7459,7 +7497,8 @@ bool PipelineCache::VulkanPipelineCacheSaveDue(std::chrono::steady_clock::time_p
 }
 
 void PipelineCache::QueueVulkanPipelineCacheSave(bool again_if_busy) {
-    if (!use_vulkan_pipeline_cache || vulkan_pipeline_cache_filename.empty()) {
+    if (!use_vulkan_pipeline_cache || vulkan_pipeline_cache_filename.empty() ||
+        IntelFetchesCacheWhenIdle(device)) {
         return;
     }
     if (flush_in_flight.exchange(true, std::memory_order_acq_rel)) {
@@ -7902,7 +7941,7 @@ PipelineCache::MemoryOwnerCounts PipelineCache::MemoryOwners() {
     // The VkPipelineCache object keeps every binary built this session in memory. Its size comes
     // from the saves, and between them from a query once a minute on the serialization thread
     // (some drivers serialize the whole cache to answer it), never while a save is under way.
-    if (use_vulkan_pipeline_cache && vulkan_pipeline_cache) {
+    if (use_vulkan_pipeline_cache && vulkan_pipeline_cache && !IntelFetchesCacheWhenIdle(device)) {
         const auto now = std::chrono::steady_clock::now();
         if (now - last_cache_size_query >= std::chrono::minutes{1} &&
             !flush_in_flight.load(std::memory_order_acquire)) {
@@ -10011,6 +10050,16 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
 void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& filename,
                                                  const vk::PipelineCache& pipeline_cache,
                                                  u32 cache_version) try {
+    size_t cache_size = 0;
+    if (pipeline_cache) {
+        pipeline_cache.Read(&cache_size, nullptr);
+        // A boot that finds every pipeline in the cache counts as many builds as one that makes
+        // them, and would write the same gigabyte again.
+        if (LeanPipelineCacheSaves() &&
+            cache_size == saved_cache_size.load(std::memory_order_relaxed)) {
+            return;
+        }
+    }
     // Written beside the cache and renamed over it: the emulator stopped mid-write left the cache
     // empty, and every later boot failed to read it.
     auto temporary = filename;
@@ -10025,10 +10074,8 @@ void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& fi
     file.write(VULKAN_CACHE_MAGIC_NUMBER.data(), VULKAN_CACHE_MAGIC_NUMBER.size())
         .write(reinterpret_cast<const char*>(&cache_version), sizeof(cache_version));
 
-    size_t cache_size = 0;
     std::vector<char> cache_data;
     if (pipeline_cache) {
-        pipeline_cache.Read(&cache_size, nullptr);
         cache_data.resize(cache_size);
         pipeline_cache.Read(&cache_size, cache_data.data());
     }
@@ -10050,6 +10097,7 @@ void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& fi
         std::filesystem::remove(temporary, error);
         return;
     }
+    saved_cache_size.store(cache_size, std::memory_order_relaxed);
 
     LOG_INFO(Render_Vulkan, "Vulkan driver pipelines cached at: {}",
              Common::FS::PathToUTF8String(filename));
@@ -10122,7 +10170,10 @@ vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::
                  "Loaded Vulkan driver pipeline cache: {}", Common::FS::PathToUTF8String(filename));
 
         try {
-            return create_pipeline_cache(cache_size, cache_data.data());
+            vk::PipelineCache loaded = create_pipeline_cache(cache_size, cache_data.data());
+            saved_cache_size.store(cache_size, std::memory_order_relaxed);
+            last_cache_size.store(cache_size, std::memory_order_relaxed);
+            return loaded;
         } catch (const vk::Exception& e) {
             // The blob came from another driver or driver version (e.g. switching between
             // MoltenVK and KosmicKrisp on macOS): the driver rejects it. Start empty instead of

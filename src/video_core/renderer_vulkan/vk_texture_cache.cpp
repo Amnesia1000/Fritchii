@@ -55,6 +55,7 @@
 #include "video_core/texture_cache/samples_helper.h"
 #include "video_core/texture_cache/util.h"
 #include "video_core/dlss_contract.h"
+#include "video_core/vulkan_common/vk_enum_string_helper.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/vulkan_common/streamline.h"
@@ -5721,6 +5722,7 @@ Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& t
     // size's mips; the bias keeps the output's detail (VideoCommon::OcarinaFsrLodBias).
     f32 lod_bias = tsc.LodBias();
     ocarina_fsr_failed = &runtime.ocarina_fsr_failed;
+    spare_sampler = &runtime.spare_sampler;
     if (const f32 fsr_lod_bias = runtime.OcarinaFsrLodBias();
         fsr_lod_bias != 0.0f && tsc.mipmap_filter != TextureMipmapFilter::None) {
         const f32 biased = std::clamp(lod_bias + fsr_lod_bias, -15.0f, 15.0f);
@@ -5784,7 +5786,7 @@ VkSampler Sampler::Find(const VariantKey& key) const noexcept {
     if (it == variants.end()) {
         return VK_NULL_HANDLE;
     }
-    return *it->sampler;
+    return it->Get();
 }
 
 VkSampler Sampler::Emplace(VariantKey key) {
@@ -5855,11 +5857,42 @@ VkSampler Sampler::Emplace(VariantKey key) {
     if (!custom_border) {
         create_info.borderColor = ConvertBorderColor(color);
     }
-    variants.push_back(Variant{
-        .key = key,
-        .sampler = device_ptr->GetLogical().CreateSampler(create_info),
-    });
-    return *variants.back().sampler;
+    // Drivers limit how many samplers exist (maxSamplerAllocationCount: about 4,000 on NVIDIA) and
+    // the cache keeps every one. Past that a sampler that is close enough beats ending the game:
+    // this sampler's first variant, or else the first sampler made (linear filtering).
+    Variant variant{.key = key};
+    try {
+        // FRITCHII_TEST_SAMPLER_LIMIT=<n> (boot, TEST): the driver refuses samplers after n.
+        static const u32 test_limit = [] {
+            const char* const value = std::getenv("FRITCHII_TEST_SAMPLER_LIMIT");
+            return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
+        }();
+        static std::atomic<u32> made{0};
+        if (test_limit != 0 && made.fetch_add(1, std::memory_order_relaxed) >= test_limit) {
+            throw vk::Exception(VK_ERROR_TOO_MANY_OBJECTS);
+        }
+        variant.sampler = device_ptr->GetLogical().CreateSampler(create_info);
+        VkSampler none = VK_NULL_HANDLE;
+        spare_sampler->compare_exchange_strong(none, *variant.sampler, std::memory_order_relaxed);
+    } catch (const vk::Exception& exception) {
+        const VkResult result = exception.GetResult();
+        variant.borrowed =
+            !variants.empty() ? variants.front().Get() : spare_sampler->load(std::memory_order_relaxed);
+        if ((result != VK_ERROR_TOO_MANY_OBJECTS && result != VK_ERROR_OUT_OF_HOST_MEMORY &&
+             result != VK_ERROR_OUT_OF_DEVICE_MEMORY) ||
+            variant.borrowed == VK_NULL_HANDLE) {
+            throw;
+        }
+        static std::atomic<u32> told{0};
+        if (told.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_ERROR(Render_Vulkan,
+                      "The driver refused a sampler ({}, its limit is {}): using another one",
+                      string_VkResult(result),
+                      device_ptr->GetMaxSamplerAllocationCount());
+        }
+    }
+    variants.push_back(std::move(variant));
+    return variants.back().Get();
 }
 
 VkSampler Sampler::HandleFor(const ImageView& image_view, bool is_depth) {
