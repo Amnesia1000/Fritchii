@@ -2409,9 +2409,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             (flag->occl_flag_kind == GraphicsPipeline::OCCL_KIND_PREPASS || colour_prepass) &&
             (is_indirect || draw_tracking || frame_dump.CapturingSampled())) [[unlikely]] {
             VideoCommon::OcclFlag::Add(VideoCommon::OcclFlag::g_stats.prepass_fallback);
-            VideoCommon::OcclFlag::t_census = colour_prepass
-                                                  ? VideoCommon::OcclFlag::Census::ColourOther
-                                                  : VideoCommon::OcclFlag::Census::OffDiscards;
+            VideoCommon::OcclFlag::t_census =
+                colour_prepass ? VideoCommon::OcclFlag::t_colour_prepass_class
+                               : VideoCommon::OcclFlag::Census::OffDiscards;
             VideoCommon::OcclFlag::t_colour_prepass = false;
             return chosen;
         }
@@ -2947,9 +2947,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             if (pipeline->occl_flag_kind == GraphicsPipeline::OCCL_KIND_PREPASS) {
                 VideoCommon::OcclFlag::Add(VideoCommon::OcclFlag::g_stats.prepass_draws);
             }
-            if (VideoCommon::OcclFlag::t_colour_prepass) {
-                VideoCommon::OcclFlag::Add(VideoCommon::OcclFlag::g_stats.colour_prepass_draws);
-            }
+
         } else if (maxwell3d->regs.zpass_pixel_count_enable != 0) {
             query_cache_runtime.NoteOtherCountedDraw(
                 VideoCommon::OcclFlag::Blocks(census)); // nothing without the flag area
@@ -2987,7 +2985,11 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                 }
                 scheduler.Record(
                     [](vk::CommandBuffer cmdbuf) { cmdbuf.SetDepthWriteEnableEXT(false); });
+                const bool clear_masks = colour_prepass && pipeline->occl_flag_kind == 1;
                 if (colour_prepass) {
+                    OcclFlag::Add(OcclFlag::g_stats.colour_prepass_draws);
+                }
+                if (clear_masks) {
                     scheduler.Record([](vk::CommandBuffer cmdbuf) {
                         static constexpr std::array<VkColorComponentFlags,
                                                     Maxwell::NumRenderTargets>
@@ -3000,7 +3002,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                                      vk::CommandBuffer cmdbuf) {
                     cmdbuf.SetDepthWriteEnableEXT(enable);
                 });
-                if (colour_prepass) {
+                if (clear_masks) {
                     // The draw's own masks again (recorded from its registers).
                     maxwell3d->dirty.flags[Dirty::Blending] = true;
                     maxwell3d->dirty.flags[Dirty::ColorMask] = true;

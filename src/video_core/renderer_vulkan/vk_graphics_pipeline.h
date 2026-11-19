@@ -505,7 +505,12 @@ public:
     /// end, drawn first with depth writes off; the real draw follows with this pipeline).
     std::unique_ptr<GraphicsPipeline> occl_flag_prepass;
     u8 occl_flag_prepass_state{};
-    /// On a flag variant, its kind: 1 host flag program, 2 colour, 3 pre-pass.
+    /// FRITCHII_OCCL_FLAG colour pre-pass without dynamic colour write masks: the host flag
+    /// variant built from this key with every attachment's write mask and blend cleared.
+    std::unique_ptr<GraphicsPipeline> occl_flag_nocolour;
+    u8 occl_flag_nocolour_state{};
+    /// On a flag variant, its kind: 1 host flag program, 2 colour, 3 pre-pass, 4 host flag
+    /// program with colour writes off in its key.
     static constexpr u8 OCCL_KIND_PREPASS = 3;
     u8 occl_flag_kind{};
     /// On a flag variant: 1 its translation's descriptors equal its parent's (the parent can

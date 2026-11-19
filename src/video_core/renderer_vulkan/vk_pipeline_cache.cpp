@@ -3716,6 +3716,7 @@ thread_local u8 t_occl_flag_build{};
 constexpr u8 OCCL_FLAG_BUILD_HOST = 1;   ///< the host flag pixel program (colour off)
 constexpr u8 OCCL_FLAG_BUILD_COLOUR = 2; ///< the guest pixel program with the flag store
 constexpr u8 OCCL_FLAG_BUILD_PREPASS = 3; ///< the guest pixel program, the store at its end
+constexpr u8 OCCL_FLAG_BUILD_NOCOLOUR = 4; ///< the host flag program, colour writes off (key)
 
 /// FRITCHII_OCCL_FLAG: why `pipeline`'s guest pixel program (Lean class: no discard, depth or
 /// sample mask writes, stores) cannot take the flag store with early fragment tests for a
@@ -3810,8 +3811,7 @@ bool OcclFlagPrepassRegsOk(const Tegra::Engines::Maxwell3D::Regs& regs);
 /// dynamic colour write masks (extended dynamic state 3 blending).
 bool OcclFlagColourPrepassEligible(const GraphicsPipeline& pipeline,
                                   const Tegra::Engines::Maxwell3D::Regs& regs) {
-    return pipeline.Key().state.extended_dynamic_state_3_blend != 0 &&
-           OcclFlagPrepassPipelineOk(pipeline) && OcclFlagPrepassRegsOk(regs);
+    return OcclFlagPrepassPipelineOk(pipeline) && OcclFlagPrepassRegsOk(regs);
 }
 
 bool OcclFlagPrepassEligible(const GraphicsPipeline& pipeline,
@@ -3963,23 +3963,36 @@ GraphicsPipeline* PipelineCache::OcclFlagPipeline(GraphicsPipeline* pipeline,
                 return pipeline;
             }
         }
+        // With dynamic colour write masks the host flag variant is drawn with them cleared;
+        // without, a host variant whose key has every attachment's writes off.
+        const bool dynamic_masks = pipeline->Key().state.extended_dynamic_state_3_blend != 0;
+        u8& host_state = dynamic_masks ? pipeline->occl_flag_state
+                                       : pipeline->occl_flag_nocolour_state;
         if ((colour_verdict == Census::ColourSubgroup || colour_verdict == Census::ColourQuad) &&
-            OcclFlag::ColourPrepassAllowed() && pipeline->occl_flag_state != 2 &&
-            pipeline->IsBuilt() && OcclFlagColourPrepassEligible(*pipeline, regs)) {
-            GraphicsPipeline* host = pipeline->occl_flag.get();
+            OcclFlag::ColourPrepassAllowed() && host_state != 2 && pipeline->IsBuilt() &&
+            OcclFlagColourPrepassEligible(*pipeline, regs)) {
+            GraphicsPipeline* host = dynamic_masks ? pipeline->occl_flag.get()
+                                                   : pipeline->occl_flag_nocolour.get();
             if (host == nullptr && allow_make) {
-                host = FindOrMakeOcclFlag(*pipeline);
+                host = FindOrMakeOcclFlag(*pipeline, dynamic_masks ? OCCL_FLAG_BUILD_HOST
+                                                                   : OCCL_FLAG_BUILD_NOCOLOUR);
             }
             if (host != nullptr && host->Failed()) [[unlikely]] {
-                pipeline->occl_flag_state = 2;
+                host_state = 2;
                 OcclFlag::Add(stats.failed);
                 host = nullptr;
             }
             if (host != nullptr && host->IsBuilt() && host->occl_same_descriptors == 1) {
                 OcclFlag::t_census = Census::Flag;
                 OcclFlag::t_colour_prepass = true;
+                OcclFlag::t_colour_prepass_class = colour_verdict;
                 host->MarkUsed(frame_count);
                 return host;
+            }
+            if (host_state != 2 && (host == nullptr || !host->IsBuilt())) {
+                OcclFlag::t_census = Census::NotReady;
+                OcclFlag::Add(stats.not_ready);
+                return pipeline;
             }
         }
         switch (pipeline->IsMeshPipeline() ? PipelineClass::Mesh : pipeline_class) {
@@ -4113,6 +4126,11 @@ GraphicsPipeline* PipelineCache::FindOrMakeOcclFlag(GraphicsPipeline& full, u8 k
     std::unique_ptr<GraphicsPipeline> made;
     {
         graphics_key = full.Key();
+        if (kind == OCCL_FLAG_BUILD_NOCOLOUR) {
+            for (auto& attachment : graphics_key.state.attachments) {
+                attachment.raw = 0; // no colour writes, no blending
+            }
+        }
         t_occl_flag_build = kind;
         SCOPE_EXIT {
             graphics_key = saved;
@@ -4126,9 +4144,10 @@ GraphicsPipeline* PipelineCache::FindOrMakeOcclFlag(GraphicsPipeline& full, u8 k
             made.reset();
         }
     }
-    u8& state = kind == OCCL_FLAG_BUILD_COLOUR    ? full.occl_flag_colour_state
-                : kind == OCCL_FLAG_BUILD_PREPASS ? full.occl_flag_prepass_state
-                                                  : full.occl_flag_state;
+    u8& state = kind == OCCL_FLAG_BUILD_COLOUR     ? full.occl_flag_colour_state
+                : kind == OCCL_FLAG_BUILD_PREPASS  ? full.occl_flag_prepass_state
+                : kind == OCCL_FLAG_BUILD_NOCOLOUR ? full.occl_flag_nocolour_state
+                                                   : full.occl_flag_state;
     if (!made) {
         OcclFlag::Add(OcclFlag::g_stats.failed);
         state = 2;
@@ -4158,6 +4177,10 @@ GraphicsPipeline* PipelineCache::FindOrMakeOcclFlag(GraphicsPipeline& full, u8 k
     }
     OcclFlag::Add(OcclFlag::g_stats.made);
     made->occl_same_descriptors = OcclFlagSameDescriptors(*made, full) ? 1 : 2;
+    if (kind == OCCL_FLAG_BUILD_NOCOLOUR) {
+        full.occl_flag_nocolour = std::move(made);
+        return full.occl_flag_nocolour.get();
+    }
     full.occl_flag = std::move(made);
     full.occl_flag_state = 1;
     return full.occl_flag.get();
@@ -9529,7 +9552,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     // FRITCHII_OCCL_FLAG: the flag variant's pixel stage is the host flag program (the guest
     // pixel program was translated for its infos, which the variant keeps).
     const bool occl_flag_variant =
-        t_occl_flag_build == OCCL_FLAG_BUILD_HOST && key.unique_hashes[5] != 0;
+        (t_occl_flag_build == OCCL_FLAG_BUILD_HOST ||
+         t_occl_flag_build == OCCL_FLAG_BUILD_NOCOLOUR) &&
+        key.unique_hashes[5] != 0;
     if (occl_flag_variant && !emit_pools && !(record && record->translate_only)) {
         modules[4] = BuildShader(device, VULKAN_OCCL_FLAG_FRAG_SPV);
     }

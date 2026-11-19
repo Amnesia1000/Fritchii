@@ -125,6 +125,8 @@ inline thread_local Census t_census{};
 /// Set by PipelineCache::OcclFlagPipeline when the host flag variant it returns is for a colour
 /// pre-pass (read and cleared by the draw that follows).
 inline thread_local bool t_colour_prepass{};
+/// The census class of that draw (restored when the draw cannot take the pre-pass).
+inline thread_local Census t_colour_prepass_class{};
 
 /// A draw of this census class keeps its window's host query even with flag stores added to
 /// colour-writing Lean pixel programs.
