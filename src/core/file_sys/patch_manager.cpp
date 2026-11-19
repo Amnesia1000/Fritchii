@@ -60,6 +60,9 @@ struct BuiltinPatchRecord {
     std::span<const u8> bytes;
     bool checked;
     u32 original;
+    /// When set, this environment variable at 1 leaves this one record out: a hook stays the
+    /// game's word while the rest of the patch applies (tests of one site of a patch).
+    const char* skip_env = nullptr;
 };
 
 struct BuiltinPatch {
@@ -517,6 +520,7 @@ struct OotFixHook {
     size_t offset;
     std::array<u8, 4> bytes;
     u32 original;
+    const char* skip_env = nullptr; // =1 leaves this hook out (BuiltinPatchRecord::skip_env)
 };
 struct OotFixStub {
     size_t offset;
@@ -764,6 +768,55 @@ constexpr std::array<u8, 92> CLOTH_DT_D{
     0x02, 0x6D, 0x46, 0xBD, 0xBA, 0x6D, 0xBF, 0x17, // ldr s2, [x8, #0x66c] ; b 0x2c22090
 };
 
+// Counters that cut an amount of the step to whole units, with the amount of a 60 fps frame known
+// at the site. HR_WHOLE gives the whole units of that amount for one counter and keeps the rest:
+// in x13 the counter's address, w14 the bits of a 60 fps frame's amount, s0 the amount; out w12.
+// It gives the game's own cut unless the frame step calls the high refresh routine and
+// 0 < amount <= the 60 fps amount, so 60 fps and below, and Dark's mode, get the game's value
+// exactly (at the 60 fps amount the rest, under 1, cannot change the cut). Unlike STEP_TICKS it
+// starts a new counter from 0 and has slots of its own: 8 of {u64 address, f32 rest, pad} at state
+// +0x100 and the next slot to take at +0x180, so the ambient and step rate counters that fill
+// STEP_TICKS's table cannot push these out. Two things let it save nothing: every caller is
+// followed by a call before x12-x17, s16, s17 or the flags are read, and it keeps s0.
+//   w12 = fcvtzs(s0) ; call word is not ours, or bits - 1 >= w14 unsigned (0, negative, NaN and
+//   larger amounts): ret ; find x13's slot, none: take [next], next = (next + 1) & 7, key = x13,
+//   rest = 0 ; rest += s0 ; w12 = fcvtzs(rest) ; rest -= w12 ; ret
+// It sits after the high refresh routine, the one free run this long that no known cheat writes.
+constexpr size_t HR_WHOLE_OFFSET = 0x3C46E8C;
+constexpr std::array<u8, 132> HR_WHOLE{
+    0x0C, 0x00, 0x38, 0x1E, 0x0F, 0x55, 0xFE, 0x90, 0xEF, 0xC5, 0x4C, 0xB9,
+    0xF0, 0x09, 0x90, 0x52, 0xB0, 0x9A, 0xB2, 0x72, 0xFF, 0x01, 0x10, 0x6B,
+    0x41, 0x03, 0x00, 0x54, 0x0F, 0x00, 0x26, 0x1E, 0xEF, 0x05, 0x00, 0x51,
+    0xFF, 0x01, 0x0E, 0x6B, 0xC2, 0x02, 0x00, 0x54, 0xD0, 0x92, 0x00, 0x90,
+    0x10, 0x02, 0x3C, 0x91, 0x0E, 0x06, 0x41, 0xF8, 0xDF, 0x01, 0x0D, 0xEB,
+    0x60, 0x01, 0x00, 0x54, 0x1F, 0x1A, 0x40, 0xF2, 0x81, 0xFF, 0xFF, 0x54,
+    0x0E, 0x02, 0x40, 0xB9, 0xCF, 0x05, 0x00, 0x11, 0xEF, 0x09, 0x00, 0x12,
+    0x0F, 0x02, 0x00, 0xB9, 0x10, 0x02, 0x02, 0xD1, 0x10, 0x12, 0x0E, 0x8B,
+    0x0D, 0x06, 0x01, 0xF8, 0x1F, 0x82, 0x1F, 0xB8, 0x10, 0x82, 0x5F, 0xBC,
+    0x10, 0x2A, 0x20, 0x1E, 0x0C, 0x02, 0x38, 0x1E, 0x91, 0x01, 0x22, 0x1E,
+    0x10, 0x3A, 0x31, 0x1E, 0x10, 0x82, 0x1F, 0xBC, 0xC0, 0x03, 0x5F, 0xD6,
+};
+constexpr size_t HR_WHOLE_SLOTS_OFFSET = HR_FIX_STATE_OFFSET + 0x100;
+// The end-of-slots test is on the address, so the slots must start on a 0x80 boundary.
+static_assert(HR_WHOLE_SLOTS_OFFSET % 0x80 == 0);
+static_assert(AdrpTarget(HR_WHOLE_OFFSET + 0x2C, InstructionAt(HR_WHOLE, 0x2C)) +
+                  ((InstructionAt(HR_WHOLE, 0x30) >> 10) & 0xFFF) ==
+              HR_WHOLE_SLOTS_OFFSET);
+static_assert(HIGH_REFRESH_ROUTINE_OFFSET + OOT_CAVE_SIZE <= HR_WHOLE_OFFSET &&
+              HR_WHOLE_OFFSET + HR_WHOLE.size() <= TEXTURE_POOL_ROUTINE_OFFSET);
+
+// Time of day: each frame the clock's update (main+0x3CDF70) stores trunc(2 * step) game seconds
+// to +0x3C, which are then added to the seconds of the day. Above 60 fps the cut loses time: the
+// day runs slow below 120 fps (83% at 100) and stands still above it, with the sun swinging over
+// the frozen hour. The cut stored to +0x3C (fcvtzs w8, s0 at main+0x3CDFC0) goes through HR_WHOLE
+// with the counter x19 + 0x3C. The function's other cut, in the branch that sets the time from
+// another source (main+0x3CE160), stays the game's.
+//   x13 = x19 + 0x3c ; w14 = 2.0 ; bl HR_WHOLE ; w8 = w12 ; b 0x3cdfc4
+constexpr std::array<u8, 20> HR_TIME_STUB{
+    0x6D, 0xF2, 0x00, 0x91, 0x0E, 0x00, 0xA8, 0x52, 0x35, 0x01, 0x00, 0x94,
+    0xE8, 0x03, 0x0C, 0x2A, 0x81, 0x1D, 0x1E, 0x17,
+};
+
 // The hooks (each checked to hold the game's word), then the stubs in address order.
 constexpr std::array HR_FIX_HOOKS{
     OotFixHook{0x415300, {0x28, 0xC4, 0xE0, 0x14}, 0xD503237F}, // pacibsp -> b 0x3c463a0
@@ -799,6 +852,8 @@ constexpr std::array HR_FIX_HOOKS{
     OotFixHook{0x2AB804, {0x23, 0x6C, 0xE6, 0x14}, 0x1E270100}, // fmov s0, w8 -> b 0x3c46890
     OotFixHook{0x2C207A4, {0x53, 0x98, 0x40, 0x14}, 0xBD466D00}, // ldr s0, [x8, #0x66c] -> b 0x3c468f0
     OotFixHook{0x2C2208C, {0x31, 0x92, 0x40, 0x14}, 0xBD466D02}, // ldr s2, [x8, #0x66c] -> b 0x3c46950
+    OotFixHook{0x3CDFC0, {0x7C, 0xE2, 0xE1, 0x14}, 0x1E380008, // fcvtzs w8, s0 -> b 0x3c469b0
+               "FRITCHII_NO_HR_TIME"},
 };
 constexpr std::array HR_FIX_STUBS{
     OotFixStub{0x3C463A0, SOUND_GATE},
@@ -818,29 +873,50 @@ constexpr std::array HR_FIX_STUBS{
     OotFixStub{0x3C46890, CLOTH_DT_B},
     OotFixStub{0x3C468F0, CLOTH_DT_C},
     OotFixStub{0x3C46950, CLOTH_DT_D},
+    OotFixStub{0x3C469B0, HR_TIME_STUB},
 };
-// The sound accumulator and flag at +0, the step slots' index at +8, the 15 slots from +0x10.
-constexpr size_t HR_FIX_STATE_SIZE = 0x100;
+// Stubs past the pickup stub, also in address order.
+constexpr std::array HR_FIX_LATE_STUBS{
+    OotFixStub{HR_WHOLE_OFFSET, HR_WHOLE},
+};
+// The sound accumulator and flag at +0, the step slots' index at +8, the 15 slots from +0x10, and
+// from +0x100 HR_WHOLE's 8 slots and its next-slot word.
+constexpr size_t HR_FIX_STATE_SIZE = 0x190;
 // The stubs in order, in free padding between the Hyrule Cheat Menu and the pickup stub; their
 // state inside the BSS, clear of Dark's timer state, the ripple and pickup slots and the cheats'
-// flags from main+0x4E9FF80.
-static_assert([] {
-    size_t end = HR_FIX_CAVE_START;
-    for (const OotFixStub& stub : HR_FIX_STUBS) {
+// flags from main+0x4E9FF80. Known cheats write their own code to main+0x3C46A00..0x3C46AAC and
+// main+0x3C46CC0..0x3C46DB0 while the game runs, which no check at load can see: no stub there.
+constexpr bool HrFixStubsInOrder(std::span<const OotFixStub> stubs, size_t start, size_t limit) {
+    size_t end = start;
+    for (const OotFixStub& stub : stubs) {
         if (stub.offset < end || stub.offset % 4 != 0 || stub.bytes.size() % 4 != 0) {
             return false;
         }
         end = stub.offset + stub.bytes.size();
+        const auto touches = [&](size_t first, size_t last) {
+            return stub.offset < last && first < end;
+        };
+        if (touches(0x3C46A00, 0x3C46AAC) || touches(0x3C46CC0, 0x3C46DB0)) {
+            return false;
+        }
     }
-    return HR_FIX_CAVE_START >= 0x3C46398 && end <= PICKUP_STUB_OFFSET;
-}());
+    return end <= limit;
+}
+static_assert(HR_FIX_CAVE_START >= 0x3C46398 &&
+              HrFixStubsInOrder(HR_FIX_STUBS, HR_FIX_CAVE_START, PICKUP_STUB_OFFSET));
+static_assert(HrFixStubsInOrder(HR_FIX_LATE_STUBS, HIGH_REFRESH_ROUTINE_OFFSET + OOT_CAVE_SIZE,
+                                TEXTURE_POOL_ROUTINE_OFFSET));
 static_assert(HR_FIX_STATE_OFFSET >= 0x4E9B000 &&
               HR_FIX_STATE_OFFSET + HR_FIX_STATE_SIZE <= HIGH_REFRESH_STATE_OFFSET &&
-              HR_FIX_STATE_OFFSET + HR_FIX_STATE_SIZE <= PICKUP_STATE_OFFSET);
+              HR_FIX_STATE_OFFSET + HR_FIX_STATE_SIZE <= PICKUP_STATE_OFFSET &&
+              HR_WHOLE_SLOTS_OFFSET + 0x84 <= HR_FIX_STATE_OFFSET + HR_FIX_STATE_SIZE);
 // The hooks over the game's words, then every stub word, each checked to be zero.
 constexpr size_t HR_FIX_RECORD_COUNT = HR_FIX_HOOKS.size() + [] {
     size_t words = 0;
     for (const OotFixStub& stub : HR_FIX_STUBS) {
+        words += stub.bytes.size() / 4;
+    }
+    for (const OotFixStub& stub : HR_FIX_LATE_STUBS) {
         words += stub.bytes.size() / 4;
     }
     return words;
@@ -852,19 +928,32 @@ constexpr auto HR_FIX_RECORDS = [] {
         records[i++] = BuiltinPatchRecord{.module_offset = hook.offset,
                                           .bytes = hook.bytes,
                                           .checked = true,
-                                          .original = hook.original};
+                                          .original = hook.original,
+                                          .skip_env = hook.skip_env};
     }
-    for (const OotFixStub& stub : HR_FIX_STUBS) {
-        for (size_t offset = 0; offset < stub.bytes.size(); offset += 4) {
-            records[i++] = BuiltinPatchRecord{.module_offset = stub.offset + offset,
-                                              .bytes = stub.bytes.subspan(offset, 4),
-                                              .checked = true,
-                                              .original = 0};
+    const auto add_stubs = [&](std::span<const OotFixStub> stubs) {
+        for (const OotFixStub& stub : stubs) {
+            for (size_t offset = 0; offset < stub.bytes.size(); offset += 4) {
+                records[i++] = BuiltinPatchRecord{.module_offset = stub.offset + offset,
+                                                  .bytes = stub.bytes.subspan(offset, 4),
+                                                  .checked = true,
+                                                  .original = 0};
+            }
         }
-    }
+    };
+    add_stubs(HR_FIX_STUBS);
+    add_stubs(HR_FIX_LATE_STUBS);
     return records;
 }();
 constexpr std::string_view HR_FIX_NAME = "High refresh fixes (built-in)";
+
+bool BuiltinRecordSkipped(const BuiltinPatchRecord& record) {
+    if (record.skip_env == nullptr) {
+        return false;
+    }
+    const char* const value = std::getenv(record.skip_env);
+    return value != nullptr && std::string_view{value} == "1";
+}
 
 bool HighRefreshSettingOn() {
     // Tests boot either way without touching the player's config: EDEN_NX2_OOT_HIGH_REFRESH=0/1.
@@ -1830,6 +1919,9 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         // user mod already (the mod's patch is used then, for all records).
         bool apply = true;
         for (const BuiltinPatchRecord& record : patch.records) {
+            if (BuiltinRecordSkipped(record)) {
+                continue;
+            }
             const size_t offset = sizeof(Loader::NSOHeader) + record.module_offset;
             if (nso.size() < offset + record.bytes.size() ||
                 out.size() < offset + record.bytes.size()) {
@@ -1870,6 +1962,11 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
             continue;
         }
         for (const BuiltinPatchRecord& record : patch.records) {
+            if (BuiltinRecordSkipped(record)) {
+                LOG_INFO(Loader, "    - \"{}\": leaving {}+{:#x} out, {}=1", patch.name, name,
+                         record.module_offset, record.skip_env);
+                continue;
+            }
             std::memcpy(out.data() + sizeof(Loader::NSOHeader) + record.module_offset,
                         record.bytes.data(), record.bytes.size());
         }
