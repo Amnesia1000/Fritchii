@@ -6015,6 +6015,24 @@ Performance). Check per height: `Applying built-in patch "540p render (built-in)
 its scene at 960x540`, `NVIDIA DLSS (Streamline): 960x540 -> 1920x1080`, no repeating `the game's
 upscale draws frame N`.
 
+### FRITCHII_OOT_ACTOR_PARTS, _TOLERANCE, _TRACE, FRITCHII_OOT_MOTION_VIEW
+
+TEST, all boot switches, off by default (16 for the tolerance). OoT has no motion vectors, so
+Fritchii makes them: the camera's from depth, and for Link a replay of his one recognized skinned
+draw (9702 indices) with this frame's and the last frame's bones. Everything else gets the
+camera's motion only, which is none while the camera stands still.
+
+- FRITCHII_OOT_ACTOR_PARTS=1: the replay also takes the other draws of the actor's vertex program
+  with Link's bones and origin. A draw that doesn't belong is dropped by the replay's depth check.
+- FRITCHII_OOT_ACTOR_TOLERANCE=N: how far the replay's depth may be from the scene's, in steps of
+  the depth format. Try 64 or 256 if the motion view shows Link speckled.
+- FRITCHII_OOT_ACTOR_TRACE=1: every 600th frame logs `Ocarina actor trace:` lines: the indexed
+  draws of that program or with 48-byte vertices (shaders, index count, target, depth, blend,
+  alpha test, discard), and which of them share Link's skeleton.
+- FRITCHII_OOT_MOTION_VIEW=1: the game's target shows the motion vectors: black = none, blue =
+  some (more red and green = more pixels of motion). With a still camera only the replay's pixels
+  light up, so a screenshot shows which parts of Link have motion. Outputs up to 1440p only.
+
 ### Low-end PC simulation: FRITCHII_SIM_GPU_SLOW, FRITCHII_SIM_CPU, FRITCHII_SIM_CPU_SLOW, FRITCHII_SIM_RAM_LIMIT_MB
 
 TEST, all off by default (helper EY, 2026-11-19). They make a fast PC behave more like a weak one,
