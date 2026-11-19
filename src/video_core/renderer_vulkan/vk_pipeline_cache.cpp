@@ -3886,6 +3886,15 @@ GraphicsPipeline* PipelineCache::OcclFlagPipeline(GraphicsPipeline* pipeline,
                                               !pipeline->IsMeshPipeline()
                                           ? OcclFlagColourVerdict(*pipeline)
                                           : Census::Unknown;
+        if (colour_verdict == Census::ColourSubgroup) {
+            const auto& infos = pipeline->StageInfos();
+            const Shader::Info& pixel = infos[infos.size() - 1];
+            OcclFlag::Add(stats.sg_vote, pixel.uses_subgroup_vote ? 1 : 0);
+            OcclFlag::Add(stats.sg_mask, pixel.uses_subgroup_mask ? 1 : 0);
+            OcclFlag::Add(stats.sg_shuffle, pixel.uses_subgroup_shuffles ? 1 : 0);
+            OcclFlag::Add(stats.sg_invocation_id, pixel.uses_subgroup_invocation_id ? 1 : 0);
+            OcclFlag::Add(stats.sg_helper, pixel.uses_is_helper_invocation ? 1 : 0);
+        }
         if (colour_verdict == Census::Flag && pipeline->occl_flag_colour_state != 2 &&
             OcclFlag::ColourAllowed() && device.IsShaderInt64Supported()) {
             GraphicsPipeline* colour = pipeline->occl_flag_colour.get();

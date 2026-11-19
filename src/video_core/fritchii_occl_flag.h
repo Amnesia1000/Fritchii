@@ -119,6 +119,8 @@ inline thread_local Census t_census{};
 struct Stats {
     std::atomic<u64> census[static_cast<size_t>(Census::Count)]{};
     std::atomic<u64> colour_lean_pipelines{}; ///< distinct pipelines of colour Lean draws
+    /// Colour Lean draws refused for subgroup operations, by operation (a draw can count twice).
+    std::atomic<u64> sg_vote{}, sg_mask{}, sg_shuffle{}, sg_invocation_id{}, sg_helper{};
     std::atomic<u64> qslot_injectable{}; ///< query slots whose draws were all flag or colour Lean
     std::atomic<u64> qslot_blocked{};    ///< query slots with a blocking draw
     std::atomic<u64> qslot_empty{};      ///< query slots with no counted draw marked
@@ -210,10 +212,13 @@ inline void MaybeLog() {
     }
     LOG_INFO(Render_Vulkan,
              "Occlusion flag census per second: counted draws by class: {}; colour Lean "
-             "pipelines {} distinct in the window; query slots closed: {:.0f} all flag or "
-             "colour Lean, "
+             "pipelines {} distinct in the window; colour Lean subgroup draws by operation: vote "
+             "{:.0f}, mask {:.0f}, shuffle {:.0f}, invocation id {:.0f}, helper {:.0f}; query "
+             "slots closed: {:.0f} all flag or colour Lean, "
              "{:.0f} blocked, {:.0f} no draw marked",
              census, g.colour_lean_pipelines.exchange(0, std::memory_order_relaxed),
+             take(g.sg_vote), take(g.sg_mask), take(g.sg_shuffle), take(g.sg_invocation_id),
+             take(g.sg_helper),
              take(g.qslot_injectable),
              take(g.qslot_blocked), take(g.qslot_empty));
 }
