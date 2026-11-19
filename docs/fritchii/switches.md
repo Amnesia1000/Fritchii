@@ -2793,10 +2793,39 @@ compares (step 3 BuildPipeline would see the sibling); FRITCHII_ONEF_LEAN=1 turn
 
 ### FRITCHII_OCCL_FLAG (the "Occlusion flags" line)
 
-Built in at 1 since 6.2 (2026-11-19; the core, as its author asked; 0 turns it off). Live between its values, but **set it at boot**: the device
-keeps the buffer device address feature for the flag area only when FRITCHII_OCCL_FLAG is set
-when the device is made ("Occlusion flags (FRITCHII_OCCL_FLAG): buffer device address enabled
-for the flag area" at boot). Vulkan 1.2 or later; one follower off (the draw path it hooks is the
+A player setting since 6.2: Settings > Graphics > Advanced > "OoT occlusion speed-up", Off /
+Standard / Full (Settings::values.occlusion_speedup, global only, takes effect when the game
+starts). Standard, the default, is the core (3); Full is everything (9). When a switch sets
+FRITCHII_OCCL_FLAG (environment or nx2_switches.txt) the switch wins, for tests; it is no longer
+in the built-in switches. At each game boot the device logs "Occlusion flags:
+FRITCHII_OCCL_FLAG=N (set by a switch | the Occlusion speed-up setting)". Live between its values
+(debug server), but the device keeps the buffer device address feature for the flag area only
+when the value is not 0 at boot ("Occlusion flags (FRITCHII_OCCL_FLAG): buffer device address
+enabled for the flag area").
+
+Values: 0 off; 3 the core (Standard); 9 everything (Full: the core, colour flag variants, the
+discard pre-pass, the colour pre-pass); 1 the core as well (6.2's test builds baked 1 for the
+core, so a 1 left in a switch file or script never turns the rest on; the contributed package
+numbered "everything" 1, here it is 9); 2 verify (every flag store of 9, the host queries still
+decide; any game); 5 as 3 with the discard pre-pass and 8 as 9 without the colour pre-pass (A/B).
+Any other value is off.
+
+Full is offered once to players it can help (fritchii/occlusion_offer.cpp): when a game ends in
+which the flags acted in OoT on AMD's Windows driver with shaderInt64 (the rasterizer sets
+OcclFlag::g_full_could_help), the setting is still Standard and no switch sets
+FRITCHII_OCCL_FLAG, the offer is marked pending (UISettings fritchii_occl_offer) and shown 0.8 s
+after the game list is back, unless another window is up; else at the next plain launch. "Faster
+mode for AMD / Can give more fps on AMD cards. / Change it any time in Graphics > Advanced.
+[Not now] [Turn it on]". The answer is kept and logged ("Occlusion speed-up offer: ..."); it is
+never asked again. FRITCHII_OCCL_OFFER=0 never asks; =ask asks at every plain launch on any PC
+(screenshots). In the settings, Full is greyed out where it can't act (the picked card runs one
+follower: every card but AMD's Windows driver by default), with one tooltip line.
+
+Preparing shaders: the extensions change files the stamp hashes, but no prepared pipeline (every
+new SPIR-V path runs only for a variant made during play, never stored on disk; any other module
+is byte-identical; vk_graphics_pipeline.cpp gained draw-time code only). Nx2ShaderStamp.cmake maps
+the new hashes to 6.1's stamp (SameAsReleased, with that reason), so nobody prepares again, with
+Full on or off. Vulkan 1.2 or later; one follower off (the draw path it hooks is the
 one-thread path, which is the path on AMD's Windows driver). Code: fritchii_occl_flag.h,
 vulkan_occl_flag.frag, PipelineCache::OcclFlagPipeline / FindOrMakeOcclFlag, SamplesStreamer.
 
@@ -2829,7 +2858,7 @@ memory preferred) that the fencing thread reads.
   slot; at each report the fencing thread compares "the query counted samples" with "a flag was
   stored" for reports whose counted draws were all flag draws. Must be 0 disagreements. Reports
   whose banks were reserved again before the compare are skipped ("bank reused").
-- 1: on, Ocarina of Time only (its program ID) and not with precise counts (accurate part 2): a
+- 3 (and 1, 5, 8, 9): on, Ocarina of Time only (its program ID) and not with precise counts (accurate part 2): a
   flag slot reports 4096 when any sample passed, not the count, which is all OoT's 0xe2c pair test
   asks. A query window's first counted draw opens a flag slot (no host query) when it is a flag
   draw; any other counted draw (colour on, not Lean, texture draws, draw clears) closes it and
@@ -2875,9 +2904,10 @@ reads the CPU-written value. No flag area on Qualcomm, ARM or Turnip drivers. Th
 device-local memory (see above). Not tested on NVIDIA or Intel, nor with one follower on. Not with
 the memory-stage ring (facts are the parent's key, but not checked).
 
-#### Colour variants and pre-passes (2026-11-18, part of =1 and =2)
+#### Colour variants and pre-passes (2026-11-18; Full, =9, and verify, =2)
 
-Mode 1 and verify also cover counted draws that keep their queries otherwise:
+Full and verify also cover counted draws that keep their queries otherwise (the contributed
+package called this value 1):
 - Colour flag variant: a colour-writing draw whose pixel program is Lean and uses no subgroup,
   quad or helper operations (and no alpha to coverage) draws with its guest pixel program
   translated with RuntimeInfo::occl_flag_store: early fragment tests and, at the start of main,
@@ -2904,7 +2934,7 @@ Mode 1 and verify also cover counted draws that keep their queries otherwise:
   already open in the window counts the real draw (no pre-pass); verify ends the open query
   around the pre-pass so it compares the pre-pass flag with the real draw's count.
 - Test values (exact picture, for A/B): 3 colour-off flag variants only, 5 as 3 with the discard
-  pre-pass, 8 as 1 without the colour pre-pass.
+  pre-pass, 8 as 9 without the colour pre-pass.
 
 Logs: the flag line adds "colour flag draws, colour flag pipelines made; pre-pass draws (between
 host queries, skipped: a host query open), made, refused at the draw, refused for their
@@ -2914,11 +2944,12 @@ discarding draws' writes and the subgroup operations of colour Lean draws refuse
 Test switches (development): FRITCHII_OCCL_FLAG_DUMP=<folder> writes the first 64 colour or
 pre-pass flag pixel programs; FRITCHII_SPIRV_DUMP_DISCARD=<folder> the first 200 discarding
 programs emitted; FRITCHII_TEST_KILL_FALLBACK=1 translates new programs with the backend's
-no-demote path (OpKill). Hang reports keep 64 GPU breadcrumbs (was 8).
+no-demote path (OpKill). (The package's 64 hang report breadcrumbs are not taken: Fritchii's
+report keeps 256 submissions and names the oldest unfinished one, since dfba1c5c30.)
 
 Measured (same rig, alternating rounds): verify about 235,000-360,000 reports with the
 pre-passes, 0 disagreements, no real draws lost; host query slots ~36,000 -> ~14,500 a second;
-=1 vs =3 frame time -0.6 to -1.0 ms. One GPU hang (device lost) under PCIe load in about 50
+9 vs 3 (the package's =1 vs =3) frame time -0.6 to -1.0 ms. One GPU hang (device lost) under PCIe load in about 50
 loaded windows with the pre-passes, not reproduced since (22 min playtest and ~30 more windows
 clean); cause unknown. Flag variants are not in the disk cache: each session translates them again
 on the GPU thread (one a frame) and the driver compiles them on the workers.

@@ -2928,6 +2928,12 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             Settings::GetCurrentProgramID() == 0x0400486024DEC000ULL &&
             !VideoCore::Nx2Debug::AccuratePart(2)) {
             query_cache_runtime.SetNextFlagDraw(true);
+            // The frontend offers Full once to players whose flags act here (AMD's driver).
+            if (!VideoCommon::OcclFlag::g_full_could_help.load(std::memory_order_relaxed) &&
+                device.GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY &&
+                device.IsShaderInt64Supported()) [[unlikely]] {
+                VideoCommon::OcclFlag::g_full_could_help.store(true, std::memory_order_relaxed);
+            }
         }
         query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
                                   maxwell3d->regs.zpass_pixel_count_enable);

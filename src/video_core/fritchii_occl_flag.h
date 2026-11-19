@@ -11,10 +11,12 @@
 
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "common/settings_enums.h"
 #include "video_core/nx2_debug_control.h"
 
-/// FRITCHII_OCCL_FLAG (TEST; live between 0 and 2, but set it at boot: the device keeps the buffer
-/// device address feature only when it is set then). Occlusion test draws that can show
+/// FRITCHII_OCCL_FLAG (the graphics setting "Occlusion speed-up" when no switch sets it; live
+/// between its values, but the device keeps the buffer device address feature only when it is
+/// not 0 at boot). Occlusion test draws that can show
 /// "samples passed" without a host query: a draw that counts samples, writes no colour and
 /// whose pixel program can change nothing (FRITCHII_OCCL_LEAN's Lean class) is drawn with a flag
 /// pipeline, the same key with a host pixel program that, with early fragment tests, stores
@@ -22,23 +24,28 @@
 /// 0 off. 2 verify: the host queries stay and decide everything; at each report the fencing
 /// thread compares "the query counted samples" with "a flag was stored" for the reports whose
 /// counted draws were all flag draws. The disagreements must be 0. One line every 10 s.
-/// 1 on: a query window whose counted draws are all flag draws runs no host query; its slots
-/// are flag slots, whose values the result copies (GPU) and reads (fencing thread) take from the
-/// flag area. A window with other counted draws splits into flag and query slots (summed).
+/// On (the other values, see Value): a query window whose counted draws are all flag draws runs
+/// no host query; its slots are flag slots, whose values the result copies (GPU) and reads
+/// (fencing thread) take from the flag area. A window with other counted draws splits into flag and query slots (summed).
 namespace VideoCommon::OcclFlag {
 
-/// 1 on: flag variants for colour-off Lean draws, colour flag variants, the pre-pass for
-/// discarding colour-off draws and the colour pre-pass. 2 verify: the same flag stores, the host
-/// queries still decide (and are compared). The A/B values (each as 1 without one part, the
-/// picture stays exact): 3 colour-off flag variants only (no colour variants, no pre-passes),
-/// 5 as 3 with the discard pre-pass, 8 as 1 without the colour pre-pass. Other values are off.
+/// The values. 3 the core: flag variants for colour-off Lean draws ("Standard" in the graphics
+/// settings, the default). 9 everything: the core, colour flag variants, the pre-pass for
+/// discarding colour-off draws and the colour pre-pass ("Full"). 1 the core too: 6.2's test
+/// builds had 1 for the core, so a 1 left in a switch file never turns the rest on. 2 verify:
+/// every flag store of 9, the host queries still decide (and are compared); any game. The A/B
+/// values (the picture stays exact): 5 as 3 with the discard pre-pass, 8 as 9 without the colour
+/// pre-pass. Other values are off. (The contributed package numbered everything 1; here it is 9.)
 enum Value : int {
     Off = 0,
+    /// The core; also what Mode() returns for every value that turns flags on (the "=1" and
+    /// "mode 1" of the comments elsewhere).
     On = 1,
     Verify = 2,
     OnColourOff = 3,
     OnPrepassOnly = 5,
     OnNoColourPrepass = 8,
+    Full = 9,
 };
 
 [[nodiscard]] inline int RawMode() noexcept {
@@ -50,35 +57,63 @@ enum Value : int {
     const int value = RawMode();
     return value == Verify                                                     ? Verify
            : (value == On || value == OnColourOff || value == OnPrepassOnly ||
-              value == OnNoColourPrepass)
+              value == OnNoColourPrepass || value == Full)
                ? On
                : Off;
 }
 
-/// Counted colour-off draws whose program discards may take the flag pre-pass (1, 2, 5).
+/// Counted colour-off draws whose program discards may take the flag pre-pass (9, 2, 5, 8).
 [[nodiscard]] inline bool PrepassAllowed() noexcept {
     const int value = RawMode();
-    return value == On || value == Verify || value == OnPrepassOnly ||
+    return value == Full || value == Verify || value == OnPrepassOnly ||
            value == OnNoColourPrepass;
 }
 
-/// Colour-writing counted draws may take the colour flag variant (not with =3).
+/// Colour-writing counted draws may take the colour flag variant (9, 2, 8).
 [[nodiscard]] inline bool ColourAllowed() noexcept {
     const int value = RawMode();
-    return value == On || value == Verify || value == OnNoColourPrepass;
+    return value == Full || value == Verify || value == OnNoColourPrepass;
 }
 
 /// Colour Lean draws the colour variant cannot take (subgroup or quad operations) may take the
-/// colour pre-pass: the host flag program first with colour and depth writes off (1, 2).
+/// colour pre-pass: the host flag program first with colour and depth writes off (9, 2).
 [[nodiscard]] inline bool ColourPrepassAllowed() noexcept {
     const int value = RawMode();
-    return value == On || value == Verify;
+    return value == Full || value == Verify;
 }
 
-/// Read once at device creation: whether to keep the buffer device address feature.
-[[nodiscard]] inline bool WantedAtBoot() noexcept {
-    const char* value = std::getenv("FRITCHII_OCCL_FLAG");
-    return value != nullptr && value[0] != '\0' && value[0] != '0';
+/// The graphics setting "Occlusion speed-up" (Settings::values.occlusion_speedup) as a value:
+/// Off 0, Standard 3 (the core), Full 9.
+[[nodiscard]] inline int FromSetting(Settings::OcclusionSpeedup setting) noexcept {
+    switch (setting) {
+    case Settings::OcclusionSpeedup::Off:
+        return Off;
+    case Settings::OcclusionSpeedup::Full:
+        return Full;
+    default:
+        return OnColourOff;
+    }
+}
+
+/// Set during a session whose flags acted in OoT on AMD's proprietary driver with 64-bit shader
+/// integers (the rasterizer, at a flag draw): what Full needs to add anything. The frontend's
+/// one-time offer of Full reads it after the game (fritchii/occlusion_offer.cpp).
+inline std::atomic<bool> g_full_could_help{};
+
+/// At device creation (every game boot): the session's value, FRITCHII_OCCL_FLAG when the
+/// environment or nx2_switches.txt sets it (tests), else `setting_value` (FromSetting). The debug
+/// server can still change it live. True when it is not 0: the device then keeps the buffer
+/// device address feature for the flag area (only at boot).
+inline bool ReadAtBoot(int setting_value) {
+    const char* const env = std::getenv("FRITCHII_OCCL_FLAG");
+    const bool from_switch = env != nullptr && env[0] != '\0';
+    const int value = from_switch ? std::atoi(env) : setting_value;
+    VideoCore::Nx2Debug::g_occl_flag.store(value, std::memory_order_relaxed);
+    VideoCore::Nx2Debug::BumpSwitchGeneration();
+    g_full_could_help.store(false, std::memory_order_relaxed);
+    LOG_INFO(Render_Vulkan, "Occlusion flags: FRITCHII_OCCL_FLAG={} ({})", value,
+             from_switch ? "set by a switch" : "the Occlusion speed-up setting");
+    return value != Off;
 }
 
 /// Census (with the flag lines): why a counted draw has no flag pipeline. Set by
@@ -214,7 +249,7 @@ inline void MaybeLog() {
              "between host queries, {:.0f} skipped: a host query open), made {:.0f}, refused at "
              "the draw {:.0f}, refused for their descriptors {} since boot, real draws lost {} "
              "(must be 0); colour pre-pass draws {:.0f}",
-             Mode(), flag_draws, other, not_lean, refused, not_ready, made, failed, no_slot,
+             RawMode(), flag_draws, other, not_lean, refused, not_ready, made, failed, no_slot,
              compared, agree, q0_f1, q1_f0, g.disagree_total.load(std::memory_order_relaxed),
              mixed, no_flag, reused, flag_slots, query_slots, colour_flag_draws, colour_made,
              prepass_draws, prepass_paused, prepass_skipped, prepass_made, prepass_fallback,
