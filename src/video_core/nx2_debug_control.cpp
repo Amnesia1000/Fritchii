@@ -344,6 +344,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_OCCL_LEAN") {
         return &g_occl_lean;
     }
+    if (name == "FRITCHII_OCCL_FLAG") {
+        return &g_occl_flag;
+    }
     if (name == "FRITCHII_LOCK_CENSUS") {
         // Lives in common (the cache locks' contended path); -1 until its first read.
         return &Common::LockCensus::g_mode;

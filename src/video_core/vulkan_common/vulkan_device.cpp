@@ -15,6 +15,7 @@
 #include <optional>
 #include <thread>
 #include <unordered_map>
+#include "video_core/fritchii_occl_flag.h"
 #include "common/container/unordered_map.h"
 #include "common/container/unordered_set.h"
 #include <utility>
@@ -1023,9 +1024,27 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         extensions.buffer_device_address = false;
     } else
 #endif
-    if (!extensions.descriptor_buffer) {
+    if (!extensions.descriptor_buffer && VideoCommon::OcclFlag::WantedAtBoot() &&
+        instance_version >= VK_API_VERSION_1_2 &&
+        features.buffer_device_address.bufferDeviceAddress) {
+        // FRITCHII_OCCL_FLAG: the flag pipelines store through buffer device addresses. As for
+        // DLSS above, the feature stays enabled while the emulator's own buffers and VMA stay
+        // as they are without descriptor buffers.
+        extensions.buffer_device_address = false;
+        occl_flag_device_address = true;
+    } else if (!extensions.descriptor_buffer) {
         RemoveExtensionFeature(extensions.buffer_device_address, features.buffer_device_address,
                                VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
+    }
+    // FRITCHII_OCCL_FLAG: whichever branch ran, the feature is still enabled when it was not
+    // removed (the DLSS branch keeps it too).
+    if (VideoCommon::OcclFlag::WantedAtBoot()) {
+        occl_flag_device_address = instance_version >= VK_API_VERSION_1_2 &&
+                                   features.buffer_device_address.bufferDeviceAddress != 0;
+        LOG_INFO(Render_Vulkan,
+                 "Occlusion flags (FRITCHII_OCCL_FLAG): buffer device address {} (instance {}.{})",
+                 occl_flag_device_address ? "enabled for the flag area" : "not available",
+                 VK_API_VERSION_MAJOR(instance_version), VK_API_VERSION_MINOR(instance_version));
     }
 
     // The float16 workarounds above keep shaders from doing float16 arithmetic. Cooperative

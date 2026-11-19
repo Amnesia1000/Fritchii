@@ -29,6 +29,7 @@
 
 #include <fmt/format.h>
 
+#include "video_core/fritchii_occl_flag.h"
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 
 #include "common/assert.h"
@@ -2371,9 +2372,23 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     // With rule 3 the packet carries E's pipeline (no lookup on R, and graphics_cache is E's).
     const bool onef_lookup = onef_play != nullptr && onef_play->pipeline == nullptr;
     const size_t onef_entries_before = onef_lookup ? pipeline_cache.GraphicsEntries() : 0;
+    // FRITCHII_OCCL_FLAG (fritchii_occl_flag.h): with one follower off, an occlusion test draw
+    // may take its pipeline's flag variant; a kept flag variant is decided again.
+    VideoCommon::OcclFlag::t_census = VideoCommon::OcclFlag::Census::Unknown;
+    const auto occl_flag = [&](GraphicsPipeline* chosen, bool allow_make) -> GraphicsPipeline* {
+        if (chosen != nullptr && chosen->occl_flag_parent != nullptr) {
+            chosen = chosen->occl_flag_parent; // a kept flag variant: decided again
+        }
+        if (onef_play != nullptr || chosen == nullptr ||
+            VideoCommon::OcclFlag::Mode() == VideoCommon::OcclFlag::Off ||
+            !query_cache_runtime.OcclFlagReady()) {
+            return chosen;
+        }
+        return pipeline_cache.OcclFlagPipeline(chosen, maxwell3d->regs, allow_make);
+    };
     GraphicsPipeline* const pipeline{[&]() -> GraphicsPipeline* {
         if (delta_pipeline != nullptr) {
-            return delta_pipeline; // EXP118: kept, no lookup
+            return occl_flag(delta_pipeline, false); // EXP118: kept, no lookup (locks held)
         }
         if (onef_play != nullptr && onef_play->pipeline != nullptr) {
             // Rule 3 (FRITCHII_ONEF_E_PIPELINE): E looked this draw's pipeline up at its own
@@ -2382,7 +2397,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                 static_cast<const GraphicsPipeline*>(onef_play->pipeline));
         }
         Profile::Scope scope{Profile::Zone::PipelineLookup};
-        return pipeline_cache.CurrentGraphicsPipeline();
+        return occl_flag(pipeline_cache.CurrentGraphicsPipeline(), true);
     }()};
     if (onef_lookup &&
         (!pipeline || pipeline_cache.GraphicsEntries() > onef_entries_before)) [[unlikely]] {
@@ -2870,8 +2885,40 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         const Profile::FineScope queries_scope{Profile::Zone::DrawQueries};
         query_cache.NotifySegment(true);
         HandleTransformFeedback();
+        // FRITCHII_OCCL_FLAG=1: a flag draw opens (or keeps) a slot with no host query.
+        // A flag slot reports 4096 when any sample passed, not the count: only for Ocarina of
+        // Time, whose occlusion tests ask "any sample" (0xe2c compares a pair, one of them 0),
+        // and not when the counts are asked to be precise (accurate part 2).
+        const bool flag_draw = pipeline->occl_flag_parent != nullptr;
+        if (flag_draw && VideoCommon::OcclFlag::Mode() == VideoCommon::OcclFlag::On &&
+            Settings::GetCurrentProgramID() == 0x0400486024DEC000ULL &&
+            !VideoCore::Nx2Debug::AccuratePart(2)) {
+            query_cache_runtime.SetNextFlagDraw(true);
+        }
         query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
                                   maxwell3d->regs.zpass_pixel_count_enable);
+        query_cache_runtime.SetNextFlagDraw(false);
+        // FRITCHII_OCCL_FLAG: a flag variant stores into the open query's slot (push constant
+        // bytes 40 to 47, unused otherwise); other counted draws mark their slot as mixed.
+        // Census: the class the pipeline lookup gave this draw (Unknown: no lookup).
+        const auto census = std::exchange(VideoCommon::OcclFlag::t_census,
+                                          VideoCommon::OcclFlag::Census::Unknown);
+        if (pipeline->occl_flag_parent != nullptr) {
+            const u64 address = query_cache_runtime.OcclFlagAddress();
+            scheduler.Record([layout = pipeline->Layout(), address](vk::CommandBuffer cmdbuf) {
+                cmdbuf.PushConstants(layout, VK_SHADER_STAGE_ALL_GRAPHICS, 40, sizeof(address),
+                                     &address);
+            });
+            VideoCommon::OcclFlag::Add(VideoCommon::OcclFlag::g_stats.flag_draws);
+        } else if (maxwell3d->regs.zpass_pixel_count_enable != 0) {
+            query_cache_runtime.NoteOtherCountedDraw(
+                VideoCommon::OcclFlag::Blocks(census)); // nothing without the flag area
+            if (VideoCommon::OcclFlag::Mode() != VideoCommon::OcclFlag::Off) [[unlikely]] {
+                VideoCommon::OcclFlag::Add(VideoCommon::OcclFlag::g_stats.other_counted);
+                VideoCommon::OcclFlag::Add(
+                    VideoCommon::OcclFlag::g_stats.census[static_cast<size_t>(census)]);
+            }
+        }
     }
     const std::optional<u32> probe =
         frame_dump.CapturingSampled() ? frame_dump.BeginProbe() : std::nullopt;
@@ -4868,6 +4915,9 @@ void RasterizerVulkan::DrawTexture() {
 
     query_cache.NotifySegment(true);
     query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);
+    if (maxwell3d->regs.zpass_pixel_count_enable != 0) {
+        query_cache_runtime.NoteOtherCountedDraw(); // FRITCHII_OCCL_FLAG: not a flag draw
+    }
     const auto& draw_texture_state = maxwell3d->draw_manager.draw_texture_state;
     const auto& sampler = texture_cache.GetSampler(draw_texture_state.src_sampler, false);
     const auto& texture = texture_cache.GetImageView(draw_texture_state.src_texture);
@@ -5247,6 +5297,9 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     // would begin it outside the pass and end it inside the next draw's pass.
     query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
                               !can_defer_clear && regs.zpass_pixel_count_enable);
+    if (maxwell3d->regs.zpass_pixel_count_enable != 0) {
+        query_cache_runtime.NoteOtherCountedDraw(); // FRITCHII_OCCL_FLAG: not a flag draw
+    }
     UpdateViewportsState(regs);
 
     const u32 color_attachment = regs.clear_surface.RT;

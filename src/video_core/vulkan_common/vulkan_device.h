@@ -699,6 +699,12 @@ FN_MAX_LIMIT_LIST
         return extensions.buffer_device_address;
     }
 
+    /// FRITCHII_OCCL_FLAG: the buffer device address feature is enabled for the flag pipelines
+    /// alone (IsBufferDeviceAddressSupported stays false for everything else).
+    bool IsOcclFlagDeviceAddressEnabled() const {
+        return occl_flag_device_address || extensions.buffer_device_address;
+    }
+
     /// Returns true if formatless image load is supported.
     bool IsFormatlessImageLoadSupported() const {
         // FRITCHII_FORMATLESS_13 (boot, default 0): Vulkan 1.3 allows formatless reads per format
@@ -1625,6 +1631,7 @@ private:
     // Telemetry parameters
     std::set<std::string, std::less<>> supported_extensions; ///< Reported Vulkan extensions.
     std::set<std::string, std::less<>> loaded_extensions;    ///< Loaded Vulkan extensions.
+    bool occl_flag_device_address{}; ///< FRITCHII_OCCL_FLAG kept the BDA feature
     bool streamline_extensions{}; ///< NVIDIA DLSS's extensions are loaded.
     bool streamline_attached{};   ///< Streamline has this device.
     std::vector<size_t> valid_heap_memory;                   ///< Heaps used.
