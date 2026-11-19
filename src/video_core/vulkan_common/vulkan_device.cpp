@@ -1126,6 +1126,11 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
 
     graphics_queue = logical.GetQueue(graphics_family);
     present_queue = logical.GetQueue(present_family);
+    if (const std::optional<u32> family = LinkHogFamily()) {
+        link_hog_queue = logical.GetQueue(*family);
+        link_hog_family = *family;
+        has_link_hog_queue = true;
+    }
     if (WantsSideQueue()) {
         side_queue = logical.GetQueue(graphics_family, 1);
         has_side_queue = true;
@@ -3230,6 +3235,69 @@ bool Device::WantsSideQueue() const {
     return wanted;
 }
 
+std::optional<u32> Device::LinkHogFamily() const {
+    // Read where the device is made: after main() applied nx2_switches.txt.
+    static const std::optional<u32> family = [this]() -> std::optional<u32> {
+        // The mode alone is enough: a live test can then start the copies at rate 0.
+        const char* const value = std::getenv("FRITCHII_SIM_LINK_HOG");
+        if ((value == nullptr || std::atoi(value) <= 0) &&
+            std::getenv("FRITCHII_SIM_LINK_HOG_MODE") == nullptr) {
+            return std::nullopt;
+        }
+        // A family of its own: copy-only if there is one (a copy engine), else compute-only.
+        const auto families = physical.GetQueueFamilyProperties();
+        std::optional<u32> compute_only;
+        for (u32 index = 0; index < families.size(); ++index) {
+            const VkQueueFlags flags = families[index].queueFlags;
+            if (index == graphics_family || index == present_family ||
+                families[index].queueCount == 0 || (flags & VK_QUEUE_GRAPHICS_BIT) != 0) {
+                continue;
+            }
+            if ((flags & VK_QUEUE_COMPUTE_BIT) == 0 && (flags & VK_QUEUE_TRANSFER_BIT) != 0) {
+                return index;
+            }
+            if ((flags & VK_QUEUE_COMPUTE_BIT) != 0 && !compute_only) {
+                compute_only = index;
+            }
+        }
+        if (!compute_only) {
+            LOG_WARNING(Render_Vulkan, "FRITCHII_SIM_LINK_HOG: no queue family for it, off");
+        }
+        return compute_only;
+    }();
+    return family;
+}
+
+bool Device::PrefersDescriptorSets() const {
+    static const bool prefers = [this] {
+        const char* const value = std::getenv("FRITCHII_DESCRIPTOR_SETS");
+        const int mode = value != nullptr ? std::atoi(value) : 0;
+        VkDeviceSize window = 0;
+        const auto memory = physical.GetMemoryProperties().memoryProperties;
+        for (u32 type = 0; type < memory.memoryTypeCount; ++type) {
+            const VkMemoryPropertyFlags flags = memory.memoryTypes[type].propertyFlags;
+            if ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 &&
+                (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
+                window = (std::max)(window, memory.memoryHeaps[memory.memoryTypes[type].heapIndex].size);
+            }
+        }
+        // =2: where AMD's driver keeps command buffers and push descriptors in host memory: a
+        // discrete card whose CPU-visible window is 7 GiB or less (no resizable BAR).
+        const bool amd = GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY ||
+                         GetDriverID() == VK_DRIVER_ID_AMD_OPEN_SOURCE;
+        const bool on = mode == 1 || (mode == 2 && amd && !IsIntegrated() &&
+                                      window <= VkDeviceSize{7} << 30);
+        LOG_INFO(Render_Vulkan,
+                 "Descriptors: {} (FRITCHII_DESCRIPTOR_SETS={}; push descriptors {}, descriptor "
+                 "buffer {}; CPU-visible device memory {} MiB)",
+                 on ? "sets from pools" : "as the driver's features allow", mode,
+                 IsKhrPushDescriptorSupported() ? "supported" : "not supported",
+                 IsExtDescriptorBufferSupported() ? "supported" : "off", window >> 20);
+        return on;
+    }();
+    return prefers;
+}
+
 std::vector<VkDeviceQueueCreateInfo> Device::GetDeviceQueueCreateInfos() const {
     static constexpr float QUEUE_PRIORITY = 1.0f;
     static constexpr std::array<float, 2> QUEUE_PRIORITIES{1.0f, 1.0f};
@@ -3253,6 +3321,16 @@ std::vector<VkDeviceQueueCreateInfo> Device::GetDeviceQueueCreateInfos() const {
             ci.queueCount = 2;
             ci.pQueuePriorities = QUEUE_PRIORITIES.data();
         }
+    }
+    if (const std::optional<u32> family = LinkHogFamily()) {
+        queue_cis.push_back(VkDeviceQueueCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .queueFamilyIndex = *family,
+            .queueCount = 1,
+            .pQueuePriorities = &QUEUE_PRIORITY,
+        });
     }
 
     return queue_cis;
