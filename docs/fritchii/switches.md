@@ -896,7 +896,7 @@ cards; never integrated GPUs; a simulated card's limit counts). The small card p
 card should stop overflowing in real play (RTX 2080 at 1440p: 7.9 GB of a 6.7-7.2 GB budget, 32
 pressure events, read-backs stalling for seconds; RTX 3070 Ti 6850 of 7181) and a 6 GB card should
 fit at 1x, with nothing reserved for show. Big cards never turn it on in auto mode.
-FRITCHII_SMALL_CARD_PARTS (boot, bit mask, default 0xF) picks the parts:
+FRITCHII_SMALL_CARD_PARTS (boot, bit mask, default 0x2F) picks the parts:
 - 0x1 fit (live): the texture cache's critical threshold = budget less 1/16 of it (at most 512
   MiB; was 1/8, at most 1 GiB) less the out-of-memory margin, the block slack and what the cache's
   usage leaves out: the image pool, deleted images still in flight, collector downloads, frees
@@ -914,6 +914,9 @@ FRITCHII_SMALL_CARD_PARTS (boot, bit mask, default 0xF) picks the parts:
   stays); the status bar reads "Scale: 1x (2x DOESN'T FIT)". Log: "Small card profile: resolution
   scale ... does not fit".
 - 0x10 stream (boot, not in the default): stream buffer 64 MiB instead of 128.
+- 0x20 buffer pool blocks (boot): the buffer cache's device-local pool uses 4 MiB blocks instead of
+  16, buffers over 2 MiB take the default blocks (FRITCHII_BUFFER_POOL_BLOCK_MB overrides, 0 keeps
+  16). Castle Town: ~140 MiB of small buffers held 50 blocks, 800 MiB, on every card size.
 Logs: at boot "Small card profile (FRITCHII_SMALL_CARD=N): main heap H MiB, budget B MiB, a small /
 not a small card; profile on/off (parts ...)"; the thresholds' "Memory margins" line adds
 "uncounted U MiB (small card profile on/off)"; with FRITCHII_VRAM_REPORT=1 a second line "VRAM split
