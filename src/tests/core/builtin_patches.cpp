@@ -768,6 +768,7 @@ TEST_CASE("High refresh fixes built-in hooks its sites in both modes", "[patch_m
         Hook{0x2C207A4, 0xBD466D00, 0x14409853}, // -> b 0x3c468f0
         Hook{0x2C2208C, 0xBD466D02, 0x14409231}, // -> b 0x3c46950
         Hook{0x3CDFC0, 0x1E380008, 0x14E1E27C}, // time of day cut -> b 0x3c469b0
+        Hook{0x632D00, 0x1E380016, 0x14D84F31}, // Deku Tree web cut -> b 0x3c469c4
     };
     // Each stub's first and last word.
     struct Stub {
@@ -795,6 +796,7 @@ TEST_CASE("High refresh fixes built-in hooks its sites in both modes", "[patch_m
         Stub{0x3C468F0, 0x5C, 0xA9BF47F0, 0x17BF6798}, // cloth c ... b 0x2c207a8
         Stub{0x3C46950, 0x5C, 0xA9BF47F0, 0x17BF6DBA}, // cloth d ... b 0x2c22090
         Stub{0x3C469B0, 0x14, 0x9100F26D, 0x171E1D81}, // time of day: add x13 ... b 0x3cdfc4
+        Stub{0x3C469C4, 0x14, 0x9123E26D, 0x1727B0CC}, // Deku Tree web: add x13 ... b 0x632d04
         Stub{0x3C46E8C, 0x84, 0x1E38000C, 0xD65F03C0}, // whole units: fcvtzs w12, s0 ... ret
     };
     // The hooks a test switch can leave out, one at a time.
@@ -805,6 +807,7 @@ TEST_CASE("High refresh fixes built-in hooks its sites in both modes", "[patch_m
     };
     constexpr std::array SwitchedHooks{
         Switched{"FRITCHII_NO_HR_TIME", 0x3CDFC0, 0x1E380008},
+        Switched{"FRITCHII_NO_HR_WEB", 0x632D00, 0x1E380016},
     };
     constexpr u32 GateCallWord = 0xB94CC610; // ldr w16, [x16, #0xcc4] (the frame step's call)
     const auto word_at = [](const std::vector<u8>& nso, size_t offset) {

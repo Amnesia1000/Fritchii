@@ -817,6 +817,17 @@ constexpr std::array<u8, 20> HR_TIME_STUB{
     0xE8, 0x03, 0x0C, 0x2A, 0x81, 0x1D, 0x1E, 0x17,
 };
 
+// The Deku Tree's floor web: its update (main+0x632CB0, s8 = the elapsed time) runs
+// trunc(time / (1/60)) simulation steps, clamped to 0..3. Above 60 fps the cut is 0 every frame
+// and the web does not react when Link lands on it. The cut (fcvtzs w22, s0 at main+0x632D00) goes
+// through HR_WHOLE with a rest per web object (the counter x19 + 0x8F8), before the clamp, which
+// stays: a long pause still gives at most 3 steps and leaves no backlog.
+//   x13 = x19 + 0x8f8 ; w14 = 1.0 ; bl HR_WHOLE ; w22 = w12 ; b 0x632d04
+constexpr std::array<u8, 20> HR_WEB_STUB{
+    0x6D, 0xE2, 0x23, 0x91, 0x0E, 0xF0, 0xA7, 0x52, 0x30, 0x01, 0x00, 0x94,
+    0xF6, 0x03, 0x0C, 0x2A, 0xCC, 0xB0, 0x27, 0x17,
+};
+
 // The hooks (each checked to hold the game's word), then the stubs in address order.
 constexpr std::array HR_FIX_HOOKS{
     OotFixHook{0x415300, {0x28, 0xC4, 0xE0, 0x14}, 0xD503237F}, // pacibsp -> b 0x3c463a0
@@ -854,6 +865,8 @@ constexpr std::array HR_FIX_HOOKS{
     OotFixHook{0x2C2208C, {0x31, 0x92, 0x40, 0x14}, 0xBD466D02}, // ldr s2, [x8, #0x66c] -> b 0x3c46950
     OotFixHook{0x3CDFC0, {0x7C, 0xE2, 0xE1, 0x14}, 0x1E380008, // fcvtzs w8, s0 -> b 0x3c469b0
                "FRITCHII_NO_HR_TIME"},
+    OotFixHook{0x632D00, {0x31, 0x4F, 0xD8, 0x14}, 0x1E380016, // fcvtzs w22, s0 -> b 0x3c469c4
+               "FRITCHII_NO_HR_WEB"},
 };
 constexpr std::array HR_FIX_STUBS{
     OotFixStub{0x3C463A0, SOUND_GATE},
@@ -874,6 +887,7 @@ constexpr std::array HR_FIX_STUBS{
     OotFixStub{0x3C468F0, CLOTH_DT_C},
     OotFixStub{0x3C46950, CLOTH_DT_D},
     OotFixStub{0x3C469B0, HR_TIME_STUB},
+    OotFixStub{0x3C469C4, HR_WEB_STUB},
 };
 // Stubs past the pickup stub, also in address order.
 constexpr std::array HR_FIX_LATE_STUBS{
