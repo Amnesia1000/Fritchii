@@ -5999,6 +5999,68 @@ balance of geometry, fill and compute, other drivers' behaviour and costs, and u
 other hardware. Use them to find what becomes the limit and to compare builds on the same setting,
 not to promise a frame rate for a named card.
 
+### Slow links and small BAR: FRITCHII_LINK_STATS, FRITCHII_SIM_LINK*, FRITCHII_SIM_BAR_MIB, FRITCHII_DESCRIPTOR_SETS, FRITCHII_LIST_ARGS_LOCAL
+
+Helper FC, 2026-11-19. For eGPUs and PCIe x4 or x8 slots, with or without resizable BAR. All off by
+default. Nothing on the PC changes. work\lowend_sim.py has presets (pcie3-x8, pcie3-x4, oculink-x4,
+thunderbolt) and --link, --link-load, --link-us, --hog, --hog-mode, --bar, --link-stats.
+
+- Always on, boot log: "Stream buffer for uniforms and buffer uploads: N MiB in memory type T (heap
+  H, S MiB), device memory" and the same for texture and query uploads. "host memory" there on a
+  discrete card means the CPU-visible window was full and the GPU reads that stream over the link.
+  "Descriptors: ..." says which descriptor path the device allows and how much CPU-visible device
+  memory it has.
+- FRITCHII_LINK_STATS=1 (live). Every 10 s: "Link traffic per second": MB and requests by who asked
+  for CPU writes into device memory, GPU reads of host memory and GPU writes to host memory; stream
+  buffer full; real waits for the GPU; occlusion results read; list draws; what that traffic alone
+  takes at 3200 and 2200 MB/s. It counts what the renderer asks for. The driver's own traffic is
+  not in it (command buffers, push descriptors, query pools, present). Off: one relaxed load per
+  staging request and per real GPU wait, and one per frame.
+- FRITCHII_SIM_LINK=<MB/s> (live, 0 off), FRITCHII_SIM_LINK_LOAD=<MB/s> (live, taken from it, at most
+  nine tenths), FRITCHII_SIM_LINK_US=<us> (live). A model: each counted transfer is charged its time.
+  CPU writes into device memory make the writing thread spin. GPU transfers become GPU time through
+  FRITCHII_SIM_GPU_SLOW's dispatch, which runs alone, so a copy that would overlap other GPU work
+  counts in full. The latency is added to each real wait for the GPU and each list draw whose
+  arguments are in host memory.
+- FRITCHII_SIM_LINK_HOG=<MiB/s> (live, 0 pauses it; it or FRITCHII_SIM_LINK_HOG_MODE must be set at
+  boot, for its queue).
+  Real 16 MiB copies on a transfer queue, as the eGPU report's link_hog.py did, so everything on the
+  link competes with them, the driver's traffic included. This is the closest thing to a slow link
+  on a fast PC. FRITCHII_SIM_LINK_HOG_MODE (boot): 0 host to VRAM, 1 VRAM to VRAM (the control: same
+  engine and video memory, nothing on the link), 2 VRAM to host. Line every 10 s: "Link load": MiB/s
+  reached, MiB/s while copying (a rough measure of what the link gives), busy %. On a x16 link the
+  same MiB/s takes a much smaller share: compare at a rate that leaves what an x4 link would have,
+  and remember it also takes host memory bandwidth, which a real slow link does not.
+- FRITCHII_SIM_BAR_MIB=<MiB> (boot; 0 = none): room the stream buffers get in CPU-visible device
+  memory. The first pool made (texture and query uploads) asks first. What doesn't fit goes to host
+  memory. It models the stream buffers only, not the driver's own use of the window.
+- With FRITCHII_LINK_STATS each pool also logs, every 10 s, "Stream use for ...": MB/s and requests
+  written, the worst frame, wraps, the most regions busy at a frame end, how often it was full and
+  what went to host staging for it, how many of those were free at a fresh look at the GPU's
+  progress, and requests over a region (always host staging).
+- A stream buffer that lands in host memory on a discrete card with CPU-visible device memory logs
+  a warning ("fell out of device memory").
+- FRITCHII_SMALL_BAR_STREAMS (boot, default 0; 1 on). Only on discrete cards with split allocators
+  whose CPU-visible device memory is 1 GiB or less. Sizes the two stream buffers from the room free
+  in that window less 16 MiB, uniforms and buffer uploads first (up to 64 MiB), texture and query
+  uploads the rest (up to 128 MiB), at least 16 MiB each; on a free 256 MiB window that is today's
+  128 + 64. A buffer the allocator's budget check sent to host memory is tried again past the
+  budget. Before a request spills to host staging because the ring looks busy, the GPU's progress
+  is read again. FRITCHII_SMALL_BAR_STREAM_MIB=<transfers>,<buffers> (boot, 16 to 256 each) sets the
+  sizes for tests and turns the rest on. Resizable BAR and integrated GPUs are not touched.
+- FRITCHII_DESCRIPTOR_SETS (boot, default 0; 1 on, 2 AMD drivers on a discrete card with 7 GiB or
+  less of CPU-visible device memory). Draws and dispatches take descriptor sets from pools instead
+  of push descriptors. In AMD's open driver source, push descriptors are command buffer embedded
+  data, kept with the command buffers in host memory unless the CPU-visible window is over 7 GiB;
+  descriptor pools try device memory first. So without resizable BAR each draw's shaders would fetch
+  their descriptors over the link. More CPU work per draw on the Vulkan worker. The pipeline layouts
+  change, so the driver's pipeline cache misses on the first launch with it (and back).
+- FRITCHII_LIST_ARGS_LOCAL (boot, default 0): list draw arguments in device memory, so the GPU's
+  copy of the two words and the indirect fetch stay on the card.
+
+Not reproduced by any of these: the latency of a real slow link for fetches the renderer can't see,
+how a given driver places its memory, and an eGPU's present path when the display is on the host.
+
 ## Numbered experiments (EDEN_NX2_EXPn)
 
 Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP79, live through the debug server:
