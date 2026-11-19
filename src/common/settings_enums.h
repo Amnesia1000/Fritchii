@@ -167,6 +167,8 @@ ENUM(SpeedMode, Standard, Turbo, Slow);
 ENUM(MeshShaderMode, Automatic, Native, Compute);
 // Ocarina of Time's movies: the game's own upscaler, or a bilinear copy (Settings oot_movie_upscale).
 ENUM(OotMovieUpscale, Automatic, Bilinear, Game);
+// Intel CPUs with P- and E-cores: where the GPU emulation threads run (hybrid_cpu_placement).
+ENUM(HybridCpuPlacement, Automatic, PinGpu);
 // Ocarina of Time's frame rate cap with its high refresh rate mode on (Settings oot_high_refresh).
 // New values go at the end: saved configs store the index.
 ENUM(OotRefreshCap, Display, Hz90, Hz120, Hz144, Hz165, Unlimited);

@@ -276,6 +276,11 @@ struct Values {
                                                     Category::Cpu};
     SwitchableSetting<CpuAccuracy, true> cpu_accuracy{linkage, CpuAccuracy::Auto,
                                                       "cpu_accuracy", Category::Cpu};
+    // Intel CPUs with P- and E-cores: Automatic leaves the GPU emulation threads to Windows, PinGpu
+    // holds them on the P-cores (common/thread.cpp). Global only, read when a game starts;
+    // EDEN_HYBRID_CORES wins when it is set.
+    Setting<HybridCpuPlacement> hybrid_cpu_placement{linkage, HybridCpuPlacement::Automatic,
+                                                     "hybrid_cpu_placement", Category::Cpu};
     SwitchableSetting<CpuClock> cpu_clock{linkage,
                                               CpuClock::Normal,
                                               "fast_cpu_time",
