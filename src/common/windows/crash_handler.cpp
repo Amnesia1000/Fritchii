@@ -132,9 +132,11 @@ void Report(EXCEPTION_POINTERS* pointers) {
         return;
     }
     MINIDUMP_EXCEPTION_INFORMATION information{GetCurrentThreadId(), pointers, FALSE};
-    const BOOL written =
-        write_dump(GetCurrentProcess(), GetCurrentProcessId(), file, MiniDumpWithThreadInfo,
-                   pointers ? &information : nullptr, nullptr, nullptr);
+    // The unloaded modules name what a call through a stale pointer went to.
+    const BOOL written = write_dump(
+        GetCurrentProcess(), GetCurrentProcessId(), file,
+        static_cast<MINIDUMP_TYPE>(MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules),
+        pointers ? &information : nullptr, nullptr, nullptr);
     const DWORD error = written ? 0 : GetLastError();
     CloseHandle(file);
     LOG_CRASH("Host crash: minidump of process {} {} ({:#x})", GetCurrentProcessId(),
