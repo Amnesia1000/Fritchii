@@ -893,6 +893,14 @@ until a refusal happens. `<ms>` refuses every commit for that long from the firs
 one impossible allocation: under 5000 the log shows "refused" and "went through"; above it, "Out of
 memory" and then the game going on once the window ends (or the crash report's line).
 
+### FRITCHII_TEST_SAMPLER_LIMIT
+
+Boot, TEST, default 0. Drivers limit how many samplers exist (about 4,000 on NVIDIA) and the texture
+cache never frees one; past the limit the game used to end. A refused sampler now borrows this
+sampler's first variant or the first sampler made, and the log says "The driver refused a sampler"
+(8 times at most). `<n>` makes the driver's refusal happen after n samplers: the game must keep
+running, with some textures filtered or wrapped wrongly.
+
 ### FRITCHII_TEST_DEVICE_LOSS
 
 TEST, off by default (live, debug server only). 1 = the next queue submission goes through the

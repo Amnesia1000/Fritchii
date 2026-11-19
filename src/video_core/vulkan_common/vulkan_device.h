@@ -484,6 +484,11 @@ public:
         return properties.properties.limits.minStorageBufferOffsetAlignment;
     }
 
+    /// Returns how many samplers may exist at once.
+    u32 GetMaxSamplerAllocationCount() const {
+        return properties.properties.limits.maxSamplerAllocationCount;
+    }
+
     /// Returns the maximum range for storage buffers.
     VkDeviceSize GetMaxStorageBufferRange() const {
         return properties.properties.limits.maxStorageBufferRange;
