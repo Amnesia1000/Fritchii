@@ -1616,6 +1616,8 @@ private:
 
     VkPhysicalDeviceFeatures2 features2{};
     VkPhysicalDeviceFaultFeaturesEXT device_fault_features{};
+    /// FRITCHII_VA_REPORT=1: VK_EXT_device_address_binding_report (vulkan_debug_callback.h).
+    VkPhysicalDeviceAddressBindingReportFeaturesEXT address_binding_report_features{};
     VkPhysicalDeviceProperties2 properties2{};
 
     // Misc features

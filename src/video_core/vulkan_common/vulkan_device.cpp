@@ -47,6 +47,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_binary.h"
 #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
 #include "video_core/vulkan_common/vma.h"
+#include "video_core/vulkan_common/vulkan_debug_callback.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_kept_blocks.h"
 #include "video_core/nx2_perf.h"
@@ -1782,6 +1783,8 @@ void Device::ReportDeviceFault() const {
         const VkDeviceSize lower = address.reportedAddress & ~(precision - 1);
         LOG_CRITICAL(Render_Vulkan, "Device fault address {}: {} at {:#x} (range [{:#x}, {:#x}))",
                      i, type, address.reportedAddress, lower, lower + precision);
+        // FRITCHII_VA_REPORT=1: what held that page, and whether it was still bound.
+        VaReport::LogOwners(address.reportedAddress, precision);
     }
     for (u32 i = 0; i < counts.vendorInfoCount; ++i) {
         const VkDeviceFaultVendorInfoEXT& vendor = vendor_infos[i];
@@ -2125,10 +2128,38 @@ bool Device::GetSuitability(bool requires_swapchain) {
         device_fault_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT;
         SetNext(next, device_fault_features);
     }
+    // FRITCHII_VA_REPORT=1 (boot, test tool): the driver reports each GPU address range it binds
+    // or unbinds, so a device loss can name what held the faulting page. It reports through
+    // VK_EXT_debug_utils, which the instance enabled for it (VaReport::InstanceReady).
+    const bool has_address_binding_report =
+        VaReport::Requested() && VaReport::InstanceReady() &&
+        supported_extensions.contains(VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME);
+    if (VaReport::Requested() && !has_address_binding_report) {
+        LOG_WARNING(Render_Vulkan, "GPU address report (FRITCHII_VA_REPORT=1): off, the driver "
+                                   "has no VK_EXT_device_address_binding_report or the instance "
+                                   "no VK_EXT_debug_utils");
+    }
+    if (has_address_binding_report) {
+        address_binding_report_features.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ADDRESS_BINDING_REPORT_FEATURES_EXT;
+        SetNext(next, address_binding_report_features);
+    }
 
     // Perform the feature test.
     physical.GetFeatures2(features2);
 
+    if (has_address_binding_report) {
+        // Its features struct is in the creation chain: the extension is enabled either way.
+        loaded_extensions.insert(VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME);
+        if (address_binding_report_features.reportAddressBinding) {
+            VaReport::NoteDeviceReady();
+            LOG_INFO(Render_Vulkan, "GPU address report (FRITCHII_VA_REPORT=1): the driver reports "
+                                    "its GPU address binds");
+        } else {
+            LOG_WARNING(Render_Vulkan, "GPU address report (FRITCHII_VA_REPORT=1): off, the "
+                                       "driver lists the extension without reportAddressBinding");
+        }
+    }
     if (has_device_fault_extension) {
         loaded_extensions.insert(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
         // No vendor binary dumps: only the description, addresses and vendor codes are logged.
