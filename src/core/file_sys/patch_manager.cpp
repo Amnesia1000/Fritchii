@@ -865,6 +865,26 @@ constexpr std::array<u8, 80> HR_SOLVER{
     0x01, 0xC6, 0x9F, 0x1A, 0xC0, 0x03, 0x5F, 0xD6,
 };
 
+// Epona's fence jump: the horse's jump state machine (main+0x2C39EB0, s10 = its step) sets the
+// blend frames into its JumpReady animation so the blend ends at takeoff, except below a step of 1,
+// which at 60 fps means slow motion: then it adds the step to last frame's blend frames instead
+// (fcmp s10, #1.0 ; b.pl at main+0x2C3AE1C). In the high refresh mode every step is under 1, so
+// the blend frames grew each frame, the jump animation never blended in, and Epona galloped
+// through the fence at ground level while her body jumped. Now the b.pl goes to a stub that also
+// skips the slow-motion branch when the high refresh mode is on and the step is the frame's own
+// (within about 0.1% of [T+0x10], compared as bits): real slow motion, a step under the frame's,
+// and every other case keep the game's test. x9, x10 and the flags are dead at both targets.
+//   b.pl skip ; call word is not ours: slow ; w9 = |bits(s10) - bits([T + 0x10])| ;
+//   w9 <= 8192: skip ; slow: b 0x2c3ae24 ; skip: b 0x2c3ae48
+constexpr std::array<u8, 68> HR_HORSE_STUB{
+    0x05, 0x02, 0x00, 0x54, 0x09, 0x55, 0xFE, 0x90, 0x29, 0xC5, 0x4C, 0xB9,
+    0xEA, 0x09, 0x90, 0x52, 0xAA, 0x9A, 0xB2, 0x72, 0x3F, 0x01, 0x0A, 0x6B,
+    0x21, 0x01, 0x00, 0x54, 0x69, 0x92, 0x00, 0xD0, 0x29, 0x91, 0x45, 0xF9,
+    0x2A, 0x11, 0x40, 0xB9, 0x49, 0x01, 0x26, 0x1E, 0x29, 0x01, 0x0A, 0x6B,
+    0x29, 0x55, 0x89, 0x5A, 0x3F, 0x09, 0x40, 0x71, 0x49, 0x00, 0x00, 0x54,
+    0x8E, 0xD0, 0xBF, 0x17, 0x96, 0xD0, 0xBF, 0x17,
+};
+
 // The hooks (each checked to hold the game's word), then the stubs in address order.
 constexpr std::array HR_FIX_HOOKS{
     OotFixHook{0x415300, {0x28, 0xC4, 0xE0, 0x14}, 0xD503237F}, // pacibsp -> b 0x3c463a0
@@ -908,6 +928,8 @@ constexpr std::array HR_FIX_HOOKS{
                "FRITCHII_NO_HR_SOLVER"},
     OotFixHook{0x38AFD20, {0x63, 0x5B, 0x0E, 0x94}, 0x1E380001, // fcvtzs w1, s0 -> bl 0x3c46aac
                "FRITCHII_NO_HR_SOLVER"},
+    OotFixHook{0x2C3AE20, {0x64, 0x2F, 0x40, 0x14}, 0x54000145, // b.pl 0x2c3ae48 -> b 0x3c46bb0
+               "FRITCHII_NO_HR_HORSE"},
 };
 constexpr std::array HR_FIX_STUBS{
     OotFixStub{0x3C463A0, SOUND_GATE},
@@ -934,6 +956,7 @@ constexpr std::array HR_FIX_STUBS{
 };
 // Stubs past the pickup stub, also in address order.
 constexpr std::array HR_FIX_LATE_STUBS{
+    OotFixStub{0x3C46BB0, HR_HORSE_STUB},
     OotFixStub{HR_WHOLE_OFFSET, HR_WHOLE},
 };
 // The sound accumulator and flag at +0, the step slots' index at +8, the 15 slots from +0x10, and
@@ -961,8 +984,27 @@ constexpr bool HrFixStubsInOrder(std::span<const OotFixStub> stubs, size_t start
 }
 static_assert(HR_FIX_CAVE_START >= 0x3C46398 &&
               HrFixStubsInOrder(HR_FIX_STUBS, HR_FIX_CAVE_START, PICKUP_STUB_OFFSET));
-static_assert(HrFixStubsInOrder(HR_FIX_LATE_STUBS, HIGH_REFRESH_ROUTINE_OFFSET + OOT_CAVE_SIZE,
-                                TEXTURE_POOL_ROUTINE_OFFSET));
+// The late stubs: after the pickup stub, to the end of the page, around the words other built-ins
+// write there and the community ultrawide mod's spot (main+0x3C46C00..0x3C46DC0).
+static_assert(HrFixStubsInOrder(HR_FIX_LATE_STUBS, PICKUP_STUB_OFFSET + PICKUP_STUB.size(),
+                                0x3C47000));
+static_assert([] {
+    constexpr std::array<std::pair<size_t, size_t>, 5> taken{{
+        {0x3C46C00, 0x3C46E00}, // the ultrawide mod's spot, the shadow steps, the texture heap gap
+        {HIGH_REFRESH_ROUTINE_OFFSET, HIGH_REFRESH_ROUTINE_OFFSET + OOT_CAVE_SIZE},
+        {TEXTURE_POOL_ROUTINE_OFFSET, TEXTURE_POOL_ROUTINE_OFFSET + TEXTURE_POOL_ROUTINE.size()},
+        {WATER_ROUTINE_OFFSET, WATER_ROUTINE_OFFSET + WATER_ROUTINE.size()},
+        {PICKUP_STUB_OFFSET, PICKUP_STUB_OFFSET + PICKUP_STUB.size()},
+    }};
+    for (const OotFixStub& stub : HR_FIX_LATE_STUBS) {
+        for (const auto& [first, last] : taken) {
+            if (stub.offset < last && first < stub.offset + stub.bytes.size()) {
+                return false;
+            }
+        }
+    }
+    return true;
+}());
 static_assert(HR_FIX_STATE_OFFSET >= 0x4E9B000 &&
               HR_FIX_STATE_OFFSET + HR_FIX_STATE_SIZE <= HIGH_REFRESH_STATE_OFFSET &&
               HR_FIX_STATE_OFFSET + HR_FIX_STATE_SIZE <= PICKUP_STATE_OFFSET &&
