@@ -90,6 +90,8 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, cpu_accuracy, tr("Accuracy:"),
            tr("Change the accuracy of the emulated CPU (for debugging only)."));
     INSERT(Settings, cpu_backend, tr("Backend:"), QString());
+    INSERT(Settings, hybrid_cpu_placement, tr("Intel P-cores:"),
+           tr("Automatic lets Windows place the GPU threads.\nApplies at the next game start."));
 
     INSERT(Settings, cpu_clock, tr("CPU Clocks"),
            tr("Raises the clock the emulated CPU reports, which removes some FPS limiters.\n"
@@ -613,6 +615,11 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(DlssPreset, K, tr("K (recommended)")),
                               PAIR(DlssPreset, L, tr("L")),
                               PAIR(DlssPreset, M, tr("M")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::HybridCpuPlacement>::Index(),
+                          {
+                              PAIR(HybridCpuPlacement, Automatic, tr("Automatic")),
+                              PAIR(HybridCpuPlacement, PinGpu, tr("Pin GPU to P-cores")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::OotMovieUpscale>::Index(),
                           {
