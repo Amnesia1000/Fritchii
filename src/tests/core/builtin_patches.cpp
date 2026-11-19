@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -204,6 +205,14 @@ constexpr u32 WaterCall = 0x94EFFE4A;   // bl 0x3c46f20
 // Ocarina's main as the high refresh rate tests need it: the water renderer's fcvtzs and mul (the
 // ripple hook's and nop's originals), a BSS that holds the routine's state, and zero bytes from
 // Dark's routine to the end of its page.
+void SetTestEnv(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
+
 std::vector<u8> MakeOcarinaMain() {
     constexpr size_t Code = sizeof(Loader::NSOHeader);
     auto nso = MakeMain(OcarinaBuildId, NopInstruction);
@@ -758,6 +767,10 @@ TEST_CASE("High refresh fixes built-in hooks its sites in both modes", "[patch_m
         Hook{0x2AB804, 0x1E270100, 0x14E66C23}, // -> b 0x3c46890
         Hook{0x2C207A4, 0xBD466D00, 0x14409853}, // -> b 0x3c468f0
         Hook{0x2C2208C, 0xBD466D02, 0x14409231}, // -> b 0x3c46950
+        Hook{0x3CDFC0, 0x1E380008, 0x14E1E27C}, // time of day cut -> b 0x3c469b0
+        Hook{0x632D00, 0x1E380016, 0x14D84F31}, // Deku Tree web cut -> b 0x3c469c4
+        Hook{0x38AEBF4, 0x1E380001, 0x940E5FAE}, // solver steps -> bl 0x3c46aac
+        Hook{0x38AFD20, 0x1E380001, 0x940E5B63}, // solver steps -> bl 0x3c46aac
     };
     // Each stub's first and last word.
     struct Stub {
@@ -784,6 +797,21 @@ TEST_CASE("High refresh fixes built-in hooks its sites in both modes", "[patch_m
         Stub{0x3C46890, 0x5C, 0xA9BF47F0, 0x171993C8}, // cloth b ... b 0x2ab808
         Stub{0x3C468F0, 0x5C, 0xA9BF47F0, 0x17BF6798}, // cloth c ... b 0x2c207a8
         Stub{0x3C46950, 0x5C, 0xA9BF47F0, 0x17BF6DBA}, // cloth d ... b 0x2c22090
+        Stub{0x3C469B0, 0x14, 0x9100F26D, 0x171E1D81}, // time of day: add x13 ... b 0x3cdfc4
+        Stub{0x3C469C4, 0x14, 0x9123E26D, 0x1727B0CC}, // Deku Tree web: add x13 ... b 0x632d04
+        Stub{0x3C469D8, 0x8, 0x3A83126F, 0x3DCCCCCD},  // the solver's constants
+        Stub{0x3C46AAC, 0x50, 0x1E380001, 0xD65F03C0}, // solver: fcvtzs w1, s0 ... ret
+        Stub{0x3C46E8C, 0x84, 0x1E38000C, 0xD65F03C0}, // whole units: fcvtzs w12, s0 ... ret
+    };
+    // The hooks a test switch can leave out, one at a time.
+    struct Switched {
+        const char* env;
+        size_t offset;
+        u32 original;
+    };
+    constexpr std::array SwitchedHooks{
+        Switched{"FRITCHII_NO_HR_TIME", 0x3CDFC0, 0x1E380008},
+        Switched{"FRITCHII_NO_HR_WEB", 0x632D00, 0x1E380016},
     };
     constexpr u32 GateCallWord = 0xB94CC610; // ldr w16, [x16, #0xcc4] (the frame step's call)
     const auto word_at = [](const std::vector<u8>& nso, size_t offset) {
@@ -820,6 +848,23 @@ TEST_CASE("High refresh fixes built-in hooks its sites in both modes", "[patch_m
         REQUIRE(word_at(dark, Code + Stubs[0].offset + 8) == GateCallWord);
         Settings::values.oot_high_refresh.SetValue(true);
         REQUIRE(applied(context.Manager().PatchNSO(nso, "main")));
+    }
+
+    SECTION("A site's test switch leaves only its hook out") {
+        for (const Switched& site : SwitchedHooks) {
+            SetTestEnv(site.env, "1");
+            const auto patched = context.Manager().PatchNSO(nso, "main");
+            SetTestEnv(site.env, "");
+            REQUIRE(word_at(patched, Code + site.offset) == site.original);
+            for (const Hook& hook : Hooks) {
+                if (hook.offset != site.offset) {
+                    REQUIRE(word_at(patched, Code + hook.offset) == hook.branch);
+                }
+            }
+            for (const Stub& stub : Stubs) {
+                REQUIRE(word_at(patched, Code + stub.offset) == stub.first);
+            }
+        }
     }
 
     SECTION("Another word at a hook, a stub word in use, or off in Add-Ons: skipped whole") {
