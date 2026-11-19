@@ -876,6 +876,16 @@ void ConfigureGraphics::SetupUpscalerChoice(std::map<u32, QWidget*>& hold_graphi
     // handheld or with the scaled test switch, the plain rows stay.
     const bool picture_menu = Settings::IsDockedMode() && !VideoCommon::OcarinaScaledUpscale();
     if (picture_menu) {
+        // With no upscaler the add-on has no other place on this page (the first-start question
+        // sends players here to change it). With one, "Resolution" below includes it.
+        max_res_combobox = new QComboBox;
+        max_res_combobox->addItem(tr("Off (up to 1080p)"));
+        max_res_combobox->addItem(tr("On (1440p)"));
+        max_res_row = make_row(tr("Max Resolution:"), max_res_combobox);
+        max_res_row->setToolTip(tr("On: sharper, needs about an RTX 3070 / RX 6800 (8 GB).\n"
+                                   "Off: like the Switch 2, more fps on weaker PCs."));
+        max_res_row->setVisible(false);
+
         render_combobox = new QComboBox;
         render_row = make_row(tr("Resolution:"), render_combobox);
         render_row->setVisible(false);
@@ -957,14 +967,21 @@ void ConfigureGraphics::ApplyUpscalerChoice(int index) {
     }
     if (output_row != nullptr) {
         if (PictureUpscalerNow() == PictureUpscaler::None) {
-            // Off: the game's own upscale gets Max Resolution back as it was (or on).
+            // Off: the game's own upscale gets Max Resolution back as it was.
+            if (was_upscaling) {
+                max_resolution_upscaling = max_resolution_choice;
+            }
             max_resolution_choice = max_resolution_when_off;
         } else if (was_upscaling) {
             // DLSS <-> FSR: the same output (DLSS Native <-> FSR at 1x included).
             ApplyPictureOutput(output_before);
-        } else if (LowScene(PictureInputNow())) {
-            // Off -> DLSS below 720p: an output kept from FSR may not be one DLSS takes.
-            ApplyPictureOutput(PictureOutputNow());
+        } else {
+            // Back on: the "Resolution" picked before (a fixed height needs the add-on).
+            max_resolution_choice = max_resolution_upscaling;
+            if (LowScene(PictureInputNow())) {
+                // Off -> DLSS below 720p: an output kept from FSR may not be one DLSS takes.
+                ApplyPictureOutput(PictureOutputNow());
+            }
         }
     }
     UpdateUpscalerChoice();
@@ -1330,11 +1347,17 @@ void ConfigureGraphics::SetupPictureMenu(const std::map<u32, QWidget*>& rows) {
                                            PictureUpscalerNow() == PictureUpscaler::Fsr,
                                            Settings::values.nvidia_dlss_quality.GetValue());
     render_height_choice = render_height_saved;
-    // Turning the upscaler off brings the add-on back as it was with the game's own upscale, or
-    // on (the game's full 1440p) when the page opened with an upscaler.
-    max_resolution_when_off =
-        PictureUpscalerNow() == PictureUpscaler::None ? max_resolution_saved : true;
+    // Turning the upscaler off keeps the add-on as saved: a weak PC that keeps it off must not
+    // end up at 1440p by trying an upscaler. The "Max Resolution" row then shows it.
+    max_resolution_when_off = max_resolution_saved;
+    max_resolution_upscaling = max_resolution_saved;
 
+    connect(max_res_combobox, QOverload<int>::of(&QComboBox::activated), this, [this](int index) {
+        max_resolution_choice = index == 1;
+        max_resolution_when_off = max_resolution_choice;
+        max_resolution_upscaling = max_resolution_choice;
+        UpdatePictureMenu();
+    });
     connect(render_combobox, QOverload<int>::of(&QComboBox::activated), this, [this](int index) {
         if (index >= 0) {
             ApplyPictureInput(render_combobox->itemData(index).toUInt());
@@ -1381,6 +1404,12 @@ void ConfigureGraphics::UpdatePictureMenu() {
     resolution_widget->setVisible(!upscaling);
     render_row->setVisible(upscaling);
     output_row->setVisible(upscaling);
+    if (max_res_row != nullptr) {
+        max_res_row->setVisible(!upscaling);
+        max_res_combobox->setCurrentIndex(max_resolution_choice ? 1 : 0);
+        max_res_combobox->setEnabled(!system.IsPoweredOn()); // Applied when the game starts.
+    }
+    UpdateResolutionNames();
     // The DLSS quality follows the two choices (Native when they match): its row stays hidden
     // (the checkbox's toggle shows it: hide it again).
     if (dlss_quality_widget != nullptr) {
@@ -1433,6 +1462,42 @@ void ConfigureGraphics::UpdatePictureMenu() {
         output_row->setToolTip(tr("The size you see. Bigger is sharper, smaller runs faster."));
     } else {
         output_row->setToolTip(tr("This Resolution makes only this size."));
+    }
+}
+
+bool ConfigureGraphics::MaxResolutionNow() const {
+    return output_row != nullptr ? max_resolution_choice : FritchiiMaxResolution::Saved();
+}
+
+void ConfigureGraphics::UpdateResolutionNames() {
+    if (resolution_combobox == nullptr) {
+        return;
+    }
+    // The scales as the heights OoT draws at them: docked, then handheld. At 1x OoT draws 1440p
+    // docked with the Max Resolution add-on (its dynamic resolution, at most 1080p, without it)
+    // and 1080p handheld, not the Switch 1 heights (1080p/720p) these rows showed before
+    // (2026-11-18: no "1440p" anywhere, and the 0.75x row for weak PCs read "810p").
+    using Res = Settings::ResolutionSetup;
+    const bool max_resolution = MaxResolutionNow();
+    const u32 docked_base = max_resolution ? 1440 : 1080;
+    for (int row = 0; row < resolution_combobox->count(); ++row) {
+        const auto setup = static_cast<Res>(resolution_combobox->itemData(row).toUInt());
+        Settings::ResolutionScalingInfo info{};
+        Settings::TranslateResolutionInfo(setup, info);
+        const u32 docked = docked_base * info.up_scale >> info.down_shift;
+        const u32 handheld = 1080 * info.up_scale >> info.down_shift;
+        const QString docked_text =
+            max_resolution ? HeightName(docked) : tr("up to %1").arg(HeightName(docked));
+        // Without Max Resolution both are 1080p at 1x: one number, not the same one twice.
+        resolution_combobox->setItemText(
+            row, docked == handheld ? docked_text
+                                    : tr("%1 (Handheld %2)").arg(docked_text, HeightName(handheld)));
+        // 360p to 8K (owner 2026-11-18); a scale outside it stays only while it is the current
+        // one, so nobody's setting vanishes.
+        if (auto* view = qobject_cast<QListView*>(resolution_combobox->view())) {
+            view->setRowHidden(row, (docked < 360 || docked > 4320) &&
+                                        row != resolution_combobox->currentIndex());
+        }
     }
 }
 
@@ -1576,7 +1641,7 @@ void ConfigureGraphics::UpdateWindowFilterNote() {
             static_cast<Settings::ResolutionSetup>(
                 resolution_combobox->currentData().toUInt()),
             info);
-        const u32 base = Settings::IsDockedMode() && max_resolution_choice ? 1440U : 1080U;
+        const u32 base = Settings::IsDockedMode() && MaxResolutionNow() ? 1440U : 1080U;
         picture = base * info.up_scale >> info.down_shift;
     }
     const QScreen* const screen = window() != nullptr ? window()->screen() : nullptr;
@@ -1697,36 +1762,7 @@ void ConfigureGraphics::SetupPlainNames(const std::map<u32, QWidget*>& rows) {
     ui->bg_widget->setToolTip(tr("The color around the picture when it doesn't fill the "
                                  "window."));
 
-    // The scales as the heights OoT draws at them: docked, then handheld. At 1x OoT draws 1440p
-    // docked with the Max Resolution add-on (its dynamic resolution, at most 1080p, without it)
-    // and 1080p handheld, not the Switch 1 heights (1080p/720p) these rows showed before
-    // (2026-11-18: no "1440p" anywhere, and the 0.75x row for weak PCs read "810p").
-    if (resolution_combobox != nullptr) {
-        using Res = Settings::ResolutionSetup;
-        const bool max_resolution = FritchiiMaxResolution::Saved();
-        const u32 docked_base = max_resolution ? 1440 : 1080;
-        for (int row = 0; row < resolution_combobox->count(); ++row) {
-            const auto setup = static_cast<Res>(resolution_combobox->itemData(row).toUInt());
-            Settings::ResolutionScalingInfo info{};
-            Settings::TranslateResolutionInfo(setup, info);
-            const u32 docked = docked_base * info.up_scale >> info.down_shift;
-            const u32 handheld = 1080 * info.up_scale >> info.down_shift;
-            const QString docked_text = max_resolution
-                                            ? HeightName(docked)
-                                            : tr("up to %1").arg(HeightName(docked));
-            // Without Max Resolution both are 1080p at 1x: one number, not the same one twice.
-            resolution_combobox->setItemText(
-                row, docked == handheld
-                         ? docked_text
-                         : tr("%1 (Handheld %2)").arg(docked_text, HeightName(handheld)));
-            // 360p to 8K (owner 2026-11-18); a scale outside it stays only while it is the
-            // current one, so nobody's setting vanishes.
-            if (auto* view = qobject_cast<QListView*>(resolution_combobox->view())) {
-                view->setRowHidden(row, (docked < 360 || docked > 4320) &&
-                                            row != resolution_combobox->currentIndex());
-            }
-        }
-    }
+    UpdateResolutionNames();
     picture_scale_saved = PictureScaleNow();
     UpdateOcarinaUpscalerLabels();
     if (resolution_combobox != nullptr) {

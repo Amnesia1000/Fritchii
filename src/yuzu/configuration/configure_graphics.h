@@ -99,6 +99,10 @@ private:
     /// Settings::OcarinaRenderHeight, Settings::OcarinaMaxResolutionOn).
     void SetupPictureMenu(const std::map<u32, QWidget*>& rows);
     void UpdatePictureMenu();
+    /// Fritchii builds: the resolution list's names, as heights for the Max Resolution choice.
+    void UpdateResolutionNames();
+    /// OoT's Max Resolution add-on as this page has it now (without a picture menu: as saved).
+    [[nodiscard]] bool MaxResolutionNow() const;
     /// Fritchii builds: the short status line under the picture rows: what the choices make, why
     /// a row is locked or ignored, and when a change prepares shaders again.
     void UpdatePictureNote();
@@ -193,6 +197,8 @@ private:
     QComboBox* upscaler_combobox{};        ///< Fritchii: the "Upscaler" choice
     // Fritchii's picture menu (SetupPictureMenu).
     QWidget* dlss_quality_widget{};        ///< The nvidia_dlss_quality row (hidden there)
+    QWidget* max_res_row{};                ///< "Max Resolution", while no upscaler is on
+    QComboBox* max_res_combobox{};
     QWidget* render_row{};                 ///< "Resolution": the size the game draws
     QComboBox* render_combobox{};
     QWidget* output_row{};                 ///< "Upscale to": the size the upscaler makes
@@ -207,6 +213,7 @@ private:
     bool max_resolution_choice{true};      ///< OoT's Max Resolution add-on, saved on Apply
     bool max_resolution_saved{true};       ///< ...as it was when the page opened
     bool max_resolution_when_off{true};    ///< Its value when the upscaler goes back to off
+    bool max_resolution_upscaling{true};   ///< ...and when an upscaler comes back on
     u32 upscale_output_choice{};           ///< oot_upscale_output, saved on Apply (0 = Auto)
     u32 upscale_output_saved{};            ///< ...as it was when the page opened
     u32 render_height_choice{1440};        ///< oot_render_height, saved on Apply
