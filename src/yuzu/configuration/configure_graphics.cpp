@@ -1185,7 +1185,9 @@ bool ConfigureGraphics::OcarinaUpscalerPicked() const {
             static_cast<Settings::OotAntiAliasing>(oot_aa_combobox->currentData().toUInt()))) {
         return true;
     }
-    return DlssOn();
+    // A saved DLSS on a card from before RTX never runs: the game's own upscale stays.
+    const VkDeviceInfo::Record* const record = PictureRecord();
+    return DlssOn() && (record == nullptr || CardRunsDlss(*record));
 }
 
 const VkDeviceInfo::Record* ConfigureGraphics::PictureRecord() const {

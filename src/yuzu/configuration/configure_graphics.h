@@ -108,7 +108,7 @@ private:
     /// Fritchii builds: the short status line under the picture rows: what the choices make, why
     /// a row is locked or ignored, and when a change prepares shaders again.
     void UpdatePictureNote();
-    /// FSR or DLSS is picked for OoT (per game: DLSS is the global checkbox).
+    /// FSR, or DLSS on a card that runs it, is picked for OoT (per game: the global checkbox).
     [[nodiscard]] bool OcarinaUpscalerPicked() const;
     /// The picked card's record (per game: the global choice's), null when there is none.
     [[nodiscard]] const VkDeviceInfo::Record* PictureRecord() const;
