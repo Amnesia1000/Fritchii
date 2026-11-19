@@ -6168,6 +6168,19 @@ this session added to our file only; Intel's own disk cache still has it. No eff
 picture. Check on an Intel GPU: play 10 minutes with new pipelines, no "Vulkan driver pipelines
 cached at" in play, one at exit, and the next boot logs "Loaded Vulkan driver pipeline cache".
 
+### FRITCHII_DLSS_LOW_VRAM_CNN
+
+Boot, default 0. DLSS's default model is now "Automatic": K, as before. With this at 1 Automatic
+draws with NVIDIA's CNN preset E on cards under 7 GiB of video memory (reported on an RTX 3050 6 GB
+at 1080p Performance: 1.55 ms less GPU time, 27 MB less memory than K). A player who picks K, or any
+model, keeps it. The status bar and the log name the model that draws. Off by default because E has
+not been judged in OoT, and because Streamline 2.14 marks it deprecated: a DLSS file without it
+falls back to NVIDIA's default, M or L, the slower models that drew thin lines in Fire Emblem. E
+can also ghost more on grass and thin objects than K, mostly at Performance and Ultra Performance.
+Test on any RTX card: `EDEN_NX2_VRAM_LIMIT_MIB=6144` + this at 1 (the log says "the Automatic model
+is the CNN preset E"; the status bar says E), Performance and Ultra Performance, against K at the
+market, in tall grass and at thin fences; compare GPU busy time. `EDEN_NX2_DLSS_PRESET=E` forces it.
+
 ### FRITCHII_PCACHE_SAVE
 
 Boot, default 1; 0 = every save as before. Only where our VkPipelineCache file is in use (not

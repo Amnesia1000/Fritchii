@@ -406,12 +406,13 @@ struct Values {
     // value (left in some players' OoT configs) silently overrode the checkbox, which then showed
     // unchecked and greyed once the game ran (2026-11-09, an RTX 5080 player).
     Setting<bool> nvidia_dlss{linkage, false, "nvidia_dlss", Category::Renderer};
-    // The DLSS model (preset) for every mode: K by default (NVIDIA's defaults for Performance and
-    // Ultra Performance drew thin lines); Default leaves the choice to NVIDIA. EDEN_NX2_DLSS_PRESET
-    // still overrides it. Applies live (Apply/OK while playing).
+    // The DLSS model (preset) for every mode. Auto, the default, is K (NVIDIA's defaults for
+    // Performance and Ultra Performance drew thin lines), or E on small cards with
+    // FRITCHII_DLSS_LOW_VRAM_CNN; a player who picks K gets K. Default leaves the choice to
+    // NVIDIA. EDEN_NX2_DLSS_PRESET still overrides it. Applies live (Apply/OK while playing).
     // v5.8.4: per game as well (the owner: "in game settings and not just global").
     SwitchableSetting<DlssPreset> nvidia_dlss_preset{linkage,
-                                           DlssPreset::K,
+                                           DlssPreset::Auto,
                                            "nvidia_dlss_preset",
                                            Category::Renderer,
                                            Specialization::Default,
