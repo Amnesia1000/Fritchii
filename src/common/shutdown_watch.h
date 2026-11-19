@@ -26,5 +26,8 @@ void Step(const char* step);
 void Exiting(const char* step);
 /// Disarms (a stop finished and the app stays open).
 void End();
+/// Flushes the log and ends the process at once (exit code 2), without DLL detach: for when
+/// nothing can be saved any more (the GPU driver lost the Vulkan device).
+[[noreturn]] void EndProcessNow();
 
 } // namespace Common::ShutdownWatch

@@ -261,4 +261,8 @@ void End() {
     state.cv.notify_all();
 }
 
+void EndProcessNow() {
+    EndProcess();
+}
+
 } // namespace Common::ShutdownWatch
