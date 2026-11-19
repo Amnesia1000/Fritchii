@@ -726,32 +726,46 @@ constexpr u32 AutoOutput(u32 input) {
     return input == DYNAMIC_INPUT ? 1440U : 2160U;
 }
 
+/// The sizes DLSS is known to take from a scene: Native, its 1.5x (Quality), 2x (Performance) and
+/// 3x (Ultra Performance) modes, and 4/3, the game's own 3/4 pass that DLSS has replaced since
+/// v6.0. A pair no mode accepts turns DLSS off for the session, so other ratios (2.5x, 2.67x) are
+/// not offered; nor is 8K, where a tester's 1440p -> 8K found no mode although it is exactly 3x.
+/// A saved output outside this list still shows and runs as saved.
+constexpr bool DlssTakesOutput(u32 scene, u32 output) {
+    if (output > 2880) {
+        return false;
+    }
+    return output == scene || 2 * output == 3 * scene || output == 2 * scene ||
+           output == 3 * scene || 3 * output == 4 * scene;
+}
+
 /// The outputs DLSS and FSR make from OoT's scene, docked, as VideoCommon::PlanOcarinaPassOutput
 /// runs them. They only enlarge, by up to 3x a side (FSR 3.1's range, DLSS Ultra Performance):
 /// - A fixed scene (Max Resolution on: the game's 2560x1440, or oot_render_height's 720p, 1080p,
 ///   and with FRITCHII_OOT_RENDER_STEPS 360p, 540p, 810p, 900p, 1260p): the offered heights from
 ///   the scene's own (Native: anti-aliasing only) to 3x it. 720p -> 1080p is made at 1080p and
 ///   stretched into the game's 1440p target. Above 4K only where the card's memory allows it.
-/// - Below 720p with DLSS (`dlss`): only DLSS's exact ratios, 2x (Performance) and 3x (Ultra
-///   Performance), so 1080p from both 540p and 360p. 540p -> 1440p is 2.67x, between the two
-///   modes, and whether a mode's range takes it is not known; FSR takes any ratio up to 3x.
+/// - With DLSS (`dlss`): only the sizes DlssTakesOutput knows it takes. FSR takes any ratio up to
+///   3x.
 /// - The dynamic scene: its 3/4 pass makes 1440p, or keeps the game's size (Native).
 std::vector<u32> PictureOutputs(u32 input, u64 vram, bool dlss) {
     if (input == DYNAMIC_INPUT) {
         return {1080, 1440};
     }
     std::vector<u32> outputs;
+    std::vector<u32> exact;
     for (const unsigned height : VideoCommon::OcarinaUpscaleOutputs) {
         if (height < input || height > 3 * input ||
             !VideoCommon::OcarinaUpscaleOutputFits(height, vram)) {
             continue;
         }
-        if (dlss && LowScene(input) && height != 2 * input && height != 3 * input) {
-            continue;
-        }
         outputs.push_back(height);
+        if (DlssTakesOutput(input, height)) {
+            exact.push_back(height);
+        }
     }
-    return outputs;
+    // A test height with no exact size (1260p) keeps the list, so the row isn't empty.
+    return dlss && !exact.empty() ? exact : outputs;
 }
 
 /// The output a saved oot_upscale_output makes from that scene when the game runs it
@@ -973,14 +987,16 @@ void ConfigureGraphics::ApplyUpscalerChoice(int index) {
             }
             max_resolution_choice = max_resolution_when_off;
         } else if (was_upscaling) {
-            // DLSS <-> FSR: the same output (DLSS Native <-> FSR at 1x included).
-            ApplyPictureOutput(output_before);
+            // DLSS <-> FSR: the same output (DLSS Native <-> FSR at 1x included), or the nearest
+            // one DLSS takes.
+            ApplyPictureOutput(OfferedOutput(output_before));
         } else {
             // Back on: the "Resolution" picked before (a fixed height needs the add-on).
             max_resolution_choice = max_resolution_upscaling;
-            if (LowScene(PictureInputNow())) {
-                // Off -> DLSS below 720p: an output kept from FSR may not be one DLSS takes.
-                ApplyPictureOutput(PictureOutputNow());
+            // An output kept from FSR may not be one DLSS takes.
+            if (const u32 now = PictureOutputNow();
+                PictureUpscalerNow() == PictureUpscaler::Dlss && OfferedOutput(now) != now) {
+                ApplyPictureOutput(OfferedOutput(now));
             }
         }
     }
@@ -1287,6 +1303,20 @@ std::vector<u32> ConfigureGraphics::PictureOutputsNow() const {
     return outputs;
 }
 
+u32 ConfigureGraphics::OfferedOutput(u32 output) const {
+    const u32 input = PictureInputNow();
+    if (output == SceneHeight(input)) {
+        return output; // Native
+    }
+    const std::vector<u32> outputs =
+        PictureOutputs(input, PictureVram(), PictureUpscalerNow() == PictureUpscaler::Dlss);
+    if (outputs.empty() || std::ranges::find(outputs, output) != outputs.end()) {
+        return output;
+    }
+    const auto above = std::ranges::lower_bound(outputs, output);
+    return above != outputs.end() ? *above : outputs.back();
+}
+
 void ConfigureGraphics::ApplyPictureInput(u32 input) {
     const u32 output_before = PictureOutputNow();
     // A fixed height needs Max Resolution's fixed scene (the render patch changes its scale).
@@ -1307,10 +1337,6 @@ void ConfigureGraphics::ApplyPictureInput(u32 input) {
 
 void ConfigureGraphics::ApplyPictureOutput(u32 output) {
     const u32 input = PictureInputNow();
-    // Below 720p DLSS makes 1080p only (PictureOutputs); DLSS Native keeps the scene's size.
-    if (PictureUpscalerNow() == PictureUpscaler::Dlss && LowScene(input) && output != input) {
-        output = 1080;
-    }
     const bool native = output == SceneHeight(input);
     if (PictureUpscalerNow() == PictureUpscaler::Dlss && dlss_quality_combobox != nullptr) {
         // Native (DLAA) for the scene's own size, else an upscale: the player's own quality stays

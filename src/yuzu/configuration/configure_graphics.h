@@ -120,6 +120,8 @@ private:
     /// A picked "Resolution" (0: the dynamic size, Max Resolution off): the output stays where
     /// that resolution makes it, else the nearest.
     void ApplyPictureInput(u32 input);
+    /// `output` if the current choices offer it, else the nearest size they do.
+    [[nodiscard]] u32 OfferedOutput(u32 output) const;
     /// A picked "Upscale to" height (the scene's own: DLSS Native, FSR at 1x).
     void ApplyPictureOutput(u32 output);
     /// Fritchii builds: the window filter's pros and cons, and which one suits the picture size

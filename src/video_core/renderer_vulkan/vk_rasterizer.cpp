@@ -6020,7 +6020,10 @@ void RasterizerVulkan::DispatchCompute() {
             return;
         }
         if (replacement) {
-            LOG_WARNING(Render_Vulkan, "Ocarina temporal evaluation failed; dispatching native upscaler");
+            LOG_WARNING(Render_Vulkan,
+                        "Ocarina temporal: {} failed, the game's own upscale runs for the rest of "
+                        "this session",
+                        VideoCommon::OcarinaBackendName(*oot_backend));
         }
         if (bind) {
             bind(cmdbuf);
