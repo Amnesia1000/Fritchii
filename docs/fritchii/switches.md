@@ -1068,6 +1068,20 @@ Boot, off by default (helper BJ, 2026-11-16). On AMD's proprietary Vulkan driver
 it on and ran clean with every FRITCHII_ONEF_* line out. Log once: "One follower: off on AMD's
 proprietary driver ...". 1 = keep it on there (tests). RADV, NVIDIA and Intel unchanged.
 
+### FRITCHII_VA_REPORT
+
+TEST tool, off by default (helper FJ, 2026-11-19). Boot: 1 = the instance enables VK_EXT_debug_utils
+and the device VK_EXT_device_address_binding_report (AMD's Windows driver has it since 24.20,
+NVIDIA too), and a messenger of its own keeps the last 65,536 GPU address binds and unbinds the
+driver reports (object type, handle, range, time, thread) in a ring. On a device loss, each fault
+address VK_EXT_device_fault names is looked up: "GPU address report: #N bind|UNBIND buffer|image|...
+handle H, [A, B) K KiB, T ms before the report, thread X (holds the page)". An UNBIND newest =
+the GPU used a freed object (a lifetime bug); a live bind = a bad range inside a live object
+(sparse page, out of bounds past the robustness checks); no holder = a driver internal range or
+one older than the ring. Costs a locked ring write per bind (allocations, not draws): for loss
+hunts, not fps runs. Boot lines: "GPU address report (FRITCHII_VA_REPORT=1): messenger on" and
+"the driver reports its GPU address binds", or why it is off.
+
 ### FRITCHII_VRAM_REPORT
 
 TEST tool, off by default (helper BF, 2026-11-16). Live: 1 = every 30 frames the main device-local
