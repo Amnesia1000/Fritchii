@@ -5946,6 +5946,43 @@ Performance). Check per height: `Applying built-in patch "540p render (built-in)
 its scene at 960x540`, `NVIDIA DLSS (Streamline): 960x540 -> 1920x1080`, no repeating `the game's
 upscale draws frame N`.
 
+### Low-end PC simulation: FRITCHII_SIM_GPU_SLOW, FRITCHII_SIM_CPU, FRITCHII_SIM_CPU_SLOW, FRITCHII_SIM_RAM_LIMIT_MB
+
+TEST, all off by default (helper EY, 2026-11-19). They make a fast PC behave more like a weak one,
+so performance work can be judged for low-end hardware. Nothing on the PC changes: no admin rights,
+no driver, power, registry or Windows setting, no qt-config.ini. Everything is set by this process
+on itself and ends with it. work\lowend_sim.py sets them from presets. VRAM uses the existing
+EDEN_NX2_VRAM_LIMIT_MIB + FRITCHII_VRAM_SIM_OTHERS=1.
+
+- FRITCHII_SIM_GPU_SLOW=<factor> (live, 1 to 10; 3.5 or 350; live values are whole numbers, 350 or
+  3; 0 = off). GPU timestamps around every main-queue submission; for each ms of GPU work,
+  (factor - 1) ms of a one-invocation compute dispatch at the end of later submissions, between
+  full barriers, so nothing runs beside it. The dispatch is measured too and the difference carried
+  over. Line every 10 s: "Low-end simulation, GPU x3.50: work W ms/s, added A ms/s, xR reached, GPU
+  busy B%". R should sit at the factor; a lower R with "dropped" above 0 means the game makes too
+  few submissions to fit the load. Not slowed: the present pass and the side queue.
+- FRITCHII_SIM_CPU=<cores>/<threads> (boot; 6/12, 4/8, 6/6). The process keeps that many of the
+  PC's last cores (always fewer than it has), thread pools size themselves by it and thread
+  pinning plans for it, so a 4-core simulation runs unpinned like a real 4-core PC.
+- FRITCHII_SIM_CPU_SLOW=<factor> (live, 1 to 4). The guest cores, GPU front, GPU back and Vulkan
+  worker spin for (factor - 1) x the CPU time they used, counted in their own cycles, after each
+  stretch of work. Waits are not charged. Not slowed: the memory stage, shader compile workers,
+  audio. Line every ~10 s: "Low-end simulation, CPU x1.70: ... x1.70 in all".
+- There is no CPU cap switch on purpose. A Windows job object's hard CPU cap limits the process's
+  total only, and it stops every thread until the next interval: measured on the owner's PC
+  (lowend_sim.py --measure-cap, 2026-11-19), one thread capped at half a processor ran in turns with
+  stalls of about 307 ms. A slower CPU does nothing like that.
+- FRITCHII_SIM_RAM_LIMIT_MB=<MiB> (boot, 4096 or more): a job object's limit on committed memory.
+  Past it this process's allocations fail and the game may crash; the PC is not affected. It is a
+  failure test, not a 16 GB PC. Not used by the presets; lowend_sim.py reports the game's peak
+  memory instead.
+
+What these do not reproduce: cache size (the 7800X3D's 96 MB L3 helps emulators more than clocks
+do, so a CPU factor has to stand in for it), memory and VRAM bandwidth, PCIe lanes, another GPU's
+balance of geometry, fill and compute, other drivers' behaviour and costs, and upscaler cost on
+other hardware. Use them to find what becomes the limit and to compare builds on the same setting,
+not to promise a frame rate for a named card.
+
 ## Numbered experiments (EDEN_NX2_EXPn)
 
 Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP79, live through the debug server:

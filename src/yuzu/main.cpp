@@ -20,6 +20,7 @@
 
 #include "common/fs/fs_paths.h"
 #include "common/fs/path_util.h"
+#include "common/lowend_sim.h"
 #include "common/shutdown_watch.h"
 #include "startup_checks.h"
 
@@ -435,6 +436,8 @@ int main(int argc, char* argv[]) {
     // switches are added.
     ProfilingMode::ReadAtLaunch();
     LoadNx2Switches(argv[0]);
+    // Test only, off by default: the low-end PC simulation's limits on this process.
+    Common::LowEndSim::ApplyProcessLimits();
     // Fritchii: NVIDIA's driver shader cache must hold OoT's ~120,000 prepared pipelines. Its size
     // is a Control Panel setting newer drivers no longer show ("Shader Cache Size"); the driver
     // also reads these variables, for this process only (nothing system-wide changes). A value

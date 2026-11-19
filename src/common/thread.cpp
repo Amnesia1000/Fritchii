@@ -26,6 +26,7 @@
 #include "common/fritchii_lock_census.h"
 #include "common/fritchii_write_ring.h"
 #include "common/logging.h"
+#include "common/lowend_sim.h"
 #include "common/nx2_sample_profile.h"
 #include "common/assert.h"
 #include "common/thread.h"
@@ -794,6 +795,18 @@ Common::ThreadPinning::Topology ReadPinningTopology() {
             }
         }
         offset += entry->Size;
+    }
+    // FRITCHII_SIM_CPU: the plan sees the simulated CPU, as it would on a PC with those cores.
+    if (const u64 allowed = Common::LowEndSim::CpuMask(); allowed != 0) {
+        std::erase_if(topology.cores, [allowed](auto& core) {
+            core.mask &= allowed;
+            return core.mask == 0;
+        });
+        std::erase_if(topology.l3, [allowed](auto& cache) {
+            cache.mask &= allowed;
+            return cache.mask == 0;
+        });
+        topology.logical_processors = static_cast<u32>(std::popcount(allowed));
     }
     return topology;
 }

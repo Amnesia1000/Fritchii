@@ -29,6 +29,7 @@
 #include <streambuf>
 #include "video_core/host_shaders/vulkan_occl_flag_frag_spv.h"
 #include "video_core/fritchii_occl_flag.h"
+#include "common/lowend_sim.h"
 #include "common/cityhash.h"
 #include "common/polyfill_thread.h"
 #include "common/scm_rev.h"
@@ -714,7 +715,7 @@ size_t CapLegacyAmdBuildThreads(const Device& device, size_t threads) {
 
 size_t GetTotalPipelineWorkers(const Device& device) {
     const size_t max_core_threads =
-        std::max<size_t>(static_cast<size_t>(std::thread::hardware_concurrency()), 2ULL) - 1ULL;
+        std::max<size_t>(static_cast<size_t>(Common::LowEndSim::LogicalProcessors()), 2ULL) - 1ULL;
     // EDEN_NX2_PIPELINE_WORKERS=<n> sets the number of pipeline build threads (CheezyEmu
     // 132cc46c9e, Spikol02/Nyamu). Opt-in: unset, every GPU but legacy AMD keeps the old count.
     if (const size_t requested = RequestedPipelineWorkers(); requested != 0) {
@@ -1630,7 +1631,7 @@ size_t BackgroundPipelineThreads() {
     if (const char* value = std::getenv("EDEN_NX2_BACKGROUND_PIPELINE_THREADS")) {
         return std::clamp<size_t>(static_cast<size_t>(std::strtoull(value, nullptr, 10)), 1, 16);
     }
-    return std::clamp<size_t>(std::thread::hardware_concurrency() / 4, 1, 6);
+    return std::clamp<size_t>(Common::LowEndSim::LogicalProcessors() / 4, 1, 6);
 }
 
 /// Built graphics pipelines past which EvictUnusedPipelines destroys unused ones. By default a
@@ -5968,7 +5969,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     // Threads() workers beside the game; at full speed (the frontend holds the game for the
     // preparation) one per host thread, at normal priority.
     const size_t full_threads = CapLegacyAmdBuildThreads(
-        device, std::max<size_t>(threads, std::max(1U, std::thread::hardware_concurrency())));
+        device, std::max<size_t>(threads, std::max(1U, Common::LowEndSim::LogicalProcessors())));
     // On Intel it does not build beside the game: there its compiles took the CPU from the game
     // (owner, Arc B580 + 6 cores: lag spikes with the preparation running in play, none with
     // EDEN_NX2_PRECOMPILE=0). Like the warm-up, it builds then only while emulation is paused or
@@ -6764,7 +6765,7 @@ bool PipelineCache::CheckKeptSample(const PrecompiledKept::Index& index,
     std::atomic<bool> stop{};
     // A few threads at normal priority: the frontend holds the game while this runs, like the
     // stamp check before it, and its "Preparing shaders" screen shows after 0.8 s.
-    const size_t threads = std::clamp<size_t>(std::thread::hardware_concurrency() / 2, 1, 8);
+    const size_t threads = std::clamp<size_t>(Common::LowEndSim::LogicalProcessors() / 2, 1, 8);
     {
         std::vector<std::jthread> pool;
         for (size_t i = 0; i < std::min(threads, items.size()); ++i) {
