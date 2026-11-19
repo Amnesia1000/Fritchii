@@ -673,6 +673,20 @@ vk::ShaderModule EmitShaderModule(const Device& device, const Shader::Profile& p
             }
         }
     }
+    if (program.info.uses_demote_to_helper_invocation) [[unlikely]] {
+        // FRITCHII_SPIRV_DUMP_DISCARD=<folder> (TEST): the first 200 programs emitted from now on
+        // that discard, as .spv files (for spirv-val).
+        static std::atomic<int> dumped{};
+        if (const char* folder = std::getenv("FRITCHII_SPIRV_DUMP_DISCARD");
+            folder != nullptr && folder[0] != 0 && dumped.fetch_add(1) < 200) {
+            const std::string path =
+                fmt::format("{}/discard_{:016x}_{}.spv", folder, shader_hash, stage_index);
+            if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
+                std::fwrite(code.data(), sizeof(u32), code.size(), file);
+                std::fclose(file);
+            }
+        }
+    }
     return BuildStageModule(device, code, shader_hash, stage_index, spirv_hash);
 }
 
@@ -1057,8 +1071,11 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
             device.IsExtShaderViewportIndexLayerSupported(),
         .support_viewport_mask = device.IsNvViewportArray2Supported(),
         .support_typeless_image_loads = device.IsFormatlessImageLoadSupported(),
+        // FRITCHII_TEST_KILL_FALLBACK=1 (TEST): shaders translated from now on take the backend's
+        // path for devices without demote to helper invocation (OpKill), to check its SPIR-V.
         .support_demote_to_helper_invocation =
-            device.IsExtShaderDemoteToHelperInvocationSupported(),
+            device.IsExtShaderDemoteToHelperInvocationSupported() &&
+            std::getenv("FRITCHII_TEST_KILL_FALLBACK") == nullptr,
         .support_int64_atomics = device.IsExtShaderAtomicInt64Supported(),
         .support_shared_int64_atomics = device.IsSharedInt64AtomicsSupported(),
         .support_float32_atomic_add = device.IsFloat32AtomicAddSupported(),
