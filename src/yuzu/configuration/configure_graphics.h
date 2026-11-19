@@ -99,6 +99,18 @@ private:
     /// Settings::OcarinaRenderHeight, Settings::OcarinaMaxResolutionOn).
     void SetupPictureMenu(const std::map<u32, QWidget*>& rows);
     void UpdatePictureMenu();
+    /// Fritchii builds: the short status line under the picture rows: what the choices make, why
+    /// a row is locked or ignored, and when a change prepares shaders again.
+    void UpdatePictureNote();
+    /// FSR or DLSS is picked for OoT (per game: DLSS is the global checkbox).
+    [[nodiscard]] bool OcarinaUpscalerPicked() const;
+    /// The picked card's record (per game: the global choice's), null when there is none.
+    [[nodiscard]] const VkDeviceInfo::Record* PictureRecord() const;
+    /// The name of the upscaler that will run ("FSR 3.1" for a saved FSR 4 this card can't run).
+    [[nodiscard]] QString PictureUpscalerName() const;
+    /// The resolution scale OoT will run at (1x with an upscaler), as a number to compare: the
+    /// prepared shaders depend on it.
+    [[nodiscard]] u32 PictureScaleNow() const;
     /// A picked "Resolution" (0: the dynamic size, Max Resolution off): the output stays where
     /// that resolution makes it, else the nearest.
     void ApplyPictureInput(u32 input);
@@ -185,7 +197,8 @@ private:
     QComboBox* render_combobox{};
     QWidget* output_row{};                 ///< "Upscale to": the size the upscaler makes
     QComboBox* output_combobox{};
-    QLabel* upscale_note{};                ///< What the two make, and how to go lower
+    QLabel* upscale_note{};                ///< The status line (UpdatePictureNote)
+    u32 picture_scale_saved{};             ///< PictureScaleNow when the page opened
     QComboBox* scaling_filter_combobox{};  ///< The "Window filter" choice
     QLabel* filter_note{};                 ///< Fritchii: under it, pros, cons and the advice
     QWidget* texture_sharpness_widget{};
