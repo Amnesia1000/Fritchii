@@ -901,7 +901,7 @@ cards; never integrated GPUs; a simulated card's limit counts). The small card p
 card should stop overflowing in real play (RTX 2080 at 1440p: 7.9 GB of a 6.7-7.2 GB budget, 32
 pressure events, read-backs stalling for seconds; RTX 3070 Ti 6850 of 7181) and a 6 GB card should
 fit at 1x, with nothing reserved for show. Big cards never turn it on in auto mode.
-FRITCHII_SMALL_CARD_PARTS (boot, bit mask, default 0xF) picks the parts:
+FRITCHII_SMALL_CARD_PARTS (boot, bit mask, default 0x2F) picks the parts:
 - 0x1 fit (live): the texture cache's critical threshold = budget less 1/16 of it (at most 512
   MiB; was 1/8, at most 1 GiB) less the out-of-memory margin, the block slack and what the cache's
   usage leaves out: the image pool, deleted images still in flight, collector downloads, frees
@@ -919,6 +919,9 @@ FRITCHII_SMALL_CARD_PARTS (boot, bit mask, default 0xF) picks the parts:
   stays); the status bar reads "Scale: 1x (2x DOESN'T FIT)". Log: "Small card profile: resolution
   scale ... does not fit".
 - 0x10 stream (boot, not in the default): stream buffer 64 MiB instead of 128.
+- 0x20 buffer pool blocks (boot): the buffer cache's device-local pool uses 4 MiB blocks instead of
+  16, buffers over 2 MiB take the default blocks (FRITCHII_BUFFER_POOL_BLOCK_MB overrides, 0 keeps
+  16). Castle Town: ~140 MiB of small buffers held 50 blocks, 800 MiB, on every card size.
 Logs: at boot "Small card profile (FRITCHII_SMALL_CARD=N): main heap H MiB, budget B MiB, a small /
 not a small card; profile on/off (parts ...)"; the thresholds' "Memory margins" line adds
 "uncounted U MiB (small card profile on/off)"; with FRITCHII_VRAM_REPORT=1 a second line "VRAM split
@@ -974,6 +977,16 @@ OoT). With 1 the session runs the BC3 path instead, whose opaque scan already se
 opaque images to BC1 (EDEN_NX2_ASTC_BC1, on by default) and keeps the others in BC3. Log at boot:
 "FRITCHII_BC1_KEEPS_ALPHA: ASTC recompression BC1 runs the BC3 path ...". A candidate for default 1:
 it changes nothing for a player on BC3 or Uncompressed.
+
+### FRITCHII_VRAM_POOL_FLOOR
+
+Default 1 (helper FE, 2026-11-19). Live: 0 off. While
+FRITCHII_VRAM_POOL_FIT or budget pressure sets the image pool's cap, the cap never goes under 1/24 of
+the budget (64-192 MiB), and images only that floor keeps wait 16 frames. An image refused by the
+budget halves the pool instead of emptying it; one that could not be made still empties it. Why: over
+budget the fit gave 0, so every render target given to the pool was destroyed at once (simulated 4 GB
+card at Castle Town: 0 taken, 2,800-5,400 missed per 600 frames; 16 GB: ~640 taken, 20-50 missed).
+Cards with room never reach the floor. Judge by the "Image pool (EXP42)" line's taken and missed.
 
 ### FRITCHII_VRAM_POOL_FIT
 
@@ -1087,6 +1100,29 @@ a frame with a bounded number of deletes; an area load makes dozens of images in
 already at its budget (a 1365^2 image create took 11.9 s while the driver made room). Counted in the
 FRITCHII_VRAM_OWNERS line: "evictions before creates P passes, N images, M MiB, S short, C at the
 frame cap".
+
+### FRITCHII_TC_THRASH_GUARD
+
+Default 1 (helper FE, 2026-11-19). Live: 0 off, 1 on, 2 counts only (the log line, no floor). Stops
+the texture cache deleting images the game keeps coming back to when it is over budget. Why: the
+collector compares the driver's usage with its critical memory, and on a small card most of that
+usage is not images (Castle Town, simulated 4 GB card: 4,100-4,900 MiB in the cache's view, 1,500
+of it images, critical 2,100-2,400). It could never get there, stayed 1 GiB+ over and deleted
+everything unused for 3 frames, ASTC included: 55-60 images made a frame instead of under 1, ~1,700
+ASTC GPU decodes a second instead of ~1, 44 fps with 20 fps lows instead of ~75. Deleted images
+are remembered by address and shape (8,192 slots, ~320 KiB of RAM). When 8 or more a second come
+back after the collector took them under pressure, the collector and FRITCHII_TC_CRITICAL_ENFORCE
+leave alone images used within 1.25x the 90th percentile of the gaps (at most 600 frames). The floor
+halves when live images pass 3/4 of the budget, decays after 10 s without pressure, and is ignored
+when an allocation has failed. Without pressure it never rises, so cards with room are unchanged.
+It only keeps images longer, so it cannot change what is drawn. With it, FRITCHII_TC_CRITICAL_ENFORCE
+stops walking the idle list for the rest of a frame once a pass found nothing.
+Log every 600 frames, when anything was made again or a floor is set: "Image churn
+(FRITCHII_TC_THRASH_GUARD=N) last 600 frames: M images made, R made again after a delete (MiB, costly
+to load, frames after their last use); deleted by: collector under pressure, collector, cold sweep,
+superseded sweep, slot retire, join, unmap, unmap sweep, other; collector age floor F frames (raised,
+halved), live images MiB". Test: EDEN_NX2_VRAM_LIMIT_MIB=4096 + FRITCHII_VRAM_SIM_OTHERS=1 at Castle
+Town: "Images made" under ~2,000 per 600 frames, "ASTC GPU decodes" under ~200 per 5 s.
 
 ### FRITCHII_VRAM_OWNERS
 

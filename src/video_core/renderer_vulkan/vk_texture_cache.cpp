@@ -3235,6 +3235,7 @@ void TextureCacheRuntime::UpdatePoolFitCap() {
     const u64 budget = device.GetDeviceMemoryBudget();
     if (budget == 0) {
         pool_fit_cap = ~u64{0};
+        pool_floor_bytes = 0;
         return;
     }
     // What the driver counts: the live usage (pool included) plus the kept blocks and the unused
@@ -3245,6 +3246,16 @@ void TextureCacheRuntime::UpdatePoolFitCap() {
     const u64 margin = (std::min)(budget / 8, u64{1} << 30);
     const u64 ceiling = budget - (std::min)(budget, margin);
     pool_fit_cap = ceiling > others ? ceiling - others : 0;
+    // FRITCHII_VRAM_POOL_FLOOR (live, default 1, 0 off): past the budget the fit gave 0, for as
+    // long as the card stayed over. Castle Town on a simulated 4 GB card: every render target
+    // given to the pool was destroyed on the spot and none taken (0 taken, 2,800-5,400 missed,
+    // 640-2,400 given and evicted per 600 frames; 16 GB card: ~640 taken, 20-50 missed). The
+    // targets of a frame come back within a few frames, so a small pool of them costs little more
+    // than the images in flight would. 1/24 of the budget, 64 to 192 MiB, each waiting 16 frames.
+    pool_floor_bytes = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_vram_pool_floor,
+                                                        "FRITCHII_VRAM_POOL_FLOOR", 1) > 0
+                           ? std::clamp(budget / 24, u64{64} << 20, u64{192} << 20)
+                           : 0;
     pool_fit_budget = budget;
     pool_fit_others = others;
     pool_fit_lowest = (std::min)(pool_fit_lowest, pool_fit_cap);
@@ -3564,8 +3575,8 @@ void TextureCacheRuntime::TickFrame() {
         // switch is off or device memory ran short (an image did not fit or could not be made).
         const u32 pressure = memory_allocator.MemoryPressureEvents();
         const u32 failed = memory_allocator.FailedImages();
-        const bool short_of_memory =
-            pressure != image_pool_seen_pressure || failed != image_pool_seen_failed;
+        const bool image_failed = failed != image_pool_seen_failed;
+        const bool short_of_memory = pressure != image_pool_seen_pressure || image_failed;
         image_pool_seen_pressure = pressure;
         image_pool_seen_failed = failed;
         // FRITCHII_KEEP_BLOCKS: kept blocks go before any pooled image, then one is trimmed a
@@ -3583,6 +3594,7 @@ void TextureCacheRuntime::TickFrame() {
             VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_vram_pool_fit,
                                              "FRITCHII_VRAM_POOL_FIT") == 0) {
             pool_fit_cap = ~u64{0};
+            pool_floor_bytes = 0;
             pool_fit_frames = 0;
         } else if (pool_fit_frames++ % 30 == 0) {
             UpdatePoolFitCap();
@@ -3601,13 +3613,28 @@ void TextureCacheRuntime::TickFrame() {
         SampleVramReport();
         TickVramTrim();
         const int pool_switch = VideoCore::Nx2Debug::Experiment(42);
-        if (pool_switch == 0 || short_of_memory) {
+        // FRITCHII_VRAM_POOL_FLOOR: an image refused by the budget halves the pool, one that could
+        // not be made at all empties it. On a card that stays over budget refusals keep coming,
+        // and emptying the pool at each one is the flush the floor is there to stop.
+        if (pool_switch == 0 || image_failed || (short_of_memory && pool_floor_bytes == 0)) {
             TrimImagePool(0);
             if (ghost_pools) [[unlikely]] {
                 ghost_pools->Clear();
             }
+        } else if (short_of_memory) {
+            TrimImagePool(FittedPoolCap() / 2);
         } else {
             TrimImagePool(FittedPoolCap()); // a lowered EXP66 applies at once
+        }
+        // Only the floor keeps these: what is not taken back soon goes.
+        if (pool_floor_bytes != 0 && pool_fit_cap < pool_floor_bytes) {
+            while (!image_pool.empty() &&
+                   image_pool_frame - image_pool.front().frame > ImagePoolFloorFrames) {
+                image_pool_bytes -= image_pool.front().bytes;
+                DropPooledImage(std::move(image_pool.front().image), image_pool.front().bytes);
+                image_pool.pop_front();
+                ++image_pool_evicted;
+            }
         }
         // EDEN_NX2_EXP82 (live, frames, 0 = off; fable52_answer_after7778 1): proven entries (a
         // shape taken from the pool before) stay this many frames instead of ImagePoolMaxFrames.

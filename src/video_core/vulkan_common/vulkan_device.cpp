@@ -1466,9 +1466,16 @@ VkDeviceSize Device::DeviceBufferBlockSize() noexcept {
     // buffer cache's device-local pool, buffers over half a block take the default blocks.
     // 4 = small blocks with a 2 MiB cut-off: a 16 MiB block holds a few buffers and stays
     // pinned while any of them lives, mostly empty ("buffer pool" slack in VRAM_OWNERS).
+    // FRITCHII_SMALL_CARD (part BufferPoolBlocks): 4 unless the switch says otherwise. The first
+    // call comes with the first buffer, after the device decided the profile.
     static const VkDeviceSize size = [] {
         const char* value = std::getenv("FRITCHII_BUFFER_POOL_BLOCK_MB");
         if (value == nullptr || value[0] == '\0') {
+            if (VideoCore::SmallCard::On(VideoCore::SmallCard::BufferPoolBlocks)) {
+                LOG_INFO(Render_Vulkan, "Small card profile: device buffer pool blocks of 4 MiB, "
+                                        "buffers over 2048 KiB take the default blocks");
+                return VkDeviceSize{4} << 20;
+            }
             return SeparatePoolBlockSize;
         }
         const long mib = std::strtol(value, nullptr, 10);
