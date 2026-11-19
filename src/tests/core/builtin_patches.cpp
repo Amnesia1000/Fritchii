@@ -867,6 +867,22 @@ TEST_CASE("High refresh fixes built-in hooks its sites in both modes", "[patch_m
         }
     }
 
+    SECTION("Cloth below 60 fps: on by default, its switch puts the two old words back") {
+        constexpr std::array ClothStubs{0x3C46830, 0x3C46890, 0x3C468F0, 0x3C46950};
+        const auto on = context.Manager().PatchNSO(nso, "main");
+        SetTestEnv("FRITCHII_NO_CLOTH_SLOW", "1");
+        const auto off = context.Manager().PatchNSO(nso, "main");
+        SetTestEnv("FRITCHII_NO_CLOTH_SLOW", "");
+        REQUIRE(applied(on));
+        REQUIRE(applied(off));
+        for (const size_t stub : ClothStubs) {
+            REQUIRE(word_at(on, Code + stub + 0x1C) == NopInstruction);
+            REQUIRE(word_at(on, Code + stub + 0x34) == 0x72A7B110);  // movk w16, #0x3d88, lsl #16
+            REQUIRE(word_at(off, Code + stub + 0x1C) == 0x540001C1); // b.ne +0x38
+            REQUIRE(word_at(off, Code + stub + 0x34) == 0x72A79110); // movk w16, #0x3c88, lsl #16
+        }
+    }
+
     SECTION("Another word at a hook, a stub word in use, or off in Add-Ons: skipped whole") {
         SECTION("first hook") {
             std::memcpy(nso.data() + Code + Hooks.front().offset, &NopInstruction, sizeof(u32));

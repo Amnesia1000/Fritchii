@@ -63,6 +63,9 @@ struct BuiltinPatchRecord {
     /// When set, this environment variable at 1 leaves this one record out: a hook stays the
     /// game's word while the rest of the patch applies (tests of one site of a patch).
     const char* skip_env = nullptr;
+    /// When set, this record applies only while this environment variable is 1: the other form of
+    /// a word whose usual record has the same variable as its skip_env.
+    const char* need_env = nullptr;
 };
 
 struct BuiltinPatch {
@@ -724,15 +727,24 @@ constexpr std::array<u8, 80> SCARECROW_LAST{
 // 0x2C2208C. High refresh: min(T+0x18 (step / 60), 1/60), 1/60 when that is not positive (the
 // bits compared as integers), so a step of 1 and more still gives the game's 1/60 exactly. One
 // stub per site (no bl: x30 stays as it is), x16/x17 saved.
-//   gate (else dark) ; save x16, x17 ; w17 = [T + 0x18] ; w16 = 0x3c888888 ;
+// Below 60 fps (a step over 1) it was the other way round: each frame simulated 1/60 s while the
+// game moved on step / 60, so the cloth trailed and over-swung (Link's cap flared out after he
+// stopped and took about a second to settle at 18 fps). Now, in both frame-step modes, the time is
+// T+0x18 itself, at most 4/60: the gate's b.ne to the game's load is a nop and the bound is 4/60
+// (one word each). A step of exactly 1 still gives 1/60 (the game's 60 fps value), and above 60 fps
+// nothing changes. Both step routines keep the step in (0, 3] at normal speed, so the bound only
+// limits Turbo; a step of 0 or less would also give 4/60, and neither routine returns one.
+// FRITCHII_NO_CLOTH_SLOW=1 puts back the two words of each stub (HR_FIX_VARIANTS): the high
+// refresh mode's min(T+0x18, 1/60) and Dark's mode's game load, as before.
+//   gate (nop: always on) ; save x16, x17 ; w17 = [T + 0x18] ; w16 = 0x3d888888 ;
 //   w17 = (w17 - 1 < w16 ? w17 - 1 : w16) + 1 ; fmov s0|s2, w17 ; restore ; b back
-//   dark: the game's load ; b back
+//   dark (unreached): the game's load ; b back
 constexpr std::array<u8, 92> CLOTH_DT_A{
     0xF0, 0x47, 0xBF, 0xA9, 0x10, 0x55, 0xFE, 0x90, 0x10, 0xC6, 0x4C, 0xB9,
     0xF1, 0x09, 0x90, 0x52, 0xB1, 0x9A, 0xB2, 0x72, 0x1F, 0x02, 0x11, 0x6B,
-    0xF0, 0x47, 0xC1, 0xA8, 0xC1, 0x01, 0x00, 0x54, 0xF0, 0x47, 0xBF, 0xA9,
+    0xF0, 0x47, 0xC1, 0xA8, 0x1F, 0x20, 0x03, 0xD5, 0xF0, 0x47, 0xBF, 0xA9,
     0x70, 0x92, 0x00, 0xD0, 0x10, 0x92, 0x45, 0xF9, 0x11, 0x1A, 0x40, 0xB9,
-    0x10, 0x11, 0x91, 0x52, 0x10, 0x91, 0xA7, 0x72, 0x31, 0x06, 0x00, 0x51,
+    0x10, 0x11, 0x91, 0x52, 0x10, 0xB1, 0xA7, 0x72, 0x31, 0x06, 0x00, 0x51,
     0x3F, 0x02, 0x10, 0x6B, 0x31, 0x32, 0x90, 0x1A, 0x31, 0x06, 0x00, 0x11,
     0x20, 0x02, 0x27, 0x1E, 0xF0, 0x47, 0xC1, 0xA8, 0xAC, 0xFE, 0x13, 0x17,
     0x00, 0x6D, 0x46, 0xBD, 0xAA, 0xFE, 0x13, 0x17, // ldr s0, [x8, #0x66c] ; b 0x146330
@@ -740,9 +752,9 @@ constexpr std::array<u8, 92> CLOTH_DT_A{
 constexpr std::array<u8, 92> CLOTH_DT_B{
     0xF0, 0x47, 0xBF, 0xA9, 0x10, 0x55, 0xFE, 0x90, 0x10, 0xC6, 0x4C, 0xB9,
     0xF1, 0x09, 0x90, 0x52, 0xB1, 0x9A, 0xB2, 0x72, 0x1F, 0x02, 0x11, 0x6B,
-    0xF0, 0x47, 0xC1, 0xA8, 0xC1, 0x01, 0x00, 0x54, 0xF0, 0x47, 0xBF, 0xA9,
+    0xF0, 0x47, 0xC1, 0xA8, 0x1F, 0x20, 0x03, 0xD5, 0xF0, 0x47, 0xBF, 0xA9,
     0x70, 0x92, 0x00, 0xD0, 0x10, 0x92, 0x45, 0xF9, 0x11, 0x1A, 0x40, 0xB9,
-    0x10, 0x11, 0x91, 0x52, 0x10, 0x91, 0xA7, 0x72, 0x31, 0x06, 0x00, 0x51,
+    0x10, 0x11, 0x91, 0x52, 0x10, 0xB1, 0xA7, 0x72, 0x31, 0x06, 0x00, 0x51,
     0x3F, 0x02, 0x10, 0x6B, 0x31, 0x32, 0x90, 0x1A, 0x31, 0x06, 0x00, 0x11,
     0x20, 0x02, 0x27, 0x1E, 0xF0, 0x47, 0xC1, 0xA8, 0xCA, 0x93, 0x19, 0x17,
     0x00, 0x01, 0x27, 0x1E, 0xC8, 0x93, 0x19, 0x17, // fmov s0, w8 ; b 0x2ab808
@@ -750,9 +762,9 @@ constexpr std::array<u8, 92> CLOTH_DT_B{
 constexpr std::array<u8, 92> CLOTH_DT_C{
     0xF0, 0x47, 0xBF, 0xA9, 0x10, 0x55, 0xFE, 0x90, 0x10, 0xC6, 0x4C, 0xB9,
     0xF1, 0x09, 0x90, 0x52, 0xB1, 0x9A, 0xB2, 0x72, 0x1F, 0x02, 0x11, 0x6B,
-    0xF0, 0x47, 0xC1, 0xA8, 0xC1, 0x01, 0x00, 0x54, 0xF0, 0x47, 0xBF, 0xA9,
+    0xF0, 0x47, 0xC1, 0xA8, 0x1F, 0x20, 0x03, 0xD5, 0xF0, 0x47, 0xBF, 0xA9,
     0x70, 0x92, 0x00, 0xD0, 0x10, 0x92, 0x45, 0xF9, 0x11, 0x1A, 0x40, 0xB9,
-    0x10, 0x11, 0x91, 0x52, 0x10, 0x91, 0xA7, 0x72, 0x31, 0x06, 0x00, 0x51,
+    0x10, 0x11, 0x91, 0x52, 0x10, 0xB1, 0xA7, 0x72, 0x31, 0x06, 0x00, 0x51,
     0x3F, 0x02, 0x10, 0x6B, 0x31, 0x32, 0x90, 0x1A, 0x31, 0x06, 0x00, 0x11,
     0x20, 0x02, 0x27, 0x1E, 0xF0, 0x47, 0xC1, 0xA8, 0x9A, 0x67, 0xBF, 0x17,
     0x00, 0x6D, 0x46, 0xBD, 0x98, 0x67, 0xBF, 0x17, // ldr s0, [x8, #0x66c] ; b 0x2c207a8
@@ -760,9 +772,9 @@ constexpr std::array<u8, 92> CLOTH_DT_C{
 constexpr std::array<u8, 92> CLOTH_DT_D{
     0xF0, 0x47, 0xBF, 0xA9, 0x10, 0x55, 0xFE, 0x90, 0x10, 0xC6, 0x4C, 0xB9,
     0xF1, 0x09, 0x90, 0x52, 0xB1, 0x9A, 0xB2, 0x72, 0x1F, 0x02, 0x11, 0x6B,
-    0xF0, 0x47, 0xC1, 0xA8, 0xC1, 0x01, 0x00, 0x54, 0xF0, 0x47, 0xBF, 0xA9,
+    0xF0, 0x47, 0xC1, 0xA8, 0x1F, 0x20, 0x03, 0xD5, 0xF0, 0x47, 0xBF, 0xA9,
     0x70, 0x92, 0x00, 0xD0, 0x10, 0x92, 0x45, 0xF9, 0x11, 0x1A, 0x40, 0xB9,
-    0x10, 0x11, 0x91, 0x52, 0x10, 0x91, 0xA7, 0x72, 0x31, 0x06, 0x00, 0x51,
+    0x10, 0x11, 0x91, 0x52, 0x10, 0xB1, 0xA7, 0x72, 0x31, 0x06, 0x00, 0x51,
     0x3F, 0x02, 0x10, 0x6B, 0x31, 0x32, 0x90, 0x1A, 0x31, 0x06, 0x00, 0x11,
     0x22, 0x02, 0x27, 0x1E, 0xF0, 0x47, 0xC1, 0xA8, 0xBC, 0x6D, 0xBF, 0x17,
     0x02, 0x6D, 0x46, 0xBD, 0xBA, 0x6D, 0xBF, 0x17, // ldr s2, [x8, #0x66c] ; b 0x2c22090
@@ -955,8 +967,32 @@ static_assert(HR_FIX_STATE_OFFSET >= 0x4E9B000 &&
               HR_FIX_STATE_OFFSET + HR_FIX_STATE_SIZE <= HIGH_REFRESH_STATE_OFFSET &&
               HR_FIX_STATE_OFFSET + HR_FIX_STATE_SIZE <= PICKUP_STATE_OFFSET &&
               HR_WHOLE_SLOTS_OFFSET + 0x84 <= HR_FIX_STATE_OFFSET + HR_FIX_STATE_SIZE);
+// Stub words with a second form a test switch puts back: the stub's word applies unless the switch
+// is 1, the old word only while it is 1.
+struct OotFixVariant {
+    size_t offset;
+    std::array<u8, 4> old_bytes;
+    const char* env;
+};
+constexpr std::array<u8, 4> CLOTH_OLD_GATE{0xC1, 0x01, 0x00, 0x54};  // b.ne +0x38 (the game's load)
+constexpr std::array<u8, 4> CLOTH_OLD_BOUND{0x10, 0x91, 0xA7, 0x72}; // movk w16, #0x3c88, lsl #16
+constexpr std::array HR_FIX_VARIANTS{
+    OotFixVariant{0x3C46830 + 0x1C, CLOTH_OLD_GATE, "FRITCHII_NO_CLOTH_SLOW"},
+    OotFixVariant{0x3C46830 + 0x34, CLOTH_OLD_BOUND, "FRITCHII_NO_CLOTH_SLOW"},
+    OotFixVariant{0x3C46890 + 0x1C, CLOTH_OLD_GATE, "FRITCHII_NO_CLOTH_SLOW"},
+    OotFixVariant{0x3C46890 + 0x34, CLOTH_OLD_BOUND, "FRITCHII_NO_CLOTH_SLOW"},
+    OotFixVariant{0x3C468F0 + 0x1C, CLOTH_OLD_GATE, "FRITCHII_NO_CLOTH_SLOW"},
+    OotFixVariant{0x3C468F0 + 0x34, CLOTH_OLD_BOUND, "FRITCHII_NO_CLOTH_SLOW"},
+    OotFixVariant{0x3C46950 + 0x1C, CLOTH_OLD_GATE, "FRITCHII_NO_CLOTH_SLOW"},
+    OotFixVariant{0x3C46950 + 0x34, CLOTH_OLD_BOUND, "FRITCHII_NO_CLOTH_SLOW"},
+};
+// The cloth stubs' two changed words: a nop over the gate's b.ne, the 4/60 bound's movk.
+static_assert(InstructionAt(CLOTH_DT_A, 0x1C) == 0xD503201F && InstructionAt(CLOTH_DT_B, 0x1C) == 0xD503201F &&
+              InstructionAt(CLOTH_DT_C, 0x1C) == 0xD503201F && InstructionAt(CLOTH_DT_D, 0x1C) == 0xD503201F);
+static_assert(InstructionAt(CLOTH_DT_A, 0x34) == 0x72A7B110 && InstructionAt(CLOTH_DT_B, 0x34) == 0x72A7B110 &&
+              InstructionAt(CLOTH_DT_C, 0x34) == 0x72A7B110 && InstructionAt(CLOTH_DT_D, 0x34) == 0x72A7B110);
 // The hooks over the game's words, then every stub word, each checked to be zero.
-constexpr size_t HR_FIX_RECORD_COUNT = HR_FIX_HOOKS.size() + [] {
+constexpr size_t HR_FIX_RECORD_COUNT = HR_FIX_HOOKS.size() + HR_FIX_VARIANTS.size() + [] {
     size_t words = 0;
     for (const OotFixStub& stub : HR_FIX_STUBS) {
         words += stub.bytes.size() / 4;
@@ -979,25 +1015,53 @@ constexpr auto HR_FIX_RECORDS = [] {
     const auto add_stubs = [&](std::span<const OotFixStub> stubs) {
         for (const OotFixStub& stub : stubs) {
             for (size_t offset = 0; offset < stub.bytes.size(); offset += 4) {
+                const char* skip_env = nullptr;
+                for (const OotFixVariant& variant : HR_FIX_VARIANTS) {
+                    if (variant.offset == stub.offset + offset) {
+                        skip_env = variant.env;
+                    }
+                }
                 records[i++] = BuiltinPatchRecord{.module_offset = stub.offset + offset,
                                                   .bytes = stub.bytes.subspan(offset, 4),
                                                   .checked = true,
-                                                  .original = 0};
+                                                  .original = 0,
+                                                  .skip_env = skip_env};
             }
         }
     };
     add_stubs(HR_FIX_STUBS);
     add_stubs(HR_FIX_LATE_STUBS);
+    for (const OotFixVariant& variant : HR_FIX_VARIANTS) {
+        records[i++] = BuiltinPatchRecord{.module_offset = variant.offset,
+                                          .bytes = variant.old_bytes,
+                                          .checked = true,
+                                          .original = 0,
+                                          .need_env = variant.env};
+    }
     return records;
 }();
 constexpr std::string_view HR_FIX_NAME = "High refresh fixes (built-in)";
+// Every variant replaces a word some stub writes.
+static_assert([] {
+    for (const OotFixVariant& variant : HR_FIX_VARIANTS) {
+        size_t writers = 0;
+        for (const BuiltinPatchRecord& record : HR_FIX_RECORDS) {
+            writers += record.module_offset == variant.offset && record.skip_env == variant.env;
+        }
+        if (writers != 1) {
+            return false;
+        }
+    }
+    return true;
+}());
 
 bool BuiltinRecordSkipped(const BuiltinPatchRecord& record) {
-    if (record.skip_env == nullptr) {
-        return false;
-    }
-    const char* const value = std::getenv(record.skip_env);
-    return value != nullptr && std::string_view{value} == "1";
+    const auto set = [](const char* name) {
+        const char* const value = std::getenv(name);
+        return value != nullptr && std::string_view{value} == "1";
+    };
+    return (record.skip_env != nullptr && set(record.skip_env)) ||
+           (record.need_env != nullptr && !set(record.need_env));
 }
 
 bool HighRefreshSettingOn() {
@@ -2072,8 +2136,11 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         }
         for (const BuiltinPatchRecord& record : patch.records) {
             if (BuiltinRecordSkipped(record)) {
-                LOG_INFO(Loader, "    - \"{}\": leaving {}+{:#x} out, {}=1", patch.name, name,
-                         record.module_offset, record.skip_env);
+                // (a word kept for its switch, skipped while the switch is not 1: no line)
+                if (record.skip_env != nullptr) {
+                    LOG_INFO(Loader, "    - \"{}\": leaving {}+{:#x} out, {}=1", patch.name, name,
+                             record.module_offset, record.skip_env);
+                }
                 continue;
             }
             std::memcpy(out.data() + sizeof(Loader::NSOHeader) + record.module_offset,
