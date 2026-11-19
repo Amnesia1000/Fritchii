@@ -6150,6 +6150,17 @@ different patches only the blend part of the key. Reads the registers, so the po
 without the flag are still caught. Logs "saved by the blend value check" and why the other
 lookups refreshed in "EDEN_NX2_PIPELINE_CLEAN per second". Off by default, not measured yet.
 
+### FRITCHII_PCACHE_SAVE
+
+Boot, default 1; 0 = every save as before. Only where our VkPipelineCache file is in use (not
+NVIDIA's or AMD's Windows drivers by default). The file is written only when the driver's data
+changed size since it was read or last written: a boot whose pipelines were all in the cache
+counted as many builds as one that made them and wrote the whole file again. A save during play
+also waits until free RAM is at least twice the cache plus 4 GiB, because it copies the whole
+cache into memory and the file cache and pushes the game's pages out; the exit save always runs.
+Check: boot twice with no new pipelines; the second boot logs no "Vulkan driver pipelines cached
+at" before play and the file's date stays.
+
 ### FRITCHII_PIPELINE_KEY_HASH
 
 FRITCHII_PIPELINE_KEY_HASH (live, default 0): the graphics pipeline lookup after a key change

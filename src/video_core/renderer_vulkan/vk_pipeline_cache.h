@@ -839,6 +839,8 @@ private:
     size_t pipelines_since_flush{};
     std::chrono::steady_clock::time_point last_flush{};
     std::atomic<size_t> last_cache_size{};
+    /// Data size of our cache file as last read or written; ~0: none (FRITCHII_PCACHE_SAVE).
+    std::atomic<size_t> saved_cache_size{~size_t{0}};
     /// When MemoryOwners last asked the driver for the cache data size.
     std::chrono::steady_clock::time_point last_cache_size_query{};
     std::atomic_bool flush_in_flight{};
