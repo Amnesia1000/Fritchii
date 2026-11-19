@@ -36,7 +36,7 @@
 #include "common/shutdown_watch.h"
 #ifdef _WIN32
 #include "common/windows/crash_handler.h"
-#elif defined(__linux__)
+#elif defined(__linux__) && !defined(__ANDROID__)
 #include "common/linux/crash_handler.h"
 #endif
 #include "video_core/churn_counters.h"
@@ -1696,7 +1696,7 @@ void Device::ReportLoss(std::source_location where) const {
     static constexpr const char* FatalError = "the GPU driver lost the Vulkan device";
 #ifdef _WIN32
     Common::Windows::ReportFatalError(FatalError);
-#elif defined(__linux__)
+#elif defined(__linux__) && !defined(__ANDROID__)
     Common::Linux::LogFatalError(FatalError);
 #endif
     LOG_CRITICAL(Render_Vulkan, "Closing Fritchii: {}", FatalError);
