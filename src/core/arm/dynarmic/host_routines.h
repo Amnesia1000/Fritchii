@@ -20,7 +20,8 @@ class KProcess;
 // their translated guest code. The JIT compiles a BRK in place of the function's first
 // instruction (MemoryReadCode, guest memory unchanged); the breakpoint calls OnBreakpoint inside
 // the block (no exit from the run loop), which either answers the call (x0 the result, PC the
-// return address) or declines it (PC the next instruction, the first one being a no-op hint).
+// return address or the function's own epilogue) or declines it (the replaced instruction's
+// effect, if any, then the next instruction).
 //
 // Today: OoT's two zstd decodes (FRITCHII_HOST_ZSTD), on the host's libzstd.
 namespace Core::HostRoutines {
@@ -32,6 +33,9 @@ public:
     virtual u64 Get(int index) const = 0;
     virtual void Set(int index, u64 value) = 0;
     virtual void SetPC(u64 pc) = 0;
+    /// PSTATE as the JIT keeps it (NZCV in bits 31..28).
+    virtual u32 GetPstate() const = 0;
+    virtual void SetPstate(u32 value) = 0;
 
 protected:
     ~Registers() = default;
@@ -56,5 +60,9 @@ u32 InstructionFor(Core::System& system, Kernel::KProcess& process, Core::Memory
 /// set either way); false leaves it to the caller's own breakpoint handling.
 bool OnBreakpoint(Core::System& system, Kernel::KProcess& process, Core::Memory::Memory& memory,
                   Registers& regs, u64 pc);
+
+/// Verify mode (FRITCHII_HOST_ZSTD bit 2): stream chunks whose shadow decode differed from what
+/// the game's code did, since boot (must be 0; also in the log line).
+u64 StreamVerifyMismatches();
 
 } // namespace Core::HostRoutines

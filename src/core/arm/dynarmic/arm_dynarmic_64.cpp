@@ -175,6 +175,12 @@ public:
     void SetPC(u64 pc) override {
         m_jit.SetPC(pc);
     }
+    u32 GetPstate() const override {
+        return m_jit.GetPstate();
+    }
+    void SetPstate(u32 value) override {
+        m_jit.SetPstate(value);
+    }
 
 private:
     Dynarmic::A64::Jit& m_jit;
