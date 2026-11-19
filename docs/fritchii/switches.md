@@ -886,7 +886,12 @@ cluster's hitch score and its "another core had" time, fresh launches (boot sett
 TEST, off by default (live, debug server only). 1 = the next queue submission goes through the
 device loss report without a real loss: the "Device loss" lines, every thread's stack, the "Host
 crash" line, eden_crash.dmp from the helper process, then the process ends with code 2. It should
-take a few seconds. Never set it in nx2_switches.txt.
+take a few seconds. 2 = the same, with the GPU's semaphore treated as unreadable, as on a real loss.
+Never set it in nx2_switches.txt.
+
+The report and the hang report name the submission holding the queue up: "GPU oldest unfinished
+submission: tick N", the first after the GPU's last reported tick without an end stamp, out of the
+last 256 kept (FRITCHII_SLOW_GPU), with what it held. The newest 8 follow as before.
 
 ### FRITCHII_SMALL_CARD, FRITCHII_SMALL_CARD_PARTS, FRITCHII_SMALL_CARD_BUFFER_BLOCK_MIB
 

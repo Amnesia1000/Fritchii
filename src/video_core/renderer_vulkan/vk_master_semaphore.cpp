@@ -72,7 +72,8 @@ std::string MasterSemaphore::StallTicks(const void* self_) {
     const auto* const self = static_cast<const MasterSemaphore*>(self_);
     // What the card has reported, read now (the known tick only moves when someone refreshes).
     const u64 known = self->gpu_tick.load(std::memory_order_acquire);
-    const u64 reported = self->semaphore ? (std::max)(self->semaphore.GetCounter(), known) : known;
+    u64 read = 0;
+    const u64 reported = self->TryReadGpuTick(read) ? (std::max)(read, known) : known;
     const u64 submitted = self->stall_submitted_tick.load(std::memory_order_acquire);
     const u64 submitted_ns = self->stall_submitted_ns.load(std::memory_order_relaxed);
     const u64 now = Common::Nx2Hitch::NowNs();
@@ -83,6 +84,22 @@ std::string MasterSemaphore::StallTicks(const void* self_) {
                            ? static_cast<double>(now - submitted_ns) / 1e6
                            : 0.0,
                        reported, known, submitted > reported ? submitted - reported : 0);
+}
+
+bool MasterSemaphore::TryReadGpuTick(u64& tick) const noexcept {
+    if (!semaphore) {
+        return false;
+    }
+    try {
+        const u64 counter = semaphore.GetCounter();
+        if (counter >= CurrentTick()) {
+            return false; // no submission signals this: a lost device's value
+        }
+        tick = counter;
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 
 void MasterSemaphore::Refresh() {
@@ -105,6 +122,12 @@ void MasterSemaphore::Refresh() {
         }
         // Unchanged: no store, which would take the cache line from the threads reading it.
         if (counter <= this_tick) {
+            return;
+        }
+        // A lost device can report UINT64_MAX with VK_SUCCESS. Past every tick handed out it is
+        // no progress: kept out, the known tick stays the last real one, nothing looks finished,
+        // and the wait that follows gets the loss.
+        if (counter >= CurrentTick()) [[unlikely]] {
             return;
         }
     } while (!gpu_tick.compare_exchange_weak(this_tick, counter, std::memory_order_release,
