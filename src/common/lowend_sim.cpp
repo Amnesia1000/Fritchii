@@ -103,6 +103,12 @@ void ApplyCpuSet() {
         return;
     }
     g_cpu_mask = mask;
+    // The preparation's threads follow the simulated CPU, by its switch: nx2_precompile.cpp is one
+    // of the files the Preparing shaders stamp hashes.
+    if (std::getenv("EDEN_NX2_PRECOMPILE_THREADS") == nullptr) {
+        const int count = std::clamp(std::popcount(mask) / 4, 1, 6);
+        _putenv_s("EDEN_NX2_PRECOMPILE_THREADS", std::to_string(count).c_str());
+    }
     g_boot_notes.push_back(fmt::format("FRITCHII_SIM_CPU={}: {} cores, {} threads, processors "
                                        "{:#x} of this PC's {} cores",
                                        text, cores, threads, mask, all.size()));

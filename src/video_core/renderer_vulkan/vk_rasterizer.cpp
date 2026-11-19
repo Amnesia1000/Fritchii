@@ -5686,7 +5686,10 @@ void RasterizerVulkan::DispatchCompute() {
     constexpr u64 ThreeQuarterShader = 0xef542df87cacfe9eULL;
     const bool fsr_only_pass = pipeline->ShaderHash() == ComputePipeline::OcarinaFullSizeShader ||
                                pipeline->ShaderHash() == ThreeQuarterShader;
-    const bool can_replace = OcarinaTemporalEnabled() && pipeline->CanReplaceOcarinaUpscale() &&
+    // A pass learned below 720p (NoteLowSceneUpscale) counts like the known ones.
+    const bool upscale_pass =
+        pipeline->CanReplaceOcarinaUpscale() || pipeline->LearnedOcarinaUpscale();
+    const bool can_replace = OcarinaTemporalEnabled() && upscale_pass &&
                              (!fsr_only_pass ||
                               oot_backend == VideoCommon::OcarinaUpscaleBackend::Fsr) &&
                              !indirect_address && !frame_dump.Capturing();
@@ -5720,7 +5723,7 @@ void RasterizerVulkan::DispatchCompute() {
             constexpr u64 DepthReaderShader = 0x1fc7a0423116281fULL;
             const u64 hash = pipeline->ShaderHash();
             const bool special_pass =
-                can_replace || pipeline->CanReplaceOcarinaUpscale() ||
+                can_replace || upscale_pass ||
                 hash == ComputePipeline::OcarinaFullSizeShader ||
                 hash == ComputePipeline::Ocarina1440pShader || hash == ThreeQuarterShader ||
                 hash == ComputePipeline::Ocarina1440pScaledShader ||
@@ -9094,6 +9097,17 @@ void RasterizerVulkan::ReadOcarinaActor(OcarinaActorMesh& mesh) {
     }
 
     mesh = {std::move(vertices), std::move(indices), now.origin, before.origin, now.bones, before.bones};
+}
+
+// Here and not in vk_compute_pipeline.cpp, which the Preparing shaders stamp hashes: the same test
+// as the end of CanReplaceOcarinaUpscale.
+bool ComputePipeline::HasOcarinaUpscaleShape() const {
+    return !info.stores_global_memory && info.image_buffer_descriptors.empty() &&
+           info.image_descriptors.size() == 1 && info.image_descriptors.front().count == 1 &&
+           info.image_descriptors.front().is_written && !info.image_descriptors.front().is_read &&
+           !info.image_descriptors.front().is_byte_addressed &&
+           std::ranges::none_of(info.storage_buffers_descriptors,
+                                &Shader::StorageBufferDescriptor::is_written);
 }
 
 void RasterizerVulkan::NoteLowSceneUpscale(ComputePipeline& pipeline, u32 height) {
