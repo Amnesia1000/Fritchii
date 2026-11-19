@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <functional>
+#include <iterator>
 #include <string>
 #include <vector>
 #include <fmt/format.h>
@@ -1309,6 +1310,7 @@ u32 ConfigureGraphics::OfferedOutput(u32 output) const {
 
 void ConfigureGraphics::ApplyPictureInput(u32 input) {
     const u32 output_before = PictureOutputNow();
+    const u32 scene_before = SceneHeight(PictureInputNow());
     // A fixed height needs Max Resolution's fixed scene (the render patch changes its scale).
     max_resolution_choice = input != DYNAMIC_INPUT;
     if (input != DYNAMIC_INPUT) {
@@ -1318,6 +1320,13 @@ void ConfigureGraphics::ApplyPictureInput(u32 input) {
     const std::vector<u32> outputs =
         PictureOutputs(input, PictureVram(), PictureUpscalerNow() == PictureUpscaler::Dlss);
     u32 output = output_before;
+    // A lower Resolution is picked to go faster: an output above the screen only costs fps and is
+    // shrunk again, so it comes down to the screen (the largest size that fits it).
+    if (const u32 screen = ScreenHeight();
+        screen != 0 && !outputs.empty() && SceneHeight(input) < scene_before && output > screen) {
+        const auto above = std::ranges::upper_bound(outputs, screen);
+        output = above != outputs.begin() ? *std::prev(above) : outputs.front();
+    }
     if (!outputs.empty() && std::ranges::find(outputs, output) == outputs.end()) {
         const auto above = std::ranges::lower_bound(outputs, output);
         output = above != outputs.end() ? *above : outputs.back();
