@@ -5577,21 +5577,23 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                             text.c_str() + stamp.size() + PassesWord.size(), nullptr, 10));
                     }
                 }
+                // Its passes used up: no check either. The check compiles the biggest programs when
+                // the driver lost them, and the game waits for it at every boot.
+                if (check_mode != 2 && compute_passes >= 2) {
+                    LOG_WARNING(Render_Vulkan,
+                                "Prepared compute check skipped: {} compute passes ran for this "
+                                "preparation and the driver's cache lost the pipelines again (it "
+                                "is likely full: NVIDIA: Shader Cache Size Unlimited in the NVIDIA "
+                                "Control Panel)",
+                                compute_passes);
+                    return;
+                }
                 std::string summary;
                 const bool lost = PreparedComputeLost(*index, summary);
                 if (check_mode != 2 && !lost) {
                     LOG_INFO(Render_Vulkan, "Prepared compute check: {}: the driver's cache holds "
                                             "the prepared compute pipelines",
                              summary);
-                    return;
-                }
-                if (check_mode != 2 && compute_passes >= 2) {
-                    LOG_WARNING(Render_Vulkan,
-                                "Prepared compute check: {}: the driver's cache lost the prepared "
-                                "compute pipelines again after {} passes, not preparing them a "
-                                "third time (its cache is likely full: NVIDIA: Shader Cache Size "
-                                "Unlimited in the NVIDIA Control Panel)",
-                                summary, compute_passes);
                     return;
                 }
                 ++compute_passes;
