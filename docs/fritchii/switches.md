@@ -881,6 +881,18 @@ them. Exact: the same code, more room. Memory is committed only as code is writt
 per core, 4-6 cores). Log: "FRITCHII_JIT_CACHE_MIB=N: code cache of N MiB per core". Only worth a
 test when FRITCHII_HITCH_SPLIT=1 shows "warm compiles refused" before the load; judge by the load
 cluster's hitch score and its "another core had" time, fresh launches (boot setting).
+### FRITCHII_TEST_COMMIT_REFUSE
+
+Boot, Windows, TEST, default 0. Windows' commit limit is RAM plus the page files. A commit refused
+there (error 1455) used to end the game: guest memory then faulted, a refused `operator new` was an
+uncaught std::bad_alloc. Guest memory, page tables and `operator new` now try again every 50 ms for
+up to 5 s (a system-managed page file grows meanwhile, the texture cache gives memory back), then
+log "Out of memory" and fail as before; the crash report says the limit was hit. `operator new`
+only waits with under 4 GiB of commit left, so a bad size still fails at once. Nothing changes
+until a refusal happens. `<ms>` refuses every commit for that long from the first one on and starts
+one impossible allocation: under 5000 the log shows "refused" and "went through"; above it, "Out of
+memory" and then the game going on once the window ends (or the crash report's line).
+
 ### FRITCHII_TEST_DEVICE_LOSS
 
 TEST, off by default (live, debug server only). 1 = the next queue submission goes through the

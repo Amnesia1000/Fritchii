@@ -21,6 +21,7 @@
 #include "common/fs/fs_paths.h"
 #include "common/fs/path_util.h"
 #include "common/lowend_sim.h"
+#include "common/memory_detect.h"
 #ifdef _WIN32
 #include "common/windows/crash_handler.h"
 #endif
@@ -445,6 +446,7 @@ int main(int argc, char* argv[]) {
     // switches are added.
     ProfilingMode::ReadAtLaunch();
     LoadNx2Switches(argv[0]);
+    Common::InstallCommitLimitNewHandler();
     // Test only, off by default: the low-end PC simulation's limits on this process.
     Common::LowEndSim::ApplyProcessLimits();
     // Fritchii: NVIDIA's driver shader cache must hold OoT's ~120,000 prepared pipelines. Its size
