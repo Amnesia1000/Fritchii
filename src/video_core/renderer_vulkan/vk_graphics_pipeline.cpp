@@ -2711,7 +2711,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     bool configured;
     {
         Profile::Scope scope{Profile::Zone::ConfigureDraw};
-        if (occl_flag_kind == OCCL_KIND_PREPASS) [[unlikely]] {
+        if (occl_flag_parent != nullptr) [[unlikely]] {
             occl_prepass_rescaling = rescaling.Data(); // FRITCHII_OCCL_FLAG pre-pass
             occl_prepass_render_area = render_area;
         }

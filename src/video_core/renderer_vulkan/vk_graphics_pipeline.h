@@ -508,8 +508,12 @@ public:
     /// On a flag variant, its kind: 1 host flag program, 2 colour, 3 pre-pass.
     static constexpr u8 OCCL_KIND_PREPASS = 3;
     u8 occl_flag_kind{};
-    /// On a pre-pass variant: its last Configure's rescaling words and render area, which the
-    /// parent pushes again when it is bound for the real draw (ConfigureAfterOcclPrepass).
+    /// On a flag variant: 1 its translation's descriptors equal its parent's (the parent can
+    /// bind them for a real draw after a pre-pass), 2 they differ.
+    u8 occl_same_descriptors{};
+    /// On a flag variant: its last Configure's rescaling words and render area, which the
+    /// parent pushes again when it is bound for the real draw after a pre-pass
+    /// (ConfigureAfterOcclPrepass).
     std::remove_cvref_t<decltype(std::declval<const RescalingPushConstant&>().Data())>
         occl_prepass_rescaling{};
     RenderAreaPushConstant occl_prepass_render_area{};

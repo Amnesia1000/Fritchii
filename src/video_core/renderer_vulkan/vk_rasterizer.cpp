@@ -2389,6 +2389,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     // FRITCHII_OCCL_FLAG (fritchii_occl_flag.h): with one follower off, an occlusion test draw
     // may take its pipeline's flag variant; a kept flag variant is decided again.
     VideoCommon::OcclFlag::t_census = VideoCommon::OcclFlag::Census::Unknown;
+    VideoCommon::OcclFlag::t_colour_prepass = false;
     const auto occl_flag = [&](GraphicsPipeline* chosen, bool allow_make) -> GraphicsPipeline* {
         if (chosen != nullptr && chosen->occl_flag_parent != nullptr) {
             chosen = chosen->occl_flag_parent; // a kept flag variant: decided again
@@ -2403,10 +2404,15 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         // The pre-pass records the draw twice: not for indirect and list draws (recording them
         // consumes their arguments), the delta path and draw counting (they key on the bound
         // pipeline), or a frame dump's probe.
-        if (flag != nullptr && flag->occl_flag_kind == GraphicsPipeline::OCCL_KIND_PREPASS &&
+        const bool colour_prepass = VideoCommon::OcclFlag::t_colour_prepass;
+        if (flag != nullptr &&
+            (flag->occl_flag_kind == GraphicsPipeline::OCCL_KIND_PREPASS || colour_prepass) &&
             (is_indirect || draw_tracking || frame_dump.CapturingSampled())) [[unlikely]] {
             VideoCommon::OcclFlag::Add(VideoCommon::OcclFlag::g_stats.prepass_fallback);
-            VideoCommon::OcclFlag::t_census = VideoCommon::OcclFlag::Census::OffDiscards;
+            VideoCommon::OcclFlag::t_census = colour_prepass
+                                                  ? VideoCommon::OcclFlag::Census::ColourOther
+                                                  : VideoCommon::OcclFlag::Census::OffDiscards;
+            VideoCommon::OcclFlag::t_colour_prepass = false;
             return chosen;
         }
         return flag;
@@ -2941,6 +2947,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             if (pipeline->occl_flag_kind == GraphicsPipeline::OCCL_KIND_PREPASS) {
                 VideoCommon::OcclFlag::Add(VideoCommon::OcclFlag::g_stats.prepass_draws);
             }
+            if (VideoCommon::OcclFlag::t_colour_prepass) {
+                VideoCommon::OcclFlag::Add(VideoCommon::OcclFlag::g_stats.colour_prepass_draws);
+            }
         } else if (maxwell3d->regs.zpass_pixel_count_enable != 0) {
             query_cache_runtime.NoteOtherCountedDraw(
                 VideoCommon::OcclFlag::Blocks(census)); // nothing without the flag area
@@ -2960,8 +2969,11 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         if (VideoCommon::MemStageShadow::g_on.load(std::memory_order_relaxed)) [[unlikely]] {
             VideoCommon::MemStageShadow::BackDrawWindow(false);
         }
-        if (pipeline->occl_flag_kind == GraphicsPipeline::OCCL_KIND_PREPASS) [[unlikely]] {
-            // FRITCHII_OCCL_FLAG pre-pass: the variant draws first with depth writes off and
+        const bool colour_prepass = std::exchange(VideoCommon::OcclFlag::t_colour_prepass, false);
+        if (pipeline->occl_flag_kind == GraphicsPipeline::OCCL_KIND_PREPASS ||
+            colour_prepass) [[unlikely]] {
+            // FRITCHII_OCCL_FLAG pre-pass: the variant draws first with depth writes off (and,
+            // for a colour pre-pass, colour writes off) and
             // stores the flag; a host query open in this slot (verify, or a window that opened
             // one) does not count it: it ends before and the window's next slot opens after.
             // In mode 1 a host query already open counts the real draw exactly: no pre-pass.
@@ -2975,11 +2987,25 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                 }
                 scheduler.Record(
                     [](vk::CommandBuffer cmdbuf) { cmdbuf.SetDepthWriteEnableEXT(false); });
+                if (colour_prepass) {
+                    scheduler.Record([](vk::CommandBuffer cmdbuf) {
+                        static constexpr std::array<VkColorComponentFlags,
+                                                    Maxwell::NumRenderTargets>
+                            none{};
+                        cmdbuf.SetColorWriteMaskEXT(0, none);
+                    });
+                }
                 draw_func();
                 scheduler.Record([enable = maxwell3d->regs.depth_write_enabled != 0](
                                      vk::CommandBuffer cmdbuf) {
                     cmdbuf.SetDepthWriteEnableEXT(enable);
                 });
+                if (colour_prepass) {
+                    // The draw's own masks again (recorded from its registers).
+                    maxwell3d->dirty.flags[Dirty::Blending] = true;
+                    maxwell3d->dirty.flags[Dirty::ColorMask] = true;
+                    UpdateBlending(maxwell3d->regs, pipeline->occl_flag_parent);
+                }
                 if (query_open) {
                     query_cache_runtime.OcclPrepassResume();
                 }
@@ -3000,7 +3026,11 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                 trace_draw_hashes = {parent.ShaderHashes()[1], parent.ShaderHashes()[5]};
                 draw_func();
             } else {
-                parent.occl_flag_prepass_state = 2; // later draws take the parent alone
+                if (colour_prepass) {
+                    pipeline->occl_same_descriptors = 2; // no more colour pre-passes with it
+                } else {
+                    parent.occl_flag_prepass_state = 2; // later draws take the parent alone
+                }
                 OcclFlag::g_stats.prepass_lost.fetch_add(1, std::memory_order_relaxed);
                 LOG_ERROR(Render_Vulkan, "Occlusion flag pre-pass: the real draw could not be "
                                          "configured and was not recorded");

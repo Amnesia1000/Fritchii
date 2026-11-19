@@ -40,6 +40,11 @@ enum Value : int {
     OnColourOff = 3,
     ProbeDiscards = 4,
     OnPrepassOnly = 5,
+    /// 6 (COST PROBE, the picture can change): as 1, and colour Lean draws with subgroup
+    /// operations take the colour flag variant too (early tests can change their results).
+    ProbeSubgroup = 6,
+    /// 8 (TEST): as 1 without the colour pre-pass, to measure what it adds.
+    OnNoColourPrepass = 8,
 };
 
 [[nodiscard]] inline int RawMode() noexcept {
@@ -51,7 +56,7 @@ enum Value : int {
     const int value = RawMode();
     return value == Verify                                                     ? Verify
            : (value == On || value == OnColourOff || value == ProbeDiscards ||
-              value == OnPrepassOnly)
+              value == OnPrepassOnly || value == ProbeSubgroup || value == OnNoColourPrepass)
                ? On
                : Off;
 }
@@ -59,11 +64,20 @@ enum Value : int {
 /// Counted colour-off draws whose program discards may take the flag pre-pass (1, 2, 5).
 [[nodiscard]] inline bool PrepassAllowed() noexcept {
     const int value = RawMode();
-    return value == On || value == Verify || value == OnPrepassOnly;
+    return value == On || value == Verify || value == OnPrepassOnly || value == ProbeSubgroup ||
+           value == OnNoColourPrepass;
 }
 
 /// Colour-writing counted draws may take the colour flag variant (not with =3).
 [[nodiscard]] inline bool ColourAllowed() noexcept {
+    const int value = RawMode();
+    return value == On || value == Verify || value == ProbeSubgroup ||
+           value == OnNoColourPrepass;
+}
+
+/// Colour Lean draws the colour variant cannot take (subgroup or quad operations) may take the
+/// colour pre-pass: the host flag program first with colour and depth writes off (1, 2).
+[[nodiscard]] inline bool ColourPrepassAllowed() noexcept {
     const int value = RawMode();
     return value == On || value == Verify;
 }
@@ -108,6 +122,9 @@ inline constexpr const char* CensusNames[] = {
     "failed"};
 static_assert(std::size(CensusNames) == static_cast<size_t>(Census::Count));
 inline thread_local Census t_census{};
+/// Set by PipelineCache::OcclFlagPipeline when the host flag variant it returns is for a colour
+/// pre-pass (read and cleared by the draw that follows).
+inline thread_local bool t_colour_prepass{};
 
 /// A draw of this census class keeps its window's host query even with flag stores added to
 /// colour-writing Lean pixel programs.
@@ -133,6 +150,7 @@ struct Stats {
     std::atomic<u64> colour_made{};    ///< colour flag pipelines made (guest pixel program)
     std::atomic<u64> colour_flag_draws{}; ///< counted colour-writing draws with a flag pipeline
     std::atomic<u64> prepass_draws{};  ///< counted discarding draws drawn with the pre-pass
+    std::atomic<u64> colour_prepass_draws{}; ///< counted colour draws drawn with the colour pre-pass
     std::atomic<u64> prepass_made{};   ///< pre-pass pipelines made
     std::atomic<u64> prepass_fallback{}; ///< pre-pass refused at the draw (indirect, delta, dump)
     std::atomic<u64> prepass_paused{}; ///< pre-passes drawn between two host queries
@@ -188,7 +206,8 @@ inline void MaybeLog() {
                  prepass_draws = take(g.prepass_draws), prepass_made = take(g.prepass_made),
                  prepass_fallback = take(g.prepass_fallback),
                  prepass_paused = take(g.prepass_paused),
-                 prepass_skipped = take(g.prepass_skipped);
+                 prepass_skipped = take(g.prepass_skipped),
+                 colour_prepass_draws = take(g.colour_prepass_draws);
     LOG_INFO(Render_Vulkan,
              "Occlusion flags (FRITCHII_OCCL_FLAG={}) per second: counted draws {:.0f} with a "
              "flag pipeline, {:.0f} without (not Lean {:.0f}, regs refused {:.0f}, not ready "
@@ -199,13 +218,13 @@ inline void MaybeLog() {
              "draws {:.0f}, colour flag pipelines made {:.0f}; pre-pass draws {:.0f} ({:.0f} "
              "between host queries, {:.0f} skipped: a host query open), made {:.0f}, refused at "
              "the draw {:.0f}, refused for their descriptors {} since boot, real draws lost {} "
-             "(must be 0)",
+             "(must be 0); colour pre-pass draws {:.0f}",
              Mode(), flag_draws, other, not_lean, refused, not_ready, made, failed, no_slot,
              compared, agree, q0_f1, q1_f0, g.disagree_total.load(std::memory_order_relaxed),
              mixed, no_flag, reused, flag_slots, query_slots, colour_flag_draws, colour_made,
              prepass_draws, prepass_paused, prepass_skipped, prepass_made, prepass_fallback,
              g.prepass_refused.load(std::memory_order_relaxed),
-             g.prepass_lost.load(std::memory_order_relaxed));
+             g.prepass_lost.load(std::memory_order_relaxed), colour_prepass_draws);
     std::string census;
     for (size_t i = 0; i < static_cast<size_t>(Census::Count); ++i) {
         census += fmt::format("{}{} {:.0f}", i == 0 ? "" : ", ", CensusNames[i], take(g.census[i]));

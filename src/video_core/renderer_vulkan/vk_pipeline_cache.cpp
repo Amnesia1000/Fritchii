@@ -3785,14 +3785,39 @@ bool OcclFlagDiscardsNoWrites(const GraphicsPipeline& pipeline,
 /// stencil writes (stencil tests depend on them), depth bounds (they test the written depth),
 /// transform feedback or stores in any stage (they would run twice), NOTEQUAL with depth writes,
 /// or a pipeline without dynamic depth writes (the pre-pass turns them off).
-bool OcclFlagPrepassEligible(const GraphicsPipeline& pipeline,
-                             const Tegra::Engines::Maxwell3D::Regs& regs) {
-    using Regs = Tegra::Engines::Maxwell3D::Regs;
-    // Mandated early Z: the draw counts samples before its discards, the pre-pass after them.
+/// Pre-passes (both kinds), the pipeline: dynamic depth writes (the pre-pass turns them off),
+/// not mesh, no transform feedback or alpha to coverage, no stores in any stage (the pre-pass
+/// would run them twice).
+bool OcclFlagPrepassPipelineOk(const GraphicsPipeline& pipeline) {
     if (!pipeline.UsesExtendedDynamicState() || pipeline.IsMeshPipeline() ||
         pipeline.Key().state.xfb_enabled != 0 ||
-        pipeline.Key().state.alpha_to_coverage_enabled != 0 ||
-        pipeline.Key().state.early_z != 0) {
+        pipeline.Key().state.alpha_to_coverage_enabled != 0) {
+        return false;
+    }
+    return std::ranges::none_of(pipeline.StageInfos(), [](const Shader::Info& info) {
+        return OcclFlagStageWrites(info);
+    });
+}
+
+/// Pre-passes (both kinds), the draw's registers: see OcclFlagPrepassEligible.
+bool OcclFlagPrepassRegsOk(const Tegra::Engines::Maxwell3D::Regs& regs);
+
+/// FRITCHII_OCCL_FLAG colour pre-pass: a counted colour draw whose pixel program is Lean (no
+/// discard, depth or sample mask writes, stores) but uses subgroup or quad operations (the
+/// colour variant's early tests could change them) is drawn first with the host flag program,
+/// colour and depth writes off; then as it is. Without discards every fragment that passes the
+/// tests is counted, so the host program's flag is the draw's "some sample passed". Needs
+/// dynamic colour write masks (extended dynamic state 3 blending).
+bool OcclFlagColourPrepassEligible(const GraphicsPipeline& pipeline,
+                                  const Tegra::Engines::Maxwell3D::Regs& regs) {
+    return pipeline.Key().state.extended_dynamic_state_3_blend != 0 &&
+           OcclFlagPrepassPipelineOk(pipeline) && OcclFlagPrepassRegsOk(regs);
+}
+
+bool OcclFlagPrepassEligible(const GraphicsPipeline& pipeline,
+                             const Tegra::Engines::Maxwell3D::Regs& regs) {
+    // Mandated early Z: the draw counts samples before its discards, the pre-pass after them.
+    if (!OcclFlagPrepassPipelineOk(pipeline) || pipeline.Key().state.early_z != 0) {
         return false;
     }
     const auto& infos = pipeline.StageInfos();
@@ -3803,11 +3828,11 @@ bool OcclFlagPrepassEligible(const GraphicsPipeline& pipeline,
         pixel.uses_quad_shuffles || pixel.uses_fswzadd) {
         return false;
     }
-    if (std::ranges::any_of(infos, [](const Shader::Info& info) {
-            return OcclFlagStageWrites(info);
-        })) {
-        return false;
-    }
+    return OcclFlagPrepassRegsOk(regs);
+}
+
+bool OcclFlagPrepassRegsOk(const Tegra::Engines::Maxwell3D::Regs& regs) {
+    using Regs = Tegra::Engines::Maxwell3D::Regs;
     const bool stencil_writes =
         regs.stencil_enable != 0 &&
         (regs.stencil_front_mask != 0 ||
@@ -3912,7 +3937,10 @@ GraphicsPipeline* PipelineCache::OcclFlagPipeline(GraphicsPipeline* pipeline,
             OcclFlag::Add(stats.sg_invocation_id, pixel.uses_subgroup_invocation_id ? 1 : 0);
             OcclFlag::Add(stats.sg_helper, pixel.uses_is_helper_invocation ? 1 : 0);
         }
-        if (colour_verdict == Census::Flag && pipeline->occl_flag_colour_state != 2 &&
+        const bool probe_subgroup = colour_verdict == Census::ColourSubgroup &&
+                                    OcclFlag::RawMode() == OcclFlag::ProbeSubgroup;
+        if ((colour_verdict == Census::Flag || probe_subgroup) &&
+            pipeline->occl_flag_colour_state != 2 &&
             OcclFlag::ColourAllowed() && device.IsShaderInt64Supported()) {
             GraphicsPipeline* colour = pipeline->occl_flag_colour.get();
             if (colour == nullptr && allow_make) {
@@ -3933,6 +3961,25 @@ GraphicsPipeline* PipelineCache::OcclFlagPipeline(GraphicsPipeline* pipeline,
                 OcclFlag::t_census = Census::NotReady;
                 OcclFlag::Add(stats.not_ready);
                 return pipeline;
+            }
+        }
+        if ((colour_verdict == Census::ColourSubgroup || colour_verdict == Census::ColourQuad) &&
+            OcclFlag::ColourPrepassAllowed() && pipeline->occl_flag_state != 2 &&
+            pipeline->IsBuilt() && OcclFlagColourPrepassEligible(*pipeline, regs)) {
+            GraphicsPipeline* host = pipeline->occl_flag.get();
+            if (host == nullptr && allow_make) {
+                host = FindOrMakeOcclFlag(*pipeline);
+            }
+            if (host != nullptr && host->Failed()) [[unlikely]] {
+                pipeline->occl_flag_state = 2;
+                OcclFlag::Add(stats.failed);
+                host = nullptr;
+            }
+            if (host != nullptr && host->IsBuilt() && host->occl_same_descriptors == 1) {
+                OcclFlag::t_census = Census::Flag;
+                OcclFlag::t_colour_prepass = true;
+                host->MarkUsed(frame_count);
+                return host;
             }
         }
         switch (pipeline->IsMeshPipeline() ? PipelineClass::Mesh : pipeline_class) {
@@ -4110,6 +4157,7 @@ GraphicsPipeline* PipelineCache::FindOrMakeOcclFlag(GraphicsPipeline& full, u8 k
         return full.occl_flag_prepass.get();
     }
     OcclFlag::Add(OcclFlag::g_stats.made);
+    made->occl_same_descriptors = OcclFlagSameDescriptors(*made, full) ? 1 : 2;
     full.occl_flag = std::move(made);
     full.occl_flag_state = 1;
     return full.occl_flag.get();
