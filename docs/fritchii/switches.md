@@ -7707,3 +7707,13 @@ is written. The old accumulator's spot (main+0x3C46E8C..0x3C46F10) is free again
 Ctrl+U switches only the call word while the ripples are on. With the ripple built-in off,
 switching Dark's mode back restores both words and clears the routine; it waits while a guest
 thread stands in a routine or between the two water words.
+
+### EDEN_HYBRID_CORES
+
+Boot, Windows, CPUs with performance and efficiency cores. Wins over the "Intel P-cores" setting
+(Advanced > CPU). 2 or unset with the setting on Automatic = soft: Windows places the time-critical
+threads. 4 = GPU pinned, same as "Pin GPU to P-cores": the GPU front, back and render threads are
+held to the P-cores with CPU sets, released when they don't fit or after two 10 s windows with over
+50 late guest timers a second. It adds nothing where `Thread pinning:` already gave them cores of
+their own. 1 = strict with guards, 3 = strict without, 0 = off. Check the `CPU placement:` and
+`Hybrid placement in 10 s:` lines.
