@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <climits>
 #include <optional>
 #include <span>
@@ -141,6 +143,12 @@ private:
     static constexpr size_t NUM_LEVELS = sizeof(size_t) * CHAR_BIT;
     using StagingBuffersCache = std::array<StagingBuffers, NUM_LEVELS>;
 
+    /// The two ends of the stream's busy check: true when the request must spill to a staging
+    /// buffer. With the small BAR plan the GPU's tick is read again first.
+    bool StreamRegionsBusy(size_t region_begin, size_t region_end, size_t size);
+    /// FRITCHII_LINK_STATS: this pool's stream use, one line every 10 s.
+    void LogStreamUse();
+
     /// Request without the link accounting.
     StagingBufferRef RequestBuffer(size_t size, MemoryUsage usage, bool deferred,
                                    VideoCommon::BufferChurnStats::StagingCaller caller);
@@ -203,6 +211,25 @@ private:
     vk::Buffer stream_buffer;
     bool stream_in_device_memory{}; ///< the CPU's writes into it cross the link
     bool crosses_link{};            ///< a discrete GPU: host and device memory are apart
+    bool refresh_before_spill{};    ///< FRITCHII_SMALL_BAR_STREAMS
+    StreamRole role{};
+
+    /// FRITCHII_LINK_STATS. Requests may come from another thread than TickFrame's.
+    struct StreamUse {
+        std::atomic<u64> bytes{};
+        std::atomic<u64> requests{};
+        std::atomic<u64> frame_bytes{};
+        std::atomic<u64> peak_frame_bytes{};
+        std::atomic<u64> wraps{};
+        std::atomic<u64> full{};
+        std::atomic<u64> full_bytes{};
+        std::atomic<u64> full_was_free{};
+        std::atomic<u64> too_big{};
+        std::atomic<u64> too_big_bytes{};
+        size_t peak_busy_regions{};
+        std::chrono::steady_clock::time_point window_start{};
+    };
+    mutable StreamUse stream_use;
     VkDeviceAddress stream_buffer_address{};
     std::span<u8> stream_pointer;
     VkDeviceSize stream_buffer_size;
