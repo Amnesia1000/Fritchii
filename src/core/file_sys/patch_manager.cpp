@@ -1061,6 +1061,58 @@ constexpr std::array SHADOW_STEPS_RECORDS{
     BuiltinPatchRecord{.module_offset = 0x3C46DCC, .bytes = SHADOW_STEPS_RETURN, .checked = true, .original = 0},
 };
 
+// Texture heap tidy-up at most once a second: the game keeps its textures' storage in one heap and
+// tidies it in rounds on a thread of its own (aglTextureDataMgr::Compaction). The texture data
+// manager's per-frame step (main+0x777240, under its lock) asks for a new round at every frame no
+// round runs: its flags byte (+0x3C0) has bit 1 set once at setup. Every texture a round moves is
+// made again at its new address, which for us is a new image, a new upload and new descriptors: in
+// the market the heap sits at its 5% free line and the rounds never stop (the thread wanted the
+// cores 231-261 ms a second in the 6.0 market profile). Now a round may start at most once a second
+// (the guest's 19.2 MHz counter); the round itself, what it moves and how, is the game's, and a
+// started round always finishes. Not tied to the frame rate: it applies at any fps and in both
+// frame-step modes. The one risk: the heap is more fragmented than the game expects between rounds.
+// tbz w8, #1, 0x777288 at main+0x777278 branches to:
+//   tbz w8, #1, skip ; x9 = cntvct ; x8 = x9 - [last] ; x8 < 19.2 M: skip ;
+//   [last] = x9 ; b 0x77727c (ask) ; skip: b 0x777288
+// x8-x11 and the flags are dead at both targets. State: the last ask's counter value.
+constexpr size_t TEX_GAP_HOOK_OFFSET = 0x777278;
+constexpr size_t TEX_GAP_STUB_OFFSET = 0x3C46DD0;
+constexpr std::array<u8, 4> TEX_GAP_HOOK{0xD6, 0x3E, 0xD3, 0x14}; // b 0x3c46dd0
+constexpr std::array<u8, 48> TEX_GAP_STUB{
+    0x68, 0x01, 0x08, 0x36, 0x49, 0xE0, 0x3B, 0xD5, 0xCA, 0x92, 0x00, 0x90,
+    0x48, 0xD1, 0x47, 0xF9, 0x28, 0x01, 0x08, 0xCB, 0x0B, 0x00, 0x9F, 0x52,
+    0x8B, 0x24, 0xA0, 0x72, 0x1F, 0x01, 0x0B, 0xEB, 0x63, 0x00, 0x00, 0x54,
+    0x49, 0xD1, 0x07, 0xF9, 0x21, 0xC1, 0x2C, 0x17, 0x23, 0xC1, 0x2C, 0x17,
+};
+constexpr size_t TEX_GAP_STATE_OFFSET = 0x4E9EFA0;
+constexpr size_t TEX_GAP_STATE_SIZE = 0x8;
+static_assert(InstructionAt(TEX_GAP_HOOK, 0) == EncodeBl(TEX_GAP_HOOK_OFFSET, TEX_GAP_STUB_OFFSET) - 0x80000000U);
+static_assert(AdrpTarget(TEX_GAP_STUB_OFFSET + 0x8, InstructionAt(TEX_GAP_STUB, 0x8)) +
+                  ((InstructionAt(TEX_GAP_STUB, 0xC) >> 10) & 0xFFF) * 8 ==
+              TEX_GAP_STATE_OFFSET);
+// After the shadow steps' four words, before the high refresh routine, clear of the code known
+// cheats write from main+0x3C46CC0 to 0x3C46DB0.
+static_assert(TEX_GAP_STUB_OFFSET >= 0x3C46DD0 &&
+              TEX_GAP_STUB_OFFSET + TEX_GAP_STUB.size() <= HIGH_REFRESH_ROUTINE_OFFSET);
+// Its state after the high refresh fixes' (BSS no mod is known to write below main+0x4E9F000).
+static_assert(HR_FIX_STATE_OFFSET + HR_FIX_STATE_SIZE <= TEX_GAP_STATE_OFFSET &&
+              TEX_GAP_STATE_OFFSET % 8 == 0 &&
+              TEX_GAP_STATE_OFFSET + TEX_GAP_STATE_SIZE <= 0x4E9F000);
+constexpr auto TEX_GAP_RECORDS = [] {
+    std::array<BuiltinPatchRecord, 1 + TEX_GAP_STUB.size() / 4> records{};
+    records[0] = BuiltinPatchRecord{.module_offset = TEX_GAP_HOOK_OFFSET,
+                                    .bytes = TEX_GAP_HOOK,
+                                    .checked = true,
+                                    .original = 0x36080088}; // tbz w8, #1, 0x777288
+    for (size_t i = 1, offset = 0; offset < TEX_GAP_STUB.size(); ++i, offset += 4) {
+        records[i] = BuiltinPatchRecord{.module_offset = TEX_GAP_STUB_OFFSET + offset,
+                                        .bytes = std::span<const u8>{TEX_GAP_STUB}.subspan(offset, 4),
+                                        .checked = true,
+                                        .original = 0};
+    }
+    return records;
+}();
+
 constexpr std::array BUILTIN_PATCHES{
     BuiltinPatch{
         .name = MAX_RESOLUTION_NAME,
@@ -1160,6 +1212,18 @@ constexpr std::array BUILTIN_PATCHES{
         // the town wall 4,000-10,000 -> 30-90 per 600 frames, frames 20.5-26 -> 18.4-18.8 ms,
         // shadows unchanged in the screenshot. FRITCHII_NO_SHADOW_STEPS=1 turns it off.
         .disable_env = "FRITCHII_NO_SHADOW_STEPS",
+    },
+    // Applies to everyone at any frame rate. FRITCHII_NO_TEX_COMPACT_GAP=1 turns it off (the game
+    // asks for a round at every frame, as before), =0 applies it even when Add-Ons has it off.
+    BuiltinPatch{
+        .name = "Texture heap tidy-up once a second (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = TEX_GAP_RECORDS,
+        .disable_env = "FRITCHII_NO_TEX_COMPACT_GAP",
+        .state_offset = TEX_GAP_STATE_OFFSET,
+        .state_size = TEX_GAP_STATE_SIZE,
     },
     // OoT's render height (oot_render_height, Settings::OcarinaRenderHeight) under Max
     // Resolution with DLSS or FSR. The picture menu owns it: not in Add-Ons, where unticking one

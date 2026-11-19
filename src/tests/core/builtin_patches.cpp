@@ -892,6 +892,41 @@ TEST_CASE("High refresh fixes built-in hooks its sites in both modes", "[patch_m
     }
 }
 
+TEST_CASE("Texture heap tidy-up built-in gaps the compaction asks", "[patch_manager]") {
+    constexpr size_t Code = sizeof(Loader::NSOHeader);
+    constexpr size_t Hook = Code + 0x777278;
+    constexpr size_t Stub = Code + 0x3C46DD0;
+    constexpr u32 Tbz = 0x36080088;    // tbz w8, #1, 0x777288
+    constexpr u32 Branch = 0x14D33ED6; // b 0x3c46dd0
+    const auto word_at = [](const std::vector<u8>& nso, size_t offset) {
+        u32 word;
+        std::memcpy(&word, nso.data() + offset, sizeof(word));
+        return word;
+    };
+    PatchManagerTestContext context;
+    auto nso = MakeOcarinaMain();
+    std::memcpy(nso.data() + Hook, &Tbz, sizeof(Tbz));
+
+    SECTION("Applied: the hook, the stub from its tbz to its way back") {
+        const auto patched = context.Manager().PatchNSO(nso, "main");
+        REQUIRE(word_at(patched, Hook) == Branch);
+        REQUIRE(word_at(patched, Stub) == 0x36080168);        // tbz w8, #1, skip
+        REQUIRE(word_at(patched, Stub + 0x2C) == 0x172CC123); // b 0x777288
+    }
+    SECTION("Its switch, or another word at the hook: the game's ask at every frame") {
+        SECTION("switch") {
+            SetTestEnv("FRITCHII_NO_TEX_COMPACT_GAP", "1");
+        }
+        SECTION("hook") {
+            std::memcpy(nso.data() + Hook, &NopInstruction, sizeof(u32));
+        }
+        const auto patched = context.Manager().PatchNSO(nso, "main");
+        SetTestEnv("FRITCHII_NO_TEX_COMPACT_GAP", "");
+        REQUIRE(word_at(patched, Hook) == word_at(nso, Hook));
+        REQUIRE(word_at(patched, Stub) == 0);
+    }
+}
+
 TEST_CASE("Dark's standalone Dynamic FPS mod is skipped and hidden for the built-in",
           "[patch_manager]") {
     constexpr std::string_view DynamicFps = "Dynamic FPS by Dark (built-in)";
