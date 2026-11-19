@@ -453,7 +453,7 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
 
     SetupOcarinaUpscalerLabels();
     SetupOcarinaTextureRows(all_rows);
-    SetupPictureMenu(all_rows);
+    SetupPictureMenu();
     SetupPlainNames(all_rows);
 
     // Background color is too specific to build into the new system, so we manage it here
@@ -1056,17 +1056,18 @@ void ConfigureGraphics::SetupOcarinaUpscalerLabels() {
             const auto quality =
                 static_cast<Settings::NvidiaDlssQuality>(dlss_quality_combobox->itemData(row).toUInt());
             const bool native = quality == Settings::NvidiaDlssQuality::Native;
-            QString sizes;
-            if (max_resolution) {
-                // The picture menu's "Resolution" (oot_render_height, global), or while it is
-                // not picked FRITCHII_DLSS_RENDER_SCALE's qualities.
-                const QString render = HeightName(MenuRenderHeight(
-                    Settings::values.oot_render_height.GetValue(), false, quality));
-                sizes = native ? render : render + arrow + HeightName(2160);
-            } else {
-                const QString game_size = tr("game's size");
-                sizes = native ? game_size : game_size + arrow + HeightName(1440);
-            }
+            // The picture menu's "Resolution" (oot_render_height, global), or while it is not
+            // picked FRITCHII_DLSS_RENDER_SCALE's qualities; and its "Upscale to", as saved.
+            const u32 input = max_resolution
+                                  ? MenuRenderHeight(Settings::values.oot_render_height.GetValue(),
+                                                     false, quality)
+                                  : DYNAMIC_INPUT;
+            const u32 output = OutputFor(input, Settings::values.oot_upscale_output.GetValue(),
+                                         false, PictureVram());
+            const QString render = max_resolution ? HeightName(input) : tr("game's size");
+            const QString sizes = native || output == SceneHeight(input)
+                                      ? render
+                                      : render + arrow + HeightName(output);
             dlss_quality_combobox->setItemText(
                 row, QStringLiteral("%1: %2").arg(dlss_quality_combobox->itemText(row), sizes));
         }
@@ -1132,14 +1133,37 @@ void ConfigureGraphics::SetupOcarinaTextureRows(const std::map<u32, QWidget*>& r
     }
     ConfigurationShared::Widget* const sharpness =
         find(Settings::values.oot_texture_sharpness.Id());
-    if (custom != nullptr && sharpness != nullptr && sharpness->combobox != nullptr) {
-        QComboBox* const combobox = sharpness->combobox;
-        const auto update = [combobox, custom] {
-            custom->setVisible(combobox->currentData().toUInt() ==
-                               static_cast<u32>(Settings::OotTextureSharpness::Custom));
-        };
-        connect(combobox, QOverload<int>::of(&QComboBox::currentIndexChanged), custom, update);
-        update();
+    texture_sharpness_widget = sharpness;
+    lod_custom_widget = custom;
+    if (sharpness != nullptr) {
+        texture_sharpness_combobox = sharpness->combobox;
+    }
+    if (texture_sharpness_combobox != nullptr) {
+        connect(texture_sharpness_combobox, QOverload<int>::of(&QComboBox::currentIndexChanged),
+                this, [this](int) { UpdateOcarinaTextureRows(); });
+    }
+    if (oot_aa_combobox != nullptr) {
+        connect(oot_aa_combobox, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+                [this](int) { UpdateOcarinaTextureRows(); });
+    }
+    if (nvidia_dlss_checkbox != nullptr) {
+        connect(nvidia_dlss_checkbox, &QCheckBox::toggled, this,
+                [this](bool) { UpdateOcarinaTextureRows(); });
+    }
+    UpdateOcarinaTextureRows();
+}
+
+void ConfigureGraphics::UpdateOcarinaTextureRows() {
+    // The texture bias works only with FSR or DLSS (VideoCommon::OcarinaTextureLodBias): Fritchii
+    // shows its rows only then, in every mode (handheld and per game too).
+    const bool used = !FritchiiUi::Enabled() || OcarinaUpscalerPicked();
+    if (texture_sharpness_widget != nullptr) {
+        texture_sharpness_widget->setVisible(used);
+    }
+    if (lod_custom_widget != nullptr && texture_sharpness_combobox != nullptr) {
+        lod_custom_widget->setVisible(used &&
+                                      texture_sharpness_combobox->currentData().toUInt() ==
+                                          static_cast<u32>(Settings::OotTextureSharpness::Custom));
     }
 }
 
@@ -1318,20 +1342,10 @@ void ConfigureGraphics::ApplyPictureOutput(u32 output) {
     UpdatePictureMenu();
 }
 
-void ConfigureGraphics::SetupPictureMenu(const std::map<u32, QWidget*>& rows) {
+void ConfigureGraphics::SetupPictureMenu() {
     if (output_row == nullptr || render_row == nullptr) {
         return;
     }
-    const auto find = [&rows](u32 id) -> QWidget* {
-        const auto it = rows.find(id);
-        return it == rows.end() ? nullptr : it->second;
-    };
-    texture_sharpness_widget = find(Settings::values.oot_texture_sharpness.Id());
-    lod_custom_widget = find(Settings::values.oot_lod_bias_custom.Id());
-    if (auto* row = qobject_cast<ConfigurationShared::Widget*>(texture_sharpness_widget)) {
-        texture_sharpness_combobox = row->combobox;
-    }
-
     max_resolution_saved = FritchiiMaxResolution::Saved();
     max_resolution_choice = max_resolution_saved;
     // Not one of the offered heights: Auto, as the game takes it.
@@ -1368,11 +1382,6 @@ void ConfigureGraphics::SetupPictureMenu(const std::map<u32, QWidget*>& rows) {
             ApplyPictureOutput(output_combobox->itemData(index).toUInt());
         }
     });
-    if (texture_sharpness_combobox != nullptr) {
-        // After SetupOcarinaTextureRows' own update of the LOD bias row.
-        connect(texture_sharpness_combobox, QOverload<int>::of(&QComboBox::currentIndexChanged),
-                this, [this](int) { UpdatePictureMenu(); });
-    }
     // Saved with the other add-ons by the global config (Config::SaveDisabledAddOnValues).
     apply_funcs.push_back([this](bool) { FritchiiMaxResolution::Save(max_resolution_choice); });
     apply_funcs.push_back([this](bool) {
@@ -1415,16 +1424,7 @@ void ConfigureGraphics::UpdatePictureMenu() {
     if (dlss_quality_widget != nullptr) {
         dlss_quality_widget->setVisible(false);
     }
-    // The texture bias works only with FSR or DLSS (VideoCommon::OcarinaTextureLodBias).
-    if (texture_sharpness_widget != nullptr) {
-        texture_sharpness_widget->setVisible(upscaling);
-    }
-    if (lod_custom_widget != nullptr) {
-        lod_custom_widget->setVisible(
-            upscaling && texture_sharpness_combobox != nullptr &&
-            texture_sharpness_combobox->currentData().toUInt() ==
-                static_cast<u32>(Settings::OotTextureSharpness::Custom));
-    }
+    UpdateOcarinaTextureRows();
     if (!upscaling) {
         return;
     }

@@ -97,7 +97,7 @@ private:
     /// (oot_upscale_output), only as OoT's upscale path really runs. The choices set the Max
     /// Resolution add-on and the DLSS quality (Native when the two match) (ocarina_upscale.h,
     /// Settings::OcarinaRenderHeight, Settings::OcarinaMaxResolutionOn).
-    void SetupPictureMenu(const std::map<u32, QWidget*>& rows);
+    void SetupPictureMenu();
     void UpdatePictureMenu();
     /// Fritchii builds: the resolution list's names, as heights for the Max Resolution choice.
     void UpdateResolutionNames();
@@ -145,6 +145,8 @@ private:
     /// OoT's "DLSS jitter" row only while DLSS upscales OoT, the LOD bias row only with Custom
     /// texture sharpness. `rows`: the built setting rows by setting id.
     void SetupOcarinaTextureRows(const std::map<u32, QWidget*>& rows);
+    /// Fritchii builds: the texture sharpness rows only while FSR or DLSS is picked.
+    void UpdateOcarinaTextureRows();
 
     void RetrieveVulkanDevices();
 
