@@ -111,6 +111,8 @@ constexpr std::array<u8, 4> RenderScaleBytes(u32 float_top) {
     return {static_cast<u8>(instruction), static_cast<u8>(instruction >> 8),
             static_cast<u8>(instruction >> 16), static_cast<u8>(instruction >> 24)};
 }
+constexpr std::array<u8, 4> RENDER_SCALE_360 = RenderScaleBytes(0x3E80);  // 0.25, 640x360
+constexpr std::array<u8, 4> RENDER_SCALE_540 = RenderScaleBytes(0x3EC0);  // 0.375, 960x540
 constexpr std::array<u8, 4> RENDER_SCALE_720 = RenderScaleBytes(0x3F00);  // 0.5, 1280x720
 constexpr std::array<u8, 4> RENDER_SCALE_810 = RenderScaleBytes(0x3F10);  // 0.5625, 1440x810
 constexpr std::array<u8, 4> RENDER_SCALE_900 = RenderScaleBytes(0x3F20);  // 0.625, 1600x900
@@ -119,6 +121,26 @@ constexpr std::array<u8, 4> RENDER_SCALE_1260 = RenderScaleBytes(0x3F60); // 0.8
 static_assert(RenderScaleBytes(0x3F80) == std::array<u8, 4>{0x09, 0xF0, 0xA7, 0x52});
 static_assert(RENDER_SCALE_1080 == std::array<u8, 4>{0x09, 0xE8, 0xA7, 0x52});
 static_assert(RENDER_SCALE_720 == std::array<u8, 4>{0x09, 0xE0, 0xA7, 0x52});
+static_assert(RENDER_SCALE_540 == std::array<u8, 4>{0x09, 0xD8, 0xA7, 0x52});
+static_assert(RENDER_SCALE_360 == std::array<u8, 4>{0x09, 0xD0, 0xA7, 0x52});
+constexpr std::array RENDER_360_RECORDS{
+    BuiltinPatchRecord{.module_offset = 0x806420,
+                       .bytes = RENDER_SCALE_360,
+                       .checked = true,
+                       .original = RENDER_SCALE_ONE},
+};
+bool OcarinaRender360On() {
+    return Settings::OcarinaRenderHeight() == u32{360};
+}
+constexpr std::array RENDER_540_RECORDS{
+    BuiltinPatchRecord{.module_offset = 0x806420,
+                       .bytes = RENDER_SCALE_540,
+                       .checked = true,
+                       .original = RENDER_SCALE_ONE},
+};
+bool OcarinaRender540On() {
+    return Settings::OcarinaRenderHeight() == u32{540};
+}
 constexpr std::array RENDER_720_RECORDS{
     BuiltinPatchRecord{.module_offset = 0x806420,
                        .bytes = RENDER_SCALE_720,
@@ -1007,6 +1029,24 @@ constexpr std::array BUILTIN_PATCHES{
     },
     // OoT's render height (oot_render_height, Settings::OcarinaRenderHeight) under Max
     // Resolution with DLSS or FSR (listed in Add-Ons only while it applies).
+    BuiltinPatch{
+        .name = "360p render (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = RENDER_360_RECORDS,
+        .setting_enabled = &OcarinaRender360On,
+        .render_height = 360,
+    },
+    BuiltinPatch{
+        .name = "540p render (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = RENDER_540_RECORDS,
+        .setting_enabled = &OcarinaRender540On,
+        .render_height = 540,
+    },
     BuiltinPatch{
         .name = "720p render (built-in)",
         .title_id = 0x0400486024DEC000,

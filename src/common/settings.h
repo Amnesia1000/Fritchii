@@ -462,7 +462,7 @@ struct Values {
     Setting<u32> oot_upscale_output{linkage, 0, "oot_upscale_output", Category::Renderer};
     // OoT's render height with DLSS or FSR (docked, Max Resolution on), set by the picture menu's
     // "Resolution": 0 = not chosen (the game's 1440p, or FRITCHII_DLSS_RENDER_SCALE's DLSS
-    // qualities), 1440 = the game's 1440p, else 720 or 1080 (810, 900, 1260 with
+    // qualities), 1440 = the game's 1440p, else 720 or 1080 (360, 540, 810, 900, 1260 with
     // FRITCHII_OOT_RENDER_STEPS). A built-in patch of the game's render scale: every pass of the
     // game, compute ones too, runs at that size. Global only; takes effect when the game starts.
     Setting<u32> oot_render_height{linkage, 0, "oot_render_height", Category::Renderer};
@@ -1049,13 +1049,13 @@ NvidiaDlssRuntimeSettings GetNvidiaDlssRuntimeSettings();
 /// 1920x1080 and Ultra Performance 1280x720 before DLSS makes 4K. Off, every quality but Native
 /// takes the game's 2560x1440.
 [[nodiscard]] bool OcarinaDlssRenderScaleSwitch();
-/// FRITCHII_OOT_RENDER_STEPS (boot, 0 = off): also offer 810p, 900p and 1260p as OoT's render
-/// height (their scene sizes are not checked yet; see OcarinaRenderHeightOffered).
+/// FRITCHII_OOT_RENDER_STEPS (boot, 0 = off): also offer 360p, 540p, 810p, 900p and 1260p as OoT's
+/// render height (their scene sizes are not checked yet; see OcarinaRenderHeightOffered).
 [[nodiscard]] bool OcarinaRenderStepsSwitch();
 /// The heights OoT can draw its scene at under Max Resolution with DLSS or FSR: a built-in patch
 /// of the game's fixed render scale (main+0x806420) to height / 1440 of 2560x1440. Each scale is
-/// exact in the instruction's 16 bits (0.5, 0.5625, 0.625, 0.75, 0.875, 1).
-inline constexpr std::array<u32, 6> OcarinaRenderHeights{720, 810, 900, 1080, 1260, 1440};
+/// exact in the instruction's 16 bits (0.25, 0.375, 0.5, 0.5625, 0.625, 0.75, 0.875, 1).
+inline constexpr std::array<u32, 8> OcarinaRenderHeights{360, 540, 720, 810, 900, 1080, 1260, 1440};
 /// Whether the picture menu offers a render height: 720, 1080 and 1440 always, the others only
 /// with FRITCHII_OOT_RENDER_STEPS.
 [[nodiscard]] bool OcarinaRenderHeightOffered(u32 height);

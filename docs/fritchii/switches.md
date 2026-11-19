@@ -5931,6 +5931,21 @@ blocks loaded from ..." at boot; every 10 s with new blocks "... new blocks writ
 warm-up handed out a/b/c/d of K loaded" (per core). The hitch line's warm compile time shows
 what the warm-up costs.
 
+### FRITCHII_OOT_RENDER_STEPS
+
+TEST, off by default (boot). 1 = the picture menu's Resolution (and oot_render_height) also takes
+360p, 540p, 810p, 900p and 1260p: built-in patches of OoT's render scale (0.25, 0.375, 0.5625,
+0.625, 0.875 of 2560x1440), docked, Max Resolution on, DLSS or FSR picked. Off, those heights are
+ignored and the game draws 1440p. They stay behind the switch until a run shows the game draws
+them exactly: a line "no scene camera this frame: the camera's extent isn't the target's" means
+the game padded the size and its own upscale draws instead.
+
+Below 720p the output is at most 3x the scene: Auto is 1080p (not 4K), 540p can go to 1440p with
+FSR, 360p makes 1080p only. DLSS gets 1080p only, its exact modes (540p Performance, 360p Ultra
+Performance). Check per height: `Applying built-in patch "540p render (built-in)"`, `the game draws
+its scene at 960x540`, `NVIDIA DLSS (Streamline): 960x540 -> 1920x1080`, no repeating `the game's
+upscale draws frame N`.
+
 ## Numbered experiments (EDEN_NX2_EXPn)
 
 Numbered experiment switches EDEN_NX2_EXP0 .. EDEN_NX2_EXP79, live through the debug server:
