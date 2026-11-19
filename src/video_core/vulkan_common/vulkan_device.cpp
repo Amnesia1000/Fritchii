@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bitset>
 #include <chrono>
 #include <cstdlib>
@@ -32,6 +33,7 @@
 #include <ranges>
 #include "common/settings.h"
 #include "common/settings_enums.h"
+#include "common/shutdown_watch.h"
 #include "video_core/churn_counters.h"
 #include "video_core/memory_stage_link.h"
 #include "video_core/nx2_debug_control.h"
@@ -1654,14 +1656,27 @@ VkFormat Device::GetSupportedFormat(VkFormat wanted_format, VkFormatFeatureFlags
 }
 
 void Device::ReportLoss() const {
+    // The first thread to see the loss reports it and ends the process; the others wait for that.
+    static std::atomic_flag reported;
+    if (reported.test_and_set()) {
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::hours{1});
+        }
+    }
     LOG_CRITICAL(Render_Vulkan, "Device loss occurred!");
     PipelineBinary::NoteDeviceLoss();
     ReportDeviceFault();
     // FRITCHII_SLOW_GPU: what the GPU was last given (NVIDIA's fault info has no addresses).
     Common::Nx2Hitch::LogGpuBreadcrumbs("Device loss");
 
-    // Wait for the log to flush and for Nsight Aftermath to dump the results
-    std::this_thread::sleep_for(std::chrono::seconds{15});
+    if (nsight_aftermath_tracker) {
+        // Give Nsight Aftermath time to write its dump.
+        std::this_thread::sleep_for(std::chrono::seconds{15});
+    }
+    LOG_CRITICAL(Render_Vulkan, "Closing Fritchii: the GPU driver lost the Vulkan device");
+    // Flushes the log and skips DLL detach, which would run the driver's teardown on the lost
+    // device. An exception from here would only reach std::terminate on a worker thread.
+    Common::ShutdownWatch::EndProcessNow();
 }
 
 void Device::ReportDeviceFault() const {
